@@ -1,0 +1,43 @@
+name: 变更提案
+description: 创建一个需要产品确认、实施与验收的变更工作单元
+title: "[change] "
+labels: ["变更", "待分诊"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本 Issue 就是协作变更的最小说明。只有产品选择、权限、安全或外部依赖边界不明时才等待确认；其余工作可以在明确完成标准后直接编码。
+  - type: input
+    id: change_id
+    attributes:
+      label: 关联产品合同或当前能力
+      placeholder: "docs/产品合同与外部边界.md；如不适用请说明"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题与预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非范围
+      description: 简明写出做什么和不做什么。
+    validations:
+      required: true
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: 提案就绪检查
+      options:
+        - label: 已说明 MCP、Claude Code + 百炼、飞书的影响或无影响理由。
+          required: true
+        - label: 已列出待决策项；若存在，尚未开始实施。
+          required: true
+  - type: textarea
+    id: coordination
+    attributes:
+      label: 协作与阻塞
+      description: 主实施代理、拟用分支、相关 Issue / PR、阻塞关系。

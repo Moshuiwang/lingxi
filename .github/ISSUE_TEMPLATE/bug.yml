@@ -1,0 +1,36 @@
+name: 缺陷报告
+description: 记录当前已批准行为与实际行为不一致的情况
+title: "[bug] "
+labels: ["缺陷", "待分诊"]
+body:
+  - type: input
+    id: current_spec
+    attributes:
+      label: 当前规格或需求编号
+      placeholder: "docs/specs/.../spec.md；REQ-..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为、影响与复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏证据
+      description: 日志、截图、环境、时间；禁止提交令牌、用户数据或敏感配置。
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全检查
+      options:
+        - label: 已确认不含秘密、令牌、生产数据或个人敏感信息。
+          required: true

@@ -1,0 +1,30 @@
+name: 决策请求
+description: 请求产品负责人确认会阻塞变更实施的选择
+title: "[decision] "
+labels: ["待决策"]
+body:
+  - type: input
+    id: related_change
+    attributes:
+      label: 关联变更 / 当前合同
+      placeholder: "CHANGE-001、docs/changes/... 或 D-00x"
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: 需要确认的决定
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: 候选方案及影响
+      description: 说明用户体验、外部依赖、安全、成本或可维护性影响；不要由代理擅自选定。
+    validations:
+      required: true
+  - type: textarea
+    id: deadline
+    attributes:
+      label: 不决策时的影响
+      description: 说明哪些实现被阻塞、是否存在安全的研究工作。
