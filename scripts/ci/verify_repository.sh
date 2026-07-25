@@ -30,6 +30,7 @@ shellcheck --severity=warning "${tracked_scripts[@]}"
 printf 'ShellCheck：通过\n'
 
 python3 scripts/ci/check_markdown_links.py
+python3 scripts/ci/check_project_skills.py
 
 whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
 if [[ -n "${whitespace_files}" ]]; then

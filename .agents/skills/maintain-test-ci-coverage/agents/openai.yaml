@@ -1,0 +1,4 @@
+interface:
+  display_name: "维护 Test 与 CI 覆盖"
+  short_description: "检查本地测试、CI覆盖、时效性、执行证据与归流结论"
+  default_prompt: "使用 $maintain-test-ci-coverage 检查本次改动的本地测试、CI 覆盖与时效性，并给出归流结论。"
