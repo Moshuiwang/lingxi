@@ -1,0 +1,35 @@
+name: 研究与验证
+description: 记录可结束的调研、外部依赖核对、实验与结论
+title: "[research] "
+labels: ["研究", "待分诊"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: 要回答的问题
+      description: 说明它将支持哪项产品选择或实施判断。
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: 范围、方法与边界
+      description: 包括要核对的外部平台、允许的环境及不得收集的敏感信息。
+    validations:
+      required: true
+  - type: textarea
+    id: finish
+    attributes:
+      label: 完成标准
+      description: 什么证据能回答问题，以及无法得到结论时怎样记录。
+    validations:
+      required: true
+  - type: checkboxes
+    id: closure
+    attributes:
+      label: 结束时处理
+      options:
+        - label: 已知晓研究过程和一次性证据留在本 Issue / PR；只有长期有效的结论才回写 docs/。
+          required: true
+        - label: 已确认不在 Issue 中记录令牌、个人数据、生产数据或敏感配置。
+          required: true

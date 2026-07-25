@@ -27,6 +27,13 @@ body:
       description: 简明写出做什么和不做什么。
     validations:
       required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 可观察的完成标准
+      description: 用户、管理员或验证者怎样确认这项工作完成；不要只写技术任务。
+    validations:
+      required: true
   - type: checkboxes
     id: readiness
     attributes:
@@ -41,3 +48,10 @@ body:
     attributes:
       label: 协作与阻塞
       description: 主实施代理、拟用分支、相关 Issue / PR、阻塞关系。
+  - type: checkboxes
+    id: closeout
+    attributes:
+      label: 关闭与文档回写
+      options:
+        - label: 关闭前将检查是否需更新 docs/ 中的产品合同、当前能力或长期决策记录。
+          required: true

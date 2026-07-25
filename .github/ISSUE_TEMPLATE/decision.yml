@@ -28,3 +28,10 @@ body:
     attributes:
       label: 不决策时的影响
       description: 说明哪些实现被阻塞、是否存在安全的研究工作。
+  - type: checkboxes
+    id: record
+    attributes:
+      label: 决策归档
+      options:
+        - label: 若本次决定在 Issue 关闭后仍有效，将把结论回写到 docs/ 的产品合同、当前能力或长期决策记录。
+          required: true
