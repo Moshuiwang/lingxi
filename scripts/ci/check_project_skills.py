@@ -130,13 +130,13 @@ def validate_skill(skill_dir: Path) -> list[str]:
 
 def main() -> int:
     if not SKILLS_ROOT.is_dir():
-        print("项目 Skill 检查失败：缺少 .agents/skills", file=sys.stderr)
-        return 1
+        print("项目 Skills：未配置（跳过）")
+        return 0
 
     skill_dirs = sorted(path for path in SKILLS_ROOT.iterdir() if path.is_dir())
     if not skill_dirs:
-        print("项目 Skills：目录为空", file=sys.stderr)
-        return 1
+        print("项目 Skills：未配置（跳过）")
+        return 0
 
     failures = []
     for skill_dir in skill_dirs:

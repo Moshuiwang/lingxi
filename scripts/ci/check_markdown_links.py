@@ -29,7 +29,9 @@ def tracked_markdown_files() -> list[Path]:
         path = Path(raw_path)
         if path.parts and path.parts[0] == ".tmp":
             continue
-        paths.append(REPOSITORY_ROOT / path)
+        markdown_file = REPOSITORY_ROOT / path
+        if markdown_file.is_file():
+            paths.append(markdown_file)
     return paths
 
 
