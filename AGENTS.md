@@ -31,7 +31,7 @@
 
 ## Draft PR 前置审查
 
-- 创建 Draft PR 前，先刷新远端引用，再使用 Codex 内置 `/review`，以最新 `origin/main` 为基线审查当前分支。
+- 创建 Draft PR 前，先刷新远端引用，再使用当前代理内置的代码审查命令（Codex 的 `/review`、Claude Code 的 `/code-review` 或等效能力），以最新 `origin/main` 为基线审查当前分支。
 - 审查结论必须简要说明 Test 与 CI 对本次变化是否覆盖充分、需要补测试、需要更新 CI，或需要受控测试 / 真实入口验收；不另做独立归流流程。
 - 存在会让未来部署不安全或无法自动化的阻塞问题，或应进入 CI 的关键行为没有被实际执行时，先修复再提交 Draft PR。
 
