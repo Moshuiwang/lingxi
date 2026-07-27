@@ -6,7 +6,7 @@
   "workers_dev": false,
   "routes": [
     {
-      "pattern": "biai.chunbai.com/oauth/*",
+      "pattern": "biai-test.chunbai.com/oauth/*",
       "zone_name": "chunbai.com"
     }
   ],
