@@ -3,6 +3,13 @@
   "name": "lingxi-bot-test-oauth-bridge",
   "main": "src/worker.js",
   "compatibility_date": "2026-07-28",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "biai.chunbai.com/oauth/*",
+      "zone_name": "chunbai.com"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
