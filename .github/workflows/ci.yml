@@ -39,6 +39,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: 配置 Worker 校验运行时
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: workers/oauth-bridge/package-lock.json
+
+      - name: 校验 OAuth Worker
+        working-directory: workers/oauth-bridge
+        run: |
+          npm ci
+          npm test
+          npm run check
+
       - name: 运行基础质量门禁
         env:
           LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}

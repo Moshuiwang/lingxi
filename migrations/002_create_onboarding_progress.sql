@@ -4,7 +4,7 @@ CREATE TABLE onboarding_progress (
     card_nonce       TEXT PRIMARY KEY,
     subject_hash     TEXT NOT NULL,
     chat_hash        TEXT NOT NULL,
-    step             TEXT NOT NULL CHECK (step IN ('guide', 'declined', 'authorizing')),
+    step             TEXT NOT NULL CHECK (step IN ('guide', 'declined', 'authorizing', 'processing')),
     expires_at       TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '24 hours',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (char_length(subject_hash) = 64),

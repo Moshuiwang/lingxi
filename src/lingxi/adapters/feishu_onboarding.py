@@ -63,7 +63,7 @@ class InMemoryCardProgressStore:
     def __init__(self, key: str = "test-onboarding-state-key") -> None:
         self._key = key.encode()
         self._events: set[str] = set()
-        self._cards: dict[str, tuple[str, str, datetime]] = {}
+        self._cards: dict[str, tuple[str, str, str, datetime]] = {}
 
     def _hash(self, value: str) -> str:
         return hmac.new(self._key, value.encode(), hashlib.sha256).hexdigest()
@@ -74,14 +74,18 @@ class InMemoryCardProgressStore:
         self._events.add(event_id)
         return True
 
-    def create(self, open_id: str, chat_id: str, _step: str) -> str:
+    def create(self, open_id: str, chat_id: str, step: str) -> str:
+        subject_hash, chat_hash = self._hash(open_id), self._hash(chat_id)
+        for nonce, card in self._cards.items():
+            if card[0] == subject_hash and card[1] == chat_hash and card[2] in {"authorizing", "processing"} and card[3] > datetime.now(timezone.utc):
+                return nonce
         nonce = secrets.token_urlsafe(24)
-        self._cards[nonce] = (self._hash(open_id), self._hash(chat_id), datetime.now(timezone.utc) + timedelta(hours=24))
+        self._cards[nonce] = (subject_hash, chat_hash, step, datetime.now(timezone.utc) + timedelta(hours=24))
         return nonce
 
     def valid(self, open_id: str, chat_id: str, nonce: str) -> bool:
         card = self._cards.get(nonce)
-        return bool(card and card[2] > datetime.now(timezone.utc) and hmac.compare_digest(card[0], self._hash(open_id)) and hmac.compare_digest(card[1], self._hash(chat_id)))
+        return bool(card and card[3] > datetime.now(timezone.utc) and hmac.compare_digest(card[0], self._hash(open_id)) and hmac.compare_digest(card[1], self._hash(chat_id)))
 
 
 class OnboardingCards:
@@ -234,14 +238,27 @@ def run_long_connection_bot() -> None:
     )
 
     from lingxi.adapters.postgres_onboarding import PostgresCardProgressStore
+    from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthBridgeClient, OAuthResultProcessor
 
     dsn = os.environ.get("LINGXI_POSTGRES_DSN")
     state_key = os.environ.get("LINGXI_ONBOARDING_STATE_KEY")
     redirect_uri = os.environ.get("LINGXI_OAUTH_REDIRECT_URI")
     oauth_scope = os.environ.get("LINGXI_OAUTH_SCOPE")
-    if not dsn or not state_key or not redirect_uri or not oauth_scope:
+    bridge_url = os.environ.get("LINGXI_OAUTH_BRIDGE_URL")
+    bridge_token = os.environ.get("LINGXI_OAUTH_BRIDGE_TOKEN")
+    if not dsn or not state_key or not redirect_uri or not oauth_scope or not bridge_url or not bridge_token:
         raise RuntimeError("Bot-Test 入口缺少 PostgreSQL 或安全授权回跳配置，不能安全启动")
     persistent_store = PostgresCardProgressStore(dsn, state_key)
+    bridge = OAuthBridgeClient(bridge_url, bridge_token)
+    processor = OAuthResultProcessor(
+        persistent_store,
+        OnboardingService(persistent_store),
+        FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri),
+        bridge,
+        state_key,
+    )
+    bridge.set_processor(processor)
+    bridge.start()
     controller = FeishuOnboardingController(
         OnboardingService(persistent_store),
         LarkCardSender(app_id, app_secret),

@@ -52,6 +52,16 @@ class FeishuOnboardingControllerTest(unittest.TestCase):
         self.assertEqual(self.store.user_count(), 0)
         self.assertIn("accounts.feishu.cn", card["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["default_url"])
 
+    def test_repeated_start_keeps_the_original_authorization_link_valid(self) -> None:
+        self.controller.receive_private_message(IncomingPrivateMessage("oc_test", "ou_test", "你好", "evt_start"))
+        nonce = self.sender.sent[-1][1]["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["value"]["nonce"]
+        first = self.controller.receive_card_action("oc_test", "ou_test", "start", nonce)
+        second = self.controller.receive_card_action("oc_test", "ou_test", "start", nonce)
+
+        first_url = first["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["default_url"]
+        second_url = second["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["default_url"]
+        self.assertEqual(first_url, second_url)
+
     def test_group_message_is_not_a_private_onboarding_path(self) -> None:
         self.controller.receive_private_message(IncomingPrivateMessage("oc_group", "ou_test", "开始使用", "evt_group", chat_type="group"))
 

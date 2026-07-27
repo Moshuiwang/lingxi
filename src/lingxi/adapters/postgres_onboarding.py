@@ -97,10 +97,46 @@ class PostgresCardProgressStore(PostgresOnboardingStore):
         nonce = secrets.token_urlsafe(24)
         subject_hash, chat_hash = self._hash(open_id), self._hash(chat_id)
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT card_nonce FROM onboarding_progress WHERE subject_hash = %s AND chat_hash = %s AND step IN ('authorizing', 'processing') AND expires_at > now() FOR UPDATE",
+                (subject_hash, chat_hash),
+            )
+            active = cursor.fetchone()
+            if active is not None:
+                return str(active[0])
             cursor.execute("DELETE FROM onboarding_progress WHERE subject_hash = %s AND chat_hash = %s", (subject_hash, chat_hash))
             cursor.execute("INSERT INTO onboarding_progress (card_nonce, subject_hash, chat_hash, step) VALUES (%s, %s, %s, %s)", (nonce, subject_hash, chat_hash, step))
         return nonce
 
     def valid(self, open_id: str, chat_id: str, nonce: str) -> bool:
         row = self._fetchone("SELECT 1 FROM onboarding_progress WHERE card_nonce = %s AND subject_hash = %s AND chat_hash = %s AND expires_at > now()", (nonce, self._hash(open_id), self._hash(chat_id)))
+        return row is not None
+
+    def claim_authorizing_state(self, state: str) -> bool:
+        """先原子占用一次性 state，再向飞书换取身份，阻断回调重放。"""
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE onboarding_progress SET step = 'processing' WHERE card_nonce = %s AND step = 'authorizing' AND expires_at > now() RETURNING card_nonce",
+                (state,),
+            )
+            return cursor.fetchone() is not None
+
+    def complete_authorizing_state(self, state: str, open_id: str) -> bool:
+        """只在身份与原私聊人相符时，消费已占用的 state。"""
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT subject_hash FROM onboarding_progress WHERE card_nonce = %s AND step = 'processing' AND expires_at > now() FOR UPDATE",
+                (state,),
+            )
+            row = cursor.fetchone()
+            if row is None or not hmac.compare_digest(str(row[0]), self._hash(open_id)):
+                return False
+            cursor.execute("DELETE FROM onboarding_progress WHERE card_nonce = %s", (state,))
+            return True
+
+    def cancel_authorizing_state(self, state: str) -> bool:
+        row = self._fetchone(
+            "DELETE FROM onboarding_progress WHERE card_nonce = %s AND step IN ('authorizing', 'processing') AND expires_at > now() RETURNING card_nonce",
+            (state,),
+        )
         return row is not None
