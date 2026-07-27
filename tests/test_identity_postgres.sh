@@ -10,9 +10,11 @@ psql_in_container() {
   docker exec "${container_name}" psql -q -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" "$@"
 }
 
-psql_in_container -c 'DROP TABLE IF EXISTS inbound_event CASCADE; DROP TABLE IF EXISTS app_user CASCADE;'
+psql_in_container -c 'DROP TABLE IF EXISTS onboarding_progress CASCADE; DROP TABLE IF EXISTS inbound_event CASCADE; DROP TABLE IF EXISTS app_user CASCADE;'
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
   < "${repository_root}/migrations/001_create_app_user.sql"
+docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
+  < "${repository_root}/migrations/002_create_onboarding_progress.sql"
 
 first_insert=$(psql_in_container -At -c "
   SELECT record_authorized_identity(
@@ -68,6 +70,28 @@ done
      AND column_name IN ('permission_record_id', 'permission_version', 'permission_checked_at');
 ")" == '0' ]] || {
   printf '身份切片不应预置权限记录字段。\n' >&2
+  exit 1
+}
+
+[[ "$(psql_in_container -At -c "
+  SELECT count(*)
+    FROM information_schema.columns
+   WHERE table_name = 'onboarding_progress'
+     AND column_name IN (
+       'subject_hash', 'chat_hash', 'card_nonce', 'step', 'expires_at', 'created_at'
+     );
+")" == '6' ]] || {
+  printf '开通进度表缺少最小状态字段。\n' >&2
+  exit 1
+}
+
+[[ "$(psql_in_container -At -c "
+  SELECT count(*)
+    FROM information_schema.columns
+   WHERE table_name = 'onboarding_progress'
+     AND column_name ~ '(open_id|user_id|union_id|name|permission|token|content)';
+")" == '0' ]] || {
+  printf '开通进度表不应保存身份、权限、令牌或业务内容。\n' >&2
   exit 1
 }
 

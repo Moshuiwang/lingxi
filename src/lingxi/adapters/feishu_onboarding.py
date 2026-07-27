@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import hmac
+import secrets
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
+from urllib.parse import urlencode
 
 from lingxi.core.identity.onboarding import OnboardingResponse, OnboardingService, ResponseKind
 
@@ -23,49 +28,112 @@ class IncomingPrivateMessage:
     chat_id: str
     sender_open_id: str
     content: str
+    event_id: str
     chat_type: str = "p2p"
     message_type: str = "text"
+
+
+class CardProgressStore(Protocol):
+    def claim_inbound_event(self, event_id: str) -> bool: ...
+    def create(self, open_id: str, chat_id: str, step: str) -> str: ...
+    def valid(self, open_id: str, chat_id: str, nonce: str) -> bool: ...
+
+
+class AuthorizationUrlFactory(Protocol):
+    def create(self, state: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class FeishuAuthorizationUrlFactory:
+    """只构造用户可点的地址；授权码只会回到受控服务端。"""
+
+    app_id: str
+    redirect_uri: str
+    scope: str
+
+    def create(self, state: str) -> str:
+        return "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + urlencode(
+            {"client_id": self.app_id, "redirect_uri": self.redirect_uri, "state": state, "scope": self.scope}
+        )
+
+
+class InMemoryCardProgressStore:
+    """单元测试替身；真实 Bot-Test 必须使用 PostgreSQL 实现。"""
+
+    def __init__(self, key: str = "test-onboarding-state-key") -> None:
+        self._key = key.encode()
+        self._events: set[str] = set()
+        self._cards: dict[str, tuple[str, str, datetime]] = {}
+
+    def _hash(self, value: str) -> str:
+        return hmac.new(self._key, value.encode(), hashlib.sha256).hexdigest()
+
+    def claim_inbound_event(self, event_id: str) -> bool:
+        if event_id in self._events:
+            return False
+        self._events.add(event_id)
+        return True
+
+    def create(self, open_id: str, chat_id: str, _step: str) -> str:
+        nonce = secrets.token_urlsafe(24)
+        self._cards[nonce] = (self._hash(open_id), self._hash(chat_id), datetime.now(timezone.utc) + timedelta(hours=24))
+        return nonce
+
+    def valid(self, open_id: str, chat_id: str, nonce: str) -> bool:
+        card = self._cards.get(nonce)
+        return bool(card and card[2] > datetime.now(timezone.utc) and hmac.compare_digest(card[0], self._hash(open_id)) and hmac.compare_digest(card[1], self._hash(chat_id)))
 
 
 class OnboardingCards:
     """只放用户能看见的开通卡片，避免在外部回调中拼接业务状态。"""
 
     @staticmethod
-    def full_guide() -> dict[str, Any]:
+    def full_guide(nonce: str) -> dict[str, Any]:
         return OnboardingCards._card(
             title="欢迎使用灵犀",
             content="灵犀会在你确认后，完成企业身份与已获批准数据范围的开通。开通前发送的业务内容不会被保存或执行。",
             actions=(
-                OnboardingCards._callback_button("开始使用", "primary", "start"),
-                OnboardingCards._callback_button("暂不需要", "default", "decline"),
+                OnboardingCards._callback_button("开始使用", "primary", "start", nonce),
+                OnboardingCards._callback_button("暂不需要", "default", "decline", nonce),
             ),
         )
 
     @staticmethod
-    def short_guide() -> dict[str, Any]:
+    def short_guide(nonce: str) -> dict[str, Any]:
         return OnboardingCards._card(
             title="灵犀",
             content="需要时，点击“开始使用”即可完成开通。",
-            actions=(OnboardingCards._callback_button("开始使用", "primary", "start"),),
+            actions=(OnboardingCards._callback_button("开始使用", "primary", "start", nonce),),
         )
 
     @staticmethod
-    def authorization_required() -> dict[str, Any]:
+    def authorization_required(authorization_url: str) -> dict[str, Any]:
         return OnboardingCards._card(
             title="准备开通",
-            content="你已确认开始使用。下一步需要完成飞书授权；在授权完成前，灵犀不会创建用户记录。",
-            actions=(),
+            content="你已确认开始使用。请点击下方按钮完成飞书授权；在授权完成前，灵犀不会创建用户记录。",
+            actions=(OnboardingCards._link_button("去飞书授权", "primary", authorization_url),),
         )
 
     @staticmethod
-    def _callback_button(label: str, button_type: str, action: str) -> dict[str, Any]:
+    def _callback_button(label: str, button_type: str, action: str, nonce: str) -> dict[str, Any]:
         return {
             "tag": "button",
             "text": {"tag": "plain_text", "content": label},
             "type": button_type,
             "width": "default",
             "size": "medium",
-            "behaviors": [{"type": "callback", "value": {"action": action}}],
+            "behaviors": [{"type": "callback", "value": {"action": action, "nonce": nonce}}],
+        }
+
+    @staticmethod
+    def _link_button(label: str, button_type: str, url: str) -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": button_type,
+            "width": "default",
+            "size": "medium",
+            "behaviors": [{"type": "open_url", "default_url": url}],
         }
 
     @staticmethod
@@ -87,34 +155,42 @@ class OnboardingCards:
 class FeishuOnboardingController:
     """将可验证的领域结果转为飞书卡片。"""
 
-    def __init__(self, service: OnboardingService, sender: CardSender) -> None:
+    def __init__(self, service: OnboardingService, sender: CardSender, progress: CardProgressStore, authorization_url: AuthorizationUrlFactory | None = None) -> None:
         self._service = service
         self._sender = sender
+        self._progress = progress
+        self._authorization_url = authorization_url
 
     def receive_private_message(self, message: IncomingPrivateMessage) -> None:
         if message.chat_type != "p2p" or message.message_type != "text":
             return
+        if not self._progress.claim_inbound_event(message.event_id):
+            return
         response = self._service.receive_message(message.sender_open_id, message.content)
-        self._sender.send_card(message.chat_id, self._card_for(response))
+        self._sender.send_card(message.chat_id, self._card_for(response, message.sender_open_id, message.chat_id))
 
-    def receive_card_action(self, chat_id: str, open_id: str, action: str) -> dict[str, Any]:
+    def receive_card_action(self, chat_id: str, open_id: str, action: str, nonce: str) -> dict[str, Any] | None:
+        if not self._progress.valid(open_id, chat_id, nonce):
+            return None
         if action == "decline":
             response = self._service.decline_guide(open_id)
-            return self._card_for(response)
+            return self._card_for(response, open_id, chat_id)
         if action == "start":
             response = self._service.confirm_start(open_id, "开始使用")
-            return self._card_for(response)
-        return OnboardingCards.short_guide()
+            return self._card_for(response, open_id, chat_id)
+        return None
 
-    @staticmethod
-    def _card_for(response: OnboardingResponse) -> dict[str, Any]:
+    def _card_for(self, response: OnboardingResponse, open_id: str, chat_id: str) -> dict[str, Any]:
         if response.kind == ResponseKind.FULL_GUIDE:
-            return OnboardingCards.full_guide()
+            return OnboardingCards.full_guide(self._progress.create(open_id, chat_id, "guide"))
         if response.kind == ResponseKind.SHORT_GUIDE:
-            return OnboardingCards.short_guide()
+            return OnboardingCards.short_guide(self._progress.create(open_id, chat_id, "declined"))
         if response.kind == ResponseKind.AUTHORIZATION_REQUIRED:
-            return OnboardingCards.authorization_required()
-        return OnboardingCards.short_guide()
+            if self._authorization_url is None:
+                raise RuntimeError("未配置安全授权回跳地址，不能开始授权")
+            nonce = self._progress.create(open_id, chat_id, "authorizing")
+            return OnboardingCards.authorization_required(self._authorization_url.create(nonce))
+        return OnboardingCards.short_guide(self._progress.create(open_id, chat_id, "declined"))
 
 
 class LarkCardSender:
@@ -157,9 +233,21 @@ def run_long_connection_bot() -> None:
         P2CardActionTriggerResponse,
     )
 
-    from lingxi.core.identity.onboarding import InMemoryOnboardingStore
+    from lingxi.adapters.postgres_onboarding import PostgresCardProgressStore
 
-    controller = FeishuOnboardingController(OnboardingService(InMemoryOnboardingStore()), LarkCardSender(app_id, app_secret))
+    dsn = os.environ.get("LINGXI_POSTGRES_DSN")
+    state_key = os.environ.get("LINGXI_ONBOARDING_STATE_KEY")
+    redirect_uri = os.environ.get("LINGXI_OAUTH_REDIRECT_URI")
+    oauth_scope = os.environ.get("LINGXI_OAUTH_SCOPE")
+    if not dsn or not state_key or not redirect_uri or not oauth_scope:
+        raise RuntimeError("Bot-Test 入口缺少 PostgreSQL 或安全授权回跳配置，不能安全启动")
+    persistent_store = PostgresCardProgressStore(dsn, state_key)
+    controller = FeishuOnboardingController(
+        OnboardingService(persistent_store),
+        LarkCardSender(app_id, app_secret),
+        persistent_store,
+        FeishuAuthorizationUrlFactory(app_id, redirect_uri, oauth_scope),
+    )
 
     def receive_message(data: Any) -> None:
         event = data.event
@@ -171,6 +259,7 @@ def run_long_connection_bot() -> None:
                 chat_id=event.message.chat_id or "",
                 sender_open_id=event.sender.sender_id.open_id or "",
                 content=message_content.get("text", ""),
+                event_id=getattr(getattr(data, "header", None), "event_id", "") or "",
                 chat_type=event.message.chat_type or "",
                 message_type=event.message.message_type or "",
             )
@@ -181,7 +270,9 @@ def run_long_connection_bot() -> None:
         if event is None or event.operator is None or event.context is None or event.action is None:
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "未识别本次操作"}})
         value = event.action.value or {}
-        card = controller.receive_card_action(event.context.open_chat_id or "", event.operator.open_id or "", value.get("action", ""))
+        card = controller.receive_card_action(event.context.open_chat_id or "", event.operator.open_id or "", value.get("action", ""), value.get("nonce", ""))
+        if card is None:
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "该入口已失效或不属于当前私聊，请重新发消息开始"}})
         return P2CardActionTriggerResponse({"card": {"type": "raw", "data": card}})
 
     event_handler = (
