@@ -1,0 +1,8 @@
+[project]
+name = "lingxi"
+version = "0.1.0"
+description = "Lingxi 企业内部受控 AI 业务分析服务"
+requires-python = ">=3.12"
+
+[tool.unittest]
+start-directory = "tests"

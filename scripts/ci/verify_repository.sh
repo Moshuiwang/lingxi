@@ -16,7 +16,7 @@ done
 tracked_scripts=()
 while IFS= read -r script_path; do
   tracked_scripts+=("${script_path}")
-done < <(git ls-files 'scripts/*.sh')
+done < <(git ls-files 'scripts/*.sh' 'tests/*.sh')
 
 if ((${#tracked_scripts[@]} == 0)); then
   printf '没有找到受版本控制的 Bash 脚本。\n' >&2
@@ -31,6 +31,16 @@ printf 'ShellCheck：通过\n'
 
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
+
+if [[ -d tests ]]; then
+  PYTHONPATH=src python3 -m unittest discover -s tests -v
+  printf 'Python 自动测试：通过\n'
+fi
+
+if [[ -n "${LINGXI_POSTGRES_CONTAINER:-}" ]]; then
+  tests/test_identity_postgres.sh
+  printf 'PostgreSQL 自动测试：通过\n'
+fi
 
 whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
 if [[ -n "${whitespace_files}" ]]; then

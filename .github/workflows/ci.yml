@@ -21,6 +21,17 @@ jobs:
     name: CI / gate
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: lingxi_test
+        options: >-
+          --health-cmd "pg_isready -U postgres -d lingxi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: 检出代码
@@ -29,4 +40,6 @@ jobs:
           persist-credentials: false
 
       - name: 运行基础质量门禁
+        env:
+          LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: scripts/ci/verify_repository.sh
