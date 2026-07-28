@@ -10,11 +10,13 @@ psql_in_container() {
   docker exec "${container_name}" psql -q -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" "$@"
 }
 
-psql_in_container -c 'DROP TABLE IF EXISTS onboarding_progress CASCADE; DROP TABLE IF EXISTS inbound_event CASCADE; DROP TABLE IF EXISTS app_user CASCADE;'
+psql_in_container -c 'DROP TABLE IF EXISTS feishu_user_refresh_token CASCADE; DROP TABLE IF EXISTS onboarding_progress CASCADE; DROP TABLE IF EXISTS inbound_event CASCADE; DROP TABLE IF EXISTS app_user CASCADE;'
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
   < "${repository_root}/migrations/001_create_app_user.sql"
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
   < "${repository_root}/migrations/002_create_onboarding_progress.sql"
+docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
+  < "${repository_root}/migrations/003_create_feishu_user_refresh_token.sql"
 
 first_insert=$(psql_in_container -At -c "
   SELECT record_authorized_identity(
@@ -70,6 +72,51 @@ done
      AND column_name IN ('permission_record_id', 'permission_version', 'permission_checked_at');
 ")" == '0' ]] || {
   printf '身份切片不应预置权限记录字段。\n' >&2
+  exit 1
+}
+
+# #19 测试凭据库只允许一个密文续期凭据：不依赖 app_user，也不为短期令牌留字段。
+psql_in_container -c "
+  INSERT INTO feishu_user_refresh_token
+    (feishu_open_id, encrypted_refresh_token, scope, refresh_at, refresh_token_expires_at)
+  VALUES
+    ('ou_probe', decode('0102', 'hex'), 'offline_access', now() - interval '1 minute', now() + interval '1 hour');
+  INSERT INTO feishu_user_refresh_token
+    (feishu_open_id, encrypted_refresh_token, scope, refresh_at, refresh_token_expires_at)
+  VALUES
+    ('ou_probe', decode('0304', 'hex'), 'offline_access', now() + interval '10 minutes', now() + interval '2 hours')
+  ON CONFLICT (feishu_open_id) DO UPDATE SET
+    encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
+    refresh_at = EXCLUDED.refresh_at,
+    refresh_token_expires_at = EXCLUDED.refresh_token_expires_at;
+" >/dev/null
+
+[[ "$(psql_in_container -At -c "SELECT count(*) FROM feishu_user_refresh_token WHERE feishu_open_id = 'ou_probe';")" == '1' ]] || {
+  printf '测试续期凭据没有保持为唯一一条。\n' >&2
+  exit 1
+}
+
+[[ "$(psql_in_container -At -c "SELECT encode(encrypted_refresh_token, 'hex') FROM feishu_user_refresh_token WHERE feishu_open_id = 'ou_probe';")" == '0304' ]] || {
+  printf '测试续期凭据轮换没有替换旧密文。\n' >&2
+  exit 1
+}
+
+[[ "$(psql_in_container -At -c "
+  SELECT count(*)
+    FROM information_schema.columns
+   WHERE table_name = 'feishu_user_refresh_token'
+     AND column_name ~ '(access_token|authorization_code|client_secret|plain)';
+")" == '0' ]] || {
+  printf '测试续期凭据表不应保存短期令牌、授权码或明文字段。\n' >&2
+  exit 1
+}
+
+[[ "$(psql_in_container -At -c "
+  SELECT count(*)
+    FROM information_schema.table_constraints
+   WHERE table_name = 'feishu_user_refresh_token' AND constraint_type = 'FOREIGN KEY';
+")" == '0' ]] || {
+  printf '测试续期凭据不应依赖正式用户建档。\n' >&2
   exit 1
 }
 

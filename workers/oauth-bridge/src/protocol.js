@@ -54,8 +54,8 @@ export function debugDetails(payload) {
 
 export function callbackPage({ delivered, state }) {
   const message = delivered
-    ? "正在确认你的开通信息，请勿关闭此页面。"
-    : "开通连接已失效。请返回飞书，重新点击“开始使用”。";
+    ? "正在查询你的关联组织信息，请勿关闭此页面。"
+    : "查询连接已失效。请返回飞书，重新点击“开始使用”。";
   const bridgeScript = delivered ? `<script>
     const status = document.querySelector('#status');
     const result = new URL('/oauth/result', location.origin);
@@ -65,8 +65,8 @@ export function callbackPage({ delivered, state }) {
     socket.onmessage = ({data}) => {
       const outcome = JSON.parse(data);
       status.textContent = outcome.status === 'identity_confirmed'
-        ? '身份已确认，灵犀正在继续开通。'
-        : '本次开通未完成，请返回飞书重新开始。';
+        ? '组织信息查询完成，请查看下方资料可得性报告。'
+        : '本次组织信息查询未完成，请返回飞书重新开始。';
       if (outcome.debug_identity) {
         const debug = document.querySelector('#debug');
         const fields = ['open_id', 'user_id', 'union_id', 'name', 'department', 'tenant_key', 'locale'];
@@ -79,7 +79,7 @@ export function callbackPage({ delivered, state }) {
       }
       socket.close();
     };
-    socket.onerror = () => { status.textContent = '正在确认开通信息，请稍候或返回飞书查看进度。'; };
+    socket.onerror = () => { status.textContent = '正在查询组织信息，请稍候或返回飞书重新开始。'; };
   </script>` : "";
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>灵犀开通</title><body><p id="status">${message}</p><section id="debug-section" hidden><p><strong>仅供 Bot-Test 调试：请勿保存、转发或截图其中的身份资料。</strong></p><pre id="debug"></pre></section><section id="debug-details-section" hidden><h2>资料可得性报告</h2><pre id="debug-details"></pre></section><script>history.replaceState(null, '', location.pathname)</script>${bridgeScript}</body></html>`;
 }

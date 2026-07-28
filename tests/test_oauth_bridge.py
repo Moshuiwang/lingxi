@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from lingxi.adapters.oauth_bridge import LoadedOAuthIdentity, OAuthBridgeMessage, OAuthResultProcessor
+from lingxi.adapters.oauth_bridge import LoadedOAuthIdentity, OAuthBridgeMessage, OAuthResultProcessor, OAuthTokenGrant
 from lingxi.core.identity.onboarding import IdentityProfile, InMemoryOnboardingStore, OnboardingService
 
 
@@ -37,6 +37,16 @@ class FakeLoader:
         return LoadedOAuthIdentity(self.profile, self.debug_details)
 
 
+class FakeGrantLoader(FakeLoader):
+    def __init__(self, profile: IdentityProfile, grant: OAuthTokenGrant, debug_details: dict[str, object] | None = None) -> None:
+        super().__init__(profile, debug_details)
+        self.grant = grant
+
+    def from_authorization_code(self, code: str) -> LoadedOAuthIdentity:
+        self.codes.append(code)
+        return LoadedOAuthIdentity(self.profile, self.debug_details, self.grant)
+
+
 class FakeResultSender:
     def __init__(self) -> None:
         self.results: list[tuple[str, str]] = []
@@ -53,6 +63,14 @@ class FakeResultSender:
         self.results.append((state, status))
         self.debug_identities.append(debug_identity)
         self.debug_details.append(debug_details)
+
+
+class FakeRefreshVault:
+    def __init__(self) -> None:
+        self.saved: list[tuple[str, OAuthTokenGrant]] = []
+
+    def save(self, open_id: str, grant: OAuthTokenGrant) -> None:
+        self.saved.append((open_id, grant))
 
 
 class FailingLoader:
@@ -119,6 +137,74 @@ class OAuthResultProcessorTest(unittest.TestCase):
         self.assertNotIn("ou_expected", logs.output[0])
         self.assertNotIn("user_expected", logs.output[0])
         self.assertNotIn("union_expected", logs.output[0])
+
+    def test_timeline_log_records_stages_without_authorization_code_or_identity(self) -> None:
+        with self.assertLogs("lingxi.adapters.oauth_bridge", level="INFO") as logs:
+            self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        timeline = "\n".join(logs.output)
+        self.assertIn("authorization callback received", timeline)
+        self.assertIn("callback state claimed", timeline)
+        self.assertIn("authorized identity recorded", timeline)
+        self.assertIn("authorization completed", timeline)
+        self.assertNotIn("one-time-code", timeline)
+        self.assertNotIn("ou_expected", timeline)
+
+    def test_organization_probe_returns_result_without_creating_identity_or_storing_credential(self) -> None:
+        profile = IdentityProfile("ou_expected", "", "union_expected", "测试用户", None, None, None)
+        sender = FakeResultSender()
+        processor = OAuthResultProcessor(
+            self.state_store,
+            OnboardingService(self.identity_store),
+            FakeLoader(profile, {"所属组织": {"名字": "测试组织"}}),
+            sender,
+            "test-event-key",
+            organization_probe_only=True,
+            debug_identity_display=True,
+        )
+
+        processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertEqual(self.identity_store.user_count(), 0)
+        self.assertEqual(sender.results, [(self.state, "identity_confirmed")])
+        self.assertEqual(sender.debug_details, [{"所属组织": {"名字": "测试组织"}}])
+
+    def test_normal_authorization_saves_only_the_renewable_grant_after_identity_binding(self) -> None:
+        vault = FakeRefreshVault()
+        grant = OAuthTokenGrant("rotating-refresh-token", 604800, "offline_access")
+
+        processor = OAuthResultProcessor(
+            self.state_store,
+            OnboardingService(self.identity_store),
+            FakeGrantLoader(self.profile, grant),
+            self.sender,
+            "test-event-key",
+            token_vault=vault,
+        )
+        processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertEqual(vault.saved, [("ou_expected", grant)])
+
+    def test_probe_can_save_renewable_grant_without_creating_identity_record(self) -> None:
+        vault = FakeRefreshVault()
+        grant = OAuthTokenGrant("rotating-refresh-token", 604800, "offline_access")
+        profile = IdentityProfile("ou_expected", "", "union_expected", "测试用户", None, None, None)
+        processor = OAuthResultProcessor(
+            self.state_store,
+            OnboardingService(self.identity_store),
+            FakeGrantLoader(profile, grant, {"可见关联组织": {}}),
+            self.sender,
+            "test-event-key",
+            token_vault=vault,
+            organization_probe_only=True,
+            persist_probe_credential=True,
+        )
+
+        processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertEqual(self.identity_store.user_count(), 0)
+        self.assertEqual(vault.saved, [("ou_expected", grant)])
+        self.assertEqual(self.sender.results, [(self.state, "identity_confirmed")])
 
     def test_identity_values_are_only_returned_when_test_debug_is_explicitly_enabled(self) -> None:
         self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))

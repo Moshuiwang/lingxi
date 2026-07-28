@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from urllib.parse import parse_qs, urlparse
 
 from lingxi.adapters.feishu_onboarding import FeishuAuthorizationUrlFactory, FeishuOnboardingController, InMemoryCardProgressStore, IncomingPrivateMessage
 from lingxi.core.identity.onboarding import InMemoryOnboardingStore, OnboardingService
@@ -50,7 +51,20 @@ class FeishuOnboardingControllerTest(unittest.TestCase):
 
         self.assertEqual(card["header"]["title"]["content"], "准备开通")
         self.assertEqual(self.store.user_count(), 0)
+        self.assertIn("持续确认", card["body"]["elements"][0]["content"])
         self.assertIn("accounts.feishu.cn", card["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["default_url"])
+
+    def test_authorization_url_uses_official_authorization_code_parameters(self) -> None:
+        url = FeishuAuthorizationUrlFactory(
+            "cli_test", "https://stage.example.test/oauth/callback", "auth:user.id:read offline_access"
+        ).create("s" * 32)
+
+        query = parse_qs(urlparse(url).query)
+        self.assertEqual(query["client_id"], ["cli_test"])
+        self.assertEqual(query["response_type"], ["code"])
+        self.assertEqual(query["prompt"], ["consent"])
+        self.assertEqual(query["scope"], ["auth:user.id:read offline_access"])
+        self.assertEqual(query["state"], ["s" * 32])
 
     def test_repeated_start_keeps_the_original_authorization_link_valid(self) -> None:
         self.controller.receive_private_message(IncomingPrivateMessage("oc_test", "ou_test", "你好", "evt_start"))

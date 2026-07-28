@@ -10,6 +10,7 @@ import json
 import os
 import hashlib
 import hmac
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,9 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 
 from lingxi.core.identity.onboarding import OnboardingResponse, OnboardingService, ResponseKind
+
+
+logger = logging.getLogger(__name__)
 
 
 class CardSender(Protocol):
@@ -53,7 +57,14 @@ class FeishuAuthorizationUrlFactory:
 
     def create(self, state: str) -> str:
         return "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + urlencode(
-            {"client_id": self.app_id, "redirect_uri": self.redirect_uri, "state": state, "scope": self.scope}
+            {
+                "client_id": self.app_id,
+                "response_type": "code",
+                "redirect_uri": self.redirect_uri,
+                "state": state,
+                "scope": self.scope,
+                "prompt": "consent",
+            }
         )
 
 
@@ -114,7 +125,7 @@ class OnboardingCards:
     def authorization_required(authorization_url: str) -> dict[str, Any]:
         return OnboardingCards._card(
             title="准备开通",
-            content="你已确认开始使用。请点击下方按钮完成飞书授权；在授权完成前，灵犀不会创建用户记录。",
+            content="你已确认开始使用。请完成飞书授权，允许灵犀持续确认你的企业身份和部门；你可随时在飞书撤销授权。在授权完成前，灵犀不会创建用户记录。",
             actions=(OnboardingCards._link_button("去飞书授权", "primary", authorization_url),),
         )
 
@@ -167,21 +178,31 @@ class FeishuOnboardingController:
 
     def receive_private_message(self, message: IncomingPrivateMessage) -> None:
         if message.chat_type != "p2p" or message.message_type != "text":
+            logger.info("Onboarding timeline: ignored non-private or non-text message")
             return
         if not self._progress.claim_inbound_event(message.event_id):
+            logger.info("Onboarding timeline: ignored duplicate private message")
             return
+        logger.info("Onboarding timeline: private message accepted; selecting onboarding guidance")
         response = self._service.receive_message(message.sender_open_id, message.content)
         self._sender.send_card(message.chat_id, self._card_for(response, message.sender_open_id, message.chat_id))
+        logger.info("Onboarding timeline: guidance card sent")
 
     def receive_card_action(self, chat_id: str, open_id: str, action: str, nonce: str) -> dict[str, Any] | None:
         if not self._progress.valid(open_id, chat_id, nonce):
+            logger.info("Onboarding timeline: rejected expired or mismatched card action")
             return None
         if action == "decline":
+            logger.info("Onboarding timeline: user declined onboarding guidance")
             response = self._service.decline_guide(open_id)
             return self._card_for(response, open_id, chat_id)
         if action == "start":
+            logger.info("Onboarding timeline: user started authorization")
             response = self._service.confirm_start(open_id, "开始使用")
-            return self._card_for(response, open_id, chat_id)
+            card = self._card_for(response, open_id, chat_id)
+            logger.info("Onboarding timeline: authorization link prepared")
+            return card
+        logger.info("Onboarding timeline: rejected unrecognized card action")
         return None
 
     def _card_for(self, response: OnboardingResponse, open_id: str, chat_id: str) -> dict[str, Any]:
@@ -227,8 +248,12 @@ class LarkCardSender:
 
 
 def run_long_connection_bot() -> None:
-    """在 biai-stage 运行 Bot-Test 长连接。"""
+    """在 biai-stage 运行 Bot-Test 长连接；仅供受控验证，不是正式入口。"""
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     app_id = os.environ["FEISHU_APP_ID"]
     app_secret = os.environ["FEISHU_APP_SECRET"]
     import lark_oapi as lark
@@ -239,6 +264,7 @@ def run_long_connection_bot() -> None:
 
     from lingxi.adapters.postgres_onboarding import PostgresCardProgressStore
     from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthBridgeClient, OAuthResultProcessor
+    from lingxi.adapters.refresh_tokens import FeishuUserTokenRefresher, PostgresRefreshTokenVault
 
     dsn = os.environ.get("LINGXI_POSTGRES_DSN")
     state_key = os.environ.get("LINGXI_ONBOARDING_STATE_KEY")
@@ -246,23 +272,39 @@ def run_long_connection_bot() -> None:
     oauth_scope = os.environ.get("LINGXI_OAUTH_SCOPE")
     bridge_url = os.environ.get("LINGXI_OAUTH_BRIDGE_URL")
     bridge_token = os.environ.get("LINGXI_OAUTH_BRIDGE_TOKEN")
-    if not dsn or not state_key or not redirect_uri or not oauth_scope or not bridge_url or not bridge_token:
-        raise RuntimeError("Bot-Test 入口缺少 PostgreSQL 或安全授权回跳配置，不能安全启动")
+    refresh_token_key = os.environ.get("LINGXI_OAUTH_REFRESH_TOKEN_KEY")
+    organization_probe_only = os.environ.get("LINGXI_OAUTH_ORGANIZATION_PROBE_ONLY") == "enabled"
+    persist_probe_credential = os.environ.get("LINGXI_OAUTH_PERSIST_PROBE_CREDENTIAL") == "enabled"
+    target_tenant_key = os.environ.get("FEISHU_TARGET_TENANT_KEY")
+    if not dsn or not state_key or not redirect_uri or not oauth_scope or not bridge_url or not bridge_token or not refresh_token_key:
+        raise RuntimeError("Bot-Test 入口缺少 PostgreSQL、安全授权回跳或令牌密钥配置，不能安全启动")
+    if "offline_access" not in oauth_scope.split():
+        raise RuntimeError("Bot-Test 授权范围必须包含 offline_access，才能维持用户已同意的身份关联")
     debug_identity_display = os.environ.get("LINGXI_OAUTH_DEBUG_IDENTITY_DISPLAY") == "enabled"
     if debug_identity_display and urlparse(redirect_uri).netloc != "biai-test.chunbai.com":
         raise RuntimeError("身份资料页面调试只允许 biai-test 回跳地址")
+    if organization_probe_only and not debug_identity_display:
+        raise RuntimeError("组织信息探针只能在 Bot-Test 身份资料调试已启用时运行")
+    if persist_probe_credential and not organization_probe_only:
+        raise RuntimeError("续期凭据探针保存只能与组织信息探针一起启用")
     persistent_store = PostgresCardProgressStore(dsn, state_key)
+    token_vault = PostgresRefreshTokenVault(dsn, refresh_token_key)
+    token_refresher = FeishuUserTokenRefresher(token_vault, app_id, app_secret)
     bridge = OAuthBridgeClient(bridge_url, bridge_token)
     processor = OAuthResultProcessor(
         persistent_store,
         OnboardingService(persistent_store),
-        FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri, debug_identity_display=debug_identity_display),
+        FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri, debug_identity_display=debug_identity_display, target_tenant_key=target_tenant_key),
         bridge,
         state_key,
+        token_vault=token_vault,
+        organization_probe_only=organization_probe_only,
+        persist_probe_credential=persist_probe_credential,
         debug_identity_display=debug_identity_display,
     )
     bridge.set_processor(processor)
     bridge.start()
+    token_refresher.start()
     controller = FeishuOnboardingController(
         OnboardingService(persistent_store),
         LarkCardSender(app_id, app_secret),
@@ -302,7 +344,8 @@ def run_long_connection_bot() -> None:
         .register_p2_card_action_trigger(receive_action)
         .build()
     )
-    lark.ws.Client(app_id, app_secret, event_handler=event_handler, log_level=lark.LogLevel.INFO).start()
+    # 飞书 SDK 的 INFO 会输出连接临时参数；Lingxi 自己的无敏感时间线仍保持 INFO。
+    lark.ws.Client(app_id, app_secret, event_handler=event_handler, log_level=lark.LogLevel.WARNING).start()
 
 
 if __name__ == "__main__":

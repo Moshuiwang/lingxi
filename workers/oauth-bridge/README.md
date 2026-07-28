@@ -4,7 +4,9 @@
 
 ## 用户路径
 
-飞书浏览器 OAuth 回调到 `https://biai-test.chunbai.com/oauth/callback`。Worker 只将一次性结果即时转发给已认证的 `biai-stage` WebSocket；身份换取、校验和建档均留在 `biai-stage`。默认回调页面仅等待 `identity_confirmed` 或 `retry` 两种无身份结果，不显示或保存身份资料。
+飞书浏览器 OAuth 回调到 `https://biai-test.chunbai.com/oauth/callback`。Worker 只将一次性结果即时转发给已认证的 `biai-stage` WebSocket；身份换取、校验、建档和加密续期凭据保存均留在 `biai-stage`。默认回调页面仅等待 `identity_confirmed` 或 `retry` 两种无身份结果，不显示或保存身份资料或凭据。
+
+进行“用户身份组织查询”验收时，`LINGXI_OAUTH_ORGANIZATION_PROBE_ONLY=enabled` 使 Bot-Test 只校验“私聊人与授权人一致”，并在当前回调页显示该次用户身份可读取的组织资料；不创建用户记录。默认不保存凭据；只有产品负责人明确开启 `LINGXI_OAUTH_PERSIST_PROBE_CREDENTIAL=enabled` 后，才会加密保存可轮换的 `refresh_token`，短期 `user_access_token` 仍绝不保存。此开关不属于正式用户路径。
 
 受控调试时，只有以下两个条件同时成立，回调页才经**实时** WebSocket 显示本次得到的身份 ID，以及一份“资料可得性报告”：姓名、邮箱、手机、组织 ID/名称、按层级嵌套的部门 ID/名称、职务、职级和工作序列。报告会把未返回、无权限或不可见的项目明确标出：
 

@@ -53,7 +53,11 @@ jobs:
           npm test
           npm run check
 
+      - name: 安装 Bot-Test 凭据测试依赖
+        run: python3 -m pip install '.[feishu]'
+
       - name: 运行基础质量门禁
         env:
           LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          LINGXI_POSTGRES_DSN: postgresql://postgres@localhost:5432/lingxi_test
         run: scripts/ci/verify_repository.sh
