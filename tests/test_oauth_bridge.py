@@ -100,6 +100,15 @@ class OAuthResultProcessorTest(unittest.TestCase):
         self.assertNotIn("one-time-code", logs.output[0])
         self.assertNotIn("authorization code must never enter logs", logs.output[0])
 
+    def test_loaded_profile_records_only_three_id_presence(self) -> None:
+        with self.assertLogs("lingxi.adapters.oauth_bridge", level="INFO") as logs:
+            self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertIn("open_id=True user_id=True union_id=True", logs.output[0])
+        self.assertNotIn("ou_expected", logs.output[0])
+        self.assertNotIn("user_expected", logs.output[0])
+        self.assertNotIn("union_expected", logs.output[0])
+
     def test_malformed_messages_are_rejected_before_processing(self) -> None:
         with self.assertRaises(ValueError):
             OAuthBridgeMessage.parse('{"type":"oauth_code","state":"short","code":"x"}')

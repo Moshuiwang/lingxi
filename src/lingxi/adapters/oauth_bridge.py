@@ -116,6 +116,13 @@ class OAuthResultProcessor:
                 self._result_sender.send_result(message.state, "retry")
                 return
             profile = self._loader.from_authorization_code(message.code or "")
+            # 受控验收只确认字段是否可得；不记录任何身份标识原文。
+            logger.info(
+                "OAuth identity field presence: open_id=%s user_id=%s union_id=%s",
+                bool(profile.open_id),
+                bool(profile.user_id),
+                bool(profile.union_id),
+            )
             if not self._store.complete_authorizing_state(message.state, profile.open_id):
                 # 身份与原私聊人不能一一确认时，清除这次进度；不能留下不可恢复的“处理中”。
                 self._store.cancel_authorizing_state(message.state)
