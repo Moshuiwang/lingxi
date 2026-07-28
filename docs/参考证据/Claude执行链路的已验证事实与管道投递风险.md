@@ -48,7 +48,22 @@ self._process = await anyio.open_process(cmd, stdin=PIPE, stdout=PIPE, ...)
 
 因此，**Agent SDK 双向流式非 TTY 路径的正文与终止事件投递在该固定版本和端点组合下成立**。这不抹去前身项目 `-p` 模式的真实故障，也不证明所有未来版本或所有异常路径都不会回归；Lingxi 应保留终止事件缺失监控和禁止对已有副作用回合自动重放的安全边界。
 
-同次验证没有通过 Issue #23 的全部门禁：受控 Skill、`PreToolUse`、`PostToolUse` 和 `Stop` 已可采集，但 `PostToolUseFailure` 未被真实触发；[官方 Agent SDK Hook 参考](https://code.claude.com/docs/en/agent-sdk/hooks)显示当前 Python SDK 也不能采集另一类 `PermissionDenied` 事件。允许的只读 MCP 工具配置还没有阻止未明确禁用的 `CronCreate` 被执行。完整审计和严格工具边界仍待解决，不能把本节的投递结论扩大为“整个执行层已可开工”。
+同次验证还确认受控 Skill、`PreToolUse`、`PostToolUse` 和 `Stop` 可采集，但暴露了两个问题：`PostToolUseFailure` 全轮 0 次，以及允许的只读 MCP 工具配置没有阻止未明确禁用的 `CronCreate` 被执行。这两项由下一节的定向补测回答。
+
+## 已验证：审计采集与只读边界的机制可行，但必须由执行层自己实现
+
+2026-07-28 在同一环境执行 6 个回合的定向补测（`disallowed_tools` 完全为空，`PreToolUse` hook 为唯一屏障）：
+
+- **`PreToolUse` 返回拒绝是执行前的真阻止**。3 次非白名单调用（`Bash`、`Write`、`CronCreate`）全部被拒且均无 `PostToolUse`；文件副作用探针确认目标文件未被创建，`CronCreate` 被拒后 `session_crons` 为空、无 cron 文件残留。被拒回合仍取得非空正文和恰好一次终止结果，同回合内白名单工具照常执行。
+- **真实工具执行失败可以采集**。MCP 协议层 `isError=true` 与 MCP 进程调用中退出两种失败，2/2 触发 `PostToolUseFailure` 且 `PostToolUse` 为 0，回调带工具名、入参与错误文本。
+- **权限拒绝完全静默**。拒绝后 `PostToolUseFailure`、`PermissionDenied`、`PermissionRequest`、`PostToolUse` 均为 0。同批注册了 SDK 类型未声明的事件名并确认 CLI 会透传（`PostToolBatch` 实际触发 7 次），因此 0 次不是「没注册上」。拒绝在 SDK 消息流中仍可采集：每次拒绝产生一个 `is_error=True` 的工具结果块。
+
+由此得到两条对实现的硬约束：
+
+1. **审计链必须合成**。`PostToolUseFailure` 的语义是「工具抛错」，不是「用户没拿到结果」——被 MCP 包成正常响应的业务失败（如「指标不存在」）不会触发它。要审计用户实际是否拿到结果，必须额外解析工具回执内容；要审计拒绝，必须在自己的 `PreToolUse` 里记账。**不需要为此改用 TypeScript SDK。**
+2. **只读边界必须由执行层强制**：默认拒绝、只放行显式白名单，新增内置工具自动落入拒绝分支；不得依赖 `allowed_tools`、`disallowed_tools` 或提示词约束。
+
+一项副产品结论：**「配置一个不可达的 MCP server」不能用来构造工具执行失败**——不可达的 server 在初始化时状态为 `failed`，其工具根本不出现在工具清单里，模型无法调用。要构造真实执行失败，必须用能正常握手注册、仅在被调用时失败的 server。
 
 ## 若以后回归，可选的恢复方向
 
