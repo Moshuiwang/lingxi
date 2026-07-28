@@ -4,3 +4,8 @@
 
 # 本地临时产品资料，不进入版本库
 .tmp/
+
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
