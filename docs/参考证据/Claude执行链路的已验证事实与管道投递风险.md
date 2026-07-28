@@ -1,6 +1,6 @@
 # Claude 执行链路的已验证事实与管道投递风险
 
-> 来源：前身项目 [startimes-bi/bi-ai-agent#122](https://github.com/startimes-bi/bi-ai-agent/issues/122) 的验收记录、根因调研与生产复现，以及 Claude Agent SDK 默认 transport 的公开源码。
+> 来源：前身项目 [startimes-bi/bi-ai-agent#122](https://github.com/startimes-bi/bi-ai-agent/issues/122) 的验收记录、根因调研与生产复现，Lingxi [Issue #23](https://github.com/Moshuiwang/lingxi/issues/23) 在 `biai-stage` 的受控验证，以及 Claude Agent SDK 默认 transport 的公开源码。
 > 核对日期：2026-07-28。本文只保留对 Lingxi 执行层选型仍然有效的结论，不复制该 Issue 的过程讨论。
 
 ## 已验证成立：百炼兼容端点可以承载 Agent 会话
@@ -26,7 +26,7 @@
 
 上游 `anthropics/claude-code` 有跨版本、多次独立报告的同类现象：`--print --output-format stream-json` 在 stdout 被重定向为管道（非 TTY）时，可能在会话已内部完成的情况下始终不把终止事件写到 stdout。最小复现形式是 `claude -p "hello" | cat` 无输出而 `claude -p "hello"` 正常，指向 CLI 对 stdout 是否为 TTY 的检测与刷新路径。这些报告未见官方修复确认。
 
-## 尚未验证：Lingxi 选定的 Agent SDK 是否继承该缺陷
+## 已验证：Lingxi 选定的 Agent SDK 双向流式路径未复现该缺陷
 
 Lingxi 的执行层选型是 Python Claude Agent SDK。其默认 transport（`_internal/transport/subprocess_cli.py`）的公开源码显示，它同样以子进程方式拉起 `claude` CLI，并把 stdout 配置为管道：
 
@@ -36,13 +36,23 @@ cmd.extend(["--input-format", "stream-json"])
 self._process = await anyio.open_process(cmd, stdin=PIPE, stdout=PIPE, ...)
 ```
 
-即「改用 Agent SDK 而不是裸 CLI」并不改变触发条件——非 TTY 管道 stdout 是同一个。
+即「改用 Agent SDK 而不是裸 CLI」并不改变非 TTY 管道 stdout 这一触发条件，但 Agent SDK 使用的双向流式模式与前身项目及上游复现的 `-p` 一次性模式不同。
 
-**但存在一处未确认的差异，不得当作已知**：前身项目与上游复现用的都是 `-p` 一次性 print 模式，而 Agent SDK 用的是 `--input-format stream-json` 的双向流式模式。这两种模式是否共享同一刷新缺陷，目前没有证据，也不推测。这正是 Lingxi 开工门禁第一条要回答的问题。
+2026-07-28，Lingxi 在 `biai-stage` 使用 Python Claude Agent SDK `0.2.128`、SDK 自带 Claude Code CLI `2.1.220`、真实百炼兼容端点和真实只读 `bi-metric` MCP 完成 [Issue #23](https://github.com/Moshuiwang/lingxi/issues/23) 受控验证：
 
-## 若缺陷成立，可选的恢复方向
+- 先执行 1 个连通回合，再执行唯一一轮 39 个正式回合，未补跑或重跑；
+- 40/40 回合均取得非空最终正文和唯一终止结果；
+- 正式回合 39/39 的最终助手正文与终止结果长度、哈希一致，最长正文 13,049 字节；
+- 覆盖独立新会话、三条各 6 回合的 `resume`、两条交替恢复会话、长回答和多次真实 MCP 调用；
+- 未观察到正文为空、截断、跨会话串线或终止事件缺失。
 
-按可靠性排序，供门禁失败时评估，均未在 Lingxi 验证：
+因此，**Agent SDK 双向流式非 TTY 路径的正文与终止事件投递在该固定版本和端点组合下成立**。这不抹去前身项目 `-p` 模式的真实故障，也不证明所有未来版本或所有异常路径都不会回归；Lingxi 应保留终止事件缺失监控和禁止对已有副作用回合自动重放的安全边界。
+
+同次验证没有通过 Issue #23 的全部门禁：受控 Skill、`PreToolUse`、`PostToolUse` 和 `Stop` 已可采集，但 `PostToolUseFailure` 未被真实触发；[官方 Agent SDK Hook 参考](https://code.claude.com/docs/en/agent-sdk/hooks)显示当前 Python SDK 也不能采集另一类 `PermissionDenied` 事件。允许的只读 MCP 工具配置还没有阻止未明确禁用的 `CronCreate` 被执行。完整审计和严格工具边界仍待解决，不能把本节的投递结论扩大为“整个执行层已可开工”。
+
+## 若以后回归，可选的恢复方向
+
+按可靠性排序，供以后确认再次出现正文或终止事件丢失时评估，均未在 Lingxi 验证：
 
 1. **官方支持的补投**：`-p --resume <session-id> --output-format json` 向已有会话追加一次「只重述上次最终答案、禁用工具与 MCP」的请求，按结构化返回投递。这是官方文档写明的脚本消费接口，不依赖内部文件格式；代价是产生一次新的模型调用，不保证逐字一致。
 2. **伪终端包裹**：用 `script -qefc` 之类使 CLI 认为 stdout 连接的是 TTY，绕开该检测路径。需要评估终端控制字符带来的解析复杂度。
