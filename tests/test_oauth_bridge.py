@@ -44,6 +44,11 @@ class FakeResultSender:
         self.results.append((state, status))
 
 
+class FailingLoader:
+    def from_authorization_code(self, code: str) -> IdentityProfile:
+        raise RuntimeError("authorization code must never enter logs")
+
+
 class OAuthResultProcessorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.state = "s" * 32
@@ -81,6 +86,18 @@ class OAuthResultProcessorTest(unittest.TestCase):
         self.assertEqual(self.loader.codes, [])
         self.assertEqual(self.identity_store.user_count(), 0)
         self.assertEqual(self.sender.results, [(self.state, "retry")])
+
+    def test_failed_identity_load_records_only_the_failure_kind(self) -> None:
+        self.processor._loader = FailingLoader()
+
+        with self.assertLogs("lingxi.adapters.oauth_bridge", level="WARNING") as logs:
+            self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertEqual(self.identity_store.user_count(), 0)
+        self.assertEqual(self.sender.results, [(self.state, "retry")])
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertNotIn("one-time-code", logs.output[0])
+        self.assertNotIn("authorization code must never enter logs", logs.output[0])
 
     def test_malformed_messages_are_rejected_before_processing(self) -> None:
         with self.assertRaises(ValueError):

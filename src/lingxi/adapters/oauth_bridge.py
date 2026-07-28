@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import threading
 import time
@@ -17,6 +18,9 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from lingxi.core.identity.onboarding import IdentityProfile, OnboardingService
+
+
+logger = logging.getLogger(__name__)
 
 
 class AuthorizationStateStore(Protocol):
@@ -117,8 +121,10 @@ class OAuthResultProcessor:
                 return
             event_id = "oauth:" + hmac.new(self._event_key, (message.code or "").encode(), hashlib.sha256).hexdigest()
             self._service.authorization_succeeded(event_id, profile)
-        except Exception:
+        except Exception as error:
             # 无论外部授权失败、资料不完整或连接异常，都不把细节暴露给用户。
+            # 仅记录异常类别，便于受控验收定位；绝不记录 code、令牌或身份资料。
+            logger.warning("OAuth identity load failed: %s", type(error).__name__)
             self._store.cancel_authorizing_state(message.state)
             self._result_sender.send_result(message.state, "retry")
             return
