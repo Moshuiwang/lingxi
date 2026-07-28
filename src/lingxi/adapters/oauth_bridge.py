@@ -34,7 +34,7 @@ class IdentityLoader(Protocol):
 
 
 class OAuthBridgeResultSender(Protocol):
-    def send_result(self, state: str, status: str) -> None: ...
+    def send_result(self, state: str, status: str, debug_identity: dict[str, str | None] | None = None) -> None: ...
 
 
 class FeishuOAuthIdentityLoader:
@@ -98,12 +98,35 @@ class OAuthBridgeMessage:
 class OAuthResultProcessor:
     """每次结果都先验证原用户绑定，再允许建立身份。"""
 
-    def __init__(self, store: AuthorizationStateStore, service: OnboardingService, loader: IdentityLoader, result_sender: OAuthBridgeResultSender, event_key: str) -> None:
+    def __init__(
+        self,
+        store: AuthorizationStateStore,
+        service: OnboardingService,
+        loader: IdentityLoader,
+        result_sender: OAuthBridgeResultSender,
+        event_key: str,
+        debug_identity_display: bool = False,
+    ) -> None:
         self._store = store
         self._service = service
         self._loader = loader
         self._result_sender = result_sender
         self._event_key = event_key.encode()
+        self._debug_identity_display = debug_identity_display
+
+    def _debug_identity(self, profile: IdentityProfile) -> dict[str, str | None] | None:
+        if not self._debug_identity_display:
+            return None
+        # 仅供 biai-test 的实时页面调试：不写日志、不入库，且不包含授权码或令牌。
+        return {
+            "open_id": profile.open_id or None,
+            "user_id": profile.user_id or None,
+            "union_id": profile.union_id or None,
+            "name": profile.display_name or None,
+            "department": profile.department,
+            "tenant_key": profile.tenant_key,
+            "locale": profile.display_name_locale,
+        }
 
     def process(self, message: OAuthBridgeMessage) -> None:
         if message.type == "oauth_cancelled":
@@ -123,10 +146,11 @@ class OAuthResultProcessor:
                 bool(profile.user_id),
                 bool(profile.union_id),
             )
+            debug_identity = self._debug_identity(profile)
             if not self._store.complete_authorizing_state(message.state, profile.open_id):
                 # 身份与原私聊人不能一一确认时，清除这次进度；不能留下不可恢复的“处理中”。
                 self._store.cancel_authorizing_state(message.state)
-                self._result_sender.send_result(message.state, "retry")
+                self._result_sender.send_result(message.state, "retry", debug_identity)
                 return
             event_id = "oauth:" + hmac.new(self._event_key, (message.code or "").encode(), hashlib.sha256).hexdigest()
             self._service.authorization_succeeded(event_id, profile)
@@ -137,7 +161,7 @@ class OAuthResultProcessor:
             self._store.cancel_authorizing_state(message.state)
             self._result_sender.send_result(message.state, "retry")
             return
-        self._result_sender.send_result(message.state, "identity_confirmed")
+        self._result_sender.send_result(message.state, "identity_confirmed", debug_identity)
 
 
 class OAuthBridgeClient:
@@ -180,11 +204,14 @@ class OAuthBridgeClient:
             finally:
                 self._socket = None
 
-    def send_result(self, state: str, status: str) -> None:
+    def send_result(self, state: str, status: str, debug_identity: dict[str, str | None] | None = None) -> None:
         socket = self._socket
         if socket is None:
             return
-        socket.send(json.dumps({"type": "oauth_result", "state": state, "status": status}))
+        payload: dict[str, object] = {"type": "oauth_result", "state": state, "status": status}
+        if debug_identity is not None:
+            payload["debug_identity"] = debug_identity
+        socket.send(json.dumps(payload))
 
     def stop(self) -> None:
         self._stop.set()

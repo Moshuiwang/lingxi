@@ -14,7 +14,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from lingxi.core.identity.onboarding import OnboardingResponse, OnboardingService, ResponseKind
 
@@ -248,6 +248,9 @@ def run_long_connection_bot() -> None:
     bridge_token = os.environ.get("LINGXI_OAUTH_BRIDGE_TOKEN")
     if not dsn or not state_key or not redirect_uri or not oauth_scope or not bridge_url or not bridge_token:
         raise RuntimeError("Bot-Test 入口缺少 PostgreSQL 或安全授权回跳配置，不能安全启动")
+    debug_identity_display = os.environ.get("LINGXI_OAUTH_DEBUG_IDENTITY_DISPLAY") == "enabled"
+    if debug_identity_display and urlparse(redirect_uri).netloc != "biai-test.chunbai.com":
+        raise RuntimeError("身份资料页面调试只允许 biai-test 回跳地址")
     persistent_store = PostgresCardProgressStore(dsn, state_key)
     bridge = OAuthBridgeClient(bridge_url, bridge_token)
     processor = OAuthResultProcessor(
@@ -256,6 +259,7 @@ def run_long_connection_bot() -> None:
         FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri),
         bridge,
         state_key,
+        debug_identity_display=debug_identity_display,
     )
     bridge.set_processor(processor)
     bridge.start()

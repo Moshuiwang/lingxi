@@ -24,6 +24,20 @@ export function callbackPayload(url) {
   return code ? { type: "oauth_code", state, code } : { type: "oauth_cancelled", state };
 }
 
+function debugValue(value) {
+  return value === null || typeof value === "string" ? value : null;
+}
+
+export function debugIdentity(payload) {
+  const value = payload?.debug_identity;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const fields = ["open_id", "user_id", "union_id", "name", "department", "tenant_key", "locale"];
+  if (Object.keys(value).length !== fields.length || !fields.every((field) => Object.hasOwn(value, field))) return null;
+  const identity = Object.fromEntries(fields.map((field) => [field, debugValue(value[field])]));
+  if (Object.values(identity).some((field) => field !== null && field.length > 512)) return null;
+  return identity;
+}
+
 export function callbackPage({ delivered, state }) {
   const message = delivered
     ? "正在确认你的开通信息，请勿关闭此页面。"
@@ -39,9 +53,15 @@ export function callbackPage({ delivered, state }) {
       status.textContent = outcome.status === 'identity_confirmed'
         ? '身份已确认，灵犀正在继续开通。'
         : '本次开通未完成，请返回飞书重新开始。';
+      if (outcome.debug_identity) {
+        const debug = document.querySelector('#debug');
+        const fields = ['open_id', 'user_id', 'union_id', 'name', 'department', 'tenant_key', 'locale'];
+        debug.textContent = fields.map((field) => field + ': ' + (outcome.debug_identity[field] || '（未返回）')).join('\\n');
+        document.querySelector('#debug-section').hidden = false;
+      }
       socket.close();
     };
     socket.onerror = () => { status.textContent = '正在确认开通信息，请稍候或返回飞书查看进度。'; };
   </script>` : "";
-  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>灵犀开通</title><body><p id="status">${message}</p><script>history.replaceState(null, '', location.pathname)</script>${bridgeScript}</body></html>`;
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>灵犀开通</title><body><p id="status">${message}</p><section id="debug-section" hidden><p><strong>仅供 Bot-Test 调试：请勿保存、转发或截图其中的身份资料。</strong></p><pre id="debug"></pre></section><script>history.replaceState(null, '', location.pathname)</script>${bridgeScript}</body></html>`;
 }

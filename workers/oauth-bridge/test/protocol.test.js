@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callbackPage, callbackPayload, hasValidOAuthCallback } from "../src/protocol.js";
+import { callbackPage, callbackPayload, debugIdentity, hasValidOAuthCallback } from "../src/protocol.js";
 import { callbackResponse } from "../src/worker.js";
 
 const state = "s".repeat(32);
@@ -26,4 +26,15 @@ test("callback page removes the authorization query from browser history", () =>
 
 test("callback page may open its same-origin result notification channel", () => {
   assert.match(callbackResponse(true, state).headers.get("Content-Security-Policy"), /connect-src 'self'/);
+});
+
+test("debug identity must have the complete, bounded test-only field set", () => {
+  const identity = {
+    open_id: "ou_test", user_id: null, union_id: "on_test", name: "测试用户",
+    department: null, tenant_key: "tenant", locale: "zh_cn"
+  };
+  assert.deepEqual(debugIdentity({ debug_identity: identity }), identity);
+  assert.equal(debugIdentity({ debug_identity: { open_id: "ou_test" } }), null);
+  assert.equal(debugIdentity({ debug_identity: { ...identity, name: "x".repeat(513) } }), null);
+  assert.match(callbackPage({ delivered: true, state }), /仅供 Bot-Test 调试/);
 });

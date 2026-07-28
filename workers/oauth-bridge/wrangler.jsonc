@@ -4,6 +4,9 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-07-27",
   "workers_dev": false,
+  "vars": {
+    "DEBUG_IDENTITY_DISPLAY": "enabled"
+  },
   "routes": [
     {
       "pattern": "biai-test.chunbai.com/oauth/*",

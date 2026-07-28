@@ -39,9 +39,11 @@ class FakeLoader:
 class FakeResultSender:
     def __init__(self) -> None:
         self.results: list[tuple[str, str]] = []
+        self.debug_identities: list[dict[str, str | None] | None] = []
 
-    def send_result(self, state: str, status: str) -> None:
+    def send_result(self, state: str, status: str, debug_identity: dict[str, str | None] | None = None) -> None:
         self.results.append((state, status))
+        self.debug_identities.append(debug_identity)
 
 
 class FailingLoader:
@@ -108,6 +110,31 @@ class OAuthResultProcessorTest(unittest.TestCase):
         self.assertNotIn("ou_expected", logs.output[0])
         self.assertNotIn("user_expected", logs.output[0])
         self.assertNotIn("union_expected", logs.output[0])
+
+    def test_identity_values_are_only_returned_when_test_debug_is_explicitly_enabled(self) -> None:
+        self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+        self.assertEqual(self.sender.debug_identities, [None])
+
+        debug_sender = FakeResultSender()
+        processor = OAuthResultProcessor(
+            self.state_store,
+            OnboardingService(InMemoryOnboardingStore()),
+            self.loader,
+            debug_sender,
+            "test-event-key",
+            debug_identity_display=True,
+        )
+        processor.process(OAuthBridgeMessage("oauth_code", self.state, "another-one-time-code"))
+
+        self.assertEqual(debug_sender.debug_identities, [{
+            "open_id": "ou_expected",
+            "user_id": "user_expected",
+            "union_id": "union_expected",
+            "name": "测试用户",
+            "department": None,
+            "tenant_key": None,
+            "locale": None,
+        }])
 
     def test_malformed_messages_are_rejected_before_processing(self) -> None:
         with self.assertRaises(ValueError):
