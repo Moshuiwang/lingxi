@@ -10,12 +10,12 @@ function unauthorized() {
   return new Response("unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
 }
 
-function callbackResponse(delivered, state) {
+export function callbackResponse(delivered, state) {
   return new Response(callbackPage({ delivered, state }), {
     status: delivered ? 200 : 409,
     headers: {
       "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'",
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'",
       "Content-Type": "text/html; charset=utf-8",
       "Referrer-Policy": "no-referrer"
     }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { callbackPage, callbackPayload, hasValidOAuthCallback } from "../src/protocol.js";
+import { callbackResponse } from "../src/worker.js";
 
 const state = "s".repeat(32);
 
@@ -21,4 +22,8 @@ test("callback page removes the authorization query from browser history", () =>
   assert.match(callbackPage({ delivered: true, state }), /history\.replaceState/);
   assert.match(callbackPage({ delivered: true, state }), /\/oauth\/result/);
   assert.match(callbackPage({ delivered: false, state }), /重新点击/);
+});
+
+test("callback page may open its same-origin result notification channel", () => {
+  assert.match(callbackResponse(true, state).headers.get("Content-Security-Policy"), /connect-src 'self'/);
 });
