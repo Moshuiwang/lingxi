@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from lingxi.adapters.oauth_bridge import OAuthBridgeMessage, OAuthResultProcessor
+from lingxi.adapters.oauth_bridge import LoadedOAuthIdentity, OAuthBridgeMessage, OAuthResultProcessor
 from lingxi.core.identity.onboarding import IdentityProfile, InMemoryOnboardingStore, OnboardingService
 
 
@@ -27,27 +27,36 @@ class FakeStateStore:
 
 
 class FakeLoader:
-    def __init__(self, profile: IdentityProfile) -> None:
+    def __init__(self, profile: IdentityProfile, debug_details: dict[str, object] | None = None) -> None:
         self.profile = profile
+        self.debug_details = debug_details
         self.codes: list[str] = []
 
-    def from_authorization_code(self, code: str) -> IdentityProfile:
+    def from_authorization_code(self, code: str) -> LoadedOAuthIdentity:
         self.codes.append(code)
-        return self.profile
+        return LoadedOAuthIdentity(self.profile, self.debug_details)
 
 
 class FakeResultSender:
     def __init__(self) -> None:
         self.results: list[tuple[str, str]] = []
         self.debug_identities: list[dict[str, str | None] | None] = []
+        self.debug_details: list[dict[str, object] | None] = []
 
-    def send_result(self, state: str, status: str, debug_identity: dict[str, str | None] | None = None) -> None:
+    def send_result(
+        self,
+        state: str,
+        status: str,
+        debug_identity: dict[str, str | None] | None = None,
+        debug_details: dict[str, object] | None = None,
+    ) -> None:
         self.results.append((state, status))
         self.debug_identities.append(debug_identity)
+        self.debug_details.append(debug_details)
 
 
 class FailingLoader:
-    def from_authorization_code(self, code: str) -> IdentityProfile:
+    def from_authorization_code(self, code: str) -> LoadedOAuthIdentity:
         raise RuntimeError("authorization code must never enter logs")
 
 
@@ -114,6 +123,7 @@ class OAuthResultProcessorTest(unittest.TestCase):
     def test_identity_values_are_only_returned_when_test_debug_is_explicitly_enabled(self) -> None:
         self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
         self.assertEqual(self.sender.debug_identities, [None])
+        self.assertEqual(self.sender.debug_details, [None])
 
         debug_sender = FakeResultSender()
         processor = OAuthResultProcessor(
@@ -135,6 +145,22 @@ class OAuthResultProcessorTest(unittest.TestCase):
             "tenant_key": None,
             "locale": None,
         }])
+
+    def test_test_debug_forwards_only_the_explicit_identity_report(self) -> None:
+        report = {"所属部门": [{"id": "od-child", "name": "子部门", "children": []}]}
+        sender = FakeResultSender()
+        processor = OAuthResultProcessor(
+            self.state_store,
+            OnboardingService(InMemoryOnboardingStore()),
+            FakeLoader(self.profile, report),
+            sender,
+            "test-event-key",
+            debug_identity_display=True,
+        )
+
+        processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
+
+        self.assertEqual(sender.debug_details, [report])
 
     def test_malformed_messages_are_rejected_before_processing(self) -> None:
         with self.assertRaises(ValueError):

@@ -6,7 +6,7 @@
 
 飞书浏览器 OAuth 回调到 `https://biai-test.chunbai.com/oauth/callback`。Worker 只将一次性结果即时转发给已认证的 `biai-stage` WebSocket；身份换取、校验和建档均留在 `biai-stage`。默认回调页面仅等待 `identity_confirmed` 或 `retry` 两种无身份结果，不显示或保存身份资料。
 
-受控调试时，只有以下两个条件同时成立，回调页才经**实时** WebSocket 显示本次得到的 `open_id`、`user_id`、`union_id`、姓名、部门、租户和语言：
+受控调试时，只有以下两个条件同时成立，回调页才经**实时** WebSocket 显示本次得到的身份 ID，以及一份“资料可得性报告”：姓名、邮箱、手机、组织 ID/名称、按层级嵌套的部门 ID/名称、职务、职级和工作序列。报告会把未返回、无权限或不可见的项目明确标出：
 
 1. Bot-Test 环境变量 `LINGXI_OAUTH_DEBUG_IDENTITY_DISPLAY=enabled`，且回跳域名严格为 `biai-test.chunbai.com`；
 2. 测试 Worker 的 `DEBUG_IDENTITY_DISPLAY=enabled`。

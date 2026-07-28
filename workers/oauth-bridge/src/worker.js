@@ -1,4 +1,4 @@
-import { BRIDGE_PATH, CALLBACK_PATH, DELIVERY_PATH, RESULT_PATH, callbackPage, callbackPayload, debugIdentity, hasValidOAuthCallback, isOpaqueState } from "./protocol.js";
+import { BRIDGE_PATH, CALLBACK_PATH, DELIVERY_PATH, RESULT_PATH, callbackPage, callbackPayload, debugDetails, debugIdentity, hasValidOAuthCallback, isOpaqueState } from "./protocol.js";
 
 const BRIDGE_NAME = "bot-test";
 const OUTCOME_TTL_MS = 5 * 60 * 1000;
@@ -145,7 +145,13 @@ export class OAuthBridge {
         return;
       }
       const identity = envDebugIdentityAllowed(this.env) ? debugIdentity(outcome) : null;
-      const payload = JSON.stringify({ type: "oauth_result", status: outcome.status, ...(identity ? { debug_identity: identity } : {}) });
+      const details = envDebugIdentityAllowed(this.env) ? debugDetails(outcome) : null;
+      const payload = JSON.stringify({
+        type: "oauth_result",
+        status: outcome.status,
+        ...(identity ? { debug_identity: identity } : {}),
+        ...(details ? { debug_details: details } : {}),
+      });
       const browsers = this.state.getWebSockets(`browser:${outcome.state}`);
       if (browsers.length === 0) {
         // 身份资料只经实时浏览器连接展示，绝不写入 Durable Object 存储。

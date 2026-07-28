@@ -256,7 +256,7 @@ def run_long_connection_bot() -> None:
     processor = OAuthResultProcessor(
         persistent_store,
         OnboardingService(persistent_store),
-        FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri),
+        FeishuOAuthIdentityLoader(app_id, app_secret, redirect_uri, debug_identity_display=debug_identity_display),
         bridge,
         state_key,
         debug_identity_display=debug_identity_display,

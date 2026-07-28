@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callbackPage, callbackPayload, debugIdentity, hasValidOAuthCallback } from "../src/protocol.js";
+import { callbackPage, callbackPayload, debugDetails, debugIdentity, hasValidOAuthCallback } from "../src/protocol.js";
 import { callbackResponse } from "../src/worker.js";
 
 const state = "s".repeat(32);
@@ -37,4 +37,11 @@ test("debug identity must have the complete, bounded test-only field set", () =>
   assert.equal(debugIdentity({ debug_identity: { open_id: "ou_test" } }), null);
   assert.equal(debugIdentity({ debug_identity: { ...identity, name: "x".repeat(513) } }), null);
   assert.match(callbackPage({ delivered: true, state }), /仅供 Bot-Test 调试/);
+});
+
+test("debug report is bounded and keeps nested department paths", () => {
+  const report = { 所属部门: [{ id: "od-child", name: "子部门", children: [{ id: "od-parent", name: "父部门", children: [] }] }] };
+  assert.deepEqual(debugDetails({ debug_details: report }), report);
+  assert.equal(debugDetails({ debug_details: { tooLong: "x".repeat(513) } }), null);
+  assert.match(callbackPage({ delivered: true, state }), /资料可得性报告/);
 });
