@@ -117,6 +117,8 @@ class OAuthResultProcessor:
                 return
             profile = self._loader.from_authorization_code(message.code or "")
             if not self._store.complete_authorizing_state(message.state, profile.open_id):
+                # 身份与原私聊人不能一一确认时，清除这次进度；不能留下不可恢复的“处理中”。
+                self._store.cancel_authorizing_state(message.state)
                 self._result_sender.send_result(message.state, "retry")
                 return
             event_id = "oauth:" + hmac.new(self._event_key, (message.code or "").encode(), hashlib.sha256).hexdigest()

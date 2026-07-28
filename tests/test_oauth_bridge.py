@@ -71,6 +71,7 @@ class OAuthResultProcessorTest(unittest.TestCase):
 
         self.assertEqual(self.identity_store.user_count(), 0)
         self.assertEqual(self.sender.results, [(self.state, "retry")])
+        self.assertEqual(self.state_store.cancelled, [self.state])
 
     def test_replayed_state_never_exchanges_the_authorization_code(self) -> None:
         self.state_store.claimed = False
