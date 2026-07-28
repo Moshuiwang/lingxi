@@ -117,7 +117,7 @@ class OAuthResultProcessor:
                 return
             profile = self._loader.from_authorization_code(message.code or "")
             # 受控验收只确认字段是否可得；不记录任何身份标识原文。
-            logger.info(
+            logger.warning(
                 "OAuth identity field presence: open_id=%s user_id=%s union_id=%s",
                 bool(profile.open_id),
                 bool(profile.user_id),

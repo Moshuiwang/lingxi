@@ -101,7 +101,7 @@ class OAuthResultProcessorTest(unittest.TestCase):
         self.assertNotIn("authorization code must never enter logs", logs.output[0])
 
     def test_loaded_profile_records_only_three_id_presence(self) -> None:
-        with self.assertLogs("lingxi.adapters.oauth_bridge", level="INFO") as logs:
+        with self.assertLogs("lingxi.adapters.oauth_bridge", level="WARNING") as logs:
             self.processor.process(OAuthBridgeMessage("oauth_code", self.state, "one-time-code"))
 
         self.assertIn("open_id=True user_id=True union_id=True", logs.output[0])
