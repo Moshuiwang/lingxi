@@ -27,6 +27,10 @@ jobs:
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: lingxi_test
+        # 凭据测试经 TCP 连接 localhost:5432，必须把服务端口发布到 runner；
+        # 只用 docker exec 的表结构测试不依赖它。
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d lingxi_test"
           --health-interval 5s
