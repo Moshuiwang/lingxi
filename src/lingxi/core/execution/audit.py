@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
-from .tool_policy import DenyReasonCode, PolicyVerdict
+from .tool_policy import DenyReasonCode, PolicyVerdict, is_well_formed_tool_name
 
 # 前缀 [A-Za-z0-9_-]* 是为了盖住 access_key / x-auth-token / apiKey 这类变体。
 # 这套模式是**尽力而为**的兜底，不是完备保证：无键名上下文的裸 token 盖不住。
@@ -48,6 +48,18 @@ _SECRET_ASSIGNMENT = re.compile(
 _SECRET_SCHEME = re.compile(r"\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}", re.IGNORECASE)
 _MAX_KEPT_TEXT = 200
 _MAX_KEPT_ERROR_TEXT = 2000
+
+# 产品合同要求「不在审计中保存凭据、完整令牌」，这是绝对措辞，靠认键名做不到——
+# 没有键名上下文的裸令牌永远盖不住。因此对自由文本再加一道**与键名无关的长度上界**。
+#
+# 判定条件（见 _mask_token_runs）：16 字符以上且**含数字**的连串，或 32 字符以上的
+# 任意连串。含数字这一条是为了区分随机令牌和 `SIMULATED_UPSTREAM_FAILURE` 这类
+# 全字母错误码——后者是有诊断价值的审计事实，抹掉它等于用可读性换一个假的安全感。
+#
+# 这个上界的**边界要说清楚**：它对随机生成的令牌是结构性的（长度 ≥16 的随机
+# 字母数字串几乎必然含数字），但对纯字母且短于 32 字符的秘密无效——那一类由
+# AuditRedactor 的字段白名单与键名脱敏承担。两道合起来才构成合同要求的保证。
+_TOKEN_RUN = re.compile(r"[A-Za-z0-9+/=_-]{16,}")
 
 
 class ToolResultKind(str, Enum):
@@ -175,7 +187,9 @@ class AuditRedactor:
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, str) and len(value) <= _MAX_KEPT_TEXT:
-            return value
+            # 字段进了白名单**不代表它的值可以原样落库**：白名单管的是"记不记这个
+            # 字段"，值里混进凭据是另一回事，必须单独过一道。
+            return _redact_free_text(value)
         return _digest(value)
 
 
@@ -365,9 +379,10 @@ class TurnAudit:
     ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "tool_use_id": tool_use_id,
-            # 畸形工具名会把模型可控的原文带进来（判定层截断但不脱敏），
-            # 这是一条模型可控文本直达持久记录的路径，必须在落库前兜一道。
-            "tool_name": _redact_secrets(tool_name),
+            # 合法工具名（`mcp__bi-metric__list_metrics` 这种）是必须原样保留的
+            # 审计事实，不能被长串抹除吃掉；畸形工具名则是模型可控的任意文本，
+            # 按自由文本处理。
+            "tool_name": tool_name if is_well_formed_tool_name(tool_name) else _redact_free_text(tool_name),
             "tool_input": self._redactor.redact(tool_input),
             "allowed": allowed,
             "deny_reason_code": None,
@@ -434,18 +449,18 @@ def classify_tool_result(content: Any, *, is_error: Any = None, rules: ResultRul
 def _classify_structured(parsed: Any, rules: ResultRules) -> ToolResultKind | None:
     if not isinstance(parsed, Mapping):
         if isinstance(parsed, Sequence) and not isinstance(parsed, (str, bytes)):
-            return ToolResultKind.EMPTY_RESULT if len(parsed) == 0 else ToolResultKind.OK
+            if len(parsed) == 0:
+                return ToolResultKind.EMPTY_RESULT
+            # 非空数组**不等于**成功：`[{"error": ...}]`、`[{"success": false}]`
+            # 都是非空数组。先按失败规则查元素，查不出就是未知，不判 OK——
+            # 顶层数组没有可识别的成功结构，"没报错"不能当成"拿到了结果"。
+            for element in parsed:
+                if isinstance(element, Mapping) and _failure_in_mapping(element, rules):
+                    return ToolResultKind.BUSINESS_FAILURE
+            return ToolResultKind.UNCLASSIFIED
         return None
-    for key in rules.failure_keys:
-        if key in parsed and parsed[key]:
-            return ToolResultKind.BUSINESS_FAILURE
-    for key in rules.truthy_success_keys:
-        if key in parsed and parsed[key] is False:
-            return ToolResultKind.BUSINESS_FAILURE
-    for key in rules.status_keys:
-        value = parsed.get(key)
-        if isinstance(value, str) and value.lower() in rules.failure_status_values:
-            return ToolResultKind.BUSINESS_FAILURE
+    if _failure_in_mapping(parsed, rules):
+        return ToolResultKind.BUSINESS_FAILURE
     seen_collection = False
     for key in rules.empty_collection_keys:
         value = parsed.get(key)
@@ -454,6 +469,22 @@ def _classify_structured(parsed: Any, rules: ResultRules) -> ToolResultKind | No
                 return ToolResultKind.OK
             seen_collection = True
     return ToolResultKind.EMPTY_RESULT if seen_collection else None
+
+
+def _failure_in_mapping(parsed: Mapping[str, Any], rules: ResultRules) -> bool:
+    """按显式登记的失败规则判断一个映射是否表示业务失败。"""
+
+    for key in rules.failure_keys:
+        if key in parsed and parsed[key]:
+            return True
+    for key in rules.truthy_success_keys:
+        if key in parsed and parsed[key] is False:
+            return True
+    for key in rules.status_keys:
+        value = parsed.get(key)
+        if isinstance(value, str) and value.lower() in rules.failure_status_values:
+            return True
+    return False
 
 
 def _coerce(content: Any) -> tuple[str, Any]:
@@ -508,7 +539,24 @@ def _digest(value: Any) -> dict[str, Any]:
 
 def _error_text(error: Any) -> str:
     text = error if isinstance(error, str) else _dump(error)
-    return _redact_secrets(text)[:_MAX_KEPT_ERROR_TEXT]
+    return _redact_free_text(text)[:_MAX_KEPT_ERROR_TEXT]
+
+
+def _redact_free_text(text: str) -> str:
+    """自由文本（错误原文、回执正文、畸形工具名）的脱敏。
+
+    比 :func:`_redact_secrets` 多一道长串抹除，用来兑现合同里「不保存完整令牌」
+    的绝对要求——键名匹配是尽力而为，长度上界是结构性的。
+    """
+
+    return _TOKEN_RUN.sub(_mask_token_run, _redact_secrets(text))
+
+
+def _mask_token_run(match: re.Match[str]) -> str:
+    run = match.group(0)
+    if any(char.isdigit() for char in run) or len(run) >= 32:
+        return f"[REDACTED:{len(run)}字符]"
+    return run
 
 
 def _redact_secrets(text: str) -> str:

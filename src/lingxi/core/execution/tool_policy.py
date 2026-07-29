@@ -18,6 +18,17 @@ from typing import Any, Mapping
 _VALID_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 
 
+def is_well_formed_tool_name(tool_name: object) -> bool:
+    """工具名是否是合法标识符形态。
+
+    审计侧用它区分两种情况：合法工具名（如 ``mcp__bi-metric__list_metrics``）
+    是必须原样保留的审计事实；畸形工具名则是模型可控的任意文本，要按自由文本
+    脱敏。
+    """
+
+    return isinstance(tool_name, str) and _VALID_TOOL_NAME.fullmatch(tool_name) is not None
+
+
 class ToolDecision(str, Enum):
     ALLOW = "allow"
     DENY = "deny"

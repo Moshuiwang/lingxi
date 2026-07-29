@@ -67,8 +67,10 @@ jobs:
           # 声明的下限，两边漂移会被发现。
           python-version: '3.12'
 
-      - name: 安装 Bot-Test 凭据测试依赖
-        run: python3 -m pip install '.[feishu]'
+      # shellcheck 此前用的是 runner 镜像自带的版本，既没锁定也没打印：同一个提交
+      # 可能因为镜像更新得到不同结论。改用 pip 分发并锁版本，本机可装同一个。
+      - name: 安装 Bot-Test 凭据测试依赖与锁定版本的 shellcheck
+        run: python3 -m pip install '.[feishu]' 'shellcheck-py==0.11.0.1'
 
       # 测试跑 PYTHONPATH=src，部署跑 pip 装出来的制品；新增子目录会让两者分叉，
       # 而分叉只在部署时才暴露。必须在仓库目录之外跑，否则只是又测了一遍源码树。
@@ -76,8 +78,26 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: python3 "${GITHUB_WORKSPACE}/scripts/ci/check_installed_package.py"
 
+      # 桩模块只能证明本侧形状没变，证明不了真实 SDK 装得上、HookMatcher 签名兼容。
+      # 这一步不调用模型、不使用任何业务凭据，只构造 hooks 配置。
+      - name: 真实 Agent SDK 冒烟（不调模型、不用凭据）
+        run: |
+          python3 -m pip install '.[agent]'
+          python3 "${GITHUB_WORKSPACE}/scripts/ci/check_agent_sdk_binding.py"
+
       - name: 运行基础质量门禁
         env:
           LINGXI_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           LINGXI_POSTGRES_DSN: postgresql://postgres@localhost:5432/lingxi_test
         run: scripts/ci/verify_repository.sh
+
+      # 安装与测试都在检出目录里跑。生成物已被 .gitignore 覆盖，但受版本控制的
+      # 文件若被改写，此前不会有任何人发现——CI 仍会全绿。
+      - name: 校验 CI 没有改写受版本控制的文件
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo 'CI 过程改写了工作树：' >&2
+            git status --porcelain >&2
+            exit 1
+          fi
+          echo '工作树洁净：CI 未改写受版本控制的文件'

@@ -518,6 +518,26 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
 
         self.assertIs(classify_tool_result('{"data": [], "rows": []}'), ToolResultKind.EMPTY_RESULT)
 
+    def test_non_empty_top_level_array_is_not_success_by_itself(self) -> None:
+        """顶层数组非空**不等于**用户拿到了结果。
+
+        反例来自 Codex 只读审核（PR #36）：原实现对任何非空顶层数组直接判 OK，
+        于是 `[{"error": ...}]` 和 `[{"success": false}]` 都成了"成功"。这是
+        字典路径上那个坑的数组版本，我第一次只修了字典。
+        """
+
+        cases = {
+            '[{"error":"metric not found"}]': ToolResultKind.BUSINESS_FAILURE,
+            '[{"success":false}]': ToolResultKind.BUSINESS_FAILURE,
+            '[{"status":"failed"}]': ToolResultKind.BUSINESS_FAILURE,
+            '["查询失败，请稍后重试"]': ToolResultKind.UNCLASSIFIED,
+            '[{"metric":"收视率"}]': ToolResultKind.UNCLASSIFIED,
+            "[]": ToolResultKind.EMPTY_RESULT,
+        }
+        for payload, expected in cases.items():
+            with self.subTest(payload=payload):
+                self.assertIs(classify_tool_result(payload), expected)
+
     def test_registered_collection_keys_are_declared_as_an_ordered_sequence(self) -> None:
         """字段本身也不能退回 set：那样默认规则的遍历顺序又会随进程变化。"""
 
@@ -612,6 +632,81 @@ class DecisionSurvivesAuditFailureTest(unittest.TestCase):
 
         self.assertEqual(deny_decision(result), "deny")
         self.assertEqual(len(gateway.audit.summary().calls), 1)
+
+
+class CredentialsNeverReachTheAuditTest(unittest.TestCase):
+    """产品合同：不在审计中保存凭据、完整令牌。这是绝对要求，不是尽力而为。
+
+    认键名永远盖不住没有键名上下文的裸令牌，所以自由文本另加一道**结构性上界**：
+    16 字符以上的令牌字符连串一律抹掉。反例来自 Codex 只读审核（PR #36）。
+    """
+
+    def test_whitelisted_field_values_are_not_stored_verbatim(self) -> None:
+        """字段进白名单只决定"记不记这个字段"，不代表它的值可以原样落库。"""
+
+        redactor = AuditRedactor(allowed_input_fields=("metric",))
+
+        recorded = redactor.redact({"metric": "sk-live-abcdef1234567890XYZ"})
+
+        self.assertNotIn("sk-live-abcdef1234567890XYZ", str(recorded))
+
+    def test_bare_token_without_any_key_context_is_masked(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+        asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUseFailure",
+                    "tool_name": "mcp__bi-metric__list_metrics",
+                    "tool_use_id": "t1",
+                    "error": "upstream rejected sk-live-abcdef1234567890XYZ",
+                }
+            )
+        )
+
+        recorded = gateway.audit.summary().calls[0].error or ""
+
+        self.assertNotIn("sk-live-abcdef1234567890XYZ", recorded)
+        self.assertIn("upstream rejected", recorded, "脱敏不该把可诊断信息一起吃掉")
+
+    def test_ungated_result_body_is_masked_too(self) -> None:
+        audit = TurnAudit()
+        audit.record_tool_result(
+            tool_use_id="orphan",
+            content="blocked: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            is_error=True,
+        )
+
+        recorded = audit.summary().ungated_calls[0].error or ""
+
+        self.assertNotIn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", recorded)
+
+    def test_legitimate_mcp_tool_names_survive_intact(self) -> None:
+        """脱敏不得吃掉合法工具名——那是必须保留的审计事实。
+
+        用带数字的版本化工具名，因为它**会**命中长串规则：不带数字的名字
+        本来就不会被抹，用它做断言等于什么都没测（变异验证时发现的）。
+        """
+
+        policy = ToolPolicy(allowed_tools=("mcp__bi_metric__list_metrics_v2",))
+        gateway = ToolGateway(policy=policy, audit=TurnAudit())
+        pre_tool_use(gateway, "mcp__bi_metric__list_metrics_v2", {}, tool_use_id="t1")
+
+        self.assertEqual(gateway.audit.summary().calls[0].tool_name, "mcp__bi_metric__list_metrics_v2")
+
+    def test_useful_error_wording_survives(self) -> None:
+        """L4a 靠这段原文才发现规则层拦截；脱敏不能把它抹没。"""
+
+        audit = TurnAudit()
+        audit.record_tool_result(
+            tool_use_id="orphan",
+            content="Error: No such tool available: Write. Write exists but is not enabled in this context.",
+            is_error=True,
+        )
+
+        recorded = audit.summary().ungated_calls[0].error or ""
+
+        self.assertIn("No such tool available: Write", recorded)
 
 
 class MalformedToolNameRedactionTest(unittest.TestCase):

@@ -1,6 +1,0 @@
-
-[feishu]
-cryptography<46,>=42
-lark-oapi==1.7.1
-psycopg[binary]<4,>=3.2
-websockets<16,>=15

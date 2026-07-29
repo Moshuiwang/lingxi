@@ -10,3 +10,9 @@ __pycache__/
 .venv/
 node_modules/
 .claude/worktrees/
+
+# Python 打包与构建产物：在仓库根目录跑 pip install 会生成它们，
+# 一旦提交就会出现两份源码与陈旧的打包元数据。
+build/
+dist/
+*.egg-info/

@@ -43,7 +43,10 @@ bash -n "${tracked_scripts[@]}"
 printf 'Bash 语法：通过\n'
 
 shellcheck --severity=warning "${tracked_scripts[@]}"
-printf 'ShellCheck：通过\n'
+# 打印版本：本机与 CI 装了不同版本的 linter，是一种不会报错的分歧。
+# CI 用 pip 锁定 shellcheck-py==0.11.0.1，本机请装同一个：
+#   python3 -m pip install 'shellcheck-py==0.11.0.1'
+printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^version: //p')"
 
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
