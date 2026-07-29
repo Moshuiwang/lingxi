@@ -340,11 +340,50 @@ class UngatedCallAuditTest(unittest.TestCase):
         self.assertIs(ungated.result_kind, ToolResultKind.TOOL_ERROR)
         self.assertIn("not enabled in this context", ungated.error or "")
 
-    def test_successful_results_without_a_matching_record_do_not_invent_audit_rows(self) -> None:
+    def test_successful_but_ungated_calls_are_recorded_instead_of_silently_dropped(self) -> None:
+        """执行成功却没经过本层判定，是屏障失效的信号，必须留痕。
+
+        原实现只给失败回执建记录，成功的直接丢弃——于是"绕过了判定但跑成功了"
+        这种最危险的情况恰好隐身，审计还会反过来断言这个回合没有任何工具调用。
+        """
+
         audit = TurnAudit()
         audit.record_tool_result(tool_use_id="toolu_unknown", content='{"data": [{"value": 1}]}')
 
-        self.assertEqual(audit.summary().calls, ())
+        summary = audit.summary()
+
+        self.assertEqual(len(summary.ungated_calls), 1)
+        self.assertIsNot(summary.user_result, UserResultStatus.NO_TOOL_CALL)
+        self.assertIsNone(summary.ungated_calls[0].error, "成功回执不留业务数据正文")
+
+    def test_executed_tool_without_any_decision_is_recorded_as_ungated(self) -> None:
+        """PostToolUse 找不到判定记录 = 有工具绕过了屏障并真的执行了。"""
+
+        gateway = build_gateway()
+        asyncio.run(
+            gateway.on_hook_event(
+                {"hook_event_name": "PostToolUse", "tool_name": "Write", "tool_use_id": "toolu_bypass"}
+            )
+        )
+
+        summary = gateway.audit.summary()
+
+        self.assertEqual(len(summary.ungated_calls), 1)
+        self.assertEqual(summary.ungated_calls[0].tool_name, "Write")
+        self.assertTrue(summary.ungated_calls[0].executed)
+        self.assertIsNot(summary.user_result, UserResultStatus.NO_TOOL_CALL)
+
+    def test_unknown_hook_event_name_carrying_a_tool_leaves_a_trace(self) -> None:
+        """SDK 改事件名会让判定分支静默失效；本层挡不住，但必须看得见。"""
+
+        gateway = build_gateway()
+        asyncio.run(
+            gateway.on_hook_event(
+                {"hook_event_name": "PreToolUseV2", "tool_name": "Write", "tool_input": {}}
+            )
+        )
+
+        self.assertEqual(len(gateway.audit.summary().ungated_calls), 1)
 
     def test_a_turn_whose_only_failure_was_ungated_is_not_reported_as_denied_by_us(self) -> None:
         gateway = build_gateway()
@@ -429,6 +468,145 @@ class BusinessFailureAuditTest(unittest.TestCase):
         audit.record_terminal_result()
 
         self.assertIs(audit.summary().user_result, UserResultStatus.NO_TOOL_CALL)
+
+
+class ParsableButUnrecognisedResultTest(unittest.TestCase):
+    """V-执行-06 的否定断言：能解析成 JSON **不等于**用户拿到了结果。
+
+    原实现在结构化规则没命中时直接返回 OK，于是
+    ``{"message": "查询失败，请稍后重试"}`` 被判成成功——正是这条断言要防的错误。
+    MCP 回执绝大多数是 JSON，所以这不是边角情况，是主路径。
+    """
+
+    def test_json_payload_without_recognisable_data_is_unknown_not_ok(self) -> None:
+        for payload in (
+            '{"message": "查询失败，请稍后重试"}',
+            '{"count": 0}',
+            '{"detail": {"reason": "unavailable"}}',
+        ):
+            with self.subTest(payload=payload):
+                self.assertIs(classify_tool_result(payload), ToolResultKind.UNCLASSIFIED)
+
+    def test_registered_failure_wording_is_not_short_circuited_by_a_json_array(self) -> None:
+        rules = ResultRules(failure_text_markers=("指标不存在",))
+
+        self.assertIs(
+            classify_tool_result('["指标不存在，请确认指标名称。"]', rules=rules),
+            ToolResultKind.BUSINESS_FAILURE,
+        )
+
+    def test_non_empty_recognised_collection_is_still_ok(self) -> None:
+        self.assertIs(classify_tool_result('{"data": [{"metric": "收视率"}]}'), ToolResultKind.OK)
+
+    def test_classification_does_not_depend_on_set_iteration_order(self) -> None:
+        """多个登记集合同时出现时，分类不得随 str hash 随机化在进程之间翻转。"""
+
+        self.assertIs(classify_tool_result('{"data": [], "items": [1]}'), ToolResultKind.OK)
+        self.assertIs(classify_tool_result('{"rows": [1], "results": []}'), ToolResultKind.OK)
+        self.assertIs(classify_tool_result('{"data": [], "rows": []}'), ToolResultKind.EMPTY_RESULT)
+
+
+class AmbiguousAttributionTest(unittest.TestCase):
+    """回执认不出属于哪一次调用时，宁可另记一条，也不猜。"""
+
+    def test_failure_without_id_is_not_pinned_onto_one_of_two_same_named_calls(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t2")
+        asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUseFailure",
+                    "tool_name": "mcp__bi-metric__list_metrics",
+                    "error": "boom",
+                }
+            )
+        )
+
+        summary = gateway.audit.summary()
+        gated = [call for call in summary.calls if call.gated]
+
+        self.assertTrue(all(call.error is None for call in gated), "不得把错误挂到某一次放行调用上")
+        self.assertEqual(len(summary.ungated_calls), 1)
+        self.assertEqual(summary.ungated_calls[0].error, "boom")
+
+    def test_single_pending_call_still_matches_by_name(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+        asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUseFailure",
+                    "tool_name": "mcp__bi-metric__list_metrics",
+                    "error": "boom",
+                }
+            )
+        )
+
+        summary = gateway.audit.summary()
+
+        self.assertEqual(summary.ungated_calls, ())
+        self.assertEqual(summary.calls[0].error, "boom")
+
+
+class TurnBoundaryTest(unittest.TestCase):
+    """``ClaudeAgentOptions.hooks`` 是会话级的，一个会话跑多个回合。"""
+
+    def test_second_turn_does_not_inherit_the_first_turns_terminal_result(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+        gateway.audit.record_final_text("第一回合")
+        gateway.audit.record_terminal_result()
+        self.assertTrue(gateway.audit.summary().terminal_ok)
+
+        gateway.audit.start_turn()
+        gateway.audit.record_final_text("第二回合")
+        gateway.audit.record_terminal_result()
+
+        summary = gateway.audit.summary()
+
+        self.assertEqual(summary.terminal_result_count, 1)
+        self.assertTrue(summary.terminal_ok, "不翻页的话第二回合起 terminal_ok 会恒为假")
+        self.assertEqual(summary.calls, (), "上一回合的调用不得混进本回合的结论")
+
+
+class DecisionSurvivesAuditFailureTest(unittest.TestCase):
+    """记账处理的是模型可控的入参；它出错不得把拒绝一起带走。"""
+
+    def test_deny_is_still_returned_when_bookkeeping_raises(self) -> None:
+        class ExplodingAudit(TurnAudit):
+            def record_decision(self, **_: object) -> None:
+                raise RuntimeError("SIMULATED_AUDIT_FAULT: controlled test fault probe")
+
+        gateway = ToolGateway(policy=build_policy(), audit=ExplodingAudit())
+
+        result = pre_tool_use(gateway, "Write", {"file_path": "/tmp/x"})
+
+        self.assertEqual(deny_decision(result), "deny")
+        self.assertEqual(len(gateway.audit.summary().calls), 1, "明细丢了也要留下一条痕迹")
+
+    def test_deeply_nested_model_controlled_input_does_not_break_the_gate(self) -> None:
+        payload: object = "leaf"
+        for _ in range(30000):
+            payload = {"metric": payload}
+
+        result = pre_tool_use(gateway := build_gateway(), "Write", {"metric": payload})
+
+        self.assertEqual(deny_decision(result), "deny")
+        self.assertEqual(len(gateway.audit.summary().calls), 1)
+
+
+class MalformedToolNameRedactionTest(unittest.TestCase):
+    """畸形工具名是模型可控文本直达持久记录的一条路径。"""
+
+    def test_credentials_in_a_malformed_tool_name_do_not_reach_the_audit(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "Bash access_key=sk-live-DO-NOT-LEAK", {})
+
+        recorded = gateway.audit.summary().calls[0].tool_name
+
+        self.assertNotIn("sk-live-DO-NOT-LEAK", recorded)
+        self.assertIn("[REDACTED]", recorded)
 
 
 if __name__ == "__main__":

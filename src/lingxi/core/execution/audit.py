@@ -30,7 +30,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .tool_policy import DenyReasonCode, PolicyVerdict
 
-_SECRET_WORDS = r"token|secret|password|authorization|api[_-]?key|credential|auth"
+# 前缀 [A-Za-z0-9_-]* 是为了盖住 access_key / x-auth-token / apiKey 这类变体。
+# 这套模式是**尽力而为**的兜底，不是完备保证：无键名上下文的裸 token 盖不住。
+# 结构化入参靠 AuditRedactor 的字段白名单（默认拒绝）保证，这里只兜非结构化正文。
+_SECRET_WORDS = (
+    r"[A-Za-z0-9_-]*"
+    r"(?:token|secret|password|passwd|pwd|authorization|auth|key|credential|cookie|session|signature)"
+)
 _SECRET_KEY = re.compile(rf"({_SECRET_WORDS})", re.IGNORECASE)
 # 错误原文来自工具回执，不经过入参那套字段白名单，因此这里按赋值形态兜底脱敏，
 # 保证 V-审计-03（审计明细中不出现凭据、完整令牌）在错误路径上同样成立。
@@ -76,11 +82,15 @@ class ResultRules:
     truthy_success_keys: frozenset[str] = frozenset({"ok", "success"})
     status_keys: frozenset[str] = frozenset({"status", "state"})
     failure_status_values: frozenset[str] = frozenset({"error", "failed", "failure"})
-    empty_collection_keys: frozenset[str] = frozenset({"data", "rows", "items", "results"})
+    # 用 tuple 而不是 frozenset：命中多个键时若按集合迭代顺序取第一个，
+    # 分类结果会随 str hash 随机化在进程之间翻转（同一份回执给出不同审计结论）。
+    # 判定改成与顺序无关：任一登记集合非空即 OK，全部为空才是 EMPTY_RESULT。
+    empty_collection_keys: tuple[str, ...] = ("data", "rows", "items", "results")
     failure_text_markers: tuple[str, ...] = ()
 
 
 UNGATED_TOOL_NAME = "<未经执行层判定>"
+AUDIT_FAULT_TOOL_NAME = "<审计记账失败>"
 
 
 @dataclass(frozen=True)
@@ -178,6 +188,16 @@ class TurnAudit:
     def __init__(self, *, rules: ResultRules | None = None, redactor: AuditRedactor | None = None) -> None:
         self._rules = rules or ResultRules()
         self._redactor = redactor or AuditRedactor()
+        self.start_turn()
+
+    def start_turn(self) -> None:
+        """清空累积状态，开始记录新的一个回合。
+
+        ``ClaudeAgentOptions.hooks`` 是**会话级**的，一个会话会跑多个回合。若不翻页，
+        ``terminal_result_count`` 从第二回合起必然大于 1、``terminal_ok`` 恒为假，
+        ``user_result`` 也会把多个回合的调用混在一起判。调用方每开一个回合必须先调本方法。
+        """
+
         self._calls: list[dict[str, Any]] = []
         self._by_tool_use_id: dict[str, dict[str, Any]] = {}
         self._final_text: str = ""
@@ -204,12 +224,45 @@ class TurnAudit:
         record["deny_reason_code"] = verdict.reason_code
         record["deny_reason_text"] = verdict.model_reason if verdict.denied else None
 
+    def record_audit_fault(self, *, tool_name: str, tool_use_id: str | None) -> None:
+        """记账本身失败时的最后一道留痕：不做脱敏、不碰入参，只保证不再抛异常。
+
+        判定结果此时已经算出并会照常返回，所以这条记录只说明"这次调用的明细丢了"，
+        不说明它被放行还是被拒绝——因此记为本层未判定。
+        """
+
+        self._calls.append(
+            {
+                "tool_use_id": tool_use_id,
+                "tool_name": AUDIT_FAULT_TOOL_NAME,
+                "tool_input": {},
+                "allowed": None,
+                "deny_reason_code": None,
+                "deny_reason_text": None,
+                "executed": False,
+                "error": f"审计记账失败，明细丢失（工具名长度 {len(tool_name)}）",
+                "result_kind": ToolResultKind.UNCLASSIFIED,
+            }
+        )
+
     def record_executed(self, *, tool_name: str, tool_use_id: str | None) -> None:
-        """记录 ``PostToolUse``：工具确实执行完毕（不代表业务上成功）。"""
+        """记录 ``PostToolUse``：工具确实执行完毕（不代表业务上成功）。
+
+        找不到对应判定记录时**不丢弃**，补一条"本层未判定"的记录。否则一次真实
+        执行成功、却绕过了本层判定的调用会完全不留痕，审计还会反过来断言这个回合
+        "没有任何工具调用"——那是一条假的否定结论。屏障失效（hook 注册失败、超时、
+        事件名变更）恰恰就落在这条路径上，必须可检出。
+        """
 
         record = self._locate(tool_use_id, tool_name)
-        if record is not None:
-            record["executed"] = True
+        if record is None:
+            record = self._new_record(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                tool_input=None,
+                allowed=None,
+            )
+        record["executed"] = True
 
     def record_failure(
         self,
@@ -245,15 +298,16 @@ class TurnAudit:
         kind = classify_tool_result(content, is_error=is_error, rules=self._rules)
         record = self._locate(tool_use_id, None)
         if record is None:
-            if kind is ToolResultKind.OK:
-                return kind
             record = self._new_record(
                 tool_use_id=tool_use_id,
                 tool_name=UNGATED_TOOL_NAME,
                 tool_input=None,
                 allowed=None,
             )
-            record["error"] = _error_text(_coerce(content)[0])
+            # 成功的回执同样建记录：只记失败会让"执行了但没经过本层判定"这种
+            # 最危险的情况恰好隐身。错误正文只在失败时留存，成功回执不留业务数据。
+            if kind is not ToolResultKind.OK:
+                record["error"] = _error_text(_coerce(content)[0])
         if record["result_kind"] is not ToolResultKind.TOOL_ERROR:
             record["result_kind"] = kind
         return kind
@@ -311,7 +365,9 @@ class TurnAudit:
     ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "tool_use_id": tool_use_id,
-            "tool_name": tool_name,
+            # 畸形工具名会把模型可控的原文带进来（判定层截断但不脱敏），
+            # 这是一条模型可控文本直达持久记录的路径，必须在落库前兜一道。
+            "tool_name": _redact_secrets(tool_name),
             "tool_input": self._redactor.redact(tool_input),
             "allowed": allowed,
             "deny_reason_code": None,
@@ -326,14 +382,23 @@ class TurnAudit:
         return record
 
     def _locate(self, tool_use_id: str | None, tool_name: str | None) -> dict[str, Any] | None:
+        """按 ``tool_use_id`` 精确定位；没有 id 时只在**无歧义**的情况下按工具名回退。
+
+        回退曾经取"最后一条同名放行记录"，同名调用并行时必然挂错：成功的那次被标成
+        失败，真正失败的那次留空，回合结论还会从 NOT_OBTAINED 被拉成 UNKNOWN。
+        现在候选多于一条就不猜，返回 ``None`` 让调用方另建一条未判定记录。
+        """
+
         if tool_use_id and tool_use_id in self._by_tool_use_id:
             return self._by_tool_use_id[tool_use_id]
         if tool_name is None:
             return None
-        for record in reversed(self._calls):
-            if record["tool_name"] == tool_name and record["allowed"] is True:
-                return record
-        return None
+        candidates = [
+            record
+            for record in self._calls
+            if record["tool_name"] == tool_name and record["allowed"] is True and record["result_kind"] is None
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
 
 def classify_tool_result(content: Any, *, is_error: Any = None, rules: ResultRules | None = None) -> ToolResultKind:
@@ -349,15 +414,18 @@ def classify_tool_result(content: Any, *, is_error: Any = None, rules: ResultRul
         return ToolResultKind.TOOL_ERROR
 
     text, parsed = _coerce(content)
-    if parsed is not None:
-        structured = _classify_structured(parsed, rules)
-        if structured is not None:
-            return structured
+    # 已登记的失败措辞先判：否则被包在 JSON 数组或对象里的失败措辞会被
+    # 结构化规则短路成 OK。
     for marker in rules.failure_text_markers:
         if marker and marker in text:
             return ToolResultKind.BUSINESS_FAILURE
     if parsed is not None:
-        return ToolResultKind.OK
+        structured = _classify_structured(parsed, rules)
+        if structured is not None:
+            return structured
+        # 能解析成 JSON **不等于**用户拿到了结果。既没命中失败规则、也拿不出
+        # 可识别的非空数据集合时记为未知，由调用方决定，不得当作已送达。
+        return ToolResultKind.UNCLASSIFIED
     if text.strip():
         return ToolResultKind.UNCLASSIFIED
     return ToolResultKind.EMPTY_RESULT
@@ -378,11 +446,14 @@ def _classify_structured(parsed: Any, rules: ResultRules) -> ToolResultKind | No
         value = parsed.get(key)
         if isinstance(value, str) and value.lower() in rules.failure_status_values:
             return ToolResultKind.BUSINESS_FAILURE
+    seen_collection = False
     for key in rules.empty_collection_keys:
         value = parsed.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return ToolResultKind.EMPTY_RESULT if len(value) == 0 else ToolResultKind.OK
-    return None
+            if len(value) > 0:
+                return ToolResultKind.OK
+            seen_collection = True
+    return ToolResultKind.EMPTY_RESULT if seen_collection else None
 
 
 def _coerce(content: Any) -> tuple[str, Any]:
@@ -418,10 +489,15 @@ def _try_json(text: str) -> Any:
 
 
 def _dump(value: Any) -> str:
+    # 入参由模型控制，深度嵌套会让 json.dumps 抛 RecursionError；这里必须兜住，
+    # 否则记账异常会沿 PreToolUse 回调向上抛，把拒绝响应一起带走。
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        return str(value)
+    except (TypeError, ValueError, RecursionError):
+        try:
+            return str(value)
+        except Exception:  # noqa: BLE001 - 审计取值绝不能反过来打断判定
+            return "<unrepresentable>"
 
 
 def _digest(value: Any) -> dict[str, Any]:

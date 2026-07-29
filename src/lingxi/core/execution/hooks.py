@@ -27,6 +27,10 @@ OBSERVATION_ONLY_EVENTS: tuple[str, ...] = (
     "PermissionDenied",
 )
 
+# 认得的事件名全集。收到不在这里、却带着 tool_name 的事件，说明 SDK/CLI 改了
+# 事件名——那种情况下判定分支会静默失效，必须在审计里留痕而不是当作无事发生。
+KNOWN_EVENTS: frozenset[str] = frozenset(HOOK_EVENTS) | frozenset(OBSERVATION_ONLY_EVENTS)
+
 
 class ToolGateway:
     """执行层的唯一工具判定入口。
@@ -68,22 +72,34 @@ class ToolGateway:
                 tool_use_id=call_id,
                 error=hook_input.get("error"),
             )
+        elif event == "Stop":
+            self._audit.record_terminal_result()
+        elif event not in KNOWN_EVENTS and isinstance(tool_name, str):
+            # 认不出的事件名 + 带工具名 = 判定分支已经失效。本层挡不住（没有别的
+            # 手段），但绝不能连痕迹都不留。
+            self._audit.record_executed(tool_name=tool_name, tool_use_id=call_id)
         return {}
 
     def _on_pre_tool_use(self, tool_name: Any, tool_input: Any, call_id: str | None) -> dict[str, Any]:
         verdict = self._policy.decide(tool_name, tool_input if isinstance(tool_input, Mapping) else None)
-        self._audit.record_decision(
-            tool_name=verdict.tool_name,
-            tool_input=tool_input,
-            tool_use_id=call_id,
-            verdict=verdict,
-        )
-        if not verdict.denied:
-            return {}
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": verdict.model_reason,
+        # 先把响应算出来，再记账：记账处理的是模型可控的入参，一旦它抛异常，
+        # 异常会沿 hook 回调向上抛，把这次拒绝一起带走。审计可以失败，拒绝不能。
+        response: dict[str, Any] = {}
+        if verdict.denied:
+            response = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": verdict.model_reason,
+                }
             }
-        }
+        try:
+            self._audit.record_decision(
+                tool_name=verdict.tool_name,
+                tool_input=tool_input,
+                tool_use_id=call_id,
+                verdict=verdict,
+            )
+        except Exception:  # noqa: BLE001 - 见上：审计失败不得降级为放行
+            self._audit.record_audit_fault(tool_name=verdict.tool_name, tool_use_id=call_id)
+        return response
