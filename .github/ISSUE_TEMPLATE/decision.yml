@@ -20,7 +20,7 @@ body:
     id: options
     attributes:
       label: 候选方案及影响
-      description: 说明用户体验、外部依赖、安全、成本或可维护性影响；不要由代理擅自选定。
+      description: 逐个方案说明用户体验、外部依赖、安全影响，以及代码变动面、架构变动（接口 / 数据库）、测试与部署成本、可逆性。只写可核对的事实，“可不可承受”由产品负责人判断；不要由代理擅自选定。
     validations:
       required: true
   - type: textarea
