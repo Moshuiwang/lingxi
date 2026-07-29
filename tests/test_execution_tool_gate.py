@@ -240,6 +240,21 @@ class ToolFailureAuditTest(unittest.TestCase):
         self.assertEqual(recorded["authorization"], "[REDACTED]")
         self.assertEqual(recorded["new_field"], {"omitted": True})
 
+    def test_v_shenji_03_a_credential_used_as_a_field_name_does_not_survive(self) -> None:
+        """字段名同样是模型可控文本：只记 `omitted` 不代表键名不会落库。"""
+
+        gateway = build_gateway()
+        pre_tool_use(
+            gateway,
+            "mcp__bi-metric__describe_metric",
+            {"sk-live-abcdef1234567890XYZ": "x", "metric": "收视率"},
+        )
+
+        recorded = gateway.audit.summary().calls[0].tool_input
+
+        self.assertNotIn("sk-live-abcdef1234567890XYZ", " ".join(recorded))
+        self.assertIn("metric", recorded, "合法字段名不受影响")
+
     def test_v_shenji_03_credentials_inside_error_text_are_redacted_too(self) -> None:
         """V-审计-03 的否定断言：错误原文不经字段白名单，仍不得落下凭据。"""
 
@@ -374,7 +389,12 @@ class UngatedCallAuditTest(unittest.TestCase):
         self.assertIsNot(summary.user_result, UserResultStatus.NO_TOOL_CALL)
 
     def test_unknown_hook_event_name_carrying_a_tool_leaves_a_trace(self) -> None:
-        """SDK 改事件名会让判定分支静默失效；本层挡不住，但必须看得见。"""
+        """认不出的事件名带着工具名回调进来时必须留痕，不得当作无事发生。
+
+        **本用例不证明"SDK 改名会被发现"**：真的改名时我们注册的那个名字压根不会
+        再被调用，本分支进不去。它只覆盖「SDK 用认不出的名字回调我们已注册的
+        matcher」这一种。边界见 V-执行-11。
+        """
 
         gateway = build_gateway()
         asyncio.run(
@@ -468,6 +488,82 @@ class BusinessFailureAuditTest(unittest.TestCase):
         audit.record_terminal_result()
 
         self.assertIs(audit.summary().user_result, UserResultStatus.NO_TOOL_CALL)
+
+
+class MixedTurnResultTest(unittest.TestCase):
+    """V-执行-17：一次辅助调用成功，不足以宣告整个回合"用户拿到了结果"。
+
+    这是问数的常态路径：先 ``list_metrics`` 拿目录（成功），再 ``describe_metric``
+    查具体指标（失败）。原实现见到任意一条 ``OK`` 就判 OBTAINED，于是审计会写成
+    用户拿到了结果——`V-执行-06` 要防的正是这种谎报。本层分不清哪一次承载最终
+    业务结果，因此混合回合一律记 UNKNOWN。
+    """
+
+    def _turn_after_a_successful_catalog_lookup(
+        self, second_content: object, *, is_error: object = None, record_result: bool = True
+    ) -> UserResultStatus:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_catalog")
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_catalog", content='{"data": [{"metric": "收视率"}]}'
+        )
+        pre_tool_use(
+            gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_query"
+        )
+        if record_result:
+            gateway.audit.record_tool_result(
+                tool_use_id="toolu_query", content=second_content, is_error=is_error
+            )
+        gateway.audit.record_final_text("已按可用范围回答。")
+        gateway.audit.record_terminal_result()
+        return gateway.audit.summary().user_result
+
+    def test_success_plus_business_failure_is_not_reported_as_obtained(self) -> None:
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup('{"error": "metric not found"}'),
+            UserResultStatus.UNKNOWN,
+        )
+
+    def test_success_plus_unclassified_result_is_not_reported_as_obtained(self) -> None:
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup("查询失败，请稍后重试"),
+            UserResultStatus.UNKNOWN,
+        )
+
+    def test_success_plus_missing_result_is_not_reported_as_obtained(self) -> None:
+        """回执根本没到：连归类都没有，更不能算送达。"""
+
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup(None, record_result=False),
+            UserResultStatus.UNKNOWN,
+        )
+
+    def test_success_plus_tool_error_is_not_reported_as_obtained(self) -> None:
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup("upstream exploded", is_error=True),
+            UserResultStatus.UNKNOWN,
+        )
+
+    def test_success_plus_empty_result_is_not_reported_as_obtained(self) -> None:
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup('{"data": []}'),
+            UserResultStatus.UNKNOWN,
+        )
+
+    def test_every_allowed_call_succeeding_is_still_reported_as_obtained(self) -> None:
+        """保守化不能把正常回合也一起判掉：全部成功仍然是 OBTAINED。"""
+
+        self.assertIs(
+            self._turn_after_a_successful_catalog_lookup('{"data": [{"unit": "%"}]}'),
+            UserResultStatus.OBTAINED,
+        )
+
+    def test_a_turn_where_everything_was_denied_is_reported_as_not_obtained(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "Bash", {"command": "ls"}, tool_use_id="toolu_d1")
+        pre_tool_use(gateway, "Write", {"file_path": "/tmp/x"}, tool_use_id="toolu_d2")
+
+        self.assertIs(gateway.audit.summary().user_result, UserResultStatus.NOT_OBTAINED)
 
 
 class ParsableButUnrecognisedResultTest(unittest.TestCase):

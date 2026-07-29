@@ -10,7 +10,9 @@ feishu = ["cryptography>=42,<46", "lark-oapi==1.7.1", "psycopg[binary]>=3.2,<4",
 # （`PostToolUseFailure` 存在、子代理叫 `Agent` 不叫 `Task`、`HookMatcher` 的签名），
 # 这些都是实测得到的、SDK 未作稳定性承诺的细节。升级前必须重跑 L4a，见
 # docs/技术设计/验证与门禁.md 的 V-部署-08。
-# CI 不安装本组：判定逻辑不依赖 SDK，绑定层用桩模块验证形状。
+# 判定逻辑不依赖本组：`lingxi.core.execution` 的全部断言在无 SDK 环境即可跑，
+# 绑定层的形状由桩模块锁住。CI 另有一步装上本组做真实冒烟（构造 `HookMatcher`，
+# 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
 agent = ["claude-agent-sdk==0.2.128"]
 
 [tool.unittest]

@@ -1,12 +1,14 @@
 """SDK 绑定层的形状断言。
 
 ``lingxi.adapters.claude_agent_hooks`` 是唯一 import Claude Agent SDK 的地方，也是
-把已验证的判定逻辑接到真实 SDK 上的唯一一处。SDK 不在 ``pyproject.toml`` 的依赖里
-（CI 不装、也不该装），所以这里用桩模块顶替，锁住三件事：注册了哪些事件、回调怎么
-被调用、回调签名的第三个参数会不会被按关键字传入。
+把已验证的判定逻辑接到真实 SDK 上的唯一一处。SDK 是 ``pyproject.toml`` 里的可选
+``agent`` extra，本文件**刻意不装它**：用桩模块顶替可以在没有 SDK 的环境里跑，锁住
+三件事——注册了哪些事件、回调怎么被调用、回调签名的第三个参数会不会被按关键字传入。
 
-桩模块只能证明"我们这一侧的形状没变"，**不能**证明 SDK 那一侧接受这些事件名——
-后者只有真实链路（L4a）能回答。
+桩模块只能证明"我们这一侧的形状没变"，**不能**证明 SDK 那一侧接受这些事件名。
+CI 另有一步装上真实 SDK 做冒烟（``scripts/ci/check_agent_sdk_binding.py``），它能证明
+"装得上、``HookMatcher`` 签名兼容"，仍然证明不了事件真的会触发——后者只有真实链路
+（L4a）能回答。
 """
 
 from __future__ import annotations

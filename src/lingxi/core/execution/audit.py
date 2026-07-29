@@ -57,8 +57,12 @@ _MAX_KEPT_ERROR_TEXT = 2000
 # 全字母错误码——后者是有诊断价值的审计事实，抹掉它等于用可读性换一个假的安全感。
 #
 # 这个上界的**边界要说清楚**：它对随机生成的令牌是结构性的（长度 ≥16 的随机
-# 字母数字串几乎必然含数字），但对纯字母且短于 32 字符的秘密无效——那一类由
-# AuditRedactor 的字段白名单与键名脱敏承担。两道合起来才构成合同要求的保证。
+# 字母数字串几乎必然含数字），但对纯字母且短于 32 字符的秘密无效。
+#
+# 曾经写过"那一类由字段白名单承担"——**那句话是假的闭合**：错误正文、回执正文和
+# 工具名根本不经过字段白名单，没有任何一道规则覆盖它们里面的纯字母短秘密。这条
+# 残余缺口由产品负责人在 PR #36 第三轮审核中知情接受，`V-审计-03` 已按实际能力
+# 写明，不得再声称对自由文本的凭据保证是绝对的。
 _TOKEN_RUN = re.compile(r"[A-Za-z0-9+/=_-]{16,}")
 
 
@@ -173,10 +177,14 @@ class AuditRedactor:
             return {}
         redacted: dict[str, Any] = {}
         for key, value in tool_input.items():
-            name = str(key)
-            if _SECRET_KEY.search(name):
+            raw = str(key)
+            # 字段**名**同样是模型可控文本：未进白名单的字段虽然只记 `omitted`，
+            # 键名本身还是会落库。值已经过一道自由文本脱敏，键不过是实现自己的
+            # 内部不一致。白名单成员判断仍用原名，脱敏只作用于落库的那份。
+            name = _redact_free_text(raw)
+            if _SECRET_KEY.search(raw):
                 redacted[name] = "[REDACTED]"
-            elif name not in self._allowed:
+            elif raw not in self._allowed:
                 redacted[name] = {"omitted": True}
             else:
                 redacted[name] = self._summarize(value)
@@ -184,6 +192,9 @@ class AuditRedactor:
 
     @staticmethod
     def _summarize(value: Any) -> Any:
+        # 数字值原样保留是**有意**的：字段进白名单意味着我们已显式批准记录它，
+        # 而 epoch 毫秒、雪花 ID 这类长数字正是排障要看的事实。若某个字段可能
+        # 承载凭据，正确的做法是不要把它加进白名单，而不是在这里抹数字。
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, str) and len(value) <= _MAX_KEPT_TEXT:
@@ -355,19 +366,43 @@ class TurnAudit:
 
     @staticmethod
     def _user_result(calls: Sequence[ToolCallAudit]) -> UserResultStatus:
-        """从各次调用的归类合成回合结论；证据不足时返回 UNKNOWN 而不是猜测。"""
+        """从各次调用的归类合成回合结论；证据不足时返回 UNKNOWN 而不是猜测。
+
+        **一次成功不能代表整个回合。** 原实现见到任意一条 ``OK`` 就直接判
+        :attr:`UserResultStatus.OBTAINED`，于是「``list_metrics`` 成功拿到目录 +
+        ``describe_metric`` 业务失败」这种最常见的问数路径会被审计写成"用户拿到了
+        结果"——`V-执行-06` 要防的恰好就是这个。工具抛错和完全没有回执的调用同样
+        会被这条捷径盖掉。
+
+        本层**没有**区分「承载最终业务结果的调用」和「辅助调用」的信息：那要靠
+        执行器知道哪一次回答了用户的问题。因此混合回合一律保守记为
+        :attr:`UserResultStatus.UNKNOWN`——宁可说不知道，不可谎报已送达。等执行器
+        切片能标出主查询之后，这里才有条件给出比 UNKNOWN 更精确的结论。
+        """
 
         if not calls:
             return UserResultStatus.NO_TOOL_CALL
         # 被本层拒绝的调用不参与"拿没拿到结果"的判断（它压根没执行）；
         # 本层未判定但确实失败了的调用要参与，否则规则层拦截会让结论偏乐观。
         kinds = [call.result_kind for call in calls if not call.denied]
-        if any(kind is ToolResultKind.OK for kind in kinds):
-            return UserResultStatus.OBTAINED
-        if any(kind is None or kind is ToolResultKind.UNCLASSIFIED for kind in kinds):
+        if not kinds:
+            # 全部调用都被本层拒绝：用户确定没拿到结果。
+            return UserResultStatus.NOT_OBTAINED
+        # 没有回执（result_kind is None）与无法归类同样是"证据不足"，不是成功。
+        inconclusive = any(kind is None or kind is ToolResultKind.UNCLASSIFIED for kind in kinds)
+        failed = any(
+            kind in {ToolResultKind.TOOL_ERROR, ToolResultKind.BUSINESS_FAILURE, ToolResultKind.EMPTY_RESULT}
+            for kind in kinds
+        )
+        if inconclusive:
             return UserResultStatus.UNKNOWN
-        # 剩下的情况：放行的调用全部是抛错、业务失败或空结果；或者全部调用都被拒。
-        return UserResultStatus.NOT_OBTAINED
+        if failed:
+            # 有成功也有失败：分不清哪一次承载最终结果，记未知；
+            # 一次成功都没有：证据足以判定用户没拿到。
+            if any(kind is ToolResultKind.OK for kind in kinds):
+                return UserResultStatus.UNKNOWN
+            return UserResultStatus.NOT_OBTAINED
+        return UserResultStatus.OBTAINED
 
     def _new_record(
         self,
@@ -382,6 +417,11 @@ class TurnAudit:
             # 合法工具名（`mcp__bi-metric__list_metrics` 这种）是必须原样保留的
             # 审计事实，不能被长串抹除吃掉；畸形工具名则是模型可控的任意文本，
             # 按自由文本处理。
+            #
+            # 这里**有意**不把未知的合法形态工具名投影成哈希或长度：对一个拒绝式
+            # 白名单来说，"模型试图调用什么"是最重要的那条审计事实，抹掉它等于
+            # 让屏障的留痕失去用处。代价是模型若把凭据当成工具名发出来，它会原样
+            # 落进审计——这条已知残余缺口见 `V-审计-03`，由产品负责人知情接受。
             "tool_name": tool_name if is_well_formed_tool_name(tool_name) else _redact_free_text(tool_name),
             "tool_input": self._redactor.redact(tool_input),
             "allowed": allowed,

@@ -27,8 +27,13 @@ OBSERVATION_ONLY_EVENTS: tuple[str, ...] = (
     "PermissionDenied",
 )
 
-# 认得的事件名全集。收到不在这里、却带着 tool_name 的事件，说明 SDK/CLI 改了
-# 事件名——那种情况下判定分支会静默失效，必须在审计里留痕而不是当作无事发生。
+# 认得的事件名全集。收到不在这里、却带着 tool_name 的事件时留痕，不当作无事发生。
+#
+# **这条留痕的覆盖面比字面看起来窄。** 适配器只按 HOOK_EVENTS 与
+# OBSERVATION_ONLY_EVENTS 里的名字注册；SDK 真把 `PreToolUse` 改名的话，我们注册
+# 的那个名字根本不会再被调用，本分支永远进不去。它只在「SDK 用一个我们认不出的
+# 事件名回调我们已注册的 matcher」时生效。**不得据此声称"事件改名会自动被发现"**
+# ——事件名是否仍然有效只有真实 SDK 的冒烟检查与 L4a 能回答，见 V-执行-11。
 KNOWN_EVENTS: frozenset[str] = frozenset(HOOK_EVENTS) | frozenset(OBSERVATION_ONLY_EVENTS)
 
 
