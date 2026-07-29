@@ -57,8 +57,24 @@ jobs:
           npm test
           npm run check
 
+      # 此前没有这一步：门禁跑在 runner 镜像碰巧自带的 python3 上。
+      # ubuntu-24.04 恰好是 3.12，所以一直没暴露，但那是巧合不是声明。
+      - name: 配置 Python 运行时
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # 固定小版本而不是读 pyproject 的 ">=3.12"：后者是开区间，新 Python
+          # 发布时门禁会自己跳版本。脚本里另有一道校验，确保这里不低于 pyproject
+          # 声明的下限，两边漂移会被发现。
+          python-version: '3.12'
+
       - name: 安装 Bot-Test 凭据测试依赖
         run: python3 -m pip install '.[feishu]'
+
+      # 测试跑 PYTHONPATH=src，部署跑 pip 装出来的制品；新增子目录会让两者分叉，
+      # 而分叉只在部署时才暴露。必须在仓库目录之外跑，否则只是又测了一遍源码树。
+      - name: 校验已安装的包完整
+        working-directory: ${{ runner.temp }}
+        run: python3 "${GITHUB_WORKSPACE}/scripts/ci/check_installed_package.py"
 
       - name: 运行基础质量门禁
         env:

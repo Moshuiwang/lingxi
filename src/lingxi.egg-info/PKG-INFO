@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: lingxi
+Version: 0.1.0
+Summary: Lingxi 企业内部受控 AI 业务分析服务
+Requires-Python: >=3.12
+Provides-Extra: feishu
+Requires-Dist: cryptography<46,>=42; extra == "feishu"
+Requires-Dist: lark-oapi==1.7.1; extra == "feishu"
+Requires-Dist: psycopg[binary]<4,>=3.2; extra == "feishu"
+Requires-Dist: websockets<16,>=15; extra == "feishu"
