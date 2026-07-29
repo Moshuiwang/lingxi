@@ -9,3 +9,4 @@ __pycache__/
 *.py[cod]
 .venv/
 node_modules/
+.claude/worktrees/
