@@ -498,12 +498,30 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
     def test_non_empty_recognised_collection_is_still_ok(self) -> None:
         self.assertIs(classify_tool_result('{"data": [{"metric": "收视率"}]}'), ToolResultKind.OK)
 
-    def test_classification_does_not_depend_on_set_iteration_order(self) -> None:
-        """多个登记集合同时出现时，分类不得随 str hash 随机化在进程之间翻转。"""
+    def test_classification_does_not_depend_on_key_order(self) -> None:
+        """多个登记集合同时出现时，分类不得取决于键的遍历顺序。
 
-        self.assertIs(classify_tool_result('{"data": [], "items": [1]}'), ToolResultKind.OK)
-        self.assertIs(classify_tool_result('{"rows": [1], "results": []}'), ToolResultKind.OK)
+        直接断言"换个顺序结果不变"，而不是断言某个具体取值：后者只有在 str hash
+        随机化恰好排出坏顺序时才会红，实测 8 个 PYTHONHASHSEED 里只有 3 个能抓到
+        回归——那是个碰运气的检测器，CI 会漏掉一半以上。
+        """
+
+        for payload in ('{"data": [], "items": [1]}', '{"rows": [1], "results": []}'):
+            with self.subTest(payload=payload):
+                forward = ResultRules(empty_collection_keys=("data", "rows", "items", "results"))
+                reverse = ResultRules(empty_collection_keys=("results", "items", "rows", "data"))
+                self.assertIs(
+                    classify_tool_result(payload, rules=forward),
+                    classify_tool_result(payload, rules=reverse),
+                )
+                self.assertIs(classify_tool_result(payload, rules=forward), ToolResultKind.OK)
+
         self.assertIs(classify_tool_result('{"data": [], "rows": []}'), ToolResultKind.EMPTY_RESULT)
+
+    def test_registered_collection_keys_are_declared_as_an_ordered_sequence(self) -> None:
+        """字段本身也不能退回 set：那样默认规则的遍历顺序又会随进程变化。"""
+
+        self.assertIsInstance(ResultRules().empty_collection_keys, tuple)
 
 
 class AmbiguousAttributionTest(unittest.TestCase):
