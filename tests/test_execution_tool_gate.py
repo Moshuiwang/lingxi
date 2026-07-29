@@ -240,6 +240,46 @@ class ToolFailureAuditTest(unittest.TestCase):
         self.assertEqual(recorded["authorization"], "[REDACTED]")
         self.assertEqual(recorded["new_field"], {"omitted": True})
 
+    def test_v_shenji_03_credentials_inside_error_text_are_redacted_too(self) -> None:
+        """V-审计-03 的否定断言：错误原文不经字段白名单，仍不得落下凭据。"""
+
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__describe_metric", {"metric": "收视率"}, tool_use_id="toolu_e")
+        asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUseFailure",
+                    "tool_name": "mcp__bi-metric__describe_metric",
+                    "tool_use_id": "toolu_e",
+                    "error": (
+                        'upstream 401: {"api_key": "sk-live-DO-NOT-LEAK", "authorization": "Bearer sk-live-DO-NOT-LEAK"} '
+                        "retry with Authorization: Bearer sk-live-DO-NOT-LEAK"
+                    ),
+                }
+            )
+        )
+
+        recorded = gateway.audit.summary().failed_calls[0].error or ""
+
+        self.assertNotIn("sk-live-DO-NOT-LEAK", recorded)
+        self.assertIn("upstream 401", recorded)
+        self.assertIn("[REDACTED]", recorded)
+
+    def test_credentials_inside_ungated_tool_result_are_redacted_too(self) -> None:
+        """未经本层判定的错误回执同样要脱敏，否则规则层拦截会成为泄露口。"""
+
+        gateway = build_gateway()
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_orphan",
+            content='auth failed: password=hunter2-DO-NOT-LEAK',
+            is_error=True,
+        )
+
+        recorded = gateway.audit.summary().ungated_calls[0].error or ""
+
+        self.assertNotIn("hunter2-DO-NOT-LEAK", recorded)
+        self.assertIn("[REDACTED]", recorded)
+
 
 class DenialAuditTest(unittest.TestCase):
     """V-执行-05：调用被拒时审计中可查到该次拒绝及其理由。"""

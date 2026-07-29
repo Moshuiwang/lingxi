@@ -30,8 +30,18 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .tool_policy import DenyReasonCode, PolicyVerdict
 
-_SECRET_KEY = re.compile(r"(token|secret|password|authorization|api[_-]?key|credential|auth)", re.IGNORECASE)
+_SECRET_WORDS = r"token|secret|password|authorization|api[_-]?key|credential|auth"
+_SECRET_KEY = re.compile(rf"({_SECRET_WORDS})", re.IGNORECASE)
+# 错误原文来自工具回执，不经过入参那套字段白名单，因此这里按赋值形态兜底脱敏，
+# 保证 V-审计-03（审计明细中不出现凭据、完整令牌）在错误路径上同样成立。
+_SECRET_ASSIGNMENT = re.compile(
+    rf"((?:{_SECRET_WORDS})[\"']?\s*[:=]\s*)"
+    rf"(\"[^\"]*\"|'[^']*'|(?:bearer|basic)\s+[^\s,;)}}\]]+|[^\s,;)}}\]]+)",
+    re.IGNORECASE,
+)
+_SECRET_SCHEME = re.compile(r"\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}", re.IGNORECASE)
 _MAX_KEPT_TEXT = 200
+_MAX_KEPT_ERROR_TEXT = 2000
 
 
 class ToolResultKind(str, Enum):
@@ -421,6 +431,10 @@ def _digest(value: Any) -> dict[str, Any]:
 
 
 def _error_text(error: Any) -> str:
-    if isinstance(error, str):
-        return error[:2000]
-    return _dump(error)[:2000]
+    text = error if isinstance(error, str) else _dump(error)
+    return _redact_secrets(text)[:_MAX_KEPT_ERROR_TEXT]
+
+
+def _redact_secrets(text: str) -> str:
+    text = _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}[REDACTED]", text)
+    return _SECRET_SCHEME.sub(lambda m: f"{m.group(1)} [REDACTED]", text)
