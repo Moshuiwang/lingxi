@@ -70,14 +70,23 @@ class ResultRules:
     failure_text_markers: tuple[str, ...] = ()
 
 
+UNGATED_TOOL_NAME = "<未经执行层判定>"
+
+
 @dataclass(frozen=True)
 class ToolCallAudit:
-    """一次工具调用在审计里的完整投影。"""
+    """一次工具调用在审计里的完整投影。
+
+    ``allowed`` 有三个取值：``True`` 放行、``False`` 拒绝、``None`` **本层未判定**。
+    第三种不是理论情况：``disallowed_tools`` 这类规则层拦截发生在 ``PreToolUse``
+    之前，执行层根本收不到回调，只能从消息流里的错误回执发现它存在（L4a 实测，
+    见 Issue #29）。把它记成"放行"会让审计谎报，记成"拒绝"会谎报是本层拦的。
+    """
 
     tool_use_id: str | None
     tool_name: str
     tool_input: Mapping[str, Any]
-    allowed: bool
+    allowed: bool | None
     deny_reason_code: DenyReasonCode | None = None
     deny_reason_text: str | None = None
     executed: bool = False
@@ -86,7 +95,13 @@ class ToolCallAudit:
 
     @property
     def denied(self) -> bool:
-        return not self.allowed
+        return self.allowed is False
+
+    @property
+    def gated(self) -> bool:
+        """这次调用是否经过了执行层的判定。"""
+
+        return self.allowed is not None
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,7 @@ class TurnAuditSummary:
     calls: tuple[ToolCallAudit, ...]
     denied_calls: tuple[ToolCallAudit, ...]
     failed_calls: tuple[ToolCallAudit, ...]
+    ungated_calls: tuple[ToolCallAudit, ...]
     user_result: UserResultStatus
     final_text_bytes: int
     terminal_result_count: int
@@ -169,20 +185,14 @@ class TurnAudit:
     ) -> None:
         """记录 ``PreToolUse`` 的判定。放行和拒绝都记，拒绝额外带上理由。"""
 
-        record: dict[str, Any] = {
-            "tool_use_id": tool_use_id,
-            "tool_name": tool_name,
-            "tool_input": self._redactor.redact(tool_input),
-            "allowed": not verdict.denied,
-            "deny_reason_code": verdict.reason_code,
-            "deny_reason_text": verdict.model_reason if verdict.denied else None,
-            "executed": False,
-            "error": None,
-            "result_kind": None,
-        }
-        self._calls.append(record)
-        if tool_use_id:
-            self._by_tool_use_id[tool_use_id] = record
+        record = self._new_record(
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            allowed=not verdict.denied,
+        )
+        record["deny_reason_code"] = verdict.reason_code
+        record["deny_reason_text"] = verdict.model_reason if verdict.denied else None
 
     def record_executed(self, *, tool_name: str, tool_use_id: str | None) -> None:
         """记录 ``PostToolUse``：工具确实执行完毕（不代表业务上成功）。"""
@@ -203,31 +213,38 @@ class TurnAudit:
 
         record = self._locate(tool_use_id, tool_name)
         if record is None:
-            record = {
-                "tool_use_id": tool_use_id,
-                "tool_name": tool_name,
-                "tool_input": self._redactor.redact(tool_input),
-                "allowed": True,
-                "deny_reason_code": None,
-                "deny_reason_text": None,
-                "executed": False,
-                "error": None,
-                "result_kind": None,
-            }
-            self._calls.append(record)
-            if tool_use_id:
-                self._by_tool_use_id[tool_use_id] = record
+            record = self._new_record(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                allowed=None,
+            )
         record["error"] = _error_text(error)
         record["result_kind"] = ToolResultKind.TOOL_ERROR
 
     # ---- 来源三：解析工具回执 ----
 
     def record_tool_result(self, *, tool_use_id: str | None, content: Any, is_error: Any = None) -> ToolResultKind:
-        """解析 SDK 消息流里的工具回执，判定用户这一次到底拿到了什么。"""
+        """解析 SDK 消息流里的工具回执，判定用户这一次到底拿到了什么。
+
+        找不到对应 ``PreToolUse`` 记录的失败回执**不丢弃**，而是记成一条"本层未判定"
+        的调用。否则规则层（``disallowed_tools``）拦下的调用会在审计里彻底消失——
+        L4a 实测中就出现过这一幕。
+        """
 
         kind = classify_tool_result(content, is_error=is_error, rules=self._rules)
         record = self._locate(tool_use_id, None)
-        if record is not None and record["result_kind"] is not ToolResultKind.TOOL_ERROR:
+        if record is None:
+            if kind is ToolResultKind.OK:
+                return kind
+            record = self._new_record(
+                tool_use_id=tool_use_id,
+                tool_name=UNGATED_TOOL_NAME,
+                tool_input=None,
+                allowed=None,
+            )
+            record["error"] = _error_text(_coerce(content)[0])
+        if record["result_kind"] is not ToolResultKind.TOOL_ERROR:
             record["result_kind"] = kind
         return kind
 
@@ -251,6 +268,7 @@ class TurnAudit:
             calls=calls,
             denied_calls=denied,
             failed_calls=failed,
+            ungated_calls=tuple(call for call in calls if not call.gated),
             user_result=self._user_result(calls),
             final_text_bytes=len(self._final_text.encode("utf-8")),
             terminal_result_count=self._terminal_result_count,
@@ -263,7 +281,9 @@ class TurnAudit:
 
         if not calls:
             return UserResultStatus.NO_TOOL_CALL
-        kinds = [call.result_kind for call in calls if call.allowed]
+        # 被本层拒绝的调用不参与"拿没拿到结果"的判断（它压根没执行）；
+        # 本层未判定但确实失败了的调用要参与，否则规则层拦截会让结论偏乐观。
+        kinds = [call.result_kind for call in calls if not call.denied]
         if any(kind is ToolResultKind.OK for kind in kinds):
             return UserResultStatus.OBTAINED
         if any(kind is None or kind is ToolResultKind.UNCLASSIFIED for kind in kinds):
@@ -271,13 +291,37 @@ class TurnAudit:
         # 剩下的情况：放行的调用全部是抛错、业务失败或空结果；或者全部调用都被拒。
         return UserResultStatus.NOT_OBTAINED
 
+    def _new_record(
+        self,
+        *,
+        tool_use_id: str | None,
+        tool_name: str,
+        tool_input: Any,
+        allowed: bool | None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "tool_input": self._redactor.redact(tool_input),
+            "allowed": allowed,
+            "deny_reason_code": None,
+            "deny_reason_text": None,
+            "executed": False,
+            "error": None,
+            "result_kind": None,
+        }
+        self._calls.append(record)
+        if tool_use_id:
+            self._by_tool_use_id[tool_use_id] = record
+        return record
+
     def _locate(self, tool_use_id: str | None, tool_name: str | None) -> dict[str, Any] | None:
         if tool_use_id and tool_use_id in self._by_tool_use_id:
             return self._by_tool_use_id[tool_use_id]
         if tool_name is None:
             return None
         for record in reversed(self._calls):
-            if record["tool_name"] == tool_name and record["allowed"]:
+            if record["tool_name"] == tool_name and record["allowed"] is True:
                 return record
         return None
 

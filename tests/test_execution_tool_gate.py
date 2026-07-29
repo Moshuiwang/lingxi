@@ -111,10 +111,18 @@ class DenyByDefaultTest(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertEqual(self.gateway.audit.summary().denied_calls, ())
 
-    def test_subagent_task_tool_is_denied_because_its_inner_boundary_is_unverified(self) -> None:
-        """子代理内部的工具拒绝归属尚未验证，因此 Task 不在白名单里。"""
+    def test_subagent_tool_is_denied_by_default_under_both_of_its_known_names(self) -> None:
+        """子代理默认不放行。
 
-        self.assertIs(build_policy().decide("Task", {}).decision, ToolDecision.DENY)
+        L4a 实测（Issue #29）：子代理工具在 CLI 2.1.220 里叫 ``Agent`` 而不是
+        ``Task``，子代理内部的调用**确实经过同一个 PreToolUse 屏障**；但启用它会让
+        同一回合出现两个终止结果，与"恰好一次终止结果"冲突，因此首期仍默认拒绝。
+        """
+
+        policy = build_policy()
+
+        self.assertIs(policy.decide("Agent", {}).decision, ToolDecision.DENY)
+        self.assertIs(policy.decide("Task", {}).decision, ToolDecision.DENY)
 
     def test_missing_or_malformed_tool_name_is_denied_rather_than_allowed(self) -> None:
         for tool_name in (None, "", 42, "mcp__bi-metric__list_metrics; rm -rf /"):
@@ -261,6 +269,52 @@ class DenialAuditTest(unittest.TestCase):
 
         self.assertEqual(summary.denied_tool_names, ("Write",))
         self.assertEqual(summary.executed_tool_names, ())
+
+
+class UngatedCallAuditTest(unittest.TestCase):
+    """V-执行-09：规则层拦下的调用不经过执行层判定，审计必须仍能发现它。
+
+    L4a 实测（Issue #29）：把工具放进 ``disallowed_tools`` 后，模型确实发出了该
+    调用，但 CLI 在 ``PreToolUse`` **之前**就挡掉了——hook 一次都没触发。消息流里
+    只留下一个 ``is_error=True`` 的工具结果块，其 ``tool_use_id`` 在执行层的记账里
+    找不到对应记录。若直接丢弃，这次拦截在审计里就彻底消失了。
+    """
+
+    def test_v_zhixing_09_error_result_without_a_pre_tool_use_record_is_kept_as_ungated(self) -> None:
+        gateway = build_gateway()
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_ok")
+        gateway.audit.record_tool_result(tool_use_id="toolu_ok", content='{"data": [{"metric": "收视率"}]}')
+        gateway.audit.record_tool_result(
+            tool_use_id="toolu_never_gated",
+            content="No such tool available: Write. Write exists but is not enabled in this context.",
+            is_error=True,
+        )
+
+        summary = gateway.audit.summary()
+
+        self.assertEqual(len(summary.ungated_calls), 1)
+        ungated = summary.ungated_calls[0]
+        self.assertEqual(ungated.tool_use_id, "toolu_never_gated")
+        self.assertFalse(ungated.gated)
+        self.assertFalse(ungated.denied, "本层没有拒绝它，不能记成本层拦的")
+        self.assertIs(ungated.result_kind, ToolResultKind.TOOL_ERROR)
+        self.assertIn("not enabled in this context", ungated.error or "")
+
+    def test_successful_results_without_a_matching_record_do_not_invent_audit_rows(self) -> None:
+        audit = TurnAudit()
+        audit.record_tool_result(tool_use_id="toolu_unknown", content='{"data": [{"value": 1}]}')
+
+        self.assertEqual(audit.summary().calls, ())
+
+    def test_a_turn_whose_only_failure_was_ungated_is_not_reported_as_denied_by_us(self) -> None:
+        gateway = build_gateway()
+        gateway.audit.record_tool_result(tool_use_id="toolu_x", content="blocked upstream", is_error=True)
+
+        summary = gateway.audit.summary()
+
+        self.assertEqual(summary.denied_calls, ())
+        self.assertEqual(len(summary.failed_calls), 1)
+        self.assertIs(summary.user_result, UserResultStatus.NOT_OBTAINED)
 
 
 class BusinessFailureAuditTest(unittest.TestCase):
