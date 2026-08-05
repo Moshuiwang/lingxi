@@ -11,5 +11,8 @@ __pycache__/
 node_modules/
 .claude/worktrees/
 
-# 依赖只以 pyproject.toml 声明，CI 与受控环境用 pip 安装；本地 uv 锁文件不入库
-uv.lock
+# Python 打包与构建产物：在仓库根目录跑 pip install 会生成它们，
+# 一旦提交就会出现两份源码与陈旧的打包元数据。
+build/
+dist/
+*.egg-info/

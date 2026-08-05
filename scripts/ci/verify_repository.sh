@@ -13,6 +13,22 @@ for required_command in git python3 shellcheck; do
   }
 done
 
+# 门禁必须跑在项目声明支持的解释器上。此前用的是裸 python3：CI 上恰好是 3.12
+# 所以一直没暴露，但本地 python3 可能是 3.9——那样门禁会在一个项目不支持的
+# 解释器上给出绿灯，属于假信心，比没有门禁更危险。
+declared_python=$(sed -n 's/^requires-python = ">=\([0-9]\+\.[0-9]\+\)"$/\1/p' pyproject.toml)
+if [[ -z "${declared_python}" ]]; then
+  printf 'pyproject.toml 里读不到 requires-python，无法校验解释器版本。\n' >&2
+  exit 1
+fi
+actual_python=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+if ! python3 -c 'import sys; d=sys.argv[1].split("."); sys.exit(0 if sys.version_info[:2] >= (int(d[0]), int(d[1])) else 1)' "${declared_python}"; then
+  printf 'python3 是 %s，低于 pyproject.toml 声明的 %s。请用 python%s 运行本门禁。\n' \
+    "${actual_python}" "${declared_python}" "${declared_python}" >&2
+  exit 1
+fi
+printf '解释器版本：python3 = %s，满足声明的 >=%s\n' "${actual_python}" "${declared_python}"
+
 tracked_scripts=()
 while IFS= read -r script_path; do
   tracked_scripts+=("${script_path}")
@@ -27,7 +43,10 @@ bash -n "${tracked_scripts[@]}"
 printf 'Bash 语法：通过\n'
 
 shellcheck --severity=warning "${tracked_scripts[@]}"
-printf 'ShellCheck：通过\n'
+# 打印版本：本机与 CI 装了不同版本的 linter，是一种不会报错的分歧。
+# CI 用 pip 锁定 shellcheck-py==0.11.0.1，本机请装同一个：
+#   python3 -m pip install 'shellcheck-py==0.11.0.1'
+printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^version: //p')"
 
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
