@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
+import logging
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import secrets
 from typing import Any
 
 from lingxi.core.permission.galaxy_export import (
@@ -30,6 +31,8 @@ from lingxi.core.permission.galaxy_export import (
 )
 
 IMPORTED = "imported"
+logger = logging.getLogger("lingxi.adapters.galaxy_import")
+
 ALREADY_IMPORTED = "already_imported"
 REJECTED = "rejected"
 
@@ -80,23 +83,31 @@ class PostgresGalaxyImportStore:
     # ---- 查询 -------------------------------------------------------------
 
     def current_batch_id(self) -> str | None:
-        """当前有效批次：最近一个 `complete` 批次。"""
+        """当前有效批次：最近一个**未过期**的 `complete` 批次。
+
+        过期批次不算「当前有效」：清理流程可能尚未运行，把过期快照当有效
+        会让下游继续使用可能已失效的权限与超期人员副本（合同九十天上限；
+        Codex 复查发现）。没有新鲜批次时如实返回 None，由调用方安全失败。
+        """
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id FROM galaxy_import_batch WHERE status = 'complete' "
+                "SELECT id FROM galaxy_import_batch WHERE status = 'complete' AND expires_at > now() "
                 "ORDER BY completed_at DESC, started_at DESC LIMIT 1"
             )
             row = cursor.fetchone()
         return None if row is None else str(row[0])
 
-    def _completed_batch_for_digest(self, cursor: Any, source_digest: str) -> str | None:
+    def _batch_for_digest(self, cursor: Any, source_digest: str) -> tuple[str, str] | None:
+        # 幂等判定不看 status='complete'：批次被更新导出取代（superseded）后，
+        # 同一份旧导出再导一次会写出第二份全量并把权限快照回退（独立复查发现）。
+        # 只有 failed 批次允许同摘要重来。
         cursor.execute(
-            "SELECT id FROM galaxy_import_batch WHERE source_digest = %s AND status = 'complete' LIMIT 1",
+            "SELECT id, status FROM galaxy_import_batch WHERE source_digest = %s AND status <> 'failed' LIMIT 1",
             (source_digest,),
         )
         row = cursor.fetchone()
-        return None if row is None else str(row[0])
+        return None if row is None else (str(row[0]), str(row[1]))
 
     # ---- 写入 -------------------------------------------------------------
 
@@ -144,8 +155,17 @@ class PostgresGalaxyImportStore:
 
         with self._psycopg.connect(self._dsn) as connection:
             with connection.cursor() as cursor:
-                existing = self._completed_batch_for_digest(cursor, source_digest)
-                if existing is not None:
+                # 人工 CLI 也可能并发执行：advisory 锁把整个导入串行化，
+                # 免去「两个不同摘要交错留下双 complete」的窗口（独立复查建议）。
+                cursor.execute("SELECT pg_advisory_xact_lock(4217001)")
+                existing_hit = self._batch_for_digest(cursor, source_digest)
+                if existing_hit is not None:
+                    existing, existing_status = existing_hit
+                    if existing_status == "superseded":
+                        logger.warning(
+                            "该导出对应的批次 %s 已被更新导出取代；不重导。若确需回滚到旧快照，须显式操作而非重复导入",
+                            existing,
+                        )
                     return ImportResult(
                         outcome=ALREADY_IMPORTED,
                         batch_id=existing,

@@ -18,6 +18,9 @@ CREATE TABLE galaxy_import_batch (
     source_digest               TEXT NOT NULL,
     status                      TEXT NOT NULL
         CHECK (status IN ('staging', 'complete', 'failed', 'superseded')),
+        -- 'staging' 只存在于导入事务内部（提交即 complete，失败整体回滚）；
+        -- 'failed' 与 error_code 预留给未来拆步导入的失败留痕路径，当前代码不产生。
+        -- 任何按 expires_at 的清理流程必须排除当前有效批次（见 #17 待决策 3 登记）。
     started_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at                TIMESTAMPTZ,
     expires_at                  TIMESTAMPTZ NOT NULL DEFAULT now() + interval '2160 hours',

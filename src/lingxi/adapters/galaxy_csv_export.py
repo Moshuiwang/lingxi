@@ -34,19 +34,34 @@ class ExportBundle:
 
 
 def read_csv_table(path: Path) -> list[dict[str, str]]:
-    """把一个 CSV 读成文本行；缺列补空串，多余列按 `None` 键丢弃。"""
+    """把一个 CSV 读成文本行；缺列补空串，**字段数超过表头的行整文件拒绝**。
+
+    未转义逗号或损坏导出会让 `DictReader` 把溢出值挂在 `None` 键下；静默丢弃
+    意味着该行的邮箱/姓名/公司字段可能已整体错位，却仍能通过校验并取代有效
+    批次（Codex 复查发现）。错误信息只报行号，不回显内容。
+    """
 
     # utf-8-sig：Excel 导出的 CSV 常带 BOM，不去掉会让首列列名对不上。
     with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
         reader = csv.DictReader(csv_file)
         rows: list[dict[str, str]] = []
-        for raw_row in reader:
+        overflow_rows: list[int] = []
+        for row_number, raw_row in enumerate(reader, start=1):
+            if None in raw_row and raw_row.get(None):
+                overflow_rows.append(row_number)
+                continue
             row = {
                 str(key): ("" if value is None else value)
                 for key, value in raw_row.items()
                 if key is not None
             }
             rows.append(row)
+    if overflow_rows:
+        shown = "、".join(str(number) for number in overflow_rows[:10])
+        raise ValueError(
+            f"{path.name} 有 {len(overflow_rows)} 行字段数超过表头（数据行 {shown}"
+            f"{'…' if len(overflow_rows) > 10 else ''}）：疑似未转义逗号或损坏导出，整文件拒绝"
+        )
     return rows
 
 

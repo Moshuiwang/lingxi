@@ -144,11 +144,24 @@ def match_galaxy_account(
     employee_no_hits = [row for row in rows if employee_no and _text(row.get("user_name")) == employee_no]
     email_hits = [row for row in rows if email and normalize_email(row.get("email")) == email]
 
+    if email and len(email_hits) > 1:
+        # 任一键命中多条即转人工（V-开通-02 / V-银河-09 字面）——即使工号同时
+        # 唯一命中：共享/公共邮箱同时挂着别人，正是该让人看一眼的歧义
+        # （Codex 复查指出「工号优先」不得吞掉辅键的多义信号）。
+        return _outcome(
+            MANUAL,
+            "email_multiple_hits",
+            matched_employee_no=employee_no or None,
+            matched_email=email,
+            roster_name=roster_name,
+            galaxy_nick_names=_nick_names(email_hits),
+        )
+
     if employee_no:
         if len(employee_no_hits) == 1:
             hit = employee_no_hits[0]
             if email and email_hits and hit not in email_hits:
-                # 两键各自命中却指向不同账号：不自动选择任何一条（V-开通-02）。
+                # 两键各自唯一命中却指向不同账号：不自动选择任何一条（V-开通-02）。
                 return _outcome(
                     MANUAL,
                     "key_conflict",
@@ -184,28 +197,18 @@ def match_galaxy_account(
                 roster_name=roster_name,
             )
 
-    if email:
-        if len(email_hits) == 1:
-            hit = email_hits[0]
-            return _outcome(
-                MATCHED,
-                "unique_email_match",
-                galaxy_user_id=_text(hit.get("user_id")) or None,
-                matched_key="email",
-                matched_employee_no=employee_no or None,
-                matched_email=email,
-                roster_name=roster_name,
-                galaxy_nick_names=_nick_names(email_hits),
-            )
-        if len(email_hits) > 1:
-            return _outcome(
-                MANUAL,
-                "email_multiple_hits",
-                matched_employee_no=employee_no or None,
-                matched_email=email,
-                roster_name=roster_name,
-                galaxy_nick_names=_nick_names(email_hits),
-            )
+    if email and len(email_hits) == 1:
+        hit = email_hits[0]
+        return _outcome(
+            MATCHED,
+            "unique_email_match",
+            galaxy_user_id=_text(hit.get("user_id")) or None,
+            matched_key="email",
+            matched_employee_no=employee_no or None,
+            matched_email=email,
+            roster_name=roster_name,
+            galaxy_nick_names=_nick_names(email_hits),
+        )
 
     return _outcome(
         NOT_FOUND,

@@ -93,23 +93,26 @@ class FeishuRosterBitableTest(unittest.TestCase):
 
     def test_rows_expose_only_the_fields_the_match_chain_needs(self) -> None:
         self.assertEqual(ROSTER_FIELD_NAMES, ("人员ID", "邮箱", "人员姓名", "工号"))
-        self.assertEqual(RosterRow._fields, ("personnel_id", "email", "name", "work_no", "record_id"))
+        self.assertEqual(RosterRow._fields, ("personnel_id", "email", "name", "employee_no", "record_id"))
 
     def test_rows_can_be_handed_to_the_matcher_as_mappings(self) -> None:
         from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 
         reader = _FakePagedReader(
-            [([{"fields": {"人员ID": "fs-u1", "邮箱": "jiaming.jia@example.invalid", "人员姓名": "化名甲"}}], None)]
+            [([{"fields": {"人员ID": "fs-u1", "邮箱": "jiaming.jia@example.invalid", "人员姓名": "化名甲", "工号": "10001"}}], None)]
         )
         rows = [row._asdict() for row in read_roster_records(reader)]
 
         result = match_galaxy_account(
             "fs-u1",
             rows,
-            [{"user_id": "U1", "email": "jiaming.jia@example.invalid", "nick_name": "化名甲"}],
+            [{"user_id": "U1", "user_name": "10001", "email": "jiaming.jia@example.invalid", "nick_name": "化名甲"}],
         )
 
         self.assertEqual(result.state, MATCHED)
+        # 独立复查发现的接线陷阱：字段名对不上时工号会静默丢失、整体退化为纯
+        # 邮箱匹配，而只断言 MATCHED 抓不到。必须钉住「确实是按工号命中的」。
+        self.assertEqual(result.matched_key, "employee_no")
         self.assertEqual(result.galaxy_user_id, "U1")
 
 

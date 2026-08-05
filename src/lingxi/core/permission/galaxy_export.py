@@ -161,6 +161,16 @@ def _rows_hint(rows: Sequence[int]) -> tuple[int, ...]:
     return tuple(rows[:_MAX_REPORTED_ROWS])
 
 
+SOURCE_ROW_KEY = "_source_row_number"
+"""校验期内部字段：承载源文件行号。
+
+关键列为空的行被丢弃、精确重复被合并之后，`enumerate` 位置会偏离源行号，
+而行号是脱敏结论里唯一的定位抓手（V-银河-13 禁止回显姓名/邮箱/账号）；
+指错行会让运维改错数据（独立复查实测复现）。本字段只在校验管道内部存在，
+进入 `ValidationReport.rows` 前剥除，绝不落库。
+"""
+
+
 def _normalize_table(
     spec: TableSpec, raw_rows: Sequence[Mapping[str, Any]]
 ) -> tuple[list[dict[str, str | None]], list[Issue], list[Issue]]:
@@ -189,8 +199,10 @@ def _normalize_table(
             )
 
     if ignored:
+        # 只报数量不回显列名：损坏的 CSV 会把数据值当表头，原文拼进告警等于
+        # 把邮箱/账号写进批次 metadata 与运维输出（V-银河-13；Codex 复查发现）。
         warnings.append(
-            Issue(spec.name, "ignored_column", f"源表含 {len(ignored)} 个未落库的列：{'、'.join(sorted(ignored))}")
+            Issue(spec.name, "ignored_column", f"源表含 {len(ignored)} 个未落库的列（列名不回显）")
         )
 
     if errors:
@@ -209,6 +221,7 @@ def _normalize_table(
         ):
             empty_key_rows.append(row_number)
             continue
+        normalized_row[SOURCE_ROW_KEY] = row_number
         rows.append(normalized_row)
 
     if empty_key_rows:
@@ -224,6 +237,12 @@ def _normalize_table(
     return rows, errors, warnings
 
 
+def _payload(row) -> dict:
+    """比较与落库都不含内部行号字段。"""
+
+    return {key: value for key, value in dict(row).items() if key != SOURCE_ROW_KEY}
+
+
 def _deduplicate(
     spec: TableSpec, rows: Sequence[Mapping[str, str | None]]
 ) -> tuple[list[Mapping[str, str | None]], list[Issue], list[Issue]]:
@@ -234,12 +253,13 @@ def _deduplicate(
     exact_duplicate_rows: list[int] = []
     conflicting_rows: list[int] = []
 
-    for row_number, row in enumerate(rows, start=1):
+    for row in rows:
+        row_number = row[SOURCE_ROW_KEY]
         key = tuple(row.get(column) for column in spec.primary_key)
         existing = kept.get(key)
         if existing is None:
             kept[key] = row
-        elif dict(existing) == dict(row):
+        elif _payload(existing) == _payload(row):
             exact_duplicate_rows.append(row_number)
         else:
             conflicting_rows.append(row_number)
@@ -278,8 +298,8 @@ def _check_references(
 
     for source_table in ("user_role", "sys_user_datacountry"):
         dangling = [
-            row_number
-            for row_number, row in enumerate(tables[source_table], start=1)
+            row[SOURCE_ROW_KEY]
+            for row in tables[source_table]
             if row["user_id"] not in known_users
         ]
         if dangling:
@@ -293,8 +313,8 @@ def _check_references(
             )
 
     dangling_country = [
-        row_number
-        for row_number, row in enumerate(tables["sys_user_datacountry"], start=1)
+        row[SOURCE_ROW_KEY]
+        for row in tables["sys_user_datacountry"]
         if row["datacountry_id"] not in known_country_keys
     ]
     if dangling_country:
@@ -321,8 +341,8 @@ def _check_references(
         )
 
     countries_without_key = [
-        row_number
-        for row_number, row in enumerate(tables["sys_country"], start=1)
+        row[SOURCE_ROW_KEY]
+        for row in tables["sys_country"]
         if not row["country_key"]
     ]
     if countries_without_key:
@@ -396,5 +416,5 @@ def validate_export(raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> Va
         errors=tuple(errors),
         warnings=tuple(warnings),
         row_counts={name: len(rows) for name, rows in normalized.items()},
-        rows={name: tuple(rows) for name, rows in normalized.items()},
+        rows={name: tuple(_payload(row) for row in rows) for name, rows in normalized.items()},
     )

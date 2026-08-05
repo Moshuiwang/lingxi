@@ -105,5 +105,29 @@ class GalaxyCsvExportTest(unittest.TestCase):
         self.assertEqual(rows[0]["menu_name"], "")
 
 
+class CsvOverflowRejectionTest(unittest.TestCase):
+    """Codex 复查 P2：字段数超过表头的行（未转义逗号/损坏导出）整文件拒绝，
+    错误只报行号不回显内容。"""
+
+    def test_a_row_with_extra_fields_rejects_the_whole_file(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from lingxi.adapters.galaxy_csv_export import read_csv_table
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "user.csv"
+            path.write_text(
+                "user_id,nick_name\nU1,姓名甲\nU2,姓名乙,fake.leak@example.invalid\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as context:
+                read_csv_table(path)
+
+        message = str(context.exception)
+        self.assertIn("2", message)
+        self.assertNotIn("fake.leak@example.invalid", message)
+
+
 if __name__ == "__main__":
     unittest.main()

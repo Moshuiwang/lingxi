@@ -112,6 +112,16 @@ class GalaxyAccountManualTest(unittest.TestCase):
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual((result.state, result.reason), (MANUAL, "key_conflict"))
 
+    def test_email_multi_hit_is_manual_even_when_employee_no_hits_uniquely(self) -> None:
+        # V-开通-02 / V-银河-09 字面：任一键命中多条即转人工。共享/公共邮箱同时
+        # 挂着别人，正是该让人看一眼的歧义（Codex 复查指出不得被「工号优先」吞掉）。
+        rows = [
+            galaxy_row(user_id="U-1"),
+            galaxy_row(user_id="U-2", user_name="80002", nick_name="别人"),
+        ]
+        result = match_galaxy_account("ou_p1", [roster_row()], rows)
+        self.assertEqual((result.state, result.reason), (MANUAL, "email_multiple_hits"))
+
     def test_email_fallback_hitting_two_accounts_is_manual(self) -> None:
         rows = [
             galaxy_row(user_id="U-1", user_name="90001"),

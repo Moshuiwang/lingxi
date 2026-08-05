@@ -186,6 +186,27 @@ class GalaxyMenuIdTest(unittest.TestCase):
 class GalaxyAllAfricaSentinelTest(unittest.TestCase):
     """V-银河-04：`全非` 哨兵按产品负责人 2026-08-05 决策展开为所有国家所有公司。"""
 
+    def test_wildcard_includes_countries_without_country_key(self) -> None:
+        """全非=所有国家所有公司：无 country_key 的行（约五分之一）同样携带
+        boss_company_id，通配展开必须包含，静默丢弃会系统性少权限（独立复查+Codex）。"""
+        rows = [
+            {"country_key": "0", "name": "ALL", "name_cn": "全非", "boss_company_id": "B0"},
+            {"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"},
+            {"country_key": "", "name": "Djibouti", "name_cn": "吉布提", "boss_company_id": "B77"},
+            {"country_key": None, "name": "Comoros", "name_cn": "科摩罗", "boss_company_id": "B78"},
+        ]
+        scope = resolve_company_scope(["0"], rows)
+        companies = {country.boss_company_id for country in scope.countries}
+        self.assertEqual(companies, {"B11", "B77", "B78"})
+
+    def test_explicit_keys_do_not_pull_in_unkeyed_rows(self) -> None:
+        rows = [
+            {"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"},
+            {"country_key": "", "name": "Djibouti", "name_cn": "吉布提", "boss_company_id": "B77"},
+        ]
+        scope = resolve_company_scope(["11"], rows)
+        self.assertEqual([country.boss_company_id for country in scope.countries], ["B11"])
+
     @staticmethod
     def _country_rows() -> list[dict[str, str | None]]:
         return [
@@ -235,7 +256,7 @@ class GalaxyAllAfricaSentinelTest(unittest.TestCase):
         scope = resolve_company_scope((SENTINEL_COUNTRY_KEY,), self._country_rows())
 
         self.assertTrue(scope.all_countries)
-        self.assertEqual([country.name_cn for country in scope.countries], ["甲国", "乙国"])
+        self.assertEqual([country.name_cn for country in scope.countries], ["甲国", "乙国", "丙国"])
 
     def test_sentinel_is_not_presented_as_a_country_of_its_own(self) -> None:
         scope = resolve_company_scope((SENTINEL_COUNTRY_KEY,), self._country_rows())
@@ -261,7 +282,7 @@ class GalaxyAllAfricaSentinelTest(unittest.TestCase):
     def test_wildcard_covers_boss_company_ids_of_all_countries(self) -> None:
         scope = resolve_company_scope((SENTINEL_COUNTRY_KEY,), self._country_rows())
 
-        self.assertEqual([country.boss_company_id for country in scope.countries], ["BC-甲", "BC-乙"])
+        self.assertEqual([country.boss_company_id for country in scope.countries], ["BC-甲", "BC-乙", "BC-丙"])
 
 
 if __name__ == "__main__":

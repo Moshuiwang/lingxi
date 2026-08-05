@@ -1,3 +1,9 @@
+# 显式声明构建后端：package-data 依赖 setuptools>=61 读取 pyproject 配置，
+# 不声明时打包行为随环境里碰巧解析到的工具链漂移（独立复查发现）。
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "lingxi"
 version = "0.1.0"

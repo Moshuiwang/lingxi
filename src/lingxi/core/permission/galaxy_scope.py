@@ -150,30 +150,36 @@ def resolve_company_scope(
 ) -> CompanyScope:
     """把授权到的国家键解释成公司范围。
 
-    连接键是 `country_key`；`sys_country` 中约五分之一的行没有 `country_key`，
-    这些行无法从授权表到达，出现时记入 `unresolved_country_keys` 而不是静默丢弃。
+    连接键是 `country_key`。`sys_country` 中约五分之一的行没有 `country_key`：
+    按键连接时它们无法从授权表到达；但 `全非` 的语义是「所有国家所有公司」
+    （2026-08-05 决策），通配展开必须把这些行也包含进来——它们同样携带
+    `boss_company_id`，静默丢弃会让持有通配的近半数账号系统性少拿约五分之一
+    公司的权限（独立复查发现）。
     """
 
     by_country_key: dict[str, CountryScope] = {}
+    unkeyed: list[CountryScope] = []
     for row in country_rows:
         country_key = _text(row.get("country_key"))
-        if country_key is None:
-            continue
-        by_country_key.setdefault(
-            country_key,
-            CountryScope(
-                country_key=country_key,
-                name=_text(row.get("name")),
-                name_cn=_text(row.get("name_cn")),
-                boss_company_id=_text(row.get("boss_company_id")),
-            ),
+        scope = CountryScope(
+            country_key=country_key,
+            name=_text(row.get("name")),
+            name_cn=_text(row.get("name_cn")),
+            boss_company_id=_text(row.get("boss_company_id")),
         )
+        if not country_key:
+            unkeyed.append(scope)
+            continue
+        by_country_key.setdefault(country_key, scope)
 
     explicit = _unique(_required_text(key) for key in country_keys)
     all_countries = SENTINEL_COUNTRY_KEY in explicit
 
     if all_countries:
-        resolved = tuple(scope for key, scope in by_country_key.items() if key != SENTINEL_COUNTRY_KEY)
+        resolved = (
+            tuple(scope for key, scope in by_country_key.items() if key != SENTINEL_COUNTRY_KEY)
+            + tuple(unkeyed)
+        )
     else:
         resolved = tuple(by_country_key[key] for key in explicit if key in by_country_key)
 

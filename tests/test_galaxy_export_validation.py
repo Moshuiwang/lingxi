@@ -100,6 +100,26 @@ class GalaxyExportShapeTest(unittest.TestCase):
         self.assertEqual(report.row_counts["sys_country"], 2)
 
 
+class GalaxyExportRowNumberFidelityTest(unittest.TestCase):
+    """V-银河-13 配套：结论只报行号，行号必须指向源文件的行（独立复查实测
+    此前在丢行/合并后会偏移，运维会照错误行号改错数据）。"""
+
+    def test_row_hints_survive_dropped_and_merged_rows(self) -> None:
+        tables = _valid_tables()
+        tables["user_role"] = [
+            {"user_id": "U1", "role_id": "R1", "user_name": "姓名", "role_name": "A运营"},
+            {"user_id": "", "role_id": "R1", "user_name": "空键", "role_name": "A运营"},
+            {"user_id": "U1", "role_id": "R1", "user_name": "姓名", "role_name": "A运营"},
+            {"user_id": "U_不存在", "role_id": "R1", "user_name": "姓名", "role_name": "A运营"},
+        ]
+        report = validate_export(tables)
+
+        dangling = [issue for issue in report.errors if issue.rule == "dangling_user_id"]
+        self.assertEqual(len(dangling), 1)
+        # 源文件里悬空引用在第 4 行；朴素 enumerate 会因第 2 行被丢、第 3 行被合并而报 2。
+        self.assertEqual(dangling[0].row_numbers, (4,))
+
+
 class GalaxyExportColumnNormalizationTest(unittest.TestCase):
     """V-银河-08：源列名大小写与空白差异都能被接受，落库列名唯一。"""
 

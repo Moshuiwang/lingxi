@@ -110,6 +110,10 @@ class GalaxyImportPostgresTest(unittest.TestCase):
             cursor.execute(f"SELECT count(*) FROM {table} {where}")
             return int(cursor.fetchone()[0])
 
+    def _execute(self, query: str, parameters: tuple[object, ...] = ()) -> None:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(query, parameters)
+
     def _scalar(self, query: str, parameters: tuple[object, ...] = ()) -> object:
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(query, parameters)
@@ -285,6 +289,30 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (first.batch_id,)), "superseded")
         self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)), "complete")
         self.assertEqual(self.store.current_batch_id(), second.batch_id)
+
+    def test_a_superseded_digest_is_still_idempotent_and_never_rolls_back(self) -> None:
+        """Codex 复查 P1：导 A → 导 B（A 转 superseded）→ 误重导 A，不得写出
+        A 的第二份全量、更不得把 B 降级让过期快照重新生效。"""
+        first = self._import()
+        second = self._import(digest="digest-2")
+
+        replay = self._import()
+
+        self.assertEqual(replay.outcome, "already_imported")
+        self.assertEqual(replay.batch_id, first.batch_id)
+        self.assertEqual(self._scalar("SELECT count(*) FROM galaxy_import_batch"), 2)
+        self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)), "complete")
+        self.assertEqual(self.store.current_batch_id(), second.batch_id)
+
+    def test_an_expired_batch_is_not_the_current_batch(self) -> None:
+        """Codex 复查 P1：过期批次不算「当前有效」——清理没跑不等于快照还新鲜。"""
+        result = self._import()
+        self._execute(
+            "UPDATE galaxy_import_batch SET expires_at = now() - interval '1 hour' WHERE id = %s",
+            (result.batch_id,),
+        )
+
+        self.assertIsNone(self.store.current_batch_id())
 
     def test_batch_records_source_label_and_row_counts_per_table(self) -> None:
         result = self._import()

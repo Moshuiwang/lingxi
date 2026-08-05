@@ -30,7 +30,10 @@ class RosterRow(NamedTuple):
     personnel_id: str
     email: str
     name: str
-    work_no: str
+    # 命名与匹配层输入键一致（employee_no）：曾叫 work_no，与
+    # core/permission/account_match 的键名对不上，工号在接线处会静默丢失
+    # （独立复查实测：该形态下全部退化为纯邮箱匹配）。
+    employee_no: str
     record_id: str
 
 
@@ -83,7 +86,7 @@ def normalize_record(record: Any) -> RosterRow:
         personnel_id=field_text(fields.get("人员ID")),
         email=field_text(fields.get("邮箱")),
         name=field_text(fields.get("人员姓名")),
-        work_no=field_text(fields.get("工号")),
+        employee_no=field_text(fields.get("工号")),
         record_id=field_text(record.get("record_id")) if isinstance(record, dict) else "",
     )
 
