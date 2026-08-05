@@ -36,6 +36,9 @@ class WorkerConfig:
     question: str
     read_only_tool: str
     trace_id: str
+    # 单回合墙钟上限：SDK 传输挂住不发终止消息时，没有它整个回合会永久等待，
+    # 连失败报告都出不来（Codex 复查发现）。
+    turn_timeout_seconds: float
     audit_input_fields: tuple[str, ...] = ()
     failure_text_markers: tuple[str, ...] = ()
     mcp_servers: Mapping[str, Any] = field(default_factory=dict)
@@ -56,7 +59,8 @@ def load_config(env: Mapping[str, str]) -> WorkerConfig:
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tool=_read_only_tool(env),
-        trace_id=_text(env, "TRACE_ID") or new_ulid(),
+        trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
+        turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
         mcp_servers=_mcp_servers(env),
@@ -130,3 +134,26 @@ def _json(raw: str, name: str) -> Any:
     except ValueError as error:
         # 原文可能含连接串或令牌，只回报错误位置，不回显内容。
         raise WorkerConfigError(f"{ENV_PREFIX}{name} 不是合法 JSON：{error.__class__.__name__}") from None
+
+
+def _validated_trace_id(value: str) -> str:
+    from lingxi.core.ids import is_ulid, new_ulid
+
+    if not value:
+        return new_ulid()
+    if not is_ulid(value):
+        # 不回显收到的值：误接进来的可能是令牌。
+        raise WorkerConfigError("LINGXI_WORKER_TRACE_ID 必须是 26 位 Crockford ULID（收到的值不回显）")
+    return value
+
+
+def _turn_timeout(value: str) -> float:
+    if not value:
+        return 600.0
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正数（秒）") from error
+    if seconds <= 0:
+        raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正数（秒）")
+    return seconds

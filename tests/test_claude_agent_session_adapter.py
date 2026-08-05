@@ -35,6 +35,9 @@ class StubAgentOptions:
         cwd=None,
         model=None,
         system_prompt=None,
+        setting_sources=None,
+        permission_mode=None,
+        stderr=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
@@ -43,6 +46,9 @@ class StubAgentOptions:
         self.cwd = cwd
         self.model = model
         self.system_prompt = system_prompt
+        self.setting_sources = setting_sources
+        self.permission_mode = permission_mode
+        self.stderr = stderr
 
 
 class StubTextBlock:
@@ -155,7 +161,7 @@ class AgentOptionsShapeTest(_StubSDK):
         from lingxi.core.execution.hooks import HOOK_EVENTS, OBSERVATION_ONLY_EVENTS
 
         gateway = self.gateway()
-        options = build_agent_options(gateway, allowed_tools=("mcp__q__list",))
+        options = build_agent_options(gateway, allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
 
         self.assertEqual(set(options.hooks), set(HOOK_EVENTS) | set(OBSERVATION_ONLY_EVENTS))
         self.assertEqual(options.hooks["PreToolUse"][0].hooks, [gateway.on_hook_event])
@@ -165,13 +171,14 @@ class AgentOptionsShapeTest(_StubSDK):
     def test_optional_fields_are_only_passed_when_configured(self) -> None:
         from lingxi.adapters.claude_agent_session import build_agent_options
 
-        bare = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",))
+        bare = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
         self.assertIsNone(bare.cwd)
         self.assertIsNone(bare.model)
         self.assertIsNone(bare.mcp_servers)
 
         full = build_agent_options(
             self.gateway(),
+            stderr_sink=lambda line: None,
             allowed_tools=("mcp__q__list",),
             mcp_servers={"q": {"type": "http", "url": "https://example.invalid/mcp"}},
             cwd="/tmp/lingxi-workspace",
@@ -261,10 +268,10 @@ class SingleTurnSessionTest(_StubSDK):
             StubAssistantMessage([StubTextBlock("日活 1024。")]),
             StubResultMessage(),
         ]
-        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",))
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
         seen: list = []
 
-        asyncio.run(run_single_turn(options=options, prompt="问题", sink=seen.append))
+        asyncio.run(run_single_turn(options=options, prompt="问题", sink=seen.append, timeout_seconds=30))
 
         self.assertEqual(self.calls["clients"], [options])
         self.assertEqual(self.calls["prompts"], ["问题"])

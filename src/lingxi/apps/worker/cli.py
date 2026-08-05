@@ -6,8 +6,9 @@
   只是 ``turn`` 为空、``failure.code`` 为 ``config_error``。
 - **stderr**：结构化日志，每行一个 JSON 对象，都带 ``trace_id``。不写日志文件、
   不自行轮转（`V-部署-04`）。
-- **退出码**：0 回合正常收口；2 回合跑完但没收口（正文为空、终止结果不是恰好一次）；
-  3 配置错误；4 会话失败（含 SDK 未安装）。
+- **退出码**：0 回合正常收口；2 回合跑完但没收口（正文为空、终止结果不是恰好一次、
+  SDK 终止消息自报错误）；3 配置错误；4 会话失败（含 SDK 未安装）；
+  5 检测到绕过屏障的调用（`ungated_count > 0`，hook 未触发的唯一可观察形状）。
 
 日志里刻意不出现问题原文与最终正文，只出现字节数、计数与状态：受控验证的证据
 "只保留事件类型、计数、状态、长度、哈希和脱敏摘要"（Issue #37 验证与证据）。
@@ -21,7 +22,8 @@ import os
 import sys
 from typing import Any, Mapping, TextIO
 
-from lingxi.core.ids import new_ulid
+from lingxi.core.execution.audit import redact_free_text
+from lingxi.core.ids import is_ulid, new_ulid
 
 from .config import WorkerConfigError, load_config
 from .report import config_error_report
@@ -31,6 +33,7 @@ EXIT_OK = 0
 EXIT_TURN_NOT_CLOSED = 2
 EXIT_CONFIG_ERROR = 3
 EXIT_SESSION_FAILED = 4
+EXIT_GATE_BYPASSED = 5
 
 
 def main(
@@ -48,9 +51,14 @@ def main(
     try:
         config = load_config(env)
     except WorkerConfigError as error:
-        trace_id = env.get("LINGXI_WORKER_TRACE_ID") or new_ulid()
-        _log(err, trace_id, "error", "worker.config.invalid", message=str(error))
-        _emit(out, config_error_report(trace_id=trace_id, message=str(error)))
+        provided_trace_id = env.get("LINGXI_WORKER_TRACE_ID", "")
+        # 只有合法 ULID 才复用：误接进来的令牌不得随错误输出外泄（Codex 复查）。
+        trace_id = provided_trace_id if is_ulid(provided_trace_id) else new_ulid()
+        # 配置错误文案可能回显运维写串的原值（令牌形态也拦不住），与模型侧
+        # 同一标准：出口过自由文本脱敏并截断（独立复查发现）。
+        message = redact_free_text(str(error))[:300]
+        _log(err, trace_id, "error", "worker.config.invalid", message=message)
+        _emit(out, config_error_report(trace_id=trace_id, message=message))
         return EXIT_CONFIG_ERROR
 
     _log(
@@ -64,17 +72,21 @@ def main(
         workspace_configured=config.workspace is not None,
     )
 
-    report = asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+    report = asyncio.run(WorkerTurnExecutor(config, stderr_stream=err).run_turn(config.question))
     turn = report["turn"]
+    gate_bypassed = report["audit"]["ungated_count"] > 0
     _log(
         err,
         config.trace_id,
-        "error" if report["failure"] else "info",
+        "error" if (report["failure"] or gate_bypassed or not turn["closed"]) else "info",
         "worker.turn.finished",
         closed=turn["closed"],
         user_result=turn["user_result"],
         terminal_result_count=turn["terminal_result_count"],
         sdk_result_message_count=turn["sdk_result_message_count"],
+        sdk_result_is_error=turn["sdk_result_is_error"],
+        sdk_result_subtype=turn["sdk_result_subtype"],
+        gate_bypassed=gate_bypassed,
         final_text_bytes=turn["final_text_bytes"],
         call_count=report["audit"]["call_count"],
         denied_count=report["audit"]["denied_count"],
@@ -86,6 +98,9 @@ def main(
 
     if report["failure"]:
         return EXIT_SESSION_FAILED
+    if gate_bypassed:
+        # 屏障被绕过比"没收口"更严重：退出码单列，受控验证据此直接判失败。
+        return EXIT_GATE_BYPASSED
     return EXIT_OK if turn["closed"] else EXIT_TURN_NOT_CLOSED
 
 

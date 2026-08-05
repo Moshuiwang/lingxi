@@ -45,15 +45,25 @@ def build_report(
         "trace_id": trace_id,
         "question_bytes": len(question.encode("utf-8")),
         "turn": {
+            # 收口＝审计侧恰好一次终止 + 流侧恰好一条 ResultMessage 且它不自报
+            # 错误 + 没有失败 + 没有绕过屏障的调用。SDK 说这轮错了（如
+            # error_max_turns 截断）却被报成正常收口，受控验证会把半截回合记成
+            # 通过；ungated>0 是「hook 未触发」唯一的可观察形状（独立复查发现）。
             "closed": bool(
-                summary.terminal_ok and stream.result_message_count == 1 and failure is None
+                summary.terminal_ok
+                and stream.result_message_count == 1
+                and stream.result_is_error is not True
+                and failure is None
+                and not summary.ungated_calls
             ),
+            "gate_bypassed": bool(summary.ungated_calls),
             "final_text": redacted_text,
             "final_text_bytes": summary.final_text_bytes,
             "user_result": summary.user_result.value,
             "terminal_result_count": summary.terminal_result_count,
             "sdk_result_message_count": stream.result_message_count,
             "sdk_result_is_error": stream.result_is_error,
+            "sdk_result_subtype": redact_free_text(stream.result_subtype) if stream.result_subtype else None,
         },
         "audit": {
             "call_count": len(calls),

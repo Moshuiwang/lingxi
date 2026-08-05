@@ -64,6 +64,9 @@ class StubAgentOptions:
         cwd=None,
         model=None,
         system_prompt=None,
+        setting_sources=None,
+        permission_mode=None,
+        stderr=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
@@ -72,6 +75,9 @@ class StubAgentOptions:
         self.cwd = cwd
         self.model = model
         self.system_prompt = system_prompt
+        self.setting_sources = setting_sources
+        self.permission_mode = permission_mode
+        self.stderr = stderr
 
 
 class StubTextBlock:
@@ -127,11 +133,26 @@ class FakeAgentSDK:
     "文件不存在"是可证伪的事实，不是对实现的复述。
     """
 
-    def __init__(self, script) -> None:
+    def __init__(
+        self,
+        script,
+        *,
+        result_messages: int = 1,
+        result_subtype: str = "success",
+        result_is_error: bool = False,
+        skip_pre_tool_use: bool = False,
+    ) -> None:
         self.script = list(script)
         self.options = []
         self.prompts = []
         self.executed = []
+        # 终止消息可配置：省略/重复 ResultMessage、SDK 自报错误结束，都是
+        # 真实链路可能出现的档位（独立复查发现原脚本恒定"一次成功"）。
+        self.result_messages = result_messages
+        self.result_subtype = result_subtype
+        self.result_is_error = result_is_error
+        # 只发 PostToolUse 不发 PreToolUse：模拟 hook 未注册/被跳过的屏障失效形状。
+        self.skip_pre_tool_use = skip_pre_tool_use
 
     def install(self, testcase) -> "FakeAgentSDK":
         module = types.ModuleType("claude_agent_sdk")
@@ -193,6 +214,22 @@ class FakeAgentSDK:
             tool_input = step.get("input") or {}
             yield StubAssistantMessage([StubToolUseBlock(call_id, step["tool"], tool_input)])
 
+            if self.skip_pre_tool_use:
+                self._execute(step)
+                await self._fire(
+                    options,
+                    "PostToolUse",
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": step["tool"],
+                        "tool_input": tool_input,
+                        "tool_use_id": call_id,
+                    },
+                    call_id,
+                )
+                yield StubUserMessage([StubToolResultBlock(call_id, step.get("result"), step.get("is_error"))])
+                continue
+
             response = await self._fire(
                 options,
                 "PreToolUse",
@@ -253,7 +290,8 @@ class FakeAgentSDK:
             )
 
         await self._fire(options, "Stop", {"hook_event_name": "Stop"}, None)
-        yield StubResultMessage(subtype="success", is_error=False)
+        for _ in range(self.result_messages):
+            yield StubResultMessage(subtype=self.result_subtype, is_error=self.result_is_error)
 
     def _execute(self, step) -> None:
         self.executed.append(step["tool"])
@@ -280,7 +318,7 @@ def worker_env(**overrides):
         "LINGXI_WORKER_QUESTION": "近 7 天的活跃用户数是多少？",
         "LINGXI_WORKER_READONLY_TOOL": READ_ONLY_TOOL,
         "LINGXI_WORKER_AUDIT_INPUT_FIELDS": "metric",
-        "LINGXI_WORKER_TRACE_ID": "01J000000000000000000TEST",
+        "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
     }
     env.update({key: value for key, value in overrides.items() if value is not None})
     return env
@@ -641,6 +679,191 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(recorded["note"], {"omitted": True})
 
 
+class ReviewHardeningTest(unittest.TestCase):
+    """PR #47 独立复查后补的收口信号用例：SDK 自报错误、终止双计数、屏障绕过、
+    配置错误脱敏、中断契约。全部先按复查报告的复现步骤确认原实现确实说谎/泄漏，
+    再修复并以本组用例钉住。"""
+
+    def _run_cli(self, sdk: FakeAgentSDK):
+        from lingxi.apps.worker.cli import main
+
+        sdk.install(self)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = main(env=worker_env(), stdout=stdout, stderr=stderr)
+        return code, json.loads(stdout.getvalue()), stderr.getvalue()
+
+    def test_an_sdk_error_result_is_not_reported_as_closed(self) -> None:
+        """SDK 自己说这轮错了（如 error_max_turns 截断），不得报成正常收口。"""
+        script = [{"kind": "text", "text": "我正在查询，请稍等……"}]
+        code, payload, stderr_text = self._run_cli(
+            FakeAgentSDK(script, result_subtype="error_max_turns", result_is_error=True)
+        )
+
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["turn"]["closed"])
+        self.assertTrue(payload["turn"]["sdk_result_is_error"])
+        self.assertEqual(payload["turn"]["sdk_result_subtype"], "error_max_turns")
+        self.assertIn('"level": "error"', stderr_text.replace(": ", ": "))
+
+    def test_a_missing_result_message_does_not_close_the_turn(self) -> None:
+        """Stop 到了但没有 ResultMessage：双计数缺一即不收口（原实现无此用例，
+        删掉 result_message_count == 1 条件测试曾全绿）。"""
+        script = [{"kind": "text", "text": "答案。"}]
+        code, payload, _ = self._run_cli(FakeAgentSDK(script, result_messages=0))
+
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["turn"]["closed"])
+        self.assertEqual(payload["turn"]["sdk_result_message_count"], 0)
+        self.assertEqual(payload["turn"]["terminal_result_count"], 1)
+
+    def test_a_duplicate_result_message_does_not_close_the_turn(self) -> None:
+        script = [{"kind": "text", "text": "答案。"}]
+        code, payload, _ = self._run_cli(FakeAgentSDK(script, result_messages=2))
+
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["turn"]["closed"])
+        self.assertEqual(payload["turn"]["sdk_result_message_count"], 2)
+
+    def test_a_gate_bypass_is_a_distinct_failure_signal(self) -> None:
+        """只发 PostToolUse 不发 PreToolUse（hook 未注册/被跳过的形状）：
+        ungated_count>0 必须以专属退出码与 error 日志暴露，不得报成功。"""
+        script = [
+            {"kind": "tool", "tool": "Write", "input": {"file_path": "x"}, "result": "done"},
+            {"kind": "text", "text": "已写入。"},
+        ]
+        code, payload, stderr_text = self._run_cli(FakeAgentSDK(script, skip_pre_tool_use=True))
+
+        self.assertEqual(code, 5)
+        self.assertFalse(payload["turn"]["closed"])
+        self.assertTrue(payload["turn"]["gate_bypassed"])
+        self.assertGreaterEqual(payload["audit"]["ungated_count"], 1)
+        self.assertIn('"gate_bypassed": true', stderr_text)
+        self.assertIn('"level": "error"', stderr_text)
+
+    def test_a_normal_turn_reports_result_and_receipt_counters(self) -> None:
+        """把此前"只上报不断言"的字段钉住：正常回合恰好一条非错误终止消息、
+        回执计数与调用数一致。"""
+        script = [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "日活 1024。"},
+        ]
+        code, payload, _ = self._run_cli(FakeAgentSDK(script))
+
+        self.assertEqual(code, 0)
+        self.assertIs(payload["turn"]["sdk_result_is_error"], False)
+        self.assertEqual(payload["turn"]["sdk_result_subtype"], "success")
+        self.assertEqual(payload["audit"]["tool_result_count"], 1)
+
+    def test_a_config_error_never_echoes_a_token_shaped_value(self) -> None:
+        """配置错误文案与模型侧同一标准：出口脱敏（原实现把原值同时打进
+        stdout 与 stderr，独立复查已实测复现）。"""
+        from lingxi.apps.worker.cli import main
+
+        probe = "Bearer LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOL=probe), stdout=stdout, stderr=stderr)
+
+        self.assertEqual(code, 3)
+        self.assertNotIn(probe, stdout.getvalue())
+        self.assertNotIn(probe, stderr.getvalue())
+        self.assertNotIn("LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8", stdout.getvalue() + stderr.getvalue())
+
+    def test_a_hung_transport_times_out_as_an_explicit_failure(self) -> None:
+        """Codex 复查：SDK 传输挂住不发终止消息时必须墙钟超时并出失败报告，
+        不得永久等待。"""
+        import asyncio as _asyncio
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "占位"}])
+        sdk.install(self)
+        module = sys.modules["claude_agent_sdk"]
+
+        class HangingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    await _asyncio.sleep(3600)
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        module.ClaudeSDKClient = HangingClient
+
+        from lingxi.apps.worker.cli import main
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = main(env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS="0.05"), stdout=stdout, stderr=stderr)
+
+        self.assertEqual(code, 4)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["failure"]["code"], "turn_timeout")
+
+    def test_an_invalid_trace_id_is_rejected_without_echoing_it(self) -> None:
+        """Codex 复查：外部 trace_id 只收 26 位 Crockford ULID；误接的令牌
+        不得随错误输出原样外泄。"""
+        from lingxi.apps.worker.cli import main
+
+        probe = "Bearer_FAKE_TOKEN_a1b2c3d4e5f6g7h8i9"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = main(env=worker_env(LINGXI_WORKER_TRACE_ID=probe), stdout=stdout, stderr=stderr)
+
+        self.assertEqual(code, 3)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(probe, combined)
+        payload = json.loads(stdout.getvalue())
+        self.assertNotEqual(payload["trace_id"], probe)
+        self.assertEqual(len(payload["trace_id"]), 26)
+
+    def test_sdk_stderr_lines_are_redacted_and_structured(self) -> None:
+        """Codex 复查：SDK 子进程 stderr 必须经脱敏回调进结构化日志，
+        不得裸继承 fd 2。"""
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "占位"}])
+        sdk.install(self)
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        options = executor.build_session_options()
+
+        self.assertTrue(callable(options.stderr))
+        options.stderr("boot failed: token LINGXI_FAKE_SECRET_z9y8x7w6v5u4t3s2")
+
+        line = json.loads(captured.getvalue())
+        self.assertEqual(line["event"], "worker.sdk.stderr")
+        self.assertEqual(line["trace_id"], config.trace_id)
+        self.assertNotIn("LINGXI_FAKE_SECRET_z9y8x7w6v5u4t3s2", captured.getvalue())
+
+    def test_an_interruption_still_produces_a_report(self) -> None:
+        """CancelledError 属 BaseException：不接住就没有报告，违反 stdout 契约。"""
+        import asyncio as _asyncio
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.install(self)
+
+        module = sys.modules["claude_agent_sdk"]
+
+        class InterruptingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    raise _asyncio.CancelledError()
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        module.ClaudeSDKClient = InterruptingClient
+
+        config = load_config(worker_env())
+        report = _asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+
+        self.assertIsNotNone(report["failure"])
+        self.assertEqual(report["failure"]["code"], "interrupted")
+        self.assertFalse(report["turn"]["closed"])
+
+
 class WorkerCliTest(unittest.TestCase):
     """入口必须真的能以 ``python -m lingxi.apps.worker`` 启动。"""
 
@@ -683,11 +906,11 @@ class WorkerCliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["turn"]["user_result"], "obtained")
-        self.assertEqual(payload["trace_id"], "01J000000000000000000TEST")
+        self.assertEqual(payload["trace_id"], "01J0000000000000000TEST000")
         lines = [json.loads(line) for line in stderr.getvalue().splitlines() if line.strip()]
         self.assertTrue(lines, "结构化日志必须写到 stderr")
         for line in lines:
-            self.assertEqual(line["trace_id"], "01J000000000000000000TEST")
+            self.assertEqual(line["trace_id"], "01J0000000000000000TEST000")
         self.assertIn("worker.turn.finished", [line["event"] for line in lines])
 
     def test_cli_exit_code_reports_an_unclosed_turn(self) -> None:

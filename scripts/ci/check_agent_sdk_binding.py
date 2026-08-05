@@ -19,7 +19,14 @@ import sys
 FAKE_ENV = {
     "LINGXI_WORKER_QUESTION": "CI 构造冒烟，不会发给模型",
     "LINGXI_WORKER_READONLY_TOOL": "mcp__ci-smoke__list_metrics",
-    "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000CI",
+    "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000C10",
+    # 四个"配置了才传"的可选字段也要在真实 dataclass 上构造一次：漏在冒烟外，
+    # SDK 改字段名时 CI 全绿、配了对应变量的受控验证一跑就炸（独立复查发现）。
+    # 空壳 MCP 定义只构造不连接；command 用 /bin/true 不产生任何副作用。
+    "LINGXI_WORKER_MCP_SERVERS": '{"ci-smoke": {"type": "stdio", "command": "/bin/true"}}',
+    "LINGXI_WORKER_WORKSPACE": ".",
+    "LINGXI_WORKER_MODEL": "ci-smoke-model",
+    "LINGXI_WORKER_SYSTEM_PROMPT": "CI 构造冒烟",
 }
 
 
@@ -102,6 +109,23 @@ def check_worker_entry(expected_events: set[str]) -> str | None:
         return f"worker 只应放行一个只读工具，实际是 {getattr(options, 'allowed_tools', None)}"
     if list(getattr(options, "disallowed_tools", [])) != []:
         return "disallowed_tools 必须留空，否则规则层会抢在我们的 PreToolUse 之前拦截"
+    if list(getattr(options, "setting_sources", ["<missing>"])) != []:
+        return "setting_sources 必须显式为空列表（架构设计 5.3 隔离边界），否则设置源可能与屏障并存"
+    if getattr(options, "permission_mode", None) != "dontAsk":
+        return "permission_mode 必须是 L4a 验证过的 dontAsk"
+    if not callable(getattr(options, "stderr", None)):
+        return "必须注入 SDK 子进程 stderr 的脱敏回调，否则原始错误绕过出口纪律直接继承 fd 2"
+
+    # 会话类本身也要在真实 SDK 上核对：run_single_turn 唯一依赖它，改名或
+    # query/receive_response 签名变化只有这里能在 CI 抓到（独立复查发现）。
+    import claude_agent_sdk
+
+    client_type = getattr(claude_agent_sdk, "ClaudeSDKClient", None)
+    if client_type is None:
+        return "真实 SDK 里找不到 ClaudeSDKClient（会话类改名？）"
+    for attribute in ("query", "receive_response"):
+        if not hasattr(client_type, attribute):
+            return f"ClaudeSDKClient 缺少 {attribute}（会话协议变化？）"
     return None
 
 

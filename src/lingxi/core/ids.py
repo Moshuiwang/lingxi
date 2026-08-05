@@ -40,3 +40,17 @@ def new_ulid(*, now_ms: int | None = None, randomness: bytes | None = None) -> s
     return "".join(
         _ALPHABET[(value >> shift) & 0x1F] for shift in range((_ENCODED_LENGTH - 1) * 5, -1, -5)
     )
+
+
+_CROCKFORD = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+
+
+def is_ulid(value: object) -> bool:
+    """26 位 Crockford Base32 的形状校验（大小写不敏感）。
+
+    外部传入的 trace_id 必须过这道：任意字符串直通会破坏全仓库的 ULID 排序
+    约定，误接的令牌还会随错误输出原样外泄（Codex 复查发现）。"""
+
+    if not isinstance(value, str) or len(value) != 26:
+        return False
+    return all(ch in _CROCKFORD for ch in value.upper())

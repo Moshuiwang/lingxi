@@ -36,6 +36,7 @@ class TurnStreamRecorder:
         self._audit = audit
         self._result_message_count = 0
         self._result_is_error: bool | None = None
+        self._result_subtype: str | None = None
         self._tool_result_count = 0
         self._final_text = ""
 
@@ -60,6 +61,14 @@ class TurnStreamRecorder:
         return self._result_is_error
 
     @property
+    def result_subtype(self) -> str | None:
+        """SDK 终止消息的子类型（如 ``success`` / ``error_max_turns``）。
+
+        只保存受控投影：非字符串一律记 ``None``，超长截断——它是模型/SDK 侧
+        文本，进报告前仍会再过一次出口脱敏。"""
+        return self._result_subtype
+
+    @property
     def tool_result_count(self) -> int:
         return self._tool_result_count
 
@@ -82,3 +91,5 @@ class TurnStreamRecorder:
         elif kind == "result":
             self._result_message_count += 1
             self._result_is_error = bool(event.get("is_error"))
+            subtype = event.get("subtype")
+            self._result_subtype = subtype[:64] if isinstance(subtype, str) else None

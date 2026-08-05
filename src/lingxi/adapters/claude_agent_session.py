@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any, Callable, Iterable, Mapping
 
 from lingxi.core.execution.hooks import ToolGateway
@@ -36,6 +38,7 @@ def build_agent_options(
     model: str | None = None,
     system_prompt: str | None = None,
     observe_permission_events: bool = True,
+    stderr_sink: Callable[[str], None],
 ) -> Any:
     """构造装好只读屏障的 ``ClaudeAgentOptions``。
 
@@ -54,6 +57,17 @@ def build_agent_options(
         "allowed_tools": list(allowed_tools),
         "disallowed_tools": [],
         "hooks": build_hook_matchers(gateway, observe_permission_events=observe_permission_events),
+        # SDK 子进程的 stderr 不设回调就直接继承 fd 2：启动失败的原始错误
+        # （可能含令牌）会绕过结构化日志与出口脱敏原样落到进程 stderr
+        # （Codex 复查发现）。调用方必须提供脱敏后的结构化落点。
+        "stderr": stderr_sink,
+        # 架构设计 5.3 的隔离边界：不加载用户/项目设置源。不显式传空，宿主机
+        # ~/.claude/settings.json 里的 permissions/hooks/mcpServers 就可能与屏障
+        # 并存，PreToolUse 单点判定的绕过面被无声打开（独立复查发现）。
+        "setting_sources": [],
+        # L4a 已验证的取值（当前能力 2026-07-28 定向补测就是在 dontAsk 下确认
+        # hook 拒绝真的阻止执行）；不传则落到 SDK 默认值，行为未经验证。
+        "permission_mode": "dontAsk",
     }
     # 未配置的字段一律不传，交给 SDK 自己的默认值；传 None 覆盖默认值是另一种错。
     if mcp_servers:
@@ -72,6 +86,7 @@ async def run_single_turn(
     options: Any,
     prompt: str,
     sink: Callable[[Mapping[str, Any]], None],
+    timeout_seconds: float,
 ) -> None:
     """跑**一个**回合：建会话、发一次提问、把消息流规范化后交给 ``sink``。
 
@@ -81,11 +96,14 @@ async def run_single_turn(
 
     from claude_agent_sdk import ClaudeSDKClient
 
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(prompt)
-        async for message in client.receive_response():
-            for event in normalize_message(message):
-                sink(event)
+    # 墙钟上限盖住整个回合：SDK 传输保持连接却不发终止消息时，
+    # receive_response() 的迭代器不会自行结束（Codex 复查发现）。
+    async with asyncio.timeout(timeout_seconds):
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                for event in normalize_message(message):
+                    sink(event)
 
 
 def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
