@@ -23,6 +23,17 @@
 -- 陈旧，而它的唯一用途就是拦截陈旧状态（断言 V-开通-07）。
 -- 本表也不存任何令牌、短期凭据或聊天内容。
 
+-- 硬依赖断言：注释挡不住乱序执行，PL/pgSQL 函数体在 CREATE 时又不解析表名，
+-- 缺 006 时本迁移会「成功」、然后在第一次建档时才运行期爆炸（独立复查发现）。
+-- 在这里直接失败，把静默错误变成迁移期的显式错误。
+DO $$
+BEGIN
+    IF to_regclass('public.feishu_delegated_credential') IS NULL THEN
+        RAISE EXCEPTION '008 依赖 006_create_feishu_delegated_credential.sql，请先执行 006';
+    END IF;
+END
+$$;
+
 CREATE TABLE app_user (
     id                      TEXT PRIMARY KEY,               -- ULID, usr_*
 

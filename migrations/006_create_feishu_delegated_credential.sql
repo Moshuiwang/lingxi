@@ -17,21 +17,36 @@
 -- 绝不入库：access_token、授权码、App Secret、解密密钥、任何明文凭据。
 -- 普通员工不经过 OAuth（2026-07-28 决策），因此本表不为员工保存任何令牌。
 
+-- 撤销语义（独立复查后修订）：撤销**清空密文与轮换日程、保留主体行**。
+-- app_user 的 V-身份-02 触发器以本表 subject_open_id 为数据来源；若撤销删行，
+-- 「凭据失效但组织快照仍在有效期」的窗口里，专用授权账号就能被建成用户记录。
+-- 重新授权由 save() 的 upsert 原地补回密文。
 CREATE TABLE feishu_delegated_credential (
     purpose                   TEXT PRIMARY KEY
         CHECK (purpose = 'org_directory_sync'),
     subject_open_id           TEXT NOT NULL,
-    encrypted_refresh_token   BYTEA NOT NULL,
+    encrypted_refresh_token   BYTEA,
     scope                     TEXT NOT NULL DEFAULT '',
     issued_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
-    refresh_at                TIMESTAMPTZ NOT NULL,
-    refresh_token_expires_at  TIMESTAMPTZ NOT NULL,
+    refresh_at                TIMESTAMPTZ,
+    refresh_token_expires_at  TIMESTAMPTZ,
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (NULLIF(BTRIM(subject_open_id), '') IS NOT NULL),
-    CHECK (octet_length(encrypted_refresh_token) > 0),
-    -- 轮换点必须严格早于失效点：等于或晚于就意味着这条凭据永远等不到轮换。
-    CHECK (refresh_at < refresh_token_expires_at)
+    -- 有密文就必须有完整轮换日程，且轮换点严格早于失效点（等于或晚于意味着
+    -- 永远等不到轮换）；撤销后的行三者一并为空。
+    CHECK (
+        (
+            encrypted_refresh_token IS NULL
+            AND refresh_at IS NULL
+            AND refresh_token_expires_at IS NULL
+        ) OR (
+            octet_length(encrypted_refresh_token) > 0
+            AND refresh_at IS NOT NULL
+            AND refresh_token_expires_at IS NOT NULL
+            AND refresh_at < refresh_token_expires_at
+        )
+    )
 );
 
 -- 续期扫描的领取入口（lingxi-scheduler，FOR UPDATE SKIP LOCKED）。

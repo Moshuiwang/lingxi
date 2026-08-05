@@ -245,8 +245,20 @@ class PostgresAppUserStore:
                      display_name_locale = EXCLUDED.display_name_locale,
                      department = EXCLUDED.department,
                      tenant_key = EXCLUDED.tenant_key,
-                     employee_no = COALESCE(EXCLUDED.employee_no, app_user.employee_no),
-                     email = COALESCE(EXCLUDED.email, app_user.email),
+                     -- 花名册字段的保留只对"同一个人"成立：feishu_user_id 变了
+                     -- 说明账号复用换人（#34 方案 C 不拦截），旧人的工号/邮箱
+                     -- 绝不能挂在新人身上——工号是匹配银河的主键，残留会把
+                     -- 新人直接接到旧人的权限记录（独立复查发现）。
+                     employee_no = CASE
+                         WHEN app_user.feishu_user_id IS DISTINCT FROM EXCLUDED.feishu_user_id
+                         THEN EXCLUDED.employee_no
+                         ELSE COALESCE(EXCLUDED.employee_no, app_user.employee_no)
+                     END,
+                     email = CASE
+                         WHEN app_user.feishu_user_id IS DISTINCT FROM EXCLUDED.feishu_user_id
+                         THEN EXCLUDED.email
+                         ELSE COALESCE(EXCLUDED.email, app_user.email)
+                     END,
                      updated_at = now()
                 RETURNING id, provisioning_state, permission_record_id, (xmax = 0) AS inserted""",
                 (

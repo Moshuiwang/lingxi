@@ -34,6 +34,11 @@ from lingxi.core.identity.identifiers import redact_identifier
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECONDS = 60
+
+# 新凭据写库的退避重试间隔（秒）。飞书侧旧凭据在续期成功那一刻已作废，
+# 这里的每一次重试都是在挽救一条一次性凭据；用 _stop.wait 而不是 sleep，
+# 让 SIGTERM 仍能立即打断等待。
+SAVE_RETRY_BACKOFF_SECONDS = (0.2, 1.0, 3.0)
 # 飞书开放平台地址来自配置，代码里只有一个可被覆盖的默认值（断言 V-部署-01）。
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
@@ -154,16 +159,41 @@ class CredentialRotationLoop:
             logger.warning("专用授权续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
 
         if decide_after_refresh(outcome) is CredentialAction.ROTATE and replacement is not None:
-            self._vault.save(subject_open_id=claim.subject_open_id, grant=replacement)
-            logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
-            return RotationReport(claimed=1, rotated=1)
+            if self._save_with_retry(subject_open_id=claim.subject_open_id, replacement=replacement):
+                logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
+                return RotationReport(claimed=1, rotated=1)
+            # 新凭据没能落库：旧的此刻已被飞书作废，继续留着只会让下一轮拿死
+            # 凭据再撞一次墙。撤销并用可与普通失败区分的日志请求人工重新授权
+            # （独立复查发现：此前这里的异常会带着仅存于内存的新凭据一起消失）。
+            logger.error(
+                "不可恢复：续期成功但新凭据写库失败，旧凭据已被飞书作废，需人工重新授权 subject=%s",
+                redact_identifier(claim.subject_open_id),
+            )
+            self._vault.revoke(reason="rotation_persist_failed")
+            return RotationReport(claimed=1, revoked=1)
 
         self._vault.revoke(reason=f"refresh_{outcome.value}")
         return RotationReport(claimed=1, revoked=1)
 
+    def _save_with_retry(self, *, subject_open_id: str, replacement: Any) -> bool:
+        """新凭据写库带短退避重试：一次瞬时的数据库抖动不该报废一条一次性凭据。"""
+
+        for delay_seconds in (0.0, *SAVE_RETRY_BACKOFF_SECONDS):
+            if delay_seconds:
+                self._stop.wait(delay_seconds)
+            try:
+                self._vault.save(subject_open_id=subject_open_id, grant=replacement)
+                return True
+            except Exception as error:  # noqa: BLE001 - 记录后重试，最终失败由调用方处置
+                logger.warning("新凭据写库失败，将重试 error=%s", type(error).__name__)
+        return False
+
     def run_forever(self) -> None:
         while not self._stop.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception as error:  # noqa: BLE001 - 定时职责不因一轮异常而终止
+                logger.error("本轮续期扫描异常，下一轮继续 error=%s", type(error).__name__)
             if self._stop.is_set():
                 break
             self._stop.wait(self._interval_seconds)
@@ -174,11 +204,12 @@ def _is_definite_failure(error: BaseException) -> bool:
     """区分"飞书明确拒绝"与"结果不明确"。
 
     两者的处置**相同**（都撤销），区分只为了让日志与后续审计能分辨这两件事。
-    传输层异常属于"我们不知道飞书那边发生了什么"。
+    分类是协议细节，由 adapters 层以 ``definite`` 属性给出（代码框架第二节：
+    协议细节不进 apps 层）；没有该属性的异常一律视为"结果不明确"。
     """
 
-    code = getattr(error, "code", None)
-    return isinstance(code, str) and code.startswith("feishu_code_")
+    definite = getattr(error, "definite", None)
+    return definite is True
 
 
 def install_signal_handlers(loop: CredentialRotationLoop) -> None:

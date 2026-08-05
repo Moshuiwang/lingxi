@@ -245,14 +245,35 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         self.execute("UPDATE feishu_delegated_credential SET encrypted_refresh_token = decode('0102', 'hex')")
 
         self.assertIsNone(self.vault.load())
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 0)
+        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
 
-    def test_revoking_removes_the_row_completely(self) -> None:
+    def test_revoking_clears_the_secret_but_keeps_the_subject_row(self) -> None:
+        """撤销＝清空密文保留主体行：主体行是 V-身份-02 触发器的数据来源，
+        删行会在「凭据失效、快照仍有效」的窗口里拆掉建档防线（独立复查发现）。"""
         self._save()
 
         self.assertTrue(self.vault.revoke(reason="test"))
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
+        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
         self.assertIsNone(self.vault.load())
+        # 再次撤销没有可清空的密文，应报告 False 而不是假装又撤销了一次。
+        self.assertFalse(self.vault.revoke(reason="twice"))
+
+    def test_the_delegated_subject_is_still_rejected_after_revocation(self) -> None:
+        """独立复查要求的用例：先撤销，再为专用授权主体建档，必须仍被数据库拒绝。"""
+        self._save()
+        self.assertTrue(self.vault.revoke(reason="test"))
+
+        subject = self.scalar("SELECT subject_open_id FROM feishu_delegated_credential")
+        self.assertIsNotNone(subject)
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.execute(
+                """INSERT INTO app_user
+                     (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                      display_name, tenant_key)
+                   VALUES ('usr_test_revoked_subject', %s, 'u', 'un', '某人', 't')""",
+                (subject,),
+            )
 
 
 class OrgSnapshotTest(IdentityPostgresTestCase):
@@ -423,6 +444,47 @@ class AppUserRecordTest(IdentityPostgresTestCase):
             self.query("SELECT employee_no, email FROM app_user"),
             [("80001", "he.xugong@example-corp.invalid")],
         )
+
+    def test_concurrent_upserts_of_the_same_open_id_leave_exactly_one_record(self) -> None:
+        """V-身份-01 的并发面：两个连接同时建档同一 open_id，唯一索引 +
+        单语句 upsert 必须收敛到一条记录（补上 PR 正文声称过的并发用例）。"""
+        import threading as _threading
+
+        errors: list[BaseException] = []
+
+        def upsert() -> None:
+            try:
+                self.users.record_identity(self._draft())
+            except BaseException as error:  # noqa: BLE001 - 测试只收集
+                errors.append(error)
+
+        workers = [_threading.Thread(target=upsert) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(self.scalar("SELECT count(*) FROM app_user"), 1)
+
+    def test_an_identity_switch_clears_stale_roster_fields(self) -> None:
+        """账号复用换人（#34 方案 C 不拦截）：同一 open_id 换 user_id 后，
+        旧人的工号/邮箱不得残留——工号是匹配银河的主键，残留等于把新人
+        接到旧人的权限记录上（独立复查发现）。"""
+        enriched = dataclasses.replace(
+            self._draft(), employee_no="80001", email="he.xugong@example-corp.invalid"
+        )
+        self.users.record_identity(enriched)
+
+        handover = dataclasses.replace(
+            self._draft(),
+            feishu_user_id="user_new_owner",
+            feishu_union_id="union_new_owner",
+            display_name="接手人",
+        )
+        self.users.record_identity(handover)
+
+        self.assertEqual(self.query("SELECT employee_no, email FROM app_user"), [(None, None)])
 
     def test_a_new_identity_is_recorded_without_a_permission_record(self) -> None:
         record = self.users.record_identity(self._draft())

@@ -97,10 +97,24 @@ class PostgresDelegatedCredentialVault:
         logger.info("专用授权凭据已加密写入 subject=%s", redact_identifier(subject_open_id))
 
     def revoke(self, *, reason: str) -> bool:
-        """删除凭据。撤销就是删除：留一条用不了的凭据只会让下一轮继续撞同一堵墙。"""
+        """清空密文与轮换日程，但保留主体行。
+
+        撤销不能删行：`app_user` 的 V-身份-02 触发器以本表的 `subject_open_id`
+        为数据来源，删行等于在「凭据失效、组织快照仍在有效期」的窗口里拆掉那道
+        绕不过去的防线（独立复查发现）。凭据侧的效果与删除等价——`load()` 与
+        `claim_due()` 都只认有密文的行；重新授权由 `save()` 的 upsert 原地补回。
+        """
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("DELETE FROM feishu_delegated_credential WHERE purpose = %s", (DELEGATED_PURPOSE,))
+            cursor.execute(
+                """UPDATE feishu_delegated_credential
+                      SET encrypted_refresh_token = NULL,
+                          refresh_at = NULL,
+                          refresh_token_expires_at = NULL,
+                          updated_at = now()
+                    WHERE purpose = %s AND encrypted_refresh_token IS NOT NULL""",
+                (DELEGATED_PURPOSE,),
+            )
             removed = cursor.rowcount > 0
         if removed:
             logger.warning("专用授权凭据已撤销 reason=%s", reason)
@@ -115,7 +129,8 @@ class PostgresDelegatedCredentialVault:
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """SELECT subject_open_id, encrypted_refresh_token, scope, refresh_at, refresh_token_expires_at
-                     FROM feishu_delegated_credential WHERE purpose = %s""",
+                     FROM feishu_delegated_credential
+                    WHERE purpose = %s AND encrypted_refresh_token IS NOT NULL""",
                 (DELEGATED_PURPOSE,),
             )
             row = cursor.fetchone()
@@ -142,6 +157,7 @@ class PostgresDelegatedCredentialVault:
                 """WITH picked AS (
                        SELECT purpose FROM feishu_delegated_credential
                         WHERE purpose = %(purpose)s
+                          AND encrypted_refresh_token IS NOT NULL
                           AND refresh_at <= %(now)s
                           AND refresh_token_expires_at > %(now)s
                         FOR UPDATE SKIP LOCKED

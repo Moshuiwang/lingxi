@@ -17,6 +17,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import textwrap
 import time
 import unittest
@@ -39,6 +40,10 @@ COMPLETE_ENV = {
 }
 
 
+def replacement_grant(*, seconds: int = 604800) -> AuthorizationGrant:
+    return AuthorizationGrant(SecretToken("fake-next-token"), seconds, "offline_access")
+
+
 def credential(*, subject: str = "ou_delegated", seconds: int = 604800) -> StoredCredential:
     now = datetime.now(timezone.utc)
     return StoredCredential(
@@ -50,8 +55,9 @@ def credential(*, subject: str = "ou_delegated", seconds: int = 604800) -> Store
 
 
 class FakeVault:
-    def __init__(self, claims: list[StoredCredential | None]) -> None:
+    def __init__(self, claims: list[StoredCredential | None], *, save_failures: int = 0) -> None:
         self._claims = list(claims)
+        self._save_failures = save_failures
         self.saved: list[tuple[str, AuthorizationGrant]] = []
         self.revoked: list[str] = []
 
@@ -59,6 +65,9 @@ class FakeVault:
         return self._claims.pop(0) if self._claims else None
 
     def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at=None) -> None:
+        if self._save_failures > 0:
+            self._save_failures -= 1
+            raise RuntimeError("模拟写库失败")
         self.saved.append((subject_open_id, grant))
 
     def revoke(self, *, reason: str) -> bool:
@@ -129,6 +138,62 @@ class RotationLoopTest(unittest.TestCase):
         self.assertEqual(vault.saved[0][0], "ou_delegated")
         self.assertEqual(vault.saved[0][1].refresh_token.reveal(), "fake-next-token")
         self.assertEqual(vault.revoked, [])
+
+    def test_a_transient_save_failure_is_retried_and_the_credential_survives(self) -> None:
+        """写库瞬时失败要重试：一次数据库抖动不该报废一条一次性凭据（独立复查发现）。"""
+        vault = FakeVault([credential()], save_failures=1)
+        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+
+        report = loop.run_once()
+
+        self.assertEqual((report.claimed, report.rotated, report.revoked), (1, 1, 0))
+        self.assertEqual(len(vault.saved), 1)
+        self.assertEqual(vault.revoked, [])
+
+    def test_a_persistent_save_failure_revokes_with_a_distinct_reason(self) -> None:
+        """续期成功但新凭据始终写不进库：旧的已被飞书作废，必须撤销并以
+        可区分的日志请求人工重新授权，不得抛异常带着新凭据一起消失。"""
+        vault = FakeVault([credential()], save_failures=99)
+        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
+            report = loop.run_once()
+
+        self.assertEqual((report.claimed, report.rotated, report.revoked), (1, 0, 1))
+        self.assertEqual(vault.revoked, ["rotation_persist_failed"])
+        self.assertTrue(any("不可恢复" in line for line in captured.output))
+        self.assertTrue(all(FAKE_TOKEN not in line for line in captured.output))
+
+    def test_run_forever_survives_an_exception_in_one_round(self) -> None:
+        """定时职责不因一轮异常而终止（独立复查发现：claim_due 抛错会带崩进程）。"""
+
+        class ExplodingVault(FakeVault):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.calls = 0
+
+            def claim_due(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("模拟一次领取异常")
+                return None
+
+        vault = ExplodingVault()
+        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+
+        def stop_after_second_round() -> None:
+            deadline = time.monotonic() + 5
+            while vault.calls < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            loop.request_stop()
+
+        stopper = threading.Thread(target=stop_after_second_round)
+        stopper.start()
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR"):
+            loop.run_forever()
+        stopper.join()
+
+        self.assertGreaterEqual(vault.calls, 2)
 
     def test_a_failed_refresh_revokes_and_never_replays_the_old_credential(self) -> None:
         """V-身份-04：``refresh_token`` 一次性有效，重放等于用一个已作废的凭据。"""

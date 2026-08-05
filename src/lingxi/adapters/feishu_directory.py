@@ -34,11 +34,17 @@ REQUEST_TIMEOUT_SECONDS = 20
 
 
 class FeishuDirectoryError(RuntimeError):
-    """飞书调用失败。``code`` 供程序判断，消息里不含任何凭据。"""
+    """飞书调用失败。``code`` 供程序判断，消息里不含任何凭据。
 
-    def __init__(self, code: str) -> None:
+    ``definite`` 表示"飞书明确拒绝"（收到了业务错误码）而非"结果不明确"
+    （传输层异常、超时等）。这是协议细节的唯一出口：apps 层只读该属性，
+    不解析 ``code`` 的字符串形状（代码框架第二节）。
+    """
+
+    def __init__(self, code: str, *, definite: bool | None = None) -> None:
         super().__init__(f"飞书目录接口调用失败：{code}")
         self.code = code
+        self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
 class Transport(Protocol):
