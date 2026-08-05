@@ -129,5 +129,21 @@ class CsvOverflowRejectionTest(unittest.TestCase):
         self.assertNotIn("fake.leak@example.invalid", message)
 
 
+class CsvStrictParsingTest(unittest.TestCase):
+    def test_an_unclosed_quote_rejects_the_whole_file(self) -> None:
+        """终轮 Codex：默认解析会把未闭合引号后的内容吞进当前字段，错位行
+        可能带着关键 ID 通过校验；strict 方言下整文件拒绝。"""
+        import tempfile
+        from pathlib import Path
+
+        from lingxi.adapters.galaxy_csv_export import read_csv_table
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "user.csv"
+            path.write_bytes('user_id,nick_name\nU1,"未闭合\nU2,正常\n'.encode("utf-8"))
+            with self.assertRaises(ValueError):
+                read_csv_table(path)
+
+
 if __name__ == "__main__":
     unittest.main()

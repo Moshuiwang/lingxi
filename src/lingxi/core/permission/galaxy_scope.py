@@ -173,7 +173,18 @@ def resolve_company_scope(
         by_country_key.setdefault(country_key, scope)
 
     explicit = _unique(_required_text(key) for key in country_keys)
-    all_countries = SENTINEL_COUNTRY_KEY in explicit
+    # 通配只有在哨兵行本身验证通过时才展开：授权表里出现 0、但快照里的哨兵行
+    # 缺失或形态损坏（name/name_cn 不是 ALL/全非）说明快照不可信——此时必须
+    # **失败关闭**（把 0 记为 unresolved），绝不失败开放为全公司（终轮 Codex）。
+    sentinel_rows = [
+        row for row in country_rows if _text(row.get("country_key")) == SENTINEL_COUNTRY_KEY
+    ]
+    sentinel_valid = (
+        len(sentinel_rows) == 1
+        and _text(sentinel_rows[0].get("name")) == "ALL"
+        and _text(sentinel_rows[0].get("name_cn")) == "全非"
+    )
+    all_countries = SENTINEL_COUNTRY_KEY in explicit and sentinel_valid
 
     if all_countries:
         resolved = (
@@ -181,11 +192,20 @@ def resolve_company_scope(
             + tuple(unkeyed)
         )
     else:
-        resolved = tuple(by_country_key[key] for key in explicit if key in by_country_key)
+        # 哨兵不是国家：显式路径永不把 key=0 的行当作可用范围返回——
+        # 哨兵损坏时它会顶着「全非」的名字混进结果（终轮 Codex 的失败开放面）。
+        resolved = tuple(
+            by_country_key[key]
+            for key in explicit
+            if key != SENTINEL_COUNTRY_KEY and key in by_country_key
+        )
 
     # 连不上的键无论是否持有通配都要留痕：它是导出与解释之间的不一致信号。
     unresolved = tuple(
-        key for key in explicit if key != SENTINEL_COUNTRY_KEY and key not in by_country_key
+        key
+        for key in explicit
+        if (key != SENTINEL_COUNTRY_KEY and key not in by_country_key)
+        or (key == SENTINEL_COUNTRY_KEY and not sentinel_valid)
     )
 
     return CompanyScope(

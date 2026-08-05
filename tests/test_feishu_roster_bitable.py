@@ -101,7 +101,8 @@ class FeishuRosterBitableTest(unittest.TestCase):
         reader = _FakePagedReader(
             [([{"fields": {"人员ID": "fs-u1", "邮箱": "jiaming.jia@example.invalid", "人员姓名": "化名甲", "工号": "10001"}}], None)]
         )
-        rows = [row._asdict() for row in read_roster_records(reader)]
+        # 不做 _asdict：接线声明的是「行可直接交给匹配器」，就按原样传（终轮 Codex）。
+        rows = list(read_roster_records(reader))
 
         result = match_galaxy_account(
             "fs-u1",

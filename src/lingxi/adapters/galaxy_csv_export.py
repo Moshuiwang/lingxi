@@ -43,10 +43,16 @@ def read_csv_table(path: Path) -> list[dict[str, str]]:
 
     # utf-8-sig：Excel 导出的 CSV 常带 BOM，不去掉会让首列列名对不上。
     with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
-        reader = csv.DictReader(csv_file)
+        # strict 方言：引号错误抛 csv.Error 而不是把文件余下内容吞进当前字段
+        # （终轮 Codex：未闭合引号的错位行可能带着关键 ID 通过校验）。
+        reader = csv.DictReader(csv_file, strict=True)
         rows: list[dict[str, str]] = []
         overflow_rows: list[int] = []
-        for row_number, raw_row in enumerate(reader, start=1):
+        try:
+            enumerated = list(enumerate(reader, start=1))
+        except csv.Error as error:
+            raise ValueError(f"{path.name} 不是可靠的 CSV（解析错误，疑似未闭合引号），整文件拒绝") from error
+        for row_number, raw_row in enumerated:
             if None in raw_row and raw_row.get(None):
                 overflow_rows.append(row_number)
                 continue

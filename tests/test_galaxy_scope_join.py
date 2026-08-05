@@ -199,6 +199,22 @@ class GalaxyAllAfricaSentinelTest(unittest.TestCase):
         companies = {country.boss_company_id for country in scope.countries}
         self.assertEqual(companies, {"B11", "B77", "B78"})
 
+    def test_a_missing_or_malformed_sentinel_row_fails_closed(self) -> None:
+        """终轮 Codex：授权含 0 但快照里哨兵行缺失/损坏时，绝不失败开放为
+        全公司——0 记入 unresolved，范围为空。"""
+        malformed_sets = (
+            [],  # 哨兵行整行缺失
+            [{"country_key": "0", "name": "NOT_ALL", "name_cn": "全非", "boss_company_id": "B0"}],
+            [{"country_key": "0", "name": "ALL", "name_cn": "别的", "boss_company_id": "B0"}],
+        )
+        base = [{"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"}]
+        for sentinel_rows in malformed_sets:
+            with self.subTest(sentinel_rows=sentinel_rows):
+                scope = resolve_company_scope(["0"], sentinel_rows + base)
+                self.assertFalse(scope.all_countries)
+                self.assertEqual(scope.countries, ())
+                self.assertIn("0", scope.unresolved_country_keys)
+
     def test_explicit_keys_do_not_pull_in_unkeyed_rows(self) -> None:
         rows = [
             {"country_key": "11", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "B11"},

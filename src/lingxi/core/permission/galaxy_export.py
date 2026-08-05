@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,9 +71,10 @@ TABLE_SPECS: Mapping[str, TableSpec] = {
         (
             _column("user_id", required=True, non_empty=True),
             _column("dept_id"),
-            _column("user_name"),
-            _column("nick_name"),
-            _column("email"),
+            # 表头必需（值可空）：漏列/拼错列名会整列破坏账号匹配（终轮 Codex）。
+            _column("user_name", required=True),
+            _column("nick_name", required=True),
+            _column("email", required=True),
             # 源导出的建号时间保持原样文本：格式未经核对，不在导入期猜测解析。
             _column("create_time_raw", "create_time"),
         ),
@@ -84,7 +86,7 @@ TABLE_SPECS: Mapping[str, TableSpec] = {
             _column("user_id", required=True, non_empty=True),
             _column("role_id", required=True, non_empty=True),
             _column("source_user_name", "user_name"),
-            _column("role_name"),
+            _column("role_name", required=True),
         ),
         ("user_id", "role_id"),
     ),
@@ -113,12 +115,12 @@ TABLE_SPECS: Mapping[str, TableSpec] = {
         (
             _column("source_id", "id", required=True, non_empty=True),
             _column("country_key"),
-            _column("name"),
+            _column("name", required=True),
             _column("code"),
-            _column("name_cn"),
+            _column("name_cn", required=True),
             _column("region_key"),
             _column("region_name"),
-            _column("boss_company_id"),
+            _column("boss_company_id", required=True),
         ),
         ("source_id",),
     ),
@@ -337,6 +339,24 @@ def _check_references(
                 "user_role",
                 "role_without_menu",
                 f"{len(roles_without_menu)} 个被分配的角色在 role_menu 中没有任何菜单",
+            )
+        )
+
+    duplicated_country_keys = sorted(
+        key
+        for key, count in Counter(
+            row["country_key"] for row in tables["sys_country"] if row["country_key"]
+        ).items()
+        if count > 1
+    )
+    if duplicated_country_keys:
+        # 同键多行携带不同公司数据时，任何「取第一行」都会静默少给公司
+        # （终轮 Codex）；冲突数据整批拒绝，宁失败不写错范围。
+        errors.append(
+            Issue(
+                "sys_country",
+                "duplicate_country_key",
+                f"{len(duplicated_country_keys)} 个 country_key 存在多行定义",
             )
         )
 

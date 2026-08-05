@@ -36,6 +36,13 @@ class RosterRow(NamedTuple):
     employee_no: str
     record_id: str
 
+    def get(self, key: str, default: object = None) -> object:
+        """让本行可直接交给 ``match_galaxy_account``（它按 Mapping 的 ``get``
+        取值）。NamedTuple 没有 ``get``，此前必须先 ``_asdict()``，文档却声称
+        可直接组合（终轮 Codex 发现的接口不兼容）。"""
+
+        return getattr(self, key, default)
+
 
 class RecordPageReader(Protocol):
     """按页返回多维表格记录的只读传输。"""

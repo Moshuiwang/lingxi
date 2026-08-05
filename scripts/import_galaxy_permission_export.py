@@ -31,6 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="导入银河权限导出（CSV 目录）")
     parser.add_argument("export_directory", type=Path, help="含五个 CSV 的导出目录")
     parser.add_argument(
+        "--confirm-unchanged",
+        action="store_true",
+        help="确认这是新一次真实导出、内容恰与历史批次相同（连续刷新无变化或权限回到旧状态）；"
+        "默认为防误重导旧文件，同内容导入只返回既有批次",
+    )
+    parser.add_argument(
         "--source-label",
         required=True,
         help="来源标注，例如「银河后台导出 2026-07-28」；会写进批次表供回溯",
@@ -46,17 +52,27 @@ def main(argv: list[str] | None = None) -> int:
     store = PostgresGalaxyImportStore(dsn)
     result = store.import_export(
         source_label=arguments.source_label,
+        confirm_unchanged=arguments.confirm_unchanged,
         source_digest=bundle.digest,
         tables=bundle.tables,
     )
 
+    def _issue_line(issue) -> str:
+        # 行号是脱敏结论里唯一的定位抓手（V-银河-13：不回显姓名/邮箱/账号）；
+        # 被拒批次不落库，不打印行号管理员就无从定位（终轮 Codex）。上限 10 个。
+        text = f"{issue.table}/{issue.rule}：{issue.detail}"
+        if issue.row_numbers:
+            shown = "、".join(str(number) for number in issue.row_numbers[:10])
+            text += f"（数据行 {shown}{'…' if len(issue.row_numbers) > 10 else ''}）"
+        return text
+
     for issue in result.warnings:
-        print(f"告警 {issue.table}/{issue.rule}：{issue.detail}")
+        print(f"告警 {_issue_line(issue)}")
 
     if result.outcome == REJECTED:
         print("校验未通过，未写入任何一行：", file=sys.stderr)
         for issue in result.errors:
-            print(f"  - {issue.table}/{issue.rule}：{issue.detail}", file=sys.stderr)
+            print(f"  - {_issue_line(issue)}", file=sys.stderr)
         return 1
 
     if result.outcome == ALREADY_IMPORTED:

@@ -100,6 +100,41 @@ class GalaxyExportShapeTest(unittest.TestCase):
         self.assertEqual(report.row_counts["sys_country"], 2)
 
 
+class GalaxyExportRequiredHeaderTest(unittest.TestCase):
+    """终轮 Codex：解释所需表头缺失必须整批拒绝——漏列会整列破坏匹配/职能/公司数据，
+    而此前静默补 None 仍能取代有效快照。"""
+
+    def test_dropping_an_interpretation_header_rejects_the_export(self) -> None:
+        cases = [
+            ("user", "user_name"),
+            ("user", "email"),
+            ("user_role", "role_name"),
+            ("sys_country", "name_cn"),
+            ("sys_country", "boss_company_id"),
+        ]
+        for table, column in cases:
+            with self.subTest(table=table, column=column):
+                tables = _valid_tables()
+                tables[table] = [
+                    {key: value for key, value in row.items() if key != column} for row in tables[table]
+                ]
+                report = validate_export(tables)
+                self.assertFalse(report.ok)
+                self.assertIn("missing_column", [issue.rule for issue in report.errors])
+
+    def test_duplicate_country_keys_reject_the_export(self) -> None:
+        tables = _valid_tables()
+        extra = dict(tables["sys_country"][0])
+        extra["id"] = "999"
+        extra["boss_company_id"] = "BC-别的"
+        tables["sys_country"] = tables["sys_country"] + [extra]
+
+        report = validate_export(tables)
+
+        self.assertFalse(report.ok)
+        self.assertIn("duplicate_country_key", [issue.rule for issue in report.errors])
+
+
 class GalaxyExportRowNumberFidelityTest(unittest.TestCase):
     """V-银河-13 配套：结论只报行号，行号必须指向源文件的行（独立复查实测
     此前在丢行/合并后会偏移，运维会照错误行号改错数据）。"""

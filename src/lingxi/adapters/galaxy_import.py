@@ -137,6 +137,7 @@ class PostgresGalaxyImportStore:
         source_digest: str,
         tables: Mapping[str, Sequence[Mapping[str, Any]]],
         batch_id: str | None = None,
+        confirm_unchanged: bool = False,
     ) -> ImportResult:
         """执行「校验 → 检查已有数据 → 写入 → 回读确认」。"""
 
@@ -159,6 +160,13 @@ class PostgresGalaxyImportStore:
                 # 免去「两个不同摘要交错留下双 complete」的窗口（独立复查建议）。
                 cursor.execute("SELECT pg_advisory_xact_lock(4217001)")
                 existing_hit = self._batch_for_digest(cursor, source_digest)
+                if existing_hit is not None and confirm_unchanged:
+                    # 真实的新一次导出恰与历史内容相同（连续刷新无变化、或权限
+                    # A→B→A）：仅当调用方显式确认「这是新导出」时才作为新批次
+                    # 落库并成为当前有效（终轮 Codex：摘要不是导出身份）。
+                    # 默认路径仍然挡住误重导（上一轮 Codex：防快照回退）。
+                    logger.info("同内容导出经显式确认，按新批次导入 previous=%s", existing_hit[0])
+                    existing_hit = None
                 if existing_hit is not None:
                     existing, existing_status = existing_hit
                     if existing_status == "superseded":

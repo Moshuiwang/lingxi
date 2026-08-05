@@ -304,6 +304,27 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         self.assertEqual(self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (second.batch_id,)), "complete")
         self.assertEqual(self.store.current_batch_id(), second.batch_id)
 
+    def test_a_confirmed_unchanged_export_becomes_a_fresh_current_batch(self) -> None:
+        """终轮 Codex 的另一半：真实的新导出恰与历史内容相同（A→B→A 或连续
+        刷新无变化）时，经显式确认应作为**新批次**落库并成为当前有效；
+        默认（不确认）仍走防误重导的幂等路径。"""
+        first = self._import()
+        second = self._import(digest="digest-2")
+
+        blocked = self._import()
+        self.assertEqual(blocked.outcome, "already_imported")
+
+        confirmed = self.store.import_export(
+            source_label="重放确认",
+            source_digest="digest-1",
+            tables=_tables(),
+            confirm_unchanged=True,
+        )
+
+        self.assertEqual(confirmed.outcome, "imported")
+        self.assertNotIn(confirmed.batch_id, (first.batch_id, second.batch_id))
+        self.assertEqual(self.store.current_batch_id(), confirmed.batch_id)
+
     def test_an_expired_batch_is_not_the_current_batch(self) -> None:
         """Codex 复查 P1：过期批次不算「当前有效」——清理没跑不等于快照还新鲜。"""
         result = self._import()
