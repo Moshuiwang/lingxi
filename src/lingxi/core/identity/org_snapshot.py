@@ -1,0 +1,210 @@
+"""关联组织成员快照的批次完整性校验与过期规则。
+
+本模块只有规则，没有 I/O：读飞书目录接口在
+:mod:`lingxi.adapters.feishu_directory`，落库在
+:mod:`lingxi.adapters.postgres_identity`。
+
+**硬规则：完整性校验不通过就不提交半轮快照。** 半轮快照比没有快照更危险——
+它会让一部分在职员工"定位不到"，而失败原因（可见范围配置被改回、某个租户
+返回 0 条成员）在下游完全看不出来。2026-07-28 就出现过 8 个关联租户中有 2 个
+返回 0 条成员的实况，见 [Issue #16 正文](https://github.com/Moshuiwang/lingxi/issues/16)。
+
+校验项直接对应已经复验过的上游事实：两条身份路径看到同一批成员、三类标识
+100% 可得、``open_user_id`` 跨租户唯一（710 人去重后仍 710，重复 0）。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Sequence
+
+# 与产品的九十天可识别内容上限一致，用固定小时数避免时区与夏令时造成的漂移。
+SNAPSHOT_RETENTION_DAYS = 90
+SNAPSHOT_RETENTION_HOURS = SNAPSHOT_RETENTION_DAYS * 24
+
+
+@dataclass(frozen=True)
+class SnapshotMember:
+    """一名关联组织成员在快照中的标准化投影。
+
+    刻意**不含在职状态**：可见范围不做状态过滤，能被定位到不等于在职，而把
+    ``status`` 存进快照会立刻产生"库里在职、飞书已冻结"的陈旧窗口。在职状态
+    在开通判定时实时读取并作为入参传入（见
+    :func:`lingxi.core.identity.first_contact.decide_first_contact`）。
+    """
+
+    tenant_key: str
+    member_key: str
+    open_id: str
+    user_id: str
+    union_id: str
+    display_name: str
+    display_name_locale: str | None = None
+    department_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SnapshotDepartment:
+    tenant_key: str
+    department_key: str
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class TenantScope:
+    """一个关联租户在本轮同步中被两条身份路径分别看到的成员集合。"""
+
+    tenant_key: str
+    visible_to_user_identity: bool
+    app_member_keys: frozenset[str]
+    user_member_keys: frozenset[str]
+
+
+@dataclass(frozen=True)
+class SnapshotBatch:
+    tenants: tuple[TenantScope, ...]
+    departments: tuple[SnapshotDepartment, ...]
+    members: tuple[SnapshotMember, ...]
+
+
+class IntegrityProblem(str, Enum):
+    NO_TENANT = "no_tenant"
+    EMPTY_TENANT = "empty_tenant"
+    TENANT_NOT_USER_VISIBLE = "tenant_not_user_visible"
+    PATH_SETS_DIFFER = "path_sets_differ"
+    MEMBER_TENANT_UNKNOWN = "member_tenant_unknown"
+    MEMBER_ROW_MISSING = "member_row_missing"
+    IDENTITY_FIELD_MISSING = "identity_field_missing"
+    DUPLICATE_OPEN_ID = "duplicate_open_id"
+    DUPLICATE_MEMBER_KEY = "duplicate_member_key"
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    problems: tuple[IntegrityProblem, ...]
+    tenant_count: int
+    department_count: int
+    member_count: int
+
+    @property
+    def complete(self) -> bool:
+        return not self.problems
+
+
+class SnapshotIntegrityError(RuntimeError):
+    """校验不通过。适配器据此中止事务，一行都不提交。"""
+
+    def __init__(self, report: IntegrityReport) -> None:
+        codes = ", ".join(problem.value for problem in report.problems)
+        super().__init__(f"组织快照完整性校验未通过：{codes}")
+        self.report = report
+
+
+class DirectoryAvailability(str, Enum):
+    """组织资料对开通判定而言是否可用。"""
+
+    AVAILABLE = "available"
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+
+
+def _blank(value: object) -> bool:
+    return not isinstance(value, str) or not value.strip()
+
+
+def verify_batch(batch: SnapshotBatch) -> IntegrityReport:
+    """校验一轮快照是否可以整体提交。返回全部问题，不在第一个问题就短路。"""
+
+    problems: list[IntegrityProblem] = []
+    if not batch.tenants:
+        problems.append(IntegrityProblem.NO_TENANT)
+
+    declared_tenants = {scope.tenant_key for scope in batch.tenants}
+    members_by_tenant: dict[str, set[str]] = {}
+    for item in batch.members:
+        members_by_tenant.setdefault(item.tenant_key, set()).add(item.member_key)
+
+    for scope in batch.tenants:
+        if not scope.app_member_keys and not scope.user_member_keys:
+            problems.append(IntegrityProblem.EMPTY_TENANT)
+            continue
+        if not scope.visible_to_user_identity:
+            problems.append(IntegrityProblem.TENANT_NOT_USER_VISIBLE)
+        if scope.app_member_keys != scope.user_member_keys:
+            problems.append(IntegrityProblem.PATH_SETS_DIFFER)
+        if scope.user_member_keys - members_by_tenant.get(scope.tenant_key, set()):
+            problems.append(IntegrityProblem.MEMBER_ROW_MISSING)
+
+    seen_open_ids: set[str] = set()
+    seen_member_keys: set[tuple[str, str]] = set()
+    for item in batch.members:
+        if item.tenant_key not in declared_tenants:
+            problems.append(IntegrityProblem.MEMBER_TENANT_UNKNOWN)
+        if any(_blank(value) for value in (item.open_id, item.user_id, item.union_id, item.display_name, item.tenant_key, item.member_key)):
+            problems.append(IntegrityProblem.IDENTITY_FIELD_MISSING)
+            continue
+        if item.open_id in seen_open_ids:
+            problems.append(IntegrityProblem.DUPLICATE_OPEN_ID)
+        seen_open_ids.add(item.open_id)
+        key = (item.tenant_key, item.member_key)
+        if key in seen_member_keys:
+            problems.append(IntegrityProblem.DUPLICATE_MEMBER_KEY)
+        seen_member_keys.add(key)
+
+    # 去重但保持出现顺序，便于日志与审计逐条对照。
+    unique: list[IntegrityProblem] = []
+    for problem in problems:
+        if problem not in unique:
+            unique.append(problem)
+    return IntegrityReport(
+        problems=tuple(unique),
+        tenant_count=len(batch.tenants),
+        department_count=len(batch.departments),
+        member_count=len(batch.members),
+    )
+
+
+def require_complete_batch(batch: SnapshotBatch) -> IntegrityReport:
+    """校验并在不通过时抛错，供写库路径直接调用。"""
+
+    report = verify_batch(batch)
+    if not report.complete:
+        raise SnapshotIntegrityError(report)
+    return report
+
+
+def snapshot_expires_at(started_at: datetime) -> datetime:
+    """一轮快照的到期时刻：来源时间 + 2160 小时，调用方不得自定义或后移。"""
+
+    if not isinstance(started_at, datetime) or started_at.tzinfo is None or started_at.utcoffset() is None:
+        raise ValueError("started_at 必须是带时区的 UTC 时间")
+    return started_at + timedelta(hours=SNAPSHOT_RETENTION_HOURS)
+
+
+def snapshot_is_expired(expires_at: datetime, now: datetime) -> bool:
+    return now >= expires_at
+
+
+def directory_availability(expires_at: datetime | None, now: datetime) -> DirectoryAvailability:
+    """当前有没有一份可用于开通判定的组织资料。
+
+    没有任何完成批次（例如专用授权已失效、同步从未成功）→ ``UNAVAILABLE``；
+    有但已过九十天上限 → ``STALE``。两者都不得用于建档。
+    """
+
+    if expires_at is None:
+        return DirectoryAvailability.UNAVAILABLE
+    return DirectoryAvailability.STALE if snapshot_is_expired(expires_at, now) else DirectoryAvailability.AVAILABLE
+
+
+def index_members_by_open_id(members: Sequence[SnapshotMember]) -> dict[str, tuple[SnapshotMember, ...]]:
+    """按完整 ``open_id`` 建索引。**不做前缀、不做大小写归一、不做姓名回退。**"""
+
+    index: dict[str, list[SnapshotMember]] = {}
+    for item in members:
+        if _blank(item.open_id):
+            continue
+        index.setdefault(item.open_id.strip(), []).append(item)
+    return {key: tuple(value) for key, value in index.items()}

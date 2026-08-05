@@ -19,11 +19,22 @@ import sys
 
 # 逐个 import，缺哪个报哪个，不要笼统失败。
 REQUIRED_MODULES = (
+    "lingxi.core.ids",
     "lingxi.core.identity.onboarding",
+    "lingxi.core.identity.identifiers",
+    "lingxi.core.identity.credentials",
+    "lingxi.core.identity.org_snapshot",
+    "lingxi.core.identity.first_contact",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
     "lingxi.adapters.claude_agent_hooks",
+    "lingxi.adapters.feishu_directory",
+    "lingxi.adapters.postgres_credentials",
+    "lingxi.adapters.postgres_identity",
+    # apps/ 是本次新增的子目录：进程入口漏进制品会让"镜像 tag 就是冻结版本"
+    # 这条回滚前提直接失效，而它只在部署时才暴露（断言 V-部署-10）。
+    "lingxi.apps.scheduler",
 )
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")

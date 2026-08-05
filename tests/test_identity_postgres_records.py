@@ -1,0 +1,641 @@
+"""#16 身份链路的真实 PostgreSQL 断言；不访问飞书、不使用真实凭据。
+
+认领断言：V-开通-01、V-开通-06（真库部分）、V-身份-01、V-身份-02、V-身份-03。
+另含「完整性校验不过不提交半轮快照」这条硬规则的真库负向测试。
+
+缺 ``LINGXI_POSTGRES_DSN`` 时整类跳过并说明原因，不静默通过——数据库约束类
+断言只能在真库上验证（验证与门禁第五节）。
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
+from lingxi.core.identity.first_contact import (
+    EmploymentStatus,
+    FirstContactOutcome,
+    decide_first_contact,
+    locate_by_open_id,
+)
+from lingxi.core.identity.org_snapshot import (
+    DirectoryAvailability,
+    SnapshotBatch,
+    SnapshotDepartment,
+    SnapshotIntegrityError,
+    SnapshotMember,
+    TenantScope,
+)
+
+MIGRATIONS = Path(__file__).parents[1] / "migrations"
+FAKE_TOKEN = "fake-refresh-token-for-tests-only"
+DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
+SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
+
+
+def member(
+    *,
+    tenant_key: str = "tenant_a",
+    member_key: str = "ou_zhang",
+    open_id: str = "ou_zhang",
+    user_id: str = "user_zhang",
+    union_id: str = "union_zhang",
+    display_name: str = "张一",
+    display_name_locale: str | None = "zh-CN",
+    department_names: tuple[str, ...] = ("测试部门",),
+) -> SnapshotMember:
+    return SnapshotMember(
+        tenant_key=tenant_key,
+        member_key=member_key,
+        open_id=open_id,
+        user_id=user_id,
+        union_id=union_id,
+        display_name=display_name,
+        display_name_locale=display_name_locale,
+        department_names=department_names,
+    )
+
+
+def batch(members: tuple[SnapshotMember, ...], *, app_keys: frozenset[str] | None = None) -> SnapshotBatch:
+    keys = frozenset(item.member_key for item in members)
+    return SnapshotBatch(
+        tenants=(TenantScope("tenant_a", True, keys if app_keys is None else app_keys, keys),),
+        departments=(SnapshotDepartment("tenant_a", "dept_a", "测试部门"),),
+        members=members,
+    )
+
+
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+class IdentityPostgresTestCase(unittest.TestCase):
+    """所有真库用例的共同底座：每个用例前重建 006 / 007 / 008 三张迁移的表。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import psycopg
+
+        cls._psycopg = psycopg
+        cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
+
+    def setUp(self) -> None:
+        self.reset_schema()
+
+    def reset_schema(self) -> None:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "DROP TABLE IF EXISTS app_user CASCADE;"
+                "DROP TABLE IF EXISTS feishu_delegated_credential CASCADE;"
+                "DROP TABLE IF EXISTS feishu_org_member_snapshot CASCADE;"
+                "DROP TABLE IF EXISTS feishu_org_department_snapshot CASCADE;"
+                "DROP TABLE IF EXISTS feishu_org_tenant_snapshot CASCADE;"
+                "DROP TABLE IF EXISTS feishu_org_sync_run CASCADE;"
+            )
+            for name in (
+                "006_create_feishu_delegated_credential.sql",
+                "007_create_feishu_org_snapshot.sql",
+                "008_create_app_user.sql",
+            ):
+                cursor.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
+
+    def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(sql, parameters)
+            return cursor.fetchall()
+
+    def execute(self, sql: str, parameters: tuple = ()) -> None:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(sql, parameters)
+
+    def scalar(self, sql: str, parameters: tuple = ()):
+        rows = self.query(sql, parameters)
+        return rows[0][0] if rows else None
+
+
+class DelegatedCredentialTest(IdentityPostgresTestCase):
+    """V-身份-03：专用授权的 refresh_token 只以密文保存。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.postgres_credentials import PostgresDelegatedCredentialVault
+
+        self.vault = PostgresDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode())
+        self.issued_at = datetime.now(timezone.utc)
+
+    def _save(self, *, seconds: int = 7 * 24 * 3600, token: str = FAKE_TOKEN, issued_at: datetime | None = None) -> None:
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(token), seconds, "offline_access"),
+            issued_at=issued_at or self.issued_at,
+        )
+
+    def test_only_ciphertext_is_stored_and_the_plaintext_is_nowhere_in_the_row(self) -> None:
+        self._save()
+
+        row = self.query(
+            "SELECT subject_open_id, encrypted_refresh_token, scope FROM feishu_delegated_credential"
+        )[0]
+
+        self.assertNotIn(FAKE_TOKEN.encode(), bytes(row[1]))
+        self.assertEqual(row[0], DELEGATED_SUBJECT)
+        self.assertEqual(row[2], "offline_access")
+
+    def test_the_table_has_no_column_for_short_lived_or_plaintext_credentials(self) -> None:
+        columns = {
+            name
+            for (name,) in self.query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'feishu_delegated_credential'"
+            )
+        }
+
+        for forbidden in ("access_token", "authorization_code", "client_secret", "plain_refresh_token", "refresh_token"):
+            with self.subTest(column=forbidden):
+                self.assertNotIn(forbidden, columns)
+
+    def test_the_credential_table_does_not_depend_on_a_user_record(self) -> None:
+        # 专用授权不是员工，不能因为 app_user 的建档与删除而失效。
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM information_schema.table_constraints "
+                "WHERE table_name = 'feishu_delegated_credential' AND constraint_type = 'FOREIGN KEY'"
+            ),
+            0,
+        )
+
+    def test_at_most_one_delegated_credential_can_exist(self) -> None:
+        self._save()
+        self.vault.save(
+            subject_open_id="ou_another_subject",
+            grant=AuthorizationGrant(SecretToken("fake-second-token"), 3600, ""),
+            issued_at=self.issued_at,
+        )
+
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_credential"), "ou_another_subject")
+
+    def test_an_unknown_purpose_is_rejected_by_the_database(self) -> None:
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self.execute(
+                "INSERT INTO feishu_delegated_credential "
+                "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
+                "VALUES ('employee_token', 'ou_x', decode('0102','hex'), now(), now() + interval '1 hour')"
+            )
+
+    def test_a_rotation_point_at_or_after_expiry_is_rejected(self) -> None:
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self.execute(
+                "INSERT INTO feishu_delegated_credential "
+                "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
+                "VALUES ('org_directory_sync', 'ou_x', decode('0102','hex'), now() + interval '2 hours', now() + interval '1 hour')"
+            )
+
+    def test_the_rotation_point_follows_the_lifetime_returned_by_feishu(self) -> None:
+        self._save(seconds=7 * 24 * 3600)
+
+        refresh_at, expires_at = self.query(
+            "SELECT refresh_at, refresh_token_expires_at FROM feishu_delegated_credential"
+        )[0]
+
+        self.assertAlmostEqual((refresh_at - self.issued_at).total_seconds(), 7 * 24 * 3600 * 0.8, delta=2)
+        self.assertAlmostEqual((expires_at - self.issued_at).total_seconds(), 7 * 24 * 3600, delta=2)
+
+    def test_load_returns_the_plaintext_only_through_an_explicit_reveal(self) -> None:
+        self._save()
+
+        credential = self.vault.load()
+
+        self.assertIsNotNone(credential)
+        assert credential is not None
+        self.assertEqual(credential.grant.refresh_token.reveal(), FAKE_TOKEN)
+        self.assertNotIn(FAKE_TOKEN, repr(credential))
+
+    def test_claiming_a_due_credential_pushes_the_rotation_point_forward_once(self) -> None:
+        # 一次性凭据不能被同一轮扫描领两次。
+        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+
+        first = self.vault.claim_due()
+        second = self.vault.claim_due()
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_a_credential_that_is_not_due_is_not_claimed(self) -> None:
+        self._save(seconds=7 * 24 * 3600)
+
+        self.assertIsNone(self.vault.claim_due())
+
+    def test_a_concurrent_holder_makes_the_claim_skip_instead_of_wait(self) -> None:
+        """FOR UPDATE SKIP LOCKED：另一进程持锁时直接跳过，不排队。"""
+        self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+
+        with self._psycopg.connect(self._dsn) as holder, holder.cursor() as cursor:
+            cursor.execute("SELECT purpose FROM feishu_delegated_credential FOR UPDATE")
+            skipped = self.vault.claim_due()
+            holder.rollback()
+
+        self.assertIsNone(skipped)
+        self.assertIsNotNone(self.vault.claim_due())
+
+    def test_an_undecryptable_credential_is_revoked_rather_than_retried(self) -> None:
+        self._save()
+        self.execute("UPDATE feishu_delegated_credential SET encrypted_refresh_token = decode('0102', 'hex')")
+
+        self.assertIsNone(self.vault.load())
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 0)
+
+    def test_revoking_removes_the_row_completely(self) -> None:
+        self._save()
+
+        self.assertTrue(self.vault.revoke(reason="test"))
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 0)
+        self.assertIsNone(self.vault.load())
+
+
+class OrgSnapshotTest(IdentityPostgresTestCase):
+    """完整性校验不过就不提交半轮快照——这里是它的真库负向测试。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+
+        self.store = PostgresOrgSnapshotStore(self._dsn)
+
+    def test_a_complete_batch_is_written_in_one_go(self) -> None:
+        run_id = self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (run_id,)), "complete")
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_member_snapshot"), 1)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_tenant_snapshot"), 1)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_department_snapshot"), 1)
+
+    def test_an_incomplete_batch_leaves_no_member_row_at_all(self) -> None:
+        broken = batch((member(),), app_keys=frozenset({"ou_zhang", "ou_only_visible_to_app"}))
+
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(broken, source_app_id="cli_fake")
+
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_member_snapshot"), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_tenant_snapshot"), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_org_sync_run WHERE status = 'complete'"), 0)
+        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run"), "failed")
+
+    def test_a_failed_batch_never_becomes_the_source_of_a_location(self) -> None:
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup("ou_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.UNAVAILABLE)
+        self.assertEqual(lookup.members, ())
+
+    def test_the_database_refuses_a_complete_run_with_no_members(self) -> None:
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self.execute(
+                "INSERT INTO feishu_org_sync_run (id, source_app_id, status, completed_at, expires_at, tenant_count, member_count) "
+                "VALUES ('orgsync_empty', 'cli_fake', 'complete', now(), now(), 1, 0)"
+            )
+
+    def test_the_database_refuses_a_failed_run_that_claims_to_have_content(self) -> None:
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self.execute(
+                "INSERT INTO feishu_org_sync_run (id, source_app_id, status, expires_at, member_count) "
+                "VALUES ('orgsync_lying', 'cli_fake', 'failed', now(), 7)"
+            )
+
+    def test_the_expiry_is_pinned_to_the_source_time_and_cannot_be_pushed_out(self) -> None:
+        self.execute(
+            "INSERT INTO feishu_org_sync_run (id, source_app_id, status, started_at, expires_at) "
+            "VALUES ('orgsync_expiry', 'cli_fake', 'staging', now(), now() + interval '900 days')"
+        )
+        started_at, expires_at = self.query(
+            "SELECT started_at, expires_at FROM feishu_org_sync_run WHERE id = 'orgsync_expiry'"
+        )[0]
+        self.assertEqual(expires_at - started_at, timedelta(hours=2160))
+
+        self.execute("UPDATE feishu_org_sync_run SET expires_at = now() + interval '900 days' WHERE id = 'orgsync_expiry'")
+        started_at, expires_at = self.query(
+            "SELECT started_at, expires_at FROM feishu_org_sync_run WHERE id = 'orgsync_expiry'"
+        )[0]
+
+        self.assertEqual(expires_at - started_at, timedelta(hours=2160))
+
+    def test_the_snapshot_never_stores_employment_status(self) -> None:
+        """硬约束 2：存下来的在职状态一定是陈旧的，而它的唯一用途就是拦截陈旧状态。"""
+        columns = {
+            name
+            for (name,) in self.query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'feishu_org_member_snapshot'"
+            )
+        }
+
+        for forbidden in ("status", "is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin"):
+            with self.subTest(column=forbidden):
+                self.assertNotIn(forbidden, columns)
+
+    def test_a_member_row_missing_an_identity_field_is_refused_by_the_database(self) -> None:
+        self.execute(
+            "INSERT INTO feishu_org_sync_run (id, source_app_id, status, expires_at) "
+            "VALUES ('orgsync_guard', 'cli_fake', 'staging', now())"
+        )
+        for column in ("open_id", "user_id", "union_id", "display_name"):
+            with self.subTest(column=column):
+                values = {"open_id": "ou_x", "user_id": "user_x", "union_id": "union_x", "display_name": "张一"}
+                values[column] = "   "
+                with self.assertRaises(self._psycopg.errors.CheckViolation):
+                    self.execute(
+                        "INSERT INTO feishu_org_member_snapshot "
+                        "(id, sync_run_id, tenant_key, member_key, open_id, user_id, union_id, display_name) "
+                        "VALUES ('member_x', 'orgsync_guard', 'tenant_a', 'ou_x', %s, %s, %s, %s)",
+                        (values["open_id"], values["user_id"], values["union_id"], values["display_name"]),
+                    )
+
+    def test_lookup_returns_the_member_of_the_latest_complete_batch_only(self) -> None:
+        self.store.commit_batch(batch((member(display_name="旧的张一"),)), source_app_id="cli_fake")
+        self.store.commit_batch(batch((member(display_name="新的张一"),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup("ou_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.AVAILABLE)
+        self.assertEqual(len(lookup.members), 1)
+        self.assertEqual(lookup.members[0].display_name, "新的张一")
+        self.assertEqual(lookup.members[0].department_names, ("测试部门",))
+
+    def test_an_expired_batch_is_stale_and_yields_no_candidate(self) -> None:
+        self.store.commit_batch(
+            batch((member(),)),
+            source_app_id="cli_fake",
+            started_at=datetime.now(timezone.utc) - timedelta(days=91),
+        )
+
+        lookup = self.store.lookup("ou_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.STALE)
+        self.assertEqual(lookup.members, ())
+
+    def test_an_unknown_open_id_yields_no_candidate_without_falling_back_to_a_name(self) -> None:
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        self.assertEqual(self.store.lookup("ou_absent").members, ())
+        self.assertEqual(self.store.lookup("ou_zha").members, ())
+
+
+class AppUserRecordTest(IdentityPostgresTestCase):
+    """V-开通-01 / V-开通-06 / V-身份-01 / V-身份-02 的真库部分。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+        self.snapshots = PostgresOrgSnapshotStore(self._dsn)
+
+    def _draft(self, **overrides):
+        candidate = member(**overrides)
+        located = locate_by_open_id(candidate.open_id, (candidate,))
+        decision = decide_first_contact(
+            open_id=candidate.open_id,
+            location=located,
+            employment=EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False),
+            directory=DirectoryAvailability.AVAILABLE,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        assert decision.draft is not None
+        return decision.draft
+
+    def test_roster_fields_default_to_null_and_survive_a_refresh(self) -> None:
+        """工号/邮箱来自花名册读取步骤（2026-08-05 决策）：建档默认 NULL；
+        已写入后，不携带花名册数据的后续刷新不得把它们抹掉。"""
+        self.users.record_identity(self._draft())
+        self.assertEqual(self.query("SELECT employee_no, email FROM app_user"), [(None, None)])
+
+        enriched = dataclasses.replace(
+            self._draft(), employee_no="80001", email="he.xugong@example-corp.invalid"
+        )
+        self.users.record_identity(enriched)
+        self.users.record_identity(self._draft())
+
+        self.assertEqual(
+            self.query("SELECT employee_no, email FROM app_user"),
+            [("80001", "he.xugong@example-corp.invalid")],
+        )
+
+    def test_a_new_identity_is_recorded_without_a_permission_record(self) -> None:
+        record = self.users.record_identity(self._draft())
+
+        self.assertTrue(record.created)
+        self.assertTrue(record.id.startswith("usr_"))
+        self.assertEqual(record.provisioning_state, "matching")
+        self.assertIsNone(record.permission_record_id)
+        self.assertIsNone(self.scalar("SELECT permission_record_id FROM app_user"))
+        self.assertEqual(self.scalar("SELECT permission_version FROM app_user"), 0)
+
+    def test_the_permission_column_exists_so_the_null_is_a_verifiable_fact(self) -> None:
+        # 「字段不存在」证明不了「匹配确认前为 NULL」，只有列存在且为 NULL 才是事实。
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'app_user' AND column_name = 'permission_record_id'"
+            ),
+            1,
+        )
+
+    def test_recording_the_same_identity_twice_never_creates_a_second_record(self) -> None:
+        """V-身份-01。"""
+        first = self.users.record_identity(self._draft())
+        second = self.users.record_identity(self._draft(display_name="张一改名"))
+
+        self.assertEqual(first.id, second.id)
+        self.assertFalse(second.created)
+        self.assertEqual(self.users.count(), 1)
+        self.assertEqual(self.scalar("SELECT display_name FROM app_user"), "张一改名")
+
+    def test_a_second_row_with_the_same_open_id_is_refused_by_the_database(self) -> None:
+        self.users.record_identity(self._draft())
+
+        with self.assertRaises(self._psycopg.errors.UniqueViolation):
+            self.execute(
+                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
+                "VALUES ('usr_duplicate', 'ou_zhang', 'user_other', 'union_other', '另一个张一', 'tenant_a')"
+            )
+
+    def test_recording_again_never_resets_an_advanced_provisioning_state(self) -> None:
+        self.users.record_identity(self._draft())
+        self.execute("UPDATE app_user SET provisioning_state = 'mcp_syncing'")
+
+        record = self.users.record_identity(self._draft())
+
+        self.assertEqual(record.provisioning_state, "mcp_syncing")
+
+    def test_recording_again_never_touches_the_permission_record(self) -> None:
+        self.users.record_identity(self._draft())
+        self.execute("UPDATE app_user SET permission_record_id = 'rec_matched', permission_version = 3")
+
+        self.users.record_identity(self._draft())
+
+        self.assertEqual(self.scalar("SELECT permission_record_id FROM app_user"), "rec_matched")
+        self.assertEqual(self.scalar("SELECT permission_version FROM app_user"), 3)
+
+    def test_the_delegated_authorization_subject_cannot_be_recorded_as_a_user(self) -> None:
+        """V-身份-02：应用层已拦一次，数据库是绕不过去的那一道。"""
+        self.execute(
+            "INSERT INTO feishu_delegated_credential "
+            "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
+            "VALUES ('org_directory_sync', %s, decode('0102','hex'), now(), now() + interval '7 days')",
+            (DELEGATED_SUBJECT,),
+        )
+
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.execute(
+                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
+                "VALUES ('usr_delegated', %s, 'user_delegated', 'union_delegated', '专用授权账号', 'tenant_a')",
+                (DELEGATED_SUBJECT,),
+            )
+        self.assertEqual(self.users.count(), 0)
+
+    def test_an_existing_record_cannot_be_repointed_at_the_delegated_subject(self) -> None:
+        self.users.record_identity(self._draft())
+        self.execute(
+            "INSERT INTO feishu_delegated_credential "
+            "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
+            "VALUES ('org_directory_sync', %s, decode('0102','hex'), now(), now() + interval '7 days')",
+            (DELEGATED_SUBJECT,),
+        )
+
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.execute("UPDATE app_user SET feishu_open_id = %s", (DELEGATED_SUBJECT,))
+
+    def test_a_half_written_identity_is_refused_by_the_database(self) -> None:
+        """V-开通-06：定位失败或资料不完整时不写半条记录。"""
+        for column in ("feishu_user_id", "feishu_union_id", "display_name", "tenant_key"):
+            with self.subTest(column=column):
+                values = {
+                    "feishu_user_id": "user_zhang",
+                    "feishu_union_id": "union_zhang",
+                    "display_name": "张一",
+                    "tenant_key": "tenant_a",
+                }
+                values[column] = "   "
+                with self.assertRaises(self._psycopg.errors.CheckViolation):
+                    self.execute(
+                        "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
+                        "VALUES ('usr_partial', 'ou_partial', %s, %s, %s, %s)",
+                        (values["feishu_user_id"], values["feishu_union_id"], values["display_name"], values["tenant_key"]),
+                    )
+        self.assertEqual(self.users.count(), 0)
+
+    def test_the_user_record_has_no_employment_status_column(self) -> None:
+        columns = {
+            name
+            for (name,) in self.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'")
+        }
+
+        for forbidden in ("status", "is_activated", "is_exited", "is_frozen", "is_resigned", "is_unjoin", "employment_status"):
+            with self.subTest(column=forbidden):
+                self.assertNotIn(forbidden, columns)
+
+    def test_the_user_record_has_no_credential_column(self) -> None:
+        columns = {
+            name
+            for (name,) in self.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'app_user'")
+        }
+
+        for forbidden in ("refresh_token", "access_token", "encrypted_refresh_token", "authorization_code"):
+            with self.subTest(column=forbidden):
+                self.assertNotIn(forbidden, columns)
+
+    def test_two_people_with_the_same_display_name_both_get_a_record(self) -> None:
+        """硬约束 3：姓名不是唯一键。"""
+        self.users.record_identity(self._draft(display_name="张三"))
+        self.users.record_identity(
+            self._draft(open_id="ou_second", member_key="ou_second", user_id="user_second", union_id="union_second", display_name="张三")
+        )
+
+        self.assertEqual(self.users.count(), 2)
+        self.assertEqual(self.scalar("SELECT count(DISTINCT feishu_user_id) FROM app_user"), 2)
+
+    def test_a_latin_only_name_is_recorded_unchanged(self) -> None:
+        """V-开通-08。"""
+        self.users.record_identity(self._draft(display_name="Alice Smith", display_name_locale="en-US"))
+
+        self.assertEqual(self.scalar("SELECT display_name FROM app_user"), "Alice Smith")
+        self.assertEqual(self.scalar("SELECT display_name_locale FROM app_user"), "en-US")
+
+
+class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
+    """把定位、判定与建档串起来跑一次，确认没有旁路能写出半条记录。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+        self.snapshots = PostgresOrgSnapshotStore(self._dsn)
+
+    def _handle(self, open_id: str, employment: EmploymentStatus | None):
+        lookup = self.snapshots.lookup(open_id)
+        decision = decide_first_contact(
+            open_id=open_id,
+            location=locate_by_open_id(open_id, lookup.members),
+            employment=employment,
+            directory=lookup.availability,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        if decision.draft is not None:
+            self.users.record_identity(decision.draft)
+        return decision
+
+    def test_an_employed_member_gets_exactly_one_record_however_many_times_they_write(self) -> None:
+        self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
+        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+
+        for _ in range(3):
+            decision = self._handle("ou_zhang", employed)
+
+        self.assertIs(decision.outcome, FirstContactOutcome.RECORD_READY)
+        self.assertEqual(self.users.count(), 1)
+
+    def test_a_frozen_member_is_refused_and_nothing_is_written(self) -> None:
+        self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
+        frozen = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=True, is_resigned=False, is_unjoin=False)
+
+        decision = self._handle("ou_zhang", frozen)
+
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_EMPLOYED)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_an_unlocatable_sender_goes_to_manual_review_and_nothing_is_written(self) -> None:
+        self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
+        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+
+        decision = self._handle("ou_absent", employed)
+
+        self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_without_any_snapshot_the_sender_gets_a_terminal_state_and_nothing_is_written(self) -> None:
+        """V-身份-04 的库侧一半：专用授权失效 → 没有可用快照 → 不写半条资料。"""
+        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+
+        decision = self._handle("ou_zhang", employed)
+
+        self.assertIs(decision.outcome, FirstContactOutcome.DIRECTORY_UNAVAILABLE)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_the_delegated_subject_never_gets_a_record_even_if_it_is_in_the_snapshot(self) -> None:
+        subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated", display_name="专用授权账号")
+        self.snapshots.commit_batch(batch((member(), subject)), source_app_id="cli_fake")
+        employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
+
+        decision = self._handle(DELEGATED_SUBJECT, employed)
+
+        self.assertIs(decision.outcome, FirstContactOutcome.DELEGATED_SUBJECT_IGNORED)
+        self.assertEqual(self.users.count(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
