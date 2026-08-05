@@ -53,4 +53,9 @@ def is_ulid(value: object) -> bool:
 
     if not isinstance(value, str) or len(value) != 26:
         return False
-    return all(ch in _CROCKFORD for ch in value.upper())
+    upper = value.upper()
+    # 128 位上界：首字符只能是 0-7，否则最高两个填充位非零，
+    # 不是合法的 48 位时间戳 + 80 位随机数（终轮 Codex 复查发现）。
+    if upper[0] not in "01234567":
+        return False
+    return all(ch in _CROCKFORD for ch in upper)

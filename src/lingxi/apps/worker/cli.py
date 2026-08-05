@@ -96,11 +96,12 @@ def main(
     )
     _emit(out, report)
 
+    if gate_bypassed:
+        # 安全边界失效优先于一切其他失败态：绕过之后又超时/抛错时，受控验证
+        # 必须先看到 5 而不是通用的 4（终轮 Codex 复查发现）。
+        return EXIT_GATE_BYPASSED
     if report["failure"]:
         return EXIT_SESSION_FAILED
-    if gate_bypassed:
-        # 屏障被绕过比"没收口"更严重：退出码单列，受控验证据此直接判失败。
-        return EXIT_GATE_BYPASSED
     return EXIT_OK if turn["closed"] else EXIT_TURN_NOT_CLOSED
 
 

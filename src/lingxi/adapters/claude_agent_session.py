@@ -65,6 +65,11 @@ def build_agent_options(
         # ~/.claude/settings.json 里的 permissions/hooks/mcpServers 就可能与屏障
         # 并存，PreToolUse 单点判定的绕过面被无声打开（独立复查发现）。
         "setting_sources": [],
+        # setting_sources=[] 挡不住 MCP 来源：SDK 0.2.128 的 strict_mcp_config
+        # 默认 False，项目 .mcp.json / 用户级 / 插件 MCP 仍会被加载，甚至可能
+        # 有同名服务器顶替白名单工具（终轮 Codex 复查发现）。必须显式收紧为
+        # 「只用我们传入的 mcp_servers」。
+        "strict_mcp_config": True,
         # L4a 已验证的取值（当前能力 2026-07-28 定向补测就是在 dontAsk 下确认
         # hook 拒绝真的阻止执行）；不传则落到 SDK 默认值，行为未经验证。
         "permission_mode": "dontAsk",
@@ -81,6 +86,9 @@ def build_agent_options(
     return ClaudeAgentOptions(**kwargs)
 
 
+# 已知观测边界：固定版 SDK 的 receive_response() 在第一条 ResultMessage 后立即
+# 返回，因此「底层重复发出的第二条终止消息」在本层结构性不可见；双计数守的是
+# 本侧接线与桩级回归，不声称能检测真实 SDK 的重复投递（终轮 Codex 复查确认）。
 async def run_single_turn(
     *,
     options: Any,

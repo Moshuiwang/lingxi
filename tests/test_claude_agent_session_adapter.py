@@ -38,6 +38,7 @@ class StubAgentOptions:
         setting_sources=None,
         permission_mode=None,
         stderr=None,
+        strict_mcp_config=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
@@ -49,6 +50,7 @@ class StubAgentOptions:
         self.setting_sources = setting_sources
         self.permission_mode = permission_mode
         self.stderr = stderr
+        self.strict_mcp_config = strict_mcp_config
 
 
 class StubTextBlock:

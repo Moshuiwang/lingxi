@@ -38,5 +38,15 @@ class UlidTest(unittest.TestCase):
             new_ulid(randomness=b"\x00")
 
 
+class UlidUpperBoundTest(unittest.TestCase):
+    def test_first_character_above_seven_is_not_a_valid_ulid(self) -> None:
+        """终轮 Codex：128 位上界——首字符 8..Z 无法表示合法时间戳+随机数。"""
+        from lingxi.core.ids import is_ulid
+
+        self.assertFalse(is_ulid("Z" * 26))
+        self.assertTrue(is_ulid("0" * 26))
+        self.assertTrue(is_ulid("7" + "Z" * 25))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -154,6 +154,10 @@ def _turn_timeout(value: str) -> float:
         seconds = float(value)
     except ValueError as error:
         raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正数（秒）") from error
-    if seconds <= 0:
-        raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正数（秒）")
+    import math
+
+    if seconds <= 0 or not math.isfinite(seconds):
+        # inf / 1e999 会让 asyncio.timeout 永不触发，把本选项要防的永久挂起
+        # 原样带回来（终轮 Codex 复查发现）。
+        raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正的有限秒数")
     return seconds

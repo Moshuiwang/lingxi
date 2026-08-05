@@ -67,6 +67,7 @@ class StubAgentOptions:
         setting_sources=None,
         permission_mode=None,
         stderr=None,
+        strict_mcp_config=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
@@ -78,6 +79,7 @@ class StubAgentOptions:
         self.setting_sources = setting_sources
         self.permission_mode = permission_mode
         self.stderr = stderr
+        self.strict_mcp_config = strict_mcp_config
 
 
 class StubTextBlock:
@@ -153,6 +155,8 @@ class FakeAgentSDK:
         self.result_is_error = result_is_error
         # 只发 PostToolUse 不发 PreToolUse：模拟 hook 未注册/被跳过的屏障失效形状。
         self.skip_pre_tool_use = skip_pre_tool_use
+        # 步骤走完后抛异常：模拟「已有绕过调用、随后传输又失败」的叠加形状。
+        self.raise_after_steps: Exception | None = None
 
     def install(self, testcase) -> "FakeAgentSDK":
         module = types.ModuleType("claude_agent_sdk")
@@ -289,6 +293,8 @@ class FakeAgentSDK:
                 ]
             )
 
+        if self.raise_after_steps is not None:
+            raise self.raise_after_steps
         await self._fire(options, "Stop", {"hook_event_name": "Stop"}, None)
         for _ in range(self.result_messages):
             yield StubResultMessage(subtype=self.result_subtype, is_error=self.result_is_error)
@@ -717,6 +723,9 @@ class ReviewHardeningTest(unittest.TestCase):
         self.assertEqual(payload["turn"]["terminal_result_count"], 1)
 
     def test_a_duplicate_result_message_does_not_close_the_turn(self) -> None:
+        """桩级接线守卫：若本侧计数/条件被改坏（合并计数、删条件），本用例变红。
+        注意观测边界：真实 SDK 的 receive_response() 在首条 ResultMessage 后即返回，
+        底层重复投递在本层结构性不可见——本用例不声称能检测那种情况（终轮 Codex）。"""
         script = [{"kind": "text", "text": "答案。"}]
         code, payload, _ = self._run_cli(FakeAgentSDK(script, result_messages=2))
 
@@ -833,6 +842,30 @@ class ReviewHardeningTest(unittest.TestCase):
         self.assertEqual(line["event"], "worker.sdk.stderr")
         self.assertEqual(line["trace_id"], config.trace_id)
         self.assertNotIn("LINGXI_FAKE_SECRET_z9y8x7w6v5u4t3s2", captured.getvalue())
+
+    def test_gate_bypass_outranks_a_session_failure_in_the_exit_code(self) -> None:
+        """终轮 Codex：绕过之后传输又失败时，退出码必须先报安全边界失效（5），
+        不得被通用会话失败（4）吞掉。"""
+        sdk = FakeAgentSDK(
+            [{"kind": "tool", "tool": "Write", "input": {"file_path": "x"}, "result": "done"}],
+            skip_pre_tool_use=True,
+        )
+        sdk.raise_after_steps = RuntimeError("模拟传输失败")
+        code, payload, _ = self._run_cli(sdk)
+
+        self.assertEqual(code, 5)
+        self.assertIsNotNone(payload["failure"])
+        self.assertTrue(payload["turn"]["gate_bypassed"])
+
+    def test_a_non_finite_turn_timeout_is_rejected(self) -> None:
+        """终轮 Codex：inf/1e999 会让 asyncio.timeout 永不触发，配置期就拒绝。"""
+        from lingxi.apps.worker.cli import main
+
+        for value in ("inf", "Infinity", "1e999", "nan"):
+            with self.subTest(value=value):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = main(env=worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS=value), stdout=stdout, stderr=stderr)
+                self.assertEqual(code, 3)
 
     def test_an_interruption_still_produces_a_report(self) -> None:
         """CancelledError 属 BaseException：不接住就没有报告，违反 stdout 契约。"""
