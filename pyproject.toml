@@ -15,5 +15,11 @@ feishu = ["cryptography>=42,<46", "lark-oapi==1.7.1", "psycopg[binary]>=3.2,<4",
 # 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
 agent = ["claude-agent-sdk==0.2.128"]
 
+# 角色职能映射是随包发布的配置文件，不是源码。不显式声明就不会进 wheel，
+# 而缺失表现为「全部角色显示未映射」——一种看起来正常的失败。
+# CI 的 scripts/ci/check_installed_package.py 校验它确实在已安装的制品里。
+[tool.setuptools.package-data]
+"lingxi.config" = ["*.toml"]
+
 [tool.unittest]
 start-directory = "tests"
