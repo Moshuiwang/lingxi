@@ -76,6 +76,7 @@ class IntegrityProblem(str, Enum):
     PATH_SETS_DIFFER = "path_sets_differ"
     MEMBER_TENANT_UNKNOWN = "member_tenant_unknown"
     MEMBER_ROW_MISSING = "member_row_missing"
+    MEMBER_ROW_EXTRA = "member_row_extra"
     IDENTITY_FIELD_MISSING = "identity_field_missing"
     DUPLICATE_OPEN_ID = "duplicate_open_id"
     DUPLICATE_MEMBER_KEY = "duplicate_member_key"
@@ -136,6 +137,10 @@ def verify_batch(batch: SnapshotBatch) -> IntegrityReport:
             problems.append(IntegrityProblem.PATH_SETS_DIFFER)
         if scope.user_member_keys - members_by_tenant.get(scope.tenant_key, set()):
             problems.append(IntegrityProblem.MEMBER_ROW_MISSING)
+        # 反方向同样要查：两条可见路径都没见过的成员行混进批次，提交后会为
+        # 「不该被看到的人」建档（Codex 复查发现）。
+        if members_by_tenant.get(scope.tenant_key, set()) - scope.user_member_keys:
+            problems.append(IntegrityProblem.MEMBER_ROW_EXTRA)
 
     seen_open_ids: set[str] = set()
     seen_member_keys: set[tuple[str, str]] = set()

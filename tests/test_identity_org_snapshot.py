@@ -63,6 +63,22 @@ def batch(members: tuple[SnapshotMember, ...], *, app_keys: frozenset[str] | Non
 
 
 class BatchIntegrityTest(unittest.TestCase):
+    def test_a_member_row_outside_both_visible_paths_is_incomplete(self) -> None:
+        """反方向的完整性：两条可见路径都没见过的成员行混进批次，提交后会为
+        「不该被看到的人」建档（Codex 复查发现）。"""
+        stranger = member(member_key="ou_stranger", open_id="ou_stranger", user_id="user_s", union_id="union_s", display_name="陌生人")
+        bad = batch((member(), stranger), app_keys=frozenset({"ou_zhang"}))
+        bad = SnapshotBatch(
+            tenants=(TenantScope("tenant_a", True, frozenset({"ou_zhang"}), frozenset({"ou_zhang"})),),
+            departments=bad.departments,
+            members=(member(), stranger),
+        )
+
+        report = verify_batch(bad)
+
+        self.assertFalse(report.complete)
+        self.assertIn(IntegrityProblem.MEMBER_ROW_EXTRA, report.problems)
+
     def test_a_batch_with_matching_paths_and_complete_identity_fields_is_complete(self) -> None:
         report = verify_batch(batch((member(), member(member_key="ou_two", open_id="ou_two", user_id="user_two", union_id="union_two", display_name="Alice Smith", display_name_locale="en-US"))))
 

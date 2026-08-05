@@ -146,6 +146,11 @@ class CredentialRotationLoop:
 
         if self._stop.is_set():
             return RotationReport()
+        # 先收殓崩溃窗口留下的「已消费未落库」行：它们的旧令牌已被飞书作废，
+        # 不收殓就会在租期结束后被当成正常凭据再领取一次（Codex 复查发现）。
+        stale_collector = getattr(self._vault, "revoke_stale_consumed", None)
+        if callable(stale_collector):
+            stale_collector()
         claim = self._vault.claim_due()
         if claim is None:
             return RotationReport()

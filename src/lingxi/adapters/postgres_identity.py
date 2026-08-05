@@ -135,11 +135,25 @@ class PostgresOrgSnapshotStore:
                             for item in batch.members
                         ],
                     )
-                    # 旧批次立即让位：定位永远只看最近一轮完成的快照。
+                    # 旧批次让位，但只让**更早启动**的让位：较早启动、较晚完成的
+                    # 批次不得反过来取代更新的数据（Codex 复查发现）。整个切换在
+                    # advisory 锁内串行化，避免两轮同步交错留下双 complete。
+                    cursor.execute("SELECT pg_advisory_xact_lock(4217002)")
                     cursor.execute(
                         """UPDATE feishu_org_sync_run SET status = 'superseded'
-                            WHERE status = 'complete' AND id <> %s""",
-                        (identifier,),
+                            WHERE status = 'complete' AND id <> %(identifier)s
+                              AND started_at <= (SELECT started_at FROM feishu_org_sync_run WHERE id = %(identifier)s)""",
+                        {"identifier": identifier},
+                    )
+                    cursor.execute(
+                        """UPDATE feishu_org_sync_run SET status = 'superseded'
+                            WHERE id = %(identifier)s
+                              AND EXISTS (
+                                  SELECT 1 FROM feishu_org_sync_run other
+                                   WHERE other.status = 'complete' AND other.id <> %(identifier)s
+                                     AND other.started_at > feishu_org_sync_run.started_at
+                              )""",
+                        {"identifier": identifier},
                     )
         logger.info(
             "组织快照批次已提交 tenants=%s departments=%s members=%s",

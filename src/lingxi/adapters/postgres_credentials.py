@@ -7,7 +7,7 @@
 2. 缺加密依赖时**构造期就失败**，绝不降级为明文保存；
 3. 领取到期凭据用 ``FOR UPDATE SKIP LOCKED`` 并**立即把轮换点挪后**——
    ``refresh_token`` 一次性有效，同一条被并发领取两次等于把它用废；
-4. 解密失败、续期失败或结果不明确一律删除凭据，不重放。
+4. 解密失败、续期失败或结果不明确一律撤销（清空密文），不重放。
 
 轮换点怎么算是领域规则，在 :mod:`lingxi.core.identity.credentials`，本模块只负责
 把它写进数据库。
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from lingxi.core.identity.credentials import (
@@ -83,6 +83,7 @@ class PostgresDelegatedCredentialVault:
                      issued_at = EXCLUDED.issued_at,
                      refresh_at = EXCLUDED.refresh_at,
                      refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+                     consumed_at = NULL,
                      updated_at = now()""",
                 (
                     DELEGATED_PURPOSE,
@@ -120,6 +121,36 @@ class PostgresDelegatedCredentialVault:
             logger.warning("专用授权凭据已撤销 reason=%s", reason)
         return removed
 
+    def revoke_stale_consumed(self, *, max_age_seconds: int = 600, now: datetime | None = None) -> bool:
+        """收殓「已消费但一直没写回新凭据」的行。
+
+        这种行意味着进程在续期后、落库前死掉：旧令牌已被飞书作废，留着密文
+        只会诱使未来的代码路径重放它。清空并留下与普通失败可区分的日志，
+        由人工重新授权（Codex 复查发现的崩溃窗口）。"""
+
+        moment = now or datetime.now(timezone.utc)
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE feishu_delegated_credential
+                      SET encrypted_refresh_token = NULL,
+                          refresh_at = NULL,
+                          refresh_token_expires_at = NULL,
+                          consumed_at = NULL,
+                          updated_at = now()
+                    WHERE purpose = %(purpose)s
+                      AND encrypted_refresh_token IS NOT NULL
+                      AND consumed_at IS NOT NULL
+                      AND consumed_at < %(cutoff)s""",
+                {
+                    "purpose": DELEGATED_PURPOSE,
+                    "cutoff": moment - timedelta(seconds=max_age_seconds),
+                },
+            )
+            cleared = cursor.rowcount > 0
+        if cleared:
+            logger.error("不可恢复：发现续期后未落库的消费中凭据，已清空，需人工重新授权")
+        return cleared
+
     # ---- 读取 -------------------------------------------------------------
 
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
@@ -130,7 +161,8 @@ class PostgresDelegatedCredentialVault:
             cursor.execute(
                 """SELECT subject_open_id, encrypted_refresh_token, scope, refresh_at, refresh_token_expires_at
                      FROM feishu_delegated_credential
-                    WHERE purpose = %s AND encrypted_refresh_token IS NOT NULL""",
+                    WHERE purpose = %s AND encrypted_refresh_token IS NOT NULL
+                      AND consumed_at IS NULL""",
                 (DELEGATED_PURPOSE,),
             )
             row = cursor.fetchone()
@@ -158,12 +190,14 @@ class PostgresDelegatedCredentialVault:
                        SELECT purpose FROM feishu_delegated_credential
                         WHERE purpose = %(purpose)s
                           AND encrypted_refresh_token IS NOT NULL
+                          AND consumed_at IS NULL
                           AND refresh_at <= %(now)s
                           AND refresh_token_expires_at > %(now)s
                         FOR UPDATE SKIP LOCKED
                    )
                    UPDATE feishu_delegated_credential credential
-                      SET refresh_at = LEAST(
+                      SET consumed_at = %(now)s::timestamptz,
+                          refresh_at = LEAST(
                               %(now)s::timestamptz + make_interval(secs => %(lease)s),
                               credential.refresh_token_expires_at - INTERVAL '1 second'
                           )

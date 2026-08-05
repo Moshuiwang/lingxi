@@ -115,3 +115,23 @@ $$;
 CREATE TRIGGER app_user_no_delegated_subject
     BEFORE INSERT OR UPDATE OF feishu_open_id ON app_user
     FOR EACH ROW EXECUTE FUNCTION app_user_reject_delegated_subject();
+
+-- 反方向同样要守（Codex 复查发现）：若先有员工记录、后把同一 open_id 写成
+-- 专用授权主体，上面的触发器不会执行（写入发生在凭据表一侧），两边会共存。
+-- V-身份-02 必须由数据库独立保证，两个方向都绕不过去。
+CREATE OR REPLACE FUNCTION credential_reject_app_user_subject() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM app_user WHERE feishu_open_id = NEW.subject_open_id
+    ) THEN
+        RAISE EXCEPTION '该 open_id 已是员工用户记录，不能成为专用授权主体';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER credential_no_app_user_subject
+    BEFORE INSERT OR UPDATE OF subject_open_id ON feishu_delegated_credential
+    FOR EACH ROW EXECUTE FUNCTION credential_reject_app_user_subject();

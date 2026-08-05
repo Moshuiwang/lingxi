@@ -74,6 +74,10 @@ class FakeVault:
         self.revoked.append(reason)
         return True
 
+    def revoke_stale_consumed(self, **_kwargs) -> bool:
+        self.stale_sweeps = getattr(self, "stale_sweeps", 0) + 1
+        return False
+
 
 class FakeAuthorization:
     def __init__(self, result) -> None:
@@ -138,6 +142,16 @@ class RotationLoopTest(unittest.TestCase):
         self.assertEqual(vault.saved[0][0], "ou_delegated")
         self.assertEqual(vault.saved[0][1].refresh_token.reveal(), "fake-next-token")
         self.assertEqual(vault.revoked, [])
+
+    def test_every_round_sweeps_stale_consumed_credentials_first(self) -> None:
+        """崩溃窗口收殓：每轮先清「已消费未落库」的行，防止旧令牌在租期后被重放
+        （Codex 复查发现）。"""
+        vault = FakeVault([None])
+        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+
+        loop.run_once()
+
+        self.assertEqual(getattr(vault, "stale_sweeps", 0), 1)
 
     def test_a_transient_save_failure_is_retried_and_the_credential_survives(self) -> None:
         """写库瞬时失败要重试：一次数据库抖动不该报废一条一次性凭据（独立复查发现）。"""

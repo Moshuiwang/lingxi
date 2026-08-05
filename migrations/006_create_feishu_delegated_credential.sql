@@ -28,6 +28,11 @@ CREATE TABLE feishu_delegated_credential (
     encrypted_refresh_token   BYTEA,
     scope                     TEXT NOT NULL DEFAULT '',
     issued_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 一次性令牌的消费标记：领取去续期的那一刻置位。此后旧密文对 load() 与
+    -- claim_due() 都不可见——飞书接受续期后进程崩溃时，旧令牌已作废，
+    -- 任何重放都必然失败并可能触发风控（Codex 复查发现）。save() 写入新
+    -- 凭据时清空；超龄未清的消费中行由 revoke_stale_consumed() 收殓。
+    consumed_at               TIMESTAMPTZ,
     refresh_at                TIMESTAMPTZ,
     refresh_token_expires_at  TIMESTAMPTZ,
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),

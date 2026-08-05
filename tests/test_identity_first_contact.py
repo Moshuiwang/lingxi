@@ -299,16 +299,26 @@ class NameAndOptionalFieldTest(unittest.TestCase):
         assert decision.draft is not None
         self.assertEqual(decision.draft.feishu_user_id, "user_second")
 
-    def test_a_member_without_department_or_locale_still_gets_recorded(self) -> None:
-        """硬约束 4：可选增强字段不作为建档前提。"""
-        thin = member(display_name_locale=None, department_names=())
+    def test_a_member_without_locale_still_gets_recorded(self) -> None:
+        """硬约束 4：locale 等可选增强字段不作为建档前提。"""
+        thin = member(display_name_locale=None)
 
         decision = decide(location=locate_by_open_id("ou_zhang", (thin,)))
 
         self.assertIs(decision.outcome, FirstContactOutcome.RECORD_READY)
         assert decision.draft is not None
-        self.assertIsNone(decision.draft.department)
         self.assertIsNone(decision.draft.display_name_locale)
+
+    def test_a_member_without_department_goes_to_manual_review(self) -> None:
+        """产品合同把部门列进必要资料（「缺少姓名、部门、租户等…转人工核对」）；
+        此前部门被当可选字段放行会建出半份档案（Codex 复查发现）。"""
+        for department_names in ((), ("",), ("   ",)):
+            with self.subTest(department_names=department_names):
+                thin = member(department_names=department_names)
+                decision = decide(location=locate_by_open_id("ou_zhang", (thin,)))
+                self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
+                self.assertIs(decision.review_reason, ReviewReason.INCOMPLETE_PROFILE)
+                self.assertIsNone(decision.draft)
 
     def test_the_draft_has_no_field_for_optional_enhancements(self) -> None:
         """`mobile` / `job_title` / `leader_id` 仍不入保存范围（硬约束 4）。

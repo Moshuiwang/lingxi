@@ -49,8 +49,8 @@ class DirectoryPaginationTest(unittest.TestCase):
     def test_all_pages_are_followed_until_has_more_is_false(self) -> None:
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="collaboration_tenant_list", has_more=True, page_token="p2"),
-                page([{"tenant_key": "tenant_b"}], key="collaboration_tenant_list"),
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
             ]
         )
         client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
@@ -61,19 +61,34 @@ class DirectoryPaginationTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 2)
         self.assertIn("page_token=p2", transport.calls[1][1])
 
-    def test_a_repeated_page_token_stops_the_loop_instead_of_spinning(self) -> None:
+    def test_a_repeated_page_token_raises_instead_of_returning_partial_data(self) -> None:
+        """has_more=true 但游标停滞：服务端明确说还有数据，把半截结果当成功返回
+        会让调用方拿它替换旧快照（Codex 复查发现，语义由「静默截断」改为报错）。"""
         transport = RecordingTransport(
             [
-                page([{"tenant_key": "tenant_a"}], key="collaboration_tenant_list", has_more=True, page_token="same"),
-                page([{"tenant_key": "tenant_b"}], key="collaboration_tenant_list", has_more=True, page_token="same"),
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="same"),
+                page([{"tenant_key": "tenant_b"}], key="target_tenant_list", has_more=True, page_token="same"),
             ]
         )
         client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
 
-        tenants = client.list_collaboration_tenants(token="fake-user-token")
+        with self.assertRaises(FeishuDirectoryError) as context:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(context.exception.code, "pagination_stalled")
 
-        self.assertEqual(len(tenants), 2)
-        self.assertEqual(len(transport.calls), 2)
+    def test_the_real_probe_field_name_is_accepted(self) -> None:
+        """真实探针（verify_feishu_association.sh）实测主字段是 target_tenant_list；
+        此前的 collaboration_tenant_list 在真实响应里不存在（Codex 复查发现）。"""
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        self.assertEqual(client.list_collaboration_tenants(token="fake-user-token")[0]["tenant_key"], "tenant_a")
+
+    def test_an_http_base_url_is_rejected_before_any_request(self) -> None:
+        """飞书出站必须 HTTPS：误配 http:// 会把 Bearer token 与 App Secret
+        明文上路（Codex 复查发现）。"""
+        with self.assertRaises(ValueError):
+            FeishuDirectoryClient(base_url="http://open.feishu.invalid", transport=RecordingTransport([]))
 
     def test_a_business_error_code_is_mapped_to_a_directory_error(self) -> None:
         transport = RecordingTransport([{"code": 99991663, "msg": "permission denied"}])

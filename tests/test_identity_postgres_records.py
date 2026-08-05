@@ -276,6 +276,98 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             )
 
 
+class ConsumedCredentialTest(IdentityPostgresTestCase):
+    """一次性令牌的消费语义与双向主体防线（Codex 复查 P1）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.postgres_credentials import PostgresDelegatedCredentialVault
+
+        self.vault = PostgresDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode())
+        self.issued_at = datetime.now(timezone.utc) - timedelta(days=6)
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 7 * 24 * 3600, "offline_access"),
+            issued_at=self.issued_at,
+        )
+
+    def test_a_claim_marks_the_credential_consumed_and_hides_it_from_load(self) -> None:
+        claimed = self.vault.claim_due()
+
+        self.assertIsNotNone(claimed)
+        self.assertIsNotNone(self.scalar("SELECT consumed_at FROM feishu_delegated_credential"))
+        # 消费中：旧密文对读取路径与再次领取都不可见——它可能已被飞书作废。
+        self.assertIsNone(self.vault.load())
+        self.assertIsNone(self.vault.claim_due())
+        # 租期过后也一样：挡住重放的必须是消费标记本身，不能只靠 refresh_at
+        # 被临时挪后（否则崩溃后一个租期，旧令牌就会被再次领取）。
+        after_lease = datetime.now(timezone.utc) + timedelta(seconds=301)
+        self.assertIsNone(self.vault.claim_due(now=after_lease))
+        self.assertIsNone(self.vault.load(now=after_lease))
+
+    def test_saving_the_replacement_clears_the_consumed_marker(self) -> None:
+        self.vault.claim_due()
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+        )
+
+        self.assertIsNone(self.scalar("SELECT consumed_at FROM feishu_delegated_credential"))
+        self.assertIsNotNone(self.vault.load())
+
+    def test_a_stale_consumed_row_is_swept_with_a_distinct_log(self) -> None:
+        """进程在续期后、落库前死掉的形状：旧令牌已作废，收殓而不是留给未来重放。"""
+        self.vault.claim_due()
+
+        with self.assertLogs("lingxi.adapters.postgres_credentials", level="ERROR") as captured:
+            cleared = self.vault.revoke_stale_consumed(max_age_seconds=0, now=datetime.now(timezone.utc) + timedelta(seconds=1))
+
+        self.assertTrue(cleared)
+        self.assertTrue(any("不可恢复" in line for line in captured.output))
+        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
+        # 主体行仍在：V-身份-02 的数据源不随收殓消失。
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
+
+    def test_an_existing_app_user_open_id_cannot_become_the_delegated_subject(self) -> None:
+        """反向防线（Codex 复查）：先有员工记录、再把同一 open_id 写成专用授权
+        主体，必须被数据库拒绝——正向触发器管不到凭据表一侧的写入。"""
+        self.execute(
+            """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key)
+               VALUES ('usr_existing_employee', 'ou_employee_x', 'u_x', 'un_x', '某员工', 't_a')"""
+        )
+
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.vault.save(
+                subject_open_id="ou_employee_x",
+                grant=AuthorizationGrant(SecretToken("fake-second"), 3600, ""),
+            )
+
+
+class SnapshotCommitOrderingTest(IdentityPostgresTestCase):
+    """较早启动、较晚完成的批次不得取代更新的批次（Codex 复查 P2）。"""
+
+    def _store(self):
+        from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+
+        return PostgresOrgSnapshotStore(self._dsn)
+
+    def test_an_older_started_batch_finishing_late_does_not_supersede_the_newer(self) -> None:
+        """两轮同步重叠时，后提交但**更早启动**的那轮不得取代更新的数据；
+        started_at 经 commit_batch 参数按同步真实开始时刻传入。"""
+        store = self._store()
+        now = datetime.now(timezone.utc)
+        newer = store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=now)
+
+        older = store.commit_batch(
+            batch((member(),)), source_app_id="cli_fake", started_at=now - timedelta(hours=1)
+        )
+
+        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (newer,)), "complete")
+        self.assertEqual(self.scalar("SELECT status FROM feishu_org_sync_run WHERE id = %s", (older,)), "superseded")
+
+
 class OrgSnapshotTest(IdentityPostgresTestCase):
     """完整性校验不过就不提交半轮快照——这里是它的真库负向测试。"""
 

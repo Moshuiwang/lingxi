@@ -209,8 +209,11 @@ def decide_first_contact(
     if not employment.employed:
         return _decision(FirstContactOutcome.NOT_EMPLOYED)
 
-    # 4. 必要资料缺失时不写半条记录（断言 V-开通-06）。
-    if any(_blank(value) for value in (member.open_id, member.user_id, member.union_id, member.display_name, member.tenant_key)):
+    # 4. 必要资料缺失时不写半条记录（断言 V-开通-06）。产品合同把**部门**列进
+    #    必要资料（「缺少姓名、部门、租户等必要资料…转人工核对」）——此前部门被
+    #    当可选字段放行，会建出 department 为空的半份档案（Codex 复查发现）。
+    department = member.department_names[0].strip() if member.department_names and member.department_names[0] else ""
+    if any(_blank(value) for value in (member.open_id, member.user_id, member.union_id, member.display_name, member.tenant_key)) or not department:
         return _decision(FirstContactOutcome.MANUAL_REVIEW, review_reason=ReviewReason.INCOMPLETE_PROFILE)
 
     draft = IdentityRecordDraft(
@@ -219,8 +222,7 @@ def decide_first_contact(
         feishu_union_id=member.union_id.strip(),
         display_name=member.display_name.strip(),
         display_name_locale=member.display_name_locale,
-        # 部门是可得字段但可能为空；空就是空，不猜、不填占位。
-        department=member.department_names[0] if member.department_names else None,
+        department=department,
         tenant_key=member.tenant_key.strip(),
     )
     return _decision(FirstContactOutcome.RECORD_READY, draft=draft)

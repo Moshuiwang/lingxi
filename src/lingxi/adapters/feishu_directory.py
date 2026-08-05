@@ -47,6 +47,15 @@ class FeishuDirectoryError(RuntimeError):
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
+def _require_https(base_url: str) -> str:
+    """飞书出站必须 HTTPS（接口设计二）：误配 http:// 会把 Bearer token、
+    App Secret 与一次性 refresh token 明文上路（Codex 复查发现）。"""
+
+    if not base_url.startswith("https://"):
+        raise ValueError("飞书 base_url 必须以 https:// 开头（不回显收到的值）")
+    return base_url.rstrip("/")
+
+
 class Transport(Protocol):
     def __call__(self, method: str, url: str, *, body: Mapping[str, Any] | None = ..., token: str | None = ...) -> Any: ...
 
@@ -87,10 +96,10 @@ class _PagedClient:
     def __init__(self, *, base_url: str, transport: Callable[..., Any] | None = None) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _require_https(base_url)
         self._transport: Callable[..., Any] = transport or urllib_transport
 
-    def _pages(self, path: str, *, token: str, query: Mapping[str, Any], key: str) -> list[dict[str, Any]]:
+    def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
         collected: list[dict[str, Any]] = []
         page_token: str | None = None
         for _ in range(MAX_PAGES):
@@ -99,14 +108,22 @@ class _PagedClient:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
             data = _payload(self._transport("GET", url, body=None, token=token))
-            items = data.get(key)
-            if not isinstance(items, list):
-                raise FeishuDirectoryError(f"missing_{key}")
+            items = None
+            for candidate in keys:
+                value = data.get(candidate)
+                if isinstance(value, list):
+                    items = value
+                    break
+            if items is None:
+                raise FeishuDirectoryError(f"missing_{keys[0]}")
             collected.extend(item for item in items if isinstance(item, Mapping))
             next_token = data.get("page_token")
-            # page_token 没变说明服务端不再前进；继续翻是死循环，不是读完。
-            if data.get("has_more") is not True or not isinstance(next_token, str) or not next_token or next_token == page_token:
+            if data.get("has_more") is not True:
                 return collected
+            # has_more=true 但游标缺失或停滞：服务端明确说还有数据，把已收集的
+            # 半截结果当成功返回会让调用方用它替换旧快照（Codex 复查发现）。
+            if not isinstance(next_token, str) or not next_token or next_token == page_token:
+                raise FeishuDirectoryError("pagination_stalled")
             page_token = next_token
         raise FeishuDirectoryError("pagination_limit")
 
@@ -119,11 +136,14 @@ class FeishuDirectoryClient(_PagedClient):
     """
 
     def list_collaboration_tenants(self, *, token: str) -> list[dict[str, Any]]:
+        # 字段链取自 2026-07-29 真实探针（scripts/verify_feishu_association.sh）：
+        # 实测主字段是 target_tenant_list；此前写的 collaboration_tenant_list 在真实
+        # 响应里不存在，会让每次成功响应都被判失败（Codex 复查发现）。
         return self._pages(
             "/trust_party/v1/collaboration_tenants",
             token=token,
             query={},
-            key="collaboration_tenant_list",
+            keys=("target_tenant_list", "items", "collaboration_tenants", "tenants"),
         )
 
     def list_visible_organization(self, *, token: str, tenant_key: str, department_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -136,7 +156,7 @@ class FeishuDirectoryClient(_PagedClient):
             f"/trust_party/v1/collaboration_tenants/{quote(tenant_key, safe='')}/visible_organization",
             token=token,
             query=query,
-            key="collaboration_entity_list",
+            keys=("collaboration_entity_list", "entities", "items"),
         )
         departments = [item for item in entities if item.get("open_department_id") or item.get("department_id")]
         members = [item for item in entities if not (item.get("open_department_id") or item.get("department_id"))]
@@ -164,7 +184,7 @@ class FeishuAuthorizationClient:
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
         if not app_id or not app_secret:
             raise ValueError("缺少专用授权应用凭据")
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
         self._transport: Callable[..., Any] = transport or urllib_transport
