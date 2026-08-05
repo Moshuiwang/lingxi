@@ -1,0 +1,45 @@
+name: Docs
+
+# Issue #43 瘦身：纯文档推送到 main 的轻量门禁（Markdown 链接、项目 Skills、行尾空白）。
+# 不装依赖、不起服务容器，十几秒完成；代码路径的完整门禁见 ci.yml。
+# 同时命中两组路径的推送会两条工作流都跑，完整门禁覆盖本门禁的全部检查项。
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-gate:
+    name: Docs / gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Markdown 链接与项目 Skills 检查
+        run: |
+          python3 scripts/ci/check_markdown_links.py
+          python3 scripts/ci/check_project_skills.py
+
+      - name: 行尾空白检查
+        run: |
+          whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
+          if [ -n "${whitespace_files}" ]; then
+            printf '以下正式文件包含行尾空白：\n%s\n' "${whitespace_files}" >&2
+            exit 1
+          fi
+          echo '行尾空白：通过'

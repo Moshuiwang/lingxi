@@ -7,6 +7,17 @@ on:
   push:
     branches:
       - main
+    # Issue #43 瘦身（A2）：合并后或直推 main 的推送只对代码路径重跑完整门禁；
+    # 纯文档推送由 docs.yml 轻量覆盖。PR 阶段不做路径过滤，始终运行完整门禁。
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'workers/**'
+      - 'migrations/**'
+      - 'experiments/**'
+      - 'pyproject.toml'
+      - '.github/**'
   workflow_dispatch:
 
 permissions:
@@ -66,6 +77,10 @@ jobs:
           # 发布时门禁会自己跳版本。脚本里另有一道校验，确保这里不低于 pyproject
           # 声明的下限，两边漂移会被发现。
           python-version: '3.12'
+          # Issue #43 瘦身（A3）：缓存 pip 下载目录（feishu / agent extras，
+          # 含 claude-agent-sdk 轮子），缓存键取自 pyproject.toml 的哈希。
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
 
       # shellcheck 此前用的是 runner 镜像自带的版本，既没锁定也没打印：同一个提交
       # 可能因为镜像更新得到不同结论。改用 pip 分发并锁版本，本机可装同一个。
