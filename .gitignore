@@ -16,3 +16,6 @@ node_modules/
 build/
 dist/
 *.egg-info/
+
+# 依赖只以 pyproject.toml 声明，CI 与受控环境用 pip 安装；本地 uv 锁文件不入库
+uv.lock
