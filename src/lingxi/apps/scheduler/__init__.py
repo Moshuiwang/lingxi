@@ -9,7 +9,7 @@
 
 本模块只做组装：配置从环境变量来，轮换规则在
 :mod:`lingxi.core.identity.credentials`，存取在
-:mod:`lingxi.adapters.postgres_credentials`，飞书调用在
+:mod:`lingxi.adapters.delegated_credentials`（宿主机文件保管，选项 A 决策），飞书调用在
 :mod:`lingxi.adapters.feishu_directory`。
 
 退出语义（断言 V-部署-03）：收到 ``SIGTERM`` / ``SIGINT`` 后**停止领取新的到期
@@ -56,6 +56,10 @@ class _Secret(str):
 class SchedulerConfig:
     postgres_dsn: str = field(repr=False)
     credential_key: str = field(repr=False)
+    # 凭据文件的宿主机路径。部署契约：必须指向跨部署持久的挂载路径，
+    # 镜像替换与重启不得丢失——否则每次部署都要重新授权（产品负责人
+    # 2026-08-05 明确以「无需特殊处理」为目标、重新授权仅作保底）。
+    credential_path: str
     feishu_app_id: str
     feishu_app_secret: str = field(repr=False)
     feishu_base_url: str
@@ -64,6 +68,7 @@ class SchedulerConfig:
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
         "LINGXI_DELEGATED_CREDENTIAL_KEY",
+        "LINGXI_DELEGATED_CREDENTIAL_PATH",
         "LINGXI_FEISHU_APP_ID",
         "LINGXI_FEISHU_APP_SECRET",
         "LINGXI_FEISHU_BASE_URL",
@@ -96,6 +101,7 @@ class SchedulerConfig:
         return cls(
             postgres_dsn=_Secret(required("LINGXI_POSTGRES_DSN")),
             credential_key=_Secret(required("LINGXI_DELEGATED_CREDENTIAL_KEY")),
+            credential_path=required("LINGXI_DELEGATED_CREDENTIAL_PATH"),
             feishu_app_id=required("LINGXI_FEISHU_APP_ID"),
             feishu_app_secret=_Secret(required("LINGXI_FEISHU_APP_SECRET")),
             feishu_base_url=(source.get("LINGXI_FEISHU_BASE_URL") or "").strip() or DEFAULT_FEISHU_BASE_URL,
@@ -233,11 +239,11 @@ def install_signal_handlers(loop: CredentialRotationLoop) -> None:
 
 
 def build_loop(config: SchedulerConfig) -> CredentialRotationLoop:
+    from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
-    from lingxi.adapters.postgres_credentials import PostgresDelegatedCredentialVault
 
     return CredentialRotationLoop(
-        vault=PostgresDelegatedCredentialVault(config.postgres_dsn, config.credential_key),
+        vault=HostFileDelegatedCredentialVault(config.postgres_dsn, config.credential_key, config.credential_path),
         authorization=FeishuAuthorizationClient(
             base_url=config.feishu_base_url,
             app_id=config.feishu_app_id,

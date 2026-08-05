@@ -1,0 +1,274 @@
+"""专用授权凭据的宿主机文件保管，与数据库侧的主体登记。
+
+按产品负责人 2026-08-05 对 Issue #16 的决策（选项 A）落实成文边界（数据库设计
+原则 3、代码框架横切约定「凭据不进数据库」）：
+
+- ``refresh_token`` 只以 Fernet 密文保存在**宿主机受控文件**（0600、原子替换、
+  fcntl 排他锁），不进业务数据库，因此不随 Supabase 及其备份出司界；解密密钥
+  仍来自受控环境变量，与文件分开存放。
+- 数据库只保留 ``feishu_delegated_subject`` 登记表：主体 ``open_id`` 与配置状态。
+  它是 V-身份-02 双向触发器的数据源（撤销、收殓都不动它），也回答数据库设计
+  原则 3 允许保存的「是否已配置」。
+
+一次性令牌语义（PR #48 双复查后的形态）全部平移自数据库版实现：
+
+- ``claim_due`` 原子置位消费标记——领取去续期的那一刻起，旧密文对 ``load`` 与
+  再次领取都不可见，进程崩溃也不会在租期后重放已被飞书作废的令牌；
+- ``save`` 写入新凭据并清空消费标记（先登记数据库主体，让触发器把关，
+  再落文件——顺序不能反，否则触发器拒绝时密文已经写盘）；
+- ``revoke`` 删除凭据文件但**保留登记行**；
+- 超龄未清的消费中残留由 ``revoke_stale_consumed`` 收殓，并以「不可恢复」日志
+  请求人工重新授权。
+
+吸收测试资产 ``refresh_tokens.py`` 与数据库版前身已验证的模式：密文落盘、
+明文只在进程内（``SecretToken``）、缺加密依赖构造期即失败、绝不降级为明文。
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import logging
+import os
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from lingxi.core.identity.credentials import (
+    AuthorizationGrant,
+    SecretToken,
+    expiry_moment,
+    rotation_deadline,
+)
+from lingxi.core.identity.identifiers import redact_identifier
+
+logger = logging.getLogger(__name__)
+
+# 登记表里唯一允许的用途。新增用途要走迁移，不能靠调用方传字符串。
+DELEGATED_PURPOSE = "org_directory_sync"
+
+# 领取后其他进程再领取的观感与数据库版一致：消费标记本身就是唯一的门。
+# 保留该常量只为兼容既有调用方签名。
+DEFAULT_LEASE_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class StoredCredential:
+    subject_open_id: str
+    grant: AuthorizationGrant
+    refresh_at: datetime
+    expires_at: datetime
+
+
+class HostFileDelegatedCredentialVault:
+    """凭据文件 + 主体登记的组合保管者。API 与数据库版前身完全一致。"""
+
+    def __init__(self, dsn: str, encryption_key: str, credential_path: str) -> None:
+        try:
+            from cryptography.fernet import Fernet, InvalidToken
+            import psycopg
+        except ImportError as error:  # 绝不降级为明文保存。
+            raise RuntimeError("缺少专用授权凭据的加密依赖") from error
+        try:
+            self._cipher = Fernet(encryption_key.encode())
+        except Exception as error:
+            raise ValueError("专用授权凭据的加密密钥必须是有效的 Fernet 密钥") from error
+        if not credential_path or not str(credential_path).strip():
+            raise ValueError("必须提供凭据文件路径（宿主机受控目录）")
+        self._invalid_token = InvalidToken
+        self._dsn = dsn
+        self._psycopg = psycopg
+        self._path = Path(credential_path)
+        # 锁文件与凭据文件分开：凭据文件靠原子替换更新，锁对象必须稳定存在。
+        self._lock_path = self._path.with_name(self._path.name + ".lock")
+
+    # ---- 写入 -------------------------------------------------------------
+
+    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: datetime | None = None) -> None:
+        """登记主体并写入（或轮换）唯一一条专用授权凭据。
+
+        先写数据库登记行：V-身份-02 的反向触发器在这里把关（已是员工记录的
+        open_id 不能成为专用授权主体）。触发器拒绝时密文一个字节都不落盘。
+        """
+
+        moment = issued_at or datetime.now(timezone.utc)
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO feishu_delegated_subject (purpose, subject_open_id)
+                   VALUES (%s, %s)
+                   ON CONFLICT (purpose) DO UPDATE SET
+                     subject_open_id = EXCLUDED.subject_open_id,
+                     updated_at = now()""",
+                (DELEGATED_PURPOSE, subject_open_id),
+            )
+
+        payload = {
+            "subject_open_id": subject_open_id,
+            "refresh_token": grant.refresh_token.reveal(),
+            "scope": grant.scope,
+            "issued_at": moment.isoformat(),
+            "refresh_at": rotation_deadline(moment, grant.refresh_token_expires_in).isoformat(),
+            "expires_at": expiry_moment(moment, grant.refresh_token_expires_in).isoformat(),
+            "consumed_at": None,
+        }
+        with self._locked():
+            self._write_encrypted(payload)
+        logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
+
+    def revoke(self, *, reason: str) -> bool:
+        """删除凭据文件；数据库登记行**保留**（V-身份-02 的数据源不随撤销消失）。"""
+
+        with self._locked():
+            existed = self._path.exists()
+            if existed:
+                self._path.unlink()
+        if existed:
+            logger.warning("专用授权凭据已撤销 reason=%s", reason)
+        return existed
+
+    def revoke_stale_consumed(self, *, max_age_seconds: int = 600, now: datetime | None = None) -> bool:
+        """收殓「已消费但一直没写回新凭据」的文件。
+
+        这种文件意味着进程在续期后、落盘前死掉：旧令牌已被飞书作废，留着密文
+        只会诱使未来的代码路径重放它。"""
+
+        moment = now or datetime.now(timezone.utc)
+        with self._locked():
+            payload = self._read_payload()
+            if payload is None:
+                return False
+            consumed_at = _parse_moment(payload.get("consumed_at"))
+            if consumed_at is None or consumed_at >= moment - timedelta(seconds=max_age_seconds):
+                return False
+            self._path.unlink(missing_ok=True)
+        logger.error("不可恢复：发现续期后未落盘的消费中凭据，已清除，需人工重新授权")
+        return True
+
+    # ---- 读取 -------------------------------------------------------------
+
+    def load(self, *, now: datetime | None = None) -> StoredCredential | None:
+        """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""
+
+        moment = now or datetime.now(timezone.utc)
+        with self._locked():
+            payload = self._read_payload()
+        if payload is None:
+            return None
+        credential = self._to_credential(payload)
+        if credential is None:
+            self.revoke(reason="credential_undecryptable")
+            return None
+        if payload.get("consumed_at"):
+            # 消费中：旧令牌可能已被飞书作废，任何读取路径都不得再拿到它。
+            return None
+        if credential.expires_at <= moment:
+            self.revoke(reason="credential_expired")
+            return None
+        return credential
+
+    def claim_due(self, *, lease_seconds: int = DEFAULT_LEASE_SECONDS, now: datetime | None = None) -> StoredCredential | None:
+        """领取到期凭据并**原子置位消费标记**。
+
+        文件锁扮演数据库版 ``FOR UPDATE SKIP LOCKED`` 的角色；消费标记本身是
+        防重放的门——置位之后，无论进程死在何处，旧令牌都不会被再次领取。
+        """
+
+        del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
+        moment = now or datetime.now(timezone.utc)
+        with self._locked():
+            payload = self._read_payload()
+            if payload is None:
+                return None
+            if payload.get("consumed_at"):
+                return None
+            credential = self._to_credential(payload)
+            if credential is None:
+                self._path.unlink(missing_ok=True)
+                logger.warning("专用授权凭据已撤销 reason=credential_undecryptable")
+                return None
+            if credential.expires_at <= moment or credential.refresh_at > moment:
+                if credential.expires_at <= moment:
+                    self._path.unlink(missing_ok=True)
+                    logger.warning("专用授权凭据已撤销 reason=credential_expired")
+                return None
+            payload["consumed_at"] = moment.isoformat()
+            self._write_encrypted(payload)
+        return credential
+
+    # ---- 内部 -------------------------------------------------------------
+
+    def _locked(self):
+        return _FileLock(self._lock_path)
+
+    def _read_payload(self) -> dict[str, Any] | None:
+        try:
+            blob = self._path.read_bytes()
+        except FileNotFoundError:
+            return None
+        if not blob:
+            return None
+        try:
+            return json.loads(self._cipher.decrypt(blob))
+        except (self._invalid_token, ValueError):
+            # 解密失败按「不可用」处理，调用方决定撤销；不留半解的内容。
+            return {}
+
+    def _write_encrypted(self, payload: dict[str, Any]) -> None:
+        blob = self._cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode())
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(dir=str(self._path.parent), prefix=self._path.name + ".")
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(blob)
+            os.replace(temp_name, self._path)
+        except BaseException:
+            os.unlink(temp_name)
+            raise
+
+    def _to_credential(self, payload: dict[str, Any]) -> StoredCredential | None:
+        token = payload.get("refresh_token")
+        subject = payload.get("subject_open_id")
+        refresh_at = _parse_moment(payload.get("refresh_at"))
+        expires_at = _parse_moment(payload.get("expires_at"))
+        if not isinstance(token, str) or not token or not isinstance(subject, str) or refresh_at is None or expires_at is None:
+            return None
+        remaining = max(int((expires_at - datetime.now(timezone.utc)).total_seconds()), 1)
+        return StoredCredential(
+            subject_open_id=subject,
+            grant=AuthorizationGrant(SecretToken(token), remaining, str(payload.get("scope") or "")),
+            refresh_at=refresh_at,
+            expires_at=expires_at,
+        )
+
+
+def _parse_moment(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+class _FileLock:
+    """fcntl 排他锁：同一宿主机上的并发访问全部串行化。"""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle = None
+
+    def __enter__(self) -> "_FileLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self._path, "a+b")  # noqa: SIM115 - 锁的生命周期由上下文管理
+        os.fchmod(self._handle.fileno(), 0o600)
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        assert self._handle is not None
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None

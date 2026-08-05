@@ -1,6 +1,6 @@
 """「四达文档会议助手」专用授权凭据的生命周期规则。
 
-本模块只有规则，没有 I/O：加密存取在 :mod:`lingxi.adapters.postgres_credentials`，
+本模块只有规则，没有 I/O：加密存取在 :mod:`lingxi.adapters.delegated_credentials`，
 向飞书换新凭据在 :mod:`lingxi.adapters.feishu_directory`，定时扫描在
 ``lingxi.apps.scheduler``。这样"什么时候该轮换、失败了怎么办"可以在没有数据库、
 没有网络、没有真实凭据的 CI 里被完整证伪。

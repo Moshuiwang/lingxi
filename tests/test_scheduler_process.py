@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError
-from lingxi.adapters.postgres_credentials import StoredCredential
+from lingxi.adapters.delegated_credentials import StoredCredential
 from lingxi.apps.scheduler import CredentialRotationLoop, SchedulerConfig
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 
@@ -35,6 +35,7 @@ FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 COMPLETE_ENV = {
     "LINGXI_POSTGRES_DSN": "postgresql://user@localhost:5432/lingxi",
     "LINGXI_DELEGATED_CREDENTIAL_KEY": "ZmFrZS1mZXJuZXQta2V5LWZvci11bml0LXRlc3RzLTA9",
+    "LINGXI_DELEGATED_CREDENTIAL_PATH": "/var/lib/lingxi/credentials/delegated.enc",
     "LINGXI_FEISHU_APP_ID": "cli_fake",
     "LINGXI_FEISHU_APP_SECRET": "secret_fake",
 }
@@ -94,6 +95,7 @@ class SchedulerConfigTest(unittest.TestCase):
         config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_SCHEDULER_INTERVAL_SECONDS": "30"})
 
         self.assertEqual(config.postgres_dsn, COMPLETE_ENV["LINGXI_POSTGRES_DSN"])
+        self.assertEqual(config.credential_path, COMPLETE_ENV["LINGXI_DELEGATED_CREDENTIAL_PATH"])
         self.assertEqual(config.feishu_app_id, "cli_fake")
         self.assertEqual(config.interval_seconds, 30)
         self.assertTrue(config.feishu_base_url.startswith("https://"))

@@ -87,7 +87,7 @@ class IdentityPostgresTestCase(unittest.TestCase):
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "DROP TABLE IF EXISTS app_user CASCADE;"
-                "DROP TABLE IF EXISTS feishu_delegated_credential CASCADE;"
+                "DROP TABLE IF EXISTS feishu_delegated_subject CASCADE;"
                 "DROP TABLE IF EXISTS feishu_org_member_snapshot CASCADE;"
                 "DROP TABLE IF EXISTS feishu_org_department_snapshot CASCADE;"
                 "DROP TABLE IF EXISTS feishu_org_tenant_snapshot CASCADE;"
@@ -115,15 +115,20 @@ class IdentityPostgresTestCase(unittest.TestCase):
 
 
 class DelegatedCredentialTest(IdentityPostgresTestCase):
-    """V-身份-03：专用授权的 refresh_token 只以密文保存。"""
+    """V-身份-03（2026-08-05 选项 A 形态）：密文只在宿主机文件，数据库零凭据。"""
 
     def setUp(self) -> None:
         super().setUp()
+        import tempfile
+
         from cryptography.fernet import Fernet
 
-        from lingxi.adapters.postgres_credentials import PostgresDelegatedCredentialVault
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
 
-        self.vault = PostgresDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode())
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
         self.issued_at = datetime.now(timezone.utc)
 
     def _save(self, *, seconds: int = 7 * 24 * 3600, token: str = FAKE_TOKEN, issued_at: datetime | None = None) -> None:
@@ -133,40 +138,36 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             issued_at=issued_at or self.issued_at,
         )
 
-    def test_only_ciphertext_is_stored_and_the_plaintext_is_nowhere_in_the_row(self) -> None:
+    def test_ciphertext_lives_only_on_disk_and_the_database_holds_no_credential(self) -> None:
         self._save()
 
-        row = self.query(
-            "SELECT subject_open_id, encrypted_refresh_token, scope FROM feishu_delegated_credential"
-        )[0]
+        blob = self.path.read_bytes()
+        self.assertNotIn(FAKE_TOKEN.encode(), blob)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), oct(0o600))
 
-        self.assertNotIn(FAKE_TOKEN.encode(), bytes(row[1]))
-        self.assertEqual(row[0], DELEGATED_SUBJECT)
-        self.assertEqual(row[2], "offline_access")
-
-    def test_the_table_has_no_column_for_short_lived_or_plaintext_credentials(self) -> None:
+    def test_the_registry_table_has_no_credential_column_at_all(self) -> None:
+        """数据库设计原则 3：库里只存「是否已配置」，任何令牌形态的列都不允许存在。"""
         columns = {
             name
             for (name,) in self.query(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = 'feishu_delegated_credential'"
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'feishu_delegated_subject'"
             )
         }
 
-        for forbidden in ("access_token", "authorization_code", "client_secret", "plain_refresh_token", "refresh_token"):
-            with self.subTest(column=forbidden):
-                self.assertNotIn(forbidden, columns)
+        self.assertEqual(columns, {"purpose", "subject_open_id", "configured_at", "updated_at"})
 
-    def test_the_credential_table_does_not_depend_on_a_user_record(self) -> None:
+    def test_the_registry_does_not_depend_on_a_user_record(self) -> None:
         # 专用授权不是员工，不能因为 app_user 的建档与删除而失效。
         self.assertEqual(
             self.scalar(
                 "SELECT count(*) FROM information_schema.table_constraints "
-                "WHERE table_name = 'feishu_delegated_credential' AND constraint_type = 'FOREIGN KEY'"
+                "WHERE table_name = 'feishu_delegated_subject' AND constraint_type = 'FOREIGN KEY'"
             ),
             0,
         )
 
-    def test_at_most_one_delegated_credential_can_exist(self) -> None:
+    def test_at_most_one_delegated_subject_can_exist(self) -> None:
         self._save()
         self.vault.save(
             subject_open_id="ou_another_subject",
@@ -174,34 +175,23 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             issued_at=self.issued_at,
         )
 
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
-        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_credential"), "ou_another_subject")
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), "ou_another_subject")
 
     def test_an_unknown_purpose_is_rejected_by_the_database(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
             self.execute(
-                "INSERT INTO feishu_delegated_credential "
-                "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
-                "VALUES ('employee_token', 'ou_x', decode('0102','hex'), now(), now() + interval '1 hour')"
-            )
-
-    def test_a_rotation_point_at_or_after_expiry_is_rejected(self) -> None:
-        with self.assertRaises(self._psycopg.errors.CheckViolation):
-            self.execute(
-                "INSERT INTO feishu_delegated_credential "
-                "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
-                "VALUES ('org_directory_sync', 'ou_x', decode('0102','hex'), now() + interval '2 hours', now() + interval '1 hour')"
+                "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) VALUES ('employee_token', 'ou_x')"
             )
 
     def test_the_rotation_point_follows_the_lifetime_returned_by_feishu(self) -> None:
         self._save(seconds=7 * 24 * 3600)
 
-        refresh_at, expires_at = self.query(
-            "SELECT refresh_at, refresh_token_expires_at FROM feishu_delegated_credential"
-        )[0]
+        credential = self.vault.load()
 
-        self.assertAlmostEqual((refresh_at - self.issued_at).total_seconds(), 7 * 24 * 3600 * 0.8, delta=2)
-        self.assertAlmostEqual((expires_at - self.issued_at).total_seconds(), 7 * 24 * 3600, delta=2)
+        assert credential is not None
+        self.assertAlmostEqual((credential.refresh_at - self.issued_at).total_seconds(), 7 * 24 * 3600 * 0.8, delta=2)
+        self.assertAlmostEqual((credential.expires_at - self.issued_at).total_seconds(), 7 * 24 * 3600, delta=2)
 
     def test_load_returns_the_plaintext_only_through_an_explicit_reveal(self) -> None:
         self._save()
@@ -213,8 +203,8 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
         self.assertEqual(credential.grant.refresh_token.reveal(), FAKE_TOKEN)
         self.assertNotIn(FAKE_TOKEN, repr(credential))
 
-    def test_claiming_a_due_credential_pushes_the_rotation_point_forward_once(self) -> None:
-        # 一次性凭据不能被同一轮扫描领两次。
+    def test_claiming_a_due_credential_succeeds_exactly_once(self) -> None:
+        # 一次性凭据不能被同一轮扫描领两次；消费标记就是那道门。
         self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
 
         first = self.vault.claim_due()
@@ -228,43 +218,47 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
         self.assertIsNone(self.vault.claim_due())
 
-    def test_a_concurrent_holder_makes_the_claim_skip_instead_of_wait(self) -> None:
-        """FOR UPDATE SKIP LOCKED：另一进程持锁时直接跳过，不排队。"""
+    def test_concurrent_claims_are_serialized_by_the_file_lock(self) -> None:
+        """fcntl 排他锁扮演数据库版 SKIP LOCKED 的角色：并发领取恰好一个成功。"""
+        import threading as _threading
+
         self._save(seconds=3600, issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500))
+        results: list[object] = []
 
-        with self._psycopg.connect(self._dsn) as holder, holder.cursor() as cursor:
-            cursor.execute("SELECT purpose FROM feishu_delegated_credential FOR UPDATE")
-            skipped = self.vault.claim_due()
-            holder.rollback()
+        def worker() -> None:
+            results.append(self.vault.claim_due())
 
-        self.assertIsNone(skipped)
-        self.assertIsNotNone(self.vault.claim_due())
+        threads = [_threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
-    def test_an_undecryptable_credential_is_revoked_rather_than_retried(self) -> None:
+        self.assertEqual(sum(1 for item in results if item is not None), 1)
+
+    def test_an_undecryptable_credential_file_is_revoked_rather_than_retried(self) -> None:
         self._save()
-        self.execute("UPDATE feishu_delegated_credential SET encrypted_refresh_token = decode('0102', 'hex')")
+        self.path.write_bytes(b"\x01\x02broken")
 
         self.assertIsNone(self.vault.load())
-        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
+        self.assertFalse(self.path.exists())
 
-    def test_revoking_clears_the_secret_but_keeps_the_subject_row(self) -> None:
-        """撤销＝清空密文保留主体行：主体行是 V-身份-02 触发器的数据来源，
-        删行会在「凭据失效、快照仍有效」的窗口里拆掉建档防线（独立复查发现）。"""
+    def test_revoking_removes_the_file_but_keeps_the_registry_row(self) -> None:
+        """撤销只动凭据文件；登记行是 V-身份-02 触发器的数据来源，必须留下。"""
         self._save()
 
         self.assertTrue(self.vault.revoke(reason="test"))
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
-        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
         self.assertIsNone(self.vault.load())
-        # 再次撤销没有可清空的密文，应报告 False 而不是假装又撤销了一次。
         self.assertFalse(self.vault.revoke(reason="twice"))
 
     def test_the_delegated_subject_is_still_rejected_after_revocation(self) -> None:
-        """独立复查要求的用例：先撤销，再为专用授权主体建档，必须仍被数据库拒绝。"""
+        """撤销后为专用授权主体建档，仍被数据库拒绝（登记行未消失）。"""
         self._save()
         self.assertTrue(self.vault.revoke(reason="test"))
 
-        subject = self.scalar("SELECT subject_open_id FROM feishu_delegated_credential")
+        subject = self.scalar("SELECT subject_open_id FROM feishu_delegated_subject")
         self.assertIsNotNone(subject)
         with self.assertRaises(self._psycopg.errors.RaiseException):
             self.execute(
@@ -277,15 +271,20 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
 
 class ConsumedCredentialTest(IdentityPostgresTestCase):
-    """一次性令牌的消费语义与双向主体防线（Codex 复查 P1）。"""
+    """一次性令牌的消费语义与双向主体防线（Codex 复查 P1，文件保管形态）。"""
 
     def setUp(self) -> None:
         super().setUp()
+        import tempfile
+
         from cryptography.fernet import Fernet
 
-        from lingxi.adapters.postgres_credentials import PostgresDelegatedCredentialVault
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
 
-        self.vault = PostgresDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode())
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
         self.issued_at = datetime.now(timezone.utc) - timedelta(days=6)
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
@@ -293,19 +292,17 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
             issued_at=self.issued_at,
         )
 
-    def test_a_claim_marks_the_credential_consumed_and_hides_it_from_load(self) -> None:
+    def test_a_claim_marks_the_credential_consumed_and_hides_it_everywhere(self) -> None:
         claimed = self.vault.claim_due()
 
         self.assertIsNotNone(claimed)
-        self.assertIsNotNone(self.scalar("SELECT consumed_at FROM feishu_delegated_credential"))
-        # 消费中：旧密文对读取路径与再次领取都不可见——它可能已被飞书作废。
+        # 消费中：旧令牌可能已被飞书作废，load 与再次领取都不得再拿到它——
+        # 现在与任何未来时刻都一样（挡住重放的是消费标记本身）。
         self.assertIsNone(self.vault.load())
         self.assertIsNone(self.vault.claim_due())
-        # 租期过后也一样：挡住重放的必须是消费标记本身，不能只靠 refresh_at
-        # 被临时挪后（否则崩溃后一个租期，旧令牌就会被再次领取）。
-        after_lease = datetime.now(timezone.utc) + timedelta(seconds=301)
-        self.assertIsNone(self.vault.claim_due(now=after_lease))
-        self.assertIsNone(self.vault.load(now=after_lease))
+        later = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        self.assertIsNone(self.vault.claim_due(now=later))
+        self.assertIsNone(self.vault.load(now=later))
 
     def test_saving_the_replacement_clears_the_consumed_marker(self) -> None:
         self.vault.claim_due()
@@ -314,35 +311,36 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
             grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
         )
 
-        self.assertIsNone(self.scalar("SELECT consumed_at FROM feishu_delegated_credential"))
         self.assertIsNotNone(self.vault.load())
 
-    def test_a_stale_consumed_row_is_swept_with_a_distinct_log(self) -> None:
-        """进程在续期后、落库前死掉的形状：旧令牌已作废，收殓而不是留给未来重放。"""
+    def test_a_stale_consumed_file_is_swept_with_a_distinct_log(self) -> None:
+        """进程在续期后、落盘前死掉的形状：旧令牌已作废，收殓而不是留给未来重放。"""
         self.vault.claim_due()
 
-        with self.assertLogs("lingxi.adapters.postgres_credentials", level="ERROR") as captured:
+        with self.assertLogs("lingxi.adapters.delegated_credentials", level="ERROR") as captured:
             cleared = self.vault.revoke_stale_consumed(max_age_seconds=0, now=datetime.now(timezone.utc) + timedelta(seconds=1))
 
         self.assertTrue(cleared)
         self.assertTrue(any("不可恢复" in line for line in captured.output))
-        self.assertIsNone(self.scalar("SELECT encrypted_refresh_token FROM feishu_delegated_credential"))
-        # 主体行仍在：V-身份-02 的数据源不随收殓消失。
-        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_credential"), 1)
+        self.assertFalse(self.path.exists())
+        # 登记行仍在：V-身份-02 的数据源不随收殓消失。
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
 
     def test_an_existing_app_user_open_id_cannot_become_the_delegated_subject(self) -> None:
         """反向防线（Codex 复查）：先有员工记录、再把同一 open_id 写成专用授权
-        主体，必须被数据库拒绝——正向触发器管不到凭据表一侧的写入。"""
+        主体，必须被数据库拒绝；且**拒绝发生在密文落盘之前**（save 先登记后写盘）。"""
         self.execute(
             """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key)
                VALUES ('usr_existing_employee', 'ou_employee_x', 'u_x', 'un_x', '某员工', 't_a')"""
         )
+        self.vault.revoke(reason="reset")
 
         with self.assertRaises(self._psycopg.errors.RaiseException):
             self.vault.save(
                 subject_open_id="ou_employee_x",
                 grant=AuthorizationGrant(SecretToken("fake-second"), 3600, ""),
             )
+        self.assertFalse(self.path.exists())
 
 
 class SnapshotCommitOrderingTest(IdentityPostgresTestCase):
@@ -637,9 +635,7 @@ class AppUserRecordTest(IdentityPostgresTestCase):
     def test_the_delegated_authorization_subject_cannot_be_recorded_as_a_user(self) -> None:
         """V-身份-02：应用层已拦一次，数据库是绕不过去的那一道。"""
         self.execute(
-            "INSERT INTO feishu_delegated_credential "
-            "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
-            "VALUES ('org_directory_sync', %s, decode('0102','hex'), now(), now() + interval '7 days')",
+            "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) VALUES ('org_directory_sync', %s)",
             (DELEGATED_SUBJECT,),
         )
 
@@ -654,9 +650,7 @@ class AppUserRecordTest(IdentityPostgresTestCase):
     def test_an_existing_record_cannot_be_repointed_at_the_delegated_subject(self) -> None:
         self.users.record_identity(self._draft())
         self.execute(
-            "INSERT INTO feishu_delegated_credential "
-            "(purpose, subject_open_id, encrypted_refresh_token, refresh_at, refresh_token_expires_at) "
-            "VALUES ('org_directory_sync', %s, decode('0102','hex'), now(), now() + interval '7 days')",
+            "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) VALUES ('org_directory_sync', %s)",
             (DELEGATED_SUBJECT,),
         )
 

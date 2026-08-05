@@ -30,7 +30,7 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.hooks",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.adapters.feishu_directory",
-    "lingxi.adapters.postgres_credentials",
+    "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.postgres_identity",
     # apps/ 是本次新增的子目录：进程入口漏进制品会让"镜像 tag 就是冻结版本"
     # 这条回滚前提直接失效，而它只在部署时才暴露（断言 V-部署-10）。

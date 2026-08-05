@@ -6,7 +6,7 @@
 -- `record_authorized_identity()` 函数在正式路径上没有对应动作。001 仍留在仓库里
 -- 供既有受控测试使用，由验收人在 PR 阶段决定废弃时机。
 --
--- **依赖 migrations/006**：本迁移的触发器要读 feishu_delegated_credential，
+-- **依赖 migrations/006**：本迁移的触发器要读 feishu_delegated_subject，
 -- 必须在 006 之后执行。
 --
 -- 与 001 相比的正式化改动：
@@ -28,8 +28,8 @@
 -- 在这里直接失败，把静默错误变成迁移期的显式错误。
 DO $$
 BEGIN
-    IF to_regclass('public.feishu_delegated_credential') IS NULL THEN
-        RAISE EXCEPTION '008 依赖 006_create_feishu_delegated_credential.sql，请先执行 006';
+    IF to_regclass('public.feishu_delegated_subject') IS NULL THEN
+        RAISE EXCEPTION '008 依赖 006（feishu_delegated_subject 登记表），请先执行 006';
     END IF;
 END
 $$;
@@ -103,7 +103,7 @@ AS $$
 BEGIN
     IF NEW.feishu_open_id IS NOT NULL
        AND EXISTS (
-           SELECT 1 FROM feishu_delegated_credential
+           SELECT 1 FROM feishu_delegated_subject
             WHERE subject_open_id = NEW.feishu_open_id
        ) THEN
         RAISE EXCEPTION '专用授权账号不能被建成用户记录';
@@ -133,5 +133,5 @@ END;
 $$;
 
 CREATE TRIGGER credential_no_app_user_subject
-    BEFORE INSERT OR UPDATE OF subject_open_id ON feishu_delegated_credential
+    BEFORE INSERT OR UPDATE OF subject_open_id ON feishu_delegated_subject
     FOR EACH ROW EXECUTE FUNCTION credential_reject_app_user_subject();
