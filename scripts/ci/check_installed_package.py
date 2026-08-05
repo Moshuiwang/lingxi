@@ -19,11 +19,20 @@ import sys
 
 # 逐个 import，缺哪个报哪个，不要笼统失败。
 REQUIRED_MODULES = (
+    "lingxi.core.ids",
     "lingxi.core.identity.onboarding",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
+    "lingxi.core.execution.message_stream",
     "lingxi.adapters.claude_agent_hooks",
+    "lingxi.adapters.claude_agent_session",
+    # worker 入口是 `python -m lingxi.apps.worker`：`apps` 是本次新增的子目录，
+    # 打包配置漏收它的表现正是"测试全绿但部署起不来"（Issue #37）。
+    "lingxi.apps.worker.cli",
+    "lingxi.apps.worker.config",
+    "lingxi.apps.worker.turn",
+    "lingxi.apps.worker.__main__",
 )
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")
