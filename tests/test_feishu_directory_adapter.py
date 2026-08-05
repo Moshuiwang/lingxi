@@ -84,6 +84,15 @@ class DirectoryPaginationTest(unittest.TestCase):
 
         self.assertEqual(client.list_collaboration_tenants(token="fake-user-token")[0]["tenant_key"], "tenant_a")
 
+    def test_a_non_object_page_item_is_a_shape_error(self) -> None:
+        """终轮 Codex：静默丢弃畸形项会让被丢的租户躲过完整性校验。"""
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}, "碎片"], key="target_tenant_list")])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as context:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(context.exception.code, "invalid_page_item")
+
     def test_an_http_base_url_is_rejected_before_any_request(self) -> None:
         """飞书出站必须 HTTPS：误配 http:// 会把 Bearer token 与 App Secret
         明文上路（Codex 复查发现）。"""

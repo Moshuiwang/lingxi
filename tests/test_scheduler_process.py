@@ -65,13 +65,14 @@ class FakeVault:
     def claim_due(self):
         return self._claims.pop(0) if self._claims else None
 
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at=None) -> None:
+    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at=None, replacing_generation=None) -> bool:
         if self._save_failures > 0:
             self._save_failures -= 1
             raise RuntimeError("模拟写库失败")
         self.saved.append((subject_open_id, grant))
+        return True
 
-    def revoke(self, *, reason: str) -> bool:
+    def revoke(self, *, reason: str, generation=None) -> bool:
         self.revoked.append(reason)
         return True
 
@@ -144,6 +145,33 @@ class RotationLoopTest(unittest.TestCase):
         self.assertEqual(vault.saved[0][0], "ou_delegated")
         self.assertEqual(vault.saved[0][1].refresh_token.reveal(), "fake-next-token")
         self.assertEqual(vault.revoked, [])
+
+    def test_a_stop_during_the_sweep_prevents_a_new_claim(self) -> None:
+        """终轮 Codex：SIGTERM 落在收殓等待文件锁期间时，不得再领取并启动
+        新的续期请求。"""
+        loop_holder: list[CredentialRotationLoop] = []
+
+        class StoppingVault(FakeVault):
+            def __init__(self) -> None:
+                super().__init__([credential()])
+                self.claims = 0
+
+            def revoke_stale_consumed(self, **_kwargs) -> bool:
+                loop_holder[0].request_stop()
+                return False
+
+            def claim_due(self):
+                self.claims += 1
+                return super().claim_due()
+
+        vault = StoppingVault()
+        loop = CredentialRotationLoop(vault=vault, authorization=FakeAuthorization(replacement_grant()), interval_seconds=0.01)
+        loop_holder.append(loop)
+
+        report = loop.run_once()
+
+        self.assertEqual(vault.claims, 0)
+        self.assertEqual((report.claimed, report.rotated, report.revoked), (0, 0, 0))
 
     def test_every_round_sweeps_stale_consumed_credentials_first(self) -> None:
         """崩溃窗口收殓：每轮先清「已消费未落库」的行，防止旧令牌在租期后被重放

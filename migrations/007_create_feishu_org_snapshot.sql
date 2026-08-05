@@ -123,3 +123,32 @@ CREATE INDEX feishu_org_member_snapshot_user_id_idx
     ON feishu_org_member_snapshot (user_id);
 CREATE INDEX feishu_org_member_snapshot_run_idx
     ON feishu_org_member_snapshot (sync_run_id);
+
+
+-- 完成批次的计数必须与**实际子行**一致：声明值造假（或写路径缺陷）会让一个
+-- 没有任何子行的 complete 批次被 lookup 选中，全员「定位不到」（终轮 Codex）。
+-- 用 DEFERRABLE 约束触发器在提交时核对，迁移期即接线。
+CREATE OR REPLACE FUNCTION feishu_org_sync_run_verify_children() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    actual_tenants INTEGER;
+    actual_members INTEGER;
+BEGIN
+    IF NEW.status <> 'complete' THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO actual_tenants FROM feishu_org_tenant_snapshot WHERE sync_run_id = NEW.id;
+    SELECT count(*) INTO actual_members FROM feishu_org_member_snapshot WHERE sync_run_id = NEW.id;
+    IF actual_tenants <> NEW.tenant_count OR actual_members <> NEW.member_count THEN
+        RAISE EXCEPTION '完成批次 % 的声明计数与实际子行不一致（租户 %/%、成员 %/%）',
+            NEW.id, NEW.tenant_count, actual_tenants, NEW.member_count, actual_members;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER feishu_org_sync_run_children_consistent
+    AFTER INSERT OR UPDATE OF status ON feishu_org_sync_run
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION feishu_org_sync_run_verify_children();

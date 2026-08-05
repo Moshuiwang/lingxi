@@ -118,8 +118,8 @@ class RotationReport:
 
 class _Vault(Protocol):
     def claim_due(self) -> Any: ...
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: Any = ...) -> None: ...
-    def revoke(self, *, reason: str) -> bool: ...
+    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: Any = ..., replacing_generation: Any = ...) -> Any: ...
+    def revoke(self, *, reason: str, generation: Any = ...) -> bool: ...
 
 
 class _Authorization(Protocol):
@@ -157,6 +157,10 @@ class CredentialRotationLoop:
         stale_collector = getattr(self._vault, "revoke_stale_consumed", None)
         if callable(stale_collector):
             stale_collector()
+        if self._stop.is_set():
+            # SIGTERM 可能在收殓等待文件锁期间到达：领取前必须再看一次，
+            # 否则会在关闭宽限期里再启动一条最长 20 秒的续期请求（终轮 Codex）。
+            return RotationReport()
         claim = self._vault.claim_due()
         if claim is None:
             return RotationReport()
@@ -169,8 +173,13 @@ class CredentialRotationLoop:
             outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
             logger.warning("专用授权续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
 
+        claim_generation = getattr(claim, "generation", None) or None
         if decide_after_refresh(outcome) is CredentialAction.ROTATE and replacement is not None:
-            if self._save_with_retry(subject_open_id=claim.subject_open_id, replacement=replacement):
+            if self._save_with_retry(
+                subject_open_id=claim.subject_open_id,
+                replacement=replacement,
+                replacing_generation=claim_generation,
+            ):
                 logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
                 return RotationReport(claimed=1, rotated=1)
             # 新凭据没能落库：旧的此刻已被飞书作废，继续留着只会让下一轮拿死
@@ -180,20 +189,28 @@ class CredentialRotationLoop:
                 "不可恢复：续期成功但新凭据写库失败，旧凭据已被飞书作废，需人工重新授权 subject=%s",
                 redact_identifier(claim.subject_open_id),
             )
-            self._vault.revoke(reason="rotation_persist_failed")
+            self._vault.revoke(reason="rotation_persist_failed", generation=claim_generation)
             return RotationReport(claimed=1, revoked=1)
 
-        self._vault.revoke(reason=f"refresh_{outcome.value}")
+        # 只撤销领取到的那一代：期间的新授权不得被旧链失败连带删除（终轮 Codex）。
+        self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
         return RotationReport(claimed=1, revoked=1)
 
-    def _save_with_retry(self, *, subject_open_id: str, replacement: Any) -> bool:
-        """新凭据写库带短退避重试：一次瞬时的数据库抖动不该报废一条一次性凭据。"""
+    def _save_with_retry(self, *, subject_open_id: str, replacement: Any, replacing_generation: str | None = None) -> bool:
+        """新凭据落盘带短退避重试：一次瞬时抖动不该报废一条一次性凭据。"""
 
         for delay_seconds in (0.0, *SAVE_RETRY_BACKOFF_SECONDS):
             if delay_seconds:
                 self._stop.wait(delay_seconds)
             try:
-                self._vault.save(subject_open_id=subject_open_id, grant=replacement)
+                saved = self._vault.save(
+                    subject_open_id=subject_open_id,
+                    grant=replacement,
+                    replacing_generation=replacing_generation,
+                )
+                if saved is False:
+                    # 世代不符＝期间有新授权：旧链结果作废，视为已妥善收尾。
+                    return True
                 return True
             except Exception as error:  # noqa: BLE001 - 记录后重试，最终失败由调用方处置
                 logger.warning("新凭据写库失败，将重试 error=%s", type(error).__name__)

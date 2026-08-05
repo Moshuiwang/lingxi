@@ -116,7 +116,12 @@ class _PagedClient:
                     break
             if items is None:
                 raise FeishuDirectoryError(f"missing_{keys[0]}")
-            collected.extend(item for item in items if isinstance(item, Mapping))
+            for item in items:
+                if not isinstance(item, Mapping):
+                    # 静默丢弃会让被丢的租户躲过完整性校验、半轮快照被标完成
+                    # （终轮 Codex）：任何非对象项都是响应形状错误。
+                    raise FeishuDirectoryError("invalid_page_item")
+                collected.append(item)
             next_token = data.get("page_token")
             if data.get("has_more") is not True:
                 return collected

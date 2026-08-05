@@ -77,12 +77,16 @@ CREATE TABLE app_user (
             AND NULLIF(BTRIM(feishu_user_id), '') IS NULL
             AND NULLIF(BTRIM(feishu_union_id), '') IS NULL
             AND NULLIF(BTRIM(display_name), '') IS NULL
+            AND NULLIF(BTRIM(department), '') IS NULL
             AND NULLIF(BTRIM(tenant_key), '') IS NULL
         ) OR (
             NULLIF(BTRIM(feishu_open_id), '') IS NOT NULL
             AND NULLIF(BTRIM(feishu_user_id), '') IS NOT NULL
             AND NULLIF(BTRIM(feishu_union_id), '') IS NOT NULL
             AND NULLIF(BTRIM(display_name), '') IS NOT NULL
+            -- 部门属产品合同明列的必要资料（终轮 Codex：数据库也要落实，
+            -- 否则直连 SQL / 手工构造 draft 可绕过应用层的人工核对）。
+            AND NULLIF(BTRIM(department), '') IS NOT NULL
             AND NULLIF(BTRIM(tenant_key), '') IS NOT NULL
         )
     )
@@ -101,6 +105,9 @@ CREATE OR REPLACE FUNCTION app_user_reject_delegated_subject() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    -- 与凭据侧触发器争用同一 advisory 锁：两个 BEFORE 触发器各自的 EXISTS 在
+    -- MVCC 下看不见对方未提交的行，并发提交会让双向防线同时失守（终轮 Codex）。
+    PERFORM pg_advisory_xact_lock(4217003);
     IF NEW.feishu_open_id IS NOT NULL
        AND EXISTS (
            SELECT 1 FROM feishu_delegated_subject
@@ -123,6 +130,7 @@ CREATE OR REPLACE FUNCTION credential_reject_app_user_subject() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    PERFORM pg_advisory_xact_lock(4217003);
     IF EXISTS (
         SELECT 1 FROM app_user WHERE feishu_open_id = NEW.subject_open_id
     ) THEN

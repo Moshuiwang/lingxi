@@ -264,8 +264,8 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             self.execute(
                 """INSERT INTO app_user
                      (id, feishu_open_id, feishu_user_id, feishu_union_id,
-                      display_name, tenant_key)
-                   VALUES ('usr_test_revoked_subject', %s, 'u', 'un', '某人', 't')""",
+                      display_name, department, tenant_key)
+                   VALUES ('usr_test_revoked_subject', %s, 'u', 'un', '某人', '部门', 't')""",
                 (subject,),
             )
 
@@ -330,8 +330,8 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         """反向防线（Codex 复查）：先有员工记录、再把同一 open_id 写成专用授权
         主体，必须被数据库拒绝；且**拒绝发生在密文落盘之前**（save 先登记后写盘）。"""
         self.execute(
-            """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key)
-               VALUES ('usr_existing_employee', 'ou_employee_x', 'u_x', 'un_x', '某员工', 't_a')"""
+            """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, department, tenant_key)
+               VALUES ('usr_existing_employee', 'ou_employee_x', 'u_x', 'un_x', '某员工', '部门', 't_a')"""
         )
         self.vault.revoke(reason="reset")
 
@@ -341,6 +341,139 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
                 grant=AuthorizationGrant(SecretToken("fake-second"), 3600, ""),
             )
         self.assertFalse(self.path.exists())
+
+
+class CredentialGenerationGuardTest(IdentityPostgresTestCase):
+    """终轮 Codex P1：轮换收尾必须世代匹配——期间的新授权不得被旧链覆盖或删除。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import tempfile
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
+            issued_at=datetime.now(timezone.utc) - timedelta(seconds=3500),
+        )
+
+    def test_a_reauthorization_between_claim_and_save_wins(self) -> None:
+        claimed = self.vault.claim_due()
+        assert claimed is not None
+        # 领取之后专用用户完成了一次新授权：
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-fresh-token"), 7 * 24 * 3600, ""),
+        )
+
+        stale_write = self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-stale-rotation"), 7 * 24 * 3600, ""),
+            replacing_generation=claimed.generation,
+        )
+
+        self.assertFalse(stale_write)
+        fresh = self.vault.load()
+        assert fresh is not None
+        self.assertEqual(fresh.grant.refresh_token.reveal(), "fake-fresh-token")
+
+    def test_a_reauthorization_between_claim_and_revoke_survives(self) -> None:
+        claimed = self.vault.claim_due()
+        assert claimed is not None
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-fresh-token"), 7 * 24 * 3600, ""),
+        )
+
+        self.assertFalse(self.vault.revoke(reason="refresh_failed", generation=claimed.generation))
+        self.assertIsNotNone(self.vault.load())
+
+    def test_a_subject_mismatch_between_file_and_registry_fails_closed(self) -> None:
+        """终轮 Codex P1：登记指向 B、文件仍是 A 时，A 已在防线之外——
+        清除文件并要求重新授权，绝不继续用 A 的凭据。"""
+        self.execute(
+            "UPDATE feishu_delegated_subject SET subject_open_id = 'ou_new_subject_b'"
+        )
+
+        with self.assertLogs("lingxi.adapters.delegated_credentials", level="ERROR") as captured:
+            credential = self.vault.load()
+
+        self.assertIsNone(credential)
+        self.assertFalse(self.path.exists())
+        self.assertTrue(any("不一致" in line for line in captured.output))
+
+
+class DatabaseConsistencyBackstopTest(IdentityPostgresTestCase):
+    """终轮 Codex P2：数据库层兜底——声明计数造假与缺部门直插都被拒。"""
+
+    def test_a_complete_batch_with_fake_counts_and_no_children_is_rejected(self) -> None:
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.execute(
+                """INSERT INTO feishu_org_sync_run
+                     (id, source_app_id, status, started_at, completed_at, tenant_count, department_count, member_count)
+                   VALUES ('run_fake', 'cli_fake', 'complete', now(), now(), 3, 1, 5)"""
+            )
+
+    def test_an_identity_row_without_a_department_is_rejected_by_the_database(self) -> None:
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self.execute(
+                """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                                          display_name, tenant_key)
+                   VALUES ('usr_no_dept', 'ou_nd', 'u_nd', 'un_nd', '无部门', 't_nd')"""
+            )
+
+
+class TriggerRaceSerializationTest(IdentityPostgresTestCase):
+    """终轮 Codex P1：两个 BEFORE 触发器的 EXISTS 在 MVCC 下互看不见未提交行；
+    advisory 锁必须把两条写路径串行化，并发下双向防线仍然成立。"""
+
+    def test_an_uncommitted_app_user_still_blocks_the_registry_write(self) -> None:
+        import threading as _threading
+
+        started = _threading.Event()
+        outcome: dict[str, object] = {}
+
+        connection_one = self._psycopg.connect(self._dsn)
+        try:
+            cursor = connection_one.cursor()
+            cursor.execute(
+                """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                                          display_name, department, tenant_key)
+                   VALUES ('usr_race', 'ou_race_subject', 'u_r', 'un_r', '竞态员工', '部门', 't_r')"""
+            )
+
+            def registry_writer() -> None:
+                started.set()
+                try:
+                    with self._psycopg.connect(self._dsn) as connection_two, connection_two.cursor() as cursor_two:
+                        cursor_two.execute(
+                            "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) "
+                            "VALUES ('org_directory_sync', 'ou_race_subject')"
+                        )
+                except Exception as error:  # noqa: BLE001 - 测试收集
+                    outcome["error"] = error
+
+            worker = _threading.Thread(target=registry_writer)
+            worker.start()
+            started.wait()
+            # 触发器在 advisory 锁上排队；提交事务一让它看到已提交的员工行。
+            import time as _time
+
+            _time.sleep(0.3)
+            connection_one.commit()
+            worker.join(timeout=10)
+        finally:
+            connection_one.close()
+
+        self.assertIn("error", outcome)
+        self.assertIsInstance(outcome["error"], self._psycopg.errors.RaiseException)
 
 
 class SnapshotCommitOrderingTest(IdentityPostgresTestCase):
@@ -611,8 +744,8 @@ class AppUserRecordTest(IdentityPostgresTestCase):
 
         with self.assertRaises(self._psycopg.errors.UniqueViolation):
             self.execute(
-                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
-                "VALUES ('usr_duplicate', 'ou_zhang', 'user_other', 'union_other', '另一个张一', 'tenant_a')"
+                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, department, tenant_key) "
+                "VALUES ('usr_duplicate', 'ou_zhang', 'user_other', 'union_other', '另一个张一', '部门', 'tenant_a')"
             )
 
     def test_recording_again_never_resets_an_advanced_provisioning_state(self) -> None:
@@ -641,8 +774,8 @@ class AppUserRecordTest(IdentityPostgresTestCase):
 
         with self.assertRaises(self._psycopg.errors.RaiseException):
             self.execute(
-                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, tenant_key) "
-                "VALUES ('usr_delegated', %s, 'user_delegated', 'union_delegated', '专用授权账号', 'tenant_a')",
+                "INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name, department, tenant_key) "
+                "VALUES ('usr_delegated', %s, 'user_delegated', 'union_delegated', '专用授权账号', '部门', 'tenant_a')",
                 (DELEGATED_SUBJECT,),
             )
         self.assertEqual(self.users.count(), 0)

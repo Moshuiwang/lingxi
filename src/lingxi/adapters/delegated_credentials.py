@@ -60,6 +60,10 @@ class StoredCredential:
     grant: AuthorizationGrant
     refresh_at: datetime
     expires_at: datetime
+    # 文件世代号：每次 save 生成新值。轮换收尾（写回/撤销）必须携带领取时的
+    # 世代号，世代不符说明期间发生了新授权——旧链的结果一律放弃，不得覆盖或
+    # 删除新凭据（终轮 Codex）。
+    generation: str = ""
 
 
 class HostFileDelegatedCredentialVault:
@@ -86,7 +90,7 @@ class HostFileDelegatedCredentialVault:
 
     # ---- 写入 -------------------------------------------------------------
 
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: datetime | None = None) -> None:
+    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: datetime | None = None, replacing_generation: str | None = None) -> bool:
         """登记主体并写入（或轮换）唯一一条专用授权凭据。
 
         先写数据库登记行：V-身份-02 的反向触发器在这里把关（已是员工记录的
@@ -104,7 +108,10 @@ class HostFileDelegatedCredentialVault:
                 (DELEGATED_PURPOSE, subject_open_id),
             )
 
+        from lingxi.core.ids import new_ulid
+
         payload = {
+            "generation": new_ulid(),
             "subject_open_id": subject_open_id,
             "refresh_token": grant.refresh_token.reveal(),
             "scope": grant.scope,
@@ -114,14 +121,30 @@ class HostFileDelegatedCredentialVault:
             "consumed_at": None,
         }
         with self._locked():
+            if replacing_generation is not None:
+                current = self._read_payload()
+                current_generation = (current or {}).get("generation")
+                if current_generation != replacing_generation:
+                    # 领取之后有过新授权：旧轮换链的结果作废，绝不覆盖新凭据。
+                    logger.warning("轮换结果已过期（期间发生新授权），放弃写回")
+                    return False
             self._write_encrypted(payload)
         logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
+        return True
 
-    def revoke(self, *, reason: str) -> bool:
-        """删除凭据文件；数据库登记行**保留**（V-身份-02 的数据源不随撤销消失）。"""
+    def revoke(self, *, reason: str, generation: str | None = None) -> bool:
+        """删除凭据文件；数据库登记行**保留**（V-身份-02 的数据源不随撤销消失）。
+
+        携带 ``generation`` 时只撤销**那一代**：领取之后若发生了新授权，
+        旧链的失败不得把新凭据一起删掉（终轮 Codex）。"""
 
         with self._locked():
             existed = self._path.exists()
+            if existed and generation is not None:
+                current = self._read_payload()
+                if (current or {}).get("generation") != generation:
+                    logger.warning("撤销目标已被新授权取代，跳过")
+                    return False
             if existed:
                 self._path.unlink()
         if existed:
@@ -156,6 +179,8 @@ class HostFileDelegatedCredentialVault:
             payload = self._read_payload()
         if payload is None:
             return None
+        if not self._subject_matches_registry(payload):
+            return None
         credential = self._to_credential(payload)
         if credential is None:
             self.revoke(reason="credential_undecryptable")
@@ -183,6 +208,8 @@ class HostFileDelegatedCredentialVault:
                 return None
             if payload.get("consumed_at"):
                 return None
+            if not self._subject_matches_registry(payload):
+                return None
             credential = self._to_credential(payload)
             if credential is None:
                 self._path.unlink(missing_ok=True)
@@ -201,6 +228,26 @@ class HostFileDelegatedCredentialVault:
 
     def _locked(self):
         return _FileLock(self._lock_path)
+
+    def _subject_matches_registry(self, payload: dict[str, Any]) -> bool:
+        """凭据文件主体必须与数据库登记一致，否则失败关闭并清除文件。
+
+        主体 A→B 更换途中崩溃会留下「登记指向 B、文件仍是 A」：此时 A 已不在
+        登记表里，双向触发器只护着 B，继续用 A 的凭据等于在防线外运行
+        （终轮 Codex）。清除旧文件并要求重新授权是唯一安全的恢复。"""
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
+                (DELEGATED_PURPOSE,),
+            )
+            row = cursor.fetchone()
+        registered = None if row is None else str(row[0])
+        if registered == payload.get("subject_open_id"):
+            return True
+        logger.error("不可恢复：凭据文件主体与数据库登记不一致，已清除文件，需人工重新授权")
+        self._path.unlink(missing_ok=True)
+        return False
 
     def _read_payload(self) -> dict[str, Any] | None:
         try:
@@ -241,6 +288,7 @@ class HostFileDelegatedCredentialVault:
             grant=AuthorizationGrant(SecretToken(token), remaining, str(payload.get("scope") or "")),
             refresh_at=refresh_at,
             expires_at=expires_at,
+            generation=str(payload.get("generation") or ""),
         )
 
 
