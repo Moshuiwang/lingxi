@@ -768,7 +768,11 @@ class SummaryContentTest(RetentionPostgresTestCase):
         )
 
         cleaner = PostgresRetentionCleaner(self._dsn)
-        with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
+        # 捕获**根 logger**，不是只捕获 scheduler 那一个。清理这条链路上会写日志的
+        # 至少有 `lingxi.apps.scheduler` 与 `lingxi.adapters.retention` 两处；只盯住
+        # 其中一个，另一处的泄漏就看不见。这不是假设：变异 M-20 把人员数据写进适配器
+        # 的日志行时，只捕获 scheduler 的那一版**仍然是绿的**。
+        with self.assertLogs(level="INFO") as captured:
             from lingxi.apps.scheduler import RetentionCleanupDuty
 
             report = RetentionCleanupDuty(cleaner=cleaner).run_once()
