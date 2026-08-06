@@ -153,6 +153,7 @@ class EventPipeline:
                 self._replies.send_text(
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
                     text=self._texts.suspended,
                 )
                 self._audit.record(
@@ -198,6 +199,7 @@ class EventPipeline:
                 self._replies.send_text(
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
                     text=self._texts.busy_hint,
                 )
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
@@ -254,6 +256,7 @@ class EventPipeline:
             self._replies.send_text(
                 chat_id=message.chat_id,
                 thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
                 text=self._texts.busy_hint,
             )
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)

@@ -143,7 +143,16 @@ class Reactions(Protocol):
 
 
 class Replies(Protocol):
-    def send_text(self, *, chat_id: str, thread_id: str | None, text: str) -> None: ...
+    """发文本。
+
+    签名里带上 ``reply_to_message_id`` 与 ``thread_id``，是为了让接口设计「四、飞书出站」
+    的「必须发到同一私聊或同一话题」由**参数表**保证：实现总是回复触发它的那条消息，
+    话题里的消息回进同一话题，不需要调用方额外记住该发到哪。
+    """
+
+    def send_text(
+        self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
+    ) -> None: ...
 
 
 class AuditSink(Protocol):
