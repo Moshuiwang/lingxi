@@ -353,7 +353,7 @@ class SigtermTest(unittest.TestCase):
 
     SCRIPT = textwrap.dedent(
         """
-        import itertools, json, time
+        import itertools, json, threading, time
         from datetime import datetime, timedelta, timezone
         from lingxi.apps.scheduler import RosterAuditDuty, SchedulerLoop, install_signal_handlers
         from lingxi.core.identity.roster_audit import ArchivedIdentity
@@ -385,6 +385,10 @@ class SigtermTest(unittest.TestCase):
         days = itertools.count()
         base = datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc)
 
+        # 一个停止标志显式贯穿职责与循环——这正是 SIGTERM 要验的结构本身，
+        # 不从职责内部把私有标志掏出来。
+        stop = threading.Event()
+
         duty = RosterAuditDuty(
             baseline_reader=Baseline(),
             roster_reader=lambda: [{"personnel_id": "ou_p1", "name": "花名册姓名",
@@ -393,8 +397,9 @@ class SigtermTest(unittest.TestCase):
             audit=Audit(),
             chat_id="oc_fake_admin_group_for_tests",
             clock=lambda: base + timedelta(days=next(days)),
+            stop=stop,
         )
-        loop = SchedulerLoop(duties=(duty,), interval_seconds=0.05, stop=duty._stop)
+        loop = SchedulerLoop(duties=(duty,), interval_seconds=0.05, stop=stop)
         install_signal_handlers(loop)
         print("ready", flush=True)
         loop.run_forever()
