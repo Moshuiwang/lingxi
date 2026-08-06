@@ -99,6 +99,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
     ),
+    # 迁移作业（Issue #53）：部署时跑一次 `python -m alembic upgrade head`，不是常驻
+    # 进程。**lingxi 模块那一列刻意为空**——迁移工具链不得渗入运行时代码
+    # （断言 V-迁移-04：`grep -rn "sqlalchemy\|alembic" src/` 必须为空），
+    # 所以这一组没有任何 lingxi 入口，只有第三方那一列要证明装得上。
+    "migrate": ((), ("alembic",)),
 }
 
 
