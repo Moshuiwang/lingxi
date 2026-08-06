@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Mapping
@@ -33,6 +34,34 @@ logger = logging.getLogger(__name__)
 # 飞书群聊 `chat_id` 的前缀。用它做格式校验，是为了让「把用户 open_id 误配成群 ID」
 # 这类错配在**进程启动时**就失败，而不是等到当天第一次发日报时才失败。
 GROUP_CHAT_ID_PREFIX = "oc_"
+
+# 投递去重 ID。飞书的 `im/v1/messages` 接受一个开发者自备的 `uuid`，用于**服务端**
+# 对重复请求去重。长度上限 50，这里的取值恒为 14 + 32 = 46。
+DELIVERY_UUID_PREFIX = "lingxi-roster-"
+DELIVERY_UUID_MAX_LENGTH = 50
+
+
+def delivery_uuid(chat_id: str, dedupe_key: str) -> str:
+    """由「群 ID + 去重键」算出稳定的投递去重 ID。
+
+    **它解决的是"不确定态"，不是跨重启幂等。** HTTP POST 已经被飞书收下、而响应在
+    回程超时的那一刻，调用方无法区分"没发出去"和"发出去了但没听见回音"——重试是唯一
+    选择，而重试就会重复投递。带上同一个 `uuid` 之后，重试请求在服务端被认作同一条，
+    这条路径因此从"确定会重复"变成"由平台去重"。
+
+    取哈希而不是拼原值：群 ID 是外部标识，拼进 `uuid` 会让它出现在请求体的第二个位置，
+    也会随日志与错误上下文扩散。同样输入永远得到同样输出，这正是重试要复用它的前提。
+
+    **平台侧的去重窗口是飞书的属性，本切片未验证**（真实调用属 L4a）。因此本模块能
+    承诺的是"重试一定携带同一个 `uuid`"这个**代码事实**，不是"平台一定不会重复投递"
+    这个**平台行为**；后者要等 L4a 受控验收才能声称。
+    """
+
+    digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode("utf-8")).hexdigest()[:32]
+    value = f"{DELIVERY_UUID_PREFIX}{digest}"
+    if len(value) > DELIVERY_UUID_MAX_LENGTH:  # pragma: no cover - 取值恒为 46，改前缀时才可能触发
+        raise ValueError("投递去重 ID 超过飞书的 50 字符上限")
+    return value
 
 
 class FeishuGroupMessageError(RuntimeError):
@@ -112,11 +141,18 @@ class FeishuGroupMessages:
             raise FeishuGroupMessageError("missing_tenant_access_token")
         return token
 
-    def send_text(self, *, chat_id: str, text: str) -> None:
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
         """向 `chat_id` 发一条 **纯文本** 消息。
 
         刻意只支持文本、不支持卡片：卡片能带按钮，而管理群通知**不得有任何可执行入口**
         （`V-花名册-24`）。想加按钮的人会先撞上这个方法签名里没有卡片这件事。
+
+        `dedupe_key` 标识"这是同一次逻辑投递"。调用方对同一天的日报（含失败重试）必须
+        传同一个值，由 :func:`delivery_uuid` 折成飞书的 `uuid` 字段。做成**必填参数**
+        而不是可选：忘了传就等于回到"不确定态必然重复投递"，那正是这次要修的缺陷，
+        不该由一个默认值悄悄承担。
+
+        取令牌那一步没有 `uuid`：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
         """
 
         token = self._tenant_access_token()
@@ -128,6 +164,7 @@ class FeishuGroupMessages:
                 "msg_type": "text",
                 # 飞书把 content 定义成一段 **JSON 字符串**，不是对象。
                 "content": json.dumps({"text": text}, ensure_ascii=False),
+                "uuid": delivery_uuid(chat_id, dedupe_key),
             },
             token=token,
         )

@@ -354,7 +354,7 @@ class _BaselineReader(Protocol):
 
 
 class _GroupSender(Protocol):
-    def send_text(self, *, chat_id: str, text: str) -> None: ...
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
 
 
 class RosterAuditDuty:
@@ -373,6 +373,13 @@ class RosterAuditDuty:
 
     水位在**发送成功之后**才置位。发送失败不算已发送，下一轮重试（`V-花名册-30`）。
     空差异日也置位：那一天的审计已经记过了，重复记只是噪声（`V-花名册-25`）。
+
+    **重试与"不确定态"**。"发送失败就重试"这条规则有一个它自己看不见的缺口：HTTP
+    请求已经被飞书收下、而响应在回程超时的那一刻，进程拿到的是异常，事实却是消息已经
+    发出去了。重试于是重复投递一条日报。同一天的每一次发送——首次与全部重试——因此共用
+    一个去重键（当日 UTC 日期），由 :func:`~lingxi.adapters.feishu_group_message.delivery_uuid`
+    折成飞书的投递 `uuid` 交服务端去重。平台侧的去重窗口未经验证（属 L4a），所以这里
+    承诺的是"重试携带同一个 `uuid`"这个代码事实，不是"平台一定不会重复投递"。
     """
 
     name = "花名册审计日报"
@@ -435,9 +442,19 @@ class RosterAuditDuty:
             self._completed_on = today
             return report
 
+        if self._stop.is_set():
+            # 停止信号落在读取阶段（读库 + 读花名册都可能耗时）。这里再看一次，
+            # 让这一轮成为**干净中断**：不发送、不置水位，什么都没发生。
+            # 停止之后必须 0 次发送（`V-花名册-20`），而入口处那一次检查挡不住
+            # "进来时还没停、读完才停"这条时序。重发由裁定 C2 的知情接受覆盖。
+            logger.info("停止信号在花名册读取期间到达，本轮不发送日报")
+            return report
+
         text = render_daily_report(report, report_date=today)
         try:
-            self._sender.send_text(chat_id=self._chat_id, text=text)
+            # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
+            # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
+            self._sender.send_text(chat_id=self._chat_id, text=text, dedupe_key=today.isoformat())
         except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
             # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
             # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。
