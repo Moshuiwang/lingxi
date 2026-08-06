@@ -161,7 +161,20 @@ def main() -> int:
     failures.extend(check_runtime_isolation(RUNTIME_SOURCE_ROOT))
 
     # 建图本身就是一道检查：down_revision 指向不存在的 id 时这里抛异常。
-    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    # alembic 抛的是 `KeyError: '<那个 id>'`，裸传上去只会得到一段 sqlalchemy 内部
+    # 调用栈——红是红了，但读的人要自己认出「这是 down_revision 写错了」。
+    try:
+        script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+        script.get_heads()  # 触发 revision map 构建，把建图错误留在这里
+    except Exception as error:  # noqa: BLE001 - 建图失败的形态由 alembic 决定
+        print("alembic revision 链检查：不通过", file=sys.stderr)
+        print(
+            f"  - 无法构建 revision 图（{type(error).__name__}: {error}）。"
+            "最常见的原因是某个 revision 的 down_revision 指向了不存在的 id，"
+            "或 versions/ 下有重复的 revision id。",
+            file=sys.stderr,
+        )
+        return 1
 
     heads = script.get_heads()
     bases = script.get_bases()
