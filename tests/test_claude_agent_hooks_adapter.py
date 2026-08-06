@@ -2,7 +2,7 @@
 
 ``lingxi.adapters.claude_agent_hooks`` 是唯一 import Claude Agent SDK 的地方，也是
 把已验证的判定逻辑接到真实 SDK 上的唯一一处。SDK 是 ``pyproject.toml`` 里的可选
-``agent`` extra，本文件**刻意不装它**：用桩模块顶替可以在没有 SDK 的环境里跑，锁住
+``worker`` extra，本文件**刻意不装它**：用桩模块顶替可以在没有 SDK 的环境里跑，锁住
 三件事——注册了哪些事件、回调怎么被调用、回调签名的第三个参数会不会被按关键字传入。
 
 桩模块只能证明"我们这一侧的形状没变"，**不能**证明 SDK 那一侧接受这些事件名。

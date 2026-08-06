@@ -9,13 +9,24 @@
 通过，要么失败。
 
 用法：先安装本包，再在**仓库目录之外**运行本脚本。
+
+    python3 check_installed_package.py                      # 制品完整性（全部关键模块）
+    python3 check_installed_package.py --process scheduler  # 追加：该进程的运行依赖真的装上了
+
+``--process`` 是 Issue #56 按进程拆 extras 之后加的。**`src/lingxi/` 里没有任何模块级
+第三方 import，全部是函数内延迟导入**，所以「进程入口 import 成功」并不能证明它的运行
+依赖装上了——只装一个空环境也照样能 import 成功。要让「某个 extra 漏声明依赖」变红，
+必须显式导入第三方模块本身，这正是 ``PROCESS_RUNTIME_IMPORTS`` 的第二个元组在做的事。
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import pathlib
+import re
 import sys
+from importlib.metadata import PackageNotFoundError, metadata
 
 # 逐个 import，缺哪个报哪个，不要笼统失败。
 REQUIRED_MODULES = (
@@ -57,8 +68,171 @@ REQUIRED_PACKAGE_DATA = (("lingxi.config", "galaxy_role_function_map.toml"),)
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")
 
+# 按进程分组的运行时依赖（Issue #56）。键与 pyproject.toml 的
+# ``[project.optional-dependencies]`` 组名一一对应；值是
+# （该进程要导入的 lingxi 模块, 该进程运行时真正需要的第三方模块）。
+#
+# 第三方那一列是从进程入口逐个追 import 链得到的，不是照抄 pyproject——照抄的话
+# 这个检查就永远不会红。CI 在**每个 extra 各自的干净环境**里跑对应的一项，
+# 见 .github/workflows/ci.yml 的 `CI / extras` 矩阵。
+PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "scheduler": (
+        # 注意导入的是承载 ``main`` 的包，不是 ``lingxi.apps.scheduler.__main__``：
+        # 后者在模块级 ``raise SystemExit(main())``（没有 __name__ 卫语句），
+        # import 它会真的把续期扫描进程跑起来。
+        ("lingxi.apps.scheduler", "lingxi.adapters.delegated_credentials"),
+        ("cryptography.fernet", "psycopg"),
+    ),
+    "worker": (
+        ("lingxi.apps.worker.__main__", "lingxi.apps.worker.cli", "lingxi.adapters.claude_agent_session"),
+        ("claude_agent_sdk",),
+    ),
+    # Bot-Test 受控验证资产（代码框架第五节），不是生产进程；这些模块刻意不在
+    # REQUIRED_MODULES 里——那份清单只管正式制品——但它们的依赖同样要能装上，
+    # 否则受控验证会在 biai-stage 上才失败。
+    "bot-test": (
+        (
+            "lingxi.adapters.feishu_onboarding",
+            "lingxi.adapters.oauth_bridge",
+            "lingxi.adapters.refresh_tokens",
+            "lingxi.adapters.postgres_onboarding",
+        ),
+        ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
+    ),
+}
+
+
+# CI 的 extras 矩阵所在文件。用 ``__file__`` 定位而不是 cwd：本检查刻意在仓库目录
+# 之外运行，但它自己始终躺在仓库里，CI 也是按绝对路径调用它的。
+CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+
+# 刻意不进 CI 矩阵的组。**目前为空**；往里加必须在注释里写清为什么该组不需要
+# 「干净环境里装一次」的证明，否则这就成了漏加矩阵行的后门。
+MATRIX_EXEMPT_EXTRAS: frozenset[str] = frozenset()
+
+# 只认单行写法 `extra: [a, b, c]`。改成多行 YAML 列表时这里会找不到而**失败**，
+# 不是静默通过——找不到就当作对不上账。
+_MATRIX_LINE = re.compile(r"^[ \t]*extra:[ \t]*\[([^\]]*)\]", re.MULTILINE)
+
+
+def installed_extras() -> set[str] | None:
+    """已安装制品声明的 extras；读不到返回 ``None``。"""
+
+    try:
+        return set(metadata("lingxi").get_all("Provides-Extra") or [])
+    except PackageNotFoundError:
+        return None
+
+
+def ci_matrix_extras(workflow_text: str) -> set[str] | None:
+    """从 ci.yml 文本里读出 extras 矩阵；没有那一行返回 ``None``。"""
+
+    match = _MATRIX_LINE.search(workflow_text)
+    if match is None:
+        return None
+    return {item.strip().strip("\"'") for item in match.group(1).split(",") if item.strip()}
+
+
+def check_ci_matrix(declared: set[str], workflow_text: str | None) -> list[str]:
+    """每个 extra 都必须出现在 ci.yml 的 extras 矩阵里。
+
+    只对账「pyproject ↔ 本脚本」这半边是不够的：把新组加进 pyproject 和
+    ``PROCESS_RUNTIME_IMPORTS``、唯独漏掉矩阵那一行，CI 就从没在干净环境里装过
+    它，而 gate 全绿——独立复查实测出过这个漏洞。这里补上另半边，让代码框架里
+    「这条不靠自觉」的说法真正成立。
+    """
+
+    if workflow_text is None:
+        return [f"{CI_WORKFLOW}：读不到 CI 配置，无法核对 extras 矩阵"]
+    matrix = ci_matrix_extras(workflow_text)
+    if matrix is None:
+        return ["ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"]
+
+    failures: list[str] = []
+    for name in sorted(declared - matrix - MATRIX_EXEMPT_EXTRAS):
+        failures.append(
+            f"extra `{name}`：不在 .github/workflows/ci.yml 的 extras 矩阵里，"
+            "CI 从没在干净环境里装过它。请加进 `extra: [...]`。"
+        )
+    for name in sorted(matrix - declared):
+        failures.append(
+            f"extra `{name}`：ci.yml 矩阵里有，但已安装制品没有声明它，那条矩阵腿必然失败。"
+        )
+    return failures
+
+
+def _read_ci_workflow() -> str | None:
+    try:
+        return CI_WORKFLOW.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def check_declared_extras(declared: set[str]) -> list[str]:
+    """已安装制品声明的 extras 必须与 ``PROCESS_RUNTIME_IMPORTS`` 一一对上。
+
+    CI 矩阵和本脚本都是**按名字列举**的：新增一个 extra 却忘了同步，它就悄悄没有
+    任何检查覆盖，而且不会有任何东西变红——正是「绿色的测试不等于会变红的测试」。
+    这里读的是**已安装制品的元数据**（``Provides-Extra``）而不是 pyproject.toml：
+    本检查刻意在仓库目录之外运行，回头读源码树就把这个前提丢了。
+    """
+
+    known = set(PROCESS_RUNTIME_IMPORTS)
+    failures: list[str] = []
+    for name in sorted(declared - known):
+        failures.append(
+            f"extra `{name}`：pyproject.toml 声明了它，但 PROCESS_RUNTIME_IMPORTS 没有，"
+            "于是它的依赖没有任何检查覆盖。请补上本脚本的条目，"
+            "并同步加进 .github/workflows/ci.yml 的 extras 矩阵。"
+        )
+    for name in sorted(known - declared):
+        failures.append(
+            f"extra `{name}`：PROCESS_RUNTIME_IMPORTS 有它，但已安装制品没有声明。"
+            "pyproject.toml 可能把这一组改名或删掉了。"
+        )
+    return failures
+
+
+def _check_process(name: str) -> list[str]:
+    """校验某个进程 extra 的运行依赖在当前环境里真的可用。"""
+
+    failures: list[str] = []
+    lingxi_modules, third_party_modules = PROCESS_RUNTIME_IMPORTS[name]
+
+    for module_name in lingxi_modules:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as error:  # noqa: BLE001 - 任何导入失败都是制品问题
+            failures.append(f"{name} 进程入口 {module_name}：导入失败（{type(error).__name__}: {error}）")
+            continue
+        location = pathlib.Path(module.__file__ or "")
+        if not any(marker in location.parts for marker in _INSTALL_MARKERS):
+            failures.append(
+                f"{name} 进程入口 {module_name}：来自 {location}，不是已安装的包。"
+                "请在仓库目录之外运行本检查。"
+            )
+
+    for module_name in third_party_modules:
+        try:
+            importlib.import_module(module_name)
+        except Exception as error:  # noqa: BLE001 - 缺依赖与导入报错都是声明问题
+            failures.append(
+                f"{name} 运行依赖 {module_name}：导入失败（{type(error).__name__}: {error}）。"
+                f"pyproject.toml 的 [{name}] 组可能漏了它。"
+            )
+
+    return failures
+
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--process",
+        choices=sorted(PROCESS_RUNTIME_IMPORTS),
+        help="额外校验该进程 extra 的运行依赖已装上；省略时只做制品完整性检查。",
+    )
+    args = parser.parse_args()
+
     failures: list[str] = []
     for name in REQUIRED_MODULES:
         try:
@@ -86,6 +260,20 @@ def main() -> int:
         elif not any(marker in data_file.parts for marker in _INSTALL_MARKERS):
             failures.append(f"{package_name}/{file_name}：来自 {data_file}，不是已安装的包。")
 
+    # 不受 --process 影响：gate 那一步（不传 --process）也要能发现「新增了 extra
+    # 却没人检查它」，否则这个漏洞要等到部署才暴露。三方对账——已安装制品的
+    # Provides-Extra、本脚本的 PROCESS_RUNTIME_IMPORTS、ci.yml 的 extras 矩阵——
+    # 任意两边对不上都在这里失败。
+    declared = installed_extras()
+    if declared is None:
+        failures.append("lingxi：读不到已安装制品的元数据，无法核对 extras 声明")
+    else:
+        failures.extend(check_declared_extras(declared))
+        failures.extend(check_ci_matrix(declared, _read_ci_workflow()))
+
+    if args.process:
+        failures.extend(_check_process(args.process))
+
     if failures:
         print("已安装包完整性：不通过", file=sys.stderr)
         for line in failures:
@@ -96,6 +284,17 @@ def main() -> int:
         f"已安装包完整性：{len(REQUIRED_MODULES)} 个模块与 "
         f"{len(REQUIRED_PACKAGE_DATA)} 个数据文件全部来自已安装的包"
     )
+    print(
+        f"extras 三方对账：{len(PROCESS_RUNTIME_IMPORTS)} 组"
+        f"（{', '.join(sorted(PROCESS_RUNTIME_IMPORTS))}）在制品 Provides-Extra、"
+        "本脚本与 ci.yml 矩阵三处一致"
+    )
+    if args.process:
+        lingxi_modules, third_party_modules = PROCESS_RUNTIME_IMPORTS[args.process]
+        print(
+            f"{args.process} 进程运行依赖：{len(lingxi_modules)} 个进程入口模块与 "
+            f"{len(third_party_modules)} 个第三方模块（{', '.join(third_party_modules)}）全部可导入"
+        )
     return 0
 
 
