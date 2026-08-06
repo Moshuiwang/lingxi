@@ -55,14 +55,16 @@ BEGIN
 END
 $roles$;
 
-COMMENT ON ROLE lingxi_app IS
-    '业务表最小读写；对承载可识别内容的表没有 DELETE，也不能执行保留清理函数。';
-COMMENT ON ROLE lingxi_scheduler IS
-    '定时职责；可执行受限保留清理函数，但不能直接 DELETE，也不能 SET ROLE 到函数所有者。';
-COMMENT ON ROLE lingxi_retention_owner IS
-    '无登录；持有受限保留清理函数及目标内容表的 SELECT / DELETE，不持有 INSERT / UPDATE / TRUNCATE / DDL。';
-COMMENT ON ROLE lingxi_migrate IS
-    '仅迁移时使用的 DDL 角色；不用于运行时连接。';
+-- 各角色的职责（对应数据库设计 :610-613）：
+--   lingxi_app             业务表最小读写；对承载可识别内容的表没有 DELETE，也不能执行清理函数。
+--   lingxi_scheduler       定时职责；可执行受限清理函数，但不能直接 DELETE，也不能 SET ROLE 到函数属主。
+--   lingxi_retention_owner 无登录；持有清理函数与目标内容表的 SELECT / DELETE，无 INSERT / UPDATE / TRUNCATE / DDL。
+--   lingxi_migrate         仅迁移时使用的 DDL 角色；不用于运行时连接。
+--
+-- 这些说明**故意只写成 SQL 注释，不写成 COMMENT ON ROLE**：`COMMENT ON ROLE` 要求
+-- 执行者是超级用户，或对该角色持有 ADMIN OPTION。生产托管方（Supabase）的 postgres
+-- 不是超级用户，而角色若由 Ops 预先建好，迁移执行者也拿不到 ADMIN OPTION——那样这四条
+-- 纯文档语句会让整条迁移失败。文档价值不值这个失败面。
 
 -- lingxi_migrate 建函数后要把它移交给 lingxi_retention_owner，因此必须是该角色的成员。
 -- 这条成员关系只给迁移角色，lingxi_app / lingxi_scheduler 都不给（断言 V-保留-13）。
@@ -122,7 +124,7 @@ CREATE TRIGGER galaxy_import_batch_expiry
 -- ---------------------------------------------------------------------------
 -- 设计约束逐条来自数据库设计 :538 与 :600：
 --   * SECURITY DEFINER，属主是无登录的 lingxi_retention_owner；
---   * `SET search_path = pg_catalog`，函数体内所有目标对象带 schema 全限定名，
+--   * `SET search_path = pg_catalog, pg_temp`，函数体内所有目标对象带 schema 全限定名，
 --     调用方伪造搜索路径改不了它删哪张表；
 --   * 拒绝晚于当前时间的 p_now；实际条件是 `expires_at <= LEAST(p_now, clock_timestamp())`；
 --   * 每次调用有批量上限；
@@ -145,7 +147,14 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog
+-- 必须以 pg_temp 结尾。search_path 里没有显式写 pg_temp 时，PostgreSQL 会把它
+-- **隐式排在最前面**来解析关系名与类型名——于是调用方只要 `CREATE TEMP TABLE
+-- timestamptz (...)`，就能让下面 DECLARE 里那两个未限定的类型名指向自己的临时对象，
+-- 进而让赋值走到自己的类型转换函数上，在 SECURITY DEFINER 的属主身份里执行任意代码。
+-- 实测（PostgreSQL 16）：不写 pg_temp 时该攻击可让调用方代码以 lingxi_retention_owner
+-- 身份运行；写在最后则 pg_catalog 先命中，攻击失效。表名已经全限定挡不住这一条——
+-- 能被劫持的不是"删哪张表"，是"在属主身份里跑什么"。
+SET search_path = pg_catalog, pg_temp
 AS $cleanup$
 DECLARE
     -- 单次调用每张表最多删除的父行数上限。清理是常驻定时职责，宁可多跑几轮，
@@ -220,8 +229,9 @@ COMMENT ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) IS
     '按 expires_at <= LEAST(p_now, clock_timestamp()) 小批量回收两张父表的到期行；'
     '每张表每次调用最多 p_limit 行（上限 1000）。返回表名、删除数与实际时间范围，不返回行内容。';
 
-ALTER FUNCTION public.lingxi_retention_cleanup(timestamptz, integer)
-    OWNER TO lingxi_retention_owner;
+-- 属主移交在本文件**最末尾**（第五节）。顺序是刻意的：先由建函数的角色把
+-- REVOKE / GRANT 授权面设好，最后才改属主。反过来做在非超级用户上会静默失败，
+-- 见第五节的说明。
 
 
 -- ---------------------------------------------------------------------------
@@ -253,3 +263,54 @@ GRANT SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi
 -- 先收回 PUBLIC 的默认 EXECUTE，再按精确签名只授给 scheduler。
 REVOKE ALL ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) TO lingxi_scheduler;
+
+
+-- ---------------------------------------------------------------------------
+-- 五、把函数移交给无登录的属主角色（必须最后做）
+-- ---------------------------------------------------------------------------
+-- `ALTER FUNCTION ... OWNER TO` 有两道权限检查，**两道在执行者是超级用户时都被整体
+-- 跳过**——本地容器与 CI 的 postgres 恰好是超级用户，所以少做任何一步也一直是绿的。
+-- 生产托管方（Supabase）的 postgres 没有 SUPERUSER，两道检查都会真的执行。实测：
+--
+--   1. 当前角色必须**能 SET ROLE 到新属主**。仅有 ADMIN OPTION 不够（PostgreSQL 16
+--      把 ADMIN / SET / INHERIT 拆成三个独立选项），否则
+--      `ERROR: must be able to SET ROLE "lingxi_retention_owner"`。
+--   2. 新属主必须对目标 schema 有 **CREATE**；上面只授了 USAGE，否则
+--      `ERROR: permission denied for schema public`。
+--
+-- 两者都只在移交这一刻需要，用完立即收回，不留常驻权限。
+--
+-- **移交必须排在授权之后。** PostgreSQL 16 里 CREATEROLE 角色建出来的角色是
+-- `INHERIT FALSE` 的自动授予：先改属主的话，执行者不再继承属主权限，随后的
+-- `GRANT EXECUTE ... TO lingxi_scheduler` 只会发一条
+-- `WARNING: no privileges were granted` 然后**什么也不做**——scheduler 拿不到
+-- EXECUTE，而迁移退出码是 0。这正是超级用户环境永远看不到的那一类失败。
+-- 改属主时 PostgreSQL 会把 ACL 里旧属主授出的条目改记到新属主名下，因此先授后交不丢授权。
+-- 判定必须看 **SET** 而不是 MEMBER：PostgreSQL 16 里 CREATEROLE 角色建出来的角色，
+-- 自动授予是 `ADMIN TRUE, INHERIT FALSE, SET FALSE`。`pg_has_role(..., 'MEMBER')`
+-- 对这种带 ADMIN 的成员关系返回真，于是"看起来已经是成员了"，而 `ALTER ... OWNER TO`
+-- 要的恰恰是被关掉的那个 SET，照样报 `must be able to SET ROLE`。
+DO $handover$
+DECLARE
+    v_is_member boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'MEMBER');
+    v_can_set   boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'SET');
+BEGIN
+    IF NOT v_can_set THEN
+        EXECUTE format('GRANT lingxi_retention_owner TO %I WITH SET TRUE', current_user);
+    END IF;
+    EXECUTE 'GRANT CREATE ON SCHEMA public TO lingxi_retention_owner';
+
+    EXECUTE 'ALTER FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) OWNER TO lingxi_retention_owner';
+
+    EXECUTE 'REVOKE CREATE ON SCHEMA public FROM lingxi_retention_owner';
+    -- 恢复到移交前的授予形态，不留多出来的能力。lingxi_migrate 的常驻成员关系
+    -- （本文件第一节授出、且带 SET）不受影响：它进不了这两个分支。
+    IF NOT v_can_set AND current_user <> 'lingxi_migrate' THEN
+        IF v_is_member THEN
+            EXECUTE format('GRANT lingxi_retention_owner TO %I WITH SET FALSE', current_user);
+        ELSE
+            EXECUTE format('REVOKE lingxi_retention_owner FROM %I', current_user);
+        END IF;
+    END IF;
+END
+$handover$;

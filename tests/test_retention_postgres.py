@@ -628,7 +628,33 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
             "SELECT proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
             "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
         )
-        self.assertEqual(list(proconfig or []), ["search_path=pg_catalog"])
+        self.assertEqual(list(proconfig or []), ["search_path=pg_catalog, pg_temp"])
+
+    def test_a_shadow_temp_type_cannot_run_caller_code_as_the_owner(self) -> None:
+        """V-保留-12：`search_path` 必须以 `pg_temp` 结尾。
+
+        表名全限定挡不住这一条。`search_path` 里没有显式写 `pg_temp` 时，PostgreSQL
+        会把它**隐式排在最前**来解析关系名与**类型名**；函数 `DECLARE` 里的
+        `timestamptz` / `integer` 是未限定类型名，调用方建一张同名临时表就能改变它们
+        的解析结果，进而在 SECURITY DEFINER 的属主身份里跑自己的代码。能被劫持的
+        不是"删哪张表"，是"在属主身份里跑什么"——所以上一条影子 schema 用例覆盖不到它。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_atk", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SET SESSION AUTHORIZATION lingxi_scheduler")
+            cursor.execute("CREATE TEMP TABLE timestamptz (x int)")
+            cursor.execute("CREATE TEMP TABLE integer (x int)")
+            cursor.execute(
+                "SELECT deleted_rows FROM public.lingxi_retention_cleanup(%s, 5) "
+                "WHERE target_table = 'galaxy_import_batch'",
+                (now,),
+            )
+            deleted = int(cursor.fetchone()[0])
+
+        self.assertEqual(deleted, 1, "影子临时类型不得干扰清理函数的正常执行")
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
 
 
 # ---------------------------------------------------------------------------

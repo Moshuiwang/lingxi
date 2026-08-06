@@ -47,6 +47,7 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.role_function",
     "lingxi.adapters.galaxy_csv_export",
     "lingxi.adapters.galaxy_import",
+    "lingxi.adapters.retention",
     "lingxi.adapters.feishu_roster_bitable",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
@@ -80,7 +81,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 注意导入的是承载 ``main`` 的包，不是 ``lingxi.apps.scheduler.__main__``：
         # 后者在模块级 ``raise SystemExit(main())``（没有 __name__ 卫语句），
         # import 它会真的把续期扫描进程跑起来。
-        ("lingxi.apps.scheduler", "lingxi.adapters.delegated_credentials"),
+        ("lingxi.apps.scheduler", "lingxi.adapters.delegated_credentials", "lingxi.adapters.retention"),
         ("cryptography.fernet", "psycopg"),
     ),
     "worker": (
