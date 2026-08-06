@@ -30,9 +30,12 @@ TESTS_DIRECTORY = Path(__file__).resolve().parent
 # 历史写法中的一种，比没有守卫更危险。
 _NUMBERED_SQL_NAME = re.compile(r"[0-9]{3}_[a-z0-9_]+\.sql")
 
-# 允许出现编号 SQL 文件名的地方：底座自己（它不含任何文件名，这里是兜底），
-# 以及引用 migrations/testing/ 测试资产的用例——那些资产不属于生产链。
-_ALLOWED_FILES = {"postgres_schema.py", "test_postgres_schema_fixture.py"}
+# 唯一豁免的是本文件：下面那条否定用例必须把历史写法当字面量喂给正则。
+#
+# **建库底座 `postgres_schema.py` 不在豁免名单里。** 它现在一个编号文件名都不含，
+# 豁免它等于给"硬编码搬回底座"开了一道无人看守的门——变异复验当场证实：把清单塞回
+# 底座时，带豁免的那一版守卫不变红。
+_ALLOWED_FILES = {"test_postgres_schema_fixture.py"}
 _TESTING_ASSET = re.compile(r"migrations/testing/")
 
 # 需要真库结构的测试模块必须走底座，不得自己拼建库过程。
