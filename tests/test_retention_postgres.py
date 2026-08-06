@@ -844,13 +844,30 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
                 with_children=True,
             )
 
+        # 信号必须**确定地**落在一轮的中间，而不是靠时间凑巧。做法是在清理职责
+        # 前面放一个闸门职责：它在第 4 轮打印 armed 然后长睡，父进程读到 armed 才发
+        # SIGTERM。于是前 3 轮真的删了行（F-05 的观察点），而第 4 轮信号一定落在
+        # 闸门里——此时循环是否还让后面的清理职责领取新工作，就是 F-06 本身。
+        #
+        # 不这样安排的话，单职责版本要靠 SIGTERM 恰好落在 run_once 内部才检验得到
+        # 停止检查点；实测把检查点删掉，那一版在 8 个 PYTHONHASHSEED 下**一次都没变红**。
         script = textwrap.dedent(
             """
             import json, os, threading, time
             from lingxi.adapters.retention import PostgresRetentionCleaner
             from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop, install_signal_handlers
 
-            state = {"calls": 0, "calls_after_stop": 0, "deleted": 0}
+            state = {"calls": 0, "calls_after_stop": 0, "deleted": 0, "gate_rounds": 0}
+            ARM_ON_ROUND = 4
+
+            class Gate:
+                name = "闸门职责"
+                def run_once(self):
+                    state["gate_rounds"] += 1
+                    if state["gate_rounds"] == ARM_ON_ROUND:
+                        print("armed", flush=True)
+                        time.sleep(1.5)
+                    return None
 
             class Counting:
                 def __init__(self, inner):
@@ -861,14 +878,13 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
                         state["calls_after_stop"] += 1
                     report = self._inner.run_once()
                     state["deleted"] += report.deleted
-                    time.sleep(0.05)
                     return report
 
             stop = threading.Event()
-            # 每轮只删一行：信号有充足机会落在中间某一轮，而不是全删完之后。
+            # 每轮只删一行：信号到达时库里一定还剩着没删完的行。
             cleaner = Counting(PostgresRetentionCleaner(os.environ["LINGXI_POSTGRES_DSN"], batch_limit=1))
             duty = RetentionCleanupDuty(cleaner=cleaner, stop=stop)
-            loop = SchedulerLoop(duties=(duty,), interval_seconds=0.01, stop=stop)
+            loop = SchedulerLoop(duties=(Gate(), duty), interval_seconds=0.01, stop=stop)
             install_signal_handlers(loop)
             print("ready", flush=True)
             loop.run_forever()
@@ -891,7 +907,9 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
         try:
             assert process.stdout is not None
             self.assertEqual(process.stdout.readline().strip(), "ready")
-            time.sleep(0.35)
+            # 等子进程进入闸门的长睡再发信号：这样 SIGTERM 必然落在一轮中间。
+            self.assertEqual(process.stdout.readline().strip(), "armed")
+            time.sleep(0.1)
             sent_at = time.monotonic()
             process.send_signal(signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=30)
@@ -905,8 +923,9 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
         state = json.loads(stdout.strip().splitlines()[-1])
 
         self.assertEqual(state["calls_after_stop"], 0, "收到 SIGTERM 后不得再领取新的清理批次")
-        self.assertGreater(state["calls"], 0)
-        remaining = self.count("galaxy_import_batch")
+        self.assertGreater(state["calls"], 0, "信号到达前必须真的删过行，否则后面的一致性断言是空的")
+        self.assertGreater(remaining_before_assert := self.count("galaxy_import_batch"), 0, "信号必须落在删完之前")
+        remaining = remaining_before_assert
         self.assertEqual(state["deleted"], total_batches - remaining, "报告的删除数必须与库里实际少掉的行一致")
         for child, parent, column in CASCADE_EDGES:
             if parent != "galaxy_import_batch":
