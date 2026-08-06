@@ -346,7 +346,9 @@ def run_turn(testcase, script, *, turns=1, **env_overrides):
 
 
 def ok_result():
-    return json.dumps({"data": [{"metric": "dau", "value": 1024}]}, ensure_ascii=False)
+    # #37 A1 的真实 MCP 契约：list_metrics 成功载荷位于顶层 metrics。
+    # worker 接线测试必须使用真实形状，不能再用 data 替代而掩盖契约漂移。
+    return json.dumps({"metrics": [{"metric": "dau", "value": 1024}]}, ensure_ascii=False)
 
 
 def business_failure_result():
