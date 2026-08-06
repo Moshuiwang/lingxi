@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Mapping
 
@@ -59,10 +60,17 @@ def _number(env: Mapping[str, str], name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         # 只报变量名，不回显值——这些变量里有凭据的邻居，养成回显习惯迟早会漏。
         raise GatewayConfigError(f"{ENV_PREFIX}{name} 不是一个数字") from None
+    # ``float("nan")`` / ``float("inf")`` 都是合法的 Python 字面量，会一路通过
+    # 后面所有的比较：``nan > 0`` 为假、``nan <= x`` 也为假，于是 BackoffPolicy 的
+    # 校验放它过去，然后进程在第一次断线时睡 ``inf`` 秒——一个永远不会恢复、
+    # 也不会报错的挂起。这类值必须在启动期就拒掉。
+    if not math.isfinite(value):
+        raise GatewayConfigError(f"{ENV_PREFIX}{name} 必须是有限数字")
+    return value
 
 
 def load_config(env: Mapping[str, str]) -> GatewayConfig:

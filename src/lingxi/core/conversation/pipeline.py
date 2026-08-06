@@ -8,8 +8,11 @@
     3. 加表情            失败 → 记审计，继续                  V-接入-07/08
     4. 查用户状态        未开通 → 内容一律丢弃；已停用 → 回提示 V-审计-05
     5. 解析命令          /stop /new                            V-会话-05/06
-    6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/06a
+    6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
     7. 入队 + NOTIFY                                           V-队列-01…05
+
+编号以[验证与门禁](../../../../docs/技术设计/验证与门禁.md)的矩阵为准（两位数字，
+不用字母后缀）；断言表里的 `V-会话-02a`/`05a`/`06a` 登记时续号为 08/09/10。
 
 **关于第 1 步。** 接口设计原文写的是「验签」，那是 Webhook 语义。本切片按 2026-08-06
 决策走官方 ``lark-oapi`` 的长连接，认证发生在**握手期**（应用凭据换取 endpoint 与
@@ -57,6 +60,9 @@ BUSY_HINT_TEXT = "当前任务仍在处理中"
 # #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
 # 断言只约束「入队时固化」与「领取带版本条件」两件事。
 DEFAULT_WORKER_VERSION = "stable"
+
+# 本批唯一会被入队的消息类型。
+TEXT_MESSAGE_TYPE = "text"
 
 
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
@@ -182,7 +188,7 @@ class EventPipeline:
             busy = conversation.running_task_id is not None
 
             if command is Command.STOP:
-                # `V-会话-06a`：3.2 第 6 步的条件是「忙碌 **且非 /stop**」，
+                # `V-会话-10`：3.2 第 6 步的条件是「忙碌 **且非 /stop**」，
                 # 因此 /stop 在忙碌时照常被处理，而不是收到"当前任务仍在处理中"。
                 stopped = tx.request_stop(conversation_id=conversation.conversation_id)
                 self._audit.record(
@@ -199,7 +205,7 @@ class EventPipeline:
             if busy:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
-                # 分支在 /new 之前（`V-会话-05a`）：忙碌时的 /new 不清空上下文。
+                # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
                 self._replies.send_text(
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
@@ -222,6 +228,27 @@ class EventPipeline:
                 )
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
                 return Outcome(handled_as=HandledAs.COMMAND)
+
+            # 非文本消息（图片、语音、富文本……）：表情已经加过（合同：任何消息都加），
+            # 但**不入队**——把一条语音当成空问题排进队列，用户只会拿到一个莫名其妙的
+            # 失败，而且会白占一次话题串行名额。
+            #
+            # 刻意**不回复任何文案**：「是否要明确告诉用户暂不支持这种消息」是一条新的
+            # 用户可见承诺，合同没有写，本批不发明（与入队失败的处理同一姿态），
+            # 已登记为待产品负责人定夺项。
+            #
+            # 位置在忙碌判定**之后**：忙碌期的非文本消息与其他消息一样只得到
+            # 「当前任务仍在处理中」，不因为类型不同而给出第二种回应。
+            if message.message_type != TEXT_MESSAGE_TYPE:
+                self._audit.record(
+                    "message.unsupported_type",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    message_type=message.message_type,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+                return Outcome(handled_as=HandledAs.DROPPED)
 
             # —— 第 7 步：入队。
             return self._enqueue(tx, message, user_id=user.user_id, conversation=conversation, now=moment)
@@ -266,7 +293,7 @@ class EventPipeline:
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)
 
-        # 续用判定发生在**入队时**并落库（`V-会话-02a`）：排队多久都不再改变它。
+        # 续用判定发生在**入队时**并落库（`V-会话-08`）：排队多久都不再改变它。
         # 只读 last_task_ended_at，读不到任务开始时间或时长（`V-会话-03`）。
         resumed = should_resume_session(
             last_task_ended_at=conversation.last_task_ended_at,

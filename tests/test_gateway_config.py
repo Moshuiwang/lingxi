@@ -18,10 +18,11 @@ import dataclasses
 import logging
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 
-from lingxi.apps.gateway import main
+from lingxi.apps.gateway import build_supervisor, main
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -119,6 +120,100 @@ class RequiredConfigTests(unittest.TestCase):
         self.assertGreater(config.reconnect_factor, 1)
         self.assertGreaterEqual(config.reconnect_ceiling_seconds, config.reconnect_base_seconds)
         self.assertGreater(config.shutdown_timeout_seconds, 0)
+
+
+    def test_non_finite_numbers_are_rejected(self) -> None:
+        """``nan`` / ``inf`` 是合法的 float 字面量，会一路通过后面所有比较。
+
+        ``nan > 0`` 为假、``nan <= x`` 也为假，于是退避校验放它过去，进程在第一次
+        断线时睡 ``inf`` 秒——一个永远不会恢复、也不会报错的挂起。
+        """
+
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity"):
+            for name in (
+                f"{ENV_PREFIX}RECONNECT_BASE_SECONDS",
+                f"{ENV_PREFIX}RECONNECT_FACTOR",
+                f"{ENV_PREFIX}RECONNECT_CEILING_SECONDS",
+                f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS",
+            ):
+                with self.subTest(raw=raw, name=name):
+                    with self.assertRaises(GatewayConfigError):
+                        load_config(dict(VALID_ENV, **{name: raw}))
+
+
+class BuildSupervisorTests(unittest.TestCase):
+    """``build_supervisor`` 的装配，含空闲轮询间隔的推导。"""
+
+    def setUp(self) -> None:
+        # build_client 会 import lark_oapi；CI 的 gate 只装 scheduler 组，没有它。
+        # 用桩顶上，本用例断的是装配而不是 SDK。
+        module = types.ModuleType("lark_oapi")
+
+        class _Builder:
+            def app_id(self, value):
+                return self
+
+            def app_secret(self, value):
+                return self
+
+            def build(self):
+                return object()
+
+        module.Client = types.SimpleNamespace(builder=lambda: _Builder())
+        saved = sys.modules.get("lark_oapi")
+        sys.modules["lark_oapi"] = module
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("lark_oapi", saved)
+            if saved is not None
+            else sys.modules.pop("lark_oapi", None)
+        )
+
+    def test_poll_interval_is_derived_from_the_shutdown_timeout(self) -> None:
+        config = load_config(dict(VALID_ENV, **{f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS": "20"}))
+        supervisor = build_supervisor(config)
+
+        transport = supervisor._transport
+        self.assertEqual(
+            transport._poll_seconds,
+            5.0,
+            "空闲轮询间隔必须由停机超时推导，否则配置里的超时是一句没实现的承诺",
+        )
+        self.assertEqual(
+            transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时"
+        )
+
+    def test_poll_interval_has_a_floor(self) -> None:
+        config = load_config(dict(VALID_ENV, **{f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS": "0.01"}))
+        supervisor = build_supervisor(config)
+
+        self.assertGreaterEqual(
+            supervisor._transport._poll_seconds, 0.1, "轮询间隔不得小到变成忙循环"
+        )
+
+    def test_backoff_comes_from_the_configuration(self) -> None:
+        config = load_config(
+            dict(
+                VALID_ENV,
+                **{
+                    f"{ENV_PREFIX}RECONNECT_BASE_SECONDS": "2",
+                    f"{ENV_PREFIX}RECONNECT_FACTOR": "3",
+                    f"{ENV_PREFIX}RECONNECT_CEILING_SECONDS": "40",
+                },
+            )
+        )
+        supervisor = build_supervisor(config)
+
+        self.assertEqual(supervisor._backoff.delay_for(0), 2.0)
+        self.assertEqual(supervisor._backoff.delay_for(1), 6.0)
+        self.assertEqual(supervisor._backoff.delay_for(10), 40.0)
+
+    def test_an_injected_transport_is_used_instead_of_the_real_one(self) -> None:
+        config = load_config(VALID_ENV)
+        sentinel = object()
+
+        supervisor = build_supervisor(config, transport=sentinel)
+
+        self.assertIs(supervisor._transport, sentinel, "注入的传输层必须被采用")
 
 
 class EntryPointTests(unittest.TestCase):

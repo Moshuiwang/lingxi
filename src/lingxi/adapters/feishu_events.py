@@ -25,12 +25,30 @@ from lingxi.core.ids import new_id
 MESSAGE_RECEIVE_EVENT = "im.message.receive_v1"
 
 
+# 飞书私聊的 chat_type。合同「问数与多轮对话」开宗明义：
+# 「本节全部规则只适用于飞书私聊入口」——加表情、话题串行、/new、/stop、两小时规则
+# 全部以私聊为前提，群聊不在承诺范围内。
+PRIVATE_CHAT_TYPE = "p2p"
+
+
 class EventParseError(ValueError):
     """事件体缺少必需字段或形状不对。
 
     刻意是一个**可预期**的错误而不是 ``KeyError`` / ``TypeError``：调用方要能把
     "这条事件我读不懂"与"我的代码有 bug"区分开，前者记审计后继续收下一条。
     """
+
+
+class NonPrivateChatError(EventParseError):
+    """非私聊消息。
+
+    单独成类而不是复用 ``EventParseError``：这不是"读不懂"，是"读懂了、而且明确
+    不该受理"。调用方要能把它记成一条**越界拒绝**的审计，而不是混进解析失败里。
+    """
+
+    def __init__(self, chat_type: str | None) -> None:
+        super().__init__(f"非私聊消息，本产品只服务飞书私聊：chat_type={chat_type!r}")
+        self.chat_type = chat_type
 
 
 def _text(container: Mapping[str, Any] | None, key: str) -> str | None:
@@ -101,10 +119,24 @@ def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = No
     if not isinstance(message, Mapping):
         raise EventParseError("事件体缺少 message 段")
 
+    # 群聊边界：在构造 ``InboundMessage`` **之前**拒绝，因此非私聊消息进不了管线,
+    # 既不加表情也不回复、更不会入队。放在这里而不是管线里，是因为管线的每一步
+    # 都已经预设了私聊语义（话题串行按 conversation 一行、/new 清当前对话），
+    # 让群聊消息走进去再判定，等于给它们建了一条只差最后一步的通路。
+    #
+    # **只认显式的 `p2p`，缺字段也拒绝。** 与仓库既有的拒绝式白名单同一姿态：
+    # 默认放行的代价是把群聊内容当私聊处理（越界、且可能泄漏到不该看见的人面前），
+    # 默认拒绝的代价只是漏收——后者可观察、可修，前者不可逆。
+    chat_type = _text(message, "chat_type")
+    if chat_type != PRIVATE_CHAT_TYPE:
+        raise NonPrivateChatError(chat_type)
+
     message_id = _require(_text(message, "message_id"), "message_id")
     chat_id = _require(_text(message, "chat_id"), "chat_id")
     # thread_id 缺失表示私聊主窗口，不是错误。
     thread_id = _text(message, "thread_id")
+
+    message_type = _text(message, "message_type") or "unknown"
 
     return InboundMessage(
         event_id=event_id,
@@ -115,4 +147,5 @@ def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = No
         message_id=message_id,
         text=message_text(message.get("content"), message.get("message_type")),
         trace_id=trace_id or new_id("trc").split("_", 1)[1],
+        message_type=message_type,
     )

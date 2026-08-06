@@ -35,9 +35,16 @@ TASK_QUEUED_CHANNEL = "task_queued"
 def _user_state(provisioning_state: str, account_state: str) -> UserState:
     """把 ``app_user`` 的两列映射成管线关心的三态。
 
-    **先判停用再判开通**：一个 ``provisioning_state='active'`` 但
-    ``account_state='suspended'`` 的用户必须落进停用分支。反过来写的话，被停用的
-    老用户会被当成正常用户继续排任务——合同「已停用用户不能继续使用 Lingxi」。
+    **先判停用再判开通。** 两个判断只在一种输入上分歧：一个**既未开通、又已停用**的
+    用户（``provisioning_state != 'active'`` 且 ``account_state != 'enabled'``）——
+    本实现判他 ``SUSPENDED``，反过来写会判 ``NOT_PROVISIONED``。
+    选停用是因为两条分支的后果不同：未开通分支在后续切片里会去**启动自动匹配与开通**
+    （#65），而这个人的账号已经被管理员停掉了，替他开通是把管理员刚撤销的东西又装回去。
+    停用分支只回一句说明，是两者中可逆的那个。
+
+    （早先这里写的理由是"否则被停用的老用户会被当成正常用户继续排任务"，那是错的：
+    ``provisioning_state='active'`` 且 ``account_state='suspended'`` 的用户在两种
+    顺序下都会落进停用分支。理由写错比没写更糟，一并纠正。）
     """
 
     if account_state != "enabled":
@@ -216,21 +223,41 @@ class _Transaction:
         self._execute(f"NOTIFY {TASK_QUEUED_CHANNEL}")
 
 
+# 建连与单条语句的墙钟上限。没有它们时，一个不可达的数据库或一条被锁住的语句会让
+# 在途事件永远卡住，而停机要等在途事件做完——验收实测 SIGTERM 之后 45 秒仍未退出。
+# 这两个值是**上限不是目标**：正常情况下入队是毫秒级的。
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
+DEFAULT_STATEMENT_TIMEOUT_MS = 10_000
+
+
 class PostgresGatewayStore:
     """实现 ``core.conversation.ports.GatewayStore``。"""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        connect_timeout: int = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    ) -> None:
         import psycopg
 
         self._psycopg = psycopg
         self._dsn = dsn
+        self._connect_timeout = connect_timeout
+        self._statement_timeout_ms = statement_timeout_ms
 
     @contextmanager
     def transaction(self) -> Iterator[_Transaction]:
         """一个连接、一个事务。异常时整体回滚。"""
 
-        with self._psycopg.connect(self._dsn) as connection:
+        with self._psycopg.connect(
+            self._dsn, connect_timeout=self._connect_timeout
+        ) as connection:
             with connection.transaction():
+                # SET LOCAL：只作用于本事务，不污染连接。放在事务内的第一条，
+                # 后面的每条语句都受它约束。
+                connection.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
                 yield _Transaction(connection)
 
 
@@ -274,7 +301,9 @@ class PostgresTaskQueue:
         改写（`V-灰度-01`）；迁移 013 的触发器兜底，这里写它会直接抛异常。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with self._psycopg.connect(
+            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE task SET status = 'running',
@@ -326,7 +355,9 @@ class PostgresTaskQueue:
         ``last_task_ended_at`` 在这里落，它是两小时规则的唯一依据。
         """
 
-        with self._psycopg.connect(self._dsn) as connection:
+        with self._psycopg.connect(
+            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
@@ -356,7 +387,9 @@ class PostgresTaskQueue:
         被分到的那个版本（`V-灰度-01` 的回收路径）。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with self._psycopg.connect(
+            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE task SET status = 'queued',

@@ -567,6 +567,42 @@ class ZombieWorkerTests(GatewayPostgresTestCase):
         )
         self.assertEqual(self.scalar("SELECT worker_id FROM task"), "w2")
 
+    def test_a_late_second_finish_cannot_rewrite_a_finished_task(self) -> None:
+        """已收口的任务不得被同一 worker 的迟到二次收口改写状态。
+
+        用户按了 `/stop`、任务以 ``stopped`` 收口之后，worker 的重试或信号竞态再调一次
+        ``finish(succeeded)``，记录会从"用户已停止"翻成"已成功"——失败语义被改写。
+        （验收方备好的回归用例，已双向验证。）
+        """
+
+        self.pipeline().handle_message(inbound("evt_1"), now=NOW)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        task_id = self.scalar("SELECT id FROM task")
+        self.queue.claim(worker_id="w1", target_worker_version="stable")
+
+        self.assertTrue(
+            self.queue.finish(
+                task_id=task_id,
+                conversation_id=conversation_id,
+                status="stopped",
+                worker_id="w1",
+            )
+        )
+        self.assertEqual(self.scalar("SELECT status FROM task"), "stopped")
+
+        self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w1",
+        )
+
+        self.assertEqual(
+            self.scalar("SELECT status FROM task"),
+            "stopped",
+            "已结束任务被二次收口改写：用户按下的 /stop 被记成 succeeded",
+        )
+
     def test_the_current_worker_can_still_finish(self) -> None:
         self.pipeline().handle_message(inbound("evt_1"), now=NOW)
         conversation_id = self.scalar("SELECT id FROM conversation")
@@ -633,6 +669,12 @@ class CommandIsolationTests(GatewayPostgresTestCase):
 
     def test_stop_marks_only_its_own_running_task(self) -> None:
         topic_a, topic_b = self._two_topics()
+        # 记下话题 B 抢占中的任务标识，稍后逐字比对。断「不是 NULL」太弱：
+        # 把 B 的占用换成另一个任务同样满足它。
+        running_before = self.scalar(
+            "SELECT running_task_id FROM conversation WHERE id = %s", (topic_b,)
+        )
+        self.assertIsNotNone(running_before)
 
         self.pipeline().handle_message(
             inbound("evt_stop", thread_id="omt_A", text="/stop"), now=NOW
@@ -644,9 +686,10 @@ class CommandIsolationTests(GatewayPostgresTestCase):
         by_topic = dict(stopped)
         self.assertTrue(by_topic[topic_a], "话题 A 的运行中任务应被置 stop_requested")
         self.assertFalse(by_topic[topic_b], "话题 B 的运行中任务不得受影响")
-        self.assertIsNotNone(
+        self.assertEqual(
             self.scalar("SELECT running_task_id FROM conversation WHERE id = %s", (topic_b,)),
-            "话题 B 的 running_task_id 不得改变",
+            running_before,
+            "话题 B 的 running_task_id 必须逐字不变",
         )
 
 
@@ -756,8 +799,20 @@ class QueueClaimTests(GatewayPostgresTestCase):
         self.assertEqual(
             self.scalar("SELECT count(*) FROM task WHERE status = 'running'"), 20
         )
+        # 断「每个任务的 worker_id 与实际领到它的那个 worker 一致」，而不是
+        # 「一共出现过两个 worker」——后者在两个 worker 互相覆盖对方的任务时也成立。
+        recorded = dict(self.query("SELECT id, worker_id FROM task"))
+        for worker_id, task_ids in claimed.items():
+            for task_id in task_ids:
+                self.assertEqual(
+                    recorded[task_id],
+                    worker_id,
+                    f"任务 {task_id} 由 {worker_id} 领到，库里却记着 {recorded[task_id]}",
+                )
         self.assertEqual(
-            self.scalar("SELECT count(DISTINCT worker_id) FROM task"), 2
+            len({worker for worker in recorded.values()}),
+            2,
+            "两个 worker 都应领到过任务，否则不构成并发",
         )
 
     def test_notify_is_emitted_on_commit(self) -> None:
@@ -775,14 +830,11 @@ class QueueClaimTests(GatewayPostgresTestCase):
         finally:
             listener.close()
 
-    def test_task_is_still_claimable_when_every_notify_is_dropped(self) -> None:
-        """丢弃全部 NOTIFY 时，兜底轮询仍能领到任务——任务不永久滞留。"""
-
-        self._queue_tasks(1)  # 完全不监听 NOTIFY
-
-        claimed = self.queue.claim(worker_id="w1", target_worker_version="stable")
-
-        self.assertEqual(len(claimed), 1, "不依赖 NOTIFY 也必须能领到任务")
+    # 原先这里有一条 `test_task_is_still_claimable_when_every_notify_is_dropped`：
+    # 它只是入队一条任务然后直接 claim，压根没有 NOTIFY 参与——无论兜底轮询是否
+    # 存在都会绿，是重言式。真正的「监听方收到即领取 + 丢弃全部 NOTIFY 后兜底轮询
+    # 仍在配置上限内领到」需要一个消费者，属 S4 下半，已在验证与门禁拆成 `V-队列-06`
+    # 并标为未认领。这里不留一条假装覆盖了它的用例。
 
     def test_notify_is_not_emitted_when_the_transaction_rolls_back(self) -> None:
         listener = self._psycopg.connect(self._dsn, autocommit=True)
@@ -881,6 +933,34 @@ class WorkerVersionTests(GatewayPostgresTestCase):
             self.execute(
                 "UPDATE task SET target_worker_version = 'canary' WHERE id = %s", (task_id,)
             )
+
+    def test_no_claim_path_writes_the_version_column_at_all(self) -> None:
+        """`V-灰度-01` 说的是「任何在领取或重试路径**写**该字段的实现都要变红」。
+
+        数据库触发器只挡得住"写了个不同的值"（``IS DISTINCT FROM``）；把
+        ``target_worker_version = target_worker_version`` 写进 SET 子句，触发器与
+        任何值比较都发现不了，而那正是分流规则接上之后最容易出现的写法。
+        这里直接断 SET 子句里没有这一列——判据落在代码本身，不依赖运行时取值。
+        """
+
+        import inspect
+        import re
+
+        from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+
+        for method in (PostgresTaskQueue.claim, PostgresTaskQueue.reclaim_stale):
+            source = inspect.getsource(method)
+            set_clauses = re.findall(
+                r"UPDATE\s+task\s+SET\s+(.*?)\s+WHERE", source, re.IGNORECASE | re.DOTALL
+            )
+            self.assertTrue(set_clauses, f"{method.__name__} 里没找到 UPDATE task SET")
+            for clause in set_clauses:
+                self.assertNotIn(
+                    "target_worker_version",
+                    clause,
+                    f"{method.__name__} 的 SET 子句写了目标 worker 版本——"
+                    "入队时固化的版本在领取与回收路径上一个字都不能写",
+                )
 
     def test_claim_is_filtered_by_version(self) -> None:
         """声明 stable 的 worker 领不到 canary 任务，反之亦然。"""

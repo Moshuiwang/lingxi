@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 from lingxi.adapters.feishu_events import (
     MESSAGE_RECEIVE_EVENT,
     EventParseError,
+    NonPrivateChatError,
     parse_message_event,
 )
 from lingxi.adapters.feishu_longconn import (
@@ -70,6 +71,12 @@ def make_event_handler(
             return
         try:
             message = parse_message_event(payload)
+        except NonPrivateChatError as error:
+            # 群聊越界：合同「问数与多轮对话」只适用于飞书私聊入口。在这里就返回，
+            # 因此**不加表情、不回复、不入队**——加表情本身也是一个用户可见动作，
+            # 在群里给一条消息加表情等于宣告「我在这个群里工作」。
+            audit.record("event.rejected_non_private_chat", chat_type=error.chat_type)
+            return
         except EventParseError as error:
             # 读不懂的事件体记审计后继续收下一条，不抛给 supervisor 当成连接故障。
             audit.record("event.unparsable", error=str(error))
@@ -125,6 +132,10 @@ def build_supervisor(config: GatewayConfig, *, transport: Any = None) -> LongCon
             # 没有实现的承诺（独立复查 F4）。取四分之一，给「处理完在途事件 + 退出」
             # 留余量：实际退出耗时 ≈ 轮询间隔 + 一条在途事件的处理时间。
             poll_seconds=max(0.1, config.shutdown_timeout_seconds / 4),
+            # 单条事件从收到到落库有结果的上限。超过就让 SDK 向飞书回失败、由平台
+            # 重投，而不是无限期占住它的接收协程。取停机超时本身：比它更长的话，
+            # 一条卡住的事件就能让停机超出承诺。
+            ack_timeout_seconds=config.shutdown_timeout_seconds,
         ),
         handle_event=make_event_handler(pipeline, audit=audit),
         backoff=BackoffPolicy(

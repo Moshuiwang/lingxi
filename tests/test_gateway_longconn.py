@@ -35,6 +35,7 @@ def event(event_id: str = "evt_1", *, open_id: str = "ou_1") -> dict:
                 "message_id": f"om_{event_id}",
                 "chat_id": "oc_1",
                 "thread_id": "omt_9",
+                "chat_type": "p2p",
                 "message_type": "text",
                 "content": '{"text": "hi"}',
             },
@@ -80,7 +81,9 @@ def run(transport: ScriptedTransport, handler, *, backoff: BackoffPolicy | None 
         transport=transport,
         handle_event=handler,
         backoff=backoff or BackoffPolicy(base_seconds=0.5, factor=2.0, ceiling_seconds=8.0),
-        sleep=delays.append,  # 注入睡眠：不真的等
+        # 注入睡眠：不真的等。签名与真实实现一致（带 should_stop），
+        # 免得假实现悄悄退化成不可打断的那一种。
+        sleep=lambda seconds, should_stop: delays.append(seconds),
         audit=lambda action, /, **fields: audit.append((action, fields)),
     )
     reason = supervisor.run(should_stop=lambda: transport.exhausted)
@@ -295,6 +298,112 @@ class HandlerFailureTests(unittest.TestCase):
         self.assertIn("event.ignored", [action for action, _ in recorded])
 
 
+class AckReportingTests(unittest.TestCase):
+    """派发结果必须回报给传输层，SDK 才知道该向飞书回 OK 还是 500。"""
+
+    class ReportingTransport(ScriptedTransport):
+        def __init__(self, episodes):
+            super().__init__(episodes)
+            self.reports: list[tuple[str, str | None]] = []
+
+        def report(self, payload, error):
+            self.reports.append((payload["header"]["event_id"], type(error).__name__ if error else None))
+
+    def test_a_successful_dispatch_reports_no_error(self) -> None:
+        transport = self.ReportingTransport([[event("evt_ok")]])
+        run(transport, lambda payload: None)
+
+        self.assertEqual(transport.reports, [("evt_ok", None)])
+
+    def test_a_failed_dispatch_reports_the_error(self) -> None:
+        """注入落库失败 → 必须回报错误，否则飞书会把丢失的消息当成已投递。"""
+
+        def explode(payload):
+            raise RuntimeError("注入落库失败")
+
+        transport = self.ReportingTransport([[event("evt_bad")]])
+        run(transport, explode)
+
+        self.assertEqual(transport.reports, [("evt_bad", "RuntimeError")])
+
+    def test_a_transport_without_report_still_works(self) -> None:
+        """假传输层不实现 report 时不得报错——它是可选协议。"""
+
+        transport = ScriptedTransport([[event("evt_ok")]])
+        _, reason, _, _ = run(transport, lambda payload: None)
+        self.assertEqual(reason, TerminationReason.STOPPED)
+
+
+class InterruptibleBackoffTests(unittest.TestCase):
+    """退避等待必须能被停机信号打断（验收实测 SIGTERM 后 45 秒仍未退出）。"""
+
+    def test_real_sleep_returns_promptly_once_stopping(self) -> None:
+        import time
+
+        from lingxi.adapters.feishu_longconn import _real_sleep
+
+        stopping = False
+
+        def should_stop() -> bool:
+            return stopping
+
+        # 先证明它确实会等满
+        started = time.monotonic()
+        _real_sleep(0.3, should_stop)
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
+        # 再证明停机信号能把它打断
+        stopping = True
+        started = time.monotonic()
+        _real_sleep(60, should_stop)
+        self.assertLess(
+            time.monotonic() - started,
+            1.0,
+            "60 秒的退避没有被停机信号打断，停机会远超配置的超时",
+        )
+
+    def test_sleep_is_called_with_the_stop_predicate(self) -> None:
+        """签名里带 should_stop，注入的假实现也就不会退化成不可打断的。"""
+
+        seen: list[tuple[float, bool]] = []
+        transport = ScriptedTransport(
+            [
+                LongConnectionError(HandshakeFailure(source=FailureSource.STREAM)),
+                [event("evt_ok")],
+            ]
+        )
+        supervisor = LongConnectionSupervisor(
+            transport=transport,
+            handle_event=lambda payload: None,
+            backoff=BackoffPolicy(base_seconds=0.5, factor=2.0, ceiling_seconds=8.0),
+            sleep=lambda seconds, should_stop: seen.append((seconds, callable(should_stop))),
+        )
+        supervisor.run(should_stop=lambda: transport.exhausted)
+
+        self.assertTrue(seen)
+        self.assertTrue(all(is_callable for _, is_callable in seen))
+
+
+class BackoffResetTests(unittest.TestCase):
+    """一次健康的连接之后，退避必须从下限重新起算。"""
+
+    def test_backoff_restarts_after_events_flow_again(self) -> None:
+        failure = LongConnectionError(HandshakeFailure(source=FailureSource.STREAM))
+        transport = ScriptedTransport(
+            [failure, failure, failure, [event("evt_ok")], failure, [event("evt_last")]]
+        )
+
+        _, _, delays, _ = run(transport, lambda payload: None)
+
+        self.assertGreater(delays[2], delays[0], "连续失败期间应递增")
+        self.assertEqual(
+            delays[3],
+            delays[0],
+            "收到过真实事件之后，下一次断线的退避必须回到下限——否则健康跑很久的进程"
+            "此后每次断线都直接等上限",
+        )
+
+
 class NoInboundPortTests(unittest.TestCase):
     """`V-接入-10` 的结构面：事件只能经长连接通道进入。
 
@@ -313,17 +422,41 @@ class NoInboundPortTests(unittest.TestCase):
             "supervisor 不得出现第二个可以投递事件的公开入口",
         )
 
-    def test_events_from_outside_the_transport_reach_no_handler(self) -> None:
-        """构造一个不经该通道的投递路径：没有任何处理器被触发。"""
+    def test_a_real_delivery_attempt_from_outside_the_transport_is_refused(self) -> None:
+        """真的**尝试投递**一条事件，而不是什么都不做然后断言什么都没发生。
+
+        原先这条用例只是「不启动 supervisor，然后断言没有事件」——恒真，改坏实现也
+        不会红。这里逐个试遍 supervisor 的公开面：任何一个能把 payload 送进处理器的
+        入口都会让它变红。
+        """
 
         received: list[dict] = []
-        transport = ScriptedTransport([])
         supervisor = LongConnectionSupervisor(
-            transport=transport, handle_event=received.append
+            transport=ScriptedTransport([]), handle_event=received.append
         )
-        supervisor.run(should_stop=lambda: True)
+        payload = event("evt_bypass")
 
-        self.assertEqual(received, [], "未经长连接通道的事件不得触发任何处理器")
+        probed: list[str] = []
+        for name in dir(supervisor):
+            if name.startswith("_"):
+                continue
+            attribute = getattr(supervisor, name)
+            if not callable(attribute):
+                continue
+            for arguments in ((payload,), (payload, None)):
+                probed.append(name)
+                try:
+                    attribute(*arguments)
+                except TypeError:
+                    pass  # 签名根本不接受事件——正是我们想要的形状
+                except Exception:
+                    pass  # 接受了参数但自己失败，同样算被调用过
+
+        self.assertTrue(probed, "至少要真的探过一个公开可调用项，否则本用例恒真")
+        self.assertIn("run", probed, "公开面里的 run 必须被探到")
+        self.assertEqual(
+            received, [], "未经长连接通道的事件不得触发任何处理器"
+        )
 
 
 if __name__ == "__main__":

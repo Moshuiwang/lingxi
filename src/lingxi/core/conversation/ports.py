@@ -33,6 +33,10 @@ class InboundMessage:
     message_id: str
     text: str
     trace_id: str
+    # 飞书消息类型（``text`` / ``image`` / ``audio`` / ``post`` …）。本批只处理
+    # ``text``；其余类型照常加表情与记审计，但**不入队**——把一条语音当成空问题
+    # 排进队列，用户只会拿到一个莫名其妙的失败。
+    message_type: str = "text"
 
 
 class UserState(str, Enum):

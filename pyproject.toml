@@ -66,8 +66,9 @@ gateway = [
 #   psycopg     → adapters/refresh_tokens.py、postgres_onboarding.py、galaxy_import.py 等
 #   cryptography→ adapters/refresh_tokens.py（refresh_token 加密轮换）
 # lark-oapi 保留为运行时依赖、不降为 CI-only：2026-08-06 产品负责人否决 #39 的替换
-# 建议（登记见 #39 收口评论与 #57）。正式 gateway 进程（代码框架第一节「待建立」）
-# 落地时，长连接与发消息的依赖再从本组提升为 `gateway` 组。
+# 建议（登记见 #39 收口评论与 #57）。正式 gateway 进程已于 #57 落地，长连接与发消息
+# 的依赖已提升为上面的 `gateway` 组；本组保留同名依赖是因为 Bot-Test 那套受控资产在
+# #67 交付前整体保留（代码框架第五节），两组各自独立声明、互不依赖。
 bot-test = [
     "cryptography==45.0.7",
     "lark-oapi==1.7.1",
