@@ -309,21 +309,36 @@ class PostgresTaskQueue:
                 for row in cursor.fetchall()
             ]
 
-    def finish(self, *, task_id: str, conversation_id: str, status: str) -> bool:
-        """结束任务并释放话题。
+    def finish(
+        self, *, task_id: str, conversation_id: str, status: str, worker_id: str
+    ) -> bool:
+        """结束任务并释放话题。只有**这一代**的执行者能收口。
 
-        释放带 ``running_task_id = %s`` 条件：**只有持有者能释放**。省掉它，任何任务
-        都能清掉别人的占用（`V-会话-01` 的释放面）。``last_task_ended_at`` 在这里落，
-        它是两小时规则的唯一依据。
+        两层条件，缺一不可：
+
+        - 任务更新带 ``worker_id = %s AND status = 'running'``。只判「是不是这个任务
+          占的话题」是不够的——任务被心跳超时回收、重排、由另一个 worker 重新领取
+          之后，``task_id`` 并没有变，僵尸 worker 照样匹配得上。独立复查在真库上实测
+          出这条：僵尸 w1 的收口会把话题释放掉，而 w2 仍在执行该任务，于是下一条
+          消息可以再次抢占并与 w2 并行——同话题串行被打破。
+        - 释放带 ``running_task_id = %s``：**只有持有者能释放**，防止清掉别人的占用。
+
+        ``last_task_ended_at`` 在这里落，它是两小时规则的唯一依据。
         """
 
         with self._psycopg.connect(self._dsn) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
-                    "UPDATE task SET status = %s, ended_at = now() WHERE id = %s",
-                    (status, task_id),
+                    """
+                    UPDATE task SET status = %s, ended_at = now()
+                     WHERE id = %s AND worker_id = %s AND status = 'running'
+                    """,
+                    (status, task_id, worker_id),
                 )
+                if cursor.rowcount != 1:
+                    # 不是这一代执行者（或任务早已结束）：什么都不改，也不释放话题。
+                    return False
                 cursor.execute(
                     """
                     UPDATE conversation

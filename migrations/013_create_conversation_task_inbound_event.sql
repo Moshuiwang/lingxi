@@ -131,9 +131,14 @@ CREATE TABLE inbound_event (
     received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     event_type       TEXT        NOT NULL,
     user_open_id     TEXT,
+    -- 取值域比数据库设计蓝本多一个 not_provisioned，理由：本批**不**启动自动匹配与
+    -- 开通（正向接线是 #65），把未开通用户的事件记成 auto_provisioning 等于让这一列
+    -- 陈述一件没有发生的事；而记成 dropped 又会与「已停用」混为一谈，#54 的保留清理
+    -- 与 #65 的接线都要读这一列。auto_provisioning 保留在取值域里，留给 #65。
     handled_as       TEXT
         CHECK (handled_as IS NULL OR handled_as IN
-               ('task_queued','busy_hint','auto_provisioning','command','dropped')),
+               ('task_queued','busy_hint','not_provisioned','auto_provisioning',
+                'command','dropped')),
     trace_id         TEXT        NOT NULL,
     expires_at       TIMESTAMPTZ NOT NULL                    -- 触发器固定为 received_at + 2160 小时
 );

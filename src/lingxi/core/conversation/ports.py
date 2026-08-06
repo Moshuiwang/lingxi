@@ -67,6 +67,9 @@ class HandledAs(str, Enum):
 
     TASK_QUEUED = "task_queued"
     BUSY_HINT = "busy_hint"
+    # 未开通用户：本批只记录「收到过、没受理」，**没有**启动自动匹配与开通。
+    NOT_PROVISIONED = "not_provisioned"
+    # 留给 #65 真正接上正向开通路径时使用；本批不会写出这个值。
     AUTO_PROVISIONING = "auto_provisioning"
     COMMAND = "command"
     DROPPED = "dropped"

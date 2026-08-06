@@ -33,11 +33,21 @@ handled = []
 draining = {{"value": False}}
 
 
+# 一直有事件进来。
 class ForeverTransport:
     def stream(self):
         while True:
             yield {{"header": {{"event_id": "evt", "event_type": "im.message.receive_v1"}}}}
             time.sleep(0.02)
+
+
+# 连接活着但没有任何用户消息——夜间与周末的常态。只产出空闲心跳，
+# 真实传输层在这种状态下就是这样：阻塞在队列上等，每隔一个轮询间隔让出一次控制权。
+class IdleTransport:
+    def stream(self):
+        while True:
+            time.sleep(0.02)
+            yield None
 
 
 def handle(payload):
@@ -51,7 +61,7 @@ stop_event = threading.Event()
 install_signal_handlers(stop_event)
 
 supervisor = LongConnectionSupervisor(
-    transport=ForeverTransport(),
+    transport={transport}(),
     handle_event=handle,
     backoff=BackoffPolicy(base_seconds=0.01, factor=2.0, ceiling_seconds=0.1),
     sleep=lambda seconds: None,
@@ -97,9 +107,13 @@ def _process_socket_inodes(pid: int) -> set[str]:
 
 
 class GatewayProcessTestCase(unittest.TestCase):
-    def _spawn(self) -> subprocess.Popen:
+    def _spawn(self, transport: str = "ForeverTransport") -> subprocess.Popen:
         process = subprocess.Popen(
-            [sys.executable, "-c", CHILD_SCRIPT.format(source=str(SOURCE_ROOT))],
+            [
+                sys.executable,
+                "-c",
+                CHILD_SCRIPT.format(source=str(SOURCE_ROOT), transport=transport),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -149,18 +163,61 @@ class GracefulShutdownTests(GatewayProcessTestCase):
         remaining = process.stdout.read()
         self.assertIn("EXIT stopped", remaining, "必须以「已停止」而不是异常终止")
 
-    def test_no_new_events_after_stop_signal(self) -> None:
-        """停机后不再接收新事件：退出时的计数不再增长。"""
+    def test_sigterm_is_seen_even_when_no_events_are_arriving(self) -> None:
+        """**连接空闲时也必须停得下来。**
+
+        独立复查实测出的阻塞项：传输层不带超时地阻塞在队列上时，supervisor 只在
+        收到一条事件之后才检查停机信号，于是「当前没有用户消息」这个最常见的状态下
+        ``SIGTERM`` 根本不会被看见，进程一直挂到编排层 SIGKILL。
+
+        原先的用例用的是每 20ms 无限产出事件的传输层——恰好是那个设计唯一能工作的
+        情形，所以它是绿的。这条用例换成只产出空闲心跳的传输层，直接打在缺陷上：
+        把 supervisor 里跳过心跳、检查停机信号的那一段去掉，本条必须变红。
+        """
+
+        process = self._spawn(transport="IdleTransport")
+        time.sleep(0.3)
+
+        sent_at = time.time()
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("连接空闲时收到 SIGTERM 没有退出——停机依赖于恰好有事件进来")
+        elapsed = time.time() - sent_at
+
+        self.assertEqual(process.returncode, 0)
+        self.assertLess(elapsed, 10, "空闲连接的停机不得慢于一个轮询间隔加一点余量")
+        tail = process.stdout.read()
+        self.assertIn("EXIT stopped 0", tail, "空闲期间不应处理过任何事件")
+
+    def test_no_new_events_are_handled_after_the_stop_signal(self) -> None:
+        """停机后不再接收新事件：退出时的计数相对信号前不再增长。"""
 
         process = self._spawn()
-        time.sleep(0.5)
+        deadline = time.time() + 10
+        last_seen = 0
+        while time.time() < deadline:
+            line = process.stdout.readline()
+            if line.startswith("HANDLED"):
+                last_seen = int(line.split()[1])
+                if last_seen >= 2:
+                    break
+
         process.send_signal(signal.SIGTERM)
         process.wait(timeout=20)
 
         tail = process.stdout.read()
         exit_line = [line for line in tail.splitlines() if line.startswith("EXIT")]
         self.assertTrue(exit_line, f"没有看到退出行：{tail}")
+        final_count = int(exit_line[0].split()[2])
         self.assertIn("stopped", exit_line[0])
+        # 收到信号后至多再完成**一条**在途事件，不得继续消费。
+        self.assertLessEqual(
+            final_count,
+            last_seen + 1,
+            f"停机后仍在处理新事件：信号前 {last_seen} 条，退出时 {final_count} 条",
+        )
 
 
 class NoInboundPortTests(GatewayProcessTestCase):

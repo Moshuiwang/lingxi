@@ -142,10 +142,14 @@ class EventPipeline:
                     event_id=message.event_id,
                     trace_id=message.trace_id,
                 )
+                # 记 `not_provisioned` 而不是 `auto_provisioning`：本批**没有**启动
+                # 任何自动匹配与开通（正向接线是 #65），写后者等于让这一列陈述一件
+                # 没有发生的事。也不记 `dropped`——那会与「已停用」混为一谈，而
+                # #54 的保留清理与 #65 的接线都要读这一列。
                 tx.mark_handled_as(
-                    event_id=message.event_id, handled_as=HandledAs.AUTO_PROVISIONING
+                    event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
                 )
-                return Outcome(handled_as=HandledAs.AUTO_PROVISIONING)
+                return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
 
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
 

@@ -88,9 +88,20 @@ class GatewayPostgresTestCase(unittest.TestCase):
         self.log = CallLog()
 
     def truncate(self) -> None:
-        """清空本切片的四张表。CASCADE 处理 conversation / task 到 app_user 的外键。"""
+        """清空本切片的四张表。CASCADE 处理 conversation / task 到 app_user 的外键。
+
+        **表不在就重建。** 别的真库测试模块会 ``DROP TABLE app_user CASCADE``
+        （见 ``test_identity_postgres_records.py``），那会连带删掉 ``conversation``
+        与 ``task``。今天不出事只因为 ``unittest discover`` 按模块名排序、``gateway``
+        恰好排在 ``identity`` 前面——把本文件改个名就会炸。不依赖那个巧合
+        （独立复查提出）。
+        """
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.task') IS NOT NULL")
+            if not cursor.fetchone()[0]:
+                self._apply_migrations(self._psycopg, self._dsn)
+                return
             cursor.execute(
                 "TRUNCATE task, inbound_event, conversation, app_user RESTART IDENTITY CASCADE"
             )
@@ -394,7 +405,10 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
         conversation_id = self.scalar("SELECT id FROM conversation")
 
         released = self.queue.finish(
-            task_id="tsk_not_the_holder", conversation_id=conversation_id, status="succeeded"
+            task_id="tsk_not_the_holder",
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w1",
         )
 
         self.assertFalse(released, "非持有者的释放必须影响 0 行")
@@ -504,6 +518,76 @@ class BusyTopicWritesNoTaskTests(GatewayPostgresTestCase):
         self.assertEqual(self.task_count(), 1, "忙碌期不得产生第二个任务")
 
 
+class ZombieWorkerTests(GatewayPostgresTestCase):
+    """僵尸 worker 不得打破同话题串行（独立复查 F3 实测出的漏洞）。
+
+    场景：w1 领了任务 → 心跳超时被 scheduler 回收 → w2 重新领取并正在执行 →
+    w1 这时才醒过来调用收口。任务标识在回收重排前后**没有变**，所以只判
+    「running_task_id == task_id」的实现会认可 w1 的收口、把话题释放掉，而 w2 还在跑。
+    下一条消息随即抢占成功，与 w2 并行——同话题同时执行两个任务。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+
+    def test_a_reclaimed_task_ignores_the_previous_workers_finish(self) -> None:
+        self.pipeline().handle_message(inbound("evt_1"), now=NOW)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        task_id = self.scalar("SELECT id FROM task")
+
+        self.assertEqual(
+            [task.task_id for task in self.queue.claim(worker_id="w1", target_worker_version="stable")],
+            [task_id],
+        )
+        self.execute(
+            "UPDATE task SET heartbeat_at = now() - interval '1 hour' WHERE id = %s", (task_id,)
+        )
+        self.assertEqual(self.queue.reclaim_stale(older_than=timedelta(minutes=5)), [task_id])
+        self.assertEqual(
+            [task.task_id for task in self.queue.claim(worker_id="w2", target_worker_version="stable")],
+            [task_id],
+        )
+
+        released = self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w1",
+        )
+
+        self.assertFalse(released, "上一代执行者的收口必须被拒绝")
+        self.assertEqual(
+            self.scalar("SELECT running_task_id FROM conversation"),
+            task_id,
+            "话题不得被僵尸 worker 释放——w2 还在执行这个任务",
+        )
+        self.assertEqual(
+            self.scalar("SELECT status FROM task"), "running", "任务状态不得被僵尸 worker 改写"
+        )
+        self.assertEqual(self.scalar("SELECT worker_id FROM task"), "w2")
+
+    def test_the_current_worker_can_still_finish(self) -> None:
+        self.pipeline().handle_message(inbound("evt_1"), now=NOW)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        task_id = self.scalar("SELECT id FROM task")
+        self.queue.claim(worker_id="w1", target_worker_version="stable")
+
+        released = self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w1",
+        )
+
+        self.assertTrue(released)
+        self.assertIsNone(self.scalar("SELECT running_task_id FROM conversation"))
+        self.assertIsNotNone(
+            self.scalar("SELECT last_task_ended_at FROM conversation"),
+            "释放时必须落 last_task_ended_at——它是两小时规则的唯一依据",
+        )
+
+
 class CommandIsolationTests(GatewayPostgresTestCase):
     """`V-会话-05` / `V-会话-06`：`/new` 与 `/stop` 的话题隔离。"""
 
@@ -578,7 +662,14 @@ class SessionResumeTests(GatewayPostgresTestCase):
         pipeline.handle_message(inbound("evt_1"), now=NOW)
         conversation_id = self.scalar("SELECT id FROM conversation")
         task_id = self.scalar("SELECT id FROM task")
-        self.queue.finish(task_id=task_id, conversation_id=conversation_id, status="succeeded")
+        claimed = self.queue.claim(worker_id="w0", target_worker_version="stable")
+        self.assertEqual([task.task_id for task in claimed], [task_id])
+        self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w0",
+        )
         self.execute(
             "UPDATE conversation SET agent_session_id = 'ses_1', last_task_ended_at = %s",
             (NOW,),
@@ -859,11 +950,11 @@ class UnprovisionedUserTests(GatewayPostgresTestCase):
             inbound("evt_1", open_id="ou_stranger", text="敏感业务问题"), now=NOW
         )
 
-        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
         self.assertEqual(self.task_count(), 0, "未开通用户的消息不得产生任务")
         self.assertEqual(self.scalar("SELECT count(*) FROM conversation"), 0)
         self.assertEqual(
-            self.scalar("SELECT handled_as FROM inbound_event"), "auto_provisioning"
+            self.scalar("SELECT handled_as FROM inbound_event"), "not_provisioned"
         )
         # inbound_event 只记录收到过一个事件及处理方式，不含消息正文
         columns = [

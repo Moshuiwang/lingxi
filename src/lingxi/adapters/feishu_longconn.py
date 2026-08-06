@@ -130,9 +130,13 @@ class EventTransport(Protocol):
 
     ``stream()`` 建连并逐条产出**原始事件体**（已解码的 dict）。建连失败抛
     ``LongConnectionError``；连接中断则正常结束迭代或抛其他异常，两者都按可重试处理。
+
+    空闲时**必须**定期产出 ``None`` 心跳，好让 supervisor 有机会检查停机信号。
+    一个只在有事件时才让出控制权的实现，会让 ``SIGTERM`` 在没有用户消息时永远不被
+    看见（`V-部署-03`）。
     """
 
-    def stream(self) -> Iterator[dict]: ...
+    def stream(self) -> Iterator[dict | None]: ...
 
 
 class LongConnectionSupervisor:
@@ -170,6 +174,11 @@ class LongConnectionSupervisor:
                 for payload in self._transport.stream():
                     if should_stop():
                         break
+                    if payload is None:
+                        # 空闲心跳，不是事件：传输层在没有消息时定期让出控制权，
+                        # 好让上面那句停机检查在「当前没有任何用户消息」时也能跑到。
+                        # 不派发、不计数。
+                        continue
                     self._dispatch(payload)
                 # 迭代正常结束 = 对端关闭连接，属可重试。
             except LongConnectionError as error:
@@ -297,12 +306,24 @@ class LarkEventTransport:
         app_id: str,
         app_secret: str,
         queue_max: int = 1000,
+        poll_seconds: float = 0.5,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
         self._queue_max = queue_max
+        # 空闲轮询间隔。它决定「停机信号最晚多久被看见」，因此由 gateway 的停机
+        # 超时推导而来（见 apps/gateway.build_supervisor），不是随手取的常数。
+        self._poll_seconds = poll_seconds
 
-    def stream(self) -> Iterator[dict]:
+    def stream(self) -> Iterator[dict | None]:
+        """建连并逐条产出事件；空闲时定期产出 ``None`` 心跳。
+
+        **心跳不是装饰，是停机与断线检测的唯一入口。** 独立复查实测：不带超时地
+        阻塞在队列上时，「当前没有用户消息」这个最常见的状态下 ``SIGTERM`` 根本
+        不会被看见——supervisor 只在收到一条事件之后才检查停机信号，于是进程一直
+        挂到编排层 SIGKILL。空闲时让出控制权之后，这两件事才有机会发生。
+        """
+
         import queue as queue_module
         import threading
 
@@ -331,14 +352,46 @@ class LarkEventTransport:
         thread = threading.Thread(target=pump, name="lingxi-gateway-longconn", daemon=True)
         thread.start()
 
+        connected_once = False
         while True:
-            item = events.get()
+            try:
+                item = events.get(timeout=self._poll_seconds)
+            except queue_module.Empty:
+                if not thread.is_alive():
+                    # start() 已经返回或抛错（握手失败走这条）。
+                    break
+                connected_once, lost = _connection_liveness(client, connected_once)
+                if lost:
+                    # 连接中途静默死亡：SDK 在 auto_reconnect=False 下把
+                    # _receive_message_loop 的异常抛在一个没人 await 的 task 里，
+                    # 异常被吞、start() 永不返回、线程一直活着。唯一可观察的信号是
+                    # SDK 在抛之前先调了 _disconnect()，把 _conn 置回 None
+                    # （实测 lark_oapi 1.7.1 ws/client.py:226 → _disconnect 的 finally）。
+                    # 不检测它的话，进程看起来健康但再也收不到任何用户消息。
+                    break
+                yield None  # 空闲心跳：把控制权交回 supervisor
+                continue
             if item is finished:
                 break
             yield item
 
         if failure:
             raise LongConnectionError(translate_sdk_exception(failure[0])) from failure[0]
+
+
+def _connection_liveness(client: object, connected_once: bool) -> tuple[bool, bool]:
+    """返回 ``(是否曾经连上, 是否已经掉线)``。
+
+    读的是 SDK 的私有属性 ``_conn``，因为 1.7.1 没有提供任何公开的连接状态。
+    **降级方式是刻意选的**：如果上游改名，``getattr`` 恒得 ``None``，
+    ``connected_once`` 永远为假，于是本函数永远报「没掉线」——退回到没有断线检测的
+    行为（与本次修复前一致），而不是反过来误报掉线、把进程带进重连风暴。
+    """
+
+    conn = getattr(client, "_conn", None)
+    if conn is not None:
+        return True, False
+    return connected_once, connected_once
 
 
 def _real_sleep(seconds: float) -> None:

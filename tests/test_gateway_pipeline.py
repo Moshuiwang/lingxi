@@ -146,7 +146,7 @@ class ReactionFailureTests(PipelineTestCase):
             message(open_id="ou_unknown"), now=NOW
         )
 
-        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
 
 
 class DuplicateDeliveryTests(PipelineTestCase):
@@ -386,7 +386,7 @@ class UnprovisionedUserTests(PipelineTestCase):
             message(open_id="ou_stranger", text=secret), now=NOW
         )
 
-        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
         self.assertEqual(len(self.state.tasks), 0, "未开通用户的消息不得产生任务")
         self.assertEqual(self.log.count("reply.send_text"), 0, "本批不回显、不回复")
         for _, fields in self.log.entries:

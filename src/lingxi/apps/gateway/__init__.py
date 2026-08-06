@@ -117,7 +117,15 @@ def build_supervisor(config: GatewayConfig, *, transport: Any = None) -> LongCon
     )
     return LongConnectionSupervisor(
         transport=transport
-        or LarkEventTransport(app_id=config.app_id, app_secret=str(config.app_secret)),
+        or LarkEventTransport(
+            app_id=config.app_id,
+            app_secret=str(config.app_secret),
+            # 停机信号最晚在一个空闲轮询间隔之后被看见，因此这个间隔必须由停机
+            # 超时推导，而不是取一个与超时无关的常数——否则配置里的超时就是一句
+            # 没有实现的承诺（独立复查 F4）。取四分之一，给「处理完在途事件 + 退出」
+            # 留余量：实际退出耗时 ≈ 轮询间隔 + 一条在途事件的处理时间。
+            poll_seconds=max(0.1, config.shutdown_timeout_seconds / 4),
+        ),
         handle_event=make_event_handler(pipeline, audit=audit),
         backoff=BackoffPolicy(
             base_seconds=config.reconnect_base_seconds,
