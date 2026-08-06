@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# #16 的真实 PostgreSQL 约束测试；不访问任何业务系统。
+# 针对**测试资产** migrations/testing/001-003 的历史约束测试；不访问任何业务系统。
+# 正式表（006-008）的真库断言在 tests/test_identity_postgres_records.py。
+# 本脚本断言的旧 app_user 形状（无 permission_* 列等）只对 001 成立；
+# 随测试资产清退一并退休（migrations/README.md）。
 set -euo pipefail
 
 container_name=${LINGXI_POSTGRES_CONTAINER:-lingxi-test-postgres}
@@ -12,11 +15,11 @@ psql_in_container() {
 
 psql_in_container -c 'DROP TABLE IF EXISTS feishu_user_refresh_token CASCADE; DROP TABLE IF EXISTS onboarding_progress CASCADE; DROP TABLE IF EXISTS inbound_event CASCADE; DROP TABLE IF EXISTS app_user CASCADE;'
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
-  < "${repository_root}/migrations/001_create_app_user.sql"
+  < "${repository_root}/migrations/testing/001_create_app_user.sql"
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
-  < "${repository_root}/migrations/002_create_onboarding_progress.sql"
+  < "${repository_root}/migrations/testing/002_create_onboarding_progress.sql"
 docker exec -i "${container_name}" psql -v ON_ERROR_STOP=1 -U postgres -d "${database_name}" \
-  < "${repository_root}/migrations/003_create_feishu_user_refresh_token.sql"
+  < "${repository_root}/migrations/testing/003_create_feishu_user_refresh_token.sql"
 
 first_insert=$(psql_in_container -At -c "
   SELECT record_authorized_identity(

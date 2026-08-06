@@ -21,14 +21,22 @@ import sys
 REQUIRED_MODULES = (
     "lingxi.core.ids",
     "lingxi.core.identity.onboarding",
+    "lingxi.core.identity.identifiers",
+    "lingxi.core.identity.credentials",
+    "lingxi.core.identity.org_snapshot",
+    "lingxi.core.identity.first_contact",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
     "lingxi.core.execution.message_stream",
     "lingxi.adapters.claude_agent_hooks",
+    "lingxi.adapters.feishu_directory",
+    "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.postgres_identity",
     "lingxi.adapters.claude_agent_session",
-    # worker 入口是 `python -m lingxi.apps.worker`：`apps` 是本次新增的子目录，
-    # 打包配置漏收它的表现正是"测试全绿但部署起不来"（Issue #37）。
+    # apps/ 是新增的顶层子目录：进程入口漏进制品只在部署时暴露（V-部署-10），
+    # "测试全绿但 python -m 起不来"正是它的形状（Issue #37 / #16）。
+    "lingxi.apps.scheduler",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.turn",

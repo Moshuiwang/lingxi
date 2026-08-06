@@ -1,0 +1,146 @@
+"""专用授权凭据的生命周期规则（纯逻辑，无数据库、无网络）。
+
+认领断言：V-身份-03（凭据只以密文保存且不进入日志）的**进程内一半**——
+密文落库那一半在 tests/test_identity_postgres_records.py；这里证明明文
+不会经由 ``repr`` / ``str`` / 日志格式化泄漏。
+V-身份-04（专用授权失效时不重放旧凭据、直接撤销）的判定规则。
+"""
+
+from __future__ import annotations
+
+import logging
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from lingxi.core.identity.credentials import (
+    AuthorizationGrant,
+    CredentialAction,
+    CredentialState,
+    RefreshOutcome,
+    SecretToken,
+    credential_state,
+    decide_after_refresh,
+    expiry_moment,
+    rotation_deadline,
+)
+
+
+FAKE_TOKEN = "fake-refresh-token-for-tests-only"
+
+
+class SecretTokenTest(unittest.TestCase):
+    """V-身份-03：明文只在进程内被显式 reveal，不进入任何字符串化出口。"""
+
+    def test_repr_and_str_never_contain_the_plaintext(self) -> None:
+        secret = SecretToken(FAKE_TOKEN)
+
+        self.assertNotIn(FAKE_TOKEN, repr(secret))
+        self.assertNotIn(FAKE_TOKEN, str(secret))
+        self.assertNotIn(FAKE_TOKEN, f"{secret}")
+        self.assertNotIn(FAKE_TOKEN, "{}".format(secret))  # noqa: UP032 - 显式覆盖 format 出口
+        self.assertEqual(secret.reveal(), FAKE_TOKEN)
+
+    def test_grant_repr_and_log_formatting_never_contain_the_plaintext(self) -> None:
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 604800, "offline_access")
+        logger = logging.getLogger("lingxi.test.credentials")
+
+        with self.assertLogs(logger, level=logging.INFO) as captured:
+            logger.info("凭据状态 grant=%s repr=%r", grant, grant)
+
+        self.assertNotIn(FAKE_TOKEN, repr(grant))
+        self.assertNotIn(FAKE_TOKEN, str(grant))
+        for line in captured.output:
+            self.assertNotIn(FAKE_TOKEN, line)
+
+    def test_empty_secret_is_rejected_at_construction(self) -> None:
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    SecretToken(value)
+
+    def test_grant_requires_a_positive_lifetime_from_feishu(self) -> None:
+        for seconds in (0, -1):
+            with self.subTest(seconds=seconds):
+                with self.assertRaises(ValueError):
+                    AuthorizationGrant(SecretToken(FAKE_TOKEN), seconds, "")
+
+
+class RotationDeadlineTest(unittest.TestCase):
+    """轮换点跟着飞书返回的有效期走，不写死周期。"""
+
+    def setUp(self) -> None:
+        self.issued_at = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+
+    def test_rotation_is_scheduled_at_eighty_percent_of_the_returned_lifetime(self) -> None:
+        seven_days = 7 * 24 * 3600
+
+        deadline = rotation_deadline(self.issued_at, seven_days)
+
+        # 实测有效期 7 天时计划轮换点在发放后 5.6 天，与 80% 公式吻合。
+        self.assertEqual(deadline, self.issued_at + timedelta(seconds=int(seven_days * 0.8)))
+        self.assertEqual(deadline, self.issued_at + timedelta(days=5.6))
+
+    def test_rotation_follows_a_different_lifetime_instead_of_a_fixed_period(self) -> None:
+        short = rotation_deadline(self.issued_at, 3600)
+        long = rotation_deadline(self.issued_at, 30 * 24 * 3600)
+
+        self.assertEqual(short, self.issued_at + timedelta(seconds=2880))
+        self.assertEqual(long, self.issued_at + timedelta(seconds=int(30 * 24 * 3600 * 0.8)))
+        self.assertNotEqual(short - self.issued_at, long - self.issued_at)
+
+    def test_rotation_point_is_always_strictly_before_expiry(self) -> None:
+        for seconds in (1, 2, 5, 60, 3600, 604800):
+            with self.subTest(seconds=seconds):
+                deadline = rotation_deadline(self.issued_at, seconds)
+                expiry = expiry_moment(self.issued_at, seconds)
+                self.assertLess(deadline, expiry)
+
+    def test_naive_datetimes_are_rejected_because_storage_is_utc_only(self) -> None:
+        with self.assertRaises(ValueError):
+            rotation_deadline(datetime(2026, 8, 5, 3, 0), 3600)
+
+
+class CredentialStateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc)
+
+    def test_states_are_derived_from_the_two_stored_moments(self) -> None:
+        cases = (
+            (self.now + timedelta(hours=1), self.now + timedelta(days=7), CredentialState.ACTIVE),
+            (self.now - timedelta(seconds=1), self.now + timedelta(days=7), CredentialState.DUE),
+            (self.now - timedelta(days=8), self.now - timedelta(seconds=1), CredentialState.EXPIRED),
+        )
+        for refresh_at, expires_at, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertIs(credential_state(refresh_at=refresh_at, expires_at=expires_at, now=self.now), expected)
+
+    def test_expired_wins_over_due_so_a_dead_credential_is_never_replayed(self) -> None:
+        state = credential_state(
+            refresh_at=self.now - timedelta(days=9),
+            expires_at=self.now - timedelta(days=1),
+            now=self.now,
+        )
+
+        self.assertIs(state, CredentialState.EXPIRED)
+
+
+class RefreshOutcomeTest(unittest.TestCase):
+    """V-身份-04：只有明确成功才轮换；失败与结果不明确一律撤销。"""
+
+    def test_only_a_confirmed_rotation_keeps_the_credential(self) -> None:
+        self.assertIs(decide_after_refresh(RefreshOutcome.ROTATED), CredentialAction.ROTATE)
+
+    def test_failure_and_indeterminate_results_both_revoke(self) -> None:
+        for outcome in (RefreshOutcome.FAILED, RefreshOutcome.INDETERMINATE):
+            with self.subTest(outcome=outcome):
+                self.assertIs(decide_after_refresh(outcome), CredentialAction.REVOKE)
+
+    def test_every_outcome_is_covered_so_a_new_outcome_cannot_default_to_keeping(self) -> None:
+        # refresh_token 一次性有效：新增一个未处理的结果分支绝不能默认成「保留」。
+        for outcome in RefreshOutcome:
+            with self.subTest(outcome=outcome):
+                self.assertIn(decide_after_refresh(outcome), (CredentialAction.ROTATE, CredentialAction.REVOKE))
+
+
+if __name__ == "__main__":
+    unittest.main()

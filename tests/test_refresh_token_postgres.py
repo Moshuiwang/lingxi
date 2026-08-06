@@ -17,7 +17,7 @@ class RefreshTokenPostgresTest(unittest.TestCase):
 
         cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
-        migration = (Path(__file__).parents[1] / "migrations/003_create_feishu_user_refresh_token.sql").read_text()
+        migration = (Path(__file__).parents[1] / "migrations/testing/003_create_feishu_user_refresh_token.sql").read_text()
         with psycopg.connect(cls._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("DROP TABLE IF EXISTS feishu_user_refresh_token")
             cursor.execute(migration)

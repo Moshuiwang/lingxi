@@ -30,7 +30,7 @@ from lingxi.adapters.refresh_tokens import PostgresRefreshTokenVault
 
 
 BASE_URL = "https://open.feishu.cn/open-apis"
-SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "migrations", "005_create_feishu_org_snapshot.sql")
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "migrations", "testing", "005_create_feishu_org_snapshot.sql")
 REQUEST_PAUSE_SECONDS = 0.12
 DETAIL_PAUSE_SECONDS = 0.12
 RETENTION_DAYS = 90

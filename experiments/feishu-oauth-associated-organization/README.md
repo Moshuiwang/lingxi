@@ -23,7 +23,7 @@
 | [`scripts/probe_saved_feishu_associated_organization.py`](../../scripts/probe_saved_feishu_associated_organization.py) | 用已加密保存的测试授权复验组织下钻。 |
 | [`tests/test_feishu_oauth_v3.py`](../../tests/test_feishu_oauth_v3.py) | 无网络回归测试。 |
 | [`tests/test_refresh_token_postgres.py`](../../tests/test_refresh_token_postgres.py) | CI 测试库中验证密文保存、轮换替换与删除；不访问飞书。 |
-| [`migrations/003_create_feishu_user_refresh_token.sql`](../../migrations/003_create_feishu_user_refresh_token.sql) | 测试库的加密续期凭据表。 |
+| [`migrations/testing/003_create_feishu_user_refresh_token.sql`](../../migrations/testing/003_create_feishu_user_refresh_token.sql) | 测试库的加密续期凭据表。 |
 
 ## 不可当作正式实现的部分
 
