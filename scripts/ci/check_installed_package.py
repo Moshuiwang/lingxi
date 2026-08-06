@@ -30,6 +30,14 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.hooks",
     "lingxi.core.execution.message_stream",
     "lingxi.adapters.claude_agent_hooks",
+    "lingxi.core.permission.galaxy_export",
+    "lingxi.core.permission.galaxy_scope",
+    "lingxi.core.permission.account_match",
+    "lingxi.core.permission.role_function",
+    "lingxi.adapters.galaxy_csv_export",
+    "lingxi.adapters.galaxy_import",
+    "lingxi.adapters.feishu_roster_bitable",
+    "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.postgres_identity",
@@ -42,6 +50,10 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.__main__",
 )
+
+# 随包发布的数据文件：模块导入成功不代表数据文件进了 wheel（后者要靠
+# pyproject.toml 的 package-data 声明）。缺失时角色职能会整列变成「未映射」。
+REQUIRED_PACKAGE_DATA = (("lingxi.config", "galaxy_role_function_map.toml"),)
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")
 
@@ -62,13 +74,28 @@ def main() -> int:
                 "请在仓库目录之外运行本检查，否则它只是又测了一遍源码树。"
             )
 
+    for package_name, file_name in REQUIRED_PACKAGE_DATA:
+        try:
+            package = importlib.import_module(package_name)
+        except Exception as error:  # noqa: BLE001 - 任何导入失败都是制品问题
+            failures.append(f"{package_name}：导入失败（{type(error).__name__}: {error}）")
+            continue
+        data_file = pathlib.Path(package.__file__ or "").parent / file_name
+        if not data_file.is_file():
+            failures.append(f"{package_name}/{file_name}：数据文件不在已安装的包里")
+        elif not any(marker in data_file.parts for marker in _INSTALL_MARKERS):
+            failures.append(f"{package_name}/{file_name}：来自 {data_file}，不是已安装的包。")
+
     if failures:
         print("已安装包完整性：不通过", file=sys.stderr)
         for line in failures:
             print(f"  - {line}", file=sys.stderr)
         return 1
 
-    print(f"已安装包完整性：{len(REQUIRED_MODULES)} 个模块全部来自已安装的包")
+    print(
+        f"已安装包完整性：{len(REQUIRED_MODULES)} 个模块与 "
+        f"{len(REQUIRED_PACKAGE_DATA)} 个数据文件全部来自已安装的包"
+    )
     return 0
 
 

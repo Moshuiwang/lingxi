@@ -1,3 +1,9 @@
+# 显式声明构建后端：package-data 依赖 setuptools>=61 读取 pyproject 配置，
+# 不声明时打包行为随环境里碰巧解析到的工具链漂移（独立复查发现）。
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "lingxi"
 version = "0.1.0"
@@ -16,6 +22,12 @@ feishu = ["cryptography==45.0.7", "lark-oapi==1.7.1", "psycopg[binary]>=3.2,<4",
 # 绑定层的形状由桩模块锁住。CI 另有一步装上本组做真实冒烟（构造 `HookMatcher`，
 # 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
 agent = ["claude-agent-sdk==0.2.128"]
+
+# 角色职能映射是随包发布的配置文件，不是源码。不显式声明就不会进 wheel，
+# 而缺失表现为「全部角色显示未映射」——一种看起来正常的失败。
+# CI 的 scripts/ci/check_installed_package.py 校验它确实在已安装的制品里。
+[tool.setuptools.package-data]
+"lingxi.config" = ["*.toml"]
 
 [tool.unittest]
 start-directory = "tests"
