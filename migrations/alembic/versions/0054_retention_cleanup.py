@@ -243,7 +243,7 @@ UPDATE galaxy_import_batch
 
 -- 与 007:57-71 同型：到期时间由来源时间推导，调用方传什么都会被覆盖；
 -- 来源时间本身不允许改（改了就等于换一条推导基线，可以无限后移到期时间）。
-CREATE OR REPLACE FUNCTION galaxy_import_batchX_fix_expiry() RETURNS TRIGGER
+CREATE OR REPLACE FUNCTION galaxy_import_batch_fix_expiry() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
