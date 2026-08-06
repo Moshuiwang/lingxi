@@ -70,6 +70,11 @@ def _number(env: Mapping[str, str], name: str, default: float) -> float:
     # 也不会报错的挂起。这类值必须在启动期就拒掉。
     if not math.isfinite(value):
         raise GatewayConfigError(f"{ENV_PREFIX}{name} 必须是有限数字")
+    # 本组数值全部是「时长」或「倍数」，没有一个在 0 或负数上有意义。
+    # 尤其是停机超时：``<= 0`` 会让「在超时内退出」这条承诺退化成「立刻放弃在途事件」，
+    # 而它还被用来推导空闲轮询间隔与出站超时，负值会一路传染下去（codex 二轮 P2-B）。
+    if value <= 0:
+        raise GatewayConfigError(f"{ENV_PREFIX}{name} 必须是正数")
     return value
 
 

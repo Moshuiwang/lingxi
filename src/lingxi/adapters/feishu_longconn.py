@@ -365,6 +365,7 @@ class LarkEventTransport:
         queue_max: int = 1000,
         poll_seconds: float = 0.5,
         ack_timeout_seconds: float = 30.0,
+        handshake_timeout_seconds: float = 30.0,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -375,6 +376,11 @@ class LarkEventTransport:
         # 单条事件从收到到落库有结果的上限。超过就向 SDK 抛异常让飞书重投，
         # 而不是无限期占住 SDK 的接收协程。
         self._ack_timeout_seconds = ack_timeout_seconds
+        # 建连截止时间。**没有它就有一个活性黑洞**：endpoint 请求卡住、或首轮询之前
+        # 连接就断了，``connected_once`` 会恒为 False，于是"掉线"判定永远不成立、
+        # 空闲心跳永远产出，supervisor 认为一切正常而永不重连——一条从未连上的连接
+        # 能让进程静默失聪到重启为止（codex 二轮 P1-B）。
+        self._handshake_timeout_seconds = handshake_timeout_seconds
         # 正在等待落库结果的事件，按 payload 的对象身份索引。
         self._pending: dict[int, PendingEvent] = {}
         # 上一条连接是**怎么结束的**，供 supervisor 记审计。断线有两条形态不同的路径
@@ -447,6 +453,12 @@ class LarkEventTransport:
 
         try:
             yield from self._drain(events, finished, thread, client)
+            # **在 finally 之前**判断失败。下面的清理会主动 stop 掉这条连接的 loop，
+            # 那会让 pump 线程的 run_until_complete 抛错并记进 failure——那是我们
+            # 自己造成的，不是连接故障。放到 finally 之后判断的话，每一次正常收尾
+            # 都会被报成一次连接错误。
+            if failure:
+                raise LongConnectionError(translate_sdk_exception(failure[0])) from failure[0]
         finally:
             # 唤醒还在等 ack 的 SDK 线程：连接已经没了，让它们向飞书报失败而不是
             # 一直等到超时。
@@ -465,9 +477,6 @@ class LarkEventTransport:
             if not thread.is_alive():
                 fresh_loop.close()
 
-        if failure:
-            raise LongConnectionError(translate_sdk_exception(failure[0])) from failure[0]
-
     def _submit_pending(self, events: object) -> Callable[[PendingEvent], None]:
         def submit(pending: PendingEvent) -> None:
             self._pending[id(pending.payload)] = pending
@@ -477,8 +486,10 @@ class LarkEventTransport:
 
     def _drain(self, events, finished, thread, client) -> Iterator[dict | None]:
         import queue as queue_module
+        import time
 
         connected_once = False
+        deadline = time.monotonic() + self._handshake_timeout_seconds
         while True:
             try:
                 item = events.get(timeout=self._poll_seconds)
@@ -488,6 +499,12 @@ class LarkEventTransport:
                     self.last_close_reason = "connection_thread_exited"
                     break
                 connected_once, lost = _connection_liveness(client, connected_once)
+                if not connected_once and time.monotonic() > deadline:
+                    # 截止时间内没连上：判连接失败，交回 supervisor 走退避重连。
+                    # 不加这条，一条卡在 endpoint 上的连接会永远产出心跳，
+                    # 而 supervisor 会一直以为它是健康的。
+                    self.last_close_reason = "handshake_timeout"
+                    break
                 if lost:
                     # 连接中途静默死亡：SDK 在 auto_reconnect=False 下把
                     # _receive_message_loop 的异常抛在一个没人 await 的 task 里，

@@ -247,6 +247,91 @@ class EventLoopCollisionTests(_StubSDKTestCase):
         )
 
 
+class NeverConnectedTests(_StubSDKTestCase):
+    """从未连上的活性黑洞（codex 二轮 P1-B）。
+
+    endpoint 请求卡住、或首轮询之前连接就断了时，``connected_once`` 恒为 False，
+    于是"掉线"判定永远不成立、空闲心跳永远产出，supervisor 认为一切正常而**永不重连**
+    ——一条从未连上的连接能让进程静默失聪到重启为止。建连截止时间堵住这个洞。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        # 把桩客户端换成「endpoint 挂起」：线程活着、但 _conn 永远是 None。
+        class HangingClient:
+            def __init__(self, app_id, app_secret, event_handler=None, auto_reconnect=None):
+                self.event_handler = event_handler
+                self._conn = None
+
+            def start(self):
+                ws_client = sys.modules["lark_oapi.ws.client"]
+                ws_client.loop.run_until_complete(asyncio.sleep(30))
+
+        sys.modules["lark_oapi.ws"].Client = HangingClient
+
+    def test_a_connection_that_never_establishes_is_given_up_on(self) -> None:
+        from lingxi.adapters.feishu_longconn import LarkEventTransport
+
+        transport = LarkEventTransport(
+            app_id="cli_fake",
+            app_secret="fake",
+            poll_seconds=0.02,
+            ack_timeout_seconds=1,
+            handshake_timeout_seconds=0.2,
+        )
+
+        stream = transport.stream()
+        produced = []
+        try:
+            # 有界地拉：没有截止时间时它会永远产出心跳，用上限把"永远"变成一次
+            # 可以断言的失败，而不是让整个测试挂住。
+            for _ in range(200):
+                try:
+                    produced.append(next(stream))
+                except StopIteration:
+                    break
+            else:
+                self.fail("建连截止时间没有生效：连接从未建立，却一直产出心跳")
+        finally:
+            stream.close()
+
+        self.assertTrue(
+            all(item is None for item in produced), "建连期间不该产出任何真实事件"
+        )
+        self.assertEqual(
+            transport.last_close_reason,
+            "handshake_timeout",
+            "截止时间内没连上必须判连接失败，交回 supervisor 重连",
+        )
+
+    def test_the_stream_would_hang_forever_without_a_deadline(self) -> None:
+        """反向验证：截止时间放得足够长时，它确实会一直产心跳。
+
+        没有这条，上一条可能只是"碰巧结束了"。
+        """
+
+        from lingxi.adapters.feishu_longconn import LarkEventTransport
+
+        transport = LarkEventTransport(
+            app_id="cli_fake",
+            app_secret="fake",
+            poll_seconds=0.02,
+            ack_timeout_seconds=1,
+            handshake_timeout_seconds=30,
+        )
+        stream = transport.stream()
+        try:
+            beats = [next(stream) for _ in range(5)]
+        finally:
+            stream.close()
+
+        self.assertEqual(beats, [None] * 5)
+        self.assertIsNone(
+            transport.last_close_reason, "截止时间未到时不应判定为建连失败"
+        )
+
+
 class HeartbeatTests(_StubSDKTestCase):
     """空闲时必须产出心跳，否则停机信号在没有消息时永远看不见（`V-部署-03`）。"""
 

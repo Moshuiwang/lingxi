@@ -141,6 +141,25 @@ class RequiredConfigTests(unittest.TestCase):
                         load_config(dict(VALID_ENV, **{name: raw}))
 
 
+    def test_non_positive_numbers_are_rejected(self) -> None:
+        """本组数值全是时长或倍数，0 与负数没有一个有意义。
+
+        停机超时尤其致命：``<= 0`` 让「在超时内退出」退化成「立刻放弃在途事件」，
+        而它还被用来推导空闲轮询间隔、ack 上限与出站超时，负值会一路传染。
+        """
+
+        for raw in ("0", "-1", "-0.5"):
+            for name in (
+                f"{ENV_PREFIX}RECONNECT_BASE_SECONDS",
+                f"{ENV_PREFIX}RECONNECT_FACTOR",
+                f"{ENV_PREFIX}RECONNECT_CEILING_SECONDS",
+                f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS",
+            ):
+                with self.subTest(raw=raw, name=name):
+                    with self.assertRaises(GatewayConfigError):
+                        load_config(dict(VALID_ENV, **{name: raw}))
+
+
 class BuildSupervisorTests(unittest.TestCase):
     """``build_supervisor`` 的装配，含空闲轮询间隔的推导。"""
 
@@ -149,11 +168,18 @@ class BuildSupervisorTests(unittest.TestCase):
         # 用桩顶上，本用例断的是装配而不是 SDK。
         module = types.ModuleType("lark_oapi")
 
+        captured = self.captured = {}
+
         class _Builder:
             def app_id(self, value):
                 return self
 
             def app_secret(self, value):
+                return self
+
+            def timeout(self, value):
+                # 出站超时必须被显式设置：SDK 默认 30 秒比停机预算还长。
+                captured["timeout"] = value
                 return self
 
             def build(self):
@@ -180,6 +206,22 @@ class BuildSupervisorTests(unittest.TestCase):
         )
         self.assertEqual(
             transport._ack_timeout_seconds, 20.0, "单条事件的 ack 上限取停机超时"
+        )
+        self.assertEqual(
+            transport._handshake_timeout_seconds,
+            20.0,
+            "建连截止时间必须有，否则一条从未连上的连接会让进程静默失聪",
+        )
+        self.assertEqual(
+            self.captured["timeout"],
+            5.0,
+            "出站 HTTP 超时必须从停机预算里分配，不能用 SDK 的 30 秒默认值"
+            "——它比停机预算还长",
+        )
+        self.assertLess(
+            self.captured["timeout"],
+            20.0,
+            "出站超时不得大于等于停机预算，否则一次卡住的回复就能让停机超出承诺",
         )
 
     def test_poll_interval_has_a_floor(self) -> None:

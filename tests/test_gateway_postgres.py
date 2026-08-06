@@ -419,6 +419,193 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
         )
 
 
+class ReplyAfterCommitTests(GatewayPostgresTestCase):
+    """回复必须在事务提交之后才发出（codex 二轮 P1-A）。
+
+    在事务里发回复时：回复成功而提交失败 → 回滚 → 平台重投 → 提示重发；更糟的是
+    **原任务这时如果已经结束**，这条本应"不生效"的忙碌期消息会在重投时被正常入队
+    执行，直接违反合同「不会在当前任务结束后自动提交或自动生效」。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+
+    def test_a_failing_reply_still_leaves_the_event_committed(self) -> None:
+        """注入回复失败：事件行已提交，重投不重处理、不入队。"""
+
+        class FailingReplies:
+            def send_text(self, **kwargs):
+                raise RuntimeError("注入回复失败")
+
+        pipeline = EventPipeline(
+            store=self.store,
+            reactions=FakeReactions(self.log),
+            replies=FailingReplies(),
+            audit=FakeAudit(self.log),
+        )
+        pipeline.handle_message(inbound("evt_1"), now=NOW)  # 占用话题
+        outcome = pipeline.handle_message(inbound("evt_2"), now=NOW)  # 忙碌 → 回提示
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.scalar(
+                "SELECT handled_as FROM inbound_event WHERE feishu_event_id = 'evt_2'"
+            ),
+            "busy_hint",
+            "回复失败不得回滚已确定的处理结论",
+        )
+        self.assertEqual(self.log.count("audit.reply.failed"), 1, "回复失败要记审计")
+
+        # 现在原任务结束、话题空闲；平台重投 evt_2 —— 幂等必须挡住它。
+        task_id = self.scalar("SELECT id FROM task")
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        self.queue.claim(worker_id="w1", target_worker_version="stable")
+        self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w1",
+        )
+
+        redelivered = pipeline.handle_message(inbound("evt_2"), now=NOW)
+
+        self.assertTrue(redelivered.duplicate, "重投必须被幂等挡住")
+        self.assertEqual(
+            self.task_count(),
+            1,
+            "忙碌期收到的消息不得在任务结束后被重投入队——合同「不会自动提交或自动生效」",
+        )
+
+    def test_no_reply_is_sent_when_the_transaction_fails(self) -> None:
+        """注入提交失败：一条回复都不许发出去。"""
+
+        pipeline = EventPipeline(
+            store=_FailingCommitStore(self._dsn),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+        )
+
+        with self.assertRaises(RuntimeError):
+            pipeline.handle_message(inbound("evt_1"), now=NOW)
+
+        self.assertEqual(
+            self.log.count("reply.send_text"), 0, "事务失败时不得有任何回复发出"
+        )
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM inbound_event"), 0, "事件行应随事务回滚"
+        )
+
+
+class _FailingCommitStore:
+    """在事务的最后一步（提交前）抛异常。"""
+
+    def __init__(self, dsn: str) -> None:
+        self._inner = PostgresGatewayStore(dsn)
+
+    def transaction(self):
+        manager = self._inner.transaction()
+
+        class Wrapper:
+            def __enter__(self):
+                transaction = manager.__enter__()
+
+                class Proxy:
+                    def __getattr__(self, name):
+                        return getattr(transaction, name)
+
+                    def mark_handled_as(self, **kwargs):
+                        transaction.mark_handled_as(**kwargs)
+                        raise RuntimeError("注入失败：提交前")
+
+                return Proxy()
+
+            def __exit__(self, *exc_info):
+                return manager.__exit__(*exc_info)
+
+        return Wrapper()
+
+
+class NewCommandRaceTests(GatewayPostgresTestCase):
+    """`/new` 与抢占的竞态（codex 二轮 P2-A）。
+
+    管线读到的忙碌状态是事务开始时的快照；另一条连接可能在这之间抢占成功并已经在跑。
+    清空必须带 ``AND running_task_id IS NULL``，否则两个并发请求会同时成功，
+    把一个**正在运行**的任务的上下文清掉。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+
+    def test_new_cannot_clear_a_topic_that_just_became_busy(self) -> None:
+        """确定性版本：先占用，再直接调用清空——必须影响 0 行。"""
+
+        self.pipeline().handle_message(inbound("evt_1"), now=NOW)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        self.execute(
+            "UPDATE conversation SET agent_session_id = 'ses_1' WHERE id = %s",
+            (conversation_id,),
+        )
+
+        with self.store.transaction() as transaction:
+            cleared = transaction.clear_agent_session(conversation_id=conversation_id)
+
+        self.assertFalse(cleared, "话题忙碌时清空必须影响 0 行")
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation"),
+            "ses_1",
+            "正在运行的任务的上下文不得被 /new 清掉",
+        )
+
+    def test_concurrent_new_and_question_do_not_both_win(self) -> None:
+        """两个连接并发：一条 `/new`、一条普通消息，不得同时成功。"""
+
+        outcomes: dict[str, str] = {}
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+        # 先把会话行与上下文建出来，两个线程竞争同一行
+        self.pipeline().handle_message(inbound("evt_seed"), now=NOW)
+        self.execute("UPDATE conversation SET running_task_id = NULL, agent_session_id = 'ses_1'")
+        self.execute("DELETE FROM task")
+
+        def deliver(label: str, text: str) -> None:
+            try:
+                barrier.wait(timeout=10)
+                outcome = self.pipeline().handle_message(
+                    inbound(f"evt_{label}", text=text), now=NOW
+                )
+                outcomes[label] = outcome.handled_as.value
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=deliver, args=("new", "/new")),
+            threading.Thread(target=deliver, args=("ask", "本月销售额是多少")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        self.assertEqual(errors, [])
+        # 允许两种交错：/new 先到（清空成功 + 提问入队），或提问先到（抢占成功 +
+        # /new 得到忙碌提示）。不允许的是「清空成功且任务也在跑」。
+        if outcomes.get("new") == "command":
+            self.assertIsNone(
+                self.scalar("SELECT agent_session_id FROM conversation"),
+                "/new 成功时上下文应已清空",
+            )
+        else:
+            self.assertEqual(outcomes.get("new"), "busy_hint", "/new 未成功时只能是忙碌提示")
+            self.assertEqual(
+                self.scalar("SELECT agent_session_id FROM conversation"),
+                "ses_1",
+                "被忙碌拦下的 /new 不得清空上下文",
+            )
+
+
 class ConditionalClaimTests(GatewayPostgresTestCase):
     """抢占的**条件更新本身**，不经过管线的内存预检。
 

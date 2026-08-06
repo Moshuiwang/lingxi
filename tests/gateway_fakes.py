@@ -186,9 +186,15 @@ class FakeTransaction:
         self._maybe_fail("insert_task")
         self.staged_tasks.append(FakeTask(**kwargs))
 
-    def clear_agent_session(self, *, conversation_id: str) -> None:
+    def clear_agent_session(self, *, conversation_id: str) -> bool:
         self._log.add("store.clear_agent_session", conversation_id=conversation_id)
+        conversation = self._find(conversation_id)
+        running = self.staged_claims.get(conversation_id, conversation.running_task_id)
+        if running is not None:
+            # 与真库的条件更新同语义：话题已被占用时影响 0 行。
+            return False
         self.staged_session_clears.append(conversation_id)
+        return True
 
     def request_stop(self, *, conversation_id: str) -> str | None:
         self._log.add("store.request_stop", conversation_id=conversation_id)

@@ -24,16 +24,27 @@ logger = logging.getLogger(__name__)
 RECEIPT_EMOJI = "OnIt"
 
 
-def build_client(*, app_id: str, app_secret: str) -> Any:
+def build_client(*, app_id: str, app_secret: str, timeout_seconds: float) -> Any:
     """构造官方 SDK 客户端。
 
     凭据只从调用方传入，不在本模块读环境变量（代码框架第三节：配置在 ``apps/`` 入口
     一次性读取）。
+
+    ``timeout_seconds`` **必须显式传入，没有默认值**。SDK 自己的默认是 30 秒
+    （``lark_oapi/core/model/config.py:15``），比 gateway 的停机预算还长——一次卡住的
+    加表情或回复就能让停机超出承诺，而这两个调用都在主线程上、不可取消。让调用方
+    从停机预算里分配，比在这里再写一个可能与预算冲突的默认值安全。
     """
 
     import lark_oapi as lark
 
-    return lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
+    return (
+        lark.Client.builder()
+        .app_id(app_id)
+        .app_secret(app_secret)
+        .timeout(timeout_seconds)
+        .build()
+    )
 
 
 class LarkReactions:

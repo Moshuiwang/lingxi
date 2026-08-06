@@ -130,7 +130,8 @@ class GatewayTransaction(Protocol):
         target_worker_version: str,
     ) -> None: ...
 
-    def clear_agent_session(self, *, conversation_id: str) -> None: ...
+    def clear_agent_session(self, *, conversation_id: str) -> bool:
+        """清空该话题的会话上下文；话题已被占用时返回 ``False`` 且不改任何行。"""
 
     def request_stop(self, *, conversation_id: str) -> str | None:
         """给该话题运行中的任务置 ``stop_requested``；返回被置的任务标识或 ``None``。"""

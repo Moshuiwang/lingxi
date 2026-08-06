@@ -185,17 +185,26 @@ class _Transaction:
             ),
         )
 
-    def clear_agent_session(self, *, conversation_id: str) -> None:
-        """``/new``：清空当前对话上下文。
+    def clear_agent_session(self, *, conversation_id: str) -> bool:
+        """``/new``：清空当前对话上下文。返回是否真的清了。
 
-        条件只有 ``id = %s``，因此天然只影响这一行，其他话题的 ``agent_session_id``
+        条件里的 ``id = %s`` 让它天然只影响这一行，其他话题的 ``agent_session_id``
         与 ``last_task_ended_at`` 都不动（`V-会话-05`）。
+
+        ``AND running_task_id IS NULL`` 不能省：管线读到的忙碌状态是事务开始时的快照，
+        另一条连接可能在这之间抢占成功并已经在执行。没有这个条件时，两个并发请求
+        （一条 `/new` + 一条普通消息）会同时成功，把一个**正在运行**的任务的上下文
+        清掉——合同规定忙碌期的 `/new` 只该得到提示。
         """
 
-        self._execute(
-            "UPDATE conversation SET agent_session_id = NULL WHERE id = %s",
+        cursor = self._execute(
+            """
+            UPDATE conversation SET agent_session_id = NULL
+             WHERE id = %s AND running_task_id IS NULL
+            """,
             (conversation_id,),
         )
+        return cursor.rowcount == 1
 
     def request_stop(self, *, conversation_id: str) -> str | None:
         """``/stop``：给该话题当前占用的任务置 ``stop_requested``。

@@ -485,6 +485,84 @@ class UnprovisionedUserTests(PipelineTestCase):
             )
 
 
+class BlackHoleOutboundTests(PipelineTestCase):
+    """出站黑洞：飞书接受连接但永不响应（codex 二轮 P1-C）。
+
+    真正的时间上限来自注入给 SDK 的 HTTP 超时——它由停机预算推导，断言在
+    ``test_gateway_config.BuildSupervisorTests``。这里断的是**超时发生之后**的行为：
+    加表情与回复都不得把已确定的处理结论带走，也不得阻断后续步骤。
+    """
+
+    def test_a_hanging_reaction_does_not_block_the_pipeline(self) -> None:
+        outcome = self.build(reaction_error=TimeoutError("出站黑洞：加表情超时")).handle_message(
+            message(), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED, "加表情超时不得阻断入队")
+        self.assertEqual(len(self.state.tasks), 1)
+        self.assertEqual(self.log.count("audit.reaction.failed"), 1)
+
+    def test_a_hanging_reply_does_not_undo_the_committed_outcome(self) -> None:
+        class HangingReplies:
+            def send_text(self, **kwargs):
+                raise TimeoutError("出站黑洞：回复超时")
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_running"
+        )
+        pipeline = EventPipeline(
+            store=FakeStore(self.state, self.log),
+            reactions=FakeReactions(self.log),
+            replies=HangingReplies(),
+            audit=FakeAudit(self.log),
+        )
+
+        outcome = pipeline.handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.state.events.get("evt_1"),
+            "busy_hint",
+            "回复超时不得回滚已提交的处理结论——否则重投会让这条消息在任务结束后生效",
+        )
+        self.assertEqual(self.log.count("audit.reply.failed"), 1)
+
+
+class ShutdownSkipsBestEffortRepliesTests(PipelineTestCase):
+    """停机中跳过尽力而为的回复，但**已提交的结论不动**。"""
+
+    def test_a_pending_reply_is_skipped_while_stopping(self) -> None:
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_running"
+        )
+        pipeline = EventPipeline(
+            store=FakeStore(self.state, self.log),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+            should_stop=lambda: True,
+        )
+
+        outcome = pipeline.handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.state.events.get("evt_1"), "busy_hint", "停机不得回滚已提交的结论"
+        )
+        self.assertEqual(
+            self.log.count("reply.send_text"), 0, "停机中不得再发出站 HTTP"
+        )
+        self.assertEqual(self.log.count("audit.reply.skipped_while_stopping"), 1)
+
+    def test_replies_are_sent_when_not_stopping(self) -> None:
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_running"
+        )
+        self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(self.log.count("reply.send_text"), 1)
+
+
 class SuspendedUserTests(PipelineTestCase):
     """已停用用户不入队（合同：停用一经感知即禁止发起新的问数）。"""
 

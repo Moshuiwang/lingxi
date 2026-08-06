@@ -103,7 +103,12 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGINT, handler)
 
 
-def build_supervisor(config: GatewayConfig, *, transport: Any = None) -> LongConnectionSupervisor:
+def build_supervisor(
+    config: GatewayConfig,
+    *,
+    transport: Any = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
     ``transport`` 开成注入口：真实长连接属 L4a，全部 L2 断言注入假传输层。
@@ -115,12 +120,22 @@ def build_supervisor(config: GatewayConfig, *, transport: Any = None) -> LongCon
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
 
     audit = _LoggingAudit()
-    client = build_client(app_id=config.app_id, app_secret=str(config.app_secret))
+    # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
+    # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
+    # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
+    outbound_timeout = max(1.0, config.shutdown_timeout_seconds / 4)
+    client = build_client(
+        app_id=config.app_id,
+        app_secret=str(config.app_secret),
+        timeout_seconds=outbound_timeout,
+    )
     pipeline = EventPipeline(
         store=PostgresGatewayStore(str(config.postgres_dsn)),
         reactions=LarkReactions(client),
         replies=LarkReplies(client),
         audit=audit,
+        # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
+        should_stop=should_stop,
     )
     return LongConnectionSupervisor(
         transport=transport
@@ -136,6 +151,8 @@ def build_supervisor(config: GatewayConfig, *, transport: Any = None) -> LongCon
             # 重投，而不是无限期占住它的接收协程。取停机超时本身：比它更长的话，
             # 一条卡住的事件就能让停机超出承诺。
             ack_timeout_seconds=config.shutdown_timeout_seconds,
+            # 建连截止时间：超时未连上即判失败进重连，堵住「从未连上」的活性黑洞。
+            handshake_timeout_seconds=config.shutdown_timeout_seconds,
         ),
         handle_event=make_event_handler(pipeline, audit=audit),
         backoff=BackoffPolicy(
@@ -160,7 +177,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     stop_event = threading.Event()
     install_signal_handlers(stop_event)
 
-    supervisor = build_supervisor(config)
+    supervisor = build_supervisor(config, should_stop=stop_event.is_set)
     reason = supervisor.run(should_stop=stop_event.is_set)
 
     if reason is TerminationReason.TERMINAL_ERROR:

@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Callable
 
 from lingxi.core.ids import new_id
 
@@ -96,6 +97,7 @@ class EventPipeline:
         audit: AuditSink,
         texts: GatewayTexts | None = None,
         resolve_version: VersionResolver = fixed_stable_version,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._reactions = reactions
@@ -103,14 +105,63 @@ class EventPipeline:
         self._audit = audit
         self._texts = texts or GatewayTexts()
         self._resolve_version = resolve_version
+        # 停机位。停机时**已提交的结论不动**，只跳过尽力而为的出站回复——
+        # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
+        self._should_stop = should_stop or (lambda: False)
 
     def handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
         """处理一条 ``im.message.receive_v1``。
 
         ``now`` 只为注入时钟开放（`V-会话-02`），正常调用不传。
+
+        **回复一律在事务提交之后才发出。** 早先的写法在事务里就把"当前任务仍在处理中"
+        发出去了，于是回复成功、``mark_handled_as`` 或提交失败时：事务回滚 → 平台重投
+        → 提示重发；更糟的是**原任务如果这时已经结束**，这条本应"不生效"的消息会在
+        重投时被正常入队执行——直接违反合同「该消息不进入对话历史、不排队，也不会在
+        当前任务结束后自动提交或自动生效」。
+
+        改成先把 ``handled_as`` 结论持久化并提交、再发回复之后：重投时事件行已经在
+        库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
+        可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
         """
 
         moment = now or datetime.now(timezone.utc)
+        deferred: list[str] = []
+
+        outcome = self._within_transaction(message, moment, deferred)
+
+        # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
+        if deferred and self._should_stop():
+            # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
+            # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
+            # 一条提示不改变任何硬承诺。
+            self._audit.record(
+                "reply.skipped_while_stopping",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            return outcome
+        for text in deferred:
+            try:
+                self._replies.send_text(
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
+                    text=text,
+                )
+            except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
+                self._audit.record(
+                    "reply.failed",
+                    event_id=message.event_id,
+                    error=f"{type(error).__name__}: {error}",
+                    trace_id=message.trace_id,
+                )
+        return outcome
+
+    def _within_transaction(
+        self, message: InboundMessage, moment: datetime, deferred: list[str]
+    ) -> Outcome:
+        """第 2 步到第 7 步，全部落在同一个事务里。"""
 
         with self._store.transaction() as tx:
             # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
@@ -160,12 +211,7 @@ class EventPipeline:
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
 
             if state is UserState.SUSPENDED:
-                self._replies.send_text(
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    reply_to_message_id=message.message_id,
-                    text=self._texts.suspended,
-                )
+                deferred.append(self._texts.suspended)
                 self._audit.record(
                     "inbound_event.suspended",
                     event_id=message.event_id,
@@ -206,19 +252,23 @@ class EventPipeline:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
                 # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                self._replies.send_text(
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    reply_to_message_id=message.message_id,
-                    text=self._texts.busy_hint,
-                )
+                deferred.append(self._texts.busy_hint)
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                 return Outcome(handled_as=HandledAs.BUSY_HINT)
 
             if command is Command.NEW:
                 # 空闲时的 /new：立即清空当前对话上下文，其他话题不受影响
                 # （条件写在 conversation_id 上，天然只影响这一行）。
-                tx.clear_agent_session(conversation_id=conversation.conversation_id)
+                #
+                # 清空本身**再判一次忙碌**，因为上面那个 busy 读的是事务开始时的快照：
+                # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
+                # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
+                if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
+                    deferred.append(self._texts.busy_hint)
+                    tx.mark_handled_as(
+                        event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
+                    )
+                    return Outcome(handled_as=HandledAs.BUSY_HINT)
                 self._audit.record(
                     "command.new",
                     event_id=message.event_id,
@@ -251,7 +301,14 @@ class EventPipeline:
                 return Outcome(handled_as=HandledAs.DROPPED)
 
             # —— 第 7 步：入队。
-            return self._enqueue(tx, message, user_id=user.user_id, conversation=conversation, now=moment)
+            return self._enqueue(
+                tx,
+                message,
+                user_id=user.user_id,
+                conversation=conversation,
+                now=moment,
+                deferred=deferred,
+            )
 
     # ------------------------------------------------------------------
     # 内部步骤
@@ -276,7 +333,16 @@ class EventPipeline:
                 trace_id=message.trace_id,
             )
 
-    def _enqueue(self, tx, message: InboundMessage, *, user_id: str, conversation, now: datetime) -> Outcome:
+    def _enqueue(
+        self,
+        tx,
+        message: InboundMessage,
+        *,
+        user_id: str,
+        conversation,
+        now: datetime,
+        deferred: list[str],
+    ) -> Outcome:
         task_id = new_id("tsk")
 
         # 抢占与入队同事务：抢不到即忙碌（`V-会话-01`）；抢到之后任何失败都会让
@@ -284,12 +350,7 @@ class EventPipeline:
         if not tx.claim_conversation(
             conversation_id=conversation.conversation_id, task_id=task_id
         ):
-            self._replies.send_text(
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                reply_to_message_id=message.message_id,
-                text=self._texts.busy_hint,
-            )
+            deferred.append(self._texts.busy_hint)
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)
 
