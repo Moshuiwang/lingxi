@@ -32,6 +32,8 @@ container="${LINGXI_POSTGRES_CONTAINER}"
 # 两个一次性库。名字里带 scratch，任何人在容器里看到它们都知道可以直接删。
 sql_database='lingxi_migrate_scratch_sql'
 alembic_database='lingxi_migrate_scratch_alembic'
+# 往返检查用的参考库：每退一步就用它建一个「空库直达该版本」的对照。
+reference_database='lingxi_migrate_scratch_ref'
 workspace=$(mktemp -d)
 
 psql_do() {
@@ -50,6 +52,7 @@ cleanup() {
   rm -rf "${workspace}"
   drop_database "${sql_database}"
   drop_database "${alembic_database}"
+  drop_database "${reference_database}"
 }
 trap cleanup EXIT
 
@@ -121,7 +124,12 @@ printf '缺少 LINGXI_MIGRATION_DSN：明确失败（无默认连接串、不回
 drop_database "${sql_database}"
 drop_database "${alembic_database}"
 psql_do postgres -c "CREATE DATABASE ${sql_database};"
+# nullglob：不开这个，glob 没匹配到任何文件时 bash 会把**模式原文**留在数组里，
+# 于是长度是 1、下面那个「一个都没有」的分支永远不触发，然后 psql 去读一个叫
+# `migrations/*.sql` 的文件报一句难懂的错（内审指出的死代码）。
+shopt -s nullglob
 migration_files=(migrations/*.sql)
+shopt -u nullglob
 if ((${#migration_files[@]} == 0)); then
   printf 'migrations/ 下没有编号 SQL，迁移链检查失去对象。\n' >&2
   exit 1
@@ -202,6 +210,78 @@ if ! diff -u "${workspace}/head.sql" "${workspace}/head_again.sql"; then
   exit 1
 fi
 printf 'head 上重跑 upgrade：通过（结构不变）\n'
+
+# ---------- 逐条 revision 真往返（V-迁移-08）----------
+# 静态检查只看得出 `downgrade()` 不是空函数，看不出它做的事对不对——
+# `if False: op.drop_table(...)` 一样能过形状检查，而真库从不执行 downgrade，
+# 于是「基线之上每条 revision 可真往返」这句承诺一直没有任何机器在守（内审 / 外审
+# 共同指出）。这里在真库上走一遍：先一路 downgrade 回基线，每退一步都与
+# 「空库直接 upgrade 到那一版」逐字节比对；再一路 upgrade 回 head，每进一步都与
+# 下行时同一版本记下的 dump 逐字节比对。
+#
+# 当前链上只有基线，下面两个循环都是空的、零成本；#54 的第一条 revision 落地即生效。
+round_trip_pairs=$(python3 - <<'PY'
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
+script = ScriptDirectory.from_config(Config("alembic.ini"))
+base = script.get_bases()[0]
+head = script.get_heads()[0]
+for revision in script.iterate_revisions(head, base):
+    if revision.revision == base:
+        continue
+    parent = revision.down_revision
+    if not isinstance(parent, str):
+        raise SystemExit(
+            f"{revision.revision} 的 down_revision 是 {parent!r}（不是单个 id），"
+            "往返检查覆盖不到它，请先处理这条 revision 的形状"
+        )
+    print(f"{revision.revision} {parent}")
+PY
+)
+
+if [[ -z "${round_trip_pairs}" ]]; then
+  printf '逐条 revision 往返：本次无对象（链上只有基线，基线按设计不可 downgrade）\n'
+else
+  # 下行：head → base，逐步 downgrade 并与空库直达同一版本的结果比对。
+  while read -r revision parent; do
+    normalized_dump "${alembic_database}" > "${workspace}/at_${revision}.sql"
+    LINGXI_MIGRATION_DSN="${alembic_dsn}" python3 -m alembic downgrade "${parent}"
+    normalized_dump "${alembic_database}" > "${workspace}/down_to_${parent}.sql"
+
+    drop_database "${reference_database}"
+    psql_do postgres -c "CREATE DATABASE ${reference_database};"
+    reference_dsn=$(scratch_dsn "${reference_database}")
+    LINGXI_MIGRATION_DSN="${reference_dsn}" python3 -m alembic upgrade "${parent}"
+    normalized_dump "${reference_database}" > "${workspace}/fresh_${parent}.sql"
+
+    if ! diff -u "${workspace}/fresh_${parent}.sql" "${workspace}/down_to_${parent}.sql"; then
+      printf '\nrevision %s 的 downgrade 没有真正回到 %s（上面是 diff）。\n' "${revision}" "${parent}" >&2
+      printf 'downgrade 必须真正逆转 upgrade，否则回滚只是把版本号改小了。\n' >&2
+      exit 1
+    fi
+    stepped=$(psql_do "${alembic_database}" -tAc 'SELECT version_num FROM alembic_version;')
+    if [[ "${stepped}" != "${parent}" ]]; then
+      printf 'downgrade 之后 alembic_version 是 %s，期望 %s。\n' "${stepped}" "${parent}" >&2
+      exit 1
+    fi
+    printf 'revision %s：downgrade 到 %s 与空库直达结果一致\n' "${revision}" "${parent}"
+  done <<< "${round_trip_pairs}"
+
+  # 上行：base → head，逐步 upgrade 并与下行时同一版本记下的 dump 比对。
+  tac <<< "${round_trip_pairs}" | while read -r revision _parent; do
+    LINGXI_MIGRATION_DSN="${alembic_dsn}" python3 -m alembic upgrade "${revision}"
+    normalized_dump "${alembic_database}" > "${workspace}/back_${revision}.sql"
+    if ! diff -u "${workspace}/at_${revision}.sql" "${workspace}/back_${revision}.sql"; then
+      printf '\nrevision %s 往返之后的结构与往返之前不一致（上面是 diff）。\n' "${revision}" >&2
+      exit 1
+    fi
+    printf 'revision %s：upgrade 回来后结构与往返前一致\n' "${revision}"
+  done || exit 1
+
+  drop_database "${reference_database}"
+  printf '逐条 revision 真往返：通过（%s 条）\n' "$(wc -l <<< "${round_trip_pairs}")"
+fi
 
 # ---------- 主测试库不得被碰（V-迁移-06）----------
 # 门禁的迁移检查只动一次性 scratch 库。主测试库里冒出 alembic_version，

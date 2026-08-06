@@ -61,8 +61,22 @@ def database_url() -> str:
             f"{DSN_VARIABLE} 的 scheme 是 {scheme!r}，本仓库只使用 psycopg3。"
             f"请写成 {REQUIRED_SCHEME}:// 或裸 postgresql://（由本文件补齐驱动）。"
         )
-    if not parts.netloc and not parts.path:
-        raise RuntimeError(f"{DSN_VARIABLE} 不是一个可用的数据库 URL。")
+    # **必须显式指定库名。** `postgresql://user@host`（没有路径）和 `postgresql:///`
+    # 都是合法 URL，libpq 会回落到「与用户名同名的库」这个默认值——于是一次笔误
+    # （少写一个 `/db`、从别处复制了半截连接串）不会报错，而是把整套 DDL 应用到了
+    # 另一个库上，且迁移会「成功」。这是外审实测指出的缺口：迁移工具的默认值必须
+    # 是「拒绝」，不能是「猜一个」。
+    database = parts.path.lstrip("/")
+    if not database:
+        raise RuntimeError(
+            f"{DSN_VARIABLE} 没有指定数据库名（URL 里缺少 /<库名>）。"
+            "不补默认值：libpq 会回落到与用户名同名的库，"
+            "那样一次笔误就会把 DDL 应用到别的库上，而且不会报错。"
+        )
+    if "/" in database:
+        raise RuntimeError(
+            f"{DSN_VARIABLE} 的路径部分是 {database!r}，不是单个库名。"
+        )
     return urlunsplit(parts)
 
 

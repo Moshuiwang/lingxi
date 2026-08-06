@@ -32,7 +32,8 @@ import sys
 
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
 ALEMBIC_INI = REPOSITORY_ROOT / "alembic.ini"
-MIGRATIONS_README = REPOSITORY_ROOT / "migrations" / "README.md"
+MIGRATIONS_ROOT = REPOSITORY_ROOT / "migrations"
+MIGRATIONS_README = MIGRATIONS_ROOT / "README.md"
 RUNTIME_SOURCE_ROOT = REPOSITORY_ROOT / "src"
 
 # 迁移工具链不得进入运行时代码（断言 V-迁移-04）。引入 alembic 最容易走偏的方向，
@@ -115,6 +116,83 @@ def check_runtime_isolation(source_root: pathlib.Path) -> list[str]:
                     f"{path.relative_to(source_root.parent)}:{line_number} 出现 {name!r}："
                     "迁移工具链不得进入运行时代码，生产进程不装 SQLAlchemy。"
                 )
+    return failures
+
+
+def embedded_copy_failures(path: pathlib.Path, migrations_root: pathlib.Path) -> list[str]:
+    """内嵌的编号 SQL 副本必须与磁盘上的原文逐字节相同。
+
+    基线 revision 声称自己是 ``migrations/006``–``012`` 的**逐字节副本**，整个转换
+    方案的正确性都压在这句话上。真库门禁靠"两条链建库后 schema 逐字节相等"来守它，
+    但那道防线只看得见 schema：副本里多一句 ``INSERT``、``GRANT``、往非 public
+    schema 建对象，或只改注释，两边 ``pg_dump --schema=public`` 依然相等，而副本
+    与原文已经分叉了。而且真库那半边**没有容器就整体不跑**。
+
+    这里做的是直接的字节比对，不需要数据库，因此处处都跑。识别方式是 revision 文件
+    里的 ``CHAIN``（``(源文件名, 常量名)`` 的元组），只有基线有它；其余 revision
+    没有 CHAIN，本函数直接返回空。
+    """
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    constants: dict[str, str] = {}
+    chain_node: ast.expr | None = None
+    for node in tree.body:
+        target: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        if not isinstance(target, ast.Name) or node.value is None:
+            continue
+        if target.id == "CHAIN":
+            chain_node = node.value
+        elif isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            constants[target.id] = node.value.value
+
+    if chain_node is None:
+        return []
+    if not isinstance(chain_node, ast.Tuple):
+        return [f"{path.name}：CHAIN 不是元组字面量，无法核对内嵌副本"]
+
+    failures: list[str] = []
+    covered: set[str] = set()
+    for element in chain_node.elts:
+        if (
+            not isinstance(element, ast.Tuple)
+            or len(element.elts) != 2
+            or not isinstance(element.elts[0], ast.Constant)
+            or not isinstance(element.elts[1], ast.Name)
+        ):
+            failures.append(f"{path.name}：CHAIN 的元素不是 (源文件名, 常量名) 形状")
+            continue
+        source_name = element.elts[0].value
+        variable = element.elts[1].id
+        covered.add(source_name)
+        embedded = constants.get(variable)
+        if embedded is None:
+            failures.append(f"{path.name}：CHAIN 引用了不存在的字符串常量 {variable}")
+            continue
+        source_path = migrations_root / source_name
+        if not source_path.is_file():
+            failures.append(f"{path.name}：CHAIN 引用的源文件不存在：migrations/{source_name}")
+            continue
+        original = source_path.read_text(encoding="utf-8")
+        if embedded != original:
+            failures.append(
+                f"{path.name} 内嵌的 {variable} 与 migrations/{source_name} 已分叉"
+                f"（内嵌 {len(embedded)} 字符、磁盘 {len(original)} 字符）。"
+                "基线声称自己是逐字节副本，这条声明是整个转换方案正确性的前提；"
+                "两边都要改，或者都不改。"
+            )
+
+    on_disk = {item.name for item in sorted(migrations_root.glob("*.sql"))}
+    for missing in sorted(on_disk - covered):
+        failures.append(
+            f"migrations/{missing} 没有被任何 revision 的 CHAIN 覆盖："
+            "编号 SQL 已冻结，新增文件不会进入基线，两条链会就此分叉。"
+        )
+    for extra in sorted(covered - on_disk):
+        failures.append(f"{path.name}：CHAIN 覆盖了磁盘上不存在的 migrations/{extra}")
     return failures
 
 
@@ -205,7 +283,9 @@ def main() -> int:
             )
 
     for revision in all_revisions:
-        failures.extend(downgrade_failures(pathlib.Path(revision.path)))
+        revision_path = pathlib.Path(revision.path)
+        failures.extend(downgrade_failures(revision_path))
+        failures.extend(embedded_copy_failures(revision_path, MIGRATIONS_ROOT))
 
     # head 与 base 的 id 必须出现在 README：接管旧库的命令要用 base（基线），
     # 下游 Issue 接链与部署核对要用 head。
@@ -230,6 +310,7 @@ def main() -> int:
     print(
         f"alembic revision 链：通过（{len(all_revisions)} 条 revision，"
         f"head={heads[0]}，base={bases[0]}，无孤儿，downgrade 均非空实现；"
+        "内嵌编号 SQL 副本与磁盘原文逐字节一致；"
         "alembic.ini 无默认连接串；src/ 无迁移工具链）"
     )
     return 0

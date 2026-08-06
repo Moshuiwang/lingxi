@@ -15,7 +15,7 @@
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
-| 依赖声明 | `pyproject.toml` 的 `migrate` extra（`alembic>=1.19,<1.20`） |
+| 依赖声明 | `pyproject.toml` 的 `migrate` extra（`alembic>=1.19,<1.20`、`psycopg[binary]>=3.2,<4`） |
 
 > 上表的两个 revision id 由 `scripts/ci/check_alembic_revisions.py` 与实际链核对；
 > 新增 revision 却忘了更新这里，门禁会红。
@@ -36,9 +36,10 @@ URL 的 scheme 写 `postgresql://` 或 `postgresql+psycopg://` 都可以，
 裸 `postgresql://` 交给 SQLAlchemy，它会去找自己默认的 psycopg2 驱动，于是报
 「没有 psycopg2 模块」，与真实原因（scheme 没写驱动）差得很远。
 
-> 上一段是全仓库**唯一**出现 `psycopg2` 这个名字的地方，它是一句说明而不是依赖：
-> `pyproject.toml` 里没有它，代码里也没有。留着这句是因为下一个写连接串的人
-> 大概率会踩同一个坑。
+> `psycopg2` 这个名字在仓库里只以**说明和否定用例**的形式出现：本节、
+> `migrations/alembic/env.py` 的模块说明，以及 `tests/test_alembic_revision_check.py`
+> 里那条「非 psycopg3 驱动必须被拒绝」的用例。**它不是依赖**——`pyproject.toml`
+> 与 `src/` 里都没有它。留着这些说明是因为下一个写连接串的人大概率会踩同一个坑。
 
 ## 基线 revision 是编号 SQL 的逐字节副本
 
@@ -61,18 +62,40 @@ URL 的 scheme 写 `postgresql://` 或 `postgresql+psycopg://` 都可以，
 先把库补齐到编号 SQL 的末尾（`012`），再告诉 alembic「这个库已经在基线上了」：
 
 ```bash
-# 1. 补跑该库还缺的编号 SQL，直到 012。已经跑到 012 的库跳过这一步。
-#    编号顺序：006 → 007 → 008 → 010 → 011 → 012（009 与 004 从未使用）。
-psql "$LINGXI_MIGRATION_DSN" -v ON_ERROR_STOP=1 -f migrations/010_create_galaxy_import_batch.sql
-psql "$LINGXI_MIGRATION_DSN" -v ON_ERROR_STOP=1 -f migrations/011_create_galaxy_user_and_role.sql
-psql "$LINGXI_MIGRATION_DSN" -v ON_ERROR_STOP=1 -f migrations/012_create_galaxy_country_scope.sql
+# 0. psql 用的是 libpq，**不认** SQLAlchemy 的 `+psycopg` 驱动后缀；而上面说过
+#    LINGXI_MIGRATION_DSN 两种写法都允许。这一行把它转成 libpq 形式，
+#    使下面的命令对两种写法都逐字可执行。
+export LINGXI_LIBPQ_DSN="${LINGXI_MIGRATION_DSN/postgresql+psycopg:/postgresql:}"
 
-# 2. 只写版本号，不执行任何 DDL。
+# 1. 先探测这个库已经跑到哪一步。每列为 NULL 表示对应编号**尚未执行**。
+psql "$LINGXI_LIBPQ_DSN" -c "
+  SELECT to_regclass('public.feishu_delegated_subject') AS \"006\",
+         to_regclass('public.feishu_org_sync_run')      AS \"007\",
+         to_regclass('public.app_user')                 AS \"008\",
+         to_regclass('public.galaxy_import_batch')      AS \"010\",
+         to_regclass('public.galaxy_user')              AS \"011\",
+         to_regclass('public.galaxy_country')           AS \"012\";"
+
+# 2. 把上一步显示为 NULL 的编号**按顺序**补齐。已经执行过的那几条可以跳过；
+#    真跑了也没关系——编号 SQL 没有 IF NOT EXISTS，加上 ON_ERROR_STOP=1 会立刻
+#    响亮失败，不会造成半成品。**漏跑才是危险方向**：它不会报错，只会让你在
+#    第 3 步 stamp 出一个「缺表却自称已在基线」的库。所以别凭印象跳过，按第 1 步的结果跳。
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/006_create_feishu_delegated_credential.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/007_create_feishu_org_snapshot.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/008_create_app_user.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/010_create_galaxy_import_batch.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/011_create_galaxy_user_and_role.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/012_create_galaxy_country_scope.sql
+
+# 3. 重跑第 1 步确认六列都不是 NULL，然后只写版本号，不执行任何 DDL。
 python -m alembic stamp 20260806_baseline
 
-# 3. 之后全走 alembic。
+# 4. 之后全走 alembic。
 python -m alembic upgrade head
 ```
+
+> 编号顺序是 `006 → 007 → 008 → 010 → 011 → 012`（`009` 与 `004` 从未使用），
+> 不可乱序：`008` 的触发器要读 `006` 建的表，文件内有硬依赖断言。
 
 第 2 步的 `stamp` 是整个接管流程的关键：它写下「本库已相当于基线」，不碰任何表。
 跳过它直接 `upgrade` 会失败（这是好事）；而如果有人为了让它「跑得通」给基线加上
@@ -119,9 +142,12 @@ python -m alembic upgrade head
 拉取，与业务进程用同一个镜像 tag，因此「镜像 tag 即冻结版本」对迁移同样成立。
 在 #62 落地之前，本仓库**没有**可用的自动化部署路径——这是已登记的缺口，不是遗漏。
 
-依赖侧对应：`pyproject.toml` 的 `migrate` extra 只有 alembic 一项直接声明；
-传递闭包实测为 SQLAlchemy、Mako、MarkupSafe、greenlet、typing-extensions。
-`CI / extras (migrate)` 那条矩阵腿在干净虚拟环境里证明它单独装得上。
+依赖侧对应：`pyproject.toml` 的 `migrate` extra 直接声明两项——`alembic` 与
+`psycopg[binary]`。**驱动必须自己声明**：alembic 不依赖任何数据库驱动，驱动由 URL 的
+scheme 决定，少了它干净环境跑 `upgrade` 会报 `No module named 'psycopg'`。
+传递闭包实测为五项：SQLAlchemy、Mako、MarkupSafe、greenlet、typing-extensions
+（`psycopg-binary` 不在此列，它来自 `psycopg[binary]` 的直接声明）。
+`CI / extras (migrate)` 那条矩阵腿在干净虚拟环境里证明它单独装得上、且驱动真的能导入。
 
 ## 测试资产（`migrations/testing/*.sql`）
 

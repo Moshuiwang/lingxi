@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -137,6 +140,112 @@ class DowngradeShapeTest(unittest.TestCase):
         self.assertIn("没有 downgrade()", failures[0])
 
 
+class EmbeddedCopyTest(unittest.TestCase):
+    """基线内嵌的编号 SQL 副本必须与磁盘原文逐字节相同（V-迁移-07）。
+
+    真库那半边（两条链建库后 schema 相等）看不见这类分叉：副本里多一句 INSERT、
+    GRANT，或只改注释，两边 `pg_dump --schema=public` 依然相等。而且真库那半边
+    没有容器就整体不跑。
+    """
+
+    def _build(self, directory: str, embedded: str, on_disk: str, chain: str = "a.sql") -> list[str]:
+        root = Path(directory)
+        (root / "alembic" / "versions").mkdir(parents=True)
+        (root / chain).write_text(on_disk, encoding="utf-8")
+        revision = root / "alembic" / "versions" / "0001_baseline.py"
+        revision.write_text(
+            f"_SQL_A = {embedded!r}\n"
+            f'CHAIN: tuple[tuple[str, str], ...] = (\n    ("{chain}", _SQL_A),\n)\n',
+            encoding="utf-8",
+        )
+        return CHECK.embedded_copy_failures(revision, root)
+
+    def test_identical_bytes_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self._build(directory, "CREATE TABLE t ();\n", "CREATE TABLE t ();\n"), [])
+
+    def test_one_character_drift_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = self._build(directory, "CREATE TABLE t ();\n", "CREATE TABLE tt ();\n")
+        self.assertEqual(len(failures), 1)
+        self.assertIn("已分叉", failures[0])
+
+    def test_comment_only_drift_is_reported(self) -> None:
+        """只改注释——真库 schema 比对对这种分叉完全沉默。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            failures = self._build(directory, "-- 甲\nCREATE TABLE t ();\n", "-- 乙\nCREATE TABLE t ();\n")
+        self.assertEqual(len(failures), 1)
+        self.assertIn("已分叉", failures[0])
+
+    def test_numbered_sql_not_covered_by_any_chain_is_reported(self) -> None:
+        """编号 SQL 已冻结；磁盘上多出一个文件意味着两条链就此分叉。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "alembic" / "versions").mkdir(parents=True)
+            (root / "a.sql").write_text("X\n", encoding="utf-8")
+            (root / "b.sql").write_text("Y\n", encoding="utf-8")
+            revision = root / "alembic" / "versions" / "0001_baseline.py"
+            revision.write_text(
+                '_SQL_A = "X\\n"\nCHAIN: tuple[tuple[str, str], ...] = (\n    ("a.sql", _SQL_A),\n)\n',
+                encoding="utf-8",
+            )
+            failures = CHECK.embedded_copy_failures(revision, root)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("b.sql", failures[0])
+
+    def test_revision_without_chain_is_ignored(self) -> None:
+        """基线之外的 revision 没有 CHAIN，本检查对它们无话可说。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = root / "0002_later.py"
+            revision.write_text("def upgrade():\n    op.create_table('t')\n", encoding="utf-8")
+            self.assertEqual(CHECK.embedded_copy_failures(revision, root), [])
+
+
+class MigrationDsnTest(unittest.TestCase):
+    """env.py 的连接串校验：缺库名必须明确失败（V-迁移-05）。
+
+    走真实子进程跑 `python -m alembic current`，因为 env.py 是被 alembic exec 的，
+    没法直接 import。这些用例**不连数据库**——校验在建连接之前就失败。
+    """
+
+    def _run(self, dsn: str) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["LINGXI_MIGRATION_DSN"] = dsn
+        # 业务 DSN 故意留在环境里：顺带证明不会回落到它。
+        environment["LINGXI_POSTGRES_DSN"] = "postgresql://postgres@localhost:5432/lingxi_test"
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", "current"],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_dsn_without_database_name_is_rejected(self) -> None:
+        result = self._run("postgresql://postgres@localhost:5432")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("没有指定数据库名", result.stderr + result.stdout)
+
+    def test_dsn_with_empty_path_is_rejected(self) -> None:
+        result = self._run("postgresql:///")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("没有指定数据库名", result.stderr + result.stdout)
+
+    def test_empty_dsn_is_rejected_and_names_the_variable(self) -> None:
+        result = self._run("")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LINGXI_MIGRATION_DSN", result.stderr + result.stdout)
+
+    def test_non_psycopg_driver_is_rejected(self) -> None:
+        result = self._run("postgresql+psycopg2://postgres@localhost:5432/lingxi_test")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("psycopg3", result.stderr + result.stdout)
+
+
 class RealRepositoryStateTest(unittest.TestCase):
     """仓库当前状态必须自洽——防止上面的构造用例与真实文件脱节。"""
 
@@ -153,6 +262,12 @@ class RealRepositoryStateTest(unittest.TestCase):
         for path in revision_files:
             with self.subTest(revision=path.name):
                 self.assertEqual(CHECK.downgrade_failures(path), [])
+
+    def test_baseline_embedded_copy_matches_disk(self) -> None:
+        versions = CHECK.REPOSITORY_ROOT / "migrations" / "alembic" / "versions"
+        for path in sorted(versions.glob("*.py")):
+            with self.subTest(revision=path.name):
+                self.assertEqual(CHECK.embedded_copy_failures(path, CHECK.MIGRATIONS_ROOT), [])
 
 
 if __name__ == "__main__":
