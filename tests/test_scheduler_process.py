@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import signal
@@ -394,6 +395,10 @@ class SchedulerLoopTest(unittest.TestCase):
             SchedulerLoop(duties=(), interval_seconds=1)
 
 
+@unittest.skipUnless(
+    importlib.util.find_spec("psycopg") and importlib.util.find_spec("cryptography"),
+    "跳过：build_loop 会真的构造凭据保管与清理适配器，需要 psycopg 与 cryptography",
+)
 class BuildLoopTest(unittest.TestCase):
     def test_the_assembled_process_carries_both_duties(self) -> None:
         """"谁会调用它"的落点：清理职责由**已存在**的 `lingxi-scheduler` 进程装配。

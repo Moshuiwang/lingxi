@@ -93,12 +93,14 @@ _UPGRADE_SQL = r"""
 -- 口令属于部署接线，归 #62 / Ops，不在本迁移内发生。
 --
 -- **downgrade 不删除这四个角色**：角色是集群级共享对象，可能已被同集群的其他数据库
--- 或运维授权引用，删除是不可逆的越界操作。见 migrations/downgrades/013 的说明。
+-- 或运维授权引用，删除是不可逆的越界操作。见下方 `_DOWNGRADE_SQL` 的说明。
 --
 -- Supabase 托管实例是否允许 CREATE ROLE 尚未核实，登记为 stage（L4a）演练验证项。
 DO $roles$
 DECLARE
-    role_name text;
+    role_name   text;
+    v_is_super  boolean;
+    v_can_login boolean;
 BEGIN
     FOREACH role_name IN ARRAY ARRAY[
         'lingxi_app',
@@ -108,8 +110,42 @@ BEGIN
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = role_name) THEN
             EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
+            CONTINUE;
+        END IF;
+
+        -- 角色已经存在：**必须校验**，不能默认它就是我们要的那个。
+        -- `IF NOT EXISTS` 一跳过，一个由别人预建的同名角色就会静默继承本迁移赋予
+        -- 的全部含义——其中 lingxi_retention_owner 会直接成为 SECURITY DEFINER
+        -- 清理函数的属主。那时"无登录专用角色"这句话是假的，而没有任何东西会报错。
+        SELECT rolsuper, rolcanlogin INTO v_is_super, v_can_login
+          FROM pg_catalog.pg_roles WHERE rolname = role_name;
+
+        -- 超级用户身份下，本迁移建立的每一条限权边界都不成立（它绕过全部权限检查）。
+        -- 这个不尝试"收紧"：把别人的超级用户降权是越界操作，响亮失败才是正确行为。
+        IF v_is_super THEN
+            RAISE EXCEPTION '角色 % 已存在且是超级用户，本迁移的限权边界在它身上全部无效', role_name
+                USING HINT = '请先由 DBA 确认该角色的用途，再决定改名或降权；迁移不擅自修改超级用户';
+        END IF;
+
+        -- 登录能力：只有 lingxi_retention_owner 强制收紧。它是清理函数的属主，
+        -- 一个可登录的属主等于把"只能经受限函数删除"变成"可以直接连上来删"。
+        -- 另外三个角色的登录能力属于部署接线（#62 会给它们口令与 LOGIN），
+        -- 迁移在这里强行 NOLOGIN 会把运行时接线反复打回，故只校验不改。
+        IF role_name = 'lingxi_retention_owner' AND v_can_login THEN
+            EXECUTE format('ALTER ROLE %I NOLOGIN', role_name);
         END IF;
     END LOOP;
+
+    -- 属主角色不得是任何角色的成员：它一旦继承了别的权限，SECURITY DEFINER 的
+    -- 执行身份就不再是"只有两张父表 SELECT/DELETE"的那个最小面。
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members am
+          JOIN pg_catalog.pg_roles member ON member.oid = am.member
+         WHERE member.rolname = 'lingxi_retention_owner'
+    ) THEN
+        RAISE EXCEPTION 'lingxi_retention_owner 是其他角色的成员，会继承计划外权限'
+            USING HINT = '受限清理函数的执行身份必须保持最小权限面，请先收回该成员关系';
+    END IF;
 END
 $roles$;
 
@@ -178,6 +214,52 @@ CREATE TRIGGER galaxy_import_batch_expiry
 
 
 -- ---------------------------------------------------------------------------
+-- 二之二、未到期内容的删除防线
+-- ---------------------------------------------------------------------------
+-- 数据库设计 :535-538 的原话是「权限收紧防误操作，触发器防误授权」——两道是并列的，
+-- 不是二选一。此前只做了前半道：`lingxi_app` 没有 DELETE。但那只在授权正确时成立，
+-- 而「授权被改错」正是这道防线要挡的场景。codex 外审实测：临时给 lingxi_app 授上
+-- DELETE 之后，它可以删掉**未到期**的批次，九十天窗口内的内容凭空消失，
+-- 没有任何东西拦。
+--
+-- 规则按到期时间判定，不按角色判定：
+--   * `expires_at > clock_timestamp()`（未到期）→ 一律拒绝，谁来都拒绝；
+--   * 已到期 → 放行。受限清理函数只选到期行，因此完全不受影响；
+--     CASCADE 删的是子表行，子表没有这个触发器，也不受影响。
+--
+-- 按到期时间而不是按 `current_user = 'lingxi_retention_owner'` 判定，是因为后者会
+-- 把防线变成「只信任某个角色名」——角色名可以被预建、被冒名（这正是 P1-3 要挡的），
+-- 而到期时间是行自己的事实。两者叠加时，真正起作用的仍然是到期时间那一条。
+--
+-- **TRUNCATE 不经过行级触发器**，这道防线管不到它。TRUNCATE 由权限控制：
+-- 本迁移不向任何 lingxi_* 角色授予它，断言 V-保留-21 直接核对这一点。
+CREATE OR REPLACE FUNCTION public.lingxi_reject_premature_delete() RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $guard$
+BEGIN
+    IF OLD.expires_at > clock_timestamp() THEN
+        RAISE EXCEPTION '拒绝删除未到期的 %.% 行：到期时间 % 尚未到达',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, OLD.expires_at
+            USING HINT = '九十天窗口内的可识别内容只能等到期后由受限清理函数回收；'
+                         '需要提前删除属于用户删除编排，不是保留清理。';
+    END IF;
+    RETURN OLD;
+END;
+$guard$;
+
+DROP TRIGGER IF EXISTS galaxy_import_batch_no_premature_delete ON galaxy_import_batch;
+CREATE TRIGGER galaxy_import_batch_no_premature_delete
+    BEFORE DELETE ON galaxy_import_batch
+    FOR EACH ROW EXECUTE FUNCTION public.lingxi_reject_premature_delete();
+
+DROP TRIGGER IF EXISTS feishu_org_sync_run_no_premature_delete ON feishu_org_sync_run;
+CREATE TRIGGER feishu_org_sync_run_no_premature_delete
+    BEFORE DELETE ON feishu_org_sync_run
+    FOR EACH ROW EXECUTE FUNCTION public.lingxi_reject_premature_delete();
+
+
+-- ---------------------------------------------------------------------------
 -- 三、受限清理函数
 -- ---------------------------------------------------------------------------
 -- 设计约束逐条来自数据库设计 :538 与 :600：
@@ -213,6 +295,16 @@ SECURITY DEFINER
 -- 身份运行；写在最后则 pg_catalog 先命中，攻击失效。表名已经全限定挡不住这一条——
 -- 能被劫持的不是"删哪张表"，是"在属主身份里跑什么"。
 SET search_path = pg_catalog, pg_temp
+-- 受控等待上限。清理与凭据轮换跑在 scheduler 的同一个线程里串行执行，这里一旦
+-- 无限等待就是整个进程停摆：SIGTERM 只能设一个事件，解不开一条正在等 transactionid
+-- 的锁，进程会挂到关闭宽限期结束被强杀（codex 外审在 PG16 复现）。
+--
+-- 为什么不是 `FOR UPDATE SKIP LOCKED`：任何行锁子句（FOR UPDATE / FOR NO KEY UPDATE /
+-- FOR SHARE / FOR KEY SHARE）都要求调用者对该表持有 UPDATE 权限，而属主角色按
+-- 数据库设计 :613 只持有 SELECT / DELETE。四种子句在该权限面下实测全部
+-- `permission denied`。要用 SKIP LOCKED 就得给属主 UPDATE——那是放宽已经写定的限权
+-- 边界，属于产品决定，不在本切片内做。改用超时是同一目标下不动权限面的做法。
+SET lock_timeout = '2s'
 AS $cleanup$
 DECLARE
     -- 单次调用每张表最多删除的父行数上限。清理是常驻定时职责，宁可多跑几轮，
@@ -243,6 +335,11 @@ BEGIN
     -- 不会静默扩大删除范围。V-保留-11 用一条源文本断言钉住它不被摘掉。
     v_cutoff := LEAST(p_now, clock_timestamp());
 
+    -- 逐表捕获锁超时。不捕获的话，一张表上的一把锁会让整次调用抛异常，
+    -- 另一张表这一轮也跟着不清理；捕获之后这张表如实报 0，另一张照常进行。
+    -- plpgsql 的 EXCEPTION 块是一个子事务：超时那一刻这张表已做的删除整体回滚，
+    -- 不会留下半批。
+    BEGIN
     RETURN QUERY
     WITH doomed AS (
         SELECT b.id
@@ -261,7 +358,16 @@ BEGIN
            min(removed.gone_at),
            max(removed.gone_at)
       FROM removed;
+    EXCEPTION WHEN lock_not_available THEN
+        RETURN QUERY SELECT 'galaxy_import_batch'::text, 0::bigint,
+                            NULL::timestamptz, NULL::timestamptz;
+    END;
 
+    -- 逐表捕获锁超时。不捕获的话，一张表上的一把锁会让整次调用抛异常，
+    -- 另一张表这一轮也跟着不清理；捕获之后这张表如实报 0，另一张照常进行。
+    -- plpgsql 的 EXCEPTION 块是一个子事务：超时那一刻这张表已做的删除整体回滚，
+    -- 不会留下半批。
+    BEGIN
     RETURN QUERY
     WITH doomed AS (
         SELECT r.id
@@ -280,6 +386,10 @@ BEGIN
            min(removed.gone_at),
            max(removed.gone_at)
       FROM removed;
+    EXCEPTION WHEN lock_not_available THEN
+        RETURN QUERY SELECT 'feishu_org_sync_run'::text, 0::bigint,
+                            NULL::timestamptz, NULL::timestamptz;
+    END;
 END;
 $cleanup$;
 
@@ -312,8 +422,12 @@ GRANT SELECT, DELETE ON public.feishu_org_sync_run  TO lingxi_retention_owner;
 -- 业务写授权随运行时接线切片按**实际调用方**逐张补，不在这里预支。
 GRANT SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_app;
 
--- scheduler 只需要看得见两张父表（写运行日志时核对），同样没有 DELETE。
-GRANT SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_scheduler;
+-- scheduler 对两张父表**一条表权限都不需要**。它唯一要做的事是调用清理函数，
+-- 而那个函数是 SECURITY DEFINER：真正读写表的是属主身份，不是调用方。
+-- 运行摘要也来自函数返回值，不需要 scheduler 自己去 SELECT 核对。
+-- 先前授出的 SELECT 没有任何调用方，属于投机性授权，这里显式收回——
+-- 授权面是本迁移声称建立的边界，预支边界等于没有边界。
+REVOKE ALL ON public.galaxy_import_batch, public.feishu_org_sync_run FROM lingxi_scheduler;
 
 -- 先收回 PUBLIC 的默认 EXECUTE，再按精确签名只授给 scheduler。
 REVOKE ALL ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) FROM PUBLIC;
@@ -347,9 +461,18 @@ GRANT EXECUTE ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) 
 -- 要的恰恰是被关掉的那个 SET，照样报 `must be able to SET ROLE`。
 DO $handover$
 DECLARE
-    v_is_member boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'MEMBER');
     v_can_set   boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'SET');
+    -- 移交前的成员关系原样留底。只记 pg_has_role 的布尔量不够：还原时要把
+    -- admin / inherit / set 三个选项逐个放回去，少放一个就是「悄悄多给了一点能力」。
+    v_before    record;
 BEGIN
+    SELECT am.admin_option, am.inherit_option, am.set_option
+      INTO v_before
+      FROM pg_catalog.pg_auth_members am
+      JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
+      JOIN pg_catalog.pg_roles m ON m.oid = am.member
+     WHERE r.rolname = 'lingxi_retention_owner' AND m.rolname = current_user;
+
     IF NOT v_can_set THEN
         EXECUTE format('GRANT lingxi_retention_owner TO %I WITH SET TRUE', current_user);
     END IF;
@@ -358,13 +481,25 @@ BEGIN
     EXECUTE 'ALTER FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) OWNER TO lingxi_retention_owner';
 
     EXECUTE 'REVOKE CREATE ON SCHEMA public FROM lingxi_retention_owner';
-    -- 恢复到移交前的授予形态，不留多出来的能力。lingxi_migrate 的常驻成员关系
-    -- （本文件第一节授出、且带 SET）不受影响：它进不了这两个分支。
+
+    -- 只撤销**本次多加的那一项**，不去重新授予整条成员关系。
+    --
+    -- 走过两个错误答案，都只在非超级用户下才暴露（超级用户的 pg_has_role 恒真，
+    -- 整段被跳过），这里记下来：
+    --   1. `GRANT ... WITH SET FALSE` —— INHERIT 缺省取被授予角色的 rolinherit，
+    --      于是"还原"反而把 inherit=f 变成 inherit=t，悄悄多给了能力（M2 验收发现）；
+    --   2. 改成逐项 `WITH ADMIN %s, INHERIT %s, SET %s` 重授 —— 先是 `format('%s', boolean)`
+    --      渲染成 `t`/`f` 触发 `syntax error at or near "t"`；改成 TRUE/FALSE 之后又撞上
+    --      `ADMIN option cannot be granted back to your own grantor`：CREATEROLE 建角色
+    --      时那条自动授予的授予方就是它自己，没法把 ADMIN 再授回给授予方。
+    --
+    -- 正确的工具是 PostgreSQL 16 的 `REVOKE <选项> OPTION FOR`：它只摘掉一个选项，
+    -- 不碰成员关系本身，也就不存在"重新授予"带来的这两类问题。
     IF NOT v_can_set AND current_user <> 'lingxi_migrate' THEN
-        IF v_is_member THEN
-            EXECUTE format('GRANT lingxi_retention_owner TO %I WITH SET FALSE', current_user);
-        ELSE
+        IF v_before IS NULL THEN
             EXECUTE format('REVOKE lingxi_retention_owner FROM %I', current_user);
+        ELSE
+            EXECUTE format('REVOKE SET OPTION FOR lingxi_retention_owner FROM %I', current_user);
         END IF;
     END IF;
 END
@@ -373,7 +508,7 @@ $handover$;
 
 
 _DOWNGRADE_SQL = r"""
--- #54 S9：0054_retention_cleanup 的回滚 DDL。
+-- #54 S9：本 revision 的回滚 DDL。
 --
 -- 两件事**不会**被这里还原，都是有意的：
 --
@@ -382,7 +517,7 @@ _DOWNGRADE_SQL = r"""
 --    影响面超出本迁移，而且不可逆。角色本身不持有任何内容，留着不构成数据风险；
 --    真要清退由 Ops 显式执行。
 -- 2. **历史行的 expires_at 回填不还原。** 原值在回填时已被覆盖，无从恢复。
---    这是本迁移唯一不可逆的部分。实际影响面为零行的理由见 upgrade 第二节的注释。
+--    这是本迁移唯一不可逆的部分。实际影响面为零行的理由见 upgrade 第二节的注释（历史行回填）。
 --
 -- 会被还原的是本迁移新建的函数、触发器与全部授权。
 --
@@ -394,6 +529,10 @@ DROP FUNCTION IF EXISTS public.lingxi_retention_cleanup(timestamptz, integer);
 
 DROP TRIGGER IF EXISTS galaxy_import_batch_expiry ON galaxy_import_batch;
 DROP FUNCTION IF EXISTS galaxy_import_batch_fix_expiry();
+
+DROP TRIGGER IF EXISTS galaxy_import_batch_no_premature_delete ON galaxy_import_batch;
+DROP TRIGGER IF EXISTS feishu_org_sync_run_no_premature_delete ON feishu_org_sync_run;
+DROP FUNCTION IF EXISTS public.lingxi_reject_premature_delete();
 
 DO $revoke$
 DECLARE

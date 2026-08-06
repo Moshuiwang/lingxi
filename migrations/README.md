@@ -195,6 +195,17 @@ psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "DROP DATABASE lingxi_takeover_check;"
    不会在门禁里暴露。本 revision 已按非超级用户路径实测修正：不用 `COMMENT ON ROLE`、
    属主移交排在授权之后（先移交会让后续 `GRANT EXECUTE` 静默无效而退出码仍是 0）、
    移交前临时补齐 `SET` 成员资格与 schema `CREATE` 并在移交后立即收回。
+   **若托管方禁止 `CREATE ROLE`、四个角色改由 Ops 预建**，则必须同时把
+   `lingxi_retention_owner` 的 **ADMIN OPTION** 授予迁移执行者，否则本 revision 的
+   `GRANT lingxi_retention_owner TO lingxi_migrate` 会 `permission denied`。
+   这个失败形态是好的——响亮报错、整条 revision 原子回滚、不留半应用状态（内审已实证）——
+   但它发生在部署当场，所以要写进运维契约而不是留给现场排查：
+
+   ```sql
+   -- Ops 预建角色时，除了建角色本身，还要给迁移执行者 ADMIN OPTION
+   GRANT lingxi_retention_owner TO <迁移执行角色> WITH ADMIN OPTION;
+   ```
+
    仍未核实的是该实例上 `CREATE ROLE` 是否被托管策略额外限制，以及是否允许
    `SET SESSION AUTHORIZATION`（真库角色用例依赖它）——两项均登记为 stage（L4a）演练验证项。
 

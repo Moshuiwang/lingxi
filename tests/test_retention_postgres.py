@@ -67,11 +67,17 @@ class RetentionPostgresTestCase(unittest.TestCase):
         ensure_production_schema(cls._dsn)
 
     def setUp(self) -> None:
+        # 用 TRUNCATE 而不是 DELETE：本 revision 的 BEFORE DELETE 防线会拒绝删除
+        # **未到期**的行，而用例造的数大多是未到期的。TRUNCATE 不经过行级触发器，
+        # 正好用来做与业务语义无关的清场。这不是绕过防线——防线针对的是持有 DELETE
+        # 的业务角色，而没有任何 lingxi_* 角色被授予 TRUNCATE（断言 V-保留-21）。
+        # lock_timeout 不是可有可无的保险。TRUNCATE 要 ACCESS EXCLUSIVE 锁，
+        # 只要有任何一条用例漏关了持锁连接，这里就会**无限等待**——整个套件挂死，
+        # 在 CI 上表现为烧完 job 超时且没有任何指向原因的输出。挂死是最坏的失败形态：
+        # 它既不给结论也不给线索。设成 5 秒，泄漏立刻变成一条指名道姓的错误。
         self.execute(
-            "DELETE FROM galaxy_import_batch;"
-            "DELETE FROM feishu_org_sync_run;"
-            "DELETE FROM app_user;"
-            "DELETE FROM feishu_delegated_subject;"
+            "SET lock_timeout = '5s';"
+            "TRUNCATE galaxy_import_batch, feishu_org_sync_run, app_user, feishu_delegated_subject CASCADE"
         )
 
     # ---- 基础工具 ---------------------------------------------------------
@@ -94,6 +100,27 @@ class RetentionPostgresTestCase(unittest.TestCase):
 
     def database_now(self):
         return self.scalar("SELECT now()")
+
+    def cleanup_with_deadline(
+        self, moment, limit: int = 100, deadline: str = "15s"
+    ) -> dict[str, tuple[int, object, object]]:
+        """带客户端死线的清理调用，只给并发用例使用。
+
+        函数自己有 `lock_timeout`，正常情况下轮不到这条死线。它存在是为了让
+        「有人把 lock_timeout 摘掉」这件事表现为**一条失败**而不是**一次挂死**：
+        并发用例里持锁连接要等清理返回才释放，没有死线的话两边互等，整个套件停在
+        那里烧完 CI 的 job 超时，还不给任何指向原因的输出。
+        """
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(f"SET statement_timeout = '{deadline}'")
+            cursor.execute(
+                "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at "
+                "FROM public.lingxi_retention_cleanup(%s, %s)",
+                (moment, limit),
+            )
+            rows = cursor.fetchall()
+        return {str(row[0]): (int(row[1]), row[2], row[3]) for row in rows}
 
     def cleanup(self, moment, limit: int = 100) -> dict[str, tuple[int, object, object]]:
         """调用受限清理函数，返回 {表名: (删除数, 最早到期, 最晚到期)}。"""
@@ -466,7 +493,7 @@ class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
         """V-保留-08（验收 D-06）：迁移前写下的偏离行被回填校正。
 
         造数方式就是"迁移前的世界"：先把触发器摘掉，写一行到期时间被拉长到 900 天的
-        批次，再重新应用 013——回填是那条迁移里的一个 `UPDATE`，这里验证它真的跑了。
+        批次，再重新应用本 revision 的 upgrade DDL——回填是其中的一个 `UPDATE`，这里验证它真的跑了。
 
         同时取证：现有代码路径写出的行**本来就精确满足**该不变式（`started_at` 与
         `expires_at` 两个 DEFAULT 取的是同一个事务时间戳），所以回填在真实数据上是零行改动。
@@ -603,6 +630,84 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
 
         self.assertIn("LEAST(p_now, clock_timestamp())", str(definition))
 
+    def test_a_locked_row_bounds_the_wait_instead_of_blocking_the_whole_duty(self) -> None:
+        """V-保留-22（codex 外审 P1-1）：并发持锁时清理在有限时间返回。
+
+        清理与凭据轮换跑在 scheduler 的同一个线程里串行执行——清理一旦无限等待就是
+        整个进程停摆，而 SIGTERM 只能设一个事件，解不开一条正在等 transactionid 的锁。
+        这里开一条并发连接锁住一行，要求：**有限时间返回**、被锁的行没被删、
+        摘要如实报 0（而不是报了个删除数却什么都没删）。
+
+        为什么不是"跳过被锁的行照删其余"：任何行锁子句都要求对表持有 UPDATE 权限，
+        而属主角色按数据库设计 :613 只有 SELECT / DELETE。用超时是同一目标下不动
+        权限面的做法，代价是这一轮该表整批让路，下一轮再收（下一条用例固定这点）。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
+        self.insert_batch("gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+
+        holder = self._psycopg.connect(self._dsn)
+        self.addCleanup(holder.close)
+        with holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM galaxy_import_batch WHERE id = 'gib_locked' FOR UPDATE")
+            started = time.monotonic()
+            summary = self.cleanup_with_deadline(now)
+            elapsed = time.monotonic() - started
+        holder.close()
+
+        self.assertLess(elapsed, 10, "清理不得被行锁无限阻塞——它与凭据轮换共用一个线程")
+        self.assertGreater(elapsed, 1, "应当是等到超时才放弃，而不是根本没尝试")
+        self.assertEqual(summary["galaxy_import_batch"][0], 0, "摘要必须如实报 0，不能报出没发生的删除")
+        self.assertEqual(self.count("galaxy_import_batch"), 2, "被锁那一批一行都不该删")
+        # 逐表捕获的意义：一张表被占，另一张照常清理。
+        self.assertEqual(summary["feishu_org_sync_run"][0], 1)
+        self.assertEqual(self.count("feishu_org_sync_run"), 0)
+
+    def test_the_blocked_rows_are_collected_on_a_later_round(self) -> None:
+        """V-保留-22：让路不是漏掉——锁一放开，下一轮就全部收走。"""
+        now = self.database_now()
+        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
+        self.insert_batch("gib_other", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+
+        holder = self._psycopg.connect(self._dsn)
+        self.addCleanup(holder.close)
+        with holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM galaxy_import_batch WHERE id = 'gib_locked' FOR UPDATE")
+            self.assertEqual(self.cleanup_with_deadline(now)["galaxy_import_batch"][0], 0)
+        holder.close()
+
+        self.assertEqual(self.cleanup(now)["galaxy_import_batch"][0], 2)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+
+    def test_two_concurrent_cleanups_never_delete_the_same_row_twice(self) -> None:
+        """V-保留-22 的另一面：并发时摘要之和不得超过实际删除量。
+
+        同一批到期行如果被两个并发清理各删一次、各报一次，摘要就会大于真实删除量，
+        而运行日志正是靠摘要判断回收进度的。这里让第一条连接删掉一行且**不提交**
+        （因此持有行锁），第二条并发清理必须在超时后如实报 0，而不是把同一行再报一遍。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_a", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
+
+        first = self._psycopg.connect(self._dsn)
+        self.addCleanup(first.close)
+        with first.cursor() as cursor:
+            cursor.execute(
+                "SELECT deleted_rows FROM public.lingxi_retention_cleanup(%s, 10) "
+                "WHERE target_table = 'galaxy_import_batch'",
+                (now,),
+            )
+            deleted_by_first = int(cursor.fetchone()[0])
+            deleted_by_second = self.cleanup_with_deadline(now)["galaxy_import_batch"][0]
+        first.commit()
+        first.close()
+
+        self.assertEqual(deleted_by_first, 1)
+        self.assertEqual(deleted_by_second, 0, "第二次并发清理不得把同一行再报一次")
+        self.assertEqual(deleted_by_first + deleted_by_second, 1, "摘要之和必须等于实际删除量")
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+
     def test_a_shadow_schema_cannot_redirect_the_cleanup(self) -> None:
         """V-保留-12（验收 E-06）：函数固定 `search_path = pg_catalog`。
 
@@ -635,16 +740,27 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
             "SELECT proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
             "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
         )
-        self.assertEqual(list(proconfig or []), ["search_path=pg_catalog, pg_temp"])
+        # 两项都必须在：search_path 挡搜索路径劫持，lock_timeout 挡无限阻塞。
+        # 用相等而不是"包含"，多出一项配置也要被看见。
+        self.assertEqual(
+            list(proconfig or []),
+            ["search_path=pg_catalog, pg_temp", "lock_timeout=2s"],
+        )
 
-    def test_a_shadow_temp_type_cannot_run_caller_code_as_the_owner(self) -> None:
+    def test_a_shadow_temp_type_neither_diverts_nor_breaks_the_cleanup(self) -> None:
         """V-保留-12：`search_path` 必须以 `pg_temp` 结尾。
 
-        表名全限定挡不住这一条。`search_path` 里没有显式写 `pg_temp` 时，PostgreSQL
+        **这条断言的实际内容是"清理照常完成、目标未被改变"，不是"攻击者跑不了代码"**
+        （M2 验收指出原名名不副实，已改名以实际断言为准）。要直接断言后者需要在
+        属主身份里布一个可观察的副作用，那本身就得先把攻击做成功；这里取的是可稳定
+        观察的那一面：加固前该场景会让函数直接报错（`malformed record literal`），
+        加固后一切照常。
+
+        为什么表名全限定挡不住：`search_path` 里没有显式写 `pg_temp` 时，PostgreSQL
         会把它**隐式排在最前**来解析关系名与**类型名**；函数 `DECLARE` 里的
-        `timestamptz` / `integer` 是未限定类型名，调用方建一张同名临时表就能改变它们
-        的解析结果，进而在 SECURITY DEFINER 的属主身份里跑自己的代码。能被劫持的
-        不是"删哪张表"，是"在属主身份里跑什么"——所以上一条影子 schema 用例覆盖不到它。
+        `timestamptz` / `integer` 是未限定类型名，调用方建一张同名临时表就能改变它们的
+        解析结果。能被劫持的不是"删哪张表"，是"在属主身份里跑什么"——所以上一条
+        影子 schema 用例覆盖不到它。
         """
         now = self.database_now()
         self.insert_batch("gib_atk", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
@@ -740,6 +856,122 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 self.assertIn("permission denied", message)
         self.assertEqual(self.count("galaxy_import_batch"), 1)
 
+    def test_a_row_that_has_not_expired_cannot_be_deleted_even_with_the_privilege(self) -> None:
+        """V-保留-21（codex 外审 P1-2）：数据库设计 :535-538 的第二道防线。
+
+        「权限收紧防误操作，触发器防误授权」是并列的两道。此前只做了前半道：
+        lingxi_app 没有 DELETE。但那只在授权正确时成立，而"授权被改错"正是第二道
+        要挡的场景——codex 实测临时授上 DELETE 后，未到期批次可以被直接删掉。
+        这里把那次实测固化：**临时授予 DELETE**，然后确认仍然删不动未到期的行。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_fresh", started_at=now, status="complete")
+        self.insert_sync_run("run_fresh", started_at=now)
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.execute("GRANT DELETE ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_app")
+
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            with self.subTest(table=table):
+                with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                    cursor.execute("SET SESSION AUTHORIZATION lingxi_app")
+                    with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+                        cursor.execute(f"DELETE FROM public.{table}")
+                    connection.rollback()
+                self.assertIn("拒绝删除未到期", str(raised.exception))
+
+        self.assertEqual(self.count("galaxy_import_batch"), 1)
+        self.assertEqual(self.count("feishu_org_sync_run"), 1)
+
+    def test_an_expired_row_is_still_deletable_so_the_cleanup_is_not_blocked(self) -> None:
+        """V-保留-21 的肯定面：防线只挡未到期行，到期行照常回收。
+
+        只写否定面的话，一个"什么都拒绝"的触发器同样能让否定断言通过，
+        而它会把受限清理函数本身也堵死。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+
+        summary = self.cleanup(now)
+
+        self.assertEqual(summary["galaxy_import_batch"][0], 1)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+        self.assertEqual(self.count("galaxy_user"), 0, "CASCADE 不得被删除防线挡住")
+
+    def test_no_lingxi_role_holds_truncate_on_the_content_tables(self) -> None:
+        """V-保留-21：TRUNCATE 不经过行级触发器，因此必须由权限挡住。
+
+        删除防线是行级的，TRUNCATE 绕过它。这条断言把「没有任何 lingxi_* 角色
+        拿得到 TRUNCATE」钉住——否则那道防线可以被一条 TRUNCATE 整体绕开。
+        """
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            for role in ("lingxi_app", "lingxi_scheduler", "lingxi_retention_owner", "lingxi_migrate"):
+                with self.subTest(table=table, role=role):
+                    self.assertFalse(
+                        self.scalar(
+                            "SELECT has_table_privilege(%s, %s, 'TRUNCATE')", (role, f"public.{table}")
+                        )
+                    )
+
+    def test_the_scheduler_role_holds_no_table_privilege_at_all(self) -> None:
+        """V-保留-13（codex 外审 P2-1）：scheduler 只需要函数的 EXECUTE。
+
+        清理函数是 SECURITY DEFINER，读写表的是属主身份；运行摘要来自函数返回值。
+        scheduler 因此**一条表权限都不需要**，先前授出的 SELECT 没有任何调用方。
+        """
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                with self.subTest(table=table, privilege=privilege):
+                    self.assertFalse(
+                        self.scalar(
+                            "SELECT has_table_privilege('lingxi_scheduler', %s, %s)",
+                            (f"public.{table}", privilege),
+                        )
+                    )
+        self.assertTrue(
+            self.scalar(
+                "SELECT has_function_privilege('lingxi_scheduler', "
+                "'public.lingxi_retention_cleanup(timestamptz,integer)', 'EXECUTE')"
+            )
+        )
+
+    def test_a_pre_existing_login_owner_role_is_normalised(self) -> None:
+        """V-保留-23（codex 外审 P1-3）：预建的同名属主角色必须被校验。
+
+        `IF NOT EXISTS` 一跳过，别人预建的同名角色就静默继承本迁移赋予的全部含义——
+        其中 lingxi_retention_owner 会直接成为 SECURITY DEFINER 函数的属主。
+        一个**可登录**的属主等于把「只能经受限函数删除」变成「可以直接连上来删」。
+        """
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.execute("ALTER ROLE lingxi_retention_owner LOGIN")
+        self.assertTrue(self.scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'"))
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL)
+
+        self.assertFalse(
+            self.scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'lingxi_retention_owner'"),
+            "重新应用迁移必须把属主角色收紧回无登录",
+        )
+
+    def test_an_owner_role_that_inherits_other_privileges_is_refused(self) -> None:
+        """V-保留-23：属主角色不得是任何角色的成员。
+
+        它一旦继承别的权限，SECURITY DEFINER 的执行身份就不再是「只有两张父表
+        SELECT/DELETE」的最小面，而迁移会照常成功、没有任何提示。
+        """
+        # 收尾顺序要紧：addCleanup 是后进先出，必须**先**收回成员关系再重建结构。
+        # 反过来的话，重建时迁移会再一次撞上同一条 RAISE，建库失败，
+        # 之后每一条用例都在一个没有清理函数的库上跑——本轮实测就是这样一次红了 30 条。
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.addCleanup(self.execute, "REVOKE lingxi_app FROM lingxi_retention_owner")
+        self.execute("GRANT lingxi_app TO lingxi_retention_owner")
+
+        with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+            with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(UPGRADE_SQL)
+
+        self.assertIn("继承计划外权限", str(raised.exception))
+
     def test_no_business_role_can_become_the_retention_owner(self) -> None:
         """V-保留-13（验收 E-10）：拿不到那个角色，就拿不到它的 DELETE。"""
         for role in ("lingxi_app", "lingxi_scheduler"):
@@ -755,6 +987,9 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
 
     def test_the_four_roles_exist_and_none_of_them_can_log_in(self) -> None:
         """V-保留-13：角色随迁移幂等建立；本切片不接线运行时连接身份。"""
+        # 这是一条**集群级**精确集合断言：它假设跑在一个新鲜的、只被本仓库使用的
+        # 容器上。共享集群里别人建了 `lingxi_` 前缀的角色就会误红——那种环境下应当
+        # 改成子集断言。CI 与本机都用一次性容器，故这里取更严的相等（内审 P3-2）。
         rows = self.query(
             "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname LIKE 'lingxi\\_%' ORDER BY rolname"
         )
@@ -1007,11 +1242,14 @@ class SchedulerDutyTest(RetentionPostgresTestCase):
 class MigrationRoundTripTest(RetentionPostgresTestCase):
     """整链前滚 → 回滚 → 再前滚，往返两次。
 
-    走的是 `migrations/013_*.sql` 与 `migrations/downgrades/013_*.sql` 两个文件，
-    也就是 Alembic revision `0054_retention_cleanup` 的 `upgrade()` / `downgrade()`
-    实际执行的同一段文本（见该 revision 的模块注释）。Alembic 本身尚未成为声明的
-    依赖（属 #53），因此这里不通过 alembic 命令行跑——同一段 DDL 的 Alembic 侧
-    往返验证见 PR 说明。
+    走的是 revision `0054_retention_cleanup` 内联的 `_UPGRADE_SQL` / `_DOWNGRADE_SQL`
+    两段文本，也就是它的 `upgrade()` / `downgrade()` 实际执行的同一段字节。
+
+    分工：**alembic CLI 层的往返由门禁覆盖**——`scripts/ci/check_migration_chain.sh`
+    的"逐条 revision 真往返"会真的 `downgrade -1` 再 `upgrade`，并要求结构与往返前
+    逐字节一致。本用例覆盖的是 **DDL 文本层**：不经 alembic、直接把两段 SQL 来回跑，
+    因此在没有 alembic 的环境里也能发现"downgrade 漏删了某个对象"这类缺陷。
+    两层都要，因为它们失效的方式不同。
     """
 
     def _objects(self) -> dict[str, object]:
@@ -1043,6 +1281,9 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
 
     def test_downgrade_keeps_the_data_and_the_cluster_level_roles(self) -> None:
         """V-保留-18（验收 G-02/G-03）：回滚删对象、不删数据、不删集群级角色。"""
+        # 收尾**必须在执行 DOWNGRADE 之前注册**：注册在后面的话，中间任何一条断言
+        # 失败都会让这个共享库停在降级态，后面每一条用例跟着连坐（内审 P3-1）。
+        self.addCleanup(self._reapply_chain)
         now = self.database_now()
         self.insert_batch("gib_keep", started_at=now - timedelta(hours=1), with_children=True)
         before = self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1")
@@ -1052,7 +1293,57 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
 
         self.assertEqual(self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1"), before)
         self.assertEqual(self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"), 4)
+
+    def test_downgrade_leaves_no_privilege_granted_by_this_revision(self) -> None:
+        """V-保留-18（内审 P3-4）：降级后不残留本 revision 授出的任何权限。
+
+        这条断言没有别的东西替代：链门禁的 `pg_dump` 带 `--no-privileges`，对 ACL
+        **完全盲**，所以 downgrade 里那一整段 REVOKE 此前无人守——删掉它们，
+        两条血统的结构比对依然零差异，而权限面已经留在库里了。
+        """
         self.addCleanup(self._reapply_chain)
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(DOWNGRADE_SQL)
+
+        roles = ("lingxi_app", "lingxi_scheduler", "lingxi_retention_owner", "lingxi_migrate")
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            for role in roles:
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                    with self.subTest(table=table, role=role, privilege=privilege):
+                        self.assertFalse(
+                            self.scalar(
+                                "SELECT has_table_privilege(%s, %s, %s)",
+                                (role, f"public.{table}", privilege),
+                            )
+                        )
+        # schema 这一项必须查 **ACL 条目**，不能用 has_schema_privilege：
+        # public schema 默认把 USAGE 授给了 PUBLIC，而 has_schema_privilege 会把
+        # 经 PUBLIC 继承来的权限也算进去，于是不论是否 REVOKE 过它都恒为真——
+        # 那样写出来的断言永远不会红。这里看的是"有没有为这些角色单独授过"。
+        explicit = {
+            row[0]
+            for row in self.query(
+                "SELECT pg_get_userbyid(a.grantee) FROM pg_namespace n, aclexplode(n.nspacl) a "
+                " WHERE n.nspname = 'public' AND a.grantee <> 0"
+            )
+        }
+        for role in roles:
+            with self.subTest(role=role, object="schema public"):
+                self.assertNotIn(role, explicit)
+        # 属主角色的成员关系也应回到只剩「无」：迁移授给 lingxi_migrate 的那条被收回。
+        self.assertEqual(self._owner_members_after_downgrade(), set())
+
+    def _owner_members_after_downgrade(self) -> set[str]:
+        return {
+            row[0]
+            for row in self.query(
+                "SELECT m.rolname FROM pg_auth_members am "
+                "  JOIN pg_roles r ON r.oid = am.roleid "
+                "  JOIN pg_roles m ON m.oid = am.member "
+                " WHERE r.rolname = 'lingxi_retention_owner' AND m.rolname LIKE 'lingxi\\_%'"
+            )
+        }
 
     def test_the_previous_image_still_works_against_the_upgraded_database(self) -> None:
         """V-保留-18（验收 G-05）：触发器不得让既有写路径失败。
@@ -1108,7 +1399,7 @@ class ReimportAfterCleanupTest(RetentionPostgresTestCase):
         self.assertEqual(first.outcome, "imported")
 
         # 让它过期：来源时间不能改，所以直接换一条来源时间足够旧的同摘要批次。
-        self.execute("DELETE FROM galaxy_import_batch")
+        self.execute("TRUNCATE galaxy_import_batch CASCADE")
         now = self.database_now()
         self.insert_batch("gib_repeat", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
         self.execute("UPDATE galaxy_import_batch SET source_digest = 'digest-repeat' WHERE id = 'gib_repeat'")

@@ -1,7 +1,7 @@
 """调用数据库里的受限保留清理函数。
 
 本模块**不写任何 DELETE**。九十天回收的全部逻辑（到期条件、批量上限、拒绝未来
-时间、固定 search_path）都在 `migrations/013_create_retention_cleanup.sql` 建立的
+时间、固定 search_path）都在迁移 `0054_retention_cleanup` 建立的
 `public.lingxi_retention_cleanup(timestamptz, integer)` 里，属主是无登录的
 `lingxi_retention_owner`。适配器只负责："按当前时间调用一次，把摘要拿回来"。
 

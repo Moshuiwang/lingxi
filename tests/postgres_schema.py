@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import ast
 import os
 import threading
 from pathlib import Path
@@ -37,7 +37,13 @@ _APPLIED_HEAD: str = ""
 
 
 def applied_head() -> str:
-    """本进程实际前滚到的 head revision id。"""
+    """本进程建库时前滚到的 head revision id。
+
+    **它是脚本目录算出来的 head，不是从库里读回来的观察值**——建完库之后版本表就被
+    丢弃了（见 `_drop_version_table`）。用它断言"链跑到了哪一条"是够的（值来自
+    真正执行过的那次 `upgrade`），但它证明不了"库里现在确实是这个版本"，
+    需要后者时应当直接查库内对象（内审 P3-3）。
+    """
 
     return _APPLIED_HEAD
 
@@ -47,14 +53,33 @@ def revision_sql() -> tuple[str, str]:
 
     DDL 自 #53 起只存在于 revision 文件里，用例要重放它就得从那里取，
     不能再去读 `migrations/*.sql`——那些编号文件已冻结且不含本切片。
+
+    用 `ast` 静态取常量，**不 import 那个模块**：revision 文件顶部有
+    `from alembic import op`，import 它就等于要求每台跑单测的机器都装 alembic。
+    这个函数在模块导入期就会被调用（用例文件的模块级常量），于是没装 alembic 的
+    裸机上整个测试**发现阶段**就崩，而不是干净地跳过几条真库用例。
+    静态取常量既不需要 alembic，也不会执行 revision 里的任何代码。
     """
 
-    spec = importlib.util.spec_from_file_location("_retention_revision", RETENTION_REVISION)
-    if spec is None or spec.loader is None:  # pragma: no cover - 文件被删时才会走到
-        raise RuntimeError(f"读不到保留清理 revision：{RETENTION_REVISION}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module._UPGRADE_SQL, module._DOWNGRADE_SQL
+    tree = ast.parse(RETENTION_REVISION.read_text(encoding="utf-8"), filename=str(RETENTION_REVISION))
+    found: dict[str, str] = {}
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        if (
+            isinstance(target, ast.Name)
+            and node.value is not None
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            found[target.id] = node.value.value
+    missing = [name for name in ("_UPGRADE_SQL", "_DOWNGRADE_SQL") if name not in found]
+    if missing:
+        raise RuntimeError(f"{RETENTION_REVISION.name} 里找不到 {'、'.join(missing)}")
+    return found["_UPGRADE_SQL"], found["_DOWNGRADE_SQL"]
 
 
 def _connect(dsn: str) -> Any:
@@ -129,6 +154,9 @@ def alembic_upgrade_head(dsn: str) -> str:
             logger = manager.loggerDict.get(name)
             if isinstance(logger, logging.Logger):
                 logger.disabled = was_disabled
+        # 只还原 disabled 位，不还原 root handler / level：alembic 的日志配置会往 root
+        # 上挂自己的 handler 并留在那里。已知无害——测试断言的是具名 logger 上的记录，
+        # root 多一个 handler 只影响控制台多打几行（内审 P3-3 登记）。
     return ScriptDirectory.from_config(config).get_current_head() or ""
 
 

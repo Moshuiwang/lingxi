@@ -95,7 +95,8 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("DELETE FROM galaxy_import_batch")
+            # TRUNCATE 而非 DELETE：删除防线会拒绝删未到期行，见 0054 revision。
+            cursor.execute("TRUNCATE galaxy_import_batch CASCADE")
         self.store = PostgresGalaxyImportStore(self._dsn)
 
     def _count(self, table: str, where: str = "") -> int:
