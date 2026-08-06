@@ -506,7 +506,7 @@ CREATE TABLE galaxy_country (
     name_cn          TEXT,
     region_key       TEXT,
     -- 大区名，实测未覆盖全部国家，不能据此汇总展示公司范围。
-    region_nameX      TEXT,
+    region_name      TEXT,
     boss_company_id  TEXT,
     PRIMARY KEY (batch_id, source_id)
 );
