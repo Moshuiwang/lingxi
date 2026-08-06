@@ -195,9 +195,11 @@ jobs:
 
   # Issue #62：镜像构建与部署门禁。
   #
-  # **与 gate 并行、互不阻塞**：gate 是 5 分钟的快门禁，本 job 要构建三个镜像并且
-  # 每个都构建两次（可复现性判定），慢得多。把它塞进 gate 会让每一次纯代码改动都等
-  # 二十分钟；拆开之后，改代码的人照常在 5 分钟内拿到 gate 结论。
+  # **必须等 gate 与 extras 通过**（codex 审查 P1-4）。上一版让本 job 与 gate 并行，
+  # 理由是"gate 快、别互相拖"——但那样一个门禁没过的提交照样会把镜像推上 GHCR，
+  # 于是 `biai-stage` 能拉到一个测试没过的 tag，而拉它的人无从知道。
+  # 「失败的提交不得获得可部署制品」比「省几分钟」重要，因此加 needs。
+  # 代价是本 job 的开始时间推迟到 gate 结束（约 5 分钟），构建本身不变慢。
   #
   # 刻意**不使用矩阵**：本 job 的多数断言是**跨镜像**的（scheduler 与 worker 里都不许
   # 有 lark-oapi、三个镜像共用同一份 check_installed_package.py 对账），拆成矩阵反而
@@ -207,6 +209,7 @@ jobs:
   image:
     name: CI / image
     runs-on: ubuntu-24.04
+    needs: [gate, extras]
     timeout-minutes: 45
     # M2-62-32：`packages: write` **只在本 job 声明**。workflow 级保持 contents: read，
     # gate 与 extras 不因为本 job 需要推镜像而跟着提权。
