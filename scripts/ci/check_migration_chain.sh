@@ -54,7 +54,15 @@ cleanup() {
   drop_database "${alembic_database}"
   drop_database "${reference_database}"
 }
-trap cleanup EXIT
+
+# 退出时清理，但**保留触发退出的原始状态码**：失败路径上 cleanup 里的 `|| true`
+# 不能把非零退出洗成零。
+on_exit() {
+  local status=$?
+  cleanup
+  exit "${status}"
+}
+trap on_exit EXIT
 
 # scratch 库的连接串由业务 DSN 换库名得到：CI 与本机的端口、口令各不相同，
 # 硬编码任何一处都会让另一处失效。**全程不打印**，它可能带口令（V-迁移-06）。
@@ -303,5 +311,21 @@ if [[ -n "${main_database}" ]]; then
   fi
   printf '主测试库 %s：未被迁移步骤写入（无 alembic_version）\n' "${main_database}"
 fi
+
+# ---------- scratch 库确实被删干净了（V-迁移-06）----------
+# drop_database 为了不掩盖失败路径的原始错误而带了 `|| true`，那也意味着**成功路径上
+# 一次删除失败会被吞掉**：库留在容器里，下一次门禁就会在一个不是空库的 scratch 上
+# 建链，那时的报错与真实原因毫无关系。这里直接查 pg_database 核一遍。
+cleanup
+leftover=$(psql_do postgres -tAc "
+  SELECT datname FROM pg_database
+   WHERE datname IN ('${sql_database}', '${alembic_database}', '${reference_database}')
+   ORDER BY datname;")
+if [[ -n "${leftover}" ]]; then
+  printf '以下 scratch 库没有被删掉：\n%s\n' "${leftover}" >&2
+  printf '留着它们会让下一次门禁在非空库上建链，报出与真实原因无关的错误。\n' >&2
+  exit 1
+fi
+printf 'scratch 库已清理：三个一次性库均已不存在\n'
 
 printf '迁移链检查：全部通过\n'

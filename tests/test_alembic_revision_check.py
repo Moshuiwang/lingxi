@@ -18,18 +18,26 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "ci" / "check_alembic_revisions.py"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "check_alembic_revisions.py"
+DSN_MODULE = REPOSITORY_ROOT / "migrations" / "alembic" / "migration_dsn.py"
 
 
-def _load_script():
-    spec = importlib.util.spec_from_file_location("alembic_revision_check_under_test", SCRIPT)
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-CHECK = _load_script()
+CHECK = _load_module(SCRIPT, "alembic_revision_check_under_test")
+# 纯逻辑模块，不 import alembic：这几条断言在没装 migrate extra 的机器上照样跑。
+DSN = _load_module(DSN_MODULE, "migration_dsn_under_test")
+
+
+def _alembic_available() -> bool:
+    return importlib.util.find_spec("alembic") is not None
 
 
 class AlembicIniTest(unittest.TestCase):
@@ -206,10 +214,70 @@ class EmbeddedCopyTest(unittest.TestCase):
 
 
 class MigrationDsnTest(unittest.TestCase):
-    """env.py 的连接串校验：缺库名必须明确失败（V-迁移-05）。
+    """迁移连接串的校验（V-迁移-05）。
 
-    走真实子进程跑 `python -m alembic current`，因为 env.py 是被 alembic exec 的，
-    没法直接 import。这些用例**不连数据库**——校验在建连接之前就失败。
+    直接测 `migrations/alembic/migration_dsn.py` 的纯函数——它不 import alembic，
+    所以这几条断言在**没装 migrate extra 的机器上照样跑**。此前它们只能通过子进程
+    跑 `python -m alembic` 来验，于是在没有 alembic 的环境里表现为 FAIL 而不是 skip，
+    违反代码框架第四节「无外部依赖可运行」的约定。
+    """
+
+    def test_bare_scheme_gets_the_psycopg3_driver(self) -> None:
+        self.assertEqual(
+            DSN.normalize_database_url("postgresql://postgres@localhost:5432/lingxi"),
+            "postgresql+psycopg://postgres@localhost:5432/lingxi",
+        )
+
+    def test_explicit_psycopg_scheme_is_kept(self) -> None:
+        url = "postgresql+psycopg://postgres@localhost:5432/lingxi"
+        self.assertEqual(DSN.normalize_database_url(url), url)
+
+    def test_dsn_without_database_name_is_rejected(self) -> None:
+        with self.assertRaises(DSN.MigrationDsnError) as caught:
+            DSN.normalize_database_url("postgresql://postgres@localhost:5432")
+        self.assertIn("没有指定数据库名", str(caught.exception))
+
+    def test_dsn_with_empty_path_is_rejected(self) -> None:
+        with self.assertRaises(DSN.MigrationDsnError) as caught:
+            DSN.normalize_database_url("postgresql:///")
+        self.assertIn("没有指定数据库名", str(caught.exception))
+
+    def test_dsn_with_extra_path_segments_is_rejected(self) -> None:
+        with self.assertRaises(DSN.MigrationDsnError):
+            DSN.normalize_database_url("postgresql://postgres@localhost:5432/a/b")
+
+    def test_missing_and_blank_dsn_name_the_variable(self) -> None:
+        for raw in (None, "", "   "):
+            with self.subTest(raw=raw):
+                with self.assertRaises(DSN.MigrationDsnError) as caught:
+                    DSN.normalize_database_url(raw)
+                self.assertIn("LINGXI_MIGRATION_DSN", str(caught.exception))
+
+    def test_non_psycopg_driver_is_rejected(self) -> None:
+        with self.assertRaises(DSN.MigrationDsnError) as caught:
+            DSN.normalize_database_url("postgresql+psycopg2://postgres@localhost:5432/lingxi")
+        self.assertIn("psycopg3", str(caught.exception))
+
+    def test_error_messages_never_echo_the_connection_string(self) -> None:
+        """报错不得回显连接串——它可能带口令，而门禁与部署日志都会留痕。"""
+
+        secret = "hunter2"
+        for raw in (
+            f"mysql://user:{secret}@localhost:3306/lingxi",
+            f"postgresql://user:{secret}@localhost:5432",
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(DSN.MigrationDsnError) as caught:
+                    DSN.normalize_database_url(raw)
+                self.assertNotIn(secret, str(caught.exception))
+
+
+@unittest.skipUnless(_alembic_available(), "跳过：未安装 migrate extra（alembic），env.py 接线未验证")
+class MigrationEnvWiringTest(unittest.TestCase):
+    """env.py 确实调用了上面那段校验（而不是自己另写一份）。
+
+    纯函数用例证明逻辑对，这一条证明**它被接上了**。要真的启动 alembic，所以按
+    仓库对真库测试的同款做法用 skipUnless 声明式跳过，不静默通过。
     """
 
     def _run(self, dsn: str) -> subprocess.CompletedProcess[str]:
@@ -225,25 +293,15 @@ class MigrationDsnTest(unittest.TestCase):
             text=True,
         )
 
-    def test_dsn_without_database_name_is_rejected(self) -> None:
+    def test_env_rejects_dsn_without_database_name(self) -> None:
         result = self._run("postgresql://postgres@localhost:5432")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("没有指定数据库名", result.stderr + result.stdout)
 
-    def test_dsn_with_empty_path_is_rejected(self) -> None:
-        result = self._run("postgresql:///")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("没有指定数据库名", result.stderr + result.stdout)
-
-    def test_empty_dsn_is_rejected_and_names_the_variable(self) -> None:
+    def test_env_does_not_fall_back_to_the_business_dsn(self) -> None:
         result = self._run("")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("LINGXI_MIGRATION_DSN", result.stderr + result.stdout)
-
-    def test_non_psycopg_driver_is_rejected(self) -> None:
-        result = self._run("postgresql+psycopg2://postgres@localhost:5432/lingxi_test")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("psycopg3", result.stderr + result.stdout)
 
 
 class RealRepositoryStateTest(unittest.TestCase):

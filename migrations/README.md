@@ -77,30 +77,89 @@ psql "$LINGXI_LIBPQ_DSN" -c "
          to_regclass('public.galaxy_country')           AS \"012\";"
 
 # 2. 把上一步显示为 NULL 的编号**按顺序**补齐。已经执行过的那几条可以跳过；
-#    真跑了也没关系——编号 SQL 没有 IF NOT EXISTS，加上 ON_ERROR_STOP=1 会立刻
-#    响亮失败，不会造成半成品。**漏跑才是危险方向**：它不会报错，只会让你在
-#    第 3 步 stamp 出一个「缺表却自称已在基线」的库。所以别凭印象跳过，按第 1 步的结果跳。
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/006_create_feishu_delegated_credential.sql
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/007_create_feishu_org_snapshot.sql
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/008_create_app_user.sql
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/010_create_galaxy_import_batch.sql
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/011_create_galaxy_user_and_role.sql
-psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 -f migrations/012_create_galaxy_country_scope.sql
+#    真跑了也没关系——编号 SQL 没有 IF NOT EXISTS，会立刻响亮失败。
+#    **漏跑才是危险方向**：它不会报错，只会让你在第 3 步 stamp 出一个
+#    「缺表却自称已在基线」的库。所以别凭印象跳过，按第 1 步的结果跳。
+#
+#    `--single-transaction` 不能省：psql 默认**逐语句提交**，ON_ERROR_STOP 只是
+#    停下后续语句，已提交的那部分留在库里。那样一次中途失败会留下半个文件的对象，
+#    而重试会卡在文件开头的第一条 CREATE TABLE（「已存在」），进退两难。
+#    加上它，每个文件要么整份生效、要么完全没发生。
+#    （已核对：006–012 里没有任何不能在事务块中执行的语句——无
+#     CREATE INDEX CONCURRENTLY、VACUUM、CREATE DATABASE、ALTER SYSTEM。
+#     将来新增编号 SQL 已被冻结，所以这个前提不会因为新文件而失效。）
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/006_create_feishu_delegated_credential.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/007_create_feishu_org_snapshot.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/008_create_app_user.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/010_create_galaxy_import_batch.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/011_create_galaxy_user_and_role.sql
+psql "$LINGXI_LIBPQ_DSN" -v ON_ERROR_STOP=1 --single-transaction -f migrations/012_create_galaxy_country_scope.sql
 
 # 3. 重跑第 1 步确认六列都不是 NULL，然后只写版本号，不执行任何 DDL。
 python -m alembic stamp 20260806_baseline
 
 # 4. 之后全走 alembic。
 python -m alembic upgrade head
+
+# 5. **终验（不可跳过）**：见下一节。第 1 步的探测只看六张「首表」，
+#    一个被中途打断过的编号文件可能建出了首表却缺兄弟表——那种库的探测结果与
+#    完好的库一模一样，会被 stamp 成一个假基线。终验比对整个 schema，是唯一
+#    能判定接管是否真的完成的步骤。
 ```
 
 > 编号顺序是 `006 → 007 → 008 → 010 → 011 → 012`（`009` 与 `004` 从未使用），
 > 不可乱序：`008` 的触发器要读 `006` 建的表，文件内有硬依赖断言。
 
-第 2 步的 `stamp` 是整个接管流程的关键：它写下「本库已相当于基线」，不碰任何表。
+第 3 步的 `stamp` 是整个接管流程的关键：它写下「本库已相当于基线」，不碰任何表。
 跳过它直接 `upgrade` 会失败（这是好事）；而如果有人为了让它「跑得通」给基线加上
 `IF NOT EXISTS`，失败会变成**沉默的成功**——alembic 记下「基线做过了」，实际什么都没做，
 之后每一条迁移都建立在假的起点上。门禁有一条否定断言守着这一点。
+
+### 第 5 步：终验（接管未经终验不算完成）
+
+第 1 步的探测只查六张**首表**，它回答不了「这个编号文件是不是整份跑完了」。
+一个曾被 `Ctrl-C`、连接中断或磁盘写满打断过的库，可能建出了 `galaxy_import_batch`
+却缺 `galaxy_user`——探测六列全非空，与完好的库看起来一模一样，然后被 `stamp` 成
+一个**假基线**。之后所有迁移都建立在这个假起点上，而第一次报错可能在几个月后。
+
+唯一能判定接管真的完成的办法，是拿整个 schema 去比对一个已知正确的库：
+
+```bash
+# 5.1 建一个全新的对照库，用同一套 alembic 命令把它升到 head。
+#     `lingxi_takeover_check` 是一次性的，验完就删。
+psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "CREATE DATABASE lingxi_takeover_check;"
+LINGXI_MIGRATION_DSN="${LINGXI_MIGRATION_DSN%/*}/lingxi_takeover_check" \
+  python -m alembic upgrade head
+
+# 5.2 归一化导出两边的 schema。
+#     --exclude-table 之外还要滤掉 pg_dump 每次现生成的随机 \restrict/\unrestrict 行
+#     与含版本号的 `-- Dumped` 行，否则同一个库连续两次导出都不相等。
+dump() {
+  pg_dump --schema-only --no-owner --no-privileges --schema=public \
+          --exclude-table=public.alembic_version "$1" |
+    grep -v -E '^(-- Dumped |\\restrict |\\unrestrict )'
+}
+dump "$LINGXI_LIBPQ_DSN" > /tmp/taken_over.sql
+dump "${LINGXI_LIBPQ_DSN%/*}/lingxi_takeover_check" > /tmp/reference.sql
+
+# 5.3 必须零差异。
+diff -u /tmp/reference.sql /tmp/taken_over.sql && echo "接管完成：schema 与全新库一致"
+
+# 5.4 验完删掉对照库。
+psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "DROP DATABASE lingxi_takeover_check;"
+```
+
+**差异非零时的处置**：
+
+- **不要继续使用这个库**，也不要「再补跑一遍缺的文件」——此刻 `alembic_version` 已经
+  写着基线，再补跑会得到一个「版本号说在基线、结构却是手工拼出来」的库，比现在更难判定。
+- 把 `diff` 输出原样报告给产品负责人（它只含结构，不含业务数据，可以直接贴）。
+- 若这是一个可以重建的环境（`biai-stage`、测试库），最干净的处置是**新建一个空库、
+  直接 `alembic upgrade head`**，再按数据导入流程迁数据。
+- 若是生产库，停在这里等决定；不要在未经判定的结构上继续跑迁移。
+
+第 1 步的探测保留为**快速预检**（它能便宜地告诉你要补跑哪几个文件），
+但**判定接管是否完成一律以第 5 步为准**。
 
 ## 可回滚的边界
 
