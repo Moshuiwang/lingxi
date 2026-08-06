@@ -2,12 +2,13 @@
 
 认领断言：`V-接入-01`/`V-接入-02`（事件幂等，顺序与并发）、`V-接入-09`（重复投递的
 用户可见面）、`V-接入-11`（任务归属）、`V-队列-01`…`V-队列-05`（事务边界、抢占回滚、
-失败语义、并发领取、唤醒与兜底轮询）、`V-会话-01`（同话题串行与持有者释放）、
+失败语义、并发领取、入队发通知）、`V-会话-01`（同话题串行与持有者释放）、
 `V-会话-04`（忙碌期消息不入 task 表）、`V-会话-05`/`V-会话-06`（`/new` 与 `/stop` 的
 话题隔离）、`V-会话-08`（排队时长不改变会话归属）、`V-灰度-01`/`V-灰度-02`（版本固化
 与按版本领取）、`V-审计-05`（未开通用户内容不落库）。
 
 唯一索引、条件更新、触发器这类断言必须在真库上验证，不用 mock（验证与门禁第五节）。
+建库走 `tests/postgres_schema.py` 的整条 alembic 链，与生产同源（#53 之后编号 SQL 已冻结）。
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ import os
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from gateway_fakes import CallLog, FakeAudit, FakeReactions, FakeReplies
+from postgres_schema import ensure_production_schema, reset_production_rows
 from lingxi.adapters.postgres_conversation import (
     TASK_QUEUED_CHANNEL,
     PostgresGatewayStore,
@@ -29,18 +30,7 @@ from lingxi.core.conversation.ports import HandledAs
 from lingxi.core.ids import new_id
 
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
-MIGRATIONS = Path(__file__).parents[1] / "migrations"
-# 013 依赖 008（app_user），008 依赖 006。
-MIGRATION_CHAIN = (
-    "006_create_feishu_delegated_credential.sql",
-    "007_create_feishu_org_snapshot.sql",
-    "008_create_app_user.sql",
-    "013_create_conversation_task_inbound_event.sql",
-)
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
-
-# 迁移链每个进程只建一次，见 setUpClass 的说明。
-_SCHEMA_READY = False
 
 
 def inbound(
@@ -65,7 +55,7 @@ def inbound(
 
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
 class GatewayPostgresTestCase(unittest.TestCase):
-    """所有 gateway 真库用例的共同底座：每个用例前按迁移链重建表。"""
+    """所有 gateway 真库用例的共同底座：进程内建一次库，每个用例前只清行。"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -73,55 +63,24 @@ class GatewayPostgresTestCase(unittest.TestCase):
 
         cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
-        # 迁移链**每个进程只跑一次**：逐个用例重建要 1.6 秒，28 个用例就是 45 秒，
-        # 而门禁整体只有 5 分钟。DDL 仍然来自迁移文件本身（不是测试里另抄一份建表
-        # 语句），只是不必为了清数据把它重放 28 遍——清数据用 TRUNCATE。
-        global _SCHEMA_READY
-        if not _SCHEMA_READY:
-            cls._apply_migrations(psycopg, cls._dsn)
-            _SCHEMA_READY = True
+        # 建库走整条 alembic 链，与生产、与 scripts/ci/check_migration_chain.sh 同源
+        # （#53 之后编号 SQL 已冻结，表结构的权威来源是 revision 链）。这里不再自己
+        # 拼一份迁移文件清单——清单会过期，而过期的表现是最坏的一种失败：库里根本
+        # 没有新 revision 建的对象，用例照样全绿。
+        ensure_production_schema(cls._dsn)
 
     def setUp(self) -> None:
-        self.truncate()
+        # 结构不动，只清行；`inbound_event` 自 0057 起是生产表，已在清行范围内。
+        reset_production_rows(self._dsn)
         self.store = PostgresGatewayStore(self._dsn)
         self.queue = PostgresTaskQueue(self._dsn)
         self.log = CallLog()
-
-    def truncate(self) -> None:
-        """清空本切片的四张表。CASCADE 处理 conversation / task 到 app_user 的外键。
-
-        **表不在就重建。** 别的真库测试模块会 ``DROP TABLE app_user CASCADE``
-        （见 ``test_identity_postgres_records.py``），那会连带删掉 ``conversation``
-        与 ``task``。今天不出事只因为 ``unittest discover`` 按模块名排序、``gateway``
-        恰好排在 ``identity`` 前面——把本文件改个名就会炸。不依赖那个巧合
-        （独立复查提出）。
-        """
-
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT to_regclass('public.task') IS NOT NULL")
-            if not cursor.fetchone()[0]:
-                self._apply_migrations(self._psycopg, self._dsn)
-                return
-            cursor.execute(
-                "TRUNCATE task, inbound_event, conversation, app_user RESTART IDENTITY CASCADE"
-            )
-
-    @classmethod
-    def _apply_migrations(cls, psycopg, dsn: str) -> None:
-        with psycopg.connect(dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "DROP TABLE IF EXISTS task CASCADE;"
-                "DROP TABLE IF EXISTS inbound_event CASCADE;"
-                "DROP TABLE IF EXISTS conversation CASCADE;"
-                "DROP TABLE IF EXISTS app_user CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_member_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_department_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_tenant_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_sync_run CASCADE;"
-                "DROP TABLE IF EXISTS feishu_delegated_subject CASCADE;"
-            )
-            for name in MIGRATION_CHAIN:
-                cursor.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
+        # 断言辅助方法共用**一条** autocommit 连接。此前每次 query/execute/scalar 都
+        # 新建一条连接，一个用例十几次断言就是十几次握手——真库这一段的耗时会被
+        # 连接建立本身主导，而门禁整体只有 5 分钟。被测代码自己的连接不受影响
+        # （并发用例仍然各连各的，那是它们要验的东西）。
+        self._connection = self._psycopg.connect(self._dsn, autocommit=True)
+        self.addCleanup(self._connection.close)
 
     # -- 小工具 ---------------------------------------------------------
 
@@ -147,12 +106,12 @@ class GatewayPostgresTestCase(unittest.TestCase):
         )
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with self._connection.cursor() as cursor:
             cursor.execute(sql, parameters)
             return cursor.fetchall()
 
     def execute(self, sql: str, parameters: tuple = ()) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with self._connection.cursor() as cursor:
             cursor.execute(sql, parameters)
 
     def scalar(self, sql: str, parameters: tuple = ()):
