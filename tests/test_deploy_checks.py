@@ -13,6 +13,7 @@ docker，留给 `scripts/ci/verify_image_contract.sh`、`verify_compose_structur
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import textwrap
 import unittest
@@ -207,6 +208,109 @@ class PushFailureClassificationTest(unittest.TestCase):
             "connection refused",
         ):
             self.assertEqual(PUSH.classify_push_failure(message), PUSH.OTHER, message)
+
+
+class ImmutableTagOverwriteTest(unittest.TestCase):
+    """不可变 tag 不得被覆盖（codex 审查 P1-5）。
+
+    `docker push` 默认直接覆盖远端同名 tag。不拦这一下，"同一个 tag 永远指向同一份
+    源码"就只是口头承诺，而回滚正建立在它之上——切回去的人会拿到别的镜像，且无提示。
+    """
+
+    def test_same_content_is_skipped(self) -> None:
+        digest = "sha256:" + "a" * 64
+        self.assertEqual(PUSH.classify_existing_tag(digest, digest), PUSH.TAG_IDENTICAL)
+
+    def test_different_content_is_refused(self) -> None:
+        local = "sha256:" + "a" * 64
+        remote = "sha256:" + "b" * 64
+        self.assertEqual(PUSH.classify_existing_tag(local, remote), PUSH.TAG_CONFLICT)
+
+    def test_unknown_digest_is_refused_not_allowed(self) -> None:
+        # 读不到 digest 时必须**拒绝**，不能当成"大概是同一个"放行。
+        digest = "sha256:" + "a" * 64
+        self.assertEqual(PUSH.classify_existing_tag(digest, None), PUSH.TAG_CONFLICT)
+        self.assertEqual(PUSH.classify_existing_tag(None, digest), PUSH.TAG_CONFLICT)
+
+    def _runner(self, returncode: int, stdout: str = "", stderr: str = ""):
+        return lambda argv: PUSH.CommandResult(returncode, stdout, stderr)
+
+    def test_absent_tag_reports_not_exists(self) -> None:
+        runner = self._runner(1, stderr="manifest unknown: manifest unknown")
+        exists, digest = PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
+        self.assertFalse(exists)
+        self.assertIsNone(digest)
+
+    def test_query_failure_raises_rather_than_assuming_absent(self) -> None:
+        # 网络故障不能被读成"远端没有这个 tag"——那会直接把覆盖放行。
+        runner = self._runner(1, stderr="net/http: TLS handshake timeout")
+        with self.assertRaises(RuntimeError):
+            PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
+
+    def test_existing_tag_returns_config_digest(self) -> None:
+        digest = "sha256:" + "c" * 64
+        runner = self._runner(0, stdout=json.dumps({"config": {"digest": digest}}))
+        exists, found = PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
+        self.assertTrue(exists)
+        self.assertEqual(found, digest)
+
+
+class OverrideBypassTest(unittest.TestCase):
+    """覆盖文件不得把基线里的安全设置改回去（内审 P2-2）。
+
+    compose 的覆盖文件后加载后生效：在 compose.prod.yaml 里写一行 `user: root` 就能
+    把基线整个盖掉，而基线文件一个字没动——只看基线的静态检查会全绿。
+    """
+
+    def _with_override(self, body: str):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        override = directory / "compose.prod.yaml"
+        override.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = override
+        try:
+            return CONTRACT.check_compose_contract()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+
+    def test_override_to_root_is_caught(self) -> None:
+        failures = self._with_override("scheduler:\n  user: root\n")
+        self.assertTrue(any("root" in line for line in failures), failures)
+
+    def test_override_privileged_is_caught(self) -> None:
+        failures = self._with_override("worker:\n  privileged: true\n")
+        self.assertTrue(any("privileged" in line for line in failures), failures)
+
+    def test_override_disabling_read_only_is_caught(self) -> None:
+        failures = self._with_override("scheduler:\n  read_only: false\n")
+        self.assertTrue(any("read_only" in line for line in failures), failures)
+
+    def test_override_shrinking_stop_grace_is_caught(self) -> None:
+        failures = self._with_override("scheduler:\n  stop_grace_period: 10s\n")
+        self.assertTrue(any("stop_grace_period" in line for line in failures), failures)
+
+    def test_override_restarting_a_job_is_caught(self) -> None:
+        failures = self._with_override("worker:\n  restart: always\n")
+        self.assertTrue(any("restart" in line for line in failures), failures)
+
+    def test_shared_env_file_across_services_is_caught(self) -> None:
+        failures = self._with_override(
+            "scheduler:\n  env_file:\n    - ./.env.prod\n"
+            "worker:\n  env_file:\n    - ./.env.prod\n"
+        )
+        self.assertTrue(any("env_file" in line for line in failures), failures)
+
+
+class DatabaseTimeoutTest(unittest.TestCase):
+    """停机上界的依据必须真的写在示例 DSN 里（codex 审查 P1-3）。"""
+
+    def test_real_example_carries_all_three_settings(self) -> None:
+        self.assertEqual(CONTRACT.check_database_timeouts(), [])
+
+    def test_budget_is_derived_from_the_documented_timeouts(self) -> None:
+        # 每次操作 = 建连 + 语句 + 提交；不是只算建连。
+        self.assertEqual(CONTRACT.DATABASE_OPERATION_SECONDS, 11.0)
+        self.assertEqual(CONTRACT.DATABASE_ROUNDTRIP_BUDGET_SECONDS, 55.0)
 
 
 class RealRepositoryTest(unittest.TestCase):

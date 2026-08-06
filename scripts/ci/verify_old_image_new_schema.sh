@@ -61,10 +61,24 @@ step "1/6 起一个一次性 PostgreSQL（端口 ${port}，结束即删）"
 docker run -d --name "${container}" \
   -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=lingxi_vd05 \
   -p "${port}:5432" postgres:16-alpine >/dev/null
-for _ in $(seq 1 60); do
-  docker exec "${container}" pg_isready -U postgres -d lingxi_vd05 >/dev/null 2>&1 && break
+# **连续 3 次成功才算就绪**（Issue #62 验收 P2-2）。postgres 官方镜像的 initdb 会先起
+# 一个只监听 unix socket 的**临时服务器**跑初始化脚本，再关掉它、以最终配置重启。
+# 单次 pg_isready 有可能正好命中那个临时服务器的窗口，于是脚本以为库好了，
+# 紧接着的第一条连接却被拒——一个只在慢机器上偶发的失败。
+consecutive=0
+for _ in $(seq 1 90); do
+  if docker exec "${container}" pg_isready -U postgres -d lingxi_vd05 >/dev/null 2>&1; then
+    consecutive=$((consecutive + 1))
+    [[ "${consecutive}" -ge 3 ]] && break
+  else
+    consecutive=0
+  fi
   sleep 1
 done
+if [[ "${consecutive}" -lt 3 ]]; then
+  printf '  PostgreSQL 未在 90 秒内稳定就绪\n' >&2
+  exit 1
+fi
 docker exec "${container}" pg_isready -U postgres -d lingxi_vd05
 
 dsn="postgresql+psycopg://postgres@127.0.0.1:${port}/lingxi_vd05"
@@ -130,13 +144,26 @@ else
   upgrade_body='op.execute("ALTER TABLE feishu_delegated_subject ADD COLUMN rollout_note text")
     op.execute("CREATE TABLE vd05_added_table (id bigint PRIMARY KEY)")'
 fi
+# **down_revision 必须动态解析，不能硬编码基线**（Issue #62 codex 审查 P2-2）。
+# 写死 `20260806_baseline` 的话，任何一次新增 revision（#54 正在做）合并进来之后，
+# 这条合成迁移就会与新 head 并列成为**第二个 head**，`upgrade head` 当场报
+# "Multiple heads" 并让 CI / image 必炸——而炸的原因与被测对象毫无关系。
+current_head=$(docker run --rm --network host -e LINGXI_MIGRATION_DSN="${dsn}" \
+  --entrypoint python "${migrate_image}" -m alembic -c /opt/lingxi/alembic.ini heads 2>/dev/null \
+  | head -1 | awk '{print $1}')
+if [[ -z "${current_head}" ]]; then
+  printf '  解析不出当前链的 head，无法挂接合成迁移\n' >&2
+  exit 1
+fi
+printf '  当前链 head = %s（合成迁移挂在它后面）\n' "${current_head}"
+
 cat > "${workspace}/20260807_synthetic.py" <<PYTHON
 """合成前滚迁移（Issue #62 的 V-部署-05 演示，运行时生成，不入库）。"""
 
 from alembic import op
 
 revision = "20260807_synthetic"
-down_revision = "20260806_baseline"
+down_revision = "${current_head}"
 branch_labels = None
 depends_on = None
 
@@ -187,7 +214,13 @@ fi
 # `docker diff` 列出容器相对镜像的文件系统改动；跑了几轮扫描之后仍不该有任何日志文件。
 # 顺带覆盖 V-部署-02：除挂载的持久卷外不写需要持久化的本地状态（rootfs 是 read-only，
 # 这里再从改动面确认一次）。
-changes=$(docker diff lingxi62-vd05-scheduler || true)
+# **不加 `|| true`**（Issue #62 验收 P2-1）：取不到改动清单时，`|| true` 会让 changes
+# 变成空串，而空串恰好通过"没有日志文件"的判定——一个拿不到证据却宣告通过的检查。
+if ! changes=$(docker diff lingxi62-vd05-scheduler); then
+  printf '  判否：取不到 docker diff，无法判定容器是否写了日志文件\n' >&2
+  status=1
+  changes=""
+fi
 if printf '%s\n' "${changes}" | grep -qE '\.log$|/var/log/'; then
   printf '  判否：容器内出现了日志文件——日志必须走 stdout/stderr\n' >&2
   printf '%s\n' "${changes}" | sed 's/^/      /' >&2

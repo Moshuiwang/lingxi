@@ -45,16 +45,32 @@ SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__i
 
 # 停止宽限期的数据库往返预算（秒）。
 #
-# 为什么是个常数而不是从代码里读出来的：`psycopg.connect()` 在
-# adapters/delegated_credentials.py 里没有超时参数，libpq 的 connect_timeout 默认是
-# **无限等待**，真正的上界来自部署时 DSN 里的 `connect_timeout`——那个值不在仓库里，
-# 本检查看不见它。deploy/.env.example 因此把 `connect_timeout=5` 列为必填，
-# 这里按最坏情况 5 次往返（4 次 save 重试 + 1 次 revoke）× 5 秒 = 25 秒计。
-DATABASE_ROUNDTRIP_BUDGET_SECONDS = 25.0
+# **上一版这里只算 connect_timeout，那个上界是假的**（Issue #62 codex 审查 P1-3）：
+# `connect_timeout` 只约束建连，一条已经发出去的 SELECT / INSERT / commit 可以无限期
+# 挂着——连接早就建好了。真正的上界需要 DSN 同时带上 `statement_timeout`（约束语句）
+# 与 `lock_timeout`（约束等锁，它不算在 statement_timeout 里）。
+#
+# 这三个值都在部署侧的 DSN 里，本检查看不见运行时的真实值，因此下面按
+# deploy/.env.example 里登记的数字建模，并**另外断言示例 DSN 真的带了这三个参数**
+# （见 check_database_timeouts）——否则这段算法就只是一段好看的注释。
+DSN_CONNECT_TIMEOUT_SECONDS = 5.0
+DSN_STATEMENT_TIMEOUT_SECONDS = 3.0
+# 每次数据库操作 = 建连 + 一条语句 + 一次提交（提交本身也是语句，同样受 statement_timeout）。
+DATABASE_OPERATION_SECONDS = DSN_CONNECT_TIMEOUT_SECONDS + 2 * DSN_STATEMENT_TIMEOUT_SECONDS
+# 最坏 5 次操作：_save_with_retry 的 4 次尝试 + 失败后的 1 次 revoke。
+DATABASE_OPERATION_COUNT = 5
+DATABASE_ROUNDTRIP_BUDGET_SECONDS = DATABASE_OPERATION_SECONDS * DATABASE_OPERATION_COUNT
 
-# 安全系数。宽限期不是"刚好够"就行：`_FileLock` 用的是阻塞式 flock，DSN 的
-# connect_timeout 又是本检查看不见的部署侧配置，两者都可能把实际耗时推高。
-# 乘 1.5 是给这两项不可见量留的余量，也让"把超时改大却不动 compose"必然变红。
+# 示例 DSN 必须带的参数 → 期望值。缺任何一个，上面的预算就没有依据。
+REQUIRED_DSN_SETTINGS = {
+    "connect_timeout": "5",
+    "statement_timeout": "3000",
+    "lock_timeout": "2000",
+}
+
+# 安全系数。宽限期不是"刚好够"就行：`_FileLock` 用的是阻塞式 flock，而 DSN 的三个
+# 超时是部署侧配置、本检查只能按示例建模。乘 1.5 是给这些不可见量留的余量，
+# 也让"把超时改大却不动 compose"必然变红。
 SAFETY_FACTOR = 1.5
 
 # 凭据类环境变量：镜像里一个都不许赋值，仓库文件里也不许出现真值。
@@ -84,6 +100,15 @@ def strip_comments(text: str) -> str:
 
 def read(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def display(path: pathlib.Path) -> str:
+    """报错里显示的路径。仓库外的路径（用例会构造）退化成绝对路径而不是抛异常。"""
+
+    try:
+        return str(path.relative_to(REPOSITORY_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def parse_duration_seconds(raw: str) -> float | None:
@@ -145,6 +170,18 @@ def service_block(compose_text: str, service: str) -> str | None:
     return None
 
 
+def _worst_case_seconds() -> float:
+    """一次在途轮换在最坏情况下还要跑多久（秒）。读不到常量时抛 ValueError。"""
+
+    http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
+    backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
+    if not isinstance(http_timeout, (int, float)):
+        raise ValueError("读不到 REQUEST_TIMEOUT_SECONDS")
+    if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
+        raise ValueError("读不到 SAVE_RETRY_BACKOFF_SECONDS")
+    return float(http_timeout) + float(sum(backoff)) + DATABASE_ROUNDTRIP_BUDGET_SECONDS
+
+
 def check_stop_grace_period() -> list[str]:
     """断言 V-部署-03 / M2-62-24 / M2-62-25：宽限期必须够，而且**与源码常量联动**。
 
@@ -162,7 +199,7 @@ def check_stop_grace_period() -> list[str]:
     if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
         return [f"读不到 {SCHEDULER_APP.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
 
-    worst_case = float(http_timeout) + float(sum(backoff)) + DATABASE_ROUNDTRIP_BUDGET_SECONDS
+    worst_case = _worst_case_seconds()
     required = math.ceil(worst_case * SAFETY_FACTOR)
 
     block = service_block(strip_comments(read(COMPOSE_BASE)), "scheduler")
@@ -196,6 +233,35 @@ def check_stop_grace_period() -> list[str]:
     return failures
 
 
+def check_database_timeouts() -> list[str]:
+    """示例 DSN 必须带齐三个超时参数（Issue #62 codex 审查 P1-3）。
+
+    停止宽限期的算法把"每次数据库操作 ≤ 11 秒"当成前提。那个前提**只有在 DSN 真的带
+    了 statement_timeout 与 lock_timeout 时才成立**——只设 connect_timeout 时，一条卡住
+    的语句可以无限期挂着，宽限期再长也拦不住 SIGKILL 落在"已换新凭据、未写回数据库"
+    的窗口里。模板里写什么，部署时多半就照抄什么，所以这条断言守的是模板。
+    """
+
+    text = read(ENV_EXAMPLE)
+    match = re.search(r"^LINGXI_POSTGRES_DSN=(\S+)\s*$", text, re.MULTILINE)
+    if match is None:
+        return ["deploy/.env.example 里没有 LINGXI_POSTGRES_DSN 示范值"]
+
+    dsn = match.group(1)
+    failures = []
+    for setting, expected in sorted(REQUIRED_DSN_SETTINGS.items()):
+        # DSN 里 options 的空格与等号是 URL 编码的（%20 / %3D），所以两种写法都认。
+        pattern = rf"{re.escape(setting)}(=|%3D){re.escape(expected)}\b"
+        if not re.search(pattern, dsn, re.IGNORECASE):
+            failures.append(
+                f"deploy/.env.example 的 LINGXI_POSTGRES_DSN 没有 `{setting}={expected}`。"
+                f"\n      停止宽限期按「每次数据库操作 ≤ "
+                f"{DATABASE_OPERATION_SECONDS:.0f} 秒」建模，而这个上界正是由这三个参数给出的。"
+                "\n      只设 connect_timeout 拦不住已经发出去的语句——那是一个假的上界。"
+            )
+    return failures
+
+
 def check_compose_contract() -> list[str]:
     failures: list[str] = []
     base = strip_comments(read(COMPOSE_BASE))
@@ -205,7 +271,7 @@ def check_compose_contract() -> list[str]:
         text = strip_comments(read(path))
         if re.search(r"^\s*build:\s*$|^\s*build:\s+\S", text, re.MULTILINE):
             failures.append(
-                f"{path.relative_to(REPOSITORY_ROOT)} 含 `build:` 键。生产只拉镜像、不构建"
+                f"{display(path)} 含 `build:` 键。生产只拉镜像、不构建"
                 "（架构设计「八、部署与发布」）：compose 里存在构建定义，"
                 "`biplus-prod` 上就存在「顺手改一行再 build 一下」这条路径，"
                 "镜像 tag 就不再是被冻结的版本。"
@@ -222,9 +288,18 @@ def check_compose_contract() -> list[str]:
             if "@sha256:" in reference:
                 continue
             if "${LINGXI_IMAGE_TAG" in reference:
+                # `${VAR:-默认}` 带默认值＝漏设变量时**静默**用上那个默认，而默认值
+                # 可以是任何东西（包括 latest）。必须是 `${VAR:?...}` 的"缺了就报错退出"
+                # 形态（内审 P2-2）。
+                if re.search(r"\$\{LINGXI_IMAGE_(TAG|REGISTRY)[^}]*:-", reference):
+                    failures.append(
+                        f"{display(path)}:{line_number} 的镜像引用 "
+                        f"`{reference}` 用了 `${{VAR:-默认}}` 形态。带默认值意味着漏设变量时"
+                        "会**静默**拉一个别的镜像；必须用 `${VAR:?说明}`，缺了就报错退出。"
+                    )
                 continue
             failures.append(
-                f"{path.relative_to(REPOSITORY_ROOT)}:{line_number} 的镜像引用 "
+                f"{display(path)}:{line_number} 的镜像引用 "
                 f"`{reference}` 不是不可变引用。必须是 `@sha256:...`，"
                 "或 tag 取自 ${LINGXI_IMAGE_TAG}（其值形如 <YYYYMMDD>-<12 位 sha>）。"
                 "禁止 latest 或分支名——它们会让「切回上一个 tag」这个回滚动作失去意义。"
@@ -308,6 +383,67 @@ def check_compose_contract() -> list[str]:
         if re.search(r"^\s*privileged:\s*true", block, re.MULTILINE):
             failures.append(f"{name} 配了 privileged: true")
 
+    # ---- 覆盖文件不得把基线里的安全设置改回去（内审 P2-2）--------------------
+    # 上面全部只看 deploy/compose.yaml。compose 的覆盖文件是**后加载后生效**的：
+    # 在 compose.prod.yaml 里写一行 `user: root` 或 `privileged: true` 就能把基线的
+    # 设置整个盖掉，而基线文件本身一个字没动——静态检查全绿，实际以 root 跑。
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        text = strip_comments(read(path))
+        for service in ("scheduler", "worker", "migrate"):
+            block = service_block(text, service)
+            if block is None:
+                continue
+            user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
+            if user is not None and user.group(1).strip("'\"").split(":")[0] in {"0", "root"}:
+                failures.append(
+                    f"{display(path)} 的 {service} 用覆盖把 user 改成了 root"
+                )
+            if re.search(r"^\s*cap_add:", block, re.MULTILINE):
+                failures.append(f"{display(path)} 的 {service} 用覆盖加了 cap_add")
+            if re.search(r"^\s*privileged:\s*true", block, re.MULTILINE):
+                failures.append(f"{display(path)} 的 {service} 用覆盖加了 privileged")
+            if re.search(r"^\s*read_only:\s*false", block, re.MULTILINE):
+                failures.append(f"{display(path)} 的 {service} 用覆盖关掉了 read_only")
+            grace = re.search(r"^\s*stop_grace_period:\s*(\S+)\s*$", block, re.MULTILINE)
+            if grace is not None:
+                seconds = parse_duration_seconds(grace.group(1))
+                required = math.ceil(_worst_case_seconds() * SAFETY_FACTOR)
+                if seconds is None or seconds < required:
+                    failures.append(
+                        f"{display(path)} 的 {service} 用覆盖把 "
+                        f"stop_grace_period 改成了 {grace.group(1)}，低于要求的 {required} 秒"
+                    )
+            restart = re.search(r"^\s*restart:\s*(\S+)\s*$", block, re.MULTILINE)
+            if restart is not None and service in {"worker", "migrate"}:
+                if restart.group(1).strip("'\"") != "no":
+                    failures.append(
+                        f"{display(path)} 的 {service} 用覆盖把 restart "
+                        f"改成了 {restart.group(1)}；一次性作业必须是 \"no\""
+                    )
+
+    # ---- 凭据按服务分文件（codex 审查 P1-1）---------------------------------
+    # 三个服务共用一个 env_file 时，worker 会拿到数据库连接串、Fernet 密钥与飞书密钥。
+    # 这不是"多给几个变量"：worker 跑 Agent SDK，SDK 把进程环境继承给 Claude CLI 与
+    # 每个 MCP 子进程，于是那些凭据一路流进模型执行环境——正是产品合同「凭据不进用户
+    # 环境」要挡的方向。
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        text = strip_comments(read(path))
+        seen: dict[str, list[str]] = {}
+        for service in ("scheduler", "worker", "migrate"):
+            block = service_block(text, service)
+            if block is None:
+                continue
+            for env_file in re.findall(r"^\s*-\s*(\./\S+)\s*$", block, re.MULTILINE):
+                seen.setdefault(env_file, []).append(service)
+        for env_file, services in sorted(seen.items()):
+            if len(services) > 1:
+                failures.append(
+                    f"{display(path)}：{'、'.join(services)} 共用同一个 "
+                    f"env_file `{env_file}`。凭据必须按服务分文件——worker 跑 Agent SDK，"
+                    "SDK 会把进程环境继承给 Claude CLI 与 MCP 子进程，共享 env 等于把"
+                    "数据库与飞书凭据送进模型执行环境。"
+                )
+
     return failures
 
 
@@ -367,21 +503,35 @@ def check_dockerignore() -> list[str]:
         for line in read(DOCKERIGNORE).splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
-    required = {
+    failures = []
+
+    # 顶层就够的：这几样只会出现在上下文根目录。
+    for entry, reason in {
         ".git": "版本控制目录会把整个历史带进构建上下文",
         ".claude": "代理工作现场不属于制品",
-        ".venv": "本机虚拟环境内嵌宿主机绝对路径",
-        "__pycache__": "宿主机编译的 .pyc 内嵌构建目录绝对路径，同时破坏可复现构建与路径不泄漏",
         ".env": "凭据文件绝不进构建上下文",
-    }
-    failures = []
-    for entry, reason in required.items():
+    }.items():
         if not any(item == entry or item.startswith(entry) for item in entries):
             failures.append(f".dockerignore 没有排除 `{entry}`：{reason}")
-    if not any(item.startswith("*.py") and "c" in item for item in entries):
-        failures.append(".dockerignore 没有排除 `*.py[cod]` 一类的字节码文件")
-    if not any(item.startswith(".env") for item in entries):
-        failures.append(".dockerignore 没有排除 `.env*`")
+
+    # **必须带 `**/` 前缀**（内审 P1-2）。Docker 的排除模式按 Go 的 filepath.Match
+    # 语义匹配整条相对路径，其中 `*` 不跨 `/`：裸写 `__pycache__` 只排除上下文根目录下
+    # 的那一个，`migrations/alembic/__pycache__` 照样会被打包进去。而本仓库跑一次
+    # alembic 门禁就会生成它——排除清单看起来写了、实际没生效，是最难发现的一类。
+    for entry, reason in {
+        "**/__pycache__": "嵌套的 __pycache__（本仓库跑一次门禁就会在 migrations/alembic/ 下生成）",
+        "**/*.py[cod]": "嵌套的字节码文件；它内嵌宿主机绝对路径，同时破坏可复现构建与路径不泄漏",
+        "**/.venv": "嵌套的本机虚拟环境",
+    }.items():
+        if entry not in entries:
+            bare = entry[3:]
+            if any(item == bare for item in entries):
+                failures.append(
+                    f".dockerignore 写的是裸 `{bare}`，必须写成 `{entry}`："
+                    f"裸模式只匹配上下文根目录下的那一个，不匹配{reason}。"
+                )
+            else:
+                failures.append(f".dockerignore 没有排除 `{entry}`：{reason}")
     return failures
 
 
@@ -426,6 +576,7 @@ def check_ci_workflow() -> list[str]:
 def main() -> int:
     checks = (
         ("停止宽限期与源码常量联动", check_stop_grace_period),
+        ("数据库超时与停机上界依据", check_database_timeouts),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
         (".dockerignore 覆盖面", check_dockerignore),
@@ -444,12 +595,14 @@ def main() -> int:
 
     http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
     backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
-    worst_case = float(http_timeout) + float(sum(backoff)) + DATABASE_ROUNDTRIP_BUDGET_SECONDS
+    worst_case = _worst_case_seconds()
     print(
         "部署编排契约：通过（Dockerfile、deploy/ 下 3 个 compose、.dockerignore、ci.yml）\n"
-        f"  停止宽限期：最坏 {worst_case:.1f}s"
-        f"（HTTP {http_timeout}s + 退避 {sum(backoff)}s + 数据库 {DATABASE_ROUNDTRIP_BUDGET_SECONDS}s）"
-        f" × {SAFETY_FACTOR} → 要求 ≥ {math.ceil(worst_case * SAFETY_FACTOR)}s"
+        f"  停止宽限期：最坏 {worst_case:.1f}s（续期 HTTP {http_timeout}s + 落盘退避 "
+        f"{sum(backoff)}s + 数据库 {DATABASE_ROUNDTRIP_BUDGET_SECONDS:.0f}s ="
+        f" {DATABASE_OPERATION_COUNT} 次操作 × {DATABASE_OPERATION_SECONDS:.0f}s）"
+        f" × {SAFETY_FACTOR} → 要求 ≥ {math.ceil(worst_case * SAFETY_FACTOR)}s\n"
+        f"  示例 DSN 已带 {'、'.join(sorted(REQUIRED_DSN_SETTINGS))}，上界因此有依据"
     )
     return 0
 

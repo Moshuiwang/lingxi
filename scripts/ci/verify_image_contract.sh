@@ -23,17 +23,30 @@ note() { printf '  %s\n' "$1"; }
 fail() { printf '  判否：%s\n' "$1" >&2; failures=$((failures + 1)); }
 step() { printf '\n=== %s ===\n' "$1"; }
 
-# rootfs 全量文件清单。用 `docker export`（展平后的容器文件系统）而不是逐 layer：
-# 判定"最终镜像里有没有这个文件"就该看最终状态，被上层删掉的中间产物不该算数。
-rootfs_listing() {
-  local image=$1 container listing
+# rootfs 全量文件清单，**写进文件**再给 grep 用。用 `docker export`（展平后的容器
+# 文件系统）而不是逐 layer：判定"最终镜像里有没有这个文件"就该看最终状态。
+#
+# **为什么必须落文件，而不是 `printf "$listing" | grep -q`**（Issue #62 内审 P1-1）：
+# `grep -q` 命中后立即退出，上游 printf 随即拿到 SIGPIPE 而非零退出，`set -o pipefail`
+# 于是把**整条管道**判为失败，`if` 把它读成"没命中"。净效果是：**清单里真的有违规项
+# 时检查反而不报**，而干净时一切正常——一个只在出事时失灵的检查。
+#
+# 这不是推测。上一版就是管道写法，实测：往镜像里塞进 /scripts、/tests 和
+# /opt/lingxi/migrations/testing 三个违规目录后，`verify_image_contract.sh` 依然
+# 全绿退出 0；同一份清单用 `grep -c` 数得到 2 处命中。落文件之后立刻变红。
+rootfs_listing_to() {
+  local image=$1 destination=$2 container
   container=$(docker create "${image}")
-  listing=$(docker export "${container}" | tar -t 2>/dev/null)
+  docker export "${container}" > "${destination}.tar"
   docker rm -f "${container}" >/dev/null
-  printf '%s\n' "${listing}"
+  tar -tf "${destination}.tar" > "${destination}"
+  rm -f "${destination}.tar"
 }
 
-step "1/8 非 root 运行（V-部署-07 / M2-62-29）"
+workspace=$(mktemp -d -t lingxi62-contract-XXXXXX)
+trap 'rm -rf "${workspace}"' EXIT
+
+step "1/10 非 root 运行（V-部署-07 / M2-62-29）"
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   configured_user=$(docker inspect --format '{{.Config.User}}' "${image}")
@@ -50,7 +63,7 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${m
   fi
 done
 
-step "2/8 解释器版本满足 pyproject 声明（V-部署-09 镜像面 / M2-62-09）"
+step "2/10 解释器版本满足 pyproject 声明（V-部署-09 镜像面 / M2-62-09）"
 declared=$(sed -n 's/^requires-python = ">=\([0-9]\+\.[0-9]\+\)"$/\1/p' pyproject.toml)
 [[ -n "${declared}" ]] || fail "读不到 pyproject.toml 的 requires-python"
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
@@ -64,7 +77,7 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${m
   fi
 done
 
-step "3/8 bot-test 依赖不进生产镜像（M2-62-10）"
+step "3/10 bot-test 依赖不进生产镜像（M2-62-10）"
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   for module in lark_oapi websockets; do
@@ -83,39 +96,52 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}"; do
 done
 note "scheduler 与 worker 均未装 SQLAlchemy"
 
-step "4/8 非生产资产不进镜像（M2-62-11）与构建上下文不泄漏（M2-62-06 / M2-62-08）"
+step "4/10 非生产资产不进镜像（M2-62-11）与构建上下文不泄漏（M2-62-06 / M2-62-08）"
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
-  listing=$(rootfs_listing "${image}")
+  listing="${workspace}/${name}.listing"
+  rootfs_listing_to "${image}" "${listing}"
+  note "${name}: rootfs 清单 $(wc -l < "${listing}") 条"
+
   # 路径**锚定**在 rootfs 根与 /opt/lingxi 下，不做全局子串匹配：第三方包里带
   # `tests/` 目录是常见的（`docker export | tar -t` 输出不含前导斜杠），
   # 全局匹配会在某次依赖升级后凭空变红，然后有人把这条检查删掉。
   # 这里要问的是"**我们仓库的**非生产目录有没有被 COPY 进去"，只有这两处可能。
   for forbidden in 'scripts/' 'tests/' 'experiments/' 'workers/' 'docs/' '.git/'; do
-    if printf '%s\n' "${listing}" | grep -qE "^(${forbidden}|opt/lingxi/${forbidden})"; then
+    if grep -qE "^(${forbidden}|opt/lingxi/${forbidden})" "${listing}"; then
       fail "${name} 的 rootfs 含 ${forbidden}"
     fi
   done
   # 测试资产迁移不属于生产链，绝不能随 migrate 镜像发出去。
-  if printf '%s\n' "${listing}" | grep -qE '^opt/lingxi/migrations/testing/'; then
+  if grep -qE '^opt/lingxi/migrations/testing/' "${listing}"; then
     fail "${name} 的 rootfs 含 migrations/testing/（测试资产不属于生产链）"
   fi
-  # 构建目录路径不得出现在 rootfs 的文件名里。
-  if printf '%s\n' "${listing}" | grep -q '^build/'; then
+  # 构建目录路径不得出现在 rootfs 里。
+  if grep -qE '^build/' "${listing}"; then
     fail "${name} 的 rootfs 含构建上下文目录 /build"
   fi
-  # 宿主机编译的 .pyc 会内嵌构建目录绝对路径；镜像内自己编的不会。
-  if printf '%s\n' "${listing}" | grep -q '\.pyc$'; then
-    if docker run --rm --entrypoint sh "${image}" -c \
-        'grep -rl "/home/\|/tmp/lingxi\|second-copy" /usr/local/lib/python3.12/site-packages --include="*.pyc" 2>/dev/null | head -1' \
-        | grep -q .; then
-      fail "${name} 的 .pyc 里内嵌了宿主机路径"
+  # 我们 COPY 进去的代码下面不许有任何 __pycache__ 或字节码：那只可能来自宿主机
+  # （镜像内的 compileall 只编 site-packages）。.dockerignore 的 `**/` 前缀就是
+  # 为这一条服务的，裸模式匹配不到嵌套目录（内审 P1-2）。
+  if grep -qE '^opt/lingxi/.*(__pycache__|\.py[cod]$)' "${listing}"; then
+    fail "${name} 的 /opt/lingxi 下有 __pycache__ 或字节码——宿主机产物混进了制品"
+  fi
+
+  # 宿主机路径泄漏：只扫**我们自己 COPY 进去的** /opt/lingxi，不扫 site-packages。
+  # 上一版拿 `/home/` 去扫整个 site-packages，会被 SQLAlchemy 的 docstring 与
+  # SDK 自带 .pyc 里的示例路径误伤（内审点名的反向地雷）。这里改用构建上下文的
+  # 特征串——它只可能来自"宿主机编译产物被 COPY 进来"这一种情况。
+  if docker run --rm --entrypoint sh "${image}" -c \
+      'test -d /opt/lingxi && grep -rlE "/(home|Users)/[a-z]+/|/build/src/lingxi" /opt/lingxi 2>/dev/null | head -1' \
+      > "${workspace}/${name}.leak" 2>/dev/null; then
+    if [[ -s "${workspace}/${name}.leak" ]]; then
+      fail "${name} 的 /opt/lingxi 下有文件内嵌宿主机路径：$(head -1 "${workspace}/${name}.leak")"
     fi
   fi
-  note "${name}: rootfs 无非生产资产、无构建上下文、无宿主机路径泄漏"
+  note "${name}: 无非生产资产、无构建上下文、无宿主机路径泄漏"
 done
 
-step "5/8 镜像里不预置任何凭据（M2-62-16）"
+step "5/10 镜像里不预置任何凭据（M2-62-16）"
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   env_json=$(docker inspect --format '{{json .Config.Env}}' "${image}")
@@ -129,7 +155,7 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${m
   note "${name}: .Config.Env 无任何凭据变量赋值"
 done
 
-step "6/8 已安装制品与进程运行依赖（V-部署-10 / M2-62-12）"
+step "6/10 已安装制品与进程运行依赖（V-部署-10 / M2-62-12）"
 # 关键：跑的是**未经修改的** check_installed_package.py，工作目录在源码树之外，
 # 仓库以只读挂载。改脚本或放宽 _INSTALL_MARKERS 来"跑通"就等于把这条断言作废。
 for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
@@ -143,7 +169,7 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${m
   rm -f /tmp/lingxi-installed-$$.log
 done
 
-step "7/8 迁移随镜像进制品且与提交逐字节一致（M2-62-21）"
+step "7/10 迁移随镜像进制品且与提交逐字节一致（M2-62-21）"
 if docker run --rm --entrypoint sh "${migrate_image}" -c 'test -f /opt/lingxi/alembic.ini'; then
   image_sum=$(docker run --rm --entrypoint sha256sum "${migrate_image}" /opt/lingxi/alembic.ini | awk '{print $1}')
   local_sum=$(sha256sum alembic.ini | awk '{print $1}')
@@ -167,7 +193,7 @@ for revision in migrations/alembic/versions/*.py; do
   fi
 done
 
-step "8/8 迁移入口不依赖工作目录（M2-62-22）与失败语义（M2-62-23）"
+step "8/10 迁移入口不依赖工作目录（M2-62-22）与失败语义（M2-62-23）"
 # 不设 DSN：必须非零退出、报错明确、且不连任何默认库。
 if docker run --rm -w / "${migrate_image}" current >/tmp/lingxi-nodsn-$$.log 2>&1; then
   fail "未设 LINGXI_MIGRATION_DSN 时迁移居然成功了"
@@ -179,6 +205,60 @@ else
   fi
 fi
 rm -f /tmp/lingxi-nodsn-$$.log
+
+step "9/10 worker 内嵌 Claude CLI 真的能在本镜像里跑起来（V-部署-06 平台面）"
+# Dockerfile 声称"底座必须是 glibc、构建平台必须与运行平台一致"。声称不是断言：
+# claude-agent-sdk 的 wheel 是平台专属的（manylinux_2_17_x86_64），内嵌的 CLI 是
+# **动态链接的 ELF**（解释器 /lib64/ld-linux-x86-64.so.2）。换成 alpine/musl 底座会
+# 装得上、跑不起来；跨架构构建会拿到另一个（或没有）内嵌 CLI。两种情况都只在
+# worker 真的执行一个回合时才暴露——那已经是一次用户请求失败了。
+# 本步不调模型、不用凭据、不联网，只让 CLI 自报版本（内审 P2-1，已实测离线可行）。
+bundled_cli=/usr/local/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude
+if docker run --rm --entrypoint sh "${worker_image}" -c "test -x ${bundled_cli}"; then
+  if cli_version=$(docker run --rm --entrypoint "${bundled_cli}" "${worker_image}" --version 2>&1); then
+    note "worker: 内嵌 Claude CLI 可执行，自报 ${cli_version}"
+  else
+    fail "worker 的内嵌 Claude CLI 跑不起来（底座不是 glibc？架构不匹配？）：${cli_version}"
+  fi
+else
+  fail "worker 镜像里没有可执行的内嵌 Claude CLI（${bundled_cli}）——SDK 会回落到 npm 安装的 claude，而镜像里没有 Node"
+fi
+
+step "10/10 rootfs 内容级凭据扫描（M2-62-16 的另一半）"
+# 第 5 步只看 .Config.Env。凭据同样可能以**文件**形式混进镜像：一份误 COPY 的 .env、
+# 一个私钥、一段带口令的连接串。借第 4 步已经落盘的清单再做一次内容级扫描
+# （内审 P2-5）。用 docker run 在镜像内 grep，不把内容捞到宿主机上。
+for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+  name=${pair%%:*}; image=${pair#*:}
+  listing="${workspace}/${name}.listing"
+  # 形态一：.env 类文件根本不该存在于镜像里。
+  if grep -qE '(^|/)\.env($|\.)' "${listing}"; then
+    fail "${name} 的 rootfs 含 .env 类文件"
+  fi
+  # 形态二 / 三：私钥与带口令的连接串。只扫我们自己的 /opt/lingxi 与 /etc、/root，
+  # 不扫 site-packages——第三方包的测试夹具里有示例私钥是常见的，扫它只会制造噪声。
+  if docker run --rm --entrypoint sh "${image}" -c \
+      'grep -rlE "BEGIN ([A-Z0-9]+ )?PRIVATE KEY|postgres(ql)?://[^:/@[:space:]]+:[^@[:space:]]+@" \
+         /etc /root /opt 2>/dev/null | head -1' > "${workspace}/${name}.secret" 2>/dev/null; then
+    if [[ -s "${workspace}/${name}.secret" ]]; then
+      fail "${name} 的 rootfs 疑似含私钥或带口令的连接串：$(head -1 "${workspace}/${name}.secret")"
+    fi
+  fi
+  # 形态四：凭据变量名被**赋了真值**写进某个文件（而不是 .Config.Env）。
+  #
+  # 排除 *.md 并排除占位值（`<...>`、`$...`、空）：migrations/README.md 里就有
+  # `export LINGXI_MIGRATION_DSN='postgresql://<用户>@<主机>/<库>'` 这样的操作说明，
+  # 那是文档不是凭据。第一次跑这条扫描就被它误伤了——一个会对文档报警的安全检查，
+  # 最后一定会被人关掉。
+  if docker run --rm --entrypoint sh "${image}" -c \
+      'grep -rlE "LINGXI_(DELEGATED_CREDENTIAL_KEY|FEISHU_APP_SECRET|POSTGRES_DSN|MIGRATION_DSN|OAUTH_REFRESH_TOKEN_KEY)=[^<$\"'"'"' ]" \
+         --exclude="*.md" --exclude="*.rst" /etc /root /opt 2>/dev/null | head -1' > "${workspace}/${name}.varfile" 2>/dev/null; then
+    if [[ -s "${workspace}/${name}.varfile" ]]; then
+      fail "${name} 的 rootfs 里有文件给凭据变量赋了值：$(head -1 "${workspace}/${name}.varfile")"
+    fi
+  fi
+  note "${name}: rootfs 内容级凭据扫描通过"
+done
 
 printf '\n'
 if [[ "${failures}" -gt 0 ]]; then

@@ -9,6 +9,9 @@
 # 的最终形态，而这正是部署时真正生效的东西。
 #
 # 允许不同的：镜像 tag 值、env_file 指向、具名卷的实际名字、扫描间隔。
+# 摘要里刻意没有 env_file：`compose config` 会把 env_file 的内容展开进 environment，
+# 渲染结果里根本没有这个键，比它只会得到恒为 0 的假断言。凭据必须按服务分文件
+# 这一条由 check_deploy_contract.py 在**源文件**层面守（codex 审查 P1-1）。
 # 不允许不同的：service 名集合、镜像仓库路径、容器内挂载点集合、非 root 与只读设置。
 #     一旦这几样在两个环境之间分叉，"stage 验过了所以生产也没问题"这句话就不成立了。
 
@@ -23,7 +26,12 @@ workspace=$(mktemp -d -t lingxi62-compose-XXXXXX)
 # compose 的 env_file 默认是必需的：文件不存在时 `config` 直接报错。这里造两个**空的**
 # 占位文件让渲染能跑完。它们匹配 .gitignore 既有的 `.env.*` 规则，因此不会污染工作树，
 # 也不会被 gate 的「CI 未改写受版本控制的文件」那一步看到。
-placeholders=(deploy/.env.stage deploy/.env.prod)
+# 凭据按服务分文件（codex 审查 P1-1），因此占位文件也要按服务建齐，
+# 否则 `compose config` 会在 env_file 不存在时直接报错。
+placeholders=(
+  deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.worker deploy/.env.stage.migrate
+  deploy/.env.prod  deploy/.env.prod.scheduler  deploy/.env.prod.worker  deploy/.env.prod.migrate
+)
 created=()
 cleanup() {
   rm -rf "${workspace}"
@@ -67,6 +75,9 @@ for name in sorted(document.get("services", {})):
     lines.append("  mounts=" + str(mounts))
     lines.append("  cap_add=" + str(service.get("cap_add")))
     lines.append("  privileged=" + str(service.get("privileged")))
+    lines.append("  security_opt=" + str(sorted(service.get("security_opt") or [])))
+    lines.append("  tmpfs=" + str(sorted(service.get("tmpfs") or [])))
+    lines.append("  profiles=" + str(sorted(service.get("profiles") or [])))
 print("\n".join(lines))
 PYTHON
 )

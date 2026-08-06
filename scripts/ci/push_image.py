@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import subprocess
@@ -57,6 +58,10 @@ PERMISSION_PATTERNS = (
 PERMISSION = "permission"
 OTHER = "other"
 
+# 远端已有同名 tag 时的两种情形。
+TAG_IDENTICAL = "identical"   # 同一个镜像，重跑而已 → 跳过，幂等
+TAG_CONFLICT = "conflict"     # 内容不同 → 拒绝，不可变 tag 不得被覆盖
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -81,6 +86,52 @@ def classify_push_failure(output: str) -> str:
         if re.search(pattern, lowered):
             return PERMISSION
     return OTHER
+
+
+def remote_config_digest(reference: str, runner=run_command) -> tuple[bool, str | None]:
+    """远端同名 tag 的 config digest。返回 (是否存在, config digest)。
+
+    config digest 就是本地 `docker inspect --format {{.Id}}` 给出的那个值——镜像配置
+    blob 的 sha256。拿它比对，是在**推送之前**判断"远端那个 tag 是不是同一个镜像"的
+    唯一办法：manifest digest 要推上去才知道。
+    """
+
+    result = runner(["docker", "manifest", "inspect", reference])
+    if result.returncode != 0:
+        # 不存在与"查不了"要分开：措辞里带 not found / unknown 才算不存在。
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if re.search(r"not found|manifest unknown|no such manifest|not exist", combined):
+            return False, None
+        raise RuntimeError(f"无法查询远端 tag {reference}：{result.stderr.strip()}")
+    try:
+        document = json.loads(result.stdout)
+    except ValueError as error:
+        raise RuntimeError(f"远端 manifest 不是合法 JSON：{error}") from None
+    if "manifests" in document:
+        # 多架构清单：本仓库只构建单架构，出现它说明远端那个 tag 不是我们推的。
+        return True, None
+    digest = (document.get("config") or {}).get("digest")
+    return True, digest
+
+
+def local_config_digest(reference: str, runner=run_command) -> str | None:
+    result = runner(["docker", "inspect", "--format", "{{.Id}}", reference])
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def classify_existing_tag(local: str | None, remote: str | None) -> str:
+    """远端已存在同名 tag 时该怎么办。
+
+    不可变 tag 的全部意义在于"同一个 tag 永远指向同一份源码"，而回滚就是切回上一个
+    tag。**`docker push` 默认会直接覆盖远端同名 tag**——一次重跑、一次手滑，
+    上周那个 tag 就指向别的东西了，而回滚的人不会知道（codex 审查 P1-5）。
+    """
+
+    if remote is None or local is None:
+        return TAG_CONFLICT
+    return TAG_IDENTICAL if remote == local else TAG_CONFLICT
 
 
 def read_back_digest(reference: str, runner=run_command) -> str | None:
@@ -113,6 +164,48 @@ def main() -> int:
     args = parser.parse_args()
 
     reference = args.reference
+
+    # ---- 推送前：不可变 tag 不得被覆盖（codex 审查 P1-5）--------------------
+    # `docker push` 默认直接覆盖远端同名 tag。不拦这一下，"同一个 tag 永远指向同一份
+    # 源码"这条承诺就只是口头的，而回滚正建立在它之上。
+    try:
+        exists, remote_digest = remote_config_digest(reference)
+    except RuntimeError as error:
+        print(f"推送前无法确认远端 tag 状态，拒绝推送：{error}", file=sys.stderr)
+        return 1
+
+    if exists:
+        local_digest = local_config_digest(reference)
+        verdict = classify_existing_tag(local_digest, remote_digest)
+        if verdict is TAG_CONFLICT:
+            print(
+                f"拒绝推送：远端已存在 {reference}，且内容与本地不同。\n"
+                f"  远端 config digest：{remote_digest}\n"
+                f"  本地 config digest：{local_digest}\n"
+                "  不可变 tag 一旦被覆盖，'回滚 = 切回上一个 tag' 就不再成立——"
+                "切回去的人拿到的会是别的镜像，而且没有任何提示。\n"
+                "  正确做法是用新的提交产出新的 tag，不是覆盖旧的。",
+                file=sys.stderr,
+            )
+            write_line(args.output_file, "pushed=false")
+            write_line(
+                args.summary_file,
+                f"### 拒绝推送：不可变 tag 会被覆盖\n\n"
+                f"- 引用：`{reference}`\n"
+                f"- 远端 config digest：`{remote_digest}`\n"
+                f"- 本地 config digest：`{local_digest}`\n",
+            )
+            return 1
+        print(f"远端已存在 {reference} 且内容一致（{remote_digest}），跳过推送。")
+        write_line(args.output_file, "pushed=skipped")
+        write_line(args.output_file, f"digest={remote_digest}")
+        write_line(
+            args.summary_file,
+            f"### 镜像已在 GHCR，内容一致，跳过推送\n\n"
+            f"- 引用：`{reference}`\n- config digest：`{remote_digest}`\n",
+        )
+        return 0
+
     print(f"推送 {reference}")
     result = run_command(["docker", "push", reference])
     combined = f"{result.stdout}\n{result.stderr}"
