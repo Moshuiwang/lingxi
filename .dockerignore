@@ -1,0 +1,49 @@
+# 构建上下文排除清单（Issue #62）。
+#
+# 这份清单同时服务三条断言，不只是"让上下文小一点"：
+#
+#   - 可复现构建（V-部署-06）：`__pycache__` 里的 `.pyc` 是在**宿主机**上编译的，
+#     其 code object 的 `co_filename` 内嵌宿主机绝对路径。两个不同路径的干净 clone
+#     各构建一次，若把它们 COPY 进去，两份 rootfs 必然不同——而且差异来自构建机的
+#     本地状态，正是 V-部署-06 要禁止的那一类。
+#   - 路径不泄漏：同上，构建目录的绝对路径会随 `.pyc` 进入镜像。
+#   - 凭据不进镜像：`.env*` 是本地与受控测试的真实凭据载体（见 .gitignore），
+#     任何情况下都不得进入构建上下文。
+#
+# 排除是**默认拒绝**：先排除一切与构建无关的目录，再按 Dockerfile 的 COPY 精确取用。
+
+# 版本控制与代理工作现场
+.git
+.gitignore
+.claude
+.github
+
+# 凭据与本地配置（.env.example 也不需要进镜像）
+.env
+.env.*
+*.env
+
+# Python 本地产物：内嵌宿主机绝对路径，见上方说明
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.venv
+.tmp
+
+# Node 与 Cloudflare Worker 测试资产
+node_modules
+workers
+
+# 非生产资产：受控验证脚本、测试、实验、文档
+scripts
+tests
+experiments
+docs
+migrations/testing
+
+# 部署编排自身不进镜像（compose 在宿主机上执行）
+deploy
+Dockerfile
+.dockerignore
