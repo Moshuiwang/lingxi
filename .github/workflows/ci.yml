@@ -244,6 +244,16 @@ jobs:
           echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
           echo "不可变 tag：${batch}-${short}"
 
+      # **两腿必须走同一条构建路径，只有最终 tag 不同。**
+      #
+      # 上一版 A 腿走 build_image.sh、B 腿是裸 `docker build`，于是 A 带上了来源标签
+      # （LINGXI_SOURCE_COMMIT / LINGXI_SOURCE_TREE）而 B 的是 `unknown`。等价步骤要
+      # 逐字段比 `.Config`，而 Labels 就在 `.Config` 里——两腿**必然**不一致，等价检查
+      # 恒红，publish 又 needs 着 image，于是整条发布路径被自己堵死。
+      #
+      # 修法是让两腿共用 build_image.sh，而不是给 B 腿补一个 --build-arg：后者能让这次
+      # 变绿，但下次再往构建里加任何一个参数，同样的漂移会重演一遍。构建方式只有一处
+      # 定义，就没有"两处保持同步"这件事需要有人记得。
       - name: 构建三个镜像（构建 A）
         working-directory: build-a
         env:
@@ -256,11 +266,19 @@ jobs:
             docker tag "$(cat "${RUNNER_TEMP}/reference-${service}")" "lingxi-${service}:build-a"
           done
 
+      # 与 A 腿**逐字相同**的构建命令，只是工作目录不同、产出改打 :build-b。
+      # build_image.sh 会把两腿产出的镜像打上同一个 <批次>-<sha> tag；B 腿构建时那个
+      # tag 会指向 B 的镜像，而 A 的镜像已经另外打了 :build-a，不受影响。
       - name: 构建三个镜像（构建 B，独立目录、冷缓存）
         working-directory: build-b-second-independent-checkout
+        env:
+          LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
+          LINGXI_IMAGE_COMMIT: ${{ github.sha }}
         run: |
           for service in scheduler migrate worker; do
-            docker build --no-cache --target "${service}" -t "lingxi-${service}:build-b" .
+            LINGXI_IMAGE_REFERENCE_FILE="${RUNNER_TEMP}/reference-b-${service}" \
+              scripts/ci/build_image.sh "${service}" --no-cache
+            docker tag "$(cat "${RUNNER_TEMP}/reference-b-${service}")" "lingxi-${service}:build-b"
           done
 
       # 断言 V-部署-06 / M2-62-05：**内容级**等价，不是 manifest digest 相等。

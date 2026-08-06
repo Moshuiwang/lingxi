@@ -324,6 +324,107 @@ class OverrideBypassTest(unittest.TestCase):
         self.assertTrue(any("env_file" in line for line in failures), failures)
 
 
+class PublishJobGuardTest(unittest.TestCase):
+    """发布 job 的两条硬约束（codex 二轮 P1-1 + 验收微验 P3）。
+
+    `permissions` 按 job 生效，而同仓分支的 pull_request 会让该 job 照样拿到令牌；
+    `needs` 则决定哪些检查真的拦得住发布。两条都是"改一行就整个绕过去"的形状。
+    """
+
+    def _with_workflow(self, body: str):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        workflow = directory / "ci.yml"
+        workflow.write_text(textwrap.dedent(body), encoding="utf-8")
+        original = CONTRACT.CI_WORKFLOW
+        CONTRACT.CI_WORKFLOW = workflow
+        try:
+            return CONTRACT.check_ci_workflow()
+        finally:
+            CONTRACT.CI_WORKFLOW = original
+
+    HEAD = """
+        on:
+          push:
+            paths:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'deploy/**'
+        jobs:
+          extras:
+            strategy:
+              matrix:
+                extra: [scheduler, worker, bot-test, migrate]
+          image:
+            permissions:
+              contents: read
+            steps:
+              - run: echo build
+    """
+
+    def test_publish_without_push_main_gate_is_caught(self) -> None:
+        failures = self._with_workflow(self.HEAD + """
+          publish:
+            needs: [gate, extras, image]
+            permissions:
+              contents: read
+              packages: write
+            steps:
+              - run: python3 scripts/ci/push_image.py x
+        """)
+        self.assertTrue(any("packages: write" in f and "refs/heads/main" in f for f in failures), failures)
+
+    def test_publish_without_image_in_needs_is_caught(self) -> None:
+        # 验收微验新增：把 image 从 needs 里拿掉，镜像契约/等价/V-部署-05 全被绕过。
+        failures = self._with_workflow(self.HEAD + """
+          publish:
+            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+            needs: [gate, extras]
+            permissions:
+              contents: read
+              packages: write
+            steps:
+              - run: python3 scripts/ci/push_image.py x
+        """)
+        self.assertTrue(any("needs" in f and "image" in f for f in failures), failures)
+
+    def test_wellformed_publish_job_passes(self) -> None:
+        failures = self._with_workflow(self.HEAD + """
+          publish:
+            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+            needs: [gate, extras, image]
+            permissions:
+              contents: read
+              packages: write
+            steps:
+              - run: python3 scripts/ci/push_image.py x
+        """)
+        self.assertEqual(failures, [])
+
+
+class RealWorkflowTest(unittest.TestCase):
+    """真实 ci.yml 的两腿构建必须走同一条路径（验收微验 P1）。
+
+    A 腿走 build_image.sh、B 腿裸 docker build 时，A 带上来源标签而 B 是 unknown；
+    等价步骤逐字段比 .Config（Labels 就在里面）必然不一致，等价检查恒红，
+    而 publish needs 着 image——整条发布路径被自己堵死。
+    """
+
+    def test_both_build_legs_use_the_same_script(self) -> None:
+        text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        image_job = text[text.index("  image:"):text.index("  publish:")]
+        bare_builds = [
+            line.strip()
+            for line in image_job.splitlines()
+            if "docker build" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            bare_builds, [],
+            "image job 里出现了裸 docker build；两腿都必须走 scripts/ci/build_image.sh，"
+            "否则构建参数会在两腿之间漂移（来源标签就是这么漂的）",
+        )
+        self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
+
+
 class DatabaseTimeoutTest(unittest.TestCase):
     """停机上界的依据必须真的写在示例 DSN 里（codex 审查 P1-3）。"""
 

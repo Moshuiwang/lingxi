@@ -581,6 +581,16 @@ def check_ci_workflow() -> list[str]:
                 "      同仓分支的 pull_request 会让这个 job 照样拿到写令牌——"
                 "改一行 workflow 就能在 PR 阶段推 / 覆盖 GHCR，绕过合并门禁。"
             )
+        # 发布 job 必须 needs 着 image。镜像契约、两次构建等价、V-部署-05 全都跑在
+        # image 里；把它从 needs 里拿掉，这些检查一条都不会拦住发布，而 CI 依然全绿。
+        needs = re.search(r"^\s*needs:\s*(\[[^\]]*\]|\S.*)$", header, re.MULTILINE)
+        if needs is None or "image" not in needs.group(1):
+            failures.append(
+                f"ci.yml 的 job `{job_name}` 声明了 `packages: write`，但它的 `needs` "
+                f"不含 `image`（当前：{needs.group(1) if needs else '无 needs'}）。\n"
+                "      镜像契约、两次构建等价与 V-部署-05 都跑在 image job 里；"
+                "不 needs 它就等于这些检查一条都不拦发布，而 CI 照样全绿。"
+            )
 
     # M2-62-35 / D15：推送步骤不得吞错。
     if "push_image.py" in text:
