@@ -101,7 +101,9 @@ class ResultRules:
     # 用 tuple 而不是 frozenset：命中多个键时若按集合迭代顺序取第一个，
     # 分类结果会随 str hash 随机化在进程之间翻转（同一份回执给出不同审计结论）。
     # 判定改成与顺序无关：任一登记集合非空即 OK，全部为空才是 EMPTY_RESULT。
-    empty_collection_keys: tuple[str, ...] = ("data", "rows", "items", "results")
+    # metrics 来自 #37 A1 已确认的真实 list_metrics 成功契约；只有非空集合才
+    # 判 OK，空集合仍是 EMPTY_RESULT，其他形状仍保守记 UNCLASSIFIED。
+    empty_collection_keys: tuple[str, ...] = ("data", "rows", "items", "results", "metrics")
     failure_text_markers: tuple[str, ...] = ()
 
 
@@ -501,14 +503,56 @@ def _classify_structured(parsed: Any, rules: ResultRules) -> ToolResultKind | No
         return None
     if _failure_in_mapping(parsed, rules):
         return ToolResultKind.BUSINESS_FAILURE
+    metrics_present = "metrics" in rules.empty_collection_keys and "metrics" in parsed
+    metrics_empty = False
+    if metrics_present:
+        metrics = parsed.get("metrics")
+        if not isinstance(metrics, Sequence) or isinstance(metrics, (str, bytes)):
+            return ToolResultKind.UNCLASSIFIED
+        metrics_empty = len(metrics) == 0
     seen_collection = False
+    saw_success = False
+    saw_unclassified = False
     for key in rules.empty_collection_keys:
         value = parsed.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            if len(value) > 0:
-                return ToolResultKind.OK
             seen_collection = True
+            if len(value) == 0:
+                continue
+            if key == "metrics":
+                metric_kind = _classify_metrics_collection(value, rules)
+                if metric_kind is ToolResultKind.BUSINESS_FAILURE:
+                    return metric_kind
+                if metric_kind is ToolResultKind.UNCLASSIFIED:
+                    saw_unclassified = True
+                    continue
+            saw_success = True
+    # 同一响应里同时出现明确成功集合与模糊 metrics，仍保守记未知；否则一次
+    # 辅助集合成功会把畸形业务载荷盖掉，重演 V-执行-17 的回合级问题。
+    if saw_unclassified:
+        return ToolResultKind.UNCLASSIFIED
+    # metrics 是这次真实问数调用的业务载荷。它明确为空时，其他辅助集合即使
+    # 非空也不足以证明用户拿到了指标结果；纯 metrics 空集合仍按 EMPTY_RESULT。
+    if metrics_empty and saw_success:
+        return ToolResultKind.UNCLASSIFIED
+    if saw_success:
+        return ToolResultKind.OK
     return ToolResultKind.EMPTY_RESULT if seen_collection else None
+
+
+def _classify_metrics_collection(value: Sequence[Any], rules: ResultRules) -> ToolResultKind:
+    """锁定 #37 A1 的稳定成功边界，不把“数组非空”偷换成“业务数据有效”。
+
+    真实 ``list_metrics`` 的条目是有内容的对象。空对象、null、字符串等形状都
+    缺少足够证据，记未知；条目自身出现已登记失败形状时，整次回执记业务失败。
+    """
+
+    for item in value:
+        if not isinstance(item, Mapping) or not item:
+            return ToolResultKind.UNCLASSIFIED
+        if _failure_in_mapping(item, rules):
+            return ToolResultKind.BUSINESS_FAILURE
+    return ToolResultKind.OK
 
 
 def _failure_in_mapping(parsed: Mapping[str, Any], rules: ResultRules) -> bool:

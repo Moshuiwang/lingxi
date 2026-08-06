@@ -594,6 +594,30 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
     def test_non_empty_recognised_collection_is_still_ok(self) -> None:
         self.assertIs(classify_tool_result('{"data": [{"metric": "收视率"}]}'), ToolResultKind.OK)
 
+    def test_real_list_metrics_contract_is_success_only_when_non_empty(self) -> None:
+        """#37 A1：真实成功载荷是顶层 metrics；空或形状模糊仍不得冒充成功。"""
+
+        cases = {
+            '{"metrics": [{"metric_id": "revenue"}]}': ToolResultKind.OK,
+            '{"metrics": []}': ToolResultKind.EMPTY_RESULT,
+            '{"metrics": {"metric_id": "revenue"}}': ToolResultKind.UNCLASSIFIED,
+            '{"metrics": [null]}': ToolResultKind.UNCLASSIFIED,
+            '{"metrics": [{}]}': ToolResultKind.UNCLASSIFIED,
+            '{"metrics": [{"error": "upstream failed"}]}': ToolResultKind.BUSINESS_FAILURE,
+            '{"metrics": [{"success": false}]}': ToolResultKind.BUSINESS_FAILURE,
+            '{"metrics": [{"status": "failed"}]}': ToolResultKind.BUSINESS_FAILURE,
+            '{"metrics": [{"metric_id": "revenue"}], "error": "upstream failed"}': ToolResultKind.BUSINESS_FAILURE,
+            '{"data": [{"value": 1}], "metrics": null}': ToolResultKind.UNCLASSIFIED,
+            '{"data": [{"value": 1}], "metrics": "not-a-collection"}': ToolResultKind.UNCLASSIFIED,
+            '{"data": [{"value": 1}], "metrics": {"metric_id": "revenue"}}': ToolResultKind.UNCLASSIFIED,
+            '{"data": [{"value": 1}], "metrics": []}': ToolResultKind.UNCLASSIFIED,
+            '{"data": [{"value": 1}], "metrics": [{}]}': ToolResultKind.UNCLASSIFIED,
+            '{"data": [{"value": 1}], "metrics": [{"error": "upstream failed"}]}': ToolResultKind.BUSINESS_FAILURE,
+        }
+        for payload, expected in cases.items():
+            with self.subTest(payload=payload):
+                self.assertIs(classify_tool_result(payload), expected)
+
     def test_classification_does_not_depend_on_key_order(self) -> None:
         """多个登记集合同时出现时，分类不得取决于键的遍历顺序。
 
@@ -604,8 +628,8 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
 
         for payload in ('{"data": [], "items": [1]}', '{"rows": [1], "results": []}'):
             with self.subTest(payload=payload):
-                forward = ResultRules(empty_collection_keys=("data", "rows", "items", "results"))
-                reverse = ResultRules(empty_collection_keys=("results", "items", "rows", "data"))
+                forward = ResultRules(empty_collection_keys=("data", "rows", "items", "results", "metrics"))
+                reverse = ResultRules(empty_collection_keys=("metrics", "results", "items", "rows", "data"))
                 self.assertIs(
                     classify_tool_result(payload, rules=forward),
                     classify_tool_result(payload, rules=reverse),

@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 100
 MAX_PAGES = 200
 REQUEST_TIMEOUT_SECONDS = 20
+DEPARTMENT_ID_TYPES = frozenset({"open_department_id", "department_id"})
+
+
+def department_identifier(entity: Mapping[str, Any]) -> tuple[str, str] | None:
+    """从部门实体取出不可拆散的 ``(ID 值, ID 类型)``。
+
+    飞书同一实体可能同时返回两种 ID。沿用已受控验证的选择顺序，优先使用
+    ``open_department_id``；关键是把字段名作为类型一起交给下一次下钻调用，
+    不能只留下裸值让服务端按默认类型猜测（Issue #16 B3）。
+    """
+
+    for id_type in ("open_department_id", "department_id"):
+        value = entity.get(id_type)
+        if isinstance(value, str) and value:
+            return value, id_type
+    return None
 
 
 class FeishuDirectoryError(RuntimeError):
@@ -151,12 +167,27 @@ class FeishuDirectoryClient(_PagedClient):
             keys=("target_tenant_list", "items", "collaboration_tenants", "tenants"),
         )
 
-    def list_visible_organization(self, *, token: str, tenant_key: str, department_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def list_visible_organization(
+        self,
+        *,
+        token: str,
+        tenant_key: str,
+        department_id: str | None = None,
+        department_id_type: str | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """返回 (部门实体, 成员实体)。飞书把两者混在同一个列表里，这里拆开。"""
 
         query: dict[str, Any] = {}
-        if department_id:
+        if department_id is not None or department_id_type is not None:
+            if (
+                not isinstance(department_id, str)
+                or not department_id
+                or department_id_type not in DEPARTMENT_ID_TYPES
+            ):
+                # 不回显 ID：调用方误把令牌接到这里时，配置错误也不能泄露原值。
+                raise ValueError("部门 ID 值与类型必须成对，类型只能是 open_department_id 或 department_id")
             query["target_department_id"] = department_id
+            query["department_id_type"] = department_id_type
         entities = self._pages(
             f"/trust_party/v1/collaboration_tenants/{quote(tenant_key, safe='')}/visible_organization",
             token=token,

@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import logging
 import unittest
+from urllib.parse import parse_qs, urlparse
 
 from lingxi.adapters.feishu_directory import (
     FeishuAuthorizationClient,
     FeishuDirectoryClient,
     FeishuDirectoryError,
+    department_identifier,
 )
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
+from lingxi.core.identity.first_contact import EmploymentStatus
 
 
 BASE_URL = "https://feishu.invalid/open-apis"
@@ -127,6 +130,120 @@ class DirectoryPaginationTest(unittest.TestCase):
 
         self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
         self.assertEqual([item["open_id"] for item in members], ["ou_1"])
+
+    def test_open_department_id_value_and_type_survive_every_page(self) -> None:
+        """#16 B3：下钻 open_department_id 时，值和类型必须在全部分页请求中同行。"""
+
+        transport = RecordingTransport(
+            [
+                page([], key="collaboration_entity_list", has_more=True, page_token="p2"),
+                page([{"open_id": "ou_1"}], key="collaboration_entity_list"),
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        _, members = client.list_visible_organization(
+            token="fake-user-token",
+            tenant_key="tenant_a",
+            department_id="od_child",
+            department_id_type="open_department_id",
+        )
+
+        self.assertEqual([item["open_id"] for item in members], ["ou_1"])
+        self.assertEqual(len(transport.calls), 2)
+        for _, url, _, _ in transport.calls:
+            query = parse_qs(urlparse(url).query)
+            self.assertEqual(query["target_department_id"], ["od_child"])
+            self.assertEqual(query["department_id_type"], ["open_department_id"])
+        self.assertEqual(parse_qs(urlparse(transport.calls[1][1]).query)["page_token"], ["p2"])
+
+    def test_department_id_value_and_type_are_sent_together(self) -> None:
+        """飞书也可能只返回 department_id；不得把它误标成 open_department_id。"""
+
+        transport = RecordingTransport([page([], key="collaboration_entity_list")])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        client.list_visible_organization(
+            token="fake-user-token",
+            tenant_key="tenant_a",
+            department_id="dept_child",
+            department_id_type="department_id",
+        )
+
+        query = parse_qs(urlparse(transport.calls[0][1]).query)
+        self.assertEqual(query["target_department_id"], ["dept_child"])
+        self.assertEqual(query["department_id_type"], ["department_id"])
+
+    def test_department_id_and_type_cannot_be_supplied_separately(self) -> None:
+        """缺一项就在出站前失败，不能让飞书按默认 ID 类型猜测。"""
+
+        for department_id, department_id_type in (
+            ("od_child", None),
+            (None, "open_department_id"),
+            ("od_child", "tenant_department_id"),
+        ):
+            with self.subTest(department_id=department_id, department_id_type=department_id_type):
+                transport = RecordingTransport([])
+                client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+                with self.assertRaises(ValueError):
+                    client.list_visible_organization(
+                        token="fake-user-token",
+                        tenant_key="tenant_a",
+                        department_id=department_id,
+                        department_id_type=department_id_type,
+                    )
+                self.assertEqual(transport.calls, [], "非法 ID 对不得发出真实请求")
+
+    def test_department_identifier_keeps_the_value_and_its_source_type(self) -> None:
+        self.assertEqual(
+            department_identifier({"open_department_id": "od_1", "department_id": "dept_1"}),
+            ("od_1", "open_department_id"),
+        )
+        self.assertEqual(department_identifier({"department_id": "dept_1"}), ("dept_1", "department_id"))
+        self.assertIsNone(department_identifier({"name": "测试部门"}))
+
+    def test_visible_organization_business_error_stays_a_failure(self) -> None:
+        """补齐参数只修正确请求；飞书明确失败仍按原语义抛错，不自动重试。"""
+
+        transport = RecordingTransport([{"code": 40001, "msg": "bad department id type"}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_visible_organization(
+                token="fake-user-token",
+                tenant_key="tenant_a",
+                department_id="od_child",
+                department_id_type="open_department_id",
+            )
+
+        self.assertEqual(raised.exception.code, "feishu_code_40001")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_member_detail_and_employment_fields_are_not_changed(self) -> None:
+        detail = {
+            "open_id": "ou_1",
+            "status": {
+                "is_activated": True,
+                "is_exited": False,
+                "is_frozen": False,
+                "is_resigned": False,
+                "is_unjoin": False,
+            },
+        }
+        transport = RecordingTransport([{"code": 0, "data": {"target_user": detail}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        returned = client.get_member_detail(
+            token="fake-user-token", tenant_key="tenant_a", member_id="ou_1", id_type="open_id"
+        )
+
+        self.assertEqual(returned, detail)
+        employment = EmploymentStatus.from_feishu(returned["status"])
+        self.assertIsNotNone(employment)
+        assert employment is not None
+        self.assertTrue(employment.employed)
+        query = parse_qs(urlparse(transport.calls[0][1]).query)
+        self.assertEqual(query["target_user_id_type"], ["open_id"])
 
     def test_the_tenant_key_is_a_call_argument_not_client_configuration(self) -> None:
         """硬约束 1：租户是查出来的结果，客户端不持有目标租户配置。"""
