@@ -23,3 +23,10 @@ Alembic 按开发计划属 S11；届时本目录按[数据库设计「十一、�
 它们**不属于生产链**、不参与顺序前滚检查，仅供 `tests/test_identity_postgres.sh`、
 `tests/test_refresh_token_postgres.py` 与 `scripts/sync_feishu_org_snapshot.py` 使用；
 何时整体废弃随对应测试资产的清退一起决定。
+
+2026-08-06 登记（[#55 盘点](https://github.com/Moshuiwang/lingxi/issues/55#issuecomment-5201705742)）：按「保留最小集」口径，本轮清退清单为空。
+`002` 服务的**员工**浏览器 OAuth 路径确已排除，但 `onboarding_progress` 同时是
+「四达文档会议助手」重授权链的一环——卡片 `card_nonce` 即 OAuth `state`，回调换码前
+必须先占用该行（`src/lingxi/adapters/oauth_bridge.py:542`），因此现在删除会移除正式
+凭据代码「轮换失败 → 人工重新授权」的唯一落地手段。废弃时点改为：随
+[#67](https://github.com/Moshuiwang/lingxi/issues/67) 的正式重授权入口交付后执行。
