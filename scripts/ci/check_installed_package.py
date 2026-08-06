@@ -49,6 +49,13 @@ REQUIRED_MODULES = (
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.retention",
     "lingxi.adapters.feishu_roster_bitable",
+    # 花名册审计日报（Issue #52）：比对与渲染在 core，基线读取与群发在 adapters。
+    # 四个都要在制品里能 import——它们由 lingxi-scheduler 在运行时按需加载，
+    # "本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.identity.roster_audit",
+    "lingxi.core.identity.roster_report",
+    "lingxi.adapters.postgres_roster_audit",
+    "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
@@ -94,7 +101,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 注意导入的是承载 ``main`` 的包，不是 ``lingxi.apps.scheduler.__main__``：
         # 后者在模块级 ``raise SystemExit(main())``（没有 __name__ 卫语句），
         # import 它会真的把续期扫描进程跑起来。
-        ("lingxi.apps.scheduler", "lingxi.adapters.delegated_credentials", "lingxi.adapters.retention"),
+        # 花名册审计日报（#52）的两个 adapter 由 `build_loop` **在函数内** import。
+        # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
+        # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
+        (
+            "lingxi.apps.scheduler",
+            "lingxi.adapters.delegated_credentials",
+            "lingxi.adapters.retention",
+            "lingxi.adapters.feishu_group_message",
+            "lingxi.adapters.postgres_roster_audit",
+        ),
+        # 第三方那一列没变：群发适配走标准库 urllib（同 adapters/feishu_directory.py），
+        # 基线读取用 psycopg——两者都不引入新依赖。
         ("cryptography.fernet", "psycopg"),
     ),
     "worker": (
