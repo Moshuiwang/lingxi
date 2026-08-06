@@ -1,6 +1,6 @@
 name: Docs
 
-# Issue #43 瘦身：纯文档推送到 main 的轻量门禁（Markdown 链接、项目 Skills、行尾空白）。
+# Issue #43 瘦身：纯文档推送到 main 的轻量门禁（Markdown 链接、项目 Skills、验收矩阵、行尾空白）。
 # 不装依赖、不起服务容器，十几秒完成；代码路径的完整门禁见 ci.yml。
 # 同时命中两组路径的推送会两条工作流都跑，完整门禁覆盖本门禁的全部检查项。
 on:
@@ -30,10 +30,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Markdown 链接与项目 Skills 检查
+      - name: Markdown 链接、项目 Skills 与验收矩阵检查
         run: |
           python3 scripts/ci/check_markdown_links.py
           python3 scripts/ci/check_project_skills.py
+          # 验收矩阵的状态列与合同条款覆盖清单都只由 Markdown 承载（Issue #58）：
+          # 纯文档推送恰恰是它们唯一会被改动的路径，漏在这里，这道检查对 main 就不生效。
+          python3 scripts/ci/check_acceptance_matrix.py
 
       - name: 行尾空白检查
         run: |
