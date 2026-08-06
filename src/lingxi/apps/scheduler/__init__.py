@@ -1,21 +1,33 @@
 """``lingxi-scheduler``：定时职责进程。
 
-首个职责是专用授权凭据（「四达文档会议助手」``refresh_token``）的到期轮换。
+进程现在跑**两个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+
+1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
+   ``refresh_token`` 的到期续期；
+2. **九十天保留清理**（:class:`RetentionCleanupDuty`）——调用数据库里的受限清理
+   函数回收到期内容（Issue #54 / S9）。
+
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
 挂在飞书长连接进程内的常驻线程上，把长连接进程 kill 掉后扫描线程无声停止，没有
 任何独立信号提示"续期已经不再运行"（[Issue #16 复验记录]
 (https://github.com/Moshuiwang/lingxi/issues/16#issuecomment-5188063325)）。
 
+**职责之间互不牵连**（断言 V-保留-15）。``SchedulerLoop.run_once`` 逐个职责地捕获
+异常：清理连续失败不会让凭据轮换这一轮被跳过，反之亦然。这一条必须由代码结构
+保证而不是靠"两个职责都不会抛异常"——保留清理会因为数据库权限、连接、锁等待失败，
+而它失败时最不该发生的事情就是把一条一次性凭据的续期窗口一起拖没。
+
 本模块只做组装：配置从环境变量来，轮换规则在
 :mod:`lingxi.core.identity.credentials`，存取在
 :mod:`lingxi.adapters.delegated_credentials`（宿主机文件保管，选项 A 决策），飞书调用在
-:mod:`lingxi.adapters.feishu_directory`。
+:mod:`lingxi.adapters.feishu_directory`，清理函数调用在
+:mod:`lingxi.adapters.retention`。
 
-退出语义（断言 V-部署-03）：收到 ``SIGTERM`` / ``SIGINT`` 后**停止领取新的到期
-凭据**，把已经领取的那一次轮换做完，然后退出。半途中断一次轮换会留下一个
-"已经向飞书换过、但没写回数据库"的窗口，而 ``refresh_token`` 一次性有效——
-那个窗口等于凭据丢失。
+退出语义（断言 V-部署-03、V-保留-17）：收到 ``SIGTERM`` / ``SIGINT`` 后**停止领取
+新工作**，把已经领取的那一次做完，然后退出。半途中断一次轮换会留下一个"已经向飞书
+换过、但没写回数据库"的窗口，而 ``refresh_token`` 一次性有效——那个窗口等于凭据丢失。
+清理侧没有对应窗口：一次调用就是一个数据库事务，被打断只会整体回滚。
 """
 
 from __future__ import annotations
@@ -25,6 +37,7 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
@@ -134,11 +147,22 @@ class CredentialRotationLoop:
     失败后的处置写在 :func:`decide_after_refresh`。这里只负责编排与退出。
     """
 
-    def __init__(self, *, vault: _Vault, authorization: _Authorization, interval_seconds: float = DEFAULT_INTERVAL_SECONDS) -> None:
+    name = "凭据轮换"
+
+    def __init__(
+        self,
+        *,
+        vault: _Vault,
+        authorization: _Authorization,
+        interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
+        stop: threading.Event | None = None,
+    ) -> None:
         self._vault = vault
         self._authorization = authorization
         self._interval_seconds = interval_seconds
-        self._stop = threading.Event()
+        # 与同一进程内的其他职责共享停止标志：SIGTERM 必须一次让所有职责都停止
+        # 领取新工作，而不是只停下恰好持有信号处理函数的那一个。
+        self._stop = threading.Event() if stop is None else stop
 
     @property
     def stopping(self) -> bool:
@@ -228,6 +252,111 @@ class CredentialRotationLoop:
         logger.info("续期扫描已停止领取并退出")
 
 
+class _Cleaner(Protocol):
+    def run_once(self) -> Any: ...
+
+
+class RetentionCleanupDuty:
+    """九十天保留清理职责：每轮调用一次受限清理函数。
+
+    每轮**只调用一次**，不在职责内部循环到删空。理由有两条：一次调用就是一个
+    数据库事务，单次调用因此天然没有半删状态；而"删空为止"会让一个积压了很多
+    到期行的库在单轮里长时间持锁，也让 ``SIGTERM`` 的退出时间不再有上界。
+    积压由下一轮继续，清理本来就是幂等的（断言 V-保留-10）。
+    """
+
+    name = "保留清理"
+
+    def __init__(self, *, cleaner: _Cleaner, stop: threading.Event | None = None) -> None:
+        self._cleaner = cleaner
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> Any:
+        """已经在停止中就一批都不领。返回 ``None`` 表示本轮未执行。"""
+
+        if self._stop.is_set():
+            return None
+        report = self._cleaner.run_once()
+        # 摘要只有表名与计数。清理函数的返回里根本没有行内容，日志因此不可能
+        # 带出人员数据（断言 V-保留-14）。
+        summary = getattr(report, "summary", None)
+        logger.info("%s", summary() if callable(summary) else "保留清理：本轮完成")
+        return report
+
+
+class SchedulerLoop:
+    """按同一周期驱动多个定时职责，并把它们的失败互相隔离。
+
+    ``build_loop`` 此前直接返回单个 :class:`CredentialRotationLoop`，"进程只有一个
+    职责"这件事被硬编码在装配里。加入第二个职责必须改的正是这里：需要一个能容纳
+    职责集合、并且**逐职责**捕获异常的结构。
+    """
+
+    def __init__(
+        self,
+        *,
+        duties: Sequence[Any],
+        interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
+        stop: threading.Event | None = None,
+    ) -> None:
+        if not duties:
+            raise ValueError("定时职责进程至少要有一个职责")
+        self._duties = tuple(duties)
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def duties(self) -> tuple[Any, ...]:
+        return self._duties
+
+    @property
+    def stop_event(self) -> threading.Event:
+        return self._stop
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> tuple[Any, ...]:
+        """依次跑一遍每个职责。任何一个职责抛异常都不影响其余职责本轮执行。"""
+
+        reports: list[Any] = []
+        for duty in self._duties:
+            if self._stop.is_set():
+                # 已经在停止中：不再让后面的职责领取新工作（断言 V-保留-17）。
+                reports.append(None)
+                continue
+            try:
+                reports.append(duty.run_once())
+            except Exception as error:  # noqa: BLE001 - 一个职责失败不能带走另一个
+                # 只记异常类型，不记异常正文：正文可能带上被处理对象的内容。
+                logger.error(
+                    "定时职责本轮异常，其余职责与下一轮不受影响 duty=%s error=%s",
+                    getattr(duty, "name", type(duty).__name__),
+                    type(error).__name__,
+                )
+                reports.append(None)
+        return tuple(reports)
+
+    def run_forever(self) -> None:
+        while not self._stop.is_set():
+            self.run_once()
+            if self._stop.is_set():
+                break
+            self._stop.wait(self._interval_seconds)
+        logger.info("定时职责已停止领取并退出")
+
+
 def _is_definite_failure(error: BaseException) -> bool:
     """区分"飞书明确拒绝"与"结果不明确"。
 
@@ -240,7 +369,11 @@ def _is_definite_failure(error: BaseException) -> bool:
     return definite is True
 
 
-def install_signal_handlers(loop: CredentialRotationLoop) -> None:
+class _Stoppable(Protocol):
+    def request_stop(self) -> None: ...
+
+
+def install_signal_handlers(loop: _Stoppable) -> None:
     """把 ``SIGTERM`` / ``SIGINT`` 接到"停止领取"上。
 
     处理函数只设一个事件标志，不做任何 I/O：信号处理函数里写库或发网络请求会在
@@ -255,11 +388,22 @@ def install_signal_handlers(loop: CredentialRotationLoop) -> None:
     signal.signal(signal.SIGINT, handle)
 
 
-def build_loop(config: SchedulerConfig) -> CredentialRotationLoop:
+def build_loop(config: SchedulerConfig) -> SchedulerLoop:
+    """装配进程的全部定时职责。
+
+    职责顺序有意为之：凭据轮换在前。它处理的是一次性有效、有硬期限的凭据，
+    而清理晚一轮没有任何后果——到期行下一轮照删，到期时间不会因为清理迟到而后移
+    （断言 V-保留-16）。
+    """
+
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
+    from lingxi.adapters.retention import PostgresRetentionCleaner
 
-    return CredentialRotationLoop(
+    # 一个停止标志贯穿所有职责：SIGTERM 只设它一次，全部职责同时停止领取新工作。
+    stop = threading.Event()
+
+    rotation = CredentialRotationLoop(
         vault=HostFileDelegatedCredentialVault(config.postgres_dsn, config.credential_key, config.credential_path),
         authorization=FeishuAuthorizationClient(
             base_url=config.feishu_base_url,
@@ -267,7 +411,11 @@ def build_loop(config: SchedulerConfig) -> CredentialRotationLoop:
             app_secret=config.feishu_app_secret,
         ),
         interval_seconds=config.interval_seconds,
+        stop=stop,
     )
+    cleanup = RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(config.postgres_dsn), stop=stop)
+
+    return SchedulerLoop(duties=(rotation, cleanup), interval_seconds=config.interval_seconds, stop=stop)
 
 
 def main(argv: list[str] | None = None) -> int:
