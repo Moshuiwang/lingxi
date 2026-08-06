@@ -105,6 +105,12 @@ BEGIN
         IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN
             RAISE EXCEPTION '不允许修改任务的创建时间';
         END IF;
+        -- 续用旧会话的判定在入队时做出（合同：按"上一条任务结束到下一条新任务开始"
+        -- 的间隔判断）。任务在队列里排多久都不能改变这个结论，否则积压期一长，
+        -- 用户的上下文归属就由队列长度决定而不是由他自己的发起时间决定。
+        IF NEW.resumed_session IS DISTINCT FROM OLD.resumed_session THEN
+            RAISE EXCEPTION '不允许修改任务的会话续用判定（任务 %）', NEW.id;
+        END IF;
     END IF;
     RETURN NEW;
 END;
