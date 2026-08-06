@@ -405,6 +405,105 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
         )
 
 
+class ConditionalClaimTests(GatewayPostgresTestCase):
+    """抢占的**条件更新本身**，不经过管线的内存预检。
+
+    这一组是变异验证逼出来的。原先 `V-会话-01` 只有一条并发用例，而并发用例可以
+    「因为对的结论、错的理由」通过：管线在抢占之前先读了一次 ``running_task_id``，
+    两个线程只要错开一点，后到的那个就在**内存预检**里被拦下，根本走不到条件更新。
+    于是把条件更新改成无条件更新之后，该用例在 4 个 `PYTHONHASHSEED` 里只有 2 个
+    变红——另外 2 个照样绿。
+
+    真正承载同话题串行的是数据库那一句条件更新（内存预检只是省一次往返，两个进程
+    之间它什么也保证不了）。下面两条直接打在它身上，与线程调度无关。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+        with self.store.transaction() as transaction:
+            conversation = transaction.ensure_conversation(
+                user_id="usr_1", chat_id="oc_1", thread_id=None
+            )
+        self.conversation_id = conversation.conversation_id
+
+    def test_claiming_a_busy_topic_fails_and_does_not_overwrite(self) -> None:
+        with self.store.transaction() as transaction:
+            self.assertTrue(
+                transaction.claim_conversation(
+                    conversation_id=self.conversation_id, task_id="tsk_first"
+                )
+            )
+
+        with self.store.transaction() as transaction:
+            self.assertFalse(
+                transaction.claim_conversation(
+                    conversation_id=self.conversation_id, task_id="tsk_second"
+                ),
+                "话题已被占用时抢占必须失败——无条件更新会让第二个任务直接覆盖第一个",
+            )
+
+        self.assertEqual(
+            self.scalar("SELECT running_task_id FROM conversation"),
+            "tsk_first",
+            "占用不得被后到的任务覆盖（PR #12 的原始错误）",
+        )
+
+    def test_claim_succeeds_again_after_the_holder_releases(self) -> None:
+        with self.store.transaction() as transaction:
+            transaction.claim_conversation(
+                conversation_id=self.conversation_id, task_id="tsk_first"
+            )
+        self.execute(
+            "UPDATE conversation SET running_task_id = NULL WHERE id = %s",
+            (self.conversation_id,),
+        )
+
+        with self.store.transaction() as transaction:
+            self.assertTrue(
+                transaction.claim_conversation(
+                    conversation_id=self.conversation_id, task_id="tsk_second"
+                ),
+                "释放之后必须能重新抢占，否则话题会永久忙碌",
+            )
+
+
+class BusyTopicWritesNoTaskTests(GatewayPostgresTestCase):
+    """`V-会话-04` 的数据库面：忙碌话题上第二个任务写不进去。
+
+    与上一组同因——管线的内存预检会先拦下忙碌消息，使得「忙碌期照常写 task」这个
+    变异在端到端用例里抓不到。这里绕开预检，直接让第二次入队走到抢占。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+
+    def test_enqueue_on_a_busy_topic_writes_no_second_task(self) -> None:
+        self.pipeline().handle_message(inbound("evt_1"), now=NOW)
+        self.assertEqual(self.task_count(), 1)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+
+        # 直接尝试在已占用的话题上再抢一次并入队：抢占必须失败，任务写不进去。
+        with self.store.transaction() as transaction:
+            claimed = transaction.claim_conversation(
+                conversation_id=conversation_id, task_id="tsk_intruder"
+            )
+            self.assertFalse(claimed, "忙碌话题不得被再次抢占")
+            if claimed:  # pragma: no cover - 只有实现被改坏时才会走到
+                transaction.insert_task(
+                    task_id="tsk_intruder",
+                    conversation_id=conversation_id,
+                    user_id="usr_1",
+                    inbound_event_id="evt_intruder",
+                    prompt="不该被写进去",
+                    resumed_session=False,
+                    target_worker_version="stable",
+                )
+
+        self.assertEqual(self.task_count(), 1, "忙碌期不得产生第二个任务")
+
+
 class CommandIsolationTests(GatewayPostgresTestCase):
     """`V-会话-05` / `V-会话-06`：`/new` 与 `/stop` 的话题隔离。"""
 
