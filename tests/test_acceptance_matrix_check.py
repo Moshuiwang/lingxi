@@ -74,6 +74,23 @@ class MatrixStatusColumnTest(unittest.TestCase):
         self.assertNotIn("V-开通-02", statuses)
         self.assertTrue(any("应为 4 格" in error for error in errors), errors)
 
+    def test_escaped_pipe_stays_inside_one_cell(self) -> None:
+        """断言正文里出现字面竖线是合法的（正则、命令行管道），按 Markdown 用 `\\|` 转义。"""
+        row = "| V-执行-07 | 白名单不接受 `a\\|b` 这类正则 | L2 | 已认领 |"
+        self.assertEqual(
+            CHECK.split_row(row),
+            ["V-执行-07", "白名单不接受 `a|b` 这类正则", "L2", "已认领"],
+        )
+        statuses, errors = CHECK.parse_matrix(gate_document(GOOD_MATRIX + row + "\n", GOOD_COVERAGE))
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses["V-执行-07"], "已认领")
+
+    def test_cell_count_error_points_at_the_escape(self) -> None:
+        """裸竖线切出 5 格时，报错要说清怎么写对，而不是含糊地怪状态列。"""
+        row = "| V-执行-07 | 没转义的裸竖线 a|b | L2 | 已认领 |\n"
+        _, errors = CHECK.parse_matrix(gate_document(GOOD_MATRIX + row, GOOD_COVERAGE))
+        self.assertTrue(any("有 5 格" in error and "\\|" in error for error in errors), errors)
+
     def test_empty_status_cell_fails(self) -> None:
         rows = GOOD_MATRIX.replace("L2（真库） | 未认领 |", "L2（真库） |  |")
         _, errors = CHECK.parse_matrix(gate_document(rows, GOOD_COVERAGE))

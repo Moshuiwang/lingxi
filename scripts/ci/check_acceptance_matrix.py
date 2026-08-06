@@ -35,10 +35,19 @@ ASSERTION_RANGE = re.compile(r"^(V-[一-鿿]+)-(\d{2})…(\d{2})$")
 LOOSE_ASSERTION_ROW = re.compile(r"^V-")
 SEPARATOR_ROW = re.compile(r"^\|[\s:|-]+\|$")
 HEADING = re.compile(r"^(#{2,3})\s+(.+?)\s*$")
+# 断言正文里出现字面竖线是合法的（正则、命令行管道），Markdown 用 `\|` 转义。
+# 不认这个转义就会把一行切成 5 格，然后报"缺状态列"——错的地方和错的原因都不对。
+UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+ESCAPED_PIPE = re.compile(r"\\\|")
 
 
 def split_row(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    inner = line.strip()
+    if inner.startswith("|"):
+        inner = inner[1:]
+    if inner.endswith("|") and not inner.endswith("\\|"):
+        inner = inner[:-1]
+    return [ESCAPED_PIPE.sub("|", cell.strip()) for cell in UNESCAPED_PIPE.split(inner)]
 
 
 def is_table_row(line: str) -> bool:
@@ -92,8 +101,8 @@ def parse_matrix(text: str) -> tuple[dict[str, str], list[str]]:
             continue
         if len(cells) != len(MATRIX_HEADER):
             errors.append(
-                f"第 {line_number} 行：断言行有 {len(cells)} 格，应为 {len(MATRIX_HEADER)} 格"
-                f"（缺状态列？）：{cells[0]!r}"
+                f"第 {line_number} 行：断言行有 {len(cells)} 格，应为 {len(MATRIX_HEADER)} 格；"
+                f"若正文需要字面竖线请写成 \\| 转义：{cells[0]!r}"
             )
             continue
 
