@@ -19,10 +19,16 @@ import sys
 
 # 逐个 import，缺哪个报哪个，不要笼统失败。
 REQUIRED_MODULES = (
+    "lingxi.core.ids",
     "lingxi.core.identity.onboarding",
+    "lingxi.core.identity.identifiers",
+    "lingxi.core.identity.credentials",
+    "lingxi.core.identity.org_snapshot",
+    "lingxi.core.identity.first_contact",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
+    "lingxi.core.execution.message_stream",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -32,6 +38,17 @@ REQUIRED_MODULES = (
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.feishu_roster_bitable",
     "lingxi.adapters.role_function_map_file",
+    "lingxi.adapters.feishu_directory",
+    "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.postgres_identity",
+    "lingxi.adapters.claude_agent_session",
+    # apps/ 是新增的顶层子目录：进程入口漏进制品只在部署时暴露（V-部署-10），
+    # "测试全绿但 python -m 起不来"正是它的形状（Issue #37 / #16）。
+    "lingxi.apps.scheduler",
+    "lingxi.apps.worker.cli",
+    "lingxi.apps.worker.config",
+    "lingxi.apps.worker.turn",
+    "lingxi.apps.worker.__main__",
 )
 
 # 随包发布的数据文件：模块导入成功不代表数据文件进了 wheel（后者要靠

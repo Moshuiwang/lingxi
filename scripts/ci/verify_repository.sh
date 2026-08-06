@@ -51,6 +51,13 @@ printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^vers
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
 
+# 半开状态守卫：有容器却没有 DSN 时，Python 真库断言会静默跳过、门禁却照样绿。
+# 这种「看起来跑了真库」的假信心必须直接失败（PR #48 独立复查发现）。
+if [[ -n "${LINGXI_POSTGRES_CONTAINER:-}" && -z "${LINGXI_POSTGRES_DSN:-}" ]]; then
+  printf '设置了 LINGXI_POSTGRES_CONTAINER 却没有 LINGXI_POSTGRES_DSN：真库断言会被静默跳过。\n' >&2
+  exit 1
+fi
+
 if [[ -d tests ]]; then
   PYTHONPATH=src python3 -m unittest discover -s tests -v
   printf 'Python 自动测试：通过\n'
@@ -59,6 +66,19 @@ fi
 if [[ -n "${LINGXI_POSTGRES_CONTAINER:-}" ]]; then
   tests/test_identity_postgres.sh
   printf 'PostgreSQL 自动测试：通过\n'
+
+  # 生产迁移链必须能在空库上按编号顺序整体前滚（V-部署-05 的最小前身；
+  # migrations/testing/ 是测试资产，不属于生产链，见 migrations/README.md）。
+  # 没有这一步时，目录里两份互相冲突的建表脚本可以让门禁保持全绿。
+  docker exec "${LINGXI_POSTGRES_CONTAINER}" psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c 'DROP DATABASE IF EXISTS lingxi_migrate_check;' -c 'CREATE DATABASE lingxi_migrate_check;'
+  for migration_file in migrations/*.sql; do
+    docker exec -i "${LINGXI_POSTGRES_CONTAINER}" psql -q -v ON_ERROR_STOP=1 -U postgres -d lingxi_migrate_check \
+      < "${migration_file}"
+  done
+  docker exec "${LINGXI_POSTGRES_CONTAINER}" psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c 'DROP DATABASE IF EXISTS lingxi_migrate_check;'
+  printf '生产迁移链顺序前滚：通过（%s）\n' "$(printf '%s ' migrations/*.sql)"
 fi
 
 whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)

@@ -11,7 +11,9 @@ description = "Lingxi 企业内部受控 AI 业务分析服务"
 requires-python = ">=3.12"
 
 [project.optional-dependencies]
-feishu = ["cryptography>=42,<46", "lark-oapi==1.7.1", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
+# cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
+# 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
+feishu = ["cryptography==45.0.7", "lark-oapi==1.7.1", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
 # 精确锁版本，不用范围：执行层的只读边界建立在这个版本的 hook 事件名与工具名上
 # （`PostToolUseFailure` 存在、子代理叫 `Agent` 不叫 `Task`、`HookMatcher` 的签名），
 # 这些都是实测得到的、SDK 未作稳定性承诺的细节。升级前必须重跑 L4a，见
