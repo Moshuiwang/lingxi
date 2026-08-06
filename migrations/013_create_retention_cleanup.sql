@@ -68,6 +68,16 @@ COMMENT ON ROLE lingxi_migrate IS
 -- 这条成员关系只给迁移角色，lingxi_app / lingxi_scheduler 都不给（断言 V-保留-13）。
 GRANT lingxi_retention_owner TO lingxi_migrate;
 
+-- 反向也写死：业务角色若因为任何原因拿到了这条成员关系，重新应用本迁移必须收回它。
+-- 限权迁移应当**强制**自己的边界，而不是假设没有别人越权授过。
+--
+-- 这条不是防御性洁癖。角色成员关系是集群级对象，**不随表一起重建**：表的 ACL 在
+-- 重建表时自然清空，成员关系不会。#54 的变异测试把成员资格授给 lingxi_app 之后，
+-- 重跑整条迁移链并没有收回它，于是「应用角色不能删除内容表」「不能取得属主角色」
+-- 这一组限权断言在之后的整轮测试里**全部静默失效**——授权面被放宽了，而没有任何
+-- 东西报错。有了下面这行，同样的越权授权会在下一次迁移时被自动纠正。
+REVOKE lingxi_retention_owner FROM lingxi_app, lingxi_scheduler;
+
 -- 建库脚本重建 schema 后 PUBLIC 的 USAGE 可能不在；显式授予，不依赖默认 ACL
 -- （Supabase 等托管实例的 public schema ACL 与自建集群不一致）。
 GRANT USAGE ON SCHEMA public TO lingxi_app, lingxi_scheduler, lingxi_retention_owner;

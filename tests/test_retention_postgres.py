@@ -735,6 +735,35 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 self.assertFalse(can_login, f"{name} 本切片不应具备登录能力")
                 self.assertFalse(is_super, f"{name} 不得是超级用户")
 
+    def test_reapplying_the_migration_takes_back_an_over_granted_owner_membership(self) -> None:
+        """V-保留-13：越权授出的属主成员资格，重新应用迁移会被收回。
+
+        角色成员关系是**集群级**对象，不随表一起重建：表的 ACL 在重建表时自然清空，
+        成员关系不会。这条断言存在的理由来自一次真实事故——#54 的变异测试把成员资格
+        授给 `lingxi_app` 之后，重跑整条迁移链并没有收回它，于是"应用角色不能删除
+        内容表""不能取得属主角色"这一组限权断言在之后的整轮测试里全部静默失效：
+        授权面被放宽了，而没有任何东西报错。
+        """
+        self.execute("GRANT lingxi_retention_owner TO lingxi_app, lingxi_scheduler")
+        self.assertEqual(self._owner_members() & {"lingxi_app", "lingxi_scheduler"}, {"lingxi_app", "lingxi_scheduler"})
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+
+        self.assertEqual(self._owner_members(), {"lingxi_migrate"}, "只有迁移角色应当是属主角色的成员")
+        self._denied("lingxi_app", "SET ROLE lingxi_retention_owner")
+
+    def _owner_members(self) -> set[str]:
+        return {
+            row[0]
+            for row in self.query(
+                "SELECT r.rolname FROM pg_auth_members am "
+                "  JOIN pg_roles r ON r.oid = am.member "
+                "  JOIN pg_roles m ON m.oid = am.roleid "
+                " WHERE m.rolname = 'lingxi_retention_owner'"
+            )
+        }
+
     def test_applying_the_migration_twice_does_not_duplicate_or_fail(self) -> None:
         """V-保留-13：角色创建幂等——重复应用整条链不报错、不产生第二个角色。"""
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
