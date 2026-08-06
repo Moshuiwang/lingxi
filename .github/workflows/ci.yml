@@ -20,6 +20,12 @@ on:
       # Issue #53：alembic 配置在仓库根目录，不在上面任何一个目录里。漏掉它，
       # 「改坏迁移配置直推 main」这一路就不会触发完整门禁。
       - 'alembic.ini'
+      # Issue #62：部署编排同型。Dockerfile 与 .dockerignore 在仓库根目录，
+      # deploy/ 是新增顶层目录——三者都不在上面任何一条路径里，漏掉就等于
+      # 「改坏镜像构建或 compose 直推 main」不触发完整门禁。
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'deploy/**'
       - '.github/**'
   workflow_dispatch:
 
@@ -186,3 +192,149 @@ jobs:
           VENV: ${{ runner.temp }}/venv
         run: |
           "${VENV}/bin/python" "${GITHUB_WORKSPACE}/scripts/ci/check_installed_package.py" --process "${EXTRA}"
+
+  # Issue #62：镜像构建与部署门禁。
+  #
+  # **与 gate 并行、互不阻塞**：gate 是 5 分钟的快门禁，本 job 要构建三个镜像并且
+  # 每个都构建两次（可复现性判定），慢得多。把它塞进 gate 会让每一次纯代码改动都等
+  # 二十分钟；拆开之后，改代码的人照常在 5 分钟内拿到 gate 结论。
+  #
+  # 刻意**不使用矩阵**：本 job 的多数断言是**跨镜像**的（scheduler 与 worker 里都不许
+  # 有 lark-oapi、三个镜像共用同一份 check_installed_package.py 对账），拆成矩阵反而
+  # 要把镜像在 job 之间搬来搬去（三个加起来约 1.1 GB）。顺带也就不存在"新增矩阵用了
+  # `extra:` 作键、污染 check_installed_package.py 的三方对账正则"这个坑——
+  # scripts/ci/check_deploy_contract.py 仍然断言 ci.yml 里 `extra: [...]` 恰好一行。
+  image:
+    name: CI / image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # M2-62-32：`packages: write` **只在本 job 声明**。workflow 级保持 contents: read，
+    # gate 与 extras 不因为本 job 需要推镜像而跟着提权。
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 两份检出，**两个不同长度的绝对路径**。可复现性判定要求"同一提交、两个不同
+      # 绝对路径的干净 clone 各构建一次"结果零差异；路径长度也故意不同，
+      # 这样任何把构建目录写进产物的行为（.pyc 的 co_filename 是最常见的一种）
+      # 都会表现为长度不同的字符串，而不是碰巧对齐。
+      - name: 检出代码（构建 A）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: build-a
+
+      - name: 检出代码（构建 B，路径刻意更长）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: build-b-second-independent-checkout
+
+      - name: 计算不可变 tag
+        id: tag
+        run: |
+          batch=$(date -u +%Y%m%d)
+          short=$(echo "${GITHUB_SHA}" | cut -c1-12)
+          echo "batch=${batch}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
+          echo "不可变 tag：${batch}-${short}"
+
+      - name: 构建三个镜像（构建 A）
+        working-directory: build-a
+        env:
+          LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
+          LINGXI_IMAGE_COMMIT: ${{ github.sha }}
+        run: |
+          for service in scheduler migrate worker; do
+            LINGXI_IMAGE_REFERENCE_FILE="${RUNNER_TEMP}/reference-${service}" \
+              scripts/ci/build_image.sh "${service}" --no-cache
+            docker tag "$(cat "${RUNNER_TEMP}/reference-${service}")" "lingxi-${service}:build-a"
+          done
+
+      - name: 构建三个镜像（构建 B，独立目录、冷缓存）
+        working-directory: build-b-second-independent-checkout
+        run: |
+          for service in scheduler migrate worker; do
+            docker build --no-cache --target "${service}" -t "lingxi-${service}:build-b" .
+          done
+
+      # 断言 V-部署-06 / M2-62-05：**内容级**等价，不是 manifest digest 相等。
+      # 镜像配置里有 created 时间戳，所以同一份 rootfs 每次构建的 digest 必然不同；
+      # 拿 digest 当判据只会得到"永远不等价"这个无用结论。
+      - name: 两次构建产物等价（内容级）
+        working-directory: build-a
+        run: |
+          status=0
+          for service in scheduler migrate worker; do
+            python3 scripts/ci/image_manifest.py "lingxi-${service}:build-a" --output "/tmp/${service}-a.txt"
+            python3 scripts/ci/image_manifest.py "lingxi-${service}:build-b" --output "/tmp/${service}-b.txt"
+            if diff -u "/tmp/${service}-a.txt" "/tmp/${service}-b.txt" > "/tmp/${service}.diff"; then
+              echo "${service}：两次构建内容清单零差异"
+            else
+              echo "${service}：两次构建内容不等价" >&2
+              head -50 "/tmp/${service}.diff" >&2
+              status=1
+            fi
+            docker inspect --format '{{json .Config}}' "lingxi-${service}:build-a" > "/tmp/${service}-cfg-a.json"
+            docker inspect --format '{{json .Config}}' "lingxi-${service}:build-b" > "/tmp/${service}-cfg-b.json"
+            if ! diff -u "/tmp/${service}-cfg-a.json" "/tmp/${service}-cfg-b.json"; then
+              echo "${service}：.Config 不一致" >&2
+              status=1
+            fi
+          done
+          exit "${status}"
+
+      - name: 镜像部署契约逐条核对
+        working-directory: build-a
+        run: |
+          scripts/ci/verify_image_contract.sh \
+            lingxi-scheduler:build-a lingxi-worker:build-a lingxi-migrate:build-a
+
+      # 断言 V-部署-05 的本地演法（编排者裁定①）：真库升到 head，追加一条合成的
+      # 前滚迁移，再用**迁移前构建的镜像**启动 scheduler 跑完一轮并优雅退出。
+      - name: 旧镜像在新库结构上启动（V-部署-05）
+        working-directory: build-a
+        run: scripts/ci/verify_old_image_new_schema.sh lingxi-scheduler:build-a lingxi-migrate:build-a
+
+      # stage 与生产 compose 必须结构相同、只有配置不同（M2-62-13）。
+      - name: Compose 结构对照（stage ↔ 生产）
+        working-directory: build-a
+        run: scripts/ci/verify_compose_structure.sh
+
+      # ---- GHCR 推送：只在合并进 main 之后 -----------------------------------
+      # PR 阶段不推：fork 来的 PR 拿不到 packages 权限，而且把每个 PR 的镜像都推上去
+      # 会让仓库里堆满永远不会被部署的 tag。真实推送验证按编排者安排留在合并后。
+      - name: 登录 GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      # 推送成功 → 独立回读 digest 写进 summary。
+      # 权限不足 → 显式降级：存 tar、summary 写明「未推送」、发 ::warning::，job 仍绿。
+      # 其他失败 → 判红。三条路径的分支逻辑在 scripts/ci/push_image.py 里，
+      # **不使用 continue-on-error，也不使用 `|| true`**：那样会让三条路径长得一样。
+      - name: 推送镜像到 GHCR（权限不足则降级留证）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: build-a
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          for service in scheduler migrate worker; do
+            reference="ghcr.io/moshuiwang/lingxi-${service}:${IMAGE_TAG}"
+            docker tag "lingxi-${service}:build-a" "${reference}"
+            python3 scripts/ci/push_image.py "${reference}" \
+              --artifact-dir "${RUNNER_TEMP}/images" \
+              --summary-file "${GITHUB_STEP_SUMMARY}" \
+              --output-file "${GITHUB_OUTPUT}"
+          done
+
+      - name: 降级留证：上传镜像 tar
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lingxi-images-${{ steps.tag.outputs.tag }}
+          path: ${{ runner.temp }}/images
+          if-no-files-found: ignore
+          retention-days: 14
