@@ -50,6 +50,9 @@ printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^vers
 
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
+# 验收矩阵的三态状态列与合同条款覆盖清单（门禁 10.1 / 10.3）。这两样此前只是散文约定：
+# 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
+python3 scripts/ci/check_acceptance_matrix.py
 
 # 半开状态守卫：有容器却没有 DSN 时，Python 真库断言会静默跳过、门禁却照样绿。
 # 这种「看起来跑了真库」的假信心必须直接失败（PR #48 独立复查发现）。
