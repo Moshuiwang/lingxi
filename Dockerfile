@@ -28,8 +28,16 @@ ENV PYTHONUNBUFFERED=1 \
 # 非 root 运行（断言 V-部署-07）。固定 uid/gid 而不是让系统分配：宿主机绑定挂载的
 # 属主要能对上，浮动 uid 会让"换个机器部署就写不进卷"成为一种偶发故障。
 # 10001 落在系统账号区间之外，不与基础镜像既有账号冲突。
+#
+# `useradd` 会往 /etc/shadow 的第 3 字段写「最后一次改密码的日子」——一个
+# **days-since-epoch 整数**（实测建镜像当天是 20671）。它是构建时刻的函数，于是
+# 同一个提交今天建和明天建会得到不同的 /etc/shadow，跨零点的两次构建内容不等价，
+# V-部署-06 的"两次构建等价"就在无人察觉的情况下变成一条会偶发变红的断言。
+# 把它归零：本镜像的账号不用密码登录（shell 是 nologin、密码位是 `!`），这个字段
+# 没有任何运行期意义。（Issue #62 验收 P2-3）
 RUN groupadd --gid 10001 lingxi \
- && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin lingxi
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin lingxi \
+ && sed -i 's/^\(lingxi:[^:]*:\)[^:]*:/\10:/' /etc/shadow
 
 # 两个**不同的**持久卷挂载点（断言 V-部署-03 / M2-62-27 / M2-62-28）：
 #   credentials/ 专用授权凭据（「四达文档会议助手」refresh_token 的加密文件与锁文件）。
@@ -119,6 +127,15 @@ RUN python -m pip install --no-cache-dir --no-compile '.[worker]' \
 
 FROM base AS worker
 COPY --from=build-worker /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+# `useradd --no-create-home` 仍会把 HOME 设成 /home/lingxi，但**那个目录并不存在**，
+# 而 compose 给 worker 的是只读根文件系统——Claude Code CLI 与 MCP 子进程往 $HOME
+# 写配置或会话时会直接失败（实测：`touch $HOME/x` 报 No such file or directory）。
+# 指到 /tmp：compose 给它挂了 tmpfs，可写、随容器消失，天然满足"除用户环境目录外
+# 不写需要持久化的本地状态"（V-部署-02）。
+# **会话不在这里持久化**——worker 本就是单回合作业；跨回合的用户产物走
+# LINGXI_WORKER_WORKSPACE 指向的 /var/lib/lingxi/users 持久卷。
+# CLI 在只读根 + tmpfs HOME 下的真实行为属 stage 验证项，见 deploy/README.md。
+ENV HOME=/tmp
 USER 10001:10001
 WORKDIR /var/lib/lingxi
 # 一次性作业，不是服务：跑完一个回合就退出。调用方按退出码判定

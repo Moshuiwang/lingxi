@@ -43,19 +43,25 @@ services:
     # 数据库"的窗口里，那条 refresh_token 就永久丢失了——飞书侧旧凭据在续期成功那一刻
     # 已作废，一次性有效，没有任何补救手段，只能人工重新授权。
     #
-    # 90 秒的算法（三项相加再留余量）：
+    # 150 秒的算法（三项相加再留余量）：
     #   20.0s  续期 HTTP 超时     REQUEST_TIMEOUT_SECONDS，adapters/feishu_directory.py:33
     #    4.2s  落盘重试退避等待   SAVE_RETRY_BACKOFF_SECONDS=(0.2,1.0,3.0)，apps/scheduler/__init__.py:41
-    #   25.0s  数据库往返预算     4 次 save + 1 次 revoke，每次按 connect_timeout=5 计
+    #   55.0s  数据库往返预算     5 次操作（4 次 save 重试 + 1 次 revoke），
+    #                             每次 = connect_timeout 5s + statement_timeout 3s + 提交 3s
     #   -----
-    #   49.2s  最坏情况 → ×1.5 安全系数 = 74s → 取整到 90s
+    #   79.2s  最坏情况 → ×1.5 安全系数 = 119s → 取整到 150s
+    #
+    # **上一版这里写的是 90 秒，而且算法是错的**（Issue #62 codex 审查 P1-3）：它只把
+    # `connect_timeout` 算进去，而 connect_timeout **只约束建连**，不约束已经发出去的
+    # SELECT / INSERT / commit。一条卡住的语句可以无限期挂着，于是"90 秒是上界"这个
+    # 声称根本不成立。真正的上界要靠 DSN 里的 `statement_timeout` 与 `lock_timeout`
+    # 一起给出——它们是配置层的东西，不需要改 src/。deploy/.env.example 因此把这三个
+    # 参数一并列为必填，`check_deploy_contract.py` 会核对示例 DSN 真的带了它们，
+    # 否则这段算法就只是一段好看的注释。
     #
     # **这个不等式由 scripts/ci/check_deploy_contract.py 自动守住，不是靠这段注释。**
     # 改了 REQUEST_TIMEOUT_SECONDS 而不改这里，门禁会红（断言 M2-62-25）。
-    #
-    # 数据库那 25 秒依赖 DSN 里带 `connect_timeout=5`：psycopg.connect() 在代码里没有
-    # 超时参数，libpq 默认无限等待。deploy/.env.example 因此把 connect_timeout 列为必填。
-    stop_grace_period: 90s
+    stop_grace_period: 150s
 
     # ---- 容器权限最小化（断言 V-部署-07 / M2-62-29 / M2-62-30）----------------
     # 镜像里已经 USER 10001，这里再写一遍是为了让 compose 层面可核对，也防止将来有人
@@ -102,8 +108,10 @@ services:
     restart: "no"
     user: "10001:10001"
     read_only: true
+    # 镜像把 HOME 指到 /tmp，Claude Code CLI 与 MCP 子进程要往那里写配置与会话，
+    # 因此给得比另外两个服务大。
     tmpfs:
-      - /tmp:mode=1777,size=64m
+      - /tmp:mode=1777,size=256m
     security_opt:
       - no-new-privileges:true
     logging:

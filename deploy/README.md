@@ -36,38 +36,52 @@
 
 ## 准备
 
+一个环境要**四个**文件，不是一个：
+
 ```bash
-cp deploy/.env.example deploy/.env.stage    # 或 .env.prod，然后填真值
+cp deploy/.env.example deploy/.env.stage             # 只放 LINGXI_IMAGE_REGISTRY / LINGXI_IMAGE_TAG
+$EDITOR deploy/.env.stage.scheduler                  # 数据库 DSN、Fernet 密钥、飞书应用凭据
+$EDITOR deploy/.env.stage.worker                     # 只有 LINGXI_WORKER_* 与模型端点凭据
+$EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 ```
 
-`.env.stage` / `.env.prod` 匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
+四个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
-`LINGXI_POSTGRES_DSN` **必须带 `connect_timeout=5`**：`psycopg.connect()` 在代码里没有超时参数，libpq 默认无限等待，不设它就没有可计算的停止上界（见下方停止宽限期）。
+**为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
+
+`LINGXI_POSTGRES_DSN` **必须带 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数**，它们共同给出停机上界（见下方）。只设 `connect_timeout` 是不够的：它只约束建连，一条已经发出去的语句可以无限期挂着。
 
 ## 安装与升级
 
+**`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。
+
 ```bash
 # 1. 先跑迁移（一次性作业）
-docker compose -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml \
   --profile job run --rm migrate
 
 # 2. 再启动常驻服务
-docker compose -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
 
 # 3. 回读
-docker compose -f deploy/compose.yaml -f deploy/compose.stage.yaml ps
-docker compose -f deploy/compose.yaml -f deploy/compose.stage.yaml logs scheduler
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml ps
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml logs scheduler
 ```
 
-生产把 `compose.stage.yaml` 换成 `compose.prod.yaml`，其余逐字相同——两份覆盖文件**结构完全一致**，只有 env_file、卷名与扫描间隔不同（`scripts/ci/verify_compose_structure.sh` 每次 CI 都比对这一点）。
+生产把 `.env.stage` 换成 `.env.prod`、`compose.stage.yaml` 换成 `compose.prod.yaml`，其余逐字相同——两份覆盖文件**结构完全一致**，只有 env_file、卷名与扫描间隔不同（`scripts/ci/verify_compose_structure.sh` 每次 CI 都比对这一点）。
 
 **生产只拉镜像，不构建**：三个 compose 文件里没有任何 `build:` 键。这不是纪律而是机制。
 
 ## 回滚
 
 ```bash
-# 把 LINGXI_IMAGE_TAG 改回上一个 tag，然后：
-docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+# 把 deploy/.env.prod 里的 LINGXI_IMAGE_TAG 改回上一个 tag，然后：
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 ```
 
 回滚不触碰数据库，也不触碰两个持久卷。**前提是迁移遵守"先加后删"**：破坏性变更必须拆成两次发布，否则回滚就从"切 tag 重启"变成"恢复数据库备份"。这一条由 `scripts/ci/verify_old_image_new_schema.sh` 在每次 CI 上实测（断言 V-部署-05）。
@@ -75,8 +89,8 @@ docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 ## 恢复入口
 
 ```bash
-docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml down
-docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml down
+docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 ```
 
 数据库备份与恢复遵循 Supabase 托管方案。两个持久卷单独备份。
@@ -92,7 +106,7 @@ docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 
 凭据卷必须**跨部署持久**，镜像替换与重启不得丢失——部署目标是对该凭据「零特殊处理」。文件丢失或过期时的保底是重新走一次「四达文档会议助手」授权（产品负责人 2026-08-05）；正式重授权入口见 [#67](https://github.com/Moshuiwang/lingxi/issues/67)。
 
-## scheduler 的停止宽限期为什么是 90 秒
+## scheduler 的停止宽限期为什么是 150 秒
 
 Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过新凭据、尚未写回数据库"的窗口里，那条 `refresh_token` 就永久丢失了——飞书侧旧凭据在续期成功那一刻已作废，一次性有效，只能人工重新授权。
 
@@ -100,10 +114,14 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 | --- | --- | --- |
 | 续期 HTTP 超时 | 20.0 | `REQUEST_TIMEOUT_SECONDS`，`adapters/feishu_directory.py` |
 | 落盘重试退避等待 | 4.2 | `SAVE_RETRY_BACKOFF_SECONDS=(0.2, 1.0, 3.0)`，`apps/scheduler/__init__.py` |
-| 数据库往返预算 | 25.0 | 4 次 save 重试 + 1 次 revoke，每次按 `connect_timeout=5` 计 |
-| **最坏合计** | **49.2** | × 1.5 安全系数 = 74 秒 → 取整到 **90 秒** |
+| 数据库往返预算 | 55.0 | 5 次操作（4 次 save 重试 + 1 次 revoke）× 11 秒 |
+| **最坏合计** | **79.2** | × 1.5 安全系数 = 119 秒 → 取整到 **150 秒** |
 
-**这个不等式由 `scripts/ci/check_deploy_contract.py` 自动守住，不是靠文档。** 改了 `REQUEST_TIMEOUT_SECONDS` 而不改 compose，门禁会红。
+其中"每次数据库操作 ≤ 11 秒"= `connect_timeout` 5 秒（建连）+ `statement_timeout` 3 秒（语句）+ 3 秒（提交，提交本身也是语句）。
+
+> **早先的版本在这里写的是 90 秒，而且依据是错的。** 它只把 `connect_timeout` 算进去，但 **`connect_timeout` 只约束建连**——连接建好之后，一条卡住的 `SELECT` / `INSERT` / `COMMIT` 可以无限期挂着，于是"90 秒是上界"这个声称根本不成立。真正的上界必须由 DSN 里的 `statement_timeout` 与 `lock_timeout` 一起给出（`lock_timeout` 不能省：等锁的时间不算在 `statement_timeout` 里）。这三个参数都在配置层，不需要改 `src/`。
+
+**这个不等式由 `scripts/ci/check_deploy_contract.py` 自动守住，不是靠文档。** 它同时断言 `deploy/.env.example` 的示例 DSN 真的带了这三个参数——否则上面这张表就只是一张好看的表。改了 `REQUEST_TIMEOUT_SECONDS` 而不改 compose，门禁会红。
 
 `scheduler` 必须**单副本**：进程间互斥靠的是凭据目录里的 `flock` 文件锁，多副本会互相阻塞。
 

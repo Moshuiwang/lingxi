@@ -23,13 +23,19 @@
 .env.*
 *.env
 
-# Python 本地产物：内嵌宿主机绝对路径，见上方说明
-__pycache__
-*.py[cod]
-*.egg-info
+# Python 本地产物：内嵌宿主机绝对路径，见上方说明。
+#
+# **必须带 `**/` 前缀。** Docker 的排除模式按 Go 的 filepath.Match 语义匹配**整条
+# 相对路径**，其中 `*` 不跨 `/`。裸写 `__pycache__` 只能匹配上下文根目录下的那一个，
+# `migrations/alembic/__pycache__` 会照样被打包进去——而本仓库跑一次 alembic 门禁
+# 就会生成它（实测工作树里有 5 个 __pycache__、81 个 .pyc）。
+# 这正是 Issue #62 内审抓到的 P1-2：排除清单看起来写了，实际没生效。
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
 build
 dist
-.venv
+**/.venv
 .tmp
 
 # Node 与 Cloudflare Worker 测试资产
