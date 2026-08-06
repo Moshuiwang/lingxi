@@ -56,6 +56,27 @@ bot-test = [
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",
 ]
+# 数据库迁移（Issue #53）。**这一组不是常驻进程**，是部署时跑一次的迁移作业：
+# `LINGXI_MIGRATION_DSN=... python -m alembic upgrade head`。它单独成组而不是挂进
+# scheduler，有三个理由：
+#   1. 迁移要 DDL 权限、业务进程不要，两者本就该是不同的数据库角色；
+#   2. `src/lingxi/` 里不得出现 sqlalchemy / alembic（断言 V-迁移-04），把它塞进
+#      某个进程组等于声称那个进程运行时需要它，是假的；
+#   3. 生产镜像因此不必为了跑业务而装上 SQLAlchemy。
+# 窄区间而不是 `==`：按 2026-08-06 裁定①，alembic 属迁移工具链，不在运行时进程内，
+# 不是 V-部署-08 所说的"安全边界组件"。上界不能省——alembic 的 revision 解析与
+# 事务语义是次版本可变的，开区间等于允许它在代码没变时改变迁移行为。
+#
+# **psycopg 必须显式列在这里。** alembic 不依赖任何数据库驱动，驱动由 URL 的 scheme
+# 决定；env.py 强制 `postgresql+psycopg`，所以这一组不带 psycopg 就根本连不上库
+# （外审实测：干净环境跑 upgrade 报 `ModuleNotFoundError: No module named 'psycopg'`）。
+# 此前 gate 是绿的，因为它同时装了 scheduler 组，把驱动顺带带了进来——正是「别的组
+# 带进来的包让窄的那组永远不会红」这一类缺陷。区间与 scheduler 组同款。
+# 传递依赖（`pip install '.[migrate]'` 实测闭包，五项）：SQLAlchemy、Mako、MarkupSafe、
+# greenlet、typing-extensions。psycopg-binary 不在此列，它来自上面 `psycopg[binary]`
+# 的直接声明。这份清单在 docs/技术设计/代码框架.md 与 migrations/README.md 各有一份，
+# 三处必须一致。
+migrate = ["alembic>=1.19,<1.20", "psycopg[binary]>=3.2,<4"]
 
 # 角色职能映射是随包发布的配置文件，不是源码。不显式声明就不会进 wheel，
 # 而缺失表现为「全部角色显示未映射」——一种看起来正常的失败。

@@ -99,6 +99,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
     ),
+    # 迁移作业（Issue #53）：部署时跑一次 `python -m alembic upgrade head`，不是常驻
+    # 进程。**lingxi 模块那一列刻意为空**——迁移工具链不得渗入运行时代码
+    # （断言 V-迁移-04：`grep -rn "sqlalchemy\|alembic" src/` 必须为空），
+    # 所以这一组没有任何 lingxi 入口，只有第三方那一列要证明装得上。
+    #
+    # psycopg 与 alembic 并列，不是冗余：alembic 自己不依赖任何驱动，驱动由 URL 的
+    # scheme 决定。少了它，`upgrade head` 在干净环境里报 ModuleNotFoundError，而
+    # 这条矩阵腿是唯一会在干净环境里跑的检查（外审实测出的缺口）。
+    "migrate": ((), ("alembic", "psycopg")),
 }
 
 

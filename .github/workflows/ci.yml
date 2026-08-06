@@ -17,6 +17,9 @@ on:
       - 'migrations/**'
       - 'experiments/**'
       - 'pyproject.toml'
+      # Issue #53：alembic 配置在仓库根目录，不在上面任何一个目录里。漏掉它，
+      # 「改坏迁移配置直推 main」这一路就不会触发完整门禁。
+      - 'alembic.ini'
       - '.github/**'
   workflow_dispatch:
 
@@ -87,8 +90,12 @@ jobs:
       # 装 scheduler 组而不是全量：实测 416 条单测跑完只需要 cryptography 与 psycopg，
       # 不需要 lark-oapi / websockets（两者都只在函数内延迟导入，测试从不走到）。
       # Bot-Test 那一组的依赖由 `CI / extras` 矩阵在干净环境里单独证明装得上。
+      # 追加 migrate 组（Issue #53）：门禁的两处迁移检查真的执行 alembic——
+      # scripts/ci/check_alembic_revisions.py（建 revision 图，无需数据库）与
+      # scripts/ci/check_migration_chain.sh（两条链建库对比）。不装它，这两步会
+      # 明确失败而不是跳过，所以这一行就是 alembic 在 CI 里的安装点。
       - name: 安装测试依赖与锁定版本的 shellcheck
-        run: python3 -m pip install '.[scheduler]' 'shellcheck-py==0.11.0.1'
+        run: python3 -m pip install '.[scheduler,migrate]' 'shellcheck-py==0.11.0.1'
 
       # 测试跑 PYTHONPATH=src，部署跑 pip 装出来的制品；新增子目录会让两者分叉，
       # 而分叉只在部署时才暴露。必须在仓库目录之外跑，否则只是又测了一遍源码树。
@@ -133,12 +140,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
-      # 三组互相独立，一组坏了也要看到另外两组的结论。
+      # 各组互相独立，一组坏了也要看到其余组的结论。
       fail-fast: false
       matrix:
         # 与 pyproject.toml 的 [project.optional-dependencies] 组名保持一致；
         # 新增 extra 时必须同步加进这里，否则新组没有任何检查覆盖。
-        extra: [scheduler, worker, bot-test]
+        # check_installed_package.py 会三方对账（pyproject / 本矩阵 / 脚本），漏加即红。
+        # migrate 是部署时跑一次的迁移作业，不是常驻进程，但同样要证明"单独装得上"：
+        # #62 要为它构建镜像，那时缺依赖就是部署当场失败（Issue #53）。
+        extra: [scheduler, worker, bot-test, migrate]
 
     steps:
       - name: 检出代码
