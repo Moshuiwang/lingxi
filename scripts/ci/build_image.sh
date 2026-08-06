@@ -60,8 +60,16 @@ else
   reference="lingxi-${service}:${tag}"
 fi
 
-printf '构建 %s（target=%s）\n' "${reference}" "${service}"
-docker build --target "${service}" -t "${reference}" "$@" .
+# 源码树哈希：`git ls-files -s` 输出的 sha256。它包含每个受版本控制文件的 blob 哈希与
+# 路径，因此能唯一标识这棵树，且对同一提交恒定——推送幂等判定要的正是这个性质
+# （见 Dockerfile 的来源身份标签说明）。
+source_tree=$(git ls-files -s | sha256sum | cut -d' ' -f1)
+
+printf '构建 %s（target=%s，源 %s）\n' "${reference}" "${service}" "${short_commit}"
+docker build --target "${service}" -t "${reference}" \
+  --build-arg "LINGXI_SOURCE_COMMIT=${commit}" \
+  --build-arg "LINGXI_SOURCE_TREE=${source_tree}" \
+  "$@" .
 
 # 引用写到调用方指定的文件，**默认不写**。往仓库目录里落文件会让 gate 的
 # 「CI 没有改写受版本控制的文件」那一步变红——`git status --porcelain` 把未跟踪文件

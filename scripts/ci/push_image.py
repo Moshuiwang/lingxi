@@ -59,8 +59,9 @@ PERMISSION = "permission"
 OTHER = "other"
 
 # 远端已有同名 tag 时的两种情形。
-TAG_IDENTICAL = "identical"   # 同一个镜像，重跑而已 → 跳过，幂等
-TAG_CONFLICT = "conflict"     # 内容不同 → 拒绝，不可变 tag 不得被覆盖
+TAG_IDENTICAL = "identical"   # 同源，重跑或补推 → 跳过该服务，继续推其余
+TAG_CONFLICT = "conflict"     # 异源 → 拒绝，不可变 tag 不得被覆盖
+TAG_UNKNOWN = "unknown"       # 读不到来源标签 → 拒绝，无法判定时不放行
 
 
 @dataclass(frozen=True)
@@ -88,50 +89,57 @@ def classify_push_failure(output: str) -> str:
     return OTHER
 
 
-def remote_config_digest(reference: str, runner=run_command) -> tuple[bool, str | None]:
-    """远端同名 tag 的 config digest。返回 (是否存在, config digest)。
+# 来源身份标签。推送幂等按**来源**判定，不按 config digest（codex 二轮 P1-2）。
+REVISION_LABEL = "org.opencontainers.image.revision"
+SOURCE_TREE_LABEL = "com.moshuiwang.lingxi.source-tree"
 
-    config digest 就是本地 `docker inspect --format {{.Id}}` 给出的那个值——镜像配置
-    blob 的 sha256。拿它比对，是在**推送之前**判断"远端那个 tag 是不是同一个镜像"的
-    唯一办法：manifest digest 要推上去才知道。
+
+def remote_tag_exists(reference: str, runner=run_command) -> bool:
+    """远端是否已有这个 tag。查不了就抛错，**不能当成"没有"**。
+
+    把一次网络故障读成"远端没有这个 tag"，等于直接放行覆盖——而覆盖不可变 tag 正是
+    这一整段代码要防的事。
     """
 
     result = runner(["docker", "manifest", "inspect", reference])
-    if result.returncode != 0:
-        # 不存在与"查不了"要分开：措辞里带 not found / unknown 才算不存在。
-        combined = f"{result.stdout}\n{result.stderr}".lower()
-        if re.search(r"not found|manifest unknown|no such manifest|not exist", combined):
-            return False, None
-        raise RuntimeError(f"无法查询远端 tag {reference}：{result.stderr.strip()}")
-    try:
-        document = json.loads(result.stdout)
-    except ValueError as error:
-        raise RuntimeError(f"远端 manifest 不是合法 JSON：{error}") from None
-    if "manifests" in document:
-        # 多架构清单：本仓库只构建单架构，出现它说明远端那个 tag 不是我们推的。
-        return True, None
-    digest = (document.get("config") or {}).get("digest")
-    return True, digest
+    if result.returncode == 0:
+        return True
+    combined = f"{result.stdout}\n{result.stderr}".lower()
+    if re.search(r"not found|manifest unknown|no such manifest|not exist", combined):
+        return False
+    raise RuntimeError(f"无法查询远端 tag {reference}：{result.stderr.strip()}")
 
 
-def local_config_digest(reference: str, runner=run_command) -> str | None:
-    result = runner(["docker", "inspect", "--format", "{{.Id}}", reference])
+def image_source_identity(reference: str, runner=run_command) -> tuple[str, str] | None:
+    """读一个**本地**镜像的来源身份（源提交 sha, 源码树哈希）。读不到返回 None。"""
+
+    result = runner([
+        "docker", "inspect", "--format",
+        "{{index .Config.Labels \"%s\"}} {{index .Config.Labels \"%s\"}}"
+        % (REVISION_LABEL, SOURCE_TREE_LABEL),
+        reference,
+    ])
     if result.returncode != 0:
         return None
-    return result.stdout.strip() or None
+    parts = result.stdout.split()
+    if len(parts) != 2 or any(p in ("", "<no value>", "unknown") for p in parts):
+        return None
+    return parts[0], parts[1]
 
 
-def classify_existing_tag(local: str | None, remote: str | None) -> str:
+def classify_existing_tag(local: tuple[str, str] | None, remote: tuple[str, str] | None) -> str:
     """远端已存在同名 tag 时该怎么办。
 
-    不可变 tag 的全部意义在于"同一个 tag 永远指向同一份源码"，而回滚就是切回上一个
-    tag。**`docker push` 默认会直接覆盖远端同名 tag**——一次重跑、一次手滑，
-    上周那个 tag 就指向别的东西了，而回滚的人不会知道（codex 审查 P1-5）。
+    身份是「源提交 sha + 源码树哈希」，两者对同一提交恒定：
+      - 同源 → 这次只是重跑（或一次部分失败后的补推）→ 跳过，幂等。
+      - 异源 → 同一个 tag 指向了别的源码 → 拒绝。不可变 tag 的全部意义在于
+        "同一个 tag 永远指向同一份源码"，而回滚正建立在它之上。
+      - 任一侧读不到标签 → 拒绝。无法判定时放行覆盖是最坏的选择。
     """
 
-    if remote is None or local is None:
-        return TAG_CONFLICT
-    return TAG_IDENTICAL if remote == local else TAG_CONFLICT
+    if local is None or remote is None:
+        return TAG_UNKNOWN
+    return TAG_IDENTICAL if local == remote else TAG_CONFLICT
 
 
 def read_back_digest(reference: str, runner=run_command) -> str | None:
@@ -165,46 +173,67 @@ def main() -> int:
 
     reference = args.reference
 
-    # ---- 推送前：不可变 tag 不得被覆盖（codex 审查 P1-5）--------------------
-    # `docker push` 默认直接覆盖远端同名 tag。不拦这一下，"同一个 tag 永远指向同一份
-    # 源码"这条承诺就只是口头的，而回滚正建立在它之上。
+    # ---- 推送前：不可变 tag 不得被覆盖（codex 审查 P1-5 / 二轮 P1-2）--------
+    # 身份按**来源**判定（源提交 sha + 源码树哈希），不按 config digest：后者含
+    # created / history 时间戳，同一提交两次构建必然不同，会把每一次重跑都误判成冲突，
+    # 于是一次部分推送失败之后就再也推不上去了。
+    local_identity = image_source_identity(reference)
+    if local_identity is None:
+        print(
+            f"本地镜像 {reference} 读不到来源标签（{REVISION_LABEL} / {SOURCE_TREE_LABEL}）。"
+            "\n  没有来源身份就无法判定远端同名 tag 是不是同一份源码，拒绝推送。"
+            "\n  镜像应由 scripts/ci/build_image.sh 构建，它会带上这两个标签。",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
-        exists, remote_digest = remote_config_digest(reference)
+        exists = remote_tag_exists(reference)
     except RuntimeError as error:
         print(f"推送前无法确认远端 tag 状态，拒绝推送：{error}", file=sys.stderr)
         return 1
 
     if exists:
-        local_digest = local_config_digest(reference)
-        verdict = classify_existing_tag(local_digest, remote_digest)
-        if verdict is TAG_CONFLICT:
-            print(
-                f"拒绝推送：远端已存在 {reference}，且内容与本地不同。\n"
-                f"  远端 config digest：{remote_digest}\n"
-                f"  本地 config digest：{local_digest}\n"
-                "  不可变 tag 一旦被覆盖，'回滚 = 切回上一个 tag' 就不再成立——"
-                "切回去的人拿到的会是别的镜像，而且没有任何提示。\n"
-                "  正确做法是用新的提交产出新的 tag，不是覆盖旧的。",
-                file=sys.stderr,
-            )
-            write_line(args.output_file, "pushed=false")
+        # 读远端的来源标签要把它拉下来——标签在 config blob 里，`manifest inspect`
+        # 给不了。只有"远端已存在"这一条路径会拉，且拉完必定是跳过或拒绝，
+        # 不会再用到本地那个 tag，所以覆盖本地 tag 没有副作用。
+        pull = run_command(["docker", "pull", "--quiet", reference])
+        if pull.returncode != 0:
+            print(f"远端已有 {reference} 但拉不下来，无法判定来源，拒绝推送：{pull.stderr.strip()}", file=sys.stderr)
+            return 1
+        remote_identity = image_source_identity(reference)
+        verdict = classify_existing_tag(local_identity, remote_identity)
+
+        if verdict is TAG_IDENTICAL:
+            # 同源：这次是重跑，或是上一次部分推送失败之后的补推。跳过**这一个**服务，
+            # 调用方继续推其余——这正是"部分失败可恢复"的含义。
+            print(f"远端已有 {reference} 且来源相同（{local_identity[0][:12]}），跳过。")
+            write_line(args.output_file, "pushed=skipped")
             write_line(
                 args.summary_file,
-                f"### 拒绝推送：不可变 tag 会被覆盖\n\n"
-                f"- 引用：`{reference}`\n"
-                f"- 远端 config digest：`{remote_digest}`\n"
-                f"- 本地 config digest：`{local_digest}`\n",
+                f"### 镜像已在 GHCR，来源相同，跳过推送\n\n"
+                f"- 引用：`{reference}`\n- 源提交：`{local_identity[0]}`\n",
             )
-            return 1
-        print(f"远端已存在 {reference} 且内容一致（{remote_digest}），跳过推送。")
-        write_line(args.output_file, "pushed=skipped")
-        write_line(args.output_file, f"digest={remote_digest}")
+            return 0
+
+        reason = (
+            "读不到远端的来源标签" if verdict is TAG_UNKNOWN
+            else f"远端来源 {remote_identity[0] if remote_identity else '?'} 与本地 {local_identity[0]} 不同"
+        )
+        print(
+            f"拒绝推送：远端已存在 {reference}，但{reason}。\n"
+            "  不可变 tag 一旦被覆盖，'回滚 = 切回上一个 tag' 就不再成立——"
+            "切回去的人拿到的会是别的镜像，而且没有任何提示。\n"
+            "  正确做法是用新的提交产出新的 tag，不是覆盖旧的。",
+            file=sys.stderr,
+        )
+        write_line(args.output_file, "pushed=false")
         write_line(
             args.summary_file,
-            f"### 镜像已在 GHCR，内容一致，跳过推送\n\n"
-            f"- 引用：`{reference}`\n- config digest：`{remote_digest}`\n",
+            f"### 拒绝推送：不可变 tag 会被覆盖\n\n"
+            f"- 引用：`{reference}`\n- 判定：{reason}\n",
         )
-        return 0
+        return 1
 
     print(f"推送 {reference}")
     result = run_command(["docker", "push", reference])

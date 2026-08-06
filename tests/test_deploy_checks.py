@@ -211,48 +211,71 @@ class PushFailureClassificationTest(unittest.TestCase):
 
 
 class ImmutableTagOverwriteTest(unittest.TestCase):
-    """不可变 tag 不得被覆盖（codex 审查 P1-5）。
+    """不可变 tag 不得被覆盖，但**重跑必须幂等**（codex P1-5 + 二轮 P1-2）。
 
-    `docker push` 默认直接覆盖远端同名 tag。不拦这一下，"同一个 tag 永远指向同一份
-    源码"就只是口头承诺，而回滚正建立在它之上——切回去的人会拿到别的镜像，且无提示。
+    第一版拿 config digest 当身份，那是错的：config 里有 created 与 history 时间戳，
+    同一提交两次构建必然不同（实测两个不同的 Id）。于是每一次重跑都会被判成冲突，
+    一次部分推送失败之后就再也推不上去——一个把自己锁死的守卫。
+    身份改用来源：源提交 sha + 源码树哈希，两者对同一提交恒定。
     """
 
-    def test_same_content_is_skipped(self) -> None:
-        digest = "sha256:" + "a" * 64
-        self.assertEqual(PUSH.classify_existing_tag(digest, digest), PUSH.TAG_IDENTICAL)
+    SOURCE = ("8e26bc6b2f40383e7b9d33955d8b770352fa726b", "6d04c0a84f19")
+    OTHER = ("0000000000000000000000000000000000000000", "ffffffffffff")
 
-    def test_different_content_is_refused(self) -> None:
-        local = "sha256:" + "a" * 64
-        remote = "sha256:" + "b" * 64
-        self.assertEqual(PUSH.classify_existing_tag(local, remote), PUSH.TAG_CONFLICT)
+    def test_rerun_of_same_commit_is_skipped(self) -> None:
+        self.assertEqual(PUSH.classify_existing_tag(self.SOURCE, self.SOURCE), PUSH.TAG_IDENTICAL)
 
-    def test_unknown_digest_is_refused_not_allowed(self) -> None:
-        # 读不到 digest 时必须**拒绝**，不能当成"大概是同一个"放行。
-        digest = "sha256:" + "a" * 64
-        self.assertEqual(PUSH.classify_existing_tag(digest, None), PUSH.TAG_CONFLICT)
-        self.assertEqual(PUSH.classify_existing_tag(None, digest), PUSH.TAG_CONFLICT)
+    def test_different_source_is_refused(self) -> None:
+        self.assertEqual(PUSH.classify_existing_tag(self.SOURCE, self.OTHER), PUSH.TAG_CONFLICT)
+
+    def test_same_commit_but_different_tree_is_refused(self) -> None:
+        # 同一个 commit sha 却是不同的树（例如带未提交改动构建出来的），仍算异源。
+        mutated = (self.SOURCE[0], "aaaaaaaaaaaa")
+        self.assertEqual(PUSH.classify_existing_tag(self.SOURCE, mutated), PUSH.TAG_CONFLICT)
+
+    def test_unreadable_labels_are_refused_not_allowed(self) -> None:
+        # 无法判定时放行覆盖是最坏的选择。
+        self.assertEqual(PUSH.classify_existing_tag(self.SOURCE, None), PUSH.TAG_UNKNOWN)
+        self.assertEqual(PUSH.classify_existing_tag(None, self.SOURCE), PUSH.TAG_UNKNOWN)
 
     def _runner(self, returncode: int, stdout: str = "", stderr: str = ""):
         return lambda argv: PUSH.CommandResult(returncode, stdout, stderr)
 
     def test_absent_tag_reports_not_exists(self) -> None:
         runner = self._runner(1, stderr="manifest unknown: manifest unknown")
-        exists, digest = PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
-        self.assertFalse(exists)
-        self.assertIsNone(digest)
+        self.assertFalse(PUSH.remote_tag_exists("ghcr.io/x/y:z", runner=runner))
+
+    def test_existing_tag_reports_exists(self) -> None:
+        runner = self._runner(0, stdout="{}")
+        self.assertTrue(PUSH.remote_tag_exists("ghcr.io/x/y:z", runner=runner))
 
     def test_query_failure_raises_rather_than_assuming_absent(self) -> None:
-        # 网络故障不能被读成"远端没有这个 tag"——那会直接把覆盖放行。
+        # 网络故障被读成"远端没有这个 tag"，等于直接放行覆盖。
         runner = self._runner(1, stderr="net/http: TLS handshake timeout")
         with self.assertRaises(RuntimeError):
-            PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
+            PUSH.remote_tag_exists("ghcr.io/x/y:z", runner=runner)
 
-    def test_existing_tag_returns_config_digest(self) -> None:
-        digest = "sha256:" + "c" * 64
-        runner = self._runner(0, stdout=json.dumps({"config": {"digest": digest}}))
-        exists, found = PUSH.remote_config_digest("ghcr.io/x/y:z", runner=runner)
-        self.assertTrue(exists)
-        self.assertEqual(found, digest)
+    def test_identity_is_read_from_labels(self) -> None:
+        runner = self._runner(0, stdout="8e26bc6b2f40 6d04c0a84f19\n")
+        self.assertEqual(
+            PUSH.image_source_identity("x:y", runner=runner), ("8e26bc6b2f40", "6d04c0a84f19")
+        )
+
+    def test_missing_labels_yield_none(self) -> None:
+        for stdout in ("<no value> <no value>\n", "unknown unknown\n", "\n"):
+            self.assertIsNone(PUSH.image_source_identity("x:y", runner=self._runner(0, stdout=stdout)))
+
+    def test_partial_failure_is_recoverable(self) -> None:
+        """一次部分推送失败之后的补推：已推上去的跳过，没推的照常推。
+
+        这正是 digest 方案做不到的——它会把已推上去的那个判成冲突并整体卡死。
+        """
+
+        already_pushed = PUSH.classify_existing_tag(self.SOURCE, self.SOURCE)
+        self.assertEqual(already_pushed, PUSH.TAG_IDENTICAL, "已推上去的应跳过而不是冲突")
+        # 没推上去的那个远端不存在，走的是 remote_tag_exists → False → 正常推送路径。
+        runner = self._runner(1, stderr="manifest unknown")
+        self.assertFalse(PUSH.remote_tag_exists("ghcr.io/x/lingxi-worker:t", runner=runner))
 
 
 class OverrideBypassTest(unittest.TestCase):

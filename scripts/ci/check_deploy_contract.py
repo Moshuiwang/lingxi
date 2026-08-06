@@ -560,6 +560,28 @@ def check_ci_workflow() -> list[str]:
                 f"ci.yml 的 push `paths:` 没有 `{needed}`：改坏它直推 main 不会触发完整门禁。"
             )
 
+    # codex 二轮 P1-1：`packages: write` 只能出现在**不随 PR 跑**的 job 上。
+    #
+    # `permissions` 是按 job 生效的，而同仓分支的 pull_request 事件会让该 job 拿到所
+    # 声明的令牌。把写权限放在一个 PR 也会跑的 job 上，等于任何人改一行 workflow 就能
+    # 在 PR 阶段推 / 覆盖 GHCR，"合并后才发布"这道门整个绕过去。
+    # 判据：含 `packages: write` 的 job 必须同时有 `if:` 限定 push + refs/heads/main。
+    for match in re.finditer(r"^  (\w+):\n(.*?)(?=^  \w+:\n|\Z)", text, re.MULTILINE | re.DOTALL):
+        job_name, body = match.group(1), match.group(2)
+        # 只看 job 头部（steps 之前），避免把步骤里的字符串误当成 job 级声明。
+        header = body.split("\n    steps:", 1)[0]
+        if not re.search(r"^\s*packages:\s*write\s*$", header, re.MULTILINE):
+            continue
+        gated = re.search(r"^\s*if:.*github\.event_name\s*==\s*'push'", header, re.MULTILINE) and \
+            re.search(r"^\s*if:.*refs/heads/main", header, re.MULTILINE)
+        if not gated:
+            failures.append(
+                f"ci.yml 的 job `{job_name}` 声明了 `packages: write`，但没有 "
+                "`if: github.event_name == 'push' && github.ref == 'refs/heads/main'` 限定。\n"
+                "      同仓分支的 pull_request 会让这个 job 照样拿到写令牌——"
+                "改一行 workflow 就能在 PR 阶段推 / 覆盖 GHCR，绕过合并门禁。"
+            )
+
     # M2-62-35 / D15：推送步骤不得吞错。
     if "push_image.py" in text:
         for line in text.splitlines():

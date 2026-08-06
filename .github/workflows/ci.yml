@@ -211,11 +211,12 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [gate, extras]
     timeout-minutes: 45
-    # M2-62-32：`packages: write` **只在本 job 声明**。workflow 级保持 contents: read，
-    # gate 与 extras 不因为本 job 需要推镜像而跟着提权。
+    # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
+    # 同仓分支的 PR job 会**照样拿到**这里声明的令牌——于是一个被改造过的 workflow
+    # 可以在 PR 阶段就推 / 覆盖 GHCR，把"合并后才发布"这道门整个绕过去。
+    # 推送因此拆到下面独立的 publish job，只在 push + main 触发。
     permissions:
       contents: read
-      packages: write
 
     steps:
       # 两份检出，**两个不同长度的绝对路径**。可复现性判定要求"同一提交、两个不同
@@ -305,36 +306,74 @@ jobs:
         working-directory: build-a
         run: scripts/ci/verify_compose_structure.sh
 
-      # ---- GHCR 推送：只在合并进 main 之后 -----------------------------------
-      # PR 阶段不推：fork 来的 PR 拿不到 packages 权限，而且把每个 PR 的镜像都推上去
-      # 会让仓库里堆满永远不会被部署的 tag。真实推送验证按编排者安排留在合并后。
+  # Issue #62：镜像发布。**与构建验证分开的独立 job**（codex 二轮 P1-1）。
+  #
+  # 拆开的理由不是整洁，是权限边界：`permissions` 是**按 job** 生效的，而同仓分支的
+  # pull_request 事件会让该 job 拿到所声明的令牌。把 `packages: write` 写在会随 PR 跑的
+  # image job 上，等于任何人改一行 workflow 就能在 PR 阶段推 / 覆盖 GHCR——合并门禁
+  # 形同虚设。本 job 只在 push 到 main 时存在，PR 上根本不会实例化。
+  #
+  # 它重新构建而不是从 image job 搬运产物：三个镜像约 1.1 GB，artifact 往返比重建慢；
+  # 而"同一提交两次构建内容等价"已由 image job 用两个独立路径的干净检出实测过
+  # （V-部署-06），所以重建出来的就是被验证过的那一份。
+  publish:
+    name: CI / publish
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [gate, extras, image]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 计算不可变 tag
+        id: tag
+        run: |
+          batch=$(date -u +%Y%m%d)
+          short=$(echo "${GITHUB_SHA}" | cut -c1-12)
+          echo "batch=${batch}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
+
+      - name: 构建三个镜像
+        env:
+          LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
+          LINGXI_IMAGE_COMMIT: ${{ github.sha }}
+          LINGXI_IMAGE_REGISTRY: ghcr.io/moshuiwang
+        run: |
+          for service in scheduler migrate worker; do
+            scripts/ci/build_image.sh "${service}"
+          done
+
       - name: 登录 GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       # 推送成功 → 独立回读 digest 写进 summary。
+      # 远端已有同名 tag 且**来源相同** → 跳过该服务，继续推其余（部分失败可恢复）。
+      # 远端已有同名 tag 但来源不同 → 判红，不可变 tag 不得被覆盖。
       # 权限不足 → 显式降级：存 tar、summary 写明「未推送」、发 ::warning::，job 仍绿。
-      # 其他失败 → 判红。三条路径的分支逻辑在 scripts/ci/push_image.py 里，
-      # **不使用 continue-on-error，也不使用 `|| true`**：那样会让三条路径长得一样。
+      # 其他失败 → 判红。分支逻辑在 scripts/ci/push_image.py 里，
+      # **不使用 continue-on-error，也不使用 `|| true`**：那样几条路径会长得一样。
       - name: 推送镜像到 GHCR（权限不足则降级留证）
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: build-a
         env:
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           for service in scheduler migrate worker; do
-            reference="ghcr.io/moshuiwang/lingxi-${service}:${IMAGE_TAG}"
-            docker tag "lingxi-${service}:build-a" "${reference}"
-            python3 scripts/ci/push_image.py "${reference}" \
+            python3 scripts/ci/push_image.py \
+              "ghcr.io/moshuiwang/lingxi-${service}:${IMAGE_TAG}" \
               --artifact-dir "${RUNNER_TEMP}/images" \
               --summary-file "${GITHUB_STEP_SUMMARY}" \
               --output-file "${GITHUB_OUTPUT}"
           done
 
       - name: 降级留证：上传镜像 tar
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lingxi-images-${{ steps.tag.outputs.tag }}

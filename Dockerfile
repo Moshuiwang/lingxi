@@ -94,6 +94,20 @@ RUN python -m pip install --no-cache-dir --no-compile '.[scheduler]' \
 
 FROM base AS scheduler
 COPY --from=build-scheduler /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+# ---- 来源身份标签（Issue #62 codex 二轮 P1-2）--------------------------------
+# 推送幂等**不能**拿 config digest 当身份：同一提交两次构建的 config 里 `created` 与
+# `history` 时间戳必然不同（实测两次 --no-cache 构建得到两个不同的 Id），于是"远端已有
+# 同名 tag"会被判成内容冲突，重跑永远卡死；一次部分推送失败之后就再也推不上去了。
+#
+# 身份改用**来源**：源提交 sha + 源码树哈希。两者对同一提交恒定，因此
+#   - 重跑 → 同源 → 跳过该服务，继续推其余（部分失败可恢复）
+#   - 真的换了源码 → 异源 → 拒绝，不可变 tag 不得被覆盖
+# 标签值对同一提交恒定，所以它不破坏"两次构建内容等价"——两边标签一模一样。
+ARG LINGXI_SOURCE_COMMIT=unknown
+ARG LINGXI_SOURCE_TREE=unknown
+LABEL org.opencontainers.image.revision="${LINGXI_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Moshuiwang/lingxi" \
+      com.moshuiwang.lingxi.source-tree="${LINGXI_SOURCE_TREE}"
 USER 10001:10001
 WORKDIR /var/lib/lingxi
 # 常驻服务。停止语义见 deploy/compose.yaml 的 stop_grace_period：收到 SIGTERM 后
@@ -106,6 +120,20 @@ RUN python -m pip install --no-cache-dir --no-compile '.[migrate]' \
 
 FROM base AS migrate
 COPY --from=build-migrate /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+# ---- 来源身份标签（Issue #62 codex 二轮 P1-2）--------------------------------
+# 推送幂等**不能**拿 config digest 当身份：同一提交两次构建的 config 里 `created` 与
+# `history` 时间戳必然不同（实测两次 --no-cache 构建得到两个不同的 Id），于是"远端已有
+# 同名 tag"会被判成内容冲突，重跑永远卡死；一次部分推送失败之后就再也推不上去了。
+#
+# 身份改用**来源**：源提交 sha + 源码树哈希。两者对同一提交恒定，因此
+#   - 重跑 → 同源 → 跳过该服务，继续推其余（部分失败可恢复）
+#   - 真的换了源码 → 异源 → 拒绝，不可变 tag 不得被覆盖
+# 标签值对同一提交恒定，所以它不破坏"两次构建内容等价"——两边标签一模一样。
+ARG LINGXI_SOURCE_COMMIT=unknown
+ARG LINGXI_SOURCE_TREE=unknown
+LABEL org.opencontainers.image.revision="${LINGXI_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Moshuiwang/lingxi" \
+      com.moshuiwang.lingxi.source-tree="${LINGXI_SOURCE_TREE}"
 # 迁移随镜像进制品（migrations/README.md 的书面承诺，2026-08-06 裁定⑥）：
 # 迁移作业不在生产机现场构建、不从仓库拉取，与业务进程用同一个镜像 tag，
 # 因此"镜像 tag 即冻结版本"对迁移同样成立。
@@ -127,6 +155,20 @@ RUN python -m pip install --no-cache-dir --no-compile '.[worker]' \
 
 FROM base AS worker
 COPY --from=build-worker /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+# ---- 来源身份标签（Issue #62 codex 二轮 P1-2）--------------------------------
+# 推送幂等**不能**拿 config digest 当身份：同一提交两次构建的 config 里 `created` 与
+# `history` 时间戳必然不同（实测两次 --no-cache 构建得到两个不同的 Id），于是"远端已有
+# 同名 tag"会被判成内容冲突，重跑永远卡死；一次部分推送失败之后就再也推不上去了。
+#
+# 身份改用**来源**：源提交 sha + 源码树哈希。两者对同一提交恒定，因此
+#   - 重跑 → 同源 → 跳过该服务，继续推其余（部分失败可恢复）
+#   - 真的换了源码 → 异源 → 拒绝，不可变 tag 不得被覆盖
+# 标签值对同一提交恒定，所以它不破坏"两次构建内容等价"——两边标签一模一样。
+ARG LINGXI_SOURCE_COMMIT=unknown
+ARG LINGXI_SOURCE_TREE=unknown
+LABEL org.opencontainers.image.revision="${LINGXI_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Moshuiwang/lingxi" \
+      com.moshuiwang.lingxi.source-tree="${LINGXI_SOURCE_TREE}"
 # `useradd --no-create-home` 仍会把 HOME 设成 /home/lingxi，但**那个目录并不存在**，
 # 而 compose 给 worker 的是只读根文件系统——Claude Code CLI 与 MCP 子进程往 $HOME
 # 写配置或会话时会直接失败（实测：`touch $HOME/x` 报 No such file or directory）。
