@@ -34,7 +34,10 @@ jobs:
   gate:
     name: CI / gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
+    # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
+    # 触顶被杀（见 26e9973 的重触发说明）。10 分钟吸收绝大多数波动。
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -138,7 +141,9 @@ jobs:
   extras:
     name: CI / extras (${{ matrix.extra }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 同一次波动里 bot-test 腿也曾 5 分钟触顶；migrate 腿在争抢下实测过 4m32s。
+    # 每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且仍能挡住真正的挂死。
+    timeout-minutes: 8
     strategy:
       # 各组互相独立，一组坏了也要看到其余组的结论。
       fail-fast: false
