@@ -7,14 +7,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import unittest
 
-_MIGRATIONS = (
-    "migrations/010_create_galaxy_import_batch.sql",
-    "migrations/011_create_galaxy_user_and_role.sql",
-    "migrations/012_create_galaxy_country_scope.sql",
-)
+from postgres_schema import rebuild_production_schema
 
 _GALAXY_TABLES = (
     "galaxy_user",
@@ -91,12 +86,10 @@ class GalaxyImportPostgresTest(unittest.TestCase):
 
         cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
-        root = Path(__file__).parents[1]
+        # 建的是**整条**生产链，不是这几张银河表：013 的清理函数同时引用银河与
+        # 组织快照两侧，按表挑迁移会建不起来。链由 glob 取，新增迁移自动进来。
         with psycopg.connect(cls._dsn) as connection, connection.cursor() as cursor:
-            for table in _GALAXY_TABLES:
-                cursor.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-            for relative in _MIGRATIONS:
-                cursor.execute((root / relative).read_text(encoding="utf-8"))
+            cls._applied = rebuild_production_schema(cursor)
 
     def setUp(self) -> None:
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
@@ -326,13 +319,20 @@ class GalaxyImportPostgresTest(unittest.TestCase):
         self.assertEqual(self.store.current_batch_id(), confirmed.batch_id)
 
     def test_an_expired_batch_is_not_the_current_batch(self) -> None:
-        """Codex 复查 P1：过期批次不算「当前有效」——清理没跑不等于快照还新鲜。"""
-        result = self._import()
+        """Codex 复查 P1：过期批次不算「当前有效」——清理没跑不等于快照还新鲜。
+
+        构造方式随 #54 改了：到期时间现在由触发器锚定在 `started_at + 2160h` 上，
+        直接 UPDATE `expires_at` 会被覆盖回去。要得到一个过期批次，只能让它的
+        **来源时间**足够旧——这正是"到期时间不可后移"想要的效果，断言本身没变。
+        """
         self._execute(
-            "UPDATE galaxy_import_batch SET expires_at = now() - interval '1 hour' WHERE id = %s",
-            (result.batch_id,),
+            "INSERT INTO galaxy_import_batch "
+            "(id, source_label, source_digest, status, started_at, completed_at) "
+            "VALUES ('gib_stale', '过期导出（测试）', 'digest-stale', 'complete', %s, %s)",
+            ("2026-01-01 00:00:00+00", "2026-01-01 00:00:00+00"),
         )
 
+        self.assertEqual(self._count("galaxy_import_batch", "WHERE status = 'complete'"), 1)
         self.assertIsNone(self.store.current_batch_id())
 
     def test_batch_records_source_label_and_row_counts_per_table(self) -> None:
@@ -351,6 +351,28 @@ class GalaxyImportPostgresTest(unittest.TestCase):
 
         self.assertIsNotNone(
             self._scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (result.batch_id,))
+        )
+
+    def test_the_normal_import_path_is_not_broken_by_the_expiry_trigger(self) -> None:
+        """D-04：`staging → complete` 是导入器的正常收尾路径（galaxy_import.py:218）。
+
+        #54 给这张表补上 `BEFORE INSERT OR UPDATE` 触发器之后，最容易出的事故就是
+        把这条路径打断——它每次导入都要跑，而触发器会拒绝改来源时间。这里确认
+        导入照常成功，且到期时间在 INSERT 与 UPDATE 两次触发后仍锚在同一个来源时间上。
+        """
+        result = self._import()
+
+        self.assertEqual(result.outcome, "imported")
+        self.assertEqual(
+            self._scalar("SELECT status FROM galaxy_import_batch WHERE id = %s", (result.batch_id,)),
+            "complete",
+        )
+        self.assertTrue(
+            self._scalar(
+                "SELECT expires_at = started_at + interval '2160 hours' "
+                "FROM galaxy_import_batch WHERE id = %s",
+                (result.batch_id,),
+            )
         )
 
 

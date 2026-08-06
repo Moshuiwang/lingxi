@@ -26,7 +26,14 @@ from pathlib import Path
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError
 from lingxi.adapters.delegated_credentials import StoredCredential
-from lingxi.apps.scheduler import CredentialRotationLoop, SchedulerConfig
+from lingxi.apps.scheduler import (
+    CredentialRotationLoop,
+    RetentionCleanupDuty,
+    RotationReport,
+    SchedulerConfig,
+    SchedulerLoop,
+    build_loop,
+)
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 
 
@@ -283,6 +290,140 @@ class RotationLoopTest(unittest.TestCase):
 
         self.assertTrue(loop.stopping)
         self.assertEqual(report.claimed, 0)
+
+
+class SchedulerLoopTest(unittest.TestCase):
+    """多职责编排：失败隔离与停止语义（认领 V-保留-15、V-保留-17 的可注入部分）。
+
+    这些用例不碰数据库——它们要证明的是**结构**：一个职责抛异常时另一个职责这一轮
+    照样跑。用真库跑反而更难构造"清理必然失败"的场景。真库侧的观察点在
+    `tests/test_retention_postgres.py`。
+    """
+
+    class RecordingDuty:
+        def __init__(self, name: str, *, explode: bool = False) -> None:
+            self.name = name
+            self.calls = 0
+            self._explode = explode
+
+        def run_once(self) -> str:
+            self.calls += 1
+            if self._explode:
+                raise RuntimeError(f"{self.name} 模拟失败")
+            return f"{self.name}-ok"
+
+    def test_a_failing_duty_does_not_skip_the_other_one_in_the_same_round(self) -> None:
+        """V-保留-15（验收 F-02）：隔离由 `SchedulerLoop.run_once` 的逐职责 try 保证。
+
+        两个方向都验：清理炸不影响轮换、轮换炸不影响清理。只验一个方向的话，
+        把 try 写在循环外面（第一个职责失败就跳过其余）仍然能通过其中一半。
+        """
+        for exploding_index in (0, 1):
+            with self.subTest(exploding=exploding_index):
+                duties = [
+                    self.RecordingDuty("凭据轮换", explode=exploding_index == 0),
+                    self.RecordingDuty("保留清理", explode=exploding_index == 1),
+                ]
+                loop = SchedulerLoop(duties=duties, interval_seconds=0.01)
+
+                with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
+                    reports = loop.run_once()
+
+                self.assertEqual([duty.calls for duty in duties], [1, 1], "两个职责本轮都必须被调用")
+                self.assertEqual(reports[exploding_index], None)
+                self.assertEqual(reports[1 - exploding_index], f"{duties[1 - exploding_index].name}-ok")
+                self.assertTrue(any(duties[exploding_index].name in line for line in captured.output))
+
+    def test_repeated_failures_never_stop_the_process(self) -> None:
+        """V-保留-15（验收 F-03）：连续失败不退出；日志只记异常类型，不记正文。"""
+        exploding = self.RecordingDuty("保留清理", explode=True)
+        loop = SchedulerLoop(duties=(exploding,), interval_seconds=0.01)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
+            for _round in range(5):
+                loop.run_once()
+
+        self.assertEqual(exploding.calls, 5)
+        self.assertTrue(all("模拟失败" not in line for line in captured.output), "异常正文不得进日志")
+        self.assertTrue(any("RuntimeError" in line for line in captured.output))
+
+    def test_a_stopping_loop_lets_no_duty_claim_new_work(self) -> None:
+        """V-保留-17（验收 F-06）：停止之后一个职责都不再领取。"""
+        duties = [self.RecordingDuty("凭据轮换"), self.RecordingDuty("保留清理")]
+        loop = SchedulerLoop(duties=duties, interval_seconds=0.01)
+
+        loop.request_stop()
+        reports = loop.run_once()
+
+        self.assertTrue(loop.stopping)
+        self.assertEqual([duty.calls for duty in duties], [0, 0])
+        self.assertEqual(reports, (None, None))
+
+    def test_one_stop_signal_reaches_every_duty(self) -> None:
+        """SIGTERM 只设一个标志，全部职责必须同时停止领取。"""
+        stop = threading.Event()
+        rotation = CredentialRotationLoop(
+            vault=FakeVault([credential()]),
+            authorization=FakeAuthorization(replacement_grant()),
+            interval_seconds=0.01,
+            stop=stop,
+        )
+        cleanup = RetentionCleanupDuty(cleaner=self.RecordingDuty("保留清理"), stop=stop)
+        loop = SchedulerLoop(duties=(rotation, cleanup), interval_seconds=0.01, stop=stop)
+
+        loop.request_stop()
+
+        self.assertTrue(rotation.stopping)
+        self.assertTrue(cleanup.stopping)
+        self.assertEqual(rotation.run_once(), RotationReport())
+        self.assertIsNone(cleanup.run_once())
+
+    def test_the_retention_duty_calls_the_cleaner_exactly_once_per_round(self) -> None:
+        """每轮只调一次：一次调用就是一个事务，"删空为止"会让退出时间失去上界。"""
+        cleaner = self.RecordingDuty("清理器")
+        duty = RetentionCleanupDuty(cleaner=cleaner)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="INFO"):
+            for _round in range(3):
+                duty.run_once()
+
+        self.assertEqual(cleaner.calls, 3)
+
+    def test_a_process_without_any_duty_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            SchedulerLoop(duties=(), interval_seconds=1)
+
+
+class BuildLoopTest(unittest.TestCase):
+    def test_the_assembled_process_carries_both_duties(self) -> None:
+        """"谁会调用它"的落点：清理职责由**已存在**的 `lingxi-scheduler` 进程装配。
+
+        `build_loop` 是 `main()` 唯一的装配入口（本模块 `main` 内），因此这条断言
+        就是"新增的清理代码真的有调用方"的证据。
+        """
+        import tempfile
+
+        from cryptography.fernet import Fernet
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = SchedulerConfig.from_env(
+            {
+                **COMPLETE_ENV,
+                # 装配会真的构造凭据保管对象，需要一个有效的 Fernet 密钥与可写路径；
+                # 两者都是本地临时物，不涉及任何真实凭据。
+                "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+                "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(directory.name) / "delegated.enc"),
+            }
+        )
+
+        loop = build_loop(config)
+
+        self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理"])
+        self.assertIsInstance(loop, SchedulerLoop)
+        # 一个停止标志贯穿全部职责。
+        loop.request_stop()
+        self.assertTrue(all(duty.stopping for duty in loop.duties))
 
 
 class SigtermTest(unittest.TestCase):

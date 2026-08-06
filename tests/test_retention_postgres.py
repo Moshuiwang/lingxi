@@ -1,0 +1,1058 @@
+"""九十天保留清理机制的真实 PostgreSQL 断言（Issue #54 / S9）。
+
+认领断言：V-保留-01…20（[验证与门禁](../docs/技术设计/验证与门禁.md)「数据保留清理」）。
+
+缺 ``LINGXI_POSTGRES_DSN`` 时整类跳过并说明原因，不静默通过：这里几乎每一条
+断言的对象都是数据库自己的行为——触发器、级联、函数权限、搜索路径——在没有真库的
+环境里"通过"只意味着一行都没执行。
+
+数据全部为虚构化名，不含任何真实人员数据。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+import unittest
+from datetime import timedelta
+
+from postgres_schema import MIGRATIONS_DIRECTORY, REPOSITORY_ROOT, rebuild_production_schema
+
+SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，保留清理断言未验证（需真实 PostgreSQL 16）"
+
+RETENTION_WINDOW = timedelta(hours=2160)
+DOWNGRADE_SQL = MIGRATIONS_DIRECTORY / "downgrades" / "013_drop_retention_cleanup.sql"
+UPGRADE_SQL = MIGRATIONS_DIRECTORY / "013_create_retention_cleanup.sql"
+
+# 8 条 ON DELETE CASCADE 边，逐条列出（子表, 父表, 外键列）。
+# 合并成一个总数会让"漏了一张表"和"多删了一张表"表现成同一个数字。
+CASCADE_EDGES = (
+    ("feishu_org_tenant_snapshot", "feishu_org_sync_run", "sync_run_id"),
+    ("feishu_org_department_snapshot", "feishu_org_sync_run", "sync_run_id"),
+    ("feishu_org_member_snapshot", "feishu_org_sync_run", "sync_run_id"),
+    ("galaxy_user", "galaxy_import_batch", "batch_id"),
+    ("galaxy_user_role", "galaxy_import_batch", "batch_id"),
+    ("galaxy_role_menu", "galaxy_import_batch", "batch_id"),
+    ("galaxy_country", "galaxy_import_batch", "batch_id"),
+    ("galaxy_user_datacountry", "galaxy_import_batch", "batch_id"),
+)
+
+# 清理绝不能触达的表：它们承载"继续提供服务所需的当前状态"，不在九十天删除范围内
+# （数据库设计 :596），而且一条外键都没有，不可能被级联带走。
+UNTOUCHED_TABLES = ("feishu_delegated_subject", "app_user")
+
+
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+class RetentionPostgresTestCase(unittest.TestCase):
+    """所有保留清理用例的共同底座。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import psycopg
+
+        cls._psycopg = psycopg
+        cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
+        with psycopg.connect(cls._dsn) as connection, connection.cursor() as cursor:
+            cls.applied_migrations = rebuild_production_schema(cursor)
+
+    def setUp(self) -> None:
+        self.execute(
+            "DELETE FROM galaxy_import_batch;"
+            "DELETE FROM feishu_org_sync_run;"
+            "DELETE FROM app_user;"
+            "DELETE FROM feishu_delegated_subject;"
+        )
+
+    # ---- 基础工具 ---------------------------------------------------------
+
+    def execute(self, sql: str, parameters: tuple = ()) -> None:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(sql, parameters or None)
+
+    def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(sql, parameters or None)
+            return cursor.fetchall()
+
+    def scalar(self, sql: str, parameters: tuple = ()):
+        rows = self.query(sql, parameters)
+        return rows[0][0] if rows else None
+
+    def count(self, table: str, where: str = "", parameters: tuple = ()) -> int:
+        return int(self.scalar(f"SELECT count(*) FROM {table} {where}", parameters))
+
+    def database_now(self):
+        return self.scalar("SELECT now()")
+
+    def cleanup(self, moment, limit: int = 100) -> dict[str, tuple[int, object, object]]:
+        """调用受限清理函数，返回 {表名: (删除数, 最早到期, 最晚到期)}。"""
+
+        rows = self.query(
+            "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at "
+            "FROM public.lingxi_retention_cleanup(%s, %s)",
+            (moment, limit),
+        )
+        return {str(row[0]): (int(row[1]), row[2], row[3]) for row in rows}
+
+    # ---- 造数 -------------------------------------------------------------
+
+    def insert_batch(self, batch_id: str, *, started_at, status: str = "complete", with_children: bool = False) -> None:
+        """写一个银河导入批次。到期时间由触发器从 `started_at` 推导，不能自己指定。"""
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO galaxy_import_batch "
+                "(id, source_label, source_digest, status, started_at, completed_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (batch_id, f"合成导出 {batch_id}", f"digest-{batch_id}", status, started_at, started_at),
+            )
+            if not with_children:
+                return
+            cursor.execute("INSERT INTO galaxy_user (batch_id, user_id, email) VALUES (%s, 'U1', %s)", (batch_id, f"{batch_id}@example.invalid"))
+            cursor.execute("INSERT INTO galaxy_user_role (batch_id, user_id, role_id) VALUES (%s, 'U1', 'R1')", (batch_id,))
+            cursor.execute("INSERT INTO galaxy_role_menu (batch_id, role_id, menu_id) VALUES (%s, 'R1', 'M1')", (batch_id,))
+            cursor.execute("INSERT INTO galaxy_country (batch_id, source_id, country_key) VALUES (%s, '7', '101')", (batch_id,))
+            cursor.execute(
+                "INSERT INTO galaxy_user_datacountry (batch_id, user_id, datacountry_id) VALUES (%s, 'U1', '101')",
+                (batch_id,),
+            )
+
+    def insert_sync_run(self, run_id: str, *, started_at, status: str = "complete") -> None:
+        """写一个组织快照批次。
+
+        父行与三张子表必须在**同一个事务**里写：007 的 DEFERRABLE 约束触发器在提交
+        时核对声明计数与实际子行，分两次提交的话第一次就会被它拒绝。
+        """
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO feishu_org_sync_run "
+                "(id, source_app_id, status, started_at, completed_at, expires_at, "
+                " tenant_count, department_count, member_count) "
+                "VALUES (%s, 'cli_fake', %s, %s, %s, %s, 1, 1, 1)",
+                (run_id, status, started_at, started_at, started_at),
+            )
+            cursor.execute(
+                "INSERT INTO feishu_org_tenant_snapshot "
+                "(id, sync_run_id, tenant_key, visible_to_user_identity, member_count) "
+                "VALUES (%s, %s, 'tenant_a', true, 1)",
+                (f"{run_id}_tenant", run_id),
+            )
+            cursor.execute(
+                "INSERT INTO feishu_org_department_snapshot "
+                "(id, sync_run_id, tenant_key, department_key, name) "
+                "VALUES (%s, %s, 'tenant_a', 'dept_a', '测试部门')",
+                (f"{run_id}_dept", run_id),
+            )
+            cursor.execute(
+                "INSERT INTO feishu_org_member_snapshot "
+                "(id, sync_run_id, tenant_key, member_key, open_id, user_id, union_id, display_name) "
+                "VALUES (%s, %s, 'tenant_a', 'm1', 'ou_hua_ming', 'user_hua_ming', 'union_hua_ming', '化名甲')",
+                (f"{run_id}_member", run_id),
+            )
+
+    def insert_untouched_rows(self) -> None:
+        self.execute(
+            "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) "
+            "VALUES ('org_directory_sync', 'ou_delegated_subject')"
+        )
+        self.execute("INSERT INTO app_user (id) VALUES ('usr_untouched')")
+
+
+# ---------------------------------------------------------------------------
+# V-保留-01 / 02 / 03 / 04 / 05：到期回收与边界
+# ---------------------------------------------------------------------------
+class ExpiryCollectionTest(RetentionPostgresTestCase):
+    def test_expired_rows_in_both_parent_tables_are_removed_in_one_call(self) -> None:
+        """V-保留-01 / 02（验收 A-01/A-02/A-04）。
+
+        两张父表在同一次调用里各删各的。只实现一张的话，另一张的删除数会是 0。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(seconds=1))
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(seconds=1))
+
+        summary = self.cleanup(now)
+
+        self.assertEqual(set(summary), {"galaxy_import_batch", "feishu_org_sync_run"})
+        self.assertEqual(summary["galaxy_import_batch"][0], 1)
+        self.assertEqual(summary["feishu_org_sync_run"][0], 1)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+        self.assertEqual(self.count("feishu_org_sync_run"), 0)
+
+    def test_a_row_that_expires_one_second_later_is_untouched_field_by_field(self) -> None:
+        """V-保留-01（验收 A-03）：未到期的行**逐字段**未变，不只是"还在"。"""
+        now = self.database_now()
+        self.insert_batch("gib_fresh", started_at=now - RETENTION_WINDOW + timedelta(seconds=1))
+        before = self.scalar("SELECT to_jsonb(t) FROM galaxy_import_batch t WHERE id = 'gib_fresh'")
+
+        self.cleanup(now)
+
+        after = self.scalar("SELECT to_jsonb(t) FROM galaxy_import_batch t WHERE id = 'gib_fresh'")
+        self.assertIsNotNone(after)
+        self.assertEqual(before, after)
+
+    def test_tables_outside_the_retention_scope_are_never_touched(self) -> None:
+        """V-保留-01（验收 A-05）：`feishu_delegated_subject` 与 `app_user` 一行不动。"""
+        now = self.database_now()
+        self.insert_untouched_rows()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        before = {table: self.count(table) for table in UNTOUCHED_TABLES}
+
+        self.cleanup(now)
+
+        for table in UNTOUCHED_TABLES:
+            with self.subTest(table=table):
+                self.assertEqual(self.count(table), before[table])
+                self.assertEqual(self.count(table), 1)
+
+    def test_the_expiry_boundary_is_inclusive_and_exact_to_the_second(self) -> None:
+        """V-保留-03（验收 A-06/A-07/A-08）：`<=` 语义逐点验证。
+
+        恰好到 2160 小时的那一行**必须**被删——这一点是 `<=` 与 `<` 的唯一区别，
+        也是"九十天是上限而不是至少保留九十天"这句话在数据库里的落点。
+        """
+        now = self.database_now()
+        self.insert_batch("gib_before", started_at=now - RETENTION_WINDOW + timedelta(seconds=1))
+        self.insert_batch("gib_exact", started_at=now - RETENTION_WINDOW)
+        self.insert_batch("gib_after", started_at=now - RETENTION_WINDOW - timedelta(seconds=1))
+
+        self.cleanup(now)
+
+        surviving = {row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}
+        self.assertEqual(surviving, {"gib_before"}, "恰好到期与已过期的都应被删，只差 1 秒未到期的应留下")
+
+    def test_the_cleanup_condition_and_the_current_batch_filter_are_complementary(self) -> None:
+        """V-保留-04（验收 A-09/B-01）：不存在"既是当前批次、又可被清理"的瞬间。
+
+        `current_batch_id()` 取 `expires_at > now()`，清理取 `expires_at <= p_now`。
+        两个条件在同一时刻严格互补，所以"当前批次被 CASCADE 清理"不可能发生。
+        本条断言的意义是防止未来有人去掉 `current_batch_id()` 的过期过滤——
+        那样这里就会同时看到"它是当前批次"和"它被删掉了"。
+        """
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        now = self.database_now()
+        self.insert_batch("gib_expired", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch("gib_current", started_at=now - RETENTION_WINDOW + timedelta(hours=1), with_children=True)
+        store = PostgresGalaxyImportStore(self._dsn)
+
+        self.assertEqual(store.current_batch_id(), "gib_current")
+        summary = self.cleanup(now)
+
+        self.assertEqual(summary["galaxy_import_batch"][0], 1)
+        self.assertEqual(store.current_batch_id(), "gib_current", "当前批次在清理前后必须是同一个")
+        for child, parent, column in CASCADE_EDGES:
+            if parent != "galaxy_import_batch":
+                continue
+            with self.subTest(child=child):
+                self.assertEqual(self.count(child, f"WHERE {column} = 'gib_current'"), 1)
+
+    def test_the_window_is_2160_absolute_hours_not_ninety_calendar_days(self) -> None:
+        """V-保留-05（验收 A-10）：跨夏令时的时区里，两种写法差一个小时。
+
+        `interval '90 days'` 是日历量，跨 DST 会漂 1 小时；`interval '2160 hours'`
+        是绝对时长，不漂。上限如果会漂，"九十天上限"就不是一个可核对的承诺。
+        """
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            # America/Santiago 在 9 月第一个周日进入夏令时，8 月 1 日起算的 90 天跨过它。
+            cursor.execute("SET TIME ZONE 'America/Santiago'")
+            cursor.execute(
+                "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status, started_at) "
+                "VALUES ('gib_dst', 'DST', 'digest-dst', 'staging', %s)",
+                ("2026-08-01 00:00:00-04",),
+            )
+            cursor.execute(
+                "SELECT extract(epoch FROM (expires_at - started_at))::bigint, "
+                "       expires_at = started_at + interval '90 days' "
+                "  FROM galaxy_import_batch WHERE id = 'gib_dst'"
+            )
+            elapsed_seconds, matches_ninety_days = cursor.fetchone()
+
+        self.assertEqual(elapsed_seconds, 2160 * 3600)
+        self.assertFalse(matches_ninety_days, "跨夏令时切换时 90 日历日与 2160 小时必须落在不同时刻")
+
+
+# ---------------------------------------------------------------------------
+# V-保留-20：到期即删，不保留最近完成批次
+# ---------------------------------------------------------------------------
+class NoUnconditionalReprieveTest(RetentionPostgresTestCase):
+    def test_every_expired_batch_disappears_including_the_most_recent_one(self) -> None:
+        """V-保留-20（验收 B-02/B-03/B-05）：编排者裁定 ② 选项 B。
+
+        豁免**只**由 `expires_at <= p_now` 表达。构造一个"全部批次都已过期"的库，
+        连最近完成的那个也必须被删——任何"排除最近 complete 批次"的无条件保护都会
+        让这条变红。下游因此看到 `current_batch_id() is None`，安全失败，
+        而它在删除之前就已经是 None 了（过期即不算当前）。
+        """
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        now = self.database_now()
+        for index in range(3):
+            self.insert_batch(
+                f"gib_{index}",
+                started_at=now - RETENTION_WINDOW - timedelta(hours=index + 1),
+                status="superseded" if index else "complete",
+                with_children=True,
+            )
+        store = PostgresGalaxyImportStore(self._dsn)
+        self.assertIsNone(store.current_batch_id(), "过期批次在删除前就已经不算当前有效")
+
+        summary = self.cleanup(now)
+
+        self.assertEqual(summary["galaxy_import_batch"][0], 3)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+        self.assertIsNone(store.current_batch_id())
+
+    def test_removing_the_last_org_snapshot_turns_stale_into_unavailable(self) -> None:
+        """V-保留-20（验收 B-04）：组织快照侧的对称后果，知情接受。
+
+        删掉过期的 `feishu_org_sync_run` 之后，可观察状态由 STALE 变 UNAVAILABLE。
+        两个状态都不建档、都不产生候选，用户可见结果不变（编排者裁定 ④）。
+        """
+        from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+        from lingxi.core.identity.org_snapshot import DirectoryAvailability, directory_availability
+
+        now = self.database_now()
+        self.insert_sync_run("run_stale", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        store = PostgresOrgSnapshotStore(self._dsn)
+
+        before = directory_availability(store.latest_complete_expiry(), now)
+        self.assertIs(before, DirectoryAvailability.STALE)
+
+        self.cleanup(now)
+
+        after = directory_availability(store.latest_complete_expiry(), now)
+        self.assertIs(after, DirectoryAvailability.UNAVAILABLE)
+        self.assertIsNone(store.latest_complete_expiry())
+
+
+# ---------------------------------------------------------------------------
+# V-保留-06：CASCADE 边界
+# ---------------------------------------------------------------------------
+class CascadeBoundaryTest(RetentionPostgresTestCase):
+    def test_each_child_table_is_emptied_by_its_own_cascade_edge(self) -> None:
+        """V-保留-06（验收 C-01…C-08）：8 张子表**逐表**一条断言，不合并计数。"""
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        for child, _parent, column in CASCADE_EDGES:
+            self.assertEqual(self.count(child), 1, f"造数阶段 {child} 应有 1 行")
+
+        self.cleanup(now)
+
+        for child, parent, column in CASCADE_EDGES:
+            with self.subTest(child=child, parent=parent):
+                self.assertEqual(self.count(child), 0, f"{child} 的行应随 {parent} 一起消失")
+
+    def test_no_child_row_survives_without_its_parent(self) -> None:
+        """V-保留-06（验收 C-09）：不少——不存在没有父行的子行。"""
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch("gib_new", started_at=now, with_children=True)
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        self.insert_sync_run("run_new", started_at=now)
+
+        self.cleanup(now)
+
+        for child, parent, column in CASCADE_EDGES:
+            with self.subTest(child=child):
+                orphans = self.count(
+                    child,
+                    f"c WHERE NOT EXISTS (SELECT 1 FROM {parent} p WHERE p.id = c.{column})",
+                )
+                self.assertEqual(orphans, 0)
+
+    def test_a_batch_that_has_not_expired_keeps_every_child_row(self) -> None:
+        """V-保留-06（验收 C-10）：不多——未到期批次的子行内容一字未改。"""
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch("gib_new", started_at=now, with_children=True)
+        self.insert_sync_run("run_new", started_at=now)
+        before = {
+            child: self.query(f"SELECT to_jsonb(t) FROM {child} t ORDER BY 1")
+            for child, parent, _column in CASCADE_EDGES
+            if parent == "galaxy_import_batch"
+        }
+
+        self.cleanup(now)
+
+        for child, rows in before.items():
+            with self.subTest(child=child):
+                remaining = self.query(f"SELECT to_jsonb(t) FROM {child} t ORDER BY 1")
+                self.assertEqual(len(remaining), 1)
+                self.assertIn(remaining[0], rows)
+
+    def test_exactly_eight_foreign_keys_point_at_the_parents_and_all_of_them_cascade(self) -> None:
+        """V-保留-06（验收 C-11）：catalog 断言。
+
+        未来加第 9 条边而不更新清理器与用例时，这条会变红——它读的是
+        `pg_constraint`，不是测试自己维护的清单。
+        """
+        rows = self.query(
+            "SELECT count(*), bool_and(confdeltype = 'c') "
+            "  FROM pg_constraint "
+            " WHERE contype = 'f' "
+            "   AND confrelid IN ('public.galaxy_import_batch'::regclass, 'public.feishu_org_sync_run'::regclass)"
+        )
+
+        self.assertEqual(rows[0][0], len(CASCADE_EDGES))
+        self.assertTrue(rows[0][1], "指向两张父表的外键必须全部是 ON DELETE CASCADE")
+
+
+# ---------------------------------------------------------------------------
+# V-保留-07 / 08：不可后移的写入触发器
+# ---------------------------------------------------------------------------
+class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
+    def test_an_inserted_expiry_is_overwritten_with_the_derived_value(self) -> None:
+        """V-保留-07（验收 D-01）：调用方传 900 天也没用。"""
+        self.execute(
+            "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status, started_at, expires_at) "
+            "VALUES ('gib_liar', 'L', 'digest-liar', 'staging', now() - interval '10 hours', now() + interval '900 days')"
+        )
+
+        self.assertTrue(
+            self.scalar(
+                "SELECT expires_at = started_at + interval '2160 hours' FROM galaxy_import_batch WHERE id = 'gib_liar'"
+            )
+        )
+        self.assertTrue(
+            self.scalar("SELECT expires_at < now() + interval '91 days' FROM galaxy_import_batch WHERE id = 'gib_liar'")
+        )
+
+    def test_an_update_cannot_postpone_the_expiry(self) -> None:
+        """V-保留-07（验收 D-02）：与 007 既有做法一致——后移被**覆盖**回来。"""
+        self.insert_batch("gib_move", started_at=self.database_now() - timedelta(hours=10), status="staging")
+        before = self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_move'")
+
+        self.execute("UPDATE galaxy_import_batch SET expires_at = now() + interval '900 days' WHERE id = 'gib_move'")
+
+        self.assertEqual(self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_move'"), before)
+
+    def test_an_update_cannot_change_the_source_time(self) -> None:
+        """V-保留-07（验收 D-03）：改来源时间等于换一条推导基线，可以无限后移。"""
+        self.insert_batch("gib_anchor", started_at=self.database_now() - timedelta(hours=10), status="staging")
+
+        with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+            self.execute("UPDATE galaxy_import_batch SET started_at = now() WHERE id = 'gib_anchor'")
+
+        self.assertIn("不允许修改银河导入批次的来源时间", str(raised.exception))
+
+    def test_the_org_snapshot_trigger_still_behaves_the_same_way(self) -> None:
+        """V-保留-07（验收 D-05）：007 既有的同型断言不因本次改动而改变。"""
+        self.insert_sync_run("run_same", started_at=self.database_now() - timedelta(hours=10))
+
+        self.assertTrue(
+            self.scalar(
+                "SELECT expires_at = started_at + interval '2160 hours' FROM feishu_org_sync_run WHERE id = 'run_same'"
+            )
+        )
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.execute("UPDATE feishu_org_sync_run SET started_at = now() WHERE id = 'run_same'")
+
+    def test_history_rows_are_realigned_to_the_derived_expiry(self) -> None:
+        """V-保留-08（验收 D-06）：迁移前写下的偏离行被回填校正。
+
+        造数方式就是"迁移前的世界"：先把触发器摘掉，写一行到期时间被拉长到 900 天的
+        批次，再重新应用 013——回填是那条迁移里的一个 `UPDATE`，这里验证它真的跑了。
+
+        同时取证：现有代码路径写出的行**本来就精确满足**该不变式（`started_at` 与
+        `expires_at` 两个 DEFAULT 取的是同一个事务时间戳），所以回填在真实数据上是零行改动。
+        """
+        self.execute("DROP TRIGGER galaxy_import_batch_expiry ON galaxy_import_batch")
+        self.execute(
+            "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status, started_at, expires_at) "
+            "VALUES ('gib_legacy', 'L', 'digest-legacy', 'superseded', now() - interval '10 hours', now() + interval '900 days')"
+        )
+        # 既有代码路径：两个 DEFAULT 同取事务时间戳，写出来就已经对齐。
+        self.execute(
+            "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status) "
+            "VALUES ('gib_default', 'L', 'digest-default', 'staging')"
+        )
+        self.assertTrue(
+            self.scalar(
+                "SELECT expires_at = started_at + interval '2160 hours' FROM galaxy_import_batch WHERE id = 'gib_default'"
+            )
+        )
+        self.assertFalse(
+            self.scalar(
+                "SELECT expires_at = started_at + interval '2160 hours' FROM galaxy_import_batch WHERE id = 'gib_legacy'"
+            )
+        )
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            self.count("galaxy_import_batch", "WHERE expires_at <> started_at + interval '2160 hours'"),
+            0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# V-保留-09 / 10 / 11 / 12：函数的批量、幂等、时间下限与搜索路径
+# ---------------------------------------------------------------------------
+class CleanupFunctionContractTest(RetentionPostgresTestCase):
+    def test_a_batch_limit_caps_how_many_rows_a_single_call_removes(self) -> None:
+        """V-保留-09（验收 E-01）：10 行到期、限 3 行，恰删 3。"""
+        now = self.database_now()
+        for index in range(10):
+            self.insert_batch(
+                f"gib_{index:02d}",
+                started_at=now - RETENTION_WINDOW - timedelta(hours=index + 1),
+                status="superseded",
+            )
+
+        summary = self.cleanup(now, limit=3)
+
+        self.assertEqual(summary["galaxy_import_batch"][0], 3)
+        self.assertEqual(self.count("galaxy_import_batch"), 7)
+
+    def test_an_oversized_limit_is_clamped_and_a_non_positive_limit_is_refused(self) -> None:
+        """V-保留-09（验收 E-02）：上限夹取、非正值拒绝。
+
+        夹取而不是拒绝超大值：一次清理不该因为调用方传了个离谱的数字就整体失败，
+        到期内容会因此继续留在库里。非正值则是调用方缺陷，直接拒绝。
+        """
+        now = self.database_now()
+        self.execute(
+            "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status, started_at) "
+            "SELECT 'gib_bulk_' || n, 'L', 'digest-bulk-' || n, 'superseded', %s "
+            "  FROM generate_series(1, 1200) AS n",
+            (now - RETENTION_WINDOW - timedelta(hours=1),),
+        )
+
+        summary = self.cleanup(now, limit=10 ** 9)
+
+        self.assertEqual(summary["galaxy_import_batch"][0], 1000, "超大批量必须被夹取到函数自己的上限")
+        self.assertEqual(self.count("galaxy_import_batch"), 200)
+
+        for bad_limit in (0, -5):
+            with self.subTest(limit=bad_limit):
+                with self.assertRaises(self._psycopg.errors.RaiseException):
+                    self.cleanup(now, limit=bad_limit)
+
+    def test_repeated_calls_converge_and_then_report_zero(self) -> None:
+        """V-保留-10（验收 E-03）：幂等——循环到 0，总数对得上，再调一次不报错。"""
+        now = self.database_now()
+        for index in range(7):
+            self.insert_batch(
+                f"gib_{index:02d}",
+                started_at=now - RETENTION_WINDOW - timedelta(hours=index + 1),
+                status="superseded",
+            )
+
+        total = 0
+        for _round in range(20):
+            deleted = self.cleanup(now, limit=2)["galaxy_import_batch"][0]
+            total += deleted
+            if deleted == 0:
+                break
+
+        self.assertEqual(total, 7)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+        self.assertEqual(self.cleanup(now, limit=2)["galaxy_import_batch"][0], 0)
+
+    def test_a_future_p_now_is_refused_and_deletes_nothing(self) -> None:
+        """V-保留-11（验收 E-04）：否则"把现在说晚一点"就能删掉未到期内容。"""
+        now = self.database_now()
+        self.insert_batch("gib_fresh", started_at=now - timedelta(hours=1))
+
+        with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+            self.cleanup(now + timedelta(hours=1))
+
+        self.assertIn("晚于当前时间", str(raised.exception))
+        self.assertEqual(self.count("galaxy_import_batch"), 1)
+
+    def test_rows_that_expired_after_the_given_moment_are_kept(self) -> None:
+        """V-保留-11（验收 E-05）：实际条件是 `expires_at <= p_now`，不是"凡过期都删"。"""
+        now = self.database_now()
+        self.insert_batch("gib_older", started_at=now - RETENTION_WINDOW - timedelta(hours=2), status="superseded")
+        self.insert_batch("gib_newer", started_at=now - RETENTION_WINDOW - timedelta(minutes=30), status="superseded")
+
+        self.cleanup(now - timedelta(hours=1))
+
+        surviving = {row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}
+        self.assertEqual(surviving, {"gib_newer"}, "到期时间晚于传入 p_now 的行，即使已经过期也不该在这一次被删")
+
+    def test_the_definition_keeps_the_clock_floor(self) -> None:
+        """V-保留-11：`LEAST(p_now, clock_timestamp())` 必须留在函数定义里。
+
+        这是一条**源文本**断言，不是行为断言，因为在严格的未来时间校验之下这个
+        `LEAST` 当前是冗余的第二道闸：`p_now` 已经不可能大于 `clock_timestamp()`，
+        两种写法的可观察行为完全一致。它的价值在校验被放宽的那一天才兑现，
+        而那一天没有任何行为断言会提醒有人把它顺手删了。
+        """
+        definition = self.scalar(
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
+        )
+
+        self.assertIn("LEAST(p_now, clock_timestamp())", str(definition))
+
+    def test_a_shadow_schema_cannot_redirect_the_cleanup(self) -> None:
+        """V-保留-12（验收 E-06）：函数固定 `search_path = pg_catalog`。
+
+        调用方在自己的会话里把一张同名影子表放到搜索路径最前面，函数删的仍然是
+        `public` 里那张真表，影子表分毫未动。
+        """
+        now = self.database_now()
+        self.addCleanup(self.execute, "DROP SCHEMA IF EXISTS retention_shadow CASCADE")
+        self.execute("DROP SCHEMA IF EXISTS retention_shadow CASCADE")
+        self.execute("CREATE SCHEMA retention_shadow")
+        self.execute(
+            "CREATE TABLE retention_shadow.galaxy_import_batch "
+            "(id text PRIMARY KEY, expires_at timestamptz NOT NULL)"
+        )
+        self.execute(
+            "INSERT INTO retention_shadow.galaxy_import_batch VALUES ('shadow', now() - interval '3000 hours')"
+        )
+        self.insert_batch("gib_real", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SET search_path = retention_shadow, public")
+            cursor.execute("SELECT deleted_rows FROM public.lingxi_retention_cleanup(%s, 100) WHERE target_table = 'galaxy_import_batch'", (now,))
+            deleted = int(cursor.fetchone()[0])
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(self.count("retention_shadow.galaxy_import_batch"), 1, "影子表必须分毫未动")
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+
+        proconfig = self.scalar(
+            "SELECT proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
+        )
+        self.assertEqual(list(proconfig or []), ["search_path=pg_catalog"])
+
+
+# ---------------------------------------------------------------------------
+# V-保留-13 / 14：角色边界与摘要内容
+# ---------------------------------------------------------------------------
+class RolePrivilegeTest(RetentionPostgresTestCase):
+    """角色断言全部用 `SET SESSION AUTHORIZATION` 而不是 `SET ROLE`。
+
+    区别是决定性的：`SET ROLE` 的权限检查针对**会话用户**。测试连接的会话用户是
+    超级用户，所以 `SET ROLE lingxi_app` 之后再 `SET ROLE lingxi_retention_owner`
+    照样成功——用 `SET ROLE` 写出来的"不能提权"断言是永远绿的假断言。
+    `SET SESSION AUTHORIZATION` 会把会话用户本身换掉，后续检查才是真的。
+    """
+
+    def _denied(self, role: str, statement: str, parameters: tuple = ()) -> str:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(f"SET SESSION AUTHORIZATION {role}")
+            with self.assertRaises(self._psycopg.errors.InsufficientPrivilege) as raised:
+                cursor.execute(statement, parameters or None)
+            connection.rollback()
+        return str(raised.exception)
+
+    def test_the_function_is_security_definer_owned_by_the_retention_role(self) -> None:
+        """V-保留-13（验收 E-07）。"""
+        rows = self.query(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner) "
+            "  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            " WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
+        )
+
+        self.assertEqual(len(rows), 1, "不应存在同名重载")
+        self.assertTrue(rows[0][0], "必须是 SECURITY DEFINER")
+        self.assertEqual(rows[0][1], "lingxi_retention_owner")
+
+    def test_public_has_no_execute_and_only_the_scheduler_role_may_call_it(self) -> None:
+        """V-保留-13（验收 E-08）。"""
+        # aclexplode 把 ACL 拆成行，grantee = 0 就是 PUBLIC——比在 ACL 文本里找
+        # 子串可靠：`lingxi_retention_owner=X/...` 本身就含有 "=X/"。
+        grantees = self.query(
+            "SELECT coalesce(pg_get_userbyid(nullif(a.grantee, 0)), 'PUBLIC'), a.privilege_type "
+            "  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a "
+            " WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup' "
+            " ORDER BY 1"
+        )
+        self.assertNotIn(("PUBLIC", "EXECUTE"), grantees, "PUBLIC 不得持有 EXECUTE")
+        self.assertIn(("lingxi_scheduler", "EXECUTE"), grantees)
+        self.assertEqual(
+            sorted({name for name, _privilege in grantees}),
+            ["lingxi_retention_owner", "lingxi_scheduler"],
+            "除属主外，只有 scheduler 能拿到这个函数的任何权限",
+        )
+
+        self._denied("lingxi_app", "SELECT * FROM public.lingxi_retention_cleanup(now(), 10)")
+
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SET SESSION AUTHORIZATION lingxi_scheduler")
+            cursor.execute("SELECT target_table, deleted_rows FROM public.lingxi_retention_cleanup(now(), 10)")
+            result = dict(cursor.fetchall())
+        self.assertEqual(result["galaxy_import_batch"], 1)
+
+    def test_the_application_role_cannot_delete_the_parent_tables_directly(self) -> None:
+        """V-保留-13（验收 E-09）：有 SELECT、没有 DELETE——回收只有函数一条路。"""
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SET SESSION AUTHORIZATION lingxi_app")
+            cursor.execute("SELECT count(*) FROM public.galaxy_import_batch")
+            self.assertEqual(int(cursor.fetchone()[0]), 1, "lingxi_app 应当读得到业务表")
+
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            with self.subTest(table=table):
+                message = self._denied("lingxi_app", f"DELETE FROM public.{table}")
+                self.assertIn("permission denied", message)
+        self.assertEqual(self.count("galaxy_import_batch"), 1)
+
+    def test_no_business_role_can_become_the_retention_owner(self) -> None:
+        """V-保留-13（验收 E-10）：拿不到那个角色，就拿不到它的 DELETE。"""
+        for role in ("lingxi_app", "lingxi_scheduler"):
+            with self.subTest(role=role):
+                message = self._denied(role, "SET ROLE lingxi_retention_owner")
+                self.assertIn("permission denied", message)
+
+    def test_the_scheduler_role_cannot_delete_directly_either(self) -> None:
+        """V-保留-13：scheduler 能调函数，但没有目标表的 DELETE。"""
+        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
+            with self.subTest(table=table):
+                self._denied("lingxi_scheduler", f"DELETE FROM public.{table}")
+
+    def test_the_four_roles_exist_and_none_of_them_can_log_in(self) -> None:
+        """V-保留-13：角色随迁移幂等建立；本切片不接线运行时连接身份。"""
+        rows = self.query(
+            "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname LIKE 'lingxi\\_%' ORDER BY rolname"
+        )
+
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["lingxi_app", "lingxi_migrate", "lingxi_retention_owner", "lingxi_scheduler"],
+        )
+        for name, can_login, is_super in rows:
+            with self.subTest(role=name):
+                self.assertFalse(can_login, f"{name} 本切片不应具备登录能力")
+                self.assertFalse(is_super, f"{name} 不得是超级用户")
+
+    def test_applying_the_migration_twice_does_not_duplicate_or_fail(self) -> None:
+        """V-保留-13：角色创建幂等——重复应用整条链不报错、不产生第二个角色。"""
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"),
+            4,
+        )
+
+
+class SummaryContentTest(RetentionPostgresTestCase):
+    def test_the_summary_carries_table_names_counts_and_a_time_range_only(self) -> None:
+        """V-保留-14（验收 E-11）：摘要里不得出现任何人员数据字段值。"""
+        from lingxi.adapters.retention import PostgresRetentionCleaner
+
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_sync_run("run_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        # 先确认这些人员数据值真的在库里——否则"摘要不含它们"是一句空话。
+        personal_values = ("化名甲", "ou_hua_ming", "user_hua_ming", "union_hua_ming", "gib_old@example.invalid")
+        self.assertEqual(self.count("galaxy_user", "WHERE email = 'gib_old@example.invalid'"), 1)
+        self.assertEqual(
+            self.count(
+                "feishu_org_member_snapshot",
+                "WHERE display_name = '化名甲' AND open_id = 'ou_hua_ming' "
+                "AND user_id = 'user_hua_ming' AND union_id = 'union_hua_ming'",
+            ),
+            1,
+        )
+
+        cleaner = PostgresRetentionCleaner(self._dsn)
+        with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
+            from lingxi.apps.scheduler import RetentionCleanupDuty
+
+            report = RetentionCleanupDuty(cleaner=cleaner).run_once()
+
+        rendered = repr(report) + "\n" + report.summary() + "\n" + "\n".join(captured.output)
+        self.assertEqual(report.deleted, 2)
+        self.assertIn("galaxy_import_batch", rendered)
+        self.assertIn("feishu_org_sync_run", rendered)
+        for value in personal_values:
+            with self.subTest(value=value):
+                self.assertNotIn(value, rendered)
+        for result in report.tables:
+            with self.subTest(table=result.table):
+                self.assertIsNotNone(result.oldest_expires_at)
+                self.assertIsNotNone(result.newest_expires_at)
+
+
+# ---------------------------------------------------------------------------
+# V-保留-15 / 16 / 17：scheduler 职责
+# ---------------------------------------------------------------------------
+class SchedulerDutyTest(RetentionPostgresTestCase):
+    def test_the_scheduler_loop_actually_removes_expired_rows(self) -> None:
+        """V-保留-15（验收 F-01）：观察点是到期行真的消失，不是"调用了某个方法"。"""
+        from lingxi.adapters.retention import PostgresRetentionCleaner
+        from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop
+
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.insert_batch("gib_new", started_at=now, with_children=True)
+        loop = SchedulerLoop(duties=(RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(self._dsn)),), interval_seconds=0.01)
+
+        loop.run_once()
+
+        self.assertEqual({row[0] for row in self.query("SELECT id FROM galaxy_import_batch")}, {"gib_new"})
+
+    def test_a_failing_cleanup_never_postpones_an_expiry(self) -> None:
+        """V-保留-16（验收 F-04）：清理失败只能重试，不能把到期时间往后挪。"""
+        from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop
+
+        now = self.database_now()
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        before = self.query("SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id")
+
+        class ExplodingCleaner:
+            def run_once(self):
+                raise RuntimeError("模拟清理失败")
+
+        loop = SchedulerLoop(duties=(RetentionCleanupDuty(cleaner=ExplodingCleaner()),), interval_seconds=0.01)
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR"):
+            for _round in range(3):
+                loop.run_once()
+
+        self.assertEqual(self.query("SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY id"), before)
+
+    def test_sigterm_leaves_no_half_deleted_state_and_claims_nothing_after_stopping(self) -> None:
+        """V-保留-17（验收 F-05/F-06）：真实子进程 + 真实 SIGTERM + 真库。
+
+        无半删状态的机制是"一次调用就是一个事务"，不是"信号来得巧"。这里验证它的
+        可观察后果：无论信号落在哪一轮，库里都不存在没有父行的子行，进程报告的
+        删除总数与库里实际少掉的行数完全一致。
+        """
+        total_batches = 12
+        now = self.database_now()
+        for index in range(total_batches):
+            self.insert_batch(
+                f"gib_{index:02d}",
+                started_at=now - RETENTION_WINDOW - timedelta(hours=index + 1),
+                status="superseded",
+                with_children=True,
+            )
+
+        script = textwrap.dedent(
+            """
+            import json, os, threading, time
+            from lingxi.adapters.retention import PostgresRetentionCleaner
+            from lingxi.apps.scheduler import RetentionCleanupDuty, SchedulerLoop, install_signal_handlers
+
+            state = {"calls": 0, "calls_after_stop": 0, "deleted": 0}
+
+            class Counting:
+                def __init__(self, inner):
+                    self._inner = inner
+                def run_once(self):
+                    state["calls"] += 1
+                    if stop.is_set():
+                        state["calls_after_stop"] += 1
+                    report = self._inner.run_once()
+                    state["deleted"] += report.deleted
+                    time.sleep(0.05)
+                    return report
+
+            stop = threading.Event()
+            # 每轮只删一行：信号有充足机会落在中间某一轮，而不是全删完之后。
+            cleaner = Counting(PostgresRetentionCleaner(os.environ["LINGXI_POSTGRES_DSN"], batch_limit=1))
+            duty = RetentionCleanupDuty(cleaner=cleaner, stop=stop)
+            loop = SchedulerLoop(duties=(duty,), interval_seconds=0.01, stop=stop)
+            install_signal_handlers(loop)
+            print("ready", flush=True)
+            loop.run_forever()
+            print(json.dumps(state), flush=True)
+            """
+        )
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(REPOSITORY_ROOT / "src"),
+            "PYTHONUNBUFFERED": "1",
+        }
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            time.sleep(0.35)
+            sent_at = time.monotonic()
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=30)
+        finally:
+            if process.poll() is None:  # pragma: no cover - 只在断言失败路径上发生
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 0, msg=stderr)
+        self.assertLess(time.monotonic() - sent_at, 10, "SIGTERM 后必须在超时内退出")
+        state = json.loads(stdout.strip().splitlines()[-1])
+
+        self.assertEqual(state["calls_after_stop"], 0, "收到 SIGTERM 后不得再领取新的清理批次")
+        self.assertGreater(state["calls"], 0)
+        remaining = self.count("galaxy_import_batch")
+        self.assertEqual(state["deleted"], total_batches - remaining, "报告的删除数必须与库里实际少掉的行一致")
+        for child, parent, column in CASCADE_EDGES:
+            if parent != "galaxy_import_batch":
+                continue
+            with self.subTest(child=child):
+                self.assertEqual(
+                    self.count(child, f"c WHERE NOT EXISTS (SELECT 1 FROM {parent} p WHERE p.id = c.{column})"),
+                    0,
+                    "不得存在没有父行的子行——那才是半删状态",
+                )
+                self.assertEqual(self.count(child), remaining)
+
+
+# ---------------------------------------------------------------------------
+# V-保留-18：迁移前滚与回滚
+# ---------------------------------------------------------------------------
+class MigrationRoundTripTest(RetentionPostgresTestCase):
+    """整链前滚 → 回滚 → 再前滚，往返两次。
+
+    走的是 `migrations/013_*.sql` 与 `migrations/downgrades/013_*.sql` 两个文件，
+    也就是 Alembic revision `0054_retention_cleanup` 的 `upgrade()` / `downgrade()`
+    实际执行的同一段文本（见该 revision 的模块注释）。Alembic 本身尚未成为声明的
+    依赖（属 #53），因此这里不通过 alembic 命令行跑——同一段 DDL 的 Alembic 侧
+    往返验证见 PR 说明。
+    """
+
+    def _objects(self) -> dict[str, object]:
+        return {
+            "function": self.scalar(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
+            ),
+            "trigger_function": self.scalar(
+                "SELECT count(*) FROM pg_proc WHERE proname = 'galaxy_import_batch_fix_expiry'"
+            ),
+            "trigger": self.scalar("SELECT count(*) FROM pg_trigger WHERE tgname = 'galaxy_import_batch_expiry'"),
+        }
+
+    def test_upgrade_and_downgrade_round_trip_twice(self) -> None:
+        """V-保留-18（验收 G-01/G-02/G-04）。"""
+        self.assertEqual(self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1})
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt, phase="downgrade"):
+                with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                    cursor.execute(DOWNGRADE_SQL.read_text(encoding="utf-8"))
+                self.assertEqual(self._objects(), {"function": 0, "trigger_function": 0, "trigger": 0})
+            with self.subTest(attempt=attempt, phase="upgrade"):
+                with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                    cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+                self.assertEqual(self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1})
+
+    def test_downgrade_keeps_the_data_and_the_cluster_level_roles(self) -> None:
+        """V-保留-18（验收 G-02/G-03）：回滚删对象、不删数据、不删集群级角色。"""
+        now = self.database_now()
+        self.insert_batch("gib_keep", started_at=now - timedelta(hours=1), with_children=True)
+        before = self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1")
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(DOWNGRADE_SQL.read_text(encoding="utf-8"))
+
+        self.assertEqual(self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1"), before)
+        self.assertEqual(self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"), 4)
+        self.addCleanup(self._reapply_chain)
+
+    def test_the_previous_image_still_works_against_the_upgraded_database(self) -> None:
+        """V-保留-18（验收 G-05）：触发器不得让既有写路径失败。
+
+        "回滚就是切镜像 tag 重启"要求旧镜像能在新库上工作。这里跑的是**未随本次
+        改动的**既有写路径——银河导入器的完整落库流程——它在带触发器的库上必须照常成功。
+        """
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        store = PostgresGalaxyImportStore(self._dsn)
+        result = store.import_export(
+            source_label="合成导出（测试）",
+            source_digest="digest-old-image",
+            tables={
+                "user": [{"user_id": "U1", "dept_id": "D1", "user_name": "10001", "nick_name": "化名甲", "email": "a@example.invalid", "create_time": "2019-01-02 03:04:05"}],
+                "user_role": [{"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}],
+                "role_menu": [{"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}],
+                "sys_user_datacountry": [{"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"}],
+                "sys_country": [{"id": "7", "country_key": "101", "name": "ALPHA", "code": "AL", "name_cn": "甲国", "region_key": "1", "region_name": "甲区", "boss_company_id": "BC"}],
+            },
+        )
+
+        self.assertEqual(result.outcome, "imported")
+        self.assertEqual(store.current_batch_id(), result.batch_id)
+
+    def _reapply_chain(self) -> None:
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# V-保留-19：清理之后重导同一份导出
+# ---------------------------------------------------------------------------
+class ReimportAfterCleanupTest(RetentionPostgresTestCase):
+    def test_the_same_export_can_be_imported_again_after_its_batch_was_collected(self) -> None:
+        """V-保留-19（编排者裁定 ⑥）：**固化现状**，不是新增保护。
+
+        清理删掉批次行的同时也删掉了那条 `source_digest` 记录，因此同一份导出可以
+        重新导入并成为新的当前有效批次。这不是缺陷判定——重导要拿到的正是一份
+        新鲜的、重新起算九十天的副本。"是否需要摘要墓碑防旧导出复活"是另一个
+        产品决策（#69），本条只把当前可观察行为钉住，以便那个决策落地时这里会变红。
+        """
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        store = PostgresGalaxyImportStore(self._dsn)
+        tables = {
+            "user": [{"user_id": "U1", "dept_id": "D1", "user_name": "10001", "nick_name": "化名甲", "email": "a@example.invalid", "create_time": "2019-01-02 03:04:05"}],
+            "user_role": [{"user_id": "U1", "role_id": "R1", "user_name": "化名甲", "role_name": "A运营"}],
+            "role_menu": [{"role_id": "R1", "menu_id": "M1", "role_name": "A运营", "menu_name": "报表"}],
+            "sys_user_datacountry": [{"USER_ID": "U1", "DATACOUNTRY_ID": "101", "USER_NAME": "化名甲", "DATACOUNTRY_NAME": "甲国"}],
+            "sys_country": [{"id": "7", "country_key": "101", "name": "ALPHA", "code": "AL", "name_cn": "甲国", "region_key": "1", "region_name": "甲区", "boss_company_id": "BC"}],
+        }
+        first = store.import_export(source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables)
+        self.assertEqual(first.outcome, "imported")
+
+        # 让它过期：来源时间不能改，所以直接换一条来源时间足够旧的同摘要批次。
+        self.execute("DELETE FROM galaxy_import_batch")
+        now = self.database_now()
+        self.insert_batch("gib_repeat", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
+        self.execute("UPDATE galaxy_import_batch SET source_digest = 'digest-repeat' WHERE id = 'gib_repeat'")
+        first_expiry = self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = 'gib_repeat'")
+
+        self.cleanup(now)
+        self.assertEqual(self.count("galaxy_import_batch"), 0)
+
+        again = store.import_export(source_label="合成导出（测试）", source_digest="digest-repeat", tables=tables)
+
+        self.assertEqual(again.outcome, "imported")
+        self.assertNotEqual(again.batch_id, "gib_repeat")
+        self.assertEqual(store.current_batch_id(), again.batch_id)
+        self.assertGreater(
+            self.scalar("SELECT expires_at FROM galaxy_import_batch WHERE id = %s", (again.batch_id,)),
+            first_expiry,
+            "重导得到的是重新起算九十天的新副本",
+        )
+
+
+class MigrationChainCoverageTest(RetentionPostgresTestCase):
+    def test_the_retention_migration_is_part_of_the_chain_the_tests_apply(self) -> None:
+        """建库确实包含了本次迁移——否则上面每一条断言都是在一个没有清理函数的库上跑。"""
+        self.assertIn(UPGRADE_SQL.name, self.applied_migrations)
+        self.assertEqual(
+            [path.name for path in sorted(MIGRATIONS_DIRECTORY.glob("*.sql"))],
+            list(self.applied_migrations),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
