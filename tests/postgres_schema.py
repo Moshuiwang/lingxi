@@ -1,15 +1,14 @@
-"""真库用例共用的建库底座：按 glob 应用整条生产迁移链。
+"""真库用例共用的建库底座：整条 alembic 链建库。
 
-在这个模块之前，三个真库测试文件各自硬编码一份迁移文件名清单
-（`test_galaxy_import_postgres.py`、`test_identity_postgres_records.py`，以及
-`test_refresh_token_postgres.py` 的测试资产清单）。清单会过期，而过期的表现是
-最坏的一种失败：**测试库里根本没有新迁移建的对象，用例照样全绿**。新加一条建了
-触发器和清理函数的迁移，如果没人记得同步这三处，所有"触发器不让后移到期时间"
-之类的断言都会在一个没有触发器的库上通过。
+#53 之后**编号 SQL 已冻结**，表结构的权威来源是 `migrations/alembic/versions/`
+的 revision 链。这个模块因此不再自己拼迁移清单，而是直接 `alembic upgrade head`
+——建库路径与生产、与 `scripts/ci/check_migration_chain.sh` 完全同源。
 
-这里把"要应用哪些迁移"从人工维护的清单换成 `migrations/*.sql` 的 glob，把
-"要先删掉哪些对象"从人工维护的清单换成对同一批文件的 `CREATE TABLE` /
-`CREATE FUNCTION` 扫描。两者都跟着目录自动走，新增迁移不需要改任何测试文件。
+它替换掉的是三个真库测试文件各自硬编码的一份迁移文件名清单（#54 验收清单 H-02）。
+清单会过期，而过期的表现是最坏的一种失败：**测试库里根本没有新迁移建的对象，
+用例照样全绿**。新加一条建了触发器和清理函数的 revision，如果没人记得同步这三处，
+所有"触发器不让后移到期时间"之类的断言都会在一个没有触发器的库上通过。
+现在没有清单可过期——多一条 revision 就自动多建一条。
 
 `migrations/testing/` 的测试资产**不属于**这条链，也不会被这里删除：
 `feishu_user_refresh_token`、`onboarding_progress` 等表由使用它们的用例自己管理。
@@ -17,76 +16,185 @@
 
 from __future__ import annotations
 
-import re
+import importlib.util
+import os
+import threading
 from pathlib import Path
 from typing import Any
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIRECTORY = REPOSITORY_ROOT / "migrations"
+ALEMBIC_INI = REPOSITORY_ROOT / "alembic.ini"
+VERSIONS_DIRECTORY = MIGRATIONS_DIRECTORY / "alembic" / "versions"
+RETENTION_REVISION = VERSIONS_DIRECTORY / "0054_retention_cleanup.py"
 
-# 顶层编号 SQL 是生产链；子目录（testing/、downgrades/）不参与。
-# 与 scripts/ci/verify_repository.sh 的"空库整链前滚"取的是同一个 glob。
-_PRODUCTION_GLOB = "*.sql"
-
-_CREATE_TABLE = re.compile(r"^CREATE TABLE (?:IF NOT EXISTS )?(?:public\.)?([a-z_][a-z0-9_]*)", re.MULTILINE)
-_CREATE_FUNCTION = re.compile(r"^CREATE (?:OR REPLACE )?FUNCTION (?:public\.)?([a-z_][a-z0-9_]*)", re.MULTILINE)
-
-
-def production_migrations() -> tuple[Path, ...]:
-    """生产迁移链，按文件名排序（编号即顺序）。"""
-
-    paths = tuple(sorted(MIGRATIONS_DIRECTORY.glob(_PRODUCTION_GLOB)))
-    if not paths:
-        raise RuntimeError(f"{MIGRATIONS_DIRECTORY} 下没有找到任何生产迁移；建库底座失效")
-    return paths
+# 建库只做一次：alembic 整链前滚每次约几百毫秒，而 IdentityPostgresTestCase 是
+# **每个用例**都要重置的。重复建库会把真库这一段的耗时抬到门禁超时的量级。
+# 后续重置只清行不重建结构；确实改了结构的用例自己调 force_rebuild_schema。
+_BUILD_LOCK = threading.Lock()
+_BUILT_FOR_DSN: str | None = None
+_APPLIED_HEAD: str = ""
 
 
-def production_objects() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """扫描生产链，返回 (表名, 函数名)。用于重建前的清场。"""
+def applied_head() -> str:
+    """本进程实际前滚到的 head revision id。"""
 
-    tables: list[str] = []
-    functions: list[str] = []
-    for path in production_migrations():
-        text = path.read_text(encoding="utf-8")
-        tables.extend(_CREATE_TABLE.findall(text))
-        functions.extend(_CREATE_FUNCTION.findall(text))
-    # dict.fromkeys 去重且保序：同名对象在链里被重复创建时只删一次。
-    return tuple(dict.fromkeys(tables)), tuple(dict.fromkeys(functions))
+    return _APPLIED_HEAD
 
 
-def drop_production_objects(cursor: Any) -> None:
-    """删掉生产链建的全部表与函数；不碰测试资产的表。"""
+def revision_sql() -> tuple[str, str]:
+    """取出 #54 revision 内联的 upgrade / downgrade DDL 原文。
 
-    tables, functions = production_objects()
-    for name in tables:
-        cursor.execute(f'DROP TABLE IF EXISTS public."{name}" CASCADE')
-    if functions:
-        # 按目录里的实际签名删：函数可能有重载，也可能属主不是当前角色
-        # （清理函数属主是 lingxi_retention_owner），按名字猜签名会漏。
+    DDL 自 #53 起只存在于 revision 文件里，用例要重放它就得从那里取，
+    不能再去读 `migrations/*.sql`——那些编号文件已冻结且不含本切片。
+    """
+
+    spec = importlib.util.spec_from_file_location("_retention_revision", RETENTION_REVISION)
+    if spec is None or spec.loader is None:  # pragma: no cover - 文件被删时才会走到
+        raise RuntimeError(f"读不到保留清理 revision：{RETENTION_REVISION}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._UPGRADE_SQL, module._DOWNGRADE_SQL
+
+
+def _connect(dsn: str) -> Any:
+    import psycopg
+
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def drop_production_objects(dsn: str) -> None:
+    """清掉 public 下由生产链建立的全部表与函数，外加 alembic 版本表。
+
+    保留 `migrations/testing/` 那几张测试资产表：它们不属于生产链，
+    删了会打断 `test_refresh_token_postgres` 等用例。
+    """
+
+    preserved = ("feishu_user_refresh_token", "onboarding_progress", "inbound_event")
+    with _connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> ALL(%s)",
+            (list(preserved),),
+        )
+        for (table,) in cursor.fetchall():
+            cursor.execute(f'DROP TABLE IF EXISTS public."{table}" CASCADE')
+        # 测试资产的函数（record_authorized_identity）随其表一起保留。
         cursor.execute(
             "SELECT p.oid::regprocedure::text FROM pg_proc p "
-            "JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE n.nspname = 'public' AND p.proname = ANY(%s)",
-            (list(functions),),
+            "  JOIN pg_namespace n ON n.oid = p.pronamespace "
+            " WHERE n.nspname = 'public' AND p.proname <> 'record_authorized_identity'"
         )
         for (signature,) in cursor.fetchall():
             cursor.execute(f"DROP FUNCTION IF EXISTS {signature} CASCADE")
 
 
-def apply_production_chain(cursor: Any) -> tuple[str, ...]:
-    """按顺序应用整条生产链，返回实际应用的文件名。"""
+def alembic_upgrade_head(dsn: str) -> str:
+    """在进程内跑 `alembic upgrade head`，返回 head revision id。
 
-    applied: list[str] = []
-    for path in production_migrations():
-        # 只传 SQL、不传参数：psycopg 在无参数时完全跳过占位符插值，
-        # 迁移里 `format('… %I …')` 与 RAISE 的 `%` 才能原样送到服务端。
-        cursor.execute(path.read_text(encoding="utf-8"))
-        applied.append(path.name)
-    return tuple(applied)
+    进程内而不是起子进程：子进程每次要重新 import alembic 与 SQLAlchemy，
+    在"每个用例重置一次"的调用频率下这笔开销比迁移本身还大。
+    """
+
+    import logging
+
+    from alembic import command
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(ALEMBIC_INI))
+    previous = os.environ.get("LINGXI_MIGRATION_DSN")
+    os.environ["LINGXI_MIGRATION_DSN"] = dsn
+
+    # alembic 的 env.py 会 `fileConfig(...)` 读 alembic.ini 的日志配置，而
+    # `logging.config.fileConfig` 默认带 `disable_existing_loggers=True`：它会把
+    # **当时已经存在的**所有 logger 就地禁用。在生产里这没问题（迁移是独立进程），
+    # 在测试进程里则是跨用例污染——建完库之后，`lingxi.apps.scheduler` 与
+    # `lingxi.adapters.retention` 上的 assertLogs 全部拿不到记录，13 条与本次改动
+    # 毫无关系的用例会一起变红，而失败信息完全不指向这里。
+    # 因此进出各存取一次 disabled 位。
+    manager = logging.root.manager
+    disabled_before = {
+        name: logger.disabled
+        for name, logger in manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+    }
+    try:
+        command.upgrade(config, "head")
+    finally:
+        if previous is None:
+            os.environ.pop("LINGXI_MIGRATION_DSN", None)
+        else:
+            os.environ["LINGXI_MIGRATION_DSN"] = previous
+        for name, was_disabled in disabled_before.items():
+            logger = manager.loggerDict.get(name)
+            if isinstance(logger, logging.Logger):
+                logger.disabled = was_disabled
+    return ScriptDirectory.from_config(config).get_current_head() or ""
 
 
-def rebuild_production_schema(cursor: Any) -> tuple[str, ...]:
-    """清场 + 整链前滚。返回实际应用的迁移文件名，供用例断言"链没有被跳过"。"""
+def _drop_version_table(dsn: str) -> None:
+    """建完结构后把 `alembic_version` 去掉。
 
-    drop_production_objects(cursor)
-    return apply_production_chain(cursor)
+    业务测试库不是一个"被 alembic 管理的库"，它每轮都重建。留着版本表会有两个坏处：
+    一是 `scripts/ci/check_migration_chain.sh` 有一条明确的卫生断言——业务测试库里
+    出现 `alembic_version` 即判定"门禁的迁移步骤碰了不该碰的库"，那条断言是对的，
+    不该为了测试方便把它放宽；二是留着会让人以为这个库可以被 `alembic upgrade`
+    增量维护，而它实际上随时会被 drop 重建。
+
+    "链确实跑到了 head"这个事实由 `applied_head()` 记录，不依赖版本表。
+    """
+
+    with _connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute("DROP TABLE IF EXISTS public.alembic_version")
+
+
+def _build(dsn: str) -> str:
+    global _BUILT_FOR_DSN, _APPLIED_HEAD
+    drop_production_objects(dsn)
+    head = alembic_upgrade_head(dsn)
+    _drop_version_table(dsn)
+    _BUILT_FOR_DSN = dsn
+    _APPLIED_HEAD = head
+    return head
+
+
+def force_rebuild_schema(dsn: str) -> str:
+    """清场 + 整链前滚。改动过结构的用例收尾时调它。"""
+
+    with _BUILD_LOCK:
+        return _build(dsn)
+
+
+def ensure_production_schema(dsn: str) -> str:
+    """保证结构已就位；同一个进程内只真正建一次。"""
+
+    with _BUILD_LOCK:
+        if _BUILT_FOR_DSN == dsn:
+            return _APPLIED_HEAD
+        return _build(dsn)
+
+
+def production_tables(dsn: str) -> tuple[str, ...]:
+    """当前库里由生产链建立的表；顺序不定，删行时用 TRUNCATE ... CASCADE。"""
+
+    with _connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT tablename FROM pg_tables "
+            " WHERE schemaname = 'public' "
+            "   AND tablename <> ALL(%s) "
+            " ORDER BY tablename",
+            (["feishu_user_refresh_token", "onboarding_progress", "inbound_event", "alembic_version"],),
+        )
+        return tuple(row[0] for row in cursor.fetchall())
+
+
+def reset_production_rows(dsn: str) -> None:
+    """结构不动，只把生产表清空。比重建结构快一个数量级。"""
+
+    ensure_production_schema(dsn)
+    tables = production_tables(dsn)
+    if not tables:
+        return
+    quoted = ", ".join(f'public."{name}"' for name in tables)
+    with _connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(f"TRUNCATE {quoted} CASCADE")

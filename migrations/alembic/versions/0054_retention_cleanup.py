@@ -1,3 +1,61 @@
+"""expires_at 九十天保留清理机制：触发器、受限清理函数与数据库角色
+
+Revision ID: 0054_retention_cleanup
+Revises: 20260806_baseline
+Create Date: 2026-08-06
+
+Issue #54 / 开发计划 S9。在这条 revision 之前，`expires_at` 只是两张表上的一个列：
+`feishu_org_sync_run` 有不可后移触发器（基线内的 007 部分）但没有任何东西回收它；
+`galaxy_import_batch` 连触发器都没有，调用方可以传任意值、也可以随后把它改到更晚。
+九十天上限因此只写在文档里（[数据库设计原则 4 与第九节](../../../docs/技术设计/数据库设计.md)），
+数据库不执行它。
+
+本 revision 交付三件事：
+
+1. `galaxy_import_batch` 补上与 007 同型的不可后移触发器，并回填历史偏离行；
+2. 受限清理函数 `public.lingxi_retention_cleanup(timestamptz, integer)`，按到期时间
+   小批量删除两张父表的到期行，子行由既有 8 条 `ON DELETE CASCADE` 边带走；
+3. 数据库设计第十节已定义、但全仓库此前零定义的四个角色，以及本切片相关的最小授权。
+
+**DDL 直接内联在本文件里，不再引用 `migrations/*.sql`。** 编号 SQL 已随 #53 冻结：
+基线 `20260806_baseline` 逐字节覆盖 `006`–`012`，而 `scripts/ci/check_alembic_revisions.py`
+要求顶层每个编号 SQL 都被某条 revision 的 `CHAIN` 覆盖——新增编号文件不会进入基线，
+两条血统会就此分叉，门禁直接红。所以基线之后的 revision 是 DDL 的唯一载体。
+本 revision 没有 `CHAIN`（它不是任何磁盘文件的副本），逐字节比对因此不适用于它。
+
+**豁免只由 `expires_at <= p_now` 表达。** 不存在「排除最近完成批次」之类的无条件
+保护：九十天是合同硬上限（数据库设计 :570/:574），`galaxy_*` 不在「当前状态」例外
+名单里（:596）。下游 `current_batch_id()` 本来就按「过期即不算当前」实现
+（`src/lingxi/adapters/galaxy_import.py:95`），因此删掉过期批次不改变任何下游可
+观察结果——它此前就已经返回 None 了。组织快照侧对称的后果是可观察状态由 STALE
+变 UNAVAILABLE，两者都不建档、不产生候选，属知情接受（Issue #54 编排者裁定 ②④）。
+
+清理条件与「当前有效」判定严格互补：`expires_at > now()` 与 `expires_at <= p_now`
+在同一时刻不可能同时成立，所以「当前批次被 CASCADE 清理」在现语义下不可能发生。
+断言 V-保留-04 固化这条互补性，防的是未来有人去掉 `current_batch_id()` 的过期过滤。
+
+顺带登记一处**已被本 revision 取代的旧注释**：`migrations/010_create_galaxy_import_batch.sql`
+里写着「任何按 expires_at 的清理流程必须排除当前有效批次」，那是 #17 时期的登记，
+与上面的裁定 ② 相反。该文件已随 #53 冻结、且被基线逐字节内嵌，改它必须连基线副本
+一起改，风险大于一句过期注释的收益，因此**有意不动**——以本 revision 与
+`docs/技术设计/验证与门禁.md` 的 `V-保留-20` 为准。
+
+`downgrade()` 移除本次新增的函数与触发器并收回全部授权，但**不删除四个角色**
+（集群级共享对象），也**不还原历史行回填**（原值已不可知）——两条边界见
+`migrations/README.md` 与下方 `_DOWNGRADE_SQL` 的注释。
+"""
+
+from __future__ import annotations
+
+from alembic import op
+
+revision: str = "0054_retention_cleanup"
+down_revision: str | None = "20260806_baseline"
+branch_labels: str | None = None
+depends_on: str | None = None
+
+
+_UPGRADE_SQL = r"""
 -- #54 S9：九十天保留的执行机制——不可后移的 expires_at 触发器与受限清理函数。
 --
 -- 在这条迁移之前，`expires_at` 只是两张表上的一个列：`feishu_org_sync_run` 有
@@ -243,19 +301,16 @@ COMMENT ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) IS
 GRANT SELECT, DELETE ON public.galaxy_import_batch  TO lingxi_retention_owner;
 GRANT SELECT, DELETE ON public.feishu_org_sync_run  TO lingxi_retention_owner;
 
--- 业务角色：读写有，DELETE 没有。到期回收只有一条路径，就是下面那个函数。
-GRANT SELECT, INSERT, UPDATE ON
-    public.galaxy_import_batch,
-    public.galaxy_user,
-    public.galaxy_user_role,
-    public.galaxy_role_menu,
-    public.galaxy_country,
-    public.galaxy_user_datacountry,
-    public.feishu_org_sync_run,
-    public.feishu_org_tenant_snapshot,
-    public.feishu_org_department_snapshot,
-    public.feishu_org_member_snapshot
-TO lingxi_app;
+-- 业务角色：只授断言实际需要的 SELECT，不做投机性授权。
+--
+-- 这里原先给了 10 张表的 INSERT / UPDATE。但 `src/` 里对其中 8 张子表的 UPDATE
+-- 语句是**零条**，本切片也不接线运行时连接身份——那些授权没有任何调用方，
+-- 属于「先授出去再说」。授权面是本迁移声称建立的边界，预支边界等于没有边界。
+--
+-- 两张父表的 SELECT 保留：V-保留-13 断言的是「读得到、删不掉」，把 SELECT 一并
+-- 拿掉，那条对比就退化成「什么都没授所以当然删不掉」，测不到 DELETE 的缺席。
+-- 业务写授权随运行时接线切片按**实际调用方**逐张补，不在这里预支。
+GRANT SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_app;
 
 -- scheduler 只需要看得见两张父表（写运行日志时核对），同样没有 DELETE。
 GRANT SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_scheduler;
@@ -314,3 +369,84 @@ BEGIN
     END IF;
 END
 $handover$;
+"""
+
+
+_DOWNGRADE_SQL = r"""
+-- #54 S9：0054_retention_cleanup 的回滚 DDL。
+--
+-- 两件事**不会**被这里还原，都是有意的：
+--
+-- 1. **四个数据库角色不删除。** 角色是集群级共享对象——同一个 PostgreSQL 集群里
+--    可能还有别的数据库、别的授权引用它们。一次数据库级回滚去删集群级对象，
+--    影响面超出本迁移，而且不可逆。角色本身不持有任何内容，留着不构成数据风险；
+--    真要清退由 Ops 显式执行。
+-- 2. **历史行的 expires_at 回填不还原。** 原值在回填时已被覆盖，无从恢复。
+--    这是本迁移唯一不可逆的部分。实际影响面为零行的理由见 upgrade 第二节的注释。
+--
+-- 会被还原的是本迁移新建的函数、触发器与全部授权。
+--
+-- 全部 REVOKE 都先查角色是否存在。回滚可能跑在一个「角色由 Ops 另行清退过」的集群上，
+-- 那时 `REVOKE ... FROM 不存在的角色` 会直接报错，把一次本该成功的回滚变成失败——
+-- 而回滚失败的场合，通常正是最不能再多一个意外的场合。
+
+DROP FUNCTION IF EXISTS public.lingxi_retention_cleanup(timestamptz, integer);
+
+DROP TRIGGER IF EXISTS galaxy_import_batch_expiry ON galaxy_import_batch;
+DROP FUNCTION IF EXISTS galaxy_import_batch_fix_expiry();
+
+DO $revoke$
+DECLARE
+    v_role text;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_retention_owner') THEN
+        EXECUTE 'REVOKE SELECT, DELETE ON public.galaxy_import_batch FROM lingxi_retention_owner';
+        EXECUTE 'REVOKE SELECT, DELETE ON public.feishu_org_sync_run FROM lingxi_retention_owner';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_app') THEN
+        EXECUTE 'REVOKE SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run FROM lingxi_app';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_scheduler') THEN
+        EXECUTE 'REVOKE SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run FROM lingxi_scheduler';
+    END IF;
+
+    FOREACH v_role IN ARRAY ARRAY['lingxi_app', 'lingxi_scheduler', 'lingxi_retention_owner'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = v_role) THEN
+            EXECUTE format('REVOKE USAGE ON SCHEMA public FROM %I', v_role);
+        END IF;
+    END LOOP;
+
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_migrate')
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_retention_owner') THEN
+        EXECUTE 'REVOKE lingxi_retention_owner FROM lingxi_migrate';
+    END IF;
+END
+$revoke$;
+"""
+
+
+def _execute_verbatim(connection, sql: str) -> None:
+    """把整段 SQL 原样交给驱动执行。
+
+    与基线 revision 用的是同一条路径，理由也相同：不能用 `op.execute()` 或
+    `exec_driver_sql()`，两者最终都会把 SQL 连同一个（哪怕是空的）参数集交给
+    psycopg，于是 psycopg 进入占位符插值模式。本段 DDL 里有 `DO` 块的
+    `format('CREATE ROLE %I', ...)` 与 `RAISE` 的 `%` 占位符，插值模式下直接报
+    `only '%s', '%b', '%t' are allowed as placeholders`。
+
+    只传 SQL、不传参数时 psycopg 完全跳过插值，`%I` / `%` 原样送到服务端。
+    这条路径已在 PostgreSQL 16 上以超级用户与非超级用户两种执行身份实跑验证。
+    """
+
+    with connection.connection.cursor() as cursor:
+        cursor.execute(sql)
+
+
+def upgrade() -> None:
+    _execute_verbatim(op.get_bind(), _UPGRADE_SQL)
+
+
+def downgrade() -> None:
+    _execute_verbatim(op.get_bind(), _DOWNGRADE_SQL)

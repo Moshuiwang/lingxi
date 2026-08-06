@@ -21,13 +21,20 @@ import time
 import unittest
 from datetime import timedelta
 
-from postgres_schema import MIGRATIONS_DIRECTORY, REPOSITORY_ROOT, rebuild_production_schema
+from postgres_schema import (
+    REPOSITORY_ROOT,
+    RETENTION_REVISION,
+    applied_head,
+    ensure_production_schema,
+    force_rebuild_schema,
+    revision_sql,
+)
 
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，保留清理断言未验证（需真实 PostgreSQL 16）"
 
 RETENTION_WINDOW = timedelta(hours=2160)
-DOWNGRADE_SQL = MIGRATIONS_DIRECTORY / "downgrades" / "013_drop_retention_cleanup.sql"
-UPGRADE_SQL = MIGRATIONS_DIRECTORY / "013_create_retention_cleanup.sql"
+# DDL 自 #53 起只存在于 revision 文件里（编号 SQL 已冻结），要重放它就从那里取。
+UPGRADE_SQL, DOWNGRADE_SQL = revision_sql()
 
 # 8 条 ON DELETE CASCADE 边，逐条列出（子表, 父表, 外键列）。
 # 合并成一个总数会让"漏了一张表"和"多删了一张表"表现成同一个数字。
@@ -57,8 +64,7 @@ class RetentionPostgresTestCase(unittest.TestCase):
 
         cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
-        with psycopg.connect(cls._dsn) as connection, connection.cursor() as cursor:
-            cls.applied_migrations = rebuild_production_schema(cursor)
+        ensure_production_schema(cls._dsn)
 
     def setUp(self) -> None:
         self.execute(
@@ -465,6 +471,7 @@ class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
         同时取证：现有代码路径写出的行**本来就精确满足**该不变式（`started_at` 与
         `expires_at` 两个 DEFAULT 取的是同一个事务时间戳），所以回填在真实数据上是零行改动。
         """
+        self.addCleanup(force_rebuild_schema, self._dsn)
         self.execute("DROP TRIGGER galaxy_import_batch_expiry ON galaxy_import_batch")
         self.execute(
             "INSERT INTO galaxy_import_batch (id, source_label, source_digest, status, started_at, expires_at) "
@@ -487,7 +494,7 @@ class ImmutableExpiryTriggerTest(RetentionPostgresTestCase):
         )
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+            cursor.execute(UPGRADE_SQL)
 
         self.assertEqual(
             self.count("galaxy_import_batch", "WHERE expires_at <> started_at + interval '2160 hours'"),
@@ -774,7 +781,7 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         self.assertEqual(self._owner_members() & {"lingxi_app", "lingxi_scheduler"}, {"lingxi_app", "lingxi_scheduler"})
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+            cursor.execute(UPGRADE_SQL)
 
         self.assertEqual(self._owner_members(), {"lingxi_migrate"}, "只有迁移角色应当是属主角色的成员")
         self._denied("lingxi_app", "SET ROLE lingxi_retention_owner")
@@ -791,10 +798,10 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         }
 
     def test_applying_the_migration_twice_does_not_duplicate_or_fail(self) -> None:
-        """V-保留-13：角色创建幂等——重复应用整条链不报错、不产生第二个角色。"""
+        """V-保留-13：角色创建幂等——重复应用不报错、不产生第二个角色。"""
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
-            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+            cursor.execute(UPGRADE_SQL)
+            cursor.execute(UPGRADE_SQL)
 
         self.assertEqual(
             self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"),
@@ -1021,16 +1028,17 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
 
     def test_upgrade_and_downgrade_round_trip_twice(self) -> None:
         """V-保留-18（验收 G-01/G-02/G-04）。"""
+        self.addCleanup(force_rebuild_schema, self._dsn)
         self.assertEqual(self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1})
 
         for attempt in range(2):
             with self.subTest(attempt=attempt, phase="downgrade"):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-                    cursor.execute(DOWNGRADE_SQL.read_text(encoding="utf-8"))
+                    cursor.execute(DOWNGRADE_SQL)
                 self.assertEqual(self._objects(), {"function": 0, "trigger_function": 0, "trigger": 0})
             with self.subTest(attempt=attempt, phase="upgrade"):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-                    cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+                    cursor.execute(UPGRADE_SQL)
                 self.assertEqual(self._objects(), {"function": 1, "trigger_function": 1, "trigger": 1})
 
     def test_downgrade_keeps_the_data_and_the_cluster_level_roles(self) -> None:
@@ -1040,7 +1048,7 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
         before = self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1")
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(DOWNGRADE_SQL.read_text(encoding="utf-8"))
+            cursor.execute(DOWNGRADE_SQL)
 
         self.assertEqual(self.query("SELECT to_jsonb(t) FROM galaxy_import_batch t ORDER BY 1"), before)
         self.assertEqual(self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"), 4)
@@ -1071,8 +1079,7 @@ class MigrationRoundTripTest(RetentionPostgresTestCase):
         self.assertEqual(store.current_batch_id(), result.batch_id)
 
     def _reapply_chain(self) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(UPGRADE_SQL.read_text(encoding="utf-8"))
+        force_rebuild_schema(self._dsn)
 
 
 # ---------------------------------------------------------------------------
@@ -1123,13 +1130,44 @@ class ReimportAfterCleanupTest(RetentionPostgresTestCase):
 
 
 class MigrationChainCoverageTest(RetentionPostgresTestCase):
-    def test_the_retention_migration_is_part_of_the_chain_the_tests_apply(self) -> None:
-        """建库确实包含了本次迁移——否则上面每一条断言都是在一个没有清理函数的库上跑。"""
-        self.assertIn(UPGRADE_SQL.name, self.applied_migrations)
+    def test_the_test_database_was_built_by_the_alembic_chain_up_to_this_revision(self) -> None:
+        """建库确实跑到了本 revision——否则上面每一条断言都是在一个没有清理函数的库上跑。
+
+        观察点取建库时实际前滚到的 head，不取测试自己维护的清单；再配一条
+        "清理函数真的在库里"，两者合起来才说明链跑到了这条 revision。
+        """
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        head = ScriptDirectory.from_config(Config(str(REPOSITORY_ROOT / "alembic.ini"))).get_current_head()
+
+        self.assertEqual(applied_head(), head)
+        self.assertEqual(head, "0054_retention_cleanup")
+        # 业务测试库不留版本表：它每轮都重建，不是被 alembic 增量维护的库，
+        # 而迁移门禁有一条卫生断言专门盯着这一点。
         self.assertEqual(
-            [path.name for path in sorted(MIGRATIONS_DIRECTORY.glob("*.sql"))],
-            list(self.applied_migrations),
+            self.scalar("SELECT to_regclass('public.alembic_version')::text"),
+            None,
         )
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'public' AND p.proname = 'lingxi_retention_cleanup'"
+            ),
+            1,
+        )
+
+    def test_the_revision_file_is_the_only_carrier_of_the_retention_ddl(self) -> None:
+        """编号 SQL 已冻结：保留清理的 DDL 不得再以 `migrations/*.sql` 的形式存在。
+
+        真回来一个 `013_*.sql` 的话，#53 的逐字节门禁会红（它不在基线的 CHAIN 里），
+        但那道门禁要有容器才跑；这条不需要。
+        """
+        self.assertTrue(RETENTION_REVISION.is_file())
+        stray = [path.name for path in (REPOSITORY_ROOT / "migrations").glob("013*.sql")]
+        self.assertEqual(stray, [])
+        self.assertIn("lingxi_retention_cleanup", UPGRADE_SQL)
+        self.assertIn("DROP FUNCTION IF EXISTS public.lingxi_retention_cleanup", DOWNGRADE_SQL)
 
 
 if __name__ == "__main__":

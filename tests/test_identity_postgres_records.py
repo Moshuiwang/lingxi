@@ -31,7 +31,7 @@ from lingxi.core.identity.org_snapshot import (
     TenantScope,
 )
 
-from postgres_schema import rebuild_production_schema
+from postgres_schema import reset_production_rows
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
@@ -85,15 +85,17 @@ class IdentityPostgresTestCase(unittest.TestCase):
         self.reset_schema()
 
     def reset_schema(self) -> None:
-        """整条生产链重建，不是挑 006/007/008 三条。
+        """整条 alembic 链建库，不是挑 006/007/008 三条。
 
-        此前这里硬编码三个文件名。#54 的 013 在组织快照表上加了授权、又在银河侧
-        加了触发器，按名字挑迁移会得到一个"少了一半新对象"的库——而少了的部分
-        不会让任何用例变红，只会让它们在一个不完整的库上通过（#54 验收清单 H-02）。
+        此前这里硬编码三个文件名。保留清理 revision 在组织快照表上加了授权、又在
+        银河侧加了触发器，按名字挑迁移会得到一个"少了一半新对象"的库——而少了的
+        部分不会让任何用例变红，只会让它们在一个不完整的库上通过（#54 验收清单 H-02）。
+
+        结构在进程内只建一次，这里每个用例做的是清行：本类有五十余个用例，
+        每个都重跑一次整链前滚会把真库这一段抬到门禁超时的量级。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            self._applied = rebuild_production_schema(cursor)
+        reset_production_rows(self._dsn)
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:

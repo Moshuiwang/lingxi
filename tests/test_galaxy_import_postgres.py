@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from postgres_schema import rebuild_production_schema
+from postgres_schema import force_rebuild_schema
 
 _GALAXY_TABLES = (
     "galaxy_user",
@@ -86,10 +86,10 @@ class GalaxyImportPostgresTest(unittest.TestCase):
 
         cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
-        # 建的是**整条**生产链，不是这几张银河表：013 的清理函数同时引用银河与
-        # 组织快照两侧，按表挑迁移会建不起来。链由 glob 取，新增迁移自动进来。
-        with psycopg.connect(cls._dsn) as connection, connection.cursor() as cursor:
-            cls._applied = rebuild_production_schema(cursor)
+        # 建的是**整条 alembic 链**，不是这几张银河表：保留清理 revision 同时引用
+        # 银河与组织快照两侧，按表挑迁移建不起来；而 #53 之后表结构的权威来源就是
+        # revision 链本身，这里与生产、与迁移门禁同源。
+        cls._head = force_rebuild_schema(cls._dsn)
 
     def setUp(self) -> None:
         from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
