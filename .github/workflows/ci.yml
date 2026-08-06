@@ -77,15 +77,18 @@ jobs:
           # 发布时门禁会自己跳版本。脚本里另有一道校验，确保这里不低于 pyproject
           # 声明的下限，两边漂移会被发现。
           python-version: '3.12'
-          # Issue #43 瘦身（A3）：缓存 pip 下载目录（feishu / agent extras，
+          # Issue #43 瘦身（A3）：缓存 pip 下载目录（scheduler / worker extras，
           # 含 claude-agent-sdk 轮子），缓存键取自 pyproject.toml 的哈希。
           cache: 'pip'
           cache-dependency-path: pyproject.toml
 
       # shellcheck 此前用的是 runner 镜像自带的版本，既没锁定也没打印：同一个提交
       # 可能因为镜像更新得到不同结论。改用 pip 分发并锁版本，本机可装同一个。
-      - name: 安装 Bot-Test 凭据测试依赖与锁定版本的 shellcheck
-        run: python3 -m pip install '.[feishu]' 'shellcheck-py==0.11.0.1'
+      # 装 scheduler 组而不是全量：实测 416 条单测跑完只需要 cryptography 与 psycopg，
+      # 不需要 lark-oapi / websockets（两者都只在函数内延迟导入，测试从不走到）。
+      # Bot-Test 那一组的依赖由 `CI / extras` 矩阵在干净环境里单独证明装得上。
+      - name: 安装测试依赖与锁定版本的 shellcheck
+        run: python3 -m pip install '.[scheduler]' 'shellcheck-py==0.11.0.1'
 
       # 测试跑 PYTHONPATH=src，部署跑 pip 装出来的制品；新增子目录会让两者分叉，
       # 而分叉只在部署时才暴露。必须在仓库目录之外跑，否则只是又测了一遍源码树。
@@ -97,7 +100,7 @@ jobs:
       # 这一步不调用模型、不使用任何业务凭据，只构造 hooks 配置。
       - name: 真实 Agent SDK 冒烟（不调模型、不用凭据）
         run: |
-          python3 -m pip install '.[agent]'
+          python3 -m pip install '.[worker]'
           python3 "${GITHUB_WORKSPACE}/scripts/ci/check_agent_sdk_binding.py"
 
       - name: 运行基础质量门禁
@@ -116,3 +119,55 @@ jobs:
             exit 1
           fi
           echo '工作树洁净：CI 未改写受版本控制的文件'
+
+  # Issue #56：extras 按进程拆分之后，每个组都要被证明「单独装得上、且该进程的运行
+  # 依赖真的齐」。必须一组一个**干净虚拟环境**：装在同一个环境里累加，narrower 的组
+  # 会白白用上别组带进来的包，检查就永远不会红。
+  #
+  # gate 里的 `check_installed_package.py`（不带 --process）抓不到这类缺陷：
+  # `src/lingxi/` 没有任何模块级第三方 import，缺 psycopg 时全部模块照样 import 成功。
+  # 实测对照——把 psycopg 从 scheduler 组删掉后，不带 --process 的检查仍然退出 0，
+  # 带 --process 的退出 1。
+  extras:
+    name: CI / extras (${{ matrix.extra }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      # 三组互相独立，一组坏了也要看到另外两组的结论。
+      fail-fast: false
+      matrix:
+        # 与 pyproject.toml 的 [project.optional-dependencies] 组名保持一致；
+        # 新增 extra 时必须同步加进这里，否则新组没有任何检查覆盖。
+        extra: [scheduler, worker, bot-test]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 配置 Python 运行时
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # 与 gate 同一版本；此处不开 pip 缓存，三条矩阵腿的缓存键相同会互相抢占，
+          # 而这几个组都是小轮子，省下的时间不值那份噪声。
+          python-version: '3.12'
+
+      - name: 在干净虚拟环境里只装这一个 extra
+        env:
+          EXTRA: ${{ matrix.extra }}
+          VENV: ${{ runner.temp }}/venv
+        run: |
+          python3 -m venv "${VENV}"
+          "${VENV}/bin/python" -m pip install ".[${EXTRA}]"
+          echo "--- 该环境实际装了什么 ---"
+          "${VENV}/bin/python" -m pip list
+
+      # 与 gate 同理，必须在仓库目录之外跑，否则只是又测了一遍源码树。
+      - name: 校验制品完整与该进程的运行依赖
+        working-directory: ${{ runner.temp }}
+        env:
+          EXTRA: ${{ matrix.extra }}
+          VENV: ${{ runner.temp }}/venv
+        run: |
+          "${VENV}/bin/python" "${GITHUB_WORKSPACE}/scripts/ci/check_installed_package.py" --process "${EXTRA}"
