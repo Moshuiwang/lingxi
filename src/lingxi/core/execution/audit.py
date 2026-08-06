@@ -582,6 +582,21 @@ def _error_text(error: Any) -> str:
     return _redact_free_text(text)[:_MAX_KEPT_ERROR_TEXT]
 
 
+def redact_free_text(text: str) -> str:
+    """自由文本脱敏的**公开出口**。
+
+    审计明细在记账时已经脱敏，但执行器还要把两类模型可控文本送出进程：最终正文，
+    以及不在白名单里的工具名（后者在审计对象里**有意**原样保留，见 `V-审计-03` 的
+    残余缺口表）。这两处必须在出口再过一道，否则"凭据不进日志、不进证据"就只覆盖
+    了审计明细一半的出口。
+
+    这道脱敏的能力边界与 :func:`_redact_free_text` 完全相同，**不是绝对保证**：
+    纯字母且短于 32 字符的秘密盖不住。不得据此声称出口是干净的。
+    """
+
+    return _redact_free_text(text)
+
+
 def _redact_free_text(text: str) -> str:
     """自由文本（错误原文、回执正文、畸形工具名）的脱敏。
 
