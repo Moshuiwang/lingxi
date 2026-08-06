@@ -138,14 +138,38 @@ BEGIN
 
     -- 属主角色不得是任何角色的成员：它一旦继承了别的权限，SECURITY DEFINER 的
     -- 执行身份就不再是"只有两张父表 SELECT/DELETE"的那个最小面。
-    IF EXISTS (
-        SELECT 1 FROM pg_catalog.pg_auth_members am
-          JOIN pg_catalog.pg_roles member ON member.oid = am.member
-         WHERE member.rolname = 'lingxi_retention_owner'
-    ) THEN
-        RAISE EXCEPTION 'lingxi_retention_owner 是其他角色的成员，会继承计划外权限'
-            USING HINT = '受限清理函数的执行身份必须保持最小权限面，请先收回该成员关系';
+    -- 先做能自动纠正的那一类：业务角色被直接授予了属主角色。这条自愈在下面的
+    -- 传递性校验**之前**执行——顺序反了的话，一次可以自动纠正的直接越权授权会被
+    -- 校验当成致命错误挡下来，迁移永远跑不到自愈那一行（本轮实测踩到）。
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_app') THEN
+        EXECUTE 'REVOKE lingxi_retention_owner FROM lingxi_app';
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_scheduler') THEN
+        EXECUTE 'REVOKE lingxi_retention_owner FROM lingxi_scheduler';
+    END IF;
+
+    -- 属主角色不得继承任何其他角色的权限，**也不得经由中间角色间接继承**。
+    -- 直接查 pg_auth_members 只看得见一层：`owner → bridge → app` 这样的链上，
+    -- owner 的直接成员行只有 bridge，看起来"没有问题"，而它实际已经拿到了 app 的
+    -- 全部权限；针对 app 的直接 REVOKE 也撤不掉这条链（codex 二轮 P1-2）。
+    -- `pg_has_role` 是按传递闭包判定的，正是这里要的语义。
+    FOREACH role_name IN ARRAY ARRAY['lingxi_app', 'lingxi_scheduler', 'lingxi_migrate'] LOOP
+        IF pg_catalog.pg_has_role('lingxi_retention_owner', role_name, 'USAGE')
+           OR pg_catalog.pg_has_role('lingxi_retention_owner', role_name, 'MEMBER') THEN
+            RAISE EXCEPTION 'lingxi_retention_owner 可经成员关系取得 % 的权限（可能是间接链）', role_name
+                USING HINT = '受限清理函数的执行身份必须保持最小权限面；'
+                             '请检查 pg_auth_members 上以 lingxi_retention_owner 为成员的整条链';
+        END IF;
+    END LOOP;
+
+    -- 反向也查一次：任何业务角色都不得（直接或间接）取得属主角色。
+    FOREACH role_name IN ARRAY ARRAY['lingxi_app', 'lingxi_scheduler'] LOOP
+        IF pg_catalog.pg_has_role(role_name, 'lingxi_retention_owner', 'SET')
+           OR pg_catalog.pg_has_role(role_name, 'lingxi_retention_owner', 'USAGE') THEN
+            RAISE EXCEPTION '% 可经成员关系取得 lingxi_retention_owner（可能是间接链）', role_name
+                USING HINT = '业务角色取得属主角色即可绕过受限清理函数直接删除内容';
+        END IF;
+    END LOOP;
 END
 $roles$;
 
@@ -164,15 +188,14 @@ $roles$;
 -- 这条成员关系只给迁移角色，lingxi_app / lingxi_scheduler 都不给（断言 V-保留-13）。
 GRANT lingxi_retention_owner TO lingxi_migrate;
 
--- 反向也写死：业务角色若因为任何原因拿到了这条成员关系，重新应用本迁移必须收回它。
--- 限权迁移应当**强制**自己的边界，而不是假设没有别人越权授过。
+-- 「业务角色不得持有属主角色」这条边界的强制执行已经移进上面的 DO 块：
+-- 自愈（直接授予→收回）必须排在传递性校验之前，否则一次可以自动纠正的直接越权
+-- 会被校验当成致命错误先挡下来。这里不再重复。
 --
--- 这条不是防御性洁癖。角色成员关系是集群级对象，**不随表一起重建**：表的 ACL 在
--- 重建表时自然清空，成员关系不会。#54 的变异测试把成员资格授给 lingxi_app 之后，
--- 重跑整条迁移链并没有收回它，于是「应用角色不能删除内容表」「不能取得属主角色」
--- 这一组限权断言在之后的整轮测试里**全部静默失效**——授权面被放宽了，而没有任何
--- 东西报错。有了下面这行，同样的越权授权会在下一次迁移时被自动纠正。
-REVOKE lingxi_retention_owner FROM lingxi_app, lingxi_scheduler;
+-- 为什么需要自愈：角色成员关系是集群级对象，**不随表一起重建**——表的 ACL 在重建表
+-- 时自然清空，成员关系不会。#54 的变异测试把成员资格授给 lingxi_app 之后，重跑整条
+-- 迁移链并没有收回它，于是「应用角色不能删除内容表」「不能取得属主角色」这一组限权
+-- 断言在之后的整轮测试里全部静默失效——授权面被放宽了，而没有任何东西报错。
 
 -- 建库脚本重建 schema 后 PUBLIC 的 USAGE 可能不在；显式授予，不依赖默认 ACL
 -- （Supabase 等托管实例的 public schema ACL 与自建集群不一致）。
@@ -188,7 +211,7 @@ GRANT USAGE ON SCHEMA public TO lingxi_app, lingxi_scheduler, lingxi_retention_o
 -- 只有「调用方显式传了别的 expires_at 或 started_at」的行。
 --
 -- 回填在建触发器**之前**执行，是一次普通的数据校正：downgrade 不还原它（原值已不可知），
--- 这是本迁移唯一不可逆的部分，见 migrations/downgrades/013 与 PR 说明。
+-- 这是本迁移唯一不可逆的部分，见下方 `_DOWNGRADE_SQL` 的说明。
 UPDATE galaxy_import_batch
    SET expires_at = started_at + INTERVAL '2160 hours'
  WHERE expires_at <> started_at + INTERVAL '2160 hours';
@@ -238,11 +261,29 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $guard$
 BEGIN
+    -- **双条件**：到期 **且** 由属主角色执行，才放行（编排者裁定）。
+    -- 数据库设计 :514-538 的原话是「只有属主在到期后可删」，两个条件是并列的。
+    --
+    -- 四象限：
+    --   属主  × 已到期 → 放行（受限清理函数走的就是这一格）
+    --   属主  × 未到期 → 拒绝（属主自己也不能提前删）
+    --   非属主 × 已到期 → 拒绝（误授 lingxi_app DELETE 后，连过期行也删不掉）
+    --   非属主 × 未到期 → 拒绝
+    --
+    -- 我此前只做了到期这一维，理由是「角色名可被预建冒名」。那个顾虑现在已经被
+    -- 本迁移第一节的角色规范化消解掉了：属主角色的 LOGIN、SUPERUSER 与成员图都在
+    -- 迁移时被强制校验，冒名者过不了那一关。于是「校验执行角色」重新变得可信，
+    -- 而它挡住的正是单条件挡不住的那一格（非属主 × 已到期）。
     IF OLD.expires_at > clock_timestamp() THEN
         RAISE EXCEPTION '拒绝删除未到期的 %.% 行：到期时间 % 尚未到达',
             TG_TABLE_SCHEMA, TG_TABLE_NAME, OLD.expires_at
             USING HINT = '九十天窗口内的可识别内容只能等到期后由受限清理函数回收；'
                          '需要提前删除属于用户删除编排，不是保留清理。';
+    END IF;
+    IF current_user <> 'lingxi_retention_owner' THEN
+        RAISE EXCEPTION '拒绝由 % 直接删除 %.% 的到期行', current_user, TG_TABLE_SCHEMA, TG_TABLE_NAME
+            USING HINT = '到期内容只能经受限清理函数回收（它以 lingxi_retention_owner 身份执行）；'
+                         '运维确需直接删除时，见 migrations/README.md 的紧急删除路径。';
     END IF;
     RETURN OLD;
 END;
@@ -283,7 +324,12 @@ RETURNS TABLE (
     target_table      text,
     deleted_rows      bigint,
     oldest_expires_at timestamptz,
-    newest_expires_at timestamptz
+    newest_expires_at timestamptz,
+    -- 这一轮该表是否因为拿不到锁而整批让路。**必须与"真的没有到期行"区分开**：
+    -- 两者的 deleted_rows 都是 0，但前者是"没做成"、后者是"没有可做的"。
+    -- 不区分的话，一张长期被占的表会在运行日志里表现为一切正常，而内容一直没被回收
+    -- ——保留违规最不该有的形态就是它悄无声息（codex 二轮 P1-3）。
+    blocked           boolean
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -356,11 +402,12 @@ BEGIN
     SELECT 'galaxy_import_batch'::text,
            count(*)::bigint,
            min(removed.gone_at),
-           max(removed.gone_at)
+           max(removed.gone_at),
+           false
       FROM removed;
     EXCEPTION WHEN lock_not_available THEN
         RETURN QUERY SELECT 'galaxy_import_batch'::text, 0::bigint,
-                            NULL::timestamptz, NULL::timestamptz;
+                            NULL::timestamptz, NULL::timestamptz, true;
     END;
 
     -- 逐表捕获锁超时。不捕获的话，一张表上的一把锁会让整次调用抛异常，
@@ -384,11 +431,12 @@ BEGIN
     SELECT 'feishu_org_sync_run'::text,
            count(*)::bigint,
            min(removed.gone_at),
-           max(removed.gone_at)
+           max(removed.gone_at),
+           false
       FROM removed;
     EXCEPTION WHEN lock_not_available THEN
         RETURN QUERY SELECT 'feishu_org_sync_run'::text, 0::bigint,
-                            NULL::timestamptz, NULL::timestamptz;
+                            NULL::timestamptz, NULL::timestamptz, true;
     END;
 END;
 $cleanup$;
@@ -461,18 +509,8 @@ GRANT EXECUTE ON FUNCTION public.lingxi_retention_cleanup(timestamptz, integer) 
 -- 要的恰恰是被关掉的那个 SET，照样报 `must be able to SET ROLE`。
 DO $handover$
 DECLARE
-    v_can_set   boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'SET');
-    -- 移交前的成员关系原样留底。只记 pg_has_role 的布尔量不够：还原时要把
-    -- admin / inherit / set 三个选项逐个放回去，少放一个就是「悄悄多给了一点能力」。
-    v_before    record;
+    v_can_set boolean := pg_catalog.pg_has_role(current_user, 'lingxi_retention_owner', 'SET');
 BEGIN
-    SELECT am.admin_option, am.inherit_option, am.set_option
-      INTO v_before
-      FROM pg_catalog.pg_auth_members am
-      JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
-      JOIN pg_catalog.pg_roles m ON m.oid = am.member
-     WHERE r.rolname = 'lingxi_retention_owner' AND m.rolname = current_user;
-
     IF NOT v_can_set THEN
         EXECUTE format('GRANT lingxi_retention_owner TO %I WITH SET TRUE', current_user);
     END IF;
@@ -482,25 +520,22 @@ BEGIN
 
     EXECUTE 'REVOKE CREATE ON SCHEMA public FROM lingxi_retention_owner';
 
-    -- 只撤销**本次多加的那一项**，不去重新授予整条成员关系。
+    -- 精确撤销**本次这一条授予**，用 `GRANTED BY current_user` 限定授予方。
+    -- 成员关系按 (角色, 成员, 授予方) 三元组存放：本次是以 current_user 身份授出的，
+    -- 只撤这一条，CREATEROLE 建角色时那条由别的授予方留下的自动授予原样不动。
     --
-    -- 走过两个错误答案，都只在非超级用户下才暴露（超级用户的 pg_has_role 恒真，
-    -- 整段被跳过），这里记下来：
+    -- 走过的三个错误答案都记在这里，它们只在非超级用户下才暴露：
     --   1. `GRANT ... WITH SET FALSE` —— INHERIT 缺省取被授予角色的 rolinherit，
-    --      于是"还原"反而把 inherit=f 变成 inherit=t，悄悄多给了能力（M2 验收发现）；
-    --   2. 改成逐项 `WITH ADMIN %s, INHERIT %s, SET %s` 重授 —— 先是 `format('%s', boolean)`
-    --      渲染成 `t`/`f` 触发 `syntax error at or near "t"`；改成 TRUE/FALSE 之后又撞上
-    --      `ADMIN option cannot be granted back to your own grantor`：CREATEROLE 建角色
-    --      时那条自动授予的授予方就是它自己，没法把 ADMIN 再授回给授予方。
-    --
-    -- 正确的工具是 PostgreSQL 16 的 `REVOKE <选项> OPTION FOR`：它只摘掉一个选项，
-    -- 不碰成员关系本身，也就不存在"重新授予"带来的这两类问题。
+    --      "还原"反而把 inherit=f 变成 inherit=t；
+    --   2. 逐项 `WITH ADMIN %s, INHERIT %s, SET %s` —— `format('%s', boolean)` 渲染成
+    --      `t`/`f`，语法错误；换 TRUE/FALSE 后又撞上
+    --      `ADMIN option cannot be granted back to your own grantor`；
+    --   3. `REVOKE SET OPTION FOR ...` —— 它撤的是「所有授予方」那一条上的 SET 选项，
+    --      并不能把本次多出来的整条授予去掉，INHERIT 残留因此仍在（验收二次抓到；
+    --      当时我还写了一句"已修"的注释，而捕获的三元组从头到尾没有被读过——
+    --      没有用例覆盖成员关系状态，两轮都没自查出来）。
     IF NOT v_can_set AND current_user <> 'lingxi_migrate' THEN
-        IF v_before IS NULL THEN
-            EXECUTE format('REVOKE lingxi_retention_owner FROM %I', current_user);
-        ELSE
-            EXECUTE format('REVOKE SET OPTION FOR lingxi_retention_owner FROM %I', current_user);
-        END IF;
+        EXECUTE format('REVOKE lingxi_retention_owner FROM %I GRANTED BY %I', current_user, current_user);
     END IF;
 END
 $handover$;
@@ -547,9 +582,8 @@ BEGIN
         EXECUTE 'REVOKE SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run FROM lingxi_app';
     END IF;
 
-    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'lingxi_scheduler') THEN
-        EXECUTE 'REVOKE SELECT ON public.galaxy_import_batch, public.feishu_org_sync_run FROM lingxi_scheduler';
-    END IF;
+    -- scheduler 在 upgrade 里已经是 `REVOKE ALL`，一条表权限都没授过，
+    -- 这里不再有对应的撤销动作（原先那三行是空操作，已删）。
 
     FOREACH v_role IN ARRAY ARRAY['lingxi_app', 'lingxi_scheduler', 'lingxi_retention_owner'] LOOP
         IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = v_role) THEN

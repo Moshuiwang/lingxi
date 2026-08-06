@@ -209,6 +209,26 @@ psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "DROP DATABASE lingxi_takeover_check;"
    仍未核实的是该实例上 `CREATE ROLE` 是否被托管策略额外限制，以及是否允许
    `SET SESSION AUTHORIZATION`（真库角色用例依赖它）——两项均登记为 stage（L4a）演练验证项。
 
+## 运维紧急删除到期数据的路径
+
+保留清理的删除防线是**双条件**的：只有 `expires_at` 已到期、**且**执行身份是
+`lingxi_retention_owner` 时，两张父表的行才删得掉。正常回收走受限清理函数
+（它是 `SECURITY DEFINER`，以属主身份执行），因此不受影响。
+
+运维确需绕开定时职责直接删除**已到期**数据时，用属主身份执行：
+
+```sql
+-- 需要超级用户或对 lingxi_retention_owner 有 SET 权限
+SET SESSION AUTHORIZATION lingxi_retention_owner;
+DELETE FROM public.galaxy_import_batch WHERE expires_at <= now() AND id = '<批次 id>';
+RESET SESSION AUTHORIZATION;
+```
+
+**未到期**的数据任何身份都删不掉，属主也不行。那属于用户删除编排（合同的
+「当前运行环境删除」），不是保留清理，走各自的编排流程；确有一次性需要时，
+只能由 DBA 显式 `ALTER TABLE ... DISABLE TRIGGER` 并在操作后立即恢复，
+该动作应当留审计记录。
+
 ## 过渡期：编号 SQL 还留着
 
 顶层 `migrations/*.sql`（`006` `007` `008` `010` `011` `012`）**冻结但保留**，两个用途：

@@ -287,7 +287,16 @@ class RetentionCleanupDuty:
         # 摘要只有表名与计数。清理函数的返回里根本没有行内容，日志因此不可能
         # 带出人员数据（断言 V-保留-14）。
         summary = getattr(report, "summary", None)
-        logger.info("%s", summary() if callable(summary) else "保留清理：本轮完成")
+        rendered = summary() if callable(summary) else "保留清理：本轮完成"
+        # 有表因为拿不到锁而让路时，这一轮**没有做完**，不能记成正常完成。
+        # 两者的删除数都可能是 0，只有日志级别与标记能把它们分开：一张长期被占的表
+        # 会在 INFO 流水里表现为一切正常，而内容一直没被回收——保留违规最不该有的
+        # 形态就是它悄无声息（codex 二轮 P1-3）。
+        blocked = getattr(report, "blocked_tables", ())
+        if blocked:
+            logger.warning("%s；本轮未清理完：%s 因锁等待超时让路，下一轮重试", rendered, "、".join(blocked))
+        else:
+            logger.info("%s", rendered)
         return report
 
 

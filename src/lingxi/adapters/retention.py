@@ -38,6 +38,9 @@ class RetentionTableResult:
     deleted: int
     oldest_expires_at: datetime | None
     newest_expires_at: datetime | None
+    # 这一轮该表是否因为拿不到锁而整批让路。与"没有到期行"是两回事：
+    # 两者 deleted 都是 0，只有这个标记能把它们分开。
+    blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,12 +53,22 @@ class RetentionReport:
     def deleted(self) -> int:
         return sum(result.deleted for result in self.tables)
 
+    @property
+    def blocked_tables(self) -> tuple[str, ...]:
+        """本轮因锁等待超时而未能清理的表。非空即这一轮没做完。"""
+
+        return tuple(result.table for result in self.tables if result.blocked)
+
     def summary(self) -> str:
         """写进日志的一行摘要。只有表名与计数，永远不取行内容。"""
 
         if not self.tables:
             return "保留清理：本轮无目标表"
-        return "保留清理：" + "；".join(f"{result.table} 删除 {result.deleted} 行" for result in self.tables)
+        parts = [
+            f"{result.table} 删除 {result.deleted} 行" + ("（锁等待超时，本轮让路）" if result.blocked else "")
+            for result in self.tables
+        ]
+        return "保留清理：" + "；".join(parts)
 
 
 class PostgresRetentionCleaner:
@@ -85,7 +98,7 @@ class PostgresRetentionCleaner:
 
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at "
+                "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
                 f"FROM {CLEANUP_FUNCTION}(now(), %s)",
                 (self._batch_limit,),
             )
@@ -98,6 +111,7 @@ class PostgresRetentionCleaner:
                     deleted=int(row[1]),
                     oldest_expires_at=row[2],
                     newest_expires_at=row[3],
+                    blocked=bool(row[4]),
                 )
                 for row in rows
             )

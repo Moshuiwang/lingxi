@@ -103,7 +103,7 @@ class RetentionPostgresTestCase(unittest.TestCase):
 
     def cleanup_with_deadline(
         self, moment, limit: int = 100, deadline: str = "15s"
-    ) -> dict[str, tuple[int, object, object]]:
+    ) -> dict[str, tuple[int, object, object, bool]]:
         """带客户端死线的清理调用，只给并发用例使用。
 
         函数自己有 `lock_timeout`，正常情况下轮不到这条死线。它存在是为了让
@@ -115,22 +115,22 @@ class RetentionPostgresTestCase(unittest.TestCase):
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SET statement_timeout = '{deadline}'")
             cursor.execute(
-                "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at "
+                "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
                 "FROM public.lingxi_retention_cleanup(%s, %s)",
                 (moment, limit),
             )
             rows = cursor.fetchall()
-        return {str(row[0]): (int(row[1]), row[2], row[3]) for row in rows}
+        return {str(row[0]): (int(row[1]), row[2], row[3], bool(row[4])) for row in rows}
 
-    def cleanup(self, moment, limit: int = 100) -> dict[str, tuple[int, object, object]]:
-        """调用受限清理函数，返回 {表名: (删除数, 最早到期, 最晚到期)}。"""
+    def cleanup(self, moment, limit: int = 100) -> dict[str, tuple[int, object, object, bool]]:
+        """调用受限清理函数，返回 {表名: (删除数, 最早到期, 最晚到期, 是否因锁让路)}。"""
 
         rows = self.query(
-            "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at "
+            "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
             "FROM public.lingxi_retention_cleanup(%s, %s)",
             (moment, limit),
         )
-        return {str(row[0]): (int(row[1]), row[2], row[3]) for row in rows}
+        return {str(row[0]): (int(row[1]), row[2], row[3], bool(row[4])) for row in rows}
 
     # ---- 造数 -------------------------------------------------------------
 
@@ -659,6 +659,8 @@ class CleanupFunctionContractTest(RetentionPostgresTestCase):
         self.assertLess(elapsed, 10, "清理不得被行锁无限阻塞——它与凭据轮换共用一个线程")
         self.assertGreater(elapsed, 1, "应当是等到超时才放弃，而不是根本没尝试")
         self.assertEqual(summary["galaxy_import_batch"][0], 0, "摘要必须如实报 0，不能报出没发生的删除")
+        self.assertTrue(summary["galaxy_import_batch"][3], "让路必须带标记：与「本来就没有到期行」是两回事")
+        self.assertFalse(summary["feishu_org_sync_run"][3], "没被占的表不该带让路标记")
         self.assertEqual(self.count("galaxy_import_batch"), 2, "被锁那一批一行都不该删")
         # 逐表捕获的意义：一张表被占，另一张照常清理。
         self.assertEqual(summary["feishu_org_sync_run"][0], 1)
@@ -856,37 +858,45 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 self.assertIn("permission denied", message)
         self.assertEqual(self.count("galaxy_import_batch"), 1)
 
-    def test_a_row_that_has_not_expired_cannot_be_deleted_even_with_the_privilege(self) -> None:
-        """V-保留-21（codex 外审 P1-2）：数据库设计 :535-538 的第二道防线。
+    def test_the_delete_guard_covers_all_four_quadrants(self) -> None:
+        """V-保留-21（编排者裁定的双条件）：到期 **且** 属主，才删得掉。
 
-        「权限收紧防误操作，触发器防误授权」是并列的两道。此前只做了前半道：
-        lingxi_app 没有 DELETE。但那只在授权正确时成立，而"授权被改错"正是第二道
-        要挡的场景——codex 实测临时授上 DELETE 后，未到期批次可以被直接删掉。
-        这里把那次实测固化：**临时授予 DELETE**，然后确认仍然删不动未到期的行。
+        四象限逐格验。单验其中一维都会漏：只按到期时间判，误授 lingxi_app DELETE
+        之后它能删掉**过期**行（codex 实测）；只按角色判，属主自己能删未到期行。
         """
         now = self.database_now()
-        self.insert_batch("gib_fresh", started_at=now, status="complete")
-        self.insert_sync_run("run_fresh", started_at=now)
         self.addCleanup(force_rebuild_schema, self._dsn)
-        self.execute("GRANT DELETE ON public.galaxy_import_batch, public.feishu_org_sync_run TO lingxi_app")
+        self.insert_batch("gib_fresh", started_at=now, status="complete")
+        self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+        # 误授权：这一格正是"触发器防误授权"要挡的场景。
+        self.execute("GRANT DELETE ON public.galaxy_import_batch TO lingxi_app")
 
-        for table in ("galaxy_import_batch", "feishu_org_sync_run"):
-            with self.subTest(table=table):
+        quadrants = (
+            ("lingxi_retention_owner", "gib_old", True),
+            ("lingxi_retention_owner", "gib_fresh", False),
+            ("lingxi_app", "gib_old", False),
+            ("lingxi_app", "gib_fresh", False),
+        )
+        for role, batch_id, should_succeed in quadrants:
+            with self.subTest(role=role, row=batch_id, expected="成功" if should_succeed else "拒绝"):
                 with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-                    cursor.execute("SET SESSION AUTHORIZATION lingxi_app")
-                    with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
-                        cursor.execute(f"DELETE FROM public.{table}")
-                    connection.rollback()
-                self.assertIn("拒绝删除未到期", str(raised.exception))
+                    cursor.execute(f"SET SESSION AUTHORIZATION {role}")
+                    if should_succeed:
+                        cursor.execute("DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,))
+                        self.assertEqual(cursor.rowcount, 1)
+                        connection.rollback()
+                    else:
+                        with self.assertRaises(self._psycopg.errors.RaiseException):
+                            cursor.execute("DELETE FROM public.galaxy_import_batch WHERE id = %s", (batch_id,))
+                        connection.rollback()
 
-        self.assertEqual(self.count("galaxy_import_batch"), 1)
-        self.assertEqual(self.count("feishu_org_sync_run"), 1)
+        self.assertEqual(self.count("galaxy_import_batch"), 2, "四象限验完后两行都应还在")
 
-    def test_an_expired_row_is_still_deletable_so_the_cleanup_is_not_blocked(self) -> None:
-        """V-保留-21 的肯定面：防线只挡未到期行，到期行照常回收。
+    def test_an_expired_row_is_still_collected_by_the_restricted_function(self) -> None:
+        """V-保留-21 的肯定面：双条件不得把受限清理函数自己挡在门外。
 
-        只写否定面的话，一个"什么都拒绝"的触发器同样能让否定断言通过，
-        而它会把受限清理函数本身也堵死。
+        只写否定面的话，一个"什么都拒绝"的触发器同样能让四象限里的三格通过，
+        而它会把唯一合法的回收路径也堵死。
         """
         now = self.database_now()
         self.insert_batch("gib_old", started_at=now - RETENTION_WINDOW - timedelta(hours=1), with_children=True)
@@ -970,7 +980,68 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                 cursor.execute(UPGRADE_SQL)
 
-        self.assertIn("继承计划外权限", str(raised.exception))
+        self.assertIn("可经成员关系取得", str(raised.exception))
+
+    def test_the_handover_restores_the_membership_graph_exactly(self) -> None:
+        """V-保留-23（验收二次抓到）：移交前后成员关系三元组与 schema USAGE 完全一致。
+
+        这条断言是**根因**：属主移交要临时给执行者补一个 SET 选项，用完必须精确还原。
+        前两版还原写法各留下一点残余（`WITH SET FALSE` 把 inherit=f 变成 t；
+        `REVOKE SET OPTION FOR` 撤的是所有授予方那条、留下了本次多出来的整条授予），
+        而**没有任何用例在对照成员关系状态**，所以两轮自查都没发现，第三方连着抓了两次。
+        现在把状态对照本身钉住。
+        """
+
+        def snapshot() -> tuple:
+            members = tuple(
+                self.query(
+                    "SELECT r.rolname, m.rolname, g.rolname, am.admin_option, am.inherit_option, am.set_option "
+                    "  FROM pg_auth_members am "
+                    "  JOIN pg_roles r ON r.oid = am.roleid "
+                    "  JOIN pg_roles m ON m.oid = am.member "
+                    "  JOIN pg_roles g ON g.oid = am.grantor "
+                    " WHERE r.rolname LIKE 'lingxi\\_%' OR m.rolname LIKE 'lingxi\\_%' "
+                    " ORDER BY 1, 2, 3"
+                )
+            )
+            usage = tuple(
+                self.query(
+                    "SELECT pg_get_userbyid(a.grantee), a.privilege_type "
+                    "  FROM pg_namespace n, aclexplode(n.nspacl) a "
+                    " WHERE n.nspname = 'public' AND a.grantee <> 0 ORDER BY 1, 2"
+                )
+            )
+            return members, usage
+
+        before = snapshot()
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(UPGRADE_SQL)
+
+        self.assertEqual(snapshot(), before, "重新应用迁移不得改变成员关系图或 schema 授权面")
+
+    def test_an_indirect_membership_chain_to_the_owner_is_refused(self) -> None:
+        """V-保留-23（codex 二轮 P1-2）：间接链也要拒。
+
+        `owner → bridge → app` 这样的链上，属主的**直接**成员行只有 bridge，
+        看起来干净，而它实际已经拿到 app 的全部权限；针对 app 的直接 REVOKE 也撤不掉它。
+        判定必须用按传递闭包工作的 `pg_has_role`，不能只查一层 `pg_auth_members`。
+        """
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.addCleanup(self.execute, "DROP ROLE IF EXISTS lingxi_bridge_probe")
+        self.addCleanup(self.execute, "REVOKE lingxi_bridge_probe FROM lingxi_retention_owner")
+        self.execute("DROP ROLE IF EXISTS lingxi_bridge_probe")
+        self.execute("CREATE ROLE lingxi_bridge_probe NOLOGIN")
+        self.execute("GRANT lingxi_app TO lingxi_bridge_probe")
+        self.execute("GRANT lingxi_bridge_probe TO lingxi_retention_owner")
+        # 直接成员行里看不出问题：属主的直接上游只有 bridge。
+        self.assertTrue(self.scalar("SELECT pg_has_role('lingxi_retention_owner', 'lingxi_app', 'USAGE')"))
+
+        with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+            with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(UPGRADE_SQL)
+
+        self.assertIn("可能是间接链", str(raised.exception))
 
     def test_no_business_role_can_become_the_retention_owner(self) -> None:
         """V-保留-13（验收 E-10）：拿不到那个角色，就拿不到它的 DELETE。"""
@@ -1042,6 +1113,48 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             self.count("pg_roles", "WHERE rolname LIKE 'lingxi\\_%'"),
             4,
         )
+
+
+class BlockedRoundLoggingTest(RetentionPostgresTestCase):
+    def test_a_blocked_round_is_logged_as_a_warning_not_a_normal_completion(self) -> None:
+        """V-保留-22（codex 二轮 P1-3）：拿不到锁的那一轮不能记成正常完成。
+
+        让路与"本来就没有到期行"的 deleted 都是 0。只有标记与日志级别能把它们分开——
+        不分开的话，一张长期被占的表会在 INFO 流水里表现为一切正常，而内容一直没被
+        回收。保留违规最不该有的形态就是它悄无声息。
+        """
+        from lingxi.adapters.retention import PostgresRetentionCleaner
+        from lingxi.apps.scheduler import RetentionCleanupDuty
+
+        now = self.database_now()
+        self.insert_batch("gib_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1), status="superseded")
+
+        holder = self._psycopg.connect(self._dsn)
+        self.addCleanup(holder.close)
+        with holder.cursor() as cursor:
+            cursor.execute("SELECT id FROM galaxy_import_batch WHERE id = 'gib_locked' FOR UPDATE")
+            duty = RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(self._dsn))
+            with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
+                report = duty.run_once()
+        holder.close()
+
+        self.assertEqual(report.deleted, 0)
+        self.assertEqual(report.blocked_tables, ("galaxy_import_batch",))
+        self.assertTrue(any("锁等待超时" in line for line in captured.output))
+        self.assertTrue(any(line.startswith("WARNING") for line in captured.output))
+
+    def test_a_normal_empty_round_stays_at_info(self) -> None:
+        """对照面：没有到期行的一轮是正常完成，不该被记成 warning。"""
+        from lingxi.adapters.retention import PostgresRetentionCleaner
+        from lingxi.apps.scheduler import RetentionCleanupDuty
+
+        duty = RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(self._dsn))
+        with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
+            report = duty.run_once()
+
+        self.assertEqual(report.deleted, 0)
+        self.assertEqual(report.blocked_tables, ())
+        self.assertTrue(all(not line.startswith("WARNING") for line in captured.output))
 
 
 class SummaryContentTest(RetentionPostgresTestCase):
