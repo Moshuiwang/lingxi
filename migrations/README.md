@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `20260806_baseline` |
+| head revision | `0054_retention_cleanup` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -172,6 +172,62 @@ psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "DROP DATABASE lingxi_takeover_check;"
 同样的结构）。这是 [#53](https://github.com/Moshuiwang/lingxi/issues/53) TO PM 里「可前滚可回滚」承诺的确切口径：
 承诺覆盖基线之后的全部变更，**不覆盖基线本身**。`scripts/ci/check_alembic_revisions.py`
 拒绝空的 `downgrade()`——要么真正逆转，要么显式 `raise`，不允许「成功地什么都不做」。
+
+## `0054_retention_cleanup` 的三条越界边界（保留清理）
+
+1. **四个数据库角色**（`lingxi_app` / `lingxi_scheduler` / `lingxi_retention_owner` /
+   `lingxi_migrate`）随本 revision 幂等创建，但 **`downgrade` 不删除它们**：角色是
+   集群级共享对象，同集群的其他数据库或运维授权可能已经引用，一次数据库级回滚去删
+   集群级对象影响面超出本迁移且不可逆。角色本身不持有内容，留着不构成数据风险；
+   清退由 Ops 显式执行。四个角色一律 `NOLOGIN` 且无口令，运行时进程仍用现有连接身份；
+   授予登录能力属部署接线。`downgrade` 的全部 `REVOKE` 都先查角色是否存在——回滚可能
+   跑在一个"角色已被 Ops 另行清退"的集群上，那时对不存在的角色 `REVOKE` 会直接报错，
+   把一次本该成功的回滚变成失败。
+
+2. **历史行回填不可逆**：把 `galaxy_import_batch` 中 `expires_at` 偏离
+   `started_at + 2160 小时` 的行校正回来，原值不再可知，`downgrade` 不还原。
+   既有代码路径写出的行本来就精确满足该不变式（`started_at` 与 `expires_at` 两个
+   DEFAULT 取同一个事务时间戳），所以实际影响面为零行。
+
+3. **非超级用户执行者已实测通过。** 生产托管方（Supabase）的 `postgres` 有 `CREATEROLE`
+   但没有 `SUPERUSER`，而 `ALTER FUNCTION ... OWNER TO`、`COMMENT ON ROLE` 这些语句的
+   权限检查在超级用户下被**整体跳过**——本地容器与 CI 恰好是超级用户，所以这类问题
+   不会在门禁里暴露。本 revision 已按非超级用户路径实测修正：不用 `COMMENT ON ROLE`、
+   属主移交排在授权之后（先移交会让后续 `GRANT EXECUTE` 静默无效而退出码仍是 0）、
+   移交前临时补齐 `SET` 成员资格与 schema `CREATE` 并在移交后立即收回。
+   **若托管方禁止 `CREATE ROLE`、四个角色改由 Ops 预建**，则必须同时把
+   `lingxi_retention_owner` 的 **ADMIN OPTION** 授予迁移执行者，否则本 revision 的
+   `GRANT lingxi_retention_owner TO lingxi_migrate` 会 `permission denied`。
+   这个失败形态是好的——响亮报错、整条 revision 原子回滚、不留半应用状态（内审已实证）——
+   但它发生在部署当场，所以要写进运维契约而不是留给现场排查：
+
+   ```sql
+   -- Ops 预建角色时，除了建角色本身，还要给迁移执行者 ADMIN OPTION
+   GRANT lingxi_retention_owner TO <迁移执行角色> WITH ADMIN OPTION;
+   ```
+
+   仍未核实的是该实例上 `CREATE ROLE` 是否被托管策略额外限制，以及是否允许
+   `SET SESSION AUTHORIZATION`（真库角色用例依赖它）——两项均登记为 stage（L4a）演练验证项。
+
+## 运维紧急删除到期数据的路径
+
+保留清理的删除防线是**双条件**的：只有 `expires_at` 已到期、**且**执行身份是
+`lingxi_retention_owner` 时，两张父表的行才删得掉。正常回收走受限清理函数
+（它是 `SECURITY DEFINER`，以属主身份执行），因此不受影响。
+
+运维确需绕开定时职责直接删除**已到期**数据时，用属主身份执行：
+
+```sql
+-- 需要超级用户或对 lingxi_retention_owner 有 SET 权限
+SET SESSION AUTHORIZATION lingxi_retention_owner;
+DELETE FROM public.galaxy_import_batch WHERE expires_at <= now() AND id = '<批次 id>';
+RESET SESSION AUTHORIZATION;
+```
+
+**未到期**的数据任何身份都删不掉，属主也不行。那属于用户删除编排（合同的
+「当前运行环境删除」），不是保留清理，走各自的编排流程；确有一次性需要时，
+只能由 DBA 显式 `ALTER TABLE ... DISABLE TRIGGER` 并在操作后立即恢复，
+该动作应当留审计记录。
 
 ## 过渡期：编号 SQL 还留着
 

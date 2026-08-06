@@ -1,4 +1,11 @@
-"""Bot-Test 续期凭据库的真实 PostgreSQL 测试；不访问飞书。"""
+"""Bot-Test 续期凭据库的真实 PostgreSQL 测试；不访问飞书。
+
+本文件引用的 `migrations/testing/003` 是**测试资产**，不属于生产迁移链
+（migrations/README.md）。因此它不走 `tests/postgres_schema.py` 的整链建库，
+也不需要随新增生产迁移同步——`feishu_user_refresh_token` 这张表只有这里用，
+而生产链里根本没有它。#54 验收清单 H-02 点名的"三处硬编码清单"里，另外两处
+（银河与身份的真库用例）已改为按 glob 取整链，这一处按上述理由保持原样。
+"""
 
 from __future__ import annotations
 
