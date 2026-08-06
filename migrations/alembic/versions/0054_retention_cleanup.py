@@ -101,6 +101,7 @@ DECLARE
     role_name   text;
     v_is_super  boolean;
     v_can_login boolean;
+    v_inherited text;
 BEGIN
     FOREACH role_name IN ARRAY ARRAY[
         'lingxi_app',
@@ -148,11 +149,35 @@ BEGIN
         EXECUTE 'REVOKE lingxi_retention_owner FROM lingxi_scheduler';
     END IF;
 
-    -- 属主角色不得继承任何其他角色的权限，**也不得经由中间角色间接继承**。
-    -- 直接查 pg_auth_members 只看得见一层：`owner → bridge → app` 这样的链上，
-    -- owner 的直接成员行只有 bridge，看起来"没有问题"，而它实际已经拿到了 app 的
-    -- 全部权限；针对 app 的直接 REVOKE 也撤不掉这条链（codex 二轮 P1-2）。
-    -- `pg_has_role` 是按传递闭包判定的，正是这里要的语义。
+    -- 属主角色不得是**任何**角色的成员。这一条是全称的，不枚举具体角色名。
+    --
+    -- 一度被我收窄成"只查 lingxi_app / lingxi_scheduler / lingxi_migrate 三个"，
+    -- 那是一次实打实的回归：属主 ∈ `outsider_role` 由响亮失败变成静默通过；
+    -- 属主 ∈ `pg_write_all_data` 更直接——清理函数的执行身份从此对保留范围之外的
+    -- `app_user` 也持有 DELETE，全库写扩权，而这正是本检查存在的理由。
+    -- 收窄能逃过去，是因为三层同时收窄：注释写"任何"、实现枚举三个、用例只跑一个。
+    SELECT string_agg(container.rolname, '、' ORDER BY container.rolname)
+      INTO v_inherited
+      FROM pg_catalog.pg_auth_members am
+      JOIN pg_catalog.pg_roles member ON member.oid = am.member
+      JOIN pg_catalog.pg_roles container ON container.oid = am.roleid
+     WHERE member.rolname = 'lingxi_retention_owner';
+    IF v_inherited IS NOT NULL THEN
+        RAISE EXCEPTION 'lingxi_retention_owner 是以下角色的成员，会继承计划外权限：%', v_inherited
+            USING HINT = '受限清理函数的执行身份必须保持最小权限面（只有两张父表的 SELECT / DELETE）；'
+                         '请先收回该成员关系，包括 pg_* 预定义角色';
+    END IF;
+
+    -- 下面两个方向的传递闭包检查。**方向不对称，价值也不对称**，如实写出来：
+    --
+    --   正向（属主 → 业务角色）：已经被上面那条全称检查覆盖——任何链的第一跳都是
+    --     一条直接成员行，全称检查在那一跳就拦下了。保留它是纵深防御：全称那条哪天
+    --     被人改窄（本轮就发生过一次），这里还能兜住三个业务角色。
+    --   反向（业务角色 → 属主）：全称检查够不着。`app → bridge → owner` 这条链上，
+    --     owner 不是任何角色的成员，app 也不是 owner 的直接成员，两条直查都看不见，
+    --     而 app 已经可以 SET ROLE 到属主、绕开受限清理函数直接删内容；自愈那句
+    --     `REVOKE ... FROM lingxi_app` 同样撤不掉它（codex 二轮 P1-2）。
+    --     这一侧是传递闭包检查真正承担价值的地方。
     FOREACH role_name IN ARRAY ARRAY['lingxi_app', 'lingxi_scheduler', 'lingxi_migrate'] LOOP
         IF pg_catalog.pg_has_role('lingxi_retention_owner', role_name, 'USAGE')
            OR pg_catalog.pg_has_role('lingxi_retention_owner', role_name, 'MEMBER') THEN

@@ -980,7 +980,10 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
             with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                 cursor.execute(UPGRADE_SQL)
 
-        self.assertIn("可经成员关系取得", str(raised.exception))
+        # 直接授予会先被**全称**那条检查拦下（它排在传递闭包检查之前），
+        # 报的是"是以下角色的成员"。间接链的报文才是"可经成员关系取得"，
+        # 由 test_an_indirect_membership_chain_to_the_owner_is_refused 覆盖。
+        self.assertIn("继承计划外权限", str(raised.exception))
 
     def test_the_handover_restores_the_membership_graph_exactly(self) -> None:
         """V-保留-23 / V-保留-24：移交前后成员关系三元组完全一致——**在非超级用户下验**。
@@ -1073,28 +1076,89 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
                 as_probe([UPGRADE_SQL])
                 self.assertEqual(temporary_grant_rows(), [], "重复前滚回滚同样不得留下临时授予")
 
-    def test_an_indirect_membership_chain_to_the_owner_is_refused(self) -> None:
-        """V-保留-23（codex 二轮 P1-2）：间接链也要拒。
+    def test_the_owner_may_not_be_a_member_of_any_role_at_all(self) -> None:
+        """V-保留-23：属主不得是**任何**角色的成员——全称，不是枚举几个业务角色。
 
-        `owner → bridge → app` 这样的链上，属主的**直接**成员行只有 bridge，
-        看起来干净，而它实际已经拿到 app 的全部权限；针对 app 的直接 REVOKE 也撤不掉它。
-        判定必须用按传递闭包工作的 `pg_has_role`，不能只查一层 `pg_auth_members`。
+        这条曾被我收窄成"只查 lingxi_app / lingxi_scheduler / lingxi_migrate"，
+        是一次实打实的回归，验收实测抓回：属主 ∈ 任意外部角色由响亮失败变静默通过。
+        收窄能逃过去是因为三层同时收窄——注释写"任何"、实现枚举三个、用例只跑一个；
+        所以这条用例故意跑**两个都不在那份枚举里**的角色。
         """
+        import uuid
+
+        outsider = f"retention_outsider_{uuid.uuid4().hex[:8]}"
         self.addCleanup(force_rebuild_schema, self._dsn)
-        self.addCleanup(self.execute, "DROP ROLE IF EXISTS lingxi_bridge_probe")
-        self.addCleanup(self.execute, "REVOKE lingxi_bridge_probe FROM lingxi_retention_owner")
-        self.execute("DROP ROLE IF EXISTS lingxi_bridge_probe")
-        self.execute("CREATE ROLE lingxi_bridge_probe NOLOGIN")
-        self.execute("GRANT lingxi_app TO lingxi_bridge_probe")
-        self.execute("GRANT lingxi_bridge_probe TO lingxi_retention_owner")
-        # 直接成员行里看不出问题：属主的直接上游只有 bridge。
-        self.assertTrue(self.scalar("SELECT pg_has_role('lingxi_retention_owner', 'lingxi_app', 'USAGE')"))
+        self.addCleanup(self.execute, f"DROP ROLE IF EXISTS {outsider}")
+        self.execute(f"CREATE ROLE {outsider} NOLOGIN")
+
+        # 先把危害摆出来，再验证迁移拒绝它——否则"拒绝"只是一条没有理由的规则。
+        # pg_write_all_data 是 PostgreSQL 预定义角色，继承它之后清理函数的执行身份
+        # 对**保留范围之外**的 app_user 也持有 DELETE：受限清理函数就此变成全库写。
+        self.assertFalse(
+            self.scalar("SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')")
+        )
+        self.execute("GRANT pg_write_all_data TO lingxi_retention_owner")
+        try:
+            self.assertTrue(
+                self.scalar("SELECT has_table_privilege('lingxi_retention_owner', 'public.app_user', 'DELETE')"),
+                "危害实证：属主继承 pg_write_all_data 后对保留范围外的表也有 DELETE",
+            )
+        finally:
+            self.execute("REVOKE pg_write_all_data FROM lingxi_retention_owner")
+
+        for container in (outsider, "pg_write_all_data"):
+            with self.subTest(container=container):
+                self.execute(f"GRANT {container} TO lingxi_retention_owner")
+                try:
+                    with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
+                        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+                            cursor.execute(UPGRADE_SQL)
+                    self.assertIn("继承计划外权限", str(raised.exception))
+                    self.assertIn(container, str(raised.exception), "报错要指名是哪个角色，否则无从排查")
+                finally:
+                    self.execute(f"REVOKE {container} FROM lingxi_retention_owner")
+
+    def test_an_indirect_membership_chain_to_the_owner_is_refused(self) -> None:
+        """V-保留-23（codex 二轮 P1-2）：业务角色**经中间角色**取得属主，也要拒。
+
+        链是 `lingxi_app → bridge → lingxi_retention_owner`：app 的直接成员行只有
+        bridge，逐行看干净，而它已经可以 SET ROLE 到属主、绕开受限清理函数直接删内容；
+        自愈那句 `REVOKE lingxi_retention_owner FROM lingxi_app` 也撤不掉这条链
+        （app 本来就不是直接成员）。判定必须按传递闭包走。
+
+        方向是刻意选的：反向（属主 → 别的角色）那一侧已经被上一条**全称**检查覆盖，
+        因为任何链的第一跳都是一条直接成员行。这条用例落在全称检查够不着的那一侧，
+        也就是传递闭包检查真正承担价值的地方。
+        """
+        import uuid
+
+        # 不带 lingxi_ 前缀：另一条用例断言集群里恰好四个 lingxi_ 角色。
+        bridge = f"retention_bridge_{uuid.uuid4().hex[:8]}"
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.addCleanup(self.execute, f"DROP ROLE IF EXISTS {bridge}")
+        self.addCleanup(self.execute, f"REVOKE {bridge} FROM lingxi_app")
+        self.addCleanup(self.execute, f"REVOKE lingxi_retention_owner FROM {bridge}")
+        self.execute(f"CREATE ROLE {bridge} NOLOGIN")
+        self.execute(f"GRANT lingxi_retention_owner TO {bridge}")
+        self.execute(f"GRANT {bridge} TO lingxi_app")
+
+        # 直接成员行里看不出问题：app 的直接上游只有 bridge，而它已经够得着属主。
+        self.assertTrue(self.scalar("SELECT pg_has_role('lingxi_app', 'lingxi_retention_owner', 'USAGE')"))
+        self.assertEqual(
+            self.count(
+                "pg_auth_members am",
+                "JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles m ON m.oid = am.member "
+                "WHERE r.rolname = 'lingxi_retention_owner' AND m.rolname = 'lingxi_app'",
+            ),
+            0,
+            "构造前提：app 不是属主的直接成员，所以只查一层的实现看不见这条链",
+        )
 
         with self.assertRaises(self._psycopg.errors.RaiseException) as raised:
             with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
                 cursor.execute(UPGRADE_SQL)
 
-        self.assertIn("可能是间接链", str(raised.exception))
+        self.assertIn("可经成员关系取得", str(raised.exception))
 
     def test_no_business_role_can_become_the_retention_owner(self) -> None:
         """V-保留-13（验收 E-10）：拿不到那个角色，就拿不到它的 DELETE。"""
