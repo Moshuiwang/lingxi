@@ -1,6 +1,8 @@
 """花名册审计日报职责、群发适配与零迁移守卫（Issue #52 / W4-B）。
 
-认领断言：V-花名册-13、16、17、18、19、20、25、26、27、28、29、30、31、32、33、34。
+认领断言：V-花名册-13、V-花名册-16、V-花名册-17、V-花名册-18、V-花名册-19、
+V-花名册-20、V-花名册-25、V-花名册-26、V-花名册-27、V-花名册-28、V-花名册-29、
+V-花名册-30、V-花名册-31、V-花名册-32、V-花名册-33、V-花名册-34。
 
 真库侧（数据范围、存档不写回、端到端）在 `tests/test_roster_audit_postgres.py`；
 比对与渲染的纯函数断言在 `tests/test_roster_audit_diff.py` 与
@@ -87,17 +89,24 @@ class FakeBaselineReader:
 
 
 class FakeSender:
-    """记录每一次发送的完整载荷。失败次数可控，用来验重试与"不算已发送"。"""
+    """记录每一次发送的完整载荷。失败次数可控，用来验重试与"不算已发送"。
 
-    def __init__(self, *, failures: int = 0) -> None:
+    `attempts` 与 `payloads` 分开记：不确定态的重试要能看见"这一次请求发生过"，
+    而它恰恰不会出现在 `payloads` 里（因为它抛了异常）。
+    """
+
+    def __init__(self, *, failures: int = 0, error: Exception | None = None) -> None:
         self._failures = failures
+        self._error = error
         self.payloads: list[dict[str, str]] = []
+        self.attempts: list[dict[str, str]] = []
 
-    def send_text(self, *, chat_id: str, text: str) -> None:
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        self.attempts.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
         if self._failures > 0:
             self._failures -= 1
-            raise RuntimeError(f"模拟发送失败，正文里有资料值 {EMAIL}")
-        self.payloads.append({"chat_id": chat_id, "text": text})
+            raise self._error or RuntimeError(f"模拟发送失败，正文里有资料值 {EMAIL}")
+        self.payloads.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
 
 
 class RecordingAudit:
@@ -157,81 +166,70 @@ def build_duty(
 
 
 class ZeroMigrationGuardTest(unittest.TestCase):
-    """V-花名册-13：本切片**不新增任何 alembic revision**。
+    """V-花名册-13：本切片**不引入任何迁移能力**。
 
-    「零新表」是产品负责人 2026-08-06 的定案（选项 A），这条测试把那个定案变成一个
-    **会变红的检查**——否则「不新增表」只是 PR 正文里的一句话，下一个人加一张表时
-    没有任何东西会拦住他。
+    机器面只断言**本切片自己的源码**：不 import alembic / sqlalchemy，不含建表语句。
 
-    revision 图用 AST 解析，不 import alembic：这条守卫必须在没装 alembic 的环境里
-    照样跑，跳过等于没有守卫。
+    **刻意不枚举 `versions/` 的文件集合，也不钉住 head 的取值。** 那样写等于把一次性的
+    diff 范围固化成永久不变量：别的切片（例如 #57 的 `0057`）合并一条与花名册毫无关系的
+    revision 时，这条守卫会红——而它红了并不说明「花名册要表」这件事发生了。
+    **他线新表 ≠ 花名册要表**，一个总在别人改动时误报的守卫，最后一定是被人删掉或加豁免，
+    那时它连本来能挡的那一类问题也挡不住了。
+
+    revision 链的通用健康度（恰一个 head、恰一个 base、无孤儿、id 长度、README 同步）
+    由 #53 建立的 `scripts/ci/check_alembic_revisions.py` 承担，`verify_repository.sh`
+    无条件执行它。下面第二条用例断言这层委托是**真的**接上了，而不是我假设它接上了。
+
+    「本次 diff 零迁移」是**一次性事实**，由验收 runbook 与 PR 声明承担：
+    `git diff --stat <基线> -- migrations/` 为空。用例证明不了这件事——它看不到基线。
     """
 
-    VERSIONS_DIRECTORY = REPOSITORY_ROOT / "migrations" / "alembic" / "versions"
-    MIGRATIONS_DIRECTORY = REPOSITORY_ROOT / "migrations"
+    # 本切片新增或改动的全部源文件。
+    SLICE_SOURCES = (
+        "core/identity/roster_audit.py",
+        "core/identity/roster_report.py",
+        "adapters/postgres_roster_audit.py",
+        "adapters/feishu_group_message.py",
+        "apps/scheduler/__init__.py",
+    )
 
-    # 基线 `0ae6991`（含 #53 Alembic 链与 #54 保留清理）的状态。
-    # **后续切片若确有新表，改这里的同时必须在 PR 里说明推翻了 #52 的定案 A。**
-    EXPECTED_VERSION_FILES = frozenset({"0054_retention_cleanup.py", "20260806_baseline_006_012.py"})
-    EXPECTED_HEAD = "0054_retention_cleanup"
-    # 编号 SQL 链（`migrations/*.sql`）自 #53 起已被冻结，逐个文件名的断言在
-    # `tests/test_postgres_schema_fixture.py` 里已经有一份，这里不再重复一遍——
-    # 而且那份守卫禁止其他测试文件写死编号 SQL 的文件名（它自己是唯一豁免）。
-    # 本类只负责 revision 侧：**不新增 revision** 才是 #52 定案 A 的落点。
-    EXPECTED_NUMBERED_SQL_COUNT = 6
+    def test_no_source_of_this_slice_can_perform_a_migration(self) -> None:
+        """既不 import 迁移工具，也不自己写 DDL——两条路都堵上才叫「零迁移」。"""
 
-    def _revision_graph(self) -> dict[str, object]:
-        graph: dict[str, object] = {}
-        for path in sorted(self.VERSIONS_DIRECTORY.glob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            values: dict[str, object] = {}
-            for node in tree.body:
-                # 两种写法都认：`revision = "..."` 与带标注的 `revision: str = "..."`。
-                # 现网两个 revision 文件用的都是后者（`ast.AnnAssign`）——只认前者的话，
-                # 这条守卫会因为一条都没解析到而恒绿。
-                if isinstance(node, ast.AnnAssign):
-                    if isinstance(node.target, ast.Name) and node.target.id in {"revision", "down_revision"}:
-                        values[node.target.id] = ast.literal_eval(node.value) if node.value else None
-                elif isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
-                            values[target.id] = ast.literal_eval(node.value)
-            self.assertIn("revision", values, f"{path.name} 缺少 revision 标识")
-            graph[str(values["revision"])] = values.get("down_revision")
-        return graph
+        for module in self.SLICE_SOURCES:
+            path = SOURCE_ROOT / "lingxi" / module
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            imported: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module.split(".")[0])
 
-    def test_no_new_alembic_revision_file_was_added_by_this_slice(self) -> None:
-        present = {path.name for path in self.VERSIONS_DIRECTORY.glob("*.py")}
-
-        self.assertEqual(
-            present,
-            self.EXPECTED_VERSION_FILES,
-            "本切片定案为零新表零迁移；新增或删除 revision 文件必须先推翻 Issue #52 的定案 A",
-        )
-
-    def test_the_revision_chain_still_has_exactly_one_unchanged_head(self) -> None:
-        graph = self._revision_graph()
-        parents = {parent for parent in graph.values() if parent is not None}
-        heads = sorted(set(graph) - {str(parent) for parent in parents})
-
-        self.assertEqual(heads, [self.EXPECTED_HEAD], "revision head 必须与基线一致，且恰好 1 个")
-
-    def test_no_new_numbered_sql_file_was_added_by_this_slice(self) -> None:
-        """只数个数，不列文件名：列名字会撞上 `test_postgres_schema_fixture.py` 那条
-        「真库用例不得写死生产迁移文件名」的守卫，而那条守卫是对的。"""
-
-        present = list(self.MIGRATIONS_DIRECTORY.glob("*.sql"))
-
-        self.assertEqual(len(present), self.EXPECTED_NUMBERED_SQL_COUNT, "本切片不新增编号 SQL 迁移")
-
-    def test_the_slice_declares_no_new_table_anywhere_in_its_own_sources(self) -> None:
-        """新代码里不得出现建表语句。零新表要在源码层面也站得住。"""
-
-        for module in ("adapters/postgres_roster_audit.py", "adapters/feishu_group_message.py"):
-            text = (SOURCE_ROOT / "lingxi" / module).read_text(encoding="utf-8").upper()
             with self.subTest(module=module):
+                # 与 `V-迁移-04`（`src/` 里不得出现 sqlalchemy / alembic）同向，
+                # 这里是本切片自己的那一份。
+                self.assertNotIn("alembic", imported)
+                self.assertNotIn("sqlalchemy", imported)
+                upper = source.upper()
                 for statement in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE"):
-                    self.assertNotIn(statement, text)
+                    self.assertNotIn(statement, upper)
+
+    def test_the_shared_revision_chain_guard_is_really_wired_into_the_gate(self) -> None:
+        """委托必须可核对：#53 的检查器存在，且被门禁脚本无条件调用。
+
+        「那件事由别人管」如果没人核对，等价于没人管。
+        """
+
+        checker = REPOSITORY_ROOT / "scripts" / "ci" / "check_alembic_revisions.py"
+        gate = REPOSITORY_ROOT / "scripts" / "ci" / "verify_repository.sh"
+
+        self.assertTrue(checker.is_file(), "revision 链检查器不存在，V-花名册-13 的委托落空")
+        gate_text = gate.read_text(encoding="utf-8")
+        self.assertIn("check_alembic_revisions.py", gate_text, "门禁脚本没有调用 revision 链检查器")
+        # 检查器自己就断言"恰好 1 个 head"，这里核对那句话确实在它里面。
+        self.assertIn("get_heads()", checker.read_text(encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +255,7 @@ class DutyDrivenByTheLoopTest(unittest.TestCase):
 
 
 class DutyIsolationTest(unittest.TestCase):
-    """V-花名册-17 / 18：职责间失败隔离；连续失败不退进程；日志只记异常类型。"""
+    """V-花名册-17：职责间失败隔离。V-花名册-18：连续失败不退进程，日志只记异常类型。"""
 
     class RecordingDuty:
         def __init__(self, name: str, *, explode: bool = False) -> None:
@@ -332,6 +330,37 @@ class StopSemanticsTest(unittest.TestCase):
         self.assertEqual(reader.calls, 0, "停止后连基线都不该再读")
         self.assertEqual(audit.records, [])
 
+    def test_a_stop_arriving_during_the_read_phase_still_prevents_the_send(self) -> None:
+        """入口那一次检查挡不住"进来时还没停、读完才停"这条时序。
+
+        读库与读花名册都可能耗时（真实花名册是分页的网络读取），停止信号很容易落在
+        中间。此时必须干净中断：不发送、不置水位——半路发出去的那一份日报，
+        既不在停机预算内，也让"停止之后 0 次发送"变成一句只在快路径上成立的话。
+        """
+
+        stop = threading.Event()
+
+        class StoppingReader(FakeBaselineReader):
+            def load_active_baseline(self):
+                result = super().load_active_baseline()
+                stop.set()  # 读取期间收到 SIGTERM
+                return result
+
+        duty, sender, audit, _clock, reader = build_duty(
+            reader=StoppingReader(baseline_of_one()), stop=stop
+        )
+
+        with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
+            report = duty.run_once()
+
+        self.assertEqual(reader.calls, 1, "用例前提：这一轮确实进到了读取阶段")
+        self.assertIsNotNone(report, "比对已经做完了，返回的是这一轮的结果")
+        self.assertEqual(sender.payloads, [], "停止之后必须 0 次发送")
+        self.assertEqual(sender.attempts, [], "连一次发送尝试都不该发生")
+        self.assertIsNone(duty.completed_on, "干净中断不置水位，重发由裁定 C2 覆盖")
+        self.assertEqual(audit.records, [])
+        self.assertTrue(any("停止信号" in line for line in captured.output))
+
     def test_one_stop_signal_reaches_the_report_duty_together_with_the_others(self) -> None:
         stop = threading.Event()
         duty, sender, _audit, _clock, _reader = build_duty(stop=stop)
@@ -370,7 +399,7 @@ class SigtermTest(unittest.TestCase):
                                          "存档姓名", "E1001", "archived@example.com")]
 
         class Sender:
-            def send_text(self, *, chat_id, text):
+            def send_text(self, *, chat_id, text, dedupe_key):
                 if loop.stopping:
                     state["sends_after_stop"] += 1
                 state["send_started"] += 1
@@ -615,7 +644,7 @@ class SendFailureTest(unittest.TestCase):
 
 
 class GroupSenderTest(unittest.TestCase):
-    """V-花名册-27 / 28：出站可注入；群 ID 只从环境变量来。"""
+    """V-花名册-27：出站可注入。V-花名册-28：群 ID 只从环境变量来。"""
 
     ADAPTER_PATH = SOURCE_ROOT / "lingxi" / "adapters" / "feishu_group_message.py"
 
@@ -661,7 +690,7 @@ class GroupSenderTest(unittest.TestCase):
         )
         self.assertEqual(calls, [], "构造本身不得发任何请求")
 
-        sender.send_text(chat_id=FAKE_CHAT_ID, text="脱敏日报正文")
+        sender.send_text(chat_id=FAKE_CHAT_ID, text="脱敏日报正文", dedupe_key="2026-08-06")
 
         self.assertEqual(len(calls), 2, "一次发送＝取令牌 + 发消息")
         message = calls[1]
@@ -690,7 +719,7 @@ class GroupSenderTest(unittest.TestCase):
         )
 
         with self.assertRaises(FeishuGroupMessageError) as raised:
-            sender.send_text(chat_id=FAKE_CHAT_ID, text="脱敏日报正文")
+            sender.send_text(chat_id=FAKE_CHAT_ID, text="脱敏日报正文", dedupe_key="2026-08-06")
 
         message = str(raised.exception)
         self.assertIn("230001", message)
@@ -737,6 +766,108 @@ class GroupSenderTest(unittest.TestCase):
 
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", source)
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", SchedulerConfig.ENVIRONMENT_KEYS)
+
+
+class DeliveryIdempotenceTest(unittest.TestCase):
+    """V-花名册-31 的投递面：不确定态下的重试必须携带同一个投递 `uuid`。
+
+    「发送失败就重试」有一个它自己看不见的缺口：POST 已经被飞书收下、响应在回程超时时，
+    进程拿到的是异常，事实却是消息已经发出去了。没有 `uuid`，这条路径**确定会**重复
+    投递一份日报到管理群。
+    """
+
+    def _sender(self, transport):
+        from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+
+        return FeishuGroupMessages(
+            base_url="https://open.feishu.cn/open-apis",
+            app_id="cli_fake",
+            app_secret="secret_fake",
+            transport=transport,
+        )
+
+    def test_the_uuid_is_stable_per_chat_and_day_and_differs_across_both(self) -> None:
+        from lingxi.adapters.feishu_group_message import DELIVERY_UUID_MAX_LENGTH, delivery_uuid
+
+        same = delivery_uuid(FAKE_CHAT_ID, "2026-08-06")
+
+        self.assertEqual(same, delivery_uuid(FAKE_CHAT_ID, "2026-08-06"), "同群同日必须完全相同")
+        self.assertNotEqual(same, delivery_uuid(FAKE_CHAT_ID, "2026-08-07"), "跨日必须不同")
+        self.assertNotEqual(same, delivery_uuid("oc_another_group", "2026-08-06"), "跨群必须不同")
+        self.assertLessEqual(len(same), DELIVERY_UUID_MAX_LENGTH, "飞书对 uuid 的长度上限是 50")
+        # 群 ID 是外部标识，不该原样出现在请求体的第二个位置。
+        self.assertNotIn(FAKE_CHAT_ID, same)
+
+    def test_two_sends_on_the_same_day_carry_the_same_uuid_and_the_next_day_does_not(self) -> None:
+        bodies: list[dict] = []
+
+        def transport(method: str, url: str, *, body=None, token=None):
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t-fake"}
+            bodies.append(body)
+            return {"code": 0, "msg": "ok"}
+
+        sender = self._sender(transport)
+        sender.send_text(chat_id=FAKE_CHAT_ID, text="第一次", dedupe_key="2026-08-06")
+        sender.send_text(chat_id=FAKE_CHAT_ID, text="同日重试", dedupe_key="2026-08-06")
+        sender.send_text(chat_id=FAKE_CHAT_ID, text="第二天", dedupe_key="2026-08-07")
+
+        self.assertEqual(bodies[0]["uuid"], bodies[1]["uuid"], "同日两次请求的 uuid 必须相同")
+        self.assertNotEqual(bodies[1]["uuid"], bodies[2]["uuid"], "跨日的 uuid 必须不同")
+
+    def test_a_timeout_on_the_way_back_retries_under_the_very_same_uuid(self) -> None:
+        """不确定态的完整形状：POST 到达了飞书，响应超时，进程重试。"""
+
+        bodies: list[dict] = []
+        state = {"first": True}
+
+        def transport(method: str, url: str, *, body=None, token=None):
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t-fake"}
+            bodies.append(body)
+            if state["first"]:
+                state["first"] = False
+                # 飞书已经收下了，只是我们没听见回音。
+                raise TimeoutError("响应回程超时")
+            return {"code": 0, "msg": "ok"}
+
+        sender = self._sender(transport)
+        with self.assertRaises(TimeoutError):
+            sender.send_text(chat_id=FAKE_CHAT_ID, text="同一份日报", dedupe_key="2026-08-06")
+        sender.send_text(chat_id=FAKE_CHAT_ID, text="同一份日报", dedupe_key="2026-08-06")
+
+        self.assertEqual(len(bodies), 2, "用例前提：确实发生了两次 POST")
+        self.assertEqual(bodies[0]["uuid"], bodies[1]["uuid"], "重试必须复用同一个投递 uuid")
+
+    def test_the_duty_reuses_one_dedupe_key_across_the_failed_attempt_and_the_retry(self) -> None:
+        """职责这一层的落点：失败那一次与重试那一次共用同一个去重键。"""
+
+        clock = FixedClock()
+        sender = FakeSender(failures=1, error=TimeoutError("响应回程超时"))
+        duty, _sender, _audit, _clock, _reader = build_duty(clock=clock, sender=sender)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR"):
+            duty.run_once()
+        duty.run_once()
+
+        self.assertEqual(len(sender.attempts), 2, "用例前提：失败一次后确实重试了")
+        self.assertEqual(
+            sender.attempts[0]["dedupe_key"],
+            sender.attempts[1]["dedupe_key"],
+            "同一天的重试必须复用同一个去重键",
+        )
+        self.assertEqual(sender.attempts[0]["dedupe_key"], clock.today.isoformat())
+
+    def test_a_new_day_gets_a_new_dedupe_key(self) -> None:
+        clock = FixedClock()
+        duty, sender, _audit, _clock, _reader = build_duty(clock=clock)
+
+        duty.run_once()
+        first_day = clock.today.isoformat()
+        clock.advance()
+        duty.run_once()
+
+        self.assertEqual([payload["dedupe_key"] for payload in sender.payloads], [first_day, clock.today.isoformat()])
 
 
 class ChatIdValidationTest(unittest.TestCase):
@@ -856,7 +987,7 @@ class DutyRegistrationTest(unittest.TestCase):
 
 
 class AuditTest(unittest.TestCase):
-    """V-花名册-32 / 33：日报动作经 AuditSink 记审计；审计与日志不含资料值。"""
+    """V-花名册-32：日报动作经 AuditSink 记审计。V-花名册-33：审计与日志不含资料值。"""
 
     def test_the_report_action_goes_through_the_audit_sink(self) -> None:
         duty, _sender, audit, clock, _reader = build_duty()

@@ -1,6 +1,7 @@
 """花名册审计的真库断言（Issue #52 / W4-B，定案 A+甲）。
 
-认领断言：V-花名册-10、11、12、14、15、35、36。
+认领断言：V-花名册-10、V-花名册-11、V-花名册-12、V-花名册-14、V-花名册-15、
+V-花名册-35、V-花名册-36。
 
 比对集的两条过滤写在 SQL 里，因此只有真库能证伪它们：在 Python 里过滤的实现，用假的
 基线读取器跑照样是绿的。「存档不写回」同理——只有跑完一整轮再回读数据库，才能说
@@ -41,8 +42,8 @@ class FakeSender:
     def __init__(self) -> None:
         self.payloads: list[dict[str, str]] = []
 
-    def send_text(self, *, chat_id: str, text: str) -> None:
-        self.payloads.append({"chat_id": chat_id, "text": text})
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        self.payloads.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
 
 
 class RecordingAudit:
@@ -410,7 +411,7 @@ class AccountStateIsNeverPersistedTest(RosterAuditPostgresTestCase):
 
 
 class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
-    """V-花名册-35 / 36：合成端到端，6 名已开通 + 1 名 guest。
+    """V-花名册-35：合成端到端，6 名已开通 + 1 名 guest。V-花名册-36：该用例在 CI 实跑。
 
     这是唯一一条把「真库过滤 → 比对 → 渲染 → 发送 → 审计 → 存档不变」串起来跑的用例。
     """

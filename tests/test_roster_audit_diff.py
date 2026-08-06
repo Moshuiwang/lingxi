@@ -1,6 +1,7 @@
 """花名册比对纯函数（Issue #52 / W4-B，定案 A+甲）。
 
-认领断言：V-花名册-01、02、03、04、05、06、07、08、09。
+认领断言：V-花名册-01、V-花名册-02、V-花名册-03、V-花名册-04、V-花名册-05、
+V-花名册-06、V-花名册-07、V-花名册-08、V-花名册-09。
 
 这一层不碰数据库、不碰网络。比对集的过滤（`provisioning_state` / `account_state`）在
 读取层的 SQL 里，断言在 `tests/test_roster_audit_postgres.py`。
@@ -123,7 +124,7 @@ class ThreeStateTest(unittest.TestCase):
 
 
 class HandoverTest(unittest.TestCase):
-    """V-花名册-03 / 04：转交迹象＝姓名与邮箱**同时**变化。"""
+    """V-花名册-03（肯定面）与 V-花名册-04（否定面）：转交迹象＝姓名与邮箱**同时**变化。"""
 
     def test_name_and_email_changing_together_is_marked_as_a_handover(self) -> None:
         report = compare_roster(
