@@ -26,9 +26,13 @@ import pathlib
 
 # Alembic 的标识约定。revision 用固定字符串而不是随机 hex，方便人工缝链时对照。
 revision = "0002_s4_conversation_task_inbound_event"
-# TODO(#53 缝链)：改成 #53 那条基线 revision 的标识。留 None 会让本条被当成第二个
-# 根 revision，alembic 会报「多个 head」——是响亮的失败，不是静默错挂。
-down_revision = None  # 占位符，等 #53 合并
+# TODO(缝链)：改成 **#54 的 head revision** 的标识（编排者 2026-08-06 指示：
+# 本条挂在 #54 之后，而不是直接挂在 #53 的基线上）。已知的上游标识：
+#   #53 基线 revision id = "20260806_baseline"
+#   #54 head revision id = 待定，由编排者在变基时给出
+# 留 None 会让本条被当成第二个根 revision，alembic 会报「多个 head」
+# ——是响亮的失败，不是静默错挂。
+down_revision = None  # 占位符，等 #54 的 head id
 branch_labels = None
 depends_on = None
 
