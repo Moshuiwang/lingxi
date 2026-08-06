@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import pathlib
+import re
 import sys
 from importlib.metadata import PackageNotFoundError, metadata
 
@@ -101,7 +102,73 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 
-def _check_declared_extras() -> list[str]:
+# CI 的 extras 矩阵所在文件。用 ``__file__`` 定位而不是 cwd：本检查刻意在仓库目录
+# 之外运行，但它自己始终躺在仓库里，CI 也是按绝对路径调用它的。
+CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+
+# 刻意不进 CI 矩阵的组。**目前为空**；往里加必须在注释里写清为什么该组不需要
+# 「干净环境里装一次」的证明，否则这就成了漏加矩阵行的后门。
+MATRIX_EXEMPT_EXTRAS: frozenset[str] = frozenset()
+
+# 只认单行写法 `extra: [a, b, c]`。改成多行 YAML 列表时这里会找不到而**失败**，
+# 不是静默通过——找不到就当作对不上账。
+_MATRIX_LINE = re.compile(r"^[ \t]*extra:[ \t]*\[([^\]]*)\]", re.MULTILINE)
+
+
+def installed_extras() -> set[str] | None:
+    """已安装制品声明的 extras；读不到返回 ``None``。"""
+
+    try:
+        return set(metadata("lingxi").get_all("Provides-Extra") or [])
+    except PackageNotFoundError:
+        return None
+
+
+def ci_matrix_extras(workflow_text: str) -> set[str] | None:
+    """从 ci.yml 文本里读出 extras 矩阵；没有那一行返回 ``None``。"""
+
+    match = _MATRIX_LINE.search(workflow_text)
+    if match is None:
+        return None
+    return {item.strip().strip("\"'") for item in match.group(1).split(",") if item.strip()}
+
+
+def check_ci_matrix(declared: set[str], workflow_text: str | None) -> list[str]:
+    """每个 extra 都必须出现在 ci.yml 的 extras 矩阵里。
+
+    只对账「pyproject ↔ 本脚本」这半边是不够的：把新组加进 pyproject 和
+    ``PROCESS_RUNTIME_IMPORTS``、唯独漏掉矩阵那一行，CI 就从没在干净环境里装过
+    它，而 gate 全绿——独立复查实测出过这个漏洞。这里补上另半边，让代码框架里
+    「这条不靠自觉」的说法真正成立。
+    """
+
+    if workflow_text is None:
+        return [f"{CI_WORKFLOW}：读不到 CI 配置，无法核对 extras 矩阵"]
+    matrix = ci_matrix_extras(workflow_text)
+    if matrix is None:
+        return ["ci.yml：找不到 `extra: [...]` 矩阵行，extras 矩阵无法核对（改了写法就同步本脚本的正则）"]
+
+    failures: list[str] = []
+    for name in sorted(declared - matrix - MATRIX_EXEMPT_EXTRAS):
+        failures.append(
+            f"extra `{name}`：不在 .github/workflows/ci.yml 的 extras 矩阵里，"
+            "CI 从没在干净环境里装过它。请加进 `extra: [...]`。"
+        )
+    for name in sorted(matrix - declared):
+        failures.append(
+            f"extra `{name}`：ci.yml 矩阵里有，但已安装制品没有声明它，那条矩阵腿必然失败。"
+        )
+    return failures
+
+
+def _read_ci_workflow() -> str | None:
+    try:
+        return CI_WORKFLOW.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def check_declared_extras(declared: set[str]) -> list[str]:
     """已安装制品声明的 extras 必须与 ``PROCESS_RUNTIME_IMPORTS`` 一一对上。
 
     CI 矩阵和本脚本都是**按名字列举**的：新增一个 extra 却忘了同步，它就悄悄没有
@@ -109,11 +176,6 @@ def _check_declared_extras() -> list[str]:
     这里读的是**已安装制品的元数据**（``Provides-Extra``）而不是 pyproject.toml：
     本检查刻意在仓库目录之外运行，回头读源码树就把这个前提丢了。
     """
-
-    try:
-        declared = set(metadata("lingxi").get_all("Provides-Extra") or [])
-    except PackageNotFoundError:
-        return ["lingxi：读不到已安装制品的元数据，无法核对 extras 声明"]
 
     known = set(PROCESS_RUNTIME_IMPORTS)
     failures: list[str] = []
@@ -199,8 +261,15 @@ def main() -> int:
             failures.append(f"{package_name}/{file_name}：来自 {data_file}，不是已安装的包。")
 
     # 不受 --process 影响：gate 那一步（不传 --process）也要能发现「新增了 extra
-    # 却没人检查它」，否则这个漏洞要等到部署才暴露。
-    failures.extend(_check_declared_extras())
+    # 却没人检查它」，否则这个漏洞要等到部署才暴露。三方对账——已安装制品的
+    # Provides-Extra、本脚本的 PROCESS_RUNTIME_IMPORTS、ci.yml 的 extras 矩阵——
+    # 任意两边对不上都在这里失败。
+    declared = installed_extras()
+    if declared is None:
+        failures.append("lingxi：读不到已安装制品的元数据，无法核对 extras 声明")
+    else:
+        failures.extend(check_declared_extras(declared))
+        failures.extend(check_ci_matrix(declared, _read_ci_workflow()))
 
     if args.process:
         failures.extend(_check_process(args.process))
@@ -216,8 +285,9 @@ def main() -> int:
         f"{len(REQUIRED_PACKAGE_DATA)} 个数据文件全部来自已安装的包"
     )
     print(
-        f"extras 声明：{len(PROCESS_RUNTIME_IMPORTS)} 组"
-        f"（{', '.join(sorted(PROCESS_RUNTIME_IMPORTS))}）与已安装制品的 Provides-Extra 一致"
+        f"extras 三方对账：{len(PROCESS_RUNTIME_IMPORTS)} 组"
+        f"（{', '.join(sorted(PROCESS_RUNTIME_IMPORTS))}）在制品 Provides-Extra、"
+        "本脚本与 ci.yml 矩阵三处一致"
     )
     if args.process:
         lingxi_modules, third_party_modules = PROCESS_RUNTIME_IMPORTS[args.process]
