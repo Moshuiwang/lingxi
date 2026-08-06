@@ -118,6 +118,16 @@ def declared_requirements() -> dict[str, list[tuple[str, str]]]:
     return found
 
 
+def declared_by_extra() -> dict[str, set[str]]:
+    """extra 组名 → 该组声明的分发包集合（归一化后）。"""
+
+    data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    groups: dict[str, set[str]] = {}
+    for extra, items in ((data.get("project", {}).get("optional-dependencies")) or {}).items():
+        groups[extra] = {parse_requirement(raw)[0] for raw in items}
+    return groups
+
+
 def iter_source_files() -> list[pathlib.Path]:
     return sorted(SOURCE_ROOT.rglob("*.py"))
 
@@ -182,6 +192,123 @@ def check_imports(declared: dict[str, list[tuple[str, str]]]) -> list[str]:
     return failures
 
 
+
+# 每个 extra 的**进程入口**。用于按进程做 import 闭包校验（codex 二轮 P2-1）。
+#
+# 这一列与 scripts/ci/check_installed_package.py 的 PROCESS_RUNTIME_IMPORTS 第一元组
+# 同源；那边在**运行期**证明"装上了"，这里在**静态**证明"声明全"。两者互补：
+# 运行期检查跑在各自的干净虚拟环境里，能抓到漏装；但它只导入入口模块，
+# 一条写在深层模块函数体里、当次没被执行到的 import 它看不见。
+PROCESS_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
+    "scheduler": ("lingxi.apps.scheduler",),
+    "worker": ("lingxi.apps.worker", "lingxi.apps.worker.cli", "lingxi.apps.worker.__main__"),
+    "bot-test": (
+        "lingxi.adapters.feishu_onboarding",
+        "lingxi.adapters.oauth_bridge",
+        "lingxi.adapters.refresh_tokens",
+        "lingxi.adapters.postgres_onboarding",
+    ),
+    # 迁移作业没有任何 lingxi 入口：迁移工具链不得渗入运行时代码（V-迁移-04）。
+    "migrate": (),
+}
+
+
+def _module_file(module: str) -> pathlib.Path | None:
+    """`lingxi.a.b` → 源文件路径。找不到返回 None（可能是第三方或不存在）。"""
+
+    parts = module.split(".")
+    if not parts or parts[0] != "lingxi":
+        return None
+    base = SOURCE_ROOT.joinpath(*parts[1:])
+    if base.with_suffix(".py").is_file():
+        return base.with_suffix(".py")
+    if (base / "__init__.py").is_file():
+        return base / "__init__.py"
+    return None
+
+
+def _module_name(path: pathlib.Path) -> str:
+    relative = path.relative_to(SOURCE_ROOT)
+    parts = list(relative.parts)
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][: -len(".py")]
+    return ".".join(["lingxi", *parts])
+
+
+def _split_imports(path: pathlib.Path) -> tuple[set[str], set[str]]:
+    """返回（该文件 import 的 lingxi 模块, 第三方顶层模块）。含函数内延迟导入。"""
+
+    own = _module_name(path)
+    package = own if path.name == "__init__.py" else own.rsplit(".", 1)[0]
+    lingxi_modules: set[str] = set()
+    third_party: set[str] = set()
+
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+        targets: list[str] = []
+        if isinstance(node, ast.Import):
+            targets = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # 相对 import：按所在包解析成绝对名。
+                base = package.split(".")
+                anchor = base[: len(base) - node.level + 1]
+                targets = [".".join([*anchor, node.module] if node.module else anchor)]
+            elif node.module:
+                targets = [node.module]
+                # `from lingxi.pkg import name`：name 可能是子模块，也可能是符号。
+                if node.module.startswith("lingxi"):
+                    targets += [f"{node.module}.{alias.name}" for alias in node.names]
+        for target in targets:
+            if target.split(".")[0] == "lingxi":
+                lingxi_modules.add(target)
+            elif target.split(".")[0] not in sys.stdlib_module_names:
+                third_party.add(target.split(".")[0])
+    return lingxi_modules, third_party
+
+
+def check_process_closures(declared_by_extra: dict[str, set[str]]) -> list[str]:
+    """按进程入口做 import 闭包校验：闭包里用到的第三方必须由**该 extra** 声明。
+
+    这补的是「跨 extra 掩蔽」：`check_imports` 只问"某个 import 有没有在 pyproject 的
+    **任何一组**里声明过"。于是 worker 的代码里新增一个 `import psycopg`，因为
+    scheduler 组声明了 psycopg，全局检查照样绿——而 worker 镜像根本不装 psycopg，
+    这行代码在生产上必然 ImportError。
+    """
+
+    failures: list[str] = []
+    for extra, entries in sorted(PROCESS_ENTRY_POINTS.items()):
+        declared = declared_by_extra.get(extra, set())
+        seen: set[str] = set()
+        queue = list(entries)
+        used: dict[str, str] = {}
+        while queue:
+            module = queue.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            path = _module_file(module)
+            if path is None:
+                continue
+            lingxi_modules, third_party = _split_imports(path)
+            for name in third_party:
+                used.setdefault(name, _module_name(path))
+            queue.extend(lingxi_modules - seen)
+        for name, where in sorted(used.items()):
+            distribution = IMPORT_TO_DISTRIBUTION.get(name)
+            if distribution is None:
+                continue  # 未登记的 import 由 check_imports 报，不在这里重复
+            if normalize_distribution_name(distribution) not in declared:
+                failures.append(
+                    f"进程 `{extra}` 的 import 闭包里用到 `{name}`（出自 {where}），"
+                    f"但 pyproject.toml 的 `{extra}` 组没有声明 `{distribution}`。"
+                    f"\n      它在别的 extra 里有声明，所以全局检查是绿的——"
+                    f"但 {extra} 镜像不装它，走到那行就是 ImportError。"
+                )
+    return failures
+
+
 def check_pins(declared: dict[str, list[tuple[str, str]]]) -> list[str]:
     """安全边界组件必须锁精确版本（`==`），不接受范围。"""
 
@@ -226,6 +353,7 @@ def main() -> int:
     failures: list[str] = []
     if run_imports:
         failures.extend(check_imports(declared))
+        failures.extend(check_process_closures(declared_by_extra()))
     if run_pins:
         failures.extend(check_pins(declared))
 
@@ -244,6 +372,11 @@ def main() -> int:
             f"V-部署-08 全部声明：扫描 {len(iter_source_files())} 个源文件的全部 import"
             f"（含函数内延迟导入），{len(third_party)} 个第三方顶层模块"
             f"（{', '.join(third_party)}）均已在 pyproject.toml 声明"
+        )
+        print(
+            f"V-部署-08 进程闭包：{len(PROCESS_ENTRY_POINTS)} 个进程"
+            f"（{', '.join(sorted(PROCESS_ENTRY_POINTS))}）的 import 闭包里，"
+            "第三方依赖都由各自的 extra 声明（跨 extra 掩蔽会红）"
         )
     if run_pins:
         print(
