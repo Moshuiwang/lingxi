@@ -983,42 +983,95 @@ class RolePrivilegeTest(RetentionPostgresTestCase):
         self.assertIn("可经成员关系取得", str(raised.exception))
 
     def test_the_handover_restores_the_membership_graph_exactly(self) -> None:
-        """V-保留-23（验收二次抓到）：移交前后成员关系三元组与 schema USAGE 完全一致。
+        """V-保留-23 / V-保留-24：移交前后成员关系三元组完全一致——**在非超级用户下验**。
 
-        这条断言是**根因**：属主移交要临时给执行者补一个 SET 选项，用完必须精确还原。
-        前两版还原写法各留下一点残余（`WITH SET FALSE` 把 inherit=f 变成 t；
-        `REVOKE SET OPTION FOR` 撤的是所有授予方那条、留下了本次多出来的整条授予），
-        而**没有任何用例在对照成员关系状态**，所以两轮自查都没发现，第三方连着抓了两次。
-        现在把状态对照本身钉住。
+        必须换身份跑，否则这条断言恒绿、什么都锁不住：属主移交那段"临时补 SET 再还原"
+        的代码有前置条件 `NOT pg_has_role(current_user, owner, 'SET')`，而超级用户对
+        任何角色都为真，整段还原分支在超级用户会话里**根本不执行**。变异实测确认过：
+        把还原写法退回有缺陷的版本，超级用户下的对照断言 8 个种子全绿。
+
+        这段代码已经产出三个只在非超级用户下存在的缺陷（`t`/`f` 渲染、ADMIN 授回
+        授予方、INHERIT 残留），所以它必须有一条真的走那条分支的用例。做法与生产
+        托管方形态一致：`NOSUPERUSER CREATEROLE` 角色拥有自己的库，在里面跑整条链。
         """
+        import uuid
 
-        def snapshot() -> tuple:
-            members = tuple(
-                self.query(
-                    "SELECT r.rolname, m.rolname, g.rolname, am.admin_option, am.inherit_option, am.set_option "
+        # 名字**不带 lingxi_ 前缀**：另一条用例断言集群里恰好只有四个 `lingxi\_%`
+        # 角色，探针角色万一没清干净就会去误伤它。角色是集群级对象，代价跨用例。
+        suffix = uuid.uuid4().hex[:8]
+        probe_db = f"lingxi_probe_{suffix}"
+        probe_role = f"retention_probe_{suffix}"
+
+        def admin(sql: str) -> None:
+            with self._psycopg.connect(self._dsn, autocommit=True) as connection, connection.cursor() as cursor:
+                cursor.execute(sql)
+
+        admin(f"CREATE ROLE {probe_role} NOSUPERUSER CREATEROLE LOGIN")
+        admin(f"CREATE DATABASE {probe_db} OWNER {probe_role}")
+
+        def drop_probe() -> None:
+            """先撤掉 probe 作为**授予方**留下的集群级成员关系，再删角色。
+
+            迁移会以 probe 的身份把属主角色授给 lingxi_migrate，那条成员关系不随
+            探针库消失；probe 是它的授予方，不先撤就 DROP 不掉。
+            """
+
+            admin(f"REVOKE lingxi_retention_owner FROM lingxi_migrate GRANTED BY {probe_role} CASCADE")
+            admin(f"REVOKE lingxi_retention_owner FROM {probe_role} CASCADE")
+            admin(f"DROP ROLE IF EXISTS {probe_role}")
+
+        self.addCleanup(force_rebuild_schema, self._dsn)
+        self.addCleanup(drop_probe)
+        self.addCleanup(admin, f"DROP DATABASE IF EXISTS {probe_db}")
+
+        # 四个角色在本集群里已由别的用例建好，probe 不是创建者、拿不到 ADMIN OPTION
+        # ——这正是 README 那条「Ops 预建角色须补授 ADMIN OPTION」运维契约的场景。
+        # **`SET FALSE` 是关键**：带 SET 的话 `pg_has_role(probe, owner, 'SET')` 为真，
+        # 移交还原分支又被整段跳过，这条用例就白写了。
+        admin(f"GRANT lingxi_retention_owner TO {probe_role} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE")
+
+        probe_dsn = self._dsn.rsplit("/", 1)[0] + "/" + probe_db
+
+        def as_probe(statements: list[str]) -> None:
+            with self._psycopg.connect(probe_dsn, user=probe_role) as connection, connection.cursor() as cursor:
+                for statement in statements:
+                    cursor.execute(statement)
+
+        def temporary_grant_rows() -> list[tuple]:
+            """本次移交临时授出的那条成员关系（授予方＝执行者）。正常应当一条不剩。"""
+
+            with self._psycopg.connect(probe_dsn, autocommit=True) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT am.admin_option, am.inherit_option, am.set_option "
                     "  FROM pg_auth_members am "
                     "  JOIN pg_roles r ON r.oid = am.roleid "
                     "  JOIN pg_roles m ON m.oid = am.member "
                     "  JOIN pg_roles g ON g.oid = am.grantor "
-                    " WHERE r.rolname LIKE 'lingxi\\_%' OR m.rolname LIKE 'lingxi\\_%' "
-                    " ORDER BY 1, 2, 3"
+                    " WHERE r.rolname = 'lingxi_retention_owner' "
+                    "   AND m.rolname = %s AND g.rolname = %s",
+                    (probe_role, probe_role),
                 )
-            )
-            usage = tuple(
-                self.query(
-                    "SELECT pg_get_userbyid(a.grantee), a.privilege_type "
-                    "  FROM pg_namespace n, aclexplode(n.nspacl) a "
-                    " WHERE n.nspname = 'public' AND a.grantee <> 0 ORDER BY 1, 2"
-                )
-            )
-            return members, usage
+                return cursor.fetchall()
 
-        before = snapshot()
+        # 冻结的编号链按 glob 取，不写死文件名（守卫会拦硬编码）。
+        as_probe([path.read_text(encoding="utf-8") for path in sorted((REPOSITORY_ROOT / "migrations").glob("*.sql"))])
+        as_probe([UPGRADE_SQL])
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(UPGRADE_SQL)
+        self.assertEqual(
+            temporary_grant_rows(),
+            [],
+            "移交用完必须精确撤销本次那一条授予；留下它就是 INHERIT 残留（验收两次抓到的形态）",
+        )
+        with self._psycopg.connect(probe_dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'lingxi_retention_cleanup'")
+            self.assertEqual(cursor.fetchone()[0], "lingxi_retention_owner")
 
-        self.assertEqual(snapshot(), before, "重新应用迁移不得改变成员关系图或 schema 授权面")
+        # 两轮 downgrade → upgrade：每轮之后都不得留下临时授予。
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                as_probe([DOWNGRADE_SQL])
+                as_probe([UPGRADE_SQL])
+                self.assertEqual(temporary_grant_rows(), [], "重复前滚回滚同样不得留下临时授予")
 
     def test_an_indirect_membership_chain_to_the_owner_is_refused(self) -> None:
         """V-保留-23（codex 二轮 P1-2）：间接链也要拒。
