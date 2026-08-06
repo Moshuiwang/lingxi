@@ -51,6 +51,50 @@ $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 
 `LINGXI_POSTGRES_DSN` **必须带 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数**，它们共同给出停机上界（见下方）。只设 `connect_timeout` 是不够的：它只约束建连，一条已经发出去的语句可以无限期挂着。
 
+## 部署前置检查（preflight，逐条通过才能 `up`）
+
+### 1. 凭据文件权限（P1-3）
+
+代码框架「横切约定」要求凭据不进代码、日志、数据库、用户环境，长期凭据放操作系统级密钥管理。本批用文件注入，因此**文件权限就是这条边界的全部**——一个 0644 的 env 文件等于把生产数据库口令、Fernet 密钥和飞书应用密钥摊给机器上任何一个账号。
+
+四个文件都必须 **0600 且属主为部署用户**。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
+
+```bash
+umask 077
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.scheduler
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
+# 然后再往里写内容
+```
+
+`up` 之前逐条核对，任一不符就停下：
+
+```bash
+for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.worker deploy/.env.stage.migrate; do
+  stat -c '%n %a %U' "$f"
+done
+# 期望每行都是 `<文件> 600 <部署用户>`
+```
+
+> **登记：长期凭据迁移到操作系统级密钥管理**（Docker secrets / systemd credentials / 云托管密钥服务）尚未落地，本批只立机制与边界，不做真实部署。迁移方案与执行窗口随 stage `[ops]` Issue 决定。在那之前，文件权限是唯一的保护，因此上面这一步不是建议而是前置条件。
+
+### 2. 主机读取身份（P1-4）
+
+GHCR 上的镜像包**默认是私有的**，宿主机不登录就拉不下来——`docker compose up` 会停在
+`failed to authorize ... 403 Forbidden`（本批实测过这个报错）。因此部署机必须先有一份**只读**拉取身份：
+
+```bash
+# 令牌由 stage [ops] Issue 供给（GitHub App / 组织级 read:packages 令牌），
+# **不得使用任何个人 GitHub 凭据**，也不得复用 CI 的 GITHUB_TOKEN。
+echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
+  | docker login ghcr.io -u "<LINGXI_GHCR_READ_USER，由 ops 供给>" --password-stdin
+```
+
+两个变量本批只登记名字与来源，**没有真实值**：镜像还没推上去，拉取身份的发放属于 stage `[ops]` Issue 的范围。
+
+> 另有一个待产品负责人决定的选项：把镜像包设为**公开**，宿主机就完全不需要登录，也就没有这份长期驻留在部署机上的凭据。代价是镜像层对外可见（源码本身不在镜像里，但依赖清单与目录结构会暴露）。本批不替产品负责人做这个选择，两条路都可行。
+
 ## 安装与升级
 
 **`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。
@@ -71,6 +115,8 @@ docker compose --env-file deploy/.env.stage \
 docker compose --env-file deploy/.env.stage \
   -f deploy/compose.yaml -f deploy/compose.stage.yaml logs scheduler
 ```
+
+**上面两项 preflight 未通过时不要执行 `up`。**
 
 生产把 `.env.stage` 换成 `.env.prod`、`compose.stage.yaml` 换成 `compose.prod.yaml`，其余逐字相同——两份覆盖文件**结构完全一致**，只有 env_file、卷名与扫描间隔不同（`scripts/ci/verify_compose_structure.sh` 每次 CI 都比对这一点）。
 
