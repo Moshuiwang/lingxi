@@ -10,12 +10,24 @@
 | 服务 | 形态 | 入口 | 说明 |
 | --- | --- | --- | --- |
 | `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据（「四达文档会议助手」`refresh_token`）到期轮换扫描 |
+| `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57 / S4 前半）。放在非默认 profile 里，见下 |
 | `worker` | **一次性作业** | `python -m lingxi.apps.worker` | 单回合受控执行。跑一个 Agent SDK 回合、往 stdout 写一个 JSON 报告、退出 |
 | `migrate` | **一次性作业** | `python -m alembic -c /opt/lingxi/alembic.ini` | 部署时跑一次的数据库迁移 |
 
 **worker 是一次性作业，不是已上线的常驻服务。** 它不领任务、不接飞书、不处理 `SIGTERM`（`grep -rn signal src/lingxi/apps/worker/` 为空）。常驻 worker 需要任务队列与 gateway 入队，属 **S4 下半**，不在本批。`docker compose up -d` 只会启动 `scheduler` 一个进程。
 
-`gateway`（S4 前半，[#57](https://github.com/Moshuiwang/lingxi/issues/57)）与 `admin` 进程**尚未建立**，因此没有为它们构建镜像——未实现的入口不得用占位进程冒充。gateway 落地时在 `compose.yaml` 里新增第三个 service，卷结构无需改动。
+**`gateway` 已随 [#57](https://github.com/Moshuiwang/lingxi/issues/57) 落地并纳入编排，但默认不启动。** 它把事件落库成任务，而任务队列此刻**没有消费者**——main 上的 worker 是单回合 CLI，不领任务。启用它等于开始接收真实用户消息、排进一个没人处理的队列，用户看到的是"发了没反应"，比不接入更糟。因此它放在一个非默认 profile 里：
+
+```bash
+# 默认：不会启动 gateway
+docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
+
+# 显式启用（S4 下半接线前不要这么做）
+docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+  --profile gateway up -d
+```
+
+S4 下半（常驻 worker 与任务领取）接线之后，删掉 `compose.yaml` 里 gateway 的 `profiles:` 一行即可转为默认服务。`admin` 进程仍**未建立**，因此没有为它构建镜像——未实现的入口不得用占位进程冒充。
 
 本版**不宣称**首聊、持续同步、建档、权限发布或用户通知已经上线。
 
@@ -152,6 +164,19 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 
 凭据卷必须**跨部署持久**，镜像替换与重启不得丢失——部署目标是对该凭据「零特殊处理」。文件丢失或过期时的保底是重新走一次「四达文档会议助手」授权（产品负责人 2026-08-05）；正式重授权入口见 [#67](https://github.com/Moshuiwang/lingxi/issues/67)。
 
+## gateway 的停止宽限期为什么是 60 秒
+
+收到 `SIGTERM` 后 gateway 停止接收新事件、把在途事件**落库完成**再退出。中途被 `SIGKILL` 会留下"抢占了话题但任务没写进去"的中间态——用户发了消息、系统记得占了坑、却没有任何任务在跑。
+
+| 项 | 秒 | 依据 |
+| --- | --- | --- |
+| 停机超时 | 20.0 | `LINGXI_GATEWAY_SHUTDOWN_TIMEOUT_SECONDS` 默认值，`apps/gateway/config.py` |
+| 出站 HTTP 超时 | 5.0 | `apps/gateway/__init__.py` 取停机超时的 1/4 |
+| 数据库往返预算 | 11.0 | 一个在途事件事务，与 scheduler 同一口径 |
+| **最坏合计** | **36.0** | × 1.5 安全系数 = 54 秒 → 取整到 **60 秒** |
+
+三项**全部来自 gateway 自己的配置**，不是拍脑袋。同样由 `check_deploy_contract.py` 守住：改了 `SHUTDOWN_TIMEOUT_SECONDS` 的默认值而不改 compose，门禁会红（已实测）。
+
 ## scheduler 的停止宽限期为什么是 150 秒
 
 Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过新凭据、尚未写回数据库"的窗口里，那条 `refresh_token` 就永久丢失了——飞书侧旧凭据在续期成功那一刻已作废，一次性有效，只能人工重新授权。
@@ -174,8 +199,8 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 ## 本地验证
 
 ```bash
-scripts/ci/build_image.sh scheduler                # 构建单个镜像
-scripts/ci/verify_image_contract.sh <三个镜像引用>  # 镜像契约逐条核对
+scripts/ci/build_image.sh scheduler                # 构建单个镜像（scheduler|gateway|worker|migrate）
+scripts/ci/verify_image_contract.sh <四个镜像引用>  # 镜像契约逐条核对（scheduler worker migrate gateway）
 scripts/ci/verify_compose_structure.sh             # stage ↔ 生产结构对照
 scripts/ci/verify_old_image_new_schema.sh          # V-部署-05：旧镜像在新库上启动
 scripts/ci/verify_old_image_new_schema.sh --destructive   # 同上的变异对照，应判红

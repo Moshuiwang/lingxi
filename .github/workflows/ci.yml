@@ -260,7 +260,7 @@ jobs:
           LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
           LINGXI_IMAGE_COMMIT: ${{ github.sha }}
         run: |
-          for service in scheduler migrate worker; do
+          for service in scheduler migrate gateway worker; do
             LINGXI_IMAGE_REFERENCE_FILE="${RUNNER_TEMP}/reference-${service}" \
               scripts/ci/build_image.sh "${service}" --no-cache
             docker tag "$(cat "${RUNNER_TEMP}/reference-${service}")" "lingxi-${service}:build-a"
@@ -275,7 +275,7 @@ jobs:
           LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
           LINGXI_IMAGE_COMMIT: ${{ github.sha }}
         run: |
-          for service in scheduler migrate worker; do
+          for service in scheduler migrate gateway worker; do
             LINGXI_IMAGE_REFERENCE_FILE="${RUNNER_TEMP}/reference-b-${service}" \
               scripts/ci/build_image.sh "${service}" --no-cache
             docker tag "$(cat "${RUNNER_TEMP}/reference-b-${service}")" "lingxi-${service}:build-b"
@@ -288,7 +288,7 @@ jobs:
         working-directory: build-a
         run: |
           status=0
-          for service in scheduler migrate worker; do
+          for service in scheduler migrate gateway worker; do
             python3 scripts/ci/image_manifest.py "lingxi-${service}:build-a" --output "/tmp/${service}-a.txt"
             python3 scripts/ci/image_manifest.py "lingxi-${service}:build-b" --output "/tmp/${service}-b.txt"
             if diff -u "/tmp/${service}-a.txt" "/tmp/${service}-b.txt" > "/tmp/${service}.diff"; then
@@ -364,7 +364,7 @@ jobs:
           LINGXI_IMAGE_COMMIT: ${{ github.sha }}
           LINGXI_IMAGE_REGISTRY: ghcr.io/moshuiwang
         run: |
-          for service in scheduler migrate worker; do
+          for service in scheduler migrate gateway worker; do
             scripts/ci/build_image.sh "${service}"
           done
 
@@ -383,7 +383,7 @@ jobs:
         env:
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          for service in scheduler migrate worker; do
+          for service in scheduler migrate gateway worker; do
             python3 scripts/ci/push_image.py \
               "ghcr.io/moshuiwang/lingxi-${service}:${IMAGE_TAG}" \
               --artifact-dir "${RUNNER_TEMP}/images" \

@@ -149,6 +149,29 @@ WORKDIR /opt/lingxi
 ENTRYPOINT ["python", "-m", "alembic", "-c", "/opt/lingxi/alembic.ini"]
 CMD ["upgrade", "head"]
 
+FROM build-base AS build-gateway
+RUN python -m pip install --no-cache-dir --no-compile '.[gateway]' \
+ && python -m compileall -q -f --invalidation-mode unchecked-hash /usr/local/lib/python3.12/site-packages
+
+FROM base AS gateway
+COPY --from=build-gateway /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+ARG LINGXI_SOURCE_COMMIT=unknown
+ARG LINGXI_SOURCE_TREE=unknown
+LABEL org.opencontainers.image.revision="${LINGXI_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Moshuiwang/lingxi" \
+      com.moshuiwang.lingxi.source-tree="${LINGXI_SOURCE_TREE}"
+USER 10001:10001
+WORKDIR /var/lib/lingxi
+# 常驻服务：飞书长连接接入，把事件落库成任务（#57 / S4 前半）。
+#
+# **本镜像存在 ≠ gateway 可以上线。** 它入队之后没有消费者：worker 目前是单回合 CLI，
+# 不领任务。所以 compose 把它放在一个**非默认 profile** 里，`up -d` 不会启动它——
+# 详见 deploy/compose.yaml 的说明。
+#
+# 停机语义（V-部署-03，#57 同型认领）：收到 SIGTERM 后停止接收新事件、把在途事件
+# 落库完成再退出，不留"抢占了话题但任务没写进去"的中间态。
+CMD ["python", "-m", "lingxi.apps.gateway"]
+
 FROM build-base AS build-worker
 RUN python -m pip install --no-cache-dir --no-compile '.[worker]' \
  && python -m compileall -q -f --invalidation-mode unchecked-hash /usr/local/lib/python3.12/site-packages

@@ -17,6 +17,7 @@ cd "${repository_root}"
 scheduler_image=${1:-lingxi-scheduler:probe}
 worker_image=${2:-lingxi-worker:probe}
 migrate_image=${3:-lingxi-migrate:probe}
+gateway_image=${4:-lingxi-gateway:probe}
 
 failures=0
 note() { printf '  %s\n' "$1"; }
@@ -47,7 +48,7 @@ workspace=$(mktemp -d -t lingxi62-contract-XXXXXX)
 trap 'rm -rf "${workspace}"' EXIT
 
 step "1/10 非 root 运行（V-部署-07 / M2-62-29）"
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   configured_user=$(docker inspect --format '{{.Config.User}}' "${image}")
   actual_uid=$(docker run --rm --entrypoint id "${image}" -u)
@@ -66,7 +67,7 @@ done
 step "2/10 解释器版本满足 pyproject 声明（V-部署-09 镜像面 / M2-62-09）"
 declared=$(sed -n 's/^requires-python = ">=\([0-9]\+\.[0-9]\+\)"$/\1/p' pyproject.toml)
 [[ -n "${declared}" ]] || fail "读不到 pyproject.toml 的 requires-python"
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   if docker run --rm --entrypoint python "${image}" -c \
       "import sys;d='${declared}'.split('.');sys.exit(0 if sys.version_info[:2]>=(int(d[0]),int(d[1])) else 1)"; then
@@ -82,22 +83,37 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   for module in lark_oapi websockets; do
     if docker run --rm --entrypoint python "${image}" -c "import ${module}" >/dev/null 2>&1; then
-      fail "${name} 镜像里能 import ${module}——Bot-Test 受控验证资产混进了生产镜像"
+      fail "${name} 镜像里能 import ${module}——不属于该进程的依赖混进了生产镜像"
     fi
   done
   note "${name}: lark_oapi 与 websockets 均不可导入（符合预期）"
 done
+# gateway **合法地**装 lark-oapi 与 websockets：#57 把长连接与发消息的依赖从
+# bot-test 组提升成了 gateway 组，两组各自独立声明。所以这里不能照搬上面的否定断言，
+# 要问的是另一个问题——bot-test 独有的那些**模块**有没有混进来。
+for module in cryptography claude_agent_sdk; do
+  if docker run --rm --entrypoint python "${gateway_image}" -c "import ${module}" >/dev/null 2>&1; then
+    fail "gateway 镜像里能 import ${module}——它不在 gateway 组的声明里"
+  fi
+done
+note "gateway: 合法持有 lark_oapi / websockets（#57 提升为 gateway 组），未混入 cryptography / claude_agent_sdk"
+# 刻意**不**断言"Bot-Test 的模块不可 import"：`pip install .` 装的是整个 lingxi 包，
+# adapters/feishu_onboarding.py 这类测试资产模块因此存在于每个镜像里，这是打包方式
+# 决定的，不是编排缺陷。M2-62-11 管的是 scripts/ tests/ experiments/ workers/
+# migrations/testing/ 这些**目录**别被 COPY 进来（见第 4 步），M2-62-10 管的是
+# bot-test 那组**依赖**别被装上（见上）。第一版在这里写了一条"模块不可 import"的断言，
+# 四个镜像全红——它测的是一件从来不成立、也不该成立的事。
 # 迁移工具链不进业务进程镜像（V-迁移-04 的镜像面）。
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   if docker run --rm --entrypoint python "${image}" -c 'import sqlalchemy' >/dev/null 2>&1; then
     fail "${name} 镜像装了 SQLAlchemy——迁移工具链不得进业务进程镜像"
   fi
 done
-note "scheduler 与 worker 均未装 SQLAlchemy"
+note "scheduler / gateway / worker 均未装 SQLAlchemy"
 
 step "4/10 非生产资产不进镜像（M2-62-11）与构建上下文不泄漏（M2-62-06 / M2-62-08）"
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   listing="${workspace}/${name}.listing"
   rootfs_listing_to "${image}" "${listing}"
@@ -142,7 +158,7 @@ for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${m
 done
 
 step "5/10 镜像里不预置任何凭据（M2-62-16）"
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   env_json=$(docker inspect --format '{{json .Config.Env}}' "${image}")
   for variable in LINGXI_DELEGATED_CREDENTIAL_KEY LINGXI_OAUTH_REFRESH_TOKEN_KEY \
@@ -158,7 +174,7 @@ done
 step "6/10 已安装制品与进程运行依赖（V-部署-10 / M2-62-12）"
 # 关键：跑的是**未经修改的** check_installed_package.py，工作目录在源码树之外，
 # 仓库以只读挂载。改脚本或放宽 _INSTALL_MARKERS 来"跑通"就等于把这条断言作废。
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   if docker run --rm -v "${repository_root}":/repo:ro -w /tmp --entrypoint python "${image}" \
       /repo/scripts/ci/check_installed_package.py --process "${name}" > /tmp/lingxi-installed-$$.log 2>&1; then
@@ -228,7 +244,7 @@ step "10/10 rootfs 内容级凭据扫描（M2-62-16 的另一半）"
 # 第 5 步只看 .Config.Env。凭据同样可能以**文件**形式混进镜像：一份误 COPY 的 .env、
 # 一个私钥、一段带口令的连接串。借第 4 步已经落盘的清单再做一次内容级扫描
 # （内审 P2-5）。用 docker run 在镜像内 grep，不把内容捞到宿主机上。
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
+for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${worker_image}" "migrate:${migrate_image}"; do
   name=${pair%%:*}; image=${pair#*:}
   listing="${workspace}/${name}.listing"
   # 形态一：.env 类文件根本不该存在于镜像里。

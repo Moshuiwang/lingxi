@@ -42,6 +42,7 @@ CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
 SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__init__.py"
+GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 
 # 停止宽限期的数据库往返预算（秒）。
 #
@@ -168,6 +169,30 @@ def service_block(compose_text: str, service: str) -> str | None:
     if start is not None:
         return "\n".join(lines[start:])
     return None
+
+
+def _gateway_shutdown_timeout() -> float | None:
+    """gateway 的停机超时默认值。它是 load_config 里的调用参数，不是模块级常量。"""
+
+    match = re.search(
+        r'_number\(\s*env\s*,\s*"SHUTDOWN_TIMEOUT_SECONDS"\s*,\s*([0-9.]+)\s*\)',
+        read(GATEWAY_CONFIG),
+    )
+    return float(match.group(1)) if match else None
+
+
+def _gateway_worst_case_seconds() -> float:
+    """gateway 一次在途停机在最坏情况下还要跑多久（秒）。
+
+    三项都来自 gateway 自己的配置，不是拍脑袋：停机超时是配置默认值，出站 HTTP 超时
+    由 apps/gateway/__init__.py 取它的四分之一，数据库那一项按与 scheduler 同一口径。
+    """
+
+    shutdown = _gateway_shutdown_timeout()
+    if shutdown is None:
+        raise ValueError("读不到 gateway 的 SHUTDOWN_TIMEOUT_SECONDS 默认值")
+    outbound = max(1.0, shutdown / 4)
+    return shutdown + outbound + DATABASE_OPERATION_SECONDS
 
 
 def _worst_case_seconds() -> float:
@@ -317,6 +342,7 @@ def check_compose_contract() -> list[str]:
         )
 
     scheduler = service_block(base, "scheduler") or ""
+    gateway = service_block(base, "gateway") or ""
     worker = service_block(base, "worker") or ""
     migrate = service_block(base, "migrate") or ""
 
@@ -366,8 +392,46 @@ def check_compose_contract() -> list[str]:
         if re.search(r"^\s*stop_grace_period:", block, re.MULTILINE):
             failures.append(f"{name} 是一次性作业，不该有 stop_grace_period（那是常驻服务的概念）")
 
+    # gateway 也必须只读根（断言 V-部署-02）。
+    if not re.search(r"^\s*read_only:\s*true\s*$", gateway, re.MULTILINE):
+        failures.append("deploy/compose.yaml 的 gateway 缺 `read_only: true`（断言 V-部署-02）")
+
+    # gateway **必须放在非默认 profile 里**：它入队之后没有消费者（worker 是单回合
+    # CLI，不领任务）。让 `up -d` 顺手把它拉起来，等于开始接收真实用户消息并排进一个
+    # 没人处理的队列——用户看到的是"发了没反应"。S4 下半接线后才可转默认。
+    if not re.search(r"^\s*profiles:\s*\[.*gateway.*\]\s*$", gateway, re.MULTILINE):
+        failures.append(
+            "deploy/compose.yaml 的 gateway 没有放进非默认 profile。"
+            "队列此刻没有消费者，`up -d` 顺手启动它等于把真实用户消息排进无人处理的队列。"
+        )
+
+    # gateway 的停机宽限期，依据来自它自己的配置。
+    gateway_grace = re.search(r"^\s*stop_grace_period:\s*(\S+)\s*$", gateway, re.MULTILINE)
+    try:
+        gateway_required = math.ceil(_gateway_worst_case_seconds() * SAFETY_FACTOR)
+    except ValueError as error:
+        failures.append(str(error))
+        gateway_required = None
+    if gateway_required is not None:
+        if gateway_grace is None:
+            failures.append(
+                "deploy/compose.yaml 的 gateway 没有显式 stop_grace_period。"
+                f"最坏需要 {_gateway_worst_case_seconds():.1f} 秒（停机超时 + 出站 HTTP + 一次数据库事务）；"
+                "中途 SIGKILL 会留下「抢占了话题但任务没写进去」的中间态。"
+            )
+        else:
+            actual = parse_duration_seconds(gateway_grace.group(1))
+            if actual is None or actual < gateway_required:
+                failures.append(
+                    f"gateway 的 stop_grace_period 是 {gateway_grace.group(1)}，"
+                    f"低于要求的 {gateway_required} 秒（停机超时 "
+                    f"{_gateway_shutdown_timeout()}s + 出站 {max(1.0, (_gateway_shutdown_timeout() or 0)/4)}s "
+                    f"+ 数据库 {DATABASE_OPERATION_SECONDS}s，再乘 {SAFETY_FACTOR}）。"
+                )
+
     # M2-62-29 / M2-62-30：非 root、能力最小。
-    for name, block in (("scheduler", scheduler), ("worker", worker), ("migrate", migrate)):
+    for name, block in (("scheduler", scheduler), ("gateway", gateway),
+                        ("worker", worker), ("migrate", migrate)):
         user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
         if user is None:
             failures.append(f"{name} 没有显式 `user:`，无法在 compose 层面核对非 root")
@@ -389,7 +453,7 @@ def check_compose_contract() -> list[str]:
     # 设置整个盖掉，而基线文件本身一个字没动——静态检查全绿，实际以 root 跑。
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
-        for service in ("scheduler", "worker", "migrate"):
+        for service in ("scheduler", "gateway", "worker", "migrate"):
             block = service_block(text, service)
             if block is None:
                 continue
@@ -429,7 +493,7 @@ def check_compose_contract() -> list[str]:
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
         seen: dict[str, list[str]] = {}
-        for service in ("scheduler", "worker", "migrate"):
+        for service in ("scheduler", "gateway", "worker", "migrate"):
             block = service_block(text, service)
             if block is None:
                 continue

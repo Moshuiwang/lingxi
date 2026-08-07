@@ -25,6 +25,10 @@ services:
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
 
+  gateway:
+    env_file:
+      - ./.env.prod.gateway
+
   worker:
     env_file:
       - ./.env.prod.worker

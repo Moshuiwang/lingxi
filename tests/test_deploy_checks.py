@@ -437,12 +437,50 @@ class DatabaseTimeoutTest(unittest.TestCase):
         self.assertEqual(CONTRACT.DATABASE_ROUNDTRIP_BUDGET_SECONDS, 55.0)
 
 
+class GatewayOrchestrationTest(unittest.TestCase):
+    """gateway 纳入编排后的三条硬约束（#57 增补轮）。
+
+    gateway 是本批唯一一个「组件已交付但**不能上线**」的服务：它入队之后没有消费者
+    （worker 是单回合 CLI，不领任务）。编排必须让这件事在机制上成立，而不是靠记得。
+    """
+
+    NO_PROFILE = 'gateway:\n  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-gateway:${LINGXI_IMAGE_TAG:?y}\n  user: "10001:10001"\n  read_only: true\n  stop_grace_period: 60s\n'
+    SHORT_GRACE = 'gateway:\n  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-gateway:${LINGXI_IMAGE_TAG:?y}\n  profiles: ["gateway"]\n  user: "10001:10001"\n  read_only: true\n  stop_grace_period: 20s\n'
+
+    def _with_base(self, body: str):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        base = directory / "compose.yaml"
+        base.write_text("services:\n" + textwrap.indent(body, "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_BASE
+        CONTRACT.COMPOSE_BASE = base
+        try:
+            return CONTRACT.check_compose_contract()
+        finally:
+            CONTRACT.COMPOSE_BASE = original
+
+    def test_gateway_without_profile_is_caught(self) -> None:
+        failures = self._with_base(self.NO_PROFILE)
+        self.assertTrue(any("profile" in f for f in failures), failures)
+
+    def test_gateway_short_stop_grace_is_caught(self) -> None:
+        failures = self._with_base(self.SHORT_GRACE)
+        self.assertTrue(any("gateway" in f and "stop_grace_period" in f for f in failures), failures)
+
+    def test_gateway_budget_is_derived_from_its_own_config(self) -> None:
+        # 停机超时来自 apps/gateway/config.py 的默认值，出站取它的 1/4。
+        self.assertEqual(CONTRACT._gateway_shutdown_timeout(), 20.0)
+        self.assertEqual(CONTRACT._gateway_worst_case_seconds(), 20.0 + 5.0 + 11.0)
+
+    def test_real_compose_gateway_passes(self) -> None:
+        self.assertEqual([f for f in CONTRACT.check_compose_contract() if "gateway" in f], [])
+
+
 class RealRepositoryTest(unittest.TestCase):
     """反过来跑真实仓库状态：检查一旦找不到目标就会安静地永远通过。"""
 
     def test_declared_requirements_cover_the_known_extras(self) -> None:
         declared = DEPENDENCIES.declared_requirements()
-        for distribution in ("cryptography", "psycopg", "claude-agent-sdk", "alembic"):
+        for distribution in ("cryptography", "psycopg", "claude-agent-sdk", "alembic", "lark-oapi"):
             self.assertIn(distribution, declared, f"pyproject.toml 里找不到 {distribution}")
 
     def test_source_scan_finds_the_known_lazy_imports(self) -> None:

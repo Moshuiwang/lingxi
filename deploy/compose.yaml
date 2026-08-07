@@ -98,6 +98,55 @@ services:
       # 专用授权凭据：跨部署持久，镜像替换与重启不得丢失。
       - lingxi-credentials:/var/lib/lingxi/credentials
 
+  # 飞书长连接接入：收事件、落库成任务（#57 / S4 前半）。
+  #
+  # ---- 为什么放在**非默认 profile** 里 ----------------------------------------
+  # **gateway 不能单独上线。** 它把任务写进队列，而队列此刻**没有消费者**：main 上的
+  # worker 是单回合 CLI（读环境变量跑一个回合就退出），不领任务。启用 gateway 等于
+  # 开始接收真实用户消息、把它们排进一个没人处理的队列——用户看到的是"发了没反应"，
+  # 比不接入更糟。
+  #
+  # 因此 `docker compose up -d` **不会**启动它；要启动必须显式
+  # `--profile gateway`。S4 下半（常驻 worker 与任务领取）接线之后，把这一行
+  # profiles 删掉即可转为默认服务，届时它与 scheduler 同型。
+  # 这与 #57 的登记一致：组件已交付，尚未接线。
+  gateway:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["gateway"]
+    restart: unless-stopped
+
+    # ---- 停止宽限期（断言 V-部署-03，#57 同型认领）---------------------------
+    # 收到 SIGTERM 后停止接收新事件、把在途事件**落库完成**再退出。中途被 SIGKILL
+    # 会留下"抢占了话题但任务没写进去"的中间态——用户发了消息、系统记得占了坑、
+    # 却没有任何任务在跑。
+    #
+    # 60 秒的算法（全部来自 gateway 自己的配置，不是拍脑袋）：
+    #   20.0s  停机超时       LINGXI_GATEWAY_SHUTDOWN_TIMEOUT_SECONDS 默认值，
+    #                         apps/gateway/config.py 的 load_config
+    #    5.0s  出站 HTTP 超时 apps/gateway/__init__.py 取 shutdown_timeout / 4
+    #   11.0s  数据库往返预算 一个在途事件事务，按与 scheduler 同一口径
+    #                         （connect 5s + 语句 3s + 提交 3s）
+    #   -----
+    #   36.0s  最坏情况 → ×1.5 安全系数 = 54s → 取整到 60s
+    #
+    # 与 scheduler 那条一样，这个不等式由 scripts/ci/check_deploy_contract.py 守住：
+    # 改了 SHUTDOWN_TIMEOUT_SECONDS 的默认值而不改这里，门禁会红。
+    stop_grace_period: 60s
+
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # 不挂任何持久卷：gateway 的状态全部在数据库里，容器内不写需要持久化的东西
+    # （断言 V-部署-02）。凭据走 env_file，见各环境的覆盖文件。
+
   # 一次性作业：单回合受控执行。`docker compose run --rm worker`
   #
   # **不是常驻服务**，因此没有 restart 策略、没有 stop_grace_period、没有 healthcheck。

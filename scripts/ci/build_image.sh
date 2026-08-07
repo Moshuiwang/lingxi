@@ -26,10 +26,10 @@ service=${1:-}
 shift || true
 
 case "${service}" in
-  scheduler | worker | migrate) ;;
+  scheduler | worker | gateway | migrate) ;;
   *)
-    printf '用法：%s <scheduler|worker|migrate> [docker build 的额外参数...]\n' "$0" >&2
-    printf '（gateway 与 admin 进程尚未建立，不为它们构建镜像——未实现的入口不得用占位进程冒充）\n' >&2
+    printf '用法：%s <scheduler|worker|gateway|migrate> [docker build 的额外参数...]\n' "$0" >&2
+    printf '（admin 进程尚未建立，不为它构建镜像——未实现的入口不得用占位进程冒充）\n' >&2
     exit 2
     ;;
 esac

@@ -202,6 +202,7 @@ def check_imports(declared: dict[str, list[tuple[str, str]]]) -> list[str]:
 PROCESS_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
     "scheduler": ("lingxi.apps.scheduler",),
     "worker": ("lingxi.apps.worker", "lingxi.apps.worker.cli", "lingxi.apps.worker.__main__"),
+    "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.config", "lingxi.apps.gateway.__main__"),
     "bot-test": (
         "lingxi.adapters.feishu_onboarding",
         "lingxi.adapters.oauth_bridge",

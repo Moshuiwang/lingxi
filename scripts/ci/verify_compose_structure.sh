@@ -29,8 +29,10 @@ workspace=$(mktemp -d -t lingxi62-compose-XXXXXX)
 # 凭据按服务分文件（codex 审查 P1-1），因此占位文件也要按服务建齐，
 # 否则 `compose config` 会在 env_file 不存在时直接报错。
 placeholders=(
-  deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.worker deploy/.env.stage.migrate
-  deploy/.env.prod  deploy/.env.prod.scheduler  deploy/.env.prod.worker  deploy/.env.prod.migrate
+  deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway
+  deploy/.env.stage.worker deploy/.env.stage.migrate
+  deploy/.env.prod  deploy/.env.prod.scheduler  deploy/.env.prod.gateway
+  deploy/.env.prod.worker  deploy/.env.prod.migrate
 )
 created=()
 cleanup() {
@@ -102,7 +104,7 @@ PYTHON
 
 for environment in stage prod; do
   docker compose -f deploy/compose.yaml -f "deploy/compose.${environment}.yaml" \
-    --profile job config --format json > "${workspace}/${environment}.json"
+    --profile job --profile gateway config --format json > "${workspace}/${environment}.json"
   python3 -c "${summary_program}" "${workspace}/${environment}.json" \
     > "${workspace}/${environment}.summary"
 done
