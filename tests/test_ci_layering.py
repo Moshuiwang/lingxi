@@ -131,6 +131,35 @@ class StoryClassificationTest(unittest.TestCase):
         self.assertEqual(paths, ["docs/check.py", "scripts/ci/check.py"])
         self.assertEqual(CLASSIFIER.classify(paths), "full")
 
+    def test_non_ascii_docs_path_is_not_quoted_into_full_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "docs/参考证据").mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repository / "docs/参考证据/验收.md").write_text("通过\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "docs"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, ["docs/参考证据/验收.md"])
+        self.assertEqual(CLASSIFIER.classify(paths), "docs")
+
 
 class CandidateIdentityTest(unittest.TestCase):
     def pr(self, *, merge_sha: str = MERGE) -> dict:

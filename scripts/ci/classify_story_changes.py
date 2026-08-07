@@ -54,13 +54,15 @@ def classify(paths: list[str]) -> str:
 def changed_paths(base: str, head: str, *, repository: Path | None = None) -> list[str]:
     result = subprocess.run(
         # 不过滤 D/T 等状态；并关闭 rename 折叠，让高风险旧路径和新路径都进入分类。
-        ["git", "diff", "--name-only", "--no-renames", base, head],
+        # -z 让 Git 输出原始文件名并用 NUL 分隔；否则中文等非 ASCII 路径会被
+        # core.quotePath 转义，docs/** 会被误判成未知高风险路径。
+        ["git", "diff", "--name-only", "-z", "--no-renames", base, head],
         check=True,
         capture_output=True,
         text=True,
         cwd=repository,
     )
-    return result.stdout.splitlines()
+    return [path for path in result.stdout.split("\0") if path]
 
 
 def write_output(destination: Path, mode: str, paths: list[str]) -> None:
