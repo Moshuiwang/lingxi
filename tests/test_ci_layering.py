@@ -65,6 +65,11 @@ class StoryClassificationTest(unittest.TestCase):
     def test_unlisted_markdown_is_not_silently_treated_as_docs(self) -> None:
         self.assertEqual(CLASSIFIER.classify(["src/lingxi/prompts/runtime.md"]), "fast")
 
+    def test_filename_whitespace_cannot_disguise_an_unknown_path_as_docs(self) -> None:
+        self.assertEqual(CLASSIFIER.classify([" docs/验收.md"]), "full")
+        self.assertEqual(CLASSIFIER.classify(["README.md "]), "full")
+        self.assertEqual(CLASSIFIER.classify(["docs/换\n行.md"]), "docs")
+
     def test_deleted_high_risk_path_is_kept_with_a_mixed_docs_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
@@ -129,6 +134,97 @@ class StoryClassificationTest(unittest.TestCase):
             paths = CLASSIFIER.changed_paths(base, head, repository=repository)
 
         self.assertEqual(paths, ["docs/check.py", "scripts/ci/check.py"])
+        self.assertEqual(CLASSIFIER.classify(paths), "full")
+
+    def test_non_ascii_docs_path_is_not_quoted_into_full_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "docs/参考证据").mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repository / "docs/参考证据/验收.md").write_text("通过\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "docs"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, ["docs/参考证据/验收.md"])
+        self.assertEqual(CLASSIFIER.classify(paths), "docs")
+
+    def test_leading_space_is_preserved_by_real_git_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / " docs").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repository / " docs/验收.md").write_text("未知目录\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "space"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, [" docs/验收.md"])
+        self.assertEqual(CLASSIFIER.classify(paths), "full")
+
+    def test_file_to_symlink_type_change_remains_visible_and_high_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "scripts/ci").mkdir(parents=True)
+            changed = repository / "scripts/ci/check.py"
+            changed.write_text("pass\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            changed.unlink()
+            changed.symlink_to("target.py")
+            subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "type"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, ["scripts/ci/check.py"])
         self.assertEqual(CLASSIFIER.classify(paths), "full")
 
 

@@ -34,7 +34,9 @@ def is_fast(path: str) -> bool:
 def classify(paths: list[str]) -> str:
     normalized = []
     for raw in paths:
-        path = raw.strip()
+        # Git 文件名允许空格与换行；不得 strip，否则 ` docs/x.md` 会被伪装成
+        # 安全的 docs/** 路径。NUL 分隔已经负责界定文件名边界。
+        path = raw
         if not path:
             continue
         normalized.append(path[2:] if path.startswith("./") else path)
@@ -54,13 +56,15 @@ def classify(paths: list[str]) -> str:
 def changed_paths(base: str, head: str, *, repository: Path | None = None) -> list[str]:
     result = subprocess.run(
         # 不过滤 D/T 等状态；并关闭 rename 折叠，让高风险旧路径和新路径都进入分类。
-        ["git", "diff", "--name-only", "--no-renames", base, head],
+        # -z 让 Git 输出原始文件名并用 NUL 分隔；否则中文等非 ASCII 路径会被
+        # core.quotePath 转义，docs/** 会被误判成未知高风险路径。
+        ["git", "diff", "--name-only", "-z", "--no-renames", base, head],
         check=True,
         capture_output=True,
         text=True,
         cwd=repository,
     )
-    return result.stdout.splitlines()
+    return [path for path in result.stdout.split("\0") if path]
 
 
 def write_output(destination: Path, mode: str, paths: list[str]) -> None:
