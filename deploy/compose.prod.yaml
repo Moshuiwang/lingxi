@@ -1,0 +1,48 @@
+# `biplus-prod` 覆盖（Issue #62 / S11）。与 deploy/compose.stage.yaml **结构完全相同**，
+# 只有配置值不同。
+#
+#   docker compose --env-file deploy/.env.prod \
+#     -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
+#
+# `--env-file` 不能省，理由见 compose.stage.yaml 顶部与 deploy/README.md。
+#
+# **这里没有 `build:` 键，deploy/compose.yaml 里也没有。** 生产只拉镜像、不构建
+# （架构设计「八、部署与发布」）。回滚 = 改 LINGXI_IMAGE_TAG 后 `up -d`，见 deploy/README.md。
+#
+# 凭据**按服务分文件**，理由见 compose.stage.yaml 顶部的说明（worker 不得拿到数据库
+# 与飞书凭据：Agent SDK 会把环境继承给 Claude CLI 与 MCP 子进程）。
+# 本环境四个凭据文件：.env.prod.scheduler / .env.prod.gateway / .env.prod.worker /
+# .env.prod.migrate，**四个都必须 0600**，核对步骤见 deploy/README.md 的 preflight。
+#
+# 本文件的存在**不代表已经可以部署生产**。按 Issue #62「不在本 Issue 直接执行」：
+# 生产部署另建独立 `[ops]` Issue，固定镜像 digest、备份点、执行窗口、观察期和回滚目标。
+# 本批只交付编排文件本身，未在任何生产环境执行过。
+
+services:
+  scheduler:
+    env_file:
+      - ./.env.prod.scheduler
+    environment:
+      LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
+    volumes:
+      - lingxi-credentials:/var/lib/lingxi/credentials
+
+  gateway:
+    env_file:
+      - ./.env.prod.gateway
+
+  worker:
+    env_file:
+      - ./.env.prod.worker
+    volumes:
+      - lingxi-users:/var/lib/lingxi/users
+
+  migrate:
+    env_file:
+      - ./.env.prod.migrate
+
+volumes:
+  lingxi-credentials:
+    name: lingxi-prod-credentials
+  lingxi-users:
+    name: lingxi-prod-users

@@ -24,9 +24,14 @@ requires-python = ">=3.12"
 # 因此「模块能 import 成功」证明不了依赖装上了——校验必须显式导入第三方模块本身，
 # 见 scripts/ci/check_installed_package.py 的 `--process` 模式与 PROCESS_RUNTIME_IMPORTS。
 [project.optional-dependencies]
-# lingxi-scheduler 进程（`python -m lingxi.apps.scheduler`：专用授权凭据续期扫描）。
-# 依据：入口 → adapters/delegated_credentials.py（cryptography.fernet、psycopg）；
-# 同链上的 adapters/feishu_directory.py 只用标准库 urllib，故本组不含 lark-oapi。
+# lingxi-scheduler 进程（`python -m lingxi.apps.scheduler`）。现在跑**三个**定时职责：
+# 专用授权凭据续期扫描、九十天保留清理（#54）、花名册审计日报（#52）。
+# 依据：
+#   cryptography → adapters/delegated_credentials.py（Fernet 加密宿主机凭据文件）
+#   psycopg      → adapters/delegated_credentials.py、retention.py、postgres_roster_audit.py
+# **本组仍然不含 lark-oapi。** 同链上的 adapters/feishu_directory.py 与 #52 新增的
+# adapters/feishu_group_message.py（管理群群发）都只用标准库 urllib——发消息走 SDK 会
+# 为一个尚未接线的职责把整个 SDK 拉进常驻进程的依赖面。
 # cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
 # 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
 scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
@@ -40,6 +45,24 @@ scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
 # 绑定层的形状由桩模块锁住。CI 另有一步装上本组做真实冒烟（构造 `HookMatcher`，
 # 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
 worker = ["claude-agent-sdk==0.2.128"]
+# lingxi-gateway 进程（`python -m lingxi.apps.gateway`：飞书长连接接入与任务入队）。
+# 依据是从入口逐个追 import 链：
+#   lark-oapi → adapters/feishu_longconn.py（ws.Client 建长连接）
+#               adapters/feishu_outbound.py（加表情 message_reaction.create、
+#               回文本 message.reply）
+#   psycopg   → adapters/postgres_conversation.py（会话、任务队列、入站事件幂等）
+#   websockets→ lark-oapi 的 ws 客户端实际用它建 wss（lark_oapi/ws/client.py:12
+#               `import websockets`、:13 `from websockets.exceptions import
+#               InvalidHandshake`）
+# **websockets 显式声明，尽管 lark-oapi 会传递携带它。** 理由是独立复查已经证明
+# extras 矩阵抓不到传递依赖缺失：矩阵装的是 `.[gateway]`，lark-oapi 把 websockets
+# 带进来，于是"我们漏声明"这件事永远不会变红；一旦上游哪天把它挪出依赖表，
+# 长连接会在部署时才失败。这一组不含 cryptography——gateway 不碰 Fernet。
+gateway = [
+    "lark-oapi==1.7.1",
+    "psycopg[binary]>=3.2,<4",
+    "websockets>=15,<16",
+]
 # Bot-Test 受控验证资产（代码框架第五节列举的那一批），**不是正式生产进程**，
 # 不进生产镜像。含常驻长连接进程 `adapters/feishu_onboarding.run_long_connection_bot`
 # 与 `scripts/` 下的受控脚本。依据：
@@ -48,14 +71,36 @@ worker = ["claude-agent-sdk==0.2.128"]
 #   psycopg     → adapters/refresh_tokens.py、postgres_onboarding.py、galaxy_import.py 等
 #   cryptography→ adapters/refresh_tokens.py（refresh_token 加密轮换）
 # lark-oapi 保留为运行时依赖、不降为 CI-only：2026-08-06 产品负责人否决 #39 的替换
-# 建议（登记见 #39 收口评论与 #57）。正式 gateway 进程（代码框架第一节「待建立」）
-# 落地时，长连接与发消息的依赖再从本组提升为 `gateway` 组。
+# 建议（登记见 #39 收口评论与 #57）。正式 gateway 进程已于 #57 落地，长连接与发消息
+# 的依赖已提升为上面的 `gateway` 组；本组保留同名依赖是因为 Bot-Test 那套受控资产在
+# #67 交付前整体保留（代码框架第五节），两组各自独立声明、互不依赖。
 bot-test = [
     "cryptography==45.0.7",
     "lark-oapi==1.7.1",
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",
 ]
+# 数据库迁移（Issue #53）。**这一组不是常驻进程**，是部署时跑一次的迁移作业：
+# `LINGXI_MIGRATION_DSN=... python -m alembic upgrade head`。它单独成组而不是挂进
+# scheduler，有三个理由：
+#   1. 迁移要 DDL 权限、业务进程不要，两者本就该是不同的数据库角色；
+#   2. `src/lingxi/` 里不得出现 sqlalchemy / alembic（断言 V-迁移-04），把它塞进
+#      某个进程组等于声称那个进程运行时需要它，是假的；
+#   3. 生产镜像因此不必为了跑业务而装上 SQLAlchemy。
+# 窄区间而不是 `==`：按 2026-08-06 裁定①，alembic 属迁移工具链，不在运行时进程内，
+# 不是 V-部署-08 所说的"安全边界组件"。上界不能省——alembic 的 revision 解析与
+# 事务语义是次版本可变的，开区间等于允许它在代码没变时改变迁移行为。
+#
+# **psycopg 必须显式列在这里。** alembic 不依赖任何数据库驱动，驱动由 URL 的 scheme
+# 决定；env.py 强制 `postgresql+psycopg`，所以这一组不带 psycopg 就根本连不上库
+# （外审实测：干净环境跑 upgrade 报 `ModuleNotFoundError: No module named 'psycopg'`）。
+# 此前 gate 是绿的，因为它同时装了 scheduler 组，把驱动顺带带了进来——正是「别的组
+# 带进来的包让窄的那组永远不会红」这一类缺陷。区间与 scheduler 组同款。
+# 传递依赖（`pip install '.[migrate]'` 实测闭包，五项）：SQLAlchemy、Mako、MarkupSafe、
+# greenlet、typing-extensions。psycopg-binary 不在此列，它来自上面 `psycopg[binary]`
+# 的直接声明。这份清单在 docs/技术设计/代码框架.md 与 migrations/README.md 各有一份，
+# 三处必须一致。
+migrate = ["alembic>=1.19,<1.20", "psycopg[binary]>=3.2,<4"]
 
 # 角色职能映射是随包发布的配置文件，不是源码。不显式声明就不会进 wheel，
 # 而缺失表现为「全部角色显示未映射」——一种看起来正常的失败。

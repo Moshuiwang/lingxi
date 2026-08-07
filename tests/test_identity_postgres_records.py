@@ -31,7 +31,8 @@ from lingxi.core.identity.org_snapshot import (
     TenantScope,
 )
 
-MIGRATIONS = Path(__file__).parents[1] / "migrations"
+from postgres_schema import reset_production_rows
+
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
@@ -84,21 +85,17 @@ class IdentityPostgresTestCase(unittest.TestCase):
         self.reset_schema()
 
     def reset_schema(self) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "DROP TABLE IF EXISTS app_user CASCADE;"
-                "DROP TABLE IF EXISTS feishu_delegated_subject CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_member_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_department_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_tenant_snapshot CASCADE;"
-                "DROP TABLE IF EXISTS feishu_org_sync_run CASCADE;"
-            )
-            for name in (
-                "006_create_feishu_delegated_credential.sql",
-                "007_create_feishu_org_snapshot.sql",
-                "008_create_app_user.sql",
-            ):
-                cursor.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
+        """整条 alembic 链建库，不是挑 006/007/008 三条。
+
+        此前这里硬编码三个文件名。保留清理 revision 在组织快照表上加了授权、又在
+        银河侧加了触发器，按名字挑迁移会得到一个"少了一半新对象"的库——而少了的
+        部分不会让任何用例变红，只会让它们在一个不完整的库上通过（#54 验收清单 H-02）。
+
+        结构在进程内只建一次，这里每个用例做的是清行：本类有五十余个用例，
+        每个都重跑一次整链前滚会把真库这一段抬到门禁超时的量级。
+        """
+
+        reset_production_rows(self._dsn)
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
         with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:

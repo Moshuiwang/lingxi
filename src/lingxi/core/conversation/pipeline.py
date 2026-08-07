@@ -1,0 +1,395 @@
+"""gateway 事件处理管线：[接口设计 3.2](../../../../docs/技术设计/接口设计.md) 的处理次序。
+
+**次序本身是合同要求，不能重排。** 这个模块的全部价值就是把那张次序表变成可判定的代码，
+因此每一步上方都标了它对应的断言编号；调换任意两步都应当有用例变红。
+
+    1. 通道级认证        —— 长连接握手期完成，不在逐事件层做（见下方「关于第 1 步」）
+    2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
+    3. 加表情            失败 → 记审计，继续                  V-接入-07/08
+    4. 查用户状态        未开通 → 内容一律丢弃；已停用 → 回提示 V-审计-05
+    5. 解析命令          /stop /new                            V-会话-05/06
+    6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
+    7. 入队 + NOTIFY                                           V-队列-01…05
+
+编号以[验证与门禁](../../../../docs/技术设计/验证与门禁.md)的矩阵为准（两位数字，
+不用字母后缀）；断言表里的 `V-会话-02a`/`05a`/`06a` 登记时续号为 08/09/10。
+
+**关于第 1 步。** 接口设计原文写的是「验签」，那是 Webhook 语义。本切片按 2026-08-06
+决策走官方 ``lark-oapi`` 的长连接，认证发生在**握手期**（应用凭据换取 endpoint 与
+wss 地址），单条事件上没有可验的签名。承接同一产品意图的是 `V-接入-10`：进程不监听
+任何入站端口，事件只能从那条已认证的长连接进来。判定面比逐事件验签更严——不存在
+"签名对了就受理"的旁路，因为根本没有第二个入口。接口设计 3.2 随本切片同步修订。
+
+**关于事务边界。** 第 2 步到第 7 步跑在**同一个事务**里（`V-队列-01`）。这意味着任务
+插入失败时 ``inbound_event`` 那一行也不存在，飞书重投时该消息能被重新完整处理；也意味着
+抢占会随事务一起回滚，话题不会永久停在"忙碌"（`V-队列-02`）。
+
+第 3 步的加表情是**外部调用，落在事务里且不可回滚**——事务回滚后表情已经加上了。这是
+知情取舍，合同允许：表情"只表示已经收到，不表示消息能够执行或任务已经开始"。反过来
+不成立：任何表示"已受理"的**回复**都不能在入队成功前发出（`V-队列-03`）。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable
+
+from lingxi.core.ids import new_id
+
+from .commands import Command, parse_command
+from .ports import (
+    AuditSink,
+    GatewayStore,
+    HandledAs,
+    InboundMessage,
+    Outcome,
+    Reactions,
+    Replies,
+    UserState,
+    VersionResolver,
+)
+from .session_window import should_resume_session
+
+logger = logging.getLogger(__name__)
+
+# 合同「问数与多轮对话」逐字给出的提示语，不是本实现发明的文案：
+# 「除 /stop 外的后续消息（包括 /new）只收到"当前任务仍在处理中"的提示」。
+BUSY_HINT_TEXT = "当前任务仍在处理中"
+
+# #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
+# 断言只约束「入队时固化」与「领取带版本条件」两件事。
+DEFAULT_WORKER_VERSION = "stable"
+
+# 本批唯一会被入队的消息类型。
+TEXT_MESSAGE_TYPE = "text"
+
+
+def fixed_stable_version(*, user_id: str, now: datetime) -> str:
+    """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
+
+    return DEFAULT_WORKER_VERSION
+
+
+@dataclass(frozen=True)
+class GatewayTexts:
+    """用户可见文案。
+
+    ``busy_hint`` 来自合同原文。``suspended`` **没有**合同原文——接口设计 3.2 只写了
+    「回复停用说明」，具体措辞是尚未拍板的用户可见承诺，因此开成可注入字段并在
+    Issue 里登记为待产品负责人定夺项，而不是在代码里把某句话固化成事实。
+    """
+
+    busy_hint: str = BUSY_HINT_TEXT
+    suspended: str = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
+
+
+class EventPipeline:
+    """把一条入站消息按 3.2 的次序处理完。"""
+
+    def __init__(
+        self,
+        *,
+        store: GatewayStore,
+        reactions: Reactions,
+        replies: Replies,
+        audit: AuditSink,
+        texts: GatewayTexts | None = None,
+        resolve_version: VersionResolver = fixed_stable_version,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
+        self._store = store
+        self._reactions = reactions
+        self._replies = replies
+        self._audit = audit
+        self._texts = texts or GatewayTexts()
+        self._resolve_version = resolve_version
+        # 停机位。停机时**已提交的结论不动**，只跳过尽力而为的出站回复——
+        # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
+        self._should_stop = should_stop or (lambda: False)
+
+    def handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
+        """处理一条 ``im.message.receive_v1``。
+
+        ``now`` 只为注入时钟开放（`V-会话-02`），正常调用不传。
+
+        **回复一律在事务提交之后才发出。** 早先的写法在事务里就把"当前任务仍在处理中"
+        发出去了，于是回复成功、``mark_handled_as`` 或提交失败时：事务回滚 → 平台重投
+        → 提示重发；更糟的是**原任务如果这时已经结束**，这条本应"不生效"的消息会在
+        重投时被正常入队执行——直接违反合同「该消息不进入对话历史、不排队，也不会在
+        当前任务结束后自动提交或自动生效」。
+
+        改成先把 ``handled_as`` 结论持久化并提交、再发回复之后：重投时事件行已经在
+        库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
+        可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
+        """
+
+        moment = now or datetime.now(timezone.utc)
+        deferred: list[str] = []
+
+        outcome = self._within_transaction(message, moment, deferred)
+
+        # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
+        if deferred and self._should_stop():
+            # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
+            # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
+            # 一条提示不改变任何硬承诺。
+            self._audit.record(
+                "reply.skipped_while_stopping",
+                event_id=message.event_id,
+                trace_id=message.trace_id,
+            )
+            return outcome
+        for text in deferred:
+            try:
+                self._replies.send_text(
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
+                    text=text,
+                )
+            except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
+                self._audit.record(
+                    "reply.failed",
+                    event_id=message.event_id,
+                    error=f"{type(error).__name__}: {error}",
+                    trace_id=message.trace_id,
+                )
+        return outcome
+
+    def _within_transaction(
+        self, message: InboundMessage, moment: datetime, deferred: list[str]
+    ) -> Outcome:
+        """第 2 步到第 7 步，全部落在同一个事务里。"""
+
+        with self._store.transaction() as tx:
+            # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
+            # 早退发生在加表情之前，因此重复投递在用户可见面同样不重复：不再加表情、
+            # 不再发任何回复（`V-接入-09` 断的是出站调用次数，不只是数据库行数）。
+            first_time = tx.insert_inbound_event(
+                event_id=message.event_id,
+                event_type=message.event_type,
+                user_open_id=message.sender_open_id,
+                trace_id=message.trace_id,
+            )
+            if not first_time:
+                self._audit.record(
+                    "inbound_event.duplicate",
+                    event_id=message.event_id,
+                    trace_id=message.trace_id,
+                )
+                return Outcome(handled_as=None, duplicate=True)
+
+            # —— 第 3 步：加表情。合同：任何消息都加，失败不阻断后续处理。
+            self._add_reaction(message)
+
+            # —— 第 4 步：用户状态。
+            # 任务归属只由发送者标识解析而来（`V-接入-11`）：这里传的是
+            # message.sender_open_id，而 InboundMessage 里根本没有第二个用户标识可传。
+            user = tx.lookup_user(open_id=message.sender_open_id)
+            state = user.state if user is not None else UserState.NOT_PROVISIONED
+
+            if state is UserState.NOT_PROVISIONED:
+                # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显（`V-审计-05`）。
+                # 本批只认领这条**否定面**——正向的自动匹配与开通接线是 #65，不在本批。
+                # 注意审计里也不带消息正文：内容"不保存"包括不写进审计。
+                self._audit.record(
+                    "inbound_event.not_provisioned",
+                    event_id=message.event_id,
+                    trace_id=message.trace_id,
+                )
+                # 记 `not_provisioned` 而不是 `auto_provisioning`：本批**没有**启动
+                # 任何自动匹配与开通（正向接线是 #65），写后者等于让这一列陈述一件
+                # 没有发生的事。也不记 `dropped`——那会与「已停用」混为一谈，而
+                # #54 的保留清理与 #65 的接线都要读这一列。
+                tx.mark_handled_as(
+                    event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
+                )
+                return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
+
+            assert user is not None  # NOT_PROVISIONED 已在上一分支返回
+
+            if state is UserState.SUSPENDED:
+                deferred.append(self._texts.suspended)
+                self._audit.record(
+                    "inbound_event.suspended",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+                return Outcome(handled_as=HandledAs.DROPPED)
+
+            conversation = tx.ensure_conversation(
+                user_id=user.user_id,
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+            )
+
+            # —— 第 5 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
+            command = parse_command(message.text)
+
+            # —— 第 6 步：忙碌判定。
+            busy = conversation.running_task_id is not None
+
+            if command is Command.STOP:
+                # `V-会话-10`：3.2 第 6 步的条件是「忙碌 **且非 /stop**」，
+                # 因此 /stop 在忙碌时照常被处理，而不是收到"当前任务仍在处理中"。
+                stopped = tx.request_stop(conversation_id=conversation.conversation_id)
+                self._audit.record(
+                    "command.stop",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    conversation_id=conversation.conversation_id,
+                    stopped_task_id=stopped,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+                return Outcome(handled_as=HandledAs.COMMAND)
+
+            if busy:
+                # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
+                # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
+                # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
+                deferred.append(self._texts.busy_hint)
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
+                return Outcome(handled_as=HandledAs.BUSY_HINT)
+
+            if command is Command.NEW:
+                # 空闲时的 /new：立即清空当前对话上下文，其他话题不受影响
+                # （条件写在 conversation_id 上，天然只影响这一行）。
+                #
+                # 清空本身**再判一次忙碌**，因为上面那个 busy 读的是事务开始时的快照：
+                # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
+                # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
+                if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
+                    deferred.append(self._texts.busy_hint)
+                    tx.mark_handled_as(
+                        event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
+                    )
+                    return Outcome(handled_as=HandledAs.BUSY_HINT)
+                self._audit.record(
+                    "command.new",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    conversation_id=conversation.conversation_id,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+                return Outcome(handled_as=HandledAs.COMMAND)
+
+            # 非文本消息（图片、语音、富文本……）：表情已经加过（合同：任何消息都加），
+            # 但**不入队**——把一条语音当成空问题排进队列，用户只会拿到一个莫名其妙的
+            # 失败，而且会白占一次话题串行名额。
+            #
+            # 刻意**不回复任何文案**：「是否要明确告诉用户暂不支持这种消息」是一条新的
+            # 用户可见承诺，合同没有写，本批不发明（与入队失败的处理同一姿态），
+            # 已登记为待产品负责人定夺项。
+            #
+            # 位置在忙碌判定**之后**：忙碌期的非文本消息与其他消息一样只得到
+            # 「当前任务仍在处理中」，不因为类型不同而给出第二种回应。
+            if message.message_type != TEXT_MESSAGE_TYPE:
+                self._audit.record(
+                    "message.unsupported_type",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    message_type=message.message_type,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+                return Outcome(handled_as=HandledAs.DROPPED)
+
+            # —— 第 7 步：入队。
+            return self._enqueue(
+                tx,
+                message,
+                user_id=user.user_id,
+                conversation=conversation,
+                now=moment,
+                deferred=deferred,
+            )
+
+    # ------------------------------------------------------------------
+    # 内部步骤
+    # ------------------------------------------------------------------
+
+    def _add_reaction(self, message: InboundMessage) -> None:
+        """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
+
+        捕获 ``Exception`` 是刻意的：这一步的产品语义就是"尽力而为"，任何失败形态都
+        不该改变后续处理。把它收窄成某几个异常类型，等于让没预料到的失败形态重新获得
+        阻断后续处理的能力。
+        """
+
+        try:
+            self._reactions.add(message_id=message.message_id)
+        except Exception as error:  # noqa: BLE001 - 见 docstring
+            self._audit.record(
+                "reaction.failed",
+                event_id=message.event_id,
+                message_id=message.message_id,
+                error=f"{type(error).__name__}: {error}",
+                trace_id=message.trace_id,
+            )
+
+    def _enqueue(
+        self,
+        tx,
+        message: InboundMessage,
+        *,
+        user_id: str,
+        conversation,
+        now: datetime,
+        deferred: list[str],
+    ) -> Outcome:
+        task_id = new_id("tsk")
+
+        # 抢占与入队同事务：抢不到即忙碌（`V-会话-01`）；抢到之后任何失败都会让
+        # 抢占随事务一起回滚，话题不会永久忙碌（`V-队列-02`）。
+        if not tx.claim_conversation(
+            conversation_id=conversation.conversation_id, task_id=task_id
+        ):
+            deferred.append(self._texts.busy_hint)
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
+            return Outcome(handled_as=HandledAs.BUSY_HINT)
+
+        # 续用判定发生在**入队时**并落库（`V-会话-08`）：排队多久都不再改变它。
+        # 只读 last_task_ended_at，读不到任务开始时间或时长（`V-会话-03`）。
+        resumed = should_resume_session(
+            last_task_ended_at=conversation.last_task_ended_at,
+            agent_session_id=conversation.agent_session_id,
+            now=now,
+        )
+        # 目标 worker 版本同样在入队时求值一次并写入（`V-灰度-01`）。
+        # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
+        version = self._resolve_version(user_id=user_id, now=now)
+
+        tx.insert_task(
+            task_id=task_id,
+            conversation_id=conversation.conversation_id,
+            user_id=user_id,
+            inbound_event_id=message.event_id,
+            prompt=message.text,
+            resumed_session=resumed,
+            target_worker_version=version,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
+        tx.notify_task_queued()
+
+        self._audit.record(
+            "task.queued",
+            event_id=message.event_id,
+            user_id=user_id,
+            conversation_id=conversation.conversation_id,
+            task_id=task_id,
+            resumed_session=resumed,
+            target_worker_version=version,
+            trace_id=message.trace_id,
+        )
+        return Outcome(
+            handled_as=HandledAs.TASK_QUEUED,
+            task_id=task_id,
+            resumed_session=resumed,
+            target_worker_version=version,
+        )

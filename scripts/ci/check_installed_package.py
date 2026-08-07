@@ -47,7 +47,15 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.role_function",
     "lingxi.adapters.galaxy_csv_export",
     "lingxi.adapters.galaxy_import",
+    "lingxi.adapters.retention",
     "lingxi.adapters.feishu_roster_bitable",
+    # 花名册审计日报（Issue #52）：比对与渲染在 core，基线读取与群发在 adapters。
+    # 四个都要在制品里能 import——它们由 lingxi-scheduler 在运行时按需加载，
+    # "本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.identity.roster_audit",
+    "lingxi.core.identity.roster_report",
+    "lingxi.adapters.postgres_roster_audit",
+    "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
@@ -60,6 +68,19 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.__main__",
+    # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
+    # 新的顶层子目录，与 apps/ 当初同一个形状：漏进制品只在部署时暴露。
+    "lingxi.core.conversation.commands",
+    "lingxi.core.conversation.session_window",
+    "lingxi.core.conversation.ports",
+    "lingxi.core.conversation.pipeline",
+    "lingxi.adapters.feishu_events",
+    "lingxi.adapters.feishu_longconn",
+    "lingxi.adapters.feishu_outbound",
+    "lingxi.adapters.postgres_conversation",
+    "lingxi.apps.gateway",
+    "lingxi.apps.gateway.config",
+    "lingxi.apps.gateway.__main__",
 )
 
 # 随包发布的数据文件：模块导入成功不代表数据文件进了 wheel（后者要靠
@@ -80,12 +101,41 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 注意导入的是承载 ``main`` 的包，不是 ``lingxi.apps.scheduler.__main__``：
         # 后者在模块级 ``raise SystemExit(main())``（没有 __name__ 卫语句），
         # import 它会真的把续期扫描进程跑起来。
-        ("lingxi.apps.scheduler", "lingxi.adapters.delegated_credentials"),
+        # 花名册审计日报（#52）的两个 adapter 由 `build_loop` **在函数内** import。
+        # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
+        # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
+        (
+            "lingxi.apps.scheduler",
+            "lingxi.adapters.delegated_credentials",
+            "lingxi.adapters.retention",
+            "lingxi.adapters.feishu_group_message",
+            "lingxi.adapters.postgres_roster_audit",
+        ),
+        # 第三方那一列没变：群发适配走标准库 urllib（同 adapters/feishu_directory.py），
+        # 基线读取用 psycopg——两者都不引入新依赖。
         ("cryptography.fernet", "psycopg"),
     ),
     "worker": (
         ("lingxi.apps.worker.__main__", "lingxi.apps.worker.cli", "lingxi.adapters.claude_agent_session"),
         ("claude_agent_sdk",),
+    ),
+    "gateway": (
+        (
+            # 注意导入的是承载 ``main`` 的包与 ``__main__``：后者带 ``if __name__``
+            # 卫语句（与 worker 同惯例），import 它不会真的把长连接跑起来。
+            "lingxi.apps.gateway",
+            "lingxi.apps.gateway.config",
+            "lingxi.apps.gateway.__main__",
+            "lingxi.adapters.feishu_events",
+            "lingxi.adapters.feishu_longconn",
+            "lingxi.adapters.feishu_outbound",
+            "lingxi.adapters.postgres_conversation",
+        ),
+        # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
+        # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import
+        # 的那个子模块）而不是顶层包：websockets 15 的顶层做了惰性导入，
+        # ``import websockets`` 成功证明不了子模块装全了。
+        ("lark_oapi", "psycopg", "websockets.exceptions"),
     ),
     # Bot-Test 受控验证资产（代码框架第五节），不是生产进程；这些模块刻意不在
     # REQUIRED_MODULES 里——那份清单只管正式制品——但它们的依赖同样要能装上，
@@ -99,6 +149,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
     ),
+    # 迁移作业（Issue #53）：部署时跑一次 `python -m alembic upgrade head`，不是常驻
+    # 进程。**lingxi 模块那一列刻意为空**——迁移工具链不得渗入运行时代码
+    # （断言 V-迁移-04：`grep -rn "sqlalchemy\|alembic" src/` 必须为空），
+    # 所以这一组没有任何 lingxi 入口，只有第三方那一列要证明装得上。
+    #
+    # psycopg 与 alembic 并列，不是冗余：alembic 自己不依赖任何驱动，驱动由 URL 的
+    # scheme 决定。少了它，`upgrade head` 在干净环境里报 ModuleNotFoundError，而
+    # 这条矩阵腿是唯一会在干净环境里跑的检查（外审实测出的缺口）。
+    "migrate": ((), ("alembic", "psycopg")),
 }
 
 
