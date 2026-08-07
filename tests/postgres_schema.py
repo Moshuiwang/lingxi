@@ -93,9 +93,15 @@ def drop_production_objects(dsn: str) -> None:
 
     保留 `migrations/testing/` 那几张测试资产表：它们不属于生产链，
     删了会打断 `test_refresh_token_postgres` 等用例。
+
+    **`inbound_event` 自 `0057_gateway_tables` 起是生产表，不再在保留名单里。**
+    它此前只存在于测试资产 `migrations/testing/001` 中，所以被当成测试资产保留；
+    现在生产链自己建它，继续保留会让残留的测试资产版本挡住
+    `alembic upgrade head` 的 `CREATE TABLE`（同名对象已存在）。测试资产那一份由
+    `tests/test_identity_postgres.sh` 自己先 DROP 再建，不依赖这里保留它。
     """
 
-    preserved = ("feishu_user_refresh_token", "onboarding_progress", "inbound_event")
+    preserved = ("feishu_user_refresh_token", "onboarding_progress")
     with _connect(dsn) as connection, connection.cursor() as cursor:
         cursor.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> ALL(%s)",
@@ -211,7 +217,9 @@ def production_tables(dsn: str) -> tuple[str, ...]:
             " WHERE schemaname = 'public' "
             "   AND tablename <> ALL(%s) "
             " ORDER BY tablename",
-            (["feishu_user_refresh_token", "onboarding_progress", "inbound_event", "alembic_version"],),
+            # inbound_event 自 0057 起是生产表，必须参与清行——留在排除名单里会让
+            # gateway 的真库用例在用例之间互相看见对方的事件行（幂等断言会假红/假绿）。
+            (["feishu_user_refresh_token", "onboarding_progress", "alembic_version"],),
         )
         return tuple(row[0] for row in cursor.fetchall())
 

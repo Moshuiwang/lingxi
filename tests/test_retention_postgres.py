@@ -1660,10 +1660,16 @@ class MigrationChainCoverageTest(RetentionPostgresTestCase):
         from alembic.config import Config
         from alembic.script import ScriptDirectory
 
-        head = ScriptDirectory.from_config(Config(str(REPOSITORY_ROOT / "alembic.ini"))).get_current_head()
+        script = ScriptDirectory.from_config(Config(str(REPOSITORY_ROOT / "alembic.ini")))
+        head = script.get_current_head()
 
         self.assertEqual(applied_head(), head)
-        self.assertEqual(head, "0054_retention_cleanup")
+        # 断「本 revision 在建库实际跑过的链上」，而不是「它就是 head」。
+        # 后者会在任何人往链尾追加一条 revision 时变红，而那既不是回归、也不影响
+        # 这条用例要证明的事——#57 追加 `0057_gateway_tables` 时就撞上了。
+        # 实质检查由下面「清理函数真的在库里」承担，那一条不受链长变化影响。
+        applied_chain = [revision.revision for revision in script.walk_revisions("base", head)]
+        self.assertIn("0054_retention_cleanup", applied_chain)
         # 业务测试库不留版本表：它每轮都重建，不是被 alembic 增量维护的库，
         # 而迁移门禁有一条卫生断言专门盯着这一点。
         self.assertEqual(

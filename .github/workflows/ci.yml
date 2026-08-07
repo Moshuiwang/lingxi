@@ -34,7 +34,10 @@ jobs:
   gate:
     name: CI / gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
+    # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
+    # 触顶被杀（见 26e9973 的重触发说明）。10 分钟吸收绝大多数波动。
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -87,7 +90,7 @@ jobs:
 
       # shellcheck 此前用的是 runner 镜像自带的版本，既没锁定也没打印：同一个提交
       # 可能因为镜像更新得到不同结论。改用 pip 分发并锁版本，本机可装同一个。
-      # 装 scheduler 组而不是全量：实测 416 条单测跑完只需要 cryptography 与 psycopg，
+      # 装 scheduler 组而不是全量：单测跑完只需要 cryptography 与 psycopg，
       # 不需要 lark-oapi / websockets（两者都只在函数内延迟导入，测试从不走到）。
       # Bot-Test 那一组的依赖由 `CI / extras` 矩阵在干净环境里单独证明装得上。
       # 追加 migrate 组（Issue #53）：门禁的两处迁移检查真的执行 alembic——
@@ -138,7 +141,9 @@ jobs:
   extras:
     name: CI / extras (${{ matrix.extra }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 同一次波动里 bot-test 腿也曾 5 分钟触顶；migrate 腿在争抢下实测过 4m32s。
+    # 每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且仍能挡住真正的挂死。
+    timeout-minutes: 8
     strategy:
       # 各组互相独立，一组坏了也要看到其余组的结论。
       fail-fast: false
@@ -148,7 +153,7 @@ jobs:
         # check_installed_package.py 会三方对账（pyproject / 本矩阵 / 脚本），漏加即红。
         # migrate 是部署时跑一次的迁移作业，不是常驻进程，但同样要证明"单独装得上"：
         # #62 要为它构建镜像，那时缺依赖就是部署当场失败（Issue #53）。
-        extra: [scheduler, worker, bot-test, migrate]
+        extra: [scheduler, worker, gateway, bot-test, migrate]
 
     steps:
       - name: 检出代码

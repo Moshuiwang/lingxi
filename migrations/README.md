@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0054_retention_cleanup` |
+| head revision | `0057_gateway_tables` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -172,6 +172,19 @@ psql "${LINGXI_LIBPQ_DSN%/*}/postgres" -c "DROP DATABASE lingxi_takeover_check;"
 同样的结构）。这是 [#53](https://github.com/Moshuiwang/lingxi/issues/53) TO PM 里「可前滚可回滚」承诺的确切口径：
 承诺覆盖基线之后的全部变更，**不覆盖基线本身**。`scripts/ci/check_alembic_revisions.py`
 拒绝空的 `downgrade()`——要么真正逆转，要么显式 `raise`，不允许「成功地什么都不做」。
+
+## `0057_gateway_tables`（会话、任务队列与入站事件）
+
+Issue #57 / S4 前半。建 `conversation`、`inbound_event`、`task` 三张表，DDL 全部内联
+在 revision 里。
+
+本切片早期先写过一个顶层编号文件 `migrations/013_*.sql`，缝链时按上面的冻结规则
+**删除**：新增编号文件不会进入基线的逐字节副本，`check_alembic_revisions.py` 会因
+「顶层编号 SQL 未被任何 revision 的 `CHAIN` 覆盖」而变红。基线之后的 revision 是 DDL
+的唯一载体，本 revision 没有 `CHAIN`。
+
+`downgrade()` 真实可执行且被逐 revision 真往返覆盖：三张表都是本 revision 新建的，
+不存在需要还原的历史行，删除顺序与建表相反，两个函数显式删除。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
