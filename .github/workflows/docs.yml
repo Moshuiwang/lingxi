@@ -1,8 +1,7 @@
 name: Docs
 
-# Issue #43 瘦身：纯文档推送到 main 的轻量门禁（Markdown 链接、项目 Skills、验收矩阵、行尾空白）。
-# 不装依赖、不起服务容器，十几秒完成；代码路径的完整门禁见 ci.yml。
-# 同时命中两组路径的推送会两条工作流都跑，完整门禁覆盖本门禁的全部检查项。
+# 纯文档推送到 main 的轻量回读。PR 阶段由 Story Fast 或 Epic Full 完成准入，
+# 合并后这里只确认文档树仍自洽，不启动数据库或镜像。
 on:
   push:
     branches:
@@ -30,19 +29,5 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Markdown 链接、项目 Skills 与验收矩阵检查
-        run: |
-          python3 scripts/ci/check_markdown_links.py
-          python3 scripts/ci/check_project_skills.py
-          # 验收矩阵的状态列与合同条款覆盖清单都只由 Markdown 承载（Issue #58）：
-          # 纯文档推送恰恰是它们唯一会被改动的路径，漏在这里，这道检查对 main 就不生效。
-          python3 scripts/ci/check_acceptance_matrix.py
-
-      - name: 行尾空白检查
-        run: |
-          whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
-          if [ -n "${whitespace_files}" ]; then
-            printf '以下正式文件包含行尾空白：\n%s\n' "${whitespace_files}" >&2
-            exit 1
-          fi
-          echo '行尾空白：通过'
+      - name: 运行文档门禁
+        run: scripts/ci/verify_docs.sh

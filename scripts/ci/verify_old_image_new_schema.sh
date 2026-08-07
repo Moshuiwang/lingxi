@@ -159,7 +159,7 @@ fi
 # **down_revision 必须动态解析，不能硬编码基线**（Issue #62 codex 审查 P2-2）。
 # 写死 `20260806_baseline` 的话，任何一次新增 revision（#54 正在做）合并进来之后，
 # 这条合成迁移就会与新 head 并列成为**第二个 head**，`upgrade head` 当场报
-# "Multiple heads" 并让 CI / image 必炸——而炸的原因与被测对象毫无关系。
+# "Multiple heads" 并让 Epic Full / image 必炸——而炸的原因与被测对象毫无关系。
 current_head=$(docker run --rm --network host -e LINGXI_MIGRATION_DSN="${dsn}" \
   --entrypoint python "${migrate_image}" -m alembic -c /opt/lingxi/alembic.ini heads 2>/dev/null \
   | head -1 | awk '{print $1}')
