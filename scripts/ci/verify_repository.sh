@@ -16,7 +16,7 @@ done
 # 门禁必须跑在项目声明支持的解释器上。此前用的是裸 python3：CI 上恰好是 3.12
 # 所以一直没暴露，但本地 python3 可能是 3.9——那样门禁会在一个项目不支持的
 # 解释器上给出绿灯，属于假信心，比没有门禁更危险。
-declared_python=$(sed -n 's/^requires-python = ">=\([0-9]\+\.[0-9]\+\)"$/\1/p' pyproject.toml)
+declared_python=$(sed -nE -e 's/^requires-python = ">=([0-9]+\.[0-9]+)"$/\1/p' pyproject.toml)
 if [[ -z "${declared_python}" ]]; then
   printf 'pyproject.toml 里读不到 requires-python，无法校验解释器版本。\n' >&2
   exit 1

@@ -238,6 +238,7 @@ class NoInboundPortTests(GatewayProcessTestCase):
             "事件只能经已认证的长连接通道进入，不存在第二个入站入口",
         )
 
+    @unittest.skipUnless(Path("/proc/net/tcp").exists(), "跳过：本平台没有 /proc/net/tcp")
     def test_the_check_would_catch_a_listening_socket(self) -> None:
         """反向验证上一条的判据真的会变红——否则它可能只是"什么都没查到"。"""
 
