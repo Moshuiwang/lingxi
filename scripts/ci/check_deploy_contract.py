@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """部署编排的静态契约检查（Issue #62 / S11）。
 
-守住 Dockerfile、`deploy/` 下的 compose 文件与 `ci.yml` 里那些**改坏了不会有任何东西
+守住 Dockerfile、`deploy/` 下的 compose 文件与三层 CI 工作流里那些**改坏了不会有任何东西
 报错**的约束：停止宽限期够不够、凭据路径是不是落在持久卷上、生产 compose 里有没有混进
 构建定义、镜像 tag 是不是可变的。这些全都属于"部署当天才会暴露"的那一类，而部署当天
 暴露的代价是用户结果丢失或服务起不来。
@@ -39,6 +39,8 @@ COMPOSE_STAGE = REPOSITORY_ROOT / "deploy" / "compose.stage.yaml"
 COMPOSE_PROD = REPOSITORY_ROOT / "deploy" / "compose.prod.yaml"
 ENV_EXAMPLE = REPOSITORY_ROOT / "deploy" / ".env.example"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
+PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
 SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__init__.py"
@@ -601,14 +603,16 @@ def check_dockerignore() -> list[str]:
 
 def check_ci_workflow() -> list[str]:
     failures: list[str] = []
-    text = read(CI_WORKFLOW)
+    full = read(CI_WORKFLOW)
+    story = read(STORY_WORKFLOW)
+    publish = read(PUBLISH_WORKFLOW)
 
     # M2-62-41 / D16：`extra: [...]` 只能有一行。
     #
     # check_installed_package.py 的 `_MATRIX_LINE` 用的是 `re.search`，只取**第一个**
     # 匹配。新增一条构建矩阵若也用 `extra:` 作键，三方对账就会拿错集合去比对，
     # 既有门禁从此失效而且全绿——正是「绿色的测试不等于会变红的测试」。
-    extra_lines = re.findall(r"^[ \t]*extra:[ \t]*\[", text, re.MULTILINE)
+    extra_lines = re.findall(r"^[ \t]*extra:[ \t]*\[", full, re.MULTILINE)
     if len(extra_lines) != 1:
         failures.append(
             f"ci.yml 里有 {len(extra_lines)} 行 `extra: [...]`，必须恰好 1 行。"
@@ -617,22 +621,48 @@ def check_ci_workflow() -> list[str]:
             "新增的构建矩阵请用别的键名（本仓库用 `service:`）。"
         )
 
-    # M2-62-39：新增顶层路径必须进 push 的 paths 触发列表（#53 同型教训）。
+    # main 合并后只发布，不重跑完整门禁；发布触发路径仍必须覆盖全部部署输入。
     for needed in ("Dockerfile", "deploy/**", ".dockerignore"):
-        if f"'{needed}'" not in text and f'"{needed}"' not in text:
+        if f"'{needed}'" not in publish and f'"{needed}"' not in publish:
             failures.append(
-                f"ci.yml 的 push `paths:` 没有 `{needed}`：改坏它直推 main 不会触发完整门禁。"
+                f"publish.yml 的 push `paths:` 没有 `{needed}`：合并该输入后不会触发发布。"
             )
 
-    # codex 二轮 P1-1：`packages: write` 只能出现在**不随 PR 跑**的 job 上。
-    #
-    # `permissions` 是按 job 生效的，而同仓分支的 pull_request 事件会让该 job 拿到所
-    # 声明的令牌。把写权限放在一个 PR 也会跑的 job 上，等于任何人改一行 workflow 就能
-    # 在 PR 阶段推 / 覆盖 GHCR，"合并后才发布"这道门整个绕过去。
-    # 判据：含 `packages: write` 的 job 必须同时有 `if:` 限定 push + refs/heads/main。
-    for match in re.finditer(r"^  (\w+):\n(.*?)(?=^  \w+:\n|\Z)", text, re.MULTILINE | re.DOTALL):
+    if "workflow_call:" not in full:
+        failures.append("ci.yml 缺少 workflow_call，Story 高风险改动无法复用同一份 Epic Full。")
+    if re.search(r"^  push:\s*$", strip_comments(full), re.MULTILINE):
+        failures.append("ci.yml 仍监听 main push：合并后会重复运行完整门禁。")
+
+    candidate_match = re.search(
+        r"^  candidate:\n(.*?)(?=^  \w[\w-]*:\n|\Z)", full, re.MULTILINE | re.DOTALL
+    )
+    if candidate_match is None:
+        failures.append("ci.yml 缺少 candidate job，无法形成稳定的 Epic Full 结论。")
+    else:
+        candidate = candidate_match.group(1)
+        needs = re.search(r"^\s*needs:\s*\[([^\]]*)\]", candidate, re.MULTILINE)
+        required = {"gate", "extras", "image"}
+        actual = {item.strip() for item in needs.group(1).split(",")} if needs else set()
+        if actual != required:
+            failures.append(
+                f"ci.yml candidate needs 为 {sorted(actual)}，要求恰好 {sorted(required)}。"
+            )
+        for marker in ("write_epic_candidate.py", "upload-artifact@"):
+            if marker not in candidate:
+                failures.append(f"ci.yml candidate 缺少 `{marker}`，main 无法回读候选身份。")
+
+    for marker in ("'epic/**'", "classify_story_changes.py", "verify_docs.sh", "uses: ./.github/workflows/ci.yml", "name: Story Fast"):
+        if marker not in story:
+            failures.append(f"story.yml 缺少 `{marker}`，Story Fast 路由不完整。")
+
+    # `packages: write` 只能存在于 main push 工作流，且必须等待候选身份核对。
+    if "packages: write" in full or "packages: write" in story:
+        failures.append("PR 工作流声明了 packages: write；PR 不得获得镜像仓库写权限。")
+    publish_jobs = list(
+        re.finditer(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", publish, re.MULTILINE | re.DOTALL)
+    )
+    for match in publish_jobs:
         job_name, body = match.group(1), match.group(2)
-        # 只看 job 头部（steps 之前），避免把步骤里的字符串误当成 job 级声明。
         header = body.split("\n    steps:", 1)[0]
         if not re.search(r"^\s*packages:\s*write\s*$", header, re.MULTILINE):
             continue
@@ -640,28 +670,39 @@ def check_ci_workflow() -> list[str]:
             re.search(r"^\s*if:.*refs/heads/main", header, re.MULTILINE)
         if not gated:
             failures.append(
-                f"ci.yml 的 job `{job_name}` 声明了 `packages: write`，但没有 "
+                f"publish.yml 的 job `{job_name}` 声明了 `packages: write`，但没有 "
                 "`if: github.event_name == 'push' && github.ref == 'refs/heads/main'` 限定。\n"
                 "      同仓分支的 pull_request 会让这个 job 照样拿到写令牌——"
                 "改一行 workflow 就能在 PR 阶段推 / 覆盖 GHCR，绕过合并门禁。"
             )
-        # 发布 job 必须 needs 着 image。镜像契约、两次构建等价、V-部署-05 全都跑在
-        # image 里；把它从 needs 里拿掉，这些检查一条都不会拦住发布，而 CI 依然全绿。
         needs = re.search(r"^\s*needs:\s*(\[[^\]]*\]|\S.*)$", header, re.MULTILINE)
-        if needs is None or "image" not in needs.group(1):
+        if needs is None or "candidate" not in needs.group(1):
             failures.append(
-                f"ci.yml 的 job `{job_name}` 声明了 `packages: write`，但它的 `needs` "
-                f"不含 `image`（当前：{needs.group(1) if needs else '无 needs'}）。\n"
-                "      镜像契约、两次构建等价与 V-部署-05 都跑在 image job 里；"
-                "不 needs 它就等于这些检查一条都不拦发布，而 CI 照样全绿。"
+                f"publish.yml 的 job `{job_name}` 声明了 `packages: write`，但它的 `needs` "
+                f"不含 `candidate`（当前：{needs.group(1) if needs else '无 needs'}）。"
             )
 
+    if "verify_epic_candidate.py" not in publish:
+        failures.append("publish.yml 没有回读 Epic Full 候选证明。")
+    if publish.count("scripts/ci/build_image.sh") != 1:
+        failures.append("publish.yml 必须只保留一处四镜像构建循环，不得重复构建。")
+    for forbidden in (
+        "postgres:16",
+        "extra: [",
+        "--no-cache",
+        "verify_image_contract.sh",
+        "verify_old_image_new_schema.sh",
+        "verify_repository.sh",
+    ):
+        if forbidden in strip_comments(publish):
+            failures.append(f"publish.yml 含完整门禁动作 `{forbidden}`：main 合并后不得重复验收。")
+
     # M2-62-35 / D15：推送步骤不得吞错。
-    if "push_image.py" in text:
-        for line in text.splitlines():
+    if "push_image.py" in publish:
+        for line in publish.splitlines():
             if "continue-on-error" in line and not line.lstrip().startswith("#"):
                 failures.append(
-                    "ci.yml 用了 continue-on-error。GHCR 推送的降级必须是**显式分支**："
+                    "publish.yml 用了 continue-on-error。GHCR 推送的降级必须是**显式分支**："
                     "权限不足时上传 artifact 并在 summary 写明「未推送」，"
                     "而不是让任何失败都变成绿色。两条路径同样绿色收口 = 无法区分"
                     "「推上去了」与「没推上去」。"
@@ -693,7 +734,7 @@ def main() -> int:
     backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
     worst_case = _worst_case_seconds()
     print(
-        "部署编排契约：通过（Dockerfile、deploy/ 下 3 个 compose、.dockerignore、ci.yml）\n"
+        "部署编排契约：通过（Dockerfile、deploy/ 下 3 个 compose、.dockerignore、Story/Epic/Publish）\n"
         f"  停止宽限期：最坏 {worst_case:.1f}s（续期 HTTP {http_timeout}s + 落盘退避 "
         f"{sum(backoff)}s + 数据库 {DATABASE_ROUNDTRIP_BUDGET_SECONDS:.0f}s ="
         f" {DATABASE_OPERATION_COUNT} 次操作 × {DATABASE_OPERATION_SECONDS:.0f}s）"

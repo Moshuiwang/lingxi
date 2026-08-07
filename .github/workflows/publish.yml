@@ -1,0 +1,109 @@
+name: Main Publish
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'workers/**'
+      - 'migrations/**'
+      - 'experiments/**'
+      - 'pyproject.toml'
+      - 'alembic.ini'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'deploy/**'
+      - '.github/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Main Publish / accepted candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: 检出合并结果
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 回读 Epic Full 候选证明
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/verify_epic_candidate.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --commit-sha "${GITHUB_SHA}" \
+            --tree-sha "$(git rev-parse 'HEAD^{tree}')" \
+            --summary "${GITHUB_STEP_SUMMARY}"
+
+  publish:
+    name: Main Publish
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [candidate]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 计算不可变 tag
+        id: tag
+        run: |
+          batch=$(date -u +%Y%m%d)
+          short=$(echo "${GITHUB_SHA}" | cut -c1-12)
+          echo "batch=${batch}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${batch}-${short}" >> "${GITHUB_OUTPUT}"
+
+      - name: 构建四个发布镜像（只构建一次）
+        env:
+          LINGXI_IMAGE_BATCH: ${{ steps.tag.outputs.batch }}
+          LINGXI_IMAGE_COMMIT: ${{ github.sha }}
+          LINGXI_IMAGE_REGISTRY: ghcr.io/moshuiwang
+        run: |
+          for service in scheduler migrate gateway worker; do
+            scripts/ci/build_image.sh "${service}"
+          done
+
+      - name: 登录 GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: 推送镜像到 GHCR（权限不足则降级留证）
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          for service in scheduler migrate gateway worker; do
+            python3 scripts/ci/push_image.py \
+              "ghcr.io/moshuiwang/lingxi-${service}:${IMAGE_TAG}" \
+              --artifact-dir "${RUNNER_TEMP}/images" \
+              --summary-file "${GITHUB_STEP_SUMMARY}" \
+              --output-file "${GITHUB_OUTPUT}"
+          done
+
+      - name: 降级留证：上传镜像 tar
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lingxi-images-${{ steps.tag.outputs.tag }}
+          path: ${{ runner.temp }}/images
+          if-no-files-found: ignore
+          retention-days: 14

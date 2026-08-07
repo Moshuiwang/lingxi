@@ -95,7 +95,7 @@ _INSTALL_MARKERS = ("site-packages", "dist-packages")
 #
 # 第三方那一列是从进程入口逐个追 import 链得到的，不是照抄 pyproject——照抄的话
 # 这个检查就永远不会红。CI 在**每个 extra 各自的干净环境**里跑对应的一项，
-# 见 .github/workflows/ci.yml 的 `CI / extras` 矩阵。
+# 见 .github/workflows/ci.yml 的 `Epic Full / extras` 矩阵。
 PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "scheduler": (
         # 注意导入的是承载 ``main`` 的包，不是 ``lingxi.apps.scheduler.__main__``：

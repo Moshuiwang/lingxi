@@ -7,7 +7,7 @@
 
 镜像层面的断言（rootfs 内容、非 root、两次构建等价、旧镜像在新库上启动）需要
 docker，留给 `scripts/ci/verify_image_contract.sh`、`verify_compose_structure.sh`
-与 `verify_old_image_new_schema.sh`，由 `CI / image` job 执行，不在本文件覆盖范围。
+与 `verify_old_image_new_schema.sh`，由 `Epic Full / image` job 执行，不在本文件覆盖范围。
 """
 
 from __future__ import annotations
@@ -325,24 +325,40 @@ class OverrideBypassTest(unittest.TestCase):
 
 
 class PublishJobGuardTest(unittest.TestCase):
-    """发布 job 的两条硬约束（codex 二轮 P1-1 + 验收微验 P3）。
+    """Epic Full 候选与 main Publish 之间不能被一行配置绕过。"""
 
-    `permissions` 按 job 生效，而同仓分支的 pull_request 会让该 job 照样拿到令牌；
-    `needs` 则决定哪些检查真的拦得住发布。两条都是"改一行就整个绕过去"的形状。
+    FULL = """
+        on:
+          pull_request:
+            branches: [main]
+          workflow_call:
+        jobs:
+          extras:
+            strategy:
+              matrix:
+                extra: [scheduler, worker, gateway, bot-test, migrate]
+          candidate:
+            needs: [gate, extras, image]
+            steps:
+              - run: python3 scripts/ci/write_epic_candidate.py
+              - uses: actions/upload-artifact@sha
     """
-
-    def _with_workflow(self, body: str):
-        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
-        workflow = directory / "ci.yml"
-        workflow.write_text(textwrap.dedent(body), encoding="utf-8")
-        original = CONTRACT.CI_WORKFLOW
-        CONTRACT.CI_WORKFLOW = workflow
-        try:
-            return CONTRACT.check_ci_workflow()
-        finally:
-            CONTRACT.CI_WORKFLOW = original
-
-    HEAD = """
+    STORY = """
+        name: Story Fast
+        on:
+          pull_request:
+            branches: ['epic/**']
+        jobs:
+          classify:
+            steps:
+              - run: python3 scripts/ci/classify_story_changes.py
+          docs:
+            steps:
+              - run: scripts/ci/verify_docs.sh
+          full:
+            uses: ./.github/workflows/ci.yml
+    """
+    PUBLISH = """
         on:
           push:
             paths:
@@ -350,55 +366,66 @@ class PublishJobGuardTest(unittest.TestCase):
               - '.dockerignore'
               - 'deploy/**'
         jobs:
-          extras:
-            strategy:
-              matrix:
-                extra: [scheduler, worker, bot-test, migrate]
-          image:
+          candidate:
+            steps:
+              - run: python3 scripts/ci/verify_epic_candidate.py
+          publish:
+            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+            needs: [candidate]
             permissions:
               contents: read
+              packages: write
             steps:
-              - run: echo build
+              - run: scripts/ci/build_image.sh "${service}"
+              - run: python3 scripts/ci/push_image.py x
     """
 
+    def _with_workflows(self, *, full: str | None = None, story: str | None = None, publish: str | None = None):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        paths = {
+            "CI_WORKFLOW": directory / "ci.yml",
+            "STORY_WORKFLOW": directory / "story.yml",
+            "PUBLISH_WORKFLOW": directory / "publish.yml",
+        }
+        paths["CI_WORKFLOW"].write_text(textwrap.dedent(full or self.FULL), encoding="utf-8")
+        paths["STORY_WORKFLOW"].write_text(textwrap.dedent(story or self.STORY), encoding="utf-8")
+        paths["PUBLISH_WORKFLOW"].write_text(textwrap.dedent(publish or self.PUBLISH), encoding="utf-8")
+        originals = {name: getattr(CONTRACT, name) for name in paths}
+        for name, path in paths.items():
+            setattr(CONTRACT, name, path)
+        try:
+            return CONTRACT.check_ci_workflow()
+        finally:
+            for name, path in originals.items():
+                setattr(CONTRACT, name, path)
+
     def test_publish_without_push_main_gate_is_caught(self) -> None:
-        failures = self._with_workflow(self.HEAD + """
-          publish:
-            needs: [gate, extras, image]
-            permissions:
-              contents: read
-              packages: write
-            steps:
-              - run: python3 scripts/ci/push_image.py x
-        """)
+        publish = self.PUBLISH.replace(
+            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'", "if: always()"
+        )
+        failures = self._with_workflows(publish=publish)
         self.assertTrue(any("packages: write" in f and "refs/heads/main" in f for f in failures), failures)
 
-    def test_publish_without_image_in_needs_is_caught(self) -> None:
-        # 验收微验新增：把 image 从 needs 里拿掉，镜像契约/等价/V-部署-05 全被绕过。
-        failures = self._with_workflow(self.HEAD + """
-          publish:
-            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-            needs: [gate, extras]
-            permissions:
-              contents: read
-              packages: write
-            steps:
-              - run: python3 scripts/ci/push_image.py x
-        """)
-        self.assertTrue(any("needs" in f and "image" in f for f in failures), failures)
+    def test_publish_without_candidate_in_needs_is_caught(self) -> None:
+        failures = self._with_workflows(publish=self.PUBLISH.replace("needs: [candidate]", "needs: []"))
+        self.assertTrue(any("needs" in f and "candidate" in f for f in failures), failures)
 
     def test_wellformed_publish_job_passes(self) -> None:
-        failures = self._with_workflow(self.HEAD + """
-          publish:
-            if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-            needs: [gate, extras, image]
-            permissions:
-              contents: read
-              packages: write
-            steps:
-              - run: python3 scripts/ci/push_image.py x
-        """)
+        failures = self._with_workflows()
         self.assertEqual(failures, [])
+
+    def test_repeating_full_gate_on_main_is_caught(self) -> None:
+        publish = self.PUBLISH.replace(
+            "- run: python3 scripts/ci/verify_epic_candidate.py",
+            "- run: python3 scripts/ci/verify_epic_candidate.py\n              - run: scripts/ci/verify_repository.sh",
+        )
+        failures = self._with_workflows(publish=publish)
+        self.assertTrue(any("不得重复验收" in failure for failure in failures), failures)
+
+    def test_candidate_must_need_all_full_legs(self) -> None:
+        full = self.FULL.replace("needs: [gate, extras, image]", "needs: [gate, extras]")
+        failures = self._with_workflows(full=full)
+        self.assertTrue(any("candidate needs" in failure for failure in failures), failures)
 
 
 class RealWorkflowTest(unittest.TestCase):
@@ -438,7 +465,7 @@ class RealWorkflowTest(unittest.TestCase):
 
     def test_both_build_legs_use_the_same_script(self) -> None:
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
-        image_job = text[text.index("  image:"):text.index("  publish:")]
+        image_job = text[text.index("  image:"):text.index("  candidate:")]
         bare_builds = [
             line.strip()
             for line in image_job.splitlines()
