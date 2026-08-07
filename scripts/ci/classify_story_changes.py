@@ -20,7 +20,7 @@ FAST_PREFIXES = ("experiments/", "scripts/dev/", "src/", "tests/", "workers/")
 
 
 def is_document(path: str) -> bool:
-    return path.endswith(".md") or path in DOCUMENT_FILES or path.startswith(DOCUMENT_PREFIXES)
+    return path in DOCUMENT_FILES or path.startswith(DOCUMENT_PREFIXES)
 
 
 def is_full(path: str) -> bool:
@@ -40,21 +40,25 @@ def classify(paths: list[str]) -> str:
         normalized.append(path[2:] if path.startswith("./") else path)
     if not normalized:
         return "full"
-    if all(is_document(path) for path in normalized):
-        return "docs"
+    # 目录风险优先于扩展名：deploy/README.md 与 scripts/ci/README.md 仍属于
+    # 高风险目录，未来即使 Markdown 被用作运行期模板也不会误走文档快检。
     if any(is_full(path) for path in normalized):
         return "full"
+    if all(is_document(path) for path in normalized):
+        return "docs"
     if all(is_document(path) or is_fast(path) for path in normalized):
         return "fast"
     return "full"
 
 
-def changed_paths(base: str, head: str) -> list[str]:
+def changed_paths(base: str, head: str, *, repository: Path | None = None) -> list[str]:
     result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, head],
+        # 不过滤 D/T 等状态；并关闭 rename 折叠，让高风险旧路径和新路径都进入分类。
+        ["git", "diff", "--name-only", "--no-renames", base, head],
         check=True,
         capture_output=True,
         text=True,
+        cwd=repository,
     )
     return result.stdout.splitlines()
 

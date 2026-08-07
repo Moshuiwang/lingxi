@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -54,6 +56,80 @@ class StoryClassificationTest(unittest.TestCase):
 
     def test_empty_diff_fails_closed_to_full(self) -> None:
         self.assertEqual(CLASSIFIER.classify([]), "full")
+
+    def test_markdown_inside_a_high_risk_directory_still_uses_full_gate(self) -> None:
+        for path in ("deploy/README.md", "migrations/README.md", "scripts/ci/README.md"):
+            with self.subTest(path=path):
+                self.assertEqual(CLASSIFIER.classify([path]), "full")
+
+    def test_unlisted_markdown_is_not_silently_treated_as_docs(self) -> None:
+        self.assertEqual(CLASSIFIER.classify(["src/lingxi/prompts/runtime.md"]), "fast")
+
+    def test_deleted_high_risk_path_is_kept_with_a_mixed_docs_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "deploy").mkdir()
+            (repository / "docs").mkdir()
+            (repository / "deploy/compose.yaml").write_text("services: {}\n", encoding="utf-8")
+            (repository / "docs/note.md").write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repository / "deploy/compose.yaml").unlink()
+            (repository / "docs/note.md").write_text("after\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "change"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, ["deploy/compose.yaml", "docs/note.md"])
+        self.assertEqual(CLASSIFIER.classify(paths), "full")
+
+    def test_high_risk_rename_keeps_both_old_and_new_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "scripts/ci").mkdir(parents=True)
+            (repository / "docs").mkdir()
+            (repository / "scripts/ci/check.py").write_text("pass\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repository / "scripts/ci/check.py").rename(repository / "docs/check.py")
+            subprocess.run(["git", "add", "-A"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "rename"],
+                cwd=repository,
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            paths = CLASSIFIER.changed_paths(base, head, repository=repository)
+
+        self.assertEqual(paths, ["docs/check.py", "scripts/ci/check.py"])
+        self.assertEqual(CLASSIFIER.classify(paths), "full")
 
 
 class CandidateIdentityTest(unittest.TestCase):
