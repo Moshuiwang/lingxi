@@ -24,9 +24,14 @@ requires-python = ">=3.12"
 # 因此「模块能 import 成功」证明不了依赖装上了——校验必须显式导入第三方模块本身，
 # 见 scripts/ci/check_installed_package.py 的 `--process` 模式与 PROCESS_RUNTIME_IMPORTS。
 [project.optional-dependencies]
-# lingxi-scheduler 进程（`python -m lingxi.apps.scheduler`：专用授权凭据续期扫描）。
-# 依据：入口 → adapters/delegated_credentials.py（cryptography.fernet、psycopg）；
-# 同链上的 adapters/feishu_directory.py 只用标准库 urllib，故本组不含 lark-oapi。
+# lingxi-scheduler 进程（`python -m lingxi.apps.scheduler`）。现在跑**三个**定时职责：
+# 专用授权凭据续期扫描、九十天保留清理（#54）、花名册审计日报（#52）。
+# 依据：
+#   cryptography → adapters/delegated_credentials.py（Fernet 加密宿主机凭据文件）
+#   psycopg      → adapters/delegated_credentials.py、retention.py、postgres_roster_audit.py
+# **本组仍然不含 lark-oapi。** 同链上的 adapters/feishu_directory.py 与 #52 新增的
+# adapters/feishu_group_message.py（管理群群发）都只用标准库 urllib——发消息走 SDK 会
+# 为一个尚未接线的职责把整个 SDK 拉进常驻进程的依赖面。
 # cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
 # 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
 scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]

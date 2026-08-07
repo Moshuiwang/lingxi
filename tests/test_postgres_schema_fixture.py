@@ -43,6 +43,9 @@ _REAL_DATABASE_MODULES = (
     "test_galaxy_import_postgres.py",
     "test_identity_postgres_records.py",
     "test_retention_postgres.py",
+    # Issue #52 的花名册审计真库断言：它读 app_user，必须由整条 alembic 链建出来的
+    # 结构来跑，不能自己拼一套建库过程。
+    "test_roster_audit_postgres.py",
 )
 
 

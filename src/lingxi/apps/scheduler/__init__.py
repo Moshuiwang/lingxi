@@ -1,11 +1,17 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**两个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**三个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
 2. **九十天保留清理**（:class:`RetentionCleanupDuty`）——调用数据库里的受限清理
-   函数回收到期内容（Issue #54 / S9）。
+   函数回收到期内容（Issue #54 / S9）；
+3. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天比对一次
+   已开通用户的花名册当前值与建档存档三字段，有差异就向管理群发一条脱敏日报
+   （Issue #52 / W4-B）。第三个职责是**条件注册**的，两个前置任缺其一就不注册：
+   群 ID 环境变量缺失（可选配置，见 :class:`SchedulerConfig`），或花名册读取传输
+   未接线（真实读取的凭据与 Base ID 属 L4a 前置，登记为 R3）。不注册时进程照常
+   启动、其余职责照常运行，并留下一条指名变量的审计（断言 ``V-花名册-29``）。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -37,12 +43,15 @@ import os
 import signal
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Any, Mapping, Protocol
 
 from lingxi.core.identity.credentials import AuthorizationGrant, CredentialAction, RefreshOutcome, decide_after_refresh
 from lingxi.core.identity.identifiers import redact_identifier
+from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
+from lingxi.core.identity.roster_report import render_daily_report
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +86,11 @@ class SchedulerConfig:
     feishu_app_secret: str = field(repr=False)
     feishu_base_url: str
     interval_seconds: int
+    # 管理群 chat_id。**可选**：没有它进程照常启动，只是不注册审计日报职责。
+    # 做成可选而不是必需，是因为它只服务三个职责中的一个——为一个尚未接线的职责
+    # 让整个 scheduler 起不来，会把「日报没配」升级成「凭据轮换也停了」。
+    # 配了但格式不对则**快速失败**：那是错配，不是未配，静默降级会让人以为在发日报。
+    admin_group_chat_id: str | None = None
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -86,6 +100,7 @@ class SchedulerConfig:
         "LINGXI_FEISHU_APP_SECRET",
         "LINGXI_FEISHU_BASE_URL",
         "LINGXI_SCHEDULER_INTERVAL_SECONDS",
+        "LINGXI_ADMIN_GROUP_CHAT_ID",
     )
 
     @classmethod
@@ -111,6 +126,15 @@ class SchedulerConfig:
         else:
             interval = DEFAULT_INTERVAL_SECONDS
 
+        raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
+        if raw_chat_id:
+            from lingxi.adapters.feishu_group_message import validate_group_chat_id
+
+            # 校验函数不回显取到的值，只报变量名与期望形状。
+            admin_group_chat_id: str | None = validate_group_chat_id(raw_chat_id)
+        else:
+            admin_group_chat_id = None
+
         return cls(
             postgres_dsn=_Secret(required("LINGXI_POSTGRES_DSN")),
             credential_key=_Secret(required("LINGXI_DELEGATED_CREDENTIAL_KEY")),
@@ -119,6 +143,7 @@ class SchedulerConfig:
             feishu_app_secret=_Secret(required("LINGXI_FEISHU_APP_SECRET")),
             feishu_base_url=(source.get("LINGXI_FEISHU_BASE_URL") or "").strip() or DEFAULT_FEISHU_BASE_URL,
             interval_seconds=interval,
+            admin_group_chat_id=admin_group_chat_id,
         )
 
 
@@ -300,6 +325,168 @@ class RetentionCleanupDuty:
         return report
 
 
+class AuditSink(Protocol):
+    """审计出口。
+
+    ``audit_event`` 表属 S9，尚未建立；当前实现写结构化日志。职责只依赖这个签名，
+    届时换实现不动职责代码。签名与 #57 网关侧的同名 Protocol 一致（结构化类型，
+    两边互相满足），合并后可收敛成一份，不需要现在跨切片耦合。
+    """
+
+    def record(self, action: str, /, **fields: object) -> None: ...
+
+
+class StructuredLogAuditSink:
+    """把审计动作写成一行结构化日志。
+
+    字段按**键名排序**输出：审计行会被比对和 grep，顺序随 ``PYTHONHASHSEED`` 变化的
+    日志没法稳定断言。本类原样输出收到的字段——「不带资料值」这条约束属于调用方，
+    对应断言 ``V-花名册-33`` 因此断在调用方产生的那几行上。
+    """
+
+    def record(self, action: str, /, **fields: object) -> None:
+        rendered = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+        logger.info("审计 action=%s %s", action, rendered)
+
+
+class _BaselineReader(Protocol):
+    def load_active_baseline(self) -> Sequence[ArchivedIdentity]: ...
+
+
+class _GroupSender(Protocol):
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
+
+
+class RosterAuditDuty:
+    """每日花名册资料比对与管理群审计日报（Issue #52 / W4-B）。
+
+    一轮做四件事：读比对基线 → 读花名册当前值 → 纯函数比对 → 有差异就发一条脱敏日报。
+    四件事里只有第一件碰数据库，而且**只读**（`V-花名册-14`）。
+
+    **同日至多一次**（`V-花名册-31`）。判重靠 ``_completed_on`` 这个进程内的日期水位：
+
+    - 单轮一次、同进程跨轮一次：由这个水位**硬保证**，与轮询周期无关；
+    - 跨重启：零新表定案下没有持久载体，新进程的水位是空的，因此**重启当日会重发一份
+      内容完全相同的日报**。这是产品负责人 2026-08-06 知情接受的残留（裁定 C2 / R2）：
+      A 方案下报告由「花名册现值 + 存档」唯一确定，补跑产出同一份，重复是噪声不是错误。
+      真幂等等 ``audit_event`` 表（S9）落地后再补。
+
+    水位在**发送成功之后**才置位。发送失败不算已发送，下一轮重试（`V-花名册-30`）。
+    空差异日也置位：那一天的审计已经记过了，重复记只是噪声（`V-花名册-25`）。
+
+    **重试与"不确定态"**。"发送失败就重试"这条规则有一个它自己看不见的缺口：HTTP
+    请求已经被飞书收下、而响应在回程超时的那一刻，进程拿到的是异常，事实却是消息已经
+    发出去了。重试于是重复投递一条日报。同一天的每一次发送——首次与全部重试——因此共用
+    一个去重键（当日 UTC 日期），由 :func:`~lingxi.adapters.feishu_group_message.delivery_uuid`
+    折成飞书的投递 `uuid` 交服务端去重。平台侧的去重窗口未经验证（属 L4a），所以这里
+    承诺的是"重试携带同一个 `uuid`"这个代码事实，不是"平台一定不会重复投递"。
+    """
+
+    name = "花名册审计日报"
+
+    def __init__(
+        self,
+        *,
+        baseline_reader: _BaselineReader,
+        roster_reader: Callable[[], Sequence[Mapping[str, object]]],
+        sender: _GroupSender,
+        audit: AuditSink,
+        chat_id: str,
+        clock: Callable[[], datetime] | None = None,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._baseline_reader = baseline_reader
+        self._roster_reader = roster_reader
+        self._sender = sender
+        self._audit = audit
+        self._chat_id = chat_id
+        # 时钟注入：跨轮判重的用例要能自己决定「今天」是哪天，不能靠等到明天。
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._stop = threading.Event() if stop is None else stop
+        self._completed_on: date | None = None
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def completed_on(self) -> date | None:
+        """已完成日报的那一天。``None`` 表示本进程实例今天还没发过。"""
+
+        return self._completed_on
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> RosterAuditReport | None:
+        """跑一轮。返回 ``None`` 表示本轮没有执行比对（停止中，或今天已经做完）。"""
+
+        if self._stop.is_set():
+            # 已经在停止中：一轮都不开。停止之后必须 0 次发送（`V-花名册-20`）。
+            return None
+        today = self._clock().date()
+        if self._completed_on == today:
+            return None
+
+        baseline = self._baseline_reader.load_active_baseline()
+        report = compare_roster(baseline, self._roster_reader())
+
+        if report.is_empty:
+            # 空差异日**不发日报**，只记一条审计。合同 :85 的语义是「通知待办」，
+            # 没有待办却每天发一条「今天没事」，会让管理群很快学会忽略这个通知。
+            self._audit.record(
+                "roster_audit.no_difference",
+                report_date=today.isoformat(),
+                examined=report.examined,
+            )
+            self._completed_on = today
+            return report
+
+        if self._stop.is_set():
+            # 停止信号落在读取阶段（读库 + 读花名册都可能耗时）。这里再看一次，
+            # 让这一轮成为**干净中断**：不发送、不置水位，什么都没发生。
+            # 停止之后必须 0 次发送（`V-花名册-20`），而入口处那一次检查挡不住
+            # "进来时还没停、读完才停"这条时序。重发由裁定 C2 的知情接受覆盖。
+            logger.info("停止信号在花名册读取期间到达，本轮不发送日报")
+            return report
+
+        text = render_daily_report(report, report_date=today)
+        try:
+            # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
+            # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
+            self._sender.send_text(chat_id=self._chat_id, text=text, dedupe_key=today.isoformat())
+        except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
+            # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
+            # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。
+            self._audit.record(
+                "roster_audit.send_failed",
+                report_date=today.isoformat(),
+                error=type(error).__name__,
+            )
+            logger.error("管理群审计日报发送失败，下一轮重试 error=%s", type(error).__name__)
+            return report
+
+        self._audit.record(
+            "roster_audit.report_sent",
+            report_date=today.isoformat(),
+            examined=report.examined,
+            entries=len(report.entries),
+            handover=report.handover_count,
+            removed=report.removed_count,
+            ambiguous=report.ambiguous_count,
+        )
+        self._completed_on = today
+        # 摘要只有计数。任何一个人的标识或资料值进日志，都等于绕过日报的脱敏口径。
+        logger.info(
+            "管理群审计日报已发送 已开通用户=%s 条目=%s 疑似转交=%s 花名册查无=%s",
+            report.examined,
+            len(report.entries),
+            report.handover_count,
+            report.removed_count,
+        )
+        return report
+
+
 class SchedulerLoop:
     """按同一周期驱动多个定时职责，并把它们的失败互相隔离。
 
@@ -397,12 +584,72 @@ def install_signal_handlers(loop: _Stoppable) -> None:
     signal.signal(signal.SIGINT, handle)
 
 
-def build_loop(config: SchedulerConfig) -> SchedulerLoop:
+def _build_roster_audit_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    roster_page_reader: Any | None,
+) -> RosterAuditDuty | None:
+    """装配审计日报职责；前置不齐就**不注册**并留下一条审计，返回 ``None``。
+
+    两个前置的顺序不能换：先看群 ID。两者都缺时也只记一条审计，`V-花名册-29`
+    要求「缺群 ID → 审计**恰 1 条**」。
+    """
+
+    if not config.admin_group_chat_id:
+        # 只报变量名，不回显任何值（`V-花名册-29`）。
+        audit.record(
+            "roster_audit.duty_not_registered",
+            reason="missing_environment_variable",
+            variable="LINGXI_ADMIN_GROUP_CHAT_ID",
+        )
+        logger.warning(
+            "未配置 LINGXI_ADMIN_GROUP_CHAT_ID，花名册审计日报职责不注册；其余定时职责照常运行"
+        )
+        return None
+    if roster_page_reader is None:
+        # 真实花名册读取的传输、凭据与 Base ID 属 L4a 前置（登记为 R3）。这里显式
+        # 不注册并留痕，而不是装一个每轮都炸的假读取——后者会把「还没接线」伪装成
+        # 「接线了但一直失败」。
+        audit.record("roster_audit.duty_not_registered", reason="roster_reader_unwired")
+        logger.warning("花名册读取传输未接线（真实读取属 L4a 前置），花名册审计日报职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+    from lingxi.adapters.feishu_roster_bitable import read_roster_records
+    from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+
+    return RosterAuditDuty(
+        baseline_reader=PostgresRosterBaselineReader(config.postgres_dsn),
+        roster_reader=lambda: read_roster_records(roster_page_reader),
+        sender=FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.feishu_app_id,
+            app_secret=config.feishu_app_secret,
+        ),
+        audit=audit,
+        chat_id=config.admin_group_chat_id,
+        stop=stop,
+    )
+
+
+def build_loop(
+    config: SchedulerConfig,
+    *,
+    roster_page_reader: Any | None = None,
+    audit: AuditSink | None = None,
+) -> SchedulerLoop:
     """装配进程的全部定时职责。
 
     职责顺序有意为之：凭据轮换在前。它处理的是一次性有效、有硬期限的凭据，
     而清理晚一轮没有任何后果——到期行下一轮照删，到期时间不会因为清理迟到而后移
-    （断言 V-保留-16）。
+    （断言 V-保留-16）。审计日报排在最后：它一天只做一次事，晚一轮毫无影响。
+
+    ``roster_page_reader`` 是花名册多维表格的分页读取传输
+    （:class:`lingxi.adapters.feishu_roster_bitable.RecordPageReader`）。**默认 ``None``，
+    因此当前部署下审计日报职责不会注册**——真实读取所需的凭据与 Base ID 属 L4a 前置，
+    本切片交付的是比对、渲染、发送与调度这四段，登记为 R3。
     """
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
@@ -411,6 +658,7 @@ def build_loop(config: SchedulerConfig) -> SchedulerLoop:
 
     # 一个停止标志贯穿所有职责：SIGTERM 只设它一次，全部职责同时停止领取新工作。
     stop = threading.Event()
+    sink = audit if audit is not None else StructuredLogAuditSink()
 
     rotation = CredentialRotationLoop(
         vault=HostFileDelegatedCredentialVault(config.postgres_dsn, config.credential_key, config.credential_path),
@@ -424,7 +672,14 @@ def build_loop(config: SchedulerConfig) -> SchedulerLoop:
     )
     cleanup = RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(config.postgres_dsn), stop=stop)
 
-    return SchedulerLoop(duties=(rotation, cleanup), interval_seconds=config.interval_seconds, stop=stop)
+    duties: list[Any] = [rotation, cleanup]
+    roster_audit = _build_roster_audit_duty(
+        config, stop=stop, audit=sink, roster_page_reader=roster_page_reader
+    )
+    if roster_audit is not None:
+        duties.append(roster_audit)
+
+    return SchedulerLoop(duties=tuple(duties), interval_seconds=config.interval_seconds, stop=stop)
 
 
 def main(argv: list[str] | None = None) -> int:
