@@ -34,7 +34,9 @@ def is_fast(path: str) -> bool:
 def classify(paths: list[str]) -> str:
     normalized = []
     for raw in paths:
-        path = raw.strip()
+        # Git 文件名允许空格与换行；不得 strip，否则 ` docs/x.md` 会被伪装成
+        # 安全的 docs/** 路径。NUL 分隔已经负责界定文件名边界。
+        path = raw
         if not path:
             continue
         normalized.append(path[2:] if path.startswith("./") else path)
