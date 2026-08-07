@@ -265,10 +265,22 @@ RESET SESSION AUTHORIZATION;
 
 ## 迁移脚本怎么进入部署制品
 
-**由镜像构建把 `migrations/` 与 `alembic.ini` 一并 `COPY` 进制品，[#62](https://github.com/Moshuiwang/lingxi/issues/62) 落地**
-（2026-08-06 裁定⑥，已列为 #62 的分派输入）。迁移作业不在生产机现场构建、不从仓库
-拉取，与业务进程用同一个镜像 tag，因此「镜像 tag 即冻结版本」对迁移同样成立。
-在 #62 落地之前，本仓库**没有**可用的自动化部署路径——这是已登记的缺口，不是遗漏。
+**已由镜像构建把 `migrations/` 与 `alembic.ini` 一并 `COPY` 进制品**（2026-08-06 裁定⑥，
+[#62](https://github.com/Moshuiwang/lingxi/issues/62) 落地）。迁移作业不在生产机现场构建、
+不从仓库拉取，与业务进程用同一个镜像 tag，因此「镜像 tag 即冻结版本」对迁移同样成立。
+
+落地形态（`Dockerfile` 的 `migrate` 目标，编排见 `deploy/README.md`）：
+
+- `alembic.ini` → `/opt/lingxi/alembic.ini`，`migrations/` → `/opt/lingxi/migrations/`；
+  `migrations/testing/` 由 `.dockerignore` 排除，不进制品（它不属于生产链）。
+- 入口是 `ENTRYPOINT ["python", "-m", "alembic", "-c", "/opt/lingxi/alembic.ini"]`，
+  **`-c` 写绝对路径**而不是靠工作目录兜底：`python -m alembic` 不带 `-c` 时要求 CWD 含
+  `alembic.ini`，调用方一旦换了工作目录就会找不到配置或找到别的配置。门禁用
+  `docker run -w / <migrate 镜像>` 实测这一点（断言 M2-62-22）。
+- 每次 CI 核对镜像里的 `alembic.ini` 与全部 revision 与提交**逐字节一致**，
+  见 `scripts/ci/verify_image_contract.sh`。
+- 迁移作业**不得配 restart 策略**：迁移失败必须停下来让人看见，自动重启只会把一次失败
+  变成反复撞墙并掩盖原因。
 
 依赖侧对应：`pyproject.toml` 的 `migrate` extra 直接声明两项——`alembic` 与
 `psycopg[binary]`。**驱动必须自己声明**：alembic 不依赖任何数据库驱动，驱动由 URL 的

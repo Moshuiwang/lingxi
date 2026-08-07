@@ -58,6 +58,15 @@ python3 scripts/ci/check_acceptance_matrix.py
 # 没有容器的环境里也照跑——这几类缺陷恰恰最容易在"本机没起容器"时溜过去。
 # 没装 alembic 时它明确失败而不是跳过。
 python3 scripts/ci/check_alembic_revisions.py
+# 断言 V-部署-08（Issue #62）：运行时依赖全部在 pyproject 声明、安全边界组件锁精确版本。
+# 这条断言此前被标为「已认领」却**没有执行脚本**（Issue #58 遗留），因此从未真正守住过。
+# 扫描覆盖**函数内的延迟导入**——本仓库的第三方 import 全都写在函数体里，
+# 只扫模块级等于没扫。
+python3 scripts/ci/check_runtime_dependencies.py
+# 部署编排的静态契约（Issue #62）：停止宽限期与源码常量联动、凭据路径落在持久卷、
+# 生产 compose 零构建定义、镜像 tag 不可变、非 root。刻意不依赖 docker 与 YAML 库，
+# 这样一台没装 docker 的开发机也能跑出与 CI 相同的结论。
+python3 scripts/ci/check_deploy_contract.py
 
 # 半开状态守卫：有容器却没有 DSN 时，Python 真库断言会静默跳过、门禁却照样绿。
 # 这种「看起来跑了真库」的假信心必须直接失败（PR #48 独立复查发现）。

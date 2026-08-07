@@ -1,0 +1,61 @@
+# `biai-stage` 覆盖（Issue #62 / S11）。与 deploy/compose.prod.yaml **结构完全相同**，
+# 只有配置值不同：env_file 指向哪个文件、卷叫什么名字、扫描间隔多长。
+#
+#   docker compose --env-file deploy/.env.stage \
+#     -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
+#
+# `--env-file` 不能省：`env_file:` 只把变量注入**容器**，不参与 compose 文件自身的
+# `${VAR:?}` 插值。省了它，compose 会说 LINGXI_IMAGE_REGISTRY 没设并直接退出。
+# 完整命令见 deploy/README.md（每一条都逐字执行验证过）。
+#
+# stage 连 `Bot-Test` 与独立测试数据库，**永不连 Bot-Prod 或生产库**
+# （验证与门禁「十三、测试数据与身份边界」）。
+#
+# ---------------------------------------------------------------------------
+# 凭据**按服务分文件**，不是三个服务共用一份（Issue #62 codex 审查 P1-1）。
+#
+# 上一版给三个服务挂同一个 env_file，于是 worker 也拿到了数据库连接串、Fernet 密钥
+# 与飞书应用密钥——它一个都不需要。这不是"多给了几个变量"那么轻：worker 跑的是
+# Claude Agent SDK，**SDK 会把自己的环境继承给 Claude CLI 子进程与各个 MCP 子进程**。
+# 也就是说那份共享 env 会一路流进模型执行环境和第三方 MCP 进程里，而那正是产品合同
+# 明令"凭据不进用户环境"要挡住的方向。
+#
+# 拆开之后每个服务只拿自己那份：
+#   .env.stage.scheduler  数据库 DSN、Fernet 密钥、飞书应用凭据
+#   .env.stage.gateway    飞书应用凭据 + 数据库 DSN（#57；不含 Fernet 密钥、不含模型凭据）
+#   .env.stage.worker     只有 LINGXI_WORKER_* 与模型端点凭据
+#   .env.stage.migrate    只有迁移 DSN（DDL 权限，业务进程不该有）
+# 四个文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；四个都必须 0600，
+# 核对步骤见 deploy/README.md 的 preflight。
+# ---------------------------------------------------------------------------
+
+services:
+  scheduler:
+    env_file:
+      - ./.env.stage.scheduler
+    environment:
+      # stage 扫得勤一些，便于受控验证时尽快观察到一轮扫描。
+      LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-30}
+    volumes:
+      - lingxi-credentials:/var/lib/lingxi/credentials
+
+  gateway:
+    env_file:
+      - ./.env.stage.gateway
+
+  worker:
+    env_file:
+      - ./.env.stage.worker
+    volumes:
+      - lingxi-users:/var/lib/lingxi/users
+
+  migrate:
+    env_file:
+      - ./.env.stage.migrate
+
+volumes:
+  # 具名卷带上环境前缀：同一台机器上万一并存两套编排，卷不会互相覆盖。
+  lingxi-credentials:
+    name: lingxi-stage-credentials
+  lingxi-users:
+    name: lingxi-stage-users

@@ -1,0 +1,207 @@
+# Lingxi 部署编排：共用结构（Issue #62 / S11）。
+#
+# 用法（stage 与生产**用同一份本文件**，只叠加各自的覆盖文件）：
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
+#   docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml  up -d
+#
+# 本文件**没有 `build:` 键，一个都没有**。生产只拉镜像、不构建（架构设计「八、部署与
+# 发布」）。这不是纪律而是机制：compose 里没有构建定义，`biplus-prod` 上就不存在
+# "顺手改一行再 build 一下"这条路径，镜像 tag 因此真的是被冻结的版本。
+#
+# ---------------------------------------------------------------------------
+# 常驻服务只有 scheduler。
+#
+# worker 与 migrate 都是**一次性作业**，放在 `job` profile 里：`docker compose up -d`
+# 不会启动它们，要显式 `docker compose run --rm <名字>`。这不是权宜之计，是当前事实：
+#   - worker 在 main 上是单回合 CLI（读 LINGXI_WORKER_* 跑一个回合、往 stdout 写一个
+#     JSON、退出）。它不领任务、不接飞书、不处理 SIGTERM。常驻 worker 需要任务队列与
+#     gateway 入队，属 S4 下半，不在本批。给它配 restart 策略会把"作业正常退出"变成
+#     无限重启循环，并让人误以为 worker 服务已经上线。
+#   - migrate 是部署时跑一次的迁移作业，不是进程。
+#
+# gateway（S4 前半，#57）落地时在这里**新增第三个 service**，与 scheduler 同型：
+# image 走同一套 tag 变量、同样非 root、同样 read_only、日志同样走 stdout。
+# 它需要的持久卷是 lingxi-users（用户环境目录），已在下方定义好，无需改动卷结构。
+
+name: lingxi
+
+# ---------------------------------------------------------------------------
+# 镜像引用：仓库与 tag 都来自环境变量，且都用 `:?` 形式——**没有默认值**。
+# 漏设变量时 compose 直接报错退出，而不是悄悄拉一个 `latest`。
+# tag 语义见 deploy/README.md：`<YYYYMMDD>-<commit sha 前 12 位>`，不可变、可回溯到源码。
+# ---------------------------------------------------------------------------
+
+services:
+  # 常驻服务：专用授权凭据（「四达文档会议助手」refresh_token）到期轮换扫描。
+  scheduler:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    restart: unless-stopped
+
+    # ---- 停止宽限期（断言 V-部署-03 / M2-62-24 / M2-62-25）--------------------
+    # Docker 默认 10 秒，**不满足**。SIGKILL 若落在"已经向飞书换过新凭据、尚未写回
+    # 数据库"的窗口里，那条 refresh_token 就永久丢失了——飞书侧旧凭据在续期成功那一刻
+    # 已作废，一次性有效，没有任何补救手段，只能人工重新授权。
+    #
+    # 150 秒的算法（三项相加再留余量）：
+    #   20.0s  续期 HTTP 超时     REQUEST_TIMEOUT_SECONDS，adapters/feishu_directory.py:33
+    #    4.2s  落盘重试退避等待   SAVE_RETRY_BACKOFF_SECONDS=(0.2,1.0,3.0)，apps/scheduler/__init__.py:41
+    #   55.0s  数据库往返预算     5 次操作（4 次 save 重试 + 1 次 revoke），
+    #                             每次 = connect_timeout 5s + statement_timeout 3s + 提交 3s
+    #   -----
+    #   79.2s  最坏情况 → ×1.5 安全系数 = 119s → 取整到 150s
+    #
+    # **上一版这里写的是 90 秒，而且算法是错的**（Issue #62 codex 审查 P1-3）：它只把
+    # `connect_timeout` 算进去，而 connect_timeout **只约束建连**，不约束已经发出去的
+    # SELECT / INSERT / commit。一条卡住的语句可以无限期挂着，于是"90 秒是上界"这个
+    # 声称根本不成立。真正的上界要靠 DSN 里的 `statement_timeout` 与 `lock_timeout`
+    # 一起给出——它们是配置层的东西，不需要改 src/。deploy/.env.example 因此把这三个
+    # 参数一并列为必填，`check_deploy_contract.py` 会核对示例 DSN 真的带了它们，
+    # 否则这段算法就只是一段好看的注释。
+    #
+    # **这个不等式由 scripts/ci/check_deploy_contract.py 自动守住，不是靠这段注释。**
+    # 改了 REQUEST_TIMEOUT_SECONDS 而不改这里，门禁会红（断言 M2-62-25）。
+    stop_grace_period: 150s
+
+    # ---- 容器权限最小化（断言 V-部署-07 / M2-62-29 / M2-62-30）----------------
+    # 镜像里已经 USER 10001，这里再写一遍是为了让 compose 层面可核对，也防止将来有人
+    # 用覆盖文件把它改回 root 而无人察觉。无 cap_add、无 privileged。
+    user: "10001:10001"
+    read_only: true
+    # read_only 之后进程仍需要一处可写的临时目录（Python 的 tempfile 默认位置）。
+    # 给 tmpfs 而不是放开 rootfs：它随容器消失，天然满足"除用户环境目录外不写
+    # 需要持久化的本地状态"（断言 V-部署-02）。
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+
+    # ---- 日志（断言 V-部署-04）-----------------------------------------------
+    # 进程只往 stdout / stderr 写，不写日志文件、不自行轮转（apps/scheduler 的
+    # logging.basicConfig(stream=sys.stdout)）。轮转交给 Docker 的日志驱动。
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # ---- 配置与凭据 -----------------------------------------------------------
+    # 凭据一律走 env_file，且那个文件**不在版本库里**（见各覆盖文件与 .gitignore）。
+    # 这里只放非机密的默认值。
+    environment:
+      # 凭据文件必须落在**持久卷**里（断言 V-部署-03 / M2-62-27）。指向容器本地路径
+      # 会让每次镜像替换都丢失授权——而这个后果要到下一次轮换才暴露。
+      LINGXI_DELEGATED_CREDENTIAL_PATH: /var/lib/lingxi/credentials/delegated_credential.enc
+      LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
+
+    volumes:
+      # 专用授权凭据：跨部署持久，镜像替换与重启不得丢失。
+      - lingxi-credentials:/var/lib/lingxi/credentials
+
+  # 飞书长连接接入：收事件、落库成任务（#57 / S4 前半）。
+  #
+  # ---- 为什么放在**非默认 profile** 里 ----------------------------------------
+  # **gateway 不能单独上线。** 它把任务写进队列，而队列此刻**没有消费者**：main 上的
+  # worker 是单回合 CLI（读环境变量跑一个回合就退出），不领任务。启用 gateway 等于
+  # 开始接收真实用户消息、把它们排进一个没人处理的队列——用户看到的是"发了没反应"，
+  # 比不接入更糟。
+  #
+  # 因此 `docker compose up -d` **不会**启动它；要启动必须显式
+  # `--profile gateway`。S4 下半（常驻 worker 与任务领取）接线之后，把这一行
+  # profiles 删掉即可转为默认服务，届时它与 scheduler 同型。
+  # 这与 #57 的登记一致：组件已交付，尚未接线。
+  gateway:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["gateway"]
+    restart: unless-stopped
+
+    # ---- 停止宽限期（断言 V-部署-03，#57 同型认领）---------------------------
+    # 收到 SIGTERM 后停止接收新事件、把在途事件**落库完成**再退出。中途被 SIGKILL
+    # 会留下"抢占了话题但任务没写进去"的中间态——用户发了消息、系统记得占了坑、
+    # 却没有任何任务在跑。
+    #
+    # 60 秒的算法（全部来自 gateway 自己的配置，不是拍脑袋）：
+    #   20.0s  停机超时       LINGXI_GATEWAY_SHUTDOWN_TIMEOUT_SECONDS 默认值，
+    #                         apps/gateway/config.py 的 load_config
+    #    5.0s  出站 HTTP 超时 apps/gateway/__init__.py 取 shutdown_timeout / 4
+    #   11.0s  数据库往返预算 一个在途事件事务，按与 scheduler 同一口径
+    #                         （connect 5s + 语句 3s + 提交 3s）
+    #   -----
+    #   36.0s  最坏情况 → ×1.5 安全系数 = 54s → 取整到 60s
+    #
+    # 与 scheduler 那条一样，这个不等式由 scripts/ci/check_deploy_contract.py 守住：
+    # 改了 SHUTDOWN_TIMEOUT_SECONDS 的默认值而不改这里，门禁会红。
+    stop_grace_period: 60s
+
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # 不挂任何持久卷：gateway 的状态全部在数据库里，容器内不写需要持久化的东西
+    # （断言 V-部署-02）。凭据走 env_file，见各环境的覆盖文件。
+
+  # 一次性作业：单回合受控执行。`docker compose run --rm worker`
+  #
+  # **不是常驻服务**，因此没有 restart 策略、没有 stop_grace_period、没有 healthcheck。
+  # 它跑完一个回合就退出，退出码 0/2/3/4/5 是调用方的判定依据。
+  worker:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["job"]
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    # 镜像把 HOME 指到 /tmp，Claude Code CLI 与 MCP 子进程要往那里写配置与会话，
+    # 因此给得比另外两个服务大。
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes:
+      # 用户环境目录：与凭据**不同的卷**（断言 M2-62-28）。用户产物与会话在这里，
+      # 备份周期、恢复策略与删除语义都与凭据不同，合成一个卷会让两者无法分别处置。
+      - lingxi-users:/var/lib/lingxi/users
+
+  # 一次性作业：数据库迁移。`docker compose run --rm migrate`
+  #
+  # 镜像的 ENTRYPOINT 已经是 `python -m alembic -c /opt/lingxi/alembic.ini`，
+  # 默认 CMD 是 `upgrade head`。要跑别的子命令直接追加参数：
+  #   docker compose ... run --rm migrate current
+  #   docker compose ... run --rm migrate stamp 20260806_baseline
+  #
+  # **不得配 restart 策略**（断言 M2-62-23）：迁移失败必须停下来让人看见。自动重启会
+  # 把一次失败的迁移变成一个反复撞墙的循环，并掩盖真正的失败原因。
+  migrate:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-migrate:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["job"]
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # LINGXI_MIGRATION_DSN 与业务的 LINGXI_POSTGRES_DSN 是**两个变量**，迁移不回落到
+    # 后者：迁移要 DDL 权限、业务进程不要，两者本就该是不同的数据库角色
+    # （migrations/README.md，断言 V-迁移-05）。它只在覆盖文件的 env_file 里出现。
+
+volumes:
+  # 两个卷的实际名字由覆盖文件指定（stage 与生产各一套），这里只定义结构。
+  lingxi-credentials:
+  lingxi-users:
