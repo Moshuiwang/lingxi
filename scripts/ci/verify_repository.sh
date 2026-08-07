@@ -50,7 +50,7 @@ printf 'ShellCheck：通过（%s）\n' "$(shellcheck --version | sed -n 's/^vers
 
 python3 scripts/ci/check_markdown_links.py
 python3 scripts/ci/check_project_skills.py
-# 验收矩阵的三态状态列与合同条款覆盖清单（门禁 10.1 / 10.3）。这两样此前只是散文约定：
+# 验收矩阵的三态状态列与合同条款覆盖清单。这两样此前只是散文约定：
 # 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
 python3 scripts/ci/check_acceptance_matrix.py
 # alembic revision 链的结构性约束（Issue #53）：head 唯一、无孤儿 revision、

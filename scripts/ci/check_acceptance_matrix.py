@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""校验验收矩阵的状态列与合同条款覆盖清单（见 docs/技术设计/验证与门禁.md 的 10.1 / 10.3）。
+"""校验验收矩阵的状态列与合同条款覆盖清单（见 docs/技术设计/验收矩阵.md）。
 
 只读两份 Markdown，不访问网络、不依赖标准库以外的东西。它挡的是两类**沉默**的漏洞：
 
@@ -18,10 +18,10 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-GATE_DOCUMENT = REPOSITORY_ROOT / "docs" / "技术设计" / "验证与门禁.md"
+MATRIX_DOCUMENT = REPOSITORY_ROOT / "docs" / "技术设计" / "验收矩阵.md"
 CONTRACT_DOCUMENT = REPOSITORY_ROOT / "docs" / "产品合同与外部边界.md"
 
-# 10.1 定义的三态。状态列只允许这三个词，多一个同义词就等于多一套不受检查的语义。
+# 验收矩阵定义的三态。状态列只允许这三个词，多一个同义词就等于多一套不受检查的语义。
 ASSERTION_STATES = ("未认领", "已认领", "已验证")
 MATRIX_HEADER = ("#", "可验证断言", "层级", "状态")
 COVERAGE_HEADER = ("合同章节", "对应断言", "说明")
@@ -58,7 +58,7 @@ def is_table_row(line: str) -> bool:
 def iter_tables(text: str):
     """产出 (表头 tuple, 行号, 单元格 list)，自动跳过围栏代码块。
 
-    10.2 的 Issue 正文模板里就有一张示例矩阵（状态写的是"待实现"），它在围栏里，
+    文档里的 Issue 正文模板可能包含示例矩阵，它在围栏里，
     是文档示例不是登记表——不跳过围栏，这份检查从第一次运行就会误报。
     """
     header: tuple[str, ...] | None = None
@@ -243,11 +243,11 @@ def cross_check(
 
 
 def main() -> int:
-    gate_text = GATE_DOCUMENT.read_text(encoding="utf-8")
+    matrix_text = MATRIX_DOCUMENT.read_text(encoding="utf-8")
     contract_text = CONTRACT_DOCUMENT.read_text(encoding="utf-8")
 
-    statuses, failures = parse_matrix(gate_text)
-    coverage, coverage_errors = parse_coverage(gate_text)
+    statuses, failures = parse_matrix(matrix_text)
+    coverage, coverage_errors = parse_coverage(matrix_text)
     failures = failures + coverage_errors
     sections = contract_sections(contract_text)
     failures = failures + cross_check(statuses, coverage, sections)

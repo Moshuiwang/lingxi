@@ -231,8 +231,8 @@ class RealDocumentTest(unittest.TestCase):
         self.assertIn("验收矩阵状态列：通过", stdout.getvalue())
         self.assertIn("合同条款覆盖清单：通过", stdout.getvalue())
 
-    def test_every_assertion_in_the_gate_document_has_a_state(self) -> None:
-        statuses, errors = CHECK.parse_matrix(CHECK.GATE_DOCUMENT.read_text(encoding="utf-8"))
+    def test_every_assertion_in_the_matrix_document_has_a_state(self) -> None:
+        statuses, errors = CHECK.parse_matrix(CHECK.MATRIX_DOCUMENT.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
         self.assertGreater(len(statuses), 100)
         self.assertEqual(set(statuses.values()) - set(CHECK.ASSERTION_STATES), set())
