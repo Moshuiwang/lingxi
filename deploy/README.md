@@ -48,16 +48,17 @@ S4 下半（常驻 worker 与任务领取）接线之后，删掉 `compose.yaml`
 
 ## 准备
 
-一个环境要**四个**文件，不是一个：
+一个环境要**五个**文件，不是一个：
 
 ```bash
 cp deploy/.env.example deploy/.env.stage             # 只放 LINGXI_IMAGE_REGISTRY / LINGXI_IMAGE_TAG
 $EDITOR deploy/.env.stage.scheduler                  # 数据库 DSN、Fernet 密钥、飞书应用凭据
+$EDITOR deploy/.env.stage.gateway                    # 飞书应用凭据 + 数据库 DSN（#57）
 $EDITOR deploy/.env.stage.worker                     # 只有 LINGXI_WORKER_* 与模型端点凭据
 $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 ```
 
-四个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
+五个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
 **为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
 
@@ -69,12 +70,13 @@ $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 
 代码框架「横切约定」要求凭据不进代码、日志、数据库、用户环境，长期凭据放操作系统级密钥管理。本批用文件注入，因此**文件权限就是这条边界的全部**——一个 0644 的 env 文件等于把生产数据库口令、Fernet 密钥和飞书应用密钥摊给机器上任何一个账号。
 
-四个文件都必须 **0600 且属主为部署用户**。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
+五个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway` 装的是飞书应用密钥与数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
 
 ```bash
 umask 077
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.scheduler
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.gateway
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
 # 然后再往里写内容
@@ -83,11 +85,22 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
 `up` 之前逐条核对，任一不符就停下：
 
 ```bash
-for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.worker deploy/.env.stage.migrate; do
+# stage
+for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway \
+         deploy/.env.stage.worker deploy/.env.stage.migrate; do
+  stat -c '%n %a %U' "$f"
+done
+
+# 生产（同型，把 stage 换成 prod）
+for f in deploy/.env.prod deploy/.env.prod.scheduler deploy/.env.prod.gateway \
+         deploy/.env.prod.worker deploy/.env.prod.migrate; do
   stat -c '%n %a %U' "$f"
 done
 # 期望每行都是 `<文件> 600 <部署用户>`
 ```
+
+> `.env.<环境>.gateway` 最初漏在这份清单外（#62 终核 P2）。它装飞书应用密钥与数据库 DSN，
+> 漏掉它等于把这份凭据留在 README 自己定义的权限边界之外——而这一节的全部意义就是那条边界。
 
 > **登记：长期凭据迁移到操作系统级密钥管理**（Docker secrets / systemd credentials / 云托管密钥服务）尚未落地，本批只立机制与边界，不做真实部署。迁移方案与执行窗口随 stage `[ops]` Issue 决定。在那之前，文件权限是唯一的保护，因此上面这一步不是建议而是前置条件。
 

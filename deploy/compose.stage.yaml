@@ -22,9 +22,11 @@
 #
 # 拆开之后每个服务只拿自己那份：
 #   .env.stage.scheduler  数据库 DSN、Fernet 密钥、飞书应用凭据
+#   .env.stage.gateway    飞书应用凭据 + 数据库 DSN（#57；不含 Fernet 密钥、不含模型凭据）
 #   .env.stage.worker     只有 LINGXI_WORKER_* 与模型端点凭据
 #   .env.stage.migrate    只有迁移 DSN（DDL 权限，业务进程不该有）
-# 三个文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库。
+# 四个文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；四个都必须 0600，
+# 核对步骤见 deploy/README.md 的 preflight。
 # ---------------------------------------------------------------------------
 
 services:
