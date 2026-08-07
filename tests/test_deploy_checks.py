@@ -333,12 +333,20 @@ class PublishJobGuardTest(unittest.TestCase):
             branches: [main]
           workflow_call:
         jobs:
+          classify:
+          docs:
+            name: Epic Full / docs
+            if: needs.classify.outputs.mode == 'docs'
+            steps:
+              - run: scripts/ci/verify_docs.sh
+          gate:
+            if: needs.classify.outputs.mode != 'docs'
           extras:
             strategy:
               matrix:
                 extra: [scheduler, worker, gateway, bot-test, migrate]
           candidate:
-            needs: [gate, extras, image]
+            needs: [classify, docs, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
               - uses: actions/upload-artifact@sha
@@ -423,7 +431,9 @@ class PublishJobGuardTest(unittest.TestCase):
         self.assertTrue(any("不得重复验收" in failure for failure in failures), failures)
 
     def test_candidate_must_need_all_full_legs(self) -> None:
-        full = self.FULL.replace("needs: [gate, extras, image]", "needs: [gate, extras]")
+        full = self.FULL.replace(
+            "needs: [classify, docs, gate, extras, image]", "needs: [classify, docs, gate, extras]"
+        )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("candidate needs" in failure for failure in failures), failures)
 

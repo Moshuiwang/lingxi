@@ -9,6 +9,8 @@ on:
     paths:
       - '**.md'
       - 'docs/**'
+      - 'AGENTS.md'
+      - 'README.md'
   workflow_dispatch:
 
 permissions:

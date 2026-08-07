@@ -17,8 +17,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 面向 main 的纯文档 PR 不需要真库、extras 或镜像回归；但仍产出稳定的
+  # `Epic Full` required check。复用 Story 的路径分类器，避免在两处维护“什么是文档”。
+  # workflow_call / 手动运行一律走完整门禁，只有 main PR 才允许此轻量分支。
+  classify:
+    name: Epic / classify
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      mode: ${{ steps.changes.outputs.mode }}
+    steps:
+      - name: 检出代码与比较基线
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 路由改动
+        id: changes
+        run: |
+          python3 scripts/ci/classify_story_changes.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+  docs:
+    name: Epic Full / docs
+    needs: [classify]
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && needs.classify.outputs.mode == 'docs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 运行文档门禁
+        run: scripts/ci/verify_docs.sh
+
   gate:
     name: Epic Full / gate
+    needs: [classify]
+    if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
     runs-on: ubuntu-24.04
     # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
     # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
@@ -126,6 +168,8 @@ jobs:
   # 带 --process 的退出 1。
   extras:
     name: Epic Full / extras (${{ matrix.extra }})
+    needs: [classify]
+    if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
     runs-on: ubuntu-24.04
     # 同一次波动里 bot-test 腿也曾 5 分钟触顶；migrate 腿在争抢下实测过 4m32s。
     # 每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且仍能挡住真正的挂死。
@@ -189,7 +233,8 @@ jobs:
   image:
     name: Epic Full / image
     runs-on: ubuntu-24.04
-    needs: [gate, extras]
+    needs: [classify, gate, extras]
+    if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
     timeout-minutes: 45
     # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
     # 同仓分支的 PR job 会**照样拿到**这里声明的令牌——于是一个被改造过的 workflow
@@ -305,23 +350,37 @@ jobs:
         working-directory: build-a
         run: scripts/ci/verify_compose_structure.sh
 
-  # required check 只认这个稳定名称。它不会重新跑检查，而是要求 gate、五组 extras、
-  # 四镜像双构建全部成功，并为 PR 留下一份带树摘要的候选证明。main Publish 只接受
-  # 与这份证明内容相同的合并树；因此合并后无需再跑一遍完整门禁。
+  # required check 只认这个稳定名称。main 的纯文档 PR 只要求分类器和文档校验；
+  # 其余 PR 要求 gate、五组 extras、四镜像双构建全部成功，并留下一份带树摘要的
+  # 候选证明。main Publish 只接受与该证明相同的合并树；因此合并后无需再跑一遍完整门禁。
   candidate:
     name: Epic Full
     runs-on: ubuntu-24.04
     if: always()
-    needs: [gate, extras, image]
+    needs: [classify, docs, gate, extras, image]
     timeout-minutes: 3
 
     steps:
       - name: 确认完整门禁全部通过
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MODE: ${{ needs.classify.outputs.mode }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
           GATE_RESULT: ${{ needs.gate.result }}
           EXTRAS_RESULT: ${{ needs.extras.result }}
           IMAGE_RESULT: ${{ needs.image.result }}
         run: |
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] && [ "${MODE}" = docs ]; then
+            if [ "${CLASSIFY_RESULT}" != success ] || [ "${DOCS_RESULT}" != success ]; then
+              printf '纯文档候选未通过：classify=%s docs=%s\n' \
+                "${CLASSIFY_RESULT}" "${DOCS_RESULT}" >&2
+              exit 1
+            fi
+            echo 'Epic 纯文档候选：文档门禁通过；不运行真库、extras 或镜像构建'
+            exit 0
+          fi
           if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ] || [ "${IMAGE_RESULT}" != success ]; then
             printf 'Epic 候选未冻结：gate=%s extras=%s image=%s\n' \
               "${GATE_RESULT}" "${EXTRAS_RESULT}" "${IMAGE_RESULT}" >&2
@@ -330,13 +389,13 @@ jobs:
           echo 'Epic 候选完整门禁：全部通过'
 
       - name: 检出代码
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: 写入候选身份
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs')
         run: |
           python3 scripts/ci/write_epic_candidate.py \
             --repository "${GITHUB_REPOSITORY}" \
@@ -348,7 +407,7 @@ jobs:
             --output "${RUNNER_TEMP}/epic-candidate/candidate.json"
 
       - name: 留存候选证明
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: epic-candidate-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
