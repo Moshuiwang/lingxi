@@ -641,7 +641,7 @@ def check_ci_workflow() -> list[str]:
     else:
         candidate = candidate_match.group(1)
         needs = re.search(r"^\s*needs:\s*\[([^\]]*)\]", candidate, re.MULTILINE)
-        required = {"gate", "extras", "image"}
+        required = {"classify", "docs", "gate", "extras", "image"}
         actual = {item.strip() for item in needs.group(1).split(",")} if needs else set()
         if actual != required:
             failures.append(
@@ -650,6 +650,17 @@ def check_ci_workflow() -> list[str]:
         for marker in ("write_epic_candidate.py", "upload-artifact@"):
             if marker not in candidate:
                 failures.append(f"ci.yml candidate 缺少 `{marker}`，main 无法回读候选身份。")
+
+    # 纯文档 main PR 的稳定 required check 仍叫 Epic Full，但不得启动真库、extras
+    # 或镜像构建。遗漏这些标记会让文档改动又悄悄退化为完整回归。
+    for marker in (
+        "name: Epic Full / docs",
+        "scripts/ci/verify_docs.sh",
+        "needs.classify.outputs.mode == 'docs'",
+        "needs.classify.outputs.mode != 'docs'",
+    ):
+        if marker not in full:
+            failures.append(f"ci.yml 缺少纯文档轻量 Epic 路由标记 `{marker}`。")
 
     for marker in ("'epic/**'", "classify_story_changes.py", "verify_docs.sh", "uses: ./.github/workflows/ci.yml", "name: Story Fast"):
         if marker not in story:
