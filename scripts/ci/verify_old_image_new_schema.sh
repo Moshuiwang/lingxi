@@ -41,6 +41,18 @@ done
 scheduler_image=${scheduler_image:-lingxi-scheduler:probe}
 migrate_image=${migrate_image:-lingxi-migrate:probe}
 
+# 与 verify_image_contract.sh 同款的前置存在性检查（PR #78 的 CI 首跑教训）：
+# `:probe` 默认值是本机便利，同时是个陷阱——调用方少传参数时会默默回落到一个
+# "本机碰巧有、CI 上从来没有"的 tag，然后在跑到一半时炸出一句看不懂的
+# `No such object`。开跑就说清楚缺什么。
+for pair in "scheduler:${scheduler_image}" "migrate:${migrate_image}"; do
+  if ! docker image inspect "${pair#*:}" >/dev/null 2>&1; then
+    printf '缺少 %s 镜像：%s（本机不存在）\n' "${pair%%:*}" "${pair#*:}" >&2
+    printf '用法：%s <scheduler 引用> <migrate 引用> [--destructive]\n' "$0" >&2
+    exit 2
+  fi
+done
+
 # 端口避开本仓库其它受控测试占用的 15433 / 15436 / 15437 / 15438。
 port=${LINGXI_DEMO_PGPORT:-15440}
 container=lingxi62-vd05-pg

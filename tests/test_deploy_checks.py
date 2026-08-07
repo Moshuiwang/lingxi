@@ -409,6 +409,33 @@ class RealWorkflowTest(unittest.TestCase):
     而 publish needs 着 image——整条发布路径被自己堵死。
     """
 
+    def test_contract_check_is_invoked_with_every_image(self) -> None:
+        """ci.yml 必须把**四个**镜像都传给契约检查（PR #78 的 CI 首跑缺陷）。
+
+        少传一个时脚本会回落到 `:probe` 默认值——一个"本机碰巧有、CI 上从来没有"的
+        tag，于是 CI 跑到一半炸出 `No such object: lingxi-gateway:probe`，而本机因为
+        留着验收用的 :probe 镜像，同一份脚本全绿。**本机残留掩盖了参数缺失。**
+
+        这条断言直接盯住调用点：新增服务却忘了加进这一行，会在门禁上变红。
+        """
+
+        text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        index = text.index("verify_image_contract.sh")
+        invocation = text[index:index + 400]
+        # 取到该命令的结尾（下一个不以续行符结尾的行）
+        lines = []
+        for line in invocation.splitlines()[:6]:
+            lines.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        joined = " ".join(lines)
+        for service in ("scheduler", "worker", "migrate", "gateway"):
+            self.assertIn(
+                f"lingxi-{service}:build-a", joined,
+                f"ci.yml 调用 verify_image_contract.sh 时漏了 {service}；"
+                "脚本会回落到 :probe 默认值，CI 上不存在",
+            )
+
     def test_both_build_legs_use_the_same_script(self) -> None:
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
         image_job = text[text.index("  image:"):text.index("  publish:")]

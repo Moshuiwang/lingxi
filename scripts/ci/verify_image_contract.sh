@@ -19,6 +19,30 @@ worker_image=${2:-lingxi-worker:probe}
 migrate_image=${3:-lingxi-migrate:probe}
 gateway_image=${4:-lingxi-gateway:probe}
 
+# **四个镜像必须先都存在**，否则立刻停下并说清楚缺哪个。
+#
+# 默认值里的 `:probe` 是本机开发的便利，但它同时是个陷阱：调用方少传一个参数时，
+# 脚本会默默回落到一个"本机碰巧有、CI 上从来没有"的 tag。PR #78 的 CI 首跑正是
+# 这么失败的——ci.yml 只传了三个参数，gateway 落到 `:probe`，在第 1 步中途炸出一句
+# `No such object: lingxi-gateway:probe`；而本机因为留着验收用的 :probe 镜像，
+# 同一份脚本全绿。**本机的残留镜像掩盖了参数缺失。**
+#
+# 前置存在性检查把这类失败从"跑到一半炸一句看不懂的话"变成"开跑就说清楚缺什么"。
+missing=0
+for pair in "scheduler:${scheduler_image}" "worker:${worker_image}" \
+            "migrate:${migrate_image}" "gateway:${gateway_image}"; do
+  name=${pair%%:*}; image=${pair#*:}
+  if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    printf '  缺少 %s 镜像：%s（本机不存在）\n' "${name}" "${image}" >&2
+    missing=$((missing + 1))
+  fi
+done
+if [[ "${missing}" -gt 0 ]]; then
+  printf '\n用法：%s <scheduler 引用> <worker 引用> <migrate 引用> <gateway 引用>\n' "$0" >&2
+  printf '四个参数都要显式传；省略时的 :probe 默认值只适用于本机构建过的情况。\n' >&2
+  exit 2
+fi
+
 failures=0
 note() { printf '  %s\n' "$1"; }
 fail() { printf '  判否：%s\n' "$1" >&2; failures=$((failures + 1)); }

@@ -311,7 +311,8 @@ jobs:
         working-directory: build-a
         run: |
           scripts/ci/verify_image_contract.sh \
-            lingxi-scheduler:build-a lingxi-worker:build-a lingxi-migrate:build-a
+            lingxi-scheduler:build-a lingxi-worker:build-a \
+            lingxi-migrate:build-a lingxi-gateway:build-a
 
       # 断言 V-部署-05 的本地演法（编排者裁定①）：真库升到 head，追加一条合成的
       # 前滚迁移，再用**迁移前构建的镜像**启动 scheduler 跑完一轮并优雅退出。
