@@ -44,6 +44,7 @@ REQUIRED_MODULES = (
     "lingxi.config",
     "lingxi.config.content",
     "lingxi.core",
+    "lingxi.core.alerting",
     "lingxi.core.conversation",
     "lingxi.core.execution",
     "lingxi.core.identity",
@@ -182,6 +183,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
+            "lingxi.core.alerting",
             "lingxi.core.ids",
         ),
         # 第三方那一列没变：群发适配走标准库 urllib（同 adapters/feishu_directory.py），

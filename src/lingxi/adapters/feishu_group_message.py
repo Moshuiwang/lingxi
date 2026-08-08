@@ -39,6 +39,7 @@ GROUP_CHAT_ID_PREFIX = "oc_"
 # 对重复请求去重。长度上限 50，这里的取值恒为 14 + 32 = 46。
 DELIVERY_UUID_PREFIX = "lingxi-roster-"
 DELIVERY_UUID_MAX_LENGTH = 50
+SendOutcomeCallback = Callable[[str, bool], None]
 
 
 def delivery_uuid(chat_id: str, dedupe_key: str) -> str:
@@ -116,11 +117,27 @@ class FeishuGroupMessages:
         app_id: str,
         app_secret: str,
         transport: Callable[..., Any] | None = None,
+        on_send_outcome: SendOutcomeCallback | None = None,
     ) -> None:
         self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
         self._transport: Callable[..., Any] = transport or urllib_transport
+        self._on_send_outcome = on_send_outcome
+
+    def _notify_send(self, operation: str, succeeded: bool) -> None:
+        """把结果交给告警逻辑；告警回调失败不能改变发送语义。"""
+
+        if self._on_send_outcome is None:
+            return
+        try:
+            self._on_send_outcome(operation, succeeded)
+        except Exception as error:  # noqa: BLE001 - 观察者不是发送链路的一部分
+            logger.error(
+                "飞书发送结果观察失败，发送结果不变 operation=%s error=%s",
+                operation,
+                type(error).__name__,
+            )
 
     def _tenant_access_token(self) -> str:
         """取应用身份令牌。每次发送现取：日报一天一次，缓存换不来任何东西，
@@ -155,24 +172,29 @@ class FeishuGroupMessages:
         取令牌那一步没有 `uuid`：它是幂等的读操作，重复取令牌不产生任何用户可见后果。
         """
 
-        token = self._tenant_access_token()
-        response = self._transport(
-            "POST",
-            f"{self._base_url}/im/v1/messages?receive_id_type=chat_id",
-            body={
-                "receive_id": chat_id,
-                "msg_type": "text",
-                # 飞书把 content 定义成一段 **JSON 字符串**，不是对象。
-                "content": json.dumps({"text": text}, ensure_ascii=False),
-                "uuid": delivery_uuid(chat_id, dedupe_key),
-            },
-            token=token,
-        )
-        if not isinstance(response, Mapping):
-            raise FeishuGroupMessageError("invalid_response_shape")
-        code = response.get("code")
-        if code not in (None, 0, "0"):
-            raise FeishuGroupMessageError(f"feishu_code_{code}")
+        try:
+            token = self._tenant_access_token()
+            response = self._transport(
+                "POST",
+                f"{self._base_url}/im/v1/messages?receive_id_type=chat_id",
+                body={
+                    "receive_id": chat_id,
+                    "msg_type": "text",
+                    # 飞书把 content 定义成一段 **JSON 字符串**，不是对象。
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                    "uuid": delivery_uuid(chat_id, dedupe_key),
+                },
+                token=token,
+            )
+            if not isinstance(response, Mapping):
+                raise FeishuGroupMessageError("invalid_response_shape")
+            code = response.get("code")
+            if code not in (None, 0, "0"):
+                raise FeishuGroupMessageError(f"feishu_code_{code}")
+        except Exception:
+            self._notify_send("message_final", False)
+            raise
+        self._notify_send("message_final", True)
         # 只记「发过了」。群 ID 与日报正文都不进日志：正文虽已脱敏，但它是给管理群的，
         # 不是给运维日志的（`V-花名册-33`）。
         logger.info("管理群通知已发送 字符数=%s", len(text))

@@ -126,6 +126,7 @@ def build_supervisor(
     transport: Any = None,
     should_stop: Callable[[], bool] | None = None,
     onboarding: OnboardingRunner | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
@@ -183,6 +184,7 @@ def build_supervisor(
             ceiling_seconds=config.reconnect_ceiling_seconds,
         ),
         audit=audit.record,
+        heartbeat=heartbeat,
     )
 
 
