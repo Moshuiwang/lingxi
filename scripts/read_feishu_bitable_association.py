@@ -18,6 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.feishu_bitable_association import analyze_association
 
 
@@ -98,35 +99,34 @@ def _page_items(stage: str, path: str, token: str, item_key: str) -> list[dict[s
 
 def _read_latest_snapshot(dsn: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     try:
-        import psycopg
+        with connect(dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, completed_at, expires_at, member_count "
+                "FROM feishu_org_sync_run WHERE status = 'complete' "
+                "ORDER BY completed_at DESC LIMIT 1"
+            )
+            run = cursor.fetchone()
+            if run is None:
+                raise BitableReadError("snapshot", "complete_run_missing")
+            run_id, completed_at, expires_at, member_count = run
+            cursor.execute(
+                "SELECT tenant_key, name, open_id, user_id, union_id, union_user_id "
+                "FROM feishu_org_member_snapshot WHERE sync_run_id = %s",
+                (run_id,),
+            )
+            rows = [
+                {
+                    "tenant_key": tenant_key,
+                    "name": name,
+                    "open_id": open_id,
+                    "user_id": user_id,
+                    "union_id": union_id,
+                    "union_user_id": union_user_id,
+                }
+                for tenant_key, name, open_id, user_id, union_id, union_user_id in cursor.fetchall()
+            ]
     except ImportError as error:  # pragma: no cover - controlled runtime dependency
         raise BitableReadError("snapshot", "psycopg_missing") from error
-    with psycopg.connect(dsn) as connection, connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT id, completed_at, expires_at, member_count "
-            "FROM feishu_org_sync_run WHERE status = 'complete' "
-            "ORDER BY completed_at DESC LIMIT 1"
-        )
-        run = cursor.fetchone()
-        if run is None:
-            raise BitableReadError("snapshot", "complete_run_missing")
-        run_id, completed_at, expires_at, member_count = run
-        cursor.execute(
-            "SELECT tenant_key, name, open_id, user_id, union_id, union_user_id "
-            "FROM feishu_org_member_snapshot WHERE sync_run_id = %s",
-            (run_id,),
-        )
-        rows = [
-            {
-                "tenant_key": tenant_key,
-                "name": name,
-                "open_id": open_id,
-                "user_id": user_id,
-                "union_id": union_id,
-                "union_user_id": union_user_id,
-            }
-            for tenant_key, name, open_id, user_id, union_id, union_user_id in cursor.fetchall()
-        ]
     return {
         "run_id": str(run_id),
         "completed_at": completed_at.isoformat(),
