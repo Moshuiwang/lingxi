@@ -1273,6 +1273,36 @@ class BlockedRoundLoggingTest(RetentionPostgresTestCase):
         self.assertEqual(report.blocked_tables, ())
         self.assertTrue(all(not line.startswith("WARNING") for line in captured.output))
 
+    def test_both_locked_tables_yield_with_the_adapter_statement_timeout(self) -> None:
+        """适配器级 5s statement_timeout 足够让函数的两张表各等完 2s 后返回。"""
+
+        from lingxi.adapters.retention import PostgresRetentionCleaner
+
+        now = self.database_now()
+        self.insert_batch("gib_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+        self.insert_sync_run("run_double_locked", started_at=now - RETENTION_WINDOW - timedelta(hours=1))
+
+        first_holder = self._psycopg.connect(self._dsn)
+        second_holder = self._psycopg.connect(self._dsn)
+        self.addCleanup(first_holder.close)
+        self.addCleanup(second_holder.close)
+        try:
+            with first_holder.cursor() as first_cursor, second_holder.cursor() as second_cursor:
+                first_cursor.execute(
+                    "SELECT id FROM galaxy_import_batch WHERE id = 'gib_double_locked' FOR UPDATE"
+                )
+                second_cursor.execute(
+                    "SELECT id FROM feishu_org_sync_run WHERE id = 'run_double_locked' FOR UPDATE"
+                )
+
+                report = PostgresRetentionCleaner(self._dsn).run_once()
+        finally:
+            first_holder.close()
+            second_holder.close()
+
+        self.assertEqual(report.deleted, 0)
+        self.assertEqual(report.blocked_tables, ("galaxy_import_batch", "feishu_org_sync_run"))
+
 
 class SummaryContentTest(RetentionPostgresTestCase):
     def test_the_summary_carries_table_names_counts_and_a_time_range_only(self) -> None:

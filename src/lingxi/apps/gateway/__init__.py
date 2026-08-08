@@ -130,7 +130,7 @@ def build_supervisor(
         timeout_seconds=outbound_timeout,
     )
     pipeline = EventPipeline(
-        store=PostgresGatewayStore(str(config.postgres_dsn)),
+        store=PostgresGatewayStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
         reactions=LarkReactions(client),
         replies=LarkReplies(client),
         audit=audit,

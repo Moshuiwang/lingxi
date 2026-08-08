@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
     SecretToken,
@@ -69,10 +70,16 @@ class StoredCredential:
 class HostFileDelegatedCredentialVault:
     """凭据文件 + 主体登记的组合保管者。API 与数据库版前身完全一致。"""
 
-    def __init__(self, dsn: str, encryption_key: str, credential_path: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        encryption_key: str,
+        credential_path: str,
+        *,
+        timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+    ) -> None:
         try:
             from cryptography.fernet import Fernet, InvalidToken
-            import psycopg
         except ImportError as error:  # 绝不降级为明文保存。
             raise RuntimeError("缺少专用授权凭据的加密依赖") from error
         try:
@@ -83,7 +90,7 @@ class HostFileDelegatedCredentialVault:
             raise ValueError("必须提供凭据文件路径（宿主机受控目录）")
         self._invalid_token = InvalidToken
         self._dsn = dsn
-        self._psycopg = psycopg
+        self._timeouts = timeouts
         self._path = Path(credential_path)
         # 锁文件与凭据文件分开：凭据文件靠原子替换更新，锁对象必须稳定存在。
         self._lock_path = self._path.with_name(self._path.name + ".lock")
@@ -98,7 +105,7 @@ class HostFileDelegatedCredentialVault:
         """
 
         moment = issued_at or datetime.now(timezone.utc)
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO feishu_delegated_subject (purpose, subject_open_id)
                    VALUES (%s, %s)
@@ -236,7 +243,7 @@ class HostFileDelegatedCredentialVault:
         登记表里，双向触发器只护着 B，继续用 A 的凭据等于在防线外运行
         （终轮 Codex）。清除旧文件并要求重新授权是唯一安全的恢复。"""
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
                 (DELEGATED_PURPOSE,),
