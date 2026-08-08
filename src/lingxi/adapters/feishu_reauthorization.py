@@ -72,6 +72,7 @@ class DelegatedCredentialVault(Protocol):
         grant: AuthorizationGrant,
         issued_at: datetime | None = ...,
         replacing_generation: str | None = ...,
+        expected_registered_subject_open_id: str | None = ...,
     ) -> bool: ...
 
 
@@ -368,9 +369,14 @@ class FeishuReauthorizationEntry:
                 "persistence_failed",
                 "无法确认正式授权主体，未修改凭据，请由运维检查后重新发起授权。",
             )
-        if registered_subject is not None and not hmac.compare_digest(
-            registered_subject.strip(), pending.expected_subject_open_id
-        ):
+        if registered_subject is None or not registered_subject.strip():
+            logger.warning("正式重授权当前主体登记缺失，未写入凭据")
+            return self._failure(
+                "subject_missing",
+                "当前正式授权主体登记已缺失，未修改凭据，请由运维检查后重新发起授权。",
+            )
+        registered_subject = registered_subject.strip()
+        if not hmac.compare_digest(registered_subject, pending.expected_subject_open_id):
             logger.warning("正式重授权期间主体登记已变化，未写入凭据")
             return self._failure(
                 "subject_changed",
@@ -381,6 +387,7 @@ class FeishuReauthorizationEntry:
             saved = self._vault.save(
                 subject_open_id=pending.expected_subject_open_id,
                 grant=exchange.grant,
+                expected_registered_subject_open_id=registered_subject,
             )
         except Exception as caught:  # noqa: BLE001 - vault 必须原子失败关闭
             logger.warning("正式重授权凭据未安全保存 error=%s", type(caught).__name__)
