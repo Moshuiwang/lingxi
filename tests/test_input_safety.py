@@ -130,6 +130,42 @@ class InputBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_internal_tool_name_rule_is_guarded_by_a_single_trigger_case(self) -> None:
+        """V-注入-03：工具名规则不能靠其他敏感值或自由文本兜底。"""
+
+        internal_tool_name = "internal_reporter"
+        result = constrain_output(
+            f"请使用 {internal_tool_name} 完成查询。",
+            internal_tool_names=(internal_tool_name,),
+        )
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reasons, ("internal_tool_name",))
+        self.assertEqual(result.text, SAFE_OUTPUT_FALLBACK)
+        self.assertNotIn(internal_tool_name, result.text)
+
+    def test_process_marker_rule_is_guarded_by_a_single_trigger_case(self) -> None:
+        """V-注入-03：进程标识规则单独失效时必须变红。"""
+
+        marker = "trace_id=opaque"
+        result = constrain_output(marker)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reasons, ("process_marker",))
+        self.assertEqual(result.text, SAFE_OUTPUT_FALLBACK)
+        self.assertNotIn(marker, result.text)
+
+    def test_system_prompt_marker_rule_is_guarded_by_a_single_trigger_case(self) -> None:
+        """V-注入-03：系统提示标记规则单独失效时必须变红。"""
+
+        marker = "system prompt"
+        result = constrain_output(f"内容中出现 {marker}。")
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reasons, ("system_prompt_marker",))
+        self.assertEqual(result.text, SAFE_OUTPUT_FALLBACK)
+        self.assertNotIn(marker, result.text)
+
     def test_v_zhuru_04_injection_failure_and_no_data_have_safe_non_empty_terminals(self) -> None:
         for model_text in (INJECTION, "业务失败：指标不存在", ""):
             with self.subTest(model_text=model_text):

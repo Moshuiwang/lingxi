@@ -153,6 +153,7 @@ class WorkerService:
                 ),
                 stop_event=stop_event,
                 on_stream_event=on_stream_event,
+                external_texts=self._config.external_texts,
             )
         except Exception as error:  # noqa: BLE001 - worker 绝不留下 running
             report = {

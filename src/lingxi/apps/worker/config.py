@@ -55,6 +55,9 @@ class WorkerConfig:
     workspace: str | None = None
     model: str | None = None
     system_prompt: str | None = None
+    # #93 walking skeleton：CLI 可接收一个已知的指标描述外部文本。真实花名册 / MCP
+    # 来源仍由后续主链路注入；这里不把该配置当作权限或身份事实。
+    external_texts: tuple[tuple[str, str], ...] = ()
     worker_id: str = ""
     target_worker_version: str = "stable"
     queue_max_wait_seconds: float = 180.0
@@ -89,6 +92,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         workspace=_text(env, "WORKSPACE"),
         model=_text(env, "MODEL"),
         system_prompt=_text(env, "SYSTEM_PROMPT"),
+        external_texts=_external_texts(env),
         worker_id=_text(env, "ID") or new_ulid(),
         target_worker_version=_text(env, "TARGET_VERSION") or "stable",
         queue_max_wait_seconds=_duration(env, "QUEUE_MAX_WAIT_SECONDS", 180.0),
@@ -162,6 +166,13 @@ def _mcp_servers(env: Mapping[str, str]) -> Mapping[str, Any]:
     if not isinstance(parsed, dict):
         raise WorkerConfigError(f"{ENV_PREFIX}MCP_SERVERS 必须是 JSON 对象（服务名 → 配置）")
     return parsed
+
+
+def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    """读取 CLI 已知的指标描述，不让环境变量变成任意来源元数据。"""
+
+    description = _text(env, "METRIC_DESCRIPTION")
+    return (("metric.description", description),) if description else ()
 
 
 def _json(raw: str, name: str) -> Any:

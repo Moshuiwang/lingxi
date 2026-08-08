@@ -752,6 +752,16 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(report["audit"]["calls"][0]["result_kind"], "business_failure")
         self.assertEqual(report["turn"]["user_result"], "not_obtained")
 
+    def test_known_metric_description_is_normalized_as_external_text(self) -> None:
+        config = self._load(
+            LINGXI_WORKER_METRIC_DESCRIPTION="指标目录中的已知描述",
+        )
+
+        self.assertEqual(
+            config.external_texts,
+            (("metric.description", "指标目录中的已知描述"),),
+        )
+
     def test_audit_input_field_whitelist_is_opt_in(self) -> None:
         report, _, _ = run_turn(
             self,
@@ -1264,6 +1274,26 @@ class WorkerCliTest(unittest.TestCase):
         for line in lines:
             self.assertEqual(line["trace_id"], "01J0000000000000000TEST000")
         self.assertIn("worker.turn.finished", [line["event"] for line in lines])
+
+    def test_cli_passes_the_known_metric_description_as_external_text(self) -> None:
+        from lingxi.apps.worker.cli import main
+
+        fake = FakeAgentSDK([{"kind": "text", "text": "已完成。"}]).install(self)
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        code = main(
+            env=worker_env(
+                LINGXI_WORKER_METRIC_DESCRIPTION="指标描述来自已知外部目录。",
+            ),
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.prompts), 1)
+        self.assertIn('role="data"', fake.prompts[0])
+        self.assertIn("[待分析内容]", fake.prompts[0])
+        self.assertIn("指标描述来自已知外部目录。", fake.prompts[0])
 
     def test_cli_exit_code_reports_an_unclosed_turn(self) -> None:
         from lingxi.apps.worker.cli import main
