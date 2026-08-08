@@ -6,7 +6,7 @@
     1. 通道级认证        —— 长连接握手期完成，不在逐事件层做（见下方「关于第 1 步」）
     2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
     3. 加表情            失败 → 记审计，继续                  V-接入-07/08
-    4. 查用户状态        未开通 → 内容一律丢弃；已停用 → 回提示 V-审计-05
+    4. 查用户状态        未开通 → 丢弃正文并认领开通；已停用 → 回提示 V-审计-05
     5. 解析命令          /stop /new                            V-会话-05/06
     6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
     7. 入队 + NOTIFY                                           V-队列-01…05
@@ -45,6 +45,10 @@ from .ports import (
     GatewayStore,
     HandledAs,
     InboundMessage,
+    OnboardingMessage,
+    OnboardingResult,
+    OnboardingRunner,
+    OnboardingState,
     Outcome,
     Reactions,
     Replies,
@@ -115,6 +119,7 @@ class EventPipeline:
         texts: GatewayTexts | None = None,
         resolve_version: VersionResolver = fixed_stable_version,
         should_stop: Callable[[], bool] | None = None,
+        onboarding: OnboardingRunner | None = None,
     ) -> None:
         self._store = store
         self._reactions = reactions
@@ -122,6 +127,12 @@ class EventPipeline:
         self._audit = audit
         self._texts = texts or GatewayTexts()
         self._resolve_version = resolve_version
+        # The runner is an application boundary: it owns the #89 identity result,
+        # account matching and the #17 environment/permission/MCP orchestration.
+        # Keeping it optional preserves the old negative-only assembly for callers
+        # that have not opted into the #65 path; the gateway app passes it explicitly
+        # when the product path is enabled.
+        self._onboarding = onboarding
         # 停机位。停机时**已提交的结论不动**，只跳过尽力而为的出站回复——
         # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
         self._should_stop = should_stop or (lambda: False)
@@ -188,6 +199,9 @@ class EventPipeline:
             return Outcome(handled_as=None)
 
         # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
+        if outcome.handled_as is HandledAs.AUTO_PROVISIONING:
+            self._start_onboarding(message, deferred)
+
         if deferred and self._should_stop():
             # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
             # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
@@ -261,17 +275,25 @@ class EventPipeline:
 
             if state is UserState.NOT_PROVISIONED:
                 # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显（`V-审计-05`）。
-                # 本批只认领这条**否定面**——正向的自动匹配与开通接线是 #65，不在本批。
                 # 注意审计里也不带消息正文：内容"不保存"包括不写进审计。
+                if self._onboarding is not None:
+                    self._audit.record(
+                        "inbound_event.auto_provisioning",
+                        event_id=message.event_id,
+                        trace_id=message.trace_id,
+                    )
+                    tx.mark_handled_as(
+                        event_id=message.event_id, handled_as=HandledAs.AUTO_PROVISIONING
+                    )
+                    return Outcome(handled_as=HandledAs.AUTO_PROVISIONING)
+
+                # 未配置正向编排的旧装配仍然保持明确的否定终态；正式 gateway
+                # 通过 apps.gateway.build_supervisor 的 onboarding 注入口启用 #65。
                 self._audit.record(
                     "inbound_event.not_provisioned",
                     event_id=message.event_id,
                     trace_id=message.trace_id,
                 )
-                # 记 `not_provisioned` 而不是 `auto_provisioning`：本批**没有**启动
-                # 任何自动匹配与开通（正向接线是 #65），写后者等于让这一列陈述一件
-                # 没有发生的事。也不记 `dropped`——那会与「已停用」混为一谈，而
-                # #54 的保留清理与 #65 的接线都要读这一列。
                 tx.mark_handled_as(
                     event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
                 )
@@ -382,6 +404,73 @@ class EventPipeline:
     # ------------------------------------------------------------------
     # 内部步骤
     # ------------------------------------------------------------------
+
+    def _start_onboarding(
+        self, message: InboundMessage, deferred: list[RenderedContent]
+    ) -> None:
+        """提交后启动一次自动开通，并把结果限制在内容目录内。
+
+        事务只负责认领 ``event_id``；身份读取、匹配、开通和 MCP 同步由 runner
+        自己用独立的幂等边界完成。这样 gateway 不会把长耗时外部调用放进队列事务，
+        也不会把用户原文传入权限链。
+        """
+
+        assert self._onboarding is not None
+        checking = self._texts.catalog.text("onboarding.checking")
+        deferred.append(checking)
+
+        try:
+            result = self._onboarding.start(
+                event_id=message.event_id,
+                open_id=message.sender_open_id,
+                trace_id=message.trace_id,
+            )
+            if not isinstance(result, OnboardingResult):
+                raise TypeError("onboarding runner returned an invalid result")
+            rendered = self._render_onboarding_result(result, checking_key=checking.key)
+        except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
+            internal = self._texts.catalog.text("onboarding.internal_error")
+            deferred.append(internal)
+            self._audit.record(
+                "onboarding.failed",
+                event_id=message.event_id,
+                state=OnboardingState.INTERNAL_ERROR.value,
+                error=type(error).__name__,
+                trace_id=message.trace_id,
+            )
+            return
+
+        deferred.extend(rendered)
+        self._audit.record(
+            "onboarding.result",
+            event_id=message.event_id,
+            state=result.state.value,
+            failure_reason=result.failure_reason,
+            content_keys=tuple(content.key for content in rendered),
+            trace_id=message.trace_id,
+        )
+
+    def _render_onboarding_result(
+        self, result: OnboardingResult, *, checking_key: str
+    ) -> tuple[RenderedContent, ...]:
+        messages = list(result.messages)
+        if not messages:
+            defaults = {
+                OnboardingState.NOT_AUTHORIZED: OnboardingMessage("onboarding.not_authorized"),
+                OnboardingState.SYNC_TIMEOUT: OnboardingMessage("onboarding.sync_timeout"),
+                OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
+            }
+            default_message = defaults.get(result.state)
+            if default_message is not None:
+                messages.append(default_message)
+
+        rendered: list[RenderedContent] = []
+        for message in messages:
+            if message.key == checking_key:
+                # checking is owned by the gateway and is sent exactly once.
+                continue
+            rendered.append(self._texts.catalog.text(message.key, message.as_values()))
+        return tuple(rendered)
 
     def _add_reaction(self, message: InboundMessage) -> None:
         """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
