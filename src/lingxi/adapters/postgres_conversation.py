@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Iterator
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.conversation.ports import (
     ConversationRecord,
     HandledAs,
@@ -232,11 +233,17 @@ class _Transaction:
         self._execute(f"NOTIFY {TASK_QUEUED_CHANNEL}")
 
 
-# 建连与单条语句的墙钟上限。没有它们时，一个不可达的数据库或一条被锁住的语句会让
-# 在途事件永远卡住，而停机要等在途事件做完——验收实测 SIGTERM 之后 45 秒仍未退出。
-# 这两个值是**上限不是目标**：正常情况下入队是毫秒级的。
-DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
-DEFAULT_STATEMENT_TIMEOUT_MS = 10_000
+# 保留旧名称作为兼容导出；默认值的唯一来源是 adapters.postgres。
+DEFAULT_CONNECT_TIMEOUT_SECONDS = DEFAULT_POSTGRES_TIMEOUTS.connect_timeout_seconds
+DEFAULT_STATEMENT_TIMEOUT_MS = DEFAULT_POSTGRES_TIMEOUTS.statement_timeout_seconds * 1000
+
+
+def _seconds_from_milliseconds(name: str, value: int) -> int:
+    """把旧构造参数转成统一配置；不允许丢失精度地改变等待边界。"""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value % 1000:
+        raise ValueError(f"{name} 必须是正整数秒的毫秒数")
+    return value // 1000
 
 
 class PostgresGatewayStore:
@@ -246,27 +253,41 @@ class PostgresGatewayStore:
         self,
         dsn: str,
         *,
-        connect_timeout: int = DEFAULT_CONNECT_TIMEOUT_SECONDS,
-        statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+        timeouts: PostgresTimeouts | None = None,
+        connect_timeout: int | None = None,
+        statement_timeout_ms: int | None = None,
+        lock_timeout_ms: int | None = None,
     ) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
         self._dsn = dsn
-        self._connect_timeout = connect_timeout
-        self._statement_timeout_ms = statement_timeout_ms
+        if timeouts is not None and any(
+            value is not None for value in (connect_timeout, statement_timeout_ms, lock_timeout_ms)
+        ):
+            raise ValueError("PostgreSQL 超时只能通过 timeouts 或兼容参数中的一种提供")
+        if timeouts is not None:
+            self._timeouts = timeouts
+        else:
+            self._timeouts = PostgresTimeouts(
+                connect_timeout_seconds=(
+                    DEFAULT_CONNECT_TIMEOUT_SECONDS if connect_timeout is None else connect_timeout
+                ),
+                statement_timeout_seconds=(
+                    DEFAULT_POSTGRES_TIMEOUTS.statement_timeout_seconds
+                    if statement_timeout_ms is None
+                    else _seconds_from_milliseconds("statement_timeout_ms", statement_timeout_ms)
+                ),
+                lock_timeout_seconds=(
+                    DEFAULT_POSTGRES_TIMEOUTS.lock_timeout_seconds
+                    if lock_timeout_ms is None
+                    else _seconds_from_milliseconds("lock_timeout_ms", lock_timeout_ms)
+                ),
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[_Transaction]:
         """一个连接、一个事务。异常时整体回滚。"""
 
-        with self._psycopg.connect(
-            self._dsn, connect_timeout=self._connect_timeout
-        ) as connection:
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
-                # SET LOCAL：只作用于本事务，不污染连接。放在事务内的第一条，
-                # 后面的每条语句都受它约束。
-                connection.execute(f"SET LOCAL statement_timeout = {self._statement_timeout_ms}")
                 yield _Transaction(connection)
 
 
@@ -287,11 +308,9 @@ class PostgresTaskQueue:
     本切片只交付队列**基座**：领取、释放、回收。真正跑 Agent 会话属 S4 下半。
     """
 
-    def __init__(self, dsn: str) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
+        self._timeouts = timeouts
 
     def claim(
         self, *, worker_id: str, target_worker_version: str, limit: int = 1
@@ -310,9 +329,7 @@ class PostgresTaskQueue:
         改写（`V-灰度-01`）；迁移 013 的触发器兜底，这里写它会直接抛异常。
         """
 
-        with self._psycopg.connect(
-            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
-        ) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE task SET status = 'running',
@@ -364,9 +381,7 @@ class PostgresTaskQueue:
         ``last_task_ended_at`` 在这里落，它是两小时规则的唯一依据。
         """
 
-        with self._psycopg.connect(
-            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
-        ) as connection:
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
                 cursor.execute(
@@ -396,9 +411,7 @@ class PostgresTaskQueue:
         被分到的那个版本（`V-灰度-01` 的回收路径）。
         """
 
-        with self._psycopg.connect(
-            self._dsn, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
-        ) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE task SET status = 'queued',

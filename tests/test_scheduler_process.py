@@ -426,6 +426,10 @@ class BuildLoopTest(unittest.TestCase):
 
         self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理"])
         self.assertIsInstance(loop, SchedulerLoop)
+        from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS
+
+        cleanup_duty = loop.duties[1]
+        self.assertEqual(cleanup_duty._cleaner._timeouts, RETENTION_CLEANUP_TIMEOUTS)
         # 一个停止标志贯穿全部职责。
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

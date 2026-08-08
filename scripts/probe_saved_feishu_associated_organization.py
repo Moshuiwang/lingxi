@@ -13,6 +13,7 @@ import logging
 import os
 from urllib.request import Request
 
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthTokenGrant
 from lingxi.adapters.refresh_tokens import PostgresRefreshTokenVault
 
@@ -31,7 +32,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     vault = PostgresRefreshTokenVault(required("LINGXI_POSTGRES_DSN"), required("LINGXI_OAUTH_REFRESH_TOKEN_KEY"))
-    with vault._psycopg.connect(vault._dsn) as connection, connection.cursor() as cursor:  # noqa: SLF001 -- 受控验收读取密文
+    with connect(vault._dsn, timeouts=vault._timeouts) as connection, connection.cursor() as cursor:  # noqa: SLF001 -- 受控验收读取密文
         cursor.execute("SELECT feishu_open_id, encrypted_refresh_token FROM feishu_user_refresh_token ORDER BY updated_at DESC LIMIT 2")
         rows = cursor.fetchall()
     if len(rows) != 1:
