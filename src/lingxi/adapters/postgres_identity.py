@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.first_contact import IdentityRecordDraft
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.org_snapshot import (
@@ -48,11 +49,9 @@ class AppUserRecord:
 
 
 class PostgresOrgSnapshotStore:
-    def __init__(self, dsn: str) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
+        self._timeouts = timeouts
 
     def commit_batch(
         self,
@@ -76,7 +75,7 @@ class PostgresOrgSnapshotStore:
             self._record_failed_run(identifier, source_app_id, moment, error)
             raise
 
-        with self._psycopg.connect(self._dsn) as connection:
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
                     cursor.execute(
@@ -164,7 +163,7 @@ class PostgresOrgSnapshotStore:
         return identifier
 
     def latest_complete_expiry(self) -> datetime | None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT expires_at FROM feishu_org_sync_run WHERE status = 'complete' ORDER BY started_at DESC LIMIT 1"
             )
@@ -179,7 +178,7 @@ class PostgresOrgSnapshotStore:
         """
 
         moment = now or datetime.now(timezone.utc)
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT id, expires_at FROM feishu_org_sync_run WHERE status = 'complete' ORDER BY started_at DESC LIMIT 1"
             )
@@ -212,7 +211,7 @@ class PostgresOrgSnapshotStore:
 
     def _record_failed_run(self, run_id: str, source_app_id: str, started_at: datetime, error: SnapshotIntegrityError) -> None:
         codes = ",".join(problem.value for problem in error.report.problems)[:120]
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO feishu_org_sync_run
                      (id, source_app_id, status, started_at, completed_at, expires_at, error_code)
@@ -229,11 +228,9 @@ class PostgresOrgSnapshotStore:
 
 
 class PostgresAppUserStore:
-    def __init__(self, dsn: str) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
+        self._timeouts = timeouts
 
     def record_identity(self, draft: IdentityRecordDraft) -> AppUserRecord:
         """按 ``feishu_open_id`` 建档或刷新资料。
@@ -245,7 +242,7 @@ class PostgresAppUserStore:
           用户会因为再发一条消息被打回 ``matching``。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO app_user
                      (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
@@ -301,7 +298,7 @@ class PostgresAppUserStore:
         return record
 
     def get_by_open_id(self, open_id: str) -> AppUserRecord | None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT id, provisioning_state, permission_record_id FROM app_user WHERE feishu_open_id = %s",
                 (open_id,),
@@ -310,7 +307,7 @@ class PostgresAppUserStore:
         return None if row is None else AppUserRecord(str(row[0]), str(row[1]), row[2], False)
 
     def count(self) -> int:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT count(*) FROM app_user")
             row = cursor.fetchone()
         return int(row[0]) if row else 0
