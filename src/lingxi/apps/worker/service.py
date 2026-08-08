@@ -20,6 +20,8 @@ class QueueListener(Protocol):
 
 ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
 DeliveryFactory = Callable[[TaskContext, Callable[[], None]], TaskDelivery]
+HeartbeatCallback = Callable[[], None]
+TaskStuckCallback = Callable[[str, int], None]
 
 
 class WorkerService:
@@ -41,6 +43,8 @@ class WorkerService:
         catalog: ContentCatalog | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        heartbeat: HeartbeatCallback | None = None,
+        on_task_stuck: TaskStuckCallback | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -56,10 +60,13 @@ class WorkerService:
         self._catalog = catalog or default_content_catalog()
         self._sleep = sleep
         self._monotonic = monotonic
+        self._heartbeat = heartbeat
+        self._on_task_stuck = on_task_stuck
 
     async def process_once(self) -> bool:
         """做一轮回收、领取和执行；返回这一轮是否观察到任务。"""
 
+        self._emit_heartbeat()
         terminal_tasks = self._housekeep()
         for terminal in terminal_tasks:
             self._deliver_terminal(terminal)
@@ -78,29 +85,61 @@ class WorkerService:
         terminals: list[TerminalTask] = []
         fail_versions = getattr(self._queue, "fail_unavailable_versions", None)
         if fail_versions is not None:
-            terminals.extend(
-                fail_versions(
-                    available_versions=(self._config.target_worker_version,),
-                    unavailable_for=timedelta(
-                        seconds=self._config.worker_version_unavailable_seconds
-                    ),
+            unavailable = fail_versions(
+                available_versions=(self._config.target_worker_version,),
+                unavailable_for=timedelta(
+                    seconds=self._config.worker_version_unavailable_seconds
                 )
             )
+            terminals.extend(unavailable)
+            self._report_task_stuck("queued_stuck", len(unavailable))
         reclaim_queued = getattr(self._queue, "reclaim_queued", None)
         if reclaim_queued is not None:
-            terminals.extend(
-                reclaim_queued(
-                    max_wait=timedelta(seconds=self._config.queue_max_wait_seconds)
-                )
+            queued = reclaim_queued(
+                max_wait=timedelta(seconds=self._config.queue_max_wait_seconds)
             )
+            terminals.extend(queued)
+            self._report_task_stuck("queued_stuck", len(queued))
         reclaim_stale = getattr(self._queue, "reclaim_stale_with_outcomes", None)
         if reclaim_stale is not None:
-            _requeued, stale_terminals = reclaim_stale(
+            requeued, stale_terminals = reclaim_stale(
                 older_than=timedelta(seconds=self._config.running_heartbeat_timeout_seconds),
                 max_auto_retries=self._config.max_auto_retries,
             )
             terminals.extend(stale_terminals)
+            self._report_task_stuck(
+                "running_heartbeat_timeout", len(requeued) + len(stale_terminals)
+            )
+            self._report_task_stuck(
+                "retry_exhausted",
+                sum(item.error_kind == "retry_exhausted" for item in stale_terminals),
+            )
         return terminals
+
+    def _emit_heartbeat(self) -> None:
+        if self._heartbeat is None:
+            return
+        try:
+            self._heartbeat()
+        except Exception as error:  # noqa: BLE001 - 心跳失败不能带走任务职责
+            # 只记异常类型；心跳是告警输入，不能因为告警输入失败而让 worker 停止消费。
+            import logging
+
+            logging.getLogger(__name__).error(
+                "worker 心跳记录失败，任务职责继续运行 error=%s", type(error).__name__
+            )
+
+    def _report_task_stuck(self, kind: str, count: int) -> None:
+        if self._on_task_stuck is None or count <= 0:
+            return
+        try:
+            self._on_task_stuck(kind, count)
+        except Exception as error:  # noqa: BLE001 - 告警失败不应改变任务状态
+            import logging
+
+            logging.getLogger(__name__).error(
+                "任务滞留告警记录失败，任务状态保持由队列收口 error=%s", type(error).__name__
+            )
 
     async def _process_task(self, claimed: ClaimedTask) -> None:
         context = self._queue.task_context(

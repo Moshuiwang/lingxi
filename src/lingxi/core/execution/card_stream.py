@@ -35,6 +35,9 @@ class TextTransport(Protocol):
     ) -> None: ...
 
 
+SendOutcomeCallback = Callable[[str, bool], None]
+
+
 class CardRateLimiter:
     """一个 worker 进程共享：单话题 500ms、全进程 50 次/秒。"""
 
@@ -77,6 +80,7 @@ class CardStream:
         mark_external_side_effect: Callable[[], bool | None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         rate_limiter: CardRateLimiter | None = None,
+        on_send_outcome: SendOutcomeCallback | None = None,
     ) -> None:
         self._chat_id = chat_id
         self._thread_id = thread_id
@@ -91,6 +95,7 @@ class CardStream:
         self._fallback_needed = False
         self._last_update: float | None = None
         self._rate_limiter = rate_limiter or CardRateLimiter()
+        self._on_send_outcome = on_send_outcome
 
     @property
     def fallback_needed(self) -> bool:
@@ -110,10 +115,12 @@ class CardStream:
                 reply_to_message_id=self._reply_to_message_id,
                 card=card,
             )
+            self._notify_send("card_non_final", True)
             self._last_update = self._monotonic()
             # 创建本身就是该话题的首帧，后续更新也要遵守 500ms 间隔。
             self._rate_limiter.allow(topic=self._topic, now=self._last_update)
         except Exception:  # noqa: BLE001 - 卡片失败统一走同话题文本回退
+            self._notify_send("card_non_final", False)
             self._fallback_needed = True
 
     def update(self, *, elapsed_seconds: int, action: str = "processing") -> None:
@@ -127,8 +134,10 @@ class CardStream:
         try:
             self._before_external()
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
+            self._notify_send("card_non_final", True)
             self._last_update = now
         except Exception:  # noqa: BLE001
+            self._notify_send("card_non_final", False)
             self._fallback_needed = True
 
     def finish(
@@ -155,22 +164,30 @@ class CardStream:
             self._sequence += 1
             self._before_external()
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
+            self._notify_send("card_final", True)
             self._sequence += 1
             self._before_external()
             self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
+            self._notify_send("card_final", True)
         except Exception:  # noqa: BLE001
+            self._notify_send("card_final", False)
             self._fallback_needed = True
 
     def send_fallback(self, content: RenderedContent) -> None:
         if not self._fallback_needed:
             return
-        self._before_external()
-        self._fallback.send_text(
-            chat_id=self._chat_id,
-            thread_id=self._thread_id,
-            reply_to_message_id=self._reply_to_message_id,
-            text=content.text,
-        )
+        try:
+            self._before_external()
+            self._fallback.send_text(
+                chat_id=self._chat_id,
+                thread_id=self._thread_id,
+                reply_to_message_id=self._reply_to_message_id,
+                text=content.text,
+            )
+            self._notify_send("message_final", True)
+        except Exception:
+            self._notify_send("message_final", False)
+            raise
 
     def _status_card(self, *, action: str, elapsed_seconds: int) -> RenderedCard:
         action_key = "worker.action.completed" if action == "completed" else "worker.action.processing"
@@ -189,3 +206,14 @@ class CardStream:
             marked = self._mark_external_side_effect()
             if marked is False:
                 raise RuntimeError("任务已不再由当前 worker 持有")
+
+    def _notify_send(self, operation: str, succeeded: bool) -> None:
+        """把发送结果交给告警层；告警层故障不能改变用户任务的出站语义。"""
+
+        if self._on_send_outcome is None:
+            return
+        try:
+            self._on_send_outcome(operation, succeeded)
+        except Exception:
+            # 告警输入失败不能反向把已成功的用户交付改成失败，也不能中断文本回退。
+            return

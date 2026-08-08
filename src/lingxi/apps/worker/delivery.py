@@ -5,7 +5,13 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
-from lingxi.core.execution.card_stream import CardRateLimiter, CardStream, CardTransport, TextTransport
+from lingxi.core.execution.card_stream import (
+    CardRateLimiter,
+    CardStream,
+    CardTransport,
+    SendOutcomeCallback,
+    TextTransport,
+)
 
 
 class TaskDelivery(Protocol):
@@ -48,6 +54,7 @@ class CardTaskDelivery:
         catalog: ContentCatalog | None = None,
         mark_external_side_effect: Callable[[], bool | None] | None = None,
         rate_limiter: CardRateLimiter | None = None,
+        on_send_outcome: SendOutcomeCallback | None = None,
     ) -> None:
         self._catalog = catalog or default_content_catalog()
         self._stream = CardStream(
@@ -59,6 +66,7 @@ class CardTaskDelivery:
             catalog=self._catalog,
             mark_external_side_effect=mark_external_side_effect,
             rate_limiter=rate_limiter,
+            on_send_outcome=on_send_outcome,
         )
 
     def start(self) -> None:
