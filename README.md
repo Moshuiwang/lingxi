@@ -4,4 +4,4 @@
 
 任何开发任务先阅读 [AGENTS.md](AGENTS.md)。只有涉及产品规则、能力、长期决策或文档治理时，才按其中的路由进入[产品文档索引](docs/README.md)及相关文档。
 
-仓库文档是长期产品事实的唯一正文；动态工作统一在 [Lingxi 开发 Project](https://github.com/users/Moshuiwang/projects/2) 中管理：Issue 记录需求、缺陷、研究与待决策事项，PR 记录实现和验证，Project 记录优先级、负责人和进度。关闭 Issue 前，仍有效的结论必须回写到仓库文档。
+仓库文档是长期产品事实的唯一正文；动态工作统一在 [Lingxi 开发 Project](https://github.com/users/Moshuiwang/projects/2) 中管理：Issue 记录需求、缺陷、研究与待决策事项，PR 记录实现和验证，Project 记录优先级、负责人和进度。唯一例外是长期执行方法 v10：完整正文与后续修订只在 GitHub [Issue #83](https://github.com/Moshuiwang/lingxi/issues/83) 维护。关闭 Issue 前，仍有效的结论必须回写到仓库文档。

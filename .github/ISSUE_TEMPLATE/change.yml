@@ -1,5 +1,5 @@
 name: 功能或工程变更
-description: 创建一个使用 [feature] 或 [task] 标题、具有明确范围与验收标准的工作单元
+description: 创建一个使用 [feature]、[story] 或 [task] 标题、具有明确范围与验收标准的工作单元
 title: ""
 labels: ["变更", "待分诊"]
 body:
@@ -60,7 +60,7 @@ body:
     id: coordination
     attributes:
       label: 协作与阻塞
-      description: 主实施代理、拟用分支、相关 Issue / PR、阻塞关系。
+      description: 已知时填写主实施代理、拟用分支、相关 Issue / PR、阻塞关系；尚未形成 Plan 时可留空，由规划者再归类为 Epic / Story / Task。
   - type: checkboxes
     id: closeout
     attributes:

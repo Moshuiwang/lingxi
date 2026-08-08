@@ -12,7 +12,8 @@
 | 要新建或重组产品文档、不确定结论应留在仓库还是 Issue，或准备关闭 Issue | [产品文档索引](docs/README.md) |
 | 要实现或修改正式代码、编写测试或进行技术审查 | [代码框架](docs/技术设计/代码框架.md)与[验证与门禁](docs/技术设计/验证与门禁.md)；只在认领产品或部署断言时按需读取[验收矩阵](docs/技术设计/验收矩阵.md) |
 | 要创建或编辑 Issue、PR、Project、评论，准备 Draft PR，或进行多人、跨设备、跨 PR、高风险协作 | [协作约定](docs/协作约定.md)；技术审查同时读取[验证与门禁](docs/技术设计/验证与门禁.md) |
-| 要编排持续执行的多 Issue、多 Epic、多角色、顺序依赖或高风险 Plan | GitHub [Issue #83：长期执行计划 v10](https://github.com/Moshuiwang/lingxi/issues/83) |
+| 要规划或修订持续执行的多 Issue、多 Epic、多角色、顺序依赖或高风险 Plan | GitHub [Issue #83：长期执行计划 v10](https://github.com/Moshuiwang/lingxi/issues/83)，由规划者据此生成或修订具体 `[tracking]` Plan |
+| 要编排已经批准的长期 Plan | 已批准的 `[tracking]` Plan 及其中绑定的来源；#83 只供规划者生成或修订具体 Plan，不作为编排者补合同的后备正文 |
 | 任务关联已有 Issue、PR 或 Project | 仅相关的 GitHub 工作项 |
 
 普通问答、头脑风暴、与产品边界无关的局部修复，或纯机械改动，**不读取上述产品文档和 GitHub 工作项**。用户指定的文件、目录规则和离改动最近的 `AGENTS.md` 优先；只读取完成当前任务所需的最小集合。
