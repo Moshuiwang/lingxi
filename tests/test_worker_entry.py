@@ -1,4 +1,4 @@
-"""最薄 worker 入口的装配断言（V-执行-18、19、20，以及 V-执行-17 经装配路径复验）。
+"""最薄 worker 入口的装配断言（V-执行-18、19、20、22、23，以及 V-执行-17 经装配路径复验）。
 
 对应 Issue #37。这里**不是**又测一遍 ``lingxi.core.execution``：判定与审计逻辑的断言在
 ``tests/test_execution_tool_gate.py``。本文件要回答的是另一个问题——**那些组件真的被
@@ -148,6 +148,8 @@ class FakeAgentSDK:
         self.options = []
         self.prompts = []
         self.executed = []
+        self.child_sessions = 0
+        self.child_turns = 0
         # 终止消息可配置：省略/重复 ResultMessage、SDK 自报错误结束，都是
         # 真实链路可能出现的档位（独立复查发现原脚本恒定"一次成功"）。
         self.result_messages = result_messages
@@ -301,6 +303,9 @@ class FakeAgentSDK:
 
     def _execute(self, step) -> None:
         self.executed.append(step["tool"])
+        if step["tool"] in {"Agent", "Task"}:
+            self.child_sessions += 1
+            self.child_turns += 1
         target = step.get("writes")
         if target:
             pathlib.Path(target).write_text(step.get("input", {}).get("content", ""), encoding="utf-8")
@@ -491,6 +496,29 @@ class ReadOnlyBoundaryTest(unittest.TestCase):
         self.assertEqual(report["turn"]["terminal_result_count"], 1)
         self.assertTrue(report["turn"]["closed"])
 
+    def test_v_zhixing_23_empty_rule_layer_cannot_replace_the_pre_tool_use_boundary(self) -> None:
+        """V-执行-23：规则层为空时，越界写工具仍由 PreToolUse 拒绝。"""
+
+        report, fake, _ = run_turn(
+            self,
+            [
+                {
+                    "kind": "tool",
+                    "tool": "Write",
+                    "input": {"file_path": self.probe, "content": "越界写入"},
+                    "writes": self.probe,
+                },
+                {"kind": "text", "text": "这一部分无法查询。"},
+            ],
+            LINGXI_WORKER_WORKSPACE=self._workspace.name,
+        )
+
+        self.assertEqual(fake.options[0].disallowed_tools, [])
+        self.assertEqual(fake.executed, [])
+        self.assertFalse(os.path.exists(self.probe))
+        self.assertEqual([entry["tool_name"] for entry in report["audit"]["denied"]], ["Write"])
+        self.assertFalse(report["turn"]["gate_bypassed"])
+
     def test_workspace_is_handed_to_the_sdk_so_probes_stay_inside_it(self) -> None:
         _, fake, _ = run_turn(
             self,
@@ -499,6 +527,28 @@ class ReadOnlyBoundaryTest(unittest.TestCase):
         )
 
         self.assertEqual(fake.options[0].cwd, self._workspace.name)
+
+
+class SubagentBoundaryTest(unittest.TestCase):
+    """V-执行-22：子代理调用不得产生子会话或第二份回合审计。"""
+
+    def test_v_zhixing_22_subagent_denial_keeps_the_main_turn_closed(self) -> None:
+        report, fake, _ = run_turn(
+            self,
+            [
+                {"kind": "tool", "tool": "Task", "input": {"prompt": "请派生助手"}},
+                {"kind": "text", "text": "该操作不在本次只读范围内。"},
+            ],
+        )
+
+        self.assertEqual(fake.executed, [])
+        self.assertEqual(fake.child_sessions, 0)
+        self.assertEqual(fake.child_turns, 0)
+        self.assertEqual(report["audit"]["call_count"], 1)
+        self.assertEqual(report["audit"]["denied"][0]["tool_name"], "Task")
+        self.assertEqual(report["turn"]["terminal_result_count"], 1)
+        self.assertEqual(report["turn"]["sdk_result_message_count"], 1)
+        self.assertTrue(report["turn"]["closed"])
 
 
 class MixedTurnThroughTheEntryTest(unittest.TestCase):
