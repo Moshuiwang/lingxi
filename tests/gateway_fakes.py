@@ -98,6 +98,7 @@ class FakeTask:
     prompt: str
     resumed_session: bool
     target_worker_version: str
+    reply_to_message_id: str | None = None
     stop_requested: bool = False
     status: str = "queued"
 

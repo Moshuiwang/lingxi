@@ -7,7 +7,7 @@ CI 里被完整覆盖。SDK 绑定见 ``lingxi.adapters.claude_agent_hooks``。
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .audit import TurnAudit
 from .tool_policy import ToolPolicy
@@ -45,9 +45,16 @@ class ToolGateway:
     这次拒绝及其理由。
     """
 
-    def __init__(self, *, policy: ToolPolicy, audit: TurnAudit) -> None:
+    def __init__(
+        self,
+        *,
+        policy: ToolPolicy,
+        audit: TurnAudit,
+        mark_external_side_effect: Callable[[], None] | None = None,
+    ) -> None:
         self._policy = policy
         self._audit = audit
+        self._mark_external_side_effect = mark_external_side_effect
 
     @property
     def audit(self) -> TurnAudit:
@@ -69,8 +76,12 @@ class ToolGateway:
         if event == "PreToolUse":
             return self._on_pre_tool_use(tool_name, tool_input, call_id)
         if event == "PostToolUse" and isinstance(tool_name, str):
+            if self._is_side_effecting_tool(tool_name):
+                self._mark_side_effect()
             self._audit.record_executed(tool_name=tool_name, tool_use_id=call_id)
         elif event == "PostToolUseFailure" and isinstance(tool_name, str):
+            if self._is_side_effecting_tool(tool_name):
+                self._mark_side_effect()
             self._audit.record_failure(
                 tool_name=tool_name,
                 tool_input=tool_input,
@@ -84,6 +95,20 @@ class ToolGateway:
             # 手段），但绝不能连痕迹都不留。
             self._audit.record_executed(tool_name=tool_name, tool_use_id=call_id)
         return {}
+
+    def _mark_side_effect(self) -> None:
+        if self._mark_external_side_effect is None:
+            return
+        try:
+            self._mark_external_side_effect()
+        except Exception:  # noqa: BLE001 - 失败也必须保守地继续记审计
+            self._audit.record_audit_fault(tool_name="external_side_effect", tool_use_id=None)
+
+    @staticmethod
+    def _is_side_effecting_tool(tool_name: str) -> bool:
+        # 本 Story 的唯一放行能力是只读 MCP；其它真正执行到的工具都按可能有副作用
+        # 处理。未经过 PreToolUse 的旁路仍由报告的 ungated_calls 拦截收口。
+        return not tool_name.startswith("mcp__")
 
     def _on_pre_tool_use(self, tool_name: Any, tool_input: Any, call_id: str | None) -> dict[str, Any]:
         verdict = self._policy.decide(tool_name, tool_input if isinstance(tool_input, Mapping) else None)

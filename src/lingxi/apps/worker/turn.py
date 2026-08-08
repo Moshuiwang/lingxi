@@ -19,9 +19,13 @@ import json
 import sys
 import time
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
-from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+from lingxi.adapters.claude_agent_session import (
+    AgentSessionInterrupted,
+    build_agent_options,
+    run_single_turn,
+)
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
 from lingxi.core.execution.hooks import ToolGateway
 from lingxi.core.execution.message_stream import TurnStreamRecorder
@@ -46,6 +50,7 @@ class WorkerTurnExecutor:
         *,
         stderr_stream: Any | None = None,
         clock: Callable[[], float] | None = None,
+        mark_external_side_effect: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._policy = ToolPolicy(allowed_tools=(config.read_only_tool,))
@@ -53,7 +58,11 @@ class WorkerTurnExecutor:
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
             redactor=AuditRedactor(allowed_input_fields=config.audit_input_fields),
         )
-        self._gateway = ToolGateway(policy=self._policy, audit=self._audit)
+        self._gateway = ToolGateway(
+            policy=self._policy,
+            audit=self._audit,
+            mark_external_side_effect=mark_external_side_effect,
+        )
         self._options: Any = None
         self._stderr_stream = sys.stderr if stderr_stream is None else stderr_stream
         self._clock = time.monotonic if clock is None else clock
@@ -106,6 +115,10 @@ class WorkerTurnExecutor:
     async def run_turn(
         self,
         question: str,
+        *,
+        resume_session_id: str | None = None,
+        stop_event: asyncio.Event | None = None,
+        on_stream_event: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """执行一个回合，**总是**返回一份报告。
 
@@ -117,6 +130,11 @@ class WorkerTurnExecutor:
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
         started_at = self._clock()
+
+        def handle_event(event: Mapping[str, Any]) -> None:
+            recorder.handle(event)
+            if on_stream_event is not None:
+                on_stream_event(event)
 
         try:
             try:
@@ -131,9 +149,13 @@ class WorkerTurnExecutor:
                 await run_single_turn(
                     options=options,
                     prompt=question,
-                    sink=recorder.handle,
+                    sink=handle_event,
                     timeout_seconds=self._config.turn_timeout_seconds,
+                    resume_session_id=resume_session_id,
+                    stop_event=stop_event,
                 )
+        except AgentSessionInterrupted as error:
+            failure = _failure("interrupted", error)
         except TimeoutError as error:
             # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
             # 没有这个分支整个回合会永久等待（Codex 复查发现）。

@@ -35,8 +35,8 @@ requires-python = ">=3.12"
 # cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
 # 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
 scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
-# lingxi-worker 进程（`python -m lingxi.apps.worker`：最薄受控执行器）。
-# 依据：入口 → adapters/claude_agent_hooks.py、adapters/claude_agent_session.py。
+# lingxi-worker 进程（`python -m lingxi.apps.worker`：turn/queue 两种受控执行模式）。
+# 依据：入口 → queue service → PostgreSQL queue adapter，以及 Agent SDK session adapter。
 # 精确锁版本，不用范围：执行层的只读边界建立在这个版本的 hook 事件名与工具名上
 # （`PostToolUseFailure` 存在、子代理叫 `Agent` 不叫 `Task`、`HookMatcher` 的签名），
 # 这些都是实测得到的、SDK 未作稳定性承诺的细节。升级前必须重跑 L4a，见
@@ -44,7 +44,7 @@ scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
 # 判定逻辑不依赖本组：`lingxi.core.execution` 的全部断言在无 SDK 环境即可跑，
 # 绑定层的形状由桩模块锁住。CI 另有一步装上本组做真实冒烟（构造 `HookMatcher`，
 # 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
-worker = ["claude-agent-sdk==0.2.128"]
+worker = ["claude-agent-sdk==0.2.128", "psycopg[binary]>=3.2,<4"]
 # lingxi-gateway 进程（`python -m lingxi.apps.gateway`：飞书长连接接入与任务入队）。
 # 依据是从入口逐个追 import 链：
 #   lark-oapi → adapters/feishu_longconn.py（ws.Client 建长连接）

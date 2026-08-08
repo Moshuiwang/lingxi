@@ -96,15 +96,28 @@ class StubSystemMessage:
 
 
 class StubResultMessage:
-    def __init__(self, subtype="success", is_error=False, *, usage=None, num_turns=None, terminal_reason=None) -> None:
+    def __init__(
+        self,
+        subtype="success",
+        is_error=False,
+        session_id=None,
+        *,
+        usage=None,
+        num_turns=None,
+        terminal_reason=None,
+        error=None,
+    ) -> None:
         self.subtype = subtype
         self.is_error = is_error
+        self.session_id = session_id
         if usage is not None:
             self.usage = usage
         if num_turns is not None:
             self.num_turns = num_turns
         if terminal_reason is not None:
             self.terminal_reason = terminal_reason
+        if error is not None:
+            self.error = error
 
 
 class _StubSDK(unittest.TestCase):
@@ -315,6 +328,29 @@ class SingleTurnSessionTest(_StubSDK):
         self.assertEqual(self.calls["prompts"], ["问题"])
         self.assertEqual(self.calls["closed"], 1)
         self.assertEqual([event["kind"] for event in seen], ["assistant_message", "result"])
+
+    def test_resume_is_explicit_and_result_session_id_is_observable(self) -> None:
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [
+            StubAssistantMessage([StubTextBlock("续接结果")]),
+            StubResultMessage(session_id="session-new"),
+        ]
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        seen: list = []
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="续接问题",
+                sink=seen.append,
+                timeout_seconds=30,
+                resume_session_id="session-old",
+            )
+        )
+
+        self.assertEqual(getattr(self.calls["clients"][0], "resume"), "session-old")
+        self.assertEqual(seen[-1]["session_id"], "session-new")
 
 
 if __name__ == "__main__":
