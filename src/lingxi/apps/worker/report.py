@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping
 
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
 from lingxi.core.execution.message_stream import TurnStreamRecorder
+from lingxi.core.execution.input_safety import constrain_output
 
 _GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled"})
 
@@ -33,6 +34,8 @@ def build_report(
     final_text: str,
     duration_seconds: float,
     failure: Mapping[str, str] | None = None,
+    external_texts: Iterable[str] = (),
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
 
@@ -41,8 +44,16 @@ def build_report(
     "hook 没触发"就会被"消息流正常"掩盖，而那正是屏障失效的样子。
     """
 
-    whitelist = frozenset(allowed_tools)
-    redacted_text = redact_free_text(final_text)
+    allowed_tool_names = tuple(allowed_tools)
+    whitelist = frozenset(allowed_tool_names)
+    internal_tool_names = tuple(call.tool_name for call in summary.calls) + allowed_tool_names
+    output_safety = constrain_output(
+        final_text,
+        forbidden_values=external_texts,
+        internal_tool_names=internal_tool_names,
+        system_prompt=system_prompt,
+    )
+    redacted_text = redact_free_text(output_safety.text)
     calls = [_project_call(call, whitelist) for call in summary.calls]
     effective_failure = dict(failure) if failure else None
     result_error = (stream.result_error or "").casefold()
@@ -96,6 +107,10 @@ def build_report(
             ),
             "gate_bypassed": bool(summary.ungated_calls),
             "final_text": redacted_text,
+            "output_safety": {
+                "blocked": output_safety.blocked,
+                "reasons": output_safety.reasons,
+            },
             "final_text_bytes": summary.final_text_bytes,
             "user_result": summary.user_result.value,
             "terminal_result_count": summary.terminal_result_count,

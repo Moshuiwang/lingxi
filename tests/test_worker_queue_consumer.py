@@ -273,7 +273,9 @@ class WorkerServiceTests(unittest.TestCase):
 
         executor = Executor()
         service = WorkerService(
-            config=worker_config(),
+            config=worker_config(
+                external_texts=(("metric.description", "指标目录中的已知描述"),),
+            ),
             queue=queue,
             executor_factory=lambda config, marker: executor,
             delivery_factory=lambda context, marker: delivery,
@@ -284,6 +286,10 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(queue.finished[0]["status"], "succeeded")
         self.assertEqual(queue.finished[0]["agent_session_id"], "new-session")
         self.assertIsNotNone(executor.kwargs["resume_session_id"])
+        self.assertEqual(
+            executor.kwargs["external_texts"],
+            (("metric.description", "指标目录中的已知描述"),),
+        )
 
     def test_success_result_survives_card_update_failure_in_the_same_topic(self) -> None:
         """V-卡片-03：成功回合的卡片更新失败时补发完整结果且仍为 succeeded。"""

@@ -19,7 +19,8 @@ import json
 import sys
 import time
 
-from typing import Any, Callable, Mapping
+from collections.abc import Iterable, Mapping
+from typing import Any, Callable
 
 from lingxi.adapters.claude_agent_session import (
     AgentSessionInterrupted,
@@ -28,6 +29,7 @@ from lingxi.adapters.claude_agent_session import (
 )
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
 from lingxi.core.execution.hooks import ToolGateway
+from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 
@@ -119,6 +121,7 @@ class WorkerTurnExecutor:
         resume_session_id: str | None = None,
         stop_event: asyncio.Event | None = None,
         on_stream_event: Callable[[Mapping[str, Any]], None] | None = None,
+        external_texts: Iterable[tuple[str, object]] | Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         """执行一个回合，**总是**返回一份报告。
 
@@ -126,6 +129,8 @@ class WorkerTurnExecutor:
         没发生"无法区分，而这两者的处置完全不同。
         """
 
+        normalized_external_texts = normalize_external_texts(external_texts)
+        agent_prompt = compose_agent_prompt(question, normalized_external_texts)
         self._audit.start_turn()
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
@@ -148,7 +153,7 @@ class WorkerTurnExecutor:
             if options is not None:
                 await run_single_turn(
                     options=options,
-                    prompt=question,
+                    prompt=agent_prompt,
                     sink=handle_event,
                     timeout_seconds=self._config.turn_timeout_seconds,
                     resume_session_id=resume_session_id,
@@ -185,6 +190,8 @@ class WorkerTurnExecutor:
             final_text=recorder.final_text,
             duration_seconds=duration_seconds,
             failure=failure,
+            external_texts=tuple(text for _, text in normalized_external_texts),
+            system_prompt=self._config.system_prompt,
         )
 
 

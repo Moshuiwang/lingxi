@@ -108,7 +108,12 @@ def main(
         turn_timeout_seconds=config.turn_timeout_seconds,
     )
 
-    report = asyncio.run(WorkerTurnExecutor(config, stderr_stream=err).run_turn(config.question))
+    report = asyncio.run(
+        WorkerTurnExecutor(config, stderr_stream=err).run_turn(
+            config.question,
+            external_texts=config.external_texts,
+        )
+    )
     turn = report["turn"]
     resources = report["resources"]
     usage = resources["usage"]
