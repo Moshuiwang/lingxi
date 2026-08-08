@@ -1,4 +1,4 @@
-"""V-银河-09 / V-银河-10：工号（主）/ 邮箱（辅）匹配三态与 nick_name 不参与判定。
+"""V-银河-09 / V-银河-10：工号（主）/ 邮箱（辅）匹配与 nick_name 不参与判定。
 
 对应《2026-08-05 花名册身份链与工号邮箱匹配》决策，是门禁 V-开通-02/03/06/09
 的纯函数层用例；全部数据为虚构合成值。
@@ -9,7 +9,6 @@ from __future__ import annotations
 import unittest
 
 from lingxi.core.permission.account_match import (
-    MANUAL,
     MATCHED,
     NOT_FOUND,
     match_galaxy_account,
@@ -50,7 +49,7 @@ class GalaxyAccountMatchedTest(unittest.TestCase):
         self.assertEqual((result.state, result.matched_key), (MATCHED, "employee_no"))
 
     def test_missing_employee_no_falls_back_to_unique_email(self) -> None:
-        # V-开通-09：工号缺失但邮箱可用时按合同走邮箱回退，不转人工。
+        # V-开通-09：工号缺失但邮箱可用时按合同走邮箱回退。
         result = match_galaxy_account("ou_p1", [roster_row(employee_no="")], [galaxy_row(user_name="99999")])
         self.assertEqual((result.state, result.reason), (MATCHED, "unique_email_match"))
         self.assertEqual(result.matched_key, "email")
@@ -73,62 +72,75 @@ class GalaxyAccountMatchedTest(unittest.TestCase):
         )
         self.assertEqual(result.state, NOT_FOUND)
 
-    def test_duplicate_roster_rows_with_identical_keys_still_match(self) -> None:
-        # V-开通-09：多行但 (工号, 邮箱) 完全一致，可唯一判定，不转人工。
-        result = match_galaxy_account("ou_p1", [roster_row(), roster_row()], [galaxy_row()])
-        self.assertEqual(result.state, MATCHED)
+class GalaxyAccountNotAuthorizedTest(unittest.TestCase):
+    """任何非唯一成功都统一走无可用银河权限出口，同时保留内部原因。"""
 
-
-class GalaxyAccountManualTest(unittest.TestCase):
-    """任一键命中多条、两键冲突、花名册歧义或必要资料缺失 → 转人工。"""
-
-    def test_person_absent_from_roster_is_manual(self) -> None:
-        # V-开通-06：花名册查无对应记录 → 转人工核对，不是申请指引。
+    def test_person_absent_from_roster_is_not_authorized(self) -> None:
+        # V-开通-06：花名册查无对应记录 → 不建档、不建待办。
         result = match_galaxy_account("ou_absent", [roster_row()], [galaxy_row()])
-        self.assertEqual((result.state, result.reason), (MANUAL, "roster_not_found"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "roster_not_found"))
 
-    def test_duplicate_roster_rows_with_conflicting_keys_are_manual(self) -> None:
+    def test_duplicate_roster_rows_with_identical_keys_are_not_authorized(self) -> None:
+        result = match_galaxy_account("ou_p1", [roster_row(), roster_row()], [galaxy_row()])
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "roster_multiple_rows"))
+
+    def test_duplicate_roster_rows_with_conflicting_keys_are_not_authorized(self) -> None:
         rows = [roster_row(), roster_row(employee_no="80002")]
         result = match_galaxy_account("ou_p1", rows, [galaxy_row()])
-        self.assertEqual((result.state, result.reason), (MANUAL, "roster_duplicate_conflict"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "roster_multiple_rows"))
 
-    def test_missing_both_keys_is_manual(self) -> None:
+    def test_missing_both_keys_is_not_authorized(self) -> None:
         # V-开通-06：工号与邮箱等必要资料均缺失。
         result = match_galaxy_account("ou_p1", [roster_row(employee_no="", email="")], [galaxy_row()])
-        self.assertEqual((result.state, result.reason), (MANUAL, "required_fields_missing"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "required_fields_missing"))
 
-    def test_employee_no_hitting_two_accounts_is_manual(self) -> None:
+    def test_employee_no_hitting_two_accounts_is_not_authorized(self) -> None:
         # V-开通-02：匹配键命中多条记录时不自动选择任何一条。
         rows = [galaxy_row(), galaxy_row(user_id="U-2", email="other@example-corp.invalid")]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
-        self.assertEqual((result.state, result.reason), (MANUAL, "employee_no_multiple_hits"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "employee_no_multiple_hits"))
 
-    def test_conflicting_keys_are_manual(self) -> None:
+    def test_conflicting_keys_are_not_authorized(self) -> None:
         # V-开通-02：工号指向 U-1、邮箱指向 U-2 → 两键结果冲突。
         rows = [
             galaxy_row(user_id="U-1", email="someone.else@example-corp.invalid"),
             galaxy_row(user_id="U-2", user_name="70000"),
         ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
-        self.assertEqual((result.state, result.reason), (MANUAL, "key_conflict"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "key_conflict"))
 
-    def test_email_multi_hit_is_manual_even_when_employee_no_hits_uniquely(self) -> None:
-        # V-开通-02 / V-银河-09 字面：任一键命中多条即转人工。共享/公共邮箱同时
-        # 挂着别人，正是该让人看一眼的歧义（Codex 复查指出不得被「工号优先」吞掉）。
+    def test_email_multi_hit_is_not_authorized_even_when_employee_no_hits_uniquely(self) -> None:
+        # V-开通-02 / V-银河-09：任一键命中多条都不是唯一成功。
         rows = [
             galaxy_row(user_id="U-1"),
             galaxy_row(user_id="U-2", user_name="80002", nick_name="别人"),
         ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
-        self.assertEqual((result.state, result.reason), (MANUAL, "email_multiple_hits"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "email_multiple_hits"))
 
-    def test_email_fallback_hitting_two_accounts_is_manual(self) -> None:
+    def test_email_fallback_hitting_two_accounts_is_not_authorized(self) -> None:
         rows = [
             galaxy_row(user_id="U-1", user_name="90001"),
             galaxy_row(user_id="U-2", user_name="90002"),
         ]
         result = match_galaxy_account("ou_p1", [roster_row(employee_no="")], rows)
-        self.assertEqual((result.state, result.reason), (MANUAL, "email_multiple_hits"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "email_multiple_hits"))
+
+    def test_employee_no_hit_with_blank_galaxy_user_id_is_not_authorized(self) -> None:
+        result = match_galaxy_account("ou_p1", [roster_row()], [galaxy_row(user_id="")])
+
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "galaxy_record_incomplete"))
+        self.assertIsNone(result.galaxy_user_id)
+
+    def test_email_hit_with_blank_galaxy_user_id_is_not_authorized(self) -> None:
+        result = match_galaxy_account(
+            "ou_p1",
+            [roster_row(employee_no="")],
+            [galaxy_row(user_id="", user_name="99999")],
+        )
+
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "galaxy_record_incomplete"))
+        self.assertIsNone(result.galaxy_user_id)
 
 
 class GalaxyAccountNotFoundTest(unittest.TestCase):
@@ -150,7 +162,7 @@ class GalaxyAccountNotFoundTest(unittest.TestCase):
         )
         self.assertEqual(result.state, NOT_FOUND)
 
-    def test_galaxy_rows_missing_email_do_not_upgrade_not_found_to_manual(self) -> None:
+    def test_galaxy_rows_missing_email_keep_the_not_authorized_result(self) -> None:
         # 早期纯邮箱口径的保守分支已被决策记录取代：银河存在缺 email 账号
         # 不再把「查无」整体升级为人工。
         rows = [
@@ -162,7 +174,7 @@ class GalaxyAccountNotFoundTest(unittest.TestCase):
 
 
 class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):
-    """V-银河-10：nick_name 只作辅助核对，不参与判定。"""
+    """V-银河-10：nick_name 只作内部诊断，不参与判定。"""
 
     def test_nick_name_collision_does_not_change_a_matched_result(self) -> None:
         rows = [
@@ -172,14 +184,14 @@ class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual((result.state, result.galaxy_user_id), (MATCHED, "U-1"))
 
-    def test_duplicate_employee_no_stays_manual_even_when_one_nick_name_matches(self) -> None:
+    def test_duplicate_employee_no_stays_not_authorized_even_when_one_nick_name_matches(self) -> None:
         # 变异守卫：两行同工号、姓名一同一异，若实现偷偷用姓名挑一条，本用例变红。
         rows = [
             galaxy_row(user_id="U-1", nick_name="何虚工", email="a@example-corp.invalid"),
             galaxy_row(user_id="U-2", nick_name="别人", email="b@example-corp.invalid"),
         ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
-        self.assertEqual((result.state, result.reason), (MANUAL, "employee_no_multiple_hits"))
+        self.assertEqual((result.state, result.reason), (NOT_FOUND, "employee_no_multiple_hits"))
 
     def test_nick_name_cannot_rescue_a_missed_lookup(self) -> None:
         rows = [galaxy_row(user_name="99999", email="other@example-corp.invalid", nick_name="何虚工")]
@@ -206,8 +218,8 @@ class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):
 
 
 class GalaxyAccountStateVocabularyTest(unittest.TestCase):
-    def test_only_three_states_exist(self) -> None:
-        self.assertEqual({MATCHED, MANUAL, NOT_FOUND}, {"matched", "manual", "not_found"})
+    def test_only_two_user_level_states_exist(self) -> None:
+        self.assertEqual({MATCHED, NOT_FOUND}, {"matched", "not_found"})
 
 
 if __name__ == "__main__":

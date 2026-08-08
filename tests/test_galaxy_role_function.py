@@ -1,6 +1,6 @@
 """A 前缀角色到职能标签的映射（V-银河-11）。
 
-映射规则来自产品负责人 2026-08-05 的决策 2：抽成仓库内可维护的配置文件，
+映射规则来自产品负责人 2026-08-05、2026-08-08 的决定：抽成仓库内可维护的配置文件，
 由产品负责人后期持续维护。实现不得对配置未覆盖的角色名做任何猜测。
 """
 
@@ -91,8 +91,37 @@ class ShippedRoleFunctionMapFileTest(unittest.TestCase):
     def test_repository_config_file_loads_and_contains_the_decided_rules(self) -> None:
         mapping = load_role_function_map(default_role_function_map_path())
 
-        self.assertEqual(mapping["A运营"], "运营")
-        self.assertEqual(mapping["A销售"], "销售")
+        expected = {
+            "A商务": "商务",
+            "A海外CEO门户": "CEO",
+            "A海外收视率样本户": "内容",
+            "A海外本地员工收视率报表": "内容",
+            "A财务": "财务",
+            "A财务-折扣": "财务",
+            "A运营": "运营",
+            "A运营_CEO": "运营",
+            "A运营_DTTDTH": "运营",
+            "A运营_万村通": "运营",
+            "A运营_呼叫中心": "运营",
+            "A运营（所有）": "运营",
+            "A运营_OTT专岗": "OTT",
+            "A运营_OTT运营分析": "OTT",
+            "A销售": "销售",
+            "A销售_三级销售体系": "销售",
+            "A销售_中文包": "销售",
+            "A销售_渠道分析（海外）": "销售",
+            "A销售_电视机": "销售",
+            "A销售（所有）": "销售",
+        }
+
+        self.assertEqual(dict(mapping), expected)
+        for unsupported in (
+            "APP产品运营",
+            "APP收入",
+            "APP运营（总部）-收视与媒资",
+            "A海外本地员工营业厅",
+        ):
+            self.assertNotIn(unsupported, mapping)
 
     def test_config_file_documents_how_to_maintain_it(self) -> None:
         text = default_role_function_map_path().read_text(encoding="utf-8")

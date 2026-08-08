@@ -78,7 +78,7 @@ class EmploymentStatus:
     def from_feishu(cls, payload: Any) -> "EmploymentStatus | None":
         """把飞书返回的 ``status`` 转成判定投影；任何字段缺失或非布尔即返回 ``None``。
 
-        返回 ``None`` 表示**不可判定**，调用方必须转人工，不得当作在职。默认成
+        返回 ``None`` 表示**不可判定**，调用方必须拒绝开通，不得当作在职。默认成
         在职是这条链路最危险的错误：它会给一个已冻结的账号开通并发布权限。
         """
 
@@ -95,25 +95,19 @@ class EmploymentStatus:
 
 class FirstContactOutcome(str, Enum):
     RECORD_READY = "record_ready"
-    NOT_EMPLOYED = "not_employed"
-    MANUAL_REVIEW = "manual_review"
+    NOT_AUTHORIZED = "not_authorized"
     DELEGATED_SUBJECT_IGNORED = "delegated_subject_ignored"
     DIRECTORY_UNAVAILABLE = "directory_unavailable"
 
 
-class ReviewReason(str, Enum):
-    """转人工的原因。
-
-    正式的 ``manual_review`` 表（含 ``reason`` 的 CHECK 取值）在保留与管理切片
-    才落地；届时按下面的对应关系映射，不在本模块提前引入那张表：
-    ``NOT_LOCATED`` / ``INCOMPLETE_PROFILE`` → ``incomplete_record``、
-    ``AMBIGUOUS_IDENTITY`` → ``duplicate_name``、``EMPLOYMENT_UNKNOWN`` → ``state_unknown``。
-    """
+class FailureReason(str, Enum):
+    """不开通的内部诊断原因；只用于审计和排障，不创建人工核对待办。"""
 
     NOT_LOCATED = "not_located"
     AMBIGUOUS_IDENTITY = "ambiguous_identity"
     INCOMPLETE_PROFILE = "incomplete_profile"
     EMPLOYMENT_UNKNOWN = "employment_unknown"
+    NOT_EMPLOYED = "not_employed"
 
 
 @dataclass(frozen=True)
@@ -148,7 +142,7 @@ class FirstContactDecision:
     outcome: FirstContactOutcome
     message: str
     draft: IdentityRecordDraft | None = None
-    review_reason: ReviewReason | None = None
+    failure_reason: FailureReason | None = None
 
     @property
     def creates_record(self) -> bool:
@@ -159,10 +153,12 @@ class FirstContactDecision:
 # 表名或堆栈。措辞回答"现在发生了什么、接下来谁处理、我要不要重发"。
 _MESSAGES: dict[FirstContactOutcome, str] = {
     FirstContactOutcome.RECORD_READY: "已经认出你了，正在为你准备可用的查询范围，稍后会在这里告诉你结果。",
-    FirstContactOutcome.NOT_EMPLOYED: "你的账号当前不是在职状态，暂时无法开通。请先联系人事或你的管理员确认账号状态，恢复后再来这里发一条消息即可。",
-    FirstContactOutcome.MANUAL_REVIEW: "暂时无法确认你的身份信息，已经转给管理员人工核对。核对完成后会在这里回复你，不需要重复发送。",
+    FirstContactOutcome.NOT_AUTHORIZED: "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 Lingxi 使用。Lingxi 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
     FirstContactOutcome.DELEGATED_SUBJECT_IGNORED: "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。",
-    FirstContactOutcome.DIRECTORY_UNAVAILABLE: "组织资料同步暂时不可用，现在还不能核对你的身份。已经记录本次请求，管理员处理后会在这里回复你，不需要重复发送。",
+    FirstContactOutcome.DIRECTORY_UNAVAILABLE: (
+        "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
+        "处理完成后我们会通知你。错误码：LX-ONBOARD-001。"
+    ),
 }
 
 
@@ -197,24 +193,23 @@ def decide_first_contact(
         return _decision(FirstContactOutcome.DIRECTORY_UNAVAILABLE)
 
     if location.outcome is LocationOutcome.NOT_FOUND:
-        return _decision(FirstContactOutcome.MANUAL_REVIEW, review_reason=ReviewReason.NOT_LOCATED)
+        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_LOCATED)
     if location.outcome is LocationOutcome.AMBIGUOUS or location.member is None:
-        return _decision(FirstContactOutcome.MANUAL_REVIEW, review_reason=ReviewReason.AMBIGUOUS_IDENTITY)
+        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.AMBIGUOUS_IDENTITY)
 
     member = location.member
 
-    # 3. 在职状态不可判定 → 转人工；明确非在职 → 终态。两者都不建档。
+    # 3. 在职状态不可判定或明确非在职都按无可用权限结束。两者都不建档、不建待办。
     if employment is None:
-        return _decision(FirstContactOutcome.MANUAL_REVIEW, review_reason=ReviewReason.EMPLOYMENT_UNKNOWN)
+        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.EMPLOYMENT_UNKNOWN)
     if not employment.employed:
-        return _decision(FirstContactOutcome.NOT_EMPLOYED)
+        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.NOT_EMPLOYED)
 
-    # 4. 必要资料缺失时不写半条记录（断言 V-开通-06）。产品合同把**部门**列进
-    #    必要资料（「缺少姓名、部门、租户等必要资料…转人工核对」）——此前部门被
-    #    当可选字段放行，会建出 department 为空的半份档案（Codex 复查发现）。
+    # 4. 必要资料缺失时不写半条记录（断言 V-开通-06），统一走无可用权限出口。
+    #    部门仍是必要资料；把它当可选字段放行会建出 department 为空的半份档案。
     department = member.department_names[0].strip() if member.department_names and member.department_names[0] else ""
     if any(_blank(value) for value in (member.open_id, member.user_id, member.union_id, member.display_name, member.tenant_key)) or not department:
-        return _decision(FirstContactOutcome.MANUAL_REVIEW, review_reason=ReviewReason.INCOMPLETE_PROFILE)
+        return _decision(FirstContactOutcome.NOT_AUTHORIZED, failure_reason=FailureReason.INCOMPLETE_PROFILE)
 
     draft = IdentityRecordDraft(
         feishu_open_id=member.open_id.strip(),
@@ -232,6 +227,6 @@ def _decision(
     outcome: FirstContactOutcome,
     *,
     draft: IdentityRecordDraft | None = None,
-    review_reason: ReviewReason | None = None,
+    failure_reason: FailureReason | None = None,
 ) -> FirstContactDecision:
-    return FirstContactDecision(outcome=outcome, message=_MESSAGES[outcome], draft=draft, review_reason=review_reason)
+    return FirstContactDecision(outcome=outcome, message=_MESSAGES[outcome], draft=draft, failure_reason=failure_reason)

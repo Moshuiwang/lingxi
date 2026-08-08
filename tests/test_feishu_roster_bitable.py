@@ -80,7 +80,7 @@ class FeishuRosterBitableTest(unittest.TestCase):
 
         rows = read_roster_records(reader)
 
-        # 花名册实测存在同一人员 ID 的重复行；adapter 不去重，由匹配层判为转人工。
+        # 花名册实测存在同一人员 ID 的重复行；adapter 不去重，由匹配层统一判为无可用权限。
         self.assertEqual(len(rows), 2)
 
     def test_missing_optional_fields_become_empty_text(self) -> None:
