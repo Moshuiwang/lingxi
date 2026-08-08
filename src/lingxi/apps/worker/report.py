@@ -20,6 +20,8 @@ from typing import Any, Iterable, Mapping
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 
+_GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled"})
+
 
 def build_report(
     *,
@@ -29,6 +31,7 @@ def build_report(
     summary: TurnAuditSummary,
     stream: TurnStreamRecorder,
     final_text: str,
+    duration_seconds: float,
     failure: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
@@ -41,6 +44,20 @@ def build_report(
     whitelist = frozenset(allowed_tools)
     redacted_text = redact_free_text(final_text)
     calls = [_project_call(call, whitelist) for call in summary.calls]
+    failure_code = failure.get("code") if failure else None
+    guard_triggered = failure_code in _GUARD_FAILURE_CODES
+    termination_reason = failure_code or ("completed" if summary.terminal_ok else "turn_not_closed")
+    termination_state = "guarded" if guard_triggered else ("completed" if failure is None else "failed")
+    result_delivery = "confirmed" if summary.user_result.value == "obtained" else "not_confirmed"
+    usage = stream.usage_summary
+    resources = {
+        "agent_turns": stream.agent_turns,
+        "agent_turns_status": "known" if stream.agent_turns is not None else "unknown",
+        "duration_seconds": duration_seconds,
+        "tool_call_count": len(calls),
+        "executed_tool_call_count": sum(1 for call in summary.calls if call.executed),
+        "usage": usage,
+    }
     return {
         "trace_id": trace_id,
         "question_bytes": len(question.encode("utf-8")),
@@ -64,6 +81,12 @@ def build_report(
             "sdk_result_message_count": stream.result_message_count,
             "sdk_result_is_error": stream.result_is_error,
             "sdk_result_subtype": redact_free_text(stream.result_subtype) if stream.result_subtype else None,
+            "sdk_terminal_reason": redact_free_text(stream.terminal_reason) if stream.terminal_reason else None,
+            "termination_state": termination_state,
+            "termination_reason": termination_reason,
+            "guard_triggered": guard_triggered,
+            "result_delivery": result_delivery,
+            "duration_seconds": duration_seconds,
         },
         "audit": {
             "call_count": len(calls),
@@ -71,12 +94,16 @@ def build_report(
             "failed_count": len(summary.failed_calls),
             "ungated_count": len(summary.ungated_calls),
             "tool_result_count": stream.tool_result_count,
+            "termination_reason": termination_reason,
+            "guard_triggered": guard_triggered,
+            "usage": usage,
             "executed_tool_names": [
                 _project_tool_name(name, whitelist) for name in summary.executed_tool_names
             ],
             "denied": [call for call in calls if call["allowed"] is False],
             "calls": calls,
         },
+        "resources": resources,
         "failure": dict(failure) if failure else None,
     }
 

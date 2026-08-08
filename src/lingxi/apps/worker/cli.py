@@ -70,10 +70,14 @@ def main(
         question_bytes=len(config.question.encode("utf-8")),
         mcp_servers=sorted(config.mcp_servers),
         workspace_configured=config.workspace is not None,
+        max_turns=config.max_turns,
+        turn_timeout_seconds=config.turn_timeout_seconds,
     )
 
     report = asyncio.run(WorkerTurnExecutor(config, stderr_stream=err).run_turn(config.question))
     turn = report["turn"]
+    resources = report["resources"]
+    usage = resources["usage"]
     gate_bypassed = report["audit"]["ungated_count"] > 0
     _log(
         err,
@@ -86,6 +90,17 @@ def main(
         sdk_result_message_count=turn["sdk_result_message_count"],
         sdk_result_is_error=turn["sdk_result_is_error"],
         sdk_result_subtype=turn["sdk_result_subtype"],
+        sdk_terminal_reason=turn["sdk_terminal_reason"],
+        termination_state=turn["termination_state"],
+        termination_reason=turn["termination_reason"],
+        guard_triggered=turn["guard_triggered"],
+        duration_seconds=resources["duration_seconds"],
+        agent_turns=resources["agent_turns"],
+        tool_call_count=resources["tool_call_count"],
+        executed_tool_call_count=resources["executed_tool_call_count"],
+        usage_status=usage["status"],
+        usage_source=usage["source"],
+        usage_fields=usage.get("fields"),
         gate_bypassed=gate_bypassed,
         final_text_bytes=turn["final_text_bytes"],
         call_count=report["audit"]["call_count"],

@@ -58,6 +58,7 @@ class StubAgentOptions:
         self,
         *,
         allowed_tools=None,
+        max_turns=None,
         disallowed_tools=None,
         hooks=None,
         mcp_servers=None,
@@ -70,6 +71,7 @@ class StubAgentOptions:
         strict_mcp_config=None,
     ) -> None:
         self.allowed_tools = allowed_tools
+        self.max_turns = max_turns
         self.disallowed_tools = disallowed_tools
         self.hooks = hooks
         self.mcp_servers = mcp_servers
@@ -123,9 +125,25 @@ class StubSystemMessage:
 
 
 class StubResultMessage:
-    def __init__(self, subtype="success", is_error=False) -> None:
+    def __init__(
+        self,
+        subtype="success",
+        is_error=False,
+        num_turns=None,
+        usage=None,
+        terminal_reason=None,
+        usage_source=None,
+    ) -> None:
         self.subtype = subtype
         self.is_error = is_error
+        if num_turns is not None:
+            self.num_turns = num_turns
+        if usage is not None:
+            self.usage = usage
+        if terminal_reason is not None:
+            self.terminal_reason = terminal_reason
+        if usage_source is not None:
+            self.usage_source = usage_source
 
 
 class FakeAgentSDK:
@@ -142,6 +160,10 @@ class FakeAgentSDK:
         result_messages: int = 1,
         result_subtype: str = "success",
         result_is_error: bool = False,
+        result_num_turns: int | None = None,
+        result_usage: dict | None = None,
+        terminal_reason: str | None = None,
+        usage_source: str = "mock",
         skip_pre_tool_use: bool = False,
     ) -> None:
         self.script = list(script)
@@ -155,6 +177,10 @@ class FakeAgentSDK:
         self.result_messages = result_messages
         self.result_subtype = result_subtype
         self.result_is_error = result_is_error
+        self.result_num_turns = result_num_turns
+        self.result_usage = result_usage
+        self.terminal_reason = terminal_reason
+        self.usage_source = usage_source
         # 只发 PostToolUse 不发 PreToolUse：模拟 hook 未注册/被跳过的屏障失效形状。
         self.skip_pre_tool_use = skip_pre_tool_use
         # 步骤走完后抛异常：模拟「已有绕过调用、随后传输又失败」的叠加形状。
@@ -299,7 +325,14 @@ class FakeAgentSDK:
             raise self.raise_after_steps
         await self._fire(options, "Stop", {"hook_event_name": "Stop"}, None)
         for _ in range(self.result_messages):
-            yield StubResultMessage(subtype=self.result_subtype, is_error=self.result_is_error)
+            yield StubResultMessage(
+                subtype=self.result_subtype,
+                is_error=self.result_is_error,
+                num_turns=self.result_num_turns,
+                usage=self.result_usage,
+                terminal_reason=self.terminal_reason,
+                usage_source=self.usage_source,
+            )
 
     def _execute(self, step) -> None:
         self.executed.append(step["tool"])
@@ -387,6 +420,7 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(executor.policy.allowed_tools, frozenset({READ_ONLY_TOOL}))
         self.assertEqual(fake.options[0].allowed_tools, [READ_ONLY_TOOL], "纵深防御层也只列这一个工具")
+        self.assertEqual(fake.options[0].max_turns, 20, "默认轮数必须通过 SDK 选项生效")
         self.assertEqual(
             fake.options[0].disallowed_tools,
             [],
@@ -736,6 +770,190 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(recorded["metric"], "dau")
         self.assertEqual(recorded["note"], {"omitted": True})
 
+    def test_resource_defaults_and_custom_values_are_configurable(self) -> None:
+        config = self._load(
+            LINGXI_WORKER_MAX_TURNS="7",
+            LINGXI_WORKER_TURN_TIMEOUT_SECONDS="12.5",
+        )
+
+        self.assertEqual(config.max_turns, 7)
+        self.assertEqual(config.turn_timeout_seconds, 12.5)
+
+    def test_resource_values_beyond_hard_limits_fail_at_startup(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        for name, value in (
+            ("LINGXI_WORKER_MAX_TURNS", "31"),
+            ("LINGXI_WORKER_TURN_TIMEOUT_SECONDS", "900.1"),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(WorkerConfigError):
+                    self._load(**{name: value})
+
+    def test_max_turns_must_be_a_positive_integer(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        for value in ("0", "-1", "1.5", "not-a-number"):
+            with self.subTest(value=value), self.assertRaises(WorkerConfigError):
+                self._load(LINGXI_WORKER_MAX_TURNS=value)
+
+
+class WorkerResourceGuardTest(unittest.TestCase):
+    """V-护栏-01…07：worker 资源上限与 usage 出口。"""
+
+    def _run_with_sdk(
+        self,
+        script,
+        *,
+        sdk_kwargs=None,
+        env_overrides=None,
+        clock=None,
+    ):
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        fake = FakeAgentSDK(script, **(sdk_kwargs or {})).install(self)
+        config = load_config(worker_env(**(env_overrides or {})))
+        executor = WorkerTurnExecutor(config, clock=clock)
+        report = asyncio.run(executor.run_turn(config.question))
+        return report, fake, executor
+
+    def test_v_hulan_01_max_turns_is_passed_to_sdk_and_has_distinct_guard_state(self) -> None:
+        report, fake, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "尚未完成。"}],
+            sdk_kwargs={"result_subtype": "error_max_turns", "result_is_error": True, "result_num_turns": 2},
+            env_overrides={"LINGXI_WORKER_MAX_TURNS": "2"},
+        )
+
+        self.assertEqual(fake.options[0].max_turns, 2)
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertEqual(report["turn"]["termination_state"], "guarded")
+        self.assertEqual(report["turn"]["termination_reason"], "max_turns_exceeded")
+        self.assertTrue(report["turn"]["guard_triggered"])
+        self.assertEqual(report["turn"]["result_delivery"], "not_confirmed")
+
+    def test_v_hulan_02_wall_clock_and_cancel_are_distinct_from_max_turns(self) -> None:
+        import asyncio as _asyncio
+
+        hanging = FakeAgentSDK([{"kind": "text", "text": "占位"}]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+
+        class HangingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    await _asyncio.sleep(3600)
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        module.ClaudeSDKClient = HangingClient
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        config = load_config(worker_env(LINGXI_WORKER_TURN_TIMEOUT_SECONDS="0.01"))
+        timeout_report = _asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+        self.assertEqual(timeout_report["failure"]["code"], "turn_timeout")
+        self.assertEqual(timeout_report["turn"]["termination_reason"], "turn_timeout")
+
+        class CancelledClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    raise _asyncio.CancelledError()
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        module.ClaudeSDKClient = CancelledClient
+        cancel_report = _asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+        self.assertEqual(cancel_report["failure"]["code"], "cancelled")
+        self.assertEqual(cancel_report["turn"]["termination_reason"], "cancelled")
+        self.assertNotEqual(cancel_report["turn"]["termination_reason"], "turn_timeout")
+        del hanging
+
+    def test_v_hulan_03_guarded_turn_with_confirmed_result_is_marked_early(self) -> None:
+        report, _, _ = self._run_with_sdk(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "text", "text": "近 7 天日活是 1024。"},
+            ],
+            sdk_kwargs={"result_subtype": "error_max_turns", "result_is_error": True, "result_num_turns": 2},
+        )
+
+        self.assertFalse(report["turn"]["closed"])
+        self.assertTrue(report["turn"]["guard_triggered"])
+        self.assertEqual(report["turn"]["result_delivery"], "confirmed")
+        self.assertEqual(report["turn"]["user_result"], "obtained")
+        self.assertEqual(report["audit"]["termination_reason"], "max_turns_exceeded")
+
+    def test_v_hulan_04_resource_counters_match_injected_execution(self) -> None:
+        ticks = iter((100.0, 101.25))
+        report, _, _ = self._run_with_sdk(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "tool", "tool": "Write", "input": {"file_path": "probe"}},
+                {"kind": "text", "text": "已完成。"},
+            ],
+            sdk_kwargs={"result_num_turns": 3},
+            clock=lambda: next(ticks),
+        )
+
+        resources = report["resources"]
+        self.assertEqual(resources["agent_turns"], 3)
+        self.assertEqual(resources["agent_turns_status"], "known")
+        self.assertEqual(resources["duration_seconds"], 1.25)
+        self.assertEqual(resources["tool_call_count"], 2)
+        self.assertEqual(resources["executed_tool_call_count"], 1)
+
+    def test_v_hulan_05_unknown_usage_is_explicit_and_never_zero_filled(self) -> None:
+        report, _, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "没有拿到可确认结果。"}],
+            sdk_kwargs={"result_num_turns": 1},
+        )
+
+        usage = report["resources"]["usage"]
+        self.assertEqual(usage["status"], "unknown")
+        self.assertEqual(usage["source"], "mock")
+        self.assertNotIn("fields", usage)
+        self.assertNotIn("input_tokens", json.dumps(report))
+        self.assertNotIn('"output_tokens": 0', json.dumps(report))
+
+    def test_v_hulan_05_mock_usage_is_numeric_summary_only(self) -> None:
+        report, _, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "已完成。"}],
+            sdk_kwargs={
+                "result_num_turns": 1,
+                "result_usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "secret": FAKE_CREDENTIAL,
+                    "result": "模型正文不得进入 usage",
+                },
+            },
+        )
+
+        usage = report["resources"]["usage"]
+        self.assertEqual(usage, {"status": "known", "source": "mock", "fields": {"input_tokens": 12, "output_tokens": 7}})
+        self.assertNotIn(FAKE_CREDENTIAL, json.dumps(report, ensure_ascii=False))
+        self.assertNotIn("模型正文不得进入 usage", json.dumps(report, ensure_ascii=False))
+
+    def test_v_hulan_06_mock_usage_carries_mock_source_and_no_billing_claim(self) -> None:
+        from lingxi.core.execution.audit import TurnAudit
+        from lingxi.core.execution.message_stream import TurnStreamRecorder
+
+        recorder = TurnStreamRecorder(TurnAudit())
+        recorder.handle(
+            {
+                "kind": "result",
+                "is_error": False,
+                "subtype": "success",
+                "usage_source": "mock",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }
+        )
+
+        self.assertEqual(recorder.usage_summary["source"], "mock")
+        self.assertEqual(recorder.usage_summary["status"], "known")
+
 
 class ReviewHardeningTest(unittest.TestCase):
     """PR #47 独立复查后补的收口信号用例：SDK 自报错误、终止双计数、屏障绕过、
@@ -757,10 +975,11 @@ class ReviewHardeningTest(unittest.TestCase):
             FakeAgentSDK(script, result_subtype="error_max_turns", result_is_error=True)
         )
 
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 4)
         self.assertFalse(payload["turn"]["closed"])
         self.assertTrue(payload["turn"]["sdk_result_is_error"])
         self.assertEqual(payload["turn"]["sdk_result_subtype"], "error_max_turns")
+        self.assertEqual(payload["failure"]["code"], "max_turns_exceeded")
         self.assertIn('"level": "error"', stderr_text.replace(": ", ": "))
 
     def test_a_missing_result_message_does_not_close_the_turn(self) -> None:
@@ -945,7 +1164,7 @@ class ReviewHardeningTest(unittest.TestCase):
         report = _asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
 
         self.assertIsNotNone(report["failure"])
-        self.assertEqual(report["failure"]["code"], "interrupted")
+        self.assertEqual(report["failure"]["code"], "cancelled")
         self.assertFalse(report["turn"]["closed"])
 
 
