@@ -84,8 +84,12 @@ REQUIRED_MODULES = (
 )
 
 # 随包发布的数据文件：模块导入成功不代表数据文件进了 wheel（后者要靠
-# pyproject.toml 的 package-data 声明）。缺失时角色职能会整列变成「未映射」。
-REQUIRED_PACKAGE_DATA = (("lingxi.config", "galaxy_role_function_map.toml"),)
+# pyproject.toml 的 package-data 声明）。缺失时角色职能会整列变成「未映射」，或让
+# 正式用户路径在部署后失去版本化内容目录。
+REQUIRED_PACKAGE_DATA = (
+    ("lingxi.config", "galaxy_role_function_map.toml"),
+    ("lingxi.config", "content.toml"),
+)
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")
 

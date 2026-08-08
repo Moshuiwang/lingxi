@@ -176,6 +176,8 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertEqual(decision.draft.department, "测试部门")
         self.assertEqual(decision.draft.tenant_key, "tenant_a")
         self.assertEqual(decision.draft.provisioning_state, "matching")
+        self.assertEqual(decision.content_key, "onboarding.matched")
+        self.assertTrue(decision.content_version)
 
     def test_the_draft_carries_no_employment_status_field_at_all(self) -> None:
         """硬约束 2：``status`` 只用于当次拦截，存下来立刻产生陈旧窗口。"""

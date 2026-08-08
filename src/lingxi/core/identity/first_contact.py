@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
+from lingxi.config.content import default_content_catalog
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember, index_members_by_open_id
 
 
@@ -141,6 +142,8 @@ class IdentityRecordDraft:
 class FirstContactDecision:
     outcome: FirstContactOutcome
     message: str
+    content_key: str = ""
+    content_version: str = ""
     draft: IdentityRecordDraft | None = None
     failure_reason: FailureReason | None = None
 
@@ -149,16 +152,11 @@ class FirstContactDecision:
         return self.draft is not None
 
 
-# 面向员工的终态文案。按错误模型的约定：可直接展示的中文，不含内部标识、
-# 表名或堆栈。措辞回答"现在发生了什么、接下来谁处理、我要不要重发"。
-_MESSAGES: dict[FirstContactOutcome, str] = {
-    FirstContactOutcome.RECORD_READY: "已经认出你了，正在为你准备可用的查询范围，稍后会在这里告诉你结果。",
-    FirstContactOutcome.NOT_AUTHORIZED: "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 Lingxi 使用。Lingxi 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
-    FirstContactOutcome.DELEGATED_SUBJECT_IGNORED: "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。",
-    FirstContactOutcome.DIRECTORY_UNAVAILABLE: (
-        "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
-        "处理完成后我们会通知你。错误码：LX-ONBOARD-001。"
-    ),
+_MESSAGE_KEYS: dict[FirstContactOutcome, str] = {
+    FirstContactOutcome.RECORD_READY: "onboarding.matched",
+    FirstContactOutcome.NOT_AUTHORIZED: "onboarding.not_authorized",
+    FirstContactOutcome.DELEGATED_SUBJECT_IGNORED: "onboarding.delegated_subject",
+    FirstContactOutcome.DIRECTORY_UNAVAILABLE: "onboarding.internal_error",
 }
 
 
@@ -229,4 +227,12 @@ def _decision(
     draft: IdentityRecordDraft | None = None,
     failure_reason: FailureReason | None = None,
 ) -> FirstContactDecision:
-    return FirstContactDecision(outcome=outcome, message=_MESSAGES[outcome], draft=draft, failure_reason=failure_reason)
+    content = default_content_catalog().text(_MESSAGE_KEYS[outcome])
+    return FirstContactDecision(
+        outcome=outcome,
+        message=content.text,
+        content_key=content.key,
+        content_version=content.version,
+        draft=draft,
+        failure_reason=failure_reason,
+    )
