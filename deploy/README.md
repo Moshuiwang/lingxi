@@ -13,8 +13,9 @@
 | `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57 / S4 前半）。放在非默认 profile 里，见下 |
 | `worker` | **一次性作业** | `python -m lingxi.apps.worker` | 单回合受控执行。跑一个 Agent SDK 回合、往 stdout 写一个 JSON 报告、退出 |
 | `migrate` | **一次性作业** | `python -m alembic -c /opt/lingxi/alembic.ini` | 部署时跑一次的数据库迁移 |
+| `reauthorize` | **一次性作业，默认不启动** | `python -m lingxi.apps.reauthorize` | 凭据丢失或过期时的正式重授权；复用 scheduler 镜像，放在 `job` profile |
 
-**worker 是一次性作业，不是已上线的常驻服务。** 它不领任务、不接飞书、不处理 `SIGTERM`（`grep -rn signal src/lingxi/apps/worker/` 为空）。常驻 worker 需要任务队列与 gateway 入队，属 **S4 下半**，不在本批。`docker compose up -d` 只会启动 `scheduler` 一个进程。
+**worker 与 reauthorize 都是一次性作业，不是已上线的常驻服务。** worker 不领任务、不接飞书、不处理 `SIGTERM`（`grep -rn signal src/lingxi/apps/worker/` 为空）。常驻 worker 需要任务队列与 gateway 入队，属 **S4 下半**，不在本批。`docker compose up -d` 只会启动 `scheduler` 一个进程；重授权必须由运维人员显式 `run`。
 
 **`gateway` 已随 [#57](https://github.com/Moshuiwang/lingxi/issues/57) 落地并纳入编排，但默认不启动。** 它把事件落库成任务，而任务队列此刻**没有消费者**——main 上的 worker 是单回合 CLI，不领任务。启用它等于开始接收真实用户消息、排进一个没人处理的队列，用户看到的是"发了没反应"，比不接入更糟。因此它放在一个非默认 profile 里：
 
@@ -48,7 +49,7 @@ S4 下半（常驻 worker 与任务领取）接线之后，删掉 `compose.yaml`
 
 ## 准备
 
-一个环境要**五个**文件，不是一个：
+一个环境要**六个**文件，不是一个：
 
 ```bash
 cp deploy/.env.example deploy/.env.stage             # 只放 LINGXI_IMAGE_REGISTRY / LINGXI_IMAGE_TAG
@@ -56,9 +57,10 @@ $EDITOR deploy/.env.stage.scheduler                  # 数据库 DSN、Fernet �
 $EDITOR deploy/.env.stage.gateway                    # 飞书应用凭据 + 数据库 DSN（#57）
 $EDITOR deploy/.env.stage.worker                     # 只有 LINGXI_WORKER_* 与模型端点凭据
 $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
+$EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库、应用与全部 scope 配置
 ```
 
-五个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
+六个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
 **为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
 
@@ -70,7 +72,7 @@ $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 
 代码框架「横切约定」要求凭据不进代码、日志、数据库、用户环境，长期凭据放操作系统级密钥管理。本批用文件注入，因此**文件权限就是这条边界的全部**——一个 0644 的 env 文件等于把生产数据库口令、Fernet 密钥和飞书应用密钥摊给机器上任何一个账号。
 
-五个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway` 装的是飞书应用密钥与数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
+六个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway` 与 `.env.<环境>.reauthorize` 都装有飞书应用密钥和数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
 
 ```bash
 umask 077
@@ -79,6 +81,7 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.schedul
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.gateway
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.reauthorize
 # 然后再往里写内容
 ```
 
@@ -87,13 +90,13 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
 ```bash
 # stage
 for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway \
-         deploy/.env.stage.worker deploy/.env.stage.migrate; do
+         deploy/.env.stage.worker deploy/.env.stage.migrate deploy/.env.stage.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 
 # 生产（同型，把 stage 换成 prod）
 for f in deploy/.env.prod deploy/.env.prod.scheduler deploy/.env.prod.gateway \
-         deploy/.env.prod.worker deploy/.env.prod.migrate; do
+         deploy/.env.prod.worker deploy/.env.prod.migrate deploy/.env.prod.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 # 期望每行都是 `<文件> 600 <部署用户>`
@@ -175,7 +178,34 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 
 **刻意是两个卷**：凭据是安全边界、用户目录是业务数据，备份周期、恢复策略与删除语义都不同，合成一个卷会让"只恢复凭据"或"只清用户目录"变成不可能。
 
-凭据卷必须**跨部署持久**，镜像替换与重启不得丢失——部署目标是对该凭据「零特殊处理」。文件丢失或过期时的保底是重新走一次「四达文档会议助手」授权（产品负责人 2026-08-05）；正式重授权入口见 [#67](https://github.com/Moshuiwang/lingxi/issues/67)。
+凭据卷必须**跨部署持久**，镜像替换与重启不得丢失——部署目标是对该凭据「零特殊处理」。文件丢失或过期时的保底按下面的正式 job 流程重新走一次「四达文档会议助手」授权。
+
+## 凭据丢失或过期的保底
+
+正式重授权是一次性运维动作，不新增常驻服务。它使用 scheduler 镜像内随包发布的
+`python -m lingxi.apps.reauthorize`，以 uid 10001 挂载同一个 `lingxi-{stage,prod}-credentials`
+卷；state 文件和凭据文件都在该卷内，入口会在启动前拒绝文件或锁文件路径冲突。
+
+以 stage 为例，确认六个 env 文件都已按上面的 preflight 准备好后执行：
+
+```bash
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+  --profile job run --rm reauthorize
+```
+
+终端只显示授权地址和脱敏结果；按提示在受控浏览器完成同意，再在关闭回显的输入提示中粘贴完整 HTTPS 回跳地址。不要把回跳地址或授权码写入命令行、shell 历史、Issue 或日志。取消、换码失败或保存失败后不要重放旧回跳，重新运行该一次性 job 取得新的 state。
+
+成功退出后回读 scheduler，并确认凭据文件仍由 uid 10001 可读：
+
+```bash
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d scheduler
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml logs scheduler
+```
+
+生产环境将 `.env.stage`、`compose.stage.yaml` 和 `lingxi-stage-credentials` 对应替换为 prod 配置；真实生产操作仍须另建并批准 `[ops]` Issue，不在本 Story 执行。
 
 ## gateway 的停止宽限期为什么是 60 秒
 

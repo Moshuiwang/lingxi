@@ -73,7 +73,15 @@ class FakeVault:
     def claim_due(self):
         return self._claims.pop(0) if self._claims else None
 
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at=None, replacing_generation=None) -> bool:
+    def save(
+        self,
+        *,
+        subject_open_id: str,
+        grant: AuthorizationGrant,
+        issued_at=None,
+        replacing_generation=None,
+        expected_registered_subject_open_id=None,
+    ) -> bool:
         if self._save_failures > 0:
             self._save_failures -= 1
             raise RuntimeError("模拟写库失败")
@@ -455,7 +463,15 @@ class SigtermTest(unittest.TestCase):
                     "subject_open_id": "ou_delegated",
                     "grant": AuthorizationGrant(SecretToken("fake"), 604800, ""),
                 })()
-            def save(self, *, subject_open_id, grant, issued_at=None):
+            def save(
+                self,
+                *,
+                subject_open_id,
+                grant,
+                issued_at=None,
+                replacing_generation=None,
+                expected_registered_subject_open_id=None,
+            ):
                 pass
             def revoke(self, *, reason):
                 return True

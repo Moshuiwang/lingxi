@@ -135,6 +135,24 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             issued_at=issued_at or self.issued_at,
         )
 
+    def test_registered_subject_open_id_reads_the_registered_subject(self) -> None:
+        self._save()
+
+        self.assertEqual(self.vault.registered_subject_open_id(), DELEGATED_SUBJECT)
+
+    def test_registered_subject_open_id_returns_none_when_registration_is_missing(self) -> None:
+        self.assertIsNone(self.vault.registered_subject_open_id())
+
+    def test_registered_subject_open_id_reads_a_changed_registration(self) -> None:
+        self._save()
+        changed_subject = "ou_changed_delegated_subject"
+        self.execute(
+            "UPDATE feishu_delegated_subject SET subject_open_id = %s",
+            (changed_subject,),
+        )
+
+        self.assertEqual(self.vault.registered_subject_open_id(), changed_subject)
+
     def test_ciphertext_lives_only_on_disk_and_the_database_holds_no_credential(self) -> None:
         self._save()
 
@@ -405,6 +423,24 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         self.assertIsNone(credential)
         self.assertFalse(self.path.exists())
         self.assertTrue(any("不一致" in line for line in captured.output))
+
+    def test_save_cas_rejects_a_changed_registered_subject_without_overwriting_it(self) -> None:
+        self.vault.revoke(reason="reset")
+        changed_subject = "ou_new_subject_b"
+        self.execute(
+            "UPDATE feishu_delegated_subject SET subject_open_id = %s",
+            (changed_subject,),
+        )
+
+        saved = self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-stale-save"), 7 * 24 * 3600, ""),
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+        )
+
+        self.assertFalse(saved)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), changed_subject)
+        self.assertFalse(self.path.exists())
 
 
 class DatabaseConsistencyBackstopTest(IdentityPostgresTestCase):
