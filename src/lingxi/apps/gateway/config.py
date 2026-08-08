@@ -14,6 +14,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from lingxi.adapters.postgres import (
+    DEFAULT_POSTGRES_TIMEOUTS,
+    PostgresTimeoutConfigError,
+    PostgresTimeouts,
+)
+
 ENV_PREFIX = "LINGXI_GATEWAY_"
 
 
@@ -40,6 +46,7 @@ class GatewayConfig:
     app_id: str
     app_secret: _Secret = field(repr=False)
     postgres_dsn: _Secret = field(repr=False)
+    postgres_timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
     reconnect_base_seconds: float = 1.0
     reconnect_factor: float = 2.0
     reconnect_ceiling_seconds: float = 60.0
@@ -89,10 +96,18 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
             "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
         )
 
+    try:
+        postgres_timeouts = PostgresTimeouts.from_env(
+            env, prefix=f"{ENV_PREFIX}POSTGRES_"
+        )
+    except PostgresTimeoutConfigError as error:
+        raise GatewayConfigError(str(error)) from None
+
     config = GatewayConfig(
         app_id=_text(env, "APP_ID") or "",
         app_secret=_Secret(_text(env, "APP_SECRET") or ""),
         postgres_dsn=_Secret(_text(env, "POSTGRES_DSN") or ""),
+        postgres_timeouts=postgres_timeouts,
         reconnect_base_seconds=_number(env, "RECONNECT_BASE_SECONDS", 1.0),
         reconnect_factor=_number(env, "RECONNECT_FACTOR", 2.0),
         reconnect_ceiling_seconds=_number(env, "RECONNECT_CEILING_SECONDS", 60.0),

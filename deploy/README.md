@@ -64,7 +64,7 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 **为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
 
-`LINGXI_POSTGRES_DSN` **必须带 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数**，它们共同给出停机上界（见下方）。只设 `connect_timeout` 是不够的：它只约束建连，一条已经发出去的语句可以无限期挂着。
+`LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
 ## 部署前置检查（preflight，逐条通过才能 `up`）
 
@@ -228,14 +228,14 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 | --- | --- | --- |
 | 续期 HTTP 超时 | 20.0 | `REQUEST_TIMEOUT_SECONDS`，`adapters/feishu_directory.py` |
 | 落盘重试退避等待 | 4.2 | `SAVE_RETRY_BACKOFF_SECONDS=(0.2, 1.0, 3.0)`，`apps/scheduler/__init__.py` |
-| 数据库往返预算 | 55.0 | 5 次操作（4 次 save 重试 + 1 次 revoke）× 11 秒 |
-| **最坏合计** | **79.2** | × 1.5 安全系数 = 119 秒 → 取整到 **150 秒** |
+| 数据库往返预算 | 75.0 | 5 次操作（4 次 save 重试 + 1 次 revoke）× 15 秒，按合法覆盖最坏值 |
+| **最坏合计** | **99.2** | × 1.5 安全系数 = 148.8 秒 → 取整要求 149 秒，compose 保留 **150 秒** |
 
-其中"每次数据库操作 ≤ 11 秒"= `connect_timeout` 5 秒（建连）+ `statement_timeout` 3 秒（语句）+ 3 秒（提交，提交本身也是语句）。
+其中合法覆盖下"每次数据库操作 ≤ 15 秒"= 合法 `MAX_TIMEOUT_SECONDS=5` 下的 5 秒（建连）+ 5 秒（语句）+ 5 秒（提交，提交本身也是语句）。示例 DSN 的默认值对应名义预算 5+3+3=11 秒。
 
-> **早先的版本在这里写的是 90 秒，而且依据是错的。** 它只把 `connect_timeout` 算进去，但 **`connect_timeout` 只约束建连**——连接建好之后，一条卡住的 `SELECT` / `INSERT` / `COMMIT` 可以无限期挂着，于是"90 秒是上界"这个声称根本不成立。真正的上界必须由 DSN 里的 `statement_timeout` 与 `lock_timeout` 一起给出（`lock_timeout` 不能省：等锁的时间不算在 `statement_timeout` 里）。这三个参数都在配置层，不需要改 `src/`。
+> **早先的版本在这里写的是 90 秒，而且依据是错的。** 它只把 `connect_timeout` 算进去，但 **`connect_timeout` 只约束建连**——连接建好之后，一条卡住的 `SELECT` / `INSERT` / `COMMIT` 可以无限期挂着。当前运行时边界由 `src/lingxi/adapters/postgres.py` 的连接工厂 kwargs 提供，默认值为 5/3/2 秒；DSN 同名参数会被覆盖，不能作为唯一事实源。合法覆盖必须使用 `LINGXI_POSTGRES_*_TIMEOUT_SECONDS`，不能通过修改 DSN 绕过工厂上界。
 
-**这个不等式由 `scripts/ci/check_deploy_contract.py` 自动守住，不是靠文档。** 它同时断言 `deploy/.env.example` 的示例 DSN 真的带了这三个参数——否则上面这张表就只是一张好看的表。改了 `REQUEST_TIMEOUT_SECONDS` 而不改 compose，门禁会红。
+**这个不等式由 `scripts/ci/check_deploy_contract.py` 自动守住，不是靠文档。** 门禁从连接工厂读取默认值与 `MAX_TIMEOUT_SECONDS` 建模，并把示例 DSN 的三个参数与默认值对账；修改合法上界或 `REQUEST_TIMEOUT_SECONDS` 而不满足 150 秒宽限期，门禁会红。
 
 `scheduler` 必须**单副本**：进程间互斥靠的是凭据目录里的 `flock` 文件锁，多副本会互相阻塞。
 
