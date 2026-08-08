@@ -241,6 +241,34 @@ class DecideFirstContactTest(unittest.TestCase):
                 self.assertIs(decision.failure_reason, FailureReason.INCOMPLETE_PROFILE)
                 self.assertIsNone(decision.draft)
 
+    def test_identity_failure_reasons_share_one_user_visible_terminal_message(self) -> None:
+        """V-开通-17：内部原因可区分，但用户侧提示必须逐字节一致。"""
+
+        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
+        cases = (
+            decide(open_id="ou_absent", location=locate_by_open_id("ou_absent", (member(),))),
+            decide(location=locate_by_open_id("ou_zhang", (member(), duplicate))),
+            decide(location=locate_by_open_id("ou_zhang", (member(user_id="   "),))),
+            decide(employment=None),
+            decide(
+                employment=EmploymentStatus(
+                    is_activated=True,
+                    is_exited=False,
+                    is_frozen=True,
+                    is_resigned=False,
+                    is_unjoin=False,
+                )
+            ),
+        )
+
+        self.assertEqual({decision.outcome for decision in cases}, {FirstContactOutcome.NOT_AUTHORIZED})
+        self.assertEqual(len({decision.failure_reason for decision in cases}), len(cases))
+        self.assertEqual(len({decision.message for decision in cases}), 1)
+        self.assertEqual(len({decision.content_key for decision in cases}), 1)
+        for decision in cases:
+            self.assertIsNone(decision.draft)
+            self.assertNotIn("manual_review", decision.message)
+
     def test_the_delegated_authorization_subject_is_never_recorded_as_a_user(self) -> None:
         """V-身份-02。"""
         subject = member(member_key=DELEGATED_SUBJECT, open_id=DELEGATED_SUBJECT, user_id="user_delegated", union_id="union_delegated", display_name="专用授权账号")

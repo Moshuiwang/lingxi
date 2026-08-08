@@ -1,4 +1,4 @@
-"""V-银河-09 / V-银河-10：工号（主）/ 邮箱（辅）匹配与 nick_name 不参与判定。
+"""V-银河-09 / V-银河-10 / V-开通-17：工号（主）/ 邮箱（辅）匹配与 nick_name 不参与判定。
 
 对应《2026-08-05 花名册身份链与工号邮箱匹配》决策，是门禁 V-开通-02/03/06/09
 的纯函数层用例；全部数据为虚构合成值。
@@ -171,6 +171,43 @@ class GalaxyAccountNotFoundTest(unittest.TestCase):
         ]
         result = match_galaxy_account("ou_p1", [roster_row()], rows)
         self.assertEqual(result.state, NOT_FOUND)
+
+
+class GalaxyFailureReasonCodeTest(unittest.TestCase):
+    """V-开通-17：失败关闭统一，但内部原因不能被合并。"""
+
+    def test_deterministic_failures_keep_distinct_reasons_with_one_terminal_state(self) -> None:
+        cases = {
+            "roster_not_found": ("ou_absent", [roster_row()], [galaxy_row()]),
+            "roster_multiple_rows": ("ou_p1", [roster_row(), roster_row()], [galaxy_row()]),
+            "required_fields_missing": (
+                "ou_p1",
+                [roster_row(employee_no="", email="")],
+                [galaxy_row()],
+            ),
+            "key_conflict": (
+                "ou_p1",
+                [roster_row()],
+                [
+                    galaxy_row(user_id="U-1", email="other@example-corp.invalid"),
+                    galaxy_row(user_id="U-2", user_name="70000"),
+                ],
+            ),
+            "galaxy_account_not_found": (
+                "ou_p1",
+                [roster_row()],
+                [galaxy_row(user_id="U-9", user_name="99999", email="other@example-corp.invalid")],
+            ),
+        }
+
+        results = {
+            expected_reason: match_galaxy_account(personnel_id, roster_rows, galaxy_rows)
+            for expected_reason, (personnel_id, roster_rows, galaxy_rows) in cases.items()
+        }
+
+        self.assertEqual({result.state for result in results.values()}, {NOT_FOUND})
+        self.assertEqual({result.reason for result in results.values()}, set(cases))
+        self.assertEqual(len({result.reason for result in results.values()}), len(cases))
 
 
 class GalaxyAccountNickNameIsAdvisoryOnlyTest(unittest.TestCase):

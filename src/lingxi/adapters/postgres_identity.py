@@ -46,6 +46,12 @@ class AppUserRecord:
     provisioning_state: str
     permission_record_id: str | None
     created: bool
+    employee_no: str | None = None
+    email: str | None = None
+
+
+class IdentityStorageIntegrityError(RuntimeError):
+    """建档请求的花名册字段未按原值落库时拒绝继续。"""
 
 
 class PostgresOrgSnapshotStore:
@@ -271,7 +277,8 @@ class PostgresAppUserStore:
                          ELSE COALESCE(EXCLUDED.email, app_user.email)
                      END,
                      updated_at = now()
-                RETURNING id, provisioning_state, permission_record_id, (xmax = 0) AS inserted""",
+                RETURNING id, provisioning_state, permission_record_id, employee_no, email,
+                          (xmax = 0) AS inserted""",
                 (
                     new_id("usr"),
                     draft.feishu_open_id,
@@ -287,8 +294,14 @@ class PostgresAppUserStore:
                 ),
             )
             row = cursor.fetchone()
-        assert row is not None
-        record = AppUserRecord(str(row[0]), str(row[1]), row[2], bool(row[3]))
+            assert row is not None
+            record = AppUserRecord(str(row[0]), str(row[1]), row[2], bool(row[5]), row[3], row[4])
+            for field in ("employee_no", "email"):
+                expected = getattr(draft, field)
+                if expected is not None and getattr(record, field) != expected:
+                    # 不能把模型里有、库里空（或被规范化改写）的身份键交给后续匹配。
+                    # 异常发生在连接事务内，当前写入随事务回滚；日志和异常都不带字段值。
+                    raise IdentityStorageIntegrityError(f"app_user {field} 持久化回读不一致")
         logger.info(
             "统一用户记录已写入 open_id=%s created=%s state=%s",
             redact_identifier(draft.feishu_open_id),
@@ -300,11 +313,12 @@ class PostgresAppUserStore:
     def get_by_open_id(self, open_id: str) -> AppUserRecord | None:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id, provisioning_state, permission_record_id FROM app_user WHERE feishu_open_id = %s",
+                "SELECT id, provisioning_state, permission_record_id, employee_no, email "
+                "FROM app_user WHERE feishu_open_id = %s",
                 (open_id,),
             )
             row = cursor.fetchone()
-        return None if row is None else AppUserRecord(str(row[0]), str(row[1]), row[2], False)
+        return None if row is None else AppUserRecord(str(row[0]), str(row[1]), row[2], False, row[3], row[4])
 
     def count(self) -> int:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:

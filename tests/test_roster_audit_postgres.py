@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 
 from postgres_schema import ensure_production_schema
 
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 from lingxi.apps.scheduler import RosterAuditDuty
 from lingxi.core.identity.roster_audit import DiffKind
@@ -60,14 +61,11 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        import psycopg
-
-        cls._psycopg = psycopg
         cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
         ensure_production_schema(cls._dsn)
 
     def setUp(self) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SET lock_timeout = '5s'")
             cursor.execute("TRUNCATE app_user CASCADE")
 
@@ -92,7 +90,7 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
         姓名、部门与租户，因此那一行只能整体为空，不能只把姓名清成空串。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             if tombstone:
                 cursor.execute(
                     """INSERT INTO app_user
@@ -126,14 +124,14 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
     def archived_snapshot(self) -> dict[str, tuple[object, ...]]:
         """全部 app_user 行的存档三字段快照，用于逐字段对比。"""
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT id, {', '.join(ARCHIVED_FIELDS_SQL)}, updated_at FROM app_user ORDER BY id")
             return {str(row[0]): tuple(row[1:]) for row in cursor.fetchall()}
 
     def every_text_value_in_the_database(self) -> str:
         """把全库所有文本列的内容拼成一个大字符串，用于哨兵扫描。"""
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """SELECT table_name, column_name FROM information_schema.columns
                     WHERE table_schema = 'public'
