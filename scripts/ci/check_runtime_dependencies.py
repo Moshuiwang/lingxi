@@ -200,7 +200,9 @@ def check_imports(declared: dict[str, list[tuple[str, str]]]) -> list[str]:
 # 运行期检查跑在各自的干净虚拟环境里，能抓到漏装；但它只导入入口模块，
 # 一条写在深层模块函数体里、当次没被执行到的 import 它看不见。
 PROCESS_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
-    "scheduler": ("lingxi.apps.scheduler",),
+    # scheduler 镜像还承载一次性正式重授权 job；它与 scheduler 共用同一依赖闭包，
+    # 但不是常驻职责。
+    "scheduler": ("lingxi.apps.scheduler", "lingxi.apps.reauthorize", "lingxi.apps.reauthorize.__main__"),
     "worker": ("lingxi.apps.worker", "lingxi.apps.worker.cli", "lingxi.apps.worker.__main__"),
     "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.config", "lingxi.apps.gateway.__main__"),
     "bot-test": (

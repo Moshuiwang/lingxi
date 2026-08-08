@@ -64,6 +64,10 @@ REQUIRED_MODULES = (
     # apps/ 是新增的顶层子目录：进程入口漏进制品只在部署时暴露（V-部署-10），
     # "测试全绿但 python -m 起不来"正是它的形状（Issue #37 / #16）。
     "lingxi.apps.scheduler",
+    # 正式重授权是 scheduler 镜像里的**一次性**运维 job；scripts/ 被 .dockerignore
+    # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
+    "lingxi.apps.reauthorize",
+    "lingxi.apps.reauthorize.__main__",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.turn",
@@ -106,6 +110,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
         (
             "lingxi.apps.scheduler",
+            "lingxi.apps.reauthorize",
+            "lingxi.apps.reauthorize.__main__",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.retention",
             "lingxi.adapters.feishu_group_message",

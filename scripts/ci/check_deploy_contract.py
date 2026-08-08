@@ -347,6 +347,41 @@ def check_compose_contract() -> list[str]:
     gateway = service_block(base, "gateway") or ""
     worker = service_block(base, "worker") or ""
     migrate = service_block(base, "migrate") or ""
+    reauthorize = service_block(base, "reauthorize") or ""
+
+    if not reauthorize:
+        failures.append("deploy/compose.yaml 缺少正式重授权一次性 job `reauthorize`")
+    else:
+        if not re.search(r"^\s*profiles:\s*\[.*job.*\]\s*$", reauthorize, re.MULTILINE):
+            failures.append("reauthorize 必须放在 job profile，不能作为常驻服务启动")
+        if not re.search(r'^\s*restart:\s*["\']?no["\']?\s*$', reauthorize, re.MULTILINE):
+            failures.append('reauthorize 是一次性作业，必须显式使用 `restart: "no"`')
+        if re.search(r"^\s*stop_grace_period:", reauthorize, re.MULTILINE):
+            failures.append("reauthorize 是一次性作业，不应配置 stop_grace_period")
+        if not re.search(r"^\s*read_only:\s*true\s*$", reauthorize, re.MULTILINE):
+            failures.append("reauthorize 缺 `read_only: true`")
+        user = re.search(r"^\s*user:\s*(\S+)\s*$", reauthorize, re.MULTILINE)
+        if user is None or user.group(1).strip("'\"") != "10001:10001":
+            failures.append("reauthorize 必须与 scheduler 一样以 `10001:10001` 运行")
+        if not re.search(r"^\s*stdin_open:\s*true\s*$", reauthorize, re.MULTILINE) or not re.search(
+            r"^\s*tty:\s*true\s*$", reauthorize, re.MULTILINE
+        ):
+            failures.append("reauthorize 必须保留交互终端以执行关闭回显的回调输入")
+        if not re.search(
+            r'^\s*command:\s*\["python",\s*"-m",\s*"lingxi\.apps\.reauthorize"\]\s*$',
+            reauthorize,
+            re.MULTILINE,
+        ):
+            failures.append("reauthorize 没有指向随镜像发布的 `python -m lingxi.apps.reauthorize`")
+        if not re.search(r"lingxi-credentials:/var/lib/lingxi/credentials", reauthorize):
+            failures.append("reauthorize 必须挂载凭据持久卷")
+        for variable in ("LINGXI_DELEGATED_CREDENTIAL_PATH", "LINGXI_DELEGATED_REAUTH_STATE_PATH"):
+            if not re.search(
+                rf"^\s*{variable}:\s*/var/lib/lingxi/credentials/\S+\s*$",
+                reauthorize,
+                re.MULTILINE,
+            ):
+                failures.append(f"reauthorize 必须在凭据卷内声明 {variable}")
 
     # M2-62-27 / D14：凭据路径必须落在**声明为持久卷**的挂载点下。
     path_match = re.search(
@@ -433,7 +468,7 @@ def check_compose_contract() -> list[str]:
 
     # M2-62-29 / M2-62-30：非 root、能力最小。
     for name, block in (("scheduler", scheduler), ("gateway", gateway),
-                        ("worker", worker), ("migrate", migrate)):
+                        ("worker", worker), ("migrate", migrate), ("reauthorize", reauthorize)):
         user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
         if user is None:
             failures.append(f"{name} 没有显式 `user:`，无法在 compose 层面核对非 root")
@@ -455,7 +490,7 @@ def check_compose_contract() -> list[str]:
     # 设置整个盖掉，而基线文件本身一个字没动——静态检查全绿，实际以 root 跑。
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
-        for service in ("scheduler", "gateway", "worker", "migrate"):
+        for service in ("scheduler", "gateway", "worker", "migrate", "reauthorize"):
             block = service_block(text, service)
             if block is None:
                 continue
@@ -480,7 +515,7 @@ def check_compose_contract() -> list[str]:
                         f"stop_grace_period 改成了 {grace.group(1)}，低于要求的 {required} 秒"
                     )
             restart = re.search(r"^\s*restart:\s*(\S+)\s*$", block, re.MULTILINE)
-            if restart is not None and service in {"worker", "migrate"}:
+            if restart is not None and service in {"worker", "migrate", "reauthorize"}:
                 if restart.group(1).strip("'\"") != "no":
                     failures.append(
                         f"{display(path)} 的 {service} 用覆盖把 restart "
@@ -495,7 +530,7 @@ def check_compose_contract() -> list[str]:
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
         seen: dict[str, list[str]] = {}
-        for service in ("scheduler", "gateway", "worker", "migrate"):
+        for service in ("scheduler", "gateway", "worker", "migrate", "reauthorize"):
             block = service_block(text, service)
             if block is None:
                 continue

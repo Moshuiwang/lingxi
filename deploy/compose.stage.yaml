@@ -25,7 +25,8 @@
 #   .env.stage.gateway    飞书应用凭据 + 数据库 DSN（#57；不含 Fernet 密钥、不含模型凭据）
 #   .env.stage.worker     只有 LINGXI_WORKER_* 与模型端点凭据
 #   .env.stage.migrate    只有迁移 DSN（DDL 权限，业务进程不该有）
-# 四个文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；四个都必须 0600，
+#   .env.stage.reauthorize 一次性重授权 job 的数据库、应用与 scope 配置
+# 五个运行时文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；五个都必须 0600，
 # 核对步骤见 deploy/README.md 的 preflight。
 # ---------------------------------------------------------------------------
 
@@ -52,6 +53,12 @@ services:
   migrate:
     env_file:
       - ./.env.stage.migrate
+
+  reauthorize:
+    env_file:
+      - ./.env.stage.reauthorize
+    volumes:
+      - lingxi-credentials:/var/lib/lingxi/credentials
 
 volumes:
   # 具名卷带上环境前缀：同一台机器上万一并存两套编排，卷不会互相覆盖。
