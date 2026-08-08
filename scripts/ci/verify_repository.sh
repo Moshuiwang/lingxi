@@ -66,6 +66,9 @@ python3 scripts/ci/check_alembic_revisions.py
 # 扫描覆盖**函数内的延迟导入**——本仓库的第三方 import 全都写在函数体里，
 # 只扫模块级等于没扫。
 python3 scripts/ci/check_runtime_dependencies.py
+# V-部署-10 / Issue #76：反向枚举 src/lingxi/，核对正式制品与各进程依赖清单；
+# 这里只跑源码清单，不假设工作树已经 pip install，完整制品检查仍由 CI / 镜像门禁执行。
+python3 scripts/ci/check_installed_package.py --source-only
 # 部署编排的静态契约（Issue #62）：停止宽限期与源码常量联动、凭据路径落在持久卷、
 # 生产 compose 零构建定义、镜像 tag 不可变、非 root。刻意不依赖 docker 与 YAML 库，
 # 这样一台没装 docker 的开发机也能跑出与 CI 相同的结论。
