@@ -180,6 +180,14 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
         self.assertEqual(self.vault.saved[0][1].refresh_token.reveal(), FAKE_REFRESH_TOKEN)
 
+    def test_success_result_and_logs_never_contain_authorization_values(self) -> None:
+        state = self._begin()
+
+        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
+            result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW)
+
+        self._assert_authorization_values_are_absent(result, captured.output)
+
     def test_missing_expired_and_replayed_states_are_rejected_and_mismatch_does_not_consume_valid_state(self) -> None:
         self.assertFalse(self.entry.handle_callback("s" * 32, code=FAKE_CODE).ok)
 
@@ -234,11 +242,11 @@ class ReauthorizationEntryTest(unittest.TestCase):
 
         failed_state = self._begin()
         self.exchanger.result = RuntimeError("secret error must not be logged")
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.WARNING) as captured:
+        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
             failed = self.entry.handle_callback(failed_state, code=FAKE_CODE, now=NOW + timedelta(seconds=2))
         self.assertEqual(failed.code, "exchange_failed")
         self.assertEqual(self.vault.saved, [])
-        self.assertTrue(all(FAKE_CODE not in line and FAKE_REFRESH_TOKEN not in line for line in captured.output))
+        self._assert_authorization_values_are_absent(failed, captured.output)
 
     def test_save_failure_returns_recovery_result_and_does_not_report_success(self) -> None:
         state = self._begin()
@@ -265,12 +273,15 @@ class ReauthorizationEntryTest(unittest.TestCase):
         state = self._begin()
         self.exchanger.result = RuntimeError(f"{FAKE_CODE} {FAKE_ACCESS_TOKEN} {FAKE_REFRESH_TOKEN}")
 
-        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.WARNING) as captured:
+        with self.assertLogs("lingxi.adapters.feishu_reauthorization", level=logging.INFO) as captured:
             result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW)
 
-        rendered = result.message + result.code + "\n".join(captured.output)
+        self._assert_authorization_values_are_absent(result, captured.output)
+
+    def _assert_authorization_values_are_absent(self, result: ReauthorizationResult, logs: list[str]) -> None:
+        rendered = repr(result) + "\n".join(logs)
         for secret in (FAKE_CODE, FAKE_ACCESS_TOKEN, FAKE_REFRESH_TOKEN):
-            self.assertNotIn(secret, rendered)
+            self.assertFalse(secret in rendered, "结果或日志包含授权原值")
 
 
 if __name__ == "__main__":
