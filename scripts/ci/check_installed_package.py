@@ -70,6 +70,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.retention",
     "lingxi.adapters.feishu_roster_bitable",
+    "lingxi.adapters.feishu_reauthorization",
     # 花名册审计日报（Issue #52）：比对与渲染在 core，基线读取与群发在 adapters。
     # 四个都要在制品里能 import——它们由 lingxi-scheduler 在运行时按需加载，
     # "本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
@@ -80,6 +81,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.oauth_bridge_client",
     "lingxi.adapters.postgres",
     "lingxi.adapters.postgres_identity",
     "lingxi.adapters.claude_agent_session",
@@ -87,6 +89,10 @@ REQUIRED_MODULES = (
     # "测试全绿但 python -m 起不来"正是它的形状（Issue #37 / #16）。
     "lingxi.apps.scheduler",
     "lingxi.apps.scheduler.__main__",
+    # 正式重授权是 scheduler 镜像里的**一次性**运维 job；scripts/ 被 .dockerignore
+    # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
+    "lingxi.apps.reauthorize",
+    "lingxi.apps.reauthorize.__main__",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -186,9 +192,24 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.ids",
         ),
-        # 第三方那一列没变：群发适配走标准库 urllib（同 adapters/feishu_directory.py），
-        # 基线读取用 psycopg——两者都不引入新依赖。
-        ("cryptography.fernet", "psycopg"),
+        # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
+        # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
+        ("cryptography.fernet", "psycopg", "websockets.sync.client"),
+    ),
+    "reauthorize": (
+        (
+            "lingxi.apps.reauthorize",
+            "lingxi.apps.reauthorize.__main__",
+            "lingxi.adapters.delegated_credentials",
+            "lingxi.adapters.feishu_directory",
+            "lingxi.adapters.feishu_reauthorization",
+            "lingxi.adapters.oauth_bridge_client",
+            "lingxi.adapters.postgres",
+            "lingxi.core.identity.credentials",
+            "lingxi.core.identity.identifiers",
+            "lingxi.core.ids",
+        ),
+        ("cryptography.fernet", "psycopg", "websockets.sync.client"),
     ),
     "worker": (
         (
@@ -246,6 +267,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             "lingxi.adapters.feishu_onboarding",
             "lingxi.adapters.oauth_bridge",
+            "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.refresh_tokens",
             "lingxi.adapters.postgres_onboarding",
             "lingxi.adapters.postgres",
@@ -268,6 +290,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 # PROCESS_RUNTIME_IMPORTS 没有漏掉某个实际会被该进程加载的 lingxi 模块。
 PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
     "scheduler": ("lingxi.apps.scheduler", "lingxi.apps.scheduler.__main__"),
+    "reauthorize": ("lingxi.apps.reauthorize.__main__",),
     "worker": ("lingxi.apps.worker.__main__",),
     "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.__main__"),
     "bot-test": (

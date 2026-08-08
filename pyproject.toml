@@ -34,7 +34,17 @@ requires-python = ">=3.12"
 # 为一个尚未接线的职责把整个 SDK 拉进常驻进程的依赖面。
 # cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
 # 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
-scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
+# scheduler 镜像也承载一次性 reauthorize job，因此显式带上 OAuth Bridge WebSocket
+# 传输依赖；常驻 scheduler 本身仍不加载 OAuth Bridge 业务模块。
+scheduler = [
+    "cryptography==45.0.7",
+    "psycopg[binary]>=3.2,<4",
+    "websockets>=15,<16",
+]
+# 正式重授权是 scheduler 镜像里的独立一次性 job，但 #76 的干净环境门禁按进程
+# 闭包逐项对账，因此保留同一依赖闭包的独立 extra 供 CI 验证；部署仍复用 scheduler
+# 镜像，不额外构建第五个生产镜像。
+reauthorize = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
 # lingxi-worker 进程（`python -m lingxi.apps.worker`：turn/queue 两种受控执行模式）。
 # 依据：入口 → queue service → PostgreSQL queue adapter，以及 Agent SDK session adapter。
 # 精确锁版本，不用范围：执行层的只读边界建立在这个版本的 hook 事件名与工具名上
@@ -63,11 +73,12 @@ gateway = [
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",
 ]
-# Bot-Test 受控验证资产（代码框架第五节列举的那一批），**不是正式生产进程**，
-# 不进生产镜像。含常驻长连接进程 `adapters/feishu_onboarding.run_long_connection_bot`
+# Bot-Test 受控验证资产（代码框架第五节列举的那一批），**不是正式生产进程**；
+# `bot-test` 组本身不进生产镜像，但 `websockets` 也由正式 reauthorize 入口共享使用。
+# 含常驻长连接进程 `adapters/feishu_onboarding.run_long_connection_bot`
 # 与 `scripts/` 下的受控脚本。依据：
 #   lark-oapi   → adapters/feishu_onboarding.py（LarkCardSender 发卡片、长连接收事件）
-#   websockets  → adapters/oauth_bridge.py（OAuth 结果桥接长连接）
+#   websockets  → adapters/oauth_bridge.py（旧 Bot-Test OAuth 结果桥接长连接）
 #   psycopg     → adapters/refresh_tokens.py、postgres_onboarding.py、galaxy_import.py 等
 #   cryptography→ adapters/refresh_tokens.py（refresh_token 加密轮换）
 # lark-oapi 保留为运行时依赖、不降为 CI-only：2026-08-06 产品负责人否决 #39 的替换
