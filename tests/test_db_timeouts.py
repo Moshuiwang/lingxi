@@ -12,9 +12,18 @@ from unittest import mock
 
 from lingxi.adapters.postgres import (
     DEFAULT_POSTGRES_TIMEOUTS,
+    MAX_TIMEOUT_SECONDS,
     PostgresTimeoutConfigError,
     PostgresTimeouts,
     connect,
+)
+from lingxi.adapters.retention import (
+    RETENTION_CLEANUP_STATEMENT_TIMEOUT_SECONDS,
+    RETENTION_CLEANUP_TIMEOUTS,
+    RETENTION_DELETE_BATCH_MARGIN_SECONDS,
+    RETENTION_FUNCTION_LOCK_TIMEOUT_SECONDS,
+    RETENTION_FUNCTION_LOCK_WAIT_COUNT,
+    PostgresRetentionCleaner,
 )
 
 
@@ -53,14 +62,14 @@ class PostgresTimeoutConfigTest(unittest.TestCase):
     def test_legal_environment_overrides_are_applied(self) -> None:
         config = PostgresTimeouts.from_env(
             {
-                "LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS": "7",
-                "LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS": "11",
-                "LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS": "2",
+                "LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS": str(MAX_TIMEOUT_SECONDS),
+                "LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS": str(MAX_TIMEOUT_SECONDS),
+                "LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS": str(MAX_TIMEOUT_SECONDS),
             }
         )
         self.assertEqual(
             (config.connect_timeout_seconds, config.statement_timeout_seconds, config.lock_timeout_seconds),
-            (7, 11, 2),
+            (MAX_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
         )
 
     def test_missing_environment_values_keep_finite_defaults(self) -> None:
@@ -68,12 +77,26 @@ class PostgresTimeoutConfigTest(unittest.TestCase):
         self.assertEqual(config, DEFAULT_POSTGRES_TIMEOUTS)
 
     def test_invalid_environment_values_are_rejected_without_unbounded_fallback(self) -> None:
-        for raw in ("0", "-1", "61", "not-a-number"):
+        for raw in ("0", "-1", str(MAX_TIMEOUT_SECONDS + 1), "not-a-number"):
             with self.subTest(raw=raw):
                 with self.assertRaises(PostgresTimeoutConfigError):
                     PostgresTimeouts.from_env(
                         {"LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS": raw}
                     )
+
+    def test_retention_adapter_statement_timeout_exceeds_function_lock_wait_budget(self) -> None:
+        """清理函数的两次 2s 锁等待必须先于适配器级 statement_timeout 返回。"""
+
+        lock_wait_budget = RETENTION_FUNCTION_LOCK_WAIT_COUNT * RETENTION_FUNCTION_LOCK_TIMEOUT_SECONDS
+        self.assertEqual(
+            RETENTION_CLEANUP_STATEMENT_TIMEOUT_SECONDS,
+            lock_wait_budget + RETENTION_DELETE_BATCH_MARGIN_SECONDS,
+        )
+        self.assertGreater(RETENTION_CLEANUP_TIMEOUTS.statement_timeout_seconds, lock_wait_budget)
+        self.assertEqual(
+            PostgresRetentionCleaner("postgresql://test/db")._timeouts,
+            RETENTION_CLEANUP_TIMEOUTS,
+        )
 
     def test_factory_always_passes_all_three_boundaries_to_psycopg(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []

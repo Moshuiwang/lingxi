@@ -19,7 +19,13 @@ DEFAULT_LOCK_TIMEOUT_SECONDS = 2
 
 # 这是仓库级受控覆盖范围，不是部署配置。上限防止某个调用方用“覆盖”重新引入
 # 长时间无界等待；一次性迁移有自己的有限配置，见迁移入口模块。
-MAX_TIMEOUT_SECONDS = 60
+#
+# 上限还必须与 scheduler 的 150s stop_grace_period 相容：门禁按最坏的 5 次数据库操作
+# 建模，每次是默认建连 5s + 一条语句和一次提交各 MAX_TIMEOUT_SECONDS，另有续期 HTTP
+# 20s、落盘退避 4.2s，并乘 1.5 安全系数。因此要求
+# (20 + 4.2 + 5 * (5 + 2 * MAX_TIMEOUT_SECONDS)) * 1.5 <= 150；
+# MAX=5 时为 148.8s（取整要求 149s），MAX=6 时已为 171.3s，故合法上界只能是 5s。
+MAX_TIMEOUT_SECONDS = 5
 
 
 class PostgresTimeoutConfigError(ValueError):

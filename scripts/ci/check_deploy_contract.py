@@ -43,37 +43,24 @@ STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
+POSTGRES_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "postgres.py"
 SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__init__.py"
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 
-# 停止宽限期的数据库往返预算（秒）。
-#
-# **上一版这里只算 connect_timeout，那个上界是假的**（Issue #62 codex 审查 P1-3）：
-# `connect_timeout` 只约束建连，一条已经发出去的 SELECT / INSERT / commit 可以无限期
-# 挂着——连接早就建好了。真正的上界需要 DSN 同时带上 `statement_timeout`（约束语句）
-# 与 `lock_timeout`（约束等锁，它不算在 statement_timeout 里）。
-#
-# 这三个值都在部署侧的 DSN 里，本检查看不见运行时的真实值，因此下面按
-# deploy/.env.example 里登记的数字建模，并**另外断言示例 DSN 真的带了这三个参数**
-# （见 check_database_timeouts）——否则这段算法就只是一段好看的注释。
-DSN_CONNECT_TIMEOUT_SECONDS = 5.0
-DSN_STATEMENT_TIMEOUT_SECONDS = 3.0
-# 每次数据库操作 = 建连 + 一条语句 + 一次提交（提交本身也是语句，同样受 statement_timeout）。
-DATABASE_OPERATION_SECONDS = DSN_CONNECT_TIMEOUT_SECONDS + 2 * DSN_STATEMENT_TIMEOUT_SECONDS
+# 停止宽限期的数据库往返预算（秒）由下方的 ``module_constant`` 从统一连接工厂读取。
+# 这里不能复制 DSN 或连接工厂的数字：工厂通过 kwargs 覆盖 DSN 同名参数，且合法环境
+# 覆盖还会把每一项调到 ``MAX_TIMEOUT_SECONDS``。门禁必须按那个事实源的合法最坏值建模。
+POSTGRES_TIMEOUT_SOURCE_NAMES = {
+    "connect_timeout": "DEFAULT_CONNECT_TIMEOUT_SECONDS",
+    "statement_timeout": "DEFAULT_STATEMENT_TIMEOUT_SECONDS",
+    "lock_timeout": "DEFAULT_LOCK_TIMEOUT_SECONDS",
+}
 # 最坏 5 次操作：_save_with_retry 的 4 次尝试 + 失败后的 1 次 revoke。
 DATABASE_OPERATION_COUNT = 5
-DATABASE_ROUNDTRIP_BUDGET_SECONDS = DATABASE_OPERATION_SECONDS * DATABASE_OPERATION_COUNT
-
-# 示例 DSN 必须带的参数 → 期望值。缺任何一个，上面的预算就没有依据。
-REQUIRED_DSN_SETTINGS = {
-    "connect_timeout": "5",
-    "statement_timeout": "3000",
-    "lock_timeout": "2000",
-}
 
 # 安全系数。宽限期不是"刚好够"就行：`_FileLock` 用的是阻塞式 flock，而 DSN 的三个
-# 超时是部署侧配置、本检查只能按示例建模。乘 1.5 是给这些不可见量留的余量，
-# 也让"把超时改大却不动 compose"必然变红。
+# 超时及覆盖值来自统一连接工厂。乘 1.5 是给不可见量留的余量，也让"把超时改大却不动
+# compose"必然变红。
 SAFETY_FACTOR = 1.5
 
 # 凭据类环境变量：镜像里一个都不许赋值，仓库文件里也不许出现真值。
@@ -150,6 +137,62 @@ def module_constant(path: pathlib.Path, name: str):
     return None
 
 
+def _postgres_timeout_facts() -> tuple[dict[str, int], int]:
+    """读取业务连接工厂的默认超时与合法覆盖上界。"""
+
+    defaults: dict[str, int] = {}
+    for setting, source_name in POSTGRES_TIMEOUT_SOURCE_NAMES.items():
+        value = module_constant(POSTGRES_ADAPTER, source_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"读不到或非法的 {POSTGRES_ADAPTER}: {source_name}")
+        defaults[setting] = value
+
+    max_timeout = module_constant(POSTGRES_ADAPTER, "MAX_TIMEOUT_SECONDS")
+    if isinstance(max_timeout, bool) or not isinstance(max_timeout, int) or max_timeout <= 0:
+        raise ValueError(f"读不到或非法的 {POSTGRES_ADAPTER}: MAX_TIMEOUT_SECONDS")
+    if any(value > max_timeout for value in defaults.values()):
+        raise ValueError(
+            f"{POSTGRES_ADAPTER} 的默认超时不能超过 MAX_TIMEOUT_SECONDS={max_timeout}"
+        )
+    return defaults, max_timeout
+
+
+def _database_operation_seconds() -> float:
+    """按合法最坏覆盖计算一次数据库建连、语句、提交的预算。"""
+
+    defaults, max_timeout = _postgres_timeout_facts()
+    # 每次数据库操作 = 默认建连上界 + 一条语句 + 一次提交；两个语句边界都按
+    # ``MAX_TIMEOUT_SECONDS`` 取最坏合法覆盖。当前默认建连也是 5s，因此该模型覆盖
+    # 所有合法配置；保留拆开的写法是为了让 5 + 2×MAX 的推导可被门禁读懂。
+    return float(defaults["connect_timeout"] + 2 * max_timeout)
+
+
+def _default_database_operation_seconds() -> float:
+    """按连接工厂默认值计算模板 DSN 的名义单次操作预算。"""
+
+    defaults, _ = _postgres_timeout_facts()
+    return float(defaults["connect_timeout"] + 2 * defaults["statement_timeout"])
+
+
+def _required_dsn_settings() -> dict[str, str]:
+    """返回应与连接工厂默认值相符的示例 DSN 参数。"""
+
+    defaults, _ = _postgres_timeout_facts()
+    return {
+        "connect_timeout": str(defaults["connect_timeout"]),
+        "statement_timeout": str(defaults["statement_timeout"] * 1000),
+        "lock_timeout": str(defaults["lock_timeout"] * 1000),
+    }
+
+
+# 保留这些模块级值供测试和成功摘要读取；每个检查函数仍会重新读取事实源，避免检查
+# 逻辑与源码在同一进程内被临时改动后继续使用旧快照。
+POSTGRES_DEFAULT_TIMEOUTS, POSTGRES_MAX_TIMEOUT_SECONDS = _postgres_timeout_facts()
+DATABASE_OPERATION_SECONDS = _database_operation_seconds()
+DATABASE_ROUNDTRIP_BUDGET_SECONDS = DATABASE_OPERATION_SECONDS * DATABASE_OPERATION_COUNT
+REQUIRED_DSN_SETTINGS = _required_dsn_settings()
+
+
 def service_block(compose_text: str, service: str) -> str | None:
     """截取某个 service 在 compose 里的那一段（已去注释）。
 
@@ -194,7 +237,7 @@ def _gateway_worst_case_seconds() -> float:
     if shutdown is None:
         raise ValueError("读不到 gateway 的 SHUTDOWN_TIMEOUT_SECONDS 默认值")
     outbound = max(1.0, shutdown / 4)
-    return shutdown + outbound + DATABASE_OPERATION_SECONDS
+    return shutdown + outbound + _database_operation_seconds()
 
 
 def _worst_case_seconds() -> float:
@@ -206,7 +249,7 @@ def _worst_case_seconds() -> float:
         raise ValueError("读不到 REQUEST_TIMEOUT_SECONDS")
     if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
         raise ValueError("读不到 SAVE_RETRY_BACKOFF_SECONDS")
-    return float(http_timeout) + float(sum(backoff)) + DATABASE_ROUNDTRIP_BUDGET_SECONDS
+    return float(http_timeout) + float(sum(backoff)) + _database_operation_seconds() * DATABASE_OPERATION_COUNT
 
 
 def check_stop_grace_period() -> list[str]:
@@ -226,7 +269,17 @@ def check_stop_grace_period() -> list[str]:
     if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
         return [f"读不到 {SCHEDULER_APP.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
 
-    worst_case = _worst_case_seconds()
+    try:
+        defaults, max_timeout = _postgres_timeout_facts()
+        database_operation_seconds = float(defaults["connect_timeout"] + 2 * max_timeout)
+        database_roundtrip_budget_seconds = database_operation_seconds * DATABASE_OPERATION_COUNT
+        worst_case = (
+            float(http_timeout)
+            + float(sum(backoff))
+            + database_roundtrip_budget_seconds
+        )
+    except ValueError as error:
+        return [str(error)]
     required = math.ceil(worst_case * SAFETY_FACTOR)
 
     block = service_block(strip_comments(read(COMPOSE_BASE)), "scheduler")
@@ -238,7 +291,8 @@ def check_stop_grace_period() -> list[str]:
             "deploy/compose.yaml 的 scheduler 没有显式 stop_grace_period。"
             f"Docker 默认 10 秒，而本进程最坏需要 {worst_case:.1f} 秒"
             f"（续期 HTTP {http_timeout}s + 落盘退避 {sum(backoff)}s + "
-            f"数据库往返预算 {DATABASE_ROUNDTRIP_BUDGET_SECONDS}s）。"
+            f"数据库往返预算 {database_roundtrip_budget_seconds:.0f}s，"
+            f"合法覆盖上界 {max_timeout}s）。"
             "SIGKILL 落在续期成功、写库未完成的窗口里 = 永久丢失一条一次性凭据。"
         )
         return failures
@@ -253,7 +307,8 @@ def check_stop_grace_period() -> list[str]:
             f"      算法：续期 HTTP 超时 {http_timeout}s（feishu_directory.py 的 "
             f"REQUEST_TIMEOUT_SECONDS）+ 落盘重试退避 {sum(backoff)}s"
             f"（scheduler 的 SAVE_RETRY_BACKOFF_SECONDS）+ 数据库往返预算 "
-            f"{DATABASE_ROUNDTRIP_BUDGET_SECONDS}s = {worst_case:.1f}s，"
+            f"{database_roundtrip_budget_seconds:.0f}s = {worst_case:.1f}s，"
+            f"其中合法覆盖按 {max_timeout}s 建模，"
             f"再乘安全系数 {SAFETY_FACTOR} = {required}s。\n"
             "      改了上述任一常量就必须同步改 deploy/compose.yaml——这正是本检查存在的理由。"
         )
@@ -261,12 +316,11 @@ def check_stop_grace_period() -> list[str]:
 
 
 def check_database_timeouts() -> list[str]:
-    """示例 DSN 必须带齐三个超时参数（Issue #62 codex 审查 P1-3）。
+    """示例 DSN 要带齐并镜像工厂默认值；它不是运行时事实源。
 
-    停止宽限期的算法把"每次数据库操作 ≤ 11 秒"当成前提。那个前提**只有在 DSN 真的带
-    了 statement_timeout 与 lock_timeout 时才成立**——只设 connect_timeout 时，一条卡住
-    的语句可以无限期挂着，宽限期再长也拦不住 SIGKILL 落在"已换新凭据、未写回数据库"
-    的窗口里。模板里写什么，部署时多半就照抄什么，所以这条断言守的是模板。
+    连接工厂会以 kwargs 覆盖 DSN 同名参数，因此停机预算不再从这个示例 DSN 推导。
+    仍检查模板中的三个参数，是为了让示例与工厂默认配置保持可核对的一致；实际合法
+    覆盖只能走 ``LINGXI_POSTGRES_*_TIMEOUT_SECONDS``。
     """
 
     text = read(ENV_EXAMPLE)
@@ -275,16 +329,19 @@ def check_database_timeouts() -> list[str]:
         return ["deploy/.env.example 里没有 LINGXI_POSTGRES_DSN 示范值"]
 
     dsn = match.group(1)
+    try:
+        required_settings = _required_dsn_settings()
+    except ValueError as error:
+        return [str(error)]
     failures = []
-    for setting, expected in sorted(REQUIRED_DSN_SETTINGS.items()):
+    for setting, expected in sorted(required_settings.items()):
         # DSN 里 options 的空格与等号是 URL 编码的（%20 / %3D），所以两种写法都认。
         pattern = rf"{re.escape(setting)}(=|%3D){re.escape(expected)}\b"
         if not re.search(pattern, dsn, re.IGNORECASE):
             failures.append(
                 f"deploy/.env.example 的 LINGXI_POSTGRES_DSN 没有 `{setting}={expected}`。"
-                f"\n      停止宽限期按「每次数据库操作 ≤ "
-                f"{DATABASE_OPERATION_SECONDS:.0f} 秒」建模，而这个上界正是由这三个参数给出的。"
-                "\n      只设 connect_timeout 拦不住已经发出去的语句——那是一个假的上界。"
+                f"\n      这是连接工厂默认值的模板对账；运行时实际由 src/lingxi/adapters/postgres.py"
+                " 的 kwargs 覆盖 DSN，合法覆盖请使用 LINGXI_POSTGRES_*_TIMEOUT_SECONDS。"
             )
     return failures
 
@@ -410,15 +467,17 @@ def check_compose_contract() -> list[str]:
     # gateway 的停机宽限期，依据来自它自己的配置。
     gateway_grace = re.search(r"^\s*stop_grace_period:\s*(\S+)\s*$", gateway, re.MULTILINE)
     try:
-        gateway_required = math.ceil(_gateway_worst_case_seconds() * SAFETY_FACTOR)
+        gateway_worst_case = _gateway_worst_case_seconds()
+        gateway_required = math.ceil(gateway_worst_case * SAFETY_FACTOR)
     except ValueError as error:
         failures.append(str(error))
+        gateway_worst_case = None
         gateway_required = None
     if gateway_required is not None:
         if gateway_grace is None:
             failures.append(
                 "deploy/compose.yaml 的 gateway 没有显式 stop_grace_period。"
-                f"最坏需要 {_gateway_worst_case_seconds():.1f} 秒（停机超时 + 出站 HTTP + 一次数据库事务）；"
+                f"最坏需要 {gateway_worst_case:.1f} 秒（停机超时 + 出站 HTTP + 一次数据库事务）；"
                 "中途 SIGKILL 会留下「抢占了话题但任务没写进去」的中间态。"
             )
         else:
@@ -428,7 +487,7 @@ def check_compose_contract() -> list[str]:
                     f"gateway 的 stop_grace_period 是 {gateway_grace.group(1)}，"
                     f"低于要求的 {gateway_required} 秒（停机超时 "
                     f"{_gateway_shutdown_timeout()}s + 出站 {max(1.0, (_gateway_shutdown_timeout() or 0)/4)}s "
-                    f"+ 数据库 {DATABASE_OPERATION_SECONDS}s，再乘 {SAFETY_FACTOR}）。"
+                    f"+ 数据库 {_database_operation_seconds():.0f}s，再乘 {SAFETY_FACTOR}）。"
                 )
 
     # M2-62-29 / M2-62-30：非 root、能力最小。
@@ -473,8 +532,12 @@ def check_compose_contract() -> list[str]:
             grace = re.search(r"^\s*stop_grace_period:\s*(\S+)\s*$", block, re.MULTILINE)
             if grace is not None:
                 seconds = parse_duration_seconds(grace.group(1))
-                required = math.ceil(_worst_case_seconds() * SAFETY_FACTOR)
-                if seconds is None or seconds < required:
+                try:
+                    required = math.ceil(_worst_case_seconds() * SAFETY_FACTOR)
+                except ValueError as error:
+                    failures.append(str(error))
+                    required = None
+                if required is not None and (seconds is None or seconds < required):
                     failures.append(
                         f"{display(path)} 的 {service} 用覆盖把 "
                         f"stop_grace_period 改成了 {grace.group(1)}，低于要求的 {required} 秒"
@@ -743,14 +806,21 @@ def main() -> int:
 
     http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
     backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
-    worst_case = _worst_case_seconds()
+    _, max_timeout = _postgres_timeout_facts()
+    default_database_operation_seconds = _default_database_operation_seconds()
+    database_operation_seconds = _database_operation_seconds()
+    database_roundtrip_budget_seconds = database_operation_seconds * DATABASE_OPERATION_COUNT
+    worst_case = float(http_timeout) + float(sum(backoff)) + database_roundtrip_budget_seconds
+    required_dsn_settings = _required_dsn_settings()
     print(
         "部署编排契约：通过（Dockerfile、deploy/ 下 3 个 compose、.dockerignore、Story/Epic/Publish）\n"
         f"  停止宽限期：最坏 {worst_case:.1f}s（续期 HTTP {http_timeout}s + 落盘退避 "
-        f"{sum(backoff)}s + 数据库 {DATABASE_ROUNDTRIP_BUDGET_SECONDS:.0f}s ="
-        f" {DATABASE_OPERATION_COUNT} 次操作 × {DATABASE_OPERATION_SECONDS:.0f}s）"
+        f"{sum(backoff)}s + 数据库 {database_roundtrip_budget_seconds:.0f}s ="
+        f" {DATABASE_OPERATION_COUNT} 次操作 × {database_operation_seconds:.0f}s，"
+        f"合法覆盖上界 {max_timeout}s；默认单次 {default_database_operation_seconds:.0f}s）"
         f" × {SAFETY_FACTOR} → 要求 ≥ {math.ceil(worst_case * SAFETY_FACTOR)}s\n"
-        f"  示例 DSN 已带 {'、'.join(sorted(REQUIRED_DSN_SETTINGS))}，上界因此有依据"
+        f"  示例 DSN 已带 {'、'.join(sorted(required_dsn_settings))}，并与工厂默认值对账；"
+        "运行时覆盖走 LINGXI_POSTGRES_*_TIMEOUT_SECONDS"
     )
     return 0
 

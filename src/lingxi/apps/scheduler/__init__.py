@@ -671,7 +671,7 @@ def build_loop(
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
-    from lingxi.adapters.retention import PostgresRetentionCleaner
+    from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS, PostgresRetentionCleaner
 
     # 一个停止标志贯穿所有职责：SIGTERM 只设它一次，全部职责同时停止领取新工作。
     stop = threading.Event()
@@ -693,7 +693,9 @@ def build_loop(
         stop=stop,
     )
     cleanup = RetentionCleanupDuty(
-        cleaner=PostgresRetentionCleaner(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        # 清理函数内部两张表各有 2s lock_timeout，不能沿用 scheduler 通用的 3s
+        # statement_timeout；适配器专用覆盖要大于 2×2s 累计并留出删批余量。
+        cleaner=PostgresRetentionCleaner(config.postgres_dsn, timeouts=RETENTION_CLEANUP_TIMEOUTS),
         stop=stop,
     )
 
