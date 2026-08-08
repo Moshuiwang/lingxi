@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ast
+import os
+import subprocess
+import sys
 import tomllib
 import unittest
 from datetime import date
@@ -23,9 +26,60 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report
 
 
+_FORMAL_RENDERING_MODULES = (
+    "lingxi.core.conversation.pipeline",
+    "lingxi.core.identity.first_contact",
+    "lingxi.core.identity.roster_report",
+)
+
+
 def _document() -> dict:
     with CONTENT_PATH.open("rb") as stream:
         return tomllib.load(stream)
+
+
+def _imported_bot_test_modules(source_root: Path) -> tuple[str, ...]:
+    """在干净解释器中导入正式入口，再读取其传递导入闭包。"""
+
+    probe = """
+import importlib
+import sys
+
+for module_name in sys.argv[1:]:
+    importlib.import_module(module_name)
+
+for loaded_name in sorted(sys.modules):
+    if any(
+        loaded_name == forbidden
+        or loaded_name.startswith(forbidden + ".")
+        for forbidden in (
+            "lingxi.core.identity.onboarding",
+            "lingxi.adapters.feishu_onboarding",
+            "lingxi.adapters.oauth_bridge",
+            "lingxi.adapters.refresh_tokens",
+            "lingxi.adapters.postgres_onboarding",
+        )
+    ):
+        print(loaded_name)
+"""
+    environment = os.environ.copy()
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(source_root), inherited_pythonpath) if path
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, *_FORMAL_RENDERING_MODULES],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "正式渲染入口导入失败：\n"
+            + (completed.stderr or completed.stdout).strip()
+        )
+    return tuple(line for line in completed.stdout.splitlines() if line)
 
 
 def _code_string_literals(path: Path):
@@ -156,16 +210,15 @@ class ContentDirectoryTests(unittest.TestCase):
                         "正式渲染入口的用户可见中文字面量必须来自内容目录",
                     )
 
-    def test_formal_renderers_do_not_import_bot_test_card_assets(self) -> None:
+    def test_formal_renderers_do_not_import_bot_test_assets_transitively(self) -> None:
         source_root = Path(__file__).parents[1] / "src" / "lingxi"
-        for path in (
-            source_root / "core" / "conversation" / "pipeline.py",
-            source_root / "core" / "identity" / "first_contact.py",
-            source_root / "core" / "identity" / "roster_report.py",
-        ):
-            source = path.read_text(encoding="utf-8")
-            self.assertNotIn("feishu_onboarding", source)
-            self.assertNotIn("oauth-bridge", source)
+        imported = _imported_bot_test_modules(source_root.parent)
+        self.assertEqual(
+            imported,
+            (),
+            "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块："
+            + ", ".join(imported),
+        )
 
 
 class UserVisibleOutputTests(unittest.TestCase):

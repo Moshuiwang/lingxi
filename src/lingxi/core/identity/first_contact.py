@@ -153,7 +153,7 @@ class FirstContactDecision:
 
 
 _MESSAGE_KEYS: dict[FirstContactOutcome, str] = {
-    FirstContactOutcome.RECORD_READY: "onboarding.matched",
+    FirstContactOutcome.RECORD_READY: "onboarding.checking",
     FirstContactOutcome.NOT_AUTHORIZED: "onboarding.not_authorized",
     FirstContactOutcome.DELEGATED_SUBJECT_IGNORED: "onboarding.delegated_subject",
     FirstContactOutcome.DIRECTORY_UNAVAILABLE: "onboarding.internal_error",
