@@ -490,15 +490,65 @@ class RealWorkflowTest(unittest.TestCase):
 
 
 class DatabaseTimeoutTest(unittest.TestCase):
-    """停机上界的依据必须真的写在示例 DSN 里（codex 审查 P1-3）。"""
+    """停机上界必须来自连接工厂事实源，示例 DSN 只做默认值对账。"""
 
     def test_real_example_carries_all_three_settings(self) -> None:
         self.assertEqual(CONTRACT.check_database_timeouts(), [])
 
     def test_budget_is_derived_from_the_documented_timeouts(self) -> None:
-        # 每次操作 = 建连 + 语句 + 提交；不是只算建连。
-        self.assertEqual(CONTRACT.DATABASE_OPERATION_SECONDS, 11.0)
-        self.assertEqual(CONTRACT.DATABASE_ROUNDTRIP_BUDGET_SECONDS, 55.0)
+        # 默认值仍是 5+3+3=11；停止预算必须按合法覆盖的最坏 5+5+5=15 建模。
+        self.assertEqual(CONTRACT._default_database_operation_seconds(), 11.0)
+        self.assertEqual(CONTRACT.DATABASE_OPERATION_SECONDS, 15.0)
+        self.assertEqual(CONTRACT.DATABASE_ROUNDTRIP_BUDGET_SECONDS, 75.0)
+        self.assertEqual(CONTRACT.POSTGRES_MAX_TIMEOUT_SECONDS, 5)
+
+    def test_an_overbudget_factory_maximum_is_caught(self) -> None:
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            adapter = Path(directory) / "postgres.py"
+            adapter.write_text(
+                "DEFAULT_CONNECT_TIMEOUT_SECONDS = 5\n"
+                "DEFAULT_STATEMENT_TIMEOUT_SECONDS = 3\n"
+                "DEFAULT_LOCK_TIMEOUT_SECONDS = 2\n"
+                "MAX_TIMEOUT_SECONDS = 60\n",
+                encoding="utf-8",
+            )
+            original = CONTRACT.POSTGRES_ADAPTER
+            CONTRACT.POSTGRES_ADAPTER = adapter
+            try:
+                failures = CONTRACT.check_stop_grace_period()
+            finally:
+                CONTRACT.POSTGRES_ADAPTER = original
+
+        self.assertTrue(any("合法覆盖按 60s 建模" in failure for failure in failures), failures)
+        self.assertTrue(any("低于要求" in failure for failure in failures), failures)
+
+    def test_dsn_assumption_drift_from_factory_default_is_caught(self) -> None:
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            adapter = Path(directory) / "postgres.py"
+            env_example = Path(directory) / ".env.example"
+            adapter.write_text(
+                "DEFAULT_CONNECT_TIMEOUT_SECONDS = 5\n"
+                "DEFAULT_STATEMENT_TIMEOUT_SECONDS = 4\n"
+                "DEFAULT_LOCK_TIMEOUT_SECONDS = 2\n"
+                "MAX_TIMEOUT_SECONDS = 5\n",
+                encoding="utf-8",
+            )
+            env_example.write_text(
+                "LINGXI_POSTGRES_DSN=postgresql://user:password@host:5432/db?connect_timeout=5"
+                "&options=-c%20statement_timeout%3D3000%20-c%20lock_timeout%3D2000\n",
+                encoding="utf-8",
+            )
+            original_adapter = CONTRACT.POSTGRES_ADAPTER
+            original_env = CONTRACT.ENV_EXAMPLE
+            CONTRACT.POSTGRES_ADAPTER = adapter
+            CONTRACT.ENV_EXAMPLE = env_example
+            try:
+                failures = CONTRACT.check_database_timeouts()
+            finally:
+                CONTRACT.POSTGRES_ADAPTER = original_adapter
+                CONTRACT.ENV_EXAMPLE = original_env
+
+        self.assertTrue(any("statement_timeout=4000" in failure for failure in failures), failures)
 
 
 class GatewayOrchestrationTest(unittest.TestCase):
@@ -533,7 +583,7 @@ class GatewayOrchestrationTest(unittest.TestCase):
     def test_gateway_budget_is_derived_from_its_own_config(self) -> None:
         # 停机超时来自 apps/gateway/config.py 的默认值，出站取它的 1/4。
         self.assertEqual(CONTRACT._gateway_shutdown_timeout(), 20.0)
-        self.assertEqual(CONTRACT._gateway_worst_case_seconds(), 20.0 + 5.0 + 11.0)
+        self.assertEqual(CONTRACT._gateway_worst_case_seconds(), 20.0 + 5.0 + 15.0)
 
     def test_real_compose_gateway_passes(self) -> None:
         self.assertEqual([f for f in CONTRACT.check_compose_contract() if "gateway" in f], [])

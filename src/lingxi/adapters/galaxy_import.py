@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.permission.galaxy_export import (
     SOURCE_TABLES,
     TABLE_SPECS,
@@ -72,13 +73,12 @@ def _issue_payload(issues: Sequence[Issue]) -> list[dict[str, Any]]:
 class PostgresGalaxyImportStore:
     """银河导出的落库入口。构造时不连接数据库，每次调用自带事务。"""
 
-    def __init__(self, dsn: str) -> None:
-        import psycopg
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         from psycopg.types.json import Json
 
-        self._psycopg = psycopg
         self._json = Json
         self._dsn = dsn
+        self._timeouts = timeouts
 
     # ---- 查询 -------------------------------------------------------------
 
@@ -90,7 +90,7 @@ class PostgresGalaxyImportStore:
         Codex 复查发现）。没有新鲜批次时如实返回 None，由调用方安全失败。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT id FROM galaxy_import_batch WHERE status = 'complete' AND expires_at > now() "
                 "ORDER BY completed_at DESC, started_at DESC LIMIT 1"
@@ -154,7 +154,7 @@ class PostgresGalaxyImportStore:
         new_batch_id = batch_id or f"gib_{secrets.token_urlsafe(16)}"
         row_counts = {name: len(report.rows[name]) for name in SOURCE_TABLES}
 
-        with self._psycopg.connect(self._dsn) as connection:
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.cursor() as cursor:
                 # 人工 CLI 也可能并发执行：advisory 锁把整个导入串行化，
                 # 免去「两个不同摘要交错留下双 complete」的窗口（独立复查建议）。
