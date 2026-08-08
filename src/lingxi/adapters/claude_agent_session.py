@@ -33,6 +33,7 @@ def build_agent_options(
     gateway: ToolGateway,
     *,
     allowed_tools: Iterable[str],
+    max_turns: int | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
     cwd: str | None = None,
     model: str | None = None,
@@ -77,6 +78,8 @@ def build_agent_options(
     # 未配置的字段一律不传，交给 SDK 自己的默认值；传 None 覆盖默认值是另一种错。
     if mcp_servers:
         kwargs["mcp_servers"] = dict(mcp_servers)
+    if max_turns is not None:
+        kwargs["max_turns"] = max_turns
     if cwd:
         kwargs["cwd"] = cwd
     if model:
@@ -149,13 +152,25 @@ def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
         )
 
     if isinstance(message, ResultMessage):
-        return (
-            {
-                "kind": "result",
-                "subtype": getattr(message, "subtype", None),
-                "is_error": bool(getattr(message, "is_error", False)),
-            },
-        )
+        event: dict[str, Any] = {
+            "kind": "result",
+            "subtype": getattr(message, "subtype", None),
+            "is_error": bool(getattr(message, "is_error", False)),
+        }
+        # ResultMessage 的字段随 CLI / SDK 版本演进；只把存在的观测字段传给
+        # recorder，不把 result 或 structured_output 这类模型正文带入 usage 摘要。
+        for name in (
+            "usage",
+            "num_turns",
+            "duration_ms",
+            "duration_api_ms",
+            "terminal_reason",
+            "usage_source",
+        ):
+            value = getattr(message, name, None)
+            if value is not None:
+                event[name] = value
+        return (event,)
 
     return ()
 

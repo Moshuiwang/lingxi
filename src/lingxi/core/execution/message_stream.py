@@ -21,6 +21,12 @@ from .audit import TurnAudit
 
 # 规范化事件的取值全集。适配器只允许产出这三种，多一种就说明两层的约定漂了。
 STREAM_EVENT_KINDS: tuple[str, ...] = ("assistant_message", "tool_result", "result")
+_USAGE_TOKEN_FIELDS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
 
 
 class TurnStreamRecorder:
@@ -37,8 +43,15 @@ class TurnStreamRecorder:
         self._result_message_count = 0
         self._result_is_error: bool | None = None
         self._result_subtype: str | None = None
+        self._terminal_reason: str | None = None
         self._tool_result_count = 0
         self._final_text = ""
+        self._usage_summary: dict[str, Any] = {
+            "status": "unknown",
+            "source": "sdk",
+            "reason": "no_result_message",
+        }
+        self._agent_turns: int | None = None
 
     @property
     def final_text(self) -> str:
@@ -69,8 +82,26 @@ class TurnStreamRecorder:
         return self._result_subtype
 
     @property
+    def terminal_reason(self) -> str | None:
+        """SDK 回报的终止原因，只保留有限长度的枚举样字符串。"""
+
+        return self._terminal_reason
+
+    @property
     def tool_result_count(self) -> int:
         return self._tool_result_count
+
+    @property
+    def usage_summary(self) -> dict[str, Any]:
+        """外部 SDK usage 的安全摘要；未知必须显式存在，不能用 0 填洞。"""
+
+        return dict(self._usage_summary)
+
+    @property
+    def agent_turns(self) -> int | None:
+        """SDK 终止消息提供的实际 Agent 轮数；没有该字段时保持未知。"""
+
+        return self._agent_turns
 
     def handle(self, event: Mapping[str, Any]) -> None:
         kind = event.get("kind")
@@ -93,3 +124,45 @@ class TurnStreamRecorder:
             self._result_is_error = bool(event.get("is_error"))
             subtype = event.get("subtype")
             self._result_subtype = subtype[:64] if isinstance(subtype, str) else None
+            terminal_reason = event.get("terminal_reason")
+            self._terminal_reason = terminal_reason[:64] if isinstance(terminal_reason, str) else None
+            self._agent_turns = _non_negative_int(event.get("num_turns"))
+            self._usage_summary = _usage_summary(
+                event.get("usage"),
+                source=event.get("usage_source", "sdk"),
+            )
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _usage_summary(value: Any, *, source: Any) -> dict[str, Any]:
+    """只保留已知 token 计数字段，拒绝把任意 SDK payload 当成 usage。"""
+
+    safe_source = source if isinstance(source, str) and source in {"sdk", "mock"} else "unknown"
+    if not isinstance(value, Mapping):
+        return {
+            "status": "unknown",
+            "source": safe_source,
+            "reason": "not_provided",
+        }
+
+    fields: dict[str, int] = {}
+    for name in _USAGE_TOKEN_FIELDS:
+        candidate = value.get(name)
+        if _non_negative_int(candidate) is not None:
+            fields[name] = candidate
+    if not fields:
+        return {
+            "status": "unknown",
+            "source": safe_source,
+            "reason": "no_recognized_token_counts",
+        }
+    return {
+        "status": "known",
+        "source": safe_source,
+        "fields": fields,
+    }

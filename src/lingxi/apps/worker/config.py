@@ -19,6 +19,13 @@ from lingxi.core.ids import new_ulid
 
 ENV_PREFIX = "LINGXI_WORKER_"
 
+# 这是部署配置的默认口径；实际任务值仍从环境变量读取。硬上限是产品为单任务
+# 设下的安全边界，越过它必须在启动期拒绝，不能让一次部署带着不确定的成本口径运行。
+DEFAULT_MAX_TURNS = 20
+MAX_TURNS_HARD_LIMIT = 30
+DEFAULT_TURN_TIMEOUT_SECONDS = 600.0
+TURN_TIMEOUT_HARD_LIMIT_SECONDS = 900.0
+
 # 本切片只允许一个明确确认过的**只读 MCP 工具**（Issue #37 实施范围 2）。要求
 # ``mcp__`` 前缀是这条范围的机器可核对形式：Skill、Agent、Task 与任何内置工具都
 # 因此落在配置期拒绝分支里，不需要维护一份"禁止配置"的名单。
@@ -36,6 +43,7 @@ class WorkerConfig:
     question: str
     read_only_tool: str
     trace_id: str
+    max_turns: int
     # 单回合墙钟上限：SDK 传输挂住不发终止消息时，没有它整个回合会永久等待，
     # 连失败报告都出不来（Codex 复查发现）。
     turn_timeout_seconds: float
@@ -60,6 +68,7 @@ def load_config(env: Mapping[str, str]) -> WorkerConfig:
         question=_text(env, "QUESTION") or "",
         read_only_tool=_read_only_tool(env),
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
+        max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
@@ -149,15 +158,32 @@ def _validated_trace_id(value: str) -> str:
 
 def _turn_timeout(value: str) -> float:
     if not value:
-        return 600.0
+        return DEFAULT_TURN_TIMEOUT_SECONDS
     try:
         seconds = float(value)
     except ValueError as error:
         raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正数（秒）") from error
     import math
 
-    if seconds <= 0 or not math.isfinite(seconds):
+    if seconds <= 0 or not math.isfinite(seconds) or seconds > TURN_TIMEOUT_HARD_LIMIT_SECONDS:
         # inf / 1e999 会让 asyncio.timeout 永不触发，把本选项要防的永久挂起
-        # 原样带回来（终轮 Codex 复查发现）。
-        raise WorkerConfigError("LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正的有限秒数")
+        # 原样带回来（终轮 Codex 复查发现）；越过产品硬上限同样在启动期拒绝。
+        raise WorkerConfigError(
+            "LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正的有限秒数，且不得超过"
+            f" {TURN_TIMEOUT_HARD_LIMIT_SECONDS:g} 秒"
+        )
     return seconds
+
+
+def _max_turns(value: str) -> int:
+    if not value:
+        return DEFAULT_MAX_TURNS
+    try:
+        turns = int(value)
+    except ValueError as error:
+        raise WorkerConfigError("LINGXI_WORKER_MAX_TURNS 必须是正整数") from error
+    if turns <= 0 or turns > MAX_TURNS_HARD_LIMIT:
+        raise WorkerConfigError(
+            f"LINGXI_WORKER_MAX_TURNS 必须在 1 到 {MAX_TURNS_HARD_LIMIT} 之间"
+        )
+    return turns

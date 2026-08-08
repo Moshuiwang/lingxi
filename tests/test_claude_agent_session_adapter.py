@@ -29,6 +29,7 @@ class StubAgentOptions:
         self,
         *,
         allowed_tools=None,
+        max_turns=None,
         disallowed_tools=None,
         hooks=None,
         mcp_servers=None,
@@ -41,6 +42,7 @@ class StubAgentOptions:
         strict_mcp_config=None,
     ) -> None:
         self.allowed_tools = allowed_tools
+        self.max_turns = max_turns
         self.disallowed_tools = disallowed_tools
         self.hooks = hooks
         self.mcp_servers = mcp_servers
@@ -94,9 +96,15 @@ class StubSystemMessage:
 
 
 class StubResultMessage:
-    def __init__(self, subtype="success", is_error=False) -> None:
+    def __init__(self, subtype="success", is_error=False, *, usage=None, num_turns=None, terminal_reason=None) -> None:
         self.subtype = subtype
         self.is_error = is_error
+        if usage is not None:
+            self.usage = usage
+        if num_turns is not None:
+            self.num_turns = num_turns
+        if terminal_reason is not None:
+            self.terminal_reason = terminal_reason
 
 
 class _StubSDK(unittest.TestCase):
@@ -192,6 +200,18 @@ class AgentOptionsShapeTest(_StubSDK):
         self.assertEqual(full.system_prompt, "只读问数")
         self.assertEqual(set(full.mcp_servers), {"q"})
 
+    def test_max_turns_is_passed_when_configured(self) -> None:
+        from lingxi.adapters.claude_agent_session import build_agent_options
+
+        options = build_agent_options(
+            self.gateway(),
+            allowed_tools=("mcp__q__list",),
+            max_turns=7,
+            stderr_sink=lambda line: None,
+        )
+
+        self.assertEqual(options.max_turns, 7)
+
 
 class MessageNormalisationTest(_StubSDK):
     def test_assistant_text_blocks_become_one_final_text_event(self) -> None:
@@ -235,6 +255,22 @@ class MessageNormalisationTest(_StubSDK):
         events = normalize_message(StubResultMessage(subtype="success", is_error=False))
 
         self.assertEqual(events, ({"kind": "result", "subtype": "success", "is_error": False},))
+
+    def test_result_message_carries_usage_and_termination_metadata_without_model_text(self) -> None:
+        from lingxi.adapters.claude_agent_session import normalize_message
+
+        events = normalize_message(
+            StubResultMessage(
+                usage={"input_tokens": 3, "output_tokens": 4},
+                num_turns=2,
+                terminal_reason="max_turns",
+            )
+        )
+
+        self.assertEqual(events[0]["usage"], {"input_tokens": 3, "output_tokens": 4})
+        self.assertEqual(events[0]["num_turns"], 2)
+        self.assertEqual(events[0]["terminal_reason"], "max_turns")
+        self.assertNotIn("result", events[0])
 
     def test_every_normalised_kind_is_one_the_core_recorder_knows(self) -> None:
         """适配器产出的事件种类必须与 core 记账端的约定完全一致。
