@@ -21,9 +21,12 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lingxi.apps.gateway import build_supervisor, main
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
+from gateway_fakes import FakeOnboarding
+from lingxi.core.conversation.ports import OnboardingState
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
@@ -256,6 +259,29 @@ class BuildSupervisorTests(unittest.TestCase):
         supervisor = build_supervisor(config, transport=sentinel)
 
         self.assertIs(supervisor._transport, sentinel, "注入的传输层必须被采用")
+
+    def test_injected_onboarding_runner_reaches_the_event_pipeline(self) -> None:
+        config = load_config(VALID_ENV)
+        runner = FakeOnboarding()
+
+        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+            build_supervisor(config, transport=object(), onboarding=runner)
+
+        self.assertIs(
+            pipeline_class.call_args.kwargs["onboarding"],
+            runner,
+            "gateway 装配必须把 #89/#17 开通 runner 传入事件管线",
+        )
+
+    def test_missing_onboarding_runner_fails_closed(self) -> None:
+        config = load_config(VALID_ENV)
+
+        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+            build_supervisor(config, transport=object())
+
+        fallback = pipeline_class.call_args.kwargs["onboarding"]
+        result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
+        self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
 
 
 class EntryPointTests(unittest.TestCase):
