@@ -113,9 +113,25 @@ MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {
     "lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
 }
 
-# 单独保留一份期望键集，防止把正式模块删出 REQUIRED_MODULES 后再塞进豁免表，
-# 让“漏登记”伪装成“刻意不打包”。值也要非空，便于审查者知道豁免边界。
-_EXPECTED_MODULE_MANIFEST_EXEMPTIONS = dict(MODULE_MANIFEST_EXEMPTIONS)
+# 这是与上面实际登记表**独立维护**的批准快照。键集和理由全文都故意重复写在这里，
+# 不能从 `MODULE_MANIFEST_EXEMPTIONS` 派生；否则新增/改写源码登记会把“漂移检查”变成
+# 同一字面量的自引用，永远不会变红。正式变更豁免时必须同时审查并更新这两份冻结数据。
+_FROZEN_MODULE_MANIFEST_EXEMPTION_KEYS = frozenset(
+    {
+        "lingxi.adapters.feishu_bitable_association",
+        "lingxi.adapters.feishu_onboarding",
+        "lingxi.adapters.oauth_bridge",
+        "lingxi.adapters.postgres_onboarding",
+        "lingxi.adapters.refresh_tokens",
+    }
+)
+_FROZEN_MODULE_MANIFEST_EXEMPTION_REASONS: dict[str, str] = {
+    "lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单",
+    "lingxi.adapters.feishu_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+    "lingxi.adapters.postgres_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+    "lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+}
 
 # 这个文件没有 `if __name__ == "__main__"` 保护，直接 import 会启动常驻 scheduler。
 # 它仍必须出现在制品清单和 scheduler 的静态依赖闭包里，只是运行时检查改用 find_spec。
@@ -242,7 +258,11 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
 PROCESS_ENTRY_EXEMPTIONS: dict[str, str] = {
     "migrate": "迁移作业只运行 alembic upgrade，不绑定 lingxi 运行时模块",
 }
-_EXPECTED_PROCESS_ENTRY_EXEMPTIONS = dict(PROCESS_ENTRY_EXEMPTIONS)
+# 与 `PROCESS_ENTRY_EXEMPTIONS` 分开冻结，防止迁移边界理由被改写后仍与自身副本相等。
+_FROZEN_PROCESS_ENTRY_EXEMPTION_KEYS = frozenset({"migrate"})
+_FROZEN_PROCESS_ENTRY_EXEMPTION_REASONS: dict[str, str] = {
+    "migrate": "迁移作业只运行 alembic upgrade，不绑定 lingxi 运行时模块",
+}
 
 
 # CI 的 extras 矩阵所在文件。用 ``__file__`` 定位而不是 cwd：本检查刻意在仓库目录
@@ -399,20 +419,23 @@ def check_module_manifests(
 
     if len(required) != len(set(required)):
         failures.append("REQUIRED_MODULES：存在重复登记，清单必须逐项且唯一")
-    expected_exemptions = set(_EXPECTED_MODULE_MANIFEST_EXEMPTIONS)
+    frozen_exemption_names = set(_FROZEN_MODULE_MANIFEST_EXEMPTION_KEYS)
+    frozen_exemption_reasons = _FROZEN_MODULE_MANIFEST_EXEMPTION_REASONS
     actual_exemption_names = set(actual_exemptions)
-    for name in sorted(actual_exemption_names - expected_exemptions):
+    if set(frozen_exemption_reasons) != frozen_exemption_names:
+        failures.append("模块豁免冻结键集与冻结理由全文不一致，冻结清单本身需要修复。")
+    for name in sorted(actual_exemption_names - frozen_exemption_names):
         failures.append(
             f"豁免 `{name}`：不是已批准的模块豁免；不能用错误豁免掩盖制品清单漏项。"
         )
-    for name in sorted(expected_exemptions - actual_exemption_names):
+    for name in sorted(frozen_exemption_names - actual_exemption_names):
         failures.append(f"豁免 `{name}`：已批准但未登记，必须保留可审查理由。")
     for name, reason in sorted(actual_exemptions.items()):
         if not isinstance(reason, str) or not reason.strip():
             failures.append(f"豁免 `{name}`：缺少理由，不能静默忽略源码模块。")
         if name not in actual_source:
             failures.append(f"豁免 `{name}`：源码中不存在，豁免登记已陈旧。")
-        elif name in _EXPECTED_MODULE_MANIFEST_EXEMPTIONS and reason != _EXPECTED_MODULE_MANIFEST_EXEMPTIONS[name]:
+        elif name in frozen_exemption_names and reason != frozen_exemption_reasons.get(name):
             failures.append(f"豁免 `{name}`：理由与已批准政策不一致，不能借改名扩大豁免范围。")
 
     required_set = set(required)
@@ -436,8 +459,16 @@ def check_module_manifests(
     for extra in sorted(actual_processes - expected_processes):
         failures.append(f"PROCESS_RUNTIME_IMPORTS：登记了未知进程 `{extra}`。")
 
-    expected_entry_exemptions = dict(_EXPECTED_PROCESS_ENTRY_EXEMPTIONS)
-    if dict(PROCESS_ENTRY_EXEMPTIONS) != expected_entry_exemptions:
+    actual_entry_exemptions = PROCESS_ENTRY_EXEMPTIONS
+    frozen_entry_names = set(_FROZEN_PROCESS_ENTRY_EXEMPTION_KEYS)
+    if (
+        set(_FROZEN_PROCESS_ENTRY_EXEMPTION_REASONS) != frozen_entry_names
+        or set(actual_entry_exemptions) != frozen_entry_names
+        or any(
+            actual_entry_exemptions.get(name) != _FROZEN_PROCESS_ENTRY_EXEMPTION_REASONS.get(name)
+            for name in frozen_entry_names
+        )
+    ):
         failures.append("PROCESS_ENTRY_EXEMPTIONS：进程入口豁免发生漂移，必须保留迁移边界理由。")
 
     for extra in sorted(expected_processes & actual_processes):

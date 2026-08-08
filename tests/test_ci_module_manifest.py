@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,14 +31,38 @@ def _load_checker():
 CHECKER = _load_checker()
 
 
+def _run_source_only_with_edit(edit):
+    """在临时仓库中改写检查器源码，并走真实 CLI 路径取得退出码。"""
+
+    with tempfile.TemporaryDirectory(prefix="issue76-manifest-") as directory:
+        temporary_repository = Path(directory) / "repository"
+        temporary_script = temporary_repository / "scripts" / "ci" / SCRIPT.name
+        temporary_script.parent.mkdir(parents=True)
+        shutil.copytree(
+            REPOSITORY_ROOT / "src" / "lingxi",
+            temporary_repository / "src" / "lingxi",
+        )
+        original = SCRIPT.read_text(encoding="utf-8")
+        temporary_script.write_text(edit(original), encoding="utf-8")
+        return subprocess.run(
+            [str(Path(sys.executable).resolve()), str(temporary_script), "--source-only"],
+            cwd=temporary_repository,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
 class ModuleManifestReconciliationTest(unittest.TestCase):
     def test_real_repository_manifest_is_complete(self) -> None:
         failures = CHECKER.check_module_manifests()
+        source = CHECKER.source_module_names()
+        artifact_modules = set(CHECKER.REQUIRED_MODULES)
+        exempted_modules = set(CHECKER.MODULE_MANIFEST_EXEMPTIONS)
 
         self.assertEqual([], failures, "\n".join(failures))
-        self.assertEqual(61, len(CHECKER.source_module_names()))
-        self.assertEqual(56, len(CHECKER.REQUIRED_MODULES))
-        self.assertEqual(5, len(CHECKER.MODULE_MANIFEST_EXEMPTIONS))
+        self.assertSetEqual(source, artifact_modules | exempted_modules)
+        self.assertSetEqual(set(), artifact_modules & exempted_modules)
 
     def test_source_enumeration_includes_package_initializers(self) -> None:
         source = CHECKER.source_module_names()
@@ -104,6 +130,51 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         self.assertTrue(failures)
         self.assertTrue(any("错误豁免" in line for line in failures))
         self.assertTrue(any("lingxi.apps.worker.report" in line for line in failures))
+
+    def test_source_edit_formal_module_to_unapproved_exemption_fails(self) -> None:
+        def edit(source: str) -> str:
+            self.assertIn('    "lingxi.adapters.galaxy_import",\n', source)
+            self.assertIn("MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n", source)
+            source = source.replace('    "lingxi.adapters.galaxy_import",\n', "", 1)
+            return source.replace(
+                "MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n",
+                'MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {\n'
+                '    "lingxi.adapters.galaxy_import": "临时随意豁免理由",\n',
+                1,
+            )
+
+        result = _run_source_only_with_edit(edit)
+        output = result.stdout + result.stderr
+
+        self.assertNotEqual(0, result.returncode, output)
+        self.assertIn("lingxi.adapters.galaxy_import", output)
+        self.assertIn("不是已批准的模块豁免", output)
+
+    def test_source_edit_module_exemption_reason_fails(self) -> None:
+        def edit(source: str) -> str:
+            old = '"lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载"'
+            self.assertIn(old, source)
+            return source.replace(old, '"lingxi.adapters.refresh_tokens": "被改写的豁免理由"', 1)
+
+        result = _run_source_only_with_edit(edit)
+        output = result.stdout + result.stderr
+
+        self.assertNotEqual(0, result.returncode, output)
+        self.assertIn("lingxi.adapters.refresh_tokens", output)
+        self.assertIn("理由与已批准政策不一致", output)
+
+    def test_source_edit_migrate_entry_reason_fails(self) -> None:
+        def edit(source: str) -> str:
+            old = '"migrate": "迁移作业只运行 alembic upgrade，不绑定 lingxi 运行时模块"'
+            self.assertIn(old, source)
+            return source.replace(old, '"migrate": "被改写的迁移入口理由"', 1)
+
+        result = _run_source_only_with_edit(edit)
+        output = result.stdout + result.stderr
+
+        self.assertNotEqual(0, result.returncode, output)
+        self.assertIn("PROCESS_ENTRY_EXEMPTIONS", output)
+        self.assertIn("进程入口豁免发生漂移", output)
 
     def test_a_process_cannot_depend_on_a_formal_artifact_exemption(self) -> None:
         process = dict(CHECKER.PROCESS_RUNTIME_IMPORTS)
