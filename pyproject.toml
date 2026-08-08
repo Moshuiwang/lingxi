@@ -34,11 +34,17 @@ requires-python = ">=3.12"
 # 为一个尚未接线的职责把整个 SDK 拉进常驻进程的依赖面。
 # cryptography 精确锁版：Fernet 是宿主机凭据文件的安全边界，范围区间会让
 # 依赖升级在代码未变时改变该边界（终轮 Codex）；升级须重跑凭据保管验证。
-scheduler = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
+# scheduler 镜像也承载一次性 reauthorize job，因此显式带上 OAuth Bridge WebSocket
+# 传输依赖；常驻 scheduler 本身仍不加载 OAuth Bridge 业务模块。
+scheduler = [
+    "cryptography==45.0.7",
+    "psycopg[binary]>=3.2,<4",
+    "websockets>=15,<16",
+]
 # 正式重授权是 scheduler 镜像里的独立一次性 job，但 #76 的干净环境门禁按进程
 # 闭包逐项对账，因此保留同一依赖闭包的独立 extra 供 CI 验证；部署仍复用 scheduler
 # 镜像，不额外构建第五个生产镜像。
-reauthorize = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4"]
+reauthorize = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4", "websockets>=15,<16"]
 # lingxi-worker 进程（`python -m lingxi.apps.worker`：最薄受控执行器）。
 # 依据：入口 → adapters/claude_agent_hooks.py、adapters/claude_agent_session.py。
 # 精确锁版本，不用范围：执行层的只读边界建立在这个版本的 hook 事件名与工具名上

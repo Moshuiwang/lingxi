@@ -16,13 +16,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from lingxi.apps.reauthorize import parse_callback_url
+from lingxi.apps.reauthorize import handle_bridge_message
 from lingxi.adapters.feishu_directory import AuthorizationExchange
 from lingxi.adapters.feishu_reauthorization import (
     FeishuReauthorizationEntry,
     HostFileAuthorizationStateStore,
     ReauthorizationResult,
 )
+from lingxi.adapters.oauth_bridge_client import OAuthBridgeClient, OAuthBridgeMessage
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 
 
@@ -93,6 +94,22 @@ class FakeVault:
         return self.save_result
 
 
+class FakeBridgeResultSender:
+    def __init__(self) -> None:
+        self.results: list[tuple[str, str]] = []
+
+    def send_result(self, state: str, status: str, **_kwargs: object) -> None:
+        self.results.append((state, status))
+
+
+class RecordingDefaultProcessor:
+    def __init__(self, messages: list[OAuthBridgeMessage]) -> None:
+        self.messages = messages
+
+    def process(self, message: OAuthBridgeMessage) -> None:
+        self.messages.append(message)
+
+
 class StateStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -141,27 +158,6 @@ class StateStoreTest(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
 
-class CallbackParserTest(unittest.TestCase):
-    def test_callback_parser_returns_only_one_state_and_one_result(self) -> None:
-        state, code, error = parse_callback_url(
-            "https://stage.example.test/callback?state=" + "s" * 43 + "&code=fake-one-time-code"
-        )
-
-        self.assertEqual(state, "s" * 43)
-        self.assertEqual(code, "fake-one-time-code")
-        self.assertIsNone(error)
-
-    def test_callback_parser_rejects_http_fragment_and_ambiguous_result(self) -> None:
-        for callback in (
-            "http://stage.example.test/callback?state=" + "s" * 43 + "&code=fake",
-            "https://stage.example.test/callback#code=fake",
-            "https://stage.example.test/callback?state=" + "s" * 43 + "&code=fake&error=denied",
-        ):
-            with self.subTest(callback=callback):
-                with self.assertRaises(ValueError):
-                    parse_callback_url(callback)
-
-
 class ReauthorizationEntryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -183,8 +179,8 @@ class ReauthorizationEntryTest(unittest.TestCase):
             state_ttl_seconds=600,
         )
 
-    def _begin(self) -> str:
-        start = self.entry.begin(now=NOW)
+    def _begin(self, *, now: datetime = NOW) -> str:
+        start = self.entry.begin(now=now)
         query = parse_qs(urlparse(start.authorization_url).query)
         self.assertEqual(query["client_id"], ["cli_fake"])
         self.assertEqual(query["redirect_uri"], ["https://stage.example.test/reauth/callback"])
@@ -206,6 +202,44 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertEqual(len(self.vault.saved), 1)
         self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
         self.assertEqual(self.vault.saved[0][1].refresh_token.reveal(), FAKE_REFRESH_TOKEN)
+
+    def test_oauth_bridge_injection_routes_to_formal_reauthorization_without_onboarding(self) -> None:
+        state = self._begin(now=datetime.now(timezone.utc))
+        sender = FakeBridgeResultSender()
+        onboarding_messages: list[OAuthBridgeMessage] = []
+        bridge = OAuthBridgeClient(
+            "wss://bridge.example.test/oauth/bridge",
+            "bridge-token-for-test",
+            processor=RecordingDefaultProcessor(onboarding_messages),
+        )
+        results: list[ReauthorizationResult] = []
+        bridge.register_state_handler(
+            state,
+            lambda message: results.append(handle_bridge_message(self.entry, sender, message)),
+        )
+
+        bridge.handle_message(OAuthBridgeMessage("oauth_code", state, FAKE_CODE))
+
+        self.assertEqual(results, [ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False)])
+        self.assertEqual(onboarding_messages, [])
+        self.assertEqual(sender.results, [(state, "identity_confirmed")])
+        self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
+        self.assertEqual(self.exchanger.calls[0][0], FAKE_CODE)
+
+    def test_oauth_bridge_cancellation_uses_formal_retry_result(self) -> None:
+        state = self._begin(now=datetime.now(timezone.utc))
+        sender = FakeBridgeResultSender()
+
+        result = handle_bridge_message(
+            self.entry,
+            sender,
+            OAuthBridgeMessage("oauth_cancelled", state),
+        )
+
+        self.assertEqual(result, ReauthorizationResult(False, "cancelled", "已取消本次授权，未修改凭据，请重新发起授权。", True))
+        self.assertEqual(sender.results, [(state, "retry")])
+        self.assertEqual(self.exchanger.calls, [])
+        self.assertEqual(self.vault.saved, [])
 
     def test_success_result_and_logs_never_contain_authorization_values(self) -> None:
         state = self._begin()

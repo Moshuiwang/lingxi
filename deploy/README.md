@@ -184,7 +184,8 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 
 正式重授权是一次性运维动作，不新增常驻服务。它使用 scheduler 镜像内随包发布的
 `python -m lingxi.apps.reauthorize`，以 uid 10001 挂载同一个 `lingxi-{stage,prod}-credentials`
-卷；state 文件和凭据文件都在该卷内，入口会在启动前拒绝文件或锁文件路径冲突。
+卷；state 文件和凭据文件都在该卷内，入口会在启动前拒绝文件或锁文件路径冲突。授权回调
+由 OAuth Bridge 的主动 WebSocket 回传，job 不接收终端粘贴的回跳地址。
 
 以 stage 为例，确认六个 env 文件都已按上面的 preflight 准备好后执行：
 
@@ -194,7 +195,9 @@ docker compose --env-file deploy/.env.stage \
   --profile job run --rm reauthorize
 ```
 
-终端只显示授权地址和脱敏结果；按提示在受控浏览器完成同意，再在关闭回显的输入提示中粘贴完整 HTTPS 回跳地址。不要把回跳地址或授权码写入命令行、shell 历史、Issue 或日志。取消、换码失败或保存失败后不要重放旧回跳，重新运行该一次性 job 取得新的 state。
+终端只显示授权地址和脱敏结果；按提示在受控浏览器完成同意，授权码由 Worker 即时转发到
+已经认证的 biai-stage WebSocket。不要把回跳地址或授权码写入命令行、shell 历史、Issue 或日志。
+取消、换码失败或保存失败后不要重放旧回跳，重新运行该一次性 job 取得新的 state。
 
 成功退出后回读 scheduler，并确认凭据文件仍由 uid 10001 可读：
 

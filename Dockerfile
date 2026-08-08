@@ -58,7 +58,8 @@ RUN mkdir -p /var/lib/lingxi/credentials /var/lib/lingxi/users \
 #
 # 依赖按**进程**分组（pyproject.toml 的 optional-dependencies，Issue #56），
 # 每个镜像只装它那一组：scheduler 镜像里没有 claude-agent-sdk，worker 镜像里没有
-# psycopg，两者都没有 bot-test 那一组（lark-oapi / websockets 不进生产镜像）。
+# psycopg；OAuth Bridge 的 WebSocket 传输仅随承载 reauthorize job 的 scheduler 镜像发布，
+# lark-oapi 与 Bot-Test 专用依赖仍不进入正式镜像。
 #
 # `--no-compile` + 随后的 compileall 是**可复现性**要求，不是性能优化：
 # pip 默认生成的 .pyc 用时间戳失效模式，文件头内嵌**源文件 mtime**。同一提交的两个
