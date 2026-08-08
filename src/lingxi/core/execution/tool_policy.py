@@ -16,6 +16,8 @@ from enum import Enum
 from typing import Any, Mapping
 
 _VALID_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+_MCP_TOOL_PREFIX = "mcp__"
+_CONTROLLED_TOOL_NAMES = frozenset({"Skill"})
 
 
 def is_well_formed_tool_name(tool_name: object) -> bool:
@@ -93,6 +95,16 @@ class ToolPolicy:
     ) -> None:
         self._allowed_tools = self._freeze_names(allowed_tools, field="allowed_tools")
         self._allowed_skills = self._freeze_names(allowed_skills, field="allowed_skills", allow_empty=True)
+        unsupported = sorted(
+            name
+            for name in self._allowed_tools
+            if name not in _CONTROLLED_TOOL_NAMES and not name.startswith(_MCP_TOOL_PREFIX)
+        )
+        if unsupported:
+            raise ToolPolicyError(
+                "allowed_tools 只能包含明确批准的 mcp__ 只读工具或 Skill；"
+                f"不允许配置内置/派生工具：{', '.join(unsupported)}"
+            )
         if "Skill" in self._allowed_tools and not self._allowed_skills:
             raise ToolPolicyError("白名单放行了 Skill 工具，必须同时给出允许的 Skill 名单")
 
