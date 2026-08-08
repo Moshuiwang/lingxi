@@ -36,6 +36,7 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.core.conversation.pipeline import EventPipeline
+from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 
@@ -51,6 +52,22 @@ class _LoggingAudit:
 
     def record(self, action: str, /, **fields: object) -> None:
         logger.info("audit %s %s", action, fields)
+
+
+class _UnavailableOnboarding:
+    """外部开通编排未装配时的失败关闭实现。
+
+    正向 gateway 接线仍然认领事件，但绝不假装匹配或开通成功；正式部署应把
+    #89/#17 编排 runner 传入 ``build_supervisor``。这也让漏装配表现为冻结的
+    ``LX-ONBOARD-001`` 终态，而不是静默回到旧的「未开通」分支。
+    """
+
+    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
+        del event_id, open_id, trace_id
+        return OnboardingResult(
+            state=OnboardingState.INTERNAL_ERROR,
+            failure_reason="onboarding_runner_unavailable",
+        )
 
 
 def make_event_handler(
@@ -108,10 +125,14 @@ def build_supervisor(
     *,
     transport: Any = None,
     should_stop: Callable[[], bool] | None = None,
+    onboarding: OnboardingRunner | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
-    ``transport`` 开成注入口：真实长连接属 L4a，全部 L2 断言注入假传输层。
+    ``transport`` 和 ``onboarding`` 都是注入口：真实长连接与真实身份/权限外部链属
+    L4a，全部 L2/L3 断言注入假实现。``onboarding`` 未提供时采用失败关闭 runner，
+    不会把未开通正文悄悄交给下游，也不会误报已开通。
     adapters 在函数体内延迟 import，与 ``apps/scheduler`` 的 ``build_loop`` 同惯例。
     """
 
@@ -120,6 +141,7 @@ def build_supervisor(
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
 
     audit = _LoggingAudit()
+    effective_onboarding = onboarding or _UnavailableOnboarding()
     # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
     # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
     # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
@@ -134,6 +156,7 @@ def build_supervisor(
         reactions=LarkReactions(client),
         replies=LarkReplies(client),
         audit=audit,
+        onboarding=effective_onboarding,
         # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
         should_stop=should_stop,
     )
@@ -161,6 +184,7 @@ def build_supervisor(
             ceiling_seconds=config.reconnect_ceiling_seconds,
         ),
         audit=audit.record,
+        heartbeat=heartbeat,
     )
 
 

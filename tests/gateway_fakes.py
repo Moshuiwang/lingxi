@@ -17,6 +17,8 @@ from typing import Any, Iterator
 from lingxi.core.conversation.ports import (
     ConversationRecord,
     HandledAs,
+    OnboardingResult,
+    OnboardingState,
     UserRecord,
     UserState,
 )
@@ -81,6 +83,28 @@ class FakeAudit:
         self._log.add(f"audit.{action}", **fields)
 
 
+class FakeOnboarding:
+    """只接收 gateway 的身份三元组，模拟 #89/#17 的编排边界。"""
+
+    def __init__(
+        self,
+        *,
+        result: OnboardingResult | None = None,
+        fail_with: Exception | None = None,
+    ) -> None:
+        self.calls: list[dict[str, str]] = []
+        self._result = result or OnboardingResult(state=OnboardingState.STARTED)
+        self._fail_with = fail_with
+
+    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
+        self.calls.append(
+            {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
+        )
+        if self._fail_with is not None:
+            raise self._fail_with
+        return self._result
+
+
 @dataclass
 class FakeConversation:
     conversation_id: str
@@ -98,6 +122,7 @@ class FakeTask:
     prompt: str
     resumed_session: bool
     target_worker_version: str
+    reply_to_message_id: str | None = None
     stop_requested: bool = False
     status: str = "queued"
 

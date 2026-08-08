@@ -42,7 +42,9 @@ REQUIRED_MODULES = (
     "lingxi.apps",
     "lingxi.apps.worker",
     "lingxi.config",
+    "lingxi.config.content",
     "lingxi.core",
+    "lingxi.core.alerting",
     "lingxi.core.conversation",
     "lingxi.core.execution",
     "lingxi.core.identity",
@@ -56,7 +58,9 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
+    "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
+    "lingxi.core.execution.card_stream",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -93,6 +97,8 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
+    "lingxi.apps.worker.delivery",
+    "lingxi.apps.worker.service",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
     # 新的顶层子目录，与 apps/ 当初同一个形状：漏进制品只在部署时暴露。
@@ -145,8 +151,12 @@ _FROZEN_MODULE_MANIFEST_EXEMPTION_REASONS: dict[str, str] = {
 _NON_IMPORTABLE_MODULES = frozenset({"lingxi.apps.scheduler.__main__"})
 
 # 随包发布的数据文件：模块导入成功不代表数据文件进了 wheel（后者要靠
-# pyproject.toml 的 package-data 声明）。缺失时角色职能会整列变成「未映射」。
-REQUIRED_PACKAGE_DATA = (("lingxi.config", "galaxy_role_function_map.toml"),)
+# pyproject.toml 的 package-data 声明）。缺失时角色职能会整列变成「未映射」，或让
+# 正式用户路径在部署后失去版本化内容目录。
+REQUIRED_PACKAGE_DATA = (
+    ("lingxi.config", "galaxy_role_function_map.toml"),
+    ("lingxi.config", "content.toml"),
+)
 
 _INSTALL_MARKERS = ("site-packages", "dist-packages")
 
@@ -167,6 +177,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             "lingxi.apps.scheduler",
             "lingxi.apps.scheduler.__main__",
+            "lingxi.config.content",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
@@ -178,6 +189,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
+            "lingxi.core.alerting",
             "lingxi.core.ids",
         ),
         # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
@@ -206,15 +218,23 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
+            "lingxi.apps.worker.delivery",
+            "lingxi.apps.worker.service",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
+            "lingxi.adapters.postgres",
+            "lingxi.adapters.postgres_conversation",
+            "lingxi.config.content",
+            "lingxi.core.conversation.ports",
             "lingxi.core.execution.audit",
+            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
+            "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
             "lingxi.core.execution.tool_policy",
             "lingxi.core.ids",
         ),
-        ("claude_agent_sdk",),
+        ("claude_agent_sdk", "psycopg"),
     ),
     "gateway": (
         (
@@ -223,6 +243,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.gateway",
             "lingxi.apps.gateway.config",
             "lingxi.apps.gateway.__main__",
+            "lingxi.config.content",
             "lingxi.adapters.feishu_events",
             "lingxi.adapters.feishu_longconn",
             "lingxi.adapters.feishu_outbound",

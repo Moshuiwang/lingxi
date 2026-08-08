@@ -17,12 +17,19 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, Callable
 
-from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+from lingxi.adapters.claude_agent_session import (
+    AgentSessionInterrupted,
+    build_agent_options,
+    run_single_turn,
+)
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
 from lingxi.core.execution.hooks import ToolGateway
+from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 
@@ -39,16 +46,28 @@ class WorkerTurnExecutor:
     hooks、不调 ``start_turn()``、不接消息流——用例都必须变红。
     """
 
-    def __init__(self, config: WorkerConfig, *, stderr_stream: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        *,
+        stderr_stream: Any | None = None,
+        clock: Callable[[], float] | None = None,
+        mark_external_side_effect: Callable[[], None] | None = None,
+    ) -> None:
         self._config = config
         self._policy = ToolPolicy(allowed_tools=(config.read_only_tool,))
         self._audit = TurnAudit(
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
             redactor=AuditRedactor(allowed_input_fields=config.audit_input_fields),
         )
-        self._gateway = ToolGateway(policy=self._policy, audit=self._audit)
+        self._gateway = ToolGateway(
+            policy=self._policy,
+            audit=self._audit,
+            mark_external_side_effect=mark_external_side_effect,
+        )
         self._options: Any = None
         self._stderr_stream = sys.stderr if stderr_stream is None else stderr_stream
+        self._clock = time.monotonic if clock is None else clock
 
     @property
     def policy(self) -> ToolPolicy:
@@ -69,6 +88,7 @@ class WorkerTurnExecutor:
             self._options = build_agent_options(
                 self._gateway,
                 allowed_tools=(self._config.read_only_tool,),
+                max_turns=self._config.max_turns,
                 mcp_servers=self._config.mcp_servers,
                 cwd=self._config.workspace,
                 model=self._config.model,
@@ -97,6 +117,11 @@ class WorkerTurnExecutor:
     async def run_turn(
         self,
         question: str,
+        *,
+        resume_session_id: str | None = None,
+        stop_event: asyncio.Event | None = None,
+        on_stream_event: Callable[[Mapping[str, Any]], None] | None = None,
+        external_texts: Iterable[tuple[str, object]] | Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         """执行一个回合，**总是**返回一份报告。
 
@@ -104,9 +129,17 @@ class WorkerTurnExecutor:
         没发生"无法区分，而这两者的处置完全不同。
         """
 
+        normalized_external_texts = normalize_external_texts(external_texts)
+        agent_prompt = compose_agent_prompt(question, normalized_external_texts)
         self._audit.start_turn()
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
+        started_at = self._clock()
+
+        def handle_event(event: Mapping[str, Any]) -> None:
+            recorder.handle(event)
+            if on_stream_event is not None:
+                on_stream_event(event)
 
         try:
             try:
@@ -120,20 +153,33 @@ class WorkerTurnExecutor:
             if options is not None:
                 await run_single_turn(
                     options=options,
-                    prompt=question,
-                    sink=recorder.handle,
+                    prompt=agent_prompt,
+                    sink=handle_event,
                     timeout_seconds=self._config.turn_timeout_seconds,
+                    resume_session_id=resume_session_id,
+                    stop_event=stop_event,
                 )
+        except AgentSessionInterrupted as error:
+            failure = _failure("interrupted", error)
         except TimeoutError as error:
             # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
             # 没有这个分支整个回合会永久等待（Codex 复查发现）。
-            failure = _failure("turn_timeout", error)
-        except (KeyboardInterrupt, asyncio.CancelledError) as error:
+            del error
+            failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
+        except asyncio.CancelledError:
             # BaseException 不接住就没有报告，违反 cli 的 stdout 契约
-            # 「恰好一个 JSON 对象」；中断也要留下一份可辨认的失败回合。
+            # 「恰好一个 JSON 对象」；取消也要留下一份可辨认的失败回合，不能伪装成
+            # 正常完成或墙钟超时。
+            failure = _failure_message("cancelled", "任务已取消，未继续执行")
+        except KeyboardInterrupt as error:
             failure = _failure("interrupted", error)
         except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
             failure = _failure("session_failed", error)
+
+        if failure is None:
+            failure = _sdk_termination_failure(recorder)
+
+        duration_seconds = max(0.0, self._clock() - started_at)
 
         return build_report(
             trace_id=self._config.trace_id,
@@ -142,7 +188,10 @@ class WorkerTurnExecutor:
             summary=self._audit.summary(),
             stream=recorder,
             final_text=recorder.final_text,
+            duration_seconds=duration_seconds,
             failure=failure,
+            external_texts=tuple(text for _, text in normalized_external_texts),
+            system_prompt=self._config.system_prompt,
         )
 
 
@@ -150,3 +199,17 @@ def _failure(code: str, error: BaseException) -> dict[str, str]:
     # 异常正文可能带上连接串、路径或令牌，按自由文本脱敏后再截断。
     text = redact_free_text(f"{type(error).__name__}: {error}")[:_MAX_FAILURE_TEXT]
     return {"code": code, "message": text}
+
+
+def _failure_message(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": redact_free_text(message)[:_MAX_FAILURE_TEXT]}
+
+
+def _sdk_termination_failure(recorder: TurnStreamRecorder) -> dict[str, str] | None:
+    """把 SDK 的终止元数据收口成产品可区分的护栏原因码。"""
+
+    if recorder.terminal_reason in {"max_turns"} or recorder.result_subtype == "error_max_turns":
+        return _failure_message("max_turns_exceeded", "任务提前结束：达到 Agent 轮数上限，结果可能不完整")
+    if recorder.terminal_reason in {"aborted_streaming", "aborted_tools"}:
+        return _failure_message("cancelled", "任务已取消，未继续执行")
+    return None

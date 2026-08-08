@@ -83,9 +83,9 @@ def revision_sql() -> tuple[str, str]:
 
 
 def _connect(dsn: str) -> Any:
-    import psycopg
+    from lingxi.adapters.postgres import connect
 
-    return psycopg.connect(dsn, autocommit=True)
+    return connect(dsn, autocommit=True)
 
 
 def drop_production_objects(dsn: str) -> None:

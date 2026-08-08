@@ -19,6 +19,9 @@ from typing import Any, Iterable, Mapping
 
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
 from lingxi.core.execution.message_stream import TurnStreamRecorder
+from lingxi.core.execution.input_safety import constrain_output
+
+_GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled"})
 
 
 def build_report(
@@ -29,7 +32,10 @@ def build_report(
     summary: TurnAuditSummary,
     stream: TurnStreamRecorder,
     final_text: str,
+    duration_seconds: float,
     failure: Mapping[str, str] | None = None,
+    external_texts: Iterable[str] = (),
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
 
@@ -38,9 +44,52 @@ def build_report(
     "hook 没触发"就会被"消息流正常"掩盖，而那正是屏障失效的样子。
     """
 
-    whitelist = frozenset(allowed_tools)
-    redacted_text = redact_free_text(final_text)
+    allowed_tool_names = tuple(allowed_tools)
+    whitelist = frozenset(allowed_tool_names)
+    internal_tool_names = tuple(call.tool_name for call in summary.calls) + allowed_tool_names
+    output_safety = constrain_output(
+        final_text,
+        forbidden_values=external_texts,
+        internal_tool_names=internal_tool_names,
+        system_prompt=system_prompt,
+    )
+    redacted_text = redact_free_text(output_safety.text)
     calls = [_project_call(call, whitelist) for call in summary.calls]
+    effective_failure = dict(failure) if failure else None
+    result_error = (stream.result_error or "").casefold()
+    context_error = "context" in result_error and any(
+        marker in result_error for marker in ("long", "length", "limit", "window")
+    )
+    if effective_failure is None and (
+        stream.result_subtype
+        in {
+            "error_context_too_long",
+            "context_length_exceeded",
+            "context_too_long",
+        }
+        or context_error
+    ):
+        effective_failure = {
+            "code": "context_too_long",
+            "message": "agent_context_too_long",
+        }
+
+    failure_code = effective_failure.get("code") if effective_failure else None
+    guard_triggered = failure_code in _GUARD_FAILURE_CODES
+    termination_reason = failure_code or ("completed" if summary.terminal_ok else "turn_not_closed")
+    termination_state = "guarded" if guard_triggered else (
+        "completed" if effective_failure is None else "failed"
+    )
+    result_delivery = "confirmed" if summary.user_result.value == "obtained" else "not_confirmed"
+    usage = stream.usage_summary
+    resources = {
+        "agent_turns": stream.agent_turns,
+        "agent_turns_status": "known" if stream.agent_turns is not None else "unknown",
+        "duration_seconds": duration_seconds,
+        "tool_call_count": len(calls),
+        "executed_tool_call_count": sum(1 for call in summary.calls if call.executed),
+        "usage": usage,
+    }
     return {
         "trace_id": trace_id,
         "question_bytes": len(question.encode("utf-8")),
@@ -53,17 +102,28 @@ def build_report(
                 summary.terminal_ok
                 and stream.result_message_count == 1
                 and stream.result_is_error is not True
-                and failure is None
+                and effective_failure is None
                 and not summary.ungated_calls
             ),
             "gate_bypassed": bool(summary.ungated_calls),
             "final_text": redacted_text,
+            "output_safety": {
+                "blocked": output_safety.blocked,
+                "reasons": output_safety.reasons,
+            },
             "final_text_bytes": summary.final_text_bytes,
             "user_result": summary.user_result.value,
             "terminal_result_count": summary.terminal_result_count,
             "sdk_result_message_count": stream.result_message_count,
             "sdk_result_is_error": stream.result_is_error,
             "sdk_result_subtype": redact_free_text(stream.result_subtype) if stream.result_subtype else None,
+            "sdk_terminal_reason": redact_free_text(stream.terminal_reason) if stream.terminal_reason else None,
+            "termination_state": termination_state,
+            "termination_reason": termination_reason,
+            "guard_triggered": guard_triggered,
+            "result_delivery": result_delivery,
+            "duration_seconds": duration_seconds,
+            "session_id": stream.session_id,
         },
         "audit": {
             "call_count": len(calls),
@@ -71,13 +131,17 @@ def build_report(
             "failed_count": len(summary.failed_calls),
             "ungated_count": len(summary.ungated_calls),
             "tool_result_count": stream.tool_result_count,
+            "termination_reason": termination_reason,
+            "guard_triggered": guard_triggered,
+            "usage": usage,
             "executed_tool_names": [
                 _project_tool_name(name, whitelist) for name in summary.executed_tool_names
             ],
             "denied": [call for call in calls if call["allowed"] is False],
             "calls": calls,
         },
-        "failure": dict(failure) if failure else None,
+        "resources": resources,
+        "failure": effective_failure,
     }
 
 

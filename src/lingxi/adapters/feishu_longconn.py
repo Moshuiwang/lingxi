@@ -157,6 +157,7 @@ class LongConnectionSupervisor:
         # ``time.sleep``。把它做进类型里，注入的假实现也就不会退化成不可打断的。
         sleep: Callable[[float, Callable[[], bool]], None] | None = None,
         audit: Callable[..., None] | None = None,
+        heartbeat: Callable[[], None] | None = None,
     ) -> None:
         self._transport = transport
         self._handle_event = handle_event
@@ -164,6 +165,7 @@ class LongConnectionSupervisor:
         # 注入时钟/注入睡眠：重连间隔断言不能靠真的等 60 秒。
         self._sleep = sleep if sleep is not None else _real_sleep
         self._audit = audit if audit is not None else _log_audit
+        self._heartbeat = heartbeat
         # 供断言读取：`V-接入-06` 要求终止型错误下重连次数**恒为 0**。
         self.reconnect_attempts = 0
         self.observed_delays: list[float] = []
@@ -173,8 +175,10 @@ class LongConnectionSupervisor:
 
         attempt = 0
         while not should_stop():
+            self._emit_heartbeat()
             try:
                 for payload in self._transport.stream():
+                    self._emit_heartbeat()
                     if should_stop():
                         break
                     if payload is None:
@@ -223,6 +227,21 @@ class LongConnectionSupervisor:
             self._sleep(delay, should_stop)
 
         return TerminationReason.STOPPED
+
+    def _emit_heartbeat(self) -> None:
+        if self._heartbeat is None:
+            return
+        try:
+            self._heartbeat()
+        except Exception as error:  # noqa: BLE001 - 心跳观察失败不能断开长连接
+            try:
+                self._audit("longconn.heartbeat_failed", error=type(error).__name__)
+            except Exception as audit_error:  # noqa: BLE001 - 审计观察失败也不能断流
+                logger.error(
+                    "长连接心跳失败且审计失败 error=%s audit_error=%s",
+                    type(error).__name__,
+                    type(audit_error).__name__,
+                )
 
     def _dispatch(self, payload: dict) -> None:
         """把一条事件交给处理器，并把结果回报给传输层。

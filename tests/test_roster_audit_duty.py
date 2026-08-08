@@ -498,6 +498,8 @@ class SendCountTest(unittest.TestCase):
         self.assertEqual(len(sender.payloads), 1, "非空差异日发送恰 1 次")
         self.assertEqual(sender.payloads[0]["chat_id"], FAKE_CHAT_ID)
         self.assertEqual(audit.actions(), ["roster_audit.report_sent"])
+        self.assertEqual(audit.records[0][1]["content_key"], "roster.daily_report")
+        self.assertTrue(audit.records[0][1]["content_version"])
 
 
 class RemovalTakesNoActionTest(unittest.TestCase):
@@ -613,6 +615,8 @@ class SendFailureTest(unittest.TestCase):
 
         self.assertEqual(sender.payloads, [])
         self.assertEqual(audit.actions(), ["roster_audit.send_failed"])
+        self.assertEqual(audit.records[0][1]["content_key"], "roster.daily_report")
+        self.assertTrue(audit.records[0][1]["content_version"])
         self.assertIsNone(duty.completed_on, "发送失败不得算作当日已发送")
 
         # 同一天的下一轮会重试，并且这次成功。

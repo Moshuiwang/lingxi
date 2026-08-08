@@ -1,4 +1,4 @@
-"""执行层工具边界与合成审计链的断言（V-执行-01…06）。
+"""执行层工具边界与合成审计链的断言（V-执行-01…17、22、23）。
 
 对应 Issue #29。这些用例不依赖 Claude Agent SDK、模型额度或任何外部系统：
 判定逻辑全部在 ``lingxi.core.execution`` 里，因此可以在 CI 的 gate 中强制执行。
@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import unittest
 
 from lingxi.core.execution.audit import (
@@ -79,6 +82,13 @@ class ToolPolicyConfigurationTest(unittest.TestCase):
         with self.assertRaises(ToolPolicyError):
             ToolPolicy(allowed_tools=("Skill",))
 
+    def test_builtin_and_delegating_tools_cannot_be_added_to_the_core_allowlist(self) -> None:
+        """核心层也必须拒绝把内置或子代理工具配置成显式放行项。"""
+
+        for tool_name in ("Agent", "Task", "Write", "Bash"):
+            with self.subTest(tool=tool_name), self.assertRaises(ToolPolicyError):
+                ToolPolicy(allowed_tools=(tool_name,))
+
 
 class DenyByDefaultTest(unittest.TestCase):
     """V-执行-01 / V-执行-02：白名单外的调用在执行前被拒。"""
@@ -111,8 +121,8 @@ class DenyByDefaultTest(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertEqual(self.gateway.audit.summary().denied_calls, ())
 
-    def test_subagent_tool_is_denied_by_default_under_both_of_its_known_names(self) -> None:
-        """子代理默认不放行。
+    def test_v_zhixing_22_subagent_tool_is_denied_by_default_under_both_known_names(self) -> None:
+        """V-执行-22：子代理默认不放行。
 
         L4a 实测（Issue #29）：子代理工具在 CLI 2.1.220 里叫 ``Agent`` 而不是
         ``Task``，子代理内部的调用**确实经过同一个 PreToolUse 屏障**；但启用它会让
@@ -637,6 +647,32 @@ class ParsableButUnrecognisedResultTest(unittest.TestCase):
                 self.assertIs(classify_tool_result(payload, rules=forward), ToolResultKind.OK)
 
         self.assertIs(classify_tool_result('{"data": [], "rows": []}'), ToolResultKind.EMPTY_RESULT)
+
+    def test_v_zhixing_15_classification_is_stable_across_eight_hash_seeds(self) -> None:
+        """V-执行-15：回执归类不能靠某个进程的字符串哈希排列碰巧正确。"""
+
+        source = (
+            "from lingxi.core.execution.audit import ResultRules, classify_tool_result; "
+            "payload = {'data': [{'value': 1}], 'metrics': [{}]}; "
+            "rules = ResultRules(empty_collection_keys=frozenset({'data', 'rows', 'items', 'results', 'metrics'})); "
+            "print(classify_tool_result(payload, rules=rules).value)"
+        )
+        environment = os.environ.copy()
+        source_root = os.path.join(os.path.dirname(__file__), "..", "src")
+        environment["PYTHONPATH"] = os.path.abspath(source_root)
+        observed = []
+        for seed in range(8):
+            environment["PYTHONHASHSEED"] = str(seed)
+            completed = subprocess.run(
+                [sys.executable, "-c", source],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            observed.append(completed.stdout.strip())
+
+        self.assertEqual(observed, [ToolResultKind.UNCLASSIFIED.value] * 8)
 
     def test_non_empty_top_level_array_is_not_success_by_itself(self) -> None:
         """顶层数组非空**不等于**用户拿到了结果。

@@ -1,5 +1,8 @@
 """``python -m lingxi.apps.worker`` 的命令行外壳。
 
+``LINGXI_WORKER_MODE=turn`` 执行一次受控回合；``queue`` 启动长期队列消费者。队列
+模式只负责数据库任务状态与执行生命周期，真实外部出站 transport 由应用装配层注入。
+
 输出契约（受控验证要引用它，因此写死在这里）：
 
 - **stdout**：恰好一个 JSON 对象，就是回合报告。配置错误时也是一个 JSON 对象，
@@ -24,10 +27,12 @@ from typing import Any, Mapping, TextIO
 
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
+from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 
 from .config import WorkerConfigError, load_config
 from .report import config_error_report
 from .turn import WorkerTurnExecutor
+from .service import WorkerService
 
 EXIT_OK = 0
 EXIT_TURN_NOT_CLOSED = 2
@@ -49,7 +54,8 @@ def main(
     err = sys.stderr if stderr is None else stderr
 
     try:
-        config = load_config(env)
+        queue_mode = env.get("LINGXI_WORKER_MODE", "turn").strip().lower() == "queue"
+        config = load_config(env, require_question=not queue_mode)
     except WorkerConfigError as error:
         provided_trace_id = env.get("LINGXI_WORKER_TRACE_ID", "")
         # 只有合法 ULID 才复用：误接进来的令牌不得随错误输出外泄（Codex 复查）。
@@ -61,6 +67,34 @@ def main(
         _emit(out, config_error_report(trace_id=trace_id, message=message))
         return EXIT_CONFIG_ERROR
 
+    if queue_mode:
+        dsn = env.get("LINGXI_POSTGRES_DSN", "").strip()
+        if not dsn:
+            message = "队列 worker 缺少 LINGXI_POSTGRES_DSN"
+            _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
+            _emit(out, config_error_report(trace_id=config.trace_id, message=message))
+            return EXIT_CONFIG_ERROR
+        _log(
+            err,
+            config.trace_id,
+            "info",
+            "worker.queue.start",
+            worker_id=config.worker_id,
+            target_worker_version=config.target_worker_version,
+            max_concurrency=config.max_concurrency,
+        )
+        queue = PostgresTaskQueue(dsn)
+        service = WorkerService(
+            config=config,
+            queue=queue,
+            listener_factory=lambda: PostgresTaskQueueListener(dsn),
+        )
+        try:
+            asyncio.run(service.run())
+        except KeyboardInterrupt:
+            return 0
+        return 0
+
     _log(
         err,
         config.trace_id,
@@ -70,10 +104,19 @@ def main(
         question_bytes=len(config.question.encode("utf-8")),
         mcp_servers=sorted(config.mcp_servers),
         workspace_configured=config.workspace is not None,
+        max_turns=config.max_turns,
+        turn_timeout_seconds=config.turn_timeout_seconds,
     )
 
-    report = asyncio.run(WorkerTurnExecutor(config, stderr_stream=err).run_turn(config.question))
+    report = asyncio.run(
+        WorkerTurnExecutor(config, stderr_stream=err).run_turn(
+            config.question,
+            external_texts=config.external_texts,
+        )
+    )
     turn = report["turn"]
+    resources = report["resources"]
+    usage = resources["usage"]
     gate_bypassed = report["audit"]["ungated_count"] > 0
     _log(
         err,
@@ -86,6 +129,17 @@ def main(
         sdk_result_message_count=turn["sdk_result_message_count"],
         sdk_result_is_error=turn["sdk_result_is_error"],
         sdk_result_subtype=turn["sdk_result_subtype"],
+        sdk_terminal_reason=turn["sdk_terminal_reason"],
+        termination_state=turn["termination_state"],
+        termination_reason=turn["termination_reason"],
+        guard_triggered=turn["guard_triggered"],
+        duration_seconds=resources["duration_seconds"],
+        agent_turns=resources["agent_turns"],
+        tool_call_count=resources["tool_call_count"],
+        executed_tool_call_count=resources["executed_tool_call_count"],
+        usage_status=usage["status"],
+        usage_source=usage["source"],
+        usage_fields=usage.get("fields"),
         gate_bypassed=gate_bypassed,
         final_text_bytes=turn["final_text_bytes"],
         call_count=report["audit"]["call_count"],

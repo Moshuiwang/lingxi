@@ -71,9 +71,9 @@ class HandledAs(str, Enum):
 
     TASK_QUEUED = "task_queued"
     BUSY_HINT = "busy_hint"
-    # 未开通用户：本批只记录「收到过、没受理」，**没有**启动自动匹配与开通。
+    # 未开通用户：本批只记录「收到过、没受理」，不把正文交给任何下游。
     NOT_PROVISIONED = "not_provisioned"
-    # 留给 #65 真正接上正向开通路径时使用；本批不会写出这个值。
+    # #65：事件提交后触发一次自动匹配与开通编排。
     AUTO_PROVISIONING = "auto_provisioning"
     COMMAND = "command"
     DROPPED = "dropped"
@@ -92,6 +92,53 @@ class Outcome:
     task_id: str | None = None
     resumed_session: bool | None = None
     target_worker_version: str | None = None
+
+
+class OnboardingState(str, Enum):
+    """自动开通编排的结果；具体身份、权限和外部同步由注入层负责。"""
+
+    STARTED = "started"
+    MATCHED = "matched"
+    COMPLETED = "completed"
+    NOT_AUTHORIZED = "not_authorized"
+    SYNC_TIMEOUT = "sync_timeout"
+    INTERNAL_ERROR = "internal_error"
+
+
+@dataclass(frozen=True)
+class OnboardingMessage:
+    """ContentCatalog 的 key 与已经由编排层确定的展示变量。"""
+
+    key: str
+    values: tuple[tuple[str, object], ...] = ()
+
+    def as_values(self) -> dict[str, object]:
+        return dict(self.values)
+
+
+@dataclass(frozen=True)
+class OnboardingResult:
+    """自动匹配/开通编排返回给 gateway 的受控结果。"""
+
+    state: OnboardingState
+    messages: tuple[OnboardingMessage, ...] = ()
+    failure_reason: str | None = None
+
+
+class OnboardingRunner(Protocol):
+    """提交 gateway 事件后启动既有身份链与开通编排。
+
+    参数刻意只有事件身份；未开通用户的入站正文必须丢弃，不能进入身份或权限链。
+    ``start`` 必须按 event_id/open_id 幂等，具体持久化与外部依赖由注入实现负责。
+    """
+
+    def start(
+        self,
+        *,
+        event_id: str,
+        open_id: str,
+        trace_id: str,
+    ) -> OnboardingResult: ...
 
 
 class GatewayTransaction(Protocol):
@@ -128,6 +175,7 @@ class GatewayTransaction(Protocol):
         prompt: str,
         resumed_session: bool,
         target_worker_version: str,
+        reply_to_message_id: str | None = None,
     ) -> None: ...
 
     def clear_agent_session(self, *, conversation_id: str) -> bool:
@@ -142,6 +190,8 @@ class GatewayTransaction(Protocol):
 
 class GatewayStore(Protocol):
     def transaction(self) -> ContextManager[GatewayTransaction]: ...
+
+    def claim_queue_failure_notice(self, *, event_id: str) -> bool: ...
 
 
 class Reactions(Protocol):

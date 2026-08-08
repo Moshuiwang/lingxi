@@ -1,6 +1,6 @@
 """#16 身份链路的真实 PostgreSQL 断言；不访问飞书、不使用真实凭据。
 
-认领断言：V-开通-01、V-开通-06（真库部分）、V-身份-01、V-身份-02、V-身份-03。
+认领断言：V-开通-01、V-开通-06（真库部分）、V-开通-15、V-开通-16、V-身份-01、V-身份-02、V-身份-03。
 另含「完整性校验不过不提交半轮快照」这条硬规则的真库负向测试。
 
 缺 ``LINGXI_POSTGRES_DSN`` 时整类跳过并说明原因，不静默通过——数据库约束类
@@ -15,6 +15,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_identity import IdentityStorageIntegrityError
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
@@ -98,12 +100,12 @@ class IdentityPostgresTestCase(unittest.TestCase):
         reset_production_rows(self._dsn)
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(sql, parameters)
             return cursor.fetchall()
 
     def execute(self, sql: str, parameters: tuple = ()) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(sql, parameters)
 
     def scalar(self, sql: str, parameters: tuple = ()):
@@ -473,7 +475,7 @@ class TriggerRaceSerializationTest(IdentityPostgresTestCase):
         started = _threading.Event()
         outcome: dict[str, object] = {}
 
-        connection_one = self._psycopg.connect(self._dsn)
+        connection_one = connect(self._dsn)
         try:
             cursor = connection_one.cursor()
             cursor.execute(
@@ -485,7 +487,7 @@ class TriggerRaceSerializationTest(IdentityPostgresTestCase):
             def registry_writer() -> None:
                 started.set()
                 try:
-                    with self._psycopg.connect(self._dsn) as connection_two, connection_two.cursor() as cursor_two:
+                    with connect(self._dsn) as connection_two, connection_two.cursor() as cursor_two:
                         cursor_two.execute(
                             "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) "
                             "VALUES ('org_directory_sync', 'ou_race_subject')"
@@ -662,7 +664,7 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
 
 
 class AppUserRecordTest(IdentityPostgresTestCase):
-    """V-开通-01 / V-开通-06 / V-身份-01 / V-身份-02 的真库部分。"""
+    """V-开通-01 / V-开通-06 / V-开通-15 / V-开通-16 / V-身份-01 / V-身份-02 的真库部分。"""
 
     def setUp(self) -> None:
         super().setUp()
@@ -699,6 +701,138 @@ class AppUserRecordTest(IdentityPostgresTestCase):
         self.assertEqual(
             self.query("SELECT employee_no, email FROM app_user"),
             [("80001", "he.xugong@example-corp.invalid")],
+        )
+
+    def test_roster_fields_round_trip_through_app_user_adapter_and_catalog(self) -> None:
+        """V-开通-15：模型字段不能停在内存里，正式适配器必须写入并回读原值。"""
+
+        draft = dataclasses.replace(
+            self._draft(), employee_no="00080001", email="Roster.User@Example-Corp.invalid"
+        )
+
+        written = self.users.record_identity(draft)
+        loaded = self.users.get_by_open_id(draft.feishu_open_id)
+
+        self.assertEqual((written.employee_no, written.email), ("00080001", "Roster.User@Example-Corp.invalid"))
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual((loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid"))
+        self.assertEqual(
+            self.query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'app_user' "
+                "AND column_name IN ('employee_no', 'email') ORDER BY column_name"
+            ),
+            [("email",), ("employee_no",)],
+        )
+        self.assertEqual(
+            self.query("SELECT employee_no, email FROM app_user WHERE id = %s", (written.id,)),
+            [("00080001", "Roster.User@Example-Corp.invalid")],
+        )
+
+    def test_roster_baseline_reads_the_same_nonempty_archive_after_identity_write(self) -> None:
+        """V-开通-16：#52 读取的三字段必须来自同一份真实建档基线。"""
+
+        from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+
+        draft = dataclasses.replace(
+            self._draft(),
+            employee_no="00080002",
+            email="baseline.user@example-corp.invalid",
+            provisioning_state="active",
+        )
+        written = self.users.record_identity(draft)
+        loaded = self.users.get_by_open_id(draft.feishu_open_id)
+        baseline = PostgresRosterBaselineReader(self._dsn).load_active_baseline()
+        stored = self.query(
+            "SELECT display_name, employee_no, email FROM app_user WHERE id = %s", (written.id,)
+        )
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(len(baseline), 1)
+        self.assertEqual(stored, [(draft.display_name, "00080002", "baseline.user@example-corp.invalid")])
+        self.assertTrue(all(stored[0]), "日报基线不得把建档工号或邮箱静默读成空值")
+        self.assertEqual(
+            (baseline[0].display_name, baseline[0].employee_no, baseline[0].email),
+            stored[0],
+        )
+        self.assertEqual((loaded.employee_no, loaded.email), stored[0][1:])
+
+    def test_empty_roster_field_from_database_fails_closed_and_rolls_back(self) -> None:
+        """V-开通-15：模型有工号但数据库回读为空时不得静默建档。"""
+
+        trigger_name = "test_i89_blank_employee_no"
+        function_name = "test_i89_blank_employee_no"
+        self.execute(
+            f"DROP TRIGGER IF EXISTS {trigger_name} ON app_user; "
+            f"DROP FUNCTION IF EXISTS {function_name}();"
+        )
+        self.addCleanup(
+            lambda: self.execute(
+                f"DROP TRIGGER IF EXISTS {trigger_name} ON app_user; "
+                f"DROP FUNCTION IF EXISTS {function_name}();"
+            )
+        )
+        self.execute(
+            f"""CREATE FUNCTION {function_name}() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                NEW.employee_no := NULL;
+                RETURN NEW;
+            END
+            $$;
+            CREATE TRIGGER {trigger_name}
+            BEFORE INSERT OR UPDATE ON app_user
+            FOR EACH ROW EXECUTE FUNCTION {function_name}();"""
+        )
+
+        draft = dataclasses.replace(self._draft(), employee_no="00080003", email="blank.field@example.invalid")
+        with self.assertRaises(IdentityStorageIntegrityError) as raised:
+            self.users.record_identity(draft)
+
+        self.assertIn("employee_no", str(raised.exception))
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)),
+            0,
+        )
+
+    def test_rewritten_roster_field_from_database_fails_closed_and_rolls_back(self) -> None:
+        """V-开通-15：数据库回读被改写时不得把不一致资料交给后续链路。"""
+
+        trigger_name = "test_i89_rewrite_roster_email"
+        function_name = "test_i89_rewrite_roster_email"
+        self.execute(
+            f"DROP TRIGGER IF EXISTS {trigger_name} ON app_user; "
+            f"DROP FUNCTION IF EXISTS {function_name}();"
+        )
+        self.addCleanup(
+            lambda: self.execute(
+                f"DROP TRIGGER IF EXISTS {trigger_name} ON app_user; "
+                f"DROP FUNCTION IF EXISTS {function_name}();"
+            )
+        )
+        self.execute(
+            f"""CREATE FUNCTION {function_name}() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                NEW.email := lower(NEW.email);
+                RETURN NEW;
+            END
+            $$;
+            CREATE TRIGGER {trigger_name}
+            BEFORE INSERT OR UPDATE ON app_user
+            FOR EACH ROW EXECUTE FUNCTION {function_name}();"""
+        )
+
+        draft = dataclasses.replace(self._draft(), employee_no="00080004", email="Rewrite.Field@Example.invalid")
+        with self.assertRaises(IdentityStorageIntegrityError) as raised:
+            self.users.record_identity(draft)
+
+        self.assertIn("email", str(raised.exception))
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM app_user WHERE feishu_open_id = %s", (draft.feishu_open_id,)),
+            0,
         )
 
     def test_concurrent_upserts_of_the_same_open_id_leave_exactly_one_record(self) -> None:

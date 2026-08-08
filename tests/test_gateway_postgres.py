@@ -1,6 +1,7 @@
 """gateway 的真库断言（需要真实 PostgreSQL）。
 
-认领断言：`V-接入-01`/`V-接入-02`（事件幂等，顺序与并发）、`V-接入-09`（重复投递的
+认领断言：`V-开通-10`/`V-开通-12`/`V-开通-13`/`V-开通-14`（未开通首聊的
+真实事件认领、统一失败出口与重复投递）、`V-接入-01`/`V-接入-02`（事件幂等，顺序与并发）、`V-接入-09`（重复投递的
 用户可见面）、`V-接入-11`（任务归属）、`V-队列-01`…`V-队列-05`（事务边界、抢占回滚、
 失败语义、并发领取、入队发通知）、`V-会话-01`（同话题串行与持有者释放）、
 `V-会话-04`（忙碌期消息不入 task 表）、`V-会话-05`/`V-会话-06`（`/new` 与 `/stop` 的
@@ -18,7 +19,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from gateway_fakes import CallLog, FakeAudit, FakeReactions, FakeReplies
+from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies
 from postgres_schema import ensure_production_schema, reset_production_rows
 from lingxi.adapters.postgres_conversation import (
     TASK_QUEUED_CHANNEL,
@@ -26,7 +27,7 @@ from lingxi.adapters.postgres_conversation import (
     PostgresTaskQueue,
 )
 from lingxi.core.conversation import EventPipeline, InboundMessage
-from lingxi.core.conversation.ports import HandledAs
+from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
 from lingxi.core.ids import new_id
 
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
@@ -1169,7 +1170,7 @@ class WorkerVersionTests(GatewayPostgresTestCase):
 
 
 class UnprovisionedUserTests(GatewayPostgresTestCase):
-    """`V-审计-05` 的 gateway 侧否定面。"""
+    """`V-开通-10`/`V-审计-05` 的 gateway 真库面。"""
 
     def test_unprovisioned_message_writes_only_the_event_row(self) -> None:
         outcome = self.pipeline().handle_message(
@@ -1192,6 +1193,67 @@ class UnprovisionedUserTests(GatewayPostgresTestCase):
         ]
         self.assertNotIn("content", columns)
         self.assertNotIn("prompt", columns)
+
+    def test_wired_first_message_claims_auto_onboarding_once(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+        pipeline = self.pipeline(onboarding=runner)
+
+        first = pipeline.handle_message(
+            inbound("evt_auto", open_id="ou_stranger", text="不要保存这段正文"), now=NOW
+        )
+        second = pipeline.handle_message(
+            inbound("evt_auto", open_id="ou_stranger", text="不要保存这段正文"), now=NOW
+        )
+
+        self.assertEqual(first.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertTrue(second.duplicate)
+        self.assertEqual(runner.calls, [{
+            "event_id": "evt_auto",
+            "open_id": "ou_stranger",
+            "trace_id": "trc_evt_auto",
+        }])
+        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 1)
+        self.assertEqual(
+            self.scalar("SELECT handled_as FROM inbound_event"), "auto_provisioning"
+        )
+        self.assertEqual(self.task_count(), 0)
+        self.assertEqual(self.scalar("SELECT count(*) FROM conversation"), 0)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.not_authorized"],
+        )
+
+    def test_concurrent_duplicate_first_messages_start_one_runner(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.SYNC_TIMEOUT))
+        barrier = threading.Barrier(2)
+        results: list[bool] = []
+        errors: list[BaseException] = []
+
+        def deliver() -> None:
+            try:
+                barrier.wait(timeout=10)
+                outcome = self.pipeline(onboarding=runner).handle_message(
+                    inbound("evt_auto_race", open_id="ou_stranger"), now=NOW
+                )
+                results.append(outcome.duplicate)
+            except BaseException as error:  # noqa: BLE001 - 交回主线程断言
+                errors.append(error)
+
+        threads = [threading.Thread(target=deliver) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(len(runner.calls), 1, "并发重复不得启动两个开通编排")
+        self.assertEqual(self.scalar("SELECT count(*) FROM inbound_event"), 1)
+        self.assertEqual(self.task_count(), 0)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.sync_timeout"],
+        )
 
 
 class RetentionTests(GatewayPostgresTestCase):

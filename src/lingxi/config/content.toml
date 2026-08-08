@@ -1,0 +1,67 @@
+[meta]
+version = "2026-08-08"
+
+[texts]
+"onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
+"onboarding.matched" = "已核对到你的银河权限，正在完成 Lingxi 开通和权限同步，请稍候。同步完成后会通知你。"
+"onboarding.completed" = "开通完成，你现在可以开始使用 Lingxi。当前可用范围：公司：{company_name}；职能：{function_name}。"
+"onboarding.not_authorized" = "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 Lingxi 使用。Lingxi 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
+"onboarding.sync_timeout" = "权限同步未完成，已转交处理，无需重复开通"
+"onboarding.internal_error" = "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。处理完成后我们会通知你。错误码：LX-ONBOARD-001。"
+"onboarding.delegated_subject" = "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。"
+
+"gateway.busy_hint" = "当前任务仍在处理中"
+"gateway.suspended" = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
+"gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
+
+"worker.action.processing" = "正在处理"
+"worker.action.completed" = "已完成"
+"worker.status" = "{action} · {elapsed_seconds} 秒"
+"worker.queued_timeout" = "任务尚未开始，当前排队已超过等待时间，请稍后重试。"
+"worker.version_unavailable" = "任务尚未开始，当前执行能力暂时不可用，请稍后重试。"
+"worker.running_timeout" = "任务执行超时，结果未能确认，请稍后重试。"
+"worker.stopped" = "任务已停止。"
+"worker.stopped_result" = "任务已停止。已产生的结果：{result}"
+"worker.failed" = "本次任务未取得可用结果，请稍后重试。"
+"worker.side_effect_uncertain" = "任务结果未能确认，未自动重试，请稍后重试。"
+"worker.context_too_long" = "当前对话过长，请使用 `/new` 开始新会话"
+
+"roster.report_title" = "花名册每日资料比对"
+"roster.header" = "{title} {report_date}"
+"roster.daily_report" = "{body}"
+"roster.summary" = "比对范围：已开通用户 {examined} 人；本次发现 {entries} 条需要人工核实。"
+"roster.disclaimer" = "正文只列内部用户标识与发生变化的字段名，不含姓名、工号、邮箱等任何资料内容；请到花名册或管理后台核实后，在管理 MCP 处置。"
+"roster.handover_mark" = "疑似转交（姓名与邮箱同时变化）"
+"roster.section.changed" = "资料变化"
+"roster.section.removed" = "花名册查无此人"
+"roster.section.ambiguous" = "花名册同一人员 ID 存在多行"
+"roster.note.changed" = ""
+"roster.note.removed" = "仅提示，本系统未做任何自动处置"
+"roster.note.ambiguous" = "未取任意一行比对，请先在花名册消歧"
+"roster.section_heading" = "{title} {count} 条"
+"roster.section_heading_with_note" = "{heading}（{note}）"
+"roster.entry" = "- {user_id} 变化字段：{fields}"
+"roster.entry_handover" = "{entry}｜{handover_mark}"
+"roster.field.display_name" = "姓名"
+"roster.field.employee_no" = "工号"
+"roster.field.email" = "邮箱"
+
+[cards."query.status"]
+title = "查询进度"
+body = "{status}"
+button_labels = []
+
+[cards."query.result"]
+title = "查询结果"
+body = "{result}"
+button_labels = []
+
+[cards."query.failure"]
+title = "查询结果"
+body = "{message}"
+button_labels = []
+
+[cards."query.empty"]
+title = "查询结果"
+body = "本次未取得可用结果。"
+button_labels = []

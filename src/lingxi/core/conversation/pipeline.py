@@ -6,7 +6,7 @@
     1. 通道级认证        —— 长连接握手期完成，不在逐事件层做（见下方「关于第 1 步」）
     2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
     3. 加表情            失败 → 记审计，继续                  V-接入-07/08
-    4. 查用户状态        未开通 → 内容一律丢弃；已停用 → 回提示 V-审计-05
+    4. 查用户状态        未开通 → 丢弃正文并认领开通；已停用 → 回提示 V-审计-05
     5. 解析命令          /stop /new                            V-会话-05/06
     6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
     7. 入队 + NOTIFY                                           V-队列-01…05
@@ -32,10 +32,11 @@ wss 地址），单条事件上没有可验的签名。承接同一产品意图�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
+from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.ids import new_id
 
 from .commands import Command, parse_command
@@ -44,6 +45,10 @@ from .ports import (
     GatewayStore,
     HandledAs,
     InboundMessage,
+    OnboardingMessage,
+    OnboardingResult,
+    OnboardingRunner,
+    OnboardingState,
     Outcome,
     Reactions,
     Replies,
@@ -54,9 +59,8 @@ from .session_window import should_resume_session
 
 logger = logging.getLogger(__name__)
 
-# 合同「问数与多轮对话」逐字给出的提示语，不是本实现发明的文案：
-# 「除 /stop 外的后续消息（包括 /new）只收到"当前任务仍在处理中"的提示」。
-BUSY_HINT_TEXT = "当前任务仍在处理中"
+# 对外保留这个旧导出，避免调用方为读取固定提示而复制文案；正文唯一来源是内容目录。
+BUSY_HINT_TEXT = default_content_catalog().text("gateway.busy_hint").text
 
 # #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
 # 断言只约束「入队时固化」与「领取带版本条件」两件事。
@@ -64,6 +68,10 @@ DEFAULT_WORKER_VERSION = "stable"
 
 # 本批唯一会被入队的消息类型。
 TEXT_MESSAGE_TYPE = "text"
+
+
+class QueueInsertFailure(RuntimeError):
+    """task 写入失败，入队事务必须整体回滚。"""
 
 
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
@@ -76,13 +84,26 @@ def fixed_stable_version(*, user_id: str, now: datetime) -> str:
 class GatewayTexts:
     """用户可见文案。
 
-    ``busy_hint`` 来自合同原文。``suspended`` **没有**合同原文——接口设计 3.2 只写了
-    「回复停用说明」，具体措辞是尚未拍板的用户可见承诺，因此开成可注入字段并在
-    Issue 里登记为待产品负责人定夺项，而不是在代码里把某句话固化成事实。
+    文字字段保留为 ``str``，兼容现有注入式测试；默认值来自版本化内容目录。发送前通过
+    ``*_content`` 方法补回键和版本，审计不记录渲染后的用户正文。
     """
 
-    busy_hint: str = BUSY_HINT_TEXT
-    suspended: str = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
+    busy_hint: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.busy_hint").text
+    )
+    suspended: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.suspended").text
+    )
+    catalog: ContentCatalog = field(default_factory=default_content_catalog, repr=False, compare=False)
+
+    def busy_hint_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
+
+    def suspended_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.suspended", self.suspended)
+
+    def queue_failed_content(self) -> RenderedContent:
+        return self.catalog.text("gateway.queue_failed")
 
 
 class EventPipeline:
@@ -98,6 +119,7 @@ class EventPipeline:
         texts: GatewayTexts | None = None,
         resolve_version: VersionResolver = fixed_stable_version,
         should_stop: Callable[[], bool] | None = None,
+        onboarding: OnboardingRunner | None = None,
     ) -> None:
         self._store = store
         self._reactions = reactions
@@ -105,6 +127,12 @@ class EventPipeline:
         self._audit = audit
         self._texts = texts or GatewayTexts()
         self._resolve_version = resolve_version
+        # The runner is an application boundary: it owns the #89 identity result,
+        # account matching and the #17 environment/permission/MCP orchestration.
+        # Keeping it optional preserves the old negative-only assembly for callers
+        # that have not opted into the #65 path; the gateway app passes it explicitly
+        # when the product path is enabled.
+        self._onboarding = onboarding
         # 停机位。停机时**已提交的结论不动**，只跳过尽力而为的出站回复——
         # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
         self._should_stop = should_stop or (lambda: False)
@@ -126,40 +154,95 @@ class EventPipeline:
         """
 
         moment = now or datetime.now(timezone.utc)
-        deferred: list[str] = []
+        deferred: list[RenderedContent] = []
 
-        outcome = self._within_transaction(message, moment, deferred)
+        try:
+            outcome = self._within_transaction(message, moment, deferred)
+        except QueueInsertFailure as error:
+            # 真正的 PostgreSQL store 通过独立事务取得一次发送权；没有该能力的旧注入
+            # store 继续抛出原始异常，以免把一个仅测试事务回滚的假实现冒充生产发送器。
+            claim_notice = getattr(self._store, "claim_queue_failure_notice", None)
+            if claim_notice is None:
+                raise error.__cause__ or error
+            if claim_notice(event_id=message.event_id):
+                content = self._texts.queue_failed_content()
+                if not self._should_stop():
+                    try:
+                        self._replies.send_text(
+                            chat_id=message.chat_id,
+                            thread_id=message.thread_id,
+                            reply_to_message_id=message.message_id,
+                            text=content.text,
+                        )
+                        self._audit.record(
+                            "reply.sent",
+                            event_id=message.event_id,
+                            content_key=content.key,
+                            content_version=content.version,
+                            trace_id=message.trace_id,
+                        )
+                    except Exception as send_error:  # noqa: BLE001 - 结论已回滚，提示尽力而为
+                        self._audit.record(
+                            "reply.failed",
+                            event_id=message.event_id,
+                            content_key=content.key,
+                            content_version=content.version,
+                            error=f"{type(send_error).__name__}: {send_error}",
+                            trace_id=message.trace_id,
+                        )
+            self._audit.record(
+                "task.enqueue_failed",
+                event_id=message.event_id,
+                error=f"{type(error.__cause__ or error).__name__}",
+                trace_id=message.trace_id,
+            )
+            return Outcome(handled_as=None)
 
         # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
+        if outcome.handled_as is HandledAs.AUTO_PROVISIONING:
+            self._start_onboarding(message, deferred)
+
         if deferred and self._should_stop():
             # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
             # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
             # 一条提示不改变任何硬承诺。
-            self._audit.record(
-                "reply.skipped_while_stopping",
-                event_id=message.event_id,
-                trace_id=message.trace_id,
-            )
+            for content in deferred:
+                self._audit.record(
+                    "reply.skipped_while_stopping",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
+                )
             return outcome
-        for text in deferred:
+        for content in deferred:
             try:
                 self._replies.send_text(
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
                     reply_to_message_id=message.message_id,
-                    text=text,
+                    text=content.text,
+                )
+                self._audit.record(
+                    "reply.sent",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
                 )
             except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
                 self._audit.record(
                     "reply.failed",
                     event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
                     error=f"{type(error).__name__}: {error}",
                     trace_id=message.trace_id,
                 )
         return outcome
 
     def _within_transaction(
-        self, message: InboundMessage, moment: datetime, deferred: list[str]
+        self, message: InboundMessage, moment: datetime, deferred: list[RenderedContent]
     ) -> Outcome:
         """第 2 步到第 7 步，全部落在同一个事务里。"""
 
@@ -192,17 +275,25 @@ class EventPipeline:
 
             if state is UserState.NOT_PROVISIONED:
                 # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显（`V-审计-05`）。
-                # 本批只认领这条**否定面**——正向的自动匹配与开通接线是 #65，不在本批。
                 # 注意审计里也不带消息正文：内容"不保存"包括不写进审计。
+                if self._onboarding is not None:
+                    self._audit.record(
+                        "inbound_event.auto_provisioning",
+                        event_id=message.event_id,
+                        trace_id=message.trace_id,
+                    )
+                    tx.mark_handled_as(
+                        event_id=message.event_id, handled_as=HandledAs.AUTO_PROVISIONING
+                    )
+                    return Outcome(handled_as=HandledAs.AUTO_PROVISIONING)
+
+                # 未配置正向编排的旧装配仍然保持明确的否定终态；正式 gateway
+                # 通过 apps.gateway.build_supervisor 的 onboarding 注入口启用 #65。
                 self._audit.record(
                     "inbound_event.not_provisioned",
                     event_id=message.event_id,
                     trace_id=message.trace_id,
                 )
-                # 记 `not_provisioned` 而不是 `auto_provisioning`：本批**没有**启动
-                # 任何自动匹配与开通（正向接线是 #65），写后者等于让这一列陈述一件
-                # 没有发生的事。也不记 `dropped`——那会与「已停用」混为一谈，而
-                # #54 的保留清理与 #65 的接线都要读这一列。
                 tx.mark_handled_as(
                     event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
                 )
@@ -211,7 +302,7 @@ class EventPipeline:
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
 
             if state is UserState.SUSPENDED:
-                deferred.append(self._texts.suspended)
+                deferred.append(self._texts.suspended_content())
                 self._audit.record(
                     "inbound_event.suspended",
                     event_id=message.event_id,
@@ -252,7 +343,7 @@ class EventPipeline:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
                 # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                deferred.append(self._texts.busy_hint)
+                deferred.append(self._texts.busy_hint_content())
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                 return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -264,7 +355,7 @@ class EventPipeline:
                 # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
                 # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
                 if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
-                    deferred.append(self._texts.busy_hint)
+                    deferred.append(self._texts.busy_hint_content())
                     tx.mark_handled_as(
                         event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
                     )
@@ -314,6 +405,73 @@ class EventPipeline:
     # 内部步骤
     # ------------------------------------------------------------------
 
+    def _start_onboarding(
+        self, message: InboundMessage, deferred: list[RenderedContent]
+    ) -> None:
+        """提交后启动一次自动开通，并把结果限制在内容目录内。
+
+        事务只负责认领 ``event_id``；身份读取、匹配、开通和 MCP 同步由 runner
+        自己用独立的幂等边界完成。这样 gateway 不会把长耗时外部调用放进队列事务，
+        也不会把用户原文传入权限链。
+        """
+
+        assert self._onboarding is not None
+        checking = self._texts.catalog.text("onboarding.checking")
+        deferred.append(checking)
+
+        try:
+            result = self._onboarding.start(
+                event_id=message.event_id,
+                open_id=message.sender_open_id,
+                trace_id=message.trace_id,
+            )
+            if not isinstance(result, OnboardingResult):
+                raise TypeError("onboarding runner returned an invalid result")
+            rendered = self._render_onboarding_result(result, checking_key=checking.key)
+        except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
+            internal = self._texts.catalog.text("onboarding.internal_error")
+            deferred.append(internal)
+            self._audit.record(
+                "onboarding.failed",
+                event_id=message.event_id,
+                state=OnboardingState.INTERNAL_ERROR.value,
+                error=type(error).__name__,
+                trace_id=message.trace_id,
+            )
+            return
+
+        deferred.extend(rendered)
+        self._audit.record(
+            "onboarding.result",
+            event_id=message.event_id,
+            state=result.state.value,
+            failure_reason=result.failure_reason,
+            content_keys=tuple(content.key for content in rendered),
+            trace_id=message.trace_id,
+        )
+
+    def _render_onboarding_result(
+        self, result: OnboardingResult, *, checking_key: str
+    ) -> tuple[RenderedContent, ...]:
+        messages = list(result.messages)
+        if not messages:
+            defaults = {
+                OnboardingState.NOT_AUTHORIZED: OnboardingMessage("onboarding.not_authorized"),
+                OnboardingState.SYNC_TIMEOUT: OnboardingMessage("onboarding.sync_timeout"),
+                OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
+            }
+            default_message = defaults.get(result.state)
+            if default_message is not None:
+                messages.append(default_message)
+
+        rendered: list[RenderedContent] = []
+        for message in messages:
+            if message.key == checking_key:
+                # checking is owned by the gateway and is sent exactly once.
+                continue
+            rendered.append(self._texts.catalog.text(message.key, message.as_values()))
+        return tuple(rendered)
+
     def _add_reaction(self, message: InboundMessage) -> None:
         """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
 
@@ -350,7 +508,7 @@ class EventPipeline:
         if not tx.claim_conversation(
             conversation_id=conversation.conversation_id, task_id=task_id
         ):
-            deferred.append(self._texts.busy_hint)
+            deferred.append(self._texts.busy_hint_content())
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -365,15 +523,19 @@ class EventPipeline:
         # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
         version = self._resolve_version(user_id=user_id, now=now)
 
-        tx.insert_task(
-            task_id=task_id,
-            conversation_id=conversation.conversation_id,
-            user_id=user_id,
-            inbound_event_id=message.event_id,
-            prompt=message.text,
-            resumed_session=resumed,
-            target_worker_version=version,
-        )
+        try:
+            tx.insert_task(
+                task_id=task_id,
+                conversation_id=conversation.conversation_id,
+                user_id=user_id,
+                inbound_event_id=message.event_id,
+                prompt=message.text,
+                resumed_session=resumed,
+                target_worker_version=version,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as error:  # noqa: BLE001 - 事务外只做一次失败提示
+            raise QueueInsertFailure("task insert failed") from error
         tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
         tx.notify_task_queued()
 
@@ -393,3 +555,12 @@ class EventPipeline:
             resumed_session=resumed,
             target_worker_version=version,
         )
+
+
+def _as_content(catalog: ContentCatalog, key: str, value: str) -> RenderedContent:
+    """把兼容旧注入口的字符串包成可追溯内容；默认值仍来自目录。"""
+
+    configured = catalog.text(key)
+    if value == configured.text:
+        return configured
+    return RenderedContent(key=key, version=catalog.version, text=value)

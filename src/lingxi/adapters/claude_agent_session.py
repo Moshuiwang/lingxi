@@ -12,12 +12,17 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 
 from typing import Any, Callable, Iterable, Mapping
 
 from lingxi.core.execution.hooks import ToolGateway
 
 from .claude_agent_hooks import build_hook_matchers
+
+
+class AgentSessionInterrupted(Exception):
+    """worker 收到 /stop 后要求 SDK 尽快中断当前回合。"""
 
 # 依赖到的 SDK 类型名。集中列出，便于真实 SDK 冒烟一次性核对它们是否还在。
 MESSAGE_TYPE_NAMES: tuple[str, ...] = (
@@ -33,6 +38,7 @@ def build_agent_options(
     gateway: ToolGateway,
     *,
     allowed_tools: Iterable[str],
+    max_turns: int | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
     cwd: str | None = None,
     model: str | None = None,
@@ -77,6 +83,8 @@ def build_agent_options(
     # 未配置的字段一律不传，交给 SDK 自己的默认值；传 None 覆盖默认值是另一种错。
     if mcp_servers:
         kwargs["mcp_servers"] = dict(mcp_servers)
+    if max_turns is not None:
+        kwargs["max_turns"] = max_turns
     if cwd:
         kwargs["cwd"] = cwd
     if model:
@@ -95,6 +103,8 @@ async def run_single_turn(
     prompt: str,
     sink: Callable[[Mapping[str, Any]], None],
     timeout_seconds: float,
+    resume_session_id: str | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     """跑**一个**回合：建会话、发一次提问、把消息流规范化后交给 ``sink``。
 
@@ -106,12 +116,47 @@ async def run_single_turn(
 
     # 墙钟上限盖住整个回合：SDK 传输保持连接却不发终止消息时，
     # receive_response() 的迭代器不会自行结束（Codex 复查发现）。
+    session_options = options
+    if resume_session_id:
+        # SDK options 是 dataclass；测试桩未必是 dataclass，所以保留一个不改变原对象的
+        # 浅拷贝回退。resume 只在明确续用时传入，新的会话不会偷偷复用旧上下文。
+        try:
+            from dataclasses import replace
+
+            session_options = replace(options, resume=resume_session_id)
+        except (TypeError, ValueError):
+            session_options = copy.copy(options)
+            setattr(session_options, "resume", resume_session_id)
+
     async with asyncio.timeout(timeout_seconds):
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            async for message in client.receive_response():
-                for event in normalize_message(message):
-                    sink(event)
+        async with ClaudeSDKClient(options=session_options) as client:
+            interrupted = asyncio.Event()
+
+            async def interrupt_when_requested() -> None:
+                if stop_event is None:
+                    return
+                await stop_event.wait()
+                interrupt = getattr(client, "interrupt", None)
+                if callable(interrupt):
+                    result = interrupt()
+                    if hasattr(result, "__await__"):
+                        await result
+                interrupted.set()
+
+            monitor = asyncio.create_task(interrupt_when_requested())
+            try:
+                await client.query(prompt)
+                async for message in client.receive_response():
+                    for event in normalize_message(message):
+                        sink(event)
+                    if interrupted.is_set():
+                        raise AgentSessionInterrupted()
+            finally:
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
 
 
 def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
@@ -149,13 +194,31 @@ def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
         )
 
     if isinstance(message, ResultMessage):
-        return (
-            {
-                "kind": "result",
-                "subtype": getattr(message, "subtype", None),
-                "is_error": bool(getattr(message, "is_error", False)),
-            },
-        )
+        event: dict[str, Any] = {
+            "kind": "result",
+            "subtype": getattr(message, "subtype", None),
+            "is_error": bool(getattr(message, "is_error", False)),
+        }
+        # ResultMessage 的字段随 CLI / SDK 版本演进；只把存在的观测字段传给
+        # recorder，不把 result 或 structured_output 这类模型正文带入 usage 摘要。
+        for name in (
+            "usage",
+            "num_turns",
+            "duration_ms",
+            "duration_api_ms",
+            "terminal_reason",
+            "usage_source",
+        ):
+            value = getattr(message, name, None)
+            if value is not None:
+                event[name] = value
+        session_id = getattr(message, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            event["session_id"] = session_id
+        error_text = getattr(message, "error", None)
+        if isinstance(error_text, str) and error_text:
+            event["error"] = error_text[:500]
+        return (event,)
 
     return ()
 

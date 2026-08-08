@@ -176,6 +176,8 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertEqual(decision.draft.department, "测试部门")
         self.assertEqual(decision.draft.tenant_key, "tenant_a")
         self.assertEqual(decision.draft.provisioning_state, "matching")
+        self.assertEqual(decision.content_key, "onboarding.checking")
+        self.assertTrue(decision.content_version)
 
     def test_the_draft_carries_no_employment_status_field_at_all(self) -> None:
         """硬约束 2：``status`` 只用于当次拦截，存下来立刻产生陈旧窗口。"""
@@ -238,6 +240,34 @@ class DecideFirstContactTest(unittest.TestCase):
                 self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
                 self.assertIs(decision.failure_reason, FailureReason.INCOMPLETE_PROFILE)
                 self.assertIsNone(decision.draft)
+
+    def test_identity_failure_reasons_share_one_user_visible_terminal_message(self) -> None:
+        """V-开通-17：内部原因可区分，但用户侧提示必须逐字节一致。"""
+
+        duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
+        cases = (
+            decide(open_id="ou_absent", location=locate_by_open_id("ou_absent", (member(),))),
+            decide(location=locate_by_open_id("ou_zhang", (member(), duplicate))),
+            decide(location=locate_by_open_id("ou_zhang", (member(user_id="   "),))),
+            decide(employment=None),
+            decide(
+                employment=EmploymentStatus(
+                    is_activated=True,
+                    is_exited=False,
+                    is_frozen=True,
+                    is_resigned=False,
+                    is_unjoin=False,
+                )
+            ),
+        )
+
+        self.assertEqual({decision.outcome for decision in cases}, {FirstContactOutcome.NOT_AUTHORIZED})
+        self.assertEqual(len({decision.failure_reason for decision in cases}), len(cases))
+        self.assertEqual(len({decision.message for decision in cases}), 1)
+        self.assertEqual(len({decision.content_key for decision in cases}), 1)
+        for decision in cases:
+            self.assertIsNone(decision.draft)
+            self.assertNotIn("manual_review", decision.message)
 
     def test_the_delegated_authorization_subject_is_never_recorded_as_a_user(self) -> None:
         """V-身份-02。"""
@@ -388,6 +418,51 @@ class UserFacingMessageTest(unittest.TestCase):
             decide(open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,))),
             decide(directory=DirectoryAvailability.UNAVAILABLE),
         )
+
+    def test_each_terminal_outcome_has_exact_contract_or_base_user_visible_text(self) -> None:
+        record_ready = decide()
+        self.assertEqual(
+            record_ready.message,
+            "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。",
+        )
+        self.assertEqual(record_ready.content_key, "onboarding.checking")
+
+        not_authorized = decide(
+            open_id="ou_absent",
+            location=locate_by_open_id("ou_absent", (member(),)),
+        )
+        self.assertEqual(
+            not_authorized.message,
+            "当前没有可用的银河权限，请先在银河申请或补充权限。"
+            "银河权限生效并完成同步后，请再回到 Lingxi 使用。"
+            "Lingxi 不能代替你申请或扩大银河权限。"
+            "如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
+        )
+        self.assertEqual(not_authorized.content_key, "onboarding.not_authorized")
+
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+        )
+        delegated = decide(
+            open_id=DELEGATED_SUBJECT,
+            location=locate_by_open_id(DELEGATED_SUBJECT, (subject,)),
+        )
+        self.assertEqual(
+            delegated.message,
+            "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。",
+        )
+        self.assertEqual(delegated.content_key, "onboarding.delegated_subject")
+
+        directory_unavailable = decide(directory=DirectoryAvailability.UNAVAILABLE)
+        self.assertEqual(
+            directory_unavailable.message,
+            "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
+            "处理完成后我们会通知你。错误码：LX-ONBOARD-001。",
+        )
+        self.assertEqual(directory_unavailable.content_key, "onboarding.internal_error")
 
     def test_every_outcome_has_a_non_empty_chinese_message(self) -> None:
         seen = set()

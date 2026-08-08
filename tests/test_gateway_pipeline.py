@@ -18,6 +18,7 @@ from gateway_fakes import (
     CallLog,
     FakeAudit,
     FakeConversation,
+    FakeOnboarding,
     FakeReactions,
     FakeReplies,
     FakeState,
@@ -37,6 +38,7 @@ from lingxi.core.conversation import (
     UserState,
 )
 from lingxi.core.conversation.ports import HandledAs
+from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, OnboardingState
 from lingxi.core.conversation.session_window import should_resume_session
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
@@ -69,12 +71,19 @@ class PipelineTestCase(unittest.TestCase):
         self.state = FakeState()
         self.state.users["ou_1"] = provisioned_user()
 
-    def build(self, *, fail_on: str | None = None, reaction_error: Exception | None = None):
+    def build(
+        self,
+        *,
+        fail_on: str | None = None,
+        reaction_error: Exception | None = None,
+        onboarding=None,
+    ):
         return EventPipeline(
             store=FakeStore(self.state, self.log, fail_on=fail_on),
             reactions=FakeReactions(self.log, fail_with=reaction_error),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
+            onboarding=onboarding,
         )
 
 
@@ -146,6 +155,10 @@ class ReactionFailureTests(PipelineTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
         self.assertEqual(self.log.count("reply.send_text"), 1, "加表情失败不得吞掉忙碌提示")
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content_key"], "gateway.busy_hint")
+        self.assertTrue(sent[0]["content_version"])
 
     def test_unprovisioned_path_still_completes_when_reaction_fails(self) -> None:
         outcome = self.build(reaction_error=RuntimeError("飞书 500")).handle_message(
@@ -483,6 +496,100 @@ class UnprovisionedUserTests(PipelineTestCase):
                 repr(fields),
                 "未开通用户发来的业务内容不得出现在任何审计或出站调用里",
             )
+
+
+class AutomaticOnboardingTests(PipelineTestCase):
+    """#65：首次未开通消息只认领一次，并在提交后启动开通编排。"""
+
+    def test_first_message_claims_and_starts_identity_chain_without_text(self) -> None:
+        secret = "我的工号是 12345，帮我查工资"
+        runner = FakeOnboarding(
+            result=OnboardingResult(
+                state=OnboardingState.COMPLETED,
+                messages=(
+                    OnboardingMessage("onboarding.matched"),
+                    OnboardingMessage(
+                        "onboarding.completed",
+                        values=(("company_name", "公司 A"), ("function_name", "销售")),
+                    ),
+                ),
+            )
+        )
+        pipeline = self.build(onboarding=runner)
+
+        outcome = pipeline.handle_message(
+            message(event_id="evt_onboard", open_id="ou_stranger", text=secret), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(self.state.events["evt_onboard"], "auto_provisioning")
+        self.assertEqual(
+            runner.calls,
+            [{"event_id": "evt_onboard", "open_id": "ou_stranger", "trace_id": "trc_evt_onboard"}],
+        )
+        self.assertNotIn("text", runner.calls[0])
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.matched", "onboarding.completed"],
+        )
+        self.assertEqual(len(self.state.tasks), 0)
+        for _, fields in self.log.entries:
+            self.assertNotIn(secret, repr(fields))
+
+    def test_duplicate_delivery_does_not_restart_onboarding_or_reply(self) -> None:
+        runner = FakeOnboarding(
+            result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED)
+        )
+        pipeline = self.build(onboarding=runner)
+
+        pipeline.handle_message(message(event_id="evt_onboard_dup", open_id="ou_new"), now=NOW)
+        replies_after_first = self.log.count("reply.send_text")
+        outcome = pipeline.handle_message(
+            message(event_id="evt_onboard_dup", open_id="ou_new"), now=NOW
+        )
+
+        self.assertTrue(outcome.duplicate)
+        self.assertEqual(len(runner.calls), 1, "重复事件不得重复触发开通编排")
+        self.assertEqual(self.log.count("reply.send_text"), replies_after_first)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.not_authorized"],
+        )
+
+    def test_unmatched_result_is_terminal_fixed_prompt(self) -> None:
+        runner = FakeOnboarding(
+            result=OnboardingResult(
+                state=OnboardingState.NOT_AUTHORIZED,
+                failure_reason="no_supported_function",
+            )
+        )
+
+        outcome = self.build(onboarding=runner).handle_message(
+            message(event_id="evt_unmatched", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.not_authorized"],
+        )
+        self.assertEqual(len(self.state.tasks), 0)
+        self.assertEqual(self.log.count("store.ensure_conversation"), 0)
+
+    def test_runner_failure_uses_internal_terminal_prompt(self) -> None:
+        runner = FakeOnboarding(fail_with=RuntimeError("外部权限服务不可用"))
+
+        outcome = self.build(onboarding=runner).handle_message(
+            message(event_id="evt_internal", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.internal_error"],
+        )
+        self.assertEqual(self.log.count("audit.onboarding.failed"), 1)
+        self.assertNotIn("外部权限服务不可用", repr(self.log.entries))
 
 
 class BlackHoleOutboundTests(PipelineTestCase):
