@@ -70,7 +70,16 @@ class CardTaskDelivery:
     def complete(self, *, result: str, elapsed_seconds: int = 0) -> None:
         self._stream.finish(result=result, elapsed_seconds=elapsed_seconds)
         if self._stream.fallback_needed:
-            self._stream.send_fallback(self._catalog.text("worker.failed"))
+            # 卡片失败不等于回合失败：模型已经给出的正文必须原样交付，避免用户
+            # 看到失败提示而丢掉可用答案。结果是动态正文，不经过固定文案目录；
+            # 话题定位仍由 CardStream 持有，文本适配器也因此只能收到同一目标。
+            self._stream.send_fallback(
+                RenderedContent(
+                    key="worker.result",
+                    version=self._catalog.version,
+                    text=result,
+                )
+            )
 
     def fail(self, *, content: RenderedContent) -> None:
         self._stream.finish(failure=content)

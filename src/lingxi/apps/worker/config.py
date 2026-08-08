@@ -43,10 +43,12 @@ class WorkerConfig:
     question: str
     read_only_tool: str
     trace_id: str
-    max_turns: int
     # 单回合墙钟上限：SDK 传输挂住不发终止消息时，没有它整个回合会永久等待，
     # 连失败报告都出不来（Codex 复查发现）。
     turn_timeout_seconds: float
+    # 直接构造配置的测试与嵌入调用方沿用旧接口时仍使用同一安全默认值；正式入口
+    # 通过 load_config 显式校验并传入部署值。
+    max_turns: int = DEFAULT_MAX_TURNS
     audit_input_fields: tuple[str, ...] = ()
     failure_text_markers: tuple[str, ...] = ()
     mcp_servers: Mapping[str, Any] = field(default_factory=dict)
