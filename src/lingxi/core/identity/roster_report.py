@@ -30,69 +30,112 @@ from datetime import date
 
 from lingxi.core.identity.roster_audit import (
     ARCHIVED_FIELDS,
-    FIELD_LABELS,
     DiffKind,
     PersonDiff,
     RosterAuditReport,
 )
+from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 
-REPORT_TITLE = "花名册每日资料比对"
+_CATALOG = default_content_catalog()
+REPORT_TITLE = _CATALOG.text("roster.report_title").text
 
-# 转交标注。做成独立后缀而不是混进字段名列表，管理员一眼能挑出来（`V-花名册-21`）。
-HANDOVER_MARK = "疑似转交（姓名与邮箱同时变化）"
+# 保留模块级导出供既有日报测试与调用方使用；正文来源仍是内容目录。
+HANDOVER_MARK = _CATALOG.text("roster.handover_mark").text
 
-_SECTION_TITLES = {
-    DiffKind.CHANGED: "资料变化",
-    DiffKind.REMOVED: "花名册查无此人",
-    DiffKind.AMBIGUOUS: "花名册同一人员 ID 存在多行",
+_SECTION_TITLE_KEYS = {
+    DiffKind.CHANGED: "roster.section.changed",
+    DiffKind.REMOVED: "roster.section.removed",
+    DiffKind.AMBIGUOUS: "roster.section.ambiguous",
 }
 
-_SECTION_NOTES = {
-    DiffKind.CHANGED: "",
-    # 「移除」只上报，不停用、不撤权、不产生待办（`V-花名册-26`）。把这句写进正文，
-    # 是为了让管理员不会以为系统已经处理过了。
-    DiffKind.REMOVED: "仅提示，本系统未做任何自动处置",
-    DiffKind.AMBIGUOUS: "未取任意一行比对，请先在花名册消歧",
+_SECTION_NOTE_KEYS = {
+    DiffKind.CHANGED: "roster.note.changed",
+    DiffKind.REMOVED: "roster.note.removed",
+    DiffKind.AMBIGUOUS: "roster.note.ambiguous",
 }
 
 # 章节输出顺序固定。
 _SECTION_ORDER = (DiffKind.CHANGED, DiffKind.REMOVED, DiffKind.AMBIGUOUS)
 
+_FIELD_LABEL_KEYS = {
+    "display_name": "roster.field.display_name",
+    "employee_no": "roster.field.employee_no",
+    "email": "roster.field.email",
+}
 
-def _field_label(field: str) -> str:
-    return FIELD_LABELS.get(field, field)
+
+def _field_label(field: str, catalog) -> str:
+    key = _FIELD_LABEL_KEYS.get(field)
+    return catalog.text(key).text if key is not None else field
 
 
-def _entry_line(entry: PersonDiff) -> str:
+def _entry_line(entry: PersonDiff, *, catalog) -> str:
     """一条目一行。行首是完整的内部用户标识，其后只有字段名与标注。"""
 
     if not entry.changed_fields:
         return f"- {entry.app_user_id}"
     # 按 ARCHIVED_FIELDS 的固定次序渲染，不依赖 changed_fields 的构造顺序。
-    labels = "、".join(_field_label(field) for field in ARCHIVED_FIELDS if field in entry.changed_fields)
-    line = f"- {entry.app_user_id} 变化字段：{labels}"
-    return f"{line}｜{HANDOVER_MARK}" if entry.handover else line
+    labels = "、".join(
+        _field_label(field, catalog) for field in ARCHIVED_FIELDS if field in entry.changed_fields
+    )
+    line = catalog.text(
+        "roster.entry", user_id=entry.app_user_id, fields=labels
+    ).text
+    if entry.handover:
+        return catalog.text(
+            "roster.entry_handover", entry=line, handover_mark=HANDOVER_MARK
+        ).text
+    return line
 
 
-def render_daily_report(report: RosterAuditReport, *, report_date: date) -> str:
-    """渲染日报正文。空差异日不该走到这里——那天不发日报，只记审计。"""
+def render_daily_report_content(
+    report: RosterAuditReport,
+    *,
+    report_date: date,
+    catalog: ContentCatalog | None = None,
+) -> RenderedContent:
+    """渲染日报正文并保留内容键/版本；空差异日仍只由调用方决定是否发送。"""
 
+    catalog = catalog or default_content_catalog()
+    title = catalog.text("roster.report_title").text
     lines = [
-        f"{REPORT_TITLE} {report_date.isoformat()}",
-        f"比对范围：已开通用户 {report.examined} 人；本次发现 {len(report.entries)} 条需要人工核实。",
-        # 措辞不用「原值/新值/旧值」这类词：`V-花名册-22` 对新旧值形态做模式扫描，
-        # 一句自我说明的免责话术会把扫描变成必须开豁免的检查，而豁免正是它失效的开始。
-        "正文只列内部用户标识与发生变化的字段名，不含姓名、工号、邮箱等任何资料内容；请到花名册或管理后台核实后，在管理 MCP 处置。",
+        catalog.text(
+            "roster.header", title=title, report_date=report_date.isoformat()
+        ).text,
+        catalog.text(
+            "roster.summary", examined=report.examined, entries=len(report.entries)
+        ).text,
+        catalog.text("roster.disclaimer").text,
     ]
 
     for kind in _SECTION_ORDER:
         section = tuple(entry for entry in report.entries if entry.kind is kind)
         if not section:
             continue
-        note = _SECTION_NOTES[kind]
-        heading = f"{_SECTION_TITLES[kind]} {len(section)} 条"
+        section_title = catalog.text(_SECTION_TITLE_KEYS[kind]).text
+        note = catalog.text(_SECTION_NOTE_KEYS[kind]).text
+        heading = catalog.text(
+            "roster.section_heading", title=section_title, count=len(section)
+        ).text
         lines.append("")
-        lines.append(f"{heading}（{note}）" if note else heading)
-        lines.extend(_entry_line(entry) for entry in section)
+        lines.append(
+            catalog.text(
+                "roster.section_heading_with_note", heading=heading, note=note
+            ).text
+            if note
+            else heading
+        )
+        lines.extend(_entry_line(entry, catalog=catalog) for entry in section)
 
-    return "\n".join(lines)
+    return catalog.text("roster.daily_report", body="\n".join(lines))
+
+
+def render_daily_report(
+    report: RosterAuditReport,
+    *,
+    report_date: date,
+    catalog: ContentCatalog | None = None,
+) -> str:
+    """兼容旧调用方的字符串入口；正式发送链路使用带元数据的函数。"""
+
+    return render_daily_report_content(report, report_date=report_date, catalog=catalog).text

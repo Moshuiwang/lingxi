@@ -176,6 +176,8 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertEqual(decision.draft.department, "测试部门")
         self.assertEqual(decision.draft.tenant_key, "tenant_a")
         self.assertEqual(decision.draft.provisioning_state, "matching")
+        self.assertEqual(decision.content_key, "onboarding.checking")
+        self.assertTrue(decision.content_version)
 
     def test_the_draft_carries_no_employment_status_field_at_all(self) -> None:
         """硬约束 2：``status`` 只用于当次拦截，存下来立刻产生陈旧窗口。"""
@@ -388,6 +390,51 @@ class UserFacingMessageTest(unittest.TestCase):
             decide(open_id=DELEGATED_SUBJECT, location=locate_by_open_id(DELEGATED_SUBJECT, (subject,))),
             decide(directory=DirectoryAvailability.UNAVAILABLE),
         )
+
+    def test_each_terminal_outcome_has_exact_contract_or_base_user_visible_text(self) -> None:
+        record_ready = decide()
+        self.assertEqual(
+            record_ready.message,
+            "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。",
+        )
+        self.assertEqual(record_ready.content_key, "onboarding.checking")
+
+        not_authorized = decide(
+            open_id="ou_absent",
+            location=locate_by_open_id("ou_absent", (member(),)),
+        )
+        self.assertEqual(
+            not_authorized.message,
+            "当前没有可用的银河权限，请先在银河申请或补充权限。"
+            "银河权限生效并完成同步后，请再回到 Lingxi 使用。"
+            "Lingxi 不能代替你申请或扩大银河权限。"
+            "如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
+        )
+        self.assertEqual(not_authorized.content_key, "onboarding.not_authorized")
+
+        subject = member(
+            member_key=DELEGATED_SUBJECT,
+            open_id=DELEGATED_SUBJECT,
+            user_id="user_delegated",
+            union_id="union_delegated",
+        )
+        delegated = decide(
+            open_id=DELEGATED_SUBJECT,
+            location=locate_by_open_id(DELEGATED_SUBJECT, (subject,)),
+        )
+        self.assertEqual(
+            delegated.message,
+            "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。",
+        )
+        self.assertEqual(delegated.content_key, "onboarding.delegated_subject")
+
+        directory_unavailable = decide(directory=DirectoryAvailability.UNAVAILABLE)
+        self.assertEqual(
+            directory_unavailable.message,
+            "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
+            "处理完成后我们会通知你。错误码：LX-ONBOARD-001。",
+        )
+        self.assertEqual(directory_unavailable.content_key, "onboarding.internal_error")
 
     def test_every_outcome_has_a_non_empty_chinese_message(self) -> None:
         seen = set()

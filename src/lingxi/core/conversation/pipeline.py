@@ -32,10 +32,11 @@ wss 地址），单条事件上没有可验的签名。承接同一产品意图�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
+from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.ids import new_id
 
 from .commands import Command, parse_command
@@ -54,9 +55,8 @@ from .session_window import should_resume_session
 
 logger = logging.getLogger(__name__)
 
-# 合同「问数与多轮对话」逐字给出的提示语，不是本实现发明的文案：
-# 「除 /stop 外的后续消息（包括 /new）只收到"当前任务仍在处理中"的提示」。
-BUSY_HINT_TEXT = "当前任务仍在处理中"
+# 对外保留这个旧导出，避免调用方为读取固定提示而复制文案；正文唯一来源是内容目录。
+BUSY_HINT_TEXT = default_content_catalog().text("gateway.busy_hint").text
 
 # #45 的分流规则形态属 S11（决策第 3 条）。本批最小实现固定 stable，
 # 断言只约束「入队时固化」与「领取带版本条件」两件事。
@@ -76,13 +76,23 @@ def fixed_stable_version(*, user_id: str, now: datetime) -> str:
 class GatewayTexts:
     """用户可见文案。
 
-    ``busy_hint`` 来自合同原文。``suspended`` **没有**合同原文——接口设计 3.2 只写了
-    「回复停用说明」，具体措辞是尚未拍板的用户可见承诺，因此开成可注入字段并在
-    Issue 里登记为待产品负责人定夺项，而不是在代码里把某句话固化成事实。
+    文字字段保留为 ``str``，兼容现有注入式测试；默认值来自版本化内容目录。发送前通过
+    ``*_content`` 方法补回键和版本，审计不记录渲染后的用户正文。
     """
 
-    busy_hint: str = BUSY_HINT_TEXT
-    suspended: str = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
+    busy_hint: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.busy_hint").text
+    )
+    suspended: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.suspended").text
+    )
+    catalog: ContentCatalog = field(default_factory=default_content_catalog, repr=False, compare=False)
+
+    def busy_hint_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
+
+    def suspended_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.suspended", self.suspended)
 
 
 class EventPipeline:
@@ -126,7 +136,7 @@ class EventPipeline:
         """
 
         moment = now or datetime.now(timezone.utc)
-        deferred: list[str] = []
+        deferred: list[RenderedContent] = []
 
         outcome = self._within_transaction(message, moment, deferred)
 
@@ -135,31 +145,43 @@ class EventPipeline:
             # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
             # HTTP 只会把停机拖过预算（出站默认 30 秒 > 停机 20 秒），而用户少收
             # 一条提示不改变任何硬承诺。
-            self._audit.record(
-                "reply.skipped_while_stopping",
-                event_id=message.event_id,
-                trace_id=message.trace_id,
-            )
+            for content in deferred:
+                self._audit.record(
+                    "reply.skipped_while_stopping",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
+                )
             return outcome
-        for text in deferred:
+        for content in deferred:
             try:
                 self._replies.send_text(
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
                     reply_to_message_id=message.message_id,
-                    text=text,
+                    text=content.text,
+                )
+                self._audit.record(
+                    "reply.sent",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
                 )
             except Exception as error:  # noqa: BLE001 - 回复失败不改变已提交的结论
                 self._audit.record(
                     "reply.failed",
                     event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
                     error=f"{type(error).__name__}: {error}",
                     trace_id=message.trace_id,
                 )
         return outcome
 
     def _within_transaction(
-        self, message: InboundMessage, moment: datetime, deferred: list[str]
+        self, message: InboundMessage, moment: datetime, deferred: list[RenderedContent]
     ) -> Outcome:
         """第 2 步到第 7 步，全部落在同一个事务里。"""
 
@@ -211,7 +233,7 @@ class EventPipeline:
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
 
             if state is UserState.SUSPENDED:
-                deferred.append(self._texts.suspended)
+                deferred.append(self._texts.suspended_content())
                 self._audit.record(
                     "inbound_event.suspended",
                     event_id=message.event_id,
@@ -252,7 +274,7 @@ class EventPipeline:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
                 # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                deferred.append(self._texts.busy_hint)
+                deferred.append(self._texts.busy_hint_content())
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                 return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -264,7 +286,7 @@ class EventPipeline:
                 # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
                 # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
                 if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
-                    deferred.append(self._texts.busy_hint)
+                    deferred.append(self._texts.busy_hint_content())
                     tx.mark_handled_as(
                         event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
                     )
@@ -350,7 +372,7 @@ class EventPipeline:
         if not tx.claim_conversation(
             conversation_id=conversation.conversation_id, task_id=task_id
         ):
-            deferred.append(self._texts.busy_hint)
+            deferred.append(self._texts.busy_hint_content())
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -393,3 +415,12 @@ class EventPipeline:
             resumed_session=resumed,
             target_worker_version=version,
         )
+
+
+def _as_content(catalog: ContentCatalog, key: str, value: str) -> RenderedContent:
+    """把兼容旧注入口的字符串包成可追溯内容；默认值仍来自目录。"""
+
+    configured = catalog.text(key)
+    if value == configured.text:
+        return configured
+    return RenderedContent(key=key, version=catalog.version, text=value)

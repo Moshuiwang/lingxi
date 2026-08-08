@@ -51,7 +51,7 @@ from typing import Any, Mapping, Protocol
 from lingxi.core.identity.credentials import AuthorizationGrant, CredentialAction, RefreshOutcome, decide_after_refresh
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
-from lingxi.core.identity.roster_report import render_daily_report
+from lingxi.core.identity.roster_report import render_daily_report_content
 
 logger = logging.getLogger(__name__)
 
@@ -450,17 +450,21 @@ class RosterAuditDuty:
             logger.info("停止信号在花名册读取期间到达，本轮不发送日报")
             return report
 
-        text = render_daily_report(report, report_date=today)
+        content = render_daily_report_content(report, report_date=today)
         try:
             # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
             # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
-            self._sender.send_text(chat_id=self._chat_id, text=text, dedupe_key=today.isoformat())
+            self._sender.send_text(
+                chat_id=self._chat_id, text=content.text, dedupe_key=today.isoformat()
+            )
         except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
             # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
             # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。
             self._audit.record(
                 "roster_audit.send_failed",
                 report_date=today.isoformat(),
+                content_key=content.key,
+                content_version=content.version,
                 error=type(error).__name__,
             )
             logger.error("管理群审计日报发送失败，下一轮重试 error=%s", type(error).__name__)
@@ -469,6 +473,8 @@ class RosterAuditDuty:
         self._audit.record(
             "roster_audit.report_sent",
             report_date=today.isoformat(),
+            content_key=content.key,
+            content_version=content.version,
             examined=report.examined,
             entries=len(report.entries),
             handover=report.handover_count,

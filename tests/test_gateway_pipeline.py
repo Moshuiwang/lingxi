@@ -146,6 +146,10 @@ class ReactionFailureTests(PipelineTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
         self.assertEqual(self.log.count("reply.send_text"), 1, "加表情失败不得吞掉忙碌提示")
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content_key"], "gateway.busy_hint")
+        self.assertTrue(sent[0]["content_version"])
 
     def test_unprovisioned_path_still_completes_when_reaction_fails(self) -> None:
         outcome = self.build(reaction_error=RuntimeError("飞书 500")).handle_message(
