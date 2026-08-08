@@ -48,6 +48,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Protocol
 
+from lingxi.adapters.postgres import (
+    DEFAULT_POSTGRES_TIMEOUTS,
+    PostgresTimeoutConfigError,
+    PostgresTimeouts,
+)
 from lingxi.core.identity.credentials import AuthorizationGrant, CredentialAction, RefreshOutcome, decide_after_refresh
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
@@ -86,6 +91,7 @@ class SchedulerConfig:
     feishu_app_secret: str = field(repr=False)
     feishu_base_url: str
     interval_seconds: int
+    postgres_timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
     # 管理群 chat_id。**可选**：没有它进程照常启动，只是不注册审计日报职责。
     # 做成可选而不是必需，是因为它只服务三个职责中的一个——为一个尚未接线的职责
     # 让整个 scheduler 起不来，会把「日报没配」升级成「凭据轮换也停了」。
@@ -94,6 +100,9 @@ class SchedulerConfig:
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
+        "LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS",
+        "LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS",
+        "LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS",
         "LINGXI_DELEGATED_CREDENTIAL_KEY",
         "LINGXI_DELEGATED_CREDENTIAL_PATH",
         "LINGXI_FEISHU_APP_ID",
@@ -135,8 +144,14 @@ class SchedulerConfig:
         else:
             admin_group_chat_id = None
 
+        try:
+            postgres_timeouts = PostgresTimeouts.from_env(source)
+        except PostgresTimeoutConfigError as error:
+            raise ValueError(str(error)) from None
+
         return cls(
             postgres_dsn=_Secret(required("LINGXI_POSTGRES_DSN")),
+            postgres_timeouts=postgres_timeouts,
             credential_key=_Secret(required("LINGXI_DELEGATED_CREDENTIAL_KEY")),
             credential_path=required("LINGXI_DELEGATED_CREDENTIAL_PATH"),
             feishu_app_id=required("LINGXI_FEISHU_APP_ID"),
@@ -621,7 +636,9 @@ def _build_roster_audit_duty(
     from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 
     return RosterAuditDuty(
-        baseline_reader=PostgresRosterBaselineReader(config.postgres_dsn),
+        baseline_reader=PostgresRosterBaselineReader(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
         roster_reader=lambda: read_roster_records(roster_page_reader),
         sender=FeishuGroupMessages(
             base_url=config.feishu_base_url,
@@ -661,7 +678,12 @@ def build_loop(
     sink = audit if audit is not None else StructuredLogAuditSink()
 
     rotation = CredentialRotationLoop(
-        vault=HostFileDelegatedCredentialVault(config.postgres_dsn, config.credential_key, config.credential_path),
+        vault=HostFileDelegatedCredentialVault(
+            config.postgres_dsn,
+            config.credential_key,
+            config.credential_path,
+            timeouts=config.postgres_timeouts,
+        ),
         authorization=FeishuAuthorizationClient(
             base_url=config.feishu_base_url,
             app_id=config.feishu_app_id,
@@ -670,7 +692,10 @@ def build_loop(
         interval_seconds=config.interval_seconds,
         stop=stop,
     )
-    cleanup = RetentionCleanupDuty(cleaner=PostgresRetentionCleaner(config.postgres_dsn), stop=stop)
+    cleanup = RetentionCleanupDuty(
+        cleaner=PostgresRetentionCleaner(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        stop=stop,
+    )
 
     duties: list[Any] = [rotation, cleanup]
     roster_audit = _build_roster_audit_duty(

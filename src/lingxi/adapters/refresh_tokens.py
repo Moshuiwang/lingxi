@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 from urllib.request import Request
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthTokenGrant
 
 
@@ -28,10 +29,15 @@ class RefreshTokenVault(Protocol):
 class PostgresRefreshTokenVault:
     """密文在 PostgreSQL，解密密钥只在 biai-stage 的受控环境变量中。"""
 
-    def __init__(self, dsn: str, encryption_key: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        encryption_key: str,
+        *,
+        timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+    ) -> None:
         try:
             from cryptography.fernet import Fernet
-            import psycopg
         except ImportError as error:  # 绝不降级为明文保存。
             raise RuntimeError("缺少 Bot-Test 加密续期凭据依赖") from error
         try:
@@ -39,7 +45,7 @@ class PostgresRefreshTokenVault:
         except Exception as error:
             raise ValueError("LINGXI_OAUTH_REFRESH_TOKEN_KEY 必须是有效的 Fernet 密钥") from error
         self._dsn = dsn
-        self._psycopg = psycopg
+        self._timeouts = timeouts
 
     @staticmethod
     def _refresh_at(seconds: int) -> datetime:
@@ -50,7 +56,7 @@ class PostgresRefreshTokenVault:
         ciphertext = self._cipher.encrypt(grant.refresh_token.encode())
         refresh_at = self._refresh_at(grant.refresh_token_expires_in)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=grant.refresh_token_expires_in)
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO feishu_user_refresh_token
                     (feishu_open_id, encrypted_refresh_token, scope, refresh_at, refresh_token_expires_at)
@@ -65,7 +71,7 @@ class PostgresRefreshTokenVault:
 
     def due(self) -> list[tuple[str, OAuthTokenGrant]]:
         """先占用记录，避免同一个一次性 refresh_token 被并发使用。"""
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """WITH picked AS (
                     SELECT feishu_open_id FROM feishu_user_refresh_token
@@ -93,7 +99,7 @@ class PostgresRefreshTokenVault:
         self.save(open_id, grant)
 
     def remove(self, open_id: str) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute("DELETE FROM feishu_user_refresh_token WHERE feishu_open_id = %s", (open_id,))
 
 

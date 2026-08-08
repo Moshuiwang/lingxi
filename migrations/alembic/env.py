@@ -26,7 +26,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 
 # `alembic.ini` 的 prepend_sys_path 把本目录放进 sys.path，所以这个 import 成立。
-from migration_dsn import DSN_VARIABLE, normalize_database_url
+from migration_dsn import DSN_VARIABLE, migration_connect_args, normalize_database_url
 
 config = context.config
 if config.config_file_name is not None:
@@ -35,7 +35,7 @@ if config.config_file_name is not None:
 
 def run_migrations_online() -> None:
     url = normalize_database_url(os.environ.get(DSN_VARIABLE))
-    engine = create_engine(url, poolclass=pool.NullPool)
+    engine = create_engine(url, poolclass=pool.NullPool, connect_args=migration_connect_args())
     try:
         with engine.connect() as connection:
             context.configure(

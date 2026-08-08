@@ -53,6 +53,9 @@ python3 scripts/ci/check_project_skills.py
 # 验收矩阵的三态状态列与合同条款覆盖清单。这两样此前只是散文约定：
 # 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
 python3 scripts/ci/check_acceptance_matrix.py
+# Issue #75：正式 PostgreSQL 连接必须走唯一工厂，迁移入口必须有独立且有限的连接参数。
+# 该检查登记在 #75 的共享位置；#76 的制品 / 进程依赖清单检查按编排者约定后续追加。
+python3 scripts/ci/check_db_timeouts.py
 # alembic revision 链的结构性约束（Issue #53）：head 唯一、无孤儿 revision、
 # downgrade 不是静默空实现、README 的 revision id 未过期。**不连数据库**，因此
 # 没有容器的环境里也照跑——这几类缺陷恰恰最容易在"本机没起容器"时溜过去。

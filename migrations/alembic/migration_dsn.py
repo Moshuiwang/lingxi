@@ -24,6 +24,25 @@ REQUIRED_SCHEME = "postgresql+psycopg"
 # 允许写成裸 scheme（运维手写、从业务 DSN 复制都是这个形状），由本模块补齐驱动。
 BARE_SCHEMES = ("postgresql", "postgres")
 
+# 迁移不能 import ``lingxi.adapters.postgres``：迁移工具链与运行时依赖必须保持隔离。
+# 因此这里是一次性迁移自己的有限配置，而不是把语句超时取消。DDL 允许比业务默认值
+# 更长，但仍必须在有限时间内结束；锁等待上限更短，避免迁移无限期等业务事务。
+MIGRATION_CONNECT_TIMEOUT_SECONDS = 5
+MIGRATION_STATEMENT_TIMEOUT_SECONDS = 60
+MIGRATION_LOCK_TIMEOUT_SECONDS = 10
+
+
+def migration_connect_args() -> dict[str, object]:
+    """返回 SQLAlchemy/psycopg3 在线迁移的独立有限连接参数。"""
+
+    return {
+        "connect_timeout": MIGRATION_CONNECT_TIMEOUT_SECONDS,
+        "options": (
+            f"-c statement_timeout={MIGRATION_STATEMENT_TIMEOUT_SECONDS}s "
+            f"-c lock_timeout={MIGRATION_LOCK_TIMEOUT_SECONDS}s"
+        ),
+    }
+
 
 class MigrationDsnError(RuntimeError):
     """连接串不可用。消息保证不含连接串本身。"""

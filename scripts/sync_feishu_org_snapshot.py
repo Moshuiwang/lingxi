@@ -22,9 +22,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-import psycopg
 from psycopg.types.json import Jsonb
 
+from lingxi.adapters.postgres import connect
 from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthTokenGrant
 from lingxi.adapters.refresh_tokens import PostgresRefreshTokenVault
 
@@ -127,7 +127,7 @@ def app_access_token(app_id: str, app_secret: str) -> str:
 
 def refresh_saved_user_token() -> str:
     vault = PostgresRefreshTokenVault(required("LINGXI_POSTGRES_DSN"), required("LINGXI_OAUTH_REFRESH_TOKEN_KEY"))
-    with vault._psycopg.connect(vault._dsn) as connection, connection.cursor() as cursor:  # noqa: SLF001
+    with connect(vault._dsn, timeouts=vault._timeouts) as connection, connection.cursor() as cursor:  # noqa: SLF001
         cursor.execute(
             "SELECT feishu_open_id, encrypted_refresh_token "
             "FROM feishu_user_refresh_token ORDER BY updated_at DESC LIMIT 2"
@@ -361,7 +361,7 @@ def json_value(value: object, default: object) -> object:
     return default if value is None else value
 
 
-def ensure_schema(connection: psycopg.Connection[Any]) -> None:
+def ensure_schema(connection: Any) -> None:
     expected = {
         "feishu_org_sync_run",
         "feishu_org_tenant_snapshot",
@@ -387,7 +387,7 @@ def ensure_schema(connection: psycopg.Connection[Any]) -> None:
 
 def insert_failed_run(dsn: str, run_id: str, app_id: str, code: str) -> None:
     try:
-        with psycopg.connect(dsn) as connection, connection.cursor() as cursor:
+        with connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO feishu_org_sync_run "
                 "(id, source_app_id, status, completed_at, expires_at, error_code) "
@@ -488,7 +488,7 @@ def write_snapshot(
         "credentials_saved": False,
         "id_completeness": completeness,
     }
-    with psycopg.connect(dsn) as connection:
+    with connect(dsn) as connection:
         ensure_schema(connection)
         with connection.transaction():
             with connection.cursor() as cursor:
@@ -538,7 +538,7 @@ def main() -> int:
     app_secret = required("FEISHU_APP_SECRET")
     run_id = new_id("orgsync")
     try:
-        with psycopg.connect(test_dsn) as connection:
+        with connect(test_dsn) as connection:
             ensure_schema(connection)
         app_token = app_access_token(app_id, app_secret)
         app_listing = request_json(

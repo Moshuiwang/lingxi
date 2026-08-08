@@ -7,29 +7,34 @@ import hmac
 import secrets
 from typing import Any
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.onboarding import AppUser, IdentityProfile
 
 
 class PostgresOnboardingStore:
     """进度只存 HMAC，身份只在授权成功后才写入 app_user。"""
 
-    def __init__(self, dsn: str, state_key: str) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
+    def __init__(
+        self,
+        dsn: str,
+        state_key: str,
+        *,
+        timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+    ) -> None:
         self._dsn = dsn
         self._key = state_key.encode()
+        self._timeouts = timeouts
 
     def _hash(self, value: str) -> str:
         return hmac.new(self._key, value.encode(), hashlib.sha256).hexdigest()
 
     def _fetchone(self, query: str, parameters: tuple[Any, ...]) -> tuple[Any, ...] | None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(query, parameters)
             return cursor.fetchone()
 
     def _execute(self, query: str, parameters: tuple[Any, ...]) -> None:
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(query, parameters)
 
     def dismiss_guide(self, open_id: str) -> None:
@@ -89,14 +94,14 @@ class PostgresCardProgressStore(PostgresOnboardingStore):
     def claim_inbound_event(self, event_id: str) -> bool:
         if not event_id:
             return False
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute("INSERT INTO inbound_event (feishu_event_id, event_type) VALUES (%s, 'im.message.receive_v1') ON CONFLICT DO NOTHING RETURNING feishu_event_id", (event_id,))
             return cursor.fetchone() is not None
 
     def create(self, open_id: str, chat_id: str, step: str) -> str:
         nonce = secrets.token_urlsafe(24)
         subject_hash, chat_hash = self._hash(open_id), self._hash(chat_id)
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT card_nonce FROM onboarding_progress WHERE subject_hash = %s AND chat_hash = %s AND step IN ('authorizing', 'processing') AND expires_at > now() FOR UPDATE",
                 (subject_hash, chat_hash),
@@ -114,7 +119,7 @@ class PostgresCardProgressStore(PostgresOnboardingStore):
 
     def claim_authorizing_state(self, state: str) -> bool:
         """先原子占用一次性 state，再向飞书换取身份，阻断回调重放。"""
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE onboarding_progress SET step = 'processing' WHERE card_nonce = %s AND step = 'authorizing' AND expires_at > now() RETURNING card_nonce",
                 (state,),
@@ -123,7 +128,7 @@ class PostgresCardProgressStore(PostgresOnboardingStore):
 
     def complete_authorizing_state(self, state: str, open_id: str) -> bool:
         """只在身份与原私聊人相符时，消费已占用的 state。"""
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT subject_hash FROM onboarding_progress WHERE card_nonce = %s AND step = 'processing' AND expires_at > now() FOR UPDATE",
                 (state,),

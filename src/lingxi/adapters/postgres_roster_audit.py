@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 
 logger = logging.getLogger(__name__)
@@ -52,11 +53,9 @@ def _text(value: object) -> str:
 class PostgresRosterBaselineReader:
     """读取已开通用户的存档三字段。构造时不连接数据库，每次调用自带连接。"""
 
-    def __init__(self, dsn: str) -> None:
-        import psycopg
-
-        self._psycopg = psycopg
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
+        self._timeouts = timeouts
 
     def load_active_baseline(self) -> tuple[ArchivedIdentity, ...]:
         """返回本轮比对集。只取五列：内部标识、人员 ID 与存档三字段。
@@ -64,7 +63,7 @@ class PostgresRosterBaselineReader:
         取的列就是要用的列——多取一列就是多一份可识别数据进内存，而它没有用途。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(ACTIVE_BASELINE_SQL)
             rows = cursor.fetchall()
 

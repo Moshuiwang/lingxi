@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+
 logger = logging.getLogger("lingxi.adapters.retention")
 
 # 每张表每次调用删多少行。函数侧另有 1000 的硬上限，这里传的是常规节奏：
@@ -74,14 +76,18 @@ class RetentionReport:
 class PostgresRetentionCleaner:
     """受限清理函数的调用方。构造时不连接数据库，每次调用自带事务。"""
 
-    def __init__(self, dsn: str, *, batch_limit: int = DEFAULT_BATCH_LIMIT) -> None:
-        import psycopg
-
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        batch_limit: int = DEFAULT_BATCH_LIMIT,
+        timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+    ) -> None:
         if batch_limit <= 0:
             raise ValueError("保留清理的批量必须是正整数")
-        self._psycopg = psycopg
         self._dsn = dsn
         self._batch_limit = batch_limit
+        self._timeouts = timeouts
 
     @property
     def batch_limit(self) -> int:
@@ -96,7 +102,7 @@ class PostgresRetentionCleaner:
         删了父行没删子行的半删状态（断言 V-保留-17）。
         """
 
-        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT target_table, deleted_rows, oldest_expires_at, newest_expires_at, blocked "
                 f"FROM {CLEANUP_FUNCTION}(now(), %s)",
