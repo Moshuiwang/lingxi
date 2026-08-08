@@ -135,6 +135,24 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
             issued_at=issued_at or self.issued_at,
         )
 
+    def test_registered_subject_open_id_reads_the_registered_subject(self) -> None:
+        self._save()
+
+        self.assertEqual(self.vault.registered_subject_open_id(), DELEGATED_SUBJECT)
+
+    def test_registered_subject_open_id_returns_none_when_registration_is_missing(self) -> None:
+        self.assertIsNone(self.vault.registered_subject_open_id())
+
+    def test_registered_subject_open_id_reads_a_changed_registration(self) -> None:
+        self._save()
+        changed_subject = "ou_changed_delegated_subject"
+        self.execute(
+            "UPDATE feishu_delegated_subject SET subject_open_id = %s",
+            (changed_subject,),
+        )
+
+        self.assertEqual(self.vault.registered_subject_open_id(), changed_subject)
+
     def test_ciphertext_lives_only_on_disk_and_the_database_holds_no_credential(self) -> None:
         self._save()
 
