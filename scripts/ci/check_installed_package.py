@@ -42,6 +42,7 @@ REQUIRED_MODULES = (
     "lingxi.apps",
     "lingxi.apps.worker",
     "lingxi.config",
+    "lingxi.config.content",
     "lingxi.core",
     "lingxi.core.conversation",
     "lingxi.core.execution",
@@ -165,6 +166,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             "lingxi.apps.scheduler",
             "lingxi.apps.scheduler.__main__",
+            "lingxi.config.content",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
@@ -206,6 +208,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.gateway",
             "lingxi.apps.gateway.config",
             "lingxi.apps.gateway.__main__",
+            "lingxi.config.content",
             "lingxi.adapters.feishu_events",
             "lingxi.adapters.feishu_longconn",
             "lingxi.adapters.feishu_outbound",
