@@ -11,8 +11,9 @@
 #
 # 凭据**按服务分文件**，理由见 compose.stage.yaml 顶部的说明（worker 不得拿到数据库
 # 与飞书凭据：Agent SDK 会把环境继承给 Claude CLI 与 MCP 子进程）。
-# 本环境四个凭据文件：.env.prod.scheduler / .env.prod.gateway / .env.prod.worker /
-# .env.prod.migrate，**四个都必须 0600**，核对步骤见 deploy/README.md 的 preflight。
+# 本环境五个运行时 env 文件：.env.prod.scheduler / .env.prod.gateway / .env.prod.worker /
+# .env.prod.migrate / .env.prod.reauthorize，**五个都必须 0600**，核对步骤见
+# deploy/README.md 的 preflight。
 #
 # 本文件的存在**不代表已经可以部署生产**。按 Issue #62「不在本 Issue 直接执行」：
 # 生产部署另建独立 `[ops]` Issue，固定镜像 digest、备份点、执行窗口、观察期和回滚目标。
@@ -40,6 +41,12 @@ services:
   migrate:
     env_file:
       - ./.env.prod.migrate
+
+  reauthorize:
+    env_file:
+      - ./.env.prod.reauthorize
+    volumes:
+      - lingxi-credentials:/var/lib/lingxi/credentials
 
 volumes:
   lingxi-credentials:

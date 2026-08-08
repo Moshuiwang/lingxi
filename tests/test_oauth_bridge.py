@@ -6,6 +6,7 @@ import json
 import unittest
 
 from lingxi.adapters.oauth_bridge import LoadedOAuthIdentity, OAuthBridgeMessage, OAuthResultProcessor, OAuthTokenGrant
+from lingxi.adapters.oauth_bridge_client import OAuthBridgeClient
 from lingxi.core.identity.onboarding import IdentityProfile, InMemoryOnboardingStore, OnboardingService
 
 
@@ -253,6 +254,54 @@ class OAuthResultProcessorTest(unittest.TestCase):
             OAuthBridgeMessage.parse('{"type":"oauth_code","state":"short","code":"x"}')
         with self.assertRaises(ValueError):
             OAuthBridgeMessage.parse(json.dumps({"type": "oauth_code", "state": "x" * 32 + ".", "code": "x"}))
+
+
+class RecordingBridgeProcessor:
+    def __init__(self) -> None:
+        self.messages: list[OAuthBridgeMessage] = []
+
+    def process(self, message: OAuthBridgeMessage) -> None:
+        self.messages.append(message)
+
+
+class OAuthBridgeRoutingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.default = RecordingBridgeProcessor()
+        self.client = OAuthBridgeClient("wss://bridge.example.test/oauth/bridge", "bridge-token-for-test", self.default)
+        self.reauthorize_state = "r" * 43
+
+    def test_registered_reauthorization_state_never_reaches_onboarding_processor(self) -> None:
+        received: list[OAuthBridgeMessage] = []
+        self.client.register_state_handler(self.reauthorize_state, received.append)
+
+        self.client.handle_message(OAuthBridgeMessage("oauth_code", self.reauthorize_state, "one-time-code"))
+
+        self.assertEqual(received, [OAuthBridgeMessage("oauth_code", self.reauthorize_state, "one-time-code")])
+        self.assertEqual(self.default.messages, [])
+
+    def test_unregistered_state_keeps_existing_onboarding_processor(self) -> None:
+        onboarding_state = "o" * 32
+
+        self.client.handle_message(OAuthBridgeMessage("oauth_code", onboarding_state, "one-time-code"))
+
+        self.assertEqual(self.default.messages, [OAuthBridgeMessage("oauth_code", onboarding_state, "one-time-code")])
+
+    def test_reauthorization_state_replay_stays_on_its_handler(self) -> None:
+        received: list[OAuthBridgeMessage] = []
+        self.client.register_state_handler(self.reauthorize_state, received.append)
+        message = OAuthBridgeMessage("oauth_cancelled", self.reauthorize_state)
+
+        self.client.handle_message(message)
+        self.client.handle_message(message)
+
+        self.assertEqual(received, [message, message])
+        self.assertEqual(self.default.messages, [])
+
+    def test_state_handler_cannot_be_registered_twice(self) -> None:
+        self.client.register_state_handler(self.reauthorize_state, lambda _message: None)
+
+        with self.assertRaises(ValueError):
+            self.client.register_state_handler(self.reauthorize_state, lambda _message: None)
 
 
 if __name__ == "__main__":

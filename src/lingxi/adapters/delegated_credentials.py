@@ -97,36 +97,29 @@ class HostFileDelegatedCredentialVault:
 
     # ---- 写入 -------------------------------------------------------------
 
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: datetime | None = None, replacing_generation: str | None = None) -> bool:
+    def save(
+        self,
+        *,
+        subject_open_id: str,
+        grant: AuthorizationGrant,
+        issued_at: datetime | None = None,
+        replacing_generation: str | None = None,
+        expected_registered_subject_open_id: str | None = None,
+    ) -> bool:
         """登记主体并写入（或轮换）唯一一条专用授权凭据。
 
-        先写数据库登记行：V-身份-02 的反向触发器在这里把关（已是员工记录的
-        open_id 不能成为专用授权主体）。触发器拒绝时密文一个字节都不落盘。
+        ``expected_registered_subject_open_id`` 用于回调和轮换收尾的原子 CAS：
+        传入时，数据库事务只在登记仍等于 expected 时继续，避免一次旧读取把
+        已撤销或已更换的主体写回。文件锁覆盖登记校验、世代校验和加密写入，
+        因而不会在保存流程中留下旧文件覆盖窗口。
+
+        无 expected 时是初次受控写入的兼容路径；V-身份-02 的反向触发器仍在
+        登记写入处把关，触发器拒绝时密文一个字节都不落盘。
         """
 
         moment = issued_at or datetime.now(timezone.utc)
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO feishu_delegated_subject (purpose, subject_open_id)
-                   VALUES (%s, %s)
-                   ON CONFLICT (purpose) DO UPDATE SET
-                     subject_open_id = EXCLUDED.subject_open_id,
-                     updated_at = now()""",
-                (DELEGATED_PURPOSE, subject_open_id),
-            )
-
         from lingxi.core.ids import new_ulid
 
-        payload = {
-            "generation": new_ulid(),
-            "subject_open_id": subject_open_id,
-            "refresh_token": grant.refresh_token.reveal(),
-            "scope": grant.scope,
-            "issued_at": moment.isoformat(),
-            "refresh_at": rotation_deadline(moment, grant.refresh_token_expires_in).isoformat(),
-            "expires_at": expiry_moment(moment, grant.refresh_token_expires_in).isoformat(),
-            "consumed_at": None,
-        }
         with self._locked():
             if replacing_generation is not None:
                 current = self._read_payload()
@@ -135,7 +128,42 @@ class HostFileDelegatedCredentialVault:
                     # 领取之后有过新授权：旧轮换链的结果作废，绝不覆盖新凭据。
                     logger.warning("轮换结果已过期（期间发生新授权），放弃写回")
                     return False
-            self._write_encrypted(payload)
+
+            with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+                if expected_registered_subject_open_id is not None:
+                    # 条件 UPDATE 是保存事务内的 CAS。它会锁住匹配的登记行；
+                    # 并发的主体变更若先提交，这里返回零行，绝不执行后续写入。
+                    cursor.execute(
+                        """UPDATE feishu_delegated_subject
+                              SET updated_at = updated_at
+                            WHERE purpose = %s AND subject_open_id = %s
+                        RETURNING subject_open_id""",
+                        (DELEGATED_PURPOSE, expected_registered_subject_open_id),
+                    )
+                    if cursor.fetchone() is None:
+                        logger.warning("保存前主体登记 CAS 失败，放弃写入")
+                        return False
+                else:
+                    cursor.execute(
+                        """INSERT INTO feishu_delegated_subject (purpose, subject_open_id)
+                           VALUES (%s, %s)
+                           ON CONFLICT (purpose) DO UPDATE SET
+                             subject_open_id = EXCLUDED.subject_open_id,
+                             updated_at = now()""",
+                        (DELEGATED_PURPOSE, subject_open_id),
+                    )
+
+                payload = {
+                    "generation": new_ulid(),
+                    "subject_open_id": subject_open_id,
+                    "refresh_token": grant.refresh_token.reveal(),
+                    "scope": grant.scope,
+                    "issued_at": moment.isoformat(),
+                    "refresh_at": rotation_deadline(moment, grant.refresh_token_expires_in).isoformat(),
+                    "expires_at": expiry_moment(moment, grant.refresh_token_expires_in).isoformat(),
+                    "consumed_at": None,
+                }
+                self._write_encrypted(payload)
         logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
         return True
 
@@ -177,6 +205,24 @@ class HostFileDelegatedCredentialVault:
         return True
 
     # ---- 读取 -------------------------------------------------------------
+
+    def registered_subject_open_id(self) -> str | None:
+        """读取正式登记的专用授权主体，不读取凭据文件。
+
+        重授权入口用这条登记绑定回调身份；回调本身的身份只接受飞书
+        ``user_info`` 回读，不能由浏览器参数提供。撤销凭据时登记行保留，
+        因此失效后的恢复仍然有明确的比较对象。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
+                (DELEGATED_PURPOSE,),
+            )
+            row = cursor.fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0].strip():
+            return None
+        return row[0].strip()
 
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
         """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""

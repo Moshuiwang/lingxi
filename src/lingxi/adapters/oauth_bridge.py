@@ -12,16 +12,15 @@ import hashlib
 import hmac
 import json
 import logging
-import re
-import threading
-import time
 import unicodedata
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Protocol
 from urllib.parse import quote, urlencode
 
 from lingxi.core.identity.onboarding import IdentityProfile, OnboardingService
+
+from .oauth_bridge_client import OAuthBridgeClient, OAuthBridgeMessage, OAuthBridgeResultSender
 
 
 logger = logging.getLogger(__name__)
@@ -39,16 +38,6 @@ class IdentityLoader(Protocol):
 
 class RefreshTokenVault(Protocol):
     def save(self, open_id: str, grant: "OAuthTokenGrant") -> None: ...
-
-
-class OAuthBridgeResultSender(Protocol):
-    def send_result(
-        self,
-        state: str,
-        status: str,
-        debug_identity: dict[str, str | None] | None = None,
-        debug_details: dict[str, object] | None = None,
-    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -471,26 +460,6 @@ class FeishuOAuthIdentityLoader:
         )
 
 
-@dataclass(frozen=True)
-class OAuthBridgeMessage:
-    type: str
-    state: str
-    code: str | None = None
-
-    @classmethod
-    def parse(cls, raw: str) -> "OAuthBridgeMessage":
-        value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("type") not in {"oauth_code", "oauth_cancelled"}:
-            raise ValueError("未识别的 OAuth 桥接消息")
-        state = value.get("state")
-        if not isinstance(state, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", state):
-            raise ValueError("无效的 OAuth 状态")
-        code = value.get("code")
-        if value["type"] == "oauth_code" and (not isinstance(code, str) or not code):
-            raise ValueError("授权结果缺少一次性 code")
-        return cls(value["type"], state, code)
-
-
 class OAuthResultProcessor:
     """每次结果都先验证原用户绑定，再允许建立身份。"""
 
@@ -589,67 +558,3 @@ class OAuthResultProcessor:
             return
         self._result_sender.send_result(message.state, "identity_confirmed", debug_identity, loaded.debug_details if self._debug_identity_display else None)
         logger.info("OAuth timeline: authorization completed")
-
-
-class OAuthBridgeClient:
-    """可自动重连的出站 WebSocket；连接断开不缓存授权结果。"""
-
-    def __init__(self, url: str, token: str, processor: OAuthResultProcessor | None = None, sleep: Callable[[float], None] = time.sleep) -> None:
-        self._url = url
-        self._token = token
-        self._processor = processor
-        self._sleep = sleep
-        self._stop = threading.Event()
-        self._socket: object | None = None
-
-    def set_processor(self, processor: OAuthResultProcessor) -> None:
-        self._processor = processor
-
-    def start(self) -> threading.Thread:
-        thread = threading.Thread(target=self.run_forever, name="lingxi-oauth-bridge", daemon=True)
-        thread.start()
-        return thread
-
-    def run_forever(self) -> None:
-        from websockets.sync.client import connect
-
-        while not self._stop.is_set():
-            try:
-                with connect(self._url, additional_headers={"Authorization": f"Bearer {self._token}"}, open_timeout=10) as socket:
-                    self._socket = socket
-                    for raw in socket:
-                        if self._stop.is_set():
-                            break
-                        try:
-                            if self._processor is not None:
-                                self._processor.process(OAuthBridgeMessage.parse(raw))
-                        except ValueError:
-                            continue
-            except Exception:
-                # 断线仅触发重连；不输出凭据、授权码或身份资料。
-                self._sleep(3)
-            finally:
-                self._socket = None
-
-    def send_result(
-        self,
-        state: str,
-        status: str,
-        debug_identity: dict[str, str | None] | None = None,
-        debug_details: dict[str, object] | None = None,
-    ) -> None:
-        socket = self._socket
-        if socket is None:
-            return
-        payload: dict[str, object] = {"type": "oauth_result", "state": state, "status": status}
-        if debug_identity is not None:
-            payload["debug_identity"] = debug_identity
-        if debug_details is not None:
-            payload["debug_details"] = debug_details
-        socket.send(json.dumps(payload))
-
-    def stop(self) -> None:
-        self._stop.set()
-        socket = self._socket
-        if socket is not None:
-            socket.close()

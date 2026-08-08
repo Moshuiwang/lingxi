@@ -188,7 +188,15 @@ class RotationReport:
 
 class _Vault(Protocol):
     def claim_due(self) -> Any: ...
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, issued_at: Any = ..., replacing_generation: Any = ...) -> Any: ...
+    def save(
+        self,
+        *,
+        subject_open_id: str,
+        grant: AuthorizationGrant,
+        issued_at: Any = ...,
+        replacing_generation: Any = ...,
+        expected_registered_subject_open_id: Any = ...,
+    ) -> Any: ...
     def revoke(self, *, reason: str, generation: Any = ...) -> bool: ...
 
 
@@ -288,6 +296,7 @@ class CredentialRotationLoop:
                     subject_open_id=subject_open_id,
                     grant=replacement,
                     replacing_generation=replacing_generation,
+                    expected_registered_subject_open_id=subject_open_id,
                 )
                 if saved is False:
                     # 世代不符＝期间有新授权：旧链结果作废，视为已妥善收尾。

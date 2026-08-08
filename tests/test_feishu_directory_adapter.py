@@ -11,6 +11,7 @@ import unittest
 from urllib.parse import parse_qs, urlparse
 
 from lingxi.adapters.feishu_directory import (
+    AuthorizationExchange,
     FeishuAuthorizationClient,
     FeishuDirectoryClient,
     FeishuDirectoryError,
@@ -254,6 +255,137 @@ class DirectoryPaginationTest(unittest.TestCase):
 
 
 class AuthorizationClientTest(unittest.TestCase):
+    def test_authorization_code_exchange_returns_identity_and_only_long_term_grant(self) -> None:
+        code = "fake-one-time-code"
+        access_token = "fake-access-token"
+        refresh_token = "fake-refresh-token"
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "refresh_token_expires_in": 604800,
+                    "scope": "auth:user.id:read offline_access",
+                },
+                {
+                    "code": 0,
+                    "data": {
+                        "open_id": "ou_delegated",
+                        "user_id": "u_delegated",
+                        "union_id": "on_delegated",
+                        "name": "四达文档会议助手",
+                    },
+                },
+            ]
+        )
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL,
+            app_id="cli_fake",
+            app_secret="secret_fake",
+            transport=transport,
+        )
+
+        exchanged = client.exchange_authorization_code(
+            code,
+            redirect_uri="https://example.test/callback",
+            required_scope="auth:user.id:read offline_access",
+        )
+
+        self.assertIsInstance(exchanged, AuthorizationExchange)
+        self.assertEqual(exchanged.subject_open_id, "ou_delegated")
+        self.assertEqual(exchanged.grant.refresh_token.reveal(), refresh_token)
+        self.assertFalse(hasattr(exchanged, "access_token"), "短期 access_token 不得成为正式结果")
+        self.assertEqual(len(transport.calls), 2)
+        method, url, body, token = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertNotIn(code, url)
+        self.assertNotIn(refresh_token, url)
+        self.assertIsNone(token)
+        assert body is not None
+        self.assertEqual(body["code"], code)
+        self.assertEqual(transport.calls[1][3], access_token)
+
+    def test_authorization_code_without_requested_scope_is_rejected_before_user_info(self) -> None:
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "access_token": "fake-access-token",
+                    "refresh_token": "fake-refresh-token",
+                    "refresh_token_expires_in": 604800,
+                    "scope": "auth:user.id:read",
+                }
+            ]
+        )
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL,
+            app_id="cli_fake",
+            app_secret="secret_fake",
+            transport=transport,
+        )
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.exchange_authorization_code(
+                "fake-one-time-code",
+                redirect_uri="https://example.test/callback",
+                required_scope="auth:user.id:read offline_access",
+            )
+
+        self.assertEqual(raised.exception.code, "scope_incomplete")
+        self.assertEqual(len(transport.calls), 1, "没有可轮换授权时不得读取身份或继续写入")
+
+    def test_authorization_code_with_offline_access_but_missing_directory_scope_is_rejected(self) -> None:
+        """P1-A：只返回 offline_access 的子集授权不能写入正式凭据。"""
+
+        required_scope = "auth:user.id:read auth:directory:readonly offline_access"
+        returned_scope = "auth:user.id:read offline_access"
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "access_token": "fake-access-token",
+                    "refresh_token": "fake-refresh-token",
+                    "refresh_token_expires_in": 604800,
+                    "scope": returned_scope,
+                }
+            ]
+        )
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL,
+            app_id="cli_fake",
+            app_secret="secret_fake",
+            transport=transport,
+        )
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.exchange_authorization_code(
+                "fake-one-time-code",
+                redirect_uri="https://example.test/callback",
+                required_scope=required_scope,
+            )
+
+        self.assertEqual(raised.exception.code, "scope_incomplete")
+        self.assertEqual(len(transport.calls), 1, "scope 不足时不得读取身份或继续写入")
+
+    def test_authorization_code_exchange_rejects_non_https_redirect_before_network(self) -> None:
+        transport = RecordingTransport([])
+        client = FeishuAuthorizationClient(
+            base_url=BASE_URL,
+            app_id="cli_fake",
+            app_secret="secret_fake",
+            transport=transport,
+        )
+
+        with self.assertRaises(ValueError):
+            client.exchange_authorization_code(
+                "fake-one-time-code",
+                redirect_uri="http://example.test/callback",
+                required_scope="auth:user.id:read offline_access",
+            )
+
+        self.assertEqual(transport.calls, [])
+
     def test_a_successful_refresh_returns_a_wrapped_secret(self) -> None:
         transport = RecordingTransport(
             [{"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 604800, "scope": "offline_access"}]

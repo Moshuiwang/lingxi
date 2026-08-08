@@ -30,9 +30,9 @@ workspace=$(mktemp -d -t lingxi62-compose-XXXXXX)
 # 否则 `compose config` 会在 env_file 不存在时直接报错。
 placeholders=(
   deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway
-  deploy/.env.stage.worker deploy/.env.stage.migrate
+  deploy/.env.stage.worker deploy/.env.stage.migrate deploy/.env.stage.reauthorize
   deploy/.env.prod  deploy/.env.prod.scheduler  deploy/.env.prod.gateway
-  deploy/.env.prod.worker  deploy/.env.prod.migrate
+  deploy/.env.prod.worker  deploy/.env.prod.migrate deploy/.env.prod.reauthorize
 )
 created=()
 cleanup() {

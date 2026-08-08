@@ -183,7 +183,8 @@ jobs:
         # check_installed_package.py 会三方对账（pyproject / 本矩阵 / 脚本），漏加即红。
         # migrate 是部署时跑一次的迁移作业，不是常驻进程，但同样要证明"单独装得上"：
         # #62 要为它构建镜像，那时缺依赖就是部署当场失败（Issue #53）。
-        extra: [scheduler, worker, gateway, bot-test, migrate]
+        # reauthorize 复用 scheduler 镜像，但作为独立一次性入口单独验证其 import 闭包。
+        extra: [scheduler, reauthorize, worker, gateway, bot-test, migrate]
 
     steps:
       - name: 检出代码
