@@ -24,7 +24,6 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
-from lingxi.core.identity.onboarding import IdentityProfile
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +73,9 @@ class AuthorizationExchange:
     ``AuthorizationGrant``。
     """
 
-    profile: IdentityProfile
+    # 正式重授权只需要把飞书回读的主体与长期凭据交给上层；完整的
+    # ``IdentityProfile`` 属于 Bot-Test 开通资产，不能成为正式换码的传递依赖。
+    subject_open_id: str
     grant: AuthorizationGrant
 
 
@@ -256,7 +257,13 @@ class FeishuAuthorizationClient:
         self._app_secret = app_secret
         self._transport: Callable[..., Any] = transport or urllib_transport
 
-    def exchange_authorization_code(self, code: str, *, redirect_uri: str) -> AuthorizationExchange:
+    def exchange_authorization_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str,
+        required_scope: str,
+    ) -> AuthorizationExchange:
         """用一次性授权码取得身份和可轮换凭据。
 
         ``code`` 与短期访问令牌只在本次方法调用的内存里存在；只返回身份资料
@@ -292,8 +299,8 @@ class FeishuAuthorizationClient:
             raise FeishuDirectoryError("refresh_token_missing")
         if not isinstance(expires_in, int) or isinstance(expires_in, bool) or expires_in <= 0:
             raise FeishuDirectoryError("refresh_token_lifetime_missing")
-        if not isinstance(scope, str) or "offline_access" not in scope.split():
-            raise FeishuDirectoryError("offline_access_missing")
+        if not isinstance(scope, str) or not scope_covers(required_scope, scope):
+            raise FeishuDirectoryError("scope_incomplete")
 
         access_token = SecretToken(access_token_value)
         info = self._transport(
@@ -309,19 +316,11 @@ class FeishuAuthorizationClient:
         if not isinstance(raw_profile, Mapping):
             raise FeishuDirectoryError("identity_profile_invalid")
 
-        profile = IdentityProfile(
-            _text_value(raw_profile.get("open_id")),
-            _text_value(raw_profile.get("user_id")),
-            _text_value(raw_profile.get("union_id")),
-            _text_value(raw_profile.get("name")),
-            _optional_text_value(raw_profile.get("department")),
-            _optional_text_value(raw_profile.get("tenant_key")),
-            _optional_text_value(raw_profile.get("locale")),
-        )
-        if not profile.open_id:
+        subject_open_id = _text_value(raw_profile.get("open_id"))
+        if not subject_open_id:
             raise FeishuDirectoryError("identity_open_id_missing")
         return AuthorizationExchange(
-            profile=profile,
+            subject_open_id=subject_open_id,
             grant=AuthorizationGrant(SecretToken(refresh_token), expires_in, scope),
         )
 
@@ -369,6 +368,11 @@ def _text_value(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _optional_text_value(value: object) -> str | None:
-    text = _text_value(value)
-    return text or None
+def scope_covers(requested_scope: str, returned_scope: str) -> bool:
+    """判断飞书返回的 scope 是否覆盖本次配置请求的全部 scope。"""
+
+    if not isinstance(requested_scope, str) or not isinstance(returned_scope, str):
+        return False
+    requested = frozenset(requested_scope.split())
+    returned = frozenset(returned_scope.split())
+    return bool(requested) and requested.issubset(returned)

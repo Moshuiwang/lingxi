@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from scripts.reauthorize_feishu_delegated import parse_callback_url
+from lingxi.apps.reauthorize import parse_callback_url
 from lingxi.adapters.feishu_directory import AuthorizationExchange
 from lingxi.adapters.feishu_reauthorization import (
     FeishuReauthorizationEntry,
@@ -24,7 +24,6 @@ from lingxi.adapters.feishu_reauthorization import (
     ReauthorizationResult,
 )
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
-from lingxi.core.identity.onboarding import IdentityProfile
 
 
 NOW = datetime(2026, 8, 8, 7, 0, tzinfo=timezone.utc)
@@ -37,18 +36,28 @@ FAKE_REFRESH_TOKEN = "fake-refresh-token"
 
 def exchange(subject: str = EXPECTED_SUBJECT) -> AuthorizationExchange:
     return AuthorizationExchange(
-        profile=IdentityProfile(subject, "user_delegated", "union_delegated", "四达文档会议助手", None, None, None),
-        grant=AuthorizationGrant(SecretToken(FAKE_REFRESH_TOKEN), 604800, "offline_access"),
+        subject_open_id=subject,
+        grant=AuthorizationGrant(
+            SecretToken(FAKE_REFRESH_TOKEN),
+            604800,
+            "auth:user.id:read offline_access",
+        ),
     )
 
 
 class FakeExchanger:
     def __init__(self, result: AuthorizationExchange | Exception) -> None:
         self.result = result
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str]] = []
 
-    def exchange_authorization_code(self, code: str, *, redirect_uri: str) -> AuthorizationExchange:
-        self.calls.append((code, redirect_uri))
+    def exchange_authorization_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str,
+        required_scope: str,
+    ) -> AuthorizationExchange:
+        self.calls.append((code, redirect_uri, required_scope))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -175,7 +184,10 @@ class ReauthorizationEntryTest(unittest.TestCase):
         result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
 
         self.assertEqual(result, ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False))
-        self.assertEqual(self.exchanger.calls, [(FAKE_CODE, "https://stage.example.test/reauth/callback")])
+        self.assertEqual(
+            self.exchanger.calls,
+            [(FAKE_CODE, "https://stage.example.test/reauth/callback", "auth:user.id:read offline_access")],
+        )
         self.assertEqual(len(self.vault.saved), 1)
         self.assertEqual(self.vault.saved[0][0], EXPECTED_SUBJECT)
         self.assertEqual(self.vault.saved[0][1].refresh_token.reveal(), FAKE_REFRESH_TOKEN)
@@ -234,11 +246,28 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertEqual(result.code, "exchange_failed")
         self.assertEqual(self.vault.saved, [])
 
+    def test_returned_scope_must_cover_configuration_before_saving(self) -> None:
+        state = self._begin()
+        self.exchanger.result = AuthorizationExchange(
+            subject_open_id=EXPECTED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(FAKE_REFRESH_TOKEN), 604800, "offline_access"),
+        )
+
+        result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "exchange_failed")
+        self.assertEqual(self.vault.saved, [])
+
     def test_cancel_and_exchange_failure_consume_state_without_saving(self) -> None:
         cancelled_state = self._begin()
         cancelled = self.entry.handle_callback(cancelled_state, error="access_denied", now=NOW + timedelta(seconds=1))
         self.assertEqual(cancelled.code, "cancelled")
         self.assertEqual(self.exchanger.calls, [])
+        self.assertIsNone(
+            self.state_store.claim(cancelled_state, now=NOW + timedelta(seconds=2)),
+            "取消回调也必须先消耗当前 state，不能被同一 state 再次领取",
+        )
 
         failed_state = self._begin()
         self.exchanger.result = RuntimeError("secret error must not be logged")

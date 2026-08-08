@@ -201,6 +201,35 @@ services:
     # 后者：迁移要 DDL 权限、业务进程不要，两者本就该是不同的数据库角色
     # （migrations/README.md，断言 V-迁移-05）。它只在覆盖文件的 env_file 里出现。
 
+  # 一次性作业：正式重授权。`docker compose --profile job run --rm reauthorize`
+  #
+  # 入口随 scheduler 镜像发布，但这是受控运维动作，不是常驻服务。它必须以与
+  # scheduler 相同的 uid 写入凭据卷，避免 root 生成的文件让 scheduler 无法读回。
+  # state 文件与凭据文件均在同一个持久卷中，由入口启动前拒绝路径/锁文件冲突。
+  reauthorize:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["job"]
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    stdin_open: true
+    tty: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    command: ["python", "-m", "lingxi.apps.reauthorize"]
+    environment:
+      LINGXI_DELEGATED_CREDENTIAL_PATH: /var/lib/lingxi/credentials/delegated_credential.enc
+      LINGXI_DELEGATED_REAUTH_STATE_PATH: /var/lib/lingxi/credentials/delegated_credential.reauth-state
+    volumes:
+      - lingxi-credentials:/var/lib/lingxi/credentials
+
 volumes:
   # 两个卷的实际名字由覆盖文件指定（stage 与生产各一套），这里只定义结构。
   lingxi-credentials:
