@@ -904,6 +904,16 @@ class WorkerResourceGuardTest(unittest.TestCase):
         self.assertEqual(resources["tool_call_count"], 2)
         self.assertEqual(resources["executed_tool_call_count"], 1)
 
+    def test_v_hulan_04_missing_num_turns_is_unknown_not_zero(self) -> None:
+        """ResultMessage 没有 num_turns 时必须保留未知，不能用 0 填洞。"""
+        report, _, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "已完成。"}],
+        )
+
+        resources = report["resources"]
+        self.assertIsNone(resources["agent_turns"])
+        self.assertEqual(resources["agent_turns_status"], "unknown")
+
     def test_v_hulan_05_unknown_usage_is_explicit_and_never_zero_filled(self) -> None:
         report, _, _ = self._run_with_sdk(
             [{"kind": "text", "text": "没有拿到可确认结果。"}],
@@ -916,6 +926,23 @@ class WorkerResourceGuardTest(unittest.TestCase):
         self.assertNotIn("fields", usage)
         self.assertNotIn("input_tokens", json.dumps(report))
         self.assertNotIn('"output_tokens": 0', json.dumps(report))
+
+    def test_v_hulan_05_unrecognised_usage_dict_is_unknown_not_zero_filled(self) -> None:
+        """SDK 给出 usage 字典但没有可识别 token 字段时不得伪造 0。"""
+        report, _, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "没有拿到可确认结果。"}],
+            sdk_kwargs={"result_num_turns": 1, "result_usage": {"foo": 1}},
+        )
+
+        usage = report["resources"]["usage"]
+        self.assertEqual(
+            usage,
+            {
+                "status": "unknown",
+                "source": "mock",
+                "reason": "no_recognized_token_counts",
+            },
+        )
 
     def test_v_hulan_05_mock_usage_is_numeric_summary_only(self) -> None:
         report, _, _ = self._run_with_sdk(
@@ -953,6 +980,27 @@ class WorkerResourceGuardTest(unittest.TestCase):
 
         self.assertEqual(recorder.usage_summary["source"], "mock")
         self.assertEqual(recorder.usage_summary["status"], "known")
+
+    def test_v_hulan_07_minimum_turn_guard_reaches_sdk_and_ends_early(self) -> None:
+        """最小轮数仍传入 SDK，并以护栏终态结束；无重试/绕过是结构性论证。"""
+        report, fake, _ = self._run_with_sdk(
+            [{"kind": "text", "text": "尚未完成。"}],
+            sdk_kwargs={
+                "result_subtype": "error_max_turns",
+                "result_is_error": True,
+                "result_num_turns": 1,
+            },
+            env_overrides={
+                "LINGXI_WORKER_MAX_TURNS": "1",
+                "LINGXI_WORKER_TURN_TIMEOUT_SECONDS": "0.01",
+            },
+        )
+
+        self.assertEqual(fake.options[0].max_turns, 1)
+        self.assertEqual(fake.prompts, ["近 7 天的活跃用户数是多少？"])
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertEqual(report["turn"]["termination_state"], "guarded")
+        self.assertTrue(report["turn"]["guard_triggered"])
 
 
 class ReviewHardeningTest(unittest.TestCase):
