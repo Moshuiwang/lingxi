@@ -262,6 +262,17 @@ class GalaxyExportRejectionTest(unittest.TestCase):
         self.assertEqual(report.row_counts["user_role"], 2)
         self.assertIn("duplicate_row", [issue.rule for issue in report.warnings])
 
+    def test_exact_duplicate_user_row_rejects_the_whole_export(self) -> None:
+        # 账号实体的原始多行不能在导入期折叠成“唯一命中”；字段相同也拒绝整批。
+        tables = _valid_tables()
+        tables["user"].append(dict(tables["user"][0]))
+
+        report = validate_export(tables)
+
+        self.assertFalse(report.ok)
+        self.assertIn("duplicate_row", [issue.rule for issue in report.errors])
+        self.assertNotIn("duplicate_row", [issue.rule for issue in report.warnings])
+
     def test_role_row_of_unknown_account_is_rejected(self) -> None:
         tables = _valid_tables()
         tables["user_role"].append({"user_id": "U-未知", "role_id": "R-甲", "user_name": "化名丁", "role_name": "A运营"})

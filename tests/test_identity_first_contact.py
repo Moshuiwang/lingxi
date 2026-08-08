@@ -2,7 +2,7 @@
 
 认领断言：
 - V-开通-01：建档草稿的 ``permission_record_id`` 恒为 ``None``，不先占位再回填；
-- V-开通-06：定位不到或资料不完整时不产出任何草稿，转人工；
+- V-开通-06：定位不到或资料不完整时不产出任何草稿，统一按无可用权限结束；
 - V-开通-07：飞书成员详情显示非在职时不建档，且 ``status`` 不进入草稿；
 - V-开通-08：姓名不含汉字时按既有规则正常判定，不走语言分支、不静默丢弃；
 - V-身份-02：专用授权用户自身不会被建成 ``app_user``；
@@ -17,9 +17,9 @@ import unittest
 
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
+    FailureReason,
     FirstContactOutcome,
     LocationOutcome,
-    ReviewReason,
     decide_first_contact,
     locate_by_open_id,
 )
@@ -192,42 +192,51 @@ class DecideFirstContactTest(unittest.TestCase):
 
         decision = decide(employment=not_employed)
 
-        self.assertIs(decision.outcome, FirstContactOutcome.NOT_EMPLOYED)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+        self.assertIs(decision.failure_reason, FailureReason.NOT_EMPLOYED)
         self.assertIsNone(decision.draft)
         self.assertFalse(decision.creates_record)
 
-    def test_an_undecidable_employment_status_goes_to_manual_review_without_a_draft(self) -> None:
+    def test_an_undecidable_employment_status_is_not_authorized_without_a_draft(self) -> None:
         decision = decide(employment=None)
 
-        self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
-        self.assertIs(decision.review_reason, ReviewReason.EMPLOYMENT_UNKNOWN)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+        self.assertIs(decision.failure_reason, FailureReason.EMPLOYMENT_UNKNOWN)
         self.assertIsNone(decision.draft)
 
-    def test_a_member_that_cannot_be_located_goes_to_manual_review_without_a_draft(self) -> None:
+    def test_a_member_that_cannot_be_located_is_not_authorized_without_a_draft(self) -> None:
         decision = decide(open_id="ou_absent", location=locate_by_open_id("ou_absent", (member(),)))
 
-        self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
-        self.assertIs(decision.review_reason, ReviewReason.NOT_LOCATED)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+        self.assertIs(decision.failure_reason, FailureReason.NOT_LOCATED)
+        self.assertEqual(
+            decision.message,
+            "当前没有可用的银河权限，请先在银河申请或补充权限。"
+            "银河权限生效并完成同步后，请再回到 Lingxi 使用。"
+            "Lingxi 不能代替你申请或扩大银河权限。"
+            "如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
+        )
+        self.assertNotIn("人工核对", decision.message)
         self.assertIsNone(decision.draft)
 
-    def test_an_ambiguous_match_goes_to_manual_review_without_picking_a_candidate(self) -> None:
+    def test_an_ambiguous_match_is_not_authorized_without_picking_a_candidate(self) -> None:
         duplicate = member(member_key="ou_zhang_second", user_id="user_other", union_id="union_other")
 
         decision = decide(location=locate_by_open_id("ou_zhang", (member(), duplicate)))
 
-        self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
-        self.assertIs(decision.review_reason, ReviewReason.AMBIGUOUS_IDENTITY)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+        self.assertIs(decision.failure_reason, FailureReason.AMBIGUOUS_IDENTITY)
         self.assertIsNone(decision.draft)
 
-    def test_an_incomplete_profile_goes_to_manual_review_without_a_partial_draft(self) -> None:
+    def test_an_incomplete_profile_is_not_authorized_without_a_partial_draft(self) -> None:
         """V-开通-06：必要资料缺失时不写入不完整的用户记录。"""
         for field in ("user_id", "union_id", "display_name", "tenant_key"):
             with self.subTest(field=field):
                 incomplete = member(**{field: "   "})  # type: ignore[arg-type]
                 decision = decide(location=locate_by_open_id("ou_zhang", (incomplete,)))
 
-                self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
-                self.assertIs(decision.review_reason, ReviewReason.INCOMPLETE_PROFILE)
+                self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+                self.assertIs(decision.failure_reason, FailureReason.INCOMPLETE_PROFILE)
                 self.assertIsNone(decision.draft)
 
     def test_the_delegated_authorization_subject_is_never_recorded_as_a_user(self) -> None:
@@ -267,7 +276,11 @@ class DecideFirstContactTest(unittest.TestCase):
                 self.assertIs(decision.outcome, FirstContactOutcome.DIRECTORY_UNAVAILABLE)
                 self.assertIsNone(decision.draft)
                 self.assertFalse(decision.creates_record)
-                self.assertTrue(decision.message.strip())
+                self.assertEqual(
+                    decision.message,
+                    "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
+                    "处理完成后我们会通知你。错误码：LX-ONBOARD-001。",
+                )
 
     def test_the_delegated_subject_is_refused_even_when_the_directory_is_unavailable(self) -> None:
         decision = decide(open_id=DELEGATED_SUBJECT, directory=DirectoryAvailability.UNAVAILABLE, location=locate_by_open_id(DELEGATED_SUBJECT, ()))
@@ -309,15 +322,15 @@ class NameAndOptionalFieldTest(unittest.TestCase):
         assert decision.draft is not None
         self.assertIsNone(decision.draft.display_name_locale)
 
-    def test_a_member_without_department_goes_to_manual_review(self) -> None:
-        """产品合同把部门列进必要资料（「缺少姓名、部门、租户等…转人工核对」）；
+    def test_a_member_without_department_is_not_authorized(self) -> None:
+        """产品合同把部门列进必要资料；缺失时不写半条记录，也不建人工待办。
         此前部门被当可选字段放行会建出半份档案（Codex 复查发现）。"""
         for department_names in ((), ("",), ("   ",)):
             with self.subTest(department_names=department_names):
                 thin = member(department_names=department_names)
                 decision = decide(location=locate_by_open_id("ou_zhang", (thin,)))
-                self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
-                self.assertIs(decision.review_reason, ReviewReason.INCOMPLETE_PROFILE)
+                self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
+                self.assertIs(decision.failure_reason, FailureReason.INCOMPLETE_PROFILE)
                 self.assertIsNone(decision.draft)
 
     def test_the_draft_has_no_field_for_optional_enhancements(self) -> None:

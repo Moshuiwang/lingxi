@@ -267,14 +267,20 @@ def _deduplicate(
             conflicting_rows.append(row_number)
 
     if exact_duplicate_rows:
-        warnings.append(
-            Issue(
-                spec.name,
-                "duplicate_row",
-                f"{len(exact_duplicate_rows)} 行与既有行完全相同，已合并",
-                _rows_hint(exact_duplicate_rows),
-            )
+        issue = Issue(
+            spec.name,
+            "duplicate_row",
+            (
+                f"{len(exact_duplicate_rows)} 行与既有用户行完全相同，原始账号记录不唯一，拒绝整批导入"
+                if spec.name == "user"
+                else f"{len(exact_duplicate_rows)} 行与既有行完全相同，已合并"
+            ),
+            _rows_hint(exact_duplicate_rows),
         )
+        # `user` 是账号匹配的实体表。字段完全相同也仍是两条原始账号记录；若在这里
+        # 合并，运行时会把“多条”伪装成“唯一命中”。关系表中的重复边不改变实体唯一性，
+        # 仍按既有规则合并并告警。
+        (errors if spec.name == "user" else warnings).append(issue)
     if conflicting_rows:
         errors.append(
             Issue(

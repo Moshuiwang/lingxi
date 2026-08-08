@@ -883,16 +883,16 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
 
         decision = self._handle("ou_zhang", frozen)
 
-        self.assertIs(decision.outcome, FirstContactOutcome.NOT_EMPLOYED)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
         self.assertEqual(self.users.count(), 0)
 
-    def test_an_unlocatable_sender_goes_to_manual_review_and_nothing_is_written(self) -> None:
+    def test_an_unlocatable_sender_is_not_authorized_and_nothing_is_written(self) -> None:
         self.snapshots.commit_batch(batch((member(),)), source_app_id="cli_fake")
         employed = EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False)
 
         decision = self._handle("ou_absent", employed)
 
-        self.assertIs(decision.outcome, FirstContactOutcome.MANUAL_REVIEW)
+        self.assertIs(decision.outcome, FirstContactOutcome.NOT_AUTHORIZED)
         self.assertEqual(self.users.count(), 0)
 
     def test_without_any_snapshot_the_sender_gets_a_terminal_state_and_nothing_is_written(self) -> None:
