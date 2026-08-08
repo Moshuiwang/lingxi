@@ -46,18 +46,17 @@ services:
     # 150 秒的算法（三项相加再留余量）：
     #   20.0s  续期 HTTP 超时     REQUEST_TIMEOUT_SECONDS，adapters/feishu_directory.py:33
     #    4.2s  落盘重试退避等待   SAVE_RETRY_BACKOFF_SECONDS=(0.2,1.0,3.0)，apps/scheduler/__init__.py:41
-    #   55.0s  数据库往返预算     5 次操作（4 次 save 重试 + 1 次 revoke），
-    #                             每次 = connect_timeout 5s + statement_timeout 3s + 提交 3s
+    #   75.0s  数据库往返预算     5 次操作（4 次 save 重试 + 1 次 revoke），
+    #                             每次最坏 = MAX_TIMEOUT_SECONDS 5s（建连）+
+    #                             5s（语句）+ 5s（提交）
     #   -----
-    #   79.2s  最坏情况 → ×1.5 安全系数 = 119s → 取整到 150s
+    #   99.2s  最坏情况 → ×1.5 安全系数 = 148.8s → 要求 149s → compose 保留 150s
+    #                             余量 1s
     #
     # **上一版这里写的是 90 秒，而且算法是错的**（Issue #62 codex 审查 P1-3）：它只把
-    # `connect_timeout` 算进去，而 connect_timeout **只约束建连**，不约束已经发出去的
-    # SELECT / INSERT / commit。一条卡住的语句可以无限期挂着，于是"90 秒是上界"这个
-    # 声称根本不成立。真正的上界要靠 DSN 里的 `statement_timeout` 与 `lock_timeout`
-    # 一起给出——它们是配置层的东西，不需要改 src/。deploy/.env.example 因此把这三个
-    # 参数一并列为必填，`check_deploy_contract.py` 会核对示例 DSN 真的带了它们，
-    # 否则这段算法就只是一段好看的注释。
+    # `connect_timeout` 算进去，没覆盖已建连后的语句和提交。当前运行时边界由
+    # `src/lingxi/adapters/postgres.py` 的连接工厂 kwargs 提供；示例 DSN 只是与工厂默认值的
+    # 对账基线，不能作为唯一事实源。合法覆盖必须使用 `LINGXI_POSTGRES_*_TIMEOUT_SECONDS`。
     #
     # **这个不等式由 scripts/ci/check_deploy_contract.py 自动守住，不是靠这段注释。**
     # 改了 REQUEST_TIMEOUT_SECONDS 而不改这里，门禁会红（断言 M2-62-25）。

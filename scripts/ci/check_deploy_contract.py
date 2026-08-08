@@ -160,11 +160,10 @@ def _postgres_timeout_facts() -> tuple[dict[str, int], int]:
 def _database_operation_seconds() -> float:
     """按合法最坏覆盖计算一次数据库建连、语句、提交的预算。"""
 
-    defaults, max_timeout = _postgres_timeout_facts()
-    # 每次数据库操作 = 默认建连上界 + 一条语句 + 一次提交；两个语句边界都按
-    # ``MAX_TIMEOUT_SECONDS`` 取最坏合法覆盖。当前默认建连也是 5s，因此该模型覆盖
-    # 所有合法配置；保留拆开的写法是为了让 5 + 2×MAX 的推导可被门禁读懂。
-    return float(defaults["connect_timeout"] + 2 * max_timeout)
+    _, max_timeout = _postgres_timeout_facts()
+    # 每次数据库操作 = 建连、语句和提交各按 ``MAX_TIMEOUT_SECONDS`` 取最坏合法覆盖。
+    # 当前 MAX=5，因此该模型为 5 + 2×MAX；保留拆开的写法是为了让推导可被门禁读懂。
+    return float(max_timeout + 2 * max_timeout)
 
 
 def _default_database_operation_seconds() -> float:
@@ -270,8 +269,8 @@ def check_stop_grace_period() -> list[str]:
         return [f"读不到 {SCHEDULER_APP.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
 
     try:
-        defaults, max_timeout = _postgres_timeout_facts()
-        database_operation_seconds = float(defaults["connect_timeout"] + 2 * max_timeout)
+        _, max_timeout = _postgres_timeout_facts()
+        database_operation_seconds = float(max_timeout + 2 * max_timeout)
         database_roundtrip_budget_seconds = database_operation_seconds * DATABASE_OPERATION_COUNT
         worst_case = (
             float(http_timeout)
