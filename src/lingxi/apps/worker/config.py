@@ -53,12 +53,23 @@ class WorkerConfig:
     workspace: str | None = None
     model: str | None = None
     system_prompt: str | None = None
+    worker_id: str = ""
+    target_worker_version: str = "stable"
+    queue_max_wait_seconds: float = 180.0
+    worker_version_unavailable_seconds: float = 180.0
+    running_heartbeat_timeout_seconds: float = 90.0
+    heartbeat_interval_seconds: float = 30.0
+    stop_poll_interval_seconds: float = 1.0
+    poll_interval_seconds: float = 2.0
+    max_auto_retries: int = 1
+    max_concurrency: int = 16
 
 
-def load_config(env: Mapping[str, str]) -> WorkerConfig:
+def load_config(env: Mapping[str, str], *, require_question: bool = True) -> WorkerConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`WorkerConfigError`。"""
 
-    missing = [name for name in ("QUESTION", "READONLY_TOOL") if not _text(env, name)]
+    required_names = ("QUESTION", "READONLY_TOOL") if require_question else ("READONLY_TOOL",)
+    missing = [name for name in required_names if not _text(env, name)]
     if missing:
         raise WorkerConfigError(
             "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
@@ -76,6 +87,20 @@ def load_config(env: Mapping[str, str]) -> WorkerConfig:
         workspace=_text(env, "WORKSPACE"),
         model=_text(env, "MODEL"),
         system_prompt=_text(env, "SYSTEM_PROMPT"),
+        worker_id=_text(env, "ID") or new_ulid(),
+        target_worker_version=_text(env, "TARGET_VERSION") or "stable",
+        queue_max_wait_seconds=_duration(env, "QUEUE_MAX_WAIT_SECONDS", 180.0),
+        worker_version_unavailable_seconds=_duration(
+            env, "WORKER_VERSION_UNAVAILABLE_SECONDS", 180.0
+        ),
+        running_heartbeat_timeout_seconds=_duration(
+            env, "RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0
+        ),
+        heartbeat_interval_seconds=_duration(env, "HEARTBEAT_INTERVAL_SECONDS", 30.0),
+        stop_poll_interval_seconds=_duration(env, "STOP_POLL_INTERVAL_SECONDS", 1.0),
+        poll_interval_seconds=_duration(env, "POLL_INTERVAL_SECONDS", 2.0),
+        max_auto_retries=_positive_int(env, "MAX_AUTO_RETRIES", 1, allow_zero=True),
+        max_concurrency=_positive_int(env, "MAX_CONCURRENCY", 16),
     )
 
 
@@ -187,3 +212,34 @@ def _max_turns(value: str) -> int:
             f"LINGXI_WORKER_MAX_TURNS 必须在 1 到 {MAX_TURNS_HARD_LIMIT} 之间"
         )
     return turns
+
+
+def _duration(env: Mapping[str, str], name: str, default: float) -> float:
+    value = _text(env, name)
+    if not value:
+        return default
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise WorkerConfigError(f"{ENV_PREFIX}{name} 必须是正的有限秒数") from error
+    import math
+
+    if seconds <= 0 or not math.isfinite(seconds):
+        raise WorkerConfigError(f"{ENV_PREFIX}{name} 必须是正的有限秒数")
+    return seconds
+
+
+def _positive_int(
+    env: Mapping[str, str], name: str, default: int, *, allow_zero: bool = False
+) -> int:
+    value = _text(env, name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise WorkerConfigError(f"{ENV_PREFIX}{name} 必须是整数") from error
+    invalid = parsed < 0 if allow_zero else parsed <= 0
+    if invalid:
+        raise WorkerConfigError(f"{ENV_PREFIX}{name} 必须是合法的正整数")
+    return parsed

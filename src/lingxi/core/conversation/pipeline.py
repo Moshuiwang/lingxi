@@ -66,6 +66,10 @@ DEFAULT_WORKER_VERSION = "stable"
 TEXT_MESSAGE_TYPE = "text"
 
 
+class QueueInsertFailure(RuntimeError):
+    """task 写入失败，入队事务必须整体回滚。"""
+
+
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
     """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
 
@@ -93,6 +97,9 @@ class GatewayTexts:
 
     def suspended_content(self) -> RenderedContent:
         return _as_content(self.catalog, "gateway.suspended", self.suspended)
+
+    def queue_failed_content(self) -> RenderedContent:
+        return self.catalog.text("gateway.queue_failed")
 
 
 class EventPipeline:
@@ -138,7 +145,47 @@ class EventPipeline:
         moment = now or datetime.now(timezone.utc)
         deferred: list[RenderedContent] = []
 
-        outcome = self._within_transaction(message, moment, deferred)
+        try:
+            outcome = self._within_transaction(message, moment, deferred)
+        except QueueInsertFailure as error:
+            # 真正的 PostgreSQL store 通过独立事务取得一次发送权；没有该能力的旧注入
+            # store 继续抛出原始异常，以免把一个仅测试事务回滚的假实现冒充生产发送器。
+            claim_notice = getattr(self._store, "claim_queue_failure_notice", None)
+            if claim_notice is None:
+                raise error.__cause__ or error
+            if claim_notice(event_id=message.event_id):
+                content = self._texts.queue_failed_content()
+                if not self._should_stop():
+                    try:
+                        self._replies.send_text(
+                            chat_id=message.chat_id,
+                            thread_id=message.thread_id,
+                            reply_to_message_id=message.message_id,
+                            text=content.text,
+                        )
+                        self._audit.record(
+                            "reply.sent",
+                            event_id=message.event_id,
+                            content_key=content.key,
+                            content_version=content.version,
+                            trace_id=message.trace_id,
+                        )
+                    except Exception as send_error:  # noqa: BLE001 - 结论已回滚，提示尽力而为
+                        self._audit.record(
+                            "reply.failed",
+                            event_id=message.event_id,
+                            content_key=content.key,
+                            content_version=content.version,
+                            error=f"{type(send_error).__name__}: {send_error}",
+                            trace_id=message.trace_id,
+                        )
+            self._audit.record(
+                "task.enqueue_failed",
+                event_id=message.event_id,
+                error=f"{type(error.__cause__ or error).__name__}",
+                trace_id=message.trace_id,
+            )
+            return Outcome(handled_as=None)
 
         # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
         if deferred and self._should_stop():
@@ -387,15 +434,19 @@ class EventPipeline:
         # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
         version = self._resolve_version(user_id=user_id, now=now)
 
-        tx.insert_task(
-            task_id=task_id,
-            conversation_id=conversation.conversation_id,
-            user_id=user_id,
-            inbound_event_id=message.event_id,
-            prompt=message.text,
-            resumed_session=resumed,
-            target_worker_version=version,
-        )
+        try:
+            tx.insert_task(
+                task_id=task_id,
+                conversation_id=conversation.conversation_id,
+                user_id=user_id,
+                inbound_event_id=message.event_id,
+                prompt=message.text,
+                resumed_session=resumed,
+                target_worker_version=version,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as error:  # noqa: BLE001 - 事务外只做一次失败提示
+            raise QueueInsertFailure("task insert failed") from error
         tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
         tx.notify_task_queued()
 

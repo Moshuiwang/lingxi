@@ -128,6 +128,7 @@ class GatewayTransaction(Protocol):
         prompt: str,
         resumed_session: bool,
         target_worker_version: str,
+        reply_to_message_id: str | None = None,
     ) -> None: ...
 
     def clear_agent_session(self, *, conversation_id: str) -> bool:
@@ -142,6 +143,8 @@ class GatewayTransaction(Protocol):
 
 class GatewayStore(Protocol):
     def transaction(self) -> ContextManager[GatewayTransaction]: ...
+
+    def claim_queue_failure_notice(self, *, event_id: str) -> bool: ...
 
 
 class Reactions(Protocol):

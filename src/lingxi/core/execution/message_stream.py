@@ -52,6 +52,8 @@ class TurnStreamRecorder:
             "reason": "no_result_message",
         }
         self._agent_turns: int | None = None
+        self._result_error: str | None = None
+        self._session_id: str | None = None
 
     @property
     def final_text(self) -> str:
@@ -88,6 +90,10 @@ class TurnStreamRecorder:
         return self._terminal_reason
 
     @property
+    def result_error(self) -> str | None:
+        return self._result_error
+
+    @property
     def tool_result_count(self) -> int:
         return self._tool_result_count
 
@@ -102,6 +108,12 @@ class TurnStreamRecorder:
         """SDK 终止消息提供的实际 Agent 轮数；没有该字段时保持未知。"""
 
         return self._agent_turns
+
+    @property
+    def session_id(self) -> str | None:
+        """SDK 终止消息报告的会话标识；没有可靠标识时保持 None。"""
+
+        return self._session_id
 
     def handle(self, event: Mapping[str, Any]) -> None:
         kind = event.get("kind")
@@ -131,6 +143,11 @@ class TurnStreamRecorder:
                 event.get("usage"),
                 source=event.get("usage_source", "sdk"),
             )
+            error = event.get("error")
+            self._result_error = error[:500] if isinstance(error, str) else None
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self._session_id = session_id
 
 
 def _non_negative_int(value: Any) -> int | None:
