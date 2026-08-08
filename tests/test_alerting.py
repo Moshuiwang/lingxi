@@ -207,6 +207,49 @@ class SendFailureTests(unittest.TestCase):
         self.assertEqual(len(third), 1)
         self.assertEqual(third[0].count, 3)
 
+    def test_dedupe_window_boundary_alerts_again_exactly_at_threshold(self) -> None:
+        # 去重窗口用 `<`（observe: 距上次主告警 < dedupe_window 才压制）。整点到达
+        # 阈值时不再算重复，必须重新告警。把 `<` 改成 `<=` 会让整点边界被误判为重复，
+        # 本用例随之变红。
+        manager = AlertManager()
+        window = manager.policy.dedupe_window_seconds  # 默认 1800s / 30 分钟
+
+        first = manager.send_failure(channel="message", final=True, at=START, trace_id="01JTRACE")
+        just_inside = manager.send_failure(
+            channel="message",
+            final=True,
+            at=START + timedelta(seconds=window - 1),
+            trace_id="01JTRACE",
+        )
+        at_boundary = manager.send_failure(
+            channel="message",
+            final=True,
+            at=START + timedelta(seconds=window),
+            trace_id="01JTRACE",
+        )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(just_inside, (), "去重窗口内(1799s)仍必须去重")
+        self.assertEqual(len(at_boundary), 1, "整点到达去重窗口阈值(1800s)必须重新告警")
+        self.assertEqual(at_boundary[0].action, NoticeAction.ALERT)
+
+    def test_recovery_window_boundary_recovers_exactly_at_threshold(self) -> None:
+        # 恢复稳定窗口用 `<`（_recover_due: 稳定时长 < recovery_stable 就继续等待）。稳定
+        # 时长整点到达阈值时必须发恢复。把 `<` 改成 `<=` 会让整点边界漏发恢复，本用例
+        # 随之变红。
+        manager = AlertManager()
+        stable = manager.policy.recovery_stable_seconds  # 默认 300s / 5 分钟
+        recovery_start = START + timedelta(minutes=1)
+
+        manager.send_failure(channel="message", final=True, at=START, trace_id="01JTRACE")
+        manager.send_succeeded(channel="message", at=recovery_start, trace_id="01JTRACE")
+        just_inside = manager.tick(at=recovery_start + timedelta(seconds=stable - 1))
+        at_boundary = manager.tick(at=recovery_start + timedelta(seconds=stable))
+
+        self.assertEqual(just_inside, (), "稳定窗口内(299s)不能提前发恢复")
+        self.assertEqual(len(at_boundary), 1, "整点到达恢复稳定阈值(300s)必须发恢复")
+        self.assertEqual(at_boundary[0].action, NoticeAction.RECOVERY)
+
 
 if __name__ == "__main__":
     unittest.main()

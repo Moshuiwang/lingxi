@@ -240,6 +240,18 @@ class HeartbeatRegistry:
         record.previous_active = True
 
     def status(self, component: str, *, at: datetime) -> HeartbeatStatus:
+        """返回组件的活跃判定；``changed`` 是“自上次观察以来是否翻转”的边沿信号。
+
+        这里**有意**推进 ``previous_active`` 基线：``changed`` 按设计是边沿触发的翻转
+        信号（活跃↔不活跃只在发生的那一次为真），所以每次观察都要把基线推进到当前
+        判定，否则同一次翻转会被反复报告。``HeartbeatTests`` 固化了这一语义（翻转当次
+        为真、下一次同态为假），因此不能改成“读不改状态”。
+
+        对告警决策没有副作用：唯一的生产消费者 ``AlertManager.check_heartbeats`` 只用
+        ``active`` 决定观察 / 恢复，而 ``active`` 是 ``(at, last_seen_at, timeout)`` 的纯
+        函数，与基线推进无关；``changed`` 只作日志与边沿判定参考。
+        """
+
         component = _category(component, "component")
         record = self._records.get(component)
         if record is None:
@@ -251,6 +263,7 @@ class HeartbeatRegistry:
         else:
             active = (moment - record.last_seen_at).total_seconds() < record.timeout_seconds
             changed = record.previous_active is not None and active != record.previous_active
+        # 推进边沿基线——理由见方法文档；只影响 changed，不影响 active 决策。
         record.previous_active = active if record.last_seen_at is not None else record.previous_active
         return HeartbeatStatus(component, record.last_seen_at, active, changed)
 
@@ -379,15 +392,8 @@ class AlertManager:
             self._windows[key] = window
 
         if signal.kind is AlertKind.FEISHU_SEND_FAILED and not signal.final:
-            if (
-                window.consecutive_failures
-                and (signal.observed_at - window.last_failure_at).total_seconds()
-                > self.policy.send_failure_window_seconds
-            ):
-                window.window_started_at = signal.observed_at
-                window.consecutive_failures = 0
-                window.total_count = 0
-                window.last_alert_at = None
+            # 五分钟窗口过期的重置已由上面的 `_new_send_window` 统一兜底（过期即换成
+            # 全新窗口，consecutive_failures 归零），这里只需累加当前失败次数。
             window.consecutive_failures += signal.count
         else:
             window.consecutive_failures = max(window.consecutive_failures, 1)
