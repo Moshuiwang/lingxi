@@ -77,6 +77,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.oauth_bridge_client",
     "lingxi.adapters.postgres",
     "lingxi.adapters.postgres_identity",
     "lingxi.adapters.claude_agent_session",
@@ -179,9 +180,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_report",
             "lingxi.core.ids",
         ),
-        # 第三方那一列没变：群发适配走标准库 urllib（同 adapters/feishu_directory.py），
-        # 基线读取用 psycopg——两者都不引入新依赖。
-        ("cryptography.fernet", "psycopg"),
+        # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
+        # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
+        ("cryptography.fernet", "psycopg", "websockets.sync.client"),
     ),
     "reauthorize": (
         (
@@ -190,12 +191,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.feishu_reauthorization",
+            "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.postgres",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.ids",
         ),
-        ("cryptography.fernet", "psycopg"),
+        ("cryptography.fernet", "psycopg", "websockets.sync.client"),
     ),
     "worker": (
         (
@@ -244,6 +246,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             "lingxi.adapters.feishu_onboarding",
             "lingxi.adapters.oauth_bridge",
+            "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.refresh_tokens",
             "lingxi.adapters.postgres_onboarding",
             "lingxi.adapters.postgres",

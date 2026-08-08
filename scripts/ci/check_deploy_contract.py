@@ -419,10 +419,8 @@ def check_compose_contract() -> list[str]:
         user = re.search(r"^\s*user:\s*(\S+)\s*$", reauthorize, re.MULTILINE)
         if user is None or user.group(1).strip("'\"") != "10001:10001":
             failures.append("reauthorize 必须与 scheduler 一样以 `10001:10001` 运行")
-        if not re.search(r"^\s*stdin_open:\s*true\s*$", reauthorize, re.MULTILINE) or not re.search(
-            r"^\s*tty:\s*true\s*$", reauthorize, re.MULTILINE
-        ):
-            failures.append("reauthorize 必须保留交互终端以执行关闭回显的回调输入")
+        if re.search(r"^\s*(stdin_open|tty):", reauthorize, re.MULTILINE):
+            failures.append("reauthorize 通过 OAuth Bridge 接收回调，不应开启交互终端")
         if not re.search(
             r'^\s*command:\s*\["python",\s*"-m",\s*"lingxi\.apps\.reauthorize"\]\s*$',
             reauthorize,

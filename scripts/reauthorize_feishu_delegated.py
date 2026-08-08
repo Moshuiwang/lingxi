@@ -15,15 +15,17 @@
 * ``LINGXI_FEISHU_REDIRECT_URI``
 * ``LINGXI_FEISHU_AUTHORIZATION_ENDPOINT``
 * ``LINGXI_FEISHU_SCOPE``（必须含 ``offline_access``）
+* ``LINGXI_OAUTH_BRIDGE_URL`` / ``LINGXI_OAUTH_BRIDGE_TOKEN``
 
 可选变量：``LINGXI_DELEGATED_REAUTH_STATE_PATH``、
-``LINGXI_DELEGATED_REAUTH_STATE_KEY``、``LINGXI_DELEGATED_SUBJECT_OPEN_ID``。
+``LINGXI_DELEGATED_REAUTH_STATE_KEY``、``LINGXI_DELEGATED_SUBJECT_OPEN_ID``、
+``LINGXI_OAUTH_BRIDGE_WAIT_SECONDS``。
 未提供主体时从正式 ``feishu_delegated_subject`` 登记表读取，不能从回调参数猜测。
 """
 
 from __future__ import annotations
 
-from lingxi.apps.reauthorize import main, parse_callback_url, required
+from lingxi.apps.reauthorize import main
 
 
 if __name__ == "__main__":

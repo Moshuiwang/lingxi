@@ -102,16 +102,23 @@ for pair in "scheduler:${scheduler_image}" "gateway:${gateway_image}" "worker:${
   fi
 done
 
-step "3/10 bot-test 依赖不进生产镜像（M2-62-10）"
-for pair in "scheduler:${scheduler_image}" "worker:${worker_image}"; do
-  name=${pair%%:*}; image=${pair#*:}
-  for module in lark_oapi websockets; do
-    if docker run --rm --entrypoint python "${image}" -c "import ${module}" >/dev/null 2>&1; then
-      fail "${name} 镜像里能 import ${module}——不属于该进程的依赖混进了生产镜像"
-    fi
-  done
-  note "${name}: lark_oapi 与 websockets 均不可导入（符合预期）"
+step "3/10 生产进程依赖隔离（M2-62-10）"
+# scheduler 镜像同时承载正式 reauthorize job；OAuthBridgeClient 的 WebSocket 传输
+# 因此是该镜像的正式依赖。lark-oapi 仍属于 gateway/Bot-Test，不得随 scheduler 进入。
+if docker run --rm --entrypoint python "${scheduler_image}" -c 'import lark_oapi' >/dev/null 2>&1; then
+  fail "scheduler 镜像里能 import lark_oapi——gateway/Bot-Test 依赖混进了正式镜像"
+fi
+if docker run --rm --entrypoint python "${scheduler_image}" -c 'import websockets' >/dev/null 2>&1; then
+  note "scheduler: lark_oapi 不可导入，websockets 仅用于正式 reauthorize OAuth Bridge"
+else
+  fail "scheduler 镜像缺少正式 reauthorize 所需的 websockets"
+fi
+for module in lark_oapi websockets; do
+  if docker run --rm --entrypoint python "${worker_image}" -c "import ${module}" >/dev/null 2>&1; then
+    fail "worker 镜像里能 import ${module}——不属于该进程的依赖混进了生产镜像"
+  fi
 done
+note "worker: lark_oapi 与 websockets 均不可导入（符合预期）"
 # gateway **合法地**装 lark-oapi 与 websockets：#57 把长连接与发消息的依赖从
 # bot-test 组提升成了 gateway 组，两组各自独立声明。所以这里不能照搬上面的否定断言，
 # 要问的是另一个问题——bot-test 独有的那些**模块**有没有混进来。
