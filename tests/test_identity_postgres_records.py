@@ -424,6 +424,24 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         self.assertFalse(self.path.exists())
         self.assertTrue(any("不一致" in line for line in captured.output))
 
+    def test_save_cas_rejects_a_changed_registered_subject_without_overwriting_it(self) -> None:
+        self.vault.revoke(reason="reset")
+        changed_subject = "ou_new_subject_b"
+        self.execute(
+            "UPDATE feishu_delegated_subject SET subject_open_id = %s",
+            (changed_subject,),
+        )
+
+        saved = self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-stale-save"), 7 * 24 * 3600, ""),
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+        )
+
+        self.assertFalse(saved)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), changed_subject)
+        self.assertFalse(self.path.exists())
+
 
 class DatabaseConsistencyBackstopTest(IdentityPostgresTestCase):
     """终轮 Codex P2：数据库层兜底——声明计数造假与缺部门直插都被拒。"""

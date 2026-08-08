@@ -1,6 +1,6 @@
 """正式重授权入口的 state、身份绑定和失败关闭断言。
 
-认领 Issue #67 阶段 A、`V-身份-03` 与 `V-身份-04` 的新增安全面。传输、换码
+认领 Issue #67 阶段 A、`V-身份-03`、`V-身份-04` 与 `V-身份-06` 的新增安全面。传输、换码
 和 vault 都使用可注入替身；真实飞书授权属于 E1 的 biai-stage L4a，不在本地
 单测里冒充通过。
 """
@@ -32,6 +32,7 @@ OTHER_SUBJECT = "ou_other_subject"
 FAKE_CODE = "fake-one-time-code"
 FAKE_ACCESS_TOKEN = "fake-access-token"
 FAKE_REFRESH_TOKEN = "fake-refresh-token"
+_EXPECTED_SUBJECT_MISSING = object()
 
 
 def exchange(subject: str = EXPECTED_SUBJECT) -> AuthorizationExchange:
@@ -68,11 +69,25 @@ class FakeVault:
         self.registered_subject = registered_subject
         self.save_result = save_result
         self.saved: list[tuple[str, AuthorizationGrant]] = []
+        self.after_registered_subject_read = None
 
     def registered_subject_open_id(self) -> str | None:
-        return self.registered_subject
+        subject = self.registered_subject
+        if self.after_registered_subject_read is not None:
+            self.after_registered_subject_read()
+        return subject
 
-    def save(self, *, subject_open_id: str, grant: AuthorizationGrant, **_kwargs: object) -> bool:
+    def save(
+        self,
+        *,
+        subject_open_id: str,
+        grant: AuthorizationGrant,
+        expected_registered_subject_open_id: object = _EXPECTED_SUBJECT_MISSING,
+        **_kwargs: object,
+    ) -> bool:
+        if expected_registered_subject_open_id is not _EXPECTED_SUBJECT_MISSING:
+            if expected_registered_subject_open_id != self.registered_subject:
+                return False
         if self.save_result:
             self.saved.append((subject_open_id, grant))
         return self.save_result
@@ -235,6 +250,27 @@ class ReauthorizationEntryTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "subject_changed")
         self.assertEqual(self.vault.saved, [])
+
+    def test_missing_subject_registration_after_begin_is_rejected_without_saving(self) -> None:
+        state = self._begin()
+        self.vault.registered_subject = None
+
+        result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "subject_missing")
+        self.assertEqual(self.vault.saved, [])
+
+    def test_subject_registration_change_between_read_and_save_is_rejected_by_cas(self) -> None:
+        state = self._begin()
+        self.vault.after_registered_subject_read = lambda: setattr(self.vault, "registered_subject", OTHER_SUBJECT)
+
+        result = self.entry.handle_callback(state, code=FAKE_CODE, now=NOW + timedelta(seconds=1))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "persistence_failed")
+        self.assertEqual(self.vault.saved, [])
+        self.assertEqual(self.vault.registered_subject, OTHER_SUBJECT)
 
     def test_incomplete_exchange_result_fails_closed_without_saving(self) -> None:
         state = self._begin()
