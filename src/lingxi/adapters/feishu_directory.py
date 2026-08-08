@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
+from lingxi.core.identity.onboarding import IdentityProfile
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +65,38 @@ class FeishuDirectoryError(RuntimeError):
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
+@dataclass(frozen=True)
+class AuthorizationExchange:
+    """授权码换回的最小正式结果。
+
+    短期 ``access_token`` 只用于本次读取 ``user_info``，刻意不放进返回对象；
+    调用方因此不能把它顺手交给凭据 vault 或日志。长期只保留用来轮换的
+    ``AuthorizationGrant``。
+    """
+
+    profile: IdentityProfile
+    grant: AuthorizationGrant
+
+
 def _require_https(base_url: str) -> str:
     """飞书出站必须 HTTPS（接口设计二）：误配 http:// 会把 Bearer token、
     App Secret 与一次性 refresh token 明文上路（Codex 复查发现）。"""
 
-    if not base_url.startswith("https://"):
-        raise ValueError("飞书 base_url 必须以 https:// 开头（不回显收到的值）")
-    return base_url.rstrip("/")
+    return _require_https_uri(base_url, "飞书 base_url").rstrip("/")
+
+
+def _require_https_uri(value: object, label: str) -> str:
+    """校验外部 OAuth URL，不把配置原值带进错误消息。"""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label}不能为空")
+    text = value.strip()
+    parsed = urlparse(text)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{label}必须使用不含凭据的 HTTPS 地址")
+    if parsed.fragment:
+        raise ValueError(f"{label}不得包含 URL fragment")
+    return text
 
 
 class Transport(Protocol):
@@ -213,7 +240,11 @@ class FeishuDirectoryClient(_PagedClient):
 
 
 class FeishuAuthorizationClient:
-    """专用授权凭据的续期调用。只做一件事：拿旧的换新的。"""
+    """专用授权凭据的换码与续期调用。
+
+    两条调用都在本适配器内完成协议细节；上层只得到正式领域对象，不会接触
+    飞书响应字典或短期 ``access_token``。
+    """
 
     def __init__(self, *, base_url: str, app_id: str, app_secret: str, transport: Callable[..., Any] | None = None) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
@@ -224,6 +255,75 @@ class FeishuAuthorizationClient:
         self._app_id = app_id
         self._app_secret = app_secret
         self._transport: Callable[..., Any] = transport or urllib_transport
+
+    def exchange_authorization_code(self, code: str, *, redirect_uri: str) -> AuthorizationExchange:
+        """用一次性授权码取得身份和可轮换凭据。
+
+        ``code`` 与短期访问令牌只在本次方法调用的内存里存在；只返回身份资料
+        和 ``AuthorizationGrant``。没有明确的 ``offline_access`` 或完整的
+        refresh 凭据时失败关闭，调用方不能把一次性的半成品交给 vault。
+        """
+
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("授权码不能为空")
+        redirect_uri = _require_https_uri(redirect_uri, "授权回跳地址")
+        response = self._transport(
+            "POST",
+            f"{self._base_url}/authen/v2/oauth/token",
+            body={
+                "grant_type": "authorization_code",
+                "client_id": self._app_id,
+                "client_secret": self._app_secret,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            token=None,
+        )
+        data = response if isinstance(response, Mapping) else {}
+        if data.get("code") not in (None, 0, "0"):
+            raise FeishuDirectoryError(f"feishu_code_{data.get('code')}")
+        access_token_value = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_in = data.get("refresh_token_expires_in")
+        scope = data.get("scope")
+        if not isinstance(access_token_value, str) or not access_token_value:
+            raise FeishuDirectoryError("access_token_missing")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise FeishuDirectoryError("refresh_token_missing")
+        if not isinstance(expires_in, int) or isinstance(expires_in, bool) or expires_in <= 0:
+            raise FeishuDirectoryError("refresh_token_lifetime_missing")
+        if not isinstance(scope, str) or "offline_access" not in scope.split():
+            raise FeishuDirectoryError("offline_access_missing")
+
+        access_token = SecretToken(access_token_value)
+        info = self._transport(
+            "GET",
+            f"{self._base_url}/authen/v1/user_info",
+            body=None,
+            token=access_token.reveal(),
+        )
+        if not isinstance(info, Mapping) or info.get("code") not in (None, 0, "0"):
+            code_value = info.get("code") if isinstance(info, Mapping) else "invalid_response"
+            raise FeishuDirectoryError(f"feishu_code_{code_value}")
+        raw_profile = info.get("data", info)
+        if not isinstance(raw_profile, Mapping):
+            raise FeishuDirectoryError("identity_profile_invalid")
+
+        profile = IdentityProfile(
+            _text_value(raw_profile.get("open_id")),
+            _text_value(raw_profile.get("user_id")),
+            _text_value(raw_profile.get("union_id")),
+            _text_value(raw_profile.get("name")),
+            _optional_text_value(raw_profile.get("department")),
+            _optional_text_value(raw_profile.get("tenant_key")),
+            _optional_text_value(raw_profile.get("locale")),
+        )
+        if not profile.open_id:
+            raise FeishuDirectoryError("identity_open_id_missing")
+        return AuthorizationExchange(
+            profile=profile,
+            grant=AuthorizationGrant(SecretToken(refresh_token), expires_in, scope),
+        )
 
     def refresh(self, current: AuthorizationGrant) -> tuple[AuthorizationGrant, SecretToken]:
         """用当前 ``refresh_token`` 换一组新凭据。
@@ -261,3 +361,14 @@ class FeishuAuthorizationClient:
         scope = data.get("scope")
         logger.info("专用授权续期成功 lifetime_seconds=%s", expires_in)
         return AuthorizationGrant(SecretToken(next_token), expires_in, scope if isinstance(scope, str) else ""), SecretToken(access_token)
+
+
+def _text_value(value: object) -> str:
+    """只接受飞书身份字段的字符串形态，不把对象错误转成可识别文本。"""
+
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _optional_text_value(value: object) -> str | None:
+    text = _text_value(value)
+    return text or None

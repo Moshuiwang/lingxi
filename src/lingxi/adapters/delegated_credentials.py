@@ -171,6 +171,24 @@ class HostFileDelegatedCredentialVault:
 
     # ---- 读取 -------------------------------------------------------------
 
+    def registered_subject_open_id(self) -> str | None:
+        """读取正式登记的专用授权主体，不读取凭据文件。
+
+        重授权入口用这条登记绑定回调身份；回调本身的身份只接受飞书
+        ``user_info`` 回读，不能由浏览器参数提供。撤销凭据时登记行保留，
+        因此失效后的恢复仍然有明确的比较对象。
+        """
+
+        with self._psycopg.connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
+                (DELEGATED_PURPOSE,),
+            )
+            row = cursor.fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0].strip():
+            return None
+        return row[0].strip()
+
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
         """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""
 
