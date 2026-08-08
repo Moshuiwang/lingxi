@@ -32,10 +32,9 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 
 from lingxi.core.identity.credentials import AuthorizationGrant
-from lingxi.core.identity.onboarding import IdentityProfile
 
 from .delegated_credentials import _FileLock  # noqa: SLF001 - 复用同一宿主机文件锁
-from .feishu_directory import AuthorizationExchange
+from .feishu_directory import AuthorizationExchange, scope_covers
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +76,13 @@ class DelegatedCredentialVault(Protocol):
 
 
 class AuthorizationCodeExchanger(Protocol):
-    def exchange_authorization_code(self, code: str, *, redirect_uri: str) -> AuthorizationExchange: ...
+    def exchange_authorization_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str,
+        required_scope: str,
+    ) -> AuthorizationExchange: ...
 
 
 class HostFileAuthorizationStateStore:
@@ -320,7 +325,11 @@ class FeishuReauthorizationEntry:
             return self._failure("cancelled", "已取消本次授权，未修改凭据，请重新发起授权。")
 
         try:
-            exchange = self._exchanger.exchange_authorization_code(code or "", redirect_uri=self._redirect_uri)
+            exchange = self._exchanger.exchange_authorization_code(
+                code or "",
+                redirect_uri=self._redirect_uri,
+                required_scope=self._scope,
+            )
         except Exception as caught:  # noqa: BLE001 - 外部失败只能按安全失败关闭
             logger.warning("正式重授权换码失败 error=%s", type(caught).__name__)
             return self._failure(
@@ -330,15 +339,16 @@ class FeishuReauthorizationEntry:
 
         if (
             not isinstance(exchange, AuthorizationExchange)
-            or not isinstance(exchange.profile, IdentityProfile)
+            or not isinstance(exchange.subject_open_id, str)
             or not isinstance(exchange.grant, AuthorizationGrant)
+            or not scope_covers(self._scope, exchange.grant.scope)
         ):
             logger.warning("正式重授权换码结果不完整，未写入凭据")
             return self._failure(
                 "exchange_failed",
                 "飞书返回的授权资料不完整，未修改正式凭据，请重新发起授权。",
             )
-        returned_subject = exchange.profile.open_id
+        returned_subject = exchange.subject_open_id
         if not isinstance(returned_subject, str) or not hmac.compare_digest(
             returned_subject.strip(), pending.expected_subject_open_id
         ):
