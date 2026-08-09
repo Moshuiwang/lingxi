@@ -305,3 +305,8 @@ scheme 决定，少了它干净环境跑 `upgrade` 会报 `No module named 'psyc
 必须先占用该行（`src/lingxi/adapters/oauth_bridge.py:542`），因此现在删除会移除正式
 凭据代码「轮换失败 → 人工重新授权」的唯一落地手段。废弃时点改为：随
 [#67](https://github.com/Moshuiwang/lingxi/issues/67) 的正式重授权入口交付后执行。
+
+2026-08-09 回写（#67 阶段 B）：正式重授权入口已交付并在 `biai-stage` 完成真实 L4a，
+但阶段 B 按缩小清单执行，**`migrations/testing/002`、`003` 继续保留**——它们仍是
+「飞书私聊卡片 → 首次开通」这条链目前唯一跑通过的验证入口（生产侧 `OnboardingRunner`
+当前唯一实现是失败关闭桩），废弃时点顺延到 E4 真实 onboarding runner 通过 L4a 之后。
