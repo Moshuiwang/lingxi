@@ -4,6 +4,7 @@
 
 # 本地临时产品资料，不进入版本库
 .tmp/
+.codex-tmp/
 
 __pycache__/
 *.py[cod]
