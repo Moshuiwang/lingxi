@@ -33,8 +33,12 @@ class DrainTimeoutError(Exception):
     """会话收尾（``ClaudeSDKClient.__aexit__``）超过独立宽限（#143）。
 
     收尾宽限与业务执行预算彼此独立、各自有界：业务墙钟超时不得连带截断收尾——
-    终态接收、用量回收要在自己的时间窗里跑完。这个异常只在收尾本身也挂起时才
-    触发，是"宁可多等一段有界时间，也不静默丢终态"的最后一道保护，不是常态。
+    终态接收、用量回收要在自己的时间窗里跑完。这个异常**只在业务阶段没有别的
+    异常在传播、且收尾本身也挂起时**才触发，是"宁可多等一段有界时间，也不静默
+    丢终态"的最后一道保护，不是常态。业务阶段已经有异常在传播时（例如业务墙钟
+    ``TimeoutError``）收尾又同时挂起，这个类不会被抛出——原始的业务异常会继续
+    传播，不被这里替换（复查发现：替换会把 turn_timeout 终态压成
+    drain_timeout，并让失败文案谎称"已完成业务执行"）。
     """
 
 # 依赖到的 SDK 类型名。集中列出，便于真实 SDK 冒烟一次性核对它们是否还在。
@@ -201,9 +205,21 @@ async def run_single_turn(
                 async with asyncio.timeout(drain_grace_seconds):
                     await client.__aexit__(exc_type, exc_val, exc_tb)
             except TimeoutError:
-                raise DrainTimeoutError(
-                    f"会话收尾超过独立宽限 {drain_grace_seconds:g} 秒"
-                ) from None
+                if exc_type is not None:
+                    # 业务阶段已经有异常在传播（典型情况：业务墙钟 TimeoutError，
+                    # 但不限于它——任何业务阶段异常都适用），收尾这次自己也超时。
+                    # 不能用 DrainTimeoutError（或这里收尾自己的 TimeoutError）
+                    # 替换掉正在传播的业务异常：那会让 turn_timeout 终态被压成
+                    # drain_timeout，且失败文案会谎称"已完成业务执行"（业务阶段
+                    # 其实也没跑完，复查发现，见 #149 修复说明）。这里刻意什么都
+                    # 不 raise——``finally`` 块正常收尾时，Python 会自动继续传播
+                    # 进入本 ``finally`` 前就已经在途的那个原始异常（``exc_val``），
+                    # 不需要、也不应该手动重新 raise 它。
+                    pass
+                else:
+                    raise DrainTimeoutError(
+                        f"会话收尾超过独立宽限 {drain_grace_seconds:g} 秒"
+                    ) from None
 
 
 def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:

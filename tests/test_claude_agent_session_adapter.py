@@ -438,6 +438,53 @@ class SingleTurnSessionTest(_StubSDK):
 
         self.assertEqual(self.calls["closed"], 1)
 
+    def test_business_timeout_and_drain_timeout_together_do_not_mask_turn_timeout(self) -> None:
+        """复查发现：业务墙钟超时与收尾同时超时时，不得让 DrainTimeoutError 替换
+        掉正在传播的业务 TimeoutError——那会把 turn_timeout 终态压成
+        drain_timeout，且失败文案会谎称"已完成业务执行"（业务阶段其实也没跑
+        完）。改坏 ``run_single_turn`` 收尾里的异常吞掉逻辑（让它重新 raise
+        DrainTimeoutError）必须让本用例变红。"""
+
+        from lingxi.adapters.claude_agent_session import (
+            DrainTimeoutError,
+            build_agent_options,
+            run_single_turn,
+        )
+
+        module = sys.modules["claude_agent_sdk"]
+
+        class DoubleHangClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    await asyncio.sleep(3600)
+                    yield  # pragma: no cover
+
+                return _gen()
+
+            async def __aexit__(self, *exc_info):
+                await asyncio.sleep(3600)
+                return await super().__aexit__(*exc_info)  # pragma: no cover
+
+        module.ClaudeSDKClient = DoubleHangClient
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+
+        with self.assertRaises(TimeoutError) as ctx:
+            asyncio.run(
+                run_single_turn(
+                    options=options,
+                    prompt="问题",
+                    sink=lambda event: None,
+                    timeout_seconds=0.01,
+                    drain_grace_seconds=0.01,
+                )
+            )
+
+        # DrainTimeoutError 不是 TimeoutError 的子类：断言异常类型明确排除它，
+        # 不只是靠 assertRaises(TimeoutError) 顺带覆盖。
+        self.assertNotIsInstance(ctx.exception, DrainTimeoutError)
+        # 收尾自己也挂起、被墙钟取消，从未真正跑完一次。
+        self.assertEqual(self.calls["closed"], 0)
+
     def test_aenter_failure_does_not_call_aexit(self) -> None:
         """建连本身失败（entered 仍为 False）时不得调用 __aexit__——与
         ``async with`` 的真实协议一致，避免对一个没建成的客户端做收尾。"""

@@ -14,9 +14,13 @@ worker 输出离开进程前移除已知的敏感值、内部工具标识和系�
 1. 能确定边界的敏感片段只替换对应片段，一次命中不得让整段有效结论消失。
 2. 只有在已知敏感内容覆盖了全部可展示正文、没有任何有效业务内容幸存时，
    才整段拒发（``withheld``），使用独立终态，不伪装成功。
-3. 片段检测要覆盖归一化后的中英文高风险标记（系统提示类），并能捕捉「只泄露
-   一段」而不是整份精确复述的情况；检测方式是**确定性的结构化切分**（换行、
-   句末标点、固定长度下界），不是语义相似度或模糊匹配，避免误伤正常业务回答。
+3. 系统提示类标记检测覆盖 ASCII 大小写变体、全角折叠、有界零宽字符穿插与
+   繁简变体（见 ``_SYSTEM_PROMPT_MARKERS``），但这是**针对已知复现样本的定向
+   加固**，不是通用 NFKC/同形字防护。片段切分只施加于 ``system_prompt``——
+   它是唯一「哪怕泄露一句也不允许」的敏感来源；``forbidden_values``（生产上
+   即 ``external_texts``）不做片段切分，因为那类内容是模型被期望原样引用的
+   合法业务依据，片段级匹配会把正常问答整体遮蔽。检测方式是**确定性的结构化
+   切分**（换行、句末标点、固定长度下界），不是语义相似度或模糊匹配。
 """
 
 from __future__ import annotations
@@ -53,11 +57,67 @@ _PROCESS_MARKER_MAX_LEN = 45
 # "System_Prompt"、"system - prompt" 这类轻微变体；中文分支是 #142 缺口二的
 # 修复——原实现只认英文，中文用户反而没有防护。两个分支都是**字面 token 匹配**，
 # 不做语义判断，符合"不做无边界模糊拦截"的合同要求。
+#
+# 归一化绕过面（复查发现，#149 修复）：模型可以被诱导用全角字母、在字符间插入
+# 零宽字符、或用繁体「系統」代替简体「系统」来吐出标记，逃过纯字面匹配。以下
+# 只针对这三类具体复现样本（全角、零宽插入、繁简变体），不是通用 NFKC/同形字
+# 防护——那需要更大范围的评估，不在本次修复范围内。
+
+# 全角折叠：把 U+FF01-FF5E（全角 ASCII，含全角字母/数字/标点）与 U+3000
+# （全角空格）逐字符折成对应半角字符。这是**逐字符 1:1** 映射，不改变字符串
+# 长度或位置，折叠后在其上匹配到的偏移量可以直接复用在原文上，不需要额外的
+# 位置重映射（区别于"零宽字符剥离"那种会改变长度的做法）。
+_FULLWIDTH_FOLD = str.maketrans(
+    {chr(code_point): chr(code_point - 0xFEE0) for code_point in range(0xFF01, 0xFF5F)}
+    | {"　": " "}
+)
+
+
+def _fold_for_marker_matching(text: str) -> str:
+    """只为系统提示标记检测折叠全角字符；不改变正文本身，也不改变长度。"""
+
+    return text.translate(_FULLWIDTH_FOLD)
+
+
+# 零宽字符容忍：攻击者可以在标记字面量的字符之间插入零宽字符（渲染不可见）
+# 打断连续子串匹配。用**有界**重复（{0,4}，与既有 [\s_-]{0,4} 同一纪律）而不是
+# 无界 ``*``——无界重复会让"一个命中最长可能多少字符"失去上界，破坏
+# ``StreamingOutputGuard`` 有界尾部缓冲的前提（见下面 ``_max_pattern_length``
+# 用到的 ``_SYSTEM_PROMPT_MARKER_MAX_LEN``）。
+_ZERO_WIDTH_CHARS = "​‌‍⁠﻿"
+_ZW_GAP = f"[{_ZERO_WIDTH_CHARS}]{{0,4}}"
+
+
+def _zw_tolerant(literal: str) -> str:
+    """把字面量拆成字符间允许穿插有界零宽字符的正则片段。"""
+
+    return _ZW_GAP.join(re.escape(char) for char in literal)
+
+
 _SYSTEM_PROMPT_MARKERS = re.compile(
-    r"(?:\bsystem[\s_-]{0,4}prompt\b|系统[\s]{0,4}提示(?:词|语)?)",
+    r"(?:\b"
+    + _zw_tolerant("system")
+    + r"[\s_-]{0,4}"
+    + _zw_tolerant("prompt")
+    + r"\b|"
+    + _zw_tolerant("系")
+    + _ZW_GAP
+    + r"[统統]"
+    + _ZW_GAP
+    + r"[\s]{0,4}"
+    + _zw_tolerant("提示")
+    + r"(?:"
+    + _zw_tolerant("词")
+    + r"|"
+    + _zw_tolerant("语")
+    + r")?)",
     re.IGNORECASE,
 )
-_SYSTEM_PROMPT_MARKER_MAX_LEN = 24
+# 上界推导（英文分支是最长的一支）："system" 6 字符、5 个字符间隙；连接符
+# 间隙至多 4；"prompt" 6 字符、5 个字符间隙；每个零宽间隙至多 4 个字符：
+# 6 + 5*4 + 4 + 6 + 5*4 = 56。中文分支明显更短。改坏这个推导（例如改大零宽
+# 间隙上限却不同步改这个常量）由 test_input_safety.py 的最坏情况用例验红。
+_SYSTEM_PROMPT_MARKER_MAX_LEN = 56
 
 # 片段检测的下界：短于它的候选片段大多是常见短词，拦截它们只会误伤正常业务
 # 回答（合同第 4 条「不做无边界模糊拦截」）。具体取值是实现决定，由白盒测试与
@@ -66,6 +126,13 @@ _MIN_FRAGMENT_CHARS = 6
 # 结构性切分边界：换行与中英文句末标点。不含逗号、冒号等弱边界——切得越碎，
 # 短片段误伤正常文本的概率越高；只切句子级边界是精度与召回之间的确定性折中。
 _FRAGMENT_BOUNDARY = re.compile(r"[\n。！？.!?;；]+")
+
+# "命中区间之外是否还幸存真实业务内容"的判定不能用 ``str.strip()``——它只剔除
+# 空白，遮蔽后残留的孤立标点（比如整段被替换后只剩一个句号）会被误判成"幸存
+# 的业务结论"，进而放弃本该触发的 withheld 终态（复查发现，见 #149 修复说明）。
+# 改用"是否存在至少一个词/数字/CJK 字符"：\w 在 Python 的 Unicode 正则里覆盖
+# 字母、数字与 CJK 表意文字，恰好排除纯标点/空白残渣。
+_MEANINGFUL_CONTENT = re.compile(r"\w", re.UNICODE)
 
 _PLACEHOLDER_VALUE = "【已隐藏】"
 _PLACEHOLDER_TOOL = "【内部能力已隐藏】"
@@ -214,7 +281,7 @@ def constrain_output(
     merged = _merge_spans(spans)
     redacted, reasons, kept_original = _apply_spans(candidate, merged, len(candidate))
 
-    if reasons and not kept_original.strip():
+    if reasons and not _has_meaningful_content(kept_original):
         _ensure_terminal_text_is_safe(withheld_text, forbidden_values, system_prompt, internal_tool_names)
         return OutputConstraintResult(
             text=withheld_text,
@@ -383,8 +450,14 @@ class StreamingOutputGuard:
         for reason in reasons_used:
             if reason not in self._reasons:
                 self._reasons.append(reason)
-        if kept.strip():
+        if _has_meaningful_content(kept):
             self._has_real_content = True
+
+
+def _has_meaningful_content(text: str) -> bool:
+    """判断命中区间之外幸存的文本里是否还有真实业务内容（而不只是标点残渣）。"""
+
+    return _MEANINGFUL_CONTENT.search(text) is not None
 
 
 def _find_spans(
@@ -399,9 +472,17 @@ def _find_spans(
     for value in forbidden:
         for start in _iter_substring_positions(candidate, value):
             spans.append(_Span(start, start + len(value), "forbidden_value"))
-        for fragment in _derive_fragments(value):
-            for start in _iter_substring_positions(candidate, fragment):
-                spans.append(_Span(start, start + len(fragment), "forbidden_fragment"))
+
+    # 片段切分（#142 缺口一）只施加于 ``system_prompt``：它是唯一"绝不允许被
+    # 引用哪怕一句"的敏感来源。``forbidden_values`` 在生产上唯一来源是
+    # ``external_texts``（指标描述等外部业务文本），这类内容是模型回答问题时
+    # 被期望原样引用的合法依据——对它做片段级匹配会把"这个指标怎么定义的"这
+    # 类正常问答整体遮蔽，超出 #142 缺口一的范围（复查发现）。整串精确匹配
+    # （上面的 ``forbidden_value``）仍然覆盖 ``forbidden_values``，只是不再对
+    # 它们做结构化切分。
+    for fragment in _derive_fragments(system_prompt) if system_prompt else ():
+        for start in _iter_substring_positions(candidate, fragment):
+            spans.append(_Span(start, start + len(fragment), "forbidden_fragment"))
 
     for name in _unique_texts(internal_tool_names):
         for start in _iter_substring_positions(candidate, name):
@@ -409,7 +490,11 @@ def _find_spans(
 
     for match in _PROCESS_MARKERS.finditer(candidate):
         spans.append(_Span(match.start(), match.end(), "process_marker"))
-    for match in _SYSTEM_PROMPT_MARKERS.finditer(candidate):
+    # 系统提示标记在**全角折叠后**的副本上匹配：折叠是逐字符 1:1 映射（见
+    # ``_fold_for_marker_matching``），不改变长度或位置，因此这里得到的偏移量
+    # 可以直接当作原文 ``candidate`` 上的偏移量使用。
+    folded_for_markers = _fold_for_marker_matching(candidate)
+    for match in _SYSTEM_PROMPT_MARKERS.finditer(folded_for_markers):
         spans.append(_Span(match.start(), match.end(), "system_prompt_marker"))
 
     return spans

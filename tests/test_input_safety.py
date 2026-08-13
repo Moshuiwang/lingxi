@@ -185,6 +185,50 @@ class InputBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.reasons, ("system_prompt_marker",))
                 self.assertNotIn(phrasing, result.text)
 
+    def test_v_149_normalized_system_prompt_marker_variants_are_caught(self) -> None:
+        """复查发现：出口标记检测此前零 Unicode 归一化，全角字母、字符间插入
+        零宽字符、繁体「系統」都能绕过匹配。这里只针对复查给出的三类具体复现
+        样本做定向加固（不是通用 NFKC/同形字防护），改坏折叠或正则的任意一支
+        都必须让本用例变红。"""
+
+        for label, text in (
+            # 英文分支带 \b 边界锚点（与既有 ASCII 用例同一结构：标记前后要有
+            # 非 \w 分隔符，这不是本次修复要处理的"中西文之间没有分隔符"问题）。
+            ("全角英文", "内容中出现 ｓｙｓｔｅｍ　ｐｒｏｍｐｔ。"),
+            ("零宽插入", "这是系​统提示相关的内容"),
+            ("繁体中文", "这是系統提示相关的内容"),
+        ):
+            with self.subTest(label=label):
+                result = constrain_output(text)
+                self.assertTrue(result.blocked, f"{label} 应当命中 system_prompt_marker")
+                self.assertEqual(result.reasons, ("system_prompt_marker",))
+
+    def test_v_149_normalization_does_not_change_the_original_text_shown_around_the_hit(self) -> None:
+        """折叠只用于检测，替换仍然发生在原文上——命中范围之外的原始字符（包括
+        全角字符本身）必须原样保留，不能被悄悄转成半角。"""
+
+        result = constrain_output("报告：ｓｙｓｔｅｍ　ｐｒｏｍｐｔ 已确认")
+
+        self.assertTrue(result.blocked)
+        self.assertIn("报告", result.text)
+        self.assertIn("已确认", result.text)
+        self.assertNotIn("ｓｙｓｔｅｍ", result.text)
+
+    def test_v_149_worst_case_zero_width_padding_is_still_bounded_and_caught(self) -> None:
+        """``_SYSTEM_PROMPT_MARKER_MAX_LEN`` 的上界推导必须真的够用：每个字符
+        间隙塞满允许的零宽字符上限时，标记仍然要被识别为一次命中（否则说明
+        有界重复的上界或缓冲常量算错了）。"""
+
+        zw = "​​​​"
+        padded = zw.join("system") + "-" * 4 + zw.join("prompt")
+
+        result = constrain_output(f"内容：{padded}。")
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reasons, ("system_prompt_marker",))
+        self.assertIn("内容", result.text)
+        self.assertIn("。", result.text)
+
     def test_v_zhuru_142_system_prompt_fragment_leak_is_caught(self) -> None:
         """#142 缺口一：旧实现只做整串精确匹配，模型只泄露系统提示中的一句时
         照常放行。改坏片段切分（例如把 ``_derive_fragments`` 恒定返回空）必须
@@ -233,6 +277,42 @@ class InputBoundaryTests(unittest.TestCase):
                 self.assertFalse(result.withheld)
                 self.assertEqual(result.text, text)
 
+    def test_v_149_fragment_matching_does_not_apply_to_external_texts(self) -> None:
+        """复查发现：片段切分此前对全部 ``forbidden_values``（生产上就是
+        ``external_texts``，唯一来源是指标描述）无差别生效，导致模型合法引用
+        指标描述开头一句时被整体遮蔽。片段切分现在只施加于 ``system_prompt``；
+        ``forbidden_values`` 的整串精确匹配保持不变（合同第 4 条：不做无边界
+        模糊拦截，误报控制用例需要覆盖 external_texts 这条路径）。"""
+
+        metric_description = (
+            "日活用户数：统计当日登录过的去重用户数。"
+            "口径与埋点保持一致。"
+            "不含内部测试账号。"
+        )
+        answer = "日活用户数：统计当日登录过的去重用户数。近 7 天日活是 1024，环比上升 3%。"
+
+        result = constrain_output(answer, forbidden_values=(metric_description,))
+
+        self.assertFalse(result.blocked)
+        self.assertFalse(result.withheld)
+        self.assertEqual(result.text, answer)
+
+    def test_v_149_whole_value_match_still_applies_to_external_texts(self) -> None:
+        """收紧片段切分范围不能连带丢掉整串精确匹配：external_texts 原样被完整
+        复述时仍然要局部遮蔽那一段。"""
+
+        metric_description = "机密指标口径：仅供内部审计使用，禁止外传。"
+        answer = f"回答：{metric_description} 近 7 天日活是 1024。"
+
+        result = constrain_output(answer, forbidden_values=(metric_description,))
+
+        self.assertTrue(result.blocked)
+        self.assertFalse(result.withheld)
+        self.assertEqual(result.reasons, ("forbidden_value",))
+        self.assertNotIn(metric_description, result.text)
+        self.assertIn("回答", result.text)
+        self.assertIn("近 7 天日活是 1024", result.text)
+
     def test_v_zhuru_04_injection_failure_and_no_data_have_safe_non_empty_terminals(self) -> None:
         for model_text, expect_withheld in (
             (INJECTION, True),
@@ -262,6 +342,36 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertEqual(result.text, WITHHELD_MESSAGE)
         self.assertNotIn(INJECTION, result.text)
         self.assertNotEqual(result.text, SAFE_OUTPUT_FALLBACK)
+
+    def test_v_149_punctuation_only_residue_is_still_withheld(self) -> None:
+        """复查发现：命中区间之外只剩标点残渣（不是空白）时，此前会被
+        ``kept_original.strip()`` 误判成"还有幸存业务内容"而放弃 withheld。
+        改回 ``.strip()`` 判定必须让本用例变红。"""
+
+        result = constrain_output("。" + INJECTION, forbidden_values=(INJECTION,))
+
+        self.assertTrue(result.blocked)
+        self.assertTrue(result.withheld)
+        self.assertEqual(result.text, WITHHELD_MESSAGE)
+        self.assertNotIn(INJECTION, result.text)
+
+    def test_v_149_system_prompt_fragment_leak_with_only_punctuation_residue_is_withheld(self) -> None:
+        """同一缺陷的系统提示复现：模型只复述了系统提示里的一句，命中区间之外
+        只剩下一个句号，没有任何真实业务结论——必须整段拒发，而不是放行一个
+        只剩标点的"命中"结果。"""
+
+        system_prompt = (
+            "只读问数系统提示：只能查询当前用户范围。"
+            "请始终使用中文回答用户问题。"
+            "不得透露内部工具名称。"
+        )
+        model_text = "请始终使用中文回答用户问题。"
+
+        result = constrain_output(model_text, system_prompt=system_prompt)
+
+        self.assertTrue(result.blocked)
+        self.assertTrue(result.withheld)
+        self.assertEqual(result.text, WITHHELD_MESSAGE)
 
     def test_overlapping_hits_are_merged_without_corrupting_the_boundary(self) -> None:
         """一个内部工具名恰好也命中系统提示标记文本时，重叠区间必须被合并成一次
