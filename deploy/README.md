@@ -123,6 +123,88 @@ echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
 
 > 另有一个待产品负责人决定的选项：把镜像包设为**公开**，宿主机就完全不需要登录，也就没有这份长期驻留在部署机上的凭据。代价是镜像层对外可见（源码本身不在镜像里，但依赖清单与目录结构会暴露）。本批不替产品负责人做这个选择，两条路都可行。
 
+## PR 候选镜像下载与校验（Issue #150；仅用于 #102 验收，不是发布路径）
+
+> **这一节只在验收某个未合并 PR 时使用。** 合并后的正式部署仍按上面「主机读取身份」「安装与升级」走 GHCR 拉取。**严禁在 `biai-stage` 现场用 `docker build` 重新构建这四个镜像，也不得用合并后 `Main Publish` 推送 GHCR 的镜像替代未合并 PR 的候选**——两者是不同对象：合并后的镜像是从合并树重新构建的，不保证与 PR 验收时的树逐位相同（Issue #62 决策登记、[验证与门禁](../docs/技术设计/验证与门禁.md)「五、CI 分层」）。
+
+**为什么需要单独下载**：`biai-stage` 要验收的是"这个 PR 这一次 `Epic Full` 构建出的镜像"，而不是合并后重新构建的另一份对象——`Epic Full / image` job 构建出的四个镜像只存在于那次 CI runner 上，job 结束就消失，因此必须先落地成可下载 artifact。
+
+**去哪下载、保存多久**：`Epic Full` 每次对一个 PR 跑通 `image` job（纯文档 PR 不会有这一步），会产出一个名为
+
+```
+epic-candidate-images-pr-<PR 编号>-<PR head sha>
+```
+
+的 GitHub Actions artifact，内容是 `manifest.json` + 四个 `lingxi-<service>-<批次>-<commit 短码>.tar`（scheduler / migrate / gateway / worker 各一个）。**这与既有的 `epic-candidate-pr-<PR 编号>-<PR head sha>` 是两个不同的 artifact**——那个只装 `candidate.json`，`Main Publish` 的 `verify_epic_candidate.py` 断言其文件列表严格等于 `["candidate.json"]`，混进镜像 tar 会直接破坏合并后的候选回读，因此镜像制品独立开一个 artifact，不合并进去。
+
+保存期 **14 天**，与 `publish.yml`「降级留证：上传镜像 tar」一致——同类产物同一保存期。超过保存期后无法再下载；需要验收更旧的候选时，让对应 PR 重新跑一次 `Epic Full` 产出新候选，**不能**用合并后的 GHCR 镜像顶替。
+
+**下载**（需要一个具备该仓库 Actions 只读权限的身份，本仓库机器人 `gh` 登录已满足）：
+
+```bash
+gh run list --repo Moshuiwang/lingxi --workflow=ci.yml --branch <PR 分支名> --limit 5
+gh run download <run id> --repo Moshuiwang/lingxi \
+  --name "epic-candidate-images-pr-<PR 编号>-<PR head sha>" \
+  --dir /path/to/bundle-dir
+```
+
+**下载后先校验，不导入没核对过的东西**：
+
+```bash
+python3 scripts/ci/verify_epic_candidate_bundle.py /path/to/bundle-dir \
+  --expect-repository Moshuiwang/lingxi \
+  --expect-pr-number <PR 编号> \
+  --expect-head-sha <PR head sha> \
+  --expect-run-id <run id>
+```
+
+manifest 结构、四镜像齐全性（scheduler/migrate/gateway/worker 缺一不可、多一不可）、
+每个 tar 的大小与 sha256、以及传入的 PR 身份，任一项不符，脚本非零退出并一次性列出全部
+问题——不会因为查到第一个问题就停下让人漏看第二个。
+
+**导入并核对镜像 digest**（追加 `--import`，需要本机 docker）：
+
+```bash
+python3 scripts/ci/verify_epic_candidate_bundle.py /path/to/bundle-dir --import
+```
+
+这一步会对四个 tar 逐个 `docker load`，再回读每个镜像的 `.Id`，核对与 manifest 记录的
+`image_digest` 一致——证明"导入到本机 docker 的东西"确实是这次构建产出的那个，不是
+半截下载或被替换的对象。
+
+**接入 compose 使用候选镜像**：候选镜像的本地引用是 `lingxi-<service>:build-a`（CI 构建时
+打的本地 tag，不含仓库前缀），而 `deploy/compose.yaml` 的镜像引用要求
+`${LINGXI_IMAGE_REGISTRY:?}/lingxi-<service>:${LINGXI_IMAGE_TAG:?}`（`LINGXI_IMAGE_REGISTRY`
+不允许留空）。导入后重新打 tag 让两者对上：
+
+```bash
+for service in scheduler migrate gateway worker; do
+  docker tag "lingxi-${service}:build-a" "epic-candidate/lingxi-${service}:pr-<PR 编号>"
+done
+# deploy/.env.stage 对应设置：
+#   LINGXI_IMAGE_REGISTRY=epic-candidate
+#   LINGXI_IMAGE_TAG=pr-<PR 编号>
+```
+
+此后按下面「安装与升级」正常执行；区别只是镜像来自候选 artifact 而不是 GHCR 拉取，
+**上面「主机读取身份」那一步（GHCR 登录）此时不需要**——镜像已经在本机 load 过。
+
+**最小回滚**：在 `biai-stage` 上切换候选或回退到上一个候选，只需要把
+`deploy/.env.stage` 的 `LINGXI_IMAGE_TAG` 改回上一个候选对应的本地 tag（前提是那个候选
+镜像仍在本机 docker 里、未被 `docker rmi`），再执行 `up -d` 即可切回——机制与下面
+「回滚」一节生产环境切 tag 相同，只是候选场景下 tag 指向本机而不是 GHCR。候选之间的
+切换不触碰生产数据库或生产持久卷；真实生产的回滚与恢复仍以「回滚」「恢复入口」两节
+为准，本节不重复。
+
+**候选替换登记要求**：同一个 PR 出现新提交，或旧候选对应的 Actions run 已过期，之前
+下载导入的候选立即失效。切换到新候选时，必须在对应验收 Issue（如 #102）里登记：
+
+- **旧候选**：PR head sha、run id、四个 `image_digest`（可从旧 `manifest.json` 摘）。
+- **新候选**：同样四项。
+- **失效证据**：为什么旧候选不再代表当前 PR（新提交 sha、CI 重跑、run 过期等）。
+- **重验范围**：哪些已经在旧候选上做过的验收动作需要在新候选上重跑——不能只换镜像
+  不换证据，那样"验收通过"这句话就对不上实际跑过的对象。
+
 ## 安装与升级
 
 **`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。

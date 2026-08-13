@@ -340,6 +340,55 @@ jobs:
             lingxi-scheduler:build-a lingxi-worker:build-a \
             lingxi-migrate:build-a lingxi-gateway:build-a
 
+      # Issue #150：合并前把这次通过契约核对的四镜像（A 腿，与 B 腿内容级等价）
+      # 导出为可下载 artifact，并生成绑定 PR head SHA / Git tree / 构建输入的 manifest。
+      # 只在真实 PR 触发时产出——workflow_dispatch 手动运行没有 PR 身份可绑定，不导出。
+      - name: 导出四镜像候选并生成 manifest（Issue #150）
+        if: github.event_name == 'pull_request'
+        working-directory: build-a
+        run: |
+          python3 scripts/ci/write_epic_candidate_images.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --tested-sha "${GITHUB_SHA}" \
+            --tree-sha "$(git rev-parse 'HEAD^{tree}')" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --batch "${{ steps.tag.outputs.batch }}" \
+            --output-dir "${RUNNER_TEMP}/epic-candidate-images" \
+            --image "scheduler=lingxi-scheduler:build-a" \
+            --image "migrate=lingxi-migrate:build-a" \
+            --image "gateway=lingxi-gateway:build-a" \
+            --image "worker=lingxi-worker:build-a"
+
+      # 上传前自校验：manifest 与四个 tar 的 sha256/大小/服务集合必须彼此一致，
+      # 否则宁可让 job 红，也不上传一份看起来齐全、实际对不上的候选包。
+      - name: 自校验候选镜像包结构（Issue #150）
+        if: github.event_name == 'pull_request'
+        working-directory: build-a
+        run: |
+          python3 scripts/ci/verify_epic_candidate_bundle.py \
+            "${RUNNER_TEMP}/epic-candidate-images" \
+            --expect-repository "${GITHUB_REPOSITORY}" \
+            --expect-pr-number "${{ github.event.pull_request.number }}" \
+            --expect-head-sha "${{ github.event.pull_request.head.sha }}" \
+            --expect-tree-sha "$(git rev-parse 'HEAD^{tree}')" \
+            --expect-run-id "${GITHUB_RUN_ID}"
+
+      # 命名与 epic-candidate-pr-* 并列但不同名：那份 artifact 只装 candidate.json，
+      # Main Publish 的 verify_epic_candidate.py 断言其文件列表恰好是 ["candidate.json"]，
+      # 混进 tar 会直接破坏合并后的候选回读。四镜像候选必须是独立的 artifact。
+      # 保存期 14 天，与 publish.yml「降级留证：上传镜像 tar」一致——同类产物同一保存期，
+      # 不为 PR 候选单独定一个更长的期限。
+      - name: 留存候选镜像 artifact（Issue #150）
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epic-candidate-images-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/epic-candidate-images
+          if-no-files-found: error
+          retention-days: 14
+
       # 断言 V-部署-05 的本地演法（编排者裁定①）：真库升到 head，追加一条合成的
       # 前滚迁移，再用**迁移前构建的镜像**启动 scheduler 跑完一轮并优雅退出。
       - name: 旧镜像在新库结构上启动（V-部署-05）

@@ -345,6 +345,13 @@ class PublishJobGuardTest(unittest.TestCase):
             strategy:
               matrix:
                 extra: [scheduler, worker, gateway, bot-test, migrate]
+          image:
+            steps:
+              - run: python3 scripts/ci/write_epic_candidate_images.py
+              - run: python3 scripts/ci/verify_epic_candidate_bundle.py
+              - uses: actions/upload-artifact@sha
+                with:
+                  name: epic-candidate-images-pr-1-abc
           candidate:
             needs: [classify, docs, gate, extras, image]
             steps:
@@ -436,6 +443,34 @@ class PublishJobGuardTest(unittest.TestCase):
         )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("candidate needs" in failure for failure in failures), failures)
+
+    def test_missing_image_job_is_caught(self) -> None:
+        """Issue #150：没有 image job 就没有 PR 候选四镜像 artifact，必须明确报错。"""
+
+        full = self.FULL.replace(
+            """
+          image:
+            steps:
+              - run: python3 scripts/ci/write_epic_candidate_images.py
+              - run: python3 scripts/ci/verify_epic_candidate_bundle.py
+              - uses: actions/upload-artifact@sha
+                with:
+                  name: epic-candidate-images-pr-1-abc""",
+            "",
+        )
+        failures = self._with_workflows(full=full)
+        self.assertTrue(any("缺少 image job" in failure for failure in failures), failures)
+
+    def test_image_job_missing_export_script_is_caught(self) -> None:
+        """image job 存在但漏掉导出/自校验/上传其中一步，同样要挡住（Issue #150）。"""
+
+        full = self.FULL.replace(
+            "- run: python3 scripts/ci/write_epic_candidate_images.py\n              ", ""
+        )
+        failures = self._with_workflows(full=full)
+        self.assertTrue(
+            any("write_epic_candidate_images.py" in failure for failure in failures), failures
+        )
 
 
 class RealWorkflowTest(unittest.TestCase):
