@@ -215,6 +215,9 @@ class WorkerService:
         final_text = turn.get("final_text") if isinstance(turn, Mapping) else ""
         final_text = final_text if isinstance(final_text, str) else ""
 
+        output_safety = turn.get("output_safety") if isinstance(turn, Mapping) else None
+        withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
+
         if stop_requested or failure_code == "interrupted":
             status = "stopped"
             error_kind = "stopped"
@@ -224,6 +227,14 @@ class WorkerService:
                 else self._catalog.text("worker.stopped")
             )
             self._deliver_failure(delivery, content)
+        elif withheld:
+            # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
+            # succeeded——用户没有拿到结果。status 沿用既有取值域（不新增数据库
+            # 迁移），用独立的 error_kind 承载"redacted_withheld"这个可查询终态，
+            # 与"failed"下其余原因码同一模式（见 task.error_kind 无 CHECK 约束）。
+            status = "failed"
+            error_kind = "redacted_withheld"
+            self._deliver_failure(delivery, self._catalog.text("worker.redacted_withheld"))
         elif bool(turn.get("closed")) and not failure:
             status = "succeeded"
             error_kind = None

@@ -352,6 +352,119 @@ class SingleTurnSessionTest(_StubSDK):
         self.assertEqual(getattr(self.calls["clients"][0], "resume"), "session-old")
         self.assertEqual(seen[-1]["session_id"], "session-new")
 
+    def test_business_duration_callback_fires_once_before_drain(self) -> None:
+        """#143：业务耗时在收尾之前单独测得一次，不与总耗时混在一起。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [StubAssistantMessage([StubTextBlock("日活 1024。")]), StubResultMessage()]
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        ticks = iter((100.0, 101.2, 101.25))
+        durations: list[float] = []
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=lambda event: None,
+                timeout_seconds=30,
+                clock=lambda: next(ticks),
+                on_business_duration=durations.append,
+            )
+        )
+
+        self.assertEqual(len(durations), 1)
+        self.assertAlmostEqual(durations[0], 1.2, places=9)
+
+    def test_drain_grace_is_independent_and_bounded_from_the_business_budget(self) -> None:
+        """#143：收尾宽限独立且有界——业务阶段早已完成，收尾自己挂起时必须在
+        它自己的宽限内失败，而不是被业务墙钟提前判定、也不是永久挂起。"""
+
+        from lingxi.adapters.claude_agent_session import (
+            DrainTimeoutError,
+            build_agent_options,
+            run_single_turn,
+        )
+
+        self.messages = [StubAssistantMessage([StubTextBlock("日活 1024。")]), StubResultMessage()]
+        module = sys.modules["claude_agent_sdk"]
+
+        class HangingDrainClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def __aexit__(self, *exc_info):
+                await asyncio.sleep(3600)
+                return await super().__aexit__(*exc_info)
+
+        module.ClaudeSDKClient = HangingDrainClient
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+
+        with self.assertRaises(DrainTimeoutError):
+            asyncio.run(
+                run_single_turn(
+                    options=options,
+                    prompt="问题",
+                    sink=lambda event: None,
+                    timeout_seconds=30,
+                    drain_grace_seconds=0.01,
+                )
+            )
+
+    def test_business_timeout_still_drains_within_its_own_grace(self) -> None:
+        """业务阶段超时不得连带跳过收尾：__aexit__ 必须仍然被调用一次。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        module = sys.modules["claude_agent_sdk"]
+
+        class HangingBusinessClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            def receive_response(self):
+                async def _gen():
+                    await asyncio.sleep(3600)
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        module.ClaudeSDKClient = HangingBusinessClient
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                run_single_turn(
+                    options=options,
+                    prompt="问题",
+                    sink=lambda event: None,
+                    timeout_seconds=0.01,
+                )
+            )
+
+        self.assertEqual(self.calls["closed"], 1)
+
+    def test_aenter_failure_does_not_call_aexit(self) -> None:
+        """建连本身失败（entered 仍为 False）时不得调用 __aexit__——与
+        ``async with`` 的真实协议一致，避免对一个没建成的客户端做收尾。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        module = sys.modules["claude_agent_sdk"]
+
+        class FailingEnterClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def __aenter__(self):
+                raise RuntimeError("连接失败")
+
+        module.ClaudeSDKClient = FailingEnterClient
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                run_single_turn(
+                    options=options,
+                    prompt="问题",
+                    sink=lambda event: None,
+                    timeout_seconds=30,
+                )
+            )
+
+        self.assertEqual(self.calls["closed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

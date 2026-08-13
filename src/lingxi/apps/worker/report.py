@@ -11,6 +11,15 @@
 收紧的代价写在这里，不藏着：含数字的 16+ 字符未知工具名会被投影成长度，可读性
 让位于凭据不外泄。**白名单内的工具名不过这道**——它们是我们自己配的，形态已知，
 抹掉只会让正常审计难读。
+
+**输出安全的诚实终态**（[#141](https://github.com/Moshuiwang/lingxi/issues/141)、
+[#149](https://github.com/Moshuiwang/lingxi/issues/149)）：``output_safety.withheld``
+为真时（整段正文因无法安全展示而被拒发），本层把用户可见的 ``turn.user_result``
+改写为独立、可查询的 ``redacted_withheld``，不再沿用审计侧按工具调用结果算出的
+``obtained``——那个值只回答"工具调用有没有成功"，回答不了"用户有没有拿到内容"，
+两者一旦分岔（例如一次正常查询成功、但最终正文因安全策略整段拒发），继续展示
+``obtained`` 就是产品合同明令禁止的"伪装成功"。原始的工具调用分类改名保留在
+``audit.tool_call_result``，不丢失、只是不再冒充"用户结果"。
 """
 
 from __future__ import annotations
@@ -21,7 +30,10 @@ from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.input_safety import constrain_output
 
-_GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled"})
+_GUARD_FAILURE_CODES = frozenset({"max_turns_exceeded", "turn_timeout", "cancelled", "drain_timeout"})
+# 独立、可查询的安全拒发终态；命名与 #141/#149 产品决定一致，"最终命名可由实现
+# 保持同义"——这里就是那个约定名字，运营/审计据此过滤，不猜测某个字符串巧合。
+REDACTED_WITHHELD_RESULT = "redacted_withheld"
 
 
 def build_report(
@@ -36,12 +48,22 @@ def build_report(
     failure: Mapping[str, str] | None = None,
     external_texts: Iterable[str] = (),
     system_prompt: str | None = None,
+    business_execution_budget_seconds: float | None = None,
+    business_duration_seconds: float | None = None,
+    drain_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
 
     ``closed`` 同时要求两件事：审计侧恰好一次终止结果（来自 ``Stop`` hook）与消息流
     侧恰好一条 ``ResultMessage``。两个来源分开计数、都要成立——把它们并成一个数字，
     "hook 没触发"就会被"消息流正常"掩盖，而那正是屏障失效的样子。
+
+    耗时口径（#143，产品负责人 2026-08-13 拍板）：``business_execution_budget_seconds``
+    是配置的业务执行预算，不是端到端总耗时的承诺；``business_duration_seconds`` /
+    ``drain_duration_seconds`` 是分别测得的业务执行与收尾耗时（收尾宽限独立、有
+    界，不因预算耗尽被截断）；``duration_seconds`` 是实际总耗时——用户如果看到
+    耗时，看到的必须是这一个，不是配置值。三个新字段由调用方按需提供，缺省时
+    保持未知（``None``），不构造数据。
     """
 
     allowed_tool_names = tuple(allowed_tools)
@@ -80,12 +102,23 @@ def build_report(
     termination_state = "guarded" if guard_triggered else (
         "completed" if effective_failure is None else "failed"
     )
-    result_delivery = "confirmed" if summary.user_result.value == "obtained" else "not_confirmed"
+    # 用户是否拿到了结果，必须同时满足"工具调用确认成功"与"最终正文没有因为
+    # 安全策略被整段拒发"——只看前者正是 #141 描述的"内部记 obtained，用户拿到
+    # 兜底文案"那个缺陷。withheld 时改写为独立终态，不伪装成功（合同第 2 条）。
+    effective_user_result = (
+        REDACTED_WITHHELD_RESULT if output_safety.withheld else summary.user_result.value
+    )
+    result_delivery = (
+        "confirmed" if effective_user_result == "obtained" else "not_confirmed"
+    )
     usage = stream.usage_summary
     resources = {
         "agent_turns": stream.agent_turns,
         "agent_turns_status": "known" if stream.agent_turns is not None else "unknown",
         "duration_seconds": duration_seconds,
+        "business_execution_budget_seconds": business_execution_budget_seconds,
+        "business_duration_seconds": business_duration_seconds,
+        "drain_duration_seconds": drain_duration_seconds,
         "tool_call_count": len(calls),
         "executed_tool_call_count": sum(1 for call in summary.calls if call.executed),
         "usage": usage,
@@ -109,10 +142,11 @@ def build_report(
             "final_text": redacted_text,
             "output_safety": {
                 "blocked": output_safety.blocked,
+                "withheld": output_safety.withheld,
                 "reasons": output_safety.reasons,
             },
             "final_text_bytes": summary.final_text_bytes,
-            "user_result": summary.user_result.value,
+            "user_result": effective_user_result,
             "terminal_result_count": summary.terminal_result_count,
             "sdk_result_message_count": stream.result_message_count,
             "sdk_result_is_error": stream.result_is_error,
@@ -130,6 +164,9 @@ def build_report(
             "denied_count": len(summary.denied_calls),
             "failed_count": len(summary.failed_calls),
             "ungated_count": len(summary.ungated_calls),
+            # 工具调用本身的分类结论（不受出口安全策略影响）；用户实际拿到了
+            # 什么必须看 turn.user_result，两者一旦分岔以后者为准（见文件头）。
+            "tool_call_result": summary.user_result.value,
             "tool_result_count": stream.tool_result_count,
             "termination_reason": termination_reason,
             "guard_triggered": guard_triggered,

@@ -781,6 +781,8 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(recorded["note"], {"omitted": True})
 
     def test_resource_defaults_and_custom_values_are_configurable(self) -> None:
+        from lingxi.apps.worker.config import DEFAULT_DRAIN_GRACE_SECONDS
+
         config = self._load(
             LINGXI_WORKER_MAX_TURNS="7",
             LINGXI_WORKER_TURN_TIMEOUT_SECONDS="12.5",
@@ -788,6 +790,11 @@ class WorkerConfigTest(unittest.TestCase):
 
         self.assertEqual(config.max_turns, 7)
         self.assertEqual(config.turn_timeout_seconds, 12.5)
+        # #143：收尾宽限独立配置，未显式设置时落到自己的默认值，不借用业务预算。
+        self.assertEqual(config.drain_grace_seconds, DEFAULT_DRAIN_GRACE_SECONDS)
+
+        custom = self._load(LINGXI_WORKER_DRAIN_GRACE_SECONDS="5")
+        self.assertEqual(custom.drain_grace_seconds, 5.0)
 
     def test_resource_values_beyond_hard_limits_fail_at_startup(self) -> None:
         from lingxi.apps.worker.config import WorkerConfigError
@@ -795,8 +802,10 @@ class WorkerConfigTest(unittest.TestCase):
         for name, value in (
             ("LINGXI_WORKER_MAX_TURNS", "31"),
             ("LINGXI_WORKER_TURN_TIMEOUT_SECONDS", "900.1"),
+            ("LINGXI_WORKER_DRAIN_GRACE_SECONDS", "120.1"),
+            ("LINGXI_WORKER_DRAIN_GRACE_SECONDS", "0"),
         ):
-            with self.subTest(name=name):
+            with self.subTest(name=name, value=value):
                 with self.assertRaises(WorkerConfigError):
                     self._load(**{name: value})
 
@@ -896,7 +905,12 @@ class WorkerResourceGuardTest(unittest.TestCase):
         self.assertEqual(report["audit"]["termination_reason"], "max_turns_exceeded")
 
     def test_v_hulan_04_resource_counters_match_injected_execution(self) -> None:
-        ticks = iter((100.0, 101.25))
+        from lingxi.apps.worker.config import DEFAULT_TURN_TIMEOUT_SECONDS
+
+        # 四次取值对应 turn.py 的 started_at、适配器的 business_start、业务阶段
+        # 结束、turn.py 的收口耗时；business_duration=1.2，drain_duration=0.05，
+        # 二者相加等于沿用已久的 duration_seconds=1.25（#143：三者分开记录）。
+        ticks = iter((100.0, 100.0, 101.2, 101.25))
         report, _, _ = self._run_with_sdk(
             [
                 {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
@@ -913,6 +927,9 @@ class WorkerResourceGuardTest(unittest.TestCase):
         self.assertEqual(resources["duration_seconds"], 1.25)
         self.assertEqual(resources["tool_call_count"], 2)
         self.assertEqual(resources["executed_tool_call_count"], 1)
+        self.assertAlmostEqual(resources["business_duration_seconds"], 1.2, places=9)
+        self.assertAlmostEqual(resources["drain_duration_seconds"], 0.05, places=9)
+        self.assertEqual(resources["business_execution_budget_seconds"], DEFAULT_TURN_TIMEOUT_SECONDS)
 
     def test_v_hulan_04_missing_num_turns_is_unknown_not_zero(self) -> None:
         """ResultMessage 没有 num_turns 时必须保留未知，不能用 0 填洞。"""

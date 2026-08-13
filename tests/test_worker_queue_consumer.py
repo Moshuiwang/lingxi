@@ -393,6 +393,42 @@ class WorkerServiceTests(unittest.TestCase):
                 expected_error = "stopped" if stopped else "running_timeout"
                 self.assertEqual(queue.finished[0]["error_kind"], expected_error)
 
+    def test_withheld_output_is_never_marked_succeeded(self) -> None:
+        """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得记
+        succeeded、不得走 delivery.complete()——用户没有拿到结果，必须走独立、
+        可查询的 redacted_withheld 终态。改坏这条路由（例如去掉 withheld 判断）
+        必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+        delivery = RecordingDelivery()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            delivery_factory=lambda context, marker: delivery,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(queue.finished[0]["status"], "failed")
+        self.assertEqual(queue.finished[0]["error_kind"], "redacted_withheld")
+        self.assertNotEqual(queue.finished[0]["status"], "succeeded")
+        self.assertEqual(delivery.events[-1], ("fail", "worker.redacted_withheld"))
+        self.assertFalse(any(event[0] == "complete" for event in delivery.events))
+
 
 @unittest.skipUnless(DSN, SKIP_DB)
 class RealQueueTerminalTests(unittest.TestCase):

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import sys
+import time
 
 from typing import Any, Callable, Iterable, Mapping
 
@@ -20,9 +22,20 @@ from lingxi.core.execution.hooks import ToolGateway
 
 from .claude_agent_hooks import build_hook_matchers
 
+DEFAULT_DRAIN_GRACE_SECONDS = 30.0
+
 
 class AgentSessionInterrupted(Exception):
     """worker 收到 /stop 后要求 SDK 尽快中断当前回合。"""
+
+
+class DrainTimeoutError(Exception):
+    """会话收尾（``ClaudeSDKClient.__aexit__``）超过独立宽限（#143）。
+
+    收尾宽限与业务执行预算彼此独立、各自有界：业务墙钟超时不得连带截断收尾——
+    终态接收、用量回收要在自己的时间窗里跑完。这个异常只在收尾本身也挂起时才
+    触发，是"宁可多等一段有界时间，也不静默丢终态"的最后一道保护，不是常态。
+    """
 
 # 依赖到的 SDK 类型名。集中列出，便于真实 SDK 冒烟一次性核对它们是否还在。
 MESSAGE_TYPE_NAMES: tuple[str, ...] = (
@@ -105,17 +118,26 @@ async def run_single_turn(
     timeout_seconds: float,
     resume_session_id: str | None = None,
     stop_event: asyncio.Event | None = None,
+    drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS,
+    clock: Callable[[], float] | None = None,
+    on_business_duration: Callable[[float], None] | None = None,
 ) -> None:
     """跑**一个**回合：建会话、发一次提问、把消息流规范化后交给 ``sink``。
 
     用 ``ClaudeSDKClient``（流式会话）而不是一次性的 ``query()``：hook 回调走的是
     控制协议，只有流式会话才谈得上"屏障在生效"。
+
+    耗时口径（#143）：``timeout_seconds`` 只盖住"建连 + 发问 + 收流"这段业务
+    执行，是业务执行预算，不是端到端总耗时的承诺；``client.__aexit__``（收尾：
+    断开连接、终态接收、用量回收）用**独立、有界**的 ``drain_grace_seconds``，
+    不共用业务墙钟，也不因业务阶段已经超时而被连带截断——真实链路已经观测到
+    收尾本身有固定开销（约 6 秒），把它算进业务墙钟只会让配置值失去意义。
+    ``on_business_duration`` 在业务阶段结束时收到一次耗时（不含收尾），供调用方
+    与自己测得的总耗时相减得到收尾耗时；不提供时不影响任何行为。
     """
 
     from claude_agent_sdk import ClaudeSDKClient
 
-    # 墙钟上限盖住整个回合：SDK 传输保持连接却不发终止消息时，
-    # receive_response() 的迭代器不会自行结束（Codex 复查发现）。
     session_options = options
     if resume_session_id:
         # SDK options 是 dataclass；测试桩未必是 dataclass，所以保留一个不改变原对象的
@@ -128,35 +150,60 @@ async def run_single_turn(
             session_options = copy.copy(options)
             setattr(session_options, "resume", resume_session_id)
 
-    async with asyncio.timeout(timeout_seconds):
-        async with ClaudeSDKClient(options=session_options) as client:
-            interrupted = asyncio.Event()
+    measure = clock or time.monotonic
+    business_start = measure()
+    client = ClaudeSDKClient(options=session_options)
+    entered = False
+    try:
+        # 业务墙钟上限盖住"建连 + 发问 + 收流"：SDK 传输保持连接却不发终止
+        # 消息时，receive_response() 的迭代器不会自行结束（Codex 复查发现）。
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await client.__aenter__()
+                entered = True
+                interrupted = asyncio.Event()
 
-            async def interrupt_when_requested() -> None:
-                if stop_event is None:
-                    return
-                await stop_event.wait()
-                interrupt = getattr(client, "interrupt", None)
-                if callable(interrupt):
-                    result = interrupt()
-                    if hasattr(result, "__await__"):
-                        await result
-                interrupted.set()
+                async def interrupt_when_requested() -> None:
+                    if stop_event is None:
+                        return
+                    await stop_event.wait()
+                    interrupt = getattr(client, "interrupt", None)
+                    if callable(interrupt):
+                        result = interrupt()
+                        if hasattr(result, "__await__"):
+                            await result
+                    interrupted.set()
 
-            monitor = asyncio.create_task(interrupt_when_requested())
-            try:
-                await client.query(prompt)
-                async for message in client.receive_response():
-                    for event in normalize_message(message):
-                        sink(event)
-                    if interrupted.is_set():
-                        raise AgentSessionInterrupted()
-            finally:
-                monitor.cancel()
+                monitor = asyncio.create_task(interrupt_when_requested())
                 try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+                    await client.query(prompt)
+                    async for message in client.receive_response():
+                        for event in normalize_message(message):
+                            sink(event)
+                        if interrupted.is_set():
+                            raise AgentSessionInterrupted()
+                finally:
+                    monitor.cancel()
+                    try:
+                        await monitor
+                    except asyncio.CancelledError:
+                        pass
+        finally:
+            if on_business_duration is not None:
+                on_business_duration(max(0.0, measure() - business_start))
+    finally:
+        if entered:
+            # 把当前正在传播的异常（如果有）原样转给 __aexit__，与 ``async with``
+            # 的真实协议一致；本层不解读它的返回值是否要求"吞掉"该异常——现实
+            # 中的 SDK 客户端不会这样做，真的这样做由 L4a 暴露。
+            exc_type, exc_val, exc_tb = sys.exc_info()
+            try:
+                async with asyncio.timeout(drain_grace_seconds):
+                    await client.__aexit__(exc_type, exc_val, exc_tb)
+            except TimeoutError:
+                raise DrainTimeoutError(
+                    f"会话收尾超过独立宽限 {drain_grace_seconds:g} 秒"
+                ) from None
 
 
 def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:
