@@ -73,6 +73,11 @@ class WorkerConfig:
     queue_max_wait_seconds: float = 180.0
     worker_version_unavailable_seconds: float = 180.0
     running_heartbeat_timeout_seconds: float = 90.0
+    # 待投递、失败或送达状态不明的投递终态最长保留时间（Issue #151 状态合同第 8
+    # 条）：自 terminal 事件写入起最长 24 小时未确认 platform_received 即到期，
+    # 强制收敛为 delivery_expired 并释放话题。开放配置只为测试用更短窗口验证到点
+    # 行为，正式部署固定 24 小时。
+    delivery_expiry_seconds: float = 86400.0
     heartbeat_interval_seconds: float = 30.0
     stop_poll_interval_seconds: float = 1.0
     poll_interval_seconds: float = 2.0
@@ -113,6 +118,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         running_heartbeat_timeout_seconds=_duration(
             env, "RUNNING_HEARTBEAT_TIMEOUT_SECONDS", 90.0
         ),
+        delivery_expiry_seconds=_duration(env, "DELIVERY_EXPIRY_SECONDS", 86400.0),
         heartbeat_interval_seconds=_duration(env, "HEARTBEAT_INTERVAL_SECONDS", 30.0),
         stop_poll_interval_seconds=_duration(env, "STOP_POLL_INTERVAL_SECONDS", 1.0),
         poll_interval_seconds=_duration(env, "POLL_INTERVAL_SECONDS", 2.0),

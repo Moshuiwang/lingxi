@@ -61,6 +61,10 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
     "lingxi.core.execution.card_stream",
+    # 投递事件 outbox 的纯领域逻辑（Issue #151）：终态分类与解析规则，
+    # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+    "lingxi.core.delivery",
+    "lingxi.core.delivery.ports",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -97,7 +101,6 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
-    "lingxi.apps.worker.delivery",
     "lingxi.apps.worker.service",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
@@ -239,7 +242,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
-            "lingxi.apps.worker.delivery",
             "lingxi.apps.worker.service",
             "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
@@ -254,9 +256,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # 投递事件 outbox 的纯领域逻辑（Issue #151），由
+            # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
             "lingxi.core.execution",
             "lingxi.core.execution.audit",
-            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
@@ -288,6 +293,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
+            # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
+            # 终态解析规则，即便本批 gateway 尚未消费 outbox。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
             "lingxi.core.ids",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
