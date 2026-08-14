@@ -170,6 +170,73 @@ class DbTimeoutGateTest(unittest.TestCase):
 
         self.assertTrue(any("bad_store.py:3" in failure for failure in failures))
 
+    def test_from_psycopg_connection_import_and_class_connect_is_rejected(self) -> None:
+        """Issue #116：`from psycopg.connection import Connection` 的 module 是
+        `psycopg.connection`，随后 `Connection.connect(dsn)` 也是裸建连——两处都必须
+        变红，不能只靠 import 那一行报错就当作覆盖到位。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "lingxi"
+            (source / "adapters").mkdir(parents=True)
+            (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
+            bad = source / "adapters" / "bad_store.py"
+            bad.write_text(
+                "from psycopg.connection import Connection\n\n"
+                "def open_store(dsn):\n"
+                "    return Connection.connect(dsn)\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK.check_runtime_connections(source)
+
+        self.assertTrue(failures)
+        self.assertTrue(any("bad_store.py:1" in failure and "直接从 psycopg 导入" in failure for failure in failures))
+        self.assertTrue(any("bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure for failure in failures))
+
+    def test_import_psycopg_connection_submodule_and_connect_is_rejected(self) -> None:
+        """`import psycopg.connection` 的 `name` 是 `psycopg.connection`，非字面量
+        `"psycopg"`；绑定的本地名字仍是顶层 `psycopg`，随后 `psycopg.connect(dsn)`
+        同样是裸建连，两处都必须变红（Issue #116）。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "lingxi"
+            (source / "adapters").mkdir(parents=True)
+            (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
+            bad = source / "adapters" / "bad_store.py"
+            bad.write_text(
+                "import psycopg.connection\n\n"
+                "def open_store(dsn):\n"
+                "    return psycopg.connect(dsn)\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK.check_runtime_connections(source)
+
+        self.assertTrue(failures)
+        self.assertTrue(any("bad_store.py:1" in failure and "直接导入 psycopg" in failure for failure in failures))
+        self.assertTrue(any("bad_store.py:4" in failure and "裸 PostgreSQL 连接" in failure for failure in failures))
+
+    def test_unrelated_psycopg_submodule_import_is_not_flagged(self) -> None:
+        """`psycopg.types.json` 等与建连无关的子模块不应被这条门禁误杀——
+        `adapters/galaxy_import.py`、`adapters/postgres_identity.py` 已经在用
+        `from psycopg.types.json import Json/Jsonb`（Issue #116 加固前的真实用法）。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "lingxi"
+            (source / "adapters").mkdir(parents=True)
+            (source / "adapters" / "postgres.py").write_text("# 工厂占位\n", encoding="utf-8")
+            fine = source / "adapters" / "fine_store.py"
+            fine.write_text(
+                "from psycopg.types.json import Json\n\n"
+                "def wrap(value):\n"
+                "    return Json(value)\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK.check_runtime_connections(source)
+
+        self.assertEqual(failures, [])
+
 
 class MigrationTimeoutConfigTest(unittest.TestCase):
     def test_migration_has_an_explicit_finite_exception_configuration(self) -> None:

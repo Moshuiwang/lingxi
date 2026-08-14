@@ -25,6 +25,7 @@ version = "2026-08-08"
 "worker.failed" = "本次任务未取得可用结果，请稍后重试。"
 "worker.side_effect_uncertain" = "任务结果未能确认，未自动重试，请稍后重试。"
 "worker.context_too_long" = "当前对话过长，请使用 `/new` 开始新会话"
+"worker.redacted_withheld" = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果；如有需要请联系管理员，系统不会自动重试。"
 
 "roster.report_title" = "花名册每日资料比对"
 "roster.header" = "{title} {report_date}"
