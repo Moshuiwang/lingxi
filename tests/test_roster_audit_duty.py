@@ -937,7 +937,9 @@ class DutyRegistrationTest(unittest.TestCase):
 
         loop = build_loop(self._config(), audit=audit)
 
-        self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理"])
+        self.assertEqual(
+            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+        )
         self.assertEqual(len(audit.records), 1, "缺群 ID 时审计恰 1 条")
         action, fields = audit.records[0]
         self.assertEqual(action, "roster_audit.duty_not_registered")
@@ -955,7 +957,9 @@ class DutyRegistrationTest(unittest.TestCase):
 
         loop = build_loop(self._config(LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID), audit=audit)
 
-        self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理"])
+        self.assertEqual(
+            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+        )
         self.assertEqual([action for action, _ in audit.records], ["roster_audit.duty_not_registered"])
         self.assertEqual(audit.records[0][1]["reason"], "roster_reader_unwired")
 
@@ -978,7 +982,10 @@ class DutyRegistrationTest(unittest.TestCase):
             audit=audit,
         )
 
-        self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "花名册审计日报"])
+        self.assertEqual(
+            [duty.name for duty in loop.duties],
+            ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
+        )
         self.assertEqual(audit.records, [], "前置齐备时不该有『未注册』审计")
         # 一个停止标志贯穿全部职责。
         loop.request_stop()

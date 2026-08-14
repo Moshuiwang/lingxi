@@ -40,7 +40,15 @@ Issue #151。数据库设计[「问数结果投递事件与会话保留 Outbox�
 "仅 INSERT" 高治理表名单里（那份名单目前只有 ``audit_event``/``chat_message``/
 ``inbound_event``），本迁移因此让 ``lingxi_app`` 按既有 ``task``/``conversation``
 同等权限直接读写它；升级到 ``lingxi_retention_owner`` 受限清理函数模式是可预见的
-后续加固项，不是本 Story 的完成标准（PR 描述中登记为已知留白）。
+后续加固项，不是本 Story 的完成标准（PR 描述中登记为已知留白）。**这条留白目前
+具体表现为：``task_delivery_event`` 的行没有任何物理删除路径**——现有清理方法
+只把 ``content`` 置 ``NULL``，``sequence``/``terminal_kind``/``error_kind`` 等
+低敏事实一旦写入就永久保留，不受九十天上限约束，也不在
+``adapters/retention.py`` 的清理函数或 ``RetentionCleanupDuty`` 覆盖范围内
+（内审 P3-4）。行删除需要先做治理决定（是否需要与 ``chat_message``/
+``audit_event`` 同等的 ``SECURITY DEFINER`` 受限清理函数，还是可以按
+``lingxi_app`` 直接 ``DELETE``），因此和升级到 ``lingxi_retention_owner`` 一并
+留给同一个后续加固 Story，不在本次修复里单独处理。
 
 ``downgrade()`` 真实可执行：``task_delivery_event`` 是本 revision 新建的表，直接
 整体删除；``task.status`` 的 CHECK 收窄回五个旧值——若届时仍有
@@ -119,9 +127,16 @@ CREATE TABLE task_delivery_event (
     CHECK (platform_message_id IS NULL OR platform_received_at IS NOT NULL)
 );
 
-CREATE INDEX task_delivery_event_task_idx ON task_delivery_event (task_id, sequence);
+-- 没有再建一条 (task_id, sequence) 索引：上面的 UNIQUE (task_id, sequence) 已经
+-- 自动带出同键同序的唯一索引，覆盖按 task_id 或 task_id+sequence 查询的全部
+-- 用法；单独再建一条完全同键的普通索引只会重复维护成本，不服务任何这条索引本身
+-- 才独有的查询（内审 P3-1）。
 
--- 二十四小时到期清理只关心"尚未送达的 terminal 行"；服务这一条查询的部分索引，
+-- 二十四小时到期清理只关心"尚未送达的 terminal 行"，且判定必须直接读这条
+-- expires_at 本身（触发器锁定的唯一事实来源），不能在应用层另算一个窗口
+-- （内审 P2-1：此前 expire_undelivered_terminals 读的是可配置的
+-- DELIVERY_EXPIRY_SECONDS 重新计算 created_at 的窗口，这张表的 expires_at 列
+-- 因此从未被任何查询读过）。这条部分索引服务的正是 P2-1 修复后的真实查询谓词，
 -- 不随已送达或非终态事件增长而退化。
 CREATE INDEX task_delivery_event_pending_expiry_idx
     ON task_delivery_event (expires_at)

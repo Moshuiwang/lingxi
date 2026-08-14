@@ -594,41 +594,6 @@ class PostgresTaskQueue:
                 agent_session_id=row[12],
             )
 
-    def terminal_context(self, *, task_id: str) -> TaskContext | None:
-        """终态通知使用的只读定位；不要求任务仍被某个 worker 持有。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT t.id, t.conversation_id, t.user_id, t.prompt,
-                       t.resumed_session, t.target_worker_version, t.attempts,
-                       t.reply_to_message_id, t.stop_requested, t.side_effect_state,
-                       c.feishu_chat_id, c.feishu_thread_id, c.agent_session_id
-                  FROM task AS t
-                  JOIN conversation AS c ON c.id = t.conversation_id
-                 WHERE t.id = %s AND t.status = 'failed'
-                """,
-                (task_id,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return TaskContext(
-                task_id=row[0],
-                conversation_id=row[1],
-                user_id=row[2],
-                prompt=row[3],
-                resumed_session=row[4],
-                target_worker_version=row[5],
-                attempts=row[6],
-                reply_to_message_id=row[7],
-                stop_requested=row[8],
-                side_effect_state=row[9],
-                chat_id=row[10],
-                thread_id=row[11],
-                agent_session_id=row[12],
-            )
-
     def reclaim_stale(
         self,
         *,
@@ -1022,6 +987,20 @@ class PostgresTaskQueue:
         业务终态完全来自写终态事件时记录的 ``terminal_kind``/``error_kind``——
         投递确认成功不改写业务结果（`V-投递-04`）：业务失败的任务在这里仍然收敛
         为 ``failed``，不会因为飞书接受了失败卡片就变成 ``succeeded``。
+
+        返回值只有两种合法含义：``True`` 表示三条写入（事件确认、任务收敛、
+        会话回写）已经**全部**提交；``False`` 表示第一步查询就没找到可确认的
+        东西（任务已经不在 ``awaiting_delivery``，或没有尚未确认的 terminal
+        事件）——这种情况下**没有任何写入发生**。``conversation`` 更新失败
+        （``running_task_id`` 与预期不符，通常意味着有其他路径已经在这中间改动
+        了这个话题）不会走到这两种含义里的任何一种：它是内部不变量被破坏，
+        与写终态事件时 ``task`` 行的 ``rowcount != 1`` 检查同一处理方式——整个
+        事务 ``raise`` 回滚，不悄悄提交前两步再返回一个和"什么都没确认到"
+        看起来一样的 ``False``。此前这里对 ``conversation`` 更新的失败只是
+        ``return cursor.rowcount == 1``，会在事件与任务都已提交之后，把
+        ``agent_session_id`` 静默丢弃、只留一个无法区分含义的 ``False``
+        （内审 P2-4，真库负向用例见
+        ``test_confirm_delivery_rolls_back_entirely_when_the_conversation_write_conflicts``）。
         """
 
         if platform_message_kind not in ("card", "text"):
@@ -1080,9 +1059,19 @@ class PostgresTaskQueue:
                     """,
                     (agent_session_id, conversation_id, task_id),
                 )
-                return cursor.rowcount == 1
+                if cursor.rowcount != 1:
+                    # 上面两条写入（事件确认、task 收敛）已经在这个事务里执行，
+                    # 但还没提交：整个 with 块以异常退出，psycopg 回滚整个事务，
+                    # 三条写入因此要么全部不生效。宁可响亮失败也不要悄悄丢弃
+                    # agent_session_id、或者用一个和"没有可确认的东西"含义相同
+                    # 的 False 掩盖"已经确认到一半"的竞态（内审 P2-4）。
+                    raise RuntimeError(
+                        f"任务 {task_id} 确认送达时 conversation {conversation_id} "
+                        "的话题占用状态发生了竞态"
+                    )
+                return True
 
-    def expire_undelivered_terminals(self, *, older_than: timedelta) -> list[TerminalTask]:
+    def expire_undelivered_terminals(self) -> list[TerminalTask]:
         """二十四小时到期仍未确认送达：强制收敛为 ``failed``/``delivery_expired``，
         释放话题，清空事件正文，只留低敏事实（状态合同第 8 条、`V-投递-06`）。
 
@@ -1090,8 +1079,17 @@ class PostgresTaskQueue:
         用户已取得结果，这是投递状态唯一允许改写业务结论的路径（`V-投递-04`
         的例外情形，在核心 :mod:`lingxi.core.delivery.ports` 中单独命名）。
 
-        ``older_than`` 由调用方（scheduler）固定传 24 小时；开放参数只是为了让
-        测试用更短窗口验证到点行为，不代表业务上存在另一个合法值。
+        判定直接读 ``task_delivery_event.expires_at`` 本身——那一列由迁移 0059
+        的触发器锁定为 ``created_at + 24 小时``、调用方写什么都会被覆盖，是这条
+        二十四小时上限唯一的真相来源。**不接受调用方传入的窗口参数**：早先这里
+        有一个 ``older_than`` 参数，由 ``WorkerConfig.delivery_expiry_seconds``
+        （环境变量 ``DELIVERY_EXPIRY_SECONDS``）注入，实际查询因此从来没有读过
+        ``expires_at`` 列本身，而是在应用层用这个可配置窗口重新计算
+        ``created_at < now() - 窗口``——一次环境变量改动就能把触发器锁定的上限
+        抬到任意长度，数据库完全不会阻止（内审 P2-1）。测试需要更短的等待窗口
+        时，直接构造一条 ``created_at`` 已经在过去的行（触发器只锁定
+        ``UPDATE`` 时的 ``created_at``，``INSERT`` 时调用方仍可以指定任意值），
+        不再通过参数放大或缩小 24 小时这个业务常量。
         """
 
         terminals: list[TerminalTask] = []
@@ -1106,11 +1104,10 @@ class PostgresTaskQueue:
                         ON e.task_id = t.id AND e.event_type = 'terminal'
                      WHERE t.status = 'awaiting_delivery'
                        AND e.platform_received_at IS NULL
-                       AND e.created_at < now() - %s::interval
+                       AND e.expires_at <= now()
                      ORDER BY e.created_at, t.id
                      FOR UPDATE OF t SKIP LOCKED
-                    """,
-                    (older_than,),
+                    """
                 )
                 rows = cursor.fetchall()
                 for task_id, conversation_id in rows:

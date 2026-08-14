@@ -116,11 +116,12 @@ class WorkerService:
         # 二十四小时到期仍未确认送达的投递终态：状态合同第 8 条、V-投递-06。
         # 这一步只强制收敛任务状态、释放话题并清空事件正文；把清理结果对外展现
         # 为"投递已过期，请重新提问"仍是 Gateway（下一次用户主动消息触发）的职责。
+        # 二十四小时上限不接受这里传参：它由迁移 0059 的触发器锁定在
+        # task_delivery_event.expires_at 列上，调用方不再持有另一份可以让它
+        # 漂移的窗口配置（内审 P2-1）。
         expire_undelivered = getattr(self._queue, "expire_undelivered_terminals", None)
         if expire_undelivered is not None:
-            expired = expire_undelivered(
-                older_than=timedelta(seconds=self._config.delivery_expiry_seconds)
-            )
+            expired = expire_undelivered()
             terminals.extend(expired)
             self._report_task_stuck("delivery_expired", len(expired))
         return terminals

@@ -357,6 +357,45 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             self.scalar("SELECT platform_message_id FROM task_delivery_event WHERE task_id='tsk-1'"), "c1"
         )
 
+    def test_confirm_delivery_rolls_back_entirely_when_the_conversation_write_conflicts(self) -> None:
+        """内审 P2-4：``conversation.running_task_id`` 与任务不一致（竞态或状态
+        损坏）时，事件确认与任务收敛这两步已经在同一事务里执行、尚未提交——修复
+        前它们会照常提交，只有 conversation 回写悄悄失败并返回一个和"没有可确认
+        的东西"含义相同的 ``False``，``agent_session_id`` 被静默丢弃。修复后必须
+        ``raise`` 并让整个事务回滚：三条写入要么全部生效，要么全部不生效。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="答案正文", agent_session_id="sess-9",
+        )
+        # 模拟竞态：conversation 已经不再指向这个任务了（例如被别的路径改动）。
+        self.execute("UPDATE conversation SET running_task_id='tsk-other' WHERE id='cnv-1'")
+
+        with self.assertRaises(RuntimeError):
+            self.queue.confirm_delivery(
+                task_id="tsk-1", platform_message_kind="card", platform_message_id="om-1",
+            )
+
+        # 整个确认事务必须整体回滚：task 与 event 都不能推进到"已确认"，
+        # 不能出现"业务已提交、会话回写却丢了"的半条状态。
+        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
+        self.assertIsNone(
+            self.scalar("SELECT platform_received_at FROM task_delivery_event WHERE task_id='tsk-1'")
+        )
+        self.assertIsNone(self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"))
+        # 重试（假设调用方在竞态解除后重试）仍然可以正常成功：这不是把任务卡死，
+        # 只是不允许静默的半提交。
+        self.execute("UPDATE conversation SET running_task_id='tsk-1' WHERE id='cnv-1'")
+        self.assertTrue(
+            self.queue.confirm_delivery(
+                task_id="tsk-1", platform_message_kind="card", platform_message_id="om-2",
+            )
+        )
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-9"
+        )
+
     def test_expire_undelivered_terminals_forces_delivery_expired_even_for_business_success(self) -> None:
         """V-投递-04/06：二十四小时到期是唯一允许覆盖业务结论的路径——即使原始
         业务结论是 success，到期也必须收敛为 failed/delivery_expired，不得把
@@ -367,7 +406,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             task_id="tsk-1", terminal_kind="success", content="答案",
             created_at_sql="now() - interval '25 hours'",
         )
-        expired = self.queue.expire_undelivered_terminals(older_than=timedelta(hours=24))
+        expired = self.queue.expire_undelivered_terminals()
         self.assertEqual([item.task_id for item in expired], ["tsk-1"])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
         self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired")
@@ -381,7 +420,7 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
     def test_expire_undelivered_terminals_ignores_not_yet_expired(self) -> None:
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1", status="awaiting_delivery")
         self.seed_terminal_event(task_id="tsk-1", created_at_sql="now()")
-        expired = self.queue.expire_undelivered_terminals(older_than=timedelta(hours=24))
+        expired = self.queue.expire_undelivered_terminals()
         self.assertEqual(expired, [])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "awaiting_delivery")
 
@@ -393,9 +432,57 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             platform_received=True,
         )
         self.execute("UPDATE task SET status='succeeded' WHERE id='tsk-1'")
-        expired = self.queue.expire_undelivered_terminals(older_than=timedelta(hours=24))
+        expired = self.queue.expire_undelivered_terminals()
         self.assertEqual(expired, [])
         self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "succeeded")
+
+    def test_expire_undelivered_terminals_is_governed_by_the_trigger_owned_expires_at_column(self) -> None:
+        """内审 P2-1：清理判定必须直接读触发器锁定的 ``expires_at`` 列本身，不能
+        在应用层按一个可配置窗口重新计算"是否过期"。这里构造一条 ``created_at``
+        仍是刚才、但 ``expires_at`` 被直接改到已过期的行——修复前的查询判据是
+        ``created_at < now() - 窗口``，这一行永远不会被判定过期（``created_at``
+        是刚才）；修复后的查询判据是 ``expires_at <= now()``，必须正确收敛它。
+
+        直接改 ``expires_at`` 前必须先关掉触发器：这本身就是证据——应用代码没有
+        任何合法路径能做到下面这一步，这里只是为了不真的等 24 小时来模拟"到期
+        时刻已到"。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1", status="awaiting_delivery")
+        self.seed_terminal_event(task_id="tsk-1", terminal_kind="success", content="答案")
+        self.execute("ALTER TABLE task_delivery_event DISABLE TRIGGER task_delivery_event_expiry")
+        self.execute(
+            "UPDATE task_delivery_event SET expires_at = now() - interval '1 minute' WHERE task_id = %s",
+            ("tsk-1",),
+        )
+        self.execute("ALTER TABLE task_delivery_event ENABLE TRIGGER task_delivery_event_expiry")
+
+        expired = self.queue.expire_undelivered_terminals()
+
+        self.assertEqual([item.task_id for item in expired], ["tsk-1"])
+        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-1'"), "failed")
+        self.assertEqual(self.scalar("SELECT error_kind FROM task WHERE id='tsk-1'"), "delivery_expired")
+
+    def test_append_delivery_event_accepts_safely_releasable_answer_with_content(self) -> None:
+        """机制级验证（内审 P3-3）：``safely_releasable_answer`` 是 ``terminal``
+        之外唯一允许携带正文的事件类型（``CONTENT_BEARING_EVENT_TYPES``），持久化
+        机制本身完整可用。Worker 当前的执行路径还没有产生这类事件的调用点——见
+        PR 正文「已知范围边界」，这条用例只证明底层机制不是"合同写了、实现里
+        连能不能插进去都没验证过"。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        appended = self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="safely_releasable_answer",
+            idempotency_key="tsk-1:a1:safely_releasable_answer:1", content="流式安全片段",
+        )
+        self.assertFalse(appended.duplicate)
+        self.assertEqual(
+            self.scalar(
+                "SELECT content FROM task_delivery_event WHERE idempotency_key=%s",
+                ("tsk-1:a1:safely_releasable_answer:1",),
+            ),
+            "流式安全片段",
+        )
 
 
 class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
@@ -523,7 +610,6 @@ class WorkerServiceHousekeepingIntegrationTests(DeliveryOutboxTestCase):
         config = WorkerConfig(
             question="", read_only_tool="mcp__q__read", trace_id="01J00000000000000000000000",
             turn_timeout_seconds=1.0, worker_id="worker-1", target_worker_version="stable",
-            delivery_expiry_seconds=24 * 3600.0,
         )
         service = WorkerService(config=config, queue=self.queue)
         asyncio.run(service.process_once())

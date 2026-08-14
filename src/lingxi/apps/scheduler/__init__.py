@@ -1,14 +1,17 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**三个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**四个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
 2. **九十天保留清理**（:class:`RetentionCleanupDuty`）——调用数据库里的受限清理
    函数回收到期内容（Issue #54 / S9）；
-3. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天比对一次
+3. **空闲会话到点清理**（:class:`IdleConversationSweepDuty`）——会话空闲满两小时
+   由 scheduler 周期扫描并主动清除已送达的投递正文，不依赖下一次任务入队
+   （Issue #151、2026-08-14 补充决定、`V-投递-10`）；
+4. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天比对一次
    已开通用户的花名册当前值与建档存档三字段，有差异就向管理群发一条脱敏日报
-   （Issue #52 / W4-B）。第三个职责是**条件注册**的，两个前置任缺其一就不注册：
+   （Issue #52 / W4-B）。第四个职责是**条件注册**的，两个前置任缺其一就不注册：
    群 ID 环境变量缺失（可选配置，见 :class:`SchedulerConfig`），或花名册读取传输
    未接线（真实读取的凭据与 Base ID 属 L4a 前置，登记为 R3）。不注册时进程照常
    启动、其余职责照常运行，并留下一条指名变量的审计（断言 ``V-花名册-29``）。
@@ -364,6 +367,51 @@ class RetentionCleanupDuty:
         else:
             logger.info("%s", rendered)
         return report
+
+
+class IdleConversationSweepDuty:
+    """会话空闲满两小时的到点清理职责：每轮调用一次
+    ``PostgresTaskQueue.sweep_idle_conversations``。
+
+    2026-08-14 补充决定（数据库设计「问数结果投递事件与会话保留 Outbox」、
+    `V-投递-10`）：会话空闲满两小时后，即使用户未再发起新的问数任务，已经送达
+    的安全结果正文也必须由定时清理机制主动清除，不依赖下一次任务入队。#151 落地
+    时只交付了应用层方法本身，没有接上任何生产调用方（内审 P2-2）；本职责补上
+    这一条调用点，写法与 :class:`RetentionCleanupDuty` 同型——每轮只清一次，
+    天然幂等，被打断只回滚这一批 ``UPDATE``，不留半清状态。
+    """
+
+    name = "空闲会话清理"
+
+    def __init__(
+        self, *, queue: Any, idle_after: timedelta, stop: threading.Event | None = None
+    ) -> None:
+        self._queue = queue
+        self._idle_after = idle_after
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> int | None:
+        """已经在停止中就一批都不领。返回 ``None`` 表示本轮未执行，否则返回本轮
+        清除了已送达正文的会话数（供日志/断言，不承载业务语义）。"""
+
+        if self._stop.is_set():
+            return None
+        cleared = self._queue.sweep_idle_conversations(idle_after=self._idle_after)
+        if cleared:
+            logger.info("空闲会话清理：本轮清除 %s 个会话的已送达投递正文", cleared)
+        return cleared
+
+
+#: 会话空闲清理的固定窗口（产品合同「数据保留与删除」、`V-投递-10`）：不设配置，
+#: 与 P2-1 修复同一取舍——业务常量不应该有一个能让它漂移的环境变量。
+IDLE_CONVERSATION_SWEEP_AFTER = timedelta(hours=2)
 
 
 class AuditSink(Protocol):
@@ -920,8 +968,9 @@ def build_loop(
     """装配进程的全部定时职责。
 
     职责顺序有意为之：凭据轮换在前。它处理的是一次性有效、有硬期限的凭据，
-    而清理晚一轮没有任何后果——到期行下一轮照删，到期时间不会因为清理迟到而后移
-    （断言 V-保留-16）。审计日报排在最后：它一天只做一次事，晚一轮毫无影响。
+    而两类清理晚一轮都没有任何后果——到期行/空闲会话下一轮照清，到期时间不会
+    因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报
+    排在最后：它一天只做一次事，晚一轮毫无影响。
 
     ``roster_page_reader`` 是花名册多维表格的分页读取传输
     （:class:`lingxi.adapters.feishu_roster_bitable.RecordPageReader`）。**默认 ``None``，
@@ -931,6 +980,7 @@ def build_loop(
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
+    from lingxi.adapters.postgres_conversation import PostgresTaskQueue
     from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS, PostgresRetentionCleaner
 
     # 一个停止标志贯穿所有职责：SIGTERM 只设它一次，全部职责同时停止领取新工作。
@@ -958,8 +1008,13 @@ def build_loop(
         cleaner=PostgresRetentionCleaner(config.postgres_dsn, timeouts=RETENTION_CLEANUP_TIMEOUTS),
         stop=stop,
     )
+    idle_sweep = IdleConversationSweepDuty(
+        queue=PostgresTaskQueue(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        idle_after=IDLE_CONVERSATION_SWEEP_AFTER,
+        stop=stop,
+    )
 
-    duties: list[Any] = [rotation, cleanup]
+    duties: list[Any] = [rotation, cleanup, idle_sweep]
     roster_audit = _build_roster_audit_duty(
         config,
         stop=stop,

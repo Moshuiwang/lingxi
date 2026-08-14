@@ -199,6 +199,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
             "lingxi.adapters.postgres",
+            # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
+            # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
+            # 包（`__init__.py` 一次性 re-export 四个子模块）与 `core.delivery`
+            # 一并拉进闭包，同样必须显式登记，理由与上面同一条注释。
+            "lingxi.adapters.postgres_conversation",
             "lingxi.core",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
@@ -207,6 +212,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_report",
             "lingxi.core.alerting",
             "lingxi.core.ids",
+            "lingxi.core.conversation",
+            "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.pipeline",
+            "lingxi.core.conversation.ports",
+            "lingxi.core.conversation.session_window",
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
         ),
         # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
         # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
