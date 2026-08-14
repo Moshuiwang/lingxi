@@ -14,12 +14,18 @@ import sys
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import unquote, urlsplit
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*]\(([^)\s]+)(?:\s+[^)]*)?\)")
-ATX_HEADING = re.compile(r"^(#{1,6})\s+(.+?)(?:\s+#+)?\s*$")
+# GFM 允许 ATX 标题行首有 0-3 个空格缩进（4 个及以上视为缩进代码块）。
+# 标题级别本身不参与后续逻辑，用非捕获组；捕获组 1 是标题文本。
+ATX_HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.+?)(?:\s+#+)?\s*$")
+# 标题里的行内链接/图片 `[文字](URL)` / `![alt](URL)`：GitHub 渲染后按
+# 纯文本生成锚点，URL 本身不进 slug，所以生成锚点前要先归约成显示文字。
+INLINE_LINK_OR_IMAGE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
 
 
 def tracked_markdown_files() -> list[Path]:
@@ -43,14 +49,35 @@ def tracked_markdown_files() -> list[Path]:
     return paths
 
 
+def iter_unfenced_lines(markdown_file: Path) -> Iterator[tuple[int, str]]:
+    """逐行产出 (行号, 行内容)，跳过 ``` / ~~~ 围栏代码块内的行。
+
+    `check_file` 与 `heading_anchors` 都要在扫描前排除围栏代码块，此前
+    两处各写了一遍围栏开关判断；抽成共用迭代器避免逻辑漂移。
+    """
+    in_fenced_code = False
+    for line_number, line in enumerate(
+        markdown_file.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            in_fenced_code = not in_fenced_code
+            continue
+        if in_fenced_code:
+            continue
+        yield line_number, line
+
+
 def slugify(heading_text: str) -> str:
     """按 GitHub 的标题转锚点规则生成 slug。
 
-    规则（据本仓库现有互相引用的锚点逐条核对得出）：整体转小写；
-    删除所有非字母、非数字、非空格、非连字符、非下划线的字符（标点、
-    符号一律整体删除，不留分隔符）；再把空格替换成连字符，不合并
-    连续的连字符。
+    规则（据本仓库现有互相引用的锚点逐条核对得出）：先把标题里的行内
+    链接/图片归约为其显示文字（GitHub 是先渲染成纯文本再生成锚点，
+    URL 本身不进 slug）；整体转小写；删除所有非字母、非数字、非空格、
+    非连字符、非下划线的字符（标点、符号一律整体删除，不留分隔符）；
+    再把空格替换成连字符，不合并连续的连字符。
     """
+    heading_text = INLINE_LINK_OR_IMAGE.sub(r"\1", heading_text)
     lowered = heading_text.lower()
     kept_chars = []
     for char in lowered:
@@ -65,27 +92,30 @@ def slugify(heading_text: str) -> str:
 
 @lru_cache(maxsize=None)
 def heading_anchors(markdown_file: Path) -> frozenset[str]:
-    """目标文件中全部标题按顺序生成的锚点集合（含重复标题的 -1/-2 后缀）。"""
+    """目标文件中全部标题按顺序生成的锚点集合（含重复标题的去重后缀）。
+
+    去重规则与 GitHub（github-slugger）一致：原始 slug 与派生出的
+    `-N` 后缀共用同一张“已产出锚点”登记表，逐个尝试 `-1`、`-2`……
+    直到撞不上为止。因此 `A`、`A`、`A-1` 三个标题依次得到
+    `a`、`a-1`、`a-1-1`；若只按基础 slug 计数会得到 `a`、`a-1`、`a-1`，
+    第三个标题的锚点会与第二个标题冲突。
+    """
     anchors = []
-    occurrences: dict[str, int] = {}
-    in_fenced_code = False
+    produced: set[str] = set()
 
-    for line in markdown_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith(("```", "~~~")):
-            in_fenced_code = not in_fenced_code
-            continue
-        if in_fenced_code:
-            continue
-
+    for _, line in iter_unfenced_lines(markdown_file):
         match = ATX_HEADING.match(line)
         if not match:
             continue
 
-        slug = slugify(match.group(2).strip())
-        seen_before = occurrences.get(slug, 0)
-        occurrences[slug] = seen_before + 1
-        anchors.append(f"{slug}-{seen_before}" if seen_before else slug)
+        base_slug = slugify(match.group(1).strip())
+        slug = base_slug
+        suffix = 1
+        while slug in produced:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        produced.add(slug)
+        anchors.append(slug)
 
     return frozenset(anchors)
 
@@ -108,18 +138,8 @@ def parse_local_link(link: str) -> tuple[str, str, str] | None:
 
 def check_file(markdown_file: Path) -> list[str]:
     errors = []
-    in_fenced_code = False
 
-    for line_number, line in enumerate(
-        markdown_file.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        stripped = line.lstrip()
-        if stripped.startswith(("```", "~~~")):
-            in_fenced_code = not in_fenced_code
-            continue
-        if in_fenced_code:
-            continue
-
+    for line_number, line in iter_unfenced_lines(markdown_file):
         for match in MARKDOWN_LINK.finditer(line):
             parsed = parse_local_link(match.group(1))
             if parsed is None:
