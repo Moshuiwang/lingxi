@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from lingxi.adapters.claude_agent_session import (
     AgentSessionInterrupted,
+    DrainTimeoutError,
     build_agent_options,
     run_single_turn,
 )
@@ -135,6 +136,10 @@ class WorkerTurnExecutor:
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
         started_at = self._clock()
+        # #143：业务耗时由适配器在业务阶段结束时回填一次；收尾耗时事后用
+        # "总耗时 - 业务耗时" 推得。适配器没有机会调用回调时（例如构造选项就
+        # 失败）保持未知，不能构造数据。
+        business_phase: dict[str, float] = {}
 
         def handle_event(event: Mapping[str, Any]) -> None:
             recorder.handle(event)
@@ -158,9 +163,19 @@ class WorkerTurnExecutor:
                     timeout_seconds=self._config.turn_timeout_seconds,
                     resume_session_id=resume_session_id,
                     stop_event=stop_event,
+                    drain_grace_seconds=self._config.drain_grace_seconds,
+                    clock=self._clock,
+                    on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
                 )
         except AgentSessionInterrupted as error:
             failure = _failure("interrupted", error)
+        except DrainTimeoutError as error:
+            # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
+            # 成 turn_timeout（#143：收尾宽限独立且有界）。
+            failure = _failure_message(
+                "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
+            )
+            del error
         except TimeoutError as error:
             # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
             # 没有这个分支整个回合会永久等待（Codex 复查发现）。
@@ -180,6 +195,12 @@ class WorkerTurnExecutor:
             failure = _sdk_termination_failure(recorder)
 
         duration_seconds = max(0.0, self._clock() - started_at)
+        business_duration_seconds = business_phase.get("seconds")
+        drain_duration_seconds = (
+            max(0.0, duration_seconds - business_duration_seconds)
+            if business_duration_seconds is not None
+            else None
+        )
 
         return build_report(
             trace_id=self._config.trace_id,
@@ -192,6 +213,9 @@ class WorkerTurnExecutor:
             failure=failure,
             external_texts=tuple(text for _, text in normalized_external_texts),
             system_prompt=self._config.system_prompt,
+            business_execution_budget_seconds=self._config.turn_timeout_seconds,
+            business_duration_seconds=business_duration_seconds,
+            drain_duration_seconds=drain_duration_seconds,
         )
 
 

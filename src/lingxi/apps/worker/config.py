@@ -23,8 +23,17 @@ ENV_PREFIX = "LINGXI_WORKER_"
 # 设下的安全边界，越过它必须在启动期拒绝，不能让一次部署带着不确定的成本口径运行。
 DEFAULT_MAX_TURNS = 20
 MAX_TURNS_HARD_LIMIT = 30
+# 这是**业务执行预算**，不是端到端总耗时的承诺（#143，产品负责人 2026-08-13
+# 拍板）：SDK 会话收尾（终态接收、用量回收）另有独立、有界的收尾宽限
+# （见 ``DEFAULT_DRAIN_GRACE_SECONDS``），不计入这个预算，也不因预算耗尽被
+# 截断。对外如果要承诺"单任务最多 N 秒"，N 必须是预算加收尾宽限，不是这一个值。
 DEFAULT_TURN_TIMEOUT_SECONDS = 600.0
 TURN_TIMEOUT_HARD_LIMIT_SECONDS = 900.0
+# 收尾宽限：真实链路观测到的固定收尾开销约 6 秒（#143），默认值留出充分余量，
+# 不让正常收尾撞到这个上限；只有 SDK 断开挂起等病态情况才会触发，触发时报告
+# 独立的 ``drain_timeout`` 原因码，不与业务墙钟超时混淆。
+DEFAULT_DRAIN_GRACE_SECONDS = 30.0
+DRAIN_GRACE_HARD_LIMIT_SECONDS = 120.0
 
 # 本切片只允许一个明确确认过的**只读 MCP 工具**（Issue #37 实施范围 2）。要求
 # ``mcp__`` 前缀是这条范围的机器可核对形式：Skill、Agent、Task 与任何内置工具都
@@ -43,12 +52,13 @@ class WorkerConfig:
     question: str
     read_only_tool: str
     trace_id: str
-    # 单回合墙钟上限：SDK 传输挂住不发终止消息时，没有它整个回合会永久等待，
-    # 连失败报告都出不来（Codex 复查发现）。
+    # 单回合墙钟上限（业务执行预算）：SDK 传输挂住不发终止消息时，没有它整个
+    # 回合会永久等待，连失败报告都出不来（Codex 复查发现）。不含收尾宽限。
     turn_timeout_seconds: float
     # 直接构造配置的测试与嵌入调用方沿用旧接口时仍使用同一安全默认值；正式入口
     # 通过 load_config 显式校验并传入部署值。
     max_turns: int = DEFAULT_MAX_TURNS
+    drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS
     audit_input_fields: tuple[str, ...] = ()
     failure_text_markers: tuple[str, ...] = ()
     mcp_servers: Mapping[str, Any] = field(default_factory=dict)
@@ -86,6 +96,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
         max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
+        drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
         mcp_servers=_mcp_servers(env),
@@ -209,6 +220,23 @@ def _turn_timeout(value: str) -> float:
         raise WorkerConfigError(
             "LINGXI_WORKER_TURN_TIMEOUT_SECONDS 必须是正的有限秒数，且不得超过"
             f" {TURN_TIMEOUT_HARD_LIMIT_SECONDS:g} 秒"
+        )
+    return seconds
+
+
+def _drain_grace(value: str) -> float:
+    if not value:
+        return DEFAULT_DRAIN_GRACE_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise WorkerConfigError("LINGXI_WORKER_DRAIN_GRACE_SECONDS 必须是正数（秒）") from error
+    import math
+
+    if seconds <= 0 or not math.isfinite(seconds) or seconds > DRAIN_GRACE_HARD_LIMIT_SECONDS:
+        raise WorkerConfigError(
+            "LINGXI_WORKER_DRAIN_GRACE_SECONDS 必须是正的有限秒数，且不得超过"
+            f" {DRAIN_GRACE_HARD_LIMIT_SECONDS:g} 秒"
         )
     return seconds
 
