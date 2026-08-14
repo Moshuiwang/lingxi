@@ -167,6 +167,13 @@ _INSTALL_MARKERS = ("site-packages", "dist-packages")
 # 第三方那一列是从进程入口逐个追 import 链得到的，不是照抄 pyproject——照抄的话
 # 这个检查就永远不会红。CI 在**每个 extra 各自的干净环境**里跑对应的一项，
 # 见 .github/workflows/ci.yml 的 `Epic Full / extras` 矩阵。
+#
+# 第一列还包含沿途所有存在的父包 `__init__`（`lingxi`、`lingxi.core` 等）：Python
+# 导入任何子模块前都会先执行这些父包，`process_source_closure` 会把它们一并纳入
+# 闭包（Issue #116）。`lingxi.core.conversation` 的 `__init__.py` 本身 re-export
+# 了 `commands` / `pipeline` / `session_window`，所以只导入 `...conversation.ports`
+# 的 worker 实际上也会连带加载这三个子模块——这是加固前真实存在的登记缺口，
+# 不是补一个理论场景。
 PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "scheduler": (
         # `scheduler.__main__` 在模块级 `raise SystemExit(main())`（没有 __name__ 卫语句），
@@ -175,9 +182,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
         # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
         (
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.scheduler",
             "lingxi.apps.scheduler.__main__",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
@@ -185,6 +196,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
@@ -198,13 +211,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "reauthorize": (
         (
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.reauthorize",
             "lingxi.apps.reauthorize.__main__",
+            "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.ids",
@@ -213,6 +231,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "worker": (
         (
+            "lingxi",
+            "lingxi.apps",
+            "lingxi.apps.worker",
             "lingxi.apps.worker.__main__",
             "lingxi.apps.worker.cli",
             "lingxi.apps.worker.config",
@@ -220,12 +241,20 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.delivery",
             "lingxi.apps.worker.service",
+            "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.core",
+            "lingxi.core.conversation",
+            "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
+            "lingxi.core.conversation.session_window",
+            "lingxi.core.execution",
             "lingxi.core.execution.audit",
             "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
@@ -240,15 +269,21 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             # 注意导入的是承载 ``main`` 的包与 ``__main__``：后者带 ``if __name__``
             # 卫语句（与 worker 同惯例），import 它不会真的把长连接跑起来。
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.gateway",
             "lingxi.apps.gateway.config",
             "lingxi.apps.gateway.__main__",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.adapters",
             "lingxi.adapters.feishu_events",
             "lingxi.adapters.feishu_longconn",
             "lingxi.adapters.feishu_outbound",
             "lingxi.adapters.postgres_conversation",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
@@ -265,12 +300,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # 制品豁免，但它们依赖的正式 core.identity.onboarding 仍属于正式制品清单。
     "bot-test": (
         (
+            "lingxi",
+            "lingxi.adapters",
             "lingxi.adapters.feishu_onboarding",
             "lingxi.adapters.oauth_bridge",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.refresh_tokens",
             "lingxi.adapters.postgres_onboarding",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.onboarding",
         ),
         ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
@@ -418,10 +457,30 @@ def _source_imports(module: str, source_files: Mapping[str, pathlib.Path]) -> se
     return found
 
 
+def _ancestor_packages(module: str, source_files: Mapping[str, pathlib.Path]) -> list[str]:
+    """返回一个模块路径上、在源码树里确实存在 `__init__.py` 的父包（不含自身）。
+
+    Python 导入 ``lingxi.core.conversation.pipeline`` 之前，会先依次执行
+    ``lingxi/__init__.py``、``lingxi/core/__init__.py``、
+    ``lingxi/core/conversation/__init__.py``——这些父包 `__init__` 是该模块真实会
+    被加载的一部分，即便当前它们是空文件或只 import 已登记的子模块。若不把它们
+    带进闭包，父包 `__init__` 日后新增未登记依赖时，`--source-only` 门禁看不见，
+    只会在部署后的干净镜像里才暴露（Issue #116）。
+    """
+
+    parts = module.split(".")
+    ancestors: list[str] = []
+    for end in range(1, len(parts)):
+        candidate = ".".join(parts[:end])
+        if candidate in source_files:
+            ancestors.append(candidate)
+    return ancestors
+
+
 def process_source_closure(
     extra: str, source_files: Mapping[str, pathlib.Path] | None = None
 ) -> set[str]:
-    """计算一个进程入口实际会加载的 lingxi 模块闭包。"""
+    """计算一个进程入口实际会加载的 lingxi 模块闭包，含沿途所有存在的父包 `__init__`。"""
 
     files = source_module_files() if source_files is None else source_files
     roots = PROCESS_SOURCE_ENTRY_POINTS[extra]
@@ -433,6 +492,7 @@ def process_source_closure(
             continue
         seen.add(module)
         pending.extend(_source_imports(module, files) - seen)
+        pending.extend(name for name in _ancestor_packages(module, files) if name not in seen)
     return seen
 
 
