@@ -18,6 +18,20 @@ from lingxi.core.delivery.ports import TerminalKind
 
 logger = logging.getLogger(__name__)
 
+# `claim()` 前重判停机信号需要跨过 `loop.add_signal_handler` 自管道机制的完整
+# 投递链路（PR #173 独立复核第二轮 P2-1）：OS 送达信号 → 自管道被写入一个
+# 字节 → 事件循环下一轮 `select()` 才发现可读，把**自管道 reader 回调**排进
+# 就绪队列并在同一轮执行 → 该回调再把**真正的用户回调**（这里是
+# `stop.set()`）通过 `_add_callback_signalsafe` 排进下一轮就绪队列 → 再下一轮
+# 才真正执行。经真实 SIGTERM + 真实 `add_signal_handler` 实测（5/5、3/3 稳定
+# 复现，见该轮评论）：`await asyncio.sleep(0)` 只能让当前协程前进一轮，必须
+# 连续让出 **3 轮**才能观测到 `is_set()` 变为 True——上一版只让出一次，对
+# 真实信号无效（对 `loop.call_soon` 模拟的假信号有效，因为它跳过了自管道的
+# 两跳，这也是为什么当时新增用例是绿的、生产路径依旧漏的原因）。这里给到
+# 5 轮，在实测必需的 3 轮之上留出实现细节漂移的余量；一旦提前观测到
+# `is_set()` 就立即返回，不多空转。
+_STOP_SIGNAL_DRAIN_YIELDS = 5
+
 
 class QueueListener(Protocol):
     def wait(self, *, timeout_seconds: float) -> bool: ...
@@ -101,24 +115,23 @@ class WorkerService:
         self._tick_alerts()
         terminal_tasks = self._housekeep()
 
-        # 再判一次停机信号，紧贴在 claim() 之前（PR #173 独立复核 P2-1）：
-        # `run()` 的 `while not stop.is_set()` 判定与这里的 `claim()` 之间没有
-        # 任何 await（心跳、告警 tick、`_housekeep()` 全是同步代码），而
-        # `loop.add_signal_handler` 装的回调靠自管道机制投递，只有在事件循环
-        # 真正拿到控制权（也就是某次 await 让出）时才会被处理——纯同步代码
-        # 中间不存在能被它插入的缝隙。信号如果恰好在这段同步窗口内被操作系统
-        # 送达，Python 侧只是把回调排进了事件循环的就绪队列，**这里读到的
-        # `is_set()` 依然是旧值**，之前会把一条还在排队、从未执行过的任务
-        # 领走，直接收口成 `stopped` 且不会被重排。因此先 `await
-        # asyncio.sleep(0)` 主动让出一次——这是标准的"给事件循环一个处理已就绪
-        # 回调的机会"惯用法，不是无意义的空转——再判一次 `is_set()`，让"停止
-        # 新领取"（#153 完成标准第 3 条）在这个窗口里也成立。`self._global_stop`
-        # 为 ``None`` 时（`process_once()` 的白盒调用方与既有测试）跳过整段，
-        # 行为不变、不多一次调度。
+        # 再判一次停机信号，紧贴在 claim() 之前（PR #173 独立复核 P2-1，第二轮
+        # 复核证明单次 `sleep(0)` 对真实信号无效，见模块顶部
+        # `_STOP_SIGNAL_DRAIN_YIELDS` 的机制说明）：`run()` 的
+        # `while not stop.is_set()` 判定与这里的 `claim()` 之间没有任何 await
+        # （心跳、告警 tick、`_housekeep()` 全是同步代码），信号如果恰好在这段
+        # 同步窗口内被操作系统送达，`self._global_stop.is_set()` 在没有真正让
+        # 事件循环跑完自管道投递链路之前读到的都是旧值——会把一条还在排队、
+        # 从未执行过的任务领走，直接收口成 `stopped` 且不会被重排。因此连续
+        # 让出 `_STOP_SIGNAL_DRAIN_YIELDS` 轮（一旦提前观测到 `is_set()` 立即
+        # 返回，不多空转），让"停止新领取"（#153 完成标准第 3 条）在这个窗口
+        # 里也真正成立。`self._global_stop` 为 ``None`` 时（`process_once()`
+        # 的白盒调用方与既有测试）跳过整段，行为不变、不多一次调度。
         if self._global_stop is not None:
-            await asyncio.sleep(0)
-            if self._global_stop.is_set():
-                return bool(terminal_tasks)
+            for _ in range(_STOP_SIGNAL_DRAIN_YIELDS):
+                await asyncio.sleep(0)
+                if self._global_stop.is_set():
+                    return bool(terminal_tasks)
 
         tasks = self._queue.claim(
             worker_id=self._config.worker_id,
@@ -474,7 +487,7 @@ class WorkerService:
             # unhealthy。`_monitor` 本来就按 `stop_poll_interval_seconds`
             # （默认 1s）在跳、贯穿整个在途任务的生命周期，是"进程仍在做正确的
             # 事"这个信号真正应该来源的地方；每跳一次戳一次是本地文件写入，
-            # 成本可忽略。真实证据：`tests/test_liveness_and_healthcheck.py` 的
+            # 成本可忽略。真实证据：`tests/test_worker_queue_consumer.py` 的
             # ``test_liveness_stays_fresh_through_a_long_in_flight_turn`` ——
             # 删掉这一行后该用例会变红。
             self._emit_heartbeat()

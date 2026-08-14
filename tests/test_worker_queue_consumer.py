@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
+import signal
 import tempfile
 import threading
 import time
@@ -765,6 +767,104 @@ class WorkerServiceTests(unittest.TestCase):
             "在途任务执行期间活性文件年龄不应超过阈值——否则健康检查会在"
             "完全正常的长回合期间把容器判定为 unhealthy",
         )
+
+    def test_a_real_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_stops_claiming(
+        self,
+    ) -> None:
+        """PR #173 独立复核第二轮 P2-1：上一轮 `test_a_sigterm_that_lands_
+        during_the_synchronous_housekeeping_stretch_stops_claiming` 用
+        `loop.call_soon(stop.set)` 模拟"信号回调已排队未执行"被复核证明与
+        真实信号路径不等价——`loop.call_soon` 直接进就绪队列，跳过了
+        `loop.add_signal_handler` 自管道机制的两跳，一次 `sleep(0)` 就够；真实
+        SIGTERM 经自管道投递需要三轮让出才会被观测到（见
+        ``service.py`` 模块顶部 ``_STOP_SIGNAL_DRAIN_YIELDS`` 的机制说明）。
+        本用例改用**真实 POSIX 信号**（进程内 ``os.kill(os.getpid(),
+        signal.SIGTERM)``）经真实 ``_run_queue_worker`` 里真实的
+        ``loop.add_signal_handler`` 路径复现，不再依赖任何模拟。
+
+        复现手法：``os.kill`` 从 ``_housekeep()`` 内部、在它返回前触发——这
+        精确复现"SIGTERM 恰好在 claim() 前的同步窗口内被操作系统送达"这个
+        场景，且是真实内核信号投递，不是任何形式的模拟。
+
+        变异验证：把 `process_once()` 里 claim() 前新增的多轮让出+复判整段
+        删掉（或把 `_STOP_SIGNAL_DRAIN_YIELDS` 改回 1），本用例会变红
+        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
+        ``stopped``，且不会被重排）。
+        """
+
+        from lingxi.adapters.postgres_conversation import ClaimedTask as _ClaimedTask
+        from lingxi.apps.worker.cli import _run_queue_worker
+
+        queue = FakeWorkerQueue()
+        claim_calls = 0
+        original_claim = queue.claim
+
+        def counting_claim(**kwargs: object) -> list[_ClaimedTask]:
+            nonlocal claim_calls
+            claim_calls += 1
+            return original_claim(**kwargs)
+
+        queue.claim = counting_claim  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(poll_interval_seconds=0.01),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        original_housekeep = service._housekeep
+        signal_sent = False
+
+        def housekeeping_that_sends_a_real_sigterm() -> list[object]:
+            nonlocal signal_sent
+            result = original_housekeep()
+            if not signal_sent:
+                signal_sent = True
+                # 真实内核信号，不是模拟。此时 `_run_queue_worker` 已经用真实
+                # `loop.add_signal_handler` 装好了 SIGTERM 处理器，同进程内
+                # 自己发给自己是让真实信号落在这段同步窗口内最直接、最可控的
+                # 方式——处理器已接管，不会走到默认终止行为，不影响测试进程
+                # 本身的存活。
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+
+        service._housekeep = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
+
+        err = io.StringIO()
+
+        async def scenario() -> None:
+            await _run_queue_worker(
+                service,
+                shutdown_timeout_seconds=2.0,
+                err=err,
+                trace_id="01J00000000000000000000SIG",
+            )
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+
+        self.assertIn(
+            "worker.queue.signal_received",
+            err.getvalue(),
+            "真实信号处理器必须确实跑过一次，否则本用例没有测到真实信号路径",
+        )
+        self.assertEqual(
+            claim_calls,
+            0,
+            "真实 SIGTERM 已经在 housekeeping 同步窗口内送达后，claim() 不应该"
+            "再被调用——一条从未执行过的排队任务不该被领走后直接收口成"
+            " stopped",
+        )
+        self.assertIsNotNone(
+            queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
+        )
+        self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
 
 
 @unittest.skipUnless(DSN, SKIP_DB)

@@ -55,20 +55,21 @@ docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/com
 
 ## 准备
 
-一个环境要**六个**文件，不是一个：
+一个环境要**七个**文件，不是一个：
 
 ```bash
 cp deploy/.env.example deploy/.env.stage             # 只放 LINGXI_IMAGE_REGISTRY / LINGXI_IMAGE_TAG
 $EDITOR deploy/.env.stage.scheduler                  # 数据库 DSN、Fernet 密钥、飞书应用凭据
 $EDITOR deploy/.env.stage.gateway                    # 飞书应用凭据 + 数据库 DSN（#57）
 $EDITOR deploy/.env.stage.worker                     # 只有 LINGXI_WORKER_* 与模型端点凭据
+$EDITOR deploy/.env.stage.worker-queue               # 常驻队列消费者：含数据库 DSN（#153 PR #173 复核 P1-2）
 $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库、应用与全部 scope 配置
 ```
 
-六个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
+七个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
-**为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
+**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）不跑 Agent SDK、不继承环境给任何子进程，但它需要 `LINGXI_POSTGRES_DSN` 才能领任务——这正是它必须有自己独立一份 env 文件、不能借用 `worker` 那份的原因（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
@@ -78,7 +79,7 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 代码框架「横切约定」要求凭据不进代码、日志、数据库、用户环境，长期凭据放操作系统级密钥管理。本批用文件注入，因此**文件权限就是这条边界的全部**——一个 0644 的 env 文件等于把生产数据库口令、Fernet 密钥和飞书应用密钥摊给机器上任何一个账号。
 
-六个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway` 与 `.env.<环境>.reauthorize` 都装有飞书应用密钥和数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
+七个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway`、`.env.<环境>.worker-queue` 与 `.env.<环境>.reauthorize` 都装有飞书应用密钥或数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
 
 ```bash
 umask 077
@@ -86,6 +87,7 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.scheduler
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.gateway
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker-queue
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.reauthorize
 # 然后再往里写内容
@@ -96,13 +98,15 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.reautho
 ```bash
 # stage
 for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway \
-         deploy/.env.stage.worker deploy/.env.stage.migrate deploy/.env.stage.reauthorize; do
+         deploy/.env.stage.worker deploy/.env.stage.worker-queue \
+         deploy/.env.stage.migrate deploy/.env.stage.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 
 # 生产（同型，把 stage 换成 prod）
 for f in deploy/.env.prod deploy/.env.prod.scheduler deploy/.env.prod.gateway \
-         deploy/.env.prod.worker deploy/.env.prod.migrate deploy/.env.prod.reauthorize; do
+         deploy/.env.prod.worker deploy/.env.prod.worker-queue \
+         deploy/.env.prod.migrate deploy/.env.prod.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 # 期望每行都是 `<文件> 600 <部署用户>`
@@ -300,7 +304,7 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 卷；state 文件和凭据文件都在该卷内，入口会在启动前拒绝文件或锁文件路径冲突。授权回调
 由 OAuth Bridge 的主动 WebSocket 回传，job 不接收终端粘贴的回跳地址。
 
-以 stage 为例，确认六个 env 文件都已按上面的 preflight 准备好后执行：
+以 stage 为例，确认七个 env 文件都已按上面的 preflight 准备好后执行：
 
 ```bash
 docker compose --env-file deploy/.env.stage \
