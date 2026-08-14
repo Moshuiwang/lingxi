@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
 from lingxi.adapters.postgres import connect
@@ -565,6 +567,60 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
         )
 
+    def test_a_global_stop_signal_interrupts_an_in_flight_turn_within_the_poll_interval(
+        self,
+    ) -> None:
+        """Issue #153：SIGTERM 落地为 ``run(stop_event=...)`` 收到停止信号时，在途
+        任务的 ``_monitor`` 必须把这次全局停机与用户 ``/stop`` 同等对待——不是等
+        任务自然结束（例如撞满 turn_timeout），而是在一个 ``stop_poll_interval``
+        量级的时间内就让执行器收到中断请求，并把任务收口为 ``stopped`` 终态。
+        改掉 ``_monitor`` 里对 ``self._global_stop`` 的检查（或不在 ``run()`` 里
+        赋值它）都必须让本用例变红：要么在途回合永远等不到中断（用例超时），
+        要么虽然结束但终态不是 ``stopped``。
+        """
+
+        queue = FakeWorkerQueue()
+        turn_started = threading.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                turn_started.set()
+                # 真实执行器在 stop_event 被置位时会向 Agent SDK 发起 interrupt()
+                # 并很快返回；这里直接用同一个协作式信号模拟"回合已经响应中断"。
+                await kwargs["stop_event"].wait()  # type: ignore[union-attr]
+                return {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {"code": "interrupted"},
+                }
+
+        service = WorkerService(
+            config=worker_config(stop_poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> float:
+            global_stop = asyncio.Event()
+            run_task = asyncio.create_task(service.run(stop_event=global_stop))
+            started = await asyncio.to_thread(turn_started.wait, 2.0)
+            self.assertTrue(started, "回合应先真正开始执行，才能验证停机信号能中断它")
+            began_stopping_at = time.monotonic()
+            global_stop.set()
+            await asyncio.wait_for(run_task, timeout=2.0)
+            return time.monotonic() - began_stopping_at
+
+        elapsed = asyncio.run(scenario())
+
+        self.assertLess(
+            elapsed,
+            1.0,
+            "全局停机信号必须在一个 stop_poll_interval 量级内让在途回合收到中断"
+            "请求并收口，不能等到轮询周期之外的更长预算",
+        )
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "stopped")
+        self.assertEqual(terminal["error_kind"], "stopped")
+
 
 @unittest.skipUnless(DSN, SKIP_DB)
 class RealQueueTerminalTests(unittest.TestCase):
@@ -1034,3 +1090,114 @@ class RealQueueTerminalTests(unittest.TestCase):
             "task_queued",
             "失败事务没有落 inbound_event，故故障恢复后重投必须能够完整入队",
         )
+
+
+@unittest.skipUnless(DSN, SKIP_DB)
+class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
+    """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
+    的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的
+    正确性已在 ``tests/test_delivery_outbox.py`` 的 ``AgentSessionCleanupQueueTests``
+    覆盖，本文件只覆盖 ``WorkerService._cleanup_agent_sessions`` 这一段消费。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        assert DSN is not None
+        ensure_production_schema(DSN)
+
+    def setUp(self) -> None:
+        assert DSN is not None
+        reset_production_rows(DSN)
+        self.queue = PostgresTaskQueue(DSN)
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO app_user
+                       (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                        display_name, department, tenant_key, provisioning_state)
+                       VALUES ('usr-90','ou-90','u-90','un-90','张三','数据部','tk-90','active')"""
+                )
+
+    def _queue_cleanup(self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command") -> None:
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+                       VALUES (%s, 'usr-90', %s, %s)""",
+                    (cleanup_id, agent_session_id, reason),
+                )
+
+    def test_deletes_the_matching_file_and_marks_the_row_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000000SESS.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            service._cleanup_agent_sessions()
+
+            self.assertFalse(jsonl.exists())
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-1'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_a_cleanup_for_a_session_that_never_produced_a_file_is_still_marked_done(self) -> None:
+        """任务在建会话前就失败，从未真正落过盘——这不是清理失败，必须照常
+        标记完成，不能让一条永远匹配不到文件的记录卡住队列。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._queue_cleanup(cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=Path(tmp),
+            )
+            service._cleanup_agent_sessions()
+
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-2'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_without_a_configured_session_root_the_queue_is_left_untouched(self) -> None:
+        """没有可用会话根目录时整体跳过——不半途认领又做不了事（模块说明）。"""
+
+        self._queue_cleanup(cleanup_id="asc-int-3", agent_session_id="01J00000000000000000SKIP")
+
+        service = WorkerService(config=worker_config(), queue=self.queue, session_root=None)
+        service._cleanup_agent_sessions()
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-3'"
+            ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+
+    def test_runs_end_to_end_through_process_once_via_the_housekeep_round(self) -> None:
+        """确认接线到了真正的入口——``process_once()`` 而不是只有直接调用私有
+        方法才生效（否则装配一处没接对，生产环境永远不会真正清理）。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000PROCE.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            asyncio.run(service.process_once())
+
+            self.assertFalse(jsonl.exists())

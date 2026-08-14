@@ -50,6 +50,16 @@ services:
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
+  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 共用同一份
+  # `.env.stage.worker`——两者是同一镜像、同一套 LINGXI_WORKER_* 环境变量面，
+  # 差别只是 `LINGXI_WORKER_MODE`（由 deploy/compose.yaml 基线的
+  # `environment:` 直接给值），不是需要互相隔离的两个信任边界。
+  worker-queue:
+    env_file:
+      - ./.env.stage.worker
+    volumes:
+      - lingxi-users:/var/lib/lingxi/users
+
   migrate:
     env_file:
       - ./.env.stage.migrate

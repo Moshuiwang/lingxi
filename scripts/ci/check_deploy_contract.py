@@ -46,6 +46,7 @@ FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_dir
 POSTGRES_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "postgres.py"
 SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__init__.py"
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
+WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
 
 # 停止宽限期的数据库往返预算（秒）由下方的 ``module_constant`` 从统一连接工厂读取。
 # 这里不能复制 DSN 或连接工厂的数字：工厂通过 kwargs 覆盖 DSN 同名参数，且合法环境
@@ -239,6 +240,20 @@ def _gateway_worst_case_seconds() -> float:
     return shutdown + outbound + _database_operation_seconds()
 
 
+def _worker_worst_case_seconds() -> float:
+    """queue worker 一次 SIGTERM 优雅停机在最坏情况下还要跑多久（秒）。
+
+    与 gateway/scheduler 同一模型：进程自己的停机预算（
+    ``DEFAULT_SHUTDOWN_TIMEOUT_SECONDS``，读自 apps/worker/config.py）加一次
+    数据库终态写入的最坏预算。没有出站 HTTP 这一项——worker 不直接调用飞书。
+    """
+
+    shutdown = module_constant(WORKER_CONFIG, "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS")
+    if not isinstance(shutdown, (int, float)):
+        raise ValueError("读不到 worker 的 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 默认值")
+    return float(shutdown) + _database_operation_seconds()
+
+
 def _worst_case_seconds() -> float:
     """一次在途轮换在最坏情况下还要跑多久（秒）。读不到常量时抛 ValueError。"""
 
@@ -402,6 +417,7 @@ def check_compose_contract() -> list[str]:
     scheduler = service_block(base, "scheduler") or ""
     gateway = service_block(base, "gateway") or ""
     worker = service_block(base, "worker") or ""
+    worker_queue = service_block(base, "worker-queue") or ""
     migrate = service_block(base, "migrate") or ""
     reauthorize = service_block(base, "reauthorize") or ""
 
@@ -522,9 +538,84 @@ def check_compose_contract() -> list[str]:
                     f"+ 数据库 {_database_operation_seconds():.0f}s，再乘 {SAFETY_FACTOR}）。"
                 )
 
+    # ---- worker-queue：常驻 queue worker（Issue #153）-------------------------
+    if not worker_queue:
+        failures.append(
+            "deploy/compose.yaml 缺少常驻 queue worker service `worker-queue`"
+            "（Issue #153：Stage/MVP 受控部署 profile 需要 scheduler、gateway、"
+            "常驻 queue worker 三者同时启动）。"
+        )
+    else:
+        if not re.search(r"^\s*profiles:\s*\[.*mvp.*\]\s*$", worker_queue, re.MULTILINE):
+            failures.append(
+                "worker-queue 没有放进 `mvp` profile：Stage/MVP 受控部署形态"
+                "必须能用一个明确命名的 profile 同时拉起它。"
+            )
+        if not re.search(r'^\s*restart:\s*unless-stopped\s*$', worker_queue, re.MULTILINE):
+            failures.append(
+                "worker-queue 是常驻服务，必须 `restart: unless-stopped`"
+                "（与一次性 `worker` job 的 `restart: \"no\"` 刻意不同）。"
+            )
+        if not re.search(
+            r'^\s*LINGXI_WORKER_MODE:\s*queue\s*$', worker_queue, re.MULTILINE
+        ):
+            failures.append("worker-queue 没有设置 LINGXI_WORKER_MODE=queue，会退化成一次性 turn 模式")
+        if "lingxi-users:/var/lib/lingxi/users" not in worker_queue:
+            failures.append("worker-queue 必须挂载用户环境持久卷（与一次性 worker job 一致）")
+        if not re.search(r"^\s*read_only:\s*true\s*$", worker_queue, re.MULTILINE):
+            failures.append("worker-queue 缺 `read_only: true`（断言 V-部署-02，与 scheduler/gateway 同一要求）")
+
+        worker_queue_grace = re.search(
+            r"^\s*stop_grace_period:\s*(\S+)\s*$", worker_queue, re.MULTILINE
+        )
+        try:
+            worker_worst_case = _worker_worst_case_seconds()
+            worker_required = math.ceil(worker_worst_case * SAFETY_FACTOR)
+        except ValueError as error:
+            failures.append(str(error))
+            worker_worst_case = None
+            worker_required = None
+        if worker_required is not None:
+            if worker_queue_grace is None:
+                failures.append(
+                    "deploy/compose.yaml 的 worker-queue 没有显式 stop_grace_period。"
+                    f"最坏需要 {worker_worst_case:.1f} 秒（SIGTERM 停机预算 + 一次终态"
+                    "写库事务）；中途 SIGKILL 会让一次已经在途的 Agent 回合失去被"
+                    "cooperative 中断的机会。"
+                )
+            else:
+                actual = parse_duration_seconds(worker_queue_grace.group(1))
+                if actual is None or actual < worker_required:
+                    failures.append(
+                        f"worker-queue 的 stop_grace_period 是 "
+                        f"{worker_queue_grace.group(1)}，低于要求的 {worker_required} 秒"
+                        f"（worker 自身 SIGTERM 停机预算 + 数据库终态写入预算，再乘"
+                        f" {SAFETY_FACTOR}）。"
+                    )
+
+    # ---- healthcheck：三个常驻服务都必须有（Issue #153，合同第 5 条）---------
+    for name, block in (
+        ("scheduler", scheduler),
+        ("gateway", gateway),
+        ("worker-queue", worker_queue),
+    ):
+        if not block:
+            continue
+        if not re.search(r"^\s*healthcheck:\s*$", block, re.MULTILINE):
+            failures.append(
+                f"{name} 没有 healthcheck。合同第 5 条要求依赖不可用时健康检查"
+                "必须如实变红，不能只靠容器 PID 存活。"
+            )
+        elif "lingxi.apps.healthcheck" not in block:
+            failures.append(
+                f"{name} 的 healthcheck 没有调用 `python -m lingxi.apps.healthcheck`，"
+                "无法证明它真的探测了依赖可达性与主循环活性，而不是一条摆设命令。"
+            )
+
     # M2-62-29 / M2-62-30：非 root、能力最小。
     for name, block in (("scheduler", scheduler), ("gateway", gateway),
-                        ("worker", worker), ("migrate", migrate), ("reauthorize", reauthorize)):
+                        ("worker", worker), ("worker-queue", worker_queue),
+                        ("migrate", migrate), ("reauthorize", reauthorize)):
         user = re.search(r"^\s*user:\s*(\S+)\s*$", block, re.MULTILINE)
         if user is None:
             failures.append(f"{name} 没有显式 `user:`，无法在 compose 层面核对非 root")
@@ -546,7 +637,7 @@ def check_compose_contract() -> list[str]:
     # 设置整个盖掉，而基线文件本身一个字没动——静态检查全绿，实际以 root 跑。
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
-        for service in ("scheduler", "gateway", "worker", "migrate", "reauthorize"):
+        for service in ("scheduler", "gateway", "worker", "worker-queue", "migrate", "reauthorize"):
             block = service_block(text, service)
             if block is None:
                 continue
@@ -587,17 +678,25 @@ def check_compose_contract() -> list[str]:
     # 这不是"多给几个变量"：worker 跑 Agent SDK，SDK 把进程环境继承给 Claude CLI 与
     # 每个 MCP 子进程，于是那些凭据一路流进模型执行环境——正是产品合同「凭据不进用户
     # 环境」要挡的方向。
+    #
+    # **`worker` 与 `worker-queue` 例外**（Issue #153）：两者是**同一个镜像、同一套
+    # `LINGXI_WORKER_*` 环境变量面**，区别只是 `LINGXI_WORKER_MODE` 取 `turn` 还是
+    # `queue`（由 deploy/compose.yaml 基线的 `environment:` 直接给值，不经 env_file）
+    # ——本来就是同一个信任边界内的一次性/常驻两种运行形态，不是两个需要互相隔离的
+    # 不同进程；共用同一份 env_file 不产生新的凭据暴露面。其余任何两个服务共用
+    # env_file 仍然直接判定失败。
+    _ENV_FILE_SHARING_EXCEPTIONS = (frozenset({"worker", "worker-queue"}),)
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
         seen: dict[str, list[str]] = {}
-        for service in ("scheduler", "gateway", "worker", "migrate", "reauthorize"):
+        for service in ("scheduler", "gateway", "worker", "worker-queue", "migrate", "reauthorize"):
             block = service_block(text, service)
             if block is None:
                 continue
             for env_file in re.findall(r"^\s*-\s*(\./\S+)\s*$", block, re.MULTILINE):
                 seen.setdefault(env_file, []).append(service)
         for env_file, services in sorted(seen.items()):
-            if len(services) > 1:
+            if len(services) > 1 and frozenset(services) not in _ENV_FILE_SHARING_EXCEPTIONS:
                 failures.append(
                     f"{display(path)}：{'、'.join(services)} 共用同一个 "
                     f"env_file `{env_file}`。凭据必须按服务分文件——worker 跑 Agent SDK，"

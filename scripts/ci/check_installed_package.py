@@ -41,6 +41,12 @@ REQUIRED_MODULES = (
     "lingxi.adapters",
     "lingxi.apps",
     "lingxi.apps.worker",
+    # Issue #153：三个常驻进程共用的活性心跳与健康检查命令。它们不是独立进程，
+    # 是随镜像一起装的 `python -m lingxi.apps.healthcheck`，由 compose 的
+    # `healthcheck.test` 以 `docker exec` 语义调用。
+    "lingxi.apps.liveness",
+    "lingxi.apps.healthcheck",
+    "lingxi.apps.healthcheck.__main__",
     "lingxi.config",
     "lingxi.config.content",
     "lingxi.core",
@@ -102,6 +108,7 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.service",
+    "lingxi.apps.worker.session_cleanup",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
     # 新的顶层子目录，与 apps/ 当初同一个形状：漏进制品只在部署时暴露。
@@ -193,6 +200,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps",
             "lingxi.apps.scheduler",
             "lingxi.apps.scheduler.__main__",
+            # Issue #153：main() 装配的健康检查/活性文件命令，随镜像一起装，
+            # 由 compose 的 healthcheck.test 以 `docker exec` 语义调用。
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
@@ -259,6 +271,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.service",
+            "lingxi.apps.worker.session_cleanup",
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
             "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
@@ -267,6 +283,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.core",
+            "lingxi.core.alerting",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.pipeline",
@@ -295,6 +312,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.gateway",
             "lingxi.apps.gateway.config",
             "lingxi.apps.gateway.__main__",
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
@@ -309,7 +329,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 因此必须显式登记，理由与本文件其余"函数内 import"条目一致。
             "lingxi.adapters.feishu_delivery",
             "lingxi.apps.gateway.delivery",
+            # 最小告警装配（Issue #153）：build_alerting_duty 在函数内 import
+            # FeishuGroupMessages（只在配置了管理群时才用得到，其余时候走
+            # 日志出口，但两条路径都必须能真的装得上）；FeishuGroupMessages 又
+            # 模块级 import adapters.feishu_directory 的 urllib 传输，后者本身
+            # 模块级依赖 core.identity.credentials（AuthorizationGrant/SecretToken
+            # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
+            "lingxi.adapters.feishu_group_message",
+            "lingxi.adapters.feishu_directory",
             "lingxi.core",
+            "lingxi.core.alerting",
+            "lingxi.core.identity",
+            "lingxi.core.identity.credentials",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.pipeline",
@@ -363,10 +394,23 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 # 每个 extra 的源码入口。下面的静态闭包会遍历函数体内的延迟 import，反向证明
 # PROCESS_RUNTIME_IMPORTS 没有漏掉某个实际会被该进程加载的 lingxi 模块。
 PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
-    "scheduler": ("lingxi.apps.scheduler", "lingxi.apps.scheduler.__main__"),
+    # `apps.healthcheck.__main__` 追加进三个进程各自的入口集合：它不是被
+    # scheduler/gateway/worker 的模块 import 到的，是随同一个镜像装的独立命令，
+    # 由 compose 的 `healthcheck.test` 以 `docker exec` 语义单独调用（Issue
+    # #153）。加进来才能让静态闭包真的走到它的函数内 import（`lingxi.adapters.
+    # postgres`），反向证明每个进程的 extra 里健康检查命令本身也装得上。
+    "scheduler": (
+        "lingxi.apps.scheduler",
+        "lingxi.apps.scheduler.__main__",
+        "lingxi.apps.healthcheck.__main__",
+    ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
-    "worker": ("lingxi.apps.worker.__main__",),
-    "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.__main__"),
+    "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),
+    "gateway": (
+        "lingxi.apps.gateway",
+        "lingxi.apps.gateway.__main__",
+        "lingxi.apps.healthcheck.__main__",
+    ),
     "bot-test": (
         "lingxi.adapters.feishu_onboarding",
         "lingxi.adapters.oauth_bridge",

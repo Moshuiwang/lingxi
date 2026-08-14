@@ -103,8 +103,10 @@ PYTHON
 )
 
 for environment in stage prod; do
+  # --profile mvp（Issue #153）：把 worker-queue 也纳入结构对照，否则它只在
+  # mvp profile 下才可见，stage/prod 之间的等价性就漏了这个常驻服务一半的检查。
   docker compose -f deploy/compose.yaml -f "deploy/compose.${environment}.yaml" \
-    --profile job --profile gateway config --format json > "${workspace}/${environment}.json"
+    --profile job --profile gateway --profile mvp config --format json > "${workspace}/${environment}.json"
   python3 -c "${summary_program}" "${workspace}/${environment}.json" \
     > "${workspace}/${environment}.summary"
 done

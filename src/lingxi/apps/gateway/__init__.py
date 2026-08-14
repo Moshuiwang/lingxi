@@ -36,12 +36,31 @@ from lingxi.adapters.feishu_longconn import (
     LongConnectionSupervisor,
     TerminationReason,
 )
+from lingxi.apps.liveness import touch_liveness
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], None]:
+    """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
+
+    两件事共用同一个触发时机——都是"这条循环这一轮还活着"的证据——但服务不同的
+    消费者：``AlertManager`` 供跨进程重启也能观察到的阈值/去重状态机，活性文件
+    供同容器内的 ``python -m lingxi.apps.healthcheck`` 判断"主循环是否还在跳动"
+    （见 ``apps/liveness.py`` 模块说明）。
+    """
+
+    beat = alerting_duty.heartbeat_callback(liveness_role)
+
+    def combined() -> None:
+        beat()
+        touch_liveness(liveness_role)
+
+    return combined
 
 
 class _LoggingAudit:
@@ -195,13 +214,19 @@ def build_supervisor(
     )
 
 
-def assemble_delivery_consumer(config: GatewayConfig, *, queue: Any = None) -> Any:
+def assemble_delivery_consumer(
+    config: GatewayConfig, *, queue: Any = None, alerting_duty: Any = None
+) -> Any:
     """装配投递消费循环（Issue #152）：读 outbox、驱动 CardKit 流式卡片与文本兜底。
 
     独立建一个飞书 SDK 客户端，而不是复用 ``build_supervisor`` 内部那一个——两者
     生命周期不同（这一个要跟着后台线程一起停），共用同一个客户端对象反而会让"谁
     负责关它"变得含糊；多一个轻量 SDK 客户端对象本身不产生任何网络连接，直到第一次
     真正调用才建立 HTTP 连接。
+
+    ``alerting_duty``（Issue #153）不为 ``None`` 时，把它的
+    ``delivery_alert_callback()`` 接到 ``DeliveryConsumer.on_alert``——这是最小告警
+    装配合同点名的注入点："把 #152 的 on_alert 注入点接到真实告警路由"。
     """
 
     from lingxi.adapters.feishu_outbound import build_client
@@ -219,6 +244,52 @@ def assemble_delivery_consumer(config: GatewayConfig, *, queue: Any = None) -> A
         queue=queue
         or PostgresTaskQueue(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
         limit=config.delivery_batch_limit,
+        on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
+    )
+
+
+class _LogOnlyAlertSender:
+    """gateway 未配置管理群时的告警出口：只记结构化日志，不发起网络请求。
+
+    与 ``apps/worker/cli.py`` 的同名类同一姿态——没有配置目标群不等于告警关闭，
+    只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有
+    明确定义"，这里的定义是"继续跑，只是暂时没有群通知"）。
+    """
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        del chat_id, dedupe_key
+        logging.getLogger("lingxi.apps.gateway.alert").warning(text)
+
+
+def build_alerting_duty(config: GatewayConfig) -> Any:
+    """装配 gateway 自己的告警状态机（Issue #153）。
+
+    gateway 与 scheduler、worker 是三个独立部署单元，进程间不直接通信，因此各自
+    持有一份 ``AlertManager``——这不是重复造轮子，是"告警状态机跟着部署单元走"
+    这条既有约束的自然结果（``core/alerting.py`` 模块说明）。配置了
+    ``LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`` 时真正发进管理群；没配时状态机照常
+    运行（阈值、去重、恢复计时都真实生效），只是发送端退化为结构化日志。
+    """
+
+    from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
+
+    if config.admin_group_chat_id:
+        from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+
+        sender: Any = FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.app_id,
+            app_secret=str(config.app_secret),
+        )
+        chat_id = config.admin_group_chat_id
+    else:
+        sender = _LogOnlyAlertSender()
+        chat_id = "gateway-log-only"
+
+    return AlertingDuty(
+        manager=AlertManager(policy=config.alert_policy),
+        dispatcher=AlertDispatcher(sender=sender, chat_id=chat_id, policy=config.alert_policy),
+        audit=_LoggingAudit(),
     )
 
 
@@ -252,11 +323,24 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
 
     install_signal_handlers(stop_event, on_stop=_mark_shutdown_requested)
 
-    supervisor = build_supervisor(config, should_stop=stop_event.is_set)
-    consumer = assemble_delivery_consumer(config)
+    # 最小告警装配（Issue #153）：一份 AlertingDuty 服务两条循环，各自用不同的
+    # 心跳/活性 key（见 build_alerting_duty、apps.liveness 的角色说明），因此
+    # 任一条循环停摆都能被单独发现，不会被另一条仍然健康掩盖。
+    alerting_duty = build_alerting_duty(config)
+    supervisor = build_supervisor(
+        config,
+        should_stop=stop_event.is_set,
+        heartbeat=_combined_heartbeat(alerting_duty, "gateway-longconn"),
+    )
+    consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
     delivery_thread = threading.Thread(
         target=consumer.run_forever,
-        kwargs={"stop": stop_event, "poll_interval_seconds": config.delivery_poll_interval_seconds},
+        kwargs={
+            "stop": stop_event,
+            "poll_interval_seconds": config.delivery_poll_interval_seconds,
+            "heartbeat": _combined_heartbeat(alerting_duty, "gateway-delivery"),
+            "on_tick": alerting_duty.run_once,
+        },
         name="lingxi-gateway-delivery",
         # 独立审核 P3-5：非守护线程会让解释器在退出时等它结束——如果它没能在
         # 停机预算内 join 完，下面"进程仍将继续关闭"这句话在 daemon=False 时其实

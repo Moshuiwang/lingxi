@@ -38,6 +38,14 @@ services:
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
+  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 共用同一份
+  # `.env.prod.worker`，理由见 compose.stage.yaml 同名 service 的注释。
+  worker-queue:
+    env_file:
+      - ./.env.prod.worker
+    volumes:
+      - lingxi-users:/var/lib/lingxi/users
+
   migrate:
     env_file:
       - ./.env.prod.migrate

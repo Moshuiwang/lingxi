@@ -379,5 +379,83 @@ print([notice.event_type for notice in manager.tick(at=now + timedelta(seconds=3
         ])
 
 
+class DeliveryAlertCallbackTests(unittest.TestCase):
+    """Issue #153：Gateway ``DeliveryConsumer.on_alert`` 注入点接到真实告警路由
+    ——``AlertingDuty.delivery_alert_callback()`` 是这条注入点的落地形式。"""
+
+    def test_a_delivery_alert_is_observed_as_a_feishu_send_failed_signal(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("dispatch_uncertain_card_finish.feishu_send_failed", sender.calls[0]["text"])
+
+    def test_kind_strings_are_sanitized_into_a_safe_scope(self) -> None:
+        """真实 kind 字符串带冒号与大写字母（如 ``fallback_send_failed:
+        TimeoutError``），AlertSignal 的 scope 校验只接受小写字母数字与
+        ``_.-``——不消毒直接传会在这里抛 ValueError，告警本身也就不会发生。
+        """
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        # 不应抛出 ValueError——这正是本用例要证明的。
+        callback("fallback_send_failed:TimeoutError", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+
+    def test_an_unsafe_task_id_degrades_to_no_trace_id_instead_of_dropping_the_alert(
+        self,
+    ) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_create", "带空格的非法-id 值")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1, "trace_id 格式异常不得让整条告警消失")
+        self.assertIn("trace_id=-", sender.calls[0]["text"])
+
+    def test_different_delivery_kinds_do_not_share_a_dedupe_window(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_create", "01J00000000000000000000TAS1")
+        callback("progress_persist_failed:RuntimeError", "01J00000000000000000000TAS2")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(
+            len(sender.calls), 2, "两类不同的投递失败必须各自独立限流，不能互相压制"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

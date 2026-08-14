@@ -97,6 +97,19 @@ services:
       # 专用授权凭据：跨部署持久，镜像替换与重启不得丢失。
       - lingxi-credentials:/var/lib/lingxi/credentials
 
+    # ---- 健康检查（断言 V-部署-* / Issue #153）---------------------------------
+    # 不监听任何端口：用 `docker exec` 语义在容器内跑一条受控命令（合同第 5 条：
+    # "healthcheck 使用进程/数据库心跳或受控命令，不为健康检查扩大网络攻击面"）。
+    # 该命令同时探测数据库可达性与主循环活性文件——依赖不可用或主循环停摆都会
+    # 让它如实变红，不接受"PID 存活即健康"（`scripts/ci/check_deploy_contract.py`
+    # 会核对每个常驻服务都配了 healthcheck）。
+    healthcheck:
+      test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "scheduler"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   # 飞书长连接接入：收事件、落库成任务（#57 / S4 前半）。
   #
   # ---- 为什么放在**非默认 profile** 里 ----------------------------------------
@@ -111,7 +124,14 @@ services:
   # 这与 #57 的登记一致：组件已交付，尚未接线。
   gateway:
     image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
-    profiles: ["gateway"]
+    # ---- profile 归属（Issue #153）------------------------------------------
+    # 仍然保留独立的 `gateway` profile：`deploy/README.md` 里 `--profile gateway`
+    # 这条既有命令继续按原样工作，不因本次改动改变含义。同时加入新的 `mvp`
+    # profile——它与 scheduler（无 profile，恒常驻）、`worker-queue`
+    # （新增，见下）一起构成"同时启动迁移后的 scheduler、gateway、常驻 queue
+    # worker"这个受控部署形态（#153 范围第 1 条）。两个 profile 名字任一命中都
+    # 会启动这个服务（compose 的 profiles 语义是 OR，不是 AND）。
+    profiles: ["gateway", "mvp"]
     restart: unless-stopped
 
     # ---- 停止宽限期（断言 V-部署-03，#57 同型认领）---------------------------
@@ -146,6 +166,13 @@ services:
     # 不挂任何持久卷：gateway 的状态全部在数据库里，容器内不写需要持久化的东西
     # （断言 V-部署-02）。凭据走 env_file，见各环境的覆盖文件。
 
+    healthcheck:
+      test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "gateway"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
   # 一次性作业：单回合受控执行。`docker compose run --rm worker`
   #
   # **不是常驻服务**，因此没有 restart 策略、没有 stop_grace_period、没有 healthcheck。
@@ -171,6 +198,59 @@ services:
       # 用户环境目录：与凭据**不同的卷**（断言 M2-62-28）。用户产物与会话在这里，
       # 备份周期、恢复策略与删除语义都与凭据不同，合成一个卷会让两者无法分别处置。
       - lingxi-users:/var/lib/lingxi/users
+
+  # 常驻服务：队列消费者。`LINGXI_WORKER_MODE=queue` 让**同一个镜像**跑
+  # apps/worker/cli.py 的长期循环分支而不是单回合分支（Issue #153）——与
+  # `worker`（一次性 `turn` job）刻意是**两个不同的 compose service**，而不是
+  # 同一个 service 靠 profile 切行为：compose 的 service 定义只有一份，
+  # `check_deploy_contract.py` 对 `worker` 的既有断言（无 restart、无
+  # stop_grace_period、无 healthcheck）必须继续成立，不能因为新增常驻用法而放松。
+  #
+  # 只在 `mvp` profile 里，不进默认 `docker compose up -d`——与 scheduler/gateway
+  # 一起构成 Epic A 的候选/Stage 验收对象，不静默改变生产发布入口（#153 范围第 1
+  # 条、可观察完成标准第 1 条）。
+  worker-queue:
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    profiles: ["mvp"]
+    restart: unless-stopped
+
+    environment:
+      LINGXI_WORKER_MODE: queue
+
+    # ---- 停止宽限期（Issue #153；apps/worker/config.py 的
+    # DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 头部注释有完整推导）----------------------
+    #   1.0s   /stop 检测延迟   stop_poll_interval_seconds 默认值
+    #  30.0s   SDK 收尾宽限     DEFAULT_DRAIN_GRACE_SECONDS，独立于业务墙钟
+    #  15.0s   终态写库预算     按连接工厂合法覆盖上界 MAX_TIMEOUT_SECONDS=5 建模
+    #                           （5 + 2×5）
+    #  -----
+    #  46.0s   最坏情况 → ×1.5 安全系数 = 69s → 取整到 90s（与本服务自身
+    #          LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS 默认 45s 留出充分余量：
+    #          进程自己会在 45s 内主动退出，这里的 90s 只是 SIGKILL 兜底）。
+    # 这个不等式由 scripts/ci/check_deploy_contract.py 守住，改了
+    # DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 而不改这里，门禁会红。
+    stop_grace_period: 90s
+
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes:
+      - lingxi-users:/var/lib/lingxi/users
+
+    healthcheck:
+      test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "worker"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   # 一次性作业：数据库迁移。`docker compose run --rm migrate`
   #

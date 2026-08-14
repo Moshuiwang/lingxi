@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0060_gateway_delivery_dispatch` |
+| head revision | `0061_agent_session_cleanup` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -194,6 +194,20 @@ Issue #152。在 `task` 上新增四列（`delivery_consumed_sequence`、`delive
 未启用的 `card_id`/`card_seq`/`fallback_text` 同表。理由详见 revision 文件头部注释。
 
 纯新增列，前滚兼容；`downgrade()` 直接 `DROP COLUMN`，不存在需要回填的历史值。
+
+## `0061_agent_session_cleanup`（Agent 会话 JSONL 物理清理队列）
+
+Issue #153。新表 `agent_session_cleanup`：三个会话边界触发点（`/new`、空闲两小时
+到点、停用/权限变化感知）各自往这里排队"哪个 `agent_session_id` 不会再被 resume
+了"，真正的物理文件删除延后到常驻 Worker 的周期性收口认领执行——触发点所在的
+Gateway/scheduler 进程都没有挂载用户环境目录。`agent_session_id` 唯一索引防止
+并发触发（例如 `/new` 与空闲到点扫描撞在同一时刻）产生重复待办；`queued_at` 上的
+局部索引（`WHERE done_at IS NULL`）让待处理队列的领取查询不随历史已完成行增长
+变慢。理由详见 revision 文件头部注释与[数据库设计「问数结果投递事件与会话保留
+Outbox」](../docs/技术设计/数据库设计.md#问数结果投递事件与会话保留-outbox)。
+
+整张表本 revision 新增，前滚兼容；`downgrade()` 直接 `DROP TABLE`，不存在需要
+回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
