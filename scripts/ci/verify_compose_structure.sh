@@ -30,9 +30,11 @@ workspace=$(mktemp -d -t lingxi62-compose-XXXXXX)
 # 否则 `compose config` 会在 env_file 不存在时直接报错。
 placeholders=(
   deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway
-  deploy/.env.stage.worker deploy/.env.stage.migrate deploy/.env.stage.reauthorize
+  deploy/.env.stage.worker deploy/.env.stage.worker-queue
+  deploy/.env.stage.migrate deploy/.env.stage.reauthorize
   deploy/.env.prod  deploy/.env.prod.scheduler  deploy/.env.prod.gateway
-  deploy/.env.prod.worker  deploy/.env.prod.migrate deploy/.env.prod.reauthorize
+  deploy/.env.prod.worker  deploy/.env.prod.worker-queue
+  deploy/.env.prod.migrate deploy/.env.prod.reauthorize
 )
 created=()
 cleanup() {
@@ -103,8 +105,10 @@ PYTHON
 )
 
 for environment in stage prod; do
+  # --profile mvp（Issue #153）：把 worker-queue 也纳入结构对照，否则它只在
+  # mvp profile 下才可见，stage/prod 之间的等价性就漏了这个常驻服务一半的检查。
   docker compose -f deploy/compose.yaml -f "deploy/compose.${environment}.yaml" \
-    --profile job --profile gateway config --format json > "${workspace}/${environment}.json"
+    --profile job --profile gateway --profile mvp config --format json > "${workspace}/${environment}.json"
   python3 -c "${summary_program}" "${workspace}/${environment}.json" \
     > "${workspace}/${environment}.summary"
 done

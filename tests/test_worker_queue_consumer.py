@@ -18,11 +18,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
+import signal
+import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
 from lingxi.adapters.postgres import connect
@@ -565,6 +569,303 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
         )
 
+    def test_a_global_stop_signal_interrupts_an_in_flight_turn_within_the_poll_interval(
+        self,
+    ) -> None:
+        """Issue #153：SIGTERM 落地为 ``run(stop_event=...)`` 收到停止信号时，在途
+        任务的 ``_monitor`` 必须把这次全局停机与用户 ``/stop`` 同等对待——不是等
+        任务自然结束（例如撞满 turn_timeout），而是在一个 ``stop_poll_interval``
+        量级的时间内就让执行器收到中断请求，并把任务收口为 ``stopped`` 终态。
+        改掉 ``_monitor`` 里对 ``self._global_stop`` 的检查（或不在 ``run()`` 里
+        赋值它）都必须让本用例变红：要么在途回合永远等不到中断（用例超时），
+        要么虽然结束但终态不是 ``stopped``。
+        """
+
+        queue = FakeWorkerQueue()
+        turn_started = threading.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                turn_started.set()
+                # 真实执行器在 stop_event 被置位时会向 Agent SDK 发起 interrupt()
+                # 并很快返回；这里直接用同一个协作式信号模拟"回合已经响应中断"。
+                await kwargs["stop_event"].wait()  # type: ignore[union-attr]
+                return {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {"code": "interrupted"},
+                }
+
+        service = WorkerService(
+            config=worker_config(stop_poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> float:
+            global_stop = asyncio.Event()
+            run_task = asyncio.create_task(service.run(stop_event=global_stop))
+            started = await asyncio.to_thread(turn_started.wait, 2.0)
+            self.assertTrue(started, "回合应先真正开始执行，才能验证停机信号能中断它")
+            began_stopping_at = time.monotonic()
+            global_stop.set()
+            await asyncio.wait_for(run_task, timeout=2.0)
+            return time.monotonic() - began_stopping_at
+
+        elapsed = asyncio.run(scenario())
+
+        self.assertLess(
+            elapsed,
+            1.0,
+            "全局停机信号必须在一个 stop_poll_interval 量级内让在途回合收到中断"
+            "请求并收口，不能等到轮询周期之外的更长预算",
+        )
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "stopped")
+        self.assertEqual(terminal["error_kind"], "stopped")
+
+    def test_a_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_stops_claiming(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P2-1：`run()` 的 `while not stop.is_set()` 判定与
+        `claim()` 之间没有任何 `await`（心跳、告警 tick、`_housekeep()` 全是同步
+        代码），而 `loop.add_signal_handler` 装的回调靠自管道机制投递，只有
+        事件循环真正让出控制权时才会被处理——纯同步的代码段中间没有能被它
+        插进来的缝隙。真实 SIGTERM 如果恰好在这段同步窗口内被操作系统送达，
+        Python 侧当时只是把回调排进了事件循环的就绪队列，`process_once()`
+        如果不主动让出一次就直接判定，读到的仍是旧值，会把一条还在排队、
+        从未执行过的任务领走，直接收口成 ``stopped`` 且不会被重排。
+
+        复现手法：把 ``_housekeep`` 换成一个"在这次同步调用期间，把停机信号
+        排进事件循环就绪队列"的版本——这精确模拟了"信号回调已排队、尚未
+        执行"这个状态，不依赖真实操作系统信号的时序抖动。
+
+        变异验证：把 `process_once()` 里 `claim()` 前的 `await
+        asyncio.sleep(0)` + 重新判定 `is_set()` 整段删掉，本用例会变红
+        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
+        ``stopped``）。
+        """
+
+        queue = FakeWorkerQueue()
+        claim_calls = 0
+        original_claim = queue.claim
+
+        def counting_claim(**kwargs: object) -> list[ClaimedTask]:
+            nonlocal claim_calls
+            claim_calls += 1
+            return original_claim(**kwargs)
+
+        queue.claim = counting_claim  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> None:
+            stop = asyncio.Event()
+
+            # 精确模拟"SIGTERM 的自管道回调已经在事件循环就绪队列里排队、
+            # 但还没被处理"：这次同步的 `_housekeep()` 调用期间，操作系统
+            # 送达了信号，`loop.call_soon` 把 `stop.set` 排进了就绪队列。
+            original_housekeep = service._housekeep
+
+            def housekeeping_that_races_with_sigterm() -> list[object]:
+                asyncio.get_running_loop().call_soon(stop.set)
+                return original_housekeep()
+
+            service._housekeep = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
+
+            run_task = asyncio.ensure_future(service.run(stop_event=stop))
+            await asyncio.wait_for(run_task, timeout=2.0)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(
+            claim_calls,
+            0,
+            "停机信号已经排队后，claim() 不应该再被调用——一条从未执行过的"
+            "排队任务不该被领走后直接收口成 stopped",
+        )
+        self.assertIsNotNone(
+            queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
+        )
+        self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
+
+    def test_liveness_stays_fresh_through_a_long_in_flight_turn(self) -> None:
+        """PR #173 独立复核 P1-5：``_emit_heartbeat()``（进而 ``touch_liveness``）
+        此前只在 ``process_once()`` 开头调用一次，而 ``process_once()`` 会
+        ``await asyncio.gather(...)`` 等完整批任务才返回——任何明显长于活性
+        阈值的正常回合都会把活性文件晾在原地不动，直到该批任务结束，健康检查
+        在系统最忙的时候持续说谎（生产比例：`turn_timeout_seconds` 默认
+        600s、worker 活性阈值默认 60s）。
+
+        本用例用远比生产宽松的比例复现（回合 0.4s、阈值 0.15s，宽松约 4 倍）：
+        ``_monitor`` 本来就按 ``stop_poll_interval_seconds`` 在跳、贯穿整个
+        在途任务的生命周期，是"进程仍在做正确的事"这个信号真正应该来源的
+        地方。
+
+        变异存活证据：把 ``_monitor`` 循环里那次 ``self._emit_heartbeat()``
+        删掉，本用例会变红（活性年龄峰值追上回合时长，超过阈值）。
+        """
+
+        from lingxi.apps.liveness import read_liveness_age_seconds, touch_liveness
+
+        queue = FakeWorkerQueue()
+        turn_seconds = 0.4
+        threshold_seconds = 0.15
+
+        class SlowExecutor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                await asyncio.sleep(turn_seconds)
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            max_age_seen = 0.0
+
+            service = WorkerService(
+                config=worker_config(stop_poll_interval_seconds=0.02),
+                queue=queue,
+                executor_factory=lambda config, marker: SlowExecutor(),
+                heartbeat=lambda: touch_liveness("worker", directory=directory),
+            )
+
+            async def poll_liveness_during_the_turn() -> None:
+                nonlocal max_age_seen
+                deadline = time.monotonic() + turn_seconds + 0.3
+                while time.monotonic() < deadline:
+                    age = read_liveness_age_seconds("worker", directory=directory)
+                    if age is not None:
+                        max_age_seen = max(max_age_seen, age)
+                    await asyncio.sleep(0.02)
+
+            async def scenario() -> None:
+                poller = asyncio.ensure_future(poll_liveness_during_the_turn())
+                await service.process_once()
+                poller.cancel()
+                try:
+                    await poller
+                except asyncio.CancelledError:
+                    pass
+
+            asyncio.run(scenario())
+
+        self.assertLess(
+            max_age_seen,
+            threshold_seconds,
+            "在途任务执行期间活性文件年龄不应超过阈值——否则健康检查会在"
+            "完全正常的长回合期间把容器判定为 unhealthy",
+        )
+
+    def test_a_real_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_stops_claiming(
+        self,
+    ) -> None:
+        """PR #173 独立复核第二轮 P2-1：上一轮 `test_a_sigterm_that_lands_
+        during_the_synchronous_housekeeping_stretch_stops_claiming` 用
+        `loop.call_soon(stop.set)` 模拟"信号回调已排队未执行"被复核证明与
+        真实信号路径不等价——`loop.call_soon` 直接进就绪队列，跳过了
+        `loop.add_signal_handler` 自管道机制的两跳，一次 `sleep(0)` 就够；真实
+        SIGTERM 经自管道投递需要三轮让出才会被观测到（见
+        ``service.py`` 模块顶部 ``_STOP_SIGNAL_DRAIN_YIELDS`` 的机制说明）。
+        本用例改用**真实 POSIX 信号**（进程内 ``os.kill(os.getpid(),
+        signal.SIGTERM)``）经真实 ``_run_queue_worker`` 里真实的
+        ``loop.add_signal_handler`` 路径复现，不再依赖任何模拟。
+
+        复现手法：``os.kill`` 从 ``_housekeep()`` 内部、在它返回前触发——这
+        精确复现"SIGTERM 恰好在 claim() 前的同步窗口内被操作系统送达"这个
+        场景，且是真实内核信号投递，不是任何形式的模拟。
+
+        变异验证：把 `process_once()` 里 claim() 前新增的多轮让出+复判整段
+        删掉（或把 `_STOP_SIGNAL_DRAIN_YIELDS` 改回 1），本用例会变红
+        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
+        ``stopped``，且不会被重排）。
+        """
+
+        from lingxi.adapters.postgres_conversation import ClaimedTask as _ClaimedTask
+        from lingxi.apps.worker.cli import _run_queue_worker
+
+        queue = FakeWorkerQueue()
+        claim_calls = 0
+        original_claim = queue.claim
+
+        def counting_claim(**kwargs: object) -> list[_ClaimedTask]:
+            nonlocal claim_calls
+            claim_calls += 1
+            return original_claim(**kwargs)
+
+        queue.claim = counting_claim  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(poll_interval_seconds=0.01),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        original_housekeep = service._housekeep
+        signal_sent = False
+
+        def housekeeping_that_sends_a_real_sigterm() -> list[object]:
+            nonlocal signal_sent
+            result = original_housekeep()
+            if not signal_sent:
+                signal_sent = True
+                # 真实内核信号，不是模拟。此时 `_run_queue_worker` 已经用真实
+                # `loop.add_signal_handler` 装好了 SIGTERM 处理器，同进程内
+                # 自己发给自己是让真实信号落在这段同步窗口内最直接、最可控的
+                # 方式——处理器已接管，不会走到默认终止行为，不影响测试进程
+                # 本身的存活。
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+
+        service._housekeep = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
+
+        err = io.StringIO()
+
+        async def scenario() -> None:
+            await _run_queue_worker(
+                service,
+                shutdown_timeout_seconds=2.0,
+                err=err,
+                trace_id="01J00000000000000000000SIG",
+            )
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+
+        self.assertIn(
+            "worker.queue.signal_received",
+            err.getvalue(),
+            "真实信号处理器必须确实跑过一次，否则本用例没有测到真实信号路径",
+        )
+        self.assertEqual(
+            claim_calls,
+            0,
+            "真实 SIGTERM 已经在 housekeeping 同步窗口内送达后，claim() 不应该"
+            "再被调用——一条从未执行过的排队任务不该被领走后直接收口成"
+            " stopped",
+        )
+        self.assertIsNotNone(
+            queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
+        )
+        self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
+
 
 @unittest.skipUnless(DSN, SKIP_DB)
 class RealQueueTerminalTests(unittest.TestCase):
@@ -993,6 +1294,58 @@ class RealQueueTerminalTests(unittest.TestCase):
                 ("session-saved", None),
             )
 
+    def test_finish_queues_the_overwritten_agent_session_for_cleanup(self) -> None:
+        """PR #173 独立复核 P2-4：``finish()`` 用
+        ``agent_session_id = COALESCE(%s, agent_session_id)`` 写回，旧值被新值
+        覆盖时，此前三个既有触发点（``/new``、空闲到点、停用/权限变化）都不会把
+        这个旧 session id 排队做物理清理——话题闲置未满两小时就被新一轮任务
+        覆盖，或真实 CLI 的 ``--resume`` 返回了新 session id，都会让旧的 JSONL
+        永久留在磁盘上。
+
+        用一个已经带着 ``agent_session_id='old-session'`` 的会话验证：新任务
+        ``finish(agent_session_id='new-session')`` 之后，``old-session`` 必须
+        出现在 ``agent_session_cleanup`` 里、原因是 ``session_overwritten``，
+        而 ``new-session`` 不应该被排队（它是活跃会话，不该被清理）。
+        """
+
+        self._insert_old_task(task_id="tsk-overwrite", conversation_id="cnv-overwrite")
+        self.execute(
+            "UPDATE conversation SET agent_session_id='old-session' WHERE id='cnv-overwrite'"
+        )
+
+        claimed = self.queue.claim(worker_id="worker-overwrite", target_worker_version="stable")
+        self.assertEqual(claimed[0].conversation_id, "cnv-overwrite")
+
+        finished = self.queue.finish(
+            task_id=claimed[0].task_id,
+            conversation_id="cnv-overwrite",
+            status="succeeded",
+            worker_id="worker-overwrite",
+            agent_session_id="new-session",
+        )
+        self.assertTrue(finished)
+
+        with connect(DSN) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT agent_session_id FROM conversation WHERE id='cnv-overwrite'"
+                ).fetchone()[0],
+                "new-session",
+            )
+            row = connection.execute(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id='old-session'"
+            ).fetchone()
+            self.assertIsNotNone(
+                row, "被覆盖的旧 session id 必须被排队做物理清理，否则永久留在磁盘上"
+            )
+            self.assertEqual(row[0], "session_overwritten")
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='new-session'"
+                ).fetchone(),
+                "刚写入的新 session id 是活跃会话，不该被排队清理",
+            )
+
     def test_enqueue_failure_has_one_catalog_notice_and_reprocesses_after_recovery(self) -> None:
         assert DSN is not None
         log = CallLog()
@@ -1034,3 +1387,148 @@ class RealQueueTerminalTests(unittest.TestCase):
             "task_queued",
             "失败事务没有落 inbound_event，故故障恢复后重投必须能够完整入队",
         )
+
+
+@unittest.skipUnless(DSN, SKIP_DB)
+class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
+    """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
+    的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的
+    正确性已在 ``tests/test_delivery_outbox.py`` 的 ``AgentSessionCleanupQueueTests``
+    覆盖，本文件只覆盖 ``WorkerService._cleanup_agent_sessions`` 这一段消费。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        assert DSN is not None
+        ensure_production_schema(DSN)
+
+    def setUp(self) -> None:
+        assert DSN is not None
+        reset_production_rows(DSN)
+        self.queue = PostgresTaskQueue(DSN)
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO app_user
+                       (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                        display_name, department, tenant_key, provisioning_state)
+                       VALUES ('usr-90','ou-90','u-90','un-90','张三','数据部','tk-90','active')"""
+                )
+
+    def _queue_cleanup(self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command") -> None:
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+                       VALUES (%s, 'usr-90', %s, %s)""",
+                    (cleanup_id, agent_session_id, reason),
+                )
+
+    def test_deletes_the_matching_file_and_marks_the_row_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000000SESS.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            service._cleanup_agent_sessions()
+
+            self.assertFalse(jsonl.exists())
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-1'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_a_cleanup_for_a_session_that_never_produced_a_file_is_still_marked_done(self) -> None:
+        """任务在建会话前就失败，从未真正落过盘——这不是清理失败，必须照常
+        标记完成，不能让一条永远匹配不到文件的记录卡住队列。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._queue_cleanup(cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=Path(tmp),
+            )
+            service._cleanup_agent_sessions()
+
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-2'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_without_a_configured_session_root_the_queue_is_left_untouched(self) -> None:
+        """没有可用会话根目录时整体跳过——不半途认领又做不了事（模块说明）。"""
+
+        self._queue_cleanup(cleanup_id="asc-int-3", agent_session_id="01J00000000000000000SKIP")
+
+        service = WorkerService(config=worker_config(), queue=self.queue, session_root=None)
+        service._cleanup_agent_sessions()
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-3'"
+            ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+
+    def test_a_configured_but_nonexistent_session_root_is_not_marked_done(self) -> None:
+        """PR #173 独立复核 P2-6：``LINGXI_WORKER_SESSION_ROOT`` **配置了**、但指向
+        一个不存在的目录（照抄旧版 ``.env.example`` 的示例值就会这样，镜像固定
+        ``HOME=/tmp``），与"根目录存在、这个会话确实没有文件"必须是两种不同的
+        结果。前者是"这次没法处理"，理应留给下一次十分钟软窗口重试；后者才是
+        "已确认无事可做"。改动前两者被合并成同一个 `mark_done` 分支——
+        `agent_session_cleanup.agent_session_id` 是唯一索引 + `ON CONFLICT DO
+        NOTHING`，一旦被标记完成就再也不会被重新排队，事后把配置改对也补不回来。
+        """
+
+        self._queue_cleanup(cleanup_id="asc-int-5", agent_session_id="01J00000000000000NOTREAL")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_root = Path(tmp) / "does-not-exist"
+            self.assertFalse(missing_root.exists())
+
+            service = WorkerService(
+                config=worker_config(), queue=self.queue, session_root=missing_root
+            )
+            service._cleanup_agent_sessions()
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-5'"
+            ).fetchone()
+        self.assertIsNotNone(
+            row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写"
+        )
+        self.assertIsNone(
+            row[1],
+            "根目录不存在时不能标记完成：事后把配置改对也补不回一条已经被"
+            "标记完成的行（唯一索引 + ON CONFLICT DO NOTHING）",
+        )
+
+    def test_runs_end_to_end_through_process_once_via_the_housekeep_round(self) -> None:
+        """确认接线到了真正的入口——``process_once()`` 而不是只有直接调用私有
+        方法才生效（否则装配一处没接对，生产环境永远不会真正清理）。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000PROCE.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            asyncio.run(service.process_once())
+
+            self.assertFalse(jsonl.exists())

@@ -54,6 +54,7 @@ class WorkerTurnExecutor:
         stderr_stream: Any | None = None,
         clock: Callable[[], float] | None = None,
         mark_external_side_effect: Callable[[], None] | None = None,
+        propagate_cancellation: bool = False,
     ) -> None:
         self._config = config
         self._policy = ToolPolicy(allowed_tools=(config.read_only_tool,))
@@ -69,6 +70,10 @@ class WorkerTurnExecutor:
         self._options: Any = None
         self._stderr_stream = sys.stderr if stderr_stream is None else stderr_stream
         self._clock = time.monotonic if clock is None else clock
+        # 见 `run_turn` 里 `except asyncio.CancelledError` 分支的说明（PR #173
+        # 独立复核 P1-3）：默认 False，保持一次性 turn 模式 CLI 的既有行为
+        # （stdout 必须恰好一个 JSON 报告，取消也要留下可辨认的失败回合）。
+        self._propagate_cancellation = propagate_cancellation
 
     @property
     def policy(self) -> ToolPolicy:
@@ -182,9 +187,24 @@ class WorkerTurnExecutor:
             del error
             failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
         except asyncio.CancelledError:
-            # BaseException 不接住就没有报告，违反 cli 的 stdout 契约
-            # 「恰好一个 JSON 对象」；取消也要留下一份可辨认的失败回合，不能伪装成
-            # 正常完成或墙钟超时。
+            # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
+            # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
+            # 失败回合，不能伪装成正常完成或墙钟超时。
+            #
+            # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
+            # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
+            # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
+            # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
+            # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
+            # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
+            # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
+            # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
+            # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
+            # 路径。真实证据：`tests/test_worker_process.py` 的
+            # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
+            # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
+            if self._propagate_cancellation:
+                raise
             failure = _failure_message("cancelled", "任务已取消，未继续执行")
         except KeyboardInterrupt as error:
             failure = _failure("interrupted", error)

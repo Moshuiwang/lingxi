@@ -19,8 +19,14 @@ from lingxi.adapters.postgres import (
     PostgresTimeoutConfigError,
     PostgresTimeouts,
 )
+from lingxi.core.alerting import AlertPolicy
 
 ENV_PREFIX = "LINGXI_GATEWAY_"
+
+# 飞书开放平台地址来自配置，代码里只有一个可被覆盖的默认值（断言 V-部署-01）；
+# 与 apps/scheduler/__init__.py 的 DEFAULT_FEISHU_BASE_URL 同一取舍——只有告警
+# 出口的 FeishuGroupMessages（走标准库 urllib，不经 lark-oapi）需要这个原始 URL。
+DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
 
 class GatewayConfigError(ValueError):
@@ -56,6 +62,12 @@ class GatewayConfig:
     # Worker 进程，不在本进程内——轮询间隔是唯一的发现机制，因此默认取一个较短的值。
     delivery_poll_interval_seconds: float = 1.0
     delivery_batch_limit: int = 20
+    # 最小告警装配（Issue #153）：管理群 chat_id **可选**——没有它进程照常启动，
+    # 只是告警只落到结构化日志、不真正发进管理群，与 scheduler 的
+    # `admin_group_chat_id` 同一取舍（一个尚未接线的可选职责不该让整个进程起不来）。
+    admin_group_chat_id: str | None = None
+    alert_policy: AlertPolicy = field(default_factory=AlertPolicy)
+    feishu_base_url: str = DEFAULT_FEISHU_BASE_URL
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -120,6 +132,24 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
     except PostgresTimeoutConfigError as error:
         raise GatewayConfigError(str(error)) from None
 
+    raw_chat_id = _text(env, "ADMIN_GROUP_CHAT_ID")
+    if raw_chat_id:
+        from lingxi.adapters.feishu_group_message import validate_group_chat_id
+
+        try:
+            admin_group_chat_id: str | None = validate_group_chat_id(
+                raw_chat_id, variable_name=f"{ENV_PREFIX}ADMIN_GROUP_CHAT_ID"
+            )
+        except ValueError as error:
+            raise GatewayConfigError(str(error)) from None
+    else:
+        admin_group_chat_id = None
+
+    try:
+        alert_policy = AlertPolicy.from_mapping(env, prefix=f"{ENV_PREFIX}ALERT_")
+    except ValueError as error:
+        raise GatewayConfigError(str(error)) from None
+
     config = GatewayConfig(
         app_id=_text(env, "APP_ID") or "",
         app_secret=_Secret(_text(env, "APP_SECRET") or ""),
@@ -131,6 +161,9 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         shutdown_timeout_seconds=_number(env, "SHUTDOWN_TIMEOUT_SECONDS", 20.0),
         delivery_poll_interval_seconds=_number(env, "DELIVERY_POLL_INTERVAL_SECONDS", 1.0),
         delivery_batch_limit=_positive_int(env, "DELIVERY_BATCH_LIMIT", 20),
+        admin_group_chat_id=admin_group_chat_id,
+        alert_policy=alert_policy,
+        feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

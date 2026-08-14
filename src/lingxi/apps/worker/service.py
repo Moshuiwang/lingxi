@@ -3,15 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TerminalTask
 from lingxi.apps.worker.config import WorkerConfig
+from lingxi.apps.worker.session_cleanup import delete_agent_session_files
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import TerminalKind
+
+logger = logging.getLogger(__name__)
+
+# `claim()` 前重判停机信号需要跨过 `loop.add_signal_handler` 自管道机制的完整
+# 投递链路（PR #173 独立复核第二轮 P2-1）：OS 送达信号 → 自管道被写入一个
+# 字节 → 事件循环下一轮 `select()` 才发现可读，把**自管道 reader 回调**排进
+# 就绪队列并在同一轮执行 → 该回调再把**真正的用户回调**（这里是
+# `stop.set()`）通过 `_add_callback_signalsafe` 排进下一轮就绪队列 → 再下一轮
+# 才真正执行。经真实 SIGTERM + 真实 `add_signal_handler` 实测（5/5、3/3 稳定
+# 复现，见该轮评论）：`await asyncio.sleep(0)` 只能让当前协程前进一轮，必须
+# 连续让出 **3 轮**才能观测到 `is_set()` 变为 True——上一版只让出一次，对
+# 真实信号无效（对 `loop.call_soon` 模拟的假信号有效，因为它跳过了自管道的
+# 两跳，这也是为什么当时新增用例是绿的、生产路径依旧漏的原因）。这里给到
+# 5 轮，在实测必需的 3 轮之上留出实现细节漂移的余量；一旦提前观测到
+# `is_set()` 就立即返回，不多空转。
+_STOP_SIGNAL_DRAIN_YIELDS = 5
 
 
 class QueueListener(Protocol):
@@ -49,12 +68,25 @@ class WorkerService:
         monotonic: Callable[[], float] = time.monotonic,
         heartbeat: HeartbeatCallback | None = None,
         on_task_stuck: TaskStuckCallback | None = None,
+        session_root: Path | None = None,
+        session_cleanup_batch_limit: int = 20,
+        on_alert_tick: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
         self._executor_factory = executor_factory or (
             lambda worker_config, marker: WorkerTurnExecutor(
-                worker_config, mark_external_side_effect=marker
+                worker_config,
+                mark_external_side_effect=marker,
+                # 常驻 queue worker 必须让 SIGTERM 停机预算耗尽时的取消原样传播
+                # 出来（PR #173 独立复核 P1-3）：默认行为（一次性 turn 模式 CLI
+                # 那份）会把取消吞成一份"已取消"的失败报告并正常返回，
+                # `_process_task` 就会把它当成真实完成的回合同步写终态——预算
+                # 耗尽后任务本该保持 `running`、交给心跳超时回收
+                # （`reclaim_stale_with_outcomes`，已在 #90/#151 验证），不该被
+                # 写成一次可能失真的 FAILED 终态。见 `WorkerTurnExecutor.run_turn`
+                # 里 `propagate_cancellation` 的完整说明。
+                propagate_cancellation=True,
             )
         )
         self._listener_factory = listener_factory
@@ -63,12 +95,43 @@ class WorkerService:
         self._monotonic = monotonic
         self._heartbeat = heartbeat
         self._on_task_stuck = on_task_stuck
+        # Agent 会话 JSONL 物理清理（Issue #153）：``None`` 表示当前环境没有可用的
+        # 会话根目录（例如缺 ``HOME``），此时 ``_cleanup_agent_sessions`` 整体跳过，
+        # 不触碰清理队列——留着排队等下一个配置正确的进程来处理，而不是假装已清理。
+        self._session_root = session_root
+        self._session_cleanup_batch_limit = session_cleanup_batch_limit
+        # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
+        # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
+        self._on_alert_tick = on_alert_tick
+        # SIGTERM 收到后由 run() 设置：在途任务的 `_monitor` 据此把"进程正在停机"
+        # 与"用户发了 /stop"同等看待，主动请求 Agent SDK 中断当前回合（Issue #153
+        # 完成标准第 3 条）。默认 None，保持 process_once()/白盒测试的既有行为不变。
+        self._global_stop: asyncio.Event | None = None
 
     async def process_once(self) -> bool:
         """做一轮回收、领取和执行；返回这一轮是否观察到任务。"""
 
         self._emit_heartbeat()
+        self._tick_alerts()
         terminal_tasks = self._housekeep()
+
+        # 再判一次停机信号，紧贴在 claim() 之前（PR #173 独立复核 P2-1，第二轮
+        # 复核证明单次 `sleep(0)` 对真实信号无效，见模块顶部
+        # `_STOP_SIGNAL_DRAIN_YIELDS` 的机制说明）：`run()` 的
+        # `while not stop.is_set()` 判定与这里的 `claim()` 之间没有任何 await
+        # （心跳、告警 tick、`_housekeep()` 全是同步代码），信号如果恰好在这段
+        # 同步窗口内被操作系统送达，`self._global_stop.is_set()` 在没有真正让
+        # 事件循环跑完自管道投递链路之前读到的都是旧值——会把一条还在排队、
+        # 从未执行过的任务领走，直接收口成 `stopped` 且不会被重排。因此连续
+        # 让出 `_STOP_SIGNAL_DRAIN_YIELDS` 轮（一旦提前观测到 `is_set()` 立即
+        # 返回，不多空转），让"停止新领取"（#153 完成标准第 3 条）在这个窗口
+        # 里也真正成立。`self._global_stop` 为 ``None`` 时（`process_once()`
+        # 的白盒调用方与既有测试）跳过整段，行为不变、不多一次调度。
+        if self._global_stop is not None:
+            for _ in range(_STOP_SIGNAL_DRAIN_YIELDS):
+                await asyncio.sleep(0)
+                if self._global_stop.is_set():
+                    return bool(terminal_tasks)
 
         tasks = self._queue.claim(
             worker_id=self._config.worker_id,
@@ -91,7 +154,10 @@ class WorkerService:
                 )
             )
             terminals.extend(unavailable)
-            self._report_task_stuck("queued_stuck", len(unavailable))
+            # 独立于"排队太久"（queued_stuck）：这一类是"目标 worker 版本压根没有
+            # 可用实例"，运维需要看到的诊断动作不同（部署缺一个版本 vs 单纯积压），
+            # 因此用独立的告警类型（Issue #153 最小可观测性第四类）。
+            self._report_task_stuck("worker_version_unavailable", len(unavailable))
         reclaim_queued = getattr(self._queue, "reclaim_queued", None)
         if reclaim_queued is not None:
             queued = reclaim_queued(
@@ -123,8 +189,69 @@ class WorkerService:
         if expire_undelivered is not None:
             expired = expire_undelivered()
             terminals.extend(expired)
-            self._report_task_stuck("delivery_expired", len(expired))
+            # 与 core.alerting.AlertKind.AWAITING_DELIVERY_STUCK 对齐（Issue #153
+            # 最小可观测性第二类：queued/running/awaiting-delivery 滞留三选一）。
+            self._report_task_stuck("awaiting_delivery_stuck", len(expired))
+        self._cleanup_agent_sessions()
         return terminals
+
+    def _cleanup_agent_sessions(self) -> None:
+        """认领并物理删除一批到期的 Agent 会话 JSONL（Issue #153）。
+
+        没有配置可用的会话根目录，或队列适配器不支持这组方法（旧测试用的假队列）
+        时整体跳过——不半途认领又做不了事，让请求继续排队给下一个真正能处理它的
+        进程。单条删除失败不清 ``done_at``：下一轮的十分钟软领取窗口会重试，见迁移
+        0061 头部注释。
+        """
+
+        if self._session_root is None:
+            return
+        claim = getattr(self._queue, "claim_session_cleanups", None)
+        mark_done = getattr(self._queue, "mark_session_cleanups_done", None)
+        if claim is None or mark_done is None:
+            return
+        try:
+            pending = claim(limit=self._session_cleanup_batch_limit)
+        except Exception as error:  # noqa: BLE001 - 清理认领失败不能带走任务职责
+            logger.error("Agent 会话清理队列认领失败 error=%s", type(error).__name__)
+            return
+        if not pending:
+            return
+        # 根目录本身不存在与"根目录存在、这个会话确实没有文件"是两件不同的事
+        # （PR #173 独立复核 P2-6）：`delete_agent_session_files` 对两者都返回
+        # `0`（幂等设计，理由见该函数文档），但把这两种情况合并成同一个"标记
+        # 完成"分支是错的——`.env.example` 里一个写错的 `LINGXI_WORKER_
+        # SESSION_ROOT`（例如示例值 `/var/lib/lingxi/users/.claude/projects`，
+        # 而镜像固定 `HOME=/tmp`）会让这一批本该被清理的会话被静默标记完成；
+        # `agent_session_cleanup.agent_session_id` 是唯一索引 +
+        # `ON CONFLICT DO NOTHING`，标记完成的行不会被重新排队，事后改对配置
+        # 也补不回来。这里已经认领（`claimed_at`/`worker_id` 已写），因此不能
+        # 简单地什么都不做就返回——十分钟软领取窗口本来就是为这类"认领了但
+        # 这次处理不了"设计的重试兜底，只需要不调用 `mark_done` 即可让它到点
+        # 被下一个进程重新认领。
+        if not self._session_root.is_dir():
+            logger.error(
+                "Agent 会话清理根目录不存在，本轮跳过、不标记完成 pending=%d",
+                len(pending),
+            )
+            return
+        done_ids: list[str] = []
+        for item in pending:
+            try:
+                delete_agent_session_files(self._session_root, item.agent_session_id)
+            except Exception as error:  # noqa: BLE001 - 单条失败不影响本轮其余条目
+                logger.error(
+                    "Agent 会话 JSONL 物理删除失败 reason=%s error=%s",
+                    item.reason,
+                    type(error).__name__,
+                )
+                continue
+            done_ids.append(item.id)
+        if done_ids:
+            try:
+                mark_done(ids=done_ids)
+            except Exception as error:  # noqa: BLE001 - 标记失败只影响是否重试，不影响正确性
+                logger.error("Agent 会话清理标记完成失败 error=%s", type(error).__name__)
 
     def _emit_heartbeat(self) -> None:
         if self._heartbeat is None:
@@ -137,6 +264,26 @@ class WorkerService:
 
             logging.getLogger(__name__).error(
                 "worker 心跳记录失败，任务职责继续运行 error=%s", type(error).__name__
+            )
+
+    def _tick_alerts(self) -> None:
+        """定期戳一下告警状态机的恢复计时与投递重试（Issue #153）。
+
+        worker 没有 scheduler 那种独立的定时职责循环，借用队列消费循环本身每轮
+        调用一次；戳的频率因此等于 ``poll_interval_seconds``（默认 2 秒），比
+        scheduler 的告警职责频率高，但告警状态机本身对调用频率不敏感（去重、
+        阈值判定都基于时间戳而非调用次数）。
+        """
+
+        if self._on_alert_tick is None:
+            return
+        try:
+            self._on_alert_tick()
+        except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走任务职责
+            import logging
+
+            logging.getLogger(__name__).error(
+                "worker 告警状态机推进失败，任务职责继续运行 error=%s", type(error).__name__
             )
 
     def _report_task_stuck(self, kind: str, count: int) -> None:
@@ -332,7 +479,25 @@ class WorkerService:
     async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
         last_heartbeat = self._monotonic()
         while True:
-            if self._queue.stop_requested(task_id=task_id, worker_id=self._config.worker_id):
+            # 活性文件必须在这条循环里戳，不能只靠 `process_once()` 开头那一次
+            # （PR #173 独立复核 P1-5）：`process_once()` 会 `await
+            # asyncio.gather(...)` 等完整批任务才返回，一个正常但较长的回合
+            # （`turn_timeout_seconds` 默认 600s）足以让活性文件年龄超过 worker
+            # 角色的健康检查阈值（默认 60s），把"完全正常、只是在忙"的容器打成
+            # unhealthy。`_monitor` 本来就按 `stop_poll_interval_seconds`
+            # （默认 1s）在跳、贯穿整个在途任务的生命周期，是"进程仍在做正确的
+            # 事"这个信号真正应该来源的地方；每跳一次戳一次是本地文件写入，
+            # 成本可忽略。真实证据：`tests/test_worker_queue_consumer.py` 的
+            # ``test_liveness_stays_fresh_through_a_long_in_flight_turn`` ——
+            # 删掉这一行后该用例会变红。
+            self._emit_heartbeat()
+            # SIGTERM 与用户 `/stop` 对在途回合而言是同一件事——都要求 Agent SDK
+            # 尽快中断当前回合（Issue #153 完成标准第 3 条："通知在途回合停止"）。
+            # `self._global_stop` 只在 `run()` 收到停止信号时被置位，process_once()
+            # 的白盒调用方与既有测试不传它，行为不变。
+            if self._queue.stop_requested(
+                task_id=task_id, worker_id=self._config.worker_id
+            ) or (self._global_stop is not None and self._global_stop.is_set()):
                 stop_event.set()
             now = self._monotonic()
             if now - last_heartbeat >= self._config.heartbeat_interval_seconds:
@@ -354,6 +519,8 @@ class WorkerService:
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
+        # 见 `_monitor`：在途任务据此把"进程正在停机"与"用户发了 /stop"同等看待。
+        self._global_stop = stop
         listener_context = self._listener_factory() if self._listener_factory else None
         if listener_context is None:
             while not stop.is_set():

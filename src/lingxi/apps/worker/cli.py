@@ -22,15 +22,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
-from typing import Any, Mapping, TextIO
+from pathlib import Path
+from typing import Any, Callable, Mapping, TextIO
 
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 
-from .config import WorkerConfigError, load_config
+from lingxi.apps.liveness import touch_liveness
+
+from .config import WorkerConfig, WorkerConfigError, load_config
 from .report import config_error_report
+from .session_cleanup import default_session_root
 from .turn import WorkerTurnExecutor
 from .service import WorkerService
 
@@ -84,13 +89,36 @@ def main(
             max_concurrency=config.max_concurrency,
         )
         queue = PostgresTaskQueue(dsn)
+        alerting_duty = _build_alerting_duty(err=err, trace_id=config.trace_id)
+        session_root = _resolve_session_root(config, env)
+        if session_root is None:
+            _log(
+                err,
+                config.trace_id,
+                "error",
+                "worker.queue.session_cleanup.unconfigured",
+                message="取不到会话根目录（HOME 未设置且未显式配置 "
+                "LINGXI_WORKER_SESSION_ROOT），Agent 会话 JSONL 物理清理本次运行将不生效",
+            )
         service = WorkerService(
             config=config,
             queue=queue,
             listener_factory=lambda: PostgresTaskQueueListener(dsn),
+            heartbeat=_combined_heartbeat(alerting_duty, "worker"),
+            on_task_stuck=alerting_duty.task_stuck_callback(),
+            on_alert_tick=alerting_duty.run_once,
+            session_root=session_root,
+            session_cleanup_batch_limit=config.session_cleanup_batch_limit,
         )
         try:
-            asyncio.run(service.run())
+            asyncio.run(
+                _run_queue_worker(
+                    service,
+                    shutdown_timeout_seconds=config.shutdown_timeout_seconds,
+                    err=err,
+                    trace_id=config.trace_id,
+                )
+            )
         except KeyboardInterrupt:
             return 0
         return 0
@@ -157,6 +185,158 @@ def main(
     if report["failure"]:
         return EXIT_SESSION_FAILED
     return EXIT_OK if turn["closed"] else EXIT_TURN_NOT_CLOSED
+
+
+class _LogOnlyAlertSender:
+    """worker 的告警发送出口（Issue #153）：只记结构化日志，从不发起网络请求。
+
+    Worker 按合同不获得飞书出站密钥（代码框架「三、横切约定」、部署编排合同第 8
+    条），因此不能像 gateway/scheduler 那样把告警直接发进管理群——真正的跨进程
+    可观测需要一个 DB 载体（登记见当前能力，留 S9）。这里仍然装配完整的
+    ``AlertManager``/``AlertingDuty`` 状态机（阈值、去重、恢复计时都真实生效），
+    只是"发送"这一步落到结构化日志，运维可以从容器日志或未来接入的日志聚合里
+    看到它——不是没有告警，是告警路由目前只到日志这一层。
+
+    与本模块其余输出同一惯例——写 ``_log()`` 的结构化 JSON 行到 ``err``，不用
+    stdlib ``logging``：``main()`` 从不调用 ``logging.basicConfig()``（它的日志
+    完全由这里的显式 ``_log()`` 调用驱动），经由 stdlib ``logging`` 发出的调用
+    在没有配置 handler 时会被默认阈值（WARNING）和 lastResort 处理器悄悄吞掉，
+    看起来像是"告警从未触发"，其实只是没接上出口。
+    """
+
+    def __init__(self, *, err: TextIO, trace_id: str) -> None:
+        self._err = err
+        self._trace_id = trace_id
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        del chat_id, dedupe_key
+        _log(self._err, self._trace_id, "warning", "worker.alert", text=text)
+
+
+class _StructuredAuditSink:
+    def __init__(self, *, err: TextIO, trace_id: str) -> None:
+        self._err = err
+        self._trace_id = trace_id
+
+    def record(self, action: str, /, **fields: object) -> None:
+        _log(self._err, self._trace_id, "info", f"worker.audit.{action}", **fields)
+
+
+def _build_alerting_duty(*, err: TextIO, trace_id: str) -> Any:
+    """装配一个只走日志出口的 :class:`~lingxi.core.alerting.AlertingDuty`。
+
+    延迟 import：``core.alerting`` 不是队列消费之外路径（``turn`` 模式受控验证）
+    的依赖，保持函数内 import 与本文件其余外部依赖同一惯例。
+    """
+
+    from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
+
+    return AlertingDuty(
+        manager=AlertManager(),
+        dispatcher=AlertDispatcher(
+            sender=_LogOnlyAlertSender(err=err, trace_id=trace_id),
+            # 只是一个稳定标识，不是真实投递目标——LogOnlyAlertSender 从不读它。
+            chat_id="worker-log-only",
+        ),
+        audit=_StructuredAuditSink(err=err, trace_id=trace_id),
+    )
+
+
+def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], None]:
+    """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
+
+    与 ``apps/gateway/__init__.py``、``apps/scheduler/__init__.py`` 的同名函数
+    同一形状，见那两处的说明。
+    """
+
+    beat = alerting_duty.heartbeat_callback(liveness_role)
+
+    def combined() -> None:
+        beat()
+        touch_liveness(liveness_role)
+
+    return combined
+
+
+def _resolve_session_root(config: WorkerConfig, env: Mapping[str, str]) -> Path | None:
+    """解析 Agent 会话 JSONL 物理清理（Issue #153）用的根目录。
+
+    显式配置优先；否则退回 ``$HOME/.claude/projects``（当前部署镜像固定
+    ``HOME=/tmp``，见 Dockerfile）。两者都取不到时返回 ``None``，调用方据此
+    诚实地跳过物理清理，不猜一个可能错误的路径。
+    """
+
+    if config.session_root:
+        return Path(config.session_root)
+    return default_session_root(env)
+
+
+async def _run_queue_worker(
+    service: WorkerService, *, shutdown_timeout_seconds: float, err: TextIO, trace_id: str
+) -> None:
+    """跑队列消费循环，SIGTERM/SIGINT 触发有界预算的优雅停机（Issue #153）。
+
+    信号处理器只 ``set`` 一个 ``asyncio.Event``，不做任何 I/O——与 gateway/scheduler
+    的既有信号处理惯例一致。收到信号后：``WorkerService.run`` 内部已经不再
+    ``claim`` 新任务，且在途任务的 ``_monitor`` 会把这次停机当作 ``/stop`` 主动
+    请求 Agent SDK 中断（见 ``WorkerService._monitor``）；这里只负责给"等它真的
+    收口"设一个总预算——预算内收口就是干净退出；预算耗尽就不再等，让在途任务
+    保持 ``running``，交给未来某次心跳超时回收（`V-部署-03`：留下可恢复、诚实的
+    状态，而不是无限期等待或悄悄丢弃）。
+    """
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+
+    def _handle_signal(signum: int) -> None:
+        _log(err, trace_id, "info", "worker.queue.signal_received", signum=signum)
+        stop.set()
+
+    installed_signals: list[int] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            # 非 POSIX 事件循环不支持 add_signal_handler；队列 worker 只在 Linux
+            # 容器里跑，这里退化为不安装处理器，而不是让进程直接崩溃。
+            pass
+
+    run_task = asyncio.ensure_future(service.run(stop_event=stop))
+    stop_wait_task = asyncio.ensure_future(stop.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {run_task, stop_wait_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if run_task in done:
+            # run() 自己结束了——正常情况下只会在收到停止信号后发生；如果是异常
+            # 提前结束，这里原样让异常向上传播，不吞掉真实的运行故障。
+            stop_wait_task.cancel()
+            run_task.result()
+            return
+
+        # 走到这里说明是信号触发的停机：run_task 仍在跑，给它一个有界预算收口。
+        try:
+            await asyncio.wait_for(run_task, timeout=shutdown_timeout_seconds)
+        except asyncio.TimeoutError:
+            _log(
+                err,
+                trace_id,
+                "error",
+                "worker.queue.shutdown_budget_exhausted",
+                shutdown_timeout_seconds=shutdown_timeout_seconds,
+                message="仍有在途任务未收口；进程将退出，任务保持 running 状态，"
+                "等待未来一次心跳超时回收",
+            )
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 停机路径，只记录不重抛
+                pass
+    finally:
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
 
 
 def _emit(stream: TextIO, payload: Mapping[str, Any]) -> None:

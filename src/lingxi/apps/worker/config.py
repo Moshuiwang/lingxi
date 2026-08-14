@@ -35,6 +35,17 @@ TURN_TIMEOUT_HARD_LIMIT_SECONDS = 900.0
 DEFAULT_DRAIN_GRACE_SECONDS = 30.0
 DRAIN_GRACE_HARD_LIMIT_SECONDS = 120.0
 
+# 队列模式下收到 SIGTERM 后，进程级最多再等多久（Issue #153）：这是"通知在途回合
+# 停止"之后、放弃继续等待、接受该任务留在 running（由未来某次心跳超时回收）之前
+# 的总预算。derivation（`scripts/ci/check_deploy_contract.py` 按同一模型核对
+# compose 的 `stop_grace_period`）：`stop_poll_interval_seconds` 默认 1.0s（`/stop`
+# 检测延迟）+ `DEFAULT_DRAIN_GRACE_SECONDS` 30.0s（SDK 收尾宽限，独立于业务墙钟）
+# + 一次终态写库的预算（按连接工厂合法覆盖上界 `MAX_TIMEOUT_SECONDS=5` 建模：
+# 5 + 2×5 = 15s）= 46s，取整为 45s 留一点余量而不是精确等式（真正的硬约束由
+# compose 侧再乘 1.5 安全系数兜底）。
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 45.0
+SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS = 300.0
+
 # 本切片只允许一个明确确认过的**只读 MCP 工具**（Issue #37 实施范围 2）。要求
 # ``mcp__`` 前缀是这条范围的机器可核对形式：Skill、Agent、Task 与任何内置工具都
 # 因此落在配置期拒绝分支里，不需要维护一份"禁止配置"的名单。
@@ -85,6 +96,13 @@ class WorkerConfig:
     poll_interval_seconds: float = 2.0
     max_auto_retries: int = 1
     max_concurrency: int = 16
+    # 队列模式 SIGTERM 优雅停机预算（Issue #153）；见上方 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    # 的推导注释。一次性 turn 模式不使用这个值。
+    shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    # Agent 会话 JSONL 物理清理（Issue #153）：留空时由队列模式入口按
+    # ``$HOME/.claude/projects`` 推导默认根目录，见 apps/worker/session_cleanup.py。
+    session_root: str | None = None
+    session_cleanup_batch_limit: int = 20
 
 
 def load_config(env: Mapping[str, str], *, require_question: bool = True) -> WorkerConfig:
@@ -125,6 +143,9 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         poll_interval_seconds=_duration(env, "POLL_INTERVAL_SECONDS", 2.0),
         max_auto_retries=_positive_int(env, "MAX_AUTO_RETRIES", 1, allow_zero=True),
         max_concurrency=_positive_int(env, "MAX_CONCURRENCY", 16),
+        shutdown_timeout_seconds=_shutdown_timeout(_text(env, "SHUTDOWN_TIMEOUT_SECONDS")),
+        session_root=_text(env, "SESSION_ROOT"),
+        session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
     )
 
 
@@ -244,6 +265,25 @@ def _drain_grace(value: str) -> float:
         raise WorkerConfigError(
             "LINGXI_WORKER_DRAIN_GRACE_SECONDS 必须是正的有限秒数，且不得超过"
             f" {DRAIN_GRACE_HARD_LIMIT_SECONDS:g} 秒"
+        )
+    return seconds
+
+
+def _shutdown_timeout(value: str | None) -> float:
+    if not value:
+        return DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise WorkerConfigError(
+            "LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS 必须是正数（秒）"
+        ) from error
+    import math
+
+    if seconds <= 0 or not math.isfinite(seconds) or seconds > SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS:
+        raise WorkerConfigError(
+            "LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS 必须是正的有限秒数，且不得超过"
+            f" {SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS:g} 秒"
         )
     return seconds
 

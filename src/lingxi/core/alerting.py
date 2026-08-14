@@ -9,12 +9,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Mapping
+from typing import Callable, Mapping, Protocol, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 _SAFE_CATEGORY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
@@ -29,6 +33,13 @@ class AlertKind(str, Enum):
     QUEUED_STUCK = "queued_stuck"
     RUNNING_HEARTBEAT_TIMEOUT = "running_heartbeat_timeout"
     RETRY_EXHAUSTED = "retry_exhausted"
+    # 待投递（awaiting_delivery）二十四小时强制到期收敛（Issue #153 最小可观测性
+    # 第二类：queued/running/awaiting-delivery 滞留三选一）。与 QUEUED_STUCK 分开，
+    # 因为运维要看到的诊断动作不同——这类是"确认送达一直没发生"，不是"还没被领取"。
+    AWAITING_DELIVERY_STUCK = "awaiting_delivery_stuck"
+    # 目标 worker 版本压根没有可用实例（灰度发布配置漏配一版）——与"单纯排队太久"
+    # 是两类不同的运维动作，因此独立成一个告警类型（Issue #153 最小可观测性第四类）。
+    WORKER_VERSION_UNAVAILABLE = "worker_version_unavailable"
     FEISHU_SEND_FAILED = "feishu_send_failed"
 
 
@@ -339,8 +350,10 @@ class AlertManager:
             AlertKind.QUEUED_STUCK,
             AlertKind.RUNNING_HEARTBEAT_TIMEOUT,
             AlertKind.RETRY_EXHAUSTED,
+            AlertKind.AWAITING_DELIVERY_STUCK,
+            AlertKind.WORKER_VERSION_UNAVAILABLE,
         }:
-            raise ValueError("task_stuck 只接受三类任务滞留告警")
+            raise ValueError("task_stuck 只接受五类任务滞留告警")
         return self.observe(
             AlertSignal(kind=kind, observed_at=at, scope=scope, count=count, trace_id=trace_id)
         )
@@ -476,3 +489,299 @@ class AlertManager:
             trace_id=window.trace_id,
             dedupe_key=dedupe_key,
         )
+
+
+# ---------------------------------------------------------------------------
+# 投递编排：把状态机接到管理群（Issue #92 建立，Issue #153 移至此处并接入生产
+# main()）。
+#
+# 这一段最初写在 ``apps/scheduler/__init__.py``——#92 当时唯一的调用方是 scheduler
+# 的审计日报职责。#153 需要 gateway（``DeliveryConsumer.on_alert`` 注入点）与 worker
+# （队列消费循环）各自装配同一套状态机与投递重试/去重语义，三个进程各自是独立部署
+# 单元，不能互相 import ``apps.<name>``（那会让镜像依赖面互相牵连）。这几个类只编排
+# 注入的 ``sender``/``audit`` 接口、不直接做网络或文件 I/O（真正的 I/O 藏在调用方传入
+# 的对象里），与 ``core/conversation/pipeline.py`` 里 ``EventPipeline`` 编排注入的
+# ``reactions``/``replies`` 是同一种"core 里编排、adapters 里做事"的形状，因此挪到这里
+# 而不是新增一个四进程都要 import 的 ``apps`` 工具模块。``apps/scheduler/__init__.py``
+# 继续从这里 re-export，保持既有导入路径与测试不必改动。
+# ---------------------------------------------------------------------------
+
+
+class AuditSink(Protocol):
+    def record(self, action: str, /, **fields: object) -> None: ...
+
+
+class AlertSender(Protocol):
+    """把一条已经渲染好的安全告警文本发到某个目标；具体传输由调用方注入。"""
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
+
+
+@dataclass
+class _PendingAlert:
+    notice: AlertNotice
+    next_attempt_at: datetime
+    attempt: int = 0
+
+
+class AlertDispatcher:
+    """把安全告警摘要投递给某个目标，并隔离投递失败。
+
+    这里是唯一会调用发送适配器的告警编排层。发送失败只保留摘要和下一次重试时间，
+    不把异常抛回调用方，也不保存告警正文之外的业务对象。真实发送行为由注入的
+    sender 与各自进程的受控验证负责。
+    """
+
+    def __init__(
+        self,
+        *,
+        sender: AlertSender,
+        chat_id: str,
+        policy: AlertPolicy | None = None,
+        audit: AuditSink | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not chat_id:
+            raise ValueError("告警投递目标不能为空")
+        self._sender = sender
+        self._chat_id = chat_id
+        self._policy = policy or AlertPolicy()
+        self._audit = audit
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._pending: dict[str, _PendingAlert] = {}
+        self.observed_delays: list[float] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def submit(self, notices: Sequence[AlertNotice]) -> None:
+        """加入待投递队列；相同去重键只保留一条。"""
+
+        now = _as_utc(self._clock())
+        for notice in sorted(notices, key=lambda item: item.dedupe_key):
+            self._pending.setdefault(
+                notice.dedupe_key,
+                _PendingAlert(notice=notice, next_attempt_at=now),
+            )
+
+    def run_once(self, *, at: datetime | None = None) -> int:
+        """投递当前到期的告警，返回本轮成功数。"""
+
+        now = _as_utc(self._clock() if at is None else at)
+        sent = 0
+        for dedupe_key in sorted(tuple(self._pending)):
+            pending = self._pending.get(dedupe_key)
+            if pending is None or pending.next_attempt_at > now:
+                continue
+            notice = pending.notice
+            try:
+                self._sender.send_text(
+                    chat_id=self._chat_id,
+                    text=notice.text,
+                    dedupe_key=notice.dedupe_key,
+                )
+            except Exception as error:  # noqa: BLE001 - 告警失败只进入本地重试队列
+                delay = self._policy.retry_delay(pending.attempt)
+                pending.attempt += 1
+                pending.next_attempt_at = now + timedelta(seconds=delay)
+                self.observed_delays.append(delay)
+                self._record(
+                    "alert.send_failed",
+                    event_type=notice.event_type,
+                    action=notice.action.value,
+                    attempt=pending.attempt,
+                    error=type(error).__name__,
+                )
+                logger.error(
+                    "运行告警发送失败，将重试 event=%s attempt=%s error=%s",
+                    notice.event_type,
+                    pending.attempt,
+                    type(error).__name__,
+                )
+                continue
+            del self._pending[dedupe_key]
+            sent += 1
+            self._record(
+                "alert.sent",
+                event_type=notice.event_type,
+                action=notice.action.value,
+                count=notice.count,
+            )
+        return sent
+
+    def _record(self, action: str, /, **fields: object) -> None:
+        if self._audit is None:
+            return
+        try:
+            self._audit.record(action, **fields)
+        except Exception as error:  # noqa: BLE001 - 审计观察失败不能改变告警重试
+            logger.error("运行告警审计失败 action=%s error=%s", action, type(error).__name__)
+
+
+class AlertingDuty:
+    """把告警状态机、恢复计时和投递接在一个定时职责/后台线程上。
+
+    三个进程各自装配一个实例：scheduler 挂进 ``SchedulerLoop`` 的定时职责列表；
+    gateway 与 worker 没有等价的"定时职责列表"概念，直接在各自的周期性收口
+    （``DeliveryConsumer.run_forever``、``WorkerService.process_once``）里调用
+    ``run_once``/各回调即可，不需要专门的循环包装。
+    """
+
+    name = "运行告警"
+
+    def __init__(
+        self,
+        *,
+        manager: AlertManager,
+        dispatcher: AlertDispatcher,
+        audit: AuditSink | None = None,
+        clock: Callable[[], datetime] | None = None,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._manager = manager
+        self._dispatcher = dispatcher
+        self._audit = audit
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def manager(self) -> AlertManager:
+        return self._manager
+
+    @property
+    def dispatcher(self) -> AlertDispatcher:
+        return self._dispatcher
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def heartbeat_callback(self, component: str) -> Callable[[], None]:
+        """返回给常驻进程的无参数心跳回调。"""
+
+        def beat() -> None:
+            self._manager.heartbeat(component, at=_as_utc(self._clock()))
+
+        return beat
+
+    def task_stuck_callback(self) -> Callable[[str, int], None]:
+        """返回给 Worker 的任务滞留回调，只接受类别与计数。"""
+
+        def report(kind: str, count: int) -> None:
+            notices = self._manager.task_stuck(
+                AlertKind(kind), count=count, at=_as_utc(self._clock())
+            )
+            self._submit(notices)
+
+        return report
+
+    def send_outcome_callback(self) -> Callable[[str, bool], None]:
+        """返回给卡片/群消息适配器的发送结果回调。"""
+
+        def outcome(operation: str, succeeded: bool) -> None:
+            at = _as_utc(self._clock())
+            if succeeded:
+                notices = self._manager.send_succeeded(channel=operation, at=at)
+            else:
+                notices = self._manager.send_failure(
+                    channel=operation,
+                    final=operation.endswith("_final"),
+                    at=at,
+                )
+            self._submit(notices)
+
+        return outcome
+
+    def delivery_alert_callback(self) -> Callable[[str, str], None]:
+        """返回给 Gateway ``DeliveryConsumer.on_alert`` 的回调（Issue #153）。
+
+        投递消费循环的告警形状是 ``(kind: str, task_id: str)``——``kind`` 是自由
+        字符串（``"dispatch_uncertain:card_finish"``、``"progress_persist_failed:
+        RuntimeError"`` 等，见 ``apps/gateway/delivery.py``），与 ``AlertKind`` 枚举
+        不是同一套分类。这里统一归入 ``FEISHU_SEND_FAILED``（语义上都是"投递/飞书
+        发送这条链路出了结果不明或失败"），把原始 kind 字符串标准化后放进
+        ``scope``，让不同子类型各自独立限流与去重，不互相掩盖。``task_id`` 是
+        ULID，通常满足 ``AlertSignal.trace_id`` 的安全格式；不满足时退化为不带
+        trace_id，不让一次格式意外的输入打断整条告警链路。
+        """
+
+        def report(kind: str, task_id: str) -> None:
+            scope = re.sub(r"[^a-z0-9_.-]", "_", kind.lower())[:64]
+            if not scope or not scope[0].isalpha():
+                scope = f"delivery_{scope}"[:64]
+            at = _as_utc(self._clock())
+            # PR #173 独立复核 P1-4：生产默认下 `AlertPolicy.send_failure_window_
+            # seconds`（300s）与 `DeliveryConsumer.DEFAULT_ALERT_MIN_INTERVAL_
+            # SECONDS`（300s，见 apps/gateway/delivery.py）两个 300 秒相等——
+            # `_alert_deduped` 把同一 (kind, task_id) 的上报频率压到约每 300 秒
+            # 一次，而 `AlertManager._new_send_window` 用 `>= 300s` 判定"窗口已
+            # 过期、换新窗口"，于是每一次上报都恰好落在"窗口刚过期"那一侧，
+            # `consecutive_failures` 每次被重置回 1，`threshold=3` 永远到不了：
+            # 用生产默认复现过，两小时内单个 uncertain 任务被上报 24 次、实际
+            # 发出的告警条数 = 0。
+            #
+            # 下面这两类不能等"攒够 N 次"：
+            # - `dispatch_uncertain:*`——结果不明、按设计**绝不自动重发**，必须
+            #   人工核对，是这条恢复路径的唯一入口；
+            # - `fallback_send_failed:*`——文本兜底发送遇到明确拒绝错误，
+            #   `V-告警-03`「终态失败立即告警」原文覆盖的正是这一类。
+            # 两者都改成 `final=True`：命中即报，不等阈值；仍然受
+            # `alert_min_interval_seconds`（上报节流）与 `dedupe_window_seconds`
+            # （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind
+            # （目前只有 `progress_persist_failed:*`，一次可恢复的 DB 写入
+            # 抖动）继续走"攒够阈值次数"的既有降噪路径。
+            final = kind.startswith("dispatch_uncertain:") or kind.startswith(
+                "fallback_send_failed:"
+            )
+            try:
+                signal = AlertSignal(
+                    kind=AlertKind.FEISHU_SEND_FAILED,
+                    observed_at=at,
+                    scope=scope,
+                    trace_id=task_id,
+                    final=final,
+                )
+            except ValueError:
+                signal = AlertSignal(
+                    kind=AlertKind.FEISHU_SEND_FAILED, observed_at=at, scope=scope, final=final
+                )
+            self._submit(self._manager.observe(signal))
+
+        return report
+
+    def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
+        notices = self._manager.observe(signal)
+        self._submit(notices)
+        return notices
+
+    def run_once(self) -> tuple[AlertNotice, ...] | None:
+        if self._stop.is_set():
+            return None
+        now = _as_utc(self._clock())
+        notices = self._manager.check_heartbeats(at=now)
+        notices += self._manager.tick(at=now)
+        self._submit(notices)
+        self._dispatcher.run_once(at=now)
+        return notices
+
+    def _submit(self, notices: Sequence[AlertNotice]) -> None:
+        if not notices:
+            return
+        self._dispatcher.submit(notices)
+        if self._audit is None:
+            return
+        for notice in sorted(notices, key=lambda item: item.dedupe_key):
+            action = "alert.recovery_recorded" if notice.action.value == "recovery" else "alert.recorded"
+            try:
+                self._audit.record(
+                    action,
+                    event_type=notice.event_type,
+                    count=notice.count,
+                    trace_id=notice.trace_id or "-",
+                )
+            except Exception as error:  # noqa: BLE001 - 审计失败不能丢待投递告警
+                logger.error("运行告警记录失败 action=%s error=%s", action, type(error).__name__)

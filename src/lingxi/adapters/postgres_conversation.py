@@ -204,18 +204,55 @@ class _Transaction:
 
         cursor = self._execute(
             """
-            UPDATE conversation SET agent_session_id = NULL
-             WHERE id = %s AND running_task_id IS NULL
+            WITH target AS (
+                SELECT id, user_id, agent_session_id AS previous_session_id
+                  FROM conversation
+                 WHERE id = %s AND running_task_id IS NULL
+                 FOR UPDATE
+            )
+            UPDATE conversation AS c
+               SET agent_session_id = NULL
+              FROM target
+             WHERE c.id = target.id
+            RETURNING target.user_id, target.previous_session_id
             """,
             (conversation_id,),
         )
-        cleared = cursor.rowcount == 1
+        row = cursor.fetchone()
+        cleared = row is not None
         if cleared:
             # /new 同一触发点同时清除该会话已保留的安全结果正文（产品合同「数据
             # 保留与删除」第一条、数据库设计「问数结果投递事件与会话保留 Outbox」）；
             # 与上面的会话上下文重置同一事务提交或回滚，不逐位置单独判断或延后。
             self.clear_delivered_content_for_conversation(conversation_id=conversation_id)
+            # target.previous_session_id 取的是本次 UPDATE 之前的旧值（CTE 在
+            # 更新发生前就已求值并被 FOR UPDATE 锁定），不是清空后的 NULL——
+            # Agent 会话 JSONL 的物理清理（Issue #153）按这个旧值排队。
+            user_id, old_session_id = row
+            if old_session_id:
+                self._queue_session_cleanup(
+                    user_id=user_id, agent_session_id=old_session_id, reason="new_command"
+                )
         return cleared
+
+    def _queue_session_cleanup(self, *, user_id: str, agent_session_id: str, reason: str) -> None:
+        """登记一条 Agent 会话 JSONL 物理清理请求（Issue #153）。
+
+        只登记"哪个 session id 不会再被 resume 了"，不在这里碰文件系统——本类的
+        调用方可能是 Gateway 或 scheduler 的事务，两者都没有挂载用户环境目录。真正
+        的物理删除延后到 Worker 的周期性收口（唯一挂载了该卷的常驻进程）。
+        ``ON CONFLICT DO NOTHING``：同一个 session id 只需要排队一次，重复触发
+        （例如 /new 与空闲到点扫描撞在同一时刻）不产生第二条待办。
+        """
+
+        self._execute(
+            """
+            INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (agent_session_id) DO NOTHING
+            """,
+            (new_id("asc"), user_id, agent_session_id, reason),
+        )
 
     def clear_delivered_content_for_conversation(self, *, conversation_id: str) -> int:
         """把已确认送达（``platform_received``）但仍随会话保留的投递正文清空。
@@ -469,6 +506,24 @@ class UncertainDeliveryTask:
     reserved_kind: str
 
 
+@dataclass(frozen=True)
+class SessionCleanupTask:
+    """一条待物理清理的 Agent 会话 JSONL 请求（Issue #153）。"""
+
+    id: str
+    user_id: str
+    agent_session_id: str
+    reason: str
+
+
+# ``sweep_idle_conversations`` 每次扫描新增排队的会话数上限（PR #173 独立复核
+# P2-5）：查询本身已经用 NOT EXISTS 把候选集收窄到"尚未排过队"的那些，这里只是
+# 给单次扫描一个防护上限，避免一次异常的大批量话题同时到点时单条查询/单次事务
+# 处理过多行。500 是与 Worker 侧消费能力（`claim_session_cleanups` 默认单批 20、
+# 每约 2 秒的收口轮询一次）比较后留出的宽裕量，不是精确调校值。
+_IDLE_SESSION_CLEANUP_SWEEP_LIMIT = 500
+
+
 class PostgresTaskQueue:
     """worker 与 scheduler 侧的队列操作。
 
@@ -479,6 +534,45 @@ class PostgresTaskQueue:
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
+
+    @staticmethod
+    def _queue_overwritten_session(
+        cursor: Any,
+        *,
+        user_id: str,
+        previous_session_id: str | None,
+        new_session_id: str | None,
+    ) -> None:
+        """``agent_session_id`` 被新值覆盖时，把旧值排队做物理清理（PR #173
+        独立复核 P2-4）。
+
+        ``finish()``/``confirm_delivery()`` 都用
+        ``agent_session_id = COALESCE(%s, agent_session_id)`` 写回：新值非空且
+        与旧值不同时，旧的 ``agent_session_id`` 从此不会再被任何触发点排队——
+        既有三处触发点（``/new``、空闲到点扫描、停用/权限变化）都不覆盖这条
+        路径。两个可达场景：话题闲置未满两小时就被新一轮任务覆盖（scheduler
+        的扫描还没轮到）；或真实 Claude Code CLI 的 ``--resume`` 返回了一个
+        新的 session id，每次续用都会留下一个永远不会被清理的旧 JSONL。
+
+        与调用方共用同一个 cursor/事务：旧值排队和 ``conversation`` 的写回
+        要么一起提交、要么一起回滚，不产生"任务已经收口但清理请求丢了"的
+        中间态。
+        """
+
+        if (
+            new_session_id is None
+            or not previous_session_id
+            or previous_session_id == new_session_id
+        ):
+            return
+        cursor.execute(
+            """
+            INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+            VALUES (%s, %s, %s, 'session_overwritten')
+            ON CONFLICT (agent_session_id) DO NOTHING
+            """,
+            (new_id("asc"), user_id, previous_session_id),
+        )
 
     def claim(
         self, *, worker_id: str, target_worker_version: str, limit: int = 1
@@ -584,15 +678,32 @@ class PostgresTaskQueue:
                     return False
                 cursor.execute(
                     """
-                    UPDATE conversation
+                    WITH target AS (
+                        SELECT id, user_id, agent_session_id AS previous_session_id
+                          FROM conversation
+                         WHERE id = %s AND running_task_id = %s
+                         FOR UPDATE
+                    )
+                    UPDATE conversation AS c
                        SET running_task_id = NULL,
                            last_task_ended_at = now(),
-                           agent_session_id = COALESCE(%s, agent_session_id)
-                     WHERE id = %s AND running_task_id = %s
+                           agent_session_id = COALESCE(%s, target.previous_session_id)
+                      FROM target
+                     WHERE c.id = target.id
+                    RETURNING target.user_id, target.previous_session_id
                     """,
-                    (agent_session_id, conversation_id, task_id),
+                    (conversation_id, task_id, agent_session_id),
                 )
-                return cursor.rowcount == 1
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                self._queue_overwritten_session(
+                    cursor,
+                    user_id=row[0],
+                    previous_session_id=row[1],
+                    new_session_id=agent_session_id,
+                )
+                return True
 
     def heartbeat(self, *, task_id: str, worker_id: str) -> bool:
         """只有当前 worker 这一代能续心跳；僵尸 worker 的续期会返回 False。"""
@@ -1122,15 +1233,24 @@ class PostgresTaskQueue:
                 # 或者产生的会话按上面的取舍不该被继续使用。
                 cursor.execute(
                     """
-                    UPDATE conversation
+                    WITH target AS (
+                        SELECT id, user_id, agent_session_id AS previous_session_id
+                          FROM conversation
+                         WHERE id = %s AND running_task_id = %s
+                         FOR UPDATE
+                    )
+                    UPDATE conversation AS c
                        SET running_task_id = NULL,
                            last_task_ended_at = now(),
-                           agent_session_id = COALESCE(%s, agent_session_id)
-                     WHERE id = %s AND running_task_id = %s
+                           agent_session_id = COALESCE(%s, target.previous_session_id)
+                      FROM target
+                     WHERE c.id = target.id
+                    RETURNING target.user_id, target.previous_session_id
                     """,
-                    (agent_session_id, conversation_id, task_id),
+                    (conversation_id, task_id, agent_session_id),
                 )
-                if cursor.rowcount != 1:
+                conversation_row = cursor.fetchone()
+                if conversation_row is None:
                     # 上面两条写入（事件确认、task 收敛）已经在这个事务里执行，
                     # 但还没提交：整个 with 块以异常退出，psycopg 回滚整个事务，
                     # 三条写入因此要么全部不生效。宁可响亮失败也不要悄悄丢弃
@@ -1140,6 +1260,12 @@ class PostgresTaskQueue:
                         f"任务 {task_id} 确认送达时 conversation {conversation_id} "
                         "的话题占用状态发生了竞态"
                     )
+                self._queue_overwritten_session(
+                    cursor,
+                    user_id=conversation_row[0],
+                    previous_session_id=conversation_row[1],
+                    new_session_id=agent_session_id,
+                )
                 return True
 
     def expire_undelivered_terminals(self) -> list[TerminalTask]:
@@ -1224,10 +1350,16 @@ class PostgresTaskQueue:
                 )
 
     def clear_delivered_content_for_user(self, *, user_id: str) -> int:
-        """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文。
+        """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
+        并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
 
         这是留给识别停用/权限变化的模块（身份、权限、管理域，均「待建立」）在
         感知到事件那一刻调用的冻结接口；本 Story 不实现那两类事件的探测本身。
+
+        与 ``/new``、空闲到点两类触发不同，停用/权限变化是**硬失效**：即使这个
+        会话本来还没到两小时空闲阈值，也不该在下一次消息到来时被 resume——因此
+        这里显式把 ``conversation.agent_session_id`` 置空（另外两类触发要么本来
+        就在清空它，要么依赖既有的两小时时间戳比较，不需要在这里提前置空）。
         """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection:
@@ -1245,14 +1377,56 @@ class PostgresTaskQueue:
                     """,
                     (user_id,),
                 )
-                return cursor.rowcount
+                cleared_events = cursor.rowcount
+
+                # 与 _Transaction.clear_agent_session 同一手法：RETURNING 反映的是
+                # UPDATE 之后的行，直接 RETURNING agent_session_id 只会拿到刚写入的
+                # NULL。用 CTE 在置空前先锁定并读出旧值（实测：改前的写法会让
+                # _queue_session_cleanup 拿到 None，撞上 agent_session_id 的
+                # NOT NULL 约束——见本方法对应的真库负向用例）。
+                cursor.execute(
+                    """
+                    WITH targets AS (
+                        SELECT id, agent_session_id AS previous_session_id
+                          FROM conversation
+                         WHERE user_id = %s AND agent_session_id IS NOT NULL
+                         FOR UPDATE
+                    )
+                    UPDATE conversation AS c
+                       SET agent_session_id = NULL
+                      FROM targets
+                     WHERE c.id = targets.id
+                    RETURNING targets.previous_session_id
+                    """,
+                    (user_id,),
+                )
+                retired_sessions = [row[0] for row in cursor.fetchall()]
+                transaction = _Transaction(connection)
+                for agent_session_id in retired_sessions:
+                    transaction._queue_session_cleanup(
+                        user_id=user_id,
+                        agent_session_id=agent_session_id,
+                        reason="user_cleared",
+                    )
+                return cleared_events
 
     def sweep_idle_conversations(self, *, idle_after: timedelta) -> int:
         """会话空闲满两小时由 scheduler 周期调用：到点主动清除已送达的投递正文，
-        不依赖下一次任务入队（2026-08-14 补充决定、`V-投递-10`）。
+        不依赖下一次任务入队（2026-08-14 补充决定、`V-投递-10`）；同一轮里，凡是
+        到点且仍持有当前 Agent 会话的话题，还会排队物理清理其 JSONL（Issue #153）。
 
-        只挑选当前空闲（``running_task_id IS NULL``）且仍持有未清正文的会话，
-        天然幂等——同一个会话被反复调用不会产生第二次清理副作用或报错。
+        两类到点动作的候选集**不同**，因此分两条查询、不能合并：投递正文清理只挑
+        「仍持有未清正文」的会话（没有正文可清的会话不必碰）；Agent 会话物理清理
+        只看「话题两小时规则本身已经到点、且当前仍有一个不会再被 resume 的
+        ``agent_session_id``」——与这个会话有没有投递正文无关（架构设计 5.2 节：
+        下一次任务领取时会因为超过两小时阈值而不带 ``resume``，这个 session 从那一刻
+        起就已经是孤儿，不需要等它同时"有正文可清"才处理）。这里**不**把
+        ``conversation.agent_session_id`` 置空——是否 ``resume`` 仍然只由领取任务时
+        的时间戳比较决定（`V-会话-04`），本方法只负责让物理文件不在数据库判定之外
+        继续占着磁盘。
+
+        天然幂等：清正文与排队清理都只在满足各自条件时才发生，重复调用不产生第二次
+        副作用（`agent_session_cleanup` 的 `agent_session_id` 唯一索引兜底去重）。
         返回本轮实际清理的会话数，供 scheduler 写运行日志。
         """
 
@@ -1280,7 +1454,94 @@ class PostgresTaskQueue:
                     transaction.clear_delivered_content_for_conversation(
                         conversation_id=conversation_id
                     )
+
+                cursor.execute(
+                    """
+                    SELECT c.user_id, c.agent_session_id
+                      FROM conversation AS c
+                     WHERE c.running_task_id IS NULL
+                       AND c.agent_session_id IS NOT NULL
+                       AND c.last_task_ended_at IS NOT NULL
+                       AND c.last_task_ended_at <= now() - %s::interval
+                       -- PR #173 独立复核 P2-5：这条查询刻意不清空
+                       -- agent_session_id（取舍本身是对的，见上方文档），于是每个
+                       -- 曾经用过会话、之后闲置的话题会永久留在候选集里；不加这条
+                       -- NOT EXISTS，每 60 秒的扫描会把候选集整个重新捞出来，对
+                       -- 早就已经排过队的会话再跑一次纯浪费的
+                       -- INSERT ... ON CONFLICT DO NOTHING。迁移 0061 头部注释
+                       -- 写的就是这个去重谓词，之前代码里没有落地。
+                       AND NOT EXISTS (
+                           SELECT 1 FROM agent_session_cleanup AS a
+                            WHERE a.agent_session_id = c.agent_session_id
+                       )
+                     LIMIT %s
+                    """,
+                    (idle_after, _IDLE_SESSION_CLEANUP_SWEEP_LIMIT),
+                )
+                for user_id, agent_session_id in cursor.fetchall():
+                    transaction._queue_session_cleanup(
+                        user_id=user_id, agent_session_id=agent_session_id, reason="idle_timeout"
+                    )
                 return len(conversation_ids)
+
+    # -----------------------------------------------------------------
+    # Agent 会话 JSONL 物理清理队列（Issue #153）
+    #
+    # 三类触发点（``/new``、空闲到点、停用/权限变化感知）只负责在各自的事务里往
+    # ``agent_session_cleanup`` 排队（见 ``_Transaction._queue_session_cleanup``、
+    # ``clear_delivered_content_for_user``、``sweep_idle_conversations``）；真正碰
+    # 文件系统的物理删除由这里的两个方法服务——常驻 Worker 的周期性收口调用
+    # ``claim_session_cleanups`` 认领一批，删完文件后调用
+    # ``mark_session_cleanups_done`` 标记完成。
+    # -----------------------------------------------------------------
+
+    def claim_session_cleanups(self, *, limit: int = 20) -> list[SessionCleanupTask]:
+        """认领至多 ``limit`` 条待清理请求。
+
+        ``FOR UPDATE SKIP LOCKED`` 与任务队列的领取同一手法：即使未来出现第二个
+        Worker 实例，两边也不会认领到同一行。``claimed_at`` 只是一个软标记（见迁移
+        0061 头部注释），十分钟内已被认领但还没标记完成的行不会被重新捞出——这个
+        窗口只用于"上一次认领的进程异常退出、物理删除没跑完"的兜底重试，不是强互斥。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE agent_session_cleanup
+                       SET claimed_at = now()
+                     WHERE id IN (
+                         SELECT id FROM agent_session_cleanup
+                          WHERE done_at IS NULL
+                            AND (claimed_at IS NULL OR claimed_at <= now() - INTERVAL '10 minutes')
+                          ORDER BY queued_at
+                          LIMIT %s
+                          FOR UPDATE SKIP LOCKED
+                     )
+                    RETURNING id, user_id, agent_session_id, reason
+                    """,
+                    (limit,),
+                )
+                return [
+                    SessionCleanupTask(
+                        id=row[0], user_id=row[1], agent_session_id=row[2], reason=row[3]
+                    )
+                    for row in cursor.fetchall()
+                ]
+
+    def mark_session_cleanups_done(self, *, ids: Sequence[str]) -> None:
+        """标记一批清理请求已完成（物理文件已删除或确认原本就不存在）。"""
+
+        if not ids:
+            return
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    "UPDATE agent_session_cleanup SET done_at = now() WHERE id = ANY(%s)",
+                    (list(ids),),
+                )
 
     # -----------------------------------------------------------------
     # Gateway 投递消费（Issue #152）

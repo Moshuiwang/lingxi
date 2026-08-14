@@ -60,7 +60,14 @@ from lingxi.core.identity.credentials import AuthorizationGrant, CredentialActio
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report_content
-from lingxi.core.alerting import AlertKind, AlertManager, AlertNotice, AlertPolicy, AlertSignal
+from lingxi.core.alerting import (
+    AlertDispatcher,
+    AlertingDuty,
+    AlertManager,
+    AlertPolicy,
+    AlertSender as _AlertSender,
+    AuditSink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -438,221 +445,12 @@ class StructuredLogAuditSink:
         logger.info("审计 action=%s %s", action, rendered)
 
 
-class _AlertSender(Protocol):
-    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
-
-
-@dataclass
-class _PendingAlert:
-    notice: AlertNotice
-    next_attempt_at: datetime
-    attempt: int = 0
-
-
-class AlertDispatcher:
-    """把安全告警摘要投递给管理群，并隔离投递失败。
-
-    这里是唯一会调用发送适配器的告警编排层。发送失败只保留摘要和下一次重试时间，
-    不把异常抛回 ``SchedulerLoop``，也不保存告警正文之外的业务对象。真实飞书行为
-    仍由注入的 sender 与 E4 受控窗口验证。
-    """
-
-    def __init__(
-        self,
-        *,
-        sender: _AlertSender,
-        chat_id: str,
-        policy: AlertPolicy | None = None,
-        audit: AuditSink | None = None,
-        clock: Callable[[], datetime] | None = None,
-    ) -> None:
-        if not chat_id:
-            raise ValueError("告警管理群不能为空")
-        self._sender = sender
-        self._chat_id = chat_id
-        self._policy = policy or AlertPolicy()
-        self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._pending: dict[str, _PendingAlert] = {}
-        self.observed_delays: list[float] = []
-
-    @property
-    def pending_count(self) -> int:
-        return len(self._pending)
-
-    def submit(self, notices: Sequence[AlertNotice]) -> None:
-        """加入待投递队列；相同去重键只保留一条。"""
-
-        now = _alert_utc(self._clock())
-        for notice in sorted(notices, key=lambda item: item.dedupe_key):
-            self._pending.setdefault(
-                notice.dedupe_key,
-                _PendingAlert(notice=notice, next_attempt_at=now),
-            )
-
-    def run_once(self, *, at: datetime | None = None) -> int:
-        """投递当前到期的告警，返回本轮成功数。"""
-
-        now = _alert_utc(self._clock() if at is None else at)
-        sent = 0
-        for dedupe_key in sorted(tuple(self._pending)):
-            pending = self._pending.get(dedupe_key)
-            if pending is None or pending.next_attempt_at > now:
-                continue
-            notice = pending.notice
-            try:
-                self._sender.send_text(
-                    chat_id=self._chat_id,
-                    text=notice.text,
-                    dedupe_key=notice.dedupe_key,
-                )
-            except Exception as error:  # noqa: BLE001 - 告警失败只进入本地重试队列
-                delay = self._policy.retry_delay(pending.attempt)
-                pending.attempt += 1
-                pending.next_attempt_at = now + timedelta(seconds=delay)
-                self.observed_delays.append(delay)
-                self._record(
-                    "alert.send_failed",
-                    event_type=notice.event_type,
-                    action=notice.action.value,
-                    attempt=pending.attempt,
-                    error=type(error).__name__,
-                )
-                logger.error(
-                    "运行告警发送失败，将重试 event=%s attempt=%s error=%s",
-                    notice.event_type,
-                    pending.attempt,
-                    type(error).__name__,
-                )
-                continue
-            del self._pending[dedupe_key]
-            sent += 1
-            self._record(
-                "alert.sent",
-                event_type=notice.event_type,
-                action=notice.action.value,
-                count=notice.count,
-            )
-        return sent
-
-    def _record(self, action: str, /, **fields: object) -> None:
-        if self._audit is None:
-            return
-        try:
-            self._audit.record(action, **fields)
-        except Exception as error:  # noqa: BLE001 - 审计观察失败不能改变告警重试
-            logger.error("运行告警审计失败 action=%s error=%s", action, type(error).__name__)
-
-
-class AlertingDuty:
-    """把告警状态机、恢复计时和管理群投递接在一个定时职责上。"""
-
-    name = "运行告警"
-
-    def __init__(
-        self,
-        *,
-        manager: AlertManager,
-        dispatcher: AlertDispatcher,
-        audit: AuditSink | None = None,
-        clock: Callable[[], datetime] | None = None,
-        stop: threading.Event | None = None,
-    ) -> None:
-        self._manager = manager
-        self._dispatcher = dispatcher
-        self._audit = audit
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._stop = threading.Event() if stop is None else stop
-
-    @property
-    def manager(self) -> AlertManager:
-        return self._manager
-
-    @property
-    def dispatcher(self) -> AlertDispatcher:
-        return self._dispatcher
-
-    @property
-    def stopping(self) -> bool:
-        return self._stop.is_set()
-
-    def request_stop(self) -> None:
-        self._stop.set()
-
-    def heartbeat_callback(self, component: str) -> Callable[[], None]:
-        """返回给常驻进程的无参数心跳回调。"""
-
-        def beat() -> None:
-            self._manager.heartbeat(component, at=_alert_utc(self._clock()))
-
-        return beat
-
-    def task_stuck_callback(self) -> Callable[[str, int], None]:
-        """返回给 Worker 的任务滞留回调，只接受类别与计数。"""
-
-        def report(kind: str, count: int) -> None:
-            notices = self._manager.task_stuck(
-                AlertKind(kind), count=count, at=_alert_utc(self._clock())
-            )
-            self._submit(notices)
-
-        return report
-
-    def send_outcome_callback(self) -> Callable[[str, bool], None]:
-        """返回给卡片/群消息适配器的发送结果回调。"""
-
-        def outcome(operation: str, succeeded: bool) -> None:
-            at = _alert_utc(self._clock())
-            if succeeded:
-                notices = self._manager.send_succeeded(channel=operation, at=at)
-            else:
-                notices = self._manager.send_failure(
-                    channel=operation,
-                    final=operation.endswith("_final"),
-                    at=at,
-                )
-            self._submit(notices)
-
-        return outcome
-
-    def observe(self, signal: AlertSignal) -> tuple[AlertNotice, ...]:
-        notices = self._manager.observe(signal)
-        self._submit(notices)
-        return notices
-
-    def run_once(self) -> tuple[AlertNotice, ...] | None:
-        if self._stop.is_set():
-            return None
-        now = _alert_utc(self._clock())
-        notices = self._manager.check_heartbeats(at=now)
-        notices += self._manager.tick(at=now)
-        self._submit(notices)
-        self._dispatcher.run_once(at=now)
-        return notices
-
-    def _submit(self, notices: Sequence[AlertNotice]) -> None:
-        if not notices:
-            return
-        self._dispatcher.submit(notices)
-        if self._audit is None:
-            return
-        for notice in sorted(notices, key=lambda item: item.dedupe_key):
-            action = "alert.recovery_recorded" if notice.action.value == "recovery" else "alert.recorded"
-            try:
-                self._audit.record(
-                    action,
-                    event_type=notice.event_type,
-                    count=notice.count,
-                    trace_id=notice.trace_id or "-",
-                )
-            except Exception as error:  # noqa: BLE001 - 审计失败不能丢待投递告警
-                logger.error("运行告警记录失败 action=%s error=%s", action, type(error).__name__)
-
-
-def _alert_utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("告警时间必须带时区")
-    return value.astimezone(timezone.utc)
+# _AlertSender/_PendingAlert/AlertDispatcher/AlertingDuty/_alert_utc 已迁移到
+# lingxi.core.alerting（Issue #153，见本文件顶部的导入）：gateway 与 worker 也
+# 需要装配同一套告警编排，三个 apps/<name> 互不 import，因此这段编排放进 core/
+# （只编排注入接口，不直接做 I/O，与 core/conversation/pipeline.py 的
+# EventPipeline 同一形状）。本模块沿用既有的 `_AlertSender`/`AlertDispatcher`/
+# `AlertingDuty` 名字，既有测试不必改动。
 
 
 class _BaselineReader(Protocol):
@@ -1037,6 +835,69 @@ def build_loop(
     )
 
 
+class _LogOnlyAlertSender:
+    """未配置管理群时的告警出口：只记结构化日志，不发起网络请求。
+
+    与 ``apps/gateway/__init__.py``、``apps/worker/cli.py`` 的同名类同一姿态——
+    没有配置目标群不等于告警关闭（Issue #153：合同要求"告警不可用时主流程行为
+    有明确定义"，这里的定义是"状态机照常运行，只是暂时没有群通知"）。
+    """
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        del chat_id, dedupe_key
+        logging.getLogger("lingxi.apps.scheduler.alert").warning(text)
+
+
+def build_alerting_duty(config: SchedulerConfig, *, audit: AuditSink | None = None) -> AlertingDuty:
+    """装配 scheduler 自己的告警状态机（Issue #153）。
+
+    此前 ``AlertingDuty`` 虽已建成（Issue #92），但 ``main()`` 从未真的实例化它
+    ——当前能力已经登记这个缺口："三进程 main() 均未装配告警"。这是补上 scheduler
+    这一份的地方；gateway 与 worker 各自在自己的 ``apps/<name>`` 里装配同型的一份，
+    三者互不共享状态（各自是独立部署单元）。
+    """
+
+    if config.admin_group_chat_id:
+        from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+
+        sender: Any = FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.feishu_app_id,
+            app_secret=config.feishu_app_secret,
+        )
+        chat_id = config.admin_group_chat_id
+    else:
+        sender = _LogOnlyAlertSender()
+        chat_id = "scheduler-log-only"
+
+    return AlertingDuty(
+        manager=AlertManager(policy=config.alert_policy),
+        dispatcher=AlertDispatcher(
+            sender=sender, chat_id=chat_id, policy=config.alert_policy, audit=audit
+        ),
+        audit=audit,
+    )
+
+
+def _combined_heartbeat(alerting_duty: AlertingDuty, liveness_role: str) -> Callable[[], None]:
+    """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
+
+    与 ``apps/gateway/__init__.py`` 的同名函数同一形状：``AlertManager`` 供跨进程
+    重启也能观察到的阈值/去重状态机，活性文件供同容器内的
+    ``python -m lingxi.apps.healthcheck`` 判断主循环是否还在跳动。
+    """
+
+    from lingxi.apps.liveness import touch_liveness
+
+    beat = alerting_duty.heartbeat_callback(liveness_role)
+
+    def combined() -> None:
+        beat()
+        touch_liveness(liveness_role)
+
+    return combined
+
+
 def main(argv: list[str] | None = None) -> int:
     # 日志只到 stdout / stderr，不写文件、不自行轮转（断言 V-部署-04）。
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -1046,7 +907,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"lingxi-scheduler 启动失败：{error}", file=sys.stderr)
         return 2
     try:
-        loop = build_loop(config)
+        alerting_duty = build_alerting_duty(config, audit=StructuredLogAuditSink())
+        loop = build_loop(
+            config,
+            alerting_duty=alerting_duty,
+            heartbeat=_combined_heartbeat(alerting_duty, "scheduler"),
+        )
     except (RuntimeError, ValueError) as error:
         print(f"lingxi-scheduler 启动失败：{error}", file=sys.stderr)
         return 2

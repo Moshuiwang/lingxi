@@ -482,7 +482,14 @@ class DeliveryConsumer:
                 task.task_id,
             )
 
-    def run_forever(self, *, stop: threading.Event, poll_interval_seconds: float) -> None:
+    def run_forever(
+        self,
+        *,
+        stop: threading.Event,
+        poll_interval_seconds: float,
+        heartbeat: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
+    ) -> None:
         """长期循环：每轮之间固定等待一个轮询间隔。
 
         与 ``apps/worker/service.py`` 的 ``run()`` 同一惯例——没有独立的 NOTIFY 监听
@@ -490,9 +497,25 @@ class DeliveryConsumer:
         机制。**刻意不做"这一轮处理满批就立即再跑一轮"的优化**：那样在一批任务反复
         遇到同一个真实失败（而不是积压）时会变成不带退避的忙轮询，对数据库与飞书
         出站接口造成持续压力；积压场景下晚一个轮询间隔被拾取，代价可以接受。
+
+        ``heartbeat``/``on_tick``（Issue #153）每轮都调用一次，且在 ``stop`` 已置位
+        时也会跳过——语义与 ``WorkerService.process_once`` 的
+        ``_emit_heartbeat``/``_tick_alerts`` 一致：本循环独立于长连接主线程，
+        必须有自己的活性信号，否则长连接仍在正常收信、而这条后台线程已经卡死时，
+        进程级心跳会撒谎说"健康"。
         """
 
         while not stop.is_set():
+            if heartbeat is not None:
+                try:
+                    heartbeat()
+                except Exception as error:  # noqa: BLE001 - 心跳失败不能带走投递职责
+                    logger.error("投递消费心跳记录失败 error=%s", type(error).__name__)
+            if on_tick is not None:
+                try:
+                    on_tick()
+                except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走投递职责
+                    logger.error("投递消费告警状态机推进失败 error=%s", type(error).__name__)
             self.run_once()
             stop.wait(poll_interval_seconds)
         logger.info("投递消费循环已停止")

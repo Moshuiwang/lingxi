@@ -316,6 +316,40 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             "card-1",
         )
 
+    def test_confirm_delivery_queues_the_overwritten_agent_session_for_cleanup(self) -> None:
+        """PR #173 独立复核 P2-4：``confirm_delivery()`` 与 ``finish()`` 用同一手法
+        写回 ``agent_session_id``，同一个覆盖缺口在这条路径上也存在——新终态带来
+        的新 session id 覆盖掉旧值时，旧值必须被排队做物理清理。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="答案", agent_session_id="sess-new",
+        )
+
+        confirmed = self.queue.confirm_delivery(
+            task_id="tsk-1", platform_message_kind="card", platform_message_id="card-1",
+        )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-new"
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id='sess-old'"
+            ),
+            "session_overwritten",
+            "被覆盖的旧 session id 必须被排队做物理清理，否则永久留在磁盘上",
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='sess-new'"
+            ),
+            "刚写入的新 session id 是活跃会话，不该被排队清理",
+        )
+
     def test_confirm_delivery_keeps_business_failure_not_upgraded_by_successful_delivery(self) -> None:
         """V-投递-04：飞书接受了失败卡片，业务结果仍然是 failed，不能因为投递
         成功就变成 succeeded。"""
@@ -598,6 +632,235 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
         self.assertEqual(
             self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'"), "已送达的答案"
         )
+
+
+class AgentSessionCleanupQueueTests(DeliveryOutboxTestCase):
+    """Issue #153：三个会话边界触发点（``/new``、空闲到点、按用户清理）在各自的
+    事务里往 ``agent_session_cleanup`` 排队；真正的文件删除留给 Worker 的周期性
+    收口（``tests/test_worker_queue_consumer.py`` 覆盖那一半），本文件只覆盖
+    "该不该排队、排的是不是正确的 session id、会不会排重复"。
+    """
+
+    def _pending_reasons(self, *, agent_session_id: str) -> list[str]:
+        return [
+            row[0]
+            for row in self.query(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id=%s",
+                (agent_session_id,),
+            )
+        ]
+
+    def test_new_command_queues_a_cleanup_for_the_session_it_just_retired(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET running_task_id=NULL WHERE id='cnv-1'")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+
+        with self.store.transaction() as transaction:
+            cleared = transaction.clear_agent_session(conversation_id="cnv-1")
+
+        self.assertTrue(cleared)
+        self.assertEqual(self._pending_reasons(agent_session_id="sess-old"), ["new_command"])
+        # 排队的是被清空之前的旧值，不是清空后的 NULL——否则整条记账毫无意义。
+        self.assertEqual(
+            self.scalar(
+                "SELECT user_id FROM agent_session_cleanup WHERE agent_session_id='sess-old'"
+            ),
+            "usr-1",
+        )
+
+    def test_new_command_on_a_session_that_was_already_empty_queues_nothing(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET running_task_id=NULL WHERE id='cnv-1'")
+        # agent_session_id 从未被设置过（默认 NULL）。
+
+        with self.store.transaction() as transaction:
+            transaction.clear_agent_session(conversation_id="cnv-1")
+
+        self.assertEqual(self.scalar("SELECT count(*) FROM agent_session_cleanup"), 0)
+
+    def test_idle_sweep_queues_cleanup_even_without_pending_outbox_content(self) -> None:
+        """空闲到点的物理清理候选集比"仍有未清正文"更宽（模块说明的核心取舍）：
+        一个已经送达、outbox 正文早被清过、但仍持有 agent_session_id 的会话，
+        到点后也必须被排队清理 JSONL。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-idle', "
+            "last_task_ended_at=now() - interval '3 hours' WHERE id='cnv-1'"
+        )
+
+        cleared = self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+
+        self.assertEqual(cleared, 0, "没有待清正文，因此清理正文的返回计数应为 0")
+        self.assertEqual(self._pending_reasons(agent_session_id="sess-idle"), ["idle_timeout"])
+        # 到点扫描本身不改判定用的时间戳来源——agent_session_id 仍原样保留，
+        # 是否 resume 仍由领取任务时的两小时规则时间戳比较决定（架构设计 5.2 节）。
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-idle"
+        )
+
+    def test_idle_sweep_does_not_queue_a_conversation_that_is_still_active(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-fresh', "
+            "last_task_ended_at=now() - interval '5 minutes' WHERE id='cnv-1'"
+        )
+
+        self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+
+        self.assertEqual(self.scalar("SELECT count(*) FROM agent_session_cleanup"), 0)
+
+    def test_idle_sweep_is_idempotent_and_does_not_duplicate_the_queue_entry(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-idle', "
+            "last_task_ended_at=now() - interval '3 hours' WHERE id='cnv-1'"
+        )
+
+        self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+        self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-idle'"
+            ),
+            1,
+            "同一个 session id 重复到点扫描不得排出第二条待办",
+        )
+
+    def test_idle_sweep_does_not_reselect_a_session_already_queued_by_another_trigger(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P2-5：``sweep_idle_conversations`` 的候选集查询必须
+        用 ``NOT EXISTS`` 排除已经在队列里的 ``agent_session_id``——不只是靠
+        写入时的 ``ON CONFLICT DO NOTHING`` 兜底去重，否则每 60 秒的扫描都会把
+        每一个曾经用过会话、之后闲置的话题重新捞出来做一遍纯浪费的插入尝试
+        （见 ``sweep_idle_conversations`` 的查询注释）。
+
+        用一个已经被**另一个触发点**（``/new``）排过队、原因是 ``new_command``
+        的会话来验证：即使它同时也满足空闲到点的候选条件，扫描也不应该"重新
+        发现"它——候选集里根本不该再出现这一行，原始排队原因原样保留。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-already-queued', "
+            "last_task_ended_at=now() - interval '3 hours' WHERE id='cnv-1'"
+        )
+        # 模拟这个 session id 早先已经被 /new 触发点排过队（原因不同）。
+        with self.store.transaction() as transaction:
+            transaction._queue_session_cleanup(
+                user_id="usr-1", agent_session_id="sess-already-queued", reason="new_command"
+            )
+
+        self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-already-queued'"
+            ),
+            1,
+            "已经在队列里的 session id 不应该被空闲扫描重新选中",
+        )
+        self.assertEqual(
+            self._pending_reasons(agent_session_id="sess-already-queued"),
+            ["new_command"],
+            "原始排队原因必须原样保留，不能被扫描覆盖或追加",
+        )
+
+    def test_user_level_clear_retires_every_conversation_session_for_that_user_only(self) -> None:
+        self.seed_running_task(task_id="tsk-a1", conversation_id="cnv-a1", user_id="usr-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-a1' "
+            "WHERE id='cnv-a1'"
+        )
+        self.seed_running_task(task_id="tsk-a2", conversation_id="cnv-a2", user_id="usr-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-a2' "
+            "WHERE id='cnv-a2'"
+        )
+        self.seed_running_task(task_id="tsk-b1", conversation_id="cnv-b1", user_id="usr-2")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-b1' "
+            "WHERE id='cnv-b1'"
+        )
+
+        self.queue.clear_delivered_content_for_user(user_id="usr-1")
+
+        # 停用/权限变化是硬失效：与 /new、空闲到点不同，这里必须立刻让
+        # agent_session_id 本身失效，不依赖后续任务领取时的两小时比较。
+        self.assertIsNone(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")
+        )
+        self.assertIsNone(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-a2'")
+        )
+        self.assertEqual(self._pending_reasons(agent_session_id="sess-a1"), ["user_cleared"])
+        self.assertEqual(self._pending_reasons(agent_session_id="sess-a2"), ["user_cleared"])
+        # 另一个用户的会话完全不受影响。
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-b1'"), "sess-b1"
+        )
+        self.assertEqual(self._pending_reasons(agent_session_id="sess-b1"), [])
+
+    def test_claim_marks_rows_and_a_second_claim_within_the_soft_window_returns_nothing(
+        self,
+    ) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET running_task_id=NULL WHERE id='cnv-1'")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+        with self.store.transaction() as transaction:
+            transaction.clear_agent_session(conversation_id="cnv-1")
+
+        first = self.queue.claim_session_cleanups(limit=10)
+        second = self.queue.claim_session_cleanups(limit=10)
+
+        self.assertEqual([item.agent_session_id for item in first], ["sess-old"])
+        self.assertEqual(first[0].reason, "new_command")
+        self.assertEqual(second, [], "十分钟软领取窗口内不得被第二次认领")
+
+    def test_marking_done_removes_the_row_from_future_claims(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET running_task_id=NULL WHERE id='cnv-1'")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+        with self.store.transaction() as transaction:
+            transaction.clear_agent_session(conversation_id="cnv-1")
+        claimed = self.queue.claim_session_cleanups(limit=10)
+
+        self.queue.mark_session_cleanups_done(ids=[item.id for item in claimed])
+
+        self.assertEqual(
+            self.scalar(
+                "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE agent_session_id='sess-old'"
+            ),
+            True,
+        )
+        # 十分钟窗口过期后也不会被重新捞出：done_at 非空的行被查询条件永久排除。
+        self.execute(
+            "UPDATE agent_session_cleanup SET claimed_at = now() - interval '1 hour' "
+            "WHERE agent_session_id='sess-old'"
+        )
+        self.assertEqual(self.queue.claim_session_cleanups(limit=10), [])
+
+    def test_stale_claim_past_the_soft_window_is_retried(self) -> None:
+        """模拟上一次认领的进程异常退出、物理删除没跑完：十分钟后必须能被
+        重新认领，而不是永久卡在"已认领但从未完成"状态。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET running_task_id=NULL WHERE id='cnv-1'")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+        with self.store.transaction() as transaction:
+            transaction.clear_agent_session(conversation_id="cnv-1")
+        self.queue.claim_session_cleanups(limit=10)
+        self.execute(
+            "UPDATE agent_session_cleanup SET claimed_at = now() - interval '11 minutes' "
+            "WHERE agent_session_id='sess-old'"
+        )
+
+        retried = self.queue.claim_session_cleanups(limit=10)
+
+        self.assertEqual([item.agent_session_id for item in retried], ["sess-old"])
 
 
 class WorkerServiceHousekeepingIntegrationTests(DeliveryOutboxTestCase):
