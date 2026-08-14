@@ -61,6 +61,10 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
     "lingxi.core.execution.card_stream",
+    # 投递事件 outbox 的纯领域逻辑（Issue #151）：终态分类与解析规则，
+    # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+    "lingxi.core.delivery",
+    "lingxi.core.delivery.ports",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -97,7 +101,6 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
-    "lingxi.apps.worker.delivery",
     "lingxi.apps.worker.service",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
@@ -196,6 +199,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
             "lingxi.adapters.postgres",
+            # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
+            # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
+            # 包（`__init__.py` 一次性 re-export 四个子模块）与 `core.delivery`
+            # 一并拉进闭包，同样必须显式登记，理由与上面同一条注释。
+            "lingxi.adapters.postgres_conversation",
             "lingxi.core",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
@@ -204,6 +212,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_report",
             "lingxi.core.alerting",
             "lingxi.core.ids",
+            "lingxi.core.conversation",
+            "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.pipeline",
+            "lingxi.core.conversation.ports",
+            "lingxi.core.conversation.session_window",
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
         ),
         # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
         # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
@@ -239,7 +254,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
-            "lingxi.apps.worker.delivery",
             "lingxi.apps.worker.service",
             "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
@@ -254,9 +268,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # 投递事件 outbox 的纯领域逻辑（Issue #151），由
+            # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
             "lingxi.core.execution",
             "lingxi.core.execution.audit",
-            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
@@ -288,6 +305,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
+            # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
+            # 终态解析规则，即便本批 gateway 尚未消费 outbox。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
             "lingxi.core.ids",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml

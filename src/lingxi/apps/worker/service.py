@@ -7,11 +7,11 @@ import time
 from datetime import timedelta
 from typing import Any, Callable, Mapping, Protocol
 
-from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TaskContext, TerminalTask
+from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TerminalTask
 from lingxi.apps.worker.config import WorkerConfig
-from lingxi.apps.worker.delivery import NullTaskDelivery, TaskDelivery
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
+from lingxi.core.delivery.ports import TerminalKind
 
 
 class QueueListener(Protocol):
@@ -19,7 +19,6 @@ class QueueListener(Protocol):
 
 
 ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
-DeliveryFactory = Callable[[TaskContext, Callable[[], None]], TaskDelivery]
 HeartbeatCallback = Callable[[], None]
 TaskStuckCallback = Callable[[str, int], None]
 
@@ -30,6 +29,12 @@ class WorkerService:
     ``process_once`` 是白盒测试和受控演练的入口；``run`` 才是长期 worker 循环。队列
     的 LISTEN 只用于降低延迟，任何一轮都会走轮询与回收检查，所以丢 NOTIFY 不会让
     queued 永久悬挂。
+
+    **投递意图只落数据库，不直接调用飞书**（Issue #151 状态合同）：任务收口时写入
+    ``task_delivery_event`` 的 ``started``/``progress``/``terminal`` 事件并把任务
+    转为 ``awaiting_delivery``；把事件消费为真实飞书卡片/文本、记录
+    ``platform_received`` 并最终收敛业务状态是 Gateway（#152）的职责，本类不再
+    持有任何出站 transport。
     """
 
     def __init__(
@@ -38,7 +43,6 @@ class WorkerService:
         config: WorkerConfig,
         queue: Any,
         executor_factory: ExecutorFactory | None = None,
-        delivery_factory: DeliveryFactory | None = None,
         listener_factory: Callable[[], QueueListener] | None = None,
         catalog: ContentCatalog | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
@@ -53,9 +57,6 @@ class WorkerService:
                 worker_config, mark_external_side_effect=marker
             )
         )
-        self._delivery_factory = delivery_factory or (
-            lambda _context, _marker: NullTaskDelivery()
-        )
         self._listener_factory = listener_factory
         self._catalog = catalog or default_content_catalog()
         self._sleep = sleep
@@ -68,8 +69,6 @@ class WorkerService:
 
         self._emit_heartbeat()
         terminal_tasks = self._housekeep()
-        for terminal in terminal_tasks:
-            self._deliver_terminal(terminal)
 
         tasks = self._queue.claim(
             worker_id=self._config.worker_id,
@@ -114,6 +113,17 @@ class WorkerService:
                 "retry_exhausted",
                 sum(item.error_kind == "retry_exhausted" for item in stale_terminals),
             )
+        # 二十四小时到期仍未确认送达的投递终态：状态合同第 8 条、V-投递-06。
+        # 这一步只强制收敛任务状态、释放话题并清空事件正文；把清理结果对外展现
+        # 为"投递已过期，请重新提问"仍是 Gateway（下一次用户主动消息触发）的职责。
+        # 二十四小时上限不接受这里传参：它由迁移 0059 的触发器锁定在
+        # task_delivery_event.expires_at 列上，调用方不再持有另一份可以让它
+        # 漂移的窗口配置（内审 P2-1）。
+        expire_undelivered = getattr(self._queue, "expire_undelivered_terminals", None)
+        if expire_undelivered is not None:
+            expired = expire_undelivered()
+            terminals.extend(expired)
+            self._report_task_stuck("delivery_expired", len(expired))
         return terminals
 
     def _emit_heartbeat(self) -> None:
@@ -151,37 +161,34 @@ class WorkerService:
         marker = lambda: self._queue.mark_side_effect(
             task_id=claimed.task_id, worker_id=self._config.worker_id
         )
-        delivery = self._delivery_factory(context, marker)
-        try:
-            delivery.start()
-        except Exception:
-            # delivery 的实现可以选择自己回退；这里保留任务执行，最终会以失败终态
-            # 释放话题，且不会把一个未完成的 card 当成成功。
-            pass
+        self._append_event(claimed, event_type="started", idempotency_key_suffix="started")
 
         stop_event = asyncio.Event()
         if context.stop_requested or claimed.stop_requested:
             stop_event.set()
         if stop_event.is_set():
-            self._deliver_failure(delivery, self._catalog.text("worker.stopped"))
-            self._queue.finish(
-                task_id=claimed.task_id,
-                conversation_id=claimed.conversation_id,
-                status="stopped",
-                worker_id=self._config.worker_id,
+            self._finish_terminal(
+                claimed,
+                terminal_kind=TerminalKind.STOPPED.value,
                 error_kind="stopped",
+                content=self._catalog.text("worker.stopped"),
             )
             return
         monitor = asyncio.create_task(self._monitor(claimed.task_id, stop_event))
         started_at = self._monotonic()
+        progress_count = 0
 
         def on_stream_event(event: Mapping[str, Any]) -> None:
+            nonlocal progress_count
             if event.get("kind") == "assistant_message":
                 elapsed = int(max(0.0, self._monotonic() - started_at))
-                try:
-                    delivery.progress(elapsed_seconds=elapsed)
-                except Exception:
-                    pass
+                progress_count += 1
+                self._append_event(
+                    claimed,
+                    event_type="progress",
+                    idempotency_key_suffix=f"progress:{progress_count}",
+                    elapsed_seconds=elapsed,
+                )
 
         try:
             executor = self._executor_factory(self._config, marker)
@@ -214,53 +221,112 @@ class WorkerService:
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
         final_text = turn.get("final_text") if isinstance(turn, Mapping) else ""
         final_text = final_text if isinstance(final_text, str) else ""
+        elapsed_seconds = int(max(0.0, self._monotonic() - started_at))
 
         output_safety = turn.get("output_safety") if isinstance(turn, Mapping) else None
         withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
 
         if stop_requested or failure_code == "interrupted":
-            status = "stopped"
-            error_kind = "stopped"
             content = (
                 self._catalog.text("worker.stopped_result", result=final_text)
                 if final_text
                 else self._catalog.text("worker.stopped")
             )
-            self._deliver_failure(delivery, content)
+            self._finish_terminal(
+                claimed,
+                terminal_kind=TerminalKind.STOPPED.value,
+                error_kind="stopped",
+                content=content,
+                elapsed_seconds=elapsed_seconds,
+            )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
-            # succeeded——用户没有拿到结果。status 沿用既有取值域（不新增数据库
-            # 迁移），用独立的 error_kind 承载"redacted_withheld"这个可查询终态，
-            # 与"failed"下其余原因码同一模式（见 task.error_kind 无 CHECK 约束）。
-            status = "failed"
-            error_kind = "redacted_withheld"
-            self._deliver_failure(delivery, self._catalog.text("worker.redacted_withheld"))
+            # succeeded——用户没有拿到结果，必须走独立、可查询的 redacted_withheld
+            # 终态（status 沿用既有取值域，用 error_kind 承载可查询原因）。
+            self._finish_terminal(
+                claimed,
+                terminal_kind=TerminalKind.REDACTED_WITHHELD.value,
+                error_kind="redacted_withheld",
+                content=self._catalog.text("worker.redacted_withheld"),
+                elapsed_seconds=elapsed_seconds,
+            )
         elif bool(turn.get("closed")) and not failure:
-            status = "succeeded"
-            error_kind = None
-            try:
-                delivery.complete(
-                    result=final_text,
-                    elapsed_seconds=int(max(0.0, self._monotonic() - started_at)),
-                )
-            except Exception:
-                status = "failed"
-                error_kind = "delivery_failed"
-                self._deliver_failure(delivery, self._catalog.text("worker.failed"))
+            self._finish_terminal(
+                claimed,
+                terminal_kind=TerminalKind.SUCCESS.value,
+                error_kind=None,
+                content=RenderedContent(key="worker.result", version=self._catalog.version, text=final_text),
+                elapsed_seconds=elapsed_seconds,
+                session_id=turn.get("session_id") if isinstance(turn, Mapping) else None,
+            )
         else:
-            status = "failed"
             error_kind, content = self._failure_content(failure_code)
-            self._deliver_failure(delivery, content)
+            terminal_kind = (
+                TerminalKind.TIMEOUT.value if failure_code == "turn_timeout" else TerminalKind.FAILED.value
+            )
+            self._finish_terminal(
+                claimed,
+                terminal_kind=terminal_kind,
+                error_kind=error_kind,
+                content=content,
+                elapsed_seconds=elapsed_seconds,
+            )
 
-        self._queue.finish(
+    def _append_event(
+        self,
+        claimed: ClaimedTask,
+        *,
+        event_type: str,
+        idempotency_key_suffix: str,
+        elapsed_seconds: int | None = None,
+        content: str | None = None,
+    ) -> None:
+        """写入非终态事件；失败不中断任务执行——它是可恢复的运行信号，不是结果。"""
+
+        try:
+            self._queue.append_delivery_event(
+                task_id=claimed.task_id,
+                worker_id=self._config.worker_id,
+                event_type=event_type,
+                idempotency_key=f"{claimed.task_id}:a{claimed.attempts}:{idempotency_key_suffix}",
+                elapsed_seconds=elapsed_seconds,
+                content=content,
+            )
+        except Exception as error:  # noqa: BLE001 - 事件是可恢复的运行信号，不能带走任务
+            import logging
+
+            logging.getLogger(__name__).error(
+                "投递事件写入失败，任务继续执行 event_type=%s error=%s",
+                event_type,
+                type(error).__name__,
+            )
+
+    def _finish_terminal(
+        self,
+        claimed: ClaimedTask,
+        *,
+        terminal_kind: str,
+        error_kind: str | None,
+        content: RenderedContent,
+        elapsed_seconds: int = 0,
+        session_id: str | None = None,
+    ) -> None:
+        """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
+        条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
+        成功时非空）随终态事件一起持久化，留到确认送达时才写回
+        ``conversation.agent_session_id``——同一话题在此期间不会有第二个任务插进
+        来读它，延后写入是安全的（见 ``core.delivery.ports`` 与
+        ``PostgresTaskQueue.confirm_delivery`` 的取舍说明）。
+        """
+
+        self._queue.write_terminal_event(
             task_id=claimed.task_id,
-            conversation_id=claimed.conversation_id,
-            status=status,
             worker_id=self._config.worker_id,
-            agent_session_id=(
-                turn.get("session_id") if status == "succeeded" and isinstance(turn, Mapping) else None
-            ),
+            terminal_kind=terminal_kind,
             error_kind=error_kind,
+            content=content.text,
+            elapsed_seconds=elapsed_seconds,
+            agent_session_id=session_id,
         )
 
     async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
@@ -285,30 +351,6 @@ class WorkerService:
         if code == "side_effect_uncertain":
             return "side_effect_uncertain", self._catalog.text("worker.side_effect_uncertain")
         return "session_failed", self._catalog.text("worker.failed")
-
-    @staticmethod
-    def _deliver_failure(delivery: TaskDelivery, content: RenderedContent) -> None:
-        try:
-            delivery.fail(content=content)
-        except Exception:
-            # 任务状态收口优先；真实出站失败已经不能安全重放，留给审计/人工处理。
-            pass
-
-    def _deliver_terminal(self, terminal: TerminalTask) -> None:
-        context_getter = getattr(self._queue, "terminal_context", None)
-        if context_getter is None:
-            return
-        context = context_getter(task_id=terminal.task_id)
-        if context is None:
-            return
-        delivery = self._delivery_factory(context, lambda: None)
-        content_key = {
-            "queued_timeout": "worker.queued_timeout",
-            "worker_version_unavailable": "worker.version_unavailable",
-            "side_effect_uncertain": "worker.side_effect_uncertain",
-            "retry_exhausted": "worker.running_timeout",
-        }.get(terminal.error_kind, "worker.failed")
-        self._deliver_failure(delivery, self._catalog.text(content_key))
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()

@@ -28,7 +28,9 @@ from pathlib import Path
 from lingxi.adapters.feishu_directory import FeishuDirectoryError
 from lingxi.adapters.delegated_credentials import StoredCredential
 from lingxi.apps.scheduler import (
+    IDLE_CONVERSATION_SWEEP_AFTER,
     CredentialRotationLoop,
+    IdleConversationSweepDuty,
     RetentionCleanupDuty,
     RotationReport,
     SchedulerConfig,
@@ -398,6 +400,41 @@ class SchedulerLoopTest(unittest.TestCase):
 
         self.assertEqual(cleaner.calls, 3)
 
+    class RecordingQueue:
+        """记录 ``sweep_idle_conversations`` 调用参数的假 queue，不碰真库。"""
+
+        def __init__(self, *, cleared: int = 0) -> None:
+            self.calls: list[timedelta] = []
+            self._cleared = cleared
+
+        def sweep_idle_conversations(self, *, idle_after: timedelta) -> int:
+            self.calls.append(idle_after)
+            return self._cleared
+
+    def test_the_idle_sweep_duty_calls_the_queue_with_the_two_hour_window_every_round(self) -> None:
+        """内审 P2-2：空闲会话清理必须真的接到 scheduler 的周期驱动上，且窗口
+        固定两小时（合同值，不接受配置漂移，见 P2-1 同一取舍）。"""
+
+        queue = self.RecordingQueue(cleared=2)
+        duty = IdleConversationSweepDuty(queue=queue, idle_after=IDLE_CONVERSATION_SWEEP_AFTER)
+
+        for _round in range(3):
+            report = duty.run_once()
+            self.assertEqual(report, 2)
+
+        self.assertEqual(queue.calls, [timedelta(hours=2)] * 3)
+
+    def test_a_stopping_idle_sweep_duty_does_not_call_the_queue(self) -> None:
+        stop = threading.Event()
+        queue = self.RecordingQueue(cleared=5)
+        duty = IdleConversationSweepDuty(queue=queue, idle_after=IDLE_CONVERSATION_SWEEP_AFTER, stop=stop)
+
+        stop.set()
+        report = duty.run_once()
+
+        self.assertIsNone(report)
+        self.assertEqual(queue.calls, [])
+
     def test_a_process_without_any_duty_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             SchedulerLoop(duties=(), interval_seconds=1)
@@ -408,11 +445,12 @@ class SchedulerLoopTest(unittest.TestCase):
     "跳过：build_loop 会真的构造凭据保管与清理适配器，需要 psycopg 与 cryptography",
 )
 class BuildLoopTest(unittest.TestCase):
-    def test_the_assembled_process_carries_both_duties(self) -> None:
-        """"谁会调用它"的落点：清理职责由**已存在**的 `lingxi-scheduler` 进程装配。
+    def test_the_assembled_process_carries_all_scheduled_duties(self) -> None:
+        """"谁会调用它"的落点：清理与空闲会话扫描职责由**已存在**的
+        `lingxi-scheduler` 进程装配。
 
         `build_loop` 是 `main()` 唯一的装配入口（本模块 `main` 内），因此这条断言
-        就是"新增的清理代码真的有调用方"的证据。
+        就是"新增的清理代码真的有调用方"的证据（空闲会话清理一节认领内审 P2-2）。
         """
         import tempfile
 
@@ -432,12 +470,16 @@ class BuildLoopTest(unittest.TestCase):
 
         loop = build_loop(config)
 
-        self.assertEqual([duty.name for duty in loop.duties], ["凭据轮换", "保留清理"])
+        self.assertEqual(
+            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+        )
         self.assertIsInstance(loop, SchedulerLoop)
         from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS
 
         cleanup_duty = loop.duties[1]
         self.assertEqual(cleanup_duty._cleaner._timeouts, RETENTION_CLEANUP_TIMEOUTS)
+        idle_sweep_duty = loop.duties[2]
+        self.assertEqual(idle_sweep_duty._idle_after, timedelta(hours=2))
         # 一个停止标志贯穿全部职责。
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

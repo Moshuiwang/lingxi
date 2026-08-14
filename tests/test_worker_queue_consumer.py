@@ -1,8 +1,18 @@
-"""Issue #90 的队列消费、卡片与失败终态断言。
+"""Issue #90 的队列消费与失败终态断言；Issue #151 起收口方式改为写投递事件 outbox。
 
-真库组覆盖 V-队列-06/08/09、V-会话-07/11/13 的状态、隔离、轮询与出站收口；纯逻辑组
-覆盖 V-会话-06、V-卡片-01/02/03 和 worker 收口，避免把外部飞书/CardKit L4a 误写成
-已验证。
+真库组覆盖 V-队列-06/08/09、V-会话-07 的状态、隔离与轮询；纯逻辑组覆盖 V-会话-06
+与 worker 收口写入的投递事件形状，避免把外部飞书/CardKit L4a 误写成已验证。
+
+**Issue #151 起，``WorkerService`` 不再持有任何出站 transport**：收口只写
+``task_delivery_event``（``started``/``progress``/``terminal``）并把任务转入
+``awaiting_delivery``，不直接调用飞书或释放话题——话题占用与最终业务状态改由
+:mod:`lingxi.adapters.postgres_conversation` 的 ``confirm_delivery`` /
+``expire_undelivered_terminals`` 收口，见 ``tests/test_delivery_outbox.py`` 的
+真库断言（V-投递-01…06/10）。``CardStream``/``CardTaskDelivery`` 曾经把 Worker
+接到飞书 CardKit，与「Worker 只写数据库，不直接调用飞书」的架构边界冲突，已随
+本次改动从 ``apps/worker`` 移除；``CardStream`` 本身留在
+``core/execution/card_stream.py`` 作为协议无关的可复用组件，供 #152 的 Gateway
+消费者注入真实 transport 时使用，下面的 ``CardStreamTests`` 继续直接覆盖它。
 """
 
 from __future__ import annotations
@@ -25,7 +35,6 @@ from lingxi.adapters.postgres_conversation import (
     _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
-from lingxi.apps.worker.delivery import CardTaskDelivery
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
@@ -192,7 +201,8 @@ class FakeWorkerQueue:
             stop_requested=stopped,
             side_effect_state="none",
         )
-        self.finished: list[dict[str, object]] = []
+        self.events: list[dict[str, object]] = []
+        self.terminals: list[dict[str, object]] = []
         self.marked = 0
 
     def claim(self, **kwargs: object) -> list[ClaimedTask]:
@@ -214,28 +224,13 @@ class FakeWorkerQueue:
     def stop_requested(self, **kwargs: object) -> bool:
         return self.context.stop_requested
 
-    def finish(self, **kwargs: object) -> bool:
-        self.finished.append(kwargs)
-        return True
+    def append_delivery_event(self, **kwargs: object) -> None:
+        self.events.append(kwargs)
+        return None
 
-
-class RecordingDelivery:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, object]] = []
-        self.failed_contents = []
-
-    def start(self) -> None:
-        self.events.append(("start", None))
-
-    def progress(self, *, elapsed_seconds: int) -> None:
-        self.events.append(("progress", elapsed_seconds))
-
-    def complete(self, *, result: str, elapsed_seconds: int = 0) -> None:
-        self.events.append(("complete", result))
-
-    def fail(self, *, content) -> None:
-        self.failed_contents.append(content)
-        self.events.append(("fail", content.key))
+    def write_terminal_event(self, **kwargs: object) -> None:
+        self.terminals.append(kwargs)
+        return None
 
 
 class DroppingNotifyListener:
@@ -259,13 +254,17 @@ class DroppingNotifyListener:
 
 
 class WorkerServiceTests(unittest.TestCase):
-    def test_success_resumes_session_and_releases_with_new_session_id(self) -> None:
+    """Issue #151：``_process_task`` 只写 ``task_delivery_event``，不再调用任何出站
+    transport；断言因此改看 ``queue.events``/``queue.terminals`` 记录了什么，而不是
+    ``delivery`` 对象收到了什么调用。"""
+
+    def test_success_writes_started_and_terminal_events(self) -> None:
         queue = FakeWorkerQueue()
-        delivery = RecordingDelivery()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                 self.kwargs = kwargs
+                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
                 return {
                     "turn": {"closed": True, "final_text": "结果", "session_id": "new-session"},
                     "failure": None,
@@ -278,99 +277,29 @@ class WorkerServiceTests(unittest.TestCase):
             ),
             queue=queue,
             executor_factory=lambda config, marker: executor,
-            delivery_factory=lambda context, marker: delivery,
         )
         asyncio.run(service.process_once())
 
-        self.assertEqual(delivery.events[-1], ("complete", "结果"))
-        self.assertEqual(queue.finished[0]["status"], "succeeded")
-        self.assertEqual(queue.finished[0]["agent_session_id"], "new-session")
+        self.assertEqual(queue.events[0]["event_type"], "started")
+        self.assertEqual(queue.events[1]["event_type"], "progress")
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertIsNone(terminal["error_kind"])
+        self.assertEqual(terminal["content"], "结果")
+        self.assertEqual(terminal["agent_session_id"], "new-session")
         self.assertIsNotNone(executor.kwargs["resume_session_id"])
         self.assertEqual(
             executor.kwargs["external_texts"],
             (("metric.description", "指标目录中的已知描述"),),
         )
 
-    def test_success_result_survives_card_update_failure_in_the_same_topic(self) -> None:
-        """V-卡片-03：成功回合的卡片更新失败时补发完整结果且仍为 succeeded。"""
-
-        queue = FakeWorkerQueue()
-        cards = RecordingCards(fail="update")
-        text = RecordingText()
-        delivery = CardTaskDelivery(
-            chat_id=queue.context.chat_id,
-            thread_id=queue.context.thread_id,
-            reply_to_message_id=queue.context.reply_to_message_id or "",
-            cards=cards,
-            replies=text,
-        )
-
-        class Executor:
-            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
-                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
-                return {
-                    "turn": {
-                        "closed": True,
-                        "final_text": "答案串：123 万元",
-                        "session_id": "new-session",
-                    },
-                    "failure": None,
-                }
-
-        service = WorkerService(
-            config=worker_config(),
-            queue=queue,
-            executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
-        )
-        asyncio.run(service.process_once())
-
-        self.assertEqual(queue.finished[0]["status"], "succeeded")
-        self.assertEqual(len(text.calls), 1, "成功结果只能补发一次")
-        self.assertIn("答案串：123 万元", text.calls[0]["text"])
-        self.assertNotIn("本次任务未取得可用结果", text.calls[0]["text"])
-        self.assertEqual(text.calls[0]["chat_id"], "chat-1")
-        self.assertEqual(text.calls[0]["thread_id"], "topic-1")
-
-    def test_success_result_is_failed_only_when_text_fallback_also_fails(self) -> None:
-        """V-卡片-03：文本回退本身失败才把成功回合降为 failed。"""
-
-        queue = FakeWorkerQueue()
-        delivery = CardTaskDelivery(
-            chat_id=queue.context.chat_id,
-            thread_id=queue.context.thread_id,
-            reply_to_message_id=queue.context.reply_to_message_id or "",
-            cards=RecordingCards(fail="update"),
-            replies=RecordingText(fail=True),
-        )
-
-        class Executor:
-            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
-                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
-                return {
-                    "turn": {"closed": True, "final_text": "答案串", "session_id": None},
-                    "failure": None,
-                }
-
-        service = WorkerService(
-            config=worker_config(),
-            queue=queue,
-            executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
-        )
-        asyncio.run(service.process_once())
-
-        self.assertEqual(queue.finished[0]["status"], "failed")
-        self.assertEqual(queue.finished[0]["error_kind"], "delivery_failed")
-
-    def test_stop_and_timeout_are_terminal_and_release_the_topic(self) -> None:
-        for stopped, failure_code, expected_status in (
-            (True, None, "stopped"),
-            (False, "turn_timeout", "failed"),
+    def test_stop_and_timeout_write_distinct_terminal_kinds(self) -> None:
+        for stopped, failure_code, expected_terminal_kind, expected_error in (
+            (True, None, "stopped", "stopped"),
+            (False, "turn_timeout", "timeout", "running_timeout"),
         ):
-            with self.subTest(expected_status=expected_status):
+            with self.subTest(expected_terminal_kind=expected_terminal_kind):
                 queue = FakeWorkerQueue(stopped=stopped)
-                delivery = RecordingDelivery()
 
                 class Executor:
                     async def run_turn(self, prompt: str, **kwargs: object) -> dict:
@@ -383,24 +312,21 @@ class WorkerServiceTests(unittest.TestCase):
                     config=worker_config(),
                     queue=queue,
                     executor_factory=lambda config, marker: Executor(),
-                    delivery_factory=lambda context, marker: delivery,
                 )
                 asyncio.run(service.process_once())
-                self.assertEqual(queue.finished[0]["status"], expected_status)
-                self.assertEqual(delivery.events[-1][0], "fail")
+                terminal = queue.terminals[0]
+                self.assertEqual(terminal["terminal_kind"], expected_terminal_kind)
+                self.assertEqual(terminal["error_kind"], expected_error)
                 expected_key = "worker.stopped" if stopped else "worker.running_timeout"
-                self.assertEqual(delivery.events[-1][1], expected_key)
-                expected_error = "stopped" if stopped else "running_timeout"
-                self.assertEqual(queue.finished[0]["error_kind"], expected_error)
+                self.assertEqual(terminal["content"], default_content_catalog().text(expected_key).text)
 
-    def test_withheld_output_is_never_marked_succeeded(self) -> None:
-        """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得记
-        succeeded、不得走 delivery.complete()——用户没有拿到结果，必须走独立、
-        可查询的 redacted_withheld 终态。改坏这条路由（例如去掉 withheld 判断）
-        必须让本用例变红。"""
+    def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
+        """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
+        ``terminal_kind='success'``——用户没有拿到结果，必须走独立、可查询的
+        ``redacted_withheld`` 终态。改坏这条路由（例如去掉 withheld 判断）必须让
+        本用例变红。"""
 
         queue = FakeWorkerQueue()
-        delivery = RecordingDelivery()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
@@ -419,15 +345,18 @@ class WorkerServiceTests(unittest.TestCase):
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
         )
         asyncio.run(service.process_once())
 
-        self.assertEqual(queue.finished[0]["status"], "failed")
-        self.assertEqual(queue.finished[0]["error_kind"], "redacted_withheld")
-        self.assertNotEqual(queue.finished[0]["status"], "succeeded")
-        self.assertEqual(delivery.events[-1], ("fail", "worker.redacted_withheld"))
-        self.assertFalse(any(event[0] == "complete" for event in delivery.events))
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "redacted_withheld")
+        self.assertEqual(terminal["error_kind"], "redacted_withheld")
+        self.assertNotEqual(terminal["terminal_kind"], "success")
+        # withheld 的原始 final_text 不得进入投递事件：正文只能是目录里的固定安全
+        # 文案，不是模型给出的（已经被判定不可展示的）片段。
+        self.assertEqual(
+            terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
+        )
 
 
 @unittest.skipUnless(DSN, SKIP_DB)
@@ -611,7 +540,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             ),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: RecordingDelivery(),
             listener_factory=lambda: listener,
         )
 
@@ -650,7 +578,10 @@ class RealQueueTerminalTests(unittest.TestCase):
         self.assertTrue(claimed_at)
         self.assertLessEqual(
             claimed_at[0] - queued_at,
-            poll_interval + 0.2,
+            # 0.2 → 0.3：Issue #151 给 _housekeep() 每轮多加了一次真实数据库往返
+            # （expire_undelivered_terminals），在这条真库用例的调度余量上留出对应
+            # 空间，仍然远小于用户可感知的延迟（V-队列-06 只关心"不会无限期悬挂"）。
+            poll_interval + 0.3,
             "丢弃 NOTIFY 后领取不得超过配置轮询上限（含测试调度余量）",
         )
         self.assertEqual(
@@ -703,8 +634,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             )
         )
 
-        deliveries: list[tuple[str, str, str | None, RecordingDelivery]] = []
-
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                 return {
@@ -712,39 +641,45 @@ class RealQueueTerminalTests(unittest.TestCase):
                     "failure": None,
                 }
 
-        def delivery_factory(context, marker):
-            delivery = RecordingDelivery()
-            deliveries.append((context.user_id, context.chat_id, context.thread_id, delivery))
-            return delivery
-
         service = WorkerService(
             config=worker_config(max_concurrency=2),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=delivery_factory,
         )
         asyncio.run(service.process_once())
 
+        # Issue #151：Worker 不再持有出站 transport，投递意图只落在
+        # ``task_delivery_event``。按用户回读各自的终态事件与话题定位，验证
+        # 两个用户互不串用会话或投递定位（V-会话-07）。
+        with connect(DSN) as connection:
+            rows = connection.execute(
+                """
+                SELECT t.user_id, c.feishu_chat_id, c.feishu_thread_id, e.content, t.status
+                  FROM task_delivery_event AS e
+                  JOIN task AS t ON t.id = e.task_id
+                  JOIN conversation AS c ON c.id = t.conversation_id
+                 WHERE e.event_type = 'terminal'
+                 ORDER BY t.user_id
+                """
+            ).fetchall()
+        by_user = {row[0]: row for row in rows}
+        self.assertEqual(set(by_user), {"usr-90", "usr-91"})
         self.assertEqual(
-            {
-                (user_id, chat_id, thread_id)
-                for user_id, chat_id, thread_id, _delivery in deliveries
-            },
-            {
-                ("usr-90", "chat-user-a", "topic-user-a"),
-                ("usr-91", "chat-user-b", "topic-user-b"),
-            },
+            (by_user["usr-90"][1], by_user["usr-90"][2]), ("chat-user-a", "topic-user-a")
         )
         self.assertEqual(
-            {
-                user_id: delivery.events[-1]
-                for user_id, _chat_id, _thread_id, delivery in deliveries
-            },
-            {"usr-90": ("complete", "答案 A"), "usr-91": ("complete", "答案 B")},
+            (by_user["usr-91"][1], by_user["usr-91"][2]), ("chat-user-b", "topic-user-b")
         )
+        self.assertEqual(by_user["usr-90"][3], "答案 A")
+        self.assertEqual(by_user["usr-91"][3], "答案 B")
+        self.assertEqual(by_user["usr-90"][4], "awaiting_delivery")
+        self.assertEqual(by_user["usr-91"][4], "awaiting_delivery")
 
     def test_context_too_long_suggests_new_without_replacing_agent_session(self) -> None:
-        """V-会话-11：上下文超限提示 /new，原 agent_session_id 保持不变。"""
+        """上下文超限提示 /new，原 agent_session_id 保持不变；Issue #151 起失败
+        终态也进入 ``awaiting_delivery`` 并继续占用话题，不再立即释放——释放要等
+        投递解析（confirm_delivery / expire_undelivered_terminals，见
+        ``tests/test_delivery_outbox.py``）。"""
 
         assert DSN is not None
         pipeline = EventPipeline(
@@ -773,7 +708,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             "UPDATE conversation SET agent_session_id='session-original' WHERE id=%s",
             (conversation_id,),
         )
-        delivery = RecordingDelivery()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
@@ -786,53 +720,26 @@ class RealQueueTerminalTests(unittest.TestCase):
             config=worker_config(worker_id="worker-context"),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
         )
         asyncio.run(service.process_once())
 
-        self.assertEqual(self._scalar("SELECT status FROM task"), "failed")
-        self.assertEqual(delivery.events[-1], ("fail", "worker.context_too_long"))
-        self.assertIn("/new", delivery.failed_contents[-1].text)
+        self.assertEqual(self._scalar("SELECT status FROM task"), "awaiting_delivery")
+        terminal = self._scalar(
+            "SELECT content FROM task_delivery_event WHERE event_type='terminal'"
+        )
+        self.assertIn("/new", terminal)
+        self.assertEqual(
+            self._scalar("SELECT error_kind FROM task"), "context_too_long"
+        )
         self.assertEqual(
             self._scalar(
                 "SELECT agent_session_id FROM conversation WHERE id=%s", (conversation_id,)
             ),
             "session-original",
         )
-        self.assertIsNone(self._scalar("SELECT running_task_id FROM conversation"))
-
-    def test_uncertain_side_effect_recovery_has_one_outbound_failure(self) -> None:
-        """V-会话-13：恢复收口按出站调用次数防止重复交付，不只看库行数。"""
-
-        self._insert_old_task(
-            task_id="tsk-side-once",
-            conversation_id="cnv-side-once",
-            status="running",
-            side_effect_state="possible",
-            attempts=1,
-        )
-        deliveries: list[RecordingDelivery] = []
-
-        def delivery_factory(context, marker):
-            delivery = RecordingDelivery()
-            deliveries.append(delivery)
-            return delivery
-
-        service = WorkerService(
-            config=worker_config(worker_id="worker-recovery"),
-            queue=self.queue,
-            delivery_factory=delivery_factory,
-        )
-        asyncio.run(service.process_once())
-        asyncio.run(service.process_once())
-
-        self.assertEqual(self._scalar("SELECT status FROM task WHERE id='tsk-side-once'"), "failed")
-        self.assertEqual(len(deliveries), 1, "恢复后只能创建一次用户可见投递")
-        self.assertEqual(
-            [event for event in deliveries[0].events if event[0] == "fail"],
-            [("fail", "worker.side_effect_uncertain")],
-            "V-会话-13 应断言真实出站调用，不以 task 行数代替",
-        )
+        # 失败终态同样进入 awaiting_delivery，话题继续占用直到投递解析——本
+        # Story 的状态合同第 2 条明确覆盖失败/停止/超时/withheld，不只是成功路径。
+        self.assertIsNotNone(self._scalar("SELECT running_task_id FROM conversation"))
 
     def test_claim_context_keeps_reply_scope_and_finish_persists_session(self) -> None:
         assert DSN is not None
