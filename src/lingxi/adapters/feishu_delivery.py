@@ -9,14 +9,25 @@
 按 2026-08-06 决策走官方 ``lark-oapi``；``lark_oapi`` 在函数内延迟导入，与仓库既有惯例
 一致，不碰这两个类的测试无需装 SDK。
 
-**下面四个方法都不捕获网络类异常，是刻意的**（独立审核 B-1，2026-08-14）。
-``lark_oapi`` 的 transport 是 ``requests.request(...)``（``lark_oapi/core/http/
-transport.py``），读超时/连接重置时抛出的是 ``requests.exceptions.RequestException``
-及其子类——它们全部继承自 ``IOError``（即内置 ``OSError``）。这里不做任何异常
-翻译，让它原样从 ``requests`` 一路传到 ``core.execution.card_stream``：那里用
-``except OSError`` 把"结果不明"与下面这四个方法唯一会主动抛出的
-``RuntimeError``（``response.success()`` 为假、服务端已经明确拒绝）区分开，
-见该模块文档。这个模块因此不需要在两类异常之间做任何区分，也不需要 import
+**下面四个方法按白名单分类外发结果，不捕获任何未预期异常，都是刻意的**（独立
+审核 B-1 首次修复于 2026-08-14；独立审核 R-1 于同日把判别方向从黑名单反转为
+白名单）。只有 HTTP/RPC 已经完整返回、且 ``response.success()`` 为假（业务错误码
+明确不为 0，``code``/``msg`` 字段可读，服务端已经明确拒绝这次调用）时，才显式
+抛出 ``core.execution.card_stream.DeliveryRejected``——这是唯一被
+``core.execution.card_stream``/``apps.gateway.delivery`` 当作"明确失败"处理的
+异常类型。除此之外的一切都不捕获、原样向上传播，被调用方判定为"结果不明"：
+
+- ``lark_oapi`` 内部解析响应体失败时抛出的 ``json.JSONDecodeError``；
+- ``requests.exceptions.RequestException`` 及其子类（读超时、连接重置等，
+  全部继承自内置 ``OSError``）——``lark_oapi`` 的 transport 是
+  ``requests.request(...)``（``lark_oapi/core/http/transport.py``），这里不做
+  任何异常翻译；
+- ``response.success()`` 为真、但响应缺失可回读标识（``data`` 为 ``None`` 或
+  ``card_id``/``message_id`` 缺失）——这种情况下面四个方法会显式检查并抛出
+  ``LookupError``，同样不属于 ``DeliveryRejected``；
+- 任何其它未预期的异常。
+
+这个模块因此不需要在多种"结果不明"的成因之间做任何区分，也不需要 import
 ``requests``。
 
 **卡片 JSON 2.0 载荷形状未经真实发送验证（证据等级 L1）。** 字段名与调用形态（
@@ -48,7 +59,7 @@ import json
 from typing import Any
 
 from lingxi.config.content import RenderedCard
-from lingxi.core.execution.card_stream import CardCreated
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
 
 # 卡片模板里唯一的可流式更新元素；标题与正文合并渲染进它的 content（见模块说明）。
 _STATUS_ELEMENT_ID = "lingxi_status"
@@ -138,8 +149,17 @@ class LarkCardTransport:
         )
         create_response = self._client.cardkit.v1.card.create(create_request)
         if not create_response.success():
-            raise RuntimeError(
-                "建卡失败："
+            raise DeliveryRejected(
+                f"建卡失败：code={create_response.code} msg={create_response.msg} "
+                f"log_id={create_response.get_log_id()}",
+                code=create_response.code,
+                log_id=create_response.get_log_id(),
+            )
+        if create_response.data is None or not create_response.data.card_id:
+            # 结果不明（独立审核 R-1）：响应本身表示成功，但拿不到可回读标识——
+            # 不能确定服务端是否真的建好了卡片，不属于 DeliveryRejected。
+            raise LookupError(
+                "建卡响应缺少可回读标识 card_id："
                 f"code={create_response.code} msg={create_response.msg} "
                 f"log_id={create_response.get_log_id()}"
             )
@@ -160,8 +180,16 @@ class LarkCardTransport:
         )
         send_response = self._client.im.v1.message.reply(send_request)
         if not send_response.success():
-            raise RuntimeError(
-                "卡片发送失败："
+            raise DeliveryRejected(
+                f"卡片发送失败：code={send_response.code} msg={send_response.msg} "
+                f"log_id={send_response.get_log_id()}",
+                code=send_response.code,
+                log_id=send_response.get_log_id(),
+            )
+        if send_response.data is None or not send_response.data.message_id:
+            # 结果不明（独立审核 R-1）：同上，响应成功但缺可回读标识。
+            raise LookupError(
+                "卡片发送响应缺少可回读标识 message_id："
                 f"code={send_response.code} msg={send_response.msg} "
                 f"log_id={send_response.get_log_id()}"
             )
@@ -184,9 +212,11 @@ class LarkCardTransport:
         )
         response = self._client.cardkit.v1.card_element.content(request)
         if not response.success():
-            raise RuntimeError(
-                "卡片流式更新失败："
-                f"code={response.code} msg={response.msg} log_id={response.get_log_id()}"
+            raise DeliveryRejected(
+                f"卡片流式更新失败：code={response.code} msg={response.msg} "
+                f"log_id={response.get_log_id()}",
+                code=response.code,
+                log_id=response.get_log_id(),
             )
 
     def close(self, *, card_id: str, sequence: int, card: RenderedCard) -> None:
@@ -210,9 +240,11 @@ class LarkCardTransport:
         )
         response = self._client.cardkit.v1.card.settings(request)
         if not response.success():
-            raise RuntimeError(
-                "卡片关闭流式失败："
-                f"code={response.code} msg={response.msg} log_id={response.get_log_id()}"
+            raise DeliveryRejected(
+                f"卡片关闭流式失败：code={response.code} msg={response.msg} "
+                f"log_id={response.get_log_id()}",
+                code=response.code,
+                log_id=response.get_log_id(),
             )
 
 
@@ -258,8 +290,16 @@ class LarkDeliveryText:
         )
         response = self._client.im.v1.message.reply(request)
         if not response.success():
-            raise RuntimeError(
+            raise DeliveryRejected(
                 f"发送投递文本失败：code={response.code} msg={response.msg} "
-                f"log_id={response.get_log_id()}"
+                f"log_id={response.get_log_id()}",
+                code=response.code,
+                log_id=response.get_log_id(),
+            )
+        if response.data is None or not response.data.message_id:
+            # 结果不明（独立审核 R-1）：响应成功但缺可回读标识 message_id。
+            raise LookupError(
+                "发送投递文本响应缺少可回读标识 message_id："
+                f"code={response.code} msg={response.msg} log_id={response.get_log_id()}"
             )
         return response.data.message_id

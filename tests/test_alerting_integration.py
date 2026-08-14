@@ -22,7 +22,7 @@ from lingxi.apps.scheduler import (
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.core.alerting import AlertManager, AlertPolicy
-from lingxi.core.execution.card_stream import CardStream
+from lingxi.core.execution.card_stream import CardStream, DeliveryRejected
 from lingxi.config.content import default_content_catalog
 
 
@@ -193,7 +193,10 @@ class AdapterOutcomeTests(unittest.TestCase):
 
         class Cards:
             def create(self, **_kwargs: object) -> str:
-                raise RuntimeError("card unavailable")
+                # 明确失败（白名单，独立审核 R-1）：只有 `DeliveryRejected` 会被
+                # `CardStream.start()` 吞掉并置位 `fallback_needed`，其它任何异常
+                # 类型都会原样抛出（结果不明），不再走到下面的文本兜底断言。
+                raise DeliveryRejected("card unavailable")
 
             def update(self, **_kwargs: object) -> None:
                 return None

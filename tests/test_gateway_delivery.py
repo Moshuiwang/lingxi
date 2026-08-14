@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from typing import Any
@@ -21,23 +22,25 @@ from postgres_schema import ensure_production_schema, reset_production_rows
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
-from lingxi.core.execution.card_stream import CardCreated
+from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
 
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
 
 
 class RecordingCards:
     """记录调用；``fail_at`` 控制第几次调用（1-based）开始抛出同步异常，
-    ``fail_error`` 控制抛出的异常类型（默认 ``RuntimeError``，模拟服务端明确拒绝；
-    传入 ``TimeoutError`` 等 ``OSError`` 子类模拟独立审核 B-1 的"结果不明"场景——
-    真实 adapter 走 ``requests``，其网络异常全部是 ``OSError`` 子类）。
+    ``fail_error`` 控制抛出的异常类型（默认 ``DeliveryRejected``，模拟服务端明确
+    拒绝；传入其它任何异常类型——``TimeoutError`` 等 ``OSError`` 子类、
+    ``json.JSONDecodeError``、或任何未预期的异常——都模拟独立审核 R-1 的"结果
+    不明"场景：白名单反转后，只有 ``DeliveryRejected`` 才是"明确失败"，除它以外
+    的一切都不确定服务端是否已经处理）。
     """
 
     def __init__(
         self,
         *,
         fail_at: int | None = None,
-        fail_error: type[BaseException] = RuntimeError,
+        fail_error: type[BaseException] = DeliveryRejected,
     ) -> None:
         self._fail_at = fail_at
         self._fail_error = fail_error
@@ -49,6 +52,10 @@ class RecordingCards:
     def _maybe_fail(self) -> None:
         self._calls += 1
         if self._fail_at is not None and self._calls >= self._fail_at:
+            if self._fail_error is json.JSONDecodeError:
+                # JSONDecodeError 的构造签名是 (msg, doc, pos)，不是单个消息字符串——
+                # 模拟 lark_oapi 内部解析响应体失败时真实抛出的形状。
+                raise json.JSONDecodeError("模拟响应体解析失败", "", 0)
             raise self._fail_error("card call failed")
 
     def create(self, **kwargs: object) -> CardCreated:
@@ -66,12 +73,16 @@ class RecordingCards:
 
 
 class RecordingText:
+    """``fail_error`` 默认 ``DeliveryRejected``（明确失败）；传入其它异常类型模拟
+    独立审核 R-1 的"结果不明"场景，见 ``RecordingCards`` 的类文档。
+    """
+
     def __init__(
         self,
         *,
         fail: bool = False,
         message_id: str = "msg-text-1",
-        fail_error: type[BaseException] = RuntimeError,
+        fail_error: type[BaseException] = DeliveryRejected,
     ) -> None:
         self.fail = fail
         self.message_id = message_id
@@ -514,10 +525,15 @@ class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
 
 
 class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
-    """独立审核 B-1（红线，P1）：`requests` 的超时/连接类异常（真实 adapter 走
-    lark-oapi，其 transport 是 ``requests.request(...)``）不得被当成"明确失败"
-    清预留位、降级或重试——必须转入 ``uncertain``、告警、预留位原样保留。用
-    ``TimeoutError``（内置 ``OSError`` 子类）模拟这类异常，与 ``RuntimeError``
+    """独立审核 B-1（红线，P1）首次修复、独立审核 R-1（红线家族）反转为白名单：
+    只有 ``DeliveryRejected``（服务端已经给出完整响应且业务错误码明确拒绝）才是
+    "明确失败"；除它以外的一切——`requests` 的超时/连接类异常（真实 adapter 走
+    lark-oapi，其 transport 是 ``requests.request(...)``，全部继承内置
+    ``OSError``）、JSON 解析失败（``json.JSONDecodeError``）、响应结构缺失
+    （``success()`` 为真但拿不到可回读标识）、任何其它未预期的异常——都不得被
+    当成"明确失败"清预留位、降级或重试，必须转入 ``uncertain``、告警、预留位
+    原样保留。用 ``TimeoutError``、``json.JSONDecodeError``、``LookupError``
+    （模拟"success 真但缺可回读标识"）分别覆盖这几类成因，与 ``DeliveryRejected``
     模拟的"服务端明确拒绝"区分开（后者行为不变，见其余测试类）。
     """
 
@@ -599,7 +615,7 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.start_task("tsk-1")
         self.finish_task("tsk-1", content="已产生的答案")
 
-        # create 本身明确失败（RuntimeError，行为不变），直接走文本通道；
+        # create 本身明确失败（DeliveryRejected，行为不变），直接走文本通道；
         # 文本发送这一步改为超时。
         cards = RecordingCards(fail_at=1)
         texts = RecordingText(fail=True, fail_error=TimeoutError)
@@ -621,15 +637,16 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         self.assertEqual(len(texts.calls), 1, "结果不明不得自动重发")
 
     def test_an_explicit_rejection_is_unaffected_and_still_retries(self) -> None:
-        """明确失败路径行为不变：`RuntimeError`（服务端明确拒绝）仍然立即清预留位、
-        允许下一轮重试——与上面的 ``TimeoutError`` 用例对照，证明这次修复只新增了
-        "结果不明"这一条分支，没有改变既有的"明确失败"语义。
+        """明确失败路径行为不变：`DeliveryRejected`（服务端明确拒绝，独立审核
+        R-1 用它取代此前注入 ``RuntimeError`` 的既有测试写法）仍然立即清预留位、
+        允许下一轮重试——与上面几条"结果不明"用例对照，证明白名单反转只改变了
+        判别方向，没有改变既有的"明确失败"语义。
         """
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
 
-        cards = RecordingCards(fail_at=1, fail_error=RuntimeError)
+        cards = RecordingCards(fail_at=1, fail_error=DeliveryRejected)
         texts = RecordingText()
         consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
         consumer.run_once()
@@ -639,6 +656,75 @@ class NetworkResultUnknownDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase
         ]
         self.assertIsNone(row[0], "明确失败必须清空预留位，允许下一轮重试——与上面三条 TimeoutError 用例的行为相反")
         self.assertTrue(row[1], "明确失败整体降级为文本通道，这个既有语义没有被本次修复改变")
+
+    def test_a_json_decode_error_during_card_create_does_not_retry_automatically(self) -> None:
+        """独立审核 R-1 新增：`lark_oapi` 内部响应体解析失败时抛出的
+        `json.JSONDecodeError` 不是黑名单能挡住的 `OSError`——旧的黑名单实现会把它
+        当成"明确失败"清预留位、立即降级；白名单反转后，除 `DeliveryRejected`
+        以外的一切异常默认归"结果不明"，这条用例正是证伪旧实现、证明新实现的
+        对照组。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        cards = RecordingCards(fail_at=1, fail_error=json.JSONDecodeError)
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        processed = consumer.run_once()
+        self.assertEqual(processed, 1, "run_once 正常跑完这一轮，不因结果不明让整轮失败")
+
+        row = self.query(
+            "SELECT dispatch_reserved_kind, card_id, fallback_text, delivery_consumed_sequence "
+            "FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "card_create", "预留位必须原样保留，不得清空")
+        self.assertIsNone(row[1], "没有拿到 card_id，不能假设建卡成功")
+        self.assertFalse(row[2], "结果不明绝不能降级为文本兜底")
+        self.assertEqual(row[3], 0, "游标不得推进，下一轮仍要重新评估这个 started 事件")
+        self.assertEqual(texts.calls, [], "结果不明不得改走文本通道")
+
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual([task.reserved_kind for task in uncertain], ["card_create"])
+
+        # 下一轮：uncertain 任务被排除在正常消费之外，不得自动重发（外发计数不增）。
+        recovered = DeliveryConsumer(queue=self.queue, cards=RecordingCards(), texts=texts)
+        processed_next = recovered.run_once()
+        self.assertEqual(processed_next, 0, "uncertain 任务不进入正常候选")
+
+    def test_missing_readable_identifier_during_text_fallback_does_not_retry_automatically(
+        self,
+    ) -> None:
+        """独立审核 R-1 新增：`response.success()` 为真但拿不到 `message_id`
+        （真实 adapter 遇到这种响应形状时显式抛出 `LookupError`，见
+        `adapters.feishu_delivery` 的模块说明）同样不是 `DeliveryRejected`——
+        没有任何证据表明服务端拒绝了这次调用，反而它可能已经受理，只是响应缺失
+        可回读标识，必须归"结果不明"，不得当成"明确失败"清预留位后按退避重发。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1", content="已产生的答案")
+
+        # create 本身明确失败，直接走文本通道；文本发送这一步响应缺可回读标识。
+        cards = RecordingCards(fail_at=1)
+        texts = RecordingText(fail=True, fail_error=LookupError)
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        processed = consumer.run_once()
+        self.assertEqual(processed, 1)
+
+        self.assertEqual(len(texts.calls), 1, "文本发送确实被尝试过一次")
+        row = self.query("SELECT dispatch_reserved_kind, status FROM task WHERE id='tsk-1'")[0]
+        self.assertEqual(row[0], "text_send", "结果不明必须保留预留位，不得清空重试")
+        self.assertEqual(row[1], "awaiting_delivery")
+
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual([task.reserved_kind for task in uncertain], ["text_send"])
+
+        # 下一轮：uncertain 任务被排除在正常消费之外，不得自动重发（外发计数不增）。
+        processed_next = consumer.run_once()
+        self.assertEqual(processed_next, 0)
+        self.assertEqual(len(texts.calls), 1, "结果不明不得自动重发")
 
 
 class UncertainTasksStopAlertingAfterExpiryTests(DeliveryConsumerTestCase):

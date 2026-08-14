@@ -14,15 +14,16 @@ Gateway 侧的消费进度持久化（``adapters.postgres_conversation`` 新增�
 不产生第二次可见卡片帧），但那只保证卡片本身不重复，**不保证消费循环的错误处理
 不会把一次因崩溃重启导致的序号冲突误判成"卡片链路整体失败"、进而降级到文本兜底**
 ——那样会在卡片其实已经成功送达之后又多发一条文本终态，是跨通道的重复投递，因此
-同样纳入预留位保护（迁移 0060 头部注释）。**进程崩溃、或外发调用抛出结果不明的
-网络类异常（``OSError``——读超时、连接重置，见 ``core.execution.card_stream``
-模块说明的独立审核 B-1）发生在提交预留位与清空之间时**，下一轮
+同样纳入预留位保护（迁移 0060 头部注释）。**进程崩溃、或外发调用抛出任何不是
+``core.execution.card_stream.DeliveryRejected`` 的异常（结果不明——JSON 解析
+失败、响应缺失可回读标识、``OSError`` 类网络异常等，见该模块说明的独立审核
+R-1 白名单）发生在提交预留位与清空之间时**，下一轮
 ``list_pending_delivery_tasks`` 会把这个任务排除在正常消费之外，
 ``list_uncertain_delivery_tasks`` 把它路由给告警——消费循环不会替它猜测上一次调用
 是否成功后自动重发（issue 状态合同第 6 条）。**只有服务端明确拒绝**（真实 adapter
-`response.success()` 为假时抛出的 ``RuntimeError``，即业务错误码明确表示未受理）
-**才走 `clear_dispatch_reservation` 立即清空、允许下一轮重试**；结果不明的
-``OSError`` 类异常绝不清空，统一转 ``uncertain``。
+`response.success()` 为假、业务错误码明确表示未受理时抛出的 ``DeliveryRejected``）
+**才走 `clear_dispatch_reservation` 立即清空、允许下一轮重试**；除它以外的一切
+异常都归结果不明，绝不清空，统一转 ``uncertain``。
 
 **人工恢复（独立审核 B-2 补全，2026-08-14）**：处理一个 ``uncertain`` 任务之前，
 必须先核对对应的外发调用**是否实际已经成功**，核对手段按 ``reserved_kind``：
@@ -30,8 +31,11 @@ Gateway 侧的消费进度持久化（``adapters.postgres_conversation`` 新增�
 - ``card_create``：按话题（``chat_id``/``thread_id``）回读飞书侧该会话的最新消息，
   确认是否已经出现一张对应本次问题的卡片消息；找到即可读出其真实 ``card_id`` /
   ``message_id`` 作为幂等标识核对依据。
-- ``card_finish``：任务的 ``card_id`` 已经持久化（建卡阶段已经成功），按这个
-  ``card_id`` 回读该卡片当前内容/``sequence``，核对是否已经写入终态正文。
+- ``card_finish``（独立审核 R-2 修正，2026-08-14：此前写的「按 card_id 回读卡片」
+  指向一个不存在的接口——CardKit 没有单独的"读卡片当前内容"接口）：建卡阶段已经
+  成功，任务的 ``delivery_message_id``（建卡时唯一拿到的消息级可回读标识）已经
+  持久化——按这个 ``message_id`` 回读该条消息，人工目视核对卡片当前显示的内容
+  是否已经是终态正文（成功结果或失败提示），而不是仍停在处理中的中间状态。
 - ``text_send``：按话题回读飞书侧该会话的最新消息，核对是否已经出现一条内容匹配
   的文本终态（没有平台原生幂等标识，只能按内容 + 时间窗口人工比对）。
 
@@ -44,7 +48,13 @@ Gateway 侧的消费进度持久化（``adapters.postgres_conversation`` 新增�
    卡片 sequence 走 ``card_sequence`` 参数，连同这条 ``terminal``/``started``
    事件的 ``sequence`` 作为 ``consumed_sequence``），该调用本身会原子清空预留位
    并推进游标，让任务在下一轮被 ``confirm_delivery`` 正常确认送达——不重放任何
-   外部调用。
+   外部调用。**``reserved_kind`` 是 ``text_send`` 时，写回必须同时传
+   ``fallback_text=True``**（独立审核 R-3 修正，2026-08-14：不传时默认
+   ``False``）——下一轮 ``_maybe_confirm`` 按 ``stream.fallback_needed``（即
+   持久化的 ``task.fallback_text``）决定 ``confirm_delivery`` 的
+   ``platform_message_kind`` 写 ``"card"`` 还是 ``"text"``，漏传会把一条实际走
+   文本通道送达的记录误标成卡片，是记账错标。``card_create``/``card_finish``
+   场景则保持 ``fallback_text=False``（或不传，沿用既有默认）。
 2. **确认未送达**（回读证实没有任何卡片/消息产生，或产生的内容与本次任务不符）：
    这才允许调用 ``clear_dispatch_reservation`` 清空预留位，交给下一轮按既有逻辑
    重新外发。
@@ -73,6 +83,7 @@ from lingxi.core.execution.card_stream import (
     CardRateLimiter,
     CardStream,
     CardTransport,
+    DeliveryRejected,
     SendOutcomeCallback,
     TextTransport,
 )
@@ -276,10 +287,11 @@ class DeliveryConsumer:
                 return False
             try:
                 stream.start()
-            except OSError as error:
-                # 独立审核 B-1：建卡结果不明（网络超时/连接中断），服务端可能
-                # 已经处理——不清预留位、不推进游标、不降级。预留位原样留在
-                # 数据库里，转入既有 uncertain 告警路径，等待人工核对。
+            except Exception as error:  # noqa: BLE001 - 白名单反转（独立审核 R-1）：
+                # `CardStream.start()` 只吞掉 `DeliveryRejected`（明确失败），其余
+                # 一切异常（JSON 解析失败/响应缺失可回读标识/网络类异常等）都原样
+                # 抛出到这里——服务端可能已经处理，不清预留位、不推进游标、不降级。
+                # 预留位原样留在数据库里，转入既有 uncertain 告警路径，等待人工核对。
                 logger.error(
                     "建卡结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
                     task.task_id,
@@ -351,10 +363,11 @@ class DeliveryConsumer:
                     stream.finish(result=event.content or "", elapsed_seconds=elapsed)
                 else:
                     stream.finish(failure=content, elapsed_seconds=elapsed)
-            except OSError as error:
-                # 独立审核 B-1：终态更新结果不明（网络超时/连接中断），平台可能
-                # 已经处理——不能猜是成功还是失败。不清预留位、不降级、不推进
-                # 游标，转入既有 uncertain 告警路径，等待人工核对。
+            except Exception as error:  # noqa: BLE001 - 白名单反转（独立审核 R-1）：
+                # `CardStream.finish()` 的终态更新只吞掉 `DeliveryRejected`（明确
+                # 失败），其余一切异常都原样抛出到这里——平台可能已经处理，不能猜
+                # 是成功还是失败。不清预留位、不降级、不推进游标，转入既有
+                # uncertain 告警路径，等待人工核对。
                 logger.error(
                     "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
                     task.task_id,
@@ -362,7 +375,7 @@ class DeliveryConsumer:
                 )
                 return False
             # finish() 内部吞掉了明确失败（card_stream.py 的既有设计；结果不明的
-            # OSError 会原样抛出，已经在上面 except 里处理），走到这里就是拿到了
+            # 异常会原样抛出，已经在上面 except 里处理），走到这里就是拿到了
             # 明确结果：成功，或已经清晰地降级为需要文本兜底。
             #
             # **只在降级时提前清空预留位**（独立审核 P1-1，2026-08-14 修复）：降级
@@ -413,8 +426,14 @@ class DeliveryConsumer:
             return _FallbackOutcome.RETRY_LATER
         try:
             stream.send_fallback(content)
-        except OSError as error:
-            # 独立审核 B-1：文本兜底结果不明（网络超时/连接中断），服务端可能
+        except DeliveryRejected as error:
+            # 明确失败（白名单，独立审核 R-1）：清预留位，下一轮按退避重试。
+            self._queue.clear_dispatch_reservation(task_id=task.task_id)
+            self._record_fallback_attempt_failed(task.task_id)
+            self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
+            return _FallbackOutcome.RETRY_LATER
+        except Exception as error:  # noqa: BLE001 - 结果不明（白名单反转，独立审核
+            # R-1）：JSON 解析失败/响应缺失可回读标识/网络类异常等，服务端可能
             # 已经受理并投递——不清预留位、不进入重试退避（那等于"下一轮原样
             # 重试"，正是本次复现的重复投递）。转入既有 uncertain 告警路径。
             logger.error(
@@ -423,11 +442,6 @@ class DeliveryConsumer:
                 type(error).__name__,
             )
             return _FallbackOutcome.UNCERTAIN
-        except Exception as error:  # noqa: BLE001 - 明确失败：清预留位，下一轮按退避重试
-            self._queue.clear_dispatch_reservation(task_id=task.task_id)
-            self._record_fallback_attempt_failed(task.task_id)
-            self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
-            return _FallbackOutcome.RETRY_LATER
         self._clear_fallback_backoff(task.task_id)
         return _FallbackOutcome.SENT
 
