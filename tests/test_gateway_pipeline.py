@@ -192,6 +192,48 @@ class DuplicateDeliveryTests(PipelineTestCase):
         self.assertEqual(len(self.state.tasks), 1, "重复投递至多产生一个任务")
 
 
+class DeliveryExpiredNoticeTests(PipelineTestCase):
+    """Issue #152、`V-投递-06` 后半句：到期未投递的正文只在用户下一条主动消息上
+    提示一次「请重新提问」，不主动推送、不重放旧答案。"""
+
+    def test_pending_notice_is_appended_once_and_not_repeated(self) -> None:
+        # 首次 ensure_conversation 分配的会话标识是 FakeTransaction 的既定行为
+        # （见 gateway_fakes.py），预置在同一个话题上。
+        self.state.pending_delivery_expired_notices.add("cnv_0")
+
+        self.build().handle_message(message("e1"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertTrue(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "有一条尚未提示过的到期任务时，这条主动消息应当附带一次提示",
+        )
+
+        self.log = CallLog()
+        self.build().handle_message(message("e2"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertFalse(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "同一次到期只提示一次，不随后续消息反复提示",
+        )
+
+    def test_pending_notice_does_not_block_the_message_from_being_queued(self) -> None:
+        self.state.pending_delivery_expired_notices.add("cnv_0")
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(
+            outcome.handled_as,
+            HandledAs.TASK_QUEUED,
+            "过期提示只是追加的一条回复，不改变这条消息本身该有的正常处理结果",
+        )
+
+    def test_no_pending_notice_means_no_extra_reply(self) -> None:
+        self.build().handle_message(message("e1"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertFalse(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "没有预置到期任务时不应该凭空出现提示",
+        )
+
+
 class TaskOwnershipTests(unittest.TestCase):
     """`V-接入-11`：任务归属只来自事件发送者标识的解析结果。"""
 

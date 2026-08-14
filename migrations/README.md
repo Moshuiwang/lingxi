@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0059_delivery_outbox` |
+| head revision | `0060_gateway_delivery_dispatch` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -185,6 +185,15 @@ Issue #57 / S4 前半。建 `conversation`、`inbound_event`、`task` 三张表�
 
 `downgrade()` 真实可执行且被逐 revision 真往返覆盖：三张表都是本 revision 新建的，
 不存在需要还原的历史行，删除顺序与建表相反，两个函数显式删除。
+
+## `0060_gateway_delivery_dispatch`（Gateway 投递消费记账）
+
+Issue #152。在 `task` 上新增四列（`delivery_consumed_sequence`、`delivery_message_id`、
+`dispatch_reserved_kind`、`delivery_expired_notice_sent_at`），供 Gateway 消费循环记录
+「消费到哪、绑定了哪个可回读标识、外发前预留位、是否已提示过期」；与 0057 已建但一直
+未启用的 `card_id`/`card_seq`/`fallback_text` 同表。理由详见 revision 文件头部注释。
+
+纯新增列，前滚兼容；`downgrade()` 直接 `DROP COLUMN`，不存在需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

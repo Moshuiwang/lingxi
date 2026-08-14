@@ -116,6 +116,10 @@ REQUIRED_MODULES = (
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
+    # Gateway 投递消费循环（Issue #152）：CardKit 流式卡片/文本兜底 adapter 与
+    # 消费循环编排，各自都在制品里必须能 import。
+    "lingxi.adapters.feishu_delivery",
+    "lingxi.apps.gateway.delivery",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -299,6 +303,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_outbound",
             "lingxi.adapters.postgres_conversation",
             "lingxi.adapters.postgres",
+            # 投递消费循环（Issue #152）：CardKit/文本兜底 adapter 由
+            # apps.gateway.assemble_delivery_consumer 在函数内 import；
+            # apps.gateway.delivery 又在函数内 import 到它——两者都不在模块顶层，
+            # 因此必须显式登记，理由与本文件其余"函数内 import"条目一致。
+            "lingxi.adapters.feishu_delivery",
+            "lingxi.apps.gateway.delivery",
             "lingxi.core",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
@@ -307,9 +317,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.session_window",
             # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
             # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
-            # 终态解析规则，即便本批 gateway 尚未消费 outbox。
+            # 终态解析规则。apps.gateway.delivery 额外直接依赖 core.execution.*
+            # ——卡片顺序、限流与失败回退（Issue #152）。
             "lingxi.core.delivery",
             "lingxi.core.delivery.ports",
+            "lingxi.core.execution",
+            "lingxi.core.execution.card_stream",
             "lingxi.core.ids",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml

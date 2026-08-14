@@ -38,7 +38,12 @@ from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
-from lingxi.core.execution.card_stream import CardRateLimiter, CardStream
+from lingxi.core.execution.card_stream import (
+    CardCreated,
+    CardRateLimiter,
+    CardStream,
+    DeliveryRejected,
+)
 from postgres_schema import ensure_production_schema, reset_production_rows
 
 
@@ -62,36 +67,45 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    def __init__(self, *, fail: str | None = None) -> None:
+    """``error`` 默认 ``DeliveryRejected``（明确失败，独立审核 R-1 白名单）；传入
+    ``TimeoutError`` 等其它任何异常类型模拟"结果不明"，见
+    ``core.execution.card_stream`` 模块说明。
+    """
+
+    def __init__(
+        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejected
+    ) -> None:
         self.fail = fail
+        self._error = error
         self.calls: list[tuple[str, int | None]] = []
         self.bodies: list[str] = []
 
-    def create(self, **kwargs: object) -> str:
+    def create(self, **kwargs: object) -> CardCreated:
         self.calls.append(("create", None))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "create":
-            raise RuntimeError("card create")
-        return "card-1"
+            raise self._error("card create")
+        return CardCreated(card_id="card-1", message_id="msg-card-1")
 
     def update(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("update", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "update":
-            raise RuntimeError("card update")
+            raise self._error("card update")
 
     def close(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("close", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "close":
-            raise RuntimeError("card close")
+            raise self._error("card close")
 
 
 class RecordingText:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
         self.fail = fail
+        self._error = error
 
     def send_text(
         self,
@@ -100,7 +114,7 @@ class RecordingText:
         thread_id: str | None,
         reply_to_message_id: str,
         text: str,
-    ) -> None:
+    ) -> str:
         self.calls.append(
             {
                 "chat_id": chat_id,
@@ -111,7 +125,8 @@ class RecordingText:
         )
         self.texts.append(text)
         if self.fail:
-            raise RuntimeError("text fallback")
+            raise self._error("text fallback")
+        return "msg-fallback-1"
 
 
 class CardStreamTests(unittest.TestCase):
@@ -143,6 +158,36 @@ class CardStreamTests(unittest.TestCase):
         self.assertIn("已完成 · 1 秒", cards.bodies[-2])
         self.assertEqual(text.texts, [])
 
+    def test_finish_counts_toward_the_shared_global_rate_budget(self) -> None:
+        """独立审核 P2-2：``finish()`` 刻意不经过单话题 500ms 节流（终态帧是结果
+        本身，被吞掉比不节流更糟），但全进程 50 次/秒的预算必须同样计入终态更新
+        +关闭这两次调用，否则并发多话题同时终态时全局计数会失真。
+        """
+
+        limiter = CardRateLimiter()
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: 0.0,
+            rate_limiter=limiter,
+        )
+        stream.start()  # 消费全局预算第 1 个名额
+        for index in range(48):
+            self.assertTrue(limiter.allow(topic=f"filler-{index}", now=0.0))
+        # 至此全局预算已经用掉 49/50，只剩 1 个名额。
+
+        stream.finish(result="结果", elapsed_seconds=1)  # 终态更新 + 关闭，各占一个名额
+
+        self.assertFalse(
+            limiter.allow(topic="topic-brand-new", now=0.0),
+            "finish() 的两次调用必须计入全局 50 次/秒预算，否则这里会被误放行",
+        )
+
     def test_card_failure_falls_back_to_same_topic_text(self) -> None:
         cards = RecordingCards(fail="update")
         text = RecordingText()
@@ -169,6 +214,168 @@ class CardStreamTests(unittest.TestCase):
             "topic-a",
             "V-卡片-03：文本回退必须保留原 thread_id",
         )
+
+    def test_close_failure_alone_does_not_fall_back_to_a_duplicate_text(self) -> None:
+        """独立审核 P1-2：终态**更新**已经成功（用户已经能在卡片里看到完整答案），
+        只有随后的**关闭**失败——不得整体降级为文本兜底，否则用户会在同一话题里
+        看到同一条答案两遍。G-CARD 实测：未手动关闭的流式卡片距上次开启 10 分钟
+        后由平台自动关闭，关闭失败本身不构成结果丢失。
+        """
+
+        cards = RecordingCards(fail="close")
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "只有关闭失败，不能整体降级为文本通道")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls],
+            ["create", "update", "close"],
+            "终态更新必须真实发出；关闭也确实被尝试过（只是失败了）",
+        )
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertIsNone(message_id, "fallback_needed 为假时 send_fallback 不产生任何外部调用")
+        self.assertEqual(text.calls, [], "答案已经在卡片里对用户可见，绝不能再发一条重复文本终态")
+
+    def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1/R-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络
+        异常全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把
+        它抛出去，不能像 ``DeliveryRejected`` 那样吞掉并置位 ``fallback_needed``
+        （那会让调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
+        """
+
+        cards = RecordingCards(fail="create", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+
+        with self.assertRaises(TimeoutError):
+            stream.start()
+
+        self.assertIsNone(stream.card_id, "没有拿到 card_id，不能假设建卡成功")
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+
+    def test_terminal_update_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1 场景 1：终态更新超时不得被 ``finish()`` 吞掉后降级为文本
+        兜底——必须原样抛出，且不再继续调用 ``close()``。
+        """
+
+        cards = RecordingCards(fail="update", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+
+        with self.assertRaises(TimeoutError):
+            stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls], ["create", "update"], "结果不明时不得继续调用 close"
+        )
+
+    def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
+        """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
+        无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
+        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejected`` 在这一步行为
+        一致。
+        """
+
+        cards = RecordingCards(fail="close", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)  # 不应该抛出
+
+        self.assertFalse(stream.fallback_needed, "关闭失败（无论何种异常）都不整体降级")
+        self.assertEqual([kind for kind, _ in cards.calls], ["create", "update", "close"])
+
+    def test_text_fallback_timeout_is_not_swallowed(self) -> None:
+        """独立审核 B-1 场景 2：文本兜底发送超时必须原样抛出，调用方据此不清预留位、
+        不进入重试退避。
+        """
+
+        cards = RecordingCards(fail="create")  # 明确失败，走文本通道
+        text = RecordingText(fail=True, error=TimeoutError)
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        self.assertTrue(stream.fallback_needed)
+
+        with self.assertRaises(TimeoutError):
+            stream.send_fallback(default_content_catalog().text("worker.failed"))
+
+        self.assertIsNone(stream.message_id, "没有拿到 message_id，不能假设文本已经送达")
+        self.assertEqual(len(text.calls), 1, "发送确实被尝试过一次")
+
+    def test_resuming_with_an_existing_card_id_does_not_create_a_second_card(self) -> None:
+        """Issue #152：Gateway 消费循环重启后用 ``initial_*`` 恢复，``start()``
+        必须是安全的空操作，不产生第二次 ``create()`` 调用（状态合同第 7 条）。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_card_id="card-resumed",
+            initial_sequence=2,
+            initial_message_id="msg-resumed",
+        )
+
+        stream.start()
+        self.assertEqual(cards.calls, [], "resume 场景下 start() 必须是空操作")
+        self.assertEqual(stream.card_id, "card-resumed")
+        self.assertEqual(stream.message_id, "msg-resumed")
+
+        stream.finish(result="结果", elapsed_seconds=1)
+        self.assertEqual(
+            [sequence for kind, sequence in cards.calls if kind in {"update", "close"}],
+            [3, 4],
+            "序号从持久化的 initial_sequence 之后继续，不从零重新计数",
+        )
+
+    def test_resuming_with_fallback_already_needed_skips_the_card_path_entirely(self) -> None:
+        """已经降级为文本通道的任务重启后不得再尝试建卡或更新卡片。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_fallback_needed=True,
+        )
+
+        stream.start()
+        stream.update(elapsed_seconds=1)
+        stream.finish(result="结果")
+        self.assertEqual(cards.calls, [], "已降级的任务重启后不得再触碰卡片通道")
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertEqual(message_id, "msg-fallback-1")
+        self.assertEqual(stream.message_id, "msg-fallback-1")
 
 
 class FakeWorkerQueue:

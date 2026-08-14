@@ -187,6 +187,10 @@ class GatewayTransaction(Protocol):
     def notify_task_queued(self) -> None:
         """发出 ``NOTIFY task_queued``。在事务内调用，随提交一起对外可见。"""
 
+    def consume_delivery_expired_notice(self, *, conversation_id: str) -> bool:
+        """该话题是否有尚未提示过的「投递已过期」任务；命中即原子标记为已提示
+        （Issue #152、`V-投递-06` 后半句）。"""
+
 
 class GatewayStore(Protocol):
     def transaction(self) -> ContextManager[GatewayTransaction]: ...

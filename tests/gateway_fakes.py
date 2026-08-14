@@ -137,6 +137,10 @@ class FakeState:
     tasks: list[FakeTask] = field(default_factory=list)
     notifies: int = 0
     committed: bool = False
+    # Issue #152：预置某个话题「有一条尚未提示过的投递已过期任务」，供
+    # test_gateway_pipeline.py 的专项用例断言 gateway.delivery_expired 提示的触发
+    # 与只提示一次；默认空集合，绝大多数既有用例因此不受影响。
+    pending_delivery_expired_notices: set[str] = field(default_factory=set)
 
 
 class FakeTransaction:
@@ -233,6 +237,20 @@ class FakeTransaction:
     def notify_task_queued(self) -> None:
         self._log.add("store.notify_task_queued")
         self.staged_notifies += 1
+
+    def consume_delivery_expired_notice(self, *, conversation_id: str) -> bool:
+        self._log.add(
+            "store.consume_delivery_expired_notice", conversation_id=conversation_id
+        )
+        if conversation_id not in self._state.pending_delivery_expired_notices:
+            return False
+        # 与真实实现同语义：命中即原子标记为已提示，直接从暂存状态里摘掉，同一次
+        # 到期不会被同一个话题的下一条消息再次命中。这里不经过 commit 暂存区——
+        # 假实现里没有别的路径会读写这个集合，直接摘除不会破坏"事务失败即回滚"的
+        # 测试意图（真实实现的原子性由真库 UPDATE...RETURNING 承担，见
+        # adapters.postgres_conversation）。
+        self._state.pending_delivery_expired_notices.discard(conversation_id)
+        return True
 
     def _find(self, conversation_id: str) -> FakeConversation:
         for conversation in self._state.conversations.values():
