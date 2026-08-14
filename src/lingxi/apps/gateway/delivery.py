@@ -14,10 +14,40 @@ Gateway 侧的消费进度持久化（``adapters.postgres_conversation`` 新增�
 不产生第二次可见卡片帧），但那只保证卡片本身不重复，**不保证消费循环的错误处理
 不会把一次因崩溃重启导致的序号冲突误判成"卡片链路整体失败"、进而降级到文本兜底**
 ——那样会在卡片其实已经成功送达之后又多发一条文本终态，是跨通道的重复投递，因此
-同样纳入预留位保护（迁移 0060 头部注释）。**进程崩溃发生在提交预留位与清空之间时**，
-下一轮 ``list_pending_delivery_tasks`` 会把这个任务排除在正常消费之外，
+同样纳入预留位保护（迁移 0060 头部注释）。**进程崩溃、或外发调用抛出结果不明的
+网络类异常（``OSError``——读超时、连接重置，见 ``core.execution.card_stream``
+模块说明的独立审核 B-1）发生在提交预留位与清空之间时**，下一轮
+``list_pending_delivery_tasks`` 会把这个任务排除在正常消费之外，
 ``list_uncertain_delivery_tasks`` 把它路由给告警——消费循环不会替它猜测上一次调用
-是否成功后自动重发（issue 状态合同第 6 条）。恢复需要人工核对后清空预留位。
+是否成功后自动重发（issue 状态合同第 6 条）。**只有服务端明确拒绝**（真实 adapter
+`response.success()` 为假时抛出的 ``RuntimeError``，即业务错误码明确表示未受理）
+**才走 `clear_dispatch_reservation` 立即清空、允许下一轮重试**；结果不明的
+``OSError`` 类异常绝不清空，统一转 ``uncertain``。
+
+**人工恢复（独立审核 B-2 补全，2026-08-14）**：处理一个 ``uncertain`` 任务之前，
+必须先核对对应的外发调用**是否实际已经成功**，核对手段按 ``reserved_kind``：
+
+- ``card_create``：按话题（``chat_id``/``thread_id``）回读飞书侧该会话的最新消息，
+  确认是否已经出现一张对应本次问题的卡片消息；找到即可读出其真实 ``card_id`` /
+  ``message_id`` 作为幂等标识核对依据。
+- ``card_finish``：任务的 ``card_id`` 已经持久化（建卡阶段已经成功），按这个
+  ``card_id`` 回读该卡片当前内容/``sequence``，核对是否已经写入终态正文。
+- ``text_send``：按话题回读飞书侧该会话的最新消息，核对是否已经出现一条内容匹配
+  的文本终态（没有平台原生幂等标识，只能按内容 + 时间窗口人工比对）。
+
+核对结论决定动作，且只有这两种：
+
+1. **已经送达**（回读证实卡片/文本确实已经到达用户）：**不得**调用
+   ``clear_dispatch_reservation`` 后任由消费循环重放——那会照搬本 Story 修复的
+   红线场景，重放一条已经成功的终态。正确动作是把回读到的标识通过
+   ``record_delivery_progress`` 直接写回（``card_id``/``message_id`` 参数，
+   卡片 sequence 走 ``card_sequence`` 参数，连同这条 ``terminal``/``started``
+   事件的 ``sequence`` 作为 ``consumed_sequence``），该调用本身会原子清空预留位
+   并推进游标，让任务在下一轮被 ``confirm_delivery`` 正常确认送达——不重放任何
+   外部调用。
+2. **确认未送达**（回读证实没有任何卡片/消息产生，或产生的内容与本次任务不符）：
+   这才允许调用 ``clear_dispatch_reservation`` 清空预留位，交给下一轮按既有逻辑
+   重新外发。
 
 **已知残留风险：G-CARD 10 分钟流式自动关闭**（独立审核 P2-5，#162 评论
 5290545953/5291111636 实测；[验收矩阵](../../../../docs/技术设计/验收矩阵.md)
@@ -34,6 +64,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from enum import Enum
 from typing import Any, Callable
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
@@ -57,6 +88,21 @@ def _default_alert(kind: str, task_id: str) -> None:
     """
 
     logger.error("投递消费告警 kind=%s task_id=%s", kind, task_id)
+
+
+class _FallbackOutcome(Enum):
+    """``DeliveryConsumer._send_fallback`` 的结果分类。
+
+    独立审核 B-1 之前只有两种结果（成功 / 失败），用 ``bool`` 就够；现在需要
+    第三种——"结果不明"——单独区分开，因为它决定 `_handle_terminal` 之后能不能
+    安全尝试 `_maybe_confirm`（见该方法文档），而 `RETRY_LATER` 的几种成因
+    （退避未到期、预留位没抢到、明确失败）都不影响这一点，与本次修复之前的
+    既有行为保持一致。
+    """
+
+    SENT = "sent"
+    RETRY_LATER = "retry_later"
+    UNCERTAIN = "uncertain"
 
 
 class DeliveryConsumer:
@@ -193,6 +239,7 @@ class DeliveryConsumer:
             initial_fallback_needed=task.fallback_text,
         )
 
+        confirm_safe = True
         for event in events:
             if event.event_type == "started":
                 if not self._handle_started(task, stream, event):
@@ -203,12 +250,20 @@ class DeliveryConsumer:
             elif event.event_type in ("progress", "safely_releasable_answer"):
                 self._handle_progress(task, stream, event)
             elif event.event_type == "terminal":
-                self._handle_terminal(task, stream, event)
+                confirm_safe = self._handle_terminal(task, stream, event)
                 # terminal 是该任务在 outbox 里唯一一条终态事件（#151 状态合同：
                 # 重复终态被拒绝），处理完不会再有后续事件需要看。
                 break
 
-        self._maybe_confirm(task, stream)
+        if confirm_safe:
+            self._maybe_confirm(task, stream)
+        # confirm_safe 为假只发生在独立审核 B-1 的"结果不明"分支：此时
+        # `stream.message_id` 可能只是更早建卡时就拿到、与这一轮真正想确认的
+        # 终态结果无关的旧值，用它调用 `confirm_delivery` 会把一个应该转
+        # `uncertain` 的任务提前误标成已确认送达（`list_uncertain_delivery_tasks`
+        # 只看 `status IN ('running','awaiting_delivery')`，一旦被误标成
+        # `succeeded`/`failed` 就会从这条告警路径里永久消失，而预留位却还留着，
+        # 变成一个无人再看得到的孤儿）。
 
     def _handle_started(self, task: Any, stream: CardStream, event: Any) -> bool:
         """返回是否可以继续处理本轮的后续事件（`False` 表示预留位没抢到）。"""
@@ -219,7 +274,18 @@ class DeliveryConsumer:
                 # 要么任务已经不在可处理状态。两种情况都不该继续外发，直接返回，
                 # 这个 started 事件的游标本轮不推进，下一轮重新评估。
                 return False
-            stream.start()
+            try:
+                stream.start()
+            except OSError as error:
+                # 独立审核 B-1：建卡结果不明（网络超时/连接中断），服务端可能
+                # 已经处理——不清预留位、不推进游标、不降级。预留位原样留在
+                # 数据库里，转入既有 uncertain 告警路径，等待人工核对。
+                logger.error(
+                    "建卡结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
+                    task.task_id,
+                    type(error).__name__,
+                )
+                return False
         self._queue.record_delivery_progress(
             task_id=task.task_id,
             consumed_sequence=event.sequence,
@@ -255,7 +321,17 @@ class DeliveryConsumer:
             )
             raise
 
-    def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> None:
+    def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> bool:
+        """处理这一轮的终态事件。返回值是"这一轮结束后尝试 `_maybe_confirm`
+        是否安全"——只有独立审核 B-1 的"结果不明"分支会返回 ``False``：此时
+        ``stream.message_id`` 可能只是更早建卡时就拿到、与这一轮终态结果无关的
+        旧值，`_maybe_confirm` 用它去 `confirm_delivery` 会把一个应该转
+        ``uncertain`` 的任务提前误标成已确认送达（见 `_process_task` 的调用点）。
+        除此之外的所有分支（含预留位没抢到、明确失败）都返回 ``True``，与本次
+        修复之前"`_handle_terminal` 之后总是尝试 `_maybe_confirm`"的既有行为
+        完全一致。
+        """
+
         content = RenderedContent(
             key="delivery.terminal", version=self._catalog.version, text=event.content or ""
         )
@@ -269,13 +345,25 @@ class DeliveryConsumer:
             if not self._queue.reserve_dispatch(task_id=task.task_id, kind="card_finish"):
                 # 抢不到：要么上一轮处理到一半崩溃（uncertain，本轮不碰），要么任务
                 # 状态发生了竞态。两种情况都不该再调用 finish()。
-                return
-            if event.terminal_kind == TerminalKind.SUCCESS.value:
-                stream.finish(result=event.content or "", elapsed_seconds=elapsed)
-            else:
-                stream.finish(failure=content, elapsed_seconds=elapsed)
-            # finish() 内部吞掉了全部同步异常（card_stream.py 的既有设计），走到这里
-            # 就是拿到了明确结果：成功，或已经清晰地降级为需要文本兜底。
+                return True
+            try:
+                if event.terminal_kind == TerminalKind.SUCCESS.value:
+                    stream.finish(result=event.content or "", elapsed_seconds=elapsed)
+                else:
+                    stream.finish(failure=content, elapsed_seconds=elapsed)
+            except OSError as error:
+                # 独立审核 B-1：终态更新结果不明（网络超时/连接中断），平台可能
+                # 已经处理——不能猜是成功还是失败。不清预留位、不降级、不推进
+                # 游标，转入既有 uncertain 告警路径，等待人工核对。
+                logger.error(
+                    "终态卡片更新结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
+                    task.task_id,
+                    type(error).__name__,
+                )
+                return False
+            # finish() 内部吞掉了明确失败（card_stream.py 的既有设计；结果不明的
+            # OSError 会原样抛出，已经在上面 except 里处理），走到这里就是拿到了
+            # 明确结果：成功，或已经清晰地降级为需要文本兜底。
             #
             # **只在降级时提前清空预留位**（独立审核 P1-1，2026-08-14 修复）：降级
             # 意味着卡片终态还没有确定送达，需要立即腾出预留位给下面的
@@ -294,11 +382,13 @@ class DeliveryConsumer:
                 self._queue.clear_dispatch_reservation(task_id=task.task_id)
 
         if stream.fallback_needed:
-            if not self._send_fallback(task, stream, content):
-                # 预留位没抢到，或外发同步捕获到明确失败：这一轮不推进游标，terminal
-                # 事件下一轮重新处理（`_send_fallback` 已经在明确失败时清了预留位，
-                # 崩溃则留给 list_uncertain_delivery_tasks）。
-                return
+            outcome = self._send_fallback(task, stream, content)
+            if outcome is not _FallbackOutcome.SENT:
+                # 预留位没抢到、退避未到期，或外发同步捕获到明确失败：这一轮不
+                # 推进游标，terminal 事件下一轮重新处理（`_send_fallback` 已经在
+                # 明确失败时清了预留位）。只有 `UNCERTAIN`（独立审核 B-1）时
+                # `_maybe_confirm` 才不安全——见本方法文档。
+                return outcome is not _FallbackOutcome.UNCERTAIN
 
         self._queue.record_delivery_progress(
             task_id=task.task_id,
@@ -308,25 +398,38 @@ class DeliveryConsumer:
             card_sequence=stream.sequence,
             fallback_text=stream.fallback_needed,
         )
+        return True
 
-    def _send_fallback(self, task: Any, stream: CardStream, content: RenderedContent) -> bool:
+    def _send_fallback(
+        self, task: Any, stream: CardStream, content: RenderedContent
+    ) -> _FallbackOutcome:
         if not self._fallback_backoff_ready(task.task_id):
             # 独立审核 P2-4：明确失败原来是"清预留位、下一轮原样重试"，默认
             # 1 秒轮询下等于对飞书出站接口每秒重试一次，最长可以持续到 24 小时
             # 到期——真实平台限流会先被打上去。这里不改变"最终会重试"这个语义，
             # 只是不在退避窗口内再去抢预留位、不产生新的外发尝试。
-            return False
+            return _FallbackOutcome.RETRY_LATER
         if not self._queue.reserve_dispatch(task_id=task.task_id, kind="text_send"):
-            return False
+            return _FallbackOutcome.RETRY_LATER
         try:
             stream.send_fallback(content)
+        except OSError as error:
+            # 独立审核 B-1：文本兜底结果不明（网络超时/连接中断），服务端可能
+            # 已经受理并投递——不清预留位、不进入重试退避（那等于"下一轮原样
+            # 重试"，正是本次复现的重复投递）。转入既有 uncertain 告警路径。
+            logger.error(
+                "文本兜底发送结果不明，转入 uncertain 等待人工核对 task_id=%s error=%s",
+                task.task_id,
+                type(error).__name__,
+            )
+            return _FallbackOutcome.UNCERTAIN
         except Exception as error:  # noqa: BLE001 - 明确失败：清预留位，下一轮按退避重试
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
             self._record_fallback_attempt_failed(task.task_id)
             self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
-            return False
+            return _FallbackOutcome.RETRY_LATER
         self._clear_fallback_backoff(task.task_id)
-        return True
+        return _FallbackOutcome.SENT
 
     def _maybe_confirm(self, task: Any, stream: CardStream) -> None:
         """终态已经落到某个通道且任务处于 ``awaiting_delivery`` 时尝试确认送达。

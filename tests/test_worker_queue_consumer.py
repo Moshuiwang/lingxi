@@ -62,8 +62,11 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    def __init__(self, *, fail: str | None = None) -> None:
+    def __init__(
+        self, *, fail: str | None = None, error: type[BaseException] = RuntimeError
+    ) -> None:
         self.fail = fail
+        self._error = error
         self.calls: list[tuple[str, int | None]] = []
         self.bodies: list[str] = []
 
@@ -71,27 +74,28 @@ class RecordingCards:
         self.calls.append(("create", None))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "create":
-            raise RuntimeError("card create")
+            raise self._error("card create")
         return CardCreated(card_id="card-1", message_id="msg-card-1")
 
     def update(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("update", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "update":
-            raise RuntimeError("card update")
+            raise self._error("card update")
 
     def close(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("close", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "close":
-            raise RuntimeError("card close")
+            raise self._error("card close")
 
 
 class RecordingText:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, error: type[BaseException] = RuntimeError) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
         self.fail = fail
+        self._error = error
 
     def send_text(
         self,
@@ -111,7 +115,7 @@ class RecordingText:
         )
         self.texts.append(text)
         if self.fail:
-            raise RuntimeError("text fallback")
+            raise self._error("text fallback")
         return "msg-fallback-1"
 
 
@@ -230,6 +234,85 @@ class CardStreamTests(unittest.TestCase):
         message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
         self.assertIsNone(message_id, "fallback_needed 为假时 send_fallback 不产生任何外部调用")
         self.assertEqual(text.calls, [], "答案已经在卡片里对用户可见，绝不能再发一条重复文本终态")
+
+    def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络异常
+        全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把它
+        抛出去，不能像 ``RuntimeError`` 那样吞掉并置位 ``fallback_needed``（那会让
+        调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
+        """
+
+        cards = RecordingCards(fail="create", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+
+        with self.assertRaises(TimeoutError):
+            stream.start()
+
+        self.assertIsNone(stream.card_id, "没有拿到 card_id，不能假设建卡成功")
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+
+    def test_terminal_update_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1 场景 1：终态更新超时不得被 ``finish()`` 吞掉后降级为文本
+        兜底——必须原样抛出，且不再继续调用 ``close()``。
+        """
+
+        cards = RecordingCards(fail="update", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+
+        with self.assertRaises(TimeoutError):
+            stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls], ["create", "update"], "结果不明时不得继续调用 close"
+        )
+
+    def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
+        """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
+        无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
+        用户可见"这个结论，``TimeoutError`` 与 ``RuntimeError`` 在这一步行为一致。
+        """
+
+        cards = RecordingCards(fail="close", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)  # 不应该抛出
+
+        self.assertFalse(stream.fallback_needed, "关闭失败（无论何种异常）都不整体降级")
+        self.assertEqual([kind for kind, _ in cards.calls], ["create", "update", "close"])
+
+    def test_text_fallback_timeout_is_not_swallowed(self) -> None:
+        """独立审核 B-1 场景 2：文本兜底发送超时必须原样抛出，调用方据此不清预留位、
+        不进入重试退避。
+        """
+
+        cards = RecordingCards(fail="create")  # 明确失败，走文本通道
+        text = RecordingText(fail=True, error=TimeoutError)
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        self.assertTrue(stream.fallback_needed)
+
+        with self.assertRaises(TimeoutError):
+            stream.send_fallback(default_content_catalog().text("worker.failed"))
+
+        self.assertIsNone(stream.message_id, "没有拿到 message_id，不能假设文本已经送达")
+        self.assertEqual(len(text.calls), 1, "发送确实被尝试过一次")
 
     def test_resuming_with_an_existing_card_id_does_not_create_a_second_card(self) -> None:
         """Issue #152：Gateway 消费循环重启后用 ``initial_*`` 恢复，``start()``

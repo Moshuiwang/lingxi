@@ -9,6 +9,16 @@
 按 2026-08-06 决策走官方 ``lark-oapi``；``lark_oapi`` 在函数内延迟导入，与仓库既有惯例
 一致，不碰这两个类的测试无需装 SDK。
 
+**下面四个方法都不捕获网络类异常，是刻意的**（独立审核 B-1，2026-08-14）。
+``lark_oapi`` 的 transport 是 ``requests.request(...)``（``lark_oapi/core/http/
+transport.py``），读超时/连接重置时抛出的是 ``requests.exceptions.RequestException``
+及其子类——它们全部继承自 ``IOError``（即内置 ``OSError``）。这里不做任何异常
+翻译，让它原样从 ``requests`` 一路传到 ``core.execution.card_stream``：那里用
+``except OSError`` 把"结果不明"与下面这四个方法唯一会主动抛出的
+``RuntimeError``（``response.success()`` 为假、服务端已经明确拒绝）区分开，
+见该模块文档。这个模块因此不需要在两类异常之间做任何区分，也不需要 import
+``requests``。
+
 **卡片 JSON 2.0 载荷形状未经真实发送验证（证据等级 L1）。** 字段名与调用形态（
 ``cardkit/v1/cards`` 的 ``create``/``elements.content`` 流式更新/``settings`` 关闭、
 共用整卡级 ``sequence``）已经由 G-CARD Bot-Test 探针实测确认（#162 评论

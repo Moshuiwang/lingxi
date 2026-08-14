@@ -7,6 +7,24 @@
 ``start()`` 一张已经建好的卡片——它把上一次持久化的 ``card_id``/``sequence``/
 ``message_id``/``fallback_needed`` 作为 ``initial_*`` 参数传回来，本类从那一点继续，
 不产生第二张有效卡片（`V-卡片-01`、状态合同第 7 条）。
+
+**「明确失败」与「结果不明」不是同一件事**（独立审核 B-1，2026-08-14 修复，红线：
+重复投递）。``start()``/``finish()`` 的终态更新/``send_fallback()`` 这三处外发调用，
+原来把同步捕获到的**任何** ``Exception`` 都当成"服务端明确拒绝"处理：立即降级/
+清预留位，交给下一轮重试或改道文本兜底。这对真实 adapter（``adapters.feishu_delivery``，
+走官方 ``lark-oapi``，其 transport 是 ``requests.request(...)``）是错的——读超时、
+连接重置一样会抛异常，但服务端可能已经把这次调用处理完了。用 Python 内置
+``OSError`` 作为"结果不明"的判别边界：``requests.exceptions.RequestException``
+及其子类（``Timeout``/``ConnectionError`` 等）全部继承自 ``IOError``（即
+``OSError``），因此不需要在这个不依赖飞书 SDK 的模块里 import ``requests`` 就能
+精确捕获它们；真实 adapter 也不需要做任何异常翻译，网络异常原样从
+``requests.request()`` 一路传到这里。三处外发在捕获到 ``OSError`` 时统一原样
+``raise``，不降级、不清空 ``_fallback_needed``——调用方（``apps.gateway.delivery``）
+据此不清预留位、不重试、不改道，转入既有 ``uncertain`` 告警路径，等待人工核对
+是否已经送达（issue #152 状态合同第 6 条）。终态**关闭**（``finish()`` 的第二次
+外部调用）不受这条规则约束——它的失败语义本身就与异常类型无关（见 ``finish()``
+文档：更新已经成功后仅关闭失败不构成结果丢失），``OSError`` 落进既有
+``except Exception`` 分支效果与其它异常完全一致，无需特殊处理。
 """
 
 from __future__ import annotations
@@ -177,7 +195,11 @@ class CardStream:
             self._last_update = self._monotonic()
             # 创建本身就是该话题的首帧，后续更新也要遵守 500ms 间隔。
             self._rate_limiter.allow(topic=self._topic, now=self._last_update)
-        except Exception:  # noqa: BLE001 - 卡片失败统一走同话题文本回退
+        except OSError:
+            # 结果不明（独立审核 B-1）：建卡是否已经在服务端生效不可知，不能假装
+            # 明确失败——原样抛给调用方，不降级、不清预留位、不重试。
+            raise
+        except Exception:  # noqa: BLE001 - 明确失败：卡片路径统一走同话题文本回退
             self._notify_send("card_non_final", False)
             self._fallback_needed = True
 
@@ -237,7 +259,12 @@ class CardStream:
             self._rate_limiter.record(topic=self._topic, now=self._monotonic())
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
-        except Exception:  # noqa: BLE001 - 终态正文还没确定送达，只能整体降级
+        except OSError:
+            # 结果不明（独立审核 B-1）：终态正文是否已经写进卡片对进程不可知——
+            # 绝不能当"明确失败"整体降级为文本兜底，那正是本次复现的跨通道重复
+            # 投递。原样抛给调用方，不降级、不清预留位、不重试。
+            raise
+        except Exception:  # noqa: BLE001 - 明确失败：终态正文还没确定送达，只能整体降级
             self._notify_send("card_final", False)
             self._fallback_needed = True
             return
@@ -249,6 +276,9 @@ class CardStream:
             self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
         except Exception:  # noqa: BLE001 - 见上面的方法说明：不降级，避免重复投递
+            # 独立审核 B-1 不延伸到这里：关闭失败——无论是明确拒绝还是网络类
+            # 异常——都不改变"更新已经成功、答案对用户可见"这个结论，本身就与
+            # 异常是否属于结果不明无关，因此不单独拆出 ``except OSError``。
             self._notify_send("card_final", False)
 
     def send_fallback(self, content: RenderedContent) -> str | None:
@@ -256,8 +286,10 @@ class CardStream:
 
         调用方负责在这次调用之前完成"外发前预留位"的持久化（Issue #151 审核 P3-6、
         本类文件头注释）——文本发送没有飞书原生幂等键，这里的异常刻意不吞掉，交由
-        调用方区分"同步捕获的明确失败"（可以清预留位、下一轮重试）与"进程崩溃"
-        （预留位留在数据库里，下一轮必须识别为 ``uncertain`` 而不是自动重发）。
+        调用方区分"同步捕获的明确失败"（可以清预留位、下一轮重试）、"结果不明"
+        （``OSError``，独立审核 B-1：转 ``uncertain``，不清预留位、不重试）与
+        "进程崩溃"（预留位留在数据库里，下一轮必须识别为 ``uncertain`` 而不是
+        自动重发）。
         """
 
         if not self._fallback_needed:
@@ -270,6 +302,11 @@ class CardStream:
                 reply_to_message_id=self._reply_to_message_id,
                 text=content.text,
             )
+        except OSError:
+            # 结果不明（独立审核 B-1）：文本是否已经送达对进程不可知，不计入
+            # "发送失败"的告警统计（那会把可能已经成功的一次发送计成失败）；
+            # 原样抛给调用方，不清预留位、不重试。
+            raise
         except Exception:
             self._notify_send("message_final", False)
             raise
