@@ -18,6 +18,15 @@ Gateway 侧的消费进度持久化（``adapters.postgres_conversation`` 新增�
 下一轮 ``list_pending_delivery_tasks`` 会把这个任务排除在正常消费之外，
 ``list_uncertain_delivery_tasks`` 把它路由给告警——消费循环不会替它猜测上一次调用
 是否成功后自动重发（issue 状态合同第 6 条）。恢复需要人工核对后清空预留位。
+
+**已知残留风险：G-CARD 10 分钟流式自动关闭**（独立审核 P2-5，#162 评论
+5290545953/5291111636 实测；[验收矩阵](../../../../docs/技术设计/验收矩阵.md)
+``V-卡片-02``/``V-卡片-03`` 补充段落有同一份登记）。未手动关闭的流式卡片距上次
+开启 10 分钟后由平台自动关闭；本消费循环允许卡片跨任意时长恢复（任务寿命只受
+24 小时到期约束，问数任务运行超过 10 分钟并不罕见）。一旦流式已经被平台自动
+关闭，恢复后的 ``update``/``close`` 会失败——中途 ``update`` 失败按既有语义整体
+降级为文本兜底（不构成重复投递），用户会看到一张停在某个中间状态的旧卡片、
+外加一条文本答案。未消除，留待 Bot-Test/Stage 真实验证平台侧关闭行为后再评估。
 """
 
 from __future__ import annotations
@@ -53,6 +62,13 @@ def _default_alert(kind: str, task_id: str) -> None:
 class DeliveryConsumer:
     """一轮读若干候选任务、逐个驱动到底；异常按任务隔离，一个任务失败不带走整轮。"""
 
+    # 独立审核 P2-4：uncertain 告警与文本兜底重试原来完全没有退避，默认
+    # `poll_interval=1.0s` 下会变成每秒一次的告警/外发洪流。这两个默认值把它们
+    # 收敛到"仍然会被看见，但不再洪泛"——具体数值不是硬性产品承诺，可按需调。
+    DEFAULT_ALERT_MIN_INTERVAL_SECONDS = 300.0
+    DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS = 2.0
+    DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS = 300.0
+
     def __init__(
         self,
         *,
@@ -64,7 +80,11 @@ class DeliveryConsumer:
         on_send_outcome: SendOutcomeCallback | None = None,
         on_alert: AlertCallback | None = None,
         limit: int = 20,
+        uncertain_limit: int = 50,
         monotonic: Callable[[], float] = time.monotonic,
+        alert_min_interval_seconds: float = DEFAULT_ALERT_MIN_INTERVAL_SECONDS,
+        fallback_backoff_base_seconds: float = DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS,
+        fallback_backoff_cap_seconds: float = DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS,
     ) -> None:
         self._queue = queue
         self._cards = cards
@@ -76,15 +96,70 @@ class DeliveryConsumer:
         self._on_send_outcome = on_send_outcome
         self._alert = on_alert or _default_alert
         self._limit = limit
+        self._uncertain_limit = uncertain_limit
         self._monotonic = monotonic
+        self._alert_min_interval_seconds = alert_min_interval_seconds
+        self._fallback_backoff_base_seconds = fallback_backoff_base_seconds
+        self._fallback_backoff_cap_seconds = fallback_backoff_cap_seconds
+        # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
+        # 的降级（重启本身就已经是一次重新评估的机会）。
+        self._last_alerted_at: dict[tuple[str, str], float] = {}
+        self._fallback_attempts: dict[str, int] = {}
+        self._fallback_next_attempt_at: dict[str, float] = {}
+
+    def _alert_deduped(self, kind: str, task_id: str) -> None:
+        """同一个 (kind, task_id) 在 `alert_min_interval_seconds` 内只告警一次。
+
+        独立审核 P2-4：默认 1 秒轮询下不去重会变成约 8.6 万条/天/任务的告警噪音，
+        真实告警路由接上后就是刷屏。这里只做"降频"，不做"消音"——问题仍然会被
+        看见，只是不再淹没其它信号；数据库里的预留位本身没有变化，人工核对的
+        判断依据不受影响。
+        """
+
+        key = (kind, task_id)
+        now = self._monotonic()
+        last = self._last_alerted_at.get(key)
+        if last is not None and now - last < self._alert_min_interval_seconds:
+            return
+        self._last_alerted_at[key] = now
+        self._alert(kind, task_id)
+
+    def _fallback_backoff_ready(self, task_id: str) -> bool:
+        deadline = self._fallback_next_attempt_at.get(task_id)
+        return deadline is None or self._monotonic() >= deadline
+
+    def _record_fallback_attempt_failed(self, task_id: str) -> None:
+        attempts = self._fallback_attempts.get(task_id, 0) + 1
+        self._fallback_attempts[task_id] = attempts
+        backoff = min(
+            self._fallback_backoff_base_seconds * (2 ** (attempts - 1)),
+            self._fallback_backoff_cap_seconds,
+        )
+        self._fallback_next_attempt_at[task_id] = self._monotonic() + backoff
+
+    def _clear_fallback_backoff(self, task_id: str) -> None:
+        self._fallback_attempts.pop(task_id, None)
+        self._fallback_next_attempt_at.pop(task_id, None)
 
     def run_once(self) -> int:
         """跑一轮：先报告仍然卡在"外发前预留位"里的任务，再处理正常候选。
         返回本轮实际处理的候选任务数（不含仅被告警的 uncertain 任务）。
         """
 
-        for uncertain in self._queue.list_uncertain_delivery_tasks():
-            self._alert("dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id)
+        uncertain_tasks = self._queue.list_uncertain_delivery_tasks(limit=self._uncertain_limit)
+        for uncertain in uncertain_tasks:
+            self._alert_deduped(
+                "dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id
+            )
+        if len(uncertain_tasks) >= self._uncertain_limit:
+            # 独立审核 P2-4：`list_uncertain_delivery_tasks` 的 `LIMIT` 会让超过
+            # 这个数量的 uncertain 任务静默无告警。这里没有条件做到精确判断"是否
+            # 真的还有更多"（那需要多查一次或改成不设上限），只能在命中上限这个
+            # 强信号出现时留一条能被搜到的日志，提醒有更多任务可能没被看到。
+            logger.error(
+                "投递消费：uncertain 任务数达到查询上限，可能还有未被告警的任务 count=%d",
+                len(uncertain_tasks),
+            )
 
         tasks = self._queue.list_pending_delivery_tasks(limit=self._limit)
         for task in tasks:
@@ -159,12 +234,26 @@ class DeliveryConsumer:
         # 写入方（#151 已登记留白），流式正文本体的卡片渲染留待该写入方接上之后
         # 再做——这里先保证"消费到了、游标推进了"是安全、不会重复的（见模块说明）。
         stream.update(elapsed_seconds=event.elapsed_seconds or 0)
-        self._queue.record_delivery_progress(
-            task_id=task.task_id,
-            consumed_sequence=event.sequence,
-            card_sequence=stream.sequence,
-            fallback_text=stream.fallback_needed,
-        )
+        try:
+            self._queue.record_delivery_progress(
+                task_id=task.task_id,
+                consumed_sequence=event.sequence,
+                card_sequence=stream.sequence,
+                fallback_text=stream.fallback_needed,
+            )
+        except Exception as error:  # noqa: BLE001 - 记一条告警后照常向上抛，交给 run_once 隔离
+            # 独立审核 P2-3（已知残留风险，未完全消除）：`stream.update()` 的外部
+            # 调用已经真实发出、序号已经在内存里前进，但这次持久化失败意味着
+            # `card_seq` 没有落库。下一轮如果把这个 progress 事件当正常候选重放，
+            # 会用落后的序号再调用一次 `update()`，被 CardKit 拒绝、永久降级为
+            # 文本通道——不产生重复投递（进度帧本身不是"结果"），但会让用户看到
+            # 一张卡在"正在处理"的卡片。这里没有像终态/建卡那样引入预留位来完全
+            # 消除这个窗口（会给每个 progress 帧都加两次额外的数据库往返，成本/
+            # 收益需要单独评估），只先保证它不再是"零告警的静默永久降级"。
+            self._alert_deduped(
+                "progress_persist_failed:" + type(error).__name__, task.task_id
+            )
+            raise
 
     def _handle_terminal(self, task: Any, stream: CardStream, event: Any) -> None:
         content = RenderedContent(
@@ -186,8 +275,23 @@ class DeliveryConsumer:
             else:
                 stream.finish(failure=content, elapsed_seconds=elapsed)
             # finish() 内部吞掉了全部同步异常（card_stream.py 的既有设计），走到这里
-            # 就是拿到了明确结果（成功，或已经清晰地降级为需要文本兜底），可以安全清空。
-            self._queue.clear_dispatch_reservation(task_id=task.task_id)
+            # 就是拿到了明确结果：成功，或已经清晰地降级为需要文本兜底。
+            #
+            # **只在降级时提前清空预留位**（独立审核 P1-1，2026-08-14 修复）：降级
+            # 意味着卡片终态还没有确定送达，需要立即腾出预留位给下面的
+            # `_send_fallback` 去拿 `text_send`；此时清空不产生重复投递风险，因为
+            # 卡片本来就没有成功。**成功路径刻意不在这里清空**——继续持有
+            # `card_finish` 预留位，直到方法末尾的 `record_delivery_progress` 把
+            # "进度已经推进"与"预留位被清空"放进同一次写入。如果不这样做：终态
+            # 更新+关闭全部成功之后、`record_delivery_progress` 落库之前发生一次
+            # 普通瞬时错误（无需进程崩溃），预留位会先被清空、游标却还停在旧值；
+            # 下一轮会把这个任务当正常候选、用落后的 `card_seq` 重放已经用掉的
+            # 序号，被 CardKit 拒绝、误判成"卡片链路整体失败"，对一个其实已经成功
+            # 送达的答案又发一条重复的文本终态——这正是本次审核复现的红线场景。
+            # 预留位继续持有则让同样的崩溃/瞬时错误落到 `list_uncertain_delivery_tasks`
+            # 的告警路径，不会被下一轮自动重放。
+            if stream.fallback_needed:
+                self._queue.clear_dispatch_reservation(task_id=task.task_id)
 
         if stream.fallback_needed:
             if not self._send_fallback(task, stream, content):
@@ -206,14 +310,22 @@ class DeliveryConsumer:
         )
 
     def _send_fallback(self, task: Any, stream: CardStream, content: RenderedContent) -> bool:
+        if not self._fallback_backoff_ready(task.task_id):
+            # 独立审核 P2-4：明确失败原来是"清预留位、下一轮原样重试"，默认
+            # 1 秒轮询下等于对飞书出站接口每秒重试一次，最长可以持续到 24 小时
+            # 到期——真实平台限流会先被打上去。这里不改变"最终会重试"这个语义，
+            # 只是不在退避窗口内再去抢预留位、不产生新的外发尝试。
+            return False
         if not self._queue.reserve_dispatch(task_id=task.task_id, kind="text_send"):
             return False
         try:
             stream.send_fallback(content)
-        except Exception as error:  # noqa: BLE001 - 明确失败：清预留位，下一轮重试
+        except Exception as error:  # noqa: BLE001 - 明确失败：清预留位，下一轮按退避重试
             self._queue.clear_dispatch_reservation(task_id=task.task_id)
-            self._alert("fallback_send_failed:" + type(error).__name__, task.task_id)
+            self._record_fallback_attempt_failed(task.task_id)
+            self._alert_deduped("fallback_send_failed:" + type(error).__name__, task.task_id)
             return False
+        self._clear_fallback_backoff(task.task_id)
         return True
 
     def _maybe_confirm(self, task: Any, stream: CardStream) -> None:

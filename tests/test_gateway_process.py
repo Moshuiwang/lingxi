@@ -220,6 +220,51 @@ class GracefulShutdownTests(GatewayProcessTestCase):
         )
 
 
+class SignalHandlerOnStopCallbackTests(GatewayProcessTestCase):
+    """独立审核 P3-5：``install_signal_handlers`` 新增的 ``on_stop`` 回调必须在
+    信号处理器里真的被调用——这是 ``apps.gateway.main()`` 精确计量"停机预算从
+    信号到达那一刻起用掉了多少"的唯一依据，回调没被调用会让那段计时退化回
+    "从进程启动那一刻算起"（正是本次修复要消除的问题）。
+
+    用真实子进程发真实信号，不在测试进程里注册信号处理器——那样做会污染
+    unittest 运行器自身的信号状态。
+    """
+
+    def test_on_stop_fires_when_the_signal_arrives(self) -> None:
+        script = (
+            "import sys, os, signal, threading, time\n"
+            f"sys.path.insert(0, {str(SOURCE_ROOT)!r})\n"
+            "from lingxi.apps.gateway import install_signal_handlers\n"
+            "stop_event = threading.Event()\n"
+            "marks = []\n"
+            "install_signal_handlers(stop_event, on_stop=lambda: marks.append(time.monotonic()))\n"
+            "print('READY', flush=True)\n"
+            "while not stop_event.is_set():\n"
+            "    time.sleep(0.01)\n"
+            "print('STOPPED', len(marks), flush=True)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.addCleanup(self._reap, process)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if process.stdout.readline().startswith("READY"):
+                break
+        else:
+            self.fail("子进程没有在超时内就绪")
+
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("收到 SIGTERM 后没有在超时内退出")
+
+        tail = process.stdout.read()
+        self.assertIn("STOPPED 1", tail, f"on_stop 必须恰好被调用一次：{tail!r}")
+
+
 class NoInboundPortTests(GatewayProcessTestCase):
     """`V-接入-10`：gateway 进程不监听任何入站端口。"""
 

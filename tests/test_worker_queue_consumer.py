@@ -144,6 +144,36 @@ class CardStreamTests(unittest.TestCase):
         self.assertIn("已完成 · 1 秒", cards.bodies[-2])
         self.assertEqual(text.texts, [])
 
+    def test_finish_counts_toward_the_shared_global_rate_budget(self) -> None:
+        """独立审核 P2-2：``finish()`` 刻意不经过单话题 500ms 节流（终态帧是结果
+        本身，被吞掉比不节流更糟），但全进程 50 次/秒的预算必须同样计入终态更新
+        +关闭这两次调用，否则并发多话题同时终态时全局计数会失真。
+        """
+
+        limiter = CardRateLimiter()
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: 0.0,
+            rate_limiter=limiter,
+        )
+        stream.start()  # 消费全局预算第 1 个名额
+        for index in range(48):
+            self.assertTrue(limiter.allow(topic=f"filler-{index}", now=0.0))
+        # 至此全局预算已经用掉 49/50，只剩 1 个名额。
+
+        stream.finish(result="结果", elapsed_seconds=1)  # 终态更新 + 关闭，各占一个名额
+
+        self.assertFalse(
+            limiter.allow(topic="topic-brand-new", now=0.0),
+            "finish() 的两次调用必须计入全局 50 次/秒预算，否则这里会被误放行",
+        )
+
     def test_card_failure_falls_back_to_same_topic_text(self) -> None:
         cards = RecordingCards(fail="update")
         text = RecordingText()
@@ -170,6 +200,36 @@ class CardStreamTests(unittest.TestCase):
             "topic-a",
             "V-卡片-03：文本回退必须保留原 thread_id",
         )
+
+    def test_close_failure_alone_does_not_fall_back_to_a_duplicate_text(self) -> None:
+        """独立审核 P1-2：终态**更新**已经成功（用户已经能在卡片里看到完整答案），
+        只有随后的**关闭**失败——不得整体降级为文本兜底，否则用户会在同一话题里
+        看到同一条答案两遍。G-CARD 实测：未手动关闭的流式卡片距上次开启 10 分钟
+        后由平台自动关闭，关闭失败本身不构成结果丢失。
+        """
+
+        cards = RecordingCards(fail="close")
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "只有关闭失败，不能整体降级为文本通道")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls],
+            ["create", "update", "close"],
+            "终态更新必须真实发出；关闭也确实被尝试过（只是失败了）",
+        )
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertIsNone(message_id, "fallback_needed 为假时 send_fallback 不产生任何外部调用")
+        self.assertEqual(text.calls, [], "答案已经在卡片里对用户可见，绝不能再发一条重复文本终态")
 
     def test_resuming_with_an_existing_card_id_does_not_create_a_second_card(self) -> None:
         """Issue #152：Gateway 消费循环重启后用 ``initial_*`` 恢复，``start()``

@@ -1342,13 +1342,24 @@ class PostgresTaskQueue:
             ]
 
     def list_uncertain_delivery_tasks(self, *, limit: int = 50) -> list[UncertainDeliveryTask]:
-        """列出外发前预留位卡住的任务，供告警。见 ``reserve_dispatch`` 的说明。"""
+        """列出外发前预留位卡住的任务，供告警。见 ``reserve_dispatch`` 的说明。
+
+        ``status IN ('running', 'awaiting_delivery')``（独立审核 P2-4）：
+        ``expire_undelivered_terminals`` 的二十四小时强制收敛不读、也不清
+        ``dispatch_reserved_kind``——它只管把业务结论收敛为 ``failed``，预留位
+        字段本身是 Gateway 消费循环私有的运行时簿记。没有这条过滤，一个卡在
+        预留位里、后来被到期路径收敛为 ``failed`` 的任务会在 ``dispatch_reserved_kind``
+        永远不被清空的情况下被这里永远查出来，按默认 1 秒轮询造成不会停止的
+        告警——即使任务本身早已经不再需要任何人处理。任务到期收敛之后这个字段
+        本身也不再有意义（不会再被任何投递路径读取或写入）。
+        """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT id, dispatch_reserved_kind FROM task
                  WHERE dispatch_reserved_kind IS NOT NULL
+                   AND status IN ('running', 'awaiting_delivery')
                  ORDER BY created_at
                  LIMIT %s
                 """,

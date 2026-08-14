@@ -75,6 +75,21 @@ class CardRateLimiter:
         self._global_updates.append(now)
         return True
 
+    def record(self, *, topic: str, now: float) -> None:
+        """无条件记一次已经发生的调用，不做节流判断、不可能返回拒绝。
+
+        终态更新+关闭（``CardStream.finish()``）不经过 ``allow()`` 的单话题 500ms
+        节流——那两帧是结果本身，被节流吞掉等于结果丢失，比不节流更糟（独立审核
+        P2-2）。但全进程 50 次/秒的预算是 CardKit 的硬限制，终态这两次调用同样要
+        计入，否则并发多话题同时终态时全局计数会失真、放过原本该被节流的其它
+        话题。只推进全局窗口，不改动单话题的 500ms 记录——终态调用不受单话题
+        节流约束，也不应该反过来去占用/影响它。
+        """
+
+        while self._global_updates and now - self._global_updates[0] >= 1.0:
+            self._global_updates.popleft()
+        self._global_updates.append(now)
+
 
 @dataclass(frozen=True)
 class CardStreamResult:
@@ -190,31 +205,51 @@ class CardStream:
         failure: RenderedContent | None = None,
         elapsed_seconds: int = 0,
     ) -> None:
+        """终态更新 + 关闭。**这两步的失败语义并不对称**（独立审核 P1-2）：
+
+        - 终态 **更新** 失败：完整答案还没有确定写进卡片，用户看不到结果——必须
+          整体降级为文本兜底，否则结果丢失。
+        - 终态更新已经成功之后，仅 **关闭** 失败：答案已经在卡片里对用户可见，
+          结果没有丢——按 G-CARD 实测（未手动关闭的流式卡片距上次开启 10 分钟后
+          由平台自动关闭），关闭失败本身不构成"结果丢失"，只是收尾没做完。此时
+          绝不能再触发文本兜底：那样只会让同一条答案在同一话题里出现两遍，是
+          比"卡片没关"更差的用户体验，也直接违反"不得同时形成卡片终态与重复
+          文本终态"（`V-卡片-03`）。因此关闭失败**不**置位 ``_fallback_needed``。
+        """
+
         if self._card_id is None or self._fallback_needed:
             return
+        if failure is None:
+            body = result or self._catalog.card("query.empty").body
+            completed = self._catalog.text(
+                "worker.status",
+                action=self._catalog.text("worker.action.completed").text,
+                elapsed_seconds=max(0, elapsed_seconds),
+            ).text
+            body = f"{completed}\n{body}"
+            card = self._catalog.card("query.result", result=body)
+        else:
+            card = self._catalog.card("query.failure", message=failure.text)
+
+        self._sequence += 1
         try:
-            if failure is None:
-                body = result or self._catalog.card("query.empty").body
-                completed = self._catalog.text(
-                    "worker.status",
-                    action=self._catalog.text("worker.action.completed").text,
-                    elapsed_seconds=max(0, elapsed_seconds),
-                ).text
-                body = f"{completed}\n{body}"
-                card = self._catalog.card("query.result", result=body)
-            else:
-                card = self._catalog.card("query.failure", message=failure.text)
-            self._sequence += 1
             self._before_external()
+            self._rate_limiter.record(topic=self._topic, now=self._monotonic())
             self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
             self._notify_send("card_final", True)
-            self._sequence += 1
-            self._before_external()
-            self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
-            self._notify_send("card_final", True)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - 终态正文还没确定送达，只能整体降级
             self._notify_send("card_final", False)
             self._fallback_needed = True
+            return
+
+        self._sequence += 1
+        try:
+            self._before_external()
+            self._rate_limiter.record(topic=self._topic, now=self._monotonic())
+            self._transport.close(card_id=self._card_id, sequence=self._sequence, card=card)
+            self._notify_send("card_final", True)
+        except Exception:  # noqa: BLE001 - 见上面的方法说明：不降级，避免重复投递
+            self._notify_send("card_final", False)
 
     def send_fallback(self, content: RenderedContent) -> str | None:
         """发一次同话题文本兜底；不需要时（未降级）返回 ``None`` 且不产生外部调用。

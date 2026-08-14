@@ -20,6 +20,16 @@ Runtime Assembled）。``CardStream`` 把标题与正文合并成一段 markdown
 ``RenderedCard`` 同时含标题与正文，合并成一段是让"一次 ``CardStream.update()``
 调用对应一次外部调用"这条既有约束继续成立的最小改法，不引入第二个元素、第二个
 序号消耗点。
+
+**已知限制（独立审核 P3-4，未消除）：`reply_to_message_id` 可为空。** 迁移
+``0058`` 起 ``task.reply_to_message_id`` 可空（``ALTER TABLE task ADD COLUMN
+reply_to_message_id TEXT``），但下面两个类的卡片与文本通道都只走
+``ReplyMessageRequest.message_id(reply_to_message_id)``——完全不使用调用方已经
+传入的 ``chat_id``/``thread_id`` 做兜底。为空时两条通道都会被飞书拒绝，叠加
+``apps.gateway.delivery.DeliveryConsumer`` 的重试退避会变成持续失败循环（不会
+造成重复投递，只是持续无法送达）。当前 ``core.conversation.pipeline`` 总会填
+``message.message_id``（生产路径下这个空值目前不会发生），因此判定为可接受的
+已知限制而非本次必须修复的红线，留给下一次改动这个模块的人一并处理。
 """
 
 from __future__ import annotations

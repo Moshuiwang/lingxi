@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from typing import Any
 
 from postgres_schema import ensure_production_schema, reset_production_rows
 
@@ -108,6 +109,30 @@ class _SimulatedCrash(BaseException):
     进程崩溃不会被自己的 ``except Exception`` 捕获），而不是"同步捕获到的明确失败"。
     测试断言的正是消费循环在这条边界上不把两者混为一谈。
     """
+
+
+class _RecordDeliveryProgressFailsOnce:
+    """代理真实 ``PostgresTaskQueue``；下一次 ``record_delivery_progress`` 调用
+    抛出一个普通 ``RuntimeError``（模拟数据库连接瞬时重置），此后恢复正常。
+
+    独立审核 P1-1 复现用的正是这种"不需要进程崩溃"的普通瞬时错误——真实进程
+    崩溃（``_SimulatedCrash``）已经由既有用例覆盖，这里补的是"终态外部调用
+    已经全部成功、只是随后的进度落库这一步失败"这半个此前完全没有测试覆盖的
+    窗口。
+    """
+
+    def __init__(self, queue: Any) -> None:
+        self._queue = queue
+        self._should_fail = True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._queue, name)
+
+    def record_delivery_progress(self, **kwargs: object) -> None:
+        if self._should_fail:
+            self._should_fail = False
+            raise RuntimeError("simulated transient database error")
+        self._queue.record_delivery_progress(**kwargs)
 
 
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
@@ -271,15 +296,22 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertEqual(row[2], "msg-text-1")
 
     def test_text_fallback_failure_keeps_task_pending_for_retry(self) -> None:
-        """文本兜底同步捕获到明确失败：清预留位、不确认送达，下一轮可以重试。"""
+        """文本兜底同步捕获到明确失败：清预留位、不确认送达，下一轮可以重试。
+
+        独立审核 P2-4 修复后，明确失败带有退避——这里用受控时钟把时间拨过退避
+        窗口，验证的仍然是"下一轮重试"这件事本身，不测退避的具体时长。
+        """
 
         self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
         self.start_task("tsk-1")
         self.finish_task("tsk-1")
 
+        clock = [0.0]
         cards = RecordingCards(fail_at=1)  # create 本身就失败，直接走文本通道
         texts = RecordingText(fail=True)
-        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+        )
         consumer.run_once()
 
         row = self.query(
@@ -289,12 +321,17 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertIsNone(row[1], "明确失败必须清空预留位，允许下一轮重试")
         self.assertIsNone(row[2])
 
-        # 下一轮：文本发送恢复正常，应当成功重试并确认送达。
+        # 退避窗口内立即重试一次：不应该产生新的外发尝试（P2-4：无退避会打平台限流）。
+        consumer.run_once()
+        self.assertEqual(len(texts.calls), 1, "退避窗口内不应该再次尝试外发")
+
+        # 时钟拨过退避窗口 + 文本发送恢复正常：下一轮应当成功重试并确认送达。
+        clock[0] += DeliveryConsumer.DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS
         texts.fail = False
         consumer.run_once()
         row = self.query("SELECT status FROM task WHERE id='tsk-1'")[0]
         self.assertEqual(row[0], "succeeded")
-        self.assertEqual(len(texts.calls), 2, "第一次失败 + 第二次重试各一次")
+        self.assertEqual(len(texts.calls), 2, "第一次失败 + 退避过后的第二次重试各一次")
 
 
 class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
@@ -372,6 +409,71 @@ class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
         uncertain = self.queue.list_uncertain_delivery_tasks()
         self.assertEqual([task.reserved_kind for task in uncertain], ["card_finish"])
 
+    def test_a_transient_progress_persist_failure_after_terminal_finish_succeeds_does_not_duplicate_delivery(
+        self,
+    ) -> None:
+        """独立审核 P1-1（红线）：终态卡片更新+关闭全部**成功**之后（用户已经在卡片
+        里看到完整答案），紧接着的进度落库遇到一次普通瞬时错误（不需要进程崩溃、
+        不需要 ``BaseException``）——绝不能让下一轮把这个任务当正常候选、用落后的
+        ``card_seq`` 重放已经用掉的序号，被 CardKit 拒绝后误判成"卡片链路整体
+        失败"、又发一条重复的文本终态。正确行为：预留位继续持有，任务落入
+        ``uncertain``，不自动重发。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()  # 建卡（started 事件），正常成功。
+
+        self.finish_task("tsk-1", content="已产生的答案")
+        failing_queue = _RecordDeliveryProgressFailsOnce(self.queue)
+        failing_consumer = DeliveryConsumer(queue=failing_queue, cards=cards, texts=texts)
+        # 复现评论原文的关键点："这条路径不需要进程崩溃"——`run_once()` 按任务隔离
+        # 异常（`except Exception`），这次瞬时错误在生产里就是被这样吞掉、正常
+        # 跑完一整轮，而不是让进程崩溃退出。
+        processed_first_round = failing_consumer.run_once()
+        self.assertEqual(processed_first_round, 1)
+
+        # 终态更新与关闭这两次外部调用已经真实发出并成功——这正是本次审核复现的
+        # 场景：外部调用已经成功，只是随后的进度落库失败。
+        self.assertEqual(len(cards.update_calls), 1, "终态更新已经真实发出")
+        self.assertEqual(len(cards.close_calls), 1, "关闭也已经真实发出")
+        self.assertEqual(texts.calls, [], "此时还不应该有任何文本兜底")
+
+        row = self.query(
+            "SELECT dispatch_reserved_kind, card_seq, fallback_text, status "
+            "FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(
+            row[0], "card_finish", "预留位必须继续持有，直到进度真正落库——这是本次修复的核心"
+        )
+        self.assertEqual(row[1], 0, "外部调用已经成功但进度落库失败，card_seq 不应该被写进去")
+        self.assertFalse(row[2])
+        self.assertEqual(row[3], "awaiting_delivery")
+
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual(
+            [task.reserved_kind for task in uncertain],
+            ["card_finish"],
+            "必须被路由为 uncertain，而不是可以被下一轮自动重放的正常候选",
+        )
+
+        # "重启"后的下一轮：uncertain 任务必须被排除在正常消费之外——既不能重放
+        # 已经成功的终态更新/关闭，更不能因为重放被拒绝就改发一条文本终态。
+        recovered = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        processed = recovered.run_once()
+        self.assertEqual(processed, 0, "uncertain 任务不进入正常候选列表")
+        self.assertEqual(len(cards.update_calls), 1, "不得重放已经成功的终态更新")
+        self.assertEqual(len(cards.close_calls), 1, "不得重放已经成功的关闭")
+        self.assertEqual(
+            texts.calls,
+            [],
+            "卡片已经真实送达完整答案，绝不能因为一次瞬时错误又发一条重复的文本终态",
+        )
+
     def test_clearing_the_reservation_by_hand_makes_the_task_processable_again(self) -> None:
         """人工核对后清空预留位是唯一的恢复路径；清空之后消费恢复正常。"""
 
@@ -389,6 +491,52 @@ class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
         self.queue.clear_dispatch_reservation(task_id="tsk-1")
         consumer.run_once()
         self.assertEqual(len(cards.create_calls), 1, "人工清空预留位后恢复正常消费")
+
+
+class UncertainTasksStopAlertingAfterExpiryTests(DeliveryConsumerTestCase):
+    """独立审核 P2-4：`list_uncertain_delivery_tasks` 不能对一个已经被二十四小时
+    到期路径收敛为 ``failed`` 的任务永远告警——那个任务已经不再需要任何人处理，
+    `dispatch_reserved_kind` 字段之后也不会再被任何投递路径读取。
+    """
+
+    def test_expired_task_stops_being_reported_as_uncertain(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        # 直接插入一条已经过期的 terminal 行，跳过真实二十四小时等待（与
+        # `DeliveryExpiredNoticeTests` 同一手法）。
+        self.execute(
+            """
+            INSERT INTO task_delivery_event
+                (id, task_id, sequence, event_type, terminal_kind, content,
+                 worker_id, idempotency_key, created_at)
+            VALUES ('tde-tsk-1-2','tsk-1',2,'terminal','success','已产生的答案',
+                    'worker-1','tsk-1:terminal', now() - interval '25 hours')
+            """
+        )
+        self.execute("UPDATE task SET status = 'awaiting_delivery' WHERE id = 'tsk-1'")
+        # 模拟"崩溃在预留位提交与清空之间"：预留位卡住，任务落入 uncertain。
+        self.assertTrue(self.queue.reserve_dispatch(task_id="tsk-1", kind="card_finish"))
+
+        uncertain_before = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual([task.task_id for task in uncertain_before], ["tsk-1"])
+
+        expired = self.queue.expire_undelivered_terminals()
+        self.assertEqual([task.task_id for task in expired], ["tsk-1"])
+
+        uncertain_after = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual(
+            uncertain_after, [], "任务已经被到期路径收敛为 failed，不应该继续被当作 uncertain 告警"
+        )
+
+        row = self.query(
+            "SELECT status, dispatch_reserved_kind FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "failed", "到期路径的业务结论不受预留位状态影响")
+        self.assertEqual(
+            row[1],
+            "card_finish",
+            "预留位字段本身不需要被到期路径清空——任务收敛之后它不会再被任何查询读取",
+        )
 
 
 class RateLimitingTests(DeliveryConsumerTestCase):
