@@ -516,6 +516,14 @@ class SessionCleanupTask:
     reason: str
 
 
+# ``sweep_idle_conversations`` 每次扫描新增排队的会话数上限（PR #173 独立复核
+# P2-5）：查询本身已经用 NOT EXISTS 把候选集收窄到"尚未排过队"的那些，这里只是
+# 给单次扫描一个防护上限，避免一次异常的大批量话题同时到点时单条查询/单次事务
+# 处理过多行。500 是与 Worker 侧消费能力（`claim_session_cleanups` 默认单批 20、
+# 每约 2 秒的收口轮询一次）比较后留出的宽裕量，不是精确调校值。
+_IDLE_SESSION_CLEANUP_SWEEP_LIMIT = 500
+
+
 class PostgresTaskQueue:
     """worker 与 scheduler 侧的队列操作。
 
@@ -526,6 +534,45 @@ class PostgresTaskQueue:
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
+
+    @staticmethod
+    def _queue_overwritten_session(
+        cursor: Any,
+        *,
+        user_id: str,
+        previous_session_id: str | None,
+        new_session_id: str | None,
+    ) -> None:
+        """``agent_session_id`` 被新值覆盖时，把旧值排队做物理清理（PR #173
+        独立复核 P2-4）。
+
+        ``finish()``/``confirm_delivery()`` 都用
+        ``agent_session_id = COALESCE(%s, agent_session_id)`` 写回：新值非空且
+        与旧值不同时，旧的 ``agent_session_id`` 从此不会再被任何触发点排队——
+        既有三处触发点（``/new``、空闲到点扫描、停用/权限变化）都不覆盖这条
+        路径。两个可达场景：话题闲置未满两小时就被新一轮任务覆盖（scheduler
+        的扫描还没轮到）；或真实 Claude Code CLI 的 ``--resume`` 返回了一个
+        新的 session id，每次续用都会留下一个永远不会被清理的旧 JSONL。
+
+        与调用方共用同一个 cursor/事务：旧值排队和 ``conversation`` 的写回
+        要么一起提交、要么一起回滚，不产生"任务已经收口但清理请求丢了"的
+        中间态。
+        """
+
+        if (
+            new_session_id is None
+            or not previous_session_id
+            or previous_session_id == new_session_id
+        ):
+            return
+        cursor.execute(
+            """
+            INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+            VALUES (%s, %s, %s, 'session_overwritten')
+            ON CONFLICT (agent_session_id) DO NOTHING
+            """,
+            (new_id("asc"), user_id, previous_session_id),
+        )
 
     def claim(
         self, *, worker_id: str, target_worker_version: str, limit: int = 1
@@ -631,15 +678,32 @@ class PostgresTaskQueue:
                     return False
                 cursor.execute(
                     """
-                    UPDATE conversation
+                    WITH target AS (
+                        SELECT id, user_id, agent_session_id AS previous_session_id
+                          FROM conversation
+                         WHERE id = %s AND running_task_id = %s
+                         FOR UPDATE
+                    )
+                    UPDATE conversation AS c
                        SET running_task_id = NULL,
                            last_task_ended_at = now(),
-                           agent_session_id = COALESCE(%s, agent_session_id)
-                     WHERE id = %s AND running_task_id = %s
+                           agent_session_id = COALESCE(%s, target.previous_session_id)
+                      FROM target
+                     WHERE c.id = target.id
+                    RETURNING target.user_id, target.previous_session_id
                     """,
-                    (agent_session_id, conversation_id, task_id),
+                    (conversation_id, task_id, agent_session_id),
                 )
-                return cursor.rowcount == 1
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                self._queue_overwritten_session(
+                    cursor,
+                    user_id=row[0],
+                    previous_session_id=row[1],
+                    new_session_id=agent_session_id,
+                )
+                return True
 
     def heartbeat(self, *, task_id: str, worker_id: str) -> bool:
         """只有当前 worker 这一代能续心跳；僵尸 worker 的续期会返回 False。"""
@@ -1169,15 +1233,24 @@ class PostgresTaskQueue:
                 # 或者产生的会话按上面的取舍不该被继续使用。
                 cursor.execute(
                     """
-                    UPDATE conversation
+                    WITH target AS (
+                        SELECT id, user_id, agent_session_id AS previous_session_id
+                          FROM conversation
+                         WHERE id = %s AND running_task_id = %s
+                         FOR UPDATE
+                    )
+                    UPDATE conversation AS c
                        SET running_task_id = NULL,
                            last_task_ended_at = now(),
-                           agent_session_id = COALESCE(%s, agent_session_id)
-                     WHERE id = %s AND running_task_id = %s
+                           agent_session_id = COALESCE(%s, target.previous_session_id)
+                      FROM target
+                     WHERE c.id = target.id
+                    RETURNING target.user_id, target.previous_session_id
                     """,
-                    (agent_session_id, conversation_id, task_id),
+                    (conversation_id, task_id, agent_session_id),
                 )
-                if cursor.rowcount != 1:
+                conversation_row = cursor.fetchone()
+                if conversation_row is None:
                     # 上面两条写入（事件确认、task 收敛）已经在这个事务里执行，
                     # 但还没提交：整个 with 块以异常退出，psycopg 回滚整个事务，
                     # 三条写入因此要么全部不生效。宁可响亮失败也不要悄悄丢弃
@@ -1187,6 +1260,12 @@ class PostgresTaskQueue:
                         f"任务 {task_id} 确认送达时 conversation {conversation_id} "
                         "的话题占用状态发生了竞态"
                     )
+                self._queue_overwritten_session(
+                    cursor,
+                    user_id=conversation_row[0],
+                    previous_session_id=conversation_row[1],
+                    new_session_id=agent_session_id,
+                )
                 return True
 
     def expire_undelivered_terminals(self) -> list[TerminalTask]:
@@ -1384,8 +1463,20 @@ class PostgresTaskQueue:
                        AND c.agent_session_id IS NOT NULL
                        AND c.last_task_ended_at IS NOT NULL
                        AND c.last_task_ended_at <= now() - %s::interval
+                       -- PR #173 独立复核 P2-5：这条查询刻意不清空
+                       -- agent_session_id（取舍本身是对的，见上方文档），于是每个
+                       -- 曾经用过会话、之后闲置的话题会永久留在候选集里；不加这条
+                       -- NOT EXISTS，每 60 秒的扫描会把候选集整个重新捞出来，对
+                       -- 早就已经排过队的会话再跑一次纯浪费的
+                       -- INSERT ... ON CONFLICT DO NOTHING。迁移 0061 头部注释
+                       -- 写的就是这个去重谓词，之前代码里没有落地。
+                       AND NOT EXISTS (
+                           SELECT 1 FROM agent_session_cleanup AS a
+                            WHERE a.agent_session_id = c.agent_session_id
+                       )
+                     LIMIT %s
                     """,
-                    (idle_after,),
+                    (idle_after, _IDLE_SESSION_CLEANUP_SWEEP_LIMIT),
                 )
                 for user_id, agent_session_id in cursor.fetchall():
                     transaction._queue_session_cleanup(

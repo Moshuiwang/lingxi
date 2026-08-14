@@ -360,6 +360,37 @@ def check_database_timeouts() -> list[str]:
     return failures
 
 
+def check_worker_queue_env_example() -> list[str]:
+    """`deploy/.env.example` 的 worker-queue 小节必须自带 `LINGXI_POSTGRES_DSN`。
+
+    PR #173 复核 P1-2：早期版本让 worker-queue 借用一次性 `worker` job 的
+    env 文件，那份文件的示范文本明确写着"这里不放数据库连接串"，worker-queue
+    因此照抄部署后拿不到 DSN、以 `restart: unless-stopped` 无限崩溃重启。
+    现在两者分文件，这里守住"worker-queue 自己的小节确实示范了 DSN"，防止
+    未来又把这两行拆开时安静地漏掉。
+    """
+
+    text = read(ENV_EXAMPLE)
+    match = re.search(
+        r"文件五：deploy/\.env\.stage\.worker-queue.*?(?=\n# ={10,}\n# 文件六)",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return [
+            "deploy/.env.example 找不到「文件五：…worker-queue」小节"
+            "（或小节顺序/编号被改动，check_worker_queue_env_example 的定位正则需要同步更新）"
+        ]
+    section = match.group(0)
+    if not re.search(r"^LINGXI_POSTGRES_DSN=\S+\s*$", section, re.MULTILINE):
+        return [
+            "deploy/.env.example 的 worker-queue 小节里没有 LINGXI_POSTGRES_DSN 示范值。"
+            "worker-queue 是常驻队列消费者，启动期读不到这个变量会以 exit=3 拒绝启动，"
+            "配上 restart: unless-stopped 就是无限崩溃重启（PR #173 复核 P1-2）。"
+        ]
+    return []
+
+
 def check_compose_contract() -> list[str]:
     failures: list[str] = []
     base = strip_comments(read(COMPOSE_BASE))
@@ -673,19 +704,19 @@ def check_compose_contract() -> list[str]:
                         f"改成了 {restart.group(1)}；一次性作业必须是 \"no\""
                     )
 
-    # ---- 凭据按服务分文件（codex 审查 P1-1）---------------------------------
-    # 三个服务共用一个 env_file 时，worker 会拿到数据库连接串、Fernet 密钥与飞书密钥。
-    # 这不是"多给几个变量"：worker 跑 Agent SDK，SDK 把进程环境继承给 Claude CLI 与
-    # 每个 MCP 子进程，于是那些凭据一路流进模型执行环境——正是产品合同「凭据不进用户
-    # 环境」要挡的方向。
+    # ---- 凭据按服务分文件（codex 审查 P1-1；PR #173 复核 P1-2 收紧）-----------
+    # 两个服务共用一个 env_file 时，其中一边会拿到它不该拿到的凭据。这不是"多给
+    # 几个变量"：worker / worker-queue 跑 Agent SDK，SDK 把进程环境继承给 Claude
+    # CLI 与每个 MCP 子进程，于是那些凭据一路流进模型执行环境——正是产品合同
+    # 「凭据不进用户环境」要挡的方向。
     #
-    # **`worker` 与 `worker-queue` 例外**（Issue #153）：两者是**同一个镜像、同一套
-    # `LINGXI_WORKER_*` 环境变量面**，区别只是 `LINGXI_WORKER_MODE` 取 `turn` 还是
-    # `queue`（由 deploy/compose.yaml 基线的 `environment:` 直接给值，不经 env_file）
-    # ——本来就是同一个信任边界内的一次性/常驻两种运行形态，不是两个需要互相隔离的
-    # 不同进程；共用同一份 env_file 不产生新的凭据暴露面。其余任何两个服务共用
-    # env_file 仍然直接判定失败。
-    _ENV_FILE_SHARING_EXCEPTIONS = (frozenset({"worker", "worker-queue"}),)
+    # **不再为 `worker`/`worker-queue` 放行共用**（PR #173 复核 P1-2 撤销了这条
+    # 例外）：两者虽是同一镜像、同一套 `LINGXI_WORKER_*` 变量面，但 worker-queue
+    # 常驻领任务、必须有 `LINGXI_POSTGRES_DSN`，一次性 `worker` job 从不碰数据库
+    # ——共用同一份文件时，要么 worker 意外获得数据库凭据（经 Agent SDK 继承给模型
+    # 执行环境），要么 worker-queue 拿不到 DSN 而无限崩溃重启（两种后果都不可接受，
+    # 见 deploy/.env.example「文件四/文件五」的说明）。任何两个服务共用 env_file
+    # 现在一律判定失败，没有例外。
     for path in (COMPOSE_STAGE, COMPOSE_PROD):
         text = strip_comments(read(path))
         seen: dict[str, list[str]] = {}
@@ -696,7 +727,7 @@ def check_compose_contract() -> list[str]:
             for env_file in re.findall(r"^\s*-\s*(\./\S+)\s*$", block, re.MULTILINE):
                 seen.setdefault(env_file, []).append(service)
         for env_file, services in sorted(seen.items()):
-            if len(services) > 1 and frozenset(services) not in _ENV_FILE_SHARING_EXCEPTIONS:
+            if len(services) > 1:
                 failures.append(
                     f"{display(path)}：{'、'.join(services)} 共用同一个 "
                     f"env_file `{env_file}`。凭据必须按服务分文件——worker 跑 Agent SDK，"
@@ -940,6 +971,7 @@ def main() -> int:
     checks = (
         ("停止宽限期与源码常量联动", check_stop_grace_period),
         ("数据库超时与停机上界依据", check_database_timeouts),
+        ("worker-queue env.example 示范值", check_worker_queue_env_example),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
         (".dockerignore 覆盖面", check_dockerignore),

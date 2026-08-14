@@ -714,16 +714,40 @@ class AlertingDuty:
             if not scope or not scope[0].isalpha():
                 scope = f"delivery_{scope}"[:64]
             at = _as_utc(self._clock())
+            # PR #173 独立复核 P1-4：生产默认下 `AlertPolicy.send_failure_window_
+            # seconds`（300s）与 `DeliveryConsumer.DEFAULT_ALERT_MIN_INTERVAL_
+            # SECONDS`（300s，见 apps/gateway/delivery.py）两个 300 秒相等——
+            # `_alert_deduped` 把同一 (kind, task_id) 的上报频率压到约每 300 秒
+            # 一次，而 `AlertManager._new_send_window` 用 `>= 300s` 判定"窗口已
+            # 过期、换新窗口"，于是每一次上报都恰好落在"窗口刚过期"那一侧，
+            # `consecutive_failures` 每次被重置回 1，`threshold=3` 永远到不了：
+            # 用生产默认复现过，两小时内单个 uncertain 任务被上报 24 次、实际
+            # 发出的告警条数 = 0。
+            #
+            # 下面这两类不能等"攒够 N 次"：
+            # - `dispatch_uncertain:*`——结果不明、按设计**绝不自动重发**，必须
+            #   人工核对，是这条恢复路径的唯一入口；
+            # - `fallback_send_failed:*`——文本兜底发送遇到明确拒绝错误，
+            #   `V-告警-03`「终态失败立即告警」原文覆盖的正是这一类。
+            # 两者都改成 `final=True`：命中即报，不等阈值；仍然受
+            # `alert_min_interval_seconds`（上报节流）与 `dedupe_window_seconds`
+            # （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind
+            # （目前只有 `progress_persist_failed:*`，一次可恢复的 DB 写入
+            # 抖动）继续走"攒够阈值次数"的既有降噪路径。
+            final = kind.startswith("dispatch_uncertain:") or kind.startswith(
+                "fallback_send_failed:"
+            )
             try:
                 signal = AlertSignal(
                     kind=AlertKind.FEISHU_SEND_FAILED,
                     observed_at=at,
                     scope=scope,
                     trace_id=task_id,
+                    final=final,
                 )
             except ValueError:
                 signal = AlertSignal(
-                    kind=AlertKind.FEISHU_SEND_FAILED, observed_at=at, scope=scope
+                    kind=AlertKind.FEISHU_SEND_FAILED, observed_at=at, scope=scope, final=final
                 )
             self._submit(self._manager.observe(signal))
 

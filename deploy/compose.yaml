@@ -219,14 +219,21 @@ services:
 
     # ---- 停止宽限期（Issue #153；apps/worker/config.py 的
     # DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 头部注释有完整推导）----------------------
-    #   1.0s   /stop 检测延迟   stop_poll_interval_seconds 默认值
-    #  30.0s   SDK 收尾宽限     DEFAULT_DRAIN_GRACE_SECONDS，独立于业务墙钟
-    #  15.0s   终态写库预算     按连接工厂合法覆盖上界 MAX_TIMEOUT_SECONDS=5 建模
-    #                           （5 + 2×5）
+    # 与 scripts/ci/check_deploy_contract.py::_worker_worst_case_seconds() 的
+    # 实际门禁模型逐项对齐（PR #173 独立复核 P3-2：旧版注释另起一套推导，算出
+    # 的余量与门禁实际要求的数字对不上）：
+    #  45.0s   进程自身停机预算   LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS 默认值
+    #                             （DEFAULT_SHUTDOWN_TIMEOUT_SECONDS），它自己的
+    #                             推导已经包含 /stop 检测延迟（1.0s）、SDK 收尾
+    #                             宽限（DEFAULT_DRAIN_GRACE_SECONDS 30.0s）与一次
+    #                             终态写库预算，见该常量的头部注释
+    #  15.0s   终态写库预算       门禁模型在上面之外再单独留一次，作为 SIGKILL
+    #                             兜底窗口，按连接工厂合法覆盖上界
+    #                             MAX_TIMEOUT_SECONDS=5 建模（5 + 2×5）
     #  -----
-    #  46.0s   最坏情况 → ×1.5 安全系数 = 69s → 取整到 90s（与本服务自身
-    #          LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS 默认 45s 留出充分余量：
-    #          进程自己会在 45s 内主动退出，这里的 90s 只是 SIGKILL 兜底）。
+    #  60.0s   最坏情况 → ×1.5 安全系数 = 90s（这是门禁要求的下限，不是留了
+    #          余量后取整——90 秒恰好等于门禁最低要求，一点富余都没有；改小
+    #          任何一点都会打红门禁）。
     # 这个不等式由 scripts/ci/check_deploy_contract.py 守住，改了
     # DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 而不改这里，门禁会红。
     stop_grace_period: 90s

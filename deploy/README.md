@@ -362,15 +362,24 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 `SIGKILL` 只是把"优雅收口"换成"任务留在 `running`、等未来一次心跳超时被回收"——
 不丢结果、不重复副作用（依托 outbox 语义），但会晚一轮才被发现。
 
+**这张表必须和 `scripts/ci/check_deploy_contract.py::_worker_worst_case_seconds()`
+的实际门禁模型逐项对上**——PR #173 独立复核 P3-2 发现旧版这里另起一套推导
+（1.0+30.0+15.0=46.0），算出的余量与门禁实际要求的数字对不上：门禁的模型是
+"进程自身停机预算（已经把 `/stop` 检测延迟、SDK 收尾宽限都算进去了）再加一次
+终态写库预算"，不是把这些分项在这里重新加一遍。
+
 | 项 | 秒 | 依据 |
 | --- | --- | --- |
-| `/stop` 检测延迟 | 1.0 | `stop_poll_interval_seconds` 默认值，`apps/worker/config.py` |
-| SDK 收尾宽限 | 30.0 | `DEFAULT_DRAIN_GRACE_SECONDS`，独立于业务墙钟 |
-| 终态写库预算 | 15.0 | 按连接工厂合法覆盖上界 `MAX_TIMEOUT_SECONDS=5` 建模（5+2×5） |
-| **最坏合计** | **46.0** | × 1.5 安全系数 = 69 秒 → 取整到 **90 秒**（进程自身的 `LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS` 默认 45 秒，90 秒只是 `SIGKILL` 兜底，留了约两倍余量） |
+| 进程自身停机预算 | 45.0 | `LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS` 默认值（`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`，`apps/worker/config.py`）——它自己的推导已经包含 `/stop` 检测延迟（1.0s）、SDK 收尾宽限（`DEFAULT_DRAIN_GRACE_SECONDS` 30.0s，独立于业务墙钟）与一次终态写库预算，合计约 46s、取整为 45s，见该常量的头部注释 |
+| 终态写库预算 | 15.0 | 门禁模型在上面这个已经打包好的预算之外，**再单独留一次**终态写库预算作为 `SIGKILL` 兜底窗口，按连接工厂合法覆盖上界 `MAX_TIMEOUT_SECONDS=5` 建模（5+2×5） |
+| **最坏合计** | **60.0** | × 1.5 安全系数 = `math.ceil(60.0 × 1.5)` = **90 秒**（这是门禁要求的下限，不是留了余量后取整——90 秒恰好等于门禁的最低要求，一点富余都没有；`stop_grace_period` 写成低于 90 的任何值都会打红门禁，写成刚好 90 才是精确匹配，不是巧合） |
 
 同样由 `scripts/ci/check_deploy_contract.py` 自动守住：改了
-`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`（`apps/worker/config.py`）而不改 compose，门禁会红。
+`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`（`apps/worker/config.py`）而不改 compose，门禁会红；
+改这里的 `stop_grace_period` 时，务必先用
+`python3 scripts/ci/check_deploy_contract.py` 里的
+`_worker_worst_case_seconds()` 现算一次门禁的实际下限，不要凭这张表的旧数字
+手动推算——两者一度不一致过。
 
 ## 健康检查：不开放端口，`docker exec` 语义
 

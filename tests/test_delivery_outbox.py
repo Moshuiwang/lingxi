@@ -316,6 +316,40 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
             "card-1",
         )
 
+    def test_confirm_delivery_queues_the_overwritten_agent_session_for_cleanup(self) -> None:
+        """PR #173 独立复核 P2-4：``confirm_delivery()`` 与 ``finish()`` 用同一手法
+        写回 ``agent_session_id``，同一个覆盖缺口在这条路径上也存在——新终态带来
+        的新 session id 覆盖掉旧值时，旧值必须被排队做物理清理。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute("UPDATE conversation SET agent_session_id='sess-old' WHERE id='cnv-1'")
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="答案", agent_session_id="sess-new",
+        )
+
+        confirmed = self.queue.confirm_delivery(
+            task_id="tsk-1", platform_message_kind="card", platform_message_id="card-1",
+        )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation WHERE id='cnv-1'"), "sess-new"
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id='sess-old'"
+            ),
+            "session_overwritten",
+            "被覆盖的旧 session id 必须被排队做物理清理，否则永久留在磁盘上",
+        )
+        self.assertIsNone(
+            self.scalar(
+                "SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='sess-new'"
+            ),
+            "刚写入的新 session id 是活跃会话，不该被排队清理",
+        )
+
     def test_confirm_delivery_keeps_business_failure_not_upgraded_by_successful_delivery(self) -> None:
         """V-投递-04：飞书接受了失败卡片，业务结果仍然是 failed，不能因为投递
         成功就变成 succeeded。"""
@@ -693,6 +727,46 @@ class AgentSessionCleanupQueueTests(DeliveryOutboxTestCase):
             ),
             1,
             "同一个 session id 重复到点扫描不得排出第二条待办",
+        )
+
+    def test_idle_sweep_does_not_reselect_a_session_already_queued_by_another_trigger(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P2-5：``sweep_idle_conversations`` 的候选集查询必须
+        用 ``NOT EXISTS`` 排除已经在队列里的 ``agent_session_id``——不只是靠
+        写入时的 ``ON CONFLICT DO NOTHING`` 兜底去重，否则每 60 秒的扫描都会把
+        每一个曾经用过会话、之后闲置的话题重新捞出来做一遍纯浪费的插入尝试
+        （见 ``sweep_idle_conversations`` 的查询注释）。
+
+        用一个已经被**另一个触发点**（``/new``）排过队、原因是 ``new_command``
+        的会话来验证：即使它同时也满足空闲到点的候选条件，扫描也不应该"重新
+        发现"它——候选集里根本不该再出现这一行，原始排队原因原样保留。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.execute(
+            "UPDATE conversation SET running_task_id=NULL, agent_session_id='sess-already-queued', "
+            "last_task_ended_at=now() - interval '3 hours' WHERE id='cnv-1'"
+        )
+        # 模拟这个 session id 早先已经被 /new 触发点排过队（原因不同）。
+        with self.store.transaction() as transaction:
+            transaction._queue_session_cleanup(
+                user_id="usr-1", agent_session_id="sess-already-queued", reason="new_command"
+            )
+
+        self.queue.sweep_idle_conversations(idle_after=timedelta(hours=2))
+
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-already-queued'"
+            ),
+            1,
+            "已经在队列里的 session id 不应该被空闲扫描重新选中",
+        )
+        self.assertEqual(
+            self._pending_reasons(agent_session_id="sess-already-queued"),
+            ["new_command"],
+            "原始排队原因必须原样保留，不能被扫描覆盖或追加",
         )
 
     def test_user_level_clear_retires_every_conversation_session_for_that_user_only(self) -> None:

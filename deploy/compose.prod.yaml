@@ -10,10 +10,11 @@
 # （架构设计「八、部署与发布」）。回滚 = 改 LINGXI_IMAGE_TAG 后 `up -d`，见 deploy/README.md。
 #
 # 凭据**按服务分文件**，理由见 compose.stage.yaml 顶部的说明（worker 不得拿到数据库
-# 与飞书凭据：Agent SDK 会把环境继承给 Claude CLI 与 MCP 子进程）。
-# 本环境五个运行时 env 文件：.env.prod.scheduler / .env.prod.gateway / .env.prod.worker /
-# .env.prod.migrate / .env.prod.reauthorize，**五个都必须 0600**，核对步骤见
-# deploy/README.md 的 preflight。
+# 与飞书凭据：Agent SDK 会把环境继承给 Claude CLI 与 MCP 子进程；worker-queue 需要
+# 数据库 DSN 才能领任务，因此与 worker 各自独立一份文件——PR #173 复核 P1-2）。
+# 本环境六个运行时 env 文件：.env.prod.scheduler / .env.prod.gateway / .env.prod.worker /
+# .env.prod.worker-queue / .env.prod.migrate / .env.prod.reauthorize，**六个都必须
+# 0600**，核对步骤见 deploy/README.md 的 preflight。
 #
 # 本文件的存在**不代表已经可以部署生产**。按 Issue #62「不在本 Issue 直接执行」：
 # 生产部署另建独立 `[ops]` Issue，固定镜像 digest、备份点、执行窗口、观察期和回滚目标。
@@ -38,11 +39,11 @@ services:
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
-  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 共用同一份
-  # `.env.prod.worker`，理由见 compose.stage.yaml 同名 service 的注释。
+  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 是同一镜像，但独立一份
+  # env 文件，理由见 compose.stage.yaml 同名 service 的注释（PR #173 复核 P1-2）。
   worker-queue:
     env_file:
-      - ./.env.prod.worker
+      - ./.env.prod.worker-queue
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 

@@ -62,7 +62,17 @@ class WorkerService:
         self._queue = queue
         self._executor_factory = executor_factory or (
             lambda worker_config, marker: WorkerTurnExecutor(
-                worker_config, mark_external_side_effect=marker
+                worker_config,
+                mark_external_side_effect=marker,
+                # 常驻 queue worker 必须让 SIGTERM 停机预算耗尽时的取消原样传播
+                # 出来（PR #173 独立复核 P1-3）：默认行为（一次性 turn 模式 CLI
+                # 那份）会把取消吞成一份"已取消"的失败报告并正常返回，
+                # `_process_task` 就会把它当成真实完成的回合同步写终态——预算
+                # 耗尽后任务本该保持 `running`、交给心跳超时回收
+                # （`reclaim_stale_with_outcomes`，已在 #90/#151 验证），不该被
+                # 写成一次可能失真的 FAILED 终态。见 `WorkerTurnExecutor.run_turn`
+                # 里 `propagate_cancellation` 的完整说明。
+                propagate_cancellation=True,
             )
         )
         self._listener_factory = listener_factory
@@ -90,6 +100,25 @@ class WorkerService:
         self._emit_heartbeat()
         self._tick_alerts()
         terminal_tasks = self._housekeep()
+
+        # 再判一次停机信号，紧贴在 claim() 之前（PR #173 独立复核 P2-1）：
+        # `run()` 的 `while not stop.is_set()` 判定与这里的 `claim()` 之间没有
+        # 任何 await（心跳、告警 tick、`_housekeep()` 全是同步代码），而
+        # `loop.add_signal_handler` 装的回调靠自管道机制投递，只有在事件循环
+        # 真正拿到控制权（也就是某次 await 让出）时才会被处理——纯同步代码
+        # 中间不存在能被它插入的缝隙。信号如果恰好在这段同步窗口内被操作系统
+        # 送达，Python 侧只是把回调排进了事件循环的就绪队列，**这里读到的
+        # `is_set()` 依然是旧值**，之前会把一条还在排队、从未执行过的任务
+        # 领走，直接收口成 `stopped` 且不会被重排。因此先 `await
+        # asyncio.sleep(0)` 主动让出一次——这是标准的"给事件循环一个处理已就绪
+        # 回调的机会"惯用法，不是无意义的空转——再判一次 `is_set()`，让"停止
+        # 新领取"（#153 完成标准第 3 条）在这个窗口里也成立。`self._global_stop`
+        # 为 ``None`` 时（`process_once()` 的白盒调用方与既有测试）跳过整段，
+        # 行为不变、不多一次调度。
+        if self._global_stop is not None:
+            await asyncio.sleep(0)
+            if self._global_stop.is_set():
+                return bool(terminal_tasks)
 
         tasks = self._queue.claim(
             worker_id=self._config.worker_id,
@@ -174,6 +203,24 @@ class WorkerService:
             logger.error("Agent 会话清理队列认领失败 error=%s", type(error).__name__)
             return
         if not pending:
+            return
+        # 根目录本身不存在与"根目录存在、这个会话确实没有文件"是两件不同的事
+        # （PR #173 独立复核 P2-6）：`delete_agent_session_files` 对两者都返回
+        # `0`（幂等设计，理由见该函数文档），但把这两种情况合并成同一个"标记
+        # 完成"分支是错的——`.env.example` 里一个写错的 `LINGXI_WORKER_
+        # SESSION_ROOT`（例如示例值 `/var/lib/lingxi/users/.claude/projects`，
+        # 而镜像固定 `HOME=/tmp`）会让这一批本该被清理的会话被静默标记完成；
+        # `agent_session_cleanup.agent_session_id` 是唯一索引 +
+        # `ON CONFLICT DO NOTHING`，标记完成的行不会被重新排队，事后改对配置
+        # 也补不回来。这里已经认领（`claimed_at`/`worker_id` 已写），因此不能
+        # 简单地什么都不做就返回——十分钟软领取窗口本来就是为这类"认领了但
+        # 这次处理不了"设计的重试兜底，只需要不调用 `mark_done` 即可让它到点
+        # 被下一个进程重新认领。
+        if not self._session_root.is_dir():
+            logger.error(
+                "Agent 会话清理根目录不存在，本轮跳过、不标记完成 pending=%d",
+                len(pending),
+            )
             return
         done_ids: list[str] = []
         for item in pending:
@@ -419,6 +466,18 @@ class WorkerService:
     async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
         last_heartbeat = self._monotonic()
         while True:
+            # 活性文件必须在这条循环里戳，不能只靠 `process_once()` 开头那一次
+            # （PR #173 独立复核 P1-5）：`process_once()` 会 `await
+            # asyncio.gather(...)` 等完整批任务才返回，一个正常但较长的回合
+            # （`turn_timeout_seconds` 默认 600s）足以让活性文件年龄超过 worker
+            # 角色的健康检查阈值（默认 60s），把"完全正常、只是在忙"的容器打成
+            # unhealthy。`_monitor` 本来就按 `stop_poll_interval_seconds`
+            # （默认 1s）在跳、贯穿整个在途任务的生命周期，是"进程仍在做正确的
+            # 事"这个信号真正应该来源的地方；每跳一次戳一次是本地文件写入，
+            # 成本可忽略。真实证据：`tests/test_liveness_and_healthcheck.py` 的
+            # ``test_liveness_stays_fresh_through_a_long_in_flight_turn`` ——
+            # 删掉这一行后该用例会变红。
+            self._emit_heartbeat()
             # SIGTERM 与用户 `/stop` 对在途回合而言是同一件事——都要求 Agent SDK
             # 尽快中断当前回合（Issue #153 完成标准第 3 条："通知在途回合停止"）。
             # `self._global_stop` 只在 `run()` 收到停止信号时被置位，process_once()

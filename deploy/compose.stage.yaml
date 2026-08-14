@@ -12,7 +12,7 @@
 # （验证与门禁「十三、测试数据与身份边界」）。
 #
 # ---------------------------------------------------------------------------
-# 凭据**按服务分文件**，不是三个服务共用一份（Issue #62 codex 审查 P1-1）。
+# 凭据**按服务分文件**，不是几个服务共用一份（Issue #62 codex 审查 P1-1）。
 #
 # 上一版给三个服务挂同一个 env_file，于是 worker 也拿到了数据库连接串、Fernet 密钥
 # 与飞书应用密钥——它一个都不需要。这不是"多给了几个变量"那么轻：worker 跑的是
@@ -21,12 +21,16 @@
 # 明令"凭据不进用户环境"要挡住的方向。
 #
 # 拆开之后每个服务只拿自己那份：
-#   .env.stage.scheduler  数据库 DSN、Fernet 密钥、飞书应用凭据
-#   .env.stage.gateway    飞书应用凭据 + 数据库 DSN（#57；不含 Fernet 密钥、不含模型凭据）
-#   .env.stage.worker     只有 LINGXI_WORKER_* 与模型端点凭据
-#   .env.stage.migrate    只有迁移 DSN（DDL 权限，业务进程不该有）
+#   .env.stage.scheduler   数据库 DSN、Fernet 密钥、飞书应用凭据
+#   .env.stage.gateway     飞书应用凭据 + 数据库 DSN（#57；不含 Fernet 密钥、不含模型凭据）
+#   .env.stage.worker      一次性 turn job：只有 LINGXI_WORKER_* 与模型端点凭据，不含数据库
+#   .env.stage.worker-queue 常驻队列消费者：数据库 DSN + LINGXI_WORKER_* + 模型端点凭据
+#                           （PR #173 复核 P1-2：与 worker 不再共用同一份文件——worker
+#                           不需要数据库，worker-queue 需要，共用会让其中一边拿到不该
+#                           拿到的东西）
+#   .env.stage.migrate     只有迁移 DSN（DDL 权限，业务进程不该有）
 #   .env.stage.reauthorize 一次性重授权 job 的数据库、应用与 scope 配置
-# 五个运行时文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；五个都必须 0600，
+# 六个运行时文件都匹配 .gitignore 既有的 `.env.*` 规则，不入库；六个都必须 0600，
 # 核对步骤见 deploy/README.md 的 preflight。
 # ---------------------------------------------------------------------------
 
@@ -50,13 +54,14 @@ services:
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
-  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 共用同一份
-  # `.env.stage.worker`——两者是同一镜像、同一套 LINGXI_WORKER_* 环境变量面，
-  # 差别只是 `LINGXI_WORKER_MODE`（由 deploy/compose.yaml 基线的
-  # `environment:` 直接给值），不是需要互相隔离的两个信任边界。
+  # 常驻 queue worker（Issue #153）：与一次性 `worker` job 是同一镜像，但**独立一份
+  # env 文件**（PR #173 复核 P1-2）——worker-queue 常驻领取真实任务，必须拿到
+  # `LINGXI_POSTGRES_DSN` 才能启动；一次性 `worker` job 从不碰数据库。共用同一份
+  # 文件会让其中一边拿到它不该拿到的东西：要么 worker 意外获得数据库凭据（并经
+  # Agent SDK 继承给模型执行环境），要么 worker-queue 拿不到 DSN 而无限崩溃重启。
   worker-queue:
     env_file:
-      - ./.env.stage.worker
+      - ./.env.stage.worker-queue
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
