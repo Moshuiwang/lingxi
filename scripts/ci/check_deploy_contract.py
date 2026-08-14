@@ -746,6 +746,27 @@ def check_ci_workflow() -> list[str]:
             if marker not in candidate:
                 failures.append(f"ci.yml candidate 缺少 `{marker}`，main 无法回读候选身份。")
 
+    # Issue #150：PR 候选四镜像必须真的导出、自校验并留存成可下载 artifact，
+    # 不能只是"构建过、验证过契约"就完事——那些镜像在 job 结束后随 runner 一起消失，
+    # biai-stage 拿不到与这次构建逐字节一致的对象。
+    image_match = re.search(
+        r"^  image:\n(.*?)(?=^  \w[\w-]*:\n|\Z)", full, re.MULTILINE | re.DOTALL
+    )
+    if image_match is None:
+        failures.append("ci.yml 缺少 image job，无法产出 PR 候选四镜像 artifact（Issue #150）。")
+    else:
+        image_body = image_match.group(1)
+        for marker in (
+            "write_epic_candidate_images.py",
+            "verify_epic_candidate_bundle.py",
+            "epic-candidate-images-pr-",
+            "upload-artifact@",
+        ):
+            if marker not in image_body:
+                failures.append(
+                    f"ci.yml 的 image job 缺少 `{marker}`：PR 候选镜像制品链不完整（Issue #150）。"
+                )
+
     # 纯文档 main PR 的稳定 required check 仍叫 Epic Full，但不得启动真库、extras
     # 或镜像构建。遗漏这些标记会让文档改动又悄悄退化为完整回归。
     for marker in (
