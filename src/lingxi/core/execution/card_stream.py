@@ -2,6 +2,11 @@
 
 这里不依赖飞书 SDK。卡片适配器只实现 ``CardTransport``，因此 L2 可以用内存假实现
 验证序号、话题隔离和失败回退，L4a 再验证 CardKit 的真实字段与投递效果。
+
+**Issue #152 起支持从持久化状态恢复（resume）**：Gateway 消费循环崩溃重启后不会重新
+``start()`` 一张已经建好的卡片——它把上一次持久化的 ``card_id``/``sequence``/
+``message_id``/``fallback_needed`` 作为 ``initial_*`` 参数传回来，本类从那一点继续，
+不产生第二张有效卡片（`V-卡片-01`、状态合同第 7 条）。
 """
 
 from __future__ import annotations
@@ -14,6 +19,19 @@ from typing import Callable, Protocol
 from lingxi.config.content import ContentCatalog, RenderedCard, RenderedContent, default_content_catalog
 
 
+@dataclass(frozen=True)
+class CardCreated:
+    """建卡并把它作为消息发出后的结果。
+
+    ``card_id`` 用于后续的流式更新/关闭；``message_id`` 是发送消息接口返回的可回读
+    标识（G-CARD 实测：卡片与文本共用同一发送接口与响应结构），在卡片整个生命周期内
+    只在这里产生一次，后续流式更新不产生新的 message_id。
+    """
+
+    card_id: str
+    message_id: str
+
+
 class CardTransport(Protocol):
     def create(
         self,
@@ -22,7 +40,7 @@ class CardTransport(Protocol):
         thread_id: str | None,
         reply_to_message_id: str,
         card: RenderedCard,
-    ) -> str: ...
+    ) -> CardCreated: ...
 
     def update(self, *, card_id: str, sequence: int, card: RenderedCard) -> None: ...
 
@@ -32,7 +50,7 @@ class CardTransport(Protocol):
 class TextTransport(Protocol):
     def send_text(
         self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
-    ) -> None: ...
+    ) -> str: ...
 
 
 SendOutcomeCallback = Callable[[str, bool], None]
@@ -81,6 +99,10 @@ class CardStream:
         monotonic: Callable[[], float] = time.monotonic,
         rate_limiter: CardRateLimiter | None = None,
         on_send_outcome: SendOutcomeCallback | None = None,
+        initial_card_id: str | None = None,
+        initial_sequence: int = 0,
+        initial_message_id: str | None = None,
+        initial_fallback_needed: bool = False,
     ) -> None:
         self._chat_id = chat_id
         self._thread_id = thread_id
@@ -90,9 +112,12 @@ class CardStream:
         self._catalog = catalog or default_content_catalog()
         self._mark_external_side_effect = mark_external_side_effect
         self._monotonic = monotonic
-        self._card_id: str | None = None
-        self._sequence = 0
-        self._fallback_needed = False
+        # resume 场景：非 None/非零表示接着一次此前已经持久化的进度继续，而不是从零建卡
+        # （Issue #152、状态合同第 7 条：重启不产生第二张有效卡片）。
+        self._card_id: str | None = initial_card_id
+        self._sequence = initial_sequence
+        self._message_id: str | None = initial_message_id
+        self._fallback_needed = initial_fallback_needed
         self._last_update: float | None = None
         self._rate_limiter = rate_limiter or CardRateLimiter()
         self._on_send_outcome = on_send_outcome
@@ -105,16 +130,34 @@ class CardStream:
     def sequence(self) -> int:
         return self._sequence
 
+    @property
+    def card_id(self) -> str | None:
+        return self._card_id
+
+    @property
+    def message_id(self) -> str | None:
+        """当前投递通道（卡片或文本兜底）绑定的可回读标识；尚未取得时为 ``None``。"""
+
+        return self._message_id
+
     def start(self) -> None:
+        """建卡并发出。resume 场景下（已经有 ``card_id`` 或已经降级）直接不做事——
+        调用方按持久化状态决定要不要调用这一步，这里的判断只是防御性幂等。
+        """
+
+        if self._card_id is not None or self._fallback_needed:
+            return
         card = self._status_card(action="processing", elapsed_seconds=0)
         try:
             self._before_external()
-            self._card_id = self._transport.create(
+            created = self._transport.create(
                 chat_id=self._chat_id,
                 thread_id=self._thread_id,
                 reply_to_message_id=self._reply_to_message_id,
                 card=card,
             )
+            self._card_id = created.card_id
+            self._message_id = created.message_id
             self._notify_send("card_non_final", True)
             self._last_update = self._monotonic()
             # 创建本身就是该话题的首帧，后续更新也要遵守 500ms 间隔。
@@ -173,21 +216,31 @@ class CardStream:
             self._notify_send("card_final", False)
             self._fallback_needed = True
 
-    def send_fallback(self, content: RenderedContent) -> None:
+    def send_fallback(self, content: RenderedContent) -> str | None:
+        """发一次同话题文本兜底；不需要时（未降级）返回 ``None`` 且不产生外部调用。
+
+        调用方负责在这次调用之前完成"外发前预留位"的持久化（Issue #151 审核 P3-6、
+        本类文件头注释）——文本发送没有飞书原生幂等键，这里的异常刻意不吞掉，交由
+        调用方区分"同步捕获的明确失败"（可以清预留位、下一轮重试）与"进程崩溃"
+        （预留位留在数据库里，下一轮必须识别为 ``uncertain`` 而不是自动重发）。
+        """
+
         if not self._fallback_needed:
-            return
+            return None
         try:
             self._before_external()
-            self._fallback.send_text(
+            message_id = self._fallback.send_text(
                 chat_id=self._chat_id,
                 thread_id=self._thread_id,
                 reply_to_message_id=self._reply_to_message_id,
                 text=content.text,
             )
-            self._notify_send("message_final", True)
         except Exception:
             self._notify_send("message_final", False)
             raise
+        self._message_id = message_id
+        self._notify_send("message_final", True)
+        return message_id
 
     def _status_card(self, *, action: str, elapsed_seconds: int) -> RenderedCard:
         action_key = "worker.action.completed" if action == "completed" else "worker.action.processing"

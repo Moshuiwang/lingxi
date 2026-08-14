@@ -13,6 +13,7 @@ version = "2026-08-08"
 "gateway.busy_hint" = "当前任务仍在处理中"
 "gateway.suspended" = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
+"gateway.delivery_expired" = "上一次问数结果因超过投递时限未能确认送达，已过期，请重新提问。"
 
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"

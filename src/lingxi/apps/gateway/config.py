@@ -52,6 +52,10 @@ class GatewayConfig:
     reconnect_ceiling_seconds: float = 60.0
     # 收到 SIGTERM 后等待在途事件落库的上限（`V-部署-03`）。
     shutdown_timeout_seconds: float = 20.0
+    # 投递消费循环（Issue #152）没有独立的 NOTIFY 监听——outbox 事件的写入方是
+    # Worker 进程，不在本进程内——轮询间隔是唯一的发现机制，因此默认取一个较短的值。
+    delivery_poll_interval_seconds: float = 1.0
+    delivery_batch_limit: int = 20
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -85,6 +89,19 @@ def _number(env: Mapping[str, str], name: str, default: float) -> float:
     return value
 
 
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = _text(env, name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise GatewayConfigError(f"{ENV_PREFIX}{name} 不是一个整数") from None
+    if value <= 0:
+        raise GatewayConfigError(f"{ENV_PREFIX}{name} 必须是正整数")
+    return value
+
+
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
@@ -112,6 +129,8 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         reconnect_factor=_number(env, "RECONNECT_FACTOR", 2.0),
         reconnect_ceiling_seconds=_number(env, "RECONNECT_CEILING_SECONDS", 60.0),
         shutdown_timeout_seconds=_number(env, "SHUTDOWN_TIMEOUT_SECONDS", 20.0),
+        delivery_poll_interval_seconds=_number(env, "DELIVERY_POLL_INTERVAL_SECONDS", 1.0),
+        delivery_batch_limit=_positive_int(env, "DELIVERY_BATCH_LIMIT", 20),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

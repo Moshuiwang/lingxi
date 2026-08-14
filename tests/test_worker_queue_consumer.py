@@ -38,7 +38,7 @@ from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
-from lingxi.core.execution.card_stream import CardRateLimiter, CardStream
+from lingxi.core.execution.card_stream import CardCreated, CardRateLimiter, CardStream
 from postgres_schema import ensure_production_schema, reset_production_rows
 
 
@@ -67,12 +67,12 @@ class RecordingCards:
         self.calls: list[tuple[str, int | None]] = []
         self.bodies: list[str] = []
 
-    def create(self, **kwargs: object) -> str:
+    def create(self, **kwargs: object) -> CardCreated:
         self.calls.append(("create", None))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "create":
             raise RuntimeError("card create")
-        return "card-1"
+        return CardCreated(card_id="card-1", message_id="msg-card-1")
 
     def update(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("update", sequence))
@@ -100,7 +100,7 @@ class RecordingText:
         thread_id: str | None,
         reply_to_message_id: str,
         text: str,
-    ) -> None:
+    ) -> str:
         self.calls.append(
             {
                 "chat_id": chat_id,
@@ -112,6 +112,7 @@ class RecordingText:
         self.texts.append(text)
         if self.fail:
             raise RuntimeError("text fallback")
+        return "msg-fallback-1"
 
 
 class CardStreamTests(unittest.TestCase):
@@ -169,6 +170,58 @@ class CardStreamTests(unittest.TestCase):
             "topic-a",
             "V-卡片-03：文本回退必须保留原 thread_id",
         )
+
+    def test_resuming_with_an_existing_card_id_does_not_create_a_second_card(self) -> None:
+        """Issue #152：Gateway 消费循环重启后用 ``initial_*`` 恢复，``start()``
+        必须是安全的空操作，不产生第二次 ``create()`` 调用（状态合同第 7 条）。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_card_id="card-resumed",
+            initial_sequence=2,
+            initial_message_id="msg-resumed",
+        )
+
+        stream.start()
+        self.assertEqual(cards.calls, [], "resume 场景下 start() 必须是空操作")
+        self.assertEqual(stream.card_id, "card-resumed")
+        self.assertEqual(stream.message_id, "msg-resumed")
+
+        stream.finish(result="结果", elapsed_seconds=1)
+        self.assertEqual(
+            [sequence for kind, sequence in cards.calls if kind in {"update", "close"}],
+            [3, 4],
+            "序号从持久化的 initial_sequence 之后继续，不从零重新计数",
+        )
+
+    def test_resuming_with_fallback_already_needed_skips_the_card_path_entirely(self) -> None:
+        """已经降级为文本通道的任务重启后不得再尝试建卡或更新卡片。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_fallback_needed=True,
+        )
+
+        stream.start()
+        stream.update(elapsed_seconds=1)
+        stream.finish(result="结果")
+        self.assertEqual(cards.calls, [], "已降级的任务重启后不得再触碰卡片通道")
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertEqual(message_id, "msg-fallback-1")
+        self.assertEqual(stream.message_id, "msg-fallback-1")
 
 
 class FakeWorkerQueue:

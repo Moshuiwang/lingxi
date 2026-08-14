@@ -1,0 +1,466 @@
+"""Issue #152：Gateway 投递消费循环的真库断言。
+
+覆盖：`V-卡片-01`（sequence 严格递增）、`V-卡片-02`（限流）、`V-卡片-03`（首次失败后
+永久走文本通道、同话题只发一次文本终态）、`V-投递-03`（platform_received 的真实获得
+路径与 uncertain 不自动重发）、状态合同第 7 条（重启从最后确认 sequence 恢复，不产生
+第二张有效卡片/第二条文本终态）。
+
+真实飞书 CardKit/发送接口不在本文件断言范围（L4a，留 Bot-Test/Stage）；本文件用
+``core.execution.card_stream`` 的 ``CardTransport``/``TextTransport`` 假实现验证
+消费循环本身的顺序、幂等与崩溃恢复语义，用真实 PostgreSQL 验证持久化的部分。
+"""
+
+from __future__ import annotations
+
+import os
+import unittest
+
+from postgres_schema import ensure_production_schema, reset_production_rows
+
+from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+from lingxi.apps.gateway.delivery import DeliveryConsumer
+from lingxi.core.execution.card_stream import CardCreated
+
+SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
+
+
+class RecordingCards:
+    """记录调用；``fail_at`` 控制第几次调用（1-based）开始抛出同步异常。"""
+
+    def __init__(self, *, fail_at: int | None = None) -> None:
+        self._fail_at = fail_at
+        self._calls = 0
+        self.create_calls: list[dict] = []
+        self.update_calls: list[dict] = []
+        self.close_calls: list[dict] = []
+
+    def _maybe_fail(self) -> None:
+        self._calls += 1
+        if self._fail_at is not None and self._calls >= self._fail_at:
+            raise RuntimeError("card call failed")
+
+    def create(self, **kwargs: object) -> CardCreated:
+        self._maybe_fail()
+        self.create_calls.append(kwargs)
+        return CardCreated(card_id="card-1", message_id="msg-card-1")
+
+    def update(self, **kwargs: object) -> None:
+        self._maybe_fail()
+        self.update_calls.append(kwargs)
+
+    def close(self, **kwargs: object) -> None:
+        self._maybe_fail()
+        self.close_calls.append(kwargs)
+
+
+class RecordingText:
+    def __init__(self, *, fail: bool = False, message_id: str = "msg-text-1") -> None:
+        self.fail = fail
+        self.message_id = message_id
+        self.calls: list[dict] = []
+
+    def send_text(self, **kwargs: object) -> str:
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("text send failed")
+        return self.message_id
+
+
+class RaisingCardsMidFinish:
+    """``create`` 正常成功；终态 ``update``（``finish()`` 内部的第一次调用）崩溃。
+
+    模拟"卡片其实已经建好、终态更新这一步的外部调用结果对进程来说永远不可知"——
+    与 ``RaisingCardsMidCreate`` 同一手法，用 ``BaseException`` 表示真实进程崩溃，
+    而不是 ``CardStream`` 自己会捕获的同步失败。
+    """
+
+    def __init__(self) -> None:
+        self.create_calls: list[dict] = []
+
+    def create(self, **kwargs: object) -> CardCreated:
+        self.create_calls.append(kwargs)
+        return CardCreated(card_id="card-1", message_id="msg-card-1")
+
+    def update(self, **kwargs: object) -> None:
+        raise _SimulatedCrash("终态更新的外部调用结果对进程来说永远不可知")
+
+    def close(self, **kwargs: object) -> None:  # pragma: no cover - 不会走到
+        raise AssertionError("崩溃恢复场景不应该继续调用 close")
+
+
+class RaisingCardsMidCreate:
+    """模拟"预留位已提交、外部调用本身在进行中崩溃"：``create`` 从不返回。"""
+
+    def create(self, **kwargs: object) -> CardCreated:
+        raise _SimulatedCrash("外部调用尚未确定结果时进程崩溃")
+
+    def update(self, **kwargs: object) -> None:  # pragma: no cover - 不会走到
+        raise AssertionError("崩溃恢复场景不应该继续调用 update")
+
+    def close(self, **kwargs: object) -> None:  # pragma: no cover - 不会走到
+        raise AssertionError("崩溃恢复场景不应该继续调用 close")
+
+
+class _SimulatedCrash(BaseException):
+    """刻意继承 ``BaseException`` 而不是 ``Exception``：``CardStream.start()`` 只
+    捕获 ``Exception``，用它模拟"这次外部调用的结果对进程来说永远不可知"（真实的
+    进程崩溃不会被自己的 ``except Exception`` 捕获），而不是"同步捕获到的明确失败"。
+    测试断言的正是消费循环在这条边界上不把两者混为一谈。
+    """
+
+
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+class DeliveryConsumerTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import psycopg
+
+        cls._psycopg = psycopg
+        cls._dsn = os.environ["LINGXI_POSTGRES_DSN"]
+        ensure_production_schema(cls._dsn)
+
+    def setUp(self) -> None:
+        reset_production_rows(self._dsn)
+        self.queue = PostgresTaskQueue(self._dsn)
+        self._connection = self._psycopg.connect(self._dsn, autocommit=True)
+        self.addCleanup(self._connection.close)
+        self.execute(
+            """INSERT INTO app_user
+               (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                display_name, department, tenant_key, provisioning_state)
+               VALUES ('usr-1','ou-1','u-1','un-1','张三','数据部','tk-1','active')"""
+        )
+
+    def execute(self, sql: str, parameters: tuple = ()) -> None:
+        with self._connection.cursor() as cursor:
+            cursor.execute(sql, parameters)
+
+    def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(sql, parameters)
+            return cursor.fetchall()
+
+    def scalar(self, sql: str, parameters: tuple = ()):
+        rows = self.query(sql, parameters)
+        return rows[0][0] if rows else None
+
+    def seed_running_task(
+        self, *, task_id: str, conversation_id: str, reply_to_message_id: str = "reply-1"
+    ) -> None:
+        self.execute(
+            """INSERT INTO conversation
+               (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
+               VALUES (%s,'usr-1',%s,%s,%s)""",
+            (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+        )
+        self.execute(
+            """INSERT INTO task
+               (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                target_worker_version,worker_id,heartbeat_at,attempts,
+                reply_to_message_id,content_expires_at)
+               VALUES (%s,%s,'usr-1',%s,'问题','running','stable','worker-1',now(),1,%s,now())""",
+            (task_id, conversation_id, f"event-{task_id}", reply_to_message_id),
+        )
+
+    def start_task(self, task_id: str) -> None:
+        self.queue.append_delivery_event(
+            task_id=task_id, worker_id="worker-1", event_type="started",
+            idempotency_key=f"{task_id}:a1:started",
+        )
+
+    def finish_task(self, task_id: str, *, content: str = "已送达的答案") -> None:
+        self.queue.write_terminal_event(
+            task_id=task_id, worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content=content,
+        )
+
+
+class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
+    """一条开始事件建唯一卡片；流式更新与关闭严格递增；成功送达确认（`V-卡片-01`）。"""
+
+    def test_started_progress_and_terminal_produce_one_card_and_confirm_delivery(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        # 受控时钟：建卡在 t=0 消费掉话题的首个限流名额；progress 必须等窗口过后
+        # （t=0.6）才会被放行，否则会被 `V-卡片-02` 的 500ms 节流吞掉，这里要验证
+        # 的正是"放行的更新与随后的终态更新共用整卡级严格递增序号"，节流吞掉的帧
+        # 不构成矛盾但会让这条断言测不到想测的东西。
+        clock = [0.0]
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+        )
+        consumer.run_once()  # 只处理 started：建卡。
+
+        clock[0] = 0.6
+        self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=3,
+        )
+        self.finish_task("tsk-1")
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(len(cards.create_calls), 1, "只建一次卡片")
+        self.assertEqual(
+            [call["sequence"] for call in cards.update_calls], [1, 2],
+            "进度更新 + 终态更新共用整卡级严格递增序号",
+        )
+        self.assertEqual([call["sequence"] for call in cards.close_calls], [3])
+        self.assertEqual(texts.calls, [], "卡片路径全程未降级，不应该发文本兜底")
+
+        row = self.query(
+            "SELECT status, delivery_message_id, card_id, card_seq FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "succeeded")
+        self.assertEqual(row[1], "msg-card-1")
+        self.assertEqual(row[2], "card-1")
+        self.assertEqual(row[3], 3)
+        received = self.scalar(
+            "SELECT platform_received_at IS NOT NULL FROM task_delivery_event "
+            "WHERE task_id='tsk-1' AND event_type='terminal'"
+        )
+        self.assertTrue(received)
+
+    def test_a_second_round_with_no_new_events_does_not_repeat_delivery(self) -> None:
+        """重复轮询（没有新事件）不应该产生第二次外部调用（状态合同第 7 条）。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1")
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+        first_round_calls = len(cards.create_calls) + len(cards.update_calls) + len(cards.close_calls)
+
+        consumer.run_once()
+        second_round_calls = (
+            len(cards.create_calls) + len(cards.update_calls) + len(cards.close_calls)
+        )
+        self.assertEqual(second_round_calls, first_round_calls, "已确认送达的任务不再被消费")
+
+
+class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
+    """`V-卡片-03`：卡片链路首次失败后停止后续卡片更新，只发一次文本终态。"""
+
+    def test_update_failure_falls_back_and_confirms_as_text(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1", content="已产生的答案")
+
+        # 第 1 次调用（create）成功，第 2 次（finish 的 update）失败。
+        cards = RecordingCards(fail_at=2)
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+
+        self.assertEqual(len(cards.create_calls), 1)
+        self.assertEqual(len(cards.close_calls), 0, "更新失败后不再尝试关闭")
+        self.assertEqual(len(texts.calls), 1, "同话题只发一次文本终态")
+        self.assertIn("已产生的答案", texts.calls[0]["text"])
+
+        row = self.query(
+            "SELECT status, fallback_text, delivery_message_id FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "succeeded")
+        self.assertTrue(row[1])
+        self.assertEqual(row[2], "msg-text-1")
+
+    def test_text_fallback_failure_keeps_task_pending_for_retry(self) -> None:
+        """文本兜底同步捕获到明确失败：清预留位、不确认送达，下一轮可以重试。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1")
+
+        cards = RecordingCards(fail_at=1)  # create 本身就失败，直接走文本通道
+        texts = RecordingText(fail=True)
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+
+        row = self.query(
+            "SELECT status, dispatch_reserved_kind, delivery_message_id FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "awaiting_delivery", "明确失败不确认送达，任务保持待投递")
+        self.assertIsNone(row[1], "明确失败必须清空预留位，允许下一轮重试")
+        self.assertIsNone(row[2])
+
+        # 下一轮：文本发送恢复正常，应当成功重试并确认送达。
+        texts.fail = False
+        consumer.run_once()
+        row = self.query("SELECT status FROM task WHERE id='tsk-1'")[0]
+        self.assertEqual(row[0], "succeeded")
+        self.assertEqual(len(texts.calls), 2, "第一次失败 + 第二次重试各一次")
+
+
+class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
+    """重复投递防线的核心验证：外发前预留位已提交、外部调用结果不明时崩溃重启，
+    不得自动重发（Issue #151 审核 P3-6、issue 状态合同第 6 条）。
+    """
+
+    def test_a_crash_during_card_create_is_not_retried_automatically(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        crashing_cards = RaisingCardsMidCreate()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=crashing_cards, texts=texts)
+        with self.assertRaises(_SimulatedCrash):
+            consumer.run_once()
+
+        # 预留位已经在外部调用之前独立提交，"进程崩溃"不会把它清空。
+        row = self.query(
+            "SELECT dispatch_reserved_kind, card_id, delivery_consumed_sequence "
+            "FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "card_create")
+        self.assertIsNone(row[1])
+        self.assertEqual(row[2], 0, "游标没有推进——这个 started 事件下一轮还会被看到")
+
+        # "重启"后的下一轮消费者：预留位卡住的任务必须被排除在正常消费之外，
+        # 不能因为看到同一个 started 事件又调用一次 create()。
+        safe_cards = RecordingCards()
+        recovered_consumer = DeliveryConsumer(queue=self.queue, cards=safe_cards, texts=texts)
+        processed = recovered_consumer.run_once()
+        self.assertEqual(processed, 0, "uncertain 任务不进入正常候选列表")
+        self.assertEqual(len(safe_cards.create_calls), 0, "不得自动重发造成重复结果")
+
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual(len(uncertain), 1)
+        self.assertEqual(uncertain[0].task_id, "tsk-1")
+        self.assertEqual(uncertain[0].reserved_kind, "card_create")
+
+    def test_a_crash_during_terminal_finish_does_not_fall_back_to_a_duplicate_text(self) -> None:
+        """本 Story 自查发现的边界：卡片已经建成、终态更新+关闭这一步崩溃后，下一轮
+        绝不能把"重放会被 CardKit 拒绝"误判成"卡片链路失败"从而改发一条文本终态
+        ——那样会在卡片其实已经送达之后又多发一次结果，是跨通道的重复投递。
+        """
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1")
+
+        crashing_cards = RaisingCardsMidFinish()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=crashing_cards, texts=texts)
+        with self.assertRaises(_SimulatedCrash):
+            consumer.run_once()
+
+        row = self.query(
+            "SELECT dispatch_reserved_kind, card_id, fallback_text, status "
+            "FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "card_finish", "预留位必须在外部调用之前独立提交")
+        self.assertEqual(row[1], "card-1", "建卡本身在崩溃之前已经成功并持久化")
+        self.assertFalse(row[2], "还没有明确失败，不能标记为已降级")
+        self.assertEqual(row[3], "awaiting_delivery")
+
+        # "重启"后的下一轮：uncertain 任务必须被排除在正常消费之外，既不能重新调用
+        # update/close（会撞上 CardKit 的 300317），也绝不能改发一条文本终态。
+        safe_cards = RecordingCards()
+        recovered = DeliveryConsumer(queue=self.queue, cards=safe_cards, texts=texts)
+        processed = recovered.run_once()
+        self.assertEqual(processed, 0)
+        self.assertEqual(len(safe_cards.update_calls), 0)
+        self.assertEqual(len(safe_cards.close_calls), 0)
+        self.assertEqual(texts.calls, [], "不得因为终态更新崩溃就改发文本终态")
+
+        uncertain = self.queue.list_uncertain_delivery_tasks()
+        self.assertEqual([task.reserved_kind for task in uncertain], ["card_finish"])
+
+    def test_clearing_the_reservation_by_hand_makes_the_task_processable_again(self) -> None:
+        """人工核对后清空预留位是唯一的恢复路径；清空之后消费恢复正常。"""
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1")
+        self.queue.reserve_dispatch(task_id="tsk-1", kind="card_create")
+
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+        self.assertEqual(len(cards.create_calls), 0, "预留位没清空前不得外发")
+
+        self.queue.clear_dispatch_reservation(task_id="tsk-1")
+        consumer.run_once()
+        self.assertEqual(len(cards.create_calls), 1, "人工清空预留位后恢复正常消费")
+
+
+class RateLimitingTests(DeliveryConsumerTestCase):
+    """`V-卡片-02`：单话题 500ms 内的中间更新帧被抑制，不产生外部调用。"""
+
+    def test_topic_updates_are_throttled_within_the_same_round(self) -> None:
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        for index in range(1, 4):
+            self.queue.append_delivery_event(
+                task_id="tsk-1", worker_id="worker-1", event_type="progress",
+                idempotency_key=f"tsk-1:a1:progress:{index}", elapsed_seconds=index,
+            )
+
+        # 注入受控时钟：建卡消费掉话题的首个限流名额后，三次 progress 全部落在
+        # 500ms 窗口内，只有窗口之外的最后一次应当被放行——用真实 wall clock 断言
+        # 这一点会不稳定（取决于本轮实际跑了多久），因此不依赖真实时间流逝。
+        clock = [0.0]
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+        )
+        consumer.run_once()
+
+        self.assertEqual(len(cards.update_calls), 0, "建卡本身消费了首个限流名额，同一时刻的更新被抑制")
+        cursor = self.scalar("SELECT delivery_consumed_sequence FROM task WHERE id='tsk-1'")
+        self.assertEqual(cursor, 4, "游标必须推进到最后一个序号，即使更新被限流抑制")
+
+        # 时钟前进超过 500ms 后的下一轮：限流解除，用最新状态发一次更新。
+        clock[0] = 0.6
+        self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:4", elapsed_seconds=9,
+        )
+        consumer.run_once()
+        self.assertEqual(len(cards.update_calls), 1, "窗口之外的更新应当被放行")
+
+
+class DeliveryExpiredNoticeTests(DeliveryConsumerTestCase):
+    """`V-投递-06` 后半句：到期只在用户下一条主动消息上提示一次。"""
+
+    def test_consume_notice_is_one_shot(self) -> None:
+        from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        # 直接插入一条已经过期的 terminal 行（跳过真实二十四小时等待）：触发器锁定
+        # created_at 只在 INSERT 时可以自由指定，UPDATE 会被拒绝（0059 冻结的不变量），
+        # 因此必须在插入时就回填，不能先正常写入再改时间。
+        self.execute(
+            """
+            INSERT INTO task_delivery_event
+                (id, task_id, sequence, event_type, terminal_kind, content,
+                 worker_id, idempotency_key, created_at)
+            VALUES ('tde-tsk-1-2','tsk-1',2,'terminal','success','已送达的答案',
+                    'worker-1','tsk-1:terminal', now() - interval '25 hours')
+            """
+        )
+        self.execute("UPDATE task SET status = 'awaiting_delivery' WHERE id = 'tsk-1'")
+        expired = self.queue.expire_undelivered_terminals()
+        self.assertEqual([task.task_id for task in expired], ["tsk-1"])
+
+        store = PostgresGatewayStore(self._dsn)
+        with store.transaction() as tx:
+            first = tx.consume_delivery_expired_notice(conversation_id="cnv-1")
+        with store.transaction() as tx:
+            second = tx.consume_delivery_expired_notice(conversation_id="cnv-1")
+
+        self.assertTrue(first, "有一条到期未提示的任务，第一次应当命中")
+        self.assertFalse(second, "同一次到期只提示一次")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

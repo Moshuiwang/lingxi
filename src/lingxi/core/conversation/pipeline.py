@@ -318,6 +318,15 @@ class EventPipeline:
                 thread_id=message.thread_id,
             )
 
+            # 用户这次主动发消息：如果这个话题上一次问数因二十四小时未获得
+            # platform_received 而到期（`delivery_expired`），且还没提示过，就在这里
+            # 提示一次「请重新提问」（Issue #152、`V-投递-06` 后半句）。这条检查
+            # **不影响**当前消息接下来按第 5～7 步的正常处理——用户这条消息该入队
+            # 还是入队，该被判忙碌还是判忙碌，过期提示只是额外追加的一条回复，且
+            # 只提示一次，不主动推送、不重放旧答案。
+            if tx.consume_delivery_expired_notice(conversation_id=conversation.conversation_id):
+                deferred.append(self._texts.catalog.text("gateway.delivery_expired"))
+
             # —— 第 5 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)
 
