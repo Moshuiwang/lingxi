@@ -33,7 +33,7 @@ from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTas
 
 from lingxi.apps.liveness import touch_liveness
 
-from .config import WorkerConfig, WorkerConfigError, load_config
+from .config import ENV_PREFIX, WorkerConfig, WorkerConfigError, load_config
 from .report import config_error_report
 from .session_cleanup import default_session_root
 from .turn import WorkerTurnExecutor
@@ -77,6 +77,18 @@ def main(
         if not dsn:
             message = "队列 worker 缺少 LINGXI_POSTGRES_DSN"
             _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
+            _emit(out, config_error_report(trace_id=config.trace_id, message=message))
+            return EXIT_CONFIG_ERROR
+        # Issue #177：工作目录预检必须在宣告"队列 worker 已启动"之前完成——否则
+        # 一条 worker.queue.start 日志会紧跟着一条启动失败，误导成"先启动、后
+        # 失败"，而实际上这个进程从未真正进入过可用状态。
+        if config.workspace is not None and not _ensure_worker_workspace(
+            config.workspace, err=err, trace_id=config.trace_id
+        ):
+            message = (
+                f"{ENV_PREFIX}WORKSPACE 不可用：既不存在也无法创建，或存在但不是"
+                "可写目录"
+            )
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
         _log(
@@ -256,6 +268,52 @@ def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], 
         touch_liveness(liveness_role)
 
     return combined
+
+
+def _ensure_worker_workspace(workspace: str, *, err: TextIO, trace_id: str) -> bool:
+    """队列模式启动预检：显式配置的 ``LINGXI_WORKER_WORKSPACE`` 必须存在且可写
+    （Issue #177）。
+
+    S-A-07 r3 实测：部署配置显式指向一个容器内不存在的目录时，Agent SDK 子进程
+    起不来，每个回合都在约一秒内落成同一种泛化 ``session_failed``——容器 health
+    仍然正常、Gateway 也正常投递失败卡片，运维因此无法从任何可观察面把"本地
+    工作目录无效"与"会话/模型真的失败了"区分开（见 Issue 正文）。
+
+    这里不猜测、不吞掉这类配置错误：不存在就尝试就地创建（``mkdir -p``，只作用
+    于这一个已经显式配置的路径本身，不额外派生或改写成别的路径）；创建失败，
+    或者路径存在但不是一个可写目录，队列 worker 直接启动失败退出——绝不让
+    进程带着一个坏掉的工作目录进入"每个回合都可能重演同一种失败"的运行状态。
+
+    只有**显式**配置了 ``LINGXI_WORKER_WORKSPACE`` 时才会走到这里（调用方已经
+    判过 ``config.workspace is not None``）：不显式配置时 Agent SDK 用自己的
+    默认工作目录，不属于本次预检的范围。
+    """
+
+    path = Path(workspace)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        _log(
+            err,
+            trace_id,
+            "error",
+            "worker.queue.workspace.unavailable",
+            reason="create_failed",
+            workspace_path_length=len(workspace),
+            error=type(error).__name__,
+        )
+        return False
+    if not path.is_dir() or not os.access(path, os.W_OK):
+        _log(
+            err,
+            trace_id,
+            "error",
+            "worker.queue.workspace.unavailable",
+            reason="not_a_writable_directory",
+            workspace_path_length=len(workspace),
+        )
+        return False
+    return True
 
 
 def _resolve_session_root(config: WorkerConfig, env: Mapping[str, str]) -> Path | None:

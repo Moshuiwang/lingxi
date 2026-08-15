@@ -24,7 +24,8 @@ from lingxi.core.conversation.ports import (
     UserRecord,
     UserState,
 )
-from lingxi.core.delivery.ports import DeliveryEventType, resolve_delivered_outcome
+from lingxi.config.content import ContentCatalog, default_content_catalog
+from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, resolve_delivered_outcome
 from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
@@ -523,6 +524,26 @@ class SessionCleanupTask:
 # 每约 2 秒的收口轮询一次）比较后留出的宽裕量，不是精确调校值。
 _IDLE_SESSION_CLEANUP_SWEEP_LIMIT = 500
 
+# 三条"系统代为收口"路径共用的哨兵 worker_id（Issue #178）：``reclaim_stale``
+# 的心跳超时终态分支、``reclaim_queued``、``fail_unavailable_versions`` 收口的
+# 任务从未被一个仍然存活的 worker 正常执行完，没有真实持有者可以填进
+# ``task_delivery_event.worker_id``。该列只是 ``TEXT NOT NULL``，没有指向任何
+# "worker" 表的外键（迁移 0059），写一个固定、可在诊断查询里一眼认出的哨兵值
+# 即可，不影响 Gateway 消费循环（它不按 worker_id 过滤）。
+_SYSTEM_DELIVERY_WORKER_ID = "system"
+
+# error_kind → 用户可见文案键：全部复用 config/content.toml 已经登记、已过产品
+# 审校的既有文案（Issue #178 明确要求"走 config/content 既有文案机制"，不发明
+# 新文案）。`worker.queued_timeout`/`worker.version_unavailable` 在本次修复前
+# 从未被任何生产代码引用过——它们是 #151 outbox 改造时被遗留的"文案已经写好、
+# 但没有任何路径真正投递"的孤儿键，本次修复是它们第一次被真正渲染发出。
+_SYSTEM_TERMINAL_CONTENT_KEYS: dict[str, str] = {
+    "queued_timeout": "worker.queued_timeout",
+    "worker_version_unavailable": "worker.version_unavailable",
+    "retry_exhausted": "worker.running_timeout",
+    "side_effect_uncertain": "worker.side_effect_uncertain",
+}
+
 
 class PostgresTaskQueue:
     """worker 与 scheduler 侧的队列操作。
@@ -531,9 +552,20 @@ class PostgresTaskQueue:
     factory；没有连接字符串或 psycopg 直连旁路。
     """
 
-    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
+        content_catalog: ContentCatalog | None = None,
+    ) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
+        # 系统代为收口路径（见下 `_write_system_terminal`）渲染用户可见文案要用到
+        # 目录；默认与 `apps.worker.service.WorkerService` 相同的
+        # `default_content_catalog()`（lru_cache，全进程唯一实例），调用方可注入
+        # 假目录做测试，不需要为此单独构造一个 worker 实体。
+        self._content_catalog = content_catalog or default_content_catalog()
 
     @staticmethod
     def _queue_overwritten_session(
@@ -822,25 +854,23 @@ class PostgresTaskQueue:
                         requeued.append(task_id)
                         continue
                     error_kind = "side_effect_uncertain" if side_effect_state != "none" else "retry_exhausted"
-                    cursor.execute(
-                        """
-                        UPDATE task SET status = 'failed', ended_at = now(), error_kind = %s
-                         WHERE id = %s AND status = 'running'
-                        """,
-                        (error_kind, task_id),
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE conversation SET running_task_id = NULL, last_task_ended_at = now()
-                         WHERE id = %s AND running_task_id = %s
-                        """,
-                        (conversation_id, task_id),
-                    )
+                    # Issue #178（红线）：这个任务从未被一个仍然存活的 worker 正常
+                    # 收口——旧实现在这里直接把 task 记 failed 并释放话题，跳过了
+                    # outbox，用户永远收不到终态。改为写出与真实 worker 完全同型的
+                    # 投递事件序列并转入 awaiting_delivery，见
+                    # `_write_system_terminal` 的说明。
+                    if not self._write_system_terminal(
+                        cursor,
+                        task_id=task_id,
+                        error_kind=error_kind,
+                        from_status="running",
+                    ):
+                        continue  # pragma: no cover - 见该方法文档的竞态防御说明
                     terminal.append(
                         TerminalTask(
                             task_id=task_id,
                             conversation_id=conversation_id,
-                            status="failed",
+                            status="awaiting_delivery",
                             error_kind=error_kind,
                         )
                     )
@@ -922,29 +952,121 @@ class PostgresTaskQueue:
                 cursor.execute(sql, params)
                 rows = cursor.fetchall()
                 for task_id, conversation_id in rows:
-                    cursor.execute(
-                        """
-                        UPDATE task SET status = 'failed', ended_at = now(), error_kind = %s
-                         WHERE id = %s AND status = 'queued'
-                        """,
-                        (error_kind, task_id),
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE conversation SET running_task_id = NULL, last_task_ended_at = now()
-                         WHERE id = %s AND running_task_id = %s
-                        """,
-                        (conversation_id, task_id),
-                    )
+                    # Issue #178（红线）：见 `reclaim_stale` 同一处注释——这个任务
+                    # 从未被任何 worker 领取过，同样必须写出唯一、可投递的用户
+                    # 终态，不能只改 task.status 就直接释放话题。
+                    if not self._write_system_terminal(
+                        cursor,
+                        task_id=task_id,
+                        error_kind=error_kind,
+                        from_status="queued",
+                    ):
+                        continue  # pragma: no cover - 见该方法文档的竞态防御说明
                     terminals.append(
                         TerminalTask(
                             task_id=task_id,
                             conversation_id=conversation_id,
-                            status="failed",
+                            status="awaiting_delivery",
                             error_kind=error_kind,
                         )
                     )
         return terminals
+
+    def _write_system_terminal(
+        self,
+        cursor: Any,
+        *,
+        task_id: str,
+        error_kind: str,
+        from_status: str,
+    ) -> bool:
+        """系统代为收口一个从未被真实 worker 正常执行完的任务时，写出与真实
+        worker 完全同型的投递事件序列并转入 ``awaiting_delivery``（Issue #178：
+        ``reclaim_stale`` 的心跳超时终态分支、``reclaim_queued``、
+        ``fail_unavailable_versions`` 此前只改 ``task.status`` 就直接把话题
+        释放掉，跳过了 outbox——数据库里任务已经"结束"，但没有任何可投递的
+        终态，用户永远停在处理态收不到结果）。
+
+        **调用方必须已经用 ``SELECT ... FOR UPDATE [SKIP LOCKED]`` 锁定了这一
+        行**（``reclaim_stale``/``_fail_queued`` 的既有查询本来就这样做）：这里
+        只按 ``status = from_status`` 再确认一次并原子转移，不重复获取锁。
+
+        **不释放 ``conversation.running_task_id``**：话题继续占用，直到 Gateway
+        消费 outbox 并调用 ``confirm_delivery``，或二十四小时到期兜底
+        （``expire_undelivered_terminals``）——与真实 worker 通过
+        ``write_terminal_event`` 收口的既有语义完全一致（#151/#152 状态合同），
+        也是"Gateway 不可用时由既有 24 小时到期路径兜底为 delivery_expired"
+        这句话能够成立的唯一原因：这条路径复用的是同一张 outbox 表和同一组
+        到期/确认机制，不是另起一套。
+
+        **必须先写一条 ``started`` 事件，再写 ``terminal``，不能只写终态**：
+        Gateway 消费循环（``apps/gateway/delivery.py`` 的 ``_handle_terminal``）
+        只在 ``stream.card_id is not None`` 或 ``stream.fallback_needed`` 为真
+        时才会建卡或走文本兜底；一个从未出现过 ``started`` 事件的任务两者都是
+        假，终态事件会被无声消费（游标推进）而不产生任何外发，任务只能在
+        ``awaiting_delivery`` 里静默沉底、靠 24 小时到期兜底才勉强收口——这正是
+        本次要修复的"用户永远收不到终态"换一个更晚的时间点重演。写一条与真实
+        worker 完全同形的 ``started``（不带正文，只是一个让 Gateway 建卡/判定
+        兜底的信号）事件，复用的是已经过 #152 完整测试的既有消费路径，不需要
+        改 Gateway 或卡片协议的任何一行代码。
+
+        幂等：``started``/``terminal`` 各自用固定的 idempotency_key（与真实
+        worker 写终态时用的 ``f"{task_id}:terminal"`` 同一形状），重复调用
+        （同一批任务被 housekeeping 轮询两次、或写到一半崩溃后整个事务回滚重来）
+        不会产生第二条事件——理论上不该发生第二次调用还命中已存在的终态
+        （命中即说明状态已经离开 ``from_status``，行锁下不会被再次选中），但
+        仍然按既有 `append_delivery_event`/`write_terminal_event` 同一原则做
+        防御性检查，返回 ``False`` 表示"这一行已经被处理过，调用方不应该把它
+        算作这一轮新产生的终态"。
+        """
+
+        content_key = _SYSTEM_TERMINAL_CONTENT_KEYS.get(error_kind)
+        if content_key is None:
+            raise ValueError(f"没有为 error_kind={error_kind!r} 登记用户可见文案键")
+        content = self._content_catalog.text(content_key).text
+
+        started_key = f"{task_id}:system:started"
+        if self._find_by_idempotency_key(cursor, started_key) is None:
+            self._insert_new_event(
+                cursor,
+                task_id=task_id,
+                worker_id=_SYSTEM_DELIVERY_WORKER_ID,
+                event_type=DeliveryEventType.STARTED.value,
+                idempotency_key=started_key,
+                terminal_kind=None,
+                error_kind=None,
+                elapsed_seconds=None,
+                content=None,
+            )
+
+        terminal_key = f"{task_id}:terminal"
+        if self._find_by_idempotency_key(cursor, terminal_key) is not None:
+            return False
+
+        self._insert_new_event(
+            cursor,
+            task_id=task_id,
+            worker_id=_SYSTEM_DELIVERY_WORKER_ID,
+            event_type=DeliveryEventType.TERMINAL.value,
+            idempotency_key=terminal_key,
+            terminal_kind=TerminalKind.FAILED.value,
+            error_kind=error_kind,
+            elapsed_seconds=None,
+            content=content,
+        )
+        cursor.execute(
+            """
+            UPDATE task SET status = 'awaiting_delivery', error_kind = %s, ended_at = now()
+             WHERE id = %s AND status = %s
+            """,
+            (error_kind, task_id, from_status),
+        )
+        if cursor.rowcount != 1:
+            # 上面的 FOR UPDATE 已经锁定并校验过状态；到这里还失败说明状态机被
+            # 绕过，宁可响亮失败也不要悄悄不释放/不占用（与 write_terminal_event
+            # 的既有处理方式一致）。
+            raise RuntimeError(f"任务 {task_id} 在系统代为收口时状态发生了竞态")
+        return True
 
     # -----------------------------------------------------------------
     # 投递事件 outbox（Issue #151）

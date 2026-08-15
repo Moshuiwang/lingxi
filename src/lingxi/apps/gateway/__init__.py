@@ -41,6 +41,7 @@ from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 
 from .config import GatewayConfig, GatewayConfigError, load_config
+from .log_redaction import install_credential_redaction
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +306,11 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     """
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    # Issue #176（安全）：第三方飞书 SDK 建立长连接后会以 INFO 级别打印带认证
+    # 查询参数的完整 URL；必须在它有机会真正记一条日志之前就把两层脱敏都装好，
+    # 因此紧跟在 basicConfig 之后、任何可能触发连接的代码之前调用。见
+    # apps/gateway/log_redaction.py 模块头部说明。
+    install_credential_redaction()
     try:
         config = load_config(env if env is not None else os.environ)
     except GatewayConfigError as error:
