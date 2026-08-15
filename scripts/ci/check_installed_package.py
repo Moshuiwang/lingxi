@@ -127,6 +127,9 @@ REQUIRED_MODULES = (
     # 消费循环编排，各自都在制品里必须能 import。
     "lingxi.adapters.feishu_delivery",
     "lingxi.apps.gateway.delivery",
+    # 第三方飞书 SDK 连接日志的凭据脱敏（Issue #176），在 gateway main() 装配时
+    # 调用，制品必须真的带上这个模块。
+    "lingxi.apps.gateway.log_redaction",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -355,6 +358,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.execution",
             "lingxi.core.execution.card_stream",
             "lingxi.core.ids",
+            # 第三方 SDK 连接日志的凭据脱敏（Issue #176），main() 顶层 import；
+            # 复用 core.execution.audit 里唯一一份查询参数脱敏纯函数，该模块又
+            # 模块级依赖 core.execution.tool_policy（DenyReasonCode 等审计形状），
+            # 因此这条链一并登记。
+            "lingxi.apps.gateway.log_redaction",
+            "lingxi.core.execution.audit",
+            "lingxi.core.execution.tool_policy",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
         # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import

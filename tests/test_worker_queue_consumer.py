@@ -942,22 +942,86 @@ class RealQueueTerminalTests(unittest.TestCase):
             with connection.transaction():
                 connection.execute(sql, parameters)
 
-    def test_queued_without_worker_is_failed_and_releases_topic(self) -> None:
+    def _terminal_event(self, task_id: str) -> tuple[str, str, str] | None:
+        """按 ``task_id`` 读回它的 ``terminal`` 投递事件；不存在则 ``None``。
+
+        返回 ``(terminal_kind, error_kind, content)`` 三元组，用于 Issue #178
+        的一组断言：系统代为收口路径必须写出唯一、可投递、内容诚实的终态事件，
+        不能只改 ``task.status``。
+        """
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                """SELECT terminal_kind, error_kind, content FROM task_delivery_event
+                   WHERE task_id = %s AND event_type = 'terminal'""",
+                (task_id,),
+            ).fetchone()
+        return tuple(row) if row is not None else None
+
+    def _event_count(self, task_id: str) -> int:
+        with connect(DSN) as connection:
+            return connection.execute(
+                "SELECT count(*) FROM task_delivery_event WHERE task_id = %s", (task_id,)
+            ).fetchone()[0]
+
+    def test_queued_without_worker_writes_an_honest_terminal_event_and_keeps_the_topic(
+        self,
+    ) -> None:
+        """Issue #178（红线）：系统代为收口不得只改 task.status——必须写出唯一、
+        可投递的用户终态事件，交给 Gateway 正常投递，confirm 后才释放话题。
+        """
+
         self._insert_old_task(task_id="tsk-q", conversation_id="cnv-q")
         terminals = self.queue.reclaim_queued(max_wait=timedelta(minutes=3))
         self.assertEqual([item.error_kind for item in terminals], ["queued_timeout"])
+        self.assertEqual([item.status for item in terminals], ["awaiting_delivery"])
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-q'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
+            # 话题继续占用：还没有人确认送达，同一话题的下一条消息不该被放行
+            # 进来抢占——与真实 worker 写 terminal 事件后的既有语义一致。
+            self.assertEqual(
+                connection.execute(
+                    "SELECT running_task_id FROM conversation WHERE id='cnv-q'"
+                ).fetchone()[0],
+                "tsk-q",
+            )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-q")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "queued_timeout")
+        self.assertEqual(content, default_content_catalog().text("worker.queued_timeout").text)
+        # 唯一：started + terminal，不多不少；确认 Gateway 真的有内容可读。
+        self.assertEqual(self._event_count("tsk-q"), 2)
+
+        # 幂等：housekeeping 重复轮询（进程重启、下一轮 poll）不得再产生第二条
+        # 终态——命中已判过的这一批时，`reclaim_queued` 的查询条件
+        # （`status='queued'`）天然不会再选中它，返回空列表；事件表行数不变。
+        again = self.queue.reclaim_queued(max_wait=timedelta(minutes=3))
+        self.assertEqual(again, [])
+        self.assertEqual(self._event_count("tsk-q"), 2)
+
+        # 闭环：Gateway 消费 outbox 后调用 confirm_delivery，业务终态才真正收敛
+        # 为 failed 并释放话题——不是这条收口路径自己直接释放。
+        confirmed = self.queue.confirm_delivery(
+            task_id="tsk-q", platform_message_kind="text", platform_message_id="om_fake_q"
+        )
+        self.assertTrue(confirmed)
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT status, error_kind FROM task WHERE id='tsk-q'"
+            ).fetchone()
+            self.assertEqual(tuple(row), ("failed", "queued_timeout"))
             self.assertIsNone(
                 connection.execute(
                     "SELECT running_task_id FROM conversation WHERE id='cnv-q'"
                 ).fetchone()[0]
             )
 
-    def test_unavailable_version_is_not_changed_to_stable(self) -> None:
+    def test_unavailable_version_writes_an_honest_terminal_event_and_does_not_change_version(
+        self,
+    ) -> None:
         self._insert_old_task(task_id="tsk-c", conversation_id="cnv-c", version="canary")
         self._insert_old_task(task_id="tsk-s", conversation_id="cnv-s", version="stable")
         terminals = self.queue.fail_unavailable_versions(
@@ -968,19 +1032,31 @@ class RealQueueTerminalTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT status,target_worker_version FROM task WHERE id='tsk-c'"
             ).fetchone()
-            self.assertEqual(row, ("failed", "canary"))
+            self.assertEqual(row, ("awaiting_delivery", "canary"))
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-s'").fetchone()[0],
                 "queued",
             )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-c")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "worker_version_unavailable")
+        self.assertEqual(
+            content, default_content_catalog().text("worker.version_unavailable").text
+        )
+        # 没被判定不可用的 canary 版本本身不该凭空出现终态事件。
+        self.assertIsNone(self._terminal_event("tsk-s"))
 
-    def test_stale_safe_retry_then_exhaustion_and_side_effect_no_replay(self) -> None:
+    def test_stale_safe_retry_then_exhaustion_writes_terminal_events_and_no_replay(
+        self,
+    ) -> None:
         self._insert_old_task(
             task_id="tsk-r", conversation_id="cnv-r", status="running", attempts=1
         )
         self.assertEqual(
             self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"]
         )
+        # 安全重试的第一轮回到 queued，不写终态事件——不是这条路径要收口的对象。
+        self.assertIsNone(self._terminal_event("tsk-r"))
         claimed = self.queue.claim(worker_id="worker-2", target_worker_version="stable")
         self.assertEqual(claimed[0].attempts, 2)
         with connect(DSN) as connection:
@@ -992,13 +1068,19 @@ class RealQueueTerminalTests(unittest.TestCase):
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-r'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
-            self.assertIsNone(
+            # 重试耗尽是终态收口，话题继续占用直到投递解析。
+            self.assertEqual(
                 connection.execute(
                     "SELECT running_task_id FROM conversation WHERE id='cnv-r'"
-                ).fetchone()[0]
+                ).fetchone()[0],
+                "tsk-r",
             )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-r")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "retry_exhausted")
+        self.assertEqual(content, default_content_catalog().text("worker.running_timeout").text)
 
         self._insert_old_task(
             task_id="tsk-x",
@@ -1011,8 +1093,14 @@ class RealQueueTerminalTests(unittest.TestCase):
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-x'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
+        x_terminal_kind, x_error_kind, x_content = self._terminal_event("tsk-x")
+        self.assertEqual(x_terminal_kind, "failed")
+        self.assertEqual(x_error_kind, "side_effect_uncertain")
+        self.assertEqual(
+            x_content, default_content_catalog().text("worker.side_effect_uncertain").text
+        )
 
     def test_listener_receives_committed_notify(self) -> None:
         assert DSN is not None
