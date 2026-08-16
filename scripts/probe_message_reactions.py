@@ -50,9 +50,14 @@ _MAX_PAGES = 20
 
 
 def message_id_suffix(message_id: str) -> str:
-    """只保留末 6 位供肉眼对齐，整段消息标识不进输出。"""
+    """只保留末 6 位供肉眼对齐，整段消息标识不进输出。
 
-    return f"…{message_id[-6:]}" if len(message_id) > 6 else message_id
+    短标识（≤6 位，真实飞书 message_id 不会这么短）无条件退化成占位符而不是
+    原样回显（独立审核 F11）：这条纪律的意义在于"完整标识永远不进 stdout"，
+    不在于"通常不进"。
+    """
+
+    return f"…{message_id[-6:]}" if len(message_id) > 6 else "…"
 
 
 def summarize_reactions(items: Iterable[Any]) -> dict[str, Any]:
@@ -153,8 +158,15 @@ def main(argv: list[str] | None = None, *, client: Any = None) -> int:
 
     try:
         summary = summarize_reactions(_list_reaction_pages(client, message_id))
-    except RuntimeError as error:
-        print(str(error), file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - 探针必须以文档化退出码收口（独立审核 F4）
+        # lark-oapi 的传输层不包网络异常：DNS 抖动 / 超时会以 requests 异常原样
+        # 穿透 list 调用，只接 RuntimeError 会让探针带着裸 traceback（可能含请求
+        # URL）崩溃在文档化退出码之外，验收者无法区分"探针坏了"和"平台失败"。
+        # 出口统一过自由文本脱敏并截断，RuntimeError 分支（含飞书 code/log_id）
+        # 同样适用——那段文本本就不含凭据，脱敏是幂等的。
+        from lingxi.core.execution.audit import redact_free_text
+
+        print(redact_free_text(f"{type(error).__name__}: {error}")[:300], file=sys.stderr)
         return 1
 
     print(

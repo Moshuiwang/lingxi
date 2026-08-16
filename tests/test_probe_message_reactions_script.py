@@ -190,6 +190,27 @@ class MainTests(unittest.TestCase):
         self.assertIn("99991672", err)
         self.assertIn("lgid_test", err)
 
+    def test_a_network_error_also_exits_1_instead_of_crashing(self) -> None:
+        """独立审核 F4：lark-oapi 传输层不包网络异常，DNS 抖动/超时会以 requests
+        异常原样穿透 list 调用——探针必须以文档化退出码收口，而不是裸 traceback
+        （可能含请求 URL）崩在 0/1/2 契约之外。"""
+
+        class _RaisingClient(_FakeClient):
+            def _list(self, request):
+                raise ConnectionError("dns hiccup on stage")
+
+        code, _, err = self._run(["om_x"], _RaisingClient([]))
+        self.assertEqual(code, 1)
+        self.assertIn("ConnectionError", err)
+
+    def test_a_short_message_id_is_not_echoed_in_full(self) -> None:
+        """独立审核 F11：纪律是"完整标识永远不进 stdout"，短标识退化成占位符。"""
+
+        client = _FakeClient([_FakeResponse(items=[])])
+        code, out, _ = self._run(["om_x"], client)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["message_id_suffix"], "…")
+
     def test_missing_credentials_exit_2_without_touching_the_network(self) -> None:
         out, err = io.StringIO(), io.StringIO()
         with patch.dict("os.environ", {}, clear=True):

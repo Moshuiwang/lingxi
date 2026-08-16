@@ -77,10 +77,23 @@ class _LoggingAudit:
     的证据就是 ``reaction.failed`` 这一行审计——它淹没在 INFO 级正常流水里，验收
     没有捕获到，问题因此无法定位。级别只影响日志可见性，动作名与字段不变，
     重放脚本 ``_AuditCapture``（level=INFO 的 Handler）仍照常收到这些记录。
+
+    后缀规则之外还有一个显式名单（独立审核 F5）：``message.unsupported_type``
+    不以失败后缀结尾，但它是"用户发了消息却什么都没发生"的唯一入站侧证据
+    （非文本消息被判不支持、不建任务）——r19 首轮误判正是这一类。名单只收
+    "用户得不到任何回应"的动作；有明确用户回复的拒绝分支（未开通、已停用、
+    群聊拒绝）不在此列，停机期间的 ``reply.skipped_while_stopping`` 属正常
+    停机路径，也不在此列。
     """
 
+    _EXTRA_WARNING_ACTIONS = frozenset({"message.unsupported_type"})
+
     def record(self, action: str, /, **fields: object) -> None:
-        log = logger.warning if action.endswith(("failed", "error", "unparsable")) else logger.info
+        promote = (
+            action.endswith(("failed", "error", "unparsable"))
+            or action in self._EXTRA_WARNING_ACTIONS
+        )
+        log = logger.warning if promote else logger.info
         log("audit %s %s", action, fields)
 
 

@@ -124,6 +124,16 @@ class ValidateEnvelopeTests(unittest.TestCase):
         self.assertIn("event.message.message_type", message)
         self.assertIn("'text'", message)
 
+    def test_padded_text_message_type_is_rejected(self) -> None:
+        """独立审核 F6：生产解析 ``message_text`` 用原值比较，``"text "`` 会被判成
+        非文本、正文提取为空——校验必须与生产同口径做精确比较，strip 后放行会让
+        重放悄悄变成一个空问题任务。"""
+
+        payload = _envelope(message_type="text ")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("event.message.message_type", str(raised.exception))
+
 
 class AuditCaptureTests(unittest.TestCase):
     def setUp(self) -> None:

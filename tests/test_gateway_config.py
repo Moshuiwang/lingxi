@@ -401,6 +401,17 @@ class LoggingAuditLevelTests(unittest.TestCase):
         self.assertTrue(captured.output[0].startswith("WARNING"))
         self.assertIn("reaction.failed", captured.output[0])
 
+    def test_unsupported_message_type_logs_at_warning(self) -> None:
+        """独立审核 F5：``message.unsupported_type`` 不以失败后缀结尾，但它是
+        "用户发了消息却什么都没发生"的唯一入站侧证据（r19 首轮误判正是这一类），
+        必须进 WARNING 显式名单。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+            _LoggingAudit().record("message.unsupported_type")
+        self.assertTrue(captured.output[0].startswith("WARNING"))
+
     def test_normal_actions_stay_at_info(self) -> None:
         from lingxi.apps.gateway import _LoggingAudit
 

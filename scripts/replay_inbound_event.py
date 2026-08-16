@@ -34,10 +34,12 @@ envelope（飞书回调体的原始形状），由验收执行者自备。脚本
 - ``event.message.chat_id``
 - ``event.message.chat_type``：必须是 ``"p2p"``（问数与多轮对话只服务飞书私聊，
   群聊事件在生产入口本身就会被拒绝，重放它测不出幂等）
-- ``event.message.message_type``：必须是 ``"text"``。真实解析路径
-  （``adapters/feishu_events.message_text``）只对文本消息提取正文并创建问数任务；
-  缺失或其他类型会被生产入口判为不支持的消息类型，既不建任务也不产生用户结果，
-  重放它测不出幂等（S-A-07 r19 实测踩过这个坑，Issue #57 评论 5307741204）
+- ``event.message.message_type``：必须**精确等于** ``"text"``（不含任何空白——
+  真实解析 ``adapters/feishu_events.message_text`` 用的是原值比较，``"text "``
+  会被当成非文本，正文提取为空）。非 text 消息在生产入口仍会入库去重、仍会加
+  表情（管线第 2、3 步先于类型检查），但**不创建任务、不产生用户结果**——
+  r19 要验证的问数幂等旅程（一个任务、一条结果）因此测不完整（S-A-07 r19
+  实测踩过这个坑，Issue #57 评论 5307741204）
 - ``event.message.content``：飞书消息体（一段 JSON 字符串）
 
 **用法**（真实凭据只从环境变量读取，不出现在命令行参数里）：
@@ -85,15 +87,22 @@ TEXT_MESSAGE_TYPE = "text"
 def _string_at(payload: object, *path: str) -> str | None:
     """按路径取一个非空字符串字段；缺失、类型不对或空白一律返回 ``None``。"""
 
+    node = _raw_at(payload, *path)
+    if not isinstance(node, str):
+        return None
+    stripped = node.strip()
+    return stripped or None
+
+
+def _raw_at(payload: object, *path: str) -> Any:
+    """按路径取原值，不做 strip：供必须与生产解析同口径的精确比较使用。"""
+
     node: Any = payload
     for key in path:
         if not isinstance(node, dict):
             return None
         node = node.get(key)
-    if not isinstance(node, str):
-        return None
-    stripped = node.strip()
-    return stripped or None
+    return node
 
 
 def validate_envelope(payload: object) -> None:
@@ -139,12 +148,15 @@ def validate_envelope(payload: object) -> None:
             f"（问数与多轮对话只服务飞书私聊，收到 {chat_type!r}）"
         )
 
-    message_type = _string_at(payload, "event", "message", "message_type")
+    # 用**原值**而不是 strip 后的值比较（独立审核 F6）：生产解析
+    # ``message_text`` 是原值比较，``"text "`` 在这里放行的话，重放会变成一个
+    # 空问题任务——正是本校验要防止的"输入问题被误读成产品行为"。
+    message_type = _raw_at(payload, "event", "message", "message_type")
     if message_type != TEXT_MESSAGE_TYPE:
         problems.append(
-            f"event.message.message_type 必须是 {TEXT_MESSAGE_TYPE!r}"
-            f"（真实解析只对文本消息创建问数任务，其他类型会被判为不支持、"
-            f"测不出幂等，收到 {message_type!r}）"
+            f"event.message.message_type 必须精确等于 {TEXT_MESSAGE_TYPE!r}（不含空白；"
+            f"非 text 消息仍会入库去重并加表情，但不创建任务、不产生用户结果，"
+            f"r19 的问数幂等旅程测不完整，收到 {message_type!r}）"
         )
 
     if _string_at(payload, "event", "message", "content") is None:

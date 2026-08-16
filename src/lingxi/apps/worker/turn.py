@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 import time
 
@@ -35,25 +34,23 @@ from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_e
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 
-from .config import WorkerConfig
+from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
 
 _MAX_FAILURE_TEXT = 500
-
-# S-A-07 输出安全 canary（Issue #142）：masked 档位在模型正文没有任何可保留内容
-# 时垫入的合成业务句——没有它，"masked + 空正文"会因为命中区间之外无幸存内容而
-# 滑进 withheld 终态，masked 档位就不再是确定性的。措辞刻意自述身份，用户侧一旦
-# 看到它就知道这一轮是受控验收注入，不是真实业务结论。
-_CANARY_FALLBACK_BODY = "受控验收合成正文：本句由输出安全 canary 注入，保留可展示的业务结论。"
-
 
 def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: str) -> str:
     """把合成 system prompt 确定性注入最终正文，供出口安全约束命中（#142）。
 
     - ``withheld``：整段替换为 system prompt——整串命中覆盖全部正文、无业务内容
       幸存，``constrain_output`` 必然给出 ``withheld=True``；
-    - ``masked``：正文之后追加 system prompt——追加区间被整串命中遮蔽，模型正文
-      幸存，必然 ``blocked=True`` 且 ``withheld=False``。
+    - ``masked``：固定幸存句 + 模型正文（如有）+ system prompt——幸存句不含任何
+      已知敏感模式，且配置期已拒绝"合成提示是幸存句子串"的形态（独立审核 F2/F3），
+      因此**无论模型正文是什么**（哪怕整段都是可遮蔽的标记，例如模型恰好输出
+      ``system prompt`` 字样），幸存句都保证命中区间之外有真实内容，必然
+      ``blocked=True`` 且 ``withheld=False``。第一版实现依赖"模型正文有幸存内容"
+      的运行期判定，独立审核 F3 实证证明可遮蔽正文会让 masked 滑进 withheld——
+      确定性必须由构造保证，不能由模型行为保证。
 
     两个档位都不依赖模型行为：r17 的教训是把触发条件寄托在"模型恰好复述提示词"
     上，真实链路一次都没有触发过。注入发生在 ``build_report``（出口约束所在地）
@@ -62,9 +59,11 @@ def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: s
 
     if mode == "withheld":
         return system_prompt
-    # 与 core.execution.input_safety 的"幸存业务内容"判定同一口径（\w 覆盖字母、
-    # 数字与 CJK）：模型正文只要有任何真实内容就保留它，否则垫入合成业务句。
-    base = final_text if re.search(r"\w", final_text or "", re.UNICODE) else _CANARY_FALLBACK_BODY
+    base = (
+        f"{OUTPUT_SAFETY_CANARY_SURVIVOR_BODY}\n{final_text}"
+        if final_text
+        else OUTPUT_SAFETY_CANARY_SURVIVOR_BODY
+    )
     return f"{base}\n{system_prompt}"
 
 
@@ -251,10 +250,13 @@ class WorkerTurnExecutor:
         )
 
         final_text = recorder.final_text
-        if self._config.output_safety_canary is not None:
-            # 默认关闭；开启时 config 已在启动期保证 system_prompt 非空。注入留
-            # 一条低敏结构化痕迹（不含提示词或正文原文），让验收能从 Worker 日志
-            # 确认"这一轮的安全终态出自 canary，不是真实泄露"。
+        if self._config.output_safety_canary is not None and failure is None:
+            # 默认关闭；开启时 WorkerConfig.__post_init__ 已保证 system_prompt
+            # 非空。**只对没有失败的回合注入**（独立审核 F1）：超时、会话失败、
+            # 中断等真实失败必须保留原样的失败终态——注入会让 withheld 覆盖
+            # 真实失败原因，验收拿到的就是假证据。注入留一条低敏结构化痕迹
+            # （不含提示词或正文原文），让验收能从 Worker 日志确认"这一轮的
+            # 安全终态出自 canary，不是真实泄露"。
             final_text = _inject_output_safety_canary(
                 final_text,
                 mode=self._config.output_safety_canary,
