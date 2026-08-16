@@ -240,7 +240,7 @@ class RedactedTargetSummaryTests(unittest.TestCase):
         self.assertIn("db.example.internal", summary)
         self.assertIn("5432", summary)
         self.assertIn("lingxi_prod", summary)
-        self.assertIn("cli_12", summary, "只回显 app_id 前 6 位，供肉眼核对是哪个飞书应用")
+        self.assertIn("cli_123456", summary, "只回显 app_id 前 10 位，供肉眼核对是哪个飞书应用")
         self.assertNotIn(password, summary)
         self.assertNotIn(dsn, summary, "不得回显完整 DSN")
         self.assertNotIn("sslmode", summary, "查询参数不进摘要")
@@ -261,6 +261,53 @@ class RedactedTargetSummaryTests(unittest.TestCase):
         summary = self.module.redacted_target_summary(config)
 
         self.assertIn("无法解析", summary)
+
+    def test_summary_never_contains_the_password_for_a_keyword_value_dsn(self) -> None:
+        """libpq 的关键字/值写法（``host=... password=...``）没有 ``scheme://``，
+        ``urlsplit`` 解不出 ``netloc``、会把整段原样塞进 ``path``。这条断言要能
+        抓住"忘了先判 netloc 是否非空、直接把 path 当 dbname 打出来"这类回归——
+        独立审核实测：把实现里的 ``if parsed.netloc:`` 改成 ``if True:`` 后，
+        本用例必须变红（已自查，见提交说明）。
+        """
+
+        from lingxi.apps.gateway.config import ENV_PREFIX, load_config
+
+        password = "S3cr3tP@ss-only-for-this-test"
+        dsn = f"host=db.example.internal port=5432 dbname=lingxi_prod user=lingxi password={password}"
+        env = {
+            f"{ENV_PREFIX}APP_ID": "cli_1234567890abcdef",
+            f"{ENV_PREFIX}APP_SECRET": "fake-secret-for-test-only",
+            f"{ENV_PREFIX}POSTGRES_DSN": dsn,
+        }
+        config = load_config(env)
+
+        summary = self.module.redacted_target_summary(config)
+
+        self.assertNotIn(password, summary)
+        self.assertNotIn(dsn, summary, "不得原样回显关键字/值形式的整条 DSN")
+
+    def test_summary_degrades_gracefully_when_the_port_is_not_numeric(self) -> None:
+        """端口段不是合法数字时（如 ``...@host:notaport/db``），``urlsplit`` 切
+        ``netloc`` 本身不报错——只有真的访问 ``.port`` 才会抛未捕获的
+        ``ValueError``，之前会让脚本在打印这行肉眼核对提示的时候直接 traceback
+        中止，而不是退化成占位符。
+        """
+
+        from lingxi.apps.gateway.config import ENV_PREFIX, load_config
+
+        env = {
+            f"{ENV_PREFIX}APP_ID": "cli_1234567890abcdef",
+            f"{ENV_PREFIX}APP_SECRET": "fake-secret-for-test-only",
+            f"{ENV_PREFIX}POSTGRES_DSN": "postgresql://lingxi:pass@db.example.internal:notaport/lingxi_prod",
+        }
+        config = load_config(env)
+
+        summary = self.module.redacted_target_summary(config)  # 不得抛出 ValueError
+
+        self.assertIn("db.example.internal", summary, "host 段本身合法，仍应正常回显")
+        self.assertIn("无法解析", summary, "端口段解析失败时退化为占位符")
+        self.assertNotIn("notaport", summary)
+        self.assertNotIn("pass", summary, "netloc 里的口令片段不得出现在摘要里")
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ envelope（飞书回调体的原始形状），由验收执行者自备。脚本
         /path/to/envelope.json --times 2
 
 **产出**：启动时先在 stderr 打一行不含凭据的目标环境摘要（数据库 host/dbname
-与 app_id 前 6 位，见 ``redacted_target_summary``，独立审核 P3-1），供执行者
+与 app_id 前 10 位，见 ``redacted_target_summary``，独立审核 P3-1），供执行者
 肉眼核对没敲错环境；随后每一轮重放的处理结果摘要（``duplicate`` 标志 + 观察到
 的审计动作名）逐行打印到 stdout。全程不打印凭据、不打印消息正文全文——摘要
 只包含固定的审计动作名称字符串，取自 ``apps.gateway._LoggingAudit`` 的既有
@@ -144,10 +144,23 @@ def redacted_target_summary(config: Any) -> str:
 
     验收执行者在受控环境里手动敲这个脚本，环境变量填错（比如把生产 DSN 当测试
     DSN 用）不会有任何编译期或类型检查能拦住——启动时把连的是哪个 host/dbname、
-    用的是哪个飞书应用（只取 app_id 前 6 位）打出来，供肉眼核对"这是不是我以为
-    的那个受控环境"。只取这两样：口令、查询参数（可能带 ``options``/其它敏感
-    片段）与完整 DSN 一律不进摘要，即便执行者把这行日志贴进工单或聊天记录也
-    不会带出凭据。
+    用的是哪个飞书应用（只取 app_id 前 10 位；飞书 app_id 一律 ``cli_`` 开头，
+    只取 6 位的话剩下能区分的字符太少，10 位足够肉眼辨认是哪个应用，且 app_id
+    本身不是机密）打出来，供肉眼核对"这是不是我以为的那个受控环境"。只取这
+    两样：口令、查询参数（可能带 ``options``/其它敏感片段）与完整 DSN 一律不进
+    摘要，即便执行者把这行日志贴进工单或聊天记录也不会带出凭据。
+
+    两类畸形 DSN 都必须退化成占位符而不是让脚本在打印这行提示的时候就崩溃或
+    漏出凭据（独立审核 P3-1 追加自查）：
+
+    - **非 URL 形态**（如 libpq 的 ``host=h port=5432 ... password=x`` 关键字/
+      值写法）：``urlsplit`` 解不出 ``netloc``，把整段原样塞进 ``path``——必须
+      先判 ``parsed.netloc`` 是否非空，为空就整体退化成占位符，否则会把整段
+      （含 ``password=...``）当成"dbname"打出来，等于没有脱敏。
+    - **端口段不是合法数字**（如 ``...@host:notaport/db``）：``urlsplit`` 切
+      ``netloc`` 时不校验端口内容，只有真的访问 ``.port`` 才会抛
+      ``ValueError``——不能让一份肉眼核对提示因为 DSN 里一个写错的端口就把
+      整个脚本带崩溃退出。
     """
 
     parsed = urllib.parse.urlsplit(str(config.postgres_dsn))
@@ -156,11 +169,16 @@ def redacted_target_summary(config: Any) -> str:
         # netloc 时 urlsplit 会把整段畸形字符串原样塞进 path，直接拿来当
         # dbname 显示等于没有脱敏，宁可整段都退化成占位符。
         host = parsed.hostname or "(无法解析 host)"
-        port = f":{parsed.port}" if parsed.port else ""
+        try:
+            port = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            # 端口段不是合法数字：这里只是一份肉眼核对提示，解析失败就退化
+            # 成占位符，不能让脚本因为一个写错的 DSN 在打印摘要这一步崩溃。
+            port = ":(无法解析 port)"
         dbname = parsed.path.lstrip("/") or "(无法解析 dbname)"
     else:
         host, port, dbname = "(无法解析 host)", "", "(无法解析 dbname)"
-    app_id_prefix = (config.app_id or "")[:6] or "(空)"
+    app_id_prefix = (config.app_id or "")[:10] or "(空)"
     return f"目标数据库={host}{port}/{dbname} 飞书应用 app_id 前缀={app_id_prefix}…"
 
 
