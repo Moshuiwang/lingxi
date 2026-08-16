@@ -55,12 +55,17 @@ reauthorize = ["cryptography==45.0.7", "psycopg[binary]>=3.2,<4", "websockets>=1
 # 绑定层的形状由桩模块锁住。CI 另有一步装上本组做真实冒烟（构造 `HookMatcher`，
 # 不调模型、不用凭据），见 scripts/ci/check_agent_sdk_binding.py。
 worker = ["claude-agent-sdk==0.2.128", "psycopg[binary]>=3.2,<4"]
-# lingxi-gateway 进程（`python -m lingxi.apps.gateway`：飞书长连接接入与任务入队）。
-# 依据是从入口逐个追 import 链：
+# lingxi-gateway 进程（`python -m lingxi.apps.gateway`：飞书长连接接入、任务入队与
+# 投递消费循环）。依据是从入口逐个追 import 链：
 #   lark-oapi → adapters/feishu_longconn.py（ws.Client 建长连接）
 #               adapters/feishu_outbound.py（加表情 message_reaction.create、
 #               回文本 message.reply）
-#   psycopg   → adapters/postgres_conversation.py（会话、任务队列、入站事件幂等）
+#               adapters/feishu_delivery.py（Issue #152：CardKit
+#               cardkit.v1.card.create/update/settings、
+#               cardkit.v1.card_element.content 流式更新、
+#               投递文本兜底 im.v1.message.reply）
+#   psycopg   → adapters/postgres_conversation.py（会话、任务队列、入站事件幂等、
+#               投递 outbox 消费记账）
 #   websockets→ lark-oapi 的 ws 客户端实际用它建 wss（lark_oapi/ws/client.py:12
 #               `import websockets`、:13 `from websockets.exceptions import
 #               InvalidHandshake`）

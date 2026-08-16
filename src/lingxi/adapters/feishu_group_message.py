@@ -78,20 +78,25 @@ class FeishuGroupMessageError(RuntimeError):
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
-def validate_group_chat_id(value: str) -> str:
+def validate_group_chat_id(
+    value: str, *, variable_name: str = "LINGXI_ADMIN_GROUP_CHAT_ID"
+) -> str:
     """校验群 ID 形状；不合法就快速失败，且**不回显取到的值**。
 
     群 ID 本身不是密钥，但它是一个外部标识：错误消息里带上它，就会被日志、CI 输出和
-    工单一路复制出去。只报变量名足以定位问题。
+    工单一路复制出去。只报变量名足以定位问题。``variable_name`` 可覆盖——scheduler
+    与 gateway 各自读取自己命名空间下的变量（`LINGXI_ADMIN_GROUP_CHAT_ID` /
+    `LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`，Issue #153），错误消息必须指向调用方
+    真正读取的那一个，否则会把运维导向去改一个不存在效果的变量。
     """
 
     text = (value or "").strip()
     if not text.startswith(GROUP_CHAT_ID_PREFIX) or len(text) <= len(GROUP_CHAT_ID_PREFIX):
         raise ValueError(
-            f"环境变量 LINGXI_ADMIN_GROUP_CHAT_ID 必须是飞书群 chat_id（以 {GROUP_CHAT_ID_PREFIX} 开头），不回显收到的值"
+            f"环境变量 {variable_name} 必须是飞书群 chat_id（以 {GROUP_CHAT_ID_PREFIX} 开头），不回显收到的值"
         )
     if any(character.isspace() for character in text):
-        raise ValueError("环境变量 LINGXI_ADMIN_GROUP_CHAT_ID 不得包含空白字符，不回显收到的值")
+        raise ValueError(f"环境变量 {variable_name} 不得包含空白字符，不回显收到的值")
     return text
 
 

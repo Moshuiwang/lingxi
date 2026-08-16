@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from typing import Any, Callable, Mapping
 
 from lingxi.adapters.feishu_events import (
@@ -35,12 +36,33 @@ from lingxi.adapters.feishu_longconn import (
     LongConnectionSupervisor,
     TerminationReason,
 )
+from lingxi.apps.liveness import touch_liveness
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
+from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
 
 from .config import GatewayConfig, GatewayConfigError, load_config
+from .log_redaction import install_credential_redaction
 
 logger = logging.getLogger(__name__)
+
+
+def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], None]:
+    """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
+
+    两件事共用同一个触发时机——都是"这条循环这一轮还活着"的证据——但服务不同的
+    消费者：``AlertManager`` 供跨进程重启也能观察到的阈值/去重状态机，活性文件
+    供同容器内的 ``python -m lingxi.apps.healthcheck`` 判断"主循环是否还在跳动"
+    （见 ``apps/liveness.py`` 模块说明）。
+    """
+
+    beat = alerting_duty.heartbeat_callback(liveness_role)
+
+    def combined() -> None:
+        beat()
+        touch_liveness(liveness_role)
+
+    return combined
 
 
 class _LoggingAudit:
@@ -48,10 +70,31 @@ class _LoggingAudit:
 
     ``audit_event`` 表属后续切片；管线只依赖 ``AuditSink`` 的签名，届时换实现不动管线。
     这里**不记录消息正文**——未开通用户的内容"不保存"包括不写进日志。
+
+    失败类动作（``reaction.failed``、``reply.failed``、``event.handler_failed``、
+    ``event.unparsable`` 等）记 ``WARNING`` 而不是 ``INFO``：S-A-07 r15/r19 真实验收
+    发现「已收到」表情缺失（#175/#185）时，唯一能回答"加表情调用到底怎么失败的"
+    的证据就是 ``reaction.failed`` 这一行审计——它淹没在 INFO 级正常流水里，验收
+    没有捕获到，问题因此无法定位。级别只影响日志可见性，动作名与字段不变，
+    重放脚本 ``_AuditCapture``（level=INFO 的 Handler）仍照常收到这些记录。
+
+    后缀规则之外还有一个显式名单（独立审核 F5）：``message.unsupported_type``
+    不以失败后缀结尾，但它是"用户发了消息却什么都没发生"的唯一入站侧证据
+    （非文本消息被判不支持、不建任务）——r19 首轮误判正是这一类。名单只收
+    "用户得不到任何回应"的动作；有明确用户回复的拒绝分支（未开通、已停用、
+    群聊拒绝）不在此列，停机期间的 ``reply.skipped_while_stopping`` 属正常
+    停机路径，也不在此列。
     """
 
+    _EXTRA_WARNING_ACTIONS = frozenset({"message.unsupported_type"})
+
     def record(self, action: str, /, **fields: object) -> None:
-        logger.info("audit %s %s", action, fields)
+        promote = (
+            action.endswith(("failed", "error", "unparsable"))
+            or action in self._EXTRA_WARNING_ACTIONS
+        )
+        log = logger.warning if promote else logger.info
+        log("audit %s %s", action, fields)
 
 
 class _UnavailableOnboarding:
@@ -105,16 +148,22 @@ def make_event_handler(
     return handle
 
 
-def install_signal_handlers(stop_event: threading.Event) -> None:
-    """``SIGTERM`` / ``SIGINT`` 只置一个标志位。
+def install_signal_handlers(
+    stop_event: threading.Event, *, on_stop: Callable[[], None] | None = None
+) -> None:
+    """``SIGTERM`` / ``SIGINT`` 只置一个标志位（外加可选的一次性回调）。
 
     处理器里不做 I/O：信号可能落在任意一条语句之间，在那里写库或发网络请求会把
-    "停机"变成一个新的故障源。
+    "停机"变成一个新的故障源。``on_stop``（独立审核 P3-5）只做一件轻量的事——
+    记一个内存里的时间戳，供 ``main()`` 精确计量"停机预算从信号到达那一刻起
+    用掉了多少"，不是新的 I/O 故障源，风险与 ``stop_event.set()`` 本身同级。
     """
 
     def handler(signum: int, _frame: Any) -> None:
         logger.info("收到信号 %s，开始停机", signum)
         stop_event.set()
+        if on_stop is not None:
+            on_stop()
 
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGINT, handler)
@@ -188,10 +237,177 @@ def build_supervisor(
     )
 
 
+class _RejectingCards:
+    """S-A-07 受控验收缺口专用：让配置命中的那一步卡片外发调用确定性收到
+    ``DeliveryRejected``（服务端明确拒绝），用于在没有真实故障可复现的情况下证伪
+    #152「关闭卡片路径 + 同话题一次完整文本终态」的降级路径（验收缺口登记于 #152、
+    #154 评论 5306860510、#162 E-022）。**只在显式设置
+    ``LINGXI_GATEWAY_CARD_FAILURE_INJECT`` 时才会被装配**；未设置（默认）时
+    ``assemble_delivery_consumer`` 走 ``build_delivery_consumer`` 的默认参数，
+    与本类加入之前的装配路径逐字节一致。
+
+    设计取舍：只让被选中的那一步失败，未选中的步骤直通真实 transport——
+    ``create`` 命中时 ``CardStream.start()`` 只会捕获 ``DeliveryRejected`` 并整体
+    降级为文本兜底，``update``/``close`` 根本不会再被这次任务调用到。
+
+    **四个值的实测语义（独立审核 P2-1 修正，覆盖此前文档的错误描述）**：
+
+    - ``create``/``all`` 在正常单轮场景下**等价**：``all`` 虽然三步都会拒绝，但
+      建卡这一步先被拒、任务立即整体降级，``update``/``close`` 根本没有机会被
+      调用到；只有任务从已持久化 ``card_id`` 恢复（上一轮建卡已经成功、这一轮
+      从终态更新起步）时，``all`` 才会真的命中 update/close 那一支，此时才与
+      ``create`` 单独命中的效果不同。
+    - **覆盖"注入发生在建卡成功之后"（终态更新阶段）降级路径的是 ``update``**，
+      不是 ``all``：终态更新失败会被 ``CardStream.finish()`` 捕获并整体降级为
+      文本兜底。
+    - ``close`` 单独命中时**不产生降级**：终态更新已经成功、只是收尾关闭失败，
+      ``CardStream.finish()`` 对这种情况刻意不触发文本兜底（否则会在卡片已经
+      显示正确答案之后再发一条重复文本，见该方法文档）。``close`` 因此是
+      "关闭失败不得产生第二条文本终态"这条否定断言的验收入口，不是产生降级
+      的正向用例。
+
+    选最简单、语义最清晰的实现，不建一个"命中一次之后这个任务全部转失败"的
+    状态机。
+    """
+
+    def __init__(self, real: CardTransport, *, inject: str) -> None:
+        self._real = real
+        self._inject = inject
+
+    def create(self, **kwargs: object) -> CardCreated:
+        if self._inject in ("create", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (create)", code=-1)
+        return self._real.create(**kwargs)  # type: ignore[arg-type]
+
+    def update(self, **kwargs: object) -> None:
+        if self._inject in ("update", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (update)", code=-1)
+        self._real.update(**kwargs)  # type: ignore[arg-type]
+
+    def close(self, **kwargs: object) -> None:
+        if self._inject in ("close", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (close)", code=-1)
+        self._real.close(**kwargs)  # type: ignore[arg-type]
+
+
+def assemble_delivery_consumer(
+    config: GatewayConfig, *, queue: Any = None, alerting_duty: Any = None
+) -> Any:
+    """装配投递消费循环（Issue #152）：读 outbox、驱动 CardKit 流式卡片与文本兜底。
+
+    独立建一个飞书 SDK 客户端，而不是复用 ``build_supervisor`` 内部那一个——两者
+    生命周期不同（这一个要跟着后台线程一起停），共用同一个客户端对象反而会让"谁
+    负责关它"变得含糊；多一个轻量 SDK 客户端对象本身不产生任何网络连接，直到第一次
+    真正调用才建立 HTTP 连接。
+
+    ``alerting_duty``（Issue #153）不为 ``None`` 时，把它的
+    ``delivery_alert_callback()`` 接到 ``DeliveryConsumer.on_alert``——这是最小告警
+    装配合同点名的注入点："把 #152 的 on_alert 注入点接到真实告警路由"。
+
+    ``config.card_failure_injection``（S-A-07 受控验收缺口）命中时，装配一个包一层
+    "确定性拒绝"的 ``_RejectingCards`` 代替真实 ``LarkCardTransport``；未设置
+    （默认）时这段分支完全不执行，装配结果与本开关加入之前逐字节一致。
+    """
+
+    from lingxi.adapters.feishu_outbound import build_client
+    from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+    from lingxi.apps.gateway.delivery import build_delivery_consumer
+
+    outbound_timeout = max(1.0, config.shutdown_timeout_seconds / 4)
+    client = build_client(
+        app_id=config.app_id,
+        app_secret=str(config.app_secret),
+        timeout_seconds=outbound_timeout,
+    )
+
+    cards: CardTransport | None = None
+    if config.card_failure_injection is not None:
+        from lingxi.adapters.feishu_delivery import LarkCardTransport
+
+        # 显眼的结构化告知（S-A-07 卡片故障注入开关第 3 点）：这个开关一旦被遗忘在
+        # 开启状态，生产环境里每一条问数结果都会被强制降级成文本终态——必须让它在
+        # 启动日志里足够扎眼，而不是混在普通 INFO 审计日志里被忽略。默认关闭时
+        # （本分支不执行）不会有这条日志，与既有装配路径完全一致。
+        logger.warning(
+            "gateway.delivery.card_failure_injection_enabled inject=%s "
+            "此开关仅供 S-A-07 受控验收使用，默认应为关闭；如果这不是一次受控验收"
+            "启动，请立即核实并清空 LINGXI_GATEWAY_CARD_FAILURE_INJECT",
+            config.card_failure_injection,
+        )
+        cards = _RejectingCards(LarkCardTransport(client), inject=config.card_failure_injection)
+
+    return build_delivery_consumer(
+        client=client,
+        queue=queue
+        or PostgresTaskQueue(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
+        cards=cards,
+        limit=config.delivery_batch_limit,
+        on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
+    )
+
+
+class _LogOnlyAlertSender:
+    """gateway 未配置管理群时的告警出口：只记结构化日志，不发起网络请求。
+
+    与 ``apps/worker/cli.py`` 的同名类同一姿态——没有配置目标群不等于告警关闭，
+    只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有
+    明确定义"，这里的定义是"继续跑，只是暂时没有群通知"）。
+    """
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        del chat_id, dedupe_key
+        logging.getLogger("lingxi.apps.gateway.alert").warning(text)
+
+
+def build_alerting_duty(config: GatewayConfig) -> Any:
+    """装配 gateway 自己的告警状态机（Issue #153）。
+
+    gateway 与 scheduler、worker 是三个独立部署单元，进程间不直接通信，因此各自
+    持有一份 ``AlertManager``——这不是重复造轮子，是"告警状态机跟着部署单元走"
+    这条既有约束的自然结果（``core/alerting.py`` 模块说明）。配置了
+    ``LINGXI_GATEWAY_ADMIN_GROUP_CHAT_ID`` 时真正发进管理群；没配时状态机照常
+    运行（阈值、去重、恢复计时都真实生效），只是发送端退化为结构化日志。
+    """
+
+    from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
+
+    if config.admin_group_chat_id:
+        from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+
+        sender: Any = FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.app_id,
+            app_secret=str(config.app_secret),
+        )
+        chat_id = config.admin_group_chat_id
+    else:
+        sender = _LogOnlyAlertSender()
+        chat_id = "gateway-log-only"
+
+    return AlertingDuty(
+        manager=AlertManager(policy=config.alert_policy),
+        dispatcher=AlertDispatcher(sender=sender, chat_id=chat_id, policy=config.alert_policy),
+        audit=_LoggingAudit(),
+    )
+
+
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
-    """进程入口。返回退出码。"""
+    """进程入口。返回退出码。
+
+    **同一进程内跑两条独立职责**：主线程承载长连接接入（``supervisor.run``，
+    阻塞到收到停机信号）；投递消费循环（Issue #152）在一个后台线程里跑，共享同一个
+    ``stop_event``。两者不共享任何可变状态——投递消费只读写数据库与飞书出站接口，
+    不碰长连接管线的内存对象，因此不需要额外的跨线程同步。这是 #152 停止条件里
+    "同一 Gateway 进程能否在不阻塞长连接的情况下可靠消费" 的落地方式：后台线程的
+    数据库轮询与出站调用不会阻塞长连接协程接收下一条事件。
+    """
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    # Issue #176（安全）：第三方飞书 SDK 建立长连接后会以 INFO 级别打印带认证
+    # 查询参数的完整 URL；必须在它有机会真正记一条日志之前就把两层脱敏都装好，
+    # 因此紧跟在 basicConfig 之后、任何可能触发连接的代码之前调用。见
+    # apps/gateway/log_redaction.py 模块头部说明。
+    install_credential_redaction()
     try:
         config = load_config(env if env is not None else os.environ)
     except GatewayConfigError as error:
@@ -199,10 +415,68 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         return 2
 
     stop_event = threading.Event()
-    install_signal_handlers(stop_event)
+    # 独立审核 P3-5：只在信号处理器里记一个时间戳，标记"停机预算从这一刻开始
+    # 计"。不能用"进入 main() 之后的耗时"当近似——`supervisor.run()` 在收到
+    # 停机信号之前会正常阻塞任意长时间（可能是几天），那段时间不属于停机预算。
+    shutdown_requested_at: list[float | None] = [None]
 
-    supervisor = build_supervisor(config, should_stop=stop_event.is_set)
-    reason = supervisor.run(should_stop=stop_event.is_set)
+    def _mark_shutdown_requested() -> None:
+        if shutdown_requested_at[0] is None:
+            shutdown_requested_at[0] = time.monotonic()
+
+    install_signal_handlers(stop_event, on_stop=_mark_shutdown_requested)
+
+    # 最小告警装配（Issue #153）：一份 AlertingDuty 服务两条循环，各自用不同的
+    # 心跳/活性 key（见 build_alerting_duty、apps.liveness 的角色说明），因此
+    # 任一条循环停摆都能被单独发现，不会被另一条仍然健康掩盖。
+    alerting_duty = build_alerting_duty(config)
+    supervisor = build_supervisor(
+        config,
+        should_stop=stop_event.is_set,
+        heartbeat=_combined_heartbeat(alerting_duty, "gateway-longconn"),
+    )
+    consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
+    delivery_thread = threading.Thread(
+        target=consumer.run_forever,
+        kwargs={
+            "stop": stop_event,
+            "poll_interval_seconds": config.delivery_poll_interval_seconds,
+            "heartbeat": _combined_heartbeat(alerting_duty, "gateway-delivery"),
+            "on_tick": alerting_duty.run_once,
+        },
+        name="lingxi-gateway-delivery",
+        # 独立审核 P3-5：非守护线程会让解释器在退出时等它结束——如果它没能在
+        # 停机预算内 join 完，下面"进程仍将继续关闭"这句话在 daemon=False 时其实
+        # 不成立（CPython 会一直等非守护线程）。改成守护线程，让"预算耗尽就不再
+        # 等"这句承诺对进程本身也成立：预算内能 join 完就是干净退出；耗尽了就是
+        # 进程退出时硬收掉这个线程，不会让一个卡住的外部调用把整个进程焊住。
+        daemon=True,
+    )
+    delivery_thread.start()
+
+    try:
+        reason = supervisor.run(should_stop=stop_event.is_set)
+    finally:
+        # 长连接侧已经收到停机信号（或者提前异常退出）：确保投递线程也收到同一个
+        # 信号，再在停机预算内等它退出——不能让进程在后台线程还在跑外部调用时
+        # 直接退出（`V-部署-03`：完成或安全中断在途工作，不是立刻放弃）。
+        stop_event.set()
+        if shutdown_requested_at[0] is None:
+            # 没收到 SIGTERM/SIGINT 就走到这里——例如 supervisor.run() 自己因
+            # 终止型错误提前返回。这种情况下还没有任何"优雅停机"流程被启动过，
+            # 预算从现在开始计，而不是当成"已经用掉全部预算"。
+            shutdown_requested_at[0] = time.monotonic()
+        # 独立审核 P3-5：``supervisor.run()`` 从收到信号到返回，自己内部也会按
+        # 同一个 ``shutdown_timeout_seconds`` 等在途事件处理完，已经消耗了停机
+        # 预算的一部分。这里的 join 只用**剩余**预算，而不是重新给满一份——否则
+        # 两段各按完整预算计时，最坏情况下总停机时间是承诺值的两倍。
+        elapsed = time.monotonic() - shutdown_requested_at[0]
+        remaining_budget = max(0.0, config.shutdown_timeout_seconds - elapsed)
+        delivery_thread.join(timeout=remaining_budget)
+        if delivery_thread.is_alive():
+            logger.error(
+                "投递消费线程未能在停机预算内退出，进程将不再等待它、直接关闭"
+            )
 
     if reason is TerminationReason.TERMINAL_ERROR:
         # 终止型错误（403 / 514 超连接数上限）：进程进入明确的终止态，退出码非 0，

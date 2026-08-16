@@ -22,7 +22,7 @@ from lingxi.apps.scheduler import (
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.core.alerting import AlertManager, AlertPolicy
-from lingxi.core.execution.card_stream import CardStream
+from lingxi.core.execution.card_stream import CardStream, DeliveryRejected
 from lingxi.config.content import default_content_catalog
 
 
@@ -193,7 +193,10 @@ class AdapterOutcomeTests(unittest.TestCase):
 
         class Cards:
             def create(self, **_kwargs: object) -> str:
-                raise RuntimeError("card unavailable")
+                # 明确失败（白名单，独立审核 R-1）：只有 `DeliveryRejected` 会被
+                # `CardStream.start()` 吞掉并置位 `fallback_needed`，其它任何异常
+                # 类型都会原样抛出（结果不明），不再走到下面的文本兜底断言。
+                raise DeliveryRejected("card unavailable")
 
             def update(self, **_kwargs: object) -> None:
                 return None
@@ -374,6 +377,172 @@ print([notice.event_type for notice in manager.tick(at=now + timedelta(seconds=3
             "middle.feishu_send_failed",
             "zeta.feishu_send_failed",
         ])
+
+
+class DeliveryAlertCallbackTests(unittest.TestCase):
+    """Issue #153：Gateway ``DeliveryConsumer.on_alert`` 注入点接到真实告警路由
+    ——``AlertingDuty.delivery_alert_callback()`` 是这条注入点的落地形式。"""
+
+    def test_a_delivery_alert_is_observed_as_a_feishu_send_failed_signal(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("dispatch_uncertain_card_finish.feishu_send_failed", sender.calls[0]["text"])
+
+    def test_kind_strings_are_sanitized_into_a_safe_scope(self) -> None:
+        """真实 kind 字符串带冒号与大写字母（如 ``fallback_send_failed:
+        TimeoutError``），AlertSignal 的 scope 校验只接受小写字母数字与
+        ``_.-``——不消毒直接传会在这里抛 ValueError，告警本身也就不会发生。
+        """
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        # 不应抛出 ValueError——这正是本用例要证明的。
+        callback("fallback_send_failed:TimeoutError", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+
+    def test_an_unsafe_task_id_degrades_to_no_trace_id_instead_of_dropping_the_alert(
+        self,
+    ) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_create", "带空格的非法-id 值")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1, "trace_id 格式异常不得让整条告警消失")
+        self.assertIn("trace_id=-", sender.calls[0]["text"])
+
+    def test_different_delivery_kinds_do_not_share_a_dedupe_window(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_create", "01J00000000000000000000TAS1")
+        callback("progress_persist_failed:RuntimeError", "01J00000000000000000000TAS2")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(
+            len(sender.calls), 2, "两类不同的投递失败必须各自独立限流，不能互相压制"
+        )
+
+    def test_a_single_uncertain_report_alerts_immediately_under_production_defaults(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P1-4：生产默认 ``AlertPolicy()``（``send_failure_
+        window_seconds=300``、``send_failure_threshold=3``）与
+        ``DeliveryConsumer.DEFAULT_ALERT_MIN_INTERVAL_SECONDS``（同为 300）两个
+        300 秒相等，此前会让 `dispatch_uncertain:*` 无论按真实上报节奏重复多少次
+        都恰好落在"窗口刚过期"一侧、``consecutive_failures`` 永远回到 1、
+        ``threshold=3`` 永远到不了——用生产默认复现过，两小时内单个 uncertain
+        任务被上报 24 次、实际发出的告警条数 = 0。
+
+        修复后 `dispatch_uncertain:*` 走 ``final=True``：**单次**上报、**默认**
+        策略，就必须立刻出一条告警——不必等第二次、第三次，也不必绕开生产默认值
+        用 ``send_failure_threshold=1`` 这种测试专用配置。这正是本用例要钉住的
+        回归：把 ``delivery_alert_callback`` 里的 ``final`` 改回恒为 ``False``，
+        本用例会变红（发出的告警条数变成 0）。
+        """
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy()),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(
+            len(sender.calls),
+            1,
+            "结果不明、绝不自动重发的 uncertain 任务，必须在第一次被观察到时就"
+            "报警，不能等到攒够 send_failure_threshold 次——生产默认下这个"
+            "阈值在原实现里永远到不了",
+        )
+
+    def test_repeated_uncertain_reports_at_the_min_interval_still_respect_dedupe(
+        self,
+    ) -> None:
+        """``final=True`` 不等于"每次上报都发一条新告警"：同一 (kind, task_id)
+        仍然只受 ``dedupe_window_seconds``（生产默认 1800 秒）约束一次通知，
+        不会因为改成 final 就从"从不告警"变成"刷屏"。"""
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy()),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+        # 按 DeliveryConsumer.DEFAULT_ALERT_MIN_INTERVAL_SECONDS（300s）的上报
+        # 节奏再上报一次：仍在 dedupe_window_seconds（1800s）之内。
+        clock.value = clock.value + timedelta(seconds=300)
+        callback("dispatch_uncertain:card_finish", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(
+            len(sender.calls), 1, "同一 uncertain 任务在去重窗口内重复上报不应刷屏"
+        )
+
+    def test_a_fallback_send_rejection_alerts_immediately_under_production_defaults(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P1-4：``fallback_send_failed:*`` 是文本兜底遇到明确
+        拒绝错误（``V-告警-03``「终态失败立即告警」覆盖的正是这一类），同样不能
+        靠攒够 3 次同一 5 分钟窗口内的失败——生产默认下与 uncertain 类别是
+        同一个 300s 撞 300s 的问题。"""
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy()),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.delivery_alert_callback()
+
+        callback("fallback_send_failed:DeliveryRejected", "01J00000000000000000000TASK")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
 
 
 if __name__ == "__main__":

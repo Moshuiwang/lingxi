@@ -124,6 +124,31 @@ class RequiredConfigTests(unittest.TestCase):
         self.assertGreaterEqual(config.reconnect_ceiling_seconds, config.reconnect_base_seconds)
         self.assertGreater(config.shutdown_timeout_seconds, 0)
 
+    def test_card_failure_injection_defaults_to_disabled(self) -> None:
+        """默认关闭：不设置该变量时装配路径必须与开关加入之前逐字节一致。"""
+
+        config = load_config(VALID_ENV)
+        self.assertIsNone(config.card_failure_injection)
+
+    def test_card_failure_injection_accepts_the_four_legal_values(self) -> None:
+        for value in ("create", "update", "close", "all"):
+            with self.subTest(value=value):
+                env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": value})
+                config = load_config(env)
+                self.assertEqual(config.card_failure_injection, value)
+
+    def test_card_failure_injection_rejects_illegal_values_at_startup(self) -> None:
+        """S-A-07 卡片故障注入开关第 1 点：非法值必须启动即失败（失败关闭），
+        不能等到装配投递消费循环时才发现拼错的值被悄悄当成"未启用"放过。
+        """
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "createx"})
+        with self.assertRaises(GatewayConfigError) as raised:
+            load_config(env)
+        message = str(raised.exception)
+        self.assertIn(f"{ENV_PREFIX}CARD_FAILURE_INJECT", message)
+        self.assertNotIn("createx", message, "报错不得回显收到的值")
+
 
     def test_non_finite_numbers_are_rejected(self) -> None:
         """``nan`` / ``inf`` 是合法的 float 字面量，会一路通过后面所有比较。
@@ -282,6 +307,117 @@ class BuildSupervisorTests(unittest.TestCase):
         fallback = pipeline_class.call_args.kwargs["onboarding"]
         result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
         self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+
+
+class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
+    """S-A-07 卡片故障注入开关的装配接线：设置后 consumer 用注入 transport，
+    缺省用真实类型——验证的是 ``assemble_delivery_consumer`` 传给
+    ``build_delivery_consumer`` 的 ``cards`` 参数本身，不连真实飞书或数据库。
+    """
+
+    def setUp(self) -> None:
+        # 与 BuildSupervisorTests 同一手法：build_client 会 import lark_oapi，
+        # CI 的 gate 只装 scheduler 组，没有它，用桩顶上。
+        module = types.ModuleType("lark_oapi")
+
+        class _Builder:
+            def app_id(self, value):
+                return self
+
+            def app_secret(self, value):
+                return self
+
+            def timeout(self, value):
+                return self
+
+            def build(self):
+                return object()
+
+        module.Client = types.SimpleNamespace(builder=lambda: _Builder())
+        saved = sys.modules.get("lark_oapi")
+        sys.modules["lark_oapi"] = module
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("lark_oapi", saved)
+            if saved is not None
+            else sys.modules.pop("lark_oapi", None)
+        )
+
+    def test_default_configuration_passes_no_injected_transport(self) -> None:
+        from lingxi.apps.gateway import assemble_delivery_consumer
+
+        config = load_config(VALID_ENV)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer") as builder:
+            assemble_delivery_consumer(config, queue=object())
+
+        self.assertIsNone(
+            builder.call_args.kwargs["cards"],
+            "缺省时必须走 build_delivery_consumer 自己的默认真实类型，"
+            "不额外传入任何 cards——装配路径与本开关加入之前逐字节一致",
+        )
+
+    def test_injected_configuration_wires_the_rejecting_transport(self) -> None:
+        from lingxi.apps.gateway import _RejectingCards, assemble_delivery_consumer
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "close"})
+        config = load_config(env)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer") as builder:
+            assemble_delivery_consumer(config, queue=object())
+
+        cards = builder.call_args.kwargs["cards"]
+        self.assertIsInstance(cards, _RejectingCards)
+        self.assertEqual(cards._inject, "close")
+
+    def test_injected_configuration_logs_a_visible_startup_warning(self) -> None:
+        """第 3 点：启用时必须有一条显眼的结构化告知，防止开关被遗忘在开启状态。"""
+
+        from lingxi.apps.gateway import assemble_delivery_consumer
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "all"})
+        config = load_config(env)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer"):
+            with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+                assemble_delivery_consumer(config, queue=object())
+
+        self.assertTrue(
+            any("card_failure_injection_enabled" in line for line in captured.output),
+            "开关开启时必须打一条能被搜到的结构化告警",
+        )
+
+
+class LoggingAuditLevelTests(unittest.TestCase):
+    """#175/#185：失败类审计动作必须在 WARNING 级可见。
+
+    S-A-07 r15/r19 真实验收里「已收到」表情缺失时，``reaction.failed`` 是唯一能
+    回答"加表情调用到底怎么失败的"的证据；它此前记在 INFO 级、淹没在正常流水中，
+    验收没有捕获到。这里锁定级别约定：``*failed`` / ``*error`` / ``*unparsable``
+    记 WARNING，正常动作保持 INFO。
+    """
+
+    def test_failed_actions_log_at_warning(self) -> None:
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+            _LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
+        self.assertTrue(captured.output[0].startswith("WARNING"))
+        self.assertIn("reaction.failed", captured.output[0])
+
+    def test_unsupported_message_type_logs_at_warning(self) -> None:
+        """独立审核 F5：``message.unsupported_type`` 不以失败后缀结尾，但它是
+        "用户发了消息却什么都没发生"的唯一入站侧证据（r19 首轮误判正是这一类），
+        必须进 WARNING 显式名单。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+            _LoggingAudit().record("message.unsupported_type")
+        self.assertTrue(captured.output[0].startswith("WARNING"))
+
+    def test_normal_actions_stay_at_info(self) -> None:
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
+            _LoggingAudit().record("reply.sent")
+        self.assertTrue(captured.output[0].startswith("INFO"))
 
 
 class EntryPointTests(unittest.TestCase):

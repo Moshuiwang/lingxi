@@ -1,18 +1,33 @@
-"""Issue #90 的队列消费、卡片与失败终态断言。
+"""Issue #90 的队列消费与失败终态断言；Issue #151 起收口方式改为写投递事件 outbox。
 
-真库组覆盖 V-队列-06/08/09、V-会话-07/11/13 的状态、隔离、轮询与出站收口；纯逻辑组
-覆盖 V-会话-06、V-卡片-01/02/03 和 worker 收口，避免把外部飞书/CardKit L4a 误写成
-已验证。
+真库组覆盖 V-队列-06/08/09、V-会话-07 的状态、隔离与轮询；纯逻辑组覆盖 V-会话-06
+与 worker 收口写入的投递事件形状，避免把外部飞书/CardKit L4a 误写成已验证。
+
+**Issue #151 起，``WorkerService`` 不再持有任何出站 transport**：收口只写
+``task_delivery_event``（``started``/``progress``/``terminal``）并把任务转入
+``awaiting_delivery``，不直接调用飞书或释放话题——话题占用与最终业务状态改由
+:mod:`lingxi.adapters.postgres_conversation` 的 ``confirm_delivery`` /
+``expire_undelivered_terminals`` 收口，见 ``tests/test_delivery_outbox.py`` 的
+真库断言（V-投递-01…06/10）。``CardStream``/``CardTaskDelivery`` 曾经把 Worker
+接到飞书 CardKit，与「Worker 只写数据库，不直接调用飞书」的架构边界冲突，已随
+本次改动从 ``apps/worker`` 移除；``CardStream`` 本身留在
+``core/execution/card_stream.py`` 作为协议无关的可复用组件，供 #152 的 Gateway
+消费者注入真实 transport 时使用，下面的 ``CardStreamTests`` 继续直接覆盖它。
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import os
+import signal
+import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Mapping
 
 from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
 from lingxi.adapters.postgres import connect
@@ -25,11 +40,15 @@ from lingxi.adapters.postgres_conversation import (
     _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
-from lingxi.apps.worker.delivery import CardTaskDelivery
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import EventPipeline, InboundMessage
-from lingxi.core.execution.card_stream import CardRateLimiter, CardStream
+from lingxi.core.execution.card_stream import (
+    CardCreated,
+    CardRateLimiter,
+    CardStream,
+    DeliveryRejected,
+)
 from postgres_schema import ensure_production_schema, reset_production_rows
 
 
@@ -53,36 +72,45 @@ def worker_config(**overrides: object) -> WorkerConfig:
 
 
 class RecordingCards:
-    def __init__(self, *, fail: str | None = None) -> None:
+    """``error`` 默认 ``DeliveryRejected``（明确失败，独立审核 R-1 白名单）；传入
+    ``TimeoutError`` 等其它任何异常类型模拟"结果不明"，见
+    ``core.execution.card_stream`` 模块说明。
+    """
+
+    def __init__(
+        self, *, fail: str | None = None, error: type[BaseException] = DeliveryRejected
+    ) -> None:
         self.fail = fail
+        self._error = error
         self.calls: list[tuple[str, int | None]] = []
         self.bodies: list[str] = []
 
-    def create(self, **kwargs: object) -> str:
+    def create(self, **kwargs: object) -> CardCreated:
         self.calls.append(("create", None))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "create":
-            raise RuntimeError("card create")
-        return "card-1"
+            raise self._error("card create")
+        return CardCreated(card_id="card-1", message_id="msg-card-1")
 
     def update(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("update", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "update":
-            raise RuntimeError("card update")
+            raise self._error("card update")
 
     def close(self, *, sequence: int, **kwargs: object) -> None:
         self.calls.append(("close", sequence))
         self.bodies.append(kwargs["card"].body)  # type: ignore[union-attr]
         if self.fail == "close":
-            raise RuntimeError("card close")
+            raise self._error("card close")
 
 
 class RecordingText:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, error: type[BaseException] = DeliveryRejected) -> None:
         self.texts: list[str] = []
         self.calls: list[dict[str, object]] = []
         self.fail = fail
+        self._error = error
 
     def send_text(
         self,
@@ -91,7 +119,7 @@ class RecordingText:
         thread_id: str | None,
         reply_to_message_id: str,
         text: str,
-    ) -> None:
+    ) -> str:
         self.calls.append(
             {
                 "chat_id": chat_id,
@@ -102,7 +130,8 @@ class RecordingText:
         )
         self.texts.append(text)
         if self.fail:
-            raise RuntimeError("text fallback")
+            raise self._error("text fallback")
+        return "msg-fallback-1"
 
 
 class CardStreamTests(unittest.TestCase):
@@ -134,6 +163,36 @@ class CardStreamTests(unittest.TestCase):
         self.assertIn("已完成 · 1 秒", cards.bodies[-2])
         self.assertEqual(text.texts, [])
 
+    def test_finish_counts_toward_the_shared_global_rate_budget(self) -> None:
+        """独立审核 P2-2：``finish()`` 刻意不经过单话题 500ms 节流（终态帧是结果
+        本身，被吞掉比不节流更糟），但全进程 50 次/秒的预算必须同样计入终态更新
+        +关闭这两次调用，否则并发多话题同时终态时全局计数会失真。
+        """
+
+        limiter = CardRateLimiter()
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: 0.0,
+            rate_limiter=limiter,
+        )
+        stream.start()  # 消费全局预算第 1 个名额
+        for index in range(48):
+            self.assertTrue(limiter.allow(topic=f"filler-{index}", now=0.0))
+        # 至此全局预算已经用掉 49/50，只剩 1 个名额。
+
+        stream.finish(result="结果", elapsed_seconds=1)  # 终态更新 + 关闭，各占一个名额
+
+        self.assertFalse(
+            limiter.allow(topic="topic-brand-new", now=0.0),
+            "finish() 的两次调用必须计入全局 50 次/秒预算，否则这里会被误放行",
+        )
+
     def test_card_failure_falls_back_to_same_topic_text(self) -> None:
         cards = RecordingCards(fail="update")
         text = RecordingText()
@@ -160,6 +219,168 @@ class CardStreamTests(unittest.TestCase):
             "topic-a",
             "V-卡片-03：文本回退必须保留原 thread_id",
         )
+
+    def test_close_failure_alone_does_not_fall_back_to_a_duplicate_text(self) -> None:
+        """独立审核 P1-2：终态**更新**已经成功（用户已经能在卡片里看到完整答案），
+        只有随后的**关闭**失败——不得整体降级为文本兜底，否则用户会在同一话题里
+        看到同一条答案两遍。G-CARD 实测：未手动关闭的流式卡片距上次开启 10 分钟
+        后由平台自动关闭，关闭失败本身不构成结果丢失。
+        """
+
+        cards = RecordingCards(fail="close")
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "只有关闭失败，不能整体降级为文本通道")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls],
+            ["create", "update", "close"],
+            "终态更新必须真实发出；关闭也确实被尝试过（只是失败了）",
+        )
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertIsNone(message_id, "fallback_needed 为假时 send_fallback 不产生任何外部调用")
+        self.assertEqual(text.calls, [], "答案已经在卡片里对用户可见，绝不能再发一条重复文本终态")
+
+    def test_create_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1/R-1：``TimeoutError``（真实 adapter 走 ``requests``，其网络
+        异常全部是内置 ``OSError`` 的子类）不是"明确失败"——``start()`` 必须原样把
+        它抛出去，不能像 ``DeliveryRejected`` 那样吞掉并置位 ``fallback_needed``
+        （那会让调用方误以为已经拿到"应该改走文本通道"这个明确结论）。
+        """
+
+        cards = RecordingCards(fail="create", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+
+        with self.assertRaises(TimeoutError):
+            stream.start()
+
+        self.assertIsNone(stream.card_id, "没有拿到 card_id，不能假设建卡成功")
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+
+    def test_terminal_update_timeout_is_not_swallowed_into_a_fallback_downgrade(self) -> None:
+        """独立审核 B-1 场景 1：终态更新超时不得被 ``finish()`` 吞掉后降级为文本
+        兜底——必须原样抛出，且不再继续调用 ``close()``。
+        """
+
+        cards = RecordingCards(fail="update", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+
+        with self.assertRaises(TimeoutError):
+            stream.finish(result="已产生的答案", elapsed_seconds=1)
+
+        self.assertFalse(stream.fallback_needed, "结果不明绝不能置位 fallback_needed")
+        self.assertEqual(
+            [kind for kind, _ in cards.calls], ["create", "update"], "结果不明时不得继续调用 close"
+        )
+
+    def test_close_timeout_still_does_not_fall_back_like_any_other_close_failure(self) -> None:
+        """``close()`` 步骤的异常分类不延伸到这里（见 ``card_stream.py`` 注释）：
+        无论关闭失败是明确拒绝还是网络类异常，都不改变"更新已经成功、答案已对
+        用户可见"这个结论，``TimeoutError`` 与 ``DeliveryRejected`` 在这一步行为
+        一致。
+        """
+
+        cards = RecordingCards(fail="close", error=TimeoutError)
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        stream.finish(result="已产生的答案", elapsed_seconds=1)  # 不应该抛出
+
+        self.assertFalse(stream.fallback_needed, "关闭失败（无论何种异常）都不整体降级")
+        self.assertEqual([kind for kind, _ in cards.calls], ["create", "update", "close"])
+
+    def test_text_fallback_timeout_is_not_swallowed(self) -> None:
+        """独立审核 B-1 场景 2：文本兜底发送超时必须原样抛出，调用方据此不清预留位、
+        不进入重试退避。
+        """
+
+        cards = RecordingCards(fail="create")  # 明确失败，走文本通道
+        text = RecordingText(fail=True, error=TimeoutError)
+        stream = CardStream(
+            chat_id="chat-a", thread_id="topic-a", reply_to_message_id="msg-a",
+            transport=cards, fallback=text,
+        )
+        stream.start()
+        self.assertTrue(stream.fallback_needed)
+
+        with self.assertRaises(TimeoutError):
+            stream.send_fallback(default_content_catalog().text("worker.failed"))
+
+        self.assertIsNone(stream.message_id, "没有拿到 message_id，不能假设文本已经送达")
+        self.assertEqual(len(text.calls), 1, "发送确实被尝试过一次")
+
+    def test_resuming_with_an_existing_card_id_does_not_create_a_second_card(self) -> None:
+        """Issue #152：Gateway 消费循环重启后用 ``initial_*`` 恢复，``start()``
+        必须是安全的空操作，不产生第二次 ``create()`` 调用（状态合同第 7 条）。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_card_id="card-resumed",
+            initial_sequence=2,
+            initial_message_id="msg-resumed",
+        )
+
+        stream.start()
+        self.assertEqual(cards.calls, [], "resume 场景下 start() 必须是空操作")
+        self.assertEqual(stream.card_id, "card-resumed")
+        self.assertEqual(stream.message_id, "msg-resumed")
+
+        stream.finish(result="结果", elapsed_seconds=1)
+        self.assertEqual(
+            [sequence for kind, sequence in cards.calls if kind in {"update", "close"}],
+            [3, 4],
+            "序号从持久化的 initial_sequence 之后继续，不从零重新计数",
+        )
+
+    def test_resuming_with_fallback_already_needed_skips_the_card_path_entirely(self) -> None:
+        """已经降级为文本通道的任务重启后不得再尝试建卡或更新卡片。"""
+
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_fallback_needed=True,
+        )
+
+        stream.start()
+        stream.update(elapsed_seconds=1)
+        stream.finish(result="结果")
+        self.assertEqual(cards.calls, [], "已降级的任务重启后不得再触碰卡片通道")
+
+        message_id = stream.send_fallback(default_content_catalog().text("worker.failed"))
+        self.assertEqual(message_id, "msg-fallback-1")
+        self.assertEqual(stream.message_id, "msg-fallback-1")
 
 
 class FakeWorkerQueue:
@@ -192,7 +413,8 @@ class FakeWorkerQueue:
             stop_requested=stopped,
             side_effect_state="none",
         )
-        self.finished: list[dict[str, object]] = []
+        self.events: list[dict[str, object]] = []
+        self.terminals: list[dict[str, object]] = []
         self.marked = 0
 
     def claim(self, **kwargs: object) -> list[ClaimedTask]:
@@ -214,28 +436,13 @@ class FakeWorkerQueue:
     def stop_requested(self, **kwargs: object) -> bool:
         return self.context.stop_requested
 
-    def finish(self, **kwargs: object) -> bool:
-        self.finished.append(kwargs)
-        return True
+    def append_delivery_event(self, **kwargs: object) -> None:
+        self.events.append(kwargs)
+        return None
 
-
-class RecordingDelivery:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, object]] = []
-        self.failed_contents = []
-
-    def start(self) -> None:
-        self.events.append(("start", None))
-
-    def progress(self, *, elapsed_seconds: int) -> None:
-        self.events.append(("progress", elapsed_seconds))
-
-    def complete(self, *, result: str, elapsed_seconds: int = 0) -> None:
-        self.events.append(("complete", result))
-
-    def fail(self, *, content) -> None:
-        self.failed_contents.append(content)
-        self.events.append(("fail", content.key))
+    def write_terminal_event(self, **kwargs: object) -> None:
+        self.terminals.append(kwargs)
+        return None
 
 
 class DroppingNotifyListener:
@@ -258,14 +465,34 @@ class DroppingNotifyListener:
         return None
 
 
+class RecordingTerminalOutcomeSink:
+    """``WorkerService(on_terminal_outcome=...)`` 的测试替身（Issue #90 评论
+    5306860255 独立复核 P1）：真实装配（``apps/worker/cli.py``）接的是结构化
+    stderr 出口，不是 stdlib ``logging``——单测因此不能再用 ``assertLogs``
+    间接验证「代码里调用了 logging」，那只能证明调用存在，证明不了运维在真实
+    队列 worker 进程里真的能看到它（真实进程从不调用 ``logging.basicConfig()``，
+    见 ``cli.py`` 的 ``_LogOnlyAlertSender`` 说明）。这里直接断言注入回调收到的
+    字段，与生产装配走同一条注入协议。"""
+
+    def __init__(self) -> None:
+        self.calls: list[Mapping[str, object]] = []
+
+    def __call__(self, fields: Mapping[str, object]) -> None:
+        self.calls.append(dict(fields))
+
+
 class WorkerServiceTests(unittest.TestCase):
-    def test_success_resumes_session_and_releases_with_new_session_id(self) -> None:
+    """Issue #151：``_process_task`` 只写 ``task_delivery_event``，不再调用任何出站
+    transport；断言因此改看 ``queue.events``/``queue.terminals`` 记录了什么，而不是
+    ``delivery`` 对象收到了什么调用。"""
+
+    def test_success_writes_started_and_terminal_events(self) -> None:
         queue = FakeWorkerQueue()
-        delivery = RecordingDelivery()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                 self.kwargs = kwargs
+                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
                 return {
                     "turn": {"closed": True, "final_text": "结果", "session_id": "new-session"},
                     "failure": None,
@@ -278,99 +505,35 @@ class WorkerServiceTests(unittest.TestCase):
             ),
             queue=queue,
             executor_factory=lambda config, marker: executor,
-            delivery_factory=lambda context, marker: delivery,
         )
         asyncio.run(service.process_once())
 
-        self.assertEqual(delivery.events[-1], ("complete", "结果"))
-        self.assertEqual(queue.finished[0]["status"], "succeeded")
-        self.assertEqual(queue.finished[0]["agent_session_id"], "new-session")
+        self.assertEqual(queue.events[0]["event_type"], "started")
+        self.assertEqual(queue.events[1]["event_type"], "progress")
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertIsNone(terminal["error_kind"])
+        self.assertEqual(terminal["content"], "结果")
+        self.assertEqual(terminal["agent_session_id"], "new-session")
         self.assertIsNotNone(executor.kwargs["resume_session_id"])
         self.assertEqual(
             executor.kwargs["external_texts"],
             (("metric.description", "指标目录中的已知描述"),),
         )
 
-    def test_success_result_survives_card_update_failure_in_the_same_topic(self) -> None:
-        """V-卡片-03：成功回合的卡片更新失败时补发完整结果且仍为 succeeded。"""
-
-        queue = FakeWorkerQueue()
-        cards = RecordingCards(fail="update")
-        text = RecordingText()
-        delivery = CardTaskDelivery(
-            chat_id=queue.context.chat_id,
-            thread_id=queue.context.thread_id,
-            reply_to_message_id=queue.context.reply_to_message_id or "",
-            cards=cards,
-            replies=text,
-        )
-
-        class Executor:
-            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
-                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
-                return {
-                    "turn": {
-                        "closed": True,
-                        "final_text": "答案串：123 万元",
-                        "session_id": "new-session",
-                    },
-                    "failure": None,
-                }
-
-        service = WorkerService(
-            config=worker_config(),
-            queue=queue,
-            executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
-        )
-        asyncio.run(service.process_once())
-
-        self.assertEqual(queue.finished[0]["status"], "succeeded")
-        self.assertEqual(len(text.calls), 1, "成功结果只能补发一次")
-        self.assertIn("答案串：123 万元", text.calls[0]["text"])
-        self.assertNotIn("本次任务未取得可用结果", text.calls[0]["text"])
-        self.assertEqual(text.calls[0]["chat_id"], "chat-1")
-        self.assertEqual(text.calls[0]["thread_id"], "topic-1")
-
-    def test_success_result_is_failed_only_when_text_fallback_also_fails(self) -> None:
-        """V-卡片-03：文本回退本身失败才把成功回合降为 failed。"""
-
-        queue = FakeWorkerQueue()
-        delivery = CardTaskDelivery(
-            chat_id=queue.context.chat_id,
-            thread_id=queue.context.thread_id,
-            reply_to_message_id=queue.context.reply_to_message_id or "",
-            cards=RecordingCards(fail="update"),
-            replies=RecordingText(fail=True),
-        )
-
-        class Executor:
-            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
-                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
-                return {
-                    "turn": {"closed": True, "final_text": "答案串", "session_id": None},
-                    "failure": None,
-                }
-
-        service = WorkerService(
-            config=worker_config(),
-            queue=queue,
-            executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
-        )
-        asyncio.run(service.process_once())
-
-        self.assertEqual(queue.finished[0]["status"], "failed")
-        self.assertEqual(queue.finished[0]["error_kind"], "delivery_failed")
-
-    def test_stop_and_timeout_are_terminal_and_release_the_topic(self) -> None:
-        for stopped, failure_code, expected_status in (
-            (True, None, "stopped"),
-            (False, "turn_timeout", "failed"),
+    def test_stop_and_timeout_write_distinct_terminal_kinds(self) -> None:
+        # Issue #90 评论 5306860255：turn 模式（apps/worker/turn.py 的
+        # `_sdk_termination_failure`）早就把撞满 Agent 轮数上限分类成
+        # `max_turns_exceeded`，但 queue 收口此前落进 `_failure_content` 的默认
+        # 分支，被压平成通用 `session_failed` + 「本次任务未取得可用结果，请稍后
+        # 重试」——用户看不出重试无意义。这里补一行覆盖 queue 链路的专属终态。
+        for stopped, failure_code, expected_terminal_kind, expected_error, expected_content_key in (
+            (True, None, "stopped", "stopped", "worker.stopped"),
+            (False, "turn_timeout", "timeout", "running_timeout", "worker.running_timeout"),
+            (False, "max_turns_exceeded", "failed", "max_turns_exceeded", "worker.max_turns"),
         ):
-            with self.subTest(expected_status=expected_status):
+            with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
                 queue = FakeWorkerQueue(stopped=stopped)
-                delivery = RecordingDelivery()
 
                 class Executor:
                     async def run_turn(self, prompt: str, **kwargs: object) -> dict:
@@ -383,15 +546,493 @@ class WorkerServiceTests(unittest.TestCase):
                     config=worker_config(),
                     queue=queue,
                     executor_factory=lambda config, marker: Executor(),
-                    delivery_factory=lambda context, marker: delivery,
                 )
                 asyncio.run(service.process_once())
-                self.assertEqual(queue.finished[0]["status"], expected_status)
-                self.assertEqual(delivery.events[-1][0], "fail")
-                expected_key = "worker.stopped" if stopped else "worker.running_timeout"
-                self.assertEqual(delivery.events[-1][1], expected_key)
-                expected_error = "stopped" if stopped else "running_timeout"
-                self.assertEqual(queue.finished[0]["error_kind"], expected_error)
+                terminal = queue.terminals[0]
+                self.assertEqual(terminal["terminal_kind"], expected_terminal_kind)
+                self.assertEqual(terminal["error_kind"], expected_error)
+                self.assertEqual(
+                    terminal["content"], default_content_catalog().text(expected_content_key).text
+                )
+
+    def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
+        """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
+        ``terminal_kind='success'``——用户没有拿到结果，必须走独立、可查询的
+        ``redacted_withheld`` 终态。改坏这条路由（例如去掉 withheld 判断）必须让
+        本用例变红。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "redacted_withheld")
+        self.assertEqual(terminal["error_kind"], "redacted_withheld")
+        self.assertNotEqual(terminal["terminal_kind"], "success")
+        # withheld 的原始 final_text 不得进入投递事件：正文只能是目录里的固定安全
+        # 文案，不是模型给出的（已经被判定不可展示的）片段。
+        self.assertEqual(
+            terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
+        )
+
+    def test_a_failed_turn_keeps_its_failure_terminal_even_when_withheld_is_set(self) -> None:
+        """PR #186 独立审核 F1：withheld 只对"本来会成功交付内容"的回合有意义。
+        超时/失败回合的残余正文即使触发了出口安全（真实泄露片段或受控 canary
+        注入），终态也必须保留真实失败原因——把真超时写成 ``redacted_withheld``，
+        运维丢失失败终态，验收拿到假阳性安全证据。把 withheld 分支挪回失败判定
+        之前必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": False,
+                        "final_text": "残余正文",
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": {"code": "turn_timeout", "message": "任务提前结束：达到墙钟上限"},
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "timeout", "真实失败终态不得被 withheld 覆盖")
+        self.assertNotEqual(terminal["terminal_kind"], "redacted_withheld")
+
+    def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
+        self,
+    ) -> None:
+        """Issue #90 评论 5306860255：queue 链路收口此前失败码与安全命中规则完全
+        不可回读，r13 只能靠猜直接原因。独立复核 P1 之后，真实装配把这条低敏
+        审计事件接到 ``apps/worker/cli.py`` 的结构化 stderr 出口（``worker.task.
+        terminal``），不再直接调用 stdlib ``logging``——真实队列 worker 进程
+        从不调用 ``logging.basicConfig()``，经 ``logging`` 发出的调用会被默认
+        阈值悄悄吞掉，运维在容器 stderr 里永远看不到（见 ``cli.py`` 的
+        ``_LogOnlyAlertSender`` 说明）。因此本用例改为断言注入的
+        ``on_terminal_outcome`` 回调收到的字段，与生产装配走同一条协议；
+        端到端的 CLI 接线级证据见 ``tests/test_worker_process.py`` 的
+        ``QueueModeTerminalOutcomeLoggingTest``。
+
+        同时做否定测试：正文样本与 ``user_id``（``open_id`` 的替身）、``prompt``
+        一律不得出现在回调收到的任何字段里。删掉 ``_log_terminal_outcome`` 里对
+        ``self._on_terminal_outcome(...)`` 的调用，或删掉 ``_finish_terminal``
+        里对 ``_log_terminal_outcome`` 的调用，都必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+        forbidden_content_sample = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。"
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": forbidden_content_sample,
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["task_id"], "tsk-1")
+        self.assertEqual(fields["error_kind"], "redacted_withheld")
+        self.assertEqual(fields["terminal_kind"], "redacted_withheld")
+        self.assertIs(fields["output_safety_blocked"], True)
+        self.assertIs(fields["output_safety_withheld"], True)
+        self.assertIn("forbidden_value", fields["output_safety_reasons"])
+        self.assertIs(fields["truncated"], False)
+        # 否定测试：正文样本、user_id（open_id 的替身）与 prompt 一律不得出现在
+        # 回调收到的字段里——这条审计事件的存在不能反过来变成新的敏感信息
+        # 泄漏面。对整个字典做字符串化检查，覆盖任何字段而不是逐个枚举。
+        serialized = repr(fields)
+        self.assertNotIn(forbidden_content_sample, serialized)
+        self.assertNotIn(queue.context.user_id, serialized)
+        self.assertNotIn(queue.context.prompt, serialized)
+
+    def test_terminal_outcome_callback_caps_failure_code_and_reason_length(self) -> None:
+        """Issue #90 评论 5306860255 独立复核 P3-2：``failure_code`` 与
+        ``output_safety`` 的每个原因码目前都来自本仓库固定的枚举式常量，但审计
+        事件是低敏信息的唯一出口——不设长度上界，就是给"未来某次改动不小心把
+        一段自由文本塞进这两个字段"留了一条不设防的泄漏面。截到 64 字符并标记
+        ``truncated=True``。"""
+
+        queue = FakeWorkerQueue()
+        oversized_failure_code = "x" * 100
+        oversized_reason = "y" * 80
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": False,
+                        "final_text": "",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": False,
+                            "reasons": (oversized_reason,),
+                        },
+                    },
+                    "failure": {"code": oversized_failure_code},
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["failure_code"], oversized_failure_code[:64])
+        self.assertEqual(len(fields["failure_code"]), 64)
+        self.assertEqual(fields["output_safety_reasons"], (oversized_reason[:64],))
+        self.assertIs(fields["truncated"], True)
+
+    def test_a_global_stop_signal_interrupts_an_in_flight_turn_within_the_poll_interval(
+        self,
+    ) -> None:
+        """Issue #153：SIGTERM 落地为 ``run(stop_event=...)`` 收到停止信号时，在途
+        任务的 ``_monitor`` 必须把这次全局停机与用户 ``/stop`` 同等对待——不是等
+        任务自然结束（例如撞满 turn_timeout），而是在一个 ``stop_poll_interval``
+        量级的时间内就让执行器收到中断请求，并把任务收口为 ``stopped`` 终态。
+        改掉 ``_monitor`` 里对 ``self._global_stop`` 的检查（或不在 ``run()`` 里
+        赋值它）都必须让本用例变红：要么在途回合永远等不到中断（用例超时），
+        要么虽然结束但终态不是 ``stopped``。
+        """
+
+        queue = FakeWorkerQueue()
+        turn_started = threading.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                turn_started.set()
+                # 真实执行器在 stop_event 被置位时会向 Agent SDK 发起 interrupt()
+                # 并很快返回；这里直接用同一个协作式信号模拟"回合已经响应中断"。
+                await kwargs["stop_event"].wait()  # type: ignore[union-attr]
+                return {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {"code": "interrupted"},
+                }
+
+        service = WorkerService(
+            config=worker_config(stop_poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> float:
+            global_stop = asyncio.Event()
+            run_task = asyncio.create_task(service.run(stop_event=global_stop))
+            started = await asyncio.to_thread(turn_started.wait, 2.0)
+            self.assertTrue(started, "回合应先真正开始执行，才能验证停机信号能中断它")
+            began_stopping_at = time.monotonic()
+            global_stop.set()
+            await asyncio.wait_for(run_task, timeout=2.0)
+            return time.monotonic() - began_stopping_at
+
+        elapsed = asyncio.run(scenario())
+
+        self.assertLess(
+            elapsed,
+            1.0,
+            "全局停机信号必须在一个 stop_poll_interval 量级内让在途回合收到中断"
+            "请求并收口，不能等到轮询周期之外的更长预算",
+        )
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "stopped")
+        self.assertEqual(terminal["error_kind"], "stopped")
+
+    def test_a_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_stops_claiming(
+        self,
+    ) -> None:
+        """PR #173 独立复核 P2-1：`run()` 的 `while not stop.is_set()` 判定与
+        `claim()` 之间没有任何 `await`（心跳、告警 tick、`_housekeep()` 全是同步
+        代码），而 `loop.add_signal_handler` 装的回调靠自管道机制投递，只有
+        事件循环真正让出控制权时才会被处理——纯同步的代码段中间没有能被它
+        插进来的缝隙。真实 SIGTERM 如果恰好在这段同步窗口内被操作系统送达，
+        Python 侧当时只是把回调排进了事件循环的就绪队列，`process_once()`
+        如果不主动让出一次就直接判定，读到的仍是旧值，会把一条还在排队、
+        从未执行过的任务领走，直接收口成 ``stopped`` 且不会被重排。
+
+        复现手法：把 ``_housekeep`` 换成一个"在这次同步调用期间，把停机信号
+        排进事件循环就绪队列"的版本——这精确模拟了"信号回调已排队、尚未
+        执行"这个状态，不依赖真实操作系统信号的时序抖动。
+
+        变异验证：把 `process_once()` 里 `claim()` 前的 `await
+        asyncio.sleep(0)` + 重新判定 `is_set()` 整段删掉，本用例会变红
+        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
+        ``stopped``）。
+        """
+
+        queue = FakeWorkerQueue()
+        claim_calls = 0
+        original_claim = queue.claim
+
+        def counting_claim(**kwargs: object) -> list[ClaimedTask]:
+            nonlocal claim_calls
+            claim_calls += 1
+            return original_claim(**kwargs)
+
+        queue.claim = counting_claim  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        async def scenario() -> None:
+            stop = asyncio.Event()
+
+            # 精确模拟"SIGTERM 的自管道回调已经在事件循环就绪队列里排队、
+            # 但还没被处理"：这次同步的 `_housekeep()` 调用期间，操作系统
+            # 送达了信号，`loop.call_soon` 把 `stop.set` 排进了就绪队列。
+            original_housekeep = service._housekeep
+
+            def housekeeping_that_races_with_sigterm() -> list[object]:
+                asyncio.get_running_loop().call_soon(stop.set)
+                return original_housekeep()
+
+            service._housekeep = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
+
+            run_task = asyncio.ensure_future(service.run(stop_event=stop))
+            await asyncio.wait_for(run_task, timeout=2.0)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(
+            claim_calls,
+            0,
+            "停机信号已经排队后，claim() 不应该再被调用——一条从未执行过的"
+            "排队任务不该被领走后直接收口成 stopped",
+        )
+        self.assertIsNotNone(
+            queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
+        )
+        self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
+
+    def test_liveness_stays_fresh_through_a_long_in_flight_turn(self) -> None:
+        """PR #173 独立复核 P1-5：``_emit_heartbeat()``（进而 ``touch_liveness``）
+        此前只在 ``process_once()`` 开头调用一次，而 ``process_once()`` 会
+        ``await asyncio.gather(...)`` 等完整批任务才返回——任何明显长于活性
+        阈值的正常回合都会把活性文件晾在原地不动，直到该批任务结束，健康检查
+        在系统最忙的时候持续说谎（生产比例：`turn_timeout_seconds` 默认
+        600s、worker 活性阈值默认 60s）。
+
+        本用例用远比生产宽松的比例复现（回合 0.4s、阈值 0.15s，宽松约 4 倍）：
+        ``_monitor`` 本来就按 ``stop_poll_interval_seconds`` 在跳、贯穿整个
+        在途任务的生命周期，是"进程仍在做正确的事"这个信号真正应该来源的
+        地方。
+
+        变异存活证据：把 ``_monitor`` 循环里那次 ``self._emit_heartbeat()``
+        删掉，本用例会变红（活性年龄峰值追上回合时长，超过阈值）。
+        """
+
+        from lingxi.apps.liveness import read_liveness_age_seconds, touch_liveness
+
+        queue = FakeWorkerQueue()
+        turn_seconds = 0.4
+        threshold_seconds = 0.15
+
+        class SlowExecutor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                await asyncio.sleep(turn_seconds)
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            max_age_seen = 0.0
+
+            service = WorkerService(
+                config=worker_config(stop_poll_interval_seconds=0.02),
+                queue=queue,
+                executor_factory=lambda config, marker: SlowExecutor(),
+                heartbeat=lambda: touch_liveness("worker", directory=directory),
+            )
+
+            async def poll_liveness_during_the_turn() -> None:
+                nonlocal max_age_seen
+                deadline = time.monotonic() + turn_seconds + 0.3
+                while time.monotonic() < deadline:
+                    age = read_liveness_age_seconds("worker", directory=directory)
+                    if age is not None:
+                        max_age_seen = max(max_age_seen, age)
+                    await asyncio.sleep(0.02)
+
+            async def scenario() -> None:
+                poller = asyncio.ensure_future(poll_liveness_during_the_turn())
+                await service.process_once()
+                poller.cancel()
+                try:
+                    await poller
+                except asyncio.CancelledError:
+                    pass
+
+            asyncio.run(scenario())
+
+        self.assertLess(
+            max_age_seen,
+            threshold_seconds,
+            "在途任务执行期间活性文件年龄不应超过阈值——否则健康检查会在"
+            "完全正常的长回合期间把容器判定为 unhealthy",
+        )
+
+    def test_a_real_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_stops_claiming(
+        self,
+    ) -> None:
+        """PR #173 独立复核第二轮 P2-1：上一轮 `test_a_sigterm_that_lands_
+        during_the_synchronous_housekeeping_stretch_stops_claiming` 用
+        `loop.call_soon(stop.set)` 模拟"信号回调已排队未执行"被复核证明与
+        真实信号路径不等价——`loop.call_soon` 直接进就绪队列，跳过了
+        `loop.add_signal_handler` 自管道机制的两跳，一次 `sleep(0)` 就够；真实
+        SIGTERM 经自管道投递需要三轮让出才会被观测到（见
+        ``service.py`` 模块顶部 ``_STOP_SIGNAL_DRAIN_YIELDS`` 的机制说明）。
+        本用例改用**真实 POSIX 信号**（进程内 ``os.kill(os.getpid(),
+        signal.SIGTERM)``）经真实 ``_run_queue_worker`` 里真实的
+        ``loop.add_signal_handler`` 路径复现，不再依赖任何模拟。
+
+        复现手法：``os.kill`` 从 ``_housekeep()`` 内部、在它返回前触发——这
+        精确复现"SIGTERM 恰好在 claim() 前的同步窗口内被操作系统送达"这个
+        场景，且是真实内核信号投递，不是任何形式的模拟。
+
+        变异验证：把 `process_once()` 里 claim() 前新增的多轮让出+复判整段
+        删掉（或把 `_STOP_SIGNAL_DRAIN_YIELDS` 改回 1），本用例会变红
+        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
+        ``stopped``，且不会被重排）。
+        """
+
+        from lingxi.adapters.postgres_conversation import ClaimedTask as _ClaimedTask
+        from lingxi.apps.worker.cli import _run_queue_worker
+
+        queue = FakeWorkerQueue()
+        claim_calls = 0
+        original_claim = queue.claim
+
+        def counting_claim(**kwargs: object) -> list[_ClaimedTask]:
+            nonlocal claim_calls
+            claim_calls += 1
+            return original_claim(**kwargs)
+
+        queue.claim = counting_claim  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(poll_interval_seconds=0.01),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        original_housekeep = service._housekeep
+        signal_sent = False
+
+        def housekeeping_that_sends_a_real_sigterm() -> list[object]:
+            nonlocal signal_sent
+            result = original_housekeep()
+            if not signal_sent:
+                signal_sent = True
+                # 真实内核信号，不是模拟。此时 `_run_queue_worker` 已经用真实
+                # `loop.add_signal_handler` 装好了 SIGTERM 处理器，同进程内
+                # 自己发给自己是让真实信号落在这段同步窗口内最直接、最可控的
+                # 方式——处理器已接管，不会走到默认终止行为，不影响测试进程
+                # 本身的存活。
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+
+        service._housekeep = housekeeping_that_sends_a_real_sigterm  # type: ignore[method-assign]
+
+        err = io.StringIO()
+
+        async def scenario() -> None:
+            await _run_queue_worker(
+                service,
+                shutdown_timeout_seconds=2.0,
+                err=err,
+                trace_id="01J00000000000000000000SIG",
+            )
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=8.0))
+
+        self.assertIn(
+            "worker.queue.signal_received",
+            err.getvalue(),
+            "真实信号处理器必须确实跑过一次，否则本用例没有测到真实信号路径",
+        )
+        self.assertEqual(
+            claim_calls,
+            0,
+            "真实 SIGTERM 已经在 housekeeping 同步窗口内送达后，claim() 不应该"
+            "再被调用——一条从未执行过的排队任务不该被领走后直接收口成"
+            " stopped",
+        )
+        self.assertIsNotNone(
+            queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
+        )
+        self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
 
 
 @unittest.skipUnless(DSN, SKIP_DB)
@@ -469,22 +1110,86 @@ class RealQueueTerminalTests(unittest.TestCase):
             with connection.transaction():
                 connection.execute(sql, parameters)
 
-    def test_queued_without_worker_is_failed_and_releases_topic(self) -> None:
+    def _terminal_event(self, task_id: str) -> tuple[str, str, str] | None:
+        """按 ``task_id`` 读回它的 ``terminal`` 投递事件；不存在则 ``None``。
+
+        返回 ``(terminal_kind, error_kind, content)`` 三元组，用于 Issue #178
+        的一组断言：系统代为收口路径必须写出唯一、可投递、内容诚实的终态事件，
+        不能只改 ``task.status``。
+        """
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                """SELECT terminal_kind, error_kind, content FROM task_delivery_event
+                   WHERE task_id = %s AND event_type = 'terminal'""",
+                (task_id,),
+            ).fetchone()
+        return tuple(row) if row is not None else None
+
+    def _event_count(self, task_id: str) -> int:
+        with connect(DSN) as connection:
+            return connection.execute(
+                "SELECT count(*) FROM task_delivery_event WHERE task_id = %s", (task_id,)
+            ).fetchone()[0]
+
+    def test_queued_without_worker_writes_an_honest_terminal_event_and_keeps_the_topic(
+        self,
+    ) -> None:
+        """Issue #178（红线）：系统代为收口不得只改 task.status——必须写出唯一、
+        可投递的用户终态事件，交给 Gateway 正常投递，confirm 后才释放话题。
+        """
+
         self._insert_old_task(task_id="tsk-q", conversation_id="cnv-q")
         terminals = self.queue.reclaim_queued(max_wait=timedelta(minutes=3))
         self.assertEqual([item.error_kind for item in terminals], ["queued_timeout"])
+        self.assertEqual([item.status for item in terminals], ["awaiting_delivery"])
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-q'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
+            # 话题继续占用：还没有人确认送达，同一话题的下一条消息不该被放行
+            # 进来抢占——与真实 worker 写 terminal 事件后的既有语义一致。
+            self.assertEqual(
+                connection.execute(
+                    "SELECT running_task_id FROM conversation WHERE id='cnv-q'"
+                ).fetchone()[0],
+                "tsk-q",
+            )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-q")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "queued_timeout")
+        self.assertEqual(content, default_content_catalog().text("worker.queued_timeout").text)
+        # 唯一：started + terminal，不多不少；确认 Gateway 真的有内容可读。
+        self.assertEqual(self._event_count("tsk-q"), 2)
+
+        # 幂等：housekeeping 重复轮询（进程重启、下一轮 poll）不得再产生第二条
+        # 终态——命中已判过的这一批时，`reclaim_queued` 的查询条件
+        # （`status='queued'`）天然不会再选中它，返回空列表；事件表行数不变。
+        again = self.queue.reclaim_queued(max_wait=timedelta(minutes=3))
+        self.assertEqual(again, [])
+        self.assertEqual(self._event_count("tsk-q"), 2)
+
+        # 闭环：Gateway 消费 outbox 后调用 confirm_delivery，业务终态才真正收敛
+        # 为 failed 并释放话题——不是这条收口路径自己直接释放。
+        confirmed = self.queue.confirm_delivery(
+            task_id="tsk-q", platform_message_kind="text", platform_message_id="om_fake_q"
+        )
+        self.assertTrue(confirmed)
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT status, error_kind FROM task WHERE id='tsk-q'"
+            ).fetchone()
+            self.assertEqual(tuple(row), ("failed", "queued_timeout"))
             self.assertIsNone(
                 connection.execute(
                     "SELECT running_task_id FROM conversation WHERE id='cnv-q'"
                 ).fetchone()[0]
             )
 
-    def test_unavailable_version_is_not_changed_to_stable(self) -> None:
+    def test_unavailable_version_writes_an_honest_terminal_event_and_does_not_change_version(
+        self,
+    ) -> None:
         self._insert_old_task(task_id="tsk-c", conversation_id="cnv-c", version="canary")
         self._insert_old_task(task_id="tsk-s", conversation_id="cnv-s", version="stable")
         terminals = self.queue.fail_unavailable_versions(
@@ -495,19 +1200,31 @@ class RealQueueTerminalTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT status,target_worker_version FROM task WHERE id='tsk-c'"
             ).fetchone()
-            self.assertEqual(row, ("failed", "canary"))
+            self.assertEqual(row, ("awaiting_delivery", "canary"))
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-s'").fetchone()[0],
                 "queued",
             )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-c")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "worker_version_unavailable")
+        self.assertEqual(
+            content, default_content_catalog().text("worker.version_unavailable").text
+        )
+        # 没被判定不可用的 canary 版本本身不该凭空出现终态事件。
+        self.assertIsNone(self._terminal_event("tsk-s"))
 
-    def test_stale_safe_retry_then_exhaustion_and_side_effect_no_replay(self) -> None:
+    def test_stale_safe_retry_then_exhaustion_writes_terminal_events_and_no_replay(
+        self,
+    ) -> None:
         self._insert_old_task(
             task_id="tsk-r", conversation_id="cnv-r", status="running", attempts=1
         )
         self.assertEqual(
             self.queue.reclaim_stale(older_than=timedelta(seconds=90)), ["tsk-r"]
         )
+        # 安全重试的第一轮回到 queued，不写终态事件——不是这条路径要收口的对象。
+        self.assertIsNone(self._terminal_event("tsk-r"))
         claimed = self.queue.claim(worker_id="worker-2", target_worker_version="stable")
         self.assertEqual(claimed[0].attempts, 2)
         with connect(DSN) as connection:
@@ -519,13 +1236,19 @@ class RealQueueTerminalTests(unittest.TestCase):
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-r'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
-            self.assertIsNone(
+            # 重试耗尽是终态收口，话题继续占用直到投递解析。
+            self.assertEqual(
                 connection.execute(
                     "SELECT running_task_id FROM conversation WHERE id='cnv-r'"
-                ).fetchone()[0]
+                ).fetchone()[0],
+                "tsk-r",
             )
+        terminal_kind, error_kind, content = self._terminal_event("tsk-r")
+        self.assertEqual(terminal_kind, "failed")
+        self.assertEqual(error_kind, "retry_exhausted")
+        self.assertEqual(content, default_content_catalog().text("worker.running_timeout").text)
 
         self._insert_old_task(
             task_id="tsk-x",
@@ -538,8 +1261,14 @@ class RealQueueTerminalTests(unittest.TestCase):
         with connect(DSN) as connection:
             self.assertEqual(
                 connection.execute("SELECT status FROM task WHERE id='tsk-x'").fetchone()[0],
-                "failed",
+                "awaiting_delivery",
             )
+        x_terminal_kind, x_error_kind, x_content = self._terminal_event("tsk-x")
+        self.assertEqual(x_terminal_kind, "failed")
+        self.assertEqual(x_error_kind, "side_effect_uncertain")
+        self.assertEqual(
+            x_content, default_content_catalog().text("worker.side_effect_uncertain").text
+        )
 
     def test_listener_receives_committed_notify(self) -> None:
         assert DSN is not None
@@ -575,7 +1304,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             ),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: RecordingDelivery(),
             listener_factory=lambda: listener,
         )
 
@@ -614,7 +1342,10 @@ class RealQueueTerminalTests(unittest.TestCase):
         self.assertTrue(claimed_at)
         self.assertLessEqual(
             claimed_at[0] - queued_at,
-            poll_interval + 0.2,
+            # 0.2 → 0.3：Issue #151 给 _housekeep() 每轮多加了一次真实数据库往返
+            # （expire_undelivered_terminals），在这条真库用例的调度余量上留出对应
+            # 空间，仍然远小于用户可感知的延迟（V-队列-06 只关心"不会无限期悬挂"）。
+            poll_interval + 0.3,
             "丢弃 NOTIFY 后领取不得超过配置轮询上限（含测试调度余量）",
         )
         self.assertEqual(
@@ -667,8 +1398,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             )
         )
 
-        deliveries: list[tuple[str, str, str | None, RecordingDelivery]] = []
-
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
                 return {
@@ -676,39 +1405,45 @@ class RealQueueTerminalTests(unittest.TestCase):
                     "failure": None,
                 }
 
-        def delivery_factory(context, marker):
-            delivery = RecordingDelivery()
-            deliveries.append((context.user_id, context.chat_id, context.thread_id, delivery))
-            return delivery
-
         service = WorkerService(
             config=worker_config(max_concurrency=2),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=delivery_factory,
         )
         asyncio.run(service.process_once())
 
+        # Issue #151：Worker 不再持有出站 transport，投递意图只落在
+        # ``task_delivery_event``。按用户回读各自的终态事件与话题定位，验证
+        # 两个用户互不串用会话或投递定位（V-会话-07）。
+        with connect(DSN) as connection:
+            rows = connection.execute(
+                """
+                SELECT t.user_id, c.feishu_chat_id, c.feishu_thread_id, e.content, t.status
+                  FROM task_delivery_event AS e
+                  JOIN task AS t ON t.id = e.task_id
+                  JOIN conversation AS c ON c.id = t.conversation_id
+                 WHERE e.event_type = 'terminal'
+                 ORDER BY t.user_id
+                """
+            ).fetchall()
+        by_user = {row[0]: row for row in rows}
+        self.assertEqual(set(by_user), {"usr-90", "usr-91"})
         self.assertEqual(
-            {
-                (user_id, chat_id, thread_id)
-                for user_id, chat_id, thread_id, _delivery in deliveries
-            },
-            {
-                ("usr-90", "chat-user-a", "topic-user-a"),
-                ("usr-91", "chat-user-b", "topic-user-b"),
-            },
+            (by_user["usr-90"][1], by_user["usr-90"][2]), ("chat-user-a", "topic-user-a")
         )
         self.assertEqual(
-            {
-                user_id: delivery.events[-1]
-                for user_id, _chat_id, _thread_id, delivery in deliveries
-            },
-            {"usr-90": ("complete", "答案 A"), "usr-91": ("complete", "答案 B")},
+            (by_user["usr-91"][1], by_user["usr-91"][2]), ("chat-user-b", "topic-user-b")
         )
+        self.assertEqual(by_user["usr-90"][3], "答案 A")
+        self.assertEqual(by_user["usr-91"][3], "答案 B")
+        self.assertEqual(by_user["usr-90"][4], "awaiting_delivery")
+        self.assertEqual(by_user["usr-91"][4], "awaiting_delivery")
 
     def test_context_too_long_suggests_new_without_replacing_agent_session(self) -> None:
-        """V-会话-11：上下文超限提示 /new，原 agent_session_id 保持不变。"""
+        """上下文超限提示 /new，原 agent_session_id 保持不变；Issue #151 起失败
+        终态也进入 ``awaiting_delivery`` 并继续占用话题，不再立即释放——释放要等
+        投递解析（confirm_delivery / expire_undelivered_terminals，见
+        ``tests/test_delivery_outbox.py``）。"""
 
         assert DSN is not None
         pipeline = EventPipeline(
@@ -737,7 +1472,6 @@ class RealQueueTerminalTests(unittest.TestCase):
             "UPDATE conversation SET agent_session_id='session-original' WHERE id=%s",
             (conversation_id,),
         )
-        delivery = RecordingDelivery()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
@@ -750,53 +1484,26 @@ class RealQueueTerminalTests(unittest.TestCase):
             config=worker_config(worker_id="worker-context"),
             queue=self.queue,
             executor_factory=lambda config, marker: Executor(),
-            delivery_factory=lambda context, marker: delivery,
         )
         asyncio.run(service.process_once())
 
-        self.assertEqual(self._scalar("SELECT status FROM task"), "failed")
-        self.assertEqual(delivery.events[-1], ("fail", "worker.context_too_long"))
-        self.assertIn("/new", delivery.failed_contents[-1].text)
+        self.assertEqual(self._scalar("SELECT status FROM task"), "awaiting_delivery")
+        terminal = self._scalar(
+            "SELECT content FROM task_delivery_event WHERE event_type='terminal'"
+        )
+        self.assertIn("/new", terminal)
+        self.assertEqual(
+            self._scalar("SELECT error_kind FROM task"), "context_too_long"
+        )
         self.assertEqual(
             self._scalar(
                 "SELECT agent_session_id FROM conversation WHERE id=%s", (conversation_id,)
             ),
             "session-original",
         )
-        self.assertIsNone(self._scalar("SELECT running_task_id FROM conversation"))
-
-    def test_uncertain_side_effect_recovery_has_one_outbound_failure(self) -> None:
-        """V-会话-13：恢复收口按出站调用次数防止重复交付，不只看库行数。"""
-
-        self._insert_old_task(
-            task_id="tsk-side-once",
-            conversation_id="cnv-side-once",
-            status="running",
-            side_effect_state="possible",
-            attempts=1,
-        )
-        deliveries: list[RecordingDelivery] = []
-
-        def delivery_factory(context, marker):
-            delivery = RecordingDelivery()
-            deliveries.append(delivery)
-            return delivery
-
-        service = WorkerService(
-            config=worker_config(worker_id="worker-recovery"),
-            queue=self.queue,
-            delivery_factory=delivery_factory,
-        )
-        asyncio.run(service.process_once())
-        asyncio.run(service.process_once())
-
-        self.assertEqual(self._scalar("SELECT status FROM task WHERE id='tsk-side-once'"), "failed")
-        self.assertEqual(len(deliveries), 1, "恢复后只能创建一次用户可见投递")
-        self.assertEqual(
-            [event for event in deliveries[0].events if event[0] == "fail"],
-            [("fail", "worker.side_effect_uncertain")],
-            "V-会话-13 应断言真实出站调用，不以 task 行数代替",
-        )
+        # 失败终态同样进入 awaiting_delivery，话题继续占用直到投递解析——本
+        # Story 的状态合同第 2 条明确覆盖失败/停止/超时/withheld，不只是成功路径。
+        self.assertIsNotNone(self._scalar("SELECT running_task_id FROM conversation"))
 
     def test_claim_context_keeps_reply_scope_and_finish_persists_session(self) -> None:
         assert DSN is not None
@@ -843,6 +1550,58 @@ class RealQueueTerminalTests(unittest.TestCase):
                 ("session-saved", None),
             )
 
+    def test_finish_queues_the_overwritten_agent_session_for_cleanup(self) -> None:
+        """PR #173 独立复核 P2-4：``finish()`` 用
+        ``agent_session_id = COALESCE(%s, agent_session_id)`` 写回，旧值被新值
+        覆盖时，此前三个既有触发点（``/new``、空闲到点、停用/权限变化）都不会把
+        这个旧 session id 排队做物理清理——话题闲置未满两小时就被新一轮任务
+        覆盖，或真实 CLI 的 ``--resume`` 返回了新 session id，都会让旧的 JSONL
+        永久留在磁盘上。
+
+        用一个已经带着 ``agent_session_id='old-session'`` 的会话验证：新任务
+        ``finish(agent_session_id='new-session')`` 之后，``old-session`` 必须
+        出现在 ``agent_session_cleanup`` 里、原因是 ``session_overwritten``，
+        而 ``new-session`` 不应该被排队（它是活跃会话，不该被清理）。
+        """
+
+        self._insert_old_task(task_id="tsk-overwrite", conversation_id="cnv-overwrite")
+        self.execute(
+            "UPDATE conversation SET agent_session_id='old-session' WHERE id='cnv-overwrite'"
+        )
+
+        claimed = self.queue.claim(worker_id="worker-overwrite", target_worker_version="stable")
+        self.assertEqual(claimed[0].conversation_id, "cnv-overwrite")
+
+        finished = self.queue.finish(
+            task_id=claimed[0].task_id,
+            conversation_id="cnv-overwrite",
+            status="succeeded",
+            worker_id="worker-overwrite",
+            agent_session_id="new-session",
+        )
+        self.assertTrue(finished)
+
+        with connect(DSN) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT agent_session_id FROM conversation WHERE id='cnv-overwrite'"
+                ).fetchone()[0],
+                "new-session",
+            )
+            row = connection.execute(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id='old-session'"
+            ).fetchone()
+            self.assertIsNotNone(
+                row, "被覆盖的旧 session id 必须被排队做物理清理，否则永久留在磁盘上"
+            )
+            self.assertEqual(row[0], "session_overwritten")
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM agent_session_cleanup WHERE agent_session_id='new-session'"
+                ).fetchone(),
+                "刚写入的新 session id 是活跃会话，不该被排队清理",
+            )
+
     def test_enqueue_failure_has_one_catalog_notice_and_reprocesses_after_recovery(self) -> None:
         assert DSN is not None
         log = CallLog()
@@ -884,3 +1643,148 @@ class RealQueueTerminalTests(unittest.TestCase):
             "task_queued",
             "失败事务没有落 inbound_event，故故障恢复后重投必须能够完整入队",
         )
+
+
+@unittest.skipUnless(DSN, SKIP_DB)
+class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
+    """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
+    的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的
+    正确性已在 ``tests/test_delivery_outbox.py`` 的 ``AgentSessionCleanupQueueTests``
+    覆盖，本文件只覆盖 ``WorkerService._cleanup_agent_sessions`` 这一段消费。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        assert DSN is not None
+        ensure_production_schema(DSN)
+
+    def setUp(self) -> None:
+        assert DSN is not None
+        reset_production_rows(DSN)
+        self.queue = PostgresTaskQueue(DSN)
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO app_user
+                       (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                        display_name, department, tenant_key, provisioning_state)
+                       VALUES ('usr-90','ou-90','u-90','un-90','张三','数据部','tk-90','active')"""
+                )
+
+    def _queue_cleanup(self, *, cleanup_id: str, agent_session_id: str, reason: str = "new_command") -> None:
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+                       VALUES (%s, 'usr-90', %s, %s)""",
+                    (cleanup_id, agent_session_id, reason),
+                )
+
+    def test_deletes_the_matching_file_and_marks_the_row_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000000SESS.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-1", agent_session_id="01J00000000000000000000SESS")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            service._cleanup_agent_sessions()
+
+            self.assertFalse(jsonl.exists())
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-1'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_a_cleanup_for_a_session_that_never_produced_a_file_is_still_marked_done(self) -> None:
+        """任务在建会话前就失败，从未真正落过盘——这不是清理失败，必须照常
+        标记完成，不能让一条永远匹配不到文件的记录卡住队列。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._queue_cleanup(cleanup_id="asc-int-2", agent_session_id="01J00000000000000000NEVER")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=Path(tmp),
+            )
+            service._cleanup_agent_sessions()
+
+            with connect(DSN) as connection:
+                done = connection.execute(
+                    "SELECT done_at IS NOT NULL FROM agent_session_cleanup WHERE id='asc-int-2'"
+                ).fetchone()[0]
+            self.assertTrue(done)
+
+    def test_without_a_configured_session_root_the_queue_is_left_untouched(self) -> None:
+        """没有可用会话根目录时整体跳过——不半途认领又做不了事（模块说明）。"""
+
+        self._queue_cleanup(cleanup_id="asc-int-3", agent_session_id="01J00000000000000000SKIP")
+
+        service = WorkerService(config=worker_config(), queue=self.queue, session_root=None)
+        service._cleanup_agent_sessions()
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-3'"
+            ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+
+    def test_a_configured_but_nonexistent_session_root_is_not_marked_done(self) -> None:
+        """PR #173 独立复核 P2-6：``LINGXI_WORKER_SESSION_ROOT`` **配置了**、但指向
+        一个不存在的目录（照抄旧版 ``.env.example`` 的示例值就会这样，镜像固定
+        ``HOME=/tmp``），与"根目录存在、这个会话确实没有文件"必须是两种不同的
+        结果。前者是"这次没法处理"，理应留给下一次十分钟软窗口重试；后者才是
+        "已确认无事可做"。改动前两者被合并成同一个 `mark_done` 分支——
+        `agent_session_cleanup.agent_session_id` 是唯一索引 + `ON CONFLICT DO
+        NOTHING`，一旦被标记完成就再也不会被重新排队，事后把配置改对也补不回来。
+        """
+
+        self._queue_cleanup(cleanup_id="asc-int-5", agent_session_id="01J00000000000000NOTREAL")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_root = Path(tmp) / "does-not-exist"
+            self.assertFalse(missing_root.exists())
+
+            service = WorkerService(
+                config=worker_config(), queue=self.queue, session_root=missing_root
+            )
+            service._cleanup_agent_sessions()
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT claimed_at, done_at FROM agent_session_cleanup WHERE id='asc-int-5'"
+            ).fetchone()
+        self.assertIsNotNone(
+            row[0], "这一条应该已经被认领——不该半途放弃到连 claimed_at 都不写"
+        )
+        self.assertIsNone(
+            row[1],
+            "根目录不存在时不能标记完成：事后把配置改对也补不回一条已经被"
+            "标记完成的行（唯一索引 + ON CONFLICT DO NOTHING）",
+        )
+
+    def test_runs_end_to_end_through_process_once_via_the_housekeep_round(self) -> None:
+        """确认接线到了真正的入口——``process_once()`` 而不是只有直接调用私有
+        方法才生效（否则装配一处没接对，生产环境永远不会真正清理）。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp)
+            jsonl = session_root / "01J00000000000000000PROCE.jsonl"
+            jsonl.write_text("{}", encoding="utf-8")
+            self._queue_cleanup(cleanup_id="asc-int-4", agent_session_id="01J00000000000000000PROCE")
+
+            service = WorkerService(
+                config=worker_config(),
+                queue=self.queue,
+                session_root=session_root,
+            )
+            asyncio.run(service.process_once())
+
+            self.assertFalse(jsonl.exists())

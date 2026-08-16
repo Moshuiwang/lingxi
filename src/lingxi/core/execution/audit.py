@@ -641,6 +641,31 @@ def redact_free_text(text: str) -> str:
     return _redact_free_text(text)
 
 
+#: 匹配 URL 查询串里形如 ``?key=value``/``&key=value`` 的一段，只捕获**值**
+#: （group 1 是含分隔符与等号的前缀，原样保留；group 2 是要盖住的值）。不要求
+#: 完整解析成合法 URL——第三方 SDK 的连接日志可能把 URL 嵌在别的文字里
+#: （如 ``"connected to wss://...?ticket=..."``），逐段匹配比先 urlparse 更稳。
+_QUERY_PARAM_VALUE = re.compile(r'([?&][^&=\s"\']+=)([^&\s"\']*)')
+
+
+def redact_query_parameter_values(text: str) -> str:
+    """把文本里 URL 查询参数的**值**统一替换为掩码，参数名保留（Issue #176）。
+
+    第三方 SDK（如飞书官方 ``lark_oapi``）建立长连接时会把完整 URL 打进日志，
+    查询串里可能携带 ``ticket``/``access_key`` 一类一次性凭据材料。这里不假设
+    具体参数名单——**宁可过宽**：只要形状匹配查询参数，值一律替换为 ``***``，
+    不区分参数名是否"看起来像"凭据。保留参数名是为了让日志仍能诊断出查询串的
+    形状（少了哪个参数、参数是否为空），而不是把整段查询串整体抹掉。
+
+    与 :func:`redact_free_text` 是两类互补脱敏，不是重复实现：那一个按**键名
+    关键词**匹配（``token``/``secret``/``password`` 等），管的是自由文本里的
+    赋值语句；这一个按**URL 查询串的位置**匹配，管的是查询参数值本身，不要求
+    参数名匹配任何关键词——两者可以同时施加，互不冲突。
+    """
+
+    return _QUERY_PARAM_VALUE.sub(lambda m: m.group(1) + "***", text)
+
+
 def _redact_free_text(text: str) -> str:
     """自由文本（错误原文、回执正文、畸形工具名）的脱敏。
 

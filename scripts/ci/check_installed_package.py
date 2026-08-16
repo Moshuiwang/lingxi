@@ -41,6 +41,12 @@ REQUIRED_MODULES = (
     "lingxi.adapters",
     "lingxi.apps",
     "lingxi.apps.worker",
+    # Issue #153：三个常驻进程共用的活性心跳与健康检查命令。它们不是独立进程，
+    # 是随镜像一起装的 `python -m lingxi.apps.healthcheck`，由 compose 的
+    # `healthcheck.test` 以 `docker exec` 语义调用。
+    "lingxi.apps.liveness",
+    "lingxi.apps.healthcheck",
+    "lingxi.apps.healthcheck.__main__",
     "lingxi.config",
     "lingxi.config.content",
     "lingxi.core",
@@ -61,6 +67,10 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
     "lingxi.core.execution.card_stream",
+    # 投递事件 outbox 的纯领域逻辑（Issue #151）：终态分类与解析规则，
+    # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+    "lingxi.core.delivery",
+    "lingxi.core.delivery.ports",
     "lingxi.adapters.claude_agent_hooks",
     "lingxi.core.permission.galaxy_export",
     "lingxi.core.permission.galaxy_scope",
@@ -97,8 +107,8 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
-    "lingxi.apps.worker.delivery",
     "lingxi.apps.worker.service",
+    "lingxi.apps.worker.session_cleanup",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
     # 新的顶层子目录，与 apps/ 当初同一个形状：漏进制品只在部署时暴露。
@@ -113,6 +123,13 @@ REQUIRED_MODULES = (
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
+    # Gateway 投递消费循环（Issue #152）：CardKit 流式卡片/文本兜底 adapter 与
+    # 消费循环编排，各自都在制品里必须能 import。
+    "lingxi.adapters.feishu_delivery",
+    "lingxi.apps.gateway.delivery",
+    # 第三方飞书 SDK 连接日志的凭据脱敏（Issue #176），在 gateway main() 装配时
+    # 调用，制品必须真的带上这个模块。
+    "lingxi.apps.gateway.log_redaction",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -167,6 +184,13 @@ _INSTALL_MARKERS = ("site-packages", "dist-packages")
 # 第三方那一列是从进程入口逐个追 import 链得到的，不是照抄 pyproject——照抄的话
 # 这个检查就永远不会红。CI 在**每个 extra 各自的干净环境**里跑对应的一项，
 # 见 .github/workflows/ci.yml 的 `Epic Full / extras` 矩阵。
+#
+# 第一列还包含沿途所有存在的父包 `__init__`（`lingxi`、`lingxi.core` 等）：Python
+# 导入任何子模块前都会先执行这些父包，`process_source_closure` 会把它们一并纳入
+# 闭包（Issue #116）。`lingxi.core.conversation` 的 `__init__.py` 本身 re-export
+# 了 `commands` / `pipeline` / `session_window`，所以只导入 `...conversation.ports`
+# 的 worker 实际上也会连带加载这三个子模块——这是加固前真实存在的登记缺口，
+# 不是补一个理论场景。
 PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "scheduler": (
         # `scheduler.__main__` 在模块级 `raise SystemExit(main())`（没有 __name__ 卫语句），
@@ -175,9 +199,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # 函数内 import 意味着"进程能起来"证明不了"这两个模块装得上"——正是 #29 之后
         # 建立的防漂移机制在这里的缺口：不列进来，extras 那条干净环境的腿永远不会红。
         (
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.scheduler",
             "lingxi.apps.scheduler.__main__",
+            # Issue #153：main() 装配的健康检查/活性文件命令，随镜像一起装，
+            # 由 compose 的 healthcheck.test 以 `docker exec` 语义调用。
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
@@ -185,12 +218,26 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
             "lingxi.adapters.postgres",
+            # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
+            # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
+            # 包（`__init__.py` 一次性 re-export 四个子模块）与 `core.delivery`
+            # 一并拉进闭包，同样必须显式登记，理由与上面同一条注释。
+            "lingxi.adapters.postgres_conversation",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
             "lingxi.core.alerting",
             "lingxi.core.ids",
+            "lingxi.core.conversation",
+            "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.pipeline",
+            "lingxi.core.conversation.ports",
+            "lingxi.core.conversation.session_window",
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
         ),
         # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
         # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
@@ -198,13 +245,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "reauthorize": (
         (
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.reauthorize",
             "lingxi.apps.reauthorize.__main__",
+            "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.ids",
@@ -213,21 +265,39 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "worker": (
         (
+            "lingxi",
+            "lingxi.apps",
+            "lingxi.apps.worker",
             "lingxi.apps.worker.__main__",
             "lingxi.apps.worker.cli",
             "lingxi.apps.worker.config",
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
-            "lingxi.apps.worker.delivery",
             "lingxi.apps.worker.service",
+            "lingxi.apps.worker.session_cleanup",
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
+            "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.core",
+            "lingxi.core.alerting",
+            "lingxi.core.conversation",
+            "lingxi.core.conversation.commands",
+            "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
+            "lingxi.core.conversation.session_window",
+            # 投递事件 outbox 的纯领域逻辑（Issue #151），由
+            # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
+            "lingxi.core.execution",
             "lingxi.core.execution.audit",
-            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
@@ -240,20 +310,61 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (
             # 注意导入的是承载 ``main`` 的包与 ``__main__``：后者带 ``if __name__``
             # 卫语句（与 worker 同惯例），import 它不会真的把长连接跑起来。
+            "lingxi",
+            "lingxi.apps",
             "lingxi.apps.gateway",
             "lingxi.apps.gateway.config",
             "lingxi.apps.gateway.__main__",
+            "lingxi.apps.liveness",
+            "lingxi.apps.healthcheck",
+            "lingxi.apps.healthcheck.__main__",
+            "lingxi.config",
             "lingxi.config.content",
+            "lingxi.adapters",
             "lingxi.adapters.feishu_events",
             "lingxi.adapters.feishu_longconn",
             "lingxi.adapters.feishu_outbound",
             "lingxi.adapters.postgres_conversation",
             "lingxi.adapters.postgres",
+            # 投递消费循环（Issue #152）：CardKit/文本兜底 adapter 由
+            # apps.gateway.assemble_delivery_consumer 在函数内 import；
+            # apps.gateway.delivery 又在函数内 import 到它——两者都不在模块顶层，
+            # 因此必须显式登记，理由与本文件其余"函数内 import"条目一致。
+            "lingxi.adapters.feishu_delivery",
+            "lingxi.apps.gateway.delivery",
+            # 最小告警装配（Issue #153）：build_alerting_duty 在函数内 import
+            # FeishuGroupMessages（只在配置了管理群时才用得到，其余时候走
+            # 日志出口，但两条路径都必须能真的装得上）；FeishuGroupMessages 又
+            # 模块级 import adapters.feishu_directory 的 urllib 传输，后者本身
+            # 模块级依赖 core.identity.credentials（AuthorizationGrant/SecretToken
+            # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
+            "lingxi.adapters.feishu_group_message",
+            "lingxi.adapters.feishu_directory",
+            "lingxi.core",
+            "lingxi.core.alerting",
+            "lingxi.core.identity",
+            "lingxi.core.identity.credentials",
+            "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
+            # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
+            # 终态解析规则。apps.gateway.delivery 额外直接依赖 core.execution.*
+            # ——卡片顺序、限流与失败回退（Issue #152）。
+            "lingxi.core.delivery",
+            "lingxi.core.delivery.ports",
+            "lingxi.core.execution",
+            "lingxi.core.execution.card_stream",
             "lingxi.core.ids",
+            # 第三方 SDK 连接日志的凭据脱敏（Issue #176），main() 顶层 import；
+            # 复用 core.execution.audit 里唯一一份查询参数脱敏纯函数，该模块又
+            # 模块级依赖 core.execution.tool_policy（DenyReasonCode 等审计形状），
+            # 因此这条链一并登记。
+            "lingxi.apps.gateway.log_redaction",
+            "lingxi.core.execution.audit",
+            "lingxi.core.execution.tool_policy",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
         # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import
@@ -265,12 +376,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # 制品豁免，但它们依赖的正式 core.identity.onboarding 仍属于正式制品清单。
     "bot-test": (
         (
+            "lingxi",
+            "lingxi.adapters",
             "lingxi.adapters.feishu_onboarding",
             "lingxi.adapters.oauth_bridge",
             "lingxi.adapters.oauth_bridge_client",
             "lingxi.adapters.refresh_tokens",
             "lingxi.adapters.postgres_onboarding",
             "lingxi.adapters.postgres",
+            "lingxi.core",
+            "lingxi.core.identity",
             "lingxi.core.identity.onboarding",
         ),
         ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
@@ -289,10 +404,23 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 # 每个 extra 的源码入口。下面的静态闭包会遍历函数体内的延迟 import，反向证明
 # PROCESS_RUNTIME_IMPORTS 没有漏掉某个实际会被该进程加载的 lingxi 模块。
 PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
-    "scheduler": ("lingxi.apps.scheduler", "lingxi.apps.scheduler.__main__"),
+    # `apps.healthcheck.__main__` 追加进三个进程各自的入口集合：它不是被
+    # scheduler/gateway/worker 的模块 import 到的，是随同一个镜像装的独立命令，
+    # 由 compose 的 `healthcheck.test` 以 `docker exec` 语义单独调用（Issue
+    # #153）。加进来才能让静态闭包真的走到它的函数内 import（`lingxi.adapters.
+    # postgres`），反向证明每个进程的 extra 里健康检查命令本身也装得上。
+    "scheduler": (
+        "lingxi.apps.scheduler",
+        "lingxi.apps.scheduler.__main__",
+        "lingxi.apps.healthcheck.__main__",
+    ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
-    "worker": ("lingxi.apps.worker.__main__",),
-    "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.__main__"),
+    "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),
+    "gateway": (
+        "lingxi.apps.gateway",
+        "lingxi.apps.gateway.__main__",
+        "lingxi.apps.healthcheck.__main__",
+    ),
     "bot-test": (
         "lingxi.adapters.feishu_onboarding",
         "lingxi.adapters.oauth_bridge",
@@ -418,10 +546,30 @@ def _source_imports(module: str, source_files: Mapping[str, pathlib.Path]) -> se
     return found
 
 
+def _ancestor_packages(module: str, source_files: Mapping[str, pathlib.Path]) -> list[str]:
+    """返回一个模块路径上、在源码树里确实存在 `__init__.py` 的父包（不含自身）。
+
+    Python 导入 ``lingxi.core.conversation.pipeline`` 之前，会先依次执行
+    ``lingxi/__init__.py``、``lingxi/core/__init__.py``、
+    ``lingxi/core/conversation/__init__.py``——这些父包 `__init__` 是该模块真实会
+    被加载的一部分，即便当前它们是空文件或只 import 已登记的子模块。若不把它们
+    带进闭包，父包 `__init__` 日后新增未登记依赖时，`--source-only` 门禁看不见，
+    只会在部署后的干净镜像里才暴露（Issue #116）。
+    """
+
+    parts = module.split(".")
+    ancestors: list[str] = []
+    for end in range(1, len(parts)):
+        candidate = ".".join(parts[:end])
+        if candidate in source_files:
+            ancestors.append(candidate)
+    return ancestors
+
+
 def process_source_closure(
     extra: str, source_files: Mapping[str, pathlib.Path] | None = None
 ) -> set[str]:
-    """计算一个进程入口实际会加载的 lingxi 模块闭包。"""
+    """计算一个进程入口实际会加载的 lingxi 模块闭包，含沿途所有存在的父包 `__init__`。"""
 
     files = source_module_files() if source_files is None else source_files
     roots = PROCESS_SOURCE_ENTRY_POINTS[extra]
@@ -433,6 +581,7 @@ def process_source_closure(
             continue
         seen.add(module)
         pending.extend(_source_imports(module, files) - seen)
+        pending.extend(name for name in _ancestor_packages(module, files) if name not in seen)
     return seen
 
 

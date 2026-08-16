@@ -30,6 +30,7 @@ from lingxi.adapters.feishu_events import (
     NonPrivateChatError,
     parse_message_event,
 )
+from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
     EventPipeline,
@@ -42,6 +43,10 @@ from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, 
 from lingxi.core.conversation.session_window import should_resume_session
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+# 产品负责人 2026-08-16 定稿的 `/new` 成功文字确认（Issue #175 评论 5306860379），
+# 逐字比对；下方 ``test_new_session_text_matches_the_pm_final_copy`` 另外断言内容
+# 目录里的实际值与这个定稿一致，两头都不能漂移。
+NEW_SESSION_TEXT = "已开启新会话，可以开始提问。"
 
 
 def message(
@@ -77,9 +82,15 @@ class PipelineTestCase(unittest.TestCase):
         fail_on: str | None = None,
         reaction_error: Exception | None = None,
         onboarding=None,
+        force_clear_agent_session_result: bool | None = None,
     ):
         return EventPipeline(
-            store=FakeStore(self.state, self.log, fail_on=fail_on),
+            store=FakeStore(
+                self.state,
+                self.log,
+                fail_on=fail_on,
+                force_clear_agent_session_result=force_clear_agent_session_result,
+            ),
             reactions=FakeReactions(self.log, fail_with=reaction_error),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
@@ -190,6 +201,48 @@ class DuplicateDeliveryTests(PipelineTestCase):
             self.log.count("reply.send_text"), replies_after_first, "第二次不得再发任何回复"
         )
         self.assertEqual(len(self.state.tasks), 1, "重复投递至多产生一个任务")
+
+
+class DeliveryExpiredNoticeTests(PipelineTestCase):
+    """Issue #152、`V-投递-06` 后半句：到期未投递的正文只在用户下一条主动消息上
+    提示一次「请重新提问」，不主动推送、不重放旧答案。"""
+
+    def test_pending_notice_is_appended_once_and_not_repeated(self) -> None:
+        # 首次 ensure_conversation 分配的会话标识是 FakeTransaction 的既定行为
+        # （见 gateway_fakes.py），预置在同一个话题上。
+        self.state.pending_delivery_expired_notices.add("cnv_0")
+
+        self.build().handle_message(message("e1"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertTrue(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "有一条尚未提示过的到期任务时，这条主动消息应当附带一次提示",
+        )
+
+        self.log = CallLog()
+        self.build().handle_message(message("e2"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertFalse(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "同一次到期只提示一次，不随后续消息反复提示",
+        )
+
+    def test_pending_notice_does_not_block_the_message_from_being_queued(self) -> None:
+        self.state.pending_delivery_expired_notices.add("cnv_0")
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(
+            outcome.handled_as,
+            HandledAs.TASK_QUEUED,
+            "过期提示只是追加的一条回复，不改变这条消息本身该有的正常处理结果",
+        )
+
+    def test_no_pending_notice_means_no_extra_reply(self) -> None:
+        self.build().handle_message(message("e1"), now=NOW)
+        replies = self.log.fields("reply.send_text")
+        self.assertFalse(
+            any("请重新提问" in reply["text"] for reply in replies),
+            "没有预置到期任务时不应该凭空出现提示",
+        )
 
 
 class TaskOwnershipTests(unittest.TestCase):
@@ -415,9 +468,17 @@ class BusyCommandTests(PipelineTestCase):
             "忙碌期的 /new 不得清空上下文（合同把 /new 列入忙碌期受限命令）",
         )
         self.assertEqual(len(self.state.tasks), 0, "忙碌期的 /new 不得入队")
+        replies = self.log.fields("reply.send_text")
         self.assertEqual(
-            self.log.fields("reply.send_text")[0]["text"],
-            BUSY_HINT_TEXT,
+            len(replies),
+            1,
+            "忙碌期的 /new 沿用现有忙碌提示，不得额外追加「已开启新会话」文案",
+        )
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+        self.assertNotEqual(
+            replies[0]["text"],
+            NEW_SESSION_TEXT,
+            "否定测试：忙碌分支不得出现 /new 成功文案",
         )
 
     def test_stop_during_busy_is_processed_not_deflected(self) -> None:
@@ -439,6 +500,69 @@ class BusyCommandTests(PipelineTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertIsNone(self.conversation.agent_session_id)
+
+    def test_new_when_idle_sends_exactly_one_success_confirmation(self) -> None:
+        """Issue #175（2026-08-16 定稿）：空闲 /new 除表情外，恰好一条文字确认，
+        内容与产品负责人定稿逐字一致。"""
+
+        self.conversation.running_task_id = None
+        self.build().handle_message(message(text="/new"), now=NOW)
+
+        self.assertEqual(self.log.count("reaction.add"), 1, "表情仍作为「已收到」信号保留")
+        self.assertEqual(len(self.state.tasks), 0, "/new 依旧不创建问数任务")
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1, "空闲 /new 恰好一条文字回复")
+        self.assertEqual(replies[0]["text"], NEW_SESSION_TEXT)
+
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content_key"], "gateway.new_session")
+        self.assertTrue(sent[0]["content_version"])
+
+    def test_new_race_loses_the_clear_gets_only_the_busy_hint_not_the_success_text(
+        self,
+    ) -> None:
+        """P2-1（独立审核）：busy 快照（事务开头 `ensure_conversation` 读到的
+        `running_task_id`）是空闲的，但真正执行 `clear_agent_session` 时已经
+        影响 0 行——对称于源码注释「清空本身再判一次忙碌」描述的竞态：另一条连接
+        在两次读取之间抢占成功。这时必须整体落到忙碌分支，`gateway.new_session`
+        绝不能和忙碌提示一起出现，否则会把一次没有真正清空上下文的 `/new` 误报
+        成功。用 `force_clear_agent_session_result=False` 直接注入这一步的返回
+        值，不依赖真实线程调度就能稳定复现（真库并发版本见
+        `test_gateway_postgres.NewCommandRaceTests`）。"""
+
+        self.conversation.running_task_id = None
+        outcome = self.build(force_clear_agent_session_result=False).handle_message(
+            message(text="/new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.conversation.agent_session_id,
+            "ses_1",
+            "竞态中真正没有清空的上下文不得被当作已经清空",
+        )
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1, "竞态分支恰好一条回复")
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+        self.assertNotEqual(
+            replies[0]["text"],
+            NEW_SESSION_TEXT,
+            "否定测试：竞态分支不得出现 /new 成功文案",
+        )
+        self.assertNotIn(
+            "gateway.new_session",
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            "否定测试：竞态分支的审计记录里不得出现成功文案的内容键",
+        )
+
+    def test_new_session_text_matches_the_pm_final_copy(self) -> None:
+        """内容目录里的 ``gateway.new_session`` 必须逐字等于 2026-08-16 定稿，
+        与上面注入测试用的字面量不得漂移。"""
+
+        self.assertEqual(
+            default_content_catalog().text("gateway.new_session").text, NEW_SESSION_TEXT
+        )
 
 
 class EnqueueFailureTests(PipelineTestCase):

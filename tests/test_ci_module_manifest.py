@@ -193,6 +193,54 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         self.assertEqual(CHECKER.process_source_closure("migrate"), set())
         self.assertIn("migrate", CHECKER.PROCESS_ENTRY_EXEMPTIONS)
 
+    def test_a_parent_package_init_gaining_a_dependency_is_reported(self) -> None:
+        """Issue #116：父包 `__init__` 新增未登记依赖必须让进程闭包门禁变红。
+
+        Python 导入 `lingxi.core.execution.audit`（worker 已登记的入口之一）前会先
+        执行 `lingxi/core/__init__.py`；加固前的闭包计算只追最深子模块，看不见父包
+        `__init__` 里新增的 import，问题会留到干净镜像启动才暴露。这里直接在父包
+        `__init__` 里加一个新依赖，断言闭包能追到它、且未登记时门禁报红。
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory) / "lingxi"
+            shutil.copytree(CHECKER.SOURCE_ROOT, temporary_root)
+
+            new_module = temporary_root / "core" / "synthetic_parent_dependency.py"
+            new_module.write_text("MARKER = 'synthetic'\n", encoding="utf-8")
+            core_init = temporary_root / "core" / "__init__.py"
+            core_init.write_text(
+                core_init.read_text(encoding="utf-8")
+                + "\nfrom lingxi.core.synthetic_parent_dependency import MARKER\n",
+                encoding="utf-8",
+            )
+
+            original_root = CHECKER.SOURCE_ROOT
+            CHECKER.SOURCE_ROOT = temporary_root
+            try:
+                files = CHECKER.source_module_files()
+                worker_closure = CHECKER.process_source_closure("worker", files)
+                failures = CHECKER.check_module_manifests(
+                    source_modules=set(files),
+                    required_modules=(
+                        *CHECKER.REQUIRED_MODULES,
+                        "lingxi.core.synthetic_parent_dependency",
+                    ),
+                )
+            finally:
+                CHECKER.SOURCE_ROOT = original_root
+
+        self.assertIn(
+            "lingxi.core.synthetic_parent_dependency",
+            worker_closure,
+            "父包 __init__ 新增的依赖必须出现在依赖它的进程闭包里",
+        )
+        self.assertTrue(failures)
+        self.assertTrue(
+            any("lingxi.core.synthetic_parent_dependency" in line for line in failures)
+        )
+        self.assertTrue(any("import 闭包" in line for line in failures))
+
 
 if __name__ == "__main__":
     unittest.main()

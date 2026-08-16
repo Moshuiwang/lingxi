@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from lingxi.adapters.claude_agent_session import (
     AgentSessionInterrupted,
+    DrainTimeoutError,
     build_agent_options,
     run_single_turn,
 )
@@ -33,10 +34,37 @@ from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_e
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 
-from .config import WorkerConfig
+from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
 
 _MAX_FAILURE_TEXT = 500
+
+def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: str) -> str:
+    """把合成 system prompt 确定性注入最终正文，供出口安全约束命中（#142）。
+
+    - ``withheld``：整段替换为 system prompt——整串命中覆盖全部正文、无业务内容
+      幸存，``constrain_output`` 必然给出 ``withheld=True``；
+    - ``masked``：固定幸存句 + 模型正文（如有）+ system prompt——幸存句不含任何
+      已知敏感模式，且配置期已拒绝"合成提示是幸存句子串"的形态（独立审核 F2/F3），
+      因此**无论模型正文是什么**（哪怕整段都是可遮蔽的标记，例如模型恰好输出
+      ``system prompt`` 字样），幸存句都保证命中区间之外有真实内容，必然
+      ``blocked=True`` 且 ``withheld=False``。第一版实现依赖"模型正文有幸存内容"
+      的运行期判定，独立审核 F3 实证证明可遮蔽正文会让 masked 滑进 withheld——
+      确定性必须由构造保证，不能由模型行为保证。
+
+    两个档位都不依赖模型行为：r17 的教训是把触发条件寄托在"模型恰好复述提示词"
+    上，真实链路一次都没有触发过。注入发生在 ``build_report``（出口约束所在地）
+    之前，走的是与真实泄露完全相同的检测与投影路径。
+    """
+
+    if mode == "withheld":
+        return system_prompt
+    base = (
+        f"{OUTPUT_SAFETY_CANARY_SURVIVOR_BODY}\n{final_text}"
+        if final_text
+        else OUTPUT_SAFETY_CANARY_SURVIVOR_BODY
+    )
+    return f"{base}\n{system_prompt}"
 
 
 class WorkerTurnExecutor:
@@ -53,6 +81,7 @@ class WorkerTurnExecutor:
         stderr_stream: Any | None = None,
         clock: Callable[[], float] | None = None,
         mark_external_side_effect: Callable[[], None] | None = None,
+        propagate_cancellation: bool = False,
     ) -> None:
         self._config = config
         self._policy = ToolPolicy(allowed_tools=(config.read_only_tool,))
@@ -68,6 +97,10 @@ class WorkerTurnExecutor:
         self._options: Any = None
         self._stderr_stream = sys.stderr if stderr_stream is None else stderr_stream
         self._clock = time.monotonic if clock is None else clock
+        # 见 `run_turn` 里 `except asyncio.CancelledError` 分支的说明（PR #173
+        # 独立复核 P1-3）：默认 False，保持一次性 turn 模式 CLI 的既有行为
+        # （stdout 必须恰好一个 JSON 报告，取消也要留下可辨认的失败回合）。
+        self._propagate_cancellation = propagate_cancellation
 
     @property
     def policy(self) -> ToolPolicy:
@@ -104,12 +137,12 @@ class WorkerTurnExecutor:
         全部出口纪律（Codex 复查发现）。"""
 
         text = redact_free_text(str(line))[:500]
-        record = {
-            "level": "warning",
-            "event": "worker.sdk.stderr",
-            "trace_id": self._config.trace_id,
-            "line": text,
-        }
+        self._emit_stderr_record(level="warning", event="worker.sdk.stderr", line=text)
+
+    def _emit_stderr_record(self, **fields: object) -> None:
+        """结构化 stderr 输出的唯一出口：每行一个 JSON 对象，恒带 trace_id。"""
+
+        record = {"trace_id": self._config.trace_id, **fields}
         self._stderr_stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         self._stderr_stream.write("\n")
         self._stderr_stream.flush()
@@ -135,6 +168,10 @@ class WorkerTurnExecutor:
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
         started_at = self._clock()
+        # #143：业务耗时由适配器在业务阶段结束时回填一次；收尾耗时事后用
+        # "总耗时 - 业务耗时" 推得。适配器没有机会调用回调时（例如构造选项就
+        # 失败）保持未知，不能构造数据。
+        business_phase: dict[str, float] = {}
 
         def handle_event(event: Mapping[str, Any]) -> None:
             recorder.handle(event)
@@ -158,18 +195,43 @@ class WorkerTurnExecutor:
                     timeout_seconds=self._config.turn_timeout_seconds,
                     resume_session_id=resume_session_id,
                     stop_event=stop_event,
+                    drain_grace_seconds=self._config.drain_grace_seconds,
+                    clock=self._clock,
+                    on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
                 )
         except AgentSessionInterrupted as error:
             failure = _failure("interrupted", error)
+        except DrainTimeoutError as error:
+            # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
+            # 成 turn_timeout（#143：收尾宽限独立且有界）。
+            failure = _failure_message(
+                "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
+            )
+            del error
         except TimeoutError as error:
             # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
             # 没有这个分支整个回合会永久等待（Codex 复查发现）。
             del error
             failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
         except asyncio.CancelledError:
-            # BaseException 不接住就没有报告，违反 cli 的 stdout 契约
-            # 「恰好一个 JSON 对象」；取消也要留下一份可辨认的失败回合，不能伪装成
-            # 正常完成或墙钟超时。
+            # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
+            # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
+            # 失败回合，不能伪装成正常完成或墙钟超时。
+            #
+            # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
+            # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
+            # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
+            # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
+            # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
+            # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
+            # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
+            # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
+            # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
+            # 路径。真实证据：`tests/test_worker_process.py` 的
+            # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
+            # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
+            if self._propagate_cancellation:
+                raise
             failure = _failure_message("cancelled", "任务已取消，未继续执行")
         except KeyboardInterrupt as error:
             failure = _failure("interrupted", error)
@@ -180,6 +242,31 @@ class WorkerTurnExecutor:
             failure = _sdk_termination_failure(recorder)
 
         duration_seconds = max(0.0, self._clock() - started_at)
+        business_duration_seconds = business_phase.get("seconds")
+        drain_duration_seconds = (
+            max(0.0, duration_seconds - business_duration_seconds)
+            if business_duration_seconds is not None
+            else None
+        )
+
+        final_text = recorder.final_text
+        if self._config.output_safety_canary is not None and failure is None:
+            # 默认关闭；开启时 WorkerConfig.__post_init__ 已保证 system_prompt
+            # 非空。**只对没有失败的回合注入**（独立审核 F1）：超时、会话失败、
+            # 中断等真实失败必须保留原样的失败终态——注入会让 withheld 覆盖
+            # 真实失败原因，验收拿到的就是假证据。注入留一条低敏结构化痕迹
+            # （不含提示词或正文原文），让验收能从 Worker 日志确认"这一轮的
+            # 安全终态出自 canary，不是真实泄露"。
+            final_text = _inject_output_safety_canary(
+                final_text,
+                mode=self._config.output_safety_canary,
+                system_prompt=self._config.system_prompt or "",
+            )
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.output_safety_canary_injected",
+                mode=self._config.output_safety_canary,
+            )
 
         return build_report(
             trace_id=self._config.trace_id,
@@ -187,11 +274,14 @@ class WorkerTurnExecutor:
             allowed_tools=self._policy.allowed_tools,
             summary=self._audit.summary(),
             stream=recorder,
-            final_text=recorder.final_text,
+            final_text=final_text,
             duration_seconds=duration_seconds,
             failure=failure,
             external_texts=tuple(text for _, text in normalized_external_texts),
             system_prompt=self._config.system_prompt,
+            business_execution_budget_seconds=self._config.turn_timeout_seconds,
+            business_duration_seconds=business_duration_seconds,
+            drain_duration_seconds=drain_duration_seconds,
         )
 
 

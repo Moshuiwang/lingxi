@@ -3,34 +3,40 @@
 本目录是 Lingxi 的部署编排。**它不是部署设计文档**——部署方案在[架构设计「八、部署与发布」](../docs/技术设计/架构设计.md)定稿，部署对代码的约束在[验证与门禁「十二、部署对代码的约束」](../docs/技术设计/验证与门禁.md)。这里只写"怎么执行"。
 
 > **本批交付的是编排与门禁，不是一次已完成的部署。**
-> `biai-stage` 的安装、健康回读、Bot-Test 真实入口与切回旧 tag 演练**尚未执行**；`biplus-prod` 一切未动。生产部署另建独立 `[ops]` Issue，固定镜像 digest、备份点、执行窗口、观察期与回滚目标。
+> `biai-stage` 的安装、健康回读、Bot-Test 真实入口与切回旧 tag 演练**尚未执行**；`biplus-prod` 一切未动。生产部署另建独立 `[ops]` Issue，固定镜像 digest、备份点、执行窗口、观察期与回滚目标。**`mvp` profile（见下）仅在本地 `docker compose config` 结构层面验证过，未在 `biai-stage`/`biplus-prod` 实际安装或跑通。**
 
 ## 本版包含哪些进程
 
 | 服务 | 形态 | 入口 | 说明 |
 | --- | --- | --- | --- |
-| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据（「四达文档会议助手」`refresh_token`）到期轮换扫描 |
-| `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57 / S4 前半）。放在非默认 profile 里，见下 |
+| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据续期扫描、九十天保留清理、空闲会话到点清理、花名册审计日报、运行告警（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 起 `main()` 真实装配 `AlertingDuty`） |
+| `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57）；同进程后台线程跑投递消费循环（#152）。放在非默认 profile 里，见下 |
 | `worker` | **一次性作业** | `python -m lingxi.apps.worker` | 单回合受控执行。跑一个 Agent SDK 回合、往 stdout 写一个 JSON 报告、退出 |
+| `worker-queue` | **常驻服务，仅 `mvp` profile**（[#153](https://github.com/Moshuiwang/lingxi/issues/153)） | `python -m lingxi.apps.worker`（`LINGXI_WORKER_MODE=queue`） | 与 `worker` **同一镜像**，长期领取队列任务；收到 `SIGTERM` 后停止领取、在途任务在一个轮询周期量级内被请求中断、有界预算内收口；同一收口周期消费 Agent 会话 JSONL 物理清理队列 |
 | `migrate` | **一次性作业** | `python -m alembic -c /opt/lingxi/alembic.ini` | 部署时跑一次的数据库迁移 |
 | `reauthorize` | **一次性作业，默认不启动** | `python -m lingxi.apps.reauthorize` | 凭据丢失或过期时的正式重授权；复用 scheduler 镜像，放在 `job` profile |
 
-**worker 与 reauthorize 都是一次性作业，不是已上线的常驻服务。** worker 不领任务、不接飞书、不处理 `SIGTERM`（`grep -rn signal src/lingxi/apps/worker/` 为空）。常驻 worker 需要任务队列与 gateway 入队，属 **S4 下半**，不在本批。`docker compose up -d` 只会启动 `scheduler` 一个进程；重授权必须由运维人员显式 `run`。
+**`worker`（一次性）与 `worker-queue`（常驻）是两个不同的 compose service，共用同一个镜像。** `worker` 不领任务、不接飞书、不处理 `SIGTERM`；`worker-queue` 才是常驻消费者（`LINGXI_WORKER_MODE=queue` 切换 `apps/worker/cli.py` 的长期循环分支）。`reauthorize` 仍是一次性作业，必须由运维人员显式 `run`。
 
-**`gateway` 已随 [#57](https://github.com/Moshuiwang/lingxi/issues/57) 落地并纳入编排，但默认不启动。** 它把事件落库成任务，而任务队列此刻**没有消费者**——main 上的 worker 是单回合 CLI，不领任务。启用它等于开始接收真实用户消息、排进一个没人处理的队列，用户看到的是"发了没反应"，比不接入更糟。因此它放在一个非默认 profile 里：
+**`gateway` 已随 [#57](https://github.com/Moshuiwang/lingxi/issues/57)/[#152](https://github.com/Moshuiwang/lingxi/issues/152) 落地，但默认仍不启动。** 裸 `docker compose up -d`（不带任何 profile）只启动 `scheduler`——这条默认行为本批**没有**改变，改变它需要显式部署合同说明并重新审核（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 完成标准第一条）。启用 gateway 有两条路径：
 
 ```bash
-# 默认：不会启动 gateway
+# 默认：只启动 scheduler
 docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/compose.stage.yaml up -d
 
-# 显式启用（S4 下半接线前不要这么做）
+# 只启用 gateway（沿用 #57 既有用法，投递队列仍无消费者——不建议单独使用）
 docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/compose.stage.yaml \
   --profile gateway up -d
+
+# 明确命名的 Stage/MVP 受控部署 profile（Issue #153）：同时拉起 scheduler、
+# gateway、常驻 queue worker——这是本仓库第一次能把三者串起来的部署形态
+docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f deploy/compose.stage.yaml \
+  --profile mvp up -d
 ```
 
-S4 下半（常驻 worker 与任务领取）接线之后，删掉 `compose.yaml` 里 gateway 的 `profiles:` 一行即可转为默认服务。`admin` 进程仍**未建立**，因此没有为它构建镜像——未实现的入口不得用占位进程冒充。
+`mvp` profile 是 Epic A 的候选与 Stage 验收对象，不是已完成的部署——`biai-stage` 的安装、健康回读、真实 CardKit 发送与 Bot-Test 真实入口仍待后置 Ops Story。`admin` 进程仍**未建立**，因此没有为它构建镜像——未实现的入口不得用占位进程冒充。
 
-本版**不宣称**首聊、持续同步、建档、权限发布或用户通知已经上线。
+本版**不宣称**首聊、持续同步、建档、权限发布或用户通知已经上线；`mvp` profile 也**不宣称**员工能真实收到问数结果——真实 CardKit 发送、真实告警发进管理群均未过 L4a。
 
 ## 镜像 tag 语义
 
@@ -49,20 +55,21 @@ S4 下半（常驻 worker 与任务领取）接线之后，删掉 `compose.yaml`
 
 ## 准备
 
-一个环境要**六个**文件，不是一个：
+一个环境要**七个**文件，不是一个：
 
 ```bash
 cp deploy/.env.example deploy/.env.stage             # 只放 LINGXI_IMAGE_REGISTRY / LINGXI_IMAGE_TAG
 $EDITOR deploy/.env.stage.scheduler                  # 数据库 DSN、Fernet 密钥、飞书应用凭据
 $EDITOR deploy/.env.stage.gateway                    # 飞书应用凭据 + 数据库 DSN（#57）
 $EDITOR deploy/.env.stage.worker                     # 只有 LINGXI_WORKER_* 与模型端点凭据
+$EDITOR deploy/.env.stage.worker-queue               # 常驻队列消费者：含数据库 DSN（#153 PR #173 复核 P1-2）
 $EDITOR deploy/.env.stage.migrate                    # 只有迁移 DSN
 $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库、应用与全部 scope 配置
 ```
 
-六个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
+七个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
-**为什么按服务拆而不是共用一份。** worker 跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给 worker 挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。scheduler 需要的那些，worker 一个都不需要。
+**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）不跑 Agent SDK、不继承环境给任何子进程，但它需要 `LINGXI_POSTGRES_DSN` 才能领任务——这正是它必须有自己独立一份 env 文件、不能借用 `worker` 那份的原因（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
@@ -72,7 +79,7 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 代码框架「横切约定」要求凭据不进代码、日志、数据库、用户环境，长期凭据放操作系统级密钥管理。本批用文件注入，因此**文件权限就是这条边界的全部**——一个 0644 的 env 文件等于把生产数据库口令、Fernet 密钥和飞书应用密钥摊给机器上任何一个账号。
 
-六个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway` 与 `.env.<环境>.reauthorize` 都装有飞书应用密钥和数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
+七个文件都必须 **0600 且属主为部署用户**——`.env.<环境>.gateway`、`.env.<环境>.worker-queue` 与 `.env.<环境>.reauthorize` 都装有飞书应用密钥或数据库 DSN，与 scheduler 那份同级，一个都不能漏。用 `install` 一步到位，别先 `cp` 再 `chmod`（那中间有一个短暂的可读窗口）：
 
 ```bash
 umask 077
@@ -80,6 +87,7 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.scheduler
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.gateway
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker
+install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.worker-queue
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.migrate
 install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.reauthorize
 # 然后再往里写内容
@@ -90,13 +98,15 @@ install -m 600 -o "$(id -un)" -g "$(id -gn)" /dev/null deploy/.env.stage.reautho
 ```bash
 # stage
 for f in deploy/.env.stage deploy/.env.stage.scheduler deploy/.env.stage.gateway \
-         deploy/.env.stage.worker deploy/.env.stage.migrate deploy/.env.stage.reauthorize; do
+         deploy/.env.stage.worker deploy/.env.stage.worker-queue \
+         deploy/.env.stage.migrate deploy/.env.stage.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 
 # 生产（同型，把 stage 换成 prod）
 for f in deploy/.env.prod deploy/.env.prod.scheduler deploy/.env.prod.gateway \
-         deploy/.env.prod.worker deploy/.env.prod.migrate deploy/.env.prod.reauthorize; do
+         deploy/.env.prod.worker deploy/.env.prod.worker-queue \
+         deploy/.env.prod.migrate deploy/.env.prod.reauthorize; do
   stat -c '%n %a %U' "$f"
 done
 # 期望每行都是 `<文件> 600 <部署用户>`
@@ -122,6 +132,113 @@ echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
 两个变量本批只登记名字与来源，**没有真实值**：镜像还没推上去，拉取身份的发放属于 stage `[ops]` Issue 的范围。
 
 > 另有一个待产品负责人决定的选项：把镜像包设为**公开**，宿主机就完全不需要登录，也就没有这份长期驻留在部署机上的凭据。代价是镜像层对外可见（源码本身不在镜像里，但依赖清单与目录结构会暴露）。本批不替产品负责人做这个选择，两条路都可行。
+
+## PR 候选镜像下载与校验（Issue #150；仅用于 #102 验收，不是发布路径）
+
+> **这一节只在验收某个未合并 PR 时使用。** 合并后的正式部署仍按上面「主机读取身份」「安装与升级」走 GHCR 拉取。**严禁在 `biai-stage` 现场用 `docker build` 重新构建这四个镜像，也不得用合并后 `Main Publish` 推送 GHCR 的镜像替代未合并 PR 的候选**——两者是不同对象：合并后的镜像是从合并树重新构建的，不保证与 PR 验收时的树逐位相同（Issue #62 决策登记、[验证与门禁](../docs/技术设计/验证与门禁.md)「五、CI 分层」）。
+
+**为什么需要单独下载**：`biai-stage` 要验收的是"这个 PR 这一次 `Epic Full` 构建出的镜像"，而不是合并后重新构建的另一份对象——`Epic Full / image` job 构建出的四个镜像只存在于那次 CI runner 上，job 结束就消失，因此必须先落地成可下载 artifact。
+
+**去哪下载、保存多久**：`Epic Full` 每次对一个 PR 跑通 `image` job（纯文档 PR 不会有这一步），会产出一个名为
+
+```
+epic-candidate-images-pr-<PR 编号>-<PR head sha>
+```
+
+的 GitHub Actions artifact，内容是 `manifest.json` + 四个 `lingxi-<service>-<批次>-<commit 短码>.tar`（scheduler / migrate / gateway / worker 各一个）。**这与既有的 `epic-candidate-pr-<PR 编号>-<PR head sha>` 是两个不同的 artifact**——那个只装 `candidate.json`，`Main Publish` 的 `verify_epic_candidate.py` 断言其文件列表严格等于 `["candidate.json"]`，混进镜像 tar 会直接破坏合并后的候选回读，因此镜像制品独立开一个 artifact，不合并进去。
+
+保存期 **14 天**，与 `publish.yml`「降级留证：上传镜像 tar」一致——同类产物同一保存期。超过保存期后无法再下载；需要验收更旧的候选时，让对应 PR 重新跑一次 `Epic Full` 产出新候选，**不能**用合并后的 GHCR 镜像顶替。
+
+**先确认这个 PR 的 base 分支，再选对应的 workflow 名字去找 run**——`image` job 定义在
+`ci.yml`（工作流名 `Epic Full`）里，但它在两种触发路径下实际运行在不同的工作流 run 上：
+
+- **base 是 `main`**：PR 直接触发 `ci.yml`，run 就挂在 `ci.yml` 名下：
+  ```bash
+  gh run list --repo Moshuiwang/lingxi --workflow=ci.yml --branch <PR 分支名> --limit 5
+  ```
+- **base 是 `epic/**`**（Stage 验收 #102 这一类场景）：PR 触发的是 `story.yml`
+  （工作流名 `Story Fast`），`ci.yml` 的 `image` job 由 `story.yml` 的 `full` job 以
+  `workflow_call` 方式嵌套执行——**不产生独立的 `ci.yml` run**，artifact 挂在
+  `story.yml` 的 run 下。用 `--workflow=ci.yml` 查会得到空列表（实测：本 PR
+  #167 base 为 `epic/a-trusted-delivery`，`gh run list --workflow=ci.yml
+  --branch claude/150-candidate-artifacts` 返回空；`--workflow=story.yml` 才能查到
+  run `31729418864`，其 `workflowName` 为 `Story Fast`，且该 run 确实持有两份
+  artifact，含 `epic-candidate-images-pr-167-…`）：
+  ```bash
+  gh run list --repo Moshuiwang/lingxi --workflow=story.yml --branch <PR 分支名> --limit 5
+  ```
+
+拿到 run id 后下载：
+
+```bash
+gh run download <run id> --repo Moshuiwang/lingxi \
+  --name "epic-candidate-images-pr-<PR 编号>-<PR head sha>" \
+  --dir /path/to/bundle-dir
+```
+
+**下载后先校验，不导入没核对过的东西**：
+
+```bash
+python3 scripts/ci/verify_epic_candidate_bundle.py /path/to/bundle-dir \
+  --expect-repository Moshuiwang/lingxi \
+  --expect-pr-number <PR 编号> \
+  --expect-head-sha <PR head sha> \
+  --expect-run-id <run id>
+```
+
+manifest 结构、四镜像齐全性（scheduler/migrate/gateway/worker 缺一不可、多一不可）、
+每个 tar 的大小与 sha256、以及传入的 PR 身份，任一项不符，脚本非零退出并一次性列出全部
+问题——不会因为查到第一个问题就停下让人漏看第二个。
+
+**导入并核对镜像 digest**（追加 `--import`，需要本机 docker）：
+
+```bash
+python3 scripts/ci/verify_epic_candidate_bundle.py /path/to/bundle-dir --import
+```
+
+这一步会对四个 tar 逐个 `docker load`，再回读每个镜像的 `.Id`，核对与 manifest 记录的
+`image_digest` 一致——证明"导入到本机 docker 的东西"确实是这次构建产出的那个，不是
+半截下载或被替换的对象。
+
+**接入 compose 使用候选镜像**：候选镜像的本地引用是 `lingxi-<service>:build-a`（CI 构建时
+打的本地 tag，不含仓库前缀），而 `deploy/compose.yaml` 的镜像引用要求
+`${LINGXI_IMAGE_REGISTRY:?}/lingxi-<service>:${LINGXI_IMAGE_TAG:?}`（`LINGXI_IMAGE_REGISTRY`
+不允许留空）。导入后重新打 tag 让两者对上——**tag 必须带上 head sha 前 12 位，不能只用
+PR 编号**（manifest.json 的 `head_sha` 字段就是这个值）：同一个 PR 出现新提交是「候选替换
+登记要求」一节明确要处理的常见场景，只用 `pr-<PR 编号>` 会让新旧候选打到同一个 tag 上，
+`docker load` 一执行旧候选在本机就不再有任何 tag 指向它（悬空、可被 `image prune`
+清掉），紧接着的「最小回滚」在这种最常见的场景下反而无对象可回：
+
+```bash
+head_sha_short=<PR head sha 前 12 位，取自 manifest.json 的 head_sha>
+for service in scheduler migrate gateway worker; do
+  docker tag "lingxi-${service}:build-a" \
+    "epic-candidate/lingxi-${service}:pr-<PR 编号>-${head_sha_short}"
+done
+# deploy/.env.stage 对应设置：
+#   LINGXI_IMAGE_REGISTRY=epic-candidate
+#   LINGXI_IMAGE_TAG=pr-<PR 编号>-<head sha 前 12 位>
+```
+
+此后按下面「安装与升级」正常执行；区别只是镜像来自候选 artifact 而不是 GHCR 拉取，
+**上面「主机读取身份」那一步（GHCR 登录）此时不需要**——镜像已经在本机 load 过。
+
+**最小回滚**：在 `biai-stage` 上切换候选或回退到上一个候选，只需要把
+`deploy/.env.stage` 的 `LINGXI_IMAGE_TAG` 改回上一个候选对应的本地 tag（`pr-<PR 编号>-<上一个
+候选的 head sha 前 12 位>`；前提是那个候选镜像仍在本机 docker 里、未被 `docker rmi`），
+再执行 `up -d` 即可切回——机制与下面「回滚」一节生产环境切 tag 相同，只是候选场景下 tag
+指向本机而不是 GHCR。因为 tag 带了 head sha，新候选导入不会覆盖旧候选的 tag，两者在本机
+可以同时存在，回滚才有对象可切。候选之间的切换不触碰生产数据库或生产持久卷；真实生产
+的回滚与恢复仍以「回滚」「恢复入口」两节为准，本节不重复。
+
+**候选替换登记要求**：同一个 PR 出现新提交，或旧候选对应的 Actions run 已过期，之前
+下载导入的候选立即失效。切换到新候选时，必须在对应验收 Issue（如 #102）里登记：
+
+- **旧候选**：PR head sha、run id、四个 `image_digest`（可从旧 `manifest.json` 摘）。
+- **新候选**：同样四项。
+- **失效证据**：为什么旧候选不再代表当前 PR（新提交 sha、CI 重跑、run 过期等）。
+- **重验范围**：哪些已经在旧候选上做过的验收动作需要在新候选上重跑——不能只换镜像
+  不换证据，那样"验收通过"这句话就对不上实际跑过的对象。
 
 ## 安装与升级
 
@@ -187,7 +304,7 @@ docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/comp
 卷；state 文件和凭据文件都在该卷内，入口会在启动前拒绝文件或锁文件路径冲突。授权回调
 由 OAuth Bridge 的主动 WebSocket 回传，job 不接收终端粘贴的回跳地址。
 
-以 stage 为例，确认六个 env 文件都已按上面的 preflight 准备好后执行：
+以 stage 为例，确认七个 env 文件都已按上面的 preflight 准备好后执行：
 
 ```bash
 docker compose --env-file deploy/.env.stage \
@@ -241,6 +358,53 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 **这个不等式由 `scripts/ci/check_deploy_contract.py` 自动守住，不是靠文档。** 门禁从连接工厂读取默认值与 `MAX_TIMEOUT_SECONDS` 建模，并把示例 DSN 的三个参数与默认值对账；修改合法上界或 `REQUEST_TIMEOUT_SECONDS` 而不满足 150 秒宽限期，门禁会红。
 
 `scheduler` 必须**单副本**：进程间互斥靠的是凭据目录里的 `flock` 文件锁，多副本会互相阻塞。
+
+## worker-queue 的停止宽限期为什么是 90 秒
+
+收到 `SIGTERM` 后停止 `claim()` 领取新任务；在途任务的 `_monitor` 把这次停机等同
+用户 `/stop`，请求 Agent SDK 中断当前回合，在预算内收口为 `stopped` 终态。中途被
+`SIGKILL` 只是把"优雅收口"换成"任务留在 `running`、等未来一次心跳超时被回收"——
+不丢结果、不重复副作用（依托 outbox 语义），但会晚一轮才被发现。
+
+**这张表必须和 `scripts/ci/check_deploy_contract.py::_worker_worst_case_seconds()`
+的实际门禁模型逐项对上**——PR #173 独立复核 P3-2 发现旧版这里另起一套推导
+（1.0+30.0+15.0=46.0），算出的余量与门禁实际要求的数字对不上：门禁的模型是
+"进程自身停机预算（已经把 `/stop` 检测延迟、SDK 收尾宽限都算进去了）再加一次
+终态写库预算"，不是把这些分项在这里重新加一遍。
+
+| 项 | 秒 | 依据 |
+| --- | --- | --- |
+| 进程自身停机预算 | 45.0 | `LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS` 默认值（`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`，`apps/worker/config.py`）——它自己的推导已经包含 `/stop` 检测延迟（1.0s）、SDK 收尾宽限（`DEFAULT_DRAIN_GRACE_SECONDS` 30.0s，独立于业务墙钟）与一次终态写库预算，合计约 46s、取整为 45s，见该常量的头部注释 |
+| 终态写库预算 | 15.0 | 门禁模型在上面这个已经打包好的预算之外，**再单独留一次**终态写库预算作为 `SIGKILL` 兜底窗口，按连接工厂合法覆盖上界 `MAX_TIMEOUT_SECONDS=5` 建模（5+2×5） |
+| **最坏合计** | **60.0** | × 1.5 安全系数 = `math.ceil(60.0 × 1.5)` = **90 秒**（这是门禁要求的下限，不是留了余量后取整——90 秒恰好等于门禁的最低要求，一点富余都没有；`stop_grace_period` 写成低于 90 的任何值都会打红门禁，写成刚好 90 才是精确匹配，不是巧合） |
+
+同样由 `scripts/ci/check_deploy_contract.py` 自动守住：改了
+`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`（`apps/worker/config.py`）而不改 compose，门禁会红；
+改这里的 `stop_grace_period` 时，务必先用
+`python3 scripts/ci/check_deploy_contract.py` 里的
+`_worker_worst_case_seconds()` 现算一次门禁的实际下限，不要凭这张表的旧数字
+手动推算——两者一度不一致过。
+
+## 健康检查：不开放端口，`docker exec` 语义
+
+三个常驻服务（`scheduler`、`gateway`、`worker-queue`）的 `healthcheck.test` 都是
+`python -m lingxi.apps.healthcheck --role <角色>`——**不监听任何端口**，与被检查
+的主进程共享同一个容器的文件系统与网络命名空间（合同第 5 条："healthcheck 使用
+进程/数据库心跳或受控命令，不为健康检查扩大网络攻击面"）。
+
+两段独立判定，**都要过**：
+
+1. **依赖可达**：用与业务代码同一个连接工厂尝试连接数据库、跑一条 `SELECT 1`；
+   数据库不可用时——无论网络问题、凭据错误还是数据库宕机——这一步必然如实失败。
+2. **主循环仍在跳动**：读取 `apps/liveness.py` 写的活性文件（主循环每轮
+   `touch_liveness(role)`），年龄超过阈值即判不健康。这一段单独存在是因为只测
+   依赖可达测不出"进程 PID 还在、数据库也连得上，但主循环因为一次未捕获异常或
+   死锁已经停止消费"。`gateway` 一个进程两条循环（长连接主线程、#152 投递消费
+   后台线程），各自有独立的活性键（`gateway-longconn`/`gateway-delivery`），
+   任一条停摆都会让健康检查变红，不被另一条仍然新鲜的心跳掩盖。
+
+活性文件写在容器内 `/tmp`（已有 tmpfs 挂载），随容器重启自然清空，不需要跨重启
+持久化，也不需要跨容器共享。
 
 ## 本地验证
 

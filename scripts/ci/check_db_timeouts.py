@@ -35,6 +35,28 @@ def _is_self_psycopg_connect(node: ast.Call) -> bool:
     )
 
 
+# 建连相关的 psycopg 命名空间：顶层 `psycopg`（`psycopg.connect`）和它承载
+# 连接类的两个子模块 `psycopg.connection`（`Connection`）、
+# `psycopg.connection_async`（`AsyncConnection`）。只匹配字面量 `"psycopg"` 会漏过
+# `from psycopg.connection import Connection` 与 `import psycopg.connection`——两者
+# 的 `module`/`name` 都不等于 `"psycopg"`，但仍是同一个建连入口（Issue #116）。
+#
+# 故意不做成“任意 `psycopg.*` 子模块都禁止”：`psycopg.types.json` 之类的类型
+# 适配子模块与建连无关，adapters 层已有合法的 `from psycopg.types.json import Json`
+# 用法，不应被这条门禁误杀。
+_PSYCOPG_CONNECTION_MODULES = frozenset({"psycopg", "psycopg.connection", "psycopg.connection_async"})
+
+
+def _is_psycopg_connection_module(module: str | None) -> bool:
+    return module in _PSYCOPG_CONNECTION_MODULES
+
+
+# psycopg 对外暴露的连接类：``Connection.connect(dsn)`` / ``AsyncConnection.connect(dsn)``
+# 是与 ``psycopg.connect(dsn)`` 等价的建连入口，只是绕开了模块级函数，从
+# ``psycopg`` 顶层或 ``psycopg.connection`` / ``psycopg.connection_async`` 子模块导入。
+_PSYCOPG_CONNECTION_CLASS_NAMES = frozenset({"Connection", "AsyncConnection"})
+
+
 def check_runtime_connections(source_root: pathlib.Path = RUNTIME_SOURCE_ROOT) -> list[str]:
     """拒绝绕过 ``lingxi.adapters.postgres.connect`` 的驱动连接。"""
 
@@ -51,23 +73,31 @@ def check_runtime_connections(source_root: pathlib.Path = RUNTIME_SOURCE_ROOT) -
 
         psycopg_names = {"psycopg"}
         raw_connect_names: set[str] = set()
+        connection_class_names: set[str] = set()
         for node in tree.body:
             if isinstance(node, ast.Import):
                 for item in node.names:
-                    if item.name == "psycopg":
-                        psycopg_names.add(item.asname or "psycopg")
-            elif isinstance(node, ast.ImportFrom) and node.module == "psycopg":
+                    if item.name in _PSYCOPG_CONNECTION_MODULES:
+                        # `import psycopg.connection` 不带 `as` 时，Python 绑定的本地
+                        # 名字仍是顶层 `psycopg`；带 `as` 时绑定的是子模块对象本身，
+                        # 同样可能拿来 `.connect(...)`，两种都要记入 psycopg_names。
+                        psycopg_names.add(item.asname or item.name.split(".", 1)[0])
+            elif isinstance(node, ast.ImportFrom) and _is_psycopg_connection_module(node.module):
                 for item in node.names:
                     if item.name == "connect":
                         raw_connect_names.add(item.asname or "connect")
+                    elif item.name in _PSYCOPG_CONNECTION_CLASS_NAMES:
+                        connection_class_names.add(item.asname or item.name)
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.Import) and any(item.name == "psycopg" for item in node.names):
+            if isinstance(node, ast.Import) and any(
+                item.name in _PSYCOPG_CONNECTION_MODULES for item in node.names
+            ):
                 failures.append(
                     f"{_relative(path, source_root)}:{node.lineno} 直接导入 psycopg："
                     "正式代码只能由 lingxi.adapters.postgres.connect 延迟导入驱动"
                 )
-            elif isinstance(node, ast.ImportFrom) and node.module == "psycopg":
+            elif isinstance(node, ast.ImportFrom) and _is_psycopg_connection_module(node.module):
                 failures.append(
                     f"{_relative(path, source_root)}:{node.lineno} 直接从 psycopg 导入："
                     "正式代码只能由 lingxi.adapters.postgres.connect 延迟导入驱动"
@@ -80,7 +110,13 @@ def check_runtime_connections(source_root: pathlib.Path = RUNTIME_SOURCE_ROOT) -
                     and isinstance(function.value, ast.Name)
                     and function.value.id in psycopg_names
                 )
-                if direct or _is_self_psycopg_connect(node) or (
+                class_connect = (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "connect"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id in connection_class_names
+                )
+                if direct or class_connect or _is_self_psycopg_connect(node) or (
                     isinstance(function, ast.Name) and function.id in raw_connect_names
                 ):
                     failures.append(
