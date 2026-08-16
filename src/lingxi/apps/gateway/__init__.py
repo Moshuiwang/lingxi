@@ -39,6 +39,7 @@ from lingxi.adapters.feishu_longconn import (
 from lingxi.apps.liveness import touch_liveness
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
+from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .log_redaction import install_credential_redaction
@@ -215,6 +216,43 @@ def build_supervisor(
     )
 
 
+class _RejectingCards:
+    """S-A-07 受控验收缺口专用：让配置命中的那一步卡片外发调用确定性收到
+    ``DeliveryRejected``（服务端明确拒绝），用于在没有真实故障可复现的情况下证伪
+    #152「关闭卡片路径 + 同话题一次完整文本终态」的降级路径（验收缺口登记于 #152、
+    #154 评论 5306860510、#162 E-022）。**只在显式设置
+    ``LINGXI_GATEWAY_CARD_FAILURE_INJECT`` 时才会被装配**；未设置（默认）时
+    ``assemble_delivery_consumer`` 走 ``build_delivery_consumer`` 的默认参数，
+    与本类加入之前的装配路径逐字节一致。
+
+    设计取舍：只让被选中的那一步失败，未选中的步骤直通真实 transport——
+    ``create`` 命中时 ``CardStream.start()`` 只会捕获 ``DeliveryRejected`` 并整体
+    降级为文本兜底，``update``/``close`` 根本不会再被这次任务调用到，因此它们
+    "顺不顺带也失败"不影响可观察的降级结果；``all`` 用来覆盖注入发生在建卡成功
+    之后（终态更新/关闭阶段）的降级路径。选最简单、语义最清晰的实现，不建一个
+    "命中一次之后这个任务全部转失败"的状态机。
+    """
+
+    def __init__(self, real: CardTransport, *, inject: str) -> None:
+        self._real = real
+        self._inject = inject
+
+    def create(self, **kwargs: object) -> CardCreated:
+        if self._inject in ("create", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (create)", code=-1)
+        return self._real.create(**kwargs)  # type: ignore[arg-type]
+
+    def update(self, **kwargs: object) -> None:
+        if self._inject in ("update", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (update)", code=-1)
+        self._real.update(**kwargs)  # type: ignore[arg-type]
+
+    def close(self, **kwargs: object) -> None:
+        if self._inject in ("close", "all"):
+            raise DeliveryRejected("card failure injected for acceptance (close)", code=-1)
+        self._real.close(**kwargs)  # type: ignore[arg-type]
+
+
 def assemble_delivery_consumer(
     config: GatewayConfig, *, queue: Any = None, alerting_duty: Any = None
 ) -> Any:
@@ -228,6 +266,10 @@ def assemble_delivery_consumer(
     ``alerting_duty``（Issue #153）不为 ``None`` 时，把它的
     ``delivery_alert_callback()`` 接到 ``DeliveryConsumer.on_alert``——这是最小告警
     装配合同点名的注入点："把 #152 的 on_alert 注入点接到真实告警路由"。
+
+    ``config.card_failure_injection``（S-A-07 受控验收缺口）命中时，装配一个包一层
+    "确定性拒绝"的 ``_RejectingCards`` 代替真实 ``LarkCardTransport``；未设置
+    （默认）时这段分支完全不执行，装配结果与本开关加入之前逐字节一致。
     """
 
     from lingxi.adapters.feishu_outbound import build_client
@@ -240,10 +282,28 @@ def assemble_delivery_consumer(
         app_secret=str(config.app_secret),
         timeout_seconds=outbound_timeout,
     )
+
+    cards: CardTransport | None = None
+    if config.card_failure_injection is not None:
+        from lingxi.adapters.feishu_delivery import LarkCardTransport
+
+        # 显眼的结构化告知（S-A-07 卡片故障注入开关第 3 点）：这个开关一旦被遗忘在
+        # 开启状态，生产环境里每一条问数结果都会被强制降级成文本终态——必须让它在
+        # 启动日志里足够扎眼，而不是混在普通 INFO 审计日志里被忽略。默认关闭时
+        # （本分支不执行）不会有这条日志，与既有装配路径完全一致。
+        logger.warning(
+            "gateway.delivery.card_failure_injection_enabled inject=%s "
+            "此开关仅供 S-A-07 受控验收使用，默认应为关闭；如果这不是一次受控验收"
+            "启动，请立即核实并清空 LINGXI_GATEWAY_CARD_FAILURE_INJECT",
+            config.card_failure_injection,
+        )
+        cards = _RejectingCards(LarkCardTransport(client), inject=config.card_failure_injection)
+
     return build_delivery_consumer(
         client=client,
         queue=queue
         or PostgresTaskQueue(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
+        cards=cards,
         limit=config.delivery_batch_limit,
         on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
     )

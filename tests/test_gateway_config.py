@@ -124,6 +124,31 @@ class RequiredConfigTests(unittest.TestCase):
         self.assertGreaterEqual(config.reconnect_ceiling_seconds, config.reconnect_base_seconds)
         self.assertGreater(config.shutdown_timeout_seconds, 0)
 
+    def test_card_failure_injection_defaults_to_disabled(self) -> None:
+        """默认关闭：不设置该变量时装配路径必须与开关加入之前逐字节一致。"""
+
+        config = load_config(VALID_ENV)
+        self.assertIsNone(config.card_failure_injection)
+
+    def test_card_failure_injection_accepts_the_four_legal_values(self) -> None:
+        for value in ("create", "update", "close", "all"):
+            with self.subTest(value=value):
+                env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": value})
+                config = load_config(env)
+                self.assertEqual(config.card_failure_injection, value)
+
+    def test_card_failure_injection_rejects_illegal_values_at_startup(self) -> None:
+        """S-A-07 卡片故障注入开关第 1 点：非法值必须启动即失败（失败关闭），
+        不能等到装配投递消费循环时才发现拼错的值被悄悄当成"未启用"放过。
+        """
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "createx"})
+        with self.assertRaises(GatewayConfigError) as raised:
+            load_config(env)
+        message = str(raised.exception)
+        self.assertIn(f"{ENV_PREFIX}CARD_FAILURE_INJECT", message)
+        self.assertNotIn("createx", message, "报错不得回显收到的值")
+
 
     def test_non_finite_numbers_are_rejected(self) -> None:
         """``nan`` / ``inf`` 是合法的 float 字面量，会一路通过后面所有比较。
@@ -282,6 +307,81 @@ class BuildSupervisorTests(unittest.TestCase):
         fallback = pipeline_class.call_args.kwargs["onboarding"]
         result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
         self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+
+
+class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
+    """S-A-07 卡片故障注入开关的装配接线：设置后 consumer 用注入 transport，
+    缺省用真实类型——验证的是 ``assemble_delivery_consumer`` 传给
+    ``build_delivery_consumer`` 的 ``cards`` 参数本身，不连真实飞书或数据库。
+    """
+
+    def setUp(self) -> None:
+        # 与 BuildSupervisorTests 同一手法：build_client 会 import lark_oapi，
+        # CI 的 gate 只装 scheduler 组，没有它，用桩顶上。
+        module = types.ModuleType("lark_oapi")
+
+        class _Builder:
+            def app_id(self, value):
+                return self
+
+            def app_secret(self, value):
+                return self
+
+            def timeout(self, value):
+                return self
+
+            def build(self):
+                return object()
+
+        module.Client = types.SimpleNamespace(builder=lambda: _Builder())
+        saved = sys.modules.get("lark_oapi")
+        sys.modules["lark_oapi"] = module
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("lark_oapi", saved)
+            if saved is not None
+            else sys.modules.pop("lark_oapi", None)
+        )
+
+    def test_default_configuration_passes_no_injected_transport(self) -> None:
+        from lingxi.apps.gateway import assemble_delivery_consumer
+
+        config = load_config(VALID_ENV)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer") as builder:
+            assemble_delivery_consumer(config, queue=object())
+
+        self.assertIsNone(
+            builder.call_args.kwargs["cards"],
+            "缺省时必须走 build_delivery_consumer 自己的默认真实类型，"
+            "不额外传入任何 cards——装配路径与本开关加入之前逐字节一致",
+        )
+
+    def test_injected_configuration_wires_the_rejecting_transport(self) -> None:
+        from lingxi.apps.gateway import _RejectingCards, assemble_delivery_consumer
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "close"})
+        config = load_config(env)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer") as builder:
+            assemble_delivery_consumer(config, queue=object())
+
+        cards = builder.call_args.kwargs["cards"]
+        self.assertIsInstance(cards, _RejectingCards)
+        self.assertEqual(cards._inject, "close")
+
+    def test_injected_configuration_logs_a_visible_startup_warning(self) -> None:
+        """第 3 点：启用时必须有一条显眼的结构化告知，防止开关被遗忘在开启状态。"""
+
+        from lingxi.apps.gateway import assemble_delivery_consumer
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}CARD_FAILURE_INJECT": "all"})
+        config = load_config(env)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer"):
+            with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+                assemble_delivery_consumer(config, queue=object())
+
+        self.assertTrue(
+            any("card_failure_injection_enabled" in line for line in captured.output),
+            "开关开启时必须打一条能被搜到的结构化告警",
+        )
 
 
 class EntryPointTests(unittest.TestCase):

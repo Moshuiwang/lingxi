@@ -525,6 +525,7 @@ def build_delivery_consumer(
     *,
     client: Any,
     queue: Any,
+    cards: CardTransport | None = None,
     on_send_outcome: SendOutcomeCallback | None = None,
     on_alert: AlertCallback | None = None,
     limit: int = 20,
@@ -534,13 +535,19 @@ def build_delivery_consumer(
     ``client`` 传入的是各调用方自行建好的飞书 SDK 客户端实例——飞书 SDK 客户端本身
     同时暴露 ``.im`` 与 ``.cardkit`` 两个命名空间，一个客户端即可同时驱动卡片与
     文本兜底，不需要为投递单独建第二套鉴权。
+
+    ``cards``（S-A-07 受控验收缺口，Issue #152/#154）默认 ``None``：这时装配的是
+    真实 ``LarkCardTransport(client)``，与本参数加入之前逐字节一致。唯一的调用方
+    ``apps.gateway.assemble_delivery_consumer`` 只在显式命中
+    ``LINGXI_GATEWAY_CARD_FAILURE_INJECT`` 时才传入一个包一层"确定性拒绝"的实现，
+    用来验证卡片降级路径——不是给业务代码开的通用注入口。
     """
 
     from lingxi.adapters.feishu_delivery import LarkCardTransport, LarkDeliveryText
 
     return DeliveryConsumer(
         queue=queue,
-        cards=LarkCardTransport(client),
+        cards=cards if cards is not None else LarkCardTransport(client),
         texts=LarkDeliveryText(client),
         on_send_outcome=on_send_outcome,
         on_alert=on_alert,

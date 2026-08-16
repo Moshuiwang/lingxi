@@ -1,0 +1,219 @@
+"""S-A-07 受控验收夹具（Issue #57 验收缺口）：``scripts/replay_inbound_event.py``
+的纯逻辑单测。
+
+只测脚本里不需要真实数据库/飞书/长连接的两块：envelope 校验、``ReplayTransport``
+的产出与结果摘要拼装、``_AuditCapture`` 的过滤规则。真正重放一个真实事件属
+L4a，留给 biai-stage/Bot-Test 受控执行，不在这里断言。
+
+加载方式照抄既有先例 ``tests/test_galaxy_import_script.py``：``scripts/`` 不是一个
+包，用 ``importlib.util.spec_from_file_location`` 按路径直接装载模块。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import logging
+import unittest
+from pathlib import Path
+
+SCRIPT = Path(__file__).parents[1] / "scripts" / "replay_inbound_event.py"
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("replay_inbound_event_script_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _envelope(
+    *,
+    event_id: str = "evt_1",
+    event_type: str = "im.message.receive_v1",
+    open_id: str = "ou_1",
+    message_id: str = "om_1",
+    chat_id: str = "oc_1",
+    chat_type: str = "p2p",
+    content: str = '{"text": "hi"}',
+) -> dict:
+    return {
+        "header": {"event_id": event_id, "event_type": event_type},
+        "event": {
+            "sender": {"sender_id": {"open_id": open_id}},
+            "message": {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "message_type": "text",
+                "content": content,
+            },
+        },
+    }
+
+
+class ValidateEnvelopeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_a_well_formed_envelope_passes(self) -> None:
+        self.module.validate_envelope(_envelope())  # 不抛异常即通过
+
+    def test_not_an_object_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.module.validate_envelope(["not", "an", "object"])
+
+    def test_missing_fields_are_all_reported_at_once(self) -> None:
+        """一次性报告全部问题，而不是命中第一个就退出——验收现场改一次文件
+        比来回跑脚本各改一个字段省事。
+        """
+
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope({"header": {}, "event": {}})
+        message = str(raised.exception)
+        self.assertIn("header.event_id", message)
+        self.assertIn("header.event_type", message)
+        self.assertIn("event.sender.sender_id.open_id", message)
+        self.assertIn("event.message.message_id", message)
+        self.assertIn("event.message.chat_id", message)
+        self.assertIn("event.message.chat_type", message)
+        self.assertIn("event.message.content", message)
+
+    def test_wrong_event_type_is_rejected(self) -> None:
+        payload = _envelope(event_type="card.action.trigger")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("header.event_type", str(raised.exception))
+
+    def test_group_chat_is_rejected(self) -> None:
+        """问数与多轮对话只服务飞书私聊：群聊事件在生产入口本身就会被拒绝，
+        重放它测不出幂等，必须在启动前就挡住。
+        """
+
+        payload = _envelope(chat_type="group")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("event.message.chat_type", str(raised.exception))
+
+    def test_blank_open_id_counts_as_missing(self) -> None:
+        payload = _envelope(open_id="   ")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("event.sender.sender_id.open_id", str(raised.exception))
+
+
+class AuditCaptureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_script()
+        self.capture = self.module._AuditCapture()
+
+    def _emit(self, logger_name: str, msg: str, args: tuple) -> None:
+        record = logging.LogRecord(
+            name=logger_name,
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=msg,
+            args=args,
+            exc_info=None,
+        )
+        self.capture.emit(record)
+
+    def test_captures_gateway_audit_actions(self) -> None:
+        self._emit("lingxi.apps.gateway", "audit %s %s", ("inbound_event.duplicate", {}))
+        self.assertEqual(self.capture.actions, ["inbound_event.duplicate"])
+
+    def test_ignores_records_from_other_loggers(self) -> None:
+        self._emit("lingxi.apps.gateway.delivery", "audit %s %s", ("task.enqueued", {}))
+        self.assertEqual(self.capture.actions, [])
+
+    def test_ignores_non_audit_log_lines(self) -> None:
+        self._emit("lingxi.apps.gateway", "收到信号 %s，开始停机", (15,))
+        self.assertEqual(self.capture.actions, [])
+
+
+class ReplayTransportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_stream_yields_the_same_envelope_the_requested_number_of_times(self) -> None:
+        envelope = _envelope(event_id="evt_replay")
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=3, audit=audit)
+
+        produced = list(transport.stream())
+
+        self.assertEqual(produced, [envelope, envelope, envelope])
+        self.assertTrue(transport.exhausted, "产完全部剧本后必须置 exhausted，供 should_stop 收工")
+        self.assertEqual(transport.connects, 1, "全部重放放在同一次连接会话里")
+
+    def test_exhausted_is_false_until_the_generator_is_fully_drained(self) -> None:
+        envelope = _envelope()
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=2, audit=audit)
+
+        iterator = transport.stream()
+        next(iterator)
+        self.assertFalse(
+            transport.exhausted, "还没产完剧本时 exhausted 必须是 False，否则会提前收工漏放"
+        )
+        next(iterator)
+        with self.assertRaises(StopIteration):
+            next(iterator)
+        self.assertTrue(transport.exhausted)
+
+    def test_report_summarises_the_first_round_as_not_duplicate(self) -> None:
+        envelope = _envelope(event_id="evt_first")
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=2, audit=audit)
+
+        audit.actions.append("inbound_event.auto_provisioning")
+        transport.report(envelope, None)
+
+        self.assertEqual(len(transport.rounds), 1)
+        summary = transport.rounds[0]
+        self.assertEqual(summary["round"], 1)
+        self.assertEqual(summary["event_id"], "evt_first")
+        self.assertFalse(summary["duplicate"])
+        self.assertEqual(summary["audit_actions"], ["inbound_event.auto_provisioning"])
+        self.assertIsNone(summary["handler_error"])
+        self.assertEqual(audit.actions, [], "读取之后必须清空，不能被下一轮继续累积")
+
+    def test_report_summarises_a_replay_as_duplicate(self) -> None:
+        envelope = _envelope(event_id="evt_dup")
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=2, audit=audit)
+
+        audit.actions.append("inbound_event.duplicate")
+        transport.report(envelope, None)
+
+        self.assertTrue(transport.rounds[0]["duplicate"])
+
+    def test_report_records_a_handler_error_when_present(self) -> None:
+        envelope = _envelope()
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=1, audit=audit)
+
+        transport.report(envelope, RuntimeError("boom"))
+
+        self.assertEqual(transport.rounds[0]["handler_error"], "RuntimeError")
+
+    def test_report_output_never_contains_message_content(self) -> None:
+        """不打印消息正文全文：摘要只包含固定 action 名称与 event_id，不回显
+        ``event.message.content``。
+        """
+
+        secret_text = "这是不应该出现在摘要里的消息正文"
+        envelope = _envelope(content=json.dumps({"text": secret_text}))
+        audit = self.module._AuditCapture()
+        transport = self.module.ReplayTransport(envelope, times=1, audit=audit)
+
+        transport.report(envelope, None)
+
+        rendered = json.dumps(transport.rounds[0], ensure_ascii=False)
+        self.assertNotIn(secret_text, rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()
