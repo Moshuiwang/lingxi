@@ -70,10 +70,18 @@ class _LoggingAudit:
 
     ``audit_event`` 表属后续切片；管线只依赖 ``AuditSink`` 的签名，届时换实现不动管线。
     这里**不记录消息正文**——未开通用户的内容"不保存"包括不写进日志。
+
+    失败类动作（``reaction.failed``、``reply.failed``、``event.handler_failed``、
+    ``event.unparsable`` 等）记 ``WARNING`` 而不是 ``INFO``：S-A-07 r15/r19 真实验收
+    发现「已收到」表情缺失（#175/#185）时，唯一能回答"加表情调用到底怎么失败的"
+    的证据就是 ``reaction.failed`` 这一行审计——它淹没在 INFO 级正常流水里，验收
+    没有捕获到，问题因此无法定位。级别只影响日志可见性，动作名与字段不变，
+    重放脚本 ``_AuditCapture``（level=INFO 的 Handler）仍照常收到这些记录。
     """
 
     def record(self, action: str, /, **fields: object) -> None:
-        logger.info("audit %s %s", action, fields)
+        log = logger.warning if action.endswith(("failed", "error", "unparsable")) else logger.info
+        log("audit %s %s", action, fields)
 
 
 class _UnavailableOnboarding:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 
@@ -38,6 +39,33 @@ from .config import WorkerConfig
 from .report import build_report
 
 _MAX_FAILURE_TEXT = 500
+
+# S-A-07 输出安全 canary（Issue #142）：masked 档位在模型正文没有任何可保留内容
+# 时垫入的合成业务句——没有它，"masked + 空正文"会因为命中区间之外无幸存内容而
+# 滑进 withheld 终态，masked 档位就不再是确定性的。措辞刻意自述身份，用户侧一旦
+# 看到它就知道这一轮是受控验收注入，不是真实业务结论。
+_CANARY_FALLBACK_BODY = "受控验收合成正文：本句由输出安全 canary 注入，保留可展示的业务结论。"
+
+
+def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: str) -> str:
+    """把合成 system prompt 确定性注入最终正文，供出口安全约束命中（#142）。
+
+    - ``withheld``：整段替换为 system prompt——整串命中覆盖全部正文、无业务内容
+      幸存，``constrain_output`` 必然给出 ``withheld=True``；
+    - ``masked``：正文之后追加 system prompt——追加区间被整串命中遮蔽，模型正文
+      幸存，必然 ``blocked=True`` 且 ``withheld=False``。
+
+    两个档位都不依赖模型行为：r17 的教训是把触发条件寄托在"模型恰好复述提示词"
+    上，真实链路一次都没有触发过。注入发生在 ``build_report``（出口约束所在地）
+    之前，走的是与真实泄露完全相同的检测与投影路径。
+    """
+
+    if mode == "withheld":
+        return system_prompt
+    # 与 core.execution.input_safety 的"幸存业务内容"判定同一口径（\w 覆盖字母、
+    # 数字与 CJK）：模型正文只要有任何真实内容就保留它，否则垫入合成业务句。
+    base = final_text if re.search(r"\w", final_text or "", re.UNICODE) else _CANARY_FALLBACK_BODY
+    return f"{base}\n{system_prompt}"
 
 
 class WorkerTurnExecutor:
@@ -110,12 +138,12 @@ class WorkerTurnExecutor:
         全部出口纪律（Codex 复查发现）。"""
 
         text = redact_free_text(str(line))[:500]
-        record = {
-            "level": "warning",
-            "event": "worker.sdk.stderr",
-            "trace_id": self._config.trace_id,
-            "line": text,
-        }
+        self._emit_stderr_record(level="warning", event="worker.sdk.stderr", line=text)
+
+    def _emit_stderr_record(self, **fields: object) -> None:
+        """结构化 stderr 输出的唯一出口：每行一个 JSON 对象，恒带 trace_id。"""
+
+        record = {"trace_id": self._config.trace_id, **fields}
         self._stderr_stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         self._stderr_stream.write("\n")
         self._stderr_stream.flush()
@@ -222,13 +250,29 @@ class WorkerTurnExecutor:
             else None
         )
 
+        final_text = recorder.final_text
+        if self._config.output_safety_canary is not None:
+            # 默认关闭；开启时 config 已在启动期保证 system_prompt 非空。注入留
+            # 一条低敏结构化痕迹（不含提示词或正文原文），让验收能从 Worker 日志
+            # 确认"这一轮的安全终态出自 canary，不是真实泄露"。
+            final_text = _inject_output_safety_canary(
+                final_text,
+                mode=self._config.output_safety_canary,
+                system_prompt=self._config.system_prompt or "",
+            )
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.output_safety_canary_injected",
+                mode=self._config.output_safety_canary,
+            )
+
         return build_report(
             trace_id=self._config.trace_id,
             question=question,
             allowed_tools=self._policy.allowed_tools,
             summary=self._audit.summary(),
             stream=recorder,
-            final_text=recorder.final_text,
+            final_text=final_text,
             duration_seconds=duration_seconds,
             failure=failure,
             external_texts=tuple(text for _, text in normalized_external_texts),

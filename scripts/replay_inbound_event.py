@@ -34,6 +34,10 @@ envelope（飞书回调体的原始形状），由验收执行者自备。脚本
 - ``event.message.chat_id``
 - ``event.message.chat_type``：必须是 ``"p2p"``（问数与多轮对话只服务飞书私聊，
   群聊事件在生产入口本身就会被拒绝，重放它测不出幂等）
+- ``event.message.message_type``：必须是 ``"text"``。真实解析路径
+  （``adapters/feishu_events.message_text``）只对文本消息提取正文并创建问数任务；
+  缺失或其他类型会被生产入口判为不支持的消息类型，既不建任务也不产生用户结果，
+  重放它测不出幂等（S-A-07 r19 实测踩过这个坑，Issue #57 评论 5307741204）
 - ``event.message.content``：飞书消息体（一段 JSON 字符串）
 
 **用法**（真实凭据只从环境变量读取，不出现在命令行参数里）：
@@ -73,6 +77,9 @@ from typing import Any, Iterator
 # 与 lingxi.adapters.feishu_events 的既有定义保持单一来源。
 MESSAGE_RECEIVE_EVENT = "im.message.receive_v1"
 PRIVATE_CHAT_TYPE = "p2p"
+# 与 adapters/feishu_events.message_text 的判定同源：只有 "text" 类型的消息会被
+# 提取正文并进入问数路径。
+TEXT_MESSAGE_TYPE = "text"
 
 
 def _string_at(payload: object, *path: str) -> str | None:
@@ -130,6 +137,14 @@ def validate_envelope(payload: object) -> None:
         problems.append(
             f"event.message.chat_type 必须是 {PRIVATE_CHAT_TYPE!r}"
             f"（问数与多轮对话只服务飞书私聊，收到 {chat_type!r}）"
+        )
+
+    message_type = _string_at(payload, "event", "message", "message_type")
+    if message_type != TEXT_MESSAGE_TYPE:
+        problems.append(
+            f"event.message.message_type 必须是 {TEXT_MESSAGE_TYPE!r}"
+            f"（真实解析只对文本消息创建问数任务，其他类型会被判为不支持、"
+            f"测不出幂等，收到 {message_type!r}）"
         )
 
     if _string_at(payload, "event", "message", "content") is None:

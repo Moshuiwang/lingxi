@@ -72,6 +72,22 @@ def main(
         _emit(out, config_error_report(trace_id=trace_id, message=message))
         return EXIT_CONFIG_ERROR
 
+    if config.output_safety_canary is not None:
+        # 显眼的结构化告知（与 gateway 卡片故障注入开关同一纪律，PR #183 先例）：
+        # 这个开关一旦被遗忘在开启状态，每一条问数结果都会被强制改写成安全遮蔽
+        # 或 withheld 终态——必须在启动日志里足够扎眼。默认关闭时本分支不执行。
+        _log(
+            err,
+            config.trace_id,
+            "warning",
+            "worker.output_safety_canary_enabled",
+            mode=config.output_safety_canary,
+            message=(
+                "此开关仅供 S-A-07 受控验收使用，默认应为关闭；如果这不是一次"
+                "受控验收启动，请立即核实并清空 LINGXI_WORKER_OUTPUT_SAFETY_CANARY"
+            ),
+        )
+
     if queue_mode:
         dsn = env.get("LINGXI_POSTGRES_DSN", "").strip()
         if not dsn:

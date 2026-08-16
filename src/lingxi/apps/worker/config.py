@@ -51,6 +51,13 @@ SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS = 300.0
 # 因此落在配置期拒绝分支里，不需要维护一份"禁止配置"的名单。
 MCP_TOOL_PREFIX = "mcp__"
 
+# S-A-07 受控验收专用（Issue #142 验收缺口）：输出安全 canary 的两个合法档位。
+# 合法值集合是验收合同的一部分，不是随口列举——``masked`` 验证「局部遮蔽、业务
+# 结论幸存」，``withheld`` 验证「整段拒发、独立 redacted_withheld 终态」。非法值
+# 必须启动即失败（失败关闭），不允许一个拼错的值悄悄放行（与 gateway 的
+# ``LINGXI_GATEWAY_CARD_FAILURE_INJECT`` 同一纪律，PR #183 先例）。
+OUTPUT_SAFETY_CANARY_MODES = ("masked", "withheld")
+
 
 class WorkerConfigError(ValueError):
     """配置不合法。启动即失败，不留到会话建立之后。"""
@@ -76,6 +83,13 @@ class WorkerConfig:
     workspace: str | None = None
     model: str | None = None
     system_prompt: str | None = None
+    # S-A-07 受控验收专用开关（Issue #142 验收缺口，#154 r17 未通过后补）：在
+    # 出口安全约束之前，把已配置的**合成** system prompt 确定性地注入最终正文，
+    # 使真实 Queue 链路不依赖模型"恰好复述"提示词就能触发局部遮蔽（masked）或
+    # 整段拒发（withheld）。默认 ``None``（不注入，报告与本开关加入之前逐字节
+    # 一致）；开启时必须同时配置 ``LINGXI_WORKER_SYSTEM_PROMPT``（注入内容的
+    # 唯一来源），且只允许配合合成 canary 提示使用——真实系统提示不进受控验收。
+    output_safety_canary: str | None = None
     # #93 walking skeleton：CLI 可接收一个已知的指标描述外部文本。真实花名册 / MCP
     # 来源仍由后续主链路注入；这里不把该配置当作权限或身份事实。
     external_texts: tuple[tuple[str, str], ...] = ()
@@ -115,6 +129,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
             "缺少必填环境变量：" + "、".join(f"{ENV_PREFIX}{name}" for name in missing)
         )
 
+    system_prompt = _text(env, "SYSTEM_PROMPT")
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tool=_read_only_tool(env),
@@ -127,7 +142,8 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         mcp_servers=_mcp_servers(env),
         workspace=_text(env, "WORKSPACE"),
         model=_text(env, "MODEL"),
-        system_prompt=_text(env, "SYSTEM_PROMPT"),
+        system_prompt=system_prompt,
+        output_safety_canary=_output_safety_canary(env, system_prompt=system_prompt),
         external_texts=_external_texts(env),
         worker_id=_text(env, "ID") or new_ulid(),
         target_worker_version=_text(env, "TARGET_VERSION") or "stable",
@@ -212,6 +228,31 @@ def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
 
     description = _text(env, "METRIC_DESCRIPTION")
     return (("metric.description", description),) if description else ()
+
+
+def _output_safety_canary(env: Mapping[str, str], *, system_prompt: str | None) -> str | None:
+    """读取输出安全 canary 档位（S-A-07 / Issue #142）。
+
+    失败关闭：非法值与"开着 canary 却没有配置 system prompt"都在启动期拒绝——
+    前者是拼写错误悄悄放行的经典形状，后者会让注入退化成空字符串、canary 永远
+    不触发，验收者会把"配置不完整"误读成"安全链路又没触发"（r17 的原样重演）。
+    """
+
+    value = _text(env, "OUTPUT_SAFETY_CANARY")
+    if value is None:
+        return None
+    if value not in OUTPUT_SAFETY_CANARY_MODES:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}OUTPUT_SAFETY_CANARY 只允许 "
+            + " / ".join(OUTPUT_SAFETY_CANARY_MODES)
+            + f"，收到：{value!r}"
+        )
+    if not system_prompt:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}OUTPUT_SAFETY_CANARY 需要同时配置 {ENV_PREFIX}SYSTEM_PROMPT"
+            "（合成 canary 提示是注入内容的唯一来源）"
+        )
+    return value
 
 
 def _json(raw: str, name: str) -> Any:

@@ -688,6 +688,124 @@ class WorkerOutputRedactionTest(unittest.TestCase):
         self.assertGreater(report["turn"]["final_text_bytes"], 0)
 
 
+class OutputSafetyCanaryTest(unittest.TestCase):
+    """S-A-07 r17 / #142：输出安全 canary 必须**确定性**触发，默认关闭且不外泄。
+
+    r17 真实链路失败的根因是把触发条件寄托在"模型恰好复述提示词"上；这里锁定
+    新合同：canary 开启时，遮蔽/withheld 终态不依赖模型行为，走与真实泄露完全
+    相同的 ``constrain_output`` 检测与投影路径。
+    """
+
+    SYNTHETIC_PROMPT = "合成安全验收提示词：本句仅用于受控验收。第二句提供更长的合成片段供切分。"
+
+    def _script(self):
+        return [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "业务答案：DAU 为一千零二十四。"},
+        ]
+
+    def test_default_off_keeps_the_final_text_untouched(self) -> None:
+        report, _, _ = run_turn(
+            self, self._script(), LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT
+        )
+        safety = report["turn"]["output_safety"]
+        self.assertFalse(safety["blocked"])
+        self.assertFalse(safety["withheld"])
+        self.assertIn("业务答案", report["turn"]["final_text"])
+
+    def test_masked_canary_deterministically_blocks_but_keeps_the_business_text(self) -> None:
+        report, _, _ = run_turn(
+            self,
+            self._script(),
+            LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+            LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+        )
+        safety = report["turn"]["output_safety"]
+        self.assertTrue(safety["blocked"], "masked 档位必须触发遮蔽，与模型输出无关")
+        self.assertFalse(safety["withheld"], "业务结论幸存时不得升级成整段拒发")
+        final_text = report["turn"]["final_text"]
+        self.assertIn("业务答案", final_text, "局部遮蔽不得吞掉幸存的业务结论（合同第 1 条）")
+        self.assertNotIn("合成安全验收提示词", final_text, "被注入的提示词原文不得离开 worker")
+        self.assertIn("已隐藏", final_text, "命中区间必须以占位符呈现")
+        self.assertEqual(report["turn"]["user_result"], "obtained")
+
+    def test_withheld_canary_forces_the_independent_redacted_terminal(self) -> None:
+        from lingxi.core.execution.input_safety import WITHHELD_MESSAGE
+
+        report, _, _ = run_turn(
+            self,
+            self._script(),
+            LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+            LINGXI_WORKER_OUTPUT_SAFETY_CANARY="withheld",
+        )
+        safety = report["turn"]["output_safety"]
+        self.assertTrue(safety["withheld"], "withheld 档位必须整段拒发，与模型输出无关")
+        self.assertTrue(safety["blocked"])
+        self.assertIn("no_safe_content", safety["reasons"])
+        self.assertEqual(report["turn"]["final_text"], WITHHELD_MESSAGE)
+        self.assertEqual(
+            report["turn"]["user_result"],
+            "redacted_withheld",
+            "withheld 不得伪装成 obtained（#141/#149 独立终态）",
+        )
+        self.assertNotIn(
+            "合成安全验收提示词",
+            json.dumps(report, ensure_ascii=False),
+            "被注入的提示词原文不得出现在报告任何角落",
+        )
+
+    def test_masked_canary_with_an_empty_model_output_still_masks_not_withholds(self) -> None:
+        report, _, _ = run_turn(
+            self,
+            [{"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()}],
+            LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+            LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+        )
+        safety = report["turn"]["output_safety"]
+        self.assertTrue(safety["blocked"])
+        self.assertFalse(safety["withheld"], "masked + 空正文不得滑进 withheld，档位必须确定")
+        self.assertIn("受控验收合成正文", report["turn"]["final_text"])
+
+    def test_the_injection_leaves_a_low_sensitivity_stderr_trace(self) -> None:
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK(self._script()).install(self)
+        stderr = io.StringIO()
+        config = load_config(
+            worker_env(
+                LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+                LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+            )
+        )
+        executor = WorkerTurnExecutor(config, stderr_stream=stderr)
+        asyncio.run(executor.run_turn(config.question))
+
+        records = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        injected = [r for r in records if r.get("event") == "worker.output_safety_canary_injected"]
+        self.assertEqual(len(injected), 1, "每轮注入必须恰好留一条可回读的低敏痕迹")
+        self.assertEqual(injected[0]["mode"], "masked")
+        self.assertEqual(injected[0]["trace_id"], config.trace_id)
+        self.assertNotIn("合成安全验收提示词", stderr.getvalue(), "痕迹不得携带提示词原文")
+
+    def test_an_invalid_canary_value_fails_at_startup(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError):
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+                    LINGXI_WORKER_OUTPUT_SAFETY_CANARY="maskedd",
+                )
+            )
+
+    def test_a_canary_without_a_system_prompt_fails_at_startup(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError):
+            load_config(worker_env(LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked"))
+
+
 class WorkerConfigTest(unittest.TestCase):
     """配置只来自 LINGXI_ 前缀环境变量，构造期就拒绝不合法形态。"""
 
