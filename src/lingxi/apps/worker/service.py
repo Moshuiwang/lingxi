@@ -400,6 +400,12 @@ class WorkerService:
 
         output_safety = turn.get("output_safety") if isinstance(turn, Mapping) else None
         withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
+        # withheld 只对"本来会成功交付内容"的回合有意义：一个超时/失败/未收口的
+        # 回合无论正文如何都不会交付 final_text，其终态必须保留真实失败原因。
+        # 此前 withheld 分支排在失败判定之前（独立审核 F1）：失败回合的残余正文
+        # 一旦触发出口安全（真实泄露片段或受控 canary 注入都可能），真超时就会被
+        # 改写成 redacted_withheld——运维丢失真实失败终态，验收拿到假阳性证据。
+        deliverable = bool(turn.get("closed")) and not failure
 
         if stop_requested or failure_code == "interrupted":
             content = (
@@ -416,7 +422,7 @@ class WorkerService:
                 failure_code=failure_code,
                 output_safety=output_safety,
             )
-        elif withheld:
+        elif deliverable and withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
             # succeeded——用户没有拿到结果，必须走独立、可查询的 redacted_withheld
             # 终态（status 沿用既有取值域，用 error_kind 承载可查询原因）。
@@ -429,7 +435,7 @@ class WorkerService:
                 failure_code=failure_code,
                 output_safety=output_safety,
             )
-        elif bool(turn.get("closed")) and not failure:
+        elif deliverable:
             self._finish_terminal(
                 claimed,
                 terminal_kind=TerminalKind.SUCCESS.value,

@@ -593,6 +593,43 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
         )
 
+    def test_a_failed_turn_keeps_its_failure_terminal_even_when_withheld_is_set(self) -> None:
+        """PR #186 独立审核 F1：withheld 只对"本来会成功交付内容"的回合有意义。
+        超时/失败回合的残余正文即使触发了出口安全（真实泄露片段或受控 canary
+        注入），终态也必须保留真实失败原因——把真超时写成 ``redacted_withheld``，
+        运维丢失失败终态，验收拿到假阳性安全证据。把 withheld 分支挪回失败判定
+        之前必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": False,
+                        "final_text": "残余正文",
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": {"code": "turn_timeout", "message": "任务提前结束：达到墙钟上限"},
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "timeout", "真实失败终态不得被 withheld 覆盖")
+        self.assertNotEqual(terminal["terminal_kind"], "redacted_withheld")
+
     def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
         self,
     ) -> None:

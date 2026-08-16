@@ -384,6 +384,42 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
         )
 
 
+class LoggingAuditLevelTests(unittest.TestCase):
+    """#175/#185：失败类审计动作必须在 WARNING 级可见。
+
+    S-A-07 r15/r19 真实验收里「已收到」表情缺失时，``reaction.failed`` 是唯一能
+    回答"加表情调用到底怎么失败的"的证据；它此前记在 INFO 级、淹没在正常流水中，
+    验收没有捕获到。这里锁定级别约定：``*failed`` / ``*error`` / ``*unparsable``
+    记 WARNING，正常动作保持 INFO。
+    """
+
+    def test_failed_actions_log_at_warning(self) -> None:
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+            _LoggingAudit().record("reaction.failed", error="RuntimeError: 加表情失败")
+        self.assertTrue(captured.output[0].startswith("WARNING"))
+        self.assertIn("reaction.failed", captured.output[0])
+
+    def test_unsupported_message_type_logs_at_warning(self) -> None:
+        """独立审核 F5：``message.unsupported_type`` 不以失败后缀结尾，但它是
+        "用户发了消息却什么都没发生"的唯一入站侧证据（r19 首轮误判正是这一类），
+        必须进 WARNING 显式名单。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+            _LoggingAudit().record("message.unsupported_type")
+        self.assertTrue(captured.output[0].startswith("WARNING"))
+
+    def test_normal_actions_stay_at_info(self) -> None:
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
+            _LoggingAudit().record("reply.sent")
+        self.assertTrue(captured.output[0].startswith("INFO"))
+
+
 class EntryPointTests(unittest.TestCase):
     def test_main_refuses_an_empty_configuration(self) -> None:
         self.assertEqual(main(env={}), 2, "缺配置必须以退出码 2 拒绝启动")

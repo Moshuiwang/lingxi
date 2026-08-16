@@ -36,6 +36,7 @@ def _envelope(
     message_id: str = "om_1",
     chat_id: str = "oc_1",
     chat_type: str = "p2p",
+    message_type: str = "text",
     content: str = '{"text": "hi"}',
 ) -> dict:
     return {
@@ -46,7 +47,7 @@ def _envelope(
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "chat_type": chat_type,
-                "message_type": "text",
+                "message_type": message_type,
                 "content": content,
             },
         },
@@ -78,6 +79,7 @@ class ValidateEnvelopeTests(unittest.TestCase):
         self.assertIn("event.message.message_id", message)
         self.assertIn("event.message.chat_id", message)
         self.assertIn("event.message.chat_type", message)
+        self.assertIn("event.message.message_type", message)
         self.assertIn("event.message.content", message)
 
     def test_wrong_event_type_is_rejected(self) -> None:
@@ -101,6 +103,36 @@ class ValidateEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             self.module.validate_envelope(payload)
         self.assertIn("event.sender.sender_id.open_id", str(raised.exception))
+
+    def test_missing_message_type_is_rejected(self) -> None:
+        """S-A-07 r19 实测缺口（Issue #57 评论 5307741204）：缺 message_type 的
+        envelope 会被真实解析判为不支持类型、不建任务，验收者会把"脚本输入不
+        完整"误读成产品回归——必须在启动前挡住。
+        """
+
+        payload = _envelope()
+        del payload["event"]["message"]["message_type"]
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("event.message.message_type", str(raised.exception))
+
+    def test_non_text_message_type_is_rejected(self) -> None:
+        payload = _envelope(message_type="image")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        message = str(raised.exception)
+        self.assertIn("event.message.message_type", message)
+        self.assertIn("'text'", message)
+
+    def test_padded_text_message_type_is_rejected(self) -> None:
+        """独立审核 F6：生产解析 ``message_text`` 用原值比较，``"text "`` 会被判成
+        非文本、正文提取为空——校验必须与生产同口径做精确比较，strip 后放行会让
+        重放悄悄变成一个空问题任务。"""
+
+        payload = _envelope(message_type="text ")
+        with self.assertRaises(ValueError) as raised:
+            self.module.validate_envelope(payload)
+        self.assertIn("event.message.message_type", str(raised.exception))
 
 
 class AuditCaptureTests(unittest.TestCase):
