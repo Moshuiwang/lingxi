@@ -30,6 +30,7 @@ from lingxi.adapters.feishu_events import (
     NonPrivateChatError,
     parse_message_event,
 )
+from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
     EventPipeline,
@@ -42,6 +43,10 @@ from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, 
 from lingxi.core.conversation.session_window import should_resume_session
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+# 产品负责人 2026-08-16 定稿的 `/new` 成功文字确认（Issue #175 评论 5306860379），
+# 逐字比对；下方 ``test_new_session_text_matches_the_pm_final_copy`` 另外断言内容
+# 目录里的实际值与这个定稿一致，两头都不能漂移。
+NEW_SESSION_TEXT = "已开启新会话，可以开始提问。"
 
 
 def message(
@@ -457,9 +462,17 @@ class BusyCommandTests(PipelineTestCase):
             "忙碌期的 /new 不得清空上下文（合同把 /new 列入忙碌期受限命令）",
         )
         self.assertEqual(len(self.state.tasks), 0, "忙碌期的 /new 不得入队")
+        replies = self.log.fields("reply.send_text")
         self.assertEqual(
-            self.log.fields("reply.send_text")[0]["text"],
-            BUSY_HINT_TEXT,
+            len(replies),
+            1,
+            "忙碌期的 /new 沿用现有忙碌提示，不得额外追加「已开启新会话」文案",
+        )
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+        self.assertNotEqual(
+            replies[0]["text"],
+            NEW_SESSION_TEXT,
+            "否定测试：忙碌分支不得出现 /new 成功文案",
         )
 
     def test_stop_during_busy_is_processed_not_deflected(self) -> None:
@@ -481,6 +494,32 @@ class BusyCommandTests(PipelineTestCase):
 
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertIsNone(self.conversation.agent_session_id)
+
+    def test_new_when_idle_sends_exactly_one_success_confirmation(self) -> None:
+        """Issue #175（2026-08-16 定稿）：空闲 /new 除表情外，恰好一条文字确认，
+        内容与产品负责人定稿逐字一致。"""
+
+        self.conversation.running_task_id = None
+        self.build().handle_message(message(text="/new"), now=NOW)
+
+        self.assertEqual(self.log.count("reaction.add"), 1, "表情仍作为「已收到」信号保留")
+        self.assertEqual(len(self.state.tasks), 0, "/new 依旧不创建问数任务")
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1, "空闲 /new 恰好一条文字回复")
+        self.assertEqual(replies[0]["text"], NEW_SESSION_TEXT)
+
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content_key"], "gateway.new_session")
+        self.assertTrue(sent[0]["content_version"])
+
+    def test_new_session_text_matches_the_pm_final_copy(self) -> None:
+        """内容目录里的 ``gateway.new_session`` 必须逐字等于 2026-08-16 定稿，
+        与上面注入测试用的字面量不得漂移。"""
+
+        self.assertEqual(
+            default_content_catalog().text("gateway.new_session").text, NEW_SESSION_TEXT
+        )
 
 
 class EnqueueFailureTests(PipelineTestCase):

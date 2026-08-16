@@ -376,6 +376,10 @@ class EventPipeline:
                     conversation_id=conversation.conversation_id,
                     trace_id=message.trace_id,
                 )
+                # 产品合同「系统明确告诉用户已经开启新会话」：表情继续充当「已收到」
+                # 信号，这里追加一条明确的文字确认，随事务提交后统一发送循环发出
+                # （不改变事务边界，见类顶部说明）。
+                deferred.append(self._texts.catalog.text("gateway.new_session"))
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
                 return Outcome(handled_as=HandledAs.COMMAND)
 
