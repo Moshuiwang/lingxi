@@ -151,6 +151,17 @@ class ContentDirectoryTests(unittest.TestCase):
                 with self.assertRaises(ContentValidationError):
                     ContentCatalog.from_mapping(invalid)
 
+    def test_card_titles_match_the_2026_08_16_pm_final_copy(self) -> None:
+        """Issue #175：处理中「正在查询」、成功「查询完成」、失败「查询未完成」，
+        空结果沿用「查询完成」；标题只在正文承载一份，卡片不再单独带 header
+        （header 去留由 `adapters.feishu_delivery` 的 `_card_payload` 断言覆盖）。"""
+
+        catalog = default_content_catalog()
+        self.assertEqual(catalog.card("query.status", status="处理中").title, "正在查询")
+        self.assertEqual(catalog.card("query.result", result="结果").title, "查询完成")
+        self.assertEqual(catalog.card("query.failure", message="失败").title, "查询未完成")
+        self.assertEqual(catalog.card("query.empty").title, "查询完成")
+
     def test_placeholder_variables_must_match_in_both_directions(self) -> None:
         catalog = default_content_catalog()
         with self.assertRaises(ContentRenderError):

@@ -33,14 +33,15 @@
 **卡片 JSON 2.0 载荷形状未经真实发送验证（证据等级 L1）。** 字段名与调用形态（
 ``cardkit/v1/cards`` 的 ``create``/``elements.content`` 流式更新/``settings`` 关闭、
 共用整卡级 ``sequence``）已经由 G-CARD Bot-Test 探针实测确认（#162 评论
-5291111636）；卡片模板本身的 JSON 结构（``header`` + 一个固定 ``element_id`` 的
-markdown 元素）依据官方 CardKit JSON 2.0 文档惯例编写，尚未经过真实发送验证——
-这一点留给 Bot-Test/Stage 的 L4a（issue #152 可观察完成标准明确本 Story 只到
-Runtime Assembled）。``CardStream`` 把标题与正文合并成一段 markdown 文本后交给
-``update()``：流式内容更新接口只更新**一个**元素的 ``content``，而
-``RenderedCard`` 同时含标题与正文，合并成一段是让"一次 ``CardStream.update()``
-调用对应一次外部调用"这条既有约束继续成立的最小改法，不引入第二个元素、第二个
-序号消耗点。
+5291111636）；卡片模板本身的 JSON 结构（不含 ``header``、只有一个固定
+``element_id`` 的 markdown 元素，Issue #175 起去掉 header，阶段标题只在正文承载
+一份）依据官方 CardKit JSON 2.0 文档惯例编写，尚未经过真实发送验证——这一点留给
+Bot-Test/Stage 的 L4a（issue #152 可观察完成标准明确本 Story 只到 Runtime
+Assembled；无 header 卡片的真实接受度是 #175 新增的 L4a 未验证项）。
+``CardStream`` 把标题与正文合并成一段 markdown 文本后交给 ``update()``：流式内容
+更新接口只更新**一个**元素的 ``content``，而 ``RenderedCard`` 同时含标题与正文，
+合并成一段是让"一次 ``CardStream.update()`` 调用对应一次外部调用"这条既有约束
+继续成立的最小改法，不引入第二个元素、第二个序号消耗点。
 
 **已知限制（独立审核 P3-4，未消除）：`reply_to_message_id` 可为空。** 迁移
 ``0058`` 起 ``task.reply_to_message_id`` 可空（``ALTER TABLE task ADD COLUMN
@@ -72,7 +73,11 @@ def _card_markdown(card: RenderedCard) -> str:
 
 
 def _card_payload(card: RenderedCard) -> dict[str, Any]:
-    """CardKit JSON 2.0 的 ``data`` 载荷：一个 header + 一个 markdown 元素。
+    """CardKit JSON 2.0 的 ``data`` 载荷：只有一个 markdown 元素，不含 ``header``。
+
+    Issue #175（2026-08-16 产品负责人定稿）：卡片不再单独带 ``header``——阶段标题
+    只在 ``_card_markdown`` 合并出的正文里承载一份，同时修复「建卡时标题在 header
+    与正文各写一遍」与「终态后 header 仍停在建卡时的进度用词」两个问题。
 
     ``update_multi=true`` 是流式卡片的必要开关（issue 状态合同第 1 条）；
     ``streaming_mode=true`` 与建卡时就打开流式，之后靠 ``elements.content`` 增量更新，
@@ -82,7 +87,6 @@ def _card_payload(card: RenderedCard) -> dict[str, Any]:
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "streaming_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": card.title}},
         "body": {
             "elements": [
                 {
