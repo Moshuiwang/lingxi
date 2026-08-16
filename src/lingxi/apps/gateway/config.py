@@ -68,6 +68,13 @@ class GatewayConfig:
     admin_group_chat_id: str | None = None
     alert_policy: AlertPolicy = field(default_factory=AlertPolicy)
     feishu_base_url: str = DEFAULT_FEISHU_BASE_URL
+    # S-A-07 受控验收专用开关（Issue #152 验收缺口，#154 评论 5306860510、
+    # #162 E-022 已批准）：注入一次确定性的卡片投递拒绝，用于在没有真实故障可
+    # 复现的情况下证伪「关闭卡片路径 + 同话题一次完整文本终态」的降级路径——
+    # 默认没有任何部署态注入点，这条降级此前只能靠真实故障偶然触发。默认
+    # `None`（不注入，装配路径与此前逐字节一致）；合法值只有四个，非法值必须
+    # 启动即失败（失败关闭），不允许一个拼错的值悄悄在生产环境里长期放行。
+    card_failure_injection: str | None = None
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -99,6 +106,32 @@ def _number(env: Mapping[str, str], name: str, default: float) -> float:
     if value <= 0:
         raise GatewayConfigError(f"{ENV_PREFIX}{name} 必须是正数")
     return value
+
+
+# 合法值集合是产品合同的一部分（S-A-07 卡片故障注入开关第 1 点），不是随口列举：
+# 每个值对应 `CardStream` 生命周期里的一步（建卡 / 流式更新 / 终态关闭）。
+# 四个值的实测语义（独立审核 P2-1，详见 apps/gateway/_RejectingCards 的文档）：
+#   - create/all 在正常单轮场景下等价（建卡先被拒即整体降级，update/close
+#     没有机会被调用到），只有从已持久化 card_id 恢复时 all 才会真的命中
+#     update/close 那一支；
+#   - 覆盖"建卡成功之后"降级路径的是 update，不是 all；
+#   - close 单独命中不产生降级（V-卡片-03：关闭失败不构成结果丢失），是
+#     "关闭失败不得产生第二条文本终态"这条否定断言的验收入口。
+_CARD_FAILURE_INJECTION_VALUES = frozenset({"create", "update", "close", "all"})
+
+
+def _card_failure_injection(env: Mapping[str, str]) -> str | None:
+    raw = _text(env, "CARD_FAILURE_INJECT")
+    if raw is None:
+        return None
+    if raw not in _CARD_FAILURE_INJECTION_VALUES:
+        # 不回显收到的值：和其余校验错误同一习惯——这个变量名紧挨着凭据变量，
+        # 养成回显习惯迟早会在别的变量上漏出秘密。
+        raise GatewayConfigError(
+            f"{ENV_PREFIX}CARD_FAILURE_INJECT 不合法，只接受："
+            + "、".join(sorted(_CARD_FAILURE_INJECTION_VALUES))
+        )
+    return raw
 
 
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -164,6 +197,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         admin_group_chat_id=admin_group_chat_id,
         alert_policy=alert_policy,
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
+        card_failure_injection=_card_failure_injection(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

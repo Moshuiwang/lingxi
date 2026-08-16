@@ -362,6 +362,62 @@ class CardFailureFallsBackToTextTests(DeliveryConsumerTestCase):
         self.assertEqual(len(texts.calls), 2, "第一次失败 + 退避过后的第二次重试各一次")
 
 
+class CardFailureInjectionAcceptanceFixtureTests(DeliveryConsumerTestCase):
+    """S-A-07 受控验收缺口专用注入开关（Issue #152 验收缺口、#154 评论
+    5306860510、#162 E-022）：``apps.gateway._RejectingCards`` 命中被选中的那一步
+    时确定性抛出 ``DeliveryRejected``，走的正是 ``CardFailureFallsBackToTextTests``
+    已经验证过的既有降级路径——这里额外验证的是注入开关本身"命中步骤即拒绝、
+    未命中步骤直通真实 transport"这条装配契约，而不是重新验证降级路径本身。
+    """
+
+    def test_create_injection_falls_back_to_a_single_text_terminal(self) -> None:
+        from lingxi.apps.gateway import _RejectingCards
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1", content="已产生的答案")
+
+        real_cards = RecordingCards()
+        cards = _RejectingCards(real_cards, inject="create")
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+
+        self.assertEqual(
+            real_cards.create_calls, [], "命中 create 时必须直接拒绝，不透传给真实 transport"
+        )
+        self.assertEqual(len(texts.calls), 1, "同话题只发一次文本终态")
+        self.assertIn("已产生的答案", texts.calls[0]["text"])
+
+        row = self.query(
+            "SELECT status, fallback_text, delivery_message_id FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "succeeded")
+        self.assertTrue(row[1])
+        self.assertEqual(row[2], "msg-text-1")
+
+    def test_only_the_configured_step_is_rejected(self) -> None:
+        """`update` 命中时 create 仍直通真实 transport——只有被选中的那一步拒绝，
+        这是 ``_RejectingCards`` 文档写明的设计取舍，必须能被证伪。
+        """
+
+        from lingxi.apps.gateway import _RejectingCards
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+        self.finish_task("tsk-1", content="已产生的答案")
+
+        real_cards = RecordingCards()
+        cards = _RejectingCards(real_cards, inject="update")
+        texts = RecordingText()
+        consumer = DeliveryConsumer(queue=self.queue, cards=cards, texts=texts)
+        consumer.run_once()
+
+        self.assertEqual(len(real_cards.create_calls), 1, "create 未被选中，必须直通真实 transport")
+        self.assertEqual(len(real_cards.close_calls), 0, "终态更新命中注入后不再尝试关闭")
+        self.assertEqual(len(texts.calls), 1, "终态更新命中注入后降级为一次文本终态")
+
+
 class CrashRecoveryDoesNotDuplicateDeliveryTests(DeliveryConsumerTestCase):
     """重复投递防线的核心验证：外发前预留位已提交、外部调用结果不明时崩溃重启，
     不得自动重发（Issue #151 审核 P3-6、issue 状态合同第 6 条）。
