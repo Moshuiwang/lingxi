@@ -82,9 +82,15 @@ class PipelineTestCase(unittest.TestCase):
         fail_on: str | None = None,
         reaction_error: Exception | None = None,
         onboarding=None,
+        force_clear_agent_session_result: bool | None = None,
     ):
         return EventPipeline(
-            store=FakeStore(self.state, self.log, fail_on=fail_on),
+            store=FakeStore(
+                self.state,
+                self.log,
+                fail_on=fail_on,
+                force_clear_agent_session_result=force_clear_agent_session_result,
+            ),
             reactions=FakeReactions(self.log, fail_with=reaction_error),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
@@ -512,6 +518,43 @@ class BusyCommandTests(PipelineTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["content_key"], "gateway.new_session")
         self.assertTrue(sent[0]["content_version"])
+
+    def test_new_race_loses_the_clear_gets_only_the_busy_hint_not_the_success_text(
+        self,
+    ) -> None:
+        """P2-1（独立审核）：busy 快照（事务开头 `ensure_conversation` 读到的
+        `running_task_id`）是空闲的，但真正执行 `clear_agent_session` 时已经
+        影响 0 行——对称于源码注释「清空本身再判一次忙碌」描述的竞态：另一条连接
+        在两次读取之间抢占成功。这时必须整体落到忙碌分支，`gateway.new_session`
+        绝不能和忙碌提示一起出现，否则会把一次没有真正清空上下文的 `/new` 误报
+        成功。用 `force_clear_agent_session_result=False` 直接注入这一步的返回
+        值，不依赖真实线程调度就能稳定复现（真库并发版本见
+        `test_gateway_postgres.NewCommandRaceTests`）。"""
+
+        self.conversation.running_task_id = None
+        outcome = self.build(force_clear_agent_session_result=False).handle_message(
+            message(text="/new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.conversation.agent_session_id,
+            "ses_1",
+            "竞态中真正没有清空的上下文不得被当作已经清空",
+        )
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1, "竞态分支恰好一条回复")
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+        self.assertNotEqual(
+            replies[0]["text"],
+            NEW_SESSION_TEXT,
+            "否定测试：竞态分支不得出现 /new 成功文案",
+        )
+        self.assertNotIn(
+            "gateway.new_session",
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            "否定测试：竞态分支的审计记录里不得出现成功文案的内容键",
+        )
 
     def test_new_session_text_matches_the_pm_final_copy(self) -> None:
         """内容目录里的 ``gateway.new_session`` 必须逐字等于 2026-08-16 定稿，
