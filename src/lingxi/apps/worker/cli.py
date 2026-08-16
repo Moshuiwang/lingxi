@@ -119,6 +119,7 @@ def main(
             heartbeat=_combined_heartbeat(alerting_duty, "worker"),
             on_task_stuck=alerting_duty.task_stuck_callback(),
             on_alert_tick=alerting_duty.run_once,
+            on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
             session_root=session_root,
             session_cleanup_batch_limit=config.session_cleanup_batch_limit,
         )
@@ -232,6 +233,24 @@ class _StructuredAuditSink:
 
     def record(self, action: str, /, **fields: object) -> None:
         _log(self._err, self._trace_id, "info", f"worker.audit.{action}", **fields)
+
+
+def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[str, Any]], None]:
+    """把 ``WorkerService`` 的终态收口低敏审计事件接到本文件的结构化 stderr 出口
+    （Issue #90 评论 5306860255 的独立复核 P1）。
+
+    ``WorkerService`` 是纯组装对象，不知道自己会被哪个入口装配，也不该假设
+    stdlib ``logging`` 有 handler——``main()`` 从不调用 ``logging.
+    basicConfig()``（见 ``_LogOnlyAlertSender`` 的说明），经由 ``logging``
+    发出的调用在真实队列 worker 进程里会被默认阈值悄悄吞掉，运维在容器 stderr
+    里永远看不到。这里复用现成的结构化 ``_log()`` 出口，让终态收口事件真正
+    落到运维能看到的地方，并带上 ``trace_id``（代码框架「三、横切约定」）。
+    """
+
+    def sink(fields: Mapping[str, Any]) -> None:
+        _log(err, trace_id, "info", "worker.task.terminal", **fields)
+
+    return sink
 
 
 def _build_alerting_duty(*, err: TextIO, trace_id: str) -> Any:
