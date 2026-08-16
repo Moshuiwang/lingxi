@@ -59,6 +59,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "worker.queued_timeout",
     "worker.version_unavailable",
     "worker.running_timeout",
+    "worker.max_turns",
     "worker.stopped",
     "worker.stopped_result",
     "worker.failed",

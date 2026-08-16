@@ -505,11 +505,17 @@ class WorkerServiceTests(unittest.TestCase):
         )
 
     def test_stop_and_timeout_write_distinct_terminal_kinds(self) -> None:
-        for stopped, failure_code, expected_terminal_kind, expected_error in (
-            (True, None, "stopped", "stopped"),
-            (False, "turn_timeout", "timeout", "running_timeout"),
+        # Issue #90 评论 5306860255：turn 模式（apps/worker/turn.py 的
+        # `_sdk_termination_failure`）早就把撞满 Agent 轮数上限分类成
+        # `max_turns_exceeded`，但 queue 收口此前落进 `_failure_content` 的默认
+        # 分支，被压平成通用 `session_failed` + 「本次任务未取得可用结果，请稍后
+        # 重试」——用户看不出重试无意义。这里补一行覆盖 queue 链路的专属终态。
+        for stopped, failure_code, expected_terminal_kind, expected_error, expected_content_key in (
+            (True, None, "stopped", "stopped", "worker.stopped"),
+            (False, "turn_timeout", "timeout", "running_timeout", "worker.running_timeout"),
+            (False, "max_turns_exceeded", "failed", "max_turns_exceeded", "worker.max_turns"),
         ):
-            with self.subTest(expected_terminal_kind=expected_terminal_kind):
+            with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
                 queue = FakeWorkerQueue(stopped=stopped)
 
                 class Executor:
@@ -528,8 +534,9 @@ class WorkerServiceTests(unittest.TestCase):
                 terminal = queue.terminals[0]
                 self.assertEqual(terminal["terminal_kind"], expected_terminal_kind)
                 self.assertEqual(terminal["error_kind"], expected_error)
-                expected_key = "worker.stopped" if stopped else "worker.running_timeout"
-                self.assertEqual(terminal["content"], default_content_catalog().text(expected_key).text)
+                self.assertEqual(
+                    terminal["content"], default_content_catalog().text(expected_content_key).text
+                )
 
     def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
         """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
@@ -568,6 +575,56 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(
             terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
         )
+
+    def test_terminal_log_records_failure_code_and_reasons_without_leaking_content(self) -> None:
+        """Issue #90 评论 5306860255：queue 链路收口此前失败码与安全命中规则完全
+        不可回读，r13 只能靠猜直接原因。这里断言收口日志带上 ``task_id``/
+        ``failure_code``/``error_kind``/``terminal_kind`` 与安全判定的布尔/原因码
+        ——同时做否定测试：正文样本与 ``user_id``（``open_id`` 的替身）一律不得
+        进日志。删掉 ``_log_terminal_outcome`` 里的 ``logger.info(...)`` 调用必须
+        让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+        forbidden_content_sample = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。"
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": forbidden_content_sample,
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": True,
+                            "reasons": ("forbidden_value",),
+                        },
+                        "user_result": "redacted_withheld",
+                    },
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        with self.assertLogs("lingxi.apps.worker.service", level="INFO") as captured:
+            asyncio.run(service.process_once())
+
+        joined = "\n".join(captured.output)
+        self.assertIn("task_id=tsk-1", joined)
+        self.assertIn("error_kind=redacted_withheld", joined)
+        self.assertIn("terminal_kind=redacted_withheld", joined)
+        self.assertIn("output_safety_blocked=True", joined)
+        self.assertIn("output_safety_withheld=True", joined)
+        self.assertIn("forbidden_value", joined)
+        # 否定测试：正文样本、user_id（open_id 的替身）与 prompt 一律不得出现在
+        # 收口日志里——这条日志的存在不能反过来变成新的敏感信息泄漏面。
+        self.assertNotIn(forbidden_content_sample, joined)
+        self.assertNotIn(queue.context.user_id, joined)
+        self.assertNotIn(queue.context.prompt, joined)
 
     def test_a_global_stop_signal_interrupts_an_in_flight_turn_within_the_poll_interval(
         self,

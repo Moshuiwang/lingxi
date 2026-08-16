@@ -385,6 +385,8 @@ class WorkerService:
                 error_kind="stopped",
                 content=content,
                 elapsed_seconds=elapsed_seconds,
+                failure_code=failure_code,
+                output_safety=output_safety,
             )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
@@ -396,6 +398,8 @@ class WorkerService:
                 error_kind="redacted_withheld",
                 content=self._catalog.text("worker.redacted_withheld"),
                 elapsed_seconds=elapsed_seconds,
+                failure_code=failure_code,
+                output_safety=output_safety,
             )
         elif bool(turn.get("closed")) and not failure:
             self._finish_terminal(
@@ -405,6 +409,8 @@ class WorkerService:
                 content=RenderedContent(key="worker.result", version=self._catalog.version, text=final_text),
                 elapsed_seconds=elapsed_seconds,
                 session_id=turn.get("session_id") if isinstance(turn, Mapping) else None,
+                failure_code=failure_code,
+                output_safety=output_safety,
             )
         else:
             error_kind, content = self._failure_content(failure_code)
@@ -417,6 +423,8 @@ class WorkerService:
                 error_kind=error_kind,
                 content=content,
                 elapsed_seconds=elapsed_seconds,
+                failure_code=failure_code,
+                output_safety=output_safety,
             )
 
     def _append_event(
@@ -457,6 +465,8 @@ class WorkerService:
         content: RenderedContent,
         elapsed_seconds: int = 0,
         session_id: str | None = None,
+        failure_code: object = None,
+        output_safety: Mapping[str, Any] | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -464,8 +474,19 @@ class WorkerService:
         ``conversation.agent_session_id``——同一话题在此期间不会有第二个任务插进
         来读它，延后写入是安全的（见 ``core.delivery.ports`` 与
         ``PostgresTaskQueue.confirm_delivery`` 的取舍说明）。
+
+        本方法是 ``_process_task`` 里所有终态写入的唯一收口点，因此低敏审计日志
+        （Issue #90 评论 5306860255）放在这里记一次，覆盖 stop/withheld/success/
+        failure 全部分支，不必在每个分支各写一遍。
         """
 
+        self._log_terminal_outcome(
+            task_id=claimed.task_id,
+            failure_code=failure_code,
+            error_kind=error_kind,
+            terminal_kind=terminal_kind,
+            output_safety=output_safety,
+        )
         self._queue.write_terminal_event(
             task_id=claimed.task_id,
             worker_id=self._config.worker_id,
@@ -474,6 +495,40 @@ class WorkerService:
             content=content.text,
             elapsed_seconds=elapsed_seconds,
             agent_session_id=session_id,
+        )
+
+    def _log_terminal_outcome(
+        self,
+        *,
+        task_id: str,
+        failure_code: object,
+        error_kind: str | None,
+        terminal_kind: str,
+        output_safety: Mapping[str, Any] | None,
+    ) -> None:
+        """queue 收口低敏结构化日志（Issue #90 评论 5306860255）：queue 链路此前
+        失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记分类性
+        的失败码、落库 ``error_kind``、``terminal_kind`` 与安全判定的布尔/原因码
+        ——**严禁**记录正文内容、用户 open_id、prompt 或模型输出片段。
+        """
+
+        blocked = bool(isinstance(output_safety, Mapping) and output_safety.get("blocked"))
+        withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
+        reasons: tuple[str, ...] = ()
+        if isinstance(output_safety, Mapping):
+            raw_reasons = output_safety.get("reasons")
+            if isinstance(raw_reasons, (list, tuple)):
+                reasons = tuple(str(reason) for reason in raw_reasons)
+        logger.info(
+            "queue 任务终态收口 task_id=%s failure_code=%s error_kind=%s terminal_kind=%s "
+            "output_safety_blocked=%s output_safety_withheld=%s output_safety_reasons=%s",
+            task_id,
+            failure_code,
+            error_kind,
+            terminal_kind,
+            blocked,
+            withheld,
+            reasons,
         )
 
     async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
@@ -515,6 +570,14 @@ class WorkerService:
             return "running_timeout", self._catalog.text("worker.running_timeout")
         if code == "side_effect_uncertain":
             return "side_effect_uncertain", self._catalog.text("worker.side_effect_uncertain")
+        if code == "max_turns_exceeded":
+            # Issue #90 评论 5306860255：turn 模式（apps/worker/turn.py 的
+            # `_sdk_termination_failure`）早已把撞满 Agent 轮数上限分类为
+            # `max_turns_exceeded`，但 queue 收口此前落进这里的默认分支，
+            # 被压平成通用 `session_failed` 文案——用户看到的是「请稍后重试」，
+            # 而重试对"问题本身步骤太多"这种失败原因没有意义。这里给它一个
+            # 独立、可查询的 error_kind 和产品负责人定稿的专属文案。
+            return "max_turns_exceeded", self._catalog.text("worker.max_turns")
         return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
