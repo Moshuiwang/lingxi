@@ -40,6 +40,29 @@ class QueueListener(Protocol):
 ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
 HeartbeatCallback = Callable[[], None]
 TaskStuckCallback = Callable[[str, int], None]
+# 终态收口低敏审计事件（Issue #90 评论 5306860255 的独立复核 P1）：字段名与取值
+# 见 ``WorkerService._log_terminal_outcome``。``WorkerService`` 是纯组装对象，
+# 不知道自己会被哪个进程入口装配，也不该假设 stdlib ``logging`` 有 handler——
+# 真实队列 worker 的 `apps/worker/cli.py` 刻意从不调用 `logging.basicConfig()`
+# （见该文件 `_LogOnlyAlertSender` 的说明：未配置 handler 时默认阈值
+# `WARNING` 会把 `logging.info(...)` 悄悄吞掉），因此这条低敏审计事件必须像
+# `heartbeat`/`on_task_stuck`/`on_alert_tick` 一样由装配层注入真正的输出出口，
+# 不能自己直接调 `logging`。
+TerminalOutcomeCallback = Callable[[Mapping[str, object]], None]
+_MAX_LOG_TOKEN_CHARS = 64
+
+
+def _cap_log_token(value: str) -> tuple[str, bool]:
+    """把失败码/安全原因码这类短标识截到审计安全的长度上界（Issue #90 评论
+    5306860255 的独立复核 P3-2）。这些值目前全部来自本仓库固定的枚举式常量
+    （``turn.py``/``report.py`` 的失败码、``input_safety`` 的原因码），不是模型
+    输出，但收口日志是低敏审计的唯一出口——不给未来新增码值设长度上界，就是
+    给"某次改动不小心把一段自由文本塞进这个字段"留了一条不设防的泄漏面。
+    """
+
+    if len(value) <= _MAX_LOG_TOKEN_CHARS:
+        return value, False
+    return value[:_MAX_LOG_TOKEN_CHARS], True
 
 
 class WorkerService:
@@ -71,6 +94,7 @@ class WorkerService:
         session_root: Path | None = None,
         session_cleanup_batch_limit: int = 20,
         on_alert_tick: Callable[[], None] | None = None,
+        on_terminal_outcome: TerminalOutcomeCallback | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -103,6 +127,10 @@ class WorkerService:
         # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
         # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
         self._on_alert_tick = on_alert_tick
+        # 终态收口低敏审计事件的真正输出出口（Issue #90 评论 5306860255 独立复核
+        # P1）：``None`` 时 `_log_terminal_outcome` 整体跳过——没有装配方就没有
+        # 输出，不假装写了一条实际被吞掉的日志。
+        self._on_terminal_outcome = on_terminal_outcome
         # SIGTERM 收到后由 run() 设置：在途任务的 `_monitor` 据此把"进程正在停机"
         # 与"用户发了 /stop"同等看待，主动请求 Agent SDK 中断当前回合（Issue #153
         # 完成标准第 3 条）。默认 None，保持 process_once()/白盒测试的既有行为不变。
@@ -506,11 +534,24 @@ class WorkerService:
         terminal_kind: str,
         output_safety: Mapping[str, Any] | None,
     ) -> None:
-        """queue 收口低敏结构化日志（Issue #90 评论 5306860255）：queue 链路此前
-        失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记分类性
-        的失败码、落库 ``error_kind``、``terminal_kind`` 与安全判定的布尔/原因码
-        ——**严禁**记录正文内容、用户 open_id、prompt 或模型输出片段。
+        """queue 收口低敏结构化审计事件（Issue #90 评论 5306860255）：queue 链路
+        此前失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记
+        分类性的失败码、落库 ``error_kind``、``terminal_kind`` 与安全判定的
+        布尔/原因码——**严禁**记录正文内容、用户 open_id、prompt 或模型输出
+        片段。
+
+        独立复核 P1：这条事件不能直接调用 stdlib ``logging``——``WorkerService``
+        不知道自己会被哪个进程入口装配，而真实队列 worker 的 ``apps/worker/
+        cli.py`` 刻意从不调用 ``logging.basicConfig()``（未配置 handler 时默认
+        阈值 ``WARNING`` 会把 ``logging.info(...)`` 悄悄吞掉，运维在真实容器
+        stderr 里永远看不到）。因此改为调用装配层注入的 ``on_terminal_outcome``
+        回调，由 ``cli.py`` 接到本文件既有的结构化 stderr 出口（``worker.task.
+        terminal``，带 ``trace_id``）。没有装配方（``None``，例如白盒测试与旧
+        调用方）时整体跳过，不假装写了一条实际不存在的日志。
         """
+
+        if self._on_terminal_outcome is None:
+            return
 
         blocked = bool(isinstance(output_safety, Mapping) and output_safety.get("blocked"))
         withheld = bool(isinstance(output_safety, Mapping) and output_safety.get("withheld"))
@@ -519,17 +560,36 @@ class WorkerService:
             raw_reasons = output_safety.get("reasons")
             if isinstance(raw_reasons, (list, tuple)):
                 reasons = tuple(str(reason) for reason in raw_reasons)
-        logger.info(
-            "queue 任务终态收口 task_id=%s failure_code=%s error_kind=%s terminal_kind=%s "
-            "output_safety_blocked=%s output_safety_withheld=%s output_safety_reasons=%s",
-            task_id,
-            failure_code,
-            error_kind,
-            terminal_kind,
-            blocked,
-            withheld,
-            reasons,
-        )
+
+        # P3-2：失败码与每个原因码入日志前截到长度上界，避免未来某次改动不小心
+        # 把自由文本塞进这两个字段时，审计日志变成新的正文泄漏面。
+        truncated = False
+        capped_failure_code: str | None = None
+        if failure_code is not None:
+            capped_failure_code, code_truncated = _cap_log_token(str(failure_code))
+            truncated = truncated or code_truncated
+        capped_reasons: list[str] = []
+        for reason in reasons:
+            capped_reason, reason_truncated = _cap_log_token(reason)
+            capped_reasons.append(capped_reason)
+            truncated = truncated or reason_truncated
+
+        fields = {
+            "task_id": task_id,
+            "failure_code": capped_failure_code,
+            "error_kind": error_kind,
+            "terminal_kind": terminal_kind,
+            "output_safety_blocked": blocked,
+            "output_safety_withheld": withheld,
+            "output_safety_reasons": tuple(capped_reasons),
+            "truncated": truncated,
+        }
+        try:
+            self._on_terminal_outcome(fields)
+        except Exception as error:  # noqa: BLE001 - 观测失败不能带走任务职责，参照 _append_event
+            logger.error(
+                "终态收口审计事件回调失败，任务收口继续 error=%s", type(error).__name__
+            )
 
     async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
         last_heartbeat = self._monotonic()

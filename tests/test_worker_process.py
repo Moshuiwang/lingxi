@@ -27,6 +27,7 @@ lingxi.apps.worker 真的这样表现"之间的那一段，只有真实子进程
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -353,6 +354,155 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
             "落库，且这次的领取不会被重排，等价于用户结果丢失",
         )
         self.assertEqual(worker_id, self.WORKER_ID, "任务仍应记着是这次领取，没有被别的路径抢走")
+
+
+@unittest.skipUnless(DSN, SKIP_REASON)
+class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
+    """真实子进程 + 真实 PostgreSQL：终态收口低敏审计事件必须真正落到队列
+    worker 进程的 stderr（Issue #90 评论 5306860255 独立复核 P1）。
+
+    ``tests/test_worker_queue_consumer.py`` 的白盒单测只能证明"注入的
+    ``on_terminal_outcome`` 回调被调用"，证明不了"真实队列 worker 进程接线
+    之后运维能在 stderr 里看到它"——真实进程从不调用 ``logging.
+    basicConfig()``，经 stdlib ``logging`` 发出的调用会被默认阈值悄悄吞掉
+    （见 ``apps/worker/cli.py`` 的 ``_LogOnlyAlertSender`` 说明）。这里插入一条
+    **建库时就已经** ``stop_requested = TRUE`` 的任务：worker 领到后立刻走
+    ``_process_task`` 最早的停止分支收口，不需要真实 Claude Agent SDK 或模型
+    凭据（协作约定：测试与 CI 不调用真实模型/飞书）。
+
+    变异存活证据：删掉 ``cli.py`` 里 ``WorkerService(...)`` 的
+    ``on_terminal_outcome=_terminal_outcome_sink(...)`` 参数，或删掉
+    ``_log_terminal_outcome`` 里对回调的调用，本用例都会因为 stderr 里找不到
+    ``worker.task.terminal`` 事件而变红。
+    """
+
+    WORKER_ID = "worker-terminal-log-test"
+    TASK_ID = "tsk-terminal-log"
+    CONVERSATION_ID = "cnv-terminal-log"
+    TRACE_ID = "01J00000000000000000000WR3"
+
+    def setUp(self) -> None:
+        assert DSN is not None
+        ensure_production_schema(DSN)
+        reset_production_rows(DSN)
+        self._insert_already_stopped_task()
+
+    def _insert_already_stopped_task(self) -> None:
+        assert DSN is not None
+        from psycopg import connect
+
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO app_user
+                       (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                        display_name, department, tenant_key, provisioning_state)
+                       VALUES ('usr-terminal-log','ou-terminal-log',
+                               'u-terminal-log','un-terminal-log',
+                               '李四','数据部','tk-terminal-log','active')"""
+                )
+                connection.execute(
+                    """INSERT INTO conversation
+                       (id,user_id,feishu_chat_id,feishu_thread_id)
+                       VALUES (%s,'usr-terminal-log',%s,%s)""",
+                    (self.CONVERSATION_ID, "chat-terminal-log", "topic-terminal-log"),
+                )
+                # stop_requested 在建库时就是 TRUE：worker 领到后不需要真实
+                # Agent SDK 会话就能走到最早的停止分支收口（`_process_task`
+                # 判 `claimed.stop_requested` 那一段），本用例只关心终态收口
+                # 审计事件是否真的落到了 stderr，不关心执行器本身。
+                connection.execute(
+                    """INSERT INTO task
+                       (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                        target_worker_version,attempts,created_at,scheduled_at,
+                        side_effect_state,content_expires_at,stop_requested)
+                       VALUES (%s,%s,'usr-terminal-log','event-terminal-log',
+                               '这是一条已经被要求停止的问题','queued','stable',0,
+                               now()-interval '1 minute',now()-interval '1 minute',
+                               'none',now(),TRUE)""",
+                    (self.TASK_ID, self.CONVERSATION_ID),
+                )
+
+    def _task_status(self) -> str:
+        assert DSN is not None
+        from psycopg import connect
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT status FROM task WHERE id=%s", (self.TASK_ID,)
+            ).fetchone()
+            assert row is not None
+            return row[0]
+
+    def test_terminal_outcome_event_reaches_stderr_with_trace_id(self) -> None:
+        assert DSN is not None
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(REPOSITORY_ROOT / "src"),
+            "PYTHONUNBUFFERED": "1",
+            "LINGXI_WORKER_MODE": "queue",
+            "LINGXI_WORKER_READONLY_TOOL": "mcp__ci_probe__noop",
+            "LINGXI_WORKER_TRACE_ID": self.TRACE_ID,
+            "LINGXI_WORKER_ID": self.WORKER_ID,
+            "LINGXI_WORKER_TARGET_VERSION": "stable",
+            "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
+            "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "30",
+            "LINGXI_POSTGRES_DSN": DSN,
+        }
+        process = subprocess.Popen(
+            [sys.executable, "-m", "lingxi.apps.worker"],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            # 轮询数据库直到终态真正写入（status 转 awaiting_delivery），确认
+            # 断言打在"终态已经收口"这个窗口上，而不是任务还在排队。
+            deadline = time.monotonic() + 10.0
+            status = None
+            while time.monotonic() < deadline:
+                status = self._task_status()
+                if status == "awaiting_delivery":
+                    break
+                time.sleep(0.1)
+            self.assertEqual(
+                status,
+                "awaiting_delivery",
+                "已带 stop_requested 的任务应被迅速领取并走停止分支收口",
+            )
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:  # pragma: no cover - 只在断言失败路径上发生
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+
+        terminal_events = []
+        for line in stderr.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("event") == "worker.task.terminal":
+                terminal_events.append(record)
+
+        self.assertEqual(
+            len(terminal_events),
+            1,
+            f"应恰好出现一条 worker.task.terminal 事件，实际 stderr={stderr}",
+        )
+        event = terminal_events[0]
+        self.assertEqual(event["trace_id"], self.TRACE_ID)
+        self.assertEqual(event["task_id"], self.TASK_ID)
+        self.assertEqual(event["terminal_kind"], "stopped")
+        self.assertEqual(event["error_kind"], "stopped")
 
 
 if __name__ == "__main__":

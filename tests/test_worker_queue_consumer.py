@@ -27,6 +27,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping
 
 from gateway_fakes import FakeAudit, FakeReactions, FakeReplies, CallLog
 from lingxi.adapters.postgres import connect
@@ -464,6 +465,22 @@ class DroppingNotifyListener:
         return None
 
 
+class RecordingTerminalOutcomeSink:
+    """``WorkerService(on_terminal_outcome=...)`` 的测试替身（Issue #90 评论
+    5306860255 独立复核 P1）：真实装配（``apps/worker/cli.py``）接的是结构化
+    stderr 出口，不是 stdlib ``logging``——单测因此不能再用 ``assertLogs``
+    间接验证「代码里调用了 logging」，那只能证明调用存在，证明不了运维在真实
+    队列 worker 进程里真的能看到它（真实进程从不调用 ``logging.basicConfig()``，
+    见 ``cli.py`` 的 ``_LogOnlyAlertSender`` 说明）。这里直接断言注入回调收到的
+    字段，与生产装配走同一条注入协议。"""
+
+    def __init__(self) -> None:
+        self.calls: list[Mapping[str, object]] = []
+
+    def __call__(self, fields: Mapping[str, object]) -> None:
+        self.calls.append(dict(fields))
+
+
 class WorkerServiceTests(unittest.TestCase):
     """Issue #151：``_process_task`` 只写 ``task_delivery_event``，不再调用任何出站
     transport；断言因此改看 ``queue.events``/``queue.terminals`` 记录了什么，而不是
@@ -576,13 +593,24 @@ class WorkerServiceTests(unittest.TestCase):
             terminal["content"], default_content_catalog().text("worker.redacted_withheld").text
         )
 
-    def test_terminal_log_records_failure_code_and_reasons_without_leaking_content(self) -> None:
+    def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
+        self,
+    ) -> None:
         """Issue #90 评论 5306860255：queue 链路收口此前失败码与安全命中规则完全
-        不可回读，r13 只能靠猜直接原因。这里断言收口日志带上 ``task_id``/
-        ``failure_code``/``error_kind``/``terminal_kind`` 与安全判定的布尔/原因码
-        ——同时做否定测试：正文样本与 ``user_id``（``open_id`` 的替身）一律不得
-        进日志。删掉 ``_log_terminal_outcome`` 里的 ``logger.info(...)`` 调用必须
-        让本用例变红。"""
+        不可回读，r13 只能靠猜直接原因。独立复核 P1 之后，真实装配把这条低敏
+        审计事件接到 ``apps/worker/cli.py`` 的结构化 stderr 出口（``worker.task.
+        terminal``），不再直接调用 stdlib ``logging``——真实队列 worker 进程
+        从不调用 ``logging.basicConfig()``，经 ``logging`` 发出的调用会被默认
+        阈值悄悄吞掉，运维在容器 stderr 里永远看不到（见 ``cli.py`` 的
+        ``_LogOnlyAlertSender`` 说明）。因此本用例改为断言注入的
+        ``on_terminal_outcome`` 回调收到的字段，与生产装配走同一条协议；
+        端到端的 CLI 接线级证据见 ``tests/test_worker_process.py`` 的
+        ``QueueModeTerminalOutcomeLoggingTest``。
+
+        同时做否定测试：正文样本与 ``user_id``（``open_id`` 的替身）、``prompt``
+        一律不得出现在回调收到的任何字段里。删掉 ``_log_terminal_outcome`` 里对
+        ``self._on_terminal_outcome(...)`` 的调用，或删掉 ``_finish_terminal``
+        里对 ``_log_terminal_outcome`` 的调用，都必须让本用例变红。"""
 
         queue = FakeWorkerQueue()
         forbidden_content_sample = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。"
@@ -604,27 +632,73 @@ class WorkerServiceTests(unittest.TestCase):
                     "failure": None,
                 }
 
+        sink = RecordingTerminalOutcomeSink()
         service = WorkerService(
             config=worker_config(),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
         )
+        asyncio.run(service.process_once())
 
-        with self.assertLogs("lingxi.apps.worker.service", level="INFO") as captured:
-            asyncio.run(service.process_once())
-
-        joined = "\n".join(captured.output)
-        self.assertIn("task_id=tsk-1", joined)
-        self.assertIn("error_kind=redacted_withheld", joined)
-        self.assertIn("terminal_kind=redacted_withheld", joined)
-        self.assertIn("output_safety_blocked=True", joined)
-        self.assertIn("output_safety_withheld=True", joined)
-        self.assertIn("forbidden_value", joined)
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["task_id"], "tsk-1")
+        self.assertEqual(fields["error_kind"], "redacted_withheld")
+        self.assertEqual(fields["terminal_kind"], "redacted_withheld")
+        self.assertIs(fields["output_safety_blocked"], True)
+        self.assertIs(fields["output_safety_withheld"], True)
+        self.assertIn("forbidden_value", fields["output_safety_reasons"])
+        self.assertIs(fields["truncated"], False)
         # 否定测试：正文样本、user_id（open_id 的替身）与 prompt 一律不得出现在
-        # 收口日志里——这条日志的存在不能反过来变成新的敏感信息泄漏面。
-        self.assertNotIn(forbidden_content_sample, joined)
-        self.assertNotIn(queue.context.user_id, joined)
-        self.assertNotIn(queue.context.prompt, joined)
+        # 回调收到的字段里——这条审计事件的存在不能反过来变成新的敏感信息
+        # 泄漏面。对整个字典做字符串化检查，覆盖任何字段而不是逐个枚举。
+        serialized = repr(fields)
+        self.assertNotIn(forbidden_content_sample, serialized)
+        self.assertNotIn(queue.context.user_id, serialized)
+        self.assertNotIn(queue.context.prompt, serialized)
+
+    def test_terminal_outcome_callback_caps_failure_code_and_reason_length(self) -> None:
+        """Issue #90 评论 5306860255 独立复核 P3-2：``failure_code`` 与
+        ``output_safety`` 的每个原因码目前都来自本仓库固定的枚举式常量，但审计
+        事件是低敏信息的唯一出口——不设长度上界，就是给"未来某次改动不小心把
+        一段自由文本塞进这两个字段"留了一条不设防的泄漏面。截到 64 字符并标记
+        ``truncated=True``。"""
+
+        queue = FakeWorkerQueue()
+        oversized_failure_code = "x" * 100
+        oversized_reason = "y" * 80
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": False,
+                        "final_text": "",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": False,
+                            "reasons": (oversized_reason,),
+                        },
+                    },
+                    "failure": {"code": oversized_failure_code},
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["failure_code"], oversized_failure_code[:64])
+        self.assertEqual(len(fields["failure_code"]), 64)
+        self.assertEqual(fields["output_safety_reasons"], (oversized_reason[:64],))
+        self.assertIs(fields["truncated"], True)
 
     def test_a_global_stop_signal_interrupts_an_in_flight_turn_within_the_poll_interval(
         self,
