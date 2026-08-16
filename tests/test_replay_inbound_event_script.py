@@ -215,5 +215,53 @@ class ReplayTransportTests(unittest.TestCase):
         self.assertNotIn(secret_text, rendered)
 
 
+class RedactedTargetSummaryTests(unittest.TestCase):
+    """独立审核 P3-1：启动摘要必须能帮执行者肉眼确认环境，同时绝不带出口令
+    或完整 DSN——摘要本身也可能被贴进工单或聊天记录。
+    """
+
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_summary_contains_host_and_dbname_but_never_the_password(self) -> None:
+        from lingxi.apps.gateway.config import ENV_PREFIX, load_config
+
+        password = "super-secret-password-only-for-this-test"
+        dsn = f"postgresql://lingxi:{password}@db.example.internal:5432/lingxi_prod?sslmode=require"
+        env = {
+            f"{ENV_PREFIX}APP_ID": "cli_1234567890abcdef",
+            f"{ENV_PREFIX}APP_SECRET": "fake-secret-for-test-only",
+            f"{ENV_PREFIX}POSTGRES_DSN": dsn,
+        }
+        config = load_config(env)
+
+        summary = self.module.redacted_target_summary(config)
+
+        self.assertIn("db.example.internal", summary)
+        self.assertIn("5432", summary)
+        self.assertIn("lingxi_prod", summary)
+        self.assertIn("cli_12", summary, "只回显 app_id 前 6 位，供肉眼核对是哪个飞书应用")
+        self.assertNotIn(password, summary)
+        self.assertNotIn(dsn, summary, "不得回显完整 DSN")
+        self.assertNotIn("sslmode", summary, "查询参数不进摘要")
+        self.assertNotIn("cli_1234567890abcdef", summary, "不完整回显 app_id")
+
+    def test_summary_degrades_gracefully_when_the_dsn_has_no_host(self) -> None:
+        """畸形 DSN 不应该让摘要本身报错——它只是一份肉眼核对用的提示。"""
+
+        from lingxi.apps.gateway.config import ENV_PREFIX, load_config
+
+        env = {
+            f"{ENV_PREFIX}APP_ID": "cli_x",
+            f"{ENV_PREFIX}APP_SECRET": "fake-secret-for-test-only",
+            f"{ENV_PREFIX}POSTGRES_DSN": "not-a-valid-dsn",
+        }
+        config = load_config(env)
+
+        summary = self.module.redacted_target_summary(config)
+
+        self.assertIn("无法解析", summary)
+
+
 if __name__ == "__main__":
     unittest.main()

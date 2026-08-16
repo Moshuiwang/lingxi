@@ -109,8 +109,14 @@ def _number(env: Mapping[str, str], name: str, default: float) -> float:
 
 
 # 合法值集合是产品合同的一部分（S-A-07 卡片故障注入开关第 1 点），不是随口列举：
-# 每个值对应 `CardStream` 生命周期里的一步（建卡 / 流式更新 / 终态关闭），`all`
-# 是"三步都注入"的组合值，供验收覆盖注入发生在建卡成功之后的降级路径。
+# 每个值对应 `CardStream` 生命周期里的一步（建卡 / 流式更新 / 终态关闭）。
+# 四个值的实测语义（独立审核 P2-1，详见 apps/gateway/_RejectingCards 的文档）：
+#   - create/all 在正常单轮场景下等价（建卡先被拒即整体降级，update/close
+#     没有机会被调用到），只有从已持久化 card_id 恢复时 all 才会真的命中
+#     update/close 那一支；
+#   - 覆盖"建卡成功之后"降级路径的是 update，不是 all；
+#   - close 单独命中不产生降级（V-卡片-03：关闭失败不构成结果丢失），是
+#     "关闭失败不得产生第二条文本终态"这条否定断言的验收入口。
 _CARD_FAILURE_INJECTION_VALUES = frozenset({"create", "update", "close", "all"})
 
 

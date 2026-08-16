@@ -5,11 +5,23 @@
 **用途**：Issue #57 的验收缺口——``build_supervisor(config, transport=...)`` 早已
 支持注入传输层（不违反「共享外部通道同一时刻只允许一个客户端」的约束，见
 AGENTS.md），但没有一个可重复运行的入口把**同一个 event_id 的完整事件体**逐字节
-重放若干次去证明 ``V-接入-01``（事件级幂等去重键）/``V-接入-09``（幂等断的是
-出站调用次数，不只是数据库行数）语义：第 1 次正常处理，第 2 次起必须被判定为
-重复，不再重复入队、不再重复加表情或回复。``EventPipeline`` 用的是真实
-``PostgresGatewayStore`` 与真实飞书出站——这正是这个脚本要验证的东西，因此不能
-把它们也换成假实现。
+重放若干次去证明入站幂等：第 1 次正常处理，第 2 次起必须被判定为重复。
+``EventPipeline`` 用的是真实 ``PostgresGatewayStore`` 与真实飞书出站——这正是这个
+脚本要验证的东西，因此不能把它们也换成假实现。
+
+**验证边界（独立审核 P3-2）——脚本的自动判定与需要人工核对的部分不是同一件事**：
+
+- 脚本**自动判定**的只有 ``V-接入-01``（事件级幂等去重键，数据库层面的
+  ``inbound_event`` 唯一约束）：判据是本次重放是否观察到
+  ``apps.gateway._LoggingAudit`` 记的 ``inbound_event.duplicate`` 审计动作
+  （见下方"产出"），退出码 0 表示这一条已经用真实数据库证实。
+- ``V-接入-09``（幂等断的是**出站调用次数**——不重复加表情、不重复回复，不只是
+  数据库行数）**脚本不做自动判定**，必须由验收执行者在飞书侧人工回读：确认
+  目标话题里只出现一次表情、第 2 轮起没有产生新的回复消息。**脚本退出码 0
+  不等于 V-接入-09 已经验证**——它只证明了事件在数据库层面被判成重复，不证明
+  出站调用真的只发生了一次（理论上如果生产代码在去重判定与出站调用之间的顺序
+  被改坏，数据库判重仍可能通过而出站被重复触发，那正是需要人工回读飞书侧才能
+  抓住的场景）。
 
 **输入**：一个 JSON 文件路径，内容是一条 ``im.message.receive_v1`` 事件的完整
 envelope（飞书回调体的原始形状），由验收执行者自备。脚本只做最小字段校验，
@@ -34,10 +46,12 @@ envelope（飞书回调体的原始形状），由验收执行者自备。脚本
     PYTHONPATH=src python3 scripts/replay_inbound_event.py \\
         /path/to/envelope.json --times 2
 
-**产出**：每一轮重放的处理结果摘要（``duplicate`` 标志 + 观察到的审计动作名），
-逐行打印到 stdout；不打印凭据、不打印消息正文全文——摘要只包含固定的审计动作
-名称字符串，取自 ``apps.gateway._LoggingAudit`` 的既有日志（那里本就不记录消息
-正文，见该类文档字符串）。
+**产出**：启动时先在 stderr 打一行不含凭据的目标环境摘要（数据库 host/dbname
+与 app_id 前 6 位，见 ``redacted_target_summary``，独立审核 P3-1），供执行者
+肉眼核对没敲错环境；随后每一轮重放的处理结果摘要（``duplicate`` 标志 + 观察到
+的审计动作名）逐行打印到 stdout。全程不打印凭据、不打印消息正文全文——摘要
+只包含固定的审计动作名称字符串，取自 ``apps.gateway._LoggingAudit`` 的既有
+日志（那里本就不记录消息正文，见该类文档字符串）。
 
 **处理边界**：脚本调用的是真实的 ``build_supervisor`` 装配路径，会真的往配置的
 数据库写入 ``inbound_event``/``task`` 等行，也会真的调用飞书出站接口（加表情、
@@ -51,6 +65,7 @@ import json
 import logging
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -122,6 +137,31 @@ def validate_envelope(payload: object) -> None:
 
     if problems:
         raise ValueError("envelope 校验失败：\n  - " + "\n  - ".join(problems))
+
+
+def redacted_target_summary(config: Any) -> str:
+    """拼一份**不含口令、不含完整 DSN**的目标环境摘要（独立审核 P3-1）。
+
+    验收执行者在受控环境里手动敲这个脚本，环境变量填错（比如把生产 DSN 当测试
+    DSN 用）不会有任何编译期或类型检查能拦住——启动时把连的是哪个 host/dbname、
+    用的是哪个飞书应用（只取 app_id 前 6 位）打出来，供肉眼核对"这是不是我以为
+    的那个受控环境"。只取这两样：口令、查询参数（可能带 ``options``/其它敏感
+    片段）与完整 DSN 一律不进摘要，即便执行者把这行日志贴进工单或聊天记录也
+    不会带出凭据。
+    """
+
+    parsed = urllib.parse.urlsplit(str(config.postgres_dsn))
+    if parsed.netloc:
+        # 只有真的解析出 scheme://host 形态时才信任 path 是 dbname——没有
+        # netloc 时 urlsplit 会把整段畸形字符串原样塞进 path，直接拿来当
+        # dbname 显示等于没有脱敏，宁可整段都退化成占位符。
+        host = parsed.hostname or "(无法解析 host)"
+        port = f":{parsed.port}" if parsed.port else ""
+        dbname = parsed.path.lstrip("/") or "(无法解析 dbname)"
+    else:
+        host, port, dbname = "(无法解析 host)", "", "(无法解析 dbname)"
+    app_id_prefix = (config.app_id or "")[:6] or "(空)"
+    return f"目标数据库={host}{port}/{dbname} 飞书应用 app_id 前缀={app_id_prefix}…"
 
 
 class _AuditCapture(logging.Handler):
@@ -245,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gateway 配置不可用：{error}", file=sys.stderr)
         return 2
 
+    # 独立审核 P3-1：启动即回显不含凭据的目标环境摘要，供执行者肉眼确认没有
+    # 把这条重放对着错的库/错的飞书应用敲出去。
+    print(redacted_target_summary(config), file=sys.stderr)
+
     audit_capture = _AuditCapture()
     logging.getLogger("lingxi.apps.gateway").addHandler(audit_capture)
 
@@ -269,12 +313,19 @@ def main(argv: list[str] | None = None) -> int:
         f"（期望：除第 1 轮外全部重复，即 {expected_duplicates} 轮）",
         file=sys.stderr,
     )
+    print(
+        "注意（V-接入-01 vs V-接入-09）：以上结论只覆盖 V-接入-01——事件在数据库层面"
+        "被判定为重复。V-接入-09（出站只加一次表情、只回一条）本脚本不做自动判定，"
+        "退出码 0 不代表它已经验证；请到飞书侧人工回读目标话题，确认第 2 轮起没有"
+        "出现新的表情或回复消息。",
+        file=sys.stderr,
+    )
 
     if len(transport.rounds) != arguments.times:
         print("警告：实际处理轮数与请求的重放次数不一致，请检查上方日志", file=sys.stderr)
         return 1
     if duplicated_rounds != expected_duplicates:
-        print("警告：重复判定轮数与期望不符，幂等可能未生效，请人工核对", file=sys.stderr)
+        print("警告：重复判定轮数与期望不符，V-接入-01 可能未生效，请人工核对", file=sys.stderr)
         return 1
     return 0
 
