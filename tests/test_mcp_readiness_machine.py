@@ -379,6 +379,30 @@ class ConfirmationTest(unittest.TestCase):
         self.assertEqual(session.attempt_count, 4)  # 空结果 + 技术失败 + 空结果 + 超时
         self.assertEqual(session.technical_failures, 1)
 
+    def test_garbage_observations_survive_the_whole_chain(self) -> None:
+        """**G7**：探针返回垃圾时，整条链要落成一次**可落库**的技术失败，而不是炸掉。
+
+        逐条覆盖：负数（会撞上迁移 0065 的 ``metric_count >= 0``）、字符串、浮点、布尔、
+        ``None``。每一次都必须是 ``technical_failure`` + 观察值为 ``None`` + 带错误码，
+        因此 :class:`ReadinessAttempt` 与数据库 CHECK 两侧都收得下。
+        """
+
+        for junk in (-1, "3", 3.0, True, None, [], {"count": 1}):
+            with self.subTest(junk=repr(junk)):
+                confirmation, _, store, _, _ = _confirmation(junk, junk)
+                session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+                self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
+                probes = [
+                    item
+                    for item in store.records
+                    if item.outcome is ReadinessOutcome.TECHNICAL_FAILURE
+                ]
+                self.assertEqual(len(probes), 2)
+                for item in probes:
+                    self.assertIsNone(item.metric_count)
+                    self.assertEqual(item.error_code, "invalid_metric_count")
+                self.assertEqual(session.technical_failures, 2)
+
     def test_store_failure_is_not_swallowed(self) -> None:
         store = FakeStore()
         store.fault = RuntimeError("库挂了")
@@ -457,6 +481,63 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(
             ReadinessSchedule(budget_seconds=901).attempt_offsets(), (0, 180, 360, 540, 720, 900)
         )
+
+    def test_a_success_returning_after_the_hard_deadline_is_not_ready(self) -> None:
+        """**G3**：探针在承诺窗口之外才返回成功 → 不得判就绪，收口 ``timed_out``。
+
+        发起前的检查管不住它（发起那一刻还没超）。最后一次探针可以在 ``deadline - 1s``
+        发起、``deadline + 20s`` 才返回，而那时窗口早已关闭。这一条同时是唯一不依赖
+        "传输层真的遵守了超时"的防线。
+        """
+
+        clock = FakeClock()
+
+        class LateSuccess:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def list_metrics(self, *, user_id: str) -> int:
+                self.calls.append(user_id)
+                # 单次跑掉 30 秒：超过 20 秒的探针超时约定，也越过 900+20 的硬上界。
+                clock.advance(1000)
+                return 5
+
+        probe = LateSuccess()
+        confirmation, _, store, _, _ = _confirmation(
+            schedule=CONTRACT_SCHEDULE, clock=clock, probe=probe
+        )
+        session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertFalse(session.ready)
+        self.assertFalse(session.applies_to(USER, VERSION))
+        # 记录里**不留** ready 行：否则表里会出现"这一轮超时但有一条就绪"的矛盾事实。
+        self.assertNotIn(ReadinessOutcome.READY, [item.outcome for item in store.records])
+        self.assertEqual(store.records[-1].outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(store.records[-1].error_code, "success_after_deadline")
+        self.assertIsNone(store.records[-1].metric_count)
+
+    def test_a_success_inside_the_hard_deadline_still_counts(self) -> None:
+        """边界内侧的对照：探针耗时把结束时刻推到预算之后、但仍在硬上界之内 → 就绪。"""
+
+        clock = FakeClock()
+
+        class SlowButInTime:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def list_metrics(self, *, user_id: str) -> int:
+                self.calls.append(user_id)
+                clock.advance(10 if len(self.calls) < 6 else 15)
+                return 0 if len(self.calls) < 6 else 4
+
+        probe = SlowButInTime()
+        confirmation, _, _, _, _ = _confirmation(
+            schedule=CONTRACT_SCHEDULE, clock=clock, probe=probe
+        )
+        session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        # 第六次在 900s 发起、915s 返回：越过预算（900）但仍在硬上界（920）之内。
+        self.assertEqual(session.outcome, ReadinessOutcome.READY)
+        self.assertEqual(clock.now - START, timedelta(seconds=915))
 
     def test_slow_probes_consume_the_budget(self) -> None:
         """探针本身耗时也吃预算：不然一次挂了 14 分钟的调用还能再等十五分钟。"""
@@ -574,6 +655,18 @@ class AttemptInvariantTest(unittest.TestCase):
                         outcome=ReadinessOutcome.TECHNICAL_FAILURE,
                         metric_count=value,
                         error_code="transport_error",
+                    )
+
+    def test_blank_error_codes_are_rejected(self) -> None:
+        """**G5**：空串与纯空白等同于"没写"——它们满足非 ``None``，却什么都没说明。"""
+
+        for blank in ("", "   ", "\t", 42, b"x"):
+            with self.subTest(blank=repr(blank)):
+                with self.assertRaises(ValueError):
+                    self._attempt(
+                        outcome=ReadinessOutcome.TECHNICAL_FAILURE,
+                        metric_count=None,
+                        error_code=blank,
                     )
 
     def test_every_non_ready_outcome_requires_an_error_code(self) -> None:

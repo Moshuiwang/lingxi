@@ -205,6 +205,38 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "tool_error")
         self.assertFalse(caught.exception.denied)
 
+    def test_non_boolean_is_error_is_unreadable_not_ignored(self) -> None:
+        """**G4**：``isError`` 类型不对就当读不懂，而不是"不是 True 那就当没错"。
+
+        ``1`` / ``"true"`` 这类取值在 ``is True`` 下判否；若响应同时带着非空 metrics，
+        一份自称出错的响应就会被一路读成就绪——正好违反"未知形状一律技术失败"。
+        """
+
+        for flag in (1, "true", "false", 0, [], {}, 1.0):
+            with self.subTest(flag=repr(flag)):
+                probe, _ = _probe(
+                    _echo(
+                        {
+                            "result": {
+                                "isError": flag,
+                                "structuredContent": {"metrics": ["日活", "收入"]},
+                            }
+                        }
+                    )
+                )
+                with self.assertRaises(McpProbeError) as caught:
+                    probe.list_metrics(user_id=USER)
+                self.assertEqual(caught.exception.code, "invalid_result_shape")
+                self.assertFalse(caught.exception.denied)
+
+    def test_is_error_false_is_a_normal_success(self) -> None:
+        """对照：显式 ``false`` 是合法的成功响应，不能被上一条误伤。"""
+
+        probe, _ = _probe(
+            _echo({"result": {"isError": False, "structuredContent": {"metrics": ["日活"]}}})
+        )
+        self.assertEqual(probe.list_metrics(user_id=USER), 1)
+
     def test_tool_level_error_can_be_whitelisted_explicitly(self) -> None:
         probe, _ = _probe(
             _echo({"result": {"isError": True, "content": []}}), tool_error_is_denied=True

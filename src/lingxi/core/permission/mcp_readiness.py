@@ -251,6 +251,12 @@ class ReadinessSchedule:
 
         因为 :meth:`__post_init__` 已经要求单次超时 ≤ 间隔，正常路径上最后一次探针
         最迟在 ``budget + probe_timeout`` 结束——**这就是对上游承诺的收口上界**。
+
+        **它在两个时刻各查一次**：发起下一次探针**之前**（还没超才发），以及探针
+        **返回之后**（超了就不许判就绪，见
+        :meth:`McpReadinessConfirmation._probe_once`）。只查前者是不够的——最后一次探针
+        可以在 ``deadline - 1 秒`` 发起、``deadline + 20 秒`` 才返回成功，而那时窗口
+        早已关闭。返回后这一查同时也是唯一不依赖"传输层真的遵守了超时"的防线。
         """
 
         return timedelta(seconds=self.budget_seconds + self.probe_timeout_seconds)
@@ -304,6 +310,11 @@ def _require_attempt_shape(
         raise ValueError("可见指标条数必须是整数或缺省")
     if metric_count is not None and metric_count < 0:
         raise ValueError("可见指标条数不得为负")
+    if error_code is not None and (not isinstance(error_code, str) or not error_code.strip()):
+        # 空串与纯空白等同于"没写"：它们能满足"非 None"，却什么都没说明，而下面正是靠
+        # "有没有错误码"判断"未就绪有没有给出原因"。数据库侧同口径（迁移 0065 的
+        # ``BTRIM(error_code) <> ''``）。
+        raise ValueError("错误码必须是非空字符串，空白不算")
     if outcome is ReadinessOutcome.READY:
         if metric_count is None or metric_count <= 0:
             raise ValueError("就绪必须带着大于零的可见指标条数（明确空结果不算就绪）")
@@ -600,10 +611,13 @@ class McpReadinessConfirmation:
                     # 只有探针链真的失控（注入的探针无视超时）才会走到这里：正常与抖动
                     # 时钟下 ``now`` 离硬上界还差一整个探针超时。
                     break
-            attempt = self._probe_once(binding, attempt_no)
+            attempt = self._probe_once(binding, attempt_no, hard_deadline)
             attempts.append(attempt)
             if attempt.ready:
                 return self._finish(binding, ReadinessOutcome.READY, tuple(attempts))
+            if attempt.outcome is ReadinessOutcome.TIMED_OUT:
+                # 探针**返回得太晚**：成功已经落在承诺窗口之外（见 :meth:`_probe_once`）。
+                return self._finish(binding, ReadinessOutcome.TIMED_OUT, tuple(attempts))
         timed_out = self._attempt(
             binding,
             len(attempts) + 1,
@@ -634,7 +648,9 @@ class McpReadinessConfirmation:
         if remaining > 0:
             self._sleep(remaining)
 
-    def _probe_once(self, binding: ReadinessBinding, attempt_no: int) -> ReadinessAttempt:
+    def _probe_once(
+        self, binding: ReadinessBinding, attempt_no: int, hard_deadline: datetime
+    ) -> ReadinessAttempt:
         started = self._now()
         try:
             observed = self._probe.list_metrics(user_id=binding.user_id)
@@ -651,12 +667,27 @@ class McpReadinessConfirmation:
         # 那一路必须不带观察值（否则它看起来像一次跑通了的探针，且负数还会撞上
         # 迁移 0065 的 CHECK，把一次本该记下来的失败变成整轮确认崩溃）。
         counted = None if outcome is ReadinessOutcome.TECHNICAL_FAILURE else int(observed)
+        finished = self._now()
+        if outcome is ReadinessOutcome.READY and finished > hard_deadline:
+            # **成功来得太晚了。** 承诺是"结论最晚在 预算 + 单次探针超时 内落地"，而这次
+            # 探针在窗口之外才返回——发起前的检查管不住它（那时还没超），只有返回后再看
+            # 一眼才管得住。这也是唯一不依赖"传输层真的遵守了超时"的防线：探针超时配大了、
+            # 或注入的探针根本不看超时，上界都只能靠这里成立。
+            #
+            # 降级成 ``timed_out`` 而不是记一条 ``ready`` 再让上层否决：那样
+            # ``mcp_sync_check`` 里会留下一行 ``ready``，而这一轮的结论是超时，
+            # 读表的人会看到两个互相矛盾的事实。观察值一并丢弃（``timed_out`` 不得携带）。
+            outcome, error_code, counted = (
+                ReadinessOutcome.TIMED_OUT,
+                "success_after_deadline",
+                None,
+            )
         return self._attempt(
             binding,
             attempt_no,
             outcome,
             started,
-            self._now(),
+            finished,
             error_code=error_code,
             metric_count=counted,
         )

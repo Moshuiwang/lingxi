@@ -325,7 +325,7 @@ class PostgresPermissionPublishStore:
                                 FOR UPDATE SKIP LOCKED
                            )
                     RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts,
-                              o.external_record_id
+                              o.created_record_id
                     """
                 )
                 row = cursor.fetchone()
@@ -344,9 +344,11 @@ class PostgresPermissionPublishStore:
             payload=dict(row[3] or {}),
             attempts=int(row[4]),
             current_permission_version=None if current is None else int(current[0]),
-            # 上一次尝试写到过外部表格的哪一行。判定层用它回答"这一行是不是我们建的"
-            # ——既有 26 行永远是 NULL，因此"密文被改写"那条判定不会误伤它们。
-            external_record_id=None if row[5] is None else str(row[5]),
+            # **这条意图自己建过的那一行**（``created_record_id``，不是审计用的
+            # ``external_record_id``）。判定层用它回答"这一行是不是我们建的"；既有 26 行
+            # 永远是 NULL，因此"密文被改写"那条判定不会误伤它们——哪怕它们的某次更新
+            # 读回不明、行 ID 已经进了 ``external_record_id``。
+            created_record_id=None if row[5] is None else str(row[5]),
         )
 
     def complete(self, attempt: PublishAttempt, *, status: str) -> None:
@@ -362,9 +364,25 @@ class PostgresPermissionPublishStore:
         :class:`PublishClaimLost`，合法的那一方成了报警对象。``attempts`` 在每次认领时
         自增，因此它是「哪一次认领」的天然版本号：旧认领者带的是旧值，命中不到，
         如实拿到 :class:`PublishClaimLost`；新认领者带的是新值，正常记账。
+
+        **两列记录的是两件不同的事，不能合并**：
+
+        - ``external_record_id``：**审计**——上一次尝试操作的是哪一行。任何尝试都会写，
+          包括既有行更新失败（``mismatch``/``uncertain``）。S-C-01 的既有语义，不变。
+        - ``created_record_id``：**出身**——这条意图**自己建过**的那一行。只有
+          ``action == 'create'`` **且真的拿到了记录标识**时才写，写进去之后也不再被
+          后续尝试改写（``COALESCE`` 只补空）。判定层拿它回答"这一行是不是我们建的"。
+
+        混用会造出一个真实的回归：既有 26 行只要有一次更新读回不明，行 ID 就进了
+        ``external_record_id``，重试时"这一行是我们建的"成立、而它们的旧密文当然不等于
+        我方快照，于是被判成永久 ``mismatch``——S-C-01 的"更新可重试收敛"就被打断了。
         """
 
         detail = _error_detail(attempt)
+        # 出身只由"create 明确返回了记录标识"这一种事实设置。创建结果不明（没拿到 ID）
+        # 时保持 NULL：那时我们无法把"自己建的"与"并发写入方建的"区分开，重试按普通
+        # 路径收敛，就绪探针是最终的门。
+        created = attempt.external_record_id if attempt.action == "create" else None
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """UPDATE publish_outbox
@@ -372,6 +390,7 @@ class PostgresPermissionPublishStore:
                           last_outcome = %(outcome)s,
                           last_error = %(detail)s,
                           external_record_id = COALESCE(%(record_id)s, external_record_id),
+                          created_record_id = COALESCE(created_record_id, %(created_id)s),
                           published_at = CASE WHEN %(status)s = 'published' THEN now() ELSE NULL END
                     WHERE id = %(id)s
                       AND status = 'publishing'
@@ -381,6 +400,7 @@ class PostgresPermissionPublishStore:
                     "outcome": attempt.outcome.value,
                     "detail": detail,
                     "record_id": attempt.external_record_id,
+                    "created_id": created,
                     "id": attempt.outbox_id,
                     "attempts": attempt.attempts,
                 },

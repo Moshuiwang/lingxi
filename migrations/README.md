@@ -257,16 +257,28 @@ Issue #156 的 S-C-01。一张新表 `publish_outbox`：权限决定（`app_user
 
 ## `0065_mcp_token_and_sync_check`（MCP 访问令牌与就绪确认记录）
 
-Issue #156 的 S-C-02。两张新表：`mcp_access_token`（Lingxi 为建档用户签发的问数 MCP
-访问令牌）与 `mcp_sync_check`（发布之后每一次「当前用户 MCP 是否就绪」的判定）。
+Issue #156 的 S-C-02。两张新表 + 一列：`mcp_access_token`（Lingxi 为建档用户签发的问数
+MCP 访问令牌）、`mcp_sync_check`（发布之后每一次「当前用户 MCP 是否就绪」的判定），
+以及 `publish_outbox.created_record_id`（**这条意图自己建过的那一行**）。
+
+最后这一列与 0064 既有的 `external_record_id` 是两件事：后者是**审计**（上一次尝试操作
+了哪一行，任何尝试都会写），前者是**出身**（只有 `create_row` 明确返回了 ID 时才写）。
+混用会让既有 26 行在一次更新读回不明之后，重试时被判成永久冲突——那是对 S-C-01
+「更新可重试收敛」语义的回归。0064 已合入不动，因此该列在本 revision 里 `ALTER TABLE` 追加。
 
 五条约束刻意写进数据库而不是留给调用方自觉：
 
 1. `mcp_access_token` 的**主键即 `user_id`**（"同一个人两条令牌"在结构上不可表达），
    且**没有任何明文列或指纹列**；
-2. `mcp_access_token.token_cipher` 的 **CHECK 让明文写不进来**（标准 base64 字母表 +
-   长度是 4 的倍数且 ≥ 44；`secrets.token_urlsafe(32)` 的明文恒为 43 个 URL 安全字符，
-   两条都不满足）——**即使绕过全部应用层、直接执行 SQL 也会被拒**；
+2. `mcp_access_token.token_cipher` 的 **CHECK 钉住我方签发格式的精确 envelope**
+   （`^[A-Za-z0-9+/]{86}==$`：明文恒 43 字符 → 密文恒 64 字节 → base64 恒 88 字符）。
+   它挡得住"把原样令牌明文写进这一列"，**即使绕过全部应用层、直接执行 SQL 也会被拒**；
+   但它**不证明内容真的经过加密**——一段恰好 88 字符的合规 base64 文本仍能写进来，
+   内容正确性由解密路径负责（解不开即失败关闭）。措辞刻意保守；
+
+   与签发格式耦合：换令牌长度或分组模式时这条 CHECK 必须同步改。另一个已知代价是
+   它与下面的禁改触发器合在一起，会让一个"形状合规但解不开"的值把那一行**砖化**
+   （只能删行重签）——取舍理由见 revision 文件头部；
 3. `mcp_access_token` 的 **BEFORE UPDATE 触发器让密文改不掉**（`user_id` /
    `token_cipher` / `issued_at` 一经写入不可改；签发走 `ON CONFLICT DO NOTHING`，
    不触发它）。覆盖会让库里的密文与已经发布出去的那一份分叉，而新值送不到消费方；

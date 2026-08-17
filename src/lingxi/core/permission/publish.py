@@ -150,14 +150,16 @@ class ExistingPermissionRow(NamedTuple):
 
     @property
     def token_cipher(self) -> str:
-        """这一行当前的令牌密文（空串 = 那一列是空的）。
+        """这一行当前的令牌密文（空串 = 那一列是空的）。**纯空白等同于空。**
 
         判定层只用它回答两个问题：**要不要补上我们的密文**（空洞才补），以及
         **发布完成前那一列还在不在**。归一走同一个 :func:`readback_text`，
-        与逐字段读回比对是同一把尺子。
+        与逐字段读回比对是同一把尺子，然后再 ``strip()``——一个 ``"   "`` 会让裸真值
+        判断认为"密文还在"，于是走六字段更新、读回一致、收敛成发布完成，而那一行对
+        问数 MCP 一样无效（合法密文恒为 88 个 base64 字符，绝不含空白）。
         """
 
-        return readback_text(self.fields.get("token_cipher"))
+        return readback_text(self.fields.get("token_cipher")).strip()
 
     def matches_key(self, record_key: str) -> bool:
         """这一行的 ``record_key`` 是不是我们要写的那一个（**大小写不敏感**）。
@@ -225,11 +227,16 @@ class ClaimedPublish:
     payload: Mapping[str, Any]
     attempts: int = 1
     current_permission_version: int | None = None
-    #: 这条意图**此前**已经写到过外部表格的哪一行（首次认领时为 ``None``）。
-    #: 它回答一个别处答不出来的问题：**这一行是不是我们建的**。既有 26 行是业务侧写的，
-    #: 它们的 ``external_record_id`` 永远是 ``None``，因此"密文不是我们那一份"这条判定
-    #: 只会作用在我们自己建的行上，不会误伤旧系统签发的令牌。
-    external_record_id: str | None = None
+    #: 这条意图**自己建过**的那一行（首次认领、以及从未成功创建时都是 ``None``）。
+    #: 它回答一个别处答不出来的问题：**这一行是不是我们建的**。
+    #:
+    #: **不是** ``publish_outbox.external_record_id``：那一列是审计语义（上一次尝试操作
+    #: 了哪一行），任何尝试都会写它，包括既有行更新失败。拿它当出身用会误伤既有 26 行
+    #: ——它们只要有一次更新读回不明，行 ID 就进了那一列，重试时"这一行是我们建的"
+    #: 成立，而旧密文当然不等于我方快照，于是被判成永久冲突。出身只由"``create_row``
+    #: 明确返回了记录标识"这一种事实设置（见 ``adapters/postgres_permission_publish``
+    #: 的 ``complete``）。
+    created_record_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -419,12 +426,13 @@ def publish_claim(
         matches
         and existing_cipher
         and row.token_cipher
-        and claim.external_record_id == matches[0].record_id
+        and claim.created_record_id == matches[0].record_id
         and existing_cipher != row.token_cipher
     ):
-        # **这一行是我们自己建的，密文却不是我们写进去的那一份。** 只有在
-        # ``external_record_id`` 对得上时才敢下这个判断——既有 26 行本来就带着旧系统的
-        # 密文，那时 ``external_record_id`` 是 ``NULL``，走不到这里，因此不会误伤。
+        # **这一行是我们自己建的，密文却不是我们写进去的那一份。** 判据是
+        # ``created_record_id``（出身）而**不是** ``external_record_id``（审计）：后者
+        # 在既有行更新失败时也会被写上，用它会把既有 26 行的一次更新重试判成永久冲突。
+        # 既有 26 行的出身永远是 ``None``，因此走不到这里，不会误伤。
         # 这条挡的是"新建后平台改写了 token_cipher"：不挡的话，重试会走六字段更新、
         # 完全不看那一列，于是收敛成 ``published``，而这一行对该用户永远无效。
         return PublishAttempt(
@@ -484,7 +492,8 @@ def publish_claim(
         # **更新路径也必须证明那一列还在。** 我们没提交它，但"发布完成"这个结论断言的是
         # "这一行现在对 MCP 有效"，而一行没有 ``token_cipher`` 的权限对 MCP 无效。
         # 不看这一眼，一次被平台清空的密文会在下一轮悄悄收敛成 ``published``。
-        if not readback_text(actual.get(TOKEN_CIPHER_FIELD)):
+        # ``strip()`` 与 :attr:`ExistingPermissionRow.token_cipher` 同一口径：纯空白不算数。
+        if not readback_text(actual.get(TOKEN_CIPHER_FIELD)).strip():
             mismatch = (TOKEN_CIPHER_FIELD,)
     if mismatch:
         return PublishAttempt(

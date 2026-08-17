@@ -240,6 +240,56 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
                         )
         self.assertIsNone(self.store.token_cipher(USER_B))
 
+    def test_the_check_pins_our_exact_envelope(self) -> None:
+        """**G6**：CHECK 钉的是我方签发格式的精确 envelope，不是泛化的"像不像密文"。
+
+        明文恒 43 字符 → 补到 48 字节 → 16B IV + 48B 密文 = 64 字节 → base64 恒 88 字符
+        且恒以 ``==`` 结尾。因此半截值、旧口径的 64 字符密文、长度不对的合规 base64 都进不来。
+        """
+
+        for _ in range(16):
+            self.assertRegex(self.cipher.encrypt(new_token()), r"^[A-Za-z0-9+/]{86}==$")
+
+        rejected = (
+            # 长度对但不是我们的格式（旧口径 64 字符：16B IV + 32B 密文）。
+            "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+",
+            "A" * 87 + "=",  # 87+1：补位数不对
+            "A" * 88,  # 长度对、没有 == 结尾
+            "A" * 84 + "====",  # 补位过多
+            "A" * 85 + "-" + "==",  # URL 安全字母表
+            "",
+        )
+        for value in rejected:
+            with self.subTest(length=len(value)):
+                with self.assertRaises(Exception):
+                    with connect(self._dsn) as connection, connection.cursor() as cursor:
+                        cursor.execute(
+                            "INSERT INTO mcp_access_token (user_id, token_cipher) VALUES (%s, %s)",
+                            (USER_B, value),
+                        )
+        self.assertIsNone(self.store.token_cipher(USER_B))
+
+    def test_the_check_does_not_prove_the_content_was_encrypted(self) -> None:
+        """**诚实边界**：一段恰好 88 字符的合规 base64 文本仍写得进去。
+
+        SQL 层证明的是"不是原样令牌、形状对得上"，**不是**"内容真的经过加密"。内容正确性
+        由解密路径负责——写进去解不开的值，读取时会响亮失败，而不是被当成有效令牌放行。
+        迁移注释与数据库设计的措辞按这条边界收敛，不宣称超出它能力的事。
+        """
+
+        junk = "A" * 86 + "=="
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO mcp_access_token (user_id, token_cipher) VALUES (%s, %s)",
+                (USER_B, junk),
+            )
+        self.assertEqual(self.store.token_cipher(USER_B), junk)
+        # 但它解不开——不放行、也不静默重签。
+        with self.assertRaises(McpTokenCipherError):
+            self.store.read_token(USER_B)
+        with self.assertRaises(McpTokenCipherError):
+            self.store.issue_token(USER_B)
+
     def test_the_database_itself_refuses_to_overwrite_a_cipher(self) -> None:
         """签发过的密文**改不掉**：绕过应用层的 UPDATE 会被触发器拒绝。
 
@@ -359,6 +409,34 @@ class SyncCheckRecordTest(McpTokenPostgresTestCase):
                             (f"syn_bad{index}", USER_A, result, error_code, metric_count),
                         )
         self.assertEqual(self.store.load_checks(USER_A, 1), ())
+
+    def test_database_rejects_blank_error_codes(self) -> None:
+        """**G5**：空串与纯空白满足 ``IS NOT NULL``，却什么都没说明——形状 CHECK 靠它。"""
+
+        for blank in ("", "   ", "\t"):
+            with self.subTest(blank=repr(blank)):
+                with self.assertRaises(Exception):
+                    with connect(self._dsn) as connection, connection.cursor() as cursor:
+                        cursor.execute(
+                            """INSERT INTO mcp_sync_check
+                                 (id, user_id, permission_version, attempt_no, result,
+                                  error_code, content_expires_at)
+                               VALUES ('syn_blank', %s, 1, 1, 'timed_out', %s, now())""",
+                            (USER_A, blank),
+                        )
+
+    def test_database_rejects_an_error_code_longer_than_a_code(self) -> None:
+        """错误码是**码**不是消息：放宽长度就会有人往里塞异常正文（含凭据与人员资料）。"""
+
+        with self.assertRaises(Exception):
+            with connect(self._dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO mcp_sync_check
+                         (id, user_id, permission_version, attempt_no, result,
+                          error_code, content_expires_at)
+                       VALUES ('syn_long', %s, 1, 1, 'timed_out', %s, now())""",
+                    (USER_A, "x" * 201),
+                )
 
     def test_database_accepts_every_legal_shape(self) -> None:
         """对照：五路各自的合法形状都写得进去（否则上面那组证明不了什么）。"""

@@ -317,7 +317,13 @@ class QueryMcpProbe:
         result = payload.get("result")
         if not isinstance(result, Mapping):
             raise McpProbeError("invalid_result_shape", denied=False)
-        if result.get("isError") is True:
+        flag = result.get("isError")
+        if flag is not None and not isinstance(flag, bool):
+            # **类型不对就当读不懂**，而不是"不是 True 那就当没错"。``1`` / ``"true"``
+            # 这类取值在 ``is True`` 下判否，于是一份自称出错、却又带着非空 metrics 的
+            # 响应会被一路读成就绪——正好违反"未知形状一律技术失败"。
+            raise McpProbeError("invalid_result_shape", denied=False)
+        if flag is True:
             # **默认按技术失败**（``tool_error_is_denied=False``）。``isError`` 只说明
             # "这次工具调用失败了"，它同时覆盖鉴权拒绝和工具自己崩溃、上游数据源不可用
             # 一类的故障。默认判成"同步中"会让一次工具崩溃安静地等满十五分钟再转运维，

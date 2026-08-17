@@ -5,25 +5,34 @@ Revises: 0064_permission_publish_outbox
 Create Date: 2026-08-17
 
 [Issue #156](https://github.com/Moshuiwang/lingxi/issues/156) 的 S-C-02（Epic C 第二个
-Story）。两张表：
+Story）。两张新表 + 一列：
 
 - ``mcp_access_token``：Lingxi 为建档用户签发的问数 MCP 访问令牌，**只存密文**；
-- ``mcp_sync_check``：发布之后「当前用户 MCP 是否就绪」的每一次判定，逐次成行。
+- ``mcp_sync_check``：发布之后「当前用户 MCP 是否就绪」的每一次判定，逐次成行；
+- ``publish_outbox.created_record_id``：**这条意图自己建过的那一行**。它与既有的
+  ``external_record_id``（审计语义：上一次尝试操作了哪一行）是两件事，理由见下面
+  ``ALTER TABLE`` 上方的注释——混用会让既有 26 行在一次更新失败之后被永久判成冲突。
 
 ## ``mcp_access_token``：明文写不进来，密文写进来就改不掉
 
 产品合同「凭据不进代码、日志、数据库、用户环境」在这张表上的落点是**两条数据库约束**，
 不是应用层的自觉：
 
-1. **``token_cipher`` 的 CHECK 让明文写不进来**：标准 base64 字母表 + 长度是 4 的倍数
-   且 ≥ 44。``secrets.token_urlsafe(32)`` 的明文恒为 43 个字符、且用的是 URL 安全字母表
-   （含 ``-``/``_``），两条都不满足。因此"把明文当密文写进这一列"**即使绕过全部应用层
-   代码、直接执行 SQL 也会被拒**。
+1. **``token_cipher`` 的 CHECK 钉住我方签发格式的精确 envelope**：
+   ``^[A-Za-z0-9+/]{86}==$``（明文恒 43 字符 → 密文恒 64 字节 → base64 恒 88 字符）。
+   因此"把原样令牌明文写进这一列"**即使绕过全部应用层代码、直接执行 SQL 也会被拒**。
+   **它不证明内容真的经过加密**——一段恰好 88 字符的合规 base64 文本仍能写进来；
+   内容正确性由解密路径负责（解不开即失败关闭）。措辞刻意保守，不宣称超出它能力的事。
 2. **BEFORE UPDATE 触发器让密文改不掉**：``user_id`` / ``token_cipher`` / ``issued_at``
    一经写入不可改。签发走 ``INSERT ... ON CONFLICT DO NOTHING``，不触发它。
 
 这两条补的是同一个洞：只写"表里没有明文列"是不够的——``token_cipher`` 本身是一个可写的
-裸 ``TEXT``，谁都可以往里写明文或覆盖既有密文，而矩阵里"明文无列可落"的说法就被绕过了。
+裸 ``TEXT``，谁都可以往里写明文或覆盖既有密文。
+
+**两条约束合在一起有一个已知代价**：一个通过了 CHECK 但内容不对的值（合规 base64、
+却解不开）写进去之后，触发器会让它**改不掉**，那一行就砖化了，只能删行重签。这是刻意的
+取舍——允许覆盖会让"已经发布出去的令牌被悄悄换掉"重新成为可能，而后者的失败形态
+（用户某天忽然没有权限、且没人知道为什么）比前者（响亮的解密失败 + 删行重签）更坏。
 
 令牌明文由 ``secrets.token_urlsafe(32)`` 生成，经 AES-256-CBC 加密成 ``token_cipher``
 后才落库；明文只在签发那一瞬间与后续按需解密（就绪探针、将来的用户环境写入）时存在于
@@ -102,23 +111,43 @@ depends_on: str | None = None
 
 
 _UPGRADE_SQL = r"""
+-- publish_outbox 增一列：**这条意图自己建过的那一行**（S-C-02 加，0064 已合入不动）。
+--
+-- 为什么不能复用既有的 external_record_id：那一列是**审计**语义——"上一次尝试操作的是
+-- 哪一行"，任何尝试（含既有行更新失败）都会经 complete() 的 COALESCE 落进去。拿它当
+-- "这一行是我们建的"来用会误伤既有 26 行：它们只要有一次更新读回 uncertain/mismatch，
+-- 行 ID 就落进 external_record_id，重试时判据成立、而它们的旧密文当然不等于我方快照，
+-- 于是被判成永久 mismatch——这是对 S-C-01「更新可重试收敛」的回归。
+--
+-- 本列的写入口径**只有一种事实**：``create_row`` 明确返回了记录标识（``action='create'``
+-- 且拿到了 ID）。因此它非空 ⇔ 这一行确实是我们建出来的。创建结果不明（没拿到 ID）时
+-- 保持 NULL：那种情况下我们无法把"自己建的"与"并发写入方建的"区分开，重试按普通路径
+-- 收敛，就绪探针是最终的门。
+ALTER TABLE publish_outbox ADD COLUMN created_record_id TEXT;
+
 CREATE TABLE mcp_access_token (
     -- 主键即用户：一个人同一时刻只能有一个有效令牌，"两条令牌"在结构上不可表达。
     -- CASCADE：账号删除编排删掉 app_user 那一行时，令牌密文一并消失。
     user_id      TEXT        PRIMARY KEY REFERENCES app_user(id) ON DELETE CASCADE,
     -- base64(IV(16B) ‖ AES-256-CBC 密文)。**没有明文列，也没有指纹列**（文件头部）。
     --
-    -- 下面这条 CHECK 让"这一列只放密文"从**应用层约定**变成**数据库约束**：
-    --   * 标准 base64 字母表（明文用的是 URL 安全字母表，含 - 和 _，直接被拒）；
-    --   * 长度是 4 的倍数且 >= 44。44 是 base64(16B IV ‖ 至少一个 16B 分组) 的长度，
-    --     而 `secrets.token_urlsafe(32)` 的明文**恒为 43 个字符**——差一个字符，
-    --     因此任何一次"把明文当密文写进来"（无论经不经过应用层）都在这里被拒。
-    -- 应用层还有两道同口径的形状校验（core 的 is_cipher_shaped、outbox 入队校验），
-    -- 三道一致；这一道的不可替代之处是它**挡得住绕过应用层的直接 SQL**。
-    token_cipher TEXT        NOT NULL
-        CHECK (token_cipher ~ '^[A-Za-z0-9+/]+={0,2}$'
-               AND length(token_cipher) >= 44
-               AND length(token_cipher) % 4 = 0),
+    -- 下面这条 CHECK 钉的是**我方签发格式的精确 envelope**，不是泛化的"像不像密文"：
+    --
+    --   明文 `secrets.token_urlsafe(32)` 恒为 43 个字符
+    --     → UTF-8 43 字节 → PKCS7 补到 48 字节 → AES-CBC 密文 48 字节
+    --     → 16B IV ‖ 48B 密文 = 64 字节 → 标准 base64 恒为 88 字符，且恒以 `==` 结尾。
+    --
+    -- 因此合法值的形状唯一：`^[A-Za-z0-9+/]{86}==$`。
+    --
+    -- **它能证明什么、不能证明什么**（措辞刻意保守）：它挡得住"把原样令牌明文写进这一列"
+    -- （明文 43 字符、URL 安全字母表，两条都不满足），也挡得住绝大多数手误与半截值；
+    -- 它**不证明**内容真的经过加密——一段恰好 88 字符的合规 base64 文本仍能写进来。
+    -- 内容的正确性由解密路径负责（解不开即失败关闭，见 adapters/postgres_mcp_token.py）。
+    --
+    -- **与签发格式耦合，改一处要改两处**：将来若换令牌长度或分组模式，这条 CHECK 必须
+    -- 同步改，否则新签发会被自己的数据库拒绝。这是刻意的耦合——宁可在签发时响亮失败，
+    -- 也不要让一列"什么都收"的凭据列静默积累坏值。
+    token_cipher TEXT        NOT NULL CHECK (token_cipher ~ '^[A-Za-z0-9+/]{86}==$'),
     issued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -163,7 +192,12 @@ CREATE TABLE mcp_sync_check (
     result             TEXT        NOT NULL
         CHECK (result IN ('ready','no_permission','waiting','timed_out','technical_failure')),
     -- 只有错误码，没有自由文本：自由文本是凭据与人员资料最常见的泄露路径。
-    error_code         TEXT,
+    -- 空串与纯空白等同于"没写"，一律拒绝：下面的形状 CHECK 靠 `error_code IS NOT NULL`
+    -- 判"未就绪必须说明原因"，而一个 '  ' 能满足 NOT NULL 却什么都没说明。
+    -- 判据用 `~ '\S'`（至少有一个非空白字符）而不是 `BTRIM(...) <> ''`：BTRIM 默认只去
+    -- 空格，一个制表符能原样通过——实测过。
+    -- 长度上限 200：错误码是**码**，不是消息；放宽就会有人往里塞异常正文。
+    error_code         TEXT        CHECK (error_code ~ '\S' AND length(error_code) <= 200),
     -- 探针看见的指标条数。就绪要求它 > 0——"明确空结果只证明这次查询没报错"
     -- （产品合同「问数 MCP」一节）。非探针分支（no_permission / timed_out）为 NULL。
     metric_count       INT         CHECK (metric_count >= 0),
@@ -242,6 +276,7 @@ DROP TABLE IF EXISTS mcp_sync_check;
 DROP FUNCTION IF EXISTS mcp_sync_check_fix_expiry();
 DROP TABLE IF EXISTS mcp_access_token;
 DROP FUNCTION IF EXISTS mcp_access_token_immutable();
+ALTER TABLE publish_outbox DROP COLUMN IF EXISTS created_record_id;
 """
 
 

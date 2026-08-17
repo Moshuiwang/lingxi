@@ -79,6 +79,7 @@ def _attempt(
     record_id: str | None = "rec_1",
     user_id: str = USER_A,
     attempts: int = 1,
+    action: str = "none",
 ) -> PublishAttempt:
     return PublishAttempt(
         outcome=outcome,
@@ -86,6 +87,7 @@ def _attempt(
         user_id=user_id,
         permission_version=version,
         attempts=attempts,
+        action=action,
         external_record_id=record_id,
         mismatch_fields=("email",) if outcome is PublishOutcome.MISMATCH else (),
     )
@@ -224,20 +226,84 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
                     )
         self.assertEqual(self._count(), 0)
 
-    def test_claim_returns_the_previous_external_record(self) -> None:
-        """重试时判定层要能回答"这一行是不是我们建的"——靠认领时带回的外部记录标识。"""
+    def test_provenance_is_only_set_by_a_create_that_returned_an_id(self) -> None:
+        """**G1**：出身列只由「``create_row`` 明确返回了 ID」这一种事实设置。
+
+        ``external_record_id`` 是审计（任何尝试都写），``created_record_id`` 是出身。
+        两者混用会让既有 26 行的一次更新失败在重试时被判成永久冲突。
+        """
 
         decision = self.store.record_decision(
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
         )
         first = self.store.claim_next()
-        self.assertIsNone(first.external_record_id)
+        self.assertIsNone(first.created_record_id)
+
+        # 一次**更新**失败：审计列记下这一行，出身列保持空。
         self.store.complete(
-            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_7"),
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.MISMATCH,
+                record_id="rec_7",
+                action="update",
+            ),
             status="pending",
         )
         second = self.store.claim_next()
-        self.assertEqual(second.external_record_id, "rec_7")
+        self.assertIsNone(second.created_record_id)
+        self.assertEqual(self.store.load(decision.outbox_id).external_record_id, "rec_7")
+
+        # 一次**创建**成功：出身列这才写上。
+        self.store.complete(
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.MISMATCH,
+                record_id="rec_8",
+                action="create",
+                attempts=2,
+            ),
+            status="pending",
+        )
+        third = self.store.claim_next()
+        self.assertEqual(third.created_record_id, "rec_8")
+
+    def test_provenance_is_never_rewritten_by_later_attempts(self) -> None:
+        """出身写定即不变：后续的更新尝试不得把它挪到别的行上。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_1",
+                     action="create"),
+            status="pending",
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_2",
+                     action="update", attempts=2),
+            status="pending",
+        )
+        self.assertEqual(self.store.claim_next().created_record_id, "rec_1")
+
+    def test_an_uncertain_create_without_an_id_claims_no_provenance(self) -> None:
+        """创建结果不明（没拿到 ID）时不认领出身：重试按普通路径收敛。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.UNCERTAIN,
+                record_id=None,
+                action="create",
+            ),
+            status="pending",
+        )
+        self.assertIsNone(self.store.claim_next().created_record_id)
 
     def test_enqueue_refuses_a_plaintext_token_in_the_snapshot(self) -> None:
         """否定面：**明文**进 outbox 的最后一关是形状校验（明文过不了 base64 判据）。"""
