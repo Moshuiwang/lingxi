@@ -11,6 +11,8 @@
 2. **分页 reader 与完整性判定**（`BitableRosterPages` / `read_roster_snapshot`，
    Issue [#52](https://github.com/Moshuiwang/lingxi/issues/52)）：按 `page_token` 读完
    整轮，并把「这一轮能不能当作快照」所需的事实结算成 :class:`RosterReadOutcome`。
+   **判定「要不要替换快照」不在这里**：门槛与保旧告警在 `core/identity/roster_snapshot.py`，
+   持久载体在 `adapters/postgres_roster_snapshot.py`（迁移 `0063_roster_snapshot`）。
 
 **真实调用未验证（证据等级 L1）**，与 `adapters/feishu_directory.py`、
 `adapters/feishu_group_message.py` 同一姿态：全部断言跑在注入的假传输层上。真实读取
@@ -113,16 +115,26 @@ def normalize_record(record: Any) -> RosterRow:
 
     判的是 `Mapping` 而不是 `dict`：分页 reader 在上一层已经按 `Mapping` 挡下非对象项，
     两层用不同的类型判据会让"通过了上层校验的记录在这里静默归一成空行"。
+
+    **形状不对就响亮失败**（PR #208 二级审查 P2-1）：记录本身不是对象、或它的 ``fields``
+    不是对象时，此前会静默归一成一条全空的行。持久快照落地后这条静默路径的代价变了
+    ——那条全空行会**被写进快照**，在比对时表现为一个"资料被清空"的人，而源头其实只是
+    给了一个形状不对的记录。这里抛 :class:`RosterReadError`（结果不明），与上一层对
+    非对象项抛 ``invalid_page_item`` 同一姿态：整轮判失败、保留上一份快照，而不是让
+    一条坏记录混进一份看起来正常的快照。
     """
 
-    fields = record.get("fields", {}) if isinstance(record, Mapping) else {}
-    fields = fields if isinstance(fields, Mapping) else {}
+    if not isinstance(record, Mapping):
+        raise RosterReadError("invalid_page_item", definite=False)
+    fields = record.get("fields", {})
+    if not isinstance(fields, Mapping):
+        raise RosterReadError("invalid_record_fields", definite=False)
     return RosterRow(
         personnel_id=field_text(fields.get("人员ID")),
         email=field_text(fields.get("邮箱")),
         name=field_text(fields.get("人员姓名")),
         employee_no=field_text(fields.get("工号")),
-        record_id=field_text(record.get("record_id")) if isinstance(record, Mapping) else "",
+        record_id=field_text(record.get("record_id")),
     )
 
 
@@ -133,6 +145,11 @@ def read_roster_records(reader: RecordPageReader, *, max_pages: int = 1000) -> t
 
     它只回答「行是什么」，不回答「这一轮能不能信」——**空源在这里与「全员都不在花名册
     里」不可区分**。需要后者的调用方（快照替换、日报）用 :func:`read_roster_snapshot`。
+
+    记录形状不对时 :func:`normalize_record` 会抛 :class:`RosterReadError` 并原样穿过
+    本函数（PR #208 二级审查 P2-1）：本函数没有"结算成失败结果对象"这一层，调用方
+    看到的就是异常。这是**有意的**——本函数的两个已知调用点都不做保旧判定，静默把坏
+    记录归一成空行会让它们拿到一份看不出问题的行集。
     """
 
     rows: list[RosterRow] = []
@@ -553,8 +570,12 @@ def read_roster_snapshot(
 
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
         raise ValueError("max_pages 必须是正整数")
-    required = tuple(required_columns)
-    key_fields = tuple(duplicate_key_fields)
+    # 去重且保序（PR #208 二级审查 P3-1）：同一列在清单里出现两次时，下面的空值统计
+    # 会对同一行加两次，于是"整列都取不到值"的判据（计数 == 行数）永远不成立，
+    # **整列缺失的检测被静默击穿**——列被改名或删掉时这一轮会被判成 COMPLETE 并顶掉
+    # 好快照。`dict.fromkeys` 保留首次出现的次序，让完整性事实的输出次序仍然稳定。
+    required = tuple(dict.fromkeys(required_columns))
+    key_fields = tuple(dict.fromkeys(duplicate_key_fields))
 
     rows: list[RosterRow] = []
     blank_counts: dict[str, int] = {column: 0 for column in required}
@@ -621,6 +642,9 @@ def read_roster_snapshot(
             status = RosterReadStatus.COMPLETE
         outcome = RosterReadOutcome(status=status, rows=tuple(rows), integrity=integrity)
 
-    # 只记计数、列名与错误码。任何一个人的资料值进日志都等于绕过日报的脱敏口径。
+    # 只记计数、列名与错误码，依据是 `V-花名册-33`：**审计与日志**不含花名册字段值。
+    # （此前这行援引的是"日报脱敏口径"，那条口径已被产品负责人 2026-08-08 的 D2 裁定
+    # 覆盖——受控管理群的日报**可以**展示姓名 / 工号 / 邮箱原值。日志侧的约束与日报
+    # 正文无关、也没有随之放宽：日志会流向排障、CI 输出与工单，那些地方不是受控管理群。）
     logger.info("花名册读取结束 %s", outcome.audit_facts())
     return outcome

@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0062_onboarding_dispatch_ledger` |
+| head revision | `0063_roster_snapshot` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -220,6 +220,22 @@ Issue #65 轻审 P2-2。在 `inbound_event` 上新增一列 `onboarding_dispatch
 
 纯新增列 + 局部索引，前滚兼容；`downgrade()` 直接删除两者。回填只写进本列，随列一起
 消失，不存在"原值已不可知"的问题。
+
+## `0063_roster_snapshot`（花名册持久快照载体）
+
+Issue #52 的 S-B-02。两张新表 `roster_snapshot`（元信息：读取时间、行数、页数、源头
+自报总数与完整性计数）与 `roster_snapshot_row`（行，按 `row_index` 保读取次序）。
+产品负责人 2026-08-08 的 D2 裁定推翻了此前的「零新表」定案：每日花名册比对需要一份
+跨进程重启与常规发布都还在的持久快照，源头返回空 / 失败 / 超时 / 半轮一律保留上一份。
+
+三条约束刻意写进数据库而不是留给调用方自觉：`singleton` 列只能为 `TRUE` 且唯一
+（任何时刻**最多一份**快照）、`row_count > 0`（零行快照会清空比对基线）、行表按
+`ON DELETE CASCADE` 挂在元信息上（删元信息即整份消失，替换因此能在同一个事务里
+做完）。行表**不加人员 ID 唯一约束**：同一人员 ID 多行是花名册实测常态。理由与
+保留期留白详见 revision 文件头部注释。
+
+两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序 `DROP TABLE`，不存在
+需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

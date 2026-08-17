@@ -87,6 +87,12 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.roster_audit",
     "lingxi.core.identity.roster_report",
     "lingxi.adapters.postgres_roster_audit",
+    # 花名册持久快照（#52 的 S-B-02，D2 裁定后的新载体）：替换门槛与保旧告警事实在
+    # core，表读写在 adapters。两者当前**还没有生产调用方**（真实读取接线属 S-B-04 /
+    # S-B-05），因此不进下面 scheduler 进程的运行时闭包——但它们必须随包发布，
+    # 否则接线那天才发现 wheel 里没有这两个模块。
+    "lingxi.core.identity.roster_snapshot",
+    "lingxi.adapters.postgres_roster_snapshot",
     "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
