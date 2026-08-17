@@ -508,13 +508,17 @@ class EventPipeline:
         开通因为一条簿记 ``UPDATE`` 失败而炸掉，会把用户可见的终态提示也一起带走。
         旧注入 store 没有这个方法时同样落进这里（``AttributeError``），行为一致：
         账本没记上，孤儿由扫描兜底。
+
+        动作名带 ``failed`` 后缀是为了让 ``apps/gateway`` 的审计实现把它升到
+        ``WARNING``：这是一次真实的数据库写失败，淹没在 INFO 流水里就等于没记
+        （#175/#185 的教训）。
         """
 
         try:
             self._store.mark_onboarding_dispatched(event_id=message.event_id)
         except Exception as error:  # noqa: BLE001 - 见 docstring
             self._audit.record(
-                "onboarding.dispatch_unrecorded",
+                "onboarding.dispatch_record_failed",
                 event_id=message.event_id,
                 error=type(error).__name__,
                 trace_id=message.trace_id,
@@ -542,6 +546,10 @@ class EventPipeline:
           「编排说开通完成却说不出范围」确实需要管理员看一眼。
         - ``started`` 是唯一允许没有下文的状态：它表示编排已异步接手，用户刚收到的
           「正在核对，请稍候」就是这一轮的完整交代。
+
+        兜底时记一条 ``onboarding.render_failed``，字段里保留编排真正返回的状态。
+        动作名带 ``failed`` 后缀，让审计实现把它升到 ``WARNING``——用户虽然拿到了
+        提示，但「编排返回了一个渲染不出来的结果」是必须有人看见的内部缺陷。
         """
 
         messages = list(result.messages)
@@ -562,7 +570,7 @@ class EventPipeline:
             )
         if not rendered and result.state is not OnboardingState.STARTED:
             self._audit.record(
-                "onboarding.unrenderable_result",
+                "onboarding.render_failed",
                 event_id=message.event_id,
                 state=result.state.value,
                 trace_id=message.trace_id,

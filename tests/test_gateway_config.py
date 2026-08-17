@@ -484,6 +484,38 @@ class LoggingAuditLevelTests(unittest.TestCase):
             _LoggingAudit().record("message.unsupported_type")
         self.assertTrue(captured.output[0].startswith("WARNING"))
 
+    def test_the_new_onboarding_diagnostics_land_at_warning(self) -> None:
+        """Issue #65 轻审三项修复新增的诊断动作必须同样在 WARNING 级可见。
+
+        它们各自是唯一能回答一类问题的证据：账本没记上（下一轮会重复交接）、
+        编排返回了渲染不出来的结果（用户拿到的是 LX-ONBOARD-001 而不是真实结论）、
+        补交时编排失败（这条事件到此为止、不再重试）。动作名都带 ``failed``
+        后缀，靠既有后缀规则升级，不再往显式名单里加条目。
+        """
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        for action in (
+            "onboarding.dispatch_record_failed",
+            "onboarding.render_failed",
+            "onboarding.reconcile_failed",
+            "onboarding.reconcile_scan_failed",
+        ):
+            with self.subTest(action=action):
+                with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+                    _LoggingAudit().record(action)
+                self.assertTrue(captured.output[0].startswith("WARNING"))
+
+    def test_a_deferred_onboarding_stays_at_info(self) -> None:
+        """停机中推迟触发开通属正常停机路径（与 ``reply.skipped_while_stopping``
+        同类），不是诊断缺口，维持 INFO。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
+            _LoggingAudit().record("onboarding.deferred_while_stopping")
+        self.assertTrue(captured.output[0].startswith("INFO"))
+
     def test_normal_actions_stay_at_info(self) -> None:
         from lingxi.apps.gateway import _LoggingAudit
 

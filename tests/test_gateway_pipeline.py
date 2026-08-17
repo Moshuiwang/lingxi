@@ -973,7 +973,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             ["onboarding.checking", "onboarding.not_authorized"],
             "簿记失败不得带走用户可见的终态提示",
         )
-        self.assertEqual(self.log.count("audit.onboarding.dispatch_unrecorded"), 1)
+        self.assertEqual(self.log.count("audit.onboarding.dispatch_record_failed"), 1)
         self.assertEqual(self.state.onboarding_dispatched, set())
 
 
@@ -1046,7 +1046,7 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
         )
 
         self.assertEqual(self._reply_keys(), ["onboarding.checking", "onboarding.matched"])
-        self.assertEqual(self.log.count("audit.onboarding.unrenderable_result"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.render_failed"), 0)
 
     def test_completed_without_a_scope_falls_back_to_the_internal_terminal(self) -> None:
         """「开通完成」必须报出公司与职能范围；报不出来就不能宣告成功。"""
@@ -1066,7 +1066,7 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
             "范围未知时不得替编排层宣告一个说不清范围的开通成功",
         )
         self.assertEqual(
-            [fields["state"] for fields in self.log.fields("audit.onboarding.unrenderable_result")],
+            [fields["state"] for fields in self.log.fields("audit.onboarding.render_failed")],
             ["completed"],
             "兜底必须在审计里保留编排真正返回的状态，否则事后无法定位",
         )
@@ -1099,7 +1099,7 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
         )
 
         self.assertEqual(self._reply_keys(), ["onboarding.checking"])
-        self.assertEqual(self.log.count("audit.onboarding.unrenderable_result"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.render_failed"), 0)
 
     def test_every_non_started_state_produces_at_least_one_message(self) -> None:
         """穷举：除 ``started`` 外，没有任何状态可以让用户悬在半空。"""
