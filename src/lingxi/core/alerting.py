@@ -729,13 +729,22 @@ class AlertingDuty:
             #   人工核对，是这条恢复路径的唯一入口；
             # - `fallback_send_failed:*`——文本兜底发送遇到明确拒绝错误，
             #   `V-告警-03`「终态失败立即告警」原文覆盖的正是这一类。
-            # 两者都改成 `final=True`：命中即报，不等阈值；仍然受
+            # - `delivery_loop_*`（Issue #191）——投递消费循环自身的连续异常
+            #   （`delivery_loop_failed:*`）与后台线程已经死亡
+            #   （`delivery_loop_dead:*`）。这两类**上报之前就已经攒过次数了**：
+            #   前者要求连续 `DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD` 轮失败才上报，
+            #   后者是一次不可逆事件，再让告警状态机攒第二遍等于重复计数，且会
+            #   原样踩中上面那个 300 秒撞 300 秒的陷阱——那意味着"整条投递能力
+            #   已经停摆"这件事永远发不出告警，正是 #191 要消灭的"无声"。
+            # 三者都改成 `final=True`：命中即报，不等阈值；仍然受
             # `alert_min_interval_seconds`（上报节流）与 `dedupe_window_seconds`
             # （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind
             # （目前只有 `progress_persist_failed:*`，一次可恢复的 DB 写入
             # 抖动）继续走"攒够阈值次数"的既有降噪路径。
-            final = kind.startswith("dispatch_uncertain:") or kind.startswith(
-                "fallback_send_failed:"
+            final = (
+                kind.startswith("dispatch_uncertain:")
+                or kind.startswith("fallback_send_failed:")
+                or kind.startswith("delivery_loop_")
             )
             try:
                 signal = AlertSignal(

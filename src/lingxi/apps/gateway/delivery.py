@@ -67,6 +67,20 @@ R-1 白名单）发生在提交预留位与清空之间时**，下一轮
 关闭，恢复后的 ``update``/``close`` 会失败——中途 ``update`` 失败按既有语义整体
 降级为文本兜底（不构成重复投递），用户会看到一张停在某个中间状态的旧卡片、
 外加一条文本答案。未消除，留待 Bot-Test/Stage 真实验证平台侧关闭行为后再评估。
+
+**循环级异常隔离（Issue #191）**：本模块此前只对**单个任务**做异常隔离，两条
+循环级查询（``list_uncertain_delivery_tasks``/``list_pending_delivery_tasks``）
+与 ``run_forever()`` 本体裸露在外——一次普通的瞬时数据库错误（语句超时、连接
+重置、数据库重启）就会一路抛穿，让这条后台线程直接死亡，而长连接主线程照常
+收消息、照常入队：Gateway 表面健康，投递能力却已经悄悄停止。结果不会丢
+（outbox 已持久化，重启即从游标续投；24 小时后 worker 侧
+``expire_undelivered_terminals`` 仍会给出诚实的 ``delivery_expired``），但用户
+侧的表现正是"发了没反应"。现在三处都有隔离：两条查询各自降级（见
+``run_once``）、``run_forever`` 每轮兜底（见该方法），连续失败达到阈值即经
+``on_alert`` 上报（见 ``_note_loop_failure``）。线程万一仍然死亡（解释器级
+``BaseException``、或将来某次改动把隔离改漏），由 ``apps/gateway/__init__.py``
+的 ``run_delivery_loop``/``delivery_thread_watchdog`` 上报，不再等活性文件过期
+被健康检查间接发现。
 """
 
 from __future__ import annotations
@@ -91,6 +105,13 @@ from lingxi.core.execution.card_stream import (
 logger = logging.getLogger(__name__)
 
 AlertCallback = Callable[[str, str], None]
+
+# Issue #191：循环级异常发生在"读哪些任务"这一步，此时还不知道是哪个任务，没有
+# ``task_id`` 可填；但既有告警回调的形状是 ``(kind, task_id)``，且 ``task_id`` 会被
+# ``AlertingDuty.delivery_alert_callback`` 当作 ``trace_id`` 上报。用一个固定、符合
+# ``AlertSignal.trace_id`` 安全格式的占位标识，让这类告警在管理群里仍然认得出来源，
+# 而不是退化成一条没有任何出处的裸告警。
+LOOP_ALERT_TRACE_ID = "gateway-delivery-loop"
 
 
 def _default_alert(kind: str, task_id: str) -> None:
@@ -125,6 +146,11 @@ class DeliveryConsumer:
     DEFAULT_ALERT_MIN_INTERVAL_SECONDS = 300.0
     DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS = 2.0
     DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS = 300.0
+    # Issue #191：连续多少轮循环级异常才上报。一次瞬时错误下一轮就会自己好，为它
+    # 告警只会让真信号被噪音淹没；"连着几轮都失败"才意味着投递能力已经实际停摆。
+    # 取 3：默认 1 秒轮询下约 3 秒即报，同时把单点抖动挡在告警之外。数值不是产品
+    # 承诺，可按需调。
+    DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD = 3
 
     def __init__(
         self,
@@ -142,6 +168,7 @@ class DeliveryConsumer:
         alert_min_interval_seconds: float = DEFAULT_ALERT_MIN_INTERVAL_SECONDS,
         fallback_backoff_base_seconds: float = DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS,
         fallback_backoff_cap_seconds: float = DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS,
+        loop_failure_alert_threshold: int = DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD,
     ) -> None:
         self._queue = queue
         self._cards = cards
@@ -158,11 +185,18 @@ class DeliveryConsumer:
         self._alert_min_interval_seconds = alert_min_interval_seconds
         self._fallback_backoff_base_seconds = fallback_backoff_base_seconds
         self._fallback_backoff_cap_seconds = fallback_backoff_cap_seconds
+        self._loop_failure_alert_threshold = loop_failure_alert_threshold
         # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
         # 的降级（重启本身就已经是一次重新评估的机会）。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
         self._fallback_attempts: dict[str, int] = {}
         self._fallback_next_attempt_at: dict[str, float] = {}
+        # Issue #191：循环级异常的计数，同样是进程内状态。``consecutive_loop_failures``
+        # 决定何时上报，一轮完全正常即归零；``loop_failures_total`` 只增不减，回答
+        # "这个进程一共扛下过多少次循环级异常"——两者都刻意留成可读属性，让日志
+        # 之外还有一个可断言、可在排查时直接读的事实。
+        self.consecutive_loop_failures = 0
+        self.loop_failures_total = 0
 
     def _alert_deduped(self, kind: str, task_id: str) -> None:
         """同一个 (kind, task_id) 在 `alert_min_interval_seconds` 内只告警一次。
@@ -198,12 +232,61 @@ class DeliveryConsumer:
         self._fallback_attempts.pop(task_id, None)
         self._fallback_next_attempt_at.pop(task_id, None)
 
+    def _note_loop_failure(self, error: BaseException, *, stage: str) -> None:
+        """记一次循环级异常：计数、结构化日志，连续到阈值就上报（Issue #191）。
+
+        只记异常类型不记正文——正文可能带上被处理对象的内容，与本模块单任务隔离、
+        ``apps/scheduler`` 定时职责隔离的既有口径一致。告警 kind 用 ``stage`` 而不是
+        异常类型：``stage`` 是一个很小的闭集（两条查询 + 整轮兜底），管理员看到的是
+        "投递循环的哪一段坏了"这个可据以行动的事实；具体异常类型留在日志里。
+        """
+
+        self.consecutive_loop_failures += 1
+        self.loop_failures_total += 1
+        logger.error(
+            "投递消费循环级异常，本轮降级后继续 stage=%s error=%s consecutive=%d total=%d",
+            stage,
+            type(error).__name__,
+            self.consecutive_loop_failures,
+            self.loop_failures_total,
+        )
+        if self.consecutive_loop_failures >= self._loop_failure_alert_threshold:
+            # 到阈值后每轮都上报，由 `_alert_deduped` 的最小间隔与告警状态机自己的
+            # 去重窗口双重限速——"还在坏"这件事应该持续可见，而不是只在跨过阈值的
+            # 那一轮响一声之后就再也不提。
+            self._alert_deduped("delivery_loop_failed:" + stage, LOOP_ALERT_TRACE_ID)
+
+    def _note_loop_recovered(self) -> None:
+        """一轮完全没有循环级异常：连续计数归零（Issue #191）。"""
+
+        if self.consecutive_loop_failures:
+            logger.info(
+                "投递消费循环已从连续异常中恢复 consecutive_before=%d",
+                self.consecutive_loop_failures,
+            )
+        self.consecutive_loop_failures = 0
+
     def run_once(self) -> int:
         """跑一轮：先报告仍然卡在"外发前预留位"里的任务，再处理正常候选。
         返回本轮实际处理的候选任务数（不含仅被告警的 uncertain 任务）。
+
+        **两条循环级查询各自隔离**（Issue #191）：任何一条抛异常都只降级它自己那
+        一段，不向上抛、不带走另一段。``list_uncertain_delivery_tasks`` 失败时正常
+        候选照常消费（uncertain 告警晚一轮，用户结果不受影响）；
+        ``list_pending_delivery_tasks`` 失败时本轮没有别的事可做，直接返回 0，下一轮
+        重来。此前这两条查询裸露在循环里，一次普通的语句超时或连接重置就会抛穿
+        ``run_forever``，让整条后台线程无声死亡（见模块说明）。
         """
 
-        uncertain_tasks = self._queue.list_uncertain_delivery_tasks(limit=self._uncertain_limit)
+        loop_healthy = True
+        try:
+            uncertain_tasks = self._queue.list_uncertain_delivery_tasks(
+                limit=self._uncertain_limit
+            )
+        except Exception as error:  # noqa: BLE001 - 见方法文档：只降级这一段，不带走本轮
+            self._note_loop_failure(error, stage="list_uncertain")
+            uncertain_tasks = []
+            loop_healthy = False
         for uncertain in uncertain_tasks:
             self._alert_deduped(
                 "dispatch_uncertain:" + uncertain.reserved_kind, uncertain.task_id
@@ -218,7 +301,11 @@ class DeliveryConsumer:
                 len(uncertain_tasks),
             )
 
-        tasks = self._queue.list_pending_delivery_tasks(limit=self._limit)
+        try:
+            tasks = self._queue.list_pending_delivery_tasks(limit=self._limit)
+        except Exception as error:  # noqa: BLE001 - 见方法文档：本轮无事可做，下一轮重来
+            self._note_loop_failure(error, stage="list_pending")
+            return 0
         for task in tasks:
             try:
                 self._process_task(task)
@@ -228,6 +315,11 @@ class DeliveryConsumer:
                     task.task_id,
                     type(error).__name__,
                 )
+        if loop_healthy:
+            # 单个任务的失败**不**计入循环级连续计数：它有自己的日志与告警路径，
+            # 而且循环本身仍然健康——把两者混在一起会让"某个任务一直失败"伪装成
+            # "整条循环坏了"。
+            self._note_loop_recovered()
         return len(tasks)
 
     def _process_task(self, task: Any) -> None:
@@ -503,6 +595,15 @@ class DeliveryConsumer:
         ``_emit_heartbeat``/``_tick_alerts`` 一致：本循环独立于长连接主线程，
         必须有自己的活性信号，否则长连接仍在正常收信、而这条后台线程已经卡死时，
         进程级心跳会撒谎说"健康"。
+
+        **本循环不因异常退出**（Issue #191）：每一轮的 ``run_once()`` 都包在异常
+        隔离里，唯一的退出条件是 ``stop`` 被置位。理由是投递能力停摆的代价远大于
+        "带着一个反复失败的循环继续跑"——outbox 是持久的，数据库恢复之后下一轮就
+        自动续投；主动退出反而把一次可自愈的瞬时故障变成必须人工重启才能恢复的
+        停摆（plain Docker Compose 不会因 unhealthy 重启容器）。连续失败由
+        ``_note_loop_failure`` 计数并在阈值处上报，因此"活着但一直失败"不会被
+        静默吸收。线程仍然可能死于解释器级 ``BaseException``，那条路径由
+        ``apps/gateway/__init__.py`` 的 ``run_delivery_loop`` 兜住并上报。
         """
 
         while not stop.is_set():
@@ -516,7 +617,12 @@ class DeliveryConsumer:
                     on_tick()
                 except Exception as error:  # noqa: BLE001 - 告警自身失败不能带走投递职责
                     logger.error("投递消费告警状态机推进失败 error=%s", type(error).__name__)
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception as error:  # noqa: BLE001 - Issue #191：一轮异常不得带走整条循环
+                # `run_once` 内部已经隔离了两条循环级查询与每个任务，走到这里的是
+                # 它们之外的异常（例如注入的告警回调自己抛错）。同样只降级这一轮。
+                self._note_loop_failure(error, stage="run_once")
             stop.wait(poll_interval_seconds)
         logger.info("投递消费循环已停止")
 
