@@ -3,6 +3,18 @@
 本模块把一次性 state、飞书回调身份绑定和正式凭据写入编排在一起。它是受控
 初始化/恢复入口，不是普通员工的开通路径；普通员工仍不经过 OAuth。
 
+同一入口有两种运维语义（产品负责人 2026-08-17 对 [Issue #137]
+(https://github.com/Moshuiwang/lingxi/issues/137) 的决定）：
+
+* ``renewal``（默认，续期）：只为**已登记**的主体续期或替换凭据。登记缺失时
+  失败关闭，不会顺手把主体建出来；
+* ``bootstrap``（首次建立）：只在主体登记**为空**时建立第一个专用授权主体，
+  由调用方（``lingxi.apps.reauthorize`` 的显式确认参数）发起。已有主体时一律
+  拒绝，不覆盖也不更新——换主体要走另一条单独授权的删除动作。
+
+两种模式共用同一套 state、身份回读与保存校验；首次建立走的是保存事务内的
+反向 CAS（登记仍为空才插入），**不是**绕过主体校验的旁路。
+
 安全边界：
 
 * state 只保存不可逆摘要、预期主体和时间元数据，文件权限为 0600，成功领取
@@ -41,6 +53,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATE_TTL_SECONDS = 10 * 60
 _STATE_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z")
 
+# 入口的两种运维语义（见模块说明）。字符串常量而不是布尔：调用点读起来就是
+# 它在做哪件事，新增第三种模式时也不必把布尔改成枚举。
+MODE_RENEWAL = "renewal"
+MODE_BOOTSTRAP = "bootstrap"
+AUTHORIZATION_MODES = (MODE_RENEWAL, MODE_BOOTSTRAP)
+
+
+class SubjectAlreadyRegisteredError(RuntimeError):
+    """首次建立模式下发现主体登记非空：拒绝执行，且不发起任何授权。
+
+    单独成类是为了让调用方能把"已有主体"与配置错误区分开，给运维一句可执行
+    的提示（先走单独授权的删除动作），而不是笼统的失败类别。
+    """
+
 
 @dataclass(frozen=True)
 class PendingAuthorization:
@@ -73,6 +99,7 @@ class DelegatedCredentialVault(Protocol):
         issued_at: datetime | None = ...,
         replacing_generation: str | None = ...,
         expected_registered_subject_open_id: str | None = ...,
+        require_absent_registration: bool = ...,
     ) -> bool: ...
 
 
@@ -253,7 +280,11 @@ class FeishuReauthorizationEntry:
         vault: DelegatedCredentialVault,
         exchanger: AuthorizationCodeExchanger,
         state_ttl_seconds: int = DEFAULT_STATE_TTL_SECONDS,
+        mode: str = MODE_RENEWAL,
     ) -> None:
+        if mode not in AUTHORIZATION_MODES:
+            raise ValueError("重授权模式只能是续期或首次建立")
+        self._mode = mode
         self._app_id = _required_text(app_id, "飞书应用 ID")
         self._redirect_uri = _https_url(redirect_uri, "授权回跳地址")
         self._authorization_endpoint = _https_url(authorization_endpoint, "飞书授权地址")
@@ -277,10 +308,22 @@ class FeishuReauthorizationEntry:
 
         未显式传入主体时只从正式登记表读取；绝不从待回调参数或浏览器字段
         推断。新 state 会替换旧的未完成 state，使旧授权地址自然失效。
+
+        首次建立模式（``bootstrap``）额外守两条：主体必须由调用方显式给出
+        （登记表为空，没有可读的来源），且发起前先确认登记确实为空——把
+        "已有主体"挡在打开授权页之前，运维不会误点一次真实同意再被拒绝。
+        回调时还会**再判定一次**（见 :meth:`handle_callback`），这里的预检只
+        为提前失败，不是唯一防线。
         """
 
         subject = expected_subject_open_id
-        if subject is None:
+        if self._mode == MODE_BOOTSTRAP:
+            if subject is None:
+                raise ValueError("首次建立模式必须显式指定专用授权主体")
+            registered = self._vault.registered_subject_open_id()
+            if registered is not None and registered.strip():
+                raise SubjectAlreadyRegisteredError("专用授权主体登记非空，首次建立模式拒绝执行")
+        elif subject is None:
             subject = self._vault.registered_subject_open_id()
         subject = _required_text(subject, "专用授权主体")
         state, expires_at = self._state_store.issue(
@@ -369,25 +412,44 @@ class FeishuReauthorizationEntry:
                 "persistence_failed",
                 "无法确认正式授权主体，未修改凭据，请由运维检查后重新发起授权。",
             )
-        if registered_subject is None or not registered_subject.strip():
-            logger.warning("正式重授权当前主体登记缺失，未写入凭据")
-            return self._failure(
-                "subject_missing",
-                "当前正式授权主体登记已缺失，未修改凭据，请由运维检查后重新发起授权。",
-            )
-        registered_subject = registered_subject.strip()
-        if not hmac.compare_digest(registered_subject, pending.expected_subject_open_id):
-            logger.warning("正式重授权期间主体登记已变化，未写入凭据")
-            return self._failure(
-                "subject_changed",
-                "正式授权主体已变化，本次授权未写入，请重新查询后发起授权。",
-            )
+        if self._mode == MODE_BOOTSTRAP:
+            # 首次建立只在登记仍为空时成立。这里读到任何主体都拒绝——包括
+            # "刚好等于本次要建立的那个"：那说明另一条路径已经建过，本次
+            # 属于重复执行，交给续期语义处理，不在这里覆盖。
+            if registered_subject is not None and registered_subject.strip():
+                logger.warning("首次建立时发现主体登记已存在，未写入凭据")
+                return self._failure(
+                    "subject_exists",
+                    "已存在专用授权主体登记，首次建立未写入任何内容；如需更换主体，请先执行单独授权的删除动作。",
+                )
+            registered_subject = None
+        else:
+            if registered_subject is None or not registered_subject.strip():
+                logger.warning("正式重授权当前主体登记缺失，未写入凭据")
+                return self._failure(
+                    "subject_missing",
+                    "当前正式授权主体登记已缺失，未修改凭据，请由运维检查后重新发起授权。",
+                )
+            registered_subject = registered_subject.strip()
+            if not hmac.compare_digest(registered_subject, pending.expected_subject_open_id):
+                logger.warning("正式重授权期间主体登记已变化，未写入凭据")
+                return self._failure(
+                    "subject_changed",
+                    "正式授权主体已变化，本次授权未写入，请重新查询后发起授权。",
+                )
 
         try:
+            # 两种模式各自把判定条件交给保存事务：续期比对 expected 主体，
+            # 首次建立要求登记仍为空。读到的结果都不是最终依据，数据库才是。
+            save_condition: dict[str, Any] = (
+                {"require_absent_registration": True}
+                if self._mode == MODE_BOOTSTRAP
+                else {"expected_registered_subject_open_id": registered_subject}
+            )
             saved = self._vault.save(
                 subject_open_id=pending.expected_subject_open_id,
                 grant=exchange.grant,
-                expected_registered_subject_open_id=registered_subject,
+                **save_condition,
             )
         except Exception as caught:  # noqa: BLE001 - vault 必须原子失败关闭
             logger.warning("正式重授权凭据未安全保存 error=%s", type(caught).__name__)
@@ -402,6 +464,14 @@ class FeishuReauthorizationEntry:
                 "授权已取得但未能安全保存，未使用半成品凭据，请检查后重新发起授权。",
             )
 
+        if self._mode == MODE_BOOTSTRAP:
+            logger.info("专用授权主体首次建立完成，凭据已交给正式 vault")
+            return ReauthorizationResult(
+                True,
+                "completed",
+                "专用授权主体已首次建立，凭据已写入；此后由既有续期路径接管。",
+                False,
+            )
         logger.info("正式重授权完成，凭据已交给正式 vault")
         return ReauthorizationResult(True, "completed", "专用授权已更新，可以继续组织目录同步。", False)
 

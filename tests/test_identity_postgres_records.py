@@ -1,6 +1,7 @@
 """#16 身份链路的真实 PostgreSQL 断言；不访问飞书、不使用真实凭据。
 
-认领断言：V-开通-01、V-开通-06（真库部分）、V-开通-15、V-开通-16、V-身份-01、V-身份-02、V-身份-03。
+认领断言：V-开通-01、V-开通-06（真库部分）、V-开通-15、V-开通-16、V-身份-01、V-身份-02、V-身份-03、
+V-身份-11（首次建立的反向 CAS，真库部分）。
 另含「完整性校验不过不提交半轮快照」这条硬规则的真库负向测试。
 
 Issue #89 S-B-03 追加 `AppUserProvisioningContractTest`：写侧建档服务合同
@@ -453,6 +454,98 @@ class CredentialGenerationGuardTest(IdentityPostgresTestCase):
         self.assertFalse(saved)
         self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), changed_subject)
         self.assertFalse(self.path.exists())
+
+
+class SubjectBootstrapCasTest(IdentityPostgresTestCase):
+    """Issue #137：首次建立专用授权主体的反向 CAS（登记为空才允许，V-身份-11）。
+
+    这条判定必须由真库证明：``ON CONFLICT DO NOTHING`` 在已有登记时返回零行，
+    是数据库在同一事务里做的判断，不是应用先读后写。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        import tempfile
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(self._dsn, Fernet.generate_key().decode(), str(self.path))
+
+    def _bootstrap(self, subject: str = DELEGATED_SUBJECT, *, token: str = FAKE_TOKEN) -> bool:
+        return self.vault.save(
+            subject_open_id=subject,
+            grant=AuthorizationGrant(SecretToken(token), 7 * 24 * 3600, "offline_access"),
+            require_absent_registration=True,
+        )
+
+    def test_an_empty_registry_accepts_exactly_one_bootstrap(self) -> None:
+        self.assertTrue(self._bootstrap())
+
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 1)
+        credential = self.vault.load()
+        assert credential is not None
+        self.assertEqual(credential.subject_open_id, DELEGATED_SUBJECT)
+
+    def test_an_existing_registration_is_never_overwritten_by_a_bootstrap(self) -> None:
+        self.assertTrue(self._bootstrap())
+        configured_at = self.scalar("SELECT configured_at FROM feishu_delegated_subject")
+
+        second = self._bootstrap("ou_another_bootstrap_subject", token="fake-second-token")
+
+        self.assertFalse(second)
+        self.assertEqual(self.scalar("SELECT subject_open_id FROM feishu_delegated_subject"), DELEGATED_SUBJECT)
+        self.assertEqual(self.scalar("SELECT configured_at FROM feishu_delegated_subject"), configured_at)
+        credential = self.vault.load()
+        assert credential is not None
+        self.assertEqual(credential.grant.refresh_token.reveal(), FAKE_TOKEN, "被拒的首次建立不得改写凭据文件")
+
+    def test_bootstrapping_the_same_subject_twice_is_still_refused(self) -> None:
+        self.assertTrue(self._bootstrap())
+
+        self.assertFalse(self._bootstrap(token="fake-repeat-token"))
+
+    def test_renewal_takes_over_after_a_bootstrap(self) -> None:
+        self.assertTrue(self._bootstrap())
+
+        renewed = self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-renewed-token"), 7 * 24 * 3600, "offline_access"),
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+        )
+
+        self.assertTrue(renewed)
+        credential = self.vault.load()
+        assert credential is not None
+        self.assertEqual(credential.grant.refresh_token.reveal(), "fake-renewed-token")
+
+    def test_the_two_cas_conditions_cannot_be_combined(self) -> None:
+        with self.assertRaises(ValueError):
+            self.vault.save(
+                subject_open_id=DELEGATED_SUBJECT,
+                grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
+                require_absent_registration=True,
+                expected_registered_subject_open_id=DELEGATED_SUBJECT,
+            )
+
+    def test_bootstrapping_an_employee_open_id_is_still_rejected_by_the_database(self) -> None:
+        """V-身份-02 的反向触发器对首次建立同样有效：错误主体进不了登记。"""
+
+        self.execute(
+            """INSERT INTO app_user (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                                     display_name, department, tenant_key)
+               VALUES ('usr_bootstrap_guard', 'ou_employee_bootstrap', 'u_b', 'un_b', '某员工', '部门', 't_a')"""
+        )
+
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self._bootstrap("ou_employee_bootstrap")
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.scalar("SELECT count(*) FROM feishu_delegated_subject"), 0)
 
 
 class DatabaseConsistencyBackstopTest(IdentityPostgresTestCase):

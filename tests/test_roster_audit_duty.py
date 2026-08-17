@@ -166,35 +166,49 @@ def build_duty(
 
 
 class ZeroMigrationGuardTest(unittest.TestCase):
-    """V-花名册-13：本切片**不引入任何迁移能力**。
+    """`V-花名册-13`：**迁移是 DDL 的唯一载体**。
 
-    机器面只断言**本切片自己的源码**：不 import alembic / sqlalchemy，不含建表语句。
+    **旧口径已作废。** 这条守卫原名「零迁移」，依据是 2026-08-06 的「零新表」定案；
+    产品负责人 2026-08-08 的 **D2 裁定**推翻了那一半——花名册读取需要一份跨重启的持久
+    快照，表与 DDL 现在真实存在于 `0063_roster_snapshot`。守卫本身**没有失去意义，
+    只是断言的东西变了**：不再是"本组一行 DDL 都没有"，而是"本组的运行时源码一行 DDL
+    都没有，建表只在 revision 里"。
+
+    机器面断言本组**全部运行时源文件**：不 import alembic / sqlalchemy，不含建表语句。
+    `SLICE_SOURCES` 覆盖比对、渲染、职责、群发、花名册读取与快照读写六个方向——
+    漏掉哪个文件，那个文件里偷偷写一句 `CREATE TABLE` 就没有任何东西会红，
+    而矩阵 `V-花名册-13` 声称的正是"四层源码都不含建表语句"。
 
     **刻意不枚举 `versions/` 的文件集合，也不钉住 head 的取值。** 那样写等于把一次性的
     diff 范围固化成永久不变量：别的切片（例如 #57 的 `0057`）合并一条与花名册毫无关系的
-    revision 时，这条守卫会红——而它红了并不说明「花名册要表」这件事发生了。
-    **他线新表 ≠ 花名册要表**，一个总在别人改动时误报的守卫，最后一定是被人删掉或加豁免，
-    那时它连本来能挡的那一类问题也挡不住了。
+    revision 时，这条守卫会红——而它红了并不说明「花名册这一组多了一张表」。
+    一个总在别人改动时误报的守卫，最后一定是被人删掉或加豁免，那时它连本来能挡的
+    那一类问题也挡不住了。
 
     revision 链的通用健康度（恰一个 head、恰一个 base、无孤儿、id 长度、README 同步）
-    由 #53 建立的 `scripts/ci/check_alembic_revisions.py` 承担，`verify_repository.sh`
-    无条件执行它。下面第二条用例断言这层委托是**真的**接上了，而不是我假设它接上了。
-
-    「本次 diff 零迁移」是**一次性事实**，由验收 runbook 与 PR 声明承担：
-    `git diff --stat <基线> -- migrations/` 为空。用例证明不了这件事——它看不到基线。
+    由 #53 建立的 `scripts/ci/check_alembic_revisions.py` 承担，逐条真往返由
+    `scripts/ci/check_migration_chain.sh` 承担，`verify_repository.sh` 无条件执行前者。
+    下面第二条用例断言这层委托是**真的**接上了，而不是我假设它接上了。
     """
 
-    # 本切片新增或改动的全部源文件。
+    # 本组（花名册审计日报 + 分页 reader + 持久快照）的全部运行时源文件。
     SLICE_SOURCES = (
         "core/identity/roster_audit.py",
         "core/identity/roster_report.py",
         "adapters/postgres_roster_audit.py",
         "adapters/feishu_group_message.py",
         "apps/scheduler/__init__.py",
+        # S-B-01：花名册分页 reader 与四态完整性判定。
+        "adapters/feishu_roster_bitable.py",
+        # S-B-02：替换门槛与保旧告警（core）、持久快照读写（adapters）。
+        # 后者是本组**唯一**写库的模块，也因此最需要这条守卫：它离"顺手在代码里
+        # 建表"只有一步之遥，而建表必须留在 revision 里才可回滚、可对账。
+        "core/identity/roster_snapshot.py",
+        "adapters/postgres_roster_snapshot.py",
     )
 
     def test_no_source_of_this_slice_can_perform_a_migration(self) -> None:
-        """既不 import 迁移工具，也不自己写 DDL——两条路都堵上才叫「零迁移」。"""
+        """既不 import 迁移工具，也不自己写 DDL——建表只在 revision 里。"""
 
         for module in self.SLICE_SOURCES:
             path = SOURCE_ROOT / "lingxi" / module
@@ -575,8 +589,12 @@ class IdempotenceTest(unittest.TestCase):
         """第③面（验收者定稿）：每个进程实例同一日最多一次；重启当日的重发载荷
         与首次**逐字段完全一致**。
 
-        零新表定案下没有持久载体，跨重启的真幂等做不到（裁定 C2 / R2 知情接受）。
+        **判重水位没有持久载体**，跨重启的真幂等做不到（裁定 C2 / R2 知情接受）。
         能被用例证明、也确实值得保证的是：那次重发不是一份**不同的**日报。
+
+        原表述是「零新表定案下没有持久载体」，那个前提已被 2026-08-08 的 D2 裁定覆盖
+        （仓库现有 `roster_snapshot`，迁移 `0063`）；但那份持久载体存的是花名册**读取
+        结果**、不是判重水位，所以这条用例要证明的东西一个字都没变。
         """
 
         clock = FixedClock()

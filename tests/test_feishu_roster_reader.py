@@ -25,6 +25,7 @@ from lingxi.adapters.feishu_roster_bitable import (
     RosterReadStatus,
     RosterRecordPage,
     RosterRow,
+    normalize_record,
     read_roster_records,
     read_roster_snapshot,
 )
@@ -81,6 +82,21 @@ class _FakePageSource:
         if isinstance(page, Exception):
             raise page
         return page
+
+
+class _FakeRecordPageReader:
+    """legacy `RecordPageReader` 形状的假读取（返回 ``(records, next_page_token)``）。"""
+
+    def __init__(self, pages: list[Any]) -> None:
+        self._pages = list(pages)
+        self.calls: list[str | None] = []
+
+    def list_records(self, page_token: str | None = None) -> Any:
+        self.calls.append(page_token)
+        index = len(self.calls) - 1
+        if index >= len(self._pages):
+            raise AssertionError("分页读取被多读了一页")
+        return self._pages[index]
 
 
 class _RecordingTransport:
@@ -254,6 +270,34 @@ class RosterFailureClassificationTest(unittest.TestCase):
         self.assertEqual(outcome.failure.code, "invalid_page_item")
         self.assertEqual(outcome.rows, ())
 
+    def test_a_record_with_non_mapping_fields_fails_the_round_instead_of_becoming_a_blank_row(self) -> None:
+        # PR #208 二级审查 P2-1：`fields` 不是对象时此前静默归一成一条全空的行。
+        # 持久快照落地后那条空行会被写进快照，在比对时表现为"这个人资料被清空了"。
+        source = _FakePageSource([_page([_record(), {"record_id": "rec-2", "fields": ["不是对象"]}], None)])
+
+        outcome = read_roster_snapshot(source)
+
+        assert outcome.failure is not None
+        self.assertEqual(outcome.status, RosterReadStatus.FAILED)
+        self.assertEqual(outcome.failure.code, "invalid_record_fields")
+        self.assertEqual(outcome.failure.kind, RosterFailureKind.INDETERMINATE)
+        # 半轮读到的那条正常行一行都不返回。
+        self.assertEqual(outcome.rows, ())
+
+    def test_normalize_record_rejects_malformed_shapes_loudly(self) -> None:
+        # legacy 路径（`read_roster_records`）没有"结算成失败结果对象"这一层，
+        # 坏记录必须以异常出现，而不是一条看不出问题的空行。
+        for malformed in ("不是对象", {"record_id": "rec-1", "fields": "不是对象"}):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(RosterReadError):
+                    normalize_record(malformed)
+
+    def test_legacy_reader_propagates_the_malformed_record_failure(self) -> None:
+        reader = _FakeRecordPageReader([([{"record_id": "rec-1", "fields": 42}], None)])
+
+        with self.assertRaises(RosterReadError):
+            read_roster_records(reader)
+
 
 class RosterIntegrityTest(unittest.TestCase):
     """完整性判定：空源、总数对账、必需列形态、缺字段行、重复键。"""
@@ -414,6 +458,27 @@ class RosterIntegrityTest(unittest.TestCase):
 
         duplicates = {item.field: item for item in outcome.integrity.duplicates}
         self.assertEqual(duplicates["personnel_id"].keys, 0)
+
+    def test_duplicate_required_columns_do_not_puncture_absent_column_detection(self) -> None:
+        # PR #208 二级审查 P3-1：同一列在清单里出现两次时，空值统计会对同一行加两次，
+        # 于是"整列都取不到值"的判据（计数 == 行数）永远不成立——列被改名或删掉这件事
+        # 会被静默放过，这一轮被判成 COMPLETE 并顶掉一份好快照。
+        source = _FakePageSource([_page([_record(employee_no=None), _record("fs-u2", record_id="rec-2", employee_no=None)], None)])
+
+        outcome = read_roster_snapshot(source, required_columns=("人员ID", "工号", "工号"))
+
+        self.assertEqual(outcome.status, RosterReadStatus.INCOMPLETE)
+        self.assertEqual(outcome.integrity.absent_columns, ("工号",))
+        # 去重同时保序：完整性事实里每列只出现一次，输出次序仍是首次出现的次序。
+        self.assertEqual([item.column for item in outcome.integrity.blank_column_rows], ["人员ID", "工号"])
+        self.assertEqual({item.column: item.rows for item in outcome.integrity.blank_column_rows}["工号"], 2)
+
+    def test_duplicate_key_fields_are_deduplicated_too(self) -> None:
+        source = _FakePageSource([_page([_record(), _record(record_id="rec-2")], None)])
+
+        outcome = read_roster_snapshot(source, duplicate_key_fields=("personnel_id", "personnel_id"))
+
+        self.assertEqual([item.field for item in outcome.integrity.duplicates], ["personnel_id"])
 
     def test_required_columns_are_configurable(self) -> None:
         source = _FakePageSource([_page([_record(extra={"部门": "化名部门"})], None)])
