@@ -80,6 +80,14 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.galaxy_scope",
     "lingxi.core.permission.account_match",
     "lingxi.core.permission.role_function",
+    # 权限发布（Issue #156 / S-C-01）：聚合与目标行形状、发布意图消费编排在 core，
+    # outbox 读写与多维表格写读回在 adapters。四个都要在制品里能 import——生产调用方
+    # 是 Epic D 的 OnboardingRunner 与每日权限刷新职责，装配前它们不在任何进程的
+    # import 闭包里，"本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.permission.publish_row",
+    "lingxi.core.permission.publish",
+    "lingxi.adapters.postgres_permission_publish",
+    "lingxi.adapters.feishu_permission_bitable",
     "lingxi.adapters.galaxy_csv_export",
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.retention",
