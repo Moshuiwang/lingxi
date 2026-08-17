@@ -221,6 +221,81 @@ class SerializationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             serialize_permissions(_aggregate(roles=[]))
 
+
+class MetricNameSensitivityTest(unittest.TestCase):
+    """值列表元素**逐字敏感**：零归一守卫（产品负责人 2026-08-17 对 #155 的答复）。
+
+    MCP 按字面匹配指标名，大小写与全半角都算数。这组用例钉住的是「这条链路上没有任何
+    顺手归一」——一旦有人在聚合层或序列化层加一次 `strip()` / `casefold()` /
+    `unicodedata.normalize()`，它们立刻变红。错的方向是**静默给错范围**而不是报错，
+    所以必须由用例守，不能靠代码评审记得。
+
+    注：写侧当前放进值列表的还是职能标签（「公司+职能→指标名」翻译层未实现）；本组
+    守的是**字符串透传纪律**，它与列表内容将来换成真正的指标名无关。
+    """
+
+    def _serialize(self, *values: str) -> str:
+        aggregate = PermissionAggregate(
+            granted=True, reason="granted", companies=("1011",), functions=values
+        )
+        return serialize_permissions(aggregate)
+
+    def test_case_difference_produces_a_different_payload(self) -> None:
+        self.assertNotEqual(self._serialize("OTT"), self._serialize("ott"))
+        self.assertIn('"OTT"', self._serialize("OTT"))
+        self.assertIn('"ott"', self._serialize("ott"))
+
+    def test_full_width_characters_survive_verbatim(self) -> None:
+        # 全角 ＯＴＴ 与半角 OTT 在 MCP 眼里是两个指标，不得被任何宽度转换抹平。
+        self.assertNotEqual(self._serialize("ＯＴＴ"), self._serialize("OTT"))
+        self.assertIn('"ＯＴＴ"', self._serialize("ＯＴＴ"))
+
+    def test_surrounding_and_inner_whitespace_is_not_trimmed(self) -> None:
+        # 连 strip 都不做：带空白的指标名是数据问题，不该由发布层悄悄"修好"。
+        self.assertIn('" 日活 "', self._serialize(" 日活 "))
+        self.assertIn('"日 活"', self._serialize("日 活"))
+
+    def test_chinese_metric_names_are_not_escaped(self) -> None:
+        # ensure_ascii=False 是「全半角敏感」的前提：转义会把原字符藏进 \uXXXX。
+        self.assertIn('"日活"', self._serialize("日活"))
+        self.assertNotIn("\\u", self._serialize("日活"))
+
+    def test_none_and_non_string_entries_fail_loudly(self) -> None:
+        for bad in (None, 123, ("日活",), ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self._serialize(bad)  # type: ignore[arg-type]
+
+    def test_a_star_inside_the_value_list_is_passed_through_unchanged(self) -> None:
+        """``"*"`` 在**值列表内**表示「该公司下所有指标」。
+
+        我方权限模型**不产出**这个形状（值来自角色名映射配置，配置里没有 `*`），
+        但读侧可能遇到它，而序列化层不得对它做任何特殊处理——特判会让「透传」这条
+        纪律出现一个例外，例外早晚会长出第二个。
+        """
+
+        self.assertEqual(self._serialize("*"), '{"1011":["*"]}')
+
+    def test_wildcard_key_and_wildcard_value_are_different_positions(self) -> None:
+        key_wildcard = serialize_permissions(
+            PermissionAggregate(
+                granted=True,
+                reason="granted",
+                companies=("1011",),
+                functions=("日活",),
+                all_companies=True,
+            )
+        )
+        self.assertEqual(key_wildcard, '{"*":["日活"]}')
+        self.assertEqual(self._serialize("*"), '{"1011":["*"]}')
+        self.assertNotEqual(key_wildcard, self._serialize("*"))
+
+    def test_writer_side_never_produces_an_empty_value_list(self) -> None:
+        """空列表=「该公司下无任何指标」，是读侧的合法形状；写侧走 fail-closed，不产出它。"""
+
+        with self.assertRaises(ValueError):
+            PermissionAggregate(granted=True, reason="granted", companies=("1011",), functions=())
+
     def test_updated_at_is_second_precision_utc(self) -> None:
         moment = datetime(2026, 8, 17, 11, 0, 0, 123456, tzinfo=timezone(timedelta(hours=8)))
         self.assertEqual(format_updated_at(moment), "2026-08-17T03:00:00Z")
