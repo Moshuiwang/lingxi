@@ -32,14 +32,6 @@ logger = logging.getLogger(__name__)
 # `is_set()` 就立即返回，不多空转。
 _STOP_SIGNAL_DRAIN_YIELDS = 5
 
-# 「这次回合失败的原因就是那次 stop 本身」的失败码集合（Issue #195）。
-# `interrupted` 是本仓库对 `AgentSessionInterrupted` 的命名；`cancelled` 是同一次
-# `client.interrupt()` 从 SDK 终止元数据（`aborted_streaming`/`aborted_tools`）
-# 回来的另一种叫法——队列 worker 的 `propagate_cancellation=True` 已经让真正的
-# `asyncio.CancelledError` 原样抛出，不会走到这里（见 `turn.py` 同名说明）。
-# 这两个码不构成「独立于 stop 的真实失败原因」，因此不参与 #195 的失败优先。
-_STOP_EQUIVALENT_FAILURE_CODES = frozenset({"interrupted", "cancelled"})
-
 
 class QueueListener(Protocol):
     def wait(self, *, timeout_seconds: float) -> bool: ...
@@ -396,9 +388,12 @@ class WorkerService:
             except asyncio.CancelledError:
                 pass
 
-        stop_requested = stop_event.is_set() or self._queue.stop_requested(
-            task_id=claimed.task_id, worker_id=self._config.worker_id
-        )
+        # 这里刻意**不再**回读队列侧的 stop 标志（此前是
+        # `stop_requested = stop_event.is_set() or self._queue.stop_requested(...)`）：
+        # 终态只由这一轮实际发生的事实决定，见下方 `stop_is_the_outcome` 的说明。
+        # 留着它就是留一个没人用的每回合额外查询和一个会诱使后来者再次「用 stop
+        # 覆盖终态」的现成变量。停止在途回合仍由 `_monitor` 置位 `stop_event`
+        # 驱动执行层中断，那条路径没有改动。
         turn = report.get("turn") or {}
         failure = report.get("failure") or {}
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
@@ -426,19 +421,26 @@ class WorkerService:
         #      `stopped`，只有成功分支才写的 `session_id` 一并丢失，用户拿不到
         #      已经产出的结果、也无法在会话内追问——踩「重启与重试不得造成
         #      用户结果丢失」这条红线。
-        # 因此 stop 只在「这一轮没有独立于 stop 的失败原因，也没有可交付结果」
-        # 时才决定终态：`failure_code is None` 说明没有任何别的原因可报，
-        # `_STOP_EQUIVALENT_FAILURE_CODES` 里的两个码本身就是这次 stop 的名字。
-        # 反过来，`interrupted` 是执行层确认「这一轮真的被中断了」，不需要再问
-        # 队列侧 stop 标志是否还在（真中断优先，与 #195 的目标优先级一致）。
+        # 因此 `stopped` 只认执行层给出的**真中断**：`interrupted` 是
+        # `adapters/claude_agent_session.py` 观测到本地 `stop_event` 已置位、
+        # 调用过 `client.interrupt()` 之后才抛出的 `AgentSessionInterrupted`
+        # （`turn.py` 映射），它是这条链路上唯一带因果的「这一轮真的被 stop
+        # 打断了」信号。队列侧的 `stop_requested` 只说明「某一刻有人请求过停止」，
+        # 不说明这一轮的结果由它决定，因此**不参与**终态选择。
+        #
+        # 尤其不能用「没有失败码」反推成 stop（codex 一级独立审查 P1-1）：
+        # `closed=False` 本身就是失败事实，`failure_code is None` 只是没人给它
+        # 起名字（屏障失效 `gate_bypassed`、failure 映射缺 `code` 都是这种形状）。
+        # 也不能把 `cancelled` 当成 stop 的别名（同审查 P1-2）：它来自
+        # `turn.py/_sdk_termination_failure` 对 SDK 自报的
+        # `aborted_streaming`/`aborted_tools`，与本地 `stop_event` 之间没有任何
+        # 因果绑定，SDK 完全可能在没人 stop 的时候自行 abort——认它就等于让一次
+        # 晚到的 stop 掩盖真实的 SDK 终止失败。
+        #
         # 注意开工前就带着 stop_requested 的任务在 `_process_task` 开头就已收口
         # 成 `stopped`，根本不会走到这里；这里处理的只有「执行途中 stop 与回合
         # 终点赛跑」这一种情况。
-        stop_is_the_outcome = failure_code == "interrupted" or (
-            stop_requested
-            and not deliverable
-            and (failure_code is None or failure_code in _STOP_EQUIVALENT_FAILURE_CODES)
-        )
+        stop_is_the_outcome = failure_code == "interrupted"
 
         if stop_is_the_outcome:
             content = (
