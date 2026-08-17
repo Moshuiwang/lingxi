@@ -15,8 +15,14 @@
 
 测试手段：按仓库既有惯例（`tests/test_gateway_transport.py`、
 `tests/test_claude_agent_hooks_adapter.py`）用 ``sys.modules`` 把 ``lark_oapi`` 换成桩，
-再用假 client 精确注入 10 类响应形状。不连真实飞书、不需要真实数据库、不需要装 SDK。
-用例蓝本是 PR #172 第 4 轮独立复核的一次性人工探针（10 种形状），本文件把它固化成回归。
+再用假 client 精确注入响应形状。不连真实飞书、不需要真实数据库、不需要装 SDK。
+用例蓝本是 PR #172 第 4 轮独立复核的一次性人工探针（10 种形状），本文件把它固化成回归并
+补齐探针没走到的穿透路径。
+
+覆盖原则：**每个外发点都要有两侧用例**——「业务拒绝 → ``DeliveryRejected``」与「异常
+原样穿透 → 结果不明」。只测其中一侧的外发点等于没有守住那一侧（PR #199 二级独立审查
+P1 实证：卡片发送点起初只有拒绝侧，给该点的外呼包一层 ``except Exception: raise
+DeliveryRejected`` 时全部用例仍然全绿）。
 
 分类规则本身不在本 Issue 范围内改动；本文件只把现有规则钉死。
 """
@@ -185,19 +191,26 @@ def _accepted() -> _Response:
     return _Response(ok=True, data=_Built())
 
 
+class _UnknownSDKError(Exception):
+    """既不是网络类、也不是解析类、更不是缺标识——SDK 未来可能新增的任何异常。
+
+    默认拒绝规则要用一个"不在任何名单中的未知对象"证明（验证与门禁第八节第 4 条），
+    不能只证明某个已知形状被正确归类。
+    """
+
+
 class _Endpoint:
     """一个假接口：按注入的脚本依次返回响应或抛出异常，并记录调用次数。"""
 
-    def __init__(self, *outcomes: Any) -> None:
-        self._outcomes = list(outcomes)
+    def __init__(self, outcome: Any) -> None:
+        self._outcome = outcome
         self.calls: list[Any] = []
 
     def __call__(self, request: Any) -> Any:
         self.calls.append(request)
-        outcome = self._outcomes.pop(0) if len(self._outcomes) > 1 else self._outcomes[0]
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
 
 
 class _FakeClient:
@@ -416,6 +429,8 @@ class CardCreateClassificationTests(_ClassificationTestCase):
         self.assertIn("message_id", str(error))
 
     def test_send_success_without_data_is_result_unknown(self) -> None:
+        """形状 9：发送响应 ``success()=True`` 但整个 ``data`` 为 ``None``。"""
+
         client = _FakeClient(reply=_Response(ok=True, data=None))
         card_transport, _ = self._transports(client)
 
@@ -425,6 +440,45 @@ class CardCreateClassificationTests(_ClassificationTestCase):
             ),
             LookupError,
         )
+
+    def test_send_read_timeout_passes_through_as_result_unknown(self) -> None:
+        """形状 10：卡片**已经建好**、发送消息时读超时——``create()`` 里误判后果最重的一格。
+
+        飞书可能已经把这张卡片发出去了，我们只是没等到响应。判成 ``DeliveryRejected``
+        会让消费侧清预留位并重试或降级文本，用户于是收到两遍同一个答案——正是不重复
+        投递红线要挡的事。PR #199 二级独立审查 P1：这一格此前零覆盖，给该外呼包一层
+        ``except Exception: raise DeliveryRejected`` 时整组用例仍然全绿。
+        """
+
+        client = _FakeClient(create=_created(), reply=TimeoutError("read timed out"))
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            TimeoutError,
+        )
+        self.assertEqual(len(client.create.calls), 1, "应当已经越过建卡、失败在发送这一步")
+        self.assertEqual(len(client.reply.calls), 1, "发送只应尝试一次，本层不重试")
+
+    def test_send_unknown_exception_passes_through_as_result_unknown(self) -> None:
+        """形状 11：卡片已建好、发送消息抛出不在任何名单里的未知异常。
+
+        与上一条同一个位置，但换成默认拒绝的反向证明（验证与门禁第八节第 4 条）：
+        不能只证明已知的超时形状被正确归类。
+        """
+
+        client = _FakeClient(create=_created(), reply=_UnknownSDKError("SDK 内部未知失败"))
+        card_transport, _ = self._transports(client)
+
+        self.assert_result_unknown(
+            lambda: card_transport.create(
+                chat_id="oc-1", thread_id=None, reply_to_message_id="om-in-1", card=_card()
+            ),
+            _UnknownSDKError,
+        )
+        self.assertEqual(len(client.reply.calls), 1)
 
     def test_the_happy_path_returns_both_readback_identifiers(self) -> None:
         """对照组：两段都成功时必须原样返回可回读标识，不被分类分支误伤。"""
@@ -442,7 +496,7 @@ class CardUpdateAndCloseClassificationTests(_ClassificationTestCase):
     """流式更新与关闭流式（``update`` / ``close``）的响应形状。"""
 
     def test_stream_update_business_error_is_an_explicit_rejection(self) -> None:
-        """形状 9：流式更新 ``success()=False``。"""
+        """形状 12：流式更新 ``success()=False``。"""
 
         client = _FakeClient(content=_rejected())
         card_transport, _ = self._transports(client)
@@ -452,6 +506,8 @@ class CardUpdateAndCloseClassificationTests(_ClassificationTestCase):
         )
 
     def test_stream_update_network_failure_is_result_unknown(self) -> None:
+        """形状 13：流式更新读超时。"""
+
         client = _FakeClient(content=TimeoutError("read timed out"))
         card_transport, _ = self._transports(client)
 
@@ -461,7 +517,7 @@ class CardUpdateAndCloseClassificationTests(_ClassificationTestCase):
         )
 
     def test_stream_close_business_error_is_an_explicit_rejection(self) -> None:
-        """形状 10：关闭流式 ``success()=False``。"""
+        """形状 14：关闭流式 ``success()=False``。"""
 
         client = _FakeClient(settings=_rejected())
         card_transport, _ = self._transports(client)
@@ -471,6 +527,8 @@ class CardUpdateAndCloseClassificationTests(_ClassificationTestCase):
         )
 
     def test_stream_close_json_decode_failure_is_result_unknown(self) -> None:
+        """形状 15：关闭流式时 ``lark_oapi`` 解析响应体失败。"""
+
         client = _FakeClient(settings=_json_decode_error())
         card_transport, _ = self._transports(client)
 
@@ -504,28 +562,32 @@ class TextFallbackClassificationTests(_ClassificationTestCase):
         )
 
     def test_text_business_error_is_an_explicit_rejection(self) -> None:
-        """形状 11：文本 ``success()=False``。"""
+        """形状 16：文本 ``success()=False``。"""
 
         client = _FakeClient(reply=_rejected())
         self.assert_explicit_rejection(self._send(client))
 
     def test_text_success_without_data_is_result_unknown(self) -> None:
-        """形状 12：文本 ``success()=True`` 但 ``data`` 为 ``None``。"""
+        """形状 17：文本 ``success()=True`` 但 ``data`` 为 ``None``。"""
 
         client = _FakeClient(reply=_Response(ok=True, data=None))
         self.assert_result_unknown(self._send(client), LookupError)
 
     def test_text_success_with_blank_message_id_is_result_unknown(self) -> None:
-        """形状 13：文本 ``success()=True`` 但 ``message_id`` 是空串。"""
+        """形状 18：文本 ``success()=True`` 但 ``message_id`` 是空串。"""
 
         client = _FakeClient(reply=_sent(message_id=""))
         self.assert_result_unknown(self._send(client), LookupError)
 
     def test_text_json_decode_failure_is_result_unknown(self) -> None:
+        """形状 19：文本兜底时 ``lark_oapi`` 解析响应体失败。"""
+
         client = _FakeClient(reply=_json_decode_error())
         self.assert_result_unknown(self._send(client), json.JSONDecodeError)
 
     def test_text_connection_reset_is_result_unknown(self) -> None:
+        """形状 20：文本兜底时连接中断——文本可能已经发出，重发用户会收到两条。"""
+
         client = _FakeClient(reply=ConnectionResetError("connection reset by peer"))
         self.assert_result_unknown(self._send(client), ConnectionResetError)
 
@@ -542,9 +604,6 @@ class UnexpectedExceptionTests(_ClassificationTestCase):
     """
 
     def test_an_unknown_exception_is_never_promoted_to_an_explicit_rejection(self) -> None:
-        class TotallyUnknownSDKError(Exception):
-            """既不是网络类、也不是解析类、更不是缺标识——SDK 未来可能新增的任何异常。"""
-
         for endpoint, invoke in (
             (
                 "create",
@@ -562,10 +621,10 @@ class UnexpectedExceptionTests(_ClassificationTestCase):
             ),
         ):
             with self.subTest(endpoint=endpoint):
-                failure = TotallyUnknownSDKError("SDK 内部未知失败")
+                failure = _UnknownSDKError("SDK 内部未知失败")
                 client = _FakeClient(create=failure, content=failure, settings=failure, reply=failure)
                 transports = self._transports(client)
-                self.assert_result_unknown(lambda: invoke(transports), TotallyUnknownSDKError)
+                self.assert_result_unknown(lambda: invoke(transports), _UnknownSDKError)
 
 
 if __name__ == "__main__":
