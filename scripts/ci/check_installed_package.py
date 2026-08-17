@@ -88,6 +88,10 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.publish",
     "lingxi.adapters.postgres_permission_publish",
     "lingxi.adapters.feishu_permission_bitable",
+    # MCP 令牌签发与就绪状态机（Issue #156 / S-C-02）：五路分流状态机在 core，
+    # 加解密、令牌与就绪记录读写、问数 MCP 探针在 adapters。与上面四个同一姿态——
+    # 生产调用方是 Epic D 的 OnboardingRunner 与每日刷新职责，本 Story 不接进程。
+    "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.galaxy_csv_export",
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.retention",

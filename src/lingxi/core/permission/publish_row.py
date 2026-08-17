@@ -108,13 +108,33 @@ MCP **每 15 分钟读一次**这张表（产品负责人答复）。因此「�
 天然有一个最长约十五分钟的窗口——这与 [#156](https://github.com/Moshuiwang/lingxi/issues/156)
 就绪轮询的十五分钟上限是同一个数量级，属 S-C-02 的设计输入，不在本模块。
 
-### ``token_cipher``：**永不写入**
+### ``token_cipher``：**新建行必须带，更新行一律不碰**
 
-它是业务侧既有字段，看名字承载的是某种凭据。产品合同「凭据不进代码、日志、数据库、
-用户环境」和 [#156](https://github.com/Moshuiwang/lingxi/issues/156) 范围第 8 条
-（「凭据、token 和无关个人数据不入 outbox/日志」）在这里的落点是同一句话：Lingxi
-**不产生、不读取、不写入** ``token_cipher``。:data:`PUBLISHED_FIELD_NAMES` 里刻意
-没有它——更新既有行时它不在更新集里，因此不会被清空，也不会被我们的值覆盖。
+这条在 2026-08-17 由产品负责人裁定，取代了 S-C-01 的「永不写入」（依据：Trace #203 的
+G-155 终判评论与同日的三项裁定；`V-权限-11` 的措辞已同步改写）。改变的原因是一条产品
+事实：**没有 ``token_cipher`` 的行对问数 MCP 毫无意义**——MCP 逐行解密该列，与请求
+``Bearer`` 明文等值匹配，解密失败即不放行。一行没有令牌的权限，写出去等于没写。
+
+因此这一列有两套语义，**按动作分**，不能合并：
+
+- **新建行必须携带 Lingxi 自己签发的 ``token_cipher``**。签发在
+  :mod:`lingxi.adapters.postgres_mcp_token`（明文 ``secrets.token_urlsafe(32)``，
+  只持久化 AES-256-CBC 密文），加密协议见 :mod:`lingxi.adapters.mcp_token_cipher`。
+  缺它就**不新建**：发布执行器以 ``invalid`` + ``missing_token_cipher`` 失败关闭
+  （见 :mod:`lingxi.core.permission.publish`）。
+- **更新既有行时它既不被清空也不被覆盖**。:data:`PUBLISHED_FIELD_NAMES`（=更新集）里
+  刻意没有它，而飞书多维表格的记录更新是**部分更新**：没出现在字段集里的列保持原值。
+  理由不是洁癖：正式表既有的 26 行是旧系统 biai-agent 签发的令牌，**Lingxi 不知道它们
+  的明文**，用我们的值覆盖过去等于让那 26 个人在下一次刷新时静默失去问数能力。
+
+**明文与主密钥仍然一步都不进 outbox、日志与告警。** 进 payload 的是密文，而
+:func:`is_cipher_shaped` 让"把明文当密文写出去"在 ``core``（拿不到主密钥的地方）就被
+拦住：``token_urlsafe`` 的明文是 43 个字符的 URL 安全 base64，过不了标准 base64 校验。
+
+**已知后果，不掩盖**：既有 26 行的用户沿用旧系统的令牌，而 Lingxi 的就绪探针用的是
+**我们**签发的那一份，因此对这些用户探针不会成功。发布执行器已经把动作记在
+``PublishAttempt.action``（``create`` / ``update``），上游据此决定要不要对该用户发起
+就绪确认——本 Story 不替上游做这个决定，也不为此新增第六种发布结果。
 
 ### ``status``：``approved``
 
@@ -133,6 +153,8 @@ MCP **每 15 分钟读一次**这张表（产品负责人答复）。因此「�
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -158,8 +180,9 @@ ALL_COMPANIES_KEY = "*"
 #: 发布语义属 S-C-03/04，本 Story 只发布**有效**权限，因此这里只有一个取值。
 STATUS_APPROVED = "approved"
 
-#: 本实现写入的字段，**顺序即比对与审计的输出顺序**。``token_cipher`` 不在其中，
-#: 理由见模块文档；它不是遗漏，改动它需要同时改产品合同。
+#: **更新既有行**时写入的字段，**顺序即比对与审计的输出顺序**。``token_cipher`` 不在
+#: 其中：更新是部分更新，没列出的列保持原值，那 26 行旧系统签发的令牌因此既不被清空
+#: 也不被覆盖（模块文档「``token_cipher``」一节）。它不是遗漏，改动它需要产品负责人裁定。
 PUBLISHED_FIELD_NAMES: tuple[str, ...] = (
     "record_key",
     "email",
@@ -168,6 +191,13 @@ PUBLISHED_FIELD_NAMES: tuple[str, ...] = (
     "status",
     "updated_at",
 )
+
+#: 令牌密文所在的列名。只有这一处字面量，别处一律引用它。
+TOKEN_CIPHER_FIELD = "token_cipher"
+
+#: **新建行**时写入的字段：更新集 + 令牌密文。没有它的新行对问数 MCP 毫无意义
+#: （MCP 逐行解密后与请求 Bearer 明文等值匹配），因此这里是必填而不是可选。
+CREATED_FIELD_NAMES: tuple[str, ...] = PUBLISHED_FIELD_NAMES + (TOKEN_CIPHER_FIELD,)
 
 #: 判断「权限有没有变化」时**不看**的字段。只有时间戳一个：把它算进去，每天一轮的
 #: 权限刷新会天天判成「变了」，天天重发一次内容完全相同的权限。
@@ -415,6 +445,10 @@ class PublishRow:
 
     构造出来的实例即可直接交给发布执行器：:attr:`fields` 的键集恒等于
     :data:`PUBLISHED_FIELD_NAMES`，值恒为非空字符串。
+
+    :attr:`token_cipher` 是**唯一可以缺席**的字段，因为它只在新建行时才写：一个已经
+    存在于发布表的人（例如既有 26 行）不需要我们提供令牌，也不允许我们覆盖他的。
+    缺席时 :attr:`create_fields` 会拒绝，发布执行器据此对"要新建却没有令牌"失败关闭。
     """
 
     record_key: str
@@ -423,6 +457,7 @@ class PublishRow:
     permissions: str
     status: str
     updated_at: str
+    token_cipher: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in PUBLISHED_FIELD_NAMES:
@@ -433,12 +468,41 @@ class PublishRow:
                 # 目标列全是**单行文本**：带换行的值在平台侧的行为未经验证，
                 # 与其赌它，不如在构造时响亮失败。
                 raise ValueError(f"发布行字段 {field_name} 不得包含换行")
+        if self.token_cipher is not None and not is_cipher_shaped(self.token_cipher):
+            # **不回显收到的值**：它是凭据材料。形状判据见 :func:`is_cipher_shaped`——
+            # 它同时挡住"把明文当密文传进来"这个最危险的手误。
+            raise ValueError("发布行的 token_cipher 形状不合法（不回显收到的值）")
 
     @property
     def fields(self) -> dict[str, str]:
-        """待写字段映射。``token_cipher`` 不在其中（模块文档）。"""
+        """**更新既有行**时的待写字段映射。``token_cipher`` 不在其中（模块文档）。"""
 
         return {name: getattr(self, name) for name in PUBLISHED_FIELD_NAMES}
+
+    @property
+    def create_fields(self) -> dict[str, str]:
+        """**新建行**时的待写字段映射：更新集 + ``token_cipher``。
+
+        没有令牌就没有可新建的行——一行没有 ``token_cipher`` 的权限，问数 MCP 解不出
+        任何 Bearer 与它匹配，写出去等于没写。因此这里**抛错**而不是退回六字段：
+        静默少写一列的结果是"发布成功了，但这个人永远问不了数"。
+        """
+
+        if not self.token_cipher:
+            raise ValueError("新建发布行必须携带 Lingxi 签发的 token_cipher")
+        return {name: getattr(self, name) for name in CREATED_FIELD_NAMES}
+
+    @property
+    def snapshot_fields(self) -> dict[str, str]:
+        """进 outbox ``payload`` 的内容快照：有令牌就是七字段，没有就是六字段。
+
+        为什么快照里放**密文**：``payload`` 是"当初决定发布的那一版"，重试必须能原样
+        重放。取不到令牌就临时去查一次，会让"这一版发布的是什么"取决于重试那一刻的
+        库状态；而密文是**当前状态**类数据（迁移 ``0065``），不含明文也不含主密钥，
+        与 outbox 里已有的邮箱、姓名相比不提高敏感级别。明文与主密钥一步都不进这里。
+        """
+
+        return self.create_fields if self.token_cipher else self.fields
 
     @property
     def content_fields(self) -> dict[str, str]:
@@ -461,15 +525,22 @@ class PublishRow:
 
         payload 是**当初决定发布的那一版内容快照**，回读时逐键取；缺键或多键都直接
         失败，不做补齐——补齐等于让一份残缺的快照冒充完整的发布意图。
+
+        ``token_cipher`` 是唯一的可选键：一份不带它的快照仍然合法（那一版决定是"只更新
+        既有行"），但它**不能补齐**——一份原本没有令牌的快照被补上一个令牌，等于把
+        "只更新"悄悄变成"可以新建"。
         """
 
         missing = [name for name in PUBLISHED_FIELD_NAMES if name not in fields]
         if missing:
             raise ValueError(f"发布内容快照缺少字段：{','.join(missing)}")
-        unexpected = [name for name in fields if name not in PUBLISHED_FIELD_NAMES]
+        unexpected = [name for name in fields if name not in CREATED_FIELD_NAMES]
         if unexpected:
             raise ValueError(f"发布内容快照含未登记字段：{','.join(sorted(unexpected))}")
-        return cls(**{name: fields[name] for name in PUBLISHED_FIELD_NAMES})
+        restored = {name: fields[name] for name in PUBLISHED_FIELD_NAMES}
+        if TOKEN_CIPHER_FIELD in fields:
+            restored[TOKEN_CIPHER_FIELD] = fields[TOKEN_CIPHER_FIELD]
+        return cls(**restored)
 
 
 def build_publish_row(
@@ -478,6 +549,7 @@ def build_publish_row(
     email: str,
     display_name: str,
     decided_at: datetime,
+    token_cipher: str | None = None,
 ) -> PublishRow:
     """把聚合结果 + 身份资料结算成目标行。
 
@@ -485,6 +557,13 @@ def build_publish_row(
     :func:`normalize_email`：``record_key`` 与 ``email`` 两列因此同源，同一个人不会
     因为大小写差异被写成两行。``display_name`` 取身份链的姓名（``app_user.display_name``），
     与建档合同同一口径（见 ``core/identity/provisioning.py``）。
+
+    ``token_cipher`` 由调用方在**决定发布之前**先向
+    :class:`lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 取（签发幂等，
+    已存在即返回既有那一份）。它是**关键字可选**参数而不是必填：调用次序错了要在
+    "新建"那一步失败关闭，而不是让整条每日刷新链路因为某个只需要更新的人拿不到令牌
+    而停摆。参数默认为 ``None`` 也让 S-C-01 的既有调用点保持可编译——但那些调用点
+    产出的行只能走更新路径。
     """
 
     if not aggregate.granted:
@@ -504,7 +583,96 @@ def build_publish_row(
         permissions=serialize_permissions(aggregate),
         status=STATUS_APPROVED,
         updated_at=format_updated_at(decided_at),
+        token_cipher=token_cipher,
     )
+
+
+def is_cipher_shaped(value: Any) -> bool:
+    """这个值**在形状上**是不是一份 ``token_cipher``（不解密，也不需要主密钥）。
+
+    存在的意义只有一个：让"把令牌明文当密文写出去"在 ``core`` 里就被拦住。``core`` 拿
+    不到主密钥，也不 import ``adapters``（代码框架第二节），因此这里只能判形状——而形状
+    已经够了：签发的明文是 ``secrets.token_urlsafe(32)``，43 个字符的 **URL 安全**
+    base64（含 ``-``/``_``、长度不是 4 的倍数），过不了标准 base64 校验；一份真密文则是
+    ``base64(16B IV ‖ 16B 整数倍密文)``，解出来至少 32 字节且对齐。
+
+    判据与 :func:`lingxi.adapters.mcp_token_cipher.looks_like_cipher` **必须一致**，
+    两处各写一份是三层 import 规则的直接后果，改动时一起改；一致性由
+    ``tests/test_mcp_token_cipher.py`` 与 ``tests/test_permission_publish_row.py``
+    各自钉住同一组样本。
+    """
+
+    if not isinstance(value, str) or not value or value.strip() != value:
+        return False
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return len(raw) >= 32 and (len(raw) - 16) % 16 == 0
+
+
+def parse_permissions(text: Any) -> dict[str, tuple[str, ...]]:
+    """把 ``permissions`` 单元格文本解析回 ``{公司ID: (指标名, …)}``。
+
+    这是 :func:`serialize_permissions` 的**读侧**，放在同一个模块是因为这套格式全仓库
+    只有一份定稿。形状不对（不是对象、值不是字符串列表）一律抛错，不做宽容修补：
+    一份读不懂的权限文档被"尽力解析"成半份，方向是**给错范围**，不是报错。
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("permissions 文本不能为空")
+    try:
+        document = json.loads(text)
+    except ValueError as error:
+        raise ValueError("permissions 不是合法 JSON") from error
+    if not isinstance(document, Mapping):
+        raise ValueError("permissions 必须是 {公司ID: [指标名, …]} 形状的对象")
+    parsed: dict[str, tuple[str, ...]] = {}
+    for key, values in document.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("permissions 的键必须是非空字符串")
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("permissions 的值必须是列表")
+        for item in values:
+            if not isinstance(item, str):
+                raise ValueError("permissions 的值列表元素必须是字符串")
+        parsed[key] = tuple(values)
+    return parsed
+
+
+def lookup_metrics(document: Mapping[str, Sequence[str]], company_id: Any = None) -> tuple[str, ...]:
+    """按**回退制**取某个公司下的指标列表。**不取并集。**
+
+    产品负责人 2026-08-17 的权威设计（留痕见
+    [#155](https://github.com/Moshuiwang/lingxi/issues/155)）：
+
+    1. 先找 ``document[company_id]``；**这个键存在就到此为止**，哪怕它是空列表——
+       空列表表示"该公司下无任何指标"，与缺键是两回事（模块文档「``permissions``」一节）。
+    2. 该键不存在，才回退 ``document["*"]``（"所有公司"）。
+    3. 两个都没有 → 空元组。
+
+    **并集是错的，不得沿用**：旧系统 biai-agent 把 ``document[company_id]`` 与
+    ``document["*"]`` 归一成并集，那会让一个"在 1011 公司只有日活"的人，因为通配键里有
+    收入而在 1011 也看见收入——方向是**多给权限**。这里刻意把回退写成一个能被指着看、
+    也能被改坏的分支，``tests/test_permission_publish_row.py`` 的
+    ``PermissionFallbackTest`` 钉着它。
+
+    ``company_id`` 为 ``None`` 时问的是另一个问题——"这个人到底有没有任何指标"——
+    此时对全部键取并集是正确的：那不是范围判定，是存在性判定。
+    """
+
+    if company_id is None:
+        return tuple(
+            sorted({item for values in document.values() for item in values})
+        )
+    key = _text(company_id)
+    if not key:
+        raise ValueError("公司标识不能为空")
+    if key in document:
+        return tuple(document[key])
+    if ALL_COMPANIES_KEY in document:
+        return tuple(document[ALL_COMPANIES_KEY])
+    return ()
 
 
 def readback_text(value: Any) -> str:
@@ -543,14 +711,18 @@ def readback_text(value: Any) -> str:
 
 
 def compare_readback(expected: Mapping[str, str], actual: Mapping[str, Any]) -> tuple[str, ...]:
-    """逐字段比对读回结果，返回**不一致的字段名**（按 :data:`PUBLISHED_FIELD_NAMES` 序）。
+    """逐字段比对读回结果，返回**不一致的字段名**（按 :data:`CREATED_FIELD_NAMES` 序）。
 
-    返回字段名而不是字段值：不一致要能进日志、告警和工单，而值里有邮箱和姓名
+    返回字段名而不是字段值：不一致要能进日志、告警和工单，而值里有邮箱、姓名和令牌密文
     （纪律同 ``core/identity/roster_audit.PersonDiff``）。空元组表示逐字段一致。
+
+    比对范围**由 ``expected`` 决定**：传 :attr:`PublishRow.fields`（更新）就比六个字段，
+    传 :attr:`PublishRow.create_fields`（新建）就连 ``token_cipher`` 一起比。这正是
+    "更新既有行时我们不碰那一列，因此也无权要求它等于我们的值"这条语义在比对层的落点。
     """
 
     return tuple(
         name
-        for name in PUBLISHED_FIELD_NAMES
+        for name in CREATED_FIELD_NAMES
         if name in expected and readback_text(actual.get(name)) != expected[name]
     )

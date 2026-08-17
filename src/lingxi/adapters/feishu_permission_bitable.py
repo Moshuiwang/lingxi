@@ -37,8 +37,14 @@
 ## 只写自己的字段
 
 ``update_row`` 只把调用方给的字段放进请求体。飞书的记录更新是**部分更新**：没出现在
-``fields`` 里的列保持原值。这正是 ``token_cipher`` 不会被清空的机制所在——那一列从来
-不进我们的字段集（见 ``core/permission/publish_row.PUBLISHED_FIELD_NAMES``）。
+``fields`` 里的列保持原值。这正是**更新既有行时** ``token_cipher`` 不会被清空的机制
+所在——更新集里从来没有那一列（见 ``core/permission/publish_row.PUBLISHED_FIELD_NAMES``）。
+
+**新建行则必须带上它**（``CREATED_FIELD_NAMES``，2026-08-17 裁定）：没有令牌的新行对
+问数 MCP 毫无意义。本模块对此**没有任何分支**——写哪些字段完全由
+``core/permission/publish`` 决定并逐字传下来，传输层不增删、不改写、不补齐。这条边界
+是刻意的：一旦传输层开始"帮忙补字段"，"更新时不碰某一列"就不再是可以在纯单测里证伪的
+判定，而变成一个要读两个模块才能确认的行为。
 """
 
 from __future__ import annotations

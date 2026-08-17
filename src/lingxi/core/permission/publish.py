@@ -10,14 +10,14 @@
 都以 Protocol 注入（:class:`PermissionTableTransport` / :class:`PermissionPublishStore`），
 全部断言可以在没有网络也没有数据库的机器上跑完。
 
-## 六个互不合并的结果
+## 七个互不合并的结果
 
 | 结果 | 发生了什么 | outbox 去向 |
 |---|---|---|
 | ``published`` | 写入成功，且逐字段读回与预期**完全一致** | ``published`` |
 | ``superseded`` | 这条意图的权限版本已被更新版本取代 | ``superseded``，**不发生任何外部调用** |
 | ``conflict`` | 同一个人已存在 ``record_key`` 口径不同的行，或命中多行 | ``failed``，不重试 |
-| ``invalid`` | 内容快照本身不可用（缺字段 / 被人改过库） | ``failed``，不重试 |
+| ``invalid`` | 内容快照本身不可用（缺字段、被人改过库，或**要新建却没有 ``token_cipher``**） | ``failed``，不重试 |
 | ``mismatch`` | 写入调用成功，但读回有字段对不上 | 重试；attempts 用尽转 ``failed`` |
 | ``rejected`` | 外部**明确拒绝**（完整响应 + 业务错误码非 0） | 重试；attempts 用尽转 ``failed`` |
 | ``uncertain`` | **结果不明**（传输异常、超时、响应形状不对、缺可回读标识） | 重试；attempts 用尽转 ``failed`` |
@@ -337,9 +337,13 @@ def publish_claim(
     1. **先判版本再动手**。旧版本的意图一次外部调用都不发——「不覆盖新权限」必须在
        写之前成立，写完再回滚已经晚了。
     2. **先查后写**。查找同时服务幂等（命中就更新）与安全（同一个人不建第二行）。
-    3. **写完必须读回**。写入接口返回成功只证明请求被受理，证明不了收下的内容与我们
+    3. **字段集按动作分**。更新写六列（``token_cipher`` 不在其中，既有行那一列既不被
+       清空也不被覆盖）；新建写七列，必须携带 Lingxi 签发的 ``token_cipher``，缺它则以
+       ``invalid`` + ``missing_token_cipher`` 失败关闭（`V-权限-11` 的两半）。
+    4. **写完必须读回**。写入接口返回成功只证明请求被受理，证明不了收下的内容与我们
        决定发布的是同一份；读回按**字符串值**比对（G-BIT 移交的实现约束，见
-       :func:`lingxi.core.permission.publish_row.readback_text`）。
+       :func:`lingxi.core.permission.publish_row.readback_text`），比对范围与本次实际
+       写出去的字段集**同一份**。
 
     未预期的异常一律不捕获、原样上抛（纪律同 ``adapters/feishu_delivery.py``）：把它们
     也吞成"结果不明"会让真正的缺陷伪装成外部异常，每一轮安静地重试下去。
@@ -388,15 +392,34 @@ def publish_claim(
     action = "update" if matches else "create"
     record_id = matches[0].record_id if matches else None
     try:
+        # **字段集按动作分**：更新只写六列（``token_cipher`` 不在其中，因此既有行那一列
+        # 既不被清空也不被覆盖）；新建必须连令牌密文一起写，否则这一行对问数 MCP 毫无
+        # 意义。理由全文在 ``publish_row`` 的模块文档「``token_cipher``」一节。
+        expected = row.fields if matches else row.create_fields
+    except ValueError as error:
+        # 要新建却没有令牌：失败关闭，不退回六字段"先建了再说"。静默少写一列的结果是
+        # "发布成功了，但这个人永远问不了数"——一个我们自己都发现不了的假成功。
+        return PublishAttempt(
+            outcome=PublishOutcome.INVALID,
+            outbox_id=claim.outbox_id,
+            user_id=claim.user_id,
+            permission_version=claim.permission_version,
+            attempts=claim.attempts,
+            action=action,
+            error_code="missing_token_cipher",
+            failure_kind=PublishFailureKind.DEFINITE,
+            detail=type(error).__name__,
+        )
+    try:
         if matches:
-            transport.update_row(matches[0].record_id, row.fields)
+            transport.update_row(matches[0].record_id, expected)
         else:
-            record_id = transport.create_row(row.fields)
+            record_id = transport.create_row(expected)
         actual = transport.read_row(record_id or "")
     except PermissionTableError as error:
         return _failure(claim, error, action=action, external_record_id=record_id)
 
-    mismatch = compare_readback(row.fields, actual)
+    mismatch = compare_readback(expected, actual)
     if mismatch:
         return PublishAttempt(
             outcome=PublishOutcome.MISMATCH,

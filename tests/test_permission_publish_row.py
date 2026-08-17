@@ -2,24 +2,33 @@
 
 认领断言：`V-权限-02`（发布内容与数据库当前记录逐字段一致——本文件覆盖"内容怎么算出来
 的、怎么比对"这半边）、`V-权限-10`（逐字段读回按**字符串值**比对）、`V-权限-11`
-（发布字段集不含 ``token_cipher``）。
+（**新建集必须含 ``token_cipher``、更新集一律不含**；明文不进任何落库形态）、
+`V-权限-06` 的本地判定面（``permissions`` 按**回退制**读，不取并集）。
+
+后两条随 [#156](https://github.com/Moshuiwang/lingxi/issues/156) 的 S-C-02 加入
+（产品负责人 2026-08-17 裁定，见 ``core/permission/publish_row.py`` 模块文档）。
 
 否定面（合同的"不得 / 不允许"必须有对应否定测试，验证与门禁第八节）：
 
 - 没有受支持职能、没有公司范围时**不产生**任何发布内容；
 - fail-closed 的聚合结果**不可能**携带公司或职能（类型层就构造不出来）；
-- ``token_cipher`` **不在**发布字段集里，也不可能混进内容快照；
+- ``token_cipher`` **不在更新集**里；缺它时新建集**构造不出来**（不静默退回六字段）；
+- 令牌**明文**永远过不了密文形状校验，因此在 ``core``（拿不到主密钥的地方）就被挡住；
+- 权限判定**不取并集**：显式公司键存在时不回退通配，空列表不等于缺键；
 - 读回比对**不按 Python 类型严格相等**：数字被读成字符串时仍然算一致。
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import secrets
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
+    CREATED_FIELD_NAMES,
     PUBLISHED_FIELD_NAMES,
     REASON_NO_COMPANY_SCOPE,
     REASON_NO_ROLES,
@@ -31,9 +40,16 @@ from lingxi.core.permission.publish_row import (
     build_publish_row,
     compare_readback,
     format_updated_at,
+    is_cipher_shaped,
+    lookup_metrics,
+    parse_permissions,
     readback_text,
     serialize_permissions,
 )
+
+#: biai-agent 加密规格 v1 的**公开测试向量密文**（非生产密钥、非生产令牌）。
+#: 这里只需要一份形状合法的密文，不解开它。
+TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+"
 
 FAKE_GALAXY_USER = "9001"
 FAKE_EMAIL = "jiaming.jia@example.invalid"
@@ -306,12 +322,13 @@ class MetricNameSensitivityTest(unittest.TestCase):
 
 
 class PublishRowTest(unittest.TestCase):
-    def _row(self) -> PublishRow:
+    def _row(self, *, token_cipher: str | None = None) -> PublishRow:
         return build_publish_row(
             aggregate=_aggregate(),
             email="  Jiaming.Jia@Example.INVALID ",
             display_name=FAKE_NAME,
             decided_at=DECIDED_AT,
+            token_cipher=token_cipher,
         )
 
     def test_record_key_and_email_share_the_normalized_value(self) -> None:
@@ -324,12 +341,51 @@ class PublishRowTest(unittest.TestCase):
         self.assertEqual(STATUS_APPROVED, "approved")
         self.assertEqual(self._row().status, "approved")
 
-    def test_published_fields_never_include_token_cipher(self) -> None:
-        """`V-权限-11` 的正面：字段集里没有 ``token_cipher``，更新集因此不会清空它。"""
+    def test_update_field_set_never_includes_token_cipher(self) -> None:
+        """`V-权限-11` 后半：更新集里没有 ``token_cipher``，既有值因此不会被清空。"""
 
         self.assertNotIn("token_cipher", PUBLISHED_FIELD_NAMES)
-        self.assertNotIn("token_cipher", self._row().fields)
-        self.assertEqual(set(self._row().fields), set(PUBLISHED_FIELD_NAMES))
+        row = self._row(token_cipher=TOKEN_CIPHER)
+        self.assertNotIn("token_cipher", row.fields)
+        self.assertEqual(set(row.fields), set(PUBLISHED_FIELD_NAMES))
+
+    def test_create_field_set_requires_token_cipher(self) -> None:
+        """`V-权限-11` 前半：新建集 = 更新集 + ``token_cipher``，缺它就构造不出来。"""
+
+        self.assertEqual(set(CREATED_FIELD_NAMES), set(PUBLISHED_FIELD_NAMES) | {"token_cipher"})
+        row = self._row(token_cipher=TOKEN_CIPHER)
+        self.assertEqual(set(row.create_fields), set(CREATED_FIELD_NAMES))
+        self.assertEqual(row.create_fields["token_cipher"], TOKEN_CIPHER)
+        with self.assertRaises(ValueError):
+            self._row(token_cipher=None).create_fields
+
+    def test_snapshot_fields_follow_whether_a_token_exists(self) -> None:
+        self.assertEqual(
+            set(self._row(token_cipher=TOKEN_CIPHER).snapshot_fields), set(CREATED_FIELD_NAMES)
+        )
+        self.assertEqual(set(self._row(token_cipher=None).snapshot_fields), set(PUBLISHED_FIELD_NAMES))
+
+    def test_plaintext_token_can_never_be_stored_as_a_cipher(self) -> None:
+        """明文当密文传进来必须在 ``core`` 就被拦住（拿不到主密钥的地方也要拦得住）。
+
+        ``secrets.token_urlsafe(32)`` 的形状（URL 安全字母表、长度不是 4 的倍数）过不了
+        标准 base64 校验，因此 ``is_cipher_shaped`` 判否，构造直接失败。
+        """
+
+        for plaintext in (secrets.token_urlsafe(32) for _ in range(32)):
+            with self.subTest(plaintext_length=len(plaintext)):
+                self.assertFalse(is_cipher_shaped(plaintext))
+                with self.assertRaises(ValueError) as caught:
+                    self._row(token_cipher=plaintext)
+                # 不回显收到的值：它是凭据材料。
+                self.assertNotIn(plaintext, str(caught.exception))
+
+    def test_malformed_cipher_is_rejected(self) -> None:
+        for value in ("", "   ", "not base64!", base64.b64encode(b"x" * 16).decode(), 42):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(is_cipher_shaped(value))
+        with self.assertRaises(ValueError):
+            self._row(token_cipher="not base64!")
 
     def test_content_fields_drop_only_the_timestamp(self) -> None:
         row = self._row()
@@ -364,10 +420,75 @@ class PublishRowTest(unittest.TestCase):
     def test_from_fields_round_trips_and_rejects_extra_keys(self) -> None:
         row = self._row()
         self.assertEqual(PublishRow.from_fields(row.fields), row)
+        with_token = self._row(token_cipher=TOKEN_CIPHER)
+        self.assertEqual(PublishRow.from_fields(with_token.create_fields), with_token)
         with self.assertRaises(ValueError):
-            PublishRow.from_fields({**row.fields, "token_cipher": "secret"})
+            PublishRow.from_fields({**row.fields, "刻意夹带": "x"})
         with self.assertRaises(ValueError):
             PublishRow.from_fields({name: "x" for name in PUBLISHED_FIELD_NAMES[:-1]})
+
+    def test_from_fields_never_invents_a_token(self) -> None:
+        """一份没有令牌的快照还原出来仍然没有令牌：**不补齐**。
+
+        补齐等于把"只更新既有行"这一版决定，悄悄变成"可以新建"。
+        """
+
+        restored = PublishRow.from_fields(self._row().fields)
+        self.assertIsNone(restored.token_cipher)
+        with self.assertRaises(ValueError):
+            restored.create_fields
+
+
+class PermissionFallbackTest(unittest.TestCase):
+    """``permissions`` 的**读侧**判定：回退制，**不取并集**（`V-权限-06` 的本地判定面）。
+
+    产品负责人 2026-08-17 的权威设计（留痕见 #155）：先看 ``permissions[company_id]``，
+    **该键存在就到此为止**（哪怕是空列表）；不存在才回退 ``permissions["*"]``。
+    旧系统 biai-agent 的并集归一是**错的**，方向是多给权限，不得沿用。
+    """
+
+    def test_explicit_company_key_wins_and_is_not_unioned(self) -> None:
+        document = parse_permissions('{"1011":["日活"],"*":["收入"]}')
+        # 并集实现会给出 ("日活","收入")——这一条正是挡它的锚点。
+        self.assertEqual(lookup_metrics(document, "1011"), ("日活",))
+        self.assertNotIn("收入", lookup_metrics(document, "1011"))
+
+    def test_missing_company_key_falls_back_to_wildcard(self) -> None:
+        document = parse_permissions('{"1011":["日活"],"*":["收入"]}')
+        self.assertEqual(lookup_metrics(document, "1012"), ("收入",))
+
+    def test_present_but_empty_list_is_not_a_miss(self) -> None:
+        """``{"1011":[]}`` 表示"该公司下无任何指标"，与缺键不同：**不回退通配**。"""
+
+        document = parse_permissions('{"1011":[],"*":["收入"]}')
+        self.assertEqual(lookup_metrics(document, "1011"), ())
+        self.assertEqual(lookup_metrics(document, "1012"), ("收入",))
+
+    def test_no_company_and_no_wildcard_is_empty(self) -> None:
+        self.assertEqual(lookup_metrics(parse_permissions('{"1011":["日活"]}'), "1012"), ())
+
+    def test_wildcard_inside_values_is_a_metric_wildcard_not_a_company_key(self) -> None:
+        # ``"*"`` 看位置：键上=所有公司，值列表内=该公司下所有指标（读侧形状）。
+        self.assertEqual(lookup_metrics(parse_permissions('{"1011":["*"]}'), "1011"), ("*",))
+
+    def test_existence_question_takes_the_union_on_purpose(self) -> None:
+        """``company_id=None`` 问的是"有没有任何指标"，那是存在性判定，不是范围判定。"""
+
+        document = parse_permissions('{"1011":["日活"],"1012":["收入"]}')
+        self.assertEqual(lookup_metrics(document), ("收入", "日活"))
+        self.assertEqual(lookup_metrics(parse_permissions('{"1011":[]}')), ())
+
+    def test_parse_rejects_shapes_it_cannot_read(self) -> None:
+        for text in ("", "   ", "不是 JSON", "[]", '{"1011":"日活"}', '{"1011":[1]}', '{"":["x"]}'):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    parse_permissions(text)
+
+    def test_round_trip_with_the_writer(self) -> None:
+        aggregate = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        document = parse_permissions(serialize_permissions(aggregate))
+        self.assertEqual(lookup_metrics(document, "1011"), ("OTT", "商务"))
+        self.assertEqual(lookup_metrics(document, "9999"), ())
 
 
 class ReadbackTest(unittest.TestCase):

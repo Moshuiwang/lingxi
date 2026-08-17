@@ -40,7 +40,13 @@ from lingxi.core.permission.publish import (
     PublishAttempt,
     PublishOutcome,
 )
-from lingxi.core.permission.publish_row import PUBLISHED_FIELD_NAMES, PublishRow
+from lingxi.core.permission.publish_row import (
+    CREATED_FIELD_NAMES,
+    PUBLISHED_FIELD_NAMES,
+    TOKEN_CIPHER_FIELD,
+    PublishRow,
+    is_cipher_shaped,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +203,10 @@ class PostgresPermissionPublishStore:
                     outbox_id = self.enqueue_publish(
                         user_id=user_id,
                         reason=reason,
-                        payload=row.fields,
+                        # 快照取 ``snapshot_fields``：有令牌就连密文一起冻结，重试因此
+                        # 能原样重放"当初决定发布的那一版"，不必在重试那一刻回查一次
+                        # 令牌表（那会让内容取决于重试时刻的库状态）。
+                        payload=row.snapshot_fields,
                         permission_version=version,
                         tx=connection,
                     )
@@ -219,9 +228,15 @@ class PostgresPermissionPublishStore:
         参数是它省略的实现细节（发什么内容、发的是哪一版）。``tx`` 是必填关键字参数：
         本方法不建连接、不提交、不回滚，事务边界完全在调用方手里。
 
-        ``payload`` 的键集必须恰好是 :data:`PUBLISHED_FIELD_NAMES`——多一个键就意味着
-        有人在这里往外部表格夹带字段（比如 ``token_cipher``），少一个键会让消费侧拿到
-        一份残缺的快照。两种都直接失败，不做静默补齐或过滤。
+        ``payload`` 的键集必须**恰好**是更新集 :data:`PUBLISHED_FIELD_NAMES` 或新建集
+        :data:`CREATED_FIELD_NAMES`（= 更新集 + ``token_cipher``）二者之一。多一个键就
+        意味着有人在这里往外部表格夹带字段，少一个键会让消费侧拿到一份残缺的快照；
+        "六个里少一个再补上 token_cipher 凑成七个"这种混合形状同样被拒。两种都直接
+        失败，不做静默补齐或过滤。
+
+        **进快照的是密文，不是明文**：令牌明文与主密钥一步都不进 outbox
+        （`V-权限-11`）。快照带密文的理由见
+        :attr:`lingxi.core.permission.publish_row.PublishRow.snapshot_fields`。
         """
 
         if tx is None or not hasattr(tx, "cursor"):
@@ -235,8 +250,13 @@ class PostgresPermissionPublishStore:
         if permission_version <= 0:
             raise ValueError("权限版本必须为正：0 表示还没有过任何权限决定")
         fields = dict(payload)
-        if set(fields) != set(PUBLISHED_FIELD_NAMES):
+        if set(fields) not in (set(PUBLISHED_FIELD_NAMES), set(CREATED_FIELD_NAMES)):
             raise ValueError("发布内容快照的字段集必须与已登记的发布字段完全一致")
+        cipher = fields.get(TOKEN_CIPHER_FIELD)
+        if cipher is not None and not is_cipher_shaped(cipher):
+            # 明文长得不像密文（``token_urlsafe`` 是 URL 安全 base64，长度也不对齐），
+            # 因此这道形状校验就是"明文不进 outbox"的最后一关。不回显收到的值。
+            raise ValueError("发布内容快照的 token_cipher 形状不合法（不回显收到的值）")
 
         outbox_id = new_id("pub")
         with tx.cursor() as cursor:
