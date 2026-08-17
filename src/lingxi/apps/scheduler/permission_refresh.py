@@ -104,6 +104,26 @@ STAGE_AGGREGATE = "aggregate"
 STAGE_IDENTITY = "identity"
 
 
+def _utc_date(moment: datetime) -> date:
+    """把一个时刻折成**它所在的 UTC 日期**。
+
+    全模块只有这一处做「时刻 → 日期」的转换，理由是 ``date()`` 会直接取时钟自身时区的
+    日期：一个 ``+08:00`` 的时钟在 ``00:30`` 给出的 ``date()`` 已经是新的一天，而按
+    UTC 那还是前一天。日界不统一会让"今天已经跑过"与"快照是不是今天的"用两把不同的
+    尺子，表现为某些时段整天不重算、或同一天重算两轮。日期一律 UTC（接口设计
+    「二、通用约定」，与 :class:`~lingxi.apps.scheduler.RosterAuditDuty` 的日报日期同口径）。
+
+    naive 时间**直接失败**而不是按本地时区解读：那种解读会在跨时区部署上静默算错，
+    而算错的方向不可预测。
+    """
+
+    if not isinstance(moment, datetime):
+        raise ValueError("权限重算的时间必须是时间戳")
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("权限重算的时间必须带时区：日界一律按 UTC 判定")
+    return moment.astimezone(_UTC).date()
+
+
 class _AuditSink(Protocol):
     """审计出口。
 
@@ -284,10 +304,14 @@ class PermissionRefreshDuty:
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
-        # 跳过类审计的**当日去重水位**。顺序判据在当前部署下每轮都不成立，而调度周期
-        # 是一分钟——不去重的话，一天会刷出一千四百多条内容完全相同的审计，真正的信号
-        # 会被埋掉。原因变了要重新记一条，因此水位记的是（日期, 原因）。
-        self._skip_audited: tuple[date, str] | None = None
+        # 跳过类审计的**当日去重水位**：当天已经记过哪些原因。顺序判据在当前部署下每轮
+        # 都不成立，而调度周期是一分钟——不去重的话，一天会刷出一千四百多条内容完全相同
+        # 的审计，真正的信号会被埋掉。
+        #
+        # 存的是**原因集合**而不是"最后一个原因"：同一天里原因会来回变（花名册快照到了
+        # 又被换成旧的、银河批次过期又重导），只记最后一个的话 A→B→A 会把 A 记两次，
+        # 去重就在最需要它的那条路径上失效了。
+        self._skip_audited: tuple[date, set[str]] | None = None
 
     @property
     def stopping(self) -> bool:
@@ -313,7 +337,7 @@ class PermissionRefreshDuty:
             # 已经在停止中：一轮都不开，一条发布意图都不排。
             return None
         now = self._clock()
-        today = now.date()
+        today = _utc_date(now)
         if self._completed_on == today:
             return None
 
@@ -321,8 +345,10 @@ class PermissionRefreshDuty:
         if facts is None:
             self._audit_skip(today, SKIP_MISSING_SNAPSHOT)
             return None
-        if facts.captured_at.astimezone(_UTC).date() != today:
-            self._audit_skip(today, SKIP_STALE_SNAPSHOT, snapshot_date=facts.captured_at.date().isoformat())
+        if _utc_date(facts.captured_at) != today:
+            self._audit_skip(
+                today, SKIP_STALE_SNAPSHOT, snapshot_date=_utc_date(facts.captured_at).isoformat()
+            )
             return None
 
         snapshot = self._roster_snapshot.load()
@@ -332,9 +358,9 @@ class PermissionRefreshDuty:
             # 唯一安全的动作是本轮不跑，下一轮那份新快照会自己把日期判据带过来。
             self._audit_skip(today, SKIP_MISSING_SNAPSHOT)
             return None
-        if snapshot.facts.captured_at.astimezone(_UTC).date() != today:
+        if _utc_date(snapshot.facts.captured_at) != today:
             self._audit_skip(
-                today, SKIP_STALE_SNAPSHOT, snapshot_date=snapshot.facts.captured_at.date().isoformat()
+                today, SKIP_STALE_SNAPSHOT, snapshot_date=_utc_date(snapshot.facts.captured_at).isoformat()
             )
             return None
 
@@ -345,7 +371,7 @@ class PermissionRefreshDuty:
             return None
 
         baseline = self._baseline_reader.load_active_baseline()
-        tally = _Tally(examined=len(baseline))
+        tally = _Tally()
         interrupted = False
         for identity in baseline:
             if self._stop.is_set():
@@ -354,6 +380,10 @@ class PermissionRefreshDuty:
                 # 这一轮重跑一遍——重跑对已经处理过的人是 ``UNCHANGED``，不产生第二条意图。
                 interrupted = True
                 break
+            # 计数在**领取时**递增，不在遍历前按基线行数一次性写死：被停止信号挡在外面
+            # 的那些人从来没有被看过一眼，把他们算进"已检查"会让中断轮的报告读起来像是
+            # "全都查过了、只是什么都没做"。
+            tally.examined += 1
             try:
                 self._refresh_user(identity, snapshot.rows, galaxy, now, tally)
             except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
@@ -508,12 +538,18 @@ class PermissionRefreshDuty:
         """整轮跳过时留痕，**同一天同一原因只留一条**（构造函数里的水位注释）。
 
         去重只影响审计条数，不影响判据本身：下一轮照样重新判一次，前置一旦成立
-        就立刻开跑。
+        就立刻开跑。**同一天里出现过的每一种原因都会被记到**，包括来回切换后又回到
+        先前那一种（A→B→A 只留 A、B 各一条，不会因为"最后一次记的不是 A"而把 A 记两次）。
         """
 
-        if self._skip_audited == (today, reason):
+        day, reasons = (
+            self._skip_audited if self._skip_audited is not None and self._skip_audited[0] == today
+            else (today, set())
+        )
+        if reason in reasons:
             return
-        self._skip_audited = (today, reason)
+        reasons.add(reason)
+        self._skip_audited = (day, reasons)
         action = (
             "permission_refresh.skipped_no_galaxy_batch"
             if reason == SKIP_NO_GALAXY_BATCH

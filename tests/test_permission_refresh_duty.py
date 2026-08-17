@@ -52,15 +52,18 @@ REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 DUTY_SOURCE = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py"
 
 
-def duty_code() -> str:
-    """职责源码**去掉全部文档字符串与注释**之后的正文。
+def code_without_docstrings(path: pathlib.Path) -> str:
+    """一个源文件**去掉全部文档字符串与注释**之后的正文。
 
     形状断言钉的是代码，不是文档：模块文档里恰恰必须写明"不通知、不删行、不签发令牌"
     这些词，拿原文扫描会把一份写得越清楚的文档判得越红。用 ``ast`` 剥掉 docstring 再
     ``unparse``（注释在解析阶段就没了），剩下的就是真正会执行的那部分。
+
+    ``tests/test_permission_refresh_postgres.py`` 也用它扫适配器，因此放在这里共享
+    一份——两处各写一份的话，其中一份迟早会退化成"只剥模块文档"的半吊子实现。
     """
 
-    tree = ast.parse(DUTY_SOURCE.read_text(encoding="utf-8"))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -75,6 +78,12 @@ def duty_code() -> str:
             if not body:
                 body.append(ast.Pass())
     return ast.unparse(tree)
+
+
+def duty_code() -> str:
+    """每日权限重算职责的代码正文（不含文档字符串与注释）。"""
+
+    return code_without_docstrings(DUTY_SOURCE)
 
 
 TODAY = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
@@ -445,6 +454,93 @@ class RosterFirstOrderingTest(unittest.TestCase):
 
         self.assertEqual(len(parts["audit"].records), 2, "同日同因只留一条，隔天再留一条")
 
+    def test_a_reason_that_comes_back_the_same_day_is_not_audited_twice(self) -> None:
+        """同一天里原因来回变（A→B→A）：每一种只留一条，回到 A 不重记。
+
+        去重水位记的是当天**已经记过哪些原因**，不是"最后一个原因"。只记最后一个的话，
+        这条路径上 A 会被记两次——而原因来回变正是它最可能发生的场景（花名册快照到了
+        又被换回旧的、银河批次过期又重导）。
+        """
+
+        clock = FixedClock(TODAY)
+        duty, parts = build_duty(identities=(identity(),), roster_captured_at=None, clock=clock)
+
+        duty.run_once()  # A：没有快照
+        parts["roster"]._captured_at = TODAY  # B：快照有了，但没有银河批次
+        parts["galaxy"]._snapshot = None
+        duty.run_once()
+        parts["roster"]._captured_at = None  # 回到 A
+        duty.run_once()
+
+        self.assertEqual(
+            [action for action, _ in parts["audit"].records],
+            [
+                "permission_refresh.skipped_roster_not_fresh",
+                "permission_refresh.skipped_no_galaxy_batch",
+            ],
+            "A→B→A 只留 A、B 各一条",
+        )
+
+
+class UtcDayBoundaryTest(unittest.TestCase):
+    """日界一律按 UTC 判定，不按时钟自身的时区。"""
+
+    #: 本地 ``+08:00`` 的 ``00:30``，其 UTC 时刻是**前一天** 16:30。
+    LOCAL_MIDNIGHT = datetime(2026, 8, 17, 0, 30, tzinfo=timezone(timedelta(hours=8)))
+
+    def test_a_snapshot_from_the_same_utc_day_runs_even_across_the_local_midnight(self) -> None:
+        """快照取于 08-16 20:00Z，与时钟的 UTC 日期（08-16）同一天 → 照跑。
+
+        按时钟自身时区判会把"今天"算成 08-17，于是这份快照被误判成昨天的，整天不重算。
+        """
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            roster_captured_at=datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
+            clock=FixedClock(self.LOCAL_MIDNIGHT),
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNotNone(report)
+        self.assertEqual(report.enqueued, 1)
+        self.assertEqual(duty.completed_on, date(2026, 8, 16), "水位是 UTC 日期")
+
+    def test_a_snapshot_from_the_next_utc_day_does_not_run(self) -> None:
+        """快照取于 08-17 01:00Z：本地日历上是"今天"，UTC 日历上是明天 → 不跑。
+
+        与上一条互为镜像：按时钟自身时区判，这两条的结论会正好反过来。
+        """
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            roster_captured_at=datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc),
+            clock=FixedClock(self.LOCAL_MIDNIGHT),
+        )
+
+        self.assertIsNone(duty.run_once())
+
+        self.assertEqual(parts["decisions"].calls, [])
+        fields = parts["audit"].fields_for("permission_refresh.skipped_roster_not_fresh")[0]
+        self.assertEqual(fields["reason"], SKIP_STALE_SNAPSHOT)
+        self.assertEqual(fields["report_date"], "2026-08-16", "审计里的日期同一把尺子")
+        self.assertEqual(fields["snapshot_date"], "2026-08-17")
+
+    def test_a_naive_clock_fails_fast(self) -> None:
+        """没有时区的时钟**直接失败**，不按本地时区静默解读。
+
+        整轮异常按 duty 惯例上抛，由 :class:`SchedulerLoop` 隔离并在下一轮重试——
+        比"在跨时区部署上悄悄算错日界"响亮得多。
+        """
+
+        duty, parts = build_duty(
+            identities=(identity(),), clock=FixedClock(datetime(2026, 8, 17, 3, 0))
+        )
+
+        with self.assertRaises(ValueError):
+            duty.run_once()
+        self.assertEqual(parts["decisions"].calls, [])
+
     def test_there_is_no_bypass_switch_for_the_ordering_gate(self) -> None:
         """否定断言：判据不得有旁路开关。
 
@@ -805,6 +901,9 @@ class WatermarkAndStopTest(unittest.TestCase):
 
         self.assertTrue(report.interrupted)
         self.assertEqual(len(decisions.calls), 1, "停止后不再为后面的人排意图")
+        self.assertEqual(
+            report.examined, 1, "被停止挡在外面的人从来没有被看过一眼，不算已检查"
+        )
         self.assertIsNone(duty.completed_on, "没走完的一轮不置水位")
         self.assertIn("permission_refresh.interrupted", parts["audit"].actions())
         self.assertNotIn("permission_refresh.completed", parts["audit"].actions())
