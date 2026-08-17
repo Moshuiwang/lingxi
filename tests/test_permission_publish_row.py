@@ -19,11 +19,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from lingxi.core.permission.publish_row import (
-    PERMISSIONS_FORMAT_VERSION,
+    ALL_COMPANIES_KEY,
     PUBLISHED_FIELD_NAMES,
     REASON_NO_COMPANY_SCOPE,
     REASON_NO_ROLES,
     REASON_NO_SUPPORTED_FUNCTION,
+    STATUS_APPROVED,
     PermissionAggregate,
     PublishRow,
     aggregate_permission,
@@ -126,6 +127,21 @@ class AggregateTest(unittest.TestCase):
         self.assertFalse(aggregate.granted)
         self.assertEqual(aggregate.reason, REASON_NO_COMPANY_SCOPE)
 
+    def test_scope_ordering_is_stable_regardless_of_input_order(self) -> None:
+        """聚合结果自己的次序合同：公司与职能都排过序，与输入次序无关。
+
+        序列化那一层的 ``sort_keys=True`` 只管 JSON **键**（公司），管不到列表**值**
+        （职能）；而 `audit_facts` 与 `PermissionAggregate.companies` 也会被上层直接
+        读。因此两条次序都要在这里各自成立，不能靠下游那一次排序兜底。
+        """
+
+        forward = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        backward = _aggregate(roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11"))
+        self.assertEqual(forward.companies, ("1011", "1012"))
+        self.assertEqual(backward.companies, ("1011", "1012"))
+        self.assertEqual(forward.functions, ("OTT", "商务"))
+        self.assertEqual(backward.functions, ("OTT", "商务"))
+
     def test_unresolved_country_key_narrows_instead_of_denying(self) -> None:
         """陈旧外键只让那一个国家掉出范围，不否决整个用户（方向安全：少给不多给）。"""
 
@@ -157,18 +173,49 @@ class AggregateTest(unittest.TestCase):
 
 
 class SerializationTest(unittest.TestCase):
-    def test_permissions_text_is_stable_and_sorted(self) -> None:
+    """格式依据：2026-08-17 编排者对正式表的全表只读回源核对（26/26 行）。
+
+    形状是 `{公司ID: [职能, …]}`，通配用 `"*"` 键，无版本字段——这是**消费方现行的**
+    约定，不是我们自拟的。
+    """
+
+    def test_permissions_maps_company_id_to_function_list(self) -> None:
         aggregate = _aggregate(roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11"))
         text = serialize_permissions(aggregate)
-        self.assertEqual(
-            text,
-            '{"all_companies":false,"companies":["1011","1012"],'
-            '"functions":["OTT","商务"],"v":%d}' % PERMISSIONS_FORMAT_VERSION,
-        )
-        # 恒等：同一份权限重复序列化必须逐字节相同，否则一次无变化的重发会被读回比对
-        # 判成不一致。
-        self.assertEqual(text, serialize_permissions(aggregate))
+        self.assertEqual(text, '{"1011":["OTT","商务"],"1012":["OTT","商务"]}')
         self.assertNotIn("\n", text)
+        # 消费方没有版本字段约定：塞一个它不认识的键，最好被忽略，最坏解析失败。
+        self.assertNotIn('"v"', text)
+        self.assertNotIn("all_companies", text)
+
+    def test_wildcard_scope_writes_a_single_star_key(self) -> None:
+        aggregate = _aggregate(countries=_countries("0"))
+        self.assertTrue(aggregate.all_companies)
+        self.assertEqual(serialize_permissions(aggregate), '{"*":["商务"]}')
+        self.assertEqual(ALL_COMPANIES_KEY, "*")
+
+    def test_serialization_is_byte_identical_regardless_of_input_order(self) -> None:
+        """恒等序列化：读回按字符串比对的前提。
+
+        两个聚合来自**次序不同**的同一份授权；公司键与职能列表都必须排到同一串字节，
+        否则一次没有任何变化的重发会被读回比对判成不一致。
+        """
+
+        forward = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        reversed_input = _aggregate(
+            roles=_roles("A运营（OTT）", "A商务"), countries=_countries("12", "11")
+        )
+        self.assertEqual(serialize_permissions(forward), serialize_permissions(reversed_input))
+        self.assertEqual(serialize_permissions(forward), serialize_permissions(forward))
+
+    def test_company_keys_are_sorted(self) -> None:
+        rows = [
+            {"country_key": "21", "name": "A", "name_cn": "甲", "boss_company_id": "9"},
+            {"country_key": "22", "name": "B", "name_cn": "乙", "boss_company_id": "10"},
+        ]
+        aggregate = _aggregate(countries=_countries("21", "22"), country_rows=rows)
+        # 字符串序（"10" < "9"）——重点是**恒定**，不是数值大小。
+        self.assertEqual(serialize_permissions(aggregate), '{"10":["商务"],"9":["商务"]}')
 
     def test_denied_aggregate_cannot_be_serialized(self) -> None:
         with self.assertRaises(ValueError):
@@ -196,6 +243,11 @@ class PublishRowTest(unittest.TestCase):
         row = self._row()
         self.assertEqual(row.record_key, FAKE_EMAIL)
         self.assertEqual(row.email, FAKE_EMAIL)
+
+    def test_status_matches_the_value_every_existing_row_uses(self) -> None:
+        # 既有 26 行全是 approved（2026-08-17 全表回源核对）；这一列的取值域由消费方定义。
+        self.assertEqual(STATUS_APPROVED, "approved")
+        self.assertEqual(self._row().status, "approved")
 
     def test_published_fields_never_include_token_cipher(self) -> None:
         """`V-权限-11` 的正面：字段集里没有 ``token_cipher``，更新集因此不会清空它。"""

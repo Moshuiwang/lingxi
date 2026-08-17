@@ -41,7 +41,7 @@ from lingxi.core.permission.publish_row import PUBLISHED_FIELD_NAMES, PublishRow
 FAKE_EMAIL = "jiaming.jia@example.invalid"
 OTHER_EMAIL = "yiming.yi@example.invalid"
 FAKE_NAME = "化名甲"
-PERMISSIONS = '{"all_companies":false,"companies":["1011"],"functions":["商务"],"v":1}'
+PERMISSIONS = '{"1011":["商务"]}'
 UPDATED_AT = "2026-08-17T03:00:00Z"
 
 
@@ -51,7 +51,7 @@ def _row(email: str = FAKE_EMAIL, *, permissions: str = PERMISSIONS) -> PublishR
         email=email,
         name=FAKE_NAME,
         permissions=permissions,
-        status="active",
+        status="approved",
         updated_at=UPDATED_AT,
     )
 
@@ -157,7 +157,7 @@ class PublishClaimTest(unittest.TestCase):
                         "email": FAKE_EMAIL,
                         "name": "旧名",
                         "permissions": "{}",
-                        "status": "active",
+                        "status": "approved",
                         "updated_at": "2026-01-01T00:00:00Z",
                         "token_cipher": "业务侧写入的密文",
                     },
@@ -310,8 +310,8 @@ class PublishClaimTest(unittest.TestCase):
                         "record_key": OTHER_EMAIL,
                         "email": OTHER_EMAIL,
                         "name": "化名乙",
-                        "permissions": '{"v":1}',
-                        "status": "active",
+                        "permissions": '{"2001":["运营"]}',
+                        "status": "approved",
                         "updated_at": "2026-01-01T00:00:00Z",
                     },
                 }

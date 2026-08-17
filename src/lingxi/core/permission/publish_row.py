@@ -30,32 +30,53 @@ role_function`，公司范围解释在 :mod:`lingxi.core.permission.galaxy_scope
 表在我们第一次写入之前就已经有 26 行业务侧写入的记录。用内部 ULID 作键，等于第一次发布
 就为这 26 个人各建出**第二行**权限——同一个人两行权限正是「不得重复扩大权限」要挡的形状。
 
-**同一个人只允许一行**由发布执行器守（见 :mod:`lingxi.core.permission.publish` 的
+**这条口径已经回源核对成立**：2026-08-17 编排者对正式表做过一次全表只读核对，26/26 行的
+``record_key`` 都等于该行 ``email`` 的规范化值。因此 upsert 键与业务侧既有行同口径，
+正常情况下命中即更新，不会为既有的人新建第二行。
+
+**同一个人只允许一行**仍由发布执行器守（见 :mod:`lingxi.core.permission.publish` 的
 ``CONFLICT`` 分支）：写入前按 ``record_key`` **或** ``email`` 查找，命中一行且
 ``record_key`` 一致才更新；命中的行 ``record_key`` 口径不同、或命中多行，一律失败关闭，
-既不更新也不新建。业务侧既有 26 行用的是什么 ``record_key`` 口径**尚未回源核对**，因此
-首次真实发布时它们会全部走 CONFLICT——这是刻意的：让一个未知的外部约定在受控窗口里响亮
-暴露，比静默写出重复行安全。
+既不更新也不新建。这道防线不因为口径已核对而放松——核对是某一时刻的观察，而这条守则
+要挡的是**将来**业务侧换键口径、或同一个人被写出两行的情形。
 
-### ``permissions``：一行紧凑 JSON
+### ``permissions``：一行紧凑 JSON，形状**对齐既有行的观察值**
 
 ```text
-{"all_companies":false,"companies":["1001","1002"],"functions":["OTT","运营"],"v":1}
+{"1011":["OTT","商务"],"1012":["OTT","商务"]}          ← 显式公司范围
+{"*":["OTT","商务"]}                                    ← 「全非」通配
 ```
 
-- ``json.dumps`` + ``sort_keys=True`` + 无空格分隔符：同一份权限**永远序列化成同一串
-  字节**。发布是「写入后逐字段读回比对」，不确定的序列化会让一次没有任何变化的重发被
-  判成不一致；``ensure_ascii=False`` 让职能标签在表里对人可读。
-- ``companies`` 是 ``sys_country.boss_company_id``（产品负责人 2026-08-05 决策 3：
-  向问数 MCP 申请权限用它），去重后按字符串排序；``name_cn`` 是**展示用**字段，不进
-  发布行——发布表是给 MCP 读的机器契约，不是给人看的展示层。
-- ``functions`` 是配置文件（``lingxi/config/galaxy_role_function_map.toml``）映射出的
-  Lingxi 职能标签，去重排序；未映射角色不产生职能（`V-银河-13` 的口径）。
-- ``all_companies`` 是「全非」通配的**事实标记**，与已展开的 ``companies`` 同时给出，
-  不用它代替列表：消费方无需知道我们的展开规则，但需要知道这是通配授权。
-- ``v`` 是格式版本。业务侧既有 26 行的 ``permissions`` 实际取值格式**尚未回源核对**
-  （G-BIT 只取了 schema，没有回显业务数据值）；对齐时只改本模块的
-  :func:`serialize_permissions` 与它的用例，不改其它任何地方。
+**格式依据：2026-08-17 编排者对正式表的全表只读回源核对（26/26 行一致）。** 早先本
+模块的定稿是自拟的 ``{"all_companies":…,"companies":[…],"functions":[…],"v":1}``，回源
+核对推翻了它——这张表是**现行问数 MCP 正在消费的权限源**，发布必须写消费方看得懂的
+形状，不能自定。观察到的事实：
+
+- ``permissions`` 是一个 JSON 对象，**键是公司 ID 字符串**（``"2"`` / ``"19"`` 一类）
+  或通配键 ``"*"``，**值是字符串列表**（30 个采样值全部是 ``list[str]``）；
+- 没有版本字段。因此本实现**不再写 ``v``**：往消费方的契约里塞一个它不认识的键，
+  最好的结果是被忽略，最坏的结果是解析失败。
+
+由此定稿：
+
+- **键**是 ``sys_country.boss_company_id``（产品负责人 2026-08-05 决策 3：向问数 MCP
+  申请权限用它）；持有「全非」通配时只写一个 ``"*"`` 键，不展开成几十个重复条目——
+  展开规则是我们这一侧的解释，消费方已经有它自己的通配约定。``name_cn`` 是**展示用**
+  字段，不进发布行：发布表是给 MCP 读的机器契约，不是给人看的展示层。
+- **值**是该公司下的 Lingxi 职能标签列表，来自角色名映射配置
+  （``lingxi/config/galaxy_role_function_map.toml``），去重后按字符串排序；未映射角色
+  不产生职能（`V-银河-13` 的口径）。银河的授权模型里职能是**用户级**的（角色不按国家
+  区分），因此每个公司键下是同一份职能列表。
+- ``json.dumps`` + ``sort_keys=True`` + 无空格分隔符 + 上游已排序的公司与职能：同一份
+  权限**永远序列化成同一串字节**。发布是「写入后逐字段读回比对」，不确定的序列化会让
+  一次没有任何变化的重发被判成不一致；``ensure_ascii=False`` 让职能标签在表里对人可读。
+
+**仍未确认的那一格**：「公司 ID → 职能列表」这层**语义**是从 30 个采样值的形状推断的
+（值是字符串列表，内容大概率是该公司下的职能/范围）。形状已经对齐观察值，**语义要等
+G-155（[#155](https://github.com/Moshuiwang/lingxi/issues/155) 的 MCP 环境事实）确认后
+才能真实发布**。真实写入本就留 L4a 受控窗口，这条不新增阻塞，只是把格式风险从「完全
+未知」收敛成「已对齐观察值、语义待终确认」。要改时仍然只改
+:func:`serialize_permissions` 与它的用例，不改其它任何地方。
 
 ### ``token_cipher``：**永不写入**
 
@@ -65,11 +86,19 @@ role_function`，公司范围解释在 :mod:`lingxi.core.permission.galaxy_scope
 **不产生、不读取、不写入** ``token_cipher``。:data:`PUBLISHED_FIELD_NAMES` 里刻意
 没有它——更新既有行时它不在更新集里，因此不会被清空，也不会被我们的值覆盖。
 
+### ``status``：``approved``
+
+既有 26 行的 ``status`` **全部是** ``approved``（同一次回源核对）。此前本模块自拟的
+``active`` 会在同一列里造出第二种取值，而这一列的取值域由消费方定义、不由我们定义。
+
 ### ``updated_at``：**权限决定的时刻**，不是发布尝试的时刻
 
-它随发布意图一起冻结在 outbox 的 payload 里，重试写入的永远是同一串文本。取发布时刻会
-让每次重试都改变待写内容，于是「读回与预期一致」永远只能证明最后一次写入自洽，证明不了
-写进去的是当初决定要发布的那一版。
+既有行是 ISO 风格时间串（含 ``-`` 与 ``:``），与 :func:`format_updated_at` 产出的
+``2026-08-17T03:00:00Z`` 同族。
+
+取值取的是**权限决定**的时刻：它随发布意图一起冻结在 outbox 的 payload 里，重试写入的
+永远是同一串文本。取发布时刻会让每次重试都改变待写内容，于是「读回与预期一致」永远只能
+证明最后一次写入自洽，证明不了写进去的是当初决定要发布的那一版。
 """
 
 from __future__ import annotations
@@ -90,12 +119,14 @@ from lingxi.core.permission.role_function import resolve_role_functions
 
 _UTC = timezone.utc
 
-#: ``permissions`` 文本的格式版本。改变字段含义时必须递增，消费方据此分辨。
-PERMISSIONS_FORMAT_VERSION = 1
+#: 「全非」通配在 ``permissions`` 里的键。既有行用它表示「所有公司」，因此我们不把
+#: 通配展开成几十个重复条目——展开规则是我们这一侧的解释，消费方已有自己的约定。
+ALL_COMPANIES_KEY = "*"
 
-#: 发布行「有权限」时写入的 ``status`` 值。停用 / 收回的发布语义属 S-C-03/04，
-#: 本 Story 只发布**有效**权限，因此这里只有一个取值，不预留一个没人写的枚举。
-STATUS_ACTIVE = "active"
+#: 发布行「有权限」时写入的 ``status`` 值。取 ``approved`` 是因为既有 26 行全是它
+#: （2026-08-17 全表回源核对）；这一列的取值域由消费方定义，不由我们定义。停用 / 收回的
+#: 发布语义属 S-C-03/04，本 Story 只发布**有效**权限，因此这里只有一个取值。
+STATUS_APPROVED = "approved"
 
 #: 本实现写入的字段，**顺序即比对与审计的输出顺序**。``token_cipher`` 不在其中，
 #: 理由见模块文档；它不是遗漏，改动它需要同时改产品合同。
@@ -223,8 +254,12 @@ def aggregate_permission(
         return _denied(REASON_NO_ROLES)
 
     resolved_roles = resolve_role_functions(role_names, role_function_map)
+    # 去重用 `dict.fromkeys`（保留首次出现次序）再显式排序，而不是 `sorted(set(...))`：
+    # 集合的迭代次序随 `PYTHONHASHSEED` 变化，一旦哪天有人把外层的 `sorted` 拿掉，
+    # 输出会变成"每次进程重启都不一样"，而发布靠的正是**恒等序列化**。这样写让排序是
+    # 一个能被单独看见、也能被单独改坏的动作。
     functions = tuple(
-        sorted({item.function for item in resolved_roles if item.function is not None})
+        sorted(dict.fromkeys(item.function for item in resolved_roles if item.function is not None))
     )
     unmapped = sum(1 for item in resolved_roles if not item.mapped)
     if not functions:
@@ -237,7 +272,13 @@ def aggregate_permission(
     country_keys = country_keys_for_user(account, datacountry_rows)
     scope = resolve_company_scope(country_keys, country_rows)
     company_ids = tuple(
-        sorted({_text(item.boss_company_id) for item in scope.countries if _text(item.boss_company_id)})
+        sorted(
+            dict.fromkeys(
+                _text(item.boss_company_id)
+                for item in scope.countries
+                if _text(item.boss_company_id)
+            )
+        )
     )
     missing_company_id = sum(1 for item in scope.countries if not _text(item.boss_company_id))
     if not company_ids:
@@ -265,27 +306,37 @@ def aggregate_permission(
 def serialize_permissions(aggregate: PermissionAggregate) -> str:
     """把有效权限序列化成 ``permissions`` 单元格的**唯一**文本形态。
 
-    全仓库只有这一处实现，理由见模块文档：业务侧既有行的实际格式尚未回源核对，对齐
-    时只改这一个函数与它的用例，不必去追第二处拼串的地方。
+    形状是 ``{公司ID: [职能, …]}``，持有「全非」通配时只写一个
+    :data:`ALL_COMPANIES_KEY` 键。依据是 2026-08-17 编排者对正式表的全表回源核对
+    （26/26 行），不是我们自拟的约定——这张表是现行问数 MCP 正在消费的权限源，详见模块
+    文档。全仓库只有这一处实现：「公司 ID → 职能列表」的语义还要等 G-155 终确认，届时
+    只改这一个函数与它的用例，不必去追第二处拼串的地方。
 
-    ``sort_keys=True`` + ``separators=(",", ":")`` 让同一份权限恒等地序列化成同一串
-    文本——「写入后逐字段读回按字符串比对」的前提。
+    恒等序列化（「写入后逐字段读回按字符串比对」的前提）靠两层，**都必须在**：
+
+    - :func:`aggregate_permission` 已经把公司与职能各自排过序。职能是 JSON 的**列表值**，
+      ``json.dumps`` 不会替它排序，只有这一层能保证它恒定；
+    - ``sort_keys=True`` + ``separators=(",", ":")``。它对公司键是第二道防线（上游已经
+      排过），刻意保留：这份文档将来若改成从别处取键，不会因为少了一次排序就变成
+      「每次进程重启序列化结果都不一样」。
     """
 
     if not aggregate.granted:
         # 没有权限就不该有发布行；调用方走 fail-closed 出口，不发布空权限。
         raise ValueError("无可用权限的聚合结果不得序列化成发布内容")
-    document = {
-        "v": PERMISSIONS_FORMAT_VERSION,
-        "all_companies": aggregate.all_companies,
-        "companies": list(aggregate.companies),
-        "functions": list(aggregate.functions),
-    }
+    functions = list(aggregate.functions)
+    if aggregate.all_companies:
+        document: dict[str, list[str]] = {ALL_COMPANIES_KEY: functions}
+    else:
+        # 银河的授权模型里职能是**用户级**的（角色不按国家区分），因此每个公司键下是
+        # 同一份职能列表。这不是偷懒展开：按公司细分职能需要银河提供按国家的角色授权，
+        # 而它没有——凭空细分等于伪造一份我们并不知道的范围。
+        document = {company: list(functions) for company in aggregate.companies}
     return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def format_updated_at(moment: datetime) -> str:
-    """``updated_at`` 单元格的文本：秒精度的 UTC ISO-8601。
+    """``updated_at`` 单元格的文本：秒精度的 UTC ISO-8601（既有行同为 ISO 风格时间串）。
 
     秒精度而不是微秒：这一列是给人和消费方看的时间，多出来的六位数字不带信息，
     却让「同一次决定重试写入是否产生同一串文本」多一个出错面。
@@ -391,7 +442,7 @@ def build_publish_row(
         email=normalized,
         name=name,
         permissions=serialize_permissions(aggregate),
-        status=STATUS_ACTIVE,
+        status=STATUS_APPROVED,
         updated_at=format_updated_at(decided_at),
     )
 

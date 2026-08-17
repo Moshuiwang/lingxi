@@ -48,13 +48,13 @@ EMAIL_A = "jiaming.jia@example.invalid"
 EMAIL_B = "yiming.yi@example.invalid"
 
 
-def _row(email: str = EMAIL_A, *, permissions: str = '{"companies":["1011"],"v":1}') -> PublishRow:
+def _row(email: str = EMAIL_A, *, permissions: str = '{"1011":["商务"]}') -> PublishRow:
     return PublishRow(
         record_key=email,
         email=email,
         name="化名甲",
         permissions=permissions,
-        status="active",
+        status="approved",
         updated_at="2026-08-17T03:00:00Z",
     )
 
@@ -191,7 +191,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         self.store.record_decision(user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW)
         second = self.store.record_decision(
             user_id=USER_A,
-            row=_row(permissions='{"companies":["1011","1012"],"v":1}'),
+            row=_row(permissions='{"1011":["商务"],"1012":["商务"]}'),
             reason="daily_refresh",
             decided_at=NOW,
         )
@@ -264,7 +264,7 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
         self.store.record_decision(
             user_id=USER_A,
-            row=_row(permissions='{"companies":["1012"],"v":1}'),
+            row=_row(permissions='{"1012":["商务"]}'),
             reason="x",
             decided_at=NOW,
         )
