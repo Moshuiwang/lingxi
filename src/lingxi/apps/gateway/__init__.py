@@ -81,9 +81,13 @@ class _LoggingAudit:
     后缀规则之外还有一个显式名单（独立审核 F5）：``message.unsupported_type``
     不以失败后缀结尾，但它是"用户发了消息却什么都没发生"的唯一入站侧证据
     （非文本消息被判不支持、不建任务）——r19 首轮误判正是这一类。名单只收
-    "用户得不到任何回应"的动作；有明确用户回复的拒绝分支（未开通、已停用、
-    群聊拒绝）不在此列，停机期间的 ``reply.skipped_while_stopping`` 属正常
-    停机路径，也不在此列。
+    **用户本应得到回应却什么都没发生**的动作。据此：未开通、已停用这类有明确
+    用户回复的拒绝分支不在此列；``event.rejected_non_private_chat`` 也不在此列，
+    但理由不同（PR #186 补审 P3-6）——群聊拒绝**不加表情、不回复、不入队**
+    （见上方 ``NonPrivateChatError`` 分支），这份静默是刻意的产品边界：机器人
+    不在群里暴露任何工作痕迹。既然"什么都不发生"就是这条分支承诺的结果，它就
+    不是诊断缺口，维持 ``INFO``。停机期间的 ``reply.skipped_while_stopping``
+    属正常停机路径，同样不在此列。
     """
 
     _EXTRA_WARNING_ACTIONS = frozenset({"message.unsupported_type"})

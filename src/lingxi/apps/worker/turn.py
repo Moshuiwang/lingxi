@@ -45,7 +45,7 @@ def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: s
     - ``withheld``：整段替换为 system prompt——整串命中覆盖全部正文、无业务内容
       幸存，``constrain_output`` 必然给出 ``withheld=True``；
     - ``masked``：固定幸存句 + 模型正文（如有）+ system prompt——幸存句不含任何
-      已知敏感模式，且配置期已拒绝"合成提示是幸存句子串"的形态（独立审核 F2/F3），
+      已知敏感模式，且配置期已双向拒绝"合成提示与幸存句/固定终态文案互为子串"的形态（独立审核 F2/F3 + 第一级补审 P2-3），
       因此**无论模型正文是什么**（哪怕整段都是可遮蔽的标记，例如模型恰好输出
       ``system prompt`` 字样），幸存句都保证命中区间之外有真实内容，必然
       ``blocked=True`` 且 ``withheld=False``。第一版实现依赖"模型正文有幸存内容"

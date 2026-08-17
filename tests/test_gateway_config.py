@@ -419,6 +419,18 @@ class LoggingAuditLevelTests(unittest.TestCase):
             _LoggingAudit().record("reply.sent")
         self.assertTrue(captured.output[0].startswith("INFO"))
 
+    def test_group_chat_rejection_stays_at_info(self) -> None:
+        """PR #186 补审 P3-6：群聊拒绝**不加表情、不回复、不入队**，用户侧确实
+        什么都不会发生；但这份静默是刻意的产品边界（机器人不在群里暴露工作痕迹），
+        是产品选择而不是诊断缺口，因此维持 INFO。WARNING 名单只收"用户本应得到
+        回应却什么都没发生"的动作。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
+            _LoggingAudit().record("event.rejected_non_private_chat", chat_type="group")
+        self.assertTrue(captured.output[0].startswith("INFO"))
+
 
 class EntryPointTests(unittest.TestCase):
     def test_main_refuses_an_empty_configuration(self) -> None:
