@@ -61,6 +61,10 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.credentials",
     "lingxi.core.identity.org_snapshot",
     "lingxi.core.identity.first_contact",
+    # Issue #89 写侧建档服务合同：判定层产出 + 花名册原值 → `app_user` 的注入口与
+    # 结果分类。生产调用方是 Epic D 的正式 OnboardingRunner，装配前它不在任何进程的
+    # import 闭包里，但它必须随制品发布——否则 runner 上线那天才发现 wheel 里没有它。
+    "lingxi.core.identity.provisioning",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
