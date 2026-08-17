@@ -513,5 +513,97 @@ class SingleTurnSessionTest(_StubSDK):
         self.assertEqual(self.calls["closed"], 0)
 
 
+class LocalInterruptCausalityTest(_StubSDK):
+    """#201：本进程发出的 ``interrupt()`` 必须留下**本地事实**。
+
+    上层只能靠这条事实区分"这一轮是被本地 ``/stop`` 打断的"与"SDK 自己 abort 了"
+    ——``terminal_reason=aborted_*`` 是 SDK 自报的，无人 stop 时也会出现，用"有人
+    stop 过 + SDK 自报 abort"反推因果会掩盖真实的 SDK 终止失败
+    （PR #198 一级独立审查 P1-2 裁定）。
+    """
+
+    def test_the_interrupt_fact_is_recorded_before_the_call_can_return(self) -> None:
+        """SDK 抢在 ``interrupt()`` 返回之前就收完这一轮时，事实仍然成立。
+
+        这是 #201 的竞态形状：``AgentSessionInterrupted`` 不会抛出，回合看起来
+        完全就是"SDK 自己 abort 掉了"。把回调挪到 ``await result`` 之后（或删掉
+        它）必须让本用例变红。
+        """
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_sent = asyncio.Event()
+
+        class RacingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def interrupt(self):
+                # 中断请求已经送到 SDK，但这次调用永远不返回——用一个确定的
+                # 同步点复现竞态，不靠事件循环的调度巧合。
+                interrupt_sent.set()
+                await asyncio.sleep(3600)
+
+            def receive_response(self):
+                async def _gen():
+                    await interrupt_sent.wait()
+                    yield StubResultMessage(
+                        subtype="error_during_execution",
+                        is_error=True,
+                        terminal_reason="aborted_streaming",
+                    )
+
+                return _gen()
+
+        module.ClaudeSDKClient = RacingClient
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+        seen: list = []
+        marks: list = []
+
+        async def scenario() -> None:
+            stop_event = asyncio.Event()
+            stop_event.set()
+            await run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=seen.append,
+                timeout_seconds=30,
+                stop_event=stop_event,
+                on_interrupt_requested=lambda: marks.append("interrupt"),
+            )
+
+        asyncio.run(scenario())
+
+        self.assertEqual(marks, ["interrupt"])
+        self.assertEqual(seen[-1]["terminal_reason"], "aborted_streaming")
+
+    def test_without_a_stop_no_local_interrupt_fact_is_produced(self) -> None:
+        """无人 stop 时 SDK 自行 abort：本地事实不得凭空出现（回归锁）。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [
+            StubResultMessage(
+                subtype="error_during_execution", is_error=True, terminal_reason="aborted_streaming"
+            )
+        ]
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+        marks: list = []
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=lambda event: None,
+                timeout_seconds=30,
+                on_interrupt_requested=lambda: marks.append("interrupt"),
+            )
+        )
+
+        self.assertEqual(marks, [])
+
+
 if __name__ == "__main__":
     unittest.main()
