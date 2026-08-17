@@ -1027,7 +1027,18 @@ class DutyRegistrationTest(unittest.TestCase):
     S-B-04 起前置从两个变成四个（群 ID、Base ``app_token``、``table_id``、读取令牌
     供给），且**全部由配置驱动**——此前"花名册读取未接线"是装配里写死的 ``None``，
     一个把配置全填对的部署也永远注册不上这个职责。
+
+    **「恰 1 条」的范围是花名册那一条**（#156 / S-C-03a 起）：同一个 ``build_loop`` 现在
+    还会为每日权限重算职责留一条自己的未注册审计（缺 MCP 令牌主密钥）。断言因此按
+    ``roster_audit.`` 前缀取本职责的审计——`V-花名册-29` 要挡的是"一个什么都没配的部署
+    为**花名册**刷出四条审计"，不是"整个进程只许有一条审计"。别的职责的留痕由它自己的
+    用例（``tests/test_permission_refresh_duty.py``）钉住。
     """
+
+    def _roster_records(self, audit: "RecordingAudit") -> list[tuple[str, dict]]:
+        """只取花名册审计日报职责留下的那些审计行。"""
+
+        return [record for record in audit.records if record[0].startswith("roster_audit.")]
 
     def _config(self, **extra: str) -> SchedulerConfig:
         import tempfile
@@ -1053,8 +1064,9 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(
             [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
         )
-        self.assertEqual(len(audit.records), 1, "缺群 ID 时审计恰 1 条")
-        action, fields = audit.records[0]
+        roster_records = self._roster_records(audit)
+        self.assertEqual(len(roster_records), 1, "缺群 ID 时花名册职责的审计恰 1 条")
+        action, fields = roster_records[0]
         self.assertEqual(action, "roster_audit.duty_not_registered")
         self.assertEqual(fields["variable"], "LINGXI_ADMIN_GROUP_CHAT_ID")
         self.assertNotIn("value", fields, "审计里不得回显变量的值")
@@ -1081,8 +1093,9 @@ class DutyRegistrationTest(unittest.TestCase):
                 self.assertEqual(
                     [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
                 )
-                self.assertEqual(len(audit.records), 1, "前置缺项时审计恰 1 条")
-                action, fields = audit.records[0]
+                roster_records = self._roster_records(audit)
+                self.assertEqual(len(roster_records), 1, "前置缺项时花名册职责的审计恰 1 条")
+                action, fields = roster_records[0]
                 self.assertEqual(action, "roster_audit.duty_not_registered")
                 self.assertEqual(fields["reason"], "missing_environment_variable")
                 self.assertEqual(fields["variable"], expected)
@@ -1109,8 +1122,9 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(
             [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
         )
-        self.assertEqual([action for action, _ in audit.records], ["roster_audit.duty_not_registered"])
-        self.assertEqual(audit.records[0][1]["reason"], "roster_access_token_unwired")
+        roster_records = self._roster_records(audit)
+        self.assertEqual([action for action, _ in roster_records], ["roster_audit.duty_not_registered"])
+        self.assertEqual(roster_records[0][1]["reason"], "roster_access_token_unwired")
 
     def test_with_every_prerequisite_the_duty_is_registered_by_the_existing_entry_point(self) -> None:
         """"谁会调用它"的落点：日报职责由**已存在**的 `lingxi-scheduler` 进程装配。
@@ -1137,7 +1151,7 @@ class DutyRegistrationTest(unittest.TestCase):
             [duty.name for duty in loop.duties],
             ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
         )
-        self.assertEqual(audit.records, [], "前置齐备时不该有『未注册』审计")
+        self.assertEqual(self._roster_records(audit), [], "前置齐备时不该有『未注册』审计")
         self.assertEqual(token_calls, [], "装配阶段不得取令牌，更不得发请求")
         # 一个停止标志贯穿全部职责。
         loop.request_stop()
