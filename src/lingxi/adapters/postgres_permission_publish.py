@@ -1,0 +1,480 @@
+"""权限决定与发布意图的 PostgreSQL 存取（Issue #156 / S-C-01）。
+
+表结构与逐条理由以迁移 ``0064_permission_publish_outbox`` 为准，本模块不复述。这里只
+落实三件在**代码里**才成立的事：
+
+1. **同事务**：一次权限决定把 ``app_user`` 的权限版本推进与 ``publish_outbox`` 的发布
+   意图写在**同一个事务**里。回滚之后库里既没有新版本，也没有孤立的发布意图
+   （`V-权限-01`）。:meth:`PostgresPermissionPublishStore.enqueue_publish` 因此
+   **必须接收调用方的事务对象**——接口设计[「八、领域服务接口」]
+   (../../../docs/技术设计/接口设计.md#八领域服务接口)把这条写成了签名约束，不靠代码
+   评审保证：本方法没有任何自己建连接的路径，想绕过同事务在类型上就写不出来。
+2. **认领与单飞**：``FOR UPDATE SKIP LOCKED`` 让并发消费者各取各的；额外的「该用户没有
+   另一条 ``publishing``」条件让**同一用户同时只有一条发布在途**，否则 v1 的写入落后到
+   v2 之后会把旧权限盖回去。
+3. **到期擦除**：``payload`` 里有邮箱与姓名，九十天上限由 :meth:`redact_expired_payloads`
+   把它擦成 ``'{}'`` 落实（迁移文件头部有为什么不进 ``0054`` 受限清理函数的取舍）。
+
+**没有新增 ``app_user.publish_state`` 列**：数据库设计蓝本里有这一列，当前迁移链没有
+建它。发布进度已经完整地由 ``publish_outbox.status`` 承载，再加一列等于制造第二个真相
+来源，而两个真相来源迟早会分叉（这正是「五个独立状态字段」那条设计原则要避免的反面）。
+需要它的时候由承接 ``app_user`` 状态机的 Story 一并落地。
+
+**不写 ``permission_record_id``**：`V-开通-01` 要求匹配确认前它为 ``NULL``、不先占位
+再回填；发布成功后写进去的应当是「数据库权限记录」而不是外部表格的记录标识——后者已经
+落在 ``publish_outbox.external_record_id``。这一列在本 Story 里一次都不出现在语句中。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Mapping, Protocol
+
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.core.ids import new_id
+from lingxi.core.permission.publish import (
+    ClaimedPublish,
+    PublishAttempt,
+    PublishOutcome,
+)
+from lingxi.core.permission.publish_row import PUBLISHED_FIELD_NAMES, PublishRow
+
+logger = logging.getLogger(__name__)
+
+_UTC = timezone.utc
+
+#: 一条 ``publishing`` 卡多久之后可以放回 ``pending``。取值远大于一次外部写读回的耗时，
+#: 又远小于一天：太短会让一次慢调用被重复执行（安全但浪费配额），太长会让一次进程崩溃
+#: 把该用户的后续发布堵到第二天。
+DEFAULT_RECLAIM_AFTER = timedelta(minutes=15)
+
+
+class DecisionOutcome(Enum):
+    """一次权限决定对发布链路的影响。两态，不合并。"""
+
+    # 权限内容与上一条有效意图不同（或此前没有意图）：推进版本并排出一条新的发布意图。
+    ENQUEUED = "enqueued"
+    # 权限内容与上一条**仍然有效**的意图逐字段相同：只刷新检查时间，不推进版本、
+    # 不排新意图。没有这一分支，每天一轮的权限刷新会天天写一次外部表格。
+    UNCHANGED = "unchanged"
+
+
+@dataclass(frozen=True)
+class PermissionDecision:
+    """一次权限决定落库之后的结果。"""
+
+    outcome: DecisionOutcome
+    user_id: str
+    permission_version: int
+    outbox_id: str | None = None
+
+    @property
+    def enqueued(self) -> bool:
+        return self.outcome is DecisionOutcome.ENQUEUED
+
+
+@dataclass(frozen=True)
+class StoredIntent:
+    """回读出来的一条发布意图（供运维排查与用例断言）。"""
+
+    outbox_id: str
+    user_id: str
+    permission_version: int
+    reason: str
+    payload: Mapping[str, Any]
+    status: str
+    attempts: int
+    last_outcome: str | None
+    last_error: str | None
+    external_record_id: str | None
+    published_at: datetime | None
+
+
+class _Transaction(Protocol):
+    """调用方已经开启事务的数据库连接。
+
+    只要求一个 ``cursor()``：本模块不 ``commit``、不 ``rollback``、不建连接——事务边界
+    完全由调用方掌握，这正是「审计与状态变更同事务」这条合同在类型上的落点。
+    """
+
+    def cursor(self) -> Any: ...
+
+
+class PublishClaimLost(RuntimeError):
+    """记账时那条意图已经不在 ``publishing``（被回收或被人改过）。
+
+    不静默吞掉：外部表格**可能已经写过**，而库里的状态没跟上。抛出来让调用方留痕并
+    停手；那条意图会被重新认领并重发一次，重发安全（先查后写，收敛到同一行）。
+    """
+
+
+class PostgresPermissionPublishStore:
+    """发布意图 outbox 的读写。构造时不连接数据库，每次调用自带连接（adapters 既有惯例）。"""
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    # ------------------------------------------------------------------
+    # 写侧：权限决定与发布意图同事务
+    # ------------------------------------------------------------------
+
+    def record_decision(
+        self, *, user_id: str, row: PublishRow, reason: str, decided_at: datetime | None = None
+    ) -> PermissionDecision:
+        """把一次权限决定与它的发布意图写进**同一个事务**。
+
+        次序是刻意的：
+
+        1. ``SELECT ... FOR UPDATE`` 锁住这一行 ``app_user``。同一用户的两次并发决定
+           因此串行化——少了这把锁，两次决定会读到同一个旧版本号、各自 +1，于是两条
+           意图拿到同一个 ``permission_version``，被 ``UNIQUE`` 约束拒掉一条（更糟的
+           是被拒的那条可能是新的那一份）。
+        2. 取该用户**最近一条**发布意图，逐字段比对内容（不含 ``updated_at``）。相同
+           且那条意图仍然有效（``pending``/``publishing``/``published``）时判
+           ``UNCHANGED``：只刷新 ``permission_checked_at``，不推进版本、不排新意图。
+           相同但那条意图已经 ``failed``/``superseded`` 时**照常排新意图**——内容没变
+           不等于已经发布成功，把它压成"无变化"会让一次失败的发布永远没人再试。
+        3. 推进 ``app_user.permission_version`` 并插入意图。
+
+        ``decided_at`` 只用于 ``permission_checked_at``；发布行里的时间戳已经在
+        ``row.updated_at`` 里冻结好了（见 ``core/permission/publish_row.py``）。
+        """
+
+        if not isinstance(row, PublishRow):
+            raise TypeError("发布行必须是 PublishRow：字段集与文本形态由它保证")
+        moment = decided_at or datetime.now(_UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("权限决定时间必须带时区")
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT permission_version FROM app_user WHERE id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    current = cursor.fetchone()
+                    if current is None:
+                        raise LookupError("权限决定的目标用户不存在")
+                    version = int(current[0])
+
+                    cursor.execute(
+                        """SELECT id, payload, status
+                             FROM publish_outbox
+                            WHERE user_id = %s
+                            ORDER BY permission_version DESC
+                            LIMIT 1""",
+                        (user_id,),
+                    )
+                    latest = cursor.fetchone()
+                    if latest is not None and _same_content(latest[1], row) and latest[2] in (
+                        "pending",
+                        "publishing",
+                        "published",
+                    ):
+                        cursor.execute(
+                            "UPDATE app_user SET permission_checked_at = %s, updated_at = now() "
+                            "WHERE id = %s",
+                            (moment, user_id),
+                        )
+                        logger.info(
+                            "权限无变化，不排新的发布意图 user=%s version=%s", user_id, version
+                        )
+                        return PermissionDecision(
+                            DecisionOutcome.UNCHANGED, user_id, version, str(latest[0])
+                        )
+
+                    version += 1
+                    cursor.execute(
+                        "UPDATE app_user SET permission_version = %s, permission_checked_at = %s, "
+                        "updated_at = now() WHERE id = %s",
+                        (version, moment, user_id),
+                    )
+                    outbox_id = self.enqueue_publish(
+                        user_id=user_id,
+                        reason=reason,
+                        payload=row.fields,
+                        permission_version=version,
+                        tx=connection,
+                    )
+        logger.info("权限发布意图已排入 user=%s version=%s reason=%s", user_id, version, reason)
+        return PermissionDecision(DecisionOutcome.ENQUEUED, user_id, version, outbox_id)
+
+    def enqueue_publish(
+        self,
+        *,
+        user_id: str,
+        reason: str,
+        payload: Mapping[str, str],
+        permission_version: int,
+        tx: _Transaction,
+    ) -> str:
+        """在**调用方的事务**里排一条发布意图，返回意图标识。
+
+        签名与接口设计的 ``enqueue_publish(user_id, reason, *, tx)`` 对齐，多出来的两个
+        参数是它省略的实现细节（发什么内容、发的是哪一版）。``tx`` 是必填关键字参数：
+        本方法不建连接、不提交、不回滚，事务边界完全在调用方手里。
+
+        ``payload`` 的键集必须恰好是 :data:`PUBLISHED_FIELD_NAMES`——多一个键就意味着
+        有人在这里往外部表格夹带字段（比如 ``token_cipher``），少一个键会让消费侧拿到
+        一份残缺的快照。两种都直接失败，不做静默补齐或过滤。
+        """
+
+        if tx is None or not hasattr(tx, "cursor"):
+            raise TypeError("enqueue_publish 必须接收调用方的事务对象（同事务合同）")
+        if not user_id:
+            raise ValueError("发布意图必须绑定用户")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("发布意图必须写明原因")
+        if isinstance(permission_version, bool) or not isinstance(permission_version, int):
+            raise ValueError("权限版本必须是整数")
+        if permission_version <= 0:
+            raise ValueError("权限版本必须为正：0 表示还没有过任何权限决定")
+        fields = dict(payload)
+        if set(fields) != set(PUBLISHED_FIELD_NAMES):
+            raise ValueError("发布内容快照的字段集必须与已登记的发布字段完全一致")
+
+        outbox_id = new_id("pub")
+        with tx.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO publish_outbox
+                     (id, user_id, permission_version, reason, payload, content_expires_at)
+                   VALUES (%s, %s, %s, %s, %s, now())""",
+                (outbox_id, user_id, permission_version, reason.strip(), _jsonb(fields)),
+            )
+        return outbox_id
+
+    # ------------------------------------------------------------------
+    # 消费侧
+    # ------------------------------------------------------------------
+
+    def claim_next(self) -> ClaimedPublish | None:
+        """认领最早一条可发布的意图，并原子记账（状态转 ``publishing``、尝试次数 +1）。
+
+        两道条件缺一不可：
+
+        - ``FOR UPDATE SKIP LOCKED``：并发消费者各取各的，既不重复也不互相阻塞
+          （同 ``postgres_conversation.claim_tasks`` 的既有形态）；
+        - **该用户不存在更早的非终态兄弟行**（``pending`` 或 ``publishing``）：
+          这就是「同一用户单飞」。少了它，同一用户的 v1 与 v2 会被两个消费者同时拿走，
+          v1 的外部写入落后到 v2 之后就把旧权限盖了回去——而外部表格没有版本号，
+          谁也发现不了；用户侧表现为**已经收回的权限被静默恢复**。
+
+        **为什么判据是「更早的非终态兄弟行」而不是「有没有 ``publishing``」**（二级
+        独立审查 P2-1）：后者在 ``READ COMMITTED`` 下有一个真实的漏洞窗口——消费者 A
+        认领 v1 的 ``UPDATE`` 尚未提交时，它写的 ``publishing`` 对消费者 B **不可见**，
+        B 读到的仍是 v1 提交态的 ``pending``，于是 ``NOT EXISTS (status='publishing')``
+        成立，B 领走同一用户的 v2。两个消费者同时对外发布，谁后写谁生效。
+        改成「更早的非终态兄弟行」之后，A 未提交期间 v1 在**任何**快照里都还是
+        ``pending``，正好落进判据，B 因此拒领 v2；A 提交后 v1 变 ``publishing``，
+        仍是非终态、仍然挡着。只有 v1 走到终态（``published``/``failed``/
+        ``superseded``）之后，v2 才成为该用户最老的非终态意图。次序用
+        ``(created_at, id)`` 行比较，与下面的 ``ORDER BY`` 同一把尺子。
+
+        一并取回该用户**当前**的权限版本，让「旧版本不覆盖新版本」成为纯判定
+        （见 ``core/permission/publish.publish_claim``）。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction(), connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE publish_outbox AS o
+                       SET status = 'publishing',
+                           attempts = o.attempts + 1,
+                           claimed_at = now()
+                     WHERE o.id = (
+                             SELECT c.id
+                               FROM publish_outbox c
+                              WHERE c.status = 'pending'
+                                AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM publish_outbox b
+                                       WHERE b.user_id = c.user_id
+                                         AND b.status IN ('pending', 'publishing')
+                                         AND (b.created_at, b.id) < (c.created_at, c.id)
+                                    )
+                              ORDER BY c.created_at, c.id
+                              LIMIT 1
+                                FOR UPDATE SKIP LOCKED
+                           )
+                    RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                # 当前权限版本在**同一个事务**里读，与认领是同一时刻的事实；分成两次
+                # 连接会让「认领到的是不是最新版本」建立在两个不同时刻的观察上。
+                cursor.execute(
+                    "SELECT permission_version FROM app_user WHERE id = %s", (row[1],)
+                )
+                current = cursor.fetchone()
+        return ClaimedPublish(
+            outbox_id=str(row[0]),
+            user_id=str(row[1]),
+            permission_version=int(row[2]),
+            payload=dict(row[3] or {}),
+            attempts=int(row[4]),
+            current_permission_version=None if current is None else int(current[0]),
+        )
+
+    def complete(self, attempt: PublishAttempt, *, status: str) -> None:
+        """把一次尝试的结果记回意图行。
+
+        ``WHERE status = 'publishing' AND attempts = …`` 是防线而不是装饰：它把这次
+        记账**绑定到本次认领**。
+
+        只判 ``status = 'publishing'`` 不够（二级独立审查 P3-1）：一条被
+        :meth:`reclaim_stale` 放回 ``pending``、又被**另一个**消费者重新认领的意图，
+        此刻状态恰好也是 ``publishing``——旧认领者迟到的记账会命中它，把新认领者正在
+        进行的那一次改写成 ``published``；而新认领者随后的记账反而扑空，被报成
+        :class:`PublishClaimLost`，合法的那一方成了报警对象。``attempts`` 在每次认领时
+        自增，因此它是「哪一次认领」的天然版本号：旧认领者带的是旧值，命中不到，
+        如实拿到 :class:`PublishClaimLost`；新认领者带的是新值，正常记账。
+        """
+
+        detail = _error_detail(attempt)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE publish_outbox
+                      SET status = %(status)s,
+                          last_outcome = %(outcome)s,
+                          last_error = %(detail)s,
+                          external_record_id = COALESCE(%(record_id)s, external_record_id),
+                          published_at = CASE WHEN %(status)s = 'published' THEN now() ELSE NULL END
+                    WHERE id = %(id)s
+                      AND status = 'publishing'
+                      AND attempts = %(attempts)s""",
+                {
+                    "status": status,
+                    "outcome": attempt.outcome.value,
+                    "detail": detail,
+                    "record_id": attempt.external_record_id,
+                    "id": attempt.outbox_id,
+                    "attempts": attempt.attempts,
+                },
+            )
+            if cursor.rowcount != 1:
+                raise PublishClaimLost(
+                    f"发布意图记账失败，认领已丢失：outbox={attempt.outbox_id}"
+                )
+
+    def reclaim_stale(self, *, older_than: timedelta = DEFAULT_RECLAIM_AFTER) -> int:
+        """把卡在 ``publishing`` 超过 ``older_than`` 的意图放回 ``pending``，返回条数。
+
+        这是**重启恢复**：进程在外部写入与记账之间崩溃时，那条意图会一直占着该用户的
+        单飞名额。放回去安全，因为发布本身幂等（先查后写，收敛到同一行、同一份内容）。
+        """
+
+        if not isinstance(older_than, timedelta) or older_than <= timedelta(0):
+            raise ValueError("回收阈值必须是正的时间间隔")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE publish_outbox
+                      SET status = 'pending', claimed_at = NULL, last_outcome = 'reclaimed'
+                    WHERE status = 'publishing' AND claimed_at < now() - %s::interval""",
+                (older_than,),
+            )
+            reclaimed = cursor.rowcount
+        if reclaimed:
+            logger.warning("回收滞留的发布意图 条数=%s", reclaimed)
+        return reclaimed
+
+    def redact_expired_payloads(self, *, now: datetime | None = None, limit: int = 500) -> int:
+        """把过了九十天上限的内容快照擦成空对象，返回擦除条数。
+
+        擦的是 ``payload``（含邮箱与姓名）与 ``last_error``；``user_id``、权限版本、
+        状态与时间戳留下——它们是「谁的哪一版权限什么时候发布成功过」这类运行事实，
+        本身不可再映射到人（``user_id`` 是内部 ULID，且随 ``app_user`` 删除一并 CASCADE）。
+
+        **过期的意图擦掉内容之后就发不出去了**，这是对的：一份九十天前决定的权限不该
+        在今天被写进外部表格。它下一次被认领时会以 ``invalid`` 收敛并停止重试。
+        """
+
+        moment = now or datetime.now(_UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("到期判定时间必须带时区")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE publish_outbox
+                      SET payload = '{}'::jsonb, last_error = NULL
+                    WHERE id IN (
+                            SELECT id FROM publish_outbox
+                             WHERE content_expires_at <= %s AND payload <> '{}'::jsonb
+                             ORDER BY content_expires_at
+                             LIMIT %s
+                          )""",
+                (moment, limit),
+            )
+            redacted = cursor.rowcount
+        if redacted:
+            logger.info("发布意图内容已到期擦除 条数=%s", redacted)
+        return redacted
+
+    def load(self, outbox_id: str) -> StoredIntent | None:
+        """回读一条意图。给运维排查与用例断言用，不在发布链路上。"""
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT id, user_id, permission_version, reason, payload, status, attempts,
+                          last_outcome, last_error, external_record_id, published_at
+                     FROM publish_outbox WHERE id = %s""",
+                (outbox_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return StoredIntent(
+            outbox_id=str(row[0]),
+            user_id=str(row[1]),
+            permission_version=int(row[2]),
+            reason=str(row[3]),
+            payload=dict(row[4] or {}),
+            status=str(row[5]),
+            attempts=int(row[6]),
+            last_outcome=row[7],
+            last_error=row[8],
+            external_record_id=row[9],
+            published_at=row[10],
+        )
+
+
+def _same_content(payload: Any, row: PublishRow) -> bool:
+    """上一条意图的内容与这一次的决定是否逐字段相同（``updated_at`` 不参与）。
+
+    比较前先把两边都归一成 ``{字段名: 文本}``：payload 从 JSONB 回来时数字会变成
+    Python 数字，而发布行永远是文本——按类型严格相等会让一次没有变化的刷新被判成变化。
+    """
+
+    if not isinstance(payload, Mapping):
+        return False
+    expected = row.content_fields
+    return all(str(payload.get(name, "")) == value for name, value in expected.items())
+
+
+def _error_detail(attempt: PublishAttempt) -> str | None:
+    """记进 ``last_error`` 的诊断串：**只有错误码与字段名**，没有任何字段值。"""
+
+    if attempt.outcome is PublishOutcome.PUBLISHED:
+        return None
+    parts = [attempt.error_code or attempt.outcome.value]
+    if attempt.mismatch_fields:
+        parts.append("fields=" + ",".join(attempt.mismatch_fields))
+    if attempt.detail:
+        parts.append(attempt.detail)
+    return " ".join(parts)[:500]
+
+
+def _jsonb(value: Any) -> Any:
+    """把内容快照交给 psycopg 的 JSONB 适配。延迟导入：没有驱动的机器仍能 import 本模块。"""
+
+    from psycopg.types.json import Jsonb
+
+    return Jsonb(value)

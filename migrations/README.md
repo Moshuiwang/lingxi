@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0063_roster_snapshot` |
+| head revision | `0064_permission_publish_outbox` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -236,6 +236,24 @@ Issue #52 的 S-B-02。两张新表 `roster_snapshot`（元信息：读取时间
 
 两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序 `DROP TABLE`，不存在
 需要回填的历史值。
+
+## `0064_permission_publish_outbox`（权限发布意图 outbox）
+
+Issue #156 的 S-C-01。一张新表 `publish_outbox`：权限决定（`app_user.permission_version`
+推进）与「要往当前权限多维表格发布什么」的内容快照在**同一个事务**里落库，投递异步进行。
+回滚之后库里既没有新版本，也没有孤立的发布意图（`V-权限-01`）。
+
+四条约束刻意写进数据库而不是留给调用方自觉：`UNIQUE (user_id, permission_version)`
+（同一用户同一权限版本只有一条意图）、`published_at` 与 `status='published'` 互为充要
+（一条 `failed` 却带着发布时间的行会被下游读成发布成功）、触发器把
+`content_expires_at` 固定为 `created_at + 2160 hours` 并禁止改写
+`created_at`/`user_id`/`permission_version` 三个锚点、`user_id` 上的 `ON DELETE CASCADE`
+（账号删除即带走含邮箱与姓名的内容快照）。九十天到期后的内容擦除由
+`adapters/postgres_permission_publish.py` 的 `redact_expired_payloads` 落实，未进
+`0054` 的受限清理函数——理由与四处偏离数据库设计蓝本的说明详见 revision 文件头部注释。
+
+本表本 revision 新增，前滚兼容；`downgrade()` 删表并删触发器函数，不存在需要回填的
+历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
