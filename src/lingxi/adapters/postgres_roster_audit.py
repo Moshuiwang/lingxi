@@ -77,6 +77,8 @@ class PostgresRosterBaselineReader:
             )
             for row in rows
         )
-        # 只记条数。任何一个字段值进日志都等于绕过日报的脱敏口径（`V-花名册-33`）。
+        # 只记条数。依据是 `V-花名册-33`（审计与日志不含花名册字段值）——不是日报的
+        # 展示口径，后者已被 2026-08-08 的 D2 裁定放宽到「受控管理群可含原值」，
+        # 而日志会流向排障、CI 输出与工单，不在那个受控范围里。
         logger.info("花名册审计基线已读取 已开通用户=%s", len(baseline))
         return baseline
