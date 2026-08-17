@@ -40,7 +40,13 @@ from lingxi.core.permission.publish import (
     PublishAttempt,
     PublishOutcome,
 )
-from lingxi.core.permission.publish_row import PUBLISHED_FIELD_NAMES, PublishRow
+from lingxi.core.permission.publish_row import (
+    CREATED_FIELD_NAMES,
+    PUBLISHED_FIELD_NAMES,
+    TOKEN_CIPHER_FIELD,
+    PublishRow,
+    is_cipher_shaped,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +203,10 @@ class PostgresPermissionPublishStore:
                     outbox_id = self.enqueue_publish(
                         user_id=user_id,
                         reason=reason,
-                        payload=row.fields,
+                        # 快照取 ``snapshot_fields``：有令牌就连密文一起冻结，重试因此
+                        # 能原样重放"当初决定发布的那一版"，不必在重试那一刻回查一次
+                        # 令牌表（那会让内容取决于重试时刻的库状态）。
+                        payload=row.snapshot_fields,
                         permission_version=version,
                         tx=connection,
                     )
@@ -219,9 +228,15 @@ class PostgresPermissionPublishStore:
         参数是它省略的实现细节（发什么内容、发的是哪一版）。``tx`` 是必填关键字参数：
         本方法不建连接、不提交、不回滚，事务边界完全在调用方手里。
 
-        ``payload`` 的键集必须恰好是 :data:`PUBLISHED_FIELD_NAMES`——多一个键就意味着
-        有人在这里往外部表格夹带字段（比如 ``token_cipher``），少一个键会让消费侧拿到
-        一份残缺的快照。两种都直接失败，不做静默补齐或过滤。
+        ``payload`` 的键集必须**恰好**是更新集 :data:`PUBLISHED_FIELD_NAMES` 或新建集
+        :data:`CREATED_FIELD_NAMES`（= 更新集 + ``token_cipher``）二者之一。多一个键就
+        意味着有人在这里往外部表格夹带字段，少一个键会让消费侧拿到一份残缺的快照；
+        "六个里少一个再补上 token_cipher 凑成七个"这种混合形状同样被拒。两种都直接
+        失败，不做静默补齐或过滤。
+
+        **进快照的是密文，不是明文**：令牌明文与主密钥一步都不进 outbox
+        （`V-权限-11`）。快照带密文的理由见
+        :attr:`lingxi.core.permission.publish_row.PublishRow.snapshot_fields`。
         """
 
         if tx is None or not hasattr(tx, "cursor"):
@@ -235,8 +250,15 @@ class PostgresPermissionPublishStore:
         if permission_version <= 0:
             raise ValueError("权限版本必须为正：0 表示还没有过任何权限决定")
         fields = dict(payload)
-        if set(fields) != set(PUBLISHED_FIELD_NAMES):
+        if set(fields) not in (set(PUBLISHED_FIELD_NAMES), set(CREATED_FIELD_NAMES)):
             raise ValueError("发布内容快照的字段集必须与已登记的发布字段完全一致")
+        # **键存在就校验形状**，不是"值非 None 才校验"：一份带着 ``token_cipher: None``
+        # 的七键快照曾经能过——它既不是合法的六键更新快照，也不是可用的七键新建快照，
+        # 还会在还原成 ``PublishRow`` 之后表现得像"没有令牌"。
+        if TOKEN_CIPHER_FIELD in fields and not is_cipher_shaped(fields[TOKEN_CIPHER_FIELD]):
+            # 明文长得不像密文（``token_urlsafe`` 是 URL 安全 base64，长度也不对齐），
+            # 因此这道形状校验就是"明文不进 outbox"的最后一关。不回显收到的值。
+            raise ValueError("发布内容快照的 token_cipher 形状不合法（不回显收到的值）")
 
         outbox_id = new_id("pub")
         with tx.cursor() as cursor:
@@ -302,7 +324,8 @@ class PostgresPermissionPublishStore:
                               LIMIT 1
                                 FOR UPDATE SKIP LOCKED
                            )
-                    RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts
+                    RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts,
+                              o.created_record_id
                     """
                 )
                 row = cursor.fetchone()
@@ -321,6 +344,11 @@ class PostgresPermissionPublishStore:
             payload=dict(row[3] or {}),
             attempts=int(row[4]),
             current_permission_version=None if current is None else int(current[0]),
+            # **这条意图自己建过的那一行**（``created_record_id``，不是审计用的
+            # ``external_record_id``）。判定层用它回答"这一行是不是我们建的"；既有 26 行
+            # 永远是 NULL，因此"密文被改写"那条判定不会误伤它们——哪怕它们的某次更新
+            # 读回不明、行 ID 已经进了 ``external_record_id``。
+            created_record_id=None if row[5] is None else str(row[5]),
         )
 
     def complete(self, attempt: PublishAttempt, *, status: str) -> None:
@@ -336,9 +364,31 @@ class PostgresPermissionPublishStore:
         :class:`PublishClaimLost`，合法的那一方成了报警对象。``attempts`` 在每次认领时
         自增，因此它是「哪一次认领」的天然版本号：旧认领者带的是旧值，命中不到，
         如实拿到 :class:`PublishClaimLost`；新认领者带的是新值，正常记账。
+
+        **两列记录的是两件不同的事，不能合并**：
+
+        - ``external_record_id``：**审计**——上一次尝试操作的是哪一行。任何尝试都会写，
+          包括既有行更新失败（``mismatch``/``uncertain``）。S-C-01 的既有语义，不变。
+        - ``created_record_id``：**出身**——这条意图**自己建过**的那一行。只有
+          ``action == 'create'`` **且真的拿到了记录标识**时才写；更新尝试传 ``None``，
+          因此 ``COALESCE(新值, 旧值)`` 对它是"保持不变"。判定层拿它回答"这一行是不是
+          我们建的"。
+
+          **重复创建时取最近一次**（而不是保留第一次）：能走到第二次 ``create`` 说明
+          上一行已经查不到了，出身若停在那个失效的标识上，"我们建的行密文被改写"这道
+          检查就永远命不中当前这一行——保护静默失效。取最近一次则让检查作用在真正活着
+          的那一行上，且不会产生假阳性：条件本来就是"这一行是我们建的且密文不是我们的"。
+
+        混用会造出一个真实的回归：既有 26 行只要有一次更新读回不明，行 ID 就进了
+        ``external_record_id``，重试时"这一行是我们建的"成立、而它们的旧密文当然不等于
+        我方快照，于是被判成永久 ``mismatch``——S-C-01 的"更新可重试收敛"就被打断了。
         """
 
         detail = _error_detail(attempt)
+        # 出身只由"create 明确返回了记录标识"这一种事实设置。创建结果不明（没拿到 ID）
+        # 时保持 NULL：那时我们无法把"自己建的"与"并发写入方建的"区分开，重试按普通
+        # 路径收敛，就绪探针是最终的门。
+        created = attempt.external_record_id if attempt.action == "create" else None
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """UPDATE publish_outbox
@@ -346,6 +396,7 @@ class PostgresPermissionPublishStore:
                           last_outcome = %(outcome)s,
                           last_error = %(detail)s,
                           external_record_id = COALESCE(%(record_id)s, external_record_id),
+                          created_record_id = COALESCE(%(created_id)s, created_record_id),
                           published_at = CASE WHEN %(status)s = 'published' THEN now() ELSE NULL END
                     WHERE id = %(id)s
                       AND status = 'publishing'
@@ -355,6 +406,7 @@ class PostgresPermissionPublishStore:
                     "outcome": attempt.outcome.value,
                     "detail": detail,
                     "record_id": attempt.external_record_id,
+                    "created_id": created,
                     "id": attempt.outbox_id,
                     "attempts": attempt.attempts,
                 },

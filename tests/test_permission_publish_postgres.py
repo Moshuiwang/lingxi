@@ -17,12 +17,14 @@ LOCKED`` 加谓词的属性，**到期时间不可篡改**是触发器的属性�
 from __future__ import annotations
 
 import os
+import secrets
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from postgres_schema import ensure_production_schema, reset_production_rows
 
+from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_permission_publish import (
     DecisionOutcome,
@@ -35,7 +37,11 @@ from lingxi.core.permission.publish import (
     STATUS_FAILED,
     STATUS_PUBLISHED,
 )
-from lingxi.core.permission.publish_row import PublishRow
+from lingxi.core.permission.publish_row import CREATED_FIELD_NAMES, PublishRow
+
+#: biai-agent 加密规格 v1 的**公开测试向量**（非生产密钥、非生产令牌）。
+SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+"
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，权限发布 outbox 的真库断言未验证（需真实 PostgreSQL 16）"
@@ -48,7 +54,12 @@ EMAIL_A = "jiaming.jia@example.invalid"
 EMAIL_B = "yiming.yi@example.invalid"
 
 
-def _row(email: str = EMAIL_A, *, permissions: str = '{"1011":["商务"]}') -> PublishRow:
+def _row(
+    email: str = EMAIL_A,
+    *,
+    permissions: str = '{"1011":["商务"]}',
+    token_cipher: str | None = None,
+) -> PublishRow:
     return PublishRow(
         record_key=email,
         email=email,
@@ -56,6 +67,7 @@ def _row(email: str = EMAIL_A, *, permissions: str = '{"1011":["商务"]}') -> P
         permissions=permissions,
         status="approved",
         updated_at="2026-08-17T03:00:00Z",
+        token_cipher=token_cipher,
     )
 
 
@@ -67,6 +79,7 @@ def _attempt(
     record_id: str | None = "rec_1",
     user_id: str = USER_A,
     attempts: int = 1,
+    action: str = "none",
 ) -> PublishAttempt:
     return PublishAttempt(
         outcome=outcome,
@@ -74,6 +87,7 @@ def _attempt(
         user_id=user_id,
         permission_version=version,
         attempts=attempts,
+        action=action,
         external_record_id=record_id,
         mismatch_fields=("email",) if outcome is PublishOutcome.MISMATCH else (),
     )
@@ -180,11 +194,176 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
                     self.store.enqueue_publish(
                         user_id=USER_A,
                         reason="x",
-                        payload={**_row().fields, "token_cipher": "secret"},
+                        payload={**_row().fields, "刻意夹带": "x"},
                         permission_version=1,
                         tx=connection,
                     )
         self.assertEqual(self._count(), 0)
+
+    def test_enqueue_accepts_the_create_field_set_with_a_cipher(self) -> None:
+        """`V-权限-11` 前半：带令牌密文的七字段快照是合法的内容快照。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first_onboarding",
+            decided_at=NOW,
+        )
+        stored = self.store.load(decision.outbox_id)
+        self.assertEqual(set(stored.payload), set(CREATED_FIELD_NAMES))
+        self.assertEqual(stored.payload["token_cipher"], TOKEN_CIPHER)
+
+    def test_enqueue_refuses_a_null_cipher_key(self) -> None:
+        """键存在就要合法：``token_cipher: None`` 的七键快照既不是更新快照也不可新建。"""
+
+        with connect(self._dsn) as connection:
+            with connection.transaction():
+                with self.assertRaises(ValueError):
+                    self.store.enqueue_publish(
+                        user_id=USER_A,
+                        reason="x",
+                        payload={**_row().fields, "token_cipher": None},
+                        permission_version=1,
+                        tx=connection,
+                    )
+        self.assertEqual(self._count(), 0)
+
+    def test_provenance_is_only_set_by_a_create_that_returned_an_id(self) -> None:
+        """**G1**：出身列只由「``create_row`` 明确返回了 ID」这一种事实设置。
+
+        ``external_record_id`` 是审计（任何尝试都写），``created_record_id`` 是出身。
+        两者混用会让既有 26 行的一次更新失败在重试时被判成永久冲突。
+        """
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        first = self.store.claim_next()
+        self.assertIsNone(first.created_record_id)
+
+        # 一次**更新**失败：审计列记下这一行，出身列保持空。
+        self.store.complete(
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.MISMATCH,
+                record_id="rec_7",
+                action="update",
+            ),
+            status="pending",
+        )
+        second = self.store.claim_next()
+        self.assertIsNone(second.created_record_id)
+        self.assertEqual(self.store.load(decision.outbox_id).external_record_id, "rec_7")
+
+        # 一次**创建**成功：出身列这才写上。
+        self.store.complete(
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.MISMATCH,
+                record_id="rec_8",
+                action="create",
+                attempts=2,
+            ),
+            status="pending",
+        )
+        third = self.store.claim_next()
+        self.assertEqual(third.created_record_id, "rec_8")
+
+    def test_an_update_never_moves_the_provenance(self) -> None:
+        """更新尝试不得把出身挪到别的行上——它传的是 ``None``，只能保持不变。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_1",
+                     action="create"),
+            status="pending",
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_2",
+                     action="update", attempts=2),
+            status="pending",
+        )
+        self.assertEqual(self.store.claim_next().created_record_id, "rec_1")
+
+    def test_a_second_create_moves_the_provenance_to_the_live_row(self) -> None:
+        """重复创建时出身取**最近一次**，不是停在第一次。
+
+        能走到第二次 ``create`` 说明上一行已经查不到了。出身若停在那个失效的标识上，
+        "我们建的行密文被改写"这道检查就永远命不中当前这一行——保护静默失效。
+        """
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_1",
+                     action="create"),
+            status="pending",
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_2",
+                     action="create", attempts=2),
+            status="pending",
+        )
+        self.assertEqual(self.store.claim_next().created_record_id, "rec_2")
+
+    def test_an_uncertain_create_without_an_id_claims_no_provenance(self) -> None:
+        """创建结果不明（没拿到 ID）时不认领出身：重试按普通路径收敛。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(
+                decision.outbox_id,
+                outcome=PublishOutcome.UNCERTAIN,
+                record_id=None,
+                action="create",
+            ),
+            status="pending",
+        )
+        self.assertIsNone(self.store.claim_next().created_record_id)
+
+    def test_enqueue_refuses_a_plaintext_token_in_the_snapshot(self) -> None:
+        """否定面：**明文**进 outbox 的最后一关是形状校验（明文过不了 base64 判据）。"""
+
+        for plaintext in (secrets.token_urlsafe(32), "明文令牌", "not base64!"):
+            with self.subTest(plaintext_length=len(plaintext)):
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with self.assertRaises(ValueError) as caught:
+                            self.store.enqueue_publish(
+                                user_id=USER_A,
+                                reason="x",
+                                payload={**_row().fields, "token_cipher": plaintext},
+                                permission_version=1,
+                                tx=connection,
+                            )
+                        # 不回显收到的值：它是凭据材料。
+                        self.assertNotIn(plaintext, str(caught.exception))
+        self.assertEqual(self._count(), 0)
+
+    def test_cipher_travels_but_plaintext_never_reaches_the_outbox(self) -> None:
+        """全库扫描：密文在 outbox 里，**明文一处都没有**。"""
+
+        cipher = McpTokenCipher(SPEC_MASTER_KEY)
+        plaintext = new_token()
+        self.store.record_decision(
+            user_id=USER_A,
+            row=_row(token_cipher=cipher.encrypt(plaintext)),
+            reason="first_onboarding",
+            decided_at=NOW,
+        )
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT payload::text FROM publish_outbox")
+            dumped = "".join(row[0] for row in cursor.fetchall())
+        self.assertIn("token_cipher", dumped)
+        self.assertNotIn(plaintext, dumped)
 
     def test_unchanged_permission_does_not_enqueue_again(self) -> None:
         first = self.store.record_decision(

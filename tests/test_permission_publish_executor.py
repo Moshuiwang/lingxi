@@ -3,8 +3,9 @@
 认领断言：`V-权限-02`（写入后逐字段读回，一致才算发布完成）、`V-权限-03`（发布 A 不
 改动 B 的行）、`V-权限-09`（同一 ``record_key`` 重复发布收敛到同一行；同邮箱不同
 ``record_key`` 失败关闭不新建）、`V-权限-10`（读回不一致不记发布完成并告警）、
-`V-权限-11`（不写 ``token_cipher``，既有行的该列不被清空）、`V-权限-12`（旧版本不覆盖
-新版本；重入不产生第二行）。
+`V-权限-11`（**新建行必须携带 Lingxi 签发的 ``token_cipher``；更新行的字段集不含它，
+既有值既不被清空也不被覆盖**——2026-08-17 改写，见 ``core/permission/publish_row.py``
+模块文档）、`V-权限-12`（旧版本不覆盖新版本；重入不产生第二行）。
 
 外部表格以假传输层注入（形式沿用 ``tests/test_feishu_delivery_classification.py`` 与
 花名册读取用例的既有先例）：**本文件不做任何真实飞书调用**。
@@ -36,16 +37,28 @@ from lingxi.core.permission.publish import (
     PublishOutcome,
     publish_claim,
 )
-from lingxi.core.permission.publish_row import PUBLISHED_FIELD_NAMES, PublishRow
+from lingxi.core.permission.publish_row import (
+    CREATED_FIELD_NAMES,
+    PUBLISHED_FIELD_NAMES,
+    PublishRow,
+)
 
 FAKE_EMAIL = "jiaming.jia@example.invalid"
 OTHER_EMAIL = "yiming.yi@example.invalid"
 FAKE_NAME = "化名甲"
 PERMISSIONS = '{"1011":["商务"]}'
 UPDATED_AT = "2026-08-17T03:00:00Z"
+#: biai-agent 加密规格 v1 的**公开测试向量密文**（非生产密钥、非生产令牌）。
+#: 这里只需要一份形状合法的密文，不需要解开它。
+TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+"
 
 
-def _row(email: str = FAKE_EMAIL, *, permissions: str = PERMISSIONS) -> PublishRow:
+def _row(
+    email: str = FAKE_EMAIL,
+    *,
+    permissions: str = PERMISSIONS,
+    token_cipher: str | None = TOKEN_CIPHER,
+) -> PublishRow:
     return PublishRow(
         record_key=email,
         email=email,
@@ -53,6 +66,7 @@ def _row(email: str = FAKE_EMAIL, *, permissions: str = PERMISSIONS) -> PublishR
         permissions=permissions,
         status="approved",
         updated_at=UPDATED_AT,
+        token_cipher=token_cipher,
     )
 
 
@@ -64,8 +78,9 @@ def _claim(
     attempts: int = 1,
     payload: dict | None = None,
     user_id: str = "usr_A",
+    created_record_id: str | None = None,
 ) -> ClaimedPublish:
-    fields = payload if payload is not None else (row or _row()).fields
+    fields = payload if payload is not None else (row or _row()).snapshot_fields
     return ClaimedPublish(
         outbox_id="pub_1",
         user_id=user_id,
@@ -73,6 +88,7 @@ def _claim(
         payload=fields,
         attempts=attempts,
         current_permission_version=current,
+        created_record_id=created_record_id,
     )
 
 
@@ -87,6 +103,10 @@ class FakeTable:
         self.faults: dict[str, Exception] = {}
         #: 写入后平台"悄悄改掉"的字段（模拟读回不一致）。
         self.mutate_on_write: dict[str, object] = {}
+        #: 每一次写入实际提交的字段集：``(动作, 字段字典)``。断言"更新集里没有
+        #: ``token_cipher``"必须看**提交出去的那一份**，而不是事后看表里剩下什么——
+        #: 后者在部分更新语义下永远是绿的。
+        self.written: list[tuple[str, dict]] = []
 
     def _maybe_fail(self, name: str) -> None:
         self.calls.append(name)
@@ -113,6 +133,7 @@ class FakeTable:
 
     def create_row(self, fields):
         self._maybe_fail("create_row")
+        self.written.append(("create", dict(fields)))
         record_id = f"rec_{self._next}"
         self._next += 1
         stored = dict(fields)
@@ -122,6 +143,7 @@ class FakeTable:
 
     def update_row(self, record_id, fields):
         self._maybe_fail("update_row")
+        self.written.append(("update", dict(fields)))
         row = self._find(record_id)
         # 部分更新：未列出的列保持原值（真实平台语义）。
         row["fields"].update(fields)
@@ -143,7 +165,9 @@ class PublishClaimTest(unittest.TestCase):
         self.assertEqual(attempt.action, "create")
         self.assertEqual(attempt.external_record_id, "rec_1")
         self.assertEqual(len(table.rows), 1)
-        self.assertEqual(set(table.rows[0]["fields"]), set(PUBLISHED_FIELD_NAMES))
+        # 新建集 = 更新集 + token_cipher（`V-权限-11` 前半）。
+        self.assertEqual(set(table.rows[0]["fields"]), set(CREATED_FIELD_NAMES))
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
 
     def test_existing_row_is_updated_and_token_cipher_survives(self) -> None:
         """`V-权限-11`：更新集不含 ``token_cipher``，既有值原样留在表里。"""
@@ -171,6 +195,389 @@ class PublishClaimTest(unittest.TestCase):
         self.assertEqual(table.rows[0]["fields"]["token_cipher"], "业务侧写入的密文")
         self.assertEqual(table.rows[0]["fields"]["name"], FAKE_NAME)
         self.assertNotIn("create_row", table.calls)
+
+    def test_update_field_set_never_contains_token_cipher(self) -> None:
+        """`V-权限-11` 后半（**主动构造更新路径**，断言提交出去的字段集）。
+
+        这里看的是 ``update_row`` 收到的那一份字典，不是事后表里剩下什么：飞书是部分
+        更新，"表里那一列还在"在任何实现下都成立，证明不了我们没提交它。
+        """
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        # 我们**手上有**自己签发的密文，但走的是更新路径——仍然一个字都不提交。
+        attempt = publish_claim(_claim(row=_row(token_cipher=TOKEN_CIPHER)), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.PUBLISHED)
+        self.assertEqual([action for action, _ in table.written], ["update"])
+        self.assertEqual(set(table.written[0][1]), set(PUBLISHED_FIELD_NAMES))
+        self.assertNotIn("token_cipher", table.written[0][1])
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], "旧系统签发的密文")
+
+    def test_create_without_token_cipher_fails_closed(self) -> None:
+        """`V-权限-11` 前半否定面：要新建却没有令牌 → 既不新建，也不退回六字段。"""
+
+        table = FakeTable()
+        attempt = publish_claim(_claim(row=_row(token_cipher=None)), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.INVALID)
+        self.assertEqual(attempt.error_code, "missing_token_cipher")
+        self.assertEqual(attempt.action, "create")
+        self.assertFalse(attempt.retryable)
+        self.assertEqual(attempt.next_status(), STATUS_FAILED)
+        self.assertEqual(table.rows, [])
+        self.assertEqual(table.written, [])
+        self.assertNotIn("create_row", table.calls)
+
+    def test_update_without_token_cipher_still_publishes(self) -> None:
+        """既有 26 行的形状：我们没有他们的令牌，但**更新**照常成立。"""
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        attempt = publish_claim(_claim(row=_row(token_cipher=None)), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.PUBLISHED)
+        self.assertEqual(attempt.action, "update")
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], "旧系统签发的密文")
+
+    def test_retry_after_a_dropped_cipher_never_converges_to_published(self) -> None:
+        """**F1 的核心**：新建时平台漏写 ``token_cipher`` → 重试不得降格成"发布完成"。
+
+        场景是真实的：``create_row`` 建成了行，但那一列没落地（或落成空）。本次读回
+        不一致判 ``mismatch``；**重试**时按 ``record_key`` 命中该行走更新路径——如果更新
+        路径完全不看那一列，就会写六列、读回一致、收敛成 ``published``。于是发布记成功，
+        而这一行对问数 MCP 永远无效：探针会烧满十五分钟再转运维，运维拿到的分类还是
+        "权限同步超时"，指向完全错误的方向。
+        """
+
+        table = FakeTable()
+        table.mutate_on_write = {"token_cipher": ""}
+        first = publish_claim(_claim(), transport=table)
+        self.assertEqual(first.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(first.mismatch_fields, ("token_cipher",))
+
+        # 重试：行已经在表里，密文是空的。必须**补上**并读回验证，而不是绕过。
+        table.mutate_on_write = {}
+        second = publish_claim(
+            _claim(attempts=2, created_record_id=first.external_record_id), transport=table
+        )
+        self.assertTrue(second.published)
+        self.assertEqual(second.action, "update")
+        self.assertEqual(len(table.rows), 1)
+        # 补空洞时提交的是七字段（含密文），不是六字段。
+        self.assertEqual(set(table.written[-1][1]), set(CREATED_FIELD_NAMES))
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
+
+    def test_an_update_that_clears_an_existing_cipher_is_not_published(self) -> None:
+        """更新路径**也要看一眼那一列还在不在**（B01 锚点）。
+
+        这条与"补空洞"是两件事：这里既有行**本来有**密文，因此我们走六字段更新、
+        一个字都不提交那一列；但平台在这次写入中把它清掉了。我们没提交它，不代表
+        "发布完成"可以不管它——那个结论断言的是"这一行现在对 MCP 有效"，而一行没有
+        ``token_cipher`` 的权限对 MCP 无效。不看这一眼，它就静默收敛成 ``published``。
+        """
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        table.mutate_on_write = {"token_cipher": ""}
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+        self.assertFalse(attempt.published)
+        # 走的确实是六字段更新路径：我们并没有提交那一列。
+        self.assertEqual(set(table.written[0][1]), set(PUBLISHED_FIELD_NAMES))
+
+    def test_an_update_whose_cipher_reads_back_missing_is_not_published(self) -> None:
+        """同一条防线的另一种形态：那一列在读回结果里**整个不见了**。"""
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        original_read = table.read_row
+
+        def read_without_cipher(record_id):
+            fields = original_read(record_id)
+            fields.pop("token_cipher", None)
+            return fields
+
+        table.read_row = read_without_cipher  # type: ignore[method-assign]
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+
+    def test_retry_still_fails_while_the_platform_keeps_dropping_the_cipher(self) -> None:
+        """平台持续吞掉那一列时，每一轮都必须是 ``mismatch``，永远不收敛成成功。"""
+
+        table = FakeTable()
+        table.mutate_on_write = {"token_cipher": ""}
+        first = publish_claim(_claim(), transport=table)
+        second = publish_claim(
+            _claim(attempts=2, created_record_id=first.external_record_id), transport=table
+        )
+        self.assertEqual(second.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(second.mismatch_fields, ("token_cipher",))
+        self.assertFalse(second.published)
+
+    def test_retry_after_an_uncertain_create_fills_the_missing_cipher(self) -> None:
+        """新建结果不明（读回超时）后重试：行已建但缺密文，同样必须补上再证明。"""
+
+        table = FakeTable()
+        table.faults["read_row"] = PermissionTableError("transport_error", definite=False)
+        # 模拟"建是建了，但那一列没落地"。
+        table.mutate_on_write = {"token_cipher": ""}
+        first = publish_claim(_claim(), transport=table)
+        self.assertEqual(first.outcome, PublishOutcome.UNCERTAIN)
+        self.assertEqual(first.action, "create")
+
+        table.mutate_on_write = {}
+        second = publish_claim(
+            _claim(attempts=2, created_record_id=first.external_record_id), transport=table
+        )
+        self.assertTrue(second.published)
+        self.assertEqual(len(table.rows), 1)
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
+
+    def test_update_is_not_published_when_the_row_has_no_cipher_and_we_have_none(self) -> None:
+        """既没有既有密文、我们手上也没有 → 失败关闭，不写出一行对 MCP 无效的权限。"""
+
+        table = FakeTable(
+            [{"record_id": "rec_9", "fields": {"record_key": FAKE_EMAIL, "email": FAKE_EMAIL}}]
+        )
+        attempt = publish_claim(_claim(row=_row(token_cipher=None)), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.INVALID)
+        self.assertEqual(attempt.error_code, "missing_token_cipher")
+        self.assertEqual(table.written, [])
+
+    def test_a_row_we_created_whose_cipher_was_rewritten_is_a_mismatch(self) -> None:
+        """我们建的行，密文却不是我们写进去的那一份 → ``mismatch``，不是"沿用既有令牌"。
+
+        判据是 ``external_record_id`` 对得上——既有 26 行的该值永远是 ``None``，
+        因此这条判定不会误伤旧系统签发的令牌（见下一条用例）。
+        """
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "token_cipher": "平台改写过的另一份密文",
+                    },
+                }
+            ]
+        )
+        attempt = publish_claim(
+            _claim(attempts=2, created_record_id="rec_9"), transport=table
+        )
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+        self.assertEqual(table.written, [])
+
+    def test_a_legacy_row_still_converges_after_a_failed_update(self) -> None:
+        """**S-C-01「更新可重试收敛」的回归钉**（G1）。
+
+        既有 26 行的一次更新读回不明 / 不一致之后，行 ID 会进 ``external_record_id``
+        （那是审计语义，任何尝试都会写）。如果"这一行是我们建的"用那一列判，重试时判据
+        就会成立、而旧密文当然不等于我方快照，于是这一行被判成**永久 mismatch**——
+        一个本来只是"下一轮再试一次就好"的暂时故障，变成了再也发不出去的死结。
+
+        出身只能由 ``created_record_id`` 表达，而它只在我们**真的建过**这一行时才非空。
+        """
+
+        legacy = {
+            "record_id": "rec_9",
+            "fields": {
+                "record_key": FAKE_EMAIL,
+                "email": FAKE_EMAIL,
+                "name": "旧名",
+                "permissions": "{}",
+                "status": "approved",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "token_cipher": "旧系统签发的密文",
+            },
+        }
+        table = FakeTable([dict(legacy, fields=dict(legacy["fields"]))])
+        table.faults["read_row"] = PermissionTableError("transport_error", definite=False)
+        first = publish_claim(_claim(), transport=table)
+        self.assertEqual(first.outcome, PublishOutcome.UNCERTAIN)
+        self.assertEqual(first.action, "update")
+        # 审计列确实记下了这一行——正是这一点让"拿它当出身"变得危险。
+        self.assertEqual(first.external_record_id, "rec_9")
+
+        # 重试：出身仍为 None（我们从没建过这一行），因此照常收敛。
+        second = publish_claim(_claim(attempts=2), transport=table)
+        self.assertTrue(second.published)
+        self.assertEqual(second.action, "update")
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], "旧系统签发的密文")
+
+    def test_an_uncertain_create_does_not_claim_provenance(self) -> None:
+        """创建结果不明（**没拿到 ID**）时不认领出身：重试按普通路径收敛。
+
+        那种情况下我们无法把"自己建的"与"并发写入方建的"区分开，改写判定会变成猜测；
+        就绪探针是最终的门。
+        """
+
+        table = FakeTable()
+        table.faults["create_row"] = PermissionTableError("transport_error", definite=False)
+        first = publish_claim(_claim(), transport=table)
+        self.assertEqual(first.outcome, PublishOutcome.UNCERTAIN)
+        self.assertEqual(first.action, "create")
+        self.assertIsNone(first.external_record_id)
+
+        # 与此同时另一方建出了这一行（带着别的密文）。重试不做改写判定，走普通更新。
+        table.rows.append(
+            {
+                "record_id": "rec_x",
+                "fields": {
+                    "record_key": FAKE_EMAIL,
+                    "email": FAKE_EMAIL,
+                    "name": "他人写的",
+                    "permissions": "{}",
+                    "status": "approved",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "token_cipher": "别人写进去的密文",
+                },
+            }
+        )
+        second = publish_claim(_claim(attempts=2), transport=table)
+        self.assertTrue(second.published)
+        self.assertEqual(second.action, "update")
+
+    def test_whitespace_only_cipher_counts_as_absent(self) -> None:
+        """`G2`：``"   "`` 不是密文。裸真值判断会让它冒充"那一列还在"。"""
+
+        for blank in ("   ", "\t", " 　 "):
+            with self.subTest(blank=repr(blank)):
+                table = FakeTable(
+                    [
+                        {
+                            "record_id": "rec_9",
+                            "fields": {
+                                "record_key": FAKE_EMAIL,
+                                "email": FAKE_EMAIL,
+                                "name": "旧名",
+                                "permissions": "{}",
+                                "status": "approved",
+                                "updated_at": "2026-01-01T00:00:00Z",
+                                "token_cipher": blank,
+                            },
+                        }
+                    ]
+                )
+                # 手上有密文 → 视同空洞，补上并按七字段读回。
+                attempt = publish_claim(_claim(), transport=table)
+                self.assertTrue(attempt.published)
+                self.assertEqual(set(table.written[0][1]), set(CREATED_FIELD_NAMES))
+                self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
+
+    def test_a_readback_of_only_whitespace_is_not_published(self) -> None:
+        """`G2` 的另一半：读回是纯空白同样不算"那一列还在"。"""
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        table.mutate_on_write = {"token_cipher": "   "}
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+
+    def test_a_legacy_row_we_never_created_keeps_its_own_cipher(self) -> None:
+        """对照：既有 26 行的形状（出身为空）照常更新，不误伤。"""
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        attempt = publish_claim(_claim(attempts=2), transport=table)
+        self.assertTrue(attempt.published)
+        self.assertEqual(set(table.written[0][1]), set(PUBLISHED_FIELD_NAMES))
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], "旧系统签发的密文")
+
+    def test_create_readback_covers_token_cipher(self) -> None:
+        """新建路径的读回把 ``token_cipher`` 一起比：平台改掉它同样不算发布完成。"""
+
+        table = FakeTable()
+        table.mutate_on_write = {"token_cipher": "平台改过的值"}
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+        self.assertFalse(attempt.published)
+        # 只有字段名进结果，密文值不进（它是凭据材料）。
+        self.assertNotIn(TOKEN_CIPHER, str(attempt.audit_facts()))
 
     def test_repeated_publish_converges_to_one_row(self) -> None:
         """`V-权限-09`：同一 ``record_key`` 重复发布不产生第二行。"""

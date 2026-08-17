@@ -10,15 +10,15 @@
 都以 Protocol 注入（:class:`PermissionTableTransport` / :class:`PermissionPublishStore`），
 全部断言可以在没有网络也没有数据库的机器上跑完。
 
-## 六个互不合并的结果
+## 七个互不合并的结果
 
 | 结果 | 发生了什么 | outbox 去向 |
 |---|---|---|
 | ``published`` | 写入成功，且逐字段读回与预期**完全一致** | ``published`` |
 | ``superseded`` | 这条意图的权限版本已被更新版本取代 | ``superseded``，**不发生任何外部调用** |
 | ``conflict`` | 同一个人已存在 ``record_key`` 口径不同的行，或命中多行 | ``failed``，不重试 |
-| ``invalid`` | 内容快照本身不可用（缺字段 / 被人改过库） | ``failed``，不重试 |
-| ``mismatch`` | 写入调用成功，但读回有字段对不上 | 重试；attempts 用尽转 ``failed`` |
+| ``invalid`` | 内容快照本身不可用（缺字段、被人改过库，或**要新建却没有 ``token_cipher``**） | ``failed``，不重试 |
+| ``mismatch`` | 写入调用成功，但读回有字段对不上，或 ``token_cipher`` 缺失 / 被改写 | 重试；attempts 用尽转 ``failed`` |
 | ``rejected`` | 外部**明确拒绝**（完整响应 + 业务错误码非 0） | 重试；attempts 用尽转 ``failed`` |
 | ``uncertain`` | **结果不明**（传输异常、超时、响应形状不对、缺可回读标识） | 重试；attempts 用尽转 ``failed`` |
 
@@ -71,7 +71,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, NamedTuple, Protocol
 
-from lingxi.core.permission.publish_row import PublishRow, compare_readback, readback_text
+from lingxi.core.permission.publish_row import (
+    TOKEN_CIPHER_FIELD,
+    PublishRow,
+    compare_readback,
+    readback_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,19 @@ class ExistingPermissionRow(NamedTuple):
     def email(self) -> str:
         return readback_text(self.fields.get("email"))
 
+    @property
+    def token_cipher(self) -> str:
+        """这一行当前的令牌密文（空串 = 那一列是空的）。**纯空白等同于空。**
+
+        判定层只用它回答两个问题：**要不要补上我们的密文**（空洞才补），以及
+        **发布完成前那一列还在不在**。归一走同一个 :func:`readback_text`，
+        与逐字段读回比对是同一把尺子，然后再 ``strip()``——一个 ``"   "`` 会让裸真值
+        判断认为"密文还在"，于是走六字段更新、读回一致、收敛成发布完成，而那一行对
+        问数 MCP 一样无效（合法密文恒为 88 个 base64 字符，绝不含空白）。
+        """
+
+        return readback_text(self.fields.get("token_cipher")).strip()
+
     def matches_key(self, record_key: str) -> bool:
         """这一行的 ``record_key`` 是不是我们要写的那一个（**大小写不敏感**）。
 
@@ -209,6 +227,16 @@ class ClaimedPublish:
     payload: Mapping[str, Any]
     attempts: int = 1
     current_permission_version: int | None = None
+    #: 这条意图**自己建过**的那一行（首次认领、以及从未成功创建时都是 ``None``）。
+    #: 它回答一个别处答不出来的问题：**这一行是不是我们建的**。
+    #:
+    #: **不是** ``publish_outbox.external_record_id``：那一列是审计语义（上一次尝试操作
+    #: 了哪一行），任何尝试都会写它，包括既有行更新失败。拿它当出身用会误伤既有 26 行
+    #: ——它们只要有一次更新读回不明，行 ID 就进了那一列，重试时"这一行是我们建的"
+    #: 成立，而旧密文当然不等于我方快照，于是被判成永久冲突。出身只由"``create_row``
+    #: 明确返回了记录标识"这一种事实设置（见 ``adapters/postgres_permission_publish``
+    #: 的 ``complete``）。
+    created_record_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,9 +365,15 @@ def publish_claim(
     1. **先判版本再动手**。旧版本的意图一次外部调用都不发——「不覆盖新权限」必须在
        写之前成立，写完再回滚已经晚了。
     2. **先查后写**。查找同时服务幂等（命中就更新）与安全（同一个人不建第二行）。
-    3. **写完必须读回**。写入接口返回成功只证明请求被受理，证明不了收下的内容与我们
+    3. **字段集按动作分**。新建写七列，必须携带 Lingxi 签发的 ``token_cipher``；更新
+       分两种——既有密文**非空**时写六列（那一列既不被清空也不被覆盖），既有密文**为空**
+       时把我们的密文补上（填补空洞不是覆盖）。两边都没有密文则以 ``invalid`` +
+       ``missing_token_cipher`` 失败关闭（`V-权限-11` 的两半）。
+    4. **写完必须读回**。写入接口返回成功只证明请求被受理，证明不了收下的内容与我们
        决定发布的是同一份；读回按**字符串值**比对（G-BIT 移交的实现约束，见
-       :func:`lingxi.core.permission.publish_row.readback_text`）。
+       :func:`lingxi.core.permission.publish_row.readback_text`），比对范围与本次实际
+       写出去的字段集**同一份**；此外**无论走哪条路都要确认 ``token_cipher`` 非空**
+       ——"发布完成"断言的是"这一行现在对 MCP 有效"，而没有密文的行对 MCP 无效。
 
     未预期的异常一律不捕获、原样上抛（纪律同 ``adapters/feishu_delivery.py``）：把它们
     也吞成"结果不明"会让真正的缺陷伪装成外部异常，每一轮安静地重试下去。
@@ -387,16 +421,88 @@ def publish_claim(
 
     action = "update" if matches else "create"
     record_id = matches[0].record_id if matches else None
+    existing_cipher = matches[0].token_cipher if matches else ""
+    if (
+        matches
+        and existing_cipher
+        and row.token_cipher
+        and claim.created_record_id == matches[0].record_id
+        and existing_cipher != row.token_cipher
+    ):
+        # **这一行是我们自己建的，密文却不是我们写进去的那一份。** 判据是
+        # ``created_record_id``（出身）而**不是** ``external_record_id``（审计）：后者
+        # 在既有行更新失败时也会被写上，用它会把既有 26 行的一次更新重试判成永久冲突。
+        # 既有 26 行的出身永远是 ``None``，因此走不到这里，不会误伤。
+        # 这条挡的是"新建后平台改写了 token_cipher"：不挡的话，重试会走六字段更新、
+        # 完全不看那一列，于是收敛成 ``published``，而这一行对该用户永远无效。
+        #
+        # **保证边界（编排者 2026-08-17 裁定，刻意不扩大）**：出身只在**同一条发布意图
+        # 内**有效，因此两条路径识别不到改写——新权限版本的新意图对"上一版曾建过的行"
+        # 出身为 ``None``；创建结果不明、没拿到记录标识时（行其实建成了）出身也为
+        # ``None``。两者都不补：改写者与旧系统的合法密文在那两条路径上不可区分，而
+        # "存量用户令牌归属"是待产品负责人裁定的产品结，猜错方向会把合法旧行打成永久
+        # 失败。功能性的最终门是**就绪探针**——带着错误密文的行永远探不成功，会以十五
+        # 分钟超时转运维暴露，不产生用户可见的假成功。
+        return PublishAttempt(
+            outcome=PublishOutcome.MISMATCH,
+            outbox_id=claim.outbox_id,
+            user_id=claim.user_id,
+            permission_version=claim.permission_version,
+            attempts=claim.attempts,
+            action=action,
+            external_record_id=record_id,
+            mismatch_fields=("token_cipher",),
+            error_code="readback_mismatch",
+            failure_kind=PublishFailureKind.DEFINITE,
+        )
+    try:
+        # **字段集按动作分**，其中更新又分两种（`V-权限-11` 的落点）：
+        #
+        # - 既有行的 ``token_cipher`` **非空**：一个字都不提交，那一列既不被清空也不被
+        #   覆盖——它可能是旧系统 biai-agent 签发的，我们不知道它的明文。
+        # - 既有行的 ``token_cipher`` **为空**而我们手上有密文：把它**补上**。填补空洞
+        #   不是覆盖：「不覆盖」这条规则保护的是既有令牌，空值没有什么可保护的；而一行
+        #   没有密文的权限对问数 MCP 毫无意义（解不出任何 Bearer 与它匹配）。这条路径
+        #   正是"新建成功但平台漏写了那一列"和"新建结果不明"重试时的收敛出口。
+        # - 两边都没有密文：失败关闭（下面的 ``ValueError`` 分支）。
+        if not matches:
+            expected = row.create_fields
+        elif existing_cipher:
+            expected = row.fields
+        else:
+            expected = row.create_fields
+    except ValueError as error:
+        # 要新建（或要补空洞）却没有令牌：失败关闭，不退回六字段"先建了再说"。静默少写
+        # 一列的结果是"发布成功了，但这个人永远问不了数"——一个我们自己都发现不了的假成功。
+        return PublishAttempt(
+            outcome=PublishOutcome.INVALID,
+            outbox_id=claim.outbox_id,
+            user_id=claim.user_id,
+            permission_version=claim.permission_version,
+            attempts=claim.attempts,
+            action=action,
+            external_record_id=record_id,
+            error_code="missing_token_cipher",
+            failure_kind=PublishFailureKind.DEFINITE,
+            detail=type(error).__name__,
+        )
     try:
         if matches:
-            transport.update_row(matches[0].record_id, row.fields)
+            transport.update_row(matches[0].record_id, expected)
         else:
-            record_id = transport.create_row(row.fields)
+            record_id = transport.create_row(expected)
         actual = transport.read_row(record_id or "")
     except PermissionTableError as error:
         return _failure(claim, error, action=action, external_record_id=record_id)
 
-    mismatch = compare_readback(row.fields, actual)
+    mismatch = compare_readback(expected, actual)
+    if not mismatch and TOKEN_CIPHER_FIELD not in expected:
+        # **更新路径也必须证明那一列还在。** 我们没提交它，但"发布完成"这个结论断言的是
+        # "这一行现在对 MCP 有效"，而一行没有 ``token_cipher`` 的权限对 MCP 无效。
+        # 不看这一眼，一次被平台清空的密文会在下一轮悄悄收敛成 ``published``。
+        # ``strip()`` 与 :attr:`ExistingPermissionRow.token_cipher` 同一口径：纯空白不算数。
+        if not readback_text(actual.get(TOKEN_CIPHER_FIELD)).strip():
+            mismatch = (TOKEN_CIPHER_FIELD,)
     if mismatch:
         return PublishAttempt(
             outcome=PublishOutcome.MISMATCH,
