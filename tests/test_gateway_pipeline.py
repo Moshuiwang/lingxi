@@ -6,6 +6,10 @@
 `V-会话-08`（续用判定在入队时做出）、`V-会话-09`（忙碌期 `/new`）、
 `V-会话-10`（`/stop` 不被忙碌拦截）、`V-队列-03`（入队未成功不给已受理回复）。
 
+另有 Issue #189 的两小时自动新会话告知（``SessionRotationNoticeTests``）：合同
+「系统明确告诉用户已经开启新会话」的第二条触发路径，矩阵中尚无对应断言编号，
+本模块按合同原文与产品负责人 2026-08-17 定稿约束其触发面与文案。
+
 真库那一面在 ``test_gateway_postgres.py``；长连接生命周期在 ``test_gateway_longconn.py``。
 """
 
@@ -47,6 +51,10 @@ NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
 # 逐字比对；下方 ``test_new_session_text_matches_the_pm_final_copy`` 另外断言内容
 # 目录里的实际值与这个定稿一致，两头都不能漂移。
 NEW_SESSION_TEXT = "已开启新会话，可以开始提问。"
+# 产品负责人 2026-08-17 定稿的两小时自动新会话告知（Issue #189 评论 5310887492，
+# 方案 A：独立文本回复）。同上，下方 ``SessionRotationNoticeTests`` 另有一条用例
+# 断言内容目录里的实际值与这个定稿一致。
+SESSION_ROTATED_TEXT = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"
 
 
 def message(
@@ -444,6 +452,157 @@ class ResumeDecisionAtEnqueueTests(PipelineTestCase):
 
         self.assertFalse(outcome.resumed_session)
         self.assertFalse(self.state.tasks[0].resumed_session)
+
+
+class SessionRotationNoticeTests(PipelineTestCase):
+    """Issue #189：两小时规则**自然**开新会话时，用户必须被明确告知。
+
+    合同「系统明确告诉用户已经开启新会话，不让用户误以为旧上下文仍然有效」有两条
+    触发路径，`/new` 那条由 Issue #175 落地。这一组只约束另一条：用户什么都没敲，
+    只是隔了两小时再提问。判定读的是 `_enqueue` 里那三个条件，`should_resume_session`
+    本身不变——因此这组用例同时是那三个条件的变异检测网：
+    去掉 ``not resumed`` → 会话延续用例红；去掉 ``agent_session_id`` 非空 →
+    `/new` 之后用例红；去掉 ``last_task_ended_at`` 非空 → "有会话但没结束过任务"
+    用例红；把判定整体写死成假 → 两小时用例红。四条已逐一实测。
+    """
+
+    def stale_conversation(self) -> FakeConversation:
+        conversation = FakeConversation(
+            conversation_id="cnv_1",
+            agent_session_id="ses_1",
+            last_task_ended_at=NOW - timedelta(hours=5),
+        )
+        self.state.conversations[("usr_1", "oc_1", "")] = conversation
+        return conversation
+
+    def texts(self) -> list[str]:
+        return [fields["text"] for fields in self.log.fields("reply.send_text")]
+
+    def test_two_hour_gap_sends_exactly_one_notice(self) -> None:
+        self.stale_conversation()
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertFalse(outcome.resumed_session)
+        self.assertEqual(
+            self.texts(),
+            [SESSION_ROTATED_TEXT],
+            "两小时自然开新会话时恰好一条告知，且逐字等于产品负责人定稿",
+        )
+        self.assertEqual(len(self.state.tasks), 1, "告知不改变入队本身")
+
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content_key"], "gateway.session_rotated")
+        self.assertTrue(sent[0]["content_version"])
+
+    def test_no_notice_when_the_task_could_not_be_queued(self) -> None:
+        """`V-队列-03` 的姿态：入队没成功就不给任何「已经换新会话了」的告知。
+
+        这条属性有**三道**互相独立的保险：追加发生在 ``insert_task`` 成功之后；
+        入队失败路径整体丢弃 ``deferred``；注入 store 没有独立发送权时事务失败直接
+        上抛。因此改坏其中任意一道（甚至前两道同时）都不会让本用例变红——它锁的是
+        那条对用户成立的产品属性本身，不是某一处实现位置，与
+        ``EnqueueFailureTests`` 对整条入队失败路径的断言同一姿态。
+        """
+
+        self.stale_conversation()
+        pipeline = self.build(fail_on="insert_task")
+
+        with self.assertRaises(RuntimeError):
+            pipeline.handle_message(message(), now=NOW)
+
+        self.assertEqual(self.texts(), [], "入队失败时不得发出新会话告知")
+
+    def test_continuing_session_gets_no_notice(self) -> None:
+        """会话延续（间隔在两小时内）：一个字都不多说。"""
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_1",
+            agent_session_id="ses_1",
+            last_task_ended_at=NOW - timedelta(minutes=30),
+        )
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertTrue(outcome.resumed_session)
+        self.assertEqual(self.texts(), [], "会话延续不得出现新会话告知")
+
+    def test_first_ever_question_gets_no_notice(self) -> None:
+        """首次提问：``resumed_session`` 同样是 False，但用户没有"此前上下文"，
+        告知只会凭空制造一个不存在的旧会话。"""
+
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertFalse(outcome.resumed_session, "首次提问本来就不续用")
+        self.assertIsNone(
+            self.state.conversations[("usr_1", "oc_1", "")].last_task_ended_at
+        )
+        self.assertEqual(self.texts(), [], "首次提问不得出现新会话告知")
+
+    def test_session_without_a_finished_task_gets_no_notice(self) -> None:
+        """有会话 id 却没有"上一次任务结束时间"：文案里那句「距上次对话已超过两小时」
+        无从谈起，不提示。
+
+        真库上这是一个**不可达**组合——``agent_session_id`` 只在
+        ``postgres_conversation`` 收口任务的同一条 UPDATE 里写入，那条语句同时写
+        ``last_task_ended_at = now()``。这条用例因此是纵深防御：它锁住判定必须同时
+        读这两个字段，将来若有第三处写入打破该不变量，管线不会先一步开始说假话。
+        """
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_1", agent_session_id="ses_1", last_task_ended_at=None
+        )
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertFalse(outcome.resumed_session)
+        self.assertEqual(
+            self.texts(), [], "没有上一次结束时间时不得声称「距上次对话」"
+        )
+
+    def test_question_right_after_new_command_gets_no_notice(self) -> None:
+        """`/new` 之后的第一问：``agent_session_id`` 已被清空，而 `V-会话-05` 要求
+        ``last_task_ended_at`` **保持不动**。用户刚收到过「已开启新会话，可以开始
+        提问。」，此时再补一句「距上次对话已超过两小时」既重复又与事实不符。"""
+
+        self.stale_conversation()
+        pipeline = self.build()
+        pipeline.handle_message(message("evt_new", text="/new"), now=NOW)
+        self.assertEqual(self.texts(), [NEW_SESSION_TEXT])
+
+        conversation = self.state.conversations[("usr_1", "oc_1", "")]
+        self.assertIsNone(conversation.agent_session_id, "/new 已清空会话")
+        self.assertIsNotNone(conversation.last_task_ended_at, "V-会话-05：结束时间不动")
+
+        pipeline.handle_message(message("evt_after_new"), now=NOW)
+        self.assertEqual(
+            self.texts(),
+            [NEW_SESSION_TEXT],
+            "/new 之后的第一问不得再补一条两小时告知",
+        )
+
+    def test_duplicate_delivery_does_not_send_the_notice_twice(self) -> None:
+        """`V-接入-09` 的幂等早退发生在 deferred 之前：平台重投同一条事件时，
+        用户可见面不会出现第二条告知。"""
+
+        self.stale_conversation()
+        pipeline = self.build()
+        pipeline.handle_message(message("evt_dup"), now=NOW)
+        outcome = pipeline.handle_message(message("evt_dup"), now=NOW)
+
+        self.assertTrue(outcome.duplicate)
+        self.assertEqual(
+            self.texts(), [SESSION_ROTATED_TEXT], "重复投递不得发出第二条告知"
+        )
+        self.assertEqual(len(self.state.tasks), 1, "重复投递不得产生第二个任务")
+
+    def test_session_rotated_text_matches_the_pm_final_copy(self) -> None:
+        """内容目录里的 ``gateway.session_rotated`` 必须逐字等于产品负责人
+        2026-08-17 在 Issue #189 定稿的文案（评论 5310887492）。"""
+
+        self.assertEqual(
+            default_content_catalog().text("gateway.session_rotated").text,
+            SESSION_ROTATED_TEXT,
+        )
 
 
 class BusyCommandTests(PipelineTestCase):
