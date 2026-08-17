@@ -876,17 +876,90 @@ class OutputSafetyCanaryTest(unittest.TestCase):
         绕过 load_config 的直接构造（文档支持的测试/嵌入路径）同样被拒绝，而不是
         让注入静默退化成空字符串、canary 永远不触发。"""
 
-        from lingxi.apps.worker.config import WorkerConfig, WorkerConfigError
+        from lingxi.apps.worker.config import WorkerConfigError
 
         with self.assertRaises(WorkerConfigError):
-            WorkerConfig(
-                question="q",
-                read_only_tool=READ_ONLY_TOOL,
-                trace_id="01J0000000000000000TEST000",
-                turn_timeout_seconds=60.0,
-                output_safety_canary="withheld",
-                system_prompt=None,
+            self._build_config(output_safety_canary="withheld", system_prompt=None)
+
+    def _build_config(self, **overrides):
+        from lingxi.apps.worker.config import WorkerConfig
+
+        values = {
+            "question": "q",
+            "read_only_tool": READ_ONLY_TOOL,
+            "trace_id": "01J0000000000000000TEST000",
+            "turn_timeout_seconds": 60.0,
+        }
+        values.update(overrides)
+        return WorkerConfig(**values)  # type: ignore[arg-type]
+
+    def test_direct_construction_rejects_an_invalid_canary_mode(self) -> None:
+        """PR #186 补审 P2-2：档位白名单必须由 WorkerConfig 自身承载。只放在
+        load_config 时，绕过 loader 的直接构造能带着拼错的档位跑起来——注入分支
+        既不是 masked 也不是 withheld，验收拿到的是"安全链路没触发"的假证据。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            self._build_config(
+                output_safety_canary="withheldd", system_prompt=self.SYNTHETIC_PROMPT
             )
+        self.assertNotIn("withheldd", str(raised.exception), "拒绝的值不得回显进错误文案")
+
+    def test_direct_construction_enforces_the_substring_guard(self) -> None:
+        """PR #186 补审 P2-2：子串守卫同样由类型承载，直接构造不得绕过。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            self._build_config(output_safety_canary="withheld", system_prompt="安全策略拦截")
+        self.assertIn("子串", str(raised.exception))
+        self.assertNotIn("安全策略拦截", str(raised.exception), "提示词不回显进错误文案")
+
+    def test_a_prompt_containing_a_protected_text_fails_at_startup(self) -> None:
+        """PR #186 补审 P2-3：子串守卫必须**双向**。受保护文本出现在合成提示
+        之中时，出口约束会把 system prompt 按结构性边界切片当禁词，于是 masked
+        固定幸存句被自己派生出的禁词遮蔽、命中区间外再无真实内容，masked 滑进
+        withheld；夹的若是终态文案则让终态自检炸掉。构造它不需要恶意——多行合成
+        提示中间夹一行幸存句就够了。"""
+
+        from lingxi.apps.worker.config import (
+            OUTPUT_SAFETY_CANARY_SURVIVOR_BODY,
+            WorkerConfigError,
+            load_config,
+        )
+
+        prompt = (
+            "合成安全验收提示词：本句仅用于受控验收。\n"
+            f"{OUTPUT_SAFETY_CANARY_SURVIVOR_BODY}\n"
+            "第三句提供更长的合成片段供切分。"
+        )
+        with self.assertRaises(WorkerConfigError) as raised:
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT=prompt,
+                    LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+                )
+            )
+        self.assertIn("子串", str(raised.exception))
+        self.assertNotIn("合成安全验收提示词", str(raised.exception), "提示词不回显进错误文案")
+        self.assertNotIn(
+            OUTPUT_SAFETY_CANARY_SURVIVOR_BODY,
+            str(raised.exception),
+            "错误文案不回显收到的 prompt 正文",
+        )
+
+    def test_a_normal_multi_sentence_prompt_still_passes_the_two_way_guard(self) -> None:
+        """双向守卫不得误伤：正常的多句合成提示仍然能启动并确定性触发 masked。"""
+
+        report, _, _ = run_turn(
+            self,
+            self._script(),
+            LINGXI_WORKER_SYSTEM_PROMPT=self.SYNTHETIC_PROMPT,
+            LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+        )
+        self.assertTrue(report["turn"]["output_safety"]["blocked"])
+        self.assertFalse(report["turn"]["output_safety"]["withheld"])
 
 
 class WorkerConfigTest(unittest.TestCase):
