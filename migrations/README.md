@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0064_permission_publish_outbox` |
+| head revision | `0065_mcp_token_and_sync_check` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -254,6 +254,25 @@ Issue #156 的 S-C-01。一张新表 `publish_outbox`：权限决定（`app_user
 
 本表本 revision 新增，前滚兼容；`downgrade()` 删表并删触发器函数，不存在需要回填的
 历史值。
+
+## `0065_mcp_token_and_sync_check`（MCP 访问令牌与就绪确认记录）
+
+Issue #156 的 S-C-02。两张新表：`mcp_access_token`（Lingxi 为建档用户签发的问数 MCP
+访问令牌）与 `mcp_sync_check`（发布之后每一次「当前用户 MCP 是否就绪」的判定）。
+
+四条约束刻意写进数据库而不是留给调用方自觉：`mcp_access_token` 的**主键即 `user_id`**
+（"同一个人两条令牌"在结构上不可表达）且**没有任何明文列或指纹列**（令牌明文永不落库，
+只存 AES-256-CBC 密文）；`mcp_sync_check.result` 带 CHECK 的五路取值域（`ready` /
+`no_permission` / `waiting` / `timed_out` / `technical_failure` 互斥，是产品结论而不是
+诊断分类）；`result='ready'` 与 `metric_count > 0` 互为充要（"明确空结果"不构成就绪），
+且未跑探针的两类结论不得携带观察值；`UNIQUE (user_id, permission_version, attempt_no)`
+加上由数据库取号的 `attempt_no`（进程重启后不会重号覆盖既有尝试）。
+
+与数据库设计蓝本的四处差异（`id` 用 ULID、删掉三个 `observed_*` 列、`result` 五态、
+`detail` 换成 `error_code`）与"为什么当前不提供令牌轮换"的取舍详见 revision 文件头部注释。
+
+两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序删表并删触发器函数，不存在
+需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
