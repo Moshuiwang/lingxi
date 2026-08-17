@@ -461,6 +461,11 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
 
     这条判定必须由真库证明：``ON CONFLICT DO NOTHING`` 在已有登记时返回零行，
     是数据库在同一事务里做的判断，不是应用先读后写。
+
+    **只有真库判定留在这里。** 同一断言里「两种 CAS 不能同时传」那一条是
+    ``save()`` 开头的纯内存 ``ValueError``，与数据库无关，挂在这个门控下等于在
+    没有数据库的机器上从来不跑；它已搬到
+    ``tests/test_identity_credentials.py::VaultSaveArgumentGuardTest``（#215）。
     """
 
     def setUp(self) -> None:
@@ -523,15 +528,6 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
         credential = self.vault.load()
         assert credential is not None
         self.assertEqual(credential.grant.refresh_token.reveal(), "fake-renewed-token")
-
-    def test_the_two_cas_conditions_cannot_be_combined(self) -> None:
-        with self.assertRaises(ValueError):
-            self.vault.save(
-                subject_open_id=DELEGATED_SUBJECT,
-                grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
-                require_absent_registration=True,
-                expected_registered_subject_open_id=DELEGATED_SUBJECT,
-            )
 
     def test_bootstrapping_an_employee_open_id_is_still_rejected_by_the_database(self) -> None:
         """V-身份-02 的反向触发器对首次建立同样有效：错误主体进不了登记。"""

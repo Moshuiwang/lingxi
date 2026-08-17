@@ -4,13 +4,20 @@
 密文落库那一半在 tests/test_identity_postgres_records.py；这里证明明文
 不会经由 ``repr`` / ``str`` / 日志格式化泄漏。
 V-身份-04（专用授权失效时不重放旧凭据、直接撤销）的判定规则。
+V-身份-11 的**参数守卫**那一半（两种 CAS 不能同时传），见
+``VaultSaveArgumentGuardTest``：被测的是一条纯内存 ``ValueError``，
+真库那一半（``ON CONFLICT DO NOTHING`` 的反向 CAS）仍在
+tests/test_identity_postgres_records.py。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
@@ -140,6 +147,60 @@ class RefreshOutcomeTest(unittest.TestCase):
         for outcome in RefreshOutcome:
             with self.subTest(outcome=outcome):
                 self.assertIn(decide_after_refresh(outcome), (CredentialAction.ROTATE, CredentialAction.REVOKE))
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("cryptography"),
+    "跳过：构造凭据保管对象需要 cryptography（绝不降级为明文保存）",
+)
+class VaultSaveArgumentGuardTest(unittest.TestCase):
+    """V-身份-11 的参数守卫：两种 CAS 不能同时传（`delegated_credentials.save` 开头）。
+
+    **这条不需要数据库**，因此不挂在 ``LINGXI_POSTGRES_DSN`` 门控下。被测的守卫是
+    ``save()`` 第一行的纯内存 ``ValueError``：它在文件锁与连库之前，一次保存只能有
+    一个判定条件，否则"到底以哪个为准"会变成调用方的隐式约定。放在真库门控里的后果
+    是：没有数据库的机器上它**从来没跑过**，而它恰恰是那台机器上唯一跑得动的一条。
+
+    真库那一半（登记表为空才写入的反向 CAS）留在
+    ``tests/test_identity_postgres_records.py::SubjectBootstrapCasTest``。
+    """
+
+    # 故意不可达：一旦守卫被挪到连库之后，这里会因为连不上而**响亮失败**，
+    # 不会变成一条"看起来通过了"的用例。`.invalid` 是保留后缀，不会解析到任何主机。
+    UNREACHABLE_DSN = "postgresql://lingxi-guard-test.invalid:1/never-reached"
+
+    def test_the_two_cas_conditions_cannot_be_combined(self) -> None:
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "delegated-credential.enc"
+        vault = HostFileDelegatedCredentialVault(
+            self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
+        )
+
+        # grant 在断言块**之外**构造：放进 assertRaises 里的话，将来
+        # AuthorizationGrant 自己抛 ValueError 也会让这条用例通过，而被测的守卫
+        # 根本没被执行过。
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, "")
+
+        with self.assertRaises(ValueError) as raised:
+            vault.save(
+                subject_open_id="ou_delegated_authorization_subject",
+                grant=grant,
+                require_absent_registration=True,
+                expected_registered_subject_open_id="ou_delegated_authorization_subject",
+            )
+
+        # 断言具体消息：只断言"抛了 ValueError"分不清是守卫拒绝，还是参数校验、
+        # 密钥解析之类的别的 ValueError 顺手把用例染绿了。
+        self.assertIn("首次建立与既有主体 CAS 不能同时使用", str(raised.exception))
+
+        # 守卫在文件锁之前：连锁文件都不该出现，密文更不该落盘。
+        self.assertFalse(path.exists(), "被拒的保存不得写入密文")
+        self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
 
 
 if __name__ == "__main__":
