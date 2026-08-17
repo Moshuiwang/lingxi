@@ -79,6 +79,15 @@ def _attempt(
     )
 
 
+class _Rollback(Exception):
+    """哨兵异常：让持有连接的事务块以**异常**退出，从而真正回滚。
+
+    psycopg3 的 ``connection.transaction()`` 干净退出时提交、只有异常退出才回滚。
+    用例里要制造"这次认领没发生过"的状态，就必须显式抛一个自己认得出来的异常——
+    用 ``AssertionError`` 之类会与真实断言失败混淆，用它则一眼能看出是刻意回滚。
+    """
+
+
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
 class PermissionPublishPostgresTestCase(unittest.TestCase):
     """真库断言的共同底座。"""
@@ -304,22 +313,31 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         )
 
         with connect(self._dsn) as holder:
-            with holder.transaction():
-                with holder.cursor() as cursor:
-                    # 模拟消费者 A 的认领：已经改了行、**还没提交**。
-                    cursor.execute(
-                        "UPDATE publish_outbox SET status = 'publishing', "
-                        "attempts = attempts + 1, claimed_at = now() WHERE id = %s",
-                        (first.outbox_id,),
-                    )
-                    # 消费者 B 走正式认领路径：v1 被锁（SKIP LOCKED 跳过），而 v2 必须
-                    # 被"更早的非终态兄弟行"挡住。拿到 v2 就是那个 bug 回来了。
-                    self.assertIsNone(self.store.claim_next())
+            try:
+                with holder.transaction():
+                    with holder.cursor() as cursor:
+                        # 模拟消费者 A 的认领：已经改了行、**还没提交**。
+                        cursor.execute(
+                            "UPDATE publish_outbox SET status = 'publishing', "
+                            "attempts = attempts + 1, claimed_at = now() WHERE id = %s",
+                            (first.outbox_id,),
+                        )
+                        # 消费者 B 走正式认领路径：v1 被锁（SKIP LOCKED 跳过），而 v2
+                        # 必须被"更早的非终态兄弟行"挡住。拿到 v2 就是那个 bug 回来了。
+                        self.assertIsNone(self.store.claim_next())
+                    # **必须主动抛异常才会回滚**：psycopg3 的 `transaction()` 干净退出
+                    # 时是**提交**，只有异常退出才回滚（定向复核发现）。不抛的话 v1 会
+                    # 以 publishing 落库，下面那句"回滚后照常可认领"永远不成立。
+                    # 哨兵异常同时把 attempts 的自增一并回滚，语义正好是"这次认领没发生"。
+                    raise _Rollback
+            except _Rollback:
+                pass
 
         # A 的事务回滚后，v1 回到 pending，照常可被认领。
         recovered = self.store.claim_next()
         assert recovered is not None
         self.assertEqual(recovered.outbox_id, first.outbox_id)
+        self.assertEqual(recovered.attempts, 1)
 
     def test_a_newer_version_waits_until_the_older_one_reaches_a_terminal_state(self) -> None:
         """已提交路径上的同一条规则：更早的意图没走到终态之前，新版本不被认领。"""
