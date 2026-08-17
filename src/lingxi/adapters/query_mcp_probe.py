@@ -311,18 +311,30 @@ class QueryMcpProbe:
         error = payload.get("error")
         if error is not None:
             code = error.get("code") if isinstance(error, Mapping) else None
-            denied = isinstance(code, int) and code in self._denied_error_codes
+            if isinstance(code, bool) or not isinstance(code, int):
+                # **错误码必须是 JSON-RPC 规定的整数**，否则我们连"这是什么错"都不知道。
+                # 不把它拼进自己的错误码：那等于让一个**外部可控的字符串**一路进到
+                # ``mcp_sync_check.error_code``（落库、进审计），而且超过 200 字符时还会
+                # 撞上那一列的 CHECK，把一次本该记下来的失败变成整轮确认中断。
+                raise McpProbeError("invalid_result_shape", denied=False)
+            denied = code in self._denied_error_codes
             # **错误消息一个字都不进我们的错误码**：它是服务端文本，可能回显请求内容。
             raise McpProbeError(f"jsonrpc_{code}", denied=denied)
         result = payload.get("result")
         if not isinstance(result, Mapping):
             raise McpProbeError("invalid_result_shape", denied=False)
-        flag = result.get("isError")
-        if flag is not None and not isinstance(flag, bool):
-            # **类型不对就当读不懂**，而不是"不是 True 那就当没错"。``1`` / ``"true"``
-            # 这类取值在 ``is True`` 下判否，于是一份自称出错、却又带着非空 metrics 的
-            # 响应会被一路读成就绪——正好违反"未知形状一律技术失败"。
-            raise McpProbeError("invalid_result_shape", denied=False)
+        # **按键是否存在判断**，不按取值是不是 ``None``：显式的 ``"isError": null`` 与
+        # "根本没有这个键"在 ``result.get()`` 下无法区分，于是一份自称出错、却又带着
+        # 非空 metrics 的响应会被一路读成就绪。键在就必须是 bool。
+        if "isError" in result:
+            flag = result["isError"]
+            if not isinstance(flag, bool):
+                # **类型不对就当读不懂**，而不是"不是 True 那就当没错"。``1`` / ``"true"``
+                # / ``null`` 这类取值在 ``is True`` 下都判否——正好违反"未知形状一律
+                # 技术失败"。
+                raise McpProbeError("invalid_result_shape", denied=False)
+        else:
+            flag = False
         if flag is True:
             # **默认按技术失败**（``tool_error_is_denied=False``）。``isError`` 只说明
             # "这次工具调用失败了"，它同时覆盖鉴权拒绝和工具自己崩溃、上游数据源不可用

@@ -33,6 +33,7 @@ from lingxi.core.permission.mcp_readiness import (
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
     MAX_ATTEMPTS,
+    MAX_ERROR_CODE_LENGTH,
     McpProbeError,
     McpReadinessConfirmation,
     ReadinessAttempt,
@@ -668,6 +669,26 @@ class AttemptInvariantTest(unittest.TestCase):
                         metric_count=None,
                         error_code=blank,
                     )
+
+    def test_over_long_error_codes_are_rejected_in_core(self) -> None:
+        """**H2 的 core 侧**：超限值必须在这里就被拒，不能等到数据库 CHECK。
+
+        等到数据库那一侧才失败，抛的是**记账失败**，会中断整轮确认——而这本该只是一次
+        可记录的失败。上限与迁移 ``0065`` 的 CHECK 是同一个数。
+        """
+
+        self.assertEqual(MAX_ERROR_CODE_LENGTH, 200)
+        self._attempt(
+            outcome=ReadinessOutcome.TECHNICAL_FAILURE,
+            metric_count=None,
+            error_code="x" * MAX_ERROR_CODE_LENGTH,
+        )
+        with self.assertRaises(ValueError):
+            self._attempt(
+                outcome=ReadinessOutcome.TECHNICAL_FAILURE,
+                metric_count=None,
+                error_code="x" * (MAX_ERROR_CODE_LENGTH + 1),
+            )
 
     def test_every_non_ready_outcome_requires_an_error_code(self) -> None:
         for outcome in (

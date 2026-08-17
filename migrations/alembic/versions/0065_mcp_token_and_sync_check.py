@@ -215,7 +215,10 @@ CREATE TABLE mcp_sync_check (
     --   waiting           ：必须有错误码；观察值只能缺省（明确拒绝）或恰为 0（空结果）
     --   technical_failure ：必须有错误码，且**没有**观察值——探针没跑通，任何数字都是假的
     --   no_permission     ：必须有错误码，且没有观察值（这一路压根不发探针）
-    --   timed_out         ：同上
+    --   timed_out         ：必须有错误码，且**不得保留可用观察值**。多数情况下它压根
+    --                       没发探针（预算耗尽收口）；但 `success_after_deadline`
+    --                       那一路是探针成功返回之后被降级的——观察值在那时一并丢弃，
+    --                       因为它已经落在承诺窗口之外，留着会被读成"这一轮其实看见了"。
     -- 与 core 的 _require_attempt_shape 一一对应，两处必须同时改。
     CHECK (
         CASE result

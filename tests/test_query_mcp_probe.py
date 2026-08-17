@@ -229,6 +229,29 @@ class ClassificationTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "invalid_result_shape")
                 self.assertFalse(caught.exception.denied)
 
+    def test_an_explicit_null_is_error_is_unreadable(self) -> None:
+        """**H1**：显式 ``"isError": null`` 与"没有这个键"必须区分开。
+
+        按取值判（``result.get("isError")``）时两者都是 ``None``，于是一份自称出错、
+        却又带着非空 metrics 的响应会被一路读成就绪。判据因此是**键在不在**。
+        """
+
+        probe, _ = _probe(
+            _echo(
+                {"result": {"isError": None, "structuredContent": {"metrics": ["日活", "收入"]}}}
+            )
+        )
+        with self.assertRaises(McpProbeError) as caught:
+            probe.list_metrics(user_id=USER)
+        self.assertEqual(caught.exception.code, "invalid_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_a_missing_is_error_key_is_a_normal_success(self) -> None:
+        """对照：键**不在**才是"这次调用没出错"，不能被上一条误伤。"""
+
+        probe, _ = _probe(_echo({"result": {"structuredContent": {"metrics": ["日活"]}}}))
+        self.assertEqual(probe.list_metrics(user_id=USER), 1)
+
     def test_is_error_false_is_a_normal_success(self) -> None:
         """对照：显式 ``false`` 是合法的成功响应，不能被上一条误伤。"""
 
@@ -255,6 +278,35 @@ class ClassificationTest(unittest.TestCase):
         self.assertFalse(caught.exception.denied)
         # 服务端文本一个字都不进我们的错误码。
         self.assertNotIn("回显了请求内容", str(caught.exception))
+
+    def test_a_non_integer_error_code_never_reaches_our_error_code(self) -> None:
+        """**H2**：``error.code`` 必须是整数，否则统一落 ``invalid_result_shape``。
+
+        拼进自己的错误码等于让一个**外部可控的字符串**一路进到
+        ``mcp_sync_check.error_code``（落库、进审计）；超过 200 字符时还会撞上那一列的
+        CHECK，把一次本该记下来的失败变成整轮确认中断。
+        """
+
+        payloads = (
+            {"error": {"code": "not_authorized"}},
+            {"error": {"code": None}},
+            {"error": {"code": True}},
+            {"error": {"code": 1.5}},
+            {"error": {"code": ["x"]}},
+            {"error": {"message": "没有 code"}},
+            {"error": "整个 error 不是对象"},
+            {"error": {"code": "长" * 500}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=str(payload)[:40]):
+                probe, _ = _probe(_echo(payload))
+                with self.assertRaises(McpProbeError) as caught:
+                    probe.list_metrics(user_id=USER)
+                self.assertEqual(caught.exception.code, "invalid_result_shape")
+                self.assertFalse(caught.exception.denied)
+                # 外部文本一个字都没进我们的错误码。
+                self.assertNotIn("not_authorized", caught.exception.code)
+                self.assertLessEqual(len(caught.exception.code), 200)
 
     def test_denied_error_codes_are_injectable(self) -> None:
         probe, _ = _probe(_echo({"error": {"code": -32003}}), denied_error_codes=(-32003,))

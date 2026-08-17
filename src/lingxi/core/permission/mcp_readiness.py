@@ -123,6 +123,11 @@ MAX_BUDGET_SECONDS = 3600
 DEFAULT_PROBE_TIMEOUT_SECONDS = 20
 MIN_PROBE_TIMEOUT_SECONDS = 1
 
+#: 错误码的长度上限，与迁移 ``0065`` 的 ``mcp_sync_check.error_code`` CHECK 是同一个数。
+#: 改动必须两处同时改，否则超限值会在数据库那一侧才失败，把一次可记录的失败变成
+#: 整轮确认中断。
+MAX_ERROR_CODE_LENGTH = 200
+
 #: 一次确认最多允许发多少次探针。它挡的是 ``interval=1, budget=3600`` 这类**合法却荒谬**
 #: 的组合：3601 次调用会把问数 MCP 的配额打光。做法是**拒绝这样的配置**，不是悄悄截断——
 #: 截断会让实际节奏与配置说的不是一回事，而那种偏差没人看得见。
@@ -303,18 +308,27 @@ def _require_attempt_shape(
     | ``ready`` | **必须没有** | 必须有，且 > 0 |
     | ``waiting`` | 必须有 | 没有（明确拒绝）或恰为 0（空结果） |
     | ``technical_failure`` | 必须有 | **必须没有**（探针没跑通，任何数字都是假的） |
-    | ``no_permission`` / ``timed_out`` | 必须有 | **必须没有**（这两路压根不发探针） |
+    | ``no_permission`` / ``timed_out`` | 必须有 | **必须没有**（见下） |
+
+    最后一行的理由分两种：``no_permission`` 压根不发探针；``timed_out`` 多数情况下也没发
+    （预算耗尽收口），但 ``success_after_deadline`` 那一路是探针**成功返回之后**被降级的
+    ——观察值在那时一并丢弃，因为它已经落在承诺窗口之外，留着会被读成"这一轮其实看见了"。
     """
 
     if isinstance(metric_count, bool) or not isinstance(metric_count, (int, type(None))):
         raise ValueError("可见指标条数必须是整数或缺省")
     if metric_count is not None and metric_count < 0:
         raise ValueError("可见指标条数不得为负")
-    if error_code is not None and (not isinstance(error_code, str) or not error_code.strip()):
+    if error_code is not None:
         # 空串与纯空白等同于"没写"：它们能满足"非 None"，却什么都没说明，而下面正是靠
-        # "有没有错误码"判断"未就绪有没有给出原因"。数据库侧同口径（迁移 0065 的
-        # ``BTRIM(error_code) <> ''``）。
-        raise ValueError("错误码必须是非空字符串，空白不算")
+        # "有没有错误码"判断"未就绪有没有给出原因"。
+        if not isinstance(error_code, str) or not error_code.strip():
+            raise ValueError("错误码必须是非空字符串，空白不算")
+        # 长度上限与迁移 ``0065`` 的 CHECK **同一个数**。在这里也拦一道，是因为超限时
+        # 数据库那一侧抛的是记账失败，会中断整轮确认——而这本该只是一次可记录的失败。
+        # 错误码是**码**不是消息：放宽就会有人往里塞异常正文（含凭据与人员资料）。
+        if len(error_code) > MAX_ERROR_CODE_LENGTH:
+            raise ValueError(f"错误码不得超过 {MAX_ERROR_CODE_LENGTH} 个字符：它是码，不是消息")
     if outcome is ReadinessOutcome.READY:
         if metric_count is None or metric_count <= 0:
             raise ValueError("就绪必须带着大于零的可见指标条数（明确空结果不算就绪）")
