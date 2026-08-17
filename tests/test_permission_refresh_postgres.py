@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -34,6 +35,8 @@ from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublis
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 from lingxi.apps.scheduler.permission_refresh import PermissionRefreshDuty
+
+REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，每日权限重算的真库断言未验证（需真实 PostgreSQL 16）"
@@ -240,6 +243,11 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             )
             return [(str(row[0]), int(row[1]), str(row[2])) for row in cursor.fetchall()]
 
+    def _payload(self, user_id: str) -> dict:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT payload FROM publish_outbox WHERE user_id = %s", (user_id,))
+            return dict(cursor.fetchone()[0])
+
     def _version(self, user_id: str) -> int:
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT permission_version FROM app_user WHERE id = %s", (user_id,))
@@ -252,6 +260,29 @@ class _Clock:
 
     def __call__(self) -> datetime:
         return self.moment
+
+    def advance(self, delta: timedelta) -> None:
+        self.moment = self.moment + delta
+
+
+class _ScriptedSelection(PostgresGalaxySnapshotReader):
+    """第一次选择给出指定批次，之后如实重问库里的当前有效批次。
+
+    用它把「选择与读取之间库里换了批次」变成确定性事件：真实并发窗口在测试里没法稳定
+    复现，而这段代码要挡的正是那个窗口。第二次调用**不作假**——复核拿到的是库的真实
+    答案，因此这组用例证明的是判据本身，不是脚本。
+    """
+
+    def __init__(self, dsn: str, *, first: str) -> None:
+        super().__init__(dsn)
+        self._first = first
+        self.calls = 0
+
+    def current_batch_id(self):
+        self.calls += 1
+        if self.calls == 1:
+            return self._first
+        return super().current_batch_id()
 
 
 class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
@@ -295,7 +326,14 @@ class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
 class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):
     """否定断言：内容没变的重跑不推进版本、不排第二条意图。"""
 
-    def test_a_second_round_the_same_day_changes_nothing(self) -> None:
+    def test_a_later_round_with_a_moved_clock_still_changes_nothing(self) -> None:
+        """第二轮**推进时钟**，仍然判 ``UNCHANGED``。
+
+        两轮用同一个 ``NOW`` 会掩盖一类真实回归：只要变化判定的指纹里混进了时间字段
+        （``updated_at`` 每轮都不同），"内容没变"就会天天被判成"变了"，于是每天给每个人
+        重发一次内容完全相同的权限。时钟不动的用例对这种回归**永远是绿的**。
+        """
+
         self._insert_users()
         self._write_roster_snapshot()
         self._import_galaxy()
@@ -303,8 +341,11 @@ class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):
 
         first = self._duty()
         first.run_once()
-        # 换一个新的职责实例＝模拟进程重启：水位没有持久载体，当天会再跑一轮。
-        # 产品上这一轮必须什么都不改变。
+        first_payload = self._payload(ACTIVE_USER)
+
+        # 换一个新的职责实例＝模拟进程重启（水位没有持久载体，当天会再跑一轮），
+        # 同时把时钟推到几小时后：产品上这一轮仍然必须什么都不改变。
+        self.clock.advance(timedelta(hours=6))
         second = self._duty()
         report = second.run_once()
 
@@ -312,6 +353,35 @@ class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(report.unchanged, 1)
         self.assertEqual(len(self._outbox()), 1, "不得排出第二条意图")
         self.assertEqual(self._version(ACTIVE_USER), 1, "版本不得被无变化的一轮推进")
+        self.assertEqual(
+            self._payload(ACTIVE_USER)["updated_at"],
+            first_payload["updated_at"],
+            "既有意图的内容快照连时间戳都不该被改写",
+        )
+
+    def test_the_next_day_round_is_still_unchanged(self) -> None:
+        """跨日再跑一轮（同一进程实例、时钟走到明天）：仍然无变化。
+
+        与上一条的区别是它同时跨过了水位的日界——水位放行之后，产品语义仍由
+        ``record_decision`` 的内容比对决定，而不是"新的一天所以重发一次"。
+        """
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+
+        duty = self._duty()
+        duty.run_once()
+        # 花名册快照也要跟着到第二天，否则第二轮会停在顺序判据上。
+        self.clock.advance(timedelta(days=1))
+        self._write_roster_snapshot(captured_at=NOW + timedelta(days=1))
+        report = duty.run_once()
+
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(report.enqueued, 0)
+        self.assertEqual(len(self._outbox()), 1)
+        self.assertEqual(self._version(ACTIVE_USER), 1)
 
 
 class RevokedUserTest(PermissionRefreshPostgresTestCase):
@@ -422,14 +492,14 @@ class GalaxySnapshotReaderTest(PermissionRefreshPostgresTestCase):
         self.assertIsNone(reader.load_current())
 
     def test_a_batch_that_expires_between_selection_and_read_is_rejected(self) -> None:
-        """读完之后复核批次仍然有效——这是**清理恰好落在读取中间**那条路径的抓手。
+        """读完之后**重新问一次当前有效批次**，答案必须仍是刚才那一批。
 
         九十天保留清理按 ``expires_at`` 连带删除整批行；四条读取语句在
         ``READ COMMITTED`` 下各取一次数据库快照，因此"选批次时还有效、读到一半没了"
-        是真实可达的。这里用一个把选择结果换成过期批次的子类来确定性地复现它。
+        是真实可达的。这里用 :class:`_ScriptedSelection` 确定性地复现它：第一次选择给出
+        那个过期批次，复核时如实重问，库里已经没有当前有效批次。
         """
 
-        self._import_galaxy()
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO galaxy_import_batch
@@ -439,11 +509,43 @@ class GalaxySnapshotReaderTest(PermissionRefreshPostgresTestCase):
                 ("gib_expired_between", "合成导出（测试）", "digest-between"),
             )
 
-        class _StaleSelection(PostgresGalaxySnapshotReader):
-            def current_batch_id(self):
-                return "gib_expired_between"
+        reader = _ScriptedSelection(self._dsn, first="gib_expired_between")
 
-        self.assertIsNone(_StaleSelection(self._dsn).load_current())
+        self.assertIsNone(reader.load_current())
+        self.assertEqual(reader.calls, 2, "选择一次、复核一次")
+
+    def test_a_batch_superseded_between_selection_and_read_is_rejected(self) -> None:
+        """读取期间**一次新导入完成**：手里这份行是上一批的，整轮失败关闭。
+
+        这是复核判据从「A 仍 complete 未过期」改成「A 仍是**当前**批次」要挡的那条腿：
+        旧批次转 ``superseded`` 之后它本身仍然 complete、仍然未过期，旧判据一路放行，
+        于是用刚被取代的权限覆盖新权限——而外部发布表没有版本号，谁也发现不了。
+        """
+
+        first = self._import_galaxy(digest="digest-a")
+        second = self._import_galaxy(digest="digest-b")
+        self.assertNotEqual(first, second)
+
+        reader = _ScriptedSelection(self._dsn, first=first)
+
+        self.assertIsNone(reader.load_current(), "选到 A、复核发现当前已是 B → 不可用")
+        self.assertEqual(reader.current_batch_id(), second)
+
+    def test_the_recheck_does_not_restate_the_current_batch_predicate(self) -> None:
+        """否定断言：适配器里**不得**复写「complete 且未过期」。
+
+        那是 `V-银河-06` 的规则，唯一实现在导入层。复写一份就有了第二处口径，早晚分叉
+        ——而分叉的表现是"复核通过了、用的却不是当前那一批"。复核因此只能是"重调一次
+        并比对 id"。
+        """
+
+        from test_permission_refresh_duty import code_without_docstrings
+
+        code = code_without_docstrings(
+            REPOSITORY_ROOT / "src/lingxi/adapters/postgres_galaxy_snapshot.py"
+        )
+        for forbidden in ("'complete'", "expires_at", "superseded", "status ="):
+            self.assertNotIn(forbidden, code, f"批次判据不得在适配器里复写：{forbidden}")
 
     def test_a_superseded_batch_is_not_read(self) -> None:
         first = self._import_galaxy(digest="digest-old")

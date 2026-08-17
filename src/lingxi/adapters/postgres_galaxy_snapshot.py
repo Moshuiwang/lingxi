@@ -65,12 +65,6 @@ USER_ROLE_COLUMNS: tuple[str, ...] = ("user_id", "role_name")
 USER_DATACOUNTRY_COLUMNS: tuple[str, ...] = ("user_id", "datacountry_id")
 COUNTRY_COLUMNS: tuple[str, ...] = ("country_key", "name", "name_cn", "boss_company_id")
 
-#: 批次仍然有效的复核语句。判据与导入层的 ``current_batch_id`` 同口径
-#: （``complete`` 且未过期），只是这里问的是"刚才那一批现在还算不算数"。
-BATCH_STILL_VALID_SQL = (
-    "SELECT 1 FROM galaxy_import_batch WHERE id = %s AND status = 'complete' AND expires_at > now()"
-)
-
 
 def _select(source_table: str, columns: Sequence[str]) -> str:
     """按源表名与列名拼一条整批读取语句。
@@ -175,12 +169,27 @@ class PostgresGalaxySnapshotReader:
         一行都没有"不同——后者会返回一份空快照，而空快照会让每个人都聚合成无权限，
         那是数据事实，不是不可用。
 
-        **读完再复核一次批次仍然有效**：四条语句在 ``READ COMMITTED`` 下各取一次数据库
-        快照，而九十天保留清理会按 ``expires_at`` 连带删除整批行（外键 ``CASCADE``）。
-        清理恰好落在读取中间时，回来的是一份**残缺**的快照——它不会让谁多拿权限
-        （少行只会少算范围，聚合层再往下就是失败关闭），但会让一批在职员工的权限被算成
-        "没有"。复核便宜，且把这种情形变成响亮的"本轮不可用"，而不是一份看起来正常的
-        残缺快照。
+        **读完之后重新问一次「当前有效批次是哪一批」，答案必须仍是刚才那一批**。四条
+        语句在 ``READ COMMITTED`` 下各取一次数据库快照，读取期间库里可能发生三件事，
+        这一次重调把三条腿一起盖住：
+
+        - **一次新导入完成**：旧批次转 ``superseded``、新批次成为当前有效。此时手里
+          这份行是**上一批**的——拿它去发布，等于用刚刚被取代的权限覆盖新权限，而外部
+          发布表没有版本号，谁也发现不了；
+        - **批次过期**：九十天上限到了，它不再是当前有效批次；
+        - **保留清理级联删除**：按 ``expires_at`` 删批次时子表随外键 ``CASCADE`` 一起
+          消失，读到的是一份**残缺**快照。它不会让谁多拿权限（少行只会少算范围，聚合层
+          再往下就是失败关闭），但会让一批在职员工的权限被算成"没有"。
+
+        判据刻意是**重调 :meth:`current_batch_id` 并比对 id**，而不是在这里复写一遍
+        「``complete`` 且未过期」：那条谓词是 `V-银河-06` 的规则，复写一份就有了第二处
+        口径，早晚分叉——而分叉的表现是"复核通过了、用的却不是当前那一批"。
+
+        **这道复核不保证「发布出去的一定是最新一批」，也不试图保证**：复核之后到逐人
+        ``record_decision`` 之间仍有窗口，一次恰好在此时完成的新导入要等下一天那一轮
+        才生效。这与"新批次在当日轮跑完之后才完成"是同一件事——**日频刷新的固有时延**，
+        不是缺陷。这道复核要挡的是更严重的那一种：读到一半换了批次，于是发布的内容
+        **自身不自洽**（一部分来自 A、一部分来自 B）。
         """
 
         batch_id = self.current_batch_id()
@@ -198,11 +207,14 @@ class PostgresGalaxySnapshotReader:
                 USER_DATACOUNTRY_COLUMNS,
             )
             country_rows = _rows(cursor, _select("sys_country", COUNTRY_COLUMNS), batch_id, COUNTRY_COLUMNS)
-            cursor.execute(BATCH_STILL_VALID_SQL, (batch_id,))
-            still_valid = cursor.fetchone() is not None
 
-        if not still_valid:
-            logger.warning("银河批次在读取期间失效，本次读取不可用 batch=%s", batch_id)
+        confirmed = self.current_batch_id()
+        if confirmed != batch_id:
+            logger.warning(
+                "银河当前有效批次在读取期间改变，本次读取不可用 selected=%s now=%s",
+                batch_id,
+                confirmed,
+            )
             return None
 
         snapshot = GalaxyPermissionSnapshot(
