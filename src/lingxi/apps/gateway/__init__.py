@@ -42,18 +42,25 @@ from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, O
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
 
 from .config import GatewayConfig, GatewayConfigError, load_config
+from .delivery import LOOP_ALERT_TRACE_ID
 from .log_redaction import install_credential_redaction
 
 logger = logging.getLogger(__name__)
 
 
-def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], None]:
+def _combined_heartbeat(
+    alerting_duty: Any, liveness_role: str, *, watchdog: Callable[[], None] | None = None
+) -> Callable[[], None]:
     """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
 
     两件事共用同一个触发时机——都是"这条循环这一轮还活着"的证据——但服务不同的
     消费者：``AlertManager`` 供跨进程重启也能观察到的阈值/去重状态机，活性文件
     供同容器内的 ``python -m lingxi.apps.healthcheck`` 判断"主循环是否还在跳动"
     （见 ``apps/liveness.py`` 模块说明）。
+
+    ``watchdog``（Issue #191）是搭在同一个时机上的第三件事：**这条循环还活着的
+    时候，顺手确认另一条循环也还活着**。放在心跳之后调用，一次看门狗异常不会
+    连累前面两件真正的心跳工作。
     """
 
     beat = alerting_duty.heartbeat_callback(liveness_role)
@@ -61,8 +68,76 @@ def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], 
     def combined() -> None:
         beat()
         touch_liveness(liveness_role)
+        if watchdog is not None:
+            watchdog()
 
     return combined
+
+
+def run_delivery_loop(
+    consumer: Any,
+    *,
+    stop: threading.Event,
+    poll_interval_seconds: float,
+    heartbeat: Callable[[], None] | None = None,
+    on_tick: Callable[[], None] | None = None,
+    on_dead: Callable[[str], None],
+) -> None:
+    """投递消费后台线程的实际入口：跑循环，并保证它一旦退出一定有人知道（#191）。
+
+    ``DeliveryConsumer.run_forever`` 自己已经把单轮异常隔离掉，不会因为一次瞬时
+    数据库错误退出；但"线程没了"这件事不能只由那一层保证——解释器级错误
+    （``MemoryError`` 一类 ``BaseException``）、或将来某次改动把隔离改漏，都会让
+    这条线程无声消失。此前 ``main()`` 只在 ``supervisor.run()`` 返回后才 ``join``，
+    于是"Gateway 照常收消息、却一条也投不出去"要等容器活性文件过期才被健康检查
+    间接发现，而 plain Docker Compose 并不会因为 unhealthy 重启容器（Issue #191）。
+
+    因此 ``on_dead`` 覆盖两条退出路径：异常退出（连 ``BaseException`` 一起）、以及
+    "没有收到停机信号却正常返回"。停机信号已置位时的正常返回是**预期**退出，
+    不上报——那是优雅停机，不是故障。
+    """
+
+    try:
+        consumer.run_forever(
+            stop=stop,
+            poll_interval_seconds=poll_interval_seconds,
+            heartbeat=heartbeat,
+            on_tick=on_tick,
+        )
+    except BaseException as error:
+        # 原样抛回线程：Python 会打印完整栈，排查时那份栈是唯一能定位到具体
+        # 语句的证据；告警只带异常类型，不带正文。
+        on_dead(type(error).__name__)
+        raise
+    if not stop.is_set():
+        on_dead("returned_without_stop")
+
+
+def delivery_thread_watchdog(
+    thread: threading.Thread, *, stop: threading.Event, on_dead: Callable[[str], None]
+) -> Callable[[], None]:
+    """给长连接主线程用的看门狗（Issue #191）：确认投递线程还活着。
+
+    ``main()`` 的主线程一直阻塞在 ``supervisor.run()`` 里直到停机，它没有别的机会
+    发现后台线程已经死亡。长连接每一轮（含没有用户消息时的空闲心跳）都会调用一次
+    心跳回调，把这次检查挂在同一个时机上：不新增线程、不新增定时器，也不改变任何
+    既有的停机语义。
+
+    只上报一次——线程死亡是不可逆状态，每一轮重复上报只会刷屏。线程还没 ``start()``
+    时 ``ident`` 为 ``None``，那是"尚未开始"而不是"已经死亡"，不上报。
+    """
+
+    reported = [False]
+
+    def check() -> None:
+        if reported[0] or stop.is_set():
+            return
+        if thread.ident is None or thread.is_alive():
+            return
+        reported[0] = True
+        on_dead("thread_not_alive")
+
+    return check
 
 
 class _LoggingAudit:
@@ -404,6 +479,12 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     不碰长连接管线的内存对象，因此不需要额外的跨线程同步。这是 #152 停止条件里
     "同一 Gateway 进程能否在不阻塞长连接的情况下可靠消费" 的落地方式：后台线程的
     数据库轮询与出站调用不会阻塞长连接协程接收下一条事件。
+
+    **两条循环互相看着对方**（Issue #191）：投递线程经 ``run_delivery_loop`` 起跑，
+    它的任何非预期退出都会立刻上报告警；长连接主线程每一轮心跳顺带跑一次
+    ``delivery_thread_watchdog``。此前投递线程死掉之后没有任何进程内的东西会发现，
+    只能等容器活性文件过期、健康检查变红，而 plain Docker Compose 不会因 unhealthy
+    重启容器——用户侧看到的就是"发了没反应"。
     """
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -434,19 +515,41 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     # 心跳/活性 key（见 build_alerting_duty、apps.liveness 的角色说明），因此
     # 任一条循环停摆都能被单独发现，不会被另一条仍然健康掩盖。
     alerting_duty = build_alerting_duty(config)
-    supervisor = build_supervisor(
-        config,
-        should_stop=stop_event.is_set,
-        heartbeat=_combined_heartbeat(alerting_duty, "gateway-longconn"),
-    )
+    delivery_alert = alerting_duty.delivery_alert_callback()
+    delivery_death_reported: list[bool] = [False]
+
+    def report_delivery_thread_dead(cause: str) -> None:
+        """投递线程退出的唯一上报出口（Issue #191）。
+
+        两个调用点（后台线程自己的退出路径、长连接主线程的看门狗）共用它，告警
+        文案与"只报一次"的口径因此只有一份。上报之后**立刻**把告警冲出去：告警
+        投递平时由投递循环的 ``on_tick`` 驱动，而此刻正是那条循环已经不在了，
+        不主动冲一次的话这条告警只会躺在待投递队列里没人发——那就又回到了
+        Issue #191 要消灭的"无声"。
+        """
+
+        if delivery_death_reported[0]:
+            return
+        delivery_death_reported[0] = True
+        logger.error(
+            "投递消费线程已退出，Gateway 仍在收消息但不会再有任何投递 cause=%s", cause
+        )
+        try:
+            delivery_alert("delivery_loop_dead:" + cause, LOOP_ALERT_TRACE_ID)
+            alerting_duty.run_once()
+        except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
+            logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
+
     consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
     delivery_thread = threading.Thread(
-        target=consumer.run_forever,
+        target=run_delivery_loop,
+        args=(consumer,),
         kwargs={
             "stop": stop_event,
             "poll_interval_seconds": config.delivery_poll_interval_seconds,
             "heartbeat": _combined_heartbeat(alerting_duty, "gateway-delivery"),
             "on_tick": alerting_duty.run_once,
+            "on_dead": report_delivery_thread_dead,
         },
         name="lingxi-gateway-delivery",
         # 独立审核 P3-5：非守护线程会让解释器在退出时等它结束——如果它没能在
@@ -455,6 +558,19 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         # 等"这句承诺对进程本身也成立：预算内能 join 完就是干净退出；耗尽了就是
         # 进程退出时硬收掉这个线程，不会让一个卡住的外部调用把整个进程焊住。
         daemon=True,
+    )
+    # 长连接的心跳回调里挂上投递线程的看门狗（Issue #191），因此 supervisor 必须在
+    # 线程对象存在之后再装配。两者之间没有别的依赖，换顺序不改变任何既有行为。
+    supervisor = build_supervisor(
+        config,
+        should_stop=stop_event.is_set,
+        heartbeat=_combined_heartbeat(
+            alerting_duty,
+            "gateway-longconn",
+            watchdog=delivery_thread_watchdog(
+                delivery_thread, stop=stop_event, on_dead=report_delivery_thread_dead
+            ),
+        ),
     )
     delivery_thread.start()
 

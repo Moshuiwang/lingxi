@@ -544,6 +544,41 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
 
         self.assertEqual(len(sender.calls), 1)
 
+    def test_delivery_loop_failures_alert_immediately_under_production_defaults(
+        self,
+    ) -> None:
+        """Issue #191：投递消费循环自身的连续异常与线程死亡必须发得出去。
+
+        这两类在**上报之前**就已经攒过次数了——`delivery_loop_failed:*` 要求连续
+        ``DeliveryConsumer.DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD`` 轮失败才上报，
+        `delivery_loop_dead:*` 是一次不可逆事件。再让告警状态机按 5 分钟窗口攒
+        第二遍，就会原样踩中 PR #173 独立复核 P1-4 那个 300 秒撞 300 秒的陷阱：
+        `consecutive_failures` 每次被重置回 1、`threshold=3` 永远到不了，"整条
+        投递能力已经停摆"这件事因此永远发不出一条告警——正是 #191 要消灭的
+        "无声"。把 ``delivery_alert_callback`` 里的 ``delivery_loop_`` 前缀去掉，
+        本用例会变红（发出的告警条数变成 0）。
+        """
+
+        for kind in ("delivery_loop_failed:list_pending", "delivery_loop_dead:RuntimeError"):
+            with self.subTest(kind=kind):
+                sender = FakeAlertSender()
+                clock = ManualClock()
+                duty = AlertingDuty(
+                    manager=AlertManager(policy=AlertPolicy()),
+                    dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+                    clock=clock,
+                )
+
+                duty.delivery_alert_callback()(kind, "gateway-delivery-loop")
+                duty.dispatcher.run_once(at=clock.value)
+
+                self.assertEqual(
+                    len(sender.calls),
+                    1,
+                    "投递循环停摆必须在第一次上报时就发出告警，不能等攒够阈值",
+                )
+                self.assertIn("trace_id=gateway-delivery-loop", sender.calls[0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
