@@ -1,7 +1,9 @@
 """花名册持久快照的替换门槛与保旧告警（Issue #52 / S-B-02，无网络、无数据库）。
 
 认领断言：V-花名册-41（替换门槛只认 `status`）、V-花名册-43（保旧告警四类分开）、
-V-花名册-44（首轮无快照与保旧可区分）、V-花名册-46（快照层审计不含字段值）。
+V-花名册-44（首轮无快照与保旧可区分）、V-花名册-46（快照层审计不含字段值）。另有
+二级审查 P2-A 的回读自洽性（元信息与行对不上就响亮失败，不返回半态），落在
+`SnapshotReadbackConsistencyTest`。
 
 **用的是读取层真正的结果类型**（`RosterReadOutcome` 等）而不是自造的假对象：门槛
 判定的全部价值在于它与读取层的四态语义对齐，拿假对象断言只能证明"我自己想的那套
@@ -17,6 +19,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from lingxi.adapters.feishu_roster_bitable import (
     ColumnCount,
@@ -341,6 +344,104 @@ class SnapshotUpdaterTest(unittest.TestCase):
         RosterSnapshotUpdater(store=_RecordingStore(_previous()), audit=audit).apply(_empty_source(), now=NOW)
 
         self.assertEqual([action for action, _ in audit.records], ["roster_snapshot.kept_previous"])
+
+
+class _FakeCursor:
+    """按脚本回答两条查询的假游标：先元信息、后行。"""
+
+    def __init__(self, header: Any, rows: list[Any]) -> None:
+        self._header = header
+        self._rows = rows
+        self.statements: list[str] = []
+
+    def __enter__(self) -> "_FakeCursor":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        return None
+
+    def execute(self, statement: str, parameters: Any = None) -> None:
+        del parameters
+        self.statements.append(statement)
+
+    def fetchone(self) -> Any:
+        return self._header
+
+    def fetchall(self) -> list[Any]:
+        return self._rows
+
+
+class _FakeConnection:
+    def __init__(self, cursor: _FakeCursor) -> None:
+        self._cursor = cursor
+
+    def __enter__(self) -> "_FakeConnection":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        return None
+
+    def transaction(self) -> "_FakeConnection":
+        return self
+
+    def cursor(self) -> _FakeCursor:
+        return self._cursor
+
+
+class SnapshotReadbackConsistencyTest(unittest.TestCase):
+    """二级审查 P2-A：回读到的元信息与行必须自洽，对不上就响亮失败。
+
+    并发的一次替换恰好落在回读的两条语句之间时，READ COMMITTED 下会读出「元信息说
+    N 行、行却是另一份（甚至零行）」。把它原样交出去，比对会把全体已开通用户报成
+    「移除」——这正是持久快照要挡的那个形状。
+
+    用可注入的假连接构造这个窗口：真库上它是一个需要并发才能撞到的竞态，用例里
+    直接给出竞态**结果**，断言实现拒绝返回半态。
+    """
+
+    HEADER = ("rsn_0001", YESTERDAY, 3)
+
+    def _store(self, header: Any, rows: list[Any]) -> Any:
+        from lingxi.adapters import postgres_roster_snapshot
+
+        cursor = _FakeCursor(header, rows)
+        patcher = mock.patch.object(
+            postgres_roster_snapshot, "connect", lambda *a, **k: _FakeConnection(cursor)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return postgres_roster_snapshot.PostgresRosterSnapshotStore("postgresql:///fake")
+
+    def _db_row(self, personnel_id: str) -> tuple[str, str, str, str, str]:
+        return (personnel_id, FAKE_EMAIL, FAKE_NAME, FAKE_EMPLOYEE_NO, FAKE_RECORD_ID)
+
+    def test_a_consistent_snapshot_reads_back_whole(self) -> None:
+        store = self._store(self.HEADER, [self._db_row(f"fs-u-000{n}") for n in (1, 2, 3)])
+
+        stored = store.load()
+
+        assert stored is not None
+        self.assertEqual(stored.facts.row_count, 3)
+        self.assertEqual(len(stored.rows), 3)
+
+    def test_rows_lost_to_a_concurrent_replacement_are_rejected_not_returned(self) -> None:
+        from lingxi.adapters.postgres_roster_snapshot import RosterSnapshotInconsistent
+
+        for rows, label in (([], "并发替换已删掉旧行"), ([self._db_row("fs-u-0001")], "只回来一部分")):
+            with self.subTest(label=label):
+                store = self._store(self.HEADER, rows)
+                with self.assertRaises(RosterSnapshotInconsistent) as raised:
+                    store.load()
+                # 只报两个数字，不报任何行内容。
+                message = str(raised.exception)
+                for probe in (FAKE_NAME, FAKE_EMAIL, FAKE_EMPLOYEE_NO, FAKE_PERSONNEL_ID):
+                    self.assertNotIn(probe, message)
+
+    def test_an_empty_carrier_still_reads_back_as_none(self) -> None:
+        # 「从未有过快照」不是不一致：没有元信息就没有可核对的行数。
+        store = self._store(None, [])
+
+        self.assertIsNone(store.load())
 
 
 class SnapshotAuditDisciplineTest(unittest.TestCase):

@@ -72,9 +72,24 @@ VALUES (%s, %s, %s, %s, %s, %s, %s)
 """
 
 
+class RosterSnapshotInconsistent(RuntimeError):
+    """回读到的元信息与行对不上。消息里只有两个数字，没有任何行内容。
+
+    这是**并发窗口**的信号，不是数据损坏：替换本身是原子的，但回读的两条语句在
+    READ COMMITTED 下各取一次数据库快照，一次并发替换恰好落在中间就会让两边错位。
+    抛出而不是返回半态——一份"元信息说 1206 行、实际零行"的快照会被比对读成
+    「全员移除」。
+    """
+
+
 @dataclass(frozen=True)
 class StoredRosterSnapshot:
-    """回读出来的完整快照：元信息 + 行。"""
+    """回读出来的完整快照：元信息 + 行。
+
+    构造出来的实例一定自洽：``len(rows) == facts.row_count`` 由 :meth:`
+    PostgresRosterSnapshotStore.load` 在返回前核对，对不上就抛
+    :class:`RosterSnapshotInconsistent`。
+    """
 
     facts: StoredSnapshotFacts
     rows: tuple[RosterRow, ...] = ()
@@ -130,9 +145,20 @@ class PostgresRosterSnapshotStore:
     def load(self) -> StoredRosterSnapshot | None:
         """取完整快照（元信息 + 全部行）；从未有过快照时返回 ``None``。
 
-        两次查询之间快照被替换时，回读到的行可能属于新的那一份而元信息属于旧的。
-        这里用**同一个事务**读两次，让两边一定来自同一份快照——比对拿到一份"元信息说
-        1206 行、实际只回来 900 行"的快照，会把三百个人报成移除。
+        两次查询放在**同一个事务**里，但这并不足以保证两边来自同一份快照（二级审查
+        P2-A）：默认隔离级别是 READ COMMITTED，**同一事务内的每条语句各取一次快照**。
+        并发的一次 :meth:`replace` 恰好落在两条语句之间时，第一条读到旧的元信息、第二条
+        看到的却是新事务已经删掉旧行之后的状态——回来的就是「元信息说 1206 行、实际
+        零行」。把这种结果原样交出去，比对会把全体已开通用户报成「移除」。
+
+        因此**回读后逐份核对行数**，对不上就抛 :class:`RosterSnapshotInconsistent`，
+        不返回半态。调用方拿到的要么是一份自洽的快照，要么是一个明确的异常——不会
+        是一份看起来正常、其实少了一大截的快照。重试通常就好了（替换是原子的，
+        下一次读会稳定落在替换后的那一份上）。
+
+        提高隔离级别到 ``REPEATABLE READ`` 也能消除这个窗口，但那要改连接层的事务
+        特性、影响面超出本适配器；行数核对便宜、可断言，且把"不一致"变成响亮失败，
+        比"读到一份不一致却当成正常"安全得多。
         """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection:
@@ -149,6 +175,11 @@ class PostgresRosterSnapshotStore:
             captured_at=_as_utc(header[1]),
             row_count=int(header[2]),
         )
+        if len(rows) != facts.row_count:
+            # 只报两个数字，不报任何行内容。
+            raise RosterSnapshotInconsistent(
+                f"花名册快照回读不一致：元信息 {facts.row_count} 行，实际回来 {len(rows)} 行"
+            )
         logger.info("花名册快照已回读 行=%s", len(rows))
         return StoredRosterSnapshot(
             facts=facts,
