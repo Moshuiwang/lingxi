@@ -9,6 +9,7 @@ gateway 侧——事件管线、``/new`` 与 ``/stop``、两小时规则；Agent
 from __future__ import annotations
 
 from .commands import Command, parse_command
+from .onboarding_recovery import OnboardingReconciler
 from .pipeline import BUSY_HINT_TEXT, DEFAULT_WORKER_VERSION, EventPipeline, GatewayTexts
 from .ports import (
     ConversationRecord,
@@ -19,6 +20,7 @@ from .ports import (
     OnboardingRunner,
     OnboardingState,
     Outcome,
+    PendingOnboarding,
     UserRecord,
     UserState,
 )
@@ -34,10 +36,12 @@ __all__ = [
     "HandledAs",
     "InboundMessage",
     "OnboardingMessage",
+    "OnboardingReconciler",
     "OnboardingResult",
     "OnboardingRunner",
     "OnboardingState",
     "Outcome",
+    "PendingOnboarding",
     "SESSION_IDLE_WINDOW",
     "UserRecord",
     "UserState",

@@ -10,6 +10,12 @@
 「系统明确告诉用户已经开启新会话」的第二条触发路径，矩阵中尚无对应断言编号，
 本模块按合同原文与产品负责人 2026-08-17 定稿约束其触发面与文案。
 
+Issue #65 轻审登记的三项前置修复各有一组用例，同样落在既有 `V-开通-13`（终态分支
+互斥、不误报成功）的判定面上，不新增断言编号：``OnboardingDispatchLedgerTests``
+（P2-2 在途一半：交接账本）、``OnboardingShutdownOrderTests``（P2-3：停机中不触发
+带外部副作用的开通编排）、``OnboardingTerminalRenderingTests``（P2-4：非失败终态的
+缺省渲染兜底）。P2-2 的对账扫描本身在 ``test_gateway_onboarding_recovery.py``。
+
 真库那一面在 ``test_gateway_postgres.py``；长连接生命周期在 ``test_gateway_longconn.py``。
 """
 
@@ -92,6 +98,7 @@ class PipelineTestCase(unittest.TestCase):
         onboarding=None,
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
+        should_stop=None,
     ):
         return EventPipeline(
             store=FakeStore(
@@ -105,6 +112,7 @@ class PipelineTestCase(unittest.TestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
             onboarding=onboarding,
+            should_stop=should_stop,
         )
 
 
@@ -915,6 +923,202 @@ class AutomaticOnboardingTests(PipelineTestCase):
         )
         self.assertEqual(self.log.count("audit.onboarding.failed"), 1)
         self.assertNotIn("外部权限服务不可用", repr(self.log.entries))
+
+
+class OnboardingDispatchLedgerTests(PipelineTestCase):
+    """#65 轻审 P2-2 的在途一半：编排被调用之后必须记账。
+
+    账本（迁移 0062 的 ``onboarding_dispatched_at``）唯一的作用是让"认领了却没交接"
+    这种行可判定。因此正向路径必须记上，否则对账扫描会把一条已经拿到结论的事件再
+    交接一次；而记账本身失败时又不能反过来带走用户已经该收到的提示。
+    """
+
+    def test_ledger_is_written_after_the_runner_returned(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_ledger", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(self.state.onboarding_dispatched, {"evt_ledger"})
+        self.assertGreater(
+            self.log.index("store.mark_onboarding_dispatched"),
+            self.log.index("audit.onboarding.result"),
+            "记账必须发生在编排返回之后——提前记账等于账本宣称一件还没发生的事",
+        )
+
+    def test_ledger_is_written_even_when_the_runner_raised(self) -> None:
+        runner = FakeOnboarding(fail_with=RuntimeError("外部权限服务不可用"))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_ledger_fail", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(
+            self.state.onboarding_dispatched,
+            {"evt_ledger_fail"},
+            "编排确实被调用过：不记账会让用户收到第二遍 LX-ONBOARD-001",
+        )
+
+    def test_a_failed_ledger_write_does_not_take_away_the_user_reply(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+
+        outcome = self.build(
+            onboarding=runner, fail_on="mark_onboarding_dispatched"
+        ).handle_message(message(event_id="evt_ledger_broken", open_id="ou_new"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking", "onboarding.not_authorized"],
+            "簿记失败不得带走用户可见的终态提示",
+        )
+        self.assertEqual(self.log.count("audit.onboarding.dispatch_unrecorded"), 1)
+        self.assertEqual(self.state.onboarding_dispatched, set())
+
+
+class OnboardingShutdownOrderTests(PipelineTestCase):
+    """#65 轻审 P2-3：停机窗口内**不触发**开通编排。
+
+    此前的顺序是"先调 runner，再判停机丢弃回复"——正式 runner 带外部副作用（建档、
+    建环境、发权限、MCP 同步），那等于在停机中途发起一串不可回滚的外部动作，然后把
+    用户唯一能看到的结论扔掉。
+    """
+
+    def test_runner_is_not_called_while_stopping(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.COMPLETED))
+
+        outcome = self.build(onboarding=runner, should_stop=lambda: True).handle_message(
+            message(event_id="evt_stopping", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(runner.calls, [], "停机中不得发起带外部副作用的开通编排")
+        self.assertEqual(self.log.count("reply.send_text"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.deferred_while_stopping"), 1)
+
+    def test_the_claim_survives_and_stays_unreconciled(self) -> None:
+        """停机跳过留下的是一条**故意的**孤儿：结论已提交，账本仍为空。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.COMPLETED))
+
+        self.build(onboarding=runner, should_stop=lambda: True).handle_message(
+            message(event_id="evt_stopping_claim", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(
+            self.state.events["evt_stopping_claim"],
+            "auto_provisioning",
+            "停机不得回滚已提交的认领",
+        )
+        self.assertEqual(
+            self.state.onboarding_dispatched,
+            set(),
+            "没交接就不能记成已交接——对账扫描正是靠这个空账本认出这条孤儿",
+        )
+
+    def test_a_running_gateway_still_starts_onboarding(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+
+        self.build(onboarding=runner, should_stop=lambda: False).handle_message(
+            message(event_id="evt_running", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(self.log.count("audit.onboarding.deferred_while_stopping"), 0)
+
+
+class OnboardingTerminalRenderingTests(PipelineTestCase):
+    """#65 轻审 P2-4：非失败终态的缺省渲染兜底。
+
+    缺省文案表原先只覆盖三条失败终态，一个不带 messages 的 ``matched`` / ``completed``
+    会渲染成空列表——用户收到「正在核对，请稍候」之后再无下文，而系统认为一切正常。
+    """
+
+    def _reply_keys(self) -> list[str]:
+        return [fields["content_key"] for fields in self.log.fields("audit.reply.sent")]
+
+    def test_matched_without_messages_still_tells_the_user(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.MATCHED))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_matched", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(self._reply_keys(), ["onboarding.checking", "onboarding.matched"])
+        self.assertEqual(self.log.count("audit.onboarding.unrenderable_result"), 0)
+
+    def test_completed_without_a_scope_falls_back_to_the_internal_terminal(self) -> None:
+        """「开通完成」必须报出公司与职能范围；报不出来就不能宣告成功。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.COMPLETED))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_completed_bare", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(
+            self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"]
+        )
+        self.assertNotIn(
+            "onboarding.completed",
+            self._reply_keys(),
+            "范围未知时不得替编排层宣告一个说不清范围的开通成功",
+        )
+        self.assertEqual(
+            [fields["state"] for fields in self.log.fields("audit.onboarding.unrenderable_result")],
+            ["completed"],
+            "兜底必须在审计里保留编排真正返回的状态，否则事后无法定位",
+        )
+
+    def test_a_result_whose_only_message_is_checking_also_falls_back(self) -> None:
+        """checking 由 gateway 独占且只发一次；过滤之后同样不能剩下空白。"""
+
+        runner = FakeOnboarding(
+            result=OnboardingResult(
+                state=OnboardingState.COMPLETED,
+                messages=(OnboardingMessage("onboarding.checking"),),
+            )
+        )
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_only_checking", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(
+            self._reply_keys(), ["onboarding.checking", "onboarding.internal_error"]
+        )
+
+    def test_started_without_messages_is_silent_by_design(self) -> None:
+        """``started`` 是唯一允许没有下文的状态：checking 就是这一轮的完整交代。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_started", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(self._reply_keys(), ["onboarding.checking"])
+        self.assertEqual(self.log.count("audit.onboarding.unrenderable_result"), 0)
+
+    def test_every_non_started_state_produces_at_least_one_message(self) -> None:
+        """穷举：除 ``started`` 外，没有任何状态可以让用户悬在半空。"""
+
+        for state in OnboardingState:
+            if state is OnboardingState.STARTED:
+                continue
+            with self.subTest(state=state.value):
+                self.log = CallLog()
+                self.state = FakeState()
+                runner = FakeOnboarding(result=OnboardingResult(state=state))
+                self.build(onboarding=runner).handle_message(
+                    message(event_id=f"evt_{state.value}", open_id="ou_new"), now=NOW
+                )
+                self.assertGreaterEqual(
+                    len(self._reply_keys()),
+                    2,
+                    f"{state.value} 必须在 checking 之外再给用户一条结论",
+                )
 
 
 class BlackHoleOutboundTests(PipelineTestCase):

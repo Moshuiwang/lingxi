@@ -21,6 +21,7 @@ from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
 from lingxi.core.conversation.ports import (
     ConversationRecord,
     HandledAs,
+    PendingOnboarding,
     UserRecord,
     UserState,
 )
@@ -406,6 +407,65 @@ class PostgresGatewayStore:
                     (event_id,),
                 )
                 return cursor.fetchone() is not None
+
+    def mark_onboarding_dispatched(self, *, event_id: str) -> None:
+        """记下"这条事件已经交给开通编排了"（迁移 0062、Issue #65 轻审 P2-2）。
+
+        条件里带上 ``onboarding_dispatched_at IS NULL``：真正的交接时刻是第一次，
+        重复调用不把时间戳往后推——那个时间戳是"账上什么时候平的"的唯一证据。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE inbound_event
+                       SET onboarding_dispatched_at = now()
+                     WHERE feishu_event_id = %s
+                       AND onboarding_dispatched_at IS NULL
+                    """,
+                    (event_id,),
+                )
+
+    def claim_stale_onboarding(self, *, older_than: timedelta) -> PendingOnboarding | None:
+        """认领一条超时仍未交接的未开通首聊事件，并原子记账。
+
+        ``FOR UPDATE SKIP LOCKED`` + ``onboarding_dispatched_at IS NULL`` 两道条件
+        一起保证多实例扫描时同一条只被一个实例拿走：跳过被别人锁住的行，拿到锁之后
+        再确认它还没被记账。少了后半句，两个实例可以先后拿到同一行并各触发一次开通。
+
+        ``user_open_id`` 理论上可空（列本身允许 NULL），这里显式排除：交给编排的
+        三元组缺了它就没有任何可匹配的身份，取回来也只能立刻失败。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE inbound_event
+                       SET onboarding_dispatched_at = now()
+                     WHERE feishu_event_id IN (
+                               SELECT feishu_event_id
+                                 FROM inbound_event
+                                WHERE handled_as = 'auto_provisioning'
+                                  AND onboarding_dispatched_at IS NULL
+                                  AND user_open_id IS NOT NULL
+                                  AND received_at < now() - %s::interval
+                                ORDER BY received_at
+                                LIMIT 1
+                                  FOR UPDATE SKIP LOCKED
+                           )
+                       AND onboarding_dispatched_at IS NULL
+                    RETURNING feishu_event_id, user_open_id, trace_id
+                    """,
+                    (older_than,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return PendingOnboarding(event_id=row[0], open_id=row[1], trace_id=row[2])
 
 
 @dataclass(frozen=True)

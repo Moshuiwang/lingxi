@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import ContextManager, Protocol
 
@@ -125,11 +125,27 @@ class OnboardingResult:
     failure_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingOnboarding:
+    """一条**已认领、但没能确认交给开通编排**的入站事件（Issue #65 轻审 P2-2）。
+
+    字段与 ``OnboardingRunner.start`` 的参数一一对应，别的都不带：对账扫描重新交接
+    时和首次触发走同一条边界，未开通用户的正文同样到不了编排层。
+    """
+
+    event_id: str
+    open_id: str
+    trace_id: str
+
+
 class OnboardingRunner(Protocol):
     """提交 gateway 事件后启动既有身份链与开通编排。
 
     参数刻意只有事件身份；未开通用户的入站正文必须丢弃，不能进入身份或权限链。
     ``start`` 必须按 event_id/open_id 幂等，具体持久化与外部依赖由注入实现负责。
+    **幂等在这里不是"最好有"**：提交与触发之间的崩溃会留下孤儿事件，对账扫描
+    （``onboarding_recovery.OnboardingReconciler``）会把它重新交接一次，而崩溃点也
+    可能落在"编排已经跑了一半"之后。
     """
 
     def start(
@@ -196,6 +212,25 @@ class GatewayStore(Protocol):
     def transaction(self) -> ContextManager[GatewayTransaction]: ...
 
     def claim_queue_failure_notice(self, *, event_id: str) -> bool: ...
+
+    def mark_onboarding_dispatched(self, *, event_id: str) -> None:
+        """记下"这条事件已经交给开通编排了"。
+
+        刻意**不在** ``GatewayTransaction`` 上：交接发生在入队事务提交**之后**，
+        写进同一个事务在时间上不可能（那时还没调用编排），写进事务反而会让账本
+        在编排从未被调用时就宣称交接完成。
+        """
+
+    def claim_stale_onboarding(self, *, older_than: timedelta) -> PendingOnboarding | None:
+        """认领**一条**超过 ``older_than`` 仍未确认交接的事件，并原子标记为已交接。
+
+        标记与取出必须在同一条语句里完成：多个 gateway 实例同时扫描时，一条孤儿只
+        能被其中一个拿到，否则对账本身会变成重复触发外部开通的来源。
+
+        **一次只认领一条**，而不是取一批回来慢慢处理：认领即记账，一批取回来之后
+        如果停机信号在中途到达，剩下那些已经被记成"已交接"却从未交出去的行会永远
+        没人再看。逐条认领让"随时停"天然无损——没轮到的行还没被认领。
+        """
 
 
 class Reactions(Protocol):

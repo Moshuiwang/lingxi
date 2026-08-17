@@ -19,6 +19,7 @@ from lingxi.core.conversation.ports import (
     HandledAs,
     OnboardingResult,
     OnboardingState,
+    PendingOnboarding,
     UserRecord,
     UserState,
 )
@@ -141,6 +142,12 @@ class FakeState:
     # test_gateway_pipeline.py 的专项用例断言 gateway.delivery_expired 提示的触发
     # 与只提示一次；默认空集合，绝大多数既有用例因此不受影响。
     pending_delivery_expired_notices: set[str] = field(default_factory=set)
+    # Issue #65 轻审 P2-2：迁移 0062 那一列（``onboarding_dispatched_at``）的内存
+    # 对应物——记下哪些事件已经确认交给开通编排。
+    onboarding_dispatched: set[str] = field(default_factory=set)
+    # 已认领、超过对账窗口仍未交接的孤儿事件（对账扫描的输入）。认领即摘除，与真库
+    # 「UPDATE … RETURNING 同一条语句里记账」同语义：同一条不会被认领两次。
+    stale_onboardings: list[PendingOnboarding] = field(default_factory=list)
 
 
 class FakeTransaction:
@@ -318,6 +325,28 @@ class FakeStore:
         self._fail_on = fail_on
         self._force_clear_agent_session_result = force_clear_agent_session_result
         self._force_claim_conversation_result = force_claim_conversation_result
+
+    def mark_onboarding_dispatched(self, *, event_id: str) -> None:
+        """记账：这条事件已经交给开通编排（迁移 0062 那一列的内存对应物）。
+
+        刻意**不在**事务对象上：真实实现同样是事务提交之后的一条独立 ``UPDATE``。
+        ``fail_on`` 命中时抛异常，用来断言"记不上账不能带走用户可见的终态提示"。
+        """
+
+        self._log.add("store.mark_onboarding_dispatched", event_id=event_id)
+        if self._fail_on == "mark_onboarding_dispatched":
+            raise RuntimeError("注入失败：mark_onboarding_dispatched")
+        self._state.onboarding_dispatched.add(event_id)
+
+    def claim_stale_onboarding(self, *, older_than) -> PendingOnboarding | None:
+        """认领一条孤儿；认领即摘除，与真库的原子记账同语义。"""
+
+        self._log.add("store.claim_stale_onboarding", older_than=older_than)
+        if self._fail_on == "claim_stale_onboarding":
+            raise RuntimeError("注入失败：claim_stale_onboarding")
+        if not self._state.stale_onboardings:
+            return None
+        return self._state.stale_onboardings.pop(0)
 
     @contextmanager
     def transaction(self) -> Iterator[FakeTransaction]:

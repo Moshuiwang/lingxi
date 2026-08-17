@@ -37,6 +37,7 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.apps.liveness import touch_liveness
+from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
@@ -316,6 +317,49 @@ def build_supervisor(
     )
 
 
+def build_delivery_tick(
+    *, alerting_duty: Any, reconciler: OnboardingReconciler
+) -> Callable[[], None]:
+    """投递循环每轮顺带推进的两件事，彼此隔离（Issue #65 轻审 P2-2）。
+
+    对账排在前面并且自带异常隔离：它失败不能带走告警状态机的推进。告警自身的失败
+    仍由投递循环那一层按既有方式处理（``run_forever`` 的 ``on_tick`` 已经包了一层），
+    这里不改变它——两件事各自的失败面因此不会互相掩盖。
+    """
+
+    def tick() -> None:
+        try:
+            reconciler.run_once()
+        except Exception as error:  # noqa: BLE001 - 对账失败不得带走告警与投递
+            logger.error("未开通首聊交接对账本轮失败 error=%s", type(error).__name__)
+        alerting_duty.run_once()
+
+    return tick
+
+
+def build_onboarding_reconciler(
+    config: GatewayConfig,
+    *,
+    onboarding: OnboardingRunner | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> OnboardingReconciler:
+    """装出未开通首聊的交接对账扫描（Issue #65 轻审 P2-2）。
+
+    与 ``build_supervisor`` 用同一个 ``onboarding`` 缺省口径：没传就是失败关闭桩。
+    两者各建各的 ``PostgresGatewayStore``——它只是个连接工厂，不持有跨调用状态，
+    共用一个实例不会带来任何好处，分开反而让"对账跑在另一条线程上"这件事更清楚。
+    """
+
+    from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+
+    return OnboardingReconciler(
+        store=PostgresGatewayStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
+        onboarding=onboarding or _UnavailableOnboarding(),
+        audit=_LoggingAudit(),
+        should_stop=should_stop,
+    )
+
+
 class _RejectingCards:
     """S-A-07 受控验收缺口专用：让配置命中的那一步卡片外发调用确定性收到
     ``DeliveryRejected``（服务端明确拒绝），用于在没有真实故障可复现的情况下证伪
@@ -540,6 +584,19 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
             logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
 
+    # 未开通首聊的交接对账（Issue #65 轻审 P2-2）：提交与触发之间崩溃 / 停机留下的
+    # 孤儿事件，由它重新交给开通编排一次。挂在投递线程的每轮回调上，而不是长连接
+    # 主线程——对账要连数据库、将来还要调带外部副作用的正式编排，放在长连接那条
+    # 线程上会挡住事件接收。它自己按分钟级最小间隔自限，不会被一秒一轮的投递循环
+    # 拖成空查询风暴。
+    #
+    # 待正式 runner 装配时复核（S-D-02）：真实编排的单次耗时可能到分钟级，那时要
+    # 判断它是否还适合与投递共用这条线程，或者需要自己的循环。
+    delivery_tick = build_delivery_tick(
+        alerting_duty=alerting_duty,
+        reconciler=build_onboarding_reconciler(config, should_stop=stop_event.is_set),
+    )
+
     consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
     delivery_thread = threading.Thread(
         target=run_delivery_loop,
@@ -548,7 +605,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             "stop": stop_event,
             "poll_interval_seconds": config.delivery_poll_interval_seconds,
             "heartbeat": _combined_heartbeat(alerting_duty, "gateway-delivery"),
-            "on_tick": alerting_duty.run_once,
+            "on_tick": delivery_tick,
             "on_dead": report_delivery_thread_dead,
         },
         name="lingxi-gateway-delivery",

@@ -23,7 +23,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lingxi.apps.gateway import build_supervisor, main
+from lingxi.apps.gateway import (
+    build_delivery_tick,
+    build_onboarding_reconciler,
+    build_supervisor,
+    main,
+)
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
 from gateway_fakes import FakeOnboarding
 from lingxi.core.conversation.ports import OnboardingState
@@ -307,6 +312,73 @@ class BuildSupervisorTests(unittest.TestCase):
         fallback = pipeline_class.call_args.kwargs["onboarding"]
         result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
         self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+
+
+class OnboardingReconcilerWiringTests(unittest.TestCase):
+    """#65 轻审 P2-2 的调用方：对账扫描必须真的被生产进程每轮调用。
+
+    这一组断的是"有没有人调它"，不是它自己的行为（后者在
+    ``tests/test_gateway_onboarding_recovery.py``）。#29 的教训正是"组件在库、端口
+    后无调用方"——一个没人调用的对账扫描等于没有对账扫描。
+    """
+
+    def test_the_reconciler_shares_the_supervisor_fail_closed_default(self) -> None:
+        config = load_config(VALID_ENV)
+
+        reconciler = build_onboarding_reconciler(config)
+
+        result = reconciler._onboarding.start(event_id="evt", open_id="ou", trace_id="trc")
+        self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+
+    def test_an_injected_runner_reaches_the_reconciler(self) -> None:
+        config = load_config(VALID_ENV)
+        runner = FakeOnboarding()
+
+        reconciler = build_onboarding_reconciler(config, onboarding=runner)
+
+        self.assertIs(reconciler._onboarding, runner)
+
+    def test_the_reconciler_stops_with_the_process(self) -> None:
+        """停机信号必须接到对账扫描上，否则停机中还会去认领并触发外部开通。
+
+        用例刻意只走"已停机"这一半：另一半会真的去连配置里的数据库，而本组断的是
+        接线，不是数据库可达性。
+        """
+
+        config = load_config(VALID_ENV)
+
+        reconciler = build_onboarding_reconciler(config, should_stop=lambda: True)
+
+        self.assertIsNone(reconciler.run_once(), "收到停机信号后不得再认领孤儿")
+
+    def test_each_delivery_tick_runs_both_the_reconciler_and_the_alerting(self) -> None:
+        calls: list[str] = []
+
+        tick = build_delivery_tick(
+            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
+            reconciler=types.SimpleNamespace(run_once=lambda: calls.append("reconcile")),
+        )
+        tick()
+        tick()
+
+        self.assertEqual(calls, ["reconcile", "alerting", "reconcile", "alerting"])
+
+    def test_a_failing_reconciler_does_not_take_away_the_alerting(self) -> None:
+        calls: list[str] = []
+
+        def explode() -> None:
+            raise RuntimeError("数据库不可达")
+
+        tick = build_delivery_tick(
+            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
+            reconciler=types.SimpleNamespace(run_once=explode),
+        )
+        with self.assertLogs("lingxi.apps.gateway", level=logging.ERROR) as captured:
+            tick()
+
+        self.assertEqual(calls, ["alerting"])
+        self.assertIn("交接对账", captured.output[0])
+        self.assertNotIn("数据库不可达", captured.output[0], "异常正文不进日志")
 
 
 class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
