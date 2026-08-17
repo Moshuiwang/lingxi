@@ -95,6 +95,10 @@ REQUIRED_MODULES = (
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
+    # 每日权限重算（Issue #156 / S-C-03a）：按当前有效批次读回银河快照的适配器。
+    # 与上面两组不同，它**已经有生产调用方**——`lingxi-scheduler` 的每日权限重算职责
+    # （见下面 PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。
+    "lingxi.adapters.postgres_galaxy_snapshot",
     "lingxi.adapters.galaxy_csv_export",
     "lingxi.adapters.galaxy_import",
     "lingxi.adapters.retention",
