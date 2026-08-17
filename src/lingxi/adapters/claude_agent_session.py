@@ -125,6 +125,7 @@ async def run_single_turn(
     drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS,
     clock: Callable[[], float] | None = None,
     on_business_duration: Callable[[float], None] | None = None,
+    on_interrupt_requested: Callable[[], None] | None = None,
 ) -> None:
     """跑**一个**回合：建会话、发一次提问、把消息流规范化后交给 ``sink``。
 
@@ -138,6 +139,13 @@ async def run_single_turn(
     收尾本身有固定开销（约 6 秒），把它算进业务墙钟只会让配置值失去意义。
     ``on_business_duration`` 在业务阶段结束时收到一次耗时（不含收尾），供调用方
     与自己测得的总耗时相减得到收尾耗时；不提供时不影响任何行为。
+
+    ``on_interrupt_requested``（#201）在**本进程真的向 SDK 发出 ``interrupt()``**
+    的那一刻被调用一次，是"这一轮被本地 stop 打断"的本地事实出口。调用方据此把
+    随后可能出现的 ``aborted_streaming``/``aborted_tools`` 收尾判为中断而不是通用
+    失败；没有这个回调，同一件事只能靠"有人 stop 过 + SDK 自报 abort"反推因果，
+    而 ``aborted_*`` 在无人 stop 时也会出现，反推会把真实的 SDK 终止失败改写成
+    "已停止"（PR #198 一级独立审查 P1-2 裁定）。
     """
 
     from claude_agent_sdk import ClaudeSDKClient
@@ -173,6 +181,14 @@ async def run_single_turn(
                     await stop_event.wait()
                     interrupt = getattr(client, "interrupt", None)
                     if callable(interrupt):
+                        # 本地事实必须在**发出调用之前**记下（#201）：SDK 完全可能
+                        # 在 `interrupt()` 返回之前就以 `aborted_streaming` /
+                        # `aborted_tools` 收完这一轮，此时下面的 `interrupted` 永远
+                        # 来不及置位、`AgentSessionInterrupted` 也不会抛出，回合走
+                        # 的是"正常结束 + SDK 自报 abort"这条路。记在调用之后就正好
+                        # 漏掉这一版，用户只会看到通用失败文案。
+                        if on_interrupt_requested is not None:
+                            on_interrupt_requested()
                         result = interrupt()
                         if hasattr(result, "__await__"):
                             await result

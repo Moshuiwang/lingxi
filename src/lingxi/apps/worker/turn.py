@@ -172,6 +172,10 @@ class WorkerTurnExecutor:
         # "总耗时 - 业务耗时" 推得。适配器没有机会调用回调时（例如构造选项就
         # 失败）保持未知，不能构造数据。
         business_phase: dict[str, float] = {}
+        # #201：本进程是否**真的**向 SDK 发出过 `interrupt()`。这是本地事实，不是
+        # 对队列侧 stop 标志的推断——只有它成立，才允许把 SDK 自报的 `aborted_*`
+        # 收尾判成中断（见 `_sdk_termination_failure`）。
+        local_interrupt: dict[str, bool] = {}
 
         def handle_event(event: Mapping[str, Any]) -> None:
             recorder.handle(event)
@@ -198,6 +202,7 @@ class WorkerTurnExecutor:
                     drain_grace_seconds=self._config.drain_grace_seconds,
                     clock=self._clock,
                     on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
+                    on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
                 )
         except AgentSessionInterrupted as error:
             failure = _failure("interrupted", error)
@@ -239,7 +244,19 @@ class WorkerTurnExecutor:
             failure = _failure("session_failed", error)
 
         if failure is None:
-            failure = _sdk_termination_failure(recorder)
+            failure = _sdk_termination_failure(
+                recorder, interrupt_requested=bool(local_interrupt.get("requested"))
+            )
+            if failure is not None and failure["code"] == "interrupted":
+                # 这条线只在 #201 的竞态真的发生时出现一次：本进程已发出
+                # `interrupt()`，SDK 却抢在它返回之前把这一轮以 `aborted_*` 收完，
+                # 因此 `AgentSessionInterrupted` 没有抛出。留一条可计数的低敏结构化
+                # 痕迹（不含提示词或正文），用来观察该竞态在真实链路的发生频率。
+                self._emit_stderr_record(
+                    level="warning",
+                    event="worker.stop.interrupt_race",
+                    terminal_reason=recorder.terminal_reason,
+                )
 
         duration_seconds = max(0.0, self._clock() - started_at)
         business_duration_seconds = business_phase.get("seconds")
@@ -295,11 +312,29 @@ def _failure_message(code: str, message: str) -> dict[str, str]:
     return {"code": code, "message": redact_free_text(message)[:_MAX_FAILURE_TEXT]}
 
 
-def _sdk_termination_failure(recorder: TurnStreamRecorder) -> dict[str, str] | None:
-    """把 SDK 的终止元数据收口成产品可区分的护栏原因码。"""
+def _sdk_termination_failure(
+    recorder: TurnStreamRecorder, *, interrupt_requested: bool = False
+) -> dict[str, str] | None:
+    """把 SDK 的终止元数据收口成产品可区分的护栏原因码。
+
+    ``interrupt_requested`` 是**本进程已经向 SDK 发出 ``interrupt()``** 这一本地
+    事实（#201，由适配器的 ``on_interrupt_requested`` 回填），只影响
+    ``aborted_streaming``/``aborted_tools`` 这一档的归类：
+
+    - 已发出中断 → ``interrupted``：这次 abort 就是本地 ``/stop`` 造成的，用户看到
+      "任务已停止"而不是通用失败文案（终态由 ``apps/worker/service.py`` 按
+      ``failure_code == "interrupted"`` 收口成 ``stopped``，本文件不参与那条判定）。
+      正常情况下适配器会抛 ``AgentSessionInterrupted``；只有 SDK 抢在 ``interrupt()``
+      返回之前就收完这一轮时才会落到这里。
+    - 未发出中断 → ``cancelled``：``aborted_*`` 是 SDK 自报的，无人 stop 时也会出现，
+      它必须保持失败语义。**不得**用队列侧"有人请求过停止"反推因果——那会让一次
+      晚到的 stop 掩盖真实的 SDK 终止失败（PR #198 一级独立审查 P1-2 裁定）。
+    """
 
     if recorder.terminal_reason in {"max_turns"} or recorder.result_subtype == "error_max_turns":
         return _failure_message("max_turns_exceeded", "任务提前结束：达到 Agent 轮数上限，结果可能不完整")
     if recorder.terminal_reason in {"aborted_streaming", "aborted_tools"}:
+        if interrupt_requested:
+            return _failure_message("interrupted", "任务已按停止请求中断，未继续执行")
         return _failure_message("cancelled", "任务已取消，未继续执行")
     return None
