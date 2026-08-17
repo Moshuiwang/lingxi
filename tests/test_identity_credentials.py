@@ -181,13 +181,22 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
             self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
         )
 
-        with self.assertRaises(ValueError):
+        # grant 在断言块**之外**构造：放进 assertRaises 里的话，将来
+        # AuthorizationGrant 自己抛 ValueError 也会让这条用例通过，而被测的守卫
+        # 根本没被执行过。
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, "")
+
+        with self.assertRaises(ValueError) as raised:
             vault.save(
                 subject_open_id="ou_delegated_authorization_subject",
-                grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
+                grant=grant,
                 require_absent_registration=True,
                 expected_registered_subject_open_id="ou_delegated_authorization_subject",
             )
+
+        # 断言具体消息：只断言"抛了 ValueError"分不清是守卫拒绝，还是参数校验、
+        # 密钥解析之类的别的 ValueError 顺手把用例染绿了。
+        self.assertIn("首次建立与既有主体 CAS 不能同时使用", str(raised.exception))
 
         # 守卫在文件锁之前：连锁文件都不该出现，密文更不该落盘。
         self.assertFalse(path.exists(), "被拒的保存不得写入密文")

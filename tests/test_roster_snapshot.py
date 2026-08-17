@@ -494,6 +494,10 @@ class SnapshotAuditDisciplineTest(unittest.TestCase):
 # 它要证明的是一条路径**不存在**，而不存在的东西没有调用点可以断言。产品负责人
 # 2026-08-17 的裁定是「始终保留最近一份、豁免九十天规则、超龄不自动删只按日报告警」，
 # 因此这里扫源码：谁哪天顺手给快照加一条到期清理，这条断言必须变红。
+#
+# **扫描器本身也被测**：下方 `ScannerClassifierTest` 用合成源码文本（不落盘）把四类
+# 违规与两类合法写法各钉一遍。没有那组用例，把 `_TIME_TOKENS` 清空、把 `_EXPIRY_COLUMN`
+# 改坏，真实文件照样全绿——人工验红只能证明"交付那一刻是好的"，证不了以后。
 
 # 快照载体 = 快照的建表、读写与判定的全部落点。判定层没有 SQL，但它是「超龄」这个
 # 概念的所在地，最可能被人顺手加上「超龄就删」，所以一起扫。
@@ -502,14 +506,20 @@ SNAPSHOT_CARRIER_FILES = (
     SOURCE_ROOT / "lingxi" / "core" / "identity" / "roster_snapshot.py",
 )
 MIGRATION_DIRECTORY = REPOSITORY_ROOT / "migrations" / "alembic" / "versions"
+SNAPSHOT_MIGRATION = MIGRATION_DIRECTORY / "0063_roster_snapshot.py"
 
 _SNAPSHOT_TABLE = re.compile(r"roster_snapshot(_row)?\b", re.IGNORECASE)
+
+# f-string / 拼接里被插值的那一段还原成这个记号。它不可能出现在真实 SQL 里，因此
+# 可以当作"这里有一段扫描器看不见的文本"的显式标记。
+INTERPOLATION = "⟪插值⟫"
 
 # 只有"像 SQL"的片段才当语句看。中文说明里写「删掉旧的那一份」不是路径，把散文
 # 也扫进来，这条断言很快就会因为改一段注释而变红，然后被人加白名单绕过。
 _SQL_SHAPE = re.compile(
     r"\b(select\s|insert\s+into\b|update\s+\w|delete\s+from\b|truncate\b|"
-    r"create\s+(table|index|trigger|or\s+replace\s+function)\b|drop\s+table\b|alter\s+table\b)",
+    r"create\s+(or\s+replace\s+)?(constraint\s+)?(table|index|trigger|function|procedure|view|rule)\b|"
+    r"drop\s+table\b|alter\s+table\b)",
     re.IGNORECASE,
 )
 _DELETE_VERB = re.compile(r"\b(delete\s+from|truncate|drop\s+table)\b", re.IGNORECASE)
@@ -546,7 +556,7 @@ _TIME_TOKENS = (
 # 到期字段与到期触发器是同一件事的另一种写法：不必写 DELETE 也能让快照被按时清掉
 # （数据库设计与迁移 0063 都写明本表**刻意没有** `expires_at`、没有到期触发器）。
 _EXPIRY_COLUMN = re.compile(r"\bexpire[sd]?_at\b", re.IGNORECASE)
-_CREATE_TRIGGER = re.compile(r"\bcreate\s+(or\s+replace\s+)?trigger\b", re.IGNORECASE)
+_CREATE_TRIGGER = re.compile(r"\bcreate\s+(or\s+replace\s+)?(constraint\s+)?trigger\b", re.IGNORECASE)
 # 名字层的绊线：SQL 里不带时间词、改由 Python 侧算好时间再删，语句扫描看不见，
 # 但这种入口一定会叫成"清理 / 过期 / 保留期"里的某个词。
 _TIME_DELETION_NAME = re.compile(
@@ -555,17 +565,37 @@ _TIME_DELETION_NAME = re.compile(
     re.IGNORECASE,
 )
 
+# Alembic 的迁移操作不是 SQL 字符串：``op.add_column("roster_snapshot", sa.Column(
+# "expires_at", ...))`` 的表名与列名是两个各自清白的字面量，谁都不"像 SQL"。因此
+# op.* 调用单独走一条通道，合成成一条可判定的文本。动词按方法名归一，让下面的
+# 删除动词判据认得出来。
+_ALEMBIC_OBJECTS = ("op", "operations")
+_ALEMBIC_VERBS = {
+    "drop_table": "drop table",
+    "drop_index": "drop index",
+    "drop_column": "alter table drop column",
+    "drop_constraint": "alter table drop constraint",
+    "create_table": "create table",
+    "add_column": "alter table add column",
+    "alter_column": "alter table alter column",
+    "create_index": "create index",
+}
+# ``op.execute(...)`` 的实参本身就是 SQL 字符串，已由字面量通道按 `;` 正确切句；
+# 再合成一遍只会把多条语句粘成一条，制造跨语句的假共现。
+_ALEMBIC_PASSTHROUGH = ("execute", "get_bind", "get_context")
 
-def _sql_statements(path: Path) -> list[str]:
-    """取出源文件里像 SQL 的字符串字面量，按 `;` 切成单条语句。
 
-    只看字面量、跳过 docstring：文档字符串是散文不是路径，而 0063 的文件头恰好
-    写着「本表刻意没有 ``expires_at``」——把说明当语句扫会让"写明不做"变成"违规"。
-    f-string 的字面部分会被拼回一整条，否则 ``f"DELETE FROM {t} WHERE captured_at<%s"``
-    会被拆成两段各自清白的碎片。
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _literal_texts(tree: ast.AST) -> list[str]:
+    """树里的字符串字面量（跳过 docstring），f-string 还原成带插值记号的整条。
+
+    跳过 docstring 是因为它是散文不是路径：0063 的文件头恰好写着「本表刻意没有
+    ``expires_at``」，把说明当语句扫会让"写明不做"变成"违规"。
     """
 
-    tree = ast.parse(path.read_text(encoding="utf-8"))
     docstrings: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -586,57 +616,206 @@ def _sql_statements(path: Path) -> list[str]:
         elif isinstance(node, ast.JoinedStr):
             texts.append(
                 "".join(
-                    part.value if isinstance(part, ast.Constant) and isinstance(part.value, str) else " ? "
+                    part.value
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str)
+                    else INTERPOLATION
                     for part in node.values
                 )
             )
+    return texts
+
+
+def _sql_statements(source: str) -> list[str]:
+    """源码里像 SQL 的字符串字面量，按 `;` 切成单条语句。"""
 
     statements: list[str] = []
-    for text in texts:
+    for text in _literal_texts(ast.parse(source)):
         for piece in text.split(";"):
             if _SQL_SHAPE.search(piece):
                 statements.append(piece)
     return statements
 
 
-def _snapshot_statements(path: Path) -> list[str]:
-    """该文件里所有提到快照两张表的 SQL 语句。"""
+def _alembic_operations(source: str) -> list[str]:
+    """把 ``op.<方法>(...)`` 合成成一条可判定的文本：归一动词 + 调用内全部字面量。
 
-    return [statement for statement in _sql_statements(path) if _SNAPSHOT_TABLE.search(statement)]
+    ``op.add_column("roster_snapshot", sa.Column("expires_at", ...))`` 因此变成
+    ``alter table add column roster_snapshot expires_at``——表名与列名重新回到同一条
+    语句里，到期列判据才看得见它。
+    """
+
+    units: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        root = node.func.value
+        if not (isinstance(root, ast.Name) and root.id in _ALEMBIC_OBJECTS):
+            continue
+        method = node.func.attr
+        if method in _ALEMBIC_PASSTHROUGH:
+            continue
+        literals = [" ".join(text.split()) for text in _literal_texts(node) if text.strip()]
+        if not literals:
+            continue
+        units.append(" ".join([_ALEMBIC_VERBS.get(method, method), *literals]))
+    return units
 
 
-def _time_conditioned_deletes(path: Path) -> list[tuple[str, list[str]]]:
-    """既删快照、又带时间条件的语句（连同命中的时间词一起返回，便于失败时看清）。"""
+def _ddl_units(source: str) -> list[str]:
+    """一份源码里所有可判定的单元：SQL 语句 + Alembic op.* 调用。"""
+
+    return _sql_statements(source) + _alembic_operations(source)
+
+
+def _snapshot_units(source: str) -> list[str]:
+    """其中与快照两张表有关的那些。
+
+    **表名被插值的语句一律算进来**（fail closed）：被扫的这几个文件里表名全是常量，
+    出现动态表名本身就该被重新解释，而不是因为"看不出是哪张表"被静默放过。
+    """
+
+    return [unit for unit in _ddl_units(source) if _SNAPSHOT_TABLE.search(unit) or INTERPOLATION in unit]
+
+
+def _time_conditioned_deletes(source: str) -> list[tuple[str, list[str]]]:
+    """既删快照、又带时间条件的单元（连同命中的时间词一起返回，便于失败时看清）。"""
 
     offenders: list[tuple[str, list[str]]] = []
-    for statement in _snapshot_statements(path):
-        body = _REFERENTIAL_DELETE.sub(" ", statement)
+    for unit in _snapshot_units(source):
+        body = _REFERENTIAL_DELETE.sub(" ", unit)
         if not _DELETE_VERB.search(body):
             continue
         hits = [token for token in _TIME_TOKENS if token in body.lower()]
         if hits:
-            offenders.append((" ".join(statement.split()), hits))
+            offenders.append((" ".join(unit.split()), hits))
     return offenders
 
 
-def _declared_names(path: Path) -> set[str]:
-    """文件里出现的标识符：定义名、变量名、属性名、参数名。"""
+def _expiry_definitions(source: str) -> list[str]:
+    """给快照定义到期时间列或到期触发器的单元。不写 DELETE 也能让它被按时清掉。"""
+
+    return [
+        " ".join(unit.split())
+        for unit in _snapshot_units(source)
+        if _EXPIRY_COLUMN.search(unit) or _CREATE_TRIGGER.search(unit)
+    ]
+
+
+def _timed_cleanup_names(source: str) -> list[str]:
+    """按时间清理形态的标识符：定义名、变量名、属性名、参数名。"""
 
     names: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for node in ast.walk(ast.parse(source)):
         for attribute in ("name", "id", "attr", "arg"):
             value = getattr(node, attribute, None)
-            if isinstance(value, str):
+            if isinstance(value, str) and _TIME_DELETION_NAME.search(value):
                 names.add(value)
-    return names
+    return sorted(names)
+
+
+def _violations(source: str) -> dict[str, list]:
+    """一份源码的全部判定结果。空字典值＝这一类没命中。"""
+
+    return {
+        "按时间删除快照": _time_conditioned_deletes(source),
+        "到期列或到期触发器": _expiry_definitions(source),
+        "按时间清理的入口名": _timed_cleanup_names(source),
+    }
 
 
 def _migrations_touching_the_snapshot() -> list[Path]:
-    return sorted(
-        path
-        for path in MIGRATION_DIRECTORY.glob("*.py")
-        if _SNAPSHOT_TABLE.search(path.read_text(encoding="utf-8"))
-    )
+    return sorted(path for path in MIGRATION_DIRECTORY.glob("*.py") if _SNAPSHOT_TABLE.search(_read(path)))
+
+
+# 合成源码（不落盘）：把扫描器的四个分类器逐个钉住。每条都是一个完整的 Python 模块
+# 文本，因为扫描器读的就是模块——用片段喂它等于测了一个不存在的输入形态。
+_RED_SAMPLES = {
+    "SQL 里按时间删": (
+        'PURGE = "DELETE FROM roster_snapshot WHERE captured_at < now() - interval \'48 hours\'"\n',
+        "按时间删除快照",
+    ),
+    "表名被插值的按时间删": (
+        'def build(table):\n    return f"DELETE FROM {table} WHERE captured_at < %s"\n',
+        "按时间删除快照",
+    ),
+    "op.execute 里按时间删": (
+        'def upgrade():\n'
+        '    op.execute("DELETE FROM roster_snapshot WHERE captured_at < now() - interval \'90 days\'")\n',
+        "按时间删除快照",
+    ),
+    "建表时就带到期列": (
+        'SQL = """\nCREATE TABLE roster_snapshot (\n'
+        "    id TEXT PRIMARY KEY,\n    expires_at TIMESTAMPTZ NOT NULL\n);\n\"\"\"\n",
+        "到期列或到期触发器",
+    ),
+    "op.add_column 加到期列": (
+        'def upgrade():\n'
+        '    op.add_column("roster_snapshot", sa.Column("expires_at", sa.TIMESTAMP(timezone=True)))\n',
+        "到期列或到期触发器",
+    ),
+    "op.create_table 带到期列": (
+        'def upgrade():\n'
+        '    op.create_table("roster_snapshot", sa.Column("id"), sa.Column("expires_at"))\n',
+        "到期列或到期触发器",
+    ),
+    "到期触发器": (
+        'SQL = """\nCREATE TRIGGER roster_snapshot_expiry\n'
+        "    BEFORE INSERT ON roster_snapshot\n"
+        "    FOR EACH ROW EXECUTE FUNCTION set_expiry();\n\"\"\"\n",
+        "到期列或到期触发器",
+    ),
+    "CREATE OR REPLACE TRIGGER 形态": (
+        'SQL = """\nCREATE OR REPLACE TRIGGER roster_snapshot_expiry\n'
+        "    BEFORE INSERT ON roster_snapshot FOR EACH ROW EXECUTE FUNCTION set_expiry();\n\"\"\"\n",
+        "到期列或到期触发器",
+    ),
+    "按时间清理的入口名": (
+        "class Store:\n    def purge_stale_snapshots(self, cutoff):\n        pass\n",
+        "按时间清理的入口名",
+    ),
+}
+
+_GREEN_SAMPLES = {
+    "替换即删旧的整体 DELETE": 'DELETE_SNAPSHOT_SQL = "DELETE FROM roster_snapshot"\n',
+    "ON DELETE CASCADE 是保证不是路径": (
+        'SQL = """\nCREATE TABLE roster_snapshot_row (\n'
+        "    snapshot_id TEXT NOT NULL REFERENCES roster_snapshot(id) ON DELETE CASCADE,\n"
+        "    row_index INTEGER NOT NULL\n);\n\"\"\"\n"
+    ),
+    "downgrade 整表删除": 'def downgrade():\n    op.drop_table("roster_snapshot")\n',
+    "回读语句带时间列但不删东西": (
+        'LOAD_FACTS_SQL = "SELECT id, captured_at, row_count FROM roster_snapshot"\n'
+    ),
+    "散文里写明刻意没有到期列": (
+        '"""快照表刻意没有 expires_at，也没有到期触发器：始终保留最近一份。"""\n'
+    ),
+    "超龄判定本身不是删除入口": (
+        "DEFAULT_SNAPSHOT_STALE_AFTER = 48\n"
+        "class Status:\n    stale_after_seconds = 0.0\n"
+        "    def stale(self):\n        return True\n"
+    ),
+}
+
+
+class ScannerClassifierTest(unittest.TestCase):
+    """扫描器自身的反例用例：四个分类器各自必红，两类合法写法必绿。
+
+    交付时的人工验红（在真实文件里种入违规样本再恢复）只证明**那一刻**扫描器是好的。
+    把判据清空、正则改坏、`op.*` 通道摘掉，真实文件照样全绿——因此把分类器钉在这里。
+    合成源码只进内存，不落盘。
+    """
+
+    def test_every_violation_shape_is_classified_red(self) -> None:
+        for label, (source, expected) in _RED_SAMPLES.items():
+            with self.subTest(sample=label):
+                hits = _violations(source)
+                self.assertTrue(hits[expected], f"{label} 应当被判为「{expected}」，扫描器却没看见")
+
+    def test_legitimate_shapes_stay_green(self) -> None:
+        for label, source in _GREEN_SAMPLES.items():
+            with self.subTest(sample=label):
+                hits = {kind: found for kind, found in _violations(source).items() if found}
+                self.assertEqual(hits, {}, f"{label} 是合法写法，不该被判违规")
 
 
 class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
@@ -646,25 +825,59 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
     改为按日报告警提醒」。超龄告警那一半有行为用例（`tests/test_roster_daily_source.py`
     与 `tests/test_roster_daily_report.py`）；**"不自动删"这一半只能扫源码**——要证明的
     是一条路径不存在，不存在的东西没有调用点可以断言。
+
+    **这是一条绊线，不是安全边界。** 它挡的是"顺手加一条到期清理"这种最可能发生的
+    形态，不承诺穷举。已登记的盲区（命中不了、需要人工审查兜底）：
+
+    - Python 侧先按时间算出快照 ID、SQL 里只剩 ``WHERE id = %s``；
+    - 用 ``gc`` / ``compact`` / ``rotate`` 这类不在词表里的命名；
+    - ``psycopg.sql`` 的分段组装、``EXECUTE`` 动态语句、跨函数拼接；
+    - ``MERGE ... WHEN MATCHED THEN DELETE``、分区 ``DETACH``、``TRUNCATE`` 的变体写法；
+    - 迁移之外的运维脚本、数据库侧的定时作业（不在本仓库）。
+
+    反过来的保守面（可能误红）也是刻意的：``DELETE ... RETURNING captured_at``、与到期
+    无关的触发器都会被拦下；表名被插值的语句一律按"可能是快照"处理（fail closed），
+    因此同一个文件里针对**别的**表的动态删除也会算到快照头上。命中**不等于**一定有
+    bug，等于**必须重新解释这条路径为什么存在**——把它改绿之前先回答"快照会不会因此
+    被按时间删掉"。
     """
 
     def test_the_scanner_really_sees_the_carrier_sql(self) -> None:
-        """扫描器自证：它确实看到了快照载体里真实存在的删除语句。
+        """扫描器自证（适配器侧）：它确实看到了载体里真实存在的删除语句。
 
-        没有这一条，上面几条断言在扫描器坏掉（改了文件名、SQL 换了写法、AST 取空）
+        没有这一条，下面几条断言在扫描器坏掉（改了文件名、SQL 换了写法、AST 取空）
         时会全部保持绿色——"什么都没扫到"和"扫了没问题"必须区分开。
         """
 
-        for path in (*SNAPSHOT_CARRIER_FILES, MIGRATION_DIRECTORY / "0063_roster_snapshot.py"):
+        for path in (*SNAPSHOT_CARRIER_FILES, SNAPSHOT_MIGRATION):
             with self.subTest(path=path.name):
                 self.assertTrue(path.is_file(), f"快照载体文件不在了：{path}")
 
         adapter = SNAPSHOT_CARRIER_FILES[0]
-        statements = _snapshot_statements(adapter)
-        self.assertTrue(statements, f"扫描器在 {adapter.name} 里一条快照 SQL 都没看到")
+        units = _snapshot_units(_read(adapter))
+        self.assertTrue(units, f"扫描器在 {adapter.name} 里一条快照 SQL 都没看到")
         self.assertTrue(
-            any(_DELETE_VERB.search(_REFERENTIAL_DELETE.sub(" ", statement)) for statement in statements),
+            any(_DELETE_VERB.search(_REFERENTIAL_DELETE.sub(" ", unit)) for unit in units),
             "扫描器没看到整体替换用的 DELETE：它已经不认识这个文件里的 SQL 了",
+        )
+
+    def test_the_scanner_really_extracts_the_migration_ddl(self) -> None:
+        """扫描器自证（迁移侧）：0063 的建表 DDL 真的被提取到了。
+
+        DDL 层最容易"扫了个寂寞"——迁移可以写成 SQL 字符串、也可以写成 `op.*` 调用，
+        任何一种没被提取，到期列与到期触发器那两条断言都会变成一条永远为真的空断言。
+        """
+
+        units = [" ".join(unit.split()).lower() for unit in _snapshot_units(_read(SNAPSHOT_MIGRATION))]
+
+        self.assertTrue(units, "扫描器没从 0063 提取到任何快照 DDL：这一层等于没扫")
+        self.assertTrue(
+            any(unit.startswith("create table roster_snapshot ") for unit in units),
+            f"没提取到 roster_snapshot 的建表语句，只看到：{units[:3]}",
+        )
+        self.assertTrue(
+            any("roster_snapshot_row" in unit for unit in units),
+            "没提取到行表的建表语句：两张表里少扫一张，等于漏掉一半载体",
         )
 
     def test_the_carrier_never_deletes_a_snapshot_by_time(self) -> None:
@@ -673,7 +886,7 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         for path in SNAPSHOT_CARRIER_FILES:
             with self.subTest(path=path.name):
                 self.assertEqual(
-                    _time_conditioned_deletes(path),
+                    _time_conditioned_deletes(_read(path)),
                     [],
                     f"{path.name} 出现了按时间删除快照的语句（V-花名册-47：超龄不自动删）",
                 )
@@ -683,10 +896,10 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         任务写进迁移，和写进适配器是同一件事。"""
 
         migrations = _migrations_touching_the_snapshot()
-        self.assertTrue(migrations, "没有任何迁移提到 roster_snapshot：扫描目录或表名不对")
+        self.assertIn(SNAPSHOT_MIGRATION, migrations, "0063 不在扫描范围里：扫描目录或表名不对")
         for path in migrations:
             with self.subTest(migration=path.name):
-                self.assertEqual(_time_conditioned_deletes(path), [], f"{path.name} 按时间删除快照")
+                self.assertEqual(_time_conditioned_deletes(_read(path)), [], f"{path.name} 按时间删除快照")
 
     def test_the_snapshot_tables_carry_no_expiry_column_or_trigger(self) -> None:
         """不写 DELETE 也能按时清掉：加一列 `expires_at` 再挂一个到期触发器即可。
@@ -695,16 +908,12 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         """
 
         for path in (*SNAPSHOT_CARRIER_FILES, *_migrations_touching_the_snapshot()):
-            for statement in _snapshot_statements(path):
-                with self.subTest(path=path.name):
-                    self.assertIsNone(
-                        _EXPIRY_COLUMN.search(statement),
-                        f"{path.name} 给快照加了到期时间列：{' '.join(statement.split())[:120]}",
-                    )
-                    self.assertIsNone(
-                        _CREATE_TRIGGER.search(statement),
-                        f"{path.name} 给快照挂了触发器：{' '.join(statement.split())[:120]}",
-                    )
+            with self.subTest(path=path.name):
+                self.assertEqual(
+                    _expiry_definitions(_read(path)),
+                    [],
+                    f"{path.name} 给快照定义了到期时间列或到期触发器",
+                )
 
     def test_no_carrier_entry_point_is_named_after_a_timed_cleanup(self) -> None:
         """名字层的绊线：时间在 Python 侧算、SQL 里只剩一条无条件 DELETE，语句扫描
@@ -713,9 +922,12 @@ class SnapshotHasNoTimeBasedDeletionPathTest(unittest.TestCase):
         """
 
         for path in SNAPSHOT_CARRIER_FILES:
-            offenders = sorted(name for name in _declared_names(path) if _TIME_DELETION_NAME.search(name))
             with self.subTest(path=path.name):
-                self.assertEqual(offenders, [], f"{path.name} 出现了按时间清理快照的入口名：{offenders}")
+                self.assertEqual(
+                    _timed_cleanup_names(_read(path)),
+                    [],
+                    f"{path.name} 出现了按时间清理快照的入口名",
+                )
 
 
 if __name__ == "__main__":
