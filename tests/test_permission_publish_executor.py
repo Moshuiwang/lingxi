@@ -293,6 +293,70 @@ class PublishClaimTest(unittest.TestCase):
         self.assertEqual(set(table.written[-1][1]), set(CREATED_FIELD_NAMES))
         self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
 
+    def test_an_update_that_clears_an_existing_cipher_is_not_published(self) -> None:
+        """更新路径**也要看一眼那一列还在不在**（B01 锚点）。
+
+        这条与"补空洞"是两件事：这里既有行**本来有**密文，因此我们走六字段更新、
+        一个字都不提交那一列；但平台在这次写入中把它清掉了。我们没提交它，不代表
+        "发布完成"可以不管它——那个结论断言的是"这一行现在对 MCP 有效"，而一行没有
+        ``token_cipher`` 的权限对 MCP 无效。不看这一眼，它就静默收敛成 ``published``。
+        """
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        table.mutate_on_write = {"token_cipher": ""}
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+        self.assertFalse(attempt.published)
+        # 走的确实是六字段更新路径：我们并没有提交那一列。
+        self.assertEqual(set(table.written[0][1]), set(PUBLISHED_FIELD_NAMES))
+
+    def test_an_update_whose_cipher_reads_back_missing_is_not_published(self) -> None:
+        """同一条防线的另一种形态：那一列在读回结果里**整个不见了**。"""
+
+        table = FakeTable(
+            [
+                {
+                    "record_id": "rec_9",
+                    "fields": {
+                        "record_key": FAKE_EMAIL,
+                        "email": FAKE_EMAIL,
+                        "name": "旧名",
+                        "permissions": "{}",
+                        "status": "approved",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "token_cipher": "旧系统签发的密文",
+                    },
+                }
+            ]
+        )
+        original_read = table.read_row
+
+        def read_without_cipher(record_id):
+            fields = original_read(record_id)
+            fields.pop("token_cipher", None)
+            return fields
+
+        table.read_row = read_without_cipher  # type: ignore[method-assign]
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+
     def test_retry_still_fails_while_the_platform_keeps_dropping_the_cipher(self) -> None:
         """平台持续吞掉那一列时，每一轮都必须是 ``mismatch``，永远不收敛成成功。"""
 
