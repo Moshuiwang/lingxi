@@ -2,13 +2,14 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-17-2"
-digest = "sha256:10b2e4ed271e349b0e5c6edbe120c03aa1c39a6781ccbbe78200f734833cd463"
+version = "2026-08-17-3"
+digest = "sha256:dc7975b0f93cfed97f3dc14e91634ac514a1cb8a1a81cf3cac3cec42a8928394"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
   "2026-08-08",
   "2026-08-17",
+  "2026-08-17-2",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -35,14 +36,17 @@ retired_versions = [
 "texts.onboarding.not_authorized" = "70b661df834988e6"
 "texts.onboarding.sync_timeout" = "9eb53296db8fdcf6"
 "texts.roster.daily_report" = "c0db8cc045259426"
-"texts.roster.disclaimer" = "2c4fa397ca488e3b"
-"texts.roster.entry" = "00ad66d3d5d8e248"
+"texts.roster.disclaimer" = "506969c8c0e31181"
+"texts.roster.entry" = "1a0e9c22aeab0997"
 "texts.roster.entry_handover" = "565700c8d92e99b0"
+"texts.roster.entry_plain" = "deb45efd56e3d391"
 "texts.roster.field.display_name" = "50b5b1d2abefbca6"
 "texts.roster.field.email" = "73075237fd0f05f0"
 "texts.roster.field.employee_no" = "aeb503721b21feb2"
 "texts.roster.handover_mark" = "908e8ae64c037c95"
-"texts.roster.header" = "20f3cbf2441d7773"
+"texts.roster.header" = "8707b195c40944b8"
+"texts.roster.identity" = "a21200602cc40f45"
+"texts.roster.identity_unknown" = "efb2b9c3af5d9bcc"
 "texts.roster.note.ambiguous" = "05bc22bc8df7bd87"
 "texts.roster.note.changed" = "e3b0c44298fc1c14"
 "texts.roster.note.removed" = "3fc979a083d934bd"
@@ -52,7 +56,18 @@ retired_versions = [
 "texts.roster.section.removed" = "5e177534b7ba7e86"
 "texts.roster.section_heading" = "8dfb22f7137639f2"
 "texts.roster.section_heading_with_note" = "2a2885c12683ca64"
+"texts.roster.snapshot_fresh" = "159dd0f300333f84"
+"texts.roster.snapshot_kept" = "9e08a76658bddf2f"
+"texts.roster.snapshot_reason.empty_source" = "27f5bb9181fec2a3"
+"texts.roster.snapshot_reason.failed_definite" = "8876bd8e4313b609"
+"texts.roster.snapshot_reason.failed_indeterminate" = "c7e3a666ade8b41d"
+"texts.roster.snapshot_reason.incomplete" = "b1135e8cfc8cc8b4"
+"texts.roster.snapshot_reason.unknown" = "46fd7dc50298c5c4"
+"texts.roster.snapshot_stale" = "f0109533fc1dab27"
+"texts.roster.snapshot_unavailable" = "ae665482161d100a"
 "texts.roster.summary" = "52868d99339df9ce"
+"texts.roster.summary_not_compared" = "199ba9605d467096"
+"texts.roster.value_absent" = "74e9907bf9a62de2"
 "texts.worker.action.completed" = "f28461bb49c85647"
 "texts.worker.action.processing" = "3b7e27cb4379da3c"
 "texts.worker.context_too_long" = "33805373cca13b15"

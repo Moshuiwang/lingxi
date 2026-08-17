@@ -9,12 +9,17 @@
 3. **空闲会话到点清理**（:class:`IdleConversationSweepDuty`）——会话空闲满两小时
    由 scheduler 周期扫描并主动清除已送达的投递正文，不依赖下一次任务入队
    （Issue #151、2026-08-14 补充决定、`V-投递-10`）；
-4. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天比对一次
-   已开通用户的花名册当前值与建档存档三字段，有差异就向管理群发一条脱敏日报
-   （Issue #52 / W4-B）。第四个职责是**条件注册**的，两个前置任缺其一就不注册：
-   群 ID 环境变量缺失（可选配置，见 :class:`SchedulerConfig`），或花名册读取传输
-   未接线（真实读取的凭据与 Base ID 属 L4a 前置，登记为 R3）。不注册时进程照常
-   启动、其余职责照常运行，并留下一条指名变量的审计（断言 ``V-花名册-29``）。
+4. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天（UTC 日界）
+   跑一轮：读一整轮花名册 → 更新持久快照或保留上一份 → 与建档存档三字段比对 →
+   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。第四个职责是
+   **条件注册**的，四个前置任缺其一就不注册，并留下一条指名原因的审计
+   （断言 ``V-花名册-29``）：管理群 ID、花名册 Base ``app_token``、花名册
+   ``table_id``（三者都是可选环境变量，见 :class:`SchedulerConfig`），以及花名册读取
+   所用的短期令牌供给。不注册时进程照常启动、其余职责照常运行。
+
+   **当前部署下第四个职责仍然不注册**，但理由已经从「装配里写死 ``None``」变成
+   「配置缺项」：真实读取所需的专用主体凭据自 2026-08-09 起未落盘（Issue #52 的
+   G-READ 判定），令牌供给因此还没有安全的构造方式，登记为 R3。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -60,6 +65,13 @@ from lingxi.core.identity.credentials import AuthorizationGrant, CredentialActio
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report_content
+from lingxi.core.identity.roster_snapshot import (
+    DEFAULT_SNAPSHOT_STALE_AFTER,
+    DailyRosterSource,
+    RosterRound,
+    RosterSnapshotUpdater,
+    SnapshotDecision,
+)
 from lingxi.core.alerting import (
     AlertDispatcher,
     AlertingDuty,
@@ -109,6 +121,15 @@ class SchedulerConfig:
     # 配了但格式不对则**快速失败**：那是错配，不是未配，静默降级会让人以为在发日报。
     admin_group_chat_id: str | None = None
     alert_policy: AlertPolicy = field(default_factory=AlertPolicy)
+    # 花名册多维表格的 Base 与表标识。**可选**，与群 ID 同一姿态：缺了只是不注册
+    # 日报职责，不让整个 scheduler 起不来。它们是外部标识而不是凭据，但同样只从
+    # 环境变量来，不进代码（`V-花名册-28` 的同一条理由：外部标识一旦入码就会被
+    # 日志、CI 输出和工单一路复制出去）。
+    roster_app_token: str | None = None
+    roster_table_id: str | None = None
+    # 快照超龄阈值。默认 48 小时，理由写在
+    # :data:`lingxi.core.identity.roster_snapshot.DEFAULT_SNAPSHOT_STALE_AFTER`。
+    roster_snapshot_stale_after: timedelta = DEFAULT_SNAPSHOT_STALE_AFTER
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -122,6 +143,9 @@ class SchedulerConfig:
         "LINGXI_FEISHU_BASE_URL",
         "LINGXI_SCHEDULER_INTERVAL_SECONDS",
         "LINGXI_ADMIN_GROUP_CHAT_ID",
+        "LINGXI_ROSTER_BITABLE_APP_TOKEN",
+        "LINGXI_ROSTER_BITABLE_TABLE_ID",
+        "LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -157,6 +181,39 @@ class SchedulerConfig:
         else:
             interval = DEFAULT_INTERVAL_SECONDS
 
+        def optional_identifier(name: str) -> str | None:
+            """可选的外部标识：缺失返回 ``None``，配了但带空白就快速失败。
+
+            与群 ID 同一条纪律——**错配不是未配**。一个带了换行的 Base token 静默降级
+            成"没配"，会让日报职责悄悄不注册，而运维那边看到的是"我明明配了"。
+            错误消息只报变量名，不回显取到的值。
+            """
+
+            value = (source.get(name) or "").strip()
+            if not value:
+                return None
+            if any(character.isspace() for character in value):
+                raise ValueError(f"环境变量 {name} 不得包含空白字符（不回显取到的值）")
+            return value
+
+        raw_stale_hours = (source.get("LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS") or "").strip()
+        if raw_stale_hours:
+            try:
+                stale_hours = float(raw_stale_hours)
+            except ValueError as error:
+                raise ValueError(
+                    "环境变量 LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS 必须是 0 到 8760 之间的小时数"
+                ) from error
+            # 上界一年：一个大到没有边的阈值等于把超龄告警关掉，而"关掉了"这件事
+            # 不该由一个看起来像数字的配置悄悄完成。
+            if not 0 < stale_hours <= 24 * 365:
+                raise ValueError(
+                    "环境变量 LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS 必须是 0 到 8760 之间的小时数"
+                )
+            roster_snapshot_stale_after = timedelta(hours=stale_hours)
+        else:
+            roster_snapshot_stale_after = DEFAULT_SNAPSHOT_STALE_AFTER
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -186,6 +243,9 @@ class SchedulerConfig:
             interval_seconds=interval,
             admin_group_chat_id=admin_group_chat_id,
             alert_policy=alert_policy,
+            roster_app_token=optional_identifier("LINGXI_ROSTER_BITABLE_APP_TOKEN"),
+            roster_table_id=optional_identifier("LINGXI_ROSTER_BITABLE_TABLE_ID"),
+            roster_snapshot_stale_after=roster_snapshot_stale_after,
         )
 
 
@@ -461,19 +521,53 @@ class _GroupSender(Protocol):
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
 
 
-class RosterAuditDuty:
-    """每日花名册资料比对与管理群审计日报（Issue #52 / W4-B）。
+class _RosterSource(Protocol):
+    """一轮花名册取用：交出用于比对的行与快照状态。
 
-    一轮做四件事：读比对基线 → 读花名册当前值 → 纯函数比对 → 有差异就发一条脱敏日报。
-    四件事里只有第一件碰数据库，而且**只读**（`V-花名册-14`）。
+    实现是 :class:`lingxi.core.identity.roster_snapshot.DailyRosterSource`；职责只依赖
+    这一个方法，因此全部调度与日报断言都能在没有数据库、没有网络的机器上跑完。
+    """
+
+    def current(self, *, now: datetime) -> RosterRound: ...
+
+
+class RosterAuditDuty:
+    """每日花名册资料比对与管理群审计日报（Issue #52）。
+
+    一轮做四件事：读比对基线 → 取本轮花名册（读一整轮 + 更新或保留持久快照）→
+    纯函数比对 → 该发就发一条日报。**存档三字段这一侧只读**（`V-花名册-14`）；
+    唯一的写库发生在花名册快照那一侧，而它写的是花名册的副本，不是 `app_user`。
+
+    **"该发就发"不等于"有差异才发"**。空差异日本来不发（`V-花名册-25`），但有两种
+    情形下「今天没有差异」这句话本身不可信，沉默因此是最危险的输出：
+
+    - **快照超龄**（`V-花名册-47`）：源头连续读不到，比对用的还是几天前那份花名册。
+      产品负责人 2026-08-17 裁定：始终保留最近一份、超龄**按日报告警提醒、不自动删**；
+    - **没有任何可用快照**（`V-花名册-48`）：这一天**不比对**。拿空行去比对会把全体
+      已开通用户报成「花名册查无此人」——那正是空源保护要挡的形状。
+
+    日报正文按产品负责人 2026-08-08 的 **D2 裁定**渲染：受控管理群可含用于定位的存档
+    身份（姓名、工号），并写明快照时间与同步状态、日期一律 UTC（渲染细节见
+    :mod:`lingxi.core.identity.roster_report`）。**日志与审计没有随之放宽**
+    （`V-花名册-33`）：它们流向排障、CI 输出与工单，不在受控管理群那个范围里。
 
     **同日至多一次**（`V-花名册-31`）。判重靠 ``_completed_on`` 这个进程内的日期水位：
 
     - 单轮一次、同进程跨轮一次：由这个水位**硬保证**，与轮询周期无关；
-    - 跨重启：零新表定案下没有持久载体，新进程的水位是空的，因此**重启当日会重发一份
+    - 跨重启：**判重水位没有持久载体**，新进程的水位是空的，因此**重启当日会重发一份
       内容完全相同的日报**。这是产品负责人 2026-08-06 知情接受的残留（裁定 C2 / R2）：
       A 方案下报告由「花名册现值 + 存档」唯一确定，补跑产出同一份，重复是噪声不是错误。
-      真幂等等 ``audit_event`` 表（S9）落地后再补。
+      **原表述「零新表定案下没有持久载体」的前提已被 2026-08-08 的 D2 裁定覆盖**——
+      仓库现在确有持久载体（`roster_snapshot`，迁移 `0063`），但它存的是**花名册读取
+      结果**，不是判重水位；结论因此没变：跨重启的真幂等要等判重水位本身也有持久载体
+      （或 ``audit_event`` 表落地）后再补。
+
+      **快照的 ``captured_at`` 不能顶替判重水位**（S-B-04 核对过并放弃了这条捷径）：
+      它回答的是"快照哪天换的"，而水位要回答的是"日报哪天发出去的"，两者只在最顺利的
+      那条路径上重合。发送失败的那一天快照照样已经换成当天的——拿 ``captured_at``
+      当水位，重启后会认为"今天已经做完"，于是**那一天的日报永远不会发出去**。用一个
+      每天至多重发一份相同日报的噪声，换一个整天静默的失败，方向是反的。真幂等需要
+      判重水位自己的持久列，属新迁移，不在本 Story 的授权范围内。
 
     水位在**发送成功之后**才置位。发送失败不算已发送，下一轮重试（`V-花名册-30`）。
     空差异日也置位：那一天的审计已经记过了，重复记只是噪声（`V-花名册-25`）。
@@ -492,7 +586,7 @@ class RosterAuditDuty:
         self,
         *,
         baseline_reader: _BaselineReader,
-        roster_reader: Callable[[], Sequence[Mapping[str, object]]],
+        roster_source: _RosterSource,
         sender: _GroupSender,
         audit: AuditSink,
         chat_id: str,
@@ -500,7 +594,7 @@ class RosterAuditDuty:
         stop: threading.Event | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
-        self._roster_reader = roster_reader
+        self._roster_source = roster_source
         self._sender = sender
         self._audit = audit
         self._chat_id = chat_id
@@ -528,20 +622,34 @@ class RosterAuditDuty:
         if self._stop.is_set():
             # 已经在停止中：一轮都不开。停止之后必须 0 次发送（`V-花名册-20`）。
             return None
-        today = self._clock().date()
+        now = self._clock()
+        today = now.date()
         if self._completed_on == today:
             return None
 
         baseline = self._baseline_reader.load_active_baseline()
-        report = compare_roster(baseline, self._roster_reader())
+        # 读一整轮花名册并结算持久快照。回读到不自洽的快照
+        # （:class:`~lingxi.adapters.postgres_roster_snapshot.RosterSnapshotInconsistent`）
+        # 或写快照失败时，异常原样上抛，由 :class:`SchedulerLoop` 做职责级隔离并在
+        # 下一轮重试（`V-花名册-17`）；水位不置位，因此这一天还没算做完。
+        round_result = self._roster_source.current(now=now)
+        snapshot = round_result.snapshot
 
-        if report.is_empty:
+        if snapshot.available:
+            report = compare_roster(baseline, round_result.rows)
+        else:
+            # 一份快照都没有：**不比对**（`V-花名册-48`）。空行集会把全体已开通用户
+            # 报成「花名册查无此人」，那是比"今天没日报"严重得多的错误输出。
+            report = RosterAuditReport(examined=len(baseline))
+
+        if report.is_empty and not snapshot.needs_attention:
             # 空差异日**不发日报**，只记一条审计。合同 :85 的语义是「通知待办」，
             # 没有待办却每天发一条「今天没事」，会让管理群很快学会忽略这个通知。
             self._audit.record(
                 "roster_audit.no_difference",
                 report_date=today.isoformat(),
                 examined=report.examined,
+                **snapshot.audit_facts(),
             )
             self._completed_on = today
             return report
@@ -554,7 +662,14 @@ class RosterAuditDuty:
             logger.info("停止信号在花名册读取期间到达，本轮不发送日报")
             return report
 
-        content = render_daily_report_content(report, report_date=today)
+        content = render_daily_report_content(
+            report,
+            report_date=today,
+            # D2 的存档身份段取自**本轮基线**，不是花名册：管理员要定位的是 Lingxi
+            # 这一侧的记录，而花名册当前值本来就要他自己去核实。
+            identities={person.app_user_id: person for person in baseline},
+            snapshot=snapshot,
+        )
         try:
             # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
             # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
@@ -570,6 +685,7 @@ class RosterAuditDuty:
                 content_key=content.key,
                 content_version=content.version,
                 error=type(error).__name__,
+                **snapshot.audit_facts(),
             )
             logger.error("管理群审计日报发送失败，下一轮重试 error=%s", type(error).__name__)
             return report
@@ -584,15 +700,21 @@ class RosterAuditDuty:
             handover=report.handover_count,
             removed=report.removed_count,
             ambiguous=report.ambiguous_count,
+            **snapshot.audit_facts(),
         )
         self._completed_on = today
-        # 摘要只有计数。任何一个人的标识或资料值进日志，都等于绕过日报的脱敏口径。
+        # 摘要只有计数，依据是 `V-花名册-33`（审计与日志不含花名册字段值）。日报正文的
+        # 展示口径已被 2026-08-08 的 D2 裁定放宽到「受控管理群可含原值」，日志侧没有
+        # 随之放宽：日志流向排障、CI 输出与工单，不在受控管理群那个范围里。
         logger.info(
-            "管理群审计日报已发送 已开通用户=%s 条目=%s 疑似转交=%s 花名册查无=%s",
+            "管理群审计日报已发送 已开通用户=%s 条目=%s 疑似转交=%s 花名册查无=%s "
+            "快照可用=%s 快照超龄=%s",
             report.examined,
             len(report.entries),
             report.handover_count,
             report.removed_count,
+            snapshot.available,
+            snapshot.stale,
         )
         return report
 
@@ -701,18 +823,39 @@ def install_signal_handlers(loop: _Stoppable) -> None:
     signal.signal(signal.SIGINT, handle)
 
 
+def _log_snapshot_alert(decision: SnapshotDecision) -> None:
+    """快照保旧时的告警出口：一条只含分类与错误码的结构化警告。
+
+    **面向管理员的那一份提醒走每日日报**（`V-花名册-47` 的裁定原文是「按日报告警提醒、
+    不自动删」），这里补的是运维侧那一半——日报一天只发一次，而运维需要在当轮就看到
+    "今天的花名册读取失败了"。刻意不接 ``core/alerting.py`` 的状态机：它只认心跳、
+    任务滞留与发送连续失败三类信号，把一件每日节奏的数据新鲜度事实塞进去，会让阈值、
+    去重与恢复计时三套语义同时失真。
+
+    只记分类与错误码，不记任何行内容（`V-花名册-33`）。
+    """
+
+    logger.warning(
+        "花名册本轮读取未成功，保留上一份快照 status=%s alert=%s failure_code=%s 上一份行数=%s",
+        decision.status,
+        decision.alert.value if decision.alert is not None else None,
+        decision.failure_code,
+        decision.previous_row_count,
+    )
+
+
 def _build_roster_audit_duty(
     config: SchedulerConfig,
     *,
     stop: threading.Event,
     audit: AuditSink,
-    roster_page_reader: Any | None,
+    roster_access_token: Callable[[], str] | None,
     on_send_outcome: Callable[[str, bool], None] | None = None,
 ) -> RosterAuditDuty | None:
-    """装配审计日报职责；前置不齐就**不注册**并留下一条审计，返回 ``None``。
+    """装配审计日报职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
 
-    两个前置的顺序不能换：先看群 ID。两者都缺时也只记一条审计，`V-花名册-29`
-    要求「缺群 ID → 审计**恰 1 条**」。
+    四个前置按固定次序检查，缺第一个就返回：`V-花名册-29` 要求「缺群 ID → 审计
+    **恰 1 条**」，逐条报会让一个什么都没配的部署一次刷出四条审计，反而看不出该先配哪个。
     """
 
     if not config.admin_group_chat_id:
@@ -726,23 +869,53 @@ def _build_roster_audit_duty(
             "未配置 LINGXI_ADMIN_GROUP_CHAT_ID，花名册审计日报职责不注册；其余定时职责照常运行"
         )
         return None
-    if roster_page_reader is None:
-        # 真实花名册读取的传输、凭据与 Base ID 属 L4a 前置（登记为 R3）。这里显式
-        # 不注册并留痕，而不是装一个每轮都炸的假读取——后者会把「还没接线」伪装成
-        # 「接线了但一直失败」。
-        audit.record("roster_audit.duty_not_registered", reason="roster_reader_unwired")
-        logger.warning("花名册读取传输未接线（真实读取属 L4a 前置），花名册审计日报职责不注册")
+    for variable, value in (
+        ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
+        ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
+    ):
+        if not value:
+            audit.record(
+                "roster_audit.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，花名册审计日报职责不注册；其余定时职责照常运行", variable)
+            return None
+    if roster_access_token is None:
+        # 花名册读取用的短期令牌供给尚未建立：专用授权主体的正式凭据自 2026-08-09 起
+        # 未落盘（Issue #52 的 G-READ 判定），而"就地续期换一次令牌"会与本进程的凭据
+        # 轮换职责抢同一条**一次性** refresh_token。显式不注册并留痕，而不是装一个
+        # 每轮都炸的假读取——后者会把「还没接线」伪装成「接线了但一直失败」（R3）。
+        audit.record("roster_audit.duty_not_registered", reason="roster_access_token_unwired")
+        logger.warning("花名册读取令牌供给未接线（属 L4a 前置），花名册审计日报职责不注册")
         return None
 
     from lingxi.adapters.feishu_group_message import FeishuGroupMessages
-    from lingxi.adapters.feishu_roster_bitable import read_roster_records
+    from lingxi.adapters.feishu_roster_bitable import BitableRosterPages, read_roster_snapshot
     from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    pages = BitableRosterPages(
+        base_url=config.feishu_base_url,
+        app_token=config.roster_app_token,
+        table_id=config.roster_table_id,
+        access_token=roster_access_token,
+    )
+    store = PostgresRosterSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    roster_source = DailyRosterSource(
+        # 走 `read_roster_snapshot` 而不是逐页归一：日报必须能区分「花名册真的空了」
+        # 与「这一轮没读完」，而只有前者会让保旧判定拿到 `EMPTY_SOURCE`。
+        read_round=lambda: read_roster_snapshot(pages),
+        updater=RosterSnapshotUpdater(store=store, audit=audit, on_alert=_log_snapshot_alert),
+        load_snapshot=store.load,
+        stale_after=config.roster_snapshot_stale_after,
+    )
 
     return RosterAuditDuty(
         baseline_reader=PostgresRosterBaselineReader(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
-        roster_reader=lambda: read_roster_records(roster_page_reader),
+        roster_source=roster_source,
         sender=FeishuGroupMessages(
             base_url=config.feishu_base_url,
             app_id=config.feishu_app_id,
@@ -758,7 +931,7 @@ def _build_roster_audit_duty(
 def build_loop(
     config: SchedulerConfig,
     *,
-    roster_page_reader: Any | None = None,
+    roster_access_token: Callable[[], str] | None = None,
     audit: AuditSink | None = None,
     alerting_duty: AlertingDuty | None = None,
     heartbeat: Callable[[], None] | None = None,
@@ -770,10 +943,12 @@ def build_loop(
     因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报
     排在最后：它一天只做一次事，晚一轮毫无影响。
 
-    ``roster_page_reader`` 是花名册多维表格的分页读取传输
-    （:class:`lingxi.adapters.feishu_roster_bitable.RecordPageReader`）。**默认 ``None``，
-    因此当前部署下审计日报职责不会注册**——真实读取所需的凭据与 Base ID 属 L4a 前置，
-    本切片交付的是比对、渲染、发送与调度这四段，登记为 R3。
+    ``roster_access_token`` 是花名册读取所用的**短期令牌供给**（返回已就绪令牌的可调用
+    对象）。它是整条花名册链上唯一一个还没有安全实现的部件，因此单独留作注入点，而不是
+    在这里现造一个：换取令牌要消费专用授权主体那条**一次性** ``refresh_token``，而同一
+    进程里的凭据轮换职责正是它唯一的合法消费者，两个消费者共用一条一次性令牌就是
+    2026-08-08 授权码被烧那次事故的形状。**默认 ``None``，因此当前部署下审计日报职责
+    仍然不注册**（登记为 R3），但 Base 与表标识、快照链、日报渲染与调度都已按配置装配。
     """
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
@@ -817,7 +992,7 @@ def build_loop(
         config,
         stop=stop,
         audit=sink,
-        roster_page_reader=roster_page_reader,
+        roster_access_token=roster_access_token,
         on_send_outcome=(alerting_duty.send_outcome_callback() if alerting_duty else None),
     )
     if roster_audit is not None:

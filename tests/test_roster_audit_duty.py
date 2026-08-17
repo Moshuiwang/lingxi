@@ -34,6 +34,11 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity, DiffKind
+from lingxi.core.identity.roster_snapshot import (
+    DEFAULT_SNAPSHOT_STALE_AFTER,
+    RosterRound,
+    RosterSnapshotStatus,
+)
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 SOURCE_ROOT = REPOSITORY_ROOT / "src"
@@ -73,6 +78,75 @@ def changed_rows() -> list[dict[str, object]]:
 
 def unchanged_rows() -> list[dict[str, object]]:
     return [{"personnel_id": PERSON_ONE, "name": NAME, "employee_no": EMPLOYEE_NO, "email": EMAIL}]
+
+
+# 快照的假行数。用一个接近实测规模的数字（2026-08-05 受控读取：1206 行）而不是
+# `len(rows)`：夹具里的一两行是"比对输入"，与"这一份快照有多大"不是一回事。
+SNAPSHOT_ROWS = 1206
+
+STALE_AFTER_SECONDS = DEFAULT_SNAPSHOT_STALE_AFTER.total_seconds()
+
+
+def fresh_snapshot(*, captured_at: datetime | None = None) -> RosterSnapshotStatus:
+    """本轮刚整体替换过的一份快照：可用、不超龄、无保旧告警。"""
+
+    return RosterSnapshotStatus(
+        action="replace",
+        read_status="complete",
+        stale_after_seconds=STALE_AFTER_SECONDS,
+        captured_at=captured_at or datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc),
+        row_count=SNAPSHOT_ROWS,
+        age_seconds=0.0,
+    )
+
+
+def stale_snapshot(*, age_seconds: float = STALE_AFTER_SECONDS + 3600) -> RosterSnapshotStatus:
+    """保留下来的上一份快照，且已经超龄（`V-花名册-47`）。"""
+
+    return RosterSnapshotStatus(
+        action="keep_previous",
+        read_status="failed",
+        stale_after_seconds=STALE_AFTER_SECONDS,
+        alert="failed_indeterminate",
+        failure_code="pagination_stalled",
+        failure_kind="indeterminate",
+        captured_at=datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
+        row_count=SNAPSHOT_ROWS,
+        age_seconds=age_seconds,
+    )
+
+
+def absent_snapshot() -> RosterSnapshotStatus:
+    """库里从未有过快照，且本轮也没读成功（`V-花名册-48`）。"""
+
+    return RosterSnapshotStatus(
+        action="no_snapshot_yet",
+        read_status="empty_source",
+        stale_after_seconds=STALE_AFTER_SECONDS,
+        alert="empty_source",
+    )
+
+
+class FakeRosterSource:
+    """一轮花名册取用的可注入替身：交出注入的行与快照状态，并记录被调用的时刻。"""
+
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        snapshot: RosterSnapshotStatus | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._rows = rows
+        self._snapshot = snapshot
+        self._error = error
+        self.calls: list[datetime] = []
+
+    def current(self, *, now: datetime) -> RosterRound:
+        self.calls.append(now)
+        if self._error is not None:
+            raise self._error
+        return RosterRound(tuple(self._rows), self._snapshot or fresh_snapshot(captured_at=now))
 
 
 class FakeBaselineReader:
@@ -142,6 +216,8 @@ def build_duty(
     clock: FixedClock | None = None,
     reader: FakeBaselineReader | None = None,
     stop: threading.Event | None = None,
+    snapshot: RosterSnapshotStatus | None = None,
+    source: FakeRosterSource | None = None,
 ) -> tuple[RosterAuditDuty, FakeSender, RecordingAudit, FixedClock, FakeBaselineReader]:
     sender = sender or FakeSender()
     audit = audit or RecordingAudit()
@@ -150,7 +226,7 @@ def build_duty(
     rows = rows if rows is not None else changed_rows()
     duty = RosterAuditDuty(
         baseline_reader=reader,
-        roster_reader=lambda: rows,
+        roster_source=source or FakeRosterSource(rows, snapshot=snapshot),
         sender=sender,
         audit=audit,
         chat_id=FAKE_CHAT_ID,
@@ -166,35 +242,49 @@ def build_duty(
 
 
 class ZeroMigrationGuardTest(unittest.TestCase):
-    """V-花名册-13：本切片**不引入任何迁移能力**。
+    """`V-花名册-13`：**迁移是 DDL 的唯一载体**。
 
-    机器面只断言**本切片自己的源码**：不 import alembic / sqlalchemy，不含建表语句。
+    **旧口径已作废。** 这条守卫原名「零迁移」，依据是 2026-08-06 的「零新表」定案；
+    产品负责人 2026-08-08 的 **D2 裁定**推翻了那一半——花名册读取需要一份跨重启的持久
+    快照，表与 DDL 现在真实存在于 `0063_roster_snapshot`。守卫本身**没有失去意义，
+    只是断言的东西变了**：不再是"本组一行 DDL 都没有"，而是"本组的运行时源码一行 DDL
+    都没有，建表只在 revision 里"。
+
+    机器面断言本组**全部运行时源文件**：不 import alembic / sqlalchemy，不含建表语句。
+    `SLICE_SOURCES` 覆盖比对、渲染、职责、群发、花名册读取与快照读写六个方向——
+    漏掉哪个文件，那个文件里偷偷写一句 `CREATE TABLE` 就没有任何东西会红，
+    而矩阵 `V-花名册-13` 声称的正是"四层源码都不含建表语句"。
 
     **刻意不枚举 `versions/` 的文件集合，也不钉住 head 的取值。** 那样写等于把一次性的
     diff 范围固化成永久不变量：别的切片（例如 #57 的 `0057`）合并一条与花名册毫无关系的
-    revision 时，这条守卫会红——而它红了并不说明「花名册要表」这件事发生了。
-    **他线新表 ≠ 花名册要表**，一个总在别人改动时误报的守卫，最后一定是被人删掉或加豁免，
-    那时它连本来能挡的那一类问题也挡不住了。
+    revision 时，这条守卫会红——而它红了并不说明「花名册这一组多了一张表」。
+    一个总在别人改动时误报的守卫，最后一定是被人删掉或加豁免，那时它连本来能挡的
+    那一类问题也挡不住了。
 
     revision 链的通用健康度（恰一个 head、恰一个 base、无孤儿、id 长度、README 同步）
-    由 #53 建立的 `scripts/ci/check_alembic_revisions.py` 承担，`verify_repository.sh`
-    无条件执行它。下面第二条用例断言这层委托是**真的**接上了，而不是我假设它接上了。
-
-    「本次 diff 零迁移」是**一次性事实**，由验收 runbook 与 PR 声明承担：
-    `git diff --stat <基线> -- migrations/` 为空。用例证明不了这件事——它看不到基线。
+    由 #53 建立的 `scripts/ci/check_alembic_revisions.py` 承担，逐条真往返由
+    `scripts/ci/check_migration_chain.sh` 承担，`verify_repository.sh` 无条件执行前者。
+    下面第二条用例断言这层委托是**真的**接上了，而不是我假设它接上了。
     """
 
-    # 本切片新增或改动的全部源文件。
+    # 本组（花名册审计日报 + 分页 reader + 持久快照）的全部运行时源文件。
     SLICE_SOURCES = (
         "core/identity/roster_audit.py",
         "core/identity/roster_report.py",
         "adapters/postgres_roster_audit.py",
         "adapters/feishu_group_message.py",
         "apps/scheduler/__init__.py",
+        # S-B-01：花名册分页 reader 与四态完整性判定。
+        "adapters/feishu_roster_bitable.py",
+        # S-B-02：替换门槛与保旧告警（core）、持久快照读写（adapters）。
+        # 后者是本组**唯一**写库的模块，也因此最需要这条守卫：它离"顺手在代码里
+        # 建表"只有一步之遥，而建表必须留在 revision 里才可回滚、可对账。
+        "core/identity/roster_snapshot.py",
+        "adapters/postgres_roster_snapshot.py",
     )
 
     def test_no_source_of_this_slice_can_perform_a_migration(self) -> None:
-        """既不 import 迁移工具，也不自己写 DDL——两条路都堵上才叫「零迁移」。"""
+        """既不 import 迁移工具，也不自己写 DDL——建表只在 revision 里。"""
 
         for module in self.SLICE_SOURCES:
             path = SOURCE_ROOT / "lingxi" / module
@@ -386,6 +476,7 @@ class SigtermTest(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
         from lingxi.apps.scheduler import RosterAuditDuty, SchedulerLoop, install_signal_handlers
         from lingxi.core.identity.roster_audit import ArchivedIdentity
+        from lingxi.core.identity.roster_snapshot import RosterRound, RosterSnapshotStatus
 
         state = {"rounds": 0, "rounds_after_stop": 0,
                  "send_started": 0, "send_completed": 0, "sends_after_stop": 0}
@@ -410,6 +501,20 @@ class SigtermTest(unittest.TestCase):
             def record(self, action, /, **fields):
                 pass
 
+        class Source:
+            def current(self, *, now):
+                snapshot = RosterSnapshotStatus(
+                    action="replace",
+                    read_status="complete",
+                    stale_after_seconds=172800.0,
+                    captured_at=now,
+                    row_count=1206,
+                    age_seconds=0.0,
+                )
+                rows = ({"personnel_id": "ou_p1", "name": "花名册姓名",
+                         "employee_no": "E1001", "email": "archived@example.com"},)
+                return RosterRound(rows, snapshot)
+
         # 每轮换一天，让同日判重不挡住后续轮次。
         days = itertools.count()
         base = datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc)
@@ -420,8 +525,7 @@ class SigtermTest(unittest.TestCase):
 
         duty = RosterAuditDuty(
             baseline_reader=Baseline(),
-            roster_reader=lambda: [{"personnel_id": "ou_p1", "name": "花名册姓名",
-                                    "employee_no": "E1001", "email": "archived@example.com"}],
+            roster_source=Source(),
             sender=Sender(),
             audit=Audit(),
             chat_id="oc_fake_admin_group_for_tests",
@@ -575,8 +679,12 @@ class IdempotenceTest(unittest.TestCase):
         """第③面（验收者定稿）：每个进程实例同一日最多一次；重启当日的重发载荷
         与首次**逐字段完全一致**。
 
-        零新表定案下没有持久载体，跨重启的真幂等做不到（裁定 C2 / R2 知情接受）。
+        **判重水位没有持久载体**，跨重启的真幂等做不到（裁定 C2 / R2 知情接受）。
         能被用例证明、也确实值得保证的是：那次重发不是一份**不同的**日报。
+
+        原表述是「零新表定案下没有持久载体」，那个前提已被 2026-08-08 的 D2 裁定覆盖
+        （仓库现有 `roster_snapshot`，迁移 `0063`）；但那份持久载体存的是花名册**读取
+        结果**、不是判重水位，所以这条用例要证明的东西一个字都没变。
         """
 
         clock = FixedClock()
@@ -914,7 +1022,12 @@ class ChatIdValidationTest(unittest.TestCase):
     "跳过：build_loop 会真的构造凭据保管与清理适配器，需要 psycopg 与 cryptography",
 )
 class DutyRegistrationTest(unittest.TestCase):
-    """V-花名册-29：缺群 ID → 职责不注册、进程照常启动、审计恰 1 条、不回显值。"""
+    """V-花名册-29：前置缺项 → 职责不注册、进程照常启动、审计恰 1 条、不回显值。
+
+    S-B-04 起前置从两个变成四个（群 ID、Base ``app_token``、``table_id``、读取令牌
+    供给），且**全部由配置驱动**——此前"花名册读取未接线"是装配里写死的 ``None``，
+    一个把配置全填对的部署也永远注册不上这个职责。
+    """
 
     def _config(self, **extra: str) -> SchedulerConfig:
         import tempfile
@@ -946,8 +1059,37 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(fields["variable"], "LINGXI_ADMIN_GROUP_CHAT_ID")
         self.assertNotIn("value", fields, "审计里不得回显变量的值")
 
-    def test_with_the_group_variable_but_no_roster_reader_the_duty_is_still_not_registered(self) -> None:
-        """R3：真实花名册读取的凭据与 Base ID 属 L4a 前置。
+    def test_each_missing_roster_variable_is_named_one_at_a_time(self) -> None:
+        """Base 与表标识各自缺失时都要指名，且**只报第一个缺的那个**。
+
+        逐条报会让一个什么都没配的部署一次刷出四条审计，反而看不出该先配哪个；
+        `V-花名册-29` 要的也正是「恰 1 条」。
+        """
+
+        cases = (
+            ({}, "LINGXI_ROSTER_BITABLE_APP_TOKEN"),
+            ({"LINGXI_ROSTER_BITABLE_APP_TOKEN": "bascnFakeAppToken"}, "LINGXI_ROSTER_BITABLE_TABLE_ID"),
+        )
+        for extra, expected in cases:
+            with self.subTest(variable=expected):
+                audit = RecordingAudit()
+
+                loop = build_loop(
+                    self._config(LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID, **extra), audit=audit
+                )
+
+                self.assertEqual(
+                    [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+                )
+                self.assertEqual(len(audit.records), 1, "前置缺项时审计恰 1 条")
+                action, fields = audit.records[0]
+                self.assertEqual(action, "roster_audit.duty_not_registered")
+                self.assertEqual(fields["reason"], "missing_environment_variable")
+                self.assertEqual(fields["variable"], expected)
+                self.assertNotIn("value", fields, "审计里不得回显变量的值")
+
+    def test_with_the_table_configured_but_no_token_supply_the_duty_is_still_not_registered(self) -> None:
+        """R3：花名册读取的短期令牌供给属 L4a 前置（G-READ 判定后凭据未落盘）。
 
         这里显式不注册并留痕，而不是装一个每轮都炸的假读取——后者会把「还没接线」
         伪装成「接线了但一直失败」。
@@ -955,30 +1097,39 @@ class DutyRegistrationTest(unittest.TestCase):
 
         audit = RecordingAudit()
 
-        loop = build_loop(self._config(LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID), audit=audit)
+        loop = build_loop(
+            self._config(
+                LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID,
+                LINGXI_ROSTER_BITABLE_APP_TOKEN="bascnFakeAppToken",
+                LINGXI_ROSTER_BITABLE_TABLE_ID="tblFakeTable",
+            ),
+            audit=audit,
+        )
 
         self.assertEqual(
             [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
         )
         self.assertEqual([action for action, _ in audit.records], ["roster_audit.duty_not_registered"])
-        self.assertEqual(audit.records[0][1]["reason"], "roster_reader_unwired")
+        self.assertEqual(audit.records[0][1]["reason"], "roster_access_token_unwired")
 
-    def test_with_both_prerequisites_the_duty_is_registered_by_the_existing_entry_point(self) -> None:
+    def test_with_every_prerequisite_the_duty_is_registered_by_the_existing_entry_point(self) -> None:
         """"谁会调用它"的落点：日报职责由**已存在**的 `lingxi-scheduler` 进程装配。
 
-        `build_loop` 是 `main()` 唯一的装配入口，因此这条断言就是"新增的比对、渲染、
-        发送三段真的有调用方"的证据。
+        `build_loop` 是 `main()` 唯一的装配入口，因此这条断言就是"读取、快照、比对、
+        渲染、发送整条链真的有调用方"的证据。装配过程不发任何请求：令牌供给这里没被
+        调用过一次（`V-花名册-27` 的同一条口径）。
         """
 
         audit = RecordingAudit()
-
-        class PageReader:
-            def list_records(self, page_token=None):
-                return ([], None)
+        token_calls: list[int] = []
 
         loop = build_loop(
-            self._config(LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID),
-            roster_page_reader=PageReader(),
+            self._config(
+                LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID,
+                LINGXI_ROSTER_BITABLE_APP_TOKEN="bascnFakeAppToken",
+                LINGXI_ROSTER_BITABLE_TABLE_ID="tblFakeTable",
+            ),
+            roster_access_token=lambda: token_calls.append(1) or "u-fake-token",
             audit=audit,
         )
 
@@ -987,6 +1138,7 @@ class DutyRegistrationTest(unittest.TestCase):
             ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
         )
         self.assertEqual(audit.records, [], "前置齐备时不该有『未注册』审计")
+        self.assertEqual(token_calls, [], "装配阶段不得取令牌，更不得发请求")
         # 一个停止标志贯穿全部职责。
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

@@ -27,6 +27,13 @@ from lingxi.core.identity.org_snapshot import (
     require_complete_batch,
     snapshot_expires_at,
 )
+from lingxi.core.identity.provisioning import (
+    ProvisioningRejection,
+    ProvisioningRequest,
+    ProvisioningResult,
+    classify_write_failure,
+    missing_identity_fields,
+)
 from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
@@ -237,6 +244,72 @@ class PostgresAppUserStore:
     def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
+
+    def provision(self, request: ProvisioningRequest) -> ProvisioningResult:
+        """Issue #89 写侧建档服务合同的 PostgreSQL 实现（`IdentityProvisioning`）。
+
+        语义（幂等、结果与拒绝原因、事务边界）的正文在
+        :mod:`lingxi.core.identity.provisioning`，本方法不重复叙述，只落实三件事：
+
+        1. **不短路数据库的防线**：除了数据库故意不管的那一格（`blocking_gap`），
+           请求照原样发给数据库，由「全有或全无」CHECK 与专用主体触发器拒绝，
+           再把拒绝翻译成 :class:`ProvisioningRejection`；
+        2. **不吞掉不认识的失败**：`classify_write_failure` 返回 `None` 时原样抛出，
+           不归进任何兜底原因（否则一条未知约束会伪装成「无可用银河权限」）；
+        3. **诊断不带身份原值**：日志与结果里只有字段名、原因码和脱敏后的 `open_id`。
+        """
+
+        # 只取异常基类，不碰 `psycopg` 顶层：正式代码里唯一的建连入口是
+        # `lingxi.adapters.postgres.connect`，`check_db_timeouts.py` 会把任何对
+        # `psycopg` / `psycopg.connection` 的导入判为绕过工厂。
+        from psycopg.errors import Error as DriverError
+
+        gap = request.blocking_gap
+        if gap:
+            # 数据库对「六字段全空」是放行的（账号删除完成后的合法形态），
+            # `ON CONFLICT (feishu_open_id)` 对 NULL 也不去重：这一格只能写侧自己守。
+            return self._rejected(
+                request, ProvisioningRejection.INCOMPLETE_IDENTITY, missing_fields=gap
+            )
+
+        draft = request.to_draft()
+        try:
+            record = self.record_identity(draft)
+        except IdentityStorageIntegrityError:
+            return self._rejected(request, ProvisioningRejection.STORAGE_INTEGRITY)
+        except DriverError as error:
+            missing = missing_identity_fields(draft)
+            rejection = classify_write_failure(
+                sqlstate=error.sqlstate, message=str(error), missing_fields=missing
+            )
+            if rejection is None:
+                raise
+            return self._rejected(
+                request,
+                rejection,
+                missing_fields=missing if rejection is ProvisioningRejection.INCOMPLETE_IDENTITY else (),
+            )
+        return (
+            ProvisioningResult.created(record.id)
+            if record.created
+            else ProvisioningResult.already_provisioned(record.id)
+        )
+
+    def _rejected(
+        self,
+        request: ProvisioningRequest,
+        rejection: ProvisioningRejection,
+        *,
+        missing_fields: tuple[str, ...] = (),
+    ) -> ProvisioningResult:
+        logger.warning(
+            "建档被拒 open_id=%s reason=%s missing=%s storage_fault=%s",
+            redact_identifier(request.identity.feishu_open_id),
+            rejection.value,
+            ",".join(missing_fields),
+            rejection.is_storage_fault,
+        )
+        return ProvisioningResult.rejected(rejection, missing_fields=missing_fields)
 
     def record_identity(self, draft: IdentityRecordDraft) -> AppUserRecord:
         """按 ``feishu_open_id`` 建档或刷新资料。

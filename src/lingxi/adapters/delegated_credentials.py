@@ -105,6 +105,7 @@ class HostFileDelegatedCredentialVault:
         issued_at: datetime | None = None,
         replacing_generation: str | None = None,
         expected_registered_subject_open_id: str | None = None,
+        require_absent_registration: bool = False,
     ) -> bool:
         """登记主体并写入（或轮换）唯一一条专用授权凭据。
 
@@ -113,9 +114,25 @@ class HostFileDelegatedCredentialVault:
         已撤销或已更换的主体写回。文件锁覆盖登记校验、世代校验和加密写入，
         因而不会在保存流程中留下旧文件覆盖窗口。
 
+        ``require_absent_registration`` 是**首次建立专用授权主体**（Issue #137）
+        用的反向 CAS：登记表必须仍然为空才写入。它与 expected 是同一件事的两
+        个方向——都在保存事务内让数据库判定，而不是先读后写；因此首次建立不是
+        绕过主体校验的旁路。``ON CONFLICT DO NOTHING`` 在已有登记时返回零行，
+        既不覆盖也不更新既有主体（换主体属于另一条单独授权的删除动作）。
+
+        两种 CAS 不能同时传：一次保存只能有一个判定条件，否则"到底以哪个为准"
+        会变成调用方的隐式约定。
+
+        登记为空时若磁盘上还残留旧密文，它对 ``load``/``claim_due`` 早已不可用
+        （主体与登记不一致会被清除），因此首次建立按原子替换直接写新密文，不为
+        这份已经失效的残留额外加一道人工确认。
+
         无 expected 时是初次受控写入的兼容路径；V-身份-02 的反向触发器仍在
         登记写入处把关，触发器拒绝时密文一个字节都不落盘。
         """
+
+        if require_absent_registration and expected_registered_subject_open_id is not None:
+            raise ValueError("首次建立与既有主体 CAS 不能同时使用")
 
         moment = issued_at or datetime.now(timezone.utc)
         from lingxi.core.ids import new_ulid
@@ -130,7 +147,20 @@ class HostFileDelegatedCredentialVault:
                     return False
 
             with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-                if expected_registered_subject_open_id is not None:
+                if require_absent_registration:
+                    # 首次建立的 CAS：只有登记表仍为空这一插入才会命中，返回零行
+                    # 说明期间已经有主体登记，本次一律放弃——不覆盖、不更新。
+                    cursor.execute(
+                        """INSERT INTO feishu_delegated_subject (purpose, subject_open_id)
+                           VALUES (%s, %s)
+                           ON CONFLICT (purpose) DO NOTHING
+                        RETURNING subject_open_id""",
+                        (DELEGATED_PURPOSE, subject_open_id),
+                    )
+                    if cursor.fetchone() is None:
+                        logger.warning("首次建立时主体登记已存在，放弃写入")
+                        return False
+                elif expected_registered_subject_open_id is not None:
                     # 条件 UPDATE 是保存事务内的 CAS。它会锁住匹配的登记行；
                     # 并发的主体变更若先提交，这里返回零行，绝不执行后续写入。
                     cursor.execute(

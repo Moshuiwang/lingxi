@@ -61,6 +61,10 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.credentials",
     "lingxi.core.identity.org_snapshot",
     "lingxi.core.identity.first_contact",
+    # Issue #89 写侧建档服务合同：判定层产出 + 花名册原值 → `app_user` 的注入口与
+    # 结果分类。生产调用方是 Epic D 的正式 OnboardingRunner，装配前它不在任何进程的
+    # import 闭包里，但它必须随制品发布——否则 runner 上线那天才发现 wheel 里没有它。
+    "lingxi.core.identity.provisioning",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
@@ -87,6 +91,11 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.roster_audit",
     "lingxi.core.identity.roster_report",
     "lingxi.adapters.postgres_roster_audit",
+    # 花名册持久快照（#52 的 S-B-02，D2 裁定后的新载体）：替换门槛、保旧告警事实与
+    # 每日取用编排在 core，表读写在 adapters。S-B-04 起两者都在 scheduler 的运行时
+    # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
+    "lingxi.core.identity.roster_snapshot",
+    "lingxi.adapters.postgres_roster_snapshot",
     "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
@@ -219,6 +228,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
+            # 花名册持久快照（#52 的 S-B-02）自 S-B-04 起有了真实调用方：
+            # `build_loop` 在函数内 import 它，与上面两个 adapter 同一条理由。
+            "lingxi.adapters.postgres_roster_snapshot",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
@@ -231,6 +243,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
+            "lingxi.core.identity.roster_snapshot",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             "lingxi.core.conversation",
