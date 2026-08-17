@@ -260,13 +260,24 @@ Issue #156 的 S-C-01。一张新表 `publish_outbox`：权限决定（`app_user
 Issue #156 的 S-C-02。两张新表：`mcp_access_token`（Lingxi 为建档用户签发的问数 MCP
 访问令牌）与 `mcp_sync_check`（发布之后每一次「当前用户 MCP 是否就绪」的判定）。
 
-四条约束刻意写进数据库而不是留给调用方自觉：`mcp_access_token` 的**主键即 `user_id`**
-（"同一个人两条令牌"在结构上不可表达）且**没有任何明文列或指纹列**（令牌明文永不落库，
-只存 AES-256-CBC 密文）；`mcp_sync_check.result` 带 CHECK 的五路取值域（`ready` /
-`no_permission` / `waiting` / `timed_out` / `technical_failure` 互斥，是产品结论而不是
-诊断分类）；`result='ready'` 与 `metric_count > 0` 互为充要（"明确空结果"不构成就绪），
-且未跑探针的两类结论不得携带观察值；`UNIQUE (user_id, permission_version, attempt_no)`
-加上由数据库取号的 `attempt_no`（进程重启后不会重号覆盖既有尝试）。
+五条约束刻意写进数据库而不是留给调用方自觉：
+
+1. `mcp_access_token` 的**主键即 `user_id`**（"同一个人两条令牌"在结构上不可表达），
+   且**没有任何明文列或指纹列**；
+2. `mcp_access_token.token_cipher` 的 **CHECK 让明文写不进来**（标准 base64 字母表 +
+   长度是 4 的倍数且 ≥ 44；`secrets.token_urlsafe(32)` 的明文恒为 43 个 URL 安全字符，
+   两条都不满足）——**即使绕过全部应用层、直接执行 SQL 也会被拒**；
+3. `mcp_access_token` 的 **BEFORE UPDATE 触发器让密文改不掉**（`user_id` /
+   `token_cipher` / `issued_at` 一经写入不可改；签发走 `ON CONFLICT DO NOTHING`，
+   不触发它）。覆盖会让库里的密文与已经发布出去的那一份分叉，而新值送不到消费方；
+4. `mcp_sync_check.result` 带 CHECK 的五路取值域，加上**一条完整 CHECK 表达五路各自的
+   精确形状**（就绪必须看见 > 0 条且无错误码；等待中必须有错误码且观察值只能缺省或为零；
+   技术失败与两类非探针终态必须有错误码且不得携带观察值）。只挡"就绪没观察值"是不够的
+   ——`waiting` 带着 `metric_count=5` 或 `technical_failure` 带着观察值，读起来都像
+   "探针跑通了看见了指标"，而它们恰恰是"没就绪"；
+5. `UNIQUE (user_id, permission_version, attempt_no)` 加上由数据库取号、并以事务级
+   advisory lock 串行化的 `attempt_no`（进程重启后不会重号覆盖既有尝试，并发记账也不会
+   有一方撞 `UNIQUE` 中止而丢掉一次已经真的发出去的探针记录）。
 
 与数据库设计蓝本的四处差异（`id` 用 ULID、删掉三个 `observed_*` 列、`result` 五态、
 `detail` 换成 `error_code`）与"为什么当前不提供令牌轮换"的取舍详见 revision 文件头部注释。

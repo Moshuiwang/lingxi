@@ -18,7 +18,7 @@
 | ``superseded`` | 这条意图的权限版本已被更新版本取代 | ``superseded``，**不发生任何外部调用** |
 | ``conflict`` | 同一个人已存在 ``record_key`` 口径不同的行，或命中多行 | ``failed``，不重试 |
 | ``invalid`` | 内容快照本身不可用（缺字段、被人改过库，或**要新建却没有 ``token_cipher``**） | ``failed``，不重试 |
-| ``mismatch`` | 写入调用成功，但读回有字段对不上 | 重试；attempts 用尽转 ``failed`` |
+| ``mismatch`` | 写入调用成功，但读回有字段对不上，或 ``token_cipher`` 缺失 / 被改写 | 重试；attempts 用尽转 ``failed`` |
 | ``rejected`` | 外部**明确拒绝**（完整响应 + 业务错误码非 0） | 重试；attempts 用尽转 ``failed`` |
 | ``uncertain`` | **结果不明**（传输异常、超时、响应形状不对、缺可回读标识） | 重试；attempts 用尽转 ``failed`` |
 
@@ -71,7 +71,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, NamedTuple, Protocol
 
-from lingxi.core.permission.publish_row import PublishRow, compare_readback, readback_text
+from lingxi.core.permission.publish_row import (
+    TOKEN_CIPHER_FIELD,
+    PublishRow,
+    compare_readback,
+    readback_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,17 @@ class ExistingPermissionRow(NamedTuple):
     def email(self) -> str:
         return readback_text(self.fields.get("email"))
 
+    @property
+    def token_cipher(self) -> str:
+        """这一行当前的令牌密文（空串 = 那一列是空的）。
+
+        判定层只用它回答两个问题：**要不要补上我们的密文**（空洞才补），以及
+        **发布完成前那一列还在不在**。归一走同一个 :func:`readback_text`，
+        与逐字段读回比对是同一把尺子。
+        """
+
+        return readback_text(self.fields.get("token_cipher"))
+
     def matches_key(self, record_key: str) -> bool:
         """这一行的 ``record_key`` 是不是我们要写的那一个（**大小写不敏感**）。
 
@@ -209,6 +225,11 @@ class ClaimedPublish:
     payload: Mapping[str, Any]
     attempts: int = 1
     current_permission_version: int | None = None
+    #: 这条意图**此前**已经写到过外部表格的哪一行（首次认领时为 ``None``）。
+    #: 它回答一个别处答不出来的问题：**这一行是不是我们建的**。既有 26 行是业务侧写的，
+    #: 它们的 ``external_record_id`` 永远是 ``None``，因此"密文不是我们那一份"这条判定
+    #: 只会作用在我们自己建的行上，不会误伤旧系统签发的令牌。
+    external_record_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,13 +358,15 @@ def publish_claim(
     1. **先判版本再动手**。旧版本的意图一次外部调用都不发——「不覆盖新权限」必须在
        写之前成立，写完再回滚已经晚了。
     2. **先查后写**。查找同时服务幂等（命中就更新）与安全（同一个人不建第二行）。
-    3. **字段集按动作分**。更新写六列（``token_cipher`` 不在其中，既有行那一列既不被
-       清空也不被覆盖）；新建写七列，必须携带 Lingxi 签发的 ``token_cipher``，缺它则以
-       ``invalid`` + ``missing_token_cipher`` 失败关闭（`V-权限-11` 的两半）。
+    3. **字段集按动作分**。新建写七列，必须携带 Lingxi 签发的 ``token_cipher``；更新
+       分两种——既有密文**非空**时写六列（那一列既不被清空也不被覆盖），既有密文**为空**
+       时把我们的密文补上（填补空洞不是覆盖）。两边都没有密文则以 ``invalid`` +
+       ``missing_token_cipher`` 失败关闭（`V-权限-11` 的两半）。
     4. **写完必须读回**。写入接口返回成功只证明请求被受理，证明不了收下的内容与我们
        决定发布的是同一份；读回按**字符串值**比对（G-BIT 移交的实现约束，见
        :func:`lingxi.core.permission.publish_row.readback_text`），比对范围与本次实际
-       写出去的字段集**同一份**。
+       写出去的字段集**同一份**；此外**无论走哪条路都要确认 ``token_cipher`` 非空**
+       ——"发布完成"断言的是"这一行现在对 MCP 有效"，而没有密文的行对 MCP 无效。
 
     未预期的异常一律不捕获、原样上抛（纪律同 ``adapters/feishu_delivery.py``）：把它们
     也吞成"结果不明"会让真正的缺陷伪装成外部异常，每一轮安静地重试下去。
@@ -391,14 +414,50 @@ def publish_claim(
 
     action = "update" if matches else "create"
     record_id = matches[0].record_id if matches else None
+    existing_cipher = matches[0].token_cipher if matches else ""
+    if (
+        matches
+        and existing_cipher
+        and row.token_cipher
+        and claim.external_record_id == matches[0].record_id
+        and existing_cipher != row.token_cipher
+    ):
+        # **这一行是我们自己建的，密文却不是我们写进去的那一份。** 只有在
+        # ``external_record_id`` 对得上时才敢下这个判断——既有 26 行本来就带着旧系统的
+        # 密文，那时 ``external_record_id`` 是 ``NULL``，走不到这里，因此不会误伤。
+        # 这条挡的是"新建后平台改写了 token_cipher"：不挡的话，重试会走六字段更新、
+        # 完全不看那一列，于是收敛成 ``published``，而这一行对该用户永远无效。
+        return PublishAttempt(
+            outcome=PublishOutcome.MISMATCH,
+            outbox_id=claim.outbox_id,
+            user_id=claim.user_id,
+            permission_version=claim.permission_version,
+            attempts=claim.attempts,
+            action=action,
+            external_record_id=record_id,
+            mismatch_fields=("token_cipher",),
+            error_code="readback_mismatch",
+            failure_kind=PublishFailureKind.DEFINITE,
+        )
     try:
-        # **字段集按动作分**：更新只写六列（``token_cipher`` 不在其中，因此既有行那一列
-        # 既不被清空也不被覆盖）；新建必须连令牌密文一起写，否则这一行对问数 MCP 毫无
-        # 意义。理由全文在 ``publish_row`` 的模块文档「``token_cipher``」一节。
-        expected = row.fields if matches else row.create_fields
+        # **字段集按动作分**，其中更新又分两种（`V-权限-11` 的落点）：
+        #
+        # - 既有行的 ``token_cipher`` **非空**：一个字都不提交，那一列既不被清空也不被
+        #   覆盖——它可能是旧系统 biai-agent 签发的，我们不知道它的明文。
+        # - 既有行的 ``token_cipher`` **为空**而我们手上有密文：把它**补上**。填补空洞
+        #   不是覆盖：「不覆盖」这条规则保护的是既有令牌，空值没有什么可保护的；而一行
+        #   没有密文的权限对问数 MCP 毫无意义（解不出任何 Bearer 与它匹配）。这条路径
+        #   正是"新建成功但平台漏写了那一列"和"新建结果不明"重试时的收敛出口。
+        # - 两边都没有密文：失败关闭（下面的 ``ValueError`` 分支）。
+        if not matches:
+            expected = row.create_fields
+        elif existing_cipher:
+            expected = row.fields
+        else:
+            expected = row.create_fields
     except ValueError as error:
-        # 要新建却没有令牌：失败关闭，不退回六字段"先建了再说"。静默少写一列的结果是
-        # "发布成功了，但这个人永远问不了数"——一个我们自己都发现不了的假成功。
+        # 要新建（或要补空洞）却没有令牌：失败关闭，不退回六字段"先建了再说"。静默少写
+        # 一列的结果是"发布成功了，但这个人永远问不了数"——一个我们自己都发现不了的假成功。
         return PublishAttempt(
             outcome=PublishOutcome.INVALID,
             outbox_id=claim.outbox_id,
@@ -406,6 +465,7 @@ def publish_claim(
             permission_version=claim.permission_version,
             attempts=claim.attempts,
             action=action,
+            external_record_id=record_id,
             error_code="missing_token_cipher",
             failure_kind=PublishFailureKind.DEFINITE,
             detail=type(error).__name__,
@@ -420,6 +480,12 @@ def publish_claim(
         return _failure(claim, error, action=action, external_record_id=record_id)
 
     mismatch = compare_readback(expected, actual)
+    if not mismatch and TOKEN_CIPHER_FIELD not in expected:
+        # **更新路径也必须证明那一列还在。** 我们没提交它，但"发布完成"这个结论断言的是
+        # "这一行现在对 MCP 有效"，而一行没有 ``token_cipher`` 的权限对 MCP 无效。
+        # 不看这一眼，一次被平台清空的密文会在下一轮悄悄收敛成 ``published``。
+        if not readback_text(actual.get(TOKEN_CIPHER_FIELD)):
+            mismatch = (TOKEN_CIPHER_FIELD,)
     if mismatch:
         return PublishAttempt(
             outcome=PublishOutcome.MISMATCH,

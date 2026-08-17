@@ -51,22 +51,27 @@ PERMISSIONS = '{"1011":["日活","收入"]}'
 WILDCARD = '{"*":["日活"]}'
 EMPTY_LIST = '{"1011":[]}'
 #: 验收窗口用的**最小合法配置**：两次尝试就走完全程，不依赖真等十五分钟。
-FAST = ReadinessSchedule(interval_seconds=1, budget_seconds=1)
+FAST = ReadinessSchedule(interval_seconds=1, budget_seconds=1, probe_timeout_seconds=1)
 
 
 class FakeClock:
-    """假时钟：只在 ``sleep`` 与显式 ``advance`` 时前进。"""
+    """假时钟：只在 ``sleep`` 与显式 ``advance`` 时前进。
 
-    def __init__(self, start: datetime = START) -> None:
+    ``jitter`` 模拟真实 ``time.sleep`` 的行为——它**只保证不早于**请求的时长，实际总要
+    多回来一点。这一点点误差累积起来正是"最后一次探针永远发不出去"的成因。
+    """
+
+    def __init__(self, start: datetime = START, *, jitter: float = 0.0) -> None:
         self.now = start
         self.slept: list[float] = []
+        self._jitter = jitter
 
     def __call__(self) -> datetime:
         return self.now
 
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
-        self.now += timedelta(seconds=seconds)
+        self.now += timedelta(seconds=seconds + self._jitter)
 
     def advance(self, seconds: float) -> None:
         self.now += timedelta(seconds=seconds)
@@ -186,7 +191,7 @@ class ScheduleTest(unittest.TestCase):
         """合法却荒谬的组合（1 秒一次探一小时）要**拒绝**，不是悄悄截断。"""
 
         with self.assertRaises(ValueError) as caught:
-            ReadinessSchedule(interval_seconds=1, budget_seconds=3600)
+            ReadinessSchedule(interval_seconds=1, budget_seconds=3600, probe_timeout_seconds=1)
         self.assertIn(str(MAX_ATTEMPTS), str(caught.exception))
 
     def test_confirmation_refuses_raw_numbers(self) -> None:
@@ -197,8 +202,25 @@ class ScheduleTest(unittest.TestCase):
                 store=FakeStore(),
                 audit=FakeAudit(),
                 clock=clock,
+                sleep=clock.sleep,
                 schedule=180,  # type: ignore[arg-type]
             )
+
+    def test_probe_timeout_must_not_exceed_the_interval(self) -> None:
+        """单次探针比一个间隔还久时，整轮确认会无上界地拖长——配置层就拒绝。"""
+
+        with self.assertRaises(ValueError):
+            ReadinessSchedule(interval_seconds=180, budget_seconds=900, probe_timeout_seconds=181)
+        for value in (0, -1, True, 20.0):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    ReadinessSchedule(probe_timeout_seconds=value)
+
+    def test_hard_deadline_is_budget_plus_one_probe_timeout(self) -> None:
+        """结论最晚落地的时刻 = 预算 + 单次探针超时，这就是对上游承诺的收口上界。"""
+
+        self.assertEqual(CONTRACT_SCHEDULE.hard_deadline, timedelta(seconds=900 + 20))
+        self.assertEqual(FAST.hard_deadline, timedelta(seconds=2))
 
 
 class PermissionPresenceTest(unittest.TestCase):
@@ -330,6 +352,33 @@ class ConfirmationTest(unittest.TestCase):
         self.assertEqual(session.attempt_count, CONTRACT_SCHEDULE.max_attempts + 1)
         self.assertEqual([item.attempt_no for item in store.records], list(range(1, 8)))
 
+    def test_company_id_reaches_the_permission_judgement(self) -> None:
+        """``company_id`` 必须真的接到回退制判定上（丢掉它会静默变成"任何公司都算"）。"""
+
+        document = '{"1011":["日活"]}'
+        confirmation, probe, _, _, _ = _confirmation(3)
+        # 1012 在文档里没有键，也没有通配 → 明确无权限，一次探针都不发。
+        session = confirmation.confirm(BINDING, permissions=document, company_id="1012")
+        self.assertEqual(session.outcome, ReadinessOutcome.NO_PERMISSION)
+        self.assertEqual(probe.calls, [])
+
+        confirmation, probe, _, _, _ = _confirmation(3)
+        session = confirmation.confirm(BINDING, permissions=document, company_id="1011")
+        self.assertEqual(session.outcome, ReadinessOutcome.READY)
+        self.assertEqual(probe.calls, [USER])
+
+    def test_technical_failures_counts_only_technical_failures(self) -> None:
+        """计数把 ``waiting`` 也算进去，会让"等不到"与"压根没探成"在告警里混成一件事。"""
+
+        confirmation, _, _, _, _ = _confirmation(
+            0, McpProbeError("transport_error"), schedule=ReadinessSchedule(
+                interval_seconds=1, budget_seconds=2, probe_timeout_seconds=1
+            )
+        )
+        session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        self.assertEqual(session.attempt_count, 4)  # 空结果 + 技术失败 + 空结果 + 超时
+        self.assertEqual(session.technical_failures, 1)
+
     def test_store_failure_is_not_swallowed(self) -> None:
         store = FakeStore()
         store.fault = RuntimeError("库挂了")
@@ -366,6 +415,49 @@ class BudgetTest(unittest.TestCase):
         # 第六次落在第十五分钟整点，仍在窗口内（"最多等待十五分钟"）。
         self.assertEqual(clock.now - START, timedelta(seconds=900))
 
+    def test_a_jittery_clock_still_sends_the_last_probe(self) -> None:
+        """**真实时钟下必须仍是六次。**
+
+        ``time.sleep(180)`` 只保证"不早于"，每次都会多回来一点点。上一版按
+        ``now > deadline`` 二次否决尝试，累计抖动到第六次时 ``now`` 必然略过
+        ``started + 900``，于是合同要求的最后一次探针永远发不出去——十五分钟的窗口
+        实际只用了十二分钟（二级独立审查用 1 毫秒抖动实测到）。
+        """
+
+        clock = FakeClock(jitter=0.001)
+        confirmation, probe, _, _, _ = _confirmation(
+            0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock
+        )
+        session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        self.assertEqual(len(probe.calls), 6)
+        self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
+        # 抖动确实发生了：结束时刻已经越过了纯预算，但探针一次没少。
+        self.assertGreater(clock.now - START, timedelta(seconds=900))
+
+    def test_a_success_at_the_boundary_still_counts(self) -> None:
+        """第 900 秒整点那一次成功仍然算就绪（"最多等待十五分钟"含边界）。"""
+
+        clock = FakeClock(jitter=0.001)
+        confirmation, probe, _, _, _ = _confirmation(
+            0, 0, 0, 0, 0, 7, schedule=CONTRACT_SCHEDULE, clock=clock
+        )
+        session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        self.assertEqual(session.outcome, ReadinessOutcome.READY)
+        self.assertEqual(len(probe.calls), 6)
+
+    def test_offsets_cover_899_900_and_stop_before_901(self) -> None:
+        """边界枚举：899 秒的预算给 5 次，900 给 6 次，901 仍是 6 次（下一次要 1080）。"""
+
+        self.assertEqual(
+            ReadinessSchedule(budget_seconds=899).attempt_offsets(), (0, 180, 360, 540, 720)
+        )
+        self.assertEqual(
+            ReadinessSchedule(budget_seconds=900).attempt_offsets(), (0, 180, 360, 540, 720, 900)
+        )
+        self.assertEqual(
+            ReadinessSchedule(budget_seconds=901).attempt_offsets(), (0, 180, 360, 540, 720, 900)
+        )
+
     def test_slow_probes_consume_the_budget(self) -> None:
         """探针本身耗时也吃预算：不然一次挂了 14 分钟的调用还能再等十五分钟。"""
 
@@ -386,9 +478,10 @@ class BudgetTest(unittest.TestCase):
         )
         session = confirmation.confirm(BINDING, permissions=PERMISSIONS)
         self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
-        # 每次探针 400 秒：第一次结束在 400s，第二次的目标时刻 180s 已过、立即开始，
-        # 结束在 800s；第三次目标 360s 已过、立即开始，结束在 1200s > 900s 预算，
-        # 因此第四次不再发起。
+        # 每次探针 400 秒（一个无视超时约定的注入探针）：第一次结束在 400s，第二次目标
+        # 时刻 180s 已过、立即开始并结束在 800s，第三次目标 360s 已过、立即开始并结束在
+        # 1200s——此时已越过硬上界 900+20=920s，第四次不再发起。**这条路径只在探针链
+        # 真的失控时才走到**：正常与抖动时钟下硬上界永远不触发（见上面两条）。
         self.assertEqual(len(probe.calls), 3)
 
     def test_timeout_record_carries_no_probe_observation(self) -> None:
@@ -460,11 +553,39 @@ class AttemptInvariantTest(unittest.TestCase):
         for outcome in (ReadinessOutcome.NO_PERMISSION, ReadinessOutcome.TIMED_OUT):
             with self.subTest(outcome=outcome):
                 with self.assertRaises(ValueError):
-                    self._attempt(outcome=outcome, metric_count=3)
+                    self._attempt(outcome=outcome, metric_count=3, error_code="x")
 
-    def test_technical_failure_requires_an_error_code(self) -> None:
+    def test_waiting_cannot_claim_it_saw_metrics(self) -> None:
+        """一条"等待中却看见 5 条"的记录自相矛盾——看见了就该是就绪。"""
+
         with self.assertRaises(ValueError):
-            self._attempt(outcome=ReadinessOutcome.TECHNICAL_FAILURE, metric_count=None)
+            self._attempt(outcome=ReadinessOutcome.WAITING, metric_count=5, error_code="x")
+        # 合法的两种等待中：明确拒绝（无观察值）与空结果（恰为 0）。
+        self._attempt(outcome=ReadinessOutcome.WAITING, metric_count=None, error_code="http_403")
+        self._attempt(outcome=ReadinessOutcome.WAITING, metric_count=0, error_code="empty_metrics")
+
+    def test_technical_failure_cannot_carry_observations(self) -> None:
+        """探针没跑通，任何数字都是假的；负数还会撞上迁移 0065 的 CHECK。"""
+
+        for value in (0, 3, -1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self._attempt(
+                        outcome=ReadinessOutcome.TECHNICAL_FAILURE,
+                        metric_count=value,
+                        error_code="transport_error",
+                    )
+
+    def test_every_non_ready_outcome_requires_an_error_code(self) -> None:
+        for outcome in (
+            ReadinessOutcome.WAITING,
+            ReadinessOutcome.TECHNICAL_FAILURE,
+            ReadinessOutcome.NO_PERMISSION,
+            ReadinessOutcome.TIMED_OUT,
+        ):
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(ValueError):
+                    self._attempt(outcome=outcome, metric_count=None, error_code=None)
 
     def test_naive_timestamps_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -495,28 +616,115 @@ class AttemptInvariantTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ReadinessSession(binding=BINDING, outcome=ReadinessOutcome.READY, attempts=())
 
+    def test_session_cannot_borrow_another_users_success(self) -> None:
+        """否定面：拿别人的 ready 记录 + 自己的 binding 拼不出一个 ``applies_to`` 为真的结论。
+
+        ``applies_to`` 只核 binding、不核证据，因此证据与 binding 的一致性必须在构造时
+        就成立（二级独立审查自设计的变异 S2）。
+        """
+
+        other = ReadinessAttempt(
+            binding=ReadinessBinding("usr_B", VERSION),
+            attempt_no=1,
+            outcome=ReadinessOutcome.READY,
+            started_at=START,
+            finished_at=START,
+            metric_count=9,
+        )
+        with self.assertRaises(ValueError):
+            ReadinessSession(binding=BINDING, outcome=ReadinessOutcome.READY, attempts=(other,))
+        # 版本对不上同样拒绝。
+        stale = ReadinessAttempt(
+            binding=ReadinessBinding(USER, VERSION + 1),
+            attempt_no=1,
+            outcome=ReadinessOutcome.READY,
+            started_at=START,
+            finished_at=START,
+            metric_count=9,
+        )
+        with self.assertRaises(ValueError):
+            ReadinessSession(binding=BINDING, outcome=ReadinessOutcome.READY, attempts=(stale,))
+
+    def test_session_outcome_must_match_the_last_attempt(self) -> None:
+        """一轮以超时收尾的确认不得对外宣称就绪。"""
+
+        timed_out = ReadinessAttempt(
+            binding=BINDING,
+            attempt_no=1,
+            outcome=ReadinessOutcome.TIMED_OUT,
+            started_at=START,
+            finished_at=START,
+            error_code="budget_exhausted",
+        )
+        with self.assertRaises(ValueError):
+            ReadinessSession(
+                binding=BINDING, outcome=ReadinessOutcome.READY, attempts=(timed_out,)
+            )
+
 
 class ClockTest(unittest.TestCase):
     def test_naive_clock_is_rejected(self) -> None:
+        clock = FakeClock()
         confirmation = McpReadinessConfirmation(
             probe=FakeProbe(1),
             store=FakeStore(),
             audit=FakeAudit(),
             clock=lambda: datetime(2026, 8, 17, 3, 0),
+            sleep=clock.sleep,
             schedule=FAST,
         )
         with self.assertRaises(ValueError):
             confirmation.confirm(BINDING, permissions=PERMISSIONS)
 
     def test_non_callable_clock_is_rejected(self) -> None:
+        clock = FakeClock()
         with self.assertRaises(TypeError):
             McpReadinessConfirmation(
                 probe=FakeProbe(1),
                 store=FakeStore(),
                 audit=FakeAudit(),
                 clock=START,  # type: ignore[arg-type]
+                sleep=clock.sleep,
                 schedule=FAST,
             )
+
+
+class SleeperTest(unittest.TestCase):
+    """``sleep`` **必填**：缺省会把十五分钟的等待压成瞬时，而一切看起来都正常。"""
+
+    def test_sleep_is_required(self) -> None:
+        clock = FakeClock()
+        with self.assertRaises(TypeError):
+            McpReadinessConfirmation(  # type: ignore[call-arg]
+                probe=FakeProbe(0, 0),
+                store=FakeStore(),
+                audit=FakeAudit(),
+                clock=clock,
+                schedule=FAST,
+            )
+
+    def test_non_callable_sleeper_is_rejected(self) -> None:
+        clock = FakeClock()
+        for sleeper in (None, 0, 1.5, "sleep"):
+            with self.subTest(sleeper=repr(sleeper)):
+                with self.assertRaises(TypeError) as caught:
+                    McpReadinessConfirmation(
+                        probe=FakeProbe(0, 0),
+                        store=FakeStore(),
+                        audit=FakeAudit(),
+                        clock=clock,
+                        sleep=sleeper,  # type: ignore[arg-type]
+                        schedule=FAST,
+                    )
+                self.assertIn("sleep", str(caught.exception))
+
+    def test_a_real_sleeper_actually_spends_the_budget(self) -> None:
+        """反面参照：注入了 sleeper 之后，整轮确认确实走过了完整预算。"""
+
+        clock = FakeClock()
+        confirmation, _, _, _, _ = _confirmation(0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock)
+        confirmation.confirm(BINDING, permissions=PERMISSIONS)
+        self.assertEqual(sum(clock.slept), 900.0)
 
 
 if __name__ == "__main__":  # pragma: no cover

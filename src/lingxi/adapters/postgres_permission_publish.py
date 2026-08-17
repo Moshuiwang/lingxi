@@ -252,8 +252,10 @@ class PostgresPermissionPublishStore:
         fields = dict(payload)
         if set(fields) not in (set(PUBLISHED_FIELD_NAMES), set(CREATED_FIELD_NAMES)):
             raise ValueError("发布内容快照的字段集必须与已登记的发布字段完全一致")
-        cipher = fields.get(TOKEN_CIPHER_FIELD)
-        if cipher is not None and not is_cipher_shaped(cipher):
+        # **键存在就校验形状**，不是"值非 None 才校验"：一份带着 ``token_cipher: None``
+        # 的七键快照曾经能过——它既不是合法的六键更新快照，也不是可用的七键新建快照，
+        # 还会在还原成 ``PublishRow`` 之后表现得像"没有令牌"。
+        if TOKEN_CIPHER_FIELD in fields and not is_cipher_shaped(fields[TOKEN_CIPHER_FIELD]):
             # 明文长得不像密文（``token_urlsafe`` 是 URL 安全 base64，长度也不对齐），
             # 因此这道形状校验就是"明文不进 outbox"的最后一关。不回显收到的值。
             raise ValueError("发布内容快照的 token_cipher 形状不合法（不回显收到的值）")
@@ -322,7 +324,8 @@ class PostgresPermissionPublishStore:
                               LIMIT 1
                                 FOR UPDATE SKIP LOCKED
                            )
-                    RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts
+                    RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts,
+                              o.external_record_id
                     """
                 )
                 row = cursor.fetchone()
@@ -341,6 +344,9 @@ class PostgresPermissionPublishStore:
             payload=dict(row[3] or {}),
             attempts=int(row[4]),
             current_permission_version=None if current is None else int(current[0]),
+            # 上一次尝试写到过外部表格的哪一行。判定层用它回答"这一行是不是我们建的"
+            # ——既有 26 行永远是 NULL，因此"密文被改写"那条判定不会误伤它们。
+            external_record_id=None if row[5] is None else str(row[5]),
         )
 
     def complete(self, attempt: PublishAttempt, *, status: str) -> None:

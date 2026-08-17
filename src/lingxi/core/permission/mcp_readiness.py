@@ -63,9 +63,22 @@
 布尔、非整数一律拒绝，且**没有"配错了就回退默认"的分支**——一个静默回退的配置项等于
 没有配置项，而这里配错的方向是"无上界地一直探下去"。
 
+**"发几次"与"最晚什么时候收口"是两件事，分别由两个东西决定**：
+
+- **发几次**：只看 :meth:`ReadinessSchedule.attempt_offsets` 这张计划表
+  （默认 ``(0, 180, 360, 540, 720, 900)``，六次）。执行时**不**再拿"现在过没过预算"
+  去二次否决某一次尝试——真实 ``sleep(180)`` 每次都会多回来几毫秒，累计到第六次时
+  ``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针永远被跳过，
+  实际只发五次。二级独立审查用抖动时钟实测到了这个偏差。
+- **最晚什么时候收口**：``预算 + 单次探针超时``（:attr:`ReadinessSchedule.hard_deadline`）。
+  配置层强制单次探针超时 ≤ 轮询间隔，因此最后一次探针最迟在这个时刻之前结束；
+  在这个窗口内返回的成功**仍然有效**。硬上界只在探针链真的失控（注入的探针无视超时）
+  时才触发，正常与抖动时钟下永远不触发。
+
 验收窗口用**最小合法配置**（``ReadinessSchedule(interval_seconds=1,
-budget_seconds=1)``）把等待缩短到两次尝试，不靠真的等十五分钟；时钟与 ``sleep`` 都是
-注入的，纯单测里连一秒都不用等。
+budget_seconds=1, probe_timeout_seconds=1)``）把等待缩短到两次尝试，不靠真的等十五分钟；
+时钟与 ``sleep`` 都是注入的，纯单测里连一秒都不用等。**``sleep`` 是必填参数**：缺省会让
+六次探针背靠背发完、立刻判超时，十五分钟的等待被压成毫秒级，而日志与记录看起来完全正常。
 
 ## 本模块不做的事
 
@@ -103,6 +116,12 @@ MIN_INTERVAL_SECONDS = 1
 MAX_INTERVAL_SECONDS = 900
 MIN_BUDGET_SECONDS = 1
 MAX_BUDGET_SECONDS = 3600
+
+#: 单次探针的传输超时。默认值与 ``adapters/query_mcp_probe.REQUEST_TIMEOUT_SECONDS``
+#: 一致；装配层把两者接到一起时必须保持相等，否则这里算出来的收口上界是假的。
+#: 上界不是独立常量：它被 :class:`ReadinessSchedule` 强制 ≤ 轮询间隔。
+DEFAULT_PROBE_TIMEOUT_SECONDS = 20
+MIN_PROBE_TIMEOUT_SECONDS = 1
 
 #: 一次确认最多允许发多少次探针。它挡的是 ``interval=1, budget=3600`` 这类**合法却荒谬**
 #: 的组合：3601 次调用会把问数 MCP 的配额打光。做法是**拒绝这样的配置**，不是悄悄截断——
@@ -166,14 +185,24 @@ class ReadinessSchedule:
 
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
     budget_seconds: int = DEFAULT_BUDGET_SECONDS
+    probe_timeout_seconds: int = DEFAULT_PROBE_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         _require_seconds(
             "轮询间隔", self.interval_seconds, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS
         )
         _require_seconds("总预算", self.budget_seconds, MIN_BUDGET_SECONDS, MAX_BUDGET_SECONDS)
+        _require_seconds(
+            "单次探针超时", self.probe_timeout_seconds, MIN_PROBE_TIMEOUT_SECONDS, MAX_INTERVAL_SECONDS
+        )
         if self.interval_seconds > self.budget_seconds:
             raise ValueError("轮询间隔不得大于总预算：那样只会发出一次探针，配置在说谎")
+        if self.probe_timeout_seconds > self.interval_seconds:
+            # 这条约束是**结论落地时刻的上界**（见 :attr:`hard_deadline` 与模块文档
+            # 「节奏与预算」）。单次探针允许比一个间隔还久时，慢探针会一路把后续尝试
+            # 往后推，整轮确认可以远远超过十五分钟才收口——而上游正是按十五分钟给用户
+            # 承诺的。装配层必须让探针传输层的超时与这里一致。
+            raise ValueError("单次探针超时不得大于轮询间隔：否则整轮确认会无上界地拖长")
         planned = self.budget_seconds // self.interval_seconds + 1
         if planned > MAX_ATTEMPTS:
             raise ValueError(
@@ -188,6 +217,11 @@ class ReadinessSchedule:
         十五分钟整点的那一次仍在窗口内。把它写成一个能被单独看见、也能被单独改坏的
         纯函数，是为了让"到底会探几次、最后一次在第几秒"可以直接断言，而不用去读一遍
         循环体去推断。
+
+        **这份计划表就是"发几次"的唯一判据。** 执行时不再拿"现在过没过预算"去二次否决
+        某一次尝试——真实时钟下 ``sleep(180)`` 每次都会多回来几毫秒，累计到第六次时
+        ``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针**永远被跳过**，
+        实际只发五次（二级独立审查用抖动时钟实测到这一点）。
         """
 
         offsets: list[int] = []
@@ -204,6 +238,22 @@ class ReadinessSchedule:
     @property
     def budget(self) -> timedelta:
         return timedelta(seconds=self.budget_seconds)
+
+    @property
+    def hard_deadline(self) -> timedelta:
+        """结论**最晚**落地的时刻（相对起点）：预算 + 一次探针超时。
+
+        计划表决定"发几次"，这条决定"最坏拖到什么时候"。两者分工明确：
+
+        - 正常与抖动时钟下它永远不触发，因此第六次探针照发（`V-权限-05` 的节奏）；
+        - 探针链真的失控时（注入的探针无视超时、每次跑几分钟），它把整轮确认收口在
+          ``预算 + 单次超时`` 之内，而不是让"十五分钟"变成没有上界的说法。
+
+        因为 :meth:`__post_init__` 已经要求单次超时 ≤ 间隔，正常路径上最后一次探针
+        最迟在 ``budget + probe_timeout`` 结束——**这就是对上游承诺的收口上界**。
+        """
+
+        return timedelta(seconds=self.budget_seconds + self.probe_timeout_seconds)
 
 
 #: 合同默认节奏。单独取个名字，让"用的是不是合同值"能被断言。
@@ -232,6 +282,46 @@ class ReadinessBinding:
             raise ValueError("权限版本必须为正：0 表示还没有过任何权限决定")
 
 
+def _require_attempt_shape(
+    outcome: "ReadinessOutcome", error_code: str | None, metric_count: int | None
+) -> None:
+    """五路结论各自的**精确形状**。与迁移 ``0065`` 的 CHECK 一一对应，两处必须同时改。
+
+    这不是防御性冗余，而是把"这条记录到底代表什么"钉死在类型层：二级独立审查实测过，
+    只挡 ``ready`` 那一条时，``waiting`` 可以带着 ``metric_count=5`` 落库、
+    ``technical_failure`` 可以带着观察值落库——两者读起来都像"探针跑通了看见了指标"，
+    而它们恰恰是"没就绪"。
+
+    | 结论 | 错误码 | 观察值 |
+    |---|---|---|
+    | ``ready`` | **必须没有** | 必须有，且 > 0 |
+    | ``waiting`` | 必须有 | 没有（明确拒绝）或恰为 0（空结果） |
+    | ``technical_failure`` | 必须有 | **必须没有**（探针没跑通，任何数字都是假的） |
+    | ``no_permission`` / ``timed_out`` | 必须有 | **必须没有**（这两路压根不发探针） |
+    """
+
+    if isinstance(metric_count, bool) or not isinstance(metric_count, (int, type(None))):
+        raise ValueError("可见指标条数必须是整数或缺省")
+    if metric_count is not None and metric_count < 0:
+        raise ValueError("可见指标条数不得为负")
+    if outcome is ReadinessOutcome.READY:
+        if metric_count is None or metric_count <= 0:
+            raise ValueError("就绪必须带着大于零的可见指标条数（明确空结果不算就绪）")
+        if error_code is not None:
+            raise ValueError("就绪不得同时携带错误码")
+        return
+    if not error_code:
+        raise ValueError("未就绪的结论必须带错误码，否则运维无从下手")
+    if outcome is ReadinessOutcome.WAITING:
+        if metric_count is not None and metric_count != 0:
+            # 等待中只有两种来源：明确拒绝（没看见任何东西）与空结果（恰好看见 0 条）。
+            # 一条"等待中却看见 5 条"的记录自相矛盾——看见了就该是就绪。
+            raise ValueError("等待中的观察值只能缺省或为零")
+        return
+    if metric_count is not None:
+        raise ValueError("未发起探针或探针未跑通的结论不得携带可见指标条数")
+
+
 @dataclass(frozen=True)
 class ReadinessAttempt:
     """一次判定的完整结果，可直接进审计与就绪记录表。
@@ -258,19 +348,7 @@ class ReadinessAttempt:
                 raise ValueError(f"就绪判定的{label}时间必须是带时区的时间")
         if self.finished_at < self.started_at:
             raise ValueError("就绪判定的结束时间不得早于开始时间")
-        if self.outcome is ReadinessOutcome.READY:
-            # 就绪必须**看见过东西**。一条 ready 却没有观察值的记录，会让下游读成
-            # "确认过了"，而它其实什么都没看见——这正是"明确空结果不算就绪"的落点。
-            if not isinstance(self.metric_count, int) or self.metric_count <= 0:
-                raise ValueError("就绪必须带着大于零的可见指标条数（明确空结果不算就绪）")
-            if self.error_code is not None:
-                raise ValueError("就绪不得同时携带错误码")
-        if self.outcome in (ReadinessOutcome.NO_PERMISSION, ReadinessOutcome.TIMED_OUT):
-            # 这两类结论没跑探针，携带观察值会让它们看起来像跑过。
-            if self.metric_count is not None:
-                raise ValueError("未发起探针的结论不得携带可见指标条数")
-        if self.outcome is ReadinessOutcome.TECHNICAL_FAILURE and not self.error_code:
-            raise ValueError("技术失败必须带错误码，否则运维无从下手")
+        _require_attempt_shape(self.outcome, self.error_code, self.metric_count)
 
     @property
     def ready(self) -> bool:
@@ -313,6 +391,16 @@ class ReadinessSession:
             raise ValueError("确认结果必须是终态：ready / no_permission / timed_out")
         if not self.attempts:
             raise ValueError("确认结果必须至少包含一次判定记录")
+        # 下面两条挡的是**用别人的成功拼出一个自己的成功**（二级独立审查自设计变异）：
+        # 没有它们，拿用户 B 的 ready 记录 + 用户 A 的 binding 就能构造出一个
+        # `applies_to(A, v)` 为真的对象，而 `applies_to` 只核 binding、不核证据。
+        foreign = [item for item in self.attempts if item.binding != self.binding]
+        if foreign:
+            raise ValueError("确认结果里的判定记录必须全部绑定同一个（用户，权限版本）")
+        if self.attempts[-1].outcome is not self.outcome:
+            # 收口结论只能是**最后一次判定**本身。允许两者不一致，等于允许一轮以
+            # `timed_out` 收尾的确认对外宣称 `ready`。
+            raise ValueError("确认结果必须与最后一次判定的结论一致")
 
     @property
     def ready(self) -> bool:
@@ -439,7 +527,7 @@ class McpReadinessConfirmation:
         store: ReadinessCheckStore,
         audit: _AuditSink,
         clock: Callable[[], datetime],
-        sleep: Callable[[float], None] | None = None,
+        sleep: Callable[[float], None],
         schedule: ReadinessSchedule = CONTRACT_SCHEDULE,
         on_alert: Callable[[ReadinessSession], None] | None = None,
     ) -> None:
@@ -449,6 +537,12 @@ class McpReadinessConfirmation:
             raise TypeError("轮询节奏必须是已校验的 ReadinessSchedule")
         if not callable(clock):
             raise TypeError("时钟必须可调用：注入它才能不真的等十五分钟")
+        if not callable(sleep):
+            # ``sleep`` **必填**，且没有"缺省就不等"的分支。此前它可以是 ``None``，
+            # 默认构造出来的确认会把六次探针背靠背发完、立刻判超时——十五分钟的等待
+            # 被压成毫秒级，而每一条日志、每一条记录看起来都完全正常。装配层漏注入一个
+            # 参数就静默塌成这样，是不能接受的失败形态，因此在类型上就不给它这个选项。
+            raise TypeError("sleep 必须可调用：缺省会把十五分钟的等待压成瞬时")
         self._probe = probe
         self._store = store
         self._audit = audit
@@ -493,14 +587,18 @@ class McpReadinessConfirmation:
             )
             return self._finish(binding, ReadinessOutcome.NO_PERMISSION, (attempt,))
 
-        deadline = started + self._schedule.budget
+        # **计划表决定发几次，硬上界只防失控的探针链**（见 ``ReadinessSchedule``）。
+        # 不再用"现在过没过预算"去二次否决某一次尝试：真实 ``sleep`` 每次多回来几毫秒，
+        # 累计到第六次时 ``now`` 必然略过 ``started + 900``，合同要求的最后一次探针
+        # 就永远发不出去（二级独立审查用抖动时钟实测到）。
+        hard_deadline = started + self._schedule.hard_deadline
         attempts: list[ReadinessAttempt] = []
         for attempt_no, offset in enumerate(self._schedule.attempt_offsets(), start=1):
             if attempt_no > 1:
                 self._wait_until(started + timedelta(seconds=offset))
-                if self._now() > deadline:
-                    # 预算在等待期间耗尽（探针本身也消耗预算）。这一路只会在**耗尽之后**
-                    # 走到，因此"预算没耗尽就提前判超时"在结构上不可能发生。
+                if self._now() > hard_deadline:
+                    # 只有探针链真的失控（注入的探针无视超时）才会走到这里：正常与抖动
+                    # 时钟下 ``now`` 离硬上界还差一整个探针超时。
                     break
             attempt = self._probe_once(binding, attempt_no)
             attempts.append(attempt)
@@ -529,8 +627,9 @@ class McpReadinessConfirmation:
         return moment.astimezone(_UTC)
 
     def _wait_until(self, due: datetime) -> None:
-        if self._sleep is None:
-            return
+        """等到计划时刻。**按绝对时刻等，不按间隔累加**——后者会把每一次的调度误差
+        累积下去，第六次就漂到预算之外。已经过了计划时刻就立刻开始（慢探针的情形）。"""
+
         remaining = (due - self._now()).total_seconds()
         if remaining > 0:
             self._sleep(remaining)
@@ -549,7 +648,8 @@ class McpReadinessConfirmation:
             )
         outcome, error_code = classify_probe(observed)
         # 只有被 :func:`classify_probe` 认可的观察值才进记录：读不懂的返回值落技术失败，
-        # 那一路必须不带观察值（否则它看起来像一次跑通了的探针）。
+        # 那一路必须不带观察值（否则它看起来像一次跑通了的探针，且负数还会撞上
+        # 迁移 0065 的 CHECK，把一次本该记下来的失败变成整轮确认崩溃）。
         counted = None if outcome is ReadinessOutcome.TECHNICAL_FAILURE else int(observed)
         return self._attempt(
             binding,
@@ -620,7 +720,9 @@ __all__ = [
     "CONTRACT_SCHEDULE",
     "DEFAULT_BUDGET_SECONDS",
     "DEFAULT_INTERVAL_SECONDS",
+    "DEFAULT_PROBE_TIMEOUT_SECONDS",
     "MAX_ATTEMPTS",
+    "MIN_PROBE_TIMEOUT_SECONDS",
     "MAX_BUDGET_SECONDS",
     "MAX_INTERVAL_SECONDS",
     "MIN_BUDGET_SECONDS",

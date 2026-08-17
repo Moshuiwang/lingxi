@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from postgres_schema import ensure_production_schema, reset_production_rows
 
 from lingxi.adapters.postgres import connect
-from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError
+from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError, new_token
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
@@ -222,6 +222,48 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
         with self.assertRaises(TypeError):
             PostgresMcpTokenStore(self._dsn, cipher=SPEC_MASTER_KEY)  # type: ignore[arg-type]
 
+    def test_the_database_itself_refuses_a_plaintext_token(self) -> None:
+        """`V-权限-11` 的结构性证明：**绕过全部应用层、直接 SQL 也写不进明文**。
+
+        只声明"表里没有明文列"是不够的——``token_cipher`` 本身是可写的裸 ``TEXT``。
+        CHECK（标准 base64 字母表 + 长度是 4 的倍数且 ≥ 44）让 43 个字符、URL 安全
+        字母表的 ``token_urlsafe(32)`` 明文一定过不去。
+        """
+
+        for plaintext in [new_token() for _ in range(8)] + ["明文令牌", "short", "abc="]:
+            with self.subTest(length=len(plaintext)):
+                with self.assertRaises(Exception):
+                    with connect(self._dsn) as connection, connection.cursor() as cursor:
+                        cursor.execute(
+                            "INSERT INTO mcp_access_token (user_id, token_cipher) VALUES (%s, %s)",
+                            (USER_B, plaintext),
+                        )
+        self.assertIsNone(self.store.token_cipher(USER_B))
+
+    def test_the_database_itself_refuses_to_overwrite_a_cipher(self) -> None:
+        """签发过的密文**改不掉**：绕过应用层的 UPDATE 会被触发器拒绝。
+
+        覆盖会让库里的密文与已经发布到外部表格的那一份分叉，而更新既有发布行时我们
+        不写那一列（`V-权限-11`），新值永远送不出去——用户侧表现为"某天开始问数忽然
+        没有权限"。
+        """
+
+        issued = self.store.issue_token(USER_A)
+        other = self.cipher.encrypt(new_token())
+        for column, value in (
+            ("token_cipher", other),
+            ("user_id", USER_B),
+            ("issued_at", NOW),
+        ):
+            with self.subTest(column=column):
+                with self.assertRaises(Exception):
+                    with connect(self._dsn) as connection, connection.cursor() as cursor:
+                        cursor.execute(
+                            f"UPDATE mcp_access_token SET {column} = %s WHERE user_id = %s",
+                            (value, USER_A),
+                        )
+        self.assertEqual(self.store.token_cipher(USER_A), issued.token_cipher)
+
 
 class SyncCheckRecordTest(McpTokenPostgresTestCase):
     def test_every_attempt_gets_its_own_row(self) -> None:
@@ -282,18 +324,100 @@ class SyncCheckRecordTest(McpTokenPostgresTestCase):
                     (USER_A,),
                 )
 
-    def test_database_rejects_observations_on_non_probe_results(self) -> None:
-        for result in ("no_permission", "timed_out"):
-            with self.subTest(result=result):
+    def test_database_pins_the_exact_shape_of_every_result(self) -> None:
+        """五路结论各自的**精确形状**由一条 CHECK 全表达完（与 core 的校验一一对应）。
+
+        只挡"ready 没观察值"是不够的：``waiting`` 带着 ``metric_count=5``、
+        ``technical_failure`` 带着观察值，读起来都像"探针跑通了看见了指标"，
+        而它们恰恰是"没就绪"。这一组逐条构造这些非法形状，要求数据库全部拒绝。
+        """
+
+        illegal = (
+            # (result, error_code, metric_count)
+            ("ready", "empty_metrics", 3),  # 就绪不得带错误码
+            ("ready", None, 0),  # 就绪必须看见 > 0
+            ("ready", None, None),  # 就绪必须有观察值
+            ("waiting", "empty_metrics", 5),  # 等待中不得声称看见了指标
+            ("waiting", None, 0),  # 未就绪必须有错误码
+            ("technical_failure", "transport_error", 0),  # 探针没跑通，任何数字都是假的
+            ("technical_failure", "transport_error", 3),
+            ("technical_failure", None, None),
+            ("no_permission", "x", 3),
+            ("no_permission", None, None),
+            ("timed_out", "budget_exhausted", 0),
+            ("timed_out", None, None),
+        )
+        for index, (result, error_code, metric_count) in enumerate(illegal):
+            with self.subTest(result=result, error_code=error_code, metric_count=metric_count):
                 with self.assertRaises(Exception):
                     with connect(self._dsn) as connection, connection.cursor() as cursor:
                         cursor.execute(
                             """INSERT INTO mcp_sync_check
                                  (id, user_id, permission_version, attempt_no, result,
-                                  metric_count, content_expires_at)
-                               VALUES ('syn_z', %s, 1, 1, %s, 3, now())""",
-                            (USER_A, result),
+                                  error_code, metric_count, content_expires_at)
+                               VALUES (%s, %s, 1, 1, %s, %s, %s, now())""",
+                            (f"syn_bad{index}", USER_A, result, error_code, metric_count),
                         )
+        self.assertEqual(self.store.load_checks(USER_A, 1), ())
+
+    def test_database_accepts_every_legal_shape(self) -> None:
+        """对照：五路各自的合法形状都写得进去（否则上面那组证明不了什么）。"""
+
+        legal = (
+            ("ready", None, 4),
+            ("waiting", "empty_metrics", 0),
+            ("waiting", "http_403", None),
+            ("technical_failure", "transport_error", None),
+            ("no_permission", "no_publishable_permission", None),
+            ("timed_out", "budget_exhausted", None),
+        )
+        for index, (result, error_code, metric_count) in enumerate(legal):
+            with connect(self._dsn) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO mcp_sync_check
+                         (id, user_id, permission_version, attempt_no, result,
+                          error_code, metric_count, content_expires_at)
+                       VALUES (%s, %s, 1, %s, %s, %s, %s, now())""",
+                    (f"syn_ok{index}", USER_A, index + 1, result, error_code, metric_count),
+                )
+        self.assertEqual(len(self.store.load_checks(USER_A, 1)), len(legal))
+
+    def test_attempt_numbering_is_serialised_against_concurrent_writers(self) -> None:
+        """取号必须串行化：并发记账不得读到同一个 MAX，各自算出同一个 N+1。
+
+        证明方式是**从另一条连接握住同一把 advisory lock**，然后要求记账在受限的
+        ``lock_timeout`` 内失败——只有真的去取那把锁才会等、才会超时。锁释放后照常成功。
+        没有这道串行化时，两个并发记账里会有一个撞上 ``UNIQUE`` 中止，而它对应的那次
+        探针**已经真的发出去了**，却不会留下任何记录。
+        """
+
+        import threading
+
+        key = f"mcp_sync_check:{USER_A}:{VERSION}"
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_the_lock() -> None:
+            with connect(self._dsn) as connection:
+                with connection.transaction(), connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+                    holding.set()
+                    release.wait(timeout=30)
+
+        holder = threading.Thread(target=hold_the_lock, daemon=True)
+        holder.start()
+        try:
+            self.assertTrue(holding.wait(timeout=10))
+            with self.assertRaises(Exception):
+                self.store.record_attempt(_attempt())
+        finally:
+            release.set()
+            holder.join(timeout=10)
+        # 锁放开之后照常记账。
+        self.store.record_attempt(_attempt())
+        self.assertEqual(
+            [item.attempt_no for item in self.store.load_checks(USER_A, VERSION)], [1]
+        )
 
     def test_expiry_is_derived_and_cannot_be_moved(self) -> None:
         self.store.record_attempt(_attempt())

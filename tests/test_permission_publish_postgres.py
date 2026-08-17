@@ -209,6 +209,36 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         self.assertEqual(set(stored.payload), set(CREATED_FIELD_NAMES))
         self.assertEqual(stored.payload["token_cipher"], TOKEN_CIPHER)
 
+    def test_enqueue_refuses_a_null_cipher_key(self) -> None:
+        """键存在就要合法：``token_cipher: None`` 的七键快照既不是更新快照也不可新建。"""
+
+        with connect(self._dsn) as connection:
+            with connection.transaction():
+                with self.assertRaises(ValueError):
+                    self.store.enqueue_publish(
+                        user_id=USER_A,
+                        reason="x",
+                        payload={**_row().fields, "token_cipher": None},
+                        permission_version=1,
+                        tx=connection,
+                    )
+        self.assertEqual(self._count(), 0)
+
+    def test_claim_returns_the_previous_external_record(self) -> None:
+        """重试时判定层要能回答"这一行是不是我们建的"——靠认领时带回的外部记录标识。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        first = self.store.claim_next()
+        self.assertIsNone(first.external_record_id)
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_7"),
+            status="pending",
+        )
+        second = self.store.claim_next()
+        self.assertEqual(second.external_record_id, "rec_7")
+
     def test_enqueue_refuses_a_plaintext_token_in_the_snapshot(self) -> None:
         """否定面：**明文**进 outbox 的最后一关是形状校验（明文过不了 base64 判据）。"""
 

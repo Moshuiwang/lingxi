@@ -177,29 +177,42 @@ class PostgresMcpTokenStore:
         if not isinstance(attempt, ReadinessAttempt):
             raise TypeError("就绪记录必须是 ReadinessAttempt：取值域与不变式由它保证")
         check_id = new_id("syn")
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO mcp_sync_check
-                     (id, user_id, permission_version, attempt_no, started_at, finished_at,
-                      result, error_code, metric_count, content_expires_at)
-                   SELECT %(id)s, %(user)s, %(version)s,
-                          COALESCE(MAX(c.attempt_no), 0) + 1,
-                          %(started)s, %(finished)s, %(result)s, %(error)s, %(metrics)s, now()
-                     FROM mcp_sync_check c
-                    WHERE c.user_id = %(user)s AND c.permission_version = %(version)s
-                RETURNING id""",
-                {
-                    "id": check_id,
-                    "user": attempt.binding.user_id,
-                    "version": attempt.binding.permission_version,
-                    "started": attempt.started_at,
-                    "finished": attempt.finished_at,
-                    "result": attempt.outcome.value,
-                    "error": attempt.error_code,
-                    "metrics": attempt.metric_count,
-                },
-            )
-            row = cursor.fetchone()
+        lock_key = f"mcp_sync_check:{attempt.binding.user_id}:{attempt.binding.permission_version}"
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction(), connection.cursor() as cursor:
+                # **取号必须串行化**。``COALESCE(MAX(attempt_no), 0) + 1`` 在
+                # ``READ COMMITTED`` 下会让两个并发记账读到同一个 MAX，各自算出同一个
+                # N+1，于是一个撞上 ``UNIQUE`` 中止——而它对应的那次探针**已经真的发出去
+                # 了**，却没有留下任何记录。这张表存在的理由正是"事后判断十五分钟是不是
+                # 现实的上限"，丢样本等于丢掉它唯一的用处。
+                #
+                # 用事务级 advisory lock 而不是 ``SELECT ... FOR UPDATE``：后者要有一行
+                # 可锁，而"这个人还没签发令牌"是合法状态（那时 mcp_access_token 里没有
+                # 行，锁不住任何东西，串行化就悄悄失效了）。advisory lock 不依赖任何行
+                # 是否存在，且随事务结束自动释放，不需要显式解锁路径。
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+                cursor.execute(
+                    """INSERT INTO mcp_sync_check
+                         (id, user_id, permission_version, attempt_no, started_at, finished_at,
+                          result, error_code, metric_count, content_expires_at)
+                       SELECT %(id)s, %(user)s, %(version)s,
+                              COALESCE(MAX(c.attempt_no), 0) + 1,
+                              %(started)s, %(finished)s, %(result)s, %(error)s, %(metrics)s, now()
+                         FROM mcp_sync_check c
+                        WHERE c.user_id = %(user)s AND c.permission_version = %(version)s
+                    RETURNING id""",
+                    {
+                        "id": check_id,
+                        "user": attempt.binding.user_id,
+                        "version": attempt.binding.permission_version,
+                        "started": attempt.started_at,
+                        "finished": attempt.finished_at,
+                        "result": attempt.outcome.value,
+                        "error": attempt.error_code,
+                        "metrics": attempt.metric_count,
+                    },
+                )
+                row = cursor.fetchone()
         if row is None:
             raise RuntimeError("就绪判定记录未写入")
         return str(row[0])

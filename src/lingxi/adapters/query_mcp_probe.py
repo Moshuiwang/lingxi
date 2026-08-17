@@ -15,16 +15,22 @@
 1. **端点形态与协议版本**：这里按 MCP Streamable HTTP + JSON-RPC 2.0 的 ``tools/call``
    编写（接口设计[「五、问数 MCP」](../../../docs/技术设计/接口设计.md#五问数-mcp消费方)），
    真实服务端是否就是这个形态未经证实；
-2. **``list_metrics`` 的返回形状**：``structuredContent`` 里指标列表挂在哪个键、还是
-   只有 ``content`` 里的一段 JSON 文本，未经证实。因此计数走**可注入**的
-   ``metrics_reader``，默认实现**读不懂就失败**（见 :func:`default_metrics_reader`）；
+2. **``list_metrics`` 的返回形状**：指标列表到底挂在哪里未经证实。因此计数走**可注入**的
+   ``metrics_reader``，而默认实现**只认一种形状**
+   （``result.structuredContent.metrics`` 是列表），其余一律失败——见
+   :func:`default_metrics_reader` 里"为什么窄成这样"的两条理由；
 3. **"权限还没同步"到底以什么错误形态出现**：HTTP 401/403、JSON-RPC error、还是
-   ``result.isError``，未经证实。三种都覆盖到了，且**分类可注入**
-   （``denied_status_codes`` / ``denied_error_codes``）。
+   ``result.isError``，未经证实。三种都覆盖到了，且**"明确拒绝"这一类是白名单式的、
+   默认最保守**：只有 HTTP 401/403 默认算拒绝（这是 HTTP 自己的标准语义，不是对 MCP 的
+   猜测）；JSON-RPC 错误码白名单默认为空；``result.isError`` 默认算**技术失败**，
+   要显式打开 ``tool_error_is_denied`` 才算拒绝。L4a 实测之后再按证据放宽。
 
 **所有未知形态一律落"技术失败"，绝不落"就绪"。** 这是本模块唯一不肯让步的地方：一次
 读不懂的响应被凑成就绪，用户侧表现为"开通成功了但一问就没有权限"，而我们的记录会说
-一切正常。
+一切正常。同一条纪律还有三个落点：**响应必须自证是这次请求的答复**（校验
+``jsonrpc`` 版本与 ``id`` 等值，否则一份迟到的旧答复、代理的缓存页都可能被读成成功）、
+**传输层不跟随重定向**（跟随会把 Bearer 令牌转发到新主机甚至降级到 http，见
+:func:`_no_redirect_opener`）、**永远不数 ``content`` 的块数**。
 
 ## 令牌只走请求头，且一次都不进 ``core``
 
@@ -69,8 +75,13 @@ DEFAULT_DENIED_STATUS_CODES: tuple[int, ...] = (401, 403)
 #: 就绪，只是运维看到的分类更保守。实测之后由装配层注入具体取值。
 DEFAULT_DENIED_ERROR_CODES: tuple[int, ...] = ()
 
-#: 从结构化结果里找指标列表时依次尝试的键。顺序即优先级。
-METRIC_LIST_KEYS: tuple[str, ...] = ("metrics", "items", "data", "result", "list")
+#: JSON-RPC 版本。响应必须逐字带回它，否则我们读的可能根本不是一个 JSON-RPC 响应。
+JSONRPC_VERSION = "2.0"
+
+#: 默认 reader **唯一**认得的结果形状：``result.structuredContent.metrics`` 是一个列表。
+#: 收得这么窄是刻意的，见 :func:`default_metrics_reader`。
+STRUCTURED_CONTENT_KEY = "structuredContent"
+METRIC_LIST_KEY = "metrics"
 
 
 class McpHttpResponse(NamedTuple):
@@ -92,18 +103,45 @@ def _require_https(endpoint: object) -> str:
     return endpoint.rstrip("/")
 
 
+def _no_redirect_opener() -> Any:
+    """构造一个**不跟随重定向**的 opener。
+
+    这条不是洁癖：``urllib`` 默认会自动跟随 3xx，并且**把 ``Authorization`` 请求头一起
+    转发到新地址**。于是一个被劫持或误配的 ``302`` 就能把用户的 Bearer 令牌送到另一个
+    主机、甚至从 https 降级到 http 明文——而调用方什么都看不到，只会看到一次"成功"。
+    ``_require_https`` 只管得住我们**主动**填的那个地址，管不住服务端让我们再去哪里。
+
+    做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
+    :class:`HTTPError` 抛出，我们在下面按普通非 200 状态处理，落技术失败。
+    """
+
+    from urllib.request import HTTPRedirectHandler, build_opener
+
+    class _NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - 见外层文档
+            return None
+
+    return build_opener(_NoRedirect())
+
+
 def urllib_mcp_transport(
-    method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None
+    method: str,
+    url: str,
+    *,
+    body: Mapping[str, Any] | None = None,
+    token: str | None = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> McpHttpResponse:
-    """默认传输：只发 HTTPS，不重试。令牌只进 ``Authorization`` 头。
+    """默认传输：只发 HTTPS、**不跟随重定向**、不重试。令牌只进 ``Authorization`` 头。
 
     HTTP 错误**不抛异常**：状态码本身是分类依据（401/403 = 明确拒绝），把它折成一个
     通用的传输异常会让"被拒绝"和"网断了"变成同一件事。响应体解析失败时载荷给 ``None``，
-    交由上层按状态码决定它是明确拒绝还是形状错误。
+    交由上层按状态码决定它是明确拒绝还是形状错误。3xx 因此也以状态码的形式回到上层，
+    落进"既不是 200 也不在拒绝白名单里"那一路——技术失败。
     """
 
     from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
+    from urllib.request import Request
 
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Accept": "application/json"}
@@ -113,7 +151,7 @@ def urllib_mcp_transport(
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=payload, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - 地址来自受控配置
+        with _no_redirect_opener().open(request, timeout=timeout) as response:  # noqa: S310 - 地址来自受控配置
             return McpHttpResponse(int(response.status), _load_json(response.read()))
     except HTTPError as error:
         return McpHttpResponse(int(error.code), _load_json(_read_quietly(error)))
@@ -136,49 +174,34 @@ def _load_json(raw: bytes) -> Any:
         return None
 
 
-def _count_from_document(document: Any) -> int | None:
-    """从一个"可能是指标列表"的文档里数出条数；读不懂返回 ``None``。"""
-
-    if isinstance(document, list):
-        return len(document)
-    if isinstance(document, Mapping):
-        for key in METRIC_LIST_KEYS:
-            value = document.get(key)
-            if isinstance(value, list):
-                return len(value)
-    return None
-
-
 def default_metrics_reader(result: Mapping[str, Any]) -> int:
-    """默认的指标计数：先看 ``structuredContent``，再看 ``content`` 里的 JSON 文本。
+    """默认的指标计数：**只认一种形状**——``result.structuredContent.metrics`` 是一个列表。
 
-    **不数 ``content`` 的块数**。MCP 的 ``content`` 通常是一个文本块，里面装着整份 JSON；
-    数块数会得到 1，于是一次"你没有任何指标"的空回答也会被判成就绪——**恰好是**
-    "明确空结果不算就绪"要挡的那种假成功。因此这里只认真正的列表：要么在
-    ``structuredContent`` 里，要么在文本块解析出来的 JSON 里。
+    ```json
+    {"structuredContent": {"metrics": ["日活", "收入"]}}
+    ```
 
-    两条路都读不出列表就抛技术失败。默认实现宁可说"我读不懂"，也不猜一个数字出来——
-    真实形状留 L4a 确认，确认后可由装配层注入更精确的 reader。
+    其余一切（缺键、类型不对、列表挂在别的键上、只有 ``content``）一律抛
+    ``unrecognized_result_shape`` → **技术失败**。窄到这个程度是刻意的，两条理由：
+
+    1. **假就绪是五路里唯一不可犯的方向。** 上一版依次尝试 ``metrics``/``items``/``data``/
+       ``result``/``list`` 几个键下的任意列表，于是
+       ``{"structuredContent": {"data": ["warning"]}}`` 这种与指标毫无关系的响应也能
+       数出 1 条、判成就绪。宁可对一份其实没问题的响应说"我读不懂"（多等几轮、最后转
+       运维），也不能对一份读不懂的响应说"这个人可以用了"。
+    2. **真实形状本来就未实测。** 猜五种形状不比猜一种更接近真相，只是把猜错的后果从
+       "响亮失败"换成了"静默的假成功"。L4a 实测出真实形状后，由装配层注入一个
+       **已验证的** reader 放宽——那时放宽是有证据的，不是猜的。
+
+    **永远不数 ``content`` 的块数。** MCP 的 ``content`` 通常是一个文本块，里面装着整份
+    回答；数块数会得到 1，于是一次"你没有任何指标"的空回答也会被判成就绪。
     """
 
-    count = _count_from_document(result.get("structuredContent"))
-    if count is not None:
-        return count
-    content = result.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, Mapping):
-                continue
-            text = block.get("text")
-            if not isinstance(text, str):
-                continue
-            try:
-                document = json.loads(text)
-            except ValueError:
-                continue
-            count = _count_from_document(document)
-            if count is not None:
-                return count
+    structured = result.get(STRUCTURED_CONTENT_KEY)
+    if isinstance(structured, Mapping):
+        metrics = structured.get(METRIC_LIST_KEY)
+        if isinstance(metrics, list):
+            return len(metrics)
     raise McpProbeError("unrecognized_result_shape", denied=False)
 
 
@@ -195,18 +218,32 @@ class QueryMcpProbe:
         metrics_reader: Callable[[Mapping[str, Any]], int] | None = None,
         denied_status_codes: tuple[int, ...] = DEFAULT_DENIED_STATUS_CODES,
         denied_error_codes: tuple[int, ...] = DEFAULT_DENIED_ERROR_CODES,
+        tool_error_is_denied: bool = False,
+        timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self._endpoint = _require_https(endpoint)
         if not callable(token_provider):
             raise ValueError("token_provider 必须是按 user_id 返回明文令牌的可调用对象")
         if not isinstance(tool_name, str) or not tool_name.strip():
             raise ValueError("探针工具名不得为空")
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+            raise ValueError("探针传输超时必须是正整数秒")
         self._token_provider = token_provider
         self._transport: Callable[..., McpHttpResponse] = transport or urllib_mcp_transport
         self._tool_name = tool_name.strip()
         self._metrics_reader = metrics_reader or default_metrics_reader
         self._denied_status_codes = tuple(denied_status_codes)
         self._denied_error_codes = tuple(denied_error_codes)
+        self._tool_error_is_denied = bool(tool_error_is_denied)
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def timeout_seconds(self) -> int:
+        """单次传输超时。装配层必须让它与
+        :attr:`lingxi.core.permission.mcp_readiness.ReadinessSchedule.probe_timeout_seconds`
+        一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
+
+        return self._timeout_seconds
 
     def list_metrics(self, *, user_id: str) -> int:
         """以该用户身份执行一次 ``list_metrics``，返回可见指标条数。
@@ -218,16 +255,20 @@ class QueryMcpProbe:
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("就绪探针必须指明用户")
         token = self._token(user_id)
+        # 请求标识用内部 ULID：不含用户资料，也不需要与任何外部标识对齐；每次现生成，
+        # 因此可以用它证明"这份响应是这次请求的答复"。
+        request_id = new_ulid()
         request = {
-            "jsonrpc": "2.0",
-            # 请求标识用内部 ULID：不含用户资料，也不需要与任何外部标识对齐。
-            "id": new_ulid(),
+            "jsonrpc": JSONRPC_VERSION,
+            "id": request_id,
             "method": "tools/call",
             "params": {"name": self._tool_name, "arguments": {}},
         }
-        response = self._transport("POST", self._endpoint, body=request, token=token)
+        response = self._transport(
+            "POST", self._endpoint, body=request, token=token, timeout=self._timeout_seconds
+        )
         del token  # 明文不再需要，尽早从本帧移除。
-        return self._read(response)
+        return self._read(response, request_id)
 
     # ------------------------------------------------------------------
     # 内部
@@ -247,7 +288,7 @@ class QueryMcpProbe:
             raise McpProbeError("token_missing", denied=False)
         return token
 
-    def _read(self, response: object) -> int:
+    def _read(self, response: object, request_id: str) -> int:
         if not isinstance(response, McpHttpResponse):
             raise McpProbeError("invalid_transport_result", denied=False)
         status, payload = response.status, response.payload
@@ -255,9 +296,18 @@ class QueryMcpProbe:
             # MCP 看见了请求并明确拒绝：它还没拉到我们发布的那一行 → 同步中。
             raise McpProbeError(f"http_{status}", denied=True)
         if status != 200:
+            # 3xx 也走这里：传输层不跟随重定向，一次重定向就是一次技术失败
+            # （跟随会把 Bearer 令牌转发到新地址，见 :func:`_no_redirect_opener`）。
             raise McpProbeError(f"http_{status}", denied=False)
         if not isinstance(payload, Mapping):
             raise McpProbeError("invalid_response_shape", denied=False)
+        # **先证明这是"这次请求的 JSON-RPC 答复"，再谈内容。** 少了这两道，任何一份恰好
+        # 长得像结果的 JSON——上一次请求的迟到答复、代理返回的缓存页、网关的健康检查
+        # 响应——都能被读成一次成功的探针，而假就绪是五路里唯一不可犯的方向。
+        if payload.get("jsonrpc") != JSONRPC_VERSION:
+            raise McpProbeError("invalid_jsonrpc_version", denied=False)
+        if payload.get("id") != request_id:
+            raise McpProbeError("response_id_mismatch", denied=False)
         error = payload.get("error")
         if error is not None:
             code = error.get("code") if isinstance(error, Mapping) else None
@@ -268,8 +318,12 @@ class QueryMcpProbe:
         if not isinstance(result, Mapping):
             raise McpProbeError("invalid_result_shape", denied=False)
         if result.get("isError") is True:
-            # 工具跑了但拒绝了我们（MCP 的工具级错误约定）：同样按同步中处理。
-            raise McpProbeError("tool_error", denied=True)
+            # **默认按技术失败**（``tool_error_is_denied=False``）。``isError`` 只说明
+            # "这次工具调用失败了"，它同时覆盖鉴权拒绝和工具自己崩溃、上游数据源不可用
+            # 一类的故障。默认判成"同步中"会让一次工具崩溃安静地等满十五分钟再转运维，
+            # 运维拿到的分类是"权限还没同步"——指向完全错误的方向。真实语义 L4a 实测
+            # 之后，由装配层显式打开这个开关（白名单方式放宽，而不是默认放宽）。
+            raise McpProbeError("tool_error", denied=self._tool_error_is_denied)
         count = self._metrics_reader(result)
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise McpProbeError("invalid_metric_count", denied=False)
@@ -280,10 +334,12 @@ __all__ = [
     "DEFAULT_DENIED_ERROR_CODES",
     "DEFAULT_DENIED_STATUS_CODES",
     "DEFAULT_TOOL_NAME",
-    "METRIC_LIST_KEYS",
+    "JSONRPC_VERSION",
+    "METRIC_LIST_KEY",
     "McpHttpResponse",
     "QueryMcpProbe",
     "REQUEST_TIMEOUT_SECONDS",
+    "STRUCTURED_CONTENT_KEY",
     "default_metrics_reader",
     "urllib_mcp_transport",
 ]

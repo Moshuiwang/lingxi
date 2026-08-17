@@ -65,6 +65,11 @@ python3 scripts/ci/check_content_version.py
 # 没有容器的环境里也照跑——这几类缺陷恰恰最容易在"本机没起容器"时溜过去。
 # 没装 alembic 时它明确失败而不是跳过。
 python3 scripts/ci/check_alembic_revisions.py
+# MCP 令牌加解密的互操作向量（Issue #156 / S-C-02）：那几组 AES 断言在
+# `unittest discover` 里带着 skipUnless（缺 cryptography 就跳过，这对无依赖机器是对的），
+# 但**门禁不能跟着跳过**——缺库时整组断言一条都没跑，输出却是绿的。本脚本缺库即明确失败，
+# 并要求那几组的实际执行数非零、跳过数为零。纪律同上面的 alembic 检查。
+python3 scripts/ci/check_crypto_vectors.py
 # 断言 V-部署-08（Issue #62）：运行时依赖全部在 pyproject 声明、安全边界组件锁精确版本。
 # 这条断言此前被标为「已认领」却**没有执行脚本**（Issue #58 遗留），因此从未真正守住过。
 # 扫描覆盖**函数内的延迟导入**——本仓库的第三方 import 全都写在函数体里，
