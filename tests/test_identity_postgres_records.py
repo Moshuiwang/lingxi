@@ -4,6 +4,11 @@
 V-身份-11（首次建立的反向 CAS，真库部分）。
 另含「完整性校验不过不提交半轮快照」这条硬规则的真库负向测试。
 
+Issue #89 S-B-03 追加 `AppUserProvisioningContractTest`：写侧建档服务合同
+（`core.identity.provisioning`）在真库上的那一半——CHECK 与专用主体触发器**真的**会
+拒绝、拒绝后零行残留且不破坏既有档案、同一 `open_id` 重复建档幂等返回。合同本身的
+分类规则在 `tests/test_identity_provisioning_contract.py`（无需数据库）。
+
 缺 ``LINGXI_POSTGRES_DSN`` 时整类跳过并说明原因，不静默通过——数据库约束类
 断言只能在真库上验证（验证与门禁第五节）。
 """
@@ -32,6 +37,11 @@ from lingxi.core.identity.org_snapshot import (
     SnapshotIntegrityError,
     SnapshotMember,
     TenantScope,
+)
+from lingxi.core.identity.provisioning import (
+    ProvisioningOutcome,
+    ProvisioningRejection,
+    ProvisioningRequest,
 )
 
 from postgres_schema import reset_production_rows
@@ -1105,6 +1115,291 @@ class AppUserRecordTest(IdentityPostgresTestCase):
 
         self.assertEqual(self.scalar("SELECT display_name FROM app_user"), "Alice Smith")
         self.assertEqual(self.scalar("SELECT display_name_locale FROM app_user"), "en-US")
+
+
+class AppUserProvisioningContractTest(IdentityPostgresTestCase):
+    """Issue #89 S-B-03：写侧建档服务合同在真库上的那一半。
+
+    这里要证明的不是"分类函数返回了什么"（那在纯逻辑用例里），而是**防线还在**：
+    数据库的 CHECK 与专用主体触发器真的会拒绝 `provision()` 这条路径，拒绝之后库里
+    零行残留，而重复建档幂等返回同一条。合同的语义正文见
+    `src/lingxi/core/identity/provisioning.py`。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+
+    def _identity(self, **overrides):
+        candidate = member(**overrides)
+        located = locate_by_open_id(candidate.open_id, (candidate,))
+        decision = decide_first_contact(
+            open_id=candidate.open_id,
+            location=located,
+            employment=EmploymentStatus(is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False),
+            directory=DirectoryAvailability.AVAILABLE,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        assert decision.draft is not None
+        return decision.draft
+
+    def _roster_row(self, **overrides) -> dict:
+        row = {
+            "personnel_id": "user_zhang",
+            "employee_no": "00080001",
+            "email": "Roster.User@Example-Corp.invalid",
+            "name": "张一",
+            "record_id": "rec_1",
+        }
+        row.update(overrides)
+        return row
+
+    def _breaking_trigger(self, name: str, body: str) -> None:
+        """在 `app_user` 上装一个会破坏写入的触发器，用例结束后拆掉。"""
+
+        drop = f"DROP TRIGGER IF EXISTS {name} ON app_user; DROP FUNCTION IF EXISTS {name}();"
+        self.execute(drop)
+        self.addCleanup(lambda: self.execute(drop))
+        self.execute(
+            f"""CREATE FUNCTION {name}() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                {body}
+            END
+            $$;
+            CREATE TRIGGER {name}
+            BEFORE INSERT OR UPDATE ON app_user
+            FOR EACH ROW EXECUTE FUNCTION {name}();"""
+        )
+
+    def test_provisioning_the_same_open_id_twice_returns_the_existing_record(self) -> None:
+        """幂等语义：重复建档返回「已存在」而不是报错。
+
+        对账扫描会把孤儿事件再交接一次，崩溃点还可能落在「编排已经跑了一半」之后；
+        重复建档若报错，一次**已经成功**的建档会被重入判成内部故障。
+        """
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+
+        first = self.users.provision(request)
+        second = self.users.provision(request)
+
+        self.assertIs(first.outcome, ProvisioningOutcome.CREATED)
+        self.assertIs(second.outcome, ProvisioningOutcome.ALREADY_PROVISIONED)
+        self.assertTrue(first.provisioned and second.provisioned)
+        self.assertEqual(first.app_user_id, second.app_user_id)
+        self.assertEqual(self.users.count(), 1)
+
+    def test_concurrent_provisioning_creates_exactly_one_record(self) -> None:
+        """并发重投同样只建一条，其余全部拿到「已存在」。"""
+
+        import threading as _threading
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        results: list = []
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                results.append(self.users.provision(request))
+            except BaseException as error:  # noqa: BLE001 - 测试只收集
+                errors.append(error)
+
+        workers = [_threading.Thread(target=run) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(self.scalar("SELECT count(*) FROM app_user"), 1)
+        self.assertTrue(all(result.provisioned for result in results))
+        self.assertEqual(len({result.app_user_id for result in results}), 1)
+        self.assertEqual(
+            sum(1 for result in results if result.outcome is ProvisioningOutcome.CREATED), 1
+        )
+
+    def test_reentry_never_rewinds_the_provisioning_state_or_the_permission_columns(self) -> None:
+        """V-开通-01 的重入面：已推进的用户不会被再建一次打回 `matching`。"""
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        self.users.provision(request)
+        self.execute(
+            "UPDATE app_user SET provisioning_state = 'mcp_syncing', "
+            "permission_record_id = 'rec_matched', permission_version = 3"
+        )
+
+        again = self.users.provision(request)
+
+        self.assertIs(again.outcome, ProvisioningOutcome.ALREADY_PROVISIONED)
+        self.assertEqual(
+            self.query("SELECT provisioning_state, permission_record_id, permission_version FROM app_user"),
+            [("mcp_syncing", "rec_matched", 3)],
+        )
+
+    def test_reentry_never_revives_a_suspended_account(self) -> None:
+        """停用中的账号被重入建档，不得复活。
+
+        这是 #65 轻审 P2-2 那个孤儿窗口里的真实竞争：一条"已认领、没确认交接"的事件
+        可能在整整一个对账扫描周期之后才被重新交接，而管理员完全可能在这段时间里停用
+        这个账号。重入把 `account_state` 写回 `enabled`，等于让建档服务替管理员撤销了
+        一次停用，而且没有任何人会知道。
+        """
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        self.users.provision(request)
+        self.execute("UPDATE app_user SET account_state = 'suspended'")
+
+        again = self.users.provision(request)
+
+        self.assertIs(again.outcome, ProvisioningOutcome.ALREADY_PROVISIONED)
+        self.assertTrue(again.provisioned, "重入仍然是「档在」，停用与否由编排层复核")
+        self.assertEqual(self.scalar("SELECT account_state FROM app_user"), "suspended")
+        self.assertEqual(self.users.count(), 1)
+
+    def test_the_roster_archive_is_written_verbatim(self) -> None:
+        """V-开通-15：写侧存的是花名册原值，不是匹配时刻的小写归一值。"""
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+
+        result = self.users.provision(request)
+        loaded = self.users.get_by_open_id(self._identity().feishu_open_id)
+
+        self.assertTrue(result.provisioned)
+        assert loaded is not None
+        self.assertEqual((loaded.employee_no, loaded.email), ("00080001", "Roster.User@Example-Corp.invalid"))
+        self.assertEqual(
+            self.query("SELECT employee_no, email FROM app_user WHERE id = %s", (result.app_user_id,)),
+            [("00080001", "Roster.User@Example-Corp.invalid")],
+        )
+
+    def test_provisioning_never_writes_a_permission_record(self) -> None:
+        """V-开通-01：匹配确认前不占位再回填。"""
+
+        self.users.provision(ProvisioningRequest.from_roster_row(self._identity(), self._roster_row()))
+
+        self.assertIsNone(self.scalar("SELECT permission_record_id FROM app_user"))
+        self.assertEqual(self.scalar("SELECT permission_version FROM app_user"), 0)
+
+    def test_an_incomplete_identity_is_refused_by_the_database_and_leaves_no_row(self) -> None:
+        """V-开通-06：残缺资料由数据库的「全有或全无」CHECK 拒绝，写侧不短路它。"""
+
+        for field in ("feishu_user_id", "feishu_union_id", "display_name", "department", "tenant_key"):
+            with self.subTest(field=field):
+                request = ProvisioningRequest(
+                    dataclasses.replace(self._identity(), **{field: "   "})
+                )
+
+                result = self.users.provision(request)
+
+                self.assertIs(result.outcome, ProvisioningOutcome.REJECTED)
+                self.assertIs(result.rejection, ProvisioningRejection.INCOMPLETE_IDENTITY)
+                self.assertFalse(result.rejection.is_storage_fault)
+                self.assertEqual(result.missing_fields, (field,))
+                self.assertIsNone(result.app_user_id)
+                self.assertEqual(self.users.count(), 0)
+
+    def test_a_request_without_an_open_id_never_reaches_the_table(self) -> None:
+        """数据库对「六字段全空」是放行的，这一格由写侧自己守，否则会堆出垃圾档案。"""
+
+        request = ProvisioningRequest(
+            dataclasses.replace(
+                self._identity(),
+                feishu_open_id="  ",
+                feishu_user_id="",
+                feishu_union_id="",
+                display_name="",
+                department="",
+                tenant_key="",
+            )
+        )
+
+        result = self.users.provision(request)
+
+        self.assertIs(result.rejection, ProvisioningRejection.INCOMPLETE_IDENTITY)
+        self.assertIn("feishu_open_id", result.missing_fields)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_a_rejected_provision_does_not_disturb_the_existing_record(self) -> None:
+        """拒绝整条回滚：既有档案不会被一次残缺的重入写坏。"""
+
+        good = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        created = self.users.provision(good)
+        before = self.query("SELECT display_name, department, employee_no, email FROM app_user")
+
+        broken = self.users.provision(
+            ProvisioningRequest(dataclasses.replace(self._identity(), department=" "))
+        )
+
+        self.assertIs(broken.outcome, ProvisioningOutcome.REJECTED)
+        self.assertEqual(self.users.count(), 1)
+        self.assertEqual(self.scalar("SELECT id FROM app_user"), created.app_user_id)
+        self.assertEqual(
+            self.query("SELECT display_name, department, employee_no, email FROM app_user"), before
+        )
+
+    def test_the_delegated_subject_is_refused_by_the_trigger_and_leaves_no_row(self) -> None:
+        """V-身份-02：写侧路径同样绕不过数据库那一道。"""
+
+        self.execute(
+            "INSERT INTO feishu_delegated_subject (purpose, subject_open_id) VALUES ('org_directory_sync', %s)",
+            (DELEGATED_SUBJECT,),
+        )
+        request = ProvisioningRequest(
+            dataclasses.replace(self._identity(), feishu_open_id=DELEGATED_SUBJECT)
+        )
+
+        result = self.users.provision(request)
+
+        self.assertIs(result.outcome, ProvisioningOutcome.REJECTED)
+        self.assertIs(result.rejection, ProvisioningRejection.DELEGATED_SUBJECT)
+        self.assertFalse(result.rejection.is_storage_fault)
+        self.assertEqual(result.missing_fields, ())
+        self.assertEqual(self.users.count(), 0)
+
+    def test_a_dropped_roster_field_is_reported_as_a_storage_fault(self) -> None:
+        """V-开通-15：库把工号吞了要走内部故障出口，不能显示成「没有银河权限」。"""
+
+        self._breaking_trigger("test_i89_provision_drop_employee_no", "NEW.employee_no := NULL; RETURN NEW;")
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+
+        result = self.users.provision(request)
+
+        self.assertIs(result.outcome, ProvisioningOutcome.REJECTED)
+        self.assertIs(result.rejection, ProvisioningRejection.STORAGE_INTEGRITY)
+        self.assertTrue(result.rejection.is_storage_fault)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_an_unrecognised_database_refusal_is_raised_instead_of_being_classified(self) -> None:
+        """不认识的拒绝原样抛出：否则它会伪装成一个确定性的业务终态。"""
+
+        self._breaking_trigger(
+            "test_i89_provision_unknown_refusal", "RAISE EXCEPTION '别的触发器拒绝'; RETURN NEW;"
+        )
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+
+        with self.assertRaises(self._psycopg.errors.RaiseException):
+            self.users.provision(request)
+        self.assertEqual(self.users.count(), 0)
+
+    def test_the_daily_report_baseline_reads_what_provisioning_wrote(self) -> None:
+        """V-开通-16：#52 日报比对的基线就是这条写侧路径落下的三字段。"""
+
+        from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+
+        row = self._roster_row()
+        self.users.provision(ProvisioningRequest.from_roster_row(self._identity(), row))
+        self.execute("UPDATE app_user SET provisioning_state = 'active'")
+
+        baseline = PostgresRosterBaselineReader(self._dsn).load_active_baseline()
+
+        self.assertEqual(len(baseline), 1)
+        self.assertEqual(
+            (baseline[0].display_name, baseline[0].employee_no, baseline[0].email),
+            ("张一", row["employee_no"], row["email"]),
+        )
 
 
 class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
