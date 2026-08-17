@@ -630,6 +630,128 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(terminal["terminal_kind"], "timeout", "真实失败终态不得被 withheld 覆盖")
         self.assertNotEqual(terminal["terminal_kind"], "redacted_withheld")
 
+    def test_a_failed_turn_keeps_its_failure_terminal_even_when_stop_lands_concurrently(
+        self,
+    ) -> None:
+        """Issue #195 场景 1：回合已经因 ``turn_timeout`` 失败，用户 ``/stop``
+        或停机信号在回合终点**并发**到达。终态必须保留真实失败原因，残余正文
+        不得经 ``worker.stopped_result`` 交付。
+
+        把终态优先级改回 ``if stop_requested or failure_code == "interrupted"``
+        必须让本用例变红：终态会变成 ``stopped``，运维丢失超时这个真实失败原因，
+        用户还会收到一段本不该交付的残余正文。
+        """
+
+        queue = FakeWorkerQueue()
+        leftover_text = "残余正文：这轮超时前打出来的半截内容"
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                # 真实链路里这一步由 `_monitor` 完成：轮询发现 stop_requested 就
+                # 置位同一个 stop_event。这里直接置位，等价于"stop 与回合终点
+                # 赛跑，且 stop 这一侧赢在了报告已经生成之后"。
+                kwargs["stop_event"].set()  # type: ignore[union-attr]
+                return {
+                    "turn": {"closed": False, "final_text": leftover_text, "session_id": None},
+                    "failure": {"code": "turn_timeout", "message": "任务提前结束：达到墙钟上限"},
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(
+            terminal["terminal_kind"], "timeout", "并发到达的 stop 不得改写真实失败终态"
+        )
+        self.assertNotEqual(terminal["terminal_kind"], "stopped")
+        self.assertEqual(terminal["error_kind"], "running_timeout")
+        self.assertEqual(
+            terminal["content"],
+            default_content_catalog().text("worker.running_timeout").text,
+            "失败终态只发失败文案",
+        )
+        self.assertNotIn(leftover_text, str(terminal["content"]), "失败回合的残余正文不得交付")
+
+    def test_a_succeeded_turn_still_delivers_its_result_and_session_id_when_stop_lands_late(
+        self,
+    ) -> None:
+        """Issue #195 场景 2：回合已经 ``closed=True`` 拿到结果，``/stop`` 或停机
+        信号晚到。已产出的结果必须照常交付，且只有成功分支才写的
+        ``agent_session_id`` 必须照常持久化——否则用户白等一轮、方案 B 的会话内
+        追问也失去依据（「重启与重试不得造成用户结果丢失」红线）。
+
+        把终态优先级改回 ``if stop_requested or failure_code == "interrupted"``
+        必须让本用例变红：终态被降级成 ``stopped``，``agent_session_id`` 为空。
+        """
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                report = {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "new-session"},
+                    "failure": None,
+                }
+                # 结果已经产出之后 stop 才落地：这正是"晚到"的定义。
+                kwargs["stop_event"].set()  # type: ignore[union-attr]
+                return report
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success", "晚到的 stop 不得吃掉已产出的结果")
+        self.assertNotEqual(terminal["terminal_kind"], "stopped")
+        self.assertIsNone(terminal["error_kind"])
+        self.assertEqual(terminal["content"], "结果")
+        self.assertEqual(
+            terminal["agent_session_id"], "new-session", "成功回合的 session_id 必须照常持久化"
+        )
+
+    def test_a_genuinely_interrupted_turn_keeps_the_stopped_terminal(self) -> None:
+        """Issue #195：纯 stop 的语义不变——执行层确认这一轮真被中断
+        （``failure_code == "interrupted"``，即 r4 已通过的 ``/stop`` 旅程所走的
+        那条路径）时，终态仍是 ``stopped``；已经打出来的半截结果仍随
+        ``worker.stopped_result`` 一起交付，没有正文时用 ``worker.stopped``。
+
+        把 ``interrupted`` 从终态优先级最前面挪走必须让本用例变红。
+        """
+
+        catalog = default_content_catalog()
+        for partial_text, expected_content in (
+            ("已产出的半截结果", catalog.text("worker.stopped_result", result="已产出的半截结果").text),
+            ("", catalog.text("worker.stopped").text),
+        ):
+            with self.subTest(partial_text=bool(partial_text)):
+                queue = FakeWorkerQueue()
+
+                class Executor:
+                    async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                        return {
+                            "turn": {"closed": False, "final_text": partial_text, "session_id": None},
+                            "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                        }
+
+                service = WorkerService(
+                    config=worker_config(),
+                    queue=queue,
+                    executor_factory=lambda config, marker: Executor(),
+                )
+                asyncio.run(service.process_once())
+
+                terminal = queue.terminals[0]
+                self.assertEqual(terminal["terminal_kind"], "stopped")
+                self.assertEqual(terminal["error_kind"], "stopped")
+                self.assertEqual(terminal["content"], expected_content)
+
     def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
         self,
     ) -> None:
