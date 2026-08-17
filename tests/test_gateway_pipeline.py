@@ -91,6 +91,7 @@ class PipelineTestCase(unittest.TestCase):
         reaction_error: Exception | None = None,
         onboarding=None,
         force_clear_agent_session_result: bool | None = None,
+        force_claim_conversation_result: bool | None = None,
     ):
         return EventPipeline(
             store=FakeStore(
@@ -98,6 +99,7 @@ class PipelineTestCase(unittest.TestCase):
                 self.log,
                 fail_on=fail_on,
                 force_clear_agent_session_result=force_clear_agent_session_result,
+                force_claim_conversation_result=force_claim_conversation_result,
             ),
             reactions=FakeReactions(self.log, fail_with=reaction_error),
             replies=FakeReplies(self.log),
@@ -495,6 +497,46 @@ class SessionRotationNoticeTests(PipelineTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["content_key"], "gateway.session_rotated")
         self.assertTrue(sent[0]["content_version"])
+
+    def test_busy_topic_gets_only_the_busy_hint(self) -> None:
+        """话题忙碌时，一条本来完全满足两小时告知条件的消息只得到「当前任务仍在
+        处理中」：它根本没有入队，也就没有"本次提问"可言，再说一句"已开启新会话"
+        会让用户以为这条被丢弃的消息已经在新会话里跑起来了。"""
+
+        conversation = self.stale_conversation()
+        conversation.running_task_id = "tsk_running"
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(len(self.state.tasks), 0, "忙碌期的消息不得入队")
+        self.assertEqual(
+            self.texts(), [BUSY_HINT_TEXT], "忙碌分支恰好一条回复，且不得混入新会话告知"
+        )
+
+    def test_lost_claim_race_gets_only_the_busy_hint(self) -> None:
+        """与 `/new` 竞态（``test_new_race_loses_the_clear_...``）对称的另一半：busy
+        快照读到空闲，但真正 ``claim_conversation`` 时已经影响 0 行——另一条连接在
+        两次读取之间抢占成功。这时任务同样没有入队，告知绝不能漏出去。
+
+        这条用例也是「告知必须追加在抢占与入队**之后**」的守卫：把追加块上移到
+        ``claim_conversation`` 之前，本用例即变红（已实测）。
+        """
+
+        self.stale_conversation()
+        outcome = self.build(force_claim_conversation_result=False).handle_message(
+            message(), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(len(self.state.tasks), 0, "抢占失败时不得入队")
+        self.assertEqual(
+            self.texts(), [BUSY_HINT_TEXT], "抢占失败分支恰好一条回复，且不得混入新会话告知"
+        )
+        self.assertNotIn(
+            "gateway.session_rotated",
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            "否定测试：抢占失败分支的审计记录里不得出现新会话告知的内容键",
+        )
 
     def test_no_notice_when_the_task_could_not_be_queued(self) -> None:
         """`V-队列-03` 的姿态：入队没成功就不给任何「已经换新会话了」的告知。
