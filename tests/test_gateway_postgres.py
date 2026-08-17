@@ -8,6 +8,9 @@
 话题隔离）、`V-会话-08`（排队时长不改变会话归属）、`V-灰度-01`/`V-灰度-02`（版本固化
 与按版本领取）、`V-审计-05`（未开通用户内容不落库）。
 
+``OnboardingDispatchLedgerTests`` 是 Issue #65 轻审 P2-2 的真库面：迁移 0062 的交接
+账本列、按库时间比较的对账窗口，以及并发扫描下"同一条孤儿只被认领一次"。
+
 唯一索引、条件更新、触发器这类断言必须在真库上验证，不用 mock（验证与门禁第五节）。
 建库走 `tests/postgres_schema.py` 的整条 alembic 链，与生产同源（#53 之后编号 SQL 已冻结）。
 """
@@ -1267,6 +1270,137 @@ class UnprovisionedUserTests(GatewayPostgresTestCase):
         self.assertEqual(
             [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
             ["onboarding.checking", "onboarding.sync_timeout"],
+        )
+
+
+class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
+    """迁移 0062 的交接账本与原子认领（Issue #65 轻审 P2-2）。
+
+    这三件事只有真库能判定：局部索引下的条件更新、``FOR UPDATE SKIP LOCKED`` 在并发
+    扫描下"同一条只被一个实例拿走"、以及时间窗口本身按库时间比较。认领即记账，是
+    "对账不得成为重复触发外部开通的新来源"（`V-开通-14`）在这一层的落点。
+    """
+
+    ZERO = timedelta(0)
+
+    def dispatched_at(self, event_id: str = "evt_auto"):
+        return self.scalar(
+            "SELECT onboarding_dispatched_at FROM inbound_event WHERE feishu_event_id = %s",
+            (event_id,),
+        )
+
+    def test_a_normal_first_message_settles_the_ledger(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+
+        self.pipeline(onboarding=runner).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+
+        self.assertIsNotNone(
+            self.dispatched_at(), "编排已经调用过：账本必须平，否则对账会再交接一次"
+        )
+        self.assertIsNone(
+            self.store.claim_stale_onboarding(older_than=self.ZERO),
+            "已经平账的事件不得再被对账扫描捞出来",
+        )
+
+    def test_a_shutdown_window_claim_stays_open_for_reconciliation(self) -> None:
+        """P2-3 与 P2-2 的接缝：停机跳过留下的孤儿，正是扫描要认领的那一条。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.COMPLETED))
+
+        self.pipeline(onboarding=runner, should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+
+        self.assertEqual(runner.calls, [])
+        self.assertIsNone(self.dispatched_at())
+        claimed = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(
+            (claimed.event_id, claimed.open_id, claimed.trace_id),
+            ("evt_auto", "ou_stranger", "trc_evt_auto"),
+        )
+        self.assertIsNotNone(self.dispatched_at(), "认领即记账，必须在同一条语句里完成")
+
+    def test_a_claim_younger_than_the_window_is_left_alone(self) -> None:
+        """窗口必须宽于在途的正常调用，否则会与一次正在执行的开通撞车。"""
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+
+        self.assertIsNone(self.store.claim_stale_onboarding(older_than=timedelta(minutes=30)))
+        self.assertIsNone(self.dispatched_at())
+
+    def test_other_handled_as_values_are_never_claimed(self) -> None:
+        self.add_user()
+        self.pipeline().handle_message(inbound("evt_queued"), now=NOW)
+        self.pipeline().handle_message(
+            inbound("evt_plain", open_id="ou_stranger"), now=NOW
+        )
+
+        self.assertEqual(
+            sorted(row[0] for row in self.query("SELECT handled_as FROM inbound_event")),
+            ["not_provisioned", "task_queued"],
+        )
+        self.assertIsNone(
+            self.store.claim_stale_onboarding(older_than=self.ZERO),
+            "只有 auto_provisioning 才是待交接的事件",
+        )
+
+    def test_two_concurrent_scans_claim_one_orphan_each_at_most(self) -> None:
+        for index in range(2):
+            self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+                inbound(f"evt_auto_{index}", open_id=f"ou_stranger_{index}"), now=NOW
+            )
+
+        barrier = threading.Barrier(4)
+        claimed: list[str] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def scan() -> None:
+            try:
+                barrier.wait(timeout=10)
+                pending = PostgresGatewayStore(self._dsn).claim_stale_onboarding(
+                    older_than=self.ZERO
+                )
+                if pending is not None:
+                    with lock:
+                        claimed.append(pending.event_id)
+            except BaseException as error:  # noqa: BLE001 - 交回主线程断言
+                errors.append(error)
+
+        threads = [threading.Thread(target=scan) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(claimed),
+            ["evt_auto_0", "evt_auto_1"],
+            "两条孤儿、四个扫描者：每条只能被认领一次，多出来的扫描者必须空手而归",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM inbound_event WHERE onboarding_dispatched_at IS NULL"
+            ),
+            0,
+        )
+
+    def test_settling_the_ledger_twice_does_not_move_the_timestamp(self) -> None:
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        self.store.mark_onboarding_dispatched(event_id="evt_auto")
+        first = self.dispatched_at()
+        self.store.mark_onboarding_dispatched(event_id="evt_auto")
+
+        self.assertEqual(
+            self.dispatched_at(), first, "交接时刻是账上什么时候平的唯一证据，不得被后写覆盖"
         )
 
 

@@ -69,6 +69,18 @@ DEFAULT_WORKER_VERSION = "stable"
 # 本批唯一会被入队的消息类型。
 TEXT_MESSAGE_TYPE = "text"
 
+# 编排层没有自带 messages 时，每种状态各自的缺省文案（`OnboardingState` → 内容目录 key）。
+# ``completed`` 刻意不在表内：那条文案必须带上公司与职能范围，而范围只有编排层知道，
+# 补一句说不清范围的「开通完成」等于替它宣告一个未经确认的成功。``started`` 同样不在
+# 表内，但理由相反——它已经由 ``onboarding.checking`` 交代完毕。两者的兜底见
+# ``EventPipeline._render_onboarding_result``。
+_DEFAULT_ONBOARDING_MESSAGES: dict[OnboardingState, OnboardingMessage] = {
+    OnboardingState.MATCHED: OnboardingMessage("onboarding.matched"),
+    OnboardingState.NOT_AUTHORIZED: OnboardingMessage("onboarding.not_authorized"),
+    OnboardingState.SYNC_TIMEOUT: OnboardingMessage("onboarding.sync_timeout"),
+    OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
+}
+
 
 class QueueInsertFailure(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
@@ -133,8 +145,10 @@ class EventPipeline:
         # that have not opted into the #65 path; the gateway app passes it explicitly
         # when the product path is enabled.
         self._onboarding = onboarding
-        # 停机位。停机时**已提交的结论不动**，只跳过尽力而为的出站回复——
+        # 停机位。停机时**已提交的结论不动**，只跳过提交之后那些尽力而为的动作——
         # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
+        # 跳过的有两样：出站回复，以及开通编排的触发（Issue #65 轻审 P2-3）。后者
+        # 跳过之后会留下一条待对账的事件，不会丢——见 ``handle_message``。
         self._should_stop = should_stop or (lambda: False)
 
     def handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
@@ -200,7 +214,24 @@ class EventPipeline:
 
         # 到这里事务已经提交。现在才允许产生用户可见的出站副作用。
         if outcome.handled_as is HandledAs.AUTO_PROVISIONING:
-            self._start_onboarding(message, deferred)
+            if self._should_stop():
+                # 停机中**不触发**开通编排（Issue #65 轻审 P2-3）。此前这里无条件调用
+                # runner，再由下面那段停机检查把渲染结果整批丢掉——正式 runner 有外部
+                # 副作用（建档、建环境、发权限、MCP 同步，合同允许到十五分钟），那等于
+                # 在停机窗口里发起一串不可回滚的外部动作，然后把用户唯一能看到的结论
+                # 扔掉；停机预算（默认二十秒量级）也压根装不下它。
+                #
+                # 事件行已经提交、``handled_as`` 已经是 ``auto_provisioning``，但账本上
+                # 的 ``onboarding_dispatched_at`` 仍是空——这条事件因此是一条**故意**
+                # 留下的孤儿，由 P2-2 的对账扫描在下次启动后重新交接。这是知情取舍：
+                # 晚几分钟开通，好过在停机中途开一半。
+                self._audit.record(
+                    "onboarding.deferred_while_stopping",
+                    event_id=message.event_id,
+                    trace_id=message.trace_id,
+                )
+            else:
+                self._start_onboarding(message, deferred)
 
         if deferred and self._should_stop():
             # 停机中：结论已经落库，提示是尽力而为的那一部分。此时再发一次出站
@@ -440,7 +471,9 @@ class EventPipeline:
             )
             if not isinstance(result, OnboardingResult):
                 raise TypeError("onboarding runner returned an invalid result")
-            rendered = self._render_onboarding_result(result, checking_key=checking.key)
+            rendered = self._render_onboarding_result(
+                result, checking_key=checking.key, message=message
+            )
         except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
             internal = self._texts.catalog.text("onboarding.internal_error")
             deferred.append(internal)
@@ -451,6 +484,9 @@ class EventPipeline:
                 error=type(error).__name__,
                 trace_id=message.trace_id,
             )
+            # 编排确实被调用过（异常来自它内部），账本必须记上：不记的话对账扫描会
+            # 把一条已经得到冻结失败终态的事件再交接一次，用户会收到第二遍 LX-ONBOARD-001。
+            self._mark_onboarding_dispatched(message)
             return
 
         deferred.extend(rendered)
@@ -462,27 +498,84 @@ class EventPipeline:
             content_keys=tuple(content.key for content in rendered),
             trace_id=message.trace_id,
         )
+        self._mark_onboarding_dispatched(message)
+
+    def _mark_onboarding_dispatched(self, message: InboundMessage) -> None:
+        """记账：这条事件已经交给开通编排了（Issue #65 轻审 P2-2）。
+
+        **失败只记审计，绝不向上抛。** 记不上账的最坏后果是对账扫描过一会儿再交接
+        一次，而 ``OnboardingRunner.start`` 按合同幂等；反过来，让一次已经拿到结论的
+        开通因为一条簿记 ``UPDATE`` 失败而炸掉，会把用户可见的终态提示也一起带走。
+        旧注入 store 没有这个方法时同样落进这里（``AttributeError``），行为一致：
+        账本没记上，孤儿由扫描兜底。
+
+        动作名带 ``failed`` 后缀是为了让 ``apps/gateway`` 的审计实现把它升到
+        ``WARNING``：这是一次真实的数据库写失败，淹没在 INFO 流水里就等于没记
+        （#175/#185 的教训）。
+        """
+
+        try:
+            self._store.mark_onboarding_dispatched(event_id=message.event_id)
+        except Exception as error:  # noqa: BLE001 - 见 docstring
+            self._audit.record(
+                "onboarding.dispatch_record_failed",
+                event_id=message.event_id,
+                error=type(error).__name__,
+                trace_id=message.trace_id,
+            )
 
     def _render_onboarding_result(
-        self, result: OnboardingResult, *, checking_key: str
+        self, result: OnboardingResult, *, checking_key: str, message: InboundMessage
     ) -> tuple[RenderedContent, ...]:
+        """把编排结果翻成用户可见内容；**任何非 ``started`` 的结果都必须有话说**。
+
+        默认文案表只覆盖三条失败终态时（Issue #65 轻审 P2-4），一个不带 messages 的
+        ``matched`` / ``completed`` 会渲染出空列表：用户收到「正在核对，请稍候」之后
+        再也没有下文，而系统这边认为一切正常。悬空的沉默比一条不完美的提示更糟——
+        用户既不知道该等还是该重发，也没有任何可以拿去找管理员的线索。
+
+        因此：
+
+        - ``matched`` 补默认文案。它本身不需要任何变量，含义与状态完全一致
+          （已核对到权限、正在完成开通、稍后通知）。
+        - ``completed`` **不补**「开通完成」文案。那条文案必须报出公司与职能范围
+          （产品合同：成功只在开通链路最终确认后报告范围），而这两个值只有编排层
+          知道；gateway 编不出来，也不允许宣告一个说不清范围的成功。
+        - 于是 ``completed`` 连同任何其他渲染为空的非 ``started`` 结果，一起落到冻结的
+          ``LX-ONBOARD-001`` 内部故障终态：它的原文正是「已转交管理员处理」，而
+          「编排说开通完成却说不出范围」确实需要管理员看一眼。
+        - ``started`` 是唯一允许没有下文的状态：它表示编排已异步接手，用户刚收到的
+          「正在核对，请稍候」就是这一轮的完整交代。
+
+        兜底时记一条 ``onboarding.render_failed``，字段里保留编排真正返回的状态。
+        动作名带 ``failed`` 后缀，让审计实现把它升到 ``WARNING``——用户虽然拿到了
+        提示，但「编排返回了一个渲染不出来的结果」是必须有人看见的内部缺陷。
+        """
+
         messages = list(result.messages)
         if not messages:
-            defaults = {
-                OnboardingState.NOT_AUTHORIZED: OnboardingMessage("onboarding.not_authorized"),
-                OnboardingState.SYNC_TIMEOUT: OnboardingMessage("onboarding.sync_timeout"),
-                OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
-            }
-            default_message = defaults.get(result.state)
+            default_message = _DEFAULT_ONBOARDING_MESSAGES.get(result.state)
             if default_message is not None:
                 messages.append(default_message)
 
         rendered: list[RenderedContent] = []
-        for message in messages:
-            if message.key == checking_key:
+        for onboarding_message in messages:
+            if onboarding_message.key == checking_key:
                 # checking is owned by the gateway and is sent exactly once.
                 continue
-            rendered.append(self._texts.catalog.text(message.key, message.as_values()))
+            rendered.append(
+                self._texts.catalog.text(
+                    onboarding_message.key, onboarding_message.as_values()
+                )
+            )
+        if not rendered and result.state is not OnboardingState.STARTED:
+            self._audit.record(
+                "onboarding.render_failed",
+                event_id=message.event_id,
+                state=result.state.value,
+                trace_id=message.trace_id,
+            )
+            return (self._texts.catalog.text("onboarding.internal_error"),)
         return tuple(rendered)
 
     def _add_reaction(self, message: InboundMessage) -> None:

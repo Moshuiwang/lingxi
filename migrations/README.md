@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0061_agent_session_cleanup` |
+| head revision | `0062_onboarding_dispatch_ledger` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -208,6 +208,18 @@ Outbox」](../docs/技术设计/数据库设计.md#问数结果投递事件与�
 
 整张表本 revision 新增，前滚兼容；`downgrade()` 直接 `DROP TABLE`，不存在需要
 回填的历史值。
+
+## `0062_onboarding_dispatch_ledger`（未开通首聊的交接账本）
+
+Issue #65 轻审 P2-2。在 `inbound_event` 上新增一列 `onboarding_dispatched_at`
+（`NULL` = 已认领但尚未确认交给开通编排），并对"待交接"的行建局部索引。#65 的接线
+把认领放在事务里、把触发开通编排放在提交之后，提交与触发之间的崩溃或停机会留下一条
+谁都不会再处理的孤儿行——重投被幂等挡下，编排永远不会被调用。这一列让这种行可判定，
+供 `core/conversation/onboarding_recovery.py` 的对账扫描重新交接一次。理由与回填口径
+详见 revision 文件头部注释。
+
+纯新增列 + 局部索引，前滚兼容；`downgrade()` 直接删除两者。回填只写进本列，随列一起
+消失，不存在"原值已不可知"的问题。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

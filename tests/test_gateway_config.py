@@ -23,7 +23,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lingxi.apps.gateway import build_supervisor, main
+from lingxi.apps.gateway import (
+    build_delivery_tick,
+    build_onboarding_reconciler,
+    build_supervisor,
+    main,
+)
 from lingxi.apps.gateway.config import ENV_PREFIX, GatewayConfigError, load_config
 from gateway_fakes import FakeOnboarding
 from lingxi.core.conversation.ports import OnboardingState
@@ -309,6 +314,73 @@ class BuildSupervisorTests(unittest.TestCase):
         self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
 
 
+class OnboardingReconcilerWiringTests(unittest.TestCase):
+    """#65 轻审 P2-2 的调用方：对账扫描必须真的被生产进程每轮调用。
+
+    这一组断的是"有没有人调它"，不是它自己的行为（后者在
+    ``tests/test_gateway_onboarding_recovery.py``）。#29 的教训正是"组件在库、端口
+    后无调用方"——一个没人调用的对账扫描等于没有对账扫描。
+    """
+
+    def test_the_reconciler_shares_the_supervisor_fail_closed_default(self) -> None:
+        config = load_config(VALID_ENV)
+
+        reconciler = build_onboarding_reconciler(config)
+
+        result = reconciler._onboarding.start(event_id="evt", open_id="ou", trace_id="trc")
+        self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+
+    def test_an_injected_runner_reaches_the_reconciler(self) -> None:
+        config = load_config(VALID_ENV)
+        runner = FakeOnboarding()
+
+        reconciler = build_onboarding_reconciler(config, onboarding=runner)
+
+        self.assertIs(reconciler._onboarding, runner)
+
+    def test_the_reconciler_stops_with_the_process(self) -> None:
+        """停机信号必须接到对账扫描上，否则停机中还会去认领并触发外部开通。
+
+        用例刻意只走"已停机"这一半：另一半会真的去连配置里的数据库，而本组断的是
+        接线，不是数据库可达性。
+        """
+
+        config = load_config(VALID_ENV)
+
+        reconciler = build_onboarding_reconciler(config, should_stop=lambda: True)
+
+        self.assertIsNone(reconciler.run_once(), "收到停机信号后不得再认领孤儿")
+
+    def test_each_delivery_tick_runs_both_the_reconciler_and_the_alerting(self) -> None:
+        calls: list[str] = []
+
+        tick = build_delivery_tick(
+            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
+            reconciler=types.SimpleNamespace(run_once=lambda: calls.append("reconcile")),
+        )
+        tick()
+        tick()
+
+        self.assertEqual(calls, ["reconcile", "alerting", "reconcile", "alerting"])
+
+    def test_a_failing_reconciler_does_not_take_away_the_alerting(self) -> None:
+        calls: list[str] = []
+
+        def explode() -> None:
+            raise RuntimeError("数据库不可达")
+
+        tick = build_delivery_tick(
+            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
+            reconciler=types.SimpleNamespace(run_once=explode),
+        )
+        with self.assertLogs("lingxi.apps.gateway", level=logging.ERROR) as captured:
+            tick()
+
+        self.assertEqual(calls, ["alerting"])
+        self.assertIn("交接对账", captured.output[0])
+        self.assertNotIn("数据库不可达", captured.output[0], "异常正文不进日志")
+
+
 class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
     """S-A-07 卡片故障注入开关的装配接线：设置后 consumer 用注入 transport，
     缺省用真实类型——验证的是 ``assemble_delivery_consumer`` 传给
@@ -411,6 +483,38 @@ class LoggingAuditLevelTests(unittest.TestCase):
         with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
             _LoggingAudit().record("message.unsupported_type")
         self.assertTrue(captured.output[0].startswith("WARNING"))
+
+    def test_the_new_onboarding_diagnostics_land_at_warning(self) -> None:
+        """Issue #65 轻审三项修复新增的诊断动作必须同样在 WARNING 级可见。
+
+        它们各自是唯一能回答一类问题的证据：账本没记上（下一轮会重复交接）、
+        编排返回了渲染不出来的结果（用户拿到的是 LX-ONBOARD-001 而不是真实结论）、
+        补交时编排失败（这条事件到此为止、不再重试）。动作名都带 ``failed``
+        后缀，靠既有后缀规则升级，不再往显式名单里加条目。
+        """
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        for action in (
+            "onboarding.dispatch_record_failed",
+            "onboarding.render_failed",
+            "onboarding.reconcile_failed",
+            "onboarding.reconcile_scan_failed",
+        ):
+            with self.subTest(action=action):
+                with self.assertLogs("lingxi.apps.gateway", level="WARNING") as captured:
+                    _LoggingAudit().record(action)
+                self.assertTrue(captured.output[0].startswith("WARNING"))
+
+    def test_a_deferred_onboarding_stays_at_info(self) -> None:
+        """停机中推迟触发开通属正常停机路径（与 ``reply.skipped_while_stopping``
+        同类），不是诊断缺口，维持 INFO。"""
+
+        from lingxi.apps.gateway import _LoggingAudit
+
+        with self.assertLogs("lingxi.apps.gateway", level="INFO") as captured:
+            _LoggingAudit().record("onboarding.deferred_while_stopping")
+        self.assertTrue(captured.output[0].startswith("INFO"))
 
     def test_normal_actions_stay_at_info(self) -> None:
         from lingxi.apps.gateway import _LoggingAudit
