@@ -445,6 +445,19 @@ class FakeWorkerQueue:
         return None
 
 
+class LateStopWorkerQueue(FakeWorkerQueue):
+    """开工时没有 stop、执行途中队列侧才被置上停止标志的队列替身（Issue #195）。
+
+    ``claimed``/``context`` 上的 ``stop_requested`` 保持 ``False``——否则任务在
+    ``_process_task`` 开头就直接收口成 ``stopped``，根本走不到终态选择那一段。
+    只有 ``stop_requested()`` 这个**轮询出口**返回 ``True``，它正是 ``_monitor``
+    读的那一个，也是旧收口逻辑额外回读、并据此改写终态的那一个。
+    """
+
+    def stop_requested(self, **kwargs: object) -> bool:
+        return True
+
+
 class DroppingNotifyListener:
     """真库消费者测试用的丢通知监听器：等待轮询上限后仍返回未唤醒。"""
 
@@ -629,6 +642,307 @@ class WorkerServiceTests(unittest.TestCase):
         terminal = queue.terminals[0]
         self.assertEqual(terminal["terminal_kind"], "timeout", "真实失败终态不得被 withheld 覆盖")
         self.assertNotEqual(terminal["terminal_kind"], "redacted_withheld")
+
+    # Issue #195 的收口组合用例共用的两种「stop 到达方式」。两种都要覆盖：
+    # ``stop_event`` 是 ``_monitor`` 置位的进程内信号（用户 ``/stop`` 与 SIGTERM
+    # 共用同一个事件）；``queue_flag`` 是队列侧 ``stop_requested()`` 轮询出口，
+    # 旧收口逻辑在写终态前会额外回读它一次并据此改写终态，本次修复把那次回读
+    # 一并删除，因此这一路必须有独立守卫，否则回读被加回来不会有任何东西变红。
+    _STOP_ARRIVALS = ("stop_event", "queue_flag")
+
+    def _terminal_when_stop_lands_mid_turn(
+        self, report: Mapping[str, object], *, stop_arrival: str
+    ) -> Mapping[str, object]:
+        """跑一次"回合已经产出 ``report``、stop 在同一时刻落地"的收口，返回终态事件。"""
+
+        queue = LateStopWorkerQueue() if stop_arrival == "queue_flag" else FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                if stop_arrival == "stop_event":
+                    # 真实链路里这一步由 `_monitor` 完成：轮询发现 stop 就置位
+                    # 同一个 stop_event。这里直接置位，等价于"stop 与回合终点
+                    # 赛跑，且 stop 这一侧赢在了报告已经生成之后"。
+                    kwargs["stop_event"].set()  # type: ignore[union-attr]
+                return dict(report)
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+        self.assertEqual(len(queue.terminals), 1, "一个回合只能写一条终态事件")
+        return queue.terminals[0]
+
+    def test_a_failed_turn_keeps_its_failure_terminal_even_when_stop_lands_concurrently(
+        self,
+    ) -> None:
+        """Issue #195 场景 1：回合已经因 ``turn_timeout`` 失败，用户 ``/stop``
+        或停机信号在回合终点**并发**到达。终态必须保留真实失败原因，残余正文
+        不得经 ``worker.stopped_result`` 交付。
+
+        把终态优先级改回 ``if stop_requested or failure_code == "interrupted"``
+        必须让本用例变红：终态会变成 ``stopped``，运维丢失超时这个真实失败原因，
+        用户还会收到一段本不该交付的残余正文。
+        """
+
+        leftover_text = "残余正文：这轮超时前打出来的半截内容"
+        for stop_arrival in self._STOP_ARRIVALS:
+            with self.subTest(stop_arrival=stop_arrival):
+                terminal = self._terminal_when_stop_lands_mid_turn(
+                    {
+                        "turn": {
+                            "closed": False,
+                            "final_text": leftover_text,
+                            "session_id": None,
+                        },
+                        "failure": {
+                            "code": "turn_timeout",
+                            "message": "任务提前结束：达到墙钟上限",
+                        },
+                    },
+                    stop_arrival=stop_arrival,
+                )
+
+                self.assertEqual(
+                    terminal["terminal_kind"], "timeout", "并发到达的 stop 不得改写真实失败终态"
+                )
+                self.assertNotEqual(terminal["terminal_kind"], "stopped")
+                self.assertEqual(terminal["error_kind"], "running_timeout")
+                self.assertEqual(
+                    terminal["content"],
+                    default_content_catalog().text("worker.running_timeout").text,
+                    "失败终态只发失败文案",
+                )
+                self.assertNotIn(
+                    leftover_text, str(terminal["content"]), "失败回合的残余正文不得交付"
+                )
+
+    def test_a_succeeded_turn_still_delivers_its_result_and_session_id_when_stop_lands_late(
+        self,
+    ) -> None:
+        """Issue #195 场景 2：回合已经 ``closed=True`` 拿到结果，``/stop`` 或停机
+        信号晚到。已产出的结果必须照常交付，且只有成功分支才写的
+        ``agent_session_id`` 必须照常持久化——否则用户白等一轮、方案 B 的会话内
+        追问也失去依据（「重启与重试不得造成用户结果丢失」红线）。
+
+        把终态优先级改回 ``if stop_requested or failure_code == "interrupted"``
+        必须让本用例变红：终态被降级成 ``stopped``，``agent_session_id`` 为空。
+        """
+
+        for stop_arrival in self._STOP_ARRIVALS:
+            with self.subTest(stop_arrival=stop_arrival):
+                terminal = self._terminal_when_stop_lands_mid_turn(
+                    {
+                        "turn": {
+                            "closed": True,
+                            "final_text": "结果",
+                            "session_id": "new-session",
+                        },
+                        "failure": None,
+                    },
+                    stop_arrival=stop_arrival,
+                )
+
+                self.assertEqual(
+                    terminal["terminal_kind"], "success", "晚到的 stop 不得吃掉已产出的结果"
+                )
+                self.assertNotEqual(terminal["terminal_kind"], "stopped")
+                self.assertIsNone(terminal["error_kind"])
+                self.assertEqual(terminal["content"], "结果")
+                self.assertEqual(
+                    terminal["agent_session_id"],
+                    "new-session",
+                    "成功回合的 session_id 必须照常持久化",
+                )
+
+    def test_an_unclosed_turn_without_a_named_failure_code_is_still_a_failure_under_stop(
+        self,
+    ) -> None:
+        """codex 一级独立审查 P1-1：``failure_code is None`` **不等于**「没有失败
+        事实」——``closed=False`` 本身就是失败事实。上一版实现用
+        ``failure_code is None`` 反推「那就当作是 stop 造成的」，于是同一份报告
+        在有 stop 时收口成 ``stopped``（还可能经 ``worker.stopped_result`` 把残余
+        正文交付出去），没有 stop 时却是 ``failed``/``session_failed`` 且不交付
+        正文——同一个事实两种终态，其中一种在说谎。
+
+        三种「没有可用失败码」的真实形状都必须与无 stop 时一致地收口成失败：
+        报告干脆没有 failure、failure 非空但缺 ``code``、以及屏障失效
+        （``gate_bypassed``——``Stop`` hook 没触发，是安全屏障失效唯一的可观察
+        形状，绝不能被写成"用户停止了任务"）。
+        """
+
+        leftover_text = "残余正文：不该被当成「已停止」交付出去的半截内容"
+        for label, turn_extra, failure in (
+            ("没有 failure", {}, None),
+            ("failure 非空但缺 code", {}, {"message": "某个没有归类的失败"}),
+            ("屏障失效 gate_bypassed", {"gate_bypassed": True}, None),
+        ):
+            for stop_arrival in self._STOP_ARRIVALS:
+                with self.subTest(shape=label, stop_arrival=stop_arrival):
+                    terminal = self._terminal_when_stop_lands_mid_turn(
+                        {
+                            "turn": {
+                                "closed": False,
+                                "final_text": leftover_text,
+                                "session_id": None,
+                                **turn_extra,
+                            },
+                            "failure": failure,
+                        },
+                        stop_arrival=stop_arrival,
+                    )
+
+                    self.assertEqual(
+                        terminal["terminal_kind"],
+                        "failed",
+                        "未收口的回合不因为「没有失败码」就变成用户停止",
+                    )
+                    self.assertNotEqual(terminal["terminal_kind"], "stopped")
+                    self.assertEqual(terminal["error_kind"], "session_failed")
+                    self.assertEqual(
+                        terminal["content"],
+                        default_content_catalog().text("worker.failed").text,
+                    )
+                    self.assertNotIn(
+                        leftover_text,
+                        str(terminal["content"]),
+                        "未收口回合的残余正文不得交付",
+                    )
+
+    def test_an_sdk_cancelled_turn_stays_a_failure_terminal_with_or_without_a_stop(
+        self,
+    ) -> None:
+        """codex 一级独立审查 P1-2：``cancelled`` 不是 stop 的别名。它来自
+        ``apps/worker/turn.py`` 的 ``_sdk_termination_failure`` 对 **SDK 自报**的
+        ``aborted_streaming``/``aborted_tools`` 的归类，与本侧 ``stop_event`` /
+        ``client.interrupt()`` 之间没有任何因果绑定——SDK 完全可能在没人 stop 的
+        时候自行 abort。把它当作 stop 等价码，一次晚到的 stop 就能把真实的 SDK
+        终止失败掩盖成"任务已停止"。
+
+        因此两种情况都必须是失败终态：无 stop（既有行为的回归锁）与晚到的 stop
+        （本次修复确立的语义）。
+        """
+
+        cancelled_report: dict[str, object] = {
+            "turn": {"closed": False, "final_text": "", "session_id": None},
+            "failure": {"code": "cancelled", "message": "任务已取消，未继续执行"},
+        }
+        expected_content = default_content_catalog().text("worker.failed").text
+
+        # 无 stop：既有行为，不得因本次修复而改变。
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return dict(cancelled_report)
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "session_failed")
+        self.assertEqual(terminal["content"], expected_content)
+
+        # 晚到的 stop：结论必须与无 stop 时**完全一致**。
+        for stop_arrival in self._STOP_ARRIVALS:
+            with self.subTest(stop_arrival=stop_arrival):
+                terminal = self._terminal_when_stop_lands_mid_turn(
+                    cancelled_report, stop_arrival=stop_arrival
+                )
+                self.assertEqual(
+                    terminal["terminal_kind"],
+                    "failed",
+                    "晚到的 stop 不得把 SDK 自行 abort 掩盖成「已停止」",
+                )
+                self.assertNotEqual(terminal["terminal_kind"], "stopped")
+                self.assertEqual(terminal["error_kind"], "session_failed")
+                self.assertEqual(terminal["content"], expected_content)
+
+    def test_withheld_output_stays_redacted_withheld_when_stop_lands_concurrently(
+        self,
+    ) -> None:
+        """Issue #195：withheld 分支自身语义不变（#186 F1 已定），并发到达的 stop
+        也不得把它改写成 ``stopped``——那会让"整段正文因安全策略被拒发"这个可
+        查询的独立终态消失，运维再也分不清用户是被拦了还是自己停的。
+
+        无 stop 的同一形状由
+        ``test_withheld_output_writes_redacted_withheld_terminal_not_success``
+        覆盖，本用例只补 stop 并发这一维。
+        """
+
+        withheld_text = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果。"
+        for stop_arrival in self._STOP_ARRIVALS:
+            with self.subTest(stop_arrival=stop_arrival):
+                terminal = self._terminal_when_stop_lands_mid_turn(
+                    {
+                        "turn": {
+                            "closed": True,
+                            "final_text": withheld_text,
+                            "session_id": "new-session",
+                            "output_safety": {
+                                "blocked": True,
+                                "withheld": True,
+                                "reasons": ("forbidden_value",),
+                            },
+                            "user_result": "redacted_withheld",
+                        },
+                        "failure": None,
+                    },
+                    stop_arrival=stop_arrival,
+                )
+
+                self.assertEqual(terminal["terminal_kind"], "redacted_withheld")
+                self.assertNotEqual(terminal["terminal_kind"], "stopped")
+                self.assertEqual(terminal["error_kind"], "redacted_withheld")
+                self.assertEqual(
+                    terminal["content"],
+                    default_content_catalog().text("worker.redacted_withheld").text,
+                )
+                self.assertNotIn(
+                    withheld_text, str(terminal["content"]), "被拒发的正文不得交付"
+                )
+
+    def test_a_genuinely_interrupted_turn_keeps_the_stopped_terminal(self) -> None:
+        """Issue #195：纯 stop 的语义不变——执行层确认这一轮真被中断
+        （``failure_code == "interrupted"``，即 r4 已通过的 ``/stop`` 旅程所走的
+        那条路径）时，终态仍是 ``stopped``；已经打出来的半截结果仍随
+        ``worker.stopped_result`` 一起交付，没有正文时用 ``worker.stopped``。
+
+        把 ``interrupted`` 从终态优先级最前面挪走必须让本用例变红。
+        """
+
+        catalog = default_content_catalog()
+        for partial_text, expected_content in (
+            ("已产出的半截结果", catalog.text("worker.stopped_result", result="已产出的半截结果").text),
+            ("", catalog.text("worker.stopped").text),
+        ):
+            with self.subTest(partial_text=bool(partial_text)):
+                queue = FakeWorkerQueue()
+
+                class Executor:
+                    async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                        return {
+                            "turn": {"closed": False, "final_text": partial_text, "session_id": None},
+                            "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                        }
+
+                service = WorkerService(
+                    config=worker_config(),
+                    queue=queue,
+                    executor_factory=lambda config, marker: Executor(),
+                )
+                asyncio.run(service.process_once())
+
+                terminal = queue.terminals[0]
+                self.assertEqual(terminal["terminal_kind"], "stopped")
+                self.assertEqual(terminal["error_kind"], "stopped")
+                self.assertEqual(terminal["content"], expected_content)
 
     def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
         self,
