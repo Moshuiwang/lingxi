@@ -127,15 +127,17 @@ class WorkerConfig:
     session_cleanup_batch_limit: int = 20
 
     def __post_init__(self) -> None:
-        # canary ⇒ system_prompt 的不变量放在类型自身而不是只放在 load_config
-        # （独立审核 F7）：直接构造 WorkerConfig 是文档支持的测试/嵌入路径，
-        # 只靠 loader 校验时，绕过 loader 的构造会让注入退化成空字符串、canary
-        # 永远不触发——验收者会把"配置不完整"误读成"安全链路又没触发"。
-        if self.output_safety_canary is not None and not self.system_prompt:
-            raise WorkerConfigError(
-                "output_safety_canary 需要同时提供 system_prompt（合成 canary 提示"
-                "是注入内容的唯一来源）"
-            )
+        # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
+        # F7，PR #186 补审 P2-2）：直接构造 WorkerConfig 是文档支持的测试/嵌入
+        # 路径，只靠 loader 校验时，绕过 loader 的构造能带着拼错的档位或危险提示
+        # 一路跑起来——注入退化成空字符串、canary 永远不触发，验收者会把"配置不
+        # 完整"误读成"安全链路又没触发"。两条路径必须同等失败关闭。
+        _validate_output_safety_canary(
+            self.output_safety_canary,
+            self.system_prompt,
+            mode_label="output_safety_canary",
+            prompt_label="system_prompt",
+        )
 
 
 def load_config(env: Mapping[str, str], *, require_question: bool = True) -> WorkerConfig:
@@ -249,45 +251,72 @@ def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
     return (("metric.description", description),) if description else ()
 
 
-def _output_safety_canary(env: Mapping[str, str], *, system_prompt: str | None) -> str | None:
-    """读取输出安全 canary 档位（S-A-07 / Issue #142）。
+def _validate_output_safety_canary(
+    canary: str | None,
+    system_prompt: str | None,
+    *,
+    mode_label: str,
+    prompt_label: str,
+) -> None:
+    """输出安全 canary 的全部启动期不变量（S-A-07 / Issue #142）。
 
-    失败关闭：非法值与"开着 canary 却没有配置 system prompt"都在启动期拒绝——
-    前者是拼写错误悄悄放行的经典形状，后者会让注入退化成空字符串、canary 永远
-    不触发，验收者会把"配置不完整"误读成"安全链路又没触发"（r17 的原样重演）。
+    由 ``WorkerConfig.__post_init__`` 与 ``load_config`` 共用，两条路径同等失败
+    关闭（PR #186 补审 P2-2）；``*_label`` 只决定错误文案里指向哪一侧的名字
+    （环境变量名或字段名），不改变任何判定。
+
+    失败关闭的三条：非法档位（拼写错误悄悄放行的经典形状）、"开着 canary 却没有
+    system prompt"（注入退化成空字符串、canary 永远不触发，验收者会把"配置不完整"
+    误读成"安全链路又没触发"，即 r17 的原样重演）、以及与受保护文本互为子串。
     """
 
-    value = _text(env, "OUTPUT_SAFETY_CANARY")
-    if value is None:
-        return None
-    if value not in OUTPUT_SAFETY_CANARY_MODES:
+    if canary is None:
+        return
+    if canary not in OUTPUT_SAFETY_CANARY_MODES:
         # 不回显收到的值（独立审核 F9，同 _validated_trace_id 与 gateway 卡片
         # 注入开关的既有纪律）：误接进来的可能是口令或提示词原文。
         raise WorkerConfigError(
-            f"{ENV_PREFIX}OUTPUT_SAFETY_CANARY 只允许 "
+            f"{mode_label} 只允许 "
             + " / ".join(OUTPUT_SAFETY_CANARY_MODES)
             + "（收到的值不回显）"
         )
     if not system_prompt:
         raise WorkerConfigError(
-            f"{ENV_PREFIX}OUTPUT_SAFETY_CANARY 需要同时配置 {ENV_PREFIX}SYSTEM_PROMPT"
+            f"{mode_label} 需要同时配置 {prompt_label}"
             "（合成 canary 提示是注入内容的唯一来源）"
         )
-    # 子串守卫（独立审核 F2，实证复现）：合成提示若是任一安全终态固定文案或
-    # masked 幸存句的子串，出口约束的终态自检 ``_ensure_terminal_text_is_safe``
-    # 会在 withheld 分支抛 ``InputSafetyError``，把"总是返回一份报告"的契约炸掉
-    # ——在启动期确定性拒绝，比运行期每回合炸更符合失败关闭。
-    for terminal_text, label in (
+    # 子串守卫，**双向**（独立审核 F2 实证复现 + PR #186 补审 P2-3）：
+    # - 合成提示是受保护文本的子串：出口约束的终态自检
+    #   ``_ensure_terminal_text_is_safe`` 会在 withheld 分支抛 ``InputSafetyError``，
+    #   把"总是返回一份报告"的契约炸掉；
+    # - 受保护文本出现在合成提示之中：出口约束会按结构性边界把 system prompt 切成
+    #   片段当禁词，于是幸存句 / 固定文案自身被派生成禁词——masked 档位的固定幸存句
+    #   会被遮蔽掉，命中区间之外再无真实内容，masked 滑进 withheld；落到终态文案上
+    #   同样让自检失败。构造出这个形状不需要恶意，一段多行合成提示中间夹一行幸存句
+    #   就够了。
+    # 两个方向都在启动期确定性拒绝，比运行期每回合炸更符合失败关闭。
+    for protected_text, label in (
         (WITHHELD_MESSAGE, "withheld 固定文案"),
         (SAFE_OUTPUT_FALLBACK, "空产出兜底文案"),
         (OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, "masked 幸存句"),
     ):
-        if system_prompt in terminal_text:
+        if system_prompt in protected_text or protected_text in system_prompt:
             raise WorkerConfigError(
-                f"{ENV_PREFIX}SYSTEM_PROMPT 不得是{label}的子串：canary 开启时它会"
-                "让安全终态自检失败或让幸存句被遮蔽。请换一段互不重叠的多句合成提示"
-                "（收到的值不回显）"
+                f"{prompt_label} 不得与{label}互为子串（两个方向都不行）：canary 开启时"
+                "它会让安全终态自检失败，或让固定幸存句被自己派生出的禁词遮蔽、masked "
+                "滑进 withheld。请换一段互不重叠的多句合成提示（收到的值不回显）"
             )
+
+
+def _output_safety_canary(env: Mapping[str, str], *, system_prompt: str | None) -> str | None:
+    """读取输出安全 canary 档位，并以环境变量口径给出报错。"""
+
+    value = _text(env, "OUTPUT_SAFETY_CANARY")
+    _validate_output_safety_canary(
+        value,
+        system_prompt,
+        mode_label=f"{ENV_PREFIX}OUTPUT_SAFETY_CANARY",
+        prompt_label=f"{ENV_PREFIX}SYSTEM_PROMPT",
+    )
     return value
 
 
