@@ -512,7 +512,7 @@ class EventPipeline:
         user_id: str,
         conversation,
         now: datetime,
-        deferred: list[str],
+        deferred: list[RenderedContent],
     ) -> Outcome:
         task_id = new_id("tsk")
 
@@ -531,6 +531,25 @@ class EventPipeline:
             last_task_ended_at=conversation.last_task_ended_at,
             agent_session_id=conversation.agent_session_id,
             now=now,
+        )
+        # 产品合同「系统明确告诉用户已经开启新会话」的**第二条触发路径**（Issue #189）：
+        # 不是用户敲的 `/new`，而是两小时空闲后下一条消息自然开的新会话。判定**不重算
+        # 窗口、不改 `should_resume_session`**，只把"不续用"的三种成因区分开来：
+        #
+        # - 本来有会话可续（``agent_session_id`` 非空）、也确实结束过上一次任务
+        #   （``last_task_ended_at`` 非空），却仍然判为不续用 → 唯一可能的成因就是
+        #   间隔超过了两小时，提示；
+        # - 首次提问（两者皆空）→ 不提示，用户没有任何"此前上下文"可言；
+        # - `/new` 之后（``agent_session_id`` 已被清空，``last_task_ended_at`` 按
+        #   `V-会话-05` 保持不动）→ 不提示，用户刚收到过 `gateway.new_session` 的确认，
+        #   再补一句「距上次对话已超过两小时」既重复又与事实不符。
+        #
+        # 空闲会话到点清除（`sweep_idle_conversations`）刻意**不清空** ``agent_session_id``，
+        # 因此隔了两小时才回来的用户仍然落在第一种情形里，不会被误判成 `/new` 之后。
+        session_rotated = (
+            not resumed
+            and bool(conversation.agent_session_id)
+            and conversation.last_task_ended_at is not None
         )
         # 目标 worker 版本同样在入队时求值一次并写入（`V-灰度-01`）。
         # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
@@ -551,6 +570,14 @@ class EventPipeline:
             raise QueueInsertFailure("task insert failed") from error
         tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.TASK_QUEUED)
         tx.notify_task_queued()
+
+        if session_rotated:
+            # 追加在入队**成功之后**：与 `/new`、忙碌两条分支同一姿态——只有真正
+            # 生效的那一步才追加它的文案。入队失败路径另有一道保险（整体丢弃
+            # ``deferred``，`V-队列-03`），两道合起来保证用户不会收到一条"已经换
+            # 新会话了"却其实没有任何任务在跑的告知。发送本身仍在事务提交后的
+            # 统一循环里，不改变事务边界。
+            deferred.append(self._texts.catalog.text("gateway.session_rotated"))
 
         self._audit.record(
             "task.queued",

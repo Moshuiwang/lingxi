@@ -157,6 +157,7 @@ class FakeTransaction:
         *,
         fail_on: str | None = None,
         force_clear_agent_session_result: bool | None = None,
+        force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
@@ -165,6 +166,10 @@ class FakeTransaction:
         # 时已经影响 0 行」的竞态，不依赖真实并发线程调度。``None`` 时走原有的按
         # staged_claims/running_task_id 计算的语义，与真库条件更新同构。
         self._force_clear_agent_session_result = force_clear_agent_session_result
+        # Issue #189 独立审查：普通消息这一侧的同一种竞态——busy 快照读到空闲，但
+        # claim_conversation 真正抢占时已经影响 0 行。与上一个开关同构，用来断言这条
+        # 分支同样不得漏出「已开启新会话」的告知。
+        self._force_claim_conversation_result = force_claim_conversation_result
         self.staged_events: dict[str, str | None] = {}
         self.staged_tasks: list[FakeTask] = []
         self.staged_claims: dict[str, str | None] = {}
@@ -214,6 +219,11 @@ class FakeTransaction:
     def claim_conversation(self, *, conversation_id: str, task_id: str) -> bool:
         self._log.add("store.claim_conversation", conversation_id=conversation_id, task_id=task_id)
         self._maybe_fail("claim_conversation")
+        if self._force_claim_conversation_result is not None:
+            forced = self._force_claim_conversation_result
+            if forced:
+                self.staged_claims[conversation_id] = task_id
+            return forced
         current = self._find(conversation_id)
         running = self.staged_claims.get(conversation_id, current.running_task_id)
         if running is not None:
@@ -291,8 +301,8 @@ class FakeTransaction:
 
 class FakeStore:
     """实现 ``GatewayStore``。``fail_on`` 指定在哪一步注入写失败；
-    ``force_clear_agent_session_result`` 指定在哪一步注入 ``/new`` 竞态（见
-    ``FakeTransaction.__init__`` 说明）。"""
+    ``force_clear_agent_session_result`` 与 ``force_claim_conversation_result``
+    分别注入 ``/new`` 与普通消息抢占这两处的竞态（见 ``FakeTransaction.__init__``）。"""
 
     def __init__(
         self,
@@ -301,11 +311,13 @@ class FakeStore:
         *,
         fail_on: str | None = None,
         force_clear_agent_session_result: bool | None = None,
+        force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
         self._fail_on = fail_on
         self._force_clear_agent_session_result = force_clear_agent_session_result
+        self._force_claim_conversation_result = force_claim_conversation_result
 
     @contextmanager
     def transaction(self) -> Iterator[FakeTransaction]:
@@ -314,6 +326,7 @@ class FakeStore:
             self._log,
             fail_on=self._fail_on,
             force_clear_agent_session_result=self._force_clear_agent_session_result,
+            force_claim_conversation_result=self._force_claim_conversation_result,
         )
         # 异常时**不提交**：暂存区里的事件行、抢占、任务一起消失，
         # 与真库的事务回滚同语义。
