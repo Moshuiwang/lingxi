@@ -586,7 +586,9 @@ class RosterAuditDuty:
             ambiguous=report.ambiguous_count,
         )
         self._completed_on = today
-        # 摘要只有计数。任何一个人的标识或资料值进日志，都等于绕过日报的脱敏口径。
+        # 摘要只有计数，依据是 `V-花名册-33`（审计与日志不含花名册字段值）。日报正文的
+        # 展示口径已被 2026-08-08 的 D2 裁定放宽到「受控管理群可含原值」，日志侧没有
+        # 随之放宽：日志流向排障、CI 输出与工单，不在受控管理群那个范围里。
         logger.info(
             "管理群审计日报已发送 已开通用户=%s 条目=%s 疑似转交=%s 花名册查无=%s",
             report.examined,
