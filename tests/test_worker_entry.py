@@ -1517,6 +1517,145 @@ class ReviewHardeningTest(unittest.TestCase):
         self.assertFalse(report["turn"]["closed"])
 
 
+class StopCausalTerminationTest(unittest.TestCase):
+    """#201：``/stop`` 恰好落在回合终点、SDK 以 ``aborted_*`` 收尾时的失败归类。
+
+    正常情况下本地 stop 会让适配器抛 ``AgentSessionInterrupted``（→ ``interrupted``）。
+    但 SDK 完全可能抢在 ``client.interrupt()`` 返回之前就把这一轮收完，此时回合从
+    形状上看就是"SDK 自己 abort 了"，原实现一律归为 ``cancelled``，队列侧按 #195
+    的终态优先级收口成 ``failed/session_failed``，用户主动停止却看到「请稍后重试」
+    类通用失败文案。
+
+    修法是**本地事实因果接线**，不是反推：只有本进程真的发出过 ``interrupt()``
+    才改判。三个用例分别锁住这条因果的两端（有因、无因）与"晚到的 stop 从未成为
+    本地中断"。``interrupted`` 之后的终态（``stopped``）由
+    ``tests/test_worker_queue_consumer.py`` 的
+    ``test_a_genuinely_interrupted_turn_keeps_the_stopped_terminal`` 守住，本文件
+    不重复 service 层的终态优先级判定。
+    """
+
+    def _aborted_result(self, terminal_reason: str):
+        return StubResultMessage(
+            subtype="error_during_execution", is_error=True, terminal_reason=terminal_reason
+        )
+
+    def test_a_local_interrupt_makes_an_aborted_termination_a_stop(self) -> None:
+        """本地已发出 interrupt + SDK 以 aborted_* 收尾 → ``interrupted``。
+
+        把 ``turn.py`` 里的 ``interrupt_requested`` 接线撤掉（或让适配器在
+        ``await interrupt()`` 之后才记事实）必须让本用例变红。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK([]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_sent = asyncio.Event()
+        aborted_result = self._aborted_result("aborted_streaming")
+
+        class RacingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def interrupt(self):
+                # 中断请求已经送到 SDK，这次调用却永远不返回：用确定的同步点
+                # 复现竞态，不依赖事件循环的调度巧合。
+                interrupt_sent.set()
+                await asyncio.sleep(3600)
+
+            def receive_response(self):
+                async def _gen():
+                    await interrupt_sent.wait()
+                    yield aborted_result
+
+                return _gen()
+
+        module.ClaudeSDKClient = RacingClient
+        config = load_config(worker_env())
+        stderr = io.StringIO()
+        executor = WorkerTurnExecutor(config, stderr_stream=stderr)
+
+        async def scenario():
+            stop_event = asyncio.Event()
+            stop_event.set()
+            return await executor.run_turn(config.question, stop_event=stop_event)
+
+        report = asyncio.run(scenario())
+
+        self.assertEqual(report["failure"]["code"], "interrupted")
+        self.assertEqual(report["turn"]["termination_reason"], "interrupted")
+        self.assertFalse(report["turn"]["closed"])
+        # 竞态每发生一次留一条可计数的结构化痕迹，用来观察真实频率（#201）。
+        lines = [json.loads(line) for line in stderr.getvalue().splitlines() if line.strip()]
+        races = [line for line in lines if line["event"] == "worker.stop.interrupt_race"]
+        self.assertEqual(len(races), 1)
+        self.assertEqual(races[0]["terminal_reason"], "aborted_streaming")
+        self.assertEqual(races[0]["trace_id"], config.trace_id)
+
+    def test_an_sdk_abort_without_any_local_interrupt_stays_a_failure(self) -> None:
+        """回归锁：无人 stop 时 SDK 自行 ``aborted_*`` 仍是 ``cancelled``（失败分支）。
+
+        ``aborted_*`` 是 SDK 自报的，可以在无 stop 时出现；把它当成 stop 的别名
+        会掩盖真实的 SDK 终止失败（PR #198 一级独立审查 P1-2 裁定）。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        for terminal_reason in ("aborted_streaming", "aborted_tools"):
+            with self.subTest(terminal_reason=terminal_reason):
+                FakeAgentSDK(
+                    [{"kind": "text", "text": "半截正文"}], terminal_reason=terminal_reason
+                ).install(self)
+                config = load_config(worker_env())
+                stderr = io.StringIO()
+                report = asyncio.run(
+                    WorkerTurnExecutor(config, stderr_stream=stderr).run_turn(config.question)
+                )
+
+                self.assertEqual(report["failure"]["code"], "cancelled")
+                self.assertEqual(report["turn"]["termination_reason"], "cancelled")
+                self.assertNotIn("worker.stop.interrupt_race", stderr.getvalue())
+
+    def test_a_stop_that_never_became_a_local_interrupt_keeps_the_failure(self) -> None:
+        """回归锁：stop 晚到、本进程从未发出 ``interrupt()`` → 仍是 ``cancelled``。
+
+        因果接的是"本地真的中断过"，不是"某一刻有人请求过停止"。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK([]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        stop_event = asyncio.Event()
+        interrupts: list = []
+        aborted_result = self._aborted_result("aborted_tools")
+
+        class LateStopClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def interrupt(self):  # pragma: no cover - 被调用即说明因果接错
+                interrupts.append("called")
+
+            def receive_response(self):
+                async def _gen():
+                    yield aborted_result
+                    # 回合已经收完之后才有人 stop：本进程没有、也不该再发中断。
+                    stop_event.set()
+
+                return _gen()
+
+        module.ClaudeSDKClient = LateStopClient
+        config = load_config(worker_env())
+        stderr = io.StringIO()
+        report = asyncio.run(
+            WorkerTurnExecutor(config, stderr_stream=stderr).run_turn(
+                config.question, stop_event=stop_event
+            )
+        )
+
+        self.assertEqual(interrupts, [])
+        self.assertEqual(report["failure"]["code"], "cancelled")
+        self.assertNotIn("worker.stop.interrupt_race", stderr.getvalue())
+
+
 class WorkerCliTest(unittest.TestCase):
     """入口必须真的能以 ``python -m lingxi.apps.worker`` 启动。"""
 
