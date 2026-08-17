@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-08"
+version = "2026-08-17"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"

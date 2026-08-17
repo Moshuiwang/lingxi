@@ -1,0 +1,66 @@
+# 用户可见文案的版本登记（Issue #190：文案变更必须递增版本）。
+# 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
+# 改完 content.toml 的文案后：先递增 [meta] version，再运行
+#   python3 scripts/ci/check_content_version.py --refresh
+version = "2026-08-17"
+digest = "sha256:54f387e425cc312c0599ccee1a279084bf4b72519afc40228b87a50fd8628be5"
+
+# 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
+retired_versions = [
+  "2026-08-08",
+]
+
+# 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
+[keys]
+"cards.query.empty.body" = "e799c23e7c6c94a0"
+"cards.query.empty.title" = "463b2262ebe14a9f"
+"cards.query.failure.body" = "9273d00cc73897fe"
+"cards.query.failure.title" = "61f9bd1ac5624140"
+"cards.query.result.body" = "b573e75844031a6a"
+"cards.query.result.title" = "463b2262ebe14a9f"
+"cards.query.status.body" = "c9f9dfcfdf7bd324"
+"cards.query.status.title" = "61a2d0066ab40f32"
+"texts.gateway.busy_hint" = "7984bc41c89b9e08"
+"texts.gateway.delivery_expired" = "650d1541a4369696"
+"texts.gateway.new_session" = "914f6fa8697310f6"
+"texts.gateway.queue_failed" = "c5c6ac5c10a031fa"
+"texts.gateway.suspended" = "367f5c5462e3358e"
+"texts.onboarding.checking" = "738d208e40a19f0b"
+"texts.onboarding.completed" = "4733d8c930485684"
+"texts.onboarding.delegated_subject" = "2d5caff476da0546"
+"texts.onboarding.internal_error" = "9f972625fac9999e"
+"texts.onboarding.matched" = "601320747836f485"
+"texts.onboarding.not_authorized" = "70b661df834988e6"
+"texts.onboarding.sync_timeout" = "9eb53296db8fdcf6"
+"texts.roster.daily_report" = "c0db8cc045259426"
+"texts.roster.disclaimer" = "2c4fa397ca488e3b"
+"texts.roster.entry" = "00ad66d3d5d8e248"
+"texts.roster.entry_handover" = "565700c8d92e99b0"
+"texts.roster.field.display_name" = "50b5b1d2abefbca6"
+"texts.roster.field.email" = "73075237fd0f05f0"
+"texts.roster.field.employee_no" = "aeb503721b21feb2"
+"texts.roster.handover_mark" = "908e8ae64c037c95"
+"texts.roster.header" = "20f3cbf2441d7773"
+"texts.roster.note.ambiguous" = "05bc22bc8df7bd87"
+"texts.roster.note.changed" = "e3b0c44298fc1c14"
+"texts.roster.note.removed" = "3fc979a083d934bd"
+"texts.roster.report_title" = "41d2a4fca156643a"
+"texts.roster.section.ambiguous" = "f296ed03b06f80f1"
+"texts.roster.section.changed" = "73aa4481a72597f3"
+"texts.roster.section.removed" = "5e177534b7ba7e86"
+"texts.roster.section_heading" = "8dfb22f7137639f2"
+"texts.roster.section_heading_with_note" = "2a2885c12683ca64"
+"texts.roster.summary" = "52868d99339df9ce"
+"texts.worker.action.completed" = "f28461bb49c85647"
+"texts.worker.action.processing" = "3b7e27cb4379da3c"
+"texts.worker.context_too_long" = "33805373cca13b15"
+"texts.worker.failed" = "51f1df400deab9d0"
+"texts.worker.max_turns" = "166d8e19f4b2f3b4"
+"texts.worker.queued_timeout" = "cc4e6e37b3fe6e04"
+"texts.worker.redacted_withheld" = "cf5bd3900aae4456"
+"texts.worker.running_timeout" = "b80cbbea99dbb67d"
+"texts.worker.side_effect_uncertain" = "99b6049d4bdf02bb"
+"texts.worker.status" = "239f0acefdd3bb7e"
+"texts.worker.stopped" = "a3ee9454ed117e00"
+"texts.worker.stopped_result" = "f87de4193e751578"
+"texts.worker.version_unavailable" = "9bd7e2f21d6550c5"
