@@ -387,6 +387,55 @@ class ProvisioningPortTest(unittest.TestCase):
         )
 
 
+class ReentryTouchesNoLifecycleColumnTest(unittest.TestCase):
+    """幂等重入不得改写生命周期与权限列——由 `DO UPDATE SET` 的**列表本身**保证。
+
+    这条保证此前只是"那几列没写在语句里"这个事实，没有任何东西会在它被写回去时变红。
+    源码级核对是仓库既有做法（`adapters/postgres_roster_audit` 的只读断言同一形状）。
+    真库那一半（停用后重入不复活）在 `tests/test_identity_postgres_records.py`。
+    """
+
+    # 重入绝不能出现在赋值左侧的列。前两列是准入与启停状态：一次孤儿事件重交接把
+    # `account_state` 写回 `enabled`，等于让建档服务替管理员撤销了一次停用。
+    PROTECTED_COLUMNS = (
+        "account_state",
+        "provisioning_state",
+        "permission_record_id",
+        "permission_version",
+        "permission_checked_at",
+        "workspace_state",
+        "publish_state",
+        "mcp_sync_state",
+        "posix_uid",
+        "erased_at",
+    )
+
+    def _update_clause(self) -> str:
+        import inspect
+
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+
+        source = inspect.getsource(PostgresAppUserStore.record_identity)
+        self.assertIn("DO UPDATE SET", source, "建档语句不再是 upsert，本守卫需要同步修订")
+        return source.split("DO UPDATE SET", 1)[1].split("RETURNING", 1)[0]
+
+    def test_no_lifecycle_or_permission_column_is_assigned_on_conflict(self) -> None:
+        clause = self._update_clause()
+
+        for column in self.PROTECTED_COLUMNS:
+            with self.subTest(column=column):
+                self.assertNotIn(column, clause)
+
+    def test_the_guard_actually_looks_at_the_conflict_branch(self) -> None:
+        """守卫自身的正向锚点：切出来的确实是刷新那一段，不是空串。"""
+
+        clause = self._update_clause()
+
+        self.assertIn("display_name = EXCLUDED.display_name", clause)
+        self.assertIn("employee_no", clause)
+        self.assertIn("updated_at = now()", clause)
+
+
 def _psycopg_available() -> bool:
     import importlib.util
 

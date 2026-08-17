@@ -1146,6 +1146,26 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
             [("mcp_syncing", "rec_matched", 3)],
         )
 
+    def test_reentry_never_revives_a_suspended_account(self) -> None:
+        """停用中的账号被重入建档，不得复活。
+
+        这是 #65 轻审 P2-2 那个孤儿窗口里的真实竞争：一条"已认领、没确认交接"的事件
+        可能在整整一个对账扫描周期之后才被重新交接，而管理员完全可能在这段时间里停用
+        这个账号。重入把 `account_state` 写回 `enabled`，等于让建档服务替管理员撤销了
+        一次停用，而且没有任何人会知道。
+        """
+
+        request = ProvisioningRequest.from_roster_row(self._identity(), self._roster_row())
+        self.users.provision(request)
+        self.execute("UPDATE app_user SET account_state = 'suspended'")
+
+        again = self.users.provision(request)
+
+        self.assertIs(again.outcome, ProvisioningOutcome.ALREADY_PROVISIONED)
+        self.assertTrue(again.provisioned, "重入仍然是「档在」，停用与否由编排层复核")
+        self.assertEqual(self.scalar("SELECT account_state FROM app_user"), "suspended")
+        self.assertEqual(self.users.count(), 1)
+
     def test_the_roster_archive_is_written_verbatim(self) -> None:
         """V-开通-15：写侧存的是花名册原值，不是匹配时刻的小写归一值。"""
 

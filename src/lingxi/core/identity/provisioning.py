@@ -41,8 +41,16 @@ runner 记得区分。
 
 - 不回退 `provisioning_state`：已经推进到发布或同步中的用户不会因为重入被打回 `matching`；
 - 不触碰 `permission_record_id` / `permission_version`：匹配确认前不占位、确认后不被重入抹掉（`V-开通-01`）；
+- 不触碰 `account_state`：**重入不复活被停用的账号**；
 - 会按新快照刷新身份资料与花名册字段（沿用既有 `record_identity` 语义），因为重入时
   runner 手里的资料只会更新、不会更旧。
+
+**`already_provisioned` 不等于「这个人现在还该被开通」。** 收到它之后、继续用户环境
+创建与权限发布之前，runner 必须复核该用户的当前状态（`account_state` 与
+`provisioning_state`）：孤儿事件的重交接窗口可能长达对账扫描的一整个周期，管理员在
+这段时间里停用账号是真实形状（Issue #65 轻审 P2-2 的孤儿窗口）。建档服务只保证
+「档在、且这次重入没有把它写坏」，它既不知道也不判断这个人此刻还该不该继续开通——
+把这条判断留在这里会让写侧悄悄替编排层做准入决定。
 
 ## 花名册字段存的是**花名册原值**，不是匹配用的归一值
 
@@ -132,6 +140,11 @@ def _archive_text(value: object) -> str | None:
     空白与缺失都归一为 `None` 而不是空串：空串会被写进库，而
     `roster_audit.compare_roster` 把「存档为空」读作「没有基线、不比对」，
     两者在日报里是同一个结论，但库里留空串会让「有没有存档过」这件事无法回读。
+
+    与数据库口径**不完全等价**：Python 的 `str.strip()` 剥掉全部 Unicode 空白，是
+    `migrations/008` 里 `BTRIM(x)`（默认只剥半角空格）的**超集**。这个方向是失败
+    关闭的——判空更严只会让写侧更早拒绝、或把一个全角空格存成 `NULL`，不会把数据库
+    认为有值的字段当成空值放行。
     """
 
     if value is None:
@@ -141,7 +154,8 @@ def _archive_text(value: object) -> str | None:
 
 
 def missing_identity_fields(draft: IdentityRecordDraft) -> tuple[str, ...]:
-    """按 `migrations/008` 的空白口径（`NULLIF(BTRIM(x), '')`）列出为空的身份字段名。
+    """按 `migrations/008` 的空白语义（`NULLIF(BTRIM(x), '')`）列出为空的身份字段名。
+    两侧口径的细微差异与它失败关闭的方向见 :func:`_archive_text`。
 
     **这不是那条 CHECK 的替代品**，是它的翻译器：写侧路径照常把语句发给数据库，
     由数据库拒绝；本函数只在拒绝之后把「为什么被拒」翻译成 runner 能分辨的字段名。
