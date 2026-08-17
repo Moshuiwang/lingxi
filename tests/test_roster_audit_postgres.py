@@ -20,6 +20,11 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 from lingxi.apps.scheduler import RosterAuditDuty
 from lingxi.core.identity.roster_audit import DiffKind
+from lingxi.core.identity.roster_snapshot import (
+    DEFAULT_SNAPSHOT_STALE_AFTER,
+    RosterRound,
+    RosterSnapshotStatus,
+)
 
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，花名册审计的真库断言未验证（需真实 PostgreSQL 16）"
 
@@ -53,6 +58,31 @@ class RecordingAudit:
 
     def record(self, action: str, /, **fields: object) -> None:
         self.records.append((action, dict(fields)))
+
+
+class FreshSnapshotSource:
+    """一轮花名册取用的替身：交出注入的行 + 一份刚刚整体替换过的快照状态。
+
+    快照链本身（替换 / 保旧 / 超龄）在 `tests/test_roster_snapshot*.py` 与
+    `tests/test_roster_daily_source.py` 里验；本文件验的是**真库那一侧**——比对集过滤、
+    存档不写回、端到端，因此这里只需要一个"快照可用且新鲜"的稳定前提。
+    """
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def current(self, *, now: datetime) -> RosterRound:
+        return RosterRound(
+            tuple(self._rows),
+            RosterSnapshotStatus(
+                action="replace",
+                read_status="complete",
+                stale_after_seconds=DEFAULT_SNAPSHOT_STALE_AFTER.total_seconds(),
+                captured_at=now,
+                row_count=max(len(self._rows), 1),
+                age_seconds=0.0,
+            ),
+        )
 
 
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
@@ -159,7 +189,7 @@ class RosterAuditPostgresTestCase(unittest.TestCase):
         audit = RecordingAudit()
         duty = RosterAuditDuty(
             baseline_reader=PostgresRosterBaselineReader(self._dsn),
-            roster_reader=lambda: rows,
+            roster_source=FreshSnapshotSource(rows),
             sender=sender,
             audit=audit,
             chat_id="oc_fake_admin_group_for_tests",
@@ -420,19 +450,27 @@ class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
         "转交新人",
         "handover.new@example.com",
     )
-    ARCHIVED_VALUES = (
+    # D2：被报出来的那四个人，存档身份（姓名 + 工号）**必须**出现在正文里——
+    # 不给原值管理员无法准确定位并处理人员变化。
+    REPORTED_IDENTITY_VALUES = (
         "改名者存档姓名",
         "改邮箱者存档姓名",
         "转交者存档姓名",
         "消失者存档姓名",
-        "缺邮箱者存档姓名",
-        "无变化者存档姓名",
         "E1001",
         "E1002",
         "E1003",
         "E1004",
+    )
+    # 没有被报出来的人，一个字段都不该露面。
+    UNREPORTED_IDENTITY_VALUES = (
+        "缺邮箱者存档姓名",
+        "无变化者存档姓名",
         "E1005",
         "E1006",
+    )
+    # 存档邮箱：D2 允许发原值，但本实现刻意不印邮箱（定位靠姓名 + 工号）。
+    ARCHIVED_EMAILS = (
         "changed.name@example.com",
         "changed.email@example.com",
         "handover.old@example.com",
@@ -528,11 +566,22 @@ class SyntheticEndToEndTest(RosterAuditPostgresTestCase):
                 self.assertNotIn(absent, by_user)
                 self.assertNotIn(absent, body)
 
-        # ---- 正文无真实值 ----
-        for value in self.ROSTER_VALUES + self.ARCHIVED_VALUES:
+        # ---- D2 肯定面：被报出来的人给得出存档身份 ----
+        for value in self.REPORTED_IDENTITY_VALUES:
             with self.subTest(value=value):
-                self.assertNotIn(value, body, f"日报正文不得出现资料值：{value}")
+                self.assertIn(value, body, f"日报正文必须给出存档身份：{value}")
+
+        # ---- D2 否定面：花名册当前值、存档邮箱、未被报出的人一个都不出现 ----
+        for value in self.ROSTER_VALUES + self.ARCHIVED_EMAILS + self.UNREPORTED_IDENTITY_VALUES:
+            with self.subTest(value=value):
+                self.assertNotIn(value, body, f"日报正文不得出现该值：{value}")
         self.assertNotIn("→", body)
+
+        # ---- 审计与日志侧没有随日报口径放宽（`V-花名册-33`）----
+        audited = repr(audit.records)
+        for value in self.REPORTED_IDENTITY_VALUES + self.ROSTER_VALUES + self.ARCHIVED_EMAILS:
+            with self.subTest(value=value):
+                self.assertNotIn(value, audited, f"审计记录不得出现资料值：{value}")
 
         # ---- 发送与审计各一次 ----
         self.assertEqual(len(sender.payloads), 1)

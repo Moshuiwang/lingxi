@@ -91,10 +91,9 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.roster_audit",
     "lingxi.core.identity.roster_report",
     "lingxi.adapters.postgres_roster_audit",
-    # 花名册持久快照（#52 的 S-B-02，D2 裁定后的新载体）：替换门槛与保旧告警事实在
-    # core，表读写在 adapters。两者当前**还没有生产调用方**（真实读取接线属 S-B-04 /
-    # S-B-05），因此不进下面 scheduler 进程的运行时闭包——但它们必须随包发布，
-    # 否则接线那天才发现 wheel 里没有这两个模块。
+    # 花名册持久快照（#52 的 S-B-02，D2 裁定后的新载体）：替换门槛、保旧告警事实与
+    # 每日取用编排在 core，表读写在 adapters。S-B-04 起两者都在 scheduler 的运行时
+    # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
     "lingxi.core.identity.roster_snapshot",
     "lingxi.adapters.postgres_roster_snapshot",
     "lingxi.adapters.feishu_group_message",
@@ -229,6 +228,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_roster_bitable",
             "lingxi.adapters.postgres_roster_audit",
+            # 花名册持久快照（#52 的 S-B-02）自 S-B-04 起有了真实调用方：
+            # `build_loop` 在函数内 import 它，与上面两个 adapter 同一条理由。
+            "lingxi.adapters.postgres_roster_snapshot",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
@@ -241,6 +243,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
+            "lingxi.core.identity.roster_snapshot",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             "lingxi.core.conversation",

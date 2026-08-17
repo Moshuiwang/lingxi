@@ -29,15 +29,21 @@
 登记：读取层将来多一个状态时，这里**响亮失败**而不是默默归到"保旧"——把一个没人分类
 过的新状态静默当成"保旧"，等于让快照在无人知晓的情况下停更。
 
-**告警只产出事实，不发送**：接线到告警状态机（``core/alerting.py`` 的 ``AlertingDuty``）
-属 S-B-04 的范围。本模块交付的是可断言的告警事实与一个 ``on_alert`` 注入点，
+**告警只产出事实，不发送**：本模块交付可断言的告警事实与一个 ``on_alert`` 注入点，
 :class:`RosterSnapshotUpdater` 在需要时把它调起来；不注入就只落审计，不静默丢弃。
+S-B-04 把这个注入点接上了 scheduler 的结构化告警日志，而**面向管理员的那一份提醒走
+每日日报**（`V-花名册-47` 的裁定原文就是「按日报告警提醒、不自动删」）——`core/alerting.py`
+的状态机只认心跳、任务滞留与发送连续失败三类信号，快照超龄是一件每日节奏的数据新鲜度
+事实，塞进那三类里会让阈值、去重与恢复计时三套语义同时失真。
+
+**S-B-04 新增的第三段**（:class:`DailyRosterSource`）：把「读一轮 → 判定 → 替换或保旧 →
+交出这一轮用于比对的行」串成日报真正要用的那条链，并结算快照超龄事实。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Protocol, Sequence
 
@@ -283,9 +289,10 @@ class RosterSnapshotUpdater:
     外部调用在注入进来的对象里），因此 scheduler、以及将来任何需要刷新快照的入口，
     都装配同一份编排。
 
-    **本类不注册成定时职责，也不改任何现有职责的行为**：真实花名册读取的凭据自
-    2026-08-09 起未落盘（Issue #52 的 G-READ 判定），接线属 S-B-04 / S-B-05 的范围。
-    这里交付的是可断言的判定与事实产出。
+    **调用方**是 :class:`DailyRosterSource`（S-B-04 起），后者由 ``apps/scheduler`` 的
+    花名册审计日报职责每天驱动一次。真实花名册读取所需的专用主体凭据自 2026-08-09 起
+    未落盘（Issue #52 的 G-READ 判定），因此**当前部署下该职责仍然不注册**——不注册的
+    理由现在是配置缺项并留有审计，而不是装配里写死的 ``None``。
     """
 
     name = "花名册快照"
@@ -333,3 +340,199 @@ class RosterSnapshotUpdater:
         if self._on_alert is not None:
             self._on_alert(decision)
         return decision
+
+
+#: 快照超龄阈值的默认值（`V-花名册-47`）。
+#:
+#: **为什么是 48 小时。** 快照由每日一轮的日报职责刷新，正常情况下每天换一份新的，
+#: 因此「一天没换」几乎总是可以自愈的一次性事件——源头临时读不到、一次发布窗口、
+#: 一次网络抖动，下一轮就好了；为它每天打扰管理员会让这条提醒很快被忽略。**连续两天
+#: 没换新**才说明源头是真的读不到了，而那正是需要人去看配置与权限的时候。
+#:
+#: 下界不能低于 24 小时：日报一天只跑一轮，24 小时以内的阈值会把「今天这一轮还没轮到」
+#: 报成异常。上界也不宜远大于 48 小时：比对基线在无人知晓的情况下持续变旧，恰恰是
+#: 「花名册资料比对」这件事最不该有的失效形态——它会安静地一直报「没有差异」。
+#:
+#: 可由部署覆盖（``LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS``），因为「多久算旧」
+#: 取决于花名册本身的维护节奏，那是部署事实而不是产品规则。
+DEFAULT_SNAPSHOT_STALE_AFTER = timedelta(hours=48)
+
+
+@dataclass(frozen=True)
+class RosterSnapshotStatus:
+    """一轮取用之后，快照本身处于什么状态。**不含任何花名册字段值**（`V-花名册-46`）。
+
+    这个对象有两个消费者，因此它既要能进审计，也要能进日报正文：产品负责人 2026-08-08
+    的 D2 裁定要求日报写明「快照时间与同步状态」，而管理员据以判断「今天这份日报可不可信」
+    的全部依据就在这里——快照多旧、本轮读取成不成功、失败原因是哪一类。
+    """
+
+    # `SnapshotAction` 的字面量：本轮对持久快照做了什么。
+    action: str
+    # `RosterReadStatus` 的字面量：本轮读取的结论。
+    read_status: str
+    # 超龄阈值，秒。放进状态对象而不是让渲染层去问配置：日报要说明「超过多久算旧」，
+    # 而那个数字必须与真正做判定的那个是同一个。
+    stale_after_seconds: float
+    alert: str | None = None
+    failure_code: str | None = None
+    failure_kind: str | None = None
+    # **本轮实际用于比对的那份快照**的读取时间。没有任何可用快照时为 ``None``。
+    captured_at: datetime | None = None
+    row_count: int = 0
+    age_seconds: float | None = None
+
+    @property
+    def available(self) -> bool:
+        """有没有一份可用于比对的快照。
+
+        ``False`` 时**绝不能拿空行去比对**：比对集来自 `app_user`，花名册侧一行都没有
+        会把全体已开通用户报成「移除」（`V-花名册-48`）。
+        """
+
+        return self.captured_at is not None
+
+    @property
+    def refreshed(self) -> bool:
+        """本轮是否真的换上了新快照。"""
+
+        return self.action in (SnapshotAction.INSTALL.value, SnapshotAction.REPLACE.value)
+
+    @property
+    def stale(self) -> bool:
+        """快照是否已经超龄（`V-花名册-47`）。没有快照时为 ``False``——那是更严重的
+        另一类事实（:attr:`available`），把两者混成同一个布尔值会让日报只说得出一句话。"""
+
+        return self.age_seconds is not None and self.age_seconds > self.stale_after_seconds
+
+    @property
+    def needs_attention(self) -> bool:
+        """这一天是否**即使没有任何资料差异也必须发日报**。
+
+        空差异日本来不发（`V-花名册-25`：没有待办却每天发一条「今天没事」，管理群很快
+        会学会忽略它）。但「快照超龄」与「没有快照」这两种情形下，「没有差异」这句话
+        本身就是不可信的——正是这一条让沉默成为最危险的输出。
+        """
+
+        return not self.available or self.stale
+
+    def audit_facts(self) -> dict[str, Any]:
+        """可直接进审计与日志的事实。姓名、工号、邮箱、人员 ID 一个都不在这里。"""
+
+        return {
+            "snapshot_action": self.action,
+            "snapshot_read_status": self.read_status,
+            "snapshot_alert": self.alert,
+            "snapshot_failure_code": self.failure_code,
+            "snapshot_rows": self.row_count,
+            "snapshot_captured_at": self.captured_at.isoformat() if self.captured_at else None,
+            "snapshot_age_seconds": self.age_seconds,
+            "snapshot_stale": self.stale,
+            "snapshot_available": self.available,
+        }
+
+
+@dataclass(frozen=True)
+class RosterRound:
+    """一轮花名册取用的结果：用于比对的行 + 快照状态。
+
+    两者必须一起交出去。只给行，日报就说不清「这些行是今天读到的还是三天前那份」；
+    只给状态，比对就没有输入。
+    """
+
+    rows: tuple[Any, ...]
+    snapshot: RosterSnapshotStatus
+
+
+class DailyRosterSource:
+    """每日一轮的花名册取用：**读一轮 → 更新持久快照 → 交出比对用的行与快照状态**。
+
+    只编排注入的可调用对象，不做 I/O，形状与 :class:`RosterSnapshotUpdater` 一致
+    （真正的读取与读库在注入进来的东西里）。它回答的是一个此前没有归属的问题：
+    **日报到底拿哪一份行去比对**。
+
+    答案分两种，且都不是「本轮读到什么就比什么」：
+
+    - 本轮可以替换（``COMPLETE``）：比对用**本轮读到的行**，快照同时被换成这一份；
+    - 本轮不可替换（空源 / 不完整 / 失败）：比对用**库里那一份上一次成功的快照**，
+      并把保旧原因带进日报（产品负责人 2026-08-07 决定：空源、失败或半轮读取继续
+      保留上一份有效快照）。半轮读到的行一行都拿不到——读取层在 `FAILED` 时把
+      ``rows`` 清空正是为了这一刻。
+
+    **完全没有快照时不比对**（`V-花名册-48`）：库里从未有过快照、而本轮又读不成功时，
+    行集是空的，拿它去比对会把全体已开通用户报成「花名册查无此人」。这里如实交出
+    ``available=False``，由日报侧改发告警。
+
+    ``RosterSnapshotInconsistent``（回读到的元信息与行对不上，一次并发替换恰好落在
+    两条语句之间）**不在这里捕获**：那是一个响亮的、下一轮重试就会消失的信号，
+    由职责层的失败隔离承接（`V-花名册-17`），吞掉它会让「比对用的行少了一大截」
+    表现为一切正常。
+    """
+
+    def __init__(
+        self,
+        *,
+        read_round: Callable[[], Any],
+        updater: RosterSnapshotUpdater,
+        load_snapshot: Callable[[], Any | None],
+        stale_after: timedelta = DEFAULT_SNAPSHOT_STALE_AFTER,
+    ) -> None:
+        if not isinstance(stale_after, timedelta) or stale_after <= timedelta(0):
+            raise ValueError("快照超龄阈值必须是正的时间长度")
+        self._read_round = read_round
+        self._updater = updater
+        self._load_snapshot = load_snapshot
+        self._stale_after = stale_after
+
+    @property
+    def stale_after(self) -> timedelta:
+        return self._stale_after
+
+    def current(self, *, now: datetime) -> RosterRound:
+        """跑一轮读取与快照更新，交出这一轮用于比对的行与快照状态。"""
+
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("本轮读取时间必须带时区")
+        moment = now.astimezone(_UTC)
+
+        outcome = self._read_round()
+        decision = self._updater.apply(outcome, now=moment)
+
+        if decision.should_replace:
+            # 刚写进去的就是本轮读到的那一份，不必再回读一次库：多读一次既慢，
+            # 又给并发替换多开一个可以读到别人那一份的窗口。
+            rows = tuple(getattr(outcome, "rows", ()))
+            return RosterRound(rows, self._status(decision, captured_at=moment, row_count=len(rows), now=moment))
+
+        stored = self._load_snapshot()
+        if stored is None:
+            # 库里一份都没有：`decision.action` 已经是 `NO_SNAPSHOT_YET`，这里也可能是
+            # 「刚刚被并发删掉」。两种情况对日报是同一件事：没有基线，不能比对。
+            return RosterRound((), self._status(decision, captured_at=None, row_count=0, now=moment))
+
+        facts = stored.facts
+        return RosterRound(
+            tuple(stored.rows),
+            self._status(decision, captured_at=facts.captured_at, row_count=facts.row_count, now=moment),
+        )
+
+    def _status(
+        self,
+        decision: SnapshotDecision,
+        *,
+        captured_at: datetime | None,
+        row_count: int,
+        now: datetime,
+    ) -> RosterSnapshotStatus:
+        age = None if captured_at is None else (now - captured_at).total_seconds()
+        return RosterSnapshotStatus(
+            action=decision.action.value,
+            read_status=decision.status,
+            stale_after_seconds=self._stale_after.total_seconds(),
+            alert=decision.alert.value if decision.alert is not None else None,
+            failure_code=decision.failure_code,
+            failure_kind=decision.failure_kind,
+            captured_at=captured_at,
+            row_count=row_count,
+            age_seconds=age,
+        )

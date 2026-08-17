@@ -26,7 +26,6 @@ from lingxi.adapters.feishu_roster_bitable import (
     RosterRecordPage,
     RosterRow,
     normalize_record,
-    read_roster_records,
     read_roster_snapshot,
 )
 
@@ -82,21 +81,6 @@ class _FakePageSource:
         if isinstance(page, Exception):
             raise page
         return page
-
-
-class _FakeRecordPageReader:
-    """legacy `RecordPageReader` 形状的假读取（返回 ``(records, next_page_token)``）。"""
-
-    def __init__(self, pages: list[Any]) -> None:
-        self._pages = list(pages)
-        self.calls: list[str | None] = []
-
-    def list_records(self, page_token: str | None = None) -> Any:
-        self.calls.append(page_token)
-        index = len(self.calls) - 1
-        if index >= len(self._pages):
-            raise AssertionError("分页读取被多读了一页")
-        return self._pages[index]
 
 
 class _RecordingTransport:
@@ -285,18 +269,12 @@ class RosterFailureClassificationTest(unittest.TestCase):
         self.assertEqual(outcome.rows, ())
 
     def test_normalize_record_rejects_malformed_shapes_loudly(self) -> None:
-        # legacy 路径（`read_roster_records`）没有"结算成失败结果对象"这一层，
-        # 坏记录必须以异常出现，而不是一条看不出问题的空行。
+        # 归一化本身必须响亮失败：一条形状不对的记录静默归一成全空行，会被写进快照，
+        # 在比对时表现为一个"资料被清空"的人（PR #208 二级审查 P2-1）。
         for malformed in ("不是对象", {"record_id": "rec-1", "fields": "不是对象"}):
             with self.subTest(malformed=malformed):
                 with self.assertRaises(RosterReadError):
                     normalize_record(malformed)
-
-    def test_legacy_reader_propagates_the_malformed_record_failure(self) -> None:
-        reader = _FakeRecordPageReader([([{"record_id": "rec-1", "fields": 42}], None)])
-
-        with self.assertRaises(RosterReadError):
-            read_roster_records(reader)
 
 
 class RosterIntegrityTest(unittest.TestCase):
@@ -713,19 +691,18 @@ class BitableRosterPagesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._pages(_RecordingTransport([]), access_token=FAKE_TOKEN)
 
-    def test_the_pages_object_still_satisfies_the_existing_record_page_reader(self) -> None:
-        # 既有装配点按 `RecordPageReader` 接线；同一个对象要能直接交给它，
-        # 不必为两条读取路径各接一次线。
-        transport = _RecordingTransport(
-            [
-                _bitable_response([_record()], has_more=True, page_token="page-2"),
-                _bitable_response([_record("fs-u2", record_id="rec-2")]),
-            ]
-        )
+    def test_the_repository_has_exactly_one_roster_reading_entry_point(self) -> None:
+        """S-B-04 消解 PR #208 二级审查 P2-1：legacy `read_roster_records` 已删除。
 
-        rows = read_roster_records(self._pages(transport))
+        两条读取路径并存的代价不是重复代码，而是"总有调用方接到不做保旧判定的那一条"
+        ——那条路径把「花名册真的空了」和「这一轮没读完」压成同一个空元组。
+        """
 
-        self.assertEqual([row.personnel_id for row in rows], [FAKE_PERSONNEL_ID, "fs-u2"])
+        import lingxi.adapters.feishu_roster_bitable as module
+
+        self.assertFalse(hasattr(module, "read_roster_records"))
+        self.assertFalse(hasattr(module, "RecordPageReader"))
+        self.assertFalse(hasattr(BitableRosterPages, "list_records"))
 
     def test_a_full_round_through_the_transport_reaches_a_complete_outcome(self) -> None:
         transport = _RecordingTransport(

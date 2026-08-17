@@ -6,13 +6,18 @@
 
 本模块分两段，都在同一个外部系统（花名册多维表格）上，因此不拆成第二个 adapter：
 
-1. **归一化**（`field_text` / `normalize_record` / `read_roster_records`）：把一页原始
-   记录变成 `RosterRow`。传输由调用方注入（`RecordPageReader`）。
+1. **归一化**（`field_text` / `normalize_record`）：把一条原始记录变成 `RosterRow`。
 2. **分页 reader 与完整性判定**（`BitableRosterPages` / `read_roster_snapshot`，
    Issue [#52](https://github.com/Moshuiwang/lingxi/issues/52)）：按 `page_token` 读完
    整轮，并把「这一轮能不能当作快照」所需的事实结算成 :class:`RosterReadOutcome`。
    **判定「要不要替换快照」不在这里**：门槛与保旧告警在 `core/identity/roster_snapshot.py`，
    持久载体在 `adapters/postgres_roster_snapshot.py`（迁移 `0063_roster_snapshot`）。
+
+**只剩一条读取路径**（S-B-04，消解 PR #208 二级审查 P2-1）：早先那条 legacy
+``read_roster_records``（读完全部分页、只返回行）已随日报接线一并**删除**。它只回答
+「行是什么」，把「花名册真的空了」和「这一轮没读完」压成同一个空元组，而保旧判定要的
+恰恰是这两者的区别；两条路径并存的代价是总有调用方接到不带判定的那一条。
+:func:`read_roster_snapshot` 是唯一入口。
 
 **真实调用未验证（证据等级 L1）**，与 `adapters/feishu_directory.py`、
 `adapters/feishu_group_message.py` 同一姿态：全部断言跑在注入的假传输层上。真实读取
@@ -67,13 +72,6 @@ class RosterRow(NamedTuple):
         可直接组合（终轮 Codex 发现的接口不兼容）。"""
 
         return getattr(self, key, default)
-
-
-class RecordPageReader(Protocol):
-    """按页返回多维表格记录的只读传输。"""
-
-    def list_records(self, page_token: str | None = None) -> tuple[Sequence[Any], str | None]:
-        ...
 
 
 def field_text(value: Any) -> str:
@@ -136,30 +134,6 @@ def normalize_record(record: Any) -> RosterRow:
         employee_no=field_text(fields.get("工号")),
         record_id=field_text(record.get("record_id")),
     )
-
-
-def read_roster_records(reader: RecordPageReader, *, max_pages: int = 1000) -> tuple[RosterRow, ...]:
-    """读完全部分页并归一；不去重、不过滤、不写回多维表格。
-
-    `max_pages` 是防御性上限：`page_token` 若因外部异常一直非空，宁可失败也不空转。
-
-    它只回答「行是什么」，不回答「这一轮能不能信」——**空源在这里与「全员都不在花名册
-    里」不可区分**。需要后者的调用方（快照替换、日报）用 :func:`read_roster_snapshot`。
-
-    记录形状不对时 :func:`normalize_record` 会抛 :class:`RosterReadError` 并原样穿过
-    本函数（PR #208 二级审查 P2-1）：本函数没有"结算成失败结果对象"这一层，调用方
-    看到的就是异常。这是**有意的**——本函数的两个已知调用点都不做保旧判定，静默把坏
-    记录归一成空行会让它们拿到一份看不出问题的行集。
-    """
-
-    rows: list[RosterRow] = []
-    page_token: str | None = None
-    for _ in range(max_pages):
-        records, page_token = reader.list_records(page_token)
-        rows.extend(normalize_record(record) for record in records)
-        if not page_token:
-            return tuple(rows)
-    raise RuntimeError(f"花名册分页读取超过 {max_pages} 页仍未结束，已停止")
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +324,8 @@ class RosterReadOutcome:
 
 
 class RosterRecordPage(NamedTuple):
-    """一页原始记录。比 :class:`RecordPageReader` 多一个 ``total``：完整性判定要拿
-    源头自报的总数与累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。"""
+    """一页原始记录。除了记录与游标，还带一个 ``total``：完整性判定要拿源头自报的
+    总数与累计行数对账，而那个数字在分页响应里，取不到就传 ``None``。"""
 
     records: tuple[Any, ...]
     next_page_token: str | None = None
@@ -489,14 +463,6 @@ class BitableRosterPages:
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             total = None
         return RosterRecordPage(tuple(items), next_page_token, total)
-
-    def list_records(self, page_token: str | None = None) -> tuple[Sequence[Any], str | None]:
-        """兼容 :class:`RecordPageReader`：让本类可以直接交给 :func:`read_roster_records`
-        以及已有的装配点，不必为两条读取路径各接一次线。"""
-
-        page = self.fetch_page(page_token)
-        return page.records, page.next_page_token
-
 
 def _integrity(
     *,
