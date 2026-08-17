@@ -50,6 +50,7 @@ from urllib.parse import quote, urlencode
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError, urllib_transport
 from lingxi.core.permission.publish import ExistingPermissionRow, PermissionTableError
+from lingxi.core.permission.publish_row import readback_text
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,17 @@ def _require_identifier(value: object, label: str) -> str:
 def _matches(value: Any, wanted: str) -> bool:
     """单元格值是否命中给定的键（去空白 + 大小写不敏感）。
 
+    归一走 :func:`lingxi.core.permission.publish_row.readback_text`，与「写入后逐字段
+    读回比对」**同一把尺子**（二级独立审查 P3-2）。此前这里是 ``str(value)``：多维表格
+    的文本列在分段形态下会回来一个 ``[{"text": "a"}, {"text": "b"}]``，``str()`` 得到的
+    是 Python 的 repr，永远匹配不上——而漏命中的后果不是查不到，是**判成"这个人还没有
+    行"于是新建第二行权限**。两处归一分叉早晚会让其中一处出错，因此只保留一份实现。
+
     宽松的方向是**安全**的：多命中一行只会让发布走进 CONFLICT 失败关闭，而漏命中会让
     同一个人被写出第二行权限。
     """
 
-    if not isinstance(value, str):
-        value = "" if value is None else str(value)
-    return bool(wanted) and value.strip().casefold() == wanted.strip().casefold()
+    return bool(wanted) and readback_text(value).strip().casefold() == wanted.strip().casefold()
 
 
 class BitablePermissionTable:

@@ -112,14 +112,26 @@ CREATE TABLE publish_outbox (
     CHECK (status <> 'published' OR published_at IS NOT NULL)
 );
 
--- 认领查询的谓词就是这两条部分索引：按 created_at 取最早的 pending，
--- 并确认该用户没有另一条 publishing 在途（同一用户单飞）。
+-- 认领查询按 created_at 取最早的 pending。
 CREATE INDEX publish_outbox_pending_idx
-    ON publish_outbox (created_at)
+    ON publish_outbox (created_at, id)
     WHERE status = 'pending';
 
-CREATE INDEX publish_outbox_inflight_idx
-    ON publish_outbox (user_id, claimed_at)
+-- 「同一用户单飞」的判据索引：认领候选必须是该用户**最老的非终态意图**，因此要按
+-- (user_id, created_at, id) 找"有没有更早的 pending/publishing 兄弟行"。
+--
+-- 判据不是"有没有 publishing"：READ COMMITTED 下，另一个消费者尚未提交的认领对本
+-- 事务不可见（它读到的仍是提交态的 pending），那条判据会放行同一用户的更新版本，
+-- 两个消费者同时对外发布、谁后写谁生效——用户侧就是"已经收回的权限被静默恢复"。
+-- 覆盖 pending 与 publishing 两态，正是为了让未提交窗口里的 pending 也挡得住。
+CREATE INDEX publish_outbox_active_idx
+    ON publish_outbox (user_id, created_at, id)
+    WHERE status IN ('pending', 'publishing');
+
+-- 滞留回收的扫描键：只按 claimed_at 找卡住的 publishing，不带 user_id 前缀
+-- （回收是全表按时间扫，不是按用户查）。
+CREATE INDEX publish_outbox_reclaim_idx
+    ON publish_outbox (claimed_at)
     WHERE status = 'publishing';
 
 -- 到期擦除的扫描键。不加谓词：已擦除的行也要能被"还没到期的行有多少"这类核对读到，

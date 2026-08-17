@@ -66,12 +66,14 @@ def _attempt(
     version: int = 1,
     record_id: str | None = "rec_1",
     user_id: str = USER_A,
+    attempts: int = 1,
 ) -> PublishAttempt:
     return PublishAttempt(
         outcome=outcome,
         outbox_id=outbox_id,
         user_id=user_id,
         permission_version=version,
+        attempts=attempts,
         external_record_id=record_id,
         mismatch_fields=("email",) if outcome is PublishOutcome.MISMATCH else (),
     )
@@ -280,6 +282,75 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         assert other is not None
         self.assertEqual(other.user_id, USER_B)
 
+    def test_an_uncommitted_claim_still_blocks_the_newer_version(self) -> None:
+        """二级独立审查 P2-1：**未提交的认领**也必须挡住同一用户的更新版本。
+
+        这是原实现真实存在的漏洞窗口：判据写成「有没有 ``publishing``」时，消费者 A
+        认领 v1 的 ``UPDATE`` 尚未提交，它写的 ``publishing`` 对消费者 B 不可见，B 读到
+        的还是 v1 提交态的 ``pending``，于是 B 领走 v2；两个消费者同时对外发布，v1 后写
+        就把已经收回的权限盖了回去。
+
+        这里用**另一条连接里未提交的同一句认领**精确复现那个窗口：v1 的行被锁住且状态
+        在本事务外仍是 ``pending``。改判据为「该用户不存在更早的非终态兄弟行」之后，
+        v2 因为 v1 这条更早的 ``pending`` 而拒领——这正是本用例要钉住的行为。
+        """
+
+        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.record_decision(
+            user_id=USER_A,
+            row=_row(permissions='{"1012":["商务"]}'),
+            reason="x",
+            decided_at=NOW,
+        )
+
+        with connect(self._dsn) as holder:
+            with holder.transaction():
+                with holder.cursor() as cursor:
+                    # 模拟消费者 A 的认领：已经改了行、**还没提交**。
+                    cursor.execute(
+                        "UPDATE publish_outbox SET status = 'publishing', "
+                        "attempts = attempts + 1, claimed_at = now() WHERE id = %s",
+                        (first.outbox_id,),
+                    )
+                    # 消费者 B 走正式认领路径：v1 被锁（SKIP LOCKED 跳过），而 v2 必须
+                    # 被"更早的非终态兄弟行"挡住。拿到 v2 就是那个 bug 回来了。
+                    self.assertIsNone(self.store.claim_next())
+
+        # A 的事务回滚后，v1 回到 pending，照常可被认领。
+        recovered = self.store.claim_next()
+        assert recovered is not None
+        self.assertEqual(recovered.outbox_id, first.outbox_id)
+
+    def test_a_newer_version_waits_until_the_older_one_reaches_a_terminal_state(self) -> None:
+        """已提交路径上的同一条规则：更早的意图没走到终态之前，新版本不被认领。"""
+
+        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        second = self.store.record_decision(
+            user_id=USER_A,
+            row=_row(permissions='{"1012":["商务"]}'),
+            reason="x",
+            decided_at=NOW,
+        )
+        claimed = self.store.claim_next()
+        assert claimed is not None
+        self.assertEqual(claimed.outbox_id, first.outbox_id)
+        self.assertIsNone(self.store.claim_next())
+
+        # 回收到 pending 也仍然挡着：非终态就算数，不是只有 publishing 才算。
+        self.store.reclaim_stale(older_than=timedelta(microseconds=1))
+        again = self.store.claim_next()
+        assert again is not None
+        self.assertEqual(again.outbox_id, first.outbox_id)
+        self.assertIsNone(self.store.claim_next())
+
+        # 走到终态之后，v2 才成为该用户最老的非终态意图。
+        self.store.complete(
+            _attempt(first.outbox_id or "", attempts=again.attempts), status=STATUS_PUBLISHED
+        )
+        promoted = self.store.claim_next()
+        assert promoted is not None
+        self.assertEqual(promoted.outbox_id, second.outbox_id)
+
     def test_claim_marks_publishing_and_counts_attempts(self) -> None:
         decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
         self.store.claim_next()
@@ -329,6 +400,34 @@ class CompleteTest(PermissionPublishPostgresTestCase):
         stored = self.store.load(outbox_id)
         assert stored is not None
         self.assertEqual(stored.status, "pending")
+
+    def test_a_stale_completer_cannot_overwrite_the_new_claimer(self) -> None:
+        """二级独立审查 P3-1：记账绑定到**本次认领**（``attempts``），不只看状态。
+
+        只判 ``status='publishing'`` 时的错法：旧认领者迟到的记账会命中**新认领者**
+        正在进行的那一行，把它改写成 ``published``；而新认领者随后的记账反而扑空，
+        合法的那一方被报成 :class:`PublishClaimLost`。加上 ``attempts`` 守卫之后，
+        两边各自归位——旧的失败，新的成功。
+        """
+
+        outbox_id = self._claimed()  # 旧认领者：attempts=1
+        self.store.reclaim_stale(older_than=timedelta(microseconds=1))
+        again = self.store.claim_next()  # 新认领者：attempts=2
+        assert again is not None
+        self.assertEqual(again.attempts, 2)
+
+        with self.assertRaises(PublishClaimLost):
+            self.store.complete(_attempt(outbox_id, attempts=1), status=STATUS_PUBLISHED)
+        stale = self.store.load(outbox_id)
+        assert stale is not None
+        # 新认领者仍在进行中，没有被旧记账改写。
+        self.assertEqual(stale.status, "publishing")
+        self.assertIsNone(stale.published_at)
+
+        self.store.complete(_attempt(outbox_id, attempts=2), status=STATUS_PUBLISHED)
+        stored = self.store.load(outbox_id)
+        assert stored is not None
+        self.assertEqual(stored.status, "published")
 
     def test_reclaim_puts_stale_publishing_back(self) -> None:
         outbox_id = self._claimed()

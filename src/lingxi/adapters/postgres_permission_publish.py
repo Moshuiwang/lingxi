@@ -259,9 +259,21 @@ class PostgresPermissionPublishStore:
 
         - ``FOR UPDATE SKIP LOCKED``：并发消费者各取各的，既不重复也不互相阻塞
           （同 ``postgres_conversation.claim_tasks`` 的既有形态）；
-        - ``NOT EXISTS (... status = 'publishing')``：**同一用户单飞**。少了它，同一
-          用户的 v1 与 v2 会被两个消费者同时拿走，v1 的外部写入落后到 v2 之后就把旧
-          权限盖了回去——而外部表格没有版本号，谁也发现不了。
+        - **该用户不存在更早的非终态兄弟行**（``pending`` 或 ``publishing``）：
+          这就是「同一用户单飞」。少了它，同一用户的 v1 与 v2 会被两个消费者同时拿走，
+          v1 的外部写入落后到 v2 之后就把旧权限盖了回去——而外部表格没有版本号，
+          谁也发现不了；用户侧表现为**已经收回的权限被静默恢复**。
+
+        **为什么判据是「更早的非终态兄弟行」而不是「有没有 ``publishing``」**（二级
+        独立审查 P2-1）：后者在 ``READ COMMITTED`` 下有一个真实的漏洞窗口——消费者 A
+        认领 v1 的 ``UPDATE`` 尚未提交时，它写的 ``publishing`` 对消费者 B **不可见**，
+        B 读到的仍是 v1 提交态的 ``pending``，于是 ``NOT EXISTS (status='publishing')``
+        成立，B 领走同一用户的 v2。两个消费者同时对外发布，谁后写谁生效。
+        改成「更早的非终态兄弟行」之后，A 未提交期间 v1 在**任何**快照里都还是
+        ``pending``，正好落进判据，B 因此拒领 v2；A 提交后 v1 变 ``publishing``，
+        仍是非终态、仍然挡着。只有 v1 走到终态（``published``/``failed``/
+        ``superseded``）之后，v2 才成为该用户最老的非终态意图。次序用
+        ``(created_at, id)`` 行比较，与下面的 ``ORDER BY`` 同一把尺子。
 
         一并取回该用户**当前**的权限版本，让「旧版本不覆盖新版本」成为纯判定
         （见 ``core/permission/publish.publish_claim``）。
@@ -283,7 +295,8 @@ class PostgresPermissionPublishStore:
                                       SELECT 1
                                         FROM publish_outbox b
                                        WHERE b.user_id = c.user_id
-                                         AND b.status = 'publishing'
+                                         AND b.status IN ('pending', 'publishing')
+                                         AND (b.created_at, b.id) < (c.created_at, c.id)
                                     )
                               ORDER BY c.created_at, c.id
                               LIMIT 1
@@ -313,9 +326,16 @@ class PostgresPermissionPublishStore:
     def complete(self, attempt: PublishAttempt, *, status: str) -> None:
         """把一次尝试的结果记回意图行。
 
-        ``WHERE status = 'publishing'`` 是防线而不是装饰：一条已经被
-        :meth:`reclaim_stale` 放回 ``pending``、甚至已被别人重新认领的意图，不能被这次
-        迟到的记账改写成 ``published``。命中不到就抛 :class:`PublishClaimLost`。
+        ``WHERE status = 'publishing' AND attempts = …`` 是防线而不是装饰：它把这次
+        记账**绑定到本次认领**。
+
+        只判 ``status = 'publishing'`` 不够（二级独立审查 P3-1）：一条被
+        :meth:`reclaim_stale` 放回 ``pending``、又被**另一个**消费者重新认领的意图，
+        此刻状态恰好也是 ``publishing``——旧认领者迟到的记账会命中它，把新认领者正在
+        进行的那一次改写成 ``published``；而新认领者随后的记账反而扑空，被报成
+        :class:`PublishClaimLost`，合法的那一方成了报警对象。``attempts`` 在每次认领时
+        自增，因此它是「哪一次认领」的天然版本号：旧认领者带的是旧值，命中不到，
+        如实拿到 :class:`PublishClaimLost`；新认领者带的是新值，正常记账。
         """
 
         detail = _error_detail(attempt)
@@ -327,13 +347,16 @@ class PostgresPermissionPublishStore:
                           last_error = %(detail)s,
                           external_record_id = COALESCE(%(record_id)s, external_record_id),
                           published_at = CASE WHEN %(status)s = 'published' THEN now() ELSE NULL END
-                    WHERE id = %(id)s AND status = 'publishing'""",
+                    WHERE id = %(id)s
+                      AND status = 'publishing'
+                      AND attempts = %(attempts)s""",
                 {
                     "status": status,
                     "outcome": attempt.outcome.value,
                     "detail": detail,
                     "record_id": attempt.external_record_id,
                     "id": attempt.outbox_id,
+                    "attempts": attempt.attempts,
                 },
             )
             if cursor.rowcount != 1:

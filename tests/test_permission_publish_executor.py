@@ -473,6 +473,23 @@ class ExecutorTest(unittest.TestCase):
         self.assertNotIn(FAKE_EMAIL, rendered)
         self.assertNotIn(FAKE_NAME, rendered)
 
+    def test_the_claim_identity_reaches_the_bookkeeping_unchanged(self) -> None:
+        """记账要能绑定到**本次认领**，前提是认领标识被如实带下去（P3-1 的非 SQL 那半）。
+
+        ``attempts`` 在每次认领时自增，是"哪一次认领"的天然版本号；store 的
+        ``complete`` 用它做守卫（真库用例
+        `test_a_stale_completer_cannot_overwrite_the_new_claimer`）。这里钉住的是它在
+        编排层不被改写或写死——一旦被写死，那条守卫就永远比对一个假的次数。
+        """
+
+        store = FakeStore([_claim(attempts=3)])
+        executor = PermissionPublishExecutor(
+            store=store, transport=FakeTable(), audit=RecordingAudit()
+        )
+        (attempt,) = executor.run_once()
+        self.assertEqual(attempt.attempts, 3)
+        self.assertEqual(store.completed[0][0].attempts, 3)
+
     def test_limit_bounds_one_round(self) -> None:
         store = FakeStore([_claim(), _claim(), _claim()])
         executor = PermissionPublishExecutor(

@@ -115,6 +115,24 @@ class FindRowsTest(unittest.TestCase):
         self.assertTrue(rows[0].matches_key(FAKE_EMAIL))
         self.assertFalse(rows[1].matches_key(FAKE_EMAIL))
 
+    def test_segmented_cell_value_still_matches(self) -> None:
+        """二级独立审查 P3-2：文本列的**分段形态**必须能命中。
+
+        多维表格的文本列可能回来一个 `[{"text": …}, …]`；按 `str(value)` 比较会拿到
+        Python 的 repr，永远匹配不上——而漏命中的后果不是查不到，是判成"这个人还没有
+        行"于是**新建第二行权限**。归一必须与逐字段读回比对同一把尺子。
+        """
+
+        segmented = [
+            {"type": "text", "text": "jiaming.jia@"},
+            {"type": "text", "text": "example.invalid"},
+        ]
+        table, _ = _table([_page([{"record_id": "rec_1", "fields": {"record_key": segmented, "email": ""}}])])
+        rows = table.find_rows(record_key=FAKE_EMAIL, email=FAKE_EMAIL)
+        self.assertEqual([row.record_id for row in rows], ["rec_1"])
+        # 命中之后仍按同一把尺子判定"是不是我们这个键"，因此走的是更新而不是冲突。
+        self.assertTrue(rows[0].matches_key(FAKE_EMAIL))
+
     def test_match_is_case_insensitive(self) -> None:
         table, _ = _table(
             [_page([{"record_id": "rec_1", "fields": {"record_key": FAKE_EMAIL.upper(), "email": ""}}])]
