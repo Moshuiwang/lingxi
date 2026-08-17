@@ -388,9 +388,12 @@ class WorkerService:
             except asyncio.CancelledError:
                 pass
 
-        stop_requested = stop_event.is_set() or self._queue.stop_requested(
-            task_id=claimed.task_id, worker_id=self._config.worker_id
-        )
+        # 这里刻意**不再**回读队列侧的 stop 标志（此前是
+        # `stop_requested = stop_event.is_set() or self._queue.stop_requested(...)`）：
+        # 终态只由这一轮实际发生的事实决定，见下方 `stop_is_the_outcome` 的说明。
+        # 留着它就是留一个没人用的每回合额外查询和一个会诱使后来者再次「用 stop
+        # 覆盖终态」的现成变量。停止在途回合仍由 `_monitor` 置位 `stop_event`
+        # 驱动执行层中断，那条路径没有改动。
         turn = report.get("turn") or {}
         failure = report.get("failure") or {}
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
@@ -407,7 +410,39 @@ class WorkerService:
         # 改写成 redacted_withheld——运维丢失真实失败终态，验收拿到假阳性证据。
         deliverable = bool(turn.get("closed")) and not failure
 
-        if stop_requested or failure_code == "interrupted":
+        # 终态优先级（Issue #195）：真中断 → 其他失败 → withheld → 成功。
+        # 此前第一分支是 `stop_requested or failure_code == "interrupted"`，
+        # 让一次**并发到达**的 stop 压过所有已经发生的事实：
+        #   1. 回合已因 `turn_timeout`/`drain_timeout`/`session_failed` 失败，
+        #      终态被改写成 `stopped`，残余正文还会经 `worker.stopped_result`
+        #      交付——真实失败原因丢失，与本文件「失败终态保留真实失败原因」
+        #      的既有约定（#186 F1）直接冲突；
+        #   2. 回合已经 `closed=True` 出结果，晚到的 stop 把成功降级成
+        #      `stopped`，只有成功分支才写的 `session_id` 一并丢失，用户拿不到
+        #      已经产出的结果、也无法在会话内追问——踩「重启与重试不得造成
+        #      用户结果丢失」这条红线。
+        # 因此 `stopped` 只认执行层给出的**真中断**：`interrupted` 是
+        # `adapters/claude_agent_session.py` 观测到本地 `stop_event` 已置位、
+        # 调用过 `client.interrupt()` 之后才抛出的 `AgentSessionInterrupted`
+        # （`turn.py` 映射），它是这条链路上唯一带因果的「这一轮真的被 stop
+        # 打断了」信号。队列侧的 `stop_requested` 只说明「某一刻有人请求过停止」，
+        # 不说明这一轮的结果由它决定，因此**不参与**终态选择。
+        #
+        # 尤其不能用「没有失败码」反推成 stop（codex 一级独立审查 P1-1）：
+        # `closed=False` 本身就是失败事实，`failure_code is None` 只是没人给它
+        # 起名字（屏障失效 `gate_bypassed`、failure 映射缺 `code` 都是这种形状）。
+        # 也不能把 `cancelled` 当成 stop 的别名（同审查 P1-2）：它来自
+        # `turn.py/_sdk_termination_failure` 对 SDK 自报的
+        # `aborted_streaming`/`aborted_tools`，与本地 `stop_event` 之间没有任何
+        # 因果绑定，SDK 完全可能在没人 stop 的时候自行 abort——认它就等于让一次
+        # 晚到的 stop 掩盖真实的 SDK 终止失败。
+        #
+        # 注意开工前就带着 stop_requested 的任务在 `_process_task` 开头就已收口
+        # 成 `stopped`，根本不会走到这里；这里处理的只有「执行途中 stop 与回合
+        # 终点赛跑」这一种情况。
+        stop_is_the_outcome = failure_code == "interrupted"
+
+        if stop_is_the_outcome:
             content = (
                 self._catalog.text("worker.stopped_result", result=final_text)
                 if final_text
@@ -422,7 +457,21 @@ class WorkerService:
                 failure_code=failure_code,
                 output_safety=output_safety,
             )
-        elif deliverable and withheld:
+        elif not deliverable:
+            error_kind, content = self._failure_content(failure_code)
+            terminal_kind = (
+                TerminalKind.TIMEOUT.value if failure_code == "turn_timeout" else TerminalKind.FAILED.value
+            )
+            self._finish_terminal(
+                claimed,
+                terminal_kind=terminal_kind,
+                error_kind=error_kind,
+                content=content,
+                elapsed_seconds=elapsed_seconds,
+                failure_code=failure_code,
+                output_safety=output_safety,
+            )
+        elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
             # succeeded——用户没有拿到结果，必须走独立、可查询的 redacted_withheld
             # 终态（status 沿用既有取值域，用 error_kind 承载可查询原因）。
@@ -435,7 +484,10 @@ class WorkerService:
                 failure_code=failure_code,
                 output_safety=output_safety,
             )
-        elif deliverable:
+        else:
+            # 走到这里必然 `deliverable and not withheld`：回合已收口、有结果、
+            # 没有失败。即使 stop 晚到，这份已经产出的结果照常交付，
+            # `session_id` 照常持久化（Issue #195）。
             self._finish_terminal(
                 claimed,
                 terminal_kind=TerminalKind.SUCCESS.value,
@@ -443,20 +495,6 @@ class WorkerService:
                 content=RenderedContent(key="worker.result", version=self._catalog.version, text=final_text),
                 elapsed_seconds=elapsed_seconds,
                 session_id=turn.get("session_id") if isinstance(turn, Mapping) else None,
-                failure_code=failure_code,
-                output_safety=output_safety,
-            )
-        else:
-            error_kind, content = self._failure_content(failure_code)
-            terminal_kind = (
-                TerminalKind.TIMEOUT.value if failure_code == "turn_timeout" else TerminalKind.FAILED.value
-            )
-            self._finish_terminal(
-                claimed,
-                terminal_kind=terminal_kind,
-                error_kind=error_kind,
-                content=content,
-                elapsed_seconds=elapsed_seconds,
                 failure_code=failure_code,
                 output_safety=output_safety,
             )
