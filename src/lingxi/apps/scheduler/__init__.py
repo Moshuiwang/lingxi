@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**四个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**五个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -20,6 +20,15 @@
    **当前部署下第四个职责仍然不注册**，但理由已经从「装配里写死 ``None``」变成
    「配置缺项」：真实读取所需的专用主体凭据自 2026-08-09 起未落盘（Issue #52 的
    G-READ 判定），令牌供给因此还没有安全的构造方式，登记为 R3。
+5. **每日权限重算**（:class:`~lingxi.apps.scheduler.permission_refresh.
+   PermissionRefreshDuty`）——每天（UTC 日界）跑一轮：花名册快照必须是今天取的
+   → 读当前有效银河批次 → 逐个已开通用户重算权限并排发布意图（Issue #156 的
+   S-C-03a）。第五个职责同样是**条件注册**的：缺 MCP 令牌主密钥就不注册，并留下
+   **恰一条**指名原因的审计。
+
+   它排在花名册审计日报**之后**，而「先花名册、再银河重算」（`V-权限-07`）不只靠
+   这个位置：职责自己还有一条数据判据——花名册快照的 ``captured_at`` 不是今天就整轮
+   不跑。位置只保证同一轮里的先后，判据才保证"用的是今天的花名册"。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -71,6 +80,11 @@ from lingxi.core.identity.roster_snapshot import (
     RosterRound,
     RosterSnapshotUpdater,
     SnapshotDecision,
+)
+from lingxi.apps.scheduler.permission_refresh import (
+    PERMISSION_REFRESH_REASON,
+    PermissionRefreshDuty,
+    PermissionRefreshReport,
 )
 from lingxi.core.alerting import (
     AlertDispatcher,
@@ -130,6 +144,10 @@ class SchedulerConfig:
     # 快照超龄阈值。默认 48 小时，理由写在
     # :data:`lingxi.core.identity.roster_snapshot.DEFAULT_SNAPSHOT_STALE_AFTER`。
     roster_snapshot_stale_after: timedelta = DEFAULT_SNAPSHOT_STALE_AFTER
+    # MCP 令牌主密钥（base64 的 32 字节）。**可选**，与群 ID 同一姿态：缺了只是不注册
+    # 每日权限重算职责，不让整个 scheduler 起不来；配了但不是合法主密钥则**快速失败**
+    # （错配不是未配）。它是凭据，因此不进 ``repr``（`_Secret`）。
+    mcp_token_encrypt_key: str | None = field(default=None, repr=False)
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -146,6 +164,7 @@ class SchedulerConfig:
         "LINGXI_ROSTER_BITABLE_APP_TOKEN",
         "LINGXI_ROSTER_BITABLE_TABLE_ID",
         "LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS",
+        "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -214,6 +233,18 @@ class SchedulerConfig:
         else:
             roster_snapshot_stale_after = DEFAULT_SNAPSHOT_STALE_AFTER
 
+        raw_token_key = (source.get("LINGXI_MCP_TOKEN_ENCRYPT_KEY") or "").strip()
+        if raw_token_key:
+            from lingxi.adapters.mcp_token_cipher import load_master_key
+
+            # 只为**校验形状**（base64 的 32 字节），解出来的字节立刻丢弃：配置对象里
+            # 存的仍是原始字符串，真正的加解密对象在装配那一步才构造。校验函数不回显
+            # 收到的值。错配在这里快速失败，而不是等到某一轮重算才炸。
+            load_master_key(raw_token_key)
+            mcp_token_encrypt_key: str | None = _Secret(raw_token_key)
+        else:
+            mcp_token_encrypt_key = None
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -246,6 +277,7 @@ class SchedulerConfig:
             roster_app_token=optional_identifier("LINGXI_ROSTER_BITABLE_APP_TOKEN"),
             roster_table_id=optional_identifier("LINGXI_ROSTER_BITABLE_TABLE_ID"),
             roster_snapshot_stale_after=roster_snapshot_stale_after,
+            mcp_token_encrypt_key=mcp_token_encrypt_key,
         )
 
 
@@ -928,6 +960,94 @@ def _build_roster_audit_duty(
     )
 
 
+def _build_permission_refresh_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> PermissionRefreshDuty | None:
+    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
+    审计恰一条、其余职责照常运行）。前置只有两个，逐个说明为什么它是真前置：
+
+    1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）。重算要读该用户**已有**的
+       令牌密文，而唯一的读取口
+       :class:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 只接受已经校验
+       过主密钥的加解密对象（它同时承载解密路径，构造时就要求密钥）。**没有它就没有令牌
+       读取口**，而"读不到"与"这个人没有令牌"在下游是同一个 ``None``——那会让每个需要
+       新建发布行的人都以 ``missing_token_cipher`` 失败关闭，表现成"接线了但一直失败"，
+       正是 R3 那条注释要避免的伪装。因此这里显式不注册并留痕。
+
+       **本职责一次都不解密、也不签发**：密钥在这里只用于构造那个读取口
+       （见 :mod:`lingxi.apps.scheduler.permission_refresh` 的模块文档）。
+    2. **角色职能映射配置**。它随包发布（``lingxi/config/galaxy_role_function_map.toml``）。
+       读不出来时**不能**退化成空映射——那会让所有角色变成"未映射"，于是全员被算成无可用
+       权限，是一种看起来正常的失败（``role_function_map_file`` 的模块文档同一条理由）。
+
+    数据库连接串是必需配置，进程起得来就一定有，因此它不构成一个能变红的前置判定；
+    职责真正的运行前置（花名册今天更新过、银河有当前有效批次）是**数据**而不是配置，
+    由 ``run_once`` 每轮重新判定。
+    """
+
+    if not config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV
+        )
+        return None
+
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+    from lingxi.adapters.role_function_map_file import load_role_function_map
+
+    try:
+        role_function_map = load_role_function_map()
+    except (OSError, ValueError) as error:
+        # 只记异常类型：配置解析失败的正文可能带上文件内容片段。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="role_function_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error(
+            "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
+        )
+        return None
+
+    return PermissionRefreshDuty(
+        baseline_reader=PostgresRosterBaselineReader(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        roster_snapshot=PostgresRosterSnapshotStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        galaxy=PostgresGalaxySnapshotReader(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        decisions=PostgresPermissionPublishStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        token_ciphers=PostgresMcpTokenStore(
+            config.postgres_dsn,
+            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+            timeouts=config.postgres_timeouts,
+        ),
+        role_function_map=role_function_map,
+        audit=audit,
+        stop=stop,
+    )
+
+
 def build_loop(
     config: SchedulerConfig,
     *,
@@ -940,8 +1060,11 @@ def build_loop(
 
     职责顺序有意为之：凭据轮换在前。它处理的是一次性有效、有硬期限的凭据，
     而两类清理晚一轮都没有任何后果——到期行/空闲会话下一轮照清，到期时间不会
-    因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报
-    排在最后：它一天只做一次事，晚一轮毫无影响。
+    因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报与每日
+    权限重算排在两类清理之后：它们一天只做一次事，晚一轮毫无影响；而这两个之间的先后
+    **不是随意的**——权限重算要用今天那份花名册快照，而换快照的是审计日报那一轮
+    （`V-权限-07`）。告警职责注册在**最后**（基线既有形状）：它汇总本轮观察到的信号，
+    排在被观察者后面才看得到这一轮的事实。
 
     ``roster_access_token`` 是花名册读取所用的**短期令牌供给**（返回已就绪令牌的可调用
     对象）。它是整条花名册链上唯一一个还没有安全实现的部件，因此单独留作注入点，而不是
@@ -997,6 +1120,12 @@ def build_loop(
     )
     if roster_audit is not None:
         duties.append(roster_audit)
+    # 每日权限重算排在花名册审计**之后**：同一轮里花名册快照先被换成今天的那一份，
+    # 重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。
+    # 位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
+    permission_refresh = _build_permission_refresh_duty(config, stop=stop, audit=sink)
+    if permission_refresh is not None:
+        duties.append(permission_refresh)
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:
