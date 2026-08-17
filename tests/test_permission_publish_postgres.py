@@ -267,8 +267,8 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         third = self.store.claim_next()
         self.assertEqual(third.created_record_id, "rec_8")
 
-    def test_provenance_is_never_rewritten_by_later_attempts(self) -> None:
-        """出身写定即不变：后续的更新尝试不得把它挪到别的行上。"""
+    def test_an_update_never_moves_the_provenance(self) -> None:
+        """更新尝试不得把出身挪到别的行上——它传的是 ``None``，只能保持不变。"""
 
         decision = self.store.record_decision(
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
@@ -286,6 +286,30 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
             status="pending",
         )
         self.assertEqual(self.store.claim_next().created_record_id, "rec_1")
+
+    def test_a_second_create_moves_the_provenance_to_the_live_row(self) -> None:
+        """重复创建时出身取**最近一次**，不是停在第一次。
+
+        能走到第二次 ``create`` 说明上一行已经查不到了。出身若停在那个失效的标识上，
+        "我们建的行密文被改写"这道检查就永远命不中当前这一行——保护静默失效。
+        """
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_1",
+                     action="create"),
+            status="pending",
+        )
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id, outcome=PublishOutcome.MISMATCH, record_id="rec_2",
+                     action="create", attempts=2),
+            status="pending",
+        )
+        self.assertEqual(self.store.claim_next().created_record_id, "rec_2")
 
     def test_an_uncertain_create_without_an_id_claims_no_provenance(self) -> None:
         """创建结果不明（没拿到 ID）时不认领出身：重试按普通路径收敛。"""

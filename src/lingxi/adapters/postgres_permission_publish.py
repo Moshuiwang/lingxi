@@ -370,8 +370,14 @@ class PostgresPermissionPublishStore:
         - ``external_record_id``：**审计**——上一次尝试操作的是哪一行。任何尝试都会写，
           包括既有行更新失败（``mismatch``/``uncertain``）。S-C-01 的既有语义，不变。
         - ``created_record_id``：**出身**——这条意图**自己建过**的那一行。只有
-          ``action == 'create'`` **且真的拿到了记录标识**时才写，写进去之后也不再被
-          后续尝试改写（``COALESCE`` 只补空）。判定层拿它回答"这一行是不是我们建的"。
+          ``action == 'create'`` **且真的拿到了记录标识**时才写；更新尝试传 ``None``，
+          因此 ``COALESCE(新值, 旧值)`` 对它是"保持不变"。判定层拿它回答"这一行是不是
+          我们建的"。
+
+          **重复创建时取最近一次**（而不是保留第一次）：能走到第二次 ``create`` 说明
+          上一行已经查不到了，出身若停在那个失效的标识上，"我们建的行密文被改写"这道
+          检查就永远命不中当前这一行——保护静默失效。取最近一次则让检查作用在真正活着
+          的那一行上，且不会产生假阳性：条件本来就是"这一行是我们建的且密文不是我们的"。
 
         混用会造出一个真实的回归：既有 26 行只要有一次更新读回不明，行 ID 就进了
         ``external_record_id``，重试时"这一行是我们建的"成立、而它们的旧密文当然不等于
@@ -390,7 +396,7 @@ class PostgresPermissionPublishStore:
                           last_outcome = %(outcome)s,
                           last_error = %(detail)s,
                           external_record_id = COALESCE(%(record_id)s, external_record_id),
-                          created_record_id = COALESCE(created_record_id, %(created_id)s),
+                          created_record_id = COALESCE(%(created_id)s, created_record_id),
                           published_at = CASE WHEN %(status)s = 'published' THEN now() ELSE NULL END
                     WHERE id = %(id)s
                       AND status = 'publishing'
