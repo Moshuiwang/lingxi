@@ -218,6 +218,44 @@ class DispatcherTest(unittest.TestCase):
         )
         self.assertEqual(self.waits, [0.2])
 
+    def test_the_backoff_progresses_and_then_repeats_the_last_interval(self) -> None:
+        """退避是**递进**的，且序列比重试次数短时重复最后一个间隔。
+
+        没有这条，一个"每次都等 0.2 秒"或"第三次干脆不等"的实现照样绿。
+        """
+
+        sender, audit = FakeSender(failures=99), FakeAudit()
+        dispatcher = self._dispatcher(sender, audit, max_attempts=5)
+
+        dispatcher.notify(
+            user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED
+        )
+
+        self.assertEqual(self.waits, [0.2, 1.0, 1.0, 1.0])
+
+    def test_an_empty_backoff_sequence_never_waits(self) -> None:
+        sender = FakeSender(failures=99)
+        dispatcher = self._dispatcher(sender, backoff_seconds=())
+
+        dispatcher.notify(
+            user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED
+        )
+
+        self.assertEqual(self.waits, [])
+        self.assertEqual(len(sender.calls), DEFAULT_NOTICE_ATTEMPTS)
+
+    def test_a_long_adapter_error_code_is_truncated(self) -> None:
+        """错误码是**码**不是消息：超长取值截断到 200 字符，不让它一路进审计。"""
+
+        sender = FakeSender(failures=99, error=_CodedError("x" * 500))
+        dispatcher = self._dispatcher(sender)
+
+        result = dispatcher.notify(
+            user_id=USER, open_id=OPEN_ID, permission_version=3, permissions=GRANTED
+        )
+
+        self.assertEqual(len(result.error_code or ""), 200)
+
     def test_the_retry_count_is_bounded(self) -> None:
         """否定断言：**重试有上限**，不会无限重试下去。"""
 

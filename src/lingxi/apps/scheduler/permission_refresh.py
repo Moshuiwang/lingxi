@@ -34,12 +34,19 @@
 
 本职责在它之上还有**两条边界**，都是刻意的：
 
-1. **只有"我们真的发布成功过"的用户才发撤权更新**（判据
+1. **只有在发布链上留下过足迹的用户才发撤权更新**（判据
    :meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
-   has_published_intent`）。从来没有过发布行的人**照旧跳过**：为他新建一行空权限没有
-   意义——问数 MCP 对查无此人本来就默认拒绝——而新建还需要一份令牌密文，等于替"存量
-   用户令牌归属"那个待裁定的产品结做了决定。既有 26 行那些旧系统写的人也落在这一路：
-   硬切之前他们的撤权由旧系统负责（同一条裁定的时效边界）。审计原因分类
+   has_publish_footprint`：发布成功过，**或**当前还有 ``pending``/``publishing`` 的意图
+   在途）。"在途也算"这一半是二级审查 N7 抓到的时间线要求的：昨天排的授权意图还堵在
+   ``pending``、今天这个人被撤权时若跳过，等发布面消费积压时**已经被收回的范围**会被
+   写进外部表并触发一条"范围已更新"通知；把它算进来之后，撤权决定推进版本，旧意图被
+   认领时判 ``SUPERSEDED``（一次外部调用都不发），撤权意图自身在外部无行时以
+   ``missing_token_cipher`` 失败关闭——两条路的方向都安全。
+
+   **在发布链上一点足迹都没有的人照旧跳过**：为他新建一行空权限没有意义——问数 MCP 对
+   查无此人本来就默认拒绝——而新建还需要一份令牌密文，等于替"存量用户令牌归属"那个待
+   裁定的产品结做了决定。既有 26 行那些旧系统写的人也落在这一路：硬切之前他们的撤权由
+   旧系统负责（同一条裁定的时效边界）。审计原因分类
    :data:`SKIP_NO_PUBLISHED_ROW` 让这一路可分辨。
 2. **只有聚合层明确判定"无可用权限"才算撤权**（``no_galaxy_roles`` /
    ``no_supported_function`` / ``no_company_scope``）。**匹配阶段的失败仍然只跳过**
@@ -204,16 +211,16 @@ class _TokenCipherReader(Protocol):
 
 
 class _PublishHistory(Protocol):
-    """「这个人有没有过一条发布成功的意图」的只读口
+    """「这个人在发布链上有没有留下过足迹」的只读口
     （:meth:`~lingxi.adapters.postgres_permission_publish.
-    PostgresPermissionPublishStore.has_published_intent`）。
+    PostgresPermissionPublishStore.has_publish_footprint`）。
 
     单独声明成一个只有一个方法的协议，理由与 :class:`_TokenCipherReader` 相同：
     撤权那一路只需要回答"有没有"，把整个发布 outbox 的写侧摆在这里，等于让"顺手改一下
     那条意图"在类型上变得可写。装配时传进来的确实是同一个存储对象。
     """
 
-    def has_published_intent(self, user_id: str) -> bool: ...
+    def has_publish_footprint(self, user_id: str) -> bool: ...
 
 
 class _Decision(Protocol):
@@ -569,8 +576,9 @@ class PermissionRefreshDuty:
         1. **存档缺邮箱或姓名** → 跳过。撤权行的 ``record_key``/``email``/``name``
            三列同样来自存档身份，缺了就没有"这一行是谁的"的答案。这一步在查库之前，
            因为它不需要查库。
-        2. **从来没有过发布成功的意图** → 跳过（:data:`SKIP_NO_PUBLISHED_ROW`）。
-           理由见模块文档「撤权」一节：不为一个没有发布行的人新建一行空权限。
+        2. **在发布链上一点足迹都没有**（既没发布成功过、也没有在途意图）→ 跳过
+           （:data:`SKIP_NO_PUBLISHED_ROW`）。理由见模块文档「撤权」一节：不为一个
+           没有发布行的人新建一行空权限。
         3. 否则结算撤权行并落一次权限决定。是否真的排出新意图由
            ``record_decision`` 的内容比对决定——第二天仍然无权限时判 ``UNCHANGED``，
            因此撤权**不会每天重发一次**。
@@ -587,7 +595,7 @@ class PermissionRefreshDuty:
                 reason=SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
             )
             return
-        if not self._publish_history.has_published_intent(identity.app_user_id):
+        if not self._publish_history.has_publish_footprint(identity.app_user_id):
             tally.count(SKIP_NO_PUBLISHED_ROW)
             self._audit.record(
                 "permission_refresh.user_skipped",

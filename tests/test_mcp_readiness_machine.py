@@ -35,7 +35,9 @@ S-C-03b 追加 **tick 驱动形态**（:class:`ReadinessTicker`）的断言，�
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -855,6 +857,26 @@ class SleeperTest(unittest.TestCase):
         self.assertEqual(sum(clock.slept), 900.0)
 
 
+def _code_without_docstrings(source: str) -> str:
+    """去掉全部文档字符串与注释之后的正文（形状断言只该扫代码）。"""
+
+    tree = ast.parse(textwrap.dedent(source))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            del body[0]
+            if not body:
+                body.append(ast.Pass())
+    return ast.unparse(tree)
+
+
 class _StoredCheck:
     """回读出来的一条判定行的最小形状（``adapters/postgres_mcp_token.StoredCheck``）。
 
@@ -1146,18 +1168,95 @@ class ReadinessTickerTest(unittest.TestCase):
 
         self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
 
+    def _slow_ticker(self, overrun_seconds: int, *, clock: FakeClock | None = None):
+        """一个**无视自己超时**的探针：返回成功，但花掉比 probe_timeout 更久。"""
+
+        the_clock = clock or FakeClock()
+
+        class SlowProbe:
+            calls: list[str] = []
+
+            def list_metrics(self, *, user_id: str) -> int:
+                self.calls.append(user_id)
+                the_clock.advance(overrun_seconds)
+                return 9
+
+        store = FakeStore()
+        ticker = ReadinessTicker(
+            probe=SlowProbe(),
+            store=store,
+            audit=FakeAudit(),
+            clock=the_clock,
+            schedule=CONTRACT_SCHEDULE,
+        )
+        return ticker, store, the_clock
+
     def test_a_probe_that_ignores_its_own_timeout_is_still_capped(self) -> None:
-        """但"探针链失控"那一种仍然挡得住：无视自己超时的成功不算数。"""
+        """"探针链失控"那一种仍然挡得住：无视自己超时的成功**不算就绪**。"""
+
+        ticker, _, _ = self._slow_ticker(CONTRACT_SCHEDULE.probe_timeout_seconds + 5)
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertNotEqual(attempt.outcome, ReadinessOutcome.READY)
+        self.assertIsNone(attempt.metric_count, "超窗的观察值一并丢弃")
+
+    def test_a_slow_success_mid_sequence_does_not_close_the_confirmation(self) -> None:
+        """否定断言（二级审查 N1）：**中途尝试的慢成功不得把整条确认收成终态**。
+
+        按次超时的计时窗覆盖"取令牌 + 解密 + HTTP 往返"，偶尔超过 20 秒是现实的。
+        把它判成 ``timed_out`` 终态，会让第 1 次尝试就把这条确认永久收口——预算还剩
+        十四分钟，候选集却从此排除它，通知也一并被吞。它必须落**非终态**的技术失败，
+        让计划表继续往下走。
+        """
+
+        ticker, store, _ = self._slow_ticker(CONTRACT_SCHEDULE.probe_timeout_seconds + 5)
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+        self.assertEqual(attempt.error_code, "probe_overran_timeout")
+        self.assertFalse(attempt.terminal, "第一次尝试的慢成功绝不是终态")
+        self.assertEqual(
+            [record.outcome for record in store.records],
+            [ReadinessOutcome.TECHNICAL_FAILURE],
+            "不得顺手补一条 timed_out",
+        )
+
+    def test_a_slow_success_on_the_last_attempt_still_closes_the_window(self) -> None:
+        """反面：计划表最后一次的慢成功仍然收口——预算确实用完了。"""
+
+        clock = FakeClock()
+        clock.advance(900)
+        ticker, store, _ = self._slow_ticker(
+            CONTRACT_SCHEDULE.probe_timeout_seconds + 5, clock=clock
+        )
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=5, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(attempt.error_code, "budget_exhausted")
+        self.assertEqual(
+            [record.outcome for record in store.records],
+            [ReadinessOutcome.TECHNICAL_FAILURE, ReadinessOutcome.TIMED_OUT],
+        )
+
+    def test_a_success_that_lands_exactly_on_the_limit_is_still_ready(self) -> None:
+        """边界是**严格大于**：恰好用满单次超时的成功仍然算就绪。"""
 
         clock = FakeClock()
 
-        class SlowProbe:
+        class ExactProbe:
             def list_metrics(self, *, user_id: str) -> int:
-                clock.advance(CONTRACT_SCHEDULE.probe_timeout_seconds + 5)
-                return 9
+                clock.advance(CONTRACT_SCHEDULE.probe_timeout_seconds)
+                return 4
 
         ticker = ReadinessTicker(
-            probe=SlowProbe(),
+            probe=ExactProbe(),
             store=FakeStore(),
             audit=FakeAudit(),
             clock=clock,
@@ -1166,9 +1265,55 @@ class ReadinessTickerTest(unittest.TestCase):
 
         attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
 
-        self.assertEqual(attempt.outcome, ReadinessOutcome.TIMED_OUT)
-        self.assertEqual(attempt.error_code, "success_after_deadline")
-        self.assertIsNone(attempt.metric_count)
+        self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
+        self.assertEqual(attempt.metric_count, 4)
+
+    def test_without_a_probe_only_the_revocation_path_advances(self) -> None:
+        """`probe=None`（端点未配）：撤权照常收口，需要探针的那一路本轮不动。"""
+
+        store, audit = FakeStore(), FakeAudit()
+        ticker = ReadinessTicker(
+            probe=None, store=store, audit=audit, clock=FakeClock(), schedule=CONTRACT_SCHEDULE
+        )
+        self.assertFalse(ticker.probe_wired)
+
+        revoked = ticker.advance(BINDING, permissions="{}", progress=ReadinessProgress())
+        self.assertEqual(revoked.outcome, ReadinessOutcome.NO_PERMISSION)
+
+        granted = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+        self.assertIsNone(granted, "需要探针的那一路不推进")
+        self.assertEqual(len(store.records), 1, "不落任何假的失败记录")
+
+    def test_without_a_probe_the_budget_is_never_burned(self) -> None:
+        """否定断言：端点未配时**连收口都不做**——预算耗尽建立在"真的探过"之上。"""
+
+        store = FakeStore()
+        ticker = ReadinessTicker(
+            probe=None, store=store, audit=FakeAudit(), clock=FakeClock(), schedule=CONTRACT_SCHEDULE
+        )
+
+        for count in (1, 6):
+            with self.subTest(count):
+                attempt = ticker.advance(
+                    BINDING,
+                    permissions=PERMISSIONS,
+                    progress=ReadinessProgress(attempt_count=count, first_started_at=START),
+                )
+                self.assertIsNone(attempt)
+        self.assertEqual(store.records, [])
+
+    def test_the_blocking_form_still_requires_a_probe(self) -> None:
+        """可缺省的探针只对 tick 形态有意义：开通编排拿不到结论就没法继续。"""
+
+        with self.assertRaises(TypeError):
+            McpReadinessConfirmation(
+                probe=None,
+                store=FakeStore(),
+                audit=FakeAudit(),
+                clock=FakeClock(),
+                sleep=lambda seconds: None,
+                schedule=FAST,
+            )
 
     def test_an_exhausted_plan_without_a_terminal_row_is_closed_on_sight(self) -> None:
         """进程恰好在最后一次探针与收口之间重启：下一轮直接补上收口，不留半态。"""
@@ -1200,7 +1345,9 @@ class ReadinessTickerTest(unittest.TestCase):
                 clock=FakeClock(),
                 sleep=lambda seconds: None,
             )
-        source = inspect.getsource(ReadinessTicker)
+        # 扫的是**代码**不是文档：类文档里恰恰要写明"阻塞形态靠真实 sleep"这件事，
+        # 拿原文扫描会把一份写得越清楚的文档判得越红。
+        source = _code_without_docstrings(inspect.getsource(ReadinessTicker))
         for forbidden in ("sleep", "wait(", "time."):
             self.assertNotIn(forbidden, source, f"tick 形态不得等待：{forbidden}")
 

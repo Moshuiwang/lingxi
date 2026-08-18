@@ -491,7 +491,12 @@ class PostgresPermissionPublishStore:
     # ------------------------------------------------------------------
 
     def published_awaiting_readiness(
-        self, *, reasons: Sequence[str], limit: int = 50
+        self,
+        *,
+        reasons: Sequence[str],
+        interval_seconds: int,
+        budget_seconds: int,
+        limit: int = 50,
     ) -> tuple[PendingReadiness, ...]:
         """取「已经发布读回一致、但就绪确认还没收口」的那些 ``(用户, 权限版本)``。
 
@@ -505,6 +510,15 @@ class PostgresPermissionPublishStore:
         "可用范围已更新"，而且两个确认还会对同一个 ``(用户, 权限版本)`` 并发探针。
         做成必填而不是给一个默认值：默认值会在新增一种 ``reason`` 时**静默地**把它归给
         某一方，而那正是需要有人明确决定的事。
+
+        **只取"这一轮真的该动"的那些**（二级审查 N3）。``interval_seconds`` /
+        ``budget_seconds`` 由调用方从就绪节奏传进来，本方法据此算出"下一次探针什么时候
+        到期"并只返回已经到期的行，**还没探过的排在最前面**。少了这一条，``LIMIT`` 窗口
+        会被一批"要等三分钟才到期"的候选长期占满：新发布的那一条永远挤不进来，于是合同
+        要求的"发布读回一致后立即探一次"名存实亡，收口时间也没有上界。到期时刻的算法与
+        :func:`lingxi.core.permission.mcp_readiness.next_probe_due` 必须一致
+        （``起点 + 已判定次数 × 间隔``，并以预算封顶——封顶那一步让"计划表已经用尽却
+        还没收口"的那种行立刻被取回来收口，而不是再等一个间隔）。
 
         其余三条筛选各自都不能少：
 
@@ -531,6 +545,9 @@ class PostgresPermissionPublishStore:
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
+        for label, value in (("轮询间隔", interval_seconds), ("总预算", budget_seconds)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{label}必须是正整数秒")
         wanted = [str(item) for item in reasons if str(item).strip()]
         if not wanted:
             raise ValueError("必须指明本调用方负责确认哪些 reason 的发布意图")
@@ -540,8 +557,14 @@ class PostgresPermissionPublishStore:
                 """SELECT o.user_id, o.permission_version, o.payload ->> 'permissions',
                           o.published_at
                      FROM publish_outbox o
+                     LEFT JOIN LATERAL (
+                            SELECT count(*) AS attempts, min(c.started_at) AS first_started_at
+                              FROM mcp_sync_check c
+                             WHERE c.user_id = o.user_id
+                               AND c.permission_version = o.permission_version
+                          ) progress ON TRUE
                     WHERE o.status = 'published'
-                      AND o.reason = ANY(%s)
+                      AND o.reason = ANY(%(reasons)s)
                       AND o.payload ? 'permissions'
                       AND NOT EXISTS (
                             SELECT 1 FROM publish_outbox newer
@@ -552,11 +575,25 @@ class PostgresPermissionPublishStore:
                             SELECT 1 FROM mcp_sync_check c
                              WHERE c.user_id = o.user_id
                                AND c.permission_version = o.permission_version
-                               AND c.result = ANY(%s)
+                               AND c.result = ANY(%(terminal)s)
                           )
-                    ORDER BY o.published_at, o.id
-                    LIMIT %s""",
-                (wanted, terminal, limit),
+                      AND (
+                            progress.attempts = 0
+                         OR progress.first_started_at + make_interval(
+                                secs => LEAST(
+                                    progress.attempts * %(interval)s, %(budget)s
+                                )::double precision
+                            ) <= now()
+                          )
+                    ORDER BY (progress.attempts > 0), o.published_at, o.id
+                    LIMIT %(limit)s""",
+                {
+                    "reasons": wanted,
+                    "terminal": terminal,
+                    "interval": interval_seconds,
+                    "budget": budget_seconds,
+                    "limit": limit,
+                },
             )
             rows = cursor.fetchall()
         return tuple(
@@ -569,25 +606,38 @@ class PostgresPermissionPublishStore:
             for row in rows
         )
 
-    def has_published_intent(self, user_id: str) -> bool:
-        """这个用户**有没有过**一条发布成功的意图。
+    def has_publish_footprint(self, user_id: str) -> bool:
+        """这个用户在发布链上**有没有留下过足迹**：发布成功过，**或**当前还有意图在途。
 
-        撤权那一侧的判据（`V-权限-08` 的刷新侧）：只有"我们真的往发布表写成功过一行"的
-        用户，才值得为他发一条把 ``permissions`` 清空的更新。这是**本地能拿到的、关于
-        "发布表里有没有他那一行"最直接的证据**——发布链路只有一条，写成功过就等于那一行
-        存在（我们不删行）。
+        撤权那一侧的判据（`V-权限-08` 的刷新侧）。两半各自都不能少：
 
-        反过来，从来没有过 ``published`` 意图的人**跳过**：为他新建一行空权限没有意义
+        - ``published``：我们真的往发布表写成功过一行，那一行现在还在（我们不删行），
+          因此值得为他发一条把 ``permissions`` 清空的更新。
+        - ``pending`` / ``publishing``：**还有一条尚未落地的授权意图**。不把它算进来的话
+          （二级审查 N7 抓到的时间线）：昨天排的 granted 意图还堵在 pending，今天这个人
+          被撤权却因为"还没发布过"而跳过，等发布面把积压消费掉时，那份**已经被收回的
+          范围**会被写进外部表，还会触发一条"范围已更新"通知——最长多给一天权限。
+          算进来之后，撤权决定推进版本，旧意图被认领时判 ``SUPERSEDED``（**一次外部
+          调用都不发**），而撤权意图本身在外部无行时以 ``missing_token_cipher`` 失败
+          关闭——两条路的方向都是安全的。
+
+        反过来，**在发布链上一点足迹都没有**的人仍然跳过：为他新建一行空权限没有意义
         （问数 MCP 对查无此人本来就默认拒绝），而新建还需要一份令牌密文。既有 26 行那些
         旧系统写的人也落在这一路——硬切之前他们的撤权由旧系统负责（产品负责人 2026-08-18
         裁定 3 的时效边界）。
+
+        ``failed`` / ``superseded`` **不算足迹**：前者说明那一版从来没有落到外部表，
+        后者已经被更新的版本取代。
         """
 
         if not isinstance(user_id, str) or not user_id.strip():
-            raise ValueError("发布历史判定必须指明用户")
+            raise ValueError("发布足迹判定必须指明用户")
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT 1 FROM publish_outbox WHERE user_id = %s AND status = 'published' LIMIT 1",
+                """SELECT 1 FROM publish_outbox
+                    WHERE user_id = %s
+                      AND status IN ('published', 'pending', 'publishing')
+                    LIMIT 1""",
                 (user_id,),
             )
             return cursor.fetchone() is not None

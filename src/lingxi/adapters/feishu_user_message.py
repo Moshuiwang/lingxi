@@ -33,10 +33,13 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Callable
 
-from lingxi.adapters.feishu_directory import urllib_transport
 from lingxi.adapters.feishu_group_message import delivery_uuid
 
 logger = logging.getLogger(__name__)
+
+#: 出站超时。与 ``feishu_directory.REQUEST_TIMEOUT_SECONDS`` 同量级：一条通知挂死不该
+#: 占住整轮调度（调度职责另有单轮时间预算兜底）。
+REQUEST_TIMEOUT_SECONDS = 20
 
 #: 飞书用户 ``open_id`` 的前缀。用它做形状校验，让"把群 ``chat_id`` 当成用户 open_id
 #: 传进来"在**发出去之前**失败，而不是把一个人的权限范围发进一个群。
@@ -44,7 +47,7 @@ USER_OPEN_ID_PREFIX = "ou_"
 
 #: 权限变化通知的投递去重 ID 前缀。与日报的 ``lingxi-roster-`` 分开：同一个 uuid 命名
 #: 空间下混两条投递语义，运维在飞书侧就再也分不出它属于哪一条链。
-#: 取值恒为 17 + 32 = 49，仍在飞书的 50 字符上限内（由 ``delivery_uuid`` 校验）。
+#: 取值恒为 16 + 32 = 48，仍在飞书的 50 字符上限内（由 ``delivery_uuid`` 校验）。
 NOTICE_UUID_PREFIX = "lingxi-perm-msg-"
 
 
@@ -86,6 +89,68 @@ def _require_https(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def _no_redirect_opener() -> Any:
+    """构造一个**不跟随重定向**的 opener（与 ``query_mcp_probe`` 同一条理由）。
+
+    ``urllib`` 默认会自动跟随 3xx，并且**把 ``Authorization`` 请求头一起转发到新地址**。
+    本模块的请求头里带的是应用身份令牌（``tenant_access_token``），一个被劫持或误配的
+    ``302`` 就能把它送到另一个主机、甚至从 https 降级到 http 明文——而调用方只会看到一次
+    "成功"。:func:`_require_https` 只管得住我们**主动**填的那个地址，管不住服务端让我们
+    再去哪里。
+
+    做法是让 ``redirect_request`` 返回 ``None``：``urllib`` 于是把 3xx 当成
+    :class:`HTTPError` 抛出，落进下面的错误分类。
+    """
+
+    from urllib.request import HTTPRedirectHandler, build_opener
+
+    class _NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - 见外层文档
+            return None
+
+    return build_opener(_NoRedirect())
+
+
+def no_redirect_transport(
+    method: str,
+    url: str,
+    *,
+    body: Mapping[str, Any] | None = None,
+    token: str | None = None,
+) -> Any:
+    """本模块的默认传输：只发 HTTPS、**不跟随重定向**、不重试。
+
+    与 ``feishu_directory.urllib_transport`` 的行为逐条对齐（同样的 JSON 解析与错误
+    分类），**只多一条**：不跟随 3xx。刻意不去改那个共用实现——它有四个既有调用方，
+    改默认行为属于本 Story 之外的回归面；这里只让**新增的**这条出站链路从一开始就没有
+    转发凭据的路径（同 ``query_mcp_probe`` 的 F4 型处置）。
+    """
+
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request
+
+    payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, data=payload, headers=headers, method=method)
+    try:
+        with _no_redirect_opener().open(  # noqa: S310 - 地址来自受控配置且已校验 https
+            request, timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            return json.loads(response.read())
+    except HTTPError as error:
+        # 3xx 也走这里（opener 不跟随），与其它非 2xx 一样按响应体分类。
+        try:
+            return json.loads(error.read())
+        except Exception as parse_error:  # noqa: BLE001 - 读不出响应体就只剩状态码
+            raise FeishuUserMessageError(f"http_{error.code}") from parse_error
+    except (URLError, OSError, TimeoutError) as error:
+        raise FeishuUserMessageError("transport_error") from error
+    except ValueError as error:
+        raise FeishuUserMessageError("invalid_json") from error
+
+
 class FeishuUserMessages:
     """向指定用户发送纯文本消息。
 
@@ -106,7 +171,9 @@ class FeishuUserMessages:
         self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
-        self._transport: Callable[..., Any] = transport or urllib_transport
+        # 默认传输**不跟随重定向**：一个 302 就能把应用身份令牌转发到别处
+        # （见 :func:`no_redirect_transport`）。
+        self._transport: Callable[..., Any] = transport or no_redirect_transport
         self._uuid_prefix = uuid_prefix
 
     def _tenant_access_token(self) -> str:
@@ -181,6 +248,8 @@ __all__ = [
     "FeishuUserMessageError",
     "FeishuUserMessages",
     "NOTICE_UUID_PREFIX",
+    "REQUEST_TIMEOUT_SECONDS",
     "USER_OPEN_ID_PREFIX",
+    "no_redirect_transport",
     "validate_user_open_id",
 ]

@@ -229,6 +229,34 @@ class SendTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             FeishuUserMessages(base_url="http://open.feishu.cn", app_id="a", app_secret="s")
 
+    def test_the_default_transport_does_not_follow_redirects(self) -> None:
+        """否定断言：**默认传输不跟随 3xx**——跟随会把应用身份令牌转发到新主机。
+
+        与 ``query_mcp_probe`` 的同型处置一致。这里断言的是装配事实（默认传输就是那个
+        不跟随重定向的实现）与它构造出来的 opener 里那个 handler 的行为。
+        """
+
+        import inspect
+
+        from lingxi.adapters import feishu_user_message as module
+
+        default = inspect.signature(FeishuUserMessages.__init__).parameters["transport"].default
+        self.assertIsNone(default, "默认值在构造函数体里选择，不在签名里")
+        client = FeishuUserMessages(base_url=BASE_URL, app_id="a", app_secret="s")
+        self.assertIs(client._transport, module.no_redirect_transport)
+
+        opener = module._no_redirect_opener()
+        handlers = [
+            handler
+            for handler in opener.handlers
+            if type(handler).__name__ == "_NoRedirect"
+        ]
+        self.assertEqual(len(handlers), 1)
+        self.assertIsNone(
+            handlers[0].redirect_request(None, None, 302, "Found", {}, "https://evil.invalid"),
+            "redirect_request 返回 None，urllib 因此把 3xx 抛成 HTTPError",
+        )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

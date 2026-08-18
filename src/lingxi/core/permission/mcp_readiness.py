@@ -565,7 +565,7 @@ class _ReadinessProbeRunner:
     def __init__(
         self,
         *,
-        probe: McpProbe,
+        probe: McpProbe | None,
         store: ReadinessCheckStore,
         audit: _AuditSink,
         clock: Callable[[], datetime],
@@ -587,6 +587,12 @@ class _ReadinessProbeRunner:
     def schedule(self) -> ReadinessSchedule:
         return self._schedule
 
+    @property
+    def probe_wired(self) -> bool:
+        """探针装配了没有。见 :class:`ReadinessTicker` 的「探针未接线」一节。"""
+
+        return self._probe is not None
+
     # ------------------------------------------------------------------
     # 共用的一步：发一次探针 → 分类 → 落库 → 审计
     # ------------------------------------------------------------------
@@ -603,6 +609,9 @@ class _ReadinessProbeRunner:
         binding: ReadinessBinding,
         attempt_no: int,
         hard_deadline: datetime | None = None,
+        *,
+        overrun_outcome: ReadinessOutcome = ReadinessOutcome.TIMED_OUT,
+        overrun_error: str = "success_after_deadline",
     ) -> ReadinessAttempt:
         """发一次探针并结算成一条判定记录。
 
@@ -616,6 +625,20 @@ class _ReadinessProbeRunner:
           的探针因为调度晚了几十秒而丢掉——那是把调度粒度算成了用户的错。这条防线要挡
           的东西没有变：**探针链失控**（注入的探针无视超时、一次跑几分钟）时，它的成功
           仍然不算数。整轮"最多探几次"由计划表守着，与本参数无关。
+
+        ``overrun_outcome`` / ``overrun_error`` 决定**超窗的成功落哪一路**，两种形态
+        必须不同（二级审查 N1）：
+
+        - 阻塞形态用默认的 ``timed_out``：那时整轮预算确实已经走完，超窗就是超时。
+        - **tick 形态的中途尝试必须落非终态** ``technical_failure``
+          （``probe_overran_timeout``）。用按次超时算出来的上界去判终态，会让第 1 次
+          尝试的一次慢成功（取令牌 + 解密 + HTTP 往返偶尔超过 20 秒）直接把整条确认
+          收成终态：预算还剩十四分钟，候选集却从此永久排除它，通知也一并被吞。落技术
+          失败之后，计划表照常往下走，下一次尝试仍有机会就绪——这正是"技术失败是中间态"
+          在 S-C-02 里的原意。
+
+        超窗的**边界是"严格大于"**：``finished == limit`` 仍算在窗口内。一次恰好用满
+        超时的成功不该被判出局，而 ``>`` 与 ``>=`` 的差别正是这一种。
         """
 
         started = self._now()
@@ -641,19 +664,16 @@ class _ReadinessProbeRunner:
         counted = None if outcome is ReadinessOutcome.TECHNICAL_FAILURE else int(observed)
         finished = self._now()
         if outcome is ReadinessOutcome.READY and finished > limit:
-            # **成功来得太晚了。** 承诺是"结论最晚在 预算 + 单次探针超时 内落地"，而这次
-            # 探针在窗口之外才返回——发起前的检查管不住它（那时还没超），只有返回后再看
-            # 一眼才管得住。这也是唯一不依赖"传输层真的遵守了超时"的防线：探针超时配大了、
-            # 或注入的探针根本不看超时，上界都只能靠这里成立。
+            # **成功来得太晚了。** 这次探针在窗口之外才返回——发起前的检查管不住它
+            # （那时还没超），只有返回后再看一眼才管得住。这也是唯一不依赖"传输层真的
+            # 遵守了超时"的防线：探针超时配大了、或注入的探针根本不看超时，上界都只能
+            # 靠这里成立。
             #
-            # 降级成 ``timed_out`` 而不是记一条 ``ready`` 再让上层否决：那样
-            # ``mcp_sync_check`` 里会留下一行 ``ready``，而这一轮的结论是超时，
-            # 读表的人会看到两个互相矛盾的事实。观察值一并丢弃（``timed_out`` 不得携带）。
-            outcome, error_code, counted = (
-                ReadinessOutcome.TIMED_OUT,
-                "success_after_deadline",
-                None,
-            )
+            # 降级而不是记一条 ``ready`` 再让上层否决：那样 ``mcp_sync_check`` 里会留下
+            # 一行 ``ready``，而这一轮的结论不是就绪，读表的人会看到两个互相矛盾的事实。
+            # 观察值一并丢弃（``timed_out`` 与 ``technical_failure`` 都不得携带）。
+            # **降到哪一路由调用形态决定**，见本方法文档的 ``overrun_outcome``。
+            outcome, error_code, counted = (overrun_outcome, overrun_error, None)
         return self._attempt(
             binding,
             attempt_no,
@@ -728,6 +748,10 @@ class McpReadinessConfirmation(_ReadinessProbeRunner):
         on_alert: Callable[[ReadinessSession], None] | None = None,
     ) -> None:
         super().__init__(probe=probe, store=store, audit=audit, clock=clock, schedule=schedule)
+        if probe is None:
+            # 阻塞形态没有"探针未接线"这种状态：它的调用方是一次开通编排，拿不到结论
+            # 就没法继续。可缺省的探针只对 tick 形态有意义（见 :class:`ReadinessTicker`）。
+            raise TypeError("阻塞式就绪确认必须注入探针")
         if not callable(sleep):
             # ``sleep`` **必填**，且没有"缺省就不等"的分支。此前它可以是 ``None``，
             # 默认构造出来的确认会把六次探针背靠背发完、立刻判超时——十五分钟的等待
@@ -919,6 +943,14 @@ def next_probe_due(schedule: ReadinessSchedule, progress: ReadinessProgress) -> 
     return progress.first_started_at + timedelta(seconds=offsets[progress.attempt_count])
 
 
+#: tick 形态发起探针时的超窗处置：**非终态**，让计划表继续往下走（二级审查 N1）。
+#: 单写一份是为了让"tick 的每一次探针都用同一套超窗语义"可被指着看，也可被一次改坏。
+_TICK_OVERRUN = {
+    "overrun_outcome": ReadinessOutcome.TECHNICAL_FAILURE,
+    "overrun_error": "probe_overran_timeout",
+}
+
+
 class ReadinessTicker(_ReadinessProbeRunner):
     """同一套就绪语义的 **tick 驱动**形态：每轮只发起"已经到期"的那一次探针，**从不等待**。
 
@@ -940,12 +972,37 @@ class ReadinessTicker(_ReadinessProbeRunner):
     - 因此**不能**再拿整轮上界去卡最后一次探针的成功——那会把一次真正成功的确认因为
       调度晚了几十秒而丢掉。取而代之，:meth:`_ReadinessProbeRunner._probe_once` 在
       ``hard_deadline=None`` 时按**这一次探针自己的**超时收口，挡的仍然是"探针链失控"
-      那一种（见该方法的文档）。
+      那一种（见该方法的文档）。**中途尝试的超窗成功落非终态**
+      （``technical_failure`` / ``probe_overran_timeout``），只有计划表最后一次或预算
+      耗尽才收成 ``timed_out``（二级审查 N1）。
+
+    ## 停机追赶：迟到的成功仍然算就绪，这是**刷新链**可以接受的语义
+
+    进程停了半小时再起来时，本形态会按 offset 逐次把欠下的探针补做完，其中任何一次
+    成功都算就绪——即使它发生在"发布后十五分钟"之外。这**不是**把合同的十五分钟当作
+    可选：合同那条十五分钟约束的是**首次开通**那条链（用户正在等一个"开通完成"，
+    超时要转运维、要给用户一个确定的交代），而那条链在 Epic D 用的是阻塞形态
+    :class:`McpReadinessConfirmation`，节奏由真实 ``sleep`` 保证。
+
+    刷新链的语义不同：这个人**已经在用 Lingxi**，权限范围变了，我们要做的是"确认新
+    范围真的生效了再告诉他"。调度停机期间他并没有在等待一个开通结论；停机恢复后确认
+    成功、发一条"范围已更新"，比"因为我们自己停机超时了，所以永远不告诉他"要好。
+    **两条链的十五分钟因此不是同一个承诺**，本类只承担刷新链那一条。
 
     **状态全在库里**（:class:`ReadinessProgress` ← ``mcp_sync_check``），因此进程重启
     不会让任何一条确认丢失或从头再来；同一 ``(用户, 权限版本)`` 的取号串行化由
     ``adapters/postgres_mcp_token.record_attempt`` 的事务级 advisory lock 承担，
     与阻塞形态是同一把锁。
+
+    ## 探针未接线（``probe=None``）：只推进不需要探针的那一路
+
+    问数 MCP 端点还没配时，本类仍然可以构造，但**只处理 ``no_permission`` 那一路**
+    （撤权：权限文本为空，本来就不发探针）。需要探针的那一路**本轮不推进、不落任何
+    记录**，等端点配好后原样继续——库里的进度还在，一条都不会丢。
+
+    这条边界是刻意的：装一个指向空地址的假探针，会让每条确认都以技术失败耗满预算再
+    转运维，把"还没接线"伪装成"接线了但一直失败"。而整面不装配又会把**不依赖探针的
+    撤权通知**一起关掉（二级审查 N6）。
     """
 
     name = "MCP 就绪确认（tick）"
@@ -972,6 +1029,9 @@ class ReadinessTicker(_ReadinessProbeRunner):
         5. **计划表已经用尽却还没收口**（进程恰好在最后一次探针与收口之间重启、
            或节奏配置被调小）：直接补 ``timed_out``。少了这一条，那条确认会永远停在
            "没终态、也没人再探"的状态里。
+
+        **探针未接线时**（``probe=None``）：第 2 步的 ``no_permission`` 那一路照常走完，
+        其余一律返回 ``None``——不落记录、不burn预算（见类文档最后一节）。
         """
 
         if not isinstance(binding, ReadinessBinding):
@@ -986,7 +1046,8 @@ class ReadinessTicker(_ReadinessProbeRunner):
             started = self._now()
             if not evaluate_permission_presence(permissions, company_id=company_id):
                 # 与阻塞形态同一条：**没有可等的东西就不发探针**。撤权行走的正是这一路，
-                # 它同时把这条确认收成终态，因此撤权通知也只会发一次。
+                # 它同时把这条确认收成终态，因此撤权通知也只会发一次。**这一路不需要
+                # 探针**，因此端点没配时它照样走得通。
                 return self._attempt(
                     binding,
                     1,
@@ -995,7 +1056,14 @@ class ReadinessTicker(_ReadinessProbeRunner):
                     self._now(),
                     error_code="no_publishable_permission",
                 )
-            return self._settle(binding, self._probe_once(binding, 1), offsets)
+            if self._probe is None:
+                return None
+            return self._settle(binding, self._probe_once(binding, 1, **_TICK_OVERRUN), offsets)
+
+        if self._probe is None:
+            # 探针没接线时**连收口都不做**：预算耗尽的判定建立在"我们真的探过"之上，
+            # 而这条确认一次都没探成。端点配好后它会从当前进度原样继续。
+            return None
 
         if progress.attempt_count >= len(offsets):
             return self._timed_out(binding, progress.attempt_count + 1)
@@ -1004,7 +1072,9 @@ class ReadinessTicker(_ReadinessProbeRunner):
         if due is None or self._now() < due:
             return None
         return self._settle(
-            binding, self._probe_once(binding, progress.attempt_count + 1), offsets
+            binding,
+            self._probe_once(binding, progress.attempt_count + 1, **_TICK_OVERRUN),
+            offsets,
         )
 
     # ------------------------------------------------------------------

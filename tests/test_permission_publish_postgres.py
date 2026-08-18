@@ -724,8 +724,17 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
     #: 才能在有人改了常量却忘了改 SQL 语义时变红。
     OWNED_REASONS = ("daily_permission_refresh", "daily_permission_revoke")
 
-    def _candidates(self, *, limit: int = 50):
-        return self.store.published_awaiting_readiness(reasons=self.OWNED_REASONS, limit=limit)
+    #: 就绪节奏（合同值）：到期判据必须与 `ReadinessSchedule` 同源。
+    INTERVAL_SECONDS = 180
+    BUDGET_SECONDS = 900
+
+    def _candidates(self, *, limit: int = 50, interval: int | None = None):
+        return self.store.published_awaiting_readiness(
+            reasons=self.OWNED_REASONS,
+            interval_seconds=interval or self.INTERVAL_SECONDS,
+            budget_seconds=self.BUDGET_SECONDS,
+            limit=limit,
+        )
 
     def _publish(
         self, *, user_id: str = USER_A, row: PublishRow | None = None, reason: str = "daily_permission_refresh"
@@ -745,7 +754,15 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         )
         return decision.outbox_id or ""
 
-    def _record_check(self, user_id: str, version: int, result: str) -> None:
+    def _record_check(
+        self, user_id: str, version: int, result: str, *, at: datetime | None = None
+    ) -> None:
+        """写一条就绪判定行。
+
+        ``at`` 默认取 :data:`NOW`（一个**过去**的时刻），这样"下一次探针到期了没有"
+        在多数用例里恒为真；要表达"刚刚才探过"的用例显式传当前时刻。
+        """
+
         from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
         from lingxi.core.permission.mcp_readiness import (
             ReadinessAttempt,
@@ -761,13 +778,14 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
             extra = {"error_code": "empty_metrics", "metric_count": 0}
         else:
             extra = {"error_code": "budget_exhausted"}
+        moment = at or NOW
         PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
             ReadinessAttempt(
                 binding=ReadinessBinding(user_id, version),
                 attempt_no=1,
                 outcome=outcome,
-                started_at=NOW,
-                finished_at=NOW,
+                started_at=moment,
+                finished_at=moment,
                 **extra,
             )
         )
@@ -805,7 +823,11 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         for reasons in ((), ("",), ("   ",)):
             with self.subTest(reasons):
                 with self.assertRaises(ValueError):
-                    self.store.published_awaiting_readiness(reasons=reasons)
+                    self.store.published_awaiting_readiness(
+                        reasons=reasons,
+                        interval_seconds=self.INTERVAL_SECONDS,
+                        budget_seconds=self.BUDGET_SECONDS,
+                    )
 
     def test_an_intent_superseded_by_a_newer_version_is_not_a_candidate(self) -> None:
         """否定断言：权限又变了时，**旧的那一版不再确认、也不据它通知**。"""
@@ -853,6 +875,76 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
 
         self.assertEqual(self._candidates(), ())
 
+    def test_a_confirmation_that_is_not_due_is_left_out_of_the_window(self) -> None:
+        """N3：**没到期的候选不占窗口**。
+
+        少了这一条，一批"要等三分钟"的候选会每轮占满 ``LIMIT``，新发布的那条永远挤不
+        进来——合同要求的"发布读回一致后立即探一次"就名存实亡了。
+        """
+
+        self._publish()
+        self._record_check(USER_A, 1, "waiting", at=datetime.now(timezone.utc))
+
+        self.assertEqual(self._candidates(), (), "刚探过，三分钟内不该再取回")
+
+    def test_a_confirmation_that_is_due_comes_back(self) -> None:
+        """反面：上一次探针已经过了一个间隔，它照常回到窗口里。"""
+
+        self._publish()
+        self._record_check(
+            USER_A,
+            1,
+            "waiting",
+            at=datetime.now(timezone.utc) - timedelta(seconds=self.INTERVAL_SECONDS + 20),
+        )
+
+        self.assertEqual(len(self._candidates()), 1)
+
+    def test_a_never_probed_candidate_comes_first(self) -> None:
+        """新发布的排在最前面：它要的是"立即"的第一次探针。"""
+
+        self._publish()
+        self._record_check(USER_A, 1, "waiting")
+        self._publish(user_id=USER_B, row=_row(EMAIL_B))
+
+        pending = self._candidates()
+
+        self.assertEqual([item.user_id for item in pending], [USER_B, USER_A])
+
+    def test_an_exhausted_plan_is_due_immediately_after_the_budget(self) -> None:
+        """计划表用尽却还没收口的那种行，过了预算就该被取回来收口，而不是再等一个间隔。"""
+
+        self._publish()
+        for _ in range(6):
+            self._record_check(USER_A, 1, "waiting")
+
+        # 六次尝试 × 180 秒 = 1080 秒还没到，但预算封顶让它在 900 秒就到期；
+        # 用例里把预算缩到 1 秒来表达"预算已经过了"。
+        self.assertEqual(
+            len(
+                self.store.published_awaiting_readiness(
+                    reasons=self.OWNED_REASONS,
+                    interval_seconds=self.INTERVAL_SECONDS,
+                    budget_seconds=1,
+                    limit=50,
+                )
+            ),
+            1,
+        )
+
+    def test_an_illegal_schedule_is_rejected(self) -> None:
+        for kwargs in ({"interval_seconds": 0}, {"budget_seconds": -1}, {"interval_seconds": True}):
+            with self.subTest(kwargs):
+                with self.assertRaises(ValueError):
+                    self.store.published_awaiting_readiness(
+                        reasons=self.OWNED_REASONS,
+                        **{
+                            "interval_seconds": self.INTERVAL_SECONDS,
+                            "budget_seconds": self.BUDGET_SECONDS,
+                            **kwargs,
+                        },
+                    )
+
     def test_the_budget_is_respected(self) -> None:
         self._publish()
         self._publish(user_id=USER_B, row=_row(EMAIL_B))
@@ -877,24 +969,42 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
                 (account_state, user_id),
             )
 
-    def test_a_user_without_any_published_intent_has_no_history(self) -> None:
-        """否定断言：只排过意图、还没发布成功，**不算有发布行**。"""
+    def test_a_user_with_no_intent_at_all_has_no_footprint(self) -> None:
+        self.assertFalse(self.store.has_publish_footprint(USER_A))
 
-        self.assertFalse(self.store.has_published_intent(USER_A))
+    def test_a_pending_intent_already_counts_as_a_footprint(self) -> None:
+        """N7：**在途的旧授权意图也算足迹**。
 
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        不算的话，昨天排的 granted 意图今天被跳过，等发布面消费积压时那份**已经被
+        收回的范围**会被写进外部表并触发一条"范围已更新"通知。算进来之后，撤权决定
+        推进版本，旧意图被认领时判 ``SUPERSEDED``，一次外部调用都不发。
+        """
 
-        self.assertFalse(self.store.has_published_intent(USER_A))
+        self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+        )
+
+        self.assertTrue(self.store.has_publish_footprint(USER_A))
+
+    def test_a_claimed_intent_counts_too(self) -> None:
+        self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+        )
+        self.store.claim_next()
+
+        self.assertTrue(self.store.has_publish_footprint(USER_A), "publishing 也是在途")
 
     def test_a_published_intent_makes_the_history_true(self) -> None:
         decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
         self.store.claim_next()
         self.store.complete(_attempt(decision.outbox_id or ""), status=STATUS_PUBLISHED)
 
-        self.assertTrue(self.store.has_published_intent(USER_A))
-        self.assertFalse(self.store.has_published_intent(USER_B), "只看这个人自己的历史")
+        self.assertTrue(self.store.has_publish_footprint(USER_A))
+        self.assertFalse(self.store.has_publish_footprint(USER_B), "只看这个人自己的历史")
 
-    def test_a_failed_intent_does_not_count_as_published(self) -> None:
+    def test_a_failed_intent_does_not_count_as_a_footprint(self) -> None:
+        """否定断言：``failed`` **不算足迹**——那一版从来没有落到外部表。"""
+
         decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
         self.store.claim_next()
         self.store.complete(
@@ -902,7 +1012,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
             status=STATUS_FAILED,
         )
 
-        self.assertFalse(self.store.has_published_intent(USER_A))
+        self.assertFalse(self.store.has_publish_footprint(USER_A))
 
     def test_an_active_user_has_a_notice_recipient(self) -> None:
         self._activate()
@@ -924,7 +1034,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
         self.assertIsNone(self.store.notice_recipient_open_id("usr_does_not_exist"))
 
     def test_both_queries_require_a_user(self) -> None:
-        for call in (self.store.has_published_intent, self.store.notice_recipient_open_id):
+        for call in (self.store.has_publish_footprint, self.store.notice_recipient_open_id):
             for value in ("", "   "):
                 with self.subTest(call=call.__name__, value=value):
                     with self.assertRaises(ValueError):

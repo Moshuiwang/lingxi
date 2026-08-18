@@ -210,16 +210,18 @@ class FakeTokens:
 
 
 class FakePublishHistory:
-    """「这个人有没有过一条发布成功的意图」的假实现。
+    """「这个人在发布链上有没有留下过足迹」的假实现。
 
     默认**谁都没有**：撤权那一路因此照旧跳过，S-C-03a 的既有用例不受影响。
+    真实实现里"足迹"= 发布成功过 **或** 当前还有 ``pending``/``publishing`` 的意图在途
+    （二级审查 N7），判据见 ``adapters/postgres_permission_publish.py`` 的同名方法。
     """
 
     def __init__(self, published_users: set[str] | None = None) -> None:
         self._published = published_users or set()
         self.calls: list[str] = []
 
-    def has_published_intent(self, user_id: str) -> bool:
+    def has_publish_footprint(self, user_id: str) -> bool:
         self.calls.append(user_id)
         return user_id in self._published
 
@@ -856,20 +858,45 @@ class RevocationPublishTest(unittest.TestCase):
             parts["audit"].fields_for("permission_refresh.user_revoked")[0]["enqueued"], False
         )
 
-    def test_a_revoked_user_without_an_archived_email_is_skipped(self) -> None:
-        """存档不全的撤权用户跳过：撤权行的三列同样来自存档身份。"""
+    def test_a_revoked_user_with_an_incomplete_archive_is_skipped(self) -> None:
+        """存档不全的撤权用户跳过：撤权行的三列同样来自存档身份。
+
+        **姓名与邮箱各测一次**：只测其中一个的话，把守卫写成单条件也能通过，而
+        ``build_revocation_row`` 对两者都会抛错——那时它会被算成一次技术故障。
+        """
+
+        for label, kwargs in (("缺邮箱", {"email": ""}), ("缺姓名", {"display_name": ""})):
+            with self.subTest(label):
+                duty, parts = build_duty(
+                    identities=(identity(**kwargs),),
+                    published_users={USER_ONE},
+                    galaxy=galaxy_snapshot(roles=()),
+                )
+
+                report = duty.run_once()
+
+                self.assertEqual(parts["decisions"].calls, [])
+                self.assertEqual(parts["history"].calls, [], "存档不全时连发布足迹都不查")
+                self.assertEqual(report.reasons["archived_identity_incomplete"], 1)
+                self.assertEqual(report.failed, 0, "这是分类，不是技术故障")
+
+    def test_an_in_flight_intent_also_counts_as_a_footprint(self) -> None:
+        """N7：**在途的旧授权意图**同样算足迹——撤权决定必须把它 supersede 掉。
+
+        不算的话，那条已经被收回的范围会在发布面消费积压时被写进外部表，还会触发一条
+        "范围已更新"通知（最长多给一天权限）。
+        """
 
         duty, parts = build_duty(
-            identities=(identity(email=""),),
+            identities=(identity(),),
             published_users={USER_ONE},
             galaxy=galaxy_snapshot(roles=()),
         )
 
         report = duty.run_once()
 
-        self.assertEqual(parts["decisions"].calls, [])
-        self.assertEqual(parts["history"].calls, [], "存档不全时连发布历史都不查")
-        self.assertEqual(report.reasons["archived_identity_incomplete"], 1)
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        self.assertEqual(report.revoked_published, 1)
 
     def test_the_revocation_audit_carries_no_sensitive_value(self) -> None:
         _report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
@@ -1318,7 +1345,8 @@ class DutyRegistrationTest(unittest.TestCase):
             names.index("花名册审计日报"),
             "重算必须排在花名册审计之后",
         )
-        self.assertEqual(names[-1], "每日权限重算")
+        # 发布消费职责随主密钥一起装配（它的通知面用同一把密钥），排在重算之后。
+        self.assertEqual(names[-1], "权限发布与就绪确认")
         self.assertEqual(self._own_records(audit), [], "前置齐备时不该有『未注册』审计")
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

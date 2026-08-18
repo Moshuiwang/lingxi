@@ -62,9 +62,26 @@ published_awaiting_readiness` 的 SQL 就不再把它取回来。因此"这条�
 - **收件人不可用不发通知**：``provisioning_state`` 不是 ``active``、账号正在删除或已删除
   的人一律跳过并计数（判据在 :meth:`~lingxi.adapters.postgres_permission_publish.
   PostgresPermissionPublishStore.notice_recipient_open_id` 的 SQL 里）。
-- **就绪面缺配置时整面不装配，发布面照常**（见 :func:`lingxi.apps.scheduler.
-  _build_permission_publish_duty`）。发布不依赖探针；而一个装了却每轮都炸的探针，会把
-  "还没接线"伪装成"接线了但一直失败"。
+- **三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6，见
+  :func:`lingxi.apps.scheduler._build_permission_publish_duty`）：**发布面**要权限表
+  坐标与令牌供给；**通知面**（含撤权通知）要 MCP 令牌主密钥——不是为了解密，而是因为
+  "这条变化通知过了"这个水位就落在 ``mcp_sync_check`` 上；**探针面**才要问数 MCP 端点。
+  缺端点时撤权通知照常发（它本来就不探针），缺权限表令牌时已发布的那些照常推进确认。
+  一个装了却每轮都炸的假探针会把"还没接线"伪装成"接线了但一直失败"，因此宁可不装。
+
+## 单轮的两个上界
+
+条数预算（:data:`DEFAULT_PUBLISH_LIMIT` / :data:`DEFAULT_READINESS_LIMIT`）挡的是外部
+接口配额，**时间预算**（:data:`DEFAULT_ROUND_BUDGET_SECONDS`）挡的是外部劣化：两个条数
+预算刷满可以到几十分钟，而 scheduler 的活性心跳每轮才跳一次。两个预算都是"本轮止步、
+下轮继续"，发布与就绪都可重入。停止信号与时间预算在**每一条**之前各查一次——发布面也
+一样（`V-部署-03`「停止领取新工作」）。
+
+## 单实例假设
+
+本职责按 **``lingxi-scheduler`` 只有一个实例**设计。同时跑两个实例时，两边会各自取到
+同一批候选并各发一次探针；``mcp_sync_check`` 的 advisory 锁保证取号不撞，但同一条变化
+可能被通知两次。当前部署编排里 scheduler 是单副本，此处按已知假设登记，不做分布式租约。
 """
 
 from __future__ import annotations
@@ -107,6 +124,13 @@ DEFAULT_PUBLISH_LIMIT = 50
 #: 由就绪计划表决定，与这个数无关。
 DEFAULT_READINESS_LIMIT = 50
 
+#: **单轮时间预算（秒）**。外部劣化时，条数预算挡不住时间：一条发布要写外部表 + 逐字段
+#: 读回，一次探针最长 20 秒，把两个条数预算刷满可以到几十分钟。而 scheduler 的活性心跳
+#: 每轮才跳一次，默认阈值 180 秒（``LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS``）
+#: ——一轮跑过头会让"这一轮很慢"被读成"心跳丢了"。取 60 秒：它等于默认调度周期，留出
+#: 三倍于心跳阈值的余量，且发布与就绪都可重入，本轮没做完的下一轮接着做。
+DEFAULT_ROUND_BUDGET_SECONDS = 60.0
+
 
 class _PublishExecutor(Protocol):
     def run_once(self, *, limit: int = ...) -> Sequence[Any]: ...
@@ -117,7 +141,12 @@ class _IntentStore(Protocol):
 
     def reclaim_stale(self, *, older_than: timedelta = ...) -> int: ...
     def published_awaiting_readiness(
-        self, *, reasons: Sequence[str], limit: int = ...
+        self,
+        *,
+        reasons: Sequence[str],
+        interval_seconds: int,
+        budget_seconds: int,
+        limit: int = ...,
     ) -> Sequence[Any]: ...
     def notice_recipient_open_id(self, user_id: str) -> str | None: ...
 
@@ -129,6 +158,9 @@ class _ReadinessChecks(Protocol):
 
 
 class _Ticker(Protocol):
+    schedule: Any
+    probe_wired: bool
+
     def advance(
         self, binding: ReadinessBinding, *, permissions: str, progress: ReadinessProgress
     ) -> ReadinessAttempt | None: ...
@@ -175,7 +207,9 @@ class PermissionPublishReport:
     notices_skipped: int = 0
     failed: int = 0
     interrupted: bool = False
+    publish_wired: bool = True
     readiness_wired: bool = True
+    probe_wired: bool = True
 
     def audit_facts(self) -> dict[str, Any]:
         facts: dict[str, Any] = {
@@ -191,7 +225,9 @@ class PermissionPublishReport:
             "notices_failed": self.notices_failed,
             "notices_skipped": self.notices_skipped,
             "failed": self.failed,
+            "publish_wired": self.publish_wired,
             "readiness_wired": self.readiness_wired,
+            "probe_wired": self.probe_wired,
         }
         if self.interrupted:
             facts["interrupted"] = True
@@ -215,7 +251,14 @@ class _Tally:
     notices_skipped: int = 0
     failed: int = 0
 
-    def freeze(self, *, interrupted: bool, readiness_wired: bool) -> PermissionPublishReport:
+    def freeze(
+        self,
+        *,
+        interrupted: bool,
+        publish_wired: bool,
+        readiness_wired: bool,
+        probe_wired: bool,
+    ) -> PermissionPublishReport:
         return PermissionPublishReport(
             reclaimed=self.reclaimed,
             attempts=self.attempts,
@@ -230,7 +273,9 @@ class _Tally:
             notices_skipped=self.notices_skipped,
             failed=self.failed,
             interrupted=interrupted,
+            publish_wired=publish_wired,
             readiness_wired=readiness_wired,
+            probe_wired=probe_wired,
         )
 
 
@@ -248,26 +293,37 @@ class PermissionPublishDuty:
     def __init__(
         self,
         *,
-        executor: _PublishExecutor,
         intents: _IntentStore,
         audit: _AuditSink,
+        executor: _PublishExecutor | None = None,
         readiness: ReadinessFollowUp | None = None,
         publish_limit: int = DEFAULT_PUBLISH_LIMIT,
         readiness_limit: int = DEFAULT_READINESS_LIMIT,
+        round_budget_seconds: float = DEFAULT_ROUND_BUDGET_SECONDS,
+        on_alert: Callable[[str, str], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
         for label, value in (("发布", publish_limit), ("就绪", readiness_limit)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"单轮{label}预算必须是正整数")
+        if isinstance(round_budget_seconds, bool) or not isinstance(
+            round_budget_seconds, (int, float)
+        ) or round_budget_seconds <= 0:
+            raise ValueError("单轮时间预算必须是正数秒")
         if readiness is not None and not isinstance(readiness, ReadinessFollowUp):
             raise TypeError("就绪面必须整体注入 ReadinessFollowUp，不接受半套装配")
+        if executor is None and readiness is None:
+            # 两面都没装配的职责放进循环里只会每分钟记一条空报告，纯噪声。
+            raise ValueError("发布面与就绪面至少要装配一面")
         self._executor = executor
         self._intents = intents
         self._audit = audit
         self._readiness = readiness
         self._publish_limit = publish_limit
         self._readiness_limit = readiness_limit
+        self._round_budget = timedelta(seconds=float(round_budget_seconds))
+        self._on_alert = on_alert
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
         self._stop = threading.Event() if stop is None else stop
@@ -277,6 +333,12 @@ class PermissionPublishDuty:
         return self._stop.is_set()
 
     @property
+    def publish_wired(self) -> bool:
+        """发布面装配了没有。缺权限表坐标或令牌供给时它是 ``False``，就绪面照常推进。"""
+
+        return self._executor is not None
+
+    @property
     def readiness_wired(self) -> bool:
         """就绪与通知这一面装配了没有。装配层缺配置时它是 ``False``，发布面照常。"""
 
@@ -284,6 +346,18 @@ class PermissionPublishDuty:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _out_of_time(self, started: datetime) -> bool:
+        """本轮的时间预算用完了没有。
+
+        它挡的是**外部劣化**：发布一条要写外部表 + 逐字段读回，探针一次最长 20 秒，
+        一轮把预算全刷完可以到几十分钟——而 ``lingxi-scheduler`` 的活性心跳每轮才跳一次，
+        阈值是 ``LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS``（默认 180 秒）。
+        一轮跑过头会让告警状态机把"这个进程还活着、只是这一轮很慢"读成"心跳丢了"。
+        因此本轮到点就止步，剩下的下一轮继续——发布与就绪都是可重入的。
+        """
+
+        return self._clock() - started >= self._round_budget
 
     # ------------------------------------------------------------------
     # 一轮
@@ -300,25 +374,27 @@ class PermissionPublishDuty:
             # 已经在停止中：一条意图都不领，一次探针都不发。
             return None
 
+        started = self._clock()
         tally = _Tally()
         tally.reclaimed = self._intents.reclaim_stale()
-        attempts = tuple(self._executor.run_once(limit=self._publish_limit))
-        tally.attempts = len(attempts)
-        tally.published = sum(1 for attempt in attempts if getattr(attempt, "published", False))
+        interrupted = self._publish(tally, started)
 
-        interrupted = False
         readiness = self._readiness
-        if readiness is not None and not self._stop.is_set():
+        if readiness is not None and not interrupted and not self._stop.is_set():
             pending = tuple(
                 self._intents.published_awaiting_readiness(
-                    reasons=FOLLOW_UP_REASONS, limit=self._readiness_limit
+                    reasons=FOLLOW_UP_REASONS,
+                    interval_seconds=readiness.ticker.schedule.interval_seconds,
+                    budget_seconds=readiness.ticker.schedule.budget_seconds,
+                    limit=self._readiness_limit,
                 )
             )
             tally.pending_readiness = len(pending)
             for item in pending:
-                if self._stop.is_set():
-                    # 停止信号落在遍历中间：不再为后面的人发探针或发通知。已经落库的
-                    # 判定各自是一个完整事务；下一次启动会从库里把进度原样读回来。
+                if self._stop.is_set() or self._out_of_time(started):
+                    # 停止信号或时间预算落在遍历中间：不再为后面的人发探针或发通知。
+                    # 已经落库的判定各自是一个完整事务；下一次启动会从库里把进度原样
+                    # 读回来。
                     interrupted = True
                     break
                 try:
@@ -338,7 +414,14 @@ class PermissionPublishDuty:
                         type(error).__name__,
                     )
 
-        report = tally.freeze(interrupted=interrupted, readiness_wired=self.readiness_wired)
+        report = tally.freeze(
+            interrupted=interrupted,
+            publish_wired=self.publish_wired,
+            readiness_wired=self.readiness_wired,
+            # 探针没接线时，需要探针的那一路本轮不推进——报告里必须看得出来，
+            # 否则"待确认一直是 20 条、本轮推进 0"读起来像卡死。
+            probe_wired=readiness is None or readiness.ticker.probe_wired,
+        )
         self._audit.record("permission_publish.completed", **report.audit_facts())
         if report.advanced or report.attempts or report.reclaimed:
             # 摘要只有计数。一轮什么都没做时不打日志：这条职责每分钟跑一次。
@@ -361,6 +444,35 @@ class PermissionPublishDuty:
         return report
 
     # ------------------------------------------------------------------
+    # 发布面
+    # ------------------------------------------------------------------
+
+    def _publish(self, tally: _Tally, started: datetime) -> bool:
+        """消费待发布意图，返回"本轮是不是被中断了"。
+
+        **逐条认领而不是一次 ``limit=50``**（二级审查 N4）：执行器的批量循环里没有停止
+        钩子，SIGTERM 之后它会把整批新意图继续认领完——违反"停止领取新工作"
+        （`V-部署-03`），而同一进程里的重算面与就绪面都是逐条检查的。改成每次只认领一条、
+        每条之前重新看一眼停止标志与时间预算，语义就与另外两面对齐了；``limit`` 从"一次
+        取多少"退化为"这一轮最多取多少条"，含义不变。
+        """
+
+        if self._executor is None:
+            return False
+        for _ in range(self._publish_limit):
+            if self._stop.is_set() or self._out_of_time(started):
+                return True
+            attempts = tuple(self._executor.run_once(limit=1))
+            if not attempts:
+                # 没有待发布意图了：这不是中断，是正常收工。
+                return False
+            tally.attempts += len(attempts)
+            tally.published += sum(
+                1 for attempt in attempts if getattr(attempt, "published", False)
+            )
+        return False
+
+    # ------------------------------------------------------------------
     # 单条待确认
     # ------------------------------------------------------------------
 
@@ -370,11 +482,21 @@ class PermissionPublishDuty:
         ``readiness`` 由 :meth:`run_once` 取好再传进来，而不是在这里读 ``self``：
         那一面可能整个没装配，把"它一定在"写成断言，等于让一条只在 ``-O`` 之外成立的
         保证承担类型收窄。
+
+        **收件人先查，再推进**（二级审查 N2）。次序反过来的话，收件人查询的一次瞬时
+        数据库异常会发生在**终态判定已经落库之后**——那条确认从此被候选集永久排除，
+        用户永远收不到通知，而留下的只有一条泛化的 ``user_failed``。先查则相反：查询
+        失败 → 本轮不推进、终态不落、下一轮原样重来。代价是"还没到期"的候选也会多一次
+        只读查询，而 :meth:`~lingxi.adapters.postgres_permission_publish.
+        PostgresPermissionPublishStore.published_awaiting_readiness` 已经只返回到期的
+        那些，代价因此是有界的。
         """
 
         binding = ReadinessBinding(
             user_id=item.user_id, permission_version=item.permission_version
         )
+        # 先查收件人：这一步失败不留任何终态，下一轮重来。
+        open_id = self._intents.notice_recipient_open_id(item.user_id)
         progress = ReadinessProgress.from_checks(
             readiness.checks.load_checks(item.user_id, item.permission_version)
         )
@@ -382,33 +504,48 @@ class PermissionPublishDuty:
             binding, permissions=item.permissions, progress=progress
         )
         if attempt is None:
-            # 还没到期，或者已经收口：本轮一次外部调用都不发。
+            # 还没到期、已经收口，或探针未接线：本轮一次外部调用都不发。
             return
         tally.advanced += 1
         if attempt.outcome is ReadinessOutcome.READY:
             tally.ready += 1
-            self._notify(readiness, item, tally)
+            self._notify(readiness, item, open_id, tally)
             return
         if attempt.outcome is ReadinessOutcome.NO_PERMISSION:
             # 撤权那一路：没有可等的就绪，发布读回一致本身就是通知的触发点
             # （产品负责人 2026-08-18 裁定 1）。
             tally.revoked += 1
-            self._notify(readiness, item, tally)
+            self._notify(readiness, item, open_id, tally)
             return
         if attempt.outcome is ReadinessOutcome.TIMED_OUT:
-            # **不通知**：我们没能确认这个人真的可以问数（模块文档「三条边界」）。
+            # **不通知**：我们没能确认这个人真的可以问数（模块文档「四条边界」）。
+            # 但它必须留下一条**可告警的事实**——否则刷新链的超时只剩日志与计数，
+            # 而 S-C-02 的阻塞路径是有告警出口的（`on_alert`）。
             tally.timed_out += 1
+            self._alert("permission_readiness_timed_out", item)
 
-    def _notify(self, readiness: ReadinessFollowUp, item: Any, tally: _Tally) -> None:
+    def _notify(
+        self, readiness: ReadinessFollowUp, item: Any, open_id: str | None, tally: _Tally
+    ) -> None:
         """发一条权限变化通知。**这一步失败不回头改任何状态。**
 
         通知的种类由 :func:`lingxi.core.permission.notification.render_scope_notice`
         从 ``permissions`` 文本自己判定，与就绪结论用的是**同一个**存在性判据
         （``lookup_metrics(document)``）。因此"探针成功却发出一条撤权通知"这种自相矛盾
         的组合在结构上不可能出现，不需要在这里再判一次。
+
+        **发送前的每一条异常路径都留一条 ``permission_notice.failed``**（二级审查 N2）：
+        渲染失败、端口自身崩溃，都要在通知这条链上可见，而不是只剩一条泛化的
+        ``permission_publish.user_failed``。记完之后照常上抛——渲染失败是本侧缺陷，
+        吞掉它等于把一个可修的 bug 变成"这个人偶尔收不到通知"。
+
+        **残余的 at-most-once 窗口，如实登记**：终态记录已经落库、通知还没发出去时进程
+        崩溃，这一条通知就永久丢了（候选集不会再取回它）。不做通知 outbox 是刻意的——
+        产品负责人 2026-08-18 裁定 4 要求的是"有限重试 + 审计"，不是 exactly-once；
+        为一条告知型消息再建一张 outbox，代价与收益不成比例。该窗口写进验收矩阵的未验证
+        清单。
         """
 
-        open_id = self._intents.notice_recipient_open_id(item.user_id)
         if not open_id:
             # 还没开通完、已停用或正在删除的账号：不发，只计数与留痕。
             tally.notices_skipped += 1
@@ -418,16 +555,38 @@ class PermissionPublishDuty:
                 permission_version=item.permission_version,
             )
             return
-        result = readiness.notices.notify(
-            user_id=item.user_id,
-            open_id=open_id,
-            permission_version=item.permission_version,
-            permissions=item.permissions,
-        )
+        try:
+            result = readiness.notices.notify(
+                user_id=item.user_id,
+                open_id=open_id,
+                permission_version=item.permission_version,
+                permissions=item.permissions,
+            )
+        except Exception as error:  # noqa: BLE001 - 记完通知侧的痕迹再上抛
+            tally.notices_failed += 1
+            self._audit.record(
+                "permission_notice.failed",
+                user=item.user_id,
+                permission_version=item.permission_version,
+                # 只记异常类型：异常正文可能带上正文或收件人。
+                error_code=type(error).__name__,
+                stage="render_or_dispatch",
+            )
+            raise
         if result.delivered:
             tally.notices_sent += 1
         else:
             tally.notices_failed += 1
+
+    def _alert(self, kind: str, item: Any) -> None:
+        """把一条可告警事实交给注入的出口；**回调失败不改变任何结果**。"""
+
+        if self._on_alert is None:
+            return
+        try:
+            self._on_alert(kind, item.user_id)
+        except Exception as error:  # noqa: BLE001 - 观察者不是这条链的一部分
+            logger.error("权限就绪告警回调失败 error=%s", type(error).__name__)
 
 
 __all__ = [

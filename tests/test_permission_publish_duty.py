@@ -45,6 +45,7 @@ from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REVOKE_REASON,
 )
 from lingxi.core.permission.mcp_readiness import (
+    CONTRACT_SCHEDULE,
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
@@ -109,13 +110,20 @@ class FakeAttempt:
 
 
 class FakeExecutor:
-    def __init__(self, *attempts: FakeAttempt) -> None:
-        self._attempts = attempts
+    """逐条认领的假执行器：每次 ``run_once`` 交出脚本里的下一条，空了就返回空。"""
+
+    def __init__(self, *attempts: FakeAttempt, on_call=None) -> None:
+        self._queue = list(attempts)
         self.calls: list[int] = []
+        self._on_call = on_call
 
     def run_once(self, *, limit: int = 50):
         self.calls.append(limit)
-        return self._attempts
+        if self._on_call is not None:
+            self._on_call()
+        if not self._queue:
+            return ()
+        return (self._queue.pop(0),)
 
 
 class FakePending:
@@ -131,12 +139,17 @@ class FakeIntents:
         *pending: FakePending,
         recipients: dict[str, str] | None = None,
         reclaimed: int = 0,
+        pending_error: Exception | None = None,
+        recipient_error: Exception | None = None,
     ) -> None:
         self._pending = pending
+        self._pending_error = pending_error
+        self._recipient_error = recipient_error
         self._recipients = {USER_ONE: OPEN_ID, USER_TWO: OPEN_ID} if recipients is None else recipients
         self._reclaimed = reclaimed
         self.reclaim_calls = 0
         self.pending_calls: list[int] = []
+        self.schedule_calls: list[tuple[int, int]] = []
         self.reason_calls: list[tuple[str, ...]] = []
         self.recipient_calls: list[str] = []
 
@@ -144,13 +157,20 @@ class FakeIntents:
         self.reclaim_calls += 1
         return self._reclaimed
 
-    def published_awaiting_readiness(self, *, reasons, limit: int = 50):
+    def published_awaiting_readiness(
+        self, *, reasons, interval_seconds: int, budget_seconds: int, limit: int = 50
+    ):
         self.pending_calls.append(limit)
         self.reason_calls.append(tuple(reasons))
+        self.schedule_calls.append((interval_seconds, budget_seconds))
+        if self._pending_error is not None:
+            raise self._pending_error
         return self._pending
 
     def notice_recipient_open_id(self, user_id: str) -> str | None:
         self.recipient_calls.append(user_id)
+        if self._recipient_error is not None:
+            raise self._recipient_error
         return self._recipients.get(user_id)
 
 
@@ -167,9 +187,13 @@ class FakeChecks:
 class FakeTicker:
     """按用户脚本返回一次判定；``None`` 表示"本轮没到期"。"""
 
-    def __init__(self, script: dict[str, object] | None = None) -> None:
+    def __init__(
+        self, script: dict[str, object] | None = None, *, probe_wired: bool = True
+    ) -> None:
         self._script = script or {}
         self.calls: list[tuple[str, int, str]] = []
+        self.schedule = CONTRACT_SCHEDULE
+        self.probe_wired = probe_wired
 
     def advance(self, binding: ReadinessBinding, *, permissions: str, progress: ReadinessProgress):
         self.calls.append((binding.user_id, binding.permission_version, permissions))
@@ -238,9 +262,12 @@ class RecordingAudit:
         return [fields for name, fields in self.records if name == action]
 
 
+_UNSET = object()
+
+
 def build_duty(
     *,
-    executor: FakeExecutor | None = None,
+    executor=_UNSET,
     intents: FakeIntents | None = None,
     ticker: FakeTicker | None = None,
     checks: FakeChecks | None = None,
@@ -248,8 +275,11 @@ def build_duty(
     audit: RecordingAudit | None = None,
     stop: threading.Event | None = None,
     wire_readiness: bool = True,
+    on_alert=None,
+    round_budget_seconds: float = 60.0,
+    clock=None,
 ):
-    executor = executor or FakeExecutor()
+    executor = FakeExecutor() if executor is _UNSET else executor
     intents = intents or FakeIntents()
     ticker = ticker or FakeTicker()
     checks = checks or FakeChecks()
@@ -265,6 +295,9 @@ def build_duty(
         intents=intents,
         audit=audit,
         readiness=readiness,
+        on_alert=on_alert,
+        round_budget_seconds=round_budget_seconds,
+        clock=clock,
         stop=stop,
     )
     return duty, {
@@ -294,7 +327,8 @@ class PublishFaceTest(unittest.TestCase):
         report = duty.run_once()
 
         self.assertEqual(parts["intents"].reclaim_calls, 1, "崩溃留下的在途意图每轮收殓")
-        self.assertEqual(parts["executor"].calls, [DEFAULT_PUBLISH_LIMIT])
+        # **逐条认领**（N4）：每次只领一条，好在每条之前重新看一眼停止标志与时间预算。
+        self.assertEqual(parts["executor"].calls, [1, 1, 1])
         self.assertEqual(report.attempts, 2)
         self.assertEqual(report.published, 1)
         self.assertEqual(report.reclaimed, 2)
@@ -408,9 +442,10 @@ class ReadinessNoticeTest(unittest.TestCase):
         report, parts = self._run(None)
 
         self.assertEqual(parts["notices"].calls, [])
-        self.assertEqual(parts["intents"].recipient_calls, [])
         self.assertEqual(report.advanced, 0)
         self.assertEqual(report.pending_readiness, 1)
+        # 收件人查询在推进**之前**（N2），因此它照常发生；真正的否定面是"零通知"。
+        self.assertEqual(parts["intents"].recipient_calls, [USER_ONE])
 
     def test_the_progress_is_rebuilt_from_the_stored_checks(self) -> None:
         duty, parts = build_duty(
@@ -509,6 +544,174 @@ class NoticeFailureTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
+class NoticeReliabilityTest(unittest.TestCase):
+    """N2：收件人先查再推进；发送前的每条异常路径都留 ``permission_notice.*`` 痕迹。"""
+
+    def test_a_recipient_lookup_failure_does_not_burn_the_confirmation(self) -> None:
+        """否定断言：收件人查询失败 → **本轮不推进、终态不落**，下一轮原样重来。
+
+        反过来（先落终态再查收件人）会让一次瞬时数据库异常把这条确认永久收口：候选集
+        从此排除它，用户永远收不到通知，留下的只有一条泛化的 user_failed。
+        """
+
+        duty, parts = build_duty(
+            intents=FakeIntents(
+                FakePending(USER_ONE, 2, GRANTED), recipient_error=RuntimeError("注入的库抖动")
+            ),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.READY}),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["ticker"].calls, [], "推进没有发生")
+        self.assertEqual(parts["checks"].calls, [], "连进度都不用读")
+        self.assertEqual(report.advanced, 0)
+        self.assertEqual(report.failed, 1)
+
+    def test_the_recipient_is_looked_up_before_the_probe(self) -> None:
+        order: list[str] = []
+
+        class OrderedIntents(FakeIntents):
+            def notice_recipient_open_id(self, user_id: str) -> str | None:
+                order.append("recipient")
+                return super().notice_recipient_open_id(user_id)
+
+        class OrderedTicker(FakeTicker):
+            def advance(self, binding, *, permissions, progress):
+                order.append("advance")
+                return super().advance(binding, permissions=permissions, progress=progress)
+
+        duty, _ = build_duty(
+            intents=OrderedIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=OrderedTicker({USER_ONE: ReadinessOutcome.READY}),
+        )
+
+        duty.run_once()
+
+        self.assertEqual(order, ["recipient", "advance"])
+
+    def test_a_notice_port_crash_leaves_a_notice_level_trace(self) -> None:
+        """否定断言：发送前崩溃**不得只留一条泛化的 user_failed**。"""
+
+        duty, parts = build_duty(
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.READY}),
+            notices=FakeNotices(error=RuntimeError("注入的渲染崩溃")),
+        )
+
+        report = duty.run_once()
+
+        failed = parts["audit"].fields_for("permission_notice.failed")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["error_code"], "RuntimeError")
+        self.assertEqual(failed[0]["stage"], "render_or_dispatch")
+        self.assertEqual(report.notices_failed, 1)
+        self.assertEqual(report.failed, 1, "同时仍是一次响亮的用户级失败")
+
+
+class DueOrderingTest(unittest.TestCase):
+    """N3：候选窗口只装"这一轮真的该动"的，且新发布优先。"""
+
+    def test_the_sweep_hands_the_schedule_to_the_query(self) -> None:
+        duty, parts = build_duty()
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["intents"].schedule_calls,
+            [(CONTRACT_SCHEDULE.interval_seconds, CONTRACT_SCHEDULE.budget_seconds)],
+            "到期判据必须与就绪节奏同源，否则窗口会被没到期的候选占满",
+        )
+
+    def test_a_backlog_does_not_starve_the_round(self) -> None:
+        """积压场景：窗口里全是到期项时照样逐条推进，不因为条数多就跳过。"""
+
+        pending = [FakePending(f"usr_{index:026d}", 2, GRANTED) for index in range(50)]
+        duty, parts = build_duty(
+            intents=FakeIntents(*pending, recipients={}),
+            ticker=FakeTicker({item.user_id: ReadinessOutcome.WAITING for item in pending}),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.advanced, 50)
+        self.assertEqual(len(parts["ticker"].calls), 50)
+
+
+class ReadinessAlertTest(unittest.TestCase):
+    """N5：刷新链的超时至少产生一条可告警事实。"""
+
+    def test_a_timeout_reports_an_alertable_fact(self) -> None:
+        alerts: list[tuple[str, str]] = []
+        duty, _ = build_duty(
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.TIMED_OUT}),
+            on_alert=lambda kind, user: alerts.append((kind, user)),
+        )
+
+        duty.run_once()
+
+        self.assertEqual(alerts, [("permission_readiness_timed_out", USER_ONE)])
+
+    def test_a_ready_confirmation_reports_nothing(self) -> None:
+        alerts: list[tuple[str, str]] = []
+        duty, _ = build_duty(
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.READY}),
+            on_alert=lambda kind, user: alerts.append((kind, user)),
+        )
+
+        duty.run_once()
+
+        self.assertEqual(alerts, [])
+
+    def test_an_exploding_alert_callback_does_not_change_the_result(self) -> None:
+        def explode(kind: str, user: str) -> None:
+            raise RuntimeError("注入的告警回调崩溃")
+
+        duty, _ = build_duty(
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.TIMED_OUT}),
+            on_alert=explode,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.timed_out, 1)
+        self.assertEqual(report.failed, 0, "观察者不是这条链的一部分")
+
+
+class UnwiredProbeTest(unittest.TestCase):
+    """N6：探针未接线时，撤权通知照常、报告里看得出来。"""
+
+    def test_the_report_says_the_probe_is_not_wired(self) -> None:
+        duty, _ = build_duty(ticker=FakeTicker(probe_wired=False))
+
+        report = duty.run_once()
+
+        self.assertFalse(report.probe_wired)
+        self.assertTrue(report.readiness_wired)
+
+    def test_the_publish_face_can_be_absent(self) -> None:
+        duty, parts = build_duty(
+            executor=None,
+            intents=FakeIntents(FakePending(USER_ONE, 2, REVOKED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.NO_PERMISSION}),
+        )
+
+        report = duty.run_once()
+
+        self.assertFalse(duty.publish_wired)
+        self.assertFalse(report.publish_wired)
+        self.assertEqual(report.attempts, 0)
+        self.assertEqual(report.revoked, 1, "已发布的撤权照常确认与通知")
+        self.assertEqual(len(parts["notices"].calls), 1)
+
+    def test_a_duty_with_neither_face_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            PermissionPublishDuty(intents=FakeIntents(), audit=RecordingAudit())
+
+
 class NonBlockingTest(unittest.TestCase):
     def test_the_duty_has_no_waiting_port_at_all(self) -> None:
         """否定断言：**一轮 tick 不可能被就绪等待阻塞**。
@@ -576,6 +779,69 @@ class NonBlockingTest(unittest.TestCase):
 
         self.assertIsNone(reports[0])
         self.assertEqual(reports[1].ready, 1)
+
+    def test_a_stop_signal_inside_the_publish_loop_claims_no_more(self) -> None:
+        """否定断言（N4）：**停止信号落在发布循环中间就不再认领新意图**。
+
+        `V-部署-03`「停止领取新工作」——重算面与就绪面都是逐条检查的，发布面漏掉这一条
+        会让 SIGTERM 之后整批新意图继续被认领走。
+        """
+
+        stop = threading.Event()
+        executor = FakeExecutor(
+            *(FakeAttempt(published=True) for _ in range(5)), on_call=stop.set
+        )
+        duty, parts = build_duty(executor=executor, stop=stop)
+
+        report = duty.run_once()
+
+        self.assertEqual(len(executor.calls), 1, "第一条之后就不再领了")
+        self.assertEqual(report.attempts, 1)
+        self.assertTrue(report.interrupted)
+        self.assertEqual(parts["intents"].pending_calls, [], "中断后不再开就绪面")
+
+    def test_a_round_that_runs_out_of_time_stops_and_resumes_next_round(self) -> None:
+        """否定断言（N4）：**单轮有时间上界**，外部劣化时本轮止步、下轮继续。
+
+        条数预算挡不住时间：一条发布要写外部表 + 逐字段读回，把 50 条刷满可以到几十
+        分钟，而活性心跳每轮才跳一次（默认阈值 180 秒）。
+        """
+
+        moment = [NOW]
+
+        def clock() -> datetime:
+            return moment[0]
+
+        def spend_a_minute() -> None:
+            moment[0] = moment[0] + timedelta(seconds=31)
+
+        executor = FakeExecutor(
+            *(FakeAttempt(published=True) for _ in range(5)), on_call=spend_a_minute
+        )
+        duty, parts = build_duty(
+            executor=executor,
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.READY}),
+            clock=clock,
+            round_budget_seconds=60.0,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.attempts, 2, "两条就用掉 62 秒，本轮止步")
+        self.assertTrue(report.interrupted)
+        self.assertEqual(parts["ticker"].calls, [], "本轮不再开就绪面")
+
+    def test_an_illegal_round_budget_is_rejected(self) -> None:
+        for value in (0, -1, True):
+            with self.subTest(value):
+                with self.assertRaises(ValueError):
+                    PermissionPublishDuty(
+                        executor=FakeExecutor(),
+                        intents=FakeIntents(),
+                        audit=RecordingAudit(),
+                        round_budget_seconds=value,  # type: ignore[arg-type]
+                    )
 
     def test_a_stopping_duty_does_nothing(self) -> None:
         """否定断言：停止之后**零发布、零探针、零通知**。"""
@@ -711,31 +977,31 @@ class DutyRegistrationTest(unittest.TestCase):
     def _own_records(self, audit: RecordingAudit, prefix: str):
         return [record for record in audit.records if record[0].startswith(prefix)]
 
-    def test_without_the_base_token_the_duty_is_not_registered(self) -> None:
+    def test_without_the_base_token_the_publish_face_names_the_variable(self) -> None:
         audit = RecordingAudit()
 
-        loop = build_loop(self._config(), audit=audit)
+        build_loop(self._config(), audit=audit)
 
-        self.assertNotIn("权限发布与就绪确认", [duty.name for duty in loop.duties])
         records = self._own_records(audit, "permission_publish.")
         self.assertEqual(len(records), 1, "前置缺项时本职责的审计恰 1 条")
-        action, fields = records[0]
-        self.assertEqual(action, "permission_publish.duty_not_registered")
+        _action, fields = records[0]
         self.assertEqual(fields["variable"], "LINGXI_PERMISSION_BITABLE_APP_TOKEN")
         self.assertNotIn("value", fields)
 
-    def test_without_the_access_token_supply_the_duty_is_not_registered(self) -> None:
+    def test_without_the_access_token_supply_the_publish_face_is_unwired(self) -> None:
         audit = RecordingAudit()
 
-        loop = build_loop(self._wired_config(), audit=audit)
+        build_loop(self._wired_config(), audit=audit)
 
-        self.assertNotIn("权限发布与就绪确认", [duty.name for duty in loop.duties])
         records = self._own_records(audit, "permission_publish.")
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0][1]["reason"], "permission_table_access_token_unwired")
 
-    def test_without_the_mcp_endpoint_only_the_readiness_face_is_skipped(self) -> None:
-        """否定断言：**缺 MCP 端点 → 就绪面不装配 + 恰一条审计，发布面照常注册。**"""
+    def test_without_the_mcp_endpoint_only_the_probe_is_skipped(self) -> None:
+        """否定断言（N6）：**缺 MCP 端点只关掉探针**——撤权通知与发布都照常。
+
+        撤权通知不依赖探针；把整面关掉会让一个权限刚被收回的人永远收不到告知。
+        """
 
         audit = RecordingAudit()
 
@@ -746,16 +1012,53 @@ class DutyRegistrationTest(unittest.TestCase):
         )
 
         duties = {duty.name: duty for duty in loop.duties}
-        self.assertIn("权限发布与就绪确认", duties)
-        self.assertFalse(duties["权限发布与就绪确认"].readiness_wired)
+        duty = duties["权限发布与就绪确认"]
+        self.assertTrue(duty.publish_wired)
+        self.assertTrue(duty.readiness_wired, "通知面照常装配")
         records = self._own_records(audit, "permission_readiness.")
-        self.assertEqual(len(records), 1, "就绪面未装配的审计恰 1 条")
+        self.assertEqual(len(records), 1, "探针未装配的审计恰 1 条")
+        self.assertEqual(records[0][0], "permission_readiness.probe_not_wired")
         self.assertEqual(records[0][1]["variable"], "LINGXI_QUERY_MCP_ENDPOINT")
         self.assertEqual(
             self._own_records(audit, "permission_publish."), [], "发布面照常，不留未注册审计"
         )
 
-    def test_without_the_master_key_only_the_readiness_face_is_skipped(self) -> None:
+    def test_without_the_bitable_token_the_readiness_face_still_runs(self) -> None:
+        """否定断言（N6）：**缺发布面前置时，已发布权限的确认与通知照常**。
+
+        没有理由因为"暂时写不了新的一行"就把已经发布出去、正等着确认的那些一起停掉。
+        """
+
+        audit = RecordingAudit()
+
+        loop = build_loop(
+            self._config(
+                LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                LINGXI_QUERY_MCP_ENDPOINT="https://mcp.example.invalid/rpc",
+            ),
+            audit=audit,
+        )
+
+        duties = {duty.name: duty for duty in loop.duties}
+        self.assertIn("权限发布与就绪确认", duties)
+        duty = duties["权限发布与就绪确认"]
+        self.assertFalse(duty.publish_wired)
+        self.assertTrue(duty.readiness_wired)
+        records = self._own_records(audit, "permission_publish.")
+        self.assertEqual(len(records), 1, "发布面未装配的审计恰 1 条")
+        self.assertEqual(records[0][0], "permission_publish.publish_not_wired")
+
+    def test_with_neither_face_the_duty_is_not_registered(self) -> None:
+        audit = RecordingAudit()
+
+        loop = build_loop(self._config(), audit=audit)
+
+        self.assertNotIn("权限发布与就绪确认", [duty.name for duty in loop.duties])
+        records = self._own_records(audit, "permission_publish.")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0][0], "permission_publish.duty_not_registered")
+
+    def test_without_the_master_key_the_whole_follow_up_face_is_skipped(self) -> None:
         audit = RecordingAudit()
 
         loop = build_loop(
