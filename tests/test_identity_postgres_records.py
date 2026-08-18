@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from lingxi.adapters.postgres import connect
@@ -371,6 +372,238 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.assertFalse(self.path.exists())
 
 
+class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
+    """按需续期模式（``claim_due(for_supply=True)``）在真库 + 真文件上的语义。
+
+    日报改成按日取一次派生短期令牌之后，凭据领取多了一条"还没到期也可以领"的路径。
+    这条路径与"每 UTC 日至多一次"的上界**捆在同一个开关上**，而上界的判据落在凭据
+    文件里、由本模块在自己的文件锁内判定——**这是唯一的一道**：进程内的账本副本不认识
+    凭据代际，人工重授权换来的新凭据会被旧账本一直拒到第二天（收口轮 P1）。一次性令牌
+    被高频消费正是 2026-08-08 那次事故的形状（AGENTS.md 工作底线）。
+
+    认领断言：``V-身份-03``（凭据仍只以密文落盘、判据不含任何令牌值）、
+    ``V-身份-04``（被拒的领取不得让凭据进入不可恢复状态）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        import tempfile
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        # 刚发放：轮换点在 5.6 天之后，因此"到期领取"这条路径拿不到它。
+        self.issued_at = datetime.now(timezone.utc)
+
+    def _save(self, *, refresh_consumed_at: datetime | None = None, seconds: int = 7 * 24 * 3600) -> None:
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), seconds, "offline_access"),
+            issued_at=self.issued_at,
+            refresh_consumed_at=refresh_consumed_at,
+        )
+
+    def test_a_credential_that_is_not_due_yet_is_only_claimable_for_supply(self) -> None:
+        self._save()
+
+        self.assertIsNone(self.vault.claim_due(), "到期领取这条路径不受影响")
+        claimed = self.vault.claim_due(for_supply=True)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.subject_open_id, DELEGATED_SUBJECT)
+
+    def test_the_claim_carries_back_the_moment_generated_inside_the_lock(self) -> None:
+        """权威消费时刻由锁内生成并随领取交出（收口轮 P2-a）。
+
+        调用方拿它原样写回新凭据，"哪一天已经消费过"因此只有一个时钟说了算；两处各算
+        一次的话，等锁跨过 UTC 午夜就会得到不同的日期。
+        """
+
+        self._save()
+        before = datetime.now(timezone.utc)
+
+        claimed = self.vault.claim_due(for_supply=True)
+
+        after = datetime.now(timezone.utc)
+        self.assertIsNotNone(claimed.consumed_at)
+        self.assertGreaterEqual(claimed.consumed_at, before)
+        self.assertLessEqual(claimed.consumed_at, after)
+        self.assertEqual(claimed.consumed_at.utcoffset(), timedelta(0))
+
+    def test_the_moment_is_taken_after_the_lock_is_acquired(self) -> None:
+        """"现在几点"必须在**拿到锁之后**取（收口轮 P2-a）。
+
+        锁外先算好、再进去等锁，等锁跨过 UTC 午夜时 D+1 的那次领取会被当成 D，当天
+        因此可以再消费一次一次性凭据。这里用真实的锁竞争把它钉住：另一个持有者压住锁
+        两百毫秒，领取拿到的时刻必须晚于锁被释放的那一刻。
+        """
+
+        import fcntl
+        import threading
+
+        self._save()
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        released_at: list[datetime] = []
+        holding = threading.Event()
+
+        def hold_the_lock() -> None:
+            with open(lock_path, "a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                holding.set()
+                time.sleep(0.2)
+                released_at.append(datetime.now(timezone.utc))
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        holder = threading.Thread(target=hold_the_lock)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(holding.wait(timeout=5))
+
+        claimed = self.vault.claim_due(for_supply=True)
+        holder.join()
+
+        self.assertIsNotNone(claimed)
+        self.assertGreaterEqual(
+            claimed.consumed_at, released_at[0], "时刻在锁外取的话会早于锁被释放的那一刻"
+        )
+
+    def test_a_second_claim_on_the_day_already_consumed_is_refused(self) -> None:
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        with self.assertRaises(RefreshAlreadyConsumedToday) as raised:
+            self.vault.claim_due(for_supply=True)
+
+        self.assertNotIn(FAKE_TOKEN, str(raised.exception))
+        # 异常带着"是哪一次消费"占掉了今天，调用方据此判断自己的记号还算不算数。
+        self.assertEqual(raised.exception.consumed_at, moment)
+
+    def test_the_ceiling_is_judged_against_the_locks_own_clock(self) -> None:
+        """"今天"由锁内的当前时刻决定，不由调用方在锁外算好（收口轮 P2-a）。
+
+        用注入的 ``now`` 表达"等锁等到了第二天"：判定必须跟着走到 D+1，那一天照常
+        领得到；否则跨午夜的那一次会被算成 D，当天平白多消费一次一次性凭据。
+        """
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime(2026, 8, 18, 23, 59, 30, tzinfo=timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        with self.assertRaises(RefreshAlreadyConsumedToday):
+            self.vault.claim_due(for_supply=True, now=moment + timedelta(seconds=20))
+
+        claimed = self.vault.claim_due(for_supply=True, now=moment + timedelta(minutes=1))
+        self.assertIsNotNone(claimed, "跨过 UTC 午夜之后是新的一天")
+
+    def test_a_refused_claim_leaves_the_credential_fully_usable(self) -> None:
+        """**上界判定必须在置位消费标记之前**。
+
+        反过来的话，每一次被拒的领取都会把凭据标成"消费中"——那等于每天亲手制造一次
+        凭据丢失，而它要到收殓超时之后才会被发现。变异验红锚点：把上界判定挪到
+        ``payload["consumed_at"] = ...`` 之后，本用例必须变红。
+        """
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        with self.assertRaises(RefreshAlreadyConsumedToday):
+            self.vault.claim_due(for_supply=True)
+
+        self.assertTrue(self.path.exists(), "被拒的领取不得删除凭据")
+        self.assertIsNotNone(self.vault.load(), "被拒的领取不得把凭据标成消费中")
+        self.assertIsNotNone(
+            self.vault.claim_due(for_supply=True, now=moment + timedelta(days=1)),
+            "换到下一天就该正常领得到",
+        )
+
+    def test_a_freshly_authorized_credential_is_not_blocked_by_the_ceiling(self) -> None:
+        """**收口轮 P1 在凭据层的那一半**：新授权不带消费时刻，因此当天立刻可用。
+
+        刚做完人工重新授权就被上界挡住，会让运维在恢复之后还要再等一天；这也正是
+        进程内账本副本做不到的事——它只记得"今天已经用过"，认不出这是一条新凭据。
+        """
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        self._save(refresh_consumed_at=datetime.now(timezone.utc))  # 今天已经消费过一次
+        with self.assertRaises(RefreshAlreadyConsumedToday):
+            self.vault.claim_due(for_supply=True)
+
+        # 人工重授权：同一天写入一条全新凭据，**不带**消费时刻。
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-reauthorized-token"), 7 * 24 * 3600, "offline_access"),
+        )
+
+        self.assertIsNotNone(self.vault.claim_due(for_supply=True), "重授权当天即可恢复供给")
+
+    def test_an_expired_credential_is_revoked_before_the_ceiling_is_consulted(self) -> None:
+        """失效优先于一切：一条已经失效的凭据要被清掉并要求重新授权，
+        而不是先报一句"今天已经换过了"把真正的问题盖住。"""
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment, seconds=3600)
+
+        later = moment + timedelta(seconds=3601)
+        try:
+            claimed = self.vault.claim_due(for_supply=True, now=later)
+        except RefreshAlreadyConsumedToday:  # pragma: no cover - 次序错了才会走到这里
+            self.fail("失效判定必须排在频率上界之前")
+
+        self.assertIsNone(claimed)
+        self.assertFalse(self.path.exists())
+
+    def test_the_consumption_moment_survives_a_rotation_write(self) -> None:
+        """轮换写回时把领取时拿到的那个时刻一起落盘：上界因此跟着最新那一代走。"""
+
+        first = datetime.now(timezone.utc) - timedelta(days=1)
+        self._save(refresh_consumed_at=first)
+        claimed = self.vault.claim_due(for_supply=True)
+        self.assertIsNotNone(claimed)
+
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            replacing_generation=claimed.generation,
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+            refresh_consumed_at=claimed.consumed_at,
+        )
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        with self.assertRaises(RefreshAlreadyConsumedToday) as raised:
+            self.vault.claim_due(for_supply=True)
+        self.assertEqual(raised.exception.consumed_at, claimed.consumed_at)
+        self.assertIsNotNone(
+            self.vault.claim_due(for_supply=True, now=claimed.consumed_at + timedelta(days=1)),
+            "第二天照常领得到",
+        )
+
+    def test_the_credential_file_still_carries_no_token_in_plaintext(self) -> None:
+        """`V-身份-03`：新增的判据是一个时刻，不是凭据；文件依然整体是密文。"""
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        blob = self.path.read_bytes()
+        self.assertNotIn(FAKE_TOKEN.encode(), blob)
+        self.assertNotIn(b"refresh_consumed_at", blob)
+
+
 class CredentialGenerationGuardTest(IdentityPostgresTestCase):
     """终轮 Codex P1：轮换收尾必须世代匹配——期间的新授权不得被旧链覆盖或删除。"""
 
@@ -461,6 +694,11 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
 
     这条判定必须由真库证明：``ON CONFLICT DO NOTHING`` 在已有登记时返回零行，
     是数据库在同一事务里做的判断，不是应用先读后写。
+
+    **只有真库判定留在这里。** 同一断言里「两种 CAS 不能同时传」那一条是
+    ``save()`` 开头的纯内存 ``ValueError``，与数据库无关，挂在这个门控下等于在
+    没有数据库的机器上从来不跑；它已搬到
+    ``tests/test_identity_credentials.py::VaultSaveArgumentGuardTest``（#215）。
     """
 
     def setUp(self) -> None:
@@ -523,15 +761,6 @@ class SubjectBootstrapCasTest(IdentityPostgresTestCase):
         credential = self.vault.load()
         assert credential is not None
         self.assertEqual(credential.grant.refresh_token.reveal(), "fake-renewed-token")
-
-    def test_the_two_cas_conditions_cannot_be_combined(self) -> None:
-        with self.assertRaises(ValueError):
-            self.vault.save(
-                subject_open_id=DELEGATED_SUBJECT,
-                grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
-                require_absent_registration=True,
-                expected_registered_subject_open_id=DELEGATED_SUBJECT,
-            )
 
     def test_bootstrapping_an_employee_open_id_is_still_rejected_by_the_database(self) -> None:
         """V-身份-02 的反向触发器对首次建立同样有效：错误主体进不了登记。"""

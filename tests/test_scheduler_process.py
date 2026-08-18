@@ -37,11 +37,17 @@ from lingxi.apps.scheduler import (
     SchedulerLoop,
     build_loop,
 )
-from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
+from lingxi.core.identity.credentials import (
+    AuthorizationGrant,
+    DerivedAccessToken,
+    RefreshAlreadyConsumedToday,
+    SecretToken,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
+FAKE_ACCESS_TOKEN = "fake-access-token-for-tests-only"
 COMPLETE_ENV = {
     "LINGXI_POSTGRES_DSN": "postgresql://user@localhost:5432/lingxi",
     "LINGXI_DELEGATED_CREDENTIAL_KEY": "ZmFrZS1mZXJuZXQta2V5LWZvci11bml0LXRlc3RzLTA9",
@@ -66,13 +72,28 @@ def credential(*, subject: str = "ou_delegated", seconds: int = 604800) -> Store
 
 
 class FakeVault:
+    """凭据库替身。
+
+    ``claim_due`` / ``save`` 的关键字与真实凭据库保持一致（含 Issue #215 新增的
+    ``require_due`` / ``refuse_if_consumed_on`` / ``refresh_consumed_at``）：签名对不上时
+    这里会直接 ``TypeError``，这正是"装配把参数传错了"应该有的响亮失败。
+    """
+
     def __init__(self, claims: list[StoredCredential | None], *, save_failures: int = 0) -> None:
         self._claims = list(claims)
         self._save_failures = save_failures
         self.saved: list[tuple[str, AuthorizationGrant]] = []
         self.revoked: list[str] = []
+        # 落盘记下来的"今天已经消费过一次续期"判据，供频率上界断言。
+        self.consumed_days: list[object] = []
+        # 与派生令牌持有者共享的事件序列，用于断言"先落盘、后交出"。
+        self.events: list[str] = []
 
-    def claim_due(self):
+    def claim_due(self, *, require_due: bool = True, refuse_if_consumed_on=None):
+        self.last_require_due = require_due
+        self.last_refuse_if_consumed_on = refuse_if_consumed_on
+        if refuse_if_consumed_on is not None and refuse_if_consumed_on in self.consumed_days:
+            raise RefreshAlreadyConsumedToday("今天已经消费过一次续期凭据，本次领取被拒")
         return self._claims.pop(0) if self._claims else None
 
     def save(
@@ -83,11 +104,15 @@ class FakeVault:
         issued_at=None,
         replacing_generation=None,
         expected_registered_subject_open_id=None,
+        refresh_consumed_at=None,
     ) -> bool:
         if self._save_failures > 0:
             self._save_failures -= 1
             raise RuntimeError("模拟写库失败")
+        self.events.append("save")
         self.saved.append((subject_open_id, grant))
+        if refresh_consumed_at is not None:
+            self.consumed_days.append(refresh_consumed_at.date())
         return True
 
     def revoke(self, *, reason: str, generation=None) -> bool:
@@ -100,13 +125,18 @@ class FakeVault:
 
 
 class FakeAuthorization:
-    def __init__(self, result) -> None:
+    def __init__(self, result, *, access_token_lifetime: int | None = 7200) -> None:
         self._result = result
+        self._access_token_lifetime = access_token_lifetime
+        self.calls = 0
 
     def refresh(self, current: AuthorizationGrant):
+        self.calls += 1
         if isinstance(self._result, Exception):
             raise self._result
-        return self._result, SecretToken("fake-access")
+        return self._result, DerivedAccessToken(
+            SecretToken(FAKE_ACCESS_TOKEN), self._access_token_lifetime
+        )
 
 
 class SchedulerConfigTest(unittest.TestCase):

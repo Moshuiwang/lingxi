@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
-from lingxi.core.identity.credentials import AuthorizationGrant, SecretToken
+from lingxi.core.identity.credentials import AuthorizationGrant, DerivedAccessToken, SecretToken
 
 logger = logging.getLogger(__name__)
 
@@ -324,13 +324,20 @@ class FeishuAuthorizationClient:
             grant=AuthorizationGrant(SecretToken(refresh_token), expires_in, scope),
         )
 
-    def refresh(self, current: AuthorizationGrant) -> tuple[AuthorizationGrant, SecretToken]:
+    def refresh(self, current: AuthorizationGrant) -> tuple[AuthorizationGrant, DerivedAccessToken]:
         """用当前 ``refresh_token`` 换一组新凭据。
 
-        返回 ``(新的长期凭据, 短期 access_token)``。任何字段缺失、类型不符或
+        返回 ``(新的长期凭据, 派生短期令牌)``。**长期凭据**的任何字段缺失、类型不符或
         有效期非正都抛 :class:`FeishuDirectoryError`——调用方据此按
         :func:`lingxi.core.identity.credentials.decide_after_refresh` 撤销，
         **绝不重放旧凭据**。
+
+        短期令牌的寿命（``expires_in``）自 Issue #215 起被记下来交给调用方：日报改成
+        按日取一次令牌之后，"缓存的这份还能不能用"没有别的判据。但它**缺失时不判整轮
+        续期失败**，只是让派生令牌的寿命成为"未知"：续期成功这件事已经发生，新的一次性
+        ``refresh_token`` 必须照常落盘，为一个附带字段把凭据判死会让"需人工重新授权"
+        因为一个非凭据原因而发生，方向是反的。寿命未知的后果留在令牌供给那一侧
+        （持有者拒绝缓存 → 供给按分类失败关闭），不会伪装成别的东西。
         """
 
         response = self._transport(
@@ -358,8 +365,22 @@ class FeishuAuthorizationClient:
         if not isinstance(expires_in, int) or isinstance(expires_in, bool) or expires_in <= 0:
             raise FeishuDirectoryError("refresh_token_lifetime_missing")
         scope = data.get("scope")
-        logger.info("专用授权续期成功 lifetime_seconds=%s", expires_in)
-        return AuthorizationGrant(SecretToken(next_token), expires_in, scope if isinstance(scope, str) else ""), SecretToken(access_token)
+        access_token_lifetime = data.get("expires_in")
+        if (
+            not isinstance(access_token_lifetime, int)
+            or isinstance(access_token_lifetime, bool)
+            or access_token_lifetime <= 0
+        ):
+            access_token_lifetime = None
+        logger.info(
+            "专用授权续期成功 lifetime_seconds=%s access_token_lifetime_seconds=%s",
+            expires_in,
+            access_token_lifetime,
+        )
+        return (
+            AuthorizationGrant(SecretToken(next_token), expires_in, scope if isinstance(scope, str) else ""),
+            DerivedAccessToken(SecretToken(access_token), access_token_lifetime),
+        )
 
 
 def _text_value(value: object) -> str:
