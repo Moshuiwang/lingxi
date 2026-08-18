@@ -13,17 +13,36 @@
 把「执行 Owner」定义为「编排者或其指定的受控脚本」，指的就是本文件。
 
 **默认 dry-run**：不传 ``--execute`` 时，任何步骤都只打印将要发起的调用与参数
-形状（且参数已脱敏），不发出任何真实请求——用 ``FakeTransport``/真实
-``LarkDriveTransport`` 的契约测试见 ``tests/test_probe_drive_folder_permissions.py``
-的 ``test_dry_run_never_calls_transport``。
+形状（且参数已脱敏），不发出任何真实请求。
 
 **硬停止是代码，不是约定**：步骤 3 出现预期外协作者、步骤 4/5 协作者授予结果不
-符合预期、步骤 6 文档继承与目录协作者不一致、步骤 8 ``T-Neg-01`` 意外可以访问，
-任一命中都会抛出 :class:`ProbeHalt`，终止后续步骤并自动进入清理（步骤 9）。
-**这里没有、也不会加「扩大 scope 后重试」或「修改租户设置后继续」的开关**——
-:class:`DriveTransport` 协议里根本不存在任何租户设置写接口，触发硬停止后，
-再次运行本脚本（``--cleanup-only`` 以外的任何调用）会被状态文件里记录的
-``halted_at_step`` 直接拒绝，见 ``main()``。
+符合预期（逐个身份比对期望协作者集合，不是只看数量和目标成员是否在列表里）、
+步骤 6 文档协作者与目录**当前实际重新读回**的协作者不一致（不是与本地内存里
+"以为授过谁"比较）、步骤 8 ``T-Neg-01`` 意外可以访问，任一命中都会抛出
+:class:`ProbeHalt`，终止后续步骤并自动进入清理（步骤 9）。**这里没有、也不会
+加「扩大 scope 后重试」或「修改租户设置后继续」的开关**——:class:`DriveTransport`
+协议里根本不存在任何租户设置写接口。
+
+**命中硬停止后，没有任何参数组合能让脚本继续发起真实写请求**（2026-08-18 独立
+审查坐实了上一版的四处绕过面，已逐条封死，见每处代码注释里的"独立审查"标记）：
+
+- 状态文件路径**固定**为 ``$LINGXI_DRIVE_PROBE_STATE_DIR/drive_folder_probe_state.json``，
+  不接受任何 ``--state-file`` 式的路径覆盖参数——上一版正是靠"换一个状态文件路径"
+  就能让硬停止形同虚设。
+- 每次命中硬停止都会**额外**写一份与状态目录无关的**全局哨兵文件**
+  （``~/.lingxi_drive_probe_halted.json``，路径固定，不经过任何 CLI 参数或环境
+  变量，也不在这份 docstring 之外的任何地方暴露成可配置项）：只要它存在，任何
+  ``--execute``（``--cleanup-only`` 除外）都会被直接拒绝——哪怕把
+  ``LINGXI_DRIVE_PROBE_STATE_DIR`` 换成一个全新、此前从未用过的目录也一样。
+  清除它**只能靠人工直接删除这个文件**，脚本不提供、也不会提供任何命令行方式
+  清除它。
+- 命令行解析关闭了前缀缩写匹配（``allow_abbrev=False``）：``--e``/``--ex``/
+  ``--exec`` 一律被当成未知参数拒绝，不会被静默解释成 ``--execute``。
+- 状态的"读 → 判断是否已经停止 → 跑步骤 → 落盘"全过程持有跨进程文件锁
+  （POSIX ``flock``，见 :func:`_locked_state`），两个并发调用不会互相踩踏，
+  也不会出现"后保存者覆盖掉先停止者写下的停止状态"。
+- 命中硬停止后**先落盘停止状态，再尝试自动清理**；清理阶段哪怕抛异常，磁盘上
+  的停止事实也已经写死，不会因为清理崩溃就在下次调用时"看起来像没发生过"。
 
 **凭据只从环境变量读取，不接受命令行参数**（命令行参数会进 shell 历史与进程
 列表）：
@@ -42,9 +61,12 @@
 
 **状态文件**（``$LINGXI_DRIVE_PROBE_STATE_DIR/drive_folder_probe_state.json``）
 让九步可以逐步执行、可以在窗口中断后从任意步续跑——它保存本次探针创建的真实
-对象标识（目录/文档 token、已授予的协作者），**不脱敏**，因此只能活在独立临时
-目录里，不得提交、粘贴进 Issue、日志或聊天。终端输出与状态文件是两回事：终端
-输出（``build_report``）永远脱敏。
+对象标识（目录/文档 token、已授予的协作者、**完整目录名**），**不脱敏**，因此
+只能活在独立临时目录里，不得提交、粘贴进 Issue、日志或聊天。终端输出与状态
+文件是两回事：终端输出（``build_report`` 及九步各自的 summary）永远脱敏，包括
+目录名/文档名（一律经 :func:`redact_id`）与飞书返回的自由文本 ``msg``
+（一律经 :func:`redact_message`，**不透传原文，哪怕截断也不做**——它自己可能
+就带着完整成员标识或邮箱）。
 
 **协作者列表符合预期 ≠ 仅本人可访问**：文件夹链接分享范围没有已知可读写 API，
 程序永远无法自证「除协作者外没有别的入口能打开」。``only_owner_accessible`` 字段
@@ -53,17 +75,20 @@
 
 **退出码**：0 全部请求步骤正常完成（含 dry-run 预览、cleanup-only 完全清空）；
 1 脚本内部异常（环境/网络问题，不是探针结论）；2 用法或配置错误（缺环境变量、
-步骤顺序不对、命令行参数冲突）；3 命中硬停止条款（已自动清理，属预期内的
-「停止并记录」，不是崩溃），**或**清理步骤本身没有完全成功（例如某个协作者
-删不掉）——两种情况都必须看 JSON 输出里的 ``halted_at_step``/``complete`` 字段
-分辨具体原因，退出码只负责告诉调用方"不能当作已经收尾，需要看详情"。
+步骤顺序不对、命令行参数冲突/未知参数、状态文件损坏）；3 命中硬停止条款（含
+清理阶段本身抛异常或没有完全成功），或全局硬停止哨兵仍然存在——两种情况都
+必须看 stderr 与 JSON 输出里的 ``halted_at_step``/``complete`` 字段分辨具体原因，
+退出码只负责告诉调用方"不能当作已经收尾，需要看详情"。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
+import re
 import secrets
 import sys
 from dataclasses import dataclass, field, asdict
@@ -121,7 +146,11 @@ class DriveTransport(Protocol):
 
 
 def redact_id(value: str | None, *, keep: int = 4) -> str:
-    """截断标识：只保留前 ``keep`` 位与长度，永不回显完整 token/用户标识。"""
+    """截断标识：只保留前 ``keep`` 位与长度，永不回显完整 token/用户标识/目录名。
+
+    独立审查 P1-3：目录名、文档名也一律经过这里，不因为"内容是脚本自己生成的
+    非业务字符串"就当成安全，宁可排障时少一点信息，也不给共享屏幕留原文。
+    """
 
     if not value:
         return "(none)"
@@ -131,12 +160,28 @@ def redact_id(value: str | None, *, keep: int = 4) -> str:
     return f"{text[:keep]}…(len={len(text)})"
 
 
-def redact_message(text: str | None, *, limit: int = 200) -> str:
-    """飞书返回的 ``msg`` 字段偶尔会回显请求参数；截断为保守长度，不做语义解析。"""
+_IDENTIFIER_LIKE_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,}")
+
+
+def redact_message(text: str | None) -> dict[str, Any]:
+    """把飞书返回的自由文本 ``msg`` 折叠成不透传原文的元信息。
+
+    独立审查 P1-3 坐实：``msg`` 偶尔会回显请求参数——完整 token、成员标识、
+    邮箱都可能落在里面；截断只是"泄露得晚一点"，不是脱敏。这里**不透传任何
+    原文片段**，哪怕截断也不做，只给长度和一个粗粒度的"看起来像不像含有
+    标识符"信号，供人判断要不要去受控环境自己的日志里查原始返回。
+    """
 
     if not text:
-        return ""
-    return text[:limit]
+        return {"present": False}
+    looks_like_identifier = bool(_IDENTIFIER_LIKE_PATTERN.search(text)) or "@" in text
+    return {"present": True, "length": len(text), "looks_like_identifier": looks_like_identifier}
+
+
+def redact_path(path: Path | str) -> str:
+    """路径可能含真实用户名/主机目录结构；只保留文件名，不回显父目录。"""
+
+    return f"…/{Path(path).name}"
 
 
 UNKNOWN = "unknown"
@@ -207,7 +252,18 @@ def load_config(env: dict[str, str]) -> ProbeConfig:
 # ---------------------------------------------------------------------------
 # 状态：让九步可以逐步执行、可以在窗口中断后续跑。**不脱敏**——只允许活在
 # LINGXI_DRIVE_PROBE_STATE_DIR 指定的独立临时目录，不得提交、粘贴进 Issue/日志。
+#
+# 状态文件名**固定**、不接受任何 CLI 覆盖（独立审查 P1-1）：上一版的
+# ``--state-file`` 让"换一个路径"等价于"换一次干净的探针"，硬停止形同虚设。
 # ---------------------------------------------------------------------------
+
+_STATE_FILENAME = "drive_folder_probe_state.json"
+
+_DEFAULT_HALT_SENTINEL_PATH = Path.home() / ".lingxi_drive_probe_halted.json"
+"""全局硬停止哨兵的默认位置：固定在 home 目录下，不经过任何 CLI 参数或环境
+变量。``main()`` 的 ``halt_sentinel_path`` 形参**只用于测试注入**，真实调用
+永远落在这一个位置——正是为了让"换一个状态目录"救不了"换一次干净的探针"。
+"""
 
 
 @dataclass
@@ -226,8 +282,8 @@ class ProbeState:
     def to_json(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["_notice"] = (
-            "本文件含未脱敏的探针运行状态，只应存在于独立临时目录，"
-            "不得提交、粘贴进 Issue、日志或聊天。"
+            "本文件含未脱敏的探针运行状态（含完整目录名/token），只应存在于"
+            "独立临时目录，不得提交、粘贴进 Issue、日志或聊天。"
         )
         return payload
 
@@ -246,7 +302,7 @@ def load_state(path: Path) -> ProbeState:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise StateCorruptError(
-            f"状态文件 {path} 无法读取或不是合法 JSON：{type(error).__name__}；"
+            f"状态文件 {redact_path(path)} 无法读取或不是合法 JSON：{type(error).__name__}；"
             "不猜测状态，手动核对后再继续（必要时删除该文件重新开始）"
         ) from error
     return ProbeState.from_json(payload)
@@ -257,6 +313,56 @@ def save_state(path: Path, state: ProbeState) -> None:
     path.write_text(
         json.dumps(state.to_json(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+@contextlib.contextmanager
+def _locked_state(path: Path):
+    """整个"读状态 → 判断是否已经命中过硬停止 → 跑步骤 → 落盘"必须在同一把
+    跨进程互斥锁内完成（独立审查 P2-a）：否则两个并发进程可能都读到"尚未停止"，
+    其中一个已经停止的结果，还可能被后保存的另一个进程覆盖掉。
+
+    锁文件与状态文件同目录、固定命名（``<状态文件名>.lock``），不经过任何 CLI
+    参数——它锁的是"这个状态目录"，不是"这次调用挑的路径"（状态文件名本身也
+    已经固定，见 :data:`_STATE_FILENAME`）。用 POSIX ``flock``：本仓库的受控
+    执行环境（``biai-stage``/``tz``）都是 Linux，不追求跨平台。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _load_halt_sentinel(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # 哨兵本身损坏也按"存在"处理：宁可误挡一次真实写操作，也不能因为解析
+        # 失败就放行——这个文件的唯一职责是挡，不是提供诊断信息。
+        return {"step": None, "reason": "sentinel_unreadable"}
+
+
+def _write_halt_sentinel(path: Path, *, step: int, reason: str, state_dir: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "halted_at": datetime.now(timezone.utc).isoformat(),
+        "step": step,
+        "reason": reason,
+        "state_dir": redact_path(state_dir),
+        "notice": (
+            "跨状态目录的全局硬停止哨兵：只要这个文件存在，任何 --execute"
+            "（--cleanup-only 除外）都会被拒绝，没有命令行参数能清除它。"
+            "确认已经人工处理后，手动删除本文件才能继续任何真实写操作。"
+        ),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +396,10 @@ def _is_creator_entry(member: dict[str, Any]) -> bool:
     真实 API 是否真的把所有者列进 ``members``、以及具体字段取值，目前未经真实
     调用验证（L1，见模块 docstring）；第一次真实执行如与此假设不符，需要回来
     修正这条判定，不影响其余编排逻辑与契约测试覆盖的行为。
+
+    真实环境如果存在租户级默认协作者，需要先在执行卡的《步骤 3 默认项名单》
+    附录里登记，本函数本身不做任何"放行已知默认项"的例外——那属于窗口前的
+    人工核实结论，不是脚本可以替人判断的事。
     """
 
     return member.get("perm") == "owner" and member.get("member_type") == "app"
@@ -333,7 +443,7 @@ def step_2_create_folder(
     )
     plan = {
         "call": "create_folder",
-        "params": {"name": name, "parent_token": parent_display},
+        "params": {"name": redact_id(name), "parent_token": parent_display},
     }
     if dry_run:
         return StepOutcome(2, True, {"dry_run": True, "would_call": plan})
@@ -347,7 +457,7 @@ def step_2_create_folder(
         raise ProbeHalt(2, "create_folder_missing_token", {"code": result.code})
     state.probe_folder_token = token
     return StepOutcome(
-        2, True, {"code": result.code, "folder_token": redact_id(token), "folder_name": name}
+        2, True, {"code": result.code, "folder_token": redact_id(token), "folder_name": redact_id(name)}
     )
 
 
@@ -382,7 +492,6 @@ def _grant_and_verify(
     step: int,
     member_id: str,
     role: str,
-    expected_member_count: int,
     dry_run: bool,
 ) -> StepOutcome:
     if not dry_run and not state.probe_folder_token:
@@ -411,12 +520,17 @@ def _grant_and_verify(
         raise ProbeHalt(step, "read_back_failed", {"code": read_result.code})
 
     members = read_result.data.get("members", [])
-    matches = [m for m in members if m.get("member_id") == member_id and m.get("perm") == "edit"]
-    if len(matches) != 1 or len(members) != expected_member_count:
+    actual = {(m.get("member_id"), m.get("perm")) for m in members}
+    # 期望集合 = 此前已经确认授予过的全部协作者 + 这一次新授予的这一位——逐个
+    # 身份比对，不是"数量对了 + 目标成员在列表里就算过"（独立审查 P1-4：旧实现
+    # 用后者，会漏掉"多出一个意外协作者、同时目标成员也确实在列表里"这种情况，
+    # 而"有没有意外协作者"正是这次探针要回答的核心问题）。
+    expected = {(g["member_id"], g["perm"]) for g in state.collaborators_granted} | {(member_id, "edit")}
+    if actual != expected:
         raise ProbeHalt(
             step,
             "unexpected_grant_result",
-            {"member_count": len(members), "expected_member_count": expected_member_count},
+            {"actual_member_count": len(members), "expected_member_count": len(expected)},
         )
 
     state.collaborators_granted.append(
@@ -429,13 +543,7 @@ def step_4_grant_cross_tenant(
     transport: DriveTransport, config: ProbeConfig, state: ProbeState, *, dry_run: bool
 ) -> StepOutcome:
     return _grant_and_verify(
-        transport,
-        state,
-        step=4,
-        member_id=config.member_cross,
-        role="cross_tenant_positive",
-        expected_member_count=1,
-        dry_run=dry_run,
+        transport, state, step=4, member_id=config.member_cross, role="cross_tenant_positive", dry_run=dry_run
     )
 
 
@@ -443,13 +551,7 @@ def step_5_grant_same_tenant(
     transport: DriveTransport, config: ProbeConfig, state: ProbeState, *, dry_run: bool
 ) -> StepOutcome:
     return _grant_and_verify(
-        transport,
-        state,
-        step=5,
-        member_id=config.member_same,
-        role="same_tenant_control",
-        expected_member_count=2,
-        dry_run=dry_run,
+        transport, state, step=5, member_id=config.member_same, role="same_tenant_control", dry_run=dry_run
     )
 
 
@@ -461,9 +563,21 @@ def step_6_create_probe_document(
     if not dry_run and not state.collaborators_granted:
         raise UsageError("step_6_requires_step_4_or_5：先至少完成一次协作者授予再检查继承")
 
-    plan = {"call": "create_document", "params": {"folder_token": redact_id(state.probe_folder_token)}}
+    plan = {
+        "call": "list_collaborators(folder) + create_document + list_collaborators(document)",
+        "params": {"folder_token": redact_id(state.probe_folder_token)},
+    }
     if dry_run:
         return StepOutcome(6, True, {"dry_run": True, "would_call": plan})
+
+    # 先重新读一次目录**当前**的协作者，不用本地内存里"以为授过谁"的那份
+    # （独立审查 P1-4：旧实现只比较文档协作者与本地 `collaborators_granted`，
+    # 验证的是"文档 == 我以为我授过的人"，不是"文档 == 目录当前的协作者"——
+    # 继承一致性根本没被真正验证过）。
+    folder_read = transport.list_collaborators(token=state.probe_folder_token or "", obj_type="folder")
+    if not folder_read.ok:
+        raise ProbeHalt(6, "read_folder_collaborators_failed", {"code": folder_read.code})
+    folder_members = {(m.get("member_id"), m.get("perm")) for m in folder_read.data.get("members", [])}
 
     result = transport.create_document(folder_token=state.probe_folder_token or "")
     if not result.ok:
@@ -473,17 +587,16 @@ def step_6_create_probe_document(
         raise ProbeHalt(6, "create_document_missing_token", {"code": result.code})
     state.probe_document_token = doc_token
 
-    read_result = transport.list_collaborators(token=doc_token, obj_type="docx")
-    if not read_result.ok:
-        raise ProbeHalt(6, "read_document_collaborators_failed", {"code": read_result.code})
+    doc_read = transport.list_collaborators(token=doc_token, obj_type="docx")
+    if not doc_read.ok:
+        raise ProbeHalt(6, "read_document_collaborators_failed", {"code": doc_read.code})
+    doc_members = {(m.get("member_id"), m.get("perm")) for m in doc_read.data.get("members", [])}
 
-    doc_members = {(m.get("member_id"), m.get("perm")) for m in read_result.data.get("members", [])}
-    expected = {(g["member_id"], g["perm"]) for g in state.collaborators_granted}
-    if doc_members != expected:
+    if doc_members != folder_members:
         raise ProbeHalt(
             6,
             "inheritance_mismatch",
-            {"expected_count": len(expected), "actual_count": len(doc_members)},
+            {"folder_member_count": len(folder_members), "document_member_count": len(doc_members)},
         )
 
     return StepOutcome(
@@ -505,7 +618,7 @@ def step_7_repeat_calls(
 
     plan = {
         "call": "create_folder + add_collaborator (repeat)",
-        "params": {"name": state.folder_name, "member_id": redact_id(config.member_cross)},
+        "params": {"name": redact_id(state.folder_name), "member_id": redact_id(config.member_cross)},
     }
     if dry_run:
         return StepOutcome(7, True, {"dry_run": True, "would_call": plan})
@@ -692,7 +805,10 @@ def build_report(outcomes: list[StepOutcome], state: ProbeState, *, dry_run: boo
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="#97 专属云盘目录九步探针；默认 dry-run，见模块 docstring。"
+        description="#97 专属云盘目录九步探针；默认 dry-run，见模块 docstring。",
+        # 独立审查 P1-2：argparse 默认允许无歧义的长选项前缀缩写，`--e` 会被
+        # 静默解释成 `--execute`，"没传执行开关"就不再等于"这次是 dry-run"。
+        allow_abbrev=False,
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--step", type=int, choices=sorted(STEP_FUNCTIONS), help="只跑这一步")
@@ -706,7 +822,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="步骤 8：主持人现场观察到的结果（真实执行时必填）",
     )
-    parser.add_argument("--state-file", default=None, help="覆盖默认状态文件路径")
+    # 故意没有 --state-file：状态文件路径固定派生自 LINGXI_DRIVE_PROBE_STATE_DIR，
+    # 不给"换一个路径逃过硬停止"留任何命令行入口（独立审查 P1-1）。
     return parser
 
 
@@ -728,11 +845,38 @@ def main(
     transport: DriveTransport | None = None,
     env: dict[str, str] | None = None,
     now: datetime | None = None,
+    halt_sentinel_path: Path | None = None,
 ) -> int:
+    """``halt_sentinel_path`` 只用于测试注入；真实调用永远解析到固定的 home
+    目录路径（:data:`_DEFAULT_HALT_SENTINEL_PATH`），不经过任何 CLI 参数或
+    环境变量——这一点本身就是"没有绕过开关"的一部分，见模块 docstring。
+    """
+
     env = os.environ if env is None else env  # type: ignore[assignment]
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     dry_run = not args.execute
+    sentinel_path = halt_sentinel_path or _DEFAULT_HALT_SENTINEL_PATH
+    steps = _steps_from_args(args)
+    # 判断"这次请求是不是只做清理"看**实际要跑哪些步骤**，不看 `--cleanup-only`
+    # 这一个特定 flag 的名字——`--step 9 --execute` 产生的 steps 和 `--cleanup-only`
+    # 完全一样（都是 [9]，都只调用 step_9_cleanup），如果只放行 `--cleanup-only`
+    # 会把等价的 `--step 9` 也一起挡住，这是 2026-08-18 穷尽 CLI 面审查时发现的
+    # 一致性缺口（不是安全漏洞——挡多了不是问题，但会让人以为要用没有的开关）。
+    is_cleanup_only_request = steps == [9]
+
+    # 全局哨兵检查：不依赖 LINGXI_DRIVE_PROBE_STATE_DIR 指向哪里，纯清理请求
+    # 之外的任何真实写请求都先过这一关（独立审查 P1-1）。
+    existing_sentinel = _load_halt_sentinel(sentinel_path)
+    if existing_sentinel is not None and args.execute and not is_cleanup_only_request:
+        print(
+            "检测到全局硬停止哨兵：此前某次探针命中过硬停止，尚未人工清除，"
+            f"没有命令行参数能跳过它（step={existing_sentinel.get('step')} "
+            f"reason={existing_sentinel.get('reason')}）。确认已处理后手动删除 "
+            f"{redact_path(sentinel_path)} 才能继续任何真实写操作。",
+            file=sys.stderr,
+        )
+        return 3
 
     try:
         config = load_config(env)
@@ -740,64 +884,82 @@ def main(
         print(f"缺少环境变量：{', '.join(error.missing)}", file=sys.stderr)
         return 2
 
-    steps = _steps_from_args(args)
     if steps is None:
         parser.print_help(sys.stderr)
         return 2
 
-    state_path = Path(args.state_file) if args.state_file else config.state_dir / "drive_folder_probe_state.json"
-    try:
-        state = load_state(state_path)
-    except StateCorruptError as error:
-        print(str(error), file=sys.stderr)
-        return 2
-
-    if state.halted_at_step is not None and not args.cleanup_only:
-        print(
-            f"此前已在步骤 {state.halted_at_step} 触发硬停止（{state.halt_reason}）。"
-            "只允许 --cleanup-only；本脚本不提供跳过硬停止或扩大权限后继续的开关。",
-            file=sys.stderr,
-        )
-        return 3
+    state_path = config.state_dir / _STATE_FILENAME
 
     if transport is None:
         transport = LarkDriveTransport(app_id=config.app_id, app_secret=config.app_secret)
 
-    try:
-        outcomes, halt = run_steps(
-            transport, config, state, steps, dry_run=dry_run, t_neg_01_result=args.t_neg_01_result
-        )
-    except UsageError as error:
-        print(str(error), file=sys.stderr)
-        return 2
-    except Exception as error:  # noqa: BLE001 - 探针必须以文档化退出码收口，不留裸 traceback
-        print(f"{type(error).__name__}：探针内部错误，非硬停止结论", file=sys.stderr)
+    # 独立审查 P2-a：从这里开始的"读状态 → 判断 → 跑步骤 → 落盘"全程持有跨进程
+    # 锁，见 _locked_state docstring。
+    with _locked_state(state_path):
+        try:
+            state = load_state(state_path)
+        except StateCorruptError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+
+        if state.halted_at_step is not None and not is_cleanup_only_request:
+            print(
+                f"此前已在步骤 {state.halted_at_step} 触发硬停止（{state.halt_reason}）。"
+                "只允许 --cleanup-only（或等价的 --step 9）；本脚本不提供跳过硬停止"
+                "或扩大权限后继续的开关。",
+                file=sys.stderr,
+            )
+            return 3
+
+        try:
+            outcomes, halt = run_steps(
+                transport, config, state, steps, dry_run=dry_run, t_neg_01_result=args.t_neg_01_result
+            )
+        except UsageError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        except Exception as error:  # noqa: BLE001 - 探针必须以文档化退出码收口，不留裸 traceback
+            print(f"{type(error).__name__}：探针内部错误，非硬停止结论", file=sys.stderr)
+            if not dry_run:
+                save_state(state_path, state)
+            return 1
+
+        exit_code = 0
+        if halt is not None:
+            exit_code = 3
+            if not dry_run:
+                # 独立审查 P2-b：先落盘停止状态，接下来的自动清理即使崩溃，
+                # 停止事实也已经写死——不会因为清理阶段抛异常，就在磁盘上
+                # "看起来像这次硬停止从未发生过"。
+                save_state(state_path, state)
+                _write_halt_sentinel(sentinel_path, step=halt.step, reason=halt.reason, state_dir=config.state_dir)
+                if not any(o.step == 9 for o in outcomes):
+                    try:
+                        cleanup_outcome = step_9_cleanup(transport, state, dry_run=False)
+                    except Exception as error:  # noqa: BLE001 - 同上，清理阶段异常也不能裸崩
+                        state.step_summaries["step_9_crashed"] = {"error_type": type(error).__name__}
+                        save_state(state_path, state)
+                        print(
+                            f"清理阶段抛出异常（{type(error).__name__}）：硬停止状态已落盘，"
+                            "需要人工确认清理结果后再决定下一步；不得据此重试或跳过。",
+                            file=sys.stderr,
+                        )
+                        report = build_report(outcomes, state, dry_run=dry_run)
+                        print(json.dumps(report, ensure_ascii=False, indent=2))
+                        return 3
+                    state.step_summaries["step_9"] = cleanup_outcome.summary
+                    outcomes.append(cleanup_outcome)
+        elif any(o.step == 9 and not o.ok for o in outcomes):
+            # 没有硬停止，但清理本身没做完（例如某个协作者删不掉）：如实报告，
+            # 不能因为"没有命中硬停止条款"就顺势返回成功。
+            exit_code = 3
+
         if not dry_run:
             save_state(state_path, state)
-        return 1
 
-    exit_code = 0
-    if halt is not None:
-        exit_code = 3
-        # 判断"是否已经跑过清理"要看**实际产出的 outcomes**，不能看请求的 steps
-        # 列表——`--from-step 1` 把 9 也列在请求范围内，但硬停止会让循环在半路
-        # break，9 从未真的执行过。这里如果只检查 `9 not in steps` 会在这种情况
-        # 下误判"清理已经跑过"，导致硬停止后目录/协作者留在原地没人清理。
-        if not dry_run and not any(o.step == 9 for o in outcomes):
-            cleanup_outcome = step_9_cleanup(transport, state, dry_run=False)
-            state.step_summaries["step_9"] = cleanup_outcome.summary
-            outcomes.append(cleanup_outcome)
-    elif any(o.step == 9 and not o.ok for o in outcomes):
-        # 没有硬停止，但清理本身没做完（例如某个协作者删不掉）：如实报告，
-        # 不能因为"没有命中硬停止条款"就顺势返回成功。
-        exit_code = 3
-
-    if not dry_run:
-        save_state(state_path, state)
-
-    report = build_report(outcomes, state, dry_run=dry_run)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return exit_code
+        report = build_report(outcomes, state, dry_run=dry_run)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return exit_code
 
 
 # ---------------------------------------------------------------------------
