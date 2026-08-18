@@ -35,6 +35,7 @@ from typing import Any, Mapping, Protocol
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
+from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
     ClaimedPublish,
     PublishAttempt,
@@ -80,6 +81,21 @@ class PermissionDecision:
     @property
     def enqueued(self) -> bool:
         return self.outcome is DecisionOutcome.ENQUEUED
+
+
+@dataclass(frozen=True)
+class PendingReadiness:
+    """一条已经发布读回一致、但就绪确认还没收口的意图（S-C-03b 的每轮 tick 输入）。
+
+    ``permissions`` 是**当初决定发布、并且已经逐字段读回核对过**的那一串文本。就绪判定
+    的 ``no_permission`` 分支与通知正文都只认它，因此这条链上不存在"通知说的范围"与
+    "消费方读到的范围"来自两次不同计算的可能。
+    """
+
+    user_id: str
+    permission_version: int
+    permissions: str
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +485,129 @@ class PostgresPermissionPublishStore:
         if redacted:
             logger.info("发布意图内容已到期擦除 条数=%s", redacted)
         return redacted
+
+    # ------------------------------------------------------------------
+    # 发布之后：该给谁做就绪确认、该给谁发通知
+    # ------------------------------------------------------------------
+
+    def published_awaiting_readiness(self, *, limit: int = 50) -> tuple[PendingReadiness, ...]:
+        """取「已经发布读回一致、但就绪确认还没收口」的那些 ``(用户, 权限版本)``。
+
+        这是 S-C-03b 的调度职责每轮 tick 的输入（见
+        :mod:`lingxi.apps.scheduler.permission_publish`）。三条筛选各自都不能少：
+
+        1. ``status = 'published'``——**只有发布读回一致的那一版**才进入就绪确认与通知。
+           这条同时就是「撤权通知只在读回一致之后发」这条产品裁定在 SQL 里的落点：
+           一条还在 ``pending`` 的撤权意图取不到，也就发不出任何通知。
+        2. **该用户没有更新的意图**。权限在确认期间又变了时，旧的那一版不该再被确认、
+           更不该据它给用户发一条已经过时的范围通知；新的那一版会自己走一遍。
+        3. **没有终态就绪记录**（``ready`` / ``no_permission`` / ``timed_out``）。
+           终态是这条链**唯一**的"已经处理过"水位——它同时保证了同一次变化的通知只发
+           一次，不需要第二张表、也不需要在 outbox 上再加一列状态。
+
+        **本方法跨读 ``mcp_sync_check``（属 ``postgres_mcp_token`` 的表），是一处知情的
+        例外**：两张表同属"权限发布与就绪确认"这一个领域，本方法**只读**，而 ``mcp_sync_check``
+        的**写**仍然只有 ``postgres_mcp_token.record_attempt`` 一处。做成一条语句是必需
+        而不是省事——把第三条筛选挪到 Python 里做，就得先把"全部已发布的最新意图"取回来
+        再逐条过滤，于是已经确认完的人会一直占着取回窗口，当天靠后发布的那些人可能永远
+        排不进来（饿死），而这种缺陷在小数据量的用例里完全看不出来。
+
+        ``payload`` 过了九十天会被 :meth:`redact_expired_payloads` 擦成 ``'{}'``，
+        因此这里要求 ``payload`` 里确有 ``permissions`` 键：擦过的快照说不出"当时发布的
+        范围是什么"，据它渲染通知只会渲染出一句错话。
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        terminal = sorted(item.value for item in TERMINAL_OUTCOMES)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT o.user_id, o.permission_version, o.payload ->> 'permissions',
+                          o.published_at
+                     FROM publish_outbox o
+                    WHERE o.status = 'published'
+                      AND o.payload ? 'permissions'
+                      AND NOT EXISTS (
+                            SELECT 1 FROM publish_outbox newer
+                             WHERE newer.user_id = o.user_id
+                               AND newer.permission_version > o.permission_version
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1 FROM mcp_sync_check c
+                             WHERE c.user_id = o.user_id
+                               AND c.permission_version = o.permission_version
+                               AND c.result = ANY(%s)
+                          )
+                    ORDER BY o.published_at, o.id
+                    LIMIT %s""",
+                (terminal, limit),
+            )
+            rows = cursor.fetchall()
+        return tuple(
+            PendingReadiness(
+                user_id=str(row[0]),
+                permission_version=int(row[1]),
+                permissions=str(row[2]),
+                published_at=row[3],
+            )
+            for row in rows
+        )
+
+    def has_published_intent(self, user_id: str) -> bool:
+        """这个用户**有没有过**一条发布成功的意图。
+
+        撤权那一侧的判据（`V-权限-08` 的刷新侧）：只有"我们真的往发布表写成功过一行"的
+        用户，才值得为他发一条把 ``permissions`` 清空的更新。这是**本地能拿到的、关于
+        "发布表里有没有他那一行"最直接的证据**——发布链路只有一条，写成功过就等于那一行
+        存在（我们不删行）。
+
+        反过来，从来没有过 ``published`` 意图的人**跳过**：为他新建一行空权限没有意义
+        （问数 MCP 对查无此人本来就默认拒绝），而新建还需要一份令牌密文。既有 26 行那些
+        旧系统写的人也落在这一路——硬切之前他们的撤权由旧系统负责（产品负责人 2026-08-18
+        裁定 3 的时效边界）。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("发布历史判定必须指明用户")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM publish_outbox WHERE user_id = %s AND status = 'published' LIMIT 1",
+                (user_id,),
+            )
+            return cursor.fetchone() is not None
+
+    def notice_recipient_open_id(self, user_id: str) -> str | None:
+        """权限变化通知发给谁：该用户的 ``feishu_open_id``；不该发就返回 ``None``。
+
+        **两条过滤是产品约束，不是编码习惯**，口径与花名册比对基线同源
+        （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）：
+
+        - ``provisioning_state = 'active'``：还没完成开通的人不该收到"你的可用范围已更新"；
+        - ``account_state NOT IN ('deleting','deleted')``：正在删除或已删除的账号一律不发。
+          删除编排会清空姓名等字段，给这样的账号发消息是数据范围外泄。
+
+        **为什么这条查询住在本模块**：这条链本来就在这里读 ``app_user``（权限版本），
+        而把它放进 ``postgres_identity`` 会把那个模块的建档写侧闭包（``provisioning`` /
+        ``org_snapshot`` / ``first_contact``）整个拉进 scheduler 镜像的依赖清单，
+        只为一次只读查询。本方法**只读一列**，不写、不改任何状态。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("通知收件人查询必须指明用户")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT feishu_open_id
+                     FROM app_user
+                    WHERE id = %s
+                      AND provisioning_state = 'active'
+                      AND account_state NOT IN ('deleting', 'deleted')""",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        open_id = str(row[0]).strip()
+        return open_id or None
 
     def load(self, outbox_id: str) -> StoredIntent | None:
         """回读一条意图。给运维排查与用例断言用，不在发布链路上。"""

@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**五个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**六个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -29,6 +29,19 @@
    它排在花名册审计日报**之后**，而「先花名册、再银河重算」（`V-权限-07`）不只靠
    这个位置：职责自己还有一条数据判据——花名册快照的 ``captured_at`` 不是今天就整轮
    不跑。位置只保证同一轮里的先后，判据才保证"用的是今天的花名册"。
+6. **权限发布与就绪确认**（:class:`~lingxi.apps.scheduler.permission_publish.
+   PermissionPublishDuty`）——**每轮**跑：收殓崩溃留下的在途意图 → 消费待发布意图
+   （写权限表 + 逐字段读回核对）→ 对已发布的每一条按 tick 节奏推进一次就绪探针 →
+   探针成功（或权限已清空）就给用户发一条范围变化通知（Issue #156 的 S-C-03b）。
+   它是 S-C-01 那个发布执行器的**第一个生产调用方**。
+
+   第六个职责是**分两面条件注册**的：发布面缺权限表 Base / 表标识 / 令牌供给任一项
+   就整个不注册（**恰一条**审计）；就绪与通知那一面缺 MCP 令牌主密钥或问数 MCP 端点时
+   **只有那一面不装配**（同样**恰一条**审计），发布面照常——发布不依赖探针。
+
+   **为什么它与每日重算是两个职责**：重算靠一个当日水位保证同日至多一轮，而发布消费
+   必须每轮都跑；合并会让当天第一轮之后排进来的意图一直等到第二天。
+   **单一写入负责人**：发布执行、就绪探针与用户通知全部在本进程内，不另起消费者。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -81,10 +94,20 @@ from lingxi.core.identity.roster_snapshot import (
     RosterSnapshotUpdater,
     SnapshotDecision,
 )
+from lingxi.apps.scheduler.permission_publish import (
+    PermissionPublishDuty,
+    PermissionPublishReport,
+    ReadinessFollowUp,
+)
 from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
+    PERMISSION_REVOKE_REASON,
     PermissionRefreshDuty,
     PermissionRefreshReport,
+)
+from lingxi.core.permission.mcp_readiness import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
+    ReadinessSchedule,
 )
 from lingxi.core.alerting import (
     AlertDispatcher,
@@ -148,6 +171,18 @@ class SchedulerConfig:
     # 每日权限重算职责，不让整个 scheduler 起不来；配了但不是合法主密钥则**快速失败**
     # （错配不是未配）。它是凭据，因此不进 ``repr``（`_Secret`）。
     mcp_token_encrypt_key: str | None = field(default=None, repr=False)
+    # 当前权限多维表格的 Base 与表标识（Issue #156 / S-C-03b）。**可选**，与花名册那一对
+    # 同一姿态：缺了只是不注册权限发布职责。它们是外部标识不是凭据，但同样只从环境变量来
+    # （`V-花名册-28` 的同一条理由）。
+    permission_app_token: str | None = None
+    permission_table_id: str | None = None
+    # 问数 MCP 的就绪探针端点。**可选**：缺了只是**就绪与通知那一面**不装配，发布面照常
+    # ——发布不依赖探针。配了但不是 https 则快速失败：误配 http 会让用户令牌明文上路。
+    query_mcp_endpoint: str | None = None
+    # 单次就绪探针的传输超时。它同时是 `ReadinessSchedule` 算「结论最晚什么时候落地」的
+    # 输入，因此装配层必须让探针传输层与就绪节奏用**同一个数**（见
+    # `lingxi.adapters.query_mcp_probe.QueryMcpProbe.timeout_seconds` 的文档）。
+    query_mcp_timeout_seconds: int = DEFAULT_PROBE_TIMEOUT_SECONDS
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -165,6 +200,10 @@ class SchedulerConfig:
         "LINGXI_ROSTER_BITABLE_TABLE_ID",
         "LINGXI_ROSTER_SNAPSHOT_STALE_AFTER_HOURS",
         "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
+        "LINGXI_PERMISSION_BITABLE_APP_TOKEN",
+        "LINGXI_PERMISSION_BITABLE_TABLE_ID",
+        "LINGXI_QUERY_MCP_ENDPOINT",
+        "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -245,6 +284,30 @@ class SchedulerConfig:
         else:
             mcp_token_encrypt_key = None
 
+        query_mcp_endpoint = optional_identifier("LINGXI_QUERY_MCP_ENDPOINT")
+        if query_mcp_endpoint is not None and not query_mcp_endpoint.startswith("https://"):
+            # 误配 http:// 会让用户自己的 MCP 令牌明文上路。只报变量名，不回显取到的值。
+            raise ValueError("环境变量 LINGXI_QUERY_MCP_ENDPOINT 必须以 https:// 开头（不回显取到的值）")
+
+        raw_probe_timeout = (source.get("LINGXI_QUERY_MCP_TIMEOUT_SECONDS") or "").strip()
+        if raw_probe_timeout:
+            try:
+                probe_timeout = int(raw_probe_timeout)
+            except ValueError as error:
+                raise ValueError(
+                    "环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 必须是正整数秒"
+                ) from error
+        else:
+            probe_timeout = DEFAULT_PROBE_TIMEOUT_SECONDS
+        try:
+            # 用**合同节奏**加这个超时构造一次：不合法的组合（超过一个轮询间隔、非正整数）
+            # 在**进程启动时**就失败，而不是等到某个用户第一次需要就绪确认时才炸。
+            # 节奏本身（立即 / 每 180 秒 / 900 秒预算）没有环境变量——它是合同值，
+            # 不该有一个能让它漂移的配置项（同 `IDLE_CONVERSATION_SWEEP_AFTER`）。
+            ReadinessSchedule(probe_timeout_seconds=probe_timeout)
+        except ValueError as error:
+            raise ValueError(f"环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 不合法：{error}") from None
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -278,6 +341,10 @@ class SchedulerConfig:
             roster_table_id=optional_identifier("LINGXI_ROSTER_BITABLE_TABLE_ID"),
             roster_snapshot_stale_after=roster_snapshot_stale_after,
             mcp_token_encrypt_key=mcp_token_encrypt_key,
+            permission_app_token=optional_identifier("LINGXI_PERMISSION_BITABLE_APP_TOKEN"),
+            permission_table_id=optional_identifier("LINGXI_PERMISSION_BITABLE_TABLE_ID"),
+            query_mcp_endpoint=query_mcp_endpoint,
+            query_mcp_timeout_seconds=probe_timeout,
         )
 
 
@@ -1026,6 +1093,9 @@ def _build_permission_refresh_duty(
         )
         return None
 
+    publish_store = PostgresPermissionPublishStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
     return PermissionRefreshDuty(
         baseline_reader=PostgresRosterBaselineReader(
             config.postgres_dsn, timeouts=config.postgres_timeouts
@@ -1034,9 +1104,10 @@ def _build_permission_refresh_duty(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
         galaxy=PostgresGalaxySnapshotReader(config.postgres_dsn, timeouts=config.postgres_timeouts),
-        decisions=PostgresPermissionPublishStore(
-            config.postgres_dsn, timeouts=config.postgres_timeouts
-        ),
+        decisions=publish_store,
+        # 同一个存储对象喂两个端口：一个只写权限决定，一个只读"发布过没有"。分成两个
+        # 参数是为了让撤权那条判据在类型上说得清楚（见 permission_refresh 的两个协议）。
+        publish_history=publish_store,
         token_ciphers=PostgresMcpTokenStore(
             config.postgres_dsn,
             cipher=McpTokenCipher(config.mcp_token_encrypt_key),
@@ -1048,10 +1119,173 @@ def _build_permission_refresh_duty(
     )
 
 
+def _build_readiness_follow_up(
+    config: SchedulerConfig,
+    *,
+    audit: AuditSink,
+    stop: threading.Event,
+) -> ReadinessFollowUp | None:
+    """装配「就绪确认 + 变化通知」这一面；前置不齐就**不装配**并留下**恰一条**审计。
+
+    这一面的前置有两个，缺任一就整面不装配，**而发布面照常运行**——发布不依赖探针
+    （`V-权限-07` 的发布半边不因为 MCP 端点没配就停下来）：
+
+    1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）。探针要用**该用户自己的**
+       明文令牌发起调用，解密口只接受已校验主密钥的加解密对象；就绪判定记录的读写口
+       也在同一个存储类上。没有它，这一面连"用谁的身份去探"都回答不了。
+    2. **问数 MCP 端点**（``LINGXI_QUERY_MCP_ENDPOINT``）。装一个指向空地址的探针，
+       会让每一条确认都以技术失败耗满预算再转运维——把"还没接线"伪装成"接线了但一直
+       失败"，正是 R3 那条注释要避免的形状。
+
+    **探针超时与就绪节奏用同一个数**：``ReadinessSchedule(probe_timeout_seconds=…)`` 与
+    ``QueryMcpProbe(timeout_seconds=…)`` 都取 ``config.query_mcp_timeout_seconds``。
+    两边不一致时，就绪那一侧算出来的"结论最晚什么时候落地"就是假的，因此这里在装配后
+    立刻断言相等——装配层的错配不该等到生产才暴露。
+    """
+
+    if not config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
+        audit.record(
+            "permission_readiness.not_wired",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，MCP 就绪确认与权限变化通知不装配；权限发布照常运行", MASTER_KEY_ENV
+        )
+        return None
+    if not config.query_mcp_endpoint:
+        audit.record(
+            "permission_readiness.not_wired",
+            reason="missing_environment_variable",
+            variable="LINGXI_QUERY_MCP_ENDPOINT",
+        )
+        logger.warning(
+            "未配置 LINGXI_QUERY_MCP_ENDPOINT，MCP 就绪确认与权限变化通知不装配；权限发布照常运行"
+        )
+        return None
+
+    from lingxi.adapters.feishu_user_message import FeishuUserMessages
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
+    from lingxi.adapters.query_mcp_probe import QueryMcpProbe
+    from lingxi.core.permission.mcp_readiness import ReadinessTicker
+    from lingxi.core.permission.notification import PermissionNoticeDispatcher
+
+    tokens = PostgresMcpTokenStore(
+        config.postgres_dsn,
+        cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+        timeouts=config.postgres_timeouts,
+    )
+    probe = QueryMcpProbe(
+        endpoint=config.query_mcp_endpoint,
+        token_provider=token_cipher_provider(tokens),
+        timeout_seconds=config.query_mcp_timeout_seconds,
+    )
+    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
+    if probe.timeout_seconds != schedule.probe_timeout_seconds:  # pragma: no cover - 装配自证
+        raise RuntimeError("探针传输超时必须与就绪节奏的单次超时一致，否则收口上界是假的")
+    return ReadinessFollowUp(
+        ticker=ReadinessTicker(
+            probe=probe,
+            store=tokens,
+            audit=audit,
+            clock=lambda: datetime.now(timezone.utc),
+            schedule=schedule,
+        ),
+        checks=tokens,
+        notices=PermissionNoticeDispatcher(
+            sender=FeishuUserMessages(
+                base_url=config.feishu_base_url,
+                app_id=config.feishu_app_id,
+                app_secret=config.feishu_app_secret,
+            ),
+            audit=audit,
+            # 退避用 `stop.wait` 而不是 `time.sleep`：SIGTERM 能立刻打断它
+            # （同 `CredentialRotationLoop._save_with_retry`）。
+            sleep=stop.wait,
+        ),
+    )
+
+
+def _build_permission_publish_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    permission_table_access_token: Callable[[], str] | None,
+) -> PermissionPublishDuty | None:
+    """装配权限发布消费职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律）。**发布面**的
+    三个前置逐条说明：
+
+    1. **权限发布 Base ``app_token``** 与 2. **表 ``table_id``**：写哪张表不能进代码，
+       只从环境变量来。
+    3. **发布表读写所用的短期令牌供给**。与花名册那条是**同一个未接线的部件**
+       （Issue [#215](https://github.com/Moshuiwang/lingxi/issues/215)，登记为 R3）：
+       换取令牌要消费专用授权主体那条**一次性** ``refresh_token``，而同一进程里的凭据
+       轮换职责是它唯一的合法消费者。因此这里同样只留注入点，**不在这里现造一个**——
+       两个消费者共用一条一次性令牌，就是 2026-08-08 授权码被烧那次事故的形状。
+
+    **就绪与通知那一面另有前置，缺了只让那一面不装配**（见
+    :func:`_build_readiness_follow_up`），发布面照常。两面分开的理由：发布是外部事实
+    （权限表里那一行到底对不对），就绪确认是我们对用户的承诺（能不能问数）；MCP 还没
+    接线时，前者照样应该正确地跑下去。
+    """
+
+    for variable, value in (
+        ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),
+        ("LINGXI_PERMISSION_BITABLE_TABLE_ID", config.permission_table_id),
+    ):
+        if not value:
+            audit.record(
+                "permission_publish.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，权限发布职责不注册；其余定时职责照常运行", variable)
+            return None
+    if permission_table_access_token is None:
+        audit.record(
+            "permission_publish.duty_not_registered",
+            reason="permission_table_access_token_unwired",
+        )
+        logger.warning("权限发布表读写的令牌供给未接线（属 L4a 前置），权限发布职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.core.permission.publish import PermissionPublishExecutor
+
+    store = PostgresPermissionPublishStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
+    return PermissionPublishDuty(
+        executor=PermissionPublishExecutor(
+            store=store,
+            transport=BitablePermissionTable(
+                base_url=config.feishu_base_url,
+                app_token=config.permission_app_token,
+                table_id=config.permission_table_id,
+                access_token=permission_table_access_token,
+            ),
+            audit=audit,
+        ),
+        intents=store,
+        audit=audit,
+        readiness=_build_readiness_follow_up(config, audit=audit, stop=stop),
+        stop=stop,
+    )
+
+
 def build_loop(
     config: SchedulerConfig,
     *,
     roster_access_token: Callable[[], str] | None = None,
+    permission_table_access_token: Callable[[], str] | None = None,
     audit: AuditSink | None = None,
     alerting_duty: AlertingDuty | None = None,
     heartbeat: Callable[[], None] | None = None,
@@ -1072,6 +1306,12 @@ def build_loop(
     进程里的凭据轮换职责正是它唯一的合法消费者，两个消费者共用一条一次性令牌就是
     2026-08-08 授权码被烧那次事故的形状。**默认 ``None``，因此当前部署下审计日报职责
     仍然不注册**（登记为 R3），但 Base 与表标识、快照链、日报渲染与调度都已按配置装配。
+
+    ``permission_table_access_token`` 是**权限发布表**读写所用的短期令牌供给，与上一条
+    是同一个未接线的部件、同一条理由，因此同样只留注入点、默认 ``None``——当前部署下
+    权限发布职责也不注册（同属 R3）。两条各留各的注入点而不是共用一个参数：两张表在
+    不同的 Base 上，将来完全可能由不同的授权主体读写，把它们并成一个参数等于提前替
+    那个决定做主。
     """
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
@@ -1126,6 +1366,17 @@ def build_loop(
     permission_refresh = _build_permission_refresh_duty(config, stop=stop, audit=sink)
     if permission_refresh is not None:
         duties.append(permission_refresh)
+    # 发布消费排在每日重算**之后**：同一轮里重算先把当天的意图排进来，发布紧接着就能把
+    # 它推出去，而不是白等一个调度周期。位置只保证同一轮内的先后；一条意图晚一轮被消费
+    # 没有任何产品后果（outbox 本来就是异步的）。
+    permission_publish = _build_permission_publish_duty(
+        config,
+        stop=stop,
+        audit=sink,
+        permission_table_access_token=permission_table_access_token,
+    )
+    if permission_publish is not None:
+        duties.append(permission_publish)
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:

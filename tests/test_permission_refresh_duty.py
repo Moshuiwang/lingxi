@@ -1,22 +1,24 @@
-"""每日权限重算职责的纯逻辑验收（Issue #156 / S-C-03a）。
+"""每日权限重算职责的纯逻辑验收（Issue #156 / S-C-03a，S-C-03b 补上撤权侧）。
 
-**不认领任何 `V-*` 断言**：`V-权限-07` 只交付了「重算 + 发布」这半边，另一半（银河真实
-刷新来源、变化通知、L4a 回读）待产品负责人裁定与后续切片；`V-权限-08` 的刷新侧语义
-（撤权时那一行发布行怎么办）同样未定，本切片只做「不发布、不通知、不删行」的失败关闭。
-状态列因此保持「未认领」，说明段见 ``docs/技术设计/验收矩阵.md`` 的权限发布与同步一节。
+**本文件承担 `V-权限-08` 刷新侧的纯逻辑面**（产品负责人 2026-08-18 裁定 3：撤权 =
+保行、清空 ``permissions``、不碰密文、不新建行）。`V-权限-07` 的调度与发布半边同样
+落在这里与 ``tests/test_permission_publish_duty.py``；说明段见
+``docs/技术设计/验收矩阵.md`` 的权限发布与同步一节。
 
-本文件钉的是本切片自己的行为，尤其是七条否定断言：
+本文件钉的是本职责自己的行为，尤其是这几条否定断言：
 
 1. 花名册快照缺失 / 非今日 → 整轮不跑，**一次银河读取都不发起**，零发布意图；
 2. 没有当前有效银河批次 → 零发布意图，审计可分辨；
-3. 撤权（聚合无权限，含匹配失败）→ 零发布意图、零通知、审计带原因分类；
-4. 重算职责**绝不签发令牌**（端口只有读取口 + 源码不出现签发口）；
-5. ``UNCHANGED`` 不计入新意图（真库贯穿在 ``tests/test_permission_refresh_postgres.py``）；
-6. 单个用户异常不中断整轮；
-7. 报告与审计不含权限值明细、邮箱、姓名、工号等敏感原值。
+3. **从来没有过发布行的撤权用户** → 零发布意图、零令牌读取，审计原因可分辨；
+4. **匹配失败不算撤权信号** → 连"有没有发布行"都不查，更不清空任何人的权限；
+5. 撤权行**不携带、不清空、不覆盖 ``token_cipher``**，因此在发布层建不出新行；
+6. 重算职责**绝不签发令牌、也不发任何通知**（端口里没有签发口，也没有发送口）；
+7. ``UNCHANGED`` 不计入新意图（真库贯穿在 ``tests/test_permission_refresh_postgres.py``）；
+8. 单个用户异常不中断整轮；
+9. 报告与审计不含权限值明细、邮箱、姓名、工号等敏感原值。
 
-真库那一半（active 筛选的否定样本、版本不推进、意图只有一条）在
-``tests/test_permission_refresh_postgres.py``。
+真库那一半（active 筛选的否定样本、版本不推进、意图只有一条、撤权重复判 ``UNCHANGED``）
+在 ``tests/test_permission_refresh_postgres.py``。
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from lingxi.adapters.postgres_galaxy_snapshot import GalaxyPermissionSnapshot
 from lingxi.adapters.postgres_roster_audit import ACTIVE_BASELINE_SQL
 from lingxi.apps.scheduler import (
     PERMISSION_REFRESH_REASON,
+    PERMISSION_REVOKE_REASON,
     PermissionRefreshDuty,
     PermissionRefreshReport,
     SchedulerConfig,
@@ -206,6 +209,21 @@ class FakeTokens:
         raise AssertionError("每日权限重算不得签发 MCP 令牌")
 
 
+class FakePublishHistory:
+    """「这个人有没有过一条发布成功的意图」的假实现。
+
+    默认**谁都没有**：撤权那一路因此照旧跳过，S-C-03a 的既有用例不受影响。
+    """
+
+    def __init__(self, published_users: set[str] | None = None) -> None:
+        self._published = published_users or set()
+        self.calls: list[str] = []
+
+    def has_published_intent(self, user_id: str) -> bool:
+        self.calls.append(user_id)
+        return user_id in self._published
+
+
 class _FakeDecision:
     def __init__(self, enqueued: bool) -> None:
         self.enqueued = enqueued
@@ -314,10 +332,12 @@ def build_duty(
     audit: RecordingAudit | None = None,
     clock: FixedClock | None = None,
     stop: threading.Event | None = None,
+    published_users: set[str] | None = None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
     decisions = decisions or FakeDecisions()
+    history = FakePublishHistory(published_users)
     snapshot_store = FakeRosterSnapshot(
         captured_at=roster_captured_at,
         rows=roster_rows if roster_rows is not None else (roster_row(),),
@@ -328,6 +348,7 @@ def build_duty(
         roster_snapshot=snapshot_store,
         galaxy=galaxy_reader,
         decisions=decisions,
+        publish_history=history,
         token_ciphers=tokens,
         role_function_map=ROLE_FUNCTION_MAP,
         audit=audit,
@@ -338,6 +359,7 @@ def build_duty(
         "audit": audit,
         "tokens": tokens,
         "decisions": decisions,
+        "history": history,
         "roster": snapshot_store,
         "galaxy": galaxy_reader,
     }
@@ -657,7 +679,12 @@ class GrantedUserTest(unittest.TestCase):
 
 
 class RevocationTest(unittest.TestCase):
-    """否定断言：聚合无权限的用户零发布意图、零通知，审计带可分辨原因。"""
+    """`V-权限-08` 刷新侧：**从来没发布过的人零发布意图**，审计带可分辨原因。
+
+    产品负责人 2026-08-18 裁定 3 之后，"聚合无权限"不再等于"什么都不做"——但只对
+    **我们真的发布成功过**的用户发撤权更新。本类钉的是"不发"那一半（默认夹具里谁都
+    没发布过），"发"那一半在 :class:`RevocationPublishTest`。
+    """
 
     def _run(self, **kwargs):
         duty, parts = build_duty(identities=(identity(),), **kwargs)
@@ -720,16 +747,137 @@ class RevocationTest(unittest.TestCase):
         for forbidden in ("send_text", "sender", "notify", "chat_id"):
             self.assertNotIn(forbidden, source, f"重算职责不得持有通知出口：{forbidden}")
 
-    def test_revocation_does_not_delete_or_rewrite_any_published_row(self) -> None:
-        """否定断言：撤权不删行、不改行。
+    def test_revocation_does_not_delete_or_disable_any_published_row(self) -> None:
+        """否定断言：撤权**不删行、不停用、不自己动 status**。
 
-        源码里没有任何删除/停用发布行的动作——那属 `V-权限-08` 的刷新侧语义，
-        待产品负责人裁定（#203）。
+        裁定 3 允许的唯一动作是"把 permissions 清空"，而它整个发生在
+        ``build_revocation_row`` 里；本职责源码里不出现任何删除 / 停用 / 直接改状态
+        的动作，也不自己调发布执行器（发布是另一个职责的事）。
         """
 
         source = duty_code()
         for forbidden in ("delete", "revoke_row", "disable", "STATUS_", "publish_claim"):
             self.assertNotIn(forbidden, source, f"撤权侧不得有外部写动作：{forbidden}")
+
+    def test_a_revoked_user_without_any_published_row_is_skipped(self) -> None:
+        """否定断言：**从无发布行的撤权用户零外部调用、零发布意图。**
+
+        为他新建一行空权限没有意义（MCP 对查无此人默认拒绝），而新建需要令牌密文。
+        """
+
+        report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
+
+        self.assertEqual(parts["decisions"].calls, [], "无发布行的撤权用户零发布意图")
+        self.assertEqual(parts["tokens"].read_calls, [], "撤权路径一次令牌都不读")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.revoked_published, 0)
+        self.assertEqual(report.reasons["no_published_row"], 1)
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["revocation"], "no_published_row")
+
+    def test_a_match_failure_never_triggers_a_revocation_publish(self) -> None:
+        """**匹配失败不算撤权信号**，哪怕这个人已经有发布行。
+
+        "认不出这个人是谁"不是"银河说他没有权限"；据一次花名册歧义清空权限，与花名册
+        侧「仅提示、不做任何自动处置」的既定口径正相反。
+        """
+
+        for label, kwargs in (
+            ("花名册查无", {"roster_rows": ()}),
+            ("银河账号查无", {"galaxy": galaxy_snapshot(accounts=(("g-9", "E9", "o@x.invalid"),))}),
+        ):
+            with self.subTest(label):
+                report, parts = self._run(published_users={USER_ONE}, **kwargs)
+
+                self.assertEqual(parts["decisions"].calls, [], "匹配失败零发布意图")
+                self.assertEqual(parts["history"].calls, [], "匹配失败连发布历史都不查")
+                self.assertEqual(report.revoked_published, 0)
+
+
+class RevocationPublishTest(unittest.TestCase):
+    """`V-权限-08` 刷新侧的「发」那一半：保行、清空 permissions、不碰密文。"""
+
+    def _run(self, **kwargs):
+        duty, parts = build_duty(
+            identities=(identity(),), published_users={USER_ONE}, **kwargs
+        )
+        return duty.run_once(), parts
+
+    def test_a_revoked_user_with_a_published_row_gets_an_empty_permissions_update(self) -> None:
+        report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REVOKE_REASON)
+        row = call["row"]
+        self.assertEqual(row.permissions, "{}", "撤权行的 permissions 是空对象")
+        self.assertEqual(row.status, "approved", "status 维持消费方唯一认可的取值")
+        self.assertEqual(row.record_key, EMAIL_ONE.strip().lower())
+        self.assertEqual(row.updated_at, "2026-08-17T03:00:00Z", "取权限决定的时刻")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.revoked_published, 1)
+        self.assertEqual(report.enqueued, 1)
+
+    def test_the_revocation_row_never_carries_a_token_cipher(self) -> None:
+        """否定断言：**撤权不清空、不覆盖、也不携带 token_cipher。**
+
+        快照只有六个字段，因此发布层只能走更新路径；而更新是部分更新，那一列保持原值。
+        """
+
+        _report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertIsNone(row.token_cipher)
+        self.assertNotIn("token_cipher", row.snapshot_fields)
+        self.assertEqual(set(row.snapshot_fields), set(row.fields))
+        self.assertEqual(parts["tokens"].read_calls, [], "撤权路径一次令牌都不读")
+
+    def test_a_revocation_row_cannot_create_a_new_row(self) -> None:
+        """否定断言：**撤权行在发布层根本建不出新行**（缺密文即失败关闭）。"""
+
+        _report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
+
+        row = parts["decisions"].calls[0]["row"]
+        with self.assertRaises(ValueError):
+            row.create_fields
+
+    def test_repeating_the_revocation_is_counted_as_unchanged(self) -> None:
+        """幂等由 record_decision 的内容比对承担：撤权不会每天重发一次。"""
+
+        report, parts = self._run(
+            galaxy=galaxy_snapshot(roles=()), decisions=FakeDecisions(unchanged_users={USER_ONE})
+        )
+
+        self.assertEqual(report.enqueued, 0)
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(report.revoked_published, 0, "UNCHANGED 不算一次新的撤权发布")
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.user_revoked")[0]["enqueued"], False
+        )
+
+    def test_a_revoked_user_without_an_archived_email_is_skipped(self) -> None:
+        """存档不全的撤权用户跳过：撤权行的三列同样来自存档身份。"""
+
+        duty, parts = build_duty(
+            identities=(identity(email=""),),
+            published_users={USER_ONE},
+            galaxy=galaxy_snapshot(roles=()),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [])
+        self.assertEqual(parts["history"].calls, [], "存档不全时连发布历史都不查")
+        self.assertEqual(report.reasons["archived_identity_incomplete"], 1)
+
+    def test_the_revocation_audit_carries_no_sensitive_value(self) -> None:
+        _report, parts = self._run(galaxy=galaxy_snapshot(roles=()))
+
+        fields = parts["audit"].fields_for("permission_refresh.user_revoked")[0]
+        rendered = " ".join(f"{key}={value}" for key, value in fields.items())
+        for secret in (EMAIL_ONE, NAME_ONE, EMPLOYEE_ONE, COMPANY_ID, TOKEN_CIPHER):
+            self.assertNotIn(secret, rendered)
 
 
 class IncompleteInputTest(unittest.TestCase):
@@ -1083,6 +1231,7 @@ class AuditShapeTest(unittest.TestCase):
                 "enqueued": 0,
                 "unchanged": 0,
                 "revoked": 0,
+                "revoked_published": 0,
                 "incomplete": 0,
                 "failed": 0,
             },
