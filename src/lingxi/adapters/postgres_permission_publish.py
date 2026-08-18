@@ -11,7 +11,9 @@
    评审保证：本方法没有任何自己建连接的路径，想绕过同事务在类型上就写不出来。
 2. **认领与单飞**：``FOR UPDATE SKIP LOCKED`` 让并发消费者各取各的；额外的「该用户没有
    另一条 ``publishing``」条件让**同一用户同时只有一条发布在途**，否则 v1 的写入落后到
-   v2 之后会把旧权限盖回去。
+   v2 之后会把旧权限盖回去。第三条是 :meth:`PostgresPermissionPublishStore.claim_next`
+   的 ``exclude``——**本轮已经认领过的意图本轮不再取**：一次失败只写回 ``pending``、
+   不改 ``created_at``，没有这一条它会在同一轮里被立刻重新认领（Epic C 冻结缺陷 F2）。
 3. **到期擦除**：``payload`` 里有邮箱与姓名，九十天上限由 :meth:`redact_expired_payloads`
    把它擦成 ``'{}'`` 落实（迁移文件头部有为什么不进 ``0054`` 受限清理函数的取舍）。
 
@@ -290,10 +292,16 @@ class PostgresPermissionPublishStore:
     # 消费侧
     # ------------------------------------------------------------------
 
-    def claim_next(self) -> ClaimedPublish | None:
+    def claim_next(self, *, exclude: Sequence[str] = ()) -> ClaimedPublish | None:
         """认领最早一条可发布的意图，并原子记账（状态转 ``publishing``、尝试次数 +1）。
 
-        两道条件缺一不可：
+        ``exclude`` 是**调用方本轮已经认领过**的那些 ``id``，一律跳过（Epic C 冻结缺陷
+        F2）。它只作用在**候选**上，不作用在"该用户有没有更早的非终态兄弟行"那一条：
+        被跳过的意图仍然是 ``pending``、仍然是非终态，因此仍然挡着同一用户的下一版——
+        把它从兄弟行判据里一并排除，等于在同一轮里放行同一个人的两条意图，正是"同一用户
+        单飞"要防的那件事。空序列时这个条件恒真（``id <> ALL('{}')``），语句形状不变。
+
+        三道条件缺一不可：
 
         - ``FOR UPDATE SKIP LOCKED``：并发消费者各取各的，既不重复也不互相阻塞
           （同 ``postgres_conversation.claim_tasks`` 的既有形态）；
@@ -317,6 +325,7 @@ class PostgresPermissionPublishStore:
         （见 ``core/permission/publish.publish_claim``）。
         """
 
+        skipped = [str(item) for item in exclude]
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction(), connection.cursor() as cursor:
                 cursor.execute(
@@ -329,6 +338,7 @@ class PostgresPermissionPublishStore:
                              SELECT c.id
                                FROM publish_outbox c
                               WHERE c.status = 'pending'
+                                AND c.id <> ALL(%s)
                                 AND NOT EXISTS (
                                       SELECT 1
                                         FROM publish_outbox b
@@ -342,7 +352,8 @@ class PostgresPermissionPublishStore:
                            )
                     RETURNING o.id, o.user_id, o.permission_version, o.payload, o.attempts,
                               o.created_record_id
-                    """
+                    """,
+                    (skipped,),
                 )
                 row = cursor.fetchone()
                 if row is None:

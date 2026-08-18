@@ -79,6 +79,12 @@ published_awaiting_readiness` 的 SQL 就不再把它取回来。因此"这条�
 下轮继续"，发布与就绪都可重入。停止信号与时间预算在**每一条**之前各查一次——发布面也
 一样（`V-部署-03`「停止领取新工作」）。
 
+**发布条数预算数的是"多少条不同的意图"，不是"认领了多少次"**（Epic C 冻结缺陷 F2）：本轮
+认领过的 ``outbox_id`` 由 :meth:`PermissionPublishDuty._publish` 记下并在下一次认领时排除，
+因此一条反复失败的意图不会把预算吃掉 5 份。修复前它会——同一个人的 5 次快失败重试挤在同
+一轮里，``publish_limit=50`` 实际只覆盖约 10 个用户，而这恰恰发生在全局劣化（发布表整体
+不可写）的时候，也就是最需要每个人都被试一次的时候。
+
 ## 单实例假设
 
 本职责按 **``lingxi-scheduler`` 只有一个实例**设计。同时跑两个实例时，两边会各自取到
@@ -148,7 +154,7 @@ DEFAULT_ROUND_BUDGET_SECONDS = 60.0
 
 
 class _PublishExecutor(Protocol):
-    def run_once(self, *, limit: int = ...) -> Sequence[Any]: ...
+    def run_once(self, *, limit: int = ..., exclude: Sequence[str] = ...) -> Sequence[Any]: ...
 
 
 class _IntentStore(Protocol):
@@ -478,17 +484,33 @@ class PermissionPublishDuty:
         （`V-部署-03`），而同一进程里的重算面与就绪面都是逐条检查的。改成每次只认领一条、
         每条之前重新看一眼停止标志与时间预算，语义就与另外两面对齐了；``limit`` 从"一次
         取多少"退化为"这一轮最多取多少条"，含义不变。
+
+        **"一轮"的边界因此在这里，本轮已认领清单也必须由这里持有**（Epic C 冻结缺陷 F2）。
+        逐条形态下每次 ``run_once(limit=1)`` 都是一次全新调用，执行器自己的本轮集合每次
+        只有一个元素、等于没有；把累积的清单传下去，"一条意图一轮最多认领一次"才在**生产
+        形态**下成立。少了它，一条快失败的意图（http_500 / 飞书业务错误码）会在同一轮里被
+        连续认领 5 次、零点几秒内烧完重试额度转 ``failed``，同时把 ``publish_limit`` 的
+        50 条预算放大成只覆盖约 10 个用户。
+
+        清单是**每轮新建**的局部变量，不是职责的字段：跨轮持有会让一条意图在这个进程里
+        再也轮不到，那比原缺陷更糟。
         """
 
         if self._executor is None:
             return False
+        claimed: list[str] = []
         for _ in range(self._publish_limit):
             if self._stop.is_set() or self._out_of_time(started):
                 return True
-            attempts = tuple(self._executor.run_once(limit=1))
+            attempts = tuple(self._executor.run_once(limit=1, exclude=tuple(claimed)))
             if not attempts:
                 # 没有待发布意图了：这不是中断，是正常收工。
                 return False
+            claimed.extend(
+                str(identifier)
+                for identifier in (getattr(attempt, "outbox_id", None) for attempt in attempts)
+                if identifier
+            )
             tally.attempts += len(attempts)
             tally.published += sum(
                 1 for attempt in attempts if getattr(attempt, "published", False)

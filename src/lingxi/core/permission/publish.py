@@ -48,6 +48,11 @@
   因为后者在 ``READ COMMITTED`` 下看不见尚未提交的认领；理由全文在该方法的文档。
 - **旧版本不覆盖新版本**：认领时一并取回 ``app_user.permission_version``，比它旧的意图
   直接判 ``superseded``，**一次外部调用都不发**。
+- **一轮最多认领一次**：本轮已经认领过的 ``outbox_id`` 由消费循环记下并在下一次
+  ``claim_next`` 时排除。少了这条，一次失败写回 ``pending`` 之后那条意图仍是最老的一条
+  （``created_at`` 不变），会在**同一轮里**被立刻重新认领，5 次重试在零点几秒内烧完
+  ——重试上限的"配套每轮消费节奏"因此形同虚设（Epic C 冻结缺陷 F2，理由全文在
+  ``PermissionPublishExecutor.run_once`` 的文档）。
 - **重启安全**：崩溃留下的 ``publishing`` 行由 ``reclaim_stale`` 放回 ``pending``；因为
   发布本身幂等（先查后写），重入不会写出第二行。
 - 本 Story **不装配任何常驻消费者**：真实调用方是 Epic D 的 ``OnboardingRunner`` 与每日
@@ -82,6 +87,14 @@ logger = logging.getLogger(__name__)
 
 #: 同一条发布意图最多尝试多少次。到顶之后转 ``failed`` 等人来看，而不是无限重试。
 #: 取 5 是与 outbox 的每轮消费节奏配套的经验值，不是外部规范；调整它不改变任何语义。
+#:
+#: **"与每轮消费节奏配套"这句话靠 :meth:`PermissionPublishExecutor.run_once` 的本轮排除
+#: 兑现**（Epic C 冻结缺陷 F2）。此前它是一句假话：认领语句按 ``created_at`` 取最老的一条，
+#: 刚失败回 ``pending`` 的那条 ``created_at`` 没变、仍然是最老的一条，于是**同一轮里**被
+#: 立刻重新认领——真库实测下，快失败形态（http_500 / 飞书业务错误码）的 5 次重试在 0.195
+#: 秒内烧完转 ``failed``，等于"重试"这件事从来没有跨过一次调度间隔。加上本轮排除之后，
+#: 一条意图**一轮最多认领一次**，5 次尝试因此对应 5 个调度周期（默认 5 × 60 秒），
+#: 中间隔着的正是让一次瞬时故障恢复的那段时间。
 DEFAULT_MAX_ATTEMPTS = 5
 
 # outbox 的状态取值，与迁移 ``0064`` 的 CHECK 逐字对应。写在这里而不是散落字面量：
@@ -306,6 +319,11 @@ class PublishAttempt:
 
         可重试且次数没用完 → 回 ``pending`` 等下一轮；其余一律终态。这是纯函数，
         因此"重试到底会不会停"能被断言，而不是靠读一遍消费循环去推断。
+
+        **"等下一轮"是本方法说不出口的那一半**：它只决定状态，管不到"回了 ``pending``
+        之后多久会被再次认领"。那一半由 :meth:`PermissionPublishExecutor.run_once` 的
+        本轮排除保证——本轮认领过的 ``outbox_id`` 本轮不再取，因此下一次认领必然发生在
+        下一轮（Epic C 冻结缺陷 F2 之前它发生在几十毫秒之后）。
         """
 
         if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
@@ -543,7 +561,7 @@ class PermissionPublishStore(Protocol):
     """发布意图 outbox 的最小消费面（可注入）。实现见
     ``adapters/postgres_permission_publish.py``。"""
 
-    def claim_next(self) -> ClaimedPublish | None: ...
+    def claim_next(self, *, exclude: Sequence[str] = ()) -> ClaimedPublish | None: ...
 
     def complete(self, attempt: PublishAttempt, *, status: str) -> None: ...
 
@@ -582,20 +600,50 @@ class PermissionPublishExecutor:
         self._on_alert = on_alert
         self._max_attempts = max_attempts
 
-    def run_once(self, *, limit: int = 50) -> tuple[PublishAttempt, ...]:
+    def run_once(
+        self, *, limit: int = 50, exclude: Sequence[str] = ()
+    ) -> tuple[PublishAttempt, ...]:
         """消费至多 ``limit`` 条待发布意图，返回逐条结果。
 
         ``limit`` 是**单轮预算**，不是重试上限：它挡的是"一轮把整张表刷完"占住外部
         接口配额；重试上限是 :meth:`PublishAttempt.next_status` 里的 ``max_attempts``。
+
+        **本轮认领过的意图本轮不再认领**（Epic C 冻结缺陷 F2）。认领语句按
+        ``(created_at, id)`` 取最老的一条待发布意图，而一次失败只会把状态写回
+        ``pending``、**不改 ``created_at``**——它于是仍然是最老的那一条，下一次
+        ``claim_next`` 立刻又取到它。真库实测的后果是：快失败形态（http_500 / 飞书业务
+        错误码）下，5 次重试在 **0.195 秒**内烧完并转终态 ``failed``，"重试"从来没有跨过
+        一次调度间隔；``limit=50`` 的单轮预算也被同一个人的 5 次尝试放大成只覆盖约 10 个
+        用户。修法是**进程内的本轮集合**：认领到的 ``outbox_id`` 记下来，随后传给
+        ``claim_next(exclude=…)``，让 SQL 在候选里跳过它们。
+
+        **刻意不用冷却时间戳、退避列或任何 DDL**：那需要给 ``publish_outbox`` 加列并新增
+        迁移，而"一轮一次"本来就是文档已经承诺的语义，一个进程内集合足以表达它。集合的
+        作用域是**一轮**——``exclude`` 是不可变序列而不是长期持有的可变集合，因此没有
+        "某个进程把一条意图永久排除在外"的形状。
+
+        ``exclude`` 由**谁拥有这一轮**传进来。默认空元组时本方法自己就是一轮
+        （``limit`` 条内不重复认领）；真实调度职责为了逐条检查停止信号与时间预算，
+        走的是 ``run_once(limit=1)`` × N 的形状，那时一轮的边界在职责那一层，
+        累积的已认领清单因此必须由它传下来（见
+        :meth:`lingxi.apps.scheduler.permission_publish.PermissionPublishDuty._publish`）。
+
+        **与多实例的关系**：本轮集合是进程内的，两个消费者各有各的。这不构成新问题——
+        并发安全本来就由 ``claim_next`` 的 ``FOR UPDATE SKIP LOCKED`` 与"同一用户单飞"
+        承担，而当前部署里 scheduler 是单副本、发布消费是**单一写入负责人**
+        （见 :mod:`lingxi.apps.scheduler.permission_publish` 的单实例假设）。
         """
 
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("limit 必须是正整数")
         attempts: list[PublishAttempt] = []
+        # 保序而不是 set：这一串会进 SQL 参数，顺序稳定的语句更容易在日志与用例里比对。
+        claimed: list[str] = [str(item) for item in exclude]
         for _ in range(limit):
-            claim = self._store.claim_next()
+            claim = self._store.claim_next(exclude=tuple(claimed))
             if claim is None:
                 break
+            claimed.append(claim.outbox_id)
             attempts.append(self._run_claim(claim))
         return tuple(attempts)
 

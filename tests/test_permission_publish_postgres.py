@@ -31,7 +31,11 @@ from lingxi.adapters.postgres_permission_publish import (
     PostgresPermissionPublishStore,
     PublishClaimLost,
 )
+from lingxi.apps.scheduler.permission_publish import DEFAULT_PUBLISH_LIMIT
 from lingxi.core.permission.publish import (
+    DEFAULT_MAX_ATTEMPTS,
+    PermissionPublishExecutor,
+    PermissionTableError,
     PublishAttempt,
     PublishOutcome,
     STATUS_FAILED,
@@ -1033,6 +1037,168 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
                 with self.subTest(call=call.__name__, value=value):
                     with self.assertRaises(ValueError):
                         call(value)
+
+
+class _AlwaysFailingTable:
+    """恒定快失败的发布表替身：一次 ``find_rows`` 就明确拒绝。
+
+    对应真库实测里烧掉重试额度最快的那种形态（http_500 / 飞书业务错误码非 0）——它
+    **不带任何自然节流**，因此"同一轮内被立刻重认领"在它身上最刺眼。
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def find_rows(self, *, record_key: str, email: str):
+        del record_key, email
+        self.calls += 1
+        raise PermissionTableError("http_500", definite=True)
+
+    def create_row(self, fields):  # pragma: no cover - 走不到
+        raise AssertionError("恒失败的替身不应被要求新建")
+
+    def update_row(self, record_id, fields):  # pragma: no cover - 走不到
+        raise AssertionError("恒失败的替身不应被要求更新")
+
+    def read_row(self, record_id):  # pragma: no cover - 走不到
+        raise AssertionError("恒失败的替身不应被要求读回")
+
+
+class RoundExclusionPostgresTest(PermissionPublishPostgresTestCase):
+    """**一条可重试失败的意图，一轮只认领一次**（Epic C 冻结缺陷 F2）。
+
+    只有真库能证伪它：成因在 ``claim_next`` 的 SQL 里——失败只把状态写回 ``pending``，
+    ``created_at`` 一个字不动，于是它仍然是 ``ORDER BY created_at, id`` 的第一名。修复
+    前的真库实测是 5 次重试在 **0.195 秒**内烧完转 ``failed``；本组把那条时间线钉成
+    "每轮 +1、第 5 轮才终态"。
+    """
+
+    def _executor(self, table) -> PermissionPublishExecutor:
+        return PermissionPublishExecutor(
+            store=self.store, transport=table, audit=_SilentAudit()
+        )
+
+    def _intent(self, user_id: str = USER_A, email: str = EMAIL_A) -> str:
+        decision = self.store.record_decision(
+            user_id=user_id,
+            row=_row(email, token_cipher=TOKEN_CIPHER),
+            reason="permission_refresh",
+            decided_at=NOW,
+        )
+        assert decision.outbox_id is not None
+        return decision.outbox_id
+
+    def test_one_round_claims_a_failing_intent_exactly_once(self) -> None:
+        outbox_id = self._intent()
+        table = _AlwaysFailingTable()
+        executor = self._executor(table)
+
+        attempts = executor.run_once(limit=DEFAULT_PUBLISH_LIMIT)
+
+        self.assertEqual(len(attempts), 1, "一轮只认领一次；修复前这里是 5")
+        self.assertEqual(table.calls, 1, "一轮只对外发一次调用")
+        stored = self.store.load(outbox_id)
+        self.assertEqual(stored.status, "pending", "还能重试，回 pending 等下一轮")
+        self.assertEqual(stored.attempts, 1)
+
+    def test_the_attempt_budget_is_spent_one_round_at_a_time(self) -> None:
+        """``attempts`` 每轮 +1，**第 5 轮**才转 ``failed``。
+
+        这正是 ``DEFAULT_MAX_ATTEMPTS`` 注释里"与每轮消费节奏配套"那句话的字面含义；
+        修复前 5 轮的额度全部消耗在第一轮里。
+        """
+
+        outbox_id = self._intent()
+        executor = self._executor(_AlwaysFailingTable())
+
+        for round_number in range(1, 5):
+            with self.subTest(round=round_number):
+                self.assertEqual(len(executor.run_once(limit=DEFAULT_PUBLISH_LIMIT)), 1)
+                stored = self.store.load(outbox_id)
+                self.assertEqual(stored.attempts, round_number)
+                self.assertEqual(stored.status, "pending")
+
+        self.assertEqual(len(executor.run_once(limit=DEFAULT_PUBLISH_LIMIT)), 1)
+        stored = self.store.load(outbox_id)
+        self.assertEqual(stored.attempts, DEFAULT_MAX_ATTEMPTS)
+        self.assertEqual(stored.status, "failed", "第 5 轮才转终态")
+
+        # 终态之后不再被认领：一轮什么都取不到。
+        self.assertEqual(executor.run_once(limit=DEFAULT_PUBLISH_LIMIT), ())
+
+    def test_skipping_one_intent_does_not_starve_the_others(self) -> None:
+        """否定断言：**跳过不等于少消费**。
+
+        本轮排除只把已经认领过的那条排除在候选之外。少了这一条，"修好 F2"就会造出
+        一个更糟的缺陷：一个人失败，本轮剩下的预算全部空转。
+        """
+
+        first = self._intent(USER_A, EMAIL_A)
+        second = self._intent(USER_B, EMAIL_B)
+        table = _AlwaysFailingTable()
+
+        attempts = self._executor(table).run_once(limit=DEFAULT_PUBLISH_LIMIT)
+
+        self.assertEqual(
+            sorted(item.outbox_id for item in attempts),
+            sorted((first, second)),
+            "两个人各被认领一次",
+        )
+        self.assertEqual(table.calls, 2)
+        for outbox_id in (first, second):
+            self.assertEqual(self.store.load(outbox_id).attempts, 1)
+
+    def test_the_exclusion_does_not_break_single_flight(self) -> None:
+        """否定断言：排除只作用在**候选**上，不作用在"同一用户单飞"那条判据上。
+
+        被跳过的 v1 仍然是 ``pending``、仍然是非终态，因此仍然挡着同一个人的 v2。
+        把它从兄弟行判据里一并排除，会让同一轮里同一个人的两条意图一起被认领——v1 的
+        写入落后到 v2 之后就把已经收回的权限盖了回来。
+
+        断在 ``claim_next`` 上而不是执行器上：执行器那一层看不出这条性质——v1 被
+        认领后会因为版本落后判 ``superseded``（一次外部调用都不发）并转终态，v2 于是
+        合法地在同一轮里接着出去。要证伪的是认领语句本身。
+        """
+
+        first = self._intent(USER_A, EMAIL_A)
+        self.store.record_decision(
+            user_id=USER_A,
+            row=_row(EMAIL_A, permissions='{"1012":["财务"]}', token_cipher=TOKEN_CIPHER),
+            reason="permission_refresh",
+            decided_at=NOW + timedelta(minutes=1),
+        )
+
+        self.assertEqual(self.store.claim_next().outbox_id, first, "先出去的是更老的那一条")
+        self.assertIsNone(
+            self.store.claim_next(exclude=(first,)),
+            "被跳过的 v1 仍是非终态，仍然挡着同一个人的 v2",
+        )
+
+    def test_the_next_round_claims_it_again(self) -> None:
+        """排除的作用域是**一轮**——否则重试永远不会发生。"""
+
+        outbox_id = self._intent()
+        executor = self._executor(_AlwaysFailingTable())
+
+        executor.run_once(limit=DEFAULT_PUBLISH_LIMIT)
+        executor.run_once(limit=DEFAULT_PUBLISH_LIMIT)
+
+        self.assertEqual(self.store.load(outbox_id).attempts, 2)
+
+    def test_an_explicit_exclusion_is_honoured_by_the_sql(self) -> None:
+        """``exclude`` 直接作用在认领语句里，不是在 Python 侧过滤出来的。"""
+
+        outbox_id = self._intent()
+
+        self.assertIsNone(self.store.claim_next(exclude=(outbox_id,)))
+        self.assertEqual(self.store.load(outbox_id).attempts, 0, "跳过的那条一次都没记账")
+        claimed = self.store.claim_next(exclude=())
+        self.assertEqual(claimed.outbox_id, outbox_id)
+
+
+class _SilentAudit:
+    def record(self, action: str, /, **fields: object) -> None:
+        del action, fields
 
 
 if __name__ == "__main__":  # pragma: no cover
