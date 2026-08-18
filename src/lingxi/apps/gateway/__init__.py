@@ -45,6 +45,7 @@ from lingxi.core.execution.card_stream import CardCreated, CardTransport, Delive
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
 from .log_redaction import install_credential_redaction
+from .onboarding import assert_single_onboarding_runner, build_onboarding_runner
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,7 @@ def build_supervisor(
     should_stop: Callable[[], bool] | None = None,
     onboarding: OnboardingRunner | None = None,
     heartbeat: Callable[[], None] | None = None,
+    on_onboarding_assembled: Callable[[OnboardingRunner], None] | None = None,
 ) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
@@ -263,6 +265,14 @@ def build_supervisor(
     L4a，全部 L2/L3 断言注入假实现。``onboarding`` 未提供时采用失败关闭 runner，
     不会把未开通正文悄悄交给下游，也不会误报已开通。
     adapters 在函数体内延迟 import，与 ``apps/scheduler`` 的 ``build_loop`` 同惯例。
+
+    ``on_onboarding_assembled`` 回调**只报告本函数最终采用的那个 runner**，供装配层做
+    双注入点身份断言（``apps/gateway/onboarding.assert_single_onboarding_runner``）。
+    为什么要一个回调而不是从返回的 supervisor 上读回来：``LongConnectionSupervisor``
+    的公开面被 `V-接入-10` 的结构断言冻结成 ``{run, reconnect_attempts,
+    observed_delays}``——它不得出现第二个可以投递事件的公开入口，因此也不该为了装配
+    自证而长出新的公开属性。回调不接触事件通路，只把"本函数决定用哪一个"这件事说出来，
+    而那正是断言要验的东西（缺省落桩就发生在这一行）。
     """
 
     from lingxi.adapters.feishu_longconn import LarkEventTransport
@@ -271,6 +281,8 @@ def build_supervisor(
 
     audit = _LoggingAudit()
     effective_onboarding = onboarding or _UnavailableOnboarding()
+    if on_onboarding_assembled is not None:
+        on_onboarding_assembled(effective_onboarding)
     # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
     # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
     # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
@@ -584,18 +596,32 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
             logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
 
+    # 首次开通编排（Epic D / S-D-02）：**装配一次，喂给两个注入点**。前置不齐时
+    # `build_onboarding_runner` 返回 None、留一条审计，两处一起落回失败关闭桩——
+    # 这是唯一允许两处都拿到桩的情形，而"一处真的、一处桩"由下面的装配断言挡住。
+    #
+    # 共用线程复核（#65 开工卡必含项）的结论落在这里：正式编排**不在**长连接线程、
+    # 也不在投递线程上跑。`AutoOnboardingRunner.start` 只登记 + 交给
+    # `OnboardingExecutor` 自己的线程池，立刻返回 `started`；十五分钟级的等待因此
+    # 只占住那个池子里的一条线程，收不到消息、发不出投递的两种停摆都不会发生。
+    wired_onboarding = build_onboarding_runner(
+        config, audit=_LoggingAudit(), should_stop=stop_event.is_set
+    )
+    # 桩也只建**一个**：两处各自 `onboarding or _UnavailableOnboarding()` 会造出两个
+    # 不同的桩实例，下面那条身份断言就变成了一句永远成立的空话。
+    onboarding_runner: OnboardingRunner = (
+        wired_onboarding.runner if wired_onboarding is not None else _UnavailableOnboarding()
+    )
+
     # 未开通首聊的交接对账（Issue #65 轻审 P2-2）：提交与触发之间崩溃 / 停机留下的
     # 孤儿事件，由它重新交给开通编排一次。挂在投递线程的每轮回调上，而不是长连接
-    # 主线程——对账要连数据库、将来还要调带外部副作用的正式编排，放在长连接那条
-    # 线程上会挡住事件接收。它自己按分钟级最小间隔自限，不会被一秒一轮的投递循环
-    # 拖成空查询风暴。
-    #
-    # 待正式 runner 装配时复核（S-D-02）：真实编排的单次耗时可能到分钟级，那时要
-    # 判断它是否还适合与投递共用这条线程，或者需要自己的循环。
-    delivery_tick = build_delivery_tick(
-        alerting_duty=alerting_duty,
-        reconciler=build_onboarding_reconciler(config, should_stop=stop_event.is_set),
+    # 主线程——对账要连数据库、还要调带外部副作用的正式编排，放在长连接那条线程上会
+    # 挡住事件接收。它自己按分钟级最小间隔自限，不会被一秒一轮的投递循环拖成空查询
+    # 风暴；而正式编排的分钟级耗时不会落在这条线程上（见上面的共用线程复核）。
+    reconciler = build_onboarding_reconciler(
+        config, onboarding=onboarding_runner, should_stop=stop_event.is_set
     )
+    delivery_tick = build_delivery_tick(alerting_duty=alerting_duty, reconciler=reconciler)
 
     consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
     delivery_thread = threading.Thread(
@@ -618,9 +644,12 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     )
     # 长连接的心跳回调里挂上投递线程的看门狗（Issue #191），因此 supervisor 必须在
     # 线程对象存在之后再装配。两者之间没有别的依赖，换顺序不改变任何既有行为。
+    supervisor_onboarding: list[OnboardingRunner] = []
     supervisor = build_supervisor(
         config,
         should_stop=stop_event.is_set,
+        onboarding=onboarding_runner,
+        on_onboarding_assembled=supervisor_onboarding.append,
         heartbeat=_combined_heartbeat(
             alerting_duty,
             "gateway-longconn",
@@ -629,6 +658,13 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             ),
         ),
     )
+    # **双注入点装配断言**（#65 开工卡必含项）：拿两个构造函数**各自最终采用**的那个
+    # 引用比对身份，而不是把同一个变量比较两次——后者什么也证明不了。这条断言挡住的
+    # 正是"supervisor 拿到真 runner、对账落回失败关闭桩"这种静默形状：那时孤儿事件会被
+    # 桩「认领即平账」地烧掉，唯一的证据只有一行 INFO 审计。
+    assert_single_onboarding_runner(*supervisor_onboarding, reconciler.onboarding)
+    if wired_onboarding is not None:
+        wired_onboarding.executor.start()
     delivery_thread.start()
 
     try:
@@ -654,6 +690,21 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             logger.error(
                 "投递消费线程未能在停机预算内退出，进程将不再等待它、直接关闭"
             )
+        if wired_onboarding is not None:
+            # 开通执行器**只停止领取新链**，不打断在途那一条：它可能已经建过用户环境、
+            # 排过发布意图，中途硬停会留下一个"外部副作用已经产生、账本还没写"的形状。
+            # 在途链自己在每一步之间看停止标志收口；预算内没退完就不再等——线程是
+            # daemon，一条卡在外部响应上的链不会把整个进程焊住。
+            wired_onboarding.executor.stop()
+            wired_onboarding.executor.join(
+                timeout=max(0.0, config.shutdown_timeout_seconds - (
+                    time.monotonic() - shutdown_requested_at[0]
+                ))
+            )
+            if wired_onboarding.executor.alive:
+                logger.error(
+                    "首次开通执行线程未能在停机预算内退出，进程将不再等待它、直接关闭"
+                )
 
     if reason is TerminationReason.TERMINAL_ERROR:
         # 终止型错误（403 / 514 超连接数上限）：进程进入明确的终止态，退出码非 0，

@@ -31,12 +31,26 @@ from lingxi.core.identity.provisioning import (
     ProvisioningRejection,
     ProvisioningRequest,
     ProvisioningResult,
+    UserProvisioningStatus,
     classify_write_failure,
     missing_identity_fields,
 )
 from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
+
+# 开通状态的推进次序（迁移 008 的 CHECK 是取值域，这里是**先后**）。只列首次开通链上
+# 会经过的四格：`guest` 是建档默认值之前的形态，`manual_review` / `aborted` 不在自动
+# 开通链上（产品负责人 2026-08-08 裁定：确定性失败统一无权限终态，不建人工核对）。
+# 不在表里的状态一律拒绝推进，而不是当成"排在最前面"——后者会让一个拼错的状态名把
+# 任何用户都推成 active。
+_PROVISIONING_ORDER: dict[str, int] = {
+    "guest": 0,
+    "matching": 1,
+    "provisioning": 2,
+    "mcp_syncing": 3,
+    "active": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -392,6 +406,55 @@ class PostgresAppUserStore:
             )
             row = cursor.fetchone()
         return None if row is None else AppUserRecord(str(row[0]), str(row[1]), row[2], False, row[3], row[4])
+
+    def read_status(self, user_id: str) -> UserProvisioningStatus | None:
+        """回读该用户此刻的账号状态、开通状态与权限版本（Epic D / S-D-02）。
+
+        首次开通编排在建档之后、创建用户环境与发布权限**之前**要用它复核一次——
+        `already_provisioned` 不等于「这个人现在还该被开通」（[接口设计
+        §8.1](../../../../docs/技术设计/接口设计.md)）。与 :meth:`get_by_open_id` 分开是
+        因为那一个按飞书标识查、返回的是建档投影，这一个按内部标识查、返回的是**准入
+        判据**；把两件事塞进同一个返回值会让调用方分不清自己拿到的是哪一份事实。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT account_state, provisioning_state, permission_version "
+                "FROM app_user WHERE id = %s",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return UserProvisioningStatus(str(row[0]), str(row[1]), int(row[2]))
+
+    def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
+        """把 ``provisioning_state`` 往前推一格；**只前进不回退**（`V-开通-04`）。
+
+        条件写在 SQL 的 ``WHERE`` 里，不在 Python 里先读后写：两条并发的开通链（对账
+        重交接撞上用户的新消息）会各自读到同一个旧状态，于是后到的那一条可以把
+        ``active`` 写回 ``provisioning``——一个已经开通完的用户因此重新变成"开通中"，
+        问数被拒。放进条件更新之后，这种回退在数据库层面就发生不了。
+
+        返回是否真的改了行。``False`` 有两种含义（目标状态不在推进表里、或当前状态已经
+        不比目标靠前），两者对调用方是同一件事：**不需要推进**，因此不合并成异常。
+        """
+
+        if to not in _PROVISIONING_ORDER:
+            raise ValueError("不认识的开通状态，拒绝推进")
+        allowed = tuple(state for state, rank in _PROVISIONING_ORDER.items() if rank < _PROVISIONING_ORDER[to])
+        if not allowed:  # pragma: no cover - 推进表的第一格不是任何一次推进的目标
+            return False
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET provisioning_state = %s, updated_at = now() "
+                "WHERE id = %s AND provisioning_state = ANY(%s)",
+                (to, user_id, list(allowed)),
+            )
+            changed = cursor.rowcount
+        if changed:
+            logger.info("开通状态推进 user=%s state=%s", user_id, to)
+        return bool(changed)
 
     def count(self) -> int:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:

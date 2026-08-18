@@ -60,6 +60,32 @@ DELEGATED_PURPOSE = "org_directory_sync"
 DEFAULT_LEASE_SECONDS = 300
 
 
+def registered_delegated_subject_open_id(
+    dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
+) -> str | None:
+    """读取正式登记的专用授权主体标识。**只读登记表，不碰凭据文件、不碰 refresh_token。**
+
+    做成模块级函数而不是只挂在 :class:`HostFileDelegatedCredentialVault` 上，是为了让
+    **不该持有凭据的进程**也能拿到这一个标识：首次开通编排（Epic D）必须知道"哪个
+    `open_id` 是专用授权账号"才能在判定第一步就把它排除（`V-身份-02`），而 gateway 既没有
+    Fernet 主密钥、也不该有宿主机凭据文件路径。经由那个类去读，等于逼 gateway 去构造一个
+    持有解密能力的对象——2026-08-08 的事故正是"多一个进程碰同一份专用授权凭据"的形状。
+
+    登记表里没有行、或值为空白时返回 ``None``。调用方据此判断"还没有专用主体"，
+    **不得**把 ``None`` 当成"任何人都不是专用主体"以外的含义。
+    """
+
+    with connect(dsn, timeouts=timeouts) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
+            (DELEGATED_PURPOSE,),
+        )
+        row = cursor.fetchone()
+    if row is None or not isinstance(row[0], str) or not row[0].strip():
+        return None
+    return row[0].strip()
+
+
 @dataclass(frozen=True)
 class StoredCredential:
     subject_open_id: str
@@ -270,15 +296,7 @@ class HostFileDelegatedCredentialVault:
         因此失效后的恢复仍然有明确的比较对象。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
-                (DELEGATED_PURPOSE,),
-            )
-            row = cursor.fetchone()
-        if row is None or not isinstance(row[0], str) or not row[0].strip():
-            return None
-        return row[0].strip()
+        return registered_delegated_subject_open_id(self._dsn, timeouts=self._timeouts)
 
     def load(self, *, now: datetime | None = None) -> StoredCredential | None:
         """取出当前凭据供同步使用。解密失败或已失效时撤销并返回 ``None``。"""

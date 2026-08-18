@@ -85,6 +85,18 @@ class OnboardingReconciler:
         self._monotonic = monotonic
         self._last_sweep: float | None = None
 
+    @property
+    def onboarding(self) -> OnboardingRunner:
+        """这条对账扫描实际拿到的开通编排。**只读**，供装配层回读。
+
+        对账是两个注入点里更容易被漏掉的那一个：它落回失败关闭桩时，孤儿事件会被
+        "认领即平账"地烧掉，唯一的证据是一行 INFO 级 ``onboarding.reconciled
+        state=internal_error``（#65 开工卡必含项，PR #205 二级审查 P3-2）。把引用公开出来，
+        装配断言才能真的比对两处拿到的是不是同一个实例。
+        """
+
+        return self._onboarding
+
     def run_once(self) -> int | None:
         """跑一轮对账。
 

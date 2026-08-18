@@ -976,6 +976,46 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
         self.assertEqual(self.log.count("audit.onboarding.dispatch_record_failed"), 1)
         self.assertEqual(self.state.onboarding_dispatched, set())
 
+    def test_an_asynchronous_runner_keeps_the_ledger_for_itself(self) -> None:
+        """``started`` 表示"编排异步接手了"，结论还没产生（Epic D / S-D-02）。
+
+        gateway 此刻就记账，会让一次跑到一半的崩溃变成谁都不会再看的悬空状态：对账扫描
+        被账本挡在门外，用户永远停在「正在核对」。正式 runner 在链跑到终态、并把结论发给
+        用户之后才记这一笔，因此崩在中途的那一条仍然是孤儿、仍然会被扫描重新交接一次。
+        """
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+
+        outcome = self.build(onboarding=runner).handle_message(
+            message(event_id="evt_async", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(
+            [call["event_id"] for call in runner.calls], ["evt_async"], "编排必须被调用过"
+        )
+        self.assertEqual(
+            self.state.onboarding_dispatched,
+            set(),
+            "started 的账由编排自己记；gateway 提前记会把中途崩溃的链变成无人恢复的悬空",
+        )
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking"],
+            "started 是唯一允许没有下文的状态：用户刚收到的「正在核对」就是完整交代",
+        )
+
+    def test_a_synchronous_terminal_still_gets_its_ledger_entry(self) -> None:
+        """同步返回终态的编排（失败关闭桩、旧实现）不受上面那条影响。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.INTERNAL_ERROR))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_sync_terminal", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(self.state.onboarding_dispatched, {"evt_sync_terminal"})
+
 
 class OnboardingShutdownOrderTests(PipelineTestCase):
     """#65 轻审 P2-3：停机窗口内**不触发**开通编排。

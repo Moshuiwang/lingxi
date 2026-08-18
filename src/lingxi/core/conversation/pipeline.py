@@ -151,6 +151,18 @@ class EventPipeline:
         # 跳过之后会留下一条待对账的事件，不会丢——见 ``handle_message``。
         self._should_stop = should_stop or (lambda: False)
 
+    @property
+    def onboarding(self) -> OnboardingRunner | None:
+        """这条管线实际拿到的开通编排。**只读**，供装配层回读。
+
+        Epic D 的双注入点装配断言（``apps/gateway/onboarding.assert_single_onboarding_runner``）
+        要证明 ``build_supervisor`` 与 ``build_onboarding_reconciler`` 拿到的是**同一个**
+        实例；比较两个构造好的对象各自持有的引用，才算真的证明了这件事——比较传进去的那
+        一个变量两次，什么也证明不了。
+        """
+
+        return self._onboarding
+
     def handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
         """处理一条 ``im.message.receive_v1``。
 
@@ -498,6 +510,17 @@ class EventPipeline:
             content_keys=tuple(content.key for content in rendered),
             trace_id=message.trace_id,
         )
+        if result.state is OnboardingState.STARTED:
+            # **``started`` 的账由编排自己记。** 它表示编排已经异步接手、结论还没有产生；
+            # 这里就把事件记成"已交接"，会让一次跑到一半的崩溃（进程被杀、机器重启）
+            # 变成谁都不会再看的悬空状态——对账扫描被账本挡在门外，用户永远停在「正在
+            # 核对」。正式 runner 在链跑到终态、并把结论发给用户之后才记这一笔
+            # （``core/identity/onboarding_runner.AutoOnboardingRunner._execute``），
+            # 因此崩在中途的那一条仍然是孤儿，仍然会被扫描重新交接一次。
+            #
+            # 同步返回终态的编排（失败关闭桩、旧的同步实现）不受影响：它们的结论此刻
+            # 已经产生，账照记。
+            return
         self._mark_onboarding_dispatched(message)
 
     def _mark_onboarding_dispatched(self, message: InboundMessage) -> None:

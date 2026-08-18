@@ -75,6 +75,27 @@ class GatewayConfig:
     # `None`（不注入，装配路径与此前逐字节一致）；合法值只有四个，非法值必须
     # 启动即失败（失败关闭），不允许一个拼错的值悄悄在生产环境里长期放行。
     card_failure_injection: str | None = None
+    # ---- 首次开通编排（Epic D / S-D-02）------------------------------------
+    # 下面五项**没有** `LINGXI_GATEWAY_` 前缀：它们是跨进程共享的同一份事实
+    # （scheduler 的每日重算与发布消费读的是同名变量），加前缀会让同一把主密钥、
+    # 同一个 MCP 端点在两个进程里各有一份可以互相漂移的配置。
+    #
+    # 全部**可选**：缺任何一项时首次开通编排不装配（`build_onboarding_runner` 返回
+    # `None`、留一条审计），gateway 其余职责照常启动。这与 scheduler 的
+    # `_build_permission_refresh_duty` 同一条纪律——一个尚未接线的职责不该让整个
+    # 进程起不来，但也绝不能装成"接线了但一直失败"。
+    mcp_token_encrypt_key: _Secret | None = field(default=None, repr=False)
+    query_mcp_endpoint: str | None = None
+    query_mcp_timeout_seconds: int = 20
+    #: 用户环境根目录（`/var/lib/lingxi/users`）。开通链要在它下面建家目录并写
+    #: 按用户的 `.mcp.json`（产品负责人 2026-08-17 裁定）。
+    user_env_root: str | None = None
+    #: 开通编排的执行线程数。**不能是 0，也不该很大**：每条链最长会阻塞十五分钟，
+    #: 线程数就是"同一时刻最多几个人在开通"。
+    onboarding_workers: int = 4
+    #: 排完发布意图之后，等 scheduler 把它真的写出去并读回一致的上限。等不到是本侧
+    #: 故障（`LX-ONBOARD-001`），不是 MCP 同步超时。
+    onboarding_publish_wait_seconds: float = 120.0
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -147,6 +168,68 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _shared(env: Mapping[str, str], name: str) -> str | None:
+    """读一个**不带 gateway 前缀**的跨进程共享变量。
+
+    与 :func:`_text` 分开是为了让"这一项是共享的"在调用点就看得见：同名变量在
+    scheduler 与 gateway 里必须是同一个值，加了前缀就会变成两份可以互相漂移的配置。
+    """
+
+    value = env.get(name)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _onboarding_master_key(env: Mapping[str, str]) -> _Secret | None:
+    """MCP 令牌主密钥。**只校验形状，不回显取到的值。**
+
+    形状不对时启动即失败，而不是留到某个用户第一次开通才炸——一把长度错误的主密钥
+    表现出来是"每个人的开通都在同一步失败"，排查成本远高于启动期报错。
+    """
+
+    raw = _shared(env, "LINGXI_MCP_TOKEN_ENCRYPT_KEY")
+    if raw is None:
+        return None
+    from lingxi.adapters.mcp_token_cipher import load_master_key
+
+    try:
+        load_master_key(raw)
+    except ValueError as error:
+        raise GatewayConfigError(f"环境变量 LINGXI_MCP_TOKEN_ENCRYPT_KEY 不合法：{error}") from None
+    return _Secret(raw)
+
+
+def _query_mcp_endpoint(env: Mapping[str, str]) -> str | None:
+    raw = _shared(env, "LINGXI_QUERY_MCP_ENDPOINT")
+    if raw is not None and not raw.startswith("https://"):
+        # 误配 http:// 会让用户自己的 MCP 令牌明文上路。只报变量名，不回显取到的值。
+        raise GatewayConfigError("环境变量 LINGXI_QUERY_MCP_ENDPOINT 必须以 https:// 开头")
+    return raw
+
+
+def _query_mcp_timeout_seconds(env: Mapping[str, str]) -> int:
+    from lingxi.core.permission.mcp_readiness import (
+        DEFAULT_PROBE_TIMEOUT_SECONDS,
+        ReadinessSchedule,
+    )
+
+    raw = _shared(env, "LINGXI_QUERY_MCP_TIMEOUT_SECONDS")
+    if raw is None:
+        return DEFAULT_PROBE_TIMEOUT_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise GatewayConfigError("环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 必须是正整数秒") from None
+    try:
+        # 用**合同节奏**加这个超时构造一次：不合法的组合（超过一个轮询间隔、非正整数）
+        # 在进程启动时就失败，而不是等到某个用户第一次需要就绪确认时才炸。
+        ReadinessSchedule(probe_timeout_seconds=seconds)
+    except ValueError as error:
+        raise GatewayConfigError(
+            f"环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 不合法：{error}"
+        ) from None
+    return seconds
+
+
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
@@ -198,6 +281,12 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         alert_policy=alert_policy,
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
         card_failure_injection=_card_failure_injection(env),
+        mcp_token_encrypt_key=_onboarding_master_key(env),
+        query_mcp_endpoint=_query_mcp_endpoint(env),
+        query_mcp_timeout_seconds=_query_mcp_timeout_seconds(env),
+        user_env_root=_shared(env, "LINGXI_USER_ENV_ROOT"),
+        onboarding_workers=_positive_int(env, "ONBOARDING_WORKERS", 4),
+        onboarding_publish_wait_seconds=_number(env, "ONBOARDING_PUBLISH_WAIT_SECONDS", 120.0),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，
