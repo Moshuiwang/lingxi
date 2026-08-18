@@ -911,26 +911,20 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
 
         self.assertEqual([item.user_id for item in pending], [USER_B, USER_A])
 
-    def test_an_exhausted_plan_is_due_immediately_after_the_budget(self) -> None:
-        """计划表用尽却还没收口的那种行，过了预算就该被取回来收口，而不是再等一个间隔。"""
+    def test_an_exhausted_plan_is_due_once_the_budget_has_passed(self) -> None:
+        """计划表用尽却还没收口的那种行，**过了预算就该被取回来收口**。
+
+        取一个只有"预算封顶"才成立的时刻：起点在 950 秒前，已判定 6 次。
+        ``6 × 180 = 1080`` 秒还没到，但预算 900 秒已经过了——少了 ``LEAST(..., 预算)``
+        这一层，这条永远没收口的确认要再多等一个间隔才会被取回来。
+        """
 
         self._publish()
+        started = datetime.now(timezone.utc) - timedelta(seconds=950)
         for _ in range(6):
-            self._record_check(USER_A, 1, "waiting")
+            self._record_check(USER_A, 1, "waiting", at=started)
 
-        # 六次尝试 × 180 秒 = 1080 秒还没到，但预算封顶让它在 900 秒就到期；
-        # 用例里把预算缩到 1 秒来表达"预算已经过了"。
-        self.assertEqual(
-            len(
-                self.store.published_awaiting_readiness(
-                    reasons=self.OWNED_REASONS,
-                    interval_seconds=self.INTERVAL_SECONDS,
-                    budget_seconds=1,
-                    limit=50,
-                )
-            ),
-            1,
-        )
+        self.assertEqual(len(self._candidates()), 1)
 
     def test_an_illegal_schedule_is_rejected(self) -> None:
         for kwargs in ({"interval_seconds": 0}, {"budget_seconds": -1}, {"interval_seconds": True}):
