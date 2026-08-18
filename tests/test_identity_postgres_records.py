@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from lingxi.adapters.postgres import connect
@@ -412,7 +412,10 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         self._save()
 
         self.assertIsNone(self.vault.claim_due(), "到期领取这条路径不受影响")
-        claimed = self.vault.claim_due(require_due=False)
+        # 放开到期判定必须与频率上界成对（O8）；这里给一个不会命中的日期。
+        claimed = self.vault.claim_due(
+            require_due=False, refuse_if_consumed_on=date(2000, 1, 1)
+        )
 
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed.subject_open_id, DELEGATED_SUBJECT)
@@ -490,7 +493,9 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         first = datetime.now(timezone.utc)
         self._save(refresh_consumed_at=first)
-        claimed = self.vault.claim_due(require_due=False)
+        claimed = self.vault.claim_due(
+            require_due=False, refuse_if_consumed_on=date(2000, 1, 1)
+        )
         self.assertIsNotNone(claimed)
 
         second = first + timedelta(days=1)
