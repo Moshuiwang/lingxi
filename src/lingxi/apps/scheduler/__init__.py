@@ -74,6 +74,7 @@ from lingxi.core.identity.access_token_supply import (
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
     CredentialAction,
+    CredentialSaveOutcome,
     DerivedAccessToken,
     RefreshAlreadyConsumedToday,
     RefreshOutcome,
@@ -321,6 +322,7 @@ class CredentialRotationLoop:
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         stop: threading.Event | None = None,
         holder: DerivedAccessTokenHolder | None = None,
+        budget: DailyRefreshBudget | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._vault = vault
@@ -332,11 +334,28 @@ class CredentialRotationLoop:
         # 派生短期令牌的进程内持有者。没有它时轮换照常工作，只是派生令牌被丢弃
         # （接线之前的行为）；有它时到期轮换与按需续期都把令牌喂进去。
         self._holder = holder
+        # 按需续期的每日频率上界。**账本归消费点所有**：只有这里知道"领取成功了没有"，
+        # 而那正是零消费与已消费之间唯一说得清的分界（见 DailyRefreshBudget）。
+        self._budget = budget
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # 「今天换到的那份派生令牌不可用」的记号。没有它的话，当天后续每一轮都只会看到
+        # 频率上界报出的「今天已经换过了」，而真正的原因（飞书没给寿命）再也不会出现在
+        # 审计里——一个真实故障被一个例行拒绝盖住（两路审查 O7）。
+        self._derived_unusable_on: date | None = None
 
     @property
     def stopping(self) -> bool:
         return self._stop.is_set()
+
+    @property
+    def derived_token_holder(self) -> DerivedAccessTokenHolder | None:
+        """本职责写入派生短期令牌的那个持有者。
+
+        只读暴露，供装配处断言"日报侧读的正是轮换职责写的那一份"——这条链断了不会有
+        任何用例变红，除非它有一个可观察的接缝（两路审查 O4）。
+        """
+
+        return self._holder
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -360,6 +379,7 @@ class CredentialRotationLoop:
             return RotationReport()
 
         consumed_at = self._clock()
+        consumed_day = consumed_at.astimezone(timezone.utc).date()
         derived: Any = None
         try:
             replacement, derived = self._authorization.refresh(claim.grant)
@@ -371,16 +391,26 @@ class CredentialRotationLoop:
 
         claim_generation = getattr(claim, "generation", None) or None
         if decide_after_refresh(outcome) is CredentialAction.ROTATE and replacement is not None:
-            if self._save_with_retry(
+            saved = self._save_with_retry(
                 subject_open_id=claim.subject_open_id,
                 replacement=replacement,
                 replacing_generation=claim_generation,
                 refresh_consumed_at=consumed_at,
-            ):
+            )
+            if saved is CredentialSaveOutcome.SAVED:
                 logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
                 # **落盘成功之后**才把派生令牌交给进程内持有者：反过来会让"续期成功但
                 # 写盘失败＝凭据丢失"这条路径在日报照常工作的表象下发生。
-                self._remember_derived(derived)
+                self._remember_derived(derived, day=consumed_day)
+                return RotationReport(claimed=1, rotated=1)
+            if saved is CredentialSaveOutcome.SUPERSEDED:
+                # 期间发生了新授权：本链的新凭据被丢弃，而旧的那条已经在飞书那边消费掉。
+                # 不撤销（不能连带删掉新凭据），但**一个令牌都不交出**——交出去日报会照常
+                # 工作到令牌过期为止，把"这条链已经死了"整整盖住那么久（两路审查 P1）。
+                logger.warning(
+                    "轮换结果已被期间的新授权取代，本链结果作废，派生短期令牌不予交出 subject=%s",
+                    redact_identifier(claim.subject_open_id),
+                )
                 return RotationReport(claimed=1, rotated=1)
             # 新凭据没能落库：旧的此刻已被飞书作废，继续留着只会让下一轮拿死
             # 凭据再撞一次墙。撤销并用可与普通失败区分的日志请求人工重新授权
@@ -409,25 +439,40 @@ class CredentialRotationLoop:
         - ``require_due=False``——日报每天要令牌，而轮换点五天多才到一次；
         - ``refuse_if_consumed_on``——放开到期判定必须配一道频率上界，且判据落在凭据
           文件里，进程重启与崩溃重启循环都绕不过（一次性令牌被高频消费正是 2026-08-08
-          那次事故的形状）。
+          那次事故的形状）。判据按 **UTC 日**归一，与文件那一侧用同一把尺子。
 
-        失败一律抛 :class:`AccessTokenUnavailable`，**只带分类不带值**；凭据的处置与
-        到期轮换完全一致（续期失败撤销、写盘失败撤销并按不可恢复留痕），因为"这条一次性
-        凭据还能不能用"与是谁触发的这次续期无关。
+        进程内那道上界（:class:`DailyRefreshBudget`）**在领取成功之后才记账**：领取成功
+        等于消费标记已经原子置位，这条一次性令牌从此回不来了；而领取之前的失败
+        （停止中、没有可领取的凭据）是**可证明零消费**的，占掉当日名额会让产品负责人
+        补完授权当天全天被拒（两路审查 O3）。
+
+        失败一律抛 :class:`AccessTokenUnavailable`，**只带分类、不带值、不带原因链**；
+        凭据的处置与到期轮换完全一致（续期失败撤销、写盘失败撤销并按不可恢复留痕），
+        因为"这条一次性凭据还能不能用"与是谁触发的这次续期无关。
         """
 
         if self._stop.is_set():
             # 停止中不再开启任何一次续期：半途中断的续期等于凭据丢失（模块头注释）。
+            # 零消费，因此不记账。
             raise AccessTokenUnavailable("scheduler_stopping")
         consumed_at = self._clock()
+        consumed_day = consumed_at.astimezone(timezone.utc).date()
+        if self._budget is not None and self._budget.is_spent(consumed_day):
+            raise AccessTokenUnavailable(self._refusal_reason(consumed_day))
         try:
             claim = self._vault.claim_due(
-                require_due=False, refuse_if_consumed_on=consumed_at.date()
+                require_due=False, refuse_if_consumed_on=consumed_day
             )
         except RefreshAlreadyConsumedToday:
-            raise AccessTokenUnavailable("refresh_already_consumed_today") from None
+            raise AccessTokenUnavailable(
+                self._refusal_reason(consumed_day, ceiling="refresh_already_consumed_today")
+            ) from None
         if claim is None:
+            # 零消费：没有可领取的凭据（未授权、已撤销、或正被另一条链消费中）。
             raise AccessTokenUnavailable("no_credential_available")
+        if self._budget is not None:
+            # 消费标记已经置位，从这一刻起无论后面发生什么都算今天用掉了一次。
+            self._budget.charge(consumed_day)
 
         claim_generation = getattr(claim, "generation", None) or None
         try:
@@ -436,14 +481,17 @@ class CredentialRotationLoop:
             outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
             logger.warning("按需续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
             self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
-            raise AccessTokenUnavailable(f"refresh_{outcome.value}") from error
+            # from None：原始异常留在 __cause__ 里，任何一次 traceback 打印都会把响应
+            # 正文（可能含令牌）带进日志。排障信息以净化过的类名走上面那行日志。
+            raise AccessTokenUnavailable(f"refresh_{outcome.value}") from None
 
-        if not self._save_with_retry(
+        saved = self._save_with_retry(
             subject_open_id=claim.subject_open_id,
             replacement=replacement,
             replacing_generation=claim_generation,
             refresh_consumed_at=consumed_at,
-        ):
+        )
+        if saved is CredentialSaveOutcome.FAILED:
             logger.error(
                 "不可恢复：按需续期成功但新凭据写库失败，旧凭据已被飞书作废，需人工重新授权 subject=%s",
                 redact_identifier(claim.subject_open_id),
@@ -452,27 +500,48 @@ class CredentialRotationLoop:
             # 落盘失败就**不交出令牌**：让日报这一轮失败，好过在凭据已经丢失的情况下
             # 照常发出日报、把丢失掩盖到下一次轮换才被发现。
             raise AccessTokenUnavailable("credential_persist_failed")
+        if saved is CredentialSaveOutcome.SUPERSEDED:
+            # 期间有新授权：本链的新凭据被丢弃，旧的已在飞书那边作废。不撤销（新凭据
+            # 不能被旧链连带删掉），但同样**什么都不交出**——这条链已经没有活着的凭据了。
+            logger.warning(
+                "按需续期的结果已被期间的新授权取代，本链结果作废，派生短期令牌不予交出 subject=%s",
+                redact_identifier(claim.subject_open_id),
+            )
+            raise AccessTokenUnavailable("no_credential_available")
 
         logger.info("专用授权凭据已按需轮换 subject=%s", redact_identifier(claim.subject_open_id))
-        if not self._remember_derived(derived):
+        if not self._remember_derived(derived, day=consumed_day):
             # 凭据没有丢（已落盘），只是这份派生令牌不可用。不撤销、不重试。
             raise AccessTokenUnavailable("derived_token_unusable")
 
-    def _remember_derived(self, derived: Any) -> bool:
+    def _refusal_reason(self, today: date, *, ceiling: str = "daily_refresh_budget_exhausted") -> str:
+        """今天已经换过一次时，对外报哪个分类。
+
+        默认报上界本身；但如果今天换到的那份派生令牌**本来就不可用**，真实原因是它，
+        不是"今天已经换过了"。报错原因漂移会让一个真实故障看起来像例行拒绝（O7）。
+        """
+
+        return "derived_token_unusable" if self._derived_unusable_on == today else ceiling
+
+    def _remember_derived(self, derived: Any, *, day: date) -> bool:
         """把派生令牌交给进程内持有者。没有持有者或令牌不可用时返回 ``False``。
 
-        令牌值不进日志：这里只记"有没有拿到可用的一份"。
+        令牌值不进日志：这里只记"有没有拿到可用的一份"，以及"今天这一份不可用"。
         """
 
         if self._holder is None:
+            # 没有装配持有者（接线之前的形态）。不是"今天的令牌不可用"，不记那个状态。
             return False
         if not isinstance(derived, DerivedAccessToken):
             logger.warning("续期未交出派生短期令牌，花名册读取本轮无令牌可用")
+            self._derived_unusable_on = day
             return False
-        stored = self._holder.store(derived, now=self._clock())
-        if not stored:
+        if not self._holder.store(derived, now=self._clock()):
             logger.warning("飞书未返回短期令牌寿命，派生令牌不予缓存")
-        return stored
+            self._derived_unusable_on = day
+            return False
+        self._derived_unusable_on = None
+        return True
 
     def _save_with_retry(
         self,
@@ -481,8 +550,13 @@ class CredentialRotationLoop:
         replacement: Any,
         replacing_generation: str | None = None,
         refresh_consumed_at: datetime | None = None,
-    ) -> bool:
-        """新凭据落盘带短退避重试：一次瞬时抖动不该报废一条一次性凭据。"""
+    ) -> CredentialSaveOutcome:
+        """新凭据落盘带短退避重试：一次瞬时抖动不该报废一条一次性凭据。
+
+        返回**三态**而不是布尔（:class:`CredentialSaveOutcome`）：轮换收尾只关心"要不要
+        撤销"，因此"落盘了"与"被新授权取代"曾被压成同一个真值；但派生短期令牌关心的是
+        "这条链还有没有活着的凭据"，两者在那个问题上是相反的答案。
+        """
 
         for delay_seconds in (0.0, *SAVE_RETRY_BACKOFF_SECONDS):
             if delay_seconds:
@@ -496,12 +570,13 @@ class CredentialRotationLoop:
                     refresh_consumed_at=refresh_consumed_at,
                 )
                 if saved is False:
-                    # 世代不符＝期间有新授权：旧链结果作废，视为已妥善收尾。
-                    return True
-                return True
+                    # 世代不符或主体登记 CAS 未通过＝期间有新授权：**新凭据没有落盘**。
+                    # 对撤销判定来说这算已妥善收尾，对派生令牌来说这条链已经死了。
+                    return CredentialSaveOutcome.SUPERSEDED
+                return CredentialSaveOutcome.SAVED
             except Exception as error:  # noqa: BLE001 - 记录后重试，最终失败由调用方处置
                 logger.warning("新凭据写库失败，将重试 error=%s", type(error).__name__)
-        return False
+        return CredentialSaveOutcome.FAILED
 
     def run_forever(self) -> None:
         while not self._stop.is_set():
@@ -1113,6 +1188,7 @@ def build_loop(
         interval_seconds=config.interval_seconds,
         stop=stop,
         holder=holder,
+        budget=DailyRefreshBudget(),
     )
     cleanup = RetentionCleanupDuty(
         # 清理函数内部两张表各有 2s lock_timeout，不能沿用 scheduler 通用的 3s
@@ -1135,7 +1211,6 @@ def build_loop(
         else RosterAccessTokenProvider(
             holder=holder,
             refresh=rotation.refresh_for_supply,
-            budget=DailyRefreshBudget(),
             audit=sink,
         )
     )

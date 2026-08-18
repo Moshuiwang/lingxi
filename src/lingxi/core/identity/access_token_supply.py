@@ -20,8 +20,18 @@
    2026-08-08 授权码被烧那次事故的形状，一个崩溃重启循环或一个每轮都失败的缺陷都能
    造出这个形状，因此频率上界是守卫而不是优化。
 3. **拿不到令牌就失败关闭**（:class:`AccessTokenUnavailable`）：对外只报**分类**，
-   不回显任何令牌、凭据或响应正文。绝不返回空串或占位符——那会让"没有凭据"伪装成
-   "花名册读取失败"，把排障指向错误的地方。
+   不回显任何令牌、凭据或响应正文，也不留原因链。绝不返回空串或占位符——那会让
+   "没有凭据"伪装成"花名册读取失败"，把排障指向错误的地方。
+
+## 三条**已知并接受**的残留（两路审查交叉裁定，不修）
+
+- **人工重授权会重置当日额度**：新授权不带消费标记（凭据层刻意如此），因此补授权当天
+  可以再换一次。它需要一次人工授权动作才能发生，人为门槛本身就是保护，接受；
+- **"唯一消费者"的源码扫描是绊线不是安全边界**：AST 扫的是几种已知写法，绕开它并不难
+  （换个变量名调用、动态取属性）。它的价值在于"有人不经意地加了第二个消费者时会响"，
+  不承诺拦住有意为之；
+- **"日报发送失败 + 当天进程重启"会丢掉那一天的日报**：重启后再要令牌会被持久上界拒绝。
+  维持失败关闭（放宽就等于放宽"每 UTC 日至多一次"），由编排者提请产品负责人知情接受。
 """
 
 from __future__ import annotations
@@ -87,6 +97,13 @@ def _require_utc(moment: datetime, name: str) -> datetime:
     if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
         raise ValueError(f"{name} 必须是带时区的 UTC 时间")
     return moment.astimezone(timezone.utc)
+
+
+def _require_date(day: date) -> date:
+    # datetime 是 date 的子类，误传会让"今天"变成一个带时刻的对象，比较时永不相等。
+    if not isinstance(day, date) or isinstance(day, datetime):
+        raise ValueError("频率上界只接受已经归一到 UTC 的日期")
+    return day
 
 
 class DerivedAccessTokenHolder:
@@ -160,15 +177,26 @@ class DerivedAccessTokenHolder:
 class DailyRefreshBudget:
     """按需刷新的频率上界：每 UTC 日至多一次。
 
-    **在尝试那一刻记账，不是在成功那一刻**。一次失败的续期在飞书那边同样可能已经把
-    这条一次性 ``refresh_token`` 消费掉（结果不明确时更是如此），按"成功才记账"会让一个
-    每轮都失败的缺陷每 60 秒去消费一次。上界因此按"尝试"计，比合同要求的"成功不超过
-    一次"更严，方向是安全的那一侧。
+    **记账点是"领取成功"那一刻**，不是"打算试一次"那一刻。两端各有一个坑，这里刻意
+    站在中间：
+
+    - 记在**成功之后**：一个每轮都失败的缺陷会每 60 秒去消费一次一次性令牌——那正是
+      2026-08-08 授权码被烧那次事故的形状；
+    - 记在**尝试之前**：`no_credential_available` / `scheduler_stopping` 这类**可证明
+      零消费**的失败也会占掉当日名额。后果很具体：产品负责人早上补完授权，当天全天都会
+      被"今天已经换过了"拒绝，而凭据层恰恰刻意让新授权不带消费标记（两路审查交叉确认）。
+
+  领取成功等于凭据文件里的消费标记已经原子置位——从那一刻起这条一次性令牌无论如何都
+  回不来了，因此它既是"确实消费了"的最早时刻，也是"零消费"与"已消费"之间唯一说得清的
+  分界。领取之后的任何失败（飞书拒绝、结果不明确、写盘失败）都照常记账。
 
     这是**进程内**的那一半守卫，重启即清零；重启也抹不掉的那一半由凭据文件里的
     ``refresh_consumed_at`` 承担（见 :class:`~lingxi.core.identity.credentials.
     RefreshAlreadyConsumedToday`）。两道都要有：只有进程内那道，崩溃重启循环可以绕过；
     只有文件那道，每一次拒绝都要先去开锁读文件。
+
+    只认 :class:`datetime.date`：**UTC 归一由调用方负责**，因为"今天"这件事必须与凭据
+    文件那一侧用同一把尺子量（`_utc_day`），在两个地方各算一次就会在午夜前后错位。
     """
 
     __slots__ = ("_spent_on",)
@@ -180,14 +208,13 @@ class DailyRefreshBudget:
     def spent_on(self) -> date | None:
         return self._spent_on
 
-    def try_consume(self, now: datetime) -> bool:
-        """记一次尝试；今天已经记过就返回 ``False``（本次不得去消费凭据）。"""
+    def is_spent(self, day: date) -> bool:
+        return self._spent_on == _require_date(day)
 
-        today = _require_utc(now, "now").date()
-        if self._spent_on == today:
-            return False
-        self._spent_on = today
-        return True
+    def charge(self, day: date) -> None:
+        """记下"这一天已经消费过一次"。同日重复调用无副作用。"""
+
+        self._spent_on = _require_date(day)
 
 
 class RosterAccessTokenProvider:
@@ -197,7 +224,9 @@ class RosterAccessTokenProvider:
 
     1. **手上有新鲜的就直接给**——花名册一轮要读很多页，每页现取一次，不能每页都去
        消费凭据；
-    2. 没有或已临期 → 先过频率上界，**再**触发一次轮换职责内的受控续期；
+    2. 没有或已临期 → 触发一次轮换职责内的受控续期。**频率上界不在这里**：它属于真正
+       消费凭据的那一侧（:class:`DailyRefreshBudget` 由凭据轮换职责在领取成功之后记账），
+       放在这里会变成"打算试一次就扣一次"，把可证明零消费的失败也算进去；
     3. 续期与落盘全部成功之后，才可能拿到令牌。**顺序不能反**：新的
        ``refresh_token`` 先成功落盘、再交出派生令牌，把"续期成功但写盘失败＝凭据丢失"
        的窗口压到最小且方向安全（落盘失败就不交出，并按凭据丢失风险留痕）。
@@ -206,6 +235,10 @@ class RosterAccessTokenProvider:
     ``BitableRosterPages`` 刻意把 provider 自己抛的异常原样上抛而不折成"花名册读取
     失败"，因为拿不到凭据是本侧的授权问题，不是源头异常。日报侧因此按职责级失败隔离
     处理——不注销职责、水位不置位、下一轮再试。
+
+    **异常不带原因链**（``raise ... from None``）：``__cause__`` 里挂着的原始
+    transport / provider 异常会在任何一次 traceback 打印时把响应正文乃至令牌带进日志，
+    而本类对外承诺的恰恰是"只有分类"。需要排障时给的是净化字段（异常**类名**）。
 
     审计**只记分类**，且同一 UTC 日同一分类只记一条：拒绝会在每一轮定时循环里重复
     发生（默认 60 秒一轮），逐次记会把审计淹掉。
@@ -216,7 +249,6 @@ class RosterAccessTokenProvider:
         *,
         holder: DerivedAccessTokenHolder,
         refresh: Callable[[], None],
-        budget: DailyRefreshBudget | None = None,
         audit: AuditSink | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -224,15 +256,10 @@ class RosterAccessTokenProvider:
             raise ValueError("refresh 必须是执行一次受控续期的可调用对象")
         self._holder = holder
         self._refresh = refresh
-        self._budget = budget if budget is not None else DailyRefreshBudget()
         self._audit = audit
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._audited_on: date | None = None
         self._audited_reasons: set[str] = set()
-
-    @property
-    def budget(self) -> DailyRefreshBudget:
-        return self._budget
 
     def __call__(self) -> str:
         now = _require_utc(self._clock(), "now")
@@ -240,16 +267,14 @@ class RosterAccessTokenProvider:
         if token is not None:
             return token.reveal()
 
-        if not self._budget.try_consume(now):
-            raise self._unavailable("daily_refresh_budget_exhausted", now)
-
         try:
             self._refresh()
         except AccessTokenUnavailable as error:
             self._record(error.reason, now)
             raise
         except Exception as error:  # noqa: BLE001 - 只保留分类，异常正文可能带响应内容
-            raise self._unavailable("refresh_error", now) from error
+            self._record("refresh_error", now, error_type=type(error).__name__)
+            raise AccessTokenUnavailable("refresh_error") from None
 
         moment = _require_utc(self._clock(), "now")
         token = self._holder.fresh(now=moment)
@@ -266,8 +291,11 @@ class RosterAccessTokenProvider:
         self._record(reason, now)
         return AccessTokenUnavailable(reason)
 
-    def _record(self, reason: str, now: datetime) -> None:
-        """记一条失败审计；同一天同一分类只记一条。"""
+    def _record(self, reason: str, now: datetime, **sanitized: str) -> None:
+        """记一条失败审计；同一天同一分类只记一条。
+
+        ``sanitized`` 只接受已经确认不含任何值的补充字段（目前只有异常**类名**）。
+        """
 
         today = now.date()
         if self._audited_on != today:
@@ -279,7 +307,10 @@ class RosterAccessTokenProvider:
         if self._audit is not None:
             # 只有分类与日期。令牌、凭据、响应正文一个字节都不进审计。
             self._audit.record(
-                "roster_access_token.unavailable", reason=reason, report_date=today.isoformat()
+                "roster_access_token.unavailable",
+                reason=reason,
+                report_date=today.isoformat(),
+                **sanitized,
             )
 
     def _record_success(self, now: datetime) -> None:

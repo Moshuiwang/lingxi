@@ -310,7 +310,9 @@ class HostFileDelegatedCredentialVault:
 
         ``require_due=False`` 是**按需续期**入口（Issue #215）：日报每天要一次派生
         短期令牌，而轮换点在有效期 80%（约 5.6 天）才到。放开到期判定的代价是消费频率
-        变成按日一次，因此它必须与频率上界成对使用，绝不单独放开。
+        变成按日一次，因此它必须与频率上界成对使用，绝不单独放开——**不成对就在构造期
+        直接拒绝**，不靠调用方自觉：单独放开等于把一条一次性凭据交给一个没有任何频率
+        约束的循环。
 
         ``refuse_if_consumed_on`` 就是那道上界，且**在文件锁内、置位消费标记之前**判定：
         当前凭据若记录着"那一天已经消费过一次续期"，直接抛
@@ -321,6 +323,9 @@ class HostFileDelegatedCredentialVault:
         """
 
         del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
+        if not require_due and refuse_if_consumed_on is None:
+            # 守卫在文件锁之前：被拒的调用一个字节都不该动到凭据文件。
+            raise ValueError("放开到期判定必须同时给出频率上界（两个参数成对使用）")
         moment = now or datetime.now(timezone.utc)
         with self._locked():
             payload = self._read_payload()

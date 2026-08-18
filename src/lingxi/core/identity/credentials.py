@@ -147,6 +147,26 @@ class CredentialAction(str, Enum):
     REVOKE = "revoke"
 
 
+class CredentialSaveOutcome(str, Enum):
+    """一次"把新凭据写回去"的结果。**三态，不是布尔**。
+
+    压成布尔正是 Issue #215 一级 / 二级审查交叉抓到的 P1：``SUPERSEDED``（世代不符或
+    主体登记 CAS 未通过）与 ``SAVED`` 都被折成"真"，因为对轮换收尾来说两者都算"已妥善
+    收尾、不必撤销"。但对**派生短期令牌**来说它们是相反的两件事——``SUPERSEDED`` 意味着
+    新的 ``refresh_token`` 被丢弃、本链已死（旧的那条已经在飞书那边被消费掉），此时把
+    派生令牌交出去，日报会照常工作到令牌过期为止，把"凭据丢失"整整盖住那么久。
+
+    - ``SAVED``：新凭据确实落盘了，本链继续有效；
+    - ``SUPERSEDED``：期间发生了新授权，本链结果作废——**不撤销**（不能把新凭据连带
+      删掉），但也**什么都不交出**；
+    - ``FAILED``：写不进去。旧凭据已被飞书作废，按不可恢复撤销并要求人工重新授权。
+    """
+
+    SAVED = "saved"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
+
+
 def _require_aware(moment: datetime, name: str) -> datetime:
     if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
         raise ValueError(f"{name} 必须是带时区的 UTC 时间")
