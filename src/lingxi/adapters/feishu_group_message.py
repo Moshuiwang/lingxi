@@ -42,8 +42,8 @@ DELIVERY_UUID_MAX_LENGTH = 50
 SendOutcomeCallback = Callable[[str, bool], None]
 
 
-def delivery_uuid(chat_id: str, dedupe_key: str) -> str:
-    """由「群 ID + 去重键」算出稳定的投递去重 ID。
+def delivery_uuid(chat_id: str, dedupe_key: str, *, prefix: str = DELIVERY_UUID_PREFIX) -> str:
+    """由「接收方 ID + 去重键」算出稳定的投递去重 ID。
 
     **它解决的是"不确定态"，不是跨重启幂等。** HTTP POST 已经被飞书收下、而响应在
     回程超时的那一刻，调用方无法区分"没发出去"和"发出去了但没听见回音"——重试是唯一
@@ -56,11 +56,18 @@ def delivery_uuid(chat_id: str, dedupe_key: str) -> str:
     **平台侧的去重窗口是飞书的属性，本切片未验证**（真实调用属 L4a）。因此本模块能
     承诺的是"重试一定携带同一个 `uuid`"这个**代码事实**，不是"平台一定不会重复投递"
     这个**平台行为**；后者要等 L4a 受控验收才能声称。
+
+    `prefix` 参数化（Issue #156 / S-C-03b）：权限变化通知走的是同一个
+    `im/v1/messages` 接口、需要的是同一种"重试携带同一个 uuid"的保证，但它是**另一条
+    投递语义**——两条链共用同一个前缀，会让运维在飞书侧再也分不出一个 uuid 属于日报
+    还是权限通知。取值域仍由长度上限守着（下面那一行按实际前缀算，不是按默认值算）。
     """
 
     digest = hashlib.sha256(f"{chat_id}\n{dedupe_key}".encode("utf-8")).hexdigest()[:32]
-    value = f"{DELIVERY_UUID_PREFIX}{digest}"
-    if len(value) > DELIVERY_UUID_MAX_LENGTH:  # pragma: no cover - 取值恒为 46，改前缀时才可能触发
+    if not isinstance(prefix, str) or not prefix.strip() or prefix.strip() != prefix:
+        raise ValueError("投递去重 ID 的前缀必须是不含首尾空白的非空文本")
+    value = f"{prefix}{digest}"
+    if len(value) > DELIVERY_UUID_MAX_LENGTH:
         raise ValueError("投递去重 ID 超过飞书的 50 字符上限")
     return value
 

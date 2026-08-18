@@ -159,6 +159,27 @@ publish.publish_claim`）。以及：**密文缺失（含纯空白）时任何�
 既有 26 行的 ``status`` **全部是** ``approved``（同一次回源核对）。此前本模块自拟的
 ``active`` 会在同一列里造出第二种取值，而这一列的取值域由消费方定义、不由我们定义。
 
+### 撤权行：**保行、清空 ``permissions``**（产品负责人 2026-08-18 裁定 3）
+
+权限从有变无时，`V-权限-08` 的刷新侧语义是：**那一行留着，``permissions`` 写成空对象**
+（:func:`serialize_revoked_permissions`，出口是 :func:`build_revocation_row`）。不删行、
+不改 ``status``、不碰 ``token_cipher``、不重建行——权限恢复时是一次普通的六字段更新。
+
+为什么空对象足以表达"没有权限"：消费方的权限判定是**回退制**（:func:`lookup_metrics`）
+——具体公司键查不到就回退 ``"*"``，两个都没有就是空元组，任何指标都不放行。因此
+「查无任何键」在 MCP 那一侧就是拒绝，不需要我们再造一个 ``status`` 取值去说同一件事。
+
+三条不做的事，各有理由：
+
+- **不删行**：删除是不可逆的外部副作用，而那一行还带着一份我们（对既有 26 行而言）
+  不知道明文的 ``token_cipher``；删掉之后权限恢复就必须重建行、重新给令牌。
+- **不改 ``status``**：取值域由消费方定义，自拟取值等于赌它对未知值的处理方式。
+- **不碰 ``token_cipher``**：撤权行只有六个字段，走的必然是更新路径；那一列因此保持原值
+  （:data:`PUBLISHED_FIELD_NAMES` 里本来就没有它）。
+
+**时效边界**：这条语义在**硬切之后**才由 Lingxi 负责；硬切之前正式表仍有旧系统在写，
+撤权由旧系统承担（同一条裁定）。
+
 ### ``updated_at``：**权限决定的时刻**，不是发布尝试的时刻
 
 既有行是 ISO 风格时间串（含 ``-`` 与 ``:``），与 :func:`format_updated_at` 产出的
@@ -193,10 +214,22 @@ _UTC = timezone.utc
 #: 通配展开成几十个重复条目——展开规则是我们这一侧的解释，消费方已有自己的约定。
 ALL_COMPANIES_KEY = "*"
 
-#: 发布行「有权限」时写入的 ``status`` 值。取 ``approved`` 是因为既有 26 行全是它
-#: （2026-08-17 全表回源核对）；这一列的取值域由消费方定义，不由我们定义。停用 / 收回的
-#: 发布语义属 S-C-03/04，本 Story 只发布**有效**权限，因此这里只有一个取值。
+#: 发布行的 ``status`` 值。取 ``approved`` 是因为既有 26 行全是它（2026-08-17 全表回源
+#: 核对）；这一列的取值域由消费方定义，不由我们定义。
+#:
+#: **撤权行同样写 ``approved``**（产品负责人 2026-08-18 裁定 3，见模块文档「撤权行」）：
+#: 这一列没有第二个被消费方认可的取值，自拟一个 ``revoked`` 只会让 MCP 读到一个它不认识
+#: 的字符串，而它对这一列的处理方式未经验证。撤权由 ``permissions`` 为空表达，不由
+#: ``status`` 表达。
 STATUS_APPROVED = "approved"
+
+#: **撤权行**的 ``permissions`` 文本：一个空对象。
+#:
+#: 它必须与 :func:`serialize_permissions` 出自同一套序列化约定（``json.dumps`` +
+#: ``sort_keys`` + 无空格分隔符），否则同一份「没有任何权限」会有两种字节形态，而
+#: 「写入后逐字段读回比对」与「权限有没有变化」两处判定都是按**字符串**做的。
+#: 由 :func:`serialize_revoked_permissions` 产出，这里只留一份可被指着看的期望值。
+REVOKED_PERMISSIONS_TEXT = "{}"
 
 #: **更新既有行**时写入的字段，**顺序即比对与审计的输出顺序**。``token_cipher`` 不在
 #: 其中：更新是部分更新，没列出的列保持原值，那 26 行旧系统签发的令牌因此既不被清空
@@ -427,6 +460,26 @@ def serialize_permissions(aggregate: PermissionAggregate) -> str:
     return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def serialize_revoked_permissions() -> str:
+    """撤权行的 ``permissions`` 单元格文本：**空对象**，恒为 :data:`REVOKED_PERMISSIONS_TEXT`。
+
+    产品负责人 2026-08-18 裁定 3（留痕见 [#203](https://github.com/Moshuiwang/lingxi/issues/203)
+    的决策评论）：权限从有变无时**保留那一行、把 ``permissions`` 清空**，不删行、不改
+    ``status``、不碰 ``token_cipher``。消费方一侧这条语义是成立的——问数 MCP 的权限判定
+    走**回退制**（:func:`lookup_metrics`）：具体公司键查不到就回退 ``"*"``，两个都没有就是
+    空元组，于是任何指标都不放行。空对象因此正是"这个人现在没有任何可用范围"的表达。
+
+    **为什么不复用** :func:`serialize_permissions`：那个函数对 ``not granted`` 的聚合
+    结果**抛错**，而且这条规则必须留着——它挡的是"把一份 fail-closed 的聚合当成有效权限
+    发出去"。撤权是一条**显式**的路径，因此给它一个显式的出口，而不是把既有的守卫改松。
+
+    走 ``json.dumps`` 而不是直接返回字面量，是为了让"撤权行与授权行出自同一套序列化约定"
+    这件事在代码里成立，而不是靠两处字面量碰巧相等。
+    """
+
+    return json.dumps({}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _verbatim(value: Any) -> str:
     """值列表元素的**唯一**出口：原样返回，只拒绝 ``None`` 与非字符串。
 
@@ -602,6 +655,53 @@ def build_publish_row(
         status=STATUS_APPROVED,
         updated_at=format_updated_at(decided_at),
         token_cipher=token_cipher,
+    )
+
+
+def build_revocation_row(
+    *, email: str, display_name: str, decided_at: datetime
+) -> PublishRow:
+    """结算一行**撤权行**：保行、清空 ``permissions``、其余按授权行同一套规则。
+
+    产品负责人 2026-08-18 裁定 3（`V-权限-08` 的刷新侧）：权限从有变无时行**保留**、
+    ``permissions`` 序列化为空对象、``status`` 维持 :data:`STATUS_APPROVED`、
+    ``updated_at`` 照常更新，而 ``token_cipher`` **一个字都不动**。
+
+    三条边界写在类型上，不靠调用方自觉：
+
+    1. **没有 ``token_cipher`` 参数。** 撤权行因此永远只有六个字段
+       （:attr:`PublishRow.snapshot_fields` 退化成 :attr:`PublishRow.fields`），
+       走的必然是**更新**路径——更新是部分更新，没列出的列保持原值，那一列因此既不
+       被清空也不被覆盖。想在撤权时顺手改写密文，在这个签名下写不出来。
+    2. **因此撤权也不可能新建行。** 一份不带密文的快照走到"没有命中任何既有行"那一步时，
+       :attr:`PublishRow.create_fields` 抛错，发布执行器以 ``invalid`` +
+       ``missing_token_cipher`` 失败关闭（见 :func:`lingxi.core.permission.publish.
+       publish_claim`）。这不是意外收敛，正是我们要的形状：**为一个从来没有过发布行的人
+       新建一行空权限没有任何意义**——问数 MCP 对查无此人本来就默认拒绝，而新建还需要
+       一份我们未必该给他的令牌。调用侧（每日刷新职责）另有一道判据："这个人有过成功
+       发布的意图才发撤权更新"，本函数这一条是它的兜底。
+    3. **``status`` 不变。** 取值域由消费方定义；把撤权表达成一个 MCP 不认识的
+       ``status`` 值，等于赌它对未知取值的处理方式，而那件事未经验证。
+
+    ``email`` / ``display_name`` 与 :func:`build_publish_row` 同源同口径（存档身份），
+    因此同一个人在授权与撤权之间不会因为大小写差异被写成两行。
+    """
+
+    normalized = normalize_email(email)
+    if not normalized:
+        # 与 :func:`build_publish_row` 同一条：没有邮箱就没有 record_key，
+        # 也就没有"这一行是谁的"这个问题的答案。
+        raise ValueError("发布行必须有可用邮箱：它同时是 record_key 与 email 两列")
+    name = _text(display_name)
+    if not name:
+        raise ValueError("发布行必须有姓名")
+    return PublishRow(
+        record_key=normalized,
+        email=normalized,
+        name=name,
+        permissions=serialize_revoked_permissions(),
+        status=STATUS_APPROVED,
+        updated_at=format_updated_at(decided_at),
     )
 
 

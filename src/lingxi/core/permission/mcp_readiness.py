@@ -80,6 +80,22 @@ budget_seconds=1, probe_timeout_seconds=1)``）把等待缩短到两次尝试，
 时钟与 ``sleep`` 都是注入的，纯单测里连一秒都不用等。**``sleep`` 是必填参数**：缺省会让
 六次探针背靠背发完、立刻判超时，十五分钟的等待被压成毫秒级，而日志与记录看起来完全正常。
 
+## 两种「怎么等」的形态，**一套语义**
+
+S-C-03b（Issue #156）把就绪确认接进了 ``lingxi-scheduler``，于是"等三分钟"这件事有了
+第二种实现。判定语义没有第二份：
+
+| 形态 | 怎么等 | 用在哪 |
+|---|---|---|
+| :class:`McpReadinessConfirmation` | 注入 ``sleep``，**阻塞**调用线程直到收口 | 调用方自己就是一次开通编排、可以在自己的线程里等（Epic D 的 ``OnboardingRunner``） |
+| :class:`ReadinessTicker` | **不等待**：每轮 tick 只发起已经到期的那一次 | 常驻的定时职责进程（一轮 tick 不能被占住十五分钟） |
+
+两者共用 :class:`_ReadinessProbeRunner`——分类、五路取值、绑定、落库与审计只有一份实现。
+tick 形态的全部状态从 ``mcp_sync_check`` 重建（:class:`ReadinessProgress`），因此不需要
+新表，进程重启也不会让任何一条确认丢失或从头再来。**唯一的行为差别**（探针实际发起时刻
+比计划晚最多一个调度周期，以及由此带来的收口上界）写在 :class:`ReadinessTicker` 的文档里，
+不藏着。
+
 ## 本模块不做的事
 
 - **不判断权限版本有没有被推进。** 结论只带着 :class:`ReadinessBinding`，上游在使用前
@@ -88,8 +104,8 @@ budget_seconds=1, probe_timeout_seconds=1)``）把等待缩短到两次尝试，
 - **不发告警、不改用户状态。** ``on_alert`` 只是注入点，形状与
   ``core/permission/publish.PermissionPublishExecutor`` 一致。把 ``provisioning_state``
   推到 ``active`` / ``manual_review`` 属开通编排（Epic D），不在本 Story。
-- **不装配任何常驻消费者。** 真实调用方是 Epic D 的 ``OnboardingRunner`` 与每日权限刷新
-  职责，当前进程闭包里没有它——与 ``core/permission/publish.py`` 同一姿态。
+- **不发通知。** "就绪之后对用户说什么、什么时候说"在
+  :mod:`lingxi.core.permission.notification` 与调度职责里；本模块只产出可断言的判定。
 """
 
 from __future__ import annotations
@@ -532,12 +548,167 @@ def classify_probe(metric_count: object) -> tuple[ReadinessOutcome, str | None]:
     return ReadinessOutcome.WAITING, "empty_metrics"
 
 
-class McpReadinessConfirmation:
-    """把「判权限 → 立即探一次 → 每三分钟再探 → 十五分钟收口」串起来。
+class _ReadinessProbeRunner:
+    """「发一次探针并把结论落库」这一步的**唯一**实现，两种等待形态共用。
+
+    两个子类的区别只有"怎么等到下一次探针"：
+
+    - :class:`McpReadinessConfirmation` 阻塞式——注入 ``sleep``，一轮跑完才返回；
+    - :class:`ReadinessTicker` tick 驱动式——不等待，每轮只发起已经到期的那一次。
+
+    **分类、五路取值、(用户, 权限版本) 绑定、记账与审计全部在这里，一份实现**。
+    做成基类而不是让 tick 形态自己再写一遍，是因为"第二套就绪语义"正是这条链上最贵的
+    错误：两套实现只要在"空结果算不算就绪""读不懂的响应落哪一路"上分叉一次，
+    就会有一批用户在其中一条路径上拿到假就绪。
+    """
+
+    def __init__(
+        self,
+        *,
+        probe: McpProbe,
+        store: ReadinessCheckStore,
+        audit: _AuditSink,
+        clock: Callable[[], datetime],
+        schedule: ReadinessSchedule = CONTRACT_SCHEDULE,
+    ) -> None:
+        if not isinstance(schedule, ReadinessSchedule):
+            # 只接受**已经过校验的**配置对象：允许在这里传一对裸整数，等于给每个调用点
+            # 各开一次绕过校验的口子。
+            raise TypeError("轮询节奏必须是已校验的 ReadinessSchedule")
+        if not callable(clock):
+            raise TypeError("时钟必须可调用：注入它才能不真的等十五分钟")
+        self._probe = probe
+        self._store = store
+        self._audit = audit
+        self._clock = clock
+        self._schedule = schedule
+
+    @property
+    def schedule(self) -> ReadinessSchedule:
+        return self._schedule
+
+    # ------------------------------------------------------------------
+    # 共用的一步：发一次探针 → 分类 → 落库 → 审计
+    # ------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        moment = self._clock()
+        if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+            # naive 时间会让跨时区部署算出互相矛盾的预算，而预算正是"等了多久"的唯一依据。
+            raise ValueError("注入的时钟必须返回带时区的时间")
+        return moment.astimezone(_UTC)
+
+    def _probe_once(
+        self,
+        binding: ReadinessBinding,
+        attempt_no: int,
+        hard_deadline: datetime | None = None,
+    ) -> ReadinessAttempt:
+        """发一次探针并结算成一条判定记录。
+
+        ``hard_deadline`` 是"结论最晚什么时候还算数"：
+
+        - **阻塞形态**传的是**整轮**的上界（``起点 + 预算 + 单次探针超时``）。那一轮里
+          每次等待都按绝对时刻对齐，误差是毫秒级，因此用整轮上界是准的。
+        - **tick 形态传 ``None``**，本方法改用**这一次探针自己的**上界
+          （``本次发起时刻 + 单次探针超时``）。理由：tick 形态下"计划时刻"与"真正发起
+          时刻"之间隔着最多一个调度周期，拿整轮上界去卡最后一次探针，会把一次**成功**
+          的探针因为调度晚了几十秒而丢掉——那是把调度粒度算成了用户的错。这条防线要挡
+          的东西没有变：**探针链失控**（注入的探针无视超时、一次跑几分钟）时，它的成功
+          仍然不算数。整轮"最多探几次"由计划表守着，与本参数无关。
+        """
+
+        started = self._now()
+        limit = (
+            hard_deadline
+            if hard_deadline is not None
+            else started + timedelta(seconds=self._schedule.probe_timeout_seconds)
+        )
+        try:
+            observed = self._probe.list_metrics(user_id=binding.user_id)
+        except McpProbeError as error:
+            # 明确拒绝 = MCP 还没看见这一行（同步中）；结果不明 = 我们的探针没跑起来。
+            outcome = (
+                ReadinessOutcome.WAITING if error.denied else ReadinessOutcome.TECHNICAL_FAILURE
+            )
+            return self._attempt(
+                binding, attempt_no, outcome, started, self._now(), error_code=error.code
+            )
+        outcome, error_code = classify_probe(observed)
+        # 只有被 :func:`classify_probe` 认可的观察值才进记录：读不懂的返回值落技术失败，
+        # 那一路必须不带观察值（否则它看起来像一次跑通了的探针，且负数还会撞上
+        # 迁移 0065 的 CHECK，把一次本该记下来的失败变成整轮确认崩溃）。
+        counted = None if outcome is ReadinessOutcome.TECHNICAL_FAILURE else int(observed)
+        finished = self._now()
+        if outcome is ReadinessOutcome.READY and finished > limit:
+            # **成功来得太晚了。** 承诺是"结论最晚在 预算 + 单次探针超时 内落地"，而这次
+            # 探针在窗口之外才返回——发起前的检查管不住它（那时还没超），只有返回后再看
+            # 一眼才管得住。这也是唯一不依赖"传输层真的遵守了超时"的防线：探针超时配大了、
+            # 或注入的探针根本不看超时，上界都只能靠这里成立。
+            #
+            # 降级成 ``timed_out`` 而不是记一条 ``ready`` 再让上层否决：那样
+            # ``mcp_sync_check`` 里会留下一行 ``ready``，而这一轮的结论是超时，
+            # 读表的人会看到两个互相矛盾的事实。观察值一并丢弃（``timed_out`` 不得携带）。
+            outcome, error_code, counted = (
+                ReadinessOutcome.TIMED_OUT,
+                "success_after_deadline",
+                None,
+            )
+        return self._attempt(
+            binding,
+            attempt_no,
+            outcome,
+            started,
+            finished,
+            error_code=error_code,
+            metric_count=counted,
+        )
+
+    def _attempt(
+        self,
+        binding: ReadinessBinding,
+        attempt_no: int,
+        outcome: ReadinessOutcome,
+        started_at: datetime,
+        finished_at: datetime,
+        *,
+        error_code: str | None = None,
+        metric_count: int | None = None,
+    ) -> ReadinessAttempt:
+        attempt = ReadinessAttempt(
+            binding=binding,
+            attempt_no=attempt_no,
+            outcome=outcome,
+            started_at=started_at,
+            finished_at=finished_at,
+            error_code=error_code,
+            metric_count=metric_count,
+        )
+        try:
+            self._store.record_attempt(attempt)
+        except Exception as error:
+            self._audit.record(
+                "mcp_readiness.record_failed",
+                # 只记异常类型：异常正文可能带上连接串或响应片段。
+                error=type(error).__name__,
+                **attempt.audit_facts(),
+            )
+            raise
+        self._audit.record(f"mcp_readiness.{outcome.value}", **attempt.audit_facts())
+        return attempt
+
+
+class McpReadinessConfirmation(_ReadinessProbeRunner):
+    """把「判权限 → 立即探一次 → 每三分钟再探 → 十五分钟收口」串起来（**阻塞式**）。
 
     只编排注入的接口，不做 I/O：探针、记录存储、审计、时钟与 ``sleep`` 全部注入
     （形状与 ``core/permission/publish.PermissionPublishExecutor`` 一致）。因此
     "十五分钟到底会探几次、什么时候判超时"能在纯单测里用假时钟证伪，不用真的等。
+
+    **本类会阻塞调用线程最长十五分钟**，因此它**不能**直接塞进 ``SchedulerLoop`` 的
+    一轮 tick 里——那会让同一进程里的其余定时职责一起停摆十五分钟。常驻进程要的是
+    :class:`ReadinessTicker`（同一套语义，只换"等待"的实现）。本类保留给"调用方自己
+    就是一次开通编排、可以在自己的线程里等到结论"的场景（Epic D 的 ``OnboardingRunner``）。
 
     **记录写失败不吞**：先留一条审计说明这次记账没成功，再原样上抛。一次没记下来的探针
     会让"十五分钟是不是现实的上限"这个复审问题失去样本，而那正是这张表存在的理由。
@@ -556,29 +727,15 @@ class McpReadinessConfirmation:
         schedule: ReadinessSchedule = CONTRACT_SCHEDULE,
         on_alert: Callable[[ReadinessSession], None] | None = None,
     ) -> None:
-        if not isinstance(schedule, ReadinessSchedule):
-            # 只接受**已经过校验的**配置对象：允许在这里传一对裸整数，等于给每个调用点
-            # 各开一次绕过校验的口子。
-            raise TypeError("轮询节奏必须是已校验的 ReadinessSchedule")
-        if not callable(clock):
-            raise TypeError("时钟必须可调用：注入它才能不真的等十五分钟")
+        super().__init__(probe=probe, store=store, audit=audit, clock=clock, schedule=schedule)
         if not callable(sleep):
             # ``sleep`` **必填**，且没有"缺省就不等"的分支。此前它可以是 ``None``，
             # 默认构造出来的确认会把六次探针背靠背发完、立刻判超时——十五分钟的等待
             # 被压成毫秒级，而每一条日志、每一条记录看起来都完全正常。装配层漏注入一个
             # 参数就静默塌成这样，是不能接受的失败形态，因此在类型上就不给它这个选项。
             raise TypeError("sleep 必须可调用：缺省会把十五分钟的等待压成瞬时")
-        self._probe = probe
-        self._store = store
-        self._audit = audit
-        self._clock = clock
         self._sleep = sleep
-        self._schedule = schedule
         self._on_alert = on_alert
-
-    @property
-    def schedule(self) -> ReadinessSchedule:
-        return self._schedule
 
     def confirm(
         self, binding: ReadinessBinding, *, permissions: str, company_id: Any = None
@@ -647,13 +804,6 @@ class McpReadinessConfirmation:
     # 内部
     # ------------------------------------------------------------------
 
-    def _now(self) -> datetime:
-        moment = self._clock()
-        if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
-            # naive 时间会让跨时区部署算出互相矛盾的预算，而预算正是"等了多久"的唯一依据。
-            raise ValueError("注入的时钟必须返回带时区的时间")
-        return moment.astimezone(_UTC)
-
     def _wait_until(self, due: datetime) -> None:
         """等到计划时刻。**按绝对时刻等，不按间隔累加**——后者会把每一次的调度误差
         累积下去，第六次就漂到预算之外。已经过了计划时刻就立刻开始（慢探针的情形）。"""
@@ -662,82 +812,6 @@ class McpReadinessConfirmation:
         if remaining > 0:
             self._sleep(remaining)
 
-    def _probe_once(
-        self, binding: ReadinessBinding, attempt_no: int, hard_deadline: datetime
-    ) -> ReadinessAttempt:
-        started = self._now()
-        try:
-            observed = self._probe.list_metrics(user_id=binding.user_id)
-        except McpProbeError as error:
-            # 明确拒绝 = MCP 还没看见这一行（同步中）；结果不明 = 我们的探针没跑起来。
-            outcome = (
-                ReadinessOutcome.WAITING if error.denied else ReadinessOutcome.TECHNICAL_FAILURE
-            )
-            return self._attempt(
-                binding, attempt_no, outcome, started, self._now(), error_code=error.code
-            )
-        outcome, error_code = classify_probe(observed)
-        # 只有被 :func:`classify_probe` 认可的观察值才进记录：读不懂的返回值落技术失败，
-        # 那一路必须不带观察值（否则它看起来像一次跑通了的探针，且负数还会撞上
-        # 迁移 0065 的 CHECK，把一次本该记下来的失败变成整轮确认崩溃）。
-        counted = None if outcome is ReadinessOutcome.TECHNICAL_FAILURE else int(observed)
-        finished = self._now()
-        if outcome is ReadinessOutcome.READY and finished > hard_deadline:
-            # **成功来得太晚了。** 承诺是"结论最晚在 预算 + 单次探针超时 内落地"，而这次
-            # 探针在窗口之外才返回——发起前的检查管不住它（那时还没超），只有返回后再看
-            # 一眼才管得住。这也是唯一不依赖"传输层真的遵守了超时"的防线：探针超时配大了、
-            # 或注入的探针根本不看超时，上界都只能靠这里成立。
-            #
-            # 降级成 ``timed_out`` 而不是记一条 ``ready`` 再让上层否决：那样
-            # ``mcp_sync_check`` 里会留下一行 ``ready``，而这一轮的结论是超时，
-            # 读表的人会看到两个互相矛盾的事实。观察值一并丢弃（``timed_out`` 不得携带）。
-            outcome, error_code, counted = (
-                ReadinessOutcome.TIMED_OUT,
-                "success_after_deadline",
-                None,
-            )
-        return self._attempt(
-            binding,
-            attempt_no,
-            outcome,
-            started,
-            finished,
-            error_code=error_code,
-            metric_count=counted,
-        )
-
-    def _attempt(
-        self,
-        binding: ReadinessBinding,
-        attempt_no: int,
-        outcome: ReadinessOutcome,
-        started_at: datetime,
-        finished_at: datetime,
-        *,
-        error_code: str | None = None,
-        metric_count: int | None = None,
-    ) -> ReadinessAttempt:
-        attempt = ReadinessAttempt(
-            binding=binding,
-            attempt_no=attempt_no,
-            outcome=outcome,
-            started_at=started_at,
-            finished_at=finished_at,
-            error_code=error_code,
-            metric_count=metric_count,
-        )
-        try:
-            self._store.record_attempt(attempt)
-        except Exception as error:
-            self._audit.record(
-                "mcp_readiness.record_failed",
-                # 只记异常类型：异常正文可能带上连接串或响应片段。
-                error=type(error).__name__,
-                **attempt.audit_facts(),
-            )
-            raise
-        self._audit.record(f"mcp_readiness.{outcome.value}", **attempt.audit_facts())
-        return attempt
 
     def _finish(
         self,
@@ -761,6 +835,212 @@ class McpReadinessConfirmation:
         return session
 
 
+@dataclass(frozen=True)
+class ReadinessProgress:
+    """一个 ``(用户, 权限版本)`` 到目前为止的就绪确认进度。**可从库里重建**。
+
+    这是 tick 形态的全部状态，而它**不需要新表**：``mcp_sync_check``（迁移 ``0065``）
+    本来就逐次记录了每一次判定的次序、开始时间与结论，三个字段合起来足以回答
+    「还要不要探、下一次什么时候到期、是不是已经收口了」。
+
+    - :attr:`attempt_count`：已经落库的判定次数，决定下一次是计划表里的第几次；
+    - :attr:`first_started_at`：**第一次**判定的开始时刻，也就是这一轮确认的起点。
+      节奏按绝对时刻算（起点 + 偏移），不按"上一次之后再等三分钟"累加——后者会把每一轮
+      调度误差累积下去；
+    - :attr:`terminal`：已经出现过终态（``ready`` / ``no_permission`` / ``timed_out``）。
+      终态之后一次探针都不再发，这条同时也是"同一条通知只发一次"的载体。
+    """
+
+    attempt_count: int = 0
+    first_started_at: datetime | None = None
+    terminal: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempt_count, bool) or not isinstance(self.attempt_count, int):
+            raise ValueError("已判定次数必须是整数")
+        if self.attempt_count < 0:
+            raise ValueError("已判定次数不得为负")
+        if self.attempt_count and self.first_started_at is None:
+            # 有判定记录却说不出起点，就没有任何依据算"下一次什么时候到期"。
+            # 静默按"现在"当起点会让整轮确认的窗口跟着每一次读取往后漂。
+            raise ValueError("已经判定过的确认必须带着它的起点时刻")
+        if self.first_started_at is not None and (
+            not isinstance(self.first_started_at, datetime)
+            or self.first_started_at.tzinfo is None
+            or self.first_started_at.utcoffset() is None
+        ):
+            raise ValueError("确认起点必须是带时区的时间")
+
+    @classmethod
+    def from_checks(cls, checks: Any) -> "ReadinessProgress":
+        """从 ``mcp_sync_check`` 回读出来的判定行重建进度。
+
+        只读三样东西：条数、第一行的 ``started_at``、有没有终态结论。刻意按**鸭子类型**
+        接受（只要每个元素有 ``result`` 与 ``started_at``），因为 ``core`` 不 import
+        ``adapters``——回读行的类型定义在 ``adapters/postgres_mcp_token.py``。
+
+        行的顺序按 ``attempt_no``（调用方的 ``load_checks`` 已经如此排序）。读不懂的
+        ``result`` 值**不当成终态**：那样会让一次数据异常静默收口一条本该继续的确认；
+        方向选"多探几次"，不选"提前宣告结束"。
+        """
+
+        rows = tuple(checks)
+        if not rows:
+            return cls()
+        terminal_values = {item.value for item in TERMINAL_OUTCOMES}
+        return cls(
+            attempt_count=len(rows),
+            first_started_at=rows[0].started_at,
+            terminal=any(str(row.result) in terminal_values for row in rows),
+        )
+
+
+def next_probe_due(schedule: ReadinessSchedule, progress: ReadinessProgress) -> datetime | None:
+    """下一次探针**什么时候到期**；``None`` 表示不该再探（已收口或预算用尽）。
+
+    纯函数，因此"tick 形态到底按什么节奏探"可以被直接断言，而不用去读一遍循环体推断。
+    计划表与阻塞形态**同一份**（:meth:`ReadinessSchedule.attempt_offsets`）：第一次在
+    起点，之后每 ``interval`` 一次，直到偏移超过预算。
+
+    第一次（``attempt_count == 0``）返回 ``None`` 是无意义的，因此这里返回的是"立即"
+    的语义——调用方拿不到起点，只能立刻发。为了让这一点在类型上明确，这种情况返回
+    ``None`` 会与"不该再探"混淆，所以本函数**要求已经有过至少一次判定**。
+    """
+
+    if not isinstance(progress, ReadinessProgress):
+        raise TypeError("进度必须是 ReadinessProgress")
+    if progress.attempt_count < 1 or progress.first_started_at is None:
+        raise ValueError("第一次探针不需要到期判定：发布读回一致后立即发起")
+    if progress.terminal:
+        return None
+    offsets = schedule.attempt_offsets()
+    if progress.attempt_count >= len(offsets):
+        return None
+    return progress.first_started_at + timedelta(seconds=offsets[progress.attempt_count])
+
+
+class ReadinessTicker(_ReadinessProbeRunner):
+    """同一套就绪语义的 **tick 驱动**形态：每轮只发起"已经到期"的那一次探针，**从不等待**。
+
+    存在的理由是一条硬约束：:class:`McpReadinessConfirmation` 会把调用线程阻塞最长十五
+    分钟，而 ``lingxi-scheduler`` 是**单进程顺序驱动多个职责**的循环——把它直接塞进一轮
+    tick，会让凭据轮换、保留清理、空闲会话清理跟着一起停摆十五分钟。
+
+    **换掉的只有"等待"，没有第二套语义。** 分类（:func:`classify_probe`）、五路取值、
+    ``(用户, 权限版本)`` 绑定、每次尝试落库与审计、"读不懂一律技术失败"这条方向，全部
+    走 :class:`_ReadinessProbeRunner` 的同一份实现；"最多探几次"走
+    :meth:`ReadinessSchedule.attempt_offsets` 的同一张计划表。
+
+    **与阻塞形态唯一的行为差别，如实登记**：一次探针的**实际发起时刻**是"计划时刻之后
+    的第一个 tick"，因此比计划晚最多一个调度周期（生产上是 60 秒）。由此：
+
+    - "最多探几次"不变（计划表说了算）；
+    - "结论最晚什么时候落地"从 ``预算 + 单次探针超时`` 变成
+      ``预算 + 一个调度周期 + 单次探针超时``；
+    - 因此**不能**再拿整轮上界去卡最后一次探针的成功——那会把一次真正成功的确认因为
+      调度晚了几十秒而丢掉。取而代之，:meth:`_ReadinessProbeRunner._probe_once` 在
+      ``hard_deadline=None`` 时按**这一次探针自己的**超时收口，挡的仍然是"探针链失控"
+      那一种（见该方法的文档）。
+
+    **状态全在库里**（:class:`ReadinessProgress` ← ``mcp_sync_check``），因此进程重启
+    不会让任何一条确认丢失或从头再来；同一 ``(用户, 权限版本)`` 的取号串行化由
+    ``adapters/postgres_mcp_token.record_attempt`` 的事务级 advisory lock 承担，
+    与阻塞形态是同一把锁。
+    """
+
+    name = "MCP 就绪确认（tick）"
+
+    def advance(
+        self,
+        binding: ReadinessBinding,
+        *,
+        permissions: str,
+        progress: ReadinessProgress,
+        company_id: Any = None,
+    ) -> ReadinessAttempt | None:
+        """把这一条确认往前推**至多一步**，返回本轮新落库的判定；``None`` = 本轮什么都没做。
+
+        次序与阻塞形态逐条对应：
+
+        1. **已经收口就不再动**（终态）——这也是"通知只发一次"的载体；
+        2. **还没探过**：先判有没有可等的权限（``no_permission`` 一次探针都不发），
+           否则**立即**探第一次（合同：发布读回一致后立即一次）；
+        3. **探过但没到期**：返回 ``None``，一次外部调用都不发；
+        4. **到期**：探一次。若这已经是计划表里的最后一次而它没有就绪，**同一轮内**
+           立刻补一条 ``timed_out`` 收口——与阻塞形态"循环走完就判超时"是同一时刻，
+           不拖到下一个 tick；
+        5. **计划表已经用尽却还没收口**（进程恰好在最后一次探针与收口之间重启、
+           或节奏配置被调小）：直接补 ``timed_out``。少了这一条，那条确认会永远停在
+           "没终态、也没人再探"的状态里。
+        """
+
+        if not isinstance(binding, ReadinessBinding):
+            raise TypeError("就绪确认必须绑定 (用户, 权限版本)")
+        if not isinstance(progress, ReadinessProgress):
+            raise TypeError("进度必须是 ReadinessProgress")
+        if progress.terminal:
+            return None
+
+        offsets = self._schedule.attempt_offsets()
+        if progress.attempt_count == 0:
+            started = self._now()
+            if not evaluate_permission_presence(permissions, company_id=company_id):
+                # 与阻塞形态同一条：**没有可等的东西就不发探针**。撤权行走的正是这一路，
+                # 它同时把这条确认收成终态，因此撤权通知也只会发一次。
+                return self._attempt(
+                    binding,
+                    1,
+                    ReadinessOutcome.NO_PERMISSION,
+                    started,
+                    self._now(),
+                    error_code="no_publishable_permission",
+                )
+            return self._settle(binding, self._probe_once(binding, 1), offsets)
+
+        if progress.attempt_count >= len(offsets):
+            return self._timed_out(binding, progress.attempt_count + 1)
+
+        due = next_probe_due(self._schedule, progress)
+        if due is None or self._now() < due:
+            return None
+        return self._settle(
+            binding, self._probe_once(binding, progress.attempt_count + 1), offsets
+        )
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+
+    def _settle(
+        self,
+        binding: ReadinessBinding,
+        attempt: ReadinessAttempt,
+        offsets: tuple[int, ...],
+    ) -> ReadinessAttempt:
+        """刚发的这一次如果是计划表里的最后一次而且没成，**当场**补上收口记录。"""
+
+        if attempt.terminal or attempt.attempt_no < len(offsets):
+            return attempt
+        return self._timed_out(binding, attempt.attempt_no + 1)
+
+    def _timed_out(self, binding: ReadinessBinding, attempt_no: int) -> ReadinessAttempt:
+        moment = self._now()
+        logger.warning(
+            "MCP 就绪确认预算耗尽 user=%s version=%s 已判定=%s",
+            binding.user_id,
+            binding.permission_version,
+            attempt_no - 1,
+        )
+        return self._attempt(
+            binding,
+            attempt_no,
+            ReadinessOutcome.TIMED_OUT,
+            moment,
+            self._now(),
+            error_code="budget_exhausted",
+        )
+
+
 __all__ = [
     "CONTRACT_SCHEDULE",
     "DEFAULT_BUDGET_SECONDS",
@@ -779,9 +1059,12 @@ __all__ = [
     "ReadinessBinding",
     "ReadinessCheckStore",
     "ReadinessOutcome",
+    "ReadinessProgress",
     "ReadinessSchedule",
     "ReadinessSession",
+    "ReadinessTicker",
     "TERMINAL_OUTCOMES",
     "classify_probe",
     "evaluate_permission_presence",
+    "next_probe_due",
 ]

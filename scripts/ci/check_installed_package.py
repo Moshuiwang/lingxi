@@ -95,6 +95,11 @@ REQUIRED_MODULES = (
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
+    # 权限变化通知（Issue #156 / S-C-03b）：正文渲染与「有限重试 + 审计」的发送编排在
+    # core，向用户本人 open_id 的主动发送在 adapters。两者都有生产调用方——
+    # `lingxi-scheduler` 的权限发布与就绪确认职责（见下面 PROCESS_RUNTIME_IMPORTS）。
+    "lingxi.core.permission.notification",
+    "lingxi.adapters.feishu_user_message",
     # 每日权限重算（Issue #156 / S-C-03a）：按当前有效批次读回银河快照的适配器。
     # 与上面两组不同，它**已经有生产调用方**——`lingxi-scheduler` 的每日权限重算职责
     # （见下面 PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。

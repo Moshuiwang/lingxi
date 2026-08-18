@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-17-3"
+version = "2026-08-18"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -64,6 +64,10 @@ version = "2026-08-17-3"
 "roster.snapshot_reason.failed_definite" = "花名册读取被明确拒绝"
 "roster.snapshot_reason.failed_indeterminate" = "花名册读取结果不明"
 "roster.snapshot_reason.unknown" = "保旧原因未分类"
+
+"permission.range_updated" = "你的数据查询可用范围已更新。当前可用范围——公司：{company_name}；职能：{function_name}。你可以直接发起一次查询验证，如有疑问请联系管理员。"
+"permission.range_revoked" = "你的数据查询可用范围已更新，当前暂无可用的数据范围。如有疑问请联系管理员。"
+"permission.all_companies" = "全部公司"
 
 [cards."query.status"]
 title = "正在查询"
