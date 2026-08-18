@@ -21,10 +21,21 @@
 - 非法轮询配置（零、负数、超上限、非整数、间隔大于预算、次数爆炸）一律**拒绝**，
   没有"配错了就回退默认"的分支；
 - 就绪结论绑定错误的用户或权限版本时**判否**。
+
+S-C-03b 追加 **tick 驱动形态**（:class:`ReadinessTicker`）的断言，放在本文件而不是另开
+一份：两种形态必须是**同一套语义**，把它们的用例摆在一起，任何一方悄悄分叉都会在同一个
+文件里露出来。追加的否定面：
+
+- 没到期时**零探针、零记录、零审计**；终态之后**永不再动**（这同时是"通知只发一次"的载体）；
+- tick 形态**源码里没有任何等待**（构造函数不接受 ``sleep``），因此一轮调度不会被占住；
+- 最后一次探针**成功就是成功**，不因为调度晚了一轮被丢掉；但**无视自身超时**的成功仍被
+  降级为超时；
+- 读不懂的历史结论**不**当成终态（方向选多探几次，不选提前收口）。
 """
 
 from __future__ import annotations
 
+import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -39,10 +50,13 @@ from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
     ReadinessBinding,
     ReadinessOutcome,
+    ReadinessProgress,
     ReadinessSchedule,
     ReadinessSession,
+    ReadinessTicker,
     classify_probe,
     evaluate_permission_presence,
+    next_probe_due,
 )
 
 START = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
@@ -839,6 +853,361 @@ class SleeperTest(unittest.TestCase):
         confirmation, _, _, _, _ = _confirmation(0, 0, 0, 0, 0, 0, schedule=CONTRACT_SCHEDULE, clock=clock)
         confirmation.confirm(BINDING, permissions=PERMISSIONS)
         self.assertEqual(sum(clock.slept), 900.0)
+
+
+class _StoredCheck:
+    """回读出来的一条判定行的最小形状（``adapters/postgres_mcp_token.StoredCheck``）。
+
+    这里刻意只给 ``ReadinessProgress.from_checks`` 真正会读的两个属性：多给一个字段，
+    用例就会开始依赖一份比 ``core`` 实际需要的更宽的契约。
+    """
+
+    def __init__(self, result: str, started_at: datetime) -> None:
+        self.result = result
+        self.started_at = started_at
+
+
+def _ticker(
+    *script: object,
+    schedule: ReadinessSchedule = CONTRACT_SCHEDULE,
+    clock: FakeClock | None = None,
+) -> tuple[ReadinessTicker, FakeProbe, FakeStore, FakeAudit, FakeClock]:
+    the_clock = clock or FakeClock()
+    the_probe = FakeProbe(*script)
+    the_store = FakeStore()
+    the_audit = FakeAudit()
+    return (
+        ReadinessTicker(
+            probe=the_probe,
+            store=the_store,
+            audit=the_audit,
+            clock=the_clock,
+            schedule=schedule,
+        ),
+        the_probe,
+        the_store,
+        the_audit,
+        the_clock,
+    )
+
+
+class ReadinessProgressTest(unittest.TestCase):
+    """进度从 ``mcp_sync_check`` 重建：不需要第二张表，也不需要进程内状态。"""
+
+    def test_no_rows_means_nothing_has_been_tried(self) -> None:
+        progress = ReadinessProgress.from_checks(())
+
+        self.assertEqual(progress.attempt_count, 0)
+        self.assertIsNone(progress.first_started_at)
+        self.assertFalse(progress.terminal)
+
+    def test_the_start_is_the_first_row_not_the_last(self) -> None:
+        """节奏按**绝对时刻**算。取最后一行当起点，窗口会随每一次探针往后漂。"""
+
+        progress = ReadinessProgress.from_checks(
+            (
+                _StoredCheck("waiting", START),
+                _StoredCheck("waiting", START + timedelta(seconds=180)),
+            )
+        )
+
+        self.assertEqual(progress.attempt_count, 2)
+        self.assertEqual(progress.first_started_at, START)
+        self.assertFalse(progress.terminal)
+
+    def test_every_terminal_result_is_recognised(self) -> None:
+        for result in ("ready", "no_permission", "timed_out"):
+            with self.subTest(result):
+                progress = ReadinessProgress.from_checks((_StoredCheck(result, START),))
+                self.assertTrue(progress.terminal)
+
+    def test_intermediate_results_are_not_terminal(self) -> None:
+        for result in ("waiting", "technical_failure"):
+            with self.subTest(result):
+                progress = ReadinessProgress.from_checks((_StoredCheck(result, START),))
+                self.assertFalse(progress.terminal)
+
+    def test_an_unreadable_result_is_not_treated_as_terminal(self) -> None:
+        """否定断言：读不懂的结论**不**当成终态。
+
+        方向选"多探几次"，不选"提前宣告这条确认已经结束"——后者会静默丢掉一个人的就绪。
+        """
+
+        progress = ReadinessProgress.from_checks((_StoredCheck("something_new", START),))
+
+        self.assertFalse(progress.terminal)
+
+    def test_a_progress_without_a_start_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ReadinessProgress(attempt_count=1)
+
+    def test_a_naive_start_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ReadinessProgress(attempt_count=1, first_started_at=datetime(2026, 8, 17, 3, 0))
+
+
+class NextProbeDueTest(unittest.TestCase):
+    """"下一次什么时候到期"是纯函数，计划表与阻塞形态**同一份**。"""
+
+    def test_the_offsets_match_the_blocking_engine(self) -> None:
+        for count, expected in enumerate(CONTRACT_SCHEDULE.attempt_offsets()):
+            if count == 0:
+                continue
+            with self.subTest(count):
+                due = next_probe_due(
+                    CONTRACT_SCHEDULE,
+                    ReadinessProgress(attempt_count=count, first_started_at=START),
+                )
+                self.assertEqual(due, START + timedelta(seconds=expected))
+
+    def test_the_plan_table_is_the_only_cap(self) -> None:
+        due = next_probe_due(
+            CONTRACT_SCHEDULE,
+            ReadinessProgress(
+                attempt_count=len(CONTRACT_SCHEDULE.attempt_offsets()), first_started_at=START
+            ),
+        )
+
+        self.assertIsNone(due, "计划表用完就不该再有下一次")
+
+    def test_a_terminal_confirmation_has_no_next_probe(self) -> None:
+        self.assertIsNone(
+            next_probe_due(
+                CONTRACT_SCHEDULE,
+                ReadinessProgress(attempt_count=2, first_started_at=START, terminal=True),
+            )
+        )
+
+    def test_the_first_probe_is_not_a_due_question(self) -> None:
+        """第一次探针在"发布读回一致后立即"，没有到期判定可言。"""
+
+        with self.assertRaises(ValueError):
+            next_probe_due(CONTRACT_SCHEDULE, ReadinessProgress())
+
+
+class ReadinessTickerTest(unittest.TestCase):
+    """tick 形态：同一套语义，只换"等待"的实现。"""
+
+    def test_the_first_probe_goes_out_immediately_after_publication(self) -> None:
+        ticker, probe, store, _, clock = _ticker(4)
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
+        self.assertEqual(probe.calls, [USER])
+        self.assertEqual(clock.slept, [], "tick 形态一次都不 sleep")
+        self.assertEqual(len(store.records), 1)
+
+    def test_a_probe_that_is_not_due_yet_makes_no_external_call(self) -> None:
+        """否定断言：**没到期就一次外部调用都不发**，也不落任何记录。"""
+
+        ticker, probe, store, audit, clock = _ticker(4)
+        clock.advance(179)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=1, first_started_at=START),
+        )
+
+        self.assertIsNone(attempt)
+        self.assertEqual(probe.calls, [])
+        self.assertEqual(store.records, [])
+        self.assertEqual(audit.entries, [])
+
+    def test_a_due_probe_goes_out_on_this_tick(self) -> None:
+        ticker, probe, _, _, clock = _ticker(0)
+        clock.advance(180)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=1, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.WAITING)
+        self.assertEqual(attempt.attempt_no, 2)
+        self.assertEqual(probe.calls, [USER])
+
+    def test_a_terminal_confirmation_is_never_touched_again(self) -> None:
+        """否定断言：终态之后**零探针、零记录**——这同时是"通知只发一次"的载体。"""
+
+        ticker, probe, store, audit, clock = _ticker(4)
+        clock.advance(10_000)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=1, first_started_at=START, terminal=True),
+        )
+
+        self.assertIsNone(attempt)
+        self.assertEqual(probe.calls, [])
+        self.assertEqual(store.records, [])
+        self.assertEqual(audit.entries, [])
+
+    def test_an_empty_permission_document_never_probes(self) -> None:
+        """撤权那一路：``no_permission`` 是终态，**一次探针都不发**（与阻塞形态同一条）。"""
+
+        ticker, probe, store, _, _ = _ticker(4)
+
+        attempt = ticker.advance(BINDING, permissions="{}", progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.NO_PERMISSION)
+        self.assertEqual(attempt.error_code, "no_publishable_permission")
+        self.assertTrue(attempt.terminal)
+        self.assertEqual(probe.calls, [], "没有可等的东西就不发探针")
+        self.assertEqual(len(store.records), 1)
+
+    def test_an_empty_metric_list_is_not_ready(self) -> None:
+        """否定断言：明确空结果**不算**就绪（与阻塞形态同一个分类函数）。"""
+
+        ticker, _, _, _, _ = _ticker(0)
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.WAITING)
+        self.assertEqual(attempt.error_code, "empty_metrics")
+
+    def test_an_unreadable_response_is_a_technical_failure_not_ready(self) -> None:
+        ticker, _, _, _, _ = _ticker("三条")
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+        self.assertIsNone(attempt.metric_count)
+
+    def test_a_denied_probe_is_waiting_not_a_technical_failure(self) -> None:
+        ticker, _, _, _, _ = _ticker(McpProbeError("http_403", denied=True))
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.WAITING)
+
+    def test_the_last_planned_probe_closes_the_window_in_the_same_tick(self) -> None:
+        """预算耗尽当场收口，不拖到下一个 tick（与阻塞形态"循环走完就判超时"同一时刻）。"""
+
+        ticker, probe, store, _, clock = _ticker(0, schedule=CONTRACT_SCHEDULE)
+        clock.advance(900)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=5, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(attempt.error_code, "budget_exhausted")
+        self.assertEqual(len(probe.calls), 1, "最后一次探针照发")
+        self.assertEqual(
+            [record.outcome for record in store.records],
+            [ReadinessOutcome.WAITING, ReadinessOutcome.TIMED_OUT],
+        )
+
+    def test_the_last_planned_probe_may_still_succeed(self) -> None:
+        """否定断言：最后一次探针**成功就是成功**，不会被顺手降级成超时。"""
+
+        ticker, _, store, _, clock = _ticker(6, schedule=CONTRACT_SCHEDULE)
+        clock.advance(900)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=5, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
+        self.assertEqual([record.outcome for record in store.records], [ReadinessOutcome.READY])
+
+    def test_a_late_tick_does_not_throw_away_a_successful_probe(self) -> None:
+        """**tick 粒度不该让一个人失去就绪**。
+
+        调度晚了一整轮（60 秒）才把最后一次探针发出去，它仍然成立——阻塞形态的整轮硬
+        上界在 tick 形态里换成了"每次探针自己的超时"，理由见 ``ReadinessTicker`` 文档。
+        """
+
+        ticker, _, _, _, clock = _ticker(6, schedule=CONTRACT_SCHEDULE)
+        clock.advance(960)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=5, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
+
+    def test_a_probe_that_ignores_its_own_timeout_is_still_capped(self) -> None:
+        """但"探针链失控"那一种仍然挡得住：无视自己超时的成功不算数。"""
+
+        clock = FakeClock()
+
+        class SlowProbe:
+            def list_metrics(self, *, user_id: str) -> int:
+                clock.advance(CONTRACT_SCHEDULE.probe_timeout_seconds + 5)
+                return 9
+
+        ticker = ReadinessTicker(
+            probe=SlowProbe(),
+            store=FakeStore(),
+            audit=FakeAudit(),
+            clock=clock,
+            schedule=CONTRACT_SCHEDULE,
+        )
+
+        attempt = ticker.advance(BINDING, permissions=PERMISSIONS, progress=ReadinessProgress())
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(attempt.error_code, "success_after_deadline")
+        self.assertIsNone(attempt.metric_count)
+
+    def test_an_exhausted_plan_without_a_terminal_row_is_closed_on_sight(self) -> None:
+        """进程恰好在最后一次探针与收口之间重启：下一轮直接补上收口，不留半态。"""
+
+        ticker, probe, _, _, clock = _ticker(schedule=CONTRACT_SCHEDULE)
+        clock.advance(1_000)
+
+        attempt = ticker.advance(
+            BINDING,
+            permissions=PERMISSIONS,
+            progress=ReadinessProgress(attempt_count=6, first_started_at=START),
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(probe.calls, [], "计划表已经用完，不再多发一次探针")
+
+    def test_the_ticker_never_sleeps_and_never_holds_the_round(self) -> None:
+        """否定断言：**tick 形态在源码里没有任何等待**。
+
+        形状断言：构造函数不接受 ``sleep``，源码里也不出现 ``sleep`` / ``wait``。
+        一个"顺手 sleep 一下"的实现会把整个 SchedulerLoop 占住十五分钟。
+        """
+
+        with self.assertRaises(TypeError):
+            ReadinessTicker(  # type: ignore[call-arg]
+                probe=FakeProbe(),
+                store=FakeStore(),
+                audit=FakeAudit(),
+                clock=FakeClock(),
+                sleep=lambda seconds: None,
+            )
+        source = inspect.getsource(ReadinessTicker)
+        for forbidden in ("sleep", "wait(", "time."):
+            self.assertNotIn(forbidden, source, f"tick 形态不得等待：{forbidden}")
+
+    def test_the_two_forms_share_one_probe_step(self) -> None:
+        """两种形态**共用同一份**"发一次探针并落库"的实现，不是两套语义。"""
+
+        self.assertIs(
+            McpReadinessConfirmation._probe_once, ReadinessTicker._probe_once
+        )
+        self.assertIs(McpReadinessConfirmation._attempt, ReadinessTicker._attempt)
+
+    def test_the_ticker_rejects_a_binding_of_the_wrong_type(self) -> None:
+        ticker, _, _, _, _ = _ticker(4)
+
+        with self.assertRaises(TypeError):
+            ticker.advance(("usr_A", 7), permissions=PERMISSIONS, progress=ReadinessProgress())  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":  # pragma: no cover
