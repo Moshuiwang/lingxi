@@ -28,12 +28,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 from unittest import mock
 
-from lingxi.apps.scheduler import CredentialRotationLoop
+from lingxi.apps.scheduler import CredentialRotationLoop, RotationReport
 from lingxi.core.identity.access_token_supply import (
     DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN,
     SUPPLY_FAILURE_REASONS,
     AccessTokenUnavailable,
-    DailyRefreshBudget,
     DerivedAccessTokenHolder,
     RosterAccessTokenProvider,
 )
@@ -205,43 +204,56 @@ class HolderTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# 二、频率上界：每 UTC 日至多一次，在"领取成功"那一刻记账
+# 二、频率上界：唯一权威在凭据文件里
 # --------------------------------------------------------------------------
 
 
-class DailyRefreshBudgetTest(unittest.TestCase):
-    """账本本身只是一个日期水位；**什么时候记账**由消费点决定（见 OnDemandRefreshTest）。"""
+class NoSecondCeilingCopyTest(unittest.TestCase):
+    """收口轮 P1：进程内**不得**再有一份每日上界的账本副本。
 
-    def test_a_charged_day_is_spent_and_the_next_one_is_not(self) -> None:
-        budget = DailyRefreshBudget()
+    副本不认识凭据代际。真实后果很具体：领取旧凭据后账本已记账，随后这条链因为
+    SUPERSEDED 或续期失败而作废、产品负责人当天补了授权——新凭据没有任何消费标记，
+    却会被旧账本一直拒到第二天，与"人工重授权当天即可恢复"这条已接受的语义直接冲突。
 
-        self.assertFalse(budget.is_spent(DAY.date()))
-        budget.charge(DAY.date())
+    奔逸场景不需要这份副本：续期失败或写盘失败一律撤销凭据（`V-身份-04`），撤销之后
+    根本没有凭据可以再消费。
 
-        self.assertTrue(budget.is_spent(DAY.date()))
-        self.assertFalse(budget.is_spent((DAY + timedelta(days=1)).date()))
-        self.assertEqual(budget.spent_on, DAY.date())
+    源码扫描而不是行为用例：要证明的是一样东西**不存在**。
+    """
 
-    def test_charging_the_same_day_twice_changes_nothing(self) -> None:
-        budget = DailyRefreshBudget()
-        budget.charge(DAY.date())
-        budget.charge(DAY.date())
+    def test_the_supply_module_keeps_no_daily_ledger(self) -> None:
+        source = (SOURCE_ROOT / "core" / "identity" / "access_token_supply.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
 
-        self.assertTrue(budget.is_spent(DAY.date()))
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        }
+        self.assertNotIn("DailyRefreshBudget", names)
+        for banned in ("charge", "is_spent", "try_consume", "spent_on"):
+            self.assertNotIn(banned, names, f"{banned} 是账本副本残留")
 
-    def test_only_a_normalized_date_is_accepted(self) -> None:
-        """只收 ``date``。``datetime`` 是 ``date`` 的子类，误传会让"今天"变成一个带时刻的
-        对象、比较时永不相等——上界会静默失效。归一到 UTC 是调用方的责任，因为它必须与
-        凭据文件那一侧用同一把尺子。"""
+    def test_the_rotation_duty_keeps_no_daily_ledger(self) -> None:
+        source = (SOURCE_ROOT / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
 
-        budget = DailyRefreshBudget()
+        for banned in ("DailyRefreshBudget", "_budget", "daily_refresh_budget_exhausted"):
+            self.assertNotIn(banned, source, f"{banned} 是账本副本残留")
 
-        for wrong in (DAY, datetime(2026, 8, 18, 9, 0), "2026-08-18", None):
-            with self.subTest(value=type(wrong).__name__):
-                with self.assertRaises(ValueError):
-                    budget.is_spent(wrong)  # type: ignore[arg-type]
-                with self.assertRaises(ValueError):
-                    budget.charge(wrong)  # type: ignore[arg-type]
+    def test_the_scanner_would_notice_a_reintroduced_ledger(self) -> None:
+        """防空扫：分类器对合成的"账本又回来了"必须有反应。"""
+
+        tree = ast.parse("class DailyRefreshBudget:\n    def charge(self, day):\n        pass\n")
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        }
+
+        self.assertIn("DailyRefreshBudget", names)
+        self.assertIn("charge", names)
 
 
 # --------------------------------------------------------------------------
@@ -489,36 +501,52 @@ class RecordingHolder(DerivedAccessTokenHolder):
 
 
 class ScriptedVault:
-    """凭据库替身：记录领取参数与落盘次序，可注入落盘失败。"""
+    """凭据库替身，**照做真实凭据库的锁内语义**：
+
+    - 消费时刻在"锁内"取（用注入的时钟），随领取一起交出，落盘时原样收回；
+    - ``for_supply=True`` 才放开到期判定，且同一 UTC 日只放行一次；
+    - 到期驱动的领取只在凭据到点时给。
+
+    替身与真身在这些点上对不齐，正是"本地全绿、真库两样"的来源，因此这里不简化。
+    """
 
     def __init__(
         self,
         claims,
         *,
+        clock,
         save_failures: int = 0,
         superseded: bool = False,
         events: list[str] | None = None,
-        consumed_days=(),
+        consumed_at: datetime | None = None,
     ) -> None:
         self._claims = list(claims)
+        self._clock = clock
         self._save_failures = save_failures
         self._superseded = superseded
         self.events = events if events is not None else []
-        self.consumed_days = list(consumed_days)
+        # 当前凭据上记着的消费时刻（真身里就是密文载荷里的 refresh_consumed_at）。
+        self.consumed_at = consumed_at
         self.saved: list[dict[str, object]] = []
         self.revoked: list[str] = []
         self.claim_calls: list[dict[str, object]] = []
 
-    def claim_due(self, *, require_due: bool = True, refuse_if_consumed_on=None):
-        # 替身也照做真实凭据库的成对守卫（O8）：签名与前置条件对不上要在这里就响。
-        if not require_due and refuse_if_consumed_on is None:
-            raise ValueError("放开到期判定必须同时给出频率上界（两个参数成对使用）")
-        self.claim_calls.append(
-            {"require_due": require_due, "refuse_if_consumed_on": refuse_if_consumed_on}
-        )
-        if refuse_if_consumed_on is not None and refuse_if_consumed_on in self.consumed_days:
-            raise RefreshAlreadyConsumedToday("今天已经消费过一次续期凭据，本次领取被拒")
-        return self._claims.pop(0) if self._claims else None
+    def claim_due(self, *, for_supply: bool = False):
+        moment = self._clock()  # 锁内时刻
+        self.claim_calls.append({"for_supply": for_supply, "moment": moment})
+        if for_supply and self.consumed_at is not None:
+            if self.consumed_at.astimezone(timezone.utc).date() == moment.astimezone(timezone.utc).date():
+                raise RefreshAlreadyConsumedToday(consumed_at=self.consumed_at)
+        if not self._claims:
+            return None
+        claim = self._claims.pop(0)
+        if claim is None:
+            return None
+        if not for_supply and not claim.due:
+            # 到期驱动的那条路径只在凭据到点时给。
+            return None
+        claim.consumed_at = moment
+        return claim
 
     def save(self, **fields):
         if self._save_failures > 0:
@@ -530,10 +558,14 @@ class ScriptedVault:
             return False
         self.events.append("save")
         self.saved.append(fields)
-        consumed_at = fields.get("refresh_consumed_at")
-        if consumed_at is not None:
-            self.consumed_days.append(consumed_at.astimezone(timezone.utc).date())
+        self.consumed_at = fields.get("refresh_consumed_at")
         return True
+
+    def reauthorize(self) -> None:
+        """人工重授权：换来一条全新的凭据，**没有任何消费标记**。"""
+
+        self.consumed_at = None
+        self._claims.append(_Claim(generation="gen-reauthorized"))
 
     def revoke(self, *, reason: str, generation=None) -> bool:
         self.revoked.append(reason)
@@ -564,12 +596,18 @@ class ScriptedAuthorization:
 
 
 class _Claim:
-    """``StoredCredential`` 的最小替身：按需入口只用到这四个字段。"""
+    """``StoredCredential`` 的最小替身。
 
-    def __init__(self, *, generation: str = "gen-1") -> None:
+    ``consumed_at`` 由凭据库在领取时写进来（真身在文件锁内生成），``due`` 决定它会不会
+    被到期驱动的那条领取路径拿到。
+    """
+
+    def __init__(self, *, generation: str = "gen-1", due: bool = True) -> None:
         self.subject_open_id = "ou_delegated_authorization_subject"
         self.grant = AuthorizationGrant(SecretToken(FAKE_REFRESH_TOKEN), 604800, "offline_access")
         self.generation = generation
+        self.due = due
+        self.consumed_at: datetime | None = None
 
 
 class SupplyLoopFixture(NamedTuple):
@@ -579,7 +617,17 @@ class SupplyLoopFixture(NamedTuple):
     events: list[str]
     clock: MovableClock
     authorization: ScriptedAuthorization
-    budget: DailyRefreshBudget
+
+    def restart(self) -> CredentialRotationLoop:
+        """同一个凭据文件、全新的进程内状态。"""
+
+        return CredentialRotationLoop(
+            vault=self.vault,
+            authorization=self.authorization,
+            interval_seconds=0.01,
+            holder=DerivedAccessTokenHolder(),
+            clock=self.clock,
+        )
 
 
 def build_supply_loop(
@@ -589,37 +637,36 @@ def build_supply_loop(
     save_failures: int = 0,
     superseded: bool = False,
     lifetime: int | None = 7200,
-    consumed_days=(),
+    consumed_at: datetime | None = None,
     now: datetime = DAY,
     refresh_takes: timedelta | None = None,
 ) -> SupplyLoopFixture:
     events: list[str] = []
     holder = RecordingHolder(events)
+    clock = MovableClock(now)
     vault = ScriptedVault(
         [_Claim()] if claims is None else claims,
+        clock=clock,
         save_failures=save_failures,
         superseded=superseded,
         events=events,
-        consumed_days=consumed_days,
+        consumed_at=consumed_at,
     )
     replacement = AuthorizationGrant(SecretToken(FAKE_NEXT_REFRESH_TOKEN), 604800, "offline_access")
-    clock = MovableClock(now)
     authorization = ScriptedAuthorization(
         replacement if outcome is None else outcome,
         lifetime=lifetime,
         clock=clock,
         takes=refresh_takes,
     )
-    budget = DailyRefreshBudget()
     loop = CredentialRotationLoop(
         vault=vault,
         authorization=authorization,
         interval_seconds=0.01,
         holder=holder,
-        budget=budget,
         clock=clock,
     )
-    return SupplyLoopFixture(loop, vault, holder, events, clock, authorization, budget)
+    return SupplyLoopFixture(loop, vault, holder, events, clock, authorization)
 
 
 class OnDemandRefreshTest(unittest.TestCase):
@@ -632,80 +679,106 @@ class OnDemandRefreshTest(unittest.TestCase):
         之前，本用例必须变红。
         """
 
-        loop, _vault, holder, events, _clock, _authorization, _budget = build_supply_loop()
+        loop, _vault, holder, events, _clock, _authorization = build_supply_loop()
 
         loop.refresh_for_supply()
 
         self.assertEqual(events, ["save", "store"])
         self.assertTrue(holder.has_token)
 
-    def test_the_on_demand_claim_asks_for_a_credential_that_is_not_due_yet(self) -> None:
-        """日报每天要令牌，而轮换点五天多才到一次；放开到期判定必须配一道频率上界，
-        因此两个参数**成对**出现。"""
+    def test_the_on_demand_claim_takes_a_credential_that_is_not_due_yet(self) -> None:
+        """日报每天要令牌，而轮换点五天多才到一次。
 
-        loop, vault, _holder, _events, _clock, _authorization, _budget = build_supply_loop()
-
-        loop.refresh_for_supply()
-
-        self.assertEqual(len(vault.claim_calls), 1)
-        self.assertIs(vault.claim_calls[0]["require_due"], False)
-        self.assertEqual(vault.claim_calls[0]["refuse_if_consumed_on"], DAY.date())
-
-    def test_the_persisted_credential_records_the_day_it_was_consumed(self) -> None:
-        """重启也抹不掉的那道上界：判据随凭据落盘。"""
-
-        loop, vault, _holder, _events, _clock, _authorization, _budget = build_supply_loop()
-
-        loop.refresh_for_supply()
-
-        self.assertEqual(vault.saved[0]["refresh_consumed_at"], DAY)
-        self.assertEqual(vault.consumed_days, [DAY.date()])
-
-    def test_a_second_refresh_on_the_same_day_is_refused_in_process(self) -> None:
-        """进程内那道上界：连凭据文件都不必去开锁读，就该拒绝。"""
-
-        loop, vault, _holder, _events, _clock, authorization, _budget = build_supply_loop(
-            claims=[_Claim(), _Claim()]
-        )
-        loop.refresh_for_supply()
-        claims_before = len(vault.claim_calls)
-
-        with self.assertRaises(AccessTokenUnavailable) as raised:
-            loop.refresh_for_supply()
-
-        self.assertEqual(raised.exception.reason, "daily_refresh_budget_exhausted")
-        self.assertEqual(authorization.calls, 1, "被上界拒绝时不得再向飞书发起续期")
-        self.assertEqual(len(vault.claim_calls), claims_before, "被上界拒绝时不得再去领取")
-        self.assertEqual(vault.revoked, [], "被上界拒绝不是凭据问题，不得撤销")
-
-    def test_a_restart_on_the_same_day_is_refused_by_the_persisted_ceiling(self) -> None:
-        """进程内预算随重启清零，拦不住的那一次由凭据文件里的判据挡下。
-
-        这是两道上界里唯一能防住崩溃重启循环的一道——一次性令牌被高频消费正是
-        2026-08-08 那次事故的形状。
+        ``for_supply`` 一个开关同时放开到期判定并施加每日上界，两件事拆不开。
         """
 
-        loop, vault, _holder, _events, clock, authorization, _budget = build_supply_loop(
-            claims=[_Claim(), _Claim()]
-        )
-        loop.refresh_for_supply()
+        fixture = build_supply_loop(claims=[_Claim(due=False)])
 
-        # 重启：新的持有者、新的预算，但**同一个凭据文件**。
-        restarted = CredentialRotationLoop(
-            vault=vault,
-            authorization=authorization,
-            interval_seconds=0.01,
-            holder=DerivedAccessTokenHolder(),
-            budget=DailyRefreshBudget(),
-            clock=clock,
-        )
+        # 到期驱动的那条路径拿不到它。
+        self.assertEqual(fixture.loop.run_once(), RotationReport())
+
+        fixture.vault._claims.append(_Claim(due=False))  # noqa: SLF001
+        fixture.loop.refresh_for_supply()
+
+        self.assertIs(fixture.vault.claim_calls[-1]["for_supply"], True)
+        self.assertTrue(fixture.holder.has_token)
+
+    def test_the_persisted_credential_carries_back_the_moment_the_vault_generated(self) -> None:
+        """落盘的消费时刻**原样来自凭据库锁内生成的那一个**，不是本侧另算的。
+
+        两处各算一次，等锁跨过 UTC 午夜时就会得到不同的日期，上界白白多给一天名额。
+        """
+
+        fixture = build_supply_loop()
+
+        fixture.loop.refresh_for_supply()
+
+        claimed_moment = fixture.vault.claim_calls[0]["moment"]
+        self.assertEqual(fixture.vault.saved[0]["refresh_consumed_at"], claimed_moment)
+        self.assertEqual(fixture.vault.consumed_at, claimed_moment)
+
+    def test_a_second_refresh_on_the_same_day_is_refused_by_the_credential_itself(self) -> None:
+        """同一天第二次：由凭据文件里的消费标记拒绝，**这是唯一的那道上界**。"""
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()])
+        fixture.loop.refresh_for_supply()
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
-            restarted.refresh_for_supply()
+            fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
-        self.assertEqual(authorization.calls, 1, "被上界拒绝时不得再向飞书发起续期")
-        self.assertEqual(vault.revoked, [], "被上界拒绝不是凭据问题，不得撤销")
+        self.assertEqual(fixture.authorization.calls, 1, "被上界拒绝时不得再向飞书发起续期")
+        self.assertEqual(fixture.vault.revoked, [], "被上界拒绝不是凭据问题，不得撤销")
+
+    def test_a_restart_on_the_same_day_is_still_refused(self) -> None:
+        """判据随凭据落盘，因此崩溃重启循环也绕不过——一次性令牌被高频消费正是
+        2026-08-08 那次事故的形状。"""
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()])
+        fixture.loop.refresh_for_supply()
+
+        with self.assertRaises(AccessTokenUnavailable) as raised:
+            fixture.restart().refresh_for_supply()
+
+        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(fixture.authorization.calls, 1)
+
+    def test_a_reauthorization_restores_the_supply_the_very_same_day(self) -> None:
+        """**收口轮 P1 的钉子**：当天已经消费过之后，人工重授权换来的新凭据立刻可用。
+
+        新凭据没有任何消费标记，而上界只认凭据自己。任何一份进程内账本副本都会在这里
+        把一条全新的凭据拒到第二天——那与"人工重授权重置当日额度"这条已接受的语义
+        直接冲突，也让运维在恢复之后还要再等一天。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim()])
+        fixture.loop.refresh_for_supply()
+        self.assertEqual(fixture.authorization.calls, 1)
+
+        # 当天再问一次：被凭据自己的消费标记拒绝。
+        with self.assertRaises(AccessTokenUnavailable):
+            fixture.loop.refresh_for_supply()
+
+        fixture.vault.reauthorize()  # 产品负责人当天补了授权
+        fixture.loop.refresh_for_supply()
+
+        self.assertEqual(fixture.authorization.calls, 2, "同一天、同一进程内立刻恢复供给")
+        self.assertTrue(fixture.holder.has_token)
+
+    def test_a_reauthorization_restores_the_supply_after_a_failed_chain_too(self) -> None:
+        """链因为 SUPERSEDED 作废之后同样成立：作废那一次不该在进程里留下任何账。"""
+
+        fixture = build_supply_loop(claims=[_Claim()], superseded=True)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable):
+                fixture.loop.refresh_for_supply()
+
+        fixture.vault.reauthorize()
+        fixture.vault._superseded = False  # noqa: SLF001 - 新凭据不再有世代冲突
+        fixture.loop.refresh_for_supply()
+
+        self.assertTrue(fixture.holder.has_token)
 
     def test_a_persist_failure_hands_out_nothing_and_reports_the_credential_as_lost(self) -> None:
         """写盘失败＝凭据丢失风险：**不交出令牌**、撤销、按不可恢复响亮留痕。
@@ -713,7 +786,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         变异验红锚点：把"落盘失败仍然交出令牌"改回去，本用例必须变红。
         """
 
-        loop, vault, holder, _events, _clock, _authorization, _budget = build_supply_loop(save_failures=99)
+        loop, vault, holder, _events, _clock, _authorization = build_supply_loop(save_failures=99)
 
         with no_retry_backoff():
             with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
@@ -730,7 +803,7 @@ class OnDemandRefreshTest(unittest.TestCase):
     def test_a_transient_persist_failure_still_ends_up_handing_out_the_token(self) -> None:
         """一次瞬时抖动不该报废一条一次性凭据：重试成功后次序依然是先落盘后交出。"""
 
-        loop, vault, holder, events, _clock, _authorization, _budget = build_supply_loop(save_failures=1)
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop(save_failures=1)
 
         loop.refresh_for_supply()
 
@@ -743,7 +816,7 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         from lingxi.adapters.feishu_directory import FeishuDirectoryError
 
-        loop, vault, holder, _events, _clock, _authorization, _budget = build_supply_loop(
+        loop, vault, holder, _events, _clock, _authorization = build_supply_loop(
             outcome=FeishuDirectoryError("feishu_code_20037")
         )
 
@@ -755,7 +828,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertFalse(holder.has_token)
 
     def test_an_indeterminate_refresh_is_classified_apart_from_a_definite_failure(self) -> None:
-        loop, vault, _holder, _events, _clock, _authorization, _budget = build_supply_loop(
+        loop, vault, _holder, _events, _clock, _authorization = build_supply_loop(
             outcome=TimeoutError("模拟回程超时")
         )
 
@@ -766,7 +839,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(vault.revoked, ["refresh_indeterminate"])
 
     def test_no_claimable_credential_is_not_disguised_as_anything_else(self) -> None:
-        loop, vault, _holder, _events, _clock, authorization, _budget = build_supply_loop(claims=[None])
+        loop, vault, _holder, _events, _clock, authorization = build_supply_loop(claims=[None])
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
             loop.refresh_for_supply()
@@ -779,7 +852,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         """停止之后不再开启任何一次续期：半途中断的续期等于凭据丢失
         （模块头注释、`V-部署-03`）。"""
 
-        loop, vault, _holder, _events, _clock, authorization, _budget = build_supply_loop()
+        loop, vault, _holder, _events, _clock, authorization = build_supply_loop()
         loop.request_stop()
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
@@ -792,7 +865,7 @@ class OnDemandRefreshTest(unittest.TestCase):
     def test_a_refresh_without_a_token_lifetime_keeps_the_credential(self) -> None:
         """飞书没给短期令牌寿命：新凭据已经落盘，**不撤销**；只是今天没有令牌可用。"""
 
-        loop, vault, holder, _events, _clock, _authorization, _budget = build_supply_loop(lifetime=None)
+        loop, vault, holder, _events, _clock, _authorization = build_supply_loop(lifetime=None)
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
             loop.refresh_for_supply()
@@ -814,7 +887,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         变异验红锚点：把 ``SUPERSEDED`` 重新折成 ``SAVED``，本用例必须变红。
         """
 
-        loop, vault, holder, events, _clock, _authorization, _budget = build_supply_loop(
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop(
             superseded=True
         )
 
@@ -829,45 +902,43 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(vault.revoked, [], "期间的新授权不得被旧链连带撤销")
         self.assertTrue(any("新授权取代" in line for line in captured.output))
 
-    # ---- O3：记账点在"领取成功"之后 -------------------------------------
+    # ---- 零消费的失败不该留下任何"今天用过了"的痕迹 -----------------------
 
-    def test_a_failure_before_the_claim_does_not_spend_the_daily_budget(self) -> None:
-        """可证明**零消费**的失败不得占掉当日名额。
+    def test_a_failure_before_the_claim_leaves_no_trace(self) -> None:
+        """可证明**零消费**的失败（没有可领取的凭据）之后，当天照样可以再试。
 
-        这不是省一次请求的问题：产品负责人早上补完授权，当天全天都会被"今天已经换过
-        了"拒绝，而凭据层恰恰刻意让新授权不带消费标记（两路审查 O3）。
+        上界只认凭据自己的消费标记，而这次根本没领到凭据、什么都没写。
         """
 
-        loop, vault, _holder, _events, _clock, authorization, budget = build_supply_loop(
-            claims=[None, _Claim()]
-        )
+        fixture = build_supply_loop(claims=[None, _Claim()])
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
-            loop.refresh_for_supply()
+            fixture.loop.refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
-        self.assertIsNone(budget.spent_on, "没领到凭据就没消费，不得记账")
+        self.assertIsNone(fixture.vault.consumed_at, "没领到凭据就没消费")
 
-        # 同一天补上授权：同一个进程立刻恢复供给，不必等到明天。
-        loop.refresh_for_supply()
+        fixture.loop.refresh_for_supply()
 
-        self.assertEqual(authorization.calls, 1)
-        self.assertEqual(budget.spent_on, DAY.date())
+        self.assertEqual(fixture.authorization.calls, 1, "同一天里立刻可以再试")
 
-    def test_a_stop_does_not_spend_the_daily_budget(self) -> None:
-        loop, _vault, _holder, _events, _clock, _authorization, budget = build_supply_loop()
-        loop.request_stop()
+    def test_a_stop_leaves_no_trace_and_never_claims(self) -> None:
+        fixture = build_supply_loop()
+        fixture.loop.request_stop()
 
-        with self.assertRaises(AccessTokenUnavailable):
-            loop.refresh_for_supply()
+        with self.assertRaises(AccessTokenUnavailable) as raised:
+            fixture.loop.refresh_for_supply()
 
-        self.assertIsNone(budget.spent_on)
+        self.assertEqual(raised.exception.reason, "scheduler_stopping")
+        self.assertEqual(fixture.vault.claim_calls, [], "停止中一条都不领")
+        self.assertIsNone(fixture.vault.consumed_at)
 
-    def test_any_failure_after_the_claim_spends_the_daily_budget(self) -> None:
+    def test_every_failure_after_the_claim_still_counts_as_today_s_consumption(self) -> None:
         """领取成功＝消费标记已经原子置位，这条一次性令牌从此回不来了。
 
-        之后无论飞书拒绝、结果不明确还是写盘失败，当天都不得再换一次——否则一个
-        每轮都失败的缺陷会每 60 秒烧一次。
+        因此无论后面是飞书拒绝、结果不明确、写盘失败还是 SUPERSEDED，当天都不得再换
+        一次——否则一个每轮都失败的缺陷会每 60 秒烧一次。注意判据在凭据文件里：
+        续期失败与写盘失败会撤销凭据，那时连凭据都没有了，同样换不成。
         """
 
         cases = (
@@ -879,54 +950,57 @@ class OnDemandRefreshTest(unittest.TestCase):
         )
         for kwargs, expected in cases:
             with self.subTest(reason=expected):
-                loop, _vault, _holder, _events, _clock, _authorization, budget = build_supply_loop(
-                    **kwargs
-                )
+                fixture = build_supply_loop(claims=[_Claim(), _Claim()], **kwargs)
 
                 with no_retry_backoff():
-                    with self.assertRaises(AccessTokenUnavailable) as raised:
-                        loop.refresh_for_supply()
+                    with self.assertLogs("lingxi.apps.scheduler"):
+                        with self.assertRaises(AccessTokenUnavailable) as raised:
+                            fixture.loop.refresh_for_supply()
 
                 self.assertEqual(raised.exception.reason, expected)
-                self.assertEqual(budget.spent_on, DAY.date(), "触达过飞书就必须记账")
+                self.assertEqual(
+                    fixture.vault.claim_calls[0]["for_supply"], True, "走的是按需那条路径"
+                )
+                self.assertEqual(fixture.authorization.calls, 1 if "outcome" not in kwargs else 1)
 
-    # ---- O2：异常不带原因链 ---------------------------------------------
+    # ---- O2：异常不展示原始异常 -------------------------------------------
 
-    def test_the_refresh_failure_carries_no_cause_chain(self) -> None:
-        """原始 transport 异常留在 ``__cause__`` 里，任何 traceback 打印都会把响应正文
-        （可能含令牌）带进日志。"""
+    def test_the_refresh_failure_never_shows_the_original_exception(self) -> None:
+        """原始 transport 异常的正文可能带响应体乃至令牌，而标准 traceback 会一路打印
+        出来。``from None`` 让它不进打印路径（对象上的 ``__context__`` 仍在，Python
+        语义如此）。"""
 
-        loop, _vault, _holder, _events, _clock, _authorization, _budget = build_supply_loop(
+        fixture = build_supply_loop(
             outcome=FeishuDirectoryErrorForTests(f"body-with-{FAKE_ACCESS_TOKEN}")
         )
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
-            loop.refresh_for_supply()
+            fixture.loop.refresh_for_supply()
 
+        self.assertTrue(raised.exception.__suppress_context__, "标准 traceback 不得展示原始异常")
         self.assertIsNone(raised.exception.__cause__)
-        self.assertTrue(raised.exception.__suppress_context__)
         self.assertNotIn(FAKE_ACCESS_TOKEN, str(raised.exception))
 
-    # ---- O5 / O6：两把尺子必须一致，两个时刻必须分清 ----------------------
+    # ---- 时刻语义：一把尺子、两个时刻 -------------------------------------
 
-    def test_the_persisted_ceiling_is_asked_in_utc_days(self) -> None:
-        """上界按 **UTC 日**问，与凭据文件那一侧用同一把尺子。
+    def test_the_ceiling_is_judged_by_the_vault_not_by_the_caller(self) -> None:
+        """调用方不再传任何日期：**"今天"由凭据库在自己的锁内说了算**。
 
-        用一个非 UTC 时钟表达同一时刻：判定必须不变，否则部署机器的时区会让午夜前后
-        的那一段悄悄多消费一次一次性凭据。
+        锁外算好日期再进锁，等锁跨过 UTC 午夜时 D+1 的领取会被当成 D，当天因此可以
+        再消费一次（收口轮 P2-a）。
         """
 
         eastern = timezone(timedelta(hours=8))
         # UTC 是 8-18 23:30，本地时钟显示 8-19 07:30。
-        local_midnight_window = datetime(2026, 8, 19, 7, 30, tzinfo=eastern)
-        loop, vault, _holder, _events, _clock, _authorization, budget = build_supply_loop(
-            now=local_midnight_window
+        fixture = build_supply_loop(now=datetime(2026, 8, 19, 7, 30, tzinfo=eastern))
+
+        fixture.loop.refresh_for_supply()
+
+        call = fixture.vault.claim_calls[0]
+        self.assertEqual(sorted(call), ["for_supply", "moment"], "除了模式没有别的入参")
+        self.assertEqual(
+            fixture.vault.consumed_at.astimezone(timezone.utc).date(), date(2026, 8, 18)
         )
-
-        loop.refresh_for_supply()
-
-        self.assertEqual(vault.claim_calls[0]["refuse_if_consumed_on"], date(2026, 8, 18))
-        self.assertEqual(budget.spent_on, date(2026, 8, 18))
 
     def test_the_two_moments_of_one_refresh_are_kept_apart(self) -> None:
         """一次续期跨越一个 HTTP 往返，因此有两个时刻，各有各的用途：
@@ -937,7 +1011,7 @@ class OnDemandRefreshTest(unittest.TestCase):
           寿命里，令牌因此被当成比实际更新鲜。
         """
 
-        loop, vault, holder, _events, clock, _authorization, _budget = build_supply_loop(
+        loop, vault, holder, _events, clock, _authorization = build_supply_loop(
             refresh_takes=timedelta(minutes=30)
         )
 
@@ -958,7 +1032,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         飞书的响应少了一个字段（两路审查 O7）。
         """
 
-        loop, vault, holder, _events, _clock, _authorization, _budget = build_supply_loop(
+        loop, vault, holder, _events, _clock, _authorization = build_supply_loop(
             claims=[_Claim(), _Claim()], lifetime=None
         )
 
@@ -972,31 +1046,85 @@ class OnDemandRefreshTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
 
-    def test_a_usable_token_clears_the_unusable_marker(self) -> None:
-        """拿到可用令牌之后，那个记号必须**当天就**清掉。
+    def test_a_token_that_is_stale_on_arrival_is_reported_as_unusable(self) -> None:
+        """收口轮 P2-c①：一份**一到手就临期**的令牌不算拿到了。
 
-        记号只在"今天"这一天有意义。不清掉的话，同一天里后来那次成功会被前面那次
-        失败继续污染：运维看到的是"派生令牌不可用"，而实际上令牌好好地在持有者里。
-        故意让两次都落在同一个 UTC 日——跨日的写法测不出这条，因为跨日之后记号本来
-        就不匹配了（变异验红实测：N12 首轮存活）。
+        存进去也一次都取不出来（``fresh()`` 会立刻判它不新鲜）。把它当成成功，会让
+        "这一代令牌不可用"的记号被错误清掉，当天后续每一轮都只报"今天已经换过了"，
+        真实原因（飞书给了一个几乎立刻过期的令牌）再也不会出现在审计里。
+        """
+
+        fixture = build_supply_loop(
+            claims=[_Claim(), _Claim()],
+            lifetime=int(DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN.total_seconds()) - 1,
+        )
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable) as raised:
+                fixture.loop.refresh_for_supply()
+
+        self.assertEqual(raised.exception.reason, "derived_token_unusable")
+        self.assertFalse(fixture.holder.has_token)
+        self.assertEqual(len(fixture.vault.saved), 1, "凭据照常落盘，不撤销")
+
+        # 当天后续每一轮都继续报真实原因，而不是例行的"今天已经换过了"。
+        with self.assertRaises(AccessTokenUnavailable) as again:
+            fixture.loop.refresh_for_supply()
+        self.assertEqual(again.exception.reason, "derived_token_unusable")
+
+    def test_after_a_restart_the_reason_falls_back_to_the_honest_one(self) -> None:
+        """记号是进程内的：重启之后本进程对"上一次换到了什么"一无所知。
+
+        这时如实报上界（``refresh_already_consumed_today``），不假装还知道真实原因。
         """
 
         fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
-        loop, vault = fixture.loop, fixture.vault
 
-        loop.run_once()  # 第一次：飞书没给寿命，记号置上
-        self.assertEqual(loop._derived_unusable_on, DAY.date())  # noqa: SLF001
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable):
+                fixture.loop.refresh_for_supply()
 
-        fixture.authorization._lifetime = 7200  # noqa: SLF001 - 把假响应换成带寿命的
-        loop.run_once()  # 同一天第二次：换到可用令牌，记号必须清掉
-
-        self.assertTrue(fixture.holder.has_token)
-        # 当天再问供给：文件侧的上界会拒绝，原因应当就是上界本身。
         with self.assertRaises(AccessTokenUnavailable) as raised:
-            loop.refresh_for_supply()
+            fixture.restart().refresh_for_supply()
 
         self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
-        self.assertEqual(len(vault.saved), 2)
+
+    def test_a_reauthorization_recovers_even_after_an_unusable_token(self) -> None:
+        """换到不可用令牌之后当天补授权：新凭据没有消费标记，供给立刻恢复。"""
+
+        fixture = build_supply_loop(claims=[_Claim()], lifetime=None)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable):
+                fixture.loop.refresh_for_supply()
+
+        fixture.vault.reauthorize()
+        fixture.authorization._lifetime = 7200  # noqa: SLF001 - 换成带寿命的响应
+        fixture.loop.refresh_for_supply()
+
+        self.assertTrue(fixture.holder.has_token)
+
+    def test_a_usable_token_clears_the_unusable_marker(self) -> None:
+        """拿到可用令牌之后把记号清掉。
+
+        这一条是**状态断言**而不是行为断言，理由要写清楚：记号绑定的是"哪一次消费"
+        （消费时刻），因此一条过期的记号本来就匹配不上后来的任何一次拒绝——清不清都
+        不会产生错误的对外原因。清除是纵深防御，钉住它是为了让"记号"不会在绑定被削弱
+        的某一天悄悄退化成一个永久开关。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable):
+                fixture.loop.refresh_for_supply()
+        self.assertIsNotNone(fixture.loop._derived_unusable_at)  # noqa: SLF001
+
+        fixture.vault.reauthorize()
+        fixture.authorization._lifetime = 7200  # noqa: SLF001
+        fixture.loop.refresh_for_supply()
+
+        self.assertIsNone(fixture.loop._derived_unusable_at)  # noqa: SLF001
 
 
 class FeishuDirectoryErrorForTests(Exception):
@@ -1009,7 +1137,7 @@ class ScheduledRotationFeedsTheHolderTest(unittest.TestCase):
     def test_a_due_rotation_also_hands_the_derived_token_to_the_holder(self) -> None:
         """到期轮换那一条路径同样不再丢弃派生令牌（此前 ``:328`` 当场丢弃）。"""
 
-        loop, vault, holder, events, _clock, _authorization, _budget = build_supply_loop()
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop()
 
         report = loop.run_once()
 
@@ -1019,7 +1147,7 @@ class ScheduledRotationFeedsTheHolderTest(unittest.TestCase):
         self.assertEqual(vault.saved[0]["refresh_consumed_at"], DAY)
 
     def test_a_due_rotation_that_cannot_persist_hands_out_nothing(self) -> None:
-        loop, vault, holder, _events, _clock, _authorization, _budget = build_supply_loop(save_failures=99)
+        loop, vault, holder, _events, _clock, _authorization = build_supply_loop(save_failures=99)
 
         with no_retry_backoff(), self.assertLogs("lingxi.apps.scheduler", level="ERROR"):
             report = loop.run_once()
@@ -1035,15 +1163,18 @@ class ScheduledRotationFeedsTheHolderTest(unittest.TestCase):
         ``SAVED`` 的变异会存活（N3 首轮）。
         """
 
-        loop, vault, holder, events, _clock, _authorization, _budget = build_supply_loop(
+        loop, vault, holder, events, _clock, _authorization = build_supply_loop(
             superseded=True
         )
 
         with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
             report = loop.run_once()
 
-        # 收尾判定不变：不撤销（新凭据不能被旧链连带删掉）。
-        self.assertEqual((report.claimed, report.rotated, report.revoked), (1, 1, 0))
+        # 计数口径（收口轮 P2-b）：本次结果没落盘，当前凭据不是本次产生的，因此
+        # **不计 rotated**（与写盘失败同一条口径）；但也不撤销，因此不计 revoked。
+        self.assertEqual(
+            (report.claimed, report.rotated, report.revoked, report.superseded), (1, 0, 0, 1)
+        )
         self.assertEqual(vault.revoked, [])
         # 但派生令牌一个都不交出：这条链已经没有活着的凭据了。
         self.assertFalse(holder.has_token)
@@ -1424,20 +1555,29 @@ class AssembledSupplyTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.reason, "no_credential_available")
 
-    def test_the_assembled_supply_is_bounded_by_the_daily_ceiling(self) -> None:
-        """装配出来的那条链带着频率上界：轮换职责拿到了账本，不是一个没有约束的循环。"""
+    def test_the_assembled_supply_always_asks_through_the_bounded_path(self) -> None:
+        """装配出来的那条链走的是**带每日上界的那条领取路径**。
+
+        上界的唯一权威在凭据库里，因此这里能钉的是"确实按 ``for_supply`` 模式去问"——
+        换成到期驱动的那条路径（或任何绕过上界的写法）都会让它变红。
+        """
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
 
         loop, supply = self._assemble()
-        rotation = loop.duties[0]
-        today = datetime.now(timezone.utc).date()
+        del loop
+        calls: list[dict] = []
 
-        # 直接把账本记成"今天已经用过"，等价于当天已经换过一次。
-        rotation._budget.charge(today)  # noqa: SLF001 - 装配面没有别的观察点
+        def spy(self, **kwargs):
+            calls.append(kwargs)
+            return None
 
-        with self.assertRaises(AccessTokenUnavailable) as raised:
-            supply()
+        with mock.patch.object(HostFileDelegatedCredentialVault, "claim_due", spy):
+            with self.assertRaises(AccessTokenUnavailable) as raised:
+                supply()
 
-        self.assertEqual(raised.exception.reason, "daily_refresh_budget_exhausted")
+        self.assertEqual(raised.exception.reason, "no_credential_available")
+        self.assertEqual(calls, [{"for_supply": True}])
 
 
 if __name__ == "__main__":

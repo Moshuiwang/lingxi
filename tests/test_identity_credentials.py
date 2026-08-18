@@ -234,65 +234,65 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
 
 
-    def test_relaxing_the_due_check_without_a_ceiling_is_refused_before_any_io(self) -> None:
-        """O8：``require_due=False`` 必须与 ``refuse_if_consumed_on`` 成对出现。
+    def test_no_parameter_can_relax_the_due_check_without_the_daily_ceiling(self) -> None:
+        """收口轮 P2-a：``for_supply`` 把两件事**捆死**，没有任何参数能把它们拆开。
 
-        单独放开到期判定，等于把一条**一次性**凭据交给一个没有任何频率约束的循环——
-        一次性令牌被高频消费正是 2026-08-08 授权码被烧那次事故的形状。守卫在文件锁
-        与连库之前，因此这条否定断言在没有数据库的机器上也跑得动。
+        放开到期判定而不带每日上界，等于把一条**一次性**凭据交给一个没有任何频率约束的
+        循环——一次性令牌被高频消费正是 2026-08-08 授权码被烧那次事故的形状。此前这条
+        靠一道"两个参数必须成对"的运行时守卫，守卫本身就说明 API 允许拆开；现在从形状上
+        就拆不开，因此这里断言的是**签名**。
         """
 
-        from cryptography.fernet import Fernet
+        import inspect
 
         from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
 
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        path = Path(directory.name) / "delegated-credential.enc"
-        vault = HostFileDelegatedCredentialVault(
-            self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
+        parameters = inspect.signature(HostFileDelegatedCredentialVault.claim_due).parameters
+
+        self.assertEqual(
+            sorted(name for name in parameters if name != "self"),
+            ["for_supply", "lease_seconds", "now"],
+            "多出来的旋钮就是一条可以绕过每日上界的路",
         )
-
-        with self.assertRaises(ValueError) as raised:
-            vault.claim_due(require_due=False)
-
-        self.assertIn("成对使用", str(raised.exception))
-        self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
+        self.assertIs(parameters["for_supply"].default, False, "默认必须是到期驱动的那条路径")
 
 
-class UtcDayConversionTest(unittest.TestCase):
-    """频率上界的日期换算本体（O6②）。
+class ConsumptionMomentConversionTest(unittest.TestCase):
+    """每日上界读取消费时刻的换算本体（O6②）。
 
     这一段此前没有任何直接断言：把换算整个删掉、直接取字符串前十位，全量用例依然全绿。
-    它是"今天"这件事在**凭据文件**那一侧的唯一定义，与轮换职责那一侧必须是同一把尺子。
+    它是"今天"这件事在**凭据文件**那一侧的唯一定义。
     """
 
     def test_a_non_utc_offset_is_converted_before_the_day_is_taken(self) -> None:
-        from lingxi.adapters.delegated_credentials import _utc_day
+        from lingxi.adapters.delegated_credentials import _parse_utc
 
         # 同一时刻的两种写法：UTC 8-18 23:30 == 东八区 8-19 07:30。
-        self.assertEqual(_utc_day("2026-08-18T23:30:00+00:00"), date(2026, 8, 18))
-        self.assertEqual(_utc_day("2026-08-19T07:30:00+08:00"), date(2026, 8, 18))
+        self.assertEqual(_parse_utc("2026-08-18T23:30:00+00:00").date(), date(2026, 8, 18))
+        self.assertEqual(_parse_utc("2026-08-19T07:30:00+08:00").date(), date(2026, 8, 18))
         # 反向：西五区的 8-18 21:00 已经是 UTC 的 8-19。
-        self.assertEqual(_utc_day("2026-08-18T21:00:00-05:00"), date(2026, 8, 19))
+        self.assertEqual(_parse_utc("2026-08-18T21:00:00-05:00").date(), date(2026, 8, 19))
 
     def test_a_naive_moment_is_read_as_utc(self) -> None:
-        from lingxi.adapters.delegated_credentials import _utc_day
+        from lingxi.adapters.delegated_credentials import _parse_utc
 
-        self.assertEqual(_utc_day("2026-08-18T23:30:00"), date(2026, 8, 18))
+        moment = _parse_utc("2026-08-18T23:30:00")
 
-    def test_anything_unparsable_yields_no_day(self) -> None:
-        """读不出日期时返回 ``None``＝"没有消费记录"，上界因此不拦。
+        self.assertEqual(moment.date(), date(2026, 8, 18))
+        self.assertEqual(moment.utcoffset(), timedelta(0), "读出来必须是带时区的 UTC 时刻")
+
+    def test_anything_unparsable_yields_nothing(self) -> None:
+        """读不出时刻时返回 ``None``＝"没有消费记录"，上界因此不拦。
 
         方向是刻意的：一份读不懂的旧载荷不该把凭据永久锁死；真正的防线是文件本身
         只由本模块写入。
         """
 
-        from lingxi.adapters.delegated_credentials import _utc_day
+        from lingxi.adapters.delegated_credentials import _parse_utc
 
         for broken in (None, "", "not-a-moment", 12345, {}):
             with self.subTest(value=broken):
-                self.assertIsNone(_utc_day(broken))
+                self.assertIsNone(_parse_utc(broken))
 
 
 class DerivedAccessTokenTest(unittest.TestCase):
