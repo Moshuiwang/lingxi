@@ -79,10 +79,11 @@ def _claim(
     payload: dict | None = None,
     user_id: str = "usr_A",
     created_record_id: str | None = None,
+    outbox_id: str = "pub_1",
 ) -> ClaimedPublish:
     fields = payload if payload is not None else (row or _row()).snapshot_fields
     return ClaimedPublish(
-        outbox_id="pub_1",
+        outbox_id=outbox_id,
         user_id=user_id,
         permission_version=version,
         payload=fields,
@@ -795,9 +796,18 @@ class FakeStore:
         self._claims = list(claims)
         self.completed: list[tuple[PublishAttempt, str]] = []
         self._fail_complete = fail_complete
+        #: 每次认领时收到的本轮排除清单，供 F2 的断言比对。
+        self.excludes: list[tuple[str, ...]] = []
 
-    def claim_next(self):
-        return self._claims.pop(0) if self._claims else None
+    def claim_next(self, *, exclude=()):
+        # **真的按 exclude 跳过**：只记不跳的替身会让"本轮排除"这条断言在假 store 上
+        # 恒绿，而它恰恰是本轮要证明的行为。
+        self.excludes.append(tuple(exclude))
+        for index, candidate in enumerate(self._claims):
+            if candidate.outbox_id in exclude:
+                continue
+            return self._claims.pop(index)
+        return None
 
     def complete(self, attempt, *, status):
         if self._fail_complete:
@@ -818,8 +828,8 @@ class ExecutorTest(unittest.TestCase):
         table = FakeTable()
         store = FakeStore(
             [
-                _claim(user_id="usr_A"),
-                _claim(row=_row(OTHER_EMAIL), user_id="usr_B"),
+                _claim(user_id="usr_A", outbox_id="pub_1"),
+                _claim(row=_row(OTHER_EMAIL), user_id="usr_B", outbox_id="pub_2"),
             ]
         )
         audit = RecordingAudit()
@@ -898,7 +908,7 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(store.completed[0][0].attempts, 3)
 
     def test_limit_bounds_one_round(self) -> None:
-        store = FakeStore([_claim(), _claim(), _claim()])
+        store = FakeStore([_claim(outbox_id=f"pub_{index}") for index in range(1, 4)])
         executor = PermissionPublishExecutor(
             store=store, transport=FakeTable(), audit=RecordingAudit()
         )
@@ -914,6 +924,109 @@ class ExecutorTest(unittest.TestCase):
         (attempt,) = executor.run_once()
         self.assertEqual(attempt.outcome, PublishOutcome.UNCERTAIN)
         self.assertEqual(audit.entries[0][0], "permission_publish.uncertain")
+
+
+class RoundExclusionTest(unittest.TestCase):
+    """**一条意图一轮最多认领一次**（Epic C 冻结缺陷 F2）。
+
+    修复前：``claim_next`` 按 ``(created_at, id)`` 取最老的一条，而一次失败只把状态写回
+    ``pending``、不改 ``created_at``——它仍然是最老的那一条，于是在**同一轮里**被立刻
+    重新认领。真库实测下快失败形态的 5 次重试在 0.195 秒内烧完转 ``failed``。
+
+    本组用一个"失败即放回队列"的替身重现那个形状：没有本轮排除时它会被反复取出。
+    """
+
+    def _executor(self, store) -> PermissionPublishExecutor:
+        table = FakeTable()
+        table.faults["find_rows"] = PermissionTableError("http_500", definite=True)
+        return PermissionPublishExecutor(
+            store=store, transport=table, audit=RecordingAudit()
+        )
+
+    def test_a_failed_intent_is_not_reclaimed_in_the_same_round(self) -> None:
+        store = RequeueingStore([_claim(outbox_id="pub_1")])
+
+        attempts = self._executor(store).run_once(limit=5)
+
+        self.assertEqual(len(attempts), 1, "同一条意图在一轮里只能被认领一次")
+        self.assertEqual(store.excludes, [(), ("pub_1",)])
+
+    def test_the_exclusion_does_not_starve_other_users(self) -> None:
+        """否定断言：**跳过不等于少消费**。
+
+        本轮排除只把已经认领过的那条排除在候选之外，别人的意图照常被取走——否则修
+        F2 会造出一个更糟的缺陷：一个人失败就让本轮剩下的预算全部空转。
+        """
+
+        store = RequeueingStore(
+            [
+                _claim(user_id="usr_A", outbox_id="pub_1"),
+                _claim(row=_row(OTHER_EMAIL), user_id="usr_B", outbox_id="pub_2"),
+            ]
+        )
+
+        attempts = self._executor(store).run_once(limit=5)
+
+        self.assertEqual([item.outbox_id for item in attempts], ["pub_1", "pub_2"])
+        self.assertEqual(store.excludes, [(), ("pub_1",), ("pub_1", "pub_2")])
+
+    def test_the_caller_can_own_the_round(self) -> None:
+        """一轮的边界可以在调用方那一层。
+
+        生产形态是 ``run_once(limit=1)`` × N（调度职责要逐条查停止信号与时间预算），
+        那时累积的已认领清单由职责传进来——见
+        ``lingxi.apps.scheduler.permission_publish.PermissionPublishDuty._publish``。
+        """
+
+        store = RequeueingStore([_claim(outbox_id="pub_1")])
+        executor = self._executor(store)
+
+        self.assertEqual(len(executor.run_once(limit=1)), 1)
+        self.assertEqual(executor.run_once(limit=1, exclude=("pub_1",)), ())
+        self.assertEqual(store.excludes, [(), ("pub_1",)])
+
+    def test_the_next_round_may_claim_it_again(self) -> None:
+        """排除的作用域是**一轮**：下一轮它照样能被认领，否则重试就永远不会发生。"""
+
+        store = RequeueingStore([_claim(outbox_id="pub_1")])
+        executor = self._executor(store)
+
+        self.assertEqual(len(executor.run_once(limit=5)), 1)
+        self.assertEqual(len(executor.run_once(limit=5)), 1)
+
+
+class RequeueingStore:
+    """"失败就回 ``pending``"的 outbox 替身：``complete(status='pending')`` 把那条意图
+    放回队列**最前面**（它的 ``created_at`` 没变，仍然是最老的一条）。
+
+    这正是真库 ``claim_next`` 的行为，也是 F2 的成因；没有本轮排除时它会被无限重取。
+    """
+
+    def __init__(self, claims: list[ClaimedPublish]) -> None:
+        self._claims = list(claims)
+        self.completed: list[tuple[PublishAttempt, str]] = []
+        self.excludes: list[tuple[str, ...]] = []
+
+    def claim_next(self, *, exclude=()):
+        self.excludes.append(tuple(exclude))
+        for index, candidate in enumerate(self._claims):
+            if candidate.outbox_id in exclude:
+                continue
+            return self._claims.pop(index)
+        return None
+
+    def complete(self, attempt: PublishAttempt, *, status: str) -> None:
+        self.completed.append((attempt, status))
+        if status != "pending":
+            return
+        self._claims.insert(
+            0,
+            _claim(
+                user_id=attempt.user_id,
+                outbox_id=attempt.outbox_id,
+                attempts=attempt.attempts + 1,
+            ),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

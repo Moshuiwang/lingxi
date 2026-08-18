@@ -1064,7 +1064,8 @@ class DutyRegistrationTest(unittest.TestCase):
         loop = build_loop(self._config(), audit=audit)
 
         self.assertEqual(
-            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+            [duty.name for duty in loop.duties],
+            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理"],
         )
         roster_records = self._roster_records(audit)
         self.assertEqual(len(roster_records), 1, "缺群 ID 时花名册职责的审计恰 1 条")
@@ -1093,7 +1094,8 @@ class DutyRegistrationTest(unittest.TestCase):
                 )
 
                 self.assertEqual(
-                    [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+                    [duty.name for duty in loop.duties],
+                    ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理"],
                 )
                 roster_records = self._roster_records(audit)
                 self.assertEqual(len(roster_records), 1, "前置缺项时花名册职责的审计恰 1 条")
@@ -1125,7 +1127,7 @@ class DutyRegistrationTest(unittest.TestCase):
 
         self.assertEqual(
             [duty.name for duty in loop.duties],
-            ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
+            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理", "花名册审计日报"],
         )
         # 按 ``roster_audit.`` 前缀取本职责的审计：同一个 `build_loop` 还会为每日权限重算
         # 与权限发布各留一条自己的未注册审计（本夹具没配 MCP 主密钥与发布表）。
@@ -1196,7 +1198,7 @@ class DutyRegistrationTest(unittest.TestCase):
 
         self.assertEqual(
             [duty.name for duty in loop.duties],
-            ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
+            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理", "花名册审计日报"],
         )
         self.assertEqual(self._roster_records(audit), [], "前置齐备时不该有『未注册』审计")
         self.assertEqual(token_calls, [], "装配阶段不得取令牌，更不得发请求")

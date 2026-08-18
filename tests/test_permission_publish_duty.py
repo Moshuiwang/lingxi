@@ -109,10 +109,14 @@ COMPLETE_ENV = {
 
 
 class FakeAttempt:
-    """发布执行器返回的一次尝试的最小形状。"""
+    """发布执行器返回的一次尝试的最小形状。
 
-    def __init__(self, *, published: bool) -> None:
+    ``outbox_id`` 是 F2 之后新增的最小字段：职责要靠它累积"本轮已经认领过谁"。
+    """
+
+    def __init__(self, *, published: bool, outbox_id: str = "pob_1") -> None:
         self.published = published
+        self.outbox_id = outbox_id
 
 
 class FakeExecutor:
@@ -121,10 +125,13 @@ class FakeExecutor:
     def __init__(self, *attempts: FakeAttempt, on_call=None) -> None:
         self._queue = list(attempts)
         self.calls: list[int] = []
+        #: 每次调用收到的本轮排除清单，供 F2 的断言比对。
+        self.excludes: list[tuple[str, ...]] = []
         self._on_call = on_call
 
-    def run_once(self, *, limit: int = 50):
+    def run_once(self, *, limit: int = 50, exclude=()):
         self.calls.append(limit)
+        self.excludes.append(tuple(exclude))
         if self._on_call is not None:
             self._on_call()
         if not self._queue:
@@ -352,6 +359,86 @@ class PublishFaceTest(unittest.TestCase):
         self.assertEqual(report.attempts, 2)
         self.assertEqual(report.published, 1)
         self.assertEqual(report.reclaimed, 2)
+
+    def test_the_round_carries_the_claimed_ledger_across_the_one_by_one_calls(self) -> None:
+        """**一轮的边界在职责这一层**（Epic C 冻结缺陷 F2）。
+
+        发布面是 ``run_once(limit=1)`` × N 的形状，每次调用都是全新一次——执行器自己
+        那个本轮集合每次只装得下一个元素，等于没有。因此累积的已认领清单必须由职责
+        传下去，"一条意图一轮最多认领一次"才在**生产形态**下成立。
+
+        这条断言会在有人把 ``exclude=tuple(claimed)`` 改回 ``run_once(limit=1)`` 时变红。
+        """
+
+        duty, parts = build_duty(
+            executor=FakeExecutor(
+                FakeAttempt(published=False, outbox_id="pob_1"),
+                FakeAttempt(published=False, outbox_id="pob_2"),
+            ),
+        )
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["executor"].excludes,
+            [(), ("pob_1",), ("pob_1", "pob_2")],
+            "本轮已认领的清单必须逐条累积着传下去",
+        )
+
+    def test_the_round_does_not_swallow_an_executor_failure(self) -> None:
+        """**发布面不得把执行器异常吞掉**（Epic C 冻结重验的存活变异 S）。
+
+        F2 的「一轮最多认领一次」靠的是本轮已认领清单一路传下去。今天它成立还额外
+        依赖一个事实：执行器抛异常时整轮当场结束，没有"跳过这条、继续认领下一条"
+        的分支——所以清单在异常路径上有没有记全并不影响结果。
+
+        风险在于**紧挨着的就绪面正是 ``try/except`` 逐条隔离的形状**，而本模块自己的
+        文档也写着"一个人的失败不得带走整轮"。哪天有人照着把发布面也改成吞掉异常
+        继续下一条，那条刚失败、清单里又没记上的意图就会在同一轮里被立刻重认领——
+        F2 静默复活，而在此之前没有任何用例会变红。
+
+        这条断言把"异常照常冒出去"钉成契约：要改成逐条隔离，就必须同时想清楚清单
+        在异常路径上怎么记，而不是悄悄退回原缺陷。
+        """
+
+        boom = RuntimeError("外部发布失败")
+
+        def explode() -> None:
+            raise boom
+
+        duty, parts = build_duty(
+            executor=FakeExecutor(
+                FakeAttempt(published=False, outbox_id="pob_1"),
+                on_call=explode,
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            duty.run_once()
+
+        self.assertIs(caught.exception, boom, "执行器的异常必须原样冒出，不被折算或吞掉")
+        self.assertEqual(
+            parts["executor"].calls,
+            [1],
+            "整轮当场结束：不得在异常之后继续认领下一条",
+        )
+
+    def test_the_claimed_ledger_does_not_leak_into_the_next_round(self) -> None:
+        """否定断言：清单**每轮新建**。跨轮持有会让一条意图在这个进程里再也轮不到，
+        那比原缺陷更糟——重试将永远不会发生。"""
+
+        duty, parts = build_duty(
+            executor=FakeExecutor(
+                FakeAttempt(published=False, outbox_id="pob_1"),
+                FakeAttempt(published=False, outbox_id="pob_1"),
+            ),
+        )
+
+        duty.run_once()
+        parts["executor"].excludes.clear()
+        duty.run_once()
+
+        self.assertEqual(parts["executor"].excludes[0], (), "新一轮从空清单开始")
 
     def test_the_readiness_sweep_asks_for_its_own_budget(self) -> None:
         duty, parts = build_duty()
