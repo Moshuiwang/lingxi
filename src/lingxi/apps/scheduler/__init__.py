@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**六个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**七个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -9,9 +9,16 @@
 3. **空闲会话到点清理**（:class:`IdleConversationSweepDuty`）——会话空闲满两小时
    由 scheduler 周期扫描并主动清除已送达的投递正文，不依赖下一次任务入队
    （Issue #151、2026-08-14 补充决定、`V-投递-10`）；
-4. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天（UTC 日界）
+4. **权限链九十天到期清理**（:class:`PermissionRetentionSweepDuty`）——擦掉
+   ``publish_outbox`` 到期的内容快照（里面有邮箱与姓名）、删掉 ``mcp_sync_check``
+   的到期行。两个应用层方法随 Issue #156 的 S-C-01/S-C-02 一起交付，但**当时没有接
+   任何生产调用方**（Epic C 冻结缺陷 F1，与 #151 空闲会话清理是同一个形状的缺陷）：
+   跑满九十天后含个人数据的行会原样留存，而文档已经在以现在时描述它在跑。
+   本职责是这两条的调用点；判定记录那一面缺 MCP 令牌主密钥时不装配，内容擦除
+   那一面无条件运行。
+5. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天（UTC 日界）
    跑一轮：读一整轮花名册 → 更新持久快照或保留上一份 → 与建档存档三字段比对 →
-   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。第四个职责是
+   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。第五个职责是
    **条件注册**的，四个前置任缺其一就不注册，并留下一条指名原因的审计
    （断言 ``V-花名册-29``）：管理群 ID、花名册 Base ``app_token``、花名册
    ``table_id``（三者都是可选环境变量，见 :class:`SchedulerConfig`），以及花名册读取
@@ -27,10 +34,10 @@
    **代码层接上不等于真的读得到花名册**：真实读取所需的专用主体凭据自 2026-08-09 起
    未落盘（Issue #52 的 G-READ 判定），当前部署也还没配那三个变量，因此这条链在真实
    环境里一轮都没跑过。
-5. **每日权限重算**（:class:`~lingxi.apps.scheduler.permission_refresh.
+6. **每日权限重算**（:class:`~lingxi.apps.scheduler.permission_refresh.
    PermissionRefreshDuty`）——每天（UTC 日界）跑一轮：花名册快照必须是今天取的
    → 读当前有效银河批次 → 逐个已开通用户重算权限并排发布意图（Issue #156 的
-   S-C-03a）。第五个职责同样是**条件注册**的：缺 MCP 令牌主密钥就不注册，并留下
+   S-C-03a）。第六个职责同样是**条件注册**的：缺 MCP 令牌主密钥就不注册，并留下
    **恰一条**指名原因的审计。
 
    它排在花名册审计日报**之后**，而「先花名册、再银河重算」（`V-权限-07`）不只靠
@@ -39,13 +46,13 @@
    之后，这条判据**第一次有可能为真**：日报职责一旦注册并真的读到一轮花名册，快照就被换成
    本轮时刻那一份，同一轮里紧随其后的重算即可通过——在那之前它恒为假（供给写死 ``None``、
    日报根本不注册）。
-6. **权限发布与就绪确认**（:class:`~lingxi.apps.scheduler.permission_publish.
+7. **权限发布与就绪确认**（:class:`~lingxi.apps.scheduler.permission_publish.
    PermissionPublishDuty`）——**每轮**跑：收殓崩溃留下的在途意图 → 消费待发布意图
    （写权限表 + 逐字段读回核对）→ 对已发布的每一条按 tick 节奏推进一次就绪探针 →
    探针成功（或权限已清空）就给用户发一条范围变化通知（Issue #156 的 S-C-03b）。
    它是 S-C-01 那个发布执行器的**第一个生产调用方**。
 
-   第六个职责是**分两面条件注册**的：发布面缺权限表 Base / 表标识 / 令牌供给任一项
+   第七个职责是**分两面条件注册**的：发布面缺权限表 Base / 表标识 / 令牌供给任一项
    就整个不注册（**恰一条**审计）；就绪与通知那一面缺 MCP 令牌主密钥或问数 MCP 端点时
    **只有那一面不装配**（同样**恰一条**审计），发布面照常——发布不依赖探针。
 
@@ -67,8 +74,10 @@
 本模块只做组装：配置从环境变量来，轮换规则在
 :mod:`lingxi.core.identity.credentials`，存取在
 :mod:`lingxi.adapters.delegated_credentials`（宿主机文件保管，选项 A 决策），飞书调用在
-:mod:`lingxi.adapters.feishu_directory`，清理函数调用在
-:mod:`lingxi.adapters.retention`。
+:mod:`lingxi.adapters.feishu_directory`，受限清理函数调用在
+:mod:`lingxi.adapters.retention`，权限链两张表的应用层到期处置在
+:mod:`lingxi.adapters.postgres_permission_publish` 与
+:mod:`lingxi.adapters.postgres_mcp_token`。
 
 退出语义（断言 V-部署-03、V-保留-17）：收到 ``SIGTERM`` / ``SIGINT`` 后**停止领取
 新工作**，把已经领取的那一次做完，然后退出。半途中断一次轮换会留下一个"已经向飞书
@@ -815,6 +824,144 @@ class StructuredLogAuditSink:
         logger.info("审计 action=%s %s", action, rendered)
 
 
+class _ExpiredPayloadRedactor(Protocol):
+    """``publish_outbox`` 到期内容擦除的最小端口。实现是
+    :class:`lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore`。"""
+
+    def redact_expired_payloads(self) -> int: ...
+
+
+class _ExpiredCheckPurger(Protocol):
+    """``mcp_sync_check`` 到期整行删除的最小端口。实现是
+    :class:`lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore`。"""
+
+    def purge_expired_checks(self) -> int: ...
+
+
+@dataclass(frozen=True)
+class PermissionRetentionReport:
+    """一轮权限链到期处置的摘要。**只有计数与接线状态，没有任何行内容**。
+
+    与 :class:`~lingxi.adapters.retention.RetentionReport` 同一条纪律（断言
+    ``V-保留-14``）：进日志与审计的只能是"擦了几条、删了几行"，两个适配器方法的返回值
+    本来也只有条数。
+    """
+
+    #: 本轮被擦成 ``'{}'`` 的 ``publish_outbox.payload`` 条数。
+    redacted: int = 0
+    #: 本轮被删掉的 ``mcp_sync_check`` 行数。
+    purged: int = 0
+    #: 判定记录那一面这一轮有没有装配（缺 MCP 令牌主密钥时为 ``False``）。
+    checks_wired: bool = True
+
+    def audit_facts(self) -> dict[str, Any]:
+        return {
+            "redacted": self.redacted,
+            "purged": self.purged,
+            "checks_wired": self.checks_wired,
+        }
+
+
+class PermissionRetentionSweepDuty:
+    """权限发布链两张表的九十天到期内容处置职责：每轮各调用一次。
+
+    两张表的处置方式不同，因为它们**能擦的东西**不同：
+
+    - ``publish_outbox.payload`` 里有邮箱与姓名 → 擦成 ``'{}'``（
+      :meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
+      redact_expired_payloads`）。行本身留着——``user_id``、权限版本、状态与时间戳是
+      "谁的哪一版权限什么时候发布成功过"这类运行事实。
+    - ``mcp_sync_check`` **没有可识别内容列**（只有内部 ULID、权限版本、次序、时间、结论与
+      错误码），没有列可擦 → 删整行（
+      :meth:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.
+      purge_expired_checks`）。
+
+    到期判据在两个适配器方法自己的 SQL 里（各自的 ``content_expires_at``，由迁移
+    ``0064``/``0065`` 的触发器固定），本职责**一个条件都不加**：清理职责能扩大删除面的
+    唯一方式就是"顺手多删一点"，而多删掉的东西没有任何恢复路径。
+
+    **为什么是一个独立职责，而不是并进 :class:`RetentionCleanupDuty`**：后者的删除逻辑
+    整个在数据库里——迁移 ``0054`` 建的受限清理函数，属主是无登录角色
+    ``lingxi_retention_owner``，而适配器 :mod:`lingxi.adapters.retention` **一条 DELETE 都
+    不写**；"应用与 scheduler 角色即使误获普通 DELETE 也删不掉那些表"这条保障靠的正是
+    这条分工。本职责这两条是**应用层**语句（为什么它们没有进那个受限函数，理由在迁移
+    ``0064``/``0065`` 的文件头部），塞进那个适配器会让它模块文档第一句话当场不成立，
+    两套权限模型也会混进同一个返回摘要里。形状照 :class:`IdleConversationSweepDuty`
+    ——它是**同一个缺陷的先例**：#151 只交付了应用层清理方法、没有接任何生产调用方
+    （内审 P2-2），补救办法就是在这里给它一个每轮都会跑的调用点。
+
+    **每轮只调用一次，不循环到擦空 / 删空**（同 :class:`RetentionCleanupDuty` 的理由）：
+    一次调用就是一个数据库事务，因此没有半擦状态；积压由下一轮继续，两条都是幂等的
+    （断言 ``V-保留-10``），到期时间也不会因为处置迟到而后移（断言 ``V-保留-16``）。
+
+    **失败关闭**：任何一面抛异常都先留一条**只有异常类型**的审计，再原样上抛，由
+    :meth:`SchedulerLoop.run_once` 逐职责隔离。既不吞掉也不折成 0——一条被吞掉的异常会
+    让"到期内容一直没被处置"表现为每轮一条正常的完成审计，而保留违规最不该有的形态
+    就是它悄无声息。
+    """
+
+    name = "权限链到期清理"
+
+    def __init__(
+        self,
+        *,
+        outbox: _ExpiredPayloadRedactor,
+        checks: _ExpiredCheckPurger | None,
+        audit: AuditSink,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._outbox = outbox
+        self._checks = checks
+        self._audit = audit
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def checks_wired(self) -> bool:
+        return self._checks is not None
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> PermissionRetentionReport | None:
+        """已经在停止中就一条都不处置。返回 ``None`` 表示本轮未执行。"""
+
+        if self._stop.is_set():
+            return None
+        redacted = self._sweep("publish_outbox", self._outbox.redact_expired_payloads)
+        purged = 0
+        if self._checks is not None:
+            purged = self._sweep("mcp_sync_check", self._checks.purge_expired_checks)
+        report = PermissionRetentionReport(
+            redacted=redacted, purged=purged, checks_wired=self._checks is not None
+        )
+        self._audit.record("permission_retention.completed", **report.audit_facts())
+        if redacted or purged:
+            # 一轮什么都没到期时不打日志：这条职责每分钟跑一次。
+            logger.info(
+                "权限链到期清理：publish_outbox 擦除 %s 条内容快照，mcp_sync_check 删除 %s 行",
+                redacted,
+                purged,
+            )
+        return report
+
+    def _sweep(self, table: str, call: Callable[[], int]) -> int:
+        try:
+            return int(call())
+        except Exception as error:
+            # 只记表名与异常类型：异常正文可能带上被处置那一行的内容。
+            self._audit.record(
+                "permission_retention.sweep_failed",
+                table=table,
+                error=type(error).__name__,
+            )
+            logger.error("权限链到期清理失败 table=%s error=%s", table, type(error).__name__)
+            raise
+
+
 # _AlertSender/_PendingAlert/AlertDispatcher/AlertingDuty/_alert_utc 已迁移到
 # lingxi.core.alerting（Issue #153，见本文件顶部的导入）：gateway 与 worker 也
 # 需要装配同一套告警编排，三个 apps/<name> 互不 import，因此这段编排放进 core/
@@ -1334,6 +1481,68 @@ def _build_permission_refresh_duty(
     )
 
 
+def _build_permission_retention_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> PermissionRetentionSweepDuty:
+    """装配权限链到期清理职责。**它总是注册**，只有判定记录那一面按前置条件装配。
+
+    **``publish_outbox`` 那一面没有任何配置前置**：擦 ``payload`` 只需要数据库连接串，
+    而连接串是必需配置、进程起得来就一定有。这一面恰恰是带个人数据的那一面（邮箱与
+    姓名），因此它必须无条件跑起来——给一条纯粹是"擦自己库里的内容"的路径加一个能让它
+    不注册的开关，等于给保留上界加了一个可以被关掉的旁路。
+
+    **``mcp_sync_check`` 那一面的前置是 MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）：
+    唯一的读写口 :class:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 构造时
+    就要求一个**已经校验过主密钥**的加解密对象（它同时承载解密路径）。删过期行本身用不到
+    密钥，但绕过那个构造约束就得给这个调用点单开一个不校验密钥的口子——那正是该类刻意
+    拒绝的事（它对非 :class:`McpTokenCipher` 直接抛 ``TypeError``）。缺密钥时这一面**不装配**
+    并留下**恰一条**审计，形状照 :func:`_build_readiness_follow_up` 的探针那一面（缺项只报
+    变量名、不回显任何值——它还是一把主密钥），发布 outbox 那一面照常。
+
+    这条取舍的产品后果是可接受的、也已写明：``mcp_sync_check`` **没有可识别内容列**，
+    到期不删的后果是一张只含内部 ULID 与结论码的表继续变长；而真正含邮箱与姓名的
+    ``publish_outbox.payload`` 一轮都不会少擦。
+    """
+
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+
+    checks: Any = None
+    if config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+        from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+
+        checks = PostgresMcpTokenStore(
+            config.postgres_dsn,
+            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+            timeouts=config.postgres_timeouts,
+        )
+    else:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # **恰一条**审计：只关掉判定记录那一面，发布 outbox 的内容擦除照常。
+        audit.record(
+            "permission_retention.checks_not_wired",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，mcp_sync_check 的到期删除不装配；publish_outbox 的到期内容擦除照常运行",
+            MASTER_KEY_ENV,
+        )
+
+    return PermissionRetentionSweepDuty(
+        outbox=PostgresPermissionPublishStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        checks=checks,
+        audit=audit,
+        stop=stop,
+    )
+
+
 def _build_readiness_follow_up(
     config: SchedulerConfig,
     *,
@@ -1557,9 +1766,9 @@ def build_loop(
     """装配进程的全部定时职责。
 
     职责顺序有意为之：凭据轮换在前。它处理的是一次性有效、有硬期限的凭据，
-    而两类清理晚一轮都没有任何后果——到期行/空闲会话下一轮照清，到期时间不会
-    因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报与每日
-    权限重算排在两类清理之后：它们一天只做一次事，晚一轮毫无影响；而这两个之间的先后
+    而三类清理晚一轮都没有任何后果——到期行/空闲会话/到期内容快照下一轮照清，到期时间
+    不会因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报与每日
+    权限重算排在三类清理之后：它们一天只做一次事，晚一轮毫无影响；而这两个之间的先后
     **不是随意的**——权限重算要用今天那份花名册快照，而换快照的是审计日报那一轮
     （`V-权限-07`）。告警职责注册在**最后**（基线既有形状）：它汇总本轮观察到的信号，
     排在被观察者后面才看得到这一轮的事实。
@@ -1622,8 +1831,14 @@ def build_loop(
         idle_after=IDLE_CONVERSATION_SWEEP_AFTER,
         stop=stop,
     )
+    # 权限链到期清理与上面两类清理同组，排在它们之后、发布消费之前。位置的唯一含义是
+    # 同一轮内的先后：一条 payload 已经过期的意图应当先被擦成 ``'{}'``，再轮到发布面
+    # 认领它并以 ``invalid`` 失败关闭——反过来会让一份九十天前决定的权限在到期当轮还被
+    # 写进外部表格一次。晚一轮清理没有任何后果（到期时间不因清理迟到而后移，断言
+    # ``V-保留-16``）。
+    permission_retention = _build_permission_retention_duty(config, stop=stop, audit=sink)
 
-    duties: list[Any] = [rotation, cleanup, idle_sweep]
+    duties: list[Any] = [rotation, cleanup, idle_sweep, permission_retention]
     # 令牌供给：日报侧要令牌 → 持有者里有新鲜的就直接给，没有就让**凭据轮换职责**
     # 按需换一次（每 UTC 日至多一次）。日报自己不碰一次性 refresh_token。
     supply = (

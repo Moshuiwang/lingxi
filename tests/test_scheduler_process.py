@@ -480,7 +480,10 @@ class BuildLoopTest(unittest.TestCase):
         `lingxi-scheduler` 进程装配。
 
         `build_loop` 是 `main()` 唯一的装配入口（本模块 `main` 内），因此这条断言
-        就是"新增的清理代码真的有调用方"的证据（空闲会话清理一节认领内审 P2-2）。
+        就是"新增的清理代码真的有调用方"的证据（空闲会话清理一节认领内审 P2-2；
+        权限链到期清理一节认领 Epic C 冻结缺陷 F1 —— 同一个形状的缺陷第二次发生：
+        `redact_expired_payloads` / `purge_expired_checks` 交付时同样零调用方，
+        逐条断言在 `tests/test_permission_retention_duty.py`）。
         """
         import tempfile
 
@@ -501,7 +504,8 @@ class BuildLoopTest(unittest.TestCase):
         loop = build_loop(config)
 
         self.assertEqual(
-            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+            [duty.name for duty in loop.duties],
+            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理"],
         )
         self.assertIsInstance(loop, SchedulerLoop)
         from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS
