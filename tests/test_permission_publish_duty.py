@@ -385,6 +385,44 @@ class PublishFaceTest(unittest.TestCase):
             "本轮已认领的清单必须逐条累积着传下去",
         )
 
+    def test_the_round_does_not_swallow_an_executor_failure(self) -> None:
+        """**发布面不得把执行器异常吞掉**（Epic C 冻结重验的存活变异 S）。
+
+        F2 的「一轮最多认领一次」靠的是本轮已认领清单一路传下去。今天它成立还额外
+        依赖一个事实：执行器抛异常时整轮当场结束，没有"跳过这条、继续认领下一条"
+        的分支——所以清单在异常路径上有没有记全并不影响结果。
+
+        风险在于**紧挨着的就绪面正是 ``try/except`` 逐条隔离的形状**，而本模块自己的
+        文档也写着"一个人的失败不得带走整轮"。哪天有人照着把发布面也改成吞掉异常
+        继续下一条，那条刚失败、清单里又没记上的意图就会在同一轮里被立刻重认领——
+        F2 静默复活，而在此之前没有任何用例会变红。
+
+        这条断言把"异常照常冒出去"钉成契约：要改成逐条隔离，就必须同时想清楚清单
+        在异常路径上怎么记，而不是悄悄退回原缺陷。
+        """
+
+        boom = RuntimeError("外部发布失败")
+
+        def explode() -> None:
+            raise boom
+
+        duty, parts = build_duty(
+            executor=FakeExecutor(
+                FakeAttempt(published=False, outbox_id="pob_1"),
+                on_call=explode,
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            duty.run_once()
+
+        self.assertIs(caught.exception, boom, "执行器的异常必须原样冒出，不被折算或吞掉")
+        self.assertEqual(
+            parts["executor"].calls,
+            [1],
+            "整轮当场结束：不得在异常之后继续认领下一条",
+        )
+
     def test_the_claimed_ledger_does_not_leak_into_the_next_round(self) -> None:
         """否定断言：清单**每轮新建**。跨轮持有会让一条意图在这个进程里再也轮不到，
         那比原缺陷更糟——重试将永远不会发生。"""
