@@ -202,6 +202,67 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertFalse(path.exists(), "被拒的保存不得写入密文")
         self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
 
+    def test_a_naive_consumption_moment_is_refused_before_any_io(self) -> None:
+        """频率上界的判据必须带时区（Issue #215）。
+
+        它按 **UTC 日**与日报的日界对齐；一个不带时区的时刻会被部署机器的本地时区
+        悄悄挪一天，而"挪一天"在这里的含义是多消费一次一次性凭据。守卫同样在文件锁与
+        连库之前，因此没有数据库的机器上也跑得动。
+        """
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "delegated-credential.enc"
+        vault = HostFileDelegatedCredentialVault(
+            self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
+        )
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, "")
+
+        with self.assertRaises(ValueError) as raised:
+            vault.save(
+                subject_open_id="ou_delegated_authorization_subject",
+                grant=grant,
+                refresh_consumed_at=datetime(2026, 8, 18, 9, 0),
+            )
+
+        self.assertIn("续期消费时刻必须是带时区的时间", str(raised.exception))
+        self.assertFalse(path.exists(), "被拒的保存不得写入密文")
+        self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
+
+
+class DerivedAccessTokenTest(unittest.TestCase):
+    """派生短期令牌的载体（Issue #215）：明文包在 SecretToken 里，寿命可以未知。"""
+
+    def test_the_plaintext_never_leaks_through_any_stringification(self) -> None:
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        token = DerivedAccessToken(SecretToken("fake-access-token-for-tests-only"), 7200)
+
+        for rendered in (repr(token), str(token), f"{token}", f"{token.token}"):
+            self.assertNotIn("fake-access-token-for-tests-only", rendered)
+
+    def test_a_bare_string_token_is_refused(self) -> None:
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        with self.assertRaises(TypeError):
+            DerivedAccessToken("fake-access-token-for-tests-only", 7200)  # type: ignore[arg-type]
+
+    def test_an_unknown_lifetime_is_allowed_but_a_broken_one_is_not(self) -> None:
+        """未知寿命是一种合法状态（飞书没给），但"给了一个说不通的值"不是。"""
+
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        self.assertFalse(DerivedAccessToken(SecretToken(FAKE_TOKEN)).lifetime_known)
+        self.assertTrue(DerivedAccessToken(SecretToken(FAKE_TOKEN), 1).lifetime_known)
+        for broken in (0, -1, True, 1.5, "7200"):
+            with self.subTest(lifetime=broken):
+                with self.assertRaises(ValueError):
+                    DerivedAccessToken(SecretToken(FAKE_TOKEN), broken)  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()

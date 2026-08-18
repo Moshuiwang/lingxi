@@ -371,6 +371,158 @@ class ConsumedCredentialTest(IdentityPostgresTestCase):
         self.assertFalse(self.path.exists())
 
 
+class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
+    """按需续期的两个新参数（Issue #215 主接线）在真库 + 真文件上的语义。
+
+    日报改成按日取一次派生短期令牌之后，凭据领取多了一条"还没到期也可以领"的路径。
+    它必须与频率上界**成对**出现，而上界的判据要落在凭据文件里——只有进程内的那一道，
+    崩溃重启循环每分钟就能绕过一次，而一次性令牌被高频消费正是 2026-08-08 那次事故
+    的形状（AGENTS.md 工作底线）。
+
+    认领断言：``V-身份-03``（凭据仍只以密文落盘、判据不含任何令牌值）、
+    ``V-身份-04``（被拒的领取不得让凭据进入不可恢复状态）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        import tempfile
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "delegated-credential.enc"
+        self.vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        # 刚发放：轮换点在 5.6 天之后，因此"到期领取"这条路径拿不到它。
+        self.issued_at = datetime.now(timezone.utc)
+
+    def _save(self, *, refresh_consumed_at: datetime | None = None, seconds: int = 7 * 24 * 3600) -> None:
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), seconds, "offline_access"),
+            issued_at=self.issued_at,
+            refresh_consumed_at=refresh_consumed_at,
+        )
+
+    def test_a_credential_that_is_not_due_yet_is_only_claimable_on_demand(self) -> None:
+        self._save()
+
+        self.assertIsNone(self.vault.claim_due(), "到期领取这条路径不受影响")
+        claimed = self.vault.claim_due(require_due=False)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.subject_open_id, DELEGATED_SUBJECT)
+
+    def test_a_second_claim_on_the_day_already_consumed_is_refused(self) -> None:
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        with self.assertRaises(RefreshAlreadyConsumedToday) as raised:
+            self.vault.claim_due(require_due=False, refuse_if_consumed_on=moment.date())
+
+        self.assertNotIn(FAKE_TOKEN, str(raised.exception))
+
+    def test_a_refused_claim_leaves_the_credential_fully_usable(self) -> None:
+        """**上界判定必须在置位消费标记之前**。
+
+        反过来的话，每一次被拒的领取都会把凭据标成"消费中"——那等于每天亲手制造一次
+        凭据丢失，而它要到收殓超时之后才会被发现。变异验红锚点：把上界判定挪到
+        ``payload["consumed_at"] = ...`` 之后，本用例必须变红。
+        """
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        with self.assertRaises(RefreshAlreadyConsumedToday):
+            self.vault.claim_due(require_due=False, refuse_if_consumed_on=moment.date())
+
+        self.assertTrue(self.path.exists(), "被拒的领取不得删除凭据")
+        self.assertIsNotNone(self.vault.load(), "被拒的领取不得把凭据标成消费中")
+        self.assertIsNotNone(
+            self.vault.claim_due(require_due=False, refuse_if_consumed_on=moment.date() + timedelta(days=1)),
+            "换到下一天就该正常领得到",
+        )
+
+    def test_a_freshly_authorized_credential_is_not_blocked_by_the_ceiling(self) -> None:
+        """新授权与首次建立**不带**消费时刻：那不是一次续期消费。
+
+        刚做完人工重新授权就被上界挡住，会让运维在恢复之后还要再等一天。
+        """
+
+        self._save()
+
+        claimed = self.vault.claim_due(
+            require_due=False, refuse_if_consumed_on=datetime.now(timezone.utc).date()
+        )
+
+        self.assertIsNotNone(claimed)
+
+    def test_an_expired_credential_is_revoked_before_the_ceiling_is_consulted(self) -> None:
+        """失效优先于一切：一条已经失效的凭据要被清掉并要求重新授权，
+        而不是先报一句"今天已经换过了"把真正的问题盖住。"""
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment, seconds=3600)
+
+        later = moment + timedelta(seconds=3601)
+        try:
+            claimed = self.vault.claim_due(
+                require_due=False, refuse_if_consumed_on=later.date(), now=later
+            )
+        except RefreshAlreadyConsumedToday:  # pragma: no cover - 次序错了才会走到这里
+            self.fail("失效判定必须排在频率上界之前")
+
+        self.assertIsNone(claimed)
+        self.assertFalse(self.path.exists())
+
+    def test_the_consumption_day_survives_a_rotation_write(self) -> None:
+        """轮换写回时把新的消费时刻一起落盘：上界因此跟着最新那一代走。"""
+
+        first = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=first)
+        claimed = self.vault.claim_due(require_due=False)
+        self.assertIsNotNone(claimed)
+
+        second = first + timedelta(days=1)
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            issued_at=second,
+            replacing_generation=claimed.generation,
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+            refresh_consumed_at=second,
+        )
+
+        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+
+        with self.assertRaises(RefreshAlreadyConsumedToday):
+            self.vault.claim_due(require_due=False, refuse_if_consumed_on=second.date())
+        self.assertIsNotNone(
+            self.vault.claim_due(require_due=False, refuse_if_consumed_on=first.date()),
+            "旧的那一天不该再拦住新一代凭据",
+        )
+
+    def test_the_credential_file_still_carries_no_token_in_plaintext(self) -> None:
+        """`V-身份-03`：新增的判据是一个时刻，不是凭据；文件依然整体是密文。"""
+
+        moment = datetime.now(timezone.utc)
+        self._save(refresh_consumed_at=moment)
+
+        blob = self.path.read_bytes()
+        self.assertNotIn(FAKE_TOKEN.encode(), blob)
+        self.assertNotIn(b"refresh_consumed_at", blob)
+
+
 class CredentialGenerationGuardTest(IdentityPostgresTestCase):
     """终轮 Codex P1：轮换收尾必须世代匹配——期间的新授权不得被旧链覆盖或删除。"""
 
