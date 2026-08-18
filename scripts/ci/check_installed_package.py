@@ -131,6 +131,11 @@ REQUIRED_MODULES = (
     # 但载体本身必须在制品里，否则内容到位那天才发现 wheel 里没有加载它的代码。
     "lingxi.core.permission.metric_translation",
     "lingxi.adapters.company_function_metric_map_file",
+    # 权限发布表短期令牌供给的方向无关外壳（Issue #226 前置）：写入身份用哪个方向
+    # 待产品负责人裁定，因此**尚未**被任何进程 import——与
+    # `lingxi.core.identity.provisioning` 同一姿态（生产调用方未接线，仍随制品发布），
+    # 不在下面 PROCESS_RUNTIME_IMPORTS 的任何进程闭包里。
+    "lingxi.core.permission.table_access_token_supply",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.oauth_bridge_client",

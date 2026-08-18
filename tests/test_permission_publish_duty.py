@@ -1261,6 +1261,38 @@ class DutyRegistrationTest(unittest.TestCase):
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))
 
+    def test_a_direction_agnostic_provider_fits_the_same_injection_point(self) -> None:
+        """Issue #226 前置：无论最终方向是哪一个，令牌供给的形状都是
+        ``Callable[[], str]``——``PermissionTableAccessTokenProvider``
+        （:mod:`lingxi.core.permission.table_access_token_supply`）作为这个形状的
+        方向无关外壳，必须能原样替换掉裸 lambda，装配结果不变。"""
+
+        from lingxi.core.permission.table_access_token_supply import (
+            PermissionTableAccessTokenProvider,
+        )
+
+        audit = RecordingAudit()
+        supply = PermissionTableAccessTokenProvider(fetch=lambda: "u-fake-token")
+
+        loop = build_loop(
+            self._wired_config(
+                LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                LINGXI_QUERY_MCP_ENDPOINT="https://mcp.example.invalid/rpc",
+            ),
+            permission_table_access_token=supply,
+            audit=audit,
+        )
+
+        duties = {duty.name: duty for duty in loop.duties}
+        self.assertIn("权限发布与就绪确认", duties)
+        self.assertTrue(duties["权限发布与就绪确认"].publish_wired)
+        self.assertTrue(duties["权限发布与就绪确认"].readiness_wired)
+        self.assertEqual(
+            self._own_records(audit, "permission_publish."),
+            [],
+            "配了供给之后发布面不该再留任何未装配审计",
+        )
+
     def test_the_new_variables_are_registered_in_the_environment_key_list(self) -> None:
         for variable in (
             "LINGXI_PERMISSION_BITABLE_APP_TOKEN",
