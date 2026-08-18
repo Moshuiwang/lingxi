@@ -95,6 +95,11 @@ REQUIRED_MODULES = (
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
+    # 权限变化通知（Issue #156 / S-C-03b）：正文渲染与「有限重试 + 审计」的发送编排在
+    # core，向用户本人 open_id 的主动发送在 adapters。两者都有生产调用方——
+    # `lingxi-scheduler` 的权限发布与就绪确认职责（见下面 PROCESS_RUNTIME_IMPORTS）。
+    "lingxi.core.permission.notification",
+    "lingxi.adapters.feishu_user_message",
     # 每日权限重算（Issue #156 / S-C-03a）：按当前有效批次读回银河快照的适配器。
     # 与上面两组不同，它**已经有生产调用方**——`lingxi-scheduler` 的每日权限重算职责
     # （见下面 PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。
@@ -130,6 +135,8 @@ REQUIRED_MODULES = (
     # 每日权限重算职责（Issue #156 / S-C-03a）。它由 `build_loop` 在**模块级**
     # import，因此漏登记会直接让 scheduler 起不来；仍然逐项写出来，理由同上一条。
     "lingxi.apps.scheduler.permission_refresh",
+    # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
+    "lingxi.apps.scheduler.permission_publish",
     # 正式重授权是 scheduler 镜像里的**一次性**运维 job；scripts/ 被 .dockerignore
     # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
     "lingxi.apps.reauthorize",
@@ -241,6 +248,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission` 整组、发布 outbox 与令牌读取口都进了 scheduler 的运行时
             # 闭包。这是它们**第一次**有真实进程调用方，此前只随制品发布。
             "lingxi.apps.scheduler.permission_refresh",
+            # 权限发布消费与就绪确认（Issue #156 / S-C-03b）：它把 S-C-01 的发布执行器、
+            # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
+            # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
+            "lingxi.apps.scheduler.permission_publish",
+            "lingxi.adapters.feishu_permission_bitable",
+            "lingxi.adapters.feishu_user_message",
+            "lingxi.adapters.query_mcp_probe",
+            "lingxi.core.permission.notification",
             "lingxi.adapters.postgres_galaxy_snapshot",
             "lingxi.adapters.galaxy_import",
             "lingxi.adapters.postgres_permission_publish",

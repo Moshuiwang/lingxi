@@ -24,17 +24,44 @@
 并留一条 ``permission_refresh.skipped_roster_not_fresh``。**不提供任何旁路开关**：
 一个"允许用旧花名册重算"的环境变量，会在第一次运维着急时被打开，然后再也不会被关上。
 
-## 撤权：本切片只跳过，不实现产品语义
+## 撤权：**保行、清空 ``permissions``**，且只对"我们发布过的人"发
 
-聚合结果 ``not granted``（银河账号匹配不上、角色全部未映射、解释不出公司范围、银河
-记录不完整……）时，本职责**跳过该用户**：不发布、不通知、不删除发布表里已有的行，
-只按可分辨的原因分类记一条审计并计数。
+产品负责人 2026-08-18 裁定 3（`V-权限-08` 的刷新侧，留痕见 Trace
+[#203](https://github.com/Moshuiwang/lingxi/issues/203) 的决策评论）：权限从有变无时，
+发布表那一行**留着**、``permissions`` 写成空对象、``status`` 不动、``token_cipher``
+不碰。落点是 :func:`~lingxi.core.permission.publish_row.build_revocation_row`，它产出的
+行只有六个字段，因此走的必然是更新路径。
 
-**"权限被收回时那一行发布行该怎么处置"属 `V-权限-08` 的刷新侧语义，尚待产品负责人
-裁定**（登记在 Trace [#203](https://github.com/Moshuiwang/lingxi/issues/203)）。可选项
-至少有三种——把 ``status`` 改成停用、把 ``permissions`` 清空、整行删除——它们对既有
-26 行旧系统记录的影响各不相同，且都不可逆。在裁定之前，**什么都不做**是唯一不会造成
-不可恢复外部副作用的选择。
+本职责在它之上还有**两条边界**，都是刻意的：
+
+1. **只有在发布链上留下过足迹的用户才发撤权更新**（判据
+   :meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
+   has_publish_footprint`：发布成功过，**或**当前还有 ``pending``/``publishing`` 的意图
+   在途）。"在途也算"这一半是二级审查 N7 抓到的时间线要求的：昨天排的授权意图还堵在
+   ``pending``、今天这个人被撤权时若跳过，等发布面消费积压时**已经被收回的范围**会被
+   写进外部表并触发一条"范围已更新"通知；把它算进来之后，撤权决定推进版本，旧意图被
+   认领时判 ``SUPERSEDED``（一次外部调用都不发），撤权意图自身在外部无行时以
+   ``missing_token_cipher`` 失败关闭——两条路的方向都安全。
+
+   **在发布链上一点足迹都没有的人照旧跳过**：为他新建一行空权限没有意义——问数 MCP 对
+   查无此人本来就默认拒绝——而新建还需要一份令牌密文，等于替"存量用户令牌归属"那个待
+   裁定的产品结做了决定。既有 26 行那些旧系统写的人也落在这一路：硬切之前他们的撤权由
+   旧系统负责（同一条裁定的时效边界）。审计原因分类
+   :data:`SKIP_NO_PUBLISHED_ROW` 让这一路可分辨。
+2. **只有聚合层明确判定"无可用权限"才算撤权**（``no_galaxy_roles`` /
+   ``no_supported_function`` / ``no_company_scope``）。**匹配阶段的失败仍然只跳过**
+   （``roster_not_found``、``key_conflict``、``roster_multiple_rows`` …）：那些说的是
+   "我们认不出这个人是谁"，不是"银河说他没有权限"。据一次花名册歧义或数据陈旧去清空
+   一个人的权限，方向与花名册那一侧的既定口径正好相反——那边对"花名册查无此人"的处置
+   是**仅提示、不做任何自动处置**（``roster.note.removed``），由管理员在日报里判断。
+
+幂等由 :meth:`~lingxi.adapters.postgres_permission_publish.
+PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：第二天仍然无权限时，
+撤权行与上一条意图逐字段相同 → ``UNCHANGED``，不推进版本、不排新意图、不重复写外部表。
+权限恢复时则是一次普通的六字段更新，**不重建行**。
+
+**本职责仍然不通知**：通知的触发点在发布读回一致（撤权）或就绪探针成功（增权）之后，
+属 :mod:`lingxi.apps.scheduler.permission_publish`。这里连一个发送端口都没有。
 
 ## 令牌：只读既有，绝不签发
 
@@ -76,7 +103,11 @@ from typing import Any, Protocol
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
-from lingxi.core.permission.publish_row import aggregate_permission, build_publish_row
+from lingxi.core.permission.publish_row import (
+    aggregate_permission,
+    build_publish_row,
+    build_revocation_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +116,11 @@ _UTC = timezone.utc
 #: 写进发布意图 ``reason`` 列的原因码。它回答"这条意图是谁排的"，与首次开通那条
 #: （``first_onboarding``）区分开，让运维能一眼看出某次外部写入来自每日刷新。
 PERMISSION_REFRESH_REASON = "daily_permission_refresh"
+
+#: 撤权更新那一条意图的 ``reason``。与授权刷新分开是为了让"这次外部写入是去清空权限的"
+#: 在 outbox 里一眼可辨——两者的 payload 差别只有 ``permissions`` 一列的内容，
+#: 靠肉眼比对 JSON 文本来分辨一次不可逆的外部写入，不是可接受的运维姿态。
+PERMISSION_REVOKE_REASON = "daily_permission_revoke"
 
 # ---- 跳过原因码。全部是**固定字面量**，不含任何字段值 -----------------------
 #: 花名册快照压根不存在。
@@ -97,6 +133,8 @@ SKIP_NO_GALAXY_BATCH = "no_galaxy_batch"
 SKIP_MISSING_PERSONNEL_ID = "missing_personnel_id"
 #: 已开通用户的存档缺邮箱或姓名：发布行的 ``record_key``/``name`` 两列没有来源。
 SKIP_ARCHIVED_IDENTITY_INCOMPLETE = "archived_identity_incomplete"
+#: 撤权用户在发布表里**没有我们发布过的行**：不为他新建空权限行（模块文档「撤权」一节）。
+SKIP_NO_PUBLISHED_ROW = "no_published_row"
 
 #: 逐用户结果的三个分类。``granted`` 之外的两类都**不产生任何发布意图**。
 STAGE_MATCH = "match"
@@ -172,6 +210,19 @@ class _TokenCipherReader(Protocol):
     def token_cipher(self, user_id: str) -> str | None: ...
 
 
+class _PublishHistory(Protocol):
+    """「这个人在发布链上有没有留下过足迹」的只读口
+    （:meth:`~lingxi.adapters.postgres_permission_publish.
+    PostgresPermissionPublishStore.has_publish_footprint`）。
+
+    单独声明成一个只有一个方法的协议，理由与 :class:`_TokenCipherReader` 相同：
+    撤权那一路只需要回答"有没有"，把整个发布 outbox 的写侧摆在这里，等于让"顺手改一下
+    那条意图"在类型上变得可写。装配时传进来的确实是同一个存储对象。
+    """
+
+    def has_publish_footprint(self, user_id: str) -> bool: ...
+
+
 class _Decision(Protocol):
     enqueued: bool
 
@@ -202,8 +253,11 @@ class PermissionRefreshReport:
     examined: int = 0
     enqueued: int = 0
     unchanged: int = 0
-    # 聚合结果为"无可用权限"而被跳过的人数（匹配失败也算在内：它是无权限的一种）。
+    # 本轮判定为"无可用权限"的人数（匹配失败也算在内：它是无权限的一种）。
     revoked: int = 0
+    # 其中**真的排出了一条撤权更新意图**的人数（`V-权限-08` 的刷新侧）。它一定
+    # ≤ :attr:`revoked`：匹配失败、从来没发布过、存档不全的那些人都只跳过。
+    revoked_published: int = 0
     # 输入不完整而被跳过的人数：存档缺人员 ID / 缺邮箱或姓名。
     incomplete: int = 0
     # 处理过程中抛异常的人数。一个人的异常不影响其余人（模块文档）。
@@ -227,6 +281,7 @@ class PermissionRefreshReport:
             "enqueued": self.enqueued,
             "unchanged": self.unchanged,
             "revoked": self.revoked,
+            "revoked_published": self.revoked_published,
             "incomplete": self.incomplete,
             "failed": self.failed,
         }
@@ -248,6 +303,7 @@ class _Tally:
     enqueued: int = 0
     unchanged: int = 0
     revoked: int = 0
+    revoked_published: int = 0
     incomplete: int = 0
     failed: int = 0
     reasons: dict[str, int] = field(default_factory=dict)
@@ -261,6 +317,7 @@ class _Tally:
             enqueued=self.enqueued,
             unchanged=self.unchanged,
             revoked=self.revoked,
+            revoked_published=self.revoked_published,
             incomplete=self.incomplete,
             failed=self.failed,
             interrupted=interrupted,
@@ -286,6 +343,7 @@ class PermissionRefreshDuty:
         roster_snapshot: _RosterSnapshotStore,
         galaxy: _GalaxySnapshotReader,
         decisions: _DecisionStore,
+        publish_history: _PublishHistory,
         token_ciphers: _TokenCipherReader,
         role_function_map: Mapping[str, str],
         audit: _AuditSink,
@@ -296,6 +354,7 @@ class PermissionRefreshDuty:
         self._roster_snapshot = roster_snapshot
         self._galaxy = galaxy
         self._decisions = decisions
+        self._publish_history = publish_history
         self._token_ciphers = token_ciphers
         self._role_function_map = role_function_map
         self._audit = audit
@@ -422,11 +481,12 @@ class PermissionRefreshDuty:
         # 摘要只有计数（`V-花名册-33` 的同一条纪律：日志流向排障、CI 输出与工单）。
         logger.info(
             "每日权限重算完成 已开通用户=%s 新发布意图=%s 无变化=%s 无可用权限=%s "
-            "输入不完整=%s 失败=%s",
+            "其中已排撤权=%s 输入不完整=%s 失败=%s",
             report.examined,
             report.enqueued,
             report.unchanged,
             report.revoked,
+            report.revoked_published,
             report.incomplete,
             report.failed,
         )
@@ -468,8 +528,8 @@ class PermissionRefreshDuty:
             role_function_map=self._role_function_map,
         )
         if not aggregate.granted:
-            # 撤权侧：**不发布、不通知、不删行**（模块文档「撤权」一节）。
-            self._skip(tally, identity, STAGE_AGGREGATE, aggregate.reason, revoked=True)
+            # 撤权侧：**保行清空**，且只对"我们发布过的人"发（模块文档「撤权」一节）。
+            self._revoke(tally, identity, aggregate.reason, now)
             return
 
         if not identity.email or not identity.display_name:
@@ -501,6 +561,74 @@ class PermissionRefreshDuty:
             # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
             # 不排新意图——判定在 ``record_decision`` 里，本职责只如实计数。
             tally.unchanged += 1
+
+    def _revoke(
+        self,
+        tally: _Tally,
+        identity: ArchivedIdentity,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """银河侧明确判定这个人现在没有可用权限：该清空的清空，该跳过的跳过。
+
+        三条出口按次序判，**每一条都显式返回**，不落到默认分支：
+
+        1. **存档缺邮箱或姓名** → 跳过。撤权行的 ``record_key``/``email``/``name``
+           三列同样来自存档身份，缺了就没有"这一行是谁的"的答案。这一步在查库之前，
+           因为它不需要查库。
+        2. **在发布链上一点足迹都没有**（既没发布成功过、也没有在途意图）→ 跳过
+           （:data:`SKIP_NO_PUBLISHED_ROW`）。理由见模块文档「撤权」一节：不为一个
+           没有发布行的人新建一行空权限。
+        3. 否则结算撤权行并落一次权限决定。是否真的排出新意图由
+           ``record_decision`` 的内容比对决定——第二天仍然无权限时判 ``UNCHANGED``，
+           因此撤权**不会每天重发一次**。
+        """
+
+        tally.revoked += 1
+        tally.count(reason)
+        if not identity.email or not identity.display_name:
+            tally.count(SKIP_ARCHIVED_IDENTITY_INCOMPLETE)
+            self._audit.record(
+                "permission_refresh.user_skipped",
+                user=identity.app_user_id,
+                stage=STAGE_IDENTITY,
+                reason=SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
+            )
+            return
+        if not self._publish_history.has_publish_footprint(identity.app_user_id):
+            tally.count(SKIP_NO_PUBLISHED_ROW)
+            self._audit.record(
+                "permission_refresh.user_skipped",
+                user=identity.app_user_id,
+                stage=STAGE_AGGREGATE,
+                reason=reason,
+                revocation=SKIP_NO_PUBLISHED_ROW,
+            )
+            return
+
+        row = build_revocation_row(
+            email=identity.email,
+            display_name=identity.display_name,
+            decided_at=now,
+        )
+        decision = self._decisions.record_decision(
+            user_id=identity.app_user_id,
+            row=row,
+            reason=PERMISSION_REVOKE_REASON,
+            decided_at=now,
+        )
+        if decision.enqueued:
+            tally.enqueued += 1
+            tally.revoked_published += 1
+        else:
+            # 上一条意图已经是同一份空权限：不推进版本、不排新意图。
+            tally.unchanged += 1
+        self._audit.record(
+            "permission_refresh.user_revoked",
+            user=identity.app_user_id,
+            reason=reason,
+            enqueued=decision.enqueued,
+        )
 
     def _skip(
         self,
@@ -561,6 +689,8 @@ class PermissionRefreshDuty:
 
 __all__ = [
     "PERMISSION_REFRESH_REASON",
+    "PERMISSION_REVOKE_REASON",
     "PermissionRefreshDuty",
     "PermissionRefreshReport",
+    "SKIP_NO_PUBLISHED_ROW",
 ]

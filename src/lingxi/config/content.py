@@ -101,6 +101,12 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "roster.snapshot_reason.failed_definite",
     "roster.snapshot_reason.failed_indeterminate",
     "roster.snapshot_reason.unknown",
+    # 权限变化通知（Issue #156 / S-C-03b）。前两条的**逐字文案由产品负责人 2026-08-18
+    # 批准**（留痕见 Trace #203 的决策评论）；第三条是通配公司范围的展示词，批准文案的
+    # `{company_name}` 位在「全非」通配下需要一个可读取值，不能把 `*` 直接给用户看。
+    "permission.range_updated",
+    "permission.range_revoked",
+    "permission.all_companies",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

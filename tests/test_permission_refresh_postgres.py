@@ -1,7 +1,7 @@
-"""每日权限重算的真库断言（Issue #156 / S-C-03a）。
+"""每日权限重算的真库断言（Issue #156 / S-C-03a，S-C-03b 补上撤权侧）。
 
-**不认领任何 `V-*` 断言**（理由见 ``tests/test_permission_refresh_duty.py`` 的模块文档）。
-这里放的是**只有真库能证伪**的那几条：
+与 ``tests/test_permission_refresh_duty.py`` 一同承担 `V-权限-08` 的刷新侧
+（撤权 = 保行清空、幂等、不碰密文）。这里放的是**只有真库能证伪**的那几条：
 
 1. **遍历口径**：``provisioning_state``/``account_state`` 的过滤写在 SQL 里，因此
    guest、matching、deleting、deleted 四个否定样本**一条发布意图都不产生**。在假
@@ -35,6 +35,29 @@ from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublis
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 from lingxi.apps.scheduler.permission_refresh import PermissionRefreshDuty
+from lingxi.core.permission.publish import (
+    STATUS_PUBLISHED,
+    PublishAttempt,
+    PublishOutcome,
+    publish_claim,
+)
+
+
+class _ExplodingTransport:
+    """任何一次外部调用都算断言失败：用来证明 ``SUPERSEDED`` **一次调用都不发**。"""
+
+    def find_rows(self, *, record_key: str, email: str):  # pragma: no cover - 调用即失败
+        raise AssertionError("过期意图不得发起任何外部调用")
+
+    def create_row(self, fields):  # pragma: no cover - 调用即失败
+        raise AssertionError("过期意图不得新建行")
+
+    def update_row(self, record_id, fields):  # pragma: no cover - 调用即失败
+        raise AssertionError("过期意图不得更新行")
+
+    def read_row(self, record_id):  # pragma: no cover - 调用即失败
+        raise AssertionError("过期意图不得读回")
+
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 
@@ -223,11 +246,13 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
         return PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
 
     def _duty(self) -> PermissionRefreshDuty:
+        publish_store = PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
             baseline_reader=PostgresRosterBaselineReader(self._dsn),
             roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
             galaxy=PostgresGalaxySnapshotReader(self._dsn),
-            decisions=PostgresPermissionPublishStore(self._dsn),
+            decisions=publish_store,
+            publish_history=publish_store,
             token_ciphers=self._token_store(),
             role_function_map=ROLE_FUNCTION_MAP,
             audit=self.audit,
@@ -246,6 +271,15 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
     def _payload(self, user_id: str) -> dict:
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT payload FROM publish_outbox WHERE user_id = %s", (user_id,))
+            return dict(cursor.fetchone()[0])
+
+    def _latest_payload(self, user_id: str) -> dict:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT payload FROM publish_outbox
+                    WHERE user_id = %s ORDER BY permission_version DESC LIMIT 1""",
+                (user_id,),
+            )
             return dict(cursor.fetchone()[0])
 
     def _version(self, user_id: str) -> int:
@@ -385,7 +419,126 @@ class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):
 
 
 class RevokedUserTest(PermissionRefreshPostgresTestCase):
-    """否定断言：撤权用户零发布意图，且发布表侧一行都不动。"""
+    """`V-权限-08` 刷新侧：**从无发布行的人零意图**；有发布行的人得到一条清空更新。
+
+    只有真库能证伪的那半边：撤权的**幂等**（第二天仍然无权限时判 ``UNCHANGED``、
+    不推进版本、不排第二条意图）落在 ``record_decision`` 的事务与内容比对里，
+    假 store 替不了。
+    """
+
+    def _publish_current_intent(self) -> None:
+        """把当前这条 pending 意图推到 ``published``，模拟"我们发布成功过"。"""
+
+        store = PostgresPermissionPublishStore(self._dsn)
+        claimed = store.claim_next()
+        assert claimed is not None
+        store.complete(
+            PublishAttempt(
+                outcome=PublishOutcome.PUBLISHED,
+                outbox_id=claimed.outbox_id,
+                user_id=claimed.user_id,
+                permission_version=claimed.permission_version,
+                attempts=claimed.attempts,
+                action="create",
+                external_record_id="rec_fake",
+            ),
+            status=STATUS_PUBLISHED,
+        )
+
+    def _drop_roles(self) -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM galaxy_user_role WHERE user_id = %s",
+                (f"G-{EMPLOYEE[ACTIVE_USER]}",),
+            )
+
+    def test_a_revoked_user_with_a_published_row_gets_an_empty_permissions_intent(self) -> None:
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        duty = self._duty()
+        duty.run_once()
+        self._publish_current_intent()
+        self._drop_roles()
+
+        # 第二天再跑一轮：这一次聚合是「无可用权限」。
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        report = self._duty().run_once()
+
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.revoked_published, 1)
+        self.assertEqual(self._version(ACTIVE_USER), 2, "撤权是一次新的权限决定")
+        reasons = [reason for _user, _version, reason in self._outbox()]
+        self.assertIn("daily_permission_revoke", reasons)
+        payload = self._latest_payload(ACTIVE_USER)
+        self.assertEqual(payload["permissions"], "{}")
+        self.assertEqual(payload["status"], "approved")
+        self.assertNotIn("token_cipher", payload, "撤权快照只有六个字段，密文一个字不动")
+
+    def test_repeating_the_revocation_changes_nothing(self) -> None:
+        """幂等：第二次撤权判 ``UNCHANGED``，不推进版本、不排第二条意图。"""
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        self._duty().run_once()
+        self._publish_current_intent()
+        self._drop_roles()
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        self._duty().run_once()
+        before = self._version(ACTIVE_USER)
+        intents_before = len(self._outbox())
+
+        self.clock.moment = NOW + timedelta(days=2)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        report = self._duty().run_once()
+
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.revoked_published, 0)
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(self._version(ACTIVE_USER), before, "重复撤权不推进版本")
+        self.assertEqual(len(self._outbox()), intents_before, "重复撤权不排第二条意图")
+
+    def test_a_revocation_supersedes_an_in_flight_grant(self) -> None:
+        """N7 的时间线：**在途的旧授权意图必须被撤权决定 supersede 掉**。
+
+        场景：昨天排的 granted 意图还堵在 ``pending``（发布面当天没跑通），今天这个人
+        在银河被撤权。若撤权因为"还没发布成功过"而跳过，等发布面消费积压时，那份
+        **已经被收回的范围**会被写进外部表并触发一条"范围已更新"通知。
+
+        算进足迹之后：撤权决定推进版本 → 旧意图被认领时 ``current_permission_version``
+        更大 → 判 ``SUPERSEDED``，**一次外部调用都不发**。
+        """
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        self._duty().run_once()  # 排出 v1（granted），**故意不发布**
+        self.assertEqual(self._version(ACTIVE_USER), 1)
+        self._drop_roles()
+
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        report = self._duty().run_once()
+
+        self.assertEqual(report.revoked_published, 1, "在途也算足迹，撤权照排")
+        self.assertEqual(self._version(ACTIVE_USER), 2)
+
+        # 旧的那条 granted 意图现在被认领时应当直接判过期，不做任何外部写入。
+        store = PostgresPermissionPublishStore(self._dsn)
+        claimed = store.claim_next()
+        assert claimed is not None
+        self.assertEqual(claimed.permission_version, 1)
+        self.assertEqual(
+            claimed.current_permission_version, 2, "认领时看到的当前版本已经是撤权那一版"
+        )
+        attempt = publish_claim(claimed, transport=_ExplodingTransport())
+        self.assertEqual(attempt.outcome, PublishOutcome.SUPERSEDED)
 
     def test_a_user_whose_galaxy_roles_vanish_is_only_skipped(self) -> None:
         self._insert_users()

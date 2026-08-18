@@ -31,10 +31,11 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
+from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
     ClaimedPublish,
     PublishAttempt,
@@ -80,6 +81,21 @@ class PermissionDecision:
     @property
     def enqueued(self) -> bool:
         return self.outcome is DecisionOutcome.ENQUEUED
+
+
+@dataclass(frozen=True)
+class PendingReadiness:
+    """一条已经发布读回一致、但就绪确认还没收口的意图（S-C-03b 的每轮 tick 输入）。
+
+    ``permissions`` 是**当初决定发布、并且已经逐字段读回核对过**的那一串文本。就绪判定
+    的 ``no_permission`` 分支与通知正文都只认它，因此这条链上不存在"通知说的范围"与
+    "消费方读到的范围"来自两次不同计算的可能。
+    """
+
+    user_id: str
+    permission_version: int
+    permissions: str
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +485,195 @@ class PostgresPermissionPublishStore:
         if redacted:
             logger.info("发布意图内容已到期擦除 条数=%s", redacted)
         return redacted
+
+    # ------------------------------------------------------------------
+    # 发布之后：该给谁做就绪确认、该给谁发通知
+    # ------------------------------------------------------------------
+
+    def published_awaiting_readiness(
+        self,
+        *,
+        reasons: Sequence[str],
+        interval_seconds: int,
+        budget_seconds: int,
+        limit: int = 50,
+    ) -> tuple[PendingReadiness, ...]:
+        """取「已经发布读回一致、但就绪确认还没收口」的那些 ``(用户, 权限版本)``。
+
+        这是 S-C-03b 的调度职责每轮 tick 的输入（见
+        :mod:`lingxi.apps.scheduler.permission_publish`）。
+
+        **``reasons`` 是必填的**：调用方必须说清"我负责确认哪一类意图"。它挡的不是数据
+        错误，而是**两个编排者抢同一条意图**——首次开通那条链（``first_onboarding``，
+        Epic D 的 ``OnboardingRunner``）自己会做就绪确认并发"开通完成"，如果每日刷新
+        这一侧也把它捞起来确认一遍，用户会在"开通完成"之外再收到一条措辞完全不同的
+        "可用范围已更新"，而且两个确认还会对同一个 ``(用户, 权限版本)`` 并发探针。
+        做成必填而不是给一个默认值：默认值会在新增一种 ``reason`` 时**静默地**把它归给
+        某一方，而那正是需要有人明确决定的事。
+
+        **只取"这一轮真的该动"的那些**（二级审查 N3）。``interval_seconds`` /
+        ``budget_seconds`` 由调用方从就绪节奏传进来，本方法据此算出"下一次探针什么时候
+        到期"并只返回已经到期的行，**还没探过的排在最前面**。少了这一条，``LIMIT`` 窗口
+        会被一批"要等三分钟才到期"的候选长期占满：新发布的那一条永远挤不进来，于是合同
+        要求的"发布读回一致后立即探一次"名存实亡，收口时间也没有上界。到期时刻的算法与
+        :func:`lingxi.core.permission.mcp_readiness.next_probe_due` 必须一致
+        （``起点 + 已判定次数 × 间隔``，并以预算封顶——封顶那一步让"计划表已经用尽却
+        还没收口"的那种行立刻被取回来收口，而不是再等一个间隔）。
+
+        其余三条筛选各自都不能少：
+
+        1. ``status = 'published'``——**只有发布读回一致的那一版**才进入就绪确认与通知。
+           这条同时就是「撤权通知只在读回一致之后发」这条产品裁定在 SQL 里的落点：
+           一条还在 ``pending`` 的撤权意图取不到，也就发不出任何通知。
+        2. **该用户没有更新的意图**。权限在确认期间又变了时，旧的那一版不该再被确认、
+           更不该据它给用户发一条已经过时的范围通知；新的那一版会自己走一遍。
+        3. **没有终态就绪记录**（``ready`` / ``no_permission`` / ``timed_out``）。
+           终态是这条链**唯一**的"已经处理过"水位——它同时保证了同一次变化的通知只发
+           一次，不需要第二张表、也不需要在 outbox 上再加一列状态。
+
+        **本方法跨读 ``mcp_sync_check``（属 ``postgres_mcp_token`` 的表），是一处知情的
+        例外**：两张表同属"权限发布与就绪确认"这一个领域，本方法**只读**，而 ``mcp_sync_check``
+        的**写**仍然只有 ``postgres_mcp_token.record_attempt`` 一处。做成一条语句是必需
+        而不是省事——把第三条筛选挪到 Python 里做，就得先把"全部已发布的最新意图"取回来
+        再逐条过滤，于是已经确认完的人会一直占着取回窗口，当天靠后发布的那些人可能永远
+        排不进来（饿死），而这种缺陷在小数据量的用例里完全看不出来。
+
+        ``payload`` 过了九十天会被 :meth:`redact_expired_payloads` 擦成 ``'{}'``，
+        因此这里要求 ``payload`` 里确有 ``permissions`` 键：擦过的快照说不出"当时发布的
+        范围是什么"，据它渲染通知只会渲染出一句错话。
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        for label, value in (("轮询间隔", interval_seconds), ("总预算", budget_seconds)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{label}必须是正整数秒")
+        wanted = [str(item) for item in reasons if str(item).strip()]
+        if not wanted:
+            raise ValueError("必须指明本调用方负责确认哪些 reason 的发布意图")
+        terminal = sorted(item.value for item in TERMINAL_OUTCOMES)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT o.user_id, o.permission_version, o.payload ->> 'permissions',
+                          o.published_at
+                     FROM publish_outbox o
+                     LEFT JOIN LATERAL (
+                            SELECT count(*) AS attempts, min(c.started_at) AS first_started_at
+                              FROM mcp_sync_check c
+                             WHERE c.user_id = o.user_id
+                               AND c.permission_version = o.permission_version
+                          ) progress ON TRUE
+                    WHERE o.status = 'published'
+                      AND o.reason = ANY(%(reasons)s)
+                      AND o.payload ? 'permissions'
+                      AND NOT EXISTS (
+                            SELECT 1 FROM publish_outbox newer
+                             WHERE newer.user_id = o.user_id
+                               AND newer.permission_version > o.permission_version
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1 FROM mcp_sync_check c
+                             WHERE c.user_id = o.user_id
+                               AND c.permission_version = o.permission_version
+                               AND c.result = ANY(%(terminal)s)
+                          )
+                      AND (
+                            progress.attempts = 0
+                         OR progress.first_started_at + make_interval(
+                                secs => LEAST(
+                                    progress.attempts * %(interval)s, %(budget)s
+                                )::double precision
+                            ) <= now()
+                          )
+                    ORDER BY (progress.attempts > 0), o.published_at, o.id
+                    LIMIT %(limit)s""",
+                {
+                    "reasons": wanted,
+                    "terminal": terminal,
+                    "interval": interval_seconds,
+                    "budget": budget_seconds,
+                    "limit": limit,
+                },
+            )
+            rows = cursor.fetchall()
+        return tuple(
+            PendingReadiness(
+                user_id=str(row[0]),
+                permission_version=int(row[1]),
+                permissions=str(row[2]),
+                published_at=row[3],
+            )
+            for row in rows
+        )
+
+    def has_publish_footprint(self, user_id: str) -> bool:
+        """这个用户在发布链上**有没有留下过足迹**：发布成功过，**或**当前还有意图在途。
+
+        撤权那一侧的判据（`V-权限-08` 的刷新侧）。两半各自都不能少：
+
+        - ``published``：我们真的往发布表写成功过一行，那一行现在还在（我们不删行），
+          因此值得为他发一条把 ``permissions`` 清空的更新。
+        - ``pending`` / ``publishing``：**还有一条尚未落地的授权意图**。不把它算进来的话
+          （二级审查 N7 抓到的时间线）：昨天排的 granted 意图还堵在 pending，今天这个人
+          被撤权却因为"还没发布过"而跳过，等发布面把积压消费掉时，那份**已经被收回的
+          范围**会被写进外部表，还会触发一条"范围已更新"通知——最长多给一天权限。
+          算进来之后，撤权决定推进版本，旧意图被认领时判 ``SUPERSEDED``（**一次外部
+          调用都不发**），而撤权意图本身在外部无行时以 ``missing_token_cipher`` 失败
+          关闭——两条路的方向都是安全的。
+
+        反过来，**在发布链上一点足迹都没有**的人仍然跳过：为他新建一行空权限没有意义
+        （问数 MCP 对查无此人本来就默认拒绝），而新建还需要一份令牌密文。既有 26 行那些
+        旧系统写的人也落在这一路——硬切之前他们的撤权由旧系统负责（产品负责人 2026-08-18
+        裁定 3 的时效边界）。
+
+        ``failed`` / ``superseded`` **不算足迹**：前者说明那一版从来没有落到外部表，
+        后者已经被更新的版本取代。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("发布足迹判定必须指明用户")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM publish_outbox
+                    WHERE user_id = %s
+                      AND status IN ('published', 'pending', 'publishing')
+                    LIMIT 1""",
+                (user_id,),
+            )
+            return cursor.fetchone() is not None
+
+    def notice_recipient_open_id(self, user_id: str) -> str | None:
+        """权限变化通知发给谁：该用户的 ``feishu_open_id``；不该发就返回 ``None``。
+
+        **两条过滤是产品约束，不是编码习惯**，口径与花名册比对基线同源
+        （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）：
+
+        - ``provisioning_state = 'active'``：还没完成开通的人不该收到"你的可用范围已更新"；
+        - ``account_state NOT IN ('deleting','deleted')``：正在删除或已删除的账号一律不发。
+          删除编排会清空姓名等字段，给这样的账号发消息是数据范围外泄。
+
+        **为什么这条查询住在本模块**：这条链本来就在这里读 ``app_user``（权限版本），
+        而把它放进 ``postgres_identity`` 会把那个模块的建档写侧闭包（``provisioning`` /
+        ``org_snapshot`` / ``first_contact``）整个拉进 scheduler 镜像的依赖清单，
+        只为一次只读查询。本方法**只读一列**，不写、不改任何状态。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("通知收件人查询必须指明用户")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT feishu_open_id
+                     FROM app_user
+                    WHERE id = %s
+                      AND provisioning_state = 'active'
+                      AND account_state NOT IN ('deleting', 'deleted')""",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        open_id = str(row[0]).strip()
+        return open_id or None
 
     def load(self, outbox_id: str) -> StoredIntent | None:
         """回读一条意图。给运维排查与用例断言用，不在发布链路上。"""
