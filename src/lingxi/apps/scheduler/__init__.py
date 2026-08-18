@@ -141,6 +141,10 @@ from lingxi.core.permission.mcp_readiness import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
     ReadinessSchedule,
 )
+from lingxi.core.permission.table_access_token_supply import (
+    PermissionTableAccessTokenProvider,
+)
+from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 from lingxi.core.alerting import (
     AlertDispatcher,
     AlertingDuty,
@@ -1685,13 +1689,14 @@ def _build_permission_publish_duty(
 
     1. **权限发布 Base ``app_token``** 与 2. **表 ``table_id``**：写哪张表不能进代码，
        只从环境变量来。
-    3. **发布表读写所用的短期令牌供给**。花名册那条已由 Issue
-       [#215](https://github.com/Moshuiwang/lingxi/issues/215) 接上（凭据轮换职责按需派生、
-       进程内持有者转交），**这条还没有**：默认 ``None``，仍登记为 R3。理由没变——换取
-       令牌要消费专用授权主体那条**一次性** ``refresh_token``，而同一进程里的凭据轮换
-       职责是它唯一的合法消费者，两个消费者共用一条一次性令牌就是 2026-08-08 授权码被烧
-       那次事故的形状；而发布表在**另一个 Base** 上，是否由同一个授权主体读写还是一次
-       没做的产品决定。因此这里只留注入点，**不在这里现造一个**。
+    3. **发布表读写所用的短期令牌供给**。产品负责人 2026-08-18 就 Issue
+       [#226](https://github.com/Moshuiwang/lingxi/issues/226) 裁定方向 3（应用身份），
+       ``build_loop`` 因此**总能**建出一条默认供给（见 ``build_loop`` 文档）——``None``
+       现在的含义与花名册那条同一条（Issue #215 之后确立的口径）：**"调用方真的没有
+       交出任何供给"**，不再是"这条链还没接线"，正式装配路径不会走到这一分支。
+       ``permission_table_access_token_unwired`` 这条原因码因此仍然存在（供直接构造
+       本函数的测试与非默认调用方使用），但生产 `main()` → `build_loop` 这条路径上不再
+       触发。
 
     **缺发布面前置时职责仍然注册**，只要就绪/通知那一面装得起来：已经发布出去的那些
     权限还等着被确认、被通知，没有理由因为"暂时写不了新的一行"就把它们一起停掉。
@@ -1813,12 +1818,30 @@ def build_loop(
     "这个进程今天换过没有"的账本，跨进程共享会让上界失去意义；而重启也抹不掉的那道上界
     在凭据文件里（``refresh_consumed_at``）。
 
-    ``permission_table_access_token`` 是**权限发布表**读写所用的短期令牌供给，它**没有随
-    #215 一起接上**：默认仍是 ``None``，因此当前部署下权限发布面不注册（仍登记为 R3），
-    但发布 Base 与表标识、Outbox 消费、就绪确认与通知都已按配置装配。两条各留各的注入点
-    而不是共用一个参数：两张表在不同的 Base 上，将来完全可能由不同的授权主体读写，把它们
-    并成一个参数等于提前替那个决定做主——也正因为如此，花名册那条接上了不代表这条自动
-    就有，它要么复用同一个授权主体（那是一次还没做的产品决定），要么另有自己的主体。
+    ``permission_table_access_token`` 是**权限发布表**读写所用的短期令牌供给。
+    **默认不再是 ``None``**：产品负责人 2026-08-18 就 #226 裁定方向 3——用**应用身份**
+    （``tenant_access_token``）写入，理由是"没有凭据生命周期，不需要用户再点授权、
+    不会过期、不需要轮换"（同一天上午刚为专用授权凭据到期紧急处理过一次，再增加一条
+    会轮换的凭据是代价最高的选项）；已知代价（产品负责人已知情）：写入不绑定到某个
+    具体授权人，需要把应用加为该 Base 的协作者。因此这里建出一条进程内供给
+    （:class:`~lingxi.core.permission.table_access_token_supply.
+    PermissionTableAccessTokenProvider` 包住
+    :class:`~lingxi.core.permission.tenant_token_supply.TenantAccessTokenSupply`
+    包住 :class:`~lingxi.adapters.feishu_tenant_token.FeishuTenantTokenClient`），
+    换取用的 ``app_id``/``app_secret`` 就是 scheduler 本来就必需的应用配置——**零新增
+    凭据材料**，不新增任何环境变量、不需要产品负责人做任何新的授权动作。
+
+    ``None`` 现在的含义与 ``roster_access_token`` 同一条：**"用装配好的那条"**，不是
+    "没有供给"；调用方（主要是测试）传自己的实现即可替换。**两条各留各的注入点**：
+    权限发布表与花名册在不同的 Base 上，供给形状一样但来源不同——这条走应用身份，
+    花名册那条仍是 #215 的专用主体（未来若产品负责人改变权限表的裁定，只需要换这里
+    的默认构造，参数与装配点不用动）。
+
+    **本供给不放松 Issue #227 的翻译层硬闸**：翻译内容为空/不完整时，
+    ``permission_refresh`` 一条发布意图都不会排进 outbox，与这里的令牌供给完全独立
+    （防御纵深，见 ``docs/技术设计/验收矩阵.md`` 的 ``V-权限-13``）——接通这条供给只是
+    让"已经在 outbox 里的意图能不能被真正写出去"这件事有了一个真实的执行者，不代表
+    "outbox 里会不会出现内容"这件事发生了任何变化。
     """
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
@@ -1896,11 +1919,31 @@ def build_loop(
     # 发布消费排在每日重算**之后**：同一轮里重算先把当天的意图排进来，发布紧接着就能把
     # 它推出去，而不是白等一个调度周期。位置只保证同一轮内的先后；一条意图晚一轮被消费
     # 没有任何产品后果（outbox 本来就是异步的）。
+    #
+    # 权限发布表令牌供给：Issue #226 裁定方向 3（应用身份）。换取用的 app_id/app_secret
+    # 是 scheduler 本来就必需的应用配置，因此这里**总能**建出一条默认供给——不像花名册
+    # 那条依赖凭据轮换职责先跑起来，应用身份没有"还没轮换过一次"这种中间状态。
+    from lingxi.adapters.feishu_tenant_token import FeishuTenantTokenClient
+
+    permission_table_supply = (
+        permission_table_access_token
+        if permission_table_access_token is not None
+        else PermissionTableAccessTokenProvider(
+            fetch=TenantAccessTokenSupply(
+                fetch=FeishuTenantTokenClient(
+                    base_url=config.feishu_base_url,
+                    app_id=config.feishu_app_id,
+                    app_secret=config.feishu_app_secret,
+                ).fetch,
+            ),
+            audit=sink,
+        )
+    )
     permission_publish = _build_permission_publish_duty(
         config,
         stop=stop,
         audit=sink,
-        permission_table_access_token=permission_table_access_token,
+        permission_table_access_token=permission_table_supply,
     )
     if permission_publish is not None:
         duties.append(permission_publish)

@@ -131,11 +131,14 @@ REQUIRED_MODULES = (
     # 但载体本身必须在制品里，否则内容到位那天才发现 wheel 里没有加载它的代码。
     "lingxi.core.permission.metric_translation",
     "lingxi.adapters.company_function_metric_map_file",
-    # 权限发布表短期令牌供给的方向无关外壳（Issue #226 前置）：写入身份用哪个方向
-    # 待产品负责人裁定，因此**尚未**被任何进程 import——与
-    # `lingxi.core.identity.provisioning` 同一姿态（生产调用方未接线，仍随制品发布），
-    # 不在下面 PROCESS_RUNTIME_IMPORTS 的任何进程闭包里。
+    # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
+    # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
+    # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
+    # adapters 的 feishu_tenant_token；三个都由 `build_loop` 装配（见下面
+    # PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。
     "lingxi.core.permission.table_access_token_supply",
+    "lingxi.core.permission.tenant_token_supply",
+    "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.oauth_bridge_client",
@@ -283,6 +286,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 证明不了"这个模块装得上"）。
             "lingxi.core.permission.metric_translation",
             "lingxi.adapters.company_function_metric_map_file",
+            # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
+            # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
+            # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
+            "lingxi.core.permission.table_access_token_supply",
+            "lingxi.core.permission.tenant_token_supply",
+            "lingxi.adapters.feishu_tenant_token",
             "lingxi.core.permission",
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.galaxy_export",
