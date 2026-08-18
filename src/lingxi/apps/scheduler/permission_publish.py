@@ -68,6 +68,8 @@ published_awaiting_readiness` 的 SQL 就不再把它取回来。因此"这条�
   "这条变化通知过了"这个水位就落在 ``mcp_sync_check`` 上；**探针面**才要问数 MCP 端点。
   缺端点时撤权通知照常发（它本来就不探针），缺权限表令牌时已发布的那些照常推进确认。
   一个装了却每轮都炸的假探针会把"还没接线"伪装成"接线了但一直失败"，因此宁可不装。
+  **缺端点时候选查询也随之收窄成只取撤权那一类**，否则授权候选会把窗口占死、饿死撤权
+  通知（:data:`REVOKE_ONLY_REASONS`）。
 
 ## 单轮的两个上界
 
@@ -115,6 +117,19 @@ _UTC = timezone.utc
 #: 措辞完全不同的"可用范围已更新"，而且两个确认还会对同一个 ``(用户, 权限版本)``
 #: 并发发探针。新增一种 ``reason`` 时必须显式决定它归谁，不给默认归属。
 FOLLOW_UP_REASONS: tuple[str, ...] = (PERMISSION_REFRESH_REASON, PERMISSION_REVOKE_REASON)
+
+#: **探针未接线时**只认领撤权那一类（定向终核 Q1）。
+#:
+#: 缺了这条会饿死撤权通知：候选查询把"还没探过"的排在最前面，而 ``probe=None`` 时授权
+#: 候选每轮都只得到 ``None``——不落记录，于是**永远保持"还没探过"这个最高优先级**。
+#: 只要积压了 ``readiness_limit`` 条更早的授权候选，后发布的撤权行就再也进不了窗口，
+#: 而每一轮都在重复取回同一批毫无进展的候选。撤权通知本来就不依赖探针，把授权候选
+#: 整个排除在查询之外，它们就不再占用 ``LIMIT``；端点配好后它们自然回到窗口里
+#: （进度全在库里，一条都没丢）。
+#:
+#: ``ReadinessTicker`` 里那道"权限为空才走 no_permission"的防线**保留**：这里收窄的是
+#: 取哪些候选，不是放宽哪条能收口——一条 reason 写错的授权意图仍然探不出就绪。
+REVOKE_ONLY_REASONS: tuple[str, ...] = (PERMISSION_REVOKE_REASON,)
 
 #: 单轮发布预算：一轮最多消费多少条待发布意图。挡的是"一轮把整张表刷完"占住外部接口
 #: 配额；剩下的下一轮继续（同 :meth:`PermissionPublishExecutor.run_once` 的 ``limit``）。
@@ -381,9 +396,14 @@ class PermissionPublishDuty:
 
         readiness = self._readiness
         if readiness is not None and not interrupted and not self._stop.is_set():
+            # 探针没接线时**只取撤权那一类**：授权候选这一轮推进不了，留在查询之外才不会
+            # 把窗口占死（:data:`REVOKE_ONLY_REASONS` 的文档写明了饿死是怎么发生的）。
+            reasons = (
+                FOLLOW_UP_REASONS if readiness.ticker.probe_wired else REVOKE_ONLY_REASONS
+            )
             pending = tuple(
                 self._intents.published_awaiting_readiness(
-                    reasons=FOLLOW_UP_REASONS,
+                    reasons=reasons,
                     interval_seconds=readiness.ticker.schedule.interval_seconds,
                     budget_seconds=readiness.ticker.schedule.budget_seconds,
                     limit=self._readiness_limit,
@@ -420,7 +440,10 @@ class PermissionPublishDuty:
             readiness_wired=self.readiness_wired,
             # 探针没接线时，需要探针的那一路本轮不推进——报告里必须看得出来，
             # 否则"待确认一直是 20 条、本轮推进 0"读起来像卡死。
-            probe_wired=readiness is None or readiness.ticker.probe_wired,
+            # **整面都没装配时它同样是 False**（定向终核 Q2）：给出
+            # ``readiness_wired=False, probe_wired=True`` 会让读报告的人以为探针是好的、
+            # 只是别处出了问题。
+            probe_wired=readiness is not None and readiness.ticker.probe_wired,
         )
         self._audit.record("permission_publish.completed", **report.audit_facts())
         if report.advanced or report.attempts or report.reclaimed:
@@ -592,7 +615,10 @@ class PermissionPublishDuty:
 __all__ = [
     "DEFAULT_PUBLISH_LIMIT",
     "DEFAULT_READINESS_LIMIT",
+    "DEFAULT_ROUND_BUDGET_SECONDS",
+    "FOLLOW_UP_REASONS",
     "PermissionPublishDuty",
     "PermissionPublishReport",
+    "REVOKE_ONLY_REASONS",
     "ReadinessFollowUp",
 ]

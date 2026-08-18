@@ -8,13 +8,18 @@
 
 1. **就绪没成功绝不发"范围更新"通知**（等待中、技术失败、超时都不发）；
 2. **撤权通知只在发布读回一致之后发**——候选集只来自已发布的意图；
-3. 通知失败**不阻塞权限生效、不改变发布或就绪状态、不抛异常**；
-4. **一轮 tick 不被就绪等待阻塞**：整轮零 ``sleep``，职责也没有等待端口；
-5. 缺 MCP 端点或主密钥 → **就绪面不装配 + 恰一条审计，发布面照常**；
+3. 通知失败**不阻塞权限生效、不改变发布或就绪状态、不抛异常**；收件人查询失败则
+   **本轮不推进、终态不落**（否则一次瞬时异常就把这条通知永久吞掉）；
+4. **一轮 tick 不被就绪等待阻塞**：整轮零 ``sleep``，职责也没有等待端口；单轮另有
+   **停止钩子与时间预算**，发布面也逐条检查（`V-部署-03`「停止领取新工作」）；
+5. **三个面各按自身依赖装配，缺谁只停谁**：缺 MCP 端点只停探针（撤权通知照常，且
+   候选查询随之只取撤权那一类，**不让积压的授权候选饿死撤权通知**）；缺主密钥停整个
+   通知面；缺权限表坐标/令牌只停发布面。每一面**恰一条**审计；
 6. 收件人不可用（未开通 / 停用 / 删除中）**不发通知**；
 7. 停止信号之后**零发布、零探针、零通知**；
 8. 单个用户失败不带走整轮；
-9. 报告与审计**只有计数**，不含邮箱、姓名、权限值与 open_id。
+9. 报告与审计**只有计数**，不含邮箱、姓名、权限值与 open_id；整面未装配时
+   ``probe_wired`` **也是 False**，不谎报探针没问题。
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from lingxi.apps.scheduler.permission_publish import (
     DEFAULT_PUBLISH_LIMIT,
     DEFAULT_READINESS_LIMIT,
     FOLLOW_UP_REASONS,
+    REVOKE_ONLY_REASONS,
 )
 from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REFRESH_REASON,
@@ -127,10 +133,20 @@ class FakeExecutor:
 
 
 class FakePending:
-    def __init__(self, user_id: str, permission_version: int, permissions: str) -> None:
+    def __init__(
+        self,
+        user_id: str,
+        permission_version: int,
+        permissions: str,
+        *,
+        reason: str = PERMISSION_REFRESH_REASON,
+    ) -> None:
         self.user_id = user_id
         self.permission_version = permission_version
         self.permissions = permissions
+        # 真实查询按 reason 过滤并 LIMIT；假实现照做，否则"窗口被占死"这类缺陷
+        # 在用例里根本发生不了。
+        self.reason = reason
 
 
 class FakeIntents:
@@ -165,7 +181,9 @@ class FakeIntents:
         self.schedule_calls.append((interval_seconds, budget_seconds))
         if self._pending_error is not None:
             raise self._pending_error
-        return self._pending
+        wanted = tuple(reasons)
+        matched = [item for item in self._pending if item.reason in wanted]
+        return tuple(matched[:limit])
 
     def notice_recipient_open_id(self, user_id: str) -> str | None:
         self.recipient_calls.append(user_id)
@@ -277,6 +295,7 @@ def build_duty(
     wire_readiness: bool = True,
     on_alert=None,
     round_budget_seconds: float = 60.0,
+    readiness_limit: int = DEFAULT_READINESS_LIMIT,
     clock=None,
 ):
     executor = FakeExecutor() if executor is _UNSET else executor
@@ -296,6 +315,7 @@ def build_duty(
         audit=audit,
         readiness=readiness,
         on_alert=on_alert,
+        readiness_limit=readiness_limit,
         round_budget_seconds=round_budget_seconds,
         clock=clock,
         stop=stop,
@@ -691,6 +711,60 @@ class UnwiredProbeTest(unittest.TestCase):
 
         self.assertFalse(report.probe_wired)
         self.assertTrue(report.readiness_wired)
+
+    def test_a_backlog_of_grants_does_not_starve_the_revocation_notice(self) -> None:
+        """否定断言（定向终核 Q1）：**探针未接线时，积压的授权候选不得饿死撤权通知**。
+
+        授权候选在 ``probe=None`` 下每轮都只得到 ``None``——不落记录，于是永远保持
+        "还没探过"这个最高优先级。若它们仍参与查询，只要积压条数 ≥ 单轮就绪预算，
+        后发布的撤权行就再也进不了窗口，而每轮都在重复取回同一批毫无进展的候选。
+        """
+
+        backlog = [
+            FakePending(f"usr_{index:026d}", 2, GRANTED) for index in range(5)
+        ]
+        revoked = FakePending(USER_TWO, 3, REVOKED, reason=PERMISSION_REVOKE_REASON)
+        duty, parts = build_duty(
+            intents=FakeIntents(*backlog, revoked),
+            ticker=FakeTicker({USER_TWO: ReadinessOutcome.NO_PERMISSION}, probe_wired=False),
+            readiness_limit=2,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(
+            parts["intents"].reason_calls, [REVOKE_ONLY_REASONS], "只认领不依赖探针的那一类"
+        )
+        self.assertEqual([call["user_id"] for call in parts["notices"].calls], [USER_TWO])
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.notices_sent, 1)
+
+    def test_with_a_probe_both_reasons_are_claimed(self) -> None:
+        """反面：探针接线之后，授权候选照常回到窗口里。"""
+
+        duty, parts = build_duty(
+            intents=FakeIntents(FakePending(USER_ONE, 2, GRANTED)),
+            ticker=FakeTicker({USER_ONE: ReadinessOutcome.READY}),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["intents"].reason_calls, [FOLLOW_UP_REASONS])
+        self.assertEqual(report.ready, 1)
+
+    def test_an_unwired_follow_up_face_does_not_claim_the_probe_is_fine(self) -> None:
+        """否定断言（定向终核 Q2）：整面没装配时 ``probe_wired`` **也是 False**。
+
+        给出 ``readiness_wired=False, probe_wired=True`` 会让读报告的人以为探针是好的、
+        只是别处出了问题。
+        """
+
+        duty, _ = build_duty(wire_readiness=False)
+
+        report = duty.run_once()
+
+        self.assertFalse(report.readiness_wired)
+        self.assertFalse(report.probe_wired)
 
     def test_the_publish_face_can_be_absent(self) -> None:
         duty, parts = build_duty(
