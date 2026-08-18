@@ -55,8 +55,12 @@
   ``PermissionPublishExecutor.run_once`` 的文档）。
 - **重启安全**：崩溃留下的 ``publishing`` 行由 ``reclaim_stale`` 放回 ``pending``；因为
   发布本身幂等（先查后写），重入不会写出第二行。
-- 本 Story **不装配任何常驻消费者**：真实调用方是 Epic D 的 ``OnboardingRunner`` 与每日
-  权限刷新职责。当前进程闭包里没有它，与 ``core/identity/provisioning.py`` 同一姿态。
+- **生产消费者已经装上**：S-C-03b 起，scheduler 的
+  :class:`~lingxi.apps.scheduler.permission_publish.PermissionPublishDuty` **每轮**消费
+  这里排出的意图，它是本模块的第一个生产调用方（此前这一段写「本 Story 不装配任何常驻
+  消费者」，S-C-03b 之后已不成立——Epic C 冻结缺陷复核）。Epic D 的 ``OnboardingRunner``
+  是**后续**调用方：首次开通那一条链还没有实现，它排出的意图由发布面统一消费，但确认面
+  按 ``reason`` 分治（见 ``permission_publish`` 的 ``FOLLOW_UP_REASONS``）。
 
 ## 告警
 
