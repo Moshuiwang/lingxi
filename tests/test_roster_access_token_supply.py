@@ -973,22 +973,30 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "derived_token_unusable")
 
     def test_a_usable_token_clears_the_unusable_marker(self) -> None:
-        """拿到可用令牌之后，那个记号必须清掉，否则它会一直污染后续的失败分类。"""
+        """拿到可用令牌之后，那个记号必须**当天就**清掉。
 
-        loop, _vault, _holder, _events, clock, _authorization, _budget = build_supply_loop(
-            claims=[_Claim(), _Claim(), _Claim()], lifetime=None
-        )
-        loop.run_once()
+        记号只在"今天"这一天有意义。不清掉的话，同一天里后来那次成功会被前面那次
+        失败继续污染：运维看到的是"派生令牌不可用"，而实际上令牌好好地在持有者里。
+        故意让两次都落在同一个 UTC 日——跨日的写法测不出这条，因为跨日之后记号本来
+        就不匹配了（变异验红实测：N12 首轮存活）。
+        """
 
-        # 换一份带寿命的响应，第二天正常换到令牌，随后当天再问一次。
-        clock.advance(timedelta(days=1))
-        loop._authorization._lifetime = 7200  # noqa: SLF001 - 只是把假响应换成带寿命的
-        loop.refresh_for_supply()
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
+        loop, vault = fixture.loop, fixture.vault
 
+        loop.run_once()  # 第一次：飞书没给寿命，记号置上
+        self.assertEqual(loop._derived_unusable_on, DAY.date())  # noqa: SLF001
+
+        fixture.authorization._lifetime = 7200  # noqa: SLF001 - 把假响应换成带寿命的
+        loop.run_once()  # 同一天第二次：换到可用令牌，记号必须清掉
+
+        self.assertTrue(fixture.holder.has_token)
+        # 当天再问供给：文件侧的上界会拒绝，原因应当就是上界本身。
         with self.assertRaises(AccessTokenUnavailable) as raised:
             loop.refresh_for_supply()
 
-        self.assertEqual(raised.exception.reason, "daily_refresh_budget_exhausted")
+        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(len(vault.saved), 2)
 
 
 class FeishuDirectoryErrorForTests(Exception):
@@ -1019,6 +1027,28 @@ class ScheduledRotationFeedsTheHolderTest(unittest.TestCase):
         self.assertEqual((report.claimed, report.rotated, report.revoked), (1, 0, 1))
         self.assertFalse(holder.has_token)
         self.assertEqual(vault.revoked, ["rotation_persist_failed"])
+
+    def test_a_due_rotation_whose_result_is_superseded_hands_out_nothing(self) -> None:
+        """到期轮换这一侧同样要区分"落盘了"与"被新授权取代"（两路审查 P1 的另一半）。
+
+        变异验红实测：只钉住按需入口那一侧时，把到期轮换的 ``SUPERSEDED`` 也当成
+        ``SAVED`` 的变异会存活（N3 首轮）。
+        """
+
+        loop, vault, holder, events, _clock, _authorization, _budget = build_supply_loop(
+            superseded=True
+        )
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
+            report = loop.run_once()
+
+        # 收尾判定不变：不撤销（新凭据不能被旧链连带删掉）。
+        self.assertEqual((report.claimed, report.rotated, report.revoked), (1, 1, 0))
+        self.assertEqual(vault.revoked, [])
+        # 但派生令牌一个都不交出：这条链已经没有活着的凭据了。
+        self.assertFalse(holder.has_token)
+        self.assertNotIn("store", events)
+        self.assertTrue(any("新授权取代" in line for line in captured.output))
 
 
 # --------------------------------------------------------------------------
