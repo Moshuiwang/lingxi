@@ -60,12 +60,70 @@ class SecretToken:
         return self._MASK
 
 
+class RefreshAlreadyConsumedToday(RuntimeError):
+    """今天已经消费过一次续期凭据，本次领取被拒。
+
+    这是**每日频率上界唯一的权威判据**（Issue #215）：日报改成按日消费一次性
+    ``refresh_token`` 之后，"每 UTC 日至多一次"必须有一个进程重启也抹不掉的判据，
+    否则一个崩溃重启循环会每分钟消费一次——一次性令牌被高频消费正是 2026-08-08
+    授权码被烧那次事故的形状。判定发生在凭据文件的锁内、用锁内的当前时刻，因此
+    等锁跨过 UTC 午夜也不会错位，而且**只认凭据自己**：换了新凭据（人工重授权）就
+    没有消费标记，当天立刻可以再换一次，这正是已接受的语义。
+
+    与"没有可领取的凭据"刻意分成两件事：前者是"今天已经换过了"，后者是"凭据没了"。
+    压成同一个 ``None`` 会让审计指向错误的地方（去查凭据丢失，而其实一切正常）。
+
+    ``consumed_at`` 是被拒时凭据上记着的那个**消费时刻**（不是本次领取的时刻）。
+    它由锁内生成、随凭据落盘，因此可以唯一地指认"是哪一次续期消费掉了今天的额度"——
+    调用方据此判断自己手上那条"这一代令牌不可用"的记号还算不算数。异常正文只有一句
+    固定文案，不含任何凭据值。
+    """
+
+    def __init__(self, *, consumed_at: datetime) -> None:
+        super().__init__("今天已经消费过一次续期凭据，本次领取被拒")
+        self.consumed_at = consumed_at
+
+
+@dataclass(frozen=True)
+class DerivedAccessToken:
+    """一次续期顺带派生出来的**短期** ``access_token`` 及其寿命。
+
+    只在进程内存活：不落盘、不进数据库、不进日志与审计（产品合同「凭据不进代码、
+    日志、数据库、用户环境」）。带上 ``expires_in`` 是因为"缓存下来的令牌现在还能不能
+    用"没有别的判据——飞书返回的寿命此前从未被读取过，把它丢掉就只能靠"用坏了再说"，
+    而那时报出来的会是一次花名册读取失败，指向错误的地方。
+
+    ``expires_in`` 允许为 ``None``：飞书没给寿命时**不把整轮续期判成失败**。续期成功
+    这件事已经发生，新的 ``refresh_token`` 必须照常落盘——为一个附带字段把一条一次性
+    凭据判死，方向是反的。寿命未知的派生令牌由持有者拒绝缓存，失败因此响亮地留在
+    令牌供给这一侧。
+    """
+
+    token: SecretToken
+    expires_in: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, SecretToken):
+            raise TypeError("access_token 必须包在 SecretToken 里，避免明文进入日志")
+        if self.expires_in is None:
+            return
+        if not isinstance(self.expires_in, int) or isinstance(self.expires_in, bool):
+            raise ValueError("短期令牌有效期必须是正整数秒或未知")
+        if self.expires_in <= 0:
+            raise ValueError("短期令牌有效期必须是正整数秒或未知")
+
+    @property
+    def lifetime_known(self) -> bool:
+        return self.expires_in is not None
+
+
 @dataclass(frozen=True)
 class AuthorizationGrant:
     """飞书一次授权或续期返回的、需要长期持有的那一部分。
 
     刻意**不含** ``access_token``：短期令牌只存在于一次 API 调用中，既不落库
-    也不进入本类型，免得它顺着凭据一起被持久化。
+    也不进入本类型，免得它顺着凭据一起被持久化。派生短期令牌的进程内载体是
+    :class:`DerivedAccessToken`，它同样不进任何持久载体。
     """
 
     refresh_token: SecretToken
@@ -98,6 +156,26 @@ class RefreshOutcome(str, Enum):
 class CredentialAction(str, Enum):
     ROTATE = "rotate"
     REVOKE = "revoke"
+
+
+class CredentialSaveOutcome(str, Enum):
+    """一次"把新凭据写回去"的结果。**三态，不是布尔**。
+
+    压成布尔正是 Issue #215 一级 / 二级审查交叉抓到的 P1：``SUPERSEDED``（世代不符或
+    主体登记 CAS 未通过）与 ``SAVED`` 都被折成"真"，因为对轮换收尾来说两者都算"已妥善
+    收尾、不必撤销"。但对**派生短期令牌**来说它们是相反的两件事——``SUPERSEDED`` 意味着
+    新的 ``refresh_token`` 被丢弃、本链已死（旧的那条已经在飞书那边被消费掉），此时把
+    派生令牌交出去，日报会照常工作到令牌过期为止，把"凭据丢失"整整盖住那么久。
+
+    - ``SAVED``：新凭据确实落盘了，本链继续有效；
+    - ``SUPERSEDED``：期间发生了新授权，本链结果作废——**不撤销**（不能把新凭据连带
+      删掉），但也**什么都不交出**；
+    - ``FAILED``：写不进去。旧凭据已被飞书作废，按不可恢复撤销并要求人工重新授权。
+    """
+
+    SAVED = "saved"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
 
 
 def _require_aware(moment: datetime, name: str) -> datetime:

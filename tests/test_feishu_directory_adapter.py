@@ -388,16 +388,43 @@ class AuthorizationClientTest(unittest.TestCase):
 
     def test_a_successful_refresh_returns_a_wrapped_secret(self) -> None:
         transport = RecordingTransport(
-            [{"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 604800, "scope": "offline_access"}]
+            [{"code": 0, "access_token": "fake-access", "expires_in": 7200, "refresh_token": "fake-next", "refresh_token_expires_in": 604800, "scope": "offline_access"}]
         )
         client = FeishuAuthorizationClient(base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport)
 
-        grant, access_token = client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
+        grant, derived = client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
 
         self.assertEqual(grant.refresh_token.reveal(), "fake-next")
         self.assertEqual(grant.refresh_token_expires_in, 604800)
         self.assertEqual(grant.scope, "offline_access")
-        self.assertEqual(access_token.reveal(), "fake-access")
+        self.assertEqual(derived.token.reveal(), "fake-access")
+        # Issue #215：派生短期令牌的寿命此前从未被读取，日报改成按日取令牌之后，
+        # 「缓存的这份还能不能用」没有别的判据。
+        self.assertEqual(derived.expires_in, 7200)
+        self.assertTrue(derived.lifetime_known)
+
+    def test_a_missing_access_token_lifetime_leaves_the_credential_alive(self) -> None:
+        """飞书没给短期令牌寿命时**不判整轮续期失败**（Issue #215）。
+
+        续期成功这件事已经发生，新的一次性 ``refresh_token`` 必须照常交给调用方落盘：
+        为一个附带字段把凭据判死，会让"需人工重新授权"因为一个非凭据原因而发生。
+        寿命未知的后果留在令牌供给那一侧（持有者拒绝缓存 → 供给失败关闭）。
+        """
+
+        for lifetime in ({}, {"expires_in": 0}, {"expires_in": "7200"}, {"expires_in": True}):
+            with self.subTest(lifetime=lifetime):
+                transport = RecordingTransport(
+                    [{"code": 0, "access_token": "fake-access", "refresh_token": "fake-next", "refresh_token_expires_in": 604800, **lifetime}]
+                )
+                client = FeishuAuthorizationClient(
+                    base_url=BASE_URL, app_id="cli_fake", app_secret="secret_fake", transport=transport
+                )
+
+                grant, derived = client.refresh(AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600))
+
+                self.assertEqual(grant.refresh_token.reveal(), "fake-next")
+                self.assertIsNone(derived.expires_in)
+                self.assertFalse(derived.lifetime_known)
 
     def test_an_incomplete_response_is_indeterminate_rather_than_silently_accepted(self) -> None:
         incomplete = (

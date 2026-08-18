@@ -4,13 +4,20 @@
 密文落库那一半在 tests/test_identity_postgres_records.py；这里证明明文
 不会经由 ``repr`` / ``str`` / 日志格式化泄漏。
 V-身份-04（专用授权失效时不重放旧凭据、直接撤销）的判定规则。
+V-身份-11 的**参数守卫**那一半（两种 CAS 不能同时传），见
+``VaultSaveArgumentGuardTest``：被测的是一条纯内存 ``ValueError``，
+真库那一半（``ON CONFLICT DO NOTHING`` 的反向 CAS）仍在
+tests/test_identity_postgres_records.py。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
@@ -140,6 +147,182 @@ class RefreshOutcomeTest(unittest.TestCase):
         for outcome in RefreshOutcome:
             with self.subTest(outcome=outcome):
                 self.assertIn(decide_after_refresh(outcome), (CredentialAction.ROTATE, CredentialAction.REVOKE))
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("cryptography"),
+    "跳过：构造凭据保管对象需要 cryptography（绝不降级为明文保存）",
+)
+class VaultSaveArgumentGuardTest(unittest.TestCase):
+    """V-身份-11 的参数守卫：两种 CAS 不能同时传（`delegated_credentials.save` 开头）。
+
+    **这条不需要数据库**，因此不挂在 ``LINGXI_POSTGRES_DSN`` 门控下。被测的守卫是
+    ``save()`` 第一行的纯内存 ``ValueError``：它在文件锁与连库之前，一次保存只能有
+    一个判定条件，否则"到底以哪个为准"会变成调用方的隐式约定。放在真库门控里的后果
+    是：没有数据库的机器上它**从来没跑过**，而它恰恰是那台机器上唯一跑得动的一条。
+
+    真库那一半（登记表为空才写入的反向 CAS）留在
+    ``tests/test_identity_postgres_records.py::SubjectBootstrapCasTest``。
+    """
+
+    # 故意不可达：一旦守卫被挪到连库之后，这里会因为连不上而**响亮失败**，
+    # 不会变成一条"看起来通过了"的用例。`.invalid` 是保留后缀，不会解析到任何主机。
+    UNREACHABLE_DSN = "postgresql://lingxi-guard-test.invalid:1/never-reached"
+
+    def test_the_two_cas_conditions_cannot_be_combined(self) -> None:
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "delegated-credential.enc"
+        vault = HostFileDelegatedCredentialVault(
+            self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
+        )
+
+        # grant 在断言块**之外**构造：放进 assertRaises 里的话，将来
+        # AuthorizationGrant 自己抛 ValueError 也会让这条用例通过，而被测的守卫
+        # 根本没被执行过。
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, "")
+
+        with self.assertRaises(ValueError) as raised:
+            vault.save(
+                subject_open_id="ou_delegated_authorization_subject",
+                grant=grant,
+                require_absent_registration=True,
+                expected_registered_subject_open_id="ou_delegated_authorization_subject",
+            )
+
+        # 断言具体消息：只断言"抛了 ValueError"分不清是守卫拒绝，还是参数校验、
+        # 密钥解析之类的别的 ValueError 顺手把用例染绿了。
+        self.assertIn("首次建立与既有主体 CAS 不能同时使用", str(raised.exception))
+
+        # 守卫在文件锁之前：连锁文件都不该出现，密文更不该落盘。
+        self.assertFalse(path.exists(), "被拒的保存不得写入密文")
+        self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
+
+    def test_a_naive_consumption_moment_is_refused_before_any_io(self) -> None:
+        """频率上界的判据必须带时区（Issue #215）。
+
+        它按 **UTC 日**与日报的日界对齐；一个不带时区的时刻会被部署机器的本地时区
+        悄悄挪一天，而"挪一天"在这里的含义是多消费一次一次性凭据。守卫同样在文件锁与
+        连库之前，因此没有数据库的机器上也跑得动。
+        """
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "delegated-credential.enc"
+        vault = HostFileDelegatedCredentialVault(
+            self.UNREACHABLE_DSN, Fernet.generate_key().decode(), str(path)
+        )
+        grant = AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, "")
+
+        with self.assertRaises(ValueError) as raised:
+            vault.save(
+                subject_open_id="ou_delegated_authorization_subject",
+                grant=grant,
+                refresh_consumed_at=datetime(2026, 8, 18, 9, 0),
+            )
+
+        self.assertIn("续期消费时刻必须是带时区的时间", str(raised.exception))
+        self.assertFalse(path.exists(), "被拒的保存不得写入密文")
+        self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
+
+
+    def test_no_parameter_can_relax_the_due_check_without_the_daily_ceiling(self) -> None:
+        """收口轮 P2-a：``for_supply`` 把两件事**捆死**，没有任何参数能把它们拆开。
+
+        放开到期判定而不带每日上界，等于把一条**一次性**凭据交给一个没有任何频率约束的
+        循环——一次性令牌被高频消费正是 2026-08-08 授权码被烧那次事故的形状。此前这条
+        靠一道"两个参数必须成对"的运行时守卫，守卫本身就说明 API 允许拆开；现在从形状上
+        就拆不开，因此这里断言的是**签名**。
+        """
+
+        import inspect
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        parameters = inspect.signature(HostFileDelegatedCredentialVault.claim_due).parameters
+
+        self.assertEqual(
+            sorted(name for name in parameters if name != "self"),
+            ["for_supply", "lease_seconds", "now"],
+            "多出来的旋钮就是一条可以绕过每日上界的路",
+        )
+        self.assertIs(parameters["for_supply"].default, False, "默认必须是到期驱动的那条路径")
+
+
+class ConsumptionMomentConversionTest(unittest.TestCase):
+    """每日上界读取消费时刻的换算本体（O6②）。
+
+    这一段此前没有任何直接断言：把换算整个删掉、直接取字符串前十位，全量用例依然全绿。
+    它是"今天"这件事在**凭据文件**那一侧的唯一定义。
+    """
+
+    def test_a_non_utc_offset_is_converted_before_the_day_is_taken(self) -> None:
+        from lingxi.adapters.delegated_credentials import _parse_utc
+
+        # 同一时刻的两种写法：UTC 8-18 23:30 == 东八区 8-19 07:30。
+        self.assertEqual(_parse_utc("2026-08-18T23:30:00+00:00").date(), date(2026, 8, 18))
+        self.assertEqual(_parse_utc("2026-08-19T07:30:00+08:00").date(), date(2026, 8, 18))
+        # 反向：西五区的 8-18 21:00 已经是 UTC 的 8-19。
+        self.assertEqual(_parse_utc("2026-08-18T21:00:00-05:00").date(), date(2026, 8, 19))
+
+    def test_a_naive_moment_is_read_as_utc(self) -> None:
+        from lingxi.adapters.delegated_credentials import _parse_utc
+
+        moment = _parse_utc("2026-08-18T23:30:00")
+
+        self.assertEqual(moment.date(), date(2026, 8, 18))
+        self.assertEqual(moment.utcoffset(), timedelta(0), "读出来必须是带时区的 UTC 时刻")
+
+    def test_anything_unparsable_yields_nothing(self) -> None:
+        """读不出时刻时返回 ``None``＝"没有消费记录"，上界因此不拦。
+
+        方向是刻意的：一份读不懂的旧载荷不该把凭据永久锁死；真正的防线是文件本身
+        只由本模块写入。
+        """
+
+        from lingxi.adapters.delegated_credentials import _parse_utc
+
+        for broken in (None, "", "not-a-moment", 12345, {}):
+            with self.subTest(value=broken):
+                self.assertIsNone(_parse_utc(broken))
+
+
+class DerivedAccessTokenTest(unittest.TestCase):
+    """派生短期令牌的载体（Issue #215）：明文包在 SecretToken 里，寿命可以未知。"""
+
+    def test_the_plaintext_never_leaks_through_any_stringification(self) -> None:
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        token = DerivedAccessToken(SecretToken("fake-access-token-for-tests-only"), 7200)
+
+        for rendered in (repr(token), str(token), f"{token}", f"{token.token}"):
+            self.assertNotIn("fake-access-token-for-tests-only", rendered)
+
+    def test_a_bare_string_token_is_refused(self) -> None:
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        with self.assertRaises(TypeError):
+            DerivedAccessToken("fake-access-token-for-tests-only", 7200)  # type: ignore[arg-type]
+
+    def test_an_unknown_lifetime_is_allowed_but_a_broken_one_is_not(self) -> None:
+        """未知寿命是一种合法状态（飞书没给），但"给了一个说不通的值"不是。"""
+
+        from lingxi.core.identity.credentials import DerivedAccessToken
+
+        self.assertFalse(DerivedAccessToken(SecretToken(FAKE_TOKEN)).lifetime_known)
+        self.assertTrue(DerivedAccessToken(SecretToken(FAKE_TOKEN), 1).lifetime_known)
+        for broken in (0, -1, True, 1.5, "7200"):
+            with self.subTest(lifetime=broken):
+                with self.assertRaises(ValueError):
+                    DerivedAccessToken(SecretToken(FAKE_TOKEN), broken)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
