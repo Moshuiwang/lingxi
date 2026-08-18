@@ -1030,21 +1030,30 @@ class ReadinessTickerTest(unittest.TestCase):
         self.assertEqual(probe.calls, [USER])
 
     def test_a_terminal_confirmation_is_never_touched_again(self) -> None:
-        """否定断言：终态之后**零探针、零记录**——这同时是"通知只发一次"的载体。"""
+        """否定断言：终态之后**零探针、零记录**——这同时是"通知只发一次"的载体。
 
-        ticker, probe, store, audit, clock = _ticker(4)
-        clock.advance(10_000)
+        两种进度都要盖住：**还有计划次数没用完**（少了这一条会多探几次），以及
+        **计划表已经用尽**（少了这一条会每轮补一条重复的超时记录，那正是"通知只发
+        一次"失效的形状）。
+        """
 
-        attempt = ticker.advance(
-            BINDING,
-            permissions=PERMISSIONS,
-            progress=ReadinessProgress(attempt_count=1, first_started_at=START, terminal=True),
-        )
+        for label, count in (("计划还没用完", 1), ("计划已经用尽", 6)):
+            with self.subTest(label):
+                ticker, probe, store, audit, clock = _ticker(4, schedule=CONTRACT_SCHEDULE)
+                clock.advance(10_000)
 
-        self.assertIsNone(attempt)
-        self.assertEqual(probe.calls, [])
-        self.assertEqual(store.records, [])
-        self.assertEqual(audit.entries, [])
+                attempt = ticker.advance(
+                    BINDING,
+                    permissions=PERMISSIONS,
+                    progress=ReadinessProgress(
+                        attempt_count=count, first_started_at=START, terminal=True
+                    ),
+                )
+
+                self.assertIsNone(attempt)
+                self.assertEqual(probe.calls, [])
+                self.assertEqual(store.records, [])
+                self.assertEqual(audit.entries, [])
 
     def test_an_empty_permission_document_never_probes(self) -> None:
         """撤权那一路：``no_permission`` 是终态，**一次探针都不发**（与阻塞形态同一条）。"""

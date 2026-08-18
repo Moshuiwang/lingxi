@@ -142,6 +142,20 @@ class SendTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             delivery_uuid(OPEN_ID, "k", prefix="x" * 20)
 
+    def test_sending_to_a_group_chat_id_fails_before_any_request(self) -> None:
+        """否定断言：**收件人错位在发出去之前就失败**，一次请求都不发。
+
+        校验必须在 ``send_text`` 这条真实路径上，而不是只在校验函数上——只测函数的话，
+        有人把发送里那一行校验拿掉，用例照样是绿的。
+        """
+
+        transport = FakeTransport()
+
+        with self.assertRaises(ValueError):
+            _messages(transport).send_text(open_id="oc_admin_group", text=TEXT, dedupe_key="k")
+
+        self.assertEqual(transport.calls, [], "连取令牌都不发")
+
     def test_an_empty_body_is_rejected(self) -> None:
         transport = FakeTransport()
 
