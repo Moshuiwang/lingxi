@@ -90,9 +90,22 @@ class RegistryMatchesSourceTests(unittest.TestCase):
         )
 
     def test_each_fixture_has_at_least_one_named_contract_test_file(self) -> None:
+        """F3 修复（2026-08-18 编排者修复包）：不只检查字符串非空——之前的写法对
+        任意文本或已经被删除的路径都判「有测试」。这里逐个解析 ``contract_tests``
+        里登记的每个相对路径，并用 ``Path.is_file()`` 核实它真的存在。
+        """
+
         for fixture in self.module.FIXTURES:
             with self.subTest(env_var=fixture.env_var):
-                self.assertTrue(fixture.contract_tests.strip())
+                paths = [item.strip() for item in fixture.contract_tests.split(",") if item.strip()]
+                self.assertTrue(paths, f"{fixture.env_var} 必须至少登记一个契约测试文件")
+                for relative_path in paths:
+                    full_path = REPOSITORY_ROOT / relative_path
+                    self.assertTrue(
+                        full_path.is_file(),
+                        f"{fixture.env_var} 登记的契约测试文件不存在：{relative_path}"
+                        "（写任意文本或已删除路径都不该被判为「有测试」）",
+                    )
 
 
 class ActiveFixtureDetectionTests(unittest.TestCase):
@@ -166,6 +179,145 @@ class WorkerOutputSafetyCanaryFixtureContractTests(unittest.TestCase):
         env = dict(WORKER_BASE_ENV, LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked")
         with self.assertRaises(WorkerConfigError):
             load_worker_config(env)
+
+
+class CheckFilesFixtureDetectionTests(unittest.TestCase):
+    """F2 修复（2026-08-18 编排者修复包）：夹具经 env 文件注入**容器**，不是注入
+    执行本脚本的宿主 shell 进程；``--check-clear`` 查的是宿主 shell，查错了地方。
+    这里钉住新增的文件/文本解析通道，它们才是 Stage 上真正要查的两面
+    （env 文件本身，以及 ``docker compose exec <service> env`` 经标准输入喂进来
+    的容器内实际环境）。
+    """
+
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_active_fixtures_in_text_parses_env_file_style_lines(self) -> None:
+        text = "\n".join(
+            [
+                "# a comment line",
+                "",
+                "export LINGXI_GATEWAY_CARD_FAILURE_INJECT=create",
+                "FOO=bar",
+            ]
+        )
+        self.assertEqual(
+            self.module.active_fixtures_in_text(text),
+            {"LINGXI_GATEWAY_CARD_FAILURE_INJECT": "create"},
+        )
+
+    def test_active_fixtures_in_text_parses_printenv_style_lines(self) -> None:
+        """``docker compose exec <service> env`` 的输出没有注释、没有 export 前缀，
+        每行就是 ``NAME=VALUE``——同一个解析函数必须两种来源都吃得下。
+        """
+
+        text = "LINGXI_WORKER_OUTPUT_SAFETY_CANARY=masked\nPATH=/usr/bin\n"
+        self.assertEqual(
+            self.module.active_fixtures_in_text(text),
+            {"LINGXI_WORKER_OUTPUT_SAFETY_CANARY": "masked"},
+        )
+
+    def test_blank_value_in_text_counts_as_unset(self) -> None:
+        text = 'LINGXI_GATEWAY_CARD_FAILURE_INJECT=""\n'
+        self.assertEqual(self.module.active_fixtures_in_text(text), {})
+
+    def test_active_fixtures_in_file_reads_a_real_file(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env.stage.gateway"
+            path.write_text("LINGXI_GATEWAY_CARD_FAILURE_INJECT=update\n", encoding="utf-8")
+            self.assertEqual(
+                self.module.active_fixtures_in_file(path),
+                {"LINGXI_GATEWAY_CARD_FAILURE_INJECT": "update"},
+            )
+
+    def test_active_fixtures_in_file_missing_file_is_empty_not_error(self) -> None:
+        self.assertEqual(
+            self.module.active_fixtures_in_file(Path("/nonexistent/does-not-exist-xyz")), {}
+        )
+
+    def test_cli_check_files_detects_leak_in_a_real_file(self) -> None:
+        import io
+        import tempfile
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env.stage.worker-queue"
+            path.write_text("LINGXI_WORKER_OUTPUT_SAFETY_CANARY=withheld\n", encoding="utf-8")
+            with mock.patch("sys.stderr", new=io.StringIO()) as captured:
+                self.assertEqual(self.module.main(["--check-files", str(path)]), 1)
+            self.assertIn("LINGXI_WORKER_OUTPUT_SAFETY_CANARY", captured.getvalue())
+            self.assertNotIn("withheld", captured.getvalue())
+
+    def test_cli_check_files_clean_file_returns_zero(self) -> None:
+        import io
+        import tempfile
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env.stage.scheduler"
+            path.write_text("LINGXI_POSTGRES_DSN=postgresql://fixture-test\n", encoding="utf-8")
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(self.module.main(["--check-files", str(path)]), 0)
+
+    def test_cli_check_files_missing_path_does_not_fail(self) -> None:
+        """preflight 之外单独调用时，缺文件本身不是本命令的职责——那是 Stage
+        演练脚本 preflight 步骤另外核对的事，这里只负责"存在时读到了什么"。
+        """
+
+        import io
+        import unittest.mock as mock
+
+        with mock.patch("sys.stderr", new=io.StringIO()) as captured_err, mock.patch(
+            "sys.stdout", new=io.StringIO()
+        ):
+            self.assertEqual(self.module.main(["--check-files", "/no/such/file"]), 0)
+        self.assertIn("跳过", captured_err.getvalue())
+
+    def test_cli_check_files_reads_stdin_when_dash_given(self) -> None:
+        import io
+        import unittest.mock as mock
+
+        stdin_text = "LINGXI_GATEWAY_CARD_FAILURE_INJECT=close\n"
+        with mock.patch("sys.stdin", new=io.StringIO(stdin_text)), mock.patch(
+            "sys.stderr", new=io.StringIO()
+        ) as captured_err:
+            self.assertEqual(self.module.main(["--check-files", "-"]), 1)
+        self.assertIn("<stdin>", captured_err.getvalue())
+        self.assertNotIn("close", captured_err.getvalue())
+
+
+class ScannerKnownBlindSpotTests(unittest.TestCase):
+    """P2-12 修复（2026-08-18 编排者修复包）：诚实钉住扫描器的已知盲区，不只在
+    文档里口头承认。扫描器只认「``_text(env, "...")`` + 同文件顶层 ``ENV_PREFIX``」
+    这一种写法；用完整变量名字面量直接读取环境变量（不经过这个拼接）的夹具会被
+    漏掉。这里用一份合成源码文件证明这个盲区真实存在。
+    """
+
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_full_name_literal_read_is_not_discovered(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_root = Path(tmp)
+            package_dir = src_root / "fake_pkg"
+            package_dir.mkdir()
+            (package_dir / "blind_spot.py").write_text(
+                "import os\n"
+                'value = os.environ.get("LINGXI_SCHEDULER_SOMETHING_INJECT")\n',
+                encoding="utf-8",
+            )
+            discovered = self.module.discover_fixture_env_vars_in_source(src_root)
+            self.assertEqual(
+                discovered,
+                set(),
+                "这条断言应当为真——full-name 字面量读取不走 _text()+ENV_PREFIX 拼接，"
+                "扫描器发现不了它。如果哪天这条断言开始失败，说明扫描器实现变了，"
+                "模块文档「已知盲区」那段话需要同步复核，不能留着一句不再成立的免责声明。",
+            )
 
 
 class CliSelfCheckTests(unittest.TestCase):

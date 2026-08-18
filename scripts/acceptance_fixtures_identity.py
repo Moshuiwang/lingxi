@@ -11,12 +11,26 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
    ``lingxi.core.permission.account_match.match_galaxy_account`` 与
    ``lingxi.core.permission.role_function``（连同随包发布的真实
    ``galaxy_role_function_map.toml``）。
-2. **MCP 同步超时夹具**——验收窗口不能真的等十五分钟。合同节奏由
-   ``lingxi.core.permission.mcp_readiness.ReadinessSchedule`` 承载，验收用的
-   「最小合法配置」不是本模块另起一套数字，而是该模块文档已经写明的
+2. **MCP 同步超时夹具——只用于窗口前的纯单测验证，不能注入真实 Stage 进程**
+   （2026-08-18 编排者修复包 P2-11 更正；此前的措辞暗示它可以让验收现场跳过
+   真实等待，这是错的）。合同节奏由
+   ``lingxi.core.permission.mcp_readiness.ReadinessSchedule`` 承载，最小合法
+   配置不是本模块另起一套数字，而是该模块文档已经写明、且
+   ``tests/test_mcp_readiness_machine.py`` 已在用的
    ``ReadinessSchedule(interval_seconds=1, budget_seconds=1,
    probe_timeout_seconds=1)``——本模块只把这份配方钉成一个有名字、可 import
-   的常量，避免验收现场靠记忆重新拼参数。
+   的常量，供**窗口前**用注入的时钟/假探针跑纯单测（见配套契约测试），不需要
+   在验收现场靠记忆重新拼参数。
+
+   **已核实这份配方无法在真实 Stage 进程里生效**：`ReadinessSchedule` 由调用方
+   在 Python 代码里构造，不读环境变量；已知唯一的运行期覆盖点是
+   `apps/scheduler/__init__.py` 的 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS`，且它**只**
+   覆盖 `probe_timeout_seconds` 一项，`interval_seconds`（180 秒一次）与
+   `budget_seconds`（900 秒预算）没有任何环境变量能改写，Epic D 的
+   `OnboardingRunner`（若已在候选中真实实现）目前同样没有别的覆盖入口。因此**真实
+   Stage 窗口里，MCP 同步确认要么按合同真实等最多十五分钟，要么本轮不覆盖这条
+   分支**——不要在执行卡或窗口现场暗示可以用这份「最小合法配置」把真实等待压
+   到两次探针，那只对本模块自己的纯单测成立。
 
 夹具③（开通链内部故障注入开关）与④（发布读回不一致注入开关）不在本模块：
 它们还没有生产实现（S-D-02 施工中），本模块不能替未落地的功能猜测环境变量名。

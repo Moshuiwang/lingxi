@@ -90,6 +90,40 @@ class NegativeIdentityFixturesMatchProductionParsingTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.module.negative_identity_fixture_by_name("不存在的夹具名字")
 
+    def test_unsupported_function_reaches_aggregate_permission_denial(self) -> None:
+        """P2-10 修复（2026-08-18 编排者修复包）：此前只把 UNSUPPORTED_FUNCTION 接到
+        中间层 ``resolve_role_functions``，没有接到真正做终判的
+        ``core.permission.publish_row.aggregate_permission``——「全部角色未映射」
+        真正的拒绝原因（``REASON_NO_SUPPORTED_FUNCTION``）是这一层产出的，不是
+        中间层。这里直接调用生产聚合函数本体，不重新实现判断逻辑。
+        """
+
+        from lingxi.core.permission.publish_row import (
+            REASON_NO_SUPPORTED_FUNCTION,
+            aggregate_permission,
+        )
+
+        fixture = self.module.UNSUPPORTED_FUNCTION
+        galaxy_user_id = fixture.galaxy_rows[0]["user_id"]
+        user_role_rows = tuple(
+            {"user_id": galaxy_user_id, "role_name": role_name}
+            for role_name in self.module.UNSUPPORTED_FUNCTION_ROLE_NAMES
+        )
+        mapping = load_role_function_map()
+
+        result = aggregate_permission(
+            galaxy_user_id=galaxy_user_id,
+            user_role_rows=user_role_rows,
+            datacountry_rows=(),
+            country_rows=(),
+            role_function_map=mapping,
+        )
+
+        self.assertFalse(result.granted)
+        self.assertEqual(result.reason, REASON_NO_SUPPORTED_FUNCTION)
+        self.assertEqual(result.companies, ())
+        self.assertEqual(result.functions, ())
+
 
 class McpReadinessMinimumLegalScheduleTests(unittest.TestCase):
     """MCP 同步超时夹具：验收窗口不靠真的等十五分钟。"""
@@ -122,6 +156,98 @@ class McpReadinessMinimumLegalScheduleTests(unittest.TestCase):
         started = datetime(2026, 1, 1, tzinfo=timezone.utc)
         due_times = [started + timedelta(seconds=offset) for offset in schedule.attempt_offsets()]
         self.assertEqual(due_times, [started, started + timedelta(seconds=1)])
+
+
+class _FakeClock:
+    """假时钟：``sleep`` 直接推进 ``now``，不真的等待。"""
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+class _FakeNeverReadyProbe:
+    """探针桩：每次都返回 0 条可见指标（明确空结果，按合同不算就绪）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def list_metrics(self, *, user_id: str) -> int:
+        self.calls.append(user_id)
+        return 0
+
+
+class _FakeReadinessStore:
+    def __init__(self) -> None:
+        self.records: list[object] = []
+
+    def record_attempt(self, attempt: object) -> str:
+        self.records.append(attempt)
+        return f"syn_{len(self.records)}"
+
+
+class _FakeReadinessAudit:
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, dict]] = []
+
+    def record(self, action: str, /, **fields: object) -> None:
+        self.entries.append((action, dict(fields)))
+
+
+class McpReadinessMinimumLegalScheduleWiredToRealConfirmationTests(unittest.TestCase):
+    """P2-11 修复（2026-08-18 编排者修复包）：不能只验证配方本身的纯计算属性——
+    还要把它接到真实 ``McpReadinessConfirmation.confirm()`` 上跑一轮，钉住
+    "两次探针后收口为超时"这个验收现场会依赖的具体行为。用注入的时钟/假探针，
+    一秒都不真等；探针桩与本文件其余部分一样，直接调用生产判定类本体
+    （``McpReadinessConfirmation``），不重新实现状态机。
+
+    这份配方**只用于本类这种纯单测**，不能注入真实 Stage 进程——见
+    ``scripts/acceptance_fixtures_identity.py`` 模块文档「已核实这份配方无法在
+    真实 Stage 进程里生效」一节。
+    """
+
+    def setUp(self) -> None:
+        self.module = _load_script()
+
+    def test_never_ready_probe_times_out_after_exactly_two_attempts(self) -> None:
+        from lingxi.core.permission.mcp_readiness import (
+            McpReadinessConfirmation,
+            ReadinessBinding,
+            ReadinessOutcome,
+        )
+
+        schedule = ReadinessSchedule(**self.module.MCP_READINESS_MINIMUM_LEGAL_SCHEDULE_KWARGS)
+        clock = _FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        probe = _FakeNeverReadyProbe()
+        store = _FakeReadinessStore()
+        audit = _FakeReadinessAudit()
+
+        confirmation = McpReadinessConfirmation(
+            probe=probe,
+            store=store,
+            audit=audit,
+            clock=clock,
+            sleep=clock.sleep,
+            schedule=schedule,
+        )
+        binding = ReadinessBinding(user_id="acceptance-fixture-user", permission_version=1)
+        session = confirmation.confirm(binding, permissions='{"*":["metric_a"]}')
+
+        self.assertEqual(session.outcome, ReadinessOutcome.TIMED_OUT)
+        self.assertEqual(
+            len(probe.calls), 2, "最小合法配置的计划表是 (0, 1)，应当恰好探两次，不多不少"
+        )
+        # 记录条数可能多于探针次数——预算耗尽后还会落一条不发探针的合成 timed_out
+        # 记录（``error_code=budget_exhausted``）；探针调用次数才是「探几次」的
+        # 权威判据，见 core.permission.mcp_readiness.ReadinessSchedule.attempt_offsets
+        # 的文档「发几次」一节。
+        self.assertGreaterEqual(len(store.records), 2)
+        self.assertEqual(probe.calls, ["acceptance-fixture-user", "acceptance-fixture-user"])
 
 
 class CliSelfCheckTests(unittest.TestCase):
