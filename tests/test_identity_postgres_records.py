@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -435,6 +436,43 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         self.assertGreaterEqual(claimed.consumed_at, before)
         self.assertLessEqual(claimed.consumed_at, after)
         self.assertEqual(claimed.consumed_at.utcoffset(), timedelta(0))
+
+    def test_the_moment_is_taken_after_the_lock_is_acquired(self) -> None:
+        """"现在几点"必须在**拿到锁之后**取（收口轮 P2-a）。
+
+        锁外先算好、再进去等锁，等锁跨过 UTC 午夜时 D+1 的那次领取会被当成 D，当天
+        因此可以再消费一次一次性凭据。这里用真实的锁竞争把它钉住：另一个持有者压住锁
+        两百毫秒，领取拿到的时刻必须晚于锁被释放的那一刻。
+        """
+
+        import fcntl
+        import threading
+
+        self._save()
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        released_at: list[datetime] = []
+        holding = threading.Event()
+
+        def hold_the_lock() -> None:
+            with open(lock_path, "a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                holding.set()
+                time.sleep(0.2)
+                released_at.append(datetime.now(timezone.utc))
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        holder = threading.Thread(target=hold_the_lock)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(holding.wait(timeout=5))
+
+        claimed = self.vault.claim_due(for_supply=True)
+        holder.join()
+
+        self.assertIsNotNone(claimed)
+        self.assertGreaterEqual(
+            claimed.consumed_at, released_at[0], "时刻在锁外取的话会早于锁被释放的那一刻"
+        )
 
     def test_a_second_claim_on_the_day_already_consumed_is_refused(self) -> None:
         from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday

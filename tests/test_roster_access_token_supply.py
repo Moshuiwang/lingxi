@@ -531,8 +531,14 @@ class ScriptedVault:
         self.revoked: list[str] = []
         self.claim_calls: list[dict[str, object]] = []
 
+    #: 领取本身要花的时间（等文件锁 + 一次读库核对主体）。**不能是零**：领取与落盘之间
+    #: 的时钟不前进的话，"用凭据库给的那个时刻"与"落盘时自己再取一次"在假时钟下是同一个
+    #: 值，相应的变异永远杀不死（变异验红实测 Q5）。
+    CLAIM_TAKES = timedelta(seconds=5)
+
     def claim_due(self, *, for_supply: bool = False):
         moment = self._clock()  # 锁内时刻
+        self._clock.advance(self.CLAIM_TAKES)
         self.claim_calls.append({"for_supply": for_supply, "moment": moment})
         if for_supply and self.consumed_at is not None:
             if self.consumed_at.astimezone(timezone.utc).date() == moment.astimezone(timezone.utc).date():
@@ -709,11 +715,19 @@ class OnDemandRefreshTest(unittest.TestCase):
         两处各算一次，等锁跨过 UTC 午夜时就会得到不同的日期，上界白白多给一天名额。
         """
 
-        fixture = build_supply_loop()
+        # 续期要走一个 HTTP 往返：时钟必须在领取与落盘之间前进，否则"用哪一个时刻"
+        # 这件事在假时钟下退化成同一个值，相应的变异永远杀不死（变异验红实测 Q5）。
+        fixture = build_supply_loop(refresh_takes=timedelta(minutes=30))
 
         fixture.loop.refresh_for_supply()
 
         claimed_moment = fixture.vault.claim_calls[0]["moment"]
+        self.assertEqual(claimed_moment, DAY)
+        self.assertEqual(
+            fixture.clock.now,
+            DAY + ScriptedVault.CLAIM_TAKES + timedelta(minutes=30),
+            "落盘时时钟已经走了",
+        )
         self.assertEqual(fixture.vault.saved[0]["refresh_consumed_at"], claimed_moment)
         self.assertEqual(fixture.vault.consumed_at, claimed_moment)
 
@@ -1020,7 +1034,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(vault.saved[0]["refresh_consumed_at"], DAY, "落盘用领取前那一刻")
         # 令牌寿命 7200 秒，从续期结束（DAY+30min）起算：DAY+2h 时仍在余量之外。
         self.assertIsNotNone(holder.fresh(now=DAY + timedelta(hours=2)))
-        self.assertEqual(clock.now, DAY + timedelta(minutes=30))
+        self.assertEqual(clock.now, DAY + ScriptedVault.CLAIM_TAKES + timedelta(minutes=30))
 
     # ---- O7：真实原因不被例行拒绝盖住 -------------------------------------
 
@@ -1071,6 +1085,30 @@ class OnDemandRefreshTest(unittest.TestCase):
         with self.assertRaises(AccessTokenUnavailable) as again:
             fixture.loop.refresh_for_supply()
         self.assertEqual(again.exception.reason, "derived_token_unusable")
+
+    def test_a_consumption_by_someone_else_does_not_inherit_our_marker(self) -> None:
+        """记号绑定的是**哪一次消费**，不是"某天有过一次失败"。
+
+        场景：本进程昨天换到一份不可用的令牌（记号留着），今天由另一个消费者
+        （另一个实例、或到期轮换）完成了一次消费。今天的拒绝与我们的记号无关，因此
+        必须如实报上界——继承旧记号会把一个例行拒绝说成"派生令牌不可用"，指向一个
+        今天根本没发生过的故障（变异验红实测 Q10）。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING"):
+            with self.assertRaises(AccessTokenUnavailable):
+                fixture.loop.refresh_for_supply()
+
+        # 第二天：别人先完成了一次消费，凭据上记着的是**那一次**的时刻。
+        fixture.clock.advance(timedelta(days=1))
+        fixture.vault.consumed_at = fixture.clock.now
+
+        with self.assertRaises(AccessTokenUnavailable) as raised:
+            fixture.loop.refresh_for_supply()
+
+        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
 
     def test_after_a_restart_the_reason_falls_back_to_the_honest_one(self) -> None:
         """记号是进程内的：重启之后本进程对"上一次换到了什么"一无所知。
