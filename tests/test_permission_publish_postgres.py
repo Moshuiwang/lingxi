@@ -708,5 +708,196 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
         self.assertEqual(self.store.redact_expired_payloads(now=expires), 0)
 
 
+class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
+    """S-C-03b 的每轮 tick 输入：**只有已发布、且确认还没收口**的那一版。
+
+    只有真库能证伪：三条筛选（已发布 / 没有更新版本 / 没有终态就绪记录）写在一条 SQL
+    里，其中第三条还跨读 ``mcp_sync_check``。在假 store 上跑，无论谓词怎么写都是绿的。
+
+    否定面：``pending`` 的意图取不到（**撤权通知只在读回一致之后发**的落点）；被更新
+    版本取代的旧意图取不到；已经收口（ready / no_permission / timed_out）的取不到；
+    内容擦除后的行取不到。
+    """
+
+    def _publish(self, *, user_id: str = USER_A, row: PublishRow | None = None) -> str:
+        decision = self.store.record_decision(
+            user_id=user_id, row=row or _row(), reason="x", decided_at=NOW
+        )
+        claimed = self.store.claim_next()
+        assert claimed is not None
+        self.store.complete(
+            _attempt(
+                claimed.outbox_id,
+                version=claimed.permission_version,
+                user_id=user_id,
+            ),
+            status=STATUS_PUBLISHED,
+        )
+        return decision.outbox_id or ""
+
+    def _record_check(self, user_id: str, version: int, result: str) -> None:
+        from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+        from lingxi.core.permission.mcp_readiness import (
+            ReadinessAttempt,
+            ReadinessBinding,
+            ReadinessOutcome,
+        )
+
+        outcome = ReadinessOutcome(result)
+        extra: dict = {}
+        if outcome is ReadinessOutcome.READY:
+            extra = {"metric_count": 2}
+        elif outcome is ReadinessOutcome.WAITING:
+            extra = {"error_code": "empty_metrics", "metric_count": 0}
+        else:
+            extra = {"error_code": "budget_exhausted"}
+        PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
+            ReadinessAttempt(
+                binding=ReadinessBinding(user_id, version),
+                attempt_no=1,
+                outcome=outcome,
+                started_at=NOW,
+                finished_at=NOW,
+                **extra,
+            )
+        )
+
+    def test_a_published_intent_is_a_candidate(self) -> None:
+        self._publish()
+
+        pending = self.store.published_awaiting_readiness()
+
+        self.assertEqual([item.user_id for item in pending], [USER_A])
+        self.assertEqual(pending[0].permission_version, 1)
+        self.assertEqual(pending[0].permissions, '{"1011":["商务"]}')
+
+    def test_a_pending_intent_is_not_a_candidate(self) -> None:
+        """否定断言：**还没发布读回一致的意图不会触发任何通知。**"""
+
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+
+        self.assertEqual(self.store.published_awaiting_readiness(), ())
+
+    def test_an_intent_superseded_by_a_newer_version_is_not_a_candidate(self) -> None:
+        """否定断言：权限又变了时，**旧的那一版不再确认、也不据它通知**。"""
+
+        self._publish()
+        self.store.record_decision(
+            user_id=USER_A, row=_row(permissions='{"1011":["商务","财务"]}'), reason="x", decided_at=NOW
+        )
+
+        self.assertEqual(self.store.published_awaiting_readiness(), ())
+
+    def test_a_terminal_readiness_record_removes_the_candidate(self) -> None:
+        """终态就是"这条变化处理过了"的唯一水位——它同时保证通知只发一次。"""
+
+        for result in ("ready", "no_permission", "timed_out"):
+            with self.subTest(result):
+                self.setUp()
+                self._publish()
+                self.assertEqual(len(self.store.published_awaiting_readiness()), 1)
+
+                self._record_check(USER_A, 1, result)
+
+                self.assertEqual(self.store.published_awaiting_readiness(), ())
+
+    def test_an_intermediate_readiness_record_keeps_the_candidate(self) -> None:
+        self._publish()
+
+        self._record_check(USER_A, 1, "waiting")
+
+        self.assertEqual(len(self.store.published_awaiting_readiness()), 1)
+
+    def test_a_redacted_payload_is_not_a_candidate(self) -> None:
+        """擦过的快照说不出"当时发布的范围是什么"，据它渲染通知只会渲染出一句错话。"""
+
+        self._publish()
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_expires_at FROM publish_outbox WHERE user_id = %s", (USER_A,)
+            )
+            expires = cursor.fetchone()[0]
+        self.assertEqual(self.store.redact_expired_payloads(now=expires), 1)
+
+        self.assertEqual(self.store.published_awaiting_readiness(), ())
+
+    def test_the_budget_is_respected(self) -> None:
+        self._publish()
+        self._publish(user_id=USER_B, row=_row(EMAIL_B))
+
+        self.assertEqual(len(self.store.published_awaiting_readiness(limit=1)), 1)
+        self.assertEqual(len(self.store.published_awaiting_readiness(limit=5)), 2)
+
+    def test_an_illegal_budget_is_rejected(self) -> None:
+        for limit in (0, -1, True):
+            with self.subTest(limit):
+                with self.assertRaises(ValueError):
+                    self.store.published_awaiting_readiness(limit=limit)
+
+
+class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
+    """撤权判据与通知收件人：两条只读查询的真库形状。"""
+
+    def _activate(self, user_id: str = USER_A, *, account_state: str = "enabled") -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET provisioning_state = 'active', account_state = %s WHERE id = %s",
+                (account_state, user_id),
+            )
+
+    def test_a_user_without_any_published_intent_has_no_history(self) -> None:
+        """否定断言：只排过意图、还没发布成功，**不算有发布行**。"""
+
+        self.assertFalse(self.store.has_published_intent(USER_A))
+
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+
+        self.assertFalse(self.store.has_published_intent(USER_A))
+
+    def test_a_published_intent_makes_the_history_true(self) -> None:
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.claim_next()
+        self.store.complete(_attempt(decision.outbox_id or ""), status=STATUS_PUBLISHED)
+
+        self.assertTrue(self.store.has_published_intent(USER_A))
+        self.assertFalse(self.store.has_published_intent(USER_B), "只看这个人自己的历史")
+
+    def test_a_failed_intent_does_not_count_as_published(self) -> None:
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.claim_next()
+        self.store.complete(
+            _attempt(decision.outbox_id or "", outcome=PublishOutcome.CONFLICT, record_id=None),
+            status=STATUS_FAILED,
+        )
+
+        self.assertFalse(self.store.has_published_intent(USER_A))
+
+    def test_an_active_user_has_a_notice_recipient(self) -> None:
+        self._activate()
+
+        self.assertEqual(self.store.notice_recipient_open_id(USER_A), f"ou_{USER_A}")
+
+    def test_a_user_who_is_not_yet_active_gets_no_notice(self) -> None:
+        """否定断言：还没完成开通的人不该收到"你的可用范围已更新"。"""
+
+        self.assertIsNone(self.store.notice_recipient_open_id(USER_A))
+
+    def test_a_deleting_or_deleted_account_gets_no_notice(self) -> None:
+        for state in ("deleting", "deleted"):
+            with self.subTest(state):
+                self._activate(account_state=state)
+                self.assertIsNone(self.store.notice_recipient_open_id(USER_A))
+
+    def test_an_unknown_user_gets_no_notice(self) -> None:
+        self.assertIsNone(self.store.notice_recipient_open_id("usr_does_not_exist"))
+
+    def test_both_queries_require_a_user(self) -> None:
+        for call in (self.store.has_published_intent, self.store.notice_recipient_open_id):
+            for value in ("", "   "):
+                with self.subTest(call=call.__name__, value=value):
+                    with self.assertRaises(ValueError):
+                        call(value)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
