@@ -74,18 +74,35 @@ role_function`，公司范围解释在 :mod:`lingxi.core.permission.galaxy_scope
 转小写）由 26/26 行回源核对证实，保留不动。公司 ID 键同样只做去空白——它是编号，不是
 逐字匹配的指标名。
 
-### 写侧目前放进值列表的**还不是指标名**（真实发布的阻塞项）
+### 写侧目前放进值列表的**还不是指标名**（真实发布的阻塞项，载体已交付、内容待填）
 
 Lingxi 当前的权限模型产出的是**职能标签**（角色名映射配置
 ``lingxi/config/galaxy_role_function_map.toml`` 的值，见
-:mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺一层
-**「公司 + 职能 → 指标名列表」的翻译**，它的输入来源（现行写入方 biai-agent 用的是
-什么）仍在探索中，因此本 Story **不实现它**，:func:`aggregate_permission` 的接口保持
-现状。
+:mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺的
+**「公司 + 职能 → 指标名列表」翻译层**已由 [#227](https://github.com/Moshuiwang/lingxi/issues/227)
+交付**载体**（存放形态 + 加载器 + 聚合层接线 + 校验，见
+:mod:`lingxi.core.permission.metric_translation`、
+:mod:`lingxi.adapters.company_function_metric_map_file`、随包发布的
+``lingxi/config/company_function_metric_map.toml``，接线点在
+:mod:`lingxi.apps.scheduler.permission_refresh`）；:func:`aggregate_permission` 的
+接口本身保持现状不变——它产出的仍然是职能标签，翻译发生在它与序列化之间的下一层。
 
-后果必须说清楚：**当前 :func:`serialize_permissions` 的输出在形状上正确、在取值上还
-不是 MCP 能用的指标名**。真实发布本就留 L4a 受控窗口，翻译层补齐并核对之前不得真实
-写入——这是本 Story 登记的阻塞项，不是可以顺手忽略的细节。
+**映射内容**（哪个公司的哪个职能对应哪些指标名）仍只有产品负责人能给，#227 刻意不
+实现它：随包发布的配置文件当前是空的，翻译层因此对任何用户的任何「公司 + 职能」组合
+都 fail-closed（既不猜测，也不回落成职能标签本身，也不静默丢弃只翻译一部分）。
+
+后果必须说清楚：**内容到位之前，翻译层不会产出任何可发布内容，效果等同于旧的阻塞项
+（值列表不是 MCP 能用的指标名）**，只是失败发生的位置从「隐式：没人接令牌」换成了
+「显式：翻译层 fail-closed」。真实发布本就留 L4a 受控窗口，映射内容补齐并核对之前
+不得真实写入——这条阻塞项不因为载体已交付而解除，仍然登记在此。
+
+**本函数（``serialize_permissions``）与它的既有用例本身不因翻译层而改变**：它的
+形状是"一份职能列表适用于用户持有的全部公司"，翻译之后是"每个公司一份可能不同的
+指标名列表"，两者结构不同，因此翻译层走的是姊妹函数
+:func:`serialize_translated_permissions`，不是把这个函数改成翻译层的入口——这一点
+与本文档更早版本"翻译层补上时只改这一个函数"的预告不同，是 #227 落地时的实际选择，
+理由见 :func:`serialize_translated_permissions` 与
+:mod:`lingxi.core.permission.metric_translation` 的模块文档。
 
 ### 其余定稿
 
@@ -434,10 +451,16 @@ def serialize_permissions(aggregate: PermissionAggregate) -> str:
     （26/26 行），语义依据是产品负责人同日对 #155 的答复——都不是我们自拟的约定，这张表
     是现行问数 MCP 正在消费的权限源，详见模块文档。
 
-    **当前放进值列表的还是职能标签，不是指标名**：中间缺一层「公司 + 职能 → 指标名
-    列表」的翻译（输入来源仍在探索），本 Story 不实现它。因此本函数的输出形状对、取值
-    还不可用于真实发布——模块文档「写侧目前放进值列表的还不是指标名」一节是这条阻塞项
-    的正文。全仓库只有这一处实现：翻译层补上时只改这一个函数与它的用例。
+    **当前放进值列表的还是职能标签，不是指标名**：本函数只认
+    :attr:`PermissionAggregate.functions`，从不查翻译映射——「公司 + 职能 → 指标名
+    列表」的翻译载体已由 [#227](https://github.com/Moshuiwang/lingxi/issues/227) 交付
+    （:mod:`lingxi.core.permission.metric_translation`），但走的是姊妹函数
+    :func:`serialize_translated_permissions`，**不经过本函数**：本函数的输出形状与
+    既有用例因此**一个字节都没变**。调用方（每日权限重算职责）已经切换成翻译后的
+    路径；本函数继续保留只是因为它是"聚合结果 → 发布行"这条链在职能标签层面唯一有
+    完整测试覆盖的实现，删掉它对当前生产调用点没有任何好处。模块文档「写侧目前放进
+    值列表的还不是指标名」一节是完整阻塞项的正文（内容——即真实映射——仍待产品负责人
+    填入配置文件，载体本身不产出可用于真实发布的取值）。
 
     **值列表里的字符串原样透传，一个字符都不动**（产品负责人 2026-08-17 答复：MCP 逐字
     匹配，大小写与全半角敏感）。这里只挡 ``None`` 与非字符串——那是本侧缺陷，不是数据。
@@ -463,6 +486,47 @@ def serialize_permissions(aggregate: PermissionAggregate) -> str:
         # 同一份列表。这不是偷懒展开：按公司细分需要银河提供按国家的角色授权，
         # 而它没有——凭空细分等于伪造一份我们并不知道的范围。
         document = {company: list(values) for company in aggregate.companies}
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def serialize_translated_permissions(company_metrics: Mapping[str, Sequence[str]]) -> str:
+    """把翻译层（:mod:`lingxi.core.permission.metric_translation`）产出的
+    「公司 → 指标名列表」序列化成 ``permissions`` 单元格文本。
+
+    与 :func:`serialize_permissions` 出自**同一套序列化纪律**：值列表元素经
+    :func:`_verbatim` 逐字符透传（不做任何大小写折叠、全半角转换或裁剪），
+    ``sort_keys=True`` + ``separators=(",", ":")`` + ``ensure_ascii=False``。
+    唯一的形状差异是输入——:func:`serialize_permissions` 假设**同一份职能列表
+    适用于用户持有的全部公司**（银河的授权模型决定的），本函数接受**每个公司可能
+    不同**的指标名列表（翻译层是「公司 + 职能」联合键，天然允许不同）。两个函数
+    因此不能合并成一个：合并会让"这份 functions 对所有公司通用"这条假设在类型上
+    变得可以被翻译层悄悄打破，而调用方（每日权限重算职责）不会注意到。
+
+    调用方必须保证传入的每个公司的指标名列表**已经去重排序**
+    （:func:`~lingxi.core.permission.metric_translation.translate_company_functions`
+    的产出满足这一点）——本函数不重新排序值列表元素，理由与
+    :func:`serialize_permissions` 相同：恒等序列化需要"值是 JSON 列表元素、
+    ``json.dumps`` 不会替它排序"这层保证在**上游**成立，这里只是复用它，不是
+    重新发明它。公司键本身仍由 ``sort_keys=True`` 兜底排序。
+
+    **写侧不产出空列表**：与 :func:`serialize_permissions` 同一条纪律
+    （``PermissionAggregate`` 的 ``__post_init__`` 在那一侧挡住），这里由本函数
+    自己挡——空列表表示"该公司下无任何指标"，是读侧
+    （:func:`lookup_metrics`）的合法形状，写侧翻译出一个空列表意味着某个职能在
+    某公司下被翻译成了"没有任何指标"，那本身就该在翻译层被当作未覆盖处理
+    （模块文档「未覆盖」一节），不该流到序列化层才发现。
+    """
+
+    if not company_metrics:
+        raise ValueError("翻译后的权限内容不得为空：至少要有一个公司键")
+    document: dict[str, list[str]] = {}
+    for company, metrics in company_metrics.items():
+        if not isinstance(company, str) or not company:
+            raise ValueError("翻译后的公司键必须是非空字符串")
+        values = [_verbatim(item) for item in metrics]
+        if not values:
+            raise ValueError(f"公司 {company} 的翻译结果不得是空列表：写侧不产出该形状")
+        document[company] = values
     return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -658,6 +722,53 @@ def build_publish_row(
         email=normalized,
         name=name,
         permissions=serialize_permissions(aggregate),
+        status=STATUS_APPROVED,
+        updated_at=format_updated_at(decided_at),
+        token_cipher=token_cipher,
+    )
+
+
+def build_translated_publish_row(
+    *,
+    company_metrics: Mapping[str, Sequence[str]],
+    email: str,
+    display_name: str,
+    decided_at: datetime,
+    token_cipher: str | None = None,
+) -> PublishRow:
+    """与 :func:`build_publish_row` 同构，但 ``permissions`` 取翻译层
+    （:mod:`lingxi.core.permission.metric_translation`）已经算好的
+    「公司 → 指标名列表」，而不是从 ``PermissionAggregate.functions`` 现算职能标签。
+
+    **调用方必须先翻译成功才能调用本函数**：翻译失败（存在未覆盖的「公司 + 职能」
+    组合）要走 fail-closed 出口，不产出任何发布行——本函数不接受
+    ``PermissionAggregate``，也不知道"翻译失败时该怎么办"，那个决定在调用方
+    （每日权限重算职责）。这不是遗漏：把"翻译失败"和"翻译成功后结算行"揉进同一个
+    函数，会让"失败要不要继续往下走"这件事变成一个可以被参数悄悄绕过的分支，而
+    :func:`serialize_translated_permissions` 对空输入与空列表已经会响亮失败——
+    本函数不重复那层校验，直接复用它。
+
+    ``email``/``display_name``/``decided_at``/``token_cipher`` 与
+    :func:`build_publish_row` 完全同源同口径，不再重复注释；两个函数各自独立校验
+    邮箱与姓名（而不是抽出一个共享的私有辅助函数），是为了不让"翻译路径"与
+    "职能标签直传路径"在这一层产生任何隐式耦合——两条路径将来的生命周期不同
+    （职能标签路径没有生产调用方，纯粹是既有测试覆盖的保留；翻译路径是唯一在产的
+    路径），耦合会让删除前者变成一次要同时读两条路径的手术。
+    """
+
+    normalized = normalize_email(email)
+    if not normalized:
+        # 与 build_publish_row 同一条：没有邮箱就没有 record_key，
+        # 也就没有「这一行是谁的」这个问题的答案。
+        raise ValueError("发布行必须有可用邮箱：它同时是 record_key 与 email 两列")
+    name = _text(display_name)
+    if not name:
+        raise ValueError("发布行必须有姓名")
+    return PublishRow(
+        record_key=normalized,
+        email=normalized,
+        name=name,
+        permissions=serialize_translated_permissions(company_metrics),
         status=STATUS_APPROVED,
         updated_at=format_updated_at(decided_at),
         token_cipher=token_cipher,

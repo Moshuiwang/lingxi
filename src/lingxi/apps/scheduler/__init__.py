@@ -1398,7 +1398,7 @@ def _build_permission_refresh_duty(
     """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
 
     形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
-    审计恰一条、其余职责照常运行）。前置只有两个，逐个说明为什么它是真前置：
+    审计恰一条、其余职责照常运行）。前置有三个，逐个说明为什么它是真前置：
 
     1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）。重算要读该用户**已有**的
        令牌密文，而唯一的读取口
@@ -1413,6 +1413,14 @@ def _build_permission_refresh_duty(
     2. **角色职能映射配置**。它随包发布（``lingxi/config/galaxy_role_function_map.toml``）。
        读不出来时**不能**退化成空映射——那会让所有角色变成"未映射"，于是全员被算成无可用
        权限，是一种看起来正常的失败（``role_function_map_file`` 的模块文档同一条理由）。
+    3. **公司+职能→指标名翻译映射配置**（Issue #227）。它同样随包发布
+       （``lingxi/config/company_function_metric_map.toml``），**文件读不出来或格式不对**
+       才不注册——**空映射本身是合法内容**（``[companies]`` 表存在但没有条目，代表映射
+       内容尚未由产品负责人填入），不是一种要拒绝注册的前置缺失：职责本该正常跑起来，
+       只是每个人都会在翻译那一步 fail-closed 并跳过（模块文档「翻译」一节），这与"配置
+       文件本身损坏"是两件不同的事，必须分开判断——前者是"内容还没到"，后者是"部署配置
+       本身有问题"，把两者混在一起会让"运维发现配置文件语法错了"和"产品负责人还没填映射"
+       表现成同一种"职责不注册"，无从分辨该找谁。
 
     数据库连接串是必需配置，进程起得来就一定有，因此它不构成一个能变红的前置判定；
     职责真正的运行前置（花名册今天更新过、银河有当前有效批次）是**数据**而不是配置，
@@ -1439,6 +1447,9 @@ def _build_permission_refresh_duty(
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
     from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+    from lingxi.adapters.company_function_metric_map_file import (
+        load_company_function_metric_map,
+    )
     from lingxi.adapters.role_function_map_file import load_role_function_map
 
     try:
@@ -1452,6 +1463,22 @@ def _build_permission_refresh_duty(
         )
         logger.error(
             "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
+        )
+        return None
+
+    try:
+        metric_translation_map = load_company_function_metric_map()
+    except (OSError, ValueError) as error:
+        # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；
+        # 这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="metric_translation_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error(
+            "公司+职能→指标名翻译映射配置不可用，每日权限重算职责不注册 error=%s",
+            type(error).__name__,
         )
         return None
 
@@ -1476,6 +1503,7 @@ def _build_permission_refresh_duty(
             timeouts=config.postgres_timeouts,
         ),
         role_function_map=role_function_map,
+        metric_translation_map=metric_translation_map,
         audit=audit,
         stop=stop,
     )

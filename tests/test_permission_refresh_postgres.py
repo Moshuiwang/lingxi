@@ -97,6 +97,10 @@ EMAIL = {user: f"person{index}@example.invalid" for index, user in enumerate(PER
 NAME = {user: f"化名{index}" for index, user in enumerate(PERSONNEL, start=1)}
 
 ROLE_FUNCTION_MAP = {"A运营": "运营"}
+#: 翻译层（Issue #227）测试夹具：覆盖合成导出用到的唯一「公司 + 职能」组合
+#: （``BC-甲`` + ``运营``）。指标名是虚构占位，不对应任何真实指标。
+METRIC_NAME = "示例指标-日活"
+METRIC_TRANSLATION_MAP = {"BC-甲": {"运营": (METRIC_NAME,)}}
 
 
 def _galaxy_tables() -> dict[str, list[dict[str, str]]]:
@@ -255,6 +259,7 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             publish_history=publish_store,
             token_ciphers=self._token_store(),
             role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP,
             audit=self.audit,
             clock=self.clock,
         )
@@ -353,7 +358,9 @@ class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
             payload = cursor.fetchone()[0]
         self.assertEqual(payload["token_cipher"], issued.token_cipher)
         self.assertEqual(payload["record_key"], EMAIL[ACTIVE_USER])
-        self.assertEqual(payload["permissions"], '{"BC-甲":["运营"]}')
+        # 翻译层（Issue #227）接线之后，写进 outbox payload 的是翻译产物（指标名），
+        # 不是聚合层的原始职能标签「运营」。
+        self.assertEqual(payload["permissions"], f'{{"BC-甲":["{METRIC_NAME}"]}}')
         self.assertNotIn(issued.reveal(), str(payload), "令牌明文一步都不进 outbox")
 
 

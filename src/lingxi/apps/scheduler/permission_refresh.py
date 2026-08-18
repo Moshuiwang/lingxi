@@ -8,7 +8,8 @@
    没有有效批次同样整轮不跑，审计可分辨；
 3. 遍历**已开通**用户（``provisioning_state='active'`` 且 ``account_state NOT IN
    ('deleting','deleted')``，过滤写在 SQL 里，与花名册审计同一口径），逐人：
-   花名册身份 → 银河账号匹配 → 聚合当前有效权限 → 结算发布行 → 记一次权限决定；
+   花名册身份 → 银河账号匹配 → 聚合当前有效权限 → **翻译成指标名**（未覆盖就跳过，
+   见「翻译」一节）→ 结算发布行 → 记一次权限决定；
 4. 记一条只含计数的职责报告审计。
 
 ## 为什么顺序判据是「花名册今天更新过」而不是一个开关
@@ -83,7 +84,33 @@ lingxi 统一重签、覆写发布行密文，并经 Epic D 的用户环境链�
 ——密文写进外部表而新明文没有送到用户环境，那 26 个人下一次问数就会失败，且不可逆。
 因此本职责照旧只读既有密文、一次都不签发。
 
-## 幂等与水位
+## 翻译：公司 + 职能 → 指标名，未覆盖就跳过、不发布、不撤权（Issue #227）
+
+聚合层（:func:`~lingxi.core.permission.publish_row.aggregate_permission`）产出的
+``functions`` 是**职能标签**，发布表要的是**指标名**。两者之间的翻译由
+:func:`~lingxi.core.permission.metric_translation.translate_company_functions` 完成，
+本职责在聚合成功、**尚未**结算发布行之前调用它，映射来自构造时注入的
+:attr:`_metric_translation_map`（真实装配读随包发布的
+``lingxi/config/company_function_metric_map.toml``，见
+:mod:`lingxi.apps.scheduler` 的 ``_build_permission_refresh_duty``）。
+
+翻译失败（存在未覆盖的「公司 + 职能」组合——**当前部署下映射为空，因此每一个有效
+授权用户都会走这条路**，这是刻意的，见配置文件与翻译层模块文档）时，本职责按
+:data:`SKIP_METRIC_TRANSLATION_UNAVAILABLE`（整份映射空）或
+:data:`SKIP_METRIC_TRANSLATION_UNCOVERED`（有内容但这一条没覆盖到）**跳过这个人**，
+与「输入不完整」同一档：
+
+- **不发布**：不产出任何发布意图，翻译不出真实指标名的内容不该被写出去；
+- **不撤权**：翻译覆盖不全是我们这一侧的数据缺口，不是"银河说他没有权限"，与
+  「无可用权限」（``aggregate.granted=False``）是两条不同的判定分支——把"翻译层还
+  没跟上"当成撤权信号，会让内容还没填的这段时间里，本该继续持有权限的人被误清空，
+  方向与本模块所有其他 fail-closed 分支的取舍（宁可少给、不可错撤）正好相反；
+- 计入 :attr:`PermissionRefreshReport.incomplete`，与存档缺邮箱/姓名同一个桶——两者
+  都是"我们这一侧还缺东西，不是这个人的权限变了"。
+
+映射内容全部填齐之前，本职责因此表现为"每个有权限的人都被跳过、报告里
+``reason.metric_translation_uncovered`` 计数等于应发布人数"——这条现象是预期的，
+不是回归；内容到位后这个计数会随之下降到零。
 
 同日至多一轮，靠 :attr:`~PermissionRefreshDuty.completed_on` 这个**进程内**的 UTC 日期
 水位。跨重启不幂等（新进程水位为空，当天会再跑一轮），这与
@@ -111,10 +138,14 @@ from typing import Any, Protocol
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.metric_translation import (
+    UncoveredPermissionCombination,
+    translate_company_functions,
+)
 from lingxi.core.permission.publish_row import (
     aggregate_permission,
-    build_publish_row,
     build_revocation_row,
+    build_translated_publish_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,11 +174,21 @@ SKIP_MISSING_PERSONNEL_ID = "missing_personnel_id"
 SKIP_ARCHIVED_IDENTITY_INCOMPLETE = "archived_identity_incomplete"
 #: 撤权用户在发布表里**没有我们发布过的行**：不为他新建空权限行（模块文档「撤权」一节）。
 SKIP_NO_PUBLISHED_ROW = "no_published_row"
+#: 「公司 + 职能 → 指标名」翻译层**整份映射一个条目都没有**（Issue #227）：产品负责人
+#: 还没有开始填内容。当前部署下随包发布的配置文件正是这个状态，因此**每一个有效授权
+#: 用户**都会落在这个原因码上——这是刻意的硬闸，见模块文档「翻译」一节。与
+#: :data:`SKIP_METRIC_TRANSLATION_UNCOVERED` 分开登记，是为了让运维能从审计上分辨
+#: 「整体还没开始填」与「已经在填、只是差几条」这两种截然不同的状态。
+SKIP_METRIC_TRANSLATION_UNAVAILABLE = "metric_translation_unavailable"
+#: 「公司 + 职能 → 指标名」翻译层**有内容，但这一次要用的组合没被覆盖**（Issue #227）：
+#: 不发布、不撤权，只跳过。
+SKIP_METRIC_TRANSLATION_UNCOVERED = "metric_translation_uncovered"
 
-#: 逐用户结果的三个分类。``granted`` 之外的两类都**不产生任何发布意图**。
+#: 逐用户结果的四个分类。``granted`` 之外的三类都**不产生任何发布意图**。
 STAGE_MATCH = "match"
 STAGE_AGGREGATE = "aggregate"
 STAGE_IDENTITY = "identity"
+STAGE_TRANSLATE = "translate"
 
 
 def _utc_date(moment: datetime) -> date:
@@ -336,8 +377,9 @@ class _Tally:
 class PermissionRefreshDuty:
     """每日权限重算：花名册新鲜 → 银河当前批次 → 逐个已开通用户重算并排发布意图。
 
-    语义与边界见模块文档。本类**只编排**：匹配、聚合、发布行结算三条规则分别在
+    语义与边界见模块文档。本类**只编排**：匹配、聚合、翻译、发布行结算四条规则分别在
     :mod:`lingxi.core.permission.account_match`、
+    :mod:`lingxi.core.permission.metric_translation`、
     :mod:`lingxi.core.permission.publish_row` 里，版本推进与幂等在
     :mod:`lingxi.adapters.postgres_permission_publish`，这里一条都不复制。
     """
@@ -354,6 +396,7 @@ class PermissionRefreshDuty:
         publish_history: _PublishHistory,
         token_ciphers: _TokenCipherReader,
         role_function_map: Mapping[str, str],
+        metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]],
         audit: _AuditSink,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
@@ -365,6 +408,7 @@ class PermissionRefreshDuty:
         self._publish_history = publish_history
         self._token_ciphers = token_ciphers
         self._role_function_map = role_function_map
+        self._metric_translation_map = metric_translation_map
         self._audit = audit
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
@@ -542,16 +586,37 @@ class PermissionRefreshDuty:
 
         if not identity.email or not identity.display_name:
             # 发布行的 ``record_key``/``email``/``name`` 三列都来自存档身份。缺了就
-            # 没有"这一行是谁的"的答案——先归类，而不是让 ``build_publish_row`` 抛错
-            # 之后被当成一次技术故障。
+            # 没有"这一行是谁的"的答案——先归类，而不是让 ``build_translated_publish_row``
+            # 抛错之后被当成一次技术故障。
             self._skip(tally, identity, STAGE_IDENTITY, SKIP_ARCHIVED_IDENTITY_INCOMPLETE, revoked=False)
+            return
+
+        # 翻译「公司 + 职能」→ 指标名（Issue #227）。未覆盖就跳过——不发布、不撤权，
+        # 详见模块文档「翻译」一节。放在令牌读取之前：既然本轮不会发布，没有必要为
+        # 一个注定要跳过的人去查令牌表。
+        try:
+            company_metrics = translate_company_functions(
+                companies=aggregate.companies,
+                functions=aggregate.functions,
+                all_companies=aggregate.all_companies,
+                mapping=self._metric_translation_map,
+            )
+        except UncoveredPermissionCombination as error:
+            # 两种运维状态分开记：整份映射还没有任何内容，与已经有内容但这一条组合
+            # 还没填到，是两件不同的事（模块文档「翻译」一节）。
+            reason = (
+                SKIP_METRIC_TRANSLATION_UNAVAILABLE
+                if error.mapping_is_empty
+                else SKIP_METRIC_TRANSLATION_UNCOVERED
+            )
+            self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
             return
 
         # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
         # 失败关闭）。这里没有、也不允许有任何签发路径。
         token_cipher = self._token_ciphers.token_cipher(identity.app_user_id)
-        row = build_publish_row(
-            aggregate=aggregate,
+        row = build_translated_publish_row(
+            company_metrics=company_metrics,
             email=identity.email,
             display_name=identity.display_name,
             decided_at=now,
@@ -700,5 +765,7 @@ __all__ = [
     "PERMISSION_REVOKE_REASON",
     "PermissionRefreshDuty",
     "PermissionRefreshReport",
+    "SKIP_METRIC_TRANSLATION_UNAVAILABLE",
+    "SKIP_METRIC_TRANSLATION_UNCOVERED",
     "SKIP_NO_PUBLISHED_ROW",
 ]
