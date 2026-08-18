@@ -31,7 +31,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
@@ -490,11 +490,23 @@ class PostgresPermissionPublishStore:
     # 发布之后：该给谁做就绪确认、该给谁发通知
     # ------------------------------------------------------------------
 
-    def published_awaiting_readiness(self, *, limit: int = 50) -> tuple[PendingReadiness, ...]:
+    def published_awaiting_readiness(
+        self, *, reasons: Sequence[str], limit: int = 50
+    ) -> tuple[PendingReadiness, ...]:
         """取「已经发布读回一致、但就绪确认还没收口」的那些 ``(用户, 权限版本)``。
 
         这是 S-C-03b 的调度职责每轮 tick 的输入（见
-        :mod:`lingxi.apps.scheduler.permission_publish`）。三条筛选各自都不能少：
+        :mod:`lingxi.apps.scheduler.permission_publish`）。
+
+        **``reasons`` 是必填的**：调用方必须说清"我负责确认哪一类意图"。它挡的不是数据
+        错误，而是**两个编排者抢同一条意图**——首次开通那条链（``first_onboarding``，
+        Epic D 的 ``OnboardingRunner``）自己会做就绪确认并发"开通完成"，如果每日刷新
+        这一侧也把它捞起来确认一遍，用户会在"开通完成"之外再收到一条措辞完全不同的
+        "可用范围已更新"，而且两个确认还会对同一个 ``(用户, 权限版本)`` 并发探针。
+        做成必填而不是给一个默认值：默认值会在新增一种 ``reason`` 时**静默地**把它归给
+        某一方，而那正是需要有人明确决定的事。
+
+        其余三条筛选各自都不能少：
 
         1. ``status = 'published'``——**只有发布读回一致的那一版**才进入就绪确认与通知。
            这条同时就是「撤权通知只在读回一致之后发」这条产品裁定在 SQL 里的落点：
@@ -519,6 +531,9 @@ class PostgresPermissionPublishStore:
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit 必须是正整数")
+        wanted = [str(item) for item in reasons if str(item).strip()]
+        if not wanted:
+            raise ValueError("必须指明本调用方负责确认哪些 reason 的发布意图")
         terminal = sorted(item.value for item in TERMINAL_OUTCOMES)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -526,6 +541,7 @@ class PostgresPermissionPublishStore:
                           o.published_at
                      FROM publish_outbox o
                     WHERE o.status = 'published'
+                      AND o.reason = ANY(%s)
                       AND o.payload ? 'permissions'
                       AND NOT EXISTS (
                             SELECT 1 FROM publish_outbox newer
@@ -540,7 +556,7 @@ class PostgresPermissionPublishStore:
                           )
                     ORDER BY o.published_at, o.id
                     LIMIT %s""",
-                (terminal, limit),
+                (wanted, terminal, limit),
             )
             rows = cursor.fetchall()
         return tuple(

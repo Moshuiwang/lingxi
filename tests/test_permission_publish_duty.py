@@ -38,6 +38,11 @@ from lingxi.apps.scheduler import (
 from lingxi.apps.scheduler.permission_publish import (
     DEFAULT_PUBLISH_LIMIT,
     DEFAULT_READINESS_LIMIT,
+    FOLLOW_UP_REASONS,
+)
+from lingxi.apps.scheduler.permission_refresh import (
+    PERMISSION_REFRESH_REASON,
+    PERMISSION_REVOKE_REASON,
 )
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
@@ -132,14 +137,16 @@ class FakeIntents:
         self._reclaimed = reclaimed
         self.reclaim_calls = 0
         self.pending_calls: list[int] = []
+        self.reason_calls: list[tuple[str, ...]] = []
         self.recipient_calls: list[str] = []
 
     def reclaim_stale(self, *, older_than: timedelta = timedelta(minutes=15)) -> int:
         self.reclaim_calls += 1
         return self._reclaimed
 
-    def published_awaiting_readiness(self, *, limit: int = 50):
+    def published_awaiting_readiness(self, *, reasons, limit: int = 50):
         self.pending_calls.append(limit)
+        self.reason_calls.append(tuple(reasons))
         return self._pending
 
     def notice_recipient_open_id(self, user_id: str) -> str | None:
@@ -298,6 +305,24 @@ class PublishFaceTest(unittest.TestCase):
         duty.run_once()
 
         self.assertEqual(parts["intents"].pending_calls, [DEFAULT_READINESS_LIMIT])
+
+    def test_the_sweep_only_claims_the_reasons_this_duty_owns(self) -> None:
+        """否定断言：**首次开通那条意图不归本职责确认**。
+
+        它由 Epic D 的开通编排自己确认并发"开通完成"；两边都捞的话，一个刚开通的用户
+        会在"开通完成"之外再收到一条措辞完全不同的"可用范围已更新"，而且两个确认还会
+        对同一个 (用户, 权限版本) 并发发探针。
+        """
+
+        duty, parts = build_duty()
+
+        duty.run_once()
+
+        self.assertEqual(parts["intents"].reason_calls, [FOLLOW_UP_REASONS])
+        self.assertEqual(
+            set(FOLLOW_UP_REASONS), {PERMISSION_REFRESH_REASON, PERMISSION_REVOKE_REASON}
+        )
+        self.assertNotIn("first_onboarding", FOLLOW_UP_REASONS)
 
     def test_illegal_budgets_are_rejected(self) -> None:
         for kwargs in ({"publish_limit": 0}, {"readiness_limit": -1}, {"publish_limit": True}):

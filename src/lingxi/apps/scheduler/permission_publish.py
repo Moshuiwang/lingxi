@@ -50,8 +50,13 @@ published_awaiting_readiness` 的 SQL 就不再把它取回来。因此"这条�
 "用户已经收到通知、系统却认为还没处理完"，下一轮再发一条。通知失败则**不回头改任何状态**
 ——产品负责人 2026-08-18 裁定 4：通知失败记审计与计数，不阻塞权限生效。
 
-## 三条边界
+## 四条边界
 
+- **只确认自己排出来的那两类意图**（:data:`FOLLOW_UP_REASONS`）。首次开通那条
+  （``first_onboarding``）由 Epic D 的开通编排自己确认并发"开通完成"——两边都捞的话，
+  一个刚开通的用户会在"开通完成"之外再收到一条措辞完全不同的"可用范围已更新"，
+  而且两个确认还会对同一个 ``(用户, 权限版本)`` 并发发探针。**发布面不分**：待发布意图
+  由本职责统一消费（发布本身与谁排的无关），分的只有"谁负责确认与通知"。
 - **超时不发通知**。``timed_out`` 表示我们没能确认这个人真的可以问数，此时说一句"你的
   可用范围已更新"就是一句我们没验证过的话。它落审计与计数（转运维的编排属 Epic D）。
 - **收件人不可用不发通知**：``provisioning_state`` 不是 ``active``、账号正在删除或已删除
@@ -71,6 +76,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
+from lingxi.apps.scheduler.permission_refresh import (
+    PERMISSION_REFRESH_REASON,
+    PERMISSION_REVOKE_REASON,
+)
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
     ReadinessBinding,
@@ -82,6 +91,13 @@ from lingxi.core.permission.notification import NoticeResult
 logger = logging.getLogger(__name__)
 
 _UTC = timezone.utc
+
+#: **本职责负责确认哪一类发布意图。** 每日刷新与撤权这两条是它自己排出来的；
+#: 首次开通那条（``first_onboarding``）**刻意不在其中**——它由 Epic D 的开通编排自己
+#: 确认并发"开通完成"。两边都捞的话，一个刚开通的用户会在"开通完成"之外再收到一条
+#: 措辞完全不同的"可用范围已更新"，而且两个确认还会对同一个 ``(用户, 权限版本)``
+#: 并发发探针。新增一种 ``reason`` 时必须显式决定它归谁，不给默认归属。
+FOLLOW_UP_REASONS: tuple[str, ...] = (PERMISSION_REFRESH_REASON, PERMISSION_REVOKE_REASON)
 
 #: 单轮发布预算：一轮最多消费多少条待发布意图。挡的是"一轮把整张表刷完"占住外部接口
 #: 配额；剩下的下一轮继续（同 :meth:`PermissionPublishExecutor.run_once` 的 ``limit``）。
@@ -100,7 +116,9 @@ class _IntentStore(Protocol):
     """发布意图与收件人的读取口（``adapters/postgres_permission_publish.py``）。"""
 
     def reclaim_stale(self, *, older_than: timedelta = ...) -> int: ...
-    def published_awaiting_readiness(self, *, limit: int = ...) -> Sequence[Any]: ...
+    def published_awaiting_readiness(
+        self, *, reasons: Sequence[str], limit: int = ...
+    ) -> Sequence[Any]: ...
     def notice_recipient_open_id(self, user_id: str) -> str | None: ...
 
 
@@ -289,9 +307,12 @@ class PermissionPublishDuty:
         tally.published = sum(1 for attempt in attempts if getattr(attempt, "published", False))
 
         interrupted = False
-        if self._readiness is not None and not self._stop.is_set():
+        readiness = self._readiness
+        if readiness is not None and not self._stop.is_set():
             pending = tuple(
-                self._intents.published_awaiting_readiness(limit=self._readiness_limit)
+                self._intents.published_awaiting_readiness(
+                    reasons=FOLLOW_UP_REASONS, limit=self._readiness_limit
+                )
             )
             tally.pending_readiness = len(pending)
             for item in pending:
@@ -301,7 +322,7 @@ class PermissionPublishDuty:
                     interrupted = True
                     break
                 try:
-                    self._advance(item, tally)
+                    self._advance(readiness, item, tally)
                 except Exception as error:  # noqa: BLE001 - 一个人的失败不得带走整轮
                     # 只记异常类型：异常正文可能带上被处理对象的内容。
                     tally.failed += 1
@@ -343,17 +364,21 @@ class PermissionPublishDuty:
     # 单条待确认
     # ------------------------------------------------------------------
 
-    def _advance(self, item: Any, tally: _Tally) -> None:
-        """把一条确认推进至多一步，并在它收口时决定要不要通知。"""
+    def _advance(self, readiness: ReadinessFollowUp, item: Any, tally: _Tally) -> None:
+        """把一条确认推进至多一步，并在它收口时决定要不要通知。
 
-        assert self._readiness is not None  # 由 run_once 的分支保证
+        ``readiness`` 由 :meth:`run_once` 取好再传进来，而不是在这里读 ``self``：
+        那一面可能整个没装配，把"它一定在"写成断言，等于让一条只在 ``-O`` 之外成立的
+        保证承担类型收窄。
+        """
+
         binding = ReadinessBinding(
             user_id=item.user_id, permission_version=item.permission_version
         )
         progress = ReadinessProgress.from_checks(
-            self._readiness.checks.load_checks(item.user_id, item.permission_version)
+            readiness.checks.load_checks(item.user_id, item.permission_version)
         )
-        attempt = self._readiness.ticker.advance(
+        attempt = readiness.ticker.advance(
             binding, permissions=item.permissions, progress=progress
         )
         if attempt is None:
@@ -362,19 +387,19 @@ class PermissionPublishDuty:
         tally.advanced += 1
         if attempt.outcome is ReadinessOutcome.READY:
             tally.ready += 1
-            self._notify(item, tally)
+            self._notify(readiness, item, tally)
             return
         if attempt.outcome is ReadinessOutcome.NO_PERMISSION:
             # 撤权那一路：没有可等的就绪，发布读回一致本身就是通知的触发点
             # （产品负责人 2026-08-18 裁定 1）。
             tally.revoked += 1
-            self._notify(item, tally)
+            self._notify(readiness, item, tally)
             return
         if attempt.outcome is ReadinessOutcome.TIMED_OUT:
             # **不通知**：我们没能确认这个人真的可以问数（模块文档「三条边界」）。
             tally.timed_out += 1
 
-    def _notify(self, item: Any, tally: _Tally) -> None:
+    def _notify(self, readiness: ReadinessFollowUp, item: Any, tally: _Tally) -> None:
         """发一条权限变化通知。**这一步失败不回头改任何状态。**
 
         通知的种类由 :func:`lingxi.core.permission.notification.render_scope_notice`
@@ -393,7 +418,7 @@ class PermissionPublishDuty:
                 permission_version=item.permission_version,
             )
             return
-        result = self._readiness.notices.notify(  # type: ignore[union-attr]
+        result = readiness.notices.notify(
             user_id=item.user_id,
             open_id=open_id,
             permission_version=item.permission_version,

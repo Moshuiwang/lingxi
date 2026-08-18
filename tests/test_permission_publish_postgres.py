@@ -719,9 +719,19 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
     内容擦除后的行取不到。
     """
 
-    def _publish(self, *, user_id: str = USER_A, row: PublishRow | None = None) -> str:
+    #: 本职责负责确认的 reason 集合（``apps/scheduler/permission_publish.FOLLOW_UP_REASONS``）。
+    #: 写成字面量而不是 import：这两条字符串是**跨模块的数据契约**，用例里照抄一份，
+    #: 才能在有人改了常量却忘了改 SQL 语义时变红。
+    OWNED_REASONS = ("daily_permission_refresh", "daily_permission_revoke")
+
+    def _candidates(self, *, limit: int = 50):
+        return self.store.published_awaiting_readiness(reasons=self.OWNED_REASONS, limit=limit)
+
+    def _publish(
+        self, *, user_id: str = USER_A, row: PublishRow | None = None, reason: str = "daily_permission_refresh"
+    ) -> str:
         decision = self.store.record_decision(
-            user_id=user_id, row=row or _row(), reason="x", decided_at=NOW
+            user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
         )
         claimed = self.store.claim_next()
         assert claimed is not None
@@ -765,7 +775,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
     def test_a_published_intent_is_a_candidate(self) -> None:
         self._publish()
 
-        pending = self.store.published_awaiting_readiness()
+        pending = self._candidates()
 
         self.assertEqual([item.user_id for item in pending], [USER_A])
         self.assertEqual(pending[0].permission_version, 1)
@@ -774,19 +784,41 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
     def test_a_pending_intent_is_not_a_candidate(self) -> None:
         """否定断言：**还没发布读回一致的意图不会触发任何通知。**"""
 
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+        )
 
-        self.assertEqual(self.store.published_awaiting_readiness(), ())
+        self.assertEqual(self._candidates(), ())
+
+    def test_an_intent_owned_by_another_orchestrator_is_not_a_candidate(self) -> None:
+        """否定断言：**首次开通那条意图不归每日刷新这一侧确认**。
+
+        它由 Epic D 的开通编排自己确认并发"开通完成"。两边都捞会让一个刚开通的用户
+        再收到一条措辞完全不同的"可用范围已更新"，两个确认还会并发探同一个人。
+        """
+
+        self._publish(reason="first_onboarding")
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_the_owned_reasons_must_be_stated(self) -> None:
+        for reasons in ((), ("",), ("   ",)):
+            with self.subTest(reasons):
+                with self.assertRaises(ValueError):
+                    self.store.published_awaiting_readiness(reasons=reasons)
 
     def test_an_intent_superseded_by_a_newer_version_is_not_a_candidate(self) -> None:
         """否定断言：权限又变了时，**旧的那一版不再确认、也不据它通知**。"""
 
         self._publish()
         self.store.record_decision(
-            user_id=USER_A, row=_row(permissions='{"1011":["商务","财务"]}'), reason="x", decided_at=NOW
+            user_id=USER_A,
+            row=_row(permissions='{"1011":["商务","财务"]}'),
+            reason="daily_permission_refresh",
+            decided_at=NOW,
         )
 
-        self.assertEqual(self.store.published_awaiting_readiness(), ())
+        self.assertEqual(self._candidates(), ())
 
     def test_a_terminal_readiness_record_removes_the_candidate(self) -> None:
         """终态就是"这条变化处理过了"的唯一水位——它同时保证通知只发一次。"""
@@ -795,18 +827,18 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
             with self.subTest(result):
                 self.setUp()
                 self._publish()
-                self.assertEqual(len(self.store.published_awaiting_readiness()), 1)
+                self.assertEqual(len(self._candidates()), 1)
 
                 self._record_check(USER_A, 1, result)
 
-                self.assertEqual(self.store.published_awaiting_readiness(), ())
+                self.assertEqual(self._candidates(), ())
 
     def test_an_intermediate_readiness_record_keeps_the_candidate(self) -> None:
         self._publish()
 
         self._record_check(USER_A, 1, "waiting")
 
-        self.assertEqual(len(self.store.published_awaiting_readiness()), 1)
+        self.assertEqual(len(self._candidates()), 1)
 
     def test_a_redacted_payload_is_not_a_candidate(self) -> None:
         """擦过的快照说不出"当时发布的范围是什么"，据它渲染通知只会渲染出一句错话。"""
@@ -819,20 +851,20 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
             expires = cursor.fetchone()[0]
         self.assertEqual(self.store.redact_expired_payloads(now=expires), 1)
 
-        self.assertEqual(self.store.published_awaiting_readiness(), ())
+        self.assertEqual(self._candidates(), ())
 
     def test_the_budget_is_respected(self) -> None:
         self._publish()
         self._publish(user_id=USER_B, row=_row(EMAIL_B))
 
-        self.assertEqual(len(self.store.published_awaiting_readiness(limit=1)), 1)
-        self.assertEqual(len(self.store.published_awaiting_readiness(limit=5)), 2)
+        self.assertEqual(len(self._candidates(limit=1)), 1)
+        self.assertEqual(len(self._candidates(limit=5)), 2)
 
     def test_an_illegal_budget_is_rejected(self) -> None:
         for limit in (0, -1, True):
             with self.subTest(limit):
                 with self.assertRaises(ValueError):
-                    self.store.published_awaiting_readiness(limit=limit)
+                    self._candidates(limit=limit)
 
 
 class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
