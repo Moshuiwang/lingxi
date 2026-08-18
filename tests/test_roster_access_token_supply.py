@@ -1522,8 +1522,14 @@ class AssembledSupplyTest(unittest.TestCase):
         loop = build_loop(self._config(), audit=audit)
 
         names = [duty.name for duty in loop.duties]
-        self.assertEqual(names, ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"])
-        self.assertEqual(audit.records, [], "前置齐备时不该有『未注册』审计")
+        self.assertEqual(
+            names,
+            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理", "花名册审计日报"],
+        )
+        # 只看花名册那一条：同一个 `build_loop` 还会为每日权限重算与权限发布各留一条
+        # 自己的未注册审计（本夹具没配 MCP 主密钥与发布表），那是它们各自的用例的事。
+        roster_records = [record for record in audit.records if record[0].startswith("roster_audit.")]
+        self.assertEqual(roster_records, [], "前置齐备时不该有『未注册』审计")
 
     def test_assembly_never_touches_the_credential(self) -> None:
         """装配阶段不发任何请求、不读凭据文件（`V-花名册-27` 的同一条口径）。

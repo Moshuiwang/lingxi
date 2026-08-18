@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0063_roster_snapshot` |
+| head revision | `0065_mcp_token_and_sync_check` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -235,6 +235,66 @@ Issue #52 的 S-B-02。两张新表 `roster_snapshot`（元信息：读取时间
 保留期留白详见 revision 文件头部注释。
 
 两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序 `DROP TABLE`，不存在
+需要回填的历史值。
+
+## `0064_permission_publish_outbox`（权限发布意图 outbox）
+
+Issue #156 的 S-C-01。一张新表 `publish_outbox`：权限决定（`app_user.permission_version`
+推进）与「要往当前权限多维表格发布什么」的内容快照在**同一个事务**里落库，投递异步进行。
+回滚之后库里既没有新版本，也没有孤立的发布意图（`V-权限-01`）。
+
+四条约束刻意写进数据库而不是留给调用方自觉：`UNIQUE (user_id, permission_version)`
+（同一用户同一权限版本只有一条意图）、`published_at` 与 `status='published'` 互为充要
+（一条 `failed` 却带着发布时间的行会被下游读成发布成功）、触发器把
+`content_expires_at` 固定为 `created_at + 2160 hours` 并禁止改写
+`created_at`/`user_id`/`permission_version` 三个锚点、`user_id` 上的 `ON DELETE CASCADE`
+（账号删除即带走含邮箱与姓名的内容快照）。九十天到期后的内容擦除由
+`adapters/postgres_permission_publish.py` 的 `redact_expired_payloads` 落实，未进
+`0054` 的受限清理函数——理由与四处偏离数据库设计蓝本的说明详见 revision 文件头部注释。
+
+本表本 revision 新增，前滚兼容；`downgrade()` 删表并删触发器函数，不存在需要回填的
+历史值。
+
+## `0065_mcp_token_and_sync_check`（MCP 访问令牌与就绪确认记录）
+
+Issue #156 的 S-C-02。两张新表 + 一列：`mcp_access_token`（Lingxi 为建档用户签发的问数
+MCP 访问令牌）、`mcp_sync_check`（发布之后每一次「当前用户 MCP 是否就绪」的判定），
+以及 `publish_outbox.created_record_id`（**这条意图自己建过的那一行**）。
+
+最后这一列与 0064 既有的 `external_record_id` 是两件事：后者是**审计**（上一次尝试操作
+了哪一行，任何尝试都会写），前者是**出身**（只有 `create_row` 明确返回了 ID 时才写）。
+混用会让既有 26 行在一次更新读回不明之后，重试时被判成永久冲突——那是对 S-C-01
+「更新可重试收敛」语义的回归。0064 已合入不动，因此该列在本 revision 里 `ALTER TABLE` 追加。
+
+五条约束刻意写进数据库而不是留给调用方自觉：
+
+1. `mcp_access_token` 的**主键即 `user_id`**（"同一个人两条令牌"在结构上不可表达），
+   且**没有任何明文列或指纹列**；
+2. `mcp_access_token.token_cipher` 的 **CHECK 钉住我方签发格式的精确 envelope**
+   （`^[A-Za-z0-9+/]{86}==$`：明文恒 43 字符 → 密文恒 64 字节 → base64 恒 88 字符）。
+   它挡得住"把原样令牌明文写进这一列"，**即使绕过全部应用层、直接执行 SQL 也会被拒**；
+   但它**不证明内容真的经过加密**——一段恰好 88 字符的合规 base64 文本仍能写进来，
+   内容正确性由解密路径负责（解不开即失败关闭）。措辞刻意保守；
+
+   与签发格式耦合：换令牌长度或分组模式时这条 CHECK 必须同步改。另一个已知代价是
+   它与下面的禁改触发器合在一起，会让一个"形状合规但解不开"的值把那一行**砖化**
+   （只能删行重签）——取舍理由见 revision 文件头部；
+3. `mcp_access_token` 的 **BEFORE UPDATE 触发器让密文改不掉**（`user_id` /
+   `token_cipher` / `issued_at` 一经写入不可改；签发走 `ON CONFLICT DO NOTHING`，
+   不触发它）。覆盖会让库里的密文与已经发布出去的那一份分叉，而新值送不到消费方；
+4. `mcp_sync_check.result` 带 CHECK 的五路取值域，加上**一条完整 CHECK 表达五路各自的
+   精确形状**（就绪必须看见 > 0 条且无错误码；等待中必须有错误码且观察值只能缺省或为零；
+   技术失败与两类非探针终态必须有错误码且不得携带观察值）。只挡"就绪没观察值"是不够的
+   ——`waiting` 带着 `metric_count=5` 或 `technical_failure` 带着观察值，读起来都像
+   "探针跑通了看见了指标"，而它们恰恰是"没就绪"；
+5. `UNIQUE (user_id, permission_version, attempt_no)` 加上由数据库取号、并以事务级
+   advisory lock 串行化的 `attempt_no`（进程重启后不会重号覆盖既有尝试，并发记账也不会
+   有一方撞 `UNIQUE` 中止而丢掉一次已经真的发出去的探针记录）。
+
+与数据库设计蓝本的四处差异（`id` 用 ULID、删掉三个 `observed_*` 列、`result` 五态、
+`detail` 换成 `error_code`）与"为什么当前不提供令牌轮换"的取舍详见 revision 文件头部注释。
+
+两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序删表并删触发器函数，不存在
 需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
