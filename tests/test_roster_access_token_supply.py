@@ -130,6 +130,22 @@ class HolderTest(unittest.TestCase):
         self.assertIsNone(holder.fresh(now=expires_at - DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN))
         self.assertIsNone(holder.fresh(now=expires_at + timedelta(seconds=1)))
 
+    def test_the_default_safety_margin_is_a_real_margin(self) -> None:
+        """余量必须真的存在，而且要用**绝对值**断言。
+
+        上一条用例拿被测常量自己算边界，因此把余量调成 0 它照样绿——变异验红时实测到
+        这一点（M9 首轮未变红）。一个"用被测值自证"的断言，测的是恒等式而不是行为。
+        """
+
+        self.assertGreaterEqual(DEFAULT_ACCESS_TOKEN_SAFETY_MARGIN, timedelta(minutes=1))
+
+        holder = DerivedAccessTokenHolder()
+        holder.store(derived(lifetime=7200), now=DAY)
+
+        # 距过期只剩 30 秒：任何有意义的余量都该判它不新鲜，否则一轮跨很多页的
+        # 花名册读取会在读到一半时撞上过期。
+        self.assertIsNone(holder.fresh(now=DAY + timedelta(seconds=7200 - 30)))
+
     def test_a_token_without_a_lifetime_is_refused_instead_of_cached(self) -> None:
         """寿命未知就不缓存：否则它会在某个说不清的时刻开始让花名册读取失败，
         而报出来的原因会指向花名册而不是令牌供给。"""
@@ -904,7 +920,90 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# 七、装配：日报职责真的拿到这条供给
+# 七、失败语义：拿不到令牌不伪装成花名册读取失败，也不注销职责
+# --------------------------------------------------------------------------
+
+
+class SupplyFailureSemanticsTest(unittest.TestCase):
+    """供给失败之后日报侧会发生什么。
+
+    ``BitableRosterPages._token`` 刻意**不**把 provider 自己抛的异常折成
+    :class:`RosterReadError`：拿不到凭据是本侧的授权问题，不是"花名册源头异常"，
+    两者混在一起会让日报与告警指向错误的地方（去查花名册，而问题在凭据）。
+    因此失败关闭发生在职责级：不注销、水位不置位、下一轮再试。
+    """
+
+    def _pages(self, provider):
+        from lingxi.adapters.feishu_roster_bitable import BitableRosterPages
+
+        def transport(*_args, **_kwargs):  # pragma: no cover - 令牌取不到就不该走到这里
+            raise AssertionError("拿不到令牌时不得发起任何请求")
+
+        return BitableRosterPages(
+            base_url="https://open.feishu.cn/open-apis",
+            app_token="bascnFakeAppToken",
+            table_id="tblFakeTable",
+            access_token=provider,
+            transport=transport,
+        )
+
+    def test_a_supply_failure_is_not_folded_into_a_roster_read_failure(self) -> None:
+        from lingxi.adapters.feishu_roster_bitable import read_roster_snapshot
+
+        def failing() -> str:
+            raise AccessTokenUnavailable("no_credential_available")
+
+        with self.assertRaises(AccessTokenUnavailable) as raised:
+            read_roster_snapshot(self._pages(failing))
+
+        self.assertEqual(raised.exception.reason, "no_credential_available")
+
+    def test_a_failing_duty_neither_stops_the_others_nor_stays_down(self) -> None:
+        """`V-保留-15` 的同一条结构保证在这里的落地：职责级失败隔离 + 下一轮重试。"""
+
+        from lingxi.apps.scheduler import SchedulerLoop
+
+        class FailingRosterDuty:
+            name = "花名册审计日报"
+
+            def __init__(self) -> None:
+                self.rounds = 0
+
+            def run_once(self):
+                self.rounds += 1
+                raise AccessTokenUnavailable("credential_persist_failed")
+
+        class OtherDuty:
+            name = "保留清理"
+
+            def __init__(self) -> None:
+                self.rounds = 0
+
+            def run_once(self):
+                self.rounds += 1
+                return "ok"
+
+        roster, other = FailingRosterDuty(), OtherDuty()
+        loop = SchedulerLoop(duties=(other, roster), interval_seconds=0.01)
+
+        with self.assertLogs("lingxi.apps.scheduler", level="ERROR") as captured:
+            loop.run_once()
+            loop.run_once()
+
+        self.assertEqual(roster.rounds, 2, "失败的职责下一轮照样再试，不被注销")
+        self.assertEqual(other.rounds, 2, "一个职责失败不得带走另一个")
+        self.assertTrue(
+            all("AccessTokenUnavailable" in line for line in captured.output),
+            captured.output,
+        )
+        self.assertTrue(
+            all(FAKE_ACCESS_TOKEN not in line for line in captured.output),
+            "职责级失败日志里不得出现令牌值",
+        )
+
+
+# --------------------------------------------------------------------------
+# 八、装配：日报职责真的拿到这条供给
 # --------------------------------------------------------------------------
 
 
