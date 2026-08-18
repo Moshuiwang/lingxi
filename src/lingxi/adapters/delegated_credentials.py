@@ -16,6 +16,10 @@
   再次领取都不可见，进程崩溃也不会在租期后重放已被飞书作废的令牌；
 - ``save`` 写入新凭据并清空消费标记（先登记数据库主体，让触发器把关，
   再落文件——顺序不能反，否则触发器拒绝时密文已经写盘）；
+- ``refresh_consumed_at`` 随新凭据一起落盘（Issue #215）：日报改成按日消费一次性
+  ``refresh_token`` 之后，"今天已经换过一次"需要一个**进程重启也抹不掉**的判据，
+  由 ``claim_due(for_supply=True)`` 在文件锁内、用锁内的当前时刻、且在置位消费标记
+  之前判定。**这是每日上界唯一的权威**，进程内不留第二份账本副本；
 - ``revoke`` 删除凭据文件但**保留登记行**；
 - 超龄未清的消费中残留由 ``revoke_stale_consumed`` 收殓，并以「不可恢复」日志
   请求人工重新授权。
@@ -31,7 +35,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,7 @@ from typing import Any
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
+    RefreshAlreadyConsumedToday,
     SecretToken,
     expiry_moment,
     rotation_deadline,
@@ -65,6 +70,9 @@ class StoredCredential:
     # 世代号，世代不符说明期间发生了新授权——旧链的结果一律放弃，不得覆盖或
     # 删除新凭据（终轮 Codex）。
     generation: str = ""
+    # 领取那一刻的**权威消费时刻**，由 ``claim_due`` 在文件锁内生成（Issue #215）。
+    # 只有领取回来的凭据带它；``load`` 读到的是未消费的形态，因此为 ``None``。
+    consumed_at: datetime | None = None
 
 
 class HostFileDelegatedCredentialVault:
@@ -106,6 +114,7 @@ class HostFileDelegatedCredentialVault:
         replacing_generation: str | None = None,
         expected_registered_subject_open_id: str | None = None,
         require_absent_registration: bool = False,
+        refresh_consumed_at: datetime | None = None,
     ) -> bool:
         """登记主体并写入（或轮换）唯一一条专用授权凭据。
 
@@ -129,10 +138,23 @@ class HostFileDelegatedCredentialVault:
 
         无 expected 时是初次受控写入的兼容路径；V-身份-02 的反向触发器仍在
         登记写入处把关，触发器拒绝时密文一个字节都不落盘。
+
+        ``refresh_consumed_at`` 由**消费了一次一次性 ``refresh_token`` 的调用方**
+        （凭据轮换职责）显式给出，随新凭据一起落盘，成为"今天已经换过一次"的持久判据
+        （Issue #215 的频率上界；由 :meth:`claim_due` 的 ``for_supply`` 模式在锁内判定）。
+        它必须原样回传 ``claim_due`` 返回的那个 ``consumed_at``——两处用同一个锁内时刻，
+        "哪一天已经消费过"才只有一个时钟说了算。
+
+        新授权与首次建立**不带**这个时刻：那不是一次续期消费。刚授权完就被上界挡住会让
+        运维在恢复之后还要再等一天，而"人工重授权当天即可恢复"是已接受的语义。判据显式
+        传入而不是从写入路径反推，正是为了不让"这次写入算不算消费"变成隐式约定。
         """
 
         if require_absent_registration and expected_registered_subject_open_id is not None:
             raise ValueError("首次建立与既有主体 CAS 不能同时使用")
+        if refresh_consumed_at is not None:
+            if refresh_consumed_at.tzinfo is None or refresh_consumed_at.utcoffset() is None:
+                raise ValueError("续期消费时刻必须是带时区的时间")
 
         moment = issued_at or datetime.now(timezone.utc)
         from lingxi.core.ids import new_ulid
@@ -192,6 +214,10 @@ class HostFileDelegatedCredentialVault:
                     "refresh_at": rotation_deadline(moment, grant.refresh_token_expires_in).isoformat(),
                     "expires_at": expiry_moment(moment, grant.refresh_token_expires_in).isoformat(),
                     "consumed_at": None,
+                    # 只记"哪一刻消费了一次续期"，不记任何令牌值。
+                    "refresh_consumed_at": (
+                        None if refresh_consumed_at is None else refresh_consumed_at.isoformat()
+                    ),
                 }
                 self._write_encrypted(payload)
         logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
@@ -276,16 +302,43 @@ class HostFileDelegatedCredentialVault:
             return None
         return credential
 
-    def claim_due(self, *, lease_seconds: int = DEFAULT_LEASE_SECONDS, now: datetime | None = None) -> StoredCredential | None:
-        """领取到期凭据并**原子置位消费标记**。
+    def claim_due(
+        self,
+        *,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        now: datetime | None = None,
+        for_supply: bool = False,
+    ) -> StoredCredential | None:
+        """领取凭据并**原子置位消费标记**。
 
         文件锁扮演数据库版 ``FOR UPDATE SKIP LOCKED`` 的角色；消费标记本身是
         防重放的门——置位之后，无论进程死在何处，旧令牌都不会被再次领取。
+
+        ``for_supply=True`` 是**按需续期**入口（Issue #215）：日报每天要一次派生短期
+        令牌，而轮换点在有效期 80%（约 5.6 天）才到。这个模式做两件**捆在一起**的事，
+        没有任何参数能把它们拆开：放开到期判定，同时施加"每 UTC 日至多一次"的上界。
+        拆得开就迟早会被拆开，而单独放开到期判定等于把一条一次性凭据交给一个没有任何
+        频率约束的循环。
+
+        上界的判据是凭据自己记着的 ``refresh_consumed_at``，**在锁内、用锁内的当前时刻
+        判定，也在置位消费标记之前判定**：
+
+        - 在锁内取"现在几点"，等锁跨过 UTC 午夜也不会把 D+1 的领取记成 D；
+        - 判据随凭据落盘，因此进程重启、崩溃重启循环乃至同一宿主机上的第二个实例都
+          绕不过它；这是**唯一**的每日上界，没有第二份进程内副本——副本不认识凭据代际，
+          会在人工重授权之后继续拿旧账本拒绝一条全新的凭据；
+        - 先判上界、后置位标记：反过来会让一次被拒的领取把凭据标成"消费中"，等于每天
+          亲手制造一次凭据丢失。
+
+        领取成功时返回的 :class:`StoredCredential` 带上 ``consumed_at``——**锁内生成的
+        那个权威时刻**。轮换收尾必须把它原样写回新凭据（``save(refresh_consumed_at=…)``），
+        这样"哪一天已经消费过"始终由同一个时钟说了算。
         """
 
         del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
-        moment = now or datetime.now(timezone.utc)
         with self._locked():
+            # 时刻在锁内取：等锁可能跨越 UTC 午夜，锁外算好的日期会判错一整天。
+            moment = now or datetime.now(timezone.utc)
             payload = self._read_payload()
             if payload is None:
                 return None
@@ -298,14 +351,19 @@ class HostFileDelegatedCredentialVault:
                 self._path.unlink(missing_ok=True)
                 logger.warning("专用授权凭据已撤销 reason=credential_undecryptable")
                 return None
-            if credential.expires_at <= moment or credential.refresh_at > moment:
-                if credential.expires_at <= moment:
-                    self._path.unlink(missing_ok=True)
-                    logger.warning("专用授权凭据已撤销 reason=credential_expired")
+            if credential.expires_at <= moment:
+                self._path.unlink(missing_ok=True)
+                logger.warning("专用授权凭据已撤销 reason=credential_expired")
+                return None
+            if for_supply:
+                consumed_at = _parse_utc(payload.get("refresh_consumed_at"))
+                if consumed_at is not None and consumed_at.date() == moment.astimezone(timezone.utc).date():
+                    raise RefreshAlreadyConsumedToday(consumed_at=consumed_at)
+            elif credential.refresh_at > moment:
                 return None
             payload["consumed_at"] = moment.isoformat()
             self._write_encrypted(payload)
-        return credential
+        return replace(credential, consumed_at=moment)
 
     # ---- 内部 -------------------------------------------------------------
 
@@ -382,6 +440,22 @@ def _parse_moment(value: Any) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    """把落盘的时刻读成**带时区的 UTC 时刻**。
+
+    频率上界按 UTC 日判定，与日报的日界一致；不带时区的历史值按 UTC 解读，因为
+    写入方（凭据轮换职责）只写带时区的 UTC 时刻。读不出来时返回 ``None``＝"没有消费
+    记录"，上界因此不拦——方向是刻意的：一份读不懂的旧载荷不该把凭据永久锁死。
+    """
+
+    moment = _parse_moment(value)
+    if moment is None:
+        return None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 class _FileLock:
