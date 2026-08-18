@@ -60,12 +60,59 @@ class SecretToken:
         return self._MASK
 
 
+class RefreshAlreadyConsumedToday(RuntimeError):
+    """今天已经消费过一次续期凭据，本次领取被拒。
+
+    这是**频率上界**的守卫（Issue #215）：日报改成按日消费一次性 ``refresh_token``
+    之后，"每 UTC 日至多一次"必须有一个进程重启也抹不掉的判据，否则一个崩溃重启循环
+    会每分钟消费一次——一次性令牌被高频消费正是 2026-08-08 授权码被烧那次事故的形状。
+
+    与"没有可领取的凭据"刻意分成两件事：前者是"今天已经换过了"，后者是"凭据没了"。
+    压成同一个 ``None`` 会让审计指向错误的地方（去查凭据丢失，而其实一切正常）。
+    异常正文只有分类，不含任何凭据值。
+    """
+
+
+@dataclass(frozen=True)
+class DerivedAccessToken:
+    """一次续期顺带派生出来的**短期** ``access_token`` 及其寿命。
+
+    只在进程内存活：不落盘、不进数据库、不进日志与审计（产品合同「凭据不进代码、
+    日志、数据库、用户环境」）。带上 ``expires_in`` 是因为"缓存下来的令牌现在还能不能
+    用"没有别的判据——飞书返回的寿命此前从未被读取过，把它丢掉就只能靠"用坏了再说"，
+    而那时报出来的会是一次花名册读取失败，指向错误的地方。
+
+    ``expires_in`` 允许为 ``None``：飞书没给寿命时**不把整轮续期判成失败**。续期成功
+    这件事已经发生，新的 ``refresh_token`` 必须照常落盘——为一个附带字段把一条一次性
+    凭据判死，方向是反的。寿命未知的派生令牌由持有者拒绝缓存，失败因此响亮地留在
+    令牌供给这一侧。
+    """
+
+    token: SecretToken
+    expires_in: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, SecretToken):
+            raise TypeError("access_token 必须包在 SecretToken 里，避免明文进入日志")
+        if self.expires_in is None:
+            return
+        if not isinstance(self.expires_in, int) or isinstance(self.expires_in, bool):
+            raise ValueError("短期令牌有效期必须是正整数秒或未知")
+        if self.expires_in <= 0:
+            raise ValueError("短期令牌有效期必须是正整数秒或未知")
+
+    @property
+    def lifetime_known(self) -> bool:
+        return self.expires_in is not None
+
+
 @dataclass(frozen=True)
 class AuthorizationGrant:
     """飞书一次授权或续期返回的、需要长期持有的那一部分。
 
     刻意**不含** ``access_token``：短期令牌只存在于一次 API 调用中，既不落库
-    也不进入本类型，免得它顺着凭据一起被持久化。
+    也不进入本类型，免得它顺着凭据一起被持久化。派生短期令牌的进程内载体是
+    :class:`DerivedAccessToken`，它同样不进任何持久载体。
     """
 
     refresh_token: SecretToken

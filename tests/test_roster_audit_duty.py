@@ -33,6 +33,7 @@ from lingxi.apps.scheduler import (
     StructuredLogAuditSink,
     build_loop,
 )
+from lingxi.core.identity.access_token_supply import AccessTokenUnavailable
 from lingxi.core.identity.roster_audit import ArchivedIdentity, DiffKind
 from lingxi.core.identity.roster_snapshot import (
     DEFAULT_SNAPSHOT_STALE_AFTER,
@@ -1088,11 +1089,13 @@ class DutyRegistrationTest(unittest.TestCase):
                 self.assertEqual(fields["variable"], expected)
                 self.assertNotIn("value", fields, "审计里不得回显变量的值")
 
-    def test_with_the_table_configured_but_no_token_supply_the_duty_is_still_not_registered(self) -> None:
-        """R3：花名册读取的短期令牌供给属 L4a 前置（G-READ 判定后凭据未落盘）。
+    def test_with_the_table_configured_the_built_in_token_supply_registers_the_duty(self) -> None:
+        """R3 已消解（Issue #215 主接线）：三个环境变量配齐即注册。
 
-        这里显式不注册并留痕，而不是装一个每轮都炸的假读取——后者会把「还没接线」
-        伪装成「接线了但一直失败」。
+        令牌供给不再是"整条链上唯一没有安全实现的部件"——`build_loop` 自己建出一条：
+        凭据轮换职责按需换一次、把派生短期令牌放进进程内持有者，日报侧按新鲜度取用。
+        **这条断言是"注册完全由配置驱动"的证据**（`V-花名册-29` 的后半句）：装配里不再
+        有一个永远不满足的前置。
         """
 
         audit = RecordingAudit()
@@ -1107,10 +1110,52 @@ class DutyRegistrationTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            [duty.name for duty in loop.duties], ["凭据轮换", "保留清理", "空闲会话清理"]
+            [duty.name for duty in loop.duties],
+            ["凭据轮换", "保留清理", "空闲会话清理", "花名册审计日报"],
         )
-        self.assertEqual([action for action, _ in audit.records], ["roster_audit.duty_not_registered"])
-        self.assertEqual(audit.records[0][1]["reason"], "roster_access_token_unwired")
+        self.assertEqual(audit.records, [], "前置齐备时不该有『未注册』审计")
+
+    def test_a_missing_token_supply_is_distinguishable_from_a_failing_one(self) -> None:
+        """R3 的语义修正：「没有供给」与「有供给但拿不到令牌」必须可分辨。
+
+        前者是装配问题、职责不注册、审计指名原因；后者是运行期的授权问题、职责照常
+        注册、失败按分类审计。压成同一条会让排障走错方向——这正是 R3 当初宁可显式
+        不注册、也不装一个每轮都炸的假读取的理由。
+        """
+
+        from lingxi.apps.scheduler import _build_roster_audit_duty
+
+        config = self._config(
+            LINGXI_ADMIN_GROUP_CHAT_ID=FAKE_CHAT_ID,
+            LINGXI_ROSTER_BITABLE_APP_TOKEN="bascnFakeAppToken",
+            LINGXI_ROSTER_BITABLE_TABLE_ID="tblFakeTable",
+        )
+
+        missing_audit = RecordingAudit()
+        missing = _build_roster_audit_duty(
+            config, stop=threading.Event(), audit=missing_audit, roster_access_token=None
+        )
+
+        self.assertIsNone(missing, "没有供给时不注册")
+        self.assertEqual(
+            [action for action, _ in missing_audit.records], ["roster_audit.duty_not_registered"]
+        )
+        self.assertEqual(missing_audit.records[0][1]["reason"], "missing_access_token_supply")
+
+        failing_audit = RecordingAudit()
+
+        def always_failing() -> str:
+            raise AccessTokenUnavailable("no_credential_available")
+
+        registered = _build_roster_audit_duty(
+            config,
+            stop=threading.Event(),
+            audit=failing_audit,
+            roster_access_token=always_failing,
+        )
+
+        self.assertIsNotNone(registered, "供给存在但会失败时，职责照常注册")
+        self.assertEqual(failing_audit.records, [], "运行期失败不产生『未注册』审计")
 
     def test_with_every_prerequisite_the_duty_is_registered_by_the_existing_entry_point(self) -> None:
         """"谁会调用它"的落点：日报职责由**已存在**的 `lingxi-scheduler` 进程装配。

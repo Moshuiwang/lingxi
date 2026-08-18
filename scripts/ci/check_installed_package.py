@@ -96,6 +96,9 @@ REQUIRED_MODULES = (
     # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
     "lingxi.core.identity.roster_snapshot",
     "lingxi.adapters.postgres_roster_snapshot",
+    # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
+    # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
+    "lingxi.core.identity.access_token_supply",
     "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
     "lingxi.adapters.feishu_directory",
@@ -239,6 +242,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation",
             "lingxi.core",
             "lingxi.core.identity",
+            # 花名册日报的短期令牌供给（Issue #215）：`apps/scheduler/__init__.py`
+            # 模块级 import，是常驻 scheduler 起进程就要用到的那一条。
+            "lingxi.core.identity.access_token_supply",
             "lingxi.core.identity.credentials",
             "lingxi.core.identity.identifiers",
             "lingxi.core.identity.roster_audit",

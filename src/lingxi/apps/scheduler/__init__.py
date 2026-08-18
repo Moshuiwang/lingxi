@@ -17,9 +17,13 @@
    ``table_id``（三者都是可选环境变量，见 :class:`SchedulerConfig`），以及花名册读取
    所用的短期令牌供给。不注册时进程照常启动、其余职责照常运行。
 
-   **当前部署下第四个职责仍然不注册**，但理由已经从「装配里写死 ``None``」变成
-   「配置缺项」：真实读取所需的专用主体凭据自 2026-08-09 起未落盘（Issue #52 的
-   G-READ 判定），令牌供给因此还没有安全的构造方式，登记为 R3。
+   **令牌供给自 Issue #215 起由本模块装配**（方案 C 主接线，产品负责人 2026-08-18
+   裁定）：凭据轮换职责按需消费一次一次性 ``refresh_token``，把派生的短期
+   ``access_token`` 放进**进程内**持有者（不落盘、不进日志与审计），日报侧按新鲜度
+   取用。因此第四个前置现在只取决于配置，三个环境变量配齐即注册。消费频率随之从约
+   5.6 天一次变成按日一次，上界由两道守卫钉住：进程内的每日预算，以及随凭据落盘、
+   重启也抹不掉的 ``refresh_consumed_at``。**唯一消费者的边界没有变**——日报不自己
+   换令牌，两个消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -61,7 +65,20 @@ from lingxi.adapters.postgres import (
     PostgresTimeoutConfigError,
     PostgresTimeouts,
 )
-from lingxi.core.identity.credentials import AuthorizationGrant, CredentialAction, RefreshOutcome, decide_after_refresh
+from lingxi.core.identity.access_token_supply import (
+    AccessTokenUnavailable,
+    DailyRefreshBudget,
+    DerivedAccessTokenHolder,
+    RosterAccessTokenProvider,
+)
+from lingxi.core.identity.credentials import (
+    AuthorizationGrant,
+    CredentialAction,
+    DerivedAccessToken,
+    RefreshAlreadyConsumedToday,
+    RefreshOutcome,
+    decide_after_refresh,
+)
 from lingxi.core.identity.identifiers import redact_identifier
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report_content
@@ -257,7 +274,9 @@ class RotationReport:
 
 
 class _Vault(Protocol):
-    def claim_due(self) -> Any: ...
+    def claim_due(
+        self, *, require_due: bool = ..., refuse_if_consumed_on: Any = ...
+    ) -> Any: ...
     def save(
         self,
         *,
@@ -266,6 +285,7 @@ class _Vault(Protocol):
         issued_at: Any = ...,
         replacing_generation: Any = ...,
         expected_registered_subject_open_id: Any = ...,
+        refresh_consumed_at: Any = ...,
     ) -> Any: ...
     def revoke(self, *, reason: str, generation: Any = ...) -> bool: ...
 
@@ -275,11 +295,20 @@ class _Authorization(Protocol):
 
 
 class CredentialRotationLoop:
-    """按飞书返回有效期的 80% 触发轮换的扫描循环。
+    """按飞书返回有效期的 80% 触发轮换的扫描循环，**兼一次性 ``refresh_token`` 的唯一消费者**。
 
     循环本身不判断"该不该轮换"——到期判定写在 SQL 的领取条件里（轮换点已由
     :func:`lingxi.core.identity.credentials.rotation_deadline` 算好并落库），
     失败后的处置写在 :func:`decide_after_refresh`。这里只负责编排与退出。
+
+    Issue #215 给它加了第二个入口 :meth:`refresh_for_supply`：花名册日报每天要一次派生
+    短期令牌，而换取它必须消费同一条一次性 ``refresh_token``。**唯一消费者这条边界因此
+    没有变**——日报不自己去换，而是让本职责按需换一次，再从进程内持有者取。产品负责人
+    2026-08-18 裁定接受由此带来的按日消费节奏（原为约 5.6 天一次）。
+
+    两个入口共用同一套纪律：领取（原子置位消费标记）→ 换新 → **先成功落盘、再交出**。
+    次序不能反：``refresh_token`` 一次性有效，"换到了但没落盘"等于凭据丢失，而先把派生
+    令牌交出去会让这条丢失路径在日报正常工作的表象下发生。
     """
 
     name = "凭据轮换"
@@ -291,6 +320,8 @@ class CredentialRotationLoop:
         authorization: _Authorization,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         stop: threading.Event | None = None,
+        holder: DerivedAccessTokenHolder | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._vault = vault
         self._authorization = authorization
@@ -298,6 +329,10 @@ class CredentialRotationLoop:
         # 与同一进程内的其他职责共享停止标志：SIGTERM 必须一次让所有职责都停止
         # 领取新工作，而不是只停下恰好持有信号处理函数的那一个。
         self._stop = threading.Event() if stop is None else stop
+        # 派生短期令牌的进程内持有者。没有它时轮换照常工作，只是派生令牌被丢弃
+        # （接线之前的行为）；有它时到期轮换与按需续期都把令牌喂进去。
+        self._holder = holder
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     @property
     def stopping(self) -> bool:
@@ -324,8 +359,10 @@ class CredentialRotationLoop:
         if claim is None:
             return RotationReport()
 
+        consumed_at = self._clock()
+        derived: Any = None
         try:
-            replacement, _access_token = self._authorization.refresh(claim.grant)
+            replacement, derived = self._authorization.refresh(claim.grant)
             outcome = RefreshOutcome.ROTATED
         except Exception as error:  # noqa: BLE001 - 任何异常都不足以证明"旧凭据还能用"
             replacement = None
@@ -338,8 +375,12 @@ class CredentialRotationLoop:
                 subject_open_id=claim.subject_open_id,
                 replacement=replacement,
                 replacing_generation=claim_generation,
+                refresh_consumed_at=consumed_at,
             ):
                 logger.info("专用授权凭据已轮换 subject=%s", redact_identifier(claim.subject_open_id))
+                # **落盘成功之后**才把派生令牌交给进程内持有者：反过来会让"续期成功但
+                # 写盘失败＝凭据丢失"这条路径在日报照常工作的表象下发生。
+                self._remember_derived(derived)
                 return RotationReport(claimed=1, rotated=1)
             # 新凭据没能落库：旧的此刻已被飞书作废，继续留着只会让下一轮拿死
             # 凭据再撞一次墙。撤销并用可与普通失败区分的日志请求人工重新授权
@@ -355,7 +396,92 @@ class CredentialRotationLoop:
         self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
         return RotationReport(claimed=1, revoked=1)
 
-    def _save_with_retry(self, *, subject_open_id: str, replacement: Any, replacing_generation: str | None = None) -> bool:
+    def refresh_for_supply(self) -> None:
+        """**按需**消费一次续期，把派生短期令牌交给进程内持有者（Issue #215）。
+
+        由花名册日报的令牌供给（:class:`~lingxi.core.identity.access_token_supply.
+        RosterAccessTokenProvider`）调用，本身不返回令牌——令牌只经持有者流转，而持有者
+        只在**新凭据成功落盘之后**才被写入。这条次序是本方法存在的全部理由：日报不自己
+        去消费一次性 ``refresh_token``，唯一消费者仍是本职责。
+
+        与到期轮换的两点不同，都写在参数里：
+
+        - ``require_due=False``——日报每天要令牌，而轮换点五天多才到一次；
+        - ``refuse_if_consumed_on``——放开到期判定必须配一道频率上界，且判据落在凭据
+          文件里，进程重启与崩溃重启循环都绕不过（一次性令牌被高频消费正是 2026-08-08
+          那次事故的形状）。
+
+        失败一律抛 :class:`AccessTokenUnavailable`，**只带分类不带值**；凭据的处置与
+        到期轮换完全一致（续期失败撤销、写盘失败撤销并按不可恢复留痕），因为"这条一次性
+        凭据还能不能用"与是谁触发的这次续期无关。
+        """
+
+        if self._stop.is_set():
+            # 停止中不再开启任何一次续期：半途中断的续期等于凭据丢失（模块头注释）。
+            raise AccessTokenUnavailable("scheduler_stopping")
+        consumed_at = self._clock()
+        try:
+            claim = self._vault.claim_due(
+                require_due=False, refuse_if_consumed_on=consumed_at.date()
+            )
+        except RefreshAlreadyConsumedToday:
+            raise AccessTokenUnavailable("refresh_already_consumed_today") from None
+        if claim is None:
+            raise AccessTokenUnavailable("no_credential_available")
+
+        claim_generation = getattr(claim, "generation", None) or None
+        try:
+            replacement, derived = self._authorization.refresh(claim.grant)
+        except Exception as error:  # noqa: BLE001 - 任何异常都不足以证明"旧凭据还能用"
+            outcome = RefreshOutcome.FAILED if _is_definite_failure(error) else RefreshOutcome.INDETERMINATE
+            logger.warning("按需续期未成功 outcome=%s error=%s", outcome.value, type(error).__name__)
+            self._vault.revoke(reason=f"refresh_{outcome.value}", generation=claim_generation)
+            raise AccessTokenUnavailable(f"refresh_{outcome.value}") from error
+
+        if not self._save_with_retry(
+            subject_open_id=claim.subject_open_id,
+            replacement=replacement,
+            replacing_generation=claim_generation,
+            refresh_consumed_at=consumed_at,
+        ):
+            logger.error(
+                "不可恢复：按需续期成功但新凭据写库失败，旧凭据已被飞书作废，需人工重新授权 subject=%s",
+                redact_identifier(claim.subject_open_id),
+            )
+            self._vault.revoke(reason="rotation_persist_failed", generation=claim_generation)
+            # 落盘失败就**不交出令牌**：让日报这一轮失败，好过在凭据已经丢失的情况下
+            # 照常发出日报、把丢失掩盖到下一次轮换才被发现。
+            raise AccessTokenUnavailable("credential_persist_failed")
+
+        logger.info("专用授权凭据已按需轮换 subject=%s", redact_identifier(claim.subject_open_id))
+        if not self._remember_derived(derived):
+            # 凭据没有丢（已落盘），只是这份派生令牌不可用。不撤销、不重试。
+            raise AccessTokenUnavailable("derived_token_unusable")
+
+    def _remember_derived(self, derived: Any) -> bool:
+        """把派生令牌交给进程内持有者。没有持有者或令牌不可用时返回 ``False``。
+
+        令牌值不进日志：这里只记"有没有拿到可用的一份"。
+        """
+
+        if self._holder is None:
+            return False
+        if not isinstance(derived, DerivedAccessToken):
+            logger.warning("续期未交出派生短期令牌，花名册读取本轮无令牌可用")
+            return False
+        stored = self._holder.store(derived, now=self._clock())
+        if not stored:
+            logger.warning("飞书未返回短期令牌寿命，派生令牌不予缓存")
+        return stored
+
+    def _save_with_retry(
+        self,
+        *,
+        subject_open_id: str,
+        replacement: Any,
+        replacing_generation: str | None = None,
+        refresh_consumed_at: datetime | None = None,
+    ) -> bool:
         """新凭据落盘带短退避重试：一次瞬时抖动不该报废一条一次性凭据。"""
 
         for delay_seconds in (0.0, *SAVE_RETRY_BACKOFF_SECONDS):
@@ -367,6 +493,7 @@ class CredentialRotationLoop:
                     grant=replacement,
                     replacing_generation=replacing_generation,
                     expected_registered_subject_open_id=subject_open_id,
+                    refresh_consumed_at=refresh_consumed_at,
                 )
                 if saved is False:
                     # 世代不符＝期间有新授权：旧链结果作废，视为已妥善收尾。
@@ -882,12 +1009,16 @@ def _build_roster_audit_duty(
             logger.warning("未配置 %s，花名册审计日报职责不注册；其余定时职责照常运行", variable)
             return None
     if roster_access_token is None:
-        # 花名册读取用的短期令牌供给尚未建立：专用授权主体的正式凭据自 2026-08-09 起
-        # 未落盘（Issue #52 的 G-READ 判定），而"就地续期换一次令牌"会与本进程的凭据
-        # 轮换职责抢同一条**一次性** refresh_token。显式不注册并留痕，而不是装一个
-        # 每轮都炸的假读取——后者会把「还没接线」伪装成「接线了但一直失败」（R3）。
-        audit.record("roster_audit.duty_not_registered", reason="roster_access_token_unwired")
-        logger.warning("花名册读取令牌供给未接线（属 L4a 前置），花名册审计日报职责不注册")
+        # 调用方没有交出任何令牌供给。**这条分支现在的含义是"真的没有供给"**，
+        # 不再是"这条链还没接线"：Issue #215 之后 `build_loop` 总会建出一个供给
+        # （凭据轮换职责按需换、进程内持有者转交），因此正式装配路径不会走到这里。
+        #
+        # 「配了但拿不到令牌」不走这条分支——那时职责照常注册，失败发生在运行期并按
+        # 分类审计（`roster_access_token.unavailable`）。两者必须可分辨：把运行期的
+        # 授权失败记成「未注册」，会让排障去找配置；反过来则会让「还没接线」看起来
+        # 像「接线了但一直失败」（R3 的原始教训）。
+        audit.record("roster_audit.duty_not_registered", reason="missing_access_token_supply")
+        logger.warning("调用方未提供花名册读取令牌供给，花名册审计日报职责不注册")
         return None
 
     from lingxi.adapters.feishu_group_message import FeishuGroupMessages
@@ -944,11 +1075,16 @@ def build_loop(
     排在最后：它一天只做一次事，晚一轮毫无影响。
 
     ``roster_access_token`` 是花名册读取所用的**短期令牌供给**（返回已就绪令牌的可调用
-    对象）。它是整条花名册链上唯一一个还没有安全实现的部件，因此单独留作注入点，而不是
-    在这里现造一个：换取令牌要消费专用授权主体那条**一次性** ``refresh_token``，而同一
-    进程里的凭据轮换职责正是它唯一的合法消费者，两个消费者共用一条一次性令牌就是
-    2026-08-08 授权码被烧那次事故的形状。**默认 ``None``，因此当前部署下审计日报职责
-    仍然不注册**（登记为 R3），但 Base 与表标识、快照链、日报渲染与调度都已按配置装配。
+    对象）。**默认不再是 ``None``**：Issue #215 主接线之后，这里建出一条进程内供给——
+    凭据轮换职责按需消费一次 ``refresh_token``、把派生短期令牌放进进程内持有者，日报侧
+    经 :class:`~lingxi.core.identity.access_token_supply.RosterAccessTokenProvider`
+    按新鲜度取用。**唯一消费者这条边界没有变**：日报自己不碰 ``refresh_token``，两个
+    消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
+
+    参数保留是为了让调用方（主要是测试）**替换**供给；``None`` 现在的含义是"用装配好的
+    那条"，而不是"没有供给"。进程内持有者与频率上界都建在这里，**每个进程一份**：它们是
+    "这个进程今天换过没有"的账本，跨进程共享会让上界失去意义；而重启也抹不掉的那道上界
+    在凭据文件里（``refresh_consumed_at``）。
     """
 
     from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
@@ -960,6 +1096,8 @@ def build_loop(
     stop = threading.Event()
     sink = audit if audit is not None else StructuredLogAuditSink()
 
+    # 派生短期令牌的进程内持有者：不落盘、不进日志与审计，重启即空。
+    holder = DerivedAccessTokenHolder()
     rotation = CredentialRotationLoop(
         vault=HostFileDelegatedCredentialVault(
             config.postgres_dsn,
@@ -974,6 +1112,7 @@ def build_loop(
         ),
         interval_seconds=config.interval_seconds,
         stop=stop,
+        holder=holder,
     )
     cleanup = RetentionCleanupDuty(
         # 清理函数内部两张表各有 2s lock_timeout，不能沿用 scheduler 通用的 3s
@@ -988,11 +1127,23 @@ def build_loop(
     )
 
     duties: list[Any] = [rotation, cleanup, idle_sweep]
+    # 令牌供给：日报侧要令牌 → 持有者里有新鲜的就直接给，没有就让**凭据轮换职责**
+    # 按需换一次（每 UTC 日至多一次）。日报自己不碰一次性 refresh_token。
+    supply = (
+        roster_access_token
+        if roster_access_token is not None
+        else RosterAccessTokenProvider(
+            holder=holder,
+            refresh=rotation.refresh_for_supply,
+            budget=DailyRefreshBudget(),
+            audit=sink,
+        )
+    )
     roster_audit = _build_roster_audit_duty(
         config,
         stop=stop,
         audit=sink,
-        roster_access_token=roster_access_token,
+        roster_access_token=supply,
         on_send_outcome=(alerting_duty.send_outcome_callback() if alerting_duty else None),
     )
     if roster_audit is not None:
