@@ -64,7 +64,7 @@ worker = ["claude-agent-sdk==0.2.128", "psycopg[binary]>=3.2,<4"]
 #               cardkit.v1.card.create/update/settings、
 #               cardkit.v1.card_element.content 流式更新、
 #               投递文本兜底 im.v1.message.reply）
-#   psycopg   → adapters/postgres_conversation.py（会话、任务队列、入站事件幂等、
+#   psycopg   → adapters/postgres_conversation/（会话、任务队列、入站事件幂等、
 #               投递 outbox 消费记账）
 #   websockets→ lark-oapi 的 ws 客户端实际用它建 wss（lark_oapi/ws/client.py:12
 #               `import websockets`、:13 `from websockets.exceptions import

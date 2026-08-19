@@ -8,6 +8,9 @@
 __pycache__/
 *.py[cod]
 .venv/
+# scripts/dev/check.sh 按需建出的一次性虚拟环境缓存（Issue #236），运行时产物，
+# 不是事实源——事实源是 .github/workflows/{ci,story}.yml，本目录随时可删重建。
+.dev-check/
 node_modules/
 .claude/worktrees/
 

@@ -274,7 +274,17 @@ class ZeroMigrationGuardTest(unittest.TestCase):
         "core/identity/roster_report.py",
         "adapters/postgres_roster_audit.py",
         "adapters/feishu_group_message.py",
-        "apps/scheduler/__init__.py",
+        # #237 拆分后 `RosterAuditDuty` 本身搬进 roster_audit.py；构造它、注入
+        # `PostgresRosterSnapshotStore`/`BitableRosterPages`/`PostgresRosterBaselineReader`
+        # 的装配代码（`_build_roster_audit_duty`）搬进 assembly.py。两个文件都是本组的
+        # 运行时源码，都要接着被这条守卫覆盖——否则拆分本身就会把这条守卫拆成两个哑
+        # 分支：一个继续扫一个只剩重导出的空壳（`__init__.py` 177 行，不再含任何本组
+        # 实现），另一个（真正持有实现的新文件）从未被扫过。不纳入 `config.py`：它只是
+        # `SchedulerConfig` 的纯环境变量读取，不 import 任何适配器、不构造任何存储对象，
+        # 是全部九个职责共享的配置外壳而不是本组专属源码，纳入它不会让这条守卫更有效，
+        # 只会让"本组"这个概念失去边界。
+        "apps/scheduler/roster_audit.py",
+        "apps/scheduler/assembly.py",
         # S-B-01：花名册分页 reader 与四态完整性判定。
         "adapters/feishu_roster_bitable.py",
         # S-B-02：替换门槛与保旧告警（core）、持久快照读写（adapters）。
@@ -628,7 +638,10 @@ class RemovalTakesNoActionTest(unittest.TestCase):
         self.assertEqual(audit.actions(), ["roster_audit.report_sent"])
 
     def test_the_duty_exposes_no_collaborator_that_could_mutate_anything(self) -> None:
-        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `RosterAuditDuty` 搬进了 roster_audit 子模块。
+        source = (
+            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py"
+        ).read_text(encoding="utf-8")
         tree = ast.parse(source)
         duty_class = next(
             node
@@ -875,7 +888,10 @@ class GroupSenderTest(unittest.TestCase):
         self.assertEqual(offenders, [], "群 ID 必须从环境变量注入，不得出现在代码库任何文件里")
 
     def test_the_chat_id_is_only_ever_read_from_the_environment(self) -> None:
-        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `SchedulerConfig`（读这个环境变量的地方）搬进了 config 子模块。
+        source = (
+            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "config.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", source)
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", SchedulerConfig.ENVIRONMENT_KEYS)
