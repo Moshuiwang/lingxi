@@ -177,6 +177,18 @@ REQUIRED_MODULES = (
     "lingxi.adapters.feishu_longconn",
     "lingxi.adapters.feishu_outbound",
     "lingxi.adapters.postgres_conversation",
+    # Issue #239：按读写边界拆成包后的子模块，逐个登记（与 core.conversation
+    # 拆包时同一条理由，见上方 #215 注释）。
+    "lingxi.adapters.postgres_conversation._dataclasses",
+    "lingxi.adapters.postgres_conversation._gateway_store",
+    "lingxi.adapters.postgres_conversation._listener",
+    "lingxi.adapters.postgres_conversation._queue_base",
+    "lingxi.adapters.postgres_conversation._queue_gateway_delivery",
+    "lingxi.adapters.postgres_conversation._queue_lifecycle",
+    "lingxi.adapters.postgres_conversation._queue_outbox",
+    "lingxi.adapters.postgres_conversation._queue_session_cleanup",
+    "lingxi.adapters.postgres_conversation._task_queue",
+    "lingxi.adapters.postgres_conversation._transaction",
     "lingxi.apps.gateway",
     "lingxi.apps.gateway.config",
     "lingxi.apps.gateway.__main__",
@@ -323,6 +335,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 包（`__init__.py` 一次性 re-export 四个子模块）与 `core.delivery`
             # 一并拉进闭包，同样必须显式登记，理由与上面同一条注释。
             "lingxi.adapters.postgres_conversation",
+            # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。
+            "lingxi.adapters.postgres_conversation._dataclasses",
+            "lingxi.adapters.postgres_conversation._gateway_store",
+            "lingxi.adapters.postgres_conversation._listener",
+            "lingxi.adapters.postgres_conversation._queue_base",
+            "lingxi.adapters.postgres_conversation._queue_gateway_delivery",
+            "lingxi.adapters.postgres_conversation._queue_lifecycle",
+            "lingxi.adapters.postgres_conversation._queue_outbox",
+            "lingxi.adapters.postgres_conversation._queue_session_cleanup",
+            "lingxi.adapters.postgres_conversation._task_queue",
+            "lingxi.adapters.postgres_conversation._transaction",
             "lingxi.core",
             "lingxi.core.identity",
             # 花名册日报的短期令牌供给（Issue #215）：`apps/scheduler/__init__.py`
@@ -388,6 +411,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.claude_agent_session",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
+            # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。
+            "lingxi.adapters.postgres_conversation._dataclasses",
+            "lingxi.adapters.postgres_conversation._gateway_store",
+            "lingxi.adapters.postgres_conversation._listener",
+            "lingxi.adapters.postgres_conversation._queue_base",
+            "lingxi.adapters.postgres_conversation._queue_gateway_delivery",
+            "lingxi.adapters.postgres_conversation._queue_lifecycle",
+            "lingxi.adapters.postgres_conversation._queue_outbox",
+            "lingxi.adapters.postgres_conversation._queue_session_cleanup",
+            "lingxi.adapters.postgres_conversation._task_queue",
+            "lingxi.adapters.postgres_conversation._transaction",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.core",
@@ -431,6 +465,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_longconn",
             "lingxi.adapters.feishu_outbound",
             "lingxi.adapters.postgres_conversation",
+            # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。
+            "lingxi.adapters.postgres_conversation._dataclasses",
+            "lingxi.adapters.postgres_conversation._gateway_store",
+            "lingxi.adapters.postgres_conversation._listener",
+            "lingxi.adapters.postgres_conversation._queue_base",
+            "lingxi.adapters.postgres_conversation._queue_gateway_delivery",
+            "lingxi.adapters.postgres_conversation._queue_lifecycle",
+            "lingxi.adapters.postgres_conversation._queue_outbox",
+            "lingxi.adapters.postgres_conversation._queue_session_cleanup",
+            "lingxi.adapters.postgres_conversation._task_queue",
+            "lingxi.adapters.postgres_conversation._transaction",
             "lingxi.adapters.postgres",
             # 投递消费循环（Issue #152）：CardKit/文本兜底 adapter 由
             # apps.gateway.assemble_delivery_consumer 在函数内 import；
