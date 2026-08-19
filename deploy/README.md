@@ -347,7 +347,7 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 | 项 | 秒 | 依据 |
 | --- | --- | --- |
 | 续期 HTTP 超时 | 20.0 | `REQUEST_TIMEOUT_SECONDS`，`adapters/feishu_directory.py` |
-| 落盘重试退避等待 | 4.2 | `SAVE_RETRY_BACKOFF_SECONDS=(0.2, 1.0, 3.0)`，`apps/scheduler/__init__.py` |
+| 落盘重试退避等待 | 4.2 | `SAVE_RETRY_BACKOFF_SECONDS=(0.2, 1.0, 3.0)`，`apps/scheduler/credential_rotation.py`（#237 拆分后的新位置） |
 | 数据库往返预算 | 75.0 | 5 次操作（4 次 save 重试 + 1 次 revoke）× 15 秒，按合法覆盖最坏值 |
 | **最坏合计** | **99.2** | × 1.5 安全系数 = 148.8 秒 → 取整要求 149 秒，compose 保留 **150 秒** |
 

@@ -294,8 +294,8 @@ def _build_alerting_duty(*, err: TextIO, trace_id: str) -> Any:
 def _combined_heartbeat(alerting_duty: Any, liveness_role: str) -> Callable[[], None]:
     """把"记进 AlertManager"与"戳一下活性文件"合成一个心跳回调（Issue #153）。
 
-    与 ``apps/gateway/__init__.py``、``apps/scheduler/__init__.py`` 的同名函数
-    同一形状，见那两处的说明。
+    与 ``apps/gateway/__init__.py``、``apps/scheduler/alerting_assembly.py``
+    （#237 拆分后的新位置）的同名函数同一形状，见那两处的说明。
     """
 
     beat = alerting_duty.heartbeat_callback(liveness_role)
