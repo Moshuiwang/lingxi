@@ -24,7 +24,7 @@ Epic D/E 联合验收要用到的受控失败旅程列为四类夹具，本模�
 
    **已核实这份配方无法在真实 Stage 进程里生效**：`ReadinessSchedule` 由调用方
    在 Python 代码里构造，不读环境变量；已知唯一的运行期覆盖点是
-   `apps/scheduler/__init__.py` 的 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS`，且它**只**
+   `apps/scheduler/config.py`（#237 拆分后的新位置）的 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS`，且它**只**
    覆盖 `probe_timeout_seconds` 一项，`interval_seconds`（180 秒一次）与
    `budget_seconds`（900 秒预算）没有任何环境变量能改写，Epic D 的
    `OnboardingRunner`（若已在候选中真实实现）目前同样没有别的覆盖入口。因此**真实

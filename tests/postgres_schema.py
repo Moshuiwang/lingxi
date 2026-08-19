@@ -208,29 +208,197 @@ def ensure_production_schema(dsn: str) -> str:
         return _build(dsn)
 
 
+# 清行时**不碰**的表。
+#
+# 前两张是 `migrations/testing/` 的测试资产，不属于生产链，由使用它们的用例自己管理；
+# `alembic_version` 建完库就被丢掉（见 `_drop_version_table`），正常不存在，列在这里
+# 是为了万一它被留下时清行也别去动它。
+#
+# inbound_event 自 0057 起是生产表，**不在**这份名单里——留在排除名单里会让 gateway 的
+# 真库用例在用例之间互相看见对方的事件行（幂等断言会假红/假绿）。
+_PRESERVED_FROM_ROW_RESET = (
+    "feishu_user_refresh_token",
+    "onboarding_progress",
+    "alembic_version",
+)
+
+_PRODUCTION_TABLES_SQL = (
+    "SELECT tablename FROM pg_tables "
+    " WHERE schemaname = 'public' "
+    "   AND tablename <> ALL(%s) "
+    " ORDER BY tablename"
+)
+
+# 外键的「子表 → 父表」边。清行按这个顺序从子往父删，父表那条 DELETE 执行时子表已经空了。
+_FOREIGN_KEY_EDGES_SQL = (
+    "SELECT child.relname, parent.relname "
+    "  FROM pg_constraint k "
+    "  JOIN pg_class child ON child.oid = k.conrelid "
+    "  JOIN pg_class parent ON parent.oid = k.confrelid "
+    "  JOIN pg_namespace n ON n.oid = child.relnamespace "
+    " WHERE k.contype = 'f' AND n.nspname = 'public'"
+)
+
+# 装了 DELETE 触发器的表——**这些表只能 TRUNCATE，不能 DELETE**。
+#
+# 0054 给 `galaxy_import_batch` 与 `feishu_org_sync_run` 装了 BEFORE DELETE 触发器
+# `lingxi_reject_premature_delete()`：未到期的行谁来删都拒绝（连保留清理专用角色也不例外，
+# 那道防线故意按到期时间判定、不按角色判定）。用例刚插进去的批次 2160 小时后才到期，
+# `DELETE` 会当场抛异常。`TRUNCATE` 不触发行级触发器，是这两张表唯一清得掉的手段。
+#
+# 判据从 `pg_trigger` 现查而不是写死表名：将来哪条 revision 给别的表加上 DELETE 触发器，
+# 清行会自动把那张表改走 TRUNCATE，而不是在某个无关模块里冒出一条看不懂的异常。
+# `tgtype & 8` 是 DELETE 位；行级与语句级一并算上（两者都会被 DELETE 触发、都不会被
+# TRUNCATE 触发）。`tgenabled = 'D'` 是被显式禁用的触发器，不会触发，不必回避。
+_DELETE_TRIGGER_TABLES_SQL = (
+    "SELECT DISTINCT c.relname "
+    "  FROM pg_trigger t "
+    "  JOIN pg_class c ON c.oid = t.tgrelid "
+    "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+    " WHERE NOT t.tgisinternal "
+    "   AND t.tgenabled <> 'D' "
+    "   AND n.nspname = 'public' "
+    "   AND (t.tgtype & 8) <> 0"
+)
+
+
+def _fetch_production_tables(cursor: Any) -> tuple[str, ...]:
+    cursor.execute(_PRODUCTION_TABLES_SQL, (list(_PRESERVED_FROM_ROW_RESET),))
+    return tuple(row[0] for row in cursor.fetchall())
+
+
 def production_tables(dsn: str) -> tuple[str, ...]:
-    """当前库里由生产链建立的表；顺序不定，删行时用 TRUNCATE ... CASCADE。"""
+    """当前库里由生产链建立的**全部**表，按表名排序。"""
 
     with _connect(dsn) as connection, connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT tablename FROM pg_tables "
-            " WHERE schemaname = 'public' "
-            "   AND tablename <> ALL(%s) "
-            " ORDER BY tablename",
-            # inbound_event 自 0057 起是生产表，必须参与清行——留在排除名单里会让
-            # gateway 的真库用例在用例之间互相看见对方的事件行（幂等断言会假红/假绿）。
-            (["feishu_user_refresh_token", "onboarding_progress", "alembic_version"],),
-        )
-        return tuple(row[0] for row in cursor.fetchall())
+        return _fetch_production_tables(cursor)
 
 
-def reset_production_rows(dsn: str) -> None:
-    """结构不动，只把生产表清空。比重建结构快一个数量级。"""
+def _fetch_tables_holding_rows(cursor: Any, tables: tuple[str, ...]) -> frozenset[str]:
+    """当前**确实存有行**的表；一条语句、一次往返，结果是精确集合而不是估算。
+
+    判据是逐表 `EXISTS (SELECT 1 FROM …)`，故意**不用** `pg_stat_user_tables.n_live_tup`
+    或 `pg_class.relpages`——那两个由统计收集器与 VACUUM 滞后刷新，一张刚被写过的表在
+    它们眼里可以仍然是「零行」。漏掉一张脏表的后果不是慢一点，是下一条用例看得见上一条
+    写进去的数据：把一个性能问题换成一个正确性问题。
+
+    空表上的 `EXISTS` 是一次零页的顺序扫描，既不取排他锁也不写 WAL；23 张表实测 0.9 毫秒。
+    """
+
+    if not tables:
+        return frozenset()
+    query = "\nUNION ALL\n".join(
+        f'SELECT %s WHERE EXISTS (SELECT 1 FROM public."{name}")' for name in tables
+    )
+    cursor.execute(query, list(tables))
+    return frozenset(row[0] for row in cursor.fetchall())
+
+
+def production_tables_with_rows(dsn: str) -> tuple[str, ...]:
+    """当前确实存有行的生产表，按表名排序。"""
+
+    with _connect(dsn) as connection, connection.cursor() as cursor:
+        tables = _fetch_production_tables(cursor)
+        return tuple(sorted(_fetch_tables_holding_rows(cursor, tables)))
+
+
+def _child_first_order(cursor: Any, tables: tuple[str, ...]) -> tuple[tuple[str, ...], frozenset[str]]:
+    """把生产表排成「子表在前、父表在后」的顺序，并返回排不进去的那些表。
+
+    返回的第二项是外键成环（或自环之外的循环引用）而无法定序的表。它们不参与 DELETE，
+    交给 TRUNCATE 处理——宁可慢一点，也不要在清行里出现一条顺序错误的 DELETE。
+
+    自引用（child 与 parent 是同一张表）直接忽略：`DELETE FROM t` 一次删光全表，
+    外键在语句结束时检查，自引用必然满足。
+    """
+
+    cursor.execute(_FOREIGN_KEY_EDGES_SQL)
+    known = set(tables)
+    parents: dict[str, set[str]] = {name: set() for name in tables}
+    predecessor_count: dict[str, int] = {name: 0 for name in tables}
+    for child, parent in cursor.fetchall():
+        if child == parent or child not in known or parent not in known:
+            continue
+        if parent in parents[child]:
+            continue
+        parents[child].add(parent)
+        predecessor_count[parent] += 1
+
+    ready = sorted(name for name in tables if predecessor_count[name] == 0)
+    ordered: list[str] = []
+    while ready:
+        name = ready.pop(0)
+        ordered.append(name)
+        for parent in sorted(parents[name]):
+            predecessor_count[parent] -= 1
+            if predecessor_count[parent] == 0:
+                ready.append(parent)
+        ready.sort()
+    return tuple(ordered), frozenset(known - set(ordered))
+
+
+def reset_production_rows(dsn: str) -> tuple[str, ...]:
+    """结构不动，只清掉**这一轮真的被写过**的那几张表；返回被清空的表名。
+
+    Issue #234。上一版对**当前全部生产表**做一次 `TRUNCATE … CASCADE`，于是每条真库用例
+    的固定开销与「库里一共有多少张表」成正比。本机实测（postgres:16-alpine 容器，与 CI 同款）：
+    `TRUNCATE` 一张表约 90 毫秒，23 张表 2.05 秒——每条真库用例的 2.2 秒基本全在这里。
+    2026-08-19 PR #232 门禁那 4 个
+    `psycopg.errors.QueryCanceled: canceling statement due to statement timeout`
+    也出在这条语句上：不是断言失败，是清场语句自己撞上了连接的 3 秒 statement_timeout。
+
+    90 毫秒不是 fsync（`synchronous_commit = off` 实测无改善），是 `TRUNCATE` 要给表和它的
+    每一个索引、TOAST 关系换一个新的 relfilenode——本库 23 张表背后是 91 个关系文件。
+    这笔成本按**表的数量**收，与表里有没有数据无关：清一张从头到尾没被碰过的空表，
+    和清一张写满的表一样贵。
+
+    现在分三步，都在同一条连接上：
+
+    1. 一条 `EXISTS` 语句精确问出「哪几张表真的有行」（0.9 毫秒，见
+       `_fetch_tables_holding_rows`）。一张都没有就直接返回，什么都不做。
+    2. 其中**装了 DELETE 触发器**的表（见 `_DELETE_TRIGGER_TABLES_SQL`）用
+       `TRUNCATE … CASCADE` 清——那些表 `DELETE` 不动。当前只有
+       `galaxy_import_batch` 与 `feishu_org_sync_run` 两张，绝大多数用例根本碰不到。
+    3. 其余有行的表按外键「子→父」顺序一条 `DELETE FROM` 清掉。`DELETE` 只取
+       ROW EXCLUSIVE 锁、不换 relfilenode、不重建索引文件；实测清空 23 张表 1.6 毫秒。
+
+    **成本为什么不再与表总数成正比。** 昂贵的那部分——排他锁 + relfilenode 重建 + 索引与
+    TOAST 文件重建——现在只发生在「这一轮真的写过、而且 DELETE 不动」的表上，典型用例是
+    零张。剩下与表总数有关的只有第 1 步那条 `EXISTS` 语句：它对每张表做一次零页顺序扫描，
+    不取排他锁、不写 WAL，实测 23 张表 0.9 毫秒（每张 0.04 毫秒），而上一版是每张 90 毫秒。
+    新增一张表的边际成本从 90 毫秒降到 0.04 毫秒，量级差 2000 倍。
+
+    **隔离强度没有变。** 被清掉的是「有行的表」这个**精确**集合（`EXISTS` 判定，不是估算），
+    清完之后全库一行不剩，与上一版逐字相同。`tests/test_postgres_isolation_contract.py`
+    把这条钉成契约，并做过「去掉本函数即变红」的变异复验。
+
+    **为什么不用事务回滚隔离。** 不可行：被测代码自己按 DSN 建连接、自己开事务并提交
+    （`src/lingxi/adapters/postgres.py:103-128` 的工厂，调用方形如 `postgres_identity.py:91`
+    的 `with connect(self._dsn) as connection`），测试侧包不住一个它们不使用的事务；
+    `tests/test_worker_process.py` 更是起真实子进程连同一个库，跨进程连事务都不共享。
+    """
 
     ensure_production_schema(dsn)
-    tables = production_tables(dsn)
-    if not tables:
-        return
-    quoted = ", ".join(f'public."{name}"' for name in tables)
     with _connect(dsn) as connection, connection.cursor() as cursor:
-        cursor.execute(f"TRUNCATE {quoted} CASCADE")
+        tables = _fetch_production_tables(cursor)
+        holding_rows = _fetch_tables_holding_rows(cursor, tables)
+        if not holding_rows:
+            return ()
+
+        cursor.execute(_DELETE_TRIGGER_TABLES_SQL)
+        delete_blocked = {row[0] for row in cursor.fetchall()}
+        ordered, unordered = _child_first_order(cursor, tables)
+
+        must_truncate = sorted(holding_rows & (delete_blocked | unordered))
+        if must_truncate:
+            quoted = ", ".join(f'public."{name}"' for name in must_truncate)
+            # CASCADE 是必须的：外键引用它们的表哪怕是空的，PostgreSQL 也拒绝单独截断
+            # 被引用方。CASCADE 带上的是外键图的局部闭包，与库里一共有多少张表无关。
+            cursor.execute(f"TRUNCATE {quoted} CASCADE")
+
+        # TRUNCATE … CASCADE 可能已经顺带清空了下面某几张表，那时这条 DELETE 是空转。
+        to_delete = [name for name in ordered if name in holding_rows and name not in must_truncate]
+        if to_delete:
+            cursor.execute("; ".join(f'DELETE FROM public."{name}"' for name in to_delete))
+
+        return tuple(sorted(holding_rows))
