@@ -3,7 +3,11 @@
 只做形状：给定一个会话根目录与 ``agent_session_id``，删除匹配的 JSONL 文件。真正
 「这个 session id 该不该删」的判定住在数据库（``clear_agent_session`` /
 ``sweep_idle_conversations`` / ``clear_delivered_content_for_user`` 三处触发点各自
-排队，见 ``adapters/postgres_conversation.py`` 「Agent 会话 JSONL 物理清理队列」一节）；
+排队，三处各自的排队实现在 ``adapters/postgres_conversation/_transaction.py`` 的
+``_Transaction._queue_session_cleanup``；本文件消费的两个方法
+``claim_session_cleanups``/``mark_session_cleanups_done`` 在
+``adapters/postgres_conversation/_queue_session_cleanup.py``，Issue #239 起
+按读写边界拆分自原单文件，既有调用点用到的名字全部保留，见包 __init__.py 的边界说明）；
 本模块不读写数据库，只碰文件系统——与 ``core/`` 「无 I/O」的边界对称地反过来：这里
 只有 I/O、不含判定，因此放在 ``apps/worker/`` 而不是 ``core/``。
 
