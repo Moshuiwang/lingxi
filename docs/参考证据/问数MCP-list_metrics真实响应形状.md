@@ -1,6 +1,6 @@
 # 问数 MCP `list_metrics` 真实响应形状
 
-> 最后核对：2026-08-19，来源为编排者在受控环境对真实问数 MCP 发起的第一次真实调用（只读、使用测试 MCP 令牌）。
+> 最后核对：2026-08-19，来源为编排者在受控环境对真实问数 MCP 发起的真实调用（只读、使用测试 MCP 令牌）。当天先完成第一次真实调用（确认响应形状与前 8 条中文名/`metric_id`），随后完成**二次实测**，逐字取回全部 9 条记录的 `name_en`——首次实测时只有 `sub_new_count` 一条的 `name_en` 逐字可见，其余 8 条曾被标注为「合理翻译、非逐字实测」；二次实测已把这条登记更正为全部 9 条逐字实测，见下方「实测到的指标全集」。
 >
 > 本文回答一个长期问题：**真实问数 MCP 对 `list_metrics` 的返回，逐字长什么样，能不能从中数出指标条数。** 适用范围：`list_metrics` 一个工具的成功路径与无效令牌下的拒绝路径。
 > 不适用范围：本文**不**证明 `query_metric` 与 `search_dimension` 的返回形状——这两个工具本次一次都没有调用过，未测就是未测，不得据此推断它们的形状与 `list_metrics` 相同。就绪探针的判定语义（`ready`/`waiting`/`technical_failure` 怎么分流）不在本文，见[技术设计/接口设计](../技术设计/接口设计.md#五问数-mcp消费方)与 `src/lingxi/core/permission/mcp_readiness.py`。
@@ -37,23 +37,23 @@
 
 ## 实测到的指标全集（9 条）
 
-有效令牌下 `list_metrics` 返回的完整指标集合，`metric_id` → 中文名：
+有效令牌下 `list_metrics` 返回的完整指标集合，`metric_id` / 中文名 / `name_en` 三列**全部逐字**取自 2026-08-19 的实测响应（`name_en` 一列取自当天的二次实测）：
 
-| `metric_id` | 中文名 |
-|---|---|
-| `channel_market_sharing` | 频道市占率 |
-| `channel_rate` | 频道收视率 |
-| `exchange_rate` | 汇率 |
-| `sub_deduction_count` | 扣费用户数 |
-| `sub_deduction_money` | 扣费金额 |
-| `sub_new_count` | 新增用户数 |
-| `sub_recharge_count` | 充值用户数 |
-| `sub_recharge_money` | 充值金额 |
-| `vat_rate` | 增值税率 |
+| `metric_id` | 中文名 | `name_en` |
+|---|---|---|
+| `channel_market_sharing` | 频道市占率 | `Channel Market Sharing` |
+| `channel_rate` | 频道收视率 | `Channel Viewership Rate` |
+| `exchange_rate` | 汇率 | `Exchange Rate` |
+| `sub_deduction_count` | 扣费用户数 | `Deduction User Count` |
+| `sub_deduction_money` | 扣费金额 | `Deduction Amount` |
+| `sub_new_count` | 新增用户数 | `New User Count` |
+| `sub_recharge_count` | 充值用户数 | `Recharge User Count` |
+| `sub_recharge_money` | 充值金额 | `Recharge Amount` |
+| `vat_rate` | 增值税率 | `VAT Rate` |
 
-上表 `metric_id` 与中文名逐字来自本次实测；`name_en` 只有 `sub_new_count` 一条（`New User Count`）在上方样本中逐字可见，其余 8 条的 `name_en` 未被本次实测逐字记录——测试断言中据此推断的英文名只是合理翻译，不作为已验证事实。
+三列均为逐字实测样本，不含推断或翻译。**与首次实测记录的差异**：首次实测（当天较早时刻）只逐字看到 `sub_new_count` 一条的 `name_en`，其余 8 条曾被登记为「合理翻译，非逐字实测」；当天的二次实测取回了全部 9 条的逐字 `name_en`，上表已用二次实测结果整体覆盖，不再区分首次/二次来源。
 
-**与 [#227](https://github.com/Moshuiwang/lingxi/issues/227) 映射内容的关系**：今日实测的 9 个 `metric_id` 与 #227 登记的映射全集（取自 2026-07-28）逐一比对，**无缺失、无新增**——那条映射内容不再只有 2026-07-28 单次快照的支撑，现在有 2026-08-19 的独立复测。
+**与 [#227](https://github.com/Moshuiwang/lingxi/issues/227) 映射内容的关系**：实测的 9 个 `metric_id` 与 #227 登记的映射全集（取自 2026-07-28）逐一比对，**无缺失、无新增**——那条映射内容不再只有 2026-07-28 单次快照的支撑，现在有 2026-08-19 的独立复测。
 
 ## 拒绝路径：无效令牌
 

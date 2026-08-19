@@ -506,14 +506,13 @@ class MetricsReaderTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "invalid_metric_count")
 
 
-#: 2026-08-19 编排者对真实问数 MCP（``MCP Metric Query Server 1.27.2``）实测到的全部
-#: 9 个指标（``metric_id``/``name`` 逐字来自 Issue #253；``sub_new_count`` 一条连同
-#: 整个响应外壳都是逐字实测，其余 8 条的 ``name_en`` 未被逐字提供，是合理翻译，不影响
-#: 计数断言）。完整协议记录见
+#: 2026-08-19 编排者对真实问数 MCP（``MCP Metric Query Server 1.27.2``）二次实测到的
+#: 全部 9 个指标——``metric_id``/``name``/``name_en`` 三个字段**逐字**来自 Issue #253
+#: 的二次实测记录，不再是首次实测时对 8 条 ``name_en`` 的推测翻译。完整协议记录见
 #: ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``。
 REAL_METRICS = [
-    {"metric_id": "channel_market_sharing", "name": "频道市占率", "name_en": "Channel Market Share"},
-    {"metric_id": "channel_rate", "name": "频道收视率", "name_en": "Channel Rating"},
+    {"metric_id": "channel_market_sharing", "name": "频道市占率", "name_en": "Channel Market Sharing"},
+    {"metric_id": "channel_rate", "name": "频道收视率", "name_en": "Channel Viewership Rate"},
     {"metric_id": "exchange_rate", "name": "汇率", "name_en": "Exchange Rate"},
     {"metric_id": "sub_deduction_count", "name": "扣费用户数", "name_en": "Deduction User Count"},
     {"metric_id": "sub_deduction_money", "name": "扣费金额", "name_en": "Deduction Amount"},
@@ -621,10 +620,131 @@ class VerifiedContentTextMetricsReaderTest(unittest.TestCase):
         self.assertFalse(caught.exception.denied)
 
 
-class MutationKillTest(unittest.TestCase):
-    """变异验红（Issue #253 完成标准）：把装配层注入的 reader 换回
-    ``default_metrics_reader``，真实样本用例必须变红——证明"已验证 reader 确实是
-    真实 MCP 走通的必要条件"，不是可有可无的装饰。
+class TightenedShapeTest(unittest.TestCase):
+    """Issue #253 M2：2026-08-19 二次实测把形状钉死到字段级后**主动收紧**的判据——
+    首轮实测时不敢收（形状没实测到这个细度），现在敢收了。
+    """
+
+    def test_zero_content_blocks_are_unrecognized(self) -> None:
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader({"content": [], "isError": False})
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_multiple_content_blocks_are_unrecognized(self) -> None:
+        """``content`` 必须恰好一个块：真实响应目前只观察到一个，块数一旦变化说明
+        服务端契约变了，应当响亮失败，不能悄悄只看第一块、忽略其余。
+        """
+
+        result = _real_list_metrics_result()
+        result["content"] = result["content"] * 2
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_an_extra_top_level_key_is_unrecognized(self) -> None:
+        """内层 JSON 顶层键必须恰为 ``{"metrics"}``——多一个键（如分页游标）也读不懂，
+        不去猜哪个才是真正的指标列表。
+        """
+
+        text = json.dumps({"metrics": REAL_METRICS, "cursor": "next-page-token"})
+        result = {"content": [{"type": "text", "text": text}], "isError": False}
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_a_record_missing_a_required_field_is_unrecognized(self) -> None:
+        """每条记录必须恰有 ``metric_id``/``name``/``name_en`` 三个字段：缺一个即失败。"""
+
+        for field in ("metric_id", "name", "name_en"):
+            with self.subTest(field=field):
+                record = {k: v for k, v in REAL_METRICS[0].items() if k != field}
+                result = _real_list_metrics_result([record])
+                with self.assertRaises(McpProbeError) as caught:
+                    content_text_metrics_reader(result)
+                self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+                self.assertFalse(caught.exception.denied)
+
+    def test_a_record_field_with_the_wrong_type_is_unrecognized(self) -> None:
+        """字段类型不对（如 ``metric_id`` 是数字）同样落技术失败，而不是被静默容忍。"""
+
+        for field in ("metric_id", "name", "name_en"):
+            with self.subTest(field=field):
+                record = dict(REAL_METRICS[0])
+                record[field] = 12345
+                result = _real_list_metrics_result([record])
+                with self.assertRaises(McpProbeError) as caught:
+                    content_text_metrics_reader(result)
+                self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+                self.assertFalse(caught.exception.denied)
+
+    def test_a_record_that_is_not_an_object_is_unrecognized(self) -> None:
+        result = _real_list_metrics_result(["不是对象"])
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+
+class JsonParsingHardeningTest(unittest.TestCase):
+    """Issue #253 M3：``json.loads`` 的三个隐藏口子。"""
+
+    def test_deeply_nested_text_is_folded_to_unrecognized_not_an_uncaught_exception(self) -> None:
+        """**M3 核心**：``RecursionError`` 不是 ``ValueError`` 子类。若不特别归类，
+        极深嵌套的 ``text`` 会让它穿透 ``except ValueError`` 逃到轮询循环，变成一次
+        未归类异常——这条用例在只捕获 ``ValueError`` 的旧实现下会真的变红
+        （``RecursionError`` 未被捕获，直接从 ``content_text_metrics_reader`` 里冒出）。
+        """
+
+        deeply_nested = "[" * 20000 + "]" * 20000  # 远超默认递归深度（约一万层即可触发）
+        result = {"content": [{"type": "text", "text": deeply_nested}], "isError": False}
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_non_finite_constants_are_rejected(self) -> None:
+        """``NaN``/``Infinity``/``-Infinity`` 是 JSON 标准之外的 Python 扩展，真实合同
+        里没有它们的位置——拒绝比容忍更安全。
+        """
+
+        for text in ('{"metrics": NaN}', '{"metrics": [Infinity]}', '{"metrics": -Infinity}'):
+            with self.subTest(text=text):
+                result = {"content": [{"type": "text", "text": text}], "isError": False}
+                with self.assertRaises(McpProbeError) as caught:
+                    content_text_metrics_reader(result)
+                self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+                self.assertFalse(caught.exception.denied)
+
+    def test_duplicate_keys_in_the_inner_json_are_rejected(self) -> None:
+        """重复键在 JSON 标准下未定义行为；默认解析会静默取最后一个值——拒绝比容忍
+        更安全。
+        """
+
+        text = '{"metrics": [], "metrics": ' + json.dumps(REAL_METRICS) + "}"
+        result = {"content": [{"type": "text", "text": text}], "isError": False}
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+
+class ReaderBehaviorContrastTest(unittest.TestCase):
+    """对照（Issue #253 M4）：同一份真实响应样本，分别喂给已验证 reader 与默认
+    reader，对比两者行为——这个类**没有经过装配层**，构造 ``QueryMcpProbe`` 时手动传入
+    ``metrics_reader``，因此它证明的是"两个 reader 函数在真实样本上的行为差异"，不是
+    "装配层接线正确"。
+
+    真正验红**装配层变异**（把 ``apps/scheduler/assembly.py`` 里注入的
+    ``content_text_metrics_reader`` 换回默认值）的是
+    ``tests/test_permission_publish_duty.py`` 里的
+    ``test_the_probe_is_wired_with_the_verified_content_text_reader``——那条测试真的
+    调用 ``build_loop()`` 走完整条装配路径，直接断言
+    ``probe.metrics_reader is content_text_metrics_reader``。本类此前名为
+    ``MutationKillTest`` 并自称"把装配层注入换回默认 reader 会变红"，但它从未触碰装配
+    层，这个名字与 docstring 名实不符，本轮改名并把陈述改成与它实际测的东西一致。
     """
 
     @staticmethod
@@ -635,14 +755,15 @@ class MutationKillTest(unittest.TestCase):
         )
 
     def test_the_verified_reader_reads_nine_from_the_real_fixture(self) -> None:
-        """基线（绿）：装配层实际注入的 reader，对真实样本返回 9。"""
+        """基线（绿）：已验证 reader 对真实样本返回 9。"""
 
         probe, _ = self._probe_with(content_text_metrics_reader)
         self.assertEqual(probe.list_metrics(user_id=USER), 9)
 
-    def test_reverting_to_the_default_reader_turns_the_real_fixture_red(self) -> None:
-        """变异：把 ``metrics_reader`` 换回 ``default_metrics_reader``——同一份真实样本，
-        同一次调用，不再返回 9，而是抛出技术失败。这就是 Issue #253 要修的那个故障。
+    def test_the_default_reader_cannot_read_the_same_fixture(self) -> None:
+        """对照：换成默认 reader，同一份真实样本变成技术失败——这正是 Issue #253
+        描述的那个故障（真实 MCP 上默认 reader 永远技术失败），也是为什么装配层必须
+        显式注入已验证 reader 的理由。
         """
 
         probe, _ = self._probe_with(default_metrics_reader)
