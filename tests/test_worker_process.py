@@ -32,6 +32,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import unittest
@@ -43,6 +44,38 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，队列 worker 真实子进程断言未验证"
+
+
+def _make_user_env_root(testcase: unittest.TestCase, *, seed_user_id: str | None = None) -> str:
+    """Epic D 闸⑥：queue 模式启动要求 ``LINGXI_USER_ENV_ROOT``（见
+    ``apps/worker/cli.py`` 的队列模式前置检查），本文件的真实子进程用例因此都
+    需要一个可用的根目录。``seed_user_id`` 非空时额外放一份形状合法的
+    ``.mcp.json``，供那些真的会走到"任务执行"这一步、需要读到用户自己配置的
+    用例使用；只测启动/空队列/提前停止分支的用例不需要种子文件（那些任务从不
+    会读到这一步），但仍然需要根目录本身存在，否则连启动都过不去。
+    """
+
+    directory = Path(tempfile.mkdtemp(prefix="lingxi-worker-user-env-root-"))
+    testcase.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+    if seed_user_id:
+        home = directory / seed_user_id
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "query": {
+                            "type": "http",
+                            "url": "https://example.invalid/mcp",
+                            "headers": {"Authorization": "Bearer test-token"},
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    return str(directory)
 
 
 @unittest.skipUnless(DSN, SKIP_REASON)
@@ -71,6 +104,9 @@ class QueueModeSigtermTest(unittest.TestCase):
             "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
             "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "5",
             "LINGXI_POSTGRES_DSN": DSN,
+            # 空队列下从不会真的处理任务，因此不需要种子 .mcp.json；但队列模式
+            # 启动本身要求这个变量存在（Epic D 闸⑥），缺了会在启动期就拒绝。
+            "LINGXI_USER_ENV_ROOT": _make_user_env_root(self),
         }
         process = subprocess.Popen(
             [sys.executable, "-m", "lingxi.apps.worker"],
@@ -286,6 +322,13 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
             "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "30",
             "LINGXI_WORKER_SHUTDOWN_TIMEOUT_SECONDS": str(shutdown_timeout_seconds),
             "LINGXI_POSTGRES_DSN": DSN,
+            # 这个任务真的会被领走、真的会走到 _process_task 里按 user_id 读
+            # .mcp.json 那一步（Epic D 闸⑥）——种子文件必须存在，否则任务会在
+            # 碰到假 SDK 之前就被判定 user_mcp_config_unavailable 而失败关闭，
+            # 测不到本用例真正要验证的"挂起会话下的停机预算"这件事。
+            "LINGXI_USER_ENV_ROOT": _make_user_env_root(
+                self, seed_user_id="usr-sigterm-inflight"
+            ),
         }
         process = subprocess.Popen(
             [sys.executable, "-m", "lingxi.apps.worker"],
@@ -448,6 +491,10 @@ class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
             "LINGXI_WORKER_POLL_INTERVAL_SECONDS": "0.2",
             "LINGXI_WORKER_HEARTBEAT_INTERVAL_SECONDS": "30",
             "LINGXI_POSTGRES_DSN": DSN,
+            # 这条任务建库时就已 stop_requested=TRUE，_process_task 在最早的
+            # 停止分支就收口返回，从不会走到按 user_id 读 .mcp.json 那一步——
+            # 不需要种子文件，但队列模式启动仍要求这个变量存在。
+            "LINGXI_USER_ENV_ROOT": _make_user_env_root(self),
         }
         process = subprocess.Popen(
             [sys.executable, "-m", "lingxi.apps.worker"],

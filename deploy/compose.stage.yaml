@@ -43,6 +43,13 @@ services:
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-30}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
+      # 首次开通编排（S-D-02）在这里给每个用户建家目录、写各自的 .mcp.json
+      # （Epic D 闸⑤）：挂载点须与 worker/worker-queue 一致，否则
+      # LocalUserEnvironment 在真实容器里第一次调用就会因根目录不存在而失败，
+      # 整条首次开通编排永远不会注册（见 apps/scheduler/assembly.py 的
+      # `_build_onboarding_duty` 前置检查）。scripts/ci/check_deploy_contract.py
+      # 的 check_scheduler_user_volume 把这条约束变成会变红的检查。
+      - lingxi-users:/var/lib/lingxi/users
 
   gateway:
     env_file:

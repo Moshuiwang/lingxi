@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import signal
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
@@ -60,7 +61,7 @@ def main(
 
     try:
         queue_mode = env.get("LINGXI_WORKER_MODE", "turn").strip().lower() == "queue"
-        config = load_config(env, require_question=not queue_mode)
+        config = load_config(env, require_question=not queue_mode, queue_mode=queue_mode)
     except WorkerConfigError as error:
         provided_trace_id = env.get("LINGXI_WORKER_TRACE_ID", "")
         # 只有合法 ULID 才复用：误接进来的令牌不得随错误输出外泄（Codex 复查）。
@@ -93,6 +94,31 @@ def main(
         if not dsn:
             message = "队列 worker 缺少 LINGXI_POSTGRES_DSN"
             _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
+            _emit(out, config_error_report(trace_id=config.trace_id, message=message))
+            return EXIT_CONFIG_ERROR
+        # Epic D 闸⑥：queue 模式是唯一真正处理用户任务的路径，每个任务都要按
+        # 它的 user_id 读 <user_env_root>/<user_id>/.mcp.json（见
+        # apps/worker/service.py 的 _process_task）。缺了这个根目录，队列
+        # worker 领到的**每一个**任务都必然失败关闭——与其带着这个必然失败的
+        # 配置启动、让每个任务分别撞上同一个原因，不如在启动期一次性拒绝
+        # （与 LINGXI_POSTGRES_DSN 同一姿态：恰一条日志、只报变量名、不回显
+        # 取到的值——此处本就没有取到值可回显）。
+        if not config.user_env_root:
+            message = "队列 worker 缺少 LINGXI_USER_ENV_ROOT"
+            _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
+            _emit(out, config_error_report(trace_id=config.trace_id, message=message))
+            return EXIT_CONFIG_ERROR
+        # 外部独立审查 F4：光校验形态（绝对且规范化，见 config.py 的
+        # _user_env_root）不够——卷没挂、路径写错时此前的行为是每领一个任务
+        # 失败一次，运维要靠"任务全部失败"反推"卷没挂对"。这里在启动期就真的
+        # 打开一次这个目录，把"路径不存在/不可读"这一类部署失误提前到启动期
+        # 暴露。**不 mkdir**：这个目录由 scheduler 经 LocalUserEnvironment 独占
+        # 创建（见该模块文档），worker 自己创建它既不是它的职责，也可能带着
+        # 错误的权限位创建出一个"看起来存在但用不对"的目录。
+        if not _ensure_user_env_root_available(
+            config.user_env_root, err=err, trace_id=config.trace_id
+        ):
+            message = "LINGXI_USER_ENV_ROOT 不可用：路径不存在、不可读，或不是目录"
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
         # Issue #177：工作目录预检必须在宣告"队列 worker 已启动"之前完成——否则
@@ -348,6 +374,52 @@ def _ensure_worker_workspace(workspace: str, *, err: TextIO, trace_id: str) -> b
             "worker.queue.workspace.unavailable",
             reason="not_a_writable_directory",
             workspace_path_length=len(workspace),
+        )
+        return False
+    return True
+
+
+def _ensure_user_env_root_available(user_env_root: str, *, err: TextIO, trace_id: str) -> bool:
+    """queue 模式启动预检（Epic D 闸⑥，外部独立审查 F4）：
+    ``LINGXI_USER_ENV_ROOT`` 必须指向一个**已经存在、可读**的目录。
+
+    与 :func:`_ensure_worker_workspace` **刻意不同**：这里**不 ``mkdir``**。
+    用户环境根目录由 scheduler 经 ``LocalUserEnvironment`` 独占创建（见
+    ``adapters/user_environment.py`` 模块文档），worker 只读不写；如果 worker
+    自己在这里补建一个目录，一来越权做了不属于它的事，二来会用默认权限位
+    （而不是根目录要求的 ``0750``）创建出一个"存在但形态不对"的目录，把一个
+    本该在启动期暴露的部署失误伪装成"看起来挂对了"。
+
+    卷没挂、路径写错时，此前的行为是每领一个任务在 ``load_user_mcp_servers``
+    里失败一次（``root_ENOENT`` 一类错误码），运维要靠"每个任务都失败"反推
+    "卷没挂对"。这里把它提前到启动期一次性暴露。
+    """
+
+    try:
+        fd = os.open(user_env_root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        _log(
+            err,
+            trace_id,
+            "error",
+            "worker.queue.user_env_root.unavailable",
+            reason="open_failed",
+            error=type(error).__name__,
+        )
+        return False
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        # O_DIRECTORY 本该已经挡住这一支；留着是防御性的第二道，不为它单独
+        # 编一条测不到的用例。
+        _log(
+            err,
+            trace_id,
+            "error",
+            "worker.queue.user_env_root.unavailable",
+            reason="not_a_directory",
         )
         return False
     return True
