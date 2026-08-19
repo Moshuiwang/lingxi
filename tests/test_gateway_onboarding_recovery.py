@@ -139,7 +139,8 @@ class ShutdownTests(ReconcilerTestCase):
             def __init__(self) -> None:
                 self.calls: list[dict[str, str]] = []
 
-            def start(self, *, event_id: str, open_id: str, trace_id: str):
+            def start(self, *, event_id: str, open_id: str, trace_id: str, claim_token=None):
+                del claim_token
                 self.calls.append(
                     {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
                 )
@@ -177,7 +178,7 @@ class FailureTests(ReconcilerTestCase):
         self.assertEqual(failures[0]["error"], "RuntimeError")
         self.assertEqual(self.log.count("audit.onboarding.dispatched"), 0)
         self.assertEqual(self.log.count("store.release_onboarding_claim"), 1)
-        self.assertEqual(self.state.onboarding_dispatched, set(), "放回之后账本必须是空的")
+        self.assertEqual(set(self.state.onboarding_dispatched), set(), "放回之后账本必须是空的")
         self.assertNotIn("外部权限服务不可用", repr(self.log.entries))
 
     def test_a_terminal_conclusion_is_not_retried(self) -> None:
@@ -210,7 +211,7 @@ class FailureTests(ReconcilerTestCase):
                 self.assertEqual(len(declined), 1)
                 self.assertEqual(declined[0]["reason"], reason)
                 self.assertEqual(self.log.count("store.release_onboarding_claim"), 1)
-                self.assertEqual(self.state.onboarding_dispatched, set())
+                self.assertEqual(set(self.state.onboarding_dispatched), set())
 
     def test_a_started_dispatch_without_a_reason_is_not_released(self) -> None:
         """异步接手成功（``started`` 且没有原因码）不放回——链正在跑。"""
@@ -234,7 +235,7 @@ class FailureTests(ReconcilerTestCase):
         self.state.stale_onboardings.append(orphan())
 
         class BogusRunner:
-            def start(self, *, event_id: str, open_id: str, trace_id: str):
+            def start(self, *, event_id: str, open_id: str, trace_id: str, claim_token=None):
                 return "已开通"
 
         self.build(onboarding=BogusRunner()).run_once()
@@ -287,6 +288,73 @@ class CapacityCouplingTests(ReconcilerTestCase):
         source = (lambda: 5)
         self.assertIs(self.build(capacity=source).capacity_source, source)
         self.assertIsNone(self.build().capacity_source)
+
+
+class ClaimGenerationTests(ReconcilerTestCase):
+    """释放必须带认领代次，只能撤销**自己那一次**（ABA）。
+
+    没有代次时的序列：A 释放 → B 重新认领 → A 的重试再释放一次 → **B 的认领被清掉**，
+    那条链于是在没人看着的情况下被第三方解锁，可能被并发认领两次。
+    """
+
+    def test_the_runner_receives_the_claim_generation(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding()
+
+        self.build(onboarding=runner).run_once()
+
+        self.assertEqual(len(runner.claim_tokens), 1)
+        self.assertIsNotNone(runner.claim_tokens[0], "认领代次必须一路传给编排")
+
+    def test_the_release_carries_the_generation_it_claimed(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding(
+            result=OnboardingResult(state=OnboardingState.STARTED, failure_reason="stopping")
+        )
+
+        self.build(onboarding=runner).run_once()
+
+        released = self.log.fields("store.release_onboarding_claim")
+        self.assertEqual(len(released), 1)
+        self.assertEqual(released[0]["claim_token"], runner.claim_tokens[0])
+
+    def test_a_stale_release_cannot_undo_somebody_elses_claim(self) -> None:
+        """A 释放 → B 认领 → A 重试释放：B 的认领必须还在。"""
+
+        self.state.stale_onboardings.append(orphan())
+        store = FakeStore(self.state, self.log)
+
+        first = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert first is not None
+        store.release_onboarding_claim(
+            event_id=first.event_id, claim_token=first.claim_token
+        )
+        second = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert second is not None
+        self.assertNotEqual(second.claim_token, first.claim_token)
+
+        # A 的重试：拿旧代次再释放一次。
+        store.release_onboarding_claim(
+            event_id=first.event_id, claim_token=first.claim_token
+        )
+
+        self.assertIn(
+            second.event_id,
+            self.state.onboarding_dispatched,
+            "陈旧的释放不得撤销别人的认领",
+        )
+
+    def test_a_release_without_a_generation_does_nothing(self) -> None:
+        """宁可留着不放，也不能撤销一次不知道是谁的认领。"""
+
+        self.state.stale_onboardings.append(orphan())
+        store = FakeStore(self.state, self.log)
+        claimed = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert claimed is not None
+
+        store.release_onboarding_claim(event_id=claimed.event_id)
+
+        self.assertIn(claimed.event_id, self.state.onboarding_dispatched)
 
 
 class SweepIntervalTests(ReconcilerTestCase):

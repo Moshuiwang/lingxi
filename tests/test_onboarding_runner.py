@@ -294,8 +294,9 @@ class FakeLedger:
             raise self._error
         self.marked.append(event_id)
 
-    def release_onboarding_claim(self, *, event_id: str) -> None:
-        self.released.append(event_id)
+    def release_onboarding_claim(self, *, event_id: str, claim_token=None) -> None:
+        # 记下代次：**没有代次就不该放**（那会撤销别人的认领），这条由用例断言。
+        self.released.append((event_id, claim_token))
 
 
 class RecordingAudit:
@@ -393,9 +394,15 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
     return runner, parts
 
 
+#: 认领代次的替身：真库里是那一次认领写进 ``onboarding_dispatched_at`` 的时刻。
+CLAIM_TOKEN = "claim-1"
+
+
 def run_once(**overrides: Any) -> tuple[dict[str, Any], Any]:
     runner, parts = build_runner(**overrides)
-    result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="trace_1")
+    result = runner.start(
+        event_id="evt_1", open_id=OPEN_ID, trace_id="trace_1", claim_token=CLAIM_TOKEN
+    )
     return parts, result
 
 
@@ -808,7 +815,11 @@ class NotificationAndLedgerTests(unittest.TestCase):
 
         parts, _ = run_once(notifier=FakeNotifier(error=RuntimeError()))
 
-        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertEqual(
+            parts["ledger"].released,
+            [("evt_1", CLAIM_TOKEN)],
+            "释放必须带上认领代次，否则会撤销别人的认领（ABA）",
+        )
         self.assertEqual(parts["ledger"].marked, [], "放回之后不得同时记账")
         self.assertIn(
             "onboarding.claim_released_after_notify_failed", parts["audit"].actions()
@@ -818,10 +829,14 @@ class NotificationAndLedgerTests(unittest.TestCase):
         """放回有上限：一次飞书长时间不可用不得把执行器永久占满。"""
 
         runner, parts = build_runner(notifier=FakeNotifier(error=RuntimeError()))
-        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
-        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+        runner.start(
+            event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN
+        )
+        runner.start(
+            event_id="evt_1", open_id=OPEN_ID, trace_id="t1", claim_token=CLAIM_TOKEN
+        )
 
-        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertEqual(parts["ledger"].released, [("evt_1", CLAIM_TOKEN)])
         self.assertEqual(parts["ledger"].marked, ["evt_1"], "第二次记账收口")
         self.assertIn("onboarding.notify_gave_up_failed", parts["audit"].actions())
 
@@ -915,7 +930,9 @@ class ShutdownTests(unittest.TestCase):
 
         self.assertEqual(parts["notifier"].sent, [], "停机中止不得给用户任何结论")
         self.assertEqual(parts["ledger"].marked, [], "停机中止不得记账")
-        self.assertEqual(parts["ledger"].released, ["evt_1"], "认领必须放回去")
+        self.assertEqual(
+            parts["ledger"].released, [("evt_1", CLAIM_TOKEN)], "认领必须放回去"
+        )
         self.assertIn("onboarding.aborted_while_stopping", parts["audit"].actions())
         self.assertEqual(parts["decisions"].rows, [], "停机之后不再排新的发布意图")
 
@@ -943,7 +960,7 @@ class ShutdownTests(unittest.TestCase):
         )
 
         self.assertEqual(parts["notifier"].sent, [])
-        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertEqual(parts["ledger"].released, [("evt_1", CLAIM_TOKEN)])
         self.assertNotIn("onboarding.result", parts["audit"].actions())
 
 

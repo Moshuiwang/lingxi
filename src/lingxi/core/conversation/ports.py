@@ -152,6 +152,11 @@ class PendingOnboarding:
     event_id: str
     open_id: str
     trace_id: str
+    #: **这一次认领的代次**（认领语句写进去的 ``onboarding_dispatched_at``）。释放时必须
+    #: 带上它做 CAS，否则存在 ABA：A 释放 → B 重新认领 → A 的重试再释放一次 → **B 的认领
+    #: 被清掉**，那条链于是在没人看着的情况下被第三方"解锁"，可能被并发认领两次。
+    #: ``None`` 表示"不是我们认领的"，此时任何释放都不该发生。
+    claim_token: datetime | None = None
 
 
 class OnboardingRunner(Protocol):
@@ -170,6 +175,7 @@ class OnboardingRunner(Protocol):
         event_id: str,
         open_id: str,
         trace_id: str,
+        claim_token: datetime | None = None,
     ) -> OnboardingResult: ...
 
 
@@ -237,8 +243,10 @@ class GatewayStore(Protocol):
         在编排从未被调用时就宣称交接完成。
         """
 
-    def release_onboarding_claim(self, *, event_id: str) -> None:
-        """把认领放回去（``onboarding_dispatched_at`` 置回 ``NULL``），让下一轮重新捞。
+    def release_onboarding_claim(
+        self, *, event_id: str, claim_token: datetime | None = None
+    ) -> None:
+        """把**自己那一次**认领放回去（``onboarding_dispatched_at`` 置回 ``NULL``）。
 
         :meth:`claim_stale_onboarding` 是「取出即记账」，而在它之后**这条事件仍然可能
         根本没被执行**：执行器满位、停机信号刚好落在中间、同一个人已有链在跑。没有这条
@@ -248,6 +256,11 @@ class GatewayStore(Protocol):
 
         **只放回真的没跑成的**：一条已经得出结论的事件不释放，重跑不会改变结论，只会
         持续冲击外部系统。
+
+        ``claim_token`` 是**认领代次**，实现必须拿它做 CAS：只有当行上的
+        ``onboarding_dispatched_at`` 仍然等于这个值时才清空。少了它就有 ABA——A 释放 →
+        B 重新认领 → A 的重试再释放一次 → B 的认领被清掉。``None`` 表示调用方没有认领
+        代次，实现必须**什么都不做**（宁可留着不放，也不能撤销别人的认领）。
         """
 
     def claim_stale_onboarding(self, *, older_than: timedelta) -> PendingOnboarding | None:

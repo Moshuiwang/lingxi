@@ -1767,7 +1767,7 @@ def _build_onboarding_duty(
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe
     from lingxi.adapters.role_function_map_file import load_role_function_map
-    from lingxi.adapters.user_environment import LocalUserEnvironment
+    from lingxi.adapters.user_environment import LocalUserEnvironment, UserEnvironmentError
     from lingxi.apps.scheduler.onboarding import (
         DISPATCH_AFTER,
         CatalogNotifier,
@@ -1817,6 +1817,24 @@ def _build_onboarding_duty(
         timeout_seconds=schedule.probe_timeout_seconds + PROBE_WATCHDOG_MARGIN_SECONDS,
     )
 
+    environment = LocalUserEnvironment(
+        root=config.user_env_root, mcp_endpoint=config.query_mcp_endpoint
+    )
+    # **启动期全量清扫**：被 ``SIGKILL`` 留下的写入临时文件里有明文令牌，而目录内清扫只在
+    # 「那个用户下一次再走开通」时发生——一个不再重试的用户意味着**没有时间上界**。在这里
+    # 跑一次把上界压到「至多一个进程生命周期」。扫不动就**不注册本职责**：那意味着我们管
+    # 不了这个目录，而它接下来正要接收明文凭据。
+    try:
+        environment.sweep_all()
+    except UserEnvironmentError as error:
+        audit.record(
+            "onboarding.duty_not_registered",
+            reason="user_environment_sweep_failed",
+            error=error.code,
+        )
+        logger.error("用户环境启动期清扫失败，首次开通编排不注册 code=%s", error.code)
+        return None
+
     store = PostgresGatewayStore(dsn, timeouts=timeouts)
     executor = OnboardingExecutor(workers=config.onboarding_workers, should_stop=should_stop)
     runner = AutoOnboardingRunner(
@@ -1829,9 +1847,7 @@ def _build_onboarding_duty(
         galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
         provisioning=PostgresAppUserStore(dsn, timeouts=timeouts),
         users=PostgresAppUserStore(dsn, timeouts=timeouts),
-        environment=LocalUserEnvironment(
-            root=config.user_env_root, mcp_endpoint=config.query_mcp_endpoint
-        ),
+        environment=environment,
         tokens=tokens,
         decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
         readiness=McpReadinessConfirmation(

@@ -289,6 +289,53 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(done.wait(timeout=5))
         self.assertNotEqual(seen[0], threading.get_ident())
 
+    def test_an_accepted_task_is_never_stranded_behind_the_sentinels(self) -> None:
+        """确定性竞态：submit 检查停机为假 → stop() 置位并放哨兵 → 工作线程取走哨兵全部
+        退出 → submit 恢复并入队成功 → **已经没有人会执行它**，那条链既不通知也不释放认领。
+
+        用另一条线程在「submit 已进入临界区」的那一刻调 ``stop()`` 来复现。入队与置位共用
+        同一把闸之后，那条线程只能等 submit 放手，于是哨兵必然排在**我们这条任务之后**，
+        任务照常被执行。断言的是不变量本身：**被受理的任务一定会跑**。
+        """
+
+        executor = OnboardingExecutor(workers=1, backlog=8)
+        task = object()
+        original_put = executor._queue.put_nowait
+
+        raced = threading.Event()
+
+        def racing_put(item):  # type: ignore[no-untyped-def]
+            # 只在**我们这一次** submit 时插入竞态；`stop()` 自己放哨兵时也会走到这里，
+            # 不设这道闸就会递归地再起一条 stopper 线程，测出来的东西就不是那个交错了。
+            if not raced.is_set():
+                raced.set()
+                # 在「检查停机之后、入队之前」让另一条线程去调 stop()。有闸时它拿不到锁、
+                # join 超时；没有闸时它会抢先把哨兵排进去。
+                thread = threading.Thread(target=executor.stop, daemon=True)
+                thread.start()
+                thread.join(timeout=0.3)
+                self.addCleanup(thread.join, 5)
+            return original_put(item)
+
+        executor._queue.put_nowait = racing_put  # type: ignore[assignment]
+        accepted = executor.submit(task)  # type: ignore[arg-type]
+        executor._queue.put_nowait = original_put  # type: ignore[assignment]
+
+        self.assertTrue(accepted, "检查停机时还没停机，这一次必须被受理")
+        queued = list(executor._queue.queue)
+        self.assertIs(
+            queued[0],
+            task,
+            "被受理的任务必须排在任何哨兵之前，否则工作线程取到哨兵就退出，它永远不会被执行",
+        )
+
+    def test_a_stopped_executor_refuses_even_when_the_queue_has_room(self) -> None:
+        executor = OnboardingExecutor(workers=2, backlog=8)
+        executor.stop()
+
+        self.assertEqual(executor.free_slots(), 0)
+        self.assertFalse(executor.submit(lambda: None))
+
     def test_stopping_does_not_discard_already_queued_work(self) -> None:
         """已排队的任务对应的事件**已经被记账**，丢掉就是永久烧掉。
 

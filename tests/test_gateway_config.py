@@ -329,6 +329,38 @@ class GatewayOnboardingIsInertTests(unittest.TestCase):
     接上真编排就是 gateway 十五分钟收不到消息，而现场只表现为「机器人不理人」。
     """
 
+    def setUp(self) -> None:
+        # 与 BuildSupervisorTests 同一手法：build_supervisor 里的 build_client 会
+        # import lark_oapi，而 CI 的 gate 只装 scheduler 组，没有它，用桩顶上。
+        #
+        # **不用 skipUnless**：跳过等于这条断言在门禁上根本不跑，而
+        # `assert_gateway_onboarding_is_inert` 是编排搬进 scheduler 之后**唯一**挡住
+        # 「分钟级编排又落回长连接线程」的守卫——它必须每一轮门禁都真的执行。
+        # 本用例断的是 gateway 侧的惰性，不是 SDK。
+        module = types.ModuleType("lark_oapi")
+
+        class _Builder:
+            def app_id(self, value):
+                return self
+
+            def app_secret(self, value):
+                return self
+
+            def timeout(self, value):
+                return self
+
+            def build(self):
+                return object()
+
+        module.Client = types.SimpleNamespace(builder=lambda: _Builder())
+        saved = sys.modules.get("lark_oapi")
+        sys.modules["lark_oapi"] = module
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("lark_oapi", saved)
+            if saved is not None
+            else sys.modules.pop("lark_oapi", None)
+        )
+
     def test_the_default_onboarding_only_records(self) -> None:
         config = load_config(VALID_ENV)
 

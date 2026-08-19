@@ -194,8 +194,10 @@ class _RecordingOnboarding:
     ``LX-ONBOARD-001``；而这里的语义是"收到了、正在处理"，是真话。
     """
 
-    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
-        del event_id, open_id, trace_id
+    def start(
+        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
+    ) -> OnboardingResult:
+        del event_id, open_id, trace_id, claim_token
         return OnboardingResult(state=OnboardingState.STARTED)
 
 

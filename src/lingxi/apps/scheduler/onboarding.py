@@ -209,6 +209,12 @@ class OnboardingExecutor:
         )
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+        # **入队闸**：把「检查停机」与「入队」串成一个不可分割的动作，`stop()` 置位与
+        # 放哨兵也在同一把锁内。没有它存在一条确定性竞态：submit 检查停机为假 → 被调度
+        # 出去 → stop() 置位并放哨兵 → 工作线程取走哨兵全部退出 → submit 恢复、入队成功
+        # 并返回 True → **已经没有任何线程会执行它**，那条链既不通知也不释放认领，事件
+        # 被永久烧掉。
+        self._gate = threading.Lock()
         self._stopping = threading.Event()
         self._should_stop = should_stop or (lambda: False)
         self._threads = [
@@ -235,19 +241,25 @@ class OnboardingExecutor:
 
         if self._stopping.is_set() or self._should_stop():
             return 0
+        # 只算队列里还空着的位置，**不把「正在跑的那几条马上会腾出线程」算进去**。
+        # 它只是给认领方的上界；真正的原子判定在 :meth:`submit` 的入队闸里，因此即使这个
+        # 数在读到与用掉之间过时，最坏结果也只是 submit 返回 False → 认领方释放认领 →
+        # 下一轮重捞，不会丢事件。
         return max(0, self._backlog - self._queue.qsize())
 
     def submit(self, task: Callable[[], None]) -> bool:
         """排一条链。队列满或已停机时返回 ``False``，**不阻塞调用线程**。"""
 
-        if self._stopping.is_set() or self._should_stop():
-            return False
-        try:
-            self._queue.put_nowait(task)
-        except queue.Full:
-            logger.warning("开通执行器队列已满，本次开通不受理")
-            return False
-        return True
+        with self._gate:
+            # 检查与入队必须在同一把锁内，理由见 ``self._gate`` 的注释。
+            if self._stopping.is_set() or self._should_stop():
+                return False
+            try:
+                self._queue.put_nowait(task)
+            except queue.Full:
+                logger.warning("开通执行器队列已满，本次开通不受理")
+                return False
+            return True
 
     def stop(self) -> None:
         """停止领取新链。
@@ -260,12 +272,14 @@ class OnboardingExecutor:
         在途那一条同样不打断：它在每一步之间看停止标志，自己收口并释放。
         """
 
-        self._stopping.set()
-        for _ in self._threads:
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:  # pragma: no cover - 满队列时工作线程自己会看到标志
-                pass
+        with self._gate:
+            # 与 ``submit`` 同一把锁：置位之后就不可能再有新任务排到哨兵后面去。
+            self._stopping.set()
+            for _ in self._threads:
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:  # pragma: no cover - 满队列时工作线程自己会看到标志
+                    pass
 
     def join(self, timeout: float) -> None:
         deadline = time.monotonic() + max(0.0, timeout)

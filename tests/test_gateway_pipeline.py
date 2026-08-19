@@ -940,7 +940,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             message(event_id="evt_ledger", open_id="ou_new"), now=NOW
         )
 
-        self.assertEqual(self.state.onboarding_dispatched, {"evt_ledger"})
+        self.assertEqual(set(self.state.onboarding_dispatched), {"evt_ledger"})
         self.assertGreater(
             self.log.index("store.mark_onboarding_dispatched"),
             self.log.index("audit.onboarding.result"),
@@ -955,7 +955,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
         )
 
         self.assertEqual(
-            self.state.onboarding_dispatched,
+            set(self.state.onboarding_dispatched),
             {"evt_ledger_fail"},
             "编排确实被调用过：不记账会让用户收到第二遍 LX-ONBOARD-001",
         )
@@ -974,7 +974,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             "簿记失败不得带走用户可见的终态提示",
         )
         self.assertEqual(self.log.count("audit.onboarding.dispatch_record_failed"), 1)
-        self.assertEqual(self.state.onboarding_dispatched, set())
+        self.assertEqual(set(self.state.onboarding_dispatched), set())
 
     def test_an_asynchronous_runner_keeps_the_ledger_for_itself(self) -> None:
         """``started`` 表示"编排异步接手了"，结论还没产生（Epic D / S-D-02）。
@@ -995,7 +995,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             [call["event_id"] for call in runner.calls], ["evt_async"], "编排必须被调用过"
         )
         self.assertEqual(
-            self.state.onboarding_dispatched,
+            set(self.state.onboarding_dispatched),
             set(),
             "started 的账由编排自己记；gateway 提前记会把中途崩溃的链变成无人恢复的悬空",
         )
@@ -1014,7 +1014,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             message(event_id="evt_sync_terminal", open_id="ou_new"), now=NOW
         )
 
-        self.assertEqual(self.state.onboarding_dispatched, {"evt_sync_terminal"})
+        self.assertEqual(set(self.state.onboarding_dispatched), {"evt_sync_terminal"})
 
 
 class OnboardingShutdownOrderTests(PipelineTestCase):
@@ -1052,7 +1052,7 @@ class OnboardingShutdownOrderTests(PipelineTestCase):
             "停机不得回滚已提交的认领",
         )
         self.assertEqual(
-            self.state.onboarding_dispatched,
+            set(self.state.onboarding_dispatched),
             set(),
             "没交接就不能记成已交接——对账扫描正是靠这个空账本认出这条孤儿",
         )

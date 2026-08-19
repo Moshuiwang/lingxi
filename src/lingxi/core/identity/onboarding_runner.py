@@ -305,8 +305,12 @@ class DispatchLedger(Protocol):
 
     def mark_onboarding_dispatched(self, *, event_id: str) -> None: ...
 
-    def release_onboarding_claim(self, *, event_id: str) -> None:
-        """把 ``onboarding_dispatched_at`` 放回 ``NULL``，让下一轮重新认领。"""
+    def release_onboarding_claim(self, *, event_id: str, claim_token: Any = None) -> None:
+        """把**自己那一次**认领放回 ``NULL``，让下一轮重新认领。
+
+        ``claim_token`` 是认领代次，实现按它做 CAS——少了它会出现 ABA：本链释放之后另一条
+        链重新认领，本链的重试再释放一次就把**别人的**认领清掉了。
+        """
 
 
 class _AuditSink(Protocol):
@@ -426,7 +430,14 @@ class AutoOnboardingRunner:
     # OnboardingRunner 合同
     # ------------------------------------------------------------------
 
-    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
+    def start(
+        self,
+        *,
+        event_id: str,
+        open_id: str,
+        trace_id: str,
+        claim_token: Any = None,
+    ) -> OnboardingResult:
         """认领并交给执行器。**永远不在调用线程上跑链**（见模块文档「共用线程复核」）。"""
 
         if self._should_stop():
@@ -459,7 +470,12 @@ class AutoOnboardingRunner:
 
         def task() -> None:
             try:
-                self._execute(event_id=event_id, open_id=open_id, trace_id=trace_id)
+                self._execute(
+                    event_id=event_id,
+                    open_id=open_id,
+                    trace_id=trace_id,
+                    claim_token=claim_token,
+                )
             finally:
                 self._release(open_id, event_id)
 
@@ -491,7 +507,9 @@ class AutoOnboardingRunner:
     # 执行线程
     # ------------------------------------------------------------------
 
-    def _execute(self, *, event_id: str, open_id: str, trace_id: str) -> None:
+    def _execute(
+        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
+    ) -> None:
         """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。"""
 
         try:
@@ -502,7 +520,9 @@ class AutoOnboardingRunner:
             self._audit.record(
                 "onboarding.aborted_while_stopping", event_id=event_id, trace_id=trace_id
             )
-            self._release_claim(event_id=event_id, trace_id=trace_id)
+            self._release_claim(
+                event_id=event_id, trace_id=trace_id, claim_token=claim_token
+            )
             return
         except OnboardingChainError as error:
             terminal = _internal(error.code)
@@ -532,7 +552,9 @@ class AutoOnboardingRunner:
             suffix="",
             trace_id=trace_id,
         )
-        if delivered or not self._release_for_notify(event_id=event_id, trace_id=trace_id):
+        if delivered or not self._release_for_notify(
+            event_id=event_id, trace_id=trace_id, claim_token=claim_token
+        ):
             # 送到了，或者已经放回过一次仍然送不到：记账收口。第二种情况留了一条
             # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失。
             try:
@@ -585,12 +607,14 @@ class AutoOnboardingRunner:
                     self._sleep(float(attempt))
         return False
 
-    def _release_claim(self, *, event_id: str, trace_id: str) -> None:
+    def _release_claim(self, *, event_id: str, trace_id: str, claim_token: Any = None) -> None:
         """把认领放回 ``NULL``。停机中止专用，不设次数上限——它每个进程生命周期最多
         发生一次，而且不放回去这条事件就永远没人再看。"""
 
         try:
-            self._ledger.release_onboarding_claim(event_id=event_id)
+            self._ledger.release_onboarding_claim(
+                event_id=event_id, claim_token=claim_token
+            )
         except Exception as error:  # noqa: BLE001
             self._audit.record(
                 "onboarding.release_claim_failed",
@@ -599,7 +623,9 @@ class AutoOnboardingRunner:
                 trace_id=trace_id,
             )
 
-    def _release_for_notify(self, *, event_id: str, trace_id: str) -> bool:
+    def _release_for_notify(
+        self, *, event_id: str, trace_id: str, claim_token: Any = None
+    ) -> bool:
         """通知没送到：把认领放回去，让下一轮重跑整条链。**每条事件只放回一次。**
 
         返回是否真的放回了。``False`` 表示「这条已经放回过一次、仍然送不到」，调用方据此
@@ -617,7 +643,9 @@ class AutoOnboardingRunner:
             )
             return False
         try:
-            self._ledger.release_onboarding_claim(event_id=event_id)
+            self._ledger.release_onboarding_claim(
+                event_id=event_id, claim_token=claim_token
+            )
         except Exception as error:  # noqa: BLE001 - 放不回去只能记账收口
             self._audit.record(
                 "onboarding.release_claim_failed",

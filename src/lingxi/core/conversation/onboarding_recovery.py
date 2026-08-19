@@ -197,6 +197,8 @@ class OnboardingReconciler:
                 event_id=pending.event_id,
                 open_id=pending.open_id,
                 trace_id=pending.trace_id,
+                # 认领代次一路传给编排：它在链的后段（通知送不到）也要放回自己那一次认领。
+                claim_token=pending.claim_token,
             )
             if not isinstance(result, OnboardingResult):
                 raise TypeError("onboarding runner returned an invalid result")
@@ -231,7 +233,9 @@ class OnboardingReconciler:
         """把没跑成的那一条放回去。放不回去也只记审计——它已经是降级路径了。"""
 
         try:
-            self._store.release_onboarding_claim(event_id=pending.event_id)
+            self._store.release_onboarding_claim(
+                event_id=pending.event_id, claim_token=pending.claim_token
+            )
         except Exception as error:  # noqa: BLE001
             self._audit.record(
                 "onboarding.release_claim_failed",
