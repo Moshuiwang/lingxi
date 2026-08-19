@@ -130,6 +130,20 @@ REQUIRED_MODULES = (
     "lingxi.core.identity.access_token_supply",
     "lingxi.adapters.feishu_group_message",
     "lingxi.adapters.role_function_map_file",
+    # 「公司 + 职能 → 指标名」翻译层载体（Issue #227）：校验与翻译规则在 core，
+    # 配置文件解析在 adapters。由 lingxi-scheduler 的每日权限重算职责在运行时按需
+    # 加载（见下面 PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）——映射内容当前是空的，
+    # 但载体本身必须在制品里，否则内容到位那天才发现 wheel 里没有加载它的代码。
+    "lingxi.core.permission.metric_translation",
+    "lingxi.adapters.company_function_metric_map_file",
+    # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
+    # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
+    # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
+    # adapters 的 feishu_tenant_token；三个都由 `build_loop` 装配（见下面
+    # PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。
+    "lingxi.core.permission.table_access_token_supply",
+    "lingxi.core.permission.tenant_token_supply",
+    "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
     "lingxi.adapters.oauth_bridge_client",
@@ -226,6 +240,7 @@ _NON_IMPORTABLE_MODULES = frozenset({"lingxi.apps.scheduler.__main__"})
 # 正式用户路径在部署后失去版本化内容目录。
 REQUIRED_PACKAGE_DATA = (
     ("lingxi.config", "galaxy_role_function_map.toml"),
+    ("lingxi.config", "company_function_metric_map.toml"),
     ("lingxi.config", "content.toml"),
 )
 
@@ -284,6 +299,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.mcp_token_cipher",
             "lingxi.adapters.postgres_mcp_token",
             "lingxi.adapters.role_function_map_file",
+            # 「公司 + 职能 → 指标名」翻译层载体（Issue #227）：`permission_refresh.py`
+            # 模块级 import 翻译规则，`_build_permission_refresh_duty` 函数内 import
+            # 配置文件加载器（与 `role_function_map_file` 同一条理由：函数内 import
+            # 证明不了"这个模块装得上"）。
+            "lingxi.core.permission.metric_translation",
+            "lingxi.adapters.company_function_metric_map_file",
+            # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
+            # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
+            # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
+            "lingxi.core.permission.table_access_token_supply",
+            "lingxi.core.permission.tenant_token_supply",
+            "lingxi.adapters.feishu_tenant_token",
             "lingxi.core.permission",
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.galaxy_export",
