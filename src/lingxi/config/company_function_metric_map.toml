@@ -2,21 +2,42 @@
 #
 # 依据：Issue #227（载体先行，内容后填）。这一层的作用是把 Lingxi 内部的职能标签
 # （见 galaxy_role_function_map.toml 的右值，例如「运营」「财务」）翻译成问数 MCP
-# 认识的指标名（例如「日活」「收入」），供 core/permission/publish_row.py 的
+# 认识的指标名，供 core/permission/publish_row.py 的
 # serialize_translated_permissions 写进权限发布表的 permissions 列。
 #
-# ── 这个文件当前是什么状态 ────────────────────────────────────────────
-# **当前是空的**：下面 [companies] 表存在，但没有任何条目。这是本 Story 交付时的
-# 正常状态，不是缺陷——映射内容只有产品负责人能给（哪个公司的哪个职能对应哪些指标
-# 名），代码这一侧只负责把内容后填的路铺好。
+# ── 当前状态：内容已由产品负责人填入（2026-08-19）────────────────────
+# 本文件此前是空的（载体交付时的正常状态）。2026-08-19 产品负责人给出了七个职能各自
+# 对应的指标，编排者按下面「展开规则」机械展开成本文件的全部条目。
 #
-# 空映射的效果：core/permission/metric_translation.py 的 translate_company_functions
-# 对任何一个「公司 + 职能」组合都查不到，因此**每一个原本有效授权的用户在翻译这一步
-# 都会失败关闭**——这是刻意的：在真实映射内容到位之前，不会有任何权限内容被翻译成
-# 「看起来像指标名」的文本发布出去，维持的是与「值列表仍是职能标签时不得真实发布」
-# 完全一样的效果，只是失败发生的位置换成了显式的翻译层，而不是隐式的"没人接令牌"。
+# ── 值为什么是 sub_new_count 这类 ID，而不是「新增用户数」这类中文名 ──
+# 权限发布表 permissions 列的权威结构是 {"<company_id>": ["<metric_id>", ...]}
+# （产品负责人 2026-08-17 在 Issue #155 提供，登记为外部边界有效规范）；现行写入方
+# 旧系统的映射种子数据同样是 metric_id 形态。中文名只用于人读，不进这张表。
 #
-# ── 怎么维护（产品负责人填写时看这里）────────────────────────────────
+# ── 指标清单的来源与时效边界（诚实登记）─────────────────────────────
+# 下面用到的 9 个 metric_id 来自 2026-07-28 一次**真实** list_metrics 调用的返回
+# （Issue #23 受控验证证据）。它证明这些 ID 在当时真实存在，但**不证明今天的指标全集
+# 仍是这 9 个**——真实清单的复核属于验收窗口前的受控只读前置项，尚未完成。
+#
+# ── 展开规则（为什么每家公司都列了全部 7 个职能）──────────────────────
+# 产品负责人 2026-08-19 的判断是：**同一个职能，在所有国家是同一套指标**。
+# 因此本文件对每一个公司键都写入完整的 7 个职能，而不是只写「受控导出里观察到的
+# 组合」。理由：职能→指标既然与公司无关，就不应该因为某次导出快照里恰好没出现过
+# 「某公司 + 某职能」这个组合，而让将来真的出现该组合的用户在翻译层失败关闭。
+# 这不放宽任何人的权限——一个人能拿到哪些职能仍然完全由银河的角色决定，本文件只回答
+# 「已经确定持有的职能，对应哪些指标」。
+#
+# 公司键取值来自 2026-08-06 银河受控导出中实际出现的公司编号（43 个），外加「全非」
+# 通配键 "*"。编号与国家/主体的对照不在本文件维护（本文件属公开正文），见受控目录里的
+# 映射填空模板附录。
+#
+# ── 「全部指标」为什么逐条列出，而不是写通配 "*" ─────────────────────
+# permissions 的读侧允许值列表里写 "*" 表示「该公司下所有指标」，但本仓库的写侧
+# 目前不产出这种形态。因此「CEO / 运营 = 全部指标」在这里是把当时已知的 9 个 ID
+# 逐条列出。**后果**：将来问数 MCP 新增指标时，这两个职能不会自动获得新指标，需要
+# 回来改本文件。要改成「自动获得」需要产品负责人另行决定并改写侧代码。
+#
+# ── 怎么维护 ─────────────────────────────────────────────────────────
 # 1. 在 [companies] 下面按「公司 → 职能 → 指标名列表」三层加条目：
 #
 #      [companies."<公司ID>"]
@@ -28,41 +49,433 @@
 #      列一遍——展开是我们这一侧的解释，翻译层不替这件事做主。
 #    - "<职能标签>" 必须与 galaxy_role_function_map.toml 右值**完全一致**（精确
 #      匹配，不是同义词、不做大小写或全半角折叠）。
-#    - "<指标名>" 是问数 MCP 认识的指标名，**逐字符原样透传到发布表**：大小写、
-#      全角半角、空白全部算数，一个字符都不能凭直觉改。指标名列表不能是空列表——
-#      一个职能如果在某公司下确实没有对应指标，就不要给这个公司写这个职能的条目
-#      （不覆盖 = 翻译层 fail-closed 拒绝，而不是"这个人在这个公司没有这项指标"，
-#      两者语义不同，因此空列表在这里不合法）。
+#    - "<指标名>" 逐字符原样透传到发布表：大小写、全角半角、空白全部算数，一个字符
+#      都不能凭直觉改。指标名列表不能是空列表——一个职能如果在某公司下确实没有对应
+#      指标，就不要给这个公司写这个职能的条目（不覆盖 = 翻译层 fail-closed 拒绝，
+#      而不是"这个人在这个公司没有这项指标"，两者语义不同，因此空列表在这里不合法）。
 #
 # 2. 同一个公司下允许有多个职能条目；同一个职能在不同公司下允许对应不同的指标名
-#    列表（这正是「公司 + 职能」联合键存在的原因——同一个职能在不同公司可能有不同
-#    的指标口径）。
+#    列表（这正是「公司 + 职能」联合键存在的原因）。当前内容按「全国统一」填写，
+#    将来若某个国家口径不同，直接改那个公司键下的那一行即可。
 #
 # 3. 未被本文件覆盖的「公司 + 职能」组合，翻译层会 fail-closed（既不猜测、也不回落
 #    成职能标签本身、也不静默丢弃只发布覆盖到的那部分）——运维会在每日权限重算的
-#    审计里看到 metric_translation_uncovered 计数。这不是 bug，是本文件还没填全。
+#    审计里看到 metric_translation_uncovered 计数。
 #
-# 4. 不要把含真实公司业务信息或真实指标口径细节之外的任何人员数据写进来——本文件在
-#    仓库里，属于公开正文。改完直接提交即可，无需改代码；
-#    tests/test_permission_metric_translation.py 与
-#    tests/test_company_function_metric_map_file.py 会校验文件能被解析。
+# 4. 不要把人员数据写进本文件——它在仓库里，属于公开正文。改完直接提交即可，无需改
+#    代码；tests/test_company_function_metric_map_file.py 会校验文件内容与这里登记的
+#    决定一致（改了内容却没改那组断言，门禁会红）。
 #
 # 格式为 TOML，由 Python 标准库 tomllib 解析，不引入任何新依赖。
 #
-# ── 示例（非真实数据，仅用于说明格式；不要直接照抄）───────────────────
-# 下面几行整体注释掉，公司 ID、职能标签与指标名全部是虚构占位，不对应任何真实公司、
-# 真实人员或真实指标：
-#
-# [companies."9001"]
-# "运营" = ["示例指标-日活", "示例指标-收入"]
-# "财务" = ["示例指标-收入"]
-#
-# [companies."*"]
-# "CEO" = ["示例指标-日活", "示例指标-收入", "示例指标-OTT活跃"]
+# ── 职能 → 指标（产品负责人 2026-08-19 决定，全国统一）─────────────────
+#   CEO   全部 9 个
+#   OTT   exchange_rate, vat_rate
+#   内容  exchange_rate, vat_rate, channel_rate, channel_market_sharing
+#   商务  exchange_rate, vat_rate
+#   财务  sub_new_count, sub_recharge_count, sub_recharge_money,
+#         sub_deduction_count, sub_deduction_money, exchange_rate, vat_rate
+#   运营  全部 9 个
+#   销售  sub_new_count, exchange_rate, vat_rate
 
 [meta]
 # 决策来源与最后一次由产品负责人确认的时间，改动规则时一并更新。
-decision = "Issue #227 / 载体交付，内容待产品负责人填写"
-last_reviewed = "2026-08-18"
+decision = "Issue #227 / 2026-08-19 产品负责人给出职能→指标内容，编排者机械展开"
+last_reviewed = "2026-08-19"
 
-[companies]
+
+[companies."1"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."2"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."3"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."4"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."5"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."6"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."7"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."8"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."9"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."10"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."11"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."12"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."13"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."14"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."15"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."16"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."17"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."18"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."19"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."20"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."21"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."22"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."23"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."24"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."25"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."26"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."27"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."28"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."29"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."30"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."31"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."32"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."33"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."34"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."35"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."36"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."37"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."38"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."39"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."44"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."50"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."61"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."49368"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+
+[companies."*"]
+"CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"OTT" = ["exchange_rate", "vat_rate"]
+"内容" = ["exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"商务" = ["exchange_rate", "vat_rate"]
+"财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
+"运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
+"销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
