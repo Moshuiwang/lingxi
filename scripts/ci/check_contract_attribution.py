@@ -6,34 +6,62 @@
 自己的从紧要求被错记成合同条款。散文约束挡不住这类错误：只有把每一处"标注为
 合同"的断言变成一条会核对、会变红的登记，才挡得住下一次同样的笔误。
 
+**这道闸证明的是什么，不是什么**（2026-08-19 三路独立复查后更正措辞，Issue
+#238）：它证明"这句归属已经被人显式核对过一次、登记进了下面的表、且登记的原文
+在源文件里依然一字不差地存在（没有过期）"，因此**可以被下一个人复核**。它**不
+证明**这句话在语义上真的成立——合同章节存在、原句字面未变，不代表原句的转述
+准确反映了合同的意思（那需要人读两边的正文去判断，机器做不到）。同理，一处归属
+第一次登记时"对上了"，只说明登记的那一刻核对过；合同正文后续修订后，登记表的
+摘录仍会显示"在源文件里找到了"，但可能已经不再准确反映新版合同——这也是机械
+核对无法覆盖的部分，只能靠合同正文修订时的人工复审兜底。
+
 **为什么不能只靠正则找到"合同要求"就直接核对文字**：本仓库绝大多数归属断言是
 **转述**而不是逐字引用（"银行家式复述" vs "逐字复制"），例如"合同要求两者不
 一致时不得视为发布完成"转述的是合同原文"数据库记录与飞书多维表格发布结果不
 一致…都不能视为 Lingxi 侧发布已经完成"。逐字子串匹配会把几乎所有转述都误判为
 查无对应；而放宽成"语义相近就算"又没法用程序判定。因此本脚本采用**登记制**：
 
-1. 本文件内置一份 ``GROUNDED_ATTRIBUTIONS`` 登记表，逐条记录"哪个文件的哪句话
-   （用一段能在原文里找到的摘录定位）对应产品合同的哪一节"——这是一次性的人工
-   核对结果，2026-08-19 逐条核对产品合同正文写成，不是程序自动推导的。
+1. 本文件内置一份 ``GROUNDED_ATTRIBUTIONS`` 登记表，逐条记录"哪个文件的哪一行
+   （用该行去除首尾空白后的**完整原文**精确定位，不是一段任意长度的摘录）对应
+   产品合同的哪一节"——这是一次性的人工核对结果，2026-08-19 逐条核对产品合同
+   正文写成，不是程序自动推导的。
 2. 门禁做三件**机械**的事：(a) 登记表引用的合同章节必须真实存在于
-   `docs/产品合同与外部边界.md`；(b) 登记表的摘录必须真的能在它标注的源文件里
-   找到（防止摘录过期还挂在表里）；(c) 仓库里每一处标注"产品合同明令"或"合同
-   要求"的行，都必须至少被登记表里的一条摘录覆盖，找不到覆盖就是**新出现的、
-   未经核对的归属断言**，直接判红。
-3. 少数几处归属经核对后仍有疑问（措辞源自具体 Issue 的产品负责人决定，而非
-   `产品合同与外部边界.md` 正文本身；见 ``REGISTERED_EXCEPTIONS``），按
-   AGENTS.md「宁可让门禁带一个明确登记的例外，也不要偷偷改合同」处理：不静默
-   放行，登记为例外并在门禁输出里可见地报出来，留给编排者与产品负责人裁定。
+   `docs/产品合同与外部边界.md`；(b) 登记表登记的那一行原文必须真的还能在它
+   标注的源文件里找到（防止摘录过期还挂在表里）；(c) 仓库里每一处标注"产品
+   合同明令"或"合同要求"这类归属短语的行，都必须与登记表里某一条**逐字相等**
+   ——用完整行文本做精确匹配而不是"包含即算"，是 2026-08-19 三路独立复查实测
+   坐实的两个绕过面倒逼的设计：①一个很短的摘录（如裸的"合同要求"四个字）用
+   子串匹配会覆盖住这个文件里**此后新增的任何一行**，只要那一行里出现过这四个
+   字；②往一行**已经登记过**的话后面继续追加全新的、从未核对过的归属声明，
+   子串匹配同样会因为"旧摘录仍是新行的子串"而放行。改成整行逐字相等后，这一
+   行只要有一个字符的变化就不再等于登记值，必须重新核对登记，两个绕过面同时
+   关闭。
+3. 少数几处归属经核对后仍有疑问（措辞源自具体 Issue 或 PR 的产品负责人 / 独立
+   复核决定，而非 `产品合同与外部边界.md` 正文本身；见 ``REGISTERED_EXCEPTIONS``），
+   按 AGENTS.md「宁可让门禁带一个明确登记的例外，也不要偷偷改合同」处理：不
+   静默放行，登记为例外（强制携带来源 Issue/PR 号、裁定日期、裁定人，见
+   ``RegisteredException``）并在门禁**每一次运行**的输出里可见地报出来（含
+   判红的那一次——例外不能只在通过时才被看见），留给编排者与产品负责人裁定。
 
 任何人往仓库里新加一句"产品合同明令 XXX"而不登记，门禁直接红；任何人把合同正文
-的章节改名或删除导致登记表的引用失效，门禁也直接红——这两条挡的正是"归属只在
-写下的那一刻被人读一遍，此后再没有人核对过"的腐烂路径。
+的章节改名或删除导致登记表的引用失效，门禁也直接红；任何人往一行已登记的归属
+后面追加新断言，或试图用一个过短的摘录覆盖住未来的新增行，门禁同样直接红——这
+几条挡的都是"归属只在写下的那一刻被人读一遍，此后再没有人核对过"的腐烂路径。
+
+**已知的一次真实腐烂**（2026-08-19，同批次三方合并演练触发，不是假设）：
+`REGISTERED_EXCEPTIONS` 里"告警不可用时主流程行为有明确定义"那条最初登记在
+`src/lingxi/apps/scheduler/__init__.py`；#237（拆分 scheduler 装配入口）把这段
+文字连同它所在的类整体搬到了新文件 `src/lingxi/apps/scheduler/
+alerting_assembly.py`，登记表若不跟着更新，门禁会在合并后立即判红（旧路径的
+摘录消失 + 新路径出现一条未登记的归属）。这恰好证明了机制在真实生效——登记表
+已按新路径更新，见下方对应条目。
 
 扫描失败必须失败关闭：合同文档或任何一个被扫描文件读不出来，都直接判红。
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
@@ -43,28 +71,47 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DOCUMENT = REPOSITORY_ROOT / "docs" / "产品合同与外部边界.md"
 
-# 归属触发词：本仓库里明确"把这句话的权威记成产品合同"的两种写法。
-# 只匹配这两个具体短语，不匹配裸的"合同"——本仓库大量使用"合同"表示模块自身的
-# 接口/服务合同（软件工程含义，如"OnboardingRunner.start 的服务合同"），
-# 那不是在对产品合同文档做归属声明，不属于本门禁的核对范围。
-TRIGGER_PATTERN = re.compile("合同要求|合同明令")
+# 归属触发词：本仓库里明确"把这句话的权威记成产品合同"的写法。2026-08-19 按
+# 三路独立复查的实测结果（真的在仓库里找到了漏网断言）从两个短语扩到八个。
+# 不匹配裸的"合同"——本仓库大量使用"合同"表示模块自身的接口/服务合同
+# （软件工程含义，如"OnboardingRunner.start 的服务合同"），那不是在对产品
+# 合同文档做归属声明，不属于本门禁的核对范围。
+TRIGGER_PATTERN = re.compile(
+    "合同要求|合同明令|合同明确要求|合同规定|合同约定|合同条款|合同明确排除|按合同"
+)
 
-# 只扫这三类正式文本文件——与仓库其余 check_*.py 扫描范围一致。
-SCAN_SUFFIXES = (".py", ".md", ".sh")
-# 合同文档本身是权威源，不对自己做归属核对；tests/ 下的假实现头注释与业务代码
-# 混在同一批 tracked 文件里，同样需要核对，不豁免。
-# 本脚本自身与它的单元测试是唯一例外：它们的源码里大量出现"合同要求"/"合同明令"
-# 字面串——一处是在讨论触发词本身（TRIGGER_PATTERN 的定义、登记表数据、模块
-# docstring 里的举例），另一处是单元测试构造的字符串字面量夹具——这些都不是在对
-# 产品合同文档做归属声明，扫描自己会把整份登记表和触发词定义当成待核对的断言，
-# 那是检查工具在核对自己的实现细节，不是在核对产品事实。
+# 「合同条款」这个短语在本仓库还有另一个完全不同的含义：验收矩阵.md 与
+# check_acceptance_matrix.py 用"合同条款覆盖清单"特指那份已有的、独立门禁
+# （check_acceptance_matrix.py 的 cross_check）守着的机器可读映射表——那是在
+# 描述一个已存在的治理机制的名字，不是在对某句具体规则做归属声明。不排除会
+# 把这类自我描述误判成待核对的新断言，因此单独排除这几个固定短语。
+META_EXCLUDE_PATTERN = re.compile(r"合同条款覆盖清单|合同条款无断言覆盖|产品合同条款\s*→")
+
+# 只扫这四类正式文本文件——与仓库其余 check_*.py 扫描范围一致；.sql 是
+# 2026-08-19 复查后新加的，migrations/ 下的顶层历史 SQL 与 alembic revision
+# 里同样可能出现归属注释。
+SCAN_SUFFIXES = (".py", ".md", ".sh", ".sql")
+# 合同文档本身是权威源，不对自己做归属核对。
+# 本脚本自身与它的单元测试是唯一例外：它们的源码里大量出现"合同要求"/"合同
+# 明令"等字面串——一处是在讨论触发词本身（TRIGGER_PATTERN 的定义、登记表
+# 数据、模块 docstring 里的举例），另一处是单元测试构造的字符串字面量夹具——
+# 这些都不是在对产品合同文档做归属声明，扫描自己会把整份登记表和触发词定义
+# 当成待核对的断言，那是检查工具在核对自己的实现细节，不是在核对产品事实。
 EXCLUDED_PATHS = {
     CONTRACT_DOCUMENT,
     Path(__file__).resolve(),
     REPOSITORY_ROOT / "tests" / "test_contract_attribution_check.py",
 }
 
-HEADING = re.compile(r"^(#{2,3})\s+(.+?)\s*$")
+# H1-H3 都算合法的章节标题：H1（合同文档标题本身）用于极少数**引用合同整体
+# 而非某一节**的归属（例如"技术设计按合同的章节切分"这类组织性陈述），H2/H3
+# 是正文各节。
+HEADING = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
+
+# 摘录长度下限：防止用一个极短、容易在别处偶然重现的短语（例如裸的"合同
+# 要求"四个字）去"覆盖"未来任何一行恰好包含它的新增内容。配合下方改成的
+# 整行精确匹配，这条主要是防止有人直接拿触发词本身当登记内容。
+MIN_EXCERPT_LENGTH = 8
 
 
 class AttributionCheckError(ValueError):
@@ -73,237 +120,386 @@ class AttributionCheckError(ValueError):
 
 @dataclass(frozen=True)
 class GroundedAttribution:
-    """一条已核对的归属：``file`` 里包含 ``excerpt`` 的那句话，对应合同 ``section`` 一节。"""
+    """一条已核对的归属：``file`` 里逐字等于 ``line`` 的那一行，对应合同 ``section`` 一节。"""
 
     file: str
-    excerpt: str
+    line: str
     section: str
 
 
 @dataclass(frozen=True)
 class RegisteredException:
-    """一条已登记但未核对通过的归属：不静默放行，可见地报出来。"""
+    """一条已登记但未核对通过的归属：不静默放行，携带来源与裁定信息，可见地报出来。"""
 
     file: str
-    excerpt: str
+    line: str
+    source: str
+    decided_on: str
+    decided_by: str
     reason: str
 
 
 # ---------------------------------------------------------------------------
-# 登记表：2026-08-19 对全仓库 41 处「合同要求 / 合同明令」逐条核对产品合同正文
-# （docs/产品合同与外部边界.md）写成，见 PR（#238）描述里的逐条对账结果。
-# 新增一条归属声明时，先在这里核对它对应合同哪一节、把摘录和章节名登记进来，
-# 而不是先写代码再让门禁牵着走——门禁的作用是挡住"忘了核对"，不是代替核对本身。
+# 登记表：2026-08-19 对全仓库逐条核对产品合同正文（docs/产品合同与外部边界.md）
+# 写成，见 PR #246 描述里的逐条对账结果。``line`` 必须逐字等于源文件里那一行
+# 去除首尾空白后的内容——改动那一行（哪怕只加一个字）都必须回来同步这里，
+# 这是刻意的（见模块 docstring 第 2 点）。新增一条归属声明时，先在这里核对它
+# 对应合同哪一节、把整行原文和章节名登记进来，而不是先写代码再让门禁牵着走
+# ——门禁的作用是挡住"忘了核对"，不是代替核对本身。
 # ---------------------------------------------------------------------------
 
 GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     GroundedAttribution(
+        "docs/参考证据/MVP联合验收执行卡.md",
+        '| E9 | 五类确定性无权限分支中另四类 + MCP 同步节奏的**窗口前**工程级证据（不是窗口内证据，也不能替代真实 Stage 等待） | 阶段②的 N1 只真实走通「查无对应记录」这一类；「同一人员ID多行」「双键冲突」「资料不完整」「无支持职能」四类，用与生产同一份判定函数核对的合成夹具在**窗口前**跑通，不占用产品负责人时间、也不需要为每一类另找一个真实测试账号，属 **L3**（合成输入 + 生产判定函数，不是 L4a，收口时单列，不并入 L4a 计数）。**MCP 同步「最多十五分钟」节奏的最小合法配置只用于这份夹具自己的纯单测**，已核实无法注入真实 Stage 进程（`ReadinessSchedule` 由调用方在代码里构造，不读环境变量；已知唯一运行期覆盖点 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS` 只改探针超时，不改轮询间隔与总预算）——真实 Stage 窗口里的十五分钟等待要么按合同真等（阶段②已按此设计耗时预算），要么本轮不覆盖，**不得**暗示这份夹具能让窗口内的真实等待变短 | 见 [`scripts/acceptance_fixtures_identity.py`](../../scripts/acceptance_fixtures_identity.py) 与其[契约测试](../../tests/test_acceptance_fixtures_identity_contract.py) |',
+        "开通流程",
+    ),
+    GroundedAttribution(
         "docs/参考证据/银河用户权限数据结构.md",
-        "合同要求的「公司范围」与「职能范围」是两条互相独立的授权链",
+        "合同要求的「公司范围」与「职能范围」是两条互相独立的授权链，各自从 `user_id` 出发：",
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "写操作的审计记录无法可靠保存时，用户状态不得改变",
-        "管理员处理入口与安全确认",
+        "docs/参考证据/银河用户权限数据结构.md",
+        "该导出含全部内部人员的姓名、邮箱与逐人国家授权明细。**不得进入仓库、Issue、PR、日志或任何交付物**；只有脱敏后的结构与统计性质可以记录。导入 Lingxi 数据库后按合同的最小化保存与保留规则处理。",
+        "统一用户记录与权限变化",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "会话映射（合同要求逐条落地）",
+        "docs/技术设计/README.md",
+        "| 冲突时 | **以产品合同为准** | 按合同修正设计 |",
+        "产品合同与外部边界",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/代码框架.md",
+        '- **凭据**：不进代码、日志、数据库、用户环境。日志、数据库不存凭据明文是产品合同明令（[产品合同与外部边界](../产品合同与外部边界.md)「统一用户记录与权限变化」："飞书短期令牌、数据库认证材料、MCP 令牌明文及其他凭据不得进入用户表、日志、Issue、文档或用户交付物"）；不进代码、不进用户环境是架构设计自身的从紧要求，合同正文未规定这两处（2026-08-19 归属核对更正，[#238](https://github.com/Moshuiwang/lingxi/issues/238)）。长期凭据放操作系统级密钥管理；测试只用固定假凭据探针。',
+        "统一用户记录与权限变化",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/接口设计.md",
+        "处理次序本身是合同要求，不能重排：",
         "问数与多轮对话",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "路径、归属和访问控制与飞书私聊完全一致",
-        "高级工作台",
+        "docs/技术设计/接口设计.md",
+        "Lingxi 是问数 MCP 的**客户端**。合同规定 Lingxi 不复制其权限过滤、不验收其正确性，只做两件事：把它接给 Agent，以及在开通前确认同步。",
+        "系统与外部依赖边界",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "合同要求的审计事实由 SDK 回调与 Lingxi 自己的任务编排层共同产生",
-        "审核、审计与持续优化方向",
+        "docs/技术设计/接口设计.md",
+        '合同明确排除，此处固化为"不存在的接口"而非"会拒绝的接口"：',
+        "不提供",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "高级工作台中产生的正式产物通过统一的交付 Skill 完成交付",
-        "高级工作台",
+        "docs/技术设计/接口设计.md",
+        "`authorized` 为 `true` 才代表交付完成。授权未确认时返回 `delivered: false` 与说明，由 Agent 按合同措辞告知用户核对，**不自动重发**。",
+        "交付规则",
     ),
     GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "在同一私聊或同一话题用普通文本补发完整结果（合同要求）",
-        "交付样式",
-    ),
-    GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "合同要求状态区展示",
-        "交付样式",
-    ),
-    GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        "不在审计中保存凭据、完整令牌或无关个人信息",
+        "docs/技术设计/接口设计.md",
+        '**约定**：`enqueue_publish` 与 `audit.record` 在写路径上**必须接收调用方的事务对象**，由类型签名强制"审计与状态变更同事务"——这是合同要求，不能靠代码评审保证。',
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "MCP 令牌明文一律不入库（合同明令）",
+        "3. **不存凭据。** 飞书短期令牌、数据库认证材料、MCP 令牌明文一律不入库（合同明令）。需要长期持有的外部凭据放操作系统级密钥管理，数据库里只存**是否已配置**这类布尔状态。",
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "建立统一的 `user` 用户表",
+        '合同要求"建立统一的 `user` 用户表"。`user` 是 PostgreSQL 的保留字（`SELECT user` 返回当前数据库角色），裸用会导致语法错误，加引号则每一处查询都要写 `"user"`。',
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "目标状态已经变化时一律不执行",
+        '**`permission_version` 是乐观锁的锚点**：待确认操作在准备时记下它，确认时比对——合同要求"目标状态已经变化时一律不执行"。',
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "调岗时只收回明确失效的范围",
+        '**收回用 `revoked_at` 而非物理删除**：合同要求"调岗时只收回明确失效的范围""恢复账号时不自动恢复曾被收回的权限"。后者需要知道"曾被收回"这件事，硬删除会丢失该信息。',
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "而合同要求两者不一致时不得视为发布完成",
+        '**outbox 模式**：权限变更与发布意图在同一事务落库，投递异步进行。若直接在权限变更后调飞书 API，调用失败会留下"数据库已改、发布未做"的静默不一致，而合同要求两者不一致时不得视为发布完成（`V-权限-01`）。',
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "字段对应合同要求的审计内容",
+        "字段对应合同要求的审计内容：管理员身份、当时角色、所用管理入口、目标对象、动作类型、操作前状态、拟执行影响、确认或取消、操作后状态、结果与时间。",
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "公司内部审计可以在九十天内审计完整聊天记录",
+        '`content` 存原始内容不脱敏——合同要求"公司内部审计可以在九十天内审计完整聊天记录、完整业务内容及其中的敏感内容"，脱敏会让这条不成立。脱敏只发生在 `audit_event.detail`。',
         "数据保留与删除",
     ),
     GroundedAttribution(
         "docs/技术设计/数据库设计.md",
-        "合同要求\"不执行、不保存、不回显\"",
+        '**开通前发送的内容不入库**：合同要求"不执行、不保存、不回显"。gateway 在识别出未开通用户后，只写 `inbound_event`（记录收到过一个事件及处理方式）与审计，**不写 `chat_message`**。',
         "开通成功后",
     ),
     GroundedAttribution(
-        "docs/技术设计/代码框架.md",
-        "日志、数据库不存凭据明文是产品合同明令",
-        "统一用户记录与权限变化",
+        "docs/技术设计/架构设计.md",
+        "领域模块按合同的章节切分，模块之间只通过显式接口调用，不互相读对方的表：",
+        "产品合同与外部边界",
     ),
     GroundedAttribution(
-        "docs/技术设计/接口设计.md",
-        "处理次序本身是合同要求，不能重排",
-        "问数与多轮对话",
-    ),
-    GroundedAttribution(
-        "docs/技术设计/接口设计.md",
-        "审计与状态变更同事务\"——这是合同要求",
+        "docs/技术设计/架构设计.md",
+        '2. **一致性要求指向单库。** 合同要求"写操作的审计记录无法可靠保存时，用户状态不得改变"和"同一待确认操作最多成功执行一次"。任务状态、审计、业务状态在同一个事务里提交，天然满足；引入 broker 后就需要 outbox + 幂等消费者来重新达到同样的保证——为了避免这个复杂度而引入 broker，是本末倒置。',
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
-        "src/lingxi/apps/worker/report.py",
-        "产品合同明令禁止的\"伪装成功\"",
-        "交付规则",
-    ),
-    GroundedAttribution(
-        "src/lingxi/apps/scheduler/permission_refresh.py",
-        "合同要求每日刷新",
-        "统一用户记录与权限变化",
-    ),
-    GroundedAttribution(
-        "src/lingxi/apps/scheduler/permission_refresh.py",
-        "建档合同要求人员 ID 必填",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/apps/gateway/log_redaction.py",
-        "凭据不得进日志是产品合同明令",
-        "统一用户记录与权限变化",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/execution/tool_policy.py",
-        "用户可见文案里不出现内部标识是产品合同要求",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/execution/audit.py",
-        "产品合同要求「不在审计中保存凭据、完整令牌」",
-        "管理员处理入口与安全确认",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "产品合同要求「明确确认该用户应有的公司和职能权限已经同步且可以问数后，才宣告开通成功」",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/permission/mcp_readiness.py",
-        "合同要求的最后一次探针",
-        "开通流程",
-    ),
-    GroundedAttribution(
-        "src/lingxi/core/conversation/pipeline.py",
-        "次序本身是合同要求，不能重排",
+        "docs/技术设计/架构设计.md",
+        "### 5.2 会话映射（合同要求逐条落地）",
         "问数与多轮对话",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/credentials.py",
-        "日志、数据库不存凭据明文是产品合同明令",
-        "统一用户记录与权限变化",
+        "docs/技术设计/架构设计.md",
+        '- JumpServer 登录进的是同一个家目录，因此产物、工作文件在两个入口下一致（合同要求"路径、归属和访问控制与飞书私聊完全一致"）；',
+        "高级工作台",
     ),
     GroundedAttribution(
-        "src/lingxi/core/identity/provisioning.py",
-        "的合同要求按 `event_id` / `open_id` 幂等",
+        "docs/技术设计/架构设计.md",
+        "合同要求的审计事实由 SDK 回调与 Lingxi 自己的任务编排层共同产生：",
+        "审核、审计与持续优化方向",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        "审计写入失败的处理按合同分级：**读路径**（问数）审计失败记告警但不中断用户；**写路径**（管理动作、状态变更）审计失败则不改状态。",
+        "管理员处理入口与安全确认",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        '合同要求"高级工作台中产生的正式产物通过统一的交付 Skill 完成交付"，并且"用户取得产物的路径、归属和访问控制与飞书私聊完全一致"。',
+        "高级工作台",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        "6. **任何一次创建/更新/关闭失败** → 停止卡片路径，在同一私聊或同一话题用普通文本补发完整结果（合同要求），并记审计。",
+        "交付样式",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        '合同要求状态区展示"当前动作 + 低频耗时"、完成时展示"已完成 + 总耗时"、**不展示预计剩余时间、不展示内部工具调用与过程日志**——因此 `PreToolUse` 采集的工具名只进审计，不进卡片；卡片上的"当前动作"是业务语言的映射表（如 `mcp 查询` → `正在查询数据`）。',
+        "交付样式",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        '用 **outbox 模式**（业务写入与发布意图同事务落库，异步投递）而不是"改完权限直接调飞书 API"：后者在飞书调用失败时会留下数据库已改、发布未做的静默不一致，而合同明确要求两者不一致时不得视为发布完成。',
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        '- **脱敏**：合同要求"不在审计中保存凭据、完整令牌或无关个人信息"。审计写入统一走一个 `redact()` 出口，字段白名单制——新增字段默认不记录，必须显式加入白名单。',
+        "管理员处理入口与安全确认",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        '审批流程在飞书开通链路之外（合同规定），Lingxi 不实现审批，只在管理 MCP 里提供"标记某用户已获批高级工作台"的受控写操作。',
+        "高级工作台",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/架构设计.md",
+        "| [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge) | ~2k★ | 与本产品飞书层最接近的公开实现：每个 chat / 话题 / 文档评论各自独立会话；单卡片实时更新；长连接接入；per-profile 凭据隔离 | 它把运行中收到的消息**排队到下一轮**；本产品合同明确要求运行中消息只提示、不排队、不自动生效 |",
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/飞书组织快照与多维表格关联.md",
+        "- 任何正式权限必须来自 Lingxi 数据库当前有效记录，并经过产品合同规定的 MCP 同步确认；",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/验收矩阵.md",
+        '| V-队列-03 | 入队未成功时，用户**不收到任何表示已受理或已开始处理的回复**（已加的表情按合同只表示"已收到"），且事件不被标记为已成功处理 | L2（可注入 + 真库） | 已认领 |',
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
+        "migrations/010_create_galaxy_import_batch.sql",
+        "-- 该导出含可识别人员数据，按合同的最长九十天保留：`expires_at` 交给受控清理",
+        "数据保留与删除",
+    ),
+    GroundedAttribution(
         "migrations/alembic/versions/0064_permission_publish_outbox.py",
-        "而产品合同要求两者不一致时**不得视为发布完成**",
+        "「数据库已改、发布未做」的静默不一致，而产品合同要求两者不一致时**不得视为发布完成**。",
         "系统与外部依赖边界",
     ),
     GroundedAttribution(
         "migrations/alembic/versions/0065_mcp_token_and_sync_check.py",
-        "是合同要求（与 ``publish_outbox.last_outcome``",
+        "是合同要求（与 ``publish_outbox.last_outcome`` 刻意不加 CHECK 的取舍不同——那一列",
         "管理员处理入口与安全确认",
     ),
     GroundedAttribution(
-        "tests/gateway_fakes.py",
-        "处理次序是合同要求",
-        "问数与多轮对话",
+        "migrations/alembic/versions/20260806_baseline_006_012.py",
+        "-- 该导出含可识别人员数据，按合同的最长九十天保留：`expires_at` 交给受控清理",
+        "数据保留与删除",
     ),
     GroundedAttribution(
-        "tests/test_permission_publish_postgres.py",
-        "合同要求的\"发布读回一致后立即探一次\"",
+        "scripts/acceptance_fixtures_identity.py",
+        "Stage 窗口里，MCP 同步确认要么按合同真实等最多十五分钟，要么本轮不覆盖这条",
         "开通流程",
     ),
     GroundedAttribution(
+        "src/lingxi/adapters/postgres_conversation.py",
+        "清掉——合同规定忙碌期的 `/new` 只该得到提示。",
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/gateway/log_redaction.py",
+        "凭据不得进日志是产品合同明令（代码框架「三、横切约定」）；第三方 SDK 的这个",
+        "统一用户记录与权限变化",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/scheduler/permission_refresh.py",
+        "合同要求每日刷新**严格先刷新花名册、再刷新银河快照**（`V-权限-07`）。「先」如果只靠",
+        "统一用户记录与权限变化",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/scheduler/permission_refresh.py",
+        "# 建档合同要求人员 ID 必填，但存档里真的没有时，匹配层会直接抛错。",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/worker/report.py",
+        '``obtained`` 就是产品合同明令禁止的"伪装成功"。原始的工具调用分类改名保留在',
+        "交付规则",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/conversation/pipeline.py",
+        "**次序本身是合同要求，不能重排。** 这个模块的全部价值就是把那张次序表变成可判定的代码，",
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/conversation/pipeline.py",
+        "一次，而 ``OnboardingRunner.start`` 按合同幂等；反过来，让一次已经拿到结论的",
+        "系统与外部依赖边界",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/execution/audit.py",
+        "# 产品合同要求「不在审计中保存凭据、完整令牌」，这是绝对措辞，靠认键名做不到——",
+        "管理员处理入口与安全确认",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/execution/tool_policy.py",
+        "# 2. 不要把内部工具名转述给用户——用户可见文案里不出现内部标识是产品合同要求。",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/identity/credentials.py",
+        "凭据不进代码、日志、数据库明文与用户环境。日志、数据库不存凭据明文是产品合同明令",
+        "统一用户记录与权限变化",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/identity/provisioning.py",
+        "`OnboardingRunner.start` 的合同要求按 `event_id` / `open_id` 幂等，而",
+        "系统与外部依赖边界",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/permission/mcp_readiness.py",
+        "产品合同要求「明确确认该用户应有的公司和职能权限已经同步且可以问数后，才宣告开通成功」。",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/permission/mcp_readiness.py",
+        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针永远被跳过，",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/permission/mcp_readiness.py",
+        "``now`` 必然略大于 ``started + 900``，于是合同要求的最后一次探针**永远被跳过**，",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/permission/mcp_readiness.py",
+        "# 累计到第六次时 ``now`` 必然略过 ``started + 900``，合同要求的最后一次探针",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "tests/gateway_fakes.py",
+        "设计要点：**所有调用都记进同一条 ``CallLog``**。接口设计 3.2 的处理次序是合同要求，",
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
+        "tests/test_acceptance_fixtures_identity_contract.py",
+        '"""探针桩：每次都返回 0 条可见指标（明确空结果，按合同不算就绪）。"""',
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "tests/test_galaxy_account_match.py",
+        "# V-开通-09：工号缺失但邮箱可用时按合同走邮箱回退。",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "tests/test_gateway_pipeline.py",
+        "本模块按合同原文与产品负责人 2026-08-17 定稿约束其触发面与文案。",
+        "问数与多轮对话",
+    ),
+    GroundedAttribution(
         "tests/test_mcp_readiness_machine.py",
-        "合同要求的最后一次探针永远发不出去",
+        "``started + 900``，于是合同要求的最后一次探针永远发不出去——十五分钟的窗口",
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "tests/test_permission_publish_postgres.py",
+        '进来——合同要求的"发布读回一致后立即探一次"就名存实亡了。',
         "开通流程",
     ),
 )
 
 # ---------------------------------------------------------------------------
-# 已知例外：核对时发现措辞源自具体 Issue 的产品负责人决定（有留痕），但
+# 已知例外：核对时发现措辞源自具体 Issue/PR 的裁定（有留痕），但
 # `产品合同与外部边界.md` 正文本身没有对应文字。不静默放行、不擅自改写归属，
-# 登记原因并在门禁输出里保持可见，交给编排者判断是否需要回写合同或改措辞。
+# 登记来源与裁定信息，门禁通过与失败时都可见地报出来，交给编排者判断是否需要
+# 回写合同或改措辞。
 # ---------------------------------------------------------------------------
 
 REGISTERED_EXCEPTIONS: tuple[RegisteredException, ...] = (
     RegisteredException(
-        "src/lingxi/apps/scheduler/__init__.py",
-        "合同要求\"告警不可用时主流程行为",
+        "src/lingxi/apps/gateway/__init__.py",
+        '只是"发送"这一步落到日志（Issue #153：合同要求"告警不可用时主流程行为有',
+        "Issue #153",
+        "2026-08-14",
+        "产品负责人",
         "「告警不可用时主流程行为需要明确定义」出自 Issue #153 的产品负责人决定，"
-        "产品合同与外部边界正文没有关于告警/监控行为的条款；与 gateway/__init__.py "
-        "同一处措辞。2026-08-19 归属核对登记，未改写，留待编排者判断是否需要回写合同。",
+        "产品合同与外部边界正文没有关于告警/监控行为的条款；与 "
+        "apps/scheduler/alerting_assembly.py 同一处措辞（同一登记表下方的另一条）。",
     ),
     RegisteredException(
-        "src/lingxi/apps/gateway/__init__.py",
-        "合同要求\"告警不可用时主流程行为有",
-        "同上（scheduler/__init__.py 的登记）：出自 Issue #153，合同正文未提及告警行为。",
+        "src/lingxi/apps/scheduler/alerting_assembly.py",
+        '没有配置目标群不等于告警关闭（Issue #153：合同要求"告警不可用时主流程行为',
+        "Issue #153",
+        "2026-08-14",
+        "产品负责人",
+        "同上（gateway/__init__.py 的登记）：出自 Issue #153，合同正文未提及告警行为。"
+        "2026-08-19 #237 把这段文字从 apps/scheduler/__init__.py 搬到本文件，"
+        "登记表路径已同步更新——这是本门禁设计上要防的腐烂被真实触发的一次实例。",
+    ),
+    RegisteredException(
+        "src/lingxi/core/identity/roster_snapshot.py",
+        "**为什么门槛不能写成「rows 非空」**（`V-花名册-41`，PR #208 二级审查钉入的合同条款）：",
+        "PR #208",
+        "2026-08-17",
+        "PR #208 二级独立复核",
+        '"合同条款"在这里是转述二级审查的用词，指验收矩阵 V-花名册-41 这条被独立复核'
+        "钉住的判据，不是指产品合同与外部边界正文；该文档没有关于花名册替换判据的具体规定。",
     ),
     RegisteredException(
         "src/lingxi/core/permission/publish_row.py",
-        "而合同要求这里放",
+        ":mod:`lingxi.core.permission.role_function`），而合同要求这里放**指标名**。中间缺的",
+        "Issue #155",
+        "2026-08-17",
+        "产品负责人",
         "「发布表值列表放指标名」出自 Issue #155 产品负责人对三问的答复（留痕见该 "
         "Issue 评论），是与问数 MCP 消费方的既定数据格式约定，产品合同与外部边界 "
-        "正文没有规定发布表的具体字段格式。2026-08-19 归属核对登记，未改写。",
+        "正文没有规定发布表的具体字段格式。",
+    ),
+    RegisteredException(
+        "tests/test_roster_snapshot.py",
+        "# **否定用例（PR #208 二级审查钉入的合同条款）**：INCOMPLETE 保留 rows 是有意",
+        "PR #208",
+        "2026-08-17",
+        "PR #208 二级独立复核",
+        "同上（roster_snapshot.py 的登记）。",
     ),
 )
 
@@ -367,13 +563,32 @@ def find_triggered_lines(path: Path) -> list[tuple[int, str]]:
 
     hits = []
     for line_number, line in enumerate(text.splitlines(), start=1):
-        if TRIGGER_PATTERN.search(line):
-            hits.append((line_number, line.strip()))
+        stripped = line.strip()
+        if TRIGGER_PATTERN.search(stripped) and not META_EXCLUDE_PATTERN.search(stripped):
+            hits.append((line_number, stripped))
     return hits
 
 
-def evaluate() -> tuple[list[str], str]:
-    """返回 (失败原因列表, 汇总信息)。"""
+def _read_file(relative: str, file_texts: dict[str, str], failures: list[str]) -> str | None:
+    if relative in file_texts:
+        return file_texts[relative]
+    full_path = REPOSITORY_ROOT / relative
+    try:
+        text = full_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        failures.append(f"登记表引用的文件读不出来：{relative}（{error}）")
+        file_texts[relative] = ""
+        return None
+    file_texts[relative] = text
+    return text
+
+
+def evaluate() -> tuple[list[str], list[str], str]:
+    """返回 (阻断性失败列表, 例外债务说明列表, 汇总信息)。
+
+    例外债务在**任何**运行结果下都单独返回，调用方必须在成功与失败两条路径
+    上都打印它——例外不能只在门禁通过时才被看见（B2，2026-08-19 复查）。
+    """
 
     try:
         contract_text = CONTRACT_DOCUMENT.read_text(encoding="utf-8")
@@ -382,90 +597,106 @@ def evaluate() -> tuple[list[str], str]:
 
     sections = contract_sections(contract_text)
     if not sections:
-        raise AttributionCheckError("产品合同文档里一个二/三级标题都没解析到，无法核对归属")
+        raise AttributionCheckError("产品合同文档里一个标题都没解析到，无法核对归属")
 
     failures: list[str] = []
 
-    # (a) 登记表引用的章节必须真实存在。
     for grounded in GROUNDED_ATTRIBUTIONS:
+        if len(grounded.line) < MIN_EXCERPT_LENGTH:
+            failures.append(
+                f"登记表里 {grounded.file} 的登记行短于 {MIN_EXCERPT_LENGTH} 个字符，"
+                "过短的登记容易被后续任意新增的同类短行意外撞上，请登记完整的行原文。"
+            )
         if grounded.section not in sections:
             failures.append(
                 f"登记表里 {grounded.file} 的归属指向章节「{grounded.section}」，"
                 "但产品合同文档里找不到这个标题（改名了，还是删除了？）"
             )
 
-    # (b) 登记表的摘录必须真的能在它标注的源文件里找到。
+    for exception in REGISTERED_EXCEPTIONS:
+        if len(exception.line) < MIN_EXCERPT_LENGTH:
+            failures.append(
+                f"例外登记里 {exception.file} 的登记行短于 {MIN_EXCERPT_LENGTH} 个字符。"
+            )
+        if not (exception.source and exception.decided_on and exception.decided_by):
+            failures.append(
+                f"例外登记 {exception.file} 缺少来源 Issue/PR、裁定日期或裁定人三项之一——"
+                "例外必须能被追溯，不能只写理由。"
+            )
+
     file_texts: dict[str, str] = {}
 
-    def read_registered_file(relative: str) -> str | None:
-        if relative in file_texts:
-            return file_texts[relative]
-        full_path = REPOSITORY_ROOT / relative
-        try:
-            text = full_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            failures.append(f"登记表引用的文件读不出来：{relative}（{error}）")
-            file_texts[relative] = ""
-            return None
-        file_texts[relative] = text
-        return text
-
     for grounded in GROUNDED_ATTRIBUTIONS:
-        text = read_registered_file(grounded.file)
-        if text is not None and grounded.excerpt not in text:
-            failures.append(
-                f"登记表摘录已经在源文件里找不到了：{grounded.file} 摘录 {grounded.excerpt!r}"
-                "——原句被改动或删除时，请同步更新登记表（scripts/ci/check_contract_attribution.py）"
-            )
+        text = _read_file(grounded.file, file_texts, failures)
+        if text is not None:
+            current_lines = {stripped for _, stripped in _iter_stripped_lines(text)}
+            if grounded.line not in current_lines:
+                failures.append(
+                    f"登记表登记的行已经在源文件里找不到了（逐字比对）：{grounded.file} "
+                    f"—— {grounded.line!r}。原句被改动或删除时，请同步更新登记表"
+                    "（scripts/ci/check_contract_attribution.py）"
+                )
 
     for exception in REGISTERED_EXCEPTIONS:
-        read_registered_file(exception.file)
-        text = file_texts.get(exception.file, "")
-        if exception.excerpt not in text:
-            failures.append(
-                f"例外登记的摘录已经在源文件里找不到了：{exception.file} 摘录 {exception.excerpt!r}"
-            )
+        text = _read_file(exception.file, file_texts, failures)
+        if text is not None:
+            current_lines = {stripped for _, stripped in _iter_stripped_lines(text)}
+            if exception.line not in current_lines:
+                failures.append(
+                    f"例外登记的行已经在源文件里找不到了（逐字比对）：{exception.file} "
+                    f"—— {exception.line!r}"
+                )
 
-    # (c) 仓库里每一处「合同要求/合同明令」都必须被登记表或例外表覆盖。
-    covered_by_file: dict[str, list[str]] = {}
+    # 每一处「合同要求/合同明令」都必须与登记表或例外表里的某一条**逐字相等**。
+    covered_lines_by_file: dict[str, set[str]] = {}
     for grounded in GROUNDED_ATTRIBUTIONS:
-        covered_by_file.setdefault(grounded.file, []).append(grounded.excerpt)
+        covered_lines_by_file.setdefault(grounded.file, set()).add(grounded.line)
     for exception in REGISTERED_EXCEPTIONS:
-        covered_by_file.setdefault(exception.file, []).append(exception.excerpt)
+        covered_lines_by_file.setdefault(exception.file, set()).add(exception.line)
 
     triggered_total = 0
     for path in tracked_files():
         relative = _display_path(path)
         for line_number, line in find_triggered_lines(path):
             triggered_total += 1
-            excerpts = covered_by_file.get(relative, ())
-            if not any(excerpt in line for excerpt in excerpts):
+            covered = covered_lines_by_file.get(relative, set())
+            if line not in covered:
                 failures.append(
-                    f"{relative}:{line_number}：出现「合同要求」或「合同明令」但未登记"
-                    f"——{line!r}。请先核对它是否真的对应产品合同正文，再登记进 "
-                    "scripts/ci/check_contract_attribution.py 的 GROUNDED_ATTRIBUTIONS"
-                    "（对上了）或 REGISTERED_EXCEPTIONS（对不上、且不能擅自改写归属时）。"
+                    f"{relative}:{line_number}：出现「合同要求」类归属短语但未登记"
+                    f"（逐字匹配，不是包含即算）——{line!r}。请先核对它是否真的对应"
+                    "产品合同正文，再登记进 scripts/ci/check_contract_attribution.py 的 "
+                    "GROUNDED_ATTRIBUTIONS（对上了）或 REGISTERED_EXCEPTIONS"
+                    "（对不上、且不能擅自改写归属时）。"
                 )
 
     exception_notes = [
-        f"- {exception.file}：{exception.excerpt!r} —— {exception.reason}"
+        f"- {exception.file}：{exception.line!r}\n"
+        f"  来源：{exception.source}（{exception.decided_on}，{exception.decided_by}）—— {exception.reason}"
         for exception in REGISTERED_EXCEPTIONS
     ]
     summary = (
-        f"归属核对：扫描到 {triggered_total} 处「合同要求/合同明令」，"
+        f"归属核对：扫描到 {triggered_total} 处「合同要求」类归属短语，"
         f"{len(GROUNDED_ATTRIBUTIONS)} 条登记为已核对对应合同正文，"
         f"{len(REGISTERED_EXCEPTIONS)} 条登记为已知例外（未改写归属，待裁定）"
     )
-    if exception_notes:
-        summary += "\n已知例外：\n" + "\n".join(exception_notes)
 
-    return failures, summary
+    return failures, exception_notes, summary
+
+
+def _iter_stripped_lines(text: str):
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        yield line_number, line.strip()
 
 
 def main(argv: list[str] | None = None) -> int:
-    del argv
+    # 无任何可选参数——但仍要显式解析并拒绝未知参数（本仓上一批次真实栽过
+    # `--e` 缩写命中另一个脚本里带写入副作用的选项的坑）；`allow_abbrev=False`
+    # 关掉前缀缩写匹配。
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.parse_args(argv)
+
     try:
-        failures, summary = evaluate()
+        failures, exception_notes, summary = evaluate()
     except AttributionCheckError as error:
         print(f"归属核对检查失败：{error}", file=sys.stderr)
         return 1
@@ -474,9 +705,17 @@ def main(argv: list[str] | None = None) -> int:
         print("归属核对检查失败：", file=sys.stderr)
         for failure in failures:
             print(f"- {failure}", file=sys.stderr)
+        if exception_notes:
+            print("以下已登记例外仍然有效（与本次失败无关，一并报出）：", file=sys.stderr)
+            for note in exception_notes:
+                print(note, file=sys.stderr)
         return 1
 
     print(summary)
+    if exception_notes:
+        print("已知例外：")
+        for note in exception_notes:
+            print(note)
     return 0
 
 

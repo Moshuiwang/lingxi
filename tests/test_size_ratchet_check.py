@@ -105,22 +105,122 @@ class RenderRoundTripTest(unittest.TestCase):
 
 
 class RealBaselineIsHonestTest(unittest.TestCase):
-    """反向验证：仓库里已经提交的基线文件本身必须诚实（与真实行数精确相等）。"""
+    """反向验证：仓库里已经提交的基线文件本身必须诚实（与真实行数精确相等）。
+
+    不钉死具体路径集合——#237/#239 两个并行 Story 分别把
+    ``apps/scheduler/__init__.py`` 与 ``adapters/postgres_conversation.py``
+    拆分成包，基线里哪些文件仍然超阈值会随之变化（甚至可能变成空集，见
+    ``EmptyBaselineIsLegalTest``）。这条测试只断言基线本身**诚实**——记录值
+    与实测精确相等、且每一条都真的落在 ``src/lingxi/`` 范围内——不断言具体
+    是哪几个文件（2026-08-19 三方合并演练实测坐实：钉死具体路径的旧版本在
+    #245 落地后立刻 FAIL，这不是本条测试该守的东西）。
+    """
 
     def test_committed_baseline_matches_actual_line_counts(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
         current = CHECK.measure(CHECK.iter_scope_files())
         self.assertEqual(CHECK.evaluate(baseline, current), [])
 
-    def test_committed_baseline_only_contains_the_two_known_files(self) -> None:
+    def test_committed_baseline_entries_are_all_within_scope(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
-        self.assertEqual(
-            set(baseline),
-            {
-                "src/lingxi/adapters/postgres_conversation.py",
-                "src/lingxi/apps/scheduler/__init__.py",
-            },
+        for path in baseline:
+            self.assertTrue(path.startswith("src/lingxi/"), path)
+            self.assertTrue(path.endswith(".py"), path)
+
+
+class EmptyBaselineIsLegalTest(unittest.TestCase):
+    """空基线是合法终态，不是异常：当两个大文件都被拆分完、``src/lingxi/``
+    下不再有任何文件超过阈值时，棘轮退化成"不许新文件跨过 1500 行"，那仍是
+    它的主要价值——不能把"基线空"和"扫描坏了"混为一谈（补充复查要求，
+    2026-08-19，与 A6"目录存在但零个 .py 文件"是两回事：那种是扫描本身失败，
+    这里是扫描正常、只是没有文件超阈值）。
+    """
+
+    def test_empty_baseline_against_no_over_threshold_files_passes(self) -> None:
+        self.assertEqual(CHECK.evaluate({}, {"src/lingxi/core/ids.py": 42}), [])
+
+    def test_baseline_file_containing_only_the_header_parses_to_empty_dict(self) -> None:
+        header_only = "\n".join(CHECK.BASELINE_HEADER) + "\n"
+        self.assertEqual(CHECK.parse_baseline(header_only), {})
+
+
+class RunRefreshClassificationTest(unittest.TestCase):
+    """``run_refresh`` 必须只挡「超过上限」与「新文件未登记」两类失败，放行
+    「基线记录 > 实测」（那正是它该修的陈旧记录）——这是本次修复过程中先犯
+    了一次的回归（把三类失败一律挡下，导致 #245 合并后一次正常的收紧刷新也
+    被拒绝），起了这组测试才发现，一并固化为回归用例。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.source_root = root / "src" / "lingxi"
+        self.source_root.mkdir(parents=True)
+        self.baseline_path = root / "baseline.txt"
+
+        self._orig_repository_root = CHECK.REPOSITORY_ROOT
+        self._orig_source_root = CHECK.SOURCE_ROOT
+        self._orig_baseline_path = CHECK.BASELINE_PATH
+        # measure() 用 REPOSITORY_ROOT 计算相对路径当基线键；一并打桩成临时
+        # 目录，否则真实仓库根与临时 SOURCE_ROOT 不在同一棵树下会直接抛错。
+        CHECK.REPOSITORY_ROOT = root
+        CHECK.SOURCE_ROOT = self.source_root
+        CHECK.BASELINE_PATH = self.baseline_path
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        CHECK.REPOSITORY_ROOT = self._orig_repository_root
+        CHECK.SOURCE_ROOT = self._orig_source_root
+        CHECK.BASELINE_PATH = self._orig_baseline_path
+
+    def _write_module(self, relative: str, line_count: int) -> None:
+        path = self.source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(f"# {i}" for i in range(line_count)) + "\n", encoding="utf-8")
+
+    def test_refresh_lowers_a_shrunk_entry(self) -> None:
+        self._write_module("big.py", 1600)
+        self.baseline_path.write_text(CHECK.render_baseline({"src/lingxi/big.py": 2000}), encoding="utf-8")
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/big.py": 1600})
+
+    def test_refresh_removes_an_entry_that_shrank_below_threshold(self) -> None:
+        self._write_module("shrunk.py", 100)
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"src/lingxi/shrunk.py": 2000}), encoding="utf-8"
         )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {})
+
+    def test_refresh_refuses_when_an_unregistered_file_newly_crosses_threshold(self) -> None:
+        """B1 的回归用例本体：新文件超阈值且未登记时，--refresh 必须拒绝写入，
+        不能返回 0 让人误以为已经处理好了。"""
+
+        self._write_module("registered.py", 100)  # 缩小，refresh 本该能处理
+        self._write_module("new_giant.py", CHECK.THRESHOLD_LINES + 50)  # 全新违规
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"src/lingxi/registered.py": 2000}), encoding="utf-8"
+        )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 1)
+        # 拒绝时不得动基线文件——既有的合法收紧也不该被这次失败连累着丢失。
+        self.assertEqual(
+            CHECK.load_baseline(self.baseline_path), {"src/lingxi/registered.py": 2000}
+        )
+
+    def test_refresh_refuses_when_a_registered_file_grew_past_its_ceiling(self) -> None:
+        self._write_module("grown.py", 2100)
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"src/lingxi/grown.py": 2000}), encoding="utf-8"
+        )
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"src/lingxi/grown.py": 2000})
 
 
 if __name__ == "__main__":
