@@ -5,25 +5,34 @@
 :mod:`lingxi.core.permission.mcp_readiness`；本模块只负责把协议细节做对，并在边界上把
 传输与协议的失败翻译成本仓库的语义。
 
-## 诚实边界：**真实 MCP 协议面未实测（证据等级 L1）**
+## 诚实边界：**真实 MCP 协议面大半未实测（证据等级 L1）；`list_metrics` 返回形状已 L4a（Issue #253）**
 
 与 ``adapters/feishu_permission_bitable.py`` 同一姿态，但**更弱**：那个模块至少有三条
-读/建/读回路径经过 G-BIT 回源实测，而问数 MCP 这一侧，本 Story **一次真实调用都没有
-发生过**。下面全部断言跑在注入的假传输层上。因此三件事按未验证登记，等 Epic C 冻结后的
-受控窗口做 L4a：
+读/建/读回路径经过 G-BIT 回源实测，而问数 MCP 这一侧，此前**一次真实调用都没有
+发生过**。2026-08-19 编排者在受控环境完成了第一次真实调用（只读、测试令牌，只测了
+``list_metrics``），详见
+[问数 MCP `list_metrics` 真实响应形状](../../../docs/参考证据/问数MCP-list_metrics真实响应形状.md)。
+下面因此分两类：
 
-1. **端点形态与协议版本**：这里按 MCP Streamable HTTP + JSON-RPC 2.0 的 ``tools/call``
-   编写（接口设计[「五、问数 MCP」](../../../docs/技术设计/接口设计.md#五问数-mcp消费方)），
-   真实服务端是否就是这个形态未经证实；
-2. **``list_metrics`` 的返回形状**：指标列表到底挂在哪里未经证实。因此计数走**可注入**的
-   ``metrics_reader``，而默认实现**只认一种形状**
-   （``result.structuredContent.metrics`` 是列表），其余一律失败——见
-   :func:`default_metrics_reader` 里"为什么窄成这样"的两条理由；
+1. **端点形态与协议版本**：MCP Streamable HTTP + JSON-RPC 2.0 的 ``tools/call``
+   （接口设计[「五、问数 MCP」](../../../docs/技术设计/接口设计.md#五问数-mcp消费方)）
+   ——**已实测确认**（``MCP Metric Query Server 1.27.2``，``protocolVersion=2025-06-18``）；
+2. **``list_metrics`` 的返回形状**——**已实测确认**：``result`` 没有 ``structuredContent``，
+   指标挂在 ``result.content[0].text``（一段 JSON 字符串）解开后的 ``metrics`` 键上。
+   计数仍然走**可注入**的 ``metrics_reader``：默认实现 :func:`default_metrics_reader`
+   **保持不变**、依旧只认 ``result.structuredContent.metrics``（历史语义与兜底，见它自己
+   的 docstring）；已验证的 :func:`content_text_metrics_reader` 读的正是实测到的这个
+   形状，由装配层显式注入替换默认值；
 3. **"权限还没同步"到底以什么错误形态出现**：HTTP 401/403、JSON-RPC error、还是
-   ``result.isError``，未经证实。三种都覆盖到了，且**"明确拒绝"这一类是白名单式的、
-   默认最保守**：只有 HTTP 401/403 默认算拒绝（这是 HTTP 自己的标准语义，不是对 MCP 的
-   猜测）；JSON-RPC 错误码白名单默认为空；``result.isError`` 默认算**技术失败**，
-   要显式打开 ``tool_error_is_denied`` 才算拒绝。L4a 实测之后再按证据放宽。
+   ``result.isError``，**其余两种仍未实测**（本次只测了有效令牌下的成功路径与无效令牌
+   下的 401）。已实测：无效令牌 → **HTTP 401**，响应体是 JSON-RPC
+   ``{"error": {"message": "Unauthorized: invalid token"}}``。分类只按**状态码**走
+   （见 :meth:`QueryMcpProbe._read` 里 ``status in self._denied_status_codes`` 那一步，
+   它先于任何 JSON-RPC 载荷解析），因此与默认的"401/403 算明确拒绝"逐位一致、
+   **无需改动**——这条实测只是确认现状成立，不是发现了需要放宽的新形态。JSON-RPC
+   错误码白名单默认仍为空；``result.isError`` 默认仍算**技术失败**，要显式打开
+   ``tool_error_is_denied`` 才算拒绝——这两条继续按 L1 保守处理，等各自的真实形态被
+   实测后再放宽。
 
 **所有未知形态一律落"技术失败"，绝不落"就绪"。** 这是本模块唯一不肯让步的地方：一次
 读不懂的响应被凑成就绪，用户侧表现为"开通成功了但一问就没有权限"，而我们的记录会说
@@ -82,6 +91,12 @@ JSONRPC_VERSION = "2.0"
 #: 收得这么窄是刻意的，见 :func:`default_metrics_reader`。
 STRUCTURED_CONTENT_KEY = "structuredContent"
 METRIC_LIST_KEY = "metrics"
+
+#: :func:`content_text_metrics_reader` 认得的结果形状里，文本块所在的键与块类型。
+#: 真实响应实测样本见模块文档「诚实边界」一节与
+#: ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``。
+CONTENT_KEY = "content"
+CONTENT_TEXT_TYPE = "text"
 
 
 class McpHttpResponse(NamedTuple):
@@ -205,6 +220,67 @@ def default_metrics_reader(result: Mapping[str, Any]) -> int:
     raise McpProbeError("unrecognized_result_shape", denied=False)
 
 
+def content_text_metrics_reader(result: Mapping[str, Any]) -> int:
+    """**已验证的**指标计数（Issue #253 / L4a，2026-08-19 实测）：读 ``result.content``
+    的第一个块，要求 ``type == "text"``，把它的 ``text`` 解析成 JSON，取顶层
+    ``metrics`` 列表的长度。
+
+    ```json
+    {
+      "content": [{"type": "text", "text": "{\\"metrics\\": [{\\"metric_id\\": \\"sub_new_count\\", ...}]}"}],
+      "isError": false
+    }
+    ```
+
+    这是真实问数 MCP（``MCP Metric Query Server 1.27.2``）对 ``list_metrics`` 的逐字
+    返回形状，完整实测记录见
+    ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``。``result`` 里**没有**
+    ``structuredContent``——:func:`default_metrics_reader` 因此在真实 MCP 上永远抛
+    ``unrecognized_result_shape``，这正是 Issue #253 的起因。``default_metrics_reader``
+    本身**不改**（它是兜底与历史语义，见它自己的 docstring）；本函数由装配层显式注入
+    替换默认值（``adapters/../apps/scheduler/assembly.py`` 的
+    ``_build_readiness_follow_up``），放宽是**有证据的**，不是猜的。
+
+    放宽到这一步为止，三条纪律照旧不让步：
+
+    1. **只认 ``metrics`` 这个键**（复用 :data:`METRIC_LIST_KEY`）。不依次尝试
+       ``items``/``data``/``result``/``list``——:func:`default_metrics_reader`
+       docstring 否决那种写法的理由在这里同样成立：与指标无关的列表不该被数成"就绪"。
+    2. **不数 ``content`` 的块数。** 必须解析 ``text`` 内层 JSON 后数 ``metrics``
+       列表长度，不是 ``len(result["content"])``——"你没有任何指标"的空回答同样只有
+       一个文本块，数块数会把它误判成"看见了 1 条"。
+    3. **未知形状一律技术失败，绝不放行。** 缺 ``content``、块类型不是 ``text``、
+       ``text`` 不是合法 JSON、解开后 ``metrics`` 不是列表，一律抛
+       ``unrecognized_result_shape``（``denied=False``）——与默认 reader 同一个错误码、
+       同一个方向：宁可说"读不懂"，不能说"这个人可以用了"。空 ``metrics`` 列表不算
+       畸形，如实返回 0（"0 算不算就绪"由判定层的 :func:`classify_probe` 决定，不在
+       这里）。
+
+    真实响应目前只观察到**一个**文本块；多块形态本次未实测，本函数只看
+    ``content[0]``。
+    """
+
+    content = result.get(CONTENT_KEY)
+    if not isinstance(content, list) or not content:
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    block = content[0]
+    if not isinstance(block, Mapping) or block.get("type") != CONTENT_TEXT_TYPE:
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    text = block.get("text")
+    if not isinstance(text, str):
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        raise McpProbeError("unrecognized_result_shape", denied=False) from None
+    if not isinstance(parsed, Mapping):
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    metrics = parsed.get(METRIC_LIST_KEY)
+    if not isinstance(metrics, list):
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    return len(metrics)
+
+
 class QueryMcpProbe:
     """问数 MCP 的就绪探针。构造只存参数，不做任何 I/O、不读凭据。"""
 
@@ -244,6 +320,13 @@ class QueryMcpProbe:
         一致——那边算出来的"结论最晚什么时候落地"就是拿这个数算的。"""
 
         return self._timeout_seconds
+
+    @property
+    def metrics_reader(self) -> Callable[[Mapping[str, Any]], int]:
+        """当前生效的指标计数函数。装配层与测试用它自证接线（Issue #253）：
+        没有它，"装配层是不是真的注入了已验证的 reader"就只能靠读代码相信，读不出来。"""
+
+        return self._metrics_reader
 
     def list_metrics(self, *, user_id: str) -> int:
         """以该用户身份执行一次 ``list_metrics``，返回可见指标条数。
@@ -349,6 +432,8 @@ class QueryMcpProbe:
 
 
 __all__ = [
+    "CONTENT_KEY",
+    "CONTENT_TEXT_TYPE",
     "DEFAULT_DENIED_ERROR_CODES",
     "DEFAULT_DENIED_STATUS_CODES",
     "DEFAULT_TOOL_NAME",
@@ -358,6 +443,7 @@ __all__ = [
     "QueryMcpProbe",
     "REQUEST_TIMEOUT_SECONDS",
     "STRUCTURED_CONTENT_KEY",
+    "content_text_metrics_reader",
     "default_metrics_reader",
     "urllib_mcp_transport",
 ]

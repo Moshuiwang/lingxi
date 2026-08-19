@@ -14,3 +14,4 @@
 - [验证与门禁形成记录](验证与门禁形成记录.md)：PR #12、Agent SDK 真实链路和审查事故如何形成现行门禁；仅用于追溯原因，不定义当前规则或当前通过状态。
 - [MVP联合验收执行卡](MVP联合验收执行卡.md)：Epic E（[#161](https://github.com/Moshuiwang/lingxi/issues/161)）一次性集中验收窗口的逐步执行卡，覆盖 #97 云盘九步探针、Epic D 首次开通 L4a、受控暂停窗口与 Epic E 联合验收四阶段；每条注明谁操作、预期现象与失败处理。
 - [员工旅程验收检查单](员工旅程验收检查单.md)：飞书私聊入口完整员工可见路径的逐点检查单，配合执行卡使用；每行给出可追溯的 `V-*` 断言与双通道观测要求。
+- [问数 MCP `list_metrics` 真实响应形状](问数MCP-list_metrics真实响应形状.md)：2026-08-19 对真实问数 MCP（`MCP Metric Query Server 1.27.2`）的第一次实测，`list_metrics` 的逐字返回形状、实测到的 9 个指标全集与无效令牌的拒绝形态；只测了 `list_metrics`，`query_metric`/`search_dimension` 未测。

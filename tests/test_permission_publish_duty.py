@@ -1334,6 +1334,32 @@ class DutyRegistrationTest(unittest.TestCase):
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))
 
+    def test_the_probe_is_wired_with_the_verified_content_text_reader(self) -> None:
+        """Issue #253：装配层必须显式注入已验证的
+        ``content_text_metrics_reader``，而不是让 ``QueryMcpProbe`` 落回默认值——
+        默认的 ``default_metrics_reader`` 在真实问数 MCP 上永远技术失败（见
+        ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``）。
+        """
+
+        from lingxi.adapters.query_mcp_probe import (
+            content_text_metrics_reader,
+            default_metrics_reader,
+        )
+
+        loop = build_loop(
+            self._wired_config(
+                LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                LINGXI_QUERY_MCP_ENDPOINT="https://mcp.example.invalid/rpc",
+            ),
+            permission_table_access_token=lambda: "u-fake-token",
+            audit=RecordingAudit(),
+        )
+
+        duty = {duty.name: duty for duty in loop.duties}["权限发布与就绪确认"]
+        probe = duty._readiness.ticker._probe
+        self.assertIs(probe.metrics_reader, content_text_metrics_reader)
+        self.assertIsNot(probe.metrics_reader, default_metrics_reader)
+
     def test_a_direction_agnostic_provider_fits_the_same_injection_point(self) -> None:
         """Issue #226 前置：无论最终方向是哪一个，令牌供给的形状都是
         ``Callable[[], str]``——``PermissionTableAccessTokenProvider``

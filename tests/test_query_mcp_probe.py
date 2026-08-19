@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from lingxi.adapters.query_mcp_probe import (
@@ -29,6 +30,7 @@ from lingxi.adapters.query_mcp_probe import (
     McpHttpResponse,
     QueryMcpProbe,
     _no_redirect_opener,
+    content_text_metrics_reader,
     default_metrics_reader,
 )
 from lingxi.core.permission.mcp_readiness import McpProbeError
@@ -502,6 +504,155 @@ class MetricsReaderTest(unittest.TestCase):
                 with self.assertRaises(McpProbeError) as caught:
                     probe.list_metrics(user_id=USER)
                 self.assertEqual(caught.exception.code, "invalid_metric_count")
+
+
+#: 2026-08-19 编排者对真实问数 MCP（``MCP Metric Query Server 1.27.2``）实测到的全部
+#: 9 个指标（``metric_id``/``name`` 逐字来自 Issue #253；``sub_new_count`` 一条连同
+#: 整个响应外壳都是逐字实测，其余 8 条的 ``name_en`` 未被逐字提供，是合理翻译，不影响
+#: 计数断言）。完整协议记录见
+#: ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``。
+REAL_METRICS = [
+    {"metric_id": "channel_market_sharing", "name": "频道市占率", "name_en": "Channel Market Share"},
+    {"metric_id": "channel_rate", "name": "频道收视率", "name_en": "Channel Rating"},
+    {"metric_id": "exchange_rate", "name": "汇率", "name_en": "Exchange Rate"},
+    {"metric_id": "sub_deduction_count", "name": "扣费用户数", "name_en": "Deduction User Count"},
+    {"metric_id": "sub_deduction_money", "name": "扣费金额", "name_en": "Deduction Amount"},
+    {"metric_id": "sub_new_count", "name": "新增用户数", "name_en": "New User Count"},
+    {"metric_id": "sub_recharge_count", "name": "充值用户数", "name_en": "Recharge User Count"},
+    {"metric_id": "sub_recharge_money", "name": "充值金额", "name_en": "Recharge Amount"},
+    {"metric_id": "vat_rate", "name": "增值税率", "name_en": "VAT Rate"},
+]
+
+
+def _real_list_metrics_result(metrics: list | None = REAL_METRICS) -> dict:
+    """``list_metrics`` 真实响应的 ``result``：``content`` 单个文本块，``text`` 是一段
+    JSON 字符串，解开后顶层 ``metrics`` 是对象列表——形状逐字照 Issue #253 的实测样本。
+    """
+
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps({"metrics": metrics}, ensure_ascii=False)}
+        ],
+        "isError": False,
+    }
+
+
+class VerifiedContentTextMetricsReaderTest(unittest.TestCase):
+    """``content_text_metrics_reader``：Issue #253 按 2026-08-19 真实响应形状注入的
+    已验证 reader。``default_metrics_reader`` 不变，仍然只认 ``structuredContent``。
+    """
+
+    def test_reads_all_nine_real_metrics(self) -> None:
+        self.assertEqual(content_text_metrics_reader(_real_list_metrics_result()), 9)
+
+    def test_empty_metrics_list_returns_zero_not_an_error(self) -> None:
+        """空列表是**如实的 0**，不是畸形——"0 算不算就绪"由判定层决定，不在这里。"""
+
+        self.assertEqual(content_text_metrics_reader(_real_list_metrics_result([])), 0)
+
+    def test_missing_content_is_unrecognized(self) -> None:
+        """畸形①：``result`` 里没有 ``content``。"""
+
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader({"isError": False})
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_text_that_is_not_valid_json_is_unrecognized(self) -> None:
+        """畸形②：``content[0].text`` 不是合法 JSON。"""
+
+        result = {"content": [{"type": "text", "text": "这不是 JSON"}]}
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_metrics_not_a_list_is_unrecognized(self) -> None:
+        """畸形③：解开后 ``metrics`` 不是列表。"""
+
+        result = {
+            "content": [
+                {"type": "text", "text": json.dumps({"metrics": {"not": "a list"}})}
+            ]
+        }
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_block_type_other_than_text_is_unrecognized(self) -> None:
+        """畸形④：块的 ``type`` 不是 ``text``。"""
+
+        result = {
+            "content": [{"type": "image", "text": json.dumps({"metrics": [1, 2, 3]})}]
+        }
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_never_counts_content_blocks(self) -> None:
+        """不数块数：一份"你没有任何指标"的纯文本空回答也只有一个文本块。"""
+
+        result = {"content": [{"type": "text", "text": "你当前没有可用指标"}]}
+        with self.assertRaises(McpProbeError) as caught:
+            content_text_metrics_reader(result)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def test_only_the_metrics_key_is_recognized(self) -> None:
+        """不放宽成"任意列表都算"：与指标无关的键（如告警列表）依旧读不懂。"""
+
+        for key in ("items", "data", "result", "list", "warnings"):
+            with self.subTest(key=key):
+                result = {
+                    "content": [{"type": "text", "text": json.dumps({key: ["warning"]})}]
+                }
+                with self.assertRaises(McpProbeError) as caught:
+                    content_text_metrics_reader(result)
+                self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+
+    def test_the_default_reader_still_cannot_read_the_real_shape(self) -> None:
+        """对照：``default_metrics_reader`` 保持不变——真实响应在它面前依旧读不懂。"""
+
+        with self.assertRaises(McpProbeError) as caught:
+            default_metrics_reader(_real_list_metrics_result())
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+
+class MutationKillTest(unittest.TestCase):
+    """变异验红（Issue #253 完成标准）：把装配层注入的 reader 换回
+    ``default_metrics_reader``，真实样本用例必须变红——证明"已验证 reader 确实是
+    真实 MCP 走通的必要条件"，不是可有可无的装饰。
+    """
+
+    @staticmethod
+    def _real_response(request_id: str) -> McpHttpResponse:
+        return McpHttpResponse(
+            200,
+            {"jsonrpc": "2.0", "id": request_id, "result": _real_list_metrics_result()},
+        )
+
+    def test_the_verified_reader_reads_nine_from_the_real_fixture(self) -> None:
+        """基线（绿）：装配层实际注入的 reader，对真实样本返回 9。"""
+
+        probe, _ = self._probe_with(content_text_metrics_reader)
+        self.assertEqual(probe.list_metrics(user_id=USER), 9)
+
+    def test_reverting_to_the_default_reader_turns_the_real_fixture_red(self) -> None:
+        """变异：把 ``metrics_reader`` 换回 ``default_metrics_reader``——同一份真实样本，
+        同一次调用，不再返回 9，而是抛出技术失败。这就是 Issue #253 要修的那个故障。
+        """
+
+        probe, _ = self._probe_with(default_metrics_reader)
+        with self.assertRaises(McpProbeError) as caught:
+            probe.list_metrics(user_id=USER)
+        self.assertEqual(caught.exception.code, "unrecognized_result_shape")
+        self.assertFalse(caught.exception.denied)
+
+    def _probe_with(self, reader):
+        return _probe(self._real_response, metrics_reader=reader)
 
 
 if __name__ == "__main__":  # pragma: no cover
