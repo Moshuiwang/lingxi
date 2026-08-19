@@ -1584,7 +1584,13 @@ class DutyRegistrationTest(unittest.TestCase):
             "重算必须排在花名册审计之后",
         )
         # 发布消费职责随主密钥一起装配（它的通知面用同一把密钥），排在重算之后。
-        self.assertEqual(names[-1], "权限发布与就绪确认")
+        self.assertIn("权限发布与就绪确认", names)
+        self.assertGreater(
+            names.index("权限发布与就绪确认"), names.index("每日权限重算")
+        )
+        # 组织快照同步（Issue #250）两个令牌供给默认总能建出来，因此总会真实注册，
+        # 排在权限发布消费之后（本文件不是这条位置断言的权威归属，只需不被带崩）。
+        self.assertEqual(names[-1], "组织快照同步")
         self.assertEqual(self._own_records(audit), [], "前置齐备时不该有『未注册』审计")
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

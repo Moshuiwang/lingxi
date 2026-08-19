@@ -122,6 +122,44 @@ class BatchIntegrityTest(unittest.TestCase):
         self.assertIn(IntegrityProblem.EMPTY_TENANT, verify_batch(empty_tenant).problems)
         self.assertIn(IntegrityProblem.NO_TENANT, verify_batch(no_tenant).problems)
 
+    def test_a_department_seen_only_by_the_app_path_fails_the_batch(self) -> None:
+        """F3 变异锚点：一个空部门（不含任何成员）只被应用路径看到、用户路径没有
+        产出对应的行——成员集合两边仍相等，必须靠部门集合本身的交叉校验才挡得住，
+        否则原基线里那个部门会在这一轮悄悄消失。"""
+        scope = TenantScope(
+            "tenant_a",
+            True,
+            frozenset({"ou_member_one"}),
+            frozenset({"ou_member_one"}),
+            app_department_keys=frozenset({"dept_ghost"}),
+            user_department_keys=frozenset(),
+        )
+        report = verify_batch(SnapshotBatch(tenants=(scope,), departments=(), members=(member(),)))
+
+        self.assertFalse(report.complete)
+        self.assertIn(IntegrityProblem.DEPARTMENT_SETS_DIFFER, report.problems)
+
+    def test_matching_department_sets_on_both_paths_do_not_fail_the_batch(self) -> None:
+        """两条路径都没看到额外部门（或都看到同一批）时不是问题——不该把"这个租户
+        确实没有下级部门"这类合法形态误判成完整性缺陷。"""
+        scope = TenantScope(
+            "tenant_a",
+            True,
+            frozenset({"ou_member_one"}),
+            frozenset({"ou_member_one"}),
+            app_department_keys=frozenset({"dept_a"}),
+            user_department_keys=frozenset({"dept_a"}),
+        )
+        report = verify_batch(
+            SnapshotBatch(
+                tenants=(scope,),
+                departments=(SnapshotDepartment(tenant_key="tenant_a", department_key="dept_a", name="测试部门"),),
+                members=(member(),),
+            )
+        )
+
+        self.assertTrue(report.complete)
+
     def test_a_tenant_invisible_to_the_user_identity_fails_the_batch(self) -> None:
         # 2026-07-29 补齐可见范围后才成立的前提；配置被改回时必须整批失败而不是少同步一批人。
         scope = TenantScope("tenant_a", False, frozenset({"ou_member_one"}), frozenset({"ou_member_one"}))

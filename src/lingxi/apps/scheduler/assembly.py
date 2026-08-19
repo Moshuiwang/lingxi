@@ -637,6 +637,78 @@ def _build_onboarding_duty(
     return duty
 
 
+def _build_org_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    user_access_token: Callable[[], str] | None,
+    app_access_token: Callable[[], str] | None,
+) -> Any | None:
+    """装配组织快照同步职责（Issue #250）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    形状照 :func:`_build_onboarding_duty`：两个令牌供给都是调用方必须交出的前置，
+    ``None`` 表示调用方真的没有交出任何供给（"未接线"）——正式装配路径
+    ``build_loop`` 总会建出两条（花名册/开通那条用户身份供给自 Issue #215 起是
+    默认值，权限发布表那条应用身份供给自 Issue #226 起也是默认值），因此这两条
+    分支正常不会在生产触发。**"配了但拿不到令牌"不走这里**：那时职责照常注册，
+    失败发生在 ``run_once`` 内部并按分类审计（``org_snapshot_sync.read_failed``），
+    两者必须可分辨——把运行期的授权失败记成"未注册"会让排障去找配置，反过来会让
+    "还没接线"看起来像"接线了但一直失败"（`V-花名册-29` 的同一条纪律，R3 的原始
+    教训）。
+    """
+
+    if user_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="user_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照用户身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+    if app_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="app_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照应用身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+
+    from lingxi.adapters.feishu_directory import FeishuDirectoryClient
+    from lingxi.adapters.feishu_org_snapshot_reader import read_org_snapshot
+    from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+    from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty, TokenSupplyFailure
+
+    client = FeishuDirectoryClient(base_url=config.feishu_base_url)
+
+    def read_snapshot() -> Any:
+        # 令牌各解析一次、用于本轮**整趟**递归遍历（数百次分页请求，Issue #250
+        # 编排者 2026-08-19 实测规模），不逐次请求都重新取——两条供给都会在有效期内
+        # 直接返回缓存值，这里只是不给每一次分页调用都加一次令牌新鲜度判定的开销。
+        #
+        # 两个供给分别包一层 `TokenSupplyFailure`（Issue #250 编排者复查 F6）：不这样
+        # 做的话，应用令牌、用户令牌、真实扫描三种失败在 `run_once` 的
+        # `org_snapshot_sync.read_failed` 审计里全都只剩 `error=<异常类型>`，分辨不出
+        # 该去查哪一条。只重分类、不改变失败语义——原始异常仍通过 `from error` 保留
+        # 因果链，只是审计只读安全的 `supply` 标签。
+        try:
+            app_token = app_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("app_access_token") from error
+        try:
+            user_token = user_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("user_access_token") from error
+        return read_org_snapshot(client=client, app_token=app_token, user_token=user_token)
+
+    return OrgSnapshotSyncDuty(
+        read_snapshot=read_snapshot,
+        store=PostgresOrgSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        audit=audit,
+        source_app_id=config.feishu_app_id,
+        stop=stop,
+    )
+
+
 def _build_permission_publish_duty(
     config: SchedulerConfig,
     *,
@@ -767,8 +839,9 @@ def build_loop(
     不会因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报与每日
     权限重算排在三类清理之后：它们一天只做一次事，晚一轮毫无影响；而这两个之间的先后
     **不是随意的**——权限重算要用今天那份花名册快照，而换快照的是审计日报那一轮
-    （`V-权限-07`）。告警职责注册在**最后**（基线既有形状）：它汇总本轮观察到的信号，
-    排在被观察者后面才看得到这一轮的事实。
+    （`V-权限-07`）。组织快照同步（Issue #250）排在权限发布消费之后、首次开通编排之前，
+    理由见 ``_build_org_snapshot_sync_duty`` 调用点上方的注释。告警职责注册在**最后**
+    （基线既有形状）：它汇总本轮观察到的信号，排在被观察者后面才看得到这一轮的事实。
 
     ``roster_access_token`` 是花名册读取所用的**短期令牌供给**（返回已就绪令牌的可调用
     对象）。**默认不再是 ``None``**：Issue #215 主接线之后，这里建出一条进程内供给——
@@ -911,6 +984,26 @@ def build_loop(
     )
     if permission_publish is not None:
         duties.append(permission_publish)
+    # 组织快照同步（Issue #250）排在发布消费**之后**、首次开通编排**之前**：它是开通链
+    # 身份定位那一步唯一的数据来源（``PostgresOrgSnapshotStore.lookup``），排在开通
+    # 之前才可能让**同一轮**新装配、第一次真的跑成功的那次同步，被紧随其后的开通认领
+    # 用上，少等一整个调度周期。它与花名册审计、每日权限重算之间没有数据依赖（互不
+    # 读对方的表），因此位置只服务这一个"同一轮内先后"的收益，不构成新的顺序约束。
+    #
+    # 用户身份路径复用**同一个**令牌供给 ``supply``——那条一次性 refresh_token 全系统
+    # 只允许一个消费者，与开通链的在职状态实时回读、花名册日报是同一条（2026-08-08
+    # 授权码被烧的事故形状，不新增第二个消费者）。应用身份路径复用权限发布表那条
+    # ``permission_table_supply``：tenant_access_token 不是一次性凭据、没有消费者数量
+    # 上限，两处消费的是同一类令牌，复用只是省一次多余的换取，不产生新凭据材料。
+    org_snapshot_sync = _build_org_snapshot_sync_duty(
+        config,
+        stop=stop,
+        audit=sink,
+        user_access_token=supply,
+        app_access_token=permission_table_supply,
+    )
+    if org_snapshot_sync is not None:
+        duties.append(org_snapshot_sync)
     # 首次开通编排（Epic D / S-D-02）排在发布消费**之后**：同一轮里发布面先把上一轮排出
     # 的意图推出去，开通链的发布等待才可能在同一轮内看到 ``published``。位置只保证同一轮
     # 内的先后；晚一轮没有产品后果（开通链自己会等）。

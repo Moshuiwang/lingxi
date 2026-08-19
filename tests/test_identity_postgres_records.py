@@ -994,6 +994,30 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         self.assertEqual(self.store.lookup("ou_absent").members, ())
         self.assertEqual(self.store.lookup("ou_zha").members, ())
 
+    def test_has_complete_run_on_reflects_a_persisted_watermark(self) -> None:
+        """F8：当日水位必须能对进程重启保持——真库上验证 ``has_complete_run_on``
+        只认 ``started_at`` 落在查询那个 UTC 日历日、且状态是 ``complete`` 的批次。"""
+
+        today = datetime.now(timezone.utc)
+        self.assertFalse(self.store.has_complete_run_on(today.date()), "还没提交过任何批次")
+
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=today)
+
+        self.assertTrue(self.store.has_complete_run_on(today.date()))
+        self.assertFalse(
+            self.store.has_complete_run_on((today - timedelta(days=1)).date()),
+            "只认真正落在那一天的批次，不能因为“有过完成批次”就对任何日期都返回真",
+        )
+
+    def test_has_complete_run_on_ignores_failed_runs(self) -> None:
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
+
+        self.assertFalse(
+            self.store.has_complete_run_on(datetime.now(timezone.utc).date()),
+            "失败批次不能让水位查询误判成“今天已经成功过一轮”",
+        )
+
 
 class AppUserRecordTest(IdentityPostgresTestCase):
     """V-开通-01 / V-开通-06 / V-开通-15 / V-开通-16 / V-身份-01 / V-身份-02 的真库部分。"""

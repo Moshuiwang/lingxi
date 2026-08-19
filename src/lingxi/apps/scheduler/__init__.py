@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**八个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**九个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -60,10 +60,20 @@
    必须每轮都跑；合并会让当天第一轮之后排进来的意图一直等到第二天。
    **单一写入负责人**：发布执行、就绪探针与用户通知全部在本进程内，不另起消费者。
 
-8. **首次开通编排**（``apps/scheduler/onboarding.py`` + :class:`~lingxi.core.conversation.
+8. **组织快照同步**（:class:`~lingxi.apps.scheduler.org_snapshot_sync.
+   OrgSnapshotSyncDuty`，Issue #250）——每 UTC 日至多一轮：递归遍历关联组织的应用身份
+   与专用授权用户身份两条路径 → 校验批次完整性（不通过不提交半轮）→ 写四张
+   ``feishu_org_*`` 快照表。它是首次开通链身份定位那一步唯一的数据来源；此前四张表
+   全空、产品侧没有任何东西写它们，是 Epic B 一处未被发现的缺件（写入/读取适配器都已
+   就绪，缺的只是这条生产调用点）。第八个职责同样是**条件注册**的：两个令牌供给
+   （用户身份、应用身份）任一未接线就不注册（**恰一条**审计），生产装配路径下两条都是
+   默认值因此不会真的触发。位置排在权限发布消费之后、首次开通编排之前，理由见
+   :func:`~lingxi.apps.scheduler.assembly._build_org_snapshot_sync_duty` 调用点的
+   注释。
+9. **首次开通编排**（``apps/scheduler/onboarding.py`` + :class:`~lingxi.core.conversation.
    onboarding_recovery.OnboardingReconciler`）——认领 gateway 记下的未开通首聊事件，在
    **自己的线程池**上跑完整条开通链（身份 → 匹配 → 建档 → 用户环境 → 权限发布 →
-   MCP 就绪 → ``active``），并自己私聊通知用户。第八个职责同样是**条件注册**的：缺 MCP
+   MCP 就绪 → ``active``），并自己私聊通知用户。第九个职责同样是**条件注册**的：缺 MCP
    令牌主密钥、问数 MCP 端点、用户环境根目录或在职状态令牌供给任一项就不注册（**恰一条**
    审计），此时**没有任何人认领**那些事件——它们原样留在库里，不会被认领走再烧掉。
 
@@ -117,6 +127,7 @@ from lingxi.core.alerting import (
 from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty, _combined_heartbeat
 from lingxi.apps.scheduler.assembly import (
     _build_onboarding_duty,
+    _build_org_snapshot_sync_duty,
     _build_permission_publish_duty,
     _build_permission_refresh_duty,
     _build_permission_retention_duty,
@@ -138,6 +149,7 @@ from lingxi.apps.scheduler.credential_rotation import (
     _is_definite_failure,
 )
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
+from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
 from lingxi.apps.scheduler.permission_publish import (
     PermissionPublishDuty,
     PermissionPublishReport,

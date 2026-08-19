@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
@@ -188,6 +188,24 @@ class PostgresOrgSnapshotStore:
             report.member_count,
         )
         return identifier
+
+    def has_complete_run_on(self, day: date) -> bool:
+        """今天（UTC 日历日）是否已经有一轮 ``complete`` 批次（Issue #250 F8）。
+
+        供 ``OrgSnapshotSyncDuty`` 把当日水位从纯内存变成对进程重启保持——查询
+        本身不引入租约或领导权语义，只是读一次既有表。``started_at`` 显式转到
+        UTC 再取日期，避免会话时区把"今天"判错。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM feishu_org_sync_run
+                    WHERE status = 'complete'
+                      AND (started_at AT TIME ZONE 'UTC')::date = %s
+                    LIMIT 1""",
+                (day,),
+            )
+            return cursor.fetchone() is not None
 
     def latest_complete_expiry(self) -> datetime | None:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
