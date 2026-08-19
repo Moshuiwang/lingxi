@@ -1,0 +1,224 @@
+"""「公司 + 职能 → 指标名列表」翻译层（Issue #227，载体先行、内容后填）。
+
+## 这一层解决什么问题
+
+:mod:`lingxi.core.permission.publish_row` 的 :func:`~lingxi.core.permission.
+publish_row.serialize_permissions` 把有效权限写成发布表 ``permissions`` 列的文本，
+但它现在拿到的值列表是**职能标签**（``运营``、``财务`` 这类，来自
+:mod:`lingxi.core.permission.role_function` 的配置），而问数 MCP 认的是**指标名**
+（``日活``、``收入`` 这类）。中间缺的正是这一层：把「一个用户在某个公司下持有的职能」
+翻译成「这个公司这个职能对应哪些指标名」。
+
+翻译**联合公司**（不是只按职能）：同一个职能标签在不同公司下可能对应不同的指标名
+列表（该公司不产某个指标、或指标口径不同），这也是产品负责人把 Issue 命名为「公司 +
+职能」而不是「职能」的原因。:func:`~lingxi.core.permission.publish_row.
+aggregate_permission` 产出的 ``functions`` 对同一个用户的所有公司是**同一份列表**
+（银河的授权模型里职能是用户级的），但翻译之后每个公司拿到的指标名列表可以不同——这是
+本模块与聚合层之间刻意的形状差异，也是它必须是**独立的一层**、不能直接塞进
+``PermissionAggregate`` 的原因。
+
+## 内容从哪里来（本 Story 不回答）
+
+映射内容（哪个公司的哪个职能对应哪些指标名）只有产品负责人能给，见 Issue
+[#227](https://github.com/Moshuiwang/lingxi/issues/227)。本模块只接受**已经解析好的
+文档**（:func:`build_company_function_metric_map` 的输入），文件 I/O 在
+:mod:`lingxi.adapters.company_function_metric_map_file`，随包发布的配置文件是
+``lingxi/config/company_function_metric_map.toml``——它现在**是空的**（只有
+``[companies]`` 表头，没有任何条目），这是本 Story 交付时的正常状态，不是缺陷。
+
+## fail-closed：未覆盖的组合不得被猜测，也不得被静默丢弃
+
+:func:`translate_company_functions` 对一个用户全部持有的「公司 + 职能」组合逐一核对：
+**只要有一个组合在 mapping 里找不到，整个翻译就失败**，不产出任何指标名——不猜测该
+组合应该对应什么、不回落成职能标签本身、也不悄悄只发布"有映射的那一部分"（那是静默
+丢弃，方向与「未覆盖就不给」一样安全，但会让运维以为这个人的权限只有一部分，而实际上
+是翻译层没跟上）。映射为**空**时，任何用户的任何组合都查不到，因此**每一个原本有效的
+授权用户都会在这一步 fail-closed**——这正是「映射为空时维持现有硬闸」要的效果：在
+产品负责人填入真实映射之前，没有任何人能经翻译层产出可用于真实发布的 ``permissions``
+内容。
+
+调用方（每日权限重算职责）据此把翻译失败当成"这个人本轮不发布"处理，不触碰他已经
+发布过的行——翻译覆盖不全是我们这一侧的数据缺口，不是"银河说他没有权限"，因此不应该
+被当成撤权信号（撤权语义见 ``publish_row`` 模块文档「撤权行」一节，那是另一条独立的
+判定路径，不受本模块影响）。
+
+## 与 ``serialize_permissions`` 的关系
+
+本模块不改、也不复用 ``serialize_permissions`` 的实现——那个函数的形状是"一份职能
+列表适用于用户持有的全部公司"，翻译之后的形状是"每个公司一份可能不同的指标名列表"，
+两者结构不同。:mod:`lingxi.core.permission.publish_row` 提供了同一套序列化纪律
+（``sort_keys``、无空格分隔符、``ensure_ascii=False``、值逐字符透传）的姊妹函数
+:func:`~lingxi.core.permission.publish_row.serialize_translated_permissions`，
+供本模块的输出对接；``serialize_permissions`` 本身与它的既有用例**一个字节都不改**。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+#: 「全非」通配在翻译映射里的公司键：与 ``publish_row.ALL_COMPANIES_KEY`` 同一个字面量。
+#: 不从那边 import 是为了不让本模块反向依赖 ``publish_row``（依赖方向是
+#: 翻译层 → 序列化层，而不是反过来）；两处各留一份同一个字面量的取舍，与
+#: ``core/permission/publish_row.py`` 的 ``is_cipher_shaped`` / ``looks_like_cipher``
+#: 一致两份判据同一条理由——一致性由 :mod:`tests.test_permission_metric_translation`
+#: 与 :mod:`tests.test_permission_publish_row` 各自钉住同一个值。
+ALL_COMPANIES_KEY = "*"
+
+
+class UncoveredPermissionCombination(ValueError):
+    """存在未被翻译映射覆盖的「公司 + 职能」组合：fail-closed，不猜、不丢弃。
+
+    :attr:`missing` 是缺失的 ``(公司ID或 "*", 职能标签)`` 元组集合，按公司再按职能
+    排序，可以直接进审计——公司编号与职能标签都不是人员资料（纪律同
+    ``publish_row.PermissionAggregate.audit_facts``）。
+
+    :attr:`mapping_is_empty` 让调用方能在审计里**分辨两种不同的运维状态**，
+    不止是"翻译失败"这一件事：
+
+    - ``True``：传入的整份映射一个条目都没有——产品负责人还没有开始填内容
+      （随包发布的配置文件当前就是这个状态）；
+    - ``False``：映射里**有**内容，但恰好没有覆盖这一次要用的组合——通常意味着
+      内容正在被逐步填入，只是还没填到这一条。
+
+    两者的运维含义不同（前者是"整体还没开始"，后者是"已经在填，还差几条"），
+    因此调用方（每日权限重算职责）据此记两种不同的跳过原因，见
+    :mod:`lingxi.apps.scheduler.permission_refresh` 的
+    ``SKIP_METRIC_TRANSLATION_UNAVAILABLE`` / ``SKIP_METRIC_TRANSLATION_UNCOVERED``。
+    """
+
+    def __init__(self, missing: Sequence[tuple[str, str]], *, mapping_is_empty: bool) -> None:
+        ordered = tuple(sorted(dict.fromkeys(missing)))
+        if not ordered:
+            raise ValueError("UncoveredPermissionCombination 必须携带至少一个缺失组合")
+        self.missing = ordered
+        self.mapping_is_empty = mapping_is_empty
+        super().__init__(f"未覆盖的公司+职能组合（fail-closed，不猜测、不静默丢弃）：{ordered}")
+
+
+def build_company_function_metric_map(
+    document: Mapping[str, Any],
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """校验解析后的映射文档，返回 ``{公司ID或"*": {职能标签: (指标名, …)}}``。
+
+    文档形态：``{"companies": {"<公司ID或\\"*\\">": {"<职能标签>": ["<指标名>", …]}}}``，
+    与 :mod:`lingxi.core.permission.role_function` 的 ``build_role_function_map``
+    同一套校验姿态（配置未覆盖的组合返回不到值，不是猜出一个值）。
+
+    校验规则，任何一条不满足都失败关闭（抛 ``ValueError``，不做宽容修补）：
+
+    - 顶层必须有 ``companies`` 表，值必须是映射（可以是空映射——**这是合法的初始
+      状态**，代表内容尚未填入，见模块文档）；
+    - 公司键必须是非空字符串（含 ``"*"``），且**不去重、不归一**——它要么是
+      ``sys_country.boss_company_id`` 的原始取值，要么是 ``"*"`` 通配，两者都是
+      精确匹配的键，不做大小写或空白处理；
+    - 每个公司下的职能表必须是映射，职能标签必须是非空字符串，且是
+      :mod:`lingxi.core.permission.role_function` 产出的**原样**标签
+      （精确匹配，不猜测同义词）；
+    - 每个职能对应的指标名列表：必须是非空列表，元素必须是非空字符串。
+      **允许包含重复元素**（:func:`translate_company_functions` 会去重排序），但不
+      允许空字符串或非字符串——那是配置错误，不是数据。
+
+    **不做的事**：不校验指标名是否真的存在于问数 MCP（那需要真实回源，属受控窗口
+    的核对工作，不是配置解析）；不校验职能标签是否出现在
+    ``galaxy_role_function_map.toml`` 里（两个配置文件由不同人分别维护，互相校验
+    会让改一个文件牵连另一个文件的解析）。
+    """
+
+    companies = document.get("companies")
+    if not isinstance(companies, Mapping):
+        raise ValueError("公司+职能→指标名映射缺少 [companies] 表")
+
+    result: dict[str, dict[str, tuple[str, ...]]] = {}
+    for raw_company, raw_functions in companies.items():
+        company = raw_company.strip() if isinstance(raw_company, str) else ""
+        if not company:
+            raise ValueError("公司+职能→指标名映射存在空的公司键")
+        if company in result:
+            raise ValueError(f"公司+职能→指标名映射存在重复的公司键：{company}")
+        if not isinstance(raw_functions, Mapping):
+            raise ValueError(f"公司 {company} 下的职能表必须是映射")
+
+        functions: dict[str, tuple[str, ...]] = {}
+        for raw_function, raw_metrics in raw_functions.items():
+            function = raw_function.strip() if isinstance(raw_function, str) else ""
+            if not function:
+                raise ValueError(f"公司 {company} 下存在空的职能标签")
+            if function in functions:
+                raise ValueError(f"公司 {company} 下存在重复的职能标签：{function}")
+            if not isinstance(raw_metrics, (list, tuple)) or not raw_metrics:
+                raise ValueError(
+                    f"公司 {company} 职能 {function} 的指标名列表必须是非空列表"
+                )
+            metrics: list[str] = []
+            for item in raw_metrics:
+                if not isinstance(item, str) or not item:
+                    raise ValueError(
+                        f"公司 {company} 职能 {function} 的指标名列表元素必须是非空字符串"
+                    )
+                metrics.append(item)
+            functions[function] = tuple(metrics)
+        result[company] = functions
+    return result
+
+
+def translate_company_functions(
+    *,
+    companies: Sequence[str],
+    functions: Sequence[str],
+    all_companies: bool,
+    mapping: Mapping[str, Mapping[str, Sequence[str]]],
+) -> dict[str, tuple[str, ...]]:
+    """把「公司范围 + 职能标签」翻译成发布表要的「公司 → 指标名列表」。
+
+    输入是 :func:`~lingxi.core.permission.publish_row.aggregate_permission` 的产出
+    （``companies`` / ``functions`` / ``all_companies``），输出可以直接交给
+    :func:`~lingxi.core.permission.publish_row.serialize_translated_permissions`。
+
+    **两遍扫描，先查后算**：第一遍只判断"每个公司键下的每个职能是否都能在 mapping
+    里查到"，任何一个查不到就立即抛 :class:`UncoveredPermissionCombination`、
+    **不产出任何部分结果**——这是"失败关闭"与"部分发布"之间的分界线，先查完再决定
+    要不要算，而不是边算边攒、算到哪缺哪就跳过哪。第二遍才真正取值、去重、排序。
+
+    通配（``all_companies=True``）时只查 ``mapping`` 的 ``"*"`` 键，与
+    ``publish_row.serialize_permissions`` 对「全非」通配的处理同一条口径：**不展开**
+    成具体公司——mapping 里 ``"*"`` 键下的职能→指标名同样要产品负责人显式填写，
+    翻译层不会替"持有全非通配的人到底能看哪些指标"这件事做主。
+
+    职能列表内的重复与次序**不影响结果**：同一个职能被查两次、或次序不同，翻译出的
+    指标名集合逐字节相同（去重靠 ``dict.fromkeys``、排序靠显式 ``sorted``，与
+    ``aggregate_permission`` 对职能列表的处理同一套纪律，保证恒等序列化）。
+    """
+
+    keys = (ALL_COMPANIES_KEY,) if all_companies else tuple(dict.fromkeys(companies))
+    if not keys:
+        raise ValueError("翻译需要至少一个公司键")
+    function_names = tuple(dict.fromkeys(functions))
+    if not function_names:
+        raise ValueError("翻译需要至少一个职能标签")
+
+    missing: list[tuple[str, str]] = []
+    for company in keys:
+        function_map = mapping.get(company)
+        for function in function_names:
+            if function_map is None or function not in function_map:
+                missing.append((company, function))
+    if missing:
+        raise UncoveredPermissionCombination(missing, mapping_is_empty=not mapping)
+
+    result: dict[str, tuple[str, ...]] = {}
+    for company in keys:
+        function_map = mapping[company]
+        metrics: list[str] = []
+        for function in function_names:
+            metrics.extend(function_map[function])
+        result[company] = tuple(sorted(dict.fromkeys(metrics)))
+    return result
+
+
+__all__ = [
+    "ALL_COMPANIES_KEY",
+    "UncoveredPermissionCombination",
+    "build_company_function_metric_map",
+    "translate_company_functions",
+]
