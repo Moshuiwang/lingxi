@@ -70,6 +70,11 @@ REQUIRED_MODULES = (
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
     "lingxi.adapters.user_environment",
+    # Epic D 闸⑥：按用户读取问数 MCP 配置的读侧适配器，配套上一条的写侧。由
+    # `apps/worker/service.py` 在**模块级** import（queue 模式每个任务都要
+    # 用），漏登记会直接让 worker 制品的完整性核对判红——见下面
+    # PROCESS_RUNTIME_IMPORTS 的 worker 闭包。
+    "lingxi.adapters.user_mcp_config",
     "lingxi.core.execution.tool_policy",
     "lingxi.core.execution.audit",
     "lingxi.core.execution.hooks",
@@ -473,6 +478,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters",
             "lingxi.adapters.claude_agent_hooks",
             "lingxi.adapters.claude_agent_session",
+            # Epic D 闸⑥：按用户读取问数 MCP 配置，由 apps/worker/service.py
+            # 模块级 import（queue 模式每个任务都要用）。
+            "lingxi.adapters.user_mcp_config",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
             # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。

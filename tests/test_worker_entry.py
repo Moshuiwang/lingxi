@@ -1090,6 +1090,98 @@ class WorkerConfigTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
                 self._load(LINGXI_WORKER_MAX_TURNS=value)
 
+    def test_user_env_root_is_optional_and_defaults_to_none(self) -> None:
+        config = self._load()
+        self.assertIsNone(config.user_env_root)
+
+    def test_user_env_root_reads_the_bare_variable_shared_with_scheduler(self) -> None:
+        """闸⑥：worker 与 scheduler 读同一个裸变量名 ``LINGXI_USER_ENV_ROOT``
+        （不带 ``LINGXI_WORKER_`` 前缀），两个进程指向同一个持久卷挂载点。"""
+
+        env = worker_env()
+        env["LINGXI_USER_ENV_ROOT"] = "/var/lib/lingxi/users"
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(env)
+        self.assertEqual(config.user_env_root, "/var/lib/lingxi/users")
+
+    def test_user_env_root_with_internal_whitespace_fails_at_startup(self) -> None:
+        """校验姿态照抄 scheduler 侧 ``optional_identifier``：不回显取到的值。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_USER_ENV_ROOT="/var/lib/lingxi/us ers")
+        self.assertIn("LINGXI_USER_ENV_ROOT", str(caught.exception))
+        self.assertNotIn("us ers", str(caught.exception))
+
+    def test_user_env_root_must_be_an_absolute_normalized_path(self) -> None:
+        """外部独立审查 F4：只拒空白字符串不够——相对路径与带 `..`/`.`/连续
+        斜杠/多余尾部斜杠的路径此前都会被当成合法值放行，随后被直接拼进每个
+        用户的家目录路径。这里逐个构造这些形态，确认都在启动期就被拒绝。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        malformed = (
+            "relative/path",  # 不是绝对路径
+            "var/lib/lingxi/users",  # 同上
+            "/var/lib/lingxi/../lingxi/users",  # 路径穿越分量
+            "/var/lib/./lingxi/users",  # `.` 分量
+            "/var/lib//lingxi/users",  # 连续斜杠
+            "/var/lib/lingxi/users/",  # 多余的尾部斜杠
+        )
+        for value in malformed:
+            with self.subTest(value=value):
+                with self.assertRaises(WorkerConfigError) as caught:
+                    self._load(LINGXI_USER_ENV_ROOT=value)
+                self.assertIn("LINGXI_USER_ENV_ROOT", str(caught.exception))
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_user_env_root_accepts_a_well_formed_absolute_path(self) -> None:
+        config = self._load(LINGXI_USER_ENV_ROOT="/var/lib/lingxi/users")
+        self.assertEqual(config.user_env_root, "/var/lib/lingxi/users")
+
+    def test_queue_mode_never_parses_the_shared_mcp_servers_variable(self) -> None:
+        """外部独立审查 F3：`queue` 模式的真实任务处理已经改为按用户逐个读取
+        MCP 配置（Epic D 闸⑥），`LINGXI_WORKER_MCP_SERVERS`（全进程共用配置）
+        只服务没有 user_id 概念的一次性受控回合。`queue_mode=True` 时
+        `load_config` 必须**根本不解析**这个变量——即使值是非法 JSON，
+        queue 进程也不能因为一个从不会被用到的变量而启动失败；配了合法值，
+        它也不能出现在构造出来的 WorkerConfig 里。"""
+
+        from lingxi.apps.worker.config import load_config
+
+        malformed_env = worker_env(LINGXI_WORKER_MCP_SERVERS="{not valid json")
+        # turn 模式（默认）下这份畸形值必须让 load_config 失败——这是对照组，
+        # 证明下面 queue_mode=True 的"不失败"确实是因为没有解析，不是因为
+        # 校验规则本身变松了。
+        with self.assertRaises(Exception):
+            load_config(malformed_env)
+
+        config = load_config(malformed_env, require_question=False, queue_mode=True)
+        self.assertEqual(config.mcp_servers, {})
+
+        legit_shared_servers = '{"shared": {"type": "stdio", "command": "should-not-appear"}}'
+        config_with_legit_value = load_config(
+            worker_env(LINGXI_WORKER_MCP_SERVERS=legit_shared_servers),
+            require_question=False,
+            queue_mode=True,
+        )
+        self.assertEqual(
+            config_with_legit_value.mcp_servers,
+            {},
+            "queue 模式下即使给了合法的共享配置也必须被忽略，不能出现在 WorkerConfig 里",
+        )
+
+    def test_turn_mode_still_parses_the_shared_mcp_servers_variable(self) -> None:
+        """对照组：`queue_mode=False`（默认，`turn` 模式的真实姿态）必须保持
+        既有行为不变——这个变量仍然是 `turn` 模式唯一的 MCP 配置来源。"""
+
+        config = self._load(
+            LINGXI_WORKER_MCP_SERVERS='{"query": {"type": "stdio", "command": "x"}}'
+        )
+        self.assertEqual(config.mcp_servers, {"query": {"type": "stdio", "command": "x"}})
+
 
 class WorkerResourceGuardTest(unittest.TestCase):
     """V-护栏-01…07：worker 资源上限与 usage 出口。"""

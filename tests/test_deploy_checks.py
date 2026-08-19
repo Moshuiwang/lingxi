@@ -324,6 +324,113 @@ class OverrideBypassTest(unittest.TestCase):
         self.assertTrue(any("env_file" in line for line in failures), failures)
 
 
+class SchedulerUserVolumeTest(unittest.TestCase):
+    """Epic D 闸⑤：scheduler 的首次开通编排要往用户环境目录写 ``.mcp.json``，
+    stage/prod 覆盖文件必须挂上与 worker/worker-queue 一致的 lingxi-users 卷。
+    """
+
+    def _with_overrides(self, *, stage_body: str, prod_body: str):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        stage = directory / "compose.stage.yaml"
+        prod = directory / "compose.prod.yaml"
+        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(stage_body), "  "), encoding="utf-8")
+        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(prod_body), "  "), encoding="utf-8")
+        original_stage, original_prod = CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = stage, prod
+        try:
+            return CONTRACT.check_scheduler_user_volume()
+        finally:
+            CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = original_stage, original_prod
+
+    def test_scheduler_missing_the_user_volume_in_stage_is_caught(self) -> None:
+        """变异验红：把本该出现在 stage 覆盖文件里的 lingxi-users 挂载去掉，
+        必须让本检查变红——这正是 Epic D 闸⑤修复前的真实缺陷形状。"""
+
+        body_without_mount = "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        failures = self._with_overrides(stage_body=body_without_mount, prod_body=body_with_mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "lingxi-users" in f for f in failures), failures
+        )
+        self.assertFalse(
+            any("compose.prod.yaml" in f for f in failures),
+            "prod 那份已经挂了卷，不该被误报",
+        )
+
+    def test_scheduler_missing_the_user_volume_in_prod_is_caught(self) -> None:
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        body_without_mount = "scheduler:\n  volumes:\n    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        failures = self._with_overrides(stage_body=body_with_mount, prod_body=body_without_mount)
+        self.assertTrue(
+            any("compose.prod.yaml" in f and "lingxi-users" in f for f in failures), failures
+        )
+
+    def test_a_missing_scheduler_service_is_reported_not_silently_skipped(self) -> None:
+        failures = self._with_overrides(stage_body="worker:\n  image: x\n", prod_body="worker:\n  image: x\n")
+        self.assertTrue(any("找不到 scheduler service" in f for f in failures), failures)
+
+    def test_a_read_only_mount_is_caught_not_treated_as_mounted(self) -> None:
+        """外部独立审查 F2：挂成 ``:ro`` 时 scheduler 写不进去，首次开通编排的
+        每一次写入都会失败——与完全没挂载后果相同，但此前的整块字符串包含
+        判断会因为子串仍然命中而误判成"已挂载"。运维为了保守起见随手给一个
+        卷加 `:ro` 是完全可能发生的操作失误，不需要构造攻击场景就能触发。"""
+
+        body_readonly = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users:ro\n"
+        )
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        failures = self._with_overrides(stage_body=body_readonly, prod_body=body_with_mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "只读" in f for f in failures), failures
+        )
+        self.assertFalse(
+            any("compose.prod.yaml" in f for f in failures),
+            "prod 那份是可写挂载，不该被误报",
+        )
+
+    def test_the_mount_string_appearing_elsewhere_does_not_produce_a_false_pass(self) -> None:
+        """外部独立审查 F2：此前用整块字符串包含判断，若这个子串恰好出现在
+        ``environment``/``labels`` 等非 ``volumes:`` 的地方（例如一个巧合的
+        环境变量取值），会被误判成"已挂载"——这里构造这样一份配置，确认
+        真正生效的是对 ``volumes:`` 列表的精确解析，不是子串命中。"""
+
+        body_decoy_only = (
+            "scheduler:\n"
+            "  environment:\n"
+            "    NOTE: lingxi-users:/var/lib/lingxi/users\n"
+            "  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        )
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        failures = self._with_overrides(stage_body=body_decoy_only, prod_body=body_with_mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "lingxi-users" in f for f in failures), failures
+        )
+
+    def test_real_stage_and_prod_compose_both_mount_the_user_volume(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_scheduler_user_volume(), [])
+
+
 class PublishJobGuardTest(unittest.TestCase):
     """Epic Full 候选与 main Publish 之间不能被一行配置绕过。"""
 
@@ -584,6 +691,55 @@ class DatabaseTimeoutTest(unittest.TestCase):
                 CONTRACT.ENV_EXAMPLE = original_env
 
         self.assertTrue(any("statement_timeout=4000" in failure for failure in failures), failures)
+
+
+class WorkerQueueEnvExampleTest(unittest.TestCase):
+    """``deploy/.env.example`` 的 worker-queue 小节必须自带
+    ``LINGXI_POSTGRES_DSN`` 与 ``LINGXI_USER_ENV_ROOT``（Epic D 闸⑥）。"""
+
+    SECTION_HEADER = (
+        "# ===========================================================================\n"
+        "# 文件五：deploy/.env.stage.worker-queue —— 常驻队列消费者\n"
+        "# ===========================================================================\n"
+    )
+    NEXT_SECTION = (
+        "# ===========================================================================\n"
+        "# 文件六：deploy/.env.stage.migrate —— 数据库迁移作业\n"
+        "# ===========================================================================\n"
+    )
+
+    def _with_env_example(self, section_body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        env_example = directory / ".env.example"
+        env_example.write_text(
+            self.SECTION_HEADER + section_body + "\n" + self.NEXT_SECTION, encoding="utf-8"
+        )
+        original = CONTRACT.ENV_EXAMPLE
+        CONTRACT.ENV_EXAMPLE = env_example
+        try:
+            return CONTRACT.check_worker_queue_env_example()
+        finally:
+            CONTRACT.ENV_EXAMPLE = original
+
+    def test_missing_user_env_root_is_caught(self) -> None:
+        """变异验红：去掉 LINGXI_USER_ENV_ROOT 示范值，检查必须变红——这正是
+        Epic D 闸⑥修复前 deploy/.env.example 的真实状态。"""
+
+        failures = self._with_env_example("LINGXI_POSTGRES_DSN=postgresql://x\n")
+        self.assertTrue(any("LINGXI_USER_ENV_ROOT" in f for f in failures), failures)
+
+    def test_missing_dsn_is_still_caught(self) -> None:
+        failures = self._with_env_example("LINGXI_USER_ENV_ROOT=/var/lib/lingxi/users\n")
+        self.assertTrue(any("LINGXI_POSTGRES_DSN" in f for f in failures), failures)
+
+    def test_both_present_passes(self) -> None:
+        failures = self._with_env_example(
+            "LINGXI_POSTGRES_DSN=postgresql://x\nLINGXI_USER_ENV_ROOT=/var/lib/lingxi/users\n"
+        )
+        self.assertEqual(failures, [])
+
+    def test_real_env_example_carries_both_settings(self) -> None:
+        self.assertEqual(CONTRACT.check_worker_queue_env_example(), [])
 
 
 class GatewayOrchestrationTest(unittest.TestCase):
