@@ -49,6 +49,15 @@ def page(items: list[dict[str, object]], *, key: str, has_more: bool = False, pa
     return {"code": 0, "data": data}
 
 
+def multi_page(
+    lists: dict[str, list[dict[str, object]]], *, has_more: bool = False, page_token: str | None = None
+) -> dict[str, object]:
+    data: dict[str, object] = {**lists, "has_more": has_more}
+    if page_token:
+        data["page_token"] = page_token
+    return {"code": 0, "data": data}
+
+
 class DirectoryPaginationTest(unittest.TestCase):
     def test_all_pages_are_followed_until_has_more_is_false(self) -> None:
         transport = RecordingTransport(
@@ -252,6 +261,90 @@ class DirectoryPaginationTest(unittest.TestCase):
 
         self.assertNotIn("tenant_key", inspect.signature(FeishuDirectoryClient.__init__).parameters)
         self.assertIn("tenant_key", inspect.signature(FeishuDirectoryClient.list_visible_organization).parameters)
+
+
+class AppIdentityPathTest(unittest.TestCase):
+    """Issue #250：应用身份路径（``directory/v1/*``），只服务与用户身份路径的交叉校验。"""
+
+    def test_list_collaboration_tenants_as_app_follows_pagination(self) -> None:
+        transport = RecordingTransport(
+            [
+                page([{"tenant_key": "tenant_a"}], key="tenant_list", has_more=True, page_token="p2"),
+                page([{"tenant_key": "tenant_b"}], key="tenant_list"),
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        tenants = client.list_collaboration_tenants_as_app(token="fake-app-token")
+
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a", "tenant_b"])
+        self.assertIn("/directory/v1/collaboration_tenants", transport.calls[0][1])
+
+    def test_share_entities_splits_departments_from_users(self) -> None:
+        transport = RecordingTransport(
+            [
+                multi_page(
+                    {
+                        "share_departments": [{"open_department_id": "od_1", "name": "研发部"}],
+                        "share_users": [{"open_user_id": "ou_1", "name": "张一"}],
+                    }
+                )
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
+        self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
+        query = parse_qs(urlparse(transport.calls[0][1]).query)
+        self.assertEqual(query["target_tenant_key"], ["tenant_a"])
+        self.assertEqual(query["is_select_subject"], ["false"])
+        self.assertEqual(query["target_department_id"], ["0"])
+
+    def test_share_entities_requires_both_lists_on_every_page(self) -> None:
+        """一页只返回其中一个列表是响应形状错误，不静默按空列表处理。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"share_departments": [], "has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "missing_share_users")
+
+    def test_share_entities_follows_pagination_across_both_lists(self) -> None:
+        transport = RecordingTransport(
+            [
+                multi_page(
+                    {
+                        "share_departments": [{"open_department_id": "od_1"}],
+                        "share_users": [],
+                    },
+                    has_more=True,
+                    page_token="p2",
+                ),
+                multi_page({"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}),
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
+        self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_share_entities_rejects_an_empty_department_id(self) -> None:
+        transport = RecordingTransport([])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(ValueError):
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="")
+        self.assertEqual(transport.calls, [], "非法请求不得发出真实调用")
 
 
 class AuthorizationClientTest(unittest.TestCase):

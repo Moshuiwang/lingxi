@@ -176,9 +176,56 @@ class _PagedClient:
             page_token = next_token
         raise FeishuDirectoryError("pagination_limit")
 
+    def _pages_multi(
+        self, path: str, *, token: str, query: Mapping[str, Any], list_keys: tuple[str, ...]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """同一分页游标下同时收集**多个**并列列表（Issue #250：``share_entities``
+        单页同时返回 ``share_departments`` 与 ``share_users``，不是 :meth:`_pages`
+        假设的单一命名列表）。
+
+        每一页要求全部 ``list_keys`` 都存在且是列表——飞书没有理由只返回其中一个，
+        缺失即响应形状错误，不静默按空列表处理（同 :meth:`_pages` 对非对象项的态度：
+        宁可响亮失败，也不让一页数据不完整的响应悄悄通过完整性校验）。
+        """
+
+        collected: dict[str, list[dict[str, Any]]] = {key: [] for key in list_keys}
+        page_token: str | None = None
+        for _ in range(MAX_PAGES):
+            parameters = {**query, "page_size": PAGE_SIZE}
+            if page_token:
+                parameters["page_token"] = page_token
+            url = f"{self._base_url}{path}?{urlencode(parameters)}"
+            data = _payload(self._transport("GET", url, body=None, token=token))
+            for key in list_keys:
+                value = data.get(key)
+                if not isinstance(value, list):
+                    raise FeishuDirectoryError(f"missing_{key}")
+                for item in value:
+                    if not isinstance(item, Mapping):
+                        raise FeishuDirectoryError("invalid_page_item")
+                    collected[key].append(item)
+            next_token = data.get("page_token")
+            if data.get("has_more") is not True:
+                return collected
+            if not isinstance(next_token, str) or not next_token or next_token == page_token:
+                raise FeishuDirectoryError("pagination_stalled")
+            page_token = next_token
+        raise FeishuDirectoryError("pagination_limit")
+
 
 class FeishuDirectoryClient(_PagedClient):
-    """以专用授权用户身份读取关联组织的租户、部门与成员。
+    """读取关联组织的租户、部门与成员，覆盖两条互相独立的身份路径。
+
+    - **专用授权用户身份**（``trust_party/v1/*``）：:meth:`list_collaboration_tenants`
+      / :meth:`list_visible_organization` / :meth:`get_member_detail`，Issue #16 起的
+      既有实现，是首次开通链在职状态实时回读的唯一来源。
+    - **应用身份**（``directory/v1/*``）：:meth:`list_collaboration_tenants_as_app` /
+      :meth:`list_share_entities`，Issue #250 新增——组织快照批次完整性校验
+      （``core/identity/org_snapshot.verify_batch``）要求同一租户被两条路径分别看到的
+      成员集合彼此相等，缺其中一条就没有交叉校验的另一半输入，2026-07-28 的实况问题
+      （8 个关联租户里 2 个返回 0 条成员，Issue #16）正是只有一条路径时看不出来的那种
+      错误。两条路径的请求形状取自编排者 2026-08-19 用应用身份完成的真实探测（`directory/
+      v1/collaboration_tenants`、`directory/v1/share_entities` 各自的参数与响应字段）。
 
     刻意**没有**目标租户构造参数：标识跨租户唯一，租户归属是查出来的结果
     （Issue #16 硬约束 1）。租户键一律作为调用参数传入。
@@ -225,6 +272,56 @@ class FeishuDirectoryClient(_PagedClient):
         departments = [item for item in entities if item.get("open_department_id") or item.get("department_id")]
         members = [item for item in entities if not (item.get("open_department_id") or item.get("department_id"))]
         return departments, members
+
+    def list_collaboration_tenants_as_app(self, *, token: str) -> list[dict[str, Any]]:
+        """以应用身份读取关联租户列表（``directory/v1/collaboration_tenants``）。
+
+        Issue #250 编排者 2026-08-19 用应用身份实测：``page_size=50`` 返回 ``code=0``、
+        8 个关联租户。响应顶层列表字段名未在探测记录里逐字确认，这里沿用
+        :meth:`list_collaboration_tenants` 已验证过的多字段回退顺序并补上
+        ``tenant_list``——两个端点同属"关联租户列表"这一类响应，命名规律最可能相同；
+        真正的字段名由 L4a 受控真实同步核实，回退列表里任何一个命中都按同一套逻辑处理，
+        不影响本侧的分页与校验语义。
+        """
+
+        return self._pages(
+            "/directory/v1/collaboration_tenants",
+            token=token,
+            query={},
+            keys=("tenant_list", "items", "collaboration_tenants", "tenants", "target_tenant_list"),
+        )
+
+    def list_share_entities(
+        self, *, token: str, tenant_key: str, department_id: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """以应用身份读取一层共享范围（``directory/v1/share_entities``）。
+
+        返回 ``(部门实体, 成员实体)``，对应响应里各自独立的 ``share_departments`` /
+        ``share_users`` 列表——与 :meth:`list_visible_organization` 混在一个列表里不同，
+        这个端点原生就是分开的两个列表（Issue #250 编排者 2026-08-19 实测参数与响应
+        字段：``target_tenant_key``、``is_select_subject=false``、``target_department_id``；
+        根部门传 ``"0"``）。
+
+        **递归遍历（BFS 逐级下钻子部门）与伪根记录过滤不在这里做**：这里只负责单层
+        分页，与 :meth:`list_visible_organization` 单层职责对称；递归属于"怎么把多次
+        单层调用串成一整棵树"，是编排逻辑而不是协议细节，交给
+        :mod:`lingxi.adapters.feishu_org_snapshot_reader`。
+        """
+
+        if not isinstance(department_id, str) or not department_id:
+            raise ValueError("target_department_id 不能为空；根部门请传 '0'")
+        query: dict[str, Any] = {
+            "target_tenant_key": tenant_key,
+            "is_select_subject": "false",
+            "target_department_id": department_id,
+        }
+        collected = self._pages_multi(
+            "/directory/v1/share_entities",
+            token=token,
+            query=query,
+            list_keys=("share_departments", "share_users"),
+        )
+        return collected["share_departments"], collected["share_users"]
 
     def get_member_detail(self, *, token: str, tenant_key: str, member_id: str, id_type: str = "open_id") -> dict[str, Any]:
         """读取成员详情。**在职状态只能从这里实时取，不从快照取。**"""

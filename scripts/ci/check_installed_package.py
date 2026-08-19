@@ -221,6 +221,12 @@ REQUIRED_MODULES = (
     # 首次开通编排的装配（Epic D / S-D-02）：产品负责人 2026-08-18 裁定后它住在
     # scheduler，由 `apps/scheduler/__init__.py` 在函数内 import。
     "lingxi.apps.scheduler.onboarding",
+    # 组织快照同步职责（Issue #250）：`apps/scheduler/__init__.py` 在**模块级**
+    # import `OrgSnapshotSyncDuty`（同 permission_refresh/permission_publish 那一条
+    # 理由，漏登记会直接让 scheduler 起不来）；读取编排 `feishu_org_snapshot_reader`
+    # 由 `apps/scheduler/assembly.py` 在函数内 import，同 feishu_directory 的姿态。
+    "lingxi.apps.scheduler.org_snapshot_sync",
+    "lingxi.adapters.feishu_org_snapshot_reader",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -312,6 +318,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.user_environment",
+            # 组织快照同步（Issue #250）：`apps/scheduler/__init__.py` 模块级 import
+            # `OrgSnapshotSyncDuty`；读取编排 `feishu_org_snapshot_reader` 由
+            # `_build_org_snapshot_sync_duty` 函数内 import，与 onboarding 一节
+            # 同一条"函数内 import 证明不了装得上"的理由。
+            "lingxi.apps.scheduler.org_snapshot_sync",
+            "lingxi.adapters.feishu_org_snapshot_reader",
             # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块，全部由
             # 包的 `__init__.py` 在模块级 import（维持既有的 `lingxi.apps.scheduler.
             # <名字>` 重导出契约），因此进程起来时这八个必然已经被 import 过一遍。
