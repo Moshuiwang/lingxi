@@ -54,12 +54,20 @@ class SnapshotDepartment:
 
 @dataclass(frozen=True)
 class TenantScope:
-    """一个关联租户在本轮同步中被两条身份路径分别看到的成员集合。"""
+    """一个关联租户在本轮同步中被两条身份路径分别看到的成员与部门集合。
+
+    ``app_department_keys`` / ``user_department_keys`` 默认空集合，兼容"这个租户
+    确实没有下级部门"的合法形态（两侧都为空时不判问题）——只有两侧**不相等**才是
+    完整性问题（Issue #250 编排者复查 F3：用户路径漏掉一个空部门时成员集合仍能
+    相等，必须靠部门集合本身的交叉校验才挡得住）。
+    """
 
     tenant_key: str
     visible_to_user_identity: bool
     app_member_keys: frozenset[str]
     user_member_keys: frozenset[str]
+    app_department_keys: frozenset[str] = frozenset()
+    user_department_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,7 @@ class IntegrityProblem(str, Enum):
     EMPTY_TENANT = "empty_tenant"
     TENANT_NOT_USER_VISIBLE = "tenant_not_user_visible"
     PATH_SETS_DIFFER = "path_sets_differ"
+    DEPARTMENT_SETS_DIFFER = "department_sets_differ"
     MEMBER_TENANT_UNKNOWN = "member_tenant_unknown"
     MEMBER_ROW_MISSING = "member_row_missing"
     MEMBER_ROW_EXTRA = "member_row_extra"
@@ -135,6 +144,12 @@ def verify_batch(batch: SnapshotBatch) -> IntegrityReport:
             problems.append(IntegrityProblem.TENANT_NOT_USER_VISIBLE)
         if scope.app_member_keys != scope.user_member_keys:
             problems.append(IntegrityProblem.PATH_SETS_DIFFER)
+        # 部门集合同样必须两条路径相等：成员集合能对上，不代表部门集合也对上——
+        # 一个没有成员的空部门只会出现在部门集合里，不会在成员集合的差异中露面
+        # （Issue #250 编排者复查 F3）。两侧都为空（这个租户确实没有下级部门）不算
+        # 问题；只有出现分歧才算。
+        if scope.app_department_keys != scope.user_department_keys:
+            problems.append(IntegrityProblem.DEPARTMENT_SETS_DIFFER)
         if scope.user_member_keys - members_by_tenant.get(scope.tenant_key, set()):
             problems.append(IntegrityProblem.MEMBER_ROW_MISSING)
         # 反方向同样要查：两条可见路径都没见过的成员行混进批次，提交后会为

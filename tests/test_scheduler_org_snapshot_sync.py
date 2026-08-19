@@ -38,15 +38,30 @@ class RecordingAudit:
 class FakeStore:
     """记录每一次 ``commit_batch`` 调用；不做任何真实持久化。"""
 
-    def __init__(self, *, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        already_complete_today: bool = False,
+        watermark_check_raises: Exception | None = None,
+    ) -> None:
         self._raises = raises
+        self._already_complete_today = already_complete_today
+        self._watermark_check_raises = watermark_check_raises
         self.committed: list[SnapshotBatch] = []
+        self.watermark_checks = 0
 
     def commit_batch(self, batch, *, source_app_id, run_id=None, started_at=None) -> str:
         if self._raises is not None:
             raise self._raises
         self.committed.append(batch)
         return "orgsync_fixed"
+
+    def has_complete_run_on(self, day) -> bool:
+        self.watermark_checks += 1
+        if self._watermark_check_raises is not None:
+            raise self._watermark_check_raises
+        return self._already_complete_today
 
 
 EMPTY_BATCH = SnapshotBatch(tenants=(), departments=(), members=())
@@ -207,6 +222,68 @@ class BaselineProtectionTest(unittest.TestCase):
 
         self.assertEqual(audit.actions(), ["org_snapshot_sync.commit_failed"])
         self.assertIsNone(duty.completed_on)
+
+
+class PersistedWatermarkTest(unittest.TestCase):
+    """当日水位对进程重启保持（Issue #250 F8）：新建的 duty 实例（模拟重启后的
+    内存归零）在库里已有今天的 complete 批次时不得再跑一轮；查询本身失败时按
+    未知处理、不阻塞今天的同步。"""
+
+    def test_a_freshly_constructed_duty_skips_a_day_already_completed_in_storage(self) -> None:
+        store = FakeStore(already_complete_today=True)
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=lambda: _committable_batch(),
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+        )
+        self.assertIsNone(duty.completed_on, "模拟进程重启：内存水位归零")
+
+        result = duty.run_once()
+
+        self.assertIsNone(result)
+        self.assertEqual(store.committed, [], "库里已有今天的完成批次，不该再扫一轮")
+        self.assertEqual(duty.completed_on, FIXED_NOW.date(), "读到持久化水位后本进程也该记住")
+        self.assertEqual(audit.actions(), ["org_snapshot_sync.already_completed_today"])
+
+    def test_the_persisted_watermark_is_checked_at_most_once_per_day(self) -> None:
+        store = FakeStore(already_complete_today=False)
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=lambda: _committable_batch(),
+            store=store,
+            audit=RecordingAudit(),
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+        )
+
+        duty.run_once()  # 第一轮真的跑成功，水位已经在内存里
+        store._already_complete_today = True  # 之后即便库里状态变化也不该再被问到
+        second = duty.run_once()
+
+        self.assertIsNone(second, "同一天第二次调用被内存水位挡住，不该再查一次库")
+        self.assertEqual(store.watermark_checks, 1)
+
+    def test_a_watermark_check_failure_does_not_block_todays_sync(self) -> None:
+        store = FakeStore(watermark_check_raises=RuntimeError("connection_lost"))
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=lambda: _committable_batch(),
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+        )
+
+        result = duty.run_once()
+
+        self.assertEqual(result, "orgsync_fixed", "水位查询本身失败不得阻塞今天的同步")
+        self.assertEqual(len(store.committed), 1)
+        self.assertEqual(
+            audit.actions(),
+            ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.committed"],
+        )
 
 
 class ConstructionTest(unittest.TestCase):

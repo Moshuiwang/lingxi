@@ -19,6 +19,15 @@ RosterAuditDuty` 的 ``_completed_on`` 水位（同一天只做一次，不做�
 工作）——与花名册不同的是，这里没有"空差异不发"这类产品概念，只有"今天有没有
 成功换一轮"。
 
+**当日水位对进程重启保持——但只靠读库，不靠租约。** ``_completed_on`` 本身仍是
+内存值，进程重启会清零；``run_once`` 因此在当天第一次调用时额外问一次
+``store.has_complete_run_on(today)``（读 ``feishu_org_sync_run`` 里今天 UTC 有没有
+``complete`` 批次），问过之后当天不再重复问。这不是数据库租约或领导权选举——本仓库
+当前是**单实例假设**（Epic C 冻结审查已作为知情接受登记），这里只是把"今天做没做过"
+这一件事从内存挪到已经在写的表上，避免重启后当天再跑一次数百次分页请求的全量扫描
+（Issue #250 编排者复查 F8；那次重复扫描本身会被 ``commit_batch`` 内的
+``superseded`` 收敛掉，不是数据风险，纯粹是浪费）。
+
 ## 失败就保留上一份，不覆盖
 
 **任何读取失败（传输异常、分页停滞、递归上界、身份字段缺失）都不会调用
@@ -62,6 +71,23 @@ from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotIntegrityEr
 logger = logging.getLogger(__name__)
 
 
+class TokenSupplyFailure(RuntimeError):
+    """令牌供给失败的安全分类（Issue #250 编排者复查 F6）。
+
+    应用令牌、用户令牌、真实扫描三种失败此前在 ``org_snapshot_sync.read_failed``
+    审计里只留下 ``error=<异常类型>``，分辨不出到底是哪条供给出的问题——运维排障
+    因此没法直接判断"该去查哪条令牌"还是"这是一次真实扫描失败"。这里只包一层
+    分类标签（``supply``），**不携带原始异常的正文或消息**：调用方（
+    ``apps/scheduler/assembly.py``）分别包装两个供给的调用点，抛出时用
+    ``raise TokenSupplyFailure(...) from error`` 保留因果链供本地调试，但审计只读
+    ``supply`` 与 ``type(error).__name__``，两者都不含令牌值。
+    """
+
+    def __init__(self, supply: str) -> None:
+        super().__init__(f"组织快照令牌供给失败：{supply}")
+        self.supply = supply
+
+
 class _AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 
@@ -75,6 +101,8 @@ class _SnapshotStore(Protocol):
         run_id: str | None = None,
         started_at: datetime | None = None,
     ) -> str: ...
+
+    def has_complete_run_on(self, day: date) -> bool: ...
 
 
 class OrgSnapshotSyncDuty:
@@ -107,6 +135,11 @@ class OrgSnapshotSyncDuty:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._stop = threading.Event() if stop is None else stop
         self._completed_on: date | None = None
+        # 本进程今天是否已经问过持久化水位（F8）。只问一次：问过之后，"今天到底
+        # 完成没有"完全由 `_completed_on`（本进程自己跑出来的结果）决定，不需要
+        # 每一轮都去读库——单实例假设下不会有别的进程在这中间把水位从 False 改成
+        # True（Epic C 冻结审查已登记的既知前提，见模块文档）。
+        self._checked_persisted_watermark_for: date | None = None
 
     @property
     def completed_on(self) -> date | None:
@@ -131,13 +164,42 @@ class OrgSnapshotSyncDuty:
         if self._completed_on == today:
             return None
 
+        if self._checked_persisted_watermark_for != today:
+            # 进程重启后内存水位归零：不补这一步，当天会做第二次全量扫描（数百次
+            # 分页请求，外加一个稍后被 `superseded` 收敛掉的重复批次）——不是凭据
+            # 风险（一次性 refresh_token 的"每 UTC 日至多消费一次"判据落在凭据文件
+            # 而非内存，见 `RosterAccessTokenProvider`），但纯属浪费（Issue #250
+            # 编排者复查 F8）。查询失败按"未知"处理、不阻塞本轮：这只是一个避免
+            # 重复工作的优化，不是完整性判据本身。
+            self._checked_persisted_watermark_for = today
+            try:
+                already_done = self._store.has_complete_run_on(today)
+            except Exception as error:  # noqa: BLE001 - 只记异常类型
+                self._audit.record("org_snapshot_sync.watermark_check_failed", error=type(error).__name__)
+                logger.warning(
+                    "组织快照当日持久化水位检查失败，按未知处理、继续尝试本轮 error=%s",
+                    type(error).__name__,
+                )
+            else:
+                if already_done:
+                    self._completed_on = today
+                    self._audit.record("org_snapshot_sync.already_completed_today", source="persisted_watermark")
+                    return None
+
         try:
             batch = self._read_snapshot()
         except Exception as error:  # noqa: BLE001 - 只记异常类型，正文可能带响应内容
-            self._audit.record("org_snapshot_sync.read_failed", error=type(error).__name__)
+            fields: dict[str, object] = {"error": type(error).__name__}
+            supply = getattr(error, "supply", None)
+            if isinstance(supply, str) and supply:
+                # 令牌供给失败时额外标注是哪一条（F6）：不读取原始异常的正文或
+                # 消息，只读 `TokenSupplyFailure.supply` 这个安全分类标签。
+                fields["supply"] = supply
+            self._audit.record("org_snapshot_sync.read_failed", **fields)
             logger.error(
-                "组织快照读取失败，保留上一份完成批次，下一轮重试 error=%s",
+                "组织快照读取失败，保留上一份完成批次，下一轮重试 error=%s supply=%s",
                 type(error).__name__,
+                supply if isinstance(supply, str) else "unknown",
             )
             return None
 

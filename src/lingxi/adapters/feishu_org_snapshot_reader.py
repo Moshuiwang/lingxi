@@ -9,7 +9,7 @@ Issue #250：`feishu_org_*` 四张快照表当前全空，且产品侧没有任�
 这一点：``app_member_keys`` / ``user_member_keys``）：
 
 - **应用身份路径**（``directory/v1/collaboration_tenants`` + ``share_entities``）——
-  只用来交出每个租户的成员键集合，用于与用户路径交叉校验；
+  只用来交出每个租户的成员键集合与部门键集合，用于与用户路径交叉校验；
 - **专用授权用户身份路径**（``trust_party/v1/collaboration_tenants`` +
   ``visible_organization``）——交出完整的部门与成员标准化投影（``SnapshotMember`` /
   ``SnapshotDepartment``），这是首次开通链身份定位真正要用的那一份。
@@ -79,24 +79,35 @@ def _text(value: Any) -> str | None:
     return None
 
 
-def _walk_app_scope(client: FeishuDirectoryClient, *, token: str, tenant_key: str) -> frozenset[str]:
-    """应用身份路径：递归遍历共享范围，只交出成员键集合（与用户路径交叉校验用）。
+def _walk_app_scope(
+    client: FeishuDirectoryClient, *, token: str, tenant_key: str
+) -> tuple[frozenset[str], frozenset[str]]:
+    """应用身份路径：递归遍历共享范围，交出 ``(部门键集合, 成员键集合)``。
 
-    键取 ``open_user_id``——参照已受控验证的 ``scripts/sync_feishu_org_snapshot.py``
+    成员键取 ``open_user_id``——参照已受控验证的 ``scripts/sync_feishu_org_snapshot.py``
     对同一字段的处理（该脚本把 ``open_user_id`` 与用户路径的 ``open_id`` 视为同一个
-    标识类型），因此这里产出的集合与 :func:`_walk_user_scope` 产出的 ``open_id``
+    标识类型），因此这里产出的成员集合与 :func:`_walk_user_scope` 产出的 ``open_id``
     集合在同一个租户下应当逐值相等。
+
+    部门键同样取 ``open_department_id``，与用户路径 :func:`department_identifier`
+    优先选用的 ID 类型一致，因此两条路径产出的部门集合在同一个租户下也应当逐值
+    相等——这是 F3 的交叉校验输入：只交出成员集合会漏掉"用户路径没走到的空部门"
+    这一类问题（那类部门不含任何成员，成员集合两边照样能对上）。
     """
 
+    department_keys: set[str] = set()
     member_keys: set[str] = set()
     visited: set[str] = set()
     queue: list[str] = [ROOT_DEPARTMENT_ID]
     while queue:
-        if len(visited) > MAX_DEPARTMENTS_PER_TENANT:
-            raise OrgSnapshotReadError("app_scope_department_limit_exceeded")
         department_id = queue.pop(0)
         if department_id in visited:
             continue
+        # 差一修正（F7）：检查放在"确定要新增一个已访问节点"之前，边界是
+        # "恰好撞满上界"也要报错，而不是"下一次入队才发现已经超了"——队列在
+        # 撞满的那一刻可能已经清空，导致 > 上界的判据永远等不到下一轮循环。
+        if len(visited) >= MAX_DEPARTMENTS_PER_TENANT:
+            raise OrgSnapshotReadError("app_scope_department_limit_exceeded")
         visited.add(department_id)
         departments, members = client.list_share_entities(
             token=token, tenant_key=tenant_key, department_id=department_id
@@ -108,6 +119,7 @@ def _walk_app_scope(client: FeishuDirectoryClient, *, token: str, tenant_key: st
             if child_id == ROOT_DEPARTMENT_ID:
                 # 伪根记录：递归入口本身被原样回显了一遍，不是真的子部门。
                 continue
+            department_keys.add(child_id)
             if child_id not in visited:
                 queue.append(child_id)
         for entity in members:
@@ -115,7 +127,7 @@ def _walk_app_scope(client: FeishuDirectoryClient, *, token: str, tenant_key: st
             if not isinstance(key, str) or not key:
                 raise OrgSnapshotReadError("app_scope_member_id_missing")
             member_keys.add(key)
-    return frozenset(member_keys)
+    return frozenset(department_keys), frozenset(member_keys)
 
 
 def _walk_user_scope(
@@ -138,11 +150,14 @@ def _walk_user_scope(
     queue: list[tuple[str, str] | None] = [None]
 
     while queue:
-        if len(visited) > MAX_DEPARTMENTS_PER_TENANT:
-            raise OrgSnapshotReadError("user_scope_department_limit_exceeded")
         current = queue.pop(0)
         if current in visited:
             continue
+        # 差一修正（F7）：见 `_walk_app_scope` 同一处注释——检查放在"确定要新增一个
+        # 已访问节点"之前，用 `>=`，否则恰好撞满上界、队列随后清空的那一轮永远等不到
+        # 下一次循环入口去报错。
+        if len(visited) >= MAX_DEPARTMENTS_PER_TENANT:
+            raise OrgSnapshotReadError("user_scope_department_limit_exceeded")
         visited.add(current)
         if current is None:
             entity_departments, entity_members = client.list_visible_organization(
@@ -181,6 +196,13 @@ def _walk_user_scope(
                 # 不猜、不用姓名回退——三类标识 100% 可得已复验（Issue #16），一旦
                 # 出现缺口就是需要人看一眼的异常，不是本模块该悄悄补全的情况。
                 raise OrgSnapshotReadError("user_scope_member_identity_incomplete")
+            existing = members.get(open_id)
+            if existing is not None and (existing.user_id != user_id or existing.union_id != union_id):
+                # 同一个 open_id 在不同页给出不同 user_id / union_id 是身份矛盾，不是
+                # "后面这条更新"——`dict` 赋值会静默覆盖，让矛盾的那一条悄悄穿过去写进
+                # 基线（Issue #250 编排者复查 F5）。交叉校验只比 open_id 时看不出这种
+                # 矛盾，这里在合并前先比对稳定标识本身。
+                raise OrgSnapshotReadError("user_scope_member_identity_conflict")
             members[open_id] = SnapshotMember(
                 tenant_key=tenant_key,
                 member_key=open_id,
@@ -212,6 +234,25 @@ def _with_department_names(member: SnapshotMember, names: set[str]) -> SnapshotM
     )
 
 
+def _tenant_keys(records: list[dict[str, Any]], *, error_code: str) -> set[str]:
+    """把租户列表逐条解析成租户键集合；任何一条取不到合法键立即抛错。
+
+    此前用 ``if key`` 静默丢弃取不到键的记录（Issue #250 编排者复查 F2）：只要还有
+    别的有效租户，批次就不会被判成"无租户"，于是一个格式异常的记录被悄悄当成
+    "这个租户不存在"处理，提交的是一份缩小的基线，而不是一次应该被人看到的形状
+    异常。这里改成不猜、不过滤——取不到键就直接抛，交给调用方按读取失败处理
+    （不吞、不重试、不返回半截结果，与模块文档顶部的纪律一致）。
+    """
+
+    keys: set[str] = set()
+    for record in records:
+        key = _tenant_key(record)
+        if not key:
+            raise OrgSnapshotReadError(error_code)
+        keys.add(key)
+    return keys
+
+
 def read_org_snapshot(
     *, client: FeishuDirectoryClient, app_token: str, user_token: str
 ) -> SnapshotBatch:
@@ -222,49 +263,63 @@ def read_org_snapshot(
     ``core.identity.org_snapshot.require_complete_batch``）——不通过就不提交，
     这条纪律不在本函数内重复。
 
-    **租户发现以应用身份路径为准**（``list_collaboration_tenants_as_app``）：与
-    ``scripts/sync_feishu_org_snapshot.py`` 已受控验证过的次序一致——先枚举应用身份
-    能看到的全部租户，再逐个核对用户身份路径是否也看得到。一个只对用户身份可见、
-    对应用身份不可见的租户不会出现在结果里；这种情况在当前产品形态下没有出现过
-    （应用与专用授权主体加入的是同一批关联组织），如果将来出现，`EMPTY_TENANT` /
-    `PATH_SETS_DIFFER` 判据仍然会在应用身份那一侧因为看不到而整体拒绝——只是拒绝
-    原因会记成"应用路径没这个租户"而不是一个专门的新分类，因为当前判据表里没有
-    `TENANT_NOT_APP_VISIBLE` 这一类（`core/identity/org_snapshot.py` 未提供，
-    本模块不新造判据）。
+    **租户发现遍历两条身份路径各自看到的租户键的并集**（Issue #250 编排者复查
+    F1）：此前只遍历应用身份路径看到的租户（``app_tenant_keys``），一个只在用户
+    身份路径可见、应用身份路径因半页 / 权限暂时收窄而漏看的租户会被整个排除在
+    结果之外——路径不一致判据根本没有机会检查它，因为它压根不会出现在
+    ``SnapshotBatch.tenants`` 里，那个租户的全部成员会从新基线里静默消失。
+
+    现在遍历 ``app_tenant_keys | user_tenant_keys``：只在相应身份能看到这个租户时
+    才去读那条路径，看不到的一侧**显式置空集合**（不猜、不用另一侧的值回填）。
+    这样两侧集合不对等时会被 ``core.identity.org_snapshot.verify_batch`` 的
+    ``EMPTY_TENANT``（两侧都空）或 ``PATH_SETS_DIFFER``（一侧空、另一侧非空）
+    挡住——``TenantScope`` 现有的两个字段已经足够表达"应用侧看不到"这件事，不需要
+    新增判据。
     """
 
-    app_tenant_keys = {
-        key
-        for key in (_tenant_key(record) for record in client.list_collaboration_tenants_as_app(token=app_token))
-        if key
-    }
-    user_tenant_keys = {
-        key
-        for key in (_tenant_key(record) for record in client.list_collaboration_tenants(token=user_token))
-        if key
-    }
+    app_tenant_keys = _tenant_keys(
+        client.list_collaboration_tenants_as_app(token=app_token),
+        error_code="app_scope_tenant_key_missing",
+    )
+    user_tenant_keys = _tenant_keys(
+        client.list_collaboration_tenants(token=user_token),
+        error_code="user_scope_tenant_key_missing",
+    )
 
     tenants: list[TenantScope] = []
     departments: list[SnapshotDepartment] = []
     members: list[SnapshotMember] = []
 
-    for tenant_key in sorted(app_tenant_keys):
-        app_member_keys = _walk_app_scope(client, token=app_token, tenant_key=tenant_key)
-        visible = tenant_key in user_tenant_keys
+    for tenant_key in sorted(app_tenant_keys | user_tenant_keys):
+        visible_to_app = tenant_key in app_tenant_keys
+        visible_to_user = tenant_key in user_tenant_keys
+
+        app_department_keys: frozenset[str] = frozenset()
+        app_member_keys: frozenset[str] = frozenset()
+        if visible_to_app:
+            app_department_keys, app_member_keys = _walk_app_scope(
+                client, token=app_token, tenant_key=tenant_key
+            )
+
+        user_department_keys: frozenset[str] = frozenset()
         user_member_keys: frozenset[str] = frozenset()
-        if visible:
+        if visible_to_user:
             tenant_departments, tenant_members = _walk_user_scope(
                 client, token=user_token, tenant_key=tenant_key
             )
             departments.extend(tenant_departments)
             members.extend(tenant_members.values())
+            user_department_keys = frozenset(d.department_key for d in tenant_departments)
             user_member_keys = frozenset(tenant_members)
+
         tenants.append(
             TenantScope(
                 tenant_key=tenant_key,
-                visible_to_user_identity=visible,
+                visible_to_user_identity=visible_to_user,
                 app_member_keys=app_member_keys,
                 user_member_keys=user_member_keys,
+                app_department_keys=app_department_keys,
+                user_department_keys=user_department_keys,
             )
         )
 

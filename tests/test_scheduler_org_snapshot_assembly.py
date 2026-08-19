@@ -95,9 +95,50 @@ class RuntimeVsUnwiredDistinctionTest(unittest.TestCase):
         self.assertEqual(audit.actions(), [], "装配阶段不该因为运行期会失败而提前记审计")
 
         # 运行期失败走的是职责自己的 read_failed 分类，不是装配层的 duty_not_registered。
+        # 本测试用的是指向本地假 DSN 的真实 PostgresOrgSnapshotStore（连不上）：F8 的
+        # 当日持久化水位检查会先失败一次（按"未知"处理、不阻塞），紧接着才是
+        # 令牌供给失败触发的 read_failed——两条审计都在预期之内。
         result = duty.run_once()
         self.assertIsNone(result)
-        self.assertEqual(audit.actions(), ["org_snapshot_sync.read_failed"])
+        self.assertEqual(
+            audit.actions(),
+            ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.read_failed"],
+        )
+
+    def test_a_broken_user_token_supply_is_tagged_distinctly_in_the_audit(self) -> None:
+        """F6：两条令牌供给分别包装，audit 里必须能分辨是哪一条失败——不能只留
+        一个笼统的异常类型名。（见上一个用例的注释：F8 的水位检查连不上本地假
+        DSN，会先留一条 ``watermark_check_failed``，不影响这里要验证的 ``supply``
+        标签落在紧随其后的 ``read_failed`` 记录上。）"""
+
+        def broken() -> str:
+            raise RuntimeError("access_token_unavailable")
+
+        duty, audit = build(user_token=broken, app_token=lambda: "app-token")
+
+        duty.run_once()
+
+        self.assertEqual(
+            audit.actions(),
+            ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.read_failed"],
+        )
+        self.assertEqual(audit.records[-1][1].get("supply"), "user_access_token")
+        # 不得记录原始异常消息或值——只留安全分类标签与异常类型名。
+        self.assertNotIn("access_token_unavailable", str(audit.records[-1][1]))
+
+    def test_a_broken_app_token_supply_is_tagged_distinctly_in_the_audit(self) -> None:
+        def broken() -> str:
+            raise RuntimeError("access_token_unavailable")
+
+        duty, audit = build(user_token=lambda: "user-token", app_token=broken)
+
+        duty.run_once()
+
+        self.assertEqual(
+            audit.actions(),
+            ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.read_failed"],
+        )
+        self.assertEqual(audit.records[-1][1].get("supply"), "app_access_token")
 
 
 class DefaultAssemblyTest(unittest.TestCase):

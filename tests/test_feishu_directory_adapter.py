@@ -314,6 +314,55 @@ class AppIdentityPathTest(unittest.TestCase):
             client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
         self.assertEqual(raised.exception.code, "missing_share_users")
 
+    def test_share_entities_rejects_a_non_boolean_has_more(self) -> None:
+        """F4 变异锚点：``has_more`` 缺失或类型异常（例如字符串 ``"true"``）此前会被
+        ``is not True`` 当成"读完了"，半截数据当成功返回。把
+        ``feishu_directory.py::_pages_multi`` 的判据临时改回
+        ``if data.get("has_more") is not True: return collected`` 就会让本用例变红：
+        字符串 ``"true"`` 满足 ``is not True``（不同对象），会被当成最后一页直接
+        返回，而不是抛错。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "share_departments": [{"open_department_id": "od_1"}],
+                        "share_users": [],
+                        "has_more": "true",
+                    },
+                }
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "has_more_invalid")
+
+    def test_share_entities_rejects_a_missing_has_more(self) -> None:
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "has_more_invalid")
+
+    def test_share_entities_accepts_a_strict_false_as_the_last_page(self) -> None:
+        """正向对照：真正的 bool ``False`` 才是"读完了"，不受 F4 修复影响。"""
+
+        transport = RecordingTransport(
+            [multi_page({"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}, has_more=False)]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+        self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
+
     def test_share_entities_follows_pagination_across_both_lists(self) -> None:
         transport = RecordingTransport(
             [

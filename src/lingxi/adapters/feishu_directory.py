@@ -205,7 +205,14 @@ class _PagedClient:
                         raise FeishuDirectoryError("invalid_page_item")
                     collected[key].append(item)
             next_token = data.get("page_token")
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            # `has_more` 必须是货真价实的 bool——缺失、字符串 `"true"`、`1` 等任何
+            # 非 bool 形态都不得被当成"读完了"。此前 `is not True` 会把这些异常类型
+            # 全部归到"最后一页"分支，让半截数据当成功收场（Issue #250 编排者复查
+            # F4）。类型错时立即抛，不静默按空列表或"已完成"处理。
+            if not isinstance(has_more, bool):
+                raise FeishuDirectoryError("has_more_invalid")
+            if has_more is False:
                 return collected
             if not isinstance(next_token, str) or not next_token or next_token == page_token:
                 raise FeishuDirectoryError("pagination_stalled")

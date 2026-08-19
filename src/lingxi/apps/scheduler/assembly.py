@@ -676,7 +676,7 @@ def _build_org_snapshot_sync_duty(
     from lingxi.adapters.feishu_directory import FeishuDirectoryClient
     from lingxi.adapters.feishu_org_snapshot_reader import read_org_snapshot
     from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
-    from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
+    from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty, TokenSupplyFailure
 
     client = FeishuDirectoryClient(base_url=config.feishu_base_url)
 
@@ -684,9 +684,21 @@ def _build_org_snapshot_sync_duty(
         # 令牌各解析一次、用于本轮**整趟**递归遍历（数百次分页请求，Issue #250
         # 编排者 2026-08-19 实测规模），不逐次请求都重新取——两条供给都会在有效期内
         # 直接返回缓存值，这里只是不给每一次分页调用都加一次令牌新鲜度判定的开销。
-        return read_org_snapshot(
-            client=client, app_token=app_access_token(), user_token=user_access_token()
-        )
+        #
+        # 两个供给分别包一层 `TokenSupplyFailure`（Issue #250 编排者复查 F6）：不这样
+        # 做的话，应用令牌、用户令牌、真实扫描三种失败在 `run_once` 的
+        # `org_snapshot_sync.read_failed` 审计里全都只剩 `error=<异常类型>`，分辨不出
+        # 该去查哪一条。只重分类、不改变失败语义——原始异常仍通过 `from error` 保留
+        # 因果链，只是审计只读安全的 `supply` 标签。
+        try:
+            app_token = app_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("app_access_token") from error
+        try:
+            user_token = user_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("user_access_token") from error
+        return read_org_snapshot(client=client, app_token=app_token, user_token=user_token)
 
     return OrgSnapshotSyncDuty(
         read_snapshot=read_snapshot,
