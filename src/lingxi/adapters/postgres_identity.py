@@ -445,10 +445,15 @@ class PostgresAppUserStore:
         allowed = tuple(state for state, rank in _PROVISIONING_ORDER.items() if rank < _PROVISIONING_ORDER[to])
         if not allowed:  # pragma: no cover - 推进表的第一格不是任何一次推进的目标
             return False
+        # 推到 ``active`` 还要求账号此刻是启用的：从建档后那次复核到就绪最长隔十七分钟
+        # （发布等待 + 就绪预算），管理员在这段时间里停用账号是真实形状。写在 ``WHERE``
+        # 里而不是在 Python 里先读后写——先读后写之间还有一个窗口，而这一步的后果是把
+        # 一个已经被停用的人标成"开通完成"。
+        guard = " AND account_state = 'enabled'" if to == "active" else ""
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE app_user SET provisioning_state = %s, updated_at = now() "
-                "WHERE id = %s AND provisioning_state = ANY(%s)",
+                "WHERE id = %s AND provisioning_state = ANY(%s)" + guard,
                 (to, user_id, list(allowed)),
             )
             changed = cursor.rowcount

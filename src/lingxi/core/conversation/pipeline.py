@@ -155,10 +155,9 @@ class EventPipeline:
     def onboarding(self) -> OnboardingRunner | None:
         """这条管线实际拿到的开通编排。**只读**，供装配层回读。
 
-        Epic D 的双注入点装配断言（``apps/gateway/onboarding.assert_single_onboarding_runner``）
-        要证明 ``build_supervisor`` 与 ``build_onboarding_reconciler`` 拿到的是**同一个**
-        实例；比较两个构造好的对象各自持有的引用，才算真的证明了这件事——比较传进去的那
-        一个变量两次，什么也证明不了。
+        Epic D 的装配断言（``apps/gateway/onboarding.assert_gateway_onboarding_is_inert``、
+        ``apps/scheduler/onboarding.assert_claim_limit_follows_capacity``）要回读构造好的
+        对象**实际持有**的那个引用——比较传进去的变量两次，什么也证明不了。
         """
 
         return self._onboarding
@@ -343,6 +342,22 @@ class EventPipeline:
                 return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
 
             assert user is not None  # NOT_PROVISIONED 已在上一分支返回
+
+            if state is UserState.PROVISIONING:
+                # 开通正在进行中，用户又发了一条。合同：「权限同步期间，卡片明确显示
+                # 『权限正在同步，预计最多需要十五分钟』，用户无需重复开通」。
+                # **不重新触发编排**（那一条正在 scheduler 里跑），也不入队。
+                deferred.append(self._texts.catalog.text("onboarding.matched"))
+                self._audit.record(
+                    "inbound_event.onboarding_in_flight",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(
+                    event_id=message.event_id, handled_as=HandledAs.NOT_PROVISIONED
+                )
+                return Outcome(handled_as=HandledAs.NOT_PROVISIONED)
 
             if state is UserState.SUSPENDED:
                 deferred.append(self._texts.suspended_content())

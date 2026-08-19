@@ -48,6 +48,11 @@ class UserState(str, Enum):
     """
 
     NOT_PROVISIONED = "not_provisioned"
+    # 开通已经启动、正在建环境 / 发权限 / 等 MCP 同步。**与"还没开始"必须分开**：
+    # 合同给这两个阶段规定了不同的固定提示（「已收到，正在核对」对前者，「权限正在同步，
+    # 预计最多需要十五分钟」对后者），合并会把第一条提示错用在第二个阶段，用户每问一次
+    # 都被告知"正在核对身份"，而系统其实早就核对完了。
+    PROVISIONING = "provisioning"
     SUSPENDED = "suspended"
     ACTIVE = "active"
 
@@ -123,6 +128,17 @@ class OnboardingResult:
     state: OnboardingState
     messages: tuple[OnboardingMessage, ...] = ()
     failure_reason: str | None = None
+
+
+#: **可重试的不受理原因**：编排根本没有开始跑（或明确让位），因此这条事件的认领必须被
+#: 释放、交给下一轮重新捞。与「跑过了、得到了一个失败结论」是两件完全不同的事——后者不
+#: 释放（重跑不会改变结论，只会持续冲击外部系统）。
+#:
+#: 住在 ``ports`` 而不是编排实现里：它是 :class:`OnboardingRunner` **合同**的一部分，
+#: 认领方要照它分流；放进实现会把整条权限链拖进每一个只 import ``ports`` 的进程闭包。
+RETRYABLE_REASONS: frozenset[str] = frozenset(
+    {"executor_unavailable", "stopping", "already_running"}
+)
 
 
 @dataclass(frozen=True)
@@ -219,6 +235,19 @@ class GatewayStore(Protocol):
         刻意**不在** ``GatewayTransaction`` 上：交接发生在入队事务提交**之后**，
         写进同一个事务在时间上不可能（那时还没调用编排），写进事务反而会让账本
         在编排从未被调用时就宣称交接完成。
+        """
+
+    def release_onboarding_claim(self, *, event_id: str) -> None:
+        """把认领放回去（``onboarding_dispatched_at`` 置回 ``NULL``），让下一轮重新捞。
+
+        :meth:`claim_stale_onboarding` 是「取出即记账」，而在它之后**这条事件仍然可能
+        根本没被执行**：执行器满位、停机信号刚好落在中间、同一个人已有链在跑。没有这条
+        反向路径，那些事件此后永远不会再被任何人认领——用户只剩一个「已收到」的表情，
+        不建档、不发权限、也收不到任何终态。这正是失败关闭桩「认领即平账」那条老缺陷
+        换了个入口又走回来。
+
+        **只放回真的没跑成的**：一条已经得出结论的事件不释放，重跑不会改变结论，只会
+        持续冲击外部系统。
         """
 
     def claim_stale_onboarding(self, *, older_than: timedelta) -> PendingOnboarding | None:

@@ -181,6 +181,9 @@ REQUIRED_MODULES = (
     # 首次开通编排的装配（Epic D / S-D-02）：由 `apps/gateway/__init__.py` 模块级
     # import，漏登记会直接让 gateway 起不来。
     "lingxi.apps.gateway.onboarding",
+    # 首次开通编排的装配（Epic D / S-D-02）：产品负责人 2026-08-18 裁定后它住在
+    # scheduler，由 `apps/scheduler/__init__.py` 在函数内 import。
+    "lingxi.apps.scheduler.onboarding",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -263,6 +266,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
             # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
             "lingxi.apps.scheduler.permission_publish",
+            # 首次开通编排（Epic D / S-D-02）：`build_loop` 在函数内 import 本模块与
+            # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
+            # 不会红（与本文件其余「函数内 import」条目同一条理由）。
+            "lingxi.apps.scheduler.onboarding",
+            "lingxi.core.identity.onboarding_runner",
+            "lingxi.core.identity.provisioning",
+            "lingxi.adapters.postgres_identity",
+            "lingxi.adapters.user_environment",
             "lingxi.adapters.feishu_permission_bitable",
             "lingxi.adapters.feishu_user_message",
             "lingxi.adapters.query_mcp_probe",
@@ -333,7 +344,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         # reauthorize 复用 scheduler 镜像；Bridge 的 WebSocket 依赖也必须在该制品中
         # 显式可导入，虽然常驻 scheduler 入口本身不建立 Bridge 连接。
-        ("cryptography.fernet", "psycopg", "websockets.sync.client"),
+        # `cryptography.hazmat...ciphers`：首次开通编排（Epic D / S-D-02）用
+        # `McpTokenCipher`（AES-256-CBC）签发该用户的问数 MCP 令牌；`fernet` 是宿主机
+        # 专用授权凭据文件那一条，两者是同一个包的不同子模块。
+        (
+            "cryptography.fernet",
+            "cryptography.hazmat.primitives.ciphers",
+            "psycopg",
+            "websockets.sync.client",
+        ),
     ),
     "reauthorize": (
         (
@@ -445,6 +464,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
+            # `adapters/feishu_directory.py` 的在职状态读取口把成员详情折成
+            # `core.identity.first_contact.EmploymentStatus`。gateway 本身不用那个读取口
+            # （首次开通编排在 scheduler），但它模块级 import 了同一个 adapter。
+            "lingxi.core.identity.first_contact",
+            "lingxi.core.identity.org_snapshot",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.onboarding_recovery",
@@ -467,51 +491,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.gateway.log_redaction",
             "lingxi.core.execution.audit",
             "lingxi.core.execution.tool_policy",
-            # 首次开通编排（Epic D / S-D-02）：`apps/gateway/__init__.py` 模块级 import
-            # `apps.gateway.onboarding`，后者又拉进整条判定链（身份定位、花名册、银河
-            # 聚合、发布行、就绪状态机）。适配器那一串是**函数内** import，因此必须
-            # 显式登记——不列进来，extras 那条干净环境的腿永远不会红（与 scheduler
-            # 组同一条理由）。
+            # 首次开通在 gateway 侧只剩「记事件 + 回第一条提示」（产品负责人
+            # 2026-08-18 裁定把编排整体移进 scheduler）。因此这里只有那条装配断言模块，
+            # 整条判定链与它的适配器都在 scheduler 组，不在本进程的闭包里。
             "lingxi.apps.gateway.onboarding",
-            "lingxi.core.identity.first_contact",
-            "lingxi.core.identity.identifiers",
-            "lingxi.core.identity.onboarding_runner",
-            "lingxi.core.identity.org_snapshot",
-            "lingxi.core.identity.provisioning",
-            "lingxi.core.identity.roster_snapshot",
-            "lingxi.core.permission",
-            "lingxi.core.permission.account_match",
-            "lingxi.core.permission.galaxy_export",
-            "lingxi.core.permission.galaxy_scope",
-            "lingxi.core.permission.mcp_readiness",
-            "lingxi.core.permission.notification",
-            "lingxi.core.permission.publish",
-            "lingxi.core.permission.publish_row",
-            "lingxi.core.permission.role_function",
-            "lingxi.adapters.delegated_credentials",
-            "lingxi.adapters.mcp_token_cipher",
-            "lingxi.adapters.postgres_galaxy_snapshot",
-            "lingxi.adapters.postgres_identity",
-            "lingxi.adapters.postgres_mcp_token",
-            "lingxi.adapters.postgres_permission_publish",
-            "lingxi.adapters.postgres_roster_snapshot",
-            # 上面两个快照读取口自己模块级依赖的：花名册行形状与银河批次读取。
-            "lingxi.adapters.feishu_roster_bitable",
-            "lingxi.adapters.galaxy_import",
-            "lingxi.adapters.query_mcp_probe",
-            "lingxi.adapters.role_function_map_file",
-            "lingxi.adapters.feishu_user_message",
-            "lingxi.adapters.user_environment",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
         # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import
         # 的那个子模块）而不是顶层包：websockets 15 的顶层做了惰性导入，
         # ``import websockets`` 成功证明不了子模块装全了。
-        # cryptography 自 Epic D / S-D-02 起进入 gateway：首次开通编排要用
-        # `McpTokenCipher`（AES-256-CBC）签发该用户的问数 MCP 令牌，而那个类构造时就
-        # 要求一把已校验的主密钥。gateway 仍然**不碰 Fernet**（宿主机凭据文件属
-        # scheduler），共用的只是同一个第三方包。
-        ("cryptography.hazmat.primitives.ciphers", "lark_oapi", "psycopg", "websockets.exceptions"),
+        ("lark_oapi", "psycopg", "websockets.exceptions"),
     ),
     # Bot-Test 受控验证资产（代码框架第五节），不是生产进程；四个 adapter 走显式
     # 制品豁免，但它们依赖的正式 core.identity.onboarding 仍属于正式制品清单。

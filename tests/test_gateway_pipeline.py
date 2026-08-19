@@ -1251,5 +1251,38 @@ class SuspendedUserTests(PipelineTestCase):
         self.assertEqual(self.log.count("reply.send_text"), 1)
 
 
+class OnboardingInFlightTests(PipelineTestCase):
+    """开通正在进行中又收到一条消息：回**同步中**提示，不是「正在核对」。
+
+    合同：「权限同步期间，卡片明确显示『权限正在同步，预计最多需要十五分钟』，用户无需
+    重复开通」。把第一条提示错用在这个阶段，用户每问一次都被告知「正在核对你的身份」，
+    而系统其实早就核对完、正在等 MCP 同步。
+    """
+
+    def test_a_message_during_sync_gets_the_sync_notice(self) -> None:
+        self.state.users["ou_1"] = UserRecord(user_id="usr_1", state=UserState.PROVISIONING)
+        runner = FakeOnboarding()
+
+        outcome = self.build(onboarding=runner).handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.matched"],
+            "同步期间的重复消息必须回同步提示，而不是第一条「正在核对」",
+        )
+
+    def test_it_does_not_re_trigger_the_orchestration(self) -> None:
+        """那一条正在 scheduler 里跑，重复触发只会多一次外部副作用。"""
+
+        self.state.users["ou_1"] = UserRecord(user_id="usr_1", state=UserState.PROVISIONING)
+        runner = FakeOnboarding()
+
+        self.build(onboarding=runner).handle_message(message(), now=NOW)
+
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(len(self.state.tasks), 0, "同步期间不入队")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ import unittest
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from lingxi.core.conversation.ports import OnboardingState
+from lingxi.core.conversation.ports import RETRYABLE_REASONS, OnboardingState
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
     IdentityRecordDraft,
@@ -29,6 +29,7 @@ from lingxi.core.identity.onboarding_runner import (
     KEY_INTERNAL_ERROR,
     KEY_NOT_AUTHORIZED,
     KEY_SUSPENDED,
+    KEY_SYNCING,
     KEY_SYNC_TIMEOUT,
     STATE_ACTIVE,
     STATE_MCP_SYNCING,
@@ -261,25 +262,40 @@ class FakeReadiness:
 
 
 class FakeNotifier:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, fail_times: int | None = None) -> None:
         self.sent: list[tuple[str, str, Mapping[str, object], str]] = []
+        self.attempts = 0
         self._error = error
+        self._fail_times = fail_times
 
     def send(self, *, open_id: str, key: str, values: Mapping[str, object], dedupe_key: str) -> None:
-        if self._error is not None:
+        self.attempts += 1
+        if self._error is not None and (
+            self._fail_times is None or self.attempts <= self._fail_times
+        ):
             raise self._error
         self.sent.append((open_id, key, dict(values), dedupe_key))
+
+    def keys(self) -> list[str]:
+        return [key for _, key, _, _ in self.sent]
+
+    def terminal(self) -> tuple[str, str, Mapping[str, object], str]:
+        return self.sent[-1]
 
 
 class FakeLedger:
     def __init__(self, error: Exception | None = None) -> None:
         self.marked: list[str] = []
+        self.released: list[str] = []
         self._error = error
 
     def mark_onboarding_dispatched(self, *, event_id: str) -> None:
         if self._error is not None:
             raise self._error
         self.marked.append(event_id)
+
+    def release_onboarding_claim(self, *, event_id: str) -> None:
+        self.released.append(event_id)
 
 
 class RecordingAudit:
@@ -366,6 +382,8 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         delegated_subject=overrides.get(
             "delegated_subject", lambda: overrides.get("delegated_subject_open_id", "ou_delegated")
         ),
+        notify_attempts=overrides.get("notify_attempts", 3),
+        publish_allowed=overrides.get("publish_allowed", lambda: True),
         submit=executor.submit,
         sleep=overrides.get("sleep", lambda seconds: None),
         clock=overrides.get("clock", lambda: datetime(2026, 8, 18, tzinfo=UTC)),
@@ -390,9 +408,10 @@ class HappyPathTests(unittest.TestCase):
         self.assertIs(result.state, OnboardingState.STARTED, "start 必须立刻返回 started")
         audit = parts["audit"]
         self.assertEqual(audit.facts("onboarding.result")["state"], "completed")
-        # 成功文案必须带实际公司与职能，且是唯一一条推给用户的结论。
-        self.assertEqual(len(parts["notifier"].sent), 1)
-        _, key, values, dedupe = parts["notifier"].sent[0]
+        # 合同的两条固定提示都要出现：进入同步等待时的「权限正在同步，预计最多需要
+        # 十五分钟」，以及全部完成后带实际公司与职能的成功提示。
+        self.assertEqual(parts["notifier"].keys(), [KEY_SYNCING, KEY_COMPLETED])
+        _, key, values, dedupe = parts["notifier"].terminal()
         self.assertEqual(key, KEY_COMPLETED)
         self.assertEqual(values, {"company_name": "88", "function_name": "销售分析"})
         self.assertEqual(dedupe, "onboarding:evt_1")
@@ -431,6 +450,29 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(binding.permission_version, 7)
         self.assertIn("销售分析", parts["readiness"].permissions[0])
 
+    def test_the_syncing_notice_arrives_before_the_blocking_readiness_wait(self) -> None:
+        """「权限正在同步，最多十五分钟」必须在**等待之前**发；等完再说等于没说。"""
+
+        order: list[str] = []
+
+        class OrderedNotifier(FakeNotifier):
+            def send(self, **kwargs: Any) -> None:
+                order.append(kwargs["key"])
+                super().send(**kwargs)
+
+        class OrderedReadiness(FakeReadiness):
+            def confirm(self, binding: Any, *, permissions: str) -> Any:
+                order.append("confirm")
+                return super().confirm(binding, permissions=permissions)
+
+        run_once(notifier=OrderedNotifier(), readiness=OrderedReadiness())
+        self.assertEqual(order, [KEY_SYNCING, "confirm", KEY_COMPLETED])
+
+    def test_the_progress_and_terminal_notices_do_not_dedupe_each_other(self) -> None:
+        parts, _ = run_once()
+        keys = {dedupe for _, _, _, dedupe in parts["notifier"].sent}
+        self.assertEqual(len(keys), 2, "进度提示与终态是两个用途，各自一个去重键")
+
     def test_the_plaintext_token_never_reaches_the_audit_trail(self) -> None:
         parts, _ = run_once()
         secret = FakeIssuedToken().reveal()
@@ -454,7 +496,11 @@ class ThreadingTests(unittest.TestCase):
         self.assertEqual(parts["environment"].calls, [USER_ID])
 
     def test_a_second_start_for_the_same_person_does_not_open_a_second_chain(self) -> None:
-        """`V-开通-14`：对账重交接撞上用户新消息时不重复开通、不重复提示。"""
+        """`V-开通-14`：同一个人同一时刻只跑一条链。
+
+        第二条**必须带可重试原因码**：它自己从来没被执行过，认领方要据此把认领放回去，
+        否则那条事件永远没人再捞（认领即记账）。
+        """
 
         executor = QueueingExecutor()
         runner, parts = build_runner(executor=executor)
@@ -463,17 +509,23 @@ class ThreadingTests(unittest.TestCase):
         second = runner.start(event_id="evt_2", open_id=OPEN_ID, trace_id="t2")
 
         self.assertIs(first.state, OnboardingState.STARTED)
-        self.assertIs(second.state, OnboardingState.STARTED)
+        self.assertIsNone(first.failure_reason)
+        self.assertEqual(second.failure_reason, "already_running")
+        self.assertIn(second.failure_reason, RETRYABLE_REASONS)
         self.assertEqual(len(executor.tasks), 1, "同一个人同一时刻只允许一条链")
         self.assertIn("onboarding.already_running", parts["audit"].actions())
         executor.run_all()
-        self.assertEqual(len(parts["notifier"].sent), 1)
+        self.assertEqual(parts["notifier"].keys(), [KEY_SYNCING, KEY_COMPLETED])
 
     def test_the_slot_is_released_after_the_chain_finishes(self) -> None:
         runner, parts = build_runner()
         runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
         runner.start(event_id="evt_2", open_id=OPEN_ID, trace_id="t2")
-        self.assertEqual(len(parts["notifier"].sent), 2, "上一条跑完之后同一个人可以再来")
+        self.assertEqual(
+            parts["notifier"].keys(),
+            [KEY_SYNCING, KEY_COMPLETED, KEY_SYNCING, KEY_COMPLETED],
+            "上一条跑完之后同一个人可以再来",
+        )
 
     def test_concurrent_starts_open_exactly_one_chain(self) -> None:
         executor = QueueingExecutor()
@@ -511,7 +563,7 @@ class DeterministicRejectionTests(unittest.TestCase):
     def _assert_unauthorized(self, parts: dict[str, Any], reason: str) -> None:
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "not_authorized")
         self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], reason)
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_NOT_AUTHORIZED)
+        self.assertEqual(parts["notifier"].keys(), [KEY_NOT_AUTHORIZED])
         self.assertEqual(parts["environment"].calls, [], "无权限终态不得创建用户环境")
         self.assertEqual(parts["decisions"].rows, [], "无权限终态不得排发布意图")
         self.assertEqual(parts["users"].advanced, [], "无权限终态不得推进开通状态")
@@ -570,13 +622,13 @@ class DeterministicRejectionTests(unittest.TestCase):
 
     def test_delegated_subject_gets_its_own_frozen_text(self) -> None:
         parts, _ = run_once(delegated_subject_open_id=OPEN_ID)
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_DELEGATED_SUBJECT)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_DELEGATED_SUBJECT)
         self.assertEqual(parts["environment"].calls, [])
 
     def test_delegated_subject_rejected_by_the_write_side_takes_the_same_exit(self) -> None:
         rejected = ProvisioningResult.rejected(ProvisioningRejection.DELEGATED_SUBJECT)
         parts, _ = run_once(provisioning=FakeProvisioning(rejected))
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_DELEGATED_SUBJECT)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_DELEGATED_SUBJECT)
 
 
 class InternalFaultTests(unittest.TestCase):
@@ -585,7 +637,7 @@ class InternalFaultTests(unittest.TestCase):
     def _assert_internal(self, parts: dict[str, Any], reason: str) -> None:
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
         self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], reason)
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
 
     def test_directory_unavailable(self) -> None:
         parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
@@ -606,7 +658,7 @@ class InternalFaultTests(unittest.TestCase):
         rejected = ProvisioningResult.rejected(ProvisioningRejection.STORAGE_INTEGRITY)
         parts, _ = run_once(provisioning=FakeProvisioning(rejected))
         self._assert_internal(parts, "storage_integrity")
-        self.assertNotEqual(parts["notifier"].sent[0][1], KEY_NOT_AUTHORIZED)
+        self.assertNotEqual(parts["notifier"].terminal()[1], KEY_NOT_AUTHORIZED)
 
     def test_missing_roster_snapshot_is_our_gap_not_the_user_s(self) -> None:
         parts, _ = run_once(roster=FakeRoster(rows=None))
@@ -629,7 +681,7 @@ class InternalFaultTests(unittest.TestCase):
     def test_publish_that_never_completes_is_not_a_sync_timeout(self) -> None:
         parts, _ = run_once(decisions=FakeDecisions(statuses=("pending",)))
         self._assert_internal(parts, "publish_not_completed")
-        self.assertNotEqual(parts["notifier"].sent[0][1], KEY_SYNC_TIMEOUT)
+        self.assertNotEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
 
     def test_publish_failure_is_not_reported_as_success(self) -> None:
         parts, _ = run_once(decisions=FakeDecisions(statuses=("failed",)))
@@ -660,7 +712,7 @@ class SyncTimeoutTests(unittest.TestCase):
     def test_timed_out_uses_the_dedicated_text_and_stays_in_mcp_syncing(self) -> None:
         parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT))
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "sync_timeout")
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_SYNC_TIMEOUT)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
         self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
         self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
 
@@ -670,7 +722,7 @@ class SyncTimeoutTests(unittest.TestCase):
             parts["audit"].facts("onboarding.result")["failure_reason"],
             "readiness_no_permission_after_grant",
         )
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
 
 
 class RecheckBeforeContinuingTests(unittest.TestCase):
@@ -681,20 +733,32 @@ class RecheckBeforeContinuingTests(unittest.TestCase):
         parts, _ = run_once(
             users=users, provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID))
         )
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_SUSPENDED)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SUSPENDED)
         self.assertEqual(parts["environment"].calls, [])
         self.assertEqual(parts["decisions"].rows, [])
         self.assertEqual(users.advanced, [])
         self.assertIn("onboarding.halted_account_state", parts["audit"].actions())
 
     def test_an_already_active_user_is_not_provisioned_a_second_time(self) -> None:
+        """已 active：不重复建环境、不重复发布，但**照常通知**。
+
+        这条路径正是"上一次结论没送到、被重新认领"的收敛出口——不通知就等于把它烧掉。
+        重复推送由绑定事件的去重键挡住（同一条事件的两次执行用同一个键）。
+        """
+
         users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
         parts, _ = run_once(
             users=users, provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID))
         )
         self.assertEqual(parts["environment"].calls, [], "已 active 的人不得重复创建环境")
         self.assertEqual(parts["decisions"].rows, [], "已 active 的人不得重复发布权限")
-        self.assertEqual(parts["notifier"].sent, [], "不再推第二条成功提示")
+        self.assertEqual(parts["notifier"].keys(), [KEY_COMPLETED])
+        self.assertEqual(
+            parts["notifier"].terminal()[2],
+            {"company_name": "88", "function_name": "销售分析"},
+            "范围取本轮已经算出来的那一份，不凭空编",
+        )
+        self.assertEqual(parts["notifier"].terminal()[3], "onboarding:evt_1")
         self.assertIn("onboarding.already_active", parts["audit"].actions())
         self.assertEqual(parts["ledger"].marked, ["evt_1"], "账仍然要记上")
 
@@ -703,7 +767,7 @@ class RecheckBeforeContinuingTests(unittest.TestCase):
             provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID))
         )
         self.assertEqual(parts["environment"].calls, [USER_ID])
-        self.assertEqual(parts["notifier"].sent[0][1], KEY_COMPLETED)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_COMPLETED)
 
     def test_a_vanished_user_row_is_never_read_as_permission_to_continue(self) -> None:
         parts, _ = run_once(users=FakeUsers(status=None))
@@ -718,16 +782,52 @@ class NotificationAndLedgerTests(unittest.TestCase):
 
     def test_the_dedupe_key_is_bound_to_the_event(self) -> None:
         parts, _ = run_once()
-        self.assertEqual(parts["notifier"].sent[0][3], "onboarding:evt_1")
+        self.assertEqual(parts["notifier"].terminal()[3], "onboarding:evt_1")
 
     def test_a_failed_notification_does_not_rewrite_the_terminal_state(self) -> None:
         parts, _ = run_once(notifier=FakeNotifier(error=RuntimeError()))
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
         self.assertIn("onboarding.notify_failed", parts["audit"].actions())
 
+    def test_a_transient_notification_failure_is_retried(self) -> None:
+        """一次飞书抖动不该让用户永远停在「已收到」。"""
+
+        notifier = FakeNotifier(error=RuntimeError(), fail_times=1)
+        parts, _ = run_once(notifier=notifier)
+
+        self.assertEqual(notifier.keys()[-1], KEY_COMPLETED)
+        self.assertEqual(parts["ledger"].released, [], "重试成功就不该放回认领")
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
+
+    def test_an_undeliverable_conclusion_puts_the_claim_back(self) -> None:
+        """通知反复送不到 → 放回认领，让下一轮把整条链重跑一遍。
+
+        不放回就等于"系统认为处理完了、用户什么都没收到"，而认领即记账，那条事件此后
+        再也没人捞得到。
+        """
+
+        parts, _ = run_once(notifier=FakeNotifier(error=RuntimeError()))
+
+        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertEqual(parts["ledger"].marked, [], "放回之后不得同时记账")
+        self.assertIn(
+            "onboarding.claim_released_after_notify_failed", parts["audit"].actions()
+        )
+
+    def test_the_claim_is_put_back_at_most_once_per_event(self) -> None:
+        """放回有上限：一次飞书长时间不可用不得把执行器永久占满。"""
+
+        runner, parts = build_runner(notifier=FakeNotifier(error=RuntimeError()))
+        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+        runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertEqual(parts["ledger"].marked, ["evt_1"], "第二次记账收口")
+        self.assertIn("onboarding.notify_gave_up_failed", parts["audit"].actions())
+
     def test_a_failed_ledger_write_does_not_take_the_user_conclusion_with_it(self) -> None:
         parts, _ = run_once(ledger=FakeLedger(error=RuntimeError()))
-        self.assertEqual(len(parts["notifier"].sent), 1)
+        self.assertEqual(parts["notifier"].keys(), [KEY_SYNCING, KEY_COMPLETED])
         self.assertIn("onboarding.dispatch_record_failed", parts["audit"].actions())
 
     def test_the_ledger_is_marked_after_the_user_has_been_told(self) -> None:
@@ -744,7 +844,170 @@ class NotificationAndLedgerTests(unittest.TestCase):
                 super().mark_onboarding_dispatched(event_id=event_id)
 
         run_once(notifier=OrderedNotifier(), ledger=OrderedLedger())
-        self.assertEqual(order, ["notify", "ledger"])
+        self.assertEqual(order, ["notify", "notify", "ledger"])
+
+
+class PublishGateTests(unittest.TestCase):
+    """翻译层不可用时**一条发布意图都不排**（与 Issue #227 的整轮判据同一条纪律）。
+
+    本编排是 `record_decision` 的第三个调用点，不自己带闸就是那条判据的绕行入口——
+    而绕过去的后果是往正式权限表写一行值列表还是职能标签、不是指标名的记录。
+    """
+
+    def test_a_closed_gate_stops_before_provisioning(self) -> None:
+        parts, _ = run_once(publish_allowed=lambda: False)
+
+        self.assertEqual(parts["provisioning"].requests, [], "闸门关着时连档都不建")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["decisions"].rows, [], "一条发布意图都不排")
+        self.assertIn("onboarding.publish_gate_closed", parts["audit"].actions())
+
+    def test_a_closed_gate_is_an_internal_fault_not_a_missing_permission(self) -> None:
+        """说成「没有银河权限」会把一个权限完全正常的人引去银河申请。"""
+
+        parts, _ = run_once(publish_allowed=lambda: False)
+
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "permission_translation_unavailable",
+        )
+
+    def test_a_missing_intent_is_distinguishable_from_a_failed_publish(self) -> None:
+        """「本轮没排出这一条」与「排了但发布失败」原因码必须分得开。"""
+
+        class MissingIntent(FakeDecisions):
+            def load(self, outbox_id: str) -> Any:
+                self.loads += 1
+                return None
+
+        parts, _ = run_once(decisions=MissingIntent())
+
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"], "publish_intent_missing"
+        )
+
+    def test_the_gate_cannot_be_left_out(self) -> None:
+        """缺省放行等于把一次配置缺失变成一次真实的错误发布，而外部表不可回滚。"""
+
+        with self.assertRaises(TypeError):
+            build_runner(publish_allowed=None)
+
+
+class ShutdownTests(unittest.TestCase):
+    """停机落在链的中途：**不通知、不记账、把认领放回去**。
+
+    不能当成一次失败终态告诉用户——那会在每次滚动部署时给正在开通的人推一条
+    `LX-ONBOARD-001`，而他其实什么问题都没有，下一轮就会被重新捞起来跑完。
+    """
+
+    def test_a_stop_between_steps_aborts_and_releases(self) -> None:
+        stops = {"value": False}
+
+        class StoppingEnvironment(FakeEnvironment):
+            def ensure(self, *, user_id: str, mcp_token: str) -> EnvironmentResult:
+                stops["value"] = True
+                return super().ensure(user_id=user_id, mcp_token=mcp_token)
+
+        parts, _ = run_once(
+            environment=StoppingEnvironment(), should_stop=lambda: stops["value"]
+        )
+
+        self.assertEqual(parts["notifier"].sent, [], "停机中止不得给用户任何结论")
+        self.assertEqual(parts["ledger"].marked, [], "停机中止不得记账")
+        self.assertEqual(parts["ledger"].released, ["evt_1"], "认领必须放回去")
+        self.assertIn("onboarding.aborted_while_stopping", parts["audit"].actions())
+        self.assertEqual(parts["decisions"].rows, [], "停机之后不再排新的发布意图")
+
+    def test_a_queued_chain_that_starts_after_the_stop_aborts_immediately(self) -> None:
+        """已经排队、停机之后才被取到的那一条：第一步就中止并放回。"""
+
+        parts, _ = run_once(should_stop=lambda: True, executor=InlineExecutor())
+
+        # `start` 在停机中直接不受理，原因码可重试。
+        self.assertIn("onboarding.start_declined_while_stopping", parts["audit"].actions())
+        self.assertEqual(parts["environment"].calls, [])
+
+    def test_a_stop_during_the_publish_wait_is_not_an_internal_fault(self) -> None:
+        """停机不是"发布没完成"：那一版意图仍然有效，下一轮重跑会等到它。"""
+
+        state = {"stopping": False}
+
+        def sleep(seconds: float) -> None:
+            state["stopping"] = True
+
+        parts, _ = run_once(
+            decisions=FakeDecisions(statuses=("pending",)),
+            sleep=sleep,
+            should_stop=lambda: state["stopping"],
+        )
+
+        self.assertEqual(parts["notifier"].sent, [])
+        self.assertEqual(parts["ledger"].released, ["evt_1"])
+        self.assertNotIn("onboarding.result", parts["audit"].actions())
+
+
+class ActiveWriteTests(unittest.TestCase):
+    """写 `active` 之前要再复核一次，而且推进结果不能忽略（`V-开通-04`）。"""
+
+    def test_an_account_suspended_during_the_wait_is_not_written_active(self) -> None:
+        """从建档后那次复核到就绪最长隔十七分钟，管理员在这段时间停用账号是真实形状。"""
+
+        class ChangingUsers(FakeUsers):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reads = 0
+
+            def read_status(self, user_id: str) -> UserProvisioningStatus | None:
+                self.reads += 1
+                if self.reads == 1:
+                    return UserProvisioningStatus("enabled", "matching", 0)
+                return UserProvisioningStatus("suspended", "mcp_syncing", 7)
+
+        users = ChangingUsers()
+        parts, _ = run_once(users=users)
+
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SUSPENDED)
+        self.assertNotIn(STATE_ACTIVE, users.advanced)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"], "account_not_enabled"
+        )
+
+    def test_a_refused_state_advance_is_never_reported_as_success(self) -> None:
+        """条件更新影响 0 行 = 当前状态不允许被推到 active。忽略它就是对用户说假话。"""
+
+        class RefusingUsers(FakeUsers):
+            def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
+                self.advanced.append(to)
+                return to != STATE_ACTIVE
+
+        parts, _ = run_once(users=RefusingUsers())
+
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"], "state_advance_refused"
+        )
+        self.assertIn("onboarding.state_advance_refused_failed", parts["audit"].actions())
+
+
+class UnchangedPublishTests(unittest.TestCase):
+    """`UNCHANGED` 也要等 `published`（修复包 P2-并发-4）。"""
+
+    def test_an_unchanged_decision_still_waits_for_the_row_to_be_written(self) -> None:
+        parts, _ = run_once(decisions=FakeDecisions(enqueued=False, statuses=("pending",)))
+
+        self.assertGreater(parts["decisions"].loads, 0, "UNCHANGED 不得跳过发布等待")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "publish_not_completed",
+            "发布面根本没跑不能表现成十五分钟的 MCP 同步超时",
+        )
+
+    def test_an_unchanged_but_already_published_decision_costs_no_extra_wait(self) -> None:
+        parts, _ = run_once(decisions=FakeDecisions(enqueued=False, statuses=("published",)))
+
+        self.assertEqual(parts["decisions"].loads, 1)
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_COMPLETED)
 
 
 class PureFunctionTests(unittest.TestCase):
@@ -802,6 +1065,7 @@ class ConstructionTests(unittest.TestCase):
             audit=RecordingAudit(),
             role_function_map=ROLE_FUNCTION_MAP,
             delegated_subject=lambda: None,
+            publish_allowed=lambda: True,
         )
 
     def test_a_missing_executor_is_refused_at_construction(self) -> None:

@@ -72,14 +72,9 @@ worker = ["claude-agent-sdk==0.2.128", "psycopg[binary]>=3.2,<4"]
 # **websockets 显式声明，尽管 lark-oapi 会传递携带它。** 理由是独立复查已经证明
 # extras 矩阵抓不到传递依赖缺失：矩阵装的是 `.[gateway]`，lark-oapi 把 websockets
 # 带进来，于是"我们漏声明"这件事永远不会变红；一旦上游哪天把它挪出依赖表，
-# 长连接会在部署时才失败。
-#   cryptography → adapters/mcp_token_cipher.py（Epic D / S-D-02：首次开通编排在
-#               gateway 进程内签发该用户的问数 MCP 令牌，AES-256-CBC 明文只在内存）。
-#               **gateway 仍然不碰 Fernet**——宿主机专用授权凭据文件属 scheduler，
-#               共用的只是同一个第三方包。精确锁版与 scheduler 一致：加密协议是与
-#               问数 MCP 的互操作边界，范围区间会让依赖升级在代码未变时改变它。
+# 长连接会在部署时才失败。这一组**不含 cryptography**——gateway 不碰 Fernet，首次开通
+# 编排（连同它的 MCP 令牌加解密）自 2026-08-18 裁定起住在 scheduler。
 gateway = [
-    "cryptography==45.0.7",
     "lark-oapi==1.7.1",
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",

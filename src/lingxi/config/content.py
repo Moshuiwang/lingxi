@@ -44,6 +44,7 @@ class ContentSafetyError(ContentError):
 REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.checking",
     "onboarding.matched",
+    "onboarding.syncing",
     "onboarding.completed",
     "onboarding.not_authorized",
     "onboarding.sync_timeout",

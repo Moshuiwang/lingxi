@@ -1631,6 +1631,86 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
         )
 
 
+class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
+    """开通状态推进：**只前进不回退**，且写 `active` 还要求账号此刻是启用的。
+
+    两条都写在 `WHERE` 里而不是先读后写（Epic D / S-D-02）：两条并发的开通链会读到
+    同一个旧状态，于是后到的那条能把 `active` 写回 `provisioning`——一个已经开通完的
+    用户因此重新变成「开通中」，问数被拒。而「先读账号状态、再写 active」之间的窗口，
+    后果是把一个刚被管理员停用的人标成「开通完成」。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+        candidate = member()
+        located = locate_by_open_id(candidate.open_id, (candidate,))
+        decision = decide_first_contact(
+            open_id=candidate.open_id,
+            location=located,
+            employment=EmploymentStatus(
+                is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+            ),
+            directory=DirectoryAvailability.AVAILABLE,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        assert decision.draft is not None
+        self.user_id = self.users.record_identity(decision.draft).id
+
+    def _state(self) -> str:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT provisioning_state FROM app_user WHERE id = %s", (self.user_id,))
+            return str(cursor.fetchone()[0])
+
+    def _suspend(self) -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET account_state = 'suspended' WHERE id = %s", (self.user_id,)
+            )
+
+    def test_the_chain_advances_step_by_step(self) -> None:
+        status = self.users.read_status(self.user_id)
+        assert status is not None
+        self.assertEqual((status.account_state, status.provisioning_state), ("enabled", "matching"))
+
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="mcp_syncing"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="active"))
+        self.assertEqual(self._state(), "active")
+
+    def test_it_never_goes_backwards(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="mcp_syncing"))
+        self.assertEqual(self._state(), "active", "`V-开通-04`：失败不得把状态打回去")
+
+    def test_a_suspended_account_is_never_written_active(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self._suspend()
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="active"))
+        self.assertEqual(self._state(), "mcp_syncing")
+
+    def test_a_suspended_account_can_still_be_read_back(self) -> None:
+        self._suspend()
+        status = self.users.read_status(self.user_id)
+
+        assert status is not None
+        self.assertEqual(status.account_state, "suspended")
+
+    def test_an_unknown_state_is_refused_instead_of_treated_as_first(self) -> None:
+        """拼错的状态名不能被当成「排在最前面」而把任何用户推成 active。"""
+
+        with self.assertRaises(ValueError):
+            self.users.advance_provisioning_state(self.user_id, to="actve")
+
+    def test_a_missing_user_reads_back_as_none(self) -> None:
+        self.assertIsNone(self.users.read_status("usr_does_not_exist"))
+
+
 class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
     """把定位、判定与建档串起来跑一次，确认没有旁路能写出半条记录。"""
 

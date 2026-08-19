@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 TASK_QUEUED_CHANNEL = "task_queued"
 
 
+#: 开通已经启动、还没收口的两格。``matching`` 不在里面：那是建档默认值，编排此刻可能
+#: 还没被认领，用户应当继续看到「已收到，正在核对」。
+_PROVISIONING_IN_FLIGHT = frozenset({"provisioning", "mcp_syncing"})
+
+
 def _user_state(provisioning_state: str, account_state: str) -> UserState:
     """把 ``app_user`` 的两列映射成管线关心的三态。
 
@@ -53,6 +58,10 @@ def _user_state(provisioning_state: str, account_state: str) -> UserState:
 
     if account_state != "enabled":
         return UserState.SUSPENDED
+    if provisioning_state in _PROVISIONING_IN_FLIGHT:
+        # 开通已经启动、还没收口：合同对这个阶段规定的提示与「还没开始核对」不是同一条
+        # （见 ``UserState.PROVISIONING``）。
+        return UserState.PROVISIONING
     if provisioning_state != "active":
         return UserState.NOT_PROVISIONED
     return UserState.ACTIVE
@@ -424,6 +433,27 @@ class PostgresGatewayStore:
                        SET onboarding_dispatched_at = now()
                      WHERE feishu_event_id = %s
                        AND onboarding_dispatched_at IS NULL
+                    """,
+                    (event_id,),
+                )
+
+    def release_onboarding_claim(self, *, event_id: str) -> None:
+        """把认领放回 ``NULL``，让下一轮重新捞（Epic D / S-D-02 修复包）。
+
+        条件里带上 ``onboarding_dispatched_at IS NOT NULL``：只放回真的被认领过的那一条，
+        重复调用不产生额外写。它是 :meth:`claim_stale_onboarding` 唯一的反向路径——在它
+        存在之前，任何「认领了却没跑成」的交错都会把事件永久烧掉。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE inbound_event
+                       SET onboarding_dispatched_at = NULL
+                     WHERE feishu_event_id = %s
+                       AND onboarding_dispatched_at IS NOT NULL
                     """,
                     (event_id,),
                 )

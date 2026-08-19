@@ -2,8 +2,8 @@
 
 [Issue #65](https://github.com/Moshuiwang/lingxi/issues/65) 的编排层，
 [Epic D / #160](https://github.com/Moshuiwang/lingxi/issues/160) 的 S-D-02。它替换的是
-``apps/gateway`` 里那个失败关闭桩 ``_UnavailableOnboarding``——在它存在之前，生产上每一个
-未开通用户的首条消息都只得到冻结的 ``LX-ONBOARD-001``。
+此前 ``apps/gateway`` 里那个失败关闭桩（``_UnavailableOnboarding``）——在它存在之前，生产上
+每一个未开通用户的首条消息都只得到冻结的 ``LX-ONBOARD-001``。
 
 本模块住在 ``core/``，因此不 import 任何适配器、不发请求、不连数据库、不读时钟：组织快照
 读取、在职状态实时回读、花名册、银河快照、建档、用户环境、令牌签发、权限决定、就绪探针、
@@ -40,18 +40,34 @@
 
 ## 为什么 ``start`` 立刻返回 ``started``
 
-``EventPipeline._start_onboarding`` 在 **gateway 的长连接事件线程**里同步调用
-``OnboardingRunner.start``；``OnboardingReconciler`` 在**投递消费线程**里调用同一个实例。
-真实编排的单次耗时可达分钟级（产品合同允许权限同步等到十五分钟），把它同步跑在这两条
-线程的任何一条上，代价分别是"gateway 十五分钟收不到任何消息"和"十五分钟一条投递都发
-不出去"——这正是 Issue #65 钉在开工卡上的「共用线程复核」。
+本编排住在 ``lingxi-scheduler``（产品负责人 2026-08-18 裁定，见
+[决策记录](../../../../docs/决策记录/2026-08-18-首次开通编排住在scheduler.md)）。它的调用方
+是那个进程里的 ``OnboardingDispatchDuty``——按 ``claim_stale_onboarding`` 从
+``inbound_event`` 认领 gateway 记下的未开通首聊事件。**gateway 只记事件、发第一条「已收到，
+正在核对」提示，不再持有任何会产生外部副作用的编排。**
 
-因此 ``start`` 只做三件事：**按 ``open_id`` 去重 → 交给注入的执行器 → 返回
-``OnboardingState.STARTED``**。用户刚收到的「已收到，正在核对，请稍候」就是这一轮的完整
-交代（``ports.OnboardingState`` 对 ``started`` 的定义），终态由本模块自己**主动私聊**告诉
-用户。这同时定夺了 #65 留下的「对账恢复路径的用户通知方案」：**编排自担通知 + 幂等**，
-而不是往 ``inbound_event`` 里多存两个路由标识——后者是一次扩大数据范围的决定，而通知本来
-就只需要 ``open_id``，它已经在 ``PendingOnboarding`` 里了。
+即便如此，``start`` 仍然**只做三件事**：按 ``open_id`` 去重 → 交给注入的执行器 → 返回
+``OnboardingState.STARTED``。原因不变：真实编排单次耗时可达分钟级（产品合同允许权限同步等到
+十五分钟），而 ``SchedulerLoop`` 的一轮 tick 被占住十五分钟，会让凭据轮换、保留清理、权限
+发布消费全部停摆。执行器是本编排**专属**的线程池，不与任何既有循环共用一条线程——这是
+Issue #65 钉在开工卡上的「共用线程复核」在搬迁之后的同一条结论。
+
+终态由本模块自己**主动私聊**告诉用户。这同时定夺了 #65 留下的「对账恢复路径的用户通知
+方案」：**编排自担通知 + 幂等**，而不是往 ``inbound_event`` 里多存两个路由标识——后者是一次
+扩大数据范围的决定，而通知本来就只需要 ``open_id``，它已经在 ``PendingOnboarding`` 里了。
+
+## 认领即记账，因此"没跑成"必须**放回去**
+
+``claim_stale_onboarding`` 是「取出即记账」：认领的那一刻 ``onboarding_dispatched_at`` 就被
+写上，而全仓没有任何东西会自动把它清回 ``NULL``。因此**凡是没有真正得出结论的路径都必须
+显式释放认领**，否则那条事件此后永远不会再被捞起来，用户只剩一个「已收到」的表情：
+
+| 情形 | 处理 |
+|---|---|
+| 执行器满位 / 已停机 / 同一个人已有链在跑 | ``start`` 返回 :data:`RETRYABLE_REASONS` 里的原因码，由调用方释放 |
+| 停机信号落在链的中途 | 抛 :class:`_ChainAborted`，本模块释放，**不通知、不记账** |
+| 跑出了结论但通知没送到 | 有限重试仍失败 → 释放**一次**，第二次记账收口并留 ``failed`` 审计 |
+| 跑出了结论且通知送到 | 记账收口（重跑不会改变结论，只会持续冲击外部系统） |
 
 ## 并发与共享可变状态
 
@@ -78,6 +94,28 @@
 - ``account_state != 'enabled'`` → 停止开通，不建环境、不发权限，用户按「账号已停用」告知；
 - ``provisioning_state == 'active'`` → 这个人已经开通完了，直接收口，**不重复创建环境、
   不重复发布**（`V-开通-14`），也不再发第二条成功提示。
+
+## 一条链失败中断时，外部世界留下了什么
+
+这条链会在**五个**地方留下 Lingxi 之外或事务之外的痕迹。哪一步失败都不回滚前面几步
+（跨系统原子性不在任何一份合同里），因此逐条写清残留与归属，而不是假装它们不存在：
+
+| 步骤 | 留下什么 | 谁清、怎么清 |
+|---|---|---|
+| 建档（`app_user`） | 一行 `provisioning_state` 停在中途的用户记录 | 不清。它是幂等重入的依据；重跑同一条链会原样复用，账号删除流程负责真正的删除 |
+| 令牌签发（`mcp_access_token`） | 一行密文令牌（明文不落库） | 不清。签发幂等且**绝不覆盖**，重跑复用同一份；没有它后续步骤无法重入 |
+| 用户环境（`.mcp.json`） | 见 `adapters/user_environment.py` 的残留表（含被强杀时可能留下的带令牌临时文件） | 同表 |
+| 权限发布意图（`publish_outbox`） | 一条 `pending` 意图 + `app_user.permission_version` 已推进 | **不清，而且刻意不清**：那一版权限是数据库已确认的事实，发布消费职责照常把它写出去、就绪确认照常跑、`permission.range_updated` 照常通知。见下面那条已登记的缺口 |
+| 认领账本（`inbound_event.onboarding_dispatched_at`） | 已认领的标记 | 由本模块的释放路径放回（见上表），或由结论收口 |
+
+**已登记的缺口（本 Story 未解决）**：发布意图排出去之后，如果就绪确认判了 `sync_timeout`，
+用户停在 `mcp_syncing`；scheduler 的就绪 ticker 之后**可能**会把同一 `(用户, 权限版本)`
+确认成功并发一条「范围已更新」，但**没有任何东西会把 `provisioning_state` 写成 `active`**
+——本模块是 `active` 的唯一写入方，而它那时已经返回了。用户于是收到「范围已更新」却仍然
+问不了数。合同对这一格的规定是「转交管理员处理，后续确认成功后再主动通知用户可以开始
+使用」，那条恢复路径属 Epic D 的后续步骤，不在本 Story 范围。**这条缺口同时登记在**
+``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
+（未认领，归 Epic D 下一步）——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文。
 
 ## 发布由谁执行
 
@@ -121,6 +159,7 @@ from lingxi.core.permission.publish_row import (
     aggregate_permission,
     build_publish_row,
     parse_permissions,
+    serialize_permissions,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,12 +179,23 @@ STATE_ACTIVE = "active"
 #: 冻结文案的内容目录 key。用常量而不是散落字面量：这几条是产品负责人逐字批准过的终态，
 #: 改一个 key 就等于换一条用户可见结论。
 KEY_MATCHED = "onboarding.matched"
+#: 权限发布已排出、进入同步等待时的**进度**提示。合同「权限同步期间，卡片明确显示
+#: 『权限正在同步，预计最多需要十五分钟』，用户无需重复开通」的落点。
+KEY_SYNCING = "onboarding.syncing"
 KEY_COMPLETED = "onboarding.completed"
 KEY_NOT_AUTHORIZED = "onboarding.not_authorized"
 KEY_SYNC_TIMEOUT = "onboarding.sync_timeout"
 KEY_INTERNAL_ERROR = "onboarding.internal_error"
 KEY_DELEGATED_SUBJECT = "onboarding.delegated_subject"
 KEY_SUSPENDED = "gateway.suspended"
+
+
+class _ChainAborted(Exception):
+    """停机信号落在链的中途：**不通知、不记账、把认领放回去**。
+
+    不能当成一次失败终态告诉用户——那会在每次滚动部署时给正在开通的人推一条
+    ``LX-ONBOARD-001``，而他其实什么问题都没有，下一轮就会被重新捞起来跑完。
+    """
 
 
 class OnboardingChainError(RuntimeError):
@@ -246,9 +296,17 @@ class UserNotifier(Protocol):
 
 
 class DispatchLedger(Protocol):
-    """"这条事件的开通编排已经跑完"的账本（``inbound_event.onboarding_dispatched_at``）。"""
+    """开通交接账本（``inbound_event.onboarding_dispatched_at``）。
+
+    认领这条事件时账本就已经被写上（``claim_stale_onboarding`` 是「取出即记账」），因此本
+    协议真正要紧的是**反向**那一个：跑完之后如果用户其实没被通知到，必须把账**放回去**，
+    否则这条事件永远不会再被任何人捞起来，用户只剩一个「已收到」的表情。
+    """
 
     def mark_onboarding_dispatched(self, *, event_id: str) -> None: ...
+
+    def release_onboarding_claim(self, *, event_id: str) -> None:
+        """把 ``onboarding_dispatched_at`` 放回 ``NULL``，让下一轮重新认领。"""
 
 
 class _AuditSink(Protocol):
@@ -259,15 +317,14 @@ class _AuditSink(Protocol):
 class _Terminal:
     """一次开通的内部终态：状态 + 要发的那条文案 + 内部原因码。
 
-    ``notify`` 为假的唯一场景是"这个人本来就已经 active"：那时再推一条结论，用户会在
-    自己什么都没做的情况下收到第二遍开通提示。
+    **每一个终态都要通知**，没有"这一路不说话"的分支：一条跑完却不说话的链，与一条被
+    烧掉的链在用户那边完全一样。重复推送由绑定事件的去重键挡住，不靠这里少发一次。
     """
 
     state: OnboardingState
     key: str
     values: tuple[tuple[str, object], ...] = ()
     reason: str | None = None
-    notify: bool = True
 
     def as_result(self) -> OnboardingResult:
         return OnboardingResult(
@@ -286,7 +343,7 @@ def _internal(reason: str) -> _Terminal:
 
 
 class AutoOnboardingRunner:
-    """正式的 ``OnboardingRunner``。装配见 ``apps/gateway/onboarding.py``。"""
+    """正式的 ``OnboardingRunner``。装配见 ``apps/scheduler/__init__._build_onboarding_duty``。"""
 
     name = "首次开通编排"
 
@@ -313,6 +370,8 @@ class AutoOnboardingRunner:
         clock: Callable[[], datetime] | None = None,
         should_stop: Callable[[], bool] | None = None,
         publish_wait_seconds: float = 120.0,
+        notify_attempts: int = 3,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> None:
         if not callable(delegated_subject):
             # 每次判定现读一次登记，而不是装配时读一次存着：换主体之后旧值会让
@@ -345,8 +404,23 @@ class AutoOnboardingRunner:
         self._clock = clock or (lambda: datetime.now(_UTC))
         self._should_stop = should_stop or (lambda: False)
         self._publish_wait_seconds = float(publish_wait_seconds)
+        if isinstance(notify_attempts, bool) or not isinstance(notify_attempts, int) or notify_attempts < 1:
+            raise ValueError("通知至少要尝试一次")
+        self._notify_attempts = notify_attempts
+        if publish_allowed is None or not callable(publish_allowed):
+            # **没有默认放行。** 这一格决定的是「要不要往正式权限表写一行」，而在
+            # 「职能标签 → 指标名」翻译层（Issue #227）补齐之前，写出去的值列表根本
+            # 不是消费方能用的指标名。缺省放行等于把一次配置缺失变成一次真实的错误
+            # 发布，而外部表是不可回滚的。
+            raise TypeError("必须注入发布闸门：翻译层不可用时一条发布意图都不能排")
+        self._publish_allowed = publish_allowed
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
+        #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
+        #: 把整条链重跑一遍，而链上有可能等满十五分钟的就绪确认；无上界地放回会让一次飞书
+        #: 长时间不可用把执行器永久占满。第二次仍然送不到就记账收口，并留一条 ``failed``
+        #: 后缀的响亮审计。
+        self._released_for_notify: set[str] = set()
 
     # ------------------------------------------------------------------
     # OnboardingRunner 合同
@@ -368,15 +442,18 @@ class AutoOnboardingRunner:
         with self._lock:
             running_for = self._running.get(open_id)
             if running_for is not None:
-                # 同一个人已经有一条链在跑（例如对账重交接撞上用户的新消息）。
-                # 第二次不再开链，也不再发第二条提示。
+                # 同一个人已经有一条链在跑（认领撞上另一条同人事件）。第二次不再开链，
+                # 但这条事件**自己从来没有被执行过**——它的认领必须被释放，不放回去
+                # 就再也没人捞得到它（原因码在 ``RETRYABLE_REASONS`` 里）。
                 self._audit.record(
                     "onboarding.already_running",
                     event_id=event_id,
                     running_event_id=running_for,
                     trace_id=trace_id,
                 )
-                return OnboardingResult(state=OnboardingState.STARTED)
+                return OnboardingResult(
+                    state=OnboardingState.STARTED, failure_reason="already_running"
+                )
             # **先登记再提交**：反过来会让两次几乎同时的 start 各自提交一条链。
             self._running[open_id] = event_id
 
@@ -418,7 +495,15 @@ class AutoOnboardingRunner:
         """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。"""
 
         try:
-            terminal = self._run(open_id=open_id, trace_id=trace_id)
+            terminal = self._run(event_id=event_id, open_id=open_id, trace_id=trace_id)
+        except _ChainAborted:
+            # 停机中止：放回认领，下一轮（或下次启动）从头重跑。整条链的每一步都幂等，
+            # 重跑不会重复建档、重复发布或重复通知。
+            self._audit.record(
+                "onboarding.aborted_while_stopping", event_id=event_id, trace_id=trace_id
+            )
+            self._release_claim(event_id=event_id, trace_id=trace_id)
+            return
         except OnboardingChainError as error:
             terminal = _internal(error.code)
         except Exception as error:  # noqa: BLE001 - 未预料的失败也必须有用户结论
@@ -436,83 +521,181 @@ class AutoOnboardingRunner:
             event_id=event_id,
             state=terminal.state.value,
             failure_reason=terminal.reason,
-            content_key=terminal.key if terminal.notify else "",
+            content_key=terminal.key,
             trace_id=trace_id,
         )
-        if terminal.notify:
-            self._notify(open_id=open_id, event_id=event_id, terminal=terminal, trace_id=trace_id)
-        # 记账排在通知**之后**：账本的唯一用途是让对账扫描不再重复交接，而"用户已经拿到
-        # 结论"才是这条事件真正处理完的标志。反过来会让一次通知失败变成"系统认为处理完了、
-        # 用户什么都没收到"，而且没有任何东西会再来收拾。
-        try:
-            self._ledger.mark_onboarding_dispatched(event_id=event_id)
-        except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被对账再交接一次
-            self._audit.record(
-                "onboarding.dispatch_record_failed",
-                event_id=event_id,
-                error=type(error).__name__,
-                trace_id=trace_id,
-            )
+        delivered = self._notify(
+            open_id=open_id,
+            event_id=event_id,
+            key=terminal.key,
+            values=dict(terminal.values),
+            suffix="",
+            trace_id=trace_id,
+        )
+        if delivered or not self._release_for_notify(event_id=event_id, trace_id=trace_id):
+            # 送到了，或者已经放回过一次仍然送不到：记账收口。第二种情况留了一条
+            # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失。
+            try:
+                self._ledger.mark_onboarding_dispatched(event_id=event_id)
+            except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次
+                self._audit.record(
+                    "onboarding.dispatch_record_failed",
+                    event_id=event_id,
+                    error=type(error).__name__,
+                    trace_id=trace_id,
+                )
 
     def _notify(
-        self, *, open_id: str, event_id: str, terminal: _Terminal, trace_id: str
-    ) -> None:
-        """把终态主动私聊给用户。失败只留响亮审计，**不改写终态**。"""
+        self,
+        *,
+        open_id: str,
+        event_id: str,
+        key: str,
+        values: Mapping[str, object],
+        suffix: str,
+        trace_id: str,
+    ) -> bool:
+        """主动私聊一条消息，**返回是否送达**。失败只留响亮审计，不改写终态。
+
+        有限重试而不是一次定生死：一次飞书抖动就让用户永远停在「已收到」，代价与收益完全
+        不成比例。重试之间用注入的 ``sleep``，因此纯单测里一秒都不用等。
+
+        ``dedupe_key`` 绑定**事件 + 用途**：同一条首聊事件的重复执行（重新认领、重启后
+        重跑）只会让用户看到同一条结论一次；而进度提示与终态是两个用途，各自一个键，
+        不会互相去重掉。
+        """
+
+        dedupe_key = f"onboarding:{suffix}{event_id}" if suffix else f"onboarding:{event_id}"
+        for attempt in range(1, self._notify_attempts + 1):
+            try:
+                self._notifier.send(
+                    open_id=open_id, key=key, values=dict(values), dedupe_key=dedupe_key
+                )
+                return True
+            except Exception as error:  # noqa: BLE001
+                self._audit.record(
+                    "onboarding.notify_failed",
+                    event_id=event_id,
+                    content_key=key,
+                    attempt=attempt,
+                    error=type(error).__name__,
+                    trace_id=trace_id,
+                )
+                if attempt < self._notify_attempts:
+                    self._sleep(float(attempt))
+        return False
+
+    def _release_claim(self, *, event_id: str, trace_id: str) -> None:
+        """把认领放回 ``NULL``。停机中止专用，不设次数上限——它每个进程生命周期最多
+        发生一次，而且不放回去这条事件就永远没人再看。"""
 
         try:
-            self._notifier.send(
-                open_id=open_id,
-                key=terminal.key,
-                values=dict(terminal.values),
-                # 去重键绑定**事件**：同一条首聊事件的重复执行（对账重交接、重启后重跑）
-                # 只会让用户看到同一条结论一次。
-                dedupe_key=f"onboarding:{event_id}",
-            )
+            self._ledger.release_onboarding_claim(event_id=event_id)
         except Exception as error:  # noqa: BLE001
             self._audit.record(
-                "onboarding.notify_failed",
+                "onboarding.release_claim_failed",
                 event_id=event_id,
-                state=terminal.state.value,
                 error=type(error).__name__,
                 trace_id=trace_id,
             )
+
+    def _release_for_notify(self, *, event_id: str, trace_id: str) -> bool:
+        """通知没送到：把认领放回去，让下一轮重跑整条链。**每条事件只放回一次。**
+
+        返回是否真的放回了。``False`` 表示「这条已经放回过一次、仍然送不到」，调用方据此
+        记账收口——本方法在那种情况下留一条 ``failed`` 后缀的审计（审计实现按后缀升到
+        ``WARNING``），因此放弃这件事本身不会无声消失。
+        """
+
+        with self._lock:
+            already = event_id in self._released_for_notify
+            if not already:
+                self._released_for_notify.add(event_id)
+        if already:
+            self._audit.record(
+                "onboarding.notify_gave_up_failed", event_id=event_id, trace_id=trace_id
+            )
+            return False
+        try:
+            self._ledger.release_onboarding_claim(event_id=event_id)
+        except Exception as error:  # noqa: BLE001 - 放不回去只能记账收口
+            self._audit.record(
+                "onboarding.release_claim_failed",
+                event_id=event_id,
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+            return False
+        self._audit.record(
+            "onboarding.claim_released_after_notify_failed",
+            event_id=event_id,
+            trace_id=trace_id,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # 链
     # ------------------------------------------------------------------
 
-    def _run(self, *, open_id: str, trace_id: str) -> _Terminal:
+    def _stop_guard(self) -> None:
+        """每一步之间问一次停机。**在发起下一个带外部副作用的动作之前**问。"""
+
+        if self._should_stop():
+            raise _ChainAborted()
+
+    def _run(self, *, event_id: str, open_id: str, trace_id: str) -> _Terminal:
         """一次开通的固定次序。每一步的失败去向都在这里显式返回。"""
 
+        self._stop_guard()
         located = self._locate(open_id)
         if isinstance(located, _Terminal):
             return located
         member = located
 
+        self._stop_guard()
         matched = self._match(member, trace_id=trace_id)
         if isinstance(matched, _Terminal):
             return matched
         request, aggregate = matched
 
+        self._stop_guard()
         provisioned = self._provision(request)
         if isinstance(provisioned, _Terminal):
             return provisioned
         user_id = provisioned
 
-        recheck = self._recheck_still_provisionable(user_id, trace_id=trace_id)
+        recheck = self._recheck_still_provisionable(
+            user_id, aggregate=aggregate, trace_id=trace_id
+        )
         if recheck is not None:
             return recheck
 
+        self._stop_guard()
         issued = self._issue_token(user_id)
         self._create_environment(user_id, issued)
         self._users.advance_provisioning_state(user_id, to=STATE_PROVISIONING)
 
+        self._stop_guard()
         published = self._publish(user_id, request, aggregate, issued)
         if isinstance(published, _Terminal):
             return published
         permission_version, permissions = published
         self._users.advance_provisioning_state(user_id, to=STATE_MCP_SYNCING)
 
+        # **合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，
+        # 用户必须被告知"正在同步、最多十五分钟、无需重复开通"，而不是一直停在第一条
+        # "正在核对"。它在**阻塞式就绪确认之前**发——那一步最长会等十五分钟，等完再说
+        # 就等于没说。用独立的去重键，不与终态互相去重掉。
+        self._notify(
+            open_id=open_id,
+            event_id=event_id,
+            key=KEY_SYNCING,
+            values={},
+            suffix="syncing:",
+            trace_id=trace_id,
+        )
+
+        self._stop_guard()
         return self._confirm(
             user_id=user_id,
             permission_version=permission_version,
@@ -614,6 +797,21 @@ class AutoOnboardingRunner:
             # 没有受支持职能 / 没有公司范围：同一条无权限出口。
             return _not_authorized(aggregate.reason)
 
+        if not self._publish_allowed():
+            # **翻译层不可用：一条发布意图都不排**（与 Issue #227 在每日重算那一侧的
+            # 整轮判据同一条纪律，授权与撤权都不例外）。停在这里而不是继续：
+            #
+            # - 不是"没有银河权限"——这个人明明有，说成没有会把他引去银河申请一个他
+            #   已经有的权限；
+            # - 不是"MCP 同步超时"——那条说的是外部同步慢，而这里是我们自己缺一份内容；
+            # - 也不能"先建档建环境、发布那步以后再补"：合同要求成功以发布 + 就绪确认
+            #   为前提，半开的用户会一直停在 mcp_syncing 而没有任何人会来收拾。
+            #
+            # 因此按本侧故障收口（`LX-ONBOARD-001`，已转交管理员），且**在建档之前**，
+            # 不留下任何半成品。
+            self._audit.record("onboarding.publish_gate_closed", trace_id=trace_id)
+            return _internal("permission_translation_unavailable")
+
         roster_row = roster_row_for(member.user_id, roster_rows)
         request = ProvisioningRequest.from_roster_row(draft_from_member(member), roster_row)
         return request, aggregate
@@ -640,7 +838,9 @@ class AutoOnboardingRunner:
 
     # ---- 5. 续行前复核 ---------------------------------------------------
 
-    def _recheck_still_provisionable(self, user_id: str, *, trace_id: str) -> _Terminal | None:
+    def _recheck_still_provisionable(
+        self, user_id: str, *, aggregate: Any, trace_id: str
+    ) -> _Terminal | None:
         """``already_provisioned`` 不等于「这个人现在还该被开通」（接口设计 §8.1）。"""
 
         status = self._users.read_status(user_id)
@@ -658,15 +858,15 @@ class AutoOnboardingRunner:
                 OnboardingState.NOT_AUTHORIZED, KEY_SUSPENDED, reason="account_not_enabled"
             )
         if status.provisioning_state == STATE_ACTIVE:
-            # 已经开通完了（对账重交接窗口里被另一条链跑完）。不重复建环境、不重复发布，
-            # 也不再推第二条成功提示（`V-开通-14`）。
+            # 已经开通完了（重新认领的窗口里被另一条链跑完，或上一轮跑完但通知没送到）。
+            # **不重复建环境、不重复发布**（`V-开通-14`）——但**照常通知**：这条路径正是
+            # "上一次结论没送到、被重新认领"的收敛出口，不通知就等于把它烧掉。重复推送由
+            # 绑定事件的去重键挡住（同一条事件的两次执行用同一个键）。
+            #
+            # 范围**不重新聚合一次外部权限**，用本轮已经算出来的那一份：它与即将发布
+            # （或已经发布）的那一版是同一个来源，不会凭空编出一个用户没有的范围。
             self._audit.record("onboarding.already_active", user=user_id, trace_id=trace_id)
-            return _Terminal(
-                OnboardingState.COMPLETED,
-                KEY_COMPLETED,
-                reason="already_active",
-                notify=False,
-            )
+            return self._completed(serialize_permissions(aggregate))
         return None
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
@@ -687,9 +887,11 @@ class AutoOnboardingRunner:
         try:
             self._environment.ensure(user_id=user_id, mcp_token=issued.reveal())
         except Exception as error:  # noqa: BLE001
-            raise OnboardingChainError(
-                f"user_environment_failed_{type(error).__name__}"
-            ) from error
+            # **透传实现给的错误码**（它已经脱敏，只有 errno 符号名）：`ENOENT`（卷没挂）
+            # 与 `EACCES`（权限不对）是两种完全不同的运维动作，把它们一起压成
+            # `UserEnvironmentError` 等于让排查从头再来一遍。
+            detail = getattr(error, "code", None) or type(error).__name__
+            raise OnboardingChainError(f"user_environment_failed_{detail}") from error
 
     # ---- 7. 权限发布 ------------------------------------------------------
 
@@ -718,12 +920,13 @@ class AutoOnboardingRunner:
             decided_at=self._clock(),
         )
         version = int(decision.permission_version)
-        if decision.enqueued:
-            waited = self._await_published(decision.outbox_id)
-            if waited is not None:
-                return waited
-        # ``UNCHANGED``：内容与上一条仍然有效的意图逐字段相同（重入，或每日重算已经排
-        # 过同一版）。那一条自己会被发布面消费，本链直接进入就绪确认。
+        # ``UNCHANGED`` 也要等：那一条意图可能还停在 ``pending``（重入、或每日重算刚排出
+        # 来还没被消费）。跳过等待会让"发布面根本没跑"表现成十五分钟的 MCP 同步超时——
+        # 一个本侧故障被说成了外部同步慢，运维会去查错的地方。``_await_published`` 对
+        # 已经 ``published`` 的意图第一次回读就返回，因此这里不引入任何多余等待。
+        waited = self._await_published(decision.outbox_id)
+        if waited is not None:
+            return waited
         return version, row.permissions
 
     def _await_published(self, outbox_id: str) -> _Terminal | None:
@@ -743,11 +946,19 @@ class AutoOnboardingRunner:
             status = getattr(intent, "status", None) if intent is not None else None
             if status == "published":
                 return None
+            if intent is None:
+                # 意图查不到：**本轮根本没有排出这一条**（例如翻译层整轮判据把它挡住），
+                # 与"排了但发布失败"是两件事。两者的用户出口相同（本侧故障），但原因码
+                # 必须可分辨——前者要去看内容配置，后者要去看外部表格调用。
+                return _internal("publish_intent_missing")
             if status in ("failed", "superseded"):
                 # ``superseded``：本链排的这一版已经被更新的一版取代（撤权或重算）。
                 # 那一版自己会被发布并确认，但**本次开通**不能据此宣告成功。
                 return _internal(f"publish_{status}")
-            if waited >= self._publish_wait_seconds or self._should_stop():
+            if self._should_stop():
+                # 停机不是"发布没完成"：那一版意图仍然有效，下一轮重跑会等到它。
+                raise _ChainAborted()
+            if waited >= self._publish_wait_seconds:
                 return _internal("publish_not_completed")
             self._sleep(step)
             waited += step
@@ -765,7 +976,32 @@ class AutoOnboardingRunner:
         if outcome is ReadinessOutcome.READY:
             # **只有到这里才写 active**：产品合同要求成功提示在环境创建、权限发布与当前
             # 用户 MCP 确认全部完成之后才发（`V-开通-11`）。
-            self._users.advance_provisioning_state(user_id, to=STATE_ACTIVE)
+            #
+            # **再复核一次**：从建档后那次复核到这里最长隔了十七分钟（发布等待 +
+            # 就绪预算），管理员在这段时间里停用账号是真实形状。只复核一次等于用十七
+            # 分钟前的事实宣告"开通完成"，还会把一个已经被停用的人写成 ``active``。
+            status = self._users.read_status(user_id)
+            if status is None or status.account_state != "enabled":
+                self._audit.record(
+                    "onboarding.halted_account_state",
+                    user=user_id,
+                    account_state=status.account_state if status else "missing",
+                    trace_id=trace_id,
+                )
+                return _Terminal(
+                    OnboardingState.NOT_AUTHORIZED, KEY_SUSPENDED, reason="account_not_enabled"
+                )
+            # **推进结果不能忽略**：条件更新影响 0 行意味着这个人当前状态不允许被推到
+            # ``active``（被停用、或已经被另一条路径改写）。忽略返回值就会在库里还是
+            # ``mcp_syncing`` 的情况下告诉用户"开通完成"，而他下一条消息仍然会被拒。
+            if not self._users.advance_provisioning_state(user_id, to=STATE_ACTIVE):
+                self._audit.record(
+                    "onboarding.state_advance_refused_failed",
+                    user=user_id,
+                    provisioning_state=status.provisioning_state,
+                    trace_id=trace_id,
+                )
+                return _internal("state_advance_refused")
             return self._completed(permissions)
         if outcome is ReadinessOutcome.TIMED_OUT:
             # 十五分钟预算耗尽：专用的等待类终态，**不与 LX-ONBOARD-001 混淆**

@@ -339,14 +339,34 @@ class FakeStore:
         self._state.onboarding_dispatched.add(event_id)
 
     def claim_stale_onboarding(self, *, older_than) -> PendingOnboarding | None:
-        """认领一条孤儿；认领即摘除，与真库的原子记账同语义。"""
+        """认领一条待交接事件；认领即摘除并记账，与真库的原子 ``UPDATE … RETURNING`` 同语义。"""
 
         self._log.add("store.claim_stale_onboarding", older_than=older_than)
         if self._fail_on == "claim_stale_onboarding":
             raise RuntimeError("注入失败：claim_stale_onboarding")
         if not self._state.stale_onboardings:
             return None
-        return self._state.stale_onboardings.pop(0)
+        pending = self._state.stale_onboardings.pop(0)
+        # 认领即记账：真库那条语句在取出的同一瞬间写上 ``onboarding_dispatched_at``。
+        # 假实现必须同样记，否则"没跑成就要放回去"这条断言在假实现上恒真。
+        self._state.onboarding_dispatched.add(pending.event_id)
+        return pending
+
+    def release_onboarding_claim(self, *, event_id: str) -> None:
+        """把认领放回去：从账本里去掉，并让它重新进入候选队列。"""
+
+        self._log.add("store.release_onboarding_claim", event_id=event_id)
+        if self._fail_on == "release_onboarding_claim":
+            raise RuntimeError("注入失败：release_onboarding_claim")
+        if event_id in self._state.onboarding_dispatched:
+            self._state.onboarding_dispatched.discard(event_id)
+            self._state.stale_onboardings.append(
+                PendingOnboarding(
+                    event_id=event_id,
+                    open_id=f"ou_{event_id}",
+                    trace_id=f"trc_{event_id}",
+                )
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[FakeTransaction]:

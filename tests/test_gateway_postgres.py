@@ -1391,6 +1391,43 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
             0,
         )
 
+    def test_releasing_a_claim_puts_the_event_back_in_the_candidate_set(self) -> None:
+        """认领即记账的**反向**路径（Epic D / S-D-02 修复包 P1-并发-1）。
+
+        执行器满位、正在停机、同一个人已有链在跑、`start` 抛异常、结论通知反复送不到
+        ——这五条都是「认领了却没真的跑」。没有这条反向语句时，它们各自都会把事件
+        **永久烧掉**：用户只剩一个「已收到」的表情，不建档、不发权限、也收不到任何终态。
+        """
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        claimed = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(claimed)
+        self.assertIsNotNone(self.dispatched_at(), "认领即记账")
+
+        self.store.release_onboarding_claim(event_id="evt_auto")
+
+        self.assertIsNone(self.dispatched_at(), "放回之后账本必须重新为空")
+        again = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(again, "放回之后必须能被下一轮重新认领")
+        self.assertEqual(again.event_id, "evt_auto")
+
+    def test_releasing_an_unclaimed_event_changes_nothing(self) -> None:
+        """只放回真的被认领过的那一条；重复调用不产生额外写。"""
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+
+        self.store.release_onboarding_claim(event_id="evt_auto")
+        self.store.release_onboarding_claim(event_id="evt_never_seen")
+
+        self.assertIsNone(self.dispatched_at())
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM inbound_event"), 1, "不得凭空造行"
+        )
+
     def test_settling_the_ledger_twice_does_not_move_the_timestamp(self) -> None:
         self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
             inbound("evt_auto", open_id="ou_stranger"), now=NOW

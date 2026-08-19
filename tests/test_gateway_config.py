@@ -23,9 +23,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from lingxi.apps.gateway.onboarding import assert_gateway_onboarding_is_inert
 from lingxi.apps.gateway import (
-    build_delivery_tick,
-    build_onboarding_reconciler,
     build_supervisor,
     main,
 )
@@ -303,7 +302,14 @@ class BuildSupervisorTests(unittest.TestCase):
             "gateway 装配必须把 #89/#17 开通 runner 传入事件管线",
         )
 
-    def test_missing_onboarding_runner_fails_closed(self) -> None:
+    def test_the_default_onboarding_is_the_recorder_not_a_fail_closed_stub(self) -> None:
+        """搬迁之后缺省实现从"失败关闭桩"变成"只记事件"。
+
+        它**不是**放宽了失败关闭：真正的编排在 scheduler，未装配时那边不注册、
+        没有任何人认领，事件原样留在库里——比让每个用户当场看到 LX-ONBOARD-001
+        更接近事实，也不会把事件"认领即平账"地烧掉。
+        """
+
         config = load_config(VALID_ENV)
 
         with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
@@ -311,74 +317,64 @@ class BuildSupervisorTests(unittest.TestCase):
 
         fallback = pipeline_class.call_args.kwargs["onboarding"]
         result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
-        self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(result.state, OnboardingState.STARTED)
 
 
-class OnboardingReconcilerWiringTests(unittest.TestCase):
-    """#65 轻审 P2-2 的调用方：对账扫描必须真的被生产进程每轮调用。
+class GatewayOnboardingIsInertTests(unittest.TestCase):
+    """搬迁之后 gateway 在开通链上的**全部**职责：记事件 + 回第一条提示。
 
-    这一组断的是"有没有人调它"，不是它自己的行为（后者在
-    ``tests/test_gateway_onboarding_recovery.py``）。#29 的教训正是"组件在库、端口
-    后无调用方"——一个没人调用的对账扫描等于没有对账扫描。
+    产品负责人 2026-08-18 裁定把编排整体移进 ``lingxi-scheduler``。因此这一组断的不再是
+    「对账有没有人调」（那一路整个搬走了），而是**这里绝不能再出现会产生外部副作用的
+    实现**：``EventPipeline._start_onboarding`` 在长连接事件线程里同步调用 ``start``，
+    接上真编排就是 gateway 十五分钟收不到消息，而现场只表现为「机器人不理人」。
     """
 
-    def test_the_reconciler_shares_the_supervisor_fail_closed_default(self) -> None:
+    def test_the_default_onboarding_only_records(self) -> None:
         config = load_config(VALID_ENV)
 
-        reconciler = build_onboarding_reconciler(config)
+        with patch("lingxi.apps.gateway.EventPipeline") as pipeline_class:
+            build_supervisor(config, transport=object())
 
-        result = reconciler._onboarding.start(event_id="evt", open_id="ou", trace_id="trc")
-        self.assertEqual(result.state, OnboardingState.INTERNAL_ERROR)
+        fallback = pipeline_class.call_args.kwargs["onboarding"]
+        result = fallback.start(event_id="evt", open_id="ou", trace_id="trc")
+        # `started` 的含义正是"编排已异步接手、这一轮没有别的话要说"，而**不是**
+        # 失败关闭桩那种当场给用户 LX-ONBOARD-001。
+        self.assertEqual(result.state, OnboardingState.STARTED)
+        self.assertIsNone(result.failure_reason)
+        assert_gateway_onboarding_is_inert(fallback)
 
-    def test_an_injected_runner_reaches_the_reconciler(self) -> None:
+    def test_the_builder_reports_the_implementation_it_actually_used(self) -> None:
         config = load_config(VALID_ENV)
-        runner = FakeOnboarding()
+        reported: list[object] = []
 
-        reconciler = build_onboarding_reconciler(config, onboarding=runner)
-
-        self.assertIs(reconciler._onboarding, runner)
-
-    def test_the_reconciler_stops_with_the_process(self) -> None:
-        """停机信号必须接到对账扫描上，否则停机中还会去认领并触发外部开通。
-
-        用例刻意只走"已停机"这一半：另一半会真的去连配置里的数据库，而本组断的是
-        接线，不是数据库可达性。
-        """
-
-        config = load_config(VALID_ENV)
-
-        reconciler = build_onboarding_reconciler(config, should_stop=lambda: True)
-
-        self.assertIsNone(reconciler.run_once(), "收到停机信号后不得再认领孤儿")
-
-    def test_each_delivery_tick_runs_both_the_reconciler_and_the_alerting(self) -> None:
-        calls: list[str] = []
-
-        tick = build_delivery_tick(
-            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
-            reconciler=types.SimpleNamespace(run_once=lambda: calls.append("reconcile")),
+        build_supervisor(
+            config, transport=object(), on_onboarding_assembled=reported.append
         )
-        tick()
-        tick()
 
-        self.assertEqual(calls, ["reconcile", "alerting", "reconcile", "alerting"])
+        self.assertEqual(len(reported), 1)
+        assert_gateway_onboarding_is_inert(*reported)
 
-    def test_a_failing_reconciler_does_not_take_away_the_alerting(self) -> None:
-        calls: list[str] = []
+    def test_an_executing_runner_fails_the_assembly(self) -> None:
+        """变异形状：有人把真编排接回 gateway。"""
 
-        def explode() -> None:
-            raise RuntimeError("数据库不可达")
+        class ExecutingRunner:
+            def start(self, *, event_id: str, open_id: str, trace_id: str):
+                raise AssertionError("不该被调用")
 
-        tick = build_delivery_tick(
-            alerting_duty=types.SimpleNamespace(run_once=lambda: calls.append("alerting")),
-            reconciler=types.SimpleNamespace(run_once=explode),
-        )
-        with self.assertLogs("lingxi.apps.gateway", level=logging.ERROR) as captured:
-            tick()
+        with self.assertRaises(RuntimeError):
+            assert_gateway_onboarding_is_inert(ExecutingRunner())
 
-        self.assertEqual(calls, ["alerting"])
-        self.assertIn("交接对账", captured.output[0])
-        self.assertNotIn("数据库不可达", captured.output[0], "异常正文不进日志")
+    def test_no_report_at_all_fails_instead_of_passing_vacuously(self) -> None:
+        with self.assertRaises(RuntimeError):
+            assert_gateway_onboarding_is_inert()
+
+    def test_the_delivery_tick_no_longer_carries_an_onboarding_sweep(self) -> None:
+        """投递循环不再顺带跑对账：那条循环上已经没有任何开通职责。"""
+
+        import lingxi.apps.gateway as gateway_module
+
+        self.assertFalse(hasattr(gateway_module, "build_delivery_tick"))
+        self.assertFalse(hasattr(gateway_module, "build_onboarding_reconciler"))
 
 
 class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):

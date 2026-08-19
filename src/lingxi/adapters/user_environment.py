@@ -19,6 +19,21 @@ worker → 问数 MCP 的逐用户令牌**沿用 biai-agent 老路，把 Bearer 
    （:class:`UserEnvironmentError`），不透传 `OSError` 的 `strerror`——它可能带上路径与
    文件内容片段。
 
+## 失败中断各自留下什么（谁来清、怎么清）
+
+本模块是这条链上唯一会在**磁盘**上留下东西的一步，因此把它的残留逐条写出来：
+
+| 中断点 | 留下什么 | 谁清、怎么清 |
+|---|---|---|
+| 建目录之后、写配置之前失败 | 一个**空的**家目录（`700`），不含任何凭据 | 无人清，也不需要清：下一次开通复用它；账号删除流程会连同用户环境一起删 |
+| 临时文件已写、``os.replace`` 之前抛异常 | 无——``finally`` 里 ``unlink`` 掉了 | 已在代码里处理 |
+| 临时文件已写、进程被 ``SIGKILL`` | 一个 `440` 的临时文件，**里面有明文令牌** | 由 :meth:`LocalUserEnvironment._sweep_stale` 在**下一次**对同一用户调用时删除并留 ``WARNING``；那之前它留在磁盘上（权限已收紧，但确实存在） |
+| 配置写成功、后续步骤失败（发布失败 / 就绪超时） | 一份**有效的** ``.mcp.json`` 属于一个没走到 ``active`` 的用户 | 无人清。它不构成越权：MCP 侧要能解出发布表那一行才放行，而那一行没写出去时这个令牌什么也拿不到；重跑同一条链会原样复用它 |
+
+**唯一需要人介入的是第三行**，而它只在「进程被强杀」这一种终止方式下产生。没有为它新建
+清理职责：这个目录只有本模块一条写路径，下一次调用顺手清掉的代价是零，而多一条常驻
+清理职责要多一份配置、多一个失败面。
+
 ## 本模块**不**做的事（登记的边界，不是遗漏）
 
 - **不创建 Linux 账号、不分配 uid、不 `chown`**。架构设计 5.3 的用户隔离要求
@@ -71,8 +86,19 @@ MCP_CONFIG_FILENAME = ".mcp.json"
 #: 隔离边界；这里先把目录本身收紧，属主移交见模块文档的登记边界。
 HOME_DIR_MODE = 0o700
 
+#: 根目录权限：`rwxr-x---`。**不能停在 umask 默认值**（实测 `0775`）：部署前提是"用户在
+#: 同一台机器上有 shell"，一个人人可读的根目录会把全部内部用户标识列出来；而属组可写时，
+#: 任何同组用户还能在某个人**首次开通之前**把 `<root>/<user_id>` 预置成指向别处的符号链接，
+#: 让那份令牌落到他挑的位置。属组保留 `r-x` 是给 worker 那个组留遍历权限。
+ROOT_DIR_MODE = 0o750
+
 #: 落盘凭据的文件权限：`r--r-----`。biai-agent 先例，裁定明列。
 CREDENTIAL_FILE_MODE = 0o440
+
+#: 原子写用的临时文件前缀。提成常量是因为**清扫要按它来找**：进程被 ``SIGKILL`` 掉在
+#: 「临时文件已带令牌、还没 ``os.replace``」之间时，那个文件会带着明文令牌留在磁盘上，
+#: 而 ``finally`` 里的清理根本没有机会执行。见 :meth:`LocalUserEnvironment._sweep_stale`。
+TEMPORARY_PREFIX = ".mcp.json."
 
 #: 内部用户标识的合法形态。它会成为一段路径，因此**只接受**这张白名单——`..`、`/`、
 #: 空串、前导点都会被这条正则挡住，而不是靠调用方记得别传。
@@ -120,22 +146,32 @@ class LocalUserEnvironment:
         mcp_server_name: str = "query",
         home_dir_mode: int = HOME_DIR_MODE,
         credential_file_mode: int = CREDENTIAL_FILE_MODE,
+        root_dir_mode: int = ROOT_DIR_MODE,
     ) -> None:
         if not root or not str(root).strip():
             raise ValueError("用户环境根目录不能为空")
+        if not str(root).startswith("/"):
+            # 相对路径会让"令牌落在哪"取决于进程的工作目录——那是一个没人配置、也没人
+            # 回读的隐式输入。不回显收到的值。
+            raise ValueError("用户环境根目录必须是绝对路径")
         if not isinstance(mcp_endpoint, str) or not mcp_endpoint.startswith("https://"):
             # 明文 Bearer 走 HTTP 等于把令牌发到网络上。不回显收到的值。
             raise ValueError("问数 MCP 端点必须是 https")
         if not isinstance(mcp_server_name, str) or not mcp_server_name.strip():
             raise ValueError("MCP 服务名不能为空")
         if credential_file_mode & 0o007:
-            # "其他人"位一旦被放开，同一台机器上任何用户都能读到这份令牌。
+            # 「其他人」位一旦被放开，同一台机器上任何用户都能读到这份令牌。
             raise ValueError("落盘凭据的文件权限不得对其他用户开放")
+        if root_dir_mode & 0o007 or root_dir_mode & 0o020:
+            # 根目录对其他人可见 = 内部用户标识全表泄露；对属组可写 = 首次开通前可被
+            # 预置成符号链接。两者都不是"权限稍宽一点"，是两条具体的攻击路径。
+            raise ValueError("用户环境根目录不得对其他用户开放，也不得对属组可写")
         self._root = Path(str(root))
         self._endpoint = mcp_endpoint
         self._server_name = mcp_server_name.strip()
         self._home_dir_mode = home_dir_mode
         self._file_mode = credential_file_mode
+        self._root_dir_mode = root_dir_mode
 
     def home_of(self, user_id: str) -> Path:
         """该用户的家目录路径。**不创建**，只算路径并校验标识形态。"""
@@ -156,17 +192,33 @@ class LocalUserEnvironment:
             raise UserEnvironmentError("empty_mcp_token")
         home = self.home_of(user_id)
         try:
-            home.mkdir(parents=True, exist_ok=True)
+            # **逐级建、逐级收紧**，不用 `parents=True`：那条路径上被顺手创建出来的中间
+            # 目录会停在 umask 默认值，而根目录恰恰是最不该宽的那一格（见 ROOT_DIR_MODE）。
+            self._root.mkdir(mode=self._root_dir_mode, exist_ok=True)
+            os.chmod(self._root, self._root_dir_mode)
+            home.mkdir(mode=self._home_dir_mode, exist_ok=True)
             os.chmod(home, self._home_dir_mode)
         except OSError as error:
             # 只留 errno 的符号名，不留 strerror（它带路径）。
             raise UserEnvironmentError(f"home_mkdir_{_errno_name(error)}") from None
+
+        # **先清扫，再判断要不要写。** 上一次调用如果被 ``SIGKILL`` 掉在「临时文件已经
+        # 带上令牌、还没 ``os.replace``」之间，那个文件会带着明文令牌留在磁盘上——
+        # ``finally`` 里的清理在那种终止方式下根本没有机会执行。清扫放在这里而不是别处，
+        # 是因为这是**唯一**会碰这个目录的写路径：不需要为它新建一条清理职责。
+        self._sweep_stale(home)
 
         desired = build_mcp_config(
             server_name=self._server_name, endpoint=self._endpoint, token=mcp_token
         )
         target = home / MCP_CONFIG_FILENAME
         if _read_text_or_none(target) == desired:
+            # 内容没变也要把权限收一次：一份被外部改宽过的既有配置，如果因为内容相同而
+            # 直接跳过，会让「440」这条纪律只在首次开通那一刻成立。
+            try:
+                os.chmod(target, self._file_mode)
+            except OSError as error:
+                raise UserEnvironmentError(f"config_chmod_{_errno_name(error)}") from None
             logger.info("用户环境已就绪，配置无变化 user=%s", user_id)
             return EnvironmentResult(created=False)
         self._atomic_write(target, desired)
@@ -177,6 +229,37 @@ class LocalUserEnvironment:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+
+    def _sweep_stale(self, home: Path) -> None:
+        """删掉这个用户目录里遗留的写入临时文件（可能带着明文令牌）。
+
+        只删**本模块自己**建的那种名字（``.mcp.json.*.tmp``），不碰用户的任何其他文件。
+
+        **失败关闭，不是尽力而为**：列不动或删不掉，都意味着我们管不了这个目录，而下一步
+        正要往里写一份明文令牌——继续写等于把凭据放进一个自己既看不见也清不掉的地方。
+        两条都抛 :class:`UserEnvironmentError`（错误码带 ``errno`` 符号名，让运维能直接
+        分辨 ``EACCES`` 与 ``ENOTDIR``），并各留一条不带路径的 ``WARNING``。
+        """
+
+        try:
+            leftovers = list(home.glob(f"{TEMPORARY_PREFIX}*.tmp"))
+        except OSError as error:
+            # **扫不动就不往这里放凭据。** 列不出目录内容意味着我们管不了这个目录，
+            # 而下一步正要在里面写一份明文令牌——继续写等于把凭据放进一个自己既看不见、
+            # 也清不掉的地方。这条路径同时挡住"目录被换成了别的东西"这类形态。
+            logger.warning("用户环境目录无法扫描，本次不写入配置 errno=%s", _errno_name(error))
+            raise UserEnvironmentError(f"sweep_failed_{_errno_name(error)}") from None
+        for leftover in leftovers:
+            try:
+                leftover.unlink()
+            except OSError as error:
+                # 删不掉同样是"管不了这个目录"：一份带令牌的残留会无限期躺在那里，
+                # 而我们正准备再放一份进去。响亮失败，不静默继续。
+                logger.warning(
+                    "用户环境残留的写入临时文件删除失败 errno=%s", _errno_name(error)
+                )
+                raise UserEnvironmentError(f"sweep_failed_{_errno_name(error)}") from None
+            logger.warning("清理了用户环境里遗留的写入临时文件（可能带有令牌）")
 
     def _atomic_write(self, target: Path, content: str) -> None:
         """同目录临时文件 → 收紧权限 → ``os.replace``。
@@ -190,15 +273,19 @@ class LocalUserEnvironment:
         temporary: str | None = None
         try:
             descriptor, temporary = tempfile.mkstemp(
-                dir=str(target.parent), prefix=".mcp.json.", suffix=".tmp"
+                dir=str(target.parent), prefix=TEMPORARY_PREFIX, suffix=".tmp"
             )
+            # **先收紧权限，再写内容**：`mkstemp` 给的是 `0600`，已经不比目标宽，但把
+            # `fchmod` 提到写入之前，磁盘上带令牌的那一刻起权限就已经是最终值。用
+            # `fchmod` 而不是按路径 `chmod`：作用于已经打开的这个文件描述符，中间没有
+            # 任何"按名字再找一次"的窗口（将来补 `chown` 时同一条理由更要紧）。
+            os.fchmod(descriptor, self._file_mode)
             handle = os.fdopen(descriptor, "w", encoding="utf-8")
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
             handle.close()
             handle = None
-            os.chmod(temporary, self._file_mode)
             os.replace(temporary, target)
             temporary = None
         except OSError as error:
