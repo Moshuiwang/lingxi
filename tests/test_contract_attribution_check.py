@@ -313,5 +313,140 @@ class RealRepositoryTest(unittest.TestCase):
         self.assertEqual(len(exceptions), 5, exceptions)
 
 
+class MetaExclusionDoesNotSwallowRealAssertionsTest(unittest.TestCase):
+    """M1（2026-08-19 三方复查最后一轮）：元排除此前是"整行出现过就整行跳过"，
+    一句话前半下断言、后半指向覆盖清单会让整行连同真实断言一起消失。"""
+
+    def test_a_line_with_both_a_real_assertion_and_meta_vocabulary_is_still_caught(self) -> None:
+        with _tmp_file("产品合同要求凭据不得入库；详见合同条款覆盖清单。\n") as path:
+            hits = CHECK.find_triggered_lines(path)
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn("产品合同要求凭据不得入库", hits[0][1])
+
+    def test_a_purely_meta_line_is_still_excluded(self) -> None:
+        with _tmp_file("### 10.3 合同条款覆盖清单\n") as path:
+            self.assertEqual(CHECK.find_triggered_lines(path), [])
+
+
+class HtmlCommentsAreSkippedTest(unittest.TestCase):
+    """M3：合同文档里注释掉的旧标题不应被当成仍然存在的真实章节。"""
+
+    def test_a_heading_inside_an_html_comment_block_does_not_count(self) -> None:
+        text = (
+            "# 产品合同与外部边界\n\n"
+            "## 真实章节\n正文。\n\n"
+            "<!--\n## 已删除的旧章节\n旧正文，改名前留作参考。\n-->\n\n"
+            "## 另一节\n正文。\n"
+        )
+        sections = CHECK.contract_sections(text)
+        self.assertIn("真实章节", sections)
+        self.assertIn("另一节", sections)
+        self.assertNotIn("已删除的旧章节", sections)
+
+    def test_a_single_line_self_contained_comment_does_not_hide_a_real_heading_before_it(self) -> None:
+        text = "## 真标题 <!-- 备注 -->\n"
+        self.assertEqual(CHECK.contract_sections(text), {"真标题"})
+
+
+class OccurrenceCountMatchingTest(unittest.TestCase):
+    """M4：登记表按出现次数核对，不是"这一行文本在集合里就算"——把已登记的
+    整行复制到同文件另一处，多出来的那次出现必须被单独判红。
+    """
+
+    def _patched_tracked_files(self, extra: Path):
+        real_tracked_files = CHECK.tracked_files
+
+        def patched():
+            return real_tracked_files() + [extra]
+
+        return patched
+
+    def test_a_duplicated_registered_line_flags_only_the_excess_occurrence(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = Path(tmp) / "dup.py"
+            extra.write_text(
+                "合同要求这行是唯一登记过的原文\n"
+                "# 中间的无关内容\n"
+                "合同要求这行是唯一登记过的原文\n",
+                encoding="utf-8",
+            )
+            display_path = CHECK._display_path(extra)
+            fake = CHECK.GroundedAttribution(
+                display_path, "合同要求这行是唯一登记过的原文", "问数与多轮对话"
+            )
+            original_grounded = CHECK.GROUNDED_ATTRIBUTIONS
+            CHECK.GROUNDED_ATTRIBUTIONS = original_grounded + (fake,)
+            original_tracked = CHECK.tracked_files
+            CHECK.tracked_files = self._patched_tracked_files(extra)
+            try:
+                failures, _exceptions, _summary = CHECK.evaluate()
+            finally:
+                CHECK.GROUNDED_ATTRIBUTIONS = original_grounded
+                CHECK.tracked_files = original_tracked
+        dup_failures = [f for f in failures if "dup.py" in f and "出现次数配额" in f]
+        self.assertEqual(len(dup_failures), 1, failures)
+        self.assertIn(":3：", dup_failures[0])  # 第 3 行才是超出配额的重复出现
+
+
+class ExceptionFieldContentValidationTest(unittest.TestCase):
+    """M5：例外字段不能只是非空占位符——来源必须是「Issue #数字」/「PR #数字」
+    格式，裁定日期必须是合法 ISO 日期，理由不能是空字符串。"""
+
+    def test_placeholder_values_are_rejected_on_every_field(self) -> None:
+        bad = CHECK.RegisteredException(
+            "src/lingxi/core/ids.py", "这一整行显然不存在于 ids.py 里__m5_test", "x", "x", "x", ""
+        )
+        original = CHECK.REGISTERED_EXCEPTIONS
+        CHECK.REGISTERED_EXCEPTIONS = original + (bad,)
+        try:
+            failures, _exceptions, _summary = CHECK.evaluate()
+        finally:
+            CHECK.REGISTERED_EXCEPTIONS = original
+        self.assertTrue(any("不是" in f and ("Issue" in f or "PR" in f) for f in failures), failures)
+        self.assertTrue(any("日期" in f for f in failures), failures)
+        self.assertTrue(any("reason" in f and "空字符串" in f for f in failures), failures)
+
+    def test_a_well_formed_exception_passes_field_validation(self) -> None:
+        good = CHECK.RegisteredException(
+            "src/lingxi/core/ids.py",
+            "这一整行显然不存在于 ids.py 里__m5_test_good",
+            "Issue #999",
+            "2026-08-19",
+            "产品负责人",
+            "自测夹具，非真实例外。",
+        )
+        original = CHECK.REGISTERED_EXCEPTIONS
+        CHECK.REGISTERED_EXCEPTIONS = original + (good,)
+        try:
+            failures, _exceptions, _summary = CHECK.evaluate()
+        finally:
+            CHECK.REGISTERED_EXCEPTIONS = original
+        # 字段格式本身合法；唯一还会报的失败应该是"摘录在源文件里找不到"
+        # （这条夹具文本本来就不存在于 ids.py），证明字段校验没有误伤合法输入。
+        format_failures = [
+            f for f in failures if "不是" in f or ("日期" in f and "不合法" not in f) or "空字符串" in f
+        ]
+        self.assertEqual(format_failures, [], failures)
+
+
+class ExpandedTriggerRegexFamilyTest(unittest.TestCase):
+    """M6：触发词从固定短语清单改成正则族，新出现的归属动词（此前清单里没有
+    的"禁止""指出"，以及"依据产品合同"这类前缀写法）应当自动被捞到，不需要
+    再往清单里逐个添加短语。"""
+
+    def test_previously_unlisted_suffix_verbs_are_caught(self) -> None:
+        content = "产品合同禁止这么做。\n产品合同指出另一件事。\n"
+        with _tmp_file(content) as path:
+            hits = CHECK.find_triggered_lines(path)
+        self.assertEqual(len(hits), 2, hits)
+
+    def test_prefix_form_with_a_verb_not_in_the_old_fixed_list_is_caught(self) -> None:
+        with _tmp_file("依据产品合同，这里必须这样处理。\n") as path:
+            hits = CHECK.find_triggered_lines(path)
+        self.assertEqual(len(hits), 1, hits)
+
+
 if __name__ == "__main__":
     unittest.main()

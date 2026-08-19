@@ -66,18 +66,25 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DOCUMENT = REPOSITORY_ROOT / "docs" / "产品合同与外部边界.md"
 
-# 归属触发词：本仓库里明确"把这句话的权威记成产品合同"的写法。2026-08-19 按
-# 三路独立复查的实测结果（真的在仓库里找到了漏网断言）从两个短语扩到八个。
+# 归属触发词：本仓库里明确"把这句话的权威记成产品合同"的写法。M6（2026-08-19
+# 三方复查最后一轮）指出：维护一份固定短语清单永远会漏——从两个短语扩到八个
+# 之后，"产品合同禁止…""产品合同指出…""依据产品合同…"这类没进清单的写法
+# 仍然逃逸。改成一条正则族：「(产品合同｜合同) + 可选"明确" + 归属动词」覆盖
+# 后缀写法（"合同要求""合同明确排除"……），「按/依据/根据 + 合同」覆盖前缀
+# 写法（"按合同""依据产品合同"……）。新出现的归属动词只要落在这两族里就会
+# 被自动捞到，不必再逐个补短语。
 # 不匹配裸的"合同"——本仓库大量使用"合同"表示模块自身的接口/服务合同
 # （软件工程含义，如"OnboardingRunner.start 的服务合同"），那不是在对产品
 # 合同文档做归属声明，不属于本门禁的核对范围。
 TRIGGER_PATTERN = re.compile(
-    "合同要求|合同明令|合同明确要求|合同规定|合同约定|合同条款|合同明确排除|按合同"
+    r"(?:产品合同|合同)(?:明确)?(?:要求|规定|明令|禁止|约定|条款|指出|依据|排除)"
+    r"|(?:按|依据|根据)(?:产品)?合同"
 )
 
 # 「合同条款」这个短语在本仓库还有另一个完全不同的含义：验收矩阵.md 与
@@ -112,6 +119,9 @@ HEADING = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 # 要求"四个字）去"覆盖"未来任何一行恰好包含它的新增内容。配合下方改成的
 # 整行精确匹配，这条主要是防止有人直接拿触发词本身当登记内容。
 MIN_EXCERPT_LENGTH = 8
+
+# M5：例外的「来源」必须是可点击追溯的 Issue/PR 编号，不接受任意字符串。
+EXCEPTION_SOURCE_PATTERN = re.compile(r"^(Issue|PR) #\d+$")
 
 
 class AttributionCheckError(ValueError):
@@ -149,6 +159,21 @@ class RegisteredException:
 # ---------------------------------------------------------------------------
 
 GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
+    GroundedAttribution(
+        "docs/技术设计/代码框架.md",
+        '- 测试资产中已被受控验证过的模式（如加密轮换 `refresh_token`、`open_id` 定位共享范围成员）是正式实现的参考输入，但正式代码按产品合同与技术设计重写，不直接把测试资产改名上线。',
+        "产品合同与外部边界",
+    ),
+    GroundedAttribution(
+        "docs/技术设计/验收矩阵.md",
+        '**本组不覆盖什么。** 真实群通知与真实花名册读取属 L4a，两者都**未验证（证据等级 1）**：`FeishuGroupMessages` 与花名册 reader 的全部断言跑在注入的假传输层上，与 `adapters/feishu_directory.py` 同一姿态；真实读取所需的专用主体凭据自 2026-08-09 起未落盘（Issue #52 的 G-READ 判定，E1-A 授权码被烧事故的直接后果），真实面改依赖后续的 bootstrap 重授权切片。持久快照的**接线**已由 S-B-04 完成（`V-花名册-47/48`）：快照链挂进了每日日报职责，保旧告警事实接到 scheduler 的结构化警告日志，面向管理员的提醒走日报本身——`core/alerting.py` 的状态机只认心跳、任务滞留与发送连续失败三类信号，刻意没有为快照新鲜度新增第四类。**花名册读取所用的短期令牌供给已由 [#215](https://github.com/Moshuiwang/lingxi/issues/215) 接上**（方案 C 主接线，产品负责人 2026-08-18 裁定接受按日消费节奏，留痕见 [#203 决策评论](https://github.com/Moshuiwang/lingxi/issues/203#issuecomment-5321623142) 第 7 项）：凭据轮换职责**仍是一次性 `refresh_token` 的唯一消费者**，它按需消费一次并把派生的短期 `access_token` 放进**进程内**持有者（不落盘、不进日志与审计，重启即空），日报侧按新鲜度取用。消费频率随之从约 5.6 天一次变成按日一次，上界由两道守卫钉住——进程内的每日预算，以及随凭据落盘、进程重启也抹不掉的 `refresh_consumed_at`（在文件锁内、置位消费标记之前判定）。因此 `V-花名册-29` 的第四个前置现在只取决于配置：三个环境变量配齐即注册。**这一段全部是 L2 事实**：真实续期返回的短期令牌寿命、真实按日消费节奏与真实日报送达仍属 L4a、未验证。部门比对与账号状态落库由定案排除；账号复用换人的自动拦截由 [#34](https://github.com/Moshuiwang/lingxi/issues/34) 永久排除；群内处置由合同排除；`audit_event` 表属 S9，当前审计走结构化日志。',
+        "不提供",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/execution/input_safety.py",
+        '核对更正，见 Issue #238）；但"不伪装成功"这个动机本身确有合同依据（结果',
+        "交付规则",
+    ),
     GroundedAttribution(
         "docs/参考证据/MVP联合验收执行卡.md",
         '| E9 | 五类确定性无权限分支中另四类 + MCP 同步节奏的**窗口前**工程级证据（不是窗口内证据，也不能替代真实 Stage 等待） | 阶段②的 N1 只真实走通「查无对应记录」这一类；「同一人员ID多行」「双键冲突」「资料不完整」「无支持职能」四类，用与生产同一份判定函数核对的合成夹具在**窗口前**跑通，不占用产品负责人时间、也不需要为每一类另找一个真实测试账号，属 **L3**（合成输入 + 生产判定函数，不是 L4a，收口时单列，不并入 L4a 计数）。**MCP 同步「最多十五分钟」节奏的最小合法配置只用于这份夹具自己的纯单测**，已核实无法注入真实 Stage 进程（`ReadinessSchedule` 由调用方在代码里构造，不读环境变量；已知唯一运行期覆盖点 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS` 只改探针超时，不改轮询间隔与总预算）——真实 Stage 窗口里的十五分钟等待要么按合同真等（阶段②已按此设计耗时预算），要么本轮不覆盖，**不得**暗示这份夹具能让窗口内的真实等待变短 | 见 [`scripts/acceptance_fixtures_identity.py`](../../scripts/acceptance_fixtures_identity.py) 与其[契约测试](../../tests/test_acceptance_fixtures_identity_contract.py) |',
@@ -530,9 +555,39 @@ def tracked_files() -> list[Path]:
 
 
 def contract_sections(text: str) -> set[str]:
+    """解析合同文档的标题集合，跳过代码围栏与 HTML 注释块。
+
+    M3（2026-08-19 外部复核实测坐实）：此前只跳过代码围栏，没跳过 HTML 注释
+    ``<!-- ... -->``。编辑合同时把某一节临时注释掉是常见动作，若注释块里
+    恰好留了一份同名标题（例如改名前的旧标题被注释保留做参考），门禁会把
+    这份"已经不是合同正文"的注释当成真实章节，核对照样判绿。跳过位置与
+    代码围栏同一层级——两者都是"看起来像标题但不是正文"的容器。
+    """
+
     sections: set[str] = set()
     in_fence = False
-    for line in text.splitlines():
+    in_comment = False
+    for raw_line in text.splitlines():
+        line = raw_line
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+                line = line[line.index("-->") + len("-->") :]
+            else:
+                continue
+        # 一行内可能有多段注释（含跨行注释的收尾）；逐个去掉自封闭的
+        # `<!-- ... -->` 片段，剩余文本才拿去判断是否进入跨行注释状态。
+        while "<!--" in line:
+            start = line.index("<!--")
+            end_marker = line.find("-->", start)
+            if end_marker == -1:
+                line = line[:start]
+                in_comment = True
+                break
+            line = line[:start] + line[end_marker + len("-->") :]
+        if in_comment:
+            if not line.strip():
+                continue
         if line.lstrip().startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
@@ -564,7 +619,14 @@ def find_triggered_lines(path: Path) -> list[tuple[int, str]]:
     hits = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
-        if TRIGGER_PATTERN.search(stripped) and not META_EXCLUDE_PATTERN.search(stripped):
+        # M1（2026-08-19 外部复核实测坐实）：此前是"整行只要出现过元排除短语
+        # 就整行跳过"——一句话完全可以前半下断言、后半指向覆盖清单
+        # （例如"产品合同要求凭据不得入库；详见合同条款覆盖清单。"），旧逻辑
+        # 会把这整行当成元文本，真实断言随之静默消失。改成只**挖掉**元排除
+        # 短语本身，再检查剩下的文本是否还含有真实触发词；只有整行**就是**
+        # 元文本（挖掉后不剩其他触发词）才跳过。
+        masked = META_EXCLUDE_PATTERN.sub("", stripped)
+        if TRIGGER_PATTERN.search(masked):
             hits.append((line_number, stripped))
     return hits
 
@@ -623,6 +685,27 @@ def evaluate() -> tuple[list[str], list[str], str]:
                 f"例外登记 {exception.file} 缺少来源 Issue/PR、裁定日期或裁定人三项之一——"
                 "例外必须能被追溯，不能只写理由。"
             )
+        # M5（2026-08-19 外部复核实测坐实）：此前只检查三个字段"非空字符串"，
+        # `source="x"`、`decided_on="x"`、`decided_by="x"`、`reason=""` 就能
+        # 通过——字段存在不等于内容可追溯。补上格式与内容校验。
+        elif not EXCEPTION_SOURCE_PATTERN.match(exception.source):
+            failures.append(
+                f"例外登记 {exception.file} 的来源 {exception.source!r} 不是 "
+                "「Issue #数字」或「PR #数字」这类可追溯的格式。"
+            )
+        if exception.decided_on:
+            try:
+                date.fromisoformat(exception.decided_on)
+            except ValueError:
+                failures.append(
+                    f"例外登记 {exception.file} 的裁定日期 {exception.decided_on!r} "
+                    "不是合法的 ISO 日期（YYYY-MM-DD，且必须是真实存在的日期）。"
+                )
+        if exception.reason is not None and not exception.reason.strip():
+            failures.append(
+                f"例外登记 {exception.file} 的 reason 是空字符串——"
+                "例外必须写清楚为什么对不上合同正文，不能只有来源三项、没有理由本身。"
+            )
 
     file_texts: dict[str, str] = {}
 
@@ -647,27 +730,36 @@ def evaluate() -> tuple[list[str], list[str], str]:
                     f"—— {exception.line!r}"
                 )
 
-    # 每一处「合同要求/合同明令」都必须与登记表或例外表里的某一条**逐字相等**。
-    covered_lines_by_file: dict[str, set[str]] = {}
+    # 每一处「合同要求/合同明令」都必须与登记表或例外表里的某一条**逐字相等**，
+    # 且按**出现次数**核对，不是"集合包含即算"（M4，2026-08-19 外部复核）：
+    # 把一行已登记的原文复制到同文件另一处，旧的"是否在集合里"判定拿复制出来
+    # 的那一份照样能匹配上——集合不区分"这条登记覆盖了几次出现"。改成配额制：
+    # 每条登记只能兑现登记时核对过的**那一次**出现，同一段文本在文件里比登记
+    # 次数多出来的那些新增出现，各自都要重新登记，不能蹭已核对过的旧配额。
+    remaining_budget: dict[tuple[str, str], int] = {}
     for grounded in GROUNDED_ATTRIBUTIONS:
-        covered_lines_by_file.setdefault(grounded.file, set()).add(grounded.line)
+        key = (grounded.file, grounded.line)
+        remaining_budget[key] = remaining_budget.get(key, 0) + 1
     for exception in REGISTERED_EXCEPTIONS:
-        covered_lines_by_file.setdefault(exception.file, set()).add(exception.line)
+        key = (exception.file, exception.line)
+        remaining_budget[key] = remaining_budget.get(key, 0) + 1
 
     triggered_total = 0
     for path in tracked_files():
         relative = _display_path(path)
         for line_number, line in find_triggered_lines(path):
             triggered_total += 1
-            covered = covered_lines_by_file.get(relative, set())
-            if line not in covered:
-                failures.append(
-                    f"{relative}:{line_number}：出现「合同要求」类归属短语但未登记"
-                    f"（逐字匹配，不是包含即算）——{line!r}。请先核对它是否真的对应"
-                    "产品合同正文，再登记进 scripts/ci/check_contract_attribution.py 的 "
-                    "GROUNDED_ATTRIBUTIONS（对上了）或 REGISTERED_EXCEPTIONS"
-                    "（对不上、且不能擅自改写归属时）。"
-                )
+            key = (relative, line)
+            if remaining_budget.get(key, 0) > 0:
+                remaining_budget[key] -= 1
+                continue
+            failures.append(
+                f"{relative}:{line_number}：出现「合同要求」类归属短语但未登记（或已经"
+                f"超出登记表里这句原文的出现次数配额）——{line!r}。请先核对它是否真的"
+                "对应产品合同正文，再登记进 scripts/ci/check_contract_attribution.py 的 "
+                "GROUNDED_ATTRIBUTIONS（对上了）或 REGISTERED_EXCEPTIONS"
+                "（对不上、且不能擅自改写归属时）。"
+            )
 
     exception_notes = [
         f"- {exception.file}：{exception.line!r}\n"
