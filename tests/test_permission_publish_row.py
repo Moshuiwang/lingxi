@@ -38,6 +38,7 @@ from lingxi.core.permission.publish_row import (
     PublishRow,
     aggregate_permission,
     build_publish_row,
+    build_translated_publish_row,
     compare_readback,
     format_updated_at,
     is_cipher_shaped,
@@ -45,6 +46,7 @@ from lingxi.core.permission.publish_row import (
     parse_permissions,
     readback_text,
     serialize_permissions,
+    serialize_translated_permissions,
 )
 
 #: biai-agent 加密规格 v1 的**公开测试向量密文**（非生产密钥、非生产令牌）。
@@ -319,6 +321,161 @@ class MetricNameSensitivityTest(unittest.TestCase):
     def test_naive_time_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             format_updated_at(datetime(2026, 8, 17, 3, 0))
+
+
+class TranslatedSerializationTest(unittest.TestCase):
+    """:func:`serialize_translated_permissions`（Issue #227 翻译层的姊妹序列化函数）。
+
+    与 ``SerializationTest``/``MetricNameSensitivityTest`` 对 ``serialize_permissions``
+    的覆盖对称：证明「值列表逐字符原样透传」与「恒等序列化」这两条纪律在翻译层之后
+    依然成立——只是输入形状从「一份职能列表套所有公司」换成了「每个公司一份可能
+    不同的指标名列表」。
+    """
+
+    def test_each_company_can_carry_a_different_metric_list(self) -> None:
+        text = serialize_translated_permissions({"1011": ["日活", "收入"], "1012": ["日活"]})
+
+        self.assertEqual(text, '{"1011":["日活","收入"],"1012":["日活"]}')
+
+    def test_company_keys_are_sorted_same_as_the_untranslated_path(self) -> None:
+        text = serialize_translated_permissions({"9": ["日活"], "10": ["日活"]})
+
+        self.assertEqual(text, '{"10":["日活"],"9":["日活"]}')
+
+    def test_a_wildcard_company_key_passes_through_like_any_other_key(self) -> None:
+        text = serialize_translated_permissions({ALL_COMPANIES_KEY: ["日活"]})
+
+        self.assertEqual(text, '{"*":["日活"]}')
+
+    def test_case_difference_produces_a_different_payload(self) -> None:
+        upper = serialize_translated_permissions({"1011": ["OTT"]})
+        lower = serialize_translated_permissions({"1011": ["ott"]})
+
+        self.assertNotEqual(upper, lower)
+        self.assertIn('"OTT"', upper)
+        self.assertIn('"ott"', lower)
+
+    def test_full_width_characters_survive_verbatim(self) -> None:
+        text = serialize_translated_permissions({"1011": ["ＯＴＴ"]})
+
+        self.assertIn('"ＯＴＴ"', text)
+        self.assertNotEqual(text, serialize_translated_permissions({"1011": ["OTT"]}))
+
+    def test_surrounding_whitespace_is_not_trimmed(self) -> None:
+        text = serialize_translated_permissions({"1011": [" 日活 "]})
+
+        self.assertIn('" 日活 "', text)
+
+    def test_chinese_metric_names_are_not_escaped(self) -> None:
+        text = serialize_translated_permissions({"1011": ["日活"]})
+
+        self.assertIn('"日活"', text)
+        self.assertNotIn("\\u", text)
+
+    def test_none_and_non_string_entries_fail_loudly(self) -> None:
+        for bad in (None, 123, ("日活",), ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    serialize_translated_permissions({"1011": [bad]})  # type: ignore[list-item]
+
+    def test_an_empty_metric_list_for_any_company_is_rejected(self) -> None:
+        """写侧不产出空列表——与 ``serialize_permissions`` 的
+        ``test_writer_side_never_produces_an_empty_value_list`` 同一条纪律。"""
+
+        with self.assertRaises(ValueError):
+            serialize_translated_permissions({"1011": []})
+
+    def test_completely_empty_input_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            serialize_translated_permissions({})
+
+    def test_a_blank_company_key_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            serialize_translated_permissions({"": ["日活"]})
+
+    def test_serialization_is_byte_identical_regardless_of_dict_insertion_order(self) -> None:
+        """恒等序列化：字典插入次序不影响输出字节（读回按字符串比对的前提）。"""
+
+        forward = serialize_translated_permissions({"1011": ["日活", "收入"], "1012": ["日活"]})
+        reversed_input = serialize_translated_permissions(
+            {"1012": ["日活"], "1011": ["日活", "收入"]}
+        )
+
+        self.assertEqual(forward, reversed_input)
+
+    def test_output_matches_the_untranslated_path_when_every_company_shares_one_list(self) -> None:
+        """当每个公司恰好拿到同一份值列表时（翻译层的一种特殊情形），产出的字节形态
+        与既有的 ``serialize_permissions`` 完全一致——两个函数出自同一套序列化纪律，
+        不是两套互相独立的格式。"""
+
+        aggregate = PermissionAggregate(
+            granted=True, reason="granted", companies=("1011", "1012"), functions=("OTT", "商务")
+        )
+
+        self.assertEqual(
+            serialize_permissions(aggregate),
+            serialize_translated_permissions({"1011": ["OTT", "商务"], "1012": ["OTT", "商务"]}),
+        )
+
+
+class TranslatedPublishRowTest(unittest.TestCase):
+    """:func:`build_translated_publish_row`：翻译产物结算成发布行。"""
+
+    def _row(self, *, token_cipher: str | None = None) -> PublishRow:
+        return build_translated_publish_row(
+            company_metrics={"1011": ["日活", "收入"]},
+            email=" Jia.Ming@Example.INVALID ",
+            display_name="化名甲",
+            decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            token_cipher=token_cipher,
+        )
+
+    def test_permissions_carries_the_translated_metrics_not_the_function_label(self) -> None:
+        row = self._row()
+
+        self.assertEqual(row.permissions, '{"1011":["日活","收入"]}')
+
+    def test_record_key_and_email_share_the_normalized_value(self) -> None:
+        row = self._row()
+
+        self.assertEqual(row.record_key, "jia.ming@example.invalid")
+        self.assertEqual(row.email, "jia.ming@example.invalid")
+
+    def test_missing_email_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_translated_publish_row(
+                company_metrics={"1011": ["日活"]},
+                email="   ",
+                display_name="化名甲",
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            )
+
+    def test_missing_display_name_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_translated_publish_row(
+                company_metrics={"1011": ["日活"]},
+                email="jia.ming@example.invalid",
+                display_name="  ",
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            )
+
+    def test_uncovered_translation_input_cannot_produce_a_row(self) -> None:
+        """空的翻译产物构造不出发布行——调用方必须先经过翻译层的 fail-closed 出口，
+        不能把"翻译失败"悄悄伪装成"翻译出一个空权限"。"""
+
+        with self.assertRaises(ValueError):
+            build_translated_publish_row(
+                company_metrics={},
+                email="jia.ming@example.invalid",
+                display_name="化名甲",
+                decided_at=datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc),
+            )
+
+    def test_token_cipher_is_optional_like_the_untranslated_path(self) -> None:
+        row = self._row(token_cipher=TOKEN_CIPHER)
+
+        self.assertEqual(row.token_cipher, TOKEN_CIPHER)
+        self.assertIsNone(self._row().token_cipher)
 
 
 class PublishRowTest(unittest.TestCase):

@@ -97,6 +97,10 @@ EMAIL = {user: f"person{index}@example.invalid" for index, user in enumerate(PER
 NAME = {user: f"化名{index}" for index, user in enumerate(PERSONNEL, start=1)}
 
 ROLE_FUNCTION_MAP = {"A运营": "运营"}
+#: 翻译层（Issue #227）测试夹具：覆盖合成导出用到的唯一「公司 + 职能」组合
+#: （``BC-甲`` + ``运营``）。指标名是虚构占位，不对应任何真实指标。
+METRIC_NAME = "示例指标-日活"
+METRIC_TRANSLATION_MAP = {"BC-甲": {"运营": (METRIC_NAME,)}}
 
 
 def _galaxy_tables() -> dict[str, list[dict[str, str]]]:
@@ -245,7 +249,7 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
     def _token_store(self) -> PostgresMcpTokenStore:
         return PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
 
-    def _duty(self) -> PermissionRefreshDuty:
+    def _duty(self, *, metric_translation_map=None) -> PermissionRefreshDuty:
         publish_store = PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
             baseline_reader=PostgresRosterBaselineReader(self._dsn),
@@ -255,6 +259,9 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             publish_history=publish_store,
             token_ciphers=self._token_store(),
             role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=(
+                METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+            ),
             audit=self.audit,
             clock=self.clock,
         )
@@ -353,7 +360,9 @@ class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
             payload = cursor.fetchone()[0]
         self.assertEqual(payload["token_cipher"], issued.token_cipher)
         self.assertEqual(payload["record_key"], EMAIL[ACTIVE_USER])
-        self.assertEqual(payload["permissions"], '{"BC-甲":["运营"]}')
+        # 翻译层（Issue #227）接线之后，写进 outbox payload 的是翻译产物（指标名），
+        # 不是聚合层的原始职能标签「运营」。
+        self.assertEqual(payload["permissions"], f'{{"BC-甲":["{METRIC_NAME}"]}}')
         self.assertNotIn(issued.reveal(), str(payload), "令牌明文一步都不进 outbox")
 
 
@@ -476,6 +485,34 @@ class RevokedUserTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(payload["permissions"], "{}")
         self.assertEqual(payload["status"], "approved")
         self.assertNotIn("token_cipher", payload, "撤权快照只有六个字段，密文一个字不动")
+
+    def test_a_revocation_is_blocked_when_the_translation_map_is_empty(self) -> None:
+        """P1（外部独立审查 2026-08-18 坐实、真库对照）：翻译映射为空时，一个已经
+        发布过、如今 ``granted=False`` 的用户，撤权意图同样排不出来——真库层面的
+        证据是 ``publish_outbox`` 不多一行、``app_user.permission_version`` 不推进。
+        与上一条用例（映射非空）唯一的差异只有 ``metric_translation_map={}``。
+        """
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        duty = self._duty()
+        duty.run_once()
+        self._publish_current_intent()
+        self._drop_roles()
+
+        # 第二天再跑一轮：这一次聚合是「无可用权限」，但翻译映射清空了。
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        version_before = self._version(ACTIVE_USER)
+        outbox_before = self._outbox()
+
+        report = self._duty(metric_translation_map={}).run_once()
+
+        self.assertIsNone(report, "整轮判据不成立时不产出报告")
+        self.assertEqual(self._version(ACTIVE_USER), version_before, "撤权不得推进权限版本")
+        self.assertEqual(self._outbox(), outbox_before, "publish_outbox 不得多出撤权那一行")
 
     def test_repeating_the_revocation_changes_nothing(self) -> None:
         """幂等：第二次撤权判 ``UNCHANGED``，不推进版本、不排第二条意图。"""
