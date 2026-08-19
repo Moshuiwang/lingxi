@@ -53,6 +53,18 @@ python3 scripts/ci/check_project_skills.py
 # 验收矩阵的三态状态列与合同条款覆盖清单。这两样此前只是散文约定：
 # 断言可以没人认领、合同可以新增一节而没有任何断言，门禁照样全绿。
 python3 scripts/ci/check_acceptance_matrix.py
+# 代码框架第一节「文件体量棘轮」（Issue #238）：已超过阈值（1500 行）的文件登记在
+# scripts/ci/size_ratchet_baseline.txt 里，只许变小、不许变大；未超阈值的文件不得
+# 新超过阈值。基线由 --refresh 生成，拒绝被手工调大——见该脚本头注释。
+python3 scripts/ci/check_size_ratchet.py
+# 代码框架「二、三层之间的 import 规则」第一条（Issue #238）：core/ 不得 import
+# adapters/、apps/ 或任何外部 SDK。用 ast 遍历整棵树，含函数内延迟导入。
+python3 scripts/ci/check_core_layering.py
+# 代码框架「三、横切约定」的归属核对（Issue #238）：把某句规则的权威记成产品合同
+# 本身的断言必须能在 docs/产品合同与外部边界.md 正文里找到对应，找不到就红——这道
+# 门禁挡的正是"凭据不进用户环境"这类被错记成合同条款的笔误（代码框架第三节，
+# 2026-08-19 归属核对更正）。
+python3 scripts/ci/check_contract_attribution.py
 # Issue #75：正式 PostgreSQL 连接必须走唯一工厂，迁移入口必须有独立且有限的连接参数。
 # 该检查登记在 #75 的共享位置；#76 的制品 / 进程依赖清单检查按编排者约定后续追加。
 python3 scripts/ci/check_db_timeouts.py
