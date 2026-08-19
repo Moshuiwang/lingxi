@@ -350,6 +350,15 @@ def _build_readiness_follow_up(
     ``QueryMcpProbe(timeout_seconds=…)`` 都取 ``config.query_mcp_timeout_seconds``。
     两边不一致时，就绪那一侧算出来的"结论最晚什么时候落地"就是假的，因此这里在装配后
     立刻断言相等——装配层的错配不该等到生产才暴露。
+
+    **探针的 ``metrics_reader`` 显式注入为已验证的
+    :func:`~lingxi.adapters.query_mcp_probe.content_text_metrics_reader`**（Issue #253）：
+    2026-08-19 对真实问数 MCP 的第一次实测（``docs/参考证据/问数MCP-list_metrics真实响应形状.md``）
+    发现返回里没有 ``structuredContent``，指标挂在 ``result.content[0].text`` 的一段
+    JSON 字符串里；``QueryMcpProbe`` 默认的 :func:`~lingxi.adapters.query_mcp_probe.default_metrics_reader`
+    只认前者，因此不注入的话就绪探针在真实 MCP 上会**永远**技术失败。
+    ``default_metrics_reader`` 本身不改——保留它作为"真实形状还没实测时"的收窄兜底，
+    这里只是**装配层按证据放宽**，而不是放宽默认值本身。
     """
 
     if not config.mcp_token_encrypt_key:
@@ -369,7 +378,7 @@ def _build_readiness_follow_up(
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
-    from lingxi.adapters.query_mcp_probe import QueryMcpProbe
+    from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
     from lingxi.core.permission.mcp_readiness import ReadinessTicker
     from lingxi.core.permission.notification import PermissionNoticeDispatcher
 
@@ -385,6 +394,9 @@ def _build_readiness_follow_up(
             endpoint=config.query_mcp_endpoint,
             token_provider=token_cipher_provider(tokens),
             timeout_seconds=config.query_mcp_timeout_seconds,
+            # 已验证的 reader（Issue #253 / L4a）：真实 MCP 的 list_metrics 返回没有
+            # structuredContent，见本函数文档与 docs/参考证据/问数MCP-list_metrics真实响应形状.md。
+            metrics_reader=content_text_metrics_reader,
         )
         if probe.timeout_seconds != schedule.probe_timeout_seconds:  # pragma: no cover - 装配自证
             raise RuntimeError(
