@@ -365,7 +365,10 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "开通流程",
     ),
     GroundedAttribution(
-        "src/lingxi/adapters/postgres_conversation.py",
+        # 2026-08-19 #247 把 postgres_conversation.py 拆成包，这段文字随之
+        # 搬到了 _transaction.py——登记表路径已同步更新（第二次真实腐烂被
+        # 真实触发，同一批次第一次是 #237 搬走 alerting_assembly.py 那段）。
+        "src/lingxi/adapters/postgres_conversation/_transaction.py",
         "清掉——合同规定忙碌期的 `/new` 只该得到提示。",
         "问数与多轮对话",
     ),
