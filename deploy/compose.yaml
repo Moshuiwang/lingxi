@@ -45,7 +45,7 @@ services:
     #
     # 150 秒的算法（三项相加再留余量）：
     #   20.0s  续期 HTTP 超时     REQUEST_TIMEOUT_SECONDS，adapters/feishu_directory.py:33
-    #    4.2s  落盘重试退避等待   SAVE_RETRY_BACKOFF_SECONDS=(0.2,1.0,3.0)，apps/scheduler/__init__.py:41
+    #    4.2s  落盘重试退避等待   SAVE_RETRY_BACKOFF_SECONDS=(0.2,1.0,3.0)，apps/scheduler/credential_rotation.py:39
     #   75.0s  数据库往返预算     5 次操作（4 次 save 重试 + 1 次 revoke），
     #                             每次最坏 = MAX_TIMEOUT_SECONDS 5s（建连）+
     #                             5s（语句）+ 5s（提交）

@@ -347,7 +347,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation",
             "lingxi.core",
             "lingxi.core.identity",
-            # 花名册日报的短期令牌供给（Issue #215）：`apps/scheduler/__init__.py`
+            # 花名册日报的短期令牌供给（Issue #215）：由 `apps/scheduler/credential_
+            # rotation.py` 与 `apps/scheduler/assembly.py`（#237 拆分后的新位置）
             # 模块级 import，是常驻 scheduler 起进程就要用到的那一条。
             "lingxi.core.identity.access_token_supply",
             "lingxi.core.identity.credentials",

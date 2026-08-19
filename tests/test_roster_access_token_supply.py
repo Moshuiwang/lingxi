@@ -243,7 +243,11 @@ class NoSecondCeilingCopyTest(unittest.TestCase):
             self.assertNotIn(banned, names, f"{banned} 是账本副本残留")
 
     def test_the_rotation_duty_keeps_no_daily_ledger(self) -> None:
-        source = (SOURCE_ROOT / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `CredentialRotationLoop`（唯一可能重新长出账本副本的地方）搬进了
+        # credential_rotation 子模块，不再是包的 __init__.py（那里现在只剩重导出）。
+        source = (
+            SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py"
+        ).read_text(encoding="utf-8")
 
         for banned in ("DailyRefreshBudget", "_budget", "daily_refresh_budget_exhausted"):
             self.assertNotIn(banned, source, f"{banned} 是账本副本残留")
