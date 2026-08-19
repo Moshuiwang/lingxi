@@ -125,6 +125,19 @@ class WorkerConfig:
     # ``$HOME/.claude/projects`` 推导默认根目录，见 apps/worker/session_cleanup.py。
     session_root: str | None = None
     session_cleanup_batch_limit: int = 20
+    # 用户环境根目录（Epic D 闸⑥）：queue 模式处理每个任务时，按任务的
+    # ``user_id`` 读 ``<user_env_root>/<user_id>/.mcp.json``，把解析结果作为这一
+    # 次会话专属的 ``mcp_servers``——见 ``apps/worker/service.py``。**不带
+    # ``LINGXI_WORKER_`` 前缀**：与 scheduler 侧
+    # （``apps/scheduler/config.py`` 的 ``user_env_root``）读同一个裸变量名
+    # ``LINGXI_USER_ENV_ROOT``，两个进程指向同一个持久卷挂载点，避免出现"两个
+    # 进程各自配了不同目录"的部署漂移。此处仍是**可选**字段（校验姿态照抄
+    # scheduler 侧 ``optional_identifier``）：`turn`（一次性受控回合）模式不需要
+    # 它；`queue` 模式下这是唯一真正会处理用户任务的路径，因此改由
+    # ``apps/worker/cli.py`` 在 ``queue`` 分支单独要求，缺失即启动失败
+    # （`EXIT_CONFIG_ERROR`），不是在这里强制必填——否则会连累不需要它的 `turn`
+    # 模式与直接构造 ``WorkerConfig`` 的测试/嵌入路径。
+    user_env_root: str | None = None
 
     def __post_init__(self) -> None:
         # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
@@ -183,6 +196,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         shutdown_timeout_seconds=_shutdown_timeout(_text(env, "SHUTDOWN_TIMEOUT_SECONDS")),
         session_root=_text(env, "SESSION_ROOT"),
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
+        user_env_root=_user_env_root(env),
     )
 
 
@@ -242,6 +256,24 @@ def _mcp_servers(env: Mapping[str, str]) -> Mapping[str, Any]:
     if not isinstance(parsed, dict):
         raise WorkerConfigError(f"{ENV_PREFIX}MCP_SERVERS 必须是 JSON 对象（服务名 → 配置）")
     return parsed
+
+
+def _user_env_root(env: Mapping[str, str]) -> str | None:
+    """读取裸变量 ``LINGXI_USER_ENV_ROOT``（不带 ``LINGXI_WORKER_`` 前缀）。
+
+    校验姿态逐字照抄 ``apps/scheduler/config.py`` 的 ``optional_identifier``：
+    可选、去首尾空白、内部不得含空白字符（否则快速失败，且不回显取到的值）。
+    两侧保持同一条校验规则，是"同一份部署值给两个进程用"这件事本身的一部分——
+    校验规则一旦分道扬镳，就可能出现"scheduler 觉得合法、worker 觉得非法"的
+    分歧部署。
+    """
+
+    value = (env.get("LINGXI_USER_ENV_ROOT") or "").strip()
+    if not value:
+        return None
+    if any(character.isspace() for character in value):
+        raise WorkerConfigError("环境变量 LINGXI_USER_ENV_ROOT 不得包含空白字符（不回显取到的值）")
+    return value
 
 
 def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:

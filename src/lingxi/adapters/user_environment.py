@@ -77,9 +77,11 @@ worker → 问数 MCP 的逐用户令牌**沿用 biai-agent 老路，把 Bearer 
   因此本模块只保证**目录与配置文件存在且权限收紧**，属主是运行进程本身。
 - **不读、不改、不删用户自己的任何文件**。除了 ``.mcp.json`` 与本模块自己建的写入临时文件，
   本模块不碰用户目录里的任何东西。
-- **不负责让 worker 真的用上这份配置**。worker 当前从 ``LINGXI_WORKER_MCP_SERVERS`` 读一份
-  **全进程共用**的配置（``apps/worker/config.py``），改成按用户读 ``.mcp.json`` 属 worker 侧
-  的接线，登记为后续。
+- **不负责让 worker 真的用上这份配置**（这一条已在 Epic D 闸⑥落地）：读侧在
+  ``adapters/user_mcp_config.py``，``apps/worker/service.py`` 的 ``_process_task``
+  按任务的 ``user_id`` 调用它，把结果覆盖进这次会话专属的 ``mcp_servers``；读不到
+  就失败关闭，结构上不存在回退到 ``LINGXI_WORKER_MCP_SERVERS``（全进程共用配置，
+  现仅供一次性受控回合 ``turn`` 模式使用）的分支。
 """
 
 from __future__ import annotations

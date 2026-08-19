@@ -95,6 +95,18 @@ def main(
             _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
+        # Epic D 闸⑥：queue 模式是唯一真正处理用户任务的路径，每个任务都要按
+        # 它的 user_id 读 <user_env_root>/<user_id>/.mcp.json（见
+        # apps/worker/service.py 的 _process_task）。缺了这个根目录，队列
+        # worker 领到的**每一个**任务都必然失败关闭——与其带着这个必然失败的
+        # 配置启动、让每个任务分别撞上同一个原因，不如在启动期一次性拒绝
+        # （与 LINGXI_POSTGRES_DSN 同一姿态：恰一条日志、只报变量名、不回显
+        # 取到的值——此处本就没有取到值可回显）。
+        if not config.user_env_root:
+            message = "队列 worker 缺少 LINGXI_USER_ENV_ROOT"
+            _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
+            _emit(out, config_error_report(trace_id=config.trace_id, message=message))
+            return EXIT_CONFIG_ERROR
         # Issue #177：工作目录预检必须在宣告"队列 worker 已启动"之前完成——否则
         # 一条 worker.queue.start 日志会紧跟着一条启动失败，误导成"先启动、后
         # 失败"，而实际上这个进程从未真正进入过可用状态。

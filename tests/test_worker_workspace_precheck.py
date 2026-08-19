@@ -40,6 +40,11 @@ def _worker_queue_env(**overrides: str) -> dict[str, str]:
         # 这个 DSN 语法合法但从不会被真正连接（失败路径在预检处提前返回，
         # 成功路径由下面的 `_run_queue_worker` 打桩接管，两者都不会真的拨号）。
         "LINGXI_POSTGRES_DSN": "postgresql://user:pass@localhost:5432/does-not-matter",
+        # Epic D 闸⑥：queue 模式启动现在还要求这个变量（见
+        # tests/test_worker_user_env_root_precheck.py），否则会在工作目录预检
+        # 之前就先被这条检查拦下——本文件测的是工作目录预检本身，不该被这条
+        # 无关的前置检查挡住。
+        "LINGXI_USER_ENV_ROOT": "/var/lib/lingxi/users",
     }
     env.update(overrides)
     return env

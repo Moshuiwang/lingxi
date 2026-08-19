@@ -1090,6 +1090,31 @@ class WorkerConfigTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
                 self._load(LINGXI_WORKER_MAX_TURNS=value)
 
+    def test_user_env_root_is_optional_and_defaults_to_none(self) -> None:
+        config = self._load()
+        self.assertIsNone(config.user_env_root)
+
+    def test_user_env_root_reads_the_bare_variable_shared_with_scheduler(self) -> None:
+        """闸⑥：worker 与 scheduler 读同一个裸变量名 ``LINGXI_USER_ENV_ROOT``
+        （不带 ``LINGXI_WORKER_`` 前缀），两个进程指向同一个持久卷挂载点。"""
+
+        env = worker_env()
+        env["LINGXI_USER_ENV_ROOT"] = "/var/lib/lingxi/users"
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(env)
+        self.assertEqual(config.user_env_root, "/var/lib/lingxi/users")
+
+    def test_user_env_root_with_internal_whitespace_fails_at_startup(self) -> None:
+        """校验姿态照抄 scheduler 侧 ``optional_identifier``：不回显取到的值。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_USER_ENV_ROOT="/var/lib/lingxi/us ers")
+        self.assertIn("LINGXI_USER_ENV_ROOT", str(caught.exception))
+        self.assertNotIn("us ers", str(caught.exception))
+
 
 class WorkerResourceGuardTest(unittest.TestCase):
     """V-护栏-01…07：worker 资源上限与 usage 出口。"""
