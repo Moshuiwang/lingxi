@@ -628,7 +628,10 @@ class RemovalTakesNoActionTest(unittest.TestCase):
         self.assertEqual(audit.actions(), ["roster_audit.report_sent"])
 
     def test_the_duty_exposes_no_collaborator_that_could_mutate_anything(self) -> None:
-        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `RosterAuditDuty` 搬进了 roster_audit 子模块。
+        source = (
+            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "roster_audit.py"
+        ).read_text(encoding="utf-8")
         tree = ast.parse(source)
         duty_class = next(
             node
@@ -875,7 +878,10 @@ class GroupSenderTest(unittest.TestCase):
         self.assertEqual(offenders, [], "群 ID 必须从环境变量注入，不得出现在代码库任何文件里")
 
     def test_the_chat_id_is_only_ever_read_from_the_environment(self) -> None:
-        source = (SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `SchedulerConfig`（读这个环境变量的地方）搬进了 config 子模块。
+        source = (
+            SOURCE_ROOT / "lingxi" / "apps" / "scheduler" / "config.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", source)
         self.assertIn("LINGXI_ADMIN_GROUP_CHAT_ID", SchedulerConfig.ENVIRONMENT_KEYS)

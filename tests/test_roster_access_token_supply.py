@@ -63,7 +63,13 @@ def no_retry_backoff():
     两条"永久写盘失败"的用例要各自空等 4.2 秒，而它们跑在每次门禁上。
     """
 
-    return mock.patch("lingxi.apps.scheduler.SAVE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    # #237 拆分后 `SAVE_RETRY_BACKOFF_SECONDS` 与消费它的 `_save_with_retry` 同在
+    # `credential_rotation` 子模块；补丁必须打在名字被**查找**的那个模块（该方法执行时
+    # 查的是自己所在模块的全局命名空间），打在 `lingxi.apps.scheduler`（仅重导出）上
+    # 不会影响运行时取到的值。
+    return mock.patch(
+        "lingxi.apps.scheduler.credential_rotation.SAVE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0)
+    )
 
 
 class MovableClock:
@@ -1274,11 +1280,12 @@ FORMAL_GRANT_TYPE_FILES = {
 FORMAL_REFRESH_CALL_FILES = {
     # 唯一一处调用授权客户端换新凭据的地方：凭据轮换职责的两个入口
     # （到期轮换 run_once、按需续期 refresh_for_supply）都在这个文件里。
-    "apps/scheduler/__init__.py",
+    # #237 拆分后 `CredentialRotationLoop` 搬进了 credential_rotation 子模块。
+    "apps/scheduler/credential_rotation.py",
 }
 FORMAL_CLAIM_FILES = {
-    # 唯一一处领取凭据（原子置位消费标记）的地方。
-    "apps/scheduler/__init__.py",
+    # 唯一一处领取凭据（原子置位消费标记）的地方。同上，随 #237 搬去了子模块。
+    "apps/scheduler/credential_rotation.py",
 }
 #: Bot-Test 受控验证资产：它们各有一套自己的续期实现，属于「正式开发的参考实现」，
 #: 不属于正式用户入口（代码框架第五节）。豁免不是白名单一写了事——下面两条自证
@@ -1306,7 +1313,11 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
         """防空扫：扫描器必须真的抓到已知的那几处，否则它随时可能变成一条永远绿的空断言。"""
 
         directory = (SOURCE_ROOT / "adapters" / "feishu_directory.py").read_text(encoding="utf-8")
-        scheduler = (SOURCE_ROOT / "apps" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
+        # #237 拆分后 `CredentialRotationLoop`（两个消费入口都在其中）搬进了这个子模块，
+        # 不再是包的 __init__.py。
+        scheduler = (
+            SOURCE_ROOT / "apps" / "scheduler" / "credential_rotation.py"
+        ).read_text(encoding="utf-8")
 
         self.assertTrue(scan_consumption_sites(directory).grant_type_sites)
         scheduler_sites = scan_consumption_sites(scheduler)
@@ -1563,7 +1574,10 @@ class AssembledSupplyTest(unittest.TestCase):
             captured["supply"] = kwargs["roster_access_token"]
             return real(config, **kwargs)
 
-        with mock.patch("lingxi.apps.scheduler._build_roster_audit_duty", spy):
+        # #237 拆分后 `build_loop` 与 `_build_roster_audit_duty` 同在 `assembly` 子模块，
+        # `build_loop` 在自己模块的全局命名空间里查找这个名字；补丁必须打在那里，
+        # 打在 `lingxi.apps.scheduler`（仅重导出）上不会被 `build_loop` 内部的调用看到。
+        with mock.patch("lingxi.apps.scheduler.assembly._build_roster_audit_duty", spy):
             loop = build_loop(self._config(**extra), audit=RecordingAudit())
         return loop, captured["supply"]
 

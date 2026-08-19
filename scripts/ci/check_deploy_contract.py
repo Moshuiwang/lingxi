@@ -44,7 +44,11 @@ PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
 POSTGRES_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "postgres.py"
-SCHEDULER_APP = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "__init__.py"
+# #237 拆分后 `SAVE_RETRY_BACKOFF_SECONDS` 与消费它的 `_save_with_retry` 同在
+# credential_rotation 子模块，不再是包的 __init__.py（那里现在只重导出这个名字）。
+SCHEDULER_CREDENTIAL_ROTATION = (
+    REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "credential_rotation.py"
+)
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
 
@@ -258,7 +262,7 @@ def _worst_case_seconds() -> float:
     """一次在途轮换在最坏情况下还要跑多久（秒）。读不到常量时抛 ValueError。"""
 
     http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
-    backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
+    backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
         raise ValueError("读不到 REQUEST_TIMEOUT_SECONDS")
     if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
@@ -277,11 +281,11 @@ def check_stop_grace_period() -> list[str]:
 
     failures: list[str] = []
     http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
-    backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
+    backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     if not isinstance(http_timeout, (int, float)):
         return [f"读不到 {FEISHU_DIRECTORY.name} 的 REQUEST_TIMEOUT_SECONDS，无法核算停止宽限期"]
     if not isinstance(backoff, (tuple, list)) or not all(isinstance(x, (int, float)) for x in backoff):
-        return [f"读不到 {SCHEDULER_APP.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
+        return [f"读不到 {SCHEDULER_CREDENTIAL_ROTATION.name} 的 SAVE_RETRY_BACKOFF_SECONDS，无法核算停止宽限期"]
 
     try:
         _, max_timeout = _postgres_timeout_facts()
@@ -989,7 +993,7 @@ def main() -> int:
         return 1
 
     http_timeout = module_constant(FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS")
-    backoff = module_constant(SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
+    backoff = module_constant(SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS")
     _, max_timeout = _postgres_timeout_facts()
     default_database_operation_seconds = _default_database_operation_seconds()
     database_operation_seconds = _database_operation_seconds()
