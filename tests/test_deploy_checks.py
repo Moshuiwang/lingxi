@@ -643,7 +643,9 @@ class RealRepositoryTest(unittest.TestCase):
         self.assertIsInstance(
             CONTRACT.module_constant(CONTRACT.FEISHU_DIRECTORY, "REQUEST_TIMEOUT_SECONDS"), int
         )
-        backoff = CONTRACT.module_constant(CONTRACT.SCHEDULER_APP, "SAVE_RETRY_BACKOFF_SECONDS")
+        backoff = CONTRACT.module_constant(
+            CONTRACT.SCHEDULER_CREDENTIAL_ROTATION, "SAVE_RETRY_BACKOFF_SECONDS"
+        )
         self.assertIsInstance(backoff, tuple)
 
     def test_compose_declares_a_sufficient_stop_grace_period(self) -> None:
