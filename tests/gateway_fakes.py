@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from lingxi.core.conversation.ports import (
@@ -94,13 +96,19 @@ class FakeOnboarding:
         fail_with: Exception | None = None,
     ) -> None:
         self.calls: list[dict[str, str]] = []
+        #: 每次调用拿到的认领代次。单独记，不混进 ``calls``——那一列断的是「只有事件身份，
+        #: 没有用户正文」，多一个键会让那条断言失去意义。
+        self.claim_tokens: list[Any] = []
         self._result = result or OnboardingResult(state=OnboardingState.STARTED)
         self._fail_with = fail_with
 
-    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
+    def start(
+        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
+    ) -> OnboardingResult:
         self.calls.append(
             {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
         )
+        self.claim_tokens.append(claim_token)
         if self._fail_with is not None:
             raise self._fail_with
         return self._result
@@ -128,6 +136,11 @@ class FakeTask:
     status: str = "queued"
 
 
+
+#: 「已平账」的占位代次：与真库的「时间戳非空」同义，但绝不等于任何一次认领代次，
+#: 因此不会被任何 CAS 释放误撤。
+_MARKED = object()
+
 @dataclass
 class FakeState:
     """假存储的全部状态。测试直接读它做断言。"""
@@ -144,7 +157,9 @@ class FakeState:
     pending_delivery_expired_notices: set[str] = field(default_factory=set)
     # Issue #65 轻审 P2-2：迁移 0062 那一列（``onboarding_dispatched_at``）的内存
     # 对应物——记下哪些事件已经确认交给开通编排。
-    onboarding_dispatched: set[str] = field(default_factory=set)
+    # 事件标识 → 认领代次（或 ``_MARKED``，表示「已平账」而不是「被谁认领着」）。
+    onboarding_dispatched: dict = field(default_factory=dict)
+    claim_generation: int = 0
     # 已认领、超过对账窗口仍未交接的孤儿事件（对账扫描的输入）。认领即摘除，与真库
     # 「UPDATE … RETURNING 同一条语句里记账」同语义：同一条不会被认领两次。
     stale_onboardings: list[PendingOnboarding] = field(default_factory=list)
@@ -336,17 +351,48 @@ class FakeStore:
         self._log.add("store.mark_onboarding_dispatched", event_id=event_id)
         if self._fail_on == "mark_onboarding_dispatched":
             raise RuntimeError("注入失败：mark_onboarding_dispatched")
-        self._state.onboarding_dispatched.add(event_id)
+        self._state.onboarding_dispatched.setdefault(event_id, _MARKED)
 
     def claim_stale_onboarding(self, *, older_than) -> PendingOnboarding | None:
-        """认领一条孤儿；认领即摘除，与真库的原子记账同语义。"""
+        """认领一条待交接事件；认领即摘除并记账，与真库的原子 ``UPDATE … RETURNING`` 同语义。"""
 
         self._log.add("store.claim_stale_onboarding", older_than=older_than)
         if self._fail_on == "claim_stale_onboarding":
             raise RuntimeError("注入失败：claim_stale_onboarding")
         if not self._state.stale_onboardings:
             return None
-        return self._state.stale_onboardings.pop(0)
+        pending = self._state.stale_onboardings.pop(0)
+        # 认领即记账：真库那条语句在取出的同一瞬间写上 ``onboarding_dispatched_at``，
+        # 并把那个时刻当作**认领代次**返回。假实现必须同样做，否则「没跑成就要放回去」
+        # 与「不得撤销别人的认领」两条断言在假实现上都恒真。
+        self._state.claim_generation += 1
+        token = datetime(2026, 8, 19, tzinfo=timezone.utc) + timedelta(
+            seconds=self._state.claim_generation
+        )
+        self._state.onboarding_dispatched[pending.event_id] = token
+        return dataclasses.replace(pending, claim_token=token)
+
+    def release_onboarding_claim(self, *, event_id: str, claim_token=None) -> None:
+        """把**自己那一次**认领放回去：代次对得上才清，对不上什么都不做。"""
+
+        self._log.add(
+            "store.release_onboarding_claim", event_id=event_id, claim_token=claim_token
+        )
+        if self._fail_on == "release_onboarding_claim":
+            raise RuntimeError("注入失败：release_onboarding_claim")
+        if claim_token is None:
+            return
+        if self._state.onboarding_dispatched.get(event_id) != claim_token:
+            # ABA：这条已经被别人重新认领了，撤销它等于把别人的认领清掉。
+            return
+        del self._state.onboarding_dispatched[event_id]
+        self._state.stale_onboardings.append(
+            PendingOnboarding(
+                event_id=event_id,
+                open_id=f"ou_{event_id}",
+                trace_id=f"trc_{event_id}",
+            )
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[FakeTransaction]:

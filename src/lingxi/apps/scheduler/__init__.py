@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**七个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**八个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -59,6 +59,22 @@
    **为什么它与每日重算是两个职责**：重算靠一个当日水位保证同日至多一轮，而发布消费
    必须每轮都跑；合并会让当天第一轮之后排进来的意图一直等到第二天。
    **单一写入负责人**：发布执行、就绪探针与用户通知全部在本进程内，不另起消费者。
+
+8. **首次开通编排**（``apps/scheduler/onboarding.py`` + :class:`~lingxi.core.conversation.
+   onboarding_recovery.OnboardingReconciler`）——认领 gateway 记下的未开通首聊事件，在
+   **自己的线程池**上跑完整条开通链（身份 → 匹配 → 建档 → 用户环境 → 权限发布 →
+   MCP 就绪 → ``active``），并自己私聊通知用户。第八个职责同样是**条件注册**的：缺 MCP
+   令牌主密钥、问数 MCP 端点、用户环境根目录或在职状态令牌供给任一项就不注册（**恰一条**
+   审计），此时**没有任何人认领**那些事件——它们原样留在库里，不会被认领走再烧掉。
+
+   **为什么它住在本进程而不是 gateway**（产品负责人 2026-08-18 裁定，决策记录见
+   ``docs/决策记录/2026-08-18-首次开通编排住在scheduler.md``）：在职状态必须实时回读飞书
+   成员详情，而那需要专用授权主体派生的短期令牌；那条一次性 ``refresh_token`` 全系统只
+   允许一个消费者，它已经在本进程里（职责 1 + 进程内持有者）。让 gateway 去换等于制造
+   第二条凭据通道——2026-08-08 授权码被烧那次事故的形状。
+
+   **它不占 tick**：单条链最长会阻塞十七分钟（发布等待 + 就绪预算），因此跑在专属线程池
+   上；``run_once`` 只做"认领若干条并提交"，认领量由执行器剩余容量压住。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -161,6 +177,29 @@ SAVE_RETRY_BACKOFF_SECONDS = (0.2, 1.0, 3.0)
 # 飞书开放平台地址来自配置，代码里只有一个可被覆盖的默认值（断言 V-部署-01）。
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
+#: 首次开通编排的默认执行线程数。**每条链最长阻塞十五分钟**（发布等待 + 就绪预算），
+#: 因此它就是「同一时刻最多几个人在开通」。
+#:
+#: 取 8 的依据（710 人规模的排空账，全部按最坏侧算）：
+#:
+#: - 首期服务规模是 710 人的关联组织（组织快照实测值），而首次开通是**一次性事件**
+#:   ——每个人一辈子只走一次，不是持续负载。真正要扛的只有"上线当天大量员工同时首聊"。
+#: - 典型一条链是秒级到三分钟（就绪探针在 t=0 或 t=180s 命中），8 条线程 ≈ 每小时
+#:   160–480 人，710 人在 1.5–4.5 小时内排空。
+#: - 病态一条链是 17 分钟（发布等待 120s + 就绪预算 900s，即每一次探针都不成功），
+#:   8 条线程 ≈ 每小时 28 人；这种情况下 710 人要排一天多——**但一条都不会丢**：
+#:   没被认领的事件原样留在库里，认领量由执行器剩余容量压住，下一轮照捞。
+#: - 病态情形本身也不该靠加线程解决：每条链都探满十五分钟意味着 MCP 侧根本没同步，
+#:   多开线程只是让更多人同时等一个不会来的结果。
+#:
+#: 线程绝大多数时间阻塞在 ``sleep`` 与网络等待上，8 条线程对 scheduler 进程的常驻开销
+#: 可以忽略；需要更快排空时调 ``LINGXI_ONBOARDING_WORKERS``（启动日志会把线程数与队列
+#: 深度一起报出来，不必去猜当前上限是多少）。
+#:
+#: 上界 64 是防御而不是容量规划：撞上它说明配置写错了，而不是「这次要开通很多人」。
+DEFAULT_ONBOARDING_WORKERS = 8
+MAX_ONBOARDING_WORKERS = 64
+
 
 class _Secret(str):
     """只影响 ``repr`` 的字符串子类：配置对象被打印时不吐出凭据。"""
@@ -215,6 +254,16 @@ class SchedulerConfig:
     # 输入，因此装配层必须让探针传输层与就绪节奏用**同一个数**（见
     # `lingxi.adapters.query_mcp_probe.QueryMcpProbe.timeout_seconds` 的文档）。
     query_mcp_timeout_seconds: int = DEFAULT_PROBE_TIMEOUT_SECONDS
+    # 用户环境根目录（`/var/lib/lingxi/users`）。首次开通编排要在它下面建家目录并写
+    # 按用户的 `.mcp.json`（产品负责人 2026-08-17 裁定）。**可选**：缺了只是首次开通
+    # 编排不注册，其余职责照常。
+    user_env_root: str | None = None
+    # 开通编排的执行线程数。**每条链最长会阻塞十五分钟**，因此它就是"同一时刻最多几个人
+    # 在开通"；认领量由执行器剩余容量压住（见 apps/scheduler/onboarding.py）。
+    onboarding_workers: int = DEFAULT_ONBOARDING_WORKERS
+    # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
+    # （`LX-ONBOARD-001`），不是 MCP 同步超时。
+    onboarding_publish_wait_seconds: float = 120.0
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -236,6 +285,8 @@ class SchedulerConfig:
         "LINGXI_PERMISSION_BITABLE_TABLE_ID",
         "LINGXI_QUERY_MCP_ENDPOINT",
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
+        "LINGXI_USER_ENV_ROOT",
+        "LINGXI_ONBOARDING_WORKERS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -340,6 +391,19 @@ class SchedulerConfig:
         except ValueError as error:
             raise ValueError(f"环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 不合法：{error}") from None
 
+        raw_workers = (source.get("LINGXI_ONBOARDING_WORKERS") or "").strip()
+        if raw_workers:
+            try:
+                onboarding_workers = int(raw_workers)
+            except ValueError:
+                raise ValueError("环境变量 LINGXI_ONBOARDING_WORKERS 必须是正整数") from None
+            if onboarding_workers < 1 or onboarding_workers > MAX_ONBOARDING_WORKERS:
+                raise ValueError(
+                    f"环境变量 LINGXI_ONBOARDING_WORKERS 必须在 1 到 {MAX_ONBOARDING_WORKERS} 之间"
+                )
+        else:
+            onboarding_workers = DEFAULT_ONBOARDING_WORKERS
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -377,6 +441,8 @@ class SchedulerConfig:
             permission_table_id=optional_identifier("LINGXI_PERMISSION_BITABLE_TABLE_ID"),
             query_mcp_endpoint=query_mcp_endpoint,
             query_mcp_timeout_seconds=probe_timeout,
+            user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),
+            onboarding_workers=onboarding_workers,
         )
 
 
@@ -1641,6 +1707,231 @@ def _build_readiness_follow_up(
     )
 
 
+def _build_onboarding_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    employment_access_token: Callable[[], str] | None,
+) -> Any | None:
+    """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    形状照 :func:`_build_permission_refresh_duty`。缺项时返回 ``None``，于是**没有任何人
+    认领** ``auto_provisioning`` 事件——它们原样留在 ``inbound_event`` 里等配置齐了再跑。
+    这比装一个失败关闭桩安全：桩会「认领即平账」，把事件永久烧掉。
+
+    ``employment_access_token`` 是在职状态实时回读所用的**专用授权主体派生令牌**供给。
+    它就是这次搬迁的**唯一理由**：那条一次性 ``refresh_token`` 全系统只允许一个消费者，
+    而它已经在本进程里（``CredentialRotationLoop.refresh_for_supply`` +
+    ``DerivedAccessTokenHolder``，#215 的形状）。**这里不新建供给**，只消费传进来的那一个。
+    """
+
+    from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+    unwired: tuple[str, str] | None = None
+    for variable, value in (
+        (MASTER_KEY_ENV, config.mcp_token_encrypt_key),
+        ("LINGXI_QUERY_MCP_ENDPOINT", config.query_mcp_endpoint),
+        ("LINGXI_USER_ENV_ROOT", config.user_env_root),
+    ):
+        if not value:
+            unwired = ("missing_environment_variable", variable)
+            break
+    if unwired is None and employment_access_token is None:
+        # 在职状态是**产品合同的硬门槛**（`V-开通-07`：非在职不建档、不发权限），
+        # 没有它就没有合法的开通判定，不能"先跳过这一步"。
+        unwired = ("employment_access_token_unwired", "")
+    if unwired is not None:
+        reason, variable = unwired
+        facts: dict[str, str] = {"reason": reason}
+        if variable:
+            facts["variable"] = variable
+        audit.record("onboarding.duty_not_registered", **facts)
+        logger.warning(
+            "首次开通编排未装配（%s%s）；未开通用户的首聊事件原样留在库里等待配置齐备，"
+            "其余定时职责照常运行",
+            reason,
+            f"：{variable}" if variable else "",
+        )
+        return None
+
+    from lingxi.adapters.delegated_credentials import registered_delegated_subject_open_id
+    from lingxi.adapters.feishu_directory import FeishuDirectoryClient, FeishuEmploymentReader
+    from lingxi.adapters.feishu_user_message import FeishuUserMessages
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
+    from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+    from lingxi.adapters.query_mcp_probe import QueryMcpProbe
+    from lingxi.adapters.role_function_map_file import load_role_function_map
+    from lingxi.adapters.user_environment import LocalUserEnvironment, UserEnvironmentError
+    from lingxi.apps.scheduler.onboarding import (
+        DISPATCH_AFTER,
+        CatalogNotifier,
+        HardDeadlineProbe,
+        OnboardingExecutor,
+        RosterRows,
+        assert_claim_limit_follows_capacity,
+        assert_probe_timeouts_agree,
+        monotonic_utc_clock,
+        PROBE_WATCHDOG_MARGIN_SECONDS,
+    )
+    from lingxi.config.content import default_content_catalog
+    from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
+    from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
+    from lingxi.core.permission.mcp_readiness import McpReadinessConfirmation
+
+    try:
+        role_function_map = load_role_function_map()
+    except (OSError, ValueError) as error:
+        # 只记异常类型：配置解析失败的正文可能带上文件内容片段。读不出来时**不能**退化成
+        # 空映射——那会让所有角色变成"未映射"，于是每个人都被算成无可用权限。
+        audit.record(
+            "onboarding.duty_not_registered",
+            reason="role_function_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error("角色职能映射配置不可用，首次开通编排不注册 error=%s", type(error).__name__)
+        return None
+
+    dsn = config.postgres_dsn
+    timeouts = config.postgres_timeouts
+    clock = monotonic_utc_clock()
+    should_stop = stop.is_set
+
+    tokens = PostgresMcpTokenStore(
+        dsn, cipher=McpTokenCipher(config.mcp_token_encrypt_key), timeouts=timeouts
+    )
+    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
+    probe = QueryMcpProbe(
+        endpoint=config.query_mcp_endpoint,
+        token_provider=token_cipher_provider(tokens),
+        timeout_seconds=config.query_mcp_timeout_seconds,
+    )
+    assert_probe_timeouts_agree(probe=probe, schedule=schedule)
+    guarded_probe = HardDeadlineProbe(
+        probe=probe,
+        timeout_seconds=schedule.probe_timeout_seconds + PROBE_WATCHDOG_MARGIN_SECONDS,
+    )
+
+    environment = LocalUserEnvironment(
+        root=config.user_env_root, mcp_endpoint=config.query_mcp_endpoint
+    )
+    # **启动期全量清扫**：被 ``SIGKILL`` 留下的写入临时文件里有明文令牌，而目录内清扫只在
+    # 「那个用户下一次再走开通」时发生——一个不再重试的用户意味着**没有时间上界**。在这里
+    # 跑一次把上界压到「至多一个进程生命周期」。扫不动就**不注册本职责**：那意味着我们管
+    # 不了这个目录，而它接下来正要接收明文凭据。
+    try:
+        environment.sweep_all()
+    except UserEnvironmentError as error:
+        audit.record(
+            "onboarding.duty_not_registered",
+            reason="user_environment_sweep_failed",
+            error=error.code,
+        )
+        logger.error("用户环境启动期清扫失败，首次开通编排不注册 code=%s", error.code)
+        return None
+
+    store = PostgresGatewayStore(dsn, timeouts=timeouts)
+    executor = OnboardingExecutor(workers=config.onboarding_workers, should_stop=should_stop)
+    runner = AutoOnboardingRunner(
+        directory=PostgresOrgSnapshotStore(dsn, timeouts=timeouts),
+        employment=FeishuEmploymentReader(
+            client=FeishuDirectoryClient(base_url=config.feishu_base_url),
+            access_token=employment_access_token,
+        ),
+        roster=RosterRows(PostgresRosterSnapshotStore(dsn, timeouts=timeouts)),
+        galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
+        provisioning=PostgresAppUserStore(dsn, timeouts=timeouts),
+        users=PostgresAppUserStore(dsn, timeouts=timeouts),
+        environment=environment,
+        tokens=tokens,
+        decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
+        readiness=McpReadinessConfirmation(
+            probe=guarded_probe,
+            store=tokens,
+            audit=audit,
+            clock=clock,
+            # 阻塞式确认真的会等三分钟，但它跑在开通执行器**自己的**线程上，不挡住
+            # SchedulerLoop 的任何一轮 tick。用 `stop.wait` 而不是 `time.sleep`：
+            # SIGTERM 能立刻打断等待（同 `PermissionNoticeDispatcher`）。
+            sleep=stop.wait,
+            schedule=schedule,
+        ),
+        notifier=CatalogNotifier(
+            sender=FeishuUserMessages(
+                base_url=config.feishu_base_url,
+                app_id=config.feishu_app_id,
+                app_secret=config.feishu_app_secret,
+            ),
+            catalog=default_content_catalog(),
+        ),
+        ledger=store,
+        audit=audit,
+        role_function_map=role_function_map,
+        # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
+        # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
+        delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
+        submit=executor.submit,
+        sleep=stop.wait,
+        clock=clock,
+        should_stop=should_stop,
+        publish_wait_seconds=config.onboarding_publish_wait_seconds,
+        # ------------------------------------------------------------------
+        # **发布闸门：现在是占位，恒为关闭。合并 #227 之后必须回到这一行。**
+        # ------------------------------------------------------------------
+        # 「职能标签 → 指标名」的翻译层（Issue #227）尚未合入本分支。在它落地之前，
+        # 本编排排出去的 ``permissions`` 值列表仍然是职能标签，不是消费方能用的指标名。
+        # #227 在每日重算那一侧的判据是「翻译映射整体为空时，本轮一条发布意图都不排，
+        # 撤权也不例外」；本编排是 ``record_decision`` 的**第三个**调用点（前两个是
+        # 每日重算的授权与撤权），因此必须自己带同一道闸，否则它就是那条判据的绕行入口，
+        # 而绕过去的后果是往正式权限表写一行消费方读不懂的记录——外部表不可回滚。
+        #
+        # **合并 #227 之后要做的整合动作（缺一不可）**：
+        #   1. 把这个 ``lambda: False`` 换成 #227 的真实判据——「翻译映射非空」那个
+        #      只读检查，与每日重算那一侧**用同一个来源**（不要在这里另读一份文件或
+        #      另做一次解析：两份来源迟早会漂移，而漂移的方向是错误发布）。
+        #   2. **不动 ``core``**：``AutoOnboardingRunner`` 只认一个 ``Callable[[], bool]``，
+        #      判据属装配层。
+        #   3. 验证接对了的方法：翻译映射为空时，一个身份与权限都正常的用户走完
+        #      ``_match`` 后必须停在 ``permission_translation_unavailable``（用户看到
+        #      ``LX-ONBOARD-001``），**且 ``publish_outbox`` 零新增行、``app_user``
+        #      零新增行**；映射非空时同一个用户照常推进到发布等待。
+        #      现成的变异锚点见 ``tests/test_onboarding_runner.PublishGateTests``：把这
+        #      一行改回 ``lambda: True`` 之后那一组必须变红。
+        #
+        # 关闭期间用户拿到的是 ``LX-ONBOARD-001``（已转交管理员），**不是**「没有银河
+        # 权限」——后者会把一个权限完全正常的人引去银河申请一个他已经有的权限。
+        publish_allowed=lambda: False,
+    )
+    duty = OnboardingReconciler(
+        store=store,
+        onboarding=runner,
+        audit=audit,
+        stale_after=DISPATCH_AFTER,
+        # 本进程的 SchedulerLoop 已经按 `interval_seconds` 定速，认领循环不再自限——
+        # 自限会把「首次开通最多等一个扫描周期」这句承诺变成「一个扫描周期或一分钟，
+        # 取大的那个」。
+        min_interval_seconds=0.0,
+        should_stop=should_stop,
+        capacity=executor.free_slots,
+    )
+    assert_claim_limit_follows_capacity(duty, executor)
+    executor.start()
+    logger.info(
+        "首次开通编排已装配 线程数=%s 队列深度=%s 认领窗口=%s 就绪节奏=0/%s/%s",
+        config.onboarding_workers,
+        config.onboarding_workers * 2,
+        DISPATCH_AFTER,
+        schedule.interval_seconds,
+        schedule.budget_seconds,
+    )
+    return duty
+
+
 def _build_permission_publish_duty(
     config: SchedulerConfig,
     *,
@@ -1876,6 +2167,17 @@ def build_loop(
     )
     if permission_publish is not None:
         duties.append(permission_publish)
+    # 首次开通编排（Epic D / S-D-02）排在发布消费**之后**：同一轮里发布面先把上一轮排出
+    # 的意图推出去，开通链的发布等待才可能在同一轮内看到 ``published``。位置只保证同一轮
+    # 内的先后；晚一轮没有产品后果（开通链自己会等）。
+    #
+    # 在职状态回读复用**同一个**令牌供给 ``supply``：它就是这次把编排搬进本进程的理由
+    # ——那条一次性 refresh_token 全系统只允许一个消费者，而它已经在这里了。
+    onboarding = _build_onboarding_duty(
+        config, stop=stop, audit=sink, employment_access_token=supply
+    )
+    if onboarding is not None:
+        duties.append(onboarding)
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:

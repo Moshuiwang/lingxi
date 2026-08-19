@@ -107,6 +107,23 @@ SQLSTATE_RAISE_EXCEPTION = "P0001"
 DELEGATED_SUBJECT_REJECTION_MARKER = "专用授权账号不能被建成用户记录"
 
 
+@dataclass(frozen=True)
+class UserProvisioningStatus:
+    """建档之后回读的**准入判据**：这个人此刻还该不该被继续开通。
+
+    住在这里而不是编排层，是因为它是上面「`already_provisioned` 不等于还该开通」那一段
+    的另一半：本合同说"写侧不做这个判断"，这个形状就是它把判断交出去时用的信封。放进
+    编排层会让 `adapters/postgres_identity.py` 为了实现读回而 import 整条权限链——一个
+    只想写 `app_user` 的进程不该因此把银河聚合、发布行与就绪状态机拖进自己的依赖闭包。
+
+    只有三个字段，且**都不是身份资料**：账号状态、开通状态、权限版本。
+    """
+
+    account_state: str
+    provisioning_state: str
+    permission_version: int
+
+
 class ProvisioningOutcome(str, Enum):
     """一次建档调用的结果。三态，不合并。"""
 

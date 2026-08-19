@@ -383,6 +383,43 @@ class FeishuAuthorizationClient:
         )
 
 
+class FeishuEmploymentReader:
+    """首次开通链上的**实时**在职状态读取（Epic D / S-D-02）。
+
+    组织快照刻意不保存在职状态（会立刻产生"库里在职、飞书已冻结"的陈旧窗口，而这个字段
+    的唯一用途恰恰是拦截这种情况，见 ``core/identity/first_contact`` 与 `V-开通-07`），
+    因此每次开通判定都要现读一次成员详情。
+
+    **令牌供给是注入的可调用对象，不是构造参数**：这条读取用的是专用授权主体派生出来的
+    短期令牌，而那条 ``refresh_token`` 是**一次性**的、全系统只允许一个消费者
+    （2026-08-08 授权码被烧的事故形状）。把"怎么拿到令牌"留成注入口，是为了让"谁是那个
+    唯一消费者"始终是一次显式的装配决定，而不是某个类的默认行为。
+
+    读不到、读不懂都**不返回 ``False``**：``EmploymentStatus.from_feishu`` 对缺字段返回
+    ``None``（判定层按"不可判定"拒绝开通），传输失败原样上抛（编排层归成本侧故障）。
+    默认成在职是这条链上最危险的错误——它会给一个已冻结的账号开通并发布权限。
+    """
+
+    def __init__(
+        self,
+        *,
+        client: "FeishuDirectoryClient",
+        access_token: Callable[[], str],
+    ) -> None:
+        if not callable(access_token):
+            raise TypeError("在职状态读取必须注入令牌供给")
+        self._client = client
+        self._access_token = access_token
+
+    def status(self, *, tenant_key: str, open_id: str) -> Any:
+        from lingxi.core.identity.first_contact import EmploymentStatus
+
+        detail = self._client.get_member_detail(
+            token=self._access_token(), tenant_key=tenant_key, member_id=open_id
+        )
+        return EmploymentStatus.from_feishu(detail.get("status"))
+
+
 def _text_value(value: object) -> str:
     """只接受飞书身份字段的字符串形态，不把对象错误转成可识别文本。"""
 
