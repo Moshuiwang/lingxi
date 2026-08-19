@@ -43,6 +43,8 @@ from lingxi.apps.scheduler import (
 )
 from lingxi.apps.scheduler.permission_refresh import (
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
+    SKIP_METRIC_TRANSLATION_UNAVAILABLE,
+    SKIP_METRIC_TRANSLATION_UNCOVERED,
     SKIP_MISSING_PERSONNEL_ID,
     SKIP_MISSING_SNAPSHOT,
     SKIP_NO_GALAXY_BATCH,
@@ -101,8 +103,13 @@ EMPLOYEE_TWO = "E1002"
 GALAXY_ACCOUNT_ONE = "g-1001"
 GALAXY_ACCOUNT_TWO = "g-1002"
 COMPANY_ID = "1011"
+COMPANY_ID_TWO = "1012"
 FUNCTION_LABEL = "运营"
 ROLE_NAME = "A运营"
+#: 翻译层（Issue #227）的测试夹具指标名——**虚构占位，非真实指标名**，只用于证明
+#: "翻译成功之后 permissions 里写的是翻译产物，不是职能标签本身"这条链路是通的。
+METRIC_NAME = "示例指标-日活"
+METRIC_NAME_TWO = "示例指标-收入"
 
 USER_ONE = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0B"
 USER_TWO = "usr_01K2AB4D6F8H0J2M4P6R8T0V2W"
@@ -113,6 +120,16 @@ TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 ROLE_FUNCTION_MAP = {ROLE_NAME: FUNCTION_LABEL}
+
+#: 翻译层的默认测试夹具：覆盖默认场景用到的公司+职能组合（``COMPANY_ID`` +
+#: ``FUNCTION_LABEL``）与「全非」通配（``"*"``），足够让既有的"granted user"用例
+#: 走完整条链路产出一条发布意图。第二家公司特意映射到**不同**的指标名，供
+#: ``MetricTranslationGateTest`` 证明"公司+职能"是联合键、不是只看职能。
+METRIC_TRANSLATION_MAP = {
+    COMPANY_ID: {FUNCTION_LABEL: (METRIC_NAME,)},
+    COMPANY_ID_TWO: {FUNCTION_LABEL: (METRIC_NAME_TWO,)},
+    "*": {FUNCTION_LABEL: (METRIC_NAME,)},
+}
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +352,7 @@ def build_duty(
     clock: FixedClock | None = None,
     stop: threading.Event | None = None,
     published_users: set[str] | None = None,
+    metric_translation_map=None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
@@ -353,6 +371,9 @@ def build_duty(
         publish_history=history,
         token_ciphers=tokens,
         role_function_map=ROLE_FUNCTION_MAP,
+        metric_translation_map=(
+            METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
+        ),
         audit=audit,
         clock=clock or FixedClock(TODAY),
         stop=stop,
@@ -636,7 +657,10 @@ class GrantedUserTest(unittest.TestCase):
         self.assertEqual(row.record_key, EMAIL_ONE)
         self.assertEqual(row.email, EMAIL_ONE)
         self.assertEqual(row.name, NAME_ONE)
-        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{FUNCTION_LABEL}"]}}')
+        # 翻译层（Issue #227）接线之后，写进 permissions 的是**翻译产物**（指标名），
+        # 不再是聚合层的原始职能标签——这条断言与 MetricTranslationGateTest 互补：
+        # 这里证明"翻译成功时结果正确"，那边证明"翻译失败时不发布、不撤权"。
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
         self.assertEqual(row.status, "approved")
         self.assertEqual(row.updated_at, "2026-08-17T03:00:00Z")
         self.assertEqual(row.token_cipher, TOKEN_CIPHER)
@@ -673,6 +697,220 @@ class GrantedUserTest(unittest.TestCase):
 
         source = duty_code()
         self.assertNotIn("permission_version", source)
+
+
+# --------------------------------------------------------------------------
+# 三点五、翻译层：未覆盖就跳过，不发布、不撤权（Issue #227）
+# --------------------------------------------------------------------------
+
+
+class RoundLevelTranslationGateTest(unittest.TestCase):
+    """翻译映射**整体为空**时的整轮闸门（外部独立审查 2026-08-18 坐实的 P1 修复）。
+
+    这层判据在遍历任何用户之前生效：`run_once` 直接返回 ``None``，与花名册不新鲜、
+    没有当前有效银河批次同一姿态——**不是**逐用户判据，因此授权与撤权**一起**被
+    挡住，不存在"只挡授权、撤权照旧"的旁路。这正是外部审查抓到的漏洞形状：此前
+    翻译闸只接在 `aggregate.granted=True` 的分支上，`_revoke` 完全不经过它，能直接
+    把 ``{}`` 写进正式表。
+    """
+
+    def test_the_round_produces_no_report_and_no_decisions(self) -> None:
+        """整份映射为空：`run_once` 返回 ``None``（不是一份 ``examined=0`` 的报告），
+        零发布意图，零遍历——与花名册/银河两组前置判据完全同构。"""
+
+        duty, parts = build_duty(identities=(identity(),), metric_translation_map={})
+
+        report = duty.run_once()
+
+        self.assertIsNone(report, "整轮判据不成立时不产出报告，与其余两组前置判据同构")
+        self.assertEqual(parts["decisions"].calls, [], "一条发布意图都不得产出")
+        self.assertEqual(parts["history"].calls, [], "撤权足迹查询也不得发生——遍历根本没开始")
+        self.assertEqual(parts["tokens"].read_calls, [], "令牌表也不得被查询")
+
+    def test_the_gate_blocks_a_grant_that_would_otherwise_publish(self) -> None:
+        """一个原本会被授权发布的用户，翻译层清空映射后一条都不发布——效果与
+        "值列表仍是职能标签则不得真实发布"完全一致（Issue #227「TO PM」一节的承诺），
+        现在由整轮判据而不是逐用户判据兑现。"""
+
+        duty, parts = build_duty(
+            identities=(identity(), identity(USER_TWO, personnel_id="ou_person_0002", email=EMAIL_TWO, display_name=NAME_TWO, employee_no=EMPLOYEE_TWO)),
+            roster_rows=(
+                roster_row(),
+                roster_row("ou_person_0002", employee_no=EMPLOYEE_TWO, email=EMAIL_TWO, name=NAME_TWO),
+            ),
+            galaxy=galaxy_snapshot(
+                accounts=(
+                    (GALAXY_ACCOUNT_ONE, EMPLOYEE_ONE, EMAIL_ONE),
+                    (GALAXY_ACCOUNT_TWO, EMPLOYEE_TWO, EMAIL_TWO),
+                ),
+                roles=((GALAXY_ACCOUNT_ONE, ROLE_NAME), (GALAXY_ACCOUNT_TWO, ROLE_NAME)),
+                countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_TWO, "KE")),
+            ),
+            metric_translation_map={},
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNone(report)
+        self.assertEqual(parts["decisions"].calls, [])
+
+    def test_the_gate_blocks_a_revocation_that_would_otherwise_publish(self) -> None:
+        """**P1 的核心钉子**：一个 ``granted=False``（银河侧无角色）且在发布链上有
+        足迹（曾经发布过、``has_publish_footprint`` 为真）的用户——按撤权路径的既有
+        规则本该排出一条清空 ``permissions`` 的更新意图；映射为空时，这条撤权意图
+        同样**排不出来**。对照组（不清空映射）证明"如果没有这道闸，这个人确实会被
+        撤权发布"——见 ``RevocationPublishTest`` 用同一套 ``galaxy=galaxy_snapshot(
+        roles=())`` + ``published_users={USER_ONE}`` 夹具在映射非空时产出恰一条撤权
+        意图。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            published_users={USER_ONE},
+            metric_translation_map={},
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNone(report, "整轮判据不成立：撤权也不例外")
+        self.assertEqual(
+            parts["decisions"].calls, [], "翻译层不可用时，撤权意图同样不得排入 outbox"
+        )
+        self.assertEqual(
+            parts["history"].calls, [], "遍历根本没开始，连『是否有发布足迹』都没查过"
+        )
+
+    def test_a_single_audit_entry_is_distinguishable_from_uncovered(self) -> None:
+        """整轮跳过恰一条审计，动作名与逐用户「未覆盖」判据不同——运维一眼能分辨
+        「翻译层这一轮整体没开」与「配了但某个组合漏填」。"""
+
+        duty, parts = build_duty(identities=(identity(),), metric_translation_map={})
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["audit"].actions(), ["permission_refresh.skipped_metric_translation_unavailable"]
+        )
+        fields = parts["audit"].fields_for(
+            "permission_refresh.skipped_metric_translation_unavailable"
+        )[0]
+        self.assertEqual(fields["reason"], SKIP_METRIC_TRANSLATION_UNAVAILABLE)
+
+    def test_the_gate_does_not_fire_when_the_map_has_any_content(self) -> None:
+        """否定断言：映射**非空**（哪怕只覆盖了别的公司+职能）时，整轮判据不生效——
+        遍历照常开始，逐用户判据接管；撤权路径完全不受影响（撤权从不查翻译映射）。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            published_users={USER_ONE},
+            metric_translation_map={"9999": {"某个无关职能": ("某个无关指标",)}},
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNotNone(report, "映射非空时整轮判据不该拦住遍历")
+        self.assertEqual(len(parts["decisions"].calls), 1, "撤权路径不查翻译映射，应照常发布")
+        self.assertEqual(parts["decisions"].calls[0]["reason"], PERMISSION_REVOKE_REASON)
+
+
+class MetricTranslationGateTest(unittest.TestCase):
+    """「公司 + 职能 → 指标名」翻译层接线之后，逐用户判据的行为（Issue #227）。
+
+    前提是映射**非空**（否则走 ``RoundLevelTranslationGateTest`` 的整轮判据，遍历
+    根本不会开始）。钉的是：某个组合未覆盖时只跳过这一个授权用户（不发布、不撤权、
+    不查令牌）；一个正面断言证明翻译成功时不同公司允许拿到不同的指标名列表——这是
+    「公司 + 职能」联合键存在的意义，不是只按职能。
+    """
+
+    def test_a_non_empty_map_missing_this_combination_is_distinguishable_from_unavailable(
+        self,
+    ) -> None:
+        """映射**不为空**（已经有别的公司+职能条目），但没覆盖到这次要用的组合——
+        原因码必须是「未覆盖」，不是「未配置」，两种运维状态不能被合并成一种；且
+        整轮判据不生效，`run_once` 返回真正的报告而不是 ``None``。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            metric_translation_map={"9999": {"某个无关职能": ("某个无关指标",)}},
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNotNone(report, "映射非空时整轮判据不生效")
+        self.assertEqual(parts["decisions"].calls, [])
+        self.assertEqual(report.reasons.get(SKIP_METRIC_TRANSLATION_UNCOVERED), 1)
+        self.assertIsNone(report.reasons.get(SKIP_METRIC_TRANSLATION_UNAVAILABLE))
+
+    def test_an_uncovered_grant_is_not_treated_as_a_revocation(self) -> None:
+        """否定断言：一个**授权**用户（``granted=True``）翻译不出来时，不查"这个人
+        有没有发布足迹"，更不产生撤权更新——它与 ``aggregate.granted=False`` 是两条
+        不同的判定分支，从未进入 ``_revoke``。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            metric_translation_map={"9999": {"某个无关职能": ("某个无关指标",)}},
+            published_users={USER_ONE},
+        )
+
+        duty.run_once()
+
+        self.assertEqual(parts["history"].calls, [], "未覆盖组合不得查询撤权足迹")
+        self.assertEqual(parts["decisions"].calls, [])
+
+    def test_an_uncovered_user_is_not_charged_a_token_read(self) -> None:
+        """翻译判定排在令牌读取之前：注定要跳过的人不该产生一次多余的令牌表查询。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            metric_translation_map={"9999": {"某个无关职能": ("某个无关指标",)}},
+        )
+
+        duty.run_once()
+
+        self.assertEqual(parts["tokens"].read_calls, [])
+
+    def test_partial_coverage_across_companies_fails_the_whole_user(self) -> None:
+        """否定断言：一个人持有两家公司，映射只覆盖其中一家——**整体**翻译失败，
+        不产出"只发布覆盖到的那一家"的部分结果（那是静默丢弃，不是失败关闭）。"""
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_ONE, "NG")),
+            country_rows=(
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+                ("NG", "NIGERIA", "尼日利亚", COMPANY_ID_TWO),
+            ),
+        )
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy,
+            metric_translation_map={COMPANY_ID: {FUNCTION_LABEL: (METRIC_NAME,)}},  # 缺 COMPANY_ID_TWO
+        )
+
+        duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "覆盖不全时一条部分发布都不得产出")
+
+    def test_translation_can_differ_by_company_not_just_by_function(self) -> None:
+        """正面断言：同一个用户、同一个职能，在两家公司下翻译出**不同**的指标名——
+        证明翻译层的键是「公司 + 职能」，不是只看职能。"""
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_ONE, "NG")),
+            country_rows=(
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+                ("NG", "NIGERIA", "尼日利亚", COMPANY_ID_TWO),
+            ),
+        )
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            row.permissions,
+            f'{{"{COMPANY_ID}":["{METRIC_NAME}"],"{COMPANY_ID_TWO}":["{METRIC_NAME_TWO}"]}}',
+        )
 
 
 # --------------------------------------------------------------------------
