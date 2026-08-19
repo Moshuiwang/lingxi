@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import sys
 from pathlib import Path
@@ -113,9 +114,27 @@ def find_violations(path: Path, source_root: Path = SOURCE_ROOT) -> list[str]:
                 cut = len(anchor) - node.level + 1
                 base = anchor[: max(cut, 0)]
                 resolved = ".".join([*base, node.module] if node.module else base)
-                targets = [(resolved, node.lineno)]
+                module_target = resolved
             elif node.module:
-                targets = [(node.module, node.lineno)]
+                module_target = node.module
+            else:
+                module_target = None
+
+            if module_target is not None:
+                targets = [(module_target, node.lineno)]
+                # `from lingxi.adapters import postgres_conversation` 与
+                # `from lingxi import adapters` 长得不一样，但都要抓到：后者的
+                # `node.module` 只是 `"lingxi"`，被 import 的子模块名字全部
+                # 挂在 `node.names` 上——只看 `node.module` 会让 `from lingxi
+                # import adapters` 完全穿透（`top == "lingxi"` 直接放行）。
+                # 每个别名都可能是子模块，静态语法无法区分"是子模块"还是
+                # "是符号"，因此保守地把 `module.alias` 也当成候选目标一并核对
+                # （同一姿态见 check_runtime_dependencies.py 的 `_split_imports`）。
+                if module_target == "lingxi" or module_target.startswith("lingxi."):
+                    targets += [
+                        (f"{module_target}.{alias.name}", node.lineno)
+                        for alias in node.names
+                    ]
 
         for target, lineno in targets:
             top = target.split(".")[0]
@@ -153,7 +172,12 @@ def run_check() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    del argv
+    # 无任何可选参数——但仍要显式解析：一个空 parser 的默认行为对未识别参数
+    # 直接报错退出（argparse 的标准姿态），不是像 `del argv` 那样把整份 argv
+    # 静默吞掉。`allow_abbrev=False` 关掉前缀缩写匹配，本仓上一批次正是栽在
+    # `--e` 缩写意外命中了另一个脚本里有真实副作用的选项。
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.parse_args(argv)
     return run_check()
 
 

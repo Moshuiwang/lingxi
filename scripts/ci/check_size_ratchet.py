@@ -61,7 +61,14 @@ class BaselineError(ValueError):
 def iter_scope_files() -> list[Path]:
     if not SOURCE_ROOT.is_dir():
         raise BaselineError(f"源码根目录不存在：{SOURCE_ROOT}")
-    return sorted(SOURCE_ROOT.rglob("*.py"))
+    files = sorted(SOURCE_ROOT.rglob("*.py"))
+    if not files:
+        # 目录存在但一个 .py 都没扫到：measure() 会得到空字典，基线里的每一条
+        # 登记都因为"实测不到"被 evaluate() 静默跳过（那是给"文件已删除/移出
+        # 扫描范围"设计的分支），最终判绿——这不是"棘轮通过"，是扫描本身坏了，
+        # 必须失败关闭而不是让空枚举冒充"零违规"。
+        raise BaselineError(f"源码根目录下一个 .py 文件都没扫到：{SOURCE_ROOT}")
+    return files
 
 
 def measure(paths: list[Path]) -> dict[str, int]:
@@ -137,14 +144,22 @@ def evaluate(baseline: dict[str, int], current: dict[str, int]) -> list[str]:
         elif actual < recorded:
             # 记录比实测更大：可能是文件已经缩小但没运行 --refresh，也可能是有人
             # 手工把基线数值调大了却没有对应地改动文件。两种情况在单次快照里长得
-            # 一样，本门禁不猜测意图，一律要求基线与实测**精确相等**——这正是拒绝
-            # 「手工调大基线」的手段：调大之后基线不再等于实测，直接判红；
-            # 唯一能让检查再次变绿的路径是 --refresh，而 --refresh 只会把数值写成
-            # 真实测得的行数，不采信基线文件里原有的数字。
+            # 一样，本门禁不猜测意图，一律要求基线与实测**精确相等**。
+            #
+            # **这条只堵住"基线数字与文件不一致"这一种形状，不构成"无法被绕过"
+            # 的证明**：如果同一次改动里，文件本身也同步长到与新数字精确相等
+            # （例如把 2048 行的文件改到 2348 行，同一提交里把基线那条也从
+            # 2048 改成 2348），本检查看到的是"记录 == 实测"，会判绿——精确相等
+            # 提供的价值是"任何净增都必须在同一次改动里对基线文件留下一处可审阅
+            # 的文本 diff"，不是"净增在算法上不可能通过"。真正堵住这类绕过需要
+            # 对照上一个可信基线（例如与合并基比对），但本仓当前跑
+            # `verify_repository.sh` 的 CI job（`ci.yml` 的 `gate`、
+            # `story.yml` 的 `fast`）都是浅克隆、不带 `fetch-depth: 0`，
+            # 没有可用的历史或 `origin/main` 引用可比——2026-08-19 复查后
+            # 确认加不了，如实登记为已知边界（代码框架「文件体量棘轮」一节）。
             failures.append(
                 f"{path}：棘轮基线记录 {recorded} 行，与实测 {actual} 行不一致。"
-                "基线必须与实际行数精确相等，不允许留有余量（这也是本门禁拒绝"
-                "「手工把基线调大」的手段）。运行 "
+                "基线必须与实际行数精确相等，不允许留有余量。运行 "
                 "python3 scripts/ci/check_size_ratchet.py --refresh 校准。"
             )
 
@@ -192,19 +207,24 @@ def run_refresh() -> int:
         print(f"文件体量棘轮刷新失败：{error}", file=sys.stderr)
         return 1
 
-    growth_failures = [
-        failure
-        for failure in evaluate(baseline, current)
-        if "超过棘轮基线记录的上限" in failure
-    ]
-    if growth_failures:
+    # --refresh 只能安全处理「基线里既有登记的数值需要调小或移除」这一种差异；
+    # 另外两类失败它没有能力代为解决：文件长过了自己的登记上限（那是违规，不是
+    # 该刷新的陈旧记录），以及一个此前从未登记的文件新超过了阈值（--refresh 从
+    # 不新增登记，见模块头注释）。B1（2026-08-19 外部复查）指出：旧版本只过滤
+    # 第一类失败，第二类会被无声放过，刷新照样返回 0——像是"跑过 --refresh
+    # 就等于合规"，而其实那份未登记的超阈文件原封不动地留在那里。这里改成：
+    # 只要 evaluate() 报出任何一类当前失败，--refresh 一律拒绝写入，把两类
+    # 失败原样列出来，都要求先由人处理，不代为消化。
+    blocking_failures = evaluate(baseline, current)
+    if blocking_failures:
         print(
-            "拒绝刷新：以下文件的行数比基线记录的还大，这不是「基线该更新」，"
-            "是「文件违反了棘轮」——先把文件缩回基线记录的行数以内，"
-            "--refresh 不会把一次增长当成新的基线：",
+            "拒绝刷新：仓库当前存在棘轮检查会报的失败，--refresh 不能代为解决——"
+            "「超过棘轮基线记录的上限」是文件违反了棘轮，先把文件缩回基线记录的"
+            "行数以内；「新超过体量棘轮阈值…且未登记在基线里」--refresh 从不"
+            "自动添加新登记，需要人工按提示处理：",
             file=sys.stderr,
         )
-        for failure in growth_failures:
+        for failure in blocking_failures:
             print(f"- {failure}", file=sys.stderr)
         return 1
 
@@ -236,7 +256,12 @@ def run_refresh() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="文件体量棘轮门禁（Issue #238）")
+    # `allow_abbrev=False`：本仓上一批次真实栽过前缀缩写的坑（`--e` 缩写命中
+    # 另一个脚本里带写入副作用的选项）。`--refresh` 本身就有写入副作用，
+    # 缩写匹配（如 `--r`/`--ref`）绝不能被 argparse 默认放行。
+    parser = argparse.ArgumentParser(
+        description="文件体量棘轮门禁（Issue #238）", allow_abbrev=False
+    )
     parser.add_argument(
         "--refresh",
         action="store_true",

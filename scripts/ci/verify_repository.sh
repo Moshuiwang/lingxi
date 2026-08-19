@@ -62,8 +62,9 @@ python3 scripts/ci/check_size_ratchet.py
 python3 scripts/ci/check_core_layering.py
 # 代码框架「三、横切约定」的归属核对（Issue #238）：把某句规则的权威记成产品合同
 # 本身的断言必须能在 docs/产品合同与外部边界.md 正文里找到对应，找不到就红——这道
-# 门禁挡的正是"凭据不进用户环境"这类被错记成合同条款的笔误（代码框架第三节，
-# 2026-08-19 归属核对更正）。
+# 门禁挡的正是"凭据不进用户环境"这类被错记成产品权威的笔误（代码框架第三节，
+# 2026-08-19 归属核对更正）；核对的是「归属已登记、登记与源句均未过期」，
+# 不是判定这句话在语义上是否真的成立（见 check_contract_attribution.py 头注释）。
 python3 scripts/ci/check_contract_attribution.py
 # Issue #75：正式 PostgreSQL 连接必须走唯一工厂，迁移入口必须有独立且有限的连接参数。
 # 该检查登记在 #75 的共享位置；#76 的制品 / 进程依赖清单检查按编排者约定后续追加。
