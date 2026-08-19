@@ -195,8 +195,12 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "产品合同与外部边界",
     ),
     GroundedAttribution(
+        # 2026-08-19 回合并 epic/d-first-onboarding 时，这一行在原有的 2026-08-19
+        # 归属核对更正（#238，"不进用户环境"是架构自设要求而非合同明令）基础上，
+        # 又拼回了 epic/d 的 2026-08-17 用户环境持有问数 MCP 令牌例外说明——登记表
+        # 随行文同步更新（同一行文本变化就必须重新核对登记，见模块 docstring）。
         "docs/技术设计/代码框架.md",
-        '- **凭据**：不进代码、日志、数据库、用户环境。日志、数据库不存凭据明文是产品合同明令（[产品合同与外部边界](../产品合同与外部边界.md)「统一用户记录与权限变化」："飞书短期令牌、数据库认证材料、MCP 令牌明文及其他凭据不得进入用户表、日志、Issue、文档或用户交付物"）；不进代码、不进用户环境是架构设计自身的从紧要求，合同正文未规定这两处（2026-08-19 归属核对更正，[#238](https://github.com/Moshuiwang/lingxi/issues/238)）。长期凭据放操作系统级密钥管理；测试只用固定假凭据探针。',
+        '- **凭据**：不进代码、日志、数据库。日志、数据库不存凭据明文是产品合同明令（[产品合同与外部边界](../产品合同与外部边界.md)「统一用户记录与权限变化」："飞书短期令牌、数据库认证材料、MCP 令牌明文及其他凭据不得进入用户表、日志、Issue、文档或用户交付物"）；不进代码、不进用户环境是架构设计自身的从紧要求，合同正文未规定这两处（2026-08-19 归属核对更正，[#238](https://github.com/Moshuiwang/lingxi/issues/238)）。**「不进用户环境」这条架构自设要求已于 2026-08-17 由产品负责人裁定收窄**：飞书机器人凭据、专用授权凭据与 MCP 加密主密钥仍然一律不进用户环境；**唯一的例外是逐用户的问数 MCP 令牌**，它按裁定明文落进该用户自己家目录的 `.mcp.json`（`440`），正文见[架构设计 6.9](架构设计.md)与[决策记录](../决策记录/2026-08-18-用户环境持有问数MCP令牌.md)。长期凭据放操作系统级密钥管理；测试只用固定假凭据探针。',
         "统一用户记录与权限变化",
     ),
     GroundedAttribution(
@@ -470,6 +474,49 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     GroundedAttribution(
         "tests/test_permission_publish_postgres.py",
         '进来——合同要求的"发布读回一致后立即探一次"就名存实亡了。',
+        "开通流程",
+    ),
+    # 2026-08-19 回合并 epic/d-first-onboarding：以下 8 条随 Epic D / S-D-02 的
+    # 首次开通编排代码与决策记录一起并入 main 树，此前只存在于 epic/d 分支，未经过
+    # #238 落地时的那一轮登记核对。逐条对照 docs/产品合同与外部边界.md 核对如下。
+    GroundedAttribution(
+        "docs/决策记录/2026-08-18-首次开通编排住在scheduler.md",
+        "- **gateway 只做两件事**：把未开通用户的首聊事件落进 `inbound_event`（标成 `auto_provisioning`），并**立刻**回一条合同要求的「已收到，正在核对」。它不再持有任何会产生外部副作用的开通实现。",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "docs/决策记录/2026-08-18-首次开通编排住在scheduler.md",
+        "- **接受首触延迟**：首次开通要等一个扫描周期才开始（stage 约 30 秒）。合同要求的第一条提示不受影响——它由 gateway 即时发出。",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/gateway/__init__.py",
+        "以及立刻回一条合同要求的「已收到，正在核对」。真正的编排由 scheduler 按",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/gateway/onboarding.py",
+        "2. 立刻回一条合同要求的「已收到，正在核对」。",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "src/lingxi/apps/scheduler/onboarding.py",
+        "代价是**首次开通要等一个扫描周期**才开始（产品负责人已知情并接受）。合同要求的第一条提示",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/identity/onboarding_runner.py",
+        "# **合同要求的第二条固定提示**（`V-开通-11`）：权限已经排出去、进入同步等待时，",
+        "首次对话与自动准入",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/identity/onboarding_runner.py",
+        '# - 也不能"先建档建环境、发布那步以后再补"：合同要求成功以发布 + 就绪确认',
+        "开通流程",
+    ),
+    GroundedAttribution(
+        "src/lingxi/core/identity/onboarding_runner.py",
+        "# **只有到这里才写 active**：产品合同要求成功提示在环境创建、权限发布与当前",
         "开通流程",
     ),
 )
