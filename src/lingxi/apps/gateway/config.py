@@ -24,7 +24,7 @@ from lingxi.core.alerting import AlertPolicy
 ENV_PREFIX = "LINGXI_GATEWAY_"
 
 # 飞书开放平台地址来自配置，代码里只有一个可被覆盖的默认值（断言 V-部署-01）；
-# 与 apps/scheduler/__init__.py 的 DEFAULT_FEISHU_BASE_URL 同一取舍——只有告警
+# 与 apps/scheduler/config.py（#237 拆分后的新位置）的 DEFAULT_FEISHU_BASE_URL 同一取舍——只有告警
 # 出口的 FeishuGroupMessages（走标准库 urllib，不经 lark-oapi）需要这个原始 URL。
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
