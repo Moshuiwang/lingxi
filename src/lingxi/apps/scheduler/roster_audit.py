@@ -1,0 +1,248 @@
+"""花名册资料比对与管理群审计日报职责：:class:`RosterAuditDuty`。
+
+从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出。同日至多一次、空差异不发、快照保旧
+与超龄告警等规则的完整理由见该类自己的文档字符串（未随拆分改动）。
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Callable, Sequence
+from datetime import date, datetime, timezone
+from typing import Protocol
+
+from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
+from lingxi.core.identity.roster_report import render_daily_report_content
+from lingxi.core.identity.roster_snapshot import RosterRound, SnapshotDecision
+
+from lingxi.apps.scheduler.audit import AuditSink
+
+logger = logging.getLogger(__name__)
+
+
+class _BaselineReader(Protocol):
+    def load_active_baseline(self) -> Sequence[ArchivedIdentity]: ...
+
+
+class _GroupSender(Protocol):
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
+
+
+class _RosterSource(Protocol):
+    """一轮花名册取用：交出用于比对的行与快照状态。
+
+    实现是 :class:`lingxi.core.identity.roster_snapshot.DailyRosterSource`；职责只依赖
+    这一个方法，因此全部调度与日报断言都能在没有数据库、没有网络的机器上跑完。
+    """
+
+    def current(self, *, now: datetime) -> RosterRound: ...
+
+
+class RosterAuditDuty:
+    """每日花名册资料比对与管理群审计日报（Issue #52）。
+
+    一轮做四件事：读比对基线 → 取本轮花名册（读一整轮 + 更新或保留持久快照）→
+    纯函数比对 → 该发就发一条日报。**存档三字段这一侧只读**（`V-花名册-14`）；
+    唯一的写库发生在花名册快照那一侧，而它写的是花名册的副本，不是 `app_user`。
+
+    **"该发就发"不等于"有差异才发"**。空差异日本来不发（`V-花名册-25`），但有两种
+    情形下「今天没有差异」这句话本身不可信，沉默因此是最危险的输出：
+
+    - **快照超龄**（`V-花名册-47`）：源头连续读不到，比对用的还是几天前那份花名册。
+      产品负责人 2026-08-17 裁定：始终保留最近一份、超龄**按日报告警提醒、不自动删**；
+    - **没有任何可用快照**（`V-花名册-48`）：这一天**不比对**。拿空行去比对会把全体
+      已开通用户报成「花名册查无此人」——那正是空源保护要挡的形状。
+
+    日报正文按产品负责人 2026-08-08 的 **D2 裁定**渲染：受控管理群可含用于定位的存档
+    身份（姓名、工号），并写明快照时间与同步状态、日期一律 UTC（渲染细节见
+    :mod:`lingxi.core.identity.roster_report`）。**日志与审计没有随之放宽**
+    （`V-花名册-33`）：它们流向排障、CI 输出与工单，不在受控管理群那个范围里。
+
+    **同日至多一次**（`V-花名册-31`）。判重靠 ``_completed_on`` 这个进程内的日期水位：
+
+    - 单轮一次、同进程跨轮一次：由这个水位**硬保证**，与轮询周期无关；
+    - 跨重启：**判重水位没有持久载体**，新进程的水位是空的，因此**重启当日会重发一份
+      内容完全相同的日报**。这是产品负责人 2026-08-06 知情接受的残留（裁定 C2 / R2）：
+      A 方案下报告由「花名册现值 + 存档」唯一确定，补跑产出同一份，重复是噪声不是错误。
+      **原表述「零新表定案下没有持久载体」的前提已被 2026-08-08 的 D2 裁定覆盖**——
+      仓库现在确有持久载体（`roster_snapshot`，迁移 `0063`），但它存的是**花名册读取
+      结果**，不是判重水位；结论因此没变：跨重启的真幂等要等判重水位本身也有持久载体
+      （或 ``audit_event`` 表落地）后再补。
+
+      **快照的 ``captured_at`` 不能顶替判重水位**（S-B-04 核对过并放弃了这条捷径）：
+      它回答的是"快照哪天换的"，而水位要回答的是"日报哪天发出去的"，两者只在最顺利的
+      那条路径上重合。发送失败的那一天快照照样已经换成当天的——拿 ``captured_at``
+      当水位，重启后会认为"今天已经做完"，于是**那一天的日报永远不会发出去**。用一个
+      每天至多重发一份相同日报的噪声，换一个整天静默的失败，方向是反的。真幂等需要
+      判重水位自己的持久列，属新迁移，不在本 Story 的授权范围内。
+
+    水位在**发送成功之后**才置位。发送失败不算已发送，下一轮重试（`V-花名册-30`）。
+    空差异日也置位：那一天的审计已经记过了，重复记只是噪声（`V-花名册-25`）。
+
+    **重试与"不确定态"**。"发送失败就重试"这条规则有一个它自己看不见的缺口：HTTP
+    请求已经被飞书收下、而响应在回程超时的那一刻，进程拿到的是异常，事实却是消息已经
+    发出去了。重试于是重复投递一条日报。同一天的每一次发送——首次与全部重试——因此共用
+    一个去重键（当日 UTC 日期），由 :func:`~lingxi.adapters.feishu_group_message.delivery_uuid`
+    折成飞书的投递 `uuid` 交服务端去重。平台侧的去重窗口未经验证（属 L4a），所以这里
+    承诺的是"重试携带同一个 `uuid`"这个代码事实，不是"平台一定不会重复投递"。
+    """
+
+    name = "花名册审计日报"
+
+    def __init__(
+        self,
+        *,
+        baseline_reader: _BaselineReader,
+        roster_source: _RosterSource,
+        sender: _GroupSender,
+        audit: AuditSink,
+        chat_id: str,
+        clock: Callable[[], datetime] | None = None,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._baseline_reader = baseline_reader
+        self._roster_source = roster_source
+        self._sender = sender
+        self._audit = audit
+        self._chat_id = chat_id
+        # 时钟注入：跨轮判重的用例要能自己决定「今天」是哪天，不能靠等到明天。
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._stop = threading.Event() if stop is None else stop
+        self._completed_on: date | None = None
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def completed_on(self) -> date | None:
+        """已完成日报的那一天。``None`` 表示本进程实例今天还没发过。"""
+
+        return self._completed_on
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> RosterAuditReport | None:
+        """跑一轮。返回 ``None`` 表示本轮没有执行比对（停止中，或今天已经做完）。"""
+
+        if self._stop.is_set():
+            # 已经在停止中：一轮都不开。停止之后必须 0 次发送（`V-花名册-20`）。
+            return None
+        now = self._clock()
+        today = now.date()
+        if self._completed_on == today:
+            return None
+
+        baseline = self._baseline_reader.load_active_baseline()
+        # 读一整轮花名册并结算持久快照。回读到不自洽的快照
+        # （:class:`~lingxi.adapters.postgres_roster_snapshot.RosterSnapshotInconsistent`）
+        # 或写快照失败时，异常原样上抛，由 :class:`SchedulerLoop` 做职责级隔离并在
+        # 下一轮重试（`V-花名册-17`）；水位不置位，因此这一天还没算做完。
+        round_result = self._roster_source.current(now=now)
+        snapshot = round_result.snapshot
+
+        if snapshot.available:
+            report = compare_roster(baseline, round_result.rows)
+        else:
+            # 一份快照都没有：**不比对**（`V-花名册-48`）。空行集会把全体已开通用户
+            # 报成「花名册查无此人」，那是比"今天没日报"严重得多的错误输出。
+            report = RosterAuditReport(examined=len(baseline))
+
+        if report.is_empty and not snapshot.needs_attention:
+            # 空差异日**不发日报**，只记一条审计。合同 :85 的语义是「通知待办」，
+            # 没有待办却每天发一条「今天没事」，会让管理群很快学会忽略这个通知。
+            self._audit.record(
+                "roster_audit.no_difference",
+                report_date=today.isoformat(),
+                examined=report.examined,
+                **snapshot.audit_facts(),
+            )
+            self._completed_on = today
+            return report
+
+        if self._stop.is_set():
+            # 停止信号落在读取阶段（读库 + 读花名册都可能耗时）。这里再看一次，
+            # 让这一轮成为**干净中断**：不发送、不置水位，什么都没发生。
+            # 停止之后必须 0 次发送（`V-花名册-20`），而入口处那一次检查挡不住
+            # "进来时还没停、读完才停"这条时序。重发由裁定 C2 的知情接受覆盖。
+            logger.info("停止信号在花名册读取期间到达，本轮不发送日报")
+            return report
+
+        content = render_daily_report_content(
+            report,
+            report_date=today,
+            # D2 的存档身份段取自**本轮基线**，不是花名册：管理员要定位的是 Lingxi
+            # 这一侧的记录，而花名册当前值本来就要他自己去核实。
+            identities={person.app_user_id: person for person in baseline},
+            snapshot=snapshot,
+        )
+        try:
+            # 同一天的日报（含失败重试）共用一个去重键：不确定态下的重试因此携带
+            # 同一个投递 `uuid`，由飞书服务端去重，而不是必然重复投递。
+            self._sender.send_text(
+                chat_id=self._chat_id, text=content.text, dedupe_key=today.isoformat()
+            )
+        except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
+            # 只记审计与异常类型：异常正文可能带上群 ID 或响应体。水位不置位，
+            # 因此这一天**不算已发送**，下一轮会重试（`V-花名册-30`）。
+            self._audit.record(
+                "roster_audit.send_failed",
+                report_date=today.isoformat(),
+                content_key=content.key,
+                content_version=content.version,
+                error=type(error).__name__,
+                **snapshot.audit_facts(),
+            )
+            logger.error("管理群审计日报发送失败，下一轮重试 error=%s", type(error).__name__)
+            return report
+
+        self._audit.record(
+            "roster_audit.report_sent",
+            report_date=today.isoformat(),
+            content_key=content.key,
+            content_version=content.version,
+            examined=report.examined,
+            entries=len(report.entries),
+            handover=report.handover_count,
+            removed=report.removed_count,
+            ambiguous=report.ambiguous_count,
+            **snapshot.audit_facts(),
+        )
+        self._completed_on = today
+        # 摘要只有计数，依据是 `V-花名册-33`（审计与日志不含花名册字段值）。日报正文的
+        # 展示口径已被 2026-08-08 的 D2 裁定放宽到「受控管理群可含原值」，日志侧没有
+        # 随之放宽：日志流向排障、CI 输出与工单，不在受控管理群那个范围里。
+        logger.info(
+            "管理群审计日报已发送 已开通用户=%s 条目=%s 疑似转交=%s 花名册查无=%s "
+            "快照可用=%s 快照超龄=%s",
+            report.examined,
+            len(report.entries),
+            report.handover_count,
+            report.removed_count,
+            snapshot.available,
+            snapshot.stale,
+        )
+        return report
+
+
+def _log_snapshot_alert(decision: SnapshotDecision) -> None:
+    """快照保旧时的告警出口：一条只含分类与错误码的结构化警告。
+
+    **面向管理员的那一份提醒走每日日报**（`V-花名册-47` 的裁定原文是「按日报告警提醒、
+    不自动删」），这里补的是运维侧那一半——日报一天只发一次，而运维需要在当轮就看到
+    "今天的花名册读取失败了"。刻意不接 ``core/alerting.py`` 的状态机：它只认心跳、
+    任务滞留与发送连续失败三类信号，把一件每日节奏的数据新鲜度事实塞进去，会让阈值、
+    去重与恢复计时三套语义同时失真。
+
+    只记分类与错误码，不记任何行内容（`V-花名册-33`）。
+    """
+
+    logger.warning(
+        "花名册本轮读取未成功，保留上一份快照 status=%s alert=%s failure_code=%s 上一份行数=%s",
+        decision.status,
+        decision.alert.value if decision.alert is not None else None,
+        decision.failure_code,
+        decision.previous_row_count,
+    )
