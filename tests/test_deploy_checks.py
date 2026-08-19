@@ -377,6 +377,54 @@ class SchedulerUserVolumeTest(unittest.TestCase):
         failures = self._with_overrides(stage_body="worker:\n  image: x\n", prod_body="worker:\n  image: x\n")
         self.assertTrue(any("找不到 scheduler service" in f for f in failures), failures)
 
+    def test_a_read_only_mount_is_caught_not_treated_as_mounted(self) -> None:
+        """外部独立审查 F2：挂成 ``:ro`` 时 scheduler 写不进去，首次开通编排的
+        每一次写入都会失败——与完全没挂载后果相同，但此前的整块字符串包含
+        判断会因为子串仍然命中而误判成"已挂载"。运维为了保守起见随手给一个
+        卷加 `:ro` 是完全可能发生的操作失误，不需要构造攻击场景就能触发。"""
+
+        body_readonly = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users:ro\n"
+        )
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        failures = self._with_overrides(stage_body=body_readonly, prod_body=body_with_mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "只读" in f for f in failures), failures
+        )
+        self.assertFalse(
+            any("compose.prod.yaml" in f for f in failures),
+            "prod 那份是可写挂载，不该被误报",
+        )
+
+    def test_the_mount_string_appearing_elsewhere_does_not_produce_a_false_pass(self) -> None:
+        """外部独立审查 F2：此前用整块字符串包含判断，若这个子串恰好出现在
+        ``environment``/``labels`` 等非 ``volumes:`` 的地方（例如一个巧合的
+        环境变量取值），会被误判成"已挂载"——这里构造这样一份配置，确认
+        真正生效的是对 ``volumes:`` 列表的精确解析，不是子串命中。"""
+
+        body_decoy_only = (
+            "scheduler:\n"
+            "  environment:\n"
+            "    NOTE: lingxi-users:/var/lib/lingxi/users\n"
+            "  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+        )
+        body_with_mount = (
+            "scheduler:\n  volumes:\n"
+            "    - lingxi-credentials:/var/lib/lingxi/credentials\n"
+            "    - lingxi-users:/var/lib/lingxi/users\n"
+        )
+        failures = self._with_overrides(stage_body=body_decoy_only, prod_body=body_with_mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "lingxi-users" in f for f in failures), failures
+        )
+
     def test_real_stage_and_prod_compose_both_mount_the_user_volume(self) -> None:
         """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
 

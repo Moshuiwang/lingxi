@@ -14,6 +14,7 @@ S-A-07 r3 实测：部署配置显式指向一个容器内不存在的目录时�
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import os
@@ -30,6 +31,13 @@ from lingxi.apps.worker.cli import EXIT_CONFIG_ERROR, _ensure_worker_workspace, 
 # 环境均以非 root 用户跑测试，这里仍显式判断一次，避免环境变化时静默产生假阳性。
 _RUNNING_AS_ROOT = hasattr(os, "getuid") and os.getuid() == 0
 
+# Epic D 闸⑥ F4：queue 模式启动现在会真的打开一次 LINGXI_USER_ENV_ROOT 核对
+# 它存在且可读（见 tests/test_worker_user_env_root_precheck.py），不再是随便
+# 一个格式合法的字符串就能过。本文件测的是工作目录预检本身，需要一个真实
+# 存在的目录把这条无关的前置检查垫过去。
+_USER_ENV_ROOT_DIR = tempfile.mkdtemp(prefix="lingxi-workspace-precheck-user-env-")
+atexit.register(lambda: __import__("shutil").rmtree(_USER_ENV_ROOT_DIR, ignore_errors=True))
+
 
 def _worker_queue_env(**overrides: str) -> dict[str, str]:
     env = {
@@ -40,11 +48,11 @@ def _worker_queue_env(**overrides: str) -> dict[str, str]:
         # 这个 DSN 语法合法但从不会被真正连接（失败路径在预检处提前返回，
         # 成功路径由下面的 `_run_queue_worker` 打桩接管，两者都不会真的拨号）。
         "LINGXI_POSTGRES_DSN": "postgresql://user:pass@localhost:5432/does-not-matter",
-        # Epic D 闸⑥：queue 模式启动现在还要求这个变量（见
+        # Epic D 闸⑥：queue 模式启动现在还要求这个变量真的存在（见
         # tests/test_worker_user_env_root_precheck.py），否则会在工作目录预检
         # 之前就先被这条检查拦下——本文件测的是工作目录预检本身，不该被这条
         # 无关的前置检查挡住。
-        "LINGXI_USER_ENV_ROOT": "/var/lib/lingxi/users",
+        "LINGXI_USER_ENV_ROOT": _USER_ENV_ROOT_DIR,
     }
     env.update(overrides)
     return env

@@ -136,6 +136,128 @@ class LoadUserMcpServersTest(unittest.TestCase):
                         load_user_mcp_servers(root=root, user_id="usr-1")
                     self.assertEqual(caught.exception.code, "config_shape_invalid")
 
+    def test_server_shape_is_validated_field_by_field_not_just_is_a_dict(self) -> None:
+        """外部独立审查 F1：此前只检查"每个 server 的值是不是 dict"，一份空
+        server 配置、缺 Authorization、令牌为空、甚至 ``stdio`` + ``command``
+        （能启动任意本地进程的形态）都能原样通过——分别对应"用户拿到一个莫名
+        其妙的失败而不是诚实的配置读不到终态"与"读侧被诱导去启动任意本地
+        进程"两类问题。这里逐个构造这些畸形形态，确认都在同一个错误码下
+        失败关闭。"""
+
+        malformed_servers = (
+            # 空 server 配置：不是"没有任何工具"，是"配置本身有问题"。
+            {"query": {}},
+            # 缺 Authorization。
+            {"query": {"type": "http", "url": "https://mcp.example.invalid"}},
+            # headers 存在但没有 Authorization。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {},
+                }
+            },
+            # Authorization 是空 Bearer。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {"Authorization": "Bearer "},
+                }
+            },
+            # Authorization 完全不是 Bearer 形状。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {"Authorization": "token-without-bearer-prefix"},
+                }
+            },
+            # headers 里混进了未知键。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {"Authorization": "Bearer tok", "X-Extra": "1"},
+                }
+            },
+            # url 不是 https：明文 Bearer 走 HTTP 等于把令牌发到网络上。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "http://mcp.example.invalid",
+                    "headers": {"Authorization": "Bearer tok"},
+                }
+            },
+            # 危险形态：stdio + command，能启动任意本地进程。
+            {
+                "query": {
+                    "type": "stdio",
+                    "command": "/bin/sh",
+                    "args": ["-c", "echo pwned"],
+                }
+            },
+            # type 是 http，但混进了 stdio 才有的 command 键——多一个键也拒绝。
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {"Authorization": "Bearer tok"},
+                    "command": "/bin/sh",
+                }
+            },
+            # 未知 type。
+            {
+                "query": {
+                    "type": "sse",
+                    "url": "https://mcp.example.invalid",
+                    "headers": {"Authorization": "Bearer tok"},
+                }
+            },
+        )
+        for servers in malformed_servers:
+            with self.subTest(servers=servers):
+                with tempfile.TemporaryDirectory() as root:
+                    _write(
+                        Path(root) / "usr-1" / ".mcp.json",
+                        json.dumps({"mcpServers": servers}, ensure_ascii=False),
+                    )
+                    with self.assertRaises(UserMcpConfigError) as caught:
+                        load_user_mcp_servers(root=root, user_id="usr-1")
+                    self.assertEqual(caught.exception.code, "config_shape_invalid")
+
+    def test_the_exact_write_side_shape_is_accepted(self) -> None:
+        """正向对照：写侧唯一会产出的那一种形状必须仍然被接受——F1 的严格
+        校验不能连正常配置一起挡住。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            _write(
+                Path(root) / "usr-1" / ".mcp.json",
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "query": {
+                                "type": "http",
+                                "url": "https://mcp.example.invalid",
+                                "headers": {"Authorization": "Bearer tok-123"},
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            servers = load_user_mcp_servers(root=root, user_id="usr-1")
+            self.assertEqual(
+                servers,
+                {
+                    "query": {
+                        "type": "http",
+                        "url": "https://mcp.example.invalid",
+                        "headers": {"Authorization": "Bearer tok-123"},
+                    }
+                },
+            )
+
     def test_error_code_never_echoes_the_configured_path_or_user_id(self) -> None:
         """error.code 只允许是本模块自定的安全码——不回显路径、内容或凭据。"""
 

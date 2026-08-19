@@ -409,6 +409,31 @@ def check_worker_queue_env_example() -> list[str]:
     return failures
 
 
+def _volume_mounts(service_text: str) -> list[tuple[str, str, str | None]]:
+    """解析某个 service 块下 ``volumes:`` 列表的每一项，返回
+    ``(source, target, mode)`` 三元组列表；``mode`` 是 ``:ro``/``:rw`` 这类第三段
+    （没有则 ``None``）。
+
+    复用 :func:`service_block` 的同一套缩进定界算法定位 ``volumes:`` 子块——它对
+    "key: 后跟同级子项，直到遇到同缩进或更浅的下一个键"这个结构不挑层级，原本
+    给 service 名字用，这里直接拿来给 service 块内部的 ``volumes:`` 用。
+    这样**只解析真正的 volumes 列表**，不会被 ``environment``/``labels`` 等
+    别处偶然出现的形似字符串（例如注释、环境变量值）误判成"已挂载"
+    （外部独立审查 F2：此前的整块字符串包含判断存在这个假绿口子）。
+    """
+
+    volumes_block = service_block(service_text, "volumes")
+    if volumes_block is None:
+        return []
+    mounts: list[tuple[str, str, str | None]] = []
+    for line in volumes_block.splitlines():
+        match = re.match(r"^\s*-\s*([\w.-]+):(/[^:\s]+)(?::([\w,-]+))?\s*$", line)
+        if match:
+            source, target, mode = match.groups()
+            mounts.append((source, target, mode))
+    return mounts
+
+
 def check_scheduler_user_volume() -> list[str]:
     """Epic D 闸⑤：scheduler 的首次开通编排要往用户环境目录写每个用户自己的
     ``.mcp.json``（S-D-02，``adapters/user_environment.py``），但 stage/prod
@@ -425,6 +450,15 @@ def check_scheduler_user_volume() -> list[str]:
     worker-queue 不同，scheduler 的这个挂载点目前只出现在覆盖文件里
     （基线 scheduler 只挂凭据卷，用户目录卷的声明与命名跟着 stage/prod 环境走，
     与 worker 系列的既有结构一致）。
+
+    **精确解析 ``volumes:`` 列表、显式断言不是只读**（外部独立审查 F2 修复）：
+    此前用整块字符串包含判断 ``"lingxi-users:/var/lib/lingxi/users" not in
+    block``，两种情况都会被误判成"已挂载"：①这个子串恰好出现在
+    ``environment``/``labels`` 等别处（不是真的卷挂载）；②挂成了
+    ``lingxi-users:/var/lib/lingxi/users:ro``——scheduler 写不进去，
+    子串判断依旧命中、门禁照样绿，而首次开通编排会在第一次写 ``.mcp.json``
+    时才炸。运维为了"保守"随手给一个后来发现该写的卷加 ``:ro`` 是完全可能
+    发生的操作失误，不需要构造出恶意场景就能触发。
     """
 
     failures: list[str] = []
@@ -434,7 +468,12 @@ def check_scheduler_user_volume() -> list[str]:
         if block is None:
             failures.append(f"{display(path)} 找不到 scheduler service")
             continue
-        if "lingxi-users:/var/lib/lingxi/users" not in block:
+        matching = [
+            (source, target, mode)
+            for source, target, mode in _volume_mounts(block)
+            if source == "lingxi-users" and target == "/var/lib/lingxi/users"
+        ]
+        if not matching:
             failures.append(
                 f"{display(path)} 的 scheduler 没有挂载 lingxi-users 卷"
                 "（挂载点须与 worker/worker-queue 一致：/var/lib/lingxi/users）。"
@@ -443,6 +482,15 @@ def check_scheduler_user_volume() -> list[str]:
                 "（见 apps/scheduler/assembly.py 的 _build_onboarding_duty），"
                 "且这个失败只留一条容易被忽略的审计日志，其余职责与健康检查"
                 "照常正常。"
+            )
+            continue
+        if any(mode == "ro" for _, _, mode in matching):
+            failures.append(
+                f"{display(path)} 的 scheduler 把 lingxi-users 挂成了只读"
+                "（`:ro`）。首次开通编排要往这个目录写每个用户的 .mcp.json，"
+                "只读挂载会让每一次开通都在第一次写入时失败——表现形式与完全"
+                "没挂载相同（前置不齐、编排不注册），但门禁如果只做字符串包含"
+                "判断会因为子串仍然命中而误判为通过。"
             )
     return failures
 

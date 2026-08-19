@@ -41,6 +41,44 @@
   先报 ``invalid_user_id`` 而不是静默放行——比隐式依赖对方的私有实现更安全。
 - **根目录本身不做符号链接防护**：``root`` 来自部署配置（``LINGXI_USER_ENV_ROOT``），
   不是用户可控输入；真正的攻击面在 ``<root>/<user_id>`` 这一级，见上一节。
+
+### A1/A2/A3：同机第三方可写利用面（外部独立审查登记，明确接受、不修）
+
+以下三条外部独立审查逐条点出过，判定是**明确接受、登记复审条件，不在本轮
+处理**——不是遗漏：
+
+- **A1｜``lstat`` → ``open`` 之间的 TOCTOU**：``_open_home_nofollow``/
+  ``_read_config`` 都是先 ``lstat`` 判定"当时不是符号链接"，再按名字
+  ``open(..., O_NOFOLLOW)``；两步之间如果目标被替换成指向别处的链接，读到的
+  就不是原来 ``lstat`` 看到的那个文件。
+- **A2｜未拒绝硬链接**：``O_NOFOLLOW`` 挡的是符号链接，不挡硬链接——一个
+  事先建好、指向别处内容的硬链接会被原样当成 ``.mcp.json`` 读进来。
+- **A3｜未验证权限位 / 属主 / 扩展 ACL**：本模块只判定"是不是符号链接、
+  是不是目录 / 普通文件"，不核对 ``.mcp.json`` 的属主是不是运行进程本身、
+  权限位是不是 ``0440``、有没有被扩展 ACL 放宽给其他账号读取。
+
+**接受理由（判据是可达性，三条共用）**：这三条全部要求"同一时刻，同一台
+机器上存在一个能写用户目录的第三方"才谈得上被利用。而本轮：用户目录由
+scheduler 经 ``LocalUserEnvironment`` 独占创建；JumpServer 高级工作台（用户
+在同一台机器上拿到 shell 的唯一途径）明确不在本轮范围；执行层工具白名单
+只含一个只读问数工具，Agent 没有读写文件或执行命令的能力。三个前提任一
+成立之前，这条利用面不可达。
+
+**读写两侧口径必须一致**：``adapters/user_environment.py`` 的「已知边界」
+一节已经对写侧的同一族问题（``chmod`` 不清除扩展 ACL、不拒绝硬链接）作出
+同样的接受——理由同样是"当前部署的用户目录由 Lingxi 独占创建"。读侧在这里
+登记同一结论，不能一边放行写侧、一边把读侧的同族问题判成必修。
+
+**复审条件**（与
+[决策记录《用户之间的操作系统级隔离本轮不做，设为 JumpServer 高级工作台的
+硬前置》](../../../docs/决策记录/2026-08-19-用户间操作系统级隔离本轮不做.md)
+逐条一致；任一条成立都必须回到该决策记录重新判断，不得继续沿用本节的接受
+结论）：
+
+1. JumpServer 高级工作台进入实施范围；
+2. 执行层工具白名单新增任何具备读文件、写文件或执行命令能力的工具；
+3. 用户环境目录中出现除 ``.mcp.json`` 以外的凭据或敏感产物；
+4. 同一宿主机上出现 Lingxi 之外、可登录到用户环境目录的第三方进程。
 """
 
 from __future__ import annotations
@@ -63,6 +101,23 @@ MCP_CONFIG_FILENAME = ".mcp.json"
 #: 用户标识会成为一段路径分量，因此**只接受**这张白名单——``..``、``/``、空串、
 #: 前导点都会被这条正则挡住。
 _USER_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+
+#: 单个 server 配置**恰好**允许的键集合，逐字对应 ``user_environment.py`` 的
+#: ``build_mcp_config`` 真实产出的形状——不多不少。任何额外键（``command``/
+#: ``args`` 一类 stdio 字段最典型）都判 ``config_shape_invalid``：外部独立审查
+#: 指出旧版本只检查"是不是 dict"，一份形如 ``{"type": "stdio", "command": "…"}``
+#: 的配置能原样通过，读侧因此可能被诱导去启动任意本地进程。本模块只服务
+#: 写侧唯一会产出的那一种形状（HTTP + Bearer），出现其它形状一律失败关闭，
+#: 不尝试兼容或部分接受。
+_ALLOWED_SERVER_KEYS = frozenset({"type", "url", "headers"})
+
+#: ``headers`` 只允许这一个键——同样逐字对应写侧的产出形状。
+_ALLOWED_HEADER_KEYS = frozenset({"Authorization"})
+
+#: ``Authorization`` 必须是 ``Bearer <非空且不含空白的令牌>``。真实令牌是
+#: base64/hex 一类字符集，不含空白；用这条形状本身筛掉空令牌（``Bearer``、
+#: ``Bearer ``）与夹带额外内容的令牌（``Bearer x y``）。
+_BEARER_TOKEN_PATTERN = re.compile(r"\ABearer \S+\Z")
 
 
 class UserMcpConfigError(RuntimeError):
@@ -184,6 +239,40 @@ def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
     if not isinstance(servers, dict) or not servers:
         raise UserMcpConfigError("config_shape_invalid")
     for name, value in servers.items():
-        if not isinstance(name, str) or not name or not isinstance(value, dict):
+        if not isinstance(name, str) or not name:
             raise UserMcpConfigError("config_shape_invalid")
+        _validate_server_shape(value)
     return servers
+
+
+def _validate_server_shape(value: Any) -> None:
+    """严格校验单个 server 配置**恰好**是写侧会产出的那一种形状（外部独立
+    审查 F1）：``{"type": "http", "url": "https://…", "headers":
+    {"Authorization": "Bearer <非空令牌>"}}``，不多一个键、不少一个键。
+
+    此前的版本只检查"是不是 dict"：一份 ``{"query": {}}``（空 server 配置）、
+    一份没有 ``Authorization`` 或令牌为空的配置、乃至一份
+    ``{"type": "stdio", "command": "…"}`` 都能原样通过——分别对应"用户拿到一个
+    莫名其妙的失败而不是诚实的配置读不到终态"与"读侧被诱导去启动任意本地
+    进程"两类问题。这里**结构性地只接受写侧唯一会产出的那一种形状**，任何
+    偏离（多一个键、少一个键、类型不是 http、URL 不是 https、Authorization
+    形状不对）都判 ``config_shape_invalid``——不尝试兼容、不部分接受。
+    """
+
+    if not isinstance(value, dict):
+        raise UserMcpConfigError("config_shape_invalid")
+    if set(value) != _ALLOWED_SERVER_KEYS:
+        raise UserMcpConfigError("config_shape_invalid")
+    if value.get("type") != "http":
+        raise UserMcpConfigError("config_shape_invalid")
+    url = value.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        # 明文 Bearer 走 HTTP 等于把令牌发到网络上——与写侧
+        # ``LocalUserEnvironment.__init__`` 对 ``mcp_endpoint`` 的同一条校验。
+        raise UserMcpConfigError("config_shape_invalid")
+    headers = value.get("headers")
+    if not isinstance(headers, dict) or set(headers) != _ALLOWED_HEADER_KEYS:
+        raise UserMcpConfigError("config_shape_invalid")
+    authorization = headers.get("Authorization")
+    if not isinstance(authorization, str) or not _BEARER_TOKEN_PATTERN.match(authorization):
+        raise UserMcpConfigError("config_shape_invalid")

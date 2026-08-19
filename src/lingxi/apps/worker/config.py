@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -153,8 +154,23 @@ class WorkerConfig:
         )
 
 
-def load_config(env: Mapping[str, str], *, require_question: bool = True) -> WorkerConfig:
-    """从环境变量构造配置。缺失或不合法时抛 :class:`WorkerConfigError`。"""
+def load_config(
+    env: Mapping[str, str], *, require_question: bool = True, queue_mode: bool = False
+) -> WorkerConfig:
+    """从环境变量构造配置。缺失或不合法时抛 :class:`WorkerConfigError`。
+
+    ``queue_mode``（外部独立审查 F3）：queue 模式处理真实用户任务时，
+    ``mcp_servers`` 已经改为按任务的 user_id 逐用户读取（Epic D 闸⑥，见
+    ``apps/worker/service.py``），``LINGXI_WORKER_MCP_SERVERS``（全进程共用配置）
+    只服务没有 user_id 概念的一次性受控回合（``turn`` 模式）。``queue_mode=True``
+    时**根本不调用** ``_mcp_servers(env)``——不只是"解析出来但不用"：
+    ①即使这个变量被配了非法 JSON，queue 进程也不会因为一个从不会被用到的
+    变量而拒绝启动；②合法值也不会被 ``json.loads`` 成 Python 对象、不会有
+    一份共享令牌以任何形式驻留在 queue 进程内存里。这比"解析出来、构造好
+    WorkerConfig 之后再也不读那个字段"更强：后者仍然会让配置错误的部署在
+    queue 模式下启动失败（明明这个模式根本不需要这个变量），也仍然会让令牌
+    进程内存里多留一份从未被读取过的副本。
+    """
 
     required_names = ("QUESTION", "READONLY_TOOL") if require_question else ("READONLY_TOOL",)
     missing = [name for name in required_names if not _text(env, name)]
@@ -173,7 +189,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
-        mcp_servers=_mcp_servers(env),
+        mcp_servers=({} if queue_mode else _mcp_servers(env)),
         workspace=_text(env, "WORKSPACE"),
         model=_text(env, "MODEL"),
         system_prompt=system_prompt,
@@ -261,11 +277,18 @@ def _mcp_servers(env: Mapping[str, str]) -> Mapping[str, Any]:
 def _user_env_root(env: Mapping[str, str]) -> str | None:
     """读取裸变量 ``LINGXI_USER_ENV_ROOT``（不带 ``LINGXI_WORKER_`` 前缀）。
 
-    校验姿态逐字照抄 ``apps/scheduler/config.py`` 的 ``optional_identifier``：
-    可选、去首尾空白、内部不得含空白字符（否则快速失败，且不回显取到的值）。
-    两侧保持同一条校验规则，是"同一份部署值给两个进程用"这件事本身的一部分——
-    校验规则一旦分道扬镳，就可能出现"scheduler 觉得合法、worker 觉得非法"的
-    分歧部署。
+    校验姿态照抄 ``apps/scheduler/config.py`` 的 ``optional_identifier``——可选、
+    去首尾空白、内部不得含空白字符（否则快速失败，且不回显取到的值）；两侧保持
+    同一条基线规则，是"同一份部署值给两个进程用"这件事本身的一部分。
+
+    在此之上（外部独立审查 F4）**额外要求绝对且已规范化的路径**：必须以 ``/``
+    开头，且 ``posixpath.normpath`` 归一化后与原值逐字节相同——用这一条筛掉
+    相对路径、``..`` 路径穿越分量、连续斜杠与多余的尾部斜杠。这个值随后会被
+    直接拼进每个用户的家目录路径（``<root>/<user_id>/.mcp.json``，见
+    ``adapters/user_mcp_config.py``），不接受任何"看起来像路径但形态不规范"的
+    写法——本模块只服务判定期的构造安全，真正的存在性与可读性核对留给
+    ``apps/worker/cli.py`` 的 queue 模式启动预检（读到这里就已经知道形态合法，
+    但还没碰过文件系统）。
     """
 
     value = (env.get("LINGXI_USER_ENV_ROOT") or "").strip()
@@ -273,6 +296,13 @@ def _user_env_root(env: Mapping[str, str]) -> str | None:
         return None
     if any(character.isspace() for character in value):
         raise WorkerConfigError("环境变量 LINGXI_USER_ENV_ROOT 不得包含空白字符（不回显取到的值）")
+    if not value.startswith("/") or posixpath.normpath(value) != value:
+        # 不回显收到的值：形态错误的路径本身不敏感，但保持与本文件其它校验
+        # 同一条"误接进来的可能是别的东西"纪律，不因为这一条是路径就破例。
+        raise WorkerConfigError(
+            "环境变量 LINGXI_USER_ENV_ROOT 必须是绝对且已规范化的路径"
+            "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
+        )
     return value
 
 
