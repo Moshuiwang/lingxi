@@ -1149,14 +1149,87 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(fields["variable"], "LINGXI_PERMISSION_BITABLE_APP_TOKEN")
         self.assertNotIn("value", fields)
 
-    def test_without_the_access_token_supply_the_publish_face_is_unwired(self) -> None:
+    def test_without_an_explicit_supply_build_loop_wires_the_publish_face_by_default(
+        self,
+    ) -> None:
+        """产品负责人 2026-08-18 就 #226 裁定方向 3（应用身份）之后，``build_loop``
+        不再需要调用方交出令牌供给——``permission_table_access_token`` 未显式传入时，
+        它自己建一条应用身份供给（``app_id``/``app_secret`` 是 scheduler 本来就必需的
+        配置），发布面因此**默认真实注册**。与花名册那条（#215）同一条口径。
+
+        **装配阶段不得发起任何真实请求**：只验证 ``duty.publish_wired``，不调用
+        供给本身——真实令牌获取属 L4a，见 ``tests/test_feishu_tenant_token.py``。
+        """
+
         audit = RecordingAudit()
 
-        build_loop(self._wired_config(), audit=audit)
+        loop = build_loop(
+            self._wired_config(
+                LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                LINGXI_QUERY_MCP_ENDPOINT="https://mcp.example.invalid/rpc",
+            ),
+            audit=audit,
+        )
 
-        records = self._own_records(audit, "permission_publish.")
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0][1]["reason"], "permission_table_access_token_unwired")
+        duties = {duty.name: duty for duty in loop.duties}
+        self.assertIn("权限发布与就绪确认", duties)
+        self.assertTrue(duties["权限发布与就绪确认"].publish_wired)
+        self.assertEqual(
+            self._own_records(audit, "permission_publish."),
+            [],
+            "配置齐全时默认供给应当让发布面真实注册，不留『未装配』审计",
+        )
+
+    def test_a_missing_supply_is_still_distinguishable_from_a_failing_one_at_the_builder_level(
+        self,
+    ) -> None:
+        """``_build_permission_publish_duty`` 直接调用（不经 ``build_loop`` 的默认构造）
+        时，「没有供给」与「有供给但拿不到令牌」这两种状态必须仍然可分辨——形状照
+        ``tests/test_roster_audit_duty.py`` 的
+        ``test_a_missing_token_supply_is_distinguishable_from_a_failing_one``。
+        ``build_loop`` 现在总会交出一条默认供给，但这条区分本身是
+        ``_build_permission_publish_duty`` 自己的合同，不因调用方总是传非 ``None``
+        而失去意义——直接构造它的调用方（例如未来的另一个入口）仍然可能传 ``None``。
+        """
+
+        from lingxi.apps.scheduler import _build_permission_publish_duty
+        from lingxi.core.permission.table_access_token_supply import (
+            PermissionTableAccessTokenProvider,
+            PermissionTableAccessTokenUnavailable,
+        )
+
+        config = self._wired_config()
+
+        missing_audit = RecordingAudit()
+        missing = _build_permission_publish_duty(
+            config, stop=threading.Event(), audit=missing_audit, permission_table_access_token=None
+        )
+        self.assertEqual(
+            self._own_records(missing_audit, "permission_publish.")[0][1]["reason"],
+            "permission_table_access_token_unwired",
+        )
+        # 就绪面没配 MCP 端点，因此两面都装不起来时不注册；这里只关心发布面那条原因码
+        # 是否仍然可达，不关心整体是否注册。
+        del missing
+
+        def always_failing() -> str:
+            raise PermissionTableAccessTokenUnavailable("fetch_unavailable")
+
+        failing_audit = RecordingAudit()
+        registered = _build_permission_publish_duty(
+            config,
+            stop=threading.Event(),
+            audit=failing_audit,
+            permission_table_access_token=PermissionTableAccessTokenProvider(fetch=always_failing),
+        )
+
+        self.assertIsNotNone(registered, "供给存在但会失败时，发布面照常注册")
+        self.assertTrue(registered.publish_wired)
+        self.assertEqual(
+            self._own_records(failing_audit, "permission_publish."),
+            [],
+            "运行期失败不产生装配阶段的『未装配』审计——那条只在真的调用供给时才出现",
+        )
 
     def test_without_the_mcp_endpoint_only_the_probe_is_skipped(self) -> None:
         """否定断言（N6）：**缺 MCP 端点只关掉探针**——撤权通知与发布都照常。
@@ -1260,6 +1333,38 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(self._own_records(audit, "permission_readiness."), [])
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))
+
+    def test_a_direction_agnostic_provider_fits_the_same_injection_point(self) -> None:
+        """Issue #226 前置：无论最终方向是哪一个，令牌供给的形状都是
+        ``Callable[[], str]``——``PermissionTableAccessTokenProvider``
+        （:mod:`lingxi.core.permission.table_access_token_supply`）作为这个形状的
+        方向无关外壳，必须能原样替换掉裸 lambda，装配结果不变。"""
+
+        from lingxi.core.permission.table_access_token_supply import (
+            PermissionTableAccessTokenProvider,
+        )
+
+        audit = RecordingAudit()
+        supply = PermissionTableAccessTokenProvider(fetch=lambda: "u-fake-token")
+
+        loop = build_loop(
+            self._wired_config(
+                LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                LINGXI_QUERY_MCP_ENDPOINT="https://mcp.example.invalid/rpc",
+            ),
+            permission_table_access_token=supply,
+            audit=audit,
+        )
+
+        duties = {duty.name: duty for duty in loop.duties}
+        self.assertIn("权限发布与就绪确认", duties)
+        self.assertTrue(duties["权限发布与就绪确认"].publish_wired)
+        self.assertTrue(duties["权限发布与就绪确认"].readiness_wired)
+        self.assertEqual(
+            self._own_records(audit, "permission_publish."),
+            [],
+            "配了供给之后发布面不该再留任何未装配审计",
+        )
 
     def test_the_new_variables_are_registered_in_the_environment_key_list(self) -> None:
         for variable in (
