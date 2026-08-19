@@ -53,13 +53,20 @@ class RecordingAudit:
         return [action for action, _ in self.records]
 
 
-def build(env: dict[str, str], *, token: Any = None) -> tuple[Any, RecordingAudit]:
+def build(
+    env: dict[str, str], *, token: Any = None, metric_translation_map: Any = None
+) -> tuple[Any, RecordingAudit]:
     audit = RecordingAudit()
     duty = _build_onboarding_duty(
         SchedulerConfig.from_env(env),
         stop=threading.Event(),
         audit=audit,
         employment_access_token=token,
+        # 这份用例守的是装配级断言（执行级硬截止、探针超时一致、单调时钟、认领量），
+        # 不是发布闸——闸的真实来源、共用来源与变异锚点见
+        # ``tests/test_onboarding_runner.PublishGateTests``。默认给一个恒不可用的空
+        # 映射（与占位期同一个失败关闭方向），不影响本文件任何一条断言。
+        metric_translation_map=metric_translation_map if metric_translation_map is not None else {},
     )
     return duty, audit
 
@@ -106,6 +113,45 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIsInstance(duty, OnboardingReconciler)
         self.assertEqual(audit.actions(), [], "装配成功时不该留「未装配」审计")
         self.assertIsNotNone(duty.capacity_source, "认领量必须绑上执行器剩余容量")
+
+
+class PublishGateWiringTests(unittest.TestCase):
+    """发布闸的真实判据必须来自 :func:`_build_onboarding_duty` 收到的
+    ``metric_translation_map``，不是硬编码的常量（Issue #227 开通侧整合）。
+
+    ``tests/test_onboarding_runner.PublishGateTests`` 测的是 ``AutoOnboardingRunner``
+    收到一个 ``publish_allowed`` 可调用对象之后的行为——注入什么就执行什么，不覆盖
+    "装配层怎么算出这个可调用对象"这一段。本类补的正是这一段：把
+    ``_build_onboarding_duty`` 里 ``publish_allowed=lambda: metric_translation_available(
+    metric_translation_map)`` 写死成 ``lambda: True`` 会被
+    ``test_an_empty_translation_map_keeps_the_gate_closed`` 直接测穿——它绕开数据库
+    与飞书 I/O（构造期两者都不发起真实请求），只读装配产出的可调用对象本身。
+    """
+
+    def test_an_empty_translation_map_keeps_the_gate_closed(self) -> None:
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token", metric_translation_map={})
+
+        self.assertFalse(duty._onboarding._publish_allowed())
+
+    def test_a_populated_translation_map_opens_the_gate(self) -> None:
+        duty, _ = build(
+            WIRED_ENV,
+            token=lambda: "u-token",
+            metric_translation_map={"co_1": {"运营": ("日活",)}},
+        )
+
+        self.assertTrue(duty._onboarding._publish_allowed())
+
+    def test_the_gate_reads_the_shared_object_not_a_copy(self) -> None:
+        """装配层只加载一次映射：闸门必须绑定**同一个**对象引用，不是构造时拷贝出的
+        一份快照或提前算好的布尔值——否则「共用同一个已加载对象」只是名义上的。"""
+
+        mapping = {"co_1": {"运营": ("日活",)}}
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token", metric_translation_map=mapping)
+
+        self.assertTrue(duty._onboarding._publish_allowed())
+        mapping.clear()
+        self.assertFalse(duty._onboarding._publish_allowed(), "闸门读的不是同一个对象引用")
 
 
 class ClaimCapacityTests(unittest.TestCase):

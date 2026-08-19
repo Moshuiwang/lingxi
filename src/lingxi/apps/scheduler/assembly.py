@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,6 +22,7 @@ from lingxi.core.identity.access_token_supply import (
 )
 from lingxi.core.identity.roster_snapshot import DailyRosterSource, RosterSnapshotUpdater
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.metric_translation import metric_translation_available
 from lingxi.core.permission.table_access_token_supply import (
     PermissionTableAccessTokenProvider,
 )
@@ -137,8 +138,18 @@ def _build_permission_refresh_duty(
     *,
     stop: threading.Event,
     audit: AuditSink,
-) -> PermissionRefreshDuty | None:
-    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
+) -> tuple[
+    PermissionRefreshDuty | None,
+    Mapping[str, Mapping[str, Sequence[str]]] | None,
+]:
+    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计。
+
+    返回 ``(duty, metric_translation_map)``：第二个元素是本函数**唯一一次**读取
+    ``lingxi/config/company_function_metric_map.toml`` 得到的对象（前置不齐、连
+    读取都没发生时是 ``None``）。``build_loop`` 把它原样转给
+    :func:`_build_onboarding_duty` 构造 ``publish_allowed``——**同一个已加载对象**，
+    不在开通侧另开一次文件 I/O（见 Issue #227 开通侧整合的取舍说明，
+    ``build_loop`` 内注入点上方的注释）。
 
     形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
     审计恰一条、其余职责照常运行）。前置有三个，逐个说明为什么它是真前置：
@@ -182,7 +193,7 @@ def _build_permission_refresh_duty(
         logger.warning(
             "未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV
         )
-        return None
+        return None, None
 
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
@@ -207,7 +218,7 @@ def _build_permission_refresh_duty(
         logger.error(
             "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
         )
-        return None
+        return None, None
 
     try:
         metric_translation_map = load_company_function_metric_map()
@@ -223,12 +234,12 @@ def _build_permission_refresh_duty(
             "公司+职能→指标名翻译映射配置不可用，每日权限重算职责不注册 error=%s",
             type(error).__name__,
         )
-        return None
+        return None, None
 
     publish_store = PostgresPermissionPublishStore(
         config.postgres_dsn, timeouts=config.postgres_timeouts
     )
-    return PermissionRefreshDuty(
+    duty = PermissionRefreshDuty(
         baseline_reader=PostgresRosterBaselineReader(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
@@ -250,6 +261,7 @@ def _build_permission_refresh_duty(
         audit=audit,
         stop=stop,
     )
+    return duty, metric_translation_map
 
 
 def _build_permission_retention_duty(
@@ -418,6 +430,7 @@ def _build_onboarding_duty(
     stop: threading.Event,
     audit: AuditSink,
     employment_access_token: Callable[[], str] | None,
+    metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
 
@@ -429,6 +442,11 @@ def _build_onboarding_duty(
     它就是这次搬迁的**唯一理由**：那条一次性 ``refresh_token`` 全系统只允许一个消费者，
     而它已经在本进程里（``CredentialRotationLoop.refresh_for_supply`` +
     ``DerivedAccessTokenHolder``，#215 的形状）。**这里不新建供给**，只消费传进来的那一个。
+
+    ``metric_translation_map`` 是「公司+职能→指标名」翻译映射（Issue #227），供构造
+    ``publish_allowed`` 用——**不是**新的文件读取点，而是 :func:`_build_permission_refresh_duty`
+    已经加载过的**同一个对象**（``None`` 代表那一次加载没有发生或失败，与空映射
+    同一个结论：不可用）。调用方（``build_loop``）负责只加载一次、原样转发。
     """
 
     from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
@@ -586,31 +604,31 @@ def _build_onboarding_duty(
         should_stop=should_stop,
         publish_wait_seconds=config.onboarding_publish_wait_seconds,
         # ------------------------------------------------------------------
-        # **发布闸门：现在是占位，恒为关闭。合并 #227 之后必须回到这一行。**
+        # **发布闸门（Issue #227 开通侧整合）。**
         # ------------------------------------------------------------------
-        # 「职能标签 → 指标名」的翻译层（Issue #227）尚未合入本分支。在它落地之前，
-        # 本编排排出去的 ``permissions`` 值列表仍然是职能标签，不是消费方能用的指标名。
-        # #227 在每日重算那一侧的判据是「翻译映射整体为空时，本轮一条发布意图都不排，
-        # 撤权也不例外」；本编排是 ``record_decision`` 的**第三个**调用点（前两个是
-        # 每日重算的授权与撤权），因此必须自己带同一道闸，否则它就是那条判据的绕行入口，
-        # 而绕过去的后果是往正式权限表写一行消费方读不懂的记录——外部表不可回滚。
+        # 「职能标签 → 指标名」的翻译层判据是「翻译映射整体为空时，本轮一条发布意图
+        # 都不排，撤权也不例外」（见 ``permission_refresh`` 模块文档「翻译」一节，
+        # 外部独立审查 2026-08-18 坐实的 P1）。本编排是 ``record_decision`` 的**第三个**
+        # 调用点（前两个是每日重算的授权与撤权），因此必须自己带同一道闸，否则它就是
+        # 那条判据的绕行入口，而绕过去的后果是往正式权限表写一行消费方读不懂的记录
+        # ——外部表不可回滚。
         #
-        # **合并 #227 之后要做的整合动作（缺一不可）**：
-        #   1. 把这个 ``lambda: False`` 换成 #227 的真实判据——「翻译映射非空」那个
-        #      只读检查，与每日重算那一侧**用同一个来源**（不要在这里另读一份文件或
-        #      另做一次解析：两份来源迟早会漂移，而漂移的方向是错误发布）。
-        #   2. **不动 ``core``**：``AutoOnboardingRunner`` 只认一个 ``Callable[[], bool]``，
-        #      判据属装配层。
-        #   3. 验证接对了的方法：翻译映射为空时，一个身份与权限都正常的用户走完
-        #      ``_match`` 后必须停在 ``permission_translation_unavailable``（用户看到
-        #      ``LX-ONBOARD-001``），**且 ``publish_outbox`` 零新增行、``app_user``
-        #      零新增行**；映射非空时同一个用户照常推进到发布等待。
-        #      现成的变异锚点见 ``tests/test_onboarding_runner.PublishGateTests``：把这
-        #      一行改回 ``lambda: True`` 之后那一组必须变红。
+        # 判据实现是 :func:`~lingxi.core.permission.metric_translation.
+        # metric_translation_available`——两个独立写入点共用的**唯一**一份；
+        # ``metric_translation_map`` 是**同一个已加载对象**：``build_loop`` 只调用
+        # :func:`_build_permission_refresh_duty` 读取一次
+        # ``lingxi/config/company_function_metric_map.toml``，本函数收到的是那次读取
+        # 的返回值，不在这里另读一份文件、不另做一次解析（两份来源迟早会漂移，而漂移
+        # 的方向是错误发布）。**不碰 ``core``**：``AutoOnboardingRunner`` 只认一个
+        # ``Callable[[], bool]``，判据属装配层。
         #
-        # 关闭期间用户拿到的是 ``LX-ONBOARD-001``（已转交管理员），**不是**「没有银河
-        # 权限」——后者会把一个权限完全正常的人引去银河申请一个他已经有的权限。
-        publish_allowed=lambda: False,
+        # 变异锚点见 ``tests/test_onboarding_runner.PublishGateTests``：把这一行改回
+        # ``lambda: True`` 必须让它变红；映射为空时，一个身份与权限都正常的用户走完
+        # ``_match`` 后必须停在 ``permission_translation_unavailable``（用户看到
+        # ``LX-ONBOARD-001``，已转交管理员，**不是**「没有银河权限」——后者会把一个
+        # 权限完全正常的人引去银河申请一个他已经有的权限），**且 ``publish_outbox``
+        # 零新增行、``app_user`` 零新增行**；映射非空时同一个用户照常推进到发布等待。
+        publish_allowed=lambda: metric_translation_available(metric_translation_map),
     )
     duty = OnboardingReconciler(
         store=store,
@@ -950,7 +968,16 @@ def build_loop(
     # 每日权限重算排在花名册审计**之后**：同一轮里花名册快照先被换成今天的那一份，
     # 重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。
     # 位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
-    permission_refresh = _build_permission_refresh_duty(config, stop=stop, audit=sink)
+    #
+    # ``metric_translation_map`` 是这一次调用**唯一一次**读取
+    # ``lingxi/config/company_function_metric_map.toml`` 的结果（前置不齐、连读取都
+    # 没发生时是 ``None``）；下面首次开通编排的发布闸复用**同一个对象**（Issue #227
+    # 开通侧整合），不在那里另读一份文件——两份来源迟早会漂移，而漂移的方向是错误
+    # 发布，见 ``_build_permission_refresh_duty`` 与 ``_build_onboarding_duty`` 的
+    # 参数文档。
+    permission_refresh, metric_translation_map = _build_permission_refresh_duty(
+        config, stop=stop, audit=sink
+    )
     if permission_refresh is not None:
         duties.append(permission_refresh)
     # 发布消费排在每日重算**之后**：同一轮里重算先把当天的意图排进来，发布紧接着就能把
@@ -1011,7 +1038,11 @@ def build_loop(
     # 在职状态回读复用**同一个**令牌供给 ``supply``：它就是这次把编排搬进本进程的理由
     # ——那条一次性 refresh_token 全系统只允许一个消费者，而它已经在这里了。
     onboarding = _build_onboarding_duty(
-        config, stop=stop, audit=sink, employment_access_token=supply
+        config,
+        stop=stop,
+        audit=sink,
+        employment_access_token=supply,
+        metric_translation_map=metric_translation_map,
     )
     if onboarding is not None:
         duties.append(onboarding)

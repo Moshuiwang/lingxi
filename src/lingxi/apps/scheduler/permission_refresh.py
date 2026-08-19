@@ -94,7 +94,9 @@ lingxi 统一重签、覆写发布行密文，并经 Epic D 的用户环境链�
 :func:`~lingxi.core.permission.metric_translation.translate_company_functions` 完成，
 映射来自构造时注入的 :attr:`_metric_translation_map`（真实装配读随包发布的
 ``lingxi/config/company_function_metric_map.toml``，见
-:mod:`lingxi.apps.scheduler` 的 ``_build_permission_refresh_duty``）。
+:mod:`lingxi.apps.scheduler` 的 ``_build_permission_refresh_duty``；``build_loop``
+只加载这一份文件一次，首次开通编排的发布闸——``_build_onboarding_duty`` 的
+``publish_allowed``——复用**同一个**已加载对象，不另读一次）。
 
 **这条纪律分两层，关闭面不一样，外部独立审查 2026-08-18 坐实过一次漏洞（P1）之后
 定稿如下：**
@@ -106,7 +108,9 @@ lingxi 统一重签、覆写发布行密文，并经 Epic D 的用户环境链�
    ``{}``，语义上不需要翻译），如果只在授权那条路径挡，会出现"内容到位之前，
    权限只能被减、不能被恢复"的单向不对称——这正是外部审查抓到的漏洞形状：翻译闸
    摆在授权路径上，撤权从旁路绕过直接写正式表。判据不是"这一行要不要翻译"，是
-   "翻译层这一轮可不可用"；映射非空之后，这层闸门自动打开，不需要额外开关。
+   "翻译层这一轮可不可用"；映射非空之后，这层闸门自动打开，不需要额外开关。判据
+   实现是 :func:`~lingxi.core.permission.metric_translation.metric_translation_available`
+   ——**唯一**允许存在的一份，首次开通编排的发布闸调用的是同一个函数。
 2. **逐用户判据**（``_refresh_user`` 内，只在整轮判据已经通过、即映射非空之后才可能
    走到）：某个「公司 + 职能」组合在非空映射里仍然查不到时，
    :data:`SKIP_METRIC_TRANSLATION_UNCOVERED` 只跳过**这一个授权用户**——不发布，
@@ -147,6 +151,7 @@ from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.metric_translation import (
     UncoveredPermissionCombination,
+    metric_translation_available,
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import (
@@ -501,7 +506,7 @@ class PermissionRefreshDuty:
             self._audit_skip(today, SKIP_NO_GALAXY_BATCH)
             return None
 
-        if not self._metric_translation_map:
+        if not metric_translation_available(self._metric_translation_map):
             # 外部独立审查 2026-08-18 坐实的 P1：翻译层映射整体为空时，**整轮**
             # 一条发布意图都不排——撤权也不例外。``_revoke`` 从不调用翻译（它写的
             # 是不含指标名的 ``{}``），因此把这条判据放在逐用户层面挡不住撤权；
@@ -509,6 +514,11 @@ class PermissionRefreshDuty:
             # 不是"这一行要不要翻译"。模块文档「翻译」一节有完整理由——映射为空时
             # 若只挡授权、放行撤权，权限在内容到位之前只能单向减少、不能恢复，
             # 这是最危险的那种不对称。
+            #
+            # ``metric_translation_available`` 是唯一允许存在的判据实现（见其
+            # docstring）：首次开通编排（``apps.scheduler.assembly`` 的
+            # ``publish_allowed``，Issue #227 开通侧整合）对同一个已加载对象调用
+            # 同一个函数，两个独立写入点因此不会漂移出两套看起来等价的检查。
             self._audit_skip(today, SKIP_METRIC_TRANSLATION_UNAVAILABLE)
             return None
 
