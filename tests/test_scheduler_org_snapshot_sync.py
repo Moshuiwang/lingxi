@@ -372,6 +372,71 @@ class ReadFailedAuditTest(unittest.TestCase):
         self.assertEqual(fields["supply"], "app_access_token")
         self.assertNotIn("code", fields)
 
+    def test_a_token_supply_failures_cause_code_is_recovered(self) -> None:
+        """应修 F（独立审查 2026-08-20 可选建议）：``TokenSupplyFailure`` 本身没有
+        ``.code``，但它是 ``raise TokenSupplyFailure(...) from error`` 包出来的——
+        底层 ``error``（例如 ``FeishuTenantTokenError``）若带 ``code``，应当能透过
+        ``__cause__`` 追到，不能让令牌供给失败在审计里只剩 ``supply``、丢了具体
+        原因。变异锚点：把 `__cause__` 那段追溯删掉，本用例会从"code 出现"变红成
+        "code 缺失"。"""
+
+        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailure
+
+        store = FakeStore()
+        audit = RecordingAudit()
+
+        def failing_read() -> SnapshotBatch:
+            try:
+                raise FakeFeishuDirectoryError("feishu_code_99991663")
+            except FakeFeishuDirectoryError as cause:
+                raise TokenSupplyFailure("app_access_token") from cause
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+        )
+
+        duty.run_once()
+
+        fields = audit.records[0][1]
+        self.assertEqual(fields["supply"], "app_access_token")
+        self.assertEqual(fields["code"], "feishu_code_99991663")
+
+    def test_an_unsafe_cause_code_is_dropped_not_sanitized_into_the_audit(self) -> None:
+        """必修 C 的第二道防线：`__cause__.code` 来自本模块不掌控构造的异常类
+        （例如 `adapters/feishu_tenant_token.py::FeishuTenantTokenError`，它还没
+        有做同等的来源收紧），审计写入前必须过白名单——不匹配就整个不写这个
+        字段，不做"部分保留"的净化；日志行读的是同一个已过滤的值，不能绕开审计
+        单独在日志里泄漏（这是审查实测过的注入手法：`{"code": "0 action=
+        org_snapshot_sync.committed run_id=forged tenants=8"}`）。变异锚点：把
+        `logger.error` 那行的 `fields.get("code", "unknown")` 改回直接用未过滤的
+        `code` 变量，本用例的日志断言会变红。"""
+
+        from lingxi.apps.scheduler.org_snapshot_sync import TokenSupplyFailure
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        forged = "0 action=org_snapshot_sync.committed run_id=forged tenants=8"
+
+        def failing_read() -> SnapshotBatch:
+            try:
+                raise FakeFeishuDirectoryError(forged)
+            except FakeFeishuDirectoryError as cause:
+                raise TokenSupplyFailure("app_access_token") from cause
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+        )
+
+        with self.assertLogs("lingxi.apps.scheduler.org_snapshot_sync", level="ERROR") as captured:
+            duty.run_once()
+
+        fields = audit.records[0][1]
+        self.assertEqual(fields["supply"], "app_access_token")
+        self.assertNotIn("code", fields, "不安全字符集的 code 必须整个丢弃，不能截断或替换后仍然写入")
+        for line in captured.output:
+            self.assertNotIn(forged, line, "未过滤的 code 不得原样出现在日志行里")
+            self.assertNotIn("action=org_snapshot_sync.committed", line)
+
 
 class BackoffTest(unittest.TestCase):
     """Issue #268 F3：读取失败（与完整性校验失败）后不得每个 tick 立即重试。stage
@@ -478,7 +543,9 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(result, "orgsync_fixed")
 
         # 下一天再失败一次：streak 必须从 1 重新开始，不是接着上次的 2 继续涨。
-        clock["now"] = clock["now"].replace(day=clock["now"].day + 1)
+        # 用 `timedelta(days=1)` 而不是 `replace(day=day + 1)`——后者在月末会让
+        # `day` 超出当月天数，抛 `ValueError`（应修 F，独立审查 2026-08-20）。
+        clock["now"] = clock["now"] + timedelta(days=1)
         should_fail["value"] = True
         duty.run_once()
         self.assertEqual(audit.records[-1][1]["attempt"], 1, "成功一轮之后退避必须清零，不能带着旧的失败计数")
@@ -501,6 +568,42 @@ class BackoffTest(unittest.TestCase):
         self.assertIsNone(again)
         self.assertEqual(len(audit.records), 1, "退避窗口内跳过的一轮不留审计")
         self.assertEqual(audit.records[0][1]["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
+
+    def test_a_commit_failure_also_backs_off_and_blocks_an_immediate_retry(self) -> None:
+        """独立审查必修 D：写库失败（`commit_failed`）与读取失败、完整性校验失败
+        处在流水线同一个位置——都要先跑完一轮昂贵的外部读取才会撞上——因此也要
+        推进同一条退避。`raise` 本身不变：这里既要证明异常照常冒泡，又要证明
+        状态已经在冒泡前记好，下一次调用会被退避挡住。变异锚点：把
+        `self._advance_backoff(now)` 从 `commit_failed` 分支删掉，本用例的
+        `call_count` 断言会从 1 变红成 2（且 `backoff_seconds`/`attempt` 字段
+        会从审计里消失）。"""
+
+        call_count = {"n": 0}
+
+        def counting_read() -> SnapshotBatch:
+            call_count["n"] += 1
+            return _committable_batch()
+
+        store = FakeStore(raises=RuntimeError("connection_lost"))
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=counting_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+        )
+
+        with self.assertRaises(RuntimeError):
+            duty.run_once()
+
+        self.assertEqual(audit.actions(), ["org_snapshot_sync.commit_failed"])
+        fields = audit.records[0][1]
+        self.assertEqual(fields["attempt"], 1)
+        self.assertEqual(fields["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
+
+        # 同一时刻立即再跑一轮：退避窗口内不得再发起读取（哪怕上一次是靠异常
+        # 冒泡结束的，不是靠 `return None`）。
+        again = duty.run_once()
+        self.assertIsNone(again)
+        self.assertEqual(call_count["n"], 1, "退避窗口内不得再发起外部读取")
+        self.assertEqual(len(audit.records), 1, "退避窗口内跳过的一轮不留审计")
 
 
 class ConstructionTest(unittest.TestCase):

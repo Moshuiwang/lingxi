@@ -52,7 +52,21 @@ ROOT_DEPARTMENT_ID = "0"
 
 
 class OrgSnapshotReadError(RuntimeError):
-    """读取阶段的形状问题（与 :class:`FeishuDirectoryError` 并列，不改写它）。"""
+    """读取阶段的形状问题（与 :class:`FeishuDirectoryError` 并列，不改写它）。
+
+    独立审查 2026-08-20 必修 B：此前没有 ``__init__``，7 处 ``raise`` 全部塌成
+    ``org_snapshot_sync.read_failed`` 审计里的 ``error=OrgSnapshotReadError``——
+    正是 F1 要消灭的"只剩类名、没有诊断信息"那个形状，只是发生在上一层（本模块）
+    而不是 :class:`~lingxi.adapters.feishu_directory.FeishuDirectoryError`。这里
+    的 ``code`` 与后者同一个使用约定：一律是本模块自己写死的安全分类字符串（如
+    ``"app_scope_department_id_missing"``），不含响应正文、令牌或 URL；
+    ``org_snapshot_sync.py`` 已有的 ``getattr(error, "code", None)`` 鸭子类型不用
+    改就能拿到它。
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _tenant_key(record: Mapping[str, Any]) -> str | None:
