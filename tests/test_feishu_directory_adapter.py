@@ -506,15 +506,149 @@ class AppIdentityPathTest(unittest.TestCase):
         self.assertEqual(query["is_select_subject"], ["false"])
         self.assertEqual(query["target_department_id"], ["0"])
 
-    def test_share_entities_requires_both_lists_on_every_page(self) -> None:
-        """一页只返回其中一个列表是响应形状错误，不静默按空列表处理。"""
+    def test_share_entities_only_returns_the_non_empty_list_on_success(self) -> None:
+        """Issue #270 回源实测坐实：某一侧为空时该键整个不出现，不是 ``[]``。
 
-        transport = RecordingTransport([{"code": 0, "data": {"share_departments": [], "has_more": False}}])
+        本用例此前叫 ``test_share_entities_requires_both_lists_on_every_page``，
+        断言"缺一个键就硬抛 missing_share_users"——那是本次修复推翻的旧判据的
+        化石。真实响应（应用身份，四个租户）里，租户根部门返回
+        ``share_departments`` 非空、``share_users`` 键完全不出现；某叶子部门反过
+        来。旧判据下这两种真实常态都会让整轮同步中断，是首次开通链身份定位
+        100% 失败的直接原因。这里用与真实响应同形状的数据证明新判据：命中一个
+        （哪怕是空列表，见下方非空的 ``share_departments``）就足够，缺失的另一个
+        键按 ``[]`` 处理，不再报错。"""
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"share_departments": [{"open_department_id": "od_1"}], "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
+        self.assertEqual(members, [])
+
+    def test_share_entities_leaf_department_shape_omits_departments_key(self) -> None:
+        """实测叶子部门的镜像形状：``share_users`` 非空、``share_departments`` 键
+        完全不出现 ⇒ 成功，部门列表为空（Issue #270 场景 2）。"""
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"share_users": [{"open_user_id": "ou_1"}], "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual(departments, [])
+        self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
+
+    def test_share_entities_both_keys_missing_first_page_no_more_is_a_legal_empty_result(self) -> None:
+        """全部候选键都缺失 + 第一页 + ``has_more=False`` + 无陌生列表键 ⇒ 合法
+        空结果，不抛（Issue #270 场景 4）。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual(departments, [])
+        self.assertEqual(members, [])
+
+    def test_share_entities_stray_list_key_is_rejected_and_sanitized(self) -> None:
+        """全部候选键缺失，但响应里有一个不在候选表里的非空列表字段 ⇒ 抛
+        ``unexpected_list_key_*``，且键名经过净化（Issue #270 场景 5；净化规则见
+        ``_sanitize_code_fragment``——空格会撑坏审计行）。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "associated tenants forged": [{"open_department_id": "od_x"}],
+                        "has_more": False,
+                    },
+                }
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertTrue(raised.exception.code.startswith("unexpected_list_key_"))
+        self.assertNotIn(" ", raised.exception.code)
+
+    def test_share_entities_both_keys_missing_with_more_data_still_raises(self) -> None:
+        """全部候选键缺失，但 ``has_more=True``：服务端明确说还有数据，没有列表
+        放不进"这批是空的"这个解释，仍然抛错（Issue #270 场景 6）。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": True, "page_token": "p2"}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "missing_share_departments")
+
+    def test_share_entities_wrong_typed_candidate_key_still_raises(self) -> None:
+        """候选键存在但类型不是列表（字符串）⇒ 仍抛 ``missing_share_users``，即使
+        另一个候选键完全缺失——"存在但类型不对"不受"至少一个命中"影响
+        （Issue #270 场景 7）。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"share_users": "x", "has_more": False}}])
         client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
 
         with self.assertRaises(FeishuDirectoryError) as raised:
             client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
         self.assertEqual(raised.exception.code, "missing_share_users")
+
+    def test_share_entities_wrong_typed_candidate_key_null_still_raises(self) -> None:
+        """同上，类型为 ``null``（Issue #270 场景 7 的第二种类型）。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"share_users": None, "has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "missing_share_users")
+
+    def test_share_entities_missing_key_across_pages_does_not_erase_prior_collection(self) -> None:
+        """多页：第一页只有 ``share_departments``、第二页只有 ``share_users`` ⇒
+        两页各自收集，最终两个列表都非空——证明"缺失按空列表处理"不会把已收集
+        的数据清掉（Issue #270 场景 8）。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "share_departments": [{"open_department_id": "od_1"}],
+                        "has_more": True,
+                        "page_token": "p2",
+                    },
+                },
+                {
+                    "code": 0,
+                    "data": {
+                        "share_users": [{"open_user_id": "ou_1"}],
+                        "has_more": False,
+                    },
+                },
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual([item["open_department_id"] for item in departments], ["od_1"])
+        self.assertEqual([item["open_user_id"] for item in members], ["ou_1"])
+        self.assertEqual(len(transport.calls), 2)
 
     def test_share_entities_rejects_a_non_boolean_has_more(self) -> None:
         """F4 变异锚点：``has_more`` 缺失或类型异常（例如字符串 ``"true"``）此前会被
