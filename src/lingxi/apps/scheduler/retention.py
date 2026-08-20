@@ -126,6 +126,14 @@ class _ExpiredCheckPurger(Protocol):
     def purge_expired_checks(self) -> int: ...
 
 
+class _ExpiredNoticePurger(Protocol):
+    """``onboarding_completion_notice`` 到期整行删除的最小端口（迁移 ``0066``）。
+    实现是 :class:`lingxi.adapters.postgres_late_readiness_recovery.
+    PostgresLateReadinessStore`。"""
+
+    def purge_expired_notices(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class PermissionRetentionReport:
     """一轮权限链到期处置的摘要。**只有计数与接线状态，没有任何行内容**。
@@ -139,6 +147,8 @@ class PermissionRetentionReport:
     redacted: int = 0
     #: 本轮被删掉的 ``mcp_sync_check`` 行数。
     purged: int = 0
+    #: 本轮被删掉的 ``onboarding_completion_notice`` 行数（V-开通-18）。
+    notices_purged: int = 0
     #: 判定记录那一面这一轮有没有装配（缺 MCP 令牌主密钥时为 ``False``）。
     checks_wired: bool = True
 
@@ -146,14 +156,15 @@ class PermissionRetentionReport:
         return {
             "redacted": self.redacted,
             "purged": self.purged,
+            "notices_purged": self.notices_purged,
             "checks_wired": self.checks_wired,
         }
 
 
 class PermissionRetentionSweepDuty:
-    """权限发布链两张表的九十天到期内容处置职责：每轮各调用一次。
+    """权限发布链三张表的九十天到期内容处置职责：每轮各调用一次。
 
-    两张表的处置方式不同，因为它们**能擦的东西**不同：
+    三张表的处置方式不同，因为它们**能擦的东西**不同：
 
     - ``publish_outbox.payload`` 里有邮箱与姓名 → 擦成 ``'{}'``（
       :meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
@@ -163,6 +174,12 @@ class PermissionRetentionSweepDuty:
       错误码），没有列可擦 → 删整行（
       :meth:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.
       purge_expired_checks`）。
+    - ``onboarding_completion_notice``（迁移 ``0066``，V-开通-18 的通知 outbox）同样
+      没有可识别内容列 → 删整行，但**只删已送达**（``delivered``）的那些
+      （:meth:`~lingxi.adapters.postgres_late_readiness_recovery.
+      PostgresLateReadinessStore.purge_expired_notices`）——``pending`` 的行无论多老
+      都不会被这里删掉，删掉一条还在等待送达的通知等于让一个已经写成 ``active`` 的
+      用户永远收不到「开通完成」，这条边界钉在适配器方法自己的 SQL 里，不在这里控制。
 
     到期判据在两个适配器方法自己的 SQL 里（各自的 ``content_expires_at``，由迁移
     ``0064``/``0065`` 的触发器固定），本职责**一个条件都不加**：清理职责能扩大删除面的
@@ -195,11 +212,13 @@ class PermissionRetentionSweepDuty:
         *,
         outbox: _ExpiredPayloadRedactor,
         checks: _ExpiredCheckPurger | None,
+        notices: _ExpiredNoticePurger,
         audit: AuditSink,
         stop: threading.Event | None = None,
     ) -> None:
         self._outbox = outbox
         self._checks = checks
+        self._notices = notices
         self._audit = audit
         self._stop = threading.Event() if stop is None else stop
 
@@ -223,16 +242,24 @@ class PermissionRetentionSweepDuty:
         purged = 0
         if self._checks is not None:
             purged = self._sweep("mcp_sync_check", self._checks.purge_expired_checks)
+        notices_purged = self._sweep(
+            "onboarding_completion_notice", self._notices.purge_expired_notices
+        )
         report = PermissionRetentionReport(
-            redacted=redacted, purged=purged, checks_wired=self._checks is not None
+            redacted=redacted,
+            purged=purged,
+            notices_purged=notices_purged,
+            checks_wired=self._checks is not None,
         )
         self._audit.record("permission_retention.completed", **report.audit_facts())
-        if redacted or purged:
+        if redacted or purged or notices_purged:
             # 一轮什么都没到期时不打日志：这条职责每分钟跑一次。
             logger.info(
-                "权限链到期清理：publish_outbox 擦除 %s 条内容快照，mcp_sync_check 删除 %s 行",
+                "权限链到期清理：publish_outbox 擦除 %s 条内容快照，mcp_sync_check 删除 %s 行，"
+                "onboarding_completion_notice 删除 %s 行",
                 redacted,
                 purged,
+                notices_purged,
             )
         return report
 

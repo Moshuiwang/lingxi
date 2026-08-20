@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**九个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**十个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -86,6 +86,21 @@
    **它不占 tick**：单条链最长会阻塞十七分钟（发布等待 + 就绪预算），因此跑在专属线程池
    上；``run_once`` 只做"认领若干条并提交"，认领量由执行器剩余容量压住。
 
+10. **迟到就绪恢复**（:class:`~lingxi.apps.scheduler.late_readiness_recovery.
+    LateReadinessRecoveryDuty`，[V-开通-18](../../../../docs/技术设计/验收矩阵.md)）——
+    首次开通编排（职责 9）的阻塞式就绪确认判超时之后，``provisioning_state`` 停在
+    ``mcp_syncing``，此前没有任何东西会再回来看这个人。第十个职责每轮按十五分钟一次
+    的节奏（在候选查询里判到期，不是每轮都真的发探针）把这些用户重新捞回来再探一次，
+    就绪就推进 ``active`` 并主动通知「开通完成」；未就绪的人**不**被推进、也**不**收到
+    任何暗示已经可用的消息。**总能注册**：候选查询、状态推进与通知只需要
+    ``LINGXI_POSTGRES_DSN``/飞书应用凭据（两者都是必填项）；只有需要真探针才能推进的
+    那一路会在缺 MCP 令牌主密钥或问数 MCP 端点时不装配，并留下**恰一条**审计——已经
+    探到就绪但因崩溃未推进的候选仍会被续做。判定复用
+    :mod:`lingxi.core.permission.mcp_readiness` 的探针与分类（新增
+    :class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`，与既有的
+    阻塞式/tick 式就绪确认同一份判定实现），不新造第二套"就绪"的定义。语义、放在哪、
+    节奏与"要试到什么时候为止"的产品决定缺口，见该模块自己的文档字符串。
+
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
 挂在飞书长连接进程内的常驻线程上，把长连接进程 kill 掉后扫描线程无声停止，没有
@@ -126,6 +141,7 @@ from lingxi.core.alerting import (
 
 from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty, _combined_heartbeat
 from lingxi.apps.scheduler.assembly import (
+    _build_late_readiness_recovery_duty,
     _build_onboarding_duty,
     _build_org_snapshot_sync_duty,
     _build_permission_publish_duty,
@@ -147,6 +163,13 @@ from lingxi.apps.scheduler.credential_rotation import (
     CredentialRotationLoop,
     RotationReport,
     _is_definite_failure,
+)
+from lingxi.apps.scheduler.late_readiness_recovery import (
+    DEFAULT_NOTICE_DRAIN_LIMIT,
+    DEFAULT_RECOVERY_INTERVAL_SECONDS,
+    DEFAULT_RECOVERY_LIMIT,
+    LateReadinessRecoveryDuty,
+    LateReadinessRecoveryReport,
 )
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty

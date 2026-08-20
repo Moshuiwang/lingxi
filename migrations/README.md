@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0065_mcp_token_and_sync_check` |
+| head revision | `0066_onboarding_notice_outbox` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -296,6 +296,42 @@ MCP 访问令牌）、`mcp_sync_check`（发布之后每一次「当前用户 MC
 
 两张表本 revision 新增，前滚兼容；`downgrade()` 按依赖反序删表并删触发器函数，不存在
 需要回填的历史值。
+
+## `0066_onboarding_notice_outbox`（迟到就绪恢复的「开通完成」通知 outbox）
+
+`V-开通-18` 外部独立审查 F1 修复。一张新表 `onboarding_completion_notice`：迟到就绪
+恢复职责（首次开通十五分钟同步超时之后仍然把用户捞回来确认）把 `app_user.
+provisioning_state` 推进到 `active` 与向本表排一条待发「开通完成」通知放进**同一个
+数据库事务**，堵住"状态已经推进、但通知发送失败/进程崩溃后永久收不到"这条路——
+「active 但永远不告知」与「永远不 active」对用户是同一种失败。
+
+形状照 `0064` 的 `publish_outbox`，但更简单：只有 `pending` → `delivered` 两态，
+**没有第三态**——早期版本给"收件人暂时查不到"配过一个 `skipped` 终态，外部独立审查
+第三轮坐实这原路复活了 F1 要堵的洞（接口分辨不出"暂时"与"永久"，提前判死会让一个已经
+`active` 的人永远等不到通知）：收件人暂时不可用现在仍然留在 `pending`、按既有退避
+重试，真正的账号删除由 `user_id` 上的 `ON DELETE CASCADE` 处理。**没有持久化的
+`publishing` 中间锁定态**，但认领与发送仍是两次独立调用，中间**确实存在**崩溃窗口
+——只是没有专门的数据库状态标记它：崩溃发生在发送前，下一次到期原样重认领，不丢不发；
+崩溃发生在**发送成功之后、确认送达之前**，会用同一个 `dedupe_key` 重发一次，这条"至少
+一次投递"的残余窗口如实登记在 `apps/scheduler/late_readiness_recovery.py` 的模块文档。
+
+三条约束刻意写进数据库而不是留给调用方自觉：
+
+1. `dedupe_key` 上的 `UNIQUE` 约束——同一用户同一版权限只应该有一条待发通知，适配器
+   插入时 `ON CONFLICT (dedupe_key) DO NOTHING`，因此"推进 active"这一步无论被调用
+   多少次，通知只会被排出一次；
+2. `delivered_at` 与 `status='delivered'` 互为充要（与 `0064` 的 `published_at`/
+   `status='published'` 同一条纪律：一条 `pending` 却带着送达时间的行会被下游读成
+   已经送达）；
+3. 触发器把 `content_expires_at` 固定为 `created_at + 2160 hours`，并禁止改写
+   `created_at`/`user_id`/`permission_version`/`dedupe_key` 四个锚点——与 `0064`/
+   `0065` 同型。到期整行删除（本表没有可识别内容列可擦）只覆盖已送达
+   （`delivered`）的行；**`pending` 的行永远不会被到期删除**，即使触发器已经给它
+   算出了 `content_expires_at`：删掉一条还在等待送达的通知，等于让一个已经写成
+   `active` 的用户永远收不到那句话，这正是本表要堵住的洞。
+
+本表本 revision 新增，前滚兼容；`downgrade()` 删表并删触发器函数，不存在需要回填的
+历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

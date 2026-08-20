@@ -1082,8 +1082,16 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(
             [duty.name for duty in loop.duties],
             # 组织快照同步（Issue #250）的两个令牌供给与花名册配置无关，`build_loop`
-            # 总能建出默认供给，因此总会真实注册。
-            ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理", "组织快照同步"],
+            # 总能建出默认供给，因此总会真实注册；迟到就绪恢复（V-开通-18）没有
+            # 可选前置会让它整体不装配，因此也总会真实注册，排在最后。
+            [
+                "凭据轮换",
+                "保留清理",
+                "空闲会话清理",
+                "权限链到期清理",
+                "组织快照同步",
+                "迟到就绪恢复",
+            ],
         )
         roster_records = self._roster_records(audit)
         self.assertEqual(len(roster_records), 1, "缺群 ID 时花名册职责的审计恰 1 条")
@@ -1113,7 +1121,14 @@ class DutyRegistrationTest(unittest.TestCase):
 
                 self.assertEqual(
                     [duty.name for duty in loop.duties],
-                    ["凭据轮换", "保留清理", "空闲会话清理", "权限链到期清理", "组织快照同步"],
+                    [
+                        "凭据轮换",
+                        "保留清理",
+                        "空闲会话清理",
+                        "权限链到期清理",
+                        "组织快照同步",
+                        "迟到就绪恢复",
+                    ],
                 )
                 roster_records = self._roster_records(audit)
                 self.assertEqual(len(roster_records), 1, "前置缺项时花名册职责的审计恰 1 条")
@@ -1152,6 +1167,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "权限链到期清理",
                 "花名册审计日报",
                 "组织快照同步",
+                "迟到就绪恢复",
             ],
         )
         # 按 ``roster_audit.`` 前缀取本职责的审计：同一个 `build_loop` 还会为每日权限重算
@@ -1230,6 +1246,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "权限链到期清理",
                 "花名册审计日报",
                 "组织快照同步",
+                "迟到就绪恢复",
             ],
         )
         self.assertEqual(self._roster_records(audit), [], "前置齐备时不该有『未注册』审计")

@@ -53,6 +53,7 @@ from lingxi.core.permission.mcp_readiness import (
     ReadinessBinding,
     ReadinessOutcome,
     ReadinessProgress,
+    ReadinessRecoveryTicker,
     ReadinessSchedule,
     ReadinessSession,
     ReadinessTicker,
@@ -1364,6 +1365,220 @@ class ReadinessTickerTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             ticker.advance(("usr_A", 7), permissions=PERMISSIONS, progress=ReadinessProgress())  # type: ignore[arg-type]
+
+
+def _recovery_ticker(
+    *script: object,
+    schedule: ReadinessSchedule = CONTRACT_SCHEDULE,
+    clock: FakeClock | None = None,
+) -> tuple[ReadinessRecoveryTicker, FakeProbe, FakeStore, FakeAudit, FakeClock]:
+    the_clock = clock or FakeClock()
+    the_probe = FakeProbe(*script)
+    the_store = FakeStore()
+    the_audit = FakeAudit()
+    return (
+        ReadinessRecoveryTicker(
+            probe=the_probe,
+            store=the_store,
+            audit=the_audit,
+            clock=the_clock,
+            schedule=schedule,
+        ),
+        the_probe,
+        the_store,
+        the_audit,
+        the_clock,
+    )
+
+
+class ReadinessRecoveryTickerTest(unittest.TestCase):
+    """超时后复检（V-开通-18）：同一套判定，只是不认「终态之后不再动」这条防线。
+
+    首次开通链判过一次 ``timed_out`` 之后，没有任何东西会再回来看这个人
+    （``core/identity/onboarding_runner.py`` 已登记的缺口）。本类是那条恢复路径的
+    判定层：分类、探针调用、绑定、落库与审计与另外两种形态**同一份实现**
+    （:meth:`test_it_shares_the_same_probe_step_as_the_other_two_forms`），新增的只是
+    "不认终态、可以在 timed_out 之后继续探"这一条编排层的行为。
+    """
+
+    def test_a_late_success_is_ready(self) -> None:
+        """核心场景：十五分钟超时之后，权限其实已经同步好了。"""
+
+        ticker, probe, store, audit, _ = _recovery_ticker(3)
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.READY)
+        self.assertEqual(attempt.metric_count, 3)
+        self.assertIsNone(attempt.error_code)
+        self.assertEqual(probe.calls, [USER])
+        self.assertEqual(len(store.records), 1, "就绪判定必须落库，供事后复审")
+        self.assertEqual(audit.entries[-1][0], "mcp_readiness.ready")
+
+    def test_an_empty_result_is_still_waiting_not_ready(self) -> None:
+        """否定断言：明确空结果依旧不算就绪——探针法的核心判据没有因为复检而放宽。"""
+
+        ticker, _, _, _, _ = _recovery_ticker(0)
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.WAITING)
+
+    def test_an_unreadable_result_is_a_technical_failure_not_ready(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(-1)
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+
+    def test_a_denied_probe_is_waiting_not_a_technical_failure(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(McpProbeError("still_syncing", denied=True))
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.WAITING)
+
+    def test_an_unclear_probe_failure_is_a_technical_failure(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(McpProbeError("network_error", denied=False))
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+
+    def test_the_recovery_ticker_never_produces_a_second_timeout(self) -> None:
+        """否定断言：**本类从不产出 ``timed_out``**——那是原始那一轮唯一的终态，复检
+        不该再记第二条同义的终态（模块文档「本类从不产出」一节）。
+
+        用"超窗成功"这唯一会撞上超时判定的路径来证：探针跑得比它自己的超时还久，
+        阻塞形态会把它判成 ``timed_out``（预算耗尽），本类必须与 tick 形态同一条纪律，
+        把它降级成 ``technical_failure``，而不是升级成第二个 ``timed_out``。
+        """
+
+        schedule = ReadinessSchedule(
+            interval_seconds=10, budget_seconds=10, probe_timeout_seconds=10
+        )
+        clock = FakeClock()
+
+        class SlowProbe:
+            def list_metrics(self, *, user_id: str) -> int:
+                # 让"返回时刻"远远晚于探针自己的超时，模拟探针链失控。
+                clock.advance(999)
+                return 5
+
+        ticker = ReadinessRecoveryTicker(
+            probe=SlowProbe(),
+            store=FakeStore(),
+            audit=FakeAudit(),
+            clock=clock,
+            schedule=schedule,
+        )
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+        self.assertEqual(attempt.error_code, "probe_overran_timeout")
+        self.assertIsNone(attempt.metric_count)
+
+    def test_it_never_re_judges_permission_presence(self) -> None:
+        """本类不重复判断"有没有可等的权限"：签名里没有 ``permissions`` 参数可传，
+        类型上就写不出"复检顺手判一次 no_permission"这件事。"""
+
+        params = inspect.signature(ReadinessRecoveryTicker.probe_after_timeout).parameters
+        self.assertNotIn("permissions", params)
+
+    def test_probe_not_wired_advances_nothing(self) -> None:
+        """探针未接线：不落任何记录、不烧预算，端点配好后原样继续。"""
+
+        ticker = ReadinessRecoveryTicker(
+            probe=None, store=FakeStore(), audit=FakeAudit(), clock=FakeClock()
+        )
+
+        attempt = ticker.probe_after_timeout(BINDING, attempt_no=7)
+
+        self.assertIsNone(attempt)
+        self.assertFalse(ticker.probe_wired)
+
+    def test_it_rejects_a_binding_of_the_wrong_type(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        with self.assertRaises(TypeError):
+            ticker.probe_after_timeout(("usr_A", 7), attempt_no=1)  # type: ignore[arg-type]
+
+    def test_it_rejects_an_illegal_attempt_number(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        for bad in (0, -1, True, "7"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError):
+                    ticker.probe_after_timeout(BINDING, attempt_no=bad)  # type: ignore[arg-type]
+
+    def test_it_shares_the_same_probe_step_as_the_other_two_forms(self) -> None:
+        """三种形态**共用同一份**"发一次探针并落库"的实现，不是第三套判据。"""
+
+        self.assertIs(
+            McpReadinessConfirmation._probe_once, ReadinessRecoveryTicker._probe_once
+        )
+        self.assertIs(McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt)
+        self.assertIs(ReadinessTicker._probe_once, ReadinessRecoveryTicker._probe_once)
+
+    def test_it_never_sleeps(self) -> None:
+        """否定断言：本类源码里没有任何等待——常驻职责的一轮 tick 不该被它占住。"""
+
+        source = _code_without_docstrings(inspect.getsource(ReadinessRecoveryTicker))
+        for forbidden in ("sleep", "wait(", "time."):
+            self.assertNotIn(forbidden, source, f"复检形态不得等待：{forbidden}")
+
+    def test_record_processing_failure_writes_a_technical_failure_without_probing(
+        self,
+    ) -> None:
+        """外部独立审查 F4：探针之外的失败（渲染异常、状态推进异常……）也要占住这一次
+        调度窗口，否则"毒候选"会在下一个 tick 立刻被重新选中，饿死排在后面的候选。"""
+
+        ticker, probe, store, audit, _ = _recovery_ticker(3)
+
+        attempt = ticker.record_processing_failure(
+            BINDING, attempt_no=8, code="recovery_failed_RuntimeError"
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+        self.assertEqual(attempt.error_code, "recovery_failed_RuntimeError")
+        self.assertIsNone(attempt.metric_count)
+        self.assertEqual(probe.calls, [], "本方法不发起任何探针调用")
+        self.assertEqual(len(store.records), 1, "必须落库，候选查询的到期判据才会前移")
+        self.assertEqual(audit.entries[-1][0], "mcp_readiness.technical_failure")
+
+    def test_record_processing_failure_shares_the_same_attempt_helper(self) -> None:
+        """与探针路径共用同一份落库 + 审计实现，不是第二套形状。"""
+
+        self.assertIs(
+            McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt
+        )
+
+    def test_record_processing_failure_rejects_a_binding_of_the_wrong_type(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        with self.assertRaises(TypeError):
+            ticker.record_processing_failure(
+                ("usr_A", 7), attempt_no=1, code="x"  # type: ignore[arg-type]
+            )
+
+    def test_record_processing_failure_rejects_an_illegal_attempt_number(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        for bad in (0, -1, True):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError):
+                    ticker.record_processing_failure(
+                        BINDING, attempt_no=bad, code="x"  # type: ignore[arg-type]
+                    )
+
+    def test_record_processing_failure_requires_a_code(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        for bad in ("", "   "):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError):
+                    ticker.record_processing_failure(BINDING, attempt_no=1, code=bad)
 
 
 if __name__ == "__main__":  # pragma: no cover
