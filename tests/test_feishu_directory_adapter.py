@@ -121,6 +121,26 @@ class DirectoryPaginationTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "feishu_code_99991663")
 
+    def test_a_non_integer_business_error_code_does_not_leak_into_the_directory_error(self) -> None:
+        """独立审查必修 C：``code`` 是响应里唯一直接拼进
+        ``FeishuDirectoryError.code`` 的外部数据。审查实测过用一个带空格与 ``=``
+        的字符串值伪造出一条看起来合法的审计记录——``_payload`` 现在只在
+        ``code`` 是货真价实的 ``int`` 时才插值，否则退化成固定标签
+        ``feishu_code_invalid``。变异锚点：把 ``_payload`` 里的
+        ``_safe_feishu_code(code)`` 改回 ``f"feishu_code_{code}"``，本用例会从
+        ``code == "feishu_code_invalid"``变红成把伪造字符串原样交出来。"""
+
+        forged = "0 action=org_snapshot_sync.committed run_id=forged tenants=8"
+        transport = RecordingTransport([{"code": forged, "msg": "forged"}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, "feishu_code_invalid")
+        self.assertNotIn(forged, raised.exception.code)
+        self.assertNotIn("run_id=forged", str(raised.exception))
+
     def test_a_response_that_is_not_a_mapping_is_refused(self) -> None:
         transport = RecordingTransport([["not", "a", "mapping"]])
         client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
@@ -261,6 +281,188 @@ class DirectoryPaginationTest(unittest.TestCase):
 
         self.assertNotIn("tenant_key", inspect.signature(FeishuDirectoryClient.__init__).parameters)
         self.assertIn("tenant_key", inspect.signature(FeishuDirectoryClient.list_visible_organization).parameters)
+
+
+class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
+    """Issue #268 F2：**空 ⇒ 空，畸形 ⇒ 抛错**——「空结果」不再被误判成响应形状
+    错误，但真正的形状错误（各有独立的否定断言）一条都不许被这次改动放松。
+    真实响应在结果为空时只有 ``has_more``，四个候选键一个都不出现（编排者
+    2026-08-19 用应用身份实测过同一端点的这个形状）。
+
+    独立审查 2026-08-20 推翻了本类此前覆盖的一版更宽松的实现：那一版只要候选键
+    不存在就放行空结果，不管是不是第一页、也不管响应里是否其实有一个陌生的非空
+    列表字段。收紧后判据见下方各用例；``unexpected_list_key_*`` 那两条是新增的
+    诊断能力——真实列表键名不在候选表里时，直接把陌生字段名交出来，不再是"约
+    700 次分页请求之后才在 ``verify_batch`` 里冒出来"的间接信号。
+    """
+
+    def test_no_candidate_keys_and_a_strict_false_has_more_is_an_empty_list(self) -> None:
+        """正向：这是 F2 要放行的唯一场景——第一页、没有任何候选键、``has_more``
+        严格为 ``False``、响应里也没有别的非空列表字段。变异锚点——把 `_pages`
+        里这条判据删掉、恢复成"四个候选键一个都不存在就直接 raise"，本用例会
+        变红。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        self.assertEqual(client.list_collaboration_tenants(token="fake-user-token"), [])
+
+    def test_an_unexpected_non_empty_list_key_on_the_first_page_raises_and_names_it(self) -> None:
+        """独立审查必修 A 的核心场景：真实列表键名（这里模拟成
+        ``associated_tenants``）不在候选表里时，不能被"空结果"判据静默吞掉——
+        必须抛错，且错误码直接带出陌生字段名，这正是 #268 缺的诊断信息。变异
+        锚点：把这条"陌生非空列表键必须抛错"的检查删掉，本用例会从"抛错"变红成
+        "静默返回 []"。"""
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"associated_tenants": [{"tenant_key": "tenant_a"}], "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "unexpected_list_key_associated_tenants")
+
+    def test_an_unexpected_list_key_name_is_sanitized_before_becoming_a_code(self) -> None:
+        """陌生字段名来自不可信响应：截断到 40 字符、且非安全字符被替换成 `_`——
+        不止是长度上界，字符集也要收窄，否则空格分隔的 `k=v` 审计行仍然可能被
+        字段名本身（例如带空格）注入（必修 C 的延伸）。"""
+        stray_key = "a" * 50 + " injected=true"
+        transport = RecordingTransport(
+            [{"code": 0, "data": {stray_key: [{"tenant_key": "tenant_a"}], "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        code = raised.exception.code
+        self.assertTrue(code.startswith("unexpected_list_key_"))
+        self.assertEqual(len(code) - len("unexpected_list_key_"), 40, "陌生字段名必须截断到 40 字符")
+        self.assertNotIn(" ", code)
+        self.assertNotIn("=", code)
+
+    def test_an_unexpected_empty_list_key_does_not_count_as_a_stray_signal(self) -> None:
+        """陌生字段是空列表（不是"有数据但键名不对"）时，仍然按合法空结果放行——
+        真正触发 unexpected_list_key 的信号是"有数据但没被候选键接住"，不是任意
+        陌生字段的存在。"""
+        transport = RecordingTransport([{"code": 0, "data": {"associated_tenants": [], "has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        self.assertEqual(client.list_collaboration_tenants(token="fake-user-token"), [])
+
+    def test_has_more_true_without_any_list_key_still_raises(self) -> None:
+        """否定断言：服务端明确说"还有更多"却没给列表键，不是"这批恰好是空的"。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": True}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_a_present_key_with_the_wrong_type_still_raises_even_with_has_more_false(self) -> None:
+        """否定断言：候选键**存在**但类型不对（这里是字符串），哪怕 ``has_more``
+        是 ``False``，也不能被"空结果"那条判据放行——键存在就说明飞书对这个字段
+        有意义的表达，类型不对是响应形状变了，不是"这批没有数据"。"""
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_tenant_list": "不是列表", "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_has_more_missing_with_no_candidate_keys_still_raises_not_silently_empty(self) -> None:
+        """独立审查「应修 E」降级后：``has_more`` 缺失本身不再单独抛
+        ``has_more_invalid``（只记一条 warning，见下方 ``HasMoreLeniencyTest``），
+        但"空结果"判据要求 ``has_more`` **严格为** ``False``——缺失（``None``）
+        不满足，所以仍然落进 ``missing_<key>``，不会被空结果判据顺手放行。"""
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_has_more_as_a_non_boolean_truthy_value_with_no_candidate_keys_still_raises(self) -> None:
+        """同上：``has_more`` 是字符串 ``"false"``（真值但不是合法 bool）时同样不
+        满足"严格为 False"，第一页没有候选键仍然抛 ``missing_<key>``。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": "false"}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_a_later_page_missing_the_list_key_is_a_half_page_and_must_raise(self) -> None:
+        """独立审查必修 A：中途某一页丢了候选列表键是"半页"，不是"空"——
+        #250 立下的"半页不得当成成功"纪律。此前更宽松的一版会把这种情况当成
+        "读完了"悄悄返回已收集的部分结果；现在必须抛错。变异锚点：把"只在第一页"
+        这条限制去掉（例如把 `page_token is None and not collected` 删掉），本
+        用例会从"抛错"变红成"返回 ['tenant_a']"。"""
+        transport = RecordingTransport(
+            [
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                {"code": 0, "data": {"has_more": False}},
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_visible_organization_also_accepts_an_empty_result(self) -> None:
+        """`_pages` 的空结果判据是共享实现，`list_visible_organization` 同样受益——
+        这条用户身份路径下的租户如果确实没有可见组织，不该被判成响应形状错误。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_visible_organization(token="fake-user-token", tenant_key="tenant_a")
+        self.assertEqual(departments, [])
+        self.assertEqual(members, [])
+
+
+class HasMoreLeniencyTest(unittest.TestCase):
+    """独立审查 2026-08-20「应修 E」：`_pages` 的 ``has_more`` 校验从"非法类型立即
+    抛错"降级为"非法类型按既有宽容语义处理（缺失/非法类型都当作读完了）+ 一条
+    warning 日志"，与本函数改动前、以及已受控验收的历史脚本
+    ``scripts/sync_feishu_org_snapshot.py`` 的判据一致——两边都有证据，证据不足
+    以支持"非法类型必须硬失败"这个更严格的新判据。"""
+
+    def test_a_missing_has_more_with_real_data_is_leniently_treated_as_the_last_page(self) -> None:
+        """已知限制（收口说明里登记，待真实响应证据后再决定是否收严）：``has_more``
+        完全缺失、但候选键有真实数据时，不再抛错，按"读完了"处理——与本函数改动前
+        的既有生产行为一致。变异锚点：把 `has_more is not True` 改回 `raise
+        FeishuDirectoryError("has_more_invalid")`，本用例会变红。"""
+        transport = RecordingTransport([{"code": 0, "data": {"target_tenant_list": [{"tenant_key": "tenant_a"}]}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+
+    def test_a_non_boolean_truthy_has_more_with_real_data_is_leniently_treated_as_the_last_page(self) -> None:
+        """同上，``has_more`` 是字符串 ``"true"``（非法类型，真值）时同样按"读完了"
+        处理，不继续翻页、不抛错——这是有意接受的已知限制，不是回归。"""
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_tenant_list": [{"tenant_key": "tenant_a"}], "has_more": "true"}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+        self.assertEqual(len(transport.calls), 1, "非法类型的 has_more 不得触发继续翻页")
+
+    def test_a_non_boolean_has_more_logs_a_warning_without_raising(self) -> None:
+        """降级不等于沉默：非法类型仍然留痕，只是不失败关闭。这里的 ``has_more``
+        非法（字符串 ``"false"``）且第一页没有候选键，仍然会因为"不满足空结果的
+        严格 False 条件"而抛 ``missing_<key>``——但 warning 日志与是否抛错是两件
+        独立的事，只证明 warning 确实被记下来了。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": "false"}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertLogs("lingxi.adapters.feishu_directory", level="WARNING") as captured:
+            with self.assertRaises(FeishuDirectoryError):
+                client.list_collaboration_tenants(token="fake-user-token")
+        self.assertTrue(any("has_more" in line for line in captured.output))
 
 
 class AppIdentityPathTest(unittest.TestCase):

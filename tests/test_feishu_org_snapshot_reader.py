@@ -307,6 +307,29 @@ class TenantKeyShapeTest(unittest.TestCase):
         self.assertEqual(raised.exception.args[0], "user_scope_tenant_key_missing")
 
 
+class ErrorCodeAttributeTest(unittest.TestCase):
+    """独立审查 2026-08-20 必修 B：`OrgSnapshotReadError` 此前没有 ``__init__``，
+    7 处 ``raise`` 全部塌成 `org_snapshot_sync.read_failed` 审计里的
+    ``error=OrgSnapshotReadError``——没有 `.code`，`apps/scheduler/
+    org_snapshot_sync.py` 的 ``getattr(error, "code", None)`` 鸭子类型拿不到任何
+    分类信息，F1 在这一层完全帮不上忙。变异锚点：把 `OrgSnapshotReadError` 的
+    `__init__` 删掉（退回纯 `RuntimeError` 子类，不设 `self.code`），本用例会从
+    "code == 'app_scope_tenant_key_missing'"变红成 `AttributeError`。"""
+
+    def test_the_raised_error_carries_a_readable_code_attribute(self) -> None:
+        client = FakeDirectoryClient(
+            app_tenants=[{"no_tenant_key_field": "whatever"}],
+            user_tenants=[{"tenant_key": "tenant_a"}],
+        )
+
+        with self.assertRaises(OrgSnapshotReadError) as raised:
+            read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
+        self.assertEqual(raised.exception.code, "app_scope_tenant_key_missing")
+        # `args[0]`（既有断言用的形态）与 `.code` 必须是同一个值——不是两套并存
+        # 的分类，`.code` 只是给 F1 的鸭子类型消费者一个明确、稳定的属性名。
+        self.assertEqual(raised.exception.args[0], raised.exception.code)
+
+
 class DepartmentIntegrityTest(unittest.TestCase):
     """F3 变异锚点：应用路径看到的部门必须纳入批次完整性校验，否则用户路径漏看
     的空部门（不含任何成员，成员集合两边照样能对上）会被判完整、静默从基线消失。

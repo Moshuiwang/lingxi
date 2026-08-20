@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
@@ -126,12 +127,48 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
         raise FeishuDirectoryError("invalid_json") from error
 
 
+def _safe_feishu_code(value: object) -> str:
+    """把飞书业务错误码渲染成审计安全的分类标签（独立审查 2026-08-20 必修 C）。
+
+    ``FeishuDirectoryError.code`` 里，``feishu_code_*`` 这一类是**唯一由外部响应
+    数据直接拼出来的字段**：飞书的业务错误码理应是整数，但响应本身不可信——把
+    任意 JSON 值原样塞进 ``feishu_code_{value}`` 会让审计（空格分隔的 ``k=v``
+    结构化行）被响应内容注入。审查实测：响应给 ``{"code": "0 action=
+    org_snapshot_sync.committed run_id=forged tenants=8"}`` 这类值时，旧写法能在
+    审计行里拼出一条看起来合法的伪造 ``committed`` 记录。只在 ``value`` 是货真
+    价实的 ``int``（排除 ``bool``，因为 ``bool`` 是 ``int`` 子类）时插值，否则
+    退化成一个固定标签——"响应的错误码不是预期的整数"本身就是可判断的信息，
+    不需要连带把原值一起交出来。
+    """
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"feishu_code_{value}"
+    return "feishu_code_invalid"
+
+
+_UNSAFE_CODE_FRAGMENT_CHAR = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _sanitize_code_fragment(value: str, *, max_length: int = 40) -> str:
+    """把一段可能来自不可信响应的文本，收窄成能安全拼进 ``FeishuDirectoryError.code``
+    的片段——截断长度、并把不在安全字符集里的字符替换成 ``_``。
+
+    这是必修 C（``_safe_feishu_code``）同一个风险的延伸：``unexpected_list_key_*``
+    这条错误码（``_pages`` 的空结果收紧，独立审查 2026-08-20 必修 A）把响应里一个
+    "不在候选表里"的 JSON 键名原样交出来，方便诊断；但 JSON 键名同样是外部数据、
+    同样可能含空格或其他会撑坏空格分隔 ``k=v`` 审计行的字符。只截断长度（`[:40]`）
+    只挡住"行被撑得很长"，挡不住"行被注入假字段"——字符集必须一起收窄。
+    """
+
+    return _UNSAFE_CODE_FRAGMENT_CHAR.sub("_", value[:max_length])
+
+
 def _payload(response: Any) -> dict[str, Any]:
     if not isinstance(response, Mapping):
         raise FeishuDirectoryError("invalid_response_shape")
     code = response.get("code")
     if code not in (None, 0, "0"):
-        raise FeishuDirectoryError(f"feishu_code_{code}")
+        raise FeishuDirectoryError(_safe_feishu_code(code))
     data = response.get("data")
     return dict(data) if isinstance(data, Mapping) else {}
 
@@ -144,6 +181,59 @@ class _PagedClient:
         self._transport: Callable[..., Any] = transport or urllib_transport
 
     def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        """按候选键名读一份分页列表；**空 ⇒ 空，畸形 ⇒ 抛错**（Issue #268 F2，
+        独立审查 2026-08-20 缩窄）。
+
+        真实响应在结果为空时只有 ``has_more``，四个候选键一个都不出现（编排者
+        2026-08-19 用应用身份实测过同一端点的这个形状）——此前把这种完全正常的
+        空结果当成"响应形状错误"抛出，是本次 stage 首触冒烟每 30 秒失败一轮的
+        直接原因之一。但空结果的判定收紧到**唯一场景**：这是**第一页**（还没有
+        任何游标、也还没收集到任何数据）、候选键一个都不存在（哪怕值是 ``None``
+        也算"存在"）、且 ``has_more`` 是货真价实的 ``False``。
+
+        **独立审查 2026-08-20 推翻了本函数此前更宽松的一版**：那一版只要候选键
+        不存在就放行空结果，不看是第一页还是第几页、也不看响应里是否其实有一个
+        "长得不像候选键"的列表。审查用同一份假响应实测：真实列表键名一旦不在
+        候选表里（例如飞书真用的是 ``associated_tenants`` 而不是这里列的任何一个），
+        旧版**静默返回 ``[]``**，故障要等到约 700 次分页请求之后才会在
+        ``verify_batch`` 的 ``path_sets_differ`` 里冒出来——诊断成本从 1 次请求
+        变成约 700 次，与编排者两次基于间接证据误判根因是**同一个形状**，而
+        #268 的第一优先恰恰是消灭这个形状。收紧后的判据：
+
+        - **只在第一页**才可能判定为空——**中途某一页**丢了候选列表键，是"半页"
+          不是"空"，必须抛错（下方两条合起来正是 #250 立下、本函数注释曾经点名
+          过的"半页不得当成功"纪律，此前的宽松版本反而绕开了它）；
+        - 第一页确实没有任何候选键、且 ``has_more`` 严格为 ``False`` 时，若响应里
+          存在**另一个**非空列表字段（真实列表键不在候选表里的直接信号），**必须
+          抛错并把那个陌生字段名交出来**（``unexpected_list_key_<字段名，经
+          :func:`_sanitize_code_fragment` 截断并收窄字符集>``）——这条错误码
+          本身就是诊断信息，不是"又一个不透明的 missing_"；确认响应里真的什么
+          列表都没有，才是合法空结果；
+        - ``has_more`` 为 ``True`` 却没有任何候选列表键：服务端明确说还有数据，
+          没有列表放不进"这批是空的"这个解释，仍然抛错；
+        - 候选键**存在**但类型不是列表（字符串、``null``、字典……）：飞书返回了
+          这个字段就说明它有意义，类型不对是响应形状变了，不是"这批恰好没有"，
+          仍然抛错；
+        - 列表里出现非对象项、游标停滞：与此前一致，不受本次改动影响。
+
+        **``has_more`` 不是合法 ``bool`` 时刻意不再抛错（独立审查「应修 E」）**：
+        本仓库两处证据互相矛盾——已受控验收、真跑通过 8 租户 710 人的历史脚本
+        ``scripts/sync_feishu_org_snapshot.py`` 与本函数改动前的既有实现都用
+        "不是严格 ``True`` 就当作读完了"（对缺失/非法类型宽容）；而 F2 引用的
+        "结果为空时字段缺失"这条说法若成立，`has_more: false` 本身就可能不出现，
+        对非法类型一律硬抛会把 stage 的"每 30 秒 ``missing_X``"换成"每 30 秒
+        ``has_more_invalid``"——看起来像修了，其实只是换了个错。证据不足，不
+        收严：非严格 ``bool`` 只记一条 warning 日志（拿到真实响应形状证据前留痕，
+        不失败关闭），分页是否继续仍按"严格等于 ``True`` 才继续"判定，与改动前
+        完全一致。
+
+        不采用历史脚本 ``scripts/sync_feishu_org_snapshot.py`` 的
+        ``walk_dicts(response.get("data"))`` 递归遍历方案：那样做会把响应里任意
+        位置的、恰好长得像目标对象的字典也一并捞进来，換来的宽容是以"来源不可控"
+        为代价；这里要的只是别把"没有"误判成"读错了"，以及别把"读错了"误判成
+        "没有"。
+        """
+
         collected: list[dict[str, Any]] = []
         page_token: str | None = None
         for _ in range(MAX_PAGES):
@@ -152,6 +242,16 @@ class _PagedClient:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
             data = _payload(self._transport("GET", url, body=None, token=token))
+            has_more = data.get("has_more")
+            if not isinstance(has_more, bool):
+                # 降级为 warning，不再硬抛（应修 E）：证据不足以确定"非法类型"
+                # 与"读完了"哪个解释更符合真实响应，见上方文档字符串。
+                logger.warning(
+                    "组织快照分页响应的 has_more 不是合法 bool，按既有宽容语义"
+                    "处理（不阻塞本轮，Issue #268 应修 E）path=%s type=%s",
+                    path,
+                    type(has_more).__name__,
+                )
             items = None
             for candidate in keys:
                 value = data.get(candidate)
@@ -159,6 +259,25 @@ class _PagedClient:
                     items = value
                     break
             if items is None:
+                if page_token is None and not collected and has_more is False and not any(
+                    candidate in data for candidate in keys
+                ):
+                    # 只在第一页、还没收集到任何数据时，才可能是"空结果"——见上方
+                    # 文档字符串「独立审查 2026-08-20 推翻了…」一节。响应里若还有
+                    # 一个不在候选表里的非空列表字段，那是真实字段名不在候选表里
+                    # 的直接信号，必须抛错并把字段名交出来，不能静默吞掉。
+                    stray = next(
+                        (key for key, value in data.items() if isinstance(value, list) and value),
+                        None,
+                    )
+                    if stray is not None:
+                        # 顶层 JSON 键名不是凭据，但同样不可信：`_sanitize_code_
+                        # fragment` 截断长度**并**收窄字符集（必修 C 的延伸，见
+                        # 该函数文档字符串），不只是防止响应塞一个超长字符串把
+                        # 审计行撑爆，也防止键名本身带空格 / `=` 之类字符注入
+                        # 空格分隔的 `k=v` 审计行。
+                        raise FeishuDirectoryError(f"unexpected_list_key_{_sanitize_code_fragment(stray)}")
+                    return collected
                 raise FeishuDirectoryError(f"missing_{keys[0]}")
             for item in items:
                 if not isinstance(item, Mapping):
@@ -167,7 +286,9 @@ class _PagedClient:
                     raise FeishuDirectoryError("invalid_page_item")
                 collected.append(item)
             next_token = data.get("page_token")
-            if data.get("has_more") is not True:
+            if has_more is not True:
+                # 与改动前一致：只有严格的 `True` 才继续翻页；缺失、`False`、
+                # 非法类型都当作"读完了"（应修 E，不再对非法类型硬抛）。
                 return collected
             # has_more=true 但游标缺失或停滞：服务端明确说还有数据，把已收集的
             # 半截结果当成功返回会让调用方用它替换旧快照（Codex 复查发现）。
@@ -242,6 +363,11 @@ class FeishuDirectoryClient(_PagedClient):
         # 字段链取自 2026-07-29 真实探针（scripts/verify_feishu_association.sh）：
         # 实测主字段是 target_tenant_list；此前写的 collaboration_tenant_list 在真实
         # 响应里不存在，会让每次成功响应都被判失败（Codex 复查发现）。
+        #
+        # 这条用户身份路径**没有**目标租户可传，返回"这个用户身份当前看不到任何
+        # 关联组织"完全合法（`_pages` 已按 Issue #268 F2 把这种空结果与真正的响应
+        # 形状错误分开）；调用方不得据此断言"该主体一定看不到关联组织"——那需要
+        # 独立证据，不是本方法的隐含语义（Issue #268 更正评论撤回的正是这条跳跃）。
         return self._pages(
             "/trust_party/v1/collaboration_tenants",
             token=token,
@@ -392,7 +518,7 @@ class FeishuAuthorizationClient:
         )
         data = response if isinstance(response, Mapping) else {}
         if data.get("code") not in (None, 0, "0"):
-            raise FeishuDirectoryError(f"feishu_code_{data.get('code')}")
+            raise FeishuDirectoryError(_safe_feishu_code(data.get("code")))
         access_token_value = data.get("access_token")
         refresh_token = data.get("refresh_token")
         expires_in = data.get("refresh_token_expires_in")
@@ -415,7 +541,7 @@ class FeishuAuthorizationClient:
         )
         if not isinstance(info, Mapping) or info.get("code") not in (None, 0, "0"):
             code_value = info.get("code") if isinstance(info, Mapping) else "invalid_response"
-            raise FeishuDirectoryError(f"feishu_code_{code_value}")
+            raise FeishuDirectoryError(_safe_feishu_code(code_value))
         raw_profile = info.get("data", info)
         if not isinstance(raw_profile, Mapping):
             raise FeishuDirectoryError("identity_profile_invalid")
@@ -458,7 +584,7 @@ class FeishuAuthorizationClient:
         data = response if isinstance(response, Mapping) else {}
         code = data.get("code")
         if code not in (None, 0, "0"):
-            raise FeishuDirectoryError(f"feishu_code_{code}")
+            raise FeishuDirectoryError(_safe_feishu_code(code))
         access_token = data.get("access_token")
         next_token = data.get("refresh_token")
         expires_in = data.get("refresh_token_expires_in")
