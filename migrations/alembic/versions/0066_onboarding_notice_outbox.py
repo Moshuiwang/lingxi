@@ -21,16 +21,25 @@ Create Date: 2026-08-20
 
 ## 通知本身是一张**独立的 outbox**，靠持久重试保证最终送达
 
-`onboarding_completion_notice` 只有一种正常生命周期：`pending`（排出但还没送达）→
-`delivered`（送达，终态）。第三态 `skipped` 是唯一的旁路终态——推进到 `active` 之后，
-收件人查询查不到 `open_id`（账号在极短窗口内又被停用或删除），这个人已经没有"收件人"这
-个概念了，无限重试没有意义，因此登记一个可分辨的终态而不是永远 `pending`。
+`onboarding_completion_notice` 只有两态：`pending`（排出但还没送达）→ `delivered`
+（送达，终态）。**没有第三态旁路给"收件人暂时不可用"**（外部独立审查第三轮 G1
+坐实的缺口）：早期版本一旦收件人查询查不到 `open_id` 就转一个 `skipped` 终态、
+永不重试——但 `notice_recipient_open_id` 的接口只能回答"这一刻查不到"，答不出"这是
+不是永久性的"（账号被停用完全可能是暂时的）。把一个分辨不出来的情况提前判成永久放弃，
+原路复活了 F1 要堵的那个洞：用户已经 `active`，等收件能力恢复后却再也等不到那句话。
+因此收件人暂时不可用时**仍然留在 `pending`**，按既有退避重试；真正的"这个人不用再等
+了"只有一种事实来源——`user_id` 上的 `ON DELETE CASCADE`（账号真被删除，这条通知
+连同它一起消失，不需要一个额外的终态去表达同一件事）。
 
-**没有 `sending`/`publishing` 这类中间锁定态**（与 `publish_outbox` 的三态不同）：认领与
-处理在同一次调用里背靠背发生（不像发布消费与决策是分开的两步），因此不存在"认领了却还没
-处理完就崩溃"的独立窗口需要专门的态来标记；认领步骤本身（`attempts + 1` 与
-`next_attempt_at` 前移）已经把重试节奏钉住，一次崩溃最坏只是让这一条在下一次到期时被重新
-认领，不会丢也不会重复送达（幂等靠稳定的 `dedupe_key`，由适配器折成飞书投递的去重键）。
+**没有持久化的 `sending`/`publishing` 中间锁定态**（与 `publish_outbox` 的三态不同），
+但**这不等于"认领之后不存在崩溃窗口"**——那个窗口是真实存在的，只是没有专门的数据库
+状态去标记它：认领（把 `attempts` +1、`next_attempt_at` 前移）与发送是两次独立的调用，
+中间进程随时可能崩溃。**这是"至少一次投递"的语义，不是"没有窗口"**：
+崩溃发生在发送尝试之前，这条通知与任何一条尚未到期的 `pending` 行没有区别，下一次到期
+原样重新认领，用户什么都不会看到，也不会丢；崩溃发生在**发送已经成功、但确认送达的写入
+还没提交之前**，这条通知会在下一次到期时用同一个 `dedupe_key` 再发一次——这条残余的
+"可能重复送达一次"的窗口如实登记在
+`apps/scheduler/late_readiness_recovery.py` 的模块文档，不在这里假装它不存在。
 
 ## 退避：认领本身推进下一次到期时间
 
@@ -45,10 +54,10 @@ F4 在恢复候选查询里点名的同一类问题，这里在通知 outbox 上
 本表不含邮箱或姓名（`company_name`/`function_name` 是发布出去的公司编号与职能标签的展示
 文本，来自 `payload` 快照渲染，不是人员资料本身），但仍然是一张会无限增长的运行记录表，
 按数据库设计第九节的通用纪律做九十天到期：`content_expires_at` 由触发器固定为
-`created_at + 2160 hours`，`purge_expired_notices` 删除已到期且已收口（`delivered` /
-`skipped`）的整行——**未收口（`pending`）的行永远不到期删除**，即使触发器已经给它算出了
-一个 `content_expires_at`：删掉一条还在等待送达的通知，等于让一个已经写成 `active` 的
-用户真的永远收不到那句话，这正是本迁移要堵住的那个洞。做法与 `mcp_sync_check`
+`created_at + 2160 hours`，`purge_expired_notices` 删除已到期且已送达（`delivered`）的
+整行——**`pending` 的行永远不到期删除**，即使触发器已经给它算出了一个
+`content_expires_at`：删掉一条还在等待送达的通知，等于让一个已经写成 `active` 的用户
+真的永远收不到那句话，这正是本迁移要堵住的那个洞。做法与 `mcp_sync_check`
 （`0065`）同型：没有可识别列可擦，到期即整行删除，而不是像 `publish_outbox`
 （`0064`）那样把某一列擦成占位符。
 
@@ -86,7 +95,7 @@ CREATE TABLE onboarding_completion_notice (
     company_name       TEXT        NOT NULL,
     function_name      TEXT        NOT NULL,
     status             TEXT        NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'delivered', 'skipped')),
+        CHECK (status IN ('pending', 'delivered')),
     attempts           INT         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     last_error         TEXT,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -102,7 +111,7 @@ CREATE TABLE onboarding_completion_notice (
     dedupe_key         TEXT        NOT NULL UNIQUE,
 
     -- delivered_at 是"这条通知已经送达"的唯一标记，不允许出现在其它状态上——一条
-    -- pending/skipped 却带着送达时间的行会让下游读成已经送达。
+    -- pending 却带着送达时间的行会让下游读成已经送达。
     CHECK (delivered_at IS NULL OR status = 'delivered'),
     CHECK (status <> 'delivered' OR delivered_at IS NOT NULL)
 );
@@ -112,12 +121,12 @@ CREATE INDEX onboarding_completion_notice_due_idx
     ON onboarding_completion_notice (next_attempt_at, created_at, id)
     WHERE status = 'pending';
 
--- 到期删除的扫描键：只覆盖已收口的两态，pending 永远不出现在这个索引要照顾的查询里
--- （purge 的 WHERE 子句本身也把 pending 排除在外，索引只是让"哪些已收口的行到期了"
--- 这个问题不用扫全表）。
+-- 到期删除的扫描键：只覆盖已收口的 delivered，pending 永远不出现在这个索引要照顾的
+-- 查询里（purge 的 WHERE 子句本身也把 pending 排除在外，索引只是让"哪些已送达的行
+-- 到期了"这个问题不用扫全表）。
 CREATE INDEX onboarding_completion_notice_purge_idx
     ON onboarding_completion_notice (content_expires_at)
-    WHERE status IN ('delivered', 'skipped');
+    WHERE status = 'delivered';
 
 -- 与 0057/0058/0059/0064/0065 同型：到期时间由来源时间推导，调用方传什么都会被覆盖；
 -- created_at / user_id / permission_version / dedupe_key 一经写入不可改——它们是幂等键

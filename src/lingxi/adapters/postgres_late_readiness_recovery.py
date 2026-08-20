@@ -346,8 +346,20 @@ class PostgresLateReadinessStore:
             )
 
     def mark_notice_failed(self, notice_id: str, *, error: str) -> None:
-        """记一次发送失败的错误码。**不改变 ``next_attempt_at``**——退避已经在
-        :meth:`claim_one_due_notice` 认领时算好了，这里只留痕，不重复退避。"""
+        """记一次没能送达的错误码，**这条通知仍然留在 ``pending``**，按既有退避重试。
+
+        外部独立审查第三轮 G1：本方法现在是"收件人暂时查不到"与"飞书发送失败"两种
+        情况**共用**的落点——早期版本给前者单独配了一个 ``skipped`` 终态，理由是
+        "这个人已经没有收件人概念了"，但 :meth:`~lingxi.adapters.
+        postgres_permission_publish.PostgresPermissionPublishStore.
+        notice_recipient_open_id` 的返回值 ``str | None`` 分辨不出"暂时查不到"与
+        "永久不会再有"：账号 ``account_state`` 被标成停用完全可能是暂时的。把一个
+        分辨不出来的情况提前判成永久放弃，原路复活了 F1 要堵的洞。真正"这个人不用
+        再等了"只有一种事实来源——``user_id`` 上的 ``ON DELETE CASCADE``。
+
+        **不改变 ``next_attempt_at``**——退避已经在 :meth:`claim_one_due_notice`
+        认领时算好了，这里只留痕，不重复退避。
+        """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -355,23 +367,12 @@ class PostgresLateReadinessStore:
                 (str(error)[:500], notice_id),
             )
 
-    def mark_notice_skipped(self, notice_id: str, *, reason: str) -> None:
-        """把一条通知记成永久跳过（终态）：收件人已经不存在（推进成功之后账号又被
-        停用/删除的极窄窗口）。不是失败，是"这个人已经没有收件人这个概念了"。"""
-
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE onboarding_completion_notice "
-                "SET status = 'skipped', last_error = %s WHERE id = %s",
-                (str(reason)[:500], notice_id),
-            )
-
     def purge_expired_notices(
         self, *, now: datetime | None = None, limit: int = 500
     ) -> int:
-        """删除已经收口（``delivered``/``skipped``）且过了九十天上限的通知，返回删除
-        条数。**``pending`` 的行永远不在这条语句的候选范围内**——删掉一条还在等待
-        送达的通知，等于让一个已经写成 ``active`` 的用户真的永远收不到那句话，这正是
+        """删除已经送达（``delivered``）且过了九十天上限的通知，返回删除条数。
+        **``pending`` 的行永远不在这条语句的候选范围内**——删掉一条还在等待送达的
+        通知，等于让一个已经写成 ``active`` 的用户真的永远收不到那句话，这正是
         本表存在的理由要堵住的洞。到期判据在 ``content_expires_at``（迁移 ``0066``
         的触发器固定为 ``created_at + 2160 小时``），本方法不加第二个条件。
         """
@@ -386,7 +387,7 @@ class PostgresLateReadinessStore:
                 """DELETE FROM onboarding_completion_notice
                     WHERE id IN (
                             SELECT id FROM onboarding_completion_notice
-                             WHERE status IN ('delivered', 'skipped')
+                             WHERE status = 'delivered'
                                AND content_expires_at <= %s
                              ORDER BY content_expires_at
                              LIMIT %s
@@ -398,7 +399,6 @@ class PostgresLateReadinessStore:
 
 
 __all__ = [
-    "DEFAULT_NOTICE_RETENTION",
     "LateOnboardingCandidate",
     "NOTICE_BACKOFF_CEILING_SECONDS",
     "NOTICE_BACKOFF_STEP_SECONDS",

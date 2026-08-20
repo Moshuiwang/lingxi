@@ -468,19 +468,6 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
 
         self.assertIsNone(self.store.claim_one_due_notice())
 
-    def test_a_skipped_notice_is_never_reclaimed(self) -> None:
-        self._activate()
-        claimed = self.store.claim_one_due_notice()
-        assert claimed is not None
-        self.store.mark_notice_skipped(claimed.notice_id, reason="recipient_unavailable")
-
-        with connect(self._dsn) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE onboarding_completion_notice SET next_attempt_at = now() - interval '1 second'"
-            )
-
-        self.assertIsNone(self.store.claim_one_due_notice())
-
     def test_two_pending_notices_are_claimed_oldest_first(self) -> None:
         # 不能事后拨回 created_at 来模拟"更早创建"——迁移 0066 的触发器不允许 UPDATE
         # 改写它（与 publish_outbox 的不可变纪律同型）。两次真实 INSERT 之间 `now()`
@@ -508,7 +495,7 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
         far_future = NOW + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
         purged = self.store.purge_expired_notices(now=far_future)
 
-        self.assertEqual(purged, 1, "只删已收口且过期的那一条")
+        self.assertEqual(purged, 1, "只删已送达且过期的那一条")
         self.assertEqual(self._notice_count(USER_A), 1, "pending 的那一条绝不会被删——它还在等待送达")
         self.assertEqual(self._notice_count(USER_B), 0)
 

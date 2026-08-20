@@ -99,7 +99,7 @@ record_processing_failure` 记一条技术失败，占住这一次调度窗口�
 同一张表、同一条到期判据，不会让同一个人在下一个 tick 立刻被重新选中、饿死排在后面的
 正常候选。
 
-## 要试到什么时候为止：重试受通知 outbox 的九十天保留期约束，不是真的无限期
+## 要试到什么时候为止：重试受 publish_outbox 内容快照的九十天保留期约束，不是真的无限期
 
 「一个人卡在 ``mcp_syncing`` 多久之后应该彻底放弃、转成需要人工介入的终态」是一个
 **产品决定**（例如"三天还没好就转运维，给用户一句不同的话"），编排者与实施者都没有权限
@@ -146,13 +146,24 @@ PostgresLateReadinessStore.claim_one_due_notice` 在认领的同一条 ``UPDATE`
 :class:`~lingxi.apps.scheduler.onboarding.CatalogNotifier`，去重键用
 ``(用户, 权限版本)`` 派生一个稳定值（本职责没有原始 ``event_id`` 可用），既写进
 ``onboarding_completion_notice.dedupe_key`` 这个数据库唯一约束，也传给
-``CatalogNotifier.send`` 折成飞书投递的去重键——两层去重独立生效，任何一层单独失守
-都不会导致重复送达。
+``CatalogNotifier.send`` 折成飞书投递的去重键。**这两层去重挡的不是同一件事**：
+数据库的 ``UNIQUE`` 约束挡的是"同一个事件被排出两条通知行"（:meth:`~lingxi.adapters.
+postgres_late_readiness_recovery.PostgresLateReadinessStore.
+activate_after_late_readiness` 反复调用也只会有一条 ``pending`` 行）；**用户会不会
+真的看到两条消息，挡的是飞书那一层**——同一条通知行的多次发送尝试（正常重试、或下面
+这条残余窗口触发的重发）传的是同一个 ``dedupe_key``。
 
 **残余的窗口，如实登记**：通知**已经真的发送成功**、但 :meth:`mark_notice_delivered`
-的写入在那之前崩溃——这条通知会在下一次到期时被重新认领并**再发一次**。这不是新缺口，
-是"至少一次"投递与飞书自身去重键共同兜底的既有产品裁定（2026-08-18 裁定 4），未做
-真正的两阶段提交式 exactly-once。
+的写入在那之前崩溃——这条通知会在下一次到期时被重新认领并**用同一个 dedupe_key 再发
+一次**。用户会不会因此看到两条「开通完成」，取决于飞书 ``im/v1/messages`` 接口收到
+同一个 ``uuid`` 时是否真的去重——**这是本仓库未验证的平台行为**（与
+:mod:`lingxi.adapters.feishu_user_message` 模块文档已经登记的边界同一条：「重试携带
+同一个 uuid」是代码事实，「飞书因此一定不会重复投递」未验证，属 L4a；同一条件下
+:func:`~lingxi.adapters.feishu_group_message.delivery_uuid` 也没有说明飞书那一侧的
+去重窗口有多长）。本模块**不为这条残余窗口新增任何补偿逻辑**（不做真正的两阶段提交式
+exactly-once，不在应用层再实现一次幂等）——这是"至少一次"投递的既有产品裁定
+（2026-08-18 裁定 4：通知失败有限重试、不阻塞权限生效），如实登记为已知边界，不是
+遗漏。
 
 ## 已知边界（明确接受，不修，外部独立审查 A1）
 
@@ -242,12 +253,18 @@ class _Activator(Protocol):
 
 
 class _NoticeOutbox(Protocol):
-    """待发「开通完成」通知的持久 outbox（同一适配器）。"""
+    """待发「开通完成」通知的持久 outbox（同一适配器）。
+
+    **只有两个终点**：送达（:meth:`mark_notice_delivered`）或留在 ``pending`` 按既有
+    退避重试（:meth:`mark_notice_failed`，即使原因是"收件人暂时查不到"也一样——见
+    :meth:`mark_notice_failed` 的文档，外部独立审查第三轮 G1）。**没有"永久放弃"这
+    个动作**：真正的账号删除由 ``user_id`` 上的 ``ON DELETE CASCADE`` 处理，不需要
+    调用方自己判断"这是不是不可逆"——``notice_recipient_open_id`` 的返回值分辨不出。
+    """
 
     def claim_one_due_notice(self) -> Any | None: ...
     def mark_notice_delivered(self, notice_id: str) -> None: ...
     def mark_notice_failed(self, notice_id: str, *, error: str) -> None: ...
-    def mark_notice_skipped(self, notice_id: str, *, reason: str) -> None: ...
 
 
 class _Recipients(Protocol):
@@ -290,7 +307,10 @@ class LateReadinessRecoveryReport:
     notices_claimed: int = 0
     notified: int = 0
     notice_failed: int = 0
-    notice_skipped: int = 0
+    #: 收件人暂时查不到的次数（外部独立审查第三轮 G1：**不是**"永久放弃"的计数——
+    #: 这些通知仍然留在 ``pending`` 按既有退避重试，这里只是一个可观测的分类，
+    #: 不代表它们已经收口）。
+    notice_recipient_unavailable: int = 0
     interrupted: bool = False
     #: 探针面装配了没有。缺问数 MCP 端点或令牌主密钥时是 ``False``——本职责仍然注册，
     #: 只是需要真探针的那一路本轮不推进，报告里必须看得出来，否则"候选一直没有进展"
@@ -310,7 +330,7 @@ class LateReadinessRecoveryReport:
             "notices_claimed": self.notices_claimed,
             "notified": self.notified,
             "notice_failed": self.notice_failed,
-            "notice_skipped": self.notice_skipped,
+            "notice_recipient_unavailable": self.notice_recipient_unavailable,
             "probe_wired": self.probe_wired,
         }
         if self.interrupted:
@@ -333,7 +353,7 @@ class _Tally:
     notices_claimed: int = 0
     notified: int = 0
     notice_failed: int = 0
-    notice_skipped: int = 0
+    notice_recipient_unavailable: int = 0
 
     def freeze(self, *, interrupted: bool, probe_wired: bool) -> LateReadinessRecoveryReport:
         return LateReadinessRecoveryReport(
@@ -348,7 +368,7 @@ class _Tally:
             notices_claimed=self.notices_claimed,
             notified=self.notified,
             notice_failed=self.notice_failed,
-            notice_skipped=self.notice_skipped,
+            notice_recipient_unavailable=self.notice_recipient_unavailable,
             interrupted=interrupted,
             probe_wired=probe_wired,
         )
@@ -461,7 +481,7 @@ class LateReadinessRecoveryDuty:
             logger.info(
                 "迟到就绪恢复完成 候选=%s 就绪=%s 已推进=%s 等待=%s 技术失败=%s "
                 "探针未接线=%s 推进被拒=%s 失败=%s 已认领通知=%s 已送达=%s "
-                "通知失败=%s 未通知=%s",
+                "通知失败=%s 收件人暂不可用=%s",
                 report.examined,
                 report.ready,
                 report.activated,
@@ -473,7 +493,7 @@ class LateReadinessRecoveryDuty:
                 report.notices_claimed,
                 report.notified,
                 report.notice_failed,
-                report.notice_skipped,
+                report.notice_recipient_unavailable,
             )
         return report
 
@@ -520,6 +540,15 @@ class LateReadinessRecoveryDuty:
         探针未接线三路都在这里**显式返回**，不落到任何会继续往下推进的默认分支。
 
         **候选一律重新探一次**（外部独立审查 F2）：不存在"跳过探针"的分支。
+
+        **F4 的窗口占位覆盖本方法的全程，不只是探针之后那一段**（外部独立审查第三轮
+        G2：上一轮的实现只包住了"探针之后"的异常，``probe_after_timeout`` 本身的调用
+        留在任何 ``try`` 之外——探针调用或探针落库抛出未预期异常时，外层只会记成
+        ``user_failed``，``last_started_at`` 不前移，毒候选会在下一个 tick 立刻重入。
+        因此这里对探针调用与探针之后的步骤**分别**加保护，用各自发起时刻真实的
+        ``attempt_no``：探针那一次失败时占的是**当前**这次尝试的号（它本来就该占，
+        只是没能真的探成）；探针之后的失败沿用原来的"下一个号"（探针那一次已经真的
+        成功记过账了）。
         """
 
         binding = ReadinessBinding(
@@ -529,7 +558,17 @@ class LateReadinessRecoveryDuty:
             # 探针未接线：本轮不落任何记录，端点配好后从库里的进度原样继续。
             tally.probe_unwired += 1
             return
-        attempt = self._ticker.probe_after_timeout(binding, attempt_no=item.next_attempt_no)
+        try:
+            attempt = self._ticker.probe_after_timeout(
+                binding, attempt_no=item.next_attempt_no
+            )
+        except Exception as error:  # noqa: BLE001 - 占住窗口，再让外层记 failed 并上抛
+            self._ticker.record_processing_failure(
+                binding,
+                attempt_no=item.next_attempt_no,
+                code=f"recovery_failed_{type(error).__name__}",
+            )
+            raise
         if attempt is None:
             tally.probe_unwired += 1
             return
@@ -547,7 +586,8 @@ class LateReadinessRecoveryDuty:
         # 同一个原子事务里完成，且 CAS 要求 permission_version 与探针绑定的那一版
         # 完全一致，防止拿一版已经过时的 ready 判定把人写成 active。探针之后的步骤
         # 一旦抛出未预期异常，占住这一次调度窗口再上抛（F4：不让"毒候选"立刻被
-        # 下一个 tick 重新选中）。
+        # 下一个 tick 重新选中）——探针那一次已经真的记过账了，这里用**下一个**
+        # attempt_no。
         try:
             company, function = describe_scope(parse_permissions(item.permissions))
             dedupe_key = f"onboarding:recovery:{item.user_id}:{item.permission_version}"
@@ -559,12 +599,11 @@ class LateReadinessRecoveryDuty:
                 dedupe_key=dedupe_key,
             )
         except Exception as error:  # noqa: BLE001 - 占住窗口，再让外层记 failed 并上抛
-            if self._ticker is not None:
-                self._ticker.record_processing_failure(
-                    binding,
-                    attempt_no=item.next_attempt_no + 1,
-                    code=f"recovery_failed_{type(error).__name__}",
-                )
+            self._ticker.record_processing_failure(
+                binding,
+                attempt_no=item.next_attempt_no + 1,
+                code=f"recovery_failed_{type(error).__name__}",
+            )
             raise
 
         if not activated:
@@ -614,12 +653,15 @@ class LateReadinessRecoveryDuty:
     def _send_notice(self, notice: Any, tally: _Tally) -> None:
         open_id = self._recipients.notice_recipient_open_id(notice.user_id)
         if not open_id:
-            # 推进成功之后账号又被停用/删除的极窄窗口：这个人已经没有"收件人"这个
-            # 概念了，标记永久跳过而不是无限重试一个不会再有结果的目标。
-            self._notices.mark_notice_skipped(
-                notice.notice_id, reason="recipient_unavailable"
+            # 外部独立审查第三轮 G1：**不得**转永久放弃。``notice_recipient_open_id``
+            # 只能回答"这一刻查不到"，答不出"这是不是永久性的"——账号被停用完全可能
+            # 只是暂时的。提前判死会让一个已经 active 的人永远等不到这句话，原路
+            # 复活 F1 要堵的洞。真正的"不用再等了"只有 `ON DELETE CASCADE` 一种
+            # 事实来源，因此这里与发送失败走同一条路：留在 pending，按既有退避重试。
+            self._notices.mark_notice_failed(
+                notice.notice_id, error="recipient_unavailable"
             )
-            tally.notice_skipped += 1
+            tally.notice_recipient_unavailable += 1
             self._audit.record(
                 "late_readiness_recovery.recipient_unavailable", user=notice.user_id
             )

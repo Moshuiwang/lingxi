@@ -175,7 +175,7 @@ class PermissionRetentionSweepDuty:
       :meth:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.
       purge_expired_checks`）。
     - ``onboarding_completion_notice``（迁移 ``0066``，V-开通-18 的通知 outbox）同样
-      没有可识别内容列 → 删整行，但**只删已收口**（``delivered``/``skipped``）的那些
+      没有可识别内容列 → 删整行，但**只删已送达**（``delivered``）的那些
       （:meth:`~lingxi.adapters.postgres_late_readiness_recovery.
       PostgresLateReadinessStore.purge_expired_notices`）——``pending`` 的行无论多老
       都不会被这里删掉，删掉一条还在等待送达的通知等于让一个已经写成 ``active`` 的

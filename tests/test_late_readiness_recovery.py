@@ -1,4 +1,4 @@
-"""迟到就绪恢复职责的纯逻辑验收（V-开通-18，外部独立审查 F1-F4 修复）。
+"""迟到就绪恢复职责的纯逻辑验收（V-开通-18，外部独立审查 F1-F4，第三轮 G1-G2 修复）。
 
 十五分钟同步超时之后仍然确认成功的用户，最终会被写成 ``active`` 并得到「可以开始使用」
 的主动通知；在此之前他不会收到任何暗示已经可用、实际却发不了问数的消息——这是
@@ -6,7 +6,7 @@
 ``tests/test_mcp_readiness_machine.py``，持久化半边的真库断言在
 ``tests/test_postgres_late_readiness_recovery.py``）。
 
-外部独立审查坐实的四条必修，本文件各有对应的**会变红**的用例：
+外部独立审查坐实的必修，本文件各有对应的**会变红**的用例：
 
 - **F1「active 但永远不告知」**：状态推进与排通知是原子操作（由 fake ``_Activator``
   模拟），通知发送失败**不会**丢失——它留在待发 outbox 里，下一轮仍会被重新认领并重试，
@@ -14,14 +14,28 @@
 - **F2**：候选一律重新探一次，**不存在**"跳过探针直接判就绪"的分支——`FakeCandidate`
   上没有 ``already_ready`` 字段，任何试图依赖它的实现都会在类型上直接失败。
 - **F3**：CAS 失败（版本不对/账号停用/已经被推进）**绝不发送任何通知**。
-- **F4**：探针之外的未预期异常会调用 ``record_processing_failure`` 占住调度窗口
-  （防止"毒候选"饿死后面排队的候选）；零候选、零待发通知时**不记完成审计**。
+- **F4**：探针**之后**（激活/解析）的未预期异常会调用 ``record_processing_failure``
+  占住调度窗口（防止"毒候选"饿死后面排队的候选）；零候选、零待发通知时**不记完成
+  审计**。
+- **G1（第三轮）**：收件人暂不可用（``notice_recipient_open_id`` 返回 ``None``）**不是**
+  永久放弃——它只留在 ``pending`` 按既有退避重试，绝不落到任何终态（真正的"不用再等
+  了"只有 ``ON DELETE CASCADE`` 一种事实来源）。``RecipientUnavailableTest`` 钉住这条。
+- **G2（第三轮）**：探针调用（``probe_after_timeout``）本身抛出的未预期异常也要占住
+  调度窗口——不只是探针**之后**的步骤。``ProcessingFailureTest.
+  test_a_probe_call_failure_also_records_a_processing_failure_before_reraising``
+  钉住这条：探针那次失败用**当前** ``attempt_no``，探针之后失败继续用**下一个**。
 
 否定断言（合同的"不得 / 不允许"必须有对应否定测试，验证与门禁第八节）：
 
 1. **未就绪（等待中 / 技术失败 / 探针未接线）绝不推进 ``active``、绝不排任何通知**；
 2. **CAS 失败绝不发通知**（F3）；
-3. **通知恰一次送达**：同一条通知被认领、发送成功后不会被再次发送；
+3. **通知行不会重复产生**：同一个 ``dedupe_key`` 不会在 outbox 里出现第二行（数据库
+   ``UNIQUE`` 约束，见 ``FakeLateReadinessStore`` 的 ``_by_dedupe`` 模拟）。**这不等于
+   "用户不会收到重复消息"**——发送成功到标记送达之间崩溃是已知的「至少一次投递」
+   窗口（登记在 ``lingxi.apps.scheduler.late_readiness_recovery`` 模块自己的文档
+   字符串），重试会带着同一个 ``dedupe_key`` 再发一次；那一层的去重是飞书平台侧未
+   验证的行为（L1/L4a，与 ``adapters/feishu_user_message.py`` 已经登记的边界同型），
+   本测试文件不覆盖、也不为它新增补偿逻辑；
 4. **单个候选 / 单条通知的失败不带走整轮**；
 5. 报告与审计**只有计数**，不含权限值、open_id 或渲染后的正文。
 """
@@ -225,10 +239,6 @@ class FakeLateReadinessStore:
     def mark_notice_failed(self, notice_id: str, *, error: str) -> None:
         self._notices[notice_id]["last_error"] = error
         # 状态保持 pending：与真实实现一致，退避已经在"认领"这一步算过。
-
-    def mark_notice_skipped(self, notice_id: str, *, reason: str) -> None:
-        self._notices[notice_id]["status"] = "skipped"
-        self._notices[notice_id]["last_error"] = reason
 
     def simulate_backoff_elapsed(self, user_id: str | None = None) -> None:
         """测试专用：模拟"退避窗口已经过去"（对应真实实现里 ``next_attempt_at``
@@ -574,7 +584,13 @@ class ActiveButNeverNotifiedIsImpossibleTest(unittest.TestCase):
 
 
 class RecipientUnavailableTest(unittest.TestCase):
-    def test_missing_recipient_is_skipped_without_raising(self) -> None:
+    """外部独立审查第三轮 G1：``notice_recipient_open_id`` 只能回答"这一刻查不到"，
+    答不出"这是不是永久性的"——账号被停用完全可能只是暂时的。提前判死会让一个
+    已经 ``active`` 的人永远等不到「开通完成」，原路复活 F1 要堵的洞。真正的
+    "不用再等了"只有 ``ON DELETE CASCADE``（真删除）一种事实来源，因此这里必须
+    停在 ``pending``、按既有退避重试，绝不能落到任何终态。"""
+
+    def test_missing_recipient_keeps_the_notice_pending_for_retry(self) -> None:
         store = FakeLateReadinessStore()
         duty, seams = build_duty(
             candidates=FakeCandidates(_candidate()),
@@ -585,11 +601,38 @@ class RecipientUnavailableTest(unittest.TestCase):
 
         report = duty.run_once()
 
-        self.assertEqual(report.activated, 1, "状态已经真实推进，不因为通知不了而回滚")
-        self.assertEqual(report.notice_skipped, 1)
+        self.assertEqual(report.activated, 1, "状态已经真实推进，不因为暂时联系不上而回滚")
+        self.assertEqual(report.notice_recipient_unavailable, 1)
         self.assertEqual(report.notified, 0)
         self.assertEqual(seams["notifier"].calls, [])
-        self.assertEqual(store.notice_status(USER_A), "skipped")
+        # 真实实现只有 pending / delivered 两种状态：收件人暂不可用必须停在
+        # pending——这正是 G1 要堵的洞（旧实现会把它标成一个从此再也不会被
+        # claim_one_due_notice 认领到的终态）。
+        self.assertEqual(store.notice_status(USER_A), "pending")
+
+    def test_a_recipient_that_becomes_available_later_still_gets_notified(self) -> None:
+        """不只是"没被标终态"——还要证明它后续真的会被重试送达。"""
+
+        store = FakeLateReadinessStore()
+        recipients = FakeRecipients(open_ids={USER_A: None})
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate()),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
+            recipients=recipients,
+        )
+        duty.run_once()
+        self.assertEqual(seams["notifier"].calls, [])
+
+        # 账号"复活"：现在能查到 open_id 了（对应真实世界"停用"变回"启用"）。
+        recipients._open_ids[USER_A] = OPEN_ID
+        store.simulate_backoff_elapsed(USER_A)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.notified, 1, "暂不可用之后一旦重新可达，仍然要收到「开通完成」")
+        self.assertEqual(len(seams["notifier"].calls), 1)
+        self.assertEqual(store.notice_status(USER_A), "delivered")
 
 
 class ProcessingFailureTest(unittest.TestCase):
@@ -614,6 +657,31 @@ class ProcessingFailureTest(unittest.TestCase):
         self.assertEqual(len(ticker.processing_failures), 1)
         failed_user, attempt_no, code = ticker.processing_failures[0]
         self.assertEqual(failed_user, USER_A)
+        self.assertEqual(attempt_no, 9, "探针已经真的探成功过一次，占位用下一个 attempt_no")
+        self.assertIn("RuntimeError", code)
+        self.assertIn("late_readiness_recovery.user_failed", seams["audit"].actions())
+
+    def test_a_probe_call_failure_also_records_a_processing_failure_before_reraising(
+        self,
+    ) -> None:
+        """G2：外部独立审查第三轮坐实——上一轮的保护只包住了探针**之后**的异常，
+        ``probe_after_timeout`` 调用本身（或它内部的落库）抛出未预期异常时完全没有
+        保护，直接穿透到外层只记一条泛化的 ``user_failed`` 审计，``last_started_at``
+        永远不前移，毒候选会在下一个 tick 立刻重新被选中、无限热循环，饿死队列
+        后面的候选。这条用例钉住修复：探针调用要有它自己独立的异常保护。"""
+
+        ticker = FakeTicker({USER_A: RuntimeError("probe_write_failed")})
+        duty, seams = build_duty(candidates=FakeCandidates(_candidate()), ticker=ticker)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(len(ticker.processing_failures), 1)
+        failed_user, attempt_no, code = ticker.processing_failures[0]
+        self.assertEqual(failed_user, USER_A)
+        # 探针那一次没有真的探成功——占的是**当前**这次尝试的号，不是下一个
+        # （探针之后的激活失败才用"下一个"，因为那时探针已经真的记过账）。
+        self.assertEqual(attempt_no, 8, "探针没探成功，占用当前 attempt_no，不是下一个")
         self.assertIn("RuntimeError", code)
         self.assertIn("late_readiness_recovery.user_failed", seams["audit"].actions())
 
