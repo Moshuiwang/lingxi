@@ -165,7 +165,7 @@ from lingxi.apps.scheduler.credential_rotation import (
     _is_definite_failure,
 )
 from lingxi.apps.scheduler.late_readiness_recovery import (
-    DEFAULT_NOTIFY_ATTEMPTS,
+    DEFAULT_NOTICE_DRAIN_LIMIT,
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_LIMIT,
     LateReadinessRecoveryDuty,

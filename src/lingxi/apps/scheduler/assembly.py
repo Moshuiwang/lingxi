@@ -288,8 +288,12 @@ def _build_permission_retention_duty(
     这条取舍的产品后果是可接受的、也已写明：``mcp_sync_check`` **没有可识别内容列**，
     到期不删的后果是一张只含内部 ULID 与结论码的表继续变长；而真正含邮箱与姓名的
     ``publish_outbox.payload`` 一轮都不会少擦。
+
+    **``onboarding_completion_notice``（V-开通-18，迁移 ``0066``）与 ``publish_outbox``
+    同一面**：只需要数据库连接串，没有可选前置，因此无条件装配。
     """
 
+    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
     checks: Any = None
@@ -321,6 +325,11 @@ def _build_permission_retention_duty(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
         checks=checks,
+        # onboarding_completion_notice（迁移 0066，V-开通-18）同样没有可选前置——
+        # 只需要数据库连接串，因此这一面与 publish_outbox 那一面同样无条件装配。
+        notices=PostgresLateReadinessStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
         audit=audit,
         stop=stop,
     )
@@ -691,20 +700,18 @@ def _build_late_readiness_recovery_duty(
     要试到什么时候为止，见 :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的
     模块文档；本函数只做装配。
 
-    形状照 :func:`_build_readiness_follow_up`，但比它宽松一格：候选查询
-    （:meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
-    late_onboarding_recovery_candidates`）、状态推进
-    （:class:`~lingxi.adapters.postgres_identity.PostgresAppUserStore`）与通知
-    （:class:`~lingxi.apps.scheduler.onboarding.CatalogNotifier`）都只需要
-    ``LINGXI_POSTGRES_DSN``/飞书应用凭据——两者都是 :class:`SchedulerConfig` 的必填项，
-    因此本职责**总能**注册。**唯一可选的是探针面**：缺 MCP 令牌主密钥或问数 MCP 端点
-    时，需要真探针才能推进的那一路本轮不推进，只把这**恰一条**审计记下来
-    （:class:`~lingxi.apps.scheduler.late_readiness_recovery._Ticker` 的文档）；本职责
-    仍然能完成 ``already_ready`` 那一条罕见的崩溃恢复路径。
+    形状照 :func:`_build_readiness_follow_up`，但比它宽松一格：候选查询、原子推进
+    （:class:`~lingxi.adapters.postgres_late_readiness_recovery.
+    PostgresLateReadinessStore`）与通知（:class:`~lingxi.apps.scheduler.onboarding.
+    CatalogNotifier`）都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用凭据——两者都是
+    :class:`SchedulerConfig` 的必填项，因此本职责**总能**注册。**唯一可选的是探针面**：
+    缺 MCP 令牌主密钥或问数 MCP 端点时，需要真探针才能推进的那一路本轮不推进，只把这
+    **恰一条**审计记下来（:class:`~lingxi.apps.scheduler.late_readiness_recovery._Ticker`
+    的文档）；通知面（认领已经排出的待发通知并重试直到送达）不依赖探针，照常运行。
     """
 
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
-    from lingxi.adapters.postgres_identity import PostgresAppUserStore
+    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
     from lingxi.apps.scheduler.late_readiness_recovery import LateReadinessRecoveryDuty
     from lingxi.apps.scheduler.onboarding import CatalogNotifier
@@ -713,7 +720,10 @@ def _build_late_readiness_recovery_duty(
 
     dsn = config.postgres_dsn
     timeouts = config.postgres_timeouts
-    store = PostgresPermissionPublishStore(dsn, timeouts=timeouts)
+    store = PostgresLateReadinessStore(dsn, timeouts=timeouts)
+    # 通知收件人查询是既有的只读方法，住在权限发布那份存取里
+    # （``notice_recipient_open_id``，与刷新链的变化通知共用同一条产品口径）。
+    recipients = PostgresPermissionPublishStore(dsn, timeouts=timeouts)
 
     ticker = None
     if not config.mcp_token_encrypt_key:
@@ -726,8 +736,8 @@ def _build_late_readiness_recovery_duty(
             variable=MASTER_KEY_ENV,
         )
         logger.warning(
-            "未配置 %s，迟到就绪恢复的探针面不装配；已经探到就绪但未推进的候选仍会被"
-            "续做，其余候选留在库里等配置齐备",
+            "未配置 %s，迟到就绪恢复的探针面不装配；候选留在库里等配置齐备，"
+            "已经排出但还没送达的通知照常持久重试",
             MASTER_KEY_ENV,
         )
     elif not config.query_mcp_endpoint:
@@ -738,7 +748,7 @@ def _build_late_readiness_recovery_duty(
         )
         logger.warning(
             "未配置 LINGXI_QUERY_MCP_ENDPOINT，迟到就绪恢复的探针面不装配；"
-            "已经探到就绪但未推进的候选仍会被续做，其余候选留在库里等端点配好"
+            "候选留在库里等端点配好，已经排出但还没送达的通知照常持久重试"
         )
     else:
         from lingxi.adapters.mcp_token_cipher import McpTokenCipher
@@ -774,8 +784,9 @@ def _build_late_readiness_recovery_duty(
     duty = LateReadinessRecoveryDuty(
         candidates=store,
         ticker=ticker,
-        users=PostgresAppUserStore(dsn, timeouts=timeouts),
-        recipients=store,
+        activator=store,
+        notices=store,
+        recipients=recipients,
         notifier=CatalogNotifier(
             sender=FeishuUserMessages(
                 base_url=config.feishu_base_url,
@@ -785,9 +796,6 @@ def _build_late_readiness_recovery_duty(
             catalog=default_content_catalog(),
         ),
         audit=audit,
-        # 通知重试的退避用 `stop.wait`：SIGTERM 能立刻打断它（同
-        # `PermissionNoticeDispatcher`/`AutoOnboardingRunner._notify`）。
-        sleep=stop.wait,
         reason=FIRST_ONBOARDING_REASON,
         stop=stop,
     )

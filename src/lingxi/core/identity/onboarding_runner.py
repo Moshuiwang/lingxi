@@ -116,11 +116,14 @@ Issue #65 钉在开工卡上的「共用线程复核」在搬迁之后的同一�
 :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的迟到就绪恢复职责补上
 （``V-开通-18``，见该模块自己的文档字符串）：它周期性回看停在 `mcp_syncing` 且已经判过
 `timed_out` 的用户，复用本模块同一套判定层（新增的
-:class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`），就绪就把
-`provisioning_state` 推进到 `active` 并发送「开通完成」——因此 `active` 现在有**两个**
-写入方，但两者都只经过 `advance_provisioning_state` 的同一条条件更新（只前进不回退、
-只在账号仍启用时推进），不构成竞态。**本模块自身不改**：它仍然在判超时时当场返回，
-恢复不在这条链的调用栈里发生。**这条缺口同时登记在**
+:class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`），就绪就在同一个
+数据库事务里把 `provisioning_state` 推进到 `active` 并排一条待发的「开通完成」通知
+（:meth:`~lingxi.adapters.postgres_late_readiness_recovery.PostgresLateReadinessStore.
+activate_after_late_readiness`，条件更新只在 `provisioning_state = 'mcp_syncing'`
+且账号仍启用且权限版本与探针绑定的那一版一致时才推进，同样只前进不回退）——因此
+`active` 现在有**两个**写入方，各自的条件更新虽不是同一个方法，但守卫口径一致
+（只前进、只在账号启用时推进），不构成竞态。**本模块自身不改**：它仍然在判超时时
+当场返回，恢复不在这条链的调用栈里发生。**这条缺口同时登记在**
 ``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
 ——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
 另一个 Story 的范围，本次改动只更新了验收矩阵。

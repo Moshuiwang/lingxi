@@ -93,6 +93,21 @@ class FakeChecks:
         return self._purged
 
 
+class FakeNotices:
+    """``onboarding_completion_notice`` 的到期整行删除（V-开通-18，迁移 0066）。"""
+
+    def __init__(self, *, purged: int = 0, error: Exception | None = None) -> None:
+        self._purged = purged
+        self._error = error
+        self.calls = 0
+
+    def purge_expired_notices(self) -> int:
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._purged
+
+
 class RecordingAudit:
     def __init__(self) -> None:
         self.entries: list[tuple[str, dict]] = []
@@ -109,16 +124,19 @@ def build_duty(
     *,
     outbox: FakeOutbox | None = None,
     checks: FakeChecks | None = None,
+    notices: FakeNotices | None = None,
     stop: threading.Event | None = None,
 ) -> tuple[PermissionRetentionSweepDuty, dict]:
     parts = {
         "outbox": outbox if outbox is not None else FakeOutbox(),
         "checks": checks,
+        "notices": notices if notices is not None else FakeNotices(),
         "audit": RecordingAudit(),
     }
     duty = PermissionRetentionSweepDuty(
         outbox=parts["outbox"],
         checks=parts["checks"],
+        notices=parts["notices"],
         audit=parts["audit"],
         stop=stop,
     )
@@ -131,14 +149,20 @@ def build_duty(
 
 
 class SweepTest(unittest.TestCase):
-    def test_every_round_sweeps_both_tables_exactly_once(self) -> None:
-        duty, parts = build_duty(outbox=FakeOutbox(redacted=3), checks=FakeChecks(purged=7))
+    def test_every_round_sweeps_all_three_tables_exactly_once(self) -> None:
+        duty, parts = build_duty(
+            outbox=FakeOutbox(redacted=3), checks=FakeChecks(purged=7), notices=FakeNotices(purged=2)
+        )
 
         report = duty.run_once()
 
         self.assertEqual(parts["outbox"].calls, 1)
         self.assertEqual(parts["checks"].calls, 1)
-        self.assertEqual(report, PermissionRetentionReport(redacted=3, purged=7, checks_wired=True))
+        self.assertEqual(parts["notices"].calls, 1)
+        self.assertEqual(
+            report,
+            PermissionRetentionReport(redacted=3, purged=7, notices_purged=2, checks_wired=True),
+        )
 
     def test_the_round_does_not_loop_until_empty(self) -> None:
         """每轮**只调用一次**，不在职责内部循环到擦空（同 ``RetentionCleanupDuty``）。
@@ -147,11 +171,15 @@ class SweepTest(unittest.TestCase):
         在单轮里长时间持锁，也让 ``SIGTERM`` 的退出时间不再有上界。
         """
 
-        duty, parts = build_duty(outbox=FakeOutbox(redacted=500), checks=FakeChecks(purged=500))
+        duty, parts = build_duty(
+            outbox=FakeOutbox(redacted=500), checks=FakeChecks(purged=500), notices=FakeNotices(purged=500)
+        )
 
         duty.run_once()
 
-        self.assertEqual((parts["outbox"].calls, parts["checks"].calls), (1, 1))
+        self.assertEqual(
+            (parts["outbox"].calls, parts["checks"].calls, parts["notices"].calls), (1, 1, 1)
+        )
 
     def test_a_stopping_duty_sweeps_nothing(self) -> None:
         """`V-保留-17`「停止领取新工作」：已经在停止中就一条都不处置。"""
@@ -161,7 +189,9 @@ class SweepTest(unittest.TestCase):
         duty, parts = build_duty(checks=FakeChecks(), stop=stop)
 
         self.assertIsNone(duty.run_once())
-        self.assertEqual((parts["outbox"].calls, parts["checks"].calls), (0, 0))
+        self.assertEqual(
+            (parts["outbox"].calls, parts["checks"].calls, parts["notices"].calls), (0, 0, 0)
+        )
         self.assertEqual(parts["audit"].actions, [])
 
     def test_one_stop_flag_reaches_the_duty(self) -> None:
@@ -187,10 +217,23 @@ class UnwiredChecksTest(unittest.TestCase):
 
         self.assertEqual(parts["outbox"].calls, 1)
         self.assertFalse(duty.checks_wired)
-        self.assertEqual(report, PermissionRetentionReport(redacted=2, purged=0, checks_wired=False))
+        self.assertEqual(
+            report,
+            PermissionRetentionReport(redacted=2, purged=0, notices_purged=0, checks_wired=False),
+        )
         self.assertEqual(
             parts["audit"].entries,
-            [("permission_retention.completed", {"redacted": 2, "purged": 0, "checks_wired": False})],
+            [
+                (
+                    "permission_retention.completed",
+                    {
+                        "redacted": 2,
+                        "purged": 0,
+                        "notices_purged": 0,
+                        "checks_wired": False,
+                    },
+                )
+            ],
             "报告必须说得出'那一面没装配'，否则 purged=0 读起来像'没有到期行'",
         )
 
@@ -224,6 +267,23 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual(
             parts["audit"].entries,
             [("permission_retention.sweep_failed", {"table": "mcp_sync_check", "error": "RuntimeError"})],
+        )
+        self.assertNotIn("permission_retention.completed", parts["audit"].actions)
+
+    def test_a_failing_notice_purge_is_audited_and_raised(self) -> None:
+        duty, parts = build_duty(notices=FakeNotices(error=RuntimeError("连接断开")))
+
+        with self.assertRaises(RuntimeError):
+            duty.run_once()
+
+        self.assertEqual(
+            parts["audit"].entries,
+            [
+                (
+                    "permission_retention.sweep_failed",
+                    {"table": "onboarding_completion_notice", "error": "RuntimeError"},
+                )
+            ],
         )
         self.assertNotIn("permission_retention.completed", parts["audit"].actions)
 
@@ -274,7 +334,7 @@ class AuditContentTest(unittest.TestCase):
 
         action, fields = parts["audit"].entries[0]
         self.assertEqual(action, "permission_retention.completed")
-        self.assertEqual(set(fields), {"redacted", "purged", "checks_wired"})
+        self.assertEqual(set(fields), {"redacted", "purged", "notices_purged", "checks_wired"})
         self.assertTrue(all(isinstance(value, (int, bool)) for value in fields.values()))
 
 
@@ -302,6 +362,7 @@ class RetentionSweepPostgresTest(unittest.TestCase):
     def setUp(self) -> None:
         from lingxi.adapters.mcp_token_cipher import McpTokenCipher
         from lingxi.adapters.postgres import connect
+        from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
         from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
@@ -324,9 +385,10 @@ class RetentionSweepPostgresTest(unittest.TestCase):
         self.checks = PostgresMcpTokenStore(
             self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)
         )
+        self.notices = PostgresLateReadinessStore(self._dsn)
         self.audit = RecordingAudit()
         self.duty = PermissionRetentionSweepDuty(
-            outbox=self.outbox, checks=self.checks, audit=self.audit
+            outbox=self.outbox, checks=self.checks, notices=self.notices, audit=self.audit
         )
 
     # -- 夹具 ---------------------------------------------------------------
@@ -478,7 +540,7 @@ class RetentionSweepPostgresTest(unittest.TestCase):
         expired = self._intent(USER_A, EMAIL_A, age_days=91)
         stale_check = self._check(USER_A, age_days=91)
         duty = PermissionRetentionSweepDuty(
-            outbox=self.outbox, checks=None, audit=self.audit
+            outbox=self.outbox, checks=None, notices=self.notices, audit=self.audit
         )
 
         report = duty.run_once()
@@ -569,8 +631,9 @@ class AssemblyTest(unittest.TestCase):
         self.assertTrue(matching[0].stopping)
 
     def test_the_assembled_duty_holds_the_real_adapters(self) -> None:
-        """注册的不能是一个空壳：两个端口必须真的是那两个适配器。"""
+        """注册的不能是一个空壳：三个端口必须真的是那三个适配器。"""
 
+        from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
         from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
@@ -581,6 +644,7 @@ class AssemblyTest(unittest.TestCase):
 
         self.assertIsInstance(duty._outbox, PostgresPermissionPublishStore)
         self.assertIsInstance(duty._checks, PostgresMcpTokenStore)
+        self.assertIsInstance(duty._notices, PostgresLateReadinessStore)
         self.assertTrue(duty.checks_wired)
 
     def test_without_the_master_key_the_duty_still_registers(self) -> None:

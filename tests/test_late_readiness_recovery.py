@@ -1,42 +1,46 @@
-"""迟到就绪恢复职责的纯逻辑验收（V-开通-18）。
+"""迟到就绪恢复职责的纯逻辑验收（V-开通-18，外部独立审查 F1-F4 修复）。
 
 十五分钟同步超时之后仍然确认成功的用户，最终会被写成 ``active`` 并得到「可以开始使用」
 的主动通知；在此之前他不会收到任何暗示已经可用、实际却发不了问数的消息——这是
 `V-开通-18` 的完整断言，本文件承担它的编排半边（判定层的断言在
-``tests/test_mcp_readiness_machine.py`` 的 ``ReadinessRecoveryTickerTest``）。
+``tests/test_mcp_readiness_machine.py``，持久化半边的真库断言在
+``tests/test_postgres_late_readiness_recovery.py``）。
+
+外部独立审查坐实的四条必修，本文件各有对应的**会变红**的用例：
+
+- **F1「active 但永远不告知」**：状态推进与排通知是原子操作（由 fake ``_Activator``
+  模拟），通知发送失败**不会**丢失——它留在待发 outbox 里，下一轮仍会被重新认领并重试，
+  直到真正送达为止。``ActiveButNeverNotifiedIsImpossibleTest`` 是这条修复的核心用例。
+- **F2**：候选一律重新探一次，**不存在**"跳过探针直接判就绪"的分支——`FakeCandidate`
+  上没有 ``already_ready`` 字段，任何试图依赖它的实现都会在类型上直接失败。
+- **F3**：CAS 失败（版本不对/账号停用/已经被推进）**绝不发送任何通知**。
+- **F4**：探针之外的未预期异常会调用 ``record_processing_failure`` 占住调度窗口
+  （防止"毒候选"饿死后面排队的候选）；零候选、零待发通知时**不记完成审计**。
 
 否定断言（合同的"不得 / 不允许"必须有对应否定测试，验证与门禁第八节）：
 
-1. **未就绪（等待中 / 技术失败 / 探针未接线）绝不推进 ``active``、绝不发通知**——
-   这正是 V-开通-18 断言的后半句；
-2. **通知恰一次**：状态推进成功之后这个人立刻退出候选集，同一个人不可能被通知第二次
-   （``test_running_twice_notifies_and_activates_only_once``）；
-3. **推进被数据库拒绝（账号在竞态窗口里被停用）不发通知**；
-4. **收件人不可用不发通知，但不影响已经完成的状态推进**；
-5. 通知失败**有限重试**，仍失败**不抛异常**、不影响状态；
-6. 停止信号之后**零推进、零通知**（未处理的候选原样留给下一轮）；
-7. 单个用户失败不带走整轮；
-8. 报告与审计**只有计数**，不含权限值、open_id 或渲染后的正文。
+1. **未就绪（等待中 / 技术失败 / 探针未接线）绝不推进 ``active``、绝不排任何通知**；
+2. **CAS 失败绝不发通知**（F3）；
+3. **通知恰一次送达**：同一条通知被认领、发送成功后不会被再次发送；
+4. **单个候选 / 单条通知的失败不带走整轮**；
+5. 报告与审计**只有计数**，不含权限值、open_id 或渲染后的正文。
 """
 
 from __future__ import annotations
 
 import threading
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from lingxi.apps.scheduler.late_readiness_recovery import (
-    DEFAULT_NOTIFY_ATTEMPTS,
+    DEFAULT_NOTICE_DRAIN_LIMIT,
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_LIMIT,
     LateReadinessRecoveryDuty,
     LateReadinessRecoveryReport,
 )
-from lingxi.core.identity.onboarding_runner import (
-    FIRST_ONBOARDING_REASON,
-    KEY_COMPLETED,
-    STATE_ACTIVE,
-)
+from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON, KEY_COMPLETED
 from lingxi.core.permission.mcp_readiness import (
     ReadinessAttempt,
     ReadinessBinding,
@@ -48,29 +52,25 @@ USER_B = "usr_01JQZX3M5N7P9R1T3V5W7Y9A0C"
 OPEN_ID = "ou_fake_open_id_for_tests"
 PERMISSIONS = '{"1011":["日活"]}'
 VERSION = 3
+MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
 
 def _candidate(
-    *,
-    user_id: str = USER_A,
-    version: int = VERSION,
-    permissions: str = PERMISSIONS,
-    next_attempt_no: int = 8,
-    already_ready: bool = False,
+    *, user_id: str = USER_A, version: int = VERSION, next_attempt_no: int = 8
 ) -> SimpleNamespace:
+    """真实 ``LateOnboardingCandidate`` 的最小形状。**刻意不含 ``already_ready``**
+    （F2）：任何试图读它的实现会在这里直接 ``AttributeError``，而不是安静地拿到
+    一个默认值。"""
+
     return SimpleNamespace(
         user_id=user_id,
         permission_version=version,
-        permissions=permissions,
+        permissions=PERMISSIONS,
         next_attempt_no=next_attempt_no,
-        already_ready=already_ready,
     )
 
 
 def _attempt(outcome: ReadinessOutcome) -> ReadinessAttempt:
-    from datetime import datetime, timezone
-
-    moment = datetime(2026, 8, 19, 3, 0, tzinfo=timezone.utc)
     kwargs: dict = {}
     if outcome is ReadinessOutcome.READY:
         kwargs = {"metric_count": 4}
@@ -82,17 +82,19 @@ def _attempt(outcome: ReadinessOutcome) -> ReadinessAttempt:
         binding=ReadinessBinding(USER_A, VERSION),
         attempt_no=8,
         outcome=outcome,
-        started_at=moment,
-        finished_at=moment,
+        started_at=MOMENT,
+        finished_at=MOMENT,
         **kwargs,
     )
 
 
 class FakeCandidates:
-    """按脚本返回一份固定候选列表；也可用作 :class:`FakeUsers` 手动搭配的读取口。"""
+    """返回一份固定候选列表，**只在第一次调用时**返回（此后为空）——与真实候选查询
+    "一旦推进就退出候选集"的效果对齐，让跨轮的幂等/重试类用例不需要额外的状态机。"""
 
     def __init__(self, *candidates: SimpleNamespace) -> None:
         self._candidates = list(candidates)
+        self._consumed = False
         self.calls: list[dict] = []
 
     def late_onboarding_recovery_candidates(
@@ -101,19 +103,21 @@ class FakeCandidates:
         self.calls.append(
             {"reason": reason, "interval": recovery_interval_seconds, "limit": limit}
         )
+        if self._consumed:
+            return ()
+        self._consumed = True
         return tuple(self._candidates[:limit])
 
 
 class FakeTicker:
-    """按用户脚本返回一次判定；``None`` 表示"探针未接线"（构造时整体传 ``probe=None``
-    等价，这里用一个脚本值 ``UNWIRED`` 表达同一件事，避免为它单独建一个 fake 类）。
-    """
+    """按用户脚本返回一次判定；``UNWIRED`` 表示"探针未接线"。"""
 
     UNWIRED = object()
 
     def __init__(self, script: dict[str, object] | None = None) -> None:
         self._script = script or {}
         self.calls: list[tuple[str, int, int]] = []
+        self.processing_failures: list[tuple[str, int, str]] = []
 
     def probe_after_timeout(self, binding: ReadinessBinding, *, attempt_no: int):
         self.calls.append((binding.user_id, binding.permission_version, attempt_no))
@@ -124,15 +128,126 @@ class FakeTicker:
             raise step
         return _attempt(step)
 
+    def record_processing_failure(
+        self, binding: ReadinessBinding, *, attempt_no: int, code: str
+    ) -> ReadinessAttempt:
+        self.processing_failures.append((binding.user_id, attempt_no, code))
+        return ReadinessAttempt(
+            binding=binding,
+            attempt_no=attempt_no,
+            outcome=ReadinessOutcome.TECHNICAL_FAILURE,
+            started_at=MOMENT,
+            finished_at=MOMENT,
+            error_code=code,
+        )
 
-class FakeUsers:
-    def __init__(self, *, allow: dict[str, bool] | None = None) -> None:
+
+class FakeLateReadinessStore:
+    """组合 ``_Activator`` + ``_NoticeOutbox``：内存版，行为对齐真实
+    ``PostgresLateReadinessStore`` 的两条关键保证——
+
+    1. CAS 失败（``allow`` 里显式标了 ``False``）**不产生任何通知**；
+    2. 同一个 ``dedupe_key`` 不会产生第二条通知，即使 ``activate_after_late_readiness``
+       被调用多次（真实实现靠数据库 ``UNIQUE`` 约束，这里靠一个 dict）。
+
+    ``claim_one_due_notice`` 不模拟真实的到期节奏（那条断言在真库测试里），只保证
+    "还是 pending 就能被认领到"——这正是编排层需要验证的那一半：**失败之后还留在
+    outbox 里，下一次调用仍然能捞到它**。
+    """
+
+    def __init__(
+        self,
+        *,
+        allow: dict[str, bool] | None = None,
+        current_versions: dict[str, int] | None = None,
+    ) -> None:
         self._allow = allow or {}
-        self.calls: list[tuple[str, str]] = []
+        #: 每个用户"数据库里真实的当前版本"。默认不设，意味着任何版本都通过——
+        #: 只有显式配置了才会像真实 CAS 一样核对 ``expected_permission_version``
+        #: （F3 的 duty 级证据：探针绑定的版本必须原样传给 CAS，不能被换成别的值）。
+        self._current_versions = current_versions or {}
+        self.activate_calls: list[tuple[str, int]] = []
+        self._notices: dict[str, dict] = {}
+        self._by_dedupe: dict[str, str] = {}
+        self._seq = 0
 
-    def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
-        self.calls.append((user_id, to))
-        return self._allow.get(user_id, True)
+    def activate_after_late_readiness(
+        self,
+        *,
+        user_id: str,
+        expected_permission_version: int,
+        company_name: str,
+        function_name: str,
+        dedupe_key: str,
+    ) -> bool:
+        self.activate_calls.append((user_id, expected_permission_version))
+        if not self._allow.get(user_id, True):
+            return False
+        current = self._current_versions.get(user_id)
+        if current is not None and current != expected_permission_version:
+            # 模拟真实 CAS 的 ``AND permission_version = %(expected)s``：版本对不上
+            # 就拒绝，不写任何东西。
+            return False
+        if dedupe_key not in self._by_dedupe:
+            self._seq += 1
+            notice_id = f"obn_{self._seq}"
+            self._notices[notice_id] = {
+                "notice_id": notice_id,
+                "user_id": user_id,
+                "permission_version": expected_permission_version,
+                "company_name": company_name,
+                "function_name": function_name,
+                "dedupe_key": dedupe_key,
+                "status": "pending",
+                # 认领即退避：与真实实现同一条纪律（``claim_one_due_notice`` 在认领的
+                # 同一步把下一次到期时间前移）。这里没有真实时钟，用一个布尔位模拟——
+                # 一旦被认领就不可用，直到测试显式调用 ``simulate_backoff_elapsed``
+                # 模拟"下一次到期时间已经过去"（对应真实系统里时间的流逝）。少了这一位，
+                # 单轮内的 ``_drain_notices`` 循环会把同一条失败的通知反复认领到
+                # ``notice_limit`` 次，与真实系统的退避语义不符。
+                "available": True,
+            }
+            self._by_dedupe[dedupe_key] = notice_id
+        return True
+
+    def claim_one_due_notice(self):
+        for notice in self._notices.values():
+            if notice["status"] == "pending" and notice["available"]:
+                notice["available"] = False
+                return SimpleNamespace(
+                    **{k: v for k, v in notice.items() if k not in ("status", "available")}
+                )
+        return None
+
+    def mark_notice_delivered(self, notice_id: str) -> None:
+        self._notices[notice_id]["status"] = "delivered"
+
+    def mark_notice_failed(self, notice_id: str, *, error: str) -> None:
+        self._notices[notice_id]["last_error"] = error
+        # 状态保持 pending：与真实实现一致，退避已经在"认领"这一步算过。
+
+    def mark_notice_skipped(self, notice_id: str, *, reason: str) -> None:
+        self._notices[notice_id]["status"] = "skipped"
+        self._notices[notice_id]["last_error"] = reason
+
+    def simulate_backoff_elapsed(self, user_id: str | None = None) -> None:
+        """测试专用：模拟"退避窗口已经过去"（对应真实实现里 ``next_attempt_at``
+        到期），让已认领但还没送达的通知重新可被认领。生产代码不会调用这个方法。"""
+
+        for notice in self._notices.values():
+            if user_id is None or notice["user_id"] == user_id:
+                notice["available"] = True
+
+    def notice_status(self, user_id: str) -> str | None:
+        for notice in self._notices.values():
+            if notice["user_id"] == user_id:
+                return notice["status"]
+        return None
+
+    def notice_count(self, user_id: str | None = None) -> int:
+        if user_id is None:
+            return len(self._notices)
+        return sum(1 for n in self._notices.values() if n["user_id"] == user_id)
 
 
 class FakeRecipients:
@@ -146,17 +261,25 @@ class FakeRecipients:
 
 
 class FakeNotifier:
-    def __init__(self, *, fail_times: int = 0, error: Exception | None = None) -> None:
-        self._fail_times = fail_times
-        self._error = error
+    """按用户脚本决定第几次调用才成功；默认恒成功。"""
+
+    def __init__(self, *, fail_first: dict[str, int] | None = None) -> None:
+        self._fail_first = fail_first or {}
+        self._sent_count: dict[str, int] = {}
         self.calls: list[dict] = []
 
     def send(self, *, open_id: str, key: str, values, dedupe_key: str) -> None:
         self.calls.append(
             {"open_id": open_id, "key": key, "values": dict(values), "dedupe_key": dedupe_key}
         )
-        if len(self.calls) <= self._fail_times:
-            raise (self._error or RuntimeError("send_failed"))
+        # 用 dedupe_key 里编码的 user_id 反查该发几次失败（去重键形如
+        # "onboarding:recovery:<user>:<version>"）。
+        user_id = dedupe_key.split(":")[2] if dedupe_key.count(":") >= 2 else dedupe_key
+        count = self._sent_count.get(user_id, 0) + 1
+        self._sent_count[user_id] = count
+        threshold = self._fail_first.get(user_id, 0)
+        if count <= threshold:
+            raise RuntimeError("send_failed")
 
 
 class RecordingAudit:
@@ -173,14 +296,6 @@ class RecordingAudit:
         return [name for name, _ in self.records]
 
 
-class RecordingSleep:
-    def __init__(self) -> None:
-        self.calls: list[float] = []
-
-    def __call__(self, seconds: float) -> None:
-        self.calls.append(seconds)
-
-
 _UNSET = object()
 
 
@@ -188,30 +303,28 @@ def build_duty(
     *,
     candidates=_UNSET,
     ticker=_UNSET,
-    users: FakeUsers | None = None,
+    store: FakeLateReadinessStore | None = None,
     recipients: FakeRecipients | None = None,
     notifier: FakeNotifier | None = None,
     audit: RecordingAudit | None = None,
-    sleep: RecordingSleep | None = None,
     reason: str = FIRST_ONBOARDING_REASON,
     stop: threading.Event | None = None,
     **kwargs,
 ):
     candidates = FakeCandidates(_candidate()) if candidates is _UNSET else candidates
     ticker = FakeTicker() if ticker is _UNSET else ticker
-    users = users or FakeUsers()
+    store = store or FakeLateReadinessStore()
     recipients = recipients or FakeRecipients()
     notifier = notifier or FakeNotifier()
     audit = audit or RecordingAudit()
-    sleep = sleep or RecordingSleep()
     duty = LateReadinessRecoveryDuty(
         candidates=candidates,
         ticker=ticker,
-        users=users,
+        activator=store,
+        notices=store,
         recipients=recipients,
         notifier=notifier,
         audit=audit,
-        sleep=sleep,
         reason=reason,
         stop=stop,
         **kwargs,
@@ -219,11 +332,10 @@ def build_duty(
     return duty, {
         "candidates": candidates,
         "ticker": ticker,
-        "users": users,
+        "store": store,
         "recipients": recipients,
         "notifier": notifier,
         "audit": audit,
-        "sleep": sleep,
     }
 
 
@@ -233,19 +345,6 @@ class ConstructionTest(unittest.TestCase):
             with self.subTest(reason=reason):
                 with self.assertRaises(ValueError):
                     build_duty(reason=reason)
-
-    def test_sleep_must_be_callable(self) -> None:
-        with self.assertRaises(TypeError):
-            LateReadinessRecoveryDuty(
-                candidates=FakeCandidates(),
-                ticker=FakeTicker(),
-                users=FakeUsers(),
-                recipients=FakeRecipients(),
-                notifier=FakeNotifier(),
-                audit=RecordingAudit(),
-                sleep=None,  # type: ignore[arg-type]
-                reason=FIRST_ONBOARDING_REASON,
-            )
 
     def test_recovery_interval_must_be_a_positive_integer(self) -> None:
         for bad in (0, -1, True, 1.5):
@@ -259,22 +358,22 @@ class ConstructionTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_duty(limit=bad)
 
-    def test_notify_attempts_must_be_a_positive_integer(self) -> None:
+    def test_notice_limit_must_be_a_positive_integer(self) -> None:
         for bad in (0, -1, True):
             with self.subTest(bad=repr(bad)):
                 with self.assertRaises(ValueError):
-                    build_duty(notify_attempts=bad)
+                    build_duty(notice_limit=bad)
 
     def test_defaults_match_the_documented_choices(self) -> None:
         self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 900)
         self.assertEqual(DEFAULT_RECOVERY_LIMIT, 50)
-        self.assertGreaterEqual(DEFAULT_NOTIFY_ATTEMPTS, 1)
+        self.assertEqual(DEFAULT_NOTICE_DRAIN_LIMIT, 50)
 
 
 class ReadyCandidateTest(unittest.TestCase):
-    """核心正向：超时后就绪 → 写 ``active`` + 恰一次「开通完成」通知。"""
+    """核心正向：超时后就绪 → 原子推进 ``active`` + 排通知 → 同一轮把通知发出去。"""
 
-    def test_a_late_success_activates_the_user_and_sends_the_completion_message(self) -> None:
+    def test_a_late_success_activates_and_delivers_in_the_same_tick(self) -> None:
         duty, seams = build_duty(
             candidates=FakeCandidates(_candidate()),
             ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
@@ -285,22 +384,22 @@ class ReadyCandidateTest(unittest.TestCase):
         self.assertEqual(report.examined, 1)
         self.assertEqual(report.ready, 1)
         self.assertEqual(report.activated, 1)
+        self.assertEqual(report.notices_claimed, 1)
         self.assertEqual(report.notified, 1)
         self.assertEqual(report.failed, 0)
-        self.assertEqual(seams["users"].calls, [(USER_A, STATE_ACTIVE)])
+        self.assertEqual(seams["store"].activate_calls, [(USER_A, VERSION)])
         self.assertEqual(len(seams["notifier"].calls), 1)
         sent = seams["notifier"].calls[0]
         self.assertEqual(sent["key"], KEY_COMPLETED)
         self.assertEqual(sent["open_id"], OPEN_ID)
         self.assertEqual(sent["dedupe_key"], f"onboarding:recovery:{USER_A}:{VERSION}")
+        self.assertEqual(seams["store"].notice_status(USER_A), "delivered")
 
     def test_the_completion_text_reports_the_users_actual_scope(self) -> None:
-        """文案里的公司/职能位必须来自这个人**实际**发布出去的那一份权限，不是写死值。"""
-
+        candidate = _candidate()
+        candidate.permissions = '{"2022":["收入","留存"]}'
         duty, seams = build_duty(
-            candidates=FakeCandidates(
-                _candidate(permissions='{"2022":["收入","留存"]}')
-            ),
+            candidates=FakeCandidates(candidate),
             ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
         )
 
@@ -310,26 +409,11 @@ class ReadyCandidateTest(unittest.TestCase):
         self.assertEqual(values["company_name"], "2022")
         self.assertEqual(sorted(values["function_name"].split("、")), ["收入", "留存"])
 
-    def test_an_already_ready_candidate_skips_the_probe_and_finishes_the_job(self) -> None:
-        """崩溃恢复：上一轮已经探到 ready，只是没来得及推进 + 通知。"""
-
-        duty, seams = build_duty(
-            candidates=FakeCandidates(_candidate(already_ready=True)),
-            ticker=FakeTicker({USER_A: ReadinessOutcome.WAITING}),  # 若被误调用会走到这里
-        )
-
-        report = duty.run_once()
-
-        self.assertEqual(report.ready, 1)
-        self.assertEqual(report.activated, 1)
-        self.assertEqual(report.notified, 1)
-        self.assertEqual(seams["ticker"].calls, [], "已经探到过 ready 的候选不该再探一次")
-
 
 class NotReadyCandidateTest(unittest.TestCase):
-    """核心负向：未就绪 → 不写 ``active``、不发任何暗示可用的消息。"""
+    """核心负向：未就绪 → 不写 ``active``、不排任何通知、不发任何暗示可用的消息。"""
 
-    def test_waiting_does_not_activate_or_notify(self) -> None:
+    def test_waiting_does_not_activate_or_enqueue_a_notice(self) -> None:
         duty, seams = build_duty(ticker=FakeTicker({USER_A: ReadinessOutcome.WAITING}))
 
         report = duty.run_once()
@@ -337,10 +421,10 @@ class NotReadyCandidateTest(unittest.TestCase):
         self.assertEqual(report.waiting, 1)
         self.assertEqual(report.activated, 0)
         self.assertEqual(report.notified, 0)
-        self.assertEqual(seams["users"].calls, [], "未就绪绝不能推进 provisioning_state")
+        self.assertEqual(seams["store"].activate_calls, [], "未就绪绝不能调用推进")
         self.assertEqual(seams["notifier"].calls, [], "未就绪绝不能发送任何消息")
 
-    def test_technical_failure_does_not_activate_or_notify(self) -> None:
+    def test_technical_failure_does_not_activate_or_enqueue_a_notice(self) -> None:
         duty, seams = build_duty(
             ticker=FakeTicker({USER_A: ReadinessOutcome.TECHNICAL_FAILURE})
         )
@@ -349,8 +433,7 @@ class NotReadyCandidateTest(unittest.TestCase):
 
         self.assertEqual(report.technical_failures, 1)
         self.assertEqual(report.activated, 0)
-        self.assertEqual(report.notified, 0)
-        self.assertEqual(seams["users"].calls, [])
+        self.assertEqual(seams["store"].activate_calls, [])
         self.assertEqual(seams["notifier"].calls, [])
 
     def test_probe_unwired_leaves_the_candidate_untouched(self) -> None:
@@ -360,9 +443,17 @@ class NotReadyCandidateTest(unittest.TestCase):
 
         self.assertEqual(report.probe_unwired, 1)
         self.assertEqual(report.activated, 0)
-        self.assertEqual(report.notified, 0)
-        self.assertEqual(seams["users"].calls, [])
+        self.assertEqual(seams["store"].activate_calls, [])
         self.assertEqual(seams["notifier"].calls, [])
+
+    def test_a_missing_ticker_never_activates(self) -> None:
+        duty, seams = build_duty(candidates=FakeCandidates(_candidate()), ticker=None)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.probe_unwired, 1)
+        self.assertEqual(report.activated, 0)
+        self.assertEqual(seams["store"].activate_calls, [])
 
     def test_the_duty_reports_whether_the_probe_face_is_wired(self) -> None:
         duty, _ = build_duty(ticker=None)
@@ -371,36 +462,14 @@ class NotReadyCandidateTest(unittest.TestCase):
         duty2, _ = build_duty()
         self.assertTrue(duty2.probe_wired)
 
-    def test_a_missing_ticker_does_not_advance_a_candidate_that_needs_probing(self) -> None:
-        duty, seams = build_duty(candidates=FakeCandidates(_candidate()), ticker=None)
 
-        report = duty.run_once()
+class CasFailureTest(unittest.TestCase):
+    """F3：CAS 失败（版本不对 / 账号停用 / 已被别的路径推进）绝不发任何通知。"""
 
-        self.assertEqual(report.probe_unwired, 1)
-        self.assertEqual(report.activated, 0)
-        self.assertEqual(seams["users"].calls, [])
-        self.assertEqual(seams["notifier"].calls, [])
-
-    def test_a_missing_ticker_still_finishes_an_already_ready_candidate(self) -> None:
-        """探针未接线时，``already_ready`` 那一条罕见的崩溃恢复路径仍然要走完。"""
-
-        duty, seams = build_duty(
-            candidates=FakeCandidates(_candidate(already_ready=True)), ticker=None
-        )
-
-        report = duty.run_once()
-
-        self.assertEqual(report.activated, 1)
-        self.assertEqual(report.notified, 1)
-
-
-class AdvanceAndNotifyEdgeCaseTest(unittest.TestCase):
-    def test_advance_refused_does_not_notify(self) -> None:
-        """账号在候选查到与这里之间被停用：推进被数据库拒绝，绝不发通知。"""
-
+    def test_a_refused_activation_sends_no_notice(self) -> None:
         duty, seams = build_duty(
             ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
-            users=FakeUsers(allow={USER_A: False}),
+            store=FakeLateReadinessStore(allow={USER_A: False}),
         )
 
         report = duty.run_once()
@@ -409,12 +478,108 @@ class AdvanceAndNotifyEdgeCaseTest(unittest.TestCase):
         self.assertEqual(report.activated, 0)
         self.assertEqual(report.advance_refused, 1)
         self.assertEqual(report.notified, 0)
+        self.assertEqual(report.notices_claimed, 0)
         self.assertEqual(seams["notifier"].calls, [])
         self.assertIn("late_readiness_recovery.advance_refused", seams["audit"].actions())
 
-    def test_missing_recipient_is_skipped_without_raising(self) -> None:
+    def test_the_duty_threads_the_candidates_own_version_into_the_cas(self) -> None:
+        """F3 的编排半边：探针绑定的是候选自带的 ``permission_version``，这个值必须
+        原样传给 CAS，不能被换成一个常量或别的来源——否则版本守卫在类型上成立，但
+        实际传入的值是假的，守卫形同虚设。用一个"数据库里真实版本"与候选版本不一致
+        的场景验证：CAS 因此拒绝，不推进、不通知。真实 SQL 的版本比对本身由
+        ``tests/test_postgres_late_readiness_recovery.py`` 的真库用例钉住。"""
+
+        store = FakeLateReadinessStore(current_versions={USER_A: VERSION + 1})
         duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate(version=VERSION)),
             ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.ready, 1)
+        self.assertEqual(report.activated, 0, "版本已经过时，CAS 必须拒绝")
+        self.assertEqual(report.advance_refused, 1)
+        self.assertEqual(seams["notifier"].calls, [], "版本过时的人绝不能收到任何通知")
+        self.assertEqual(store.notice_count(), 0)
+
+
+class ActiveButNeverNotifiedIsImpossibleTest(unittest.TestCase):
+    """F1 核心场景：状态推进成功之后，通知发送失败**不会**让用户永久收不到那句话——
+    它留在待发 outbox 里，下一轮会被重新认领并重试，直到真正送达。
+    """
+
+    def test_a_notify_failure_is_retried_on_the_next_tick_until_delivered(self) -> None:
+        store = FakeLateReadinessStore()
+        notifier = FakeNotifier(fail_first={USER_A: 2})  # 前两次失败，第三次成功
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate()),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
+            notifier=notifier,
+        )
+
+        first = duty.run_once()
+        self.assertEqual(first.activated, 1, "状态已经真实推进")
+        self.assertEqual(first.notified, 0, "第一次发送失败")
+        self.assertEqual(first.notice_failed, 1)
+        self.assertEqual(store.notice_status(USER_A), "pending", "失败之后仍然留在 outbox 里")
+
+        # 第二轮：没有新候选（已经 active），但待发通知仍然在，仍然会被重新认领
+        # （``simulate_backoff_elapsed`` 模拟"到期时间已经过去"，对应真实系统里
+        # 两轮之间真的流逝的时间）。
+        store.simulate_backoff_elapsed(USER_A)
+        second = duty.run_once()
+        self.assertEqual(second.examined, 0, "已经推进过的人不再是候选")
+        self.assertEqual(second.notices_claimed, 1, "失败的通知必须被重新认领")
+        self.assertEqual(second.notified, 0, "第二次仍然失败")
+        self.assertEqual(store.notice_status(USER_A), "pending")
+
+        # 第三轮：发送成功，终于送达。
+        store.simulate_backoff_elapsed(USER_A)
+        third = duty.run_once()
+        self.assertEqual(third.notified, 1)
+        self.assertEqual(store.notice_status(USER_A), "delivered")
+
+        # 全程只调用了一次 activate（不会因为通知重试而重复推进/重复排通知）。
+        self.assertEqual(store.activate_calls, [(USER_A, VERSION)])
+        self.assertEqual(store.notice_count(USER_A), 1, "自始至终只有一条通知")
+        # 用户最终恰好收到一次成功送达。
+        delivered_sends = sum(
+            1 for call in notifier.calls if call["dedupe_key"] == f"onboarding:recovery:{USER_A}:{VERSION}"
+        )
+        self.assertEqual(delivered_sends, 3, "两次失败尝试 + 一次成功，但只有一次真正送达")
+
+    def test_a_permanently_failing_notifier_never_silently_gives_up(self) -> None:
+        """否定断言：即使发送**一直**失败，通知也不会从 outbox 里消失——它不是"重试
+        三次就放弃"，而是持久重试（配额与退避在真库层面，这里只验证编排层不会主动
+        丢弃）。"""
+
+        store = FakeLateReadinessStore()
+        notifier = FakeNotifier(fail_first={USER_A: 999})
+        duty, _ = build_duty(
+            candidates=FakeCandidates(_candidate()),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
+            notifier=notifier,
+        )
+
+        for _ in range(5):
+            store.simulate_backoff_elapsed(USER_A)
+            duty.run_once()
+
+        self.assertEqual(store.notice_status(USER_A), "pending", "从未被标记为放弃")
+        self.assertEqual(store.notice_count(USER_A), 1, "重试不会产生第二条通知")
+
+
+class RecipientUnavailableTest(unittest.TestCase):
+    def test_missing_recipient_is_skipped_without_raising(self) -> None:
+        store = FakeLateReadinessStore()
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate()),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
             recipients=FakeRecipients(open_ids={USER_A: None}),
         )
 
@@ -424,74 +589,33 @@ class AdvanceAndNotifyEdgeCaseTest(unittest.TestCase):
         self.assertEqual(report.notice_skipped, 1)
         self.assertEqual(report.notified, 0)
         self.assertEqual(seams["notifier"].calls, [])
-
-    def test_notification_retries_then_succeeds(self) -> None:
-        duty, seams = build_duty(
-            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
-            notifier=FakeNotifier(fail_times=1),
-        )
-
-        report = duty.run_once()
-
-        self.assertEqual(report.notified, 1)
-        self.assertEqual(report.notice_failed, 0)
-        self.assertEqual(len(seams["notifier"].calls), 2)
-        self.assertEqual(len(seams["sleep"].calls), 1, "只在失败之后退避一次")
-
-    def test_notification_exhausts_retries_and_is_counted_as_failed(self) -> None:
-        duty, seams = build_duty(
-            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
-            notifier=FakeNotifier(fail_times=99),
-            notify_attempts=3,
-        )
-
-        report = duty.run_once()
-
-        self.assertEqual(report.activated, 1, "通知发不出去不回滚已经完成的状态推进")
-        self.assertEqual(report.notified, 0)
-        self.assertEqual(report.notice_failed, 1)
-        self.assertEqual(len(seams["notifier"].calls), 3)
-        self.assertEqual(
-            len(seams["audit"].fields_for("late_readiness_recovery.notify_failed")), 3
-        )
+        self.assertEqual(store.notice_status(USER_A), "skipped")
 
 
-class IdempotencyTest(unittest.TestCase):
-    """幂等：同一用户跑两轮，只有一次通知、只有一次状态写入。"""
+class ProcessingFailureTest(unittest.TestCase):
+    """F4：探针之外的未预期异常也要占住调度窗口。"""
 
-    def test_running_twice_notifies_and_activates_only_once(self) -> None:
-        state = {"provisioning_state": "mcp_syncing", "account_state": "enabled"}
+    def test_an_activation_failure_records_a_processing_failure_before_reraising(
+        self,
+    ) -> None:
+        class ExplodingStore(FakeLateReadinessStore):
+            def activate_after_late_readiness(self, **kwargs):
+                raise RuntimeError("db_write_failed")
 
-        class MiniCandidates:
-            def late_onboarding_recovery_candidates(self, *, reason, recovery_interval_seconds, limit=50):
-                if state["provisioning_state"] != "mcp_syncing":
-                    return ()
-                return (_candidate(),)
-
-        class MiniUsers:
-            def advance_provisioning_state(self, user_id, *, to):
-                if state["provisioning_state"] == "mcp_syncing" and state["account_state"] == "enabled":
-                    state["provisioning_state"] = to
-                    return True
-                return False
-
-        candidates = MiniCandidates()
-        users = MiniUsers()
+        store = ExplodingStore()
         ticker = FakeTicker({USER_A: ReadinessOutcome.READY})
-        notifier = FakeNotifier()
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate()), ticker=ticker, store=store
+        )
 
-        duty, _ = build_duty(candidates=candidates, ticker=ticker, users=users, notifier=notifier)
+        report = duty.run_once()
 
-        first = duty.run_once()
-        second = duty.run_once()
-
-        self.assertEqual(first.activated, 1)
-        self.assertEqual(first.notified, 1)
-        self.assertEqual(second.examined, 0, "推进成功之后这个人不再是候选")
-        self.assertEqual(second.activated, 0)
-        self.assertEqual(second.notified, 0)
-        self.assertEqual(len(notifier.calls), 1, "「开通完成」只能收到一次")
-        self.assertEqual(len(ticker.calls), 1, "已经就绪的人不该被重复探针")
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(len(ticker.processing_failures), 1)
+        failed_user, attempt_no, code = ticker.processing_failures[0]
+        self.assertEqual(failed_user, USER_A)
+        self.assertIn("RuntimeError", code)
+        self.assertIn("late_readiness_recovery.user_failed", seams["audit"].actions())
 
 
 class RoundBehaviourTest(unittest.TestCase):
@@ -525,7 +649,7 @@ class RoundBehaviourTest(unittest.TestCase):
         self.assertEqual(report.examined, 1, "停止信号之后不再处理下一个候选")
         self.assertEqual(seams["ticker"].calls, [(USER_A, VERSION, 8)])
 
-    def test_a_single_user_failure_does_not_take_down_the_round(self) -> None:
+    def test_a_single_candidate_failure_does_not_take_down_the_round(self) -> None:
         class ExplodingTicker(FakeTicker):
             def probe_after_timeout(self, binding, *, attempt_no):
                 if binding.user_id == USER_A:
@@ -543,12 +667,52 @@ class RoundBehaviourTest(unittest.TestCase):
         self.assertEqual(report.activated, 1, "另一个用户照常处理完")
         self.assertIn("late_readiness_recovery.user_failed", seams["audit"].actions())
 
+    def test_a_single_notice_failure_does_not_take_down_the_round(self) -> None:
+        store = FakeLateReadinessStore()
+
+        class ExplodingRecipients(FakeRecipients):
+            def notice_recipient_open_id(self, user_id):
+                raise RuntimeError("db_down")
+
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate()),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+            store=store,
+            recipients=ExplodingRecipients(),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.activated, 1)
+        self.assertEqual(report.failed, 1)
+        self.assertIn(
+            "late_readiness_recovery.notice_processing_failed", seams["audit"].actions()
+        )
+
     def test_the_round_is_scoped_to_the_declared_reason(self) -> None:
         duty, seams = build_duty()
 
         duty.run_once()
 
         self.assertEqual(seams["candidates"].calls[0]["reason"], FIRST_ONBOARDING_REASON)
+
+    def test_zero_candidates_and_zero_notices_write_no_completed_audit(self) -> None:
+        """F4：健康系统里绝大多数 tick 什么都不该做——不该无条件刷一条空审计。"""
+
+        duty, seams = build_duty(candidates=FakeCandidates(), ticker=FakeTicker())
+
+        report = duty.run_once()
+
+        self.assertEqual(report.examined, 0)
+        self.assertEqual(report.notices_claimed, 0)
+        self.assertNotIn("late_readiness_recovery.completed", seams["audit"].actions())
+
+    def test_some_activity_does_write_a_completed_audit(self) -> None:
+        duty, seams = build_duty(ticker=FakeTicker({USER_A: ReadinessOutcome.WAITING}))
+
+        duty.run_once()
+
+        self.assertIn("late_readiness_recovery.completed", seams["audit"].actions())
 
     def test_the_report_and_audit_carry_no_field_values(self) -> None:
         """报告与审计只有计数与固定分类，不含权限值、open_id 或渲染后的正文。"""

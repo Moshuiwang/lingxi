@@ -1170,6 +1170,41 @@ class ReadinessRecoveryTicker(_ReadinessProbeRunner):
             return None
         return self._probe_once(binding, attempt_no, **_TICK_OVERRUN)
 
+    def record_processing_failure(
+        self, binding: ReadinessBinding, *, attempt_no: int, code: str
+    ) -> ReadinessAttempt:
+        """记一条**没有真的发起探针**、但需要占住这一次调度窗口的技术失败。
+
+        外部独立审查 F4：恢复职责在探针**之后**的步骤（渲染范围文本、推进
+        ``provisioning_state``）抛出未预期异常时，如果这次窗口不留下任何记录，
+        下一个 scheduler tick 会立刻把同一个人重新选中——因为候选查询的到期判据看的
+        是 ``mcp_sync_check`` 里最后一次判定的时刻，而这次失败根本没有经过探针、没
+        有写过任何一行。一个持续失败的"毒候选"因此会一直占着 ``LIMIT`` 窗口的最前面，
+        排在它后面的正常候选被饿死。
+
+        本方法**不调用探针**，只把这次失败按 ``technical_failure`` 记一行——与探针
+        真的技术失败时走的是同一张表、同一套五路互斥形状，因此对候选查询而言两者
+        没有区别：都会把 ``last_started_at`` 往前推，让这个人乖乖等到下一个复检节奏
+        才会被再选中。``code`` 是错误分类（例如 ``recovery_failed_<异常类型名>``），
+        不是异常正文。
+        """
+
+        if not isinstance(binding, ReadinessBinding):
+            raise TypeError("就绪复检必须绑定 (用户, 权限版本)")
+        if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 1:
+            raise ValueError("尝试次序必须是正整数")
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("失败记录必须带错误码")
+        started = self._now()
+        return self._attempt(
+            binding,
+            attempt_no,
+            ReadinessOutcome.TECHNICAL_FAILURE,
+            started,
+            self._now(),
+            error_code=code.strip(),
+        )
+
 
 __all__ = [
     "CONTRACT_SCHEDULE",

@@ -1528,6 +1528,58 @@ class ReadinessRecoveryTickerTest(unittest.TestCase):
         for forbidden in ("sleep", "wait(", "time."):
             self.assertNotIn(forbidden, source, f"复检形态不得等待：{forbidden}")
 
+    def test_record_processing_failure_writes_a_technical_failure_without_probing(
+        self,
+    ) -> None:
+        """外部独立审查 F4：探针之外的失败（渲染异常、状态推进异常……）也要占住这一次
+        调度窗口，否则"毒候选"会在下一个 tick 立刻被重新选中，饿死排在后面的候选。"""
+
+        ticker, probe, store, audit, _ = _recovery_ticker(3)
+
+        attempt = ticker.record_processing_failure(
+            BINDING, attempt_no=8, code="recovery_failed_RuntimeError"
+        )
+
+        self.assertEqual(attempt.outcome, ReadinessOutcome.TECHNICAL_FAILURE)
+        self.assertEqual(attempt.error_code, "recovery_failed_RuntimeError")
+        self.assertIsNone(attempt.metric_count)
+        self.assertEqual(probe.calls, [], "本方法不发起任何探针调用")
+        self.assertEqual(len(store.records), 1, "必须落库，候选查询的到期判据才会前移")
+        self.assertEqual(audit.entries[-1][0], "mcp_readiness.technical_failure")
+
+    def test_record_processing_failure_shares_the_same_attempt_helper(self) -> None:
+        """与探针路径共用同一份落库 + 审计实现，不是第二套形状。"""
+
+        self.assertIs(
+            McpReadinessConfirmation._attempt, ReadinessRecoveryTicker._attempt
+        )
+
+    def test_record_processing_failure_rejects_a_binding_of_the_wrong_type(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        with self.assertRaises(TypeError):
+            ticker.record_processing_failure(
+                ("usr_A", 7), attempt_no=1, code="x"  # type: ignore[arg-type]
+            )
+
+    def test_record_processing_failure_rejects_an_illegal_attempt_number(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        for bad in (0, -1, True):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError):
+                    ticker.record_processing_failure(
+                        BINDING, attempt_no=bad, code="x"  # type: ignore[arg-type]
+                    )
+
+    def test_record_processing_failure_requires_a_code(self) -> None:
+        ticker, _, _, _, _ = _recovery_ticker(3)
+
+        for bad in ("", "   "):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError):
+                    ticker.record_processing_failure(BINDING, attempt_no=1, code=bad)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

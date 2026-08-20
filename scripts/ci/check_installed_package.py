@@ -235,10 +235,14 @@ REQUIRED_MODULES = (
     # 迟到就绪恢复职责（V-开通-18）：`apps/scheduler/__init__.py` 在**模块级**
     # import（同 permission_refresh/permission_publish 那一条理由，漏登记会直接
     # 让 scheduler 起不来）。它复用的适配器（postgres_permission_publish、
-    # postgres_identity、mcp_token_cipher、postgres_mcp_token、query_mcp_probe、
-    # feishu_user_message）已经因为 onboarding/permission_publish 那几节在制品
-    # 清单里，不重复登记。
+    # mcp_token_cipher、postgres_mcp_token、query_mcp_probe、feishu_user_message）
+    # 已经因为 onboarding/permission_publish 那几节在制品清单里，不重复登记。
     "lingxi.apps.scheduler.late_readiness_recovery",
+    # 外部独立审查 F1/F2/F3 修复后新增的持久化面：候选查询、「推进 active + 排通知」
+    # 同事务、通知 outbox 的 claim/complete/purge，迁移 0066 建的
+    # onboarding_completion_notice 表。由 `_build_late_readiness_recovery_duty` 与
+    # `_build_permission_retention_duty` 在函数内 import，同上一条同一条理由。
+    "lingxi.adapters.postgres_late_readiness_recovery",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -338,8 +342,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.feishu_org_snapshot_reader",
             # 迟到就绪恢复职责（V-开通-18）：`apps/scheduler/__init__.py` 模块级
             # import，与 org_snapshot_sync 一节同一条"漏登记会直接让 scheduler
-            # 起不来"的理由。
+            # 起不来"的理由。它的持久化面（`_build_late_readiness_recovery_duty`
+            # 与 `_build_permission_retention_duty` 在函数内 import）同样必须登记，
+            # 理由与 `feishu_org_snapshot_reader` 那一行相同。
             "lingxi.apps.scheduler.late_readiness_recovery",
+            "lingxi.adapters.postgres_late_readiness_recovery",
             # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块，全部由
             # 包的 `__init__.py` 在模块级 import（维持既有的 `lingxi.apps.scheduler.
             # <名字>` 重导出契约），因此进程起来时这八个必然已经被 import 过一遍。
