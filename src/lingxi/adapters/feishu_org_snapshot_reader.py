@@ -199,7 +199,13 @@ def _walk_user_scope(
             if identifier is None:
                 raise OrgSnapshotReadError("user_scope_department_id_missing")
             key, _ = identifier
-            name = _text(entity.get("name"))
+            # 部门名字段对齐真实响应（Issue #273，见下方成员循环同一处证据来源）：
+            # `visible_organization` 列表接口给的是 `department_name`，不是
+            # `name`——`name` 在真实响应里恒为空。这一处此前不会抛错，只会让
+            # `name or key` 悄悄退化成用 `department_key` 兜底显示名：是本次
+            # 证据链里唯一"看似正常运行、实际数据是错的"的一处，其余三处
+            # （成员的 open_id / union_id / name）都是硬抛。
+            name = _text(entity.get("department_name"))
             department_names[key] = name or key
             if key not in seen_department_keys:
                 seen_department_keys.add(key)
@@ -208,13 +214,43 @@ def _walk_user_scope(
                 queue.append(identifier)
 
         for entity in entity_members:
-            open_id = _text(entity.get("open_id"))
+            # 字段名对齐 2026-08-05 那次受控验收运行（`feishu_org_sync_run`，
+            # `status=complete`）保存的真实响应原文（Issue #273 回源提取，只取
+            # 字段名与出现次数，不取任何值；编排者最初误记成 2026-07-29——那是
+            # 仓库证据文档里另一次记 710 人的运行，两个数对不上才发现记错）：
+            # `visible_organization` 列表实体用的是 `open_user_id` /
+            # `user_id` / `union_user_id` / `user_name`，不是这里此前读的
+            # `open_id` / `union_id` / `name`——那三个字段在真实响应里恒为
+            # 空，会在第一个租户的第一个成员就撞上下面的
+            # `user_scope_member_identity_incomplete`，整轮同步中断（四张
+            # `feishu_org_*` 表因此一直是 0|0|0|0）。`user_id` 字段名本身
+            # 没错，维持不动。
+            open_id = _text(entity.get("open_user_id"))
             user_id = _text(entity.get("user_id"))
-            union_id = _text(entity.get("union_id"))
-            display_name = _text(entity.get("name"))
+            union_id = _text(entity.get("union_user_id"))
+            display_name = _text(entity.get("user_name"))
             if not (open_id and user_id and union_id and display_name):
-                # 不猜、不用姓名回退——三类标识 100% 可得已复验（Issue #16），一旦
-                # 出现缺口就是需要人看一眼的异常，不是本模块该悄悄补全的情况。
+                # 不猜、不用姓名回退——四类标识 100% 可得已复验：2026-08-05
+                # 那次运行保存的 713 条成员实体逐一核对，`open_user_id` /
+                # `user_id` / `union_user_id` / `user_name` 各自出现
+                # 713/713 次（Issue #273，对分页原文逐条枚举字段名的计数）。
+                # 该运行自己记录的 `metadata.id_completeness`
+                # （`{open_id: 712, user_id: 712, union_id: 712}`）是**合并
+                # 过成员详情接口之后**的完整度，口径与这里不同，不能拿来当
+                # 列表接口本身的字段可得性证据——这正是 #273 缺陷的根：此前
+                # 这里写的依据「三类标识 100% 可得已复验（Issue #16）」，验的
+                # 是「成员详情接口」（`collaboration_users`，逐人现读）上的
+                # 完整度，不是这个列表接口（`visible_organization`）上的。
+                # 严格判据本身不受这次根因牵连、依旧站得住（真实列表数据四项
+                # 都是 713/713，且编排者用同一份数据离线跑过 `verify_batch`：
+                # 8 个租户两条路径的成员集合与部门集合逐值完全相等，712 个
+                # `open_user_id` 跨租户重复 0、身份矛盾 0、空字段 0），因此
+                # 这里保留"缺一项就抛错"，不放宽成历史脚本
+                # `scripts/sync_feishu_org_snapshot.py` 那种"五选一"接受
+                # 多种字段名——放宽会让"真的缺字段"这种应该被人看到的异常
+                # 悄悄通过，与本模块"如实组装、不猜"的纪律相悖（见模块顶部
+                # 文档字符串）。一旦出现缺口就是需要人看一眼的异常，不是本
+                # 模块该悄悄补全的情况。
                 raise OrgSnapshotReadError("user_scope_member_identity_incomplete")
             existing = members.get(open_id)
             if existing is not None and (existing.user_id != user_id or existing.union_id != union_id):

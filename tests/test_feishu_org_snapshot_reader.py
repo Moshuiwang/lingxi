@@ -60,7 +60,24 @@ class FakeDirectoryClient:
 
 
 def _member(open_id: str, name: str = "某人") -> dict[str, object]:
-    return {"open_id": open_id, "user_id": f"u_{open_id}", "union_id": f"on_{open_id}", "name": name}
+    """构造用户身份路径（``visible_organization``）的真实形状成员实体。
+
+    字段名对齐 2026-08-05 那次受控验收运行保存的真实响应原文（Issue #273）：
+    ``open_user_id`` / ``user_id`` / ``union_user_id`` / ``user_name``，
+    **不含** ``open_id`` / ``union_id`` / ``name``——旧字段名在真实响应里
+    恒不存在，此前用旧字段名构造的夹具是"旧行为的化石"，测不出真实响应会
+    炸的问题；改用真实形状后本文件里所有依赖 ``_member`` 的用例才是在测
+    真实会发生的情况。参数名 ``open_id`` 保留不改，是本文件已有的调用惯例
+    （调用方传入的是"这个人的 open_user_id 值"，与 :class:`SnapshotMember`
+    的 ``open_id`` 字段同名，不是要求飞书响应里也有一个叫 ``open_id`` 的
+    字段）。"""
+
+    return {
+        "open_user_id": open_id,
+        "user_id": f"u_{open_id}",
+        "union_user_id": f"on_{open_id}",
+        "user_name": name,
+    }
 
 
 class HappyPathTest(unittest.TestCase):
@@ -80,7 +97,7 @@ class HappyPathTest(unittest.TestCase):
             user_scope={
                 "tenant_a": {
                     None: (
-                        [{"open_department_id": "od_1", "name": "研发部"}],
+                        [{"open_department_id": "od_1", "department_name": "研发部"}],
                         [],
                     ),
                     ("od_1", "open_department_id"): ([], [_member("ou_1", "张一")]),
@@ -126,17 +143,17 @@ class HappyPathTest(unittest.TestCase):
                 "tenant_a": {
                     None: (
                         [
-                            {"open_department_id": "od_parent_1", "name": "父部门一"},
-                            {"open_department_id": "od_parent_2", "name": "父部门二"},
+                            {"open_department_id": "od_parent_1", "department_name": "父部门一"},
+                            {"open_department_id": "od_parent_2", "department_name": "父部门二"},
                         ],
                         [],
                     ),
                     ("od_parent_1", "open_department_id"): (
-                        [{"open_department_id": "od_shared", "name": "共享部门"}],
+                        [{"open_department_id": "od_shared", "department_name": "共享部门"}],
                         [],
                     ),
                     ("od_parent_2", "open_department_id"): (
-                        [{"open_department_id": "od_shared", "name": "共享部门"}],
+                        [{"open_department_id": "od_shared", "department_name": "共享部门"}],
                         [_member("ou_1")],
                     ),
                     ("od_shared", "open_department_id"): ([], []),
@@ -385,11 +402,18 @@ class MemberIdentityConflictTest(unittest.TestCase):
                     None: ([{"open_department_id": "od_1"}, {"open_department_id": "od_2"}], []),
                     ("od_1", "open_department_id"): (
                         [],
-                        [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1", "name": "张一"}],
+                        [{"open_user_id": "ou_1", "user_id": "u_1", "union_user_id": "on_1", "user_name": "张一"}],
                     ),
                     ("od_2", "open_department_id"): (
                         [],
-                        [{"open_id": "ou_1", "user_id": "u_1_conflict", "union_id": "on_1", "name": "张一"}],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "user_id": "u_1_conflict",
+                                "union_user_id": "on_1",
+                                "user_name": "张一",
+                            }
+                        ],
                     ),
                 }
             },
@@ -409,11 +433,18 @@ class MemberIdentityConflictTest(unittest.TestCase):
                     None: ([{"open_department_id": "od_1"}, {"open_department_id": "od_2"}], []),
                     ("od_1", "open_department_id"): (
                         [],
-                        [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1", "name": "张一"}],
+                        [{"open_user_id": "ou_1", "user_id": "u_1", "union_user_id": "on_1", "user_name": "张一"}],
                     ),
                     ("od_2", "open_department_id"): (
                         [],
-                        [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1_conflict", "name": "张一"}],
+                        [
+                            {
+                                "open_user_id": "ou_1",
+                                "user_id": "u_1",
+                                "union_user_id": "on_1_conflict",
+                                "user_name": "张一",
+                            }
+                        ],
                     ),
                 }
             },
@@ -435,8 +466,8 @@ class MemberIdentityConflictTest(unittest.TestCase):
                 "tenant_a": {
                     None: (
                         [
-                            {"open_department_id": "od_1", "name": "部门一"},
-                            {"open_department_id": "od_2", "name": "部门二"},
+                            {"open_department_id": "od_1", "department_name": "部门一"},
+                            {"open_department_id": "od_2", "department_name": "部门二"},
                         ],
                         [],
                     ),
@@ -454,11 +485,38 @@ class MemberIdentityConflictTest(unittest.TestCase):
 
 class ShapeErrorTest(unittest.TestCase):
     def test_a_missing_member_identity_field_raises_instead_of_guessing(self) -> None:
+        """真实形状（Issue #273）但缺 ``union_user_id`` 仍要抛错——严格判据
+        保留，只是字段名对齐了真实响应，不是放宽成"有几个算几个"。"""
+
         client = FakeDirectoryClient(
             app_tenants=[{"tenant_key": "tenant_a"}],
             user_tenants=[{"tenant_key": "tenant_a"}],
             app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_1"}])}},
-            user_scope={"tenant_a": {None: ([], [{"open_id": "ou_1", "user_id": "u_1", "name": "缺 union_id"}])}},
+            user_scope={
+                "tenant_a": {None: ([], [{"open_user_id": "ou_1", "user_id": "u_1", "user_name": "缺 union_user_id"}])}
+            },
+        )
+
+        with self.assertRaises(OrgSnapshotReadError) as raised:
+            read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
+        self.assertEqual(raised.exception.args[0], "user_scope_member_identity_incomplete")
+
+    def test_legacy_field_names_are_no_longer_accepted(self) -> None:
+        """Issue #273 反向锚点：只给旧字段名（``open_id`` / ``union_id`` /
+        ``name``，此前误以为的字段名）必须仍然抛 ``user_scope_member_identity_
+        incomplete``——真实响应里根本不存在这三个字段。没有这条用例，未来有人
+        把 :func:`lingxi.adapters.feishu_org_snapshot_reader._walk_user_scope`
+        的字段名改回旧的三个（``open_id`` / ``union_id`` / ``name``），本文件
+        其余全部用真实形状构造夹具的用例会全部失败，但不会有任何一条用例专门
+        证明"旧字段名本来就该被拒绝"——本用例把这条断言钉死。"""
+
+        client = FakeDirectoryClient(
+            app_tenants=[{"tenant_key": "tenant_a"}],
+            user_tenants=[{"tenant_key": "tenant_a"}],
+            app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_1"}])}},
+            user_scope={
+                "tenant_a": {None: ([], [{"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1", "name": "张一"}])}
+            },
         )
 
         with self.assertRaises(OrgSnapshotReadError) as raised:
@@ -499,6 +557,132 @@ class ShapeErrorTest(unittest.TestCase):
 class DepartmentLimitTest(unittest.TestCase):
     def test_the_department_traversal_upper_bound_is_generous_but_finite(self) -> None:
         self.assertGreater(MAX_DEPARTMENTS_PER_TENANT, 100)
+
+
+class RealResponseShapeTest(unittest.TestCase):
+    """Issue #273：``_walk_user_scope`` 此前读的四个字段里错了三个（``open_id``
+    / ``union_id`` / 成员与部门的 ``name``），会在第一个租户的第一个成员就抛
+    ``user_scope_member_identity_incomplete``，整轮同步中断。本类用 2026-08-05
+    那次受控验收运行保存的真实响应原文的字段形状（不含旧字段名）单独钉住三件
+    事：成功解析、跨路径成员集合仍然逐值相等、部门名不会退化成部门 key。"""
+
+    def test_a_real_shape_member_parses_with_open_user_id_as_the_canonical_key(self) -> None:
+        """真实形状成员实体（含 ``i18n_user_name`` / ``user_avatar`` /
+        ``collaboration_entity_type`` 等不被读取的多余字段，与真实响应一致），
+        不含 ``open_id`` / ``union_id`` / ``name``——只靠 ``open_user_id`` /
+        ``user_id`` / ``union_user_id`` / ``user_name`` 就必须成功解析，且
+        ``SnapshotMember.member_key`` 与 ``.open_id`` 都取 ``open_user_id``
+        的值（不是别的字段）。"""
+
+        real_shape_member = {
+            "open_user_id": "ou_real_1",
+            "user_id": "u_real_1",
+            "union_user_id": "on_real_1",
+            "user_name": "真实形状张一",
+            "i18n_user_name": {"zh_cn": "真实形状张一"},
+            "user_avatar": "https://example.invalid/avatar.png",
+            "collaboration_entity_type": 1,
+        }
+        client = FakeDirectoryClient(
+            app_tenants=[{"tenant_key": "tenant_a"}],
+            user_tenants=[{"tenant_key": "tenant_a"}],
+            app_scope={"tenant_a": {"0": ([], [{"open_user_id": "ou_real_1"}])}},
+            user_scope={"tenant_a": {None: ([], [real_shape_member])}},
+        )
+
+        batch = read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
+
+        self.assertEqual(len(batch.members), 1)
+        member = batch.members[0]
+        self.assertEqual(member.member_key, "ou_real_1")
+        self.assertEqual(member.open_id, "ou_real_1")
+        self.assertEqual(member.user_id, "u_real_1")
+        self.assertEqual(member.union_id, "on_real_1")
+        self.assertEqual(member.display_name, "真实形状张一")
+        require_complete_batch(batch)  # 跨路径集合也必须对齐，不只是单条解析成功
+
+    def test_a_real_shape_department_name_resolves_to_the_department_name_field_not_a_key_fallback(self) -> None:
+        """真实形状部门实体（含 ``i18n_department_name`` / ``department_order``
+        / ``collaboration_entity_type`` 等不被读取的多余字段），不含 ``name``。
+        部门显示名必须取到 ``department_name`` 的值——不是 ``None``、也不是
+        ``_walk_user_scope`` 里 ``name or key`` 那行代码在字段取不到时会退化
+        成的 ``department_key`` 本身，那种退化不会抛错，是最容易被忽视的一种
+        静默错误。"""
+
+        real_shape_department = {
+            "open_department_id": "od_real_1",
+            "department_id": "dept_real_1",
+            "department_name": "真实形状研发部",
+            "i18n_department_name": {"zh_cn": "真实形状研发部"},
+            "department_order": 1,
+            "collaboration_entity_type": 2,
+        }
+        client = FakeDirectoryClient(
+            app_tenants=[{"tenant_key": "tenant_a"}],
+            user_tenants=[{"tenant_key": "tenant_a"}],
+            app_scope={"tenant_a": {"0": ([{"open_department_id": "od_real_1"}], [])}},
+            user_scope={
+                "tenant_a": {
+                    None: ([real_shape_department], []),
+                    ("od_real_1", "open_department_id"): ([], []),
+                }
+            },
+        )
+
+        batch = read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
+
+        self.assertEqual(len(batch.departments), 1)
+        department = batch.departments[0]
+        self.assertEqual(department.department_key, "od_real_1")
+        self.assertEqual(department.name, "真实形状研发部")
+        self.assertNotEqual(department.name, department.department_key, "部门名不能退化成部门 key 本身")
+
+    def test_app_and_user_paths_produce_identical_member_key_sets_with_real_shapes(self) -> None:
+        """跨路径一致性回归护栏：应用路径成员键取 ``open_user_id``（既有实现，
+        本次未改动），用户路径喂入真实形状实体（本次改动后同样取
+        ``open_user_id`` 的值）。``TenantScope.app_member_keys`` 与
+        ``user_member_keys`` 必须逐值相等——这是防止有人日后把用户侧字段名
+        改回 ``open_id`` 之类别的字段的护栏：那样改会让本用例的两个集合不再
+        相等而变红，即使两边"看起来都解析成功了"。"""
+
+        client = FakeDirectoryClient(
+            app_tenants=[{"tenant_key": "tenant_a"}],
+            user_tenants=[{"tenant_key": "tenant_a"}],
+            app_scope={
+                "tenant_a": {
+                    "0": ([], [{"open_user_id": "ou_real_1"}, {"open_user_id": "ou_real_2"}]),
+                }
+            },
+            user_scope={
+                "tenant_a": {
+                    None: (
+                        [],
+                        [
+                            {
+                                "open_user_id": "ou_real_1",
+                                "user_id": "u_real_1",
+                                "union_user_id": "on_real_1",
+                                "user_name": "真实一",
+                            },
+                            {
+                                "open_user_id": "ou_real_2",
+                                "user_id": "u_real_2",
+                                "union_user_id": "on_real_2",
+                                "user_name": "真实二",
+                            },
+                        ],
+                    )
+                }
+            },
+        )
+
+        batch = read_org_snapshot(client=client, app_token="app-token", user_token="user-token")
+
+        tenant_a = batch.tenants[0]
+        self.assertEqual(tenant_a.app_member_keys, frozenset({"ou_real_1", "ou_real_2"}))
+        self.assertEqual(tenant_a.app_member_keys, tenant_a.user_member_keys)
+        report = verify_batch(batch)
+        self.assertTrue(report.complete, f"真实形状下两条路径本应逐值相等，却出现问题：{report.problems}")
 
 
 if __name__ == "__main__":
