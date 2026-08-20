@@ -41,6 +41,17 @@ REQUEST_TIMEOUT_SECONDS = 20
 # scripts/sync_feishu_org_snapshot.py 用过的配方，这里照抄同一个数值，
 # 不新造节流算法。详见 _PagedClient._throttle 的文档字符串。
 REQUEST_PAUSE_SECONDS = 0.12
+
+# 频率限制的窄而有界重试（Issue #271 编排者 2026-08-20 补充压测证据）：
+# 0.12 秒节流在 2 倍真实规模（564 次调用）下实测未撞限频，但对照的无节流
+# 基线在约 1.9 req/s 撞墙、节流后的实测速率约 1.58 req/s 未撞——只差约 17%，
+# 且飞书这个配额的确切机制（滚动窗口 / 每分钟额度 / 其他）未回源确认，
+# 0.12 秒是"刚好越过线"而不是"留厚余量"的经验值。只对这一个错误码重试，
+# 不对其他业务错误码、形状错误、传输错误扩大——那些是真失败，重试只会掩盖
+# （历史脚本同样只对传输层错误重试，不对业务错误码重试）。三次、递增退避，
+# 详见 _PagedClient._request 的文档字符串。
+FEISHU_RATE_LIMIT_ERROR_CODE = "feishu_code_99991400"
+RATE_LIMIT_RETRY_BACKOFFS_SECONDS: tuple[float, ...] = (2.0, 5.0, 10.0)
 DEPARTMENT_ID_TYPES = frozenset({"open_department_id", "department_id"})
 
 
@@ -114,7 +125,13 @@ class Transport(Protocol):
 
 
 def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
-    """默认传输层：只发 HTTPS，不重试有副作用的请求。"""
+    """默认传输层：只发 HTTPS，本身不重试。
+
+    有副作用的请求（``POST``）到这一层从未重试过，这条不变。**只读的 ``GET``
+    分页请求**上，Issue #271 在更高层的 ``_PagedClient._request`` 加了一道窄而
+    有界的重试——只对飞书业务层面的频率限制错误码生效，见该方法文档字符串；
+    这层传输函数本身仍然只是"发一次、按原样返回或抛出"，不知道、也不需要知道
+    上面有没有重试。"""
 
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
@@ -189,6 +206,7 @@ class _PagedClient:
         transport: Callable[..., Any] | None = None,
         request_pause_seconds: float = REQUEST_PAUSE_SECONDS,
         sleep: Callable[[float], None] | None = None,
+        rate_limit_retry_backoffs: tuple[float, ...] = RATE_LIMIT_RETRY_BACKOFFS_SECONDS,
     ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
@@ -199,6 +217,10 @@ class _PagedClient:
         # 假 sleeper 或把 request_pause_seconds 设成 0 来跳过真实等待。
         self._request_pause_seconds = request_pause_seconds
         self._sleep: Callable[[float], None] = sleep or time.sleep
+        # 频率限制的窄而有界重试也可注入（Issue #271 编排者 2026-08-20 补充压测
+        # 证据后追加，见 `_request` 文档字符串）：默认值本身就是生效的三次递增
+        # 退避，测试注入更短的序列来避免真实等待，不代表生产默认是关闭的。
+        self._rate_limit_retry_backoffs = rate_limit_retry_backoffs
 
     def _throttle(self) -> None:
         """真实请求前的固定节流（Issue #271）。
@@ -208,14 +230,17 @@ class _PagedClient:
         跑（不被前面 250 次调用预热），无论有无间隔，40 次调用全部成功；而
         被前面 250 次调用预热过的同一份调用序列在第 251 次收到
         ``feishu_code_99991400``。这坐实了 ``99991400`` 是**累计频率限制**，
-        不是权限或数据问题，只能靠放慢请求节奏来避免，重试解决不了（重试只
-        会让已经过载的调用序列继续加压）。
+        不是权限或数据问题，只能靠放慢请求节奏来大幅降低撞上它的概率。
 
         已受控验收、真跑通过 8 租户 710 人的历史脚本
         ``scripts/sync_feishu_org_snapshot.py`` 对此的配方是每次请求前固定停
         ``REQUEST_PAUSE_SECONDS``（0.12 秒，约 8 req/s）——这里照抄同一个已经
-        验收过的数值，不新造节流算法，也不对业务错误码重试（历史脚本同样
-        只对传输层错误重试，不对业务错误码重试）。
+        验收过的数值，不新造节流算法。编排者 2026-08-20 按 2 倍真实规模
+        （564 次调用）实测这个步长本身足以避免撞限：无节流基线约 1.9 req/s
+        撞墙，节流后实测约 1.58 req/s 未撞。**但余量并不厚**（仅差约 17%），
+        且飞书这个配额的确切机制未回源确认——残余的这一点不确定性不再指望
+        单靠节流兜底，见 :meth:`_request` 对频率限制错误码的窄而有界重试
+        （节流仍是主手段，重试是节流之外的第二道防线，不是替代）。
 
         停顿量与真实 sleep 都通过构造参数注入：``request_pause_seconds`` 为
         假值（如 ``0``）时**完全不调用** ``self._sleep``，不是调用
@@ -225,6 +250,56 @@ class _PagedClient:
 
         if self._request_pause_seconds:
             self._sleep(self._request_pause_seconds)
+
+    def _request(self, url: str, *, token: str) -> dict[str, Any]:
+        """节流后发起一次 ``GET`` 请求并解码，只对飞书的频率限制业务错误码做
+        **窄而有界**的重试（Issue #271 编排者 2026-08-20 补充的真实规模压测
+        证据）。
+
+        **为什么加这一道、而不是只把节流步长调大**：0.12 秒节流在 2 倍真实
+        规模下已经验证有效（见 :meth:`_throttle`），但余量薄、配额机制未知——
+        单纯调大步长只是把同一个"猜"往后挪一个数量级，付出的代价是**每一次
+        请求**都变慢，不管当天到底会不会撞限（本职责一整轮就有 550+ 次调用，
+        这个代价摊在整条链路上）。而这里的失败代价严重不对称：组织快照同步
+        依赖的专用授权令牌**每 UTC 日只能换一次、寿命约 2 小时**（Issue #203
+        相关记录），一次 ``feishu_code_99991400`` 若原样冒泡，会让
+        ``read_org_snapshot`` 整轮作废、``commit_batch`` 不被调用——已经成功
+        读到的几百次调用全部作废，要等下一次 UTC 日界的令牌窗口才有机会重来。
+        对比之下，一次有界重试最多多花 ``sum(RATE_LIMIT_RETRY_BACKOFFS_SECONDS)``
+        （默认 17 秒）。**只对已经过载的这一次请求本身多等几秒，换掉"整轮
+        重跑或等一天"，代价明显更低**，因此选择重试而不是继续调大节流步长。
+
+        **范围收得很窄，不是"失败就重试"**：只有 ``FeishuDirectoryError.code``
+        精确等于 ``FEISHU_RATE_LIMIT_ERROR_CODE``（``feishu_code_99991400``）
+        才重试；其他业务错误码（权限、参数错误……）、``_pages``/``_pages_multi``
+        自己抛出的形状错误（``missing_*``、``invalid_page_item``、
+        ``pagination_stalled`` 等，这些发生在本方法返回之后，根本不在这个
+        ``try`` 的覆盖范围内）、以及传输层异常（``transport_error`` 等）都
+        原样抛出、不重试——那些是真失败，重试只会掩盖或者对一个已经过载的
+        序列继续加压（历史脚本同样只对传输层错误重试，不对业务错误码重试）。
+        重试次数**有界**（默认 3 次，``RATE_LIMIT_RETRY_BACKOFFS_SECONDS`` 的
+        长度），退避递增（默认 2 / 5 / 10 秒）；每次重试前也照常先过一次
+        :meth:`_throttle`，不绕开基础节流。次数耗尽仍然失败时，原样重新抛出
+        最后一次收到的 :class:`FeishuDirectoryError`——「失败就保留上一份、
+        不覆盖基线」的语义一个字不变，本方法只决定"要不要再试一次"，不决定
+        "试过之后失败了怎么办"，那仍然是调用方（最终是
+        ``apps/scheduler/org_snapshot_sync.py``）的既有职责。
+
+        退避的等待量同样通过 ``self._sleep`` 完成，与 :meth:`_throttle` 共用
+        同一个可注入的 sleeper——测试只需要一份假 sleeper 就能同时验证两者，
+        不需要真的等待。
+        """
+
+        attempt = 0
+        while True:
+            self._throttle()
+            try:
+                return _payload(self._transport("GET", url, body=None, token=token))
+            except FeishuDirectoryError as error:
+                if error.code != FEISHU_RATE_LIMIT_ERROR_CODE or attempt >= len(self._rate_limit_retry_backoffs):
+                    raise
+                self._sleep(self._rate_limit_retry_backoffs[attempt])
+                attempt += 1
 
     def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
         """按候选键名读一份分页列表；**空 ⇒ 空，畸形 ⇒ 抛错**（Issue #268 F2，
@@ -287,8 +362,7 @@ class _PagedClient:
             if page_token:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
-            self._throttle()
-            data = _payload(self._transport("GET", url, body=None, token=token))
+            data = self._request(url, token=token)
             has_more = data.get("has_more")
             if not isinstance(has_more, bool):
                 # 降级为 warning，不再硬抛（应修 E）：证据不足以确定"非法类型"
@@ -397,8 +471,7 @@ class _PagedClient:
             if page_token:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
-            self._throttle()
-            data = _payload(self._transport("GET", url, body=None, token=token))
+            data = self._request(url, token=token)
             hit_keys: list[str] = []
             for key in list_keys:
                 if key not in data:
@@ -572,8 +645,7 @@ class FeishuDirectoryClient(_PagedClient):
             f"{self._base_url}/trust_party/v1/collaboration_tenants/{quote(tenant_key, safe='')}"
             f"/collaboration_users/{quote(member_id, safe='')}?{urlencode({'target_user_id_type': id_type})}"
         )
-        self._throttle()
-        data = _payload(self._transport("GET", url, body=None, token=token))
+        data = self._request(url, token=token)
         detail = data.get("target_user")
         if not isinstance(detail, Mapping):
             raise FeishuDirectoryError("member_detail_missing")

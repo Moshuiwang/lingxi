@@ -12,6 +12,8 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 from lingxi.adapters.feishu_directory import (
+    FEISHU_RATE_LIMIT_ERROR_CODE,
+    RATE_LIMIT_RETRY_BACKOFFS_SECONDS,
     REQUEST_PAUSE_SECONDS,
     AuthorizationExchange,
     FeishuAuthorizationClient,
@@ -1069,6 +1071,114 @@ class RequestThrottleTest(unittest.TestCase):
             client = _client(transport)
             client.list_collaboration_tenants(token="fake-user-token")
         real_sleep.assert_not_called()
+
+
+def _rate_limited_response() -> dict[str, object]:
+    """飞书业务层面的频率限制响应（``_payload`` 会把 ``code=99991400`` 渲染成
+    ``FeishuDirectoryError("feishu_code_99991400")``，与
+    ``FEISHU_RATE_LIMIT_ERROR_CODE`` 精确相等）。"""
+
+    return {"code": 99991400, "msg": "too many requests"}
+
+
+class RateLimitRetryTest(unittest.TestCase):
+    """Issue #271 编排者 2026-08-20 补充的真实规模压测证据：0.12 秒节流本身余量
+    不厚、配额机制未回源确认，且撞限的失败代价严重不对称（整轮 550+ 次调用作废，
+    要等下一次 UTC 日界的令牌窗口）。这里只对 ``feishu_code_99991400`` 加一道
+    窄而有界的重试，节流仍是主手段，重试是第二道防线。"""
+
+    def test_a_rate_limit_error_recovers_on_retry(self) -> None:
+        """第一次撞限、第二次成功 ⇒ 调用方拿到正确结果；节流与退避交替出现——
+        重试前也照常先过一次基础节流，不绕开它。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport(
+            [_rate_limited_response(), page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS, RATE_LIMIT_RETRY_BACKOFFS_SECONDS[0], REQUEST_PAUSE_SECONDS])
+
+    def test_rate_limit_retries_are_bounded_and_eventually_raise(self) -> None:
+        """持续撞限 ⇒ 用尽默认的三次退避后仍然抛出，且抛出的还是
+        ``feishu_code_99991400``——重试耗尽不改变"失败就保留上一份"的语义，
+        只决定"要不要再试一次"。"""
+
+        pauses: list[float] = []
+        attempts = len(RATE_LIMIT_RETRY_BACKOFFS_SECONDS) + 1
+        transport = RecordingTransport([_rate_limited_response() for _ in range(attempts)])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, FEISHU_RATE_LIMIT_ERROR_CODE)
+        self.assertEqual(len(transport.calls), attempts)
+        expected_pauses: list[float] = []
+        for backoff in RATE_LIMIT_RETRY_BACKOFFS_SECONDS:
+            expected_pauses.append(REQUEST_PAUSE_SECONDS)
+            expected_pauses.append(backoff)
+        expected_pauses.append(REQUEST_PAUSE_SECONDS)
+        self.assertEqual(pauses, expected_pauses)
+
+    def test_only_the_rate_limit_code_is_retried(self) -> None:
+        """否定断言：另一个业务错误码（权限拒绝）不重试，立即原样抛出——
+        范围收得很窄，不是"失败就重试"。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport([{"code": 99991663, "msg": "permission denied"}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, "feishu_code_99991663")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS])
+
+    def test_pages_own_shape_errors_are_not_retried(self) -> None:
+        """否定断言：``_pages`` 自己判定的形状错误（这里是候选键存在但类型不是
+        列表——不满足 Issue #268 F2 的合法空结果条件，仍然硬抛）发生在
+        ``_request`` 返回**之后**，根本不在重试的 ``try`` 覆盖范围内——不应触发
+        任何退避重试，只有一次基础节流。防的是"以后有人把 try/except 的范围
+        不小心扩大到整个分页循环"这类回归。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_tenant_list": "not-a-list", "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS])
+
+    def test_retry_backoffs_are_injectable(self) -> None:
+        """退避序列可注入且**替换**默认序列（不是叠加）：注入只有一个 backoff
+        的序列 ⇒ 恰好重试一次后仍然失败就直接抛出，不会用默认的三次。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport([_rate_limited_response(), _rate_limited_response()])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            rate_limit_retry_backoffs=(3.0,),
+        )
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, FEISHU_RATE_LIMIT_ERROR_CODE)
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS, 3.0, REQUEST_PAUSE_SECONDS])
 
 
 if __name__ == "__main__":
