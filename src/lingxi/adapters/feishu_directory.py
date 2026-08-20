@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
@@ -33,6 +34,13 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 100
 MAX_PAGES = 200
 REQUEST_TIMEOUT_SECONDS = 20
+
+# 真实请求前的固定节流（Issue #271）：一整轮组织快照遍历要发 550+ 次突发
+# 请求，回源实测证明这会打穿飞书的累计频率限制（feishu_code_99991400）。
+# 0.12 秒（约 8 req/s）是已受控验收、真跑通过 8 租户 710 人的历史脚本
+# scripts/sync_feishu_org_snapshot.py 用过的配方，这里照抄同一个数值，
+# 不新造节流算法。详见 _PagedClient._throttle 的文档字符串。
+REQUEST_PAUSE_SECONDS = 0.12
 DEPARTMENT_ID_TYPES = frozenset({"open_department_id", "department_id"})
 
 
@@ -174,11 +182,49 @@ def _payload(response: Any) -> dict[str, Any]:
 
 
 class _PagedClient:
-    def __init__(self, *, base_url: str, transport: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        transport: Callable[..., Any] | None = None,
+        request_pause_seconds: float = REQUEST_PAUSE_SECONDS,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
         self._base_url = _require_https(base_url)
         self._transport: Callable[..., Any] = transport or urllib_transport
+        # 节流参数与真实 sleep 都可注入（Issue #271）：默认值本身就生效
+        # （REQUEST_PAUSE_SECONDS 非零），不靠调用方记得手动打开；测试注入
+        # 假 sleeper 或把 request_pause_seconds 设成 0 来跳过真实等待。
+        self._request_pause_seconds = request_pause_seconds
+        self._sleep: Callable[[float], None] = sleep or time.sleep
+
+    def _throttle(self) -> None:
+        """真实请求前的固定节流（Issue #271）。
+
+        组织快照同步是**递归遍历**：两条身份路径合计要发 550+ 次突发请求。
+        回源实测证明这会打穿飞书的频率限制——把撞过限频的那个租户单独拿出来
+        跑（不被前面 250 次调用预热），无论有无间隔，40 次调用全部成功；而
+        被前面 250 次调用预热过的同一份调用序列在第 251 次收到
+        ``feishu_code_99991400``。这坐实了 ``99991400`` 是**累计频率限制**，
+        不是权限或数据问题，只能靠放慢请求节奏来避免，重试解决不了（重试只
+        会让已经过载的调用序列继续加压）。
+
+        已受控验收、真跑通过 8 租户 710 人的历史脚本
+        ``scripts/sync_feishu_org_snapshot.py`` 对此的配方是每次请求前固定停
+        ``REQUEST_PAUSE_SECONDS``（0.12 秒，约 8 req/s）——这里照抄同一个已经
+        验收过的数值，不新造节流算法，也不对业务错误码重试（历史脚本同样
+        只对传输层错误重试，不对业务错误码重试）。
+
+        停顿量与真实 sleep 都通过构造参数注入：``request_pause_seconds`` 为
+        假值（如 ``0``）时**完全不调用** ``self._sleep``，不是调用
+        ``sleep(0)``——单元测试据此既能验证"确实节流"，也能验证"可以关掉"，
+        且默认构造出来的客户端就是生效状态，不需要调用方额外接线。
+        """
+
+        if self._request_pause_seconds:
+            self._sleep(self._request_pause_seconds)
 
     def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
         """按候选键名读一份分页列表；**空 ⇒ 空，畸形 ⇒ 抛错**（Issue #268 F2，
@@ -241,6 +287,7 @@ class _PagedClient:
             if page_token:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
+            self._throttle()
             data = _payload(self._transport("GET", url, body=None, token=token))
             has_more = data.get("has_more")
             if not isinstance(has_more, bool):
@@ -350,6 +397,7 @@ class _PagedClient:
             if page_token:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
+            self._throttle()
             data = _payload(self._transport("GET", url, body=None, token=token))
             hit_keys: list[str] = []
             for key in list_keys:
@@ -524,6 +572,7 @@ class FeishuDirectoryClient(_PagedClient):
             f"{self._base_url}/trust_party/v1/collaboration_tenants/{quote(tenant_key, safe='')}"
             f"/collaboration_users/{quote(member_id, safe='')}?{urlencode({'target_user_id_type': id_type})}"
         )
+        self._throttle()
         data = _payload(self._transport("GET", url, body=None, token=token))
         detail = data.get("target_user")
         if not isinstance(detail, Mapping):
