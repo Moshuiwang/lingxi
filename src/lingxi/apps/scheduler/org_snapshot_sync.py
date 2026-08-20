@@ -63,12 +63,34 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Protocol
 
 from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotIntegrityError
 
 logger = logging.getLogger(__name__)
+
+# 失败重试的退避（Issue #268 F3）：stage 实测每 30 秒重试一轮、连续失败数十轮，
+# 按 30 秒 tick 计一天约 2880 次无效外部调用——而本职责的产品语义只要求"每 UTC 日
+# 成功一轮"（见上方模块文档「每 UTC 日至多一轮」），失败重试完全不需要贴着 tick
+# 节奏。步长与封顶照 `adapters/postgres_late_readiness_recovery.py` 的
+# `NOTICE_BACKOFF_STEP_SECONDS`/`NOTICE_BACKOFF_CEILING_SECONDS`（5 分钟起步、封顶
+# 1 小时）——同一个"认领/失败即退避"形状的既有先例，不新造机制。按**连续失败次数**
+# 线性放大（而不是像那处先例按"认领次数"），因为本职责一次失败就是"整轮读取或整轮
+# 完整性校验没通过"，不是逐条重试单个对象。封顶 1 小时把最坏情况从约 2880 次/天
+# 压到约 24 次/天，仍留有"当天多次机会自愈"的余量。
+#
+# **读取失败与完整性校验失败共用同一条退避**（同一个 `_next_attempt_at`/
+# `_failure_streak`），不是两套机制：完整性校验只会在两条身份路径都已经读完一整轮
+# （数百次分页请求）之后才可能失败，立即重试的外部成本与读取失败同一个量级甚至更
+# 高——不存在"这条更便宜所以可以贴着 tick 重试"的理由。任何一次真正往前走了（提交
+# 成功、或从持久化水位发现今天已完成）都会把两个字段一起清零，见 `run_once`。
+# `_next_attempt_at` 是跨 UTC 日界的绝对时间戳，不在日界特意清零：最坏情况下只会
+# 把新一天的第一次尝试再晚半小时到一小时，换来的是代码不必再区分"日界内退避"与
+# "日界外退避"两套语义——`_completed_on`/持久化水位已经保证了"当天完成后不会再被
+# 这条退避挡住"。
+READ_FAILURE_BACKOFF_STEP_SECONDS = 300
+READ_FAILURE_BACKOFF_CEILING_SECONDS = 3600
 
 
 class TokenSupplyFailure(RuntimeError):
@@ -140,6 +162,11 @@ class OrgSnapshotSyncDuty:
         # 每一轮都去读库——单实例假设下不会有别的进程在这中间把水位从 False 改成
         # True（Epic C 冻结审查已登记的既知前提，见模块文档）。
         self._checked_persisted_watermark_for: date | None = None
+        # 失败推进退避（Issue #268 F3，见模块顶部 `READ_FAILURE_BACKOFF_*` 的形状
+        # 说明）。两个字段只在读取失败或完整性校验不通过时推进，任何一种"本轮真的
+        # 往前走了"（提交成功、或从持久化水位发现今天已完成）都会清零。
+        self._next_attempt_at: datetime | None = None
+        self._failure_streak = 0
 
     @property
     def completed_on(self) -> date | None:
@@ -153,6 +180,21 @@ class OrgSnapshotSyncDuty:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _advance_backoff(self, now: datetime) -> int:
+        """记一次"这轮没能往前走"，返回本次算出的退避秒数（Issue #268 F3）。"""
+
+        self._failure_streak += 1
+        backoff_seconds = min(
+            self._failure_streak * READ_FAILURE_BACKOFF_STEP_SECONDS,
+            READ_FAILURE_BACKOFF_CEILING_SECONDS,
+        )
+        self._next_attempt_at = now + timedelta(seconds=backoff_seconds)
+        return backoff_seconds
+
+    def _reset_backoff(self) -> None:
+        self._next_attempt_at = None
+        self._failure_streak = 0
 
     def run_once(self) -> str | None:
         """跑一轮。返回写入的 ``run_id``；未执行或本轮未能提交时返回 ``None``。"""
@@ -183,8 +225,19 @@ class OrgSnapshotSyncDuty:
             else:
                 if already_done:
                     self._completed_on = today
+                    # 本进程自己一次读取都没做就发现"今天已经完成"：不是这里的
+                    # 失败推进了退避，但之前若有残留的退避状态（例如昨天读取失败
+                    # 到今天才被别的实例补上）已经没有意义，一并清零。
+                    self._reset_backoff()
                     self._audit.record("org_snapshot_sync.already_completed_today", source="persisted_watermark")
                     return None
+
+        if self._next_attempt_at is not None and now < self._next_attempt_at:
+            # 退避窗口内：安静跳过，不发起外部读取。不留审计——F3 要压的是外部
+            # 调用次数，把每 30 秒一次的跳过原样记下来会制造同一量级的审计噪音，
+            # 与目标相悖；`read_failed` 审计本身已经带上 `attempt`/`backoff_seconds`，
+            # 足够看出"这一轮之后进入了退避"。
+            return None
 
         try:
             batch = self._read_snapshot()
@@ -195,10 +248,23 @@ class OrgSnapshotSyncDuty:
                 # 令牌供给失败时额外标注是哪一条（F6）：不读取原始异常的正文或
                 # 消息，只读 `TokenSupplyFailure.supply` 这个安全分类标签。
                 fields["supply"] = supply
+            code = getattr(error, "code", None)
+            if isinstance(code, str) and code:
+                # `FeishuDirectoryError.code`（Issue #268 F1）：其类文档承诺该属性
+                # "供程序判断，消息里不含任何凭据"——只读这一个分类标签，不读
+                # `str(error)`（消息正文）、不读响应正文、不读令牌或 URL 查询串。
+                # 非 `FeishuDirectoryError` 的其他异常没有这个属性，`getattr`
+                # 拿到 `None`，仍然只靠上面已经记下的 `type(error).__name__` 归类。
+                fields["code"] = code
+            backoff_seconds = self._advance_backoff(now)
+            fields["attempt"] = self._failure_streak
+            fields["backoff_seconds"] = backoff_seconds
             self._audit.record("org_snapshot_sync.read_failed", **fields)
             logger.error(
-                "组织快照读取失败，保留上一份完成批次，下一轮重试 error=%s supply=%s",
+                "组织快照读取失败，保留上一份完成批次，退避 %s 秒后重试 error=%s code=%s supply=%s",
+                backoff_seconds,
                 type(error).__name__,
+                code if isinstance(code, str) and code else "unknown",
                 supply if isinstance(supply, str) else "unknown",
             )
             return None
@@ -206,15 +272,22 @@ class OrgSnapshotSyncDuty:
         try:
             run_id = self._store.commit_batch(batch, source_app_id=self._source_app_id, started_at=now)
         except SnapshotIntegrityError as error:
+            # 也推进退避（与读取失败共用同一条，见模块顶部常量注释）：走到这一步
+            # 说明两条身份路径都已经读完一整轮（数百次分页请求）才在交叉校验上失败，
+            # 贴着 tick 立即重试的外部成本与读取失败同一个量级，没有理由只挡一条。
+            backoff_seconds = self._advance_backoff(now)
             self._audit.record(
                 "org_snapshot_sync.integrity_rejected",
                 problems=[problem.value for problem in error.report.problems],
                 tenants=error.report.tenant_count,
                 departments=error.report.department_count,
                 members=error.report.member_count,
+                attempt=self._failure_streak,
+                backoff_seconds=backoff_seconds,
             )
             logger.error(
-                "组织快照完整性校验未通过，保留上一份完成批次，下一轮重试 problems=%s",
+                "组织快照完整性校验未通过，保留上一份完成批次，退避 %s 秒后重试 problems=%s",
+                backoff_seconds,
                 ",".join(problem.value for problem in error.report.problems),
             )
             return None
@@ -224,6 +297,7 @@ class OrgSnapshotSyncDuty:
             raise
 
         self._completed_on = today
+        self._reset_backoff()
         self._audit.record(
             "org_snapshot_sync.committed",
             run_id=run_id,

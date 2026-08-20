@@ -263,6 +263,88 @@ class DirectoryPaginationTest(unittest.TestCase):
         self.assertIn("tenant_key", inspect.signature(FeishuDirectoryClient.list_visible_organization).parameters)
 
 
+class EmptyResultIsNotAShapeErrorTest(unittest.TestCase):
+    """Issue #268 F2：**空 ⇒ 空，畸形 ⇒ 抛错**——「空结果」不再被误判成响应形状
+    错误，但真正的形状错误（各有独立的否定断言）一条都不许被这次改动放松。
+    真实响应在结果为空时只有 ``has_more``，四个候选键一个都不出现（编排者
+    2026-08-19 用应用身份实测过同一端点的这个形状）。
+    """
+
+    def test_no_candidate_keys_and_a_strict_false_has_more_is_an_empty_list(self) -> None:
+        """正向：这是 F2 要放行的唯一场景。变异锚点——把 `_pages` 里这条判据删掉、
+        恢复成"四个候选键一个都不存在就直接 raise"，本用例会变红。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        self.assertEqual(client.list_collaboration_tenants(token="fake-user-token"), [])
+
+    def test_has_more_true_without_any_list_key_still_raises(self) -> None:
+        """否定断言：服务端明确说"还有更多"却没给列表键，不是"这批恰好是空的"。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": True}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_a_present_key_with_the_wrong_type_still_raises_even_with_has_more_false(self) -> None:
+        """否定断言：候选键**存在**但类型不对（这里是字符串），哪怕 ``has_more``
+        是 ``False``，也不能被"空结果"那条判据放行——键存在就说明飞书对这个字段
+        有意义的表达，类型不对是响应形状变了，不是"这批没有数据"。"""
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"target_tenant_list": "不是列表", "has_more": False}}]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "missing_target_tenant_list")
+
+    def test_has_more_missing_still_raises_even_with_no_candidate_keys(self) -> None:
+        """否定断言：``has_more`` 完全缺失时既不能断言"读完了"也不能断言"还有更多"，
+        不能被"空结果"那条判据顺手放行——必须先单独判定 ``has_more`` 不是合法 bool。"""
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "has_more_invalid")
+
+    def test_has_more_as_a_non_boolean_truthy_value_still_raises(self) -> None:
+        """否定断言：``has_more`` 是字符串 ``"false"``（真值但不是合法 bool）同样
+        必须抛错，不能被 Python 的真值判断悄悄接受成"读完了"。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": "false"}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual(raised.exception.code, "has_more_invalid")
+
+    def test_an_empty_result_on_a_later_page_after_real_data_still_terminates_cleanly(self) -> None:
+        """空结果的判据在任何一页都成立，不只是第一页；已收集的前几页数据必须
+        原样保留。"""
+        transport = RecordingTransport(
+            [
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                {"code": 0, "data": {"has_more": False}},
+            ]
+        )
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+
+    def test_visible_organization_also_accepts_an_empty_result(self) -> None:
+        """`_pages` 的空结果判据是共享实现，`list_visible_organization` 同样受益——
+        这条用户身份路径下的租户如果确实没有可见组织，不该被判成响应形状错误。"""
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": False}}])
+        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport)
+
+        departments, members = client.list_visible_organization(token="fake-user-token", tenant_key="tenant_a")
+        self.assertEqual(departments, [])
+        self.assertEqual(members, [])
+
+
 class AppIdentityPathTest(unittest.TestCase):
     """Issue #250：应用身份路径（``directory/v1/*``），只服务与用户身份路径的交叉校验。"""
 

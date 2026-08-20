@@ -144,6 +144,30 @@ class _PagedClient:
         self._transport: Callable[..., Any] = transport or urllib_transport
 
     def _pages(self, path: str, *, token: str, query: Mapping[str, Any], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        """按候选键名读一份分页列表；**空 ⇒ 空，畸形 ⇒ 抛错**（Issue #268 F2）。
+
+        真实响应在结果为空时只有 ``has_more``，四个候选键一个都不出现（编排者
+        2026-08-19 用应用身份实测过同一端点的这个形状）——此前把这种完全正常的
+        空结果当成"响应形状错误"抛出，是本次 stage 首触冒烟每 30 秒失败一轮的
+        直接原因之一。但空结果的判定必须**收紧到唯一场景**：候选键一个都不存在
+        （哪怕值是 ``None`` 也算"存在"）、且 ``has_more`` 是货真价实的 ``False``。
+        以下几种情况刻意**不**算空，仍然抛错——这不是"多列几个候选键"就能绕开的
+        宽松化：
+
+        - ``has_more`` 不是严格的 ``bool``（缺失、``"false"``、``0``……）：既不能
+          断言"读完了"也不能断言"还有更多"，按形状错误处理，不悄悄当成任何一种；
+        - ``has_more`` 为 ``True`` 却没有任何候选列表键：服务端明确说还有数据，
+          没有列表放不进"这批是空的"这个解释；
+        - 候选键**存在**但类型不是列表（字符串、``null``、字典……）：飞书返回了
+          这个字段就说明它有意义，类型不对是响应形状变了，不是"这批恰好没有"；
+        - 列表里出现非对象项、游标停滞：与此前一致，不受本次改动影响。
+
+        不采用历史脚本 ``scripts/sync_feishu_org_snapshot.py`` 的
+        ``walk_dicts(response.get("data"))`` 递归遍历方案：那样做会把响应里任意
+        位置的、恰好长得像目标对象的字典也一并捞进来，換来的宽容是以"来源不可控"
+        为代价；这里要的只是别把"没有"误判成"读错了"。
+        """
+
         collected: list[dict[str, Any]] = []
         page_token: str | None = None
         for _ in range(MAX_PAGES):
@@ -152,6 +176,11 @@ class _PagedClient:
                 parameters["page_token"] = page_token
             url = f"{self._base_url}{path}?{urlencode(parameters)}"
             data = _payload(self._transport("GET", url, body=None, token=token))
+            has_more = data.get("has_more")
+            if not isinstance(has_more, bool):
+                # 类型错时立即抛，不静默按空列表或"已完成"处理（与 `_pages_multi`
+                # 对 `has_more` 的态度一致：缺失、字符串、整数都不是"读完了"）。
+                raise FeishuDirectoryError("has_more_invalid")
             items = None
             for candidate in keys:
                 value = data.get(candidate)
@@ -159,6 +188,11 @@ class _PagedClient:
                     items = value
                     break
             if items is None:
+                if has_more is False and not any(candidate in data for candidate in keys):
+                    # 四个候选键一个都不存在、且明确说没有更多：这是空列表，不是
+                    # 响应形状错误。键存在但类型不对（上面的 `any(...)` 会捕到）
+                    # 仍然落进下面的 raise。
+                    return collected
                 raise FeishuDirectoryError(f"missing_{keys[0]}")
             for item in items:
                 if not isinstance(item, Mapping):
@@ -167,7 +201,7 @@ class _PagedClient:
                     raise FeishuDirectoryError("invalid_page_item")
                 collected.append(item)
             next_token = data.get("page_token")
-            if data.get("has_more") is not True:
+            if has_more is False:
                 return collected
             # has_more=true 但游标缺失或停滞：服务端明确说还有数据，把已收集的
             # 半截结果当成功返回会让调用方用它替换旧快照（Codex 复查发现）。
@@ -242,6 +276,11 @@ class FeishuDirectoryClient(_PagedClient):
         # 字段链取自 2026-07-29 真实探针（scripts/verify_feishu_association.sh）：
         # 实测主字段是 target_tenant_list；此前写的 collaboration_tenant_list 在真实
         # 响应里不存在，会让每次成功响应都被判失败（Codex 复查发现）。
+        #
+        # 这条用户身份路径**没有**目标租户可传，返回"这个用户身份当前看不到任何
+        # 关联组织"完全合法（`_pages` 已按 Issue #268 F2 把这种空结果与真正的响应
+        # 形状错误分开）；调用方不得据此断言"该主体一定看不到关联组织"——那需要
+        # 独立证据，不是本方法的隐含语义（Issue #268 更正评论撤回的正是这条跳跃）。
         return self._pages(
             "/trust_party/v1/collaboration_tenants",
             token=token,
