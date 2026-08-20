@@ -3,10 +3,15 @@
 这份用例守的是**只会在生产暴露**的那几条：Epic C 交办的三条装配断言（执行级硬截止、
 探针超时与就绪节奏一致、注入单调时钟）、本轮新增的第四条（认领量必须被执行器容量压住）、
 以及「前置不齐就不注册，而不是注册一个会把事件认领走再烧掉的实现」。
+
+**装配不变量（外部集成面审查 F1）**：``AssemblyInvariantTests`` 与
+``InvariantBuildLoopTests`` 守 ``onboarding != None ⇒ permission_publish != None``——
+`permission_publish` 前置不齐时开通编排不能照常注册再把用户接收进来又永远走不到可用。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -53,8 +58,15 @@ class RecordingAudit:
         return [action for action, _ in self.records]
 
 
+_WIRED_PERMISSION_PUBLISH = object()  #: 装配不变量测试之外的默认值：代表"已装配"。
+
+
 def build(
-    env: dict[str, str], *, token: Any = None, metric_translation_map: Any = None
+    env: dict[str, str],
+    *,
+    token: Any = None,
+    metric_translation_map: Any = None,
+    permission_publish: Any = _WIRED_PERMISSION_PUBLISH,
 ) -> tuple[Any, RecordingAudit]:
     audit = RecordingAudit()
     duty = _build_onboarding_duty(
@@ -67,6 +79,10 @@ def build(
         # ``tests/test_onboarding_runner.PublishGateTests``。默认给一个恒不可用的空
         # 映射（与占位期同一个失败关闭方向），不影响本文件任何一条断言。
         metric_translation_map=metric_translation_map if metric_translation_map is not None else {},
+        # 装配不变量（F1）：默认给一个非 ``None`` 的哨兵值，代表"权限发布消费职责
+        # 已装配"——本文件其余用例守的是别的前置，不该被这条新增的不变量挡住。
+        # ``AssemblyInvariantTests`` 单独测这条不变量本身。
+        permission_publish=permission_publish,
     )
     return duty, audit
 
@@ -113,6 +129,67 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIsInstance(duty, OnboardingReconciler)
         self.assertEqual(audit.actions(), [], "装配成功时不该留「未装配」审计")
         self.assertIsNotNone(duty.capacity_source, "认领量必须绑上执行器剩余容量")
+
+
+class AssemblyInvariantTests(unittest.TestCase):
+    """F1（外部集成面审查，必修）：``onboarding != None ⇒ permission_publish != None``。
+
+    权限发布消费职责（``_build_permission_publish_duty``）是**唯一**会把开通链排进
+    ``publish_outbox`` 的那条意图真正写进外部权限表的执行者。它前置不齐时开通编排
+    不能照常注册——那样会让用户先被认领、建档、建好用户环境，然后**永远**卡在半开
+    状态；迟到就绪恢复（V-开通-18）救不了这个缺口，它只能确认"已经进入就绪等待"的人。
+
+    这里**不接受**「``permission_publish`` 与 ``onboarding`` 当前碰巧共用同一个 MCP
+    主密钥前置，所以传什么值都无所谓」这种论证：下面每一条用例在 ``permission_publish``
+    以外的全部前置都齐全（含在职状态令牌供给）的情况下，只翻动 ``permission_publish``
+    这一个参数，直接证明不变量是装配层自己校验出来的，不是靠前置巧合撞上的。
+    """
+
+    def test_a_none_permission_publish_stops_onboarding_before_any_other_check(self) -> None:
+        """即使 ``permission_publish`` 以外的前置一个都没配（``BASE_ENV``），报出来的
+        原因也必须是「发布职责未装配」，不是其它某个环境变量——这条不变量排在最前面，
+        不依赖后面几条检查有没有跑到。"""
+
+        duty, audit = build(BASE_ENV, permission_publish=None)
+
+        self.assertIsNone(duty)
+        self.assertEqual(audit.actions(), ["onboarding.duty_not_registered"])
+        self.assertEqual(
+            audit.records[0][1], {"reason": "permission_publish_not_assembled"}
+        )
+
+    def test_a_none_permission_publish_stops_onboarding_even_when_everything_else_is_wired(
+        self,
+    ) -> None:
+        """真正的红线用例：``permission_publish`` 以外的每一项前置（含在职状态令牌
+        供给）都齐全，唯独 ``permission_publish`` 是 ``None``——开通编排仍然不能注册。
+
+        变异验红：把 ``_build_onboarding_duty`` 里 `if permission_publish is None:
+        ...; return None` 那段删掉（或把条件恒设为假）之后重跑本用例，
+        ``duty`` 会变成一个真实的 ``OnboardingReconciler``、`assertIsNone` 失败——
+        这就是这条不变量「会变红」的实际证据。
+        """
+
+        duty, audit = build(WIRED_ENV, token=lambda: "u-token", permission_publish=None)
+
+        self.assertIsNone(duty, "permission_publish 未装配时开通编排不得注册")
+        self.assertEqual(audit.actions(), ["onboarding.duty_not_registered"])
+        self.assertEqual(
+            audit.records[0][1],
+            {"reason": "permission_publish_not_assembled"},
+            "审计只报「发布职责未装配」这一个结构性原因，不夹带其它前置的原因",
+        )
+
+    def test_a_non_none_permission_publish_does_not_block_assembly(self) -> None:
+        """哨兵之外的任意非 ``None`` 对象都算「已装配」——不变量只认 ``is None``，
+        不对 ``permission_publish`` 的具体类型或内容做任何进一步假设。"""
+
+        duty, audit = build(
+            WIRED_ENV, token=lambda: "u-token", permission_publish=object()
+        )
+
+        self.assertIsInstance(duty, OnboardingReconciler)
+        self.assertEqual(audit.actions(), [])
 
 
 class PublishGateWiringTests(unittest.TestCase):
@@ -396,6 +473,209 @@ class ExecutorTests(unittest.TestCase):
         self.addCleanup(executor.join, 2.0)
 
         self.assertTrue(ran.wait(timeout=5), "停机不得丢弃已排队的任务")
+
+
+class StopSentinelRaceTests(unittest.TestCase):
+    """F2（外部集成面审查，应修）：``stop()`` 在队列满时哨兵全部丢失、``_loop`` 有
+    check-then-get 竞态导致工作线程无超时地永久卡死。
+
+    编排者核实后的准确形状（比审查描述的窄）：不是"必然阻塞"，而是一个
+    check-then-get 竞态——线程检查队列时还没空于是继续循环去 ``get()``，而在检查与
+    ``get()`` 之间最后一条任务被别的线程抢走，这条线程就永久卡在无超时的
+    ``queue.get()`` 上（哨兵已在 ``stop()`` 时被丢弃，不会再补）。**不丢用户事件**
+    （卡住的线程手里没有任务），真实代价是停机会耗尽整个停机预算。
+    """
+
+    def test_stop_silently_drops_sentinels_when_the_queue_is_completely_full(self) -> None:
+        """"队列满"：``stop()`` 尝试放的每一个哨兵都因为 ``queue.Full`` 被丢弃，
+        且不得因此清空或顶掉已经排队的任务（``stop()`` 的既有产品语义）。"""
+
+        executor = OnboardingExecutor(workers=2, backlog=2)
+        placeholder_a, placeholder_b = object(), object()
+        executor._queue.put_nowait(placeholder_a)
+        executor._queue.put_nowait(placeholder_b)
+        self.assertEqual(executor._queue.qsize(), 2, "队列此刻已经满了")
+
+        executor.stop()  # 不应该抛异常
+
+        self.assertTrue(executor._stopping.is_set())
+        self.assertEqual(
+            list(executor._queue.queue),
+            [placeholder_a, placeholder_b],
+            "队列已满时两次哨兵投递都必须静默失败，已排队的任务原样保留、不被顶掉",
+        )
+
+    def test_stop_fills_only_the_available_slots_when_the_queue_is_partially_full(
+        self,
+    ) -> None:
+        """"只剩部分槽位"：三条线程只有一个空位，``stop()`` 只能放进恰好一个哨兵，
+        另外两次因队列满被丢弃；已排队的两个任务同样必须原样保留。"""
+
+        executor = OnboardingExecutor(workers=3, backlog=3)
+        placeholder_a, placeholder_b = object(), object()
+        executor._queue.put_nowait(placeholder_a)
+        executor._queue.put_nowait(placeholder_b)
+        self.assertEqual(executor._queue.qsize(), 2, "三格队列只占了两格，留一个空位")
+
+        executor.stop()
+
+        remaining = list(executor._queue.queue)
+        self.assertEqual(executor._queue.qsize(), 3, "唯一的空位应该被恰好一个哨兵占掉")
+        self.assertEqual(remaining[:2], [placeholder_a, placeholder_b], "原有任务顺序不变")
+        self.assertIsNone(remaining[2], "剩下那个位置放进去的是哨兵")
+
+    def test_a_check_then_get_race_does_not_strand_a_worker_forever(self) -> None:
+        """精确复现审查描述的竞态：线程在"排空判定"和真正调用 ``get()`` 之间，
+        队列其实已经空了（模拟哨兵因队列满被丢弃、也没有别的任务补上）。
+
+        用故意撒谎一次的 ``queue.empty()`` 制造这个窗口：真实队列已经空了，但
+        ``empty()`` 仍然汇报一次"非空"，迫使线程按旧路径再走一次 ``get()``。
+
+        **变异验红**：把 :meth:`OnboardingExecutor._loop` 里 ``self._queue.get(
+        timeout=self._stop_poll_seconds)`` 改回没有超时的 ``self._queue.get()``，
+        本用例会在 ``thread.join(timeout=5)`` 处观察到线程仍然存活而失败——
+        实测输出见收口回报。
+        """
+
+        executor = OnboardingExecutor(workers=1, backlog=4, stop_poll_seconds=0.05)
+        ran = threading.Event()
+        executor.submit(ran.set)
+
+        real_empty = executor._queue.empty
+        lied_once = threading.Event()
+
+        def lying_empty() -> bool:
+            # 只撒谎一次：模拟"检查那一刻队列被判定非空"，即使真实队列这时已经空了
+            # （哨兵已经因为队列满被丢弃，此后也不会再有任何东西入队）。
+            if not lied_once.is_set():
+                lied_once.set()
+                return False
+            return real_empty()
+
+        executor._queue.empty = lying_empty  # type: ignore[assignment]
+        executor._stopping.set()  # 模拟 stop() 已经置位、但哨兵因为队列满没能投进去
+        executor.start()
+        thread = executor._threads[0]
+        self.addCleanup(thread.join, 5.0)
+
+        self.assertTrue(ran.wait(timeout=5), "真实任务必须先正常执行")
+        thread.join(timeout=5.0)
+        self.assertFalse(
+            thread.is_alive(),
+            "check-then-get 竞态窗口触发之后，线程必须在有限时间内自行退出，"
+            "不能永久卡在没有超时的 get() 上",
+        )
+
+    def test_a_full_queue_at_stop_time_still_lets_every_worker_exit_and_drains_queued_work(
+        self,
+    ) -> None:
+        """端到端场景：真实并发下，"队列满"时停机——哨兵全部因 ``queue.Full`` 丢失，
+        工作线程必须靠自己的超时轮询发现停机，而不是永久卡在 ``get()`` 上；同时已经
+        排队的业务任务一条都不能丢（``stop()`` 的既有产品语义）。
+        """
+
+        workers = 3
+        executor = OnboardingExecutor(workers=workers, backlog=workers, stop_poll_seconds=0.05)
+        executor.start()
+        self.addCleanup(executor.join, 5.0)
+
+        gate = threading.Event()
+        entered = threading.Barrier(workers + 1, timeout=5)
+
+        def block() -> None:
+            entered.wait(timeout=5)
+            gate.wait(timeout=5)
+
+        for _ in range(workers):
+            self.assertTrue(executor.submit(block))
+        entered.wait(timeout=5)  # 三条线程都已经取到各自的阻塞任务、真正在跑了
+
+        ran: list[int] = []
+        lock = threading.Lock()
+
+        def record(index: int) -> None:
+            with lock:
+                ran.append(index)
+
+        for index in range(workers):
+            self.assertTrue(executor.submit(lambda i=index: record(i)), "队列此刻必须还有空位")
+        self.assertEqual(executor._queue.qsize(), workers, "三条业务任务把队列灌满")
+
+        executor.stop()  # 三次 put_nowait(None) 全部因为 queue.Full 被静默丢弃
+
+        gate.set()  # 放行三条卡住的线程，让它们回去取排队的业务任务
+        executor.join(5.0)
+
+        self.assertFalse(executor.alive, "工作线程必须在有限时间内自行退出")
+        self.assertEqual(sorted(ran), list(range(workers)), "已排队的业务任务一条都不能丢")
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("psycopg") and importlib.util.find_spec("cryptography"),
+    "跳过：build_loop 会真的构造凭据保管与清理适配器，需要 psycopg 与 cryptography",
+)
+class InvariantBuildLoopTests(unittest.TestCase):
+    """F1：不只在 ``_build_onboarding_duty`` 单元级校验，也在 ``build_loop`` 真实装配
+    出的职责列表上核实这条不变量——证明 `build_loop` 把它刚刚构造出的
+    ``permission_publish`` 对象原样交给了 `_build_onboarding_duty`，而不是重新推导
+    出一个「看起来应该差不多」的判断。
+
+    今天的生产配置下，``permission_publish`` 与 ``onboarding`` 恰好共用同一把 MCP
+    令牌主密钥前置，靠环境变量本身很难只让前者变 ``None`` 而后者的其它前置仍然齐全
+    ——这正是外部审查警告的「巧合」。这里改用 ``unittest.mock.patch`` 直接让
+    ``_build_permission_publish_duty`` 返回 ``None``，把两者的前置解耦开来验证，
+    不依赖那个巧合。
+    """
+
+    def test_onboarding_is_absent_from_the_assembled_loop_when_permission_publish_is_none(
+        self,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.apps.scheduler import build_loop
+
+        credential_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(credential_dir.cleanup)
+        user_env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(user_env_dir.cleanup)
+
+        env = {
+            **WIRED_ENV,
+            "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+            "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(credential_dir.name) / "delegated.enc"),
+            "LINGXI_USER_ENV_ROOT": user_env_dir.name,
+        }
+        config = SchedulerConfig.from_env(env)
+        audit = RecordingAudit()
+
+        with mock.patch(
+            "lingxi.apps.scheduler.assembly._build_permission_publish_duty",
+            return_value=None,
+        ):
+            loop = build_loop(
+                config,
+                # 在职状态令牌供给非 None：不能让开通因为**自己**的另一条前置缺失
+                # 而不注册，否则测不出这条不变量单独起作用。
+                roster_access_token=lambda: "employment-token",
+                audit=audit,
+            )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertNotIn("权限发布与就绪确认", names, "本用例把 permission_publish 强制置空")
+        self.assertNotIn(
+            "未开通首聊交接对账",
+            names,
+            "permission_publish 未装配时，开通编排不得出现在真实装配出的职责列表里",
+        )
+        self.assertIn(
+            ("onboarding.duty_not_registered", {"reason": "permission_publish_not_assembled"}),
+            audit.records,
+        )
 
 
 class SchedulerConfigTests(unittest.TestCase):

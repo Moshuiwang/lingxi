@@ -79,6 +79,20 @@ PROBE_WATCHDOG_MARGIN_SECONDS = 5.0
 #: 首次开通的实际首触延迟 = 这个窗口 + 至多一个 ``SchedulerLoop`` 周期。
 DISPATCH_AFTER = timedelta(seconds=5)
 
+#: 工作线程在没有新任务时重新检查一次"是否该自行退出"的轮询间隔（外部集成面审查 F2）。
+#:
+#: ``OnboardingExecutor.stop()`` 尝试给每条线程放一个哨兵（``None``），但队列满时那次
+#: ``put_nowait`` 会静默失败——工作线程因此不能把"正确退出"完全托付给一次可能失败的
+#: 哨兵投递。取而代之，``_loop`` 用带超时的 ``queue.get()`` 顶替原来无超时的阻塞调用：
+#: 每等待这么久还没有新任务，就主动复查一次 ``_stopping`` 与队列是否已排空。
+#:
+#: 这也堵上了一条不需要队列满就能触发的**竞态**：线程在"队列还有活"这个判断和真正
+#: 调用 ``get()`` 之间，最后一条任务被另一条线程抢先取走——旧实现里这次 ``get()``
+#: 没有超时，会永久挂起（哨兵已经在 ``stop()`` 时被丢弃，不会再补）。取值 1 秒：
+#: 停机预算通常以秒计，1 秒的额外等待可以接受；生产代价是空闲线程每秒多醒一次，
+#: 可忽略不计。
+STOP_POLL_INTERVAL_SECONDS = 1.0
+
 
 # ----------------------------------------------------------------------
 # 装配断言 3：单调时钟
@@ -199,14 +213,18 @@ class OnboardingExecutor:
         workers: int,
         backlog: int | None = None,
         should_stop: Callable[[], bool] | None = None,
+        stop_poll_seconds: float = STOP_POLL_INTERVAL_SECONDS,
     ) -> None:
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("开通执行器至少要有一条线程")
+        if not isinstance(stop_poll_seconds, (int, float)) or stop_poll_seconds <= 0:
+            raise ValueError("停机轮询间隔必须是正数秒")
         self._workers = workers
         self._backlog = backlog if backlog is not None else workers * 2
         self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue(
             maxsize=self._backlog
         )
+        self._stop_poll_seconds = float(stop_poll_seconds)
         self._inflight = 0
         self._inflight_lock = threading.Lock()
         # **入队闸**：把「检查停机」与「入队」串成一个不可分割的动作，`stop()` 置位与
@@ -267,9 +285,16 @@ class OnboardingExecutor:
         **刻意不排空队列、不丢弃已排队的任务。** 那些任务对应的事件在认领那一刻就已经被
         记账了，直接丢掉等于把它们永久烧掉；而每条链的第一件事就是问一次停机
         （``AutoOnboardingRunner._run`` 的 ``_stop_guard``），停机之后被取到的那些会立刻
-        中止**并把认领放回去**。因此让它们照常出队反而是唯一不丢事件的走法。
+        中止**并把认领放回去**。因此让它们照常出队反而是唯一不丢事件的走法。**这条产品
+        语义本次未改动**：下面仍然尝试给每条线程放一个哨兵、仍然不排空队列、``queue.Full``
+        仍然被静默忽略。
 
         在途那一条同样不打断：它在每一步之间看停止标志，自己收口并释放。
+
+        **哨兵投递只是快路径，不是工作线程退出的唯一依据**（外部集成面审查 F2）：队列满时
+        某几条哨兵会投递失败，这里不再假装"工作线程自己会看到标志"就一定成立——真正兜底
+        的是 :meth:`_loop` 里带超时的 ``get()``，每 ``STOP_POLL_INTERVAL_SECONDS`` 秒自己
+        复查一次 ``_stopping`` 与队列是否已排空，不依赖这次投递是否成功。
         """
 
         with self._gate:
@@ -278,7 +303,9 @@ class OnboardingExecutor:
             for _ in self._threads:
                 try:
                     self._queue.put_nowait(None)
-                except queue.Full:  # pragma: no cover - 满队列时工作线程自己会看到标志
+                except queue.Full:
+                    # 队列满：这条哨兵投不进去。**不是问题**——工作线程不靠它退出，
+                    # 见 :meth:`_loop` 的超时轮询。
                     pass
 
     def join(self, timeout: float) -> None:
@@ -291,8 +318,30 @@ class OnboardingExecutor:
         return any(thread.is_alive() for thread in self._threads)
 
     def _loop(self) -> None:
+        """单条工作线程的主循环。
+
+        **不对正确退出依赖一次可能失败的哨兵投递**（外部集成面审查 F2）：``self._queue.get()``
+        带上 ``self._stop_poll_seconds`` 超时，取代原来无超时的阻塞调用。这堵上一条不需要
+        队列满也能触发的竞态——线程在"队列还有活，因此循环回去再 ``get()`` 一次"这个判断
+        和真正调用 ``get()`` 之间，最后一条任务被另一条工作线程抢先取走：旧实现里那次
+        ``get()`` 没有超时，会永久卡住（哨兵已经在 ``stop()`` 时因为队列满被丢弃，不会再
+        补一个进来救它）。带超时之后，即使这次扑空，线程最多等 ``stop_poll_seconds`` 就会
+        重新复查一次停止标志与队列是否已空，而不是无限期挂起。
+
+        **不改变** ``stop()`` 的产品语义：已排队的任务照常经由 ``get()`` 正常出队执行，
+        本函数从不主动丢弃队列里的内容，只是多了一条"没有新任务时定期看一眼该不该退出"
+        的路径。
+        """
+
         while True:
-            task = self._queue.get()
+            try:
+                task = self._queue.get(timeout=self._stop_poll_seconds)
+            except queue.Empty:
+                # 这一轮没有等到新任务。若已经进入停机且队列此刻确实空了，自行退出——
+                # 不再等一个可能永远不会到来的哨兵。否则回到循环顶端继续等。
+                if self._stopping.is_set() and self._queue.empty():
+                    return
+                continue
             if task is None:
                 return
             try:

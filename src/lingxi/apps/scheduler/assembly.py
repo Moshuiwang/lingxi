@@ -452,12 +452,29 @@ def _build_onboarding_duty(
     audit: AuditSink,
     employment_access_token: Callable[[], str] | None,
     metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
+    permission_publish: PermissionPublishDuty | None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
 
     形状照 :func:`_build_permission_refresh_duty`。缺项时返回 ``None``，于是**没有任何人
     认领** ``auto_provisioning`` 事件——它们原样留在 ``inbound_event`` 里等配置齐了再跑。
     这比装一个失败关闭桩安全：桩会「认领即平账」，把事件永久烧掉。
+
+    **装配不变量（外部集成面审查坐实的 F1）**：``onboarding != None ⇒ permission_publish
+    != None``。首次开通链最终会把一条发布意图排进 ``publish_outbox``
+    （``AutoOnboardingRunner`` 经 ``publish_allowed`` 闸），但真正把那条意图从 outbox
+    写进外部权限表、推进就绪确认的执行者是权限发布消费职责
+    （:func:`_build_permission_publish_duty`）。那个职责如果因为**它自己的**前置不齐而
+    没有注册，开通排出的每一条发布意图此后**没有任何职责会再看它一眼**——迟到就绪恢复
+    职责（V-开通-18）救不了，它只能确认"已经进入就绪等待"的用户，替代不了缺失的发布
+    执行者。不挡在这里的话，失败关闭会发生在"已经认领、已经建档、已经建了用户环境"
+    之后，用户表现成"接受了开通却永远走不到可用"，还可能留下需要人工收拾的半开记录。
+
+    因此这里**在认领任何用户之前**校验调用方（``build_loop``）已经装配好的
+    ``permission_publish`` 对象本身，而不是重新判断"两者前置是否恰好相同"——即使两者
+    前置未来分道扬镳，这条依赖仍然成立；这也是**不能只依赖** ``PermissionPublishDuty.
+    _publish()`` 内部 ``publish_allowed`` 闸的原因：那道闸在**认领之后**才会被摸到，
+    这里要挡的是认领本身。
 
     ``employment_access_token`` 是在职状态实时回读所用的**专用授权主体派生令牌**供给。
     它就是这次搬迁的**唯一理由**：那条一次性 ``refresh_token`` 全系统只允许一个消费者，
@@ -469,6 +486,19 @@ def _build_onboarding_duty(
     已经加载过的**同一个对象**（``None`` 代表那一次加载没有发生或失败，与空映射
     同一个结论：不可用）。调用方（``build_loop``）负责只加载一次、原样转发。
     """
+
+    if permission_publish is None:
+        # 恰一条审计：只报「发布职责没装配」这个结构性原因，不夹带 `permission_publish`
+        # 自己那一层的原因（那一层已经在自己的装配点留过审计）——两条审计合起来才是
+        # 完整的因果链，各自只认领自己那一段。
+        audit.record(
+            "onboarding.duty_not_registered", reason="permission_publish_not_assembled"
+        )
+        logger.warning(
+            "权限发布消费职责未装配，首次开通编排不注册（开通排出的发布意图不会有任何"
+            "职责消费）；未开通用户的首聊事件原样留在库里等待配置齐备，其余定时职责照常运行"
+        )
+        return None
 
     from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
 
@@ -1187,12 +1217,18 @@ def build_loop(
     #
     # 在职状态回读复用**同一个**令牌供给 ``supply``：它就是这次把编排搬进本进程的理由
     # ——那条一次性 refresh_token 全系统只允许一个消费者，而它已经在这里了。
+    #
+    # **装配不变量（外部集成面审查 F1）**：``onboarding != None ⇒ permission_publish !=
+    # None``。这里把上面刚刚装配出的 ``permission_publish``（可能是 ``None``）原样交给
+    # `_build_onboarding_duty` 校验——不在这里另写一次判断，唯一的真相来源是那个变量
+    # 本身，见 `_build_onboarding_duty` 文档字符串「装配不变量」一节的完整理由。
     onboarding = _build_onboarding_duty(
         config,
         stop=stop,
         audit=sink,
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
+        permission_publish=permission_publish,
     )
     if onboarding is not None:
         duties.append(onboarding)
