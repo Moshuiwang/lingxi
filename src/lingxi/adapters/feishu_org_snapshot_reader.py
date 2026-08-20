@@ -23,9 +23,15 @@ Issue #250：`feishu_org_*` 四张快照表当前全空，且产品侧没有任�
 包括看漏、看少的那些情况——校验层要靠"如实"才能真正发挥作用；这里但凡替调用方
 猜一个"应该是对的"默认值，校验层就失去了意义。
 
-**任何一次分页 / 递归调用失败都会原样向上抛出**，不吞、不重试、不返回半截结果：
-调用方（``apps/scheduler/org_snapshot_sync.py``）据此不调用
+**任何一次分页 / 递归调用失败都会原样向上抛出**，本模块自己不吞、不重试、不返回
+半截结果：调用方（``apps/scheduler/org_snapshot_sync.py``）据此不调用
 ``commit_batch``，上一份完成批次原样保留（"空源 / 半页 / 超时不得替换基线"）。
+**更下一层的 :class:`~lingxi.adapters.feishu_directory.FeishuDirectoryClient` 会对
+飞书的频率限制业务错误码做一道窄而有界的重试**（Issue #271，节流不足以完全避免
+撞限的余量证据后补充）——那发生在 :class:`FeishuDirectoryClient` 内部，重试耗尽
+后同样是原样抛出 :class:`~lingxi.adapters.feishu_directory.FeishuDirectoryError`，
+本模块看到的仍然只是"成功"或"最终失败"两种结果，不知道、也不需要知道下面重试过
+几次；这里的"不重试"说的是本模块自己不做额外重试，不是整条调用链路里禁止重试。
 
 不入库、不日志：本模块只处理组织资料（部门名、成员标识、姓名），不接触任何令牌或
 凭据；令牌只作为调用参数原样转给 :class:`FeishuDirectoryClient`。
@@ -52,7 +58,21 @@ ROOT_DEPARTMENT_ID = "0"
 
 
 class OrgSnapshotReadError(RuntimeError):
-    """读取阶段的形状问题（与 :class:`FeishuDirectoryError` 并列，不改写它）。"""
+    """读取阶段的形状问题（与 :class:`FeishuDirectoryError` 并列，不改写它）。
+
+    独立审查 2026-08-20 必修 B：此前没有 ``__init__``，7 处 ``raise`` 全部塌成
+    ``org_snapshot_sync.read_failed`` 审计里的 ``error=OrgSnapshotReadError``——
+    正是 F1 要消灭的"只剩类名、没有诊断信息"那个形状，只是发生在上一层（本模块）
+    而不是 :class:`~lingxi.adapters.feishu_directory.FeishuDirectoryError`。这里
+    的 ``code`` 与后者同一个使用约定：一律是本模块自己写死的安全分类字符串（如
+    ``"app_scope_department_id_missing"``），不含响应正文、令牌或 URL；
+    ``org_snapshot_sync.py`` 已有的 ``getattr(error, "code", None)`` 鸭子类型不用
+    改就能拿到它。
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _tenant_key(record: Mapping[str, Any]) -> str | None:
