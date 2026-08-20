@@ -409,6 +409,63 @@ def check_worker_queue_env_example() -> list[str]:
     return failures
 
 
+# Epic D 闸⑤（首次开通编排写侧）直接依赖的四个变量：前三个缺任一个都会让
+# `onboarding.duty_not_registered`（见 apps/scheduler/assembly.py 的
+# `_build_onboarding_duty`）；第四个不影响闸门开关，只影响开通并发吞吐，但
+# 同属这一组配置，一并守住文档覆盖度，防止有人不小心删掉示范行而没有任何
+# 提示（见 deploy/验收前部署配置清单.md「一、闸⑤」「二、按进程分组」）。
+ONBOARDING_GATE_ENV_VARS = (
+    "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
+    "LINGXI_QUERY_MCP_ENDPOINT",
+    "LINGXI_USER_ENV_ROOT",
+    "LINGXI_ONBOARDING_WORKERS",
+)
+
+
+def check_onboarding_gate_env_example() -> list[str]:
+    """`deploy/.env.example` 的 scheduler 小节（「文件二」）必须示范
+    :data:`ONBOARDING_GATE_ENV_VARS` 四个变量（`deploy/验收前部署配置清单.md`
+    登记为 Epic D 闸⑤配置项）。
+
+    这四项此前**只活在文档里**：`.env.example` 里确实写着示范值/说明，但没有
+    任何检查会在有人不小心删掉某一行示范时变红——本仓库的纪律是"只活在文档
+    里的约束不算被守住"（AGENTS.md）。这里补上机械核对，形状照
+    :func:`check_worker_queue_env_example`：只判定"变量名的赋值行是否存在"
+    （允许被 `#` 注释掉，这四项本就是可选配置，示例文件里默认注释），不校验
+    具体示范值——具体值的形状已由各自的运行时校验函数负责（例如
+    `LINGXI_QUERY_MCP_ENDPOINT` 必须以 `https://` 开头，见
+    `apps/scheduler/config.py` 的 `SchedulerConfig.from_env`）。
+
+    **不用要求"值不含空白"的行级正则**（`check_worker_queue_env_example` 用的
+    那种 ``\\S+\\s*$``）：`LINGXI_MCP_TOKEN_ENCRYPT_KEY` 的示范值
+    `<32B base64 主密钥>` 本身带空格，套用那种正则会对着当前本就正确的文件
+    误判为缺失。这里只判定"这一行确实在给这个变量名赋值"（`#?` 允许注释掉），
+    不管值里有没有空格。
+    """
+
+    text = read(ENV_EXAMPLE)
+    match = re.search(
+        r"文件二：deploy/\.env\.stage\.scheduler.*?(?=\n# ={10,}\n# 文件三)",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return [
+            "deploy/.env.example 找不到「文件二：…scheduler」小节"
+            "（或小节顺序/编号被改动，check_onboarding_gate_env_example 的定位正则需要同步更新）"
+        ]
+    section = match.group(0)
+    failures: list[str] = []
+    for variable in ONBOARDING_GATE_ENV_VARS:
+        if not re.search(rf"^#?\s*{re.escape(variable)}=", section, re.MULTILINE):
+            failures.append(
+                f"deploy/.env.example 的 scheduler 小节（「文件二」）没有示范 {variable}。"
+                "它是 Epic D 闸⑤相关的开通配置项，缺失文档示范容易让人不知道这个变量存在"
+                "（详见 deploy/验收前部署配置清单.md「一、闸⑤」）。"
+            )
+    return failures
+
+
 def _volume_mounts(service_text: str) -> list[tuple[str, str, str | None]]:
     """解析某个 service 块下 ``volumes:`` 列表的每一项，返回
     ``(source, target, mode)`` 三元组列表；``mode`` 是 ``:ro``/``:rw`` 这类第三段
@@ -1076,6 +1133,7 @@ def main() -> int:
         ("停止宽限期与源码常量联动", check_stop_grace_period),
         ("数据库超时与停机上界依据", check_database_timeouts),
         ("worker-queue env.example 示范值", check_worker_queue_env_example),
+        ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
