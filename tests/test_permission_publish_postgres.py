@@ -957,6 +957,249 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
                     self._candidates(limit=limit)
 
 
+class LateOnboardingRecoveryCandidatesTest(PermissionPublishPostgresTestCase):
+    """迟到就绪恢复的候选查询（V-开通-18）：只有真库能证伪五条筛选联合起来的效果。
+
+    否定面：还没判过超时的不是候选；``account_state`` 不是 ``enabled`` 的不是候选；
+    不属于调用方声明的 ``reason`` 的不是候选；还没发布读回一致的不是候选；擦过内容
+    的不是候选；没到复检节奏的不是候选。正面：``already_ready`` 正确标出"上一轮已经
+    探到 ready、还没被推进"的候选；``next_attempt_no`` 是真实判定次数 + 1。
+    """
+
+    REASON = "first_onboarding"
+    INTERVAL_SECONDS = 900
+
+    def _publish(
+        self, *, user_id: str = USER_A, row: PublishRow | None = None, reason: str
+    ) -> str:
+        decision = self.store.record_decision(
+            user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
+        )
+        claimed = self.store.claim_next()
+        assert claimed is not None
+        self.store.complete(
+            _attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            status=STATUS_PUBLISHED,
+        )
+        return decision.outbox_id or ""
+
+    def _record_check(
+        self, user_id: str, version: int, result: str, *, at: datetime
+    ) -> None:
+        from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+        from lingxi.core.permission.mcp_readiness import (
+            ReadinessAttempt,
+            ReadinessBinding,
+            ReadinessOutcome,
+        )
+
+        outcome = ReadinessOutcome(result)
+        extra: dict = {}
+        if outcome is ReadinessOutcome.READY:
+            extra = {"metric_count": 2}
+        elif outcome is ReadinessOutcome.WAITING:
+            extra = {"error_code": "empty_metrics", "metric_count": 0}
+        else:
+            extra = {"error_code": "budget_exhausted"}
+        PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY)).record_attempt(
+            ReadinessAttempt(
+                binding=ReadinessBinding(user_id, version),
+                attempt_no=1,
+                outcome=outcome,
+                started_at=at,
+                finished_at=at,
+                **extra,
+            )
+        )
+
+    def _stuck(self, user_id: str = USER_A, *, account_state: str = "enabled") -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET provisioning_state = 'mcp_syncing', account_state = %s "
+                "WHERE id = %s",
+                (account_state, user_id),
+            )
+
+    def _candidates(self, *, limit: int = 50, interval: int | None = None):
+        return self.store.late_onboarding_recovery_candidates(
+            reason=self.REASON,
+            recovery_interval_seconds=interval or self.INTERVAL_SECONDS,
+            limit=limit,
+        )
+
+    def test_a_timed_out_stuck_user_is_a_candidate(self) -> None:
+        self._publish(reason=self.REASON)
+        self._stuck()
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+
+        candidates = self._candidates()
+
+        self.assertEqual([item.user_id for item in candidates], [USER_A])
+        self.assertEqual(candidates[0].permission_version, 1)
+        self.assertEqual(candidates[0].permissions, '{"1011":["商务"]}')
+        self.assertEqual(candidates[0].next_attempt_no, 2, "真实判定次数(1) + 1")
+        self.assertFalse(candidates[0].already_ready)
+
+    def test_a_user_who_has_not_timed_out_yet_is_not_a_candidate(self) -> None:
+        """否定断言：本轮就绪确认还在进行（或还没开始）的人不该被复检抢一次探针。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck()
+
+        self.assertEqual(self._candidates(), (), "没有 timed_out 记录就不是恢复候选")
+
+        self._record_check(
+            USER_A, 1, "waiting", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        self.assertEqual(
+            self._candidates(), (), "只判过 waiting、还没判过超时，仍然不是候选"
+        )
+
+    def test_a_user_who_is_not_stuck_in_mcp_syncing_is_not_a_candidate(self) -> None:
+        """否定断言：已经推进过（或从未被推进到 ``mcp_syncing``）的人不该被再探一次。"""
+
+        self._publish(reason=self.REASON)
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        # 不调用 _stuck()：provisioning_state 仍是建档默认值 'guest'。
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_suspended_account_is_not_a_candidate(self) -> None:
+        """否定断言：账号已停用的人不该在这里被真实探针打扰。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck(account_state="suspended")
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_an_intent_owned_by_another_orchestrator_is_not_a_candidate(self) -> None:
+        """否定断言：本职责只认自己声明的 reason，不越界替其他链恢复。"""
+
+        self._publish(reason="daily_permission_refresh")
+        self._stuck()
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_pending_intent_is_not_a_candidate(self) -> None:
+        """否定断言：只有发布读回一致的那一版才进候选集——即使已经判过超时。"""
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(), reason=self.REASON, decided_at=NOW
+        )
+        self._stuck()
+        self._record_check(
+            USER_A,
+            decision.permission_version,
+            "timed_out",
+            at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_redacted_payload_is_not_a_candidate(self) -> None:
+        """否定断言：擦过的快照说不出"当时发布的范围是什么"，据它渲染只会渲染出错话。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck()
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_expires_at FROM publish_outbox WHERE user_id = %s", (USER_A,)
+            )
+            expires = cursor.fetchone()[0]
+        self.assertEqual(self.store.redact_expired_payloads(now=expires), 1)
+
+        self.assertEqual(self._candidates(), ())
+
+    def test_a_recent_recheck_is_not_yet_due(self) -> None:
+        """节奏判据：刚复检过，还没到 ``recovery_interval_seconds``。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck()
+        self._record_check(USER_A, 1, "timed_out", at=datetime.now(timezone.utc))
+
+        self.assertEqual(self._candidates(interval=self.INTERVAL_SECONDS), ())
+
+    def test_a_recheck_past_the_interval_comes_back(self) -> None:
+        self._publish(reason=self.REASON)
+        self._stuck()
+        self._record_check(
+            USER_A,
+            1,
+            "timed_out",
+            at=datetime.now(timezone.utc) - timedelta(seconds=self.INTERVAL_SECONDS + 20),
+        )
+
+        self.assertEqual(len(self._candidates(interval=self.INTERVAL_SECONDS)), 1)
+
+    def test_already_ready_is_surfaced_and_the_attempt_count_advances(self) -> None:
+        """崩溃恢复场景：上一轮已经探到 ready，还没来得及被推进。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck()
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._record_check(USER_A, 1, "timed_out", at=old)
+        self._record_check(USER_A, 1, "ready", at=old + timedelta(seconds=1))
+
+        candidates = self._candidates()
+
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].already_ready)
+        self.assertEqual(candidates[0].next_attempt_no, 3, "两条历史判定 + 1")
+
+    def test_only_the_users_current_version_is_considered(self) -> None:
+        """一个人有多版历史意图时，只认当前这一版；旧版的超时记录不该复活旧版。"""
+
+        self._publish(reason=self.REASON)
+        self._stuck()
+        self._record_check(
+            USER_A, 1, "timed_out", at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        # 权限又变了：排出并发布第二版（内容必须不同，否则会被判 UNCHANGED 而不产生
+        # 新版本）。
+        self._publish(reason=self.REASON, row=_row(permissions='{"1011":["商务","财务"]}'))
+
+        self.assertEqual(
+            self._candidates(), (), "v2 还没有过任何判定，v1 的超时记录不该被套用到它头上"
+        )
+
+    def test_the_reason_must_be_stated(self) -> None:
+        for reason in ("", "   "):
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError):
+                    self.store.late_onboarding_recovery_candidates(
+                        reason=reason, recovery_interval_seconds=self.INTERVAL_SECONDS
+                    )
+
+    def test_illegal_interval_or_limit_is_rejected(self) -> None:
+        for kwargs in (
+            {"recovery_interval_seconds": 0},
+            {"recovery_interval_seconds": -1},
+            {"recovery_interval_seconds": True},
+            {"limit": 0},
+            {"limit": -1},
+            {"limit": True},
+        ):
+            with self.subTest(kwargs):
+                with self.assertRaises(ValueError):
+                    self.store.late_onboarding_recovery_candidates(
+                        reason=self.REASON,
+                        **{"recovery_interval_seconds": self.INTERVAL_SECONDS, **kwargs},
+                    )
+
+
 class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
     """撤权判据与通知收件人：两条只读查询的真库形状。"""
 

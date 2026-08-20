@@ -108,14 +108,22 @@ Issue #65 钉在开工卡上的「共用线程复核」在搬迁之后的同一�
 | 权限发布意图（`publish_outbox`） | 一条 `pending` 意图 + `app_user.permission_version` 已推进 | **不清，而且刻意不清**：那一版权限是数据库已确认的事实，发布消费职责照常把它写出去、就绪确认照常跑、`permission.range_updated` 照常通知。见下面那条已登记的缺口 |
 | 认领账本（`inbound_event.onboarding_dispatched_at`） | 已认领的标记 | 由本模块的释放路径放回（见上表），或由结论收口 |
 
-**已登记的缺口（本 Story 未解决）**：发布意图排出去之后，如果就绪确认判了 `sync_timeout`，
-用户停在 `mcp_syncing`；scheduler 的就绪 ticker 之后**可能**会把同一 `(用户, 权限版本)`
-确认成功并发一条「范围已更新」，但**没有任何东西会把 `provisioning_state` 写成 `active`**
-——本模块是 `active` 的唯一写入方，而它那时已经返回了。用户于是收到「范围已更新」却仍然
-问不了数。合同对这一格的规定是「转交管理员处理，后续确认成功后再主动通知用户可以开始
-使用」，那条恢复路径属 Epic D 的后续步骤，不在本 Story 范围。**这条缺口同时登记在**
+**此前已登记、现已由另一个职责补上的缺口**：发布意图排出去之后，如果就绪确认判了
+`sync_timeout`，用户停在 `mcp_syncing`；本模块判超时时**当场返回**，此前没有任何东西会
+再回来看这个人、也没有任何东西会把 `provisioning_state` 写成 `active`——本模块**曾经**是
+`active` 唯一的写入方。合同对这一格的规定是「转交管理员处理，后续确认成功后再主动通知
+用户可以开始使用」，那条恢复路径已由
+:mod:`lingxi.apps.scheduler.late_readiness_recovery` 的迟到就绪恢复职责补上
+（``V-开通-18``，见该模块自己的文档字符串）：它周期性回看停在 `mcp_syncing` 且已经判过
+`timed_out` 的用户，复用本模块同一套判定层（新增的
+:class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`），就绪就把
+`provisioning_state` 推进到 `active` 并发送「开通完成」——因此 `active` 现在有**两个**
+写入方，但两者都只经过 `advance_provisioning_state` 的同一条条件更新（只前进不回退、
+只在账号仍启用时推进），不构成竞态。**本模块自身不改**：它仍然在判超时时当场返回，
+恢复不在这条链的调用栈里发生。**这条缺口同时登记在**
 ``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
-（未认领，归 Epic D 下一步）——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文。
+——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
+另一个 Story 的范围，本次改动只更新了验收矩阵。
 
 ## 发布由谁执行
 
