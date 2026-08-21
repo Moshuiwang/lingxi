@@ -128,6 +128,16 @@ CREDENTIAL_FILE_MODE = 0o440
 #: 空串、前导点都会被这条正则挡住，而不是靠调用方记得别传。
 _USER_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
+#: 写进 ``.mcp.json`` 的 MCP 服务名——**单一事实来源**（Issue #291 根因 #1）。
+#: ``apps/worker/config.py`` 的只读工具白名单要求每一项都以
+#: ``mcp__{QUERY_MCP_SERVER_NAME}__`` 开头，并在装配期（``load_config``）断言，
+#: 两侧共用这一个常量，不各自维护一份字符串。这正是 2026-08-21 那次事故的根因：
+#: 白名单前缀写的是遗留全进程配置的服务名 ``bi-metric``，Epic D 闸⑥切到逐用户
+#: ``.mcp.json`` 后这里早已改成 ``query``，两处没人同步，用户的每一次真实工具
+#: 调用因此在 ``PreToolUse`` 被无声拒绝。改这个值必须同时确认 worker 白名单的
+#: 装配期断言仍然通过，不能只改一处。
+QUERY_MCP_SERVER_NAME = "query"
+
 
 class UserEnvironmentError(RuntimeError):
     """用户环境创建失败。``code`` 只有错误码，**不带路径、内容或凭据片段**。"""
@@ -182,7 +192,7 @@ class LocalUserEnvironment:
         *,
         root: str,
         mcp_endpoint: str,
-        mcp_server_name: str = "query",
+        mcp_server_name: str = QUERY_MCP_SERVER_NAME,
         home_dir_mode: int = HOME_DIR_MODE,
         credential_file_mode: int = CREDENTIAL_FILE_MODE,
         root_dir_mode: int = ROOT_DIR_MODE,
