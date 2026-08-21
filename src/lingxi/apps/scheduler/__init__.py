@@ -18,22 +18,31 @@
    那一面无条件运行。
 5. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天（UTC 日界）
    跑一轮：读一整轮花名册 → 更新持久快照或保留上一份 → 与建档存档三字段比对 →
-   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。第五个职责是
-   **条件注册**的，四个前置任缺其一就不注册，并留下一条指名原因的审计
-   （断言 ``V-花名册-29``）：管理群 ID、花名册 Base ``app_token``、花名册
-   ``table_id``（三者都是可选环境变量，见 :class:`SchedulerConfig`），以及花名册读取
-   所用的短期令牌供给。不注册时进程照常启动、其余职责照常运行。
+   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。管理群 ID、花名册
+   Base ``app_token``、``table_id`` 三个前置任缺其一，或读取令牌供给未接线，就不注册
+   （断言 ``V-花名册-29``，留一条指名原因的审计），进程照常启动、其余职责照常运行。
+
+   **管理群未配置时，写快照的这一半不随之停摆**（Issue #275）：``roster_snapshot``
+   表是首次开通链第二步（``core/identity/onboarding_runner.py::_match``）与每日
+   权限重算（职责 6）的共同数据前提，两者都直接读这张表，不经过本职责。此前三个前置
+   捆在一起，导致"日报发到哪个群"这个纯通知配置决定"员工能不能被开通"
+   （2026-08-21 首触冒烟实测坐实）。因此本职责未装配时，``build_loop`` 会改为尝试
+   装配 :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty`——只依赖
+   Base 坐标与令牌供给、不比对不发送的"只写"职责；两者**互斥**注册，同一时刻至多一个
+   在触发花名册读取，因此进程总职责数仍然是十个而不是十一个。见
+   :func:`~lingxi.apps.scheduler.assembly._build_roster_snapshot_sync_duty` 与
+   :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 的文档字符串。
 
    **令牌供给自 Issue #215 起由本模块装配**（方案 C 主接线，产品负责人 2026-08-18
    裁定）：凭据轮换职责按需消费一次一次性 ``refresh_token``，把派生的短期
-   ``access_token`` 放进**进程内**持有者（不落盘、不进日志与审计），日报侧按新鲜度
-   取用。因此第四个前置现在只取决于配置，三个环境变量配齐即注册。消费频率随之从约
-   5.6 天一次变成按日一次，上界由两道守卫钉住：进程内的每日预算，以及随凭据落盘、
-   重启也抹不掉的 ``refresh_consumed_at``。**唯一消费者的边界没有变**——日报不自己
-   换令牌，两个消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
+   ``access_token`` 放进**进程内**持有者（不落盘、不进日志与审计），日报侧（或与它
+   互斥的快照写入职责）按新鲜度取用。消费频率随之从约 5.6 天一次变成按日一次，
+   上界由两道守卫钉住：进程内的每日预算，以及随凭据落盘、重启也抹不掉的
+   ``refresh_consumed_at``。**唯一消费者的边界没有变**——两个消费者共用一条一次性
+   令牌正是 2026-08-08 授权码被烧那次事故的形状。
    **代码层接上不等于真的读得到花名册**：真实读取所需的专用主体凭据自 2026-08-09 起
-   未落盘（Issue #52 的 G-READ 判定），当前部署也还没配那三个变量，因此这条链在真实
-   环境里一轮都没跑过。
+   未落盘（Issue #52 的 G-READ 判定），当前部署也还没配 Base 坐标那两个变量，因此
+   这条链在真实环境里一轮都没跑过。
 6. **每日权限重算**（:class:`~lingxi.apps.scheduler.permission_refresh.
    PermissionRefreshDuty`）——每天（UTC 日界）跑一轮：花名册快照必须是今天取的
    → 读当前有效银河批次 → 逐个已开通用户重算权限并排发布意图（Issue #156 的
@@ -157,6 +166,7 @@ from lingxi.apps.scheduler.assembly import (
     _build_permission_retention_duty,
     _build_readiness_follow_up,
     _build_roster_audit_duty,
+    _build_roster_snapshot_sync_duty,
     build_loop,
 )
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
@@ -199,7 +209,7 @@ from lingxi.apps.scheduler.retention import (
     PermissionRetentionSweepDuty,
     RetentionCleanupDuty,
 )
-from lingxi.apps.scheduler.roster_audit import RosterAuditDuty
+from lingxi.apps.scheduler.roster_audit import RosterAuditDuty, RosterSnapshotSyncDuty
 
 logger = logging.getLogger(__name__)
 
