@@ -135,6 +135,50 @@ echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
 
 > 另有一个待产品负责人决定的选项：把镜像包设为**公开**，宿主机就完全不需要登录，也就没有这份长期驻留在部署机上的凭据。代价是镜像层对外可见（源码本身不在镜像里，但依赖清单与目录结构会暴露）。本批不替产品负责人做这个选择，两条路都可行。
 
+## 编排者冻结前显式触发镜像构建（Issue #278）
+
+`epic/*` 分支合并到 `main` 走的是一条常驻「跟踪 PR」（整个 Epic 期间只开一次，base 是
+`main`，head 是该 epic 分支；每个 Story 合入 epic 分支都会把它 `synchronize` 一次）。
+Issue #278 之前，这条跟踪 PR 的**每一次** synchronize 都会自动跑一遍 `Epic Full / image`
+（双腿共 8 次镜像构建，约 4 分钟）；Epic D 实测 5 次 synchronize 只有 1 次的镜像制品被
+下面「PR 候选镜像下载」验收流程真正下载用过，其余全是陪跑。
+
+**Issue #278 之后**：跟踪 PR（head 为 `epic/**`、base 为 `main`）的**首次自动**
+synchronize 不再自动跑 `image` job（`gate` / `extras` 两个快速检查仍然照常自动跑，
+不受影响）；直接开给 `main` 的普通 PR（例如某个 `fix/xxx` 分支）不受任何影响，
+`image` 仍然照旧每次自动跑——这是"PR 检查阶段的可复现性门"，本 Issue 不动它。
+
+**编排者要固定某个候选提交（准备验收或合并前）时的显式姿势**：
+
+```bash
+# 1. 找到跟踪 PR 当前这次 synchronize 对应的 Epic Full run（base 是 main，
+#    因此直接挂在 ci.yml 名下，不像 story.yml 那样需要嵌套查找）：
+gh run list --repo Moshuiwang/lingxi --workflow=ci.yml --branch <epic 分支名> --limit 5
+
+# 2. 确认该 run 的 gate / extras 已经通过（image 会显示 skipped，这是预期状态，
+#    不是失败），再对同一个 run 做一次**全量**重跑（不要加 --failed，
+#    --failed 只重跑失败的 job，skipped 的 image 不会被算作失败）：
+gh run rerun <run id> --repo Moshuiwang/lingxi
+```
+
+`gh run rerun` 重跑的是**同一个 run**，会原样保留它的 `pull_request` 触发身份
+（PR 编号、head sha 都不变），只是 `github.run_attempt` 从 `1` 变成 `2`——
+`.github/workflows/ci.yml` 的 `image` job 的 `if` 条件正是用这个信号判断"这次是
+编排者要的构建"，见该 job 上方注释。重跑完成后，`image` 真正执行，下面「PR 候选镜像
+下载与校验」一节描述的 `epic-candidate-images-pr-<PR 编号>-<PR head sha>` artifact
+与 `epic-candidate-pr-<PR 编号>-<PR head sha>`（`candidate.json`，`Main Publish`
+回读用）都会按原有逻辑产出，两条下游链路都不需要为这次改动单独适配。
+
+**为什么不用 `workflow_dispatch`**：`.github/workflows/ci.yml` 的 `on:` 里一直都有
+`workflow_dispatch`，随时可以对任意 ref 手动跑一次 `Epic Full`（包括 `image`），
+适合脱离 PR 单独确认某个提交能不能可复现构建。但它产生的 run 在 GitHub API 里
+`event` 字段是 `workflow_dispatch`，不是 `pull_request`——`Main Publish` 的
+`scripts/ci/verify_epic_candidate.py` 查询候选证明时按 `?event=pull_request` 过滤
+（回读它要求"这个 PR 的这次 Epic Full"，而不是任意一次手动运行），`workflow_dispatch`
+的 run 无论如何都不会被这条回读命中。因此需要产出候选证明（`candidate.json` 或
+`epic-candidate-images-pr-*`）时必须用上面的 `gh run rerun`，`workflow_dispatch`
+只能用于不需要候选证明的场景（例如只是想手动确认某个提交的镜像可复现构建）。
+
 ## PR 候选镜像下载与校验（Issue #150；仅用于 #102 验收，不是发布路径）
 
 > **这一节只在验收某个未合并 PR 时使用。** 合并后的正式部署仍按上面「主机读取身份」「安装与升级」走 GHCR 拉取。**严禁在 `biai-stage` 现场用 `docker build` 重新构建这四个镜像，也不得用合并后 `Main Publish` 推送 GHCR 的镜像替代未合并 PR 的候选**——两者是不同对象：合并后的镜像是从合并树重新构建的，不保证与 PR 验收时的树逐位相同（Issue #62 决策登记、[验证与门禁](../docs/技术设计/验证与门禁.md)「五、CI 分层」）。
