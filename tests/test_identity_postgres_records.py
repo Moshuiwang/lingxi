@@ -1969,6 +1969,25 @@ class StalledProvisioningAbortTest(IdentityPostgresTestCase):
         )
         self.assertEqual(self._state(), "active")
 
+    def test_a_miscalled_expected_states_still_cannot_touch_an_active_user(self) -> None:
+        """外部独立审查 P2-3：即使调用方手滑把 `active` 传进 `expected_states`（不该
+        发生，但这条防线**不依赖**调用方自觉传对），SQL 里独立的
+        `provisioning_state <> 'active'` 仍然必须挡住——安全边界的来源是 SQL 本身，
+        不是调用方的自律。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertFalse(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing", "active"),
+                reason="stalled_lease_expired",
+            )
+        )
+        self.assertEqual(self._state(), "active")
+
     def test_a_suspended_account_is_never_aborted(self) -> None:
         """**否定断言**：已停用账号的中途状态原样保留，交给账号停用流程自己的语义
         处理，不被收口顺手改写。"""

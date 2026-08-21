@@ -41,6 +41,19 @@ class SeverityPromotionTests(unittest.TestCase):
 
         self.assertTrue(captured.output[0].startswith("WARNING:"))
 
+    def test_the_extra_warning_list_promotes_stalled_provisioning_notifier_not_wired(self) -> None:
+        """外部独立审查 P3-4：`_EXTRA_WARNING_ACTIONS` 扩展位（同
+        `apps/gateway/__init__.py` 的同名机制）此前搬迁时被漏掉了。
+        `stalled_provisioning.notifier_not_wired` 本身没有失败后缀，但描述的是
+        "本轮所有停摆候选一条都不处理"这种需要运维立刻知道的降级状态。"""
+
+        sink = StructuredLogAuditSink()
+
+        with self.assertLogs("lingxi.apps.scheduler", level="INFO") as captured:
+            sink.record("stalled_provisioning.notifier_not_wired")
+
+        self.assertTrue(captured.output[0].startswith("WARNING:"))
+
     def test_an_ordinary_action_stays_at_info(self) -> None:
         sink = StructuredLogAuditSink()
 

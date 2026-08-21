@@ -504,16 +504,22 @@ class PostgresAppUserStore:
         与 :meth:`advance_provisioning_state` 分开是刻意的（Issue #282）：那一个的合同
         是「只前进」（`V-开通-04`），在它内部开一个反向口子会让守卫读起来自相矛盾，也会
         让任何调用方都能写 ``aborted``。这一个的合同是「只从调用方明确列出的中途格收口，
-        绝不碰 ``active``，绝不碰已停用账号」——两个 ``AND`` 条件结构上保证了这一点，
-        不依赖调用方自觉传对 ``expected_states``：
+        绝不碰 ``active``，绝不碰已停用账号」——三个 ``AND`` 条件结构上保证了这一点，
+        **不依赖调用方自觉传对** ``expected_states``（外部独立审查 P2-3 修复：此前只有
+        ``provisioning_state = ANY(%s)`` 一层，若调用方误传 ``("active",)``，SQL 层
+        什么都挡不住，「不依赖调用方自觉」只是文档字符串里的一句空话）：
 
         - ``provisioning_state = ANY(%s)``：调用方必须显式列出允许收口的中途格，不给
           默认值（同一条纪律见 :meth:`late_onboarding_recovery_candidates` 的 ``reason``
           参数）。当前仅有两个合法调用方——首次开通编排跑到失败终态时的「当场收口」
           （``core/identity/onboarding_runner.py``）与停摆扫描职责的「租约到期收口」
           （``apps/scheduler/stalled_provisioning.py``），两者传的都是
-          ``("provisioning", "mcp_syncing")``。即使调用方传错，这条 ``ANY`` 也不可能
-          让本方法覆盖 ``active``——``active`` 从不会出现在一个「中途格」列表里。
+          ``("provisioning", "mcp_syncing")``。
+        - ``provisioning_state <> 'active'``：**独立于上面那条、结构上永远生效**的第二
+          道闸——即使调用方把 ``expected_states`` 传错（例如手滑传了
+          ``("active",)`` 或未来某次改动往里加了这个值），这一条本身与调用方传了什么
+          完全无关，`active` 永远不可能被这次收口覆盖。两条约束同时满足的交集才是真正
+          允许被收口的行；单靠调用方传对参数不是这份保证的来源。
         - ``account_state = 'enabled'``：与 :meth:`advance_provisioning_state` 推到
           ``active`` 时的既有守卫同一条口径，已停用账号的中途状态原样保留，交给账号
           停用流程自己的语义处理，不被这条收口顺手改写。
@@ -539,7 +545,8 @@ class PostgresAppUserStore:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE app_user SET provisioning_state = 'aborted', updated_at = now() "
-                "WHERE id = %s AND provisioning_state = ANY(%s) AND account_state = 'enabled'",
+                "WHERE id = %s AND provisioning_state = ANY(%s) "
+                "AND provisioning_state <> 'active' AND account_state = 'enabled'",
                 (user_id, list(states)),
             )
             changed = cursor.rowcount

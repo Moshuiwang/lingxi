@@ -447,20 +447,33 @@ def assert_claim_limit_follows_capacity(reconciler: Any, executor: OnboardingExe
 def assert_stalled_lease_exceeds_chain_budget(
     *, lease_seconds: float, publish_wait_seconds: float, schedule: Any
 ) -> None:
-    """装配断言 5（本轮新增，Issue #282）：**停摆租约必须严格长于一条链在
-    ``provisioning``/``mcp_syncing`` 两格上可能停留的最长时间**。
+    """装配断言 5（本轮新增，Issue #282）：**停摆租约必须严格长于一条链从最近一次
+    认领起、在 ``provisioning``/``mcp_syncing`` 两格上可能停留的最长时间**。
 
-    链在这两格上的最长自然停留 = 发布等待上界（``publish_wait_seconds``） + 就绪预算
-    （``schedule.budget_seconds``） + 单次探针超时（``schedule.probe_timeout_seconds``）
-    + 执行级硬截止余量（:data:`PROBE_WATCHDOG_MARGIN_SECONDS`）。默认组合约 20 分钟，
-    停摆扫描职责（:class:`~lingxi.apps.scheduler.stalled_provisioning.
-    StalledProvisioningDuty`）取 45 分钟租约，留出约 25 分钟余量。
+    **口径（外部独立审查 P3-2 如实改写，此前的措辞没有说清"从哪一次认领起算"
+    与"覆盖到哪一步为止"）**：
 
-    不成立时，停摆扫描会把一条**正在正常跑**的开通判成僵尸并给用户推一条
-    ``LX-ONBOARD-001``。这条断言真正挡住的不是今天的默认值算错，而是**以后有人把就绪
-    预算从十五分钟调到三十分钟**——那一次改动完全不会碰
-    ``stalled_provisioning.py`` 一个字，却会静默地把租约变成假的；装配期在这里炸出来，
-    比生产上把一批正在跑的开通误判成僵尸便宜得多。
+    - **从哪一次认领起算**：停摆候选查询（`adapters/postgres_stalled_provisioning.py`）
+      按用户**最新一条** ``auto_provisioning`` 事件的 ``onboarding_dispatched_at``
+      判到期，不是这个人第一次触发开通的那一刻。一条链因为通知发不出去被
+      ``AutoOnboardingRunner._release_for_notify`` 放回、被
+      ``OnboardingReconciler`` 重新认领后，会拿到一个**全新**的
+      ``onboarding_dispatched_at``——本断言只需要覆盖"从这**一次**认领起，链跑到
+      终态最长要多久"，不需要把"这个人可能已经被这样重跑过几轮"累加进同一个租约
+      预算：候选查询天然会用最新那一次认领重新起跑约束，历史上跑过几轮不会让
+      预算越滚越大（`abort_stalled_provisioning` 的 P2-5 修复保证了这一点）。
+    - **覆盖到分水岭之后、终态确定为止**：发布等待上界（``publish_wait_seconds``）
+      + 就绪预算（``schedule.budget_seconds``） + 单次探针超时
+      （``schedule.probe_timeout_seconds``） + 执行级硬截止余量
+      （:data:`PROBE_WATCHDOG_MARGIN_SECONDS`）——这四项按 ``_run`` 里从
+      ``advance(provisioning)`` 到 :meth:`~lingxi.core.identity.onboarding_runner.
+      AutoOnboardingRunner._confirm` 返回终态的真实执行顺序相加，是"这条链算出
+      一个终态需要多久"的上界。默认组合约 20 分钟，45 分钟租约留出约 25 分钟余量。
+    - **不包含的部分，及为什么不必包含**：终态算出来**之后**的
+      :meth:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner._notify`
+      重试耗时（默认 3 次尝试、``sleep(1)``+``sleep(2)`` ≈ 3 秒）**没有**计入公式——
+      这段时间发生在终态已经确定之后，不影响"链跑到终态需要多久"这件事本身，而且
+      3 秒相对 25 分钟余量可以忽略不计，不值得为它污染这条公式的可读性。
     """
 
     chain_budget = (

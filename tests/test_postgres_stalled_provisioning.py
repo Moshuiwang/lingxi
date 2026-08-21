@@ -20,8 +20,11 @@ from lingxi.adapters.mcp_token_cipher import McpTokenCipher
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
 from lingxi.core.permission.mcp_readiness import ReadinessAttempt, ReadinessBinding, ReadinessOutcome
+from lingxi.core.permission.publish import PublishAttempt, PublishOutcome, STATUS_PUBLISHED
+from lingxi.core.permission.publish_row import PublishRow
 
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
@@ -33,6 +36,32 @@ SKIP_REASON = (
 LEASE_SECONDS = 2700
 USER_A = "usr_stalled_a"
 USER_B = "usr_stalled_b"
+EMAIL_B = "yiming.yi@example.invalid"
+LATE_READINESS_REASON = "first_onboarding"
+
+
+def _row(email: str = EMAIL_B, *, permissions: str = '{"1011":["商务"]}') -> PublishRow:
+    return PublishRow(
+        record_key=email,
+        email=email,
+        name="化名乙",
+        permissions=permissions,
+        status="approved",
+        updated_at="2026-08-20T03:00:00Z",
+        token_cipher=None,
+    )
+
+
+def _publish_attempt(outbox_id: str, *, version: int, user_id: str) -> PublishAttempt:
+    return PublishAttempt(
+        outcome=PublishOutcome.PUBLISHED,
+        outbox_id=outbox_id,
+        permission_version=version,
+        user_id=user_id,
+        attempts=1,
+        action="create",
+        external_record_id="rec_1",
+    )
 
 
 @unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
@@ -65,10 +94,32 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
                 )
         self.store = PostgresStalledProvisioningStore(self._dsn)
         self.late_readiness = PostgresLateReadinessStore(self._dsn)
+        self.publish_store = PostgresPermissionPublishStore(self._dsn)
 
     # ------------------------------------------------------------------
     # 夹具
     # ------------------------------------------------------------------
+
+    def _publish(
+        self, *, user_id: str, row: PublishRow | None = None, reason: str = LATE_READINESS_REASON
+    ) -> int:
+        """发布一版权限并读回一致，返回 ``permission_version``——迟到就绪恢复的
+        候选查询要求 ``publish_outbox`` 里有一条 ``published`` 的意图（外部独立
+        审查 P3-1：没有这份夹具，`late_onboarding_recovery_candidates` 永远返回
+        空集，「两职责互补」的断言会变成一句永远成立的空话）。形状照
+        ``tests/test_postgres_late_readiness_recovery.py`` 的同名夹具。
+        """
+
+        decision = self.publish_store.record_decision(
+            user_id=user_id, row=row or _row(), reason=reason, decided_at=datetime.now(timezone.utc)
+        )
+        claimed = self.publish_store.claim_next()
+        assert claimed is not None
+        self.publish_store.complete(
+            _publish_attempt(claimed.outbox_id, version=claimed.permission_version, user_id=user_id),
+            status=STATUS_PUBLISHED,
+        )
+        return int(decision.permission_version)
 
     def _set_state(
         self, user_id: str = USER_A, *, state: str = "provisioning", account_state: str = "enabled"
@@ -225,6 +276,24 @@ class CandidateQueryTest(StalledProvisioningPostgresTestCase):
             "最新一次认领才 5 秒前，不该因为一条更早的历史事件被判超时",
         )
 
+    def test_a_released_latest_claim_hides_an_older_expired_one(self) -> None:
+        """**否定断言**（外部独立审查 P2-5）：这个人名下最新一条事件此刻**没有被
+        认领**（``onboarding_dispatched_at IS NULL``——例如通知发不出去被
+        ``AutoOnboardingRunner._release_for_notify`` 放回、正等着
+        ``OnboardingReconciler`` 重新认领），即使他名下**还有一条更早、认领时刻
+        早已超过租约的历史事件**，也绝不能被选中——那条历史认领不是"现在"的认领，
+        选中他等于把一条正在被对账重新认领的正常链误判成停摆 45 分钟的僵尸。"""
+
+        self._set_state(state="provisioning")
+        self._dispatch("evt_old", dispatched_at=self._expired(extra_seconds=3600))
+        self._dispatch("evt_released", dispatched_at=None)
+
+        self.assertEqual(
+            self._candidates(),
+            (),
+            "最新事件当前未被认领，不该退回去用更早那条历史认领的时刻判超时",
+        )
+
     def test_candidates_are_ordered_by_dispatch_time(self) -> None:
         self._set_state(USER_A, state="provisioning")
         self._set_state(USER_B, state="provisioning")
@@ -238,34 +307,37 @@ class CandidateQueryTest(StalledProvisioningPostgresTestCase):
 
 class ComplementaryCandidateSetsTest(StalledProvisioningPostgresTestCase):
     """`V-开通-19` 测试矩阵「两职责互补」一条的可执行形式：同一批构造数据同时喂给
-    两个候选查询，断言返回的用户集合交集为空。"""
-
-    LATE_READINESS_REASON = "first_onboarding"
+    两个候选查询，断言返回的用户集合交集为空。**两个候选集合都必须真的非空**
+    （外部独立审查 P3-1 修复）：此前的版本没有造 `publish_outbox` 夹具，
+    `late_onboarding_recovery_candidates` 永远返回空集，`stalled & late_readiness
+    == set()` 因此是一句永远成立、测不出任何东西的空话——正确的用例必须先证明
+    USER_B 真的出现在对方的候选集合里，再证明它不出现在本职责的候选集合里。
+    """
 
     def test_stalled_and_late_readiness_candidate_sets_never_overlap(self) -> None:
         # USER_A：停在 provisioning，超过停摆租约——只应出现在停摆收口的候选集合。
         self._set_state(USER_A, state="provisioning")
         self._dispatch("evt_a", user_id=USER_A, dispatched_at=self._expired())
 
-        # USER_B：停在 mcp_syncing 且已经判过 timed_out——只应出现在迟到就绪恢复的
-        # 候选集合（本职责的 NOT EXISTS 子句必须把它挡在外面）。
+        # USER_B：停在 mcp_syncing、已经发布过一版权限且已经判过 timed_out——只应
+        # 出现在迟到就绪恢复的候选集合（本职责的 NOT EXISTS 子句必须把它挡在外面）。
         self._set_state(USER_B, state="mcp_syncing")
         self._dispatch("evt_b", user_id=USER_B, dispatched_at=self._expired())
-        self._bump_permission_version(USER_B, 1)
-        self._record_timed_out(USER_B, version=1)
+        version = self._publish(user_id=USER_B)
+        self._record_timed_out(USER_B, version=version)
 
         stalled = {c.user_id for c in self._candidates()}
         late_readiness = {
             c.user_id
             for c in self.late_readiness.late_onboarding_recovery_candidates(
-                reason=self.LATE_READINESS_REASON, recovery_interval_seconds=1
+                reason=LATE_READINESS_REASON, recovery_interval_seconds=1
             )
         }
 
         self.assertEqual(stalled, {USER_A})
-        # 迟到就绪恢复还要求 publish_outbox 里有一条 published 的意图（本用例没有造），
-        # 因此这里只断言"结构上不可能同时命中同一个人"这条互补性质，不断言 USER_B
-        # 真的出现在对方的候选集合里——那需要更重的夹具，属该职责自己的测试文件。
+        self.assertEqual(
+            late_readiness, {USER_B}, "夹具必须让 USER_B 真的出现在对方的候选集合里"
+        )
         self.assertEqual(stalled & late_readiness, set())
 
 

@@ -59,6 +59,27 @@ open_id / 用户资料值）、零候选时不记审计（该职责外部独立�
 5. 全程审计只记 ``user_id`` / ``state`` / ``reason`` / ``trace_id`` / 计数，**不记
    open_id、不记任何资料值**（``LateReadinessRecoveryReport`` 同一条纪律）。
 
+## 通知节奏：进程内退避 + 过采样（外部独立审查 P2-2 修复）
+
+候选查询本身不带"这个人上一次被通知是什么时候"这个事实——通知失败**不会**改变
+``provisioning_state``（P2-1 修复：改了状态会让他直接退出候选集合，比通知节流严重
+得多），因此只要状态没变，一个持续通知失败的用户会在**每一轮** ``SchedulerLoop``
+tick（约 60 秒）都被重新选中、重新打一次飞书——没有节流的话就是无上界的重试速率。
+
+修法是 :data:`DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS`：职责实例在进程内存里记
+"这个用户最近一次被尝试处理是什么时候"，同一个用户在退避窗口内**跳过**，不占用本轮
+处理名额、也不发起新的通知调用。零迁移前提下没有持久化面可用，这条退避状态只存在
+单个进程的内存里，与「候选查询没有带过期时间的持久租约」同一个单实例假设——见下面
+「已知边界」。
+
+退避带来第二个问题：候选查询按最早认领优先排序，如果排在最前面的若干个恰好都在
+退避期内，只取 ``limit`` 条会让这些"毒候选"把整轮名额占满，饿死后面真正等待处理的
+新候选——与 ``late_readiness_recovery`` 外部独立审查 F4 挡住的"毒候选饿死正常候选"
+同一个风险形状。修法是 :data:`STALLED_FETCH_OVERSAMPLE`：候选查询按
+``limit × 过采样倍数``（封顶 ``_MAX_FETCH_LIMIT``）多取几条，在进程内跳过退避期的
+之后再从剩下的里挑最多 ``limit`` 个真正处理，用一次查询多扫描几行的成本换掉饿死
+风险。
+
 ## 通知文案：PR-1 阶段复用既有键，不新增
 
 发的是既有的 ``onboarding.internal_error`` 键（``KEY_INTERNAL_ERROR``，逐字复用，
@@ -99,21 +120,40 @@ notifier；这条分支存在是为了让"以后有人把它改成可选"或"测
 
 - 候选查询的认领没有带过期时间的持久租约（单实例假设），与 ``late_readiness_recovery``
   「已知边界」和 #250 同一判据。多实例部署或滚动发布重叠窗口出现时必须回来补。
+- **通知退避同样只在进程内存里**（同一单实例假设）：进程重启会清空
+  :attr:`StalledProvisioningDuty._last_attempt`，重启后的下一轮可能比退避窗口更早
+  再打一次飞书——最坏代价是多发一次通知（同一 ``dedupe_key``，是否被飞书去重见处置
+  顺序第 3 条），不是正确性问题。多实例部署下每个实例各自维护一份退避状态，效果上
+  等于把全局重试速率乘以实例数——多实例场景出现时必须回来重新评估。
 - 通知发送与 CAS 收口不在同一个数据库事务里（收口写入没有内建的通知 outbox）：这是
   与 ``late_readiness_recovery`` 的 F1 修复不同的形状——那边的通知是持久 outbox、独立
   重试到送达为止；本职责的通知是**一次性**尝试（不送达就整条候选留在原状态，交给
   下一轮候选查询重新捞起，本身已经是一种"重试"，只是重试的是整条处置而不是单独的
   通知）。两种形状都能达到"不会改状态不告知"这条底线，选择更简单的这一种是因为本职责
   的候选集合极小（停摆本身就是罕见事件），不值得为它另建一张 outbox 表。
+- **编排层「当场收口」通知送达之后、CAS 之前进程崩溃 → 用户可能收到两条相似的终态
+  通知，重复上界 2 条**（外部独立审查 P3-3 登记）：
+  :meth:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner._abort_if_stalled`
+  的收口发生在 ``_notify`` 已经确认送达**之后**（``onboarding:{event_id}`` 这个
+  dedupe_key 下的那条终态通知）；如果进程在"通知已送达"与"CAS 真的落库"之间崩溃，
+  ``provisioning_state`` 会原样停在中途格，45 分钟后被本职责的候选查询捞到，并用
+  **不同的** dedupe_key（``onboarding:stalled:{event_id}``，见「处置顺序」第 2 条）
+  再发一条内容相近的 ``LX-ONBOARD-001``。两条 dedupe_key 刻意不同，因此飞书那一层
+  不会把它们去重掉——用户这种情况下会看到两条相似的失败通知，不是一条。这与「处置
+  顺序」第 3 条（本职责自己"通知已发送、CAS 之前崩溃"的窗口）是**同一种**至少一次
+  投递的既有产品裁定（2026-08-18 裁定 4）在两个不同触发点上的体现，如实登记，
+  不新增补偿逻辑：崩溃窗口本身极窄（一次数据库写入的耗时），概率接近零，且方向
+  安全（多发一条不会误导用户"已经开通完成"，两条说的都是"还没成功"）。
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from lingxi.core.identity.onboarding_runner import (
     KEY_INTERNAL_ERROR,
@@ -128,9 +168,30 @@ logger = logging.getLogger(__name__)
 #: provisioning/mcp_syncing 两格上可能停留的最长时间。
 DEFAULT_STALLED_LEASE_SECONDS = 2700
 
-#: 单轮最多处理多少个停摆候选。配额保护，不是重试上限——被推迟到下一轮的候选不丢失
-#: 任何进度（进度全在 ``inbound_event``/``app_user`` 里）。
+#: 单轮最多**处理**（真的发起通知/收口）多少个停摆候选。配额保护，不是重试
+#: 上限——被推迟到下一轮的候选不丢失任何进度（进度全在 ``inbound_event``/
+#: ``app_user`` 里）。
 DEFAULT_STALLED_LIMIT = 50
+
+#: 同一个用户两次通知尝试之间的最短间隔（秒，外部独立审查 P2-2 修复）。
+#: ``SchedulerLoop`` 的 tick 周期约一分钟，而候选查询在通知持续失败、状态没有
+#: 任何变化时会**每一轮都重新选中同一个人**——不加节流会对一个持续失败的收件人
+#: 无上界地每分钟打一次飞书。取五分钟，与 ``late_readiness_recovery`` 通知退避
+#: 的起步档同一个数量级；本实现零迁移、没有持久化面，退避状态只存在**进程内存
+#: 里**（单实例假设，见模块文档「已知边界」）——进程重启最多让下一轮多试一次，
+#: 不是正确性问题，只是浪费一次配额。
+DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS = 300
+
+#: 候选查询的**过采样**倍数（外部独立审查 P2-2 修复的另一半）：查询按最早认领
+#: 优先排序，如果排在最前面的若干候选恰好都在退避期内（持续通知失败的"毒候选"），
+#: 只取 ``limit`` 条会让它们把整轮名额占满，后面真正等待处理的新候选永远排不上
+#: 号——这正是 ``late_readiness_recovery`` 外部独立审查 F4 挡过的"毒候选饿死正常
+#: 候选"在本职责这里的同型风险。查询多取几倍、在进程内跳过退避中的候选后再截到
+#: ``limit``，用一次查询多扫描几行的成本换掉这个饿死风险；候选集合本身很小
+#: （停摆是罕见事件），过采样代价可以忽略。
+STALLED_FETCH_OVERSAMPLE = 4
+#: 过采样查询量的硬上限，避免候选集合万一真的很大时一次查询扫描过多行。
+_MAX_FETCH_LIMIT = 200
 
 _EXPECTED_STATES: tuple[str, ...] = (STATE_PROVISIONING, STATE_MCP_SYNCING)
 
@@ -245,18 +306,31 @@ class StalledProvisioningDuty:
         notifier: _Notifier | None = None,
         lease_seconds: int = DEFAULT_STALLED_LEASE_SECONDS,
         limit: int = DEFAULT_STALLED_LIMIT,
+        notify_backoff_seconds: int = DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS,
+        clock: Callable[[], float] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
             raise ValueError("停摆租约必须是正整数秒")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("单轮候选上限必须是正整数")
+        if (
+            isinstance(notify_backoff_seconds, bool)
+            or not isinstance(notify_backoff_seconds, int)
+            or notify_backoff_seconds < 0
+        ):
+            raise ValueError("通知退避必须是非负整数秒")
         self._candidates = candidates
         self._aborter = aborter
         self._notifier = notifier
         self._audit = audit
         self._lease_seconds = lease_seconds
         self._limit = limit
+        self._notify_backoff_seconds = notify_backoff_seconds
+        self._clock = clock or time.monotonic
+        #: 每个用户最近一次被**尝试**处理（无论成功与否）的单调时刻。仅进程内存，
+        #: 见 ``DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS`` 的文档。
+        self._last_attempt: dict[str, float] = {}
         self._stop = threading.Event() if stop is None else stop
 
     @property
@@ -308,17 +382,37 @@ class StalledProvisioningDuty:
         return report
 
     def _sweep(self, tally: _Tally) -> bool:
-        """取到期候选并逐个处置。返回本轮是否被停止信号中断。"""
+        """取到期候选并逐个处置。返回本轮是否被停止信号中断。
 
+        **两段式**（外部独立审查 P2-2 修复）：候选查询按 :data:`STALLED_FETCH_OVERSAMPLE`
+        过采样，取回的候选先在进程内按每用户通知退避过滤，再从中挑最多 ``self._limit``
+        个**真正处理**（发通知、可能收口）——过采样是为了不让排在最前面、正处于退避期
+        的候选把 ``limit`` 名额占满，饿死后面真正等待处理的新候选（同型见模块文档）。
+        """
+
+        fetch_limit = min(self._limit * STALLED_FETCH_OVERSAMPLE, _MAX_FETCH_LIMIT)
         candidates = self._candidates.stalled_provisioning_candidates(
-            lease_seconds=self._lease_seconds, limit=self._limit
+            lease_seconds=self._lease_seconds, limit=fetch_limit
         )
+        now = self._clock()
+        processed = 0
         for item in candidates:
+            if processed >= self._limit:
+                # 本轮真正处理的名额已经用完：过采样只是为了绕开退避期的毒候选，
+                # 不是要把 `limit` 本身也放宽。
+                break
             if self._stop.is_set():
                 # 停止信号落在遍历中间：不再为后面的人处置。已经处理过的各自是完整的
                 # 一步（通知、或通知+收口），下一次启动会从库里的候选查询原样继续。
                 return True
+            last_attempt = self._last_attempt.get(item.user_id)
+            if last_attempt is not None and now - last_attempt < self._notify_backoff_seconds:
+                # 退避期内：这个人最近刚被尝试过（无论成败），跳过——不占用本轮的
+                # 处理名额，也不打一次多余的飞书。
+                continue
+            self._last_attempt[item.user_id] = now
             tally.examined += 1
+            processed += 1
             try:
                 self._process_one(item, tally)
             except Exception as error:  # noqa: BLE001 - 一个用户的失败不得带走整轮
@@ -364,7 +458,10 @@ class StalledProvisioningDuty:
         if not aborted:
             # CAS 0 行：状态在候选查到与这里之间被别的路径改写（被另一条并发链推进
             # 到 active、被停用、或已经被本职责上一轮收口过）。**不重发**——通知已经
-            # 发出去了，下一轮候选查询会按当前的真实状态重新判断。
+            # 发出去了，下一轮候选查询会按当前的真实状态重新判断。这个人此后也不会
+            # 再是本查询的候选，进程内的退避记录留着不清理（下一次真正停摆的人
+            # 是新的 user_id，不会撞上这条陈旧记录；同一 user_id 罕见地再次停摆时
+            # 多等一段退避窗口不构成正确性问题）。
             tally.advance_refused += 1
             self._audit.record(
                 "stalled_provisioning.advance_refused", user=item.user_id

@@ -606,19 +606,24 @@ class AutoOnboardingRunner:
             suffix="",
             trace_id=trace_id,
         )
+        if delivered:
+            # **只有真的送达才当场收口**（外部独立审查 P2-1 修复）：此前的判据是
+            # ``delivered or not self._release_for_notify(...)``，其中第二个析取项
+            # 覆盖"两轮通知全部失败、放弃"的分支——那种情况下用户**一条终态都没
+            # 收到**，却已经把状态收口成 ``aborted``。``aborted`` 不在
+            # ``StalledProvisioningDuty`` 的候选判据（``provisioning``/
+            # ``mcp_syncing``）里，于是这个人从此**结构上不可能再被 45 分钟兜底
+            # 捞到**——唯一还欠他一个结论的通道被自己关掉了。收窄到只在
+            # ``delivered`` 为真时收口之后，通知彻底失败的这条链原样留在中途格，
+            # 45 分钟后 ``StalledProvisioningDuty`` 会用**独立**的通知出口重新尝试
+            # 告诉他，而不是被这里提前判死。
+            self._abort_if_stalled(stalled["user_id"], terminal, trace_id=trace_id)
         if delivered or not self._release_for_notify(
             event_id=event_id, trace_id=trace_id, claim_token=claim_token
         ):
             # 送到了，或者已经放回过一次仍然送不到：记账收口。第二种情况留了一条
-            # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失。
-            #
-            # **在同一个收口窗口里当场收拾中途停摆**（Issue #282 §7.4）：不在这里等
-            # ``mark_onboarding_dispatched`` 之前做的原因是要与「已经决定不再为这条
-            # 事件重跑」这件事对齐——只要还有可能因为通知没送到而被 ``_release_for_notify``
-            # 放回去重跑一次，这条链就还没到"真的结束"的那一刻，不该抢先把状态收口成
-            # ``aborted``（那会让即将重跑的同一条链在推进 ``active`` 那一步之前，先把
-            # 自己的中途状态判成"已经结束"）。
-            self._abort_if_stalled(stalled["user_id"], terminal, trace_id=trace_id)
+            # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失——
+            # 但**不再**把它当成"当场收口"的触发条件（见上）。
             try:
                 self._ledger.mark_onboarding_dispatched(event_id=event_id)
             except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次

@@ -16,6 +16,9 @@
 5. **CAS 返回 0 行不重发**：通知已经发出去了，重发只会制造第二条相互矛盾的消息。
 6. **单个候选的失败不带走整轮**。
 7. **零候选时不记完成审计**。
+
+外部独立审查 P2-2 修复的两条新增用例：**通知退避**（同一用户在退避窗口内不得被
+再次尝试）与**过采样不饿死新候选**（退避期内的候选不得把 `limit` 名额占满）。
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from typing import Any
 from lingxi.apps.scheduler.stalled_provisioning import (
     DEFAULT_STALLED_LEASE_SECONDS,
     DEFAULT_STALLED_LIMIT,
+    STALLED_FETCH_OVERSAMPLE,
     StalledProvisioningDuty,
     StalledProvisioningReport,
 )
@@ -69,7 +73,9 @@ class FakeCandidates:
         self, *, lease_seconds: int, limit: int = 50
     ) -> tuple[Any, ...]:
         self.calls.append((lease_seconds, limit))
-        return tuple(self._items)
+        # 真实 SQL 的 ``LIMIT`` 会截断结果——不模拟这一点，退避 + 过采样的用例就
+        # 测不出"查询本身取回了几条"这件事，starvation 场景会显得永远不存在。
+        return tuple(self._items[:limit])
 
 
 class FakeAborter:
@@ -101,6 +107,8 @@ class FakeNotifier:
         order: list[str] | None = None,
     ) -> None:
         self.sent: list[tuple[str, str, dict[str, object], str]] = []
+        #: 每一次调用（无论成败）的 open_id，供退避节奏用例断言"到底打了几次飞书"。
+        self.calls: list[str] = []
         self._error = error
         self._fail_for = fail_for
         self._order = order
@@ -108,6 +116,7 @@ class FakeNotifier:
     def send(
         self, *, open_id: str, key: str, values: Any, dedupe_key: str
     ) -> None:
+        self.calls.append(open_id)
         if self._order is not None:
             self._order.append("notify")
         if self._error is not None and (not self._fail_for or open_id in self._fail_for):
@@ -147,9 +156,24 @@ def build_duty(**overrides: Any) -> tuple[StalledProvisioningDuty, dict[str, Any
         audit=parts["audit"],
         lease_seconds=overrides.get("lease_seconds", DEFAULT_STALLED_LEASE_SECONDS),
         limit=overrides.get("limit", DEFAULT_STALLED_LIMIT),
+        notify_backoff_seconds=overrides.get("notify_backoff_seconds", 300),
+        clock=overrides.get("clock"),
         stop=overrides.get("stop"),
     )
     return duty, parts
+
+
+class FakeClock:
+    """受控单调时钟：测试自己推进时间，不依赖真实 `time.monotonic`。"""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class HappyPathTests(unittest.TestCase):
@@ -185,13 +209,24 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(dedupe_key, "onboarding:stalled:evt_x")
         self.assertNotEqual(dedupe_key, "onboarding:evt_x")
 
-    def test_the_lease_and_limit_are_passed_through_to_the_candidate_query(self) -> None:
+    def test_the_lease_is_passed_through_and_the_query_is_oversampled(self) -> None:
+        """候选查询按 `limit × STALLED_FETCH_OVERSAMPLE` 过采样（外部独立审查
+        P2-2）：`limit` 本身管的是"这一轮真正处理几个"，不是"查询取几条"。"""
+
         candidates = FakeCandidates([])
         duty, _ = build_duty(candidates=candidates, lease_seconds=123, limit=7)
 
         duty.run_once()
 
-        self.assertEqual(candidates.calls, [(123, 7)])
+        self.assertEqual(candidates.calls, [(123, 7 * STALLED_FETCH_OVERSAMPLE)])
+
+    def test_the_oversample_query_is_capped(self) -> None:
+        candidates = FakeCandidates([])
+        duty, _ = build_duty(candidates=candidates, limit=1000)
+
+        duty.run_once()
+
+        self.assertEqual(candidates.calls[0][1], 200)
 
     def test_zero_candidates_records_no_completion_audit(self) -> None:
         audit = RecordingAudit()
@@ -337,6 +372,108 @@ class NegativeAssertionTests(unittest.TestCase):
             self.assertNotEqual(value, "ou_should_never_appear")
         completed_facts = audit.facts("stalled_provisioning.completed")
         self.assertNotIn("open_id", completed_facts)
+
+
+class NotifyBackoffTests(unittest.TestCase):
+    """外部独立审查 P2-2：同一用户通知持续失败时不得每一轮 tick 都重新尝试；
+    退避期内的候选也不得把 `limit` 名额占满、饿死后面真正等待处理的新候选。"""
+
+    def test_a_repeatedly_failing_candidate_is_skipped_within_the_backoff_window(self) -> None:
+        clock = FakeClock()
+        notifier = FakeNotifier(error=RuntimeError("feishu down"))
+        candidates = FakeCandidates([_candidate()])
+        duty, _ = build_duty(
+            candidates=candidates, notifier=notifier, notify_backoff_seconds=300, clock=clock
+        )
+
+        first = duty.run_once()
+        clock.advance(60)  # 一个 SchedulerLoop tick 之后
+        second = duty.run_once()
+
+        assert first is not None and second is not None
+        self.assertEqual(first.examined, 1, "第一轮必须真的尝试一次")
+        self.assertEqual(len(notifier.calls), 1, "第二轮还在退避窗口内，不该再打一次飞书")
+        self.assertEqual(second.examined, 0, "退避期内跳过，不计入本轮已处理")
+
+    def test_the_candidate_is_retried_once_the_backoff_window_elapses(self) -> None:
+        clock = FakeClock()
+        notifier = FakeNotifier(error=RuntimeError("feishu down"))
+        candidates = FakeCandidates([_candidate()])
+        duty, _ = build_duty(
+            candidates=candidates, notifier=notifier, notify_backoff_seconds=300, clock=clock
+        )
+
+        duty.run_once()
+        clock.advance(301)
+        second = duty.run_once()
+
+        assert second is not None
+        self.assertEqual(len(notifier.calls), 2, "退避窗口已过，必须重新尝试")
+        self.assertEqual(second.examined, 1)
+
+    def test_backed_off_poison_candidates_do_not_starve_a_fresh_one(self) -> None:
+        """`limit=3`：候选查询里排在最前面的三个是持续通知失败、已进入退避期的
+        "毒候选"，第四个是全新候选。**不过采样**的话查询只会取回前三个（正好是
+        `limit` 条，全部在退避期内），全新候选压根不会出现在结果集里、永远轮不到；
+        过采样之后查询能看到全部四个，进程内跳过退避中的三个，全新候选必须被
+        处理到——这正是本用例要证明的差异。
+        """
+
+        clock = FakeClock()
+        poisoned = [
+            _candidate(user_id=f"usr_poison_{i}", open_id=f"ou_poison_{i}", event_id=f"evt_poison_{i}")
+            for i in range(3)
+        ]
+        fresh = _candidate(user_id="usr_fresh", open_id="ou_fresh", event_id="evt_fresh")
+        failing_notifier = FakeNotifier(
+            error=RuntimeError("feishu down"),
+            fail_for=frozenset(candidate.open_id for candidate in poisoned),
+        )
+        candidates = FakeCandidates(list(poisoned))
+        duty, _ = build_duty(
+            candidates=candidates,
+            notifier=failing_notifier,
+            limit=3,
+            notify_backoff_seconds=300,
+            clock=clock,
+        )
+
+        # 第一轮：这个人还没有全新候选出现（他这时候才刚刚停摆），查询只看到三个
+        # 毒候选，全部被尝试一次、通知失败、进入退避期。
+        duty.run_once()
+        self.assertEqual(len(failing_notifier.calls), 3, "三个毒候选第一轮都必须被尝试过一次")
+
+        # 第二轮：候选查询现在能看到全部四个（三个毒候选依然排在最前面，因为它们
+        # 的认领时刻更早）；时钟没有推进，三个毒候选仍在退避期内。
+        candidates._items = [*poisoned, fresh]
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertIn("ou_fresh", failing_notifier.calls, "全新候选必须被真正尝试到")
+        self.assertEqual(
+            report.examined, 1, "本轮真正处理的只有全新候选，三个毒候选都被退避跳过"
+        )
+        self.assertEqual(report.notify_failed, 0, "全新候选通知应当成功")
+        self.assertEqual(report.notified, 1)
+
+    def test_notify_backoff_seconds_must_be_non_negative(self) -> None:
+        with self.assertRaises(ValueError):
+            build_duty(notify_backoff_seconds=-1)
+
+    def test_a_zero_backoff_retries_every_round(self) -> None:
+        """退避设为 0 等于不节流——用于明确表达"这条功能可以被关掉"，不是隐藏行为。"""
+
+        clock = FakeClock()
+        notifier = FakeNotifier(error=RuntimeError("feishu down"))
+        candidates = FakeCandidates([_candidate()])
+        duty, _ = build_duty(
+            candidates=candidates, notifier=notifier, notify_backoff_seconds=0, clock=clock
+        )
+
+        duty.run_once()
+        duty.run_once()
+
+        self.assertEqual(len(notifier.calls), 2)
 
 
 class ConstructionTests(unittest.TestCase):
