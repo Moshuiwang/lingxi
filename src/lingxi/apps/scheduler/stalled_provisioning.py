@@ -190,7 +190,13 @@ DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS = 300
 #: ``limit``，用一次查询多扫描几行的成本换掉这个饿死风险；候选集合本身很小
 #: （停摆是罕见事件），过采样代价可以忽略。
 STALLED_FETCH_OVERSAMPLE = 4
-#: 过采样查询量的硬上限，避免候选集合万一真的很大时一次查询扫描过多行。
+#: 过采样查询量的硬上限，避免候选集合万一真的很大时一次查询扫描过多行。**这同时是
+#: 饿死保护本身的上限**（编排者第二轮定向复核 P2-2 concern）：过采样解决的是"退避中的
+#: 候选排在最前面、把 `limit` 名额占满"，但查询本身仍然只取最早的 `_MAX_FETCH_LIMIT`
+#: 条——如果同一时刻处于退避期的老候选数量**超过**这个上限，新候选会被再次挤出结果集
+#: 之外，回到"过采样也救不了"的原始饿死处境。当前规模下（停摆是罕见事件）不会触及，
+#: 一旦触及说明积压的停摆候选已经远超正常水位，需要先处理积压本身，而不是继续加大
+#: 这个上限。
 _MAX_FETCH_LIMIT = 200
 
 _EXPECTED_STATES: tuple[str, ...] = (STATE_PROVISIONING, STATE_MCP_SYNCING)
@@ -233,7 +239,9 @@ class StalledProvisioningReport:
     """一轮的结果。**只有计数与固定分类，没有任何字段值**（同
     ``LateReadinessRecoveryReport`` 的纪律：内部用户标识、open_id 一个都不进报告）。"""
 
-    #: 本轮取到的停摆候选数。
+    #: 本轮**真正处理**（发起了通知尝试）的候选数——**不等于**本轮候选查询取到的
+    #: 行数（编排者第二轮定向复核 N-2：过采样查询取回的候选里，处于通知退避期的
+    #: 那些被跳过、不计入这里，改记 :attr:`skipped_in_backoff`）。
     examined: int = 0
     #: 通知发送成功的候选数。
     notified: int = 0
@@ -244,6 +252,12 @@ class StalledProvisioningReport:
     #: 通知送达但 CAS 返回 0 行（状态在候选查到与收口之间被别的路径改写）。
     advance_refused: int = 0
     failed: int = 0
+    #: 因为处于通知退避期而被跳过、本轮**没有**真正处理的候选数（N-2 新增）。
+    #: 与 :attr:`examined` 分开计数：如果不把它单独记下来，一轮里查询取到的候选
+    #: 全部恰好都在退避期时，:attr:`examined` 会是 0，运维读审计会误以为"这一轮
+    #: 没有任何停摆候选"，而真实情况是"有 N 个人还停在中途格，只是刚打过一次
+    #: 飞书还没到重试时间"——这两件事对运维的含义完全不同，不能被同一个 0 掩盖。
+    skipped_in_backoff: int = 0
     interrupted: bool = False
     #: 通知出口装配了没有。见模块文档「缺通知出口时的姿态」。
     notifier_wired: bool = True
@@ -256,6 +270,7 @@ class StalledProvisioningReport:
             "notify_failed": self.notify_failed,
             "advance_refused": self.advance_refused,
             "failed": self.failed,
+            "skipped_in_backoff": self.skipped_in_backoff,
             "notifier_wired": self.notifier_wired,
         }
         if self.interrupted:
@@ -271,6 +286,7 @@ class _Tally:
     notify_failed: int = 0
     advance_refused: int = 0
     failed: int = 0
+    skipped_in_backoff: int = 0
 
     def freeze(self, *, interrupted: bool, notifier_wired: bool) -> StalledProvisioningReport:
         return StalledProvisioningReport(
@@ -280,6 +296,7 @@ class _Tally:
             notify_failed=self.notify_failed,
             advance_refused=self.advance_refused,
             failed=self.failed,
+            skipped_in_backoff=self.skipped_in_backoff,
             interrupted=interrupted,
             notifier_wired=notifier_wired,
         )
@@ -365,19 +382,24 @@ class StalledProvisioningDuty:
         tally = _Tally()
         interrupted = self._sweep(tally)
         report = tally.freeze(interrupted=interrupted, notifier_wired=True)
-        if tally.examined:
-            # 零候选时不记审计（外部独立审查 F4 同一条纪律）：本职责每轮都跑，健康
-            # 系统里绝大多数 tick 什么都不该做，无条件记审计只会刷出海量空事实。
+        if tally.examined or tally.skipped_in_backoff:
+            # 零候选**且**零退避跳过时不记审计（外部独立审查 F4 同一条纪律）：本职责
+            # 每轮都跑，健康系统里绝大多数 tick 什么都不该做，无条件记审计只会刷出
+            # 海量空事实。**必须把 `skipped_in_backoff` 也算进这个门槛**（N-2 修复）：
+            # 只看 `examined` 的话，一轮取到的候选恰好全部在退避期时会静默不记审计，
+            # 运维读到的"这一轮没有停摆候选"其实是"有人被跳过了"，两件事不能同一个
+            # 沉默表达。
             self._audit.record("stalled_provisioning.completed", **report.audit_facts())
             logger.info(
                 "开通中途停摆收口完成 候选=%s 已通知=%s 已收口=%s 通知失败=%s "
-                "推进被拒=%s 失败=%s",
+                "推进被拒=%s 失败=%s 退避跳过=%s",
                 report.examined,
                 report.notified,
                 report.aborted,
                 report.notify_failed,
                 report.advance_refused,
                 report.failed,
+                report.skipped_in_backoff,
             )
         return report
 
@@ -408,7 +430,10 @@ class StalledProvisioningDuty:
             last_attempt = self._last_attempt.get(item.user_id)
             if last_attempt is not None and now - last_attempt < self._notify_backoff_seconds:
                 # 退避期内：这个人最近刚被尝试过（无论成败），跳过——不占用本轮的
-                # 处理名额，也不打一次多余的飞书。
+                # 处理名额，也不打一次多余的飞书。**必须计数**（N-2 修复）：不然一轮
+                # 取到的候选全部在退避期时，`tally.examined` 会是 0，运维读审计会
+                # 误以为这一轮没有任何停摆候选。
+                tally.skipped_in_backoff += 1
                 continue
             self._last_attempt[item.user_id] = now
             tally.examined += 1
@@ -478,8 +503,10 @@ class StalledProvisioningDuty:
 
 
 __all__ = [
+    "DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS",
     "DEFAULT_STALLED_LEASE_SECONDS",
     "DEFAULT_STALLED_LIMIT",
+    "STALLED_FETCH_OVERSAMPLE",
     "StalledProvisioningDuty",
     "StalledProvisioningReport",
 ]

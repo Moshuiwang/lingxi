@@ -394,6 +394,49 @@ class NotifyBackoffTests(unittest.TestCase):
         self.assertEqual(first.examined, 1, "第一轮必须真的尝试一次")
         self.assertEqual(len(notifier.calls), 1, "第二轮还在退避窗口内，不该再打一次飞书")
         self.assertEqual(second.examined, 0, "退避期内跳过，不计入本轮已处理")
+        self.assertEqual(second.skipped_in_backoff, 1, "跳过的候选必须被单独计数（N-2）")
+
+    def test_a_round_entirely_skipped_by_backoff_still_gets_an_audit_record(self) -> None:
+        """**否定断言**（编排者第二轮定向复核 N-2）：一轮取到的候选全部处于退避期
+        （`examined == 0`）不等于"这一轮没有任何停摆候选"——如果只用 `examined`
+        做记审计的门槛，这种情况会整轮静默，运维读到"没有停摆候选"，实际是
+        "有 N 个人还停在中途格，只是刚打过一次飞书"。"""
+
+        clock = FakeClock()
+        notifier = FakeNotifier(error=RuntimeError("feishu down"))
+        candidates = FakeCandidates([_candidate()])
+        audit = RecordingAudit()
+        duty, _ = build_duty(
+            candidates=candidates,
+            notifier=notifier,
+            notify_backoff_seconds=300,
+            clock=clock,
+            audit=audit,
+        )
+
+        duty.run_once()  # 第一轮：真的尝试一次，进入退避期。
+        second = duty.run_once()  # 第二轮：唯一的候选还在退避期内，examined=0。
+
+        assert second is not None
+        self.assertEqual(second.examined, 0)
+        self.assertEqual(second.skipped_in_backoff, 1)
+        completed_records = [
+            fields for action, fields in audit.records if action == "stalled_provisioning.completed"
+        ]
+        self.assertEqual(len(completed_records), 2, "两轮都必须各记一条完成审计，第二轮不能静默")
+        self.assertEqual(
+            completed_records[1],
+            {
+                "examined": 0,
+                "notified": 0,
+                "aborted": 0,
+                "notify_failed": 0,
+                "advance_refused": 0,
+                "failed": 0,
+                "skipped_in_backoff": 1,
+                "notifier_wired": True,
+            },
+        )
 
     def test_the_candidate_is_retried_once_the_backoff_window_elapses(self) -> None:
         clock = FakeClock()
@@ -502,6 +545,7 @@ class ConstructionTests(unittest.TestCase):
                 "notify_failed",
                 "advance_refused",
                 "failed",
+                "skipped_in_backoff",
                 "notifier_wired",
             },
         )

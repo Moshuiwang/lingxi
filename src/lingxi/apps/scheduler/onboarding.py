@@ -469,6 +469,8 @@ def assert_stalled_lease_exceeds_chain_budget(
       ``advance(provisioning)`` 到 :meth:`~lingxi.core.identity.onboarding_runner.
       AutoOnboardingRunner._confirm` 返回终态的真实执行顺序相加，是"这条链算出
       一个终态需要多久"的上界。默认组合约 20 分钟，45 分钟租约留出约 25 分钟余量。
+      认领到分水岭之间的几步（组织资料读取、建档、令牌签发、用户环境落盘）没有
+      独立上界，靠这 25 分钟余量吸收（编排者第二轮定向复核 P3-2 concern）。
     - **不包含的部分，及为什么不必包含**：终态算出来**之后**的
       :meth:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner._notify`
       重试耗时（默认 3 次尝试、``sleep(1)``+``sleep(2)`` ≈ 3 秒）**没有**计入公式——
