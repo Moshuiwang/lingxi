@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**七个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**十个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -18,22 +18,35 @@
    那一面无条件运行。
 5. **花名册资料比对与管理群审计日报**（:class:`RosterAuditDuty`）——每天（UTC 日界）
    跑一轮：读一整轮花名册 → 更新持久快照或保留上一份 → 与建档存档三字段比对 →
-   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。第五个职责是
-   **条件注册**的，四个前置任缺其一就不注册，并留下一条指名原因的审计
-   （断言 ``V-花名册-29``）：管理群 ID、花名册 Base ``app_token``、花名册
-   ``table_id``（三者都是可选环境变量，见 :class:`SchedulerConfig`），以及花名册读取
-   所用的短期令牌供给。不注册时进程照常启动、其余职责照常运行。
+   有差异（或快照超龄 / 无快照）就向管理群发一条日报（Issue #52）。管理群 ID、花名册
+   Base ``app_token``、``table_id`` 三个前置任缺其一，或读取令牌供给未接线，就不注册
+   （断言 ``V-花名册-29``，留一条指名原因的审计），进程照常启动、其余职责照常运行。
+
+   **管理群未配置时，写快照的这一半不随之停摆**（Issue #275）：``roster_snapshot``
+   表是首次开通链第二步（``core/identity/onboarding_runner.py::_match``）与每日
+   权限重算（职责 6）的共同数据前提，两者都直接读这张表，不经过本职责。此前三个前置
+   捆在一起，导致"日报发到哪个群"这个纯通知配置决定"员工能不能被开通"
+   （2026-08-21 首触冒烟实测坐实）。因此本职责未装配时，``build_loop`` 会改为尝试
+   装配 :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty`——只依赖
+   Base 坐标与令牌供给、不比对不发送的"只写"职责；两者**互斥**注册，同一时刻至多一个
+   在触发花名册读取，因此进程总职责数仍然是十个而不是十一个。见
+   :func:`~lingxi.apps.scheduler.assembly._build_roster_snapshot_sync_duty` 与
+   :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 的文档字符串。
 
    **令牌供给自 Issue #215 起由本模块装配**（方案 C 主接线，产品负责人 2026-08-18
    裁定）：凭据轮换职责按需消费一次一次性 ``refresh_token``，把派生的短期
-   ``access_token`` 放进**进程内**持有者（不落盘、不进日志与审计），日报侧按新鲜度
-   取用。因此第四个前置现在只取决于配置，三个环境变量配齐即注册。消费频率随之从约
-   5.6 天一次变成按日一次，上界由两道守卫钉住：进程内的每日预算，以及随凭据落盘、
-   重启也抹不掉的 ``refresh_consumed_at``。**唯一消费者的边界没有变**——日报不自己
-   换令牌，两个消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
+   ``access_token`` 放进**进程内**持有者（不落盘、不进日志与审计），日报侧（或与它
+   互斥的快照写入职责）按新鲜度取用。消费频率随之从约 5.6 天一次变成按需（令牌寿命
+   约 2 小时，正常一天约 12 次）。频率上界随凭据落盘、进程内不留第二份账本副本：
+   Issue #276（产品负责人 2026-08-21 裁定）解除了此前"每 UTC 日至多消费一次"的
+   自设限制，改为两次消费的最小间隔（默认 5 分钟）与每日消费次数上界（默认 100 次）
+   双重保护，判据仍是随凭据落盘的 ``refresh_consumed_at`` / ``refresh_consumed_count``。
+   **唯一消费者的边界没有变，且与频率上界是两件不同的事**——2026-08-08 授权码被烧
+   那次事故的形状是**两个客户端抢占同一条通道**，不是"换取太频繁"（详见
+   ``core/identity/access_token_supply.py`` 模块文档）。
    **代码层接上不等于真的读得到花名册**：真实读取所需的专用主体凭据自 2026-08-09 起
-   未落盘（Issue #52 的 G-READ 判定），当前部署也还没配那三个变量，因此这条链在真实
-   环境里一轮都没跑过。
+   未落盘（Issue #52 的 G-READ 判定），当前部署也还没配 Base 坐标那两个变量，因此
+   这条链在真实环境里一轮都没跑过。
 6. **每日权限重算**（:class:`~lingxi.apps.scheduler.permission_refresh.
    PermissionRefreshDuty`）——每天（UTC 日界）跑一轮：花名册快照必须是今天取的
    → 读当前有效银河批次 → 逐个已开通用户重算权限并排发布意图（Issue #156 的
@@ -59,6 +72,60 @@
    **为什么它与每日重算是两个职责**：重算靠一个当日水位保证同日至多一轮，而发布消费
    必须每轮都跑；合并会让当天第一轮之后排进来的意图一直等到第二天。
    **单一写入负责人**：发布执行、就绪探针与用户通知全部在本进程内，不另起消费者。
+
+8. **组织快照同步**（:class:`~lingxi.apps.scheduler.org_snapshot_sync.
+   OrgSnapshotSyncDuty`，Issue #250）——每 UTC 日至多一轮：递归遍历关联组织的应用身份
+   与专用授权用户身份两条路径 → 校验批次完整性（不通过不提交半轮）→ 写四张
+   ``feishu_org_*`` 快照表。它是首次开通链身份定位那一步唯一的数据来源；此前四张表
+   全空、产品侧没有任何东西写它们，是 Epic B 一处未被发现的缺件（写入/读取适配器都已
+   就绪，缺的只是这条生产调用点）。第八个职责同样是**条件注册**的：两个令牌供给
+   （用户身份、应用身份）任一未接线就不注册（**恰一条**审计），生产装配路径下两条都是
+   默认值因此不会真的触发。位置排在权限发布消费之后、首次开通编排之前，理由见
+   :func:`~lingxi.apps.scheduler.assembly._build_org_snapshot_sync_duty` 调用点的
+   注释。
+9. **首次开通编排**（``apps/scheduler/onboarding.py`` + :class:`~lingxi.core.conversation.
+   onboarding_recovery.OnboardingReconciler`）——认领 gateway 记下的未开通首聊事件，在
+   **自己的线程池**上跑完整条开通链（身份 → 匹配 → 建档 → 用户环境 → 权限发布 →
+   MCP 就绪 → ``active``），并自己私聊通知用户。第九个职责同样是**条件注册**的：缺 MCP
+   令牌主密钥、问数 MCP 端点、用户环境根目录或在职状态令牌供给任一项就不注册（**恰一条**
+   审计），此时**没有任何人认领**那些事件——它们原样留在库里，不会被认领走再烧掉。
+
+   **装配不变量（外部集成面审查坐实的 F1）**：``onboarding != None ⇒ permission_publish
+   != None 且 permission_publish.publish_wired``——第七个职责（权限发布消费）的**发布面**
+   如果因为自己的前置不齐没有装配，开通链排出的发布意图此后没有任何职责会消费；第十个
+   职责（迟到就绪恢复）救不了这个缺口，它只能确认"已经进入就绪等待"的用户。判据是
+   ``publish_wired`` 而不是 ``is not None``：第七个职责在只缺权限表 Base 坐标时会**照常
+   注册**一个只有就绪面的半个职责（那是它自己刻意的设计），旧判据会把它当成"发布执行者
+   在"而放行开通——冻结候选审查 2026-08-21 的 F1，由产品负责人当天第二次真实开通失败
+   （``publish_not_completed``）坐实。两种情形下首次开通编排都**不注册**，并各留一条
+   与其它前置同一形状的**恰一条**审计（``reason=permission_publish_not_assembled`` /
+   ``permission_publish_not_wired``），在**认领任何用户之前**挡住，而不是让用户先建档、
+   建了用户环境再永远卡住。见
+   :func:`~lingxi.apps.scheduler.assembly._build_onboarding_duty` 文档字符串。
+
+   **为什么它住在本进程而不是 gateway**（产品负责人 2026-08-18 裁定，决策记录见
+   ``docs/决策记录/2026-08-18-首次开通编排住在scheduler.md``）：在职状态必须实时回读飞书
+   成员详情，而那需要专用授权主体派生的短期令牌；那条一次性 ``refresh_token`` 全系统只
+   允许一个消费者，它已经在本进程里（职责 1 + 进程内持有者）。让 gateway 去换等于制造
+   第二条凭据通道——2026-08-08 授权码被烧那次事故的形状。
+
+   **它不占 tick**：单条链最长会阻塞十七分钟（发布等待 + 就绪预算），因此跑在专属线程池
+   上；``run_once`` 只做"认领若干条并提交"，认领量由执行器剩余容量压住。
+
+10. **迟到就绪恢复**（:class:`~lingxi.apps.scheduler.late_readiness_recovery.
+    LateReadinessRecoveryDuty`，[V-开通-18](../../../../docs/技术设计/验收矩阵.md)）——
+    首次开通编排（职责 9）的阻塞式就绪确认判超时之后，``provisioning_state`` 停在
+    ``mcp_syncing``，此前没有任何东西会再回来看这个人。第十个职责每轮按十五分钟一次
+    的节奏（在候选查询里判到期，不是每轮都真的发探针）把这些用户重新捞回来再探一次，
+    就绪就推进 ``active`` 并主动通知「开通完成」；未就绪的人**不**被推进、也**不**收到
+    任何暗示已经可用的消息。**总能注册**：候选查询、状态推进与通知只需要
+    ``LINGXI_POSTGRES_DSN``/飞书应用凭据（两者都是必填项）；只有需要真探针才能推进的
+    那一路会在缺 MCP 令牌主密钥或问数 MCP 端点时不装配，并留下**恰一条**审计——已经
+    探到就绪但因崩溃未推进的候选仍会被续做。判定复用
+    :mod:`lingxi.core.permission.mcp_readiness` 的探针与分类（新增
+    :class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`，与既有的
+    阻塞式/tick 式就绪确认同一份判定实现），不新造第二套"就绪"的定义。语义、放在哪、
+    节奏与"要试到什么时候为止"的产品决定缺口，见该模块自己的文档字符串。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -100,11 +167,15 @@ from lingxi.core.alerting import (
 
 from lingxi.apps.scheduler.alerting_assembly import build_alerting_duty, _combined_heartbeat
 from lingxi.apps.scheduler.assembly import (
+    _build_late_readiness_recovery_duty,
+    _build_onboarding_duty,
+    _build_org_snapshot_sync_duty,
     _build_permission_publish_duty,
     _build_permission_refresh_duty,
     _build_permission_retention_duty,
     _build_readiness_follow_up,
     _build_roster_audit_duty,
+    _build_roster_snapshot_sync_duty,
     build_loop,
 )
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
@@ -120,7 +191,15 @@ from lingxi.apps.scheduler.credential_rotation import (
     RotationReport,
     _is_definite_failure,
 )
+from lingxi.apps.scheduler.late_readiness_recovery import (
+    DEFAULT_NOTICE_DRAIN_LIMIT,
+    DEFAULT_RECOVERY_INTERVAL_SECONDS,
+    DEFAULT_RECOVERY_LIMIT,
+    LateReadinessRecoveryDuty,
+    LateReadinessRecoveryReport,
+)
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
+from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
 from lingxi.apps.scheduler.permission_publish import (
     PermissionPublishDuty,
     PermissionPublishReport,
@@ -139,7 +218,7 @@ from lingxi.apps.scheduler.retention import (
     PermissionRetentionSweepDuty,
     RetentionCleanupDuty,
 )
-from lingxi.apps.scheduler.roster_audit import RosterAuditDuty
+from lingxi.apps.scheduler.roster_audit import RosterAuditDuty, RosterSnapshotSyncDuty
 
 logger = logging.getLogger(__name__)
 

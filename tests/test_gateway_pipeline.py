@@ -940,7 +940,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             message(event_id="evt_ledger", open_id="ou_new"), now=NOW
         )
 
-        self.assertEqual(self.state.onboarding_dispatched, {"evt_ledger"})
+        self.assertEqual(set(self.state.onboarding_dispatched), {"evt_ledger"})
         self.assertGreater(
             self.log.index("store.mark_onboarding_dispatched"),
             self.log.index("audit.onboarding.result"),
@@ -955,7 +955,7 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
         )
 
         self.assertEqual(
-            self.state.onboarding_dispatched,
+            set(self.state.onboarding_dispatched),
             {"evt_ledger_fail"},
             "编排确实被调用过：不记账会让用户收到第二遍 LX-ONBOARD-001",
         )
@@ -974,7 +974,47 @@ class OnboardingDispatchLedgerTests(PipelineTestCase):
             "簿记失败不得带走用户可见的终态提示",
         )
         self.assertEqual(self.log.count("audit.onboarding.dispatch_record_failed"), 1)
-        self.assertEqual(self.state.onboarding_dispatched, set())
+        self.assertEqual(set(self.state.onboarding_dispatched), set())
+
+    def test_an_asynchronous_runner_keeps_the_ledger_for_itself(self) -> None:
+        """``started`` 表示"编排异步接手了"，结论还没产生（Epic D / S-D-02）。
+
+        gateway 此刻就记账，会让一次跑到一半的崩溃变成谁都不会再看的悬空状态：对账扫描
+        被账本挡在门外，用户永远停在「正在核对」。正式 runner 在链跑到终态、并把结论发给
+        用户之后才记这一笔，因此崩在中途的那一条仍然是孤儿、仍然会被扫描重新交接一次。
+        """
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+
+        outcome = self.build(onboarding=runner).handle_message(
+            message(event_id="evt_async", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(
+            [call["event_id"] for call in runner.calls], ["evt_async"], "编排必须被调用过"
+        )
+        self.assertEqual(
+            set(self.state.onboarding_dispatched),
+            set(),
+            "started 的账由编排自己记；gateway 提前记会把中途崩溃的链变成无人恢复的悬空",
+        )
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.checking"],
+            "started 是唯一允许没有下文的状态：用户刚收到的「正在核对」就是完整交代",
+        )
+
+    def test_a_synchronous_terminal_still_gets_its_ledger_entry(self) -> None:
+        """同步返回终态的编排（失败关闭桩、旧实现）不受上面那条影响。"""
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.INTERNAL_ERROR))
+
+        self.build(onboarding=runner).handle_message(
+            message(event_id="evt_sync_terminal", open_id="ou_new"), now=NOW
+        )
+
+        self.assertEqual(set(self.state.onboarding_dispatched), {"evt_sync_terminal"})
 
 
 class OnboardingShutdownOrderTests(PipelineTestCase):
@@ -1012,7 +1052,7 @@ class OnboardingShutdownOrderTests(PipelineTestCase):
             "停机不得回滚已提交的认领",
         )
         self.assertEqual(
-            self.state.onboarding_dispatched,
+            set(self.state.onboarding_dispatched),
             set(),
             "没交接就不能记成已交接——对账扫描正是靠这个空账本认出这条孤儿",
         )
@@ -1209,6 +1249,39 @@ class SuspendedUserTests(PipelineTestCase):
         self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
         self.assertEqual(len(self.state.tasks), 0)
         self.assertEqual(self.log.count("reply.send_text"), 1)
+
+
+class OnboardingInFlightTests(PipelineTestCase):
+    """开通正在进行中又收到一条消息：回**同步中**提示，不是「正在核对」。
+
+    合同：「权限同步期间，卡片明确显示『权限正在同步，预计最多需要十五分钟』，用户无需
+    重复开通」。把第一条提示错用在这个阶段，用户每问一次都被告知「正在核对你的身份」，
+    而系统其实早就核对完、正在等 MCP 同步。
+    """
+
+    def test_a_message_during_sync_gets_the_sync_notice(self) -> None:
+        self.state.users["ou_1"] = UserRecord(user_id="usr_1", state=UserState.PROVISIONING)
+        runner = FakeOnboarding()
+
+        outcome = self.build(onboarding=runner).handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.NOT_PROVISIONED)
+        self.assertEqual(
+            [fields["content_key"] for fields in self.log.fields("audit.reply.sent")],
+            ["onboarding.matched"],
+            "同步期间的重复消息必须回同步提示，而不是第一条「正在核对」",
+        )
+
+    def test_it_does_not_re_trigger_the_orchestration(self) -> None:
+        """那一条正在 scheduler 里跑，重复触发只会多一次外部副作用。"""
+
+        self.state.users["ou_1"] = UserRecord(user_id="usr_1", state=UserState.PROVISIONING)
+        runner = FakeOnboarding()
+
+        self.build(onboarding=runner).handle_message(message(), now=NOW)
+
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(len(self.state.tasks), 0, "同步期间不入队")
 
 
 if __name__ == "__main__":

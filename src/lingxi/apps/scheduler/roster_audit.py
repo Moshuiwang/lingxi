@@ -1,7 +1,21 @@
-"""花名册资料比对与管理群审计日报职责：:class:`RosterAuditDuty`。
+"""花名册资料比对与管理群审计日报职责：:class:`RosterAuditDuty`；以及与它互斥的写侧
+职责 :class:`RosterSnapshotSyncDuty`（Issue #275）。
 
 从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出。同日至多一次、空差异不发、快照保旧
 与超龄告警等规则的完整理由见该类自己的文档字符串（未随拆分改动）。
+
+**Issue #275 的解耦**：`roster_snapshot` 表是首次开通链第二步
+（`core/identity/onboarding_runner.py::_match`）的硬前提，但此前"写快照"这件事被绑在
+`RosterAuditDuty` 内部——它的前置里含 `LINGXI_ADMIN_GROUP_CHAT_ID`，一个纯粹服务
+"日报发到哪个群"的通知配置，因此没配管理群会让快照永远不写、员工永远开通不了
+（2026-08-21 首触冒烟实测坐实）。`RosterSnapshotSyncDuty` 是解出来的"只写不发"那一半：
+只依赖花名册 Base 坐标与令牌供给，与管理群配置无关。两个职责在装配层**互斥**（见
+`apps/scheduler/assembly.py` 的 `build_loop`）：管理群与 Base 坐标都齐全时，`RosterAuditDuty`
+自己内部完成"读一轮→写快照→立刻比对"（与改动前完全相同，零变化）；`RosterAuditDuty`
+因任何原因未装配时，才尝试单独装配 `RosterSnapshotSyncDuty`。这样任何时刻至多只有一个
+职责在触发花名册读取，不会出现"同一天读两轮花名册"的形状（`RosterAccessTokenProvider`
+的一次性 `refresh_token` 唯一消费者纪律因此不受影响，见
+`core/identity/access_token_supply.py`）。
 """
 
 from __future__ import annotations
@@ -42,9 +56,14 @@ class _RosterSource(Protocol):
 class RosterAuditDuty:
     """每日花名册资料比对与管理群审计日报（Issue #52）。
 
-    一轮做四件事：读比对基线 → 取本轮花名册（读一整轮 + 更新或保留持久快照）→
+    一轮做四件事：取本轮花名册（读一整轮 + 更新或保留持久快照）→ 读比对基线 →
     纯函数比对 → 该发就发一条日报。**存档三字段这一侧只读**（`V-花名册-14`）；
     唯一的写库发生在花名册快照那一侧，而它写的是花名册的副本，不是 `app_user`。
+
+    **花名册排在基线之前是刻意的**（冻结候选审查 2026-08-21 的 F6）：第一件事里的
+    快照写入是**首次开通链的硬前提**，第二件事只服务日报正文。反过来排会让"日报基线
+    读不出来"把"新员工能不能被开通"一起拖停——Issue #275 解开的是配置期的同一条耦合，
+    这里解开的是运行期那一半。理由与重复写入的安全性见 :meth:`run_once` 内的注释。
 
     **"该发就发"不等于"有差异才发"**。空差异日本来不发（`V-花名册-25`），但有两种
     情形下「今天没有差异」这句话本身不可信，沉默因此是最危险的输出：
@@ -135,13 +154,27 @@ class RosterAuditDuty:
         if self._completed_on == today:
             return None
 
-        baseline = self._baseline_reader.load_active_baseline()
+        # **先读花名册、后读比对基线**（冻结候选审查 2026-08-21 的 F6）。顺序不是随意的：
+        # 快照写入就发生在 `current()` 里，而 `roster_snapshot` 表是首次开通链第二步
+        # （`core/identity/onboarding_runner.py::_match`）与每日权限重算的硬前提；
+        # `load_active_baseline()` 读的是 `app_user`，只服务**日报正文**。旧顺序把
+        # baseline 排在前面，于是 baseline 持续读取失败时异常先冒泡，健康的花名册读取
+        # 与快照写入被一起拖停——Issue #275 只解开了"没配管理群 ⇒ 快照不写"那一半，
+        # 运行期的这一半耦合还在。调换之后，日报侧的故障只影响日报。
+        #
+        # 调换是安全的：`compare_roster` 是纯函数，两个输入之间没有依赖；baseline 抛
+        # 异常时 `current()` 已经完成、快照已经落库，下一轮重试会**再读一轮花名册、
+        # 再整体替换一次快照**——而 `PostgresRosterSnapshotStore.replace()` 是"同一
+        # 事务里删光旧行 + 整体写入新行"的整体替换（表里永远只有一份），重复写入只是
+        # 把同样的内容换成更新的 `captured_at`，不累积、不产生重复行。
+        #
         # 读一整轮花名册并结算持久快照。回读到不自洽的快照
         # （:class:`~lingxi.adapters.postgres_roster_snapshot.RosterSnapshotInconsistent`）
         # 或写快照失败时，异常原样上抛，由 :class:`SchedulerLoop` 做职责级隔离并在
         # 下一轮重试（`V-花名册-17`）；水位不置位，因此这一天还没算做完。
         round_result = self._roster_source.current(now=now)
         snapshot = round_result.snapshot
+        baseline = self._baseline_reader.load_active_baseline()
 
         if snapshot.available:
             report = compare_roster(baseline, round_result.rows)
@@ -225,6 +258,116 @@ class RosterAuditDuty:
             snapshot.stale,
         )
         return report
+
+
+class RosterSnapshotSyncDuty:
+    """花名册快照写入职责（写侧，Issue #275）：只读一轮花名册 → 更新持久快照，
+    **不比对、不渲染、不发送任何消息**。
+
+    这是从 `RosterAuditDuty` 解出来的"写"那一半：`roster_snapshot` 表是首次开通链
+    第二步（`core/identity/onboarding_runner.py::_match`）与每日权限重算
+    （`permission_refresh.py`）的共同数据前提，两者都直接经
+    `PostgresRosterSnapshotStore` 读这张表，从不经过 `RosterAuditDuty`——这条职责
+    因此把"写"对齐到它真正的消费者身边，不再要求一个只服务通知的配置项
+    （管理群 chat_id）先满足。
+
+    **只在 `RosterAuditDuty` 未装配时才会被 `build_loop` 装配**（见
+    `apps/scheduler/assembly.py::_build_roster_snapshot_sync_duty` 与
+    `build_loop` 调用点的注释）：管理群与 Base 坐标都齐全时，写入与比对仍然捆在
+    `RosterAuditDuty` 内部一次完成——那是已经验证过的路径，没有理由为它另开一次独立
+    读取。两者因此互斥，同一时刻至多一个职责在触发花名册读取，"今天到底读了几次
+    花名册"永远唯一，不给一次性 `refresh_token` 的唯一消费者纪律增加新的分辨负担。
+
+    形状与 :class:`RosterAuditDuty` 同源：只编排注入的 :class:`~lingxi.core.
+    identity.roster_snapshot.DailyRosterSource`（同一天**成功换上一份新快照之后**只
+    真正读一次,靠自己的 ``_completed_on`` 日期水位）,不做任何 I/O；写入失败**不吞**——
+    `DailyRosterSource.current()` 内部调用的 `RosterSnapshotUpdater.apply()`
+    在写库失败时原样上抛（先留一条 ``roster_snapshot.replace_failed`` 审计），
+    这里不捕获，交给 :class:`~lingxi.apps.scheduler.loop.SchedulerLoop` 做职责级
+    隔离并在下一轮重试——水位在这里也不置位，因此"今天"不会被错误地标记为已完成。
+
+    **水位只在真的换上新快照时才置位**（冻结候选审查 2026-08-21 的 F2）。上一段说的
+    "写入失败不置位"只覆盖**写库抛异常**那一路，而花名册读取失败根本不抛：
+    `adapters/feishu_roster_bitable.read_roster_snapshot` 把 ``RosterReadError``
+    结算成一个 ``status=FAILED`` 的**正常返回值**（空源、不完整同理），
+    `RosterSnapshotUpdater.apply()` 于是走"保旧"分支、正常返回，`current()` 也正常
+    返回——旧代码在这里无条件置位水位，于是**一次瞬时读取失败就烧掉一整天**：当天不再
+    写快照，而 `roster_snapshot` 表正是首次开通链第二步的硬前提，表现成"今天入职的人
+    全都开通不了，而且没有任何东西在重试"。判据因此改成
+    :attr:`~lingxi.core.identity.roster_snapshot.RosterSnapshotStatus.refreshed`
+    （``action`` 是 ``install``/``replace``，即本轮真的写进去了一份）——保旧轮与失败轮
+    都不置位，下一 tick 重试。
+
+    **同日重试的重复写入是安全的**：``PostgresRosterSnapshotStore.replace()`` 是"同一
+    事务里删光旧行 + 整体写入新行"的**整体替换**，表里永远只有一份快照；重跑一次只是
+    把同样的内容换成一个更新的 ``captured_at``，不会累积、不会产生重复行，读侧
+    （开通链 `_match`、每日权限重算）也只认库里那唯一一份。
+
+    **刻意不加读取失败退避**（与 `apps/scheduler/org_snapshot_sync.py` 的
+    ``READ_FAILURE_BACKOFF_*`` 形成对比，那里加了）。两处的量级不是一回事：
+
+    - 组织快照一轮是**数百次**分页请求，贴着 tick 重试一天约 2880 轮，那是真实成本；
+      花名册一轮 500 行/页、受控读取 1206 行只占 **3 页**，最坏情况（整天保旧）按 60 秒
+      tick 约 4300 次请求/天，量级可忽略；
+    - **令牌换取次数完全不受本次改动影响**：走到"保旧"这一支说明令牌已经拿到了，而
+      `DerivedAccessTokenHolder` 缓存的令牌寿命约 2 小时，一天仍然只换约 12 次；
+      真正拿不到令牌时 `RosterAccessTokenProvider` 抛 ``AccessTokenUnavailable``、
+      `current()` 直接冒泡——那条路径**在改动前就**到不了置位水位那一行，每 tick 重试
+      是既有形状，不是本次引入的。
+
+    因此这里选择"简单地下一 tick 再试"，用一点请求噪声换"当天还有机会自愈"；真要加
+    退避时，直接复用 `org_snapshot_sync` 那一套形状即可，不必新造机制。
+
+    **本类不持有独立的 ``audit`` 协作者**：写入结果（``roster_snapshot.replaced``/
+    ``kept_previous``/``replace_failed``）已经由注入的 `RosterSnapshotUpdater` 自己
+    的审计出口记录（见 `_build_roster_snapshot_sync_duty` 的装配代码），本类再存一份
+    只会是一个从不被调用的多余协作者。
+    """
+
+    name = "花名册快照同步"
+
+    def __init__(
+        self,
+        *,
+        roster_source: _RosterSource,
+        clock: Callable[[], datetime] | None = None,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._roster_source = roster_source
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._stop = threading.Event() if stop is None else stop
+        self._completed_on: date | None = None
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def completed_on(self) -> date | None:
+        """已完成本轮读取与写入的那一天。``None`` 表示本进程实例今天还没读过。"""
+
+        return self._completed_on
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> RosterRound | None:
+        """跑一轮。返回 ``None`` 表示本轮没有触发读取（停止中，或今天已经做完）。"""
+
+        if self._stop.is_set():
+            # 已经在停止中：不开新一轮读取（与 RosterAuditDuty 的停止语义同一条：
+            # 停止之后不得再触发新的花名册读取）。
+            return None
+        now = self._clock()
+        today = now.date()
+        if self._completed_on == today:
+            return None
+
+        # 写入失败原样上抛：水位不置位，交给 SchedulerLoop 隔离并在下一轮重试。
+        round_result = self._roster_source.current(now=now)
+        if round_result.snapshot.refreshed:
+            self._completed_on = today
+        return round_result
 
 
 def _log_snapshot_alert(decision: SnapshotDecision) -> None:

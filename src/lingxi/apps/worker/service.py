@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TerminalTask
+from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.session_cleanup import delete_agent_session_files
 from lingxi.apps.worker.turn import WorkerTurnExecutor
@@ -366,7 +368,19 @@ class WorkerService:
                 )
 
         try:
-            executor = self._executor_factory(self._config, marker)
+            # Epic D 闸⑥红线：每个用户的问数必须用他自己的那份 MCP 配置，绝不
+            # 回退到全进程共用的 self._config.mcp_servers——回退意味着用户 A
+            # 的问数用了一份不属于他的令牌去查数，是越权返回数据。这里**结构性
+            # 地没有回退分支**：读取失败（UserMcpConfigError）在下面单独一支
+            # except 里收口成失败报告，从不构造 executor、从不调用 run_turn，
+            # self._config（携带全进程共用配置）不会被传给 _executor_factory。
+            # 唯一能让任务真正执行的路径，是读到了这个用户自己的配置并用它
+            # 覆盖出一份 task_config。
+            user_mcp_servers = load_user_mcp_servers(
+                root=self._config.user_env_root or "", user_id=claimed.user_id
+            )
+            task_config = replace(self._config, mcp_servers=user_mcp_servers)
+            executor = self._executor_factory(task_config, marker)
             report = await executor.run_turn(
                 context.prompt,
                 resume_session_id=(
@@ -376,6 +390,16 @@ class WorkerService:
                 on_stream_event=on_stream_event,
                 external_texts=self._config.external_texts,
             )
+        except UserMcpConfigError as error:
+            # error.code 是本模块自定的安全码（不含路径 / 内容 / 令牌），供运维
+            # 诊断具体失败原因（例如用户还没走完首次开通、配置文件形状不对）。
+            report = {
+                "turn": {"closed": False, "final_text": "", "session_id": None},
+                "failure": {
+                    "code": "user_mcp_config_unavailable",
+                    "message": f"user_mcp_config:{error.code}",
+                },
+            }
         except Exception as error:  # noqa: BLE001 - worker 绝不留下 running
             report = {
                 "turn": {"closed": False, "final_text": "", "session_id": None},

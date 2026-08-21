@@ -76,7 +76,6 @@ class GatewayConfig:
     # 启动即失败（失败关闭），不允许一个拼错的值悄悄在生产环境里长期放行。
     card_failure_injection: str | None = None
 
-
 def _text(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(f"{ENV_PREFIX}{name}")
     if value is None:

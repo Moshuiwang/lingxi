@@ -28,6 +28,29 @@ DEFAULT_INTERVAL_SECONDS = 60
 # 飞书开放平台地址来自配置，代码里只有一个可被覆盖的默认值（断言 V-部署-01）。
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
+#: 首次开通编排的默认执行线程数。**每条链最长阻塞十五分钟**（发布等待 + 就绪预算），
+#: 因此它就是「同一时刻最多几个人在开通」。
+#:
+#: 取 8 的依据（710 人规模的排空账，全部按最坏侧算）：
+#:
+#: - 首期服务规模是 710 人的关联组织（组织快照实测值），而首次开通是**一次性事件**
+#:   ——每个人一辈子只走一次，不是持续负载。真正要扛的只有"上线当天大量员工同时首聊"。
+#: - 典型一条链是秒级到三分钟（就绪探针在 t=0 或 t=180s 命中），8 条线程 ≈ 每小时
+#:   160–480 人，710 人在 1.5–4.5 小时内排空。
+#: - 病态一条链是 17 分钟（发布等待 120s + 就绪预算 900s，即每一次探针都不成功），
+#:   8 条线程 ≈ 每小时 28 人；这种情况下 710 人要排一天多——**但一条都不会丢**：
+#:   没被认领的事件原样留在库里，认领量由执行器剩余容量压住，下一轮照捞。
+#: - 病态情形本身也不该靠加线程解决：每条链都探满十五分钟意味着 MCP 侧根本没同步，
+#:   多开线程只是让更多人同时等一个不会来的结果。
+#:
+#: 线程绝大多数时间阻塞在 ``sleep`` 与网络等待上，8 条线程对 scheduler 进程的常驻开销
+#: 可以忽略；需要更快排空时调 ``LINGXI_ONBOARDING_WORKERS``（启动日志会把线程数与队列
+#: 深度一起报出来，不必去猜当前上限是多少）。
+#:
+#: 上界 64 是防御而不是容量规划：撞上它说明配置写错了，而不是「这次要开通很多人」。
+DEFAULT_ONBOARDING_WORKERS = 8
+MAX_ONBOARDING_WORKERS = 64
+
 
 class _Secret(str):
     """只影响 ``repr`` 的字符串子类：配置对象被打印时不吐出凭据。"""
@@ -82,6 +105,16 @@ class SchedulerConfig:
     # 输入，因此装配层必须让探针传输层与就绪节奏用**同一个数**（见
     # `lingxi.adapters.query_mcp_probe.QueryMcpProbe.timeout_seconds` 的文档）。
     query_mcp_timeout_seconds: int = DEFAULT_PROBE_TIMEOUT_SECONDS
+    # 用户环境根目录（`/var/lib/lingxi/users`）。首次开通编排要在它下面建家目录并写
+    # 按用户的 `.mcp.json`（产品负责人 2026-08-17 裁定）。**可选**：缺了只是首次开通
+    # 编排不注册，其余职责照常。
+    user_env_root: str | None = None
+    # 开通编排的执行线程数。**每条链最长会阻塞十五分钟**，因此它就是"同一时刻最多几个人
+    # 在开通"；认领量由执行器剩余容量压住（见 apps/scheduler/onboarding.py）。
+    onboarding_workers: int = DEFAULT_ONBOARDING_WORKERS
+    # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
+    # （`LX-ONBOARD-001`），不是 MCP 同步超时。
+    onboarding_publish_wait_seconds: float = 120.0
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -103,6 +136,8 @@ class SchedulerConfig:
         "LINGXI_PERMISSION_BITABLE_TABLE_ID",
         "LINGXI_QUERY_MCP_ENDPOINT",
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
+        "LINGXI_USER_ENV_ROOT",
+        "LINGXI_ONBOARDING_WORKERS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -207,6 +242,19 @@ class SchedulerConfig:
         except ValueError as error:
             raise ValueError(f"环境变量 LINGXI_QUERY_MCP_TIMEOUT_SECONDS 不合法：{error}") from None
 
+        raw_workers = (source.get("LINGXI_ONBOARDING_WORKERS") or "").strip()
+        if raw_workers:
+            try:
+                onboarding_workers = int(raw_workers)
+            except ValueError:
+                raise ValueError("环境变量 LINGXI_ONBOARDING_WORKERS 必须是正整数") from None
+            if onboarding_workers < 1 or onboarding_workers > MAX_ONBOARDING_WORKERS:
+                raise ValueError(
+                    f"环境变量 LINGXI_ONBOARDING_WORKERS 必须在 1 到 {MAX_ONBOARDING_WORKERS} 之间"
+                )
+        else:
+            onboarding_workers = DEFAULT_ONBOARDING_WORKERS
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -244,4 +292,6 @@ class SchedulerConfig:
             permission_table_id=optional_identifier("LINGXI_PERMISSION_BITABLE_TABLE_ID"),
             query_mcp_endpoint=query_mcp_endpoint,
             query_mcp_timeout_seconds=probe_timeout,
+            user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),
+            onboarding_workers=onboarding_workers,
         )

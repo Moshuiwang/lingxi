@@ -402,12 +402,19 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         # 刚发放：轮换点在 5.6 天之后，因此"到期领取"这条路径拿不到它。
         self.issued_at = datetime.now(timezone.utc)
 
-    def _save(self, *, refresh_consumed_at: datetime | None = None, seconds: int = 7 * 24 * 3600) -> None:
+    def _save(
+        self,
+        *,
+        refresh_consumed_at: datetime | None = None,
+        refresh_consumed_count: int | None = None,
+        seconds: int = 7 * 24 * 3600,
+    ) -> None:
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), seconds, "offline_access"),
             issued_at=self.issued_at,
             refresh_consumed_at=refresh_consumed_at,
+            refresh_consumed_count=refresh_consumed_count,
         )
 
     def test_a_credential_that_is_not_due_yet_is_only_claimable_for_supply(self) -> None:
@@ -474,107 +481,243 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
             claimed.consumed_at, released_at[0], "时刻在锁外取的话会早于锁被释放的那一刻"
         )
 
-    def test_a_second_claim_on_the_day_already_consumed_is_refused(self) -> None:
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+    # 一个远离 UTC 午夜的固定锚点：涉及"同一 UTC 日"的用例用它，避免真的在 CI 跑到
+    # 接近午夜时产生偶发的跨日误判（Issue #276 新增用例的确定性要求）。
+    NOON = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
 
-        moment = datetime.now(timezone.utc)
-        self._save(refresh_consumed_at=moment)
+    def test_a_second_claim_within_the_minimum_interval_is_refused(self) -> None:
+        """距上一次消费未满最小间隔（默认 5 分钟）：被拒，且不置位消费标记。
 
-        with self.assertRaises(RefreshAlreadyConsumedToday) as raised:
-            self.vault.claim_due(for_supply=True)
+        变异验红锚点：把间隔判定挪到 ``payload["consumed_at"] = ...`` 之后，本用例
+        必须变红（`self.vault.load()` 会因为凭据被标成"消费中"而变成 ``None``）。
+        """
+
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+
+        with self.assertRaises(RefreshMinIntervalNotElapsed) as raised:
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(minutes=1))
 
         self.assertNotIn(FAKE_TOKEN, str(raised.exception))
-        # 异常带着"是哪一次消费"占掉了今天，调用方据此判断自己的记号还算不算数。
-        self.assertEqual(raised.exception.consumed_at, moment)
-
-    def test_the_ceiling_is_judged_against_the_locks_own_clock(self) -> None:
-        """"今天"由锁内的当前时刻决定，不由调用方在锁外算好（收口轮 P2-a）。
-
-        用注入的 ``now`` 表达"等锁等到了第二天"：判定必须跟着走到 D+1，那一天照常
-        领得到；否则跨午夜的那一次会被算成 D，当天平白多消费一次一次性凭据。
-        """
-
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
-
-        moment = datetime(2026, 8, 18, 23, 59, 30, tzinfo=timezone.utc)
-        self._save(refresh_consumed_at=moment)
-
-        with self.assertRaises(RefreshAlreadyConsumedToday):
-            self.vault.claim_due(for_supply=True, now=moment + timedelta(seconds=20))
-
-        claimed = self.vault.claim_due(for_supply=True, now=moment + timedelta(minutes=1))
-        self.assertIsNotNone(claimed, "跨过 UTC 午夜之后是新的一天")
-
-    def test_a_refused_claim_leaves_the_credential_fully_usable(self) -> None:
-        """**上界判定必须在置位消费标记之前**。
-
-        反过来的话，每一次被拒的领取都会把凭据标成"消费中"——那等于每天亲手制造一次
-        凭据丢失，而它要到收殓超时之后才会被发现。变异验红锚点：把上界判定挪到
-        ``payload["consumed_at"] = ...`` 之后，本用例必须变红。
-        """
-
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
-
-        moment = datetime.now(timezone.utc)
-        self._save(refresh_consumed_at=moment)
-
-        with self.assertRaises(RefreshAlreadyConsumedToday):
-            self.vault.claim_due(for_supply=True)
-
+        # 异常带着"是哪一次消费"占用了这次名额，调用方据此判断自己的记号还算不算数。
+        self.assertEqual(raised.exception.consumed_at, self.NOON)
         self.assertTrue(self.path.exists(), "被拒的领取不得删除凭据")
         self.assertIsNotNone(self.vault.load(), "被拒的领取不得把凭据标成消费中")
-        self.assertIsNotNone(
-            self.vault.claim_due(for_supply=True, now=moment + timedelta(days=1)),
-            "换到下一天就该正常领得到",
-        )
 
-    def test_a_freshly_authorized_credential_is_not_blocked_by_the_ceiling(self) -> None:
-        """**收口轮 P1 在凭据层的那一半**：新授权不带消费时刻，因此当天立刻可用。
+    def test_a_second_claim_after_the_interval_elapses_succeeds(self) -> None:
+        """**本次改动的正向锚点**：同一 UTC 日内、间隔已过 ⇒ 第二次换取成功。
 
-        刚做完人工重新授权就被上界挡住，会让运维在恢复之后还要再等一天；这也正是
-        进程内账本副本做不到的事——它只记得"今天已经用过"，认不出这是一条新凭据。
+        在旧判据「每 UTC 日至多一次」下，这条用例必然失败——那正是本次要推翻的形状
+        （Issue #276，产品负责人 2026-08-21 裁定）。默认间隔 5 分钟不用显式传参，
+        因此这里也顺带证明了"默认值本身生效"（约束 3）。
         """
 
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
 
-        self._save(refresh_consumed_at=datetime.now(timezone.utc))  # 今天已经消费过一次
-        with self.assertRaises(RefreshAlreadyConsumedToday):
-            self.vault.claim_due(for_supply=True)
+        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(minutes=5, seconds=1))
 
-        # 人工重授权：同一天写入一条全新凭据，**不带**消费时刻。
+        self.assertIsNotNone(claimed, "同一天、间隔已过，必须能再换一次")
+        self.assertEqual(claimed.refresh_consumed_count, 2, "当日计数在上一次的基础上加一")
+
+    def test_the_ceiling_cannot_be_disabled_by_a_sentinel_value(self) -> None:
+        """**约束 4 的直接钉子**：``for_supply=True`` 不接受能让检查整体消失的哨兵值。
+
+        两个新参数只能调整门槛的大小，不能传一个值把检查关掉——否则"放开到期判定、
+        同时施加频率上界"这两件事就被参数拆开了，而 docstring 明确说了这是不允许的。
+        """
+
+        self._save()
+
+        # **0 也是哨兵**（冻结候选审查 2026-08-21 的 F5）："至少隔 0" 对任何时刻都
+        # 成立，等于把这道上界整体关掉。此前的校验写的是 `< timedelta(0)`，只挡住
+        # 负数，与 docstring 承诺的"不接受 None、0 或更小"不符。
+        # 变异验红：把 `delegated_credentials.py` 里的 `<= timedelta(0)` 改回
+        # `< timedelta(0)` 之后重跑本用例，`timedelta(0)` 那一条子用例会红。
+        for disabled_interval in (timedelta(0), timedelta(seconds=-1)):
+            with self.subTest(min_interval=disabled_interval):
+                with self.assertRaises(ValueError):
+                    self.vault.claim_due(for_supply=True, min_interval=disabled_interval)
+        for disabled in (0, -1):
+            with self.subTest(daily_limit=disabled):
+                with self.assertRaises(ValueError):
+                    self.vault.claim_due(for_supply=True, daily_limit=disabled)
+
+    def test_a_tiny_positive_interval_is_still_a_real_check(self) -> None:
+        """0 被拒之后，"几乎没有间隔"的语义由一个**极小的正值**承担——它仍然是一道
+        真的检查（同一时刻再领一次照样被挡），只是门槛小到不干扰别的断言。"""
+
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+
+        tiny = timedelta(microseconds=1)
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+
+        with self.assertRaises(RefreshMinIntervalNotElapsed):
+            # 与上一次消费**同一时刻**：间隔为 0，仍然小于 1 微秒，照样被挡。
+            self.vault.claim_due(for_supply=True, now=self.NOON, min_interval=tiny)
+
+    def test_the_daily_limit_is_reached_with_a_distinct_reason(self) -> None:
+        """当日已达上界：抛出「日上界」，与「最小间隔」不是同一个 reason（约束 2）。
+
+        间隔已过（+1 小时，不撞最小间隔）但当日已经用满注入的上界（1），因此这里
+        钉住的只是"日上界"这一条判据，不与最小间隔混在一起。
+        """
+
+        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+
+        with self.assertRaises(RefreshDailyLimitReached) as raised:
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+
+        self.assertNotIn(FAKE_TOKEN, str(raised.exception))
+        self.assertEqual(raised.exception.consumed_at, self.NOON)
+
+    def test_the_two_ceilings_are_distinguishable_on_the_same_credential(self) -> None:
+        """同一条领取路径下，最小间隔与当日上界必须能被明确区分（约束 2 的直接钉子）。"""
+
+        from lingxi.core.identity.credentials import RefreshDailyLimitReached, RefreshMinIntervalNotElapsed
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+
+        with self.assertRaises(RefreshMinIntervalNotElapsed):
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(seconds=1), daily_limit=1)
+
+        with self.assertRaises(RefreshDailyLimitReached):
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+
+    def test_the_ceiling_resets_across_utc_midnight_judged_by_the_locks_clock(self) -> None:
+        """**跨 UTC 日界**：当日计数归零，且用锁内的当前时刻判定（收口轮 P2-a 的延伸）。
+
+        用一个很低的当日上界（1）把"计数复位"从"间隔已过"里剥离出来单独钉住：不这样
+        隔离的话，任何足以跨过午夜的时间差也早已足以满足默认 5 分钟的最小间隔，无法
+        证明复位真的是靠"日界"而不是单纯"隔了很久"。
+        """
+
+        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+
+        near_midnight = datetime(2026, 8, 18, 23, 59, 30, tzinfo=timezone.utc)
+        self._save(refresh_consumed_at=near_midnight, refresh_consumed_count=1)
+
+        # 6 分钟之后（已过最小间隔）、仍是 8-19 的 00:05:30——已经跨过 UTC 午夜，
+        # 但故意先验证"跨天之后同一个低上界照常放行"，再验证"没跨天则会被挡住"。
+        with self.assertRaises(RefreshDailyLimitReached):
+            # 20 秒之后：还没过最小间隔，也还是同一个 UTC 日，用日上界为 1 的当日
+            # 计数（已是 1）钉住"没跨天时会被挡住"这一半。
+            # 最小间隔用一个**极小的正值**（不是 0——0 是被拒的哨兵，见
+            # `test_the_ceiling_cannot_be_disabled_by_a_sentinel_value`）：这里要隔离
+            # 的是"日界有没有让计数复位"，不希望最小间隔抢先把这次领取挡下来，
+            # 20 秒已经远超 1 微秒，因此抛出来的必然是日上界那一条。
+            self.vault.claim_due(
+                for_supply=True,
+                now=near_midnight + timedelta(seconds=20),
+                daily_limit=1,
+                min_interval=timedelta(microseconds=1),
+            )
+
+        claimed = self.vault.claim_due(
+            for_supply=True, now=near_midnight + timedelta(minutes=6), daily_limit=1
+        )
+        self.assertIsNotNone(claimed, "跨过 UTC 午夜之后是新的一天，当日计数归零")
+        self.assertEqual(claimed.refresh_consumed_count, 1, "新一天的计数从 1 开始")
+
+    def test_a_freshly_authorized_credential_resets_both_ceilings(self) -> None:
+        """**收口轮 P1 在凭据层的那一半，延伸到日上界**：新授权不带消费标记与计数，
+        因此当天立刻可用——即使旧账本此刻正卡在一个很紧的日上界上。
+
+        刚做完人工重新授权就被上界挡住，会让运维在恢复之后还要再等；这也正是进程内
+        账本副本做不到的事——它只记得"已经用过、用了几次"，认不出这是一条新凭据。
+        """
+
+        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+        with self.assertRaises(RefreshDailyLimitReached):
+            # 用一个紧上界（1）确认"消费过一次"确实卡住了后续领取，不是因为间隔。
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+
+        # 人工重授权：同一天写入一条全新凭据，**不带**消费时刻与计数。
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken("fake-reauthorized-token"), 7 * 24 * 3600, "offline_access"),
         )
 
-        self.assertIsNotNone(self.vault.claim_due(for_supply=True), "重授权当天即可恢复供给")
+        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+        self.assertIsNotNone(claimed, "重授权当天即可恢复供给，即使日上界仍然是 1")
+        self.assertEqual(claimed.refresh_consumed_count, 1, "新凭据的当日计数从 1 开始，不是延续旧账本")
 
     def test_an_expired_credential_is_revoked_before_the_ceiling_is_consulted(self) -> None:
         """失效优先于一切：一条已经失效的凭据要被清掉并要求重新授权，
-        而不是先报一句"今天已经换过了"把真正的问题盖住。"""
+        而不是先报一句频率上界的拒绝把真正的问题盖住。"""
 
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+        from lingxi.core.identity.credentials import RefreshRateLimited
 
         moment = datetime.now(timezone.utc)
-        self._save(refresh_consumed_at=moment, seconds=3600)
+        self._save(refresh_consumed_at=moment, refresh_consumed_count=1, seconds=3600)
 
         later = moment + timedelta(seconds=3601)
         try:
             claimed = self.vault.claim_due(for_supply=True, now=later)
-        except RefreshAlreadyConsumedToday:  # pragma: no cover - 次序错了才会走到这里
+        except RefreshRateLimited:  # pragma: no cover - 次序错了才会走到这里
             self.fail("失效判定必须排在频率上界之前")
 
         self.assertIsNone(claimed)
         self.assertFalse(self.path.exists())
 
-    def test_the_consumption_moment_survives_a_rotation_write(self) -> None:
-        """轮换写回时把领取时拿到的那个时刻一起落盘：上界因此跟着最新那一代走。"""
+    def test_the_consumption_moment_and_count_survive_a_rotation_write(self) -> None:
+        """轮换写回时把领取时拿到的时刻**与计数**一起落盘：上界因此跟着最新那一代走。
 
-        first = datetime.now(timezone.utc) - timedelta(days=1)
-        self._save(refresh_consumed_at=first)
-        claimed = self.vault.claim_due(for_supply=True)
+        这里显式把 ``claimed.refresh_consumed_count`` 传回 ``save()``——不传的话
+        （见下面 ``test_a_caller_that_forgets_to_thread_the_count_resets_it_silently``）
+        当日计数会被这次写入悄悄清零，日上界因此形同虚设。
+        """
+
+        from lingxi.core.identity.credentials import RefreshDailyLimitReached
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=2)
         self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.refresh_consumed_count, 2)
 
+        self.vault.save(
+            subject_open_id=DELEGATED_SUBJECT,
+            grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
+            replacing_generation=claimed.generation,
+            expected_registered_subject_open_id=DELEGATED_SUBJECT,
+            refresh_consumed_at=claimed.consumed_at,
+            refresh_consumed_count=claimed.refresh_consumed_count,
+        )
+
+        with self.assertRaises(RefreshDailyLimitReached) as raised:
+            # 当日上界仍是 2、已经用掉 2 次：第三次在同一天必须被挡住。
+            self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=2), daily_limit=2)
+        self.assertEqual(raised.exception.consumed_at, claimed.consumed_at)
+
+        self.assertIsNotNone(
+            self.vault.claim_due(
+                for_supply=True, now=claimed.consumed_at + timedelta(days=1), daily_limit=2
+            ),
+            "第二天照常领得到，计数归零",
+        )
+
+    def test_a_caller_that_forgets_to_thread_the_count_resets_it_silently(self) -> None:
+        """**Issue #276 最容易踩的坑，直接钉住**：``save`` 每次都重建整份 payload，
+        新增的 ``refresh_consumed_count`` 不显式传入就会被清零——且不会有任何东西报错。
+
+        这里刻意**不传** ``refresh_consumed_count`` 来复现这个形状：同一天、同一个紧
+        上界（1）本该继续挡住第二次领取，但因为落盘时计数被悄悄清空，反而又能领到。
+        这不是本次改动想要的行为，而是证明"忘记串参数"这个坑真实存在、且必须靠调用方
+        （`credential_rotation.py`）显式传参堵住——生产代码那一侧的对应钉子在
+        ``tests/test_roster_access_token_supply.py`` 里对 ``vault.saved[...]
+        ["refresh_consumed_count"]`` 的断言。
+        """
+
+        self._save()  # 全新凭据，尚未消费过
+        claimed = self.vault.claim_due(for_supply=True, now=self.NOON)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.refresh_consumed_count, 1)
+
+        # 故意漏传 refresh_consumed_count。
         self.vault.save(
             subject_open_id=DELEGATED_SUBJECT,
             grant=AuthorizationGrant(SecretToken("fake-next-token"), 7 * 24 * 3600, "offline_access"),
@@ -583,25 +726,36 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
             refresh_consumed_at=claimed.consumed_at,
         )
 
-        from lingxi.core.identity.credentials import RefreshAlreadyConsumedToday
+        # 当日上界是 1、理应已经用满；但计数被上面那次 save() 悄悄清零，因此这里
+        # 反而领得到——这正是"字段没串进 save()"这个坑的可观察后果。
+        reclaimed = self.vault.claim_due(for_supply=True, now=claimed.consumed_at + timedelta(hours=1), daily_limit=1)
+        self.assertIsNotNone(reclaimed, "计数被悄悄清零，紧上界因此形同虚设")
 
-        with self.assertRaises(RefreshAlreadyConsumedToday) as raised:
-            self.vault.claim_due(for_supply=True)
-        self.assertEqual(raised.exception.consumed_at, claimed.consumed_at)
-        self.assertIsNotNone(
-            self.vault.claim_due(for_supply=True, now=claimed.consumed_at + timedelta(days=1)),
-            "第二天照常领得到",
-        )
+    def test_a_legacy_payload_without_the_count_field_is_treated_as_not_yet_consumed_today(self) -> None:
+        """向后兼容：不含 ``refresh_consumed_count`` 字段的旧凭据文件正常加载，且按
+        "当日尚未消费"处理（Issue #276 之前落盘的凭据、以及 ``biai-stage`` 上现存的
+        那一份真实凭据都是这个形状）。
+
+        ``refresh_consumed_at`` 特意设在间隔之外（1 小时前），只让"计数缺字段"这一个
+        维度参与判定，不与最小间隔混在一起。
+        """
+
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=None)
+
+        claimed = self.vault.claim_due(for_supply=True, now=self.NOON + timedelta(hours=1), daily_limit=1)
+
+        self.assertIsNotNone(claimed, "缺失的计数字段必须按 0 处理，不能把日上界误判为已达")
+        self.assertEqual(claimed.refresh_consumed_count, 1)
 
     def test_the_credential_file_still_carries_no_token_in_plaintext(self) -> None:
-        """`V-身份-03`：新增的判据是一个时刻，不是凭据；文件依然整体是密文。"""
+        """`V-身份-03`：新增的判据是时刻与计数，不是凭据；文件依然整体是密文。"""
 
-        moment = datetime.now(timezone.utc)
-        self._save(refresh_consumed_at=moment)
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=3)
 
         blob = self.path.read_bytes()
         self.assertNotIn(FAKE_TOKEN.encode(), blob)
         self.assertNotIn(b"refresh_consumed_at", blob)
+        self.assertNotIn(b"refresh_consumed_count", blob)
 
 
 class CredentialGenerationGuardTest(IdentityPostgresTestCase):
@@ -993,6 +1147,30 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
 
         self.assertEqual(self.store.lookup("ou_absent").members, ())
         self.assertEqual(self.store.lookup("ou_zha").members, ())
+
+    def test_has_complete_run_on_reflects_a_persisted_watermark(self) -> None:
+        """F8：当日水位必须能对进程重启保持——真库上验证 ``has_complete_run_on``
+        只认 ``started_at`` 落在查询那个 UTC 日历日、且状态是 ``complete`` 的批次。"""
+
+        today = datetime.now(timezone.utc)
+        self.assertFalse(self.store.has_complete_run_on(today.date()), "还没提交过任何批次")
+
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake", started_at=today)
+
+        self.assertTrue(self.store.has_complete_run_on(today.date()))
+        self.assertFalse(
+            self.store.has_complete_run_on((today - timedelta(days=1)).date()),
+            "只认真正落在那一天的批次，不能因为“有过完成批次”就对任何日期都返回真",
+        )
+
+    def test_has_complete_run_on_ignores_failed_runs(self) -> None:
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
+
+        self.assertFalse(
+            self.store.has_complete_run_on(datetime.now(timezone.utc).date()),
+            "失败批次不能让水位查询误判成“今天已经成功过一轮”",
+        )
 
 
 class AppUserRecordTest(IdentityPostgresTestCase):
@@ -1629,6 +1807,86 @@ class AppUserProvisioningContractTest(IdentityPostgresTestCase):
             (baseline[0].display_name, baseline[0].employee_no, baseline[0].email),
             ("张一", row["employee_no"], row["email"]),
         )
+
+
+class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
+    """开通状态推进：**只前进不回退**，且写 `active` 还要求账号此刻是启用的。
+
+    两条都写在 `WHERE` 里而不是先读后写（Epic D / S-D-02）：两条并发的开通链会读到
+    同一个旧状态，于是后到的那条能把 `active` 写回 `provisioning`——一个已经开通完的
+    用户因此重新变成「开通中」，问数被拒。而「先读账号状态、再写 active」之间的窗口，
+    后果是把一个刚被管理员停用的人标成「开通完成」。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+        candidate = member()
+        located = locate_by_open_id(candidate.open_id, (candidate,))
+        decision = decide_first_contact(
+            open_id=candidate.open_id,
+            location=located,
+            employment=EmploymentStatus(
+                is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+            ),
+            directory=DirectoryAvailability.AVAILABLE,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        assert decision.draft is not None
+        self.user_id = self.users.record_identity(decision.draft).id
+
+    def _state(self) -> str:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT provisioning_state FROM app_user WHERE id = %s", (self.user_id,))
+            return str(cursor.fetchone()[0])
+
+    def _suspend(self) -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET account_state = 'suspended' WHERE id = %s", (self.user_id,)
+            )
+
+    def test_the_chain_advances_step_by_step(self) -> None:
+        status = self.users.read_status(self.user_id)
+        assert status is not None
+        self.assertEqual((status.account_state, status.provisioning_state), ("enabled", "matching"))
+
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="mcp_syncing"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="active"))
+        self.assertEqual(self._state(), "active")
+
+    def test_it_never_goes_backwards(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="mcp_syncing"))
+        self.assertEqual(self._state(), "active", "`V-开通-04`：失败不得把状态打回去")
+
+    def test_a_suspended_account_is_never_written_active(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self._suspend()
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="active"))
+        self.assertEqual(self._state(), "mcp_syncing")
+
+    def test_a_suspended_account_can_still_be_read_back(self) -> None:
+        self._suspend()
+        status = self.users.read_status(self.user_id)
+
+        assert status is not None
+        self.assertEqual(status.account_state, "suspended")
+
+    def test_an_unknown_state_is_refused_instead_of_treated_as_first(self) -> None:
+        """拼错的状态名不能被当成「排在最前面」而把任何用户推成 active。"""
+
+        with self.assertRaises(ValueError):
+            self.users.advance_provisioning_state(self.user_id, to="actve")
+
+    def test_a_missing_user_reads_back_as_none(self) -> None:
+        self.assertIsNone(self.users.read_status("usr_does_not_exist"))
 
 
 class FirstContactThroughPostgresTest(IdentityPostgresTestCase):

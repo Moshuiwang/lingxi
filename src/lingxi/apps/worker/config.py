@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -125,6 +126,19 @@ class WorkerConfig:
     # ``$HOME/.claude/projects`` 推导默认根目录，见 apps/worker/session_cleanup.py。
     session_root: str | None = None
     session_cleanup_batch_limit: int = 20
+    # 用户环境根目录（Epic D 闸⑥）：queue 模式处理每个任务时，按任务的
+    # ``user_id`` 读 ``<user_env_root>/<user_id>/.mcp.json``，把解析结果作为这一
+    # 次会话专属的 ``mcp_servers``——见 ``apps/worker/service.py``。**不带
+    # ``LINGXI_WORKER_`` 前缀**：与 scheduler 侧
+    # （``apps/scheduler/config.py`` 的 ``user_env_root``）读同一个裸变量名
+    # ``LINGXI_USER_ENV_ROOT``，两个进程指向同一个持久卷挂载点，避免出现"两个
+    # 进程各自配了不同目录"的部署漂移。此处仍是**可选**字段（校验姿态照抄
+    # scheduler 侧 ``optional_identifier``）：`turn`（一次性受控回合）模式不需要
+    # 它；`queue` 模式下这是唯一真正会处理用户任务的路径，因此改由
+    # ``apps/worker/cli.py`` 在 ``queue`` 分支单独要求，缺失即启动失败
+    # （`EXIT_CONFIG_ERROR`），不是在这里强制必填——否则会连累不需要它的 `turn`
+    # 模式与直接构造 ``WorkerConfig`` 的测试/嵌入路径。
+    user_env_root: str | None = None
 
     def __post_init__(self) -> None:
         # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
@@ -140,8 +154,23 @@ class WorkerConfig:
         )
 
 
-def load_config(env: Mapping[str, str], *, require_question: bool = True) -> WorkerConfig:
-    """从环境变量构造配置。缺失或不合法时抛 :class:`WorkerConfigError`。"""
+def load_config(
+    env: Mapping[str, str], *, require_question: bool = True, queue_mode: bool = False
+) -> WorkerConfig:
+    """从环境变量构造配置。缺失或不合法时抛 :class:`WorkerConfigError`。
+
+    ``queue_mode``（外部独立审查 F3）：queue 模式处理真实用户任务时，
+    ``mcp_servers`` 已经改为按任务的 user_id 逐用户读取（Epic D 闸⑥，见
+    ``apps/worker/service.py``），``LINGXI_WORKER_MCP_SERVERS``（全进程共用配置）
+    只服务没有 user_id 概念的一次性受控回合（``turn`` 模式）。``queue_mode=True``
+    时**根本不调用** ``_mcp_servers(env)``——不只是"解析出来但不用"：
+    ①即使这个变量被配了非法 JSON，queue 进程也不会因为一个从不会被用到的
+    变量而拒绝启动；②合法值也不会被 ``json.loads`` 成 Python 对象、不会有
+    一份共享令牌以任何形式驻留在 queue 进程内存里。这比"解析出来、构造好
+    WorkerConfig 之后再也不读那个字段"更强：后者仍然会让配置错误的部署在
+    queue 模式下启动失败（明明这个模式根本不需要这个变量），也仍然会让令牌
+    进程内存里多留一份从未被读取过的副本。
+    """
 
     required_names = ("QUESTION", "READONLY_TOOL") if require_question else ("READONLY_TOOL",)
     missing = [name for name in required_names if not _text(env, name)]
@@ -160,7 +189,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         drain_grace_seconds=_drain_grace(_text(env, "DRAIN_GRACE_SECONDS")),
         audit_input_fields=_names(env, "AUDIT_INPUT_FIELDS"),
         failure_text_markers=_failure_markers(env),
-        mcp_servers=_mcp_servers(env),
+        mcp_servers=({} if queue_mode else _mcp_servers(env)),
         workspace=_text(env, "WORKSPACE"),
         model=_text(env, "MODEL"),
         system_prompt=system_prompt,
@@ -183,6 +212,7 @@ def load_config(env: Mapping[str, str], *, require_question: bool = True) -> Wor
         shutdown_timeout_seconds=_shutdown_timeout(_text(env, "SHUTDOWN_TIMEOUT_SECONDS")),
         session_root=_text(env, "SESSION_ROOT"),
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
+        user_env_root=_user_env_root(env),
     )
 
 
@@ -242,6 +272,38 @@ def _mcp_servers(env: Mapping[str, str]) -> Mapping[str, Any]:
     if not isinstance(parsed, dict):
         raise WorkerConfigError(f"{ENV_PREFIX}MCP_SERVERS 必须是 JSON 对象（服务名 → 配置）")
     return parsed
+
+
+def _user_env_root(env: Mapping[str, str]) -> str | None:
+    """读取裸变量 ``LINGXI_USER_ENV_ROOT``（不带 ``LINGXI_WORKER_`` 前缀）。
+
+    校验姿态照抄 ``apps/scheduler/config.py`` 的 ``optional_identifier``——可选、
+    去首尾空白、内部不得含空白字符（否则快速失败，且不回显取到的值）；两侧保持
+    同一条基线规则，是"同一份部署值给两个进程用"这件事本身的一部分。
+
+    在此之上（外部独立审查 F4）**额外要求绝对且已规范化的路径**：必须以 ``/``
+    开头，且 ``posixpath.normpath`` 归一化后与原值逐字节相同——用这一条筛掉
+    相对路径、``..`` 路径穿越分量、连续斜杠与多余的尾部斜杠。这个值随后会被
+    直接拼进每个用户的家目录路径（``<root>/<user_id>/.mcp.json``，见
+    ``adapters/user_mcp_config.py``），不接受任何"看起来像路径但形态不规范"的
+    写法——本模块只服务判定期的构造安全，真正的存在性与可读性核对留给
+    ``apps/worker/cli.py`` 的 queue 模式启动预检（读到这里就已经知道形态合法，
+    但还没碰过文件系统）。
+    """
+
+    value = (env.get("LINGXI_USER_ENV_ROOT") or "").strip()
+    if not value:
+        return None
+    if any(character.isspace() for character in value):
+        raise WorkerConfigError("环境变量 LINGXI_USER_ENV_ROOT 不得包含空白字符（不回显取到的值）")
+    if not value.startswith("/") or posixpath.normpath(value) != value:
+        # 不回显收到的值：形态错误的路径本身不敏感，但保持与本文件其它校验
+        # 同一条"误接进来的可能是别的东西"纪律，不因为这一条是路径就破例。
+        raise WorkerConfigError(
+            "环境变量 LINGXI_USER_ENV_ROOT 必须是绝对且已规范化的路径"
+            "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
+        )
+    return value
 
 
 def _external_texts(env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:

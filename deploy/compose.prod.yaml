@@ -28,6 +28,9 @@ services:
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
+      # 首次开通编排（S-D-02）在这里给每个用户建家目录、写各自的 .mcp.json
+      # （Epic D 闸⑤），理由见 compose.stage.yaml 同名 service 的注释。
+      - lingxi-users:/var/lib/lingxi/users
 
   gateway:
     env_file:

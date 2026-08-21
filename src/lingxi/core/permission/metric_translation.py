@@ -66,6 +66,31 @@ from typing import Any
 ALL_COMPANIES_KEY = "*"
 
 
+def metric_translation_available(
+    mapping: Mapping[str, Mapping[str, Sequence[str]]] | None,
+) -> bool:
+    """翻译层**整体**可用性判据：映射非空才可用（外部独立审查 2026-08-18 坐实的 P1）。
+
+    ``None``（尚未加载、或加载本身失败）与空映射（``{}``，产品负责人尚未填入内容时的
+    合法初始状态，见模块文档）在这一层是同一个结论——两者都意味着"这一轮一个组合都
+    翻译不出来"。
+
+    本函数是**唯一**允许存在的判据实现，被两个独立的写入点共用：
+
+    - :mod:`lingxi.apps.scheduler.permission_refresh`（每日权限重算，授权/撤权的
+      发布意图写入点）在 ``run_once`` 开头用它判定"这一轮要不要跑"；
+    - :mod:`lingxi.apps.scheduler.assembly`（首次开通编排，``record_decision`` 的
+      第三个调用点）用它判定 ``publish_allowed``。
+
+    两处各自维护一份看起来等价的检查，迟早会漂移——而漂移的方向是错误发布（例如
+    重算侧还在等内容、开通侧已经在往外发）。因此调用方一律传入**同一个已加载对象**、
+    调用**这同一个函数**，装配层（:func:`~lingxi.apps.scheduler.assembly.build_loop`）
+    只加载一次映射文件。
+    """
+
+    return bool(mapping)
+
+
 class UncoveredPermissionCombination(ValueError):
     """存在未被翻译映射覆盖的「公司 + 职能」组合：fail-closed，不猜、不丢弃。
 
@@ -220,5 +245,6 @@ __all__ = [
     "ALL_COMPANIES_KEY",
     "UncoveredPermissionCombination",
     "build_company_function_metric_map",
+    "metric_translation_available",
     "translate_company_functions",
 ]

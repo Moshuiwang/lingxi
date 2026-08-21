@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,6 +22,7 @@ from lingxi.core.identity.access_token_supply import (
 )
 from lingxi.core.identity.roster_snapshot import DailyRosterSource, RosterSnapshotUpdater
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
+from lingxi.core.permission.metric_translation import metric_translation_available
 from lingxi.core.permission.table_access_token_supply import (
     PermissionTableAccessTokenProvider,
 )
@@ -39,7 +40,11 @@ from lingxi.apps.scheduler.retention import (
     PermissionRetentionSweepDuty,
     RetentionCleanupDuty,
 )
-from lingxi.apps.scheduler.roster_audit import RosterAuditDuty, _log_snapshot_alert
+from lingxi.apps.scheduler.roster_audit import (
+    RosterAuditDuty,
+    RosterSnapshotSyncDuty,
+    _log_snapshot_alert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,13 +137,92 @@ def _build_roster_audit_duty(
     )
 
 
+def _build_roster_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    roster_access_token: Callable[[], str] | None,
+) -> RosterSnapshotSyncDuty | None:
+    """装配花名册快照写入职责（写侧，Issue #275）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    **只有两个前置——花名册 Base 坐标（`app_token`/`table_id`）与读取令牌供给，
+    刻意不含管理群 chat_id**：`roster_snapshot` 表是首次开通链第二步
+    （`core/identity/onboarding_runner.py::_match`）与每日权限重算的共同数据前提，
+    两者都直接读这张表，从不经过管理群那条通知链路。`_build_roster_audit_duty`
+    此前把三者捆在同一道门后面，导致"日报发到哪个群"这个纯通知配置决定"员工能不能
+    被开通"——2026-08-21 首触冒烟实测坐实了这个缺口（Issue #275）。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报
+    变量名、审计恰一条、其余职责照常运行），但**审计动作前缀改成
+    `roster_snapshot_sync.`**——与 `roster_audit.duty_not_registered` 保持可分辨
+    （约束：「没配管理群所以不发日报」与「花名册没接线所以不写快照」必须是两条不同的
+    审计原因码）。
+
+    **调用方（`build_loop`）只在 `_build_roster_audit_duty` 返回 `None` 时才会调用
+    本函数**：两个职责互斥注册，避免管理群与 Base 坐标都齐全时同时跑出两条各自独立
+    的 `DailyRosterSource`，让"今天到底读了几次花名册"失去唯一性（见
+    :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 文档字符串
+    与 `build_loop` 调用点的注释）。
+    """
+
+    for variable, value in (
+        ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
+        ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
+    ):
+        if not value:
+            audit.record(
+                "roster_snapshot_sync.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，花名册快照写入职责不注册；其余定时职责照常运行", variable)
+            return None
+    if roster_access_token is None:
+        # 同 `_build_roster_audit_duty` 的同一条纪律：这条分支现在的含义是"调用方
+        # 真的没有交出任何供给"，不是"这条链还没接线"（Issue #215 之后 `build_loop`
+        # 总会建出一条默认供给）；"配了但拿不到令牌"不走这条分支，职责照常注册，
+        # 失败发生在运行期并按分类审计。
+        audit.record("roster_snapshot_sync.duty_not_registered", reason="missing_access_token_supply")
+        logger.warning("调用方未提供花名册读取令牌供给，花名册快照写入职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_roster_bitable import BitableRosterPages, read_roster_snapshot
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    pages = BitableRosterPages(
+        base_url=config.feishu_base_url,
+        app_token=config.roster_app_token,
+        table_id=config.roster_table_id,
+        access_token=roster_access_token,
+    )
+    store = PostgresRosterSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    roster_source = DailyRosterSource(
+        read_round=lambda: read_roster_snapshot(pages),
+        updater=RosterSnapshotUpdater(store=store, audit=audit, on_alert=_log_snapshot_alert),
+        load_snapshot=store.load,
+        stale_after=config.roster_snapshot_stale_after,
+    )
+    return RosterSnapshotSyncDuty(roster_source=roster_source, stop=stop)
+
+
 def _build_permission_refresh_duty(
     config: SchedulerConfig,
     *,
     stop: threading.Event,
     audit: AuditSink,
-) -> PermissionRefreshDuty | None:
-    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
+) -> tuple[
+    PermissionRefreshDuty | None,
+    Mapping[str, Mapping[str, Sequence[str]]] | None,
+]:
+    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计。
+
+    返回 ``(duty, metric_translation_map)``：第二个元素是本函数**唯一一次**读取
+    ``lingxi/config/company_function_metric_map.toml`` 得到的对象（前置不齐、连
+    读取都没发生时是 ``None``）。``build_loop`` 把它原样转给
+    :func:`_build_onboarding_duty` 构造 ``publish_allowed``——**同一个已加载对象**，
+    不在开通侧另开一次文件 I/O（见 Issue #227 开通侧整合的取舍说明，
+    ``build_loop`` 内注入点上方的注释）。
 
     形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
     审计恰一条、其余职责照常运行）。前置有三个，逐个说明为什么它是真前置：
@@ -182,7 +266,7 @@ def _build_permission_refresh_duty(
         logger.warning(
             "未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV
         )
-        return None
+        return None, None
 
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
@@ -207,7 +291,7 @@ def _build_permission_refresh_duty(
         logger.error(
             "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
         )
-        return None
+        return None, None
 
     try:
         metric_translation_map = load_company_function_metric_map()
@@ -223,12 +307,12 @@ def _build_permission_refresh_duty(
             "公司+职能→指标名翻译映射配置不可用，每日权限重算职责不注册 error=%s",
             type(error).__name__,
         )
-        return None
+        return None, None
 
     publish_store = PostgresPermissionPublishStore(
         config.postgres_dsn, timeouts=config.postgres_timeouts
     )
-    return PermissionRefreshDuty(
+    duty = PermissionRefreshDuty(
         baseline_reader=PostgresRosterBaselineReader(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
@@ -250,6 +334,7 @@ def _build_permission_refresh_duty(
         audit=audit,
         stop=stop,
     )
+    return duty, metric_translation_map
 
 
 def _build_permission_retention_duty(
@@ -276,8 +361,12 @@ def _build_permission_retention_duty(
     这条取舍的产品后果是可接受的、也已写明：``mcp_sync_check`` **没有可识别内容列**，
     到期不删的后果是一张只含内部 ULID 与结论码的表继续变长；而真正含邮箱与姓名的
     ``publish_outbox.payload`` 一轮都不会少擦。
+
+    **``onboarding_completion_notice``（V-开通-18，迁移 ``0066``）与 ``publish_outbox``
+    同一面**：只需要数据库连接串，没有可选前置，因此无条件装配。
     """
 
+    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 
     checks: Any = None
@@ -309,6 +398,11 @@ def _build_permission_retention_duty(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
         checks=checks,
+        # onboarding_completion_notice（迁移 0066，V-开通-18）同样没有可选前置——
+        # 只需要数据库连接串，因此这一面与 publish_outbox 那一面同样无条件装配。
+        notices=PostgresLateReadinessStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
         audit=audit,
         stop=stop,
     )
@@ -421,6 +515,489 @@ def _build_readiness_follow_up(
             # （同 `CredentialRotationLoop._save_with_retry`）。
             sleep=stop.wait,
         ),
+    )
+
+
+def _build_onboarding_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    employment_access_token: Callable[[], str] | None,
+    metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
+    permission_publish: PermissionPublishDuty | None,
+) -> Any | None:
+    """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    形状照 :func:`_build_permission_refresh_duty`。缺项时返回 ``None``，于是**没有任何人
+    认领** ``auto_provisioning`` 事件——它们原样留在 ``inbound_event`` 里等配置齐了再跑。
+    这比装一个失败关闭桩安全：桩会「认领即平账」，把事件永久烧掉。
+
+    **装配不变量（外部集成面审查坐实的 F1）**：``onboarding != None ⇒ permission_publish
+    != None 且 permission_publish.publish_wired``。首次开通链最终会把一条发布意图排进
+    ``publish_outbox``（``AutoOnboardingRunner`` 经 ``publish_allowed`` 闸），但真正把
+    那条意图从 outbox 写进外部权限表、推进就绪确认的执行者是权限发布消费职责的**发布面**
+    （:func:`_build_permission_publish_duty` 里的 ``PermissionPublishExecutor``）。那一面
+    如果因为**它自己的**前置不齐而没有装配，开通排出的每一条发布意图此后**没有任何职责
+    会再看它一眼**——迟到就绪恢复职责（V-开通-18）救不了，它只能确认"已经进入就绪等待"
+    的用户，替代不了缺失的发布执行者。不挡在这里的话，失败关闭会发生在"已经认领、已经
+    建档、已经建了用户环境"之后，用户表现成"接受了开通却永远走不到可用"，还可能留下
+    需要人工收拾的半开记录。
+
+    **判据是 ``publish_wired``，不是 ``is not None``**（冻结候选审查 2026-08-21 的 F1，
+    由产品负责人当天第二次真实开通失败 ``publish_not_completed`` 坐实）：
+    :func:`_build_permission_publish_duty` 在缺 ``LINGXI_PERMISSION_BITABLE_APP_TOKEN``
+    或 ``LINGXI_PERMISSION_BITABLE_TABLE_ID`` 而就绪面装得起来时，**照常返回一个
+    ``executor=None`` 的"仅就绪"职责**（那是它自己刻意的设计：已经发布出去的权限还等着
+    被确认、被通知，没有理由因为暂时写不了新的一行就把它们一起停掉）。``is not None``
+    这条旧判据会把那个只剩半面的职责当成"发布执行者在"而放行开通，于是用户被认领、
+    被建档、发布意图被排进 outbox，而 outbox 那一侧根本没有执行者——正是上面描述的
+    半开形状。反过来，``is None`` 这一支在可达配置下几乎不成立：两面都装不起来才返回
+    ``None``，而那需要连 MCP 主密钥都缺，那本来就是开通编排自己的前置。两个分支都保留，
+    各留一条**可分辨**的审计原因码（``permission_publish_not_assembled`` /
+    ``permission_publish_not_wired``），排障时一眼看出该去补哪一组配置。
+
+    因此这里**在认领任何用户之前**校验调用方（``build_loop``）已经装配好的
+    ``permission_publish`` 对象本身，而不是重新判断"两者前置是否恰好相同"——即使两者
+    前置未来分道扬镳，这条依赖仍然成立；这也是**不能只依赖** ``PermissionPublishDuty.
+    _publish()`` 内部 ``publish_allowed`` 闸的原因：那道闸在**认领之后**才会被摸到，
+    这里要挡的是认领本身。
+
+    ``employment_access_token`` 是在职状态实时回读所用的**专用授权主体派生令牌**供给。
+    它就是这次搬迁的**唯一理由**：那条一次性 ``refresh_token`` 全系统只允许一个消费者，
+    而它已经在本进程里（``CredentialRotationLoop.refresh_for_supply`` +
+    ``DerivedAccessTokenHolder``，#215 的形状）。**这里不新建供给**，只消费传进来的那一个。
+
+    ``metric_translation_map`` 是「公司+职能→指标名」翻译映射（Issue #227），供构造
+    ``publish_allowed`` 用——**不是**新的文件读取点，而是 :func:`_build_permission_refresh_duty`
+    已经加载过的**同一个对象**（``None`` 代表那一次加载没有发生或失败，与空映射
+    同一个结论：不可用）。调用方（``build_loop``）负责只加载一次、原样转发。
+    """
+
+    if permission_publish is None or not permission_publish.publish_wired:
+        # 恰一条审计：只报「发布执行者不在」这个结构性原因，不夹带 `permission_publish`
+        # 自己那一层的原因（那一层已经在自己的装配点留过审计：`permission_publish.
+        # duty_not_registered` 或 `permission_publish.publish_not_wired`）——两条审计
+        # 合起来才是完整的因果链，各自只认领自己那一段。两个分支的原因码**可分辨**：
+        # 「整个职责没装配」要去补 MCP 那一组配置，「只有发布面没装配」要去补权限表
+        # Base 坐标。
+        reason = (
+            "permission_publish_not_assembled"
+            if permission_publish is None
+            else "permission_publish_not_wired"
+        )
+        audit.record("onboarding.duty_not_registered", reason=reason)
+        logger.warning(
+            "权限发布执行者不可用（%s），首次开通编排不注册（开通排出的发布意图不会有任何"
+            "职责消费）；未开通用户的首聊事件原样留在库里等待配置齐备，其余定时职责照常运行",
+            reason,
+        )
+        return None
+
+    from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+    unwired: tuple[str, str] | None = None
+    for variable, value in (
+        (MASTER_KEY_ENV, config.mcp_token_encrypt_key),
+        ("LINGXI_QUERY_MCP_ENDPOINT", config.query_mcp_endpoint),
+        ("LINGXI_USER_ENV_ROOT", config.user_env_root),
+    ):
+        if not value:
+            unwired = ("missing_environment_variable", variable)
+            break
+    if unwired is None and employment_access_token is None:
+        # 在职状态是**产品合同的硬门槛**（`V-开通-07`：非在职不建档、不发权限），
+        # 没有它就没有合法的开通判定，不能"先跳过这一步"。
+        unwired = ("employment_access_token_unwired", "")
+    if unwired is not None:
+        reason, variable = unwired
+        facts: dict[str, str] = {"reason": reason}
+        if variable:
+            facts["variable"] = variable
+        audit.record("onboarding.duty_not_registered", **facts)
+        logger.warning(
+            "首次开通编排未装配（%s%s）；未开通用户的首聊事件原样留在库里等待配置齐备，"
+            "其余定时职责照常运行",
+            reason,
+            f"：{variable}" if variable else "",
+        )
+        return None
+
+    from lingxi.adapters.delegated_credentials import registered_delegated_subject_open_id
+    from lingxi.adapters.feishu_directory import FeishuDirectoryClient, FeishuEmploymentReader
+    from lingxi.adapters.feishu_user_message import FeishuUserMessages
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
+    from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+    from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
+    from lingxi.adapters.role_function_map_file import load_role_function_map
+    from lingxi.adapters.user_environment import LocalUserEnvironment, UserEnvironmentError
+    from lingxi.apps.scheduler.onboarding import (
+        DISPATCH_AFTER,
+        CatalogNotifier,
+        HardDeadlineProbe,
+        OnboardingExecutor,
+        RosterRows,
+        assert_claim_limit_follows_capacity,
+        assert_probe_timeouts_agree,
+        monotonic_utc_clock,
+        PROBE_WATCHDOG_MARGIN_SECONDS,
+    )
+    from lingxi.config.content import default_content_catalog
+    from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
+    from lingxi.core.identity.onboarding_runner import AutoOnboardingRunner
+    from lingxi.core.permission.mcp_readiness import McpReadinessConfirmation
+
+    try:
+        role_function_map = load_role_function_map()
+    except (OSError, ValueError) as error:
+        # 只记异常类型：配置解析失败的正文可能带上文件内容片段。读不出来时**不能**退化成
+        # 空映射——那会让所有角色变成"未映射"，于是每个人都被算成无可用权限。
+        audit.record(
+            "onboarding.duty_not_registered",
+            reason="role_function_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error("角色职能映射配置不可用，首次开通编排不注册 error=%s", type(error).__name__)
+        return None
+
+    dsn = config.postgres_dsn
+    timeouts = config.postgres_timeouts
+    clock = monotonic_utc_clock()
+    should_stop = stop.is_set
+
+    tokens = PostgresMcpTokenStore(
+        dsn, cipher=McpTokenCipher(config.mcp_token_encrypt_key), timeouts=timeouts
+    )
+    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
+    probe = QueryMcpProbe(
+        endpoint=config.query_mcp_endpoint,
+        token_provider=token_cipher_provider(tokens),
+        timeout_seconds=config.query_mcp_timeout_seconds,
+        # 已验证的 reader（Issue #253 / L4a），同 ``_build_readiness_follow_up`` 那一份：
+        # 真实问数 MCP 的 ``list_metrics`` 返回没有 ``structuredContent``，指标挂在
+        # ``result.content[0].text`` 的一段 JSON 字符串里。这里此前遗漏了这一处注入
+        # （只有刷新链那一侧在 #253 修复时接上），后果是首次开通那次阻塞式确认在真实
+        # MCP 上永远技术失败、每个人都会走满十五分钟同步超时——与 #253 提交说明里描述
+        # 的症状（"每个用户走满 15 分钟同步超时也拿不到开通完成"）完全一致，只是那次
+        # 修复没有覆盖到这个调用点。本次随 V-开通-18 的恢复路径一并补上：不补的话，
+        # 恢复职责会成为整条链上**唯一**能探到真实就绪的地方，首次开通自己的那一轮
+        # 阻塞确认形同虚设。
+        metrics_reader=content_text_metrics_reader,
+    )
+    assert_probe_timeouts_agree(probe=probe, schedule=schedule)
+    guarded_probe = HardDeadlineProbe(
+        probe=probe,
+        timeout_seconds=schedule.probe_timeout_seconds + PROBE_WATCHDOG_MARGIN_SECONDS,
+    )
+
+    environment = LocalUserEnvironment(
+        root=config.user_env_root, mcp_endpoint=config.query_mcp_endpoint
+    )
+    # **启动期全量清扫**：被 ``SIGKILL`` 留下的写入临时文件里有明文令牌，而目录内清扫只在
+    # 「那个用户下一次再走开通」时发生——一个不再重试的用户意味着**没有时间上界**。在这里
+    # 跑一次把上界压到「至多一个进程生命周期」。扫不动就**不注册本职责**：那意味着我们管
+    # 不了这个目录，而它接下来正要接收明文凭据。
+    try:
+        environment.sweep_all()
+    except UserEnvironmentError as error:
+        audit.record(
+            "onboarding.duty_not_registered",
+            reason="user_environment_sweep_failed",
+            error=error.code,
+        )
+        logger.error("用户环境启动期清扫失败，首次开通编排不注册 code=%s", error.code)
+        return None
+
+    store = PostgresGatewayStore(dsn, timeouts=timeouts)
+    executor = OnboardingExecutor(workers=config.onboarding_workers, should_stop=should_stop)
+    runner = AutoOnboardingRunner(
+        directory=PostgresOrgSnapshotStore(dsn, timeouts=timeouts),
+        employment=FeishuEmploymentReader(
+            client=FeishuDirectoryClient(base_url=config.feishu_base_url),
+            access_token=employment_access_token,
+        ),
+        roster=RosterRows(PostgresRosterSnapshotStore(dsn, timeouts=timeouts)),
+        galaxy=PostgresGalaxySnapshotReader(dsn, timeouts=timeouts),
+        provisioning=PostgresAppUserStore(dsn, timeouts=timeouts),
+        users=PostgresAppUserStore(dsn, timeouts=timeouts),
+        environment=environment,
+        tokens=tokens,
+        decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
+        readiness=McpReadinessConfirmation(
+            probe=guarded_probe,
+            store=tokens,
+            audit=audit,
+            clock=clock,
+            # 阻塞式确认真的会等三分钟，但它跑在开通执行器**自己的**线程上，不挡住
+            # SchedulerLoop 的任何一轮 tick。用 `stop.wait` 而不是 `time.sleep`：
+            # SIGTERM 能立刻打断等待（同 `PermissionNoticeDispatcher`）。
+            sleep=stop.wait,
+            schedule=schedule,
+        ),
+        notifier=CatalogNotifier(
+            sender=FeishuUserMessages(
+                base_url=config.feishu_base_url,
+                app_id=config.feishu_app_id,
+                app_secret=config.feishu_app_secret,
+            ),
+            catalog=default_content_catalog(),
+        ),
+        ledger=store,
+        audit=audit,
+        role_function_map=role_function_map,
+        # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
+        # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
+        delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
+        submit=executor.submit,
+        sleep=stop.wait,
+        clock=clock,
+        should_stop=should_stop,
+        publish_wait_seconds=config.onboarding_publish_wait_seconds,
+        # ------------------------------------------------------------------
+        # **发布闸门（Issue #227 开通侧整合）。**
+        # ------------------------------------------------------------------
+        # 「职能标签 → 指标名」的翻译层判据是「翻译映射整体为空时，本轮一条发布意图
+        # 都不排，撤权也不例外」（见 ``permission_refresh`` 模块文档「翻译」一节，
+        # 外部独立审查 2026-08-18 坐实的 P1）。本编排是 ``record_decision`` 的**第三个**
+        # 调用点（前两个是每日重算的授权与撤权），因此必须自己带同一道闸，否则它就是
+        # 那条判据的绕行入口，而绕过去的后果是往正式权限表写一行消费方读不懂的记录
+        # ——外部表不可回滚。
+        #
+        # 判据实现是 :func:`~lingxi.core.permission.metric_translation.
+        # metric_translation_available`——两个独立写入点共用的**唯一**一份；
+        # ``metric_translation_map`` 是**同一个已加载对象**：``build_loop`` 只调用
+        # :func:`_build_permission_refresh_duty` 读取一次
+        # ``lingxi/config/company_function_metric_map.toml``，本函数收到的是那次读取
+        # 的返回值，不在这里另读一份文件、不另做一次解析（两份来源迟早会漂移，而漂移
+        # 的方向是错误发布）。**不碰 ``core``**：``AutoOnboardingRunner`` 只认一个
+        # ``Callable[[], bool]``，判据属装配层。
+        #
+        # 变异锚点见 ``tests/test_onboarding_runner.PublishGateTests``：把这一行改回
+        # ``lambda: True`` 必须让它变红；映射为空时，一个身份与权限都正常的用户走完
+        # ``_match`` 后必须停在 ``permission_translation_unavailable``（用户看到
+        # ``LX-ONBOARD-001``，已转交管理员，**不是**「没有银河权限」——后者会把一个
+        # 权限完全正常的人引去银河申请一个他已经有的权限），**且 ``publish_outbox``
+        # 零新增行、``app_user`` 零新增行**；映射非空时同一个用户照常推进到发布等待。
+        publish_allowed=lambda: metric_translation_available(metric_translation_map),
+    )
+    duty = OnboardingReconciler(
+        store=store,
+        onboarding=runner,
+        audit=audit,
+        stale_after=DISPATCH_AFTER,
+        # 本进程的 SchedulerLoop 已经按 `interval_seconds` 定速，认领循环不再自限——
+        # 自限会把「首次开通最多等一个扫描周期」这句承诺变成「一个扫描周期或一分钟，
+        # 取大的那个」。
+        min_interval_seconds=0.0,
+        should_stop=should_stop,
+        capacity=executor.free_slots,
+    )
+    assert_claim_limit_follows_capacity(duty, executor)
+    executor.start()
+    logger.info(
+        "首次开通编排已装配 线程数=%s 队列深度=%s 认领窗口=%s 就绪节奏=0/%s/%s",
+        config.onboarding_workers,
+        config.onboarding_workers * 2,
+        DISPATCH_AFTER,
+        schedule.interval_seconds,
+        schedule.budget_seconds,
+    )
+    return duty
+
+
+def _build_late_readiness_recovery_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> Any:
+    """装配迟到就绪恢复职责（V-开通-18）。**不需要任何可选前置就能注册。**
+
+    补的是 ``core/identity/onboarding_runner.py`` 模块文档「一条链失败中断时」一节
+    登记的缺口：首次开通那次阻塞式就绪确认判超时之后，``provisioning_state`` 停在
+    ``mcp_syncing``，此前没有任何东西会再回来看这个人。语义、放在哪、节奏怎么定、
+    要试到什么时候为止，见 :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的
+    模块文档；本函数只做装配。
+
+    形状照 :func:`_build_readiness_follow_up`，但比它宽松一格：候选查询、原子推进
+    （:class:`~lingxi.adapters.postgres_late_readiness_recovery.
+    PostgresLateReadinessStore`）与通知（:class:`~lingxi.apps.scheduler.onboarding.
+    CatalogNotifier`）都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用凭据——两者都是
+    :class:`SchedulerConfig` 的必填项，因此本职责**总能**注册。**唯一可选的是探针面**：
+    缺 MCP 令牌主密钥或问数 MCP 端点时，需要真探针才能推进的那一路本轮不推进，只把这
+    **恰一条**审计记下来（:class:`~lingxi.apps.scheduler.late_readiness_recovery._Ticker`
+    的文档）；通知面（认领已经排出的待发通知并重试直到送达）不依赖探针，照常运行。
+    """
+
+    from lingxi.adapters.feishu_user_message import FeishuUserMessages
+    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.apps.scheduler.late_readiness_recovery import LateReadinessRecoveryDuty
+    from lingxi.apps.scheduler.onboarding import CatalogNotifier
+    from lingxi.config.content import default_content_catalog
+    from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON
+
+    dsn = config.postgres_dsn
+    timeouts = config.postgres_timeouts
+    store = PostgresLateReadinessStore(dsn, timeouts=timeouts)
+    # 通知收件人查询是既有的只读方法，住在权限发布那份存取里
+    # （``notice_recipient_open_id``，与刷新链的变化通知共用同一条产品口径）。
+    recipients = PostgresPermissionPublishStore(dsn, timeouts=timeouts)
+
+    ticker = None
+    if not config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
+        audit.record(
+            "late_readiness_recovery.probe_not_wired",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，迟到就绪恢复的探针面不装配；候选留在库里等配置齐备，"
+            "已经排出但还没送达的通知照常持久重试",
+            MASTER_KEY_ENV,
+        )
+    elif not config.query_mcp_endpoint:
+        audit.record(
+            "late_readiness_recovery.probe_not_wired",
+            reason="missing_environment_variable",
+            variable="LINGXI_QUERY_MCP_ENDPOINT",
+        )
+        logger.warning(
+            "未配置 LINGXI_QUERY_MCP_ENDPOINT，迟到就绪恢复的探针面不装配；"
+            "候选留在库里等端点配好，已经排出但还没送达的通知照常持久重试"
+        )
+    else:
+        from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+        from lingxi.adapters.postgres_mcp_token import (
+            PostgresMcpTokenStore,
+            token_cipher_provider,
+        )
+        from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
+        from lingxi.apps.scheduler.onboarding import assert_probe_timeouts_agree
+        from lingxi.core.permission.mcp_readiness import ReadinessRecoveryTicker
+
+        tokens = PostgresMcpTokenStore(
+            dsn, cipher=McpTokenCipher(config.mcp_token_encrypt_key), timeouts=timeouts
+        )
+        schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
+        probe = QueryMcpProbe(
+            endpoint=config.query_mcp_endpoint,
+            token_provider=token_cipher_provider(tokens),
+            timeout_seconds=config.query_mcp_timeout_seconds,
+            # 已验证的 reader（Issue #253 / L4a），同 ``_build_readiness_follow_up`` 与
+            # 本文件修复过的 ``_build_onboarding_duty`` 那两份。
+            metrics_reader=content_text_metrics_reader,
+        )
+        assert_probe_timeouts_agree(probe=probe, schedule=schedule)
+        ticker = ReadinessRecoveryTicker(
+            probe=probe,
+            store=tokens,
+            audit=audit,
+            clock=lambda: datetime.now(timezone.utc),
+            schedule=schedule,
+        )
+
+    duty = LateReadinessRecoveryDuty(
+        candidates=store,
+        ticker=ticker,
+        activator=store,
+        notices=store,
+        recipients=recipients,
+        notifier=CatalogNotifier(
+            sender=FeishuUserMessages(
+                base_url=config.feishu_base_url,
+                app_id=config.feishu_app_id,
+                app_secret=config.feishu_app_secret,
+            ),
+            catalog=default_content_catalog(),
+        ),
+        audit=audit,
+        reason=FIRST_ONBOARDING_REASON,
+        stop=stop,
+    )
+    logger.info(
+        "迟到就绪恢复职责已装配 探针面=%s", "已接线" if ticker is not None else "未接线"
+    )
+    return duty
+
+
+def _build_org_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    user_access_token: Callable[[], str] | None,
+    app_access_token: Callable[[], str] | None,
+) -> Any | None:
+    """装配组织快照同步职责（Issue #250）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    形状照 :func:`_build_onboarding_duty`：两个令牌供给都是调用方必须交出的前置，
+    ``None`` 表示调用方真的没有交出任何供给（"未接线"）——正式装配路径
+    ``build_loop`` 总会建出两条（花名册/开通那条用户身份供给自 Issue #215 起是
+    默认值，权限发布表那条应用身份供给自 Issue #226 起也是默认值），因此这两条
+    分支正常不会在生产触发。**"配了但拿不到令牌"不走这里**：那时职责照常注册，
+    失败发生在 ``run_once`` 内部并按分类审计（``org_snapshot_sync.read_failed``），
+    两者必须可分辨——把运行期的授权失败记成"未注册"会让排障去找配置，反过来会让
+    "还没接线"看起来像"接线了但一直失败"（`V-花名册-29` 的同一条纪律，R3 的原始
+    教训）。
+    """
+
+    if user_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="user_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照用户身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+    if app_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="app_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照应用身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+
+    from lingxi.adapters.feishu_directory import FeishuDirectoryClient
+    from lingxi.adapters.feishu_org_snapshot_reader import read_org_snapshot
+    from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+    from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty, TokenSupplyFailure
+
+    client = FeishuDirectoryClient(base_url=config.feishu_base_url)
+
+    def read_snapshot() -> Any:
+        # 令牌各解析一次、用于本轮**整趟**递归遍历（数百次分页请求，Issue #250
+        # 编排者 2026-08-19 实测规模），不逐次请求都重新取——两条供给都会在有效期内
+        # 直接返回缓存值，这里只是不给每一次分页调用都加一次令牌新鲜度判定的开销。
+        #
+        # 两个供给分别包一层 `TokenSupplyFailure`（Issue #250 编排者复查 F6）：不这样
+        # 做的话，应用令牌、用户令牌、真实扫描三种失败在 `run_once` 的
+        # `org_snapshot_sync.read_failed` 审计里全都只剩 `error=<异常类型>`，分辨不出
+        # 该去查哪一条。只重分类、不改变失败语义——原始异常仍通过 `from error` 保留
+        # 因果链，只是审计只读安全的 `supply` 标签。
+        try:
+            app_token = app_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("app_access_token") from error
+        try:
+            user_token = user_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("user_access_token") from error
+        return read_org_snapshot(client=client, app_token=app_token, user_token=user_token)
+
+    return OrgSnapshotSyncDuty(
+        read_snapshot=read_snapshot,
+        store=PostgresOrgSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        audit=audit,
+        source_app_id=config.feishu_app_id,
+        stop=stop,
     )
 
 
@@ -554,8 +1131,9 @@ def build_loop(
     不会因为清理迟到而后移（断言 V-保留-16），空闲会话清理本身也是幂等的。审计日报与每日
     权限重算排在三类清理之后：它们一天只做一次事，晚一轮毫无影响；而这两个之间的先后
     **不是随意的**——权限重算要用今天那份花名册快照，而换快照的是审计日报那一轮
-    （`V-权限-07`）。告警职责注册在**最后**（基线既有形状）：它汇总本轮观察到的信号，
-    排在被观察者后面才看得到这一轮的事实。
+    （`V-权限-07`）。组织快照同步（Issue #250）排在权限发布消费之后、首次开通编排之前，
+    理由见 ``_build_org_snapshot_sync_duty`` 调用点上方的注释。告警职责注册在**最后**
+    （基线既有形状）：它汇总本轮观察到的信号，排在被观察者后面才看得到这一轮的事实。
 
     ``roster_access_token`` 是花名册读取所用的**短期令牌供给**（返回已就绪令牌的可调用
     对象）。**默认不再是 ``None``**：Issue #215 主接线之后，这里建出一条进程内供给——
@@ -565,9 +1143,13 @@ def build_loop(
     消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
 
     参数保留是为了让调用方（主要是测试）**替换**供给；``None`` 现在的含义是"用装配好的
-    那条"，而不是"没有供给"。进程内持有者与频率上界都建在这里，**每个进程一份**：它们是
-    "这个进程今天换过没有"的账本，跨进程共享会让上界失去意义；而重启也抹不掉的那道上界
-    在凭据文件里（``refresh_consumed_at``）。
+    那条"，而不是"没有供给"。这里建的**只有进程内持有者**（``DerivedAccessTokenHolder``，
+    每个进程一份、不落盘、重启即空，装的是派生出来的短期令牌）。**频率上界不在这里，
+    也没有第二份进程内副本**：它唯一的判据是凭据文件里的 ``refresh_consumed_at`` /
+    ``refresh_consumed_count``，由 :meth:`~lingxi.adapters.delegated_credentials.
+    HostFileDelegatedCredentialVault.claim_due` 在文件锁内判定（见该方法 docstring 与
+    ``delegated_credentials.py`` 里"这是**唯一**的频率上界"那一条）——进程内副本认不出
+    凭据代际，会在人工重授权之后继续拿旧账本拒绝一条全新的凭据。
 
     ``permission_table_access_token`` 是**权限发布表**读写所用的短期令牌供给。
     **默认不再是 ``None``**：产品负责人 2026-08-18 就 #226 裁定方向 3——用**应用身份**
@@ -642,7 +1224,8 @@ def build_loop(
 
     duties: list[Any] = [rotation, cleanup, idle_sweep, permission_retention]
     # 令牌供给：日报侧要令牌 → 持有者里有新鲜的就直接给，没有就让**凭据轮换职责**
-    # 按需换一次（每 UTC 日至多一次）。日报自己不碰一次性 refresh_token。
+    # 按需换一次（受最小间隔 + 每日上界双重保护，Issue #276）。日报自己不碰一次性
+    # refresh_token。
     supply = (
         roster_access_token
         if roster_access_token is not None
@@ -661,10 +1244,31 @@ def build_loop(
     )
     if roster_audit is not None:
         duties.append(roster_audit)
-    # 每日权限重算排在花名册审计**之后**：同一轮里花名册快照先被换成今天的那一份，
+    else:
+        # 报告职责没装配——不管原因是管理群没配、Base 坐标没配还是令牌供给没配，
+        # `_build_roster_audit_duty` 已经留下自己的 `roster_audit.*` 审计。花名册
+        # 快照写入与管理群报告解耦（Issue #275）：这里独立判定"只写不发"的快照同步
+        # 职责能不能装配——只要它自己的前提（Base 坐标 + 令牌供给）满足，快照就该
+        # 被写，不因为管理群这个纯通知配置项一起停摆。两者互斥注册（同一时刻至多一个
+        # 在触发花名册读取），见 `_build_roster_snapshot_sync_duty` 文档字符串。
+        roster_snapshot_sync = _build_roster_snapshot_sync_duty(
+            config, stop=stop, audit=sink, roster_access_token=supply
+        )
+        if roster_snapshot_sync is not None:
+            duties.append(roster_snapshot_sync)
+    # 每日权限重算排在花名册审计（或与它互斥的快照写入）**之后**：同一轮里花名册快照先被换成今天的那一份，
     # 重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。
     # 位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
-    permission_refresh = _build_permission_refresh_duty(config, stop=stop, audit=sink)
+    #
+    # ``metric_translation_map`` 是这一次调用**唯一一次**读取
+    # ``lingxi/config/company_function_metric_map.toml`` 的结果（前置不齐、连读取都
+    # 没发生时是 ``None``）；下面首次开通编排的发布闸复用**同一个对象**（Issue #227
+    # 开通侧整合），不在那里另读一份文件——两份来源迟早会漂移，而漂移的方向是错误
+    # 发布，见 ``_build_permission_refresh_duty`` 与 ``_build_onboarding_duty`` 的
+    # 参数文档。
+    permission_refresh, metric_translation_map = _build_permission_refresh_duty(
+        config, stop=stop, audit=sink
+    )
     if permission_refresh is not None:
         duties.append(permission_refresh)
     # 发布消费排在每日重算**之后**：同一轮里重算先把当天的意图排进来，发布紧接着就能把
@@ -698,6 +1302,56 @@ def build_loop(
     )
     if permission_publish is not None:
         duties.append(permission_publish)
+    # 组织快照同步（Issue #250）排在发布消费**之后**、首次开通编排**之前**：它是开通链
+    # 身份定位那一步唯一的数据来源（``PostgresOrgSnapshotStore.lookup``），排在开通
+    # 之前才可能让**同一轮**新装配、第一次真的跑成功的那次同步，被紧随其后的开通认领
+    # 用上，少等一整个调度周期。它与花名册审计、每日权限重算之间没有数据依赖（互不
+    # 读对方的表），因此位置只服务这一个"同一轮内先后"的收益，不构成新的顺序约束。
+    #
+    # 用户身份路径复用**同一个**令牌供给 ``supply``——那条一次性 refresh_token 全系统
+    # 只允许一个消费者，与开通链的在职状态实时回读、花名册日报是同一条（2026-08-08
+    # 授权码被烧的事故形状，不新增第二个消费者）。应用身份路径复用权限发布表那条
+    # ``permission_table_supply``：tenant_access_token 不是一次性凭据、没有消费者数量
+    # 上限，两处消费的是同一类令牌，复用只是省一次多余的换取，不产生新凭据材料。
+    org_snapshot_sync = _build_org_snapshot_sync_duty(
+        config,
+        stop=stop,
+        audit=sink,
+        user_access_token=supply,
+        app_access_token=permission_table_supply,
+    )
+    if org_snapshot_sync is not None:
+        duties.append(org_snapshot_sync)
+    # 首次开通编排（Epic D / S-D-02）排在发布消费**之后**：同一轮里发布面先把上一轮排出
+    # 的意图推出去，开通链的发布等待才可能在同一轮内看到 ``published``。位置只保证同一轮
+    # 内的先后；晚一轮没有产品后果（开通链自己会等）。
+    #
+    # 在职状态回读复用**同一个**令牌供给 ``supply``：它就是这次把编排搬进本进程的理由
+    # ——那条一次性 refresh_token 全系统只允许一个消费者，而它已经在这里了。
+    #
+    # **装配不变量（外部集成面审查 F1）**：``onboarding != None ⇒ permission_publish !=
+    # None 且 permission_publish.publish_wired``。这里把上面刚刚装配出的
+    # ``permission_publish``（可能是 ``None``、也可能是只装了就绪面的半个职责）原样交给
+    # `_build_onboarding_duty` 校验——不在这里另写一次判断，唯一的真相来源是那个对象
+    # 本身，见 `_build_onboarding_duty` 文档字符串「装配不变量」一节的完整理由。
+    onboarding = _build_onboarding_duty(
+        config,
+        stop=stop,
+        audit=sink,
+        employment_access_token=supply,
+        metric_translation_map=metric_translation_map,
+        permission_publish=permission_publish,
+    )
+    if onboarding is not None:
+        duties.append(onboarding)
+    # 迟到就绪恢复（V-开通-18）排在首次开通编排**之后**：它服务的是首次开通那次阻塞
+    # 确认已经判过超时、后续再也没有人回来看的用户，位置只是"同一轮内先声明的职责先
+    # 跑"的自然顺序，不构成数据依赖——它按自己的十五分钟节奏在候选查询里判到期，不是
+    # 每轮都真的发探针。**总能注册**（没有可选前置会让它整体不装配），因此不需要
+    # `if ... is not None` 判断。
+    duties.append(
+        _build_late_readiness_recovery_duty(config, stop=stop, audit=sink)
+    )
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:

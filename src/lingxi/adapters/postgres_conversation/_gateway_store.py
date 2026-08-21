@@ -6,14 +6,17 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Iterator
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.conversation.ports import PendingOnboarding
 
 from ._transaction import _Transaction
+
+logger = logging.getLogger(__name__)
 
 # 保留旧名称作为兼容导出；默认值的唯一来源是 adapters.postgres。
 DEFAULT_CONNECT_TIMEOUT_SECONDS = DEFAULT_POSTGRES_TIMEOUTS.connect_timeout_seconds
@@ -109,6 +112,41 @@ class PostgresGatewayStore:
                     (event_id,),
                 )
 
+    def release_onboarding_claim(
+        self, *, event_id: str, claim_token: datetime | None = None
+    ) -> None:
+        """把**自己那一次**认领放回 ``NULL``（Epic D / S-D-02 修复包）。
+
+        它是 :meth:`claim_stale_onboarding` 唯一的反向路径——在它存在之前，任何「认领了却
+        没跑成」的交错都会把事件永久烧掉。
+
+        **条件是 CAS，不是 ``IS NOT NULL``。** 只按事件标识清空会有 ABA：A 释放 → B 重新
+        认领 → A 的重试再释放一次 → **B 的认领被清掉**，那条链于是在没人看着的情况下被
+        第三方解锁，可能被并发认领两次并重复触发外部开通。``onboarding_dispatched_at``
+        本身就是认领代次（认领语句写进去的那个时刻），拿它比对即可，不需要新列。
+
+        ``claim_token`` 为 ``None`` 时**什么都不做**：调用方没有认领代次，宁可留着不放，
+        也不能撤销别人的认领。
+        """
+
+        if claim_token is None:
+            logger.warning(
+                "释放开通认领缺少认领代次，本次不动账本 event=%s", event_id
+            )
+            return
+        with connect(self._dsn, timeouts=self._timeouts) as connection:
+            with connection.transaction():
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE inbound_event
+                       SET onboarding_dispatched_at = NULL
+                     WHERE feishu_event_id = %s
+                       AND onboarding_dispatched_at = %s
+                    """,
+                    (event_id, claim_token),
+                )
+
     def claim_stale_onboarding(self, *, older_than: timedelta) -> PendingOnboarding | None:
         """认领一条超时仍未交接的未开通首聊事件，并原子记账。
 
@@ -139,11 +177,16 @@ class PostgresGatewayStore:
                                   FOR UPDATE SKIP LOCKED
                            )
                        AND onboarding_dispatched_at IS NULL
-                    RETURNING feishu_event_id, user_open_id, trace_id
+                    RETURNING feishu_event_id, user_open_id, trace_id,
+                              onboarding_dispatched_at
                     """,
                     (older_than,),
                 )
                 row = cursor.fetchone()
                 if row is None:
                     return None
-                return PendingOnboarding(event_id=row[0], open_id=row[1], trace_id=row[2])
+                # 第四列是**这一次认领的代次**：释放时拿它做 CAS，只能撤销自己那一次
+                # （见 :meth:`release_onboarding_claim`）。
+                return PendingOnboarding(
+                    event_id=row[0], open_id=row[1], trace_id=row[2], claim_token=row[3]
+                )

@@ -37,7 +37,6 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.apps.liveness import touch_liveness
-from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
@@ -45,6 +44,7 @@ from lingxi.core.execution.card_stream import CardCreated, CardTransport, Delive
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
 from .log_redaction import install_credential_redaction
+from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
 
@@ -177,20 +177,28 @@ class _LoggingAudit:
         log("audit %s %s", action, fields)
 
 
-class _UnavailableOnboarding:
-    """外部开通编排未装配时的失败关闭实现。
+class _RecordingOnboarding:
+    """gateway 侧的开通"编排"：**只记事件，一个外部动作都不做**。
 
-    正向 gateway 接线仍然认领事件，但绝不假装匹配或开通成功；正式部署应把
-    #89/#17 编排 runner 传入 ``build_supervisor``。这也让漏装配表现为冻结的
-    ``LX-ONBOARD-001`` 终态，而不是静默回到旧的「未开通」分支。
+    产品负责人 2026-08-18 裁定把首次开通编排整体移进 ``lingxi-scheduler``（决策记录见
+    ``docs/决策记录/2026-08-18-首次开通编排住在scheduler.md``）。gateway 从此只做两件事：
+    把首聊事件落进 ``inbound_event`` 并标成 ``auto_provisioning``（这一步由管线的事务完成），
+    以及立刻回一条合同要求的「已收到，正在核对」。真正的编排由 scheduler 按
+    ``claim_stale_onboarding`` 认领。
+
+    因此本类返回 ``STARTED``：它的字面含义正是"编排已异步接手、这一轮没有别的话要说"
+    （见 ``ports.OnboardingState``），而管线对 ``started`` **刻意不记账**——账本留给真正
+    跑完的那一方，中途崩溃的链因此仍然可以被重新认领。
+
+    **不是失败关闭桩。** 桩会返回 ``INTERNAL_ERROR``，让每个未开通用户当场看到
+    ``LX-ONBOARD-001``；而这里的语义是"收到了、正在处理"，是真话。
     """
 
-    def start(self, *, event_id: str, open_id: str, trace_id: str) -> OnboardingResult:
-        del event_id, open_id, trace_id
-        return OnboardingResult(
-            state=OnboardingState.INTERNAL_ERROR,
-            failure_reason="onboarding_runner_unavailable",
-        )
+    def start(
+        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
+    ) -> OnboardingResult:
+        del event_id, open_id, trace_id, claim_token
+        return OnboardingResult(state=OnboardingState.STARTED)
 
 
 def make_event_handler(
@@ -256,6 +264,7 @@ def build_supervisor(
     should_stop: Callable[[], bool] | None = None,
     onboarding: OnboardingRunner | None = None,
     heartbeat: Callable[[], None] | None = None,
+    on_onboarding_assembled: Callable[[OnboardingRunner], None] | None = None,
 ) -> LongConnectionSupervisor:
     """按配置装出一个 supervisor。
 
@@ -263,6 +272,14 @@ def build_supervisor(
     L4a，全部 L2/L3 断言注入假实现。``onboarding`` 未提供时采用失败关闭 runner，
     不会把未开通正文悄悄交给下游，也不会误报已开通。
     adapters 在函数体内延迟 import，与 ``apps/scheduler`` 的 ``build_loop`` 同惯例。
+
+    ``on_onboarding_assembled`` 回调**只报告本函数最终采用的那个 runner**，供装配层做
+    开通装配断言（``apps/gateway/onboarding.assert_gateway_onboarding_is_inert``）。
+    为什么要一个回调而不是从返回的 supervisor 上读回来：``LongConnectionSupervisor``
+    的公开面被 `V-接入-10` 的结构断言冻结成 ``{run, reconnect_attempts,
+    observed_delays}``——它不得出现第二个可以投递事件的公开入口，因此也不该为了装配
+    自证而长出新的公开属性。回调不接触事件通路，只把"本函数决定用哪一个"这件事说出来，
+    而那正是断言要验的东西（缺省落桩就发生在这一行）。
     """
 
     from lingxi.adapters.feishu_longconn import LarkEventTransport
@@ -270,7 +287,9 @@ def build_supervisor(
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
 
     audit = _LoggingAudit()
-    effective_onboarding = onboarding or _UnavailableOnboarding()
+    effective_onboarding = onboarding or _RecordingOnboarding()
+    if on_onboarding_assembled is not None:
+        on_onboarding_assembled(effective_onboarding)
     # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
     # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
     # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
@@ -314,49 +333,6 @@ def build_supervisor(
         ),
         audit=audit.record,
         heartbeat=heartbeat,
-    )
-
-
-def build_delivery_tick(
-    *, alerting_duty: Any, reconciler: OnboardingReconciler
-) -> Callable[[], None]:
-    """投递循环每轮顺带推进的两件事，彼此隔离（Issue #65 轻审 P2-2）。
-
-    对账排在前面并且自带异常隔离：它失败不能带走告警状态机的推进。告警自身的失败
-    仍由投递循环那一层按既有方式处理（``run_forever`` 的 ``on_tick`` 已经包了一层），
-    这里不改变它——两件事各自的失败面因此不会互相掩盖。
-    """
-
-    def tick() -> None:
-        try:
-            reconciler.run_once()
-        except Exception as error:  # noqa: BLE001 - 对账失败不得带走告警与投递
-            logger.error("未开通首聊交接对账本轮失败 error=%s", type(error).__name__)
-        alerting_duty.run_once()
-
-    return tick
-
-
-def build_onboarding_reconciler(
-    config: GatewayConfig,
-    *,
-    onboarding: OnboardingRunner | None = None,
-    should_stop: Callable[[], bool] | None = None,
-) -> OnboardingReconciler:
-    """装出未开通首聊的交接对账扫描（Issue #65 轻审 P2-2）。
-
-    与 ``build_supervisor`` 用同一个 ``onboarding`` 缺省口径：没传就是失败关闭桩。
-    两者各建各的 ``PostgresGatewayStore``——它只是个连接工厂，不持有跨调用状态，
-    共用一个实例不会带来任何好处，分开反而让"对账跑在另一条线程上"这件事更清楚。
-    """
-
-    from lingxi.adapters.postgres_conversation import PostgresGatewayStore
-
-    return OnboardingReconciler(
-        store=PostgresGatewayStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
-        onboarding=onboarding or _UnavailableOnboarding(),
-        audit=_LoggingAudit(),
-        should_stop=should_stop,
     )
 
 
@@ -584,18 +560,11 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
             logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
 
-    # 未开通首聊的交接对账（Issue #65 轻审 P2-2）：提交与触发之间崩溃 / 停机留下的
-    # 孤儿事件，由它重新交给开通编排一次。挂在投递线程的每轮回调上，而不是长连接
-    # 主线程——对账要连数据库、将来还要调带外部副作用的正式编排，放在长连接那条
-    # 线程上会挡住事件接收。它自己按分钟级最小间隔自限，不会被一秒一轮的投递循环
-    # 拖成空查询风暴。
-    #
-    # 待正式 runner 装配时复核（S-D-02）：真实编排的单次耗时可能到分钟级，那时要
-    # 判断它是否还适合与投递共用这条线程，或者需要自己的循环。
-    delivery_tick = build_delivery_tick(
-        alerting_duty=alerting_duty,
-        reconciler=build_onboarding_reconciler(config, should_stop=stop_event.is_set),
-    )
+    # 首次开通（Epic D / S-D-02）：**gateway 只记事件**。真正的编排住在
+    # `lingxi-scheduler`（产品负责人 2026-08-18 裁定），按 `claim_stale_onboarding`
+    # 认领这里落下的 `auto_provisioning` 事件。本进程因此不持有任何会产生外部副作用的
+    # 开通实现，也不再有开通线程池——分钟级的等待一条都不落在长连接线程或投递线程上。
+    onboarding_runner: OnboardingRunner = _RecordingOnboarding()
 
     consumer = assemble_delivery_consumer(config, alerting_duty=alerting_duty)
     delivery_thread = threading.Thread(
@@ -605,7 +574,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             "stop": stop_event,
             "poll_interval_seconds": config.delivery_poll_interval_seconds,
             "heartbeat": _combined_heartbeat(alerting_duty, "gateway-delivery"),
-            "on_tick": delivery_tick,
+            "on_tick": alerting_duty.run_once,
             "on_dead": report_delivery_thread_dead,
         },
         name="lingxi-gateway-delivery",
@@ -618,9 +587,12 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     )
     # 长连接的心跳回调里挂上投递线程的看门狗（Issue #191），因此 supervisor 必须在
     # 线程对象存在之后再装配。两者之间没有别的依赖，换顺序不改变任何既有行为。
+    supervisor_onboarding: list[OnboardingRunner] = []
     supervisor = build_supervisor(
         config,
         should_stop=stop_event.is_set,
+        onboarding=onboarding_runner,
+        on_onboarding_assembled=supervisor_onboarding.append,
         heartbeat=_combined_heartbeat(
             alerting_duty,
             "gateway-longconn",
@@ -629,6 +601,11 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             ),
         ),
     )
+    # **gateway 侧的开通装配断言**（搬迁后的形态）：本进程实际接到管线上的那个实现
+    # 必须是"只记事件"的那一个。接上任何会产生外部副作用的编排，都会把分钟级的等待
+    # 放回长连接线程——那正是 #65 开工卡「共用线程复核」要消灭的形状，而它在这里
+    # 只会表现为"gateway 忽然收不到消息"。
+    assert_gateway_onboarding_is_inert(*supervisor_onboarding)
     delivery_thread.start()
 
     try:

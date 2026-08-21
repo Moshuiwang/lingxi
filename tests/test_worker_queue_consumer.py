@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import io
+import json
 import os
 import signal
 import tempfile
@@ -55,6 +57,44 @@ from postgres_schema import ensure_production_schema, reset_production_rows
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_DB = "需要 LINGXI_POSTGRES_DSN 才能运行真库队列断言"
 
+# Epic D 闸⑥：_process_task 现在按任务的 user_id 读
+# <user_env_root>/<user_id>/.mcp.json，读不到就失败关闭（结构上不存在回退到
+# 全进程共用配置的分支，见 apps/worker/service.py）。本文件绝大多数用例走的是
+# 固定几个 user_id（in-memory FakeWorkerQueue 用 "usr-1"；真库用例固定用
+# "usr-90"/"usr-91"），因此在模块级建一次共用夹具目录，给这几个 user_id 各放
+# 一份形状合法的 .mcp.json，而不必逐个用例各自建目录——被 FailClosedByDefault
+# 一类的用例覆盖：真正要验证"读不到就失败关闭"的用例会显式传一个不含该用户
+# 目录的独立临时目录，见 UserMcpConfigFailClosedTest。
+_USER_ENV_ROOT_DIR = tempfile.TemporaryDirectory(prefix="lingxi-worker-user-env-")
+atexit.register(_USER_ENV_ROOT_DIR.cleanup)
+
+
+def _seed_user_mcp_config(user_id: str, *, root: str | None = None) -> None:
+    """给 ``user_id`` 放一份形状合法的 ``.mcp.json``（与
+    ``adapters/user_environment.py`` 的 ``build_mcp_config`` 同一形状）。"""
+
+    home = Path(root or _USER_ENV_ROOT_DIR.name) / user_id
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "query": {
+                        "type": "http",
+                        "url": "https://example.invalid/mcp",
+                        "headers": {"Authorization": "Bearer test-token"},
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+for _fixture_user_id in ("usr-1", "usr-90", "usr-91"):
+    _seed_user_mcp_config(_fixture_user_id)
+
 
 def worker_config(**overrides: object) -> WorkerConfig:
     values: dict[str, object] = {
@@ -66,6 +106,7 @@ def worker_config(**overrides: object) -> WorkerConfig:
         "target_worker_version": "stable",
         "heartbeat_interval_seconds": 0.01,
         "poll_interval_seconds": 0.01,
+        "user_env_root": _USER_ENV_ROOT_DIR.name,
     }
     values.update(overrides)
     return WorkerConfig(**values)  # type: ignore[arg-type]
@@ -533,6 +574,121 @@ class WorkerServiceTests(unittest.TestCase):
             executor.kwargs["external_texts"],
             (("metric.description", "指标目录中的已知描述"),),
         )
+
+    def test_the_executor_receives_this_users_own_mcp_config_not_the_shared_one(self) -> None:
+        """Epic D 闸⑥：每个用户的问数必须用他自己的那份 MCP 配置——即使全进程
+        共用的那份配置（``self._config.mcp_servers``）也配了值，executor 收到
+        的必须是从这个用户自己的 ``.mcp.json`` 读出来的那一份，两者不能相等。
+        """
+
+        queue = FakeWorkerQueue()  # user_id="usr-1"，夹具见模块顶部 _seed_user_mcp_config
+        received: list[Mapping[str, object]] = []
+
+        class Executor:
+            def __init__(self, config: WorkerConfig) -> None:
+                received.append(config.mcp_servers)
+
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": None},
+                    "failure": None,
+                }
+
+        shared_sentinel = {"shared": {"type": "stdio", "command": "should-never-be-used"}}
+        service = WorkerService(
+            config=worker_config(mcp_servers=shared_sentinel),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(config),
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(
+            received[0],
+            {
+                "query": {
+                    "type": "http",
+                    "url": "https://example.invalid/mcp",
+                    "headers": {"Authorization": "Bearer test-token"},
+                }
+            },
+        )
+        self.assertNotEqual(received[0], shared_sentinel)
+
+    def test_missing_user_mcp_config_fails_closed_without_ever_constructing_an_executor(
+        self,
+    ) -> None:
+        """Epic D 闸⑥红线：读不到用户自己的 MCP 配置必须失败关闭，且**结构上
+        不存在**回退到全进程共用配置的路径——executor 从未被构造、run_turn
+        从未被调用，terminal 必须是失败而不是成功。
+
+        变异存活证据：把 ``_process_task`` 里 ``except UserMcpConfigError`` 的
+        处理改成"读不到就退回 self._config"（例如
+        ``task_config = self._config`` 后继续往下走，而不是直接构造失败
+        report），本用例会变红——``executor_calls`` 会从 0 变成 1，且
+        ``terminal_kind`` 会从 ``"failed"`` 变成 ``"success"``、正文变成
+        "不该被用到的结果"。
+        """
+
+        queue = FakeWorkerQueue()  # user_id="usr-1"
+        with tempfile.TemporaryDirectory() as empty_root:
+            # 这个目录里没有任何 usr-1 的 .mcp.json——刻意不复用模块级共享夹具。
+            executor_calls: list[None] = []
+
+            class Executor:
+                def __init__(self) -> None:
+                    executor_calls.append(None)
+
+                async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                    return {
+                        "turn": {
+                            "closed": True,
+                            "final_text": "不该被用到的结果",
+                            "session_id": None,
+                        },
+                        "failure": None,
+                    }
+
+            sink = RecordingTerminalOutcomeSink()
+            service = WorkerService(
+                config=worker_config(user_env_root=empty_root),
+                queue=queue,
+                executor_factory=lambda config, marker: Executor(),
+                on_terminal_outcome=sink,
+            )
+            asyncio.run(service.process_once())
+
+        self.assertEqual(executor_calls, [], "读不到用户自己的配置时绝不能构造 executor")
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "session_failed")
+        self.assertNotIn("不该被用到的结果", terminal["content"])
+        self.assertEqual(len(sink.calls), 1)
+        self.assertEqual(sink.calls[0]["failure_code"], "user_mcp_config_unavailable")
+
+    def test_a_root_that_is_configured_but_unset_on_worker_config_also_fails_closed(self) -> None:
+        """``user_env_root=None``（例如漏配 ``LINGXI_USER_ENV_ROOT``）必须同样
+        失败关闭，不是被当成"没有约束、什么都能用"。"""
+
+        queue = FakeWorkerQueue()
+        executor_calls: list[None] = []
+
+        class Executor:
+            def __init__(self) -> None:
+                executor_calls.append(None)
+
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise AssertionError("不该被调用")
+
+        service = WorkerService(
+            config=worker_config(user_env_root=None),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(executor_calls, [])
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
 
     def test_stop_and_timeout_write_distinct_terminal_kinds(self) -> None:
         # Issue #90 评论 5306860255：turn 模式（apps/worker/turn.py 的

@@ -24,6 +24,11 @@ from lingxi.core.ids import new_id
 TASK_QUEUED_CHANNEL = "task_queued"
 
 
+#: 开通已经启动、还没收口的两格。``matching`` 不在里面：那是建档默认值，编排此刻可能
+#: 还没被认领，用户应当继续看到「已收到，正在核对」。
+_PROVISIONING_IN_FLIGHT = frozenset({"provisioning", "mcp_syncing"})
+
+
 def _user_state(provisioning_state: str, account_state: str) -> UserState:
     """把 ``app_user`` 的两列映射成管线关心的三态。
 
@@ -41,6 +46,10 @@ def _user_state(provisioning_state: str, account_state: str) -> UserState:
 
     if account_state != "enabled":
         return UserState.SUSPENDED
+    if provisioning_state in _PROVISIONING_IN_FLIGHT:
+        # 开通已经启动、还没收口：合同对这个阶段规定的提示与「还没开始核对」不是同一条
+        # （见 ``UserState.PROVISIONING``）。
+        return UserState.PROVISIONING
     if provisioning_state != "active":
         return UserState.NOT_PROVISIONED
     return UserState.ACTIVE

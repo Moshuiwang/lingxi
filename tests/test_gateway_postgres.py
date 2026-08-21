@@ -1391,6 +1391,87 @@ class OnboardingDispatchLedgerTests(GatewayPostgresTestCase):
             0,
         )
 
+    def test_releasing_a_claim_puts_the_event_back_in_the_candidate_set(self) -> None:
+        """认领即记账的**反向**路径（Epic D / S-D-02 修复包 P1-并发-1）。
+
+        执行器满位、正在停机、同一个人已有链在跑、`start` 抛异常、结论通知反复送不到
+        ——这五条都是「认领了却没真的跑」。没有这条反向语句时，它们各自都会把事件
+        **永久烧掉**：用户只剩一个「已收到」的表情，不建档、不发权限、也收不到任何终态。
+        """
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        claimed = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(claimed)
+        self.assertIsNotNone(self.dispatched_at(), "认领即记账")
+
+        self.store.release_onboarding_claim(
+            event_id="evt_auto", claim_token=claimed.claim_token
+        )
+
+        self.assertIsNone(self.dispatched_at(), "放回之后账本必须重新为空")
+        again = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(again, "放回之后必须能被下一轮重新认领")
+        self.assertEqual(again.event_id, "evt_auto")
+
+    def test_a_release_without_a_claim_generation_does_nothing(self) -> None:
+        """宁可留着不放，也不能撤销一次不知道是谁的认领。"""
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        claimed = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        self.assertIsNotNone(claimed)
+
+        self.store.release_onboarding_claim(event_id="evt_auto")
+
+        self.assertIsNotNone(self.dispatched_at(), "没有认领代次时一行都不该动")
+
+    def test_a_stale_release_cannot_undo_somebody_elses_claim(self) -> None:
+        """ABA：A 释放 → B 重新认领 → A 的重试再释放一次 → **B 的认领必须还在**。
+
+        没有代次时那次陈旧的释放会把 B 的认领清掉，那条链于是在没人看着的情况下被第三方
+        解锁，可能被并发认领两次并重复触发外部开通。
+        """
+
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        first = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        assert first is not None
+        self.store.release_onboarding_claim(
+            event_id="evt_auto", claim_token=first.claim_token
+        )
+        second = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        assert second is not None
+        self.assertNotEqual(second.claim_token, first.claim_token, "两次认领必须是不同代次")
+
+        # A 的重试：拿旧代次再释放一次。
+        self.store.release_onboarding_claim(
+            event_id="evt_auto", claim_token=first.claim_token
+        )
+
+        self.assertEqual(
+            self.dispatched_at(), second.claim_token, "陈旧的释放不得撤销别人的认领"
+        )
+
+    def test_releasing_an_unknown_event_changes_nothing(self) -> None:
+        self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
+            inbound("evt_auto", open_id="ou_stranger"), now=NOW
+        )
+        claimed = self.store.claim_stale_onboarding(older_than=self.ZERO)
+        assert claimed is not None
+
+        self.store.release_onboarding_claim(
+            event_id="evt_never_seen", claim_token=claimed.claim_token
+        )
+
+        self.assertIsNotNone(self.dispatched_at())
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM inbound_event"), 1, "不得凭空造行"
+        )
+
     def test_settling_the_ledger_twice_does_not_move_the_timestamp(self) -> None:
         self.pipeline(onboarding=FakeOnboarding(), should_stop=lambda: True).handle_message(
             inbound("evt_auto", open_id="ou_stranger"), now=NOW

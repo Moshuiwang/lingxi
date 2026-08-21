@@ -1111,6 +1111,101 @@ class ReadinessTicker(_ReadinessProbeRunner):
         )
 
 
+class ReadinessRecoveryTicker(_ReadinessProbeRunner):
+    """给「已经判过 ``timed_out``」的绑定做**周期性复检**（[V-开通-18](../../../../docs/技术设计/验收矩阵.md)）。
+
+    首次开通那条链（:class:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner`）
+    用 :class:`McpReadinessConfirmation` 阻塞式跑完合同预算，预算耗尽即返回 ``timed_out``
+    ——那一刻起没有任何东西会再回来看这个人（本模块「本模块不做的事」一节登记的缺口，
+    同一件事也记在 ``core/identity/onboarding_runner.py`` 的模块文档「一条链失败中断时」
+    一节）。用户的权限其实可能已经同步好了，只是没有人再替他确认一次。
+
+    :class:`ReadinessTicker` **不能**直接拿来做这件事：它的 ``advance`` 一旦看见
+    ``ReadinessProgress.terminal``（``ready`` / ``no_permission`` / ``timed_out`` 任意
+    一种）就永远不再推进——这条"终态之后不再动"的防线对**刷新链**（撤权 / 每日重算）
+    是对的，通知只发一次靠的正是它；但 ``timed_out`` 对首次开通链恰恰**不是**"处理
+    完了"，是"合同的十五分钟到了，这个人可能下一分钟就真的同步好了"。
+
+    因此本类不认 ``ReadinessProgress``，也不判断"还要不要继续再等下去"——**节奏与"查到
+    什么时候为止"是调用方的产品决定**，见
+    :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的模块文档。本类只回答一件事：
+    "现在再探一次，算不算就绪"。分类、能用到的三路结果（``ready`` / ``waiting`` /
+    ``technical_failure``）、绑定、落库与审计，与 :class:`ReadinessTicker` 是**同一份
+    实现**（继承自 :class:`_ReadinessProbeRunner`）——这正是本模块反复强调的"第二套
+    就绪语义是这条链上最贵的错误"。
+
+    本类**从不**产出 ``timed_out`` 或 ``no_permission``：前者已经在原始那一轮由
+    :class:`McpReadinessConfirmation` 记过一次，调用方不需要（也不应该）再记第二条同义
+    的终态——是否要把这个人转运维完全由调用方按自己的产品决定处理；后者的判据（这个人
+    有没有可等的权限）在原始那一轮的 :func:`evaluate_permission_presence` 已经通过
+    （走不到 ``timed_out`` 就不可能进入本类），本类不重复读库去问一次已经问过的问题。
+    超窗成功（探针返回得比它自己的超时还晚）按 :data:`_TICK_OVERRUN` 降级为
+    ``technical_failure``，与 :class:`ReadinessTicker` 的中途尝试同一条纪律——这里没有
+    "计划表最后一次"的概念，因此永远不会升级成 ``timed_out``。
+    """
+
+    name = "MCP 就绪复检（超时后恢复）"
+
+    def probe_after_timeout(
+        self, binding: ReadinessBinding, *, attempt_no: int
+    ) -> ReadinessAttempt | None:
+        """对一个已经 ``timed_out`` 的绑定再探一次；``None`` = 探针未接线，本轮不推进。
+
+        ``attempt_no`` 由调用方给出（"这个人这一版权限一共判定过几次 + 1"）：本类不读
+        ``mcp_sync_check``（``core`` 不读库），落库时数据库会用
+        ``COALESCE(MAX(attempt_no), 0) + 1`` 重新算一遍真实序号
+        （:meth:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.record_attempt`
+        的既有纪律）——这里传入的值只影响**这一次**审计事实里 ``attempt_no`` 好不好看，
+        不影响落库结果，但调用方仍然应该给出准确值，否则审计读起来会与库里的真实序号
+        对不上。
+        """
+
+        if not isinstance(binding, ReadinessBinding):
+            raise TypeError("就绪复检必须绑定 (用户, 权限版本)")
+        if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 1:
+            raise ValueError("尝试次序必须是正整数")
+        if self._probe is None:
+            # 探针未接线：与 ``ReadinessTicker`` 同一条纪律，本轮不落任何记录、不烧
+            # 预算，端点配好后从库里的进度原样继续（进度全在 ``mcp_sync_check`` 里）。
+            return None
+        return self._probe_once(binding, attempt_no, **_TICK_OVERRUN)
+
+    def record_processing_failure(
+        self, binding: ReadinessBinding, *, attempt_no: int, code: str
+    ) -> ReadinessAttempt:
+        """记一条**没有真的发起探针**、但需要占住这一次调度窗口的技术失败。
+
+        外部独立审查 F4：恢复职责在探针**之后**的步骤（渲染范围文本、推进
+        ``provisioning_state``）抛出未预期异常时，如果这次窗口不留下任何记录，
+        下一个 scheduler tick 会立刻把同一个人重新选中——因为候选查询的到期判据看的
+        是 ``mcp_sync_check`` 里最后一次判定的时刻，而这次失败根本没有经过探针、没
+        有写过任何一行。一个持续失败的"毒候选"因此会一直占着 ``LIMIT`` 窗口的最前面，
+        排在它后面的正常候选被饿死。
+
+        本方法**不调用探针**，只把这次失败按 ``technical_failure`` 记一行——与探针
+        真的技术失败时走的是同一张表、同一套五路互斥形状，因此对候选查询而言两者
+        没有区别：都会把 ``last_started_at`` 往前推，让这个人乖乖等到下一个复检节奏
+        才会被再选中。``code`` 是错误分类（例如 ``recovery_failed_<异常类型名>``），
+        不是异常正文。
+        """
+
+        if not isinstance(binding, ReadinessBinding):
+            raise TypeError("就绪复检必须绑定 (用户, 权限版本)")
+        if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 1:
+            raise ValueError("尝试次序必须是正整数")
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("失败记录必须带错误码")
+        started = self._now()
+        return self._attempt(
+            binding,
+            attempt_no,
+            ReadinessOutcome.TECHNICAL_FAILURE,
+            started,
+            self._now(),
+            error_code=code.strip(),
+        )
+
+
 __all__ = [
     "CONTRACT_SCHEDULE",
     "DEFAULT_BUDGET_SECONDS",
@@ -1130,6 +1225,7 @@ __all__ = [
     "ReadinessCheckStore",
     "ReadinessOutcome",
     "ReadinessProgress",
+    "ReadinessRecoveryTicker",
     "ReadinessSchedule",
     "ReadinessSession",
     "ReadinessTicker",

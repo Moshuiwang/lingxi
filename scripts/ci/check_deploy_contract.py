@@ -365,13 +365,19 @@ def check_database_timeouts() -> list[str]:
 
 
 def check_worker_queue_env_example() -> list[str]:
-    """`deploy/.env.example` 的 worker-queue 小节必须自带 `LINGXI_POSTGRES_DSN`。
+    """`deploy/.env.example` 的 worker-queue 小节必须自带 `LINGXI_POSTGRES_DSN`
+    与 `LINGXI_USER_ENV_ROOT`。
 
     PR #173 复核 P1-2：早期版本让 worker-queue 借用一次性 `worker` job 的
     env 文件，那份文件的示范文本明确写着"这里不放数据库连接串"，worker-queue
     因此照抄部署后拿不到 DSN、以 `restart: unless-stopped` 无限崩溃重启。
     现在两者分文件，这里守住"worker-queue 自己的小节确实示范了 DSN"，防止
     未来又把这两行拆开时安静地漏掉。
+
+    `LINGXI_USER_ENV_ROOT`（Epic D 闸⑥）是同一种失败形状的姊妹项：
+    `apps/worker/cli.py` 的队列模式前置检查缺了它同样以 exit=3 拒绝启动，
+    配上 `restart: unless-stopped` 同样是无限崩溃重启——示范文件漏了这一行，
+    照抄部署的人不会有任何提示。
     """
 
     text = read(ENV_EXAMPLE)
@@ -386,13 +392,164 @@ def check_worker_queue_env_example() -> list[str]:
             "（或小节顺序/编号被改动，check_worker_queue_env_example 的定位正则需要同步更新）"
         ]
     section = match.group(0)
+    failures: list[str] = []
     if not re.search(r"^LINGXI_POSTGRES_DSN=\S+\s*$", section, re.MULTILINE):
-        return [
+        failures.append(
             "deploy/.env.example 的 worker-queue 小节里没有 LINGXI_POSTGRES_DSN 示范值。"
             "worker-queue 是常驻队列消费者，启动期读不到这个变量会以 exit=3 拒绝启动，"
             "配上 restart: unless-stopped 就是无限崩溃重启（PR #173 复核 P1-2）。"
+        )
+    if not re.search(r"^LINGXI_USER_ENV_ROOT=\S+\s*$", section, re.MULTILINE):
+        failures.append(
+            "deploy/.env.example 的 worker-queue 小节里没有 LINGXI_USER_ENV_ROOT 示范值。"
+            "worker-queue 处理每个任务时都要按 user_id 读这个根目录下的 .mcp.json"
+            "（Epic D 闸⑥），启动期读不到会以 exit=3 拒绝启动，配上"
+            " restart: unless-stopped 就是无限崩溃重启。"
+        )
+    return failures
+
+
+# Epic D 闸⑤（首次开通编排写侧）直接依赖的四个变量：前三个缺任一个都会让
+# `onboarding.duty_not_registered`（见 apps/scheduler/assembly.py 的
+# `_build_onboarding_duty`）；第四个不影响闸门开关，只影响开通并发吞吐，但
+# 同属这一组配置，一并守住文档覆盖度，防止有人不小心删掉示范行而没有任何
+# 提示（见 deploy/验收前部署配置清单.md「一、闸⑤」「二、按进程分组」）。
+ONBOARDING_GATE_ENV_VARS = (
+    "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
+    "LINGXI_QUERY_MCP_ENDPOINT",
+    "LINGXI_USER_ENV_ROOT",
+    "LINGXI_ONBOARDING_WORKERS",
+)
+
+
+def check_onboarding_gate_env_example() -> list[str]:
+    """`deploy/.env.example` 的 scheduler 小节（「文件二」）必须示范
+    :data:`ONBOARDING_GATE_ENV_VARS` 四个变量（`deploy/验收前部署配置清单.md`
+    登记为 Epic D 闸⑤配置项）。
+
+    这四项此前**只活在文档里**：`.env.example` 里确实写着示范值/说明，但没有
+    任何检查会在有人不小心删掉某一行示范时变红——本仓库的纪律是"只活在文档
+    里的约束不算被守住"（AGENTS.md）。这里补上机械核对，形状照
+    :func:`check_worker_queue_env_example`：只判定"变量名的赋值行是否存在"
+    （允许被 `#` 注释掉，这四项本就是可选配置，示例文件里默认注释），不校验
+    具体示范值——具体值的形状已由各自的运行时校验函数负责（例如
+    `LINGXI_QUERY_MCP_ENDPOINT` 必须以 `https://` 开头，见
+    `apps/scheduler/config.py` 的 `SchedulerConfig.from_env`）。
+
+    **不用要求"值不含空白"的行级正则**（`check_worker_queue_env_example` 用的
+    那种 ``\\S+\\s*$``）：`LINGXI_MCP_TOKEN_ENCRYPT_KEY` 的示范值
+    `<32B base64 主密钥>` 本身带空格，套用那种正则会对着当前本就正确的文件
+    误判为缺失。这里只判定"这一行确实在给这个变量名赋值"（`#?` 允许注释掉），
+    不管值里有没有空格。
+    """
+
+    text = read(ENV_EXAMPLE)
+    match = re.search(
+        r"文件二：deploy/\.env\.stage\.scheduler.*?(?=\n# ={10,}\n# 文件三)",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return [
+            "deploy/.env.example 找不到「文件二：…scheduler」小节"
+            "（或小节顺序/编号被改动，check_onboarding_gate_env_example 的定位正则需要同步更新）"
         ]
-    return []
+    section = match.group(0)
+    failures: list[str] = []
+    for variable in ONBOARDING_GATE_ENV_VARS:
+        if not re.search(rf"^#?\s*{re.escape(variable)}=", section, re.MULTILINE):
+            failures.append(
+                f"deploy/.env.example 的 scheduler 小节（「文件二」）没有示范 {variable}。"
+                "它是 Epic D 闸⑤相关的开通配置项，缺失文档示范容易让人不知道这个变量存在"
+                "（详见 deploy/验收前部署配置清单.md「一、闸⑤」）。"
+            )
+    return failures
+
+
+def _volume_mounts(service_text: str) -> list[tuple[str, str, str | None]]:
+    """解析某个 service 块下 ``volumes:`` 列表的每一项，返回
+    ``(source, target, mode)`` 三元组列表；``mode`` 是 ``:ro``/``:rw`` 这类第三段
+    （没有则 ``None``）。
+
+    复用 :func:`service_block` 的同一套缩进定界算法定位 ``volumes:`` 子块——它对
+    "key: 后跟同级子项，直到遇到同缩进或更浅的下一个键"这个结构不挑层级，原本
+    给 service 名字用，这里直接拿来给 service 块内部的 ``volumes:`` 用。
+    这样**只解析真正的 volumes 列表**，不会被 ``environment``/``labels`` 等
+    别处偶然出现的形似字符串（例如注释、环境变量值）误判成"已挂载"
+    （外部独立审查 F2：此前的整块字符串包含判断存在这个假绿口子）。
+    """
+
+    volumes_block = service_block(service_text, "volumes")
+    if volumes_block is None:
+        return []
+    mounts: list[tuple[str, str, str | None]] = []
+    for line in volumes_block.splitlines():
+        match = re.match(r"^\s*-\s*([\w.-]+):(/[^:\s]+)(?::([\w,-]+))?\s*$", line)
+        if match:
+            source, target, mode = match.groups()
+            mounts.append((source, target, mode))
+    return mounts
+
+
+def check_scheduler_user_volume() -> list[str]:
+    """Epic D 闸⑤：scheduler 的首次开通编排要往用户环境目录写每个用户自己的
+    ``.mcp.json``（S-D-02，``adapters/user_environment.py``），但 stage/prod
+    覆盖文件此前只给它挂了凭据卷，没有挂用户目录卷。
+
+    后果不是"启动时报错"那种容易发现的失败：``LocalUserEnvironment`` 的
+    根目录在真实容器里第一次被访问（``sweep_all()``）就会因为不存在而抛
+    ``UserEnvironmentError``，装配层据此判定"前置不齐"、**整条首次开通编排
+    从不注册**（见 ``apps/scheduler/assembly.py`` 的 ``_build_onboarding_duty``），
+    而这只留一条容易被忽略的审计日志——其余定时职责照常运行，容器健康检查照常
+    通过，表面上"scheduler 工作正常"。
+
+    只检查 stage/prod（而不是 ``deploy/compose.yaml`` 基线）：与 worker/
+    worker-queue 不同，scheduler 的这个挂载点目前只出现在覆盖文件里
+    （基线 scheduler 只挂凭据卷，用户目录卷的声明与命名跟着 stage/prod 环境走，
+    与 worker 系列的既有结构一致）。
+
+    **精确解析 ``volumes:`` 列表、显式断言不是只读**（外部独立审查 F2 修复）：
+    此前用整块字符串包含判断 ``"lingxi-users:/var/lib/lingxi/users" not in
+    block``，两种情况都会被误判成"已挂载"：①这个子串恰好出现在
+    ``environment``/``labels`` 等别处（不是真的卷挂载）；②挂成了
+    ``lingxi-users:/var/lib/lingxi/users:ro``——scheduler 写不进去，
+    子串判断依旧命中、门禁照样绿，而首次开通编排会在第一次写 ``.mcp.json``
+    时才炸。运维为了"保守"随手给一个后来发现该写的卷加 ``:ro`` 是完全可能
+    发生的操作失误，不需要构造出恶意场景就能触发。
+    """
+
+    failures: list[str] = []
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        text = strip_comments(read(path))
+        block = service_block(text, "scheduler")
+        if block is None:
+            failures.append(f"{display(path)} 找不到 scheduler service")
+            continue
+        matching = [
+            (source, target, mode)
+            for source, target, mode in _volume_mounts(block)
+            if source == "lingxi-users" and target == "/var/lib/lingxi/users"
+        ]
+        if not matching:
+            failures.append(
+                f"{display(path)} 的 scheduler 没有挂载 lingxi-users 卷"
+                "（挂载点须与 worker/worker-queue 一致：/var/lib/lingxi/users）。"
+                "首次开通编排要在这个目录下给每个用户写 .mcp.json，缺了这个挂载，"
+                "整条首次开通编排会在启动期判定「前置不齐」而永远不注册"
+                "（见 apps/scheduler/assembly.py 的 _build_onboarding_duty），"
+                "且这个失败只留一条容易被忽略的审计日志，其余职责与健康检查"
+                "照常正常。"
+            )
+            continue
+        if any(mode == "ro" for _, _, mode in matching):
+            failures.append(
+                f"{display(path)} 的 scheduler 把 lingxi-users 挂成了只读"
+                "（`:ro`）。首次开通编排要往这个目录写每个用户的 .mcp.json，"
+                "只读挂载会让每一次开通都在第一次写入时失败——表现形式与完全"
+                "没挂载相同（前置不齐、编排不注册），但门禁如果只做字符串包含"
+                "判断会因为子串仍然命中而误判为通过。"
+            )
+    return failures
 
 
 def check_compose_contract() -> list[str]:
@@ -976,6 +1133,8 @@ def main() -> int:
         ("停止宽限期与源码常量联动", check_stop_grace_period),
         ("数据库超时与停机上界依据", check_database_timeouts),
         ("worker-queue env.example 示范值", check_worker_queue_env_example),
+        ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
+        ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
         (".dockerignore 覆盖面", check_dockerignore),

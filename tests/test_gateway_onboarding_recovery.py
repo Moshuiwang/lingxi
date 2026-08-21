@@ -81,14 +81,10 @@ class OrphanRecoveryTests(ReconcilerTestCase):
             ],
             "补交与首次触发走同一条边界：只有事件身份，没有用户正文",
         )
-        reconciled = self.log.fields("audit.onboarding.reconciled")
+        reconciled = self.log.fields("audit.onboarding.dispatched")
         self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["event_id"], "evt_orphan_1")
         self.assertEqual(reconciled[0]["state"], "not_authorized")
-        self.assertIs(
-            reconciled[0]["notified"],
-            False,
-            "这条路径没有用户可见提示，审计必须如实标注，不能让待办只活在文档里",
-        )
 
     def test_a_recovered_orphan_is_not_handed_over_twice(self) -> None:
         self.state.stale_onboardings.append(orphan())
@@ -143,7 +139,8 @@ class ShutdownTests(ReconcilerTestCase):
             def __init__(self) -> None:
                 self.calls: list[dict[str, str]] = []
 
-            def start(self, *, event_id: str, open_id: str, trace_id: str):
+            def start(self, *, event_id: str, open_id: str, trace_id: str, claim_token=None):
+                del claim_token
                 self.calls.append(
                     {"event_id": event_id, "open_id": open_id, "trace_id": trace_id}
                 )
@@ -166,33 +163,85 @@ class ShutdownTests(ReconcilerTestCase):
 class FailureTests(ReconcilerTestCase):
     """失败必须响亮，且不得变成对外部系统的无限重试。"""
 
-    def test_runner_failure_is_audited_and_not_retried(self) -> None:
+    def test_a_runner_that_never_started_gets_its_claim_released(self) -> None:
+        """``start`` 自己抛异常 = 编排根本没跑：认领必须放回去，否则事件被永久烧掉。"""
+
         self.state.stale_onboardings.append(orphan())
         runner = FakeOnboarding(fail_with=RuntimeError("外部权限服务不可用"))
         reconciler = self.build(onboarding=runner)
 
         recovered = reconciler.run_once()
-        self.now += DEFAULT_MIN_INTERVAL_SECONDS
-        again = reconciler.run_once()
 
-        self.assertEqual((recovered, again), (1, 0))
-        failures = self.log.fields("audit.onboarding.reconcile_failed")
+        self.assertEqual(recovered, 1)
+        failures = self.log.fields("audit.onboarding.dispatch_failed")
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["error"], "RuntimeError")
-        self.assertEqual(self.log.count("audit.onboarding.reconciled"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.dispatched"), 0)
+        self.assertEqual(self.log.count("store.release_onboarding_claim"), 1)
+        self.assertEqual(set(self.state.onboarding_dispatched), set(), "放回之后账本必须是空的")
         self.assertNotIn("外部权限服务不可用", repr(self.log.entries))
+
+    def test_a_terminal_conclusion_is_not_retried(self) -> None:
+        """跑过了、得到了结论（哪怕是失败终态）就**不**放回：重跑不会改变结论。"""
+
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.NOT_AUTHORIZED))
+
+        self.build(onboarding=runner).run_once()
+
+        self.assertEqual(self.log.count("store.release_onboarding_claim"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.dispatched"), 1)
+
+    def test_a_declined_dispatch_gets_its_claim_released(self) -> None:
+        """执行器满位 / 停机 / 同一个人已有链在跑：三条都是"没跑成"，都要放回。"""
+
+        for reason in ("executor_unavailable", "stopping", "already_running"):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.state.stale_onboardings.append(orphan())
+                runner = FakeOnboarding(
+                    result=OnboardingResult(
+                        state=OnboardingState.STARTED, failure_reason=reason
+                    )
+                )
+
+                self.build(onboarding=runner).run_once()
+
+                declined = self.log.fields("audit.onboarding.dispatch_declined_failed")
+                self.assertEqual(len(declined), 1)
+                self.assertEqual(declined[0]["reason"], reason)
+                self.assertEqual(self.log.count("store.release_onboarding_claim"), 1)
+                self.assertEqual(set(self.state.onboarding_dispatched), set())
+
+    def test_a_started_dispatch_without_a_reason_is_not_released(self) -> None:
+        """异步接手成功（``started`` 且没有原因码）不放回——链正在跑。"""
+
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+
+        self.build(onboarding=runner).run_once()
+
+        self.assertEqual(self.log.count("store.release_onboarding_claim"), 0)
+
+    def test_a_failing_release_only_degrades_this_round(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding(fail_with=RuntimeError("boom"))
+
+        self.build(onboarding=runner, fail_on="release_onboarding_claim").run_once()
+
+        self.assertEqual(self.log.count("audit.onboarding.release_claim_failed"), 1)
 
     def test_an_invalid_runner_result_is_a_failure_not_a_success(self) -> None:
         self.state.stale_onboardings.append(orphan())
 
         class BogusRunner:
-            def start(self, *, event_id: str, open_id: str, trace_id: str):
+            def start(self, *, event_id: str, open_id: str, trace_id: str, claim_token=None):
                 return "已开通"
 
         self.build(onboarding=BogusRunner()).run_once()
 
-        self.assertEqual(self.log.count("audit.onboarding.reconcile_failed"), 1)
-        self.assertEqual(self.log.count("audit.onboarding.reconciled"), 0)
+        self.assertEqual(self.log.count("audit.onboarding.dispatch_failed"), 1)
+        self.assertEqual(self.log.count("audit.onboarding.dispatched"), 0)
 
     def test_a_scan_failure_ends_the_round_without_raising(self) -> None:
         self.state.stale_onboardings.append(orphan())
@@ -203,6 +252,109 @@ class FailureTests(ReconcilerTestCase):
         self.assertEqual(recovered, 0)
         self.assertEqual(self.log.count("audit.onboarding.reconcile_scan_failed"), 1)
         self.assertEqual(runner.calls, [])
+
+
+class CapacityCouplingTests(ReconcilerTestCase):
+    """认领量必须被执行器剩余容量压住（Epic D / S-D-02 修复包 P1-并发-1）。
+
+    认领即记账，而执行器满位时只能拒绝。两者不联动时差额就是被**永久烧掉**的事件数：
+    默认组合曾经是「一轮最多认领 20 条、执行器容量 12」，第 13 条起必然如此。
+    """
+
+    def test_the_sweep_claims_no_more_than_the_capacity(self) -> None:
+        for index in range(10):
+            self.state.stale_onboardings.append(orphan(index))
+        runner = FakeOnboarding()
+
+        recovered = self.build(onboarding=runner, capacity=lambda: 3).run_once()
+
+        self.assertEqual(recovered, 3)
+        self.assertEqual(len(runner.calls), 3)
+        self.assertEqual(
+            len(self.state.stale_onboardings), 7, "没被认领的那些必须原样留在候选里"
+        )
+
+    def test_zero_capacity_claims_nothing_at_all(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding()
+
+        recovered = self.build(onboarding=runner, capacity=lambda: 0).run_once()
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(self.log.count("store.claim_stale_onboarding"), 0)
+        self.assertEqual(runner.calls, [])
+
+    def test_the_capacity_source_is_readable_for_the_assembly_assertion(self) -> None:
+        source = (lambda: 5)
+        self.assertIs(self.build(capacity=source).capacity_source, source)
+        self.assertIsNone(self.build().capacity_source)
+
+
+class ClaimGenerationTests(ReconcilerTestCase):
+    """释放必须带认领代次，只能撤销**自己那一次**（ABA）。
+
+    没有代次时的序列：A 释放 → B 重新认领 → A 的重试再释放一次 → **B 的认领被清掉**，
+    那条链于是在没人看着的情况下被第三方解锁，可能被并发认领两次。
+    """
+
+    def test_the_runner_receives_the_claim_generation(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding()
+
+        self.build(onboarding=runner).run_once()
+
+        self.assertEqual(len(runner.claim_tokens), 1)
+        self.assertIsNotNone(runner.claim_tokens[0], "认领代次必须一路传给编排")
+
+    def test_the_release_carries_the_generation_it_claimed(self) -> None:
+        self.state.stale_onboardings.append(orphan())
+        runner = FakeOnboarding(
+            result=OnboardingResult(state=OnboardingState.STARTED, failure_reason="stopping")
+        )
+
+        self.build(onboarding=runner).run_once()
+
+        released = self.log.fields("store.release_onboarding_claim")
+        self.assertEqual(len(released), 1)
+        self.assertEqual(released[0]["claim_token"], runner.claim_tokens[0])
+
+    def test_a_stale_release_cannot_undo_somebody_elses_claim(self) -> None:
+        """A 释放 → B 认领 → A 重试释放：B 的认领必须还在。"""
+
+        self.state.stale_onboardings.append(orphan())
+        store = FakeStore(self.state, self.log)
+
+        first = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert first is not None
+        store.release_onboarding_claim(
+            event_id=first.event_id, claim_token=first.claim_token
+        )
+        second = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert second is not None
+        self.assertNotEqual(second.claim_token, first.claim_token)
+
+        # A 的重试：拿旧代次再释放一次。
+        store.release_onboarding_claim(
+            event_id=first.event_id, claim_token=first.claim_token
+        )
+
+        self.assertIn(
+            second.event_id,
+            self.state.onboarding_dispatched,
+            "陈旧的释放不得撤销别人的认领",
+        )
+
+    def test_a_release_without_a_generation_does_nothing(self) -> None:
+        """宁可留着不放，也不能撤销一次不知道是谁的认领。"""
+
+        self.state.stale_onboardings.append(orphan())
+        store = FakeStore(self.state, self.log)
+        claimed = store.claim_stale_onboarding(older_than=DEFAULT_STALE_AFTER)
+        assert claimed is not None
+
+        store.release_onboarding_claim(event_id=claimed.event_id)
+
+        self.assertIn(claimed.event_id, self.state.onboarding_dispatched)
 
 
 class SweepIntervalTests(ReconcilerTestCase):
