@@ -20,7 +20,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from lingxi.apps.scheduler import SchedulerConfig, _build_onboarding_duty
+from lingxi.apps.scheduler import (
+    SchedulerConfig,
+    _build_onboarding_duty,
+    _build_stalled_provisioning_duty,
+)
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
     PROBE_WATCHDOG_MARGIN_SECONDS,
@@ -28,8 +32,10 @@ from lingxi.apps.scheduler.onboarding import (
     OnboardingExecutor,
     assert_claim_limit_follows_capacity,
     assert_probe_timeouts_agree,
+    assert_stalled_lease_exceeds_chain_budget,
     monotonic_utc_clock,
 )
+from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
 from lingxi.core.conversation.onboarding_recovery import OnboardingReconciler
 from lingxi.core.permission.mcp_readiness import McpProbeError, ReadinessSchedule
 
@@ -430,6 +436,64 @@ class HandoffAssertionTests(unittest.TestCase):
         """看门狗只该在传输层**根本不遵守**超时时动手，不该抢在它前面。"""
 
         self.assertGreater(PROBE_WATCHDOG_MARGIN_SECONDS, 0)
+
+
+class StalledLeaseAssertionTests(unittest.TestCase):
+    """装配断言 5（本轮新增，Issue #282）：停摆租约必须严格长于链预算。"""
+
+    def test_the_default_lease_passes_with_the_default_schedule(self) -> None:
+        assert_stalled_lease_exceeds_chain_budget(
+            lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
+            publish_wait_seconds=120.0,
+            schedule=ReadinessSchedule(),
+        )
+
+    def test_a_lease_shorter_than_the_chain_budget_fails_the_assembly(self) -> None:
+        """**否定断言**：以后有人把就绪预算调大而没有同步调整租约，装配必须炸——
+        不成立时扫描会把一条正在正常跑的开通判成僵尸。"""
+
+        with self.assertRaises(RuntimeError):
+            assert_stalled_lease_exceeds_chain_budget(
+                lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
+                publish_wait_seconds=120.0,
+                # 把就绪预算调到比默认值大得多（例如从十五分钟调到一小时），
+                # 使链预算超过 45 分钟的租约——挡住的正是"以后有人调大预算却没有
+                # 碰这个模块一个字"这条时间炸弹。
+                schedule=ReadinessSchedule(
+                    interval_seconds=180, budget_seconds=3600, probe_timeout_seconds=20
+                ),
+            )
+
+    def test_a_lease_equal_to_the_budget_is_refused(self) -> None:
+        """租约必须**严格**长于链预算，相等也不够——留不出任何余量。"""
+
+        with self.assertRaises(RuntimeError):
+            assert_stalled_lease_exceeds_chain_budget(
+                lease_seconds=125.0,
+                publish_wait_seconds=100.0,
+                schedule=_FakeSchedule(budget_seconds=20, probe_timeout_seconds=0),
+            )
+
+
+class _FakeSchedule:
+    def __init__(self, *, budget_seconds: float, probe_timeout_seconds: float) -> None:
+        self.budget_seconds = budget_seconds
+        self.probe_timeout_seconds = probe_timeout_seconds
+
+
+class StalledProvisioningAssemblyTests(unittest.TestCase):
+    """`_build_stalled_provisioning_duty`：总能注册，不需要任何可选前置。"""
+
+    def test_a_minimally_configured_process_still_registers_the_duty(self) -> None:
+        audit = RecordingAudit()
+
+        duty = _build_stalled_provisioning_duty(
+            SchedulerConfig.from_env(BASE_ENV), stop=threading.Event(), audit=audit
+        )
+
+        self.assertEqual(duty.name, "开通中途停摆收口")
+        self.assertTrue(duty.notifier_wired, "飞书应用凭据是必填配置，通知出口总能建出来")
+        self.assertEqual(audit.records, [], "装配阶段没有任何前置缺项，不该留下任何审计")
 
 
 class ExecutorTests(unittest.TestCase):

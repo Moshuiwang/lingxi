@@ -31,8 +31,24 @@ class StructuredLogAuditSink:
     字段按**键名排序**输出：审计行会被比对和 grep，顺序随 ``PYTHONHASHSEED`` 变化的
     日志没法稳定断言。本类原样输出收到的字段——「不带资料值」这条约束属于调用方，
     对应断言 ``V-花名册-33`` 因此断在调用方产生的那几行上。
+
+    **失败类动作与失败终态升级到 ``WARNING``**（Issue #282 §0.3 核实结论修复）：
+    ``core/identity/onboarding_runner.py`` 与 ``core/conversation/
+    onboarding_recovery.py`` 的文档字符串在多处写下「动作名带 ``failed`` 后缀，由审计
+    实现升到 ``WARNING``」，但本类此前**无条件** ``logger.info``——那条承诺从未真正
+    兑现过：scheduler 里全部"响亮审计"其实一条都不响亮，全部淹在 INFO 流水里。形状照
+    ``apps/gateway/__init__.py`` 同名实现的既有规则（该实现已经把这条规则落地过一次，
+    这里只是把同一条规则搬进 scheduler，不新造判据）：动作名以
+    ``failed``/``error``/``unparsable`` 结尾即升级。额外加一条 scheduler 专属的判据——
+    ``onboarding.result`` 这一行本身**没有**失败后缀（它是每次开通收口时都会记的通用
+    终态记账动作，成功与失败共用同一个动作名），因此单独判它的 ``failure_reason``
+    字段：非空说明这次开通没有成功，同样应该响亮，不能靠后缀规则漏检。
     """
 
     def record(self, action: str, /, **fields: object) -> None:
+        promote = action.endswith(("failed", "error", "unparsable")) or (
+            action == "onboarding.result" and bool(fields.get("failure_reason"))
+        )
         rendered = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
-        logger.info("审计 action=%s %s", action, rendered)
+        log = logger.warning if promote else logger.info
+        log("审计 action=%s %s", action, rendered)

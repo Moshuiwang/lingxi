@@ -1889,6 +1889,154 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
         self.assertIsNone(self.users.read_status("usr_does_not_exist"))
 
 
+class StalledProvisioningAbortTest(IdentityPostgresTestCase):
+    """`abort_stalled_provisioning` 与 `_PROVISIONING_ORDER` 收紧的真库断言
+    （Issue #282，`V-开通-19`）。
+
+    这是「当场收口」与停摆扫描职责共用的**唯一**写入方式：条件更新只从调用方明确
+    列出的中途格收口，绝不碰 ``active``，绝不碰已停用账号——四条断言都只有真库能
+    证伪（``UPDATE ... WHERE`` 谓词的属性）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+
+        self.users = PostgresAppUserStore(self._dsn)
+        candidate = member()
+        located = locate_by_open_id(candidate.open_id, (candidate,))
+        decision = decide_first_contact(
+            open_id=candidate.open_id,
+            location=located,
+            employment=EmploymentStatus(
+                is_activated=True, is_exited=False, is_frozen=False, is_resigned=False, is_unjoin=False
+            ),
+            directory=DirectoryAvailability.AVAILABLE,
+            delegated_subject_open_id=DELEGATED_SUBJECT,
+        )
+        assert decision.draft is not None
+        self.user_id = self.users.record_identity(decision.draft).id
+
+    def _state(self) -> str:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT provisioning_state FROM app_user WHERE id = %s", (self.user_id,))
+            return str(cursor.fetchone()[0])
+
+    def _suspend(self) -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET account_state = 'suspended' WHERE id = %s", (self.user_id,)
+            )
+
+    def test_provisioning_can_be_aborted(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+
+        self.assertTrue(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing"),
+                reason="stalled_lease_expired",
+            )
+        )
+        self.assertEqual(self._state(), "aborted")
+
+    def test_mcp_syncing_can_be_aborted(self) -> None:
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+
+        self.assertTrue(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing"),
+                reason="publish_failed",
+            )
+        )
+        self.assertEqual(self._state(), "aborted")
+
+    def test_an_active_user_is_never_aborted(self) -> None:
+        """**否定断言**：绝不把已经成功的人打回失败——这是本方法存在的核心边界。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertFalse(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing"),
+                reason="stalled_lease_expired",
+            )
+        )
+        self.assertEqual(self._state(), "active")
+
+    def test_a_suspended_account_is_never_aborted(self) -> None:
+        """**否定断言**：已停用账号的中途状态原样保留，交给账号停用流程自己的语义
+        处理，不被收口顺手改写。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        self._suspend()
+
+        self.assertFalse(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing"),
+                reason="stalled_lease_expired",
+            )
+        )
+        self.assertEqual(self._state(), "provisioning")
+
+    def test_a_user_that_never_started_provisioning_is_never_aborted(self) -> None:
+        """**否定断言**：不越界收口没起跑的人——`matching`/`guest` 不在
+        `expected_states` 允许的中途格里。"""
+
+        self.assertEqual(self._state(), "matching")
+
+        self.assertFalse(
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id,
+                expected_states=("provisioning", "mcp_syncing"),
+                reason="stalled_lease_expired",
+            )
+        )
+        self.assertEqual(self._state(), "matching")
+
+    def test_advance_to_aborted_never_writes_through_advance_provisioning_state(self) -> None:
+        """**否定断言**：`_PROVISIONING_ORDER` 加了 `"aborted": 0` 之后，
+        `advance_provisioning_state(to="aborted")` 必须仍然返回 `False` 且库里一行
+        都不动——证明「只前进不回退」没有被这次改动开出后门，`aborted` 只能由
+        `abort_stalled_provisioning` 这个专用入口写入。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="aborted"))
+        self.assertEqual(self._state(), "provisioning")
+
+    def test_aborted_can_advance_all_the_way_back_to_active(self) -> None:
+        """收口之后用户的下一条消息触发一条全新的链：`aborted` 必须能重新推进到
+        `matching`/`provisioning`/`mcp_syncing`/`active`，否则它是一条死胡同
+        （Issue #282「必须一并修」一节）。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        self.users.abort_stalled_provisioning(
+            user_id=self.user_id,
+            expected_states=("provisioning", "mcp_syncing"),
+            reason="stalled_lease_expired",
+        )
+        self.assertEqual(self._state(), "aborted")
+
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="matching"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="mcp_syncing"))
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="active"))
+        self.assertEqual(self._state(), "active")
+
+    def test_expected_states_must_be_given_explicitly(self) -> None:
+        with self.assertRaises(ValueError):
+            self.users.abort_stalled_provisioning(
+                user_id=self.user_id, expected_states=(), reason="stalled_lease_expired"
+            )
+
+
 class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
     """把定位、判定与建档串起来跑一次，确认没有旁路能写出半条记录。"""
 

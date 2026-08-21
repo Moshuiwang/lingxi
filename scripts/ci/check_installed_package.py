@@ -243,6 +243,13 @@ REQUIRED_MODULES = (
     # onboarding_completion_notice 表。由 `_build_late_readiness_recovery_duty` 与
     # `_build_permission_retention_duty` 在函数内 import，同上一条同一条理由。
     "lingxi.adapters.postgres_late_readiness_recovery",
+    # 开通中途停摆收口职责（Issue #282，V-开通-19）：`apps/scheduler/__init__.py` 在
+    # **模块级** import（同 late_readiness_recovery 那一条理由，漏登记会直接让
+    # scheduler 起不来）。
+    "lingxi.apps.scheduler.stalled_provisioning",
+    # 停摆候选查询的持久化面：由 `_build_stalled_provisioning_duty` 在函数内
+    # import，同 `postgres_late_readiness_recovery` 一条理由。
+    "lingxi.adapters.postgres_stalled_provisioning",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
@@ -347,6 +354,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 理由与 `feishu_org_snapshot_reader` 那一行相同。
             "lingxi.apps.scheduler.late_readiness_recovery",
             "lingxi.adapters.postgres_late_readiness_recovery",
+            # 开通中途停摆收口职责（Issue #282，V-开通-19）：`apps/scheduler/
+            # __init__.py` 模块级 import，与 late_readiness_recovery 一节同一条
+            # "漏登记会直接让 scheduler 起不来"的理由；它的候选查询持久化面
+            # （`_build_stalled_provisioning_duty` 在函数内 import）同样必须登记。
+            "lingxi.apps.scheduler.stalled_provisioning",
+            "lingxi.adapters.postgres_stalled_provisioning",
             # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块，全部由
             # 包的 `__init__.py` 在模块级 import（维持既有的 `lingxi.apps.scheduler.
             # <名字>` 重导出契约），因此进程起来时这八个必然已经被 import 过一遍。

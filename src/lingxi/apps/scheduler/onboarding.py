@@ -49,6 +49,13 @@ scheduler ：本模块每轮认领若干条 → AutoOnboardingRunner（专属线
 （默认值曾经是「一轮最多认领 20 条、执行器容量 12」，第 13 条起必然被烧）。这条断言接替了
 搬迁前那条「双注入点必须同一实例」：那条挡的是「对账落回失败关闭桩、认领即平账」，
 而搬迁之后只剩一个注入点，同样的伤害改从容量差额这个入口进来。
+
+## 第五条断言（本轮新增，Issue #282）：**停摆租约必须长于链预算**
+
+:func:`assert_stalled_lease_exceeds_chain_budget` 挡的是
+:class:`~lingxi.apps.scheduler.stalled_provisioning.StalledProvisioningDuty` 的租约常量
+与就绪节奏、发布等待上界之间的隐性耦合——三个数字分别定义在三个不同的模块里，靠人记住
+"改这个之前要看那个"迟早会有一次漏看。断言把这条耦合从注释升级成装配期真的会炸的事实。
 """
 
 from __future__ import annotations
@@ -435,3 +442,36 @@ def assert_claim_limit_follows_capacity(reconciler: Any, executor: OnboardingExe
         )
     if getattr(source, "__self__", None) is not executor:
         raise RuntimeError("开通认领循环绑定的必须是本次装配的那个执行器")
+
+
+def assert_stalled_lease_exceeds_chain_budget(
+    *, lease_seconds: float, publish_wait_seconds: float, schedule: Any
+) -> None:
+    """装配断言 5（本轮新增，Issue #282）：**停摆租约必须严格长于一条链在
+    ``provisioning``/``mcp_syncing`` 两格上可能停留的最长时间**。
+
+    链在这两格上的最长自然停留 = 发布等待上界（``publish_wait_seconds``） + 就绪预算
+    （``schedule.budget_seconds``） + 单次探针超时（``schedule.probe_timeout_seconds``）
+    + 执行级硬截止余量（:data:`PROBE_WATCHDOG_MARGIN_SECONDS`）。默认组合约 20 分钟，
+    停摆扫描职责（:class:`~lingxi.apps.scheduler.stalled_provisioning.
+    StalledProvisioningDuty`）取 45 分钟租约，留出约 25 分钟余量。
+
+    不成立时，停摆扫描会把一条**正在正常跑**的开通判成僵尸并给用户推一条
+    ``LX-ONBOARD-001``。这条断言真正挡住的不是今天的默认值算错，而是**以后有人把就绪
+    预算从十五分钟调到三十分钟**——那一次改动完全不会碰
+    ``stalled_provisioning.py`` 一个字，却会静默地把租约变成假的；装配期在这里炸出来，
+    比生产上把一批正在跑的开通误判成僵尸便宜得多。
+    """
+
+    chain_budget = (
+        float(publish_wait_seconds)
+        + float(schedule.budget_seconds)
+        + float(schedule.probe_timeout_seconds)
+        + PROBE_WATCHDOG_MARGIN_SECONDS
+    )
+    if float(lease_seconds) <= chain_budget:
+        raise RuntimeError(
+            "停摆租约必须严格长于一条链在 provisioning/mcp_syncing 两格上可能停留的"
+            f"最长时间（租约={lease_seconds}s，链预算={chain_budget}s）：不成立时，"
+            "停摆扫描会把一条正在正常跑的开通误判成僵尸"
+        )

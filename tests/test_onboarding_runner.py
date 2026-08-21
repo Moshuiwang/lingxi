@@ -165,9 +165,12 @@ class FakeProvisioning:
 class FakeUsers:
     """``status=None`` 必须能表达"刚建完档却读不回来"，因此缺省同样用哨兵。"""
 
-    def __init__(self, status: Any = _UNSET) -> None:
+    def __init__(self, status: Any = _UNSET, *, abort_result: bool = True) -> None:
         self.status = UserProvisioningStatus("enabled", "matching", 0) if status is _UNSET else status
         self.advanced: list[str] = []
+        #: `_abort_if_stalled` 每一次调用的完整参数（Issue #282 §7.4「当场收口」）。
+        self.aborted: list[tuple[str, tuple[str, ...], str]] = []
+        self._abort_result = abort_result
 
     def read_status(self, user_id: str) -> UserProvisioningStatus | None:
         return self.status
@@ -175,6 +178,12 @@ class FakeUsers:
     def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
         self.advanced.append(to)
         return True
+
+    def abort_stalled_provisioning(
+        self, *, user_id: str, expected_states: Sequence[str], reason: str
+    ) -> bool:
+        self.aborted.append((user_id, tuple(expected_states), reason))
+        return self._abort_result
 
 
 class FakeEnvironment:
@@ -1005,6 +1014,109 @@ class ActiveWriteTests(unittest.TestCase):
             parts["audit"].facts("onboarding.result")["failure_reason"], "state_advance_refused"
         )
         self.assertIn("onboarding.state_advance_refused_failed", parts["audit"].actions())
+
+
+class StalledAbortTests(unittest.TestCase):
+    """编排层「当场收口」（Issue #282 §7.4，`V-开通-19` 的一半）：链把用户推进到
+    `provisioning`（分水岭）之后遇到任何非 `SYNC_TIMEOUT`/`COMPLETED` 终态，都要当场
+    把状态收口成 `aborted`，不必等停摆扫描的 45 分钟租约。"""
+
+    def test_a_publish_failure_after_the_watershed_is_collapsed_at_once(self) -> None:
+        parts, _ = run_once(decisions=FakeDecisions(statuses=("failed",)))
+        self.assertEqual(
+            parts["users"].aborted,
+            [(USER_ID, (STATE_PROVISIONING, STATE_MCP_SYNCING), "publish_failed")],
+        )
+
+    def test_a_publish_not_completed_timeout_after_the_watershed_is_collapsed(self) -> None:
+        parts, _ = run_once(decisions=FakeDecisions(statuses=("pending",)))
+        self.assertEqual(len(parts["users"].aborted), 1)
+        self.assertEqual(parts["users"].aborted[0][2], "publish_not_completed")
+
+    def test_a_readiness_technical_failure_after_the_watershed_is_collapsed(self) -> None:
+        parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.TECHNICAL_FAILURE))
+        self.assertEqual(len(parts["users"].aborted), 1)
+        self.assertEqual(parts["users"].aborted[0][2], "readiness_technical_failure")
+
+    def test_a_no_permission_after_grant_inconsistency_is_collapsed(self) -> None:
+        """Issue #282 §0.2 明确点名的洞：`mcp_syncing` 上从未判过 `timed_out` 的失败，
+        此前既不在迟到就绪恢复的候选集合里，也没有任何东西会回来看。"""
+
+        parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.NO_PERMISSION))
+        self.assertEqual(len(parts["users"].aborted), 1)
+        self.assertEqual(parts["users"].aborted[0][2], "readiness_no_permission_after_grant")
+
+    def test_a_refused_state_advance_is_collapsed(self) -> None:
+        """Issue #282 §0.2 同一张表里点名的另一个洞：`state_advance_refused`。"""
+
+        class RefusingUsers(FakeUsers):
+            def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
+                self.advanced.append(to)
+                return to != STATE_ACTIVE
+
+        users = RefusingUsers()
+        parts, _ = run_once(users=users)
+        self.assertEqual(len(users.aborted), 1)
+        self.assertEqual(users.aborted[0][2], "state_advance_refused")
+
+    def test_failures_before_the_watershed_are_never_collapsed(self) -> None:
+        """身份定位、匹配、令牌签发、用户环境四类失败发生在把用户推进到 `provisioning`
+        之前——它们本来就会自然停在 `matching`/`guest`，不在 `_PROVISIONING_IN_FLIGHT`
+        里，管线下一条消息自然重试（Issue #282 §0.1：卡住的判据不是失败，是失败发生在
+        分水岭之后）。这里没有一个确定的、已经越过分水岭的 `user_id`，因此绝不能尝试
+        收口。"""
+
+        cases: list[dict[str, Any]] = [
+            {"directory": FakeDirectory(availability=DirectoryAvailability.STALE)},
+            {"roster": FakeRoster(rows=None)},
+            {"tokens": FakeTokens(error=RuntimeError())},
+            {"environment": FakeEnvironment(error=PermissionError())},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                parts, _ = run_once(**overrides)
+                self.assertEqual(parts["users"].aborted, [])
+
+    def test_sync_timeout_is_never_collapsed(self) -> None:
+        """**否定断言**：`SYNC_TIMEOUT` 归 `V-开通-18`（迟到就绪恢复）继续等待，绝不能
+        被本链的「当场收口」抢走——抢走会让 `provisioning_state` 提前变成 `aborted`，
+        迟到就绪恢复的候选查询立刻少了一个人，而那个人本来可能几分钟后就真的就绪。"""
+
+        parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT))
+        self.assertEqual(parts["users"].aborted, [])
+        self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
+
+    def test_a_completed_chain_is_never_collapsed(self) -> None:
+        parts, _ = run_once()
+        self.assertEqual(parts["users"].aborted, [])
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_COMPLETED)
+
+    def test_abort_failure_does_not_break_the_rest_of_execute(self) -> None:
+        """收口写口本身抛异常：只记一条响亮审计，不阻止终态通知与记账收口——收口失败
+        不改写已经决定的终态。"""
+
+        class ExplodingAbort(FakeUsers):
+            def abort_stalled_provisioning(
+                self, *, user_id: str, expected_states: Sequence[str], reason: str
+            ) -> bool:
+                raise RuntimeError("boom")
+
+        parts, _ = run_once(
+            users=ExplodingAbort(), decisions=FakeDecisions(statuses=("failed",))
+        )
+        self.assertIn("onboarding.stalled_abort_failed", parts["audit"].actions())
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+
+    def test_a_cas_that_finds_zero_rows_still_lets_the_chain_finish_normally(self) -> None:
+        """CAS 返回 `False`（状态在候选查到与收口之间被别的路径改写）不是错误，链照常
+        收口——`abort_stalled_provisioning` 的 0 行结果不需要特殊处理。"""
+
+        parts, _ = run_once(
+            users=FakeUsers(abort_result=False), decisions=FakeDecisions(statuses=("failed",))
+        )
+        self.assertEqual(len(parts["users"].aborted), 1)
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
 
 
 class UnchangedPublishTests(unittest.TestCase):
