@@ -929,6 +929,77 @@ def _build_late_readiness_recovery_duty(
     return duty
 
 
+def _build_stalled_provisioning_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> Any:
+    """装配开通中途停摆收口职责（Issue #282，`V-开通-19`）。**总能注册**，不需要任何
+    可选前置——候选查询、收口写入（复用
+    :meth:`~lingxi.adapters.postgres_identity.PostgresAppUserStore.
+    abort_stalled_provisioning`）与通知都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用
+    凭据，两者都是 :class:`SchedulerConfig` 的必填项，形状照
+    :func:`_build_late_readiness_recovery_duty`。
+
+    补的是 :mod:`lingxi.core.identity.onboarding_runner` 模块文档「同一类缺口的另一半」
+    一节登记的缺口：首次开通链在把用户推进到 ``provisioning`` 之后死掉、且编排自己的
+    「当场收口」也够不到（进程被强杀、收口写入自己那一次恰好失败），此前没有任何东西
+    会再回来看这个人。语义、放在哪、节奏怎么定见
+    :mod:`lingxi.apps.scheduler.stalled_provisioning` 的模块文档；本函数只做装配。
+
+    装配断言 5（本轮新增）：停摆租约必须严格长于一条链在 provisioning/mcp_syncing
+    两格上可能停留的最长时间——见
+    :func:`~lingxi.apps.scheduler.onboarding.assert_stalled_lease_exceeds_chain_budget`。
+    这里只是拿一份 :class:`ReadinessSchedule` 来核对预算数字，**不需要真的装配探针**
+    （本职责本身也不发探针，与迟到就绪恢复不同），因此这条断言在探针端点是否配置好之前
+    就能跑。
+    """
+
+    from lingxi.adapters.feishu_user_message import FeishuUserMessages
+    from lingxi.adapters.postgres_identity import PostgresAppUserStore
+    from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
+    from lingxi.apps.scheduler.onboarding import (
+        CatalogNotifier,
+        assert_stalled_lease_exceeds_chain_budget,
+    )
+    from lingxi.apps.scheduler.stalled_provisioning import (
+        DEFAULT_STALLED_LEASE_SECONDS,
+        StalledProvisioningDuty,
+    )
+    from lingxi.config.content import default_content_catalog
+
+    dsn = config.postgres_dsn
+    timeouts = config.postgres_timeouts
+
+    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
+    assert_stalled_lease_exceeds_chain_budget(
+        lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
+        publish_wait_seconds=config.onboarding_publish_wait_seconds,
+        schedule=schedule,
+    )
+
+    duty = StalledProvisioningDuty(
+        candidates=PostgresStalledProvisioningStore(dsn, timeouts=timeouts),
+        aborter=PostgresAppUserStore(dsn, timeouts=timeouts),
+        notifier=CatalogNotifier(
+            sender=FeishuUserMessages(
+                base_url=config.feishu_base_url,
+                app_id=config.feishu_app_id,
+                app_secret=config.feishu_app_secret,
+            ),
+            catalog=default_content_catalog(),
+        ),
+        audit=audit,
+        lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
+        stop=stop,
+    )
+    logger.info(
+        "开通中途停摆收口职责已装配 租约=%ss", DEFAULT_STALLED_LEASE_SECONDS
+    )
+    return duty
+
+
 def _build_org_snapshot_sync_duty(
     config: SchedulerConfig,
     *,
@@ -1351,6 +1422,14 @@ def build_loop(
     # `if ... is not None` 判断。
     duties.append(
         _build_late_readiness_recovery_duty(config, stop=stop, audit=sink)
+    )
+    # 开通中途停摆收口（Issue #282，`V-开通-19`）排在迟到就绪恢复**之后**：两者是同一
+    # 量级的"回来看已经安静下来的开通"职责，位置只是"同一轮内先声明的职责先跑"的自然
+    # 顺序，不构成数据依赖——两者的候选集合按各自的判据互补（见
+    # `adapters/postgres_stalled_provisioning.py` 模块文档），不会互相抢候选。**总能
+    # 注册**（没有可选前置会让它整体不装配），因此不需要 `if ... is not None` 判断。
+    duties.append(
+        _build_stalled_provisioning_duty(config, stop=stop, audit=sink)
     )
     if alerting_duty is not None:
         duties.append(alerting_duty)

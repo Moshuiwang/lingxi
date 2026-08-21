@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -39,13 +40,25 @@ from lingxi.core.ids import new_id
 
 logger = logging.getLogger(__name__)
 
-# 开通状态的推进次序（迁移 008 的 CHECK 是取值域，这里是**先后**）。只列首次开通链上
-# 会经过的四格：`guest` 是建档默认值之前的形态，`manual_review` / `aborted` 不在自动
-# 开通链上（产品负责人 2026-08-08 裁定：确定性失败统一无权限终态，不建人工核对）。
+# 开通状态的推进次序（迁移 008 的 CHECK 是取值域，这里是**先后**）。首次开通链上会
+# 经过的四格是 `guest → matching → provisioning → mcp_syncing → active`；
+# `manual_review` 不在自动开通链上（产品负责人 2026-08-08 裁定：确定性失败统一无权限
+# 终态，不建人工核对），因此不出现在这张表里。
 # 不在表里的状态一律拒绝推进，而不是当成"排在最前面"——后者会让一个拼错的状态名把
 # 任何用户都推成 active。
+#
+# `aborted` 与 `guest` 同 rank 0（Issue #282）：一条开通中途死掉、被
+# :meth:`PostgresAppUserStore.abort_stalled_provisioning` 收口成 `aborted` 之后，
+# 用户的下一条消息必须能重新从头跑一条全新的链——`rank 0` 让 `advance_provisioning_state`
+# 认为「从 aborted 出发可以推进到 matching/provisioning/mcp_syncing/active」，语义是
+# 「重新开始的起点」，不是「比 guest 更早的状态」。**这不会给 `advance_provisioning_state`
+# 开一个反向口子**：`to="aborted"` 时 `allowed`（比 aborted 的 rank 更低的状态集合）仍然是
+# 空元组，第 465-466 行的空表检查照常拒绝、不写库——`aborted` 只能由本文件下方的
+# :meth:`abort_stalled_provisioning` 专用入口写入，`advance_provisioning_state` 的
+# 「只前进」合同（`V-开通-04`）一个字都没有放宽。
 _PROVISIONING_ORDER: dict[str, int] = {
     "guest": 0,
+    "aborted": 0,
     "matching": 1,
     "provisioning": 2,
     "mcp_syncing": 3,
@@ -461,7 +474,11 @@ class PostgresAppUserStore:
         if to not in _PROVISIONING_ORDER:
             raise ValueError("不认识的开通状态，拒绝推进")
         allowed = tuple(state for state, rank in _PROVISIONING_ORDER.items() if rank < _PROVISIONING_ORDER[to])
-        if not allowed:  # pragma: no cover - 推进表的第一格不是任何一次推进的目标
+        if not allowed:
+            # rank 0 的两格（``guest``、``aborted``）都会走到这里：没有任何状态排在
+            # 它们前面，因此空表检查照常拒绝、不写库。这正是 `to="aborted"` 不会给本方法
+            # 开反向口子的原因——``aborted`` 只能由 :meth:`abort_stalled_provisioning`
+            # 这个专用入口写入（Issue #282），本方法的「只前进」合同一个字都没有放宽。
             return False
         # 推到 ``active`` 还要求账号此刻是启用的：从建档后那次复核到就绪最长隔十七分钟
         # （发布等待 + 就绪预算），管理员在这段时间里停用账号是真实形状。写在 ``WHERE``
@@ -477,6 +494,66 @@ class PostgresAppUserStore:
             changed = cursor.rowcount
         if changed:
             logger.info("开通状态推进 user=%s state=%s", user_id, to)
+        return bool(changed)
+
+    def abort_stalled_provisioning(
+        self, *, user_id: str, expected_states: Sequence[str], reason: str
+    ) -> bool:
+        """把一条中途停摆的开通收口成 ``aborted``。**条件更新，影响 0 行就是没收口。**
+
+        与 :meth:`advance_provisioning_state` 分开是刻意的（Issue #282）：那一个的合同
+        是「只前进」（`V-开通-04`），在它内部开一个反向口子会让守卫读起来自相矛盾，也会
+        让任何调用方都能写 ``aborted``。这一个的合同是「只从调用方明确列出的中途格收口，
+        绝不碰 ``active``，绝不碰已停用账号」——三个 ``AND`` 条件结构上保证了这一点，
+        **不依赖调用方自觉传对** ``expected_states``（外部独立审查 P2-3 修复：此前只有
+        ``provisioning_state = ANY(%s)`` 一层，若调用方误传 ``("active",)``，SQL 层
+        什么都挡不住，「不依赖调用方自觉」只是文档字符串里的一句空话）：
+
+        - ``provisioning_state = ANY(%s)``：调用方必须显式列出允许收口的中途格，不给
+          默认值（同一条纪律见 :meth:`late_onboarding_recovery_candidates` 的 ``reason``
+          参数）。当前仅有两个合法调用方——首次开通编排跑到失败终态时的「当场收口」
+          （``core/identity/onboarding_runner.py``）与停摆扫描职责的「租约到期收口」
+          （``apps/scheduler/stalled_provisioning.py``），两者传的都是
+          ``("provisioning", "mcp_syncing")``。
+        - ``provisioning_state <> 'active'``：**独立于上面那条、结构上永远生效**的第二
+          道闸——即使调用方把 ``expected_states`` 传错（例如手滑传了
+          ``("active",)`` 或未来某次改动往里加了这个值），这一条本身与调用方传了什么
+          完全无关，`active` 永远不可能被这次收口覆盖。两条约束同时满足的交集才是真正
+          允许被收口的行；单靠调用方传对参数不是这份保证的来源。
+        - ``account_state = 'enabled'``：与 :meth:`advance_provisioning_state` 推到
+          ``active`` 时的既有守卫同一条口径，已停用账号的中途状态原样保留，交给账号
+          停用流程自己的语义处理，不被这条收口顺手改写。
+
+        两个调用方汇合在同一个方法而不是各写一份 SQL，是为了让「什么条件下允许把一个
+        用户判定为『这次开通结束了、没有成功』」只有一处真相来源——两处调用方各自的
+        触发判据（是否真的到了失败终态、是否真的超过了停摆租约）不同，但**收口本身**
+        的安全边界必须完全一致。
+
+        ``reason`` 只进日志，不落库——``app_user`` 没有为它开一列（设计结论：本次机制
+        修复零迁移，见 Issue #282 的方案讨论）。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("收口必须指明用户")
+        if not isinstance(expected_states, Sequence) or isinstance(expected_states, (str, bytes)):
+            raise TypeError("必须显式列出允许收口的中途格，不接受默认值")
+        states = tuple(expected_states)
+        if not states:
+            raise ValueError("必须显式列出允许收口的中途格")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("必须说明收口原因")
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET provisioning_state = 'aborted', updated_at = now() "
+                "WHERE id = %s AND provisioning_state = ANY(%s) "
+                "AND provisioning_state <> 'active' AND account_state = 'enabled'",
+                (user_id, list(states)),
+            )
+            changed = cursor.rowcount
+        if changed:
+            logger.info(
+                "开通中途停摆已收口 user=%s reason=%s", user_id, reason.strip()
+            )
         return bool(changed)
 
     def count(self) -> int:

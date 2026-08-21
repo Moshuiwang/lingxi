@@ -176,6 +176,7 @@ from lingxi.apps.scheduler.assembly import (
     _build_readiness_follow_up,
     _build_roster_audit_duty,
     _build_roster_snapshot_sync_duty,
+    _build_stalled_provisioning_duty,
     build_loop,
 )
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
@@ -219,6 +220,12 @@ from lingxi.apps.scheduler.retention import (
     RetentionCleanupDuty,
 )
 from lingxi.apps.scheduler.roster_audit import RosterAuditDuty, RosterSnapshotSyncDuty
+from lingxi.apps.scheduler.stalled_provisioning import (
+    DEFAULT_STALLED_LEASE_SECONDS,
+    DEFAULT_STALLED_LIMIT,
+    StalledProvisioningDuty,
+    StalledProvisioningReport,
+)
 
 logger = logging.getLogger(__name__)
 

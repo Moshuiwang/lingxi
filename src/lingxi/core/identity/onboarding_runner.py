@@ -128,6 +128,29 @@ activate_after_late_readiness`，条件更新只在 `provisioning_state = 'mcp_s
 ——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
 另一个 Story 的范围，本次改动只更新了验收矩阵。
 
+**同一类缺口的另一半，现已由本模块自己补上**（Issue #282）：把用户推进到
+``provisioning``（``_run`` 第 715 行前后的分水岭）之后，本链在 ``_publish``/``_confirm``
+里遇到的**任何非 ``SYNC_TIMEOUT`` 失败终态**——本侧故障（发布未完成、发布失败/被
+取代）、资料不全（缺邮箱导致发布行拼不出来）、``_confirm`` 里的账号停用复核、状态推进
+被拒——都会让 ``provisioning_state`` 永久停在 ``provisioning``/``mcp_syncing``，而管线
+的短路分支（``pipeline.py`` 对 ``PROVISIONING`` 状态照发「正在完成…请稍候」）会让用户
+从此再也等不到任何结论。修法是 :meth:`AutoOnboardingRunner._abort_if_stalled`：跑到
+失败终态且早前已经越过分水岭时，**当场**把 ``provisioning_state`` CAS 收口成
+``aborted``（:meth:`~lingxi.adapters.postgres_identity.PostgresAppUserStore.
+abort_stalled_provisioning`），不必等待任何扫描周期。``aborted`` 在
+``adapters/postgres_identity.py`` 的推进表里与 ``guest`` 同 rank——用户的下一条消息会
+被管线判成 ``NOT_PROVISIONED``，自然触发一条全新的开通链（新 ``event_id``、新
+``trace_id``），**不是**把状态推回 ``guest``/``matching`` 再释放认领去自动重跑（那会
+撞上「不得盲目重跑整个流程」的既有边界，也会引入双跑风险，见
+:mod:`lingxi.apps.scheduler.stalled_provisioning` 模块文档的完整论证）。
+
+**「当场收口」覆盖不了链本身死掉的那一半**（进程被强杀、执行线程异常退出到
+``_execute`` 都够不到的地方）：这一半由 :class:`~lingxi.apps.scheduler.
+stalled_provisioning.StalledProvisioningDuty` 按认领时间 + 四十五分钟租约周期性兜底，
+两者共用同一个收口方法，只是触发判据不同（前者是"已经确定失败"，后者是"太久没有
+任何进展"）。``SYNC_TIMEOUT`` 在两条路径里都被显式排除——它仍然只属于迟到就绪恢复
+职责（``V-开通-18``）。
+
 ## 发布由谁执行
 
 **本模块只排发布意图，不自己写外部权限表格。** 外部表格的唯一写入方是
@@ -261,6 +284,16 @@ class UserStateStore(Protocol):
 
     def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
         """把 ``provisioning_state`` 往前推。**只前进不回退**（`V-开通-04`）。"""
+
+    def abort_stalled_provisioning(
+        self, *, user_id: str, expected_states: Sequence[str], reason: str
+    ) -> bool:
+        """把一条中途停摆的开通收口成 ``aborted``（Issue #282）。条件更新，影响 0 行
+        就是没收口——见 ``adapters/postgres_identity.PostgresAppUserStore.
+        abort_stalled_provisioning`` 的完整合同。本类只在「跑到失败终态、但早前已经
+        把这个人推进到 provisioning」时调用它（见 :meth:`AutoOnboardingRunner.
+        _abort_if_stalled`），停摆扫描职责（``apps/scheduler/stalled_provisioning.py``）
+        调用的是同一个方法。"""
 
 
 @dataclass(frozen=True)
@@ -523,8 +556,18 @@ class AutoOnboardingRunner:
     ) -> None:
         """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。"""
 
+        # **§7.4 编排层当场收口的挂钩**（Issue #282）：``_run`` 在把这个人推进到
+        # ``provisioning``（第 715 行的分水岭）之后才会写 ``stalled["user_id"]``——
+        # 见 :meth:`_run` 对应那一行的注释。用一个跨异常边界都能读到的可变容器，而不是
+        # 给 ``_Terminal`` 加字段：`_run` 既可能正常返回 ``_Terminal``，也可能让
+        # ``OnboardingChainError`` 或未预期异常穿透到下面的 ``except``，两条路径都要能
+        # 拿到"这条链到底有没有一个可能被卡住的用户"这件事，而后者完全不经过
+        # ``_Terminal``。
+        stalled: dict[str, str | None] = {"user_id": None}
         try:
-            terminal = self._run(event_id=event_id, open_id=open_id, trace_id=trace_id)
+            terminal = self._run(
+                event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled
+            )
         except _ChainAborted:
             # 停机中止：放回认领，下一轮（或下次启动）从头重跑。整条链的每一步都幂等，
             # 重跑不会重复建档、重复发布或重复通知。
@@ -563,11 +606,24 @@ class AutoOnboardingRunner:
             suffix="",
             trace_id=trace_id,
         )
+        if delivered:
+            # **只有真的送达才当场收口**（外部独立审查 P2-1 修复）：此前的判据是
+            # ``delivered or not self._release_for_notify(...)``，其中第二个析取项
+            # 覆盖"两轮通知全部失败、放弃"的分支——那种情况下用户**一条终态都没
+            # 收到**，却已经把状态收口成 ``aborted``。``aborted`` 不在
+            # ``StalledProvisioningDuty`` 的候选判据（``provisioning``/
+            # ``mcp_syncing``）里，于是这个人从此**结构上不可能再被 45 分钟兜底
+            # 捞到**——唯一还欠他一个结论的通道被自己关掉了。收窄到只在
+            # ``delivered`` 为真时收口之后，通知彻底失败的这条链原样留在中途格，
+            # 45 分钟后 ``StalledProvisioningDuty`` 会用**独立**的通知出口重新尝试
+            # 告诉他，而不是被这里提前判死。
+            self._abort_if_stalled(stalled["user_id"], terminal, trace_id=trace_id)
         if delivered or not self._release_for_notify(
             event_id=event_id, trace_id=trace_id, claim_token=claim_token
         ):
             # 送到了，或者已经放回过一次仍然送不到：记账收口。第二种情况留了一条
-            # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失。
+            # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失——
+            # 但**不再**把它当成"当场收口"的触发条件（见上）。
             try:
                 self._ledger.mark_onboarding_dispatched(event_id=event_id)
             except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次
@@ -672,6 +728,50 @@ class AutoOnboardingRunner:
         )
         return True
 
+    def _abort_if_stalled(
+        self, user_id: str | None, terminal: _Terminal, *, trace_id: str
+    ) -> None:
+        """本链已经确定失败终态、且早前已经把这个人推进到 ``provisioning``：**当场**
+        收口成 ``aborted``，不必等停摆扫描职责的四十五分钟租约（设计「编排层当场收口」，
+        Issue #282 §0.2/§2.4 的对称修复）。
+
+        **跳过 ``SYNC_TIMEOUT``**：那一路仍然可能就绪，归属迟到就绪恢复职责
+        （``V-开通-18``）继续按自己的节奏等待，本链**绝不能**抢它的活——``provisioning_
+        state`` 必须原样留在 ``mcp_syncing``。**跳过 ``COMPLETED``**：那一路已经推进
+        到 ``active``，条件更新天然不会命中，跳过只是省一次没有意义的空写。
+
+        ``user_id`` 为 ``None`` 表示这条链在把用户推进到 ``provisioning`` 之前就已经
+        失败（身份定位、匹配、建档三步的失败终态）——那些失败已经自然停在
+        ``matching``/``guest``，不在 ``_PROVISIONING_IN_FLIGHT`` 里，不需要本方法处理
+        （见模块文档「两个洞的共同形状」：卡住的判据不是失败，是失败发生在把用户推进
+        到 ``provisioning`` 之后）。
+
+        条件更新本身是幂等且安全的：这个人此刻若已经不在 ``provisioning``/
+        ``mcp_syncing``（被停摆扫描先一步收口、被另一条并发链推进到 ``active``、或账号
+        已经被停用），这里就是一次 0 行的空写，不会覆盖任何人的真实状态
+        （`adapters.postgres_identity.PostgresAppUserStore.abort_stalled_provisioning`
+        的 CAS 守卫）。
+        """
+
+        if user_id is None or terminal.state in (
+            OnboardingState.SYNC_TIMEOUT,
+            OnboardingState.COMPLETED,
+        ):
+            return
+        try:
+            self._users.abort_stalled_provisioning(
+                user_id=user_id,
+                expected_states=(STATE_PROVISIONING, STATE_MCP_SYNCING),
+                reason=terminal.reason or terminal.key,
+            )
+        except Exception as error:  # noqa: BLE001 - 收口失败不改写已经决定的终态
+            self._audit.record(
+                "onboarding.stalled_abort_failed",
+                user=user_id,
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
     # ------------------------------------------------------------------
     # 链
     # ------------------------------------------------------------------
@@ -682,8 +782,21 @@ class AutoOnboardingRunner:
         if self._should_stop():
             raise _ChainAborted()
 
-    def _run(self, *, event_id: str, open_id: str, trace_id: str) -> _Terminal:
-        """一次开通的固定次序。每一步的失败去向都在这里显式返回。"""
+    def _run(
+        self,
+        *,
+        event_id: str,
+        open_id: str,
+        trace_id: str,
+        stalled: dict[str, str | None],
+    ) -> _Terminal:
+        """一次开通的固定次序。每一步的失败去向都在这里显式返回。
+
+        ``stalled`` 是调用方（``_execute``）传入的可变容器：一旦这个人被推进到
+        ``provisioning``（下面那行 ``advance_provisioning_state(to=STATE_PROVISIONING)``
+        之后），就把 ``user_id`` 写进去——从这一刻起，本链任何一种失败终态都可能让他
+        停在中途格，调用方需要这个信号才能做「当场收口」（见 :meth:`_abort_if_stalled`）。
+        """
 
         self._stop_guard()
         located = self._locate(open_id)
@@ -713,6 +826,12 @@ class AutoOnboardingRunner:
         issued = self._issue_token(user_id)
         self._create_environment(user_id, issued)
         self._users.advance_provisioning_state(user_id, to=STATE_PROVISIONING)
+        # **分水岭**（Issue #282 §0.1）：从这一行起，任何失败终态都会让这个人停在
+        # ``provisioning``/``mcp_syncing``，不再自然回到 ``matching``。把 ``user_id``
+        # 交给调用方的可变容器，供 ``_abort_if_stalled`` 判断「要不要当场收口」——写在
+        # 这里而不是更早，是因为更早的失败（身份定位、匹配、建档）本来就停在
+        # ``matching``/``guest``，不在 ``_PROVISIONING_IN_FLIGHT`` 里，不需要收口。
+        stalled["user_id"] = user_id
 
         self._stop_guard()
         published = self._publish(user_id, request, aggregate, issued)
