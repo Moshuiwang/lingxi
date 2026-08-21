@@ -148,36 +148,86 @@ synchronize 不再自动跑 `image` job（`gate` / `extras` 两个快速检查�
 不受影响）；直接开给 `main` 的普通 PR（例如某个 `fix/xxx` 分支）不受任何影响，
 `image` 仍然照旧每次自动跑——这是"PR 检查阶段的可复现性门"，本 Issue 不动它。
 
-**编排者要固定某个候选提交（准备验收或合并前）时的显式姿势**：
+**编排者要固定某个候选提交（准备验收或合并前）时的主姿势——空提交 Story PR 带
+`[image-candidate]` 标记**（机器人身份可执行，不需要人工操作 GitHub 网页）：
 
 ```bash
-# 1. 找到跟踪 PR 当前这次 synchronize 对应的 Epic Full run（base 是 main，
-#    因此直接挂在 ci.yml 名下，不像 story.yml 那样需要嵌套查找）：
-gh run list --repo Moshuiwang/lingxi --workflow=ci.yml --branch <epic 分支名> --limit 5
+# 0. 前提：`epic/**` 挂了 ruleset「仅 Story Fast 后合并」（pull_request 规则 +
+#    current_user_can_bypass: never），机器人身份不能直接 `git push` 空提交到
+#    epic 分支——服务端会拒绝。必须走「开 Story PR、Story Fast 通过、squash 合并」
+#    这条已有路径（与其余 Story PR 完全一样，只是这个 PR 的 diff 是空的）。
 
-# 2. 确认该 run 的 gate / extras 已经通过（image 会显示 skipped，这是预期状态，
-#    不是失败），再对同一个 run 做一次**全量**重跑（不要加 --failed，
-#    --failed 只重跑失败的 job，skipped 的 image 不会被算作失败）：
-gh run rerun <run id> --repo Moshuiwang/lingxi
+# 1. 从 epic 分支当前 tip 开一个只有空提交的临时分支：
+git fetch origin <epic 分支名>
+git checkout -b chore/image-candidate-trigger origin/<epic 分支名>
+git commit --allow-empty -m "chore: 冻结候选镜像构建触发 [image-candidate]"
+git-claude-tz push -u origin chore/image-candidate-trigger
+
+# 2. 开 Story PR，base 指向 epic 分支（不是 main）：
+gh pr create --repo Moshuiwang/lingxi \
+  --base <epic 分支名> --head chore/image-candidate-trigger \
+  --title "chore: 冻结候选镜像构建触发 [image-candidate]" \
+  --body "空提交触发，无实际代码改动；用于让编排者显式构建一份候选镜像（Issue #278）。"
+
+# 3. 等 Story Fast 变绿（空 diff 会被 classify_story_changes.py 判成 full——
+#    "没有改动路径"和"高风险改动"用同一个兜底分支，见 scripts/ci/
+#    classify_story_changes.py 的 classify()——因此这个触发 PR 自己也会跑一遍
+#    完整 Epic Full，包含它自己的一次镜像构建；这是空 diff 场景下唯一可选的
+#    Story Fast 路径，不能绕开）：
+gh pr checks <PR 编号> --repo Moshuiwang/lingxi --watch
+
+# 4. squash 合并，**显式指定提交信息**（默认的 squash 消息不保证带上标记，
+#    必须用 --subject 显式设置）：
+gh pr merge <PR 编号> --repo Moshuiwang/lingxi --squash \
+  --subject "chore: 冻结候选镜像构建触发 [image-candidate]" --body ""
 ```
 
-`gh run rerun` 重跑的是**同一个 run**，会原样保留它的 `pull_request` 触发身份
-（PR 编号、head sha 都不变），只是 `github.run_attempt` 从 `1` 变成 `2`——
-`.github/workflows/ci.yml` 的 `image` job 的 `if` 条件正是用这个信号判断"这次是
-编排者要的构建"，见该 job 上方注释。重跑完成后，`image` 真正执行，下面「PR 候选镜像
-下载与校验」一节描述的 `epic-candidate-images-pr-<PR 编号>-<PR head sha>` artifact
-与 `epic-candidate-pr-<PR 编号>-<PR head sha>`（`candidate.json`，`Main Publish`
+第 4 步产生的 squash 提交成为 epic 分支新的 tip，把跟踪 PR（epic 分支 -> `main`）
+再 synchronize 一次；`.github/workflows/ci.yml` 的 `classify` job 会用
+`git log -1 --format=%B <PR head sha>` 读出这个提交的完整信息（不是 `HEAD`——
+`pull_request` 事件默认检出的是 GitHub 生成的临时 merge 提交，其信息是自动生成的
+合并说明，不是真正头提交的信息），检测到 `[image-candidate]` 就把
+`image` job 的按需跳过条件解除，这次 `image` 真正执行，下面「PR 候选镜像下载与
+校验」一节描述的 `epic-candidate-images-pr-<PR 编号>-<PR head sha>` artifact 与
+`epic-candidate-pr-<PR 编号>-<PR head sha>`（`candidate.json`，`Main Publish`
 回读用）都会按原有逻辑产出，两条下游链路都不需要为这次改动单独适配。
 
-**为什么不用 `workflow_dispatch`**：`.github/workflows/ci.yml` 的 `on:` 里一直都有
-`workflow_dispatch`，随时可以对任意 ref 手动跑一次 `Epic Full`（包括 `image`），
-适合脱离 PR 单独确认某个提交能不能可复现构建。但它产生的 run 在 GitHub API 里
-`event` 字段是 `workflow_dispatch`，不是 `pull_request`——`Main Publish` 的
-`scripts/ci/verify_epic_candidate.py` 查询候选证明时按 `?event=pull_request` 过滤
-（回读它要求"这个 PR 的这次 Epic Full"，而不是任意一次手动运行），`workflow_dispatch`
-的 run 无论如何都不会被这条回读命中。因此需要产出候选证明（`candidate.json` 或
-`epic-candidate-images-pr-*`）时必须用上面的 `gh run rerun`，`workflow_dispatch`
-只能用于不需要候选证明的场景（例如只是想手动确认某个提交的镜像可复现构建）。
+**空提交为什么不破坏候选证明的树比对**：`scripts/ci/verify_epic_candidate.py` 的
+`validate_document`（第 54-69 行）同时校验 `tree_sha`（第 62 行）与 `head_sha`
+（第 61 行，要求等于 `pr["head"]["sha"]`）。空提交不改任何文件，树与它的父提交
+完全相同；只要空提交落地之后到编排者实际合并跟踪 PR 之前没有再发生新的提交（既有的
+冻结纪律本来就要求这样——最终候选必须全绿且不再变化），`document["head_sha"]`
+（此次 synchronize 时的 PR head sha）与合并时 `pr["head"]["sha"]` 相同，
+`document["tree_sha"]`（此次 run 检出临时 merge 提交算出的树）与 `Main Publish`
+合并后重新算出的树也相同——两个判据都不受空提交影响。
+
+**备选姿势——`gh run rerun`（只有 Actions 写权限的身份能用，机器人不行）**：
+
+```bash
+gh run list --repo Moshuiwang/lingxi --workflow=ci.yml --branch <epic 分支名> --limit 5
+gh run rerun <run id> --repo Moshuiwang/lingxi   # 全量重跑，不要加 --failed
+```
+
+`gh run rerun` 重跑的是**同一个 run**，原样保留它的 `pull_request` 触发身份
+（PR 编号、head sha 都不变），只是 `github.run_attempt` 从 `1` 变成 `2`，同样能
+解除 `image` job 的按需跳过条件。**但本机机器人身份（GitHub App 令牌）对这个仓库
+没有 Actions 写权限**：`gh api user` 与 `gh run rerun` 都实测返回 403
+`Resource not accessible by integration`（2026-08-21 PR #285 现场复验；
+2026-08-06 已有同样记录，见项目 memory `pm-dev-workflow.md`）。因此
+`gh run rerun` 不能作为机器人可执行的主姿势，只能留给产品负责人等确实持有 Actions
+写权限的身份通过网页或个人令牌手动操作——本节把它保留为备选，不是首选。
+
+**为什么两条姿势都不能换成 `workflow_dispatch`**：`.github/workflows/ci.yml` 的
+`on:` 里一直都有 `workflow_dispatch`，随时可以对任意 ref 手动跑一次 `Epic Full`
+（包括 `image`），适合脱离 PR 单独确认某个提交能不能可复现构建。但它产生的 run 在
+GitHub API 里 `event` 字段永远是 `workflow_dispatch`，不是 `pull_request`——
+`scripts/ci/verify_epic_candidate.py` 查询候选证明时按 `?event=pull_request`
+过滤（第 121-122 行；回读它要求"这个 PR 的这次 Epic Full"，而不是任意一次手动
+运行），`workflow_dispatch` 的 run 无论怎么传 `--ref`、怎么改产出的 artifact 命名
+都不会被这条回读命中——这是 GitHub Actions 的既定行为，无法绕开。因此需要产出候选
+证明（`candidate.json` 或 `epic-candidate-images-pr-*`）时必须用上面两条姿势之一，
+`workflow_dispatch` 只能用于不需要候选证明的场景（例如只是想手动确认某个提交的
+镜像可复现构建）。
 
 ## PR 候选镜像下载与校验（Issue #150；仅用于 #102 验收，不是发布路径）
 

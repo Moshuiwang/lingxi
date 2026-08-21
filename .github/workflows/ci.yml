@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 3
     outputs:
       mode: ${{ steps.changes.outputs.mode }}
+      image_candidate: ${{ steps.image_candidate.outputs.value }}
     steps:
       - name: 检出代码与比较基线
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,6 +42,23 @@ jobs:
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
             --github-output "${GITHUB_OUTPUT}"
+
+      # Issue #278：跟踪 PR（epic/* -> main）冻结候选镜像构建的机器人可用触发信号。
+      # `if:` 表达式读不到提交正文，只能读 github 上下文；这一步把它落成一个
+      # job output 给下面 image job 的 `if:` 用。用 `git log -1 --format=%B
+      # <head sha>` 而不是 `HEAD`——本步检出的是 pull_request 事件默认的临时
+      # merge 提交，其正文是 GitHub 自动生成的合并说明，不是 PR 真正的头提交
+      # 正文；上面 fetch-depth: 0 已经把头提交对象拉全，可以直接按 sha 取。
+      - name: 检测冻结候选触发标记
+        id: image_candidate
+        run: |
+          message=$(git log -1 --format=%B "${{ github.event.pull_request.head.sha }}")
+          if printf '%s' "${message}" | grep -qF '[image-candidate]'; then
+            echo 'value=true' >> "${GITHUB_OUTPUT}"
+            echo '检测到冻结候选触发标记 [image-candidate]'
+          else
+            echo 'value=false' >> "${GITHUB_OUTPUT}"
+          fi
 
   docs:
     name: Epic Full / docs
@@ -238,22 +256,34 @@ jobs:
   # （其中 1 次还被下一次 synchronize 取消）纯属陪跑（#278）。
   #
   # 下面这行只掐掉这一种场景的**首次自动触发**：pull_request 目标是 main、来源分支
-  # 是 epic/**、且是这次 run 的第一次尝试（run_attempt == '1'）。gate / extras 仍然
-  # 每次都跑——真正费时间、费算力的是这里的双腿八次镜像构建，不是那两个检查。
-  # 直接 PR 到 main 的普通改动（例如 fix/275 这类）**不受影响**，因为它们的
-  # head_ref 不以 `epic/` 开头，走的还是原来的自动路径——这正是「PR 检查阶段的
-  # 可复现性门保持不变」那部分。
+  # 是 epic/**、且既没有显式重跑也没有冻结候选触发标记。gate / extras 仍然每次都
+  # 跑——真正费时间、费算力的是这里的双腿八次镜像构建，不是那两个检查。直接 PR 到
+  # main 的普通改动（例如 fix/275 这类）**不受影响**，因为它们的 head_ref 不以
+  # `epic/` 开头，走的还是原来的自动路径——这正是「PR 检查阶段的可复现性门保持
+  # 不变」那部分。
   #
-  # 编排者准备冻结候选（要把镜像制品钉在某个 epic 分支头）时，显式姿势是对**同一个
-  # run** 执行 `gh run rerun <run-id> --repo Moshuiwang/lingxi`（不要用 --failed，
-  # 要全量重跑）：GitHub 会原样保留这次 run 的 pull_request 触发身份（PR 号、
-  # head sha 不变），但 `github.run_attempt` 会变成 '2'，下面这行就不再匹配，
-  # image job 真正执行，下方 `candidate` job 也会据此正常产出候选证明与候选镜像
-  # artifact——`Main Publish` 的 `verify_epic_candidate.py` 只认 `event=pull_request`
-  # 的 run，`workflow_dispatch`（虽然本工作流的 `on:` 里一直都有，可用于任意 ref
-  # 单独验证镜像可复现性）产生的 run 天然满足不了这个条件，因此冻结候选证明必须走
-  # rerun 这条路，不能用 workflow_dispatch 替代（操作步骤见 deploy/README.md
-  # 「编排者冻结前显式触发镜像构建」一节）。
+  # 编排者准备冻结候选（要把镜像制品钉在某个 epic 分支头）时的**主姿势**（机器人
+  # 身份可执行，见 deploy/README.md「编排者冻结前显式触发镜像构建」一节）：在跟踪
+  # PR 的 epic 分支上开一个空提交的 Story PR，squash 合并时把提交信息设成含
+  # `[image-candidate]` 标记——上面 classify job 的「检测冻结候选触发标记」步骤
+  # 会把它读出来传给这里的 `needs.classify.outputs.image_candidate`。之所以不能直接
+  # `git push` 空提交到 epic 分支：`epic/**` 挂了 ruleset「仅 Story Fast 后合并」
+  # （`pull_request` 规则 + `current_user_can_bypass: never`），机器人身份的直接推送
+  # 会被服务端拒绝，只能走「开 PR、Story Fast 通过、squash 合并」这条已有路径。
+  #
+  # `gh run rerun <run-id>`（全量重跑，不加 --failed）在**有 Actions 写权限的身份**
+  # 手上仍然可用，作为备选姿势保留：重跑同一个 run 会原样保留 pull_request 触发
+  # 身份（PR 号、head sha 不变），`github.run_attempt` 变成 '2' 时下面这行同样不再
+  # 匹配跳过条件。但**本机机器人身份（GitHub App 令牌）对这个仓库没有 Actions 写
+  # 权限**——`gh run rerun` 实测返回 403 `Resource not accessible by integration`
+  # （2026-08-21 PR #285 现场复验；2026-08-06 已有同样记录），因此不能把它当作机器人
+  # 可执行的主姿势，只能留给产品负责人等有权限的身份通过网页手动操作。
+  #
+  # 不管走哪条姿势，产出的 run 都必须仍是 `event=pull_request`：`Main Publish` 的
+  # `verify_epic_candidate.py` 只认这个 event 类型的 run 去找候选证明 artifact，
+  # `workflow_dispatch`（本工作流的 `on:` 里一直都有，可用于任意 ref 单独验证镜像
+  # 可复现性）产生的 run 在 GitHub API 里 event 永远是 workflow_dispatch，天然满足
+  # 不了这个条件，因此不能用它替代冻结候选证明的产出。
   image:
     name: Epic Full / image
     runs-on: ubuntu-24.04
@@ -261,7 +291,8 @@ jobs:
     if: >-
       github.event_name != 'pull_request' || github.base_ref != 'main' ||
       (needs.classify.outputs.mode != 'docs' &&
-      (!startsWith(github.head_ref, 'epic/') || github.run_attempt != '1'))
+      (!startsWith(github.head_ref, 'epic/') || github.run_attempt != '1' ||
+      needs.classify.outputs.image_candidate == 'true'))
     timeout-minutes: 45
     # **本 job 不要任何写权限**（codex 二轮 P1-1）。它在 pull_request 上也会跑，而
     # 同仓分支的 PR job 会**照样拿到**这里声明的令牌——于是一个被改造过的 workflow
@@ -433,11 +464,12 @@ jobs:
           retention-days: 14
 
   # required check 只认这个稳定名称。main 的纯文档 PR 只要求分类器和文档校验；
-  # 跟踪 PR（head 为 epic/**）的首次自动 synchronize 只要求 gate、五组 extras 通过，
-  # image 允许是 skipped（#278：见上面 image job 的按需触发说明）；除此之外的 PR
-  # （含直接 PR 到 main 的普通改动、以及编排者对跟踪 PR 显式 `gh run rerun` 之后的
-  # 那次尝试）要求 gate、五组 extras、四镜像双构建全部成功，并留下一份带树摘要的
-  # 候选证明。main Publish 只接受与该证明相同的合并树；因此合并后无需再跑一遍完整门禁。
+  # 跟踪 PR（head 为 epic/**）没有冻结候选触发标记的自动 synchronize 只要求 gate、
+  # 五组 extras 通过，image 允许是 skipped（#278：见上面 image job 的按需触发说明）；
+  # 除此之外的 PR（含直接 PR 到 main 的普通改动、以及带 `[image-candidate]` 标记或
+  # 显式 `gh run rerun` 之后的那次尝试）要求 gate、五组 extras、四镜像双构建全部
+  # 成功，并留下一份带树摘要的候选证明。main Publish 只接受与该证明相同的合并树；
+  # 因此合并后无需再跑一遍完整门禁。
   candidate:
     name: Epic Full
     runs-on: ubuntu-24.04
@@ -480,7 +512,9 @@ jobs:
               exit 1
             fi
             echo 'Epic 分支同步：gate/extras 通过；镜像按需触发，本次未自动构建，不产出候选证明'
-            echo '如需为这次同步产出候选证明与候选镜像，对本次 run 执行 `gh run rerun <run-id>`（见 deploy/README.md）'
+            echo '如需为这次同步产出候选证明与候选镜像：在 epic 分支上开一个空提交的 Story PR，'
+            echo 'squash 合并时把提交信息设成含 [image-candidate] 标记（见 deploy/README.md）；'
+            echo '或者由有 Actions 写权限的身份对本次 run 执行 `gh run rerun <run-id>`（全量重跑）。'
             exit 0
           fi
           if [ "${GATE_RESULT}" != success ] || [ "${EXTRAS_RESULT}" != success ] || [ "${IMAGE_RESULT}" != success ]; then
