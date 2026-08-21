@@ -48,7 +48,11 @@ RosterAuditDuty` 的 ``_completed_on`` 水位（同一天只做一次，不做�
   ``supply``，源头是专用授权主体那条一次性 ``refresh_token``）。**不新增第二个
   消费者**——那条一次性令牌全系统只允许一个消费者，2026-08-08 曾因此烧掉产品
   负责人的一次性授权码。``RosterAccessTokenProvider`` 的"手上有新鲜的就直接给"
-  语义保证同一天内不管多少个调用方轮流取，实际换取只发生一次。
+  语义保证多个调用方轮流取时，实际换取只发生在手上那份到期之后（令牌寿命约 2 小时，
+  正常一天约 12 次），不会因为多一个调用方就多换一次。**换取频率的上界不在这里**：
+  它由凭据文件里的 ``refresh_consumed_at``/``refresh_consumed_count`` 在锁内判定，
+  自 Issue #276（产品负责人 2026-08-21 裁定）起是**最小间隔 5 分钟 + 每 UTC 日 100
+  次**两道，不再是此前的"每 UTC 日至多一次"。
 - **应用身份路径**（``list_collaboration_tenants_as_app`` / ``list_share_entities``）
   用的是 ``tenant_access_token``——它不是一次性凭据、没有消费者数量上限（见
   ``core/permission/tenant_token_supply.py`` 的模块文档），因此这里直接复用
@@ -106,6 +110,11 @@ _SAFE_AUDIT_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 # 把新一天的第一次尝试再晚半小时到一小时，换来的是代码不必再区分"日界内退避"与
 # "日界外退避"两套语义——`_completed_on`/持久化水位已经保证了"当天完成后不会再被
 # 这条退避挡住"。
+#
+# **基准时刻是"失败发生的那一刻"，不是轮开始时刻**（冻结候选审查 2026-08-21 的 F4）：
+# 一整轮全量扫描 stage 2026-08-21 实测约 345 秒，比第一档退避（300 秒）还长；用轮开始
+# 时刻当基准时，`_next_attempt_at` 在失败发生时就已经在过去，第一档退避事实上从不生效。
+# 判据落在 `_advance_backoff` 内部（它自己现取 `self._clock()`），见该方法文档字符串。
 READ_FAILURE_BACKOFF_STEP_SECONDS = 300
 READ_FAILURE_BACKOFF_CEILING_SECONDS = 3600
 
@@ -198,15 +207,27 @@ class OrgSnapshotSyncDuty:
     def request_stop(self) -> None:
         self._stop.set()
 
-    def _advance_backoff(self, now: datetime) -> int:
-        """记一次"这轮没能往前走"，返回本次算出的退避秒数（Issue #268 F3）。"""
+    def _advance_backoff(self) -> int:
+        """记一次"这轮没能往前走"，返回本次算出的退避秒数（Issue #268 F3）。
+
+        **退避基准是"失败发生的那一刻"，在这里现取**（冻结候选审查 2026-08-21 的 F4），
+        不接受调用方传进来的时刻。此前三个失败分支传的都是 ``run_once`` 顶部取的
+        **轮开始**时刻，而一整轮全量扫描 stage 2026-08-21 实测约 **345 秒**——比第一档
+        退避（300 秒）还长。于是失败发生时 ``_next_attempt_at = 轮开始 + 300s`` 已经
+        在过去，下一 tick 的退避门禁立刻放行，整轮数百次外部调用照发，而审计里却明明
+        白白写着 ``backoff_seconds=300``：第一档退避事实上从不生效，读审计的人还会被
+        它误导。时刻在这里现取，"退避 N 秒"就是从失败那一刻起的真实 N 秒。
+
+        在方法内部取而不是让每个调用点各自取，是为了让这条不变量**没有第四个调用点
+        可以忘记**：新增失败分支时不可能再传错基准。
+        """
 
         self._failure_streak += 1
         backoff_seconds = min(
             self._failure_streak * READ_FAILURE_BACKOFF_STEP_SECONDS,
             READ_FAILURE_BACKOFF_CEILING_SECONDS,
         )
-        self._next_attempt_at = now + timedelta(seconds=backoff_seconds)
+        self._next_attempt_at = self._clock() + timedelta(seconds=backoff_seconds)
         return backoff_seconds
 
     def _reset_backoff(self) -> None:
@@ -226,8 +247,9 @@ class OrgSnapshotSyncDuty:
         if self._checked_persisted_watermark_for != today:
             # 进程重启后内存水位归零：不补这一步，当天会做第二次全量扫描（数百次
             # 分页请求，外加一个稍后被 `superseded` 收敛掉的重复批次）——不是凭据
-            # 风险（一次性 refresh_token 的"每 UTC 日至多消费一次"判据落在凭据文件
-            # 而非内存，见 `RosterAccessTokenProvider`），但纯属浪费（Issue #250
+            # 风险（一次性 refresh_token 的换取频率上界落在凭据文件而非内存，自
+            # Issue #276 起是"最小间隔 5 分钟 + 每 UTC 日 100 次"两道，见
+            # `RosterAccessTokenProvider`），但纯属浪费（Issue #250
             # 编排者复查 F8）。查询失败按"未知"处理、不阻塞本轮：这只是一个避免
             # 重复工作的优化，不是完整性判据本身。
             self._checked_persisted_watermark_for = today
@@ -284,7 +306,7 @@ class OrgSnapshotSyncDuty:
                 # 白名单核对见模块顶部 `_SAFE_AUDIT_CODE` 的注释——不匹配就整个
                 # 不写这个字段，不做部分保留。
                 fields["code"] = code
-            backoff_seconds = self._advance_backoff(now)
+            backoff_seconds = self._advance_backoff()
             fields["attempt"] = self._failure_streak
             fields["backoff_seconds"] = backoff_seconds
             self._audit.record("org_snapshot_sync.read_failed", **fields)
@@ -307,7 +329,7 @@ class OrgSnapshotSyncDuty:
             # 也推进退避（与读取失败共用同一条，见模块顶部常量注释）：走到这一步
             # 说明两条身份路径都已经读完一整轮（数百次分页请求）才在交叉校验上失败，
             # 贴着 tick 立即重试的外部成本与读取失败同一个量级，没有理由只挡一条。
-            backoff_seconds = self._advance_backoff(now)
+            backoff_seconds = self._advance_backoff()
             self._audit.record(
                 "org_snapshot_sync.integrity_rejected",
                 problems=[problem.value for problem in error.report.problems],
@@ -330,7 +352,7 @@ class OrgSnapshotSyncDuty:
             # 上面给 `integrity_rejected` 扩大退避范围的理由逐字适用于这里。
             # `raise` 本身不变：写库失败仍然原样冒泡，让 `SchedulerLoop` 按既有
             # 纪律记录并隔离，这里只是在冒泡前先把退避记上。
-            backoff_seconds = self._advance_backoff(now)
+            backoff_seconds = self._advance_backoff()
             self._audit.record(
                 "org_snapshot_sync.commit_failed",
                 error=type(error).__name__,

@@ -464,6 +464,70 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(call_count["n"], 1, "退避窗口内不得再发起外部读取")
         self.assertEqual(len(audit.records), 1, "退避窗口内跳过的一轮不留审计，不制造噪音")
 
+    def test_a_round_longer_than_the_backoff_still_lands_inside_the_window(self) -> None:
+        """**冻结候选审查 2026-08-21 的 F4**：整轮耗时超过退避档位时，下一 tick 仍然
+        必须在退避窗口内。
+
+        stage 2026-08-21 实测一轮全量扫描约 **345 秒**，而第一档退避是 300 秒。旧实现
+        把 ``run_once`` 顶部取的**轮开始**时刻当退避基准，于是失败发生（轮开始 + 345
+        秒）时 ``_next_attempt_at``（轮开始 + 300 秒）已经在过去——下一 tick 的退避门禁
+        立刻放行、整轮数百次外部调用照发，而审计里明明白白写着
+        ``backoff_seconds=300``。退避档位越靠前、轮越慢，这个洞越大。
+
+        这里用注入时钟精确复现：假读取函数在抛异常**之前**把时钟推进 345 秒。
+
+        变异验红：把 `_advance_backoff` 里的 ``self._clock()`` 换回 ``run_once`` 顶部
+        的轮开始时刻（改动前那一版）之后重跑本用例，第二轮会真的再发起一次读取，
+        ``call_count["n"]`` 变成 2、``assertEqual(..., 1)`` 失败。
+        """
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        call_count = {"n": 0}
+        clock = {"now": FIXED_NOW}
+        # stage 2026-08-21 实测的全量轮耗时，刻意大于第一档退避（300 秒）。
+        round_duration = timedelta(seconds=345)
+        self.assertGreater(
+            round_duration.total_seconds(),
+            READ_FAILURE_BACKOFF_STEP_SECONDS,
+            "用例前提：整轮耗时必须真的超过第一档退避，否则测不出这个洞",
+        )
+
+        def slow_failing_read() -> SnapshotBatch:
+            call_count["n"] += 1
+            clock["now"] = clock["now"] + round_duration  # 整轮真的花了这么久
+            raise RuntimeError("transport_error")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=slow_failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        duty.run_once()
+        self.assertEqual(audit.records[0][1]["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
+
+        # 下一个 tick：从失败那一刻起才过了 30 秒，远没到 300 秒。
+        clock["now"] = clock["now"] + timedelta(seconds=30)
+        again = duty.run_once()
+
+        self.assertIsNone(again)
+        self.assertEqual(
+            call_count["n"],
+            1,
+            "退避基准必须是失败发生的时刻——否则审计写着退避 300 秒，实际一秒都没退",
+        )
+        self.assertEqual(len(audit.records), 1, "退避窗口内跳过的一轮不留审计")
+
+        # 从失败那一刻起真的过了 300 秒之后，才允许重试。
+        clock["now"] = FIXED_NOW + round_duration + timedelta(
+            seconds=READ_FAILURE_BACKOFF_STEP_SECONDS
+        )
+        duty.run_once()
+        self.assertEqual(call_count["n"], 2, "退避窗口过后必须真的重试")
+
     def test_a_retry_happens_once_the_backoff_window_has_elapsed(self) -> None:
         store = FakeStore()
         audit = RecordingAudit()
@@ -574,7 +638,7 @@ class BackoffTest(unittest.TestCase):
         处在流水线同一个位置——都要先跑完一轮昂贵的外部读取才会撞上——因此也要
         推进同一条退避。`raise` 本身不变：这里既要证明异常照常冒泡，又要证明
         状态已经在冒泡前记好，下一次调用会被退避挡住。变异锚点：把
-        `self._advance_backoff(now)` 从 `commit_failed` 分支删掉，本用例的
+        `self._advance_backoff()` 从 `commit_failed` 分支删掉，本用例的
         `call_count` 断言会从 1 变红成 2（且 `backoff_seconds`/`attempt` 字段
         会从审计里消失）。"""
 

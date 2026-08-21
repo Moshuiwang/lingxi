@@ -260,14 +260,20 @@ class _PagedClient:
         规模下已经验证有效（见 :meth:`_throttle`），但余量薄、配额机制未知——
         单纯调大步长只是把同一个"猜"往后挪一个数量级，付出的代价是**每一次
         请求**都变慢，不管当天到底会不会撞限（本职责一整轮就有 550+ 次调用，
-        这个代价摊在整条链路上）。而这里的失败代价严重不对称：组织快照同步
-        依赖的专用授权令牌**每 UTC 日只能换一次、寿命约 2 小时**（Issue #203
-        相关记录），一次 ``feishu_code_99991400`` 若原样冒泡，会让
-        ``read_org_snapshot`` 整轮作废、``commit_batch`` 不被调用——已经成功
-        读到的几百次调用全部作废，要等下一次 UTC 日界的令牌窗口才有机会重来。
+        这个代价摊在整条链路上）。而这里的失败代价严重不对称：一次
+        ``feishu_code_99991400`` 若原样冒泡，会让 ``read_org_snapshot`` 整轮
+        作废、``commit_batch`` 不被调用——已经成功读到的几百次调用全部作废，
+        整轮要从头重来（而调用方 ``apps/scheduler/org_snapshot_sync.py`` 现在
+        对失败施加 5 分钟起步、封顶 1 小时的退避，因此"重来"还要再等一段）。
         对比之下，一次有界重试最多多花 ``sum(RATE_LIMIT_RETRY_BACKOFFS_SECONDS)``
         （默认 17 秒）。**只对已经过载的这一次请求本身多等几秒，换掉"整轮
-        重跑或等一天"，代价明显更低**，因此选择重试而不是继续调大节流步长。
+        重跑"，代价明显更低**，因此选择重试而不是继续调大节流步长。
+
+        **本段原先写的"专用授权令牌每 UTC 日只能换一次……要等下一次 UTC 日界"
+        已经作废**：产品负责人 2026-08-21 就 Issue #276 裁定把那道上界改成
+        **最小间隔 5 分钟 + 每 UTC 日 100 次**两道（判据仍然只有凭据文件里的
+        ``refresh_consumed_at``/``refresh_consumed_count`` 一份）。令牌寿命约
+        2 小时这一条不变。上面的结论方向没变，只是"要等一天"这个后果不再成立。
 
         **范围收得很窄，不是"失败就重试"**：只有 ``FeishuDirectoryError.code``
         精确等于 ``FEISHU_RATE_LIMIT_ERROR_CODE``（``feishu_code_99991400``）
@@ -439,11 +445,22 @@ class _PagedClient:
           缺失的其余键按 ``[]`` 处理，正常收集并继续既有分页逻辑——这是实测常态；
         - **全部** ``list_keys`` 都缺失（键完全不在响应里，不是"存在但类型不对"，
           那种情况见下一条）、且这是**第一页**（尚无游标）、且此前尚未收集到任何
-          数据、且 ``has_more`` 严格为 ``False`` ⇒ 合法空结果，正常返回——与
-          :meth:`_pages` 同一条"半页不得当成功"纪律：中途某一页全部键缺失、或
-          ``has_more`` 不是严格 ``False``、或已经收集过数据，都不满足这个窄条件，
-          仍然抛错（``missing_{list_keys[0]}``），不能把"服务端说还有数据"或
-          "半截数据"误判成"读完了的空结果"；
+          数据、且 ``has_more`` **是 ``False`` 或整个不出现** ⇒ 合法空结果，正常
+          返回——与 :meth:`_pages` 同一条"半页不得当成功"纪律：中途某一页全部键
+          缺失、或 ``has_more`` 明确是别的值（``True``、字符串、数字……）、或已经
+          收集过数据，都不满足这个窄条件，仍然抛错（``missing_{list_keys[0]}``），
+          不能把"服务端说还有数据"或"半截数据"误判成"读完了的空结果"。
+
+          **"或整个不出现"是冻结候选审查 2026-08-21 的 F3**：Issue #268 应修 E 记下的
+          实测事实是「结果为空时字段整个不出现」——那条事实同时适用于 ``has_more``
+          自己。此前这一支硬要求 ``has_more is False``，于是一个"空且连 ``has_more``
+          都没有"的 ``share_entities`` 页会抛 ``missing_share_departments``、整轮
+          作废，把 #270 好不容易修掉的形状原样退回来。放宽只发生在这个已经被四个
+          条件夹住的窄口里：第一页、一无所获、没有任何候选键、且（下一条）响应里
+          没有任何陌生的非空列表——此时响应里确实什么都没有，"读完了的空结果"是
+          唯一说得通的解释。判据必须用 ``is`` 身份比较（``x is False or x is None``），
+          **不能写成** ``x in (False, None)``：``0 == False`` 为真而 ``in`` 用的是
+          ``==``，那样一个 ``has_more: 0`` 会误命中。
         - 同样情形下，若响应里存在**不在 ``list_keys`` 内**的非空列表字段 ⇒ 抛
           ``unexpected_list_key_{净化后的键名}``（同 :meth:`_pages`，经
           :func:`_sanitize_code_fragment` 截断并收窄字符集——JSON 键名是外部数据，
@@ -456,12 +473,19 @@ class _PagedClient:
           有意义，类型不对是响应形状变了，不是"这批恰好没有"；
         - 列表里出现非对象项、游标停滞、分页上界：与此前一致，不受本次改动影响。
 
-        ``has_more`` 的处理**不在本次改动范围**：与 :meth:`_pages` 刻意不同——那里
+        **正常翻页路径上 ``has_more`` 的处理不变**：与 :meth:`_pages` 刻意不同——那里
         对非法类型的 ``has_more`` 降级为 warning（证据不足以确定"非法类型"与"读完
-        了"哪个解释更符合真实响应），而这里对非 ``bool`` 的 ``has_more`` 仍然硬抛
-        ``has_more_invalid``（Issue #250 F4）。Issue #270 的实测（见上）证明
-        ``share_entities`` 的 ``has_more`` 是货真价实的 ``bool``，没有证据要求放宽
-        这条判据，不顺手统一。
+        了"哪个解释更符合真实响应），而这里（下方 ``has_more_invalid``）对非 ``bool``
+        的 ``has_more`` 仍然硬抛（Issue #250 F4）。Issue #270 的实测证明**非空**的
+        ``share_entities`` 页上 ``has_more`` 是货真价实的 ``bool``，没有证据要求放宽
+        那条判据，不顺手统一。上面 F3 放宽的是**另一条路径**：那一支只在"整页什么
+        列表都没有"时才会被摸到，而那正是实测说"字段会整个不出现"的那个场景，两者
+        不冲突。
+
+        **与 :meth:`_pages` 空结果判据的剩余差异是刻意保留的**：那边仍然硬要求
+        ``has_more is False``。它是独立审查 2026-08-20 显式收紧过、并写下理由的判据
+        （四个候选键指向**同一个**列表，缺键的解释空间比这里大），改它属于另一条待
+        登记的条目，不在本次修复包范围内。
         """
 
         collected: dict[str, list[dict[str, Any]]] = {key: [] for key in list_keys}
@@ -485,12 +509,17 @@ class _PagedClient:
                 hit_keys.append(key)
             if not hit_keys:
                 # 全部候选键都完全不在响应里（上面已经把"存在但类型不对"分流
-                # 出去了）。只有第一页、此前一无所获、且 has_more 严格为 False
-                # 时，才可能是 Issue #270 实测的合法空结果。
+                # 出去了）。只有第一页、此前一无所获、且 has_more 是 False **或整个
+                # 不出现**时，才可能是 Issue #270 实测的合法空结果。
+                #
+                # **`is False or is None`，不是 `in (False, None)`**（冻结候选审查
+                # 2026-08-21 F3）：`0 == False` 在 Python 里为真，`in` 用的是 `==`，
+                # 于是一个 `has_more: 0` 会误命中"合法空结果"。身份比较不会。
+                empty_page_has_more = data.get("has_more")
                 if (
                     page_token is None
                     and not any(collected[key] for key in list_keys)
-                    and data.get("has_more") is False
+                    and (empty_page_has_more is False or empty_page_has_more is None)
                 ):
                     stray = next(
                         (key for key, value in data.items() if isinstance(value, list) and value),
