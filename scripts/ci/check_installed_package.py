@@ -524,6 +524,24 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # Epic D 闸⑥：按用户读取问数 MCP 配置，由 apps/worker/service.py
             # 模块级 import（queue 模式每个任务都要用）。
             "lingxi.adapters.user_mcp_config",
+            # Issue #291 P0：apps/worker/config.py 模块级 import
+            # QUERY_MCP_SERVER_NAME（只读工具白名单前缀与写侧 .mcp.json 服务名的
+            # 单一事实来源），因此 adapters.user_environment 与它整条 import 闭包
+            # 现在也在 worker 进程的运行时闭包里——不是新增功能调用，只是取一个
+            # 模块级常量，但闭包判定按实际 import 语句走，不区分"只是拿常量"。
+            "lingxi.adapters.user_environment",
+            "lingxi.core.identity",
+            "lingxi.core.identity.first_contact",
+            "lingxi.core.identity.onboarding_runner",
+            "lingxi.core.identity.org_snapshot",
+            "lingxi.core.identity.provisioning",
+            "lingxi.core.permission",
+            "lingxi.core.permission.account_match",
+            "lingxi.core.permission.galaxy_scope",
+            "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.notification",
+            "lingxi.core.permission.publish_row",
+            "lingxi.core.permission.role_function",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
             # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。

@@ -283,7 +283,7 @@ class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):
         queue = Queue()
         config = WorkerConfig(
             question="",
-            read_only_tool="mcp__q__read",
+            read_only_tools=("mcp__q__read",),
             trace_id="01J00000000000000000000000",
             turn_timeout_seconds=1,
             worker_id="worker",

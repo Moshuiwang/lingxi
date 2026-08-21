@@ -99,7 +99,7 @@ for _fixture_user_id in ("usr-1", "usr-90", "usr-91"):
 def worker_config(**overrides: object) -> WorkerConfig:
     values: dict[str, object] = {
         "question": "",
-        "read_only_tool": "mcp__q__read",
+        "read_only_tools": ("mcp__q__read",),
         "trace_id": "01J00000000000000000000000",
         "turn_timeout_seconds": 1.0,
         "worker_id": "worker-test",

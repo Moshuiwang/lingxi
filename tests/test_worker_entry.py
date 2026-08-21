@@ -31,7 +31,7 @@ import tempfile
 import types
 import unittest
 
-READ_ONLY_TOOL = "mcp__bi-metric__list_metrics"
+READ_ONLY_TOOL = "mcp__query__list_metrics"
 # 固定假凭据探针。形状刻意选成「16 字符以上且含数字」，这是自由文本脱敏唯一
 # 与键名无关的结构性规则（V-审计-03）。真实凭据永远不进测试。
 FAKE_CREDENTIAL = "LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
@@ -360,7 +360,7 @@ class FakeAgentSDK:
 def worker_env(**overrides):
     env = {
         "LINGXI_WORKER_QUESTION": "近 7 天的活跃用户数是多少？",
-        "LINGXI_WORKER_READONLY_TOOL": READ_ONLY_TOOL,
+        "LINGXI_WORKER_READONLY_TOOLS": READ_ONLY_TOOL,
         "LINGXI_WORKER_AUDIT_INPUT_FIELDS": "metric",
         "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
     }
@@ -886,7 +886,7 @@ class OutputSafetyCanaryTest(unittest.TestCase):
 
         values = {
             "question": "q",
-            "read_only_tool": READ_ONLY_TOOL,
+            "read_only_tools": (READ_ONLY_TOOL,),
             "trace_id": "01J0000000000000000TEST000",
             "turn_timeout_seconds": 60.0,
         }
@@ -979,19 +979,70 @@ class WorkerConfigTest(unittest.TestCase):
             load_config(env)
         self.assertIn("LINGXI_WORKER_QUESTION", str(caught.exception))
 
-    def test_only_one_read_only_mcp_tool_may_be_whitelisted(self) -> None:
+    def test_read_only_tools_rejects_wildcards_space_separation_and_empty_values(self) -> None:
+        """白名单只接受精确名称、逗号分隔（Issue #291 P0）：通配符、空白分隔、
+        空字符串都不是"想放行第二个工具"该有的形状，必须在装配期拒绝。"""
         from lingxi.apps.worker.config import WorkerConfigError
 
-        for value in ("mcp__a__x,mcp__a__y", "mcp__a__x mcp__a__y", "mcp__bi-metric__*"):
+        for value in ("mcp__query__x mcp__query__y", "mcp__query__*", "", ","):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
-                self._load(LINGXI_WORKER_READONLY_TOOL=value)
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
+
+    def test_read_only_tools_accepts_multiple_comma_separated_values(self) -> None:
+        """Issue #291 P0 核心行为：真实问数 MCP 至少注册 3 个只读工具，白名单
+        必须能同时放行全部，不能"放行一个、其余照拒"。"""
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(
+            worker_env(
+                LINGXI_WORKER_READONLY_TOOLS=(
+                    "mcp__query__list_metrics,mcp__query__describe_metric,"
+                    "mcp__query__search_dimension"
+                )
+            )
+        )
+        self.assertEqual(
+            config.read_only_tools,
+            (
+                "mcp__query__list_metrics",
+                "mcp__query__describe_metric",
+                "mcp__query__search_dimension",
+            ),
+        )
+
+    def test_read_only_tools_expected_prefix_derives_from_the_same_constant_as_the_write_side(
+        self,
+    ) -> None:
+        """单一事实来源（Issue #291 P0-2）：worker 的期望前缀常量与
+        ``adapters/user_environment.py`` 写 ``.mcp.json`` 时使用的默认服务名
+        常量必须是同一个对象，不是两处凑巧写了同一个字符串。"""
+
+        from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME
+        from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX
+
+        self.assertEqual(QUERY_MCP_TOOL_PREFIX, f"mcp__{QUERY_MCP_SERVER_NAME}__")
+
+    def test_read_only_tools_prefix_must_match_the_query_mcp_server_name(self) -> None:
+        """装配期断言（Issue #291 根因 #1，与 adapters/user_environment.py 的
+        ``QUERY_MCP_SERVER_NAME`` 同一常量来源）：白名单前缀与用户环境
+        ``.mcp.json`` 实际使用的 MCP 服务名不一致时必须启动失败关闭，而不是
+        留到用户提问那一刻才被 PreToolUse 无声拒绝——``mcp__bi-metric__...``
+        正是 2026-08-21 真实事故里写错的那个值。响亮报错要同时带上期望前缀与
+        收到的值，不是只报一个笼统的"配置不合法"。"""
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_WORKER_READONLY_TOOLS="mcp__bi-metric__list_metrics")
+        message = str(caught.exception)
+        self.assertIn("mcp__query__", message)
+        self.assertIn("mcp__bi-metric__list_metrics", message)
 
     def test_builtin_and_delegating_tools_cannot_be_configured_as_the_read_only_tool(self) -> None:
         from lingxi.apps.worker.config import WorkerConfigError
 
         for value in ("Skill", "Agent", "Task", "Read", "Bash"):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
-                self._load(LINGXI_WORKER_READONLY_TOOL=value)
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
 
     def test_trace_id_is_generated_when_not_supplied(self) -> None:
         env = worker_env()
@@ -1482,7 +1533,7 @@ class ReviewHardeningTest(unittest.TestCase):
 
         probe = "Bearer LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOL=probe), stdout=stdout, stderr=stderr)
+        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOLS=probe), stdout=stdout, stderr=stderr)
 
         self.assertEqual(code, 3)
         self.assertNotIn(probe, stdout.getvalue())

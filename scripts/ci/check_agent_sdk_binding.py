@@ -18,7 +18,7 @@ import sys
 # 只用于构造对象的固定假配置：不是真实工具名，也不连接任何 MCP 服务。
 FAKE_ENV = {
     "LINGXI_WORKER_QUESTION": "CI 构造冒烟，不会发给模型",
-    "LINGXI_WORKER_READONLY_TOOL": "mcp__ci-smoke__list_metrics",
+    "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__list_metrics",
     "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000C10",
     # 四个"配置了才传"的可选字段也要在真实 dataclass 上构造一次：漏在冒烟外，
     # SDK 改字段名时 CI 全绿、配了对应变量的受控验证一跑就炸（独立复查发现）。
@@ -105,8 +105,11 @@ def check_worker_entry(expected_events: set[str]) -> str | None:
         return f"worker 会话选项里的 hooks 是 {sorted(hooks or [])}，预期 {sorted(expected_events)}"
     if hooks["PreToolUse"][0].hooks != [executor.gateway.on_hook_event]:
         return "worker 会话选项的 PreToolUse 上挂的不是本次构造的 ToolGateway"
-    if list(getattr(options, "allowed_tools", [])) != [config.read_only_tool]:
-        return f"worker 只应放行一个只读工具，实际是 {getattr(options, 'allowed_tools', None)}"
+    if list(getattr(options, "allowed_tools", [])) != list(config.read_only_tools):
+        return (
+            f"worker 会话选项的 allowed_tools 与配置的 read_only_tools 不一致，"
+            f"实际是 {getattr(options, 'allowed_tools', None)}"
+        )
     if list(getattr(options, "disallowed_tools", [])) != []:
         return "disallowed_tools 必须留空，否则规则层会抢在我们的 PreToolUse 之前拦截"
     if list(getattr(options, "setting_sources", ["<missing>"])) != []:

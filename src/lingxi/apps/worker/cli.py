@@ -183,7 +183,7 @@ def main(
         config.trace_id,
         "info",
         "worker.turn.start",
-        read_only_tool=config.read_only_tool,
+        read_only_tools=list(config.read_only_tools),
         question_bytes=len(config.question.encode("utf-8")),
         mcp_servers=sorted(config.mcp_servers),
         workspace_configured=config.workspace is not None,
