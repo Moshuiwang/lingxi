@@ -16,10 +16,11 @@
   再次领取都不可见，进程崩溃也不会在租期后重放已被飞书作废的令牌；
 - ``save`` 写入新凭据并清空消费标记（先登记数据库主体，让触发器把关，
   再落文件——顺序不能反，否则触发器拒绝时密文已经写盘）；
-- ``refresh_consumed_at`` 随新凭据一起落盘（Issue #215）：日报改成按日消费一次性
-  ``refresh_token`` 之后，"今天已经换过一次"需要一个**进程重启也抹不掉**的判据，
+- ``refresh_consumed_at`` / ``refresh_consumed_count`` 随新凭据一起落盘（Issue
+  #215 起、Issue #276 改为双重上界）：日报按需消费一次性 ``refresh_token`` 之后，
+  "两次消费的最小间隔"与"当日消费次数"都需要一个**进程重启也抹不掉**的判据，
   由 ``claim_due(for_supply=True)`` 在文件锁内、用锁内的当前时刻、且在置位消费标记
-  之前判定。**这是每日上界唯一的权威**，进程内不留第二份账本副本；
+  之前判定。**这是频率上界唯一的权威**，进程内不留第二份账本副本；
 - ``revoke`` 删除凭据文件但**保留登记行**；
 - 超龄未清的消费中残留由 ``revoke_stale_consumed`` 收殓，并以「不可恢复」日志
   请求人工重新授权。
@@ -43,7 +44,8 @@ from typing import Any
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
-    RefreshAlreadyConsumedToday,
+    RefreshDailyLimitReached,
+    RefreshMinIntervalNotElapsed,
     SecretToken,
     expiry_moment,
     rotation_deadline,
@@ -58,6 +60,19 @@ DELEGATED_PURPOSE = "org_directory_sync"
 # 领取后其他进程再领取的观感与数据库版一致：消费标记本身就是唯一的门。
 # 保留该常量只为兼容既有调用方签名。
 DEFAULT_LEASE_SECONDS = 300
+
+#: 「按需供给」两次消费之间的最小间隔（Issue #276，产品负责人 2026-08-21 裁定默认值）。
+#: 防崩溃循环：进程反复重启时每次启动都会换一次，而每次换取都作废旧 ``refresh_token``；
+#: 若撞上"换成功但落盘失败"的窗口，凭据永久丢失、需产品负责人重新授权
+#: （2026-08-20 事故正是这个形状）。正常运行令牌寿命约 2 小时才换一次，远超这个间隔。
+DEFAULT_SUPPLY_MIN_INTERVAL = timedelta(minutes=5)
+
+#: 「按需供给」每 UTC 日至多消费次数（Issue #276，产品负责人 2026-08-21 裁定默认值）。
+#: 它是**哨兵**而不是配额：最小间隔已经把崩溃循环压到至多 12 次/小时，正常一天约
+#: 12 次（2 小时寿命）远远碰不到 100；真撞上说明系统已经异常了数小时，此时停下留痕、
+#: 要求人工介入，好过继续静默轮换——每一次轮换都作废旧凭据，都是一次"换成功但落盘
+#: 失败"的机会。
+DEFAULT_SUPPLY_DAILY_LIMIT = 100
 
 
 def registered_delegated_subject_open_id(
@@ -99,6 +114,11 @@ class StoredCredential:
     # 领取那一刻的**权威消费时刻**，由 ``claim_due`` 在文件锁内生成（Issue #215）。
     # 只有领取回来的凭据带它；``load`` 读到的是未消费的形态，因此为 ``None``。
     consumed_at: datetime | None = None
+    # 「按需供给」当日消费计数——**领取成功之后应当持久化的那个新值**（Issue #276）。
+    # 只有 ``claim_due`` 的返回值带它；``load`` 读到的是 ``None``。调用方必须原样传给
+    # ``save(refresh_consumed_count=…)``：``save`` 每次都重建整份 payload，不传就会把
+    # 当日计数悄悄清零，日上界因此形同虚设且不会有任何东西报错。
+    refresh_consumed_count: int | None = None
 
 
 class HostFileDelegatedCredentialVault:
@@ -141,6 +161,7 @@ class HostFileDelegatedCredentialVault:
         expected_registered_subject_open_id: str | None = None,
         require_absent_registration: bool = False,
         refresh_consumed_at: datetime | None = None,
+        refresh_consumed_count: int | None = None,
     ) -> bool:
         """登记主体并写入（或轮换）唯一一条专用授权凭据。
 
@@ -166,14 +187,22 @@ class HostFileDelegatedCredentialVault:
         登记写入处把关，触发器拒绝时密文一个字节都不落盘。
 
         ``refresh_consumed_at`` 由**消费了一次一次性 ``refresh_token`` 的调用方**
-        （凭据轮换职责）显式给出，随新凭据一起落盘，成为"今天已经换过一次"的持久判据
-        （Issue #215 的频率上界；由 :meth:`claim_due` 的 ``for_supply`` 模式在锁内判定）。
-        它必须原样回传 ``claim_due`` 返回的那个 ``consumed_at``——两处用同一个锁内时刻，
-        "哪一天已经消费过"才只有一个时钟说了算。
+        （凭据轮换职责）显式给出，随新凭据一起落盘，成为频率上界（最小间隔）的持久判据
+        （Issue #215 起、Issue #276 改为双重上界；由 :meth:`claim_due` 的 ``for_supply``
+        模式在锁内判定）。它必须原样回传 ``claim_due`` 返回的那个 ``consumed_at``——
+        两处用同一个锁内时刻，"何时消费过"才只有一个时钟说了算。
 
-        新授权与首次建立**不带**这个时刻：那不是一次续期消费。刚授权完就被上界挡住会让
-        运维在恢复之后还要再等一天，而"人工重授权当天即可恢复"是已接受的语义。判据显式
-        传入而不是从写入路径反推，正是为了不让"这次写入算不算消费"变成隐式约定。
+        ``refresh_consumed_count`` 同理，是当日消费上界的持久判据，必须原样回传
+        ``claim_due`` 返回的那个 ``refresh_consumed_count``（Issue #276）。**这里不能
+        留空当作"沿用旧值"**：本方法每次都会重建整份 payload（见下方 ``payload = {...}``），
+        调用方不传就等于把它清零——常规到期轮换（``for_supply=False``）也要把从
+        ``claim_due`` 拿到的这个字段原样传回来，否则它会把「按需供给」那条链当天已经
+        积累的计数悄悄抹掉，日上界因此形同虚设且不会有任何东西报错。
+
+        新授权与首次建立**不带**这两个值：那不是一次续期消费。刚授权完就被上界挡住会让
+        运维在恢复之后还要再等，而"人工重授权当天即可恢复"是已接受的语义——留空即可
+        让新凭据的最小间隔与当日计数都从零开始。判据显式传入而不是从写入路径反推，
+        正是为了不让"这次写入算不算消费"变成隐式约定。
         """
 
         if require_absent_registration and expected_registered_subject_open_id is not None:
@@ -181,6 +210,13 @@ class HostFileDelegatedCredentialVault:
         if refresh_consumed_at is not None:
             if refresh_consumed_at.tzinfo is None or refresh_consumed_at.utcoffset() is None:
                 raise ValueError("续期消费时刻必须是带时区的时间")
+        if refresh_consumed_count is not None:
+            if (
+                not isinstance(refresh_consumed_count, int)
+                or isinstance(refresh_consumed_count, bool)
+                or refresh_consumed_count < 0
+            ):
+                raise ValueError("当日消费计数必须是非负整数")
 
         moment = issued_at or datetime.now(timezone.utc)
         from lingxi.core.ids import new_ulid
@@ -244,6 +280,8 @@ class HostFileDelegatedCredentialVault:
                     "refresh_consumed_at": (
                         None if refresh_consumed_at is None else refresh_consumed_at.isoformat()
                     ),
+                    # 当日消费计数（Issue #276 的日上界持久判据）；只记数值，不记任何值。
+                    "refresh_consumed_count": refresh_consumed_count,
                 }
                 self._write_encrypted(payload)
         logger.info("专用授权凭据已加密写入宿主机文件 subject=%s", redact_identifier(subject_open_id))
@@ -326,6 +364,8 @@ class HostFileDelegatedCredentialVault:
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         now: datetime | None = None,
         for_supply: bool = False,
+        min_interval: timedelta = DEFAULT_SUPPLY_MIN_INTERVAL,
+        daily_limit: int = DEFAULT_SUPPLY_DAILY_LIMIT,
     ) -> StoredCredential | None:
         """领取凭据并**原子置位消费标记**。
 
@@ -334,26 +374,42 @@ class HostFileDelegatedCredentialVault:
 
         ``for_supply=True`` 是**按需续期**入口（Issue #215）：日报每天要一次派生短期
         令牌，而轮换点在有效期 80%（约 5.6 天）才到。这个模式做两件**捆在一起**的事，
-        没有任何参数能把它们拆开：放开到期判定，同时施加"每 UTC 日至多一次"的上界。
-        拆得开就迟早会被拆开，而单独放开到期判定等于把一条一次性凭据交给一个没有任何
-        频率约束的循环。
+        没有任何参数能把它们拆开：放开到期判定，同时施加**两道频率上界**——两次消费的
+        最小间隔（``min_interval``，默认 5 分钟）与当日消费次数上界（``daily_limit``，
+        默认 100 次，Issue #276 产品负责人 2026-08-21 裁定解除此前"每 UTC 日至多一次"
+        改为这两道）。拆得开就迟早会被拆开，而单独放开到期判定等于把一条一次性凭据
+        交给一个没有任何频率约束的循环——因此 ``min_interval``/``daily_limit`` 只能
+        调整**门槛的大小**，不接受能让检查整体消失的哨兵值（``None``、0 或更小）：
+        ``for_supply=True`` 时两道检查**永远都跑**，可注入的只是阈值。
 
-        上界的判据是凭据自己记着的 ``refresh_consumed_at``，**在锁内、用锁内的当前时刻
-        判定，也在置位消费标记之前判定**：
+        两道上界的判据都是凭据自己记着的 ``refresh_consumed_at``（最近一次消费时刻）与
+        ``refresh_consumed_count``（当日消费计数），**在锁内、用锁内的当前时刻判定，也在
+        置位消费标记之前判定**：
 
         - 在锁内取"现在几点"，等锁跨过 UTC 午夜也不会把 D+1 的领取记成 D；
         - 判据随凭据落盘，因此进程重启、崩溃重启循环乃至同一宿主机上的第二个实例都
-          绕不过它；这是**唯一**的每日上界，没有第二份进程内副本——副本不认识凭据代际，
+          绕不过它；这是**唯一**的频率上界，没有第二份进程内副本——副本不认识凭据代际，
           会在人工重授权之后继续拿旧账本拒绝一条全新的凭据；
-        - 先判上界、后置位标记：反过来会让一次被拒的领取把凭据标成"消费中"，等于每天
-          亲手制造一次凭据丢失。
+        - 先判上界、后置位标记：反过来会让一次被拒的领取把凭据标成"消费中"，等于每次
+          亲手制造一次凭据丢失；
+        - 两道之中**先判最小间隔、再判当日上界**：前者是即时防线，后者是"持续异常数
+          小时才会撞上"的哨兵，同时撞上时报"当日上界"更有信息量——重试要等到明天，
+          而不是几分钟后就会被同一道上界继续拒绝。
 
-        领取成功时返回的 :class:`StoredCredential` 带上 ``consumed_at``——**锁内生成的
-        那个权威时刻**。轮换收尾必须把它原样写回新凭据（``save(refresh_consumed_at=…)``），
-        这样"哪一天已经消费过"始终由同一个时钟说了算。
+        领取成功时返回的 :class:`StoredCredential` 带上 ``consumed_at``（**锁内生成的
+        那个权威时刻**）与 ``refresh_consumed_count``（这次领取之后应有的当日计数）。
+        轮换收尾必须把两者原样写回新凭据（``save(refresh_consumed_at=…,
+        refresh_consumed_count=…)``），这样两道上界始终由同一个时钟、同一份账本说了算。
+        到期驱动（``for_supply=False``）的领取不检查上界，但**同样要把当日计数原样
+        带回去**——它自己的 ``save()`` 也会重建整份 payload，不带的话会把「按需供给」
+        当天已经积累的计数悄悄清零。
         """
 
         del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
+        if not isinstance(min_interval, timedelta) or min_interval < timedelta(0):
+            raise ValueError("最小消费间隔必须是非负的时间长度")
+        if not isinstance(daily_limit, int) or isinstance(daily_limit, bool) or daily_limit < 1:
+            raise ValueError("当日消费上界必须是正整数")
         with self._locked():
             # 时刻在锁内取：等锁可能跨越 UTC 午夜，锁外算好的日期会判错一整天。
             moment = now or datetime.now(timezone.utc)
@@ -373,15 +429,31 @@ class HostFileDelegatedCredentialVault:
                 self._path.unlink(missing_ok=True)
                 logger.warning("专用授权凭据已撤销 reason=credential_expired")
                 return None
+
+            last_consumed_at = _parse_utc(payload.get("refresh_consumed_at"))
+            same_utc_day = (
+                last_consumed_at is not None
+                and last_consumed_at.date() == moment.astimezone(timezone.utc).date()
+            )
+            # 当日消费计数的基线：跨了 UTC 日界（或从未消费过）就是 0，否则沿用落盘的
+            # 那个值——旧凭据文件没有这个字段时按 0 处理（向后兼容）。
+            count_today = _parse_supply_count(payload.get("refresh_consumed_count")) if same_utc_day else 0
+
             if for_supply:
-                consumed_at = _parse_utc(payload.get("refresh_consumed_at"))
-                if consumed_at is not None and consumed_at.date() == moment.astimezone(timezone.utc).date():
-                    raise RefreshAlreadyConsumedToday(consumed_at=consumed_at)
-            elif credential.refresh_at > moment:
-                return None
+                if last_consumed_at is not None and moment - last_consumed_at < min_interval:
+                    raise RefreshMinIntervalNotElapsed(consumed_at=last_consumed_at)
+                if count_today >= daily_limit:
+                    raise RefreshDailyLimitReached(consumed_at=last_consumed_at)
+                new_supply_count = count_today + 1
+            else:
+                if credential.refresh_at > moment:
+                    return None
+                # 不做频率判据，但把当日计数原样带过去（见上方 docstring）。
+                new_supply_count = count_today
+
             payload["consumed_at"] = moment.isoformat()
             self._write_encrypted(payload)
-        return replace(credential, consumed_at=moment)
+        return replace(credential, consumed_at=moment, refresh_consumed_count=new_supply_count)
 
     # ---- 内部 -------------------------------------------------------------
 
@@ -474,6 +546,22 @@ def _parse_utc(value: Any) -> datetime | None:
     if moment.tzinfo is None or moment.utcoffset() is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc)
+
+
+def _parse_supply_count(value: Any) -> int:
+    """把落盘的当日消费计数读成非负整数；读不出来一律当 0（没有消费记录）。
+
+    与 :func:`_parse_utc` 同一条方向：一份读不懂或缺这个字段的旧载荷（Issue #276
+    之前落盘的凭据）不该把当日计数误判成任何非零值——那会让日上界对老凭据文件
+    过早触发。写入方（本模块自己）只写非负整数或 ``None``，因此这里遇到的任何
+    其他形状都是历史遗留或不受信任的读取路径，一律按"没有计数"处理。
+    """
+
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
 
 
 class _FileLock:

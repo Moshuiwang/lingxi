@@ -40,7 +40,7 @@ from lingxi.apps.scheduler import (
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
     DerivedAccessToken,
-    RefreshAlreadyConsumedToday,
+    RefreshDailyLimitReached,
     SecretToken,
 )
 
@@ -93,7 +93,7 @@ class FakeVault:
         self.last_require_due = require_due
         self.last_refuse_if_consumed_on = refuse_if_consumed_on
         if refuse_if_consumed_on is not None and refuse_if_consumed_on in self.consumed_days:
-            raise RefreshAlreadyConsumedToday("今天已经消费过一次续期凭据，本次领取被拒")
+            raise RefreshDailyLimitReached(consumed_at=datetime.now(timezone.utc))
         return self._claims.pop(0) if self._claims else None
 
     def save(
@@ -105,6 +105,7 @@ class FakeVault:
         replacing_generation=None,
         expected_registered_subject_open_id=None,
         refresh_consumed_at=None,
+        refresh_consumed_count=None,
     ) -> bool:
         if self._save_failures > 0:
             self._save_failures -= 1

@@ -64,28 +64,49 @@ class SecretToken:
         return self._MASK
 
 
-class RefreshAlreadyConsumedToday(RuntimeError):
-    """今天已经消费过一次续期凭据，本次领取被拒。
+class RefreshRateLimited(RuntimeError):
+    """一次「按需供给」领取被频率上界拒绝的公共基类（Issue #276）。
 
-    这是**每日频率上界唯一的权威判据**（Issue #215）：日报改成按日消费一次性
-    ``refresh_token`` 之后，"每 UTC 日至多一次"必须有一个进程重启也抹不掉的判据，
-    否则一个崩溃重启循环会每分钟消费一次——一次性令牌被高频消费正是 2026-08-08
-    授权码被烧那次事故的形状。判定发生在凭据文件的锁内、用锁内的当前时刻，因此
-    等锁跨过 UTC 午夜也不会错位，而且**只认凭据自己**：换了新凭据（人工重授权）就
-    没有消费标记，当天立刻可以再换一次，这正是已接受的语义。
+    ``for_supply=True`` 放开到期判定的同时，**必须**施加频率上界——这两件事捆在一个
+    开关上，任何参数都拆不开（见 :meth:`~lingxi.adapters.delegated_credentials.
+    HostFileDelegatedCredentialVault.claim_due` 的 docstring）。上界有两道，运维处置
+    不同，因此**分成两个子类、两个审计原因码**，不共用一个：
 
-    与"没有可领取的凭据"刻意分成两件事：前者是"今天已经换过了"，后者是"凭据没了"。
-    压成同一个 ``None`` 会让审计指向错误的地方（去查凭据丢失，而其实一切正常）。
+    - :class:`RefreshMinIntervalNotElapsed`：距上一次消费还没过最小间隔（默认 5
+      分钟）——防的是崩溃循环，每次重启都换一次会在几分钟内烧掉一条一次性凭据；
+    - :class:`RefreshDailyLimitReached`：当日消费次数已达上界（默认 100 次）——防的是
+      持续数小时的崩溃循环绕开最小间隔（间隔每小时最多消费 12 次）后仍然无限期继续。
 
-    ``consumed_at`` 是被拒时凭据上记着的那个**消费时刻**（不是本次领取的时刻）。
-    它由锁内生成、随凭据落盘，因此可以唯一地指认"是哪一次续期消费掉了今天的额度"——
+    判定发生在凭据文件的锁内、用锁内的当前时刻，因此等锁跨过 UTC 午夜也不会错位，而且
+    **只认凭据自己**：换了新凭据（人工重授权）就没有消费标记与计数，当天立刻可以再换，
+    这正是已接受的语义。
+
+    与"没有可领取的凭据"刻意分成两件事：前者是"换太勤了"，后者是"凭据没了"。压成同一个
+    ``None`` 会让审计指向错误的地方（去查凭据丢失，而其实一切正常）。
+
+    ``consumed_at`` 是被拒时凭据上记着的那个**最近一次消费时刻**（不是本次领取的时刻）。
+    它由锁内生成、随凭据落盘，因此可以唯一地指认"是哪一次续期消费掉了这次的额度"——
     调用方据此判断自己手上那条"这一代令牌不可用"的记号还算不算数。异常正文只有一句
     固定文案，不含任何凭据值。
     """
 
+    _message = "本次领取被频率上界拒绝"
+
     def __init__(self, *, consumed_at: datetime) -> None:
-        super().__init__("今天已经消费过一次续期凭据，本次领取被拒")
+        super().__init__(self._message)
         self.consumed_at = consumed_at
+
+
+class RefreshMinIntervalNotElapsed(RefreshRateLimited):
+    """距上一次消费还未满最小间隔，本次领取被拒。"""
+
+    _message = "距上一次消费还未满最小间隔，本次领取被拒"
+
+
+class RefreshDailyLimitReached(RefreshRateLimited):
+    """当日消费次数已达上界，本次领取被拒。"""
+
+    _message = "当日消费次数已达上界，本次领取被拒"
 
 
 @dataclass(frozen=True)
