@@ -798,6 +798,54 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
         parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
         self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
 
+    def test_the_synchronous_stopping_terminal_also_triggers_the_callback(self) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：``start()`` 在
+        ``should_stop()`` 为真时**同步**返回 ``INTERNAL_ERROR``，从不经过
+        ``_execute``。此前只有 ``_execute`` 自己的 ``INTERNAL_ERROR`` 分支接了
+        这个回调，这条同步分支被漏掉——用户看到「已转交管理员处理」，管理群
+        实际上什么都没收到。"""
+
+        calls: list[tuple[str, str]] = []
+        runner, parts = build_runner(
+            should_stop=lambda: True,
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(calls, [("stopping", "t1")])
+
+    def test_the_synchronous_executor_unavailable_terminal_also_triggers_the_callback(
+        self,
+    ) -> None:
+        """同一条独立审查：提交执行器失败（队列满/执行器已停）同样是**同步**
+        返回的 ``INTERNAL_ERROR``，同样此前从未触发管理员送达回调。"""
+
+        calls: list[tuple[str, str]] = []
+        runner, parts = build_runner(
+            executor=InlineExecutor(accept=False),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(calls, [("executor_unavailable", "t1")])
+
+    def test_a_raising_callback_on_the_synchronous_stopping_terminal_does_not_break_start(
+        self,
+    ) -> None:
+        """否定断言，与 ``_execute`` 那条对照组同一形状：告警回调失败不得让
+        ``start()`` 本身抛穿——用户仍然要拿到一个明确的终态返回值。"""
+
+        def boom(reason: str, trace_id: str) -> None:
+            raise RuntimeError("alert sink down")
+
+        runner, parts = build_runner(should_stop=lambda: True, onboarding_failed=boom)
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertIn("onboarding.alert_callback_failed", parts["audit"].actions())
+
 
 class SyncTimeoutTests(unittest.TestCase):
     """`V-开通-13`：十五分钟同步超时是**专用**终态，不与内部故障码混淆。"""

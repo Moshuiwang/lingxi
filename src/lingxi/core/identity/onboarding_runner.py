@@ -541,6 +541,9 @@ class AutoOnboardingRunner:
                 event_id=event_id,
                 trace_id=trace_id,
             )
+            self._notify_admin_of_internal_error(
+                reason="stopping", event_id=event_id, trace_id=trace_id
+            )
             return _internal("stopping").as_result(trace_id=trace_id)
 
         with self._lock:
@@ -588,6 +591,9 @@ class AutoOnboardingRunner:
             self._audit.record(
                 "onboarding.rejected_by_executor", event_id=event_id, trace_id=trace_id
             )
+            self._notify_admin_of_internal_error(
+                reason="executor_unavailable", event_id=event_id, trace_id=trace_id
+            )
             return _internal("executor_unavailable").as_result(trace_id=trace_id)
         return OnboardingResult(state=OnboardingState.STARTED)
 
@@ -595,6 +601,34 @@ class AutoOnboardingRunner:
         with self._lock:
             if self._running.get(open_id) == event_id:
                 del self._running[open_id]
+
+    def _notify_admin_of_internal_error(
+        self, *, reason: str, event_id: str, trace_id: str
+    ) -> None:
+        """管理员送达（Issue #280 §7.3）的唯一触发点：只在真正走到本侧故障终态
+        （``OnboardingState.INTERNAL_ERROR``）时调用一次，与用户通知彼此独立——
+        告警回调失败不得带走这条链本该有的用户结论。
+
+        独立审查（分支 fix/291-280-user-experience 收尾）：``start()`` 里两条
+        **同步**返回 ``INTERNAL_ERROR`` 的分支（``stopping``——停机中拒绝开新链；
+        ``executor_unavailable``——提交执行器失败）此前从不调用这个回调，因为它们
+        根本不经过 ``_execute``（那里此前是唯一接了这个回调的地方）。用户看到的
+        是冻结文案「已转交管理员处理」，管理群却真的什么都没收到——文案承诺与
+        实际行为对不上。现在三处（这两条同步分支 + ``_execute`` 自己的
+        ``INTERNAL_ERROR`` 分支）共用这一个触发点，不允许再出现第四条漏网路径。
+        """
+
+        if self._onboarding_failed is None:
+            return
+        try:
+            self._onboarding_failed(reason, trace_id)
+        except Exception as error:  # noqa: BLE001 - 告警是锦上添花，不是链的一部分
+            self._audit.record(
+                "onboarding.alert_callback_failed",
+                event_id=event_id,
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
 
     # ------------------------------------------------------------------
     # 执行线程
@@ -647,18 +681,10 @@ class AutoOnboardingRunner:
             content_key=terminal.key,
             trace_id=trace_id,
         )
-        if terminal.state is OnboardingState.INTERNAL_ERROR and self._onboarding_failed is not None:
-            # 管理员送达（Issue #280 §7.3）：只在真正走到本侧故障终态时触发一次，
-            # 与用户通知彼此独立——告警回调失败不得带走这条链本该有的用户结论。
-            try:
-                self._onboarding_failed(terminal.reason or "unknown", trace_id)
-            except Exception as error:  # noqa: BLE001 - 告警是锦上添花，不是链的一部分
-                self._audit.record(
-                    "onboarding.alert_callback_failed",
-                    event_id=event_id,
-                    error=type(error).__name__,
-                    trace_id=trace_id,
-                )
+        if terminal.state is OnboardingState.INTERNAL_ERROR:
+            self._notify_admin_of_internal_error(
+                reason=terminal.reason or "unknown", event_id=event_id, trace_id=trace_id
+            )
         delivered = self._notify(
             open_id=open_id,
             event_id=event_id,
