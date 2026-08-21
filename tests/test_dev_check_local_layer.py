@@ -89,7 +89,14 @@ class LocalLayerMatchesCiOnARealCommitHistoryTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="lingxi-dev-check-local-layer-")
+        # `ignore_cleanup_errors=True`：临时目录里是一个真的 git 仓库，提交之后 git 可能
+        # 拉起后台 auto-gc / maintenance 继续往 `.git/objects/pack` 写文件，`cleanup()`
+        # 的 `rmdir` 撞上它就抛 `OSError: [Errno 39] Directory not empty`（2026-08-21
+        # CI 的 Epic Full / gate 真打红过一次，落在下面那个同形状的类上）。它只影响
+        # **测试自身的清理**，不改任何被测断言——清理不掉的临时目录交给系统的 /tmp 回收。
+        self._tmp = tempfile.TemporaryDirectory(
+            prefix="lingxi-dev-check-local-layer-", ignore_cleanup_errors=True
+        )
         self.repo = Path(self._tmp.name)
         _init_repo(self.repo)
 
@@ -151,7 +158,14 @@ class UncommittedChangesAreIncludedOnlyWhenAskedTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="lingxi-dev-check-worktree-")
+        # `ignore_cleanup_errors=True`：**2026-08-21 CI 的 Epic Full / gate 就是在这里
+        # 打红的**——`tearDown` 的 `cleanup()` 与 git 提交后的后台进程抢
+        # `.git/objects/pack`，抛 `OSError: [Errno 39] Directory not empty`。用例体的三条
+        # 断言全部通过，`unittest` 只是把 `tearDown` 的异常算在了用例名下。理由同上一个
+        # 类，只影响测试自身清理，不改被测断言。
+        self._tmp = tempfile.TemporaryDirectory(
+            prefix="lingxi-dev-check-worktree-", ignore_cleanup_errors=True
+        )
         self.repo = Path(self._tmp.name)
         _init_repo(self.repo)
         self.base_sha = _commit_file(self.repo, "README.md", "# 占位\n", "初始提交")

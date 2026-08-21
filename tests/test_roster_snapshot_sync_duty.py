@@ -73,23 +73,38 @@ class RecordingAudit:
 
 
 class FakeRosterSource:
-    """一轮花名册取用的可注入替身：交出固定的 `RosterRound`，记录被调用的次数。"""
+    """一轮花名册取用的可注入替身：交出固定的 `RosterRound`，记录被调用的次数。
 
-    def __init__(self, *, error: Exception | None = None) -> None:
+    ``outcomes`` 可以给一串每轮依次交出的 ``(action, read_status)``——用来复现"先失败
+    几轮、后来成功"这条时序（冻结候选审查 F2）。给完之后重复最后一个。
+    """
+
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        outcomes: tuple[tuple[str, str], ...] = (("replace", "complete"),),
+    ) -> None:
         self._error = error
+        self._outcomes = outcomes
         self.calls: list[datetime] = []
 
     def current(self, *, now: datetime) -> RosterRound:
         self.calls.append(now)
         if self._error is not None:
             raise self._error
+        index = min(len(self.calls) - 1, len(self._outcomes) - 1)
+        action, read_status = self._outcomes[index]
+        replaced = action in ("install", "replace")
         snapshot = RosterSnapshotStatus(
-            action="replace",
-            read_status="complete",
+            action=action,
+            read_status=read_status,
             stale_after_seconds=172800.0,
-            captured_at=now,
+            # 保旧轮交出的是**库里那一份旧快照**的读取时间，不是本轮的时刻；
+            # 本轮真的换上新快照时才是 `now`（见 `DailyRosterSource._status`）。
+            captured_at=now if replaced else now - timedelta(hours=20),
             row_count=1206,
-            age_seconds=0.0,
+            age_seconds=0.0 if replaced else 72000.0,
         )
         return RosterRound((), snapshot)
 
@@ -146,6 +161,74 @@ class DailyWatermarkTest(unittest.TestCase):
             clock.advance()
 
         self.assertEqual(len(source.calls), 3, "三个不同的日子应当各自触发一次读取")
+
+
+class KeptPreviousDoesNotBurnTheDayTest(unittest.TestCase):
+    """**冻结候选审查 2026-08-21 的 F2**：读取失败 / 空源 / 不完整（一律"保旧"）的那一轮
+    **不置位当日水位**，下一 tick 继续重试；只有真的换上新快照才算今天做完。
+
+    根因：`adapters/feishu_roster_bitable.read_roster_snapshot` 把 ``RosterReadError``
+    结算成一个 ``status=FAILED`` 的**正常返回值**（不抛异常），因此"写入失败原样上抛、
+    水位不置位"这条既有纪律**看不见**读取失败——旧代码在 `current()` 正常返回后无条件
+    置位水位，一次瞬时读取失败就烧掉一整天的快照写入，而 `roster_snapshot` 表正是首次
+    开通链第二步的硬前提。
+
+    变异验红：把 `RosterSnapshotSyncDuty.run_once` 里的
+    ``if round_result.snapshot.refreshed:`` 去掉（恢复成无条件 ``self._completed_on =
+    today``）之后重跑本类，两条用例都会红——重试那次读取根本不会发生。
+    """
+
+    def test_a_kept_previous_round_does_not_set_the_watermark(self) -> None:
+        clock = FixedClock()
+        source = FakeRosterSource(outcomes=(("keep_previous", "failed"),))
+        duty = RosterSnapshotSyncDuty(roster_source=source, clock=clock)
+
+        round_result = duty.run_once()
+
+        self.assertIsNotNone(round_result, "保旧轮是正常返回，不是异常")
+        self.assertFalse(round_result.snapshot.refreshed, "用例前提：本轮没有换上新快照")
+        self.assertIsNone(duty.completed_on, "保旧轮不得把这一天标记成已完成")
+
+    def test_a_transient_read_failure_is_retried_within_the_same_day(self) -> None:
+        """同一天内：前两轮读取失败（保旧），第三轮成功——快照仍然在当天写进去了。"""
+
+        clock = FixedClock()
+        source = FakeRosterSource(
+            outcomes=(
+                ("keep_previous", "failed"),
+                ("keep_previous", "empty_source"),
+                ("replace", "complete"),
+            )
+        )
+        duty = RosterSnapshotSyncDuty(roster_source=source, clock=clock)
+
+        for _tick in range(5):
+            duty.run_once()
+
+        self.assertEqual(
+            len(source.calls),
+            3,
+            "失败的两轮各重试一次，成功那一轮之后当天不再读——共 3 次",
+        )
+        self.assertEqual(duty.completed_on, clock.today, "成功那一轮才置位水位")
+
+    def test_a_never_recovering_day_does_not_set_the_watermark_at_all(self) -> None:
+        """整天都读不成功时水位始终不置位——每个 tick 都还会再试一次。
+
+        这就是"用一点请求噪声换当天还有机会自愈"那个刻意选择的可见形状（花名册一轮
+        1206 行 / 500 每页只有 3 页，量级与组织快照的数百次分页请求不是一回事，因此
+        这里刻意不加退避，见 `RosterSnapshotSyncDuty` 文档字符串）。
+        """
+
+        clock = FixedClock()
+        source = FakeRosterSource(outcomes=(("no_snapshot_yet", "failed"),))
+        duty = RosterSnapshotSyncDuty(roster_source=source, clock=clock)
+
+        for _tick in range(4):
+            duty.run_once()
+
+        self.assertEqual(len(source.calls), 4, "读不成功就每一 tick 再试一次")
+        self.assertIsNone(duty.completed_on)
 
 
 class StopSemanticsTest(unittest.TestCase):

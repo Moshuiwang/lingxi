@@ -406,8 +406,14 @@ class HostFileDelegatedCredentialVault:
         """
 
         del lease_seconds  # 消费标记取代了租期语义；参数保留以兼容调用方。
-        if not isinstance(min_interval, timedelta) or min_interval < timedelta(0):
-            raise ValueError("最小消费间隔必须是非负的时间长度")
+        if not isinstance(min_interval, timedelta) or min_interval <= timedelta(0):
+            # **`<=` 而不是 `<`**（冻结候选审查 2026-08-21 的 F5）：0 是能让这道检查
+            # 整体消失的哨兵值——两次消费之间"至少隔 0"对任何时刻都成立，等于把
+            # `for_supply=True` 的两道上界拆成一道。上方 docstring 早就写明"不接受
+            # 能让检查整体消失的哨兵值（None、0 或更小）"，此前的 `<` 只挡住了负数，
+            # 与那句承诺不符。需要"几乎没有间隔"的语义（例如要把日上界从最小间隔里
+            # 隔离出来单独断言）时传一个极小的正值，不是 0。
+            raise ValueError("最小消费间隔必须是正的时间长度（0 会让这道上界整体失效）")
         if not isinstance(daily_limit, int) or isinstance(daily_limit, bool) or daily_limit < 1:
             raise ValueError("当日消费上界必须是正整数")
         with self._locked():

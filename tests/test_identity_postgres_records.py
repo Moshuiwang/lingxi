@@ -529,12 +529,32 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
 
         self._save()
 
-        with self.assertRaises(ValueError):
-            self.vault.claim_due(for_supply=True, min_interval=timedelta(seconds=-1))
+        # **0 也是哨兵**（冻结候选审查 2026-08-21 的 F5）："至少隔 0" 对任何时刻都
+        # 成立，等于把这道上界整体关掉。此前的校验写的是 `< timedelta(0)`，只挡住
+        # 负数，与 docstring 承诺的"不接受 None、0 或更小"不符。
+        # 变异验红：把 `delegated_credentials.py` 里的 `<= timedelta(0)` 改回
+        # `< timedelta(0)` 之后重跑本用例，`timedelta(0)` 那一条子用例会红。
+        for disabled_interval in (timedelta(0), timedelta(seconds=-1)):
+            with self.subTest(min_interval=disabled_interval):
+                with self.assertRaises(ValueError):
+                    self.vault.claim_due(for_supply=True, min_interval=disabled_interval)
         for disabled in (0, -1):
             with self.subTest(daily_limit=disabled):
                 with self.assertRaises(ValueError):
                     self.vault.claim_due(for_supply=True, daily_limit=disabled)
+
+    def test_a_tiny_positive_interval_is_still_a_real_check(self) -> None:
+        """0 被拒之后，"几乎没有间隔"的语义由一个**极小的正值**承担——它仍然是一道
+        真的检查（同一时刻再领一次照样被挡），只是门槛小到不干扰别的断言。"""
+
+        from lingxi.core.identity.credentials import RefreshMinIntervalNotElapsed
+
+        tiny = timedelta(microseconds=1)
+        self._save(refresh_consumed_at=self.NOON, refresh_consumed_count=1)
+
+        with self.assertRaises(RefreshMinIntervalNotElapsed):
+            # 与上一次消费**同一时刻**：间隔为 0，仍然小于 1 微秒，照样被挡。
+            self.vault.claim_due(for_supply=True, now=self.NOON, min_interval=tiny)
 
     def test_the_daily_limit_is_reached_with_a_distinct_reason(self) -> None:
         """当日已达上界：抛出「日上界」，与「最小间隔」不是同一个 reason（约束 2）。
@@ -584,8 +604,15 @@ class OnDemandRefreshCeilingTest(IdentityPostgresTestCase):
         with self.assertRaises(RefreshDailyLimitReached):
             # 20 秒之后：还没过最小间隔，也还是同一个 UTC 日，用日上界为 1 的当日
             # 计数（已是 1）钉住"没跨天时会被挡住"这一半。
+            # 最小间隔用一个**极小的正值**（不是 0——0 是被拒的哨兵，见
+            # `test_the_ceiling_cannot_be_disabled_by_a_sentinel_value`）：这里要隔离
+            # 的是"日界有没有让计数复位"，不希望最小间隔抢先把这次领取挡下来，
+            # 20 秒已经远超 1 微秒，因此抛出来的必然是日上界那一条。
             self.vault.claim_due(
-                for_supply=True, now=near_midnight + timedelta(seconds=20), daily_limit=1, min_interval=timedelta(0)
+                for_supply=True,
+                now=near_midnight + timedelta(seconds=20),
+                daily_limit=1,
+                min_interval=timedelta(microseconds=1),
             )
 
         claimed = self.vault.claim_due(

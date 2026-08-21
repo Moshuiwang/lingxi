@@ -580,6 +580,61 @@ class AppIdentityPathTest(unittest.TestCase):
         self.assertEqual(departments, [])
         self.assertEqual(members, [])
 
+    def test_share_entities_both_keys_missing_and_has_more_absent_is_a_legal_empty_result(
+        self,
+    ) -> None:
+        """**冻结候选审查 2026-08-21 的 F3**：整页什么都没有——两个候选列表键缺失，
+        连 ``has_more`` 本身也整个不出现 ⇒ 合法空结果，不抛。
+
+        Issue #268 应修 E 记下的实测事实是「结果为空时字段整个不出现」，那条事实同样
+        适用于 ``has_more`` 自己。此前这一支硬要求 ``has_more is False``，于是这种页
+        会抛 ``missing_share_departments`` 让整轮作废，把 #270 修掉的形状原样退回来。
+
+        变异验红：把 ``_pages_multi`` 空结果分支的判据改回
+        ``and data.get("has_more") is False`` 之后重跑本用例，会抛
+        ``FeishuDirectoryError: missing_share_departments``。
+        """
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+
+        departments, members = client.list_share_entities(
+            token="fake-app-token", tenant_key="tenant_a", department_id="0"
+        )
+
+        self.assertEqual(departments, [])
+        self.assertEqual(members, [])
+        self.assertEqual(len(transport.calls), 1, "空结果一次请求就收工，不再翻页")
+
+    def test_share_entities_empty_page_with_a_zero_has_more_still_raises(self) -> None:
+        """F3 的**身份比较锚点**：``has_more: 0`` 不是"缺失"，也不是 ``False``。
+
+        判据必须写成 ``x is False or x is None``。改成 ``x in (False, None)`` 会让
+        本用例变绿（``0 == False`` 为真而 ``in`` 用的是 ``==``），一个数字 ``0`` 就
+        冒充成了合法空结果。
+        """
+
+        transport = RecordingTransport([{"code": 0, "data": {"has_more": 0}}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "missing_share_departments")
+
+    def test_share_entities_stray_list_key_without_has_more_is_still_rejected(self) -> None:
+        """放宽只发生在"响应里真的什么列表都没有"的窄口里：``has_more`` 缺失也一样，
+        有陌生的非空列表键仍然抛 ``unexpected_list_key_*``（真实字段名不在候选表里的
+        直接信号，不能静默吞成空结果）。"""
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"associated_tenants": [{"open_department_id": "od_x"}]}}]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
+        self.assertEqual(raised.exception.code, "unexpected_list_key_associated_tenants")
+
     def test_share_entities_stray_list_key_is_rejected_and_sanitized(self) -> None:
         """全部候选键缺失，但响应里有一个不在候选表里的非空列表字段 ⇒ 抛
         ``unexpected_list_key_*``，且键名经过净化（Issue #270 场景 5；净化规则见

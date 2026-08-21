@@ -534,14 +534,28 @@ def _build_onboarding_duty(
     这比装一个失败关闭桩安全：桩会「认领即平账」，把事件永久烧掉。
 
     **装配不变量（外部集成面审查坐实的 F1）**：``onboarding != None ⇒ permission_publish
-    != None``。首次开通链最终会把一条发布意图排进 ``publish_outbox``
-    （``AutoOnboardingRunner`` 经 ``publish_allowed`` 闸），但真正把那条意图从 outbox
-    写进外部权限表、推进就绪确认的执行者是权限发布消费职责
-    （:func:`_build_permission_publish_duty`）。那个职责如果因为**它自己的**前置不齐而
-    没有注册，开通排出的每一条发布意图此后**没有任何职责会再看它一眼**——迟到就绪恢复
-    职责（V-开通-18）救不了，它只能确认"已经进入就绪等待"的用户，替代不了缺失的发布
-    执行者。不挡在这里的话，失败关闭会发生在"已经认领、已经建档、已经建了用户环境"
-    之后，用户表现成"接受了开通却永远走不到可用"，还可能留下需要人工收拾的半开记录。
+    != None 且 permission_publish.publish_wired``。首次开通链最终会把一条发布意图排进
+    ``publish_outbox``（``AutoOnboardingRunner`` 经 ``publish_allowed`` 闸），但真正把
+    那条意图从 outbox 写进外部权限表、推进就绪确认的执行者是权限发布消费职责的**发布面**
+    （:func:`_build_permission_publish_duty` 里的 ``PermissionPublishExecutor``）。那一面
+    如果因为**它自己的**前置不齐而没有装配，开通排出的每一条发布意图此后**没有任何职责
+    会再看它一眼**——迟到就绪恢复职责（V-开通-18）救不了，它只能确认"已经进入就绪等待"
+    的用户，替代不了缺失的发布执行者。不挡在这里的话，失败关闭会发生在"已经认领、已经
+    建档、已经建了用户环境"之后，用户表现成"接受了开通却永远走不到可用"，还可能留下
+    需要人工收拾的半开记录。
+
+    **判据是 ``publish_wired``，不是 ``is not None``**（冻结候选审查 2026-08-21 的 F1，
+    由产品负责人当天第二次真实开通失败 ``publish_not_completed`` 坐实）：
+    :func:`_build_permission_publish_duty` 在缺 ``LINGXI_PERMISSION_BITABLE_APP_TOKEN``
+    或 ``LINGXI_PERMISSION_BITABLE_TABLE_ID`` 而就绪面装得起来时，**照常返回一个
+    ``executor=None`` 的"仅就绪"职责**（那是它自己刻意的设计：已经发布出去的权限还等着
+    被确认、被通知，没有理由因为暂时写不了新的一行就把它们一起停掉）。``is not None``
+    这条旧判据会把那个只剩半面的职责当成"发布执行者在"而放行开通，于是用户被认领、
+    被建档、发布意图被排进 outbox，而 outbox 那一侧根本没有执行者——正是上面描述的
+    半开形状。反过来，``is None`` 这一支在可达配置下几乎不成立：两面都装不起来才返回
+    ``None``，而那需要连 MCP 主密钥都缺，那本来就是开通编排自己的前置。两个分支都保留，
+    各留一条**可分辨**的审计原因码（``permission_publish_not_assembled`` /
+    ``permission_publish_not_wired``），排障时一眼看出该去补哪一组配置。
 
     因此这里**在认领任何用户之前**校验调用方（``build_loop``）已经装配好的
     ``permission_publish`` 对象本身，而不是重新判断"两者前置是否恰好相同"——即使两者
@@ -560,16 +574,23 @@ def _build_onboarding_duty(
     同一个结论：不可用）。调用方（``build_loop``）负责只加载一次、原样转发。
     """
 
-    if permission_publish is None:
-        # 恰一条审计：只报「发布职责没装配」这个结构性原因，不夹带 `permission_publish`
-        # 自己那一层的原因（那一层已经在自己的装配点留过审计）——两条审计合起来才是
-        # 完整的因果链，各自只认领自己那一段。
-        audit.record(
-            "onboarding.duty_not_registered", reason="permission_publish_not_assembled"
+    if permission_publish is None or not permission_publish.publish_wired:
+        # 恰一条审计：只报「发布执行者不在」这个结构性原因，不夹带 `permission_publish`
+        # 自己那一层的原因（那一层已经在自己的装配点留过审计：`permission_publish.
+        # duty_not_registered` 或 `permission_publish.publish_not_wired`）——两条审计
+        # 合起来才是完整的因果链，各自只认领自己那一段。两个分支的原因码**可分辨**：
+        # 「整个职责没装配」要去补 MCP 那一组配置，「只有发布面没装配」要去补权限表
+        # Base 坐标。
+        reason = (
+            "permission_publish_not_assembled"
+            if permission_publish is None
+            else "permission_publish_not_wired"
         )
+        audit.record("onboarding.duty_not_registered", reason=reason)
         logger.warning(
-            "权限发布消费职责未装配，首次开通编排不注册（开通排出的发布意图不会有任何"
-            "职责消费）；未开通用户的首聊事件原样留在库里等待配置齐备，其余定时职责照常运行"
+            "权限发布执行者不可用（%s），首次开通编排不注册（开通排出的发布意图不会有任何"
+            "职责消费）；未开通用户的首聊事件原样留在库里等待配置齐备，其余定时职责照常运行",
+            reason,
         )
         return None
 
@@ -1122,9 +1143,13 @@ def build_loop(
     消费者共用一条一次性令牌正是 2026-08-08 授权码被烧那次事故的形状。
 
     参数保留是为了让调用方（主要是测试）**替换**供给；``None`` 现在的含义是"用装配好的
-    那条"，而不是"没有供给"。进程内持有者与频率上界都建在这里，**每个进程一份**：它们是
-    "这个进程今天换过没有"的账本，跨进程共享会让上界失去意义；而重启也抹不掉的那道上界
-    在凭据文件里（``refresh_consumed_at``）。
+    那条"，而不是"没有供给"。这里建的**只有进程内持有者**（``DerivedAccessTokenHolder``，
+    每个进程一份、不落盘、重启即空，装的是派生出来的短期令牌）。**频率上界不在这里，
+    也没有第二份进程内副本**：它唯一的判据是凭据文件里的 ``refresh_consumed_at`` /
+    ``refresh_consumed_count``，由 :meth:`~lingxi.adapters.delegated_credentials.
+    HostFileDelegatedCredentialVault.claim_due` 在文件锁内判定（见该方法 docstring 与
+    ``delegated_credentials.py`` 里"这是**唯一**的频率上界"那一条）——进程内副本认不出
+    凭据代际，会在人工重授权之后继续拿旧账本拒绝一条全新的凭据。
 
     ``permission_table_access_token`` 是**权限发布表**读写所用的短期令牌供给。
     **默认不再是 ``None``**：产品负责人 2026-08-18 就 #226 裁定方向 3——用**应用身份**
@@ -1305,8 +1330,9 @@ def build_loop(
     # ——那条一次性 refresh_token 全系统只允许一个消费者，而它已经在这里了。
     #
     # **装配不变量（外部集成面审查 F1）**：``onboarding != None ⇒ permission_publish !=
-    # None``。这里把上面刚刚装配出的 ``permission_publish``（可能是 ``None``）原样交给
-    # `_build_onboarding_duty` 校验——不在这里另写一次判断，唯一的真相来源是那个变量
+    # None 且 permission_publish.publish_wired``。这里把上面刚刚装配出的
+    # ``permission_publish``（可能是 ``None``、也可能是只装了就绪面的半个职责）原样交给
+    # `_build_onboarding_duty` 校验——不在这里另写一次判断，唯一的真相来源是那个对象
     # 本身，见 `_build_onboarding_duty` 文档字符串「装配不变量」一节的完整理由。
     onboarding = _build_onboarding_duty(
         config,

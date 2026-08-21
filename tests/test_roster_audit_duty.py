@@ -415,6 +415,77 @@ class DutyIsolationTest(unittest.TestCase):
         self.assertNotIn("模拟读取失败", output)
 
 
+class SnapshotWriteIsNotHostageToTheBaselineTest(unittest.TestCase):
+    """**冻结候选审查 2026-08-21 的 F6**：日报基线读取失败**不得**拖停快照写入。
+
+    `roster_snapshot` 表是首次开通链第二步（``core/identity/onboarding_runner.py::
+    _match``）与每日权限重算的硬前提，而 `load_active_baseline()` 读的 `app_user`
+    只服务日报正文。Issue #275 把"没配管理群 ⇒ 快照不写"这条**配置期**耦合解开了，
+    但运行期还剩一条：旧代码先读基线、后取花名册，于是基线持续读不出来时，健康的
+    花名册读取与快照写入被一起拖停——表现成"今天入职的人全都开通不了"，而根因在一条
+    只影响日报的读库上。
+
+    变异验红：把 `RosterAuditDuty.run_once` 里 `load_active_baseline()` 那一行移回
+    `roster_source.current(...)` **之前**（改动前的顺序）之后重跑本类，
+    ``source.calls`` 会是空的、``assertEqual(len(source.calls), 1)`` 失败。
+    """
+
+    def test_a_failing_baseline_read_still_lets_the_snapshot_round_happen(self) -> None:
+        source = FakeRosterSource(changed_rows())
+        duty, sender, audit, _clock, reader = build_duty(
+            reader=FakeBaselineReader(baseline_of_one(), explode=True), source=source
+        )
+
+        with self.assertRaises(RuntimeError):
+            duty.run_once()
+
+        self.assertEqual(
+            len(source.calls),
+            1,
+            "花名册读取与快照写入必须先发生：它服务的是开通链，不是日报",
+        )
+        self.assertEqual(reader.calls, 1, "用例前提：基线读取确实被调用并且炸了")
+        self.assertEqual(sender.payloads, [], "比对没做成，这一轮不发日报")
+        self.assertIsNone(duty.completed_on, "异常上抛，水位不置位，下一轮重试")
+
+    def test_the_error_body_never_reaches_the_audit_or_the_logs(self) -> None:
+        """基线读取失败的异常正文里带着资料值（`FakeBaselineReader` 刻意如此）。
+
+        它原样上抛给 `SchedulerLoop` 做职责级隔离（既有纪律，`V-花名册-17`），本职责
+        自己**不记任何审计**——调换顺序没有给它新开一个会回显异常正文的出口。
+        """
+
+        source = FakeRosterSource(changed_rows())
+        duty, _sender, audit, _clock, _reader = build_duty(
+            reader=FakeBaselineReader(baseline_of_one(), explode=True), source=source
+        )
+
+        with self.assertRaises(RuntimeError):
+            duty.run_once()
+
+        self.assertEqual(audit.records, [], "基线读取失败由循环层隔离，本职责不另记审计")
+
+    def test_an_unavailable_snapshot_still_reads_the_baseline_for_the_examined_count(
+        self,
+    ) -> None:
+        """新顺序下 `snapshot.available is False` 的分支照旧成立：不比对，但
+        `examined` 仍然取自基线人数（`V-花名册-48`）。"""
+
+        source = FakeRosterSource([], snapshot=absent_snapshot())
+        duty, sender, audit, _clock, reader = build_duty(
+            baseline=baseline_of_one(), source=source
+        )
+
+        report = duty.run_once()
+
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertEqual(reader.calls, 1, "基线仍然被读到——只是排在花名册之后")
+        self.assertEqual(report.examined, len(baseline_of_one()))
+        self.assertEqual(report.entries, (), "没有可用快照时一条差异都不比对")
+        self.assertEqual(len(sender.payloads), 1, "没有快照必须发告警日报，沉默最危险")
+
+
 class StopSemanticsTest(unittest.TestCase):
     """V-花名册-20：停止之后 `sends_after_stop == 0`。"""
 

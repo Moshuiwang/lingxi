@@ -5,8 +5,11 @@
 以及「前置不齐就不注册，而不是注册一个会把事件认领走再烧掉的实现」。
 
 **装配不变量（外部集成面审查 F1）**：``AssemblyInvariantTests`` 与
-``InvariantBuildLoopTests`` 守 ``onboarding != None ⇒ permission_publish != None``——
-`permission_publish` 前置不齐时开通编排不能照常注册再把用户接收进来又永远走不到可用。
+``InvariantBuildLoopTests`` 守 ``onboarding != None ⇒ permission_publish != None 且
+permission_publish.publish_wired``——`permission_publish` 的**发布面**前置不齐时开通编排
+不能照常注册再把用户接收进来又永远走不到可用。判据从 ``is not None`` 收紧到
+``publish_wired`` 是冻结候选审查 2026-08-21 的 F1：缺权限表 Base 坐标时装出来的是一个
+**executor=None 的"仅就绪"职责**（非 ``None``），旧判据对它放行。
 """
 
 from __future__ import annotations
@@ -58,7 +61,20 @@ class RecordingAudit:
         return [action for action, _ in self.records]
 
 
-_WIRED_PERMISSION_PUBLISH = object()  #: 装配不变量测试之外的默认值：代表"已装配"。
+class StubPermissionPublish:
+    """``PermissionPublishDuty`` 的最小替身：不变量只读 :attr:`publish_wired`。
+
+    ``publish_wired=False`` 就是生产里那个**只装了就绪面**的半个职责
+    （``executor=None``，见 ``_build_permission_publish_duty``）——它不是 ``None``，
+    但没有任何东西会把 outbox 里的发布意图写出去。
+    """
+
+    def __init__(self, *, publish_wired: bool = True) -> None:
+        self.publish_wired = publish_wired
+
+
+#: 装配不变量测试之外的默认值：代表"已装配、发布面也接线了"。
+_WIRED_PERMISSION_PUBLISH = StubPermissionPublish()
 
 
 def build(
@@ -132,17 +148,22 @@ class PrerequisiteTests(unittest.TestCase):
 
 
 class AssemblyInvariantTests(unittest.TestCase):
-    """F1（外部集成面审查，必修）：``onboarding != None ⇒ permission_publish != None``。
+    """F1（外部集成面审查，必修）：``onboarding != None ⇒ permission_publish != None
+    且 permission_publish.publish_wired``。
 
-    权限发布消费职责（``_build_permission_publish_duty``）是**唯一**会把开通链排进
-    ``publish_outbox`` 的那条意图真正写进外部权限表的执行者。它前置不齐时开通编排
-    不能照常注册——那样会让用户先被认领、建档、建好用户环境，然后**永远**卡在半开
-    状态；迟到就绪恢复（V-开通-18）救不了这个缺口，它只能确认"已经进入就绪等待"的人。
+    权限发布消费职责（``_build_permission_publish_duty``）的**发布面**是**唯一**会把
+    开通链排进 ``publish_outbox`` 的那条意图真正写进外部权限表的执行者。它前置不齐时
+    开通编排不能照常注册——那样会让用户先被认领、建档、建好用户环境，然后**永远**卡在
+    半开状态；迟到就绪恢复（V-开通-18）救不了这个缺口，它只能确认"已经进入就绪等待"的人。
 
     这里**不接受**「``permission_publish`` 与 ``onboarding`` 当前碰巧共用同一个 MCP
     主密钥前置，所以传什么值都无所谓」这种论证：下面每一条用例在 ``permission_publish``
     以外的全部前置都齐全（含在职状态令牌供给）的情况下，只翻动 ``permission_publish``
     这一个参数，直接证明不变量是装配层自己校验出来的，不是靠前置巧合撞上的。
+
+    **``publish_wired=False`` 那一条是冻结候选审查 2026-08-21 F1 的锚点**：它就是缺
+    ``LINGXI_PERMISSION_BITABLE_APP_TOKEN``/``TABLE_ID`` 时生产真实装出来的形状——
+    职责对象存在（就绪面照常）、发布执行者不在。旧判据 ``is None`` 对它放行。
     """
 
     def test_a_none_permission_publish_stops_onboarding_before_any_other_check(self) -> None:
@@ -180,16 +201,47 @@ class AssemblyInvariantTests(unittest.TestCase):
             "审计只报「发布职责未装配」这一个结构性原因，不夹带其它前置的原因",
         )
 
-    def test_a_non_none_permission_publish_does_not_block_assembly(self) -> None:
-        """哨兵之外的任意非 ``None`` 对象都算「已装配」——不变量只认 ``is None``，
-        不对 ``permission_publish`` 的具体类型或内容做任何进一步假设。"""
+    def test_a_publish_wired_permission_publish_does_not_block_assembly(self) -> None:
+        """发布面接线了就放行——不变量只读 ``publish_wired``，不对
+        ``permission_publish`` 的具体类型或其余内容做任何进一步假设。"""
 
         duty, audit = build(
-            WIRED_ENV, token=lambda: "u-token", permission_publish=object()
+            WIRED_ENV,
+            token=lambda: "u-token",
+            permission_publish=StubPermissionPublish(publish_wired=True),
         )
 
         self.assertIsInstance(duty, OnboardingReconciler)
         self.assertEqual(audit.actions(), [])
+
+    def test_a_readiness_only_permission_publish_stops_onboarding(self) -> None:
+        """**冻结候选审查 2026-08-21 F1 的红线用例**：职责对象在、但发布面没装配
+        （``executor=None`` 的"仅就绪"职责，缺权限表 Base 坐标时生产真实装出来的形状）
+        ——开通编排同样不得注册。
+
+        产品负责人 2026-08-21 第二次真实开通失败（``publish_not_completed``）就是这条：
+        用户被认领、建档、建好用户环境，发布意图排进了 ``publish_outbox``，而 outbox
+        那一侧根本没有执行者。
+
+        变异验红：把 ``_build_onboarding_duty`` 的不变量改回
+        ``if permission_publish is None:``（#279 之前那一版）之后重跑本用例，``duty``
+        会变成一个真实的 ``OnboardingReconciler``、``assertIsNone`` 失败。
+        """
+
+        duty, audit = build(
+            WIRED_ENV,
+            token=lambda: "u-token",
+            permission_publish=StubPermissionPublish(publish_wired=False),
+        )
+
+        self.assertIsNone(duty, "发布面未装配时开通编排不得注册")
+        self.assertEqual(audit.actions(), ["onboarding.duty_not_registered"])
+        self.assertEqual(
+            audit.records[0][1],
+            {"reason": "permission_publish_not_wired"},
+            "两种拒绝的原因码必须可分辨：这一条要去补权限表 Base 坐标，"
+            "而不是 MCP 那一组配置",
+        )
 
 
 class PublishGateWiringTests(unittest.TestCase):
@@ -674,6 +726,63 @@ class InvariantBuildLoopTests(unittest.TestCase):
         )
         self.assertIn(
             ("onboarding.duty_not_registered", {"reason": "permission_publish_not_assembled"}),
+            audit.records,
+        )
+
+    def test_onboarding_is_absent_when_only_the_readiness_side_is_wired(self) -> None:
+        """**冻结候选审查 2026-08-21 F1 在真实装配上的锚点**：不打桩、不 patch，直接用
+        「缺权限表 Base 坐标」这一组真实环境变量跑 ``build_loop``。
+
+        这正是产品负责人 2026-08-21 第二次真实开通失败时生产的配置形状：MCP 那一组配齐
+        （所以就绪面装得起来、``PermissionPublishDuty`` 照常注册），但
+        ``LINGXI_PERMISSION_BITABLE_APP_TOKEN``/``TABLE_ID`` 没配（所以发布面
+        ``executor=None``）。职责列表里因此**有**「权限发布与就绪确认」、但**不能有**
+        开通编排。
+
+        变异验红：把不变量改回 ``if permission_publish is None:`` 之后重跑本用例，
+        「未开通首聊交接对账」会重新出现在职责列表里、``assertNotIn`` 失败。
+        """
+
+        import tempfile
+        from pathlib import Path
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.apps.scheduler import build_loop
+
+        credential_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(credential_dir.cleanup)
+        user_env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(user_env_dir.cleanup)
+
+        env = {
+            **WIRED_ENV,
+            "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+            "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(credential_dir.name) / "delegated.enc"),
+            "LINGXI_USER_ENV_ROOT": user_env_dir.name,
+        }
+        audit = RecordingAudit()
+
+        loop = build_loop(
+            SchedulerConfig.from_env(env),
+            roster_access_token=lambda: "employment-token",
+            audit=audit,
+        )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertIn(
+            "权限发布与就绪确认",
+            names,
+            "就绪面装得起来时职责本身照常注册——这正是 `is None` 判据看不见的那半个",
+        )
+        self.assertNotIn(
+            "未开通首聊交接对账",
+            names,
+            "发布面未装配时，开通编排不得出现在真实装配出的职责列表里",
+        )
+        self.assertIn(
+            ("onboarding.duty_not_registered", {"reason": "permission_publish_not_wired"}),
             audit.records,
         )
 
