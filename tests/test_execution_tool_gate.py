@@ -171,6 +171,19 @@ class DenyReasonTextTest(unittest.TestCase):
         for tool_name in READ_ONLY_TOOLS + APPROVED_SKILLS:
             self.assertNotIn(tool_name, reason)
 
+    def test_reason_forbids_the_model_from_attributing_the_denial_to_the_user(self) -> None:
+        """Issue #291：真实事故里模型把本侧白名单配错翻译成"用户账号缺权限"，
+        四条回复一致建议"联系数据平台管理员""重新登录后重试"——而用户权限完全
+        正常。模板必须显式指向系统侧、显式禁止这两条误导性建议，不能只靠"用
+        业务语言说明"这种开放式措辞，那正是旧模板放过这次编造归因的原因。"""
+
+        reason = build_policy().decide("CronCreate", {}).model_reason or ""
+
+        self.assertIn("系统侧", reason)
+        self.assertIn("已经被记录", reason)
+        self.assertIn("不要说这与用户的账号、权限或登录状态有关", reason)
+        self.assertIn("不要建议用户重新登录、联系管理员或自行申请权限", reason)
+
 
 class DeniedTurnStillClosesTest(unittest.TestCase):
     """V-执行-03：被拒回合仍取得非空最终正文和恰好一次终止结果。"""
