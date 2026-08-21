@@ -1290,6 +1290,64 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(config.mcp_servers, {"query": {"type": "stdio", "command": "x"}})
 
 
+class TerminalOutcomeSinkSeverityTest(unittest.TestCase):
+    """Issue #291 独立审查：queue 模式终态收口日志（``worker.task.terminal``）
+    在这一回合有 ``PreToolUse`` 拒绝时必须提到 ``warning`` 级别，不能和普通
+    成功终态一样淹没在 ``info`` 里——``_terminal_outcome_sink`` 是这条日志
+    唯一的落地出口（见 ``cli.py``），删掉它的级别判断分支会让本用例变红。"""
+
+    def test_a_denied_call_raises_the_log_level_to_warning(self) -> None:
+        from lingxi.apps.worker.cli import _terminal_outcome_sink
+
+        err = io.StringIO()
+        sink = _terminal_outcome_sink(err=err, trace_id="01J00000000000000000000WR3")
+
+        sink(
+            {
+                "task_id": "tsk-1",
+                "failure_code": None,
+                "error_kind": None,
+                "terminal_kind": "success",
+                "output_safety_blocked": False,
+                "output_safety_withheld": False,
+                "output_safety_reasons": (),
+                "denied_count": 1,
+                "denied_tool_names": ("Bash",),
+                "truncated": False,
+            }
+        )
+
+        line = json.loads(err.getvalue().strip())
+        self.assertEqual(line["level"], "warning")
+        self.assertEqual(line["event"], "worker.task.terminal")
+        self.assertEqual(line["denied_count"], 1)
+        self.assertEqual(line["denied_tool_names"], ["Bash"])
+
+    def test_no_denial_stays_at_info(self) -> None:
+        from lingxi.apps.worker.cli import _terminal_outcome_sink
+
+        err = io.StringIO()
+        sink = _terminal_outcome_sink(err=err, trace_id="01J00000000000000000000WR3")
+
+        sink(
+            {
+                "task_id": "tsk-1",
+                "failure_code": None,
+                "error_kind": None,
+                "terminal_kind": "success",
+                "output_safety_blocked": False,
+                "output_safety_withheld": False,
+                "output_safety_reasons": (),
+                "denied_count": 0,
+                "denied_tool_names": (),
+                "truncated": False,
+            }
+        )
+
+        line = json.loads(err.getvalue().strip())
+        self.assertEqual(line["level"], "info")
+
+
 class WorkerResourceGuardTest(unittest.TestCase):
     """V-护栏-01…07：worker 资源上限与 usage 出口。"""
 
