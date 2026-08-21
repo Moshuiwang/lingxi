@@ -49,13 +49,23 @@ jobs:
       # <head sha>` 而不是 `HEAD`——本步检出的是 pull_request 事件默认的临时
       # merge 提交，其正文是 GitHub 自动生成的合并说明，不是 PR 真正的头提交
       # 正文；上面 fetch-depth: 0 已经把头提交对象拉全，可以直接按 sha 取。
+      #
+      # 标记用 git trailer 形状（独占一行、精确匹配 `Image-Candidate: true`），
+      # 不用行内的 `[image-candidate]` 这类方括号写法——本 PR 实现这条机制时，
+      # 描述标记本身的说明文字（这条注释、commit message、deploy/README.md）自然
+      # 就会包含方括号写法的字面量，若检测逻辑只做子串匹配，任何"提到这个标记"的
+      # 提交（哪怕只是文档说明）都会被误判成"触发"。trailer 形状要求整行精确匹配，
+      # 没人会在说明性文字里恰好单独写一行 `Image-Candidate: true`，从根上避免这类
+      # 自指误判——本 PR 第一版曾用方括号写法，在自己的 commit message 里被自己的
+      # 说明文字意外命中（未影响本 PR 结论，因为 head 不是 epic/*，但暴露了这个坑，
+      # 已改用 trailer 形状）。
       - name: 检测冻结候选触发标记
         id: image_candidate
         run: |
           message=$(git log -1 --format=%B "${{ github.event.pull_request.head.sha }}")
-          if printf '%s' "${message}" | grep -qF '[image-candidate]'; then
+          if printf '%s\n' "${message}" | grep -qE '^Image-Candidate: true$'; then
             echo 'value=true' >> "${GITHUB_OUTPUT}"
-            echo '检测到冻结候选触发标记 [image-candidate]'
+            echo '检测到冻结候选触发标记 Image-Candidate: true'
           else
             echo 'value=false' >> "${GITHUB_OUTPUT}"
           fi
@@ -264,8 +274,8 @@ jobs:
   #
   # 编排者准备冻结候选（要把镜像制品钉在某个 epic 分支头）时的**主姿势**（机器人
   # 身份可执行，见 deploy/README.md「编排者冻结前显式触发镜像构建」一节）：在跟踪
-  # PR 的 epic 分支上开一个空提交的 Story PR，squash 合并时把提交信息设成含
-  # `[image-candidate]` 标记——上面 classify job 的「检测冻结候选触发标记」步骤
+  # PR 的 epic 分支上开一个空提交的 Story PR，squash 合并时把提交信息末尾加一行
+  # `Image-Candidate: true`——上面 classify job 的「检测冻结候选触发标记」步骤
   # 会把它读出来传给这里的 `needs.classify.outputs.image_candidate`。之所以不能直接
   # `git push` 空提交到 epic 分支：`epic/**` 挂了 ruleset「仅 Story Fast 后合并」
   # （`pull_request` 规则 + `current_user_can_bypass: never`），机器人身份的直接推送
@@ -466,8 +476,8 @@ jobs:
   # required check 只认这个稳定名称。main 的纯文档 PR 只要求分类器和文档校验；
   # 跟踪 PR（head 为 epic/**）没有冻结候选触发标记的自动 synchronize 只要求 gate、
   # 五组 extras 通过，image 允许是 skipped（#278：见上面 image job 的按需触发说明）；
-  # 除此之外的 PR（含直接 PR 到 main 的普通改动、以及带 `[image-candidate]` 标记或
-  # 显式 `gh run rerun` 之后的那次尝试）要求 gate、五组 extras、四镜像双构建全部
+  # 除此之外的 PR（含直接 PR 到 main 的普通改动、以及带 `Image-Candidate: true`
+  # 标记或显式 `gh run rerun` 之后的那次尝试）要求 gate、五组 extras、四镜像双构建全部
   # 成功，并留下一份带树摘要的候选证明。main Publish 只接受与该证明相同的合并树；
   # 因此合并后无需再跑一遍完整门禁。
   candidate:
@@ -513,7 +523,7 @@ jobs:
             fi
             echo 'Epic 分支同步：gate/extras 通过；镜像按需触发，本次未自动构建，不产出候选证明'
             echo '如需为这次同步产出候选证明与候选镜像：在 epic 分支上开一个空提交的 Story PR，'
-            echo 'squash 合并时把提交信息设成含 [image-candidate] 标记（见 deploy/README.md）；'
+            echo 'squash 合并时把提交信息末尾加一行 Image-Candidate: true（见 deploy/README.md）；'
             echo '或者由有 Actions 写权限的身份对本次 run 执行 `gh run rerun <run-id>`（全量重跑）。'
             exit 0
           fi

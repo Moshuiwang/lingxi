@@ -148,8 +148,9 @@ synchronize 不再自动跑 `image` job（`gate` / `extras` 两个快速检查�
 不受影响）；直接开给 `main` 的普通 PR（例如某个 `fix/xxx` 分支）不受任何影响，
 `image` 仍然照旧每次自动跑——这是"PR 检查阶段的可复现性门"，本 Issue 不动它。
 
-**编排者要固定某个候选提交（准备验收或合并前）时的主姿势——空提交 Story PR 带
-`[image-candidate]` 标记**（机器人身份可执行，不需要人工操作 GitHub 网页）：
+**编排者要固定某个候选提交（准备验收或合并前）时的主姿势——空提交 Story PR，
+提交信息末尾带一行 `Image-Candidate: true` trailer**（机器人身份可执行，不需要
+人工操作 GitHub 网页）：
 
 ```bash
 # 0. 前提：`epic/**` 挂了 ruleset「仅 Story Fast 后合并」（pull_request 规则 +
@@ -160,13 +161,15 @@ synchronize 不再自动跑 `image` job（`gate` / `extras` 两个快速检查�
 # 1. 从 epic 分支当前 tip 开一个只有空提交的临时分支：
 git fetch origin <epic 分支名>
 git checkout -b chore/image-candidate-trigger origin/<epic 分支名>
-git commit --allow-empty -m "chore: 冻结候选镜像构建触发 [image-candidate]"
+git commit --allow-empty -m "chore: 冻结候选镜像构建触发
+
+Image-Candidate: true"
 git-claude-tz push -u origin chore/image-candidate-trigger
 
 # 2. 开 Story PR，base 指向 epic 分支（不是 main）：
 gh pr create --repo Moshuiwang/lingxi \
   --base <epic 分支名> --head chore/image-candidate-trigger \
-  --title "chore: 冻结候选镜像构建触发 [image-candidate]" \
+  --title "chore: 冻结候选镜像构建触发" \
   --body "空提交触发，无实际代码改动；用于让编排者显式构建一份候选镜像（Issue #278）。"
 
 # 3. 等 Story Fast 变绿（空 diff 会被 classify_story_changes.py 判成 full——
@@ -177,16 +180,26 @@ gh pr create --repo Moshuiwang/lingxi \
 gh pr checks <PR 编号> --repo Moshuiwang/lingxi --watch
 
 # 4. squash 合并，**显式指定提交信息**（默认的 squash 消息不保证带上标记，
-#    必须用 --subject 显式设置）：
+#    必须用 --subject/--body 显式设置；trailer 必须独占一行、精确是
+#    `Image-Candidate: true`，前后不能有多余字符）：
 gh pr merge <PR 编号> --repo Moshuiwang/lingxi --squash \
-  --subject "chore: 冻结候选镜像构建触发 [image-candidate]" --body ""
+  --subject "chore: 冻结候选镜像构建触发" --body "Image-Candidate: true"
 ```
+
+**标记为什么用 trailer 形状而不是行内的 `[image-candidate]` 之类方括号写法**：
+方括号写法是子串匹配，任何"提到这个标记本身"的文字（哪怕只是像这段说明一样在
+讨论这个机制）都会被误判成"触发"——这不是假设：本 Issue 第一版实现时就在自己的
+commit message 里描述这条机制，恰好把 `[image-candidate]` 这个词组原样写了进去，
+被自己的检测逻辑命中过一次（未影响该次验证结论，因为那次 PR 的 head 不是
+`epic/*`，但足以证明子串匹配这条路子不安全）。trailer 形状要求整行精确匹配
+`Image-Candidate: true`，没有人会在说明性文字里恰好独立成行地写这一句，从根上
+避免这类自指误判。
 
 第 4 步产生的 squash 提交成为 epic 分支新的 tip，把跟踪 PR（epic 分支 -> `main`）
 再 synchronize 一次；`.github/workflows/ci.yml` 的 `classify` job 会用
 `git log -1 --format=%B <PR head sha>` 读出这个提交的完整信息（不是 `HEAD`——
 `pull_request` 事件默认检出的是 GitHub 生成的临时 merge 提交，其信息是自动生成的
-合并说明，不是真正头提交的信息），检测到 `[image-candidate]` 就把
+合并说明，不是真正头提交的信息），逐行精确匹配到 `Image-Candidate: true` 就把
 `image` job 的按需跳过条件解除，这次 `image` 真正执行，下面「PR 候选镜像下载与
 校验」一节描述的 `epic-candidate-images-pr-<PR 编号>-<PR head sha>` artifact 与
 `epic-candidate-pr-<PR 编号>-<PR head sha>`（`candidate.json`，`Main Publish`
