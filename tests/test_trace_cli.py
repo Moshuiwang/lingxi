@@ -46,6 +46,39 @@ class NoWritePathSourceScanTests(unittest.TestCase):
         for forbidden in ("--set", "--write", "--delete", "--update", "--abort", "--force"):
             self.assertNotIn(forbidden, source)
 
+    def test_no_dead_exception_classes_sit_unused_in_the_module(self) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：``TraceLookupError``
+        曾经定义在这个模块、也在 ``__all__`` 里，却从来没有任何地方 ``raise`` 过它
+        （核实：真实"查无此追溯号"由 ``_render`` 返回一条正常字符串处理，``run()``
+        对它照常返回 exit=0——``test_an_unknown_trace_id_says_so_explicitly`` 钉住
+        了这条行为，空结果是一次合法的成功查询，不是需要额外异常类型的失败）。
+        已删除该类。这里用 AST 静态扫描全部本模块定义的异常类，逐个确认它在同一
+        文件里至少被 ``raise`` 过一次——挡的是"以后又悄悄加一个没人用的异常类、
+        只是看起来像是留了扩展点"这类回归，不逐个类名硬编码。"""
+
+        tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"), filename=str(_MODULE_PATH))
+        defined_exception_names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and any(
+                isinstance(base, ast.Name) and base.id.endswith(("Error", "Exception"))
+                for base in node.bases
+            )
+        }
+        raised_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                func = node.exc.func
+                if isinstance(func, ast.Name):
+                    raised_names.add(func.id)
+        unused = defined_exception_names - raised_names
+        self.assertEqual(
+            unused,
+            set(),
+            f"本模块定义了从未被 raise 过的异常类：{unused}——真实用起来或删掉",
+        )
+
 
 class RunArgumentAndFailureClosedTests(unittest.TestCase):
     def test_missing_dsn_env_var_exits_one(self) -> None:

@@ -42,10 +42,6 @@ from typing import Any, Callable, Mapping, Sequence
 DSN_ENV_VAR = "LINGXI_POSTGRES_DSN"
 
 
-class TraceLookupError(RuntimeError):
-    """查询失败；``reason`` 是安全的分类文本，不含业务正文或凭据。"""
-
-
 @dataclass(frozen=True)
 class _EventRow:
     feishu_event_id: str
@@ -291,4 +287,4 @@ def main() -> int:  # pragma: no cover - 由 __main__.py 与真实 CLI 调用
     return run()
 
 
-__all__ = ["DSN_ENV_VAR", "TraceLookupError", "run", "main"]
+__all__ = ["DSN_ENV_VAR", "run", "main"]
