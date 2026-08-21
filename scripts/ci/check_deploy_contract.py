@@ -752,8 +752,24 @@ def check_compose_contract() -> list[str]:
             r'^\s*LINGXI_WORKER_MODE:\s*queue\s*$', worker_queue, re.MULTILINE
         ):
             failures.append("worker-queue 没有设置 LINGXI_WORKER_MODE=queue，会退化成一次性 turn 模式")
-        if "lingxi-users:/var/lib/lingxi/users" not in worker_queue:
+        # 精确解析 volumes: 列表，不再用整块字符串包含判断（Issue #261，对齐
+        # check_scheduler_user_volume 已经做的 2026-08-19 修复／外部独立审查 F2 同类
+        # 假绿口子）：字符串包含判断分不清"真的挂了这个卷"与"这个子串恰好出现在
+        # environment/labels 等别处"，也分不清"可写挂载"与"挂成 :ro"。
+        worker_queue_user_mounts = [
+            (source, target, mode)
+            for source, target, mode in _volume_mounts(worker_queue)
+            if source == "lingxi-users" and target == "/var/lib/lingxi/users"
+        ]
+        if not worker_queue_user_mounts:
             failures.append("worker-queue 必须挂载用户环境持久卷（与一次性 worker job 一致）")
+        elif any(mode == "ro" for _, _, mode in worker_queue_user_mounts):
+            failures.append(
+                "worker-queue 把用户环境持久卷 lingxi-users 挂成了只读（`:ro`）。"
+                "挂载模式须与 worker job 一致（可写），只读是明显的操作失误信号；"
+                "门禁如果只做整块字符串包含判断，会因为 `:ro` 挂载的子串仍然命中"
+                "`lingxi-users:/var/lib/lingxi/users` 而误判为通过。"
+            )
         if not re.search(r"^\s*read_only:\s*true\s*$", worker_queue, re.MULTILINE):
             failures.append("worker-queue 缺 `read_only: true`（断言 V-部署-02，与 scheduler/gateway 同一要求）")
 

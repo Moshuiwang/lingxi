@@ -780,6 +780,60 @@ class GatewayOrchestrationTest(unittest.TestCase):
         self.assertEqual([f for f in CONTRACT.check_compose_contract() if "gateway" in f], [])
 
 
+class WorkerQueueUserVolumeTest(unittest.TestCase):
+    """worker-queue 的用户环境持久卷挂载检查同样必须精确解析 ``volumes:`` 列表，
+    不能再用整块字符串包含判断（Issue #261，对齐 2026-08-19
+    ``check_scheduler_user_volume`` 已经做过的同类修复／外部独立审查 F2）。
+    """
+
+    def _with_base(self, volumes_or_decoy: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        base = directory / "compose.yaml"
+        body = (
+            'worker-queue:\n'
+            '  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-worker:${LINGXI_IMAGE_TAG:?y}\n'
+            '  profiles: ["mvp"]\n'
+            '  restart: unless-stopped\n'
+            '  user: "10001:10001"\n'
+            '  read_only: true\n'
+            + volumes_or_decoy
+        )
+        base.write_text("services:\n" + textwrap.indent(body, "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_BASE
+        CONTRACT.COMPOSE_BASE = base
+        try:
+            return CONTRACT.check_compose_contract()
+        finally:
+            CONTRACT.COMPOSE_BASE = original
+
+    def test_readonly_mount_is_caught_not_treated_as_mounted(self) -> None:
+        """挂成 ``:ro`` 时，此前的整块字符串包含判断仍会因为子串命中而误判成
+        "已挂载"——这正是外部独立审查 F2 在 scheduler 侧坐实过的同一类假绿口子，
+        这里补的是 worker-queue 那一侧。"""
+
+        failures = self._with_base('  volumes:\n    - lingxi-users:/var/lib/lingxi/users:ro\n')
+        self.assertTrue(
+            any("worker-queue" in f and "只读" in f for f in failures), failures
+        )
+
+    def test_mount_string_appearing_elsewhere_does_not_produce_a_false_pass(self) -> None:
+        """卷实际没挂、只是这个子串恰好出现在 ``environment`` 里，必须仍然变红——
+        证明真正生效的是对 ``volumes:`` 列表的精确解析，不是子串命中。"""
+
+        failures = self._with_base('  environment:\n    NOTE: lingxi-users:/var/lib/lingxi/users\n')
+        self.assertTrue(
+            any("worker-queue 必须挂载用户环境持久卷" in f for f in failures), failures
+        )
+
+    def test_real_compose_worker_queue_volume_passes(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        failures = [
+            f for f in CONTRACT.check_compose_contract() if "worker-queue" in f and "lingxi-users" in f
+        ]
+        self.assertEqual(failures, [])
+
+
 class RealRepositoryTest(unittest.TestCase):
     """反过来跑真实仓库状态：检查一旦找不到目标就会安静地永远通过。"""
 
