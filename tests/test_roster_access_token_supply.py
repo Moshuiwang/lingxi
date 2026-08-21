@@ -1,9 +1,11 @@
-"""花名册日报的短期令牌供给（Issue #215 主接线，方案 C）。
+"""花名册日报的短期令牌供给（Issue #215 主接线，方案 C；Issue #276 改频率上界）。
 
-产品负责人 2026-08-18 裁定接受**按日节奏**（留痕见 [#203 决策评论]
+产品负责人 2026-08-18 裁定接受**按需节奏**（留痕见 [#203 决策评论]
 (https://github.com/Moshuiwang/lingxi/issues/203#issuecomment-5321623142) 第 7 项）：
-一次性 ``refresh_token`` 的消费从约 5.6 天一次改为按需（事实上按日），**凭据轮换
-职责仍是唯一消费者**。本文件钉住这条接线的全部边界。
+一次性 ``refresh_token`` 的消费从约 5.6 天一次改为按需，**凭据轮换职责仍是唯一
+消费者**。2026-08-21 就 Issue #276 追加裁定：解除此前"每 UTC 日至多消费一次"的
+自设限制，改为「两次消费的最小间隔 + 每日消费次数上界」双重保护（默认 5 分钟 /
+100 次）。本文件钉住这条接线的全部边界。
 
 认领断言：
 
@@ -14,7 +16,7 @@
   且**注册完全由配置驱动**）——第四个前置"读取令牌供给"由本次接线兑现；
 - ``V-花名册-33``（审计与日志不含资料值）在令牌供给这一侧的落地。
 
-**没有覆盖什么**：真实飞书续期返回的 ``expires_in`` 取值、真实的按日消费节奏与真实
+**没有覆盖什么**：真实飞书续期返回的 ``expires_in`` 取值、真实的按需消费节奏与真实
 日报送达仍属 L4a（证据等级 1）。这里的全部断言跑在注入的假凭据库、假授权客户端与
 假时钟上，与 ``adapters/feishu_directory.py`` 同一姿态。
 """
@@ -39,7 +41,8 @@ from lingxi.core.identity.access_token_supply import (
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
     DerivedAccessToken,
-    RefreshAlreadyConsumedToday,
+    RefreshDailyLimitReached,
+    RefreshMinIntervalNotElapsed,
     SecretToken,
 )
 
@@ -511,11 +514,14 @@ class RecordingHolder(DerivedAccessTokenHolder):
 
 
 class ScriptedVault:
-    """凭据库替身，**照做真实凭据库的锁内语义**：
+    """凭据库替身，**照做真实凭据库的锁内语义**（Issue #276 改为双重上界）：
 
-    - 消费时刻在"锁内"取（用注入的时钟），随领取一起交出，落盘时原样收回；
-    - ``for_supply=True`` 才放开到期判定，且同一 UTC 日只放行一次；
-    - 到期驱动的领取只在凭据到点时给。
+    - 消费时刻与当日消费计数在"锁内"取/算（用注入的时钟），随领取一起交出，
+      落盘时原样收回；
+    - ``for_supply=True`` 才放开到期判定，且施加**两道**频率上界——两次消费的
+      最小间隔与当日消费次数上界；
+    - 到期驱动的领取只在凭据到点时给，且不做频率判据（但把当日计数原样带过去，
+      与真实凭据库同一条口径）。
 
     替身与真身在这些点上对不齐，正是"本地全绿、真库两样"的来源，因此这里不简化。
     """
@@ -529,14 +535,21 @@ class ScriptedVault:
         superseded: bool = False,
         events: list[str] | None = None,
         consumed_at: datetime | None = None,
+        consumed_count: int = 0,
+        min_interval: timedelta = timedelta(minutes=5),
+        daily_limit: int = 100,
     ) -> None:
         self._claims = list(claims)
         self._clock = clock
         self._save_failures = save_failures
         self._superseded = superseded
         self.events = events if events is not None else []
-        # 当前凭据上记着的消费时刻（真身里就是密文载荷里的 refresh_consumed_at）。
+        # 当前凭据上记着的消费时刻与当日消费计数（真身里就是密文载荷里的
+        # refresh_consumed_at / refresh_consumed_count）。
         self.consumed_at = consumed_at
+        self.consumed_count = consumed_count
+        self._min_interval = min_interval
+        self._daily_limit = daily_limit
         self.saved: list[dict[str, object]] = []
         self.revoked: list[str] = []
         self.claim_calls: list[dict[str, object]] = []
@@ -550,9 +563,25 @@ class ScriptedVault:
         moment = self._clock()  # 锁内时刻
         self._clock.advance(self.CLAIM_TAKES)
         self.claim_calls.append({"for_supply": for_supply, "moment": moment})
-        if for_supply and self.consumed_at is not None:
-            if self.consumed_at.astimezone(timezone.utc).date() == moment.astimezone(timezone.utc).date():
-                raise RefreshAlreadyConsumedToday(consumed_at=self.consumed_at)
+
+        same_utc_day = (
+            self.consumed_at is not None
+            and self.consumed_at.astimezone(timezone.utc).date() == moment.astimezone(timezone.utc).date()
+        )
+        count_today = self.consumed_count if same_utc_day else 0
+
+        if for_supply:
+            if self.consumed_at is not None and moment - self.consumed_at < self._min_interval:
+                raise RefreshMinIntervalNotElapsed(consumed_at=self.consumed_at)
+            if count_today >= self._daily_limit:
+                raise RefreshDailyLimitReached(consumed_at=self.consumed_at)
+            pending_count = count_today + 1
+        else:
+            # 到期驱动不做频率判据，但把当日计数原样带过去——与真实凭据库
+            # 同一条口径（不这样做的话，自己的 save() 会把按需供给那条链
+            # 已经积累的当日计数悄悄清零）。
+            pending_count = count_today
+
         if not self._claims:
             return None
         claim = self._claims.pop(0)
@@ -562,6 +591,7 @@ class ScriptedVault:
             # 到期驱动的那条路径只在凭据到点时给。
             return None
         claim.consumed_at = moment
+        claim.refresh_consumed_count = pending_count
         return claim
 
     def save(self, **fields):
@@ -575,12 +605,16 @@ class ScriptedVault:
         self.events.append("save")
         self.saved.append(fields)
         self.consumed_at = fields.get("refresh_consumed_at")
+        # 真身里 save() 每次都重建整份 payload：不传就是 None，读回来按 0 处理
+        # （Issue #276 最容易踩的坑，替身照做同一条语义）。
+        self.consumed_count = fields.get("refresh_consumed_count") or 0
         return True
 
     def reauthorize(self) -> None:
-        """人工重授权：换来一条全新的凭据，**没有任何消费标记**。"""
+        """人工重授权：换来一条全新的凭据，**没有任何消费标记与计数**。"""
 
         self.consumed_at = None
+        self.consumed_count = 0
         self._claims.append(_Claim(generation="gen-reauthorized"))
 
     def revoke(self, *, reason: str, generation=None) -> bool:
@@ -624,6 +658,7 @@ class _Claim:
         self.generation = generation
         self.due = due
         self.consumed_at: datetime | None = None
+        self.refresh_consumed_count: int | None = None
 
 
 class SupplyLoopFixture(NamedTuple):
@@ -654,6 +689,9 @@ def build_supply_loop(
     superseded: bool = False,
     lifetime: int | None = 7200,
     consumed_at: datetime | None = None,
+    consumed_count: int = 0,
+    min_interval: timedelta = timedelta(minutes=5),
+    daily_limit: int = 100,
     now: datetime = DAY,
     refresh_takes: timedelta | None = None,
 ) -> SupplyLoopFixture:
@@ -667,6 +705,9 @@ def build_supply_loop(
         superseded=superseded,
         events=events,
         consumed_at=consumed_at,
+        consumed_count=consumed_count,
+        min_interval=min_interval,
+        daily_limit=daily_limit,
     )
     replacement = AuthorizationGrant(SecretToken(FAKE_NEXT_REFRESH_TOKEN), 604800, "offline_access")
     authorization = ScriptedAuthorization(
@@ -705,7 +746,7 @@ class OnDemandRefreshTest(unittest.TestCase):
     def test_the_on_demand_claim_takes_a_credential_that_is_not_due_yet(self) -> None:
         """日报每天要令牌，而轮换点五天多才到一次。
 
-        ``for_supply`` 一个开关同时放开到期判定并施加每日上界，两件事拆不开。
+        ``for_supply`` 一个开关同时放开到期判定并施加频率上界，两件事拆不开。
         """
 
         fixture = build_supply_loop(claims=[_Claim(due=False)])
@@ -741,8 +782,13 @@ class OnDemandRefreshTest(unittest.TestCase):
         self.assertEqual(fixture.vault.saved[0]["refresh_consumed_at"], claimed_moment)
         self.assertEqual(fixture.vault.consumed_at, claimed_moment)
 
-    def test_a_second_refresh_on_the_same_day_is_refused_by_the_credential_itself(self) -> None:
-        """同一天第二次：由凭据文件里的消费标记拒绝，**这是唯一的那道上界**。"""
+    def test_a_second_refresh_within_the_minimum_interval_is_refused_by_the_credential_itself(self) -> None:
+        """同一天、间隔未到的第二次：由凭据文件里的最小间隔判据拒绝（Issue #276）。
+
+        两次 ``refresh_for_supply()`` 之间只过了 ``ScriptedVault.CLAIM_TAKES``（5 秒），
+        远不到默认的 5 分钟最小间隔——这条上界替换了此前"每 UTC 日至多一次"的判据，
+        但**没有消失**。
+        """
 
         fixture = build_supply_loop(claims=[_Claim(), _Claim()])
         fixture.loop.refresh_for_supply()
@@ -750,11 +796,11 @@ class OnDemandRefreshTest(unittest.TestCase):
         with self.assertRaises(AccessTokenUnavailable) as raised:
             fixture.loop.refresh_for_supply()
 
-        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
         self.assertEqual(fixture.authorization.calls, 1, "被上界拒绝时不得再向飞书发起续期")
         self.assertEqual(fixture.vault.revoked, [], "被上界拒绝不是凭据问题，不得撤销")
 
-    def test_a_restart_on_the_same_day_is_still_refused(self) -> None:
+    def test_a_restart_within_the_minimum_interval_is_still_refused(self) -> None:
         """判据随凭据落盘，因此崩溃重启循环也绕不过——一次性令牌被高频消费正是
         2026-08-08 那次事故的形状。"""
 
@@ -764,8 +810,58 @@ class OnDemandRefreshTest(unittest.TestCase):
         with self.assertRaises(AccessTokenUnavailable) as raised:
             fixture.restart().refresh_for_supply()
 
-        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
         self.assertEqual(fixture.authorization.calls, 1)
+
+    def test_a_second_refresh_after_the_interval_elapses_succeeds(self) -> None:
+        """**本次改动的正向锚点**：间隔已过 ⇒ 同一天内的第二次换取成功。
+
+        在旧判据「每 UTC 日至多一次」下，这条用例必然失败——那正是本次要推翻的形状
+        （Issue #276，产品负责人 2026-08-21 裁定）。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()])
+        fixture.loop.refresh_for_supply()
+
+        fixture.clock.advance(timedelta(minutes=6))
+        fixture.loop.refresh_for_supply()
+
+        self.assertEqual(fixture.authorization.calls, 2, "间隔已过，必须真的再换一次")
+        self.assertEqual(len(fixture.vault.saved), 2)
+        self.assertTrue(fixture.holder.has_token)
+
+    def test_the_daily_limit_is_enforced_end_to_end_with_a_distinct_reason(self) -> None:
+        """当日上界在 ``CredentialRotationLoop`` 这条真实生产路径上同样生效
+        （不只是凭据库单元测试里），且 reason 与"最小间隔未到"不同（约束 2）。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()], daily_limit=1)
+        fixture.loop.refresh_for_supply()
+
+        fixture.clock.advance(timedelta(minutes=6))  # 间隔已过，不撞最小间隔
+        with self.assertRaises(AccessTokenUnavailable) as raised:
+            fixture.loop.refresh_for_supply()
+
+        self.assertEqual(raised.exception.reason, "refresh_daily_limit_reached")
+        self.assertEqual(fixture.authorization.calls, 1, "被日上界拒绝时不得再向飞书发起续期")
+
+    def test_the_persisted_count_accumulates_across_supply_refreshes(self) -> None:
+        """**Issue #276 最容易踩的坑，在生产代码的调用路径上钉住**：每一次
+        ``refresh_for_supply()`` 落盘的 ``refresh_consumed_count`` 必须在上一次的
+        基础上累加，而不是被这次的 ``save()`` 悄悄清零。
+
+        变异验红锚点：把 ``credential_rotation.py`` 里 ``_save_with_retry`` 调用
+        ``self._vault.save(...)`` 时的 ``refresh_consumed_count=refresh_consumed_count``
+        去掉，本用例必须变红（第二次落盘的计数会变成 ``None``/``1``，而不是 ``2``）。
+        """
+
+        fixture = build_supply_loop(claims=[_Claim(), _Claim()])
+        fixture.loop.refresh_for_supply()
+        fixture.clock.advance(timedelta(minutes=6))
+        fixture.loop.refresh_for_supply()
+
+        self.assertEqual(fixture.vault.saved[0]["refresh_consumed_count"], 1)
+        self.assertEqual(fixture.vault.saved[1]["refresh_consumed_count"], 2)
 
     def test_a_reauthorization_restores_the_supply_the_very_same_day(self) -> None:
         """**收口轮 P1 的钉子**：当天已经消费过之后，人工重授权换来的新凭据立刻可用。
@@ -1111,19 +1207,20 @@ class OnDemandRefreshTest(unittest.TestCase):
             with self.assertRaises(AccessTokenUnavailable):
                 fixture.loop.refresh_for_supply()
 
-        # 第二天：别人先完成了一次消费，凭据上记着的是**那一次**的时刻。
+        # 第二天：别人先完成了一次消费，凭据上记着的是**那一次**的时刻（距现在仅
+        # 0 秒，因此撞的是最小间隔而不是当日上界——这里只关心 reason 不再继承旧记号）。
         fixture.clock.advance(timedelta(days=1))
         fixture.vault.consumed_at = fixture.clock.now
 
         with self.assertRaises(AccessTokenUnavailable) as raised:
             fixture.loop.refresh_for_supply()
 
-        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
 
     def test_after_a_restart_the_reason_falls_back_to_the_honest_one(self) -> None:
         """记号是进程内的：重启之后本进程对"上一次换到了什么"一无所知。
 
-        这时如实报上界（``refresh_already_consumed_today``），不假装还知道真实原因。
+        这时如实报上界（``refresh_min_interval_not_elapsed``），不假装还知道真实原因。
         """
 
         fixture = build_supply_loop(claims=[_Claim(), _Claim()], lifetime=None)
@@ -1135,7 +1232,7 @@ class OnDemandRefreshTest(unittest.TestCase):
         with self.assertRaises(AccessTokenUnavailable) as raised:
             fixture.restart().refresh_for_supply()
 
-        self.assertEqual(raised.exception.reason, "refresh_already_consumed_today")
+        self.assertEqual(raised.exception.reason, "refresh_min_interval_not_elapsed")
 
     def test_a_reauthorization_recovers_even_after_an_unusable_token(self) -> None:
         """换到不可用令牌之后当天补授权：新凭据没有消费标记，供给立刻恢复。"""
@@ -1631,10 +1728,11 @@ class AssembledSupplyTest(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "no_credential_available")
 
     def test_the_assembled_supply_always_asks_through_the_bounded_path(self) -> None:
-        """装配出来的那条链走的是**带每日上界的那条领取路径**。
+        """装配出来的那条链走的是**带频率上界的那条领取路径**（Issue #276）。
 
-        上界的唯一权威在凭据库里，因此这里能钉的是"确实按 ``for_supply`` 模式去问"——
-        换成到期驱动的那条路径（或任何绕过上界的写法）都会让它变红。
+        上界的唯一权威在凭据库里，且默认阈值本身生效（不用在这里显式传参）——因此这里
+        能钉的是"确实按 ``for_supply`` 模式去问，且不额外传参"。换成到期驱动的那条
+        路径、或传参绕过上界，都会让它变红。
         """
 
         from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault

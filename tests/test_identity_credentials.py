@@ -234,13 +234,16 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertFalse(path.with_name(path.name + ".lock").exists(), "守卫应在取文件锁之前就拒绝")
 
 
-    def test_no_parameter_can_relax_the_due_check_without_the_daily_ceiling(self) -> None:
-        """收口轮 P2-a：``for_supply`` 把两件事**捆死**，没有任何参数能把它们拆开。
+    def test_no_parameter_can_relax_the_due_check_without_the_rate_ceilings(self) -> None:
+        """收口轮 P2-a、Issue #276 延伸：``for_supply`` 把三件事**捆死**，没有任何参数
+        能把它们拆开。
 
-        放开到期判定而不带每日上界，等于把一条**一次性**凭据交给一个没有任何频率约束的
+        放开到期判定而不带频率上界，等于把一条**一次性**凭据交给一个没有任何频率约束的
         循环——一次性令牌被高频消费正是 2026-08-08 授权码被烧那次事故的形状。此前这条
         靠一道"两个参数必须成对"的运行时守卫，守卫本身就说明 API 允许拆开；现在从形状上
-        就拆不开，因此这里断言的是**签名**。
+        就拆不开，因此这里断言的是**签名**：新增的 ``min_interval``/``daily_limit`` 只能
+        调整门槛大小（``test_the_ceiling_cannot_be_disabled_by_a_sentinel_value`` 钉住
+        "不能传值把检查关掉"这一半），不能新增一个让检查整体消失的开关。
         """
 
         import inspect
@@ -251,8 +254,8 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
 
         self.assertEqual(
             sorted(name for name in parameters if name != "self"),
-            ["for_supply", "lease_seconds", "now"],
-            "多出来的旋钮就是一条可以绕过每日上界的路",
+            ["daily_limit", "for_supply", "lease_seconds", "min_interval", "now"],
+            "多出来的旋钮就是一条可以绕过频率上界的路",
         )
         self.assertIs(parameters["for_supply"].default, False, "默认必须是到期驱动的那条路径")
 

@@ -1199,7 +1199,8 @@ def build_loop(
 
     duties: list[Any] = [rotation, cleanup, idle_sweep, permission_retention]
     # 令牌供给：日报侧要令牌 → 持有者里有新鲜的就直接给，没有就让**凭据轮换职责**
-    # 按需换一次（每 UTC 日至多一次）。日报自己不碰一次性 refresh_token。
+    # 按需换一次（受最小间隔 + 每日上界双重保护，Issue #276）。日报自己不碰一次性
+    # refresh_token。
     supply = (
         roster_access_token
         if roster_access_token is not None
