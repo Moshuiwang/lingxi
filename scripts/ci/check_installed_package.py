@@ -56,6 +56,11 @@ REQUIRED_MODULES = (
     "lingxi.core.identity",
     "lingxi.core.permission",
     "lingxi.core.ids",
+    # 独立审查（分支 fix/291-280-user-experience 收尾）：把 QUERY_MCP_SERVER_NAME
+    # 从 adapters.user_environment 挪到这个零依赖模块，避免 worker 为了一个字符串
+    # 常量就要拖进整条首次开通编排的 import 闭包（见下面 PROCESS_RUNTIME_IMPORTS
+    # 的 worker 闭包同名注释）。
+    "lingxi.core.mcp_naming",
     "lingxi.core.identity.onboarding",
     "lingxi.core.identity.identifiers",
     "lingxi.core.identity.credentials",
@@ -464,6 +469,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_snapshot",
             "lingxi.core.alerting",
             "lingxi.core.ids",
+            # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.
+            # user_environment` 现在从这个零依赖模块导入 QUERY_MCP_SERVER_NAME，
+            # 见 worker 闭包那条同名注释。
+            "lingxi.core.mcp_naming",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.onboarding_recovery",
@@ -534,24 +543,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # Epic D 闸⑥：按用户读取问数 MCP 配置，由 apps/worker/service.py
             # 模块级 import（queue 模式每个任务都要用）。
             "lingxi.adapters.user_mcp_config",
-            # Issue #291 P0：apps/worker/config.py 模块级 import
-            # QUERY_MCP_SERVER_NAME（只读工具白名单前缀与写侧 .mcp.json 服务名的
-            # 单一事实来源），因此 adapters.user_environment 与它整条 import 闭包
-            # 现在也在 worker 进程的运行时闭包里——不是新增功能调用，只是取一个
-            # 模块级常量，但闭包判定按实际 import 语句走，不区分"只是拿常量"。
-            "lingxi.adapters.user_environment",
-            "lingxi.core.identity",
-            "lingxi.core.identity.first_contact",
-            "lingxi.core.identity.onboarding_runner",
-            "lingxi.core.identity.org_snapshot",
-            "lingxi.core.identity.provisioning",
-            "lingxi.core.permission",
-            "lingxi.core.permission.account_match",
-            "lingxi.core.permission.galaxy_scope",
-            "lingxi.core.permission.mcp_readiness",
-            "lingxi.core.permission.notification",
-            "lingxi.core.permission.publish_row",
-            "lingxi.core.permission.role_function",
+            # 独立审查（分支 fix/291-280-user-experience 收尾）：Issue #291 P0 曾让
+            # apps/worker/config.py 为了取 QUERY_MCP_SERVER_NAME 这一个字符串常量
+            # `from lingxi.adapters.user_environment import ...`，把 adapters.
+            # user_environment 顶部 import 的 `core/identity/onboarding_runner.py`
+            # 整条首次开通编排闭包（身份匹配、花名册、银河、建档等约十二个模块，
+            # 曾登记在这里）一并拉进了 worker 的运行时闭包——worker 是处理每一次
+            # 真实用户提问的热路径进程，这条闭包与它的职责毫无关系。常量已经挪到
+            # 零依赖的 `lingxi.core.mcp_naming`（不 import 任何东西），worker 现在
+            # 只需要登记这一行，不再需要上面那整条开通编排链；变异存活证据见
+            # `tests/test_worker_entry.py` 的
+            # `test_importing_worker_config_does_not_pull_in_the_onboarding_
+            # orchestration_chain`。
+            "lingxi.core.mcp_naming",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
             # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。

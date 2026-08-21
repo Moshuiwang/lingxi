@@ -100,6 +100,7 @@ import sys
 from pathlib import Path
 
 from lingxi.core.identity.onboarding_runner import EnvironmentResult
+from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,13 @@ _USER_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 #: ``.mcp.json`` 后这里早已改成 ``query``，两处没人同步，用户的每一次真实工具
 #: 调用因此在 ``PreToolUse`` 被无声拒绝。改这个值必须同时确认 worker 白名单的
 #: 装配期断言仍然通过，不能只改一处。
-QUERY_MCP_SERVER_NAME = "query"
+#:
+#: 常量本身定义在 ``lingxi.core.mcp_naming``、经上方 import 语句在本模块重新
+#: 导出（独立审查，分支 fix/291-280-user-experience 收尾）：本模块顶部还
+#: import 了 ``core/identity/onboarding_runner.py``（首次开通编排，传递拉入
+#: 约十二个模块），``apps/worker/config.py`` 此前为了这一个字符串常量就要一并
+#: 拉入整条开通编排链——与 worker 的职责毫无关系，现已改为直接从
+#: ``core.mcp_naming`` 导入，不再经本模块。
 
 
 class UserEnvironmentError(RuntimeError):

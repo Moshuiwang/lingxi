@@ -15,10 +15,10 @@ import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME
 from lingxi.core.execution.input_safety import SAFE_OUTPUT_FALLBACK, WITHHELD_MESSAGE
 from lingxi.core.execution.tool_policy import is_well_formed_tool_name
 from lingxi.core.ids import new_ulid
+from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 ENV_PREFIX = "LINGXI_WORKER_"
 
@@ -60,9 +60,10 @@ SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS = 300.0
 MCP_TOOL_PREFIX = "mcp__"
 
 # 白名单每一项都必须以这个前缀开头——服务名段与写侧（``adapters/user_environment.py``
-# 的 ``QUERY_MCP_SERVER_NAME``，写 ``.mcp.json`` 的那一侧）共用同一个常量，不各自
-# 维护一份字符串。见 ``_read_only_tools`` 的装配期断言：两侧不一致时启动失败关闭，
-# 不留到用户提问那一刻才无声降级。
+# 写 ``.mcp.json`` 的那一侧）共用同一个常量 ``QUERY_MCP_SERVER_NAME``（定义在零依赖的
+# ``lingxi.core.mcp_naming``，独立审查见该模块文档），不各自维护一份字符串。见
+# ``_read_only_tools`` 的装配期断言：两侧不一致时启动失败关闭，不留到用户提问那一刻
+# 才无声降级。
 QUERY_MCP_TOOL_PREFIX = f"{MCP_TOOL_PREFIX}{QUERY_MCP_SERVER_NAME}__"
 
 # S-A-07 受控验收专用（Issue #142 验收缺口）：输出安全 canary 的两个合法档位。
@@ -276,7 +277,7 @@ def _read_only_tools(env: Mapping[str, str]) -> tuple[str, ...]:
         raise WorkerConfigError(
             f"{ENV_PREFIX}READONLY_TOOLS 的工具前缀必须是 {QUERY_MCP_TOOL_PREFIX!r}"
             f"（与用户环境 .mcp.json 的 MCP 服务名 {QUERY_MCP_SERVER_NAME!r} 一致，"
-            "见 adapters/user_environment.py 的 QUERY_MCP_SERVER_NAME），"
+            "见 lingxi.core.mcp_naming 的 QUERY_MCP_SERVER_NAME），"
             f"收到前缀不匹配的工具名：{mismatched!r}"
         )
     # 去重且保序：同一个工具名在环境变量里写重不该产生"白名单有两条"的假象。

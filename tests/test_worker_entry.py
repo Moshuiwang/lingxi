@@ -1022,6 +1022,62 @@ class WorkerConfigTest(unittest.TestCase):
 
         self.assertEqual(QUERY_MCP_TOOL_PREFIX, f"mcp__{QUERY_MCP_SERVER_NAME}__")
 
+    def test_importing_worker_config_does_not_pull_in_the_onboarding_orchestration_chain(
+        self,
+    ) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：``apps/worker/
+        config.py`` 此前为了读 ``QUERY_MCP_SERVER_NAME`` 这一个字符串常量，写的是
+        ``from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME``——
+        而 ``adapters/user_environment.py`` 顶部 import 了 ``core/identity/
+        onboarding_runner.py``（首次开通编排，传递拉入身份匹配、花名册、银河、
+        建档等约十二个模块）。worker 是处理每一次真实用户提问的热路径进程，这条
+        闭包与它的职责毫无关系。常量已经挪到零依赖的 ``lingxi.core.mcp_naming``
+        （见该模块文档），本用例在一个干净子解释器里只 import
+        ``lingxi.apps.worker.config``，断言 ``lingxi.core.identity.
+        onboarding_runner`` 与任何 ``lingxi.adapters.*`` 模块都不在结果的 import
+        闭包里——**变异存活证据**：把 ``config.py`` 的 import 改回
+        ``from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME``
+        （修复前的写法），本用例会因为两个模块名重新出现在闭包里而变红。
+        """
+
+        probe = (
+            "import sys\n"
+            "import importlib\n"
+            "importlib.import_module('lingxi.apps.worker.config')\n"
+            "for name in sorted(sys.modules):\n"
+            "    if name.startswith('lingxi.'):\n"
+            "        print(name)\n"
+        )
+        source_root = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            path for path in (source_root, environment.get("PYTHONPATH")) if path
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"探测子进程失败：{completed.stderr}",
+        )
+        imported = set(completed.stdout.splitlines())
+        self.assertNotIn(
+            "lingxi.core.identity.onboarding_runner",
+            imported,
+            "worker 的只读工具白名单装配不该拖进整条首次开通编排链",
+        )
+        adapter_modules = {name for name in imported if name.startswith("lingxi.adapters.")}
+        self.assertEqual(
+            adapter_modules,
+            set(),
+            f"worker 的只读工具白名单装配不该 import 任何 adapters 模块，实际：{adapter_modules}",
+        )
+
     def test_read_only_tools_prefix_must_match_the_query_mcp_server_name(self) -> None:
         """装配期断言（Issue #291 根因 #1，与 adapters/user_environment.py 的
         ``QUERY_MCP_SERVER_NAME`` 同一常量来源）：白名单前缀与用户环境
