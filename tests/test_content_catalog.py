@@ -238,6 +238,85 @@ class ContentDirectoryTests(unittest.TestCase):
             exercised, 3, "本用例应至少覆盖 internal_error/sync_timeout/stalled 三个键"
         )
 
+    def test_reference_requiring_key_gates_stay_reconciled_across_render_entry_points(
+        self,
+    ) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：哪些键需要
+        ``{reference}`` 占位这件事，在 content.toml 之外还被三处代码各自维护了
+        一份字面量集合——``pipeline._KEYS_REQUIRING_REFERENCE``、
+        ``onboarding_runner._KEYS_REQUIRING_REFERENCE``、
+        ``first_contact._DEFERRED_RENDER_KEYS``——此前只靠模块文档里"靠字面值
+        对齐"这句话互相担保，没有任何门禁真正比对过。这里把 content.toml 的声明
+        当作唯一事实，对账全部四处：
+
+        1. ``onboarding_runner`` 与 ``pipeline`` 两份"需要补 reference"的集合
+           必须完全相等——它们描述的是同一件事（哪些终态文案在调用方没有显式
+           给出 reference 时要由渲染层自动补上），只是各自在不同层维护了一份
+           拷贝（见两个模块里对「共用线程复核」的引用）。
+        2. ``first_contact`` 的判定层是纯函数，拿不到 ``trace_id``，只处理它
+           自己 ``_MESSAGE_KEYS`` 能产出的那个子集；它的集合必须**恰好**是
+           "全量需要补 reference 的键" 与 "它自己能产出的键" 的交集——多一个
+           说明留了一条永远不会触发的死判据，少一个说明有一条它能产出的终态
+           会在真正渲染时因为缺 reference 而失败关闭，却没有任何一处代码为
+           这个后果留过痕迹。
+        3. content.toml 里声明 ``{reference}`` 的全部键，必须等于 "全量需要补
+           reference 的集合" 并上一个**唯一**、已知、已文档化的例外——
+           ``onboarding.stalled``：它由 ``apps/scheduler/stalled_provisioning.py``
+           在调用处直接传 ``values={"reference": ...}``，不经过这三处的补值
+           分支，因此不需要出现在任何一份"需要补"集合里。这条例外只登记这一个
+           键；将来出现第二个，说明有一条新终态文案在悄悄假设"某处会自动补
+           reference"，而实际上没有任何一处真的补了它。
+
+        改动任意一处集合、或在 content.toml 新增/移除一个 ``{reference}`` 键
+        却没有同步其余各处，本用例都会变红。
+        """
+
+        from string import Formatter
+
+        from lingxi.core.conversation import pipeline as pipeline_module
+        from lingxi.core.identity import first_contact as first_contact_module
+        from lingxi.core.identity import onboarding_runner as onboarding_runner_module
+
+        document = _document()
+        catalog_reference_keys = {
+            key
+            for key, template in document["texts"].items()
+            if any(
+                field == "reference"
+                for _literal, field, _spec, _conv in Formatter().parse(template)
+            )
+        }
+
+        onboarding_keys = onboarding_runner_module._KEYS_REQUIRING_REFERENCE
+        pipeline_keys = pipeline_module._KEYS_REQUIRING_REFERENCE
+        first_contact_keys = first_contact_module._DEFERRED_RENDER_KEYS
+
+        self.assertEqual(
+            onboarding_keys,
+            pipeline_keys,
+            "onboarding_runner 与 pipeline 各自维护的『需要补 reference』集合已经分叉",
+        )
+
+        reachable_by_first_contact = onboarding_keys & set(
+            first_contact_module._MESSAGE_KEYS.values()
+        )
+        self.assertEqual(
+            first_contact_keys,
+            reachable_by_first_contact,
+            "first_contact 的『需要延迟渲染』集合必须恰好是它自己能产出的终态键"
+            "与全量『需要补 reference』集合的交集",
+        )
+
+        # 唯一已知、已文档化的直传值例外，见本用例说明第 3 条与
+        # apps/scheduler/stalled_provisioning.py 的 KEY_STALLED 渲染调用。
+        known_direct_value_exceptions = frozenset({"onboarding.stalled"})
+        self.assertEqual(
+            catalog_reference_keys,
+            onboarding_keys | known_direct_value_exceptions,
+            "content.toml 新增或移除了一个 {reference} 占位键，但代码侧的集合"
+            "（或本用例登记的直传值例外）没有同步更新",
+        )
+
     def test_a_content_only_change_changes_rendered_text_without_code_change(self) -> None:
         document = _document()
         document["texts"]["gateway.busy_hint"] = "内容目录中的新提示"
