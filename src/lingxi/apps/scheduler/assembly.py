@@ -40,7 +40,11 @@ from lingxi.apps.scheduler.retention import (
     PermissionRetentionSweepDuty,
     RetentionCleanupDuty,
 )
-from lingxi.apps.scheduler.roster_audit import RosterAuditDuty, _log_snapshot_alert
+from lingxi.apps.scheduler.roster_audit import (
+    RosterAuditDuty,
+    RosterSnapshotSyncDuty,
+    _log_snapshot_alert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,75 @@ def _build_roster_audit_duty(
         chat_id=config.admin_group_chat_id,
         stop=stop,
     )
+
+
+def _build_roster_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    roster_access_token: Callable[[], str] | None,
+) -> RosterSnapshotSyncDuty | None:
+    """装配花名册快照写入职责（写侧，Issue #275）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    **只有两个前置——花名册 Base 坐标（`app_token`/`table_id`）与读取令牌供给，
+    刻意不含管理群 chat_id**：`roster_snapshot` 表是首次开通链第二步
+    （`core/identity/onboarding_runner.py::_match`）与每日权限重算的共同数据前提，
+    两者都直接读这张表，从不经过管理群那条通知链路。`_build_roster_audit_duty`
+    此前把三者捆在同一道门后面，导致"日报发到哪个群"这个纯通知配置决定"员工能不能
+    被开通"——2026-08-21 首触冒烟实测坐实了这个缺口（Issue #275）。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报
+    变量名、审计恰一条、其余职责照常运行），但**审计动作前缀改成
+    `roster_snapshot_sync.`**——与 `roster_audit.duty_not_registered` 保持可分辨
+    （约束：「没配管理群所以不发日报」与「花名册没接线所以不写快照」必须是两条不同的
+    审计原因码）。
+
+    **调用方（`build_loop`）只在 `_build_roster_audit_duty` 返回 `None` 时才会调用
+    本函数**：两个职责互斥注册，避免管理群与 Base 坐标都齐全时同时跑出两条各自独立
+    的 `DailyRosterSource`，让"今天到底读了几次花名册"失去唯一性（见
+    :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 文档字符串
+    与 `build_loop` 调用点的注释）。
+    """
+
+    for variable, value in (
+        ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
+        ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
+    ):
+        if not value:
+            audit.record(
+                "roster_snapshot_sync.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，花名册快照写入职责不注册；其余定时职责照常运行", variable)
+            return None
+    if roster_access_token is None:
+        # 同 `_build_roster_audit_duty` 的同一条纪律：这条分支现在的含义是"调用方
+        # 真的没有交出任何供给"，不是"这条链还没接线"（Issue #215 之后 `build_loop`
+        # 总会建出一条默认供给）；"配了但拿不到令牌"不走这条分支，职责照常注册，
+        # 失败发生在运行期并按分类审计。
+        audit.record("roster_snapshot_sync.duty_not_registered", reason="missing_access_token_supply")
+        logger.warning("调用方未提供花名册读取令牌供给，花名册快照写入职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_roster_bitable import BitableRosterPages, read_roster_snapshot
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    pages = BitableRosterPages(
+        base_url=config.feishu_base_url,
+        app_token=config.roster_app_token,
+        table_id=config.roster_table_id,
+        access_token=roster_access_token,
+    )
+    store = PostgresRosterSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    roster_source = DailyRosterSource(
+        read_round=lambda: read_roster_snapshot(pages),
+        updater=RosterSnapshotUpdater(store=store, audit=audit, on_alert=_log_snapshot_alert),
+        load_snapshot=store.load,
+        stale_after=config.roster_snapshot_stale_after,
+    )
+    return RosterSnapshotSyncDuty(roster_source=roster_source, stop=stop)
 
 
 def _build_permission_refresh_duty(
@@ -1145,7 +1218,19 @@ def build_loop(
     )
     if roster_audit is not None:
         duties.append(roster_audit)
-    # 每日权限重算排在花名册审计**之后**：同一轮里花名册快照先被换成今天的那一份，
+    else:
+        # 报告职责没装配——不管原因是管理群没配、Base 坐标没配还是令牌供给没配，
+        # `_build_roster_audit_duty` 已经留下自己的 `roster_audit.*` 审计。花名册
+        # 快照写入与管理群报告解耦（Issue #275）：这里独立判定"只写不发"的快照同步
+        # 职责能不能装配——只要它自己的前提（Base 坐标 + 令牌供给）满足，快照就该
+        # 被写，不因为管理群这个纯通知配置项一起停摆。两者互斥注册（同一时刻至多一个
+        # 在触发花名册读取），见 `_build_roster_snapshot_sync_duty` 文档字符串。
+        roster_snapshot_sync = _build_roster_snapshot_sync_duty(
+            config, stop=stop, audit=sink, roster_access_token=supply
+        )
+        if roster_snapshot_sync is not None:
+            duties.append(roster_snapshot_sync)
+    # 每日权限重算排在花名册审计（或与它互斥的快照写入）**之后**：同一轮里花名册快照先被换成今天的那一份，
     # 重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。
     # 位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
     #
