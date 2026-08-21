@@ -81,6 +81,23 @@ _DEFAULT_ONBOARDING_MESSAGES: dict[OnboardingState, OnboardingMessage] = {
     OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
 }
 
+#: 需要追溯号占位（``{reference}``）的文案键（Issue #280 §7.1）。与
+#: ``core/identity/onboarding_runner.py`` 里同名判据各自维护一份——两条渲染入口
+#: 此前就是彼此独立的失败关闭桩（本模块只在 gateway 侧 runner 惰性桩/测试注入下
+#: 才会真的走到，见该模块「共用线程复核」一节），靠字面值对齐而不是跨模块 import。
+_KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset(
+    {"onboarding.internal_error", "onboarding.sync_timeout"}
+)
+
+
+def _with_reference(key: str, values: dict[str, object], trace_id: str) -> dict[str, object]:
+    """给需要追溯号的终态文案补上 ``reference`` 占位值，已有值不覆盖。"""
+
+    merged = dict(values)
+    if key in _KEYS_REQUIRING_REFERENCE:
+        merged.setdefault("reference", trace_id)
+    return merged
+
 
 class QueueInsertFailure(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
@@ -502,7 +519,9 @@ class EventPipeline:
                 result, checking_key=checking.key, message=message
             )
         except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
-            internal = self._texts.catalog.text("onboarding.internal_error")
+            internal = self._texts.catalog.text(
+                "onboarding.internal_error", reference=message.trace_id
+            )
             deferred.append(internal)
             self._audit.record(
                 "onboarding.failed",
@@ -601,11 +620,10 @@ class EventPipeline:
             if onboarding_message.key == checking_key:
                 # checking is owned by the gateway and is sent exactly once.
                 continue
-            rendered.append(
-                self._texts.catalog.text(
-                    onboarding_message.key, onboarding_message.as_values()
-                )
+            values = _with_reference(
+                onboarding_message.key, onboarding_message.as_values(), message.trace_id
             )
+            rendered.append(self._texts.catalog.text(onboarding_message.key, values))
         if not rendered and result.state is not OnboardingState.STARTED:
             self._audit.record(
                 "onboarding.render_failed",
@@ -613,7 +631,11 @@ class EventPipeline:
                 state=result.state.value,
                 trace_id=message.trace_id,
             )
-            return (self._texts.catalog.text("onboarding.internal_error"),)
+            return (
+                self._texts.catalog.text(
+                    "onboarding.internal_error", reference=message.trace_id
+                ),
+            )
         return tuple(rendered)
 
     def _add_reaction(self, message: InboundMessage) -> None:

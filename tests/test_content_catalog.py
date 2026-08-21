@@ -184,6 +184,60 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(rendered.version, catalog.version)
         self.assertIn("测试公司", rendered.text)
 
+    def test_a_template_naming_the_trace_id_placeholder_is_rejected_at_load_time(self) -> None:
+        """#280 联合设计 §0.1【阻断级】：占位名如果叫 ``trace_id``，会在目录**加载期**
+        被内容安全规则拒绝——`pipeline.py` 在 import 期就调用 `default_content_catalog()`，
+        按字面实现会让 gateway/worker/scheduler 三个进程全部起不来，不是"某条消息发不
+        出去"。占位名必须换成 ``{reference}``（本次改动的实际选择）。这是设计要求补的
+        主动违规测试，堵住"以后有人把占位名改回 trace_id"这个回归。"""
+
+        document = _document()
+        document["texts"]["onboarding.internal_error"] = (
+            document["texts"]["onboarding.internal_error"] + "追溯号：{trace_id}。"
+        )
+        with self.assertRaises(ContentValidationError):
+            ContentCatalog.from_mapping(document)
+
+    def test_a_rendered_text_smuggling_the_forbidden_marker_through_a_variable_is_rejected(
+        self,
+    ) -> None:
+        """占位名本身安全（``reference``），但如果调用方往里塞入含 ``trace_id=`` 的值，
+        渲染出口仍必须拦截——不能只在目录加载期防模板本身，调用方传入的资料值同样要防。"""
+
+        with self.assertRaises(ContentSafetyError):
+            default_content_catalog().text("onboarding.internal_error", reference="trace_id=fake")
+
+    def test_every_key_declaring_reference_renders_with_it_and_rejects_without_it(self) -> None:
+        """占位变量集合的自动化对账（Issue #280 §10.2）：遍历 ``REQUIRED_TEXT_KEYS``，
+        任何一个键只要在 content.toml 里声明了 ``{reference}``，本测试就强制它必须
+        用 ``reference=`` 渲染成功、且省略时必须抛 ``ContentRenderError``——不逐个
+        手写键名，防止未来第五个需要追溯号的键悄悄漏了调用方传值。"""
+
+        from string import Formatter
+
+        document = _document()
+        catalog = default_content_catalog()
+        exercised = 0
+        for key in REQUIRED_TEXT_KEYS:
+            template = document["texts"][key]
+            variables = {
+                field
+                for _literal, field, _spec, _conv in Formatter().parse(template)
+                if field
+            }
+            if "reference" not in variables:
+                continue
+            exercised += 1
+            with self.subTest(key=key):
+                others = {name: "x" for name in variables if name != "reference"}
+                with self.assertRaises(ContentRenderError):
+                    catalog.text(key, **others)
+                rendered = catalog.text(key, reference="ref-x", **others)
+                self.assertIn("ref-x", rendered.text)
+        self.assertGreaterEqual(
+            exercised, 3, "本用例应至少覆盖 internal_error/sync_timeout/stalled 三个键"
+        )
+
     def test_a_content_only_change_changes_rendered_text_without_code_change(self) -> None:
         document = _document()
         document["texts"]["gateway.busy_hint"] = "内容目录中的新提示"

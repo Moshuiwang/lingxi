@@ -580,5 +580,123 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
                 self.assertIn("trace_id=gateway-delivery-loop", sender.calls[0]["text"])
 
 
+class OnboardingFailedAlertCallbackTests(unittest.TestCase):
+    """Issue #280 §7.3 步 1：开通失败真实送达管理群
+    ——``AlertingDuty.onboarding_failed_callback()`` 是编排注入点的落地形式。"""
+
+    def test_a_failure_is_observed_as_an_onboarding_failed_signal(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_failed_callback()
+
+        callback("publish_not_completed", "01J00000000000000000000TRC1")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("publish_not_completed.onboarding_failed", sender.calls[0]["text"])
+        self.assertIn("trace_id=01J00000000000000000000TRC1", sender.calls[0]["text"])
+
+    def test_the_alert_text_never_contains_open_id_or_profile_values(self) -> None:
+        """否定断言：群消息只含故障类别 + 计数 + 追溯号——回调签名里根本没有传
+        open_id / 姓名的位置，这里显式证明正文里也没有出现过任何资料值形状的串。"""
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_failed_callback()
+
+        callback("directory_unavailable", "01J00000000000000000000TRC2")
+        duty.dispatcher.run_once(at=clock.value)
+
+        text = sender.calls[0]["text"]
+        for leak in ("ou_", "usr_", "张", "李", "@"):
+            self.assertNotIn(leak, text)
+
+    def test_reason_strings_are_sanitized_into_a_safe_scope(self) -> None:
+        """内部原因码有时是 ``unexpected_ZeroDivisionError`` 这种带大写字母的形状
+        （见 onboarding_runner._run 的 unexpected_ 分支）——不消毒直接传会在
+        AlertSignal 校验里抛 ValueError，告警本身也就不会发生。"""
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_failed_callback()
+
+        callback("unexpected_ZeroDivisionError", "01J00000000000000000000TRC3")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+
+    def test_an_unsafe_trace_id_degrades_to_no_trace_id_instead_of_dropping_the_alert(
+        self,
+    ) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_failed_callback()
+
+        callback("publish_failed", "带空格的非法-id 值")
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1, "trace_id 格式异常不得让整条告警消失")
+        self.assertIn("trace_id=-", sender.calls[0]["text"])
+
+
+class OnboardingStalledAlertCallbackTests(unittest.TestCase):
+    """Issue #280 §7.3 步 2：开通中途停摆收口的聚合计数同样送达管理群
+    ——``AlertingDuty.onboarding_stalled_callback()``。"""
+
+    def test_a_positive_count_is_observed(self) -> None:
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_stalled_callback()
+
+        callback(3)
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("stalled_provisioning.onboarding_failed", sender.calls[0]["text"])
+        self.assertIn("count=3", sender.calls[0]["text"])
+
+    def test_a_zero_count_never_produces_an_alert(self) -> None:
+        """否定断言：零计数不该报警——「有人卡住了」这句话必须是真的。"""
+
+        sender = FakeAlertSender()
+        clock = ManualClock()
+        duty = AlertingDuty(
+            manager=AlertManager(policy=AlertPolicy(send_failure_threshold=1)),
+            dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+            clock=clock,
+        )
+        callback = duty.onboarding_stalled_callback()
+
+        callback(0)
+        duty.dispatcher.run_once(at=clock.value)
+
+        self.assertEqual(sender.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -378,6 +378,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "notifier": FakeNotifier(),
         "ledger": FakeLedger(),
         "audit": RecordingAudit(),
+        "onboarding_failed": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -407,6 +408,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         clock=overrides.get("clock", lambda: datetime(2026, 8, 18, tzinfo=UTC)),
         should_stop=overrides.get("should_stop", lambda: False),
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
+        onboarding_failed=parts["onboarding_failed"],
     )
     return runner, parts
 
@@ -573,12 +575,16 @@ class ThreadingTests(unittest.TestCase):
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertEqual(result.failure_reason, "executor_unavailable")
         self.assertIn("onboarding.rejected_by_executor", parts["audit"].actions())
+        # Issue #280 §7.1 渲染点 3：即使链从未真正开始跑，同步返回的终态也必须带
+        # 上这一次的追溯号——否则"少发一条"的情形恰好是最需要它的情形。
+        self.assertEqual(dict(result.messages[0].values), {"reference": "t1"})
 
     def test_stopping_declines_new_chains(self) -> None:
         runner, parts = build_runner(should_stop=lambda: True)
         result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertIn("onboarding.start_declined_while_stopping", parts["audit"].actions())
+        self.assertEqual(dict(result.messages[0].values), {"reference": "t1"})
 
 
 class DeterministicRejectionTests(unittest.TestCase):
@@ -662,6 +668,9 @@ class InternalFaultTests(unittest.TestCase):
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
         self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], reason)
         self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        # Issue #280 §7.1：本侧故障终态必须带上本次事件的追溯号（`run_once` 固定用
+        # `trace_id="trace_1"`），且不泄露内部原因码（只有 `reference` 一个变量）。
+        self.assertEqual(parts["notifier"].terminal()[2], {"reference": "trace_1"})
 
     def test_directory_unavailable(self) -> None:
         parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
@@ -730,6 +739,66 @@ class InternalFaultTests(unittest.TestCase):
         self._assert_internal(parts, "unexpected_ZeroDivisionError")
 
 
+class OnboardingFailedAlertCallbackTests(unittest.TestCase):
+    """管理员送达（Issue #280 §7.3 步 1）：只在真正走到 `INTERNAL_ERROR` 终态时调用
+    一次注入的可选回调，签名 `(reason, trace_id)`，不含 open_id / 姓名 / 任何资料值。"""
+
+    def test_an_internal_error_terminal_triggers_the_callback_exactly_once(self) -> None:
+        calls: list[tuple[str, str]] = []
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        self.assertEqual(calls, [("directory_unavailable", "trace_1")])
+
+    def test_a_non_failure_terminal_never_triggers_the_callback(self) -> None:
+        """否定断言：成功终态不得产生告警——回调签名里也没有"成功"这个概念，
+        本测试证明它压根不会被调用。"""
+
+        calls: list[tuple[str, str]] = []
+        run_once(onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)))
+        self.assertEqual(calls, [], "开通完成不应该触发管理员告警")
+
+    def test_the_callback_never_receives_open_id_or_profile_values(self) -> None:
+        """回调签名里根本没有传 open_id/姓名的位置——这里用真实签名反证：
+        两个位置参数只可能是内部原因码与追溯号，两者都不是资料值。"""
+
+        received: dict[str, Any] = {}
+
+        def capture(reason: str, trace_id: str) -> None:
+            received["reason"] = reason
+            received["trace_id"] = trace_id
+
+        run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=capture,
+        )
+        self.assertNotIn(OPEN_ID, received.values())
+        self.assertEqual(set(received), {"reason", "trace_id"})
+
+    def test_a_raising_callback_does_not_break_notification_or_ledger(self) -> None:
+        """否定断言：告警回调失败不得带走用户结论——**故意破坏**确认变红的对照组是
+        「没有这条 try/except 时同一用例会抛穿 `_execute`」。"""
+
+        def boom(reason: str, trace_id: str) -> None:
+            raise RuntimeError("alert sink down")
+
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=boom,
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
+        self.assertIn("onboarding.alert_callback_failed", parts["audit"].actions())
+
+    def test_no_callback_injected_keeps_prior_behavior(self) -> None:
+        """默认 `onboarding_failed=None`：不注入时用户仍然收到冻结文案，只是没有
+        任何东西送到管理群（此前的行为，行为不变）。"""
+
+        parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+
+
 class SyncTimeoutTests(unittest.TestCase):
     """`V-开通-13`：十五分钟同步超时是**专用**终态，不与内部故障码混淆。"""
 
@@ -737,6 +806,8 @@ class SyncTimeoutTests(unittest.TestCase):
         parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT))
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "sync_timeout")
         self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
+        # Issue #280 裁定 B2-4：`onboarding.sync_timeout` 也加追溯号。
+        self.assertEqual(parts["notifier"].terminal()[2], {"reference": "trace_1"})
         self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
         self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
 
@@ -1263,6 +1334,15 @@ class ConstructionTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
                 submit=lambda task: True, sleep=None, **self._parts()  # type: ignore[arg-type]
+            )
+
+    def test_a_non_callable_onboarding_failed_is_refused_at_construction(self) -> None:
+        with self.assertRaises(TypeError):
+            AutoOnboardingRunner(
+                submit=lambda task: True,
+                sleep=lambda seconds: None,
+                onboarding_failed="not-callable",  # type: ignore[arg-type]
+                **self._parts(),
             )
 
 

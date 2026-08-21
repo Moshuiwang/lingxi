@@ -36,7 +36,7 @@ from lingxi.apps.scheduler.stalled_provisioning import (
     StalledProvisioningReport,
 )
 from lingxi.core.identity.onboarding_runner import (
-    KEY_INTERNAL_ERROR,
+    KEY_STALLED,
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
 )
@@ -147,12 +147,14 @@ def build_duty(**overrides: Any) -> tuple[StalledProvisioningDuty, dict[str, Any
         "aborter": FakeAborter(),
         "notifier": FakeNotifier(),
         "audit": RecordingAudit(),
+        "alert": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     duty = StalledProvisioningDuty(
         candidates=parts["candidates"],
         aborter=parts["aborter"],
         notifier=parts["notifier"],
+        alert=parts["alert"],
         audit=parts["audit"],
         lease_seconds=overrides.get("lease_seconds", DEFAULT_STALLED_LEASE_SECONDS),
         limit=overrides.get("limit", DEFAULT_STALLED_LIMIT),
@@ -189,7 +191,8 @@ class HappyPathTests(unittest.TestCase):
         assert report is not None
         self.assertEqual((report.examined, report.notified, report.aborted), (1, 1, 1))
         self.assertEqual(
-            notifier.sent, [(OPEN_ID_A, KEY_INTERNAL_ERROR, {}, "onboarding:stalled:evt_a")]
+            notifier.sent,
+            [(OPEN_ID_A, KEY_STALLED, {"reference": "trc_a"}, "onboarding:stalled:evt_a")],
         )
         self.assertEqual(
             aborter.calls, [(USER_A, (STATE_PROVISIONING, STATE_MCP_SYNCING), "stalled_lease_expired")]
@@ -517,6 +520,62 @@ class NotifyBackoffTests(unittest.TestCase):
         duty.run_once()
 
         self.assertEqual(len(notifier.calls), 2)
+
+
+class StalledAlertCallbackTests(unittest.TestCase):
+    """停摆计数送达管理群（Issue #280 §7.3 步 2）：只在本轮真的收口了至少一个候选
+    时上报聚合计数，不含任何单个候选的 user_id / open_id / 追溯号。"""
+
+    def test_a_successful_round_reports_the_aborted_count(self) -> None:
+        calls: list[int] = []
+        candidates = FakeCandidates(
+            [_candidate(), _candidate(user_id=USER_B, open_id=OPEN_ID_B, event_id="evt_b")]
+        )
+        duty, _ = build_duty(candidates=candidates, alert=calls.append)
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 2)
+        self.assertEqual(calls, [2], "只传聚合计数")
+
+    def test_zero_aborted_never_calls_the_alert(self) -> None:
+        """否定断言：零候选、或候选全部通知失败/CAS 被拒时，一次都不该报警——
+        「有人卡住了」这句话必须是真的，不能空喊。"""
+
+        calls: list[int] = []
+        duty, _ = build_duty(alert=calls.append)  # 零候选
+
+        duty.run_once()
+
+        self.assertEqual(calls, [])
+
+    def test_no_alert_injected_is_a_no_op(self) -> None:
+        """默认 `alert=None`：不注入时行为与此前一致，不抛异常。"""
+
+        candidates = FakeCandidates([_candidate()])
+        duty, _ = build_duty(candidates=candidates)
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 1)
+
+    def test_a_raising_alert_does_not_discard_the_rounds_result(self) -> None:
+        """否定断言：告警回调失败不得带走本轮已经做完的收口结果。"""
+
+        def boom(count: int) -> None:
+            raise RuntimeError("alert sink down")
+
+        candidates = FakeCandidates([_candidate()])
+        audit = RecordingAudit()
+        duty, _ = build_duty(candidates=candidates, alert=boom, audit=audit)
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 1)
+        self.assertIn("stalled_provisioning.alert_callback_failed", audit.actions())
 
 
 class ConstructionTests(unittest.TestCase):

@@ -80,12 +80,21 @@ tick（约 60 秒）都被重新选中、重新打一次飞书——没有节流
 之后再从剩下的里挑最多 ``limit`` 个真正处理，用一次查询多扫描几行的成本换掉饿死
 风险。
 
-## 通知文案：PR-1 阶段复用既有键，不新增
+## 通知文案：专用键 ``onboarding.stalled``（Issue #280 裁定 B2-2）
 
-发的是既有的 ``onboarding.internal_error`` 键（``KEY_INTERNAL_ERROR``，逐字复用，
-``values={}``——该键当前没有任何占位变量）。是否新增一条专用文案说明"我们等了很久仍
-没有结果，你可以再发一条消息重试"是产品文案裁定，属 #280 的范围（联合设计 §9 第 5
-条待裁定），不在本次机制修复里做。
+PR-1 阶段曾复用 ``onboarding.internal_error`` 逐字发送；产品负责人裁定改成专用文案
+``KEY_STALLED``（``onboarding.stalled``），说明"等待已久仍未取得结果、可以再发一条
+消息重新开始"，不再套用一般性的内部故障话术。该键带追溯号占位（``{reference}``），
+用本次候选自己的 ``item.trace_id`` 渲染——同一条链的用户后续再触发一次新链时，两次
+终态提示不再逐字相同，管理员也能拿着这个追溯号去核对是哪一次。
+
+## 停摆计数送达管理群（Issue #280 §7.3 步 2）
+
+``alert`` 是可选注入的计数回调（形状照 ``AlertingDuty.onboarding_stalled_callback()``）。
+「有人卡住了」此前没有任何审计信号会送到管理群——本轮真正收口（``aborted``）的候选数
+大于零时调用一次，只传聚合计数，不含任何单个候选的 user_id / open_id / 追溯号（聚合
+批次没有单一追溯号可代表，见 ``core/alerting.py`` 对应回调文档）。回调失败不得带走
+本轮已经做完的收口结果，异常在这里被吞掉、只记审计。
 
 ## 缺通知出口时的姿态：绝不"改状态不告知"
 
@@ -156,7 +165,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from lingxi.core.identity.onboarding_runner import (
-    KEY_INTERNAL_ERROR,
+    KEY_STALLED,
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
 )
@@ -321,6 +330,7 @@ class StalledProvisioningDuty:
         aborter: _Aborter,
         audit: _AuditSink,
         notifier: _Notifier | None = None,
+        alert: Callable[[int], None] | None = None,
         lease_seconds: int = DEFAULT_STALLED_LEASE_SECONDS,
         limit: int = DEFAULT_STALLED_LIMIT,
         notify_backoff_seconds: int = DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS,
@@ -340,6 +350,7 @@ class StalledProvisioningDuty:
         self._candidates = candidates
         self._aborter = aborter
         self._notifier = notifier
+        self._alert = alert
         self._audit = audit
         self._lease_seconds = lease_seconds
         self._limit = limit
@@ -401,6 +412,16 @@ class StalledProvisioningDuty:
                 report.failed,
                 report.skipped_in_backoff,
             )
+        if report.aborted > 0 and self._alert is not None:
+            # 停摆计数送达管理群（Issue #280 §7.3 步 2）：只在本轮真的收口了至少
+            # 一个候选时上报，只传聚合计数——见模块文档「停摆计数送达管理群」。
+            try:
+                self._alert(report.aborted)
+            except Exception as error:  # noqa: BLE001 - 告警失败不得带走已完成的收口
+                self._audit.record(
+                    "stalled_provisioning.alert_callback_failed",
+                    error=type(error).__name__,
+                )
         return report
 
     def _sweep(self, tally: _Tally) -> bool:
@@ -461,8 +482,8 @@ class StalledProvisioningDuty:
         try:
             self._notifier.send(
                 open_id=item.open_id,
-                key=KEY_INTERNAL_ERROR,
-                values={},
+                key=KEY_STALLED,
+                values={"reference": item.trace_id},
                 dedupe_key=dedupe_key,
             )
         except Exception as error:  # noqa: BLE001 - 通知失败：留在原状态，下一轮重来

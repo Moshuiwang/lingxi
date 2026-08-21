@@ -220,8 +220,36 @@ KEY_COMPLETED = "onboarding.completed"
 KEY_NOT_AUTHORIZED = "onboarding.not_authorized"
 KEY_SYNC_TIMEOUT = "onboarding.sync_timeout"
 KEY_INTERNAL_ERROR = "onboarding.internal_error"
+#: 开通中途停摆收口（``apps/scheduler/stalled_provisioning.py``，Issue #282）专用文案键
+#: （Issue #280 裁定 B2-2）。此前该职责复用 ``KEY_INTERNAL_ERROR`` 逐字发送；产品负责人
+#: 要求换成专门说明"等待已久、可再发一条消息重试"的措辞，不再套用一般性的内部故障话术。
+KEY_STALLED = "onboarding.stalled"
 KEY_DELEGATED_SUBJECT = "onboarding.delegated_subject"
 KEY_SUSPENDED = "gateway.suspended"
+
+#: 需要追溯号占位（``{reference}``）的文案键集合（Issue #280 §7.1）。占位名**不能**叫
+#: ``trace_id``——那会命中 ``config/content.py`` 的内容安全正则，在目录加载期就让三个
+#: 进程全部起不来（联合设计 §0.1）。集中在一处维护，供 :func:`_with_reference` 与
+#: ``core/conversation/pipeline.py`` 各自的同名辅助函数共用同一份判据来源（后者是
+#: 不同的渲染入口，各自维护一份字面量集合，靠这份常量的字面值对齐，不做跨模块 import
+#: ——两条渲染路径此前就是各自独立的失败关闭桩，见模块文档「共用线程复核」）。
+_KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset({KEY_INTERNAL_ERROR, KEY_SYNC_TIMEOUT})
+
+
+def _with_reference(
+    key: str, values: Mapping[str, object] | Sequence[tuple[str, object]], trace_id: str
+) -> dict[str, object]:
+    """给需要追溯号的终态文案补上 ``reference`` 占位值。
+
+    只在键属于 :data:`_KEYS_REQUIRING_REFERENCE` 时补；已经带了值就不覆盖（防止
+    调用方已经显式传过一次导致 ``ContentRenderError`` 的重复变量错误——虽然当前
+    没有任何调用方会这样做，用 ``setdefault`` 而不是无条件覆盖仍然是更安全的形状）。
+    """
+
+    merged = dict(values)
+    if key in _KEYS_REQUIRING_REFERENCE:
+        merged.setdefault("reference", trace_id)
+    return merged
 
 
 class _ChainAborted(Exception):
@@ -374,10 +402,22 @@ class _Terminal:
     values: tuple[tuple[str, object], ...] = ()
     reason: str | None = None
 
-    def as_result(self) -> OnboardingResult:
+    def as_result(self, *, trace_id: str | None = None) -> OnboardingResult:
+        """转成 gateway 消费的受控结果。
+
+        ``trace_id`` 只在调用方真的持有它时传（本类的两个调用点都在
+        ``AutoOnboardingRunner.start`` 里，那里天然有它）；缺省 ``None`` 保持旧行为
+        不变——不是所有 ``_Terminal`` 都对应一次已知的追溯号（例如尚未真正开始跑链
+        就被拒绝的场景仍然有 ``trace_id``，这里留 ``None`` 只是防御性缺省，不代表
+        生产中真的会用到它）。
+        """
+
+        values = self.values
+        if trace_id is not None:
+            values = tuple(_with_reference(self.key, values, trace_id).items())
         return OnboardingResult(
             state=self.state,
-            messages=(OnboardingMessage(self.key, self.values),),
+            messages=(OnboardingMessage(self.key, values),),
             failure_reason=self.reason,
         )
 
@@ -420,6 +460,7 @@ class AutoOnboardingRunner:
         publish_wait_seconds: float = 120.0,
         notify_attempts: int = 3,
         publish_allowed: Callable[[], bool] | None = None,
+        onboarding_failed: Callable[[str, str], None] | None = None,
     ) -> None:
         if not callable(delegated_subject):
             # 每次判定现读一次登记，而不是装配时读一次存着：换主体之后旧值会让
@@ -462,6 +503,14 @@ class AutoOnboardingRunner:
             # 发布，而外部表是不可回滚的。
             raise TypeError("必须注入发布闸门：翻译层不可用时一条发布意图都不能排")
         self._publish_allowed = publish_allowed
+        if onboarding_failed is not None and not callable(onboarding_failed):
+            raise TypeError("onboarding_failed 回调必须可调用或为 None")
+        #: 管理员送达回调（Issue #280 §7.3）。**可选**：不注入时行为等价于此前——
+        #: 用户仍然收到冻结文案，只是没有任何东西送到管理群。注入时只在真正走到
+        #: ``INTERNAL_ERROR`` 终态时调用一次，签名是 ``(reason, trace_id)``——两者
+        #: 都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也没有
+        #: 传这些的位置。
+        self._onboarding_failed = onboarding_failed
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -492,7 +541,7 @@ class AutoOnboardingRunner:
                 event_id=event_id,
                 trace_id=trace_id,
             )
-            return _internal("stopping").as_result()
+            return _internal("stopping").as_result(trace_id=trace_id)
 
         with self._lock:
             running_for = self._running.get(open_id)
@@ -539,7 +588,7 @@ class AutoOnboardingRunner:
             self._audit.record(
                 "onboarding.rejected_by_executor", event_id=event_id, trace_id=trace_id
             )
-            return _internal("executor_unavailable").as_result()
+            return _internal("executor_unavailable").as_result(trace_id=trace_id)
         return OnboardingResult(state=OnboardingState.STARTED)
 
     def _release(self, open_id: str, event_id: str) -> None:
@@ -598,11 +647,23 @@ class AutoOnboardingRunner:
             content_key=terminal.key,
             trace_id=trace_id,
         )
+        if terminal.state is OnboardingState.INTERNAL_ERROR and self._onboarding_failed is not None:
+            # 管理员送达（Issue #280 §7.3）：只在真正走到本侧故障终态时触发一次，
+            # 与用户通知彼此独立——告警回调失败不得带走这条链本该有的用户结论。
+            try:
+                self._onboarding_failed(terminal.reason or "unknown", trace_id)
+            except Exception as error:  # noqa: BLE001 - 告警是锦上添花，不是链的一部分
+                self._audit.record(
+                    "onboarding.alert_callback_failed",
+                    event_id=event_id,
+                    error=type(error).__name__,
+                    trace_id=trace_id,
+                )
         delivered = self._notify(
             open_id=open_id,
             event_id=event_id,
             key=terminal.key,
-            values=dict(terminal.values),
+            values=_with_reference(terminal.key, terminal.values, trace_id),
             suffix="",
             trace_id=trace_id,
         )

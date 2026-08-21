@@ -526,6 +526,7 @@ def _build_onboarding_duty(
     employment_access_token: Callable[[], str] | None,
     metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
     permission_publish: PermissionPublishDuty | None,
+    onboarding_failed: Callable[[str, str], None] | None = None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
 
@@ -784,6 +785,10 @@ def _build_onboarding_duty(
         # 权限完全正常的人引去银河申请一个他已经有的权限），**且 ``publish_outbox``
         # 零新增行、``app_user`` 零新增行**；映射非空时同一个用户照常推进到发布等待。
         publish_allowed=lambda: metric_translation_available(metric_translation_map),
+        # 管理员送达（Issue #280 §7.3）：调用方（``build_loop``）没有装配告警职责时
+        # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
+        # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
+        onboarding_failed=onboarding_failed,
     )
     duty = OnboardingReconciler(
         store=store,
@@ -934,6 +939,7 @@ def _build_stalled_provisioning_duty(
     *,
     stop: threading.Event,
     audit: AuditSink,
+    alert: Callable[[int], None] | None = None,
 ) -> Any:
     """装配开通中途停摆收口职责（Issue #282，`V-开通-19`）。**总能注册**，不需要任何
     可选前置——候选查询、收口写入（复用
@@ -990,6 +996,7 @@ def _build_stalled_provisioning_duty(
             ),
             catalog=default_content_catalog(),
         ),
+        alert=alert,
         audit=audit,
         lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
         stop=stop,
@@ -1412,6 +1419,9 @@ def build_loop(
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
+        onboarding_failed=(
+            alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
+        ),
     )
     if onboarding is not None:
         duties.append(onboarding)
@@ -1429,7 +1439,16 @@ def build_loop(
     # `adapters/postgres_stalled_provisioning.py` 模块文档），不会互相抢候选。**总能
     # 注册**（没有可选前置会让它整体不装配），因此不需要 `if ... is not None` 判断。
     duties.append(
-        _build_stalled_provisioning_duty(config, stop=stop, audit=sink)
+        _build_stalled_provisioning_duty(
+            config,
+            stop=stop,
+            audit=sink,
+            alert=(
+                alerting_duty.onboarding_stalled_callback()
+                if alerting_duty is not None
+                else None
+            ),
+        )
     )
     if alerting_duty is not None:
         duties.append(alerting_duty)
