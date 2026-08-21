@@ -54,6 +54,12 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "${script_dir}/../.." && pwd)
 cd "${repository_root}"
 
+# 「工作树洁净」判定的参照基线（Issue #261）：在做任何事之前先记一次 git 状态快照。
+# dev-loop 下启动验证时工作树本来就可能有未提交改动，这是正常状态，不是本检查要防
+# 的问题；check_git_tree_is_clean 事后会拿这份快照与跑完后的状态比对差异，只把
+# **跑完后才出现**的改动判红。
+initial_git_status_snapshot=$(git status --porcelain)
+
 usage() {
   cat <<'EOF'
 用法：scripts/dev/check.sh [docs|fast|full] [选项]
@@ -253,14 +259,37 @@ check_installed_package_outside_repo() {
 
 # 与 gate/fast job 末尾「校验没有改写受版本控制的文件」同一条检查（Issue #236
 # 独立审查 F6）：本机门禁跑完不该在工作树里留下未提交的改动。
+#
+# **与开跑前的快照比对差异，不是只跑完后判定一次**（Issue #261）：此前的写法只在
+# 跑完后查一次 `git status --porcelain`，非空就判红——分不清「验证过程本身改写了
+# 受版本控制的文件」（这是它真正要防的）与「开跑时工作树本来就有未提交改动」
+# （dev-loop 下的正常状态，2026-08-20 本仓库已实际踩过一次，被这句话误导到错误
+# 方向）。现在只把相对 `initial_git_status_snapshot` **新增**的条目判红。
 check_git_tree_is_clean() {
-  local dirty
-  dirty=$(git status --porcelain)
-  if [[ -n "${dirty}" ]]; then
-    printf '本机验证过程改写了工作树（与 gate/fast job 的同名检查同一条规则）：\n%s\n' "${dirty}" >&2
-    exit 1
+  local current
+  current=$(git status --porcelain)
+  if [[ "${current}" == "${initial_git_status_snapshot}" ]]; then
+    printf '工作树洁净：跑完后的 git 状态与开跑前完全一致，验证过程没有新增改动\n' >&2
+    return 0
   fi
-  printf '工作树洁净：本机验证没有改写受版本控制的文件\n' >&2
+
+  local new_entries
+  new_entries=$(comm -13 \
+    <(printf '%s\n' "${initial_git_status_snapshot}" | sort) \
+    <(printf '%s\n' "${current}" | sort))
+  if [[ -z "${new_entries}" ]]; then
+    printf '工作树洁净：跑完后仍处于改动状态的文件与开跑前完全相同（下列改动是你开跑前就有的，不是本次验证新增的）：\n%s\n' \
+      "${current}" >&2
+    return 0
+  fi
+
+  printf '本机验证过程改写了工作树（与 gate/fast job 的同名检查同一条规则）。以下文件是跑完后新增的改动——开跑前的快照里没有：\n%s\n' \
+    "${new_entries}" >&2
+  if [[ -n "${initial_git_status_snapshot}" ]]; then
+    printf '（开跑前工作树已有以下改动，不计入上面的新增判定：\n%s\n）\n' \
+      "${initial_git_status_snapshot}" >&2
+  fi
+  exit 1
 }
 
 run_docs() {
