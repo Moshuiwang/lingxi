@@ -179,6 +179,12 @@ REQUIRED_MODULES = (
     # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
     "lingxi.apps.reauthorize",
     "lingxi.apps.reauthorize.__main__",
+    # 追溯号只读查询 CLI（Issue #280 §7.2）：与 apps/reauthorize 同一姿态——scripts/
+    # 被 .dockerignore 排除，一次性运维命令必须显式登记，否则源码测试全绿而部署镜像
+    # 里没有它。随 scheduler 镜像一起装，由运维在容器内以 `docker exec` 语义手动调用
+    # （不是常驻进程，不需要 compose 服务条目）。
+    "lingxi.apps.trace",
+    "lingxi.apps.trace.__main__",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -406,6 +412,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
             "lingxi.apps.healthcheck.__main__",
+            # Issue #280 §7.2：追溯号只读查询 CLI，同一姿态——随 scheduler 镜像装，
+            # 由运维在容器内以 `docker exec` 语义手动调用，不是常驻进程的一部分。
+            "lingxi.apps.trace",
+            "lingxi.apps.trace.__main__",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
@@ -707,6 +717,9 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         "lingxi.apps.scheduler",
         "lingxi.apps.scheduler.__main__",
         "lingxi.apps.healthcheck.__main__",
+        # 追溯号只读查询 CLI（Issue #280 §7.2）：同一姿态，随镜像装、独立调用，
+        # 加进来才能让静态闭包真的走到它函数内的 `lingxi.adapters.postgres` 导入。
+        "lingxi.apps.trace.__main__",
     ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
     "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),
