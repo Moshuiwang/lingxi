@@ -19,8 +19,9 @@ import json
 import logging
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -207,6 +208,7 @@ class _PagedClient:
         request_pause_seconds: float = REQUEST_PAUSE_SECONDS,
         sleep: Callable[[float], None] | None = None,
         rate_limit_retry_backoffs: tuple[float, ...] = RATE_LIMIT_RETRY_BACKOFFS_SECONDS,
+        round_deadline_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url 必须由配置注入，不得写死在代码里")
@@ -221,6 +223,45 @@ class _PagedClient:
         # 证据后追加，见 `_request` 文档字符串）：默认值本身就是生效的三次递增
         # 退避，测试注入更短的序列来避免真实等待，不代表生产默认是关闭的。
         self._rate_limit_retry_backoffs = rate_limit_retry_backoffs
+        # 整轮预算（Issue #284 A 组 #2）：只在 `round_budget()` 的 `with` 块内
+        # 生效，默认 `None` 即关闭——不影响任何没有调用 `round_budget()` 的既有
+        # 调用方（含开通链的 employment reader）。时钟可注入，测试用假时钟推进
+        # 而不必真的等待，见 `round_budget` 文档字符串。
+        self._round_deadline: float | None = None
+        self._round_deadline_clock: Callable[[], float] = round_deadline_clock
+
+    @contextmanager
+    def round_budget(self, *, seconds: float) -> Iterator[None]:
+        """限定「从进入这个 `with` 块起，最多再花 `seconds` 秒」，只作用于**这一个
+        client 实例**（Issue #284 A 组 #2）。
+
+        **动机**：`_request` 对单次请求的限频重试本身有界（默认 3 次、17 秒），
+        但递归遍历对整轮调用次数/耗时没有上界——持续撞限频时最坏约 2.7 小时，
+        超过专用授权用户身份令牌约 2 小时的寿命（`read_snapshot` 只在整轮开始时
+        取一次令牌，不会中途刷新），且这整段时间发生在调度循环的同一次
+        `run_once()` 调用里，挤占其余职责。
+
+        **判定点只有一处**：`_request` 每次真正发起请求前检查一次「现在是否已经
+        超过截止时间」，撞线立即抛 `FeishuDirectoryError("round_budget_exceeded")`
+        而**不再发出这次请求**（不消耗节流等待、不算作一次重试）。`_pages` /
+        `_pages_multi` / 上层的递归遍历完全不需要改——预算检查复用 `_request`
+        这一个已有出口，不需要把「剩余预算」这个概念下传到遍历的每一层。
+
+        **可重入但不取交集**：嵌套的 `with client.round_budget(...)` 会用内层的
+        新截止时间覆盖外层，退出内层时恢复外层原来的值——当前只有组织快照同步
+        一处调用，不需要处理真正嵌套的语义。
+
+        **默认关闭**：不调用本方法时 `_round_deadline` 恒为 `None`，`_request`
+        的预算检查因此恒不成立，对开通链等从未调用过 `round_budget()` 的调用方
+        零影响。
+        """
+
+        previous = self._round_deadline
+        self._round_deadline = self._round_deadline_clock() + seconds
+        try:
+            yield
+        finally:
+            self._round_deadline = previous
 
     def _throttle(self) -> None:
         """真实请求前的固定节流（Issue #271）。
@@ -294,10 +335,19 @@ class _PagedClient:
         退避的等待量同样通过 ``self._sleep`` 完成，与 :meth:`_throttle` 共用
         同一个可注入的 sleeper——测试只需要一份假 sleeper 就能同时验证两者，
         不需要真的等待。
+
+        **整轮预算检查在本方法顶部**（Issue #284 A 组 #2，见 :meth:`round_budget`）：
+        只有调用方进入过 ``round_budget()`` 的 ``with`` 块，``self._round_deadline``
+        才非 ``None``；撞线立即抛 ``FeishuDirectoryError("round_budget_exceeded")``，
+        **不发出这次请求、不占用节流等待、不计入限频重试次数**——这是与限频重试
+        完全独立的另一道上界，检查顺序在 :meth:`_throttle` 之前，因此撞预算之后
+        连节流等待都不会再发生。
         """
 
         attempt = 0
         while True:
+            if self._round_deadline is not None and self._round_deadline_clock() >= self._round_deadline:
+                raise FeishuDirectoryError("round_budget_exceeded")
             self._throttle()
             try:
                 return _payload(self._transport("GET", url, body=None, token=token))
