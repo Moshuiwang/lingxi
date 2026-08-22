@@ -1015,6 +1015,32 @@ def _build_stalled_provisioning_duty(
     return duty
 
 
+def _stop_aware_sleep(stop: threading.Event) -> Callable[[float], None]:
+    """把 `stop.wait` 包一层，让「停机置位后的等待」变成「中止」而不是
+    「假装等过了、照样放行」（二级独立审查 2026-08-21 P2）。
+
+    直接把 `stop.wait` 当 `FeishuDirectoryClient` 的 `sleep` 注入时，`stop`
+    一旦置位，`_throttle()`/限频重试的等待会立即返回、与"真的等过了"在
+    调用方看来完全无法区分——节流因此悄悄失效，在途一轮剩余的数百次分页
+    请求会以无节流速度打出，撞上 `_throttle` 文档字符串描述的真实频率限制。
+    这里改成：`stop.wait(seconds)` 返回 `True`（已置位）时抛出
+    `FeishuDirectoryError("stopping")` 中止当前调用，异常原样冒泡进
+    `OrgSnapshotSyncDuty.run_once()` 既有的 `read_failed`→退避→保留上一份
+    完成批次路径，符合「停止后不再发起新请求」，不是「停止后不再等待就发」。
+    只挡"要不要发起下一次等待/请求"，不中断正在进行中的单次 HTTP 请求，与
+    `McpReadinessConfirmation`/`PermissionNoticeDispatcher` 打断等待、不打断
+    在途请求的既有纪律一致。
+    """
+
+    from lingxi.adapters.feishu_directory import FeishuDirectoryError
+
+    def sleep(seconds: float) -> None:
+        if stop.wait(seconds):
+            raise FeishuDirectoryError("stopping")
+
+    return sleep
+
+
 def _build_org_snapshot_sync_duty(
     config: SchedulerConfig,
     *,
@@ -1056,11 +1082,15 @@ def _build_org_snapshot_sync_duty(
     from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
     from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty, TokenSupplyFailure
 
-    # `sleep=stop.wait`（Issue #284 A 组 #4）：节流/限频退避里的等待能被 SIGTERM
-    # 立刻打断，同 `McpReadinessConfirmation`/`PermissionNoticeDispatcher` 已有的
-    # 同一份 `stop` 用法。不中断进行中的单次 HTTP 请求，也不阻止 `stop` 置位后
-    # 发起下一次请求——只是让「要不要等」这一步能被提前结束。
-    client = FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=stop.wait)
+    # `sleep=_stop_aware_sleep(stop)`（Issue #284 A 组 #4，中止行为按二级独立审查
+    # P2 修正）：不能直接注入裸的 `stop.wait`——那会让节流/限频退避在停机置位后
+    # 的每一次等待都立刻返回 `True` 而**不是真的等过那么久**，`_throttle()` 因此
+    # 悄悄失去节流，在途一轮剩余的数百次分页请求会以无节流速度打出，正撞上
+    # `_throttle` 文档字符串要防的那种突发（真实撞过飞书累计频率限制）。这里改成
+    # 「停机置位就中止」而不是「停机置位就假装等过了、照样发下一次请求」：见
+    # `_stop_aware_sleep` 的文档字符串。不中断进行中的单次 HTTP 请求——中止点仍然
+    # 只在两次请求之间的等待里，同 SIGTERM 只打断等待、不打断在途请求的既有纪律。
+    client = FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=_stop_aware_sleep(stop))
 
     def read_snapshot() -> Any:
         # 令牌各解析一次、用于本轮**整趟**递归遍历（数百次分页请求，Issue #250

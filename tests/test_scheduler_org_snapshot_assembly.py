@@ -14,6 +14,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
+from lingxi.adapters.feishu_directory import FeishuDirectoryError
 from lingxi.apps.scheduler import SchedulerConfig, _build_org_snapshot_sync_duty, build_loop
 from lingxi.apps.scheduler.assembly import ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
@@ -279,15 +280,16 @@ class HardeningWiringTests(unittest.TestCase):
         self.assertGreater(remaining, ORG_SNAPSHOT_ROUND_BUDGET_SECONDS - 5)
         self.assertLessEqual(remaining, ORG_SNAPSHOT_ROUND_BUDGET_SECONDS)
 
-    def test_the_wired_client_uses_stop_wait_as_its_sleeper(self) -> None:
-        """`sleep=stop.wait`（设计 §4）：真实装配出来的 client 的 `_sleep` 必须
-        绑定到这一个 `stop`（`threading.Event.wait` 每次取值都会新建一个绑定
-        方法包装对象，因此这里用 `==`——绑定方法比较的是底层函数与所属实例是否
-        相同，同一个 `Event` 的 `wait` 恒相等；用 `is` 会误判为不等），不是
-        默认的 `time.sleep`。不通过"等多久才返回"的计时去推断——
-        `REQUEST_PAUSE_SECONDS`（0.12 秒）本身就远小于任何合理的 join 超时，
-        计时法分辨不出"`stop.wait` 被提前打断"与"`time.sleep` 碰巧自己也在
-        超时窗口内跑完"这两种情况，不是硬断言。"""
+    def test_the_wired_client_aborts_via_this_process_stop_not_a_raw_passthrough(self) -> None:
+        """`sleep=_stop_aware_sleep(stop)`（设计 §4，中止行为按二级独立审查 P2
+        修正）：真实装配出来的 client 的 `_sleep` 必须绑定到这一个 `stop`，但
+        **不能是裸的 `stop.wait`**——直接透传会让停机置位后的节流/限频退避悄悄
+        失去等待（`stop.wait` 返回 `True` 时 `_throttle()` 分辨不出"真的等过了"
+        与"已经置位、假装等过了"），在途一轮剩余的数百次分页请求因此会以无节流
+        速度打出。这里改用行为断言而不是身份相等：未置位时 `sleep(0)` 必须正常
+        放行；同一份 `stop` 置位后，同一个 `client._sleep` 必须转而抛出
+        `FeishuDirectoryError(code="stopping")`——这就是"确实绑定了这一个 stop"
+        的证据，比对比函数对象身份更贴近真正要守住的行为。"""
 
         captured: dict[str, Any] = {}
 
@@ -312,13 +314,25 @@ class HardeningWiringTests(unittest.TestCase):
 
         client = captured["client"]
 
-        self.assertEqual(client._sleep, stop.wait, "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep")
+        # 未置位：sleep(0) 必须正常放行，不是恒中止的桩。
+        client._sleep(0)
 
-    def test_stop_set_before_the_client_is_built_still_lets_a_throttle_wait_return_immediately(self) -> None:
-        """行为级佐证（不只是身份相等）：`stop` 在 client 构造**之前**已经置位时，
-        `_throttle()` 的等待必须立刻返回，不等满 `REQUEST_PAUSE_SECONDS`——用一个
-        远大于节流步长、但仍然远小于测试超时的下界（0.05 秒 vs 步长 0.12 秒）
-        证明"立刻返回"，不依赖"两者都在 1 秒内完成"这种分辨不出差异的计时法。"""
+        # 置位之后，同一个 client 的 sleeper 必须转而中止——证明它读的是这一份
+        # `stop`（一个绑定到别的、从未置位的 Event 的 sleeper 不会在这里变红）。
+        stop.set()
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client._sleep(0)
+        self.assertEqual(raised.exception.code, "stopping")
+
+    def test_stop_set_before_the_client_is_built_aborts_the_throttle_instead_of_silently_skipping_it(
+        self,
+    ) -> None:
+        """行为级佐证（P2 二级独立审查修复）：`stop` 在 client 构造**之前**已经
+        置位时，`_throttle()` 必须立刻**中止**（抛出 `FeishuDirectoryError`），
+        不是像修复前那样"立刻正常返回、悄悄跳过这一次节流"——后者会让在途一轮
+        剩余的数百次分页请求在停机后失去节流，以无节流速度打出，撞真实限频。
+        仍然验证"立刻"（远小于 `REQUEST_PAUSE_SECONDS`），但落点从"正常返回"
+        改成"抛错"。"""
 
         stop = threading.Event()
         stop.set()
@@ -347,14 +361,68 @@ class HardeningWiringTests(unittest.TestCase):
         import time as time_module
 
         started = time_module.monotonic()
-        client._throttle()
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            client._throttle()
         elapsed = time_module.monotonic() - started
 
+        self.assertEqual(raised.exception.code, "stopping")
         self.assertLess(
             elapsed,
             0.05,
-            "stop 已置位时节流等待必须立刻返回（远小于 REQUEST_PAUSE_SECONDS=0.12s）",
+            "stop 已置位时节流必须立刻中止（远小于 REQUEST_PAUSE_SECONDS=0.12s），不是正常返回",
         )
+
+    def test_a_stop_set_mid_round_aborts_with_no_further_requests_and_an_honest_audit(self) -> None:
+        """闭环行为证据（P2 二级独立审查修复）：`stop` 不是在构造前、也不是完全
+        没跑就置位，而是**本轮读取已经成功发出过一次节流/请求之后**才置位——
+        模拟"数百次分页请求里，进程在中途收到停机信号"这个真实场景。之后
+        client 必须立刻中止，不再发起任何一次后续节流/请求；这一轮经真实装配好
+        的 `OrgSnapshotSyncDuty.run_once()` 必须落进既有的
+        `read_failed`→退避→保留上一份完成批次路径——不是 `committed`，也不是
+        被吞掉、悄无声息地当成"这一轮跑完了"。"""
+
+        throttle_calls = {"n": 0}
+        stop = threading.Event()
+
+        def _stub_read_org_snapshot(*, client: Any, app_token: str, user_token: str) -> Any:
+            # 第一次节流：模拟"本轮已经成功发出过一次分页请求"，此时 stop 还没
+            # 置位，正常放行。
+            client._throttle()
+            throttle_calls["n"] += 1
+            # 模拟"就在下一次分页请求前，进程收到了停机信号"。
+            stop.set()
+            # 第二次节流：必须中止，异常原样冒泡——与真实 `_pages`/`_pages_multi`
+            # 在 `_request` 里遇到的行为完全一致（`_throttle()` 在真正发起请求之前）。
+            client._throttle()
+            throttle_calls["n"] += 1  # 不会执行到；如果执行到就是回归（节流没能中止）
+            return "fake-batch"
+
+        audit = RecordingAudit()
+        with mock.patch(
+            "lingxi.adapters.feishu_org_snapshot_reader.read_org_snapshot",
+            _stub_read_org_snapshot,
+        ):
+            duty = _build_org_snapshot_sync_duty(
+                SchedulerConfig.from_env(BASE_ENV),
+                stop=stop,
+                audit=audit,
+                user_access_token=lambda: "u",
+                app_access_token=lambda: "a",
+            )
+            result = duty.run_once()
+
+        self.assertIsNone(result, "中止的一轮不得返回 run_id")
+        self.assertEqual(throttle_calls["n"], 1, "停机置位之后不得再发起下一次节流/请求")
+        self.assertIsNone(duty.completed_on, "中止的一轮不得置位当日水位")
+        # 本地假 DSN（BASE_ENV 指向 localhost）连不上：F8 的当日持久化水位检查
+        # 会先失败一次（按未知处理、不阻塞），紧接着才是真正的中止——与本文件
+        # `RuntimeVsUnwiredDistinctionTest` 已经确认过的同一套顺序。
+        self.assertEqual(
+            audit.actions(),
+            ["org_snapshot_sync.watermark_check_failed", "org_snapshot_sync.read_failed"],
+        )
+        fields = audit.records[-1][1]
+        self.assertEqual(fields.get("code"), "stopping", "审计必须如实记下中止原因，不是笼统的异常类型名")
 
     def test_the_organization_snapshot_client_is_not_shared_with_onboarding(self) -> None:
         """#2 的整轮预算只挂在组织快照专用的 client 实例上——这里只验证「组织
