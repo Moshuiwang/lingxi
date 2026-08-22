@@ -799,6 +799,228 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(terminal["terminal_kind"], "timeout", "真实失败终态不得被 withheld 覆盖")
         self.assertNotEqual(terminal["terminal_kind"], "redacted_withheld")
 
+    def test_a_closed_turn_whose_body_leaks_an_internal_tool_name_is_not_success(self) -> None:
+        """P0 护栏（Issue #291 L6 取证结论，2026-08-22）：真实事故形状——模型
+        （qwen3.7-plus）把工具调用非确定性地写成了正文散文，回合仍然
+        ``closed=True``、没有 ``failure``，出口净化层正确遮蔽了内部工具名与过程
+        标记（``blocked=True``，``reasons`` 同时命中 ``internal_tool_name`` 与
+        ``process_marker``——真实取证记录的原始形状），但 ``withheld`` 没有置位
+        （遮蔽后仍有"幸存"的业务内容——遮蔽后的 JSON 骨架），旧实现据此判定
+        ``deliverable`` 并把这段协议残骸当成「查询完成」交付给用户。改坏
+        `_protocol_breakdown_reasons` 判定（例如删掉这条检查，或只在
+        `withheld=True` 时才生效）必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+        leaked_text = (
+            "好的，我将为你查询。【内部能力已隐藏】【内部标识已隐藏】"
+            "{\"metric\": \"日活\", \"value\": 1024}"
+        )
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": leaked_text,
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": False,
+                            "reasons": ("internal_tool_name", "process_marker"),
+                        },
+                        "user_result": "obtained",
+                    },
+                    "audit": {"tool_result_count": 0, "denied_count": 0, "denied": []},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertNotEqual(terminal["terminal_kind"], "success", "协议残骸不得被判定为成功交付")
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "model_protocol_breakdown")
+        self.assertNotIn(leaked_text, terminal["content"], "泄漏正文不得进入投递事件")
+        self.assertIsNone(terminal.get("agent_session_id"), "未交付成功时不应持久化新会话")
+
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["failure_code"], "model_protocol_breakdown")
+        self.assertEqual(fields["terminal_kind"], "failed")
+        self.assertIn("internal_tool_name", fields["output_safety_reasons"])
+        self.assertIn("process_marker", fields["output_safety_reasons"])
+
+    def test_a_closed_turn_whose_body_leaks_a_process_marker_is_not_success(self) -> None:
+        """同上，覆盖另一个原因码 ``process_marker``（``mcp__``/``tool_use_id``/
+        ``trace_id`` 这类过程标记）——两个原因码任一命中都必须触发本护栏，不能
+        只认 ``internal_tool_name`` 一个。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "执行中【内部标识已隐藏】，结果如下：1024",
+                        "session_id": "new-session",
+                        "output_safety": {
+                            "blocked": True,
+                            "withheld": False,
+                            "reasons": ("process_marker",),
+                        },
+                        "user_result": "obtained",
+                    },
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "model_protocol_breakdown")
+
+    def test_a_normal_successful_turn_with_tool_calls_stays_success(self) -> None:
+        """反向用例：正常成功回合（有工具调用结果、``output_safety.reasons``
+        为空）不得被新护栏误伤。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "日活是 1024。",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                        "user_result": "obtained",
+                    },
+                    "audit": {"tool_result_count": 1, "denied_count": 0, "denied": []},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertEqual(terminal["content"], "日活是 1024。")
+        self.assertEqual(sink.calls[0]["tool_result_count"], 1)
+
+    def test_a_zero_tool_result_chit_chat_turn_stays_success_on_its_own(self) -> None:
+        """反向用例：``tool_result_count == 0`` 单独不构成失败——闲聊问题不需要
+        调用任何工具，不能被误伤成协议异常。护栏只认 ``output_safety.reasons``，
+        与工具调用次数无关。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "你好，有什么可以帮你？",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                        "user_result": "not_applicable",
+                    },
+                    "audit": {"tool_result_count": 0, "denied_count": 0, "denied": []},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertEqual(sink.calls[0]["tool_result_count"], 0)
+
+    def test_terminal_outcome_callback_reports_the_real_tool_result_count(self) -> None:
+        """P1 可观测性（Issue #291 L6 取证结论）：``report["audit"][
+        "tool_result_count"]`` 必须随终态收口一起写进 ``on_terminal_outcome``
+        回调（生产装配落到 ``worker.task.terminal``）——2026-08-22 那次取证，
+        运维定位"这一轮到底有没有真的调用过工具"花了 40 分钟，就是因为这个字段
+        此前从未离开进程，只能翻完整条 SDK 事件流去数。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "查询完成，共 3 条工具调用。",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                    },
+                    "audit": {"tool_result_count": 3, "denied_count": 0, "denied": []},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(sink.calls), 1)
+        self.assertEqual(sink.calls[0]["tool_result_count"], 3)
+
+    def test_terminal_outcome_callback_defaults_tool_result_count_to_zero_when_absent(
+        self,
+    ) -> None:
+        """否定测试：``report["audit"]`` 缺失时（早退分支，例如未预期异常）如实
+        记 0，不假装有据可查——避免上一条用例的字段被恒真实现（写死为某个非零
+        值）蒙混过关。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(sink.calls[0]["tool_result_count"], 0)
+
     # Issue #195 的收口组合用例共用的两种「stop 到达方式」。两种都要覆盖：
     # ``stop_event`` 是 ``_monitor`` 置位的进程内信号（用户 ``/stop`` 与 SIGTERM
     # 共用同一个事件）；``queue_flag`` 是队列侧 ``stop_requested()`` 轮询出口，
