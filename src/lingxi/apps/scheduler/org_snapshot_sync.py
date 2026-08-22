@@ -118,6 +118,19 @@ _SAFE_AUDIT_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 READ_FAILURE_BACKOFF_STEP_SECONDS = 300
 READ_FAILURE_BACKOFF_CEILING_SECONDS = 3600
 
+# 连续撞「整轮预算」的升级阈值（独立审查二轮 P2-B4）。`round_budget_exceeded`
+# 只是众多 `read_failed` 的 code 之一，正常靠上面共用的退避静默重试即可自愈——
+# 但如果它**连续**出现，说明的不是一次网络抖动，而是
+# `LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 配的预算本身就小于真实一轮耗时：
+# 每一轮都会在完全相同的地方撞线，而失败路径的语义是「保留上一份、不覆盖基线」，
+# 这意味着快照会**静默地**永远停在旧数据上——库里仍然"有数据"，不会像空表那样
+# 显眼，运维不会自己发现。三轮（约 5+10+15=30 分钟，按第一档起步的线性退避）
+# 是"给一次真实的偶发拥堵机会自愈，但不再继续假装这是偶发"之间的折中，与
+# `MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`（`apps/scheduler/config.py`）的启动期
+# 下限校验是两道独立防线：那道挡的是"明显不可能"的误配，这道挡的是"启动时看起来
+# 合理、但对当前关联组织规模而言其实不够"的配置在运行期持续暴露出来。
+CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD = 3
+
 
 class TokenSupplyFailure(RuntimeError):
     """令牌供给失败的安全分类（Issue #250 编排者复查 F6）。
@@ -193,6 +206,14 @@ class OrgSnapshotSyncDuty:
         # 往前走了"（提交成功、或从持久化水位发现今天已完成）都会清零。
         self._next_attempt_at: datetime | None = None
         self._failure_streak = 0
+        # 连续撞「整轮预算」计数（P2-B4，见模块顶部
+        # `CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD` 的取值依据）。
+        # 只在 `read_failed` 分支里推进/清零，与 `_failure_streak` 分开计——
+        # `_failure_streak` 统计"连续多少轮没能往前走"（任何原因），这个字段
+        # 统计"连续多少轮**恰好都是**撞预算"，中间夹一次其他原因的失败
+        # （例如一次纯网络抖动的 transport_error）就清零，不算作预算配置问题
+        # 的证据。
+        self._consecutive_round_budget_exceeded = 0
 
     @property
     def completed_on(self) -> date | None:
@@ -233,6 +254,7 @@ class OrgSnapshotSyncDuty:
     def _reset_backoff(self) -> None:
         self._next_attempt_at = None
         self._failure_streak = 0
+        self._consecutive_round_budget_exceeded = 0
 
     def run_once(self) -> str | None:
         """跑一轮。返回写入的 ``run_id``；未执行或本轮未能提交时返回 ``None``。"""
@@ -321,6 +343,31 @@ class OrgSnapshotSyncDuty:
                 fields.get("code", "unknown"),
                 supply if isinstance(supply, str) else "unknown",
             )
+            if code == "round_budget_exceeded":
+                self._consecutive_round_budget_exceeded += 1
+            else:
+                # 中间夹了一次其他原因的失败：不是"预算持续不够"的证据，清零
+                # 计数——见 `__init__` 里 `_consecutive_round_budget_exceeded`
+                # 的字段注释。
+                self._consecutive_round_budget_exceeded = 0
+            if (
+                self._consecutive_round_budget_exceeded
+                >= CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD
+            ):
+                # 打破静默活锁（P2-B4）：连续撞预算不再只是普通 `read_failed` 里
+                # 埋着的一个 `code` 值，额外升一条独立的审计 action + WARNING
+                # 日志——运维扫审计或日志时能直接看到这句话，不需要先数
+                # `read_failed` 记录里 `code=round_budget_exceeded` 出现了几次。
+                self._audit.record(
+                    "org_snapshot_sync.round_budget_persistently_exceeded",
+                    consecutive=self._consecutive_round_budget_exceeded,
+                )
+                logger.warning(
+                    "组织快照连续 %s 轮撞上整轮预算上界（round_budget_exceeded）——"
+                    "预算持续低于单轮实际耗时，快照将永远无法更新，这是配置错误信号："
+                    "请调大 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
+                    self._consecutive_round_budget_exceeded,
+                )
             return None
 
         try:
@@ -330,6 +377,10 @@ class OrgSnapshotSyncDuty:
             # 说明两条身份路径都已经读完一整轮（数百次分页请求）才在交叉校验上失败，
             # 贴着 tick 立即重试的外部成本与读取失败同一个量级，没有理由只挡一条。
             backoff_seconds = self._advance_backoff()
+            # 走到这里说明本轮读取其实已经完整跑完（两条身份路径都读完了才会
+            # 交叉校验），不是撞预算——清零连续计数，不让它跟前面偶然出现的
+            # `round_budget_exceeded` 拼成一条假的"连续"证据。
+            self._consecutive_round_budget_exceeded = 0
             self._audit.record(
                 "org_snapshot_sync.integrity_rejected",
                 problems=[problem.value for problem in error.report.problems],
@@ -353,6 +404,8 @@ class OrgSnapshotSyncDuty:
             # `raise` 本身不变：写库失败仍然原样冒泡，让 `SchedulerLoop` 按既有
             # 纪律记录并隔离，这里只是在冒泡前先把退避记上。
             backoff_seconds = self._advance_backoff()
+            # 同上：本轮读取已经完整跑完，不是撞预算，清零连续计数。
+            self._consecutive_round_budget_exceeded = 0
             self._audit.record(
                 "org_snapshot_sync.commit_failed",
                 error=type(error).__name__,

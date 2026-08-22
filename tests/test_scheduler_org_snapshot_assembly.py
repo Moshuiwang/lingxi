@@ -21,7 +21,10 @@ from lingxi.apps.scheduler import (
     _build_org_snapshot_sync_duty,
     build_loop,
 )
-from lingxi.apps.scheduler.config import DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+from lingxi.apps.scheduler.config import (
+    DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS,
+    MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS,
+)
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
 
 #: 组织快照装配测试只需要「默认值」这一个数——真正生效的值来自
@@ -496,6 +499,45 @@ class RoundBudgetConfigTests(unittest.TestCase):
                     SchedulerConfig.from_env(
                         {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": value}
                     )
+
+    def test_a_non_finite_value_is_refused(self) -> None:
+        """独立审查二轮 P2-B2：`float()` 会把 `"inf"`/`"nan"`/溢出成 inf 的
+        `"1e309"` 原样解析成非有限值，`<= 0` 挡不住它们（`inf > 0`）。一旦漏过去，
+        `round_budget()` 算出的截止时间会变成 `now + inf`，预算检查恒不成立，
+        等于悄悄关闭了整轮预算这道上界。"""
+
+        for value in ("inf", "-inf", "nan", "1e309"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    SchedulerConfig.from_env(
+                        {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": value}
+                    )
+
+    def test_a_value_below_the_documented_minimum_is_refused(self) -> None:
+        """独立审查二轮 P2-B4：低于 `MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`（60 秒）
+        的预算不可能覆盖任何真实一轮，配了就意味着每一轮都必然撞
+        `round_budget_exceeded`——这是配置错误，不是"预算调小一点"。"""
+
+        for value in ("1", "59", "59.9"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    SchedulerConfig.from_env(
+                        {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": value}
+                    )
+
+    def test_the_documented_minimum_itself_is_accepted(self) -> None:
+        """边界值：`MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 本身（60 秒）必须放行，
+        下限校验拒绝的是"低于"，不是"等于"。"""
+
+        config = SchedulerConfig.from_env(
+            {
+                **BASE_ENV,
+                "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": f"{MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS:.0f}",
+            }
+        )
+        self.assertEqual(
+            config.org_snapshot_round_budget_seconds, MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+        )
 
     def test_wiring_actually_uses_the_configured_value_not_the_bare_default(self) -> None:
         """闭环证据：改配置确实改变了真实装配出的 `round_budget` 截止时间，不是

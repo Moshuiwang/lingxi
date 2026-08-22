@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -71,6 +72,17 @@ MAX_ONBOARDING_WORKERS = 64
 #: 不需要因为改一个运行参数而回到产品决策流程；调小同理，只要仍然满足上面两条
 #: 力学关系（远大于实际一轮耗时、明显小于令牌寿命），配置本身不作强制校验。
 DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 1200.0
+
+#: 组织快照整轮预算的下限（秒，独立审查二轮 P2-B4）。**60 秒不是把 stage 实测的
+#: 345 秒基线硬编码成校验值**——组织规模变化时真实基线会变，这里只挡"明显不可能
+#: 跑完一轮"的误配：任何真实一整轮全量遍历都不可能在一分钟内完成，配成低于这个数
+#: 必然导致每一轮都撞 ``round_budget_exceeded``，而失败路径的语义是"保留上一份、
+#: 不覆盖基线"——快照因此会**静默地**永远停在旧数据上（旧数据仍然摆在那，表面看
+#: 起来"有数据"，不会像空表那样明显）。``OrgSnapshotSyncDuty`` 对连续撞线单独再加
+#: 一层响亮告警（见 ``org_snapshot_sync.py`` 的
+#: ``CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD``），这里的下限校验是
+#: 第一道更早的防线：错配在进程启动时就快速失败，不必等到连续三轮撞线才发现。
+MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 60.0
 
 
 class _Secret(str):
@@ -291,11 +303,31 @@ class SchedulerConfig:
                 org_snapshot_round_budget_seconds = float(raw_org_snapshot_round_budget)
             except ValueError as error:
                 raise ValueError(
-                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒"
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒，"
+                    f"收到 {raw_org_snapshot_round_budget!r}"
                 ) from error
-            if org_snapshot_round_budget_seconds <= 0:
+            # `float()` 会把 `"inf"`/`"nan"`/`"1e309"`（超出 float 表示范围，溢出为
+            # inf）这类字符串原样解析成非有限值——独立审查二轮 P2-B2：`<= 0` 的判据
+            # 挡不住它们（`inf > 0`、`nan` 的比较恒为 False），一旦漏过去，
+            # `round_budget()` 算出的截止时间会变成 `now + inf`（或 `now + nan`，
+            # 比较行为同样不可靠），整轮请求前的预算检查因此恒不成立，等于**悄悄
+            # 关闭**了 Issue #284 引入这道上界的初衷。这里显式拒绝非有限值，
+            # 错配在进程启动时快速失败，报错写清实际收到的值（不是凭据，回显无害，
+            # 且是诊断错配所必需的）。
+            if not math.isfinite(org_snapshot_round_budget_seconds):
                 raise ValueError(
-                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒"
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是有限的正数秒，"
+                    f"收到 {raw_org_snapshot_round_budget!r}（解析为 {org_snapshot_round_budget_seconds!r}）"
+                )
+            if org_snapshot_round_budget_seconds < MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS:
+                # 下限校验（独立审查二轮 P2-B4）：见
+                # :data:`MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 的取值依据。
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须至少 "
+                    f"{MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS:.0f} 秒"
+                    "（预算必须大于全量轮实际耗时——stage 实测基线约 345 秒；低于任何"
+                    "真实一轮耗时的预算是配置错误，会让快照永远无法更新），"
+                    f"收到 {org_snapshot_round_budget_seconds!r}"
                 )
         else:
             org_snapshot_round_budget_seconds = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
