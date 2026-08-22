@@ -48,17 +48,6 @@ from lingxi.apps.scheduler.roster_audit import (
 
 logger = logging.getLogger(__name__)
 
-# 组织快照同步整轮预算（Issue #284 A 组 #2）：只挂在组织快照专用的
-# `FeishuDirectoryClient` 实例上（见 `_build_org_snapshot_sync_duty`），不影响
-# 开通链 employment reader 的令牌读取语义——两者是互不共享状态的独立 client 实例。
-# 20 分钟（1200 秒）取值理由：
-#   - 远大于真实成功一轮的 345 秒基线（stage 实测），留出合理的限频重试余量；
-#   - 远小于专用授权用户身份令牌约 2 小时的寿命，保证一轮无论成功失败都在同一个
-#     令牌有效期内结束，不会中途因令牌过期而变成一个更难诊断的错误；
-#   - 撞预算后走既有的 `READ_FAILURE_BACKOFF_STEP_SECONDS`（5 分钟起步、封顶 1
-#     小时）退避，20 分钟预算 + 退避在同一个 UTC 日内仍有多次自愈机会。
-ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 1200.0
-
 
 def _build_roster_audit_duty(
     config: SchedulerConfig,
@@ -1110,14 +1099,17 @@ def _build_org_snapshot_sync_duty(
             user_token = user_access_token()
         except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
             raise TokenSupplyFailure("user_access_token") from error
-        # 整轮预算（Issue #284 A 组 #2）：只包住这一整趟递归遍历，`round_budget`
-        # 是 `client` 这一个实例的作用域化状态，不影响开通链那个独立的 client。
-        # 撞线时 `_request` 抛出的 `FeishuDirectoryError("round_budget_exceeded")`
-        # 原样冒泡，落进本函数上面两个 `except Exception` 同一条路径之外的、
+        # 整轮预算（Issue #284 A 组 #2；取值可运维配置，见
+        # `config.org_snapshot_round_budget_seconds` 与
+        # `DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 的文档）：只包住这一整趟
+        # 递归遍历，`round_budget` 是 `client` 这一个实例的作用域化状态，不影响
+        # 开通链那个独立的 client。撞线时 `_request` 抛出的
+        # `FeishuDirectoryError("round_budget_exceeded")` 原样冒泡，落进本函数
+        # 上面两个 `except Exception` 同一条路径之外的、
         # `OrgSnapshotSyncDuty.run_once()` 现有的 `except Exception` 分支——走
         # 完全相同的「记 `read_failed` 审计→推进退避→保留上一份完成批次」路径，
         # 这里不需要再单独处理。
-        with client.round_budget(seconds=ORG_SNAPSHOT_ROUND_BUDGET_SECONDS):
+        with client.round_budget(seconds=config.org_snapshot_round_budget_seconds):
             return read_org_snapshot(client=client, app_token=app_token, user_token=user_token)
 
     return OrgSnapshotSyncDuty(

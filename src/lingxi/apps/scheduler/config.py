@@ -51,6 +51,27 @@ DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 DEFAULT_ONBOARDING_WORKERS = 8
 MAX_ONBOARDING_WORKERS = 64
 
+#: 组织快照同步整轮预算的默认值（秒，Issue #284 A 组 #2）。只挂在组织快照专用的
+#: ``FeishuDirectoryClient`` 实例上（见 ``apps/scheduler/assembly.py`` 的
+#: ``_build_org_snapshot_sync_duty``），不影响开通链 employment reader 的令牌读取
+#: 语义——两者是互不共享状态的独立 client 实例。
+#:
+#: **默认 1200 秒（20 分钟）的依据**，也是运维调整这个值时的参照系：
+#:
+#: - stage 实测一整轮全量遍历成功耗时约 345 秒，1200 秒留出约 3.5 倍余量，
+#:   覆盖限频重试与网络抖动；
+#: - 明显小于专用授权用户身份令牌约 2 小时的寿命，让一轮无论成功失败都倾向于在
+#:   同一个令牌有效期内结束，不太会中途因令牌过期而变成一个更难诊断的错误；
+#: - 撞预算后走既有的 ``READ_FAILURE_BACKOFF_STEP_SECONDS``（5 分钟起步、封顶 1
+#:   小时）退避，20 分钟预算 + 退避在同一个 UTC 日内仍有多次自愈机会。
+#:
+#: **这是一个可运维调整的默认值，不是需要另行拍板的产品判断**：可以按
+#: ``LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`` 覆盖（见 :meth:`SchedulerConfig.from_env`）
+#: ——例如关联组织规模显著增长、345 秒的基线不再成立时，运维可以直接调大这个数，
+#: 不需要因为改一个运行参数而回到产品决策流程；调小同理，只要仍然满足上面两条
+#: 力学关系（远大于实际一轮耗时、明显小于令牌寿命），配置本身不作强制校验。
+DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 1200.0
+
 
 class _Secret(str):
     """只影响 ``repr`` 的字符串子类：配置对象被打印时不吐出凭据。"""
@@ -115,6 +136,12 @@ class SchedulerConfig:
     # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
     # （`LX-ONBOARD-001`），不是 MCP 同步超时。
     onboarding_publish_wait_seconds: float = 120.0
+    # 组织快照同步整轮预算（秒）。**可选**，默认值与取值依据见
+    # :data:`DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`；运维可按需调大或调小，
+    # 不需要另行产品拍板。撞线后本轮读取原样中止，走既有的
+    # `org_snapshot_sync.read_failed` → 退避 → 保留上一份完成批次路径（不覆盖库里
+    # 最近一次成功批次），只影响"一轮最多愿意为限频重试花多久"，不改变任何产品语义。
+    org_snapshot_round_budget_seconds: float = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -138,6 +165,7 @@ class SchedulerConfig:
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
         "LINGXI_USER_ENV_ROOT",
         "LINGXI_ONBOARDING_WORKERS",
+        "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -255,6 +283,23 @@ class SchedulerConfig:
         else:
             onboarding_workers = DEFAULT_ONBOARDING_WORKERS
 
+        raw_org_snapshot_round_budget = (
+            source.get("LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS") or ""
+        ).strip()
+        if raw_org_snapshot_round_budget:
+            try:
+                org_snapshot_round_budget_seconds = float(raw_org_snapshot_round_budget)
+            except ValueError as error:
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒"
+                ) from error
+            if org_snapshot_round_budget_seconds <= 0:
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒"
+                )
+        else:
+            org_snapshot_round_budget_seconds = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -294,4 +339,5 @@ class SchedulerConfig:
             query_mcp_timeout_seconds=probe_timeout,
             user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),
             onboarding_workers=onboarding_workers,
+            org_snapshot_round_budget_seconds=org_snapshot_round_budget_seconds,
         )

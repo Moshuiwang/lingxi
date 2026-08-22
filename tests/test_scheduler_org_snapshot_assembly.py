@@ -15,9 +15,20 @@ from typing import Any
 from unittest import mock
 
 from lingxi.adapters.feishu_directory import FeishuDirectoryError
-from lingxi.apps.scheduler import SchedulerConfig, _build_org_snapshot_sync_duty, build_loop
-from lingxi.apps.scheduler.assembly import ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+from lingxi.apps.scheduler import (
+    SchedulerConfig,
+    _build_onboarding_duty,
+    _build_org_snapshot_sync_duty,
+    build_loop,
+)
+from lingxi.apps.scheduler.config import DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
+
+#: 组织快照装配测试只需要「默认值」这一个数——真正生效的值来自
+#: ``config.org_snapshot_round_budget_seconds``（可由
+#: ``LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`` 覆盖，见
+#: ``tests/test_scheduler_process.py`` 里对该环境变量解析的专门用例）。
+ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 
 BASE_ENV = {
     "LINGXI_POSTGRES_DSN": "postgresql://localhost/lingxi",
@@ -424,29 +435,99 @@ class HardeningWiringTests(unittest.TestCase):
         fields = audit.records[-1][1]
         self.assertEqual(fields.get("code"), "stopping", "审计必须如实记下中止原因，不是笼统的异常类型名")
 
-    def test_the_organization_snapshot_client_is_not_shared_with_onboarding(self) -> None:
-        """#2 的整轮预算只挂在组织快照专用的 client 实例上——这里只验证「组织
-        快照装配出的 client 与它自己的 store/audit 一样是本次调用私有构造出的
-        新对象」，不会被后续调用复用（防止未来有人为了省一次构造而把 client
-        提到装配函数外层共享，进而让 round_budget 的作用域意外扩大）。"""
+    def test_the_onboarding_employment_reader_client_is_never_wrapped_in_round_budget(self) -> None:
+        """**名不副实的旧版本**只证明了「两次组织快照装配各自拿到独立的 client
+        实例」，从未真的碰过开通链——标题却叫"not shared with onboarding"。这里
+        改成真正断言：开通链在职状态实时回读用的是**另一个独立**的
+        `FeishuDirectoryClient`（`_build_onboarding_duty` 内
+        `FeishuEmploymentReader.client`），从未调用过 `round_budget()`，因此
+        `_round_deadline` 恒为 `None`——#2 的整轮预算只挂在组织快照专用的 client
+        上，不会被将来的重构意外牵连到开通链。"""
 
-        clients: list[Any] = []
+        onboarding_env = {
+            **BASE_ENV,
+            "LINGXI_MCP_TOKEN_ENCRYPT_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.internal/query",
+            "LINGXI_USER_ENV_ROOT": "/var/lib/lingxi/users",
+        }
+
+        class StubPermissionPublish:
+            publish_wired = True
+
+        duty = _build_onboarding_duty(
+            SchedulerConfig.from_env(onboarding_env),
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=StubPermissionPublish(),
+        )
+
+        self.assertIsNotNone(duty, "本用例的环境必须齐备到真实注册，否则下面的断言测的是别的东西")
+        client = duty._onboarding._employment._client
+        self.assertIsNone(
+            client._round_deadline,
+            "开通链的 client 不该被组织快照的 round_budget 影响到——两者是互不共享状态的独立实例",
+        )
+
+
+class RoundBudgetConfigTests(unittest.TestCase):
+    """`LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`（二级独立审查 P2）：整轮预算不再
+    是代码里的硬编码常量，改成可运维配置、有默认值。这里只测配置解析本身；预算
+    真的生效（撞线时机、审计里的 code）已经由 `HardeningWiringTests` 与
+    `tests/test_scheduler_org_snapshot_sync.py::ReadFailedAuditTest` 覆盖。"""
+
+    def test_the_default_matches_the_documented_constant(self) -> None:
+        config = SchedulerConfig.from_env(BASE_ENV)
+        self.assertEqual(
+            config.org_snapshot_round_budget_seconds, DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+        )
+
+    def test_the_round_budget_is_configurable(self) -> None:
+        config = SchedulerConfig.from_env(
+            {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": "600"}
+        )
+        self.assertEqual(config.org_snapshot_round_budget_seconds, 600.0)
+
+    def test_a_non_positive_or_unparseable_value_is_refused(self) -> None:
+        for value in ("0", "-1", "abc"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    SchedulerConfig.from_env(
+                        {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": value}
+                    )
+
+    def test_wiring_actually_uses_the_configured_value_not_the_bare_default(self) -> None:
+        """闭环证据：改配置确实改变了真实装配出的 `round_budget` 截止时间，不是
+        只改了一个没人读的字段——防止"字段存在但没接线"这种此前反复出现的形状。"""
+
+        import time as time_module
+
+        captured: dict[str, Any] = {}
 
         def _stub_read_org_snapshot(*, client: Any, app_token: str, user_token: str) -> Any:
-            clients.append(client)
+            captured["deadline"] = client._round_deadline
+            captured["now"] = time_module.monotonic()
             return "fake-batch"
 
         with mock.patch(
             "lingxi.adapters.feishu_org_snapshot_reader.read_org_snapshot",
             _stub_read_org_snapshot,
         ):
-            first_duty, _audit = build(user_token=lambda: "u", app_token=lambda: "a")
-            first_duty._read_snapshot()
-            second_duty, _audit = build(user_token=lambda: "u", app_token=lambda: "a")
-            second_duty._read_snapshot()
+            duty = _build_org_snapshot_sync_duty(
+                SchedulerConfig.from_env(
+                    {**BASE_ENV, "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS": "60"}
+                ),
+                stop=threading.Event(),
+                audit=RecordingAudit(),
+                user_access_token=lambda: "u",
+                app_access_token=lambda: "a",
+            )
+            duty._read_snapshot()
 
-        self.assertEqual(len(clients), 2)
-        self.assertIsNot(clients[0], clients[1], "两次装配必须各自拿到独立的 client 实例")
+        remaining = captured["deadline"] - captured["now"]
+        self.assertGreater(remaining, 55, "必须用的是配置里的 60 秒，不是默认的 1200 秒")
+        self.assertLessEqual(remaining, 60)
 
 
 if __name__ == "__main__":

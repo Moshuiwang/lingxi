@@ -330,6 +330,38 @@ class ReadFailedAuditTest(unittest.TestCase):
         for value in fields.values():
             self.assertNotIn("这句消息正文不该出现在审计里", str(value))
 
+    def test_round_budget_exceeded_lands_in_the_ordinary_read_failed_path(self) -> None:
+        """否定断言（设计 §5 #2，二级独立审查修复的一部分）：`round_budget`
+        撞线时 `adapters/feishu_directory.py::_PagedClient._request` 抛出的
+        `FeishuDirectoryError("round_budget_exceeded")` 不需要、也不应该在本模块
+        另开一条处理分支——它必须经 `run_once()` 落进已有的 `read_failed` 审计
+        （`code=round_budget_exceeded`），像任何其他读取失败一样推进退避，且
+        **不置位当日水位**（不是"提前完成的成功一轮"）。这里用本文件既有的
+        ``FakeFeishuDirectoryError`` 假替身构造同样的 ``code``，不依赖 adapters
+        层，只验证本模块这一侧对"任意带 code 的异常"一视同仁的既有纪律确实
+        覆盖了这一个具体的 code 值。"""
+
+        store = FakeStore()
+        audit = RecordingAudit()
+
+        def failing_read() -> SnapshotBatch:
+            raise FakeFeishuDirectoryError("round_budget_exceeded")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+        )
+
+        result = duty.run_once()
+
+        self.assertIsNone(result)
+        self.assertEqual(store.committed, [], "撞预算的一轮绝不能调用 commit_batch")
+        self.assertEqual(audit.actions(), ["org_snapshot_sync.read_failed"])
+        fields = audit.records[0][1]
+        self.assertEqual(fields["code"], "round_budget_exceeded")
+        self.assertEqual(fields["attempt"], 1, "撞预算也要推进退避——与其他读取失败共用同一条状态")
+        self.assertEqual(fields["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
+        self.assertIsNone(duty.completed_on, "撞预算的一轮不得置位当日水位，下一轮必须重试")
+
     def test_a_plain_exception_without_a_code_still_falls_back_to_the_class_name(self) -> None:
         """变异锚点：把上面那条用例的输入换成没有 ``code`` 属性的普通异常，审计
         必须不出现 ``code`` 字段，只剩 ``error=<类名>``（F1 完成标准的另一半）。"""
