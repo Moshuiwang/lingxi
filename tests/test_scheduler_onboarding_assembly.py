@@ -154,6 +154,29 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertEqual(audit.actions(), [], "装配成功时不该留「未装配」审计")
         self.assertIsNotNone(duty.capacity_source, "认领量必须绑上执行器剩余容量")
 
+    def test_the_employment_reader_client_uses_stop_wait_as_its_sleeper(self) -> None:
+        """Issue #284 A 组 #4：开通链 employment reader 的 client 也要接上
+        `sleep=stop.wait`（设计 §4 的两处接线点之一，另一处是组织快照，见
+        ``tests/test_scheduler_org_snapshot_assembly.py::HardeningWiringTests``）。
+        `threading.Event.wait` 每次取值都会新建一个绑定方法包装对象，因此用
+        `==`——绑定方法比较的是底层函数与所属实例是否相同，同一个 `Event` 的
+        `wait` 恒相等；用 `is` 会误判为不等。"""
+
+        stop = threading.Event()
+        audit = RecordingAudit()
+        duty = _build_onboarding_duty(
+            SchedulerConfig.from_env(WIRED_ENV),
+            stop=stop,
+            audit=audit,
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+        )
+
+        self.assertIsInstance(duty, OnboardingReconciler)
+        client = duty._onboarding._employment._client
+        self.assertEqual(client._sleep, stop.wait, "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep")
+
 
 class AssemblyInvariantTests(unittest.TestCase):
     """F1（外部集成面审查，必修）：``onboarding != None ⇒ permission_publish != None

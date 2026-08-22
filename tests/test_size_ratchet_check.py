@@ -126,16 +126,21 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         for path in baseline:
             self.assertTrue(path.startswith("src/lingxi/"), path)
 
-    def test_the_real_committed_baseline_is_currently_empty(self) -> None:
-        """2026-08-19：#237（scheduler）与 #247（postgres_conversation）两个
-        拆分 Story 都已合入 main，`src/lingxi/` 下当前零个文件超过 1500 行。
-        这条测试钉住当前这个真实终态——不是 ``EmptyBaselineIsLegalTest`` 里
-        构造的合成夹具，是仓库里真实提交的那份基线文件本身。这条测试会随下
-        一个跨过阈值的文件出现而失效，那是预期行为（届时改这条测试而不是改
-        棘轮逻辑）。
+    def test_the_real_committed_baseline_matches_the_registered_entries(self) -> None:
+        """钉住真实提交的基线文件内容——不是 ``EmptyBaselineIsLegalTest`` 里
+        构造的合成夹具。任何新增登记必须有意识地同步更新这条测试并说明理由。
+
+        登记史：2026-08-19 #237/#247 拆分后基线曾为空；2026-08-22 登记
+        `assembly.py`（1535 行）——PR #292（装配期管理群警告）与 PR #293
+        （停机接线与预算装配）各自都低于阈值，合并后组合首次突破；两侧均为
+        必要改动，结构性拆分登记为 #284 后续（与背景线程改造同批评估），
+        不在合并窗口塞设计级重构。下一次这条测试失效时，同样在此登记理由。
         """
 
-        self.assertEqual(CHECK.load_baseline(CHECK.BASELINE_PATH), {})
+        self.assertEqual(
+            CHECK.load_baseline(CHECK.BASELINE_PATH),
+            {"src/lingxi/apps/scheduler/assembly.py": 1535},
+        )
 
 
 class EmptyBaselineIsLegalTest(unittest.TestCase):

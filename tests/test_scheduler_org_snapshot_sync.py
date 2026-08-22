@@ -16,6 +16,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from lingxi.apps.scheduler.org_snapshot_sync import (
+    CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD,
     READ_FAILURE_BACKOFF_CEILING_SECONDS,
     READ_FAILURE_BACKOFF_STEP_SECONDS,
     OrgSnapshotSyncDuty,
@@ -329,6 +330,38 @@ class ReadFailedAuditTest(unittest.TestCase):
         # 消息正文（含"这句消息正文不该出现在审计里"）不得泄漏进任何字段。
         for value in fields.values():
             self.assertNotIn("这句消息正文不该出现在审计里", str(value))
+
+    def test_round_budget_exceeded_lands_in_the_ordinary_read_failed_path(self) -> None:
+        """否定断言（设计 §5 #2，二级独立审查修复的一部分）：`round_budget`
+        撞线时 `adapters/feishu_directory.py::_PagedClient._request` 抛出的
+        `FeishuDirectoryError("round_budget_exceeded")` 不需要、也不应该在本模块
+        另开一条处理分支——它必须经 `run_once()` 落进已有的 `read_failed` 审计
+        （`code=round_budget_exceeded`），像任何其他读取失败一样推进退避，且
+        **不置位当日水位**（不是"提前完成的成功一轮"）。这里用本文件既有的
+        ``FakeFeishuDirectoryError`` 假替身构造同样的 ``code``，不依赖 adapters
+        层，只验证本模块这一侧对"任意带 code 的异常"一视同仁的既有纪律确实
+        覆盖了这一个具体的 code 值。"""
+
+        store = FakeStore()
+        audit = RecordingAudit()
+
+        def failing_read() -> SnapshotBatch:
+            raise FakeFeishuDirectoryError("round_budget_exceeded")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
+        )
+
+        result = duty.run_once()
+
+        self.assertIsNone(result)
+        self.assertEqual(store.committed, [], "撞预算的一轮绝不能调用 commit_batch")
+        self.assertEqual(audit.actions(), ["org_snapshot_sync.read_failed"])
+        fields = audit.records[0][1]
+        self.assertEqual(fields["code"], "round_budget_exceeded")
+        self.assertEqual(fields["attempt"], 1, "撞预算也要推进退避——与其他读取失败共用同一条状态")
+        self.assertEqual(fields["backoff_seconds"], READ_FAILURE_BACKOFF_STEP_SECONDS)
+        self.assertIsNone(duty.completed_on, "撞预算的一轮不得置位当日水位，下一轮必须重试")
 
     def test_a_plain_exception_without_a_code_still_falls_back_to_the_class_name(self) -> None:
         """变异锚点：把上面那条用例的输入换成没有 ``code`` 属性的普通异常，审计
@@ -676,6 +709,189 @@ class ConstructionTest(unittest.TestCase):
             OrgSnapshotSyncDuty(
                 read_snapshot=lambda: EMPTY_BATCH, store=FakeStore(), audit=RecordingAudit(), source_app_id=""
             )
+
+
+class RoundBudgetEscalationTest(unittest.TestCase):
+    """独立审查二轮 P2-B4：单次 `round_budget_exceeded` 只是普通的 `read_failed`，
+    靠既有退避静默自愈即可；但如果它**连续**出现，说明的不是一次偶发拥堵，而是
+    `LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 配的预算本身小于真实一轮耗时——
+    每一轮都会在完全相同的地方撞线，而失败路径「保留上一份、不覆盖」的语义会让
+    快照静默地永远停在旧数据上。这里断言连续撞线达到阈值时必须额外升一条响亮的
+    专用审计 action，打破这个静默活锁。
+    """
+
+    @staticmethod
+    def _advance_past_backoff(clock: dict[str, datetime], attempt: int) -> None:
+        clock["now"] = clock["now"] + timedelta(
+            seconds=min(attempt * READ_FAILURE_BACKOFF_STEP_SECONDS, READ_FAILURE_BACKOFF_CEILING_SECONDS)
+        )
+
+    def test_three_consecutive_rounds_trigger_the_escalation(self) -> None:
+        store = FakeStore()
+        audit = RecordingAudit()
+        clock = {"now": FIXED_NOW}
+
+        def failing_read() -> SnapshotBatch:
+            raise FakeFeishuDirectoryError("round_budget_exceeded")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        for attempt in range(1, CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD + 1):
+            duty.run_once()
+            self._advance_past_backoff(clock, attempt)
+
+        escalations = [
+            fields
+            for action, fields in audit.records
+            if action == "org_snapshot_sync.round_budget_persistently_exceeded"
+        ]
+        self.assertEqual(len(escalations), 1, "恰好在连续撞线达到阈值那一轮升级一次")
+        self.assertEqual(
+            escalations[0]["consecutive"], CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD
+        )
+        # 升级是在既有 read_failed 之外**额外**多记一条，不是替换它——运维仍然
+        # 能在审计里看到每一轮各自的 code/attempt/backoff_seconds。
+        self.assertEqual(
+            audit.actions().count("org_snapshot_sync.read_failed"),
+            CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD,
+        )
+
+    def test_a_warning_log_accompanies_the_escalation(self) -> None:
+        store = FakeStore()
+        audit = RecordingAudit()
+        clock = {"now": FIXED_NOW}
+
+        def failing_read() -> SnapshotBatch:
+            raise FakeFeishuDirectoryError("round_budget_exceeded")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        with self.assertLogs("lingxi.apps.scheduler.org_snapshot_sync", level="WARNING") as captured:
+            for attempt in range(1, CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD + 1):
+                duty.run_once()
+                self._advance_past_backoff(clock, attempt)
+
+        self.assertTrue(
+            any("预算" in line and "配置错误" in line for line in captured.output),
+            "打破静默活锁的日志必须响亮到能直接说明是配置错误，不能只是又一条 error 级别的失败日志",
+        )
+
+    def test_fewer_than_the_threshold_does_not_escalate(self) -> None:
+        store = FakeStore()
+        audit = RecordingAudit()
+        clock = {"now": FIXED_NOW}
+
+        def failing_read() -> SnapshotBatch:
+            raise FakeFeishuDirectoryError("round_budget_exceeded")
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        for attempt in range(1, CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD):
+            duty.run_once()
+            self._advance_past_backoff(clock, attempt)
+
+        self.assertNotIn(
+            "org_snapshot_sync.round_budget_persistently_exceeded", audit.actions()
+        )
+
+    def test_an_interleaved_different_failure_resets_the_streak(self) -> None:
+        """连续计数只统计"恰好都是撞预算"的连续轮次；中间夹一次别的失败原因
+        （例如一次纯网络抖动）不是"预算持续不够"的证据，不能被继续计入。"""
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        clock = {"now": FIXED_NOW}
+        codes = iter(
+            [
+                "round_budget_exceeded",
+                "round_budget_exceeded",
+                "transport_error",
+                "round_budget_exceeded",
+                "round_budget_exceeded",
+            ]
+        )
+
+        def failing_read() -> SnapshotBatch:
+            code = next(codes)
+            if code == "transport_error":
+                raise RuntimeError("transport_error")
+            raise FakeFeishuDirectoryError(code)
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        for attempt in range(1, 6):
+            duty.run_once()
+            self._advance_past_backoff(clock, attempt)
+
+        self.assertNotIn(
+            "org_snapshot_sync.round_budget_persistently_exceeded",
+            audit.actions(),
+            "五轮里最长的连续撞预算只有两轮（中间夹了一次 transport_error），不该升级",
+        )
+
+    def test_a_successful_commit_resets_the_streak(self) -> None:
+        """连续两轮撞预算之后，第三轮真的读成功并提交：这是"预算其实够用、
+        只是刚好偶发拥堵了两次"的证据，之后若再度连续撞线，必须重新数，不能
+        沿用之前累积的计数。"""
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        clock = {"now": FIXED_NOW}
+        outcomes = iter(
+            ["round_budget_exceeded", "round_budget_exceeded", None, "round_budget_exceeded"]
+        )
+
+        def read_or_succeed() -> SnapshotBatch:
+            outcome = next(outcomes)
+            if outcome is None:
+                return _committable_batch()
+            raise FakeFeishuDirectoryError(outcome)
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=read_or_succeed,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+        )
+
+        duty.run_once()  # 撞预算 #1
+        clock["now"] = clock["now"] + timedelta(seconds=READ_FAILURE_BACKOFF_STEP_SECONDS)
+        duty.run_once()  # 撞预算 #2
+        clock["now"] = clock["now"] + timedelta(seconds=2 * READ_FAILURE_BACKOFF_STEP_SECONDS)
+        duty.run_once()  # 成功提交
+        clock["now"] = clock["now"].replace(day=clock["now"].day + 1)  # 下一 UTC 日，daily gate 放行
+        duty.run_once()  # 撞预算 #1'（重新数）
+
+        self.assertNotIn(
+            "org_snapshot_sync.round_budget_persistently_exceeded",
+            audit.actions(),
+            "中间的成功提交必须清零连续计数，否则第四轮会被误判成第三轮连续撞线",
+        )
 
 
 def _committable_batch() -> SnapshotBatch:

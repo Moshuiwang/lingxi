@@ -12,8 +12,12 @@
 5. 夹具输入契约与生产解析同口径，且夹具自身要有测试。
 
 仓库里已经存在两个满足上述五条、以环境变量驱动的正式夹具：
-``LINGXI_GATEWAY_CARD_FAILURE_INJECT``（``apps/gateway/config.py``）与
-``LINGXI_WORKER_OUTPUT_SAFETY_CANARY``（``apps/worker/config.py``）。它们各自的
+``LINGXI_GATEWAY_CARD_FAILURE_INJECT``（取值解析在 ``apps/gateway/config.py``，
+生效装配在 ``apps/gateway/__init__.py`` 的 ``assemble_delivery_consumer``，注入点
+说明在 ``apps/gateway/delivery.py``）与 ``LINGXI_WORKER_OUTPUT_SAFETY_CANARY``
+（取值解析在 ``apps/worker/config.py``，启动期显眼告知在 ``apps/worker/cli.py``）。
+Epic D 的 #237/#238/#239 模块拆分后取值解析仍留在两个 ``config.py``，但实际生效
+与可观测的落点已分散到上述文件，核对开关是否仍在生效时应从这些落点回读。它们各自的
 业务分支已经有相当完整的契约测试（默认关闭、四/两档合法值、非法值拒绝、只影响
 被选中的一步、不泄露敏感信息），分别在 ``tests/test_gateway_config.py`` /
 ``tests/test_gateway_delivery.py`` 与 ``tests/test_worker_entry.py``——本模块**不**

@@ -1236,5 +1236,144 @@ class RateLimitRetryTest(unittest.TestCase):
         self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS, 3.0, REQUEST_PAUSE_SECONDS])
 
 
+class _FakeClock:
+    """可手动推进的假单调时钟，供 ``round_budget`` 测试注入。"""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class _AdvancingTransport:
+    """记录调用并在指定的第 N 次调用**返回之后**推进假时钟——用来模拟
+    "这一页处理花了很久" 而不需要真的等待。"""
+
+    def __init__(self, responses: list[object], *, clock: _FakeClock, advance_after: dict[int, float]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, object] | None, str | None]] = []
+        self._clock = clock
+        self._advance_after = advance_after
+
+    def __call__(self, method: str, url: str, *, body=None, token=None):
+        index = len(self.calls) + 1
+        self.calls.append((method, url, body, token))
+        if not self._responses:
+            raise AssertionError("假传输层收到了超出预置数量的调用")
+        response = self._responses.pop(0)
+        seconds = self._advance_after.get(index)
+        if seconds:
+            self._clock.advance(seconds)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class RoundBudgetTest(unittest.TestCase):
+    """Issue #284 A 组 #2：组织快照专用 client 的整轮预算——只作用于持有它的
+    这一个实例，默认关闭，撞线抛 ``round_budget_exceeded`` 且不再发出下一次
+    请求。机制在这里按单元测试覆盖；装配层是否真的用上了它见
+    ``tests/test_scheduler_org_snapshot_assembly.py::HardeningWiringTests``。
+    """
+
+    def test_a_round_that_finishes_within_budget_is_unaffected(self) -> None:
+        """回归：预算内完成的多页请求正常返回完整数据，与不设预算时的既有断言
+        （``DirectoryPaginationTest``）结果一致——`round_budget` 打开本身不改变
+        任何成功路径的行为。"""
+
+        clock = _FakeClock()
+        transport = RecordingTransport(
+            [
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
+            ]
+        )
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+        )
+
+        with client.round_budget(seconds=1200.0):
+            tenants = client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a", "tenant_b"])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_exceeding_the_budget_raises_and_stops_issuing_further_requests(self) -> None:
+        """撞预算 ⇒ 下一次 `_request` 必须抛 ``round_budget_exceeded``，且假
+        transport 的调用计数在那之后不再增长——没有再发任何请求（设计 §5
+        表格 #2 行 (a)）。"""
+
+        clock = _FakeClock()
+        transport = _AdvancingTransport(
+            [
+                page([{"tenant_key": "tenant_a"}], key="target_tenant_list", has_more=True, page_token="p2"),
+                page([{"tenant_key": "tenant_b"}], key="target_tenant_list"),
+            ],
+            clock=clock,
+            advance_after={1: 11.0},  # 第一页处理完之后，时间已经超过 10 秒的预算。
+        )
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+        )
+
+        with self.assertRaises(FeishuDirectoryError) as raised:
+            with client.round_budget(seconds=10.0):
+                client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(raised.exception.code, "round_budget_exceeded")
+        self.assertEqual(len(transport.calls), 1, "撞预算之后不应该再发出下一次请求")
+
+    def test_round_budget_exceeded_is_an_indeterminate_failure_not_a_definite_one(self) -> None:
+        """``round_budget_exceeded`` 不以 ``feishu_code_`` 开头 ⇒
+        ``FeishuDirectoryError.definite`` 按既有构造逻辑自动判为 ``False``
+        （"结果不明确"），与 `_pages` 的 `missing_*`/`pagination_stalled` 等
+        既有分类码走同一条既定处置，不需要新增分支（设计 §2）。"""
+
+        error = FeishuDirectoryError("round_budget_exceeded")
+
+        self.assertFalse(error.definite)
+
+    def test_the_budget_is_scoped_to_the_with_block_and_restored_on_exit(self) -> None:
+        """`round_budget` 的 `with` 块退出后必须把截止时间还原（默认关闭）——
+        块外一次远超预算秒数的调用不受影响，即便假时钟已经走到很晚（设计 §2
+        「限定『从进入这个 with 块起』」）。"""
+
+        clock = _FakeClock(start=1000.0)
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+        )
+
+        with client.round_budget(seconds=1.0):
+            pass  # 立即退出，不发起任何请求。
+
+        clock.advance(1000.0)  # 远超刚才那个已经退出的 1 秒预算。
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+
+    def test_without_entering_round_budget_a_huge_clock_jump_never_raises_it(self) -> None:
+        """否定断言：从未调用过 `round_budget()` 的 client（默认关闭状态），即使
+        注入的假时钟被推到很晚，也绝不会抛 `round_budget_exceeded`——预算不
+        影响任何正常轮（本任务的核心否定断言之一）。故意破坏实现确认变红：
+        把 `_PagedClient.__init__` 里 `self._round_deadline` 的默认值从 `None`
+        改成非 `None` 会让这条测试失败，证明它确实在测"默认关闭"这件事。"""
+
+        clock = _FakeClock(start=0.0)
+        clock.advance(10_000_000.0)  # 远超任何合理预算，模拟"进程已经跑了很久"。
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=lambda seconds: None, round_deadline_clock=clock
+        )
+
+        tenants = client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual([item["tenant_key"] for item in tenants], ["tenant_a"])
+
+
 if __name__ == "__main__":
     unittest.main()

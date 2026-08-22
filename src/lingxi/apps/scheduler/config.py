@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -50,6 +51,38 @@ DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 #: 上界 64 是防御而不是容量规划：撞上它说明配置写错了，而不是「这次要开通很多人」。
 DEFAULT_ONBOARDING_WORKERS = 8
 MAX_ONBOARDING_WORKERS = 64
+
+#: 组织快照同步整轮预算的默认值（秒，Issue #284 A 组 #2）。只挂在组织快照专用的
+#: ``FeishuDirectoryClient`` 实例上（见 ``apps/scheduler/assembly.py`` 的
+#: ``_build_org_snapshot_sync_duty``），不影响开通链 employment reader 的令牌读取
+#: 语义——两者是互不共享状态的独立 client 实例。
+#:
+#: **默认 1200 秒（20 分钟）的依据**，也是运维调整这个值时的参照系：
+#:
+#: - stage 实测一整轮全量遍历成功耗时约 345 秒，1200 秒留出约 3.5 倍余量，
+#:   覆盖限频重试与网络抖动；
+#: - 明显小于专用授权用户身份令牌约 2 小时的寿命，让一轮无论成功失败都倾向于在
+#:   同一个令牌有效期内结束，不太会中途因令牌过期而变成一个更难诊断的错误；
+#: - 撞预算后走既有的 ``READ_FAILURE_BACKOFF_STEP_SECONDS``（5 分钟起步、封顶 1
+#:   小时）退避，20 分钟预算 + 退避在同一个 UTC 日内仍有多次自愈机会。
+#:
+#: **这是一个可运维调整的默认值，不是需要另行拍板的产品判断**：可以按
+#: ``LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`` 覆盖（见 :meth:`SchedulerConfig.from_env`）
+#: ——例如关联组织规模显著增长、345 秒的基线不再成立时，运维可以直接调大这个数，
+#: 不需要因为改一个运行参数而回到产品决策流程；调小同理，只要仍然满足上面两条
+#: 力学关系（远大于实际一轮耗时、明显小于令牌寿命），配置本身不作强制校验。
+DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 1200.0
+
+#: 组织快照整轮预算的下限（秒，独立审查二轮 P2-B4）。**60 秒不是把 stage 实测的
+#: 345 秒基线硬编码成校验值**——组织规模变化时真实基线会变，这里只挡"明显不可能
+#: 跑完一轮"的误配：任何真实一整轮全量遍历都不可能在一分钟内完成，配成低于这个数
+#: 必然导致每一轮都撞 ``round_budget_exceeded``，而失败路径的语义是"保留上一份、
+#: 不覆盖基线"——快照因此会**静默地**永远停在旧数据上（旧数据仍然摆在那，表面看
+#: 起来"有数据"，不会像空表那样明显）。``OrgSnapshotSyncDuty`` 对连续撞线单独再加
+#: 一层响亮告警（见 ``org_snapshot_sync.py`` 的
+#: ``CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD``），这里的下限校验是
+#: 第一道更早的防线：错配在进程启动时就快速失败，不必等到连续三轮撞线才发现。
+MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS = 60.0
 
 
 class _Secret(str):
@@ -115,6 +148,12 @@ class SchedulerConfig:
     # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
     # （`LX-ONBOARD-001`），不是 MCP 同步超时。
     onboarding_publish_wait_seconds: float = 120.0
+    # 组织快照同步整轮预算（秒）。**可选**，默认值与取值依据见
+    # :data:`DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS`；运维可按需调大或调小，
+    # 不需要另行产品拍板。撞线后本轮读取原样中止，走既有的
+    # `org_snapshot_sync.read_failed` → 退避 → 保留上一份完成批次路径（不覆盖库里
+    # 最近一次成功批次），只影响"一轮最多愿意为限频重试花多久"，不改变任何产品语义。
+    org_snapshot_round_budget_seconds: float = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -138,6 +177,7 @@ class SchedulerConfig:
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
         "LINGXI_USER_ENV_ROOT",
         "LINGXI_ONBOARDING_WORKERS",
+        "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -255,6 +295,43 @@ class SchedulerConfig:
         else:
             onboarding_workers = DEFAULT_ONBOARDING_WORKERS
 
+        raw_org_snapshot_round_budget = (
+            source.get("LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS") or ""
+        ).strip()
+        if raw_org_snapshot_round_budget:
+            try:
+                org_snapshot_round_budget_seconds = float(raw_org_snapshot_round_budget)
+            except ValueError as error:
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是正数秒，"
+                    f"收到 {raw_org_snapshot_round_budget!r}"
+                ) from error
+            # `float()` 会把 `"inf"`/`"nan"`/`"1e309"`（超出 float 表示范围，溢出为
+            # inf）这类字符串原样解析成非有限值——独立审查二轮 P2-B2：`<= 0` 的判据
+            # 挡不住它们（`inf > 0`、`nan` 的比较恒为 False），一旦漏过去，
+            # `round_budget()` 算出的截止时间会变成 `now + inf`（或 `now + nan`，
+            # 比较行为同样不可靠），整轮请求前的预算检查因此恒不成立，等于**悄悄
+            # 关闭**了 Issue #284 引入这道上界的初衷。这里显式拒绝非有限值，
+            # 错配在进程启动时快速失败，报错写清实际收到的值（不是凭据，回显无害，
+            # 且是诊断错配所必需的）。
+            if not math.isfinite(org_snapshot_round_budget_seconds):
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须是有限的正数秒，"
+                    f"收到 {raw_org_snapshot_round_budget!r}（解析为 {org_snapshot_round_budget_seconds!r}）"
+                )
+            if org_snapshot_round_budget_seconds < MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS:
+                # 下限校验（独立审查二轮 P2-B4）：见
+                # :data:`MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 的取值依据。
+                raise ValueError(
+                    "环境变量 LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS 必须至少 "
+                    f"{MIN_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS:.0f} 秒"
+                    "（预算必须大于全量轮实际耗时——stage 实测基线约 345 秒；低于任何"
+                    "真实一轮耗时的预算是配置错误，会让快照永远无法更新），"
+                    f"收到 {org_snapshot_round_budget_seconds!r}"
+                )
+        else:
+            org_snapshot_round_budget_seconds = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -294,4 +371,5 @@ class SchedulerConfig:
             query_mcp_timeout_seconds=probe_timeout,
             user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),
             onboarding_workers=onboarding_workers,
+            org_snapshot_round_budget_seconds=org_snapshot_round_budget_seconds,
         )
