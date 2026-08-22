@@ -492,7 +492,12 @@ class NoticeOutboxTest(LateReadinessRecoveryPostgresTestCase):
         assert delivered_claim is not None
         self.store.mark_notice_delivered(delivered_claim.notice_id)
 
-        far_future = NOW + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
+        # 用**真实当前时刻**推远，不用固定的 ``NOW`` 常量：到期判据 ``content_expires_at``
+        # 是触发器按真库 ``now()``（写入时刻）+ 2160 小时算的，写入时刻随测试运行的真实
+        # 墙钟走。固定常量一旦落在真实墙钟 40 小时之后（NOW + 2160h < 写入时刻 + 2160h），
+        # ``far_future`` 就会小于 ``content_expires_at``，purge 判它"还没到期"而删 0 行，
+        # 这是测试夹具的时间基准错误，不是 purge 的缺陷（日界翻转型 flaky）。
+        far_future = datetime.now(timezone.utc) + timedelta(hours=2200)  # 远超过 2160 小时的到期上限
         purged = self.store.purge_expired_notices(now=far_future)
 
         self.assertEqual(purged, 1, "只删已送达且过期的那一条")
