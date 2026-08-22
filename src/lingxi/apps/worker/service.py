@@ -84,6 +84,17 @@ def _denied_tool_summary(report: Mapping[str, Any]) -> tuple[int, tuple[str, ...
     ``report["audit"]`` 在早退分支（开工前已 ``stop_requested``、读用户 MCP
     配置失败、执行器抛出未预期异常）不存在——这些分支从未真正跑过一次
     ``PreToolUse`` 判定，取不到就如实记 0/空，不假装有据可查。
+
+    **已知边界（独立审查 codex P2-A5，如实登记、不修）**：与上一段"从未跑过判定"
+    不同的是另一种时序——这一回合**已经**发生过至少一次真实的 ``PreToolUse``
+    拒绝，但 executor 在拒绝**之后**异常退出（未预期异常，落进本文件顶部
+    ``except Exception`` 那一类早退分支，``report`` 不带 ``audit`` 字段）。这种
+    情况下本轮已经发生过的拒绝计数会跟着这份不完整的 ``report`` 一起丢失——
+    ``_denied_tool_summary`` 同样如实返回 0/空，不去猜、也无法从这份 ``report``
+    里补回来。可以接受：这轮回合本身已经落到一个响亮的失败终态（未预期异常
+    带着 ``type(error).__name__`` 收口，见 ``_process_task`` 的失败分支），运维
+    看得到"这一轮坏了"；唯一的代价是看不到"坏之前它还拒绝过几次工具调用"这个
+    补充事实，不是静默丢失整轮结果。
     """
 
     audit = report.get("audit") if isinstance(report, Mapping) else None
