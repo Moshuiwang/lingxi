@@ -499,7 +499,7 @@ class WorkerTurnInputSafetyTests(unittest.TestCase):
     def test_worker_turn_marks_external_text_and_blocks_echo_at_the_exit(self) -> None:
         config = WorkerConfig(
             question="查询日活",
-            read_only_tool=READ_ONLY_TOOL,
+            read_only_tools=(READ_ONLY_TOOL,),
             trace_id="01J0000000000000000TEST000",
             turn_timeout_seconds=1.0,
             system_prompt=SYSTEM_PROMPT,
@@ -537,7 +537,7 @@ class WorkerTurnInputSafetyTests(unittest.TestCase):
 
         config = WorkerConfig(
             question="查询日活",
-            read_only_tool=READ_ONLY_TOOL,
+            read_only_tools=(READ_ONLY_TOOL,),
             trace_id="01J0000000000000000TEST002",
             turn_timeout_seconds=1.0,
             system_prompt=SYSTEM_PROMPT,

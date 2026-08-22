@@ -923,6 +923,9 @@ class AutomaticOnboardingTests(PipelineTestCase):
         )
         self.assertEqual(self.log.count("audit.onboarding.failed"), 1)
         self.assertNotIn("外部权限服务不可用", repr(self.log.entries))
+        # Issue #280 §7.1 渲染点 3（异常兜底）：正文必须带上这一次事件的追溯号，
+        # 且不得泄露内部异常正文（上一条断言已覆盖后半）。
+        self.assertIn("trc_evt_internal", self.log.fields("reply.send_text")[-1]["text"])
 
 
 class OnboardingDispatchLedgerTests(PipelineTestCase):
@@ -1110,6 +1113,9 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
             ["completed"],
             "兜底必须在审计里保留编排真正返回的状态，否则事后无法定位",
         )
+        # Issue #280 §7.1 渲染点 4（空渲染兜底）：兜底出去的 `LX-ONBOARD-001` 同样
+        # 必须带上这一次事件的追溯号。
+        self.assertIn("trc_evt_completed_bare", self.log.fields("reply.send_text")[-1]["text"])
 
     def test_a_result_whose_only_message_is_checking_also_falls_back(self) -> None:
         """checking 由 gateway 独占且只发一次；过滤之后同样不能剩下空白。"""
@@ -1159,6 +1165,24 @@ class OnboardingTerminalRenderingTests(PipelineTestCase):
                     2,
                     f"{state.value} 必须在 checking 之外再给用户一条结论",
                 )
+
+    def test_default_table_terminals_requiring_a_reference_carry_this_events_trace_id(
+        self,
+    ) -> None:
+        """Issue #280 §7.1 渲染点 4（缺省文案表）：`SYNC_TIMEOUT`/`INTERNAL_ERROR`
+        走 `_DEFAULT_ONBOARDING_MESSAGES` 缺省表（编排没有自带 messages）时，同样
+        必须补上 `reference`——否则会在渲染时抛 `ContentRenderError`，本用例首先
+        证明它不抛，再证明追溯号真的进了正文。"""
+
+        for state in (OnboardingState.SYNC_TIMEOUT, OnboardingState.INTERNAL_ERROR):
+            with self.subTest(state=state.value):
+                self.log = CallLog()
+                self.state = FakeState()
+                runner = FakeOnboarding(result=OnboardingResult(state=state))
+                self.build(onboarding=runner).handle_message(
+                    message(event_id=f"evt_default_{state.value}", open_id="ou_new"), now=NOW
+                )
+                self.assertIn(f"trc_evt_default_{state.value}", self.log.fields("reply.send_text")[-1]["text"])
 
 
 class BlackHoleOutboundTests(PipelineTestCase):

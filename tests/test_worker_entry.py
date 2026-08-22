@@ -31,7 +31,7 @@ import tempfile
 import types
 import unittest
 
-READ_ONLY_TOOL = "mcp__bi-metric__list_metrics"
+READ_ONLY_TOOL = "mcp__query__list_metrics"
 # 固定假凭据探针。形状刻意选成「16 字符以上且含数字」，这是自由文本脱敏唯一
 # 与键名无关的结构性规则（V-审计-03）。真实凭据永远不进测试。
 FAKE_CREDENTIAL = "LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
@@ -360,7 +360,7 @@ class FakeAgentSDK:
 def worker_env(**overrides):
     env = {
         "LINGXI_WORKER_QUESTION": "近 7 天的活跃用户数是多少？",
-        "LINGXI_WORKER_READONLY_TOOL": READ_ONLY_TOOL,
+        "LINGXI_WORKER_READONLY_TOOLS": READ_ONLY_TOOL,
         "LINGXI_WORKER_AUDIT_INPUT_FIELDS": "metric",
         "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
     }
@@ -886,7 +886,7 @@ class OutputSafetyCanaryTest(unittest.TestCase):
 
         values = {
             "question": "q",
-            "read_only_tool": READ_ONLY_TOOL,
+            "read_only_tools": (READ_ONLY_TOOL,),
             "trace_id": "01J0000000000000000TEST000",
             "turn_timeout_seconds": 60.0,
         }
@@ -979,19 +979,151 @@ class WorkerConfigTest(unittest.TestCase):
             load_config(env)
         self.assertIn("LINGXI_WORKER_QUESTION", str(caught.exception))
 
-    def test_only_one_read_only_mcp_tool_may_be_whitelisted(self) -> None:
+    def test_read_only_tools_rejects_wildcards_space_separation_and_empty_values(self) -> None:
+        """白名单只接受精确名称、逗号分隔（Issue #291 P0）：通配符、空白分隔、
+        空字符串都不是"想放行第二个工具"该有的形状，必须在装配期拒绝。"""
         from lingxi.apps.worker.config import WorkerConfigError
 
-        for value in ("mcp__a__x,mcp__a__y", "mcp__a__x mcp__a__y", "mcp__bi-metric__*"):
+        for value in ("mcp__query__x mcp__query__y", "mcp__query__*", "", ","):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
-                self._load(LINGXI_WORKER_READONLY_TOOL=value)
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
+
+    def test_read_only_tools_rejects_a_bare_prefix_with_nothing_after_it(self) -> None:
+        """独立审查 codex P1-1：``mcp__query__`` 本身通过合法标识符形态、``mcp__``
+        前缀、``QUERY_MCP_TOOL_PREFIX`` 前缀三段校验（它就是那个前缀字符串），但
+        前缀后面没有任何工具名——不指向任何真实工具，会被 PreToolUse 逐字比对
+        无声拒绝。必须在装配期响亮报错，不能留到用户提问那一刻才发现。"""
+        from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_WORKER_READONLY_TOOLS=QUERY_MCP_TOOL_PREFIX)
+        self.assertIn(QUERY_MCP_TOOL_PREFIX, str(caught.exception))
+
+    def test_read_only_tools_rejects_empty_segments_between_commas(self) -> None:
+        """独立审查 codex P1-1：逗号间的空段（``a,,b``）此前被 ``if part.strip()``
+        静默丢弃——配置里写错一个逗号，白名单悄悄少了一项，运维不会收到任何报错。
+        配置形状错误必须失败关闭，不能静默丢弃；多余的首尾逗号是同一类形状错误。"""
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        for value in (
+            "mcp__query__list_metrics,,mcp__query__describe_metric",
+            "mcp__query__list_metrics,",
+            ",mcp__query__list_metrics",
+        ):
+            with self.subTest(value=value), self.assertRaises(WorkerConfigError):
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
+
+    def test_read_only_tools_accepts_multiple_comma_separated_values(self) -> None:
+        """Issue #291 P0 核心行为：真实问数 MCP 至少注册 3 个只读工具，白名单
+        必须能同时放行全部，不能"放行一个、其余照拒"。"""
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(
+            worker_env(
+                LINGXI_WORKER_READONLY_TOOLS=(
+                    "mcp__query__list_metrics,mcp__query__describe_metric,"
+                    "mcp__query__search_dimension"
+                )
+            )
+        )
+        self.assertEqual(
+            config.read_only_tools,
+            (
+                "mcp__query__list_metrics",
+                "mcp__query__describe_metric",
+                "mcp__query__search_dimension",
+            ),
+        )
+
+    def test_read_only_tools_expected_prefix_derives_from_the_same_constant_as_the_write_side(
+        self,
+    ) -> None:
+        """单一事实来源（Issue #291 P0-2）：worker 的期望前缀常量与
+        ``adapters/user_environment.py`` 写 ``.mcp.json`` 时使用的默认服务名
+        常量必须是同一个对象，不是两处凑巧写了同一个字符串。"""
+
+        from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME
+        from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX
+
+        self.assertEqual(QUERY_MCP_TOOL_PREFIX, f"mcp__{QUERY_MCP_SERVER_NAME}__")
+
+    def test_importing_worker_config_does_not_pull_in_the_onboarding_orchestration_chain(
+        self,
+    ) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：``apps/worker/
+        config.py`` 此前为了读 ``QUERY_MCP_SERVER_NAME`` 这一个字符串常量，写的是
+        ``from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME``——
+        而 ``adapters/user_environment.py`` 顶部 import 了 ``core/identity/
+        onboarding_runner.py``（首次开通编排，传递拉入身份匹配、花名册、银河、
+        建档等约十二个模块）。worker 是处理每一次真实用户提问的热路径进程，这条
+        闭包与它的职责毫无关系。常量已经挪到零依赖的 ``lingxi.core.mcp_naming``
+        （见该模块文档），本用例在一个干净子解释器里只 import
+        ``lingxi.apps.worker.config``，断言 ``lingxi.core.identity.
+        onboarding_runner`` 与任何 ``lingxi.adapters.*`` 模块都不在结果的 import
+        闭包里——**变异存活证据**：把 ``config.py`` 的 import 改回
+        ``from lingxi.adapters.user_environment import QUERY_MCP_SERVER_NAME``
+        （修复前的写法），本用例会因为两个模块名重新出现在闭包里而变红。
+        """
+
+        probe = (
+            "import sys\n"
+            "import importlib\n"
+            "importlib.import_module('lingxi.apps.worker.config')\n"
+            "for name in sorted(sys.modules):\n"
+            "    if name.startswith('lingxi.'):\n"
+            "        print(name)\n"
+        )
+        source_root = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            path for path in (source_root, environment.get("PYTHONPATH")) if path
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"探测子进程失败：{completed.stderr}",
+        )
+        imported = set(completed.stdout.splitlines())
+        self.assertNotIn(
+            "lingxi.core.identity.onboarding_runner",
+            imported,
+            "worker 的只读工具白名单装配不该拖进整条首次开通编排链",
+        )
+        adapter_modules = {name for name in imported if name.startswith("lingxi.adapters.")}
+        self.assertEqual(
+            adapter_modules,
+            set(),
+            f"worker 的只读工具白名单装配不该 import 任何 adapters 模块，实际：{adapter_modules}",
+        )
+
+    def test_read_only_tools_prefix_must_match_the_query_mcp_server_name(self) -> None:
+        """装配期断言（Issue #291 根因 #1，与 adapters/user_environment.py 的
+        ``QUERY_MCP_SERVER_NAME`` 同一常量来源）：白名单前缀与用户环境
+        ``.mcp.json`` 实际使用的 MCP 服务名不一致时必须启动失败关闭，而不是
+        留到用户提问那一刻才被 PreToolUse 无声拒绝——``mcp__bi-metric__...``
+        正是 2026-08-21 真实事故里写错的那个值。响亮报错要同时带上期望前缀与
+        收到的值，不是只报一个笼统的"配置不合法"。"""
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_WORKER_READONLY_TOOLS="mcp__bi-metric__list_metrics")
+        message = str(caught.exception)
+        self.assertIn("mcp__query__", message)
+        self.assertIn("mcp__bi-metric__list_metrics", message)
 
     def test_builtin_and_delegating_tools_cannot_be_configured_as_the_read_only_tool(self) -> None:
         from lingxi.apps.worker.config import WorkerConfigError
 
         for value in ("Skill", "Agent", "Task", "Read", "Bash"):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
-                self._load(LINGXI_WORKER_READONLY_TOOL=value)
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
 
     def test_trace_id_is_generated_when_not_supplied(self) -> None:
         env = worker_env()
@@ -1181,6 +1313,64 @@ class WorkerConfigTest(unittest.TestCase):
             LINGXI_WORKER_MCP_SERVERS='{"query": {"type": "stdio", "command": "x"}}'
         )
         self.assertEqual(config.mcp_servers, {"query": {"type": "stdio", "command": "x"}})
+
+
+class TerminalOutcomeSinkSeverityTest(unittest.TestCase):
+    """Issue #291 独立审查：queue 模式终态收口日志（``worker.task.terminal``）
+    在这一回合有 ``PreToolUse`` 拒绝时必须提到 ``warning`` 级别，不能和普通
+    成功终态一样淹没在 ``info`` 里——``_terminal_outcome_sink`` 是这条日志
+    唯一的落地出口（见 ``cli.py``），删掉它的级别判断分支会让本用例变红。"""
+
+    def test_a_denied_call_raises_the_log_level_to_warning(self) -> None:
+        from lingxi.apps.worker.cli import _terminal_outcome_sink
+
+        err = io.StringIO()
+        sink = _terminal_outcome_sink(err=err, trace_id="01J00000000000000000000WR3")
+
+        sink(
+            {
+                "task_id": "tsk-1",
+                "failure_code": None,
+                "error_kind": None,
+                "terminal_kind": "success",
+                "output_safety_blocked": False,
+                "output_safety_withheld": False,
+                "output_safety_reasons": (),
+                "denied_count": 1,
+                "denied_tool_names": ("Bash",),
+                "truncated": False,
+            }
+        )
+
+        line = json.loads(err.getvalue().strip())
+        self.assertEqual(line["level"], "warning")
+        self.assertEqual(line["event"], "worker.task.terminal")
+        self.assertEqual(line["denied_count"], 1)
+        self.assertEqual(line["denied_tool_names"], ["Bash"])
+
+    def test_no_denial_stays_at_info(self) -> None:
+        from lingxi.apps.worker.cli import _terminal_outcome_sink
+
+        err = io.StringIO()
+        sink = _terminal_outcome_sink(err=err, trace_id="01J00000000000000000000WR3")
+
+        sink(
+            {
+                "task_id": "tsk-1",
+                "failure_code": None,
+                "error_kind": None,
+                "terminal_kind": "success",
+                "output_safety_blocked": False,
+                "output_safety_withheld": False,
+                "output_safety_reasons": (),
+                "denied_count": 0,
+                "denied_tool_names": (),
+                "truncated": False,
+            }
+        )
+
+        line = json.loads(err.getvalue().strip())
+        self.assertEqual(line["level"], "info")
 
 
 class WorkerResourceGuardTest(unittest.TestCase):
@@ -1482,7 +1672,7 @@ class ReviewHardeningTest(unittest.TestCase):
 
         probe = "Bearer LINGXI_FAKE_SECRET_a1b2c3d4e5f6g7h8"
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOL=probe), stdout=stdout, stderr=stderr)
+        code = main(env=worker_env(LINGXI_WORKER_READONLY_TOOLS=probe), stdout=stdout, stderr=stderr)
 
         self.assertEqual(code, 3)
         self.assertNotIn(probe, stdout.getvalue())

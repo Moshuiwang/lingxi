@@ -59,7 +59,7 @@ GATEWAY_BASE_ENV = {
 }
 WORKER_BASE_ENV = {
     "LINGXI_WORKER_QUESTION": "受控验收夹具契约测试占位问题",
-    "LINGXI_WORKER_READONLY_TOOL": "mcp__bi-metric__list_metrics",
+    "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__list_metrics",
 }
 
 

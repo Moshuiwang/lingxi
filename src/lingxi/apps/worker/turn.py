@@ -2,7 +2,8 @@
 
 本文件是 Issue #37 的全部要点所在：**把已验证的组件真的接起来**。
 
-- ``ToolPolicy``：白名单只含配置里那一个只读 MCP 工具，其余一律默认拒绝；
+- ``ToolPolicy``：白名单只含配置里那些只读 MCP 工具（Issue #291 起支持多值），
+  其余一律默认拒绝；
 - ``TurnAudit``：每回合开始显式 ``start_turn()``——``hooks`` 是会话级的，不翻页的话
   第二回合的终止计数必然从 2 起跳，回合结论也会互相污染（`V-执行-14`）；
 - ``ToolGateway``：经 ``build_hook_matchers()`` 装进真实 ``ClaudeAgentOptions.hooks``，
@@ -84,7 +85,7 @@ class WorkerTurnExecutor:
         propagate_cancellation: bool = False,
     ) -> None:
         self._config = config
-        self._policy = ToolPolicy(allowed_tools=(config.read_only_tool,))
+        self._policy = ToolPolicy(allowed_tools=config.read_only_tools)
         self._audit = TurnAudit(
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
             redactor=AuditRedactor(allowed_input_fields=config.audit_input_fields),
@@ -120,7 +121,7 @@ class WorkerTurnExecutor:
         if self._options is None:
             self._options = build_agent_options(
                 self._gateway,
-                allowed_tools=(self._config.read_only_tool,),
+                allowed_tools=self._config.read_only_tools,
                 max_turns=self._config.max_turns,
                 mcp_servers=self._config.mcp_servers,
                 cwd=self._config.workspace,

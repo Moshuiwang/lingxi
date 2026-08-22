@@ -306,11 +306,34 @@ class DecideFirstContactTest(unittest.TestCase):
                 self.assertIs(decision.outcome, FirstContactOutcome.DIRECTORY_UNAVAILABLE)
                 self.assertIsNone(decision.draft)
                 self.assertFalse(decision.creates_record)
-                self.assertEqual(
-                    decision.message,
-                    "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
-                    "处理完成后我们会通知你。错误码：LX-ONBOARD-001。",
-                )
+                # Issue #280 §7.1：`onboarding.internal_error` 现在带必填的追溯号
+                # 占位（`{reference}`），而这一层判定函数拿不到 trace_id（`decide_
+                # first_contact` 是纯函数，签名里没有它）——`message` 不再即时渲染，
+                # 真正的正文由持有 trace_id 的发送方渲染（见 first_contact.py
+                # `_decision` 与 `FirstContactDecision.message` 字段文档）。
+                self.assertEqual(decision.message, "")
+                self.assertEqual(decision.content_key, "onboarding.internal_error")
+                self.assertTrue(decision.content_version)
+
+    def test_decide_first_contact_does_not_raise_on_directory_unavailable(self) -> None:
+        """先红后绿的天然样本（Issue #280 联合设计 §10.2）：在给
+        `onboarding.internal_error` 加必填占位之前，`_decision` 对这个键的即时渲染
+        必然因为「少传 reference」而抛 `ContentRenderError`——这条用例在那个基线上
+        会红，本次改动（`_decision` 对带占位的键不再即时渲染）让它变绿。显式调用
+        `decide_first_contact`（而不只是走既有 `decide()` 便捷封装）是为了让这条
+        契约独立于其他用例的措辞断言，单独可读。"""
+
+        try:
+            decision = decide_first_contact(
+                open_id="ou_zhang",
+                location=locate_by_open_id("ou_zhang", (member(),)),
+                employment=employed(),
+                directory=DirectoryAvailability.UNAVAILABLE,
+                delegated_subject_open_id=DELEGATED_SUBJECT,
+            )
+        except Exception as error:  # noqa: BLE001 - 本用例的唯一目的就是证明不抛
+            self.fail(f"decide_first_contact 在 DIRECTORY_UNAVAILABLE 分支不应该抛异常：{error!r}")
+        self.assertIs(decision.outcome, FirstContactOutcome.DIRECTORY_UNAVAILABLE)
 
     def test_the_delegated_subject_is_refused_even_when_the_directory_is_unavailable(self) -> None:
         decision = decide(open_id=DELEGATED_SUBJECT, directory=DirectoryAvailability.UNAVAILABLE, location=locate_by_open_id(DELEGATED_SUBJECT, ()))
@@ -457,19 +480,27 @@ class UserFacingMessageTest(unittest.TestCase):
         self.assertEqual(delegated.content_key, "onboarding.delegated_subject")
 
         directory_unavailable = decide(directory=DirectoryAvailability.UNAVAILABLE)
-        self.assertEqual(
-            directory_unavailable.message,
-            "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。"
-            "处理完成后我们会通知你。错误码：LX-ONBOARD-001。",
-        )
+        # 同上：带必填占位的键不在本层即时渲染，见 test_an_unavailable_or_stale_
+        # directory_gives_a_terminal_state_without_a_draft 的完整理由。
+        self.assertEqual(directory_unavailable.message, "")
         self.assertEqual(directory_unavailable.content_key, "onboarding.internal_error")
 
     def test_every_outcome_has_a_non_empty_chinese_message(self) -> None:
+        """`DIRECTORY_UNAVAILABLE` 是本条断言唯一的已知例外：它的键带必填的追溯号
+        占位，本层判定函数拿不到 trace_id，因此 `message` 字段刻意留空（见
+        `FirstContactDecision.message` 字段文档）——正文由持有 trace_id 的发送方
+        渲染，不代表这条终态真的没有话说。"""
+
         seen = set()
         for decision in self._all_decisions():
             with self.subTest(outcome=decision.outcome):
-                self.assertTrue(decision.message.strip())
-                self.assertTrue(any("一" <= character <= "鿿" for character in decision.message))
+                if decision.outcome is FirstContactOutcome.DIRECTORY_UNAVAILABLE:
+                    self.assertEqual(decision.message, "")
+                else:
+                    self.assertTrue(decision.message.strip())
+                    self.assertTrue(
+                        any("一" <= character <= "鿿" for character in decision.message)
+                    )
             seen.add(decision.outcome)
 
         self.assertEqual(seen, set(FirstContactOutcome))

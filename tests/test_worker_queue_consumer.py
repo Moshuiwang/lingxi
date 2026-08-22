@@ -99,7 +99,7 @@ for _fixture_user_id in ("usr-1", "usr-90", "usr-91"):
 def worker_config(**overrides: object) -> WorkerConfig:
     values: dict[str, object] = {
         "question": "",
-        "read_only_tool": "mcp__q__read",
+        "read_only_tools": ("mcp__q__read",),
         "trace_id": "01J00000000000000000000000",
         "turn_timeout_seconds": 1.0,
         "worker_id": "worker-test",
@@ -1164,6 +1164,93 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertNotIn(forbidden_content_sample, serialized)
         self.assertNotIn(queue.context.user_id, serialized)
         self.assertNotIn(queue.context.prompt, serialized)
+
+    def test_terminal_outcome_callback_reports_denied_tool_calls_even_on_a_successful_turn(
+        self,
+    ) -> None:
+        """Issue #291 独立审查：``tool_policy.py`` 的拒绝文案对用户承诺"这是
+        系统侧的临时限制、问题已经被记录"，但此前 queue 链路从未把
+        ``report["audit"]["denied_count"]``（``report.py`` 早就算出来了）写进
+        任何运维可见的地方——模型撞上一次越界工具、自己绕过继续把回合正常
+        收口时（这正是设计要它做的事），运维在生产 stderr 里看不到任何一次
+        拒绝的痕迹，只有靠用户反馈才会发现白名单配错（真实事故复现路径）。
+
+        本用例模拟这个"回合仍然成功收口，但中途有一次拒绝"的真实形状：
+        断言 ``on_terminal_outcome`` 收到的字段里出现了这次拒绝的计数与工具
+        名，且不泄漏被拒调用的入参。删掉 ``service.py`` 里 ``_denied_tool_
+        summary``/``_process_task`` 对它的调用，或 ``_log_terminal_outcome``
+        里对应的字段，都必须让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "日活是 1024；另一部分我无法查询。",
+                        "session_id": "new-session",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                    },
+                    "audit": {
+                        "denied_count": 1,
+                        "denied": [
+                            {
+                                "tool_name": "Bash",
+                                "deny_reason_code": "not_in_whitelist",
+                                "allowed": False,
+                                "executed": False,
+                                "tool_input": {},
+                                "error": None,
+                                "result_kind": None,
+                            }
+                        ],
+                    },
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(sink.calls), 1)
+        fields = sink.calls[0]
+        self.assertEqual(fields["terminal_kind"], "success")
+        self.assertEqual(fields["denied_count"], 1)
+        self.assertEqual(fields["denied_tool_names"], ("Bash",))
+
+    def test_terminal_outcome_callback_reports_no_denials_when_none_happened(self) -> None:
+        """否定测试：正常回合（没有任何 ``PreToolUse`` 拒绝）不得凭空报出拒绝，
+        避免上一条用例的字段被恒真实现（例如把 ``denied_count`` 写死为 1）
+        蒙混过关。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "日活是 1024。", "session_id": "s"},
+                    "audit": {"denied_count": 0, "denied": []},
+                    "failure": None,
+                }
+
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+
+        fields = sink.calls[0]
+        self.assertEqual(fields["denied_count"], 0)
+        self.assertEqual(fields["denied_tool_names"], ())
 
     def test_terminal_outcome_callback_caps_failure_code_and_reason_length(self) -> None:
         """Issue #90 评论 5306860255 独立复核 P3-2：``failure_code`` 与

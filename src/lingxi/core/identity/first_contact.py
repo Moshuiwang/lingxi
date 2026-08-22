@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from lingxi.config.content import default_content_catalog
+from lingxi.config.content import ContentRenderError, default_content_catalog
 from lingxi.core.identity.org_snapshot import DirectoryAvailability, SnapshotMember, index_members_by_open_id
 
 
@@ -141,6 +141,12 @@ class IdentityRecordDraft:
 @dataclass(frozen=True)
 class FirstContactDecision:
     outcome: FirstContactOutcome
+    #: **历史遗留字段，生产中没有任何消费方**（全仓只有
+    #: ``core/permission/notification.py`` 读 ``content_key``；``onboarding_runner._locate``
+    #: 只用 ``outcome``/``failure_reason``）。对于带必填占位（如追溯号 ``{reference}``）的
+    #: 文案键，本字段留空——判定层拿不到 ``trace_id``（:func:`decide_first_contact` 是纯
+    #: 函数，签名里没有它），也不该猜一个假值出来渲染。真正的正文由持有 ``trace_id`` 的
+    #: 发送方按 ``content_key`` 渲染（见 Issue #280 联合设计 §7.1）。
     message: str
     content_key: str = ""
     content_version: str = ""
@@ -158,6 +164,11 @@ _MESSAGE_KEYS: dict[FirstContactOutcome, str] = {
     FirstContactOutcome.DELEGATED_SUBJECT_IGNORED: "onboarding.delegated_subject",
     FirstContactOutcome.DIRECTORY_UNAVAILABLE: "onboarding.internal_error",
 }
+
+#: 带必填占位（追溯号 ``{reference}``）、不能在本模块即时渲染的文案键（Issue #280
+#: §7.1）。``_decision`` 只确认键存在、取版本号，不渲染正文——渲染需要 ``trace_id``，
+#: 而这条判定链路是纯函数，拿不到它。
+_DEFERRED_RENDER_KEYS: frozenset[str] = frozenset({"onboarding.internal_error"})
 
 
 def _blank(value: object) -> bool:
@@ -227,7 +238,23 @@ def _decision(
     draft: IdentityRecordDraft | None = None,
     failure_reason: FailureReason | None = None,
 ) -> FirstContactDecision:
-    content = default_content_catalog().text(_MESSAGE_KEYS[outcome])
+    catalog = default_content_catalog()
+    key = _MESSAGE_KEYS[outcome]
+    if key in _DEFERRED_RENDER_KEYS:
+        # 不即时渲染：该键要求 `reference`（追溯号），而这层判定函数没有 trace_id
+        # 可传。只确认键真的登记在目录里、取当前版本号——两者是审计真正消费的事实
+        # （见 FirstContactDecision.message 字段文档）。
+        if key not in catalog.text_keys():
+            raise ContentRenderError("unregistered content key")
+        return FirstContactDecision(
+            outcome=outcome,
+            message="",
+            content_key=key,
+            content_version=catalog.version,
+            draft=draft,
+            failure_reason=failure_reason,
+        )
+    content = catalog.text(key)
     return FirstContactDecision(
         outcome=outcome,
         message=content.text,

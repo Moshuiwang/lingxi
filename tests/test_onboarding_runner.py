@@ -378,6 +378,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "notifier": FakeNotifier(),
         "ledger": FakeLedger(),
         "audit": RecordingAudit(),
+        "onboarding_failed": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -407,6 +408,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         clock=overrides.get("clock", lambda: datetime(2026, 8, 18, tzinfo=UTC)),
         should_stop=overrides.get("should_stop", lambda: False),
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
+        onboarding_failed=parts["onboarding_failed"],
     )
     return runner, parts
 
@@ -573,12 +575,16 @@ class ThreadingTests(unittest.TestCase):
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertEqual(result.failure_reason, "executor_unavailable")
         self.assertIn("onboarding.rejected_by_executor", parts["audit"].actions())
+        # Issue #280 §7.1 渲染点 3：即使链从未真正开始跑，同步返回的终态也必须带
+        # 上这一次的追溯号——否则"少发一条"的情形恰好是最需要它的情形。
+        self.assertEqual(dict(result.messages[0].values), {"reference": "t1"})
 
     def test_stopping_declines_new_chains(self) -> None:
         runner, parts = build_runner(should_stop=lambda: True)
         result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertIn("onboarding.start_declined_while_stopping", parts["audit"].actions())
+        self.assertEqual(dict(result.messages[0].values), {"reference": "t1"})
 
 
 class DeterministicRejectionTests(unittest.TestCase):
@@ -662,6 +668,9 @@ class InternalFaultTests(unittest.TestCase):
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
         self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], reason)
         self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        # Issue #280 §7.1：本侧故障终态必须带上本次事件的追溯号（`run_once` 固定用
+        # `trace_id="trace_1"`），且不泄露内部原因码（只有 `reference` 一个变量）。
+        self.assertEqual(parts["notifier"].terminal()[2], {"reference": "trace_1"})
 
     def test_directory_unavailable(self) -> None:
         parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
@@ -730,12 +739,145 @@ class InternalFaultTests(unittest.TestCase):
         self._assert_internal(parts, "unexpected_ZeroDivisionError")
 
 
+class OnboardingFailedAlertCallbackTests(unittest.TestCase):
+    """管理员送达（Issue #280 §7.3 步 1；`SYNC_TIMEOUT` 覆盖见独立审查 codex
+    P1-3）：只在真正走到 `INTERNAL_ERROR` 或 `SYNC_TIMEOUT` 终态时调用一次注入的
+    可选回调，签名 `(reason, trace_id)`，不含 open_id / 姓名 / 任何资料值——
+    `SYNC_TIMEOUT` 的专用用例在 `SyncTimeoutTests` 里（离它自己的终态断言更近）。"""
+
+    def test_an_internal_error_terminal_triggers_the_callback_exactly_once(self) -> None:
+        calls: list[tuple[str, str]] = []
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        self.assertEqual(calls, [("directory_unavailable", "trace_1")])
+
+    def test_a_non_failure_terminal_never_triggers_the_callback(self) -> None:
+        """否定断言：成功终态不得产生告警——回调签名里也没有"成功"这个概念，
+        本测试证明它压根不会被调用。"""
+
+        calls: list[tuple[str, str]] = []
+        run_once(onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)))
+        self.assertEqual(calls, [], "开通完成不应该触发管理员告警")
+
+    def test_the_callback_never_receives_open_id_or_profile_values(self) -> None:
+        """回调签名里根本没有传 open_id/姓名的位置——这里用真实签名反证：
+        两个位置参数只可能是内部原因码与追溯号，两者都不是资料值。"""
+
+        received: dict[str, Any] = {}
+
+        def capture(reason: str, trace_id: str) -> None:
+            received["reason"] = reason
+            received["trace_id"] = trace_id
+
+        run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=capture,
+        )
+        self.assertNotIn(OPEN_ID, received.values())
+        self.assertEqual(set(received), {"reason", "trace_id"})
+
+    def test_a_raising_callback_does_not_break_notification_or_ledger(self) -> None:
+        """否定断言：告警回调失败不得带走用户结论——**故意破坏**确认变红的对照组是
+        「没有这条 try/except 时同一用例会抛穿 `_execute`」。"""
+
+        def boom(reason: str, trace_id: str) -> None:
+            raise RuntimeError("alert sink down")
+
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            onboarding_failed=boom,
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
+        self.assertIn("onboarding.alert_callback_failed", parts["audit"].actions())
+
+    def test_no_callback_injected_keeps_prior_behavior(self) -> None:
+        """默认 `onboarding_failed=None`：不注入时用户仍然收到冻结文案，只是没有
+        任何东西送到管理群（此前的行为，行为不变）。"""
+
+        parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+
+    def test_the_synchronous_stopping_terminal_also_triggers_the_callback(self) -> None:
+        """独立审查（分支 fix/291-280-user-experience 收尾）：``start()`` 在
+        ``should_stop()`` 为真时**同步**返回 ``INTERNAL_ERROR``，从不经过
+        ``_execute``。此前只有 ``_execute`` 自己的 ``INTERNAL_ERROR`` 分支接了
+        这个回调，这条同步分支被漏掉——用户看到「已转交管理员处理」，管理群
+        实际上什么都没收到。"""
+
+        calls: list[tuple[str, str]] = []
+        runner, parts = build_runner(
+            should_stop=lambda: True,
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(calls, [("stopping", "t1")])
+
+    def test_the_synchronous_executor_unavailable_terminal_also_triggers_the_callback(
+        self,
+    ) -> None:
+        """同一条独立审查：提交执行器失败（队列满/执行器已停）同样是**同步**
+        返回的 ``INTERNAL_ERROR``，同样此前从未触发管理员送达回调。"""
+
+        calls: list[tuple[str, str]] = []
+        runner, parts = build_runner(
+            executor=InlineExecutor(accept=False),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(calls, [("executor_unavailable", "t1")])
+
+    def test_a_raising_callback_on_the_synchronous_stopping_terminal_does_not_break_start(
+        self,
+    ) -> None:
+        """否定断言，与 ``_execute`` 那条对照组同一形状：告警回调失败不得让
+        ``start()`` 本身抛穿——用户仍然要拿到一个明确的终态返回值。"""
+
+        def boom(reason: str, trace_id: str) -> None:
+            raise RuntimeError("alert sink down")
+
+        runner, parts = build_runner(should_stop=lambda: True, onboarding_failed=boom)
+        result = runner.start(event_id="evt_1", open_id=OPEN_ID, trace_id="t1")
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertIn("onboarding.alert_callback_failed", parts["audit"].actions())
+
+
 class SyncTimeoutTests(unittest.TestCase):
     """`V-开通-13`：十五分钟同步超时是**专用**终态，不与内部故障码混淆。"""
 
     def test_timed_out_uses_the_dedicated_text_and_stays_in_mcp_syncing(self) -> None:
         parts, _ = run_once(readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT))
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "sync_timeout")
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
+        # Issue #280 裁定 B2-4：`onboarding.sync_timeout` 也加追溯号。
+        self.assertEqual(parts["notifier"].terminal()[2], {"reference": "trace_1"})
+        self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
+        self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
+
+    def test_a_sync_timeout_terminal_also_triggers_the_admin_callback(self) -> None:
+        """独立审查 codex P1-3：产品合同对同步超时的措辞同样是"停止自动等待，
+        转交管理员处理"（``docs/产品合同与外部边界.md``「权限同步期间」一节），
+        与 ``INTERNAL_ERROR`` 分支承诺的"已转交管理员处理"是同一句产品承诺——
+        此前只有后者真的送达管理群，``sync_timeout`` 这句承诺背后没有任何送达
+        动作。``reason`` 用 ``mcp_sync_timeout``，与内部故障的原因码（如
+        ``directory_unavailable``）可区分，管理员据此分得清"这是同步超时在等"
+        还是"这是本侧真的坏了"。这条断言只覆盖告警侧，**不改变**
+        ``late_readiness_recovery`` 的自动恢复语义：``provisioning_state`` 仍然
+        停在 ``mcp_syncing``，不会因为这条告警被推进。"""
+
+        calls: list[tuple[str, str]] = []
+        parts, _ = run_once(
+            readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        self.assertEqual(calls, [("mcp_sync_timeout", "trace_1")])
         self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
         self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
         self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
@@ -1263,6 +1405,15 @@ class ConstructionTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             AutoOnboardingRunner(
                 submit=lambda task: True, sleep=None, **self._parts()  # type: ignore[arg-type]
+            )
+
+    def test_a_non_callable_onboarding_failed_is_refused_at_construction(self) -> None:
+        with self.assertRaises(TypeError):
+            AutoOnboardingRunner(
+                submit=lambda task: True,
+                sleep=lambda seconds: None,
+                onboarding_failed="not-callable",  # type: ignore[arg-type]
+                **self._parts(),
             )
 
 

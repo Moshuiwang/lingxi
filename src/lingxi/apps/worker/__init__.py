@@ -12,6 +12,6 @@ hook 回调、工具回执、最终正文和终止结果全部汇入同一个回
 
 用法::
 
-    LINGXI_WORKER_QUESTION=... LINGXI_WORKER_READONLY_TOOL=mcp__... \\
+    LINGXI_WORKER_QUESTION=... LINGXI_WORKER_READONLY_TOOLS=mcp__query__list_metrics,... \\
         python -m lingxi.apps.worker
 """

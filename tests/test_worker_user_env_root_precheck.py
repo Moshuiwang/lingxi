@@ -38,7 +38,7 @@ from lingxi.apps.worker.cli import EXIT_CONFIG_ERROR, _ensure_user_env_root_avai
 def _worker_queue_env(**overrides: str) -> dict[str, str]:
     env = {
         "LINGXI_WORKER_MODE": "queue",
-        "LINGXI_WORKER_READONLY_TOOL": "mcp__ci_probe__noop",
+        "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
         "LINGXI_WORKER_TRACE_ID": "01J00000000000000000000WKR",
         # 这个变量名合法、但从不会被真正连接：失败路径在 LINGXI_USER_ENV_ROOT
         # 检查处提前返回，成功路径由 `_run_queue_worker` 打桩接管，两者都不会
@@ -217,7 +217,7 @@ class QueueModeUserEnvRootPrecheckTests(unittest.TestCase):
             env={
                 "LINGXI_WORKER_MODE": "turn",
                 "LINGXI_WORKER_QUESTION": "近 7 天的活跃用户数是多少？",
-                "LINGXI_WORKER_READONLY_TOOL": "mcp__ci_probe__noop",
+                "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
             },
             stdout=stdout,
             stderr=stderr,

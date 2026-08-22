@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-18-2"
+version = "2026-08-21"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -11,9 +11,20 @@ version = "2026-08-18-2"
 "onboarding.syncing" = "已核对到你的银河权限，正在完成 Lingxi 开通和权限同步。权限正在同步，预计最多需要十五分钟，无需重复开通。同步完成后会通知你。"
 "onboarding.completed" = "开通完成，你现在可以开始使用 Lingxi。当前可用范围：公司：{company_name}；职能：{function_name}。"
 "onboarding.not_authorized" = "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 Lingxi 使用。Lingxi 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
-"onboarding.sync_timeout" = "权限同步未完成，已转交处理，无需重复开通"
-"onboarding.internal_error" = "当前暂时无法完成开通，已转交管理员处理，请不要重复发送。处理完成后我们会通知你。错误码：LX-ONBOARD-001。"
+# Issue #280 裁定 B2-4：加追溯号，占位名不能叫 trace_id（内容安全规则见 content.py
+# 的 _PROCESS_MARKER_PATTERN，用 {reference} 代替，见联合设计 §0.1）。
+"onboarding.sync_timeout" = "权限同步未完成，已转交处理，无需重复开通。追溯号：{reference}。"
+# Issue #280 裁定 B2-1：去掉「请不要重复发送」这一句劝阻语义（与再发一条消息即可
+# 自愈的路径直接矛盾），改成允许并引导稍后重试；同一裁定要求把「已转交管理员处理」
+# 落成真话（见 apps/scheduler/assembly.py 的 AlertKind.ONBOARDING_FAILED 送达接线），
+# 因此这句话予以保留。裁定 B2-3 确认「追溯号」标签与逐字参考措辞。
+"onboarding.internal_error" = "当前暂时无法完成开通，已转交管理员处理，你可以稍后重新发送消息重试。处理完成后我们会通知你。错误码：LX-ONBOARD-001，追溯号：{reference}。"
 "onboarding.delegated_subject" = "这个账号是组织资料同步的专用账号，不提供问数服务，也不会建立使用记录。"
+# Issue #280 裁定 B2-2：开通中途停摆收口（StalledProvisioningDuty，Issue #282）此前
+# 复用 onboarding.internal_error 逐字发送；产品负责人要求新增专用文案，说明等待已久
+# 无结果、可以再发一条消息重新开始，而不是继续套用一般性的「内部故障」措辞。错误码
+# 与追溯号沿用同一家族（裁定 B2-4：不新增第二个错误码）。
+"onboarding.stalled" = "距离你发起开通已经过了较长时间，仍然没有得到结果，本次已经停止等待。你可以再发一条消息重新开始。错误码：LX-ONBOARD-001，追溯号：{reference}。"
 
 "gateway.busy_hint" = "当前任务仍在处理中"
 "gateway.suspended" = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"

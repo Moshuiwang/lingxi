@@ -89,6 +89,7 @@ def build(
     token: Any = None,
     metric_translation_map: Any = None,
     permission_publish: Any = _WIRED_PERMISSION_PUBLISH,
+    onboarding_failed: Any = None,
 ) -> tuple[Any, RecordingAudit]:
     audit = RecordingAudit()
     duty = _build_onboarding_duty(
@@ -105,6 +106,7 @@ def build(
         # 已装配"——本文件其余用例守的是别的前置，不该被这条新增的不变量挡住。
         # ``AssemblyInvariantTests`` 单独测这条不变量本身。
         permission_publish=permission_publish,
+        onboarding_failed=onboarding_failed,
     )
     return duty, audit
 
@@ -287,6 +289,33 @@ class PublishGateWiringTests(unittest.TestCase):
         self.assertTrue(duty._onboarding._publish_allowed())
         mapping.clear()
         self.assertFalse(duty._onboarding._publish_allowed(), "闸门读的不是同一个对象引用")
+
+
+class OnboardingFailedWiringTests(unittest.TestCase):
+    """管理员送达（Issue #280 §7.3 步 1）：`_build_onboarding_duty` 收到的
+    ``onboarding_failed`` 必须原样交给 `AutoOnboardingRunner`，不是就地丢弃或
+    替换成别的东西。"""
+
+    def test_defaults_to_none_when_not_wired(self) -> None:
+        """调用方（``build_loop``）没有装配告警职责时保持 ``None``——「已转交管理员
+        处理」这句话此前就是这个默认值，行为不变。"""
+
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token")
+
+        self.assertIsNone(duty._onboarding._onboarding_failed)
+
+    def test_reaches_the_runner_when_provided(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        duty, _ = build(
+            WIRED_ENV,
+            token=lambda: "u-token",
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+
+        assert duty._onboarding._onboarding_failed is not None
+        duty._onboarding._onboarding_failed("directory_unavailable", "trc_1")
+        self.assertEqual(calls, [("directory_unavailable", "trc_1")])
 
 
 class ClaimCapacityTests(unittest.TestCase):
@@ -494,6 +523,24 @@ class StalledProvisioningAssemblyTests(unittest.TestCase):
         self.assertEqual(duty.name, "开通中途停摆收口")
         self.assertTrue(duty.notifier_wired, "飞书应用凭据是必填配置，通知出口总能建出来")
         self.assertEqual(audit.records, [], "装配阶段没有任何前置缺项，不该留下任何审计")
+        self.assertIsNone(duty._alert, "调用方没有装配告警职责时保持 None，行为不变")
+
+    def test_the_alert_callback_reaches_the_duty_when_provided(self) -> None:
+        """Issue #280 §7.3 步 2：`_build_stalled_provisioning_duty` 收到的 ``alert``
+        必须原样交给 `StalledProvisioningDuty`。"""
+
+        calls: list[int] = []
+
+        duty = _build_stalled_provisioning_duty(
+            SchedulerConfig.from_env(BASE_ENV),
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            alert=calls.append,
+        )
+
+        assert duty._alert is not None
+        duty._alert(2)
+        self.assertEqual(calls, [2])
 
 
 class ExecutorTests(unittest.TestCase):
@@ -849,6 +896,151 @@ class InvariantBuildLoopTests(unittest.TestCase):
             ("onboarding.duty_not_registered", {"reason": "permission_publish_not_wired"}),
             audit.records,
         )
+
+    def test_a_provided_alerting_duty_wires_both_onboarding_alert_callbacks(self) -> None:
+        """Issue #280 §7.3：`build_loop(alerting_duty=...)` 必须把
+        `onboarding_failed_callback()`/`onboarding_stalled_callback()` 接到刚构造出的
+        开通编排与停摆收口职责上——不是构造了 `AlertingDuty` 却没人真的用它。"""
+
+        import tempfile
+        from pathlib import Path
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.apps.scheduler import build_loop
+        from lingxi.core.alerting import AlertDispatcher, AlertingDuty, AlertManager
+
+        class _NoopSender:
+            def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+                pass
+
+        credential_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(credential_dir.cleanup)
+        user_env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(user_env_dir.cleanup)
+
+        env = {
+            **WIRED_ENV,
+            "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+            "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(credential_dir.name) / "delegated.enc"),
+            "LINGXI_USER_ENV_ROOT": user_env_dir.name,
+            # 发布面也要接线，否则 permission_publish.publish_wired 为 False，
+            # 装配不变量会让开通编排整体不注册——本用例要的是「onboarding 真的在
+            # 职责列表里」，不是复现 `test_onboarding_is_absent_when_only_the_
+            # readiness_side_is_wired` 那条反向用例。
+            "LINGXI_PERMISSION_BITABLE_APP_TOKEN": "bascnFakeToken",
+            "LINGXI_PERMISSION_BITABLE_TABLE_ID": "tblFakeTable",
+        }
+        alerting_duty = AlertingDuty(
+            manager=AlertManager(),
+            dispatcher=AlertDispatcher(sender=_NoopSender(), chat_id="oc_group"),
+        )
+
+        loop = build_loop(
+            SchedulerConfig.from_env(env),
+            roster_access_token=lambda: "employment-token",
+            alerting_duty=alerting_duty,
+        )
+        self.addCleanup(loop.request_stop)
+
+        onboarding = next(duty for duty in loop.duties if duty.name == "未开通首聊交接对账")
+        stalled = next(duty for duty in loop.duties if duty.name == "开通中途停摆收口")
+
+        self.assertIsNotNone(onboarding._onboarding._onboarding_failed)
+        self.assertIsNotNone(stalled._alert)
+        # 两个回调必须真的可用（不是占位符）：调用一次不应该抛异常。
+        onboarding._onboarding._onboarding_failed("directory_unavailable", "trc_1")
+        stalled._alert(1)
+
+    def _wired_env(self) -> dict[str, str]:
+        """独立审查 codex P1-4 两条用例共用的装配夹具：`WIRED_ENV` 加上让开通编排
+        真的注册所需的凭据卷路径与权限表 Base 坐标（同
+        ``test_a_provided_alerting_duty_wires_both_onboarding_alert_callbacks``）。"""
+
+        import tempfile
+        from pathlib import Path
+
+        from cryptography.fernet import Fernet
+
+        credential_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(credential_dir.cleanup)
+        user_env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(user_env_dir.cleanup)
+
+        return {
+            **WIRED_ENV,
+            "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+            "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(credential_dir.name) / "delegated.enc"),
+            "LINGXI_USER_ENV_ROOT": user_env_dir.name,
+            "LINGXI_PERMISSION_BITABLE_APP_TOKEN": "bascnFakeToken",
+            "LINGXI_PERMISSION_BITABLE_TABLE_ID": "tblFakeTable",
+        }
+
+    def test_onboarding_registered_without_an_admin_group_warns_once(self) -> None:
+        """独立审查 codex P1-4：`LINGXI_ADMIN_GROUP_CHAT_ID` 未配置时，「已转交管理员
+        处理」这句用户承诺背后的送达出口会退化为仅日志（`V-告警-08`）——开通职责一旦
+        真的注册（会真的产生 `INTERNAL_ERROR`/`SYNC_TIMEOUT` 终态），装配期必须留一条
+        响亮 WARNING，不能让这个组合悄悄运行。不失败关闭：`build_loop` 正常返回。"""
+
+        from lingxi.apps.scheduler import build_loop
+
+        env = self._wired_env()
+        self.assertNotIn("LINGXI_ADMIN_GROUP_CHAT_ID", env)
+        audit = RecordingAudit()
+
+        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+            loop = build_loop(
+                SchedulerConfig.from_env(env),
+                roster_access_token=lambda: "employment-token",
+                audit=audit,
+            )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertIn("未开通首聊交接对账", names, "本用例的前提是开通编排真的注册了")
+        self.assertTrue(
+            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            captured.output,
+        )
+        self.assertIn(
+            (
+                "onboarding.admin_alert_channel_missing",
+                {
+                    "reason": "missing_environment_variable",
+                    "variable": "LINGXI_ADMIN_GROUP_CHAT_ID",
+                },
+            ),
+            audit.records,
+        )
+
+    def test_onboarding_registered_with_an_admin_group_does_not_warn(self) -> None:
+        """否定断言的对照组：配了 `LINGXI_ADMIN_GROUP_CHAT_ID` 之后，同一条组合不再
+        产生这条警告或审计——证明判据真的挂在配置上，不是恒定触发。"""
+
+        from lingxi.apps.scheduler import build_loop
+
+        env = {**self._wired_env(), "LINGXI_ADMIN_GROUP_CHAT_ID": "oc_admin_group"}
+        audit = RecordingAudit()
+
+        # 本用例的环境仍然没配花名册 Base 坐标，会各自留一条与本条无关的 WARNING
+        # （见 ``_build_roster_audit_duty``/``_build_roster_snapshot_sync_duty``）；
+        # 因此不能用「完全没有 WARNING」做判据，只断言**这一条**（提到
+        # ``LINGXI_ADMIN_GROUP_CHAT_ID`` 的那条）没有出现。
+        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+            loop = build_loop(
+                SchedulerConfig.from_env(env),
+                roster_access_token=lambda: "employment-token",
+                audit=audit,
+            )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertIn("未开通首聊交接对账", names)
+        self.assertFalse(
+            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            captured.output,
+        )
+        self.assertNotIn("onboarding.admin_alert_channel_missing", audit.actions())
 
 
 class SchedulerConfigTests(unittest.TestCase):

@@ -871,7 +871,7 @@ class WorkerServiceHousekeepingIntegrationTests(DeliveryOutboxTestCase):
         self.seed_terminal_event(task_id="tsk-1", created_at_sql="now() - interval '25 hours'")
 
         config = WorkerConfig(
-            question="", read_only_tool="mcp__q__read", trace_id="01J00000000000000000000000",
+            question="", read_only_tools=("mcp__q__read",), trace_id="01J00000000000000000000000",
             turn_timeout_seconds=1.0, worker_id="worker-1", target_worker_version="stable",
         )
         service = WorkerService(config=config, queue=self.queue)
