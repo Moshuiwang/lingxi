@@ -41,6 +41,11 @@ class AlertKind(str, Enum):
     # 是两类不同的运维动作，因此独立成一个告警类型（Issue #153 最小可观测性第四类）。
     WORKER_VERSION_UNAVAILABLE = "worker_version_unavailable"
     FEISHU_SEND_FAILED = "feishu_send_failed"
+    # 首次开通失败需要管理员核查（Issue #280 §7.3）——此前 `LINGXI_ADMIN_GROUP_CHAT_ID`
+    # 的全部消费方都与开通失败无关，「已转交管理员处理」这句用户文案背后没有任何送达
+    # 动作。这一格补上开通失败（本侧故障终态 `LX-ONBOARD-001`）以及开通中途停摆收口的
+    # 送达面。
+    ONBOARDING_FAILED = "onboarding_failed"
 
 
 class NoticeAction(str, Enum):
@@ -148,6 +153,20 @@ def _category(value: str, field: str) -> str:
     if not isinstance(value, str) or not _SAFE_CATEGORY.fullmatch(value):
         raise ValueError(f"{field} 必须是安全的类别标识")
     return value
+
+
+def _safe_scope(raw: str, *, fallback_prefix: str) -> str:
+    """把任意字符串归一成 ``AlertSignal.scope`` 允许的安全类别标识。
+
+    与 ``AlertingDuty.delivery_alert_callback`` 里内联的同型归一化同一个理由：调用方
+    （开通编排的 ``failure_reason``、异常类名拼出的 ``unexpected_ValueError`` 之类）
+    完全不受这里的格式约束，归一失败绝不能让告警回调本身抛出异常打断调用方的主流程。
+    """
+
+    scope = re.sub(r"[^a-z0-9_.-]", "_", (raw or "unknown").lower())[:64]
+    if not scope or not scope[0].isalpha():
+        scope = f"{fallback_prefix}_{scope}"[:64]
+    return scope
 
 
 @dataclass(frozen=True)
@@ -695,6 +714,51 @@ class AlertingDuty:
             self._submit(notices)
 
         return outcome
+
+    def onboarding_failed_callback(self) -> Callable[[str, str], None]:
+        """返回给首次开通编排的失败回调（Issue #280 §7.3 步 1）。
+
+        群消息只含**故障类别**（内部原因码 ``reason``，经归一化，不是自由文本）、
+        **计数**与**追溯号**（``trace_id``）；不接受、也不可能接受 open_id、姓名或
+        任何资料值——回调签名里根本没有这些参数的位置。归一化失败（``reason`` 或
+        ``trace_id`` 不满足 ``AlertSignal`` 的安全格式）不抛出，退化为不带
+        ``trace_id`` 的信号，不让一次格式意外打断整条开通链的收尾。
+        """
+
+        def report(reason: str, trace_id: str) -> None:
+            scope = _safe_scope(reason, fallback_prefix="onboarding")
+            at = _as_utc(self._clock())
+            try:
+                signal = AlertSignal(
+                    kind=AlertKind.ONBOARDING_FAILED, observed_at=at, scope=scope, trace_id=trace_id
+                )
+            except ValueError:
+                signal = AlertSignal(kind=AlertKind.ONBOARDING_FAILED, observed_at=at, scope=scope)
+            self._submit(self._manager.observe(signal))
+
+        return report
+
+    def onboarding_stalled_callback(self) -> Callable[[int], None]:
+        """返回给「开通中途停摆收口」的计数回调（Issue #280 §7.3 步 2）。
+
+        「有人卡住了」此前没有任何审计信号会送到管理群——这里只报一轮里真正被收口
+        的候选**聚合计数**，不含 user_id、open_id 或任何单个候选的追溯号（聚合批次
+        没有单一追溯号可代表这一整批）。
+        """
+
+        def report(count: int) -> None:
+            if count <= 0:
+                return
+            at = _as_utc(self._clock())
+            signal = AlertSignal(
+                kind=AlertKind.ONBOARDING_FAILED,
+                observed_at=at,
+                scope="stalled_provisioning",
+                count=count,
+            )
+            self._submit(self._manager.observe(signal))
+
+        return report
 
     def delivery_alert_callback(self) -> Callable[[str, str], None]:
         """返回给 Gateway ``DeliveryConsumer.on_alert`` 的回调（Issue #153）。

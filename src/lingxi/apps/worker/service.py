@@ -52,6 +52,9 @@ TaskStuckCallback = Callable[[str, int], None]
 # 不能自己直接调 `logging`。
 TerminalOutcomeCallback = Callable[[Mapping[str, object]], None]
 _MAX_LOG_TOKEN_CHARS = 64
+# 独立审查（Issue #291 拒绝文案对用户承诺"问题已经被记录"）：一次回合里模型
+# 可能反复撞同一个越界工具，工具名列表上界防止一次异常回合把收口日志撑大。
+_MAX_LOG_DENIED_TOOL_NAMES = 20
 
 
 def _cap_log_token(value: str) -> tuple[str, bool]:
@@ -65,6 +68,49 @@ def _cap_log_token(value: str) -> tuple[str, bool]:
     if len(value) <= _MAX_LOG_TOKEN_CHARS:
         return value, False
     return value[:_MAX_LOG_TOKEN_CHARS], True
+
+
+def _denied_tool_summary(report: Mapping[str, Any]) -> tuple[int, tuple[str, ...]]:
+    """从一次回合报告里取出被拒工具调用的计数与工具名（独立审查，Issue #291）。
+
+    ``tool_policy.py`` 的拒绝文案对用户承诺"这是系统侧的临时限制、问题已经被
+    记录"，但此前这句话只在 ``LINGXI_WORKER_MODE=turn``（受控验证用的单回合
+    模式）里是真的——``report["audit"]["denied_count"]`` 早就算出来了
+    （见 ``report.py``），真正处理用户任务的 queue 模式（``_process_task``）却
+    从未把它读出来过，运维在生产 stderr 里看不到任何一次拒绝，白名单配错时
+    只能像 #291 真实事故那样靠用户反馈才发现。这里只取计数与工具名——不取
+    ``tool_input``，工具参数正文与用户资料值不属于这条低敏审计事件。
+
+    ``report["audit"]`` 在早退分支（开工前已 ``stop_requested``、读用户 MCP
+    配置失败、执行器抛出未预期异常）不存在——这些分支从未真正跑过一次
+    ``PreToolUse`` 判定，取不到就如实记 0/空，不假装有据可查。
+
+    **已知边界（独立审查 codex P2-A5，如实登记、不修）**：与上一段"从未跑过判定"
+    不同的是另一种时序——这一回合**已经**发生过至少一次真实的 ``PreToolUse``
+    拒绝，但 executor 在拒绝**之后**异常退出（未预期异常，落进本文件顶部
+    ``except Exception`` 那一类早退分支，``report`` 不带 ``audit`` 字段）。这种
+    情况下本轮已经发生过的拒绝计数会跟着这份不完整的 ``report`` 一起丢失——
+    ``_denied_tool_summary`` 同样如实返回 0/空，不去猜、也无法从这份 ``report``
+    里补回来。可以接受：这轮回合本身已经落到一个响亮的失败终态（未预期异常
+    带着 ``type(error).__name__`` 收口，见 ``_process_task`` 的失败分支），运维
+    看得到"这一轮坏了"；唯一的代价是看不到"坏之前它还拒绝过几次工具调用"这个
+    补充事实，不是静默丢失整轮结果。
+    """
+
+    audit = report.get("audit") if isinstance(report, Mapping) else None
+    if not isinstance(audit, Mapping):
+        return 0, ()
+    count = audit.get("denied_count")
+    count = count if isinstance(count, int) else 0
+    names: list[str] = []
+    denied_entries = audit.get("denied")
+    if isinstance(denied_entries, list):
+        for entry in denied_entries:
+            if isinstance(entry, Mapping):
+                name = entry.get("tool_name")
+                if isinstance(name, str):
+                    names.append(name)
+    return count, tuple(names[:_MAX_LOG_DENIED_TOOL_NAMES])
 
 
 class WorkerService:
@@ -433,6 +479,7 @@ class WorkerService:
         # 一旦触发出口安全（真实泄露片段或受控 canary 注入都可能），真超时就会被
         # 改写成 redacted_withheld——运维丢失真实失败终态，验收拿到假阳性证据。
         deliverable = bool(turn.get("closed")) and not failure
+        denied_count, denied_tool_names = _denied_tool_summary(report)
 
         # 终态优先级（Issue #195）：真中断 → 其他失败 → withheld → 成功。
         # 此前第一分支是 `stop_requested or failure_code == "interrupted"`，
@@ -480,6 +527,8 @@ class WorkerService:
                 elapsed_seconds=elapsed_seconds,
                 failure_code=failure_code,
                 output_safety=output_safety,
+                denied_count=denied_count,
+                denied_tool_names=denied_tool_names,
             )
         elif not deliverable:
             error_kind, content = self._failure_content(failure_code)
@@ -494,6 +543,8 @@ class WorkerService:
                 elapsed_seconds=elapsed_seconds,
                 failure_code=failure_code,
                 output_safety=output_safety,
+                denied_count=denied_count,
+                denied_tool_names=denied_tool_names,
             )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
@@ -507,6 +558,8 @@ class WorkerService:
                 elapsed_seconds=elapsed_seconds,
                 failure_code=failure_code,
                 output_safety=output_safety,
+                denied_count=denied_count,
+                denied_tool_names=denied_tool_names,
             )
         else:
             # 走到这里必然 `deliverable and not withheld`：回合已收口、有结果、
@@ -521,6 +574,8 @@ class WorkerService:
                 session_id=turn.get("session_id") if isinstance(turn, Mapping) else None,
                 failure_code=failure_code,
                 output_safety=output_safety,
+                denied_count=denied_count,
+                denied_tool_names=denied_tool_names,
             )
 
     def _append_event(
@@ -563,6 +618,8 @@ class WorkerService:
         session_id: str | None = None,
         failure_code: object = None,
         output_safety: Mapping[str, Any] | None = None,
+        denied_count: int = 0,
+        denied_tool_names: tuple[str, ...] = (),
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -572,8 +629,9 @@ class WorkerService:
         ``PostgresTaskQueue.confirm_delivery`` 的取舍说明）。
 
         本方法是 ``_process_task`` 里所有终态写入的唯一收口点，因此低敏审计日志
-        （Issue #90 评论 5306860255）放在这里记一次，覆盖 stop/withheld/success/
-        failure 全部分支，不必在每个分支各写一遍。
+        （Issue #90 评论 5306860255；``denied_count``/``denied_tool_names`` 见
+        Issue #291 独立审查）放在这里记一次，覆盖 stop/withheld/success/failure
+        全部分支，不必在每个分支各写一遍。
         """
 
         self._log_terminal_outcome(
@@ -582,6 +640,8 @@ class WorkerService:
             error_kind=error_kind,
             terminal_kind=terminal_kind,
             output_safety=output_safety,
+            denied_count=denied_count,
+            denied_tool_names=denied_tool_names,
         )
         self._queue.write_terminal_event(
             task_id=claimed.task_id,
@@ -601,12 +661,21 @@ class WorkerService:
         error_kind: str | None,
         terminal_kind: str,
         output_safety: Mapping[str, Any] | None,
+        denied_count: int = 0,
+        denied_tool_names: tuple[str, ...] = (),
     ) -> None:
         """queue 收口低敏结构化审计事件（Issue #90 评论 5306860255）：queue 链路
         此前失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记
-        分类性的失败码、落库 ``error_kind``、``terminal_kind`` 与安全判定的
-        布尔/原因码——**严禁**记录正文内容、用户 open_id、prompt 或模型输出
-        片段。
+        分类性的失败码、落库 ``error_kind``、``terminal_kind``、安全判定的
+        布尔/原因码，以及本回合被 ``ToolPolicy`` 拒绝的调用计数与工具名——
+        **严禁**记录正文内容、用户 open_id、prompt、模型输出片段或工具入参
+        正文。
+
+        ``denied_count``/``denied_tool_names`` 是 Issue #291 独立审查补的一项：
+        ``tool_policy.py`` 的拒绝文案对用户承诺"这是系统侧的临时限制、问题
+        已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
+        （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
+        导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
 
         独立复核 P1：这条事件不能直接调用 stdlib ``logging``——``WorkerService``
         不知道自己会被哪个进程入口装配，而真实队列 worker 的 ``apps/worker/
@@ -614,8 +683,10 @@ class WorkerService:
         阈值 ``WARNING`` 会把 ``logging.info(...)`` 悄悄吞掉，运维在真实容器
         stderr 里永远看不到）。因此改为调用装配层注入的 ``on_terminal_outcome``
         回调，由 ``cli.py`` 接到本文件既有的结构化 stderr 出口（``worker.task.
-        terminal``，带 ``trace_id``）。没有装配方（``None``，例如白盒测试与旧
-        调用方）时整体跳过，不假装写了一条实际不存在的日志。
+        terminal``，带 ``trace_id``；``denied_count > 0`` 时该出口把这条事件
+        提到 ``warning`` 级别，见 ``cli.py`` 的 ``_terminal_outcome_sink``）。
+        没有装配方（``None``，例如白盒测试与旧调用方）时整体跳过，不假装写了
+        一条实际不存在的日志。
         """
 
         if self._on_terminal_outcome is None:
@@ -630,7 +701,9 @@ class WorkerService:
                 reasons = tuple(str(reason) for reason in raw_reasons)
 
         # P3-2：失败码与每个原因码入日志前截到长度上界，避免未来某次改动不小心
-        # 把自由文本塞进这两个字段时，审计日志变成新的正文泄漏面。
+        # 把自由文本塞进这两个字段时，审计日志变成新的正文泄漏面。被拒工具名
+        # 同一惯例：内置工具名/已知 MCP 工具名很短，真正会撑长的是模型臆造的
+        # 畸形名字或凭据形态的字符串，同样不能不设上界。
         truncated = False
         capped_failure_code: str | None = None
         if failure_code is not None:
@@ -641,6 +714,11 @@ class WorkerService:
             capped_reason, reason_truncated = _cap_log_token(reason)
             capped_reasons.append(capped_reason)
             truncated = truncated or reason_truncated
+        capped_denied_tool_names: list[str] = []
+        for name in denied_tool_names:
+            capped_name, name_truncated = _cap_log_token(name)
+            capped_denied_tool_names.append(capped_name)
+            truncated = truncated or name_truncated
 
         fields = {
             "task_id": task_id,
@@ -650,6 +728,8 @@ class WorkerService:
             "output_safety_blocked": blocked,
             "output_safety_withheld": withheld,
             "output_safety_reasons": tuple(capped_reasons),
+            "denied_count": denied_count,
+            "denied_tool_names": tuple(capped_denied_tool_names),
             "truncated": truncated,
         }
         try:

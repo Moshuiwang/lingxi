@@ -526,6 +526,7 @@ def _build_onboarding_duty(
     employment_access_token: Callable[[], str] | None,
     metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
     permission_publish: PermissionPublishDuty | None,
+    onboarding_failed: Callable[[str, str], None] | None = None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
 
@@ -792,6 +793,10 @@ def _build_onboarding_duty(
         # 权限完全正常的人引去银河申请一个他已经有的权限），**且 ``publish_outbox``
         # 零新增行、``app_user`` 零新增行**；映射非空时同一个用户照常推进到发布等待。
         publish_allowed=lambda: metric_translation_available(metric_translation_map),
+        # 管理员送达（Issue #280 §7.3）：调用方（``build_loop``）没有装配告警职责时
+        # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
+        # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
+        onboarding_failed=onboarding_failed,
     )
     duty = OnboardingReconciler(
         store=store,
@@ -942,6 +947,7 @@ def _build_stalled_provisioning_duty(
     *,
     stop: threading.Event,
     audit: AuditSink,
+    alert: Callable[[int], None] | None = None,
 ) -> Any:
     """装配开通中途停摆收口职责（Issue #282，`V-开通-19`）。**总能注册**，不需要任何
     可选前置——候选查询、收口写入（复用
@@ -998,6 +1004,7 @@ def _build_stalled_provisioning_duty(
             ),
             catalog=default_content_catalog(),
         ),
+        alert=alert,
         audit=audit,
         lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
         stop=stop,
@@ -1465,9 +1472,31 @@ def build_loop(
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
+        onboarding_failed=(
+            alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
+        ),
     )
     if onboarding is not None:
         duties.append(onboarding)
+        if not config.admin_group_chat_id:
+            # 独立审查 codex P1-4：开通职责已注册（会真的产生 INTERNAL_ERROR /
+            # SYNC_TIMEOUT 终态），`onboarding_failed` 回调也已经接上（只要
+            # `alerting_duty` 存在，`main()` 里恒定存在），但没有配
+            # `LINGXI_ADMIN_GROUP_CHAT_ID` 时 `AlertDispatcher` 的送达出口会退化成
+            # `_LogOnlyAlertSender`（`V-告警-08` 既定语义：不失败关闭，状态机照常
+            # 运行）——用户看到的「已转交管理员处理」这句承诺因此没有任何人会真的
+            # 看到。这不是一个需要拒绝启动的错误（LogOnly 是产品接受的降级形态），
+            # 但必须在启动期留一条响亮日志，不能让这个组合悄悄运行。
+            logger.warning(
+                "已注册首次开通编排，但未配置 LINGXI_ADMIN_GROUP_CHAT_ID："
+                "「已转交管理员处理」的送达面将退化为仅结构化日志，管理群收不到任何"
+                "开通失败 / 同步超时告警（V-告警-08 既定语义，不阻止启动）"
+            )
+            sink.record(
+                "onboarding.admin_alert_channel_missing",
+                reason="missing_environment_variable",
+                variable="LINGXI_ADMIN_GROUP_CHAT_ID",
+            )
     # 迟到就绪恢复（V-开通-18）排在首次开通编排**之后**：它服务的是首次开通那次阻塞
     # 确认已经判过超时、后续再也没有人回来看的用户，位置只是"同一轮内先声明的职责先
     # 跑"的自然顺序，不构成数据依赖——它按自己的十五分钟节奏在候选查询里判到期，不是
@@ -1482,7 +1511,16 @@ def build_loop(
     # `adapters/postgres_stalled_provisioning.py` 模块文档），不会互相抢候选。**总能
     # 注册**（没有可选前置会让它整体不装配），因此不需要 `if ... is not None` 判断。
     duties.append(
-        _build_stalled_provisioning_duty(config, stop=stop, audit=sink)
+        _build_stalled_provisioning_duty(
+            config,
+            stop=stop,
+            audit=sink,
+            alert=(
+                alerting_duty.onboarding_stalled_callback()
+                if alerting_duty is not None
+                else None
+            ),
+        )
     )
     if alerting_duty is not None:
         duties.append(alerting_duty)

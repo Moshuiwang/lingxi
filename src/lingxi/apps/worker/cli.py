@@ -183,7 +183,7 @@ def main(
         config.trace_id,
         "info",
         "worker.turn.start",
-        read_only_tool=config.read_only_tool,
+        read_only_tools=list(config.read_only_tools),
         question_bytes=len(config.question.encode("utf-8")),
         mcp_servers=sorted(config.mcp_servers),
         workspace_configured=config.workspace is not None,
@@ -289,10 +289,19 @@ def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[s
     发出的调用在真实队列 worker 进程里会被默认阈值悄悄吞掉，运维在容器 stderr
     里永远看不到。这里复用现成的结构化 ``_log()`` 出口，让终态收口事件真正
     落到运维能看到的地方，并带上 ``trace_id``（代码框架「三、横切约定」）。
+
+    Issue #291 独立审查：``denied_count > 0``（这一回合有工具调用被 ``ToolPolicy``
+    拒绝）时把这条事件提到 ``warning`` 级别——与「turn」模式下 ``worker.turn.
+    finished`` 按 ``gate_bypassed``/失败/未收口选级别是同一惯例（见本文件
+    ``main()`` 里那段），拒绝本身不算失败（回合仍可能正常收口），但白名单
+    配错、内置工具被误判为可用这类问题只在这里才留得下痕迹，不该和普通成功
+    终态一样淹没在 ``info`` 里。
     """
 
     def sink(fields: Mapping[str, Any]) -> None:
-        _log(err, trace_id, "info", "worker.task.terminal", **fields)
+        denied_count = fields.get("denied_count")
+        level = "warning" if isinstance(denied_count, int) and denied_count > 0 else "info"
+        _log(err, trace_id, level, "worker.task.terminal", **fields)
 
     return sink
 

@@ -413,7 +413,7 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "src/lingxi/core/execution/tool_policy.py",
-        "# 2. 不要把内部工具名转述给用户——用户可见文案里不出现内部标识是产品合同要求。",
+        "# 2. 不要把内部工具名转述给用户——用户可见文案里不出现内部标识是产品合同要求；",
         "开通流程",
     ),
     GroundedAttribution(

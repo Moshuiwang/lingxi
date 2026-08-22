@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from lingxi.core.execution.input_safety import SAFE_OUTPUT_FALLBACK, WITHHELD_MESSAGE
 from lingxi.core.execution.tool_policy import is_well_formed_tool_name
 from lingxi.core.ids import new_ulid
+from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 ENV_PREFIX = "LINGXI_WORKER_"
 
@@ -48,10 +49,22 @@ DRAIN_GRACE_HARD_LIMIT_SECONDS = 120.0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 45.0
 SHUTDOWN_TIMEOUT_HARD_LIMIT_SECONDS = 300.0
 
-# 本切片只允许一个明确确认过的**只读 MCP 工具**（Issue #37 实施范围 2）。要求
+# 白名单只放行明确确认过的**只读 MCP 工具**（Issue #37 实施范围 2）。要求
 # ``mcp__`` 前缀是这条范围的机器可核对形式：Skill、Agent、Task 与任何内置工具都
 # 因此落在配置期拒绝分支里，不需要维护一份"禁止配置"的名单。
+#
+# **不再是"只允许一个"**（Issue #291 P0）：真实问数 MCP 至少注册了 3 个只读工具
+# （``list_metrics``/``describe_metric``/``search_dimension``），放行一个、拒绝
+# 其余会让每一次真实提问都在 ``PreToolUse`` 被拒——这正是 2026-08-21 那次"每条
+# 都有回复、一次真正的查询都没执行"的根因之一。
 MCP_TOOL_PREFIX = "mcp__"
+
+# 白名单每一项都必须以这个前缀开头——服务名段与写侧（``adapters/user_environment.py``
+# 写 ``.mcp.json`` 的那一侧）共用同一个常量 ``QUERY_MCP_SERVER_NAME``（定义在零依赖的
+# ``lingxi.core.mcp_naming``，独立审查见该模块文档），不各自维护一份字符串。见
+# ``_read_only_tools`` 的装配期断言：两侧不一致时启动失败关闭，不留到用户提问那一刻
+# 才无声降级。
+QUERY_MCP_TOOL_PREFIX = f"{MCP_TOOL_PREFIX}{QUERY_MCP_SERVER_NAME}__"
 
 # S-A-07 受控验收专用（Issue #142 验收缺口）：输出安全 canary 的两个合法档位。
 # 合法值集合是验收合同的一部分，不是随口列举——``masked`` 验证「局部遮蔽、业务
@@ -77,7 +90,7 @@ class WorkerConfig:
     """一次受控回合需要的全部输入。"""
 
     question: str
-    read_only_tool: str
+    read_only_tools: tuple[str, ...]
     trace_id: str
     # 单回合墙钟上限（业务执行预算）：SDK 传输挂住不发终止消息时，没有它整个
     # 回合会永久等待，连失败报告都出不来（Codex 复查发现）。不含收尾宽限。
@@ -172,7 +185,7 @@ def load_config(
     进程内存里多留一份从未被读取过的副本。
     """
 
-    required_names = ("QUESTION", "READONLY_TOOL") if require_question else ("READONLY_TOOL",)
+    required_names = ("QUESTION", "READONLY_TOOLS") if require_question else ("READONLY_TOOLS",)
     missing = [name for name in required_names if not _text(env, name)]
     if missing:
         raise WorkerConfigError(
@@ -182,7 +195,7 @@ def load_config(
     system_prompt = _text(env, "SYSTEM_PROMPT")
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
-        read_only_tool=_read_only_tool(env),
+        read_only_tools=_read_only_tools(env),
         trace_id=_validated_trace_id(_text(env, "TRACE_ID")),
         max_turns=_max_turns(_text(env, "MAX_TURNS")),
         turn_timeout_seconds=_turn_timeout(_text(env, "TURN_TIMEOUT_SECONDS")),
@@ -224,21 +237,74 @@ def _text(env: Mapping[str, str], name: str) -> str | None:
     return value or None
 
 
-def _read_only_tool(env: Mapping[str, str]) -> str:
-    value = _text(env, "READONLY_TOOL") or ""
-    if not is_well_formed_tool_name(value):
-        # 逗号、空格、通配符都会落到这里：白名单只接受**一个精确名称**，
-        # 想放行第二个工具必须是一次有人复核的范围变更，不是改一个环境变量。
+def _read_only_tools(env: Mapping[str, str]) -> tuple[str, ...]:
+    """解析多值只读工具白名单（Issue #291 P0）。
+
+    逗号分隔多个**精确名称**；不支持通配符，不支持空白分隔——这两条此前唯一的
+    单值实现已经在拒绝分支里验证过（``test_worker_entry.py``），这里延续同一
+    条不变量：白名单只接受机器可核对的精确名称，想放行一个新工具必须是一次
+    有人复核的范围变更，不是改一个环境变量就能悄悄扩大。
+
+    多段校验依次收窄，报错各自可辨认：①逗号分段里有没有空段（挡住 ``a,,b``、
+    多余首尾逗号——配置形状错误，独立审查 codex P1-1）；②每一项是不是合法标识符
+    形态（挡住通配符、空格、逗号本身混进单项）；③是不是 ``mcp__`` 前缀（挡住
+    Skill/Agent/Task/内置工具）；④是不是 ``QUERY_MCP_TOOL_PREFIX`` 前缀——**这一条
+    是 Issue #291 根因 #1 的装配期断言**：与 ``adapters/user_environment.py`` 写进
+    ``.mcp.json`` 的服务名不一致时启动失败关闭，不留到用户提问那一刻才发现工具全被
+    无声拒绝；⑤前缀之后是不是空的（挡住裸前缀 ``mcp__query__`` 本身，独立审查
+    codex P1-1）。
+    """
+
+    raw = _text(env, "READONLY_TOOLS") or ""
+    if not raw:
         raise WorkerConfigError(
-            f"{ENV_PREFIX}READONLY_TOOL 必须是单个合法工具名（只允许字母、数字、"
-            f"下划线、点和连字符），收到：{value!r}"
+            f"{ENV_PREFIX}READONLY_TOOLS 必须至少包含一个合法工具名（逗号分隔多个，"
+            f"例如 {QUERY_MCP_TOOL_PREFIX}list_metrics,{QUERY_MCP_TOOL_PREFIX}describe_metric）"
         )
-    if not value.startswith(MCP_TOOL_PREFIX):
+    # 逐段保留（不先用 ``if part.strip()`` 过滤）：逗号间的空段（``a,,b``）、多余的
+    # 首尾逗号（``a,`` / ``,a``）都是配置形状错误，必须响亮拒绝，不能被静默丢弃成
+    # "看起来解析成功、其实少了一项"（独立审查 codex P1-1）。
+    values = tuple(part.strip() for part in raw.split(","))
+    empty_positions = [index + 1 for index, part in enumerate(values) if not part]
+    if empty_positions:
         raise WorkerConfigError(
-            f"{ENV_PREFIX}READONLY_TOOL 只能是以 {MCP_TOOL_PREFIX} 开头的只读 MCP 工具；"
-            f"Skill、Agent、Task 和内置工具都不在本切片范围内，收到：{value!r}"
+            f"{ENV_PREFIX}READONLY_TOOLS 存在空的逗号分段（第 {empty_positions} 段，从 1 计数，"
+            f"含多余的首尾逗号）：配置形状错误按失败关闭处理，不静默丢弃，收到原始值：{raw!r}"
         )
-    return value
+    malformed = [value for value in values if not is_well_formed_tool_name(value)]
+    if malformed:
+        # 通配符、空格与其它非法字符都会落到这里：白名单只接受精确名称。
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 的每一项都必须是合法工具名（只允许字母、数字、"
+            f"下划线、点和连字符），收到不合法项：{malformed!r}"
+        )
+    not_mcp = [value for value in values if not value.startswith(MCP_TOOL_PREFIX)]
+    if not_mcp:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 只能是以 {MCP_TOOL_PREFIX} 开头的只读 MCP 工具；"
+            f"Skill、Agent、Task 和内置工具都不在本切片范围内，收到：{not_mcp!r}"
+        )
+    mismatched = [value for value in values if not value.startswith(QUERY_MCP_TOOL_PREFIX)]
+    if mismatched:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 的工具前缀必须是 {QUERY_MCP_TOOL_PREFIX!r}"
+            f"（与用户环境 .mcp.json 的 MCP 服务名 {QUERY_MCP_SERVER_NAME!r} 一致，"
+            "见 lingxi.core.mcp_naming 的 QUERY_MCP_SERVER_NAME），"
+            f"收到前缀不匹配的工具名：{mismatched!r}"
+        )
+    # 前缀之后必须还有具体的工具名：``mcp__query__`` 本身（前缀后为空）虽然通过了
+    # 上面三段校验（合法标识符形态、mcp__ 前缀、query__ 前缀），但它不指向任何一个
+    # 真实工具，会被 PreToolUse 逐字比对无声拒绝——必须在装配期响亮报错，不能留到
+    # 用户提问那一刻才发现白名单里有一条"看似合法、实则永远拒绝"的空项
+    # （独立审查 codex P1-1）。
+    bare_prefix = [value for value in values if value == QUERY_MCP_TOOL_PREFIX]
+    if bare_prefix:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 不能是裸前缀 {QUERY_MCP_TOOL_PREFIX!r}（前缀后必须跟具体"
+            f"的工具名，例如 {QUERY_MCP_TOOL_PREFIX}list_metrics），收到：{bare_prefix!r}"
+        )
+    # 去重且保序：同一个工具名在环境变量里写重不该产生"白名单有两条"的假象。
+    return tuple(dict.fromkeys(values))
 
 
 def _names(env: Mapping[str, str], name: str) -> tuple[str, ...]:

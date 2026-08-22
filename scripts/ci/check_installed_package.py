@@ -56,6 +56,11 @@ REQUIRED_MODULES = (
     "lingxi.core.identity",
     "lingxi.core.permission",
     "lingxi.core.ids",
+    # 独立审查（分支 fix/291-280-user-experience 收尾）：把 QUERY_MCP_SERVER_NAME
+    # 从 adapters.user_environment 挪到这个零依赖模块，避免 worker 为了一个字符串
+    # 常量就要拖进整条首次开通编排的 import 闭包（见下面 PROCESS_RUNTIME_IMPORTS
+    # 的 worker 闭包同名注释）。
+    "lingxi.core.mcp_naming",
     "lingxi.core.identity.onboarding",
     "lingxi.core.identity.identifiers",
     "lingxi.core.identity.credentials",
@@ -179,6 +184,12 @@ REQUIRED_MODULES = (
     # 排除，若这里漏掉 apps/reauthorize，源码测试仍会绿而部署 job 会在镜像内消失。
     "lingxi.apps.reauthorize",
     "lingxi.apps.reauthorize.__main__",
+    # 追溯号只读查询 CLI（Issue #280 §7.2）：与 apps/reauthorize 同一姿态——scripts/
+    # 被 .dockerignore 排除，一次性运维命令必须显式登记，否则源码测试全绿而部署镜像
+    # 里没有它。随 scheduler 镜像一起装，由运维在容器内以 `docker exec` 语义手动调用
+    # （不是常驻进程，不需要 compose 服务条目）。
+    "lingxi.apps.trace",
+    "lingxi.apps.trace.__main__",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -406,6 +417,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
             "lingxi.apps.healthcheck.__main__",
+            # Issue #280 §7.2：追溯号只读查询 CLI，同一姿态——随 scheduler 镜像装，
+            # 由运维在容器内以 `docker exec` 语义手动调用，不是常驻进程的一部分。
+            "lingxi.apps.trace",
+            "lingxi.apps.trace.__main__",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
@@ -454,6 +469,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_snapshot",
             "lingxi.core.alerting",
             "lingxi.core.ids",
+            # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.
+            # user_environment` 现在从这个零依赖模块导入 QUERY_MCP_SERVER_NAME，
+            # 见 worker 闭包那条同名注释。
+            "lingxi.core.mcp_naming",
             "lingxi.core.conversation",
             "lingxi.core.conversation.commands",
             "lingxi.core.conversation.onboarding_recovery",
@@ -524,6 +543,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # Epic D 闸⑥：按用户读取问数 MCP 配置，由 apps/worker/service.py
             # 模块级 import（queue 模式每个任务都要用）。
             "lingxi.adapters.user_mcp_config",
+            # 独立审查（分支 fix/291-280-user-experience 收尾）：Issue #291 P0 曾让
+            # apps/worker/config.py 为了取 QUERY_MCP_SERVER_NAME 这一个字符串常量
+            # `from lingxi.adapters.user_environment import ...`，把 adapters.
+            # user_environment 顶部 import 的 `core/identity/onboarding_runner.py`
+            # 整条首次开通编排闭包（身份匹配、花名册、银河、建档等约十二个模块，
+            # 曾登记在这里）一并拉进了 worker 的运行时闭包——worker 是处理每一次
+            # 真实用户提问的热路径进程，这条闭包与它的职责毫无关系。常量已经挪到
+            # 零依赖的 `lingxi.core.mcp_naming`（不 import 任何东西），worker 现在
+            # 只需要登记这一行，不再需要上面那整条开通编排链；变异存活证据见
+            # `tests/test_worker_entry.py` 的
+            # `test_importing_worker_config_does_not_pull_in_the_onboarding_
+            # orchestration_chain`。
+            "lingxi.core.mcp_naming",
             "lingxi.adapters.postgres",
             "lingxi.adapters.postgres_conversation",
             # Issue #239：按读写边界拆成包后的子模块，理由同 REQUIRED_MODULES。
@@ -689,6 +721,9 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         "lingxi.apps.scheduler",
         "lingxi.apps.scheduler.__main__",
         "lingxi.apps.healthcheck.__main__",
+        # 追溯号只读查询 CLI（Issue #280 §7.2）：同一姿态，随镜像装、独立调用，
+        # 加进来才能让静态闭包真的走到它函数内的 `lingxi.adapters.postgres` 导入。
+        "lingxi.apps.trace.__main__",
     ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
     "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),

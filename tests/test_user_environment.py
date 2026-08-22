@@ -24,6 +24,7 @@ from lingxi.adapters.user_environment import (
     TEMPORARY_PREFIX,
     TEMPORARY_SUFFIX,
     HOME_DIR_MODE,
+    QUERY_MCP_SERVER_NAME,
     ROOT_DIR_MODE,
     MCP_CONFIG_FILENAME,
     LocalUserEnvironment,
@@ -128,6 +129,17 @@ class FileSystemTests(unittest.TestCase):
         self.assertEqual(ROOT_DIR_MODE & 0o007, 0)
         # 其他用户一个字节都读不到。
         self.assertEqual(stat.S_IMODE(config.stat().st_mode) & 0o007, 0)
+
+    def test_the_default_server_name_is_the_shared_query_mcp_server_name_constant(self) -> None:
+        """单一事实来源（Issue #291 根因 #1）：不传 ``mcp_server_name`` 时写进
+        ``.mcp.json`` 的服务名必须是 ``QUERY_MCP_SERVER_NAME``——``apps/worker/
+        config.py`` 的只读工具白名单前缀断言就是拿这同一个常量来核对的，两侧
+        分道扬镳正是 2026-08-21 那次事故的根因。"""
+
+        self.environment.ensure(user_id="usr_default_name", mcp_token=TOKEN)
+
+        document = json.loads(self._config("usr_default_name").read_text(encoding="utf-8"))
+        self.assertIn(QUERY_MCP_SERVER_NAME, document["mcpServers"])
 
     def test_two_users_never_share_one_configuration(self) -> None:
         """每个人只拿到自己那一份令牌。"""

@@ -81,6 +81,23 @@ _DEFAULT_ONBOARDING_MESSAGES: dict[OnboardingState, OnboardingMessage] = {
     OnboardingState.INTERNAL_ERROR: OnboardingMessage("onboarding.internal_error"),
 }
 
+#: 需要追溯号占位（``{reference}``）的文案键（Issue #280 §7.1）。与
+#: ``core/identity/onboarding_runner.py`` 里同名判据各自维护一份——两条渲染入口
+#: 此前就是彼此独立的失败关闭桩（本模块只在 gateway 侧 runner 惰性桩/测试注入下
+#: 才会真的走到，见该模块「共用线程复核」一节），靠字面值对齐而不是跨模块 import。
+_KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset(
+    {"onboarding.internal_error", "onboarding.sync_timeout"}
+)
+
+
+def _with_reference(key: str, values: dict[str, object], trace_id: str) -> dict[str, object]:
+    """给需要追溯号的终态文案补上 ``reference`` 占位值，已有值不覆盖。"""
+
+    merged = dict(values)
+    if key in _KEYS_REQUIRING_REFERENCE:
+        merged.setdefault("reference", trace_id)
+    return merged
+
 
 class QueueInsertFailure(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
@@ -502,7 +519,20 @@ class EventPipeline:
                 result, checking_key=checking.key, message=message
             )
         except Exception as error:  # noqa: BLE001 - 失败必须落到统一终态文案
-            internal = self._texts.catalog.text("onboarding.internal_error")
+            # 独立审查 codex P1-2（已核实，见 commit 说明的核实证据）：这条分支发的
+            # 「已转交管理员处理」不像 onboarding_runner.py 的同名文案那样接了
+            # ONBOARDING_FAILED 管理员告警回调。**防御性分支，生产不可达**：
+            # `apps/gateway/__init__.py` 的 `main()` 硬编码把 `_RecordingOnboarding`
+            # （`start()` 永不抛异常，恒定返回 `OnboardingResult(state=STARTED)`）
+            # 接到这条管线上，而 `assert_gateway_onboarding_is_inert` +
+            # `INERT_ONBOARDING_TYPES == {"_RecordingOnboarding"}` 在装配期就响亮
+            # 拒绝任何其他实现——真正会抛异常或返回坏结果的 `AutoOnboardingRunner`
+            # 结构上装不到这条管线上。告警缺失因此**无生产影响**；gateway 侧若未来
+            # 装配真实 runner（松开这条装配断言），需要同步在这里接上告警出口，
+            # 不能让这条兜底继续悄悄不告警。
+            internal = self._texts.catalog.text(
+                "onboarding.internal_error", reference=message.trace_id
+            )
             deferred.append(internal)
             self._audit.record(
                 "onboarding.failed",
@@ -601,19 +631,30 @@ class EventPipeline:
             if onboarding_message.key == checking_key:
                 # checking is owned by the gateway and is sent exactly once.
                 continue
-            rendered.append(
-                self._texts.catalog.text(
-                    onboarding_message.key, onboarding_message.as_values()
-                )
+            values = _with_reference(
+                onboarding_message.key, onboarding_message.as_values(), message.trace_id
             )
+            rendered.append(self._texts.catalog.text(onboarding_message.key, values))
         if not rendered and result.state is not OnboardingState.STARTED:
+            # 独立审查 codex P1-2（已核实，见 commit 说明的核实证据）：同一类兜底——
+            # 「已转交管理员处理」没有接 ONBOARDING_FAILED 管理员告警回调。
+            # **防御性分支，生产不可达**：理由同上一处兜底（`_start_onboarding` 的
+            # `except`）——生产 gateway 恒定接的是 `_RecordingOnboarding`，它只
+            # 返回 `state=STARTED`（本条件的 `result.state is not STARTED` 恒假），
+            # 装配期断言挡住任何会返回非 `STARTED` 结果的其他实现。告警缺失因此
+            # **无生产影响**；gateway 侧若未来装配真实 runner，需要同步在这里接上
+            # 告警出口。
             self._audit.record(
                 "onboarding.render_failed",
                 event_id=message.event_id,
                 state=result.state.value,
                 trace_id=message.trace_id,
             )
-            return (self._texts.catalog.text("onboarding.internal_error"),)
+            return (
+                self._texts.catalog.text(
+                    "onboarding.internal_error", reference=message.trace_id
+                ),
+            )
         return tuple(rendered)
 
     def _add_reaction(self, message: InboundMessage) -> None:

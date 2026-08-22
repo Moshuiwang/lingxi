@@ -122,8 +122,11 @@ Issue #65 钉在开工卡上的「共用线程复核」在搬迁之后的同一�
 activate_after_late_readiness`，条件更新只在 `provisioning_state = 'mcp_syncing'`
 且账号仍启用且权限版本与探针绑定的那一版一致时才推进，同样只前进不回退）——因此
 `active` 现在有**两个**写入方，各自的条件更新虽不是同一个方法，但守卫口径一致
-（只前进、只在账号启用时推进），不构成竞态。**本模块自身不改**：它仍然在判超时时
-当场返回，恢复不在这条链的调用栈里发生。**这条缺口同时登记在**
+（只前进、只在账号启用时推进），不构成竞态。**本模块自身不改判超时时的状态推进**：
+它仍然在判超时时当场返回，`provisioning_state` 的推进与恢复不在这条链的调用栈里
+发生——**独立审查 codex P1-3 新增的只是告警侧的一次调用**（:meth:`_notify_admin_
+of_failure`），让「转交管理员处理」这句话对 `sync_timeout` 也有真实送达，不改变
+上面这条恢复语义半分毫。**这条缺口同时登记在**
 ``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
 ——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
 另一个 Story 的范围，本次改动只更新了验收矩阵。
@@ -220,8 +223,36 @@ KEY_COMPLETED = "onboarding.completed"
 KEY_NOT_AUTHORIZED = "onboarding.not_authorized"
 KEY_SYNC_TIMEOUT = "onboarding.sync_timeout"
 KEY_INTERNAL_ERROR = "onboarding.internal_error"
+#: 开通中途停摆收口（``apps/scheduler/stalled_provisioning.py``，Issue #282）专用文案键
+#: （Issue #280 裁定 B2-2）。此前该职责复用 ``KEY_INTERNAL_ERROR`` 逐字发送；产品负责人
+#: 要求换成专门说明"等待已久、可再发一条消息重试"的措辞，不再套用一般性的内部故障话术。
+KEY_STALLED = "onboarding.stalled"
 KEY_DELEGATED_SUBJECT = "onboarding.delegated_subject"
 KEY_SUSPENDED = "gateway.suspended"
+
+#: 需要追溯号占位（``{reference}``）的文案键集合（Issue #280 §7.1）。占位名**不能**叫
+#: ``trace_id``——那会命中 ``config/content.py`` 的内容安全正则，在目录加载期就让三个
+#: 进程全部起不来（联合设计 §0.1）。集中在一处维护，供 :func:`_with_reference` 与
+#: ``core/conversation/pipeline.py`` 各自的同名辅助函数共用同一份判据来源（后者是
+#: 不同的渲染入口，各自维护一份字面量集合，靠这份常量的字面值对齐，不做跨模块 import
+#: ——两条渲染路径此前就是各自独立的失败关闭桩，见模块文档「共用线程复核」）。
+_KEYS_REQUIRING_REFERENCE: frozenset[str] = frozenset({KEY_INTERNAL_ERROR, KEY_SYNC_TIMEOUT})
+
+
+def _with_reference(
+    key: str, values: Mapping[str, object] | Sequence[tuple[str, object]], trace_id: str
+) -> dict[str, object]:
+    """给需要追溯号的终态文案补上 ``reference`` 占位值。
+
+    只在键属于 :data:`_KEYS_REQUIRING_REFERENCE` 时补；已经带了值就不覆盖（防止
+    调用方已经显式传过一次导致 ``ContentRenderError`` 的重复变量错误——虽然当前
+    没有任何调用方会这样做，用 ``setdefault`` 而不是无条件覆盖仍然是更安全的形状）。
+    """
+
+    merged = dict(values)
+    if key in _KEYS_REQUIRING_REFERENCE:
+        merged.setdefault("reference", trace_id)
+    return merged
 
 
 class _ChainAborted(Exception):
@@ -374,10 +405,22 @@ class _Terminal:
     values: tuple[tuple[str, object], ...] = ()
     reason: str | None = None
 
-    def as_result(self) -> OnboardingResult:
+    def as_result(self, *, trace_id: str | None = None) -> OnboardingResult:
+        """转成 gateway 消费的受控结果。
+
+        ``trace_id`` 只在调用方真的持有它时传（本类的两个调用点都在
+        ``AutoOnboardingRunner.start`` 里，那里天然有它）；缺省 ``None`` 保持旧行为
+        不变——不是所有 ``_Terminal`` 都对应一次已知的追溯号（例如尚未真正开始跑链
+        就被拒绝的场景仍然有 ``trace_id``，这里留 ``None`` 只是防御性缺省，不代表
+        生产中真的会用到它）。
+        """
+
+        values = self.values
+        if trace_id is not None:
+            values = tuple(_with_reference(self.key, values, trace_id).items())
         return OnboardingResult(
             state=self.state,
-            messages=(OnboardingMessage(self.key, self.values),),
+            messages=(OnboardingMessage(self.key, values),),
             failure_reason=self.reason,
         )
 
@@ -420,6 +463,7 @@ class AutoOnboardingRunner:
         publish_wait_seconds: float = 120.0,
         notify_attempts: int = 3,
         publish_allowed: Callable[[], bool] | None = None,
+        onboarding_failed: Callable[[str, str], None] | None = None,
     ) -> None:
         if not callable(delegated_subject):
             # 每次判定现读一次登记，而不是装配时读一次存着：换主体之后旧值会让
@@ -462,6 +506,15 @@ class AutoOnboardingRunner:
             # 发布，而外部表是不可回滚的。
             raise TypeError("必须注入发布闸门：翻译层不可用时一条发布意图都不能排")
         self._publish_allowed = publish_allowed
+        if onboarding_failed is not None and not callable(onboarding_failed):
+            raise TypeError("onboarding_failed 回调必须可调用或为 None")
+        #: 管理员送达回调（Issue #280 §7.3；``SYNC_TIMEOUT`` 覆盖见独立审查
+        #: codex P1-3）。**可选**：不注入时行为等价于此前——用户仍然收到冻结
+        #: 文案，只是没有任何东西送到管理群。注入时在真正走到 ``INTERNAL_ERROR``
+        #: 或 ``SYNC_TIMEOUT`` 终态时各调用一次，签名是 ``(reason, trace_id)``——
+        #: 两者都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也
+        #: 没有传这些的位置。
+        self._onboarding_failed = onboarding_failed
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -492,7 +545,10 @@ class AutoOnboardingRunner:
                 event_id=event_id,
                 trace_id=trace_id,
             )
-            return _internal("stopping").as_result()
+            self._notify_admin_of_failure(
+                reason="stopping", event_id=event_id, trace_id=trace_id
+            )
+            return _internal("stopping").as_result(trace_id=trace_id)
 
         with self._lock:
             running_for = self._running.get(open_id)
@@ -539,13 +595,56 @@ class AutoOnboardingRunner:
             self._audit.record(
                 "onboarding.rejected_by_executor", event_id=event_id, trace_id=trace_id
             )
-            return _internal("executor_unavailable").as_result()
+            self._notify_admin_of_failure(
+                reason="executor_unavailable", event_id=event_id, trace_id=trace_id
+            )
+            return _internal("executor_unavailable").as_result(trace_id=trace_id)
         return OnboardingResult(state=OnboardingState.STARTED)
 
     def _release(self, open_id: str, event_id: str) -> None:
         with self._lock:
             if self._running.get(open_id) == event_id:
                 del self._running[open_id]
+
+    def _notify_admin_of_failure(
+        self, *, reason: str, event_id: str, trace_id: str
+    ) -> None:
+        """管理员送达（Issue #280 §7.3）的唯一触发点：只在真正走到"承诺过转交
+        管理员处理"的终态时调用一次，与用户通知彼此独立——告警回调失败不得
+        带走这条链本该有的用户结论。
+
+        独立审查（分支 fix/291-280-user-experience 收尾）：``start()`` 里两条
+        **同步**返回 ``INTERNAL_ERROR`` 的分支（``stopping``——停机中拒绝开新链；
+        ``executor_unavailable``——提交执行器失败）此前从不调用这个回调，因为它们
+        根本不经过 ``_execute``（那里此前是唯一接了这个回调的地方）。用户看到的
+        是冻结文案「已转交管理员处理」，管理群却真的什么都没收到——文案承诺与
+        实际行为对不上。现在三处（这两条同步分支 + ``_execute`` 自己的
+        ``INTERNAL_ERROR`` 分支）共用这一个触发点，不允许再出现第四条漏网路径。
+
+        独立审查 codex P1-3：``_execute`` 的调用点现在同时覆盖
+        ``OnboardingState.SYNC_TIMEOUT``——产品合同（``docs/产品合同与外部边界.md``
+        「权限同步期间」一节）对十五分钟同步超时的措辞同样是"停止自动等待，
+        **转交管理员处理**"，与 ``INTERNAL_ERROR`` 分支承诺的"已转交管理员处理"
+        是同一句产品承诺，此前却只有后者真的送达管理群。``reason`` 沿用
+        ``_Terminal.reason``（``"mcp_sync_timeout"``），与内部故障的原因码
+        （如 ``"directory_unavailable"``）在归一化后的 ``scope`` 里天然可区分，
+        管理员据此能分清"这是同步超时在等"还是"这是本侧真的坏了"——**不改变**
+        :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的自动恢复语义：
+        这条告警只是"让管理群知道"，恢复仍然由该模块的迟到就绪恢复职责独立完成
+        （``V-开通-18``），两者不是同一件事，也不互相依赖。
+        """
+
+        if self._onboarding_failed is None:
+            return
+        try:
+            self._onboarding_failed(reason, trace_id)
+        except Exception as error:  # noqa: BLE001 - 告警是锦上添花，不是链的一部分
+            self._audit.record(
+                "onboarding.alert_callback_failed",
+                event_id=event_id,
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
 
     # ------------------------------------------------------------------
     # 执行线程
@@ -598,11 +697,19 @@ class AutoOnboardingRunner:
             content_key=terminal.key,
             trace_id=trace_id,
         )
+        if terminal.state in (OnboardingState.INTERNAL_ERROR, OnboardingState.SYNC_TIMEOUT):
+            # SYNC_TIMEOUT 与 INTERNAL_ERROR 是产品合同里两句独立措辞（`docs/产品
+            # 合同与外部边界.md`），但都承诺"转交管理员处理"——两者都必须真的送达
+            # 管理群（独立审查 codex P1-3）。reason 沿用各自终态的 terminal.reason，
+            # 不折叠成同一个值，管理员据此分得清是哪一类。
+            self._notify_admin_of_failure(
+                reason=terminal.reason or "unknown", event_id=event_id, trace_id=trace_id
+            )
         delivered = self._notify(
             open_id=open_id,
             event_id=event_id,
             key=terminal.key,
-            values=dict(terminal.values),
+            values=_with_reference(terminal.key, terminal.values, trace_id),
             suffix="",
             trace_id=trace_id,
         )
