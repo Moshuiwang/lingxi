@@ -245,19 +245,31 @@ def _read_only_tools(env: Mapping[str, str]) -> tuple[str, ...]:
     条不变量：白名单只接受机器可核对的精确名称，想放行一个新工具必须是一次
     有人复核的范围变更，不是改一个环境变量就能悄悄扩大。
 
-    三段校验依次收窄，报错各自可辨认：①每一项是不是合法标识符形态（挡住通配符、
-    空格、逗号本身混进单项）；②是不是 ``mcp__`` 前缀（挡住 Skill/Agent/Task/
-    内置工具）；③是不是 ``QUERY_MCP_TOOL_PREFIX`` 前缀——**这一条是 Issue #291
-    根因 #1 的装配期断言**：与 ``adapters/user_environment.py`` 写进 ``.mcp.json``
-    的服务名不一致时启动失败关闭，不留到用户提问那一刻才发现工具全被无声拒绝。
+    多段校验依次收窄，报错各自可辨认：①逗号分段里有没有空段（挡住 ``a,,b``、
+    多余首尾逗号——配置形状错误，独立审查 codex P1-1）；②每一项是不是合法标识符
+    形态（挡住通配符、空格、逗号本身混进单项）；③是不是 ``mcp__`` 前缀（挡住
+    Skill/Agent/Task/内置工具）；④是不是 ``QUERY_MCP_TOOL_PREFIX`` 前缀——**这一条
+    是 Issue #291 根因 #1 的装配期断言**：与 ``adapters/user_environment.py`` 写进
+    ``.mcp.json`` 的服务名不一致时启动失败关闭，不留到用户提问那一刻才发现工具全被
+    无声拒绝；⑤前缀之后是不是空的（挡住裸前缀 ``mcp__query__`` 本身，独立审查
+    codex P1-1）。
     """
 
     raw = _text(env, "READONLY_TOOLS") or ""
-    values = tuple(part.strip() for part in raw.split(",") if part.strip())
-    if not values:
+    if not raw:
         raise WorkerConfigError(
             f"{ENV_PREFIX}READONLY_TOOLS 必须至少包含一个合法工具名（逗号分隔多个，"
             f"例如 {QUERY_MCP_TOOL_PREFIX}list_metrics,{QUERY_MCP_TOOL_PREFIX}describe_metric）"
+        )
+    # 逐段保留（不先用 ``if part.strip()`` 过滤）：逗号间的空段（``a,,b``）、多余的
+    # 首尾逗号（``a,`` / ``,a``）都是配置形状错误，必须响亮拒绝，不能被静默丢弃成
+    # "看起来解析成功、其实少了一项"（独立审查 codex P1-1）。
+    values = tuple(part.strip() for part in raw.split(","))
+    empty_positions = [index + 1 for index, part in enumerate(values) if not part]
+    if empty_positions:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 存在空的逗号分段（第 {empty_positions} 段，从 1 计数，"
+            f"含多余的首尾逗号）：配置形状错误按失败关闭处理，不静默丢弃，收到原始值：{raw!r}"
         )
     malformed = [value for value in values if not is_well_formed_tool_name(value)]
     if malformed:
@@ -279,6 +291,17 @@ def _read_only_tools(env: Mapping[str, str]) -> tuple[str, ...]:
             f"（与用户环境 .mcp.json 的 MCP 服务名 {QUERY_MCP_SERVER_NAME!r} 一致，"
             "见 lingxi.core.mcp_naming 的 QUERY_MCP_SERVER_NAME），"
             f"收到前缀不匹配的工具名：{mismatched!r}"
+        )
+    # 前缀之后必须还有具体的工具名：``mcp__query__`` 本身（前缀后为空）虽然通过了
+    # 上面三段校验（合法标识符形态、mcp__ 前缀、query__ 前缀），但它不指向任何一个
+    # 真实工具，会被 PreToolUse 逐字比对无声拒绝——必须在装配期响亮报错，不能留到
+    # 用户提问那一刻才发现白名单里有一条"看似合法、实则永远拒绝"的空项
+    # （独立审查 codex P1-1）。
+    bare_prefix = [value for value in values if value == QUERY_MCP_TOOL_PREFIX]
+    if bare_prefix:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}READONLY_TOOLS 不能是裸前缀 {QUERY_MCP_TOOL_PREFIX!r}（前缀后必须跟具体"
+            f"的工具名，例如 {QUERY_MCP_TOOL_PREFIX}list_metrics），收到：{bare_prefix!r}"
         )
     # 去重且保序：同一个工具名在环境变量里写重不该产生"白名单有两条"的假象。
     return tuple(dict.fromkeys(values))

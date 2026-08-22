@@ -988,6 +988,31 @@ class WorkerConfigTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(WorkerConfigError):
                 self._load(LINGXI_WORKER_READONLY_TOOLS=value)
 
+    def test_read_only_tools_rejects_a_bare_prefix_with_nothing_after_it(self) -> None:
+        """独立审查 codex P1-1：``mcp__query__`` 本身通过合法标识符形态、``mcp__``
+        前缀、``QUERY_MCP_TOOL_PREFIX`` 前缀三段校验（它就是那个前缀字符串），但
+        前缀后面没有任何工具名——不指向任何真实工具，会被 PreToolUse 逐字比对
+        无声拒绝。必须在装配期响亮报错，不能留到用户提问那一刻才发现。"""
+        from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError) as caught:
+            self._load(LINGXI_WORKER_READONLY_TOOLS=QUERY_MCP_TOOL_PREFIX)
+        self.assertIn(QUERY_MCP_TOOL_PREFIX, str(caught.exception))
+
+    def test_read_only_tools_rejects_empty_segments_between_commas(self) -> None:
+        """独立审查 codex P1-1：逗号间的空段（``a,,b``）此前被 ``if part.strip()``
+        静默丢弃——配置里写错一个逗号，白名单悄悄少了一项，运维不会收到任何报错。
+        配置形状错误必须失败关闭，不能静默丢弃；多余的首尾逗号是同一类形状错误。"""
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        for value in (
+            "mcp__query__list_metrics,,mcp__query__describe_metric",
+            "mcp__query__list_metrics,",
+            ",mcp__query__list_metrics",
+        ):
+            with self.subTest(value=value), self.assertRaises(WorkerConfigError):
+                self._load(LINGXI_WORKER_READONLY_TOOLS=value)
+
     def test_read_only_tools_accepts_multiple_comma_separated_values(self) -> None:
         """Issue #291 P0 核心行为：真实问数 MCP 至少注册 3 个只读工具，白名单
         必须能同时放行全部，不能"放行一个、其余照拒"。"""
