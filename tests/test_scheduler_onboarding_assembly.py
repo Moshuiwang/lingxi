@@ -952,6 +952,96 @@ class InvariantBuildLoopTests(unittest.TestCase):
         onboarding._onboarding._onboarding_failed("directory_unavailable", "trc_1")
         stalled._alert(1)
 
+    def _wired_env(self) -> dict[str, str]:
+        """独立审查 codex P1-4 两条用例共用的装配夹具：`WIRED_ENV` 加上让开通编排
+        真的注册所需的凭据卷路径与权限表 Base 坐标（同
+        ``test_a_provided_alerting_duty_wires_both_onboarding_alert_callbacks``）。"""
+
+        import tempfile
+        from pathlib import Path
+
+        from cryptography.fernet import Fernet
+
+        credential_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(credential_dir.cleanup)
+        user_env_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(user_env_dir.cleanup)
+
+        return {
+            **WIRED_ENV,
+            "LINGXI_DELEGATED_CREDENTIAL_KEY": Fernet.generate_key().decode(),
+            "LINGXI_DELEGATED_CREDENTIAL_PATH": str(Path(credential_dir.name) / "delegated.enc"),
+            "LINGXI_USER_ENV_ROOT": user_env_dir.name,
+            "LINGXI_PERMISSION_BITABLE_APP_TOKEN": "bascnFakeToken",
+            "LINGXI_PERMISSION_BITABLE_TABLE_ID": "tblFakeTable",
+        }
+
+    def test_onboarding_registered_without_an_admin_group_warns_once(self) -> None:
+        """独立审查 codex P1-4：`LINGXI_ADMIN_GROUP_CHAT_ID` 未配置时，「已转交管理员
+        处理」这句用户承诺背后的送达出口会退化为仅日志（`V-告警-08`）——开通职责一旦
+        真的注册（会真的产生 `INTERNAL_ERROR`/`SYNC_TIMEOUT` 终态），装配期必须留一条
+        响亮 WARNING，不能让这个组合悄悄运行。不失败关闭：`build_loop` 正常返回。"""
+
+        from lingxi.apps.scheduler import build_loop
+
+        env = self._wired_env()
+        self.assertNotIn("LINGXI_ADMIN_GROUP_CHAT_ID", env)
+        audit = RecordingAudit()
+
+        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+            loop = build_loop(
+                SchedulerConfig.from_env(env),
+                roster_access_token=lambda: "employment-token",
+                audit=audit,
+            )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertIn("未开通首聊交接对账", names, "本用例的前提是开通编排真的注册了")
+        self.assertTrue(
+            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            captured.output,
+        )
+        self.assertIn(
+            (
+                "onboarding.admin_alert_channel_missing",
+                {
+                    "reason": "missing_environment_variable",
+                    "variable": "LINGXI_ADMIN_GROUP_CHAT_ID",
+                },
+            ),
+            audit.records,
+        )
+
+    def test_onboarding_registered_with_an_admin_group_does_not_warn(self) -> None:
+        """否定断言的对照组：配了 `LINGXI_ADMIN_GROUP_CHAT_ID` 之后，同一条组合不再
+        产生这条警告或审计——证明判据真的挂在配置上，不是恒定触发。"""
+
+        from lingxi.apps.scheduler import build_loop
+
+        env = {**self._wired_env(), "LINGXI_ADMIN_GROUP_CHAT_ID": "oc_admin_group"}
+        audit = RecordingAudit()
+
+        # 本用例的环境仍然没配花名册 Base 坐标，会各自留一条与本条无关的 WARNING
+        # （见 ``_build_roster_audit_duty``/``_build_roster_snapshot_sync_duty``）；
+        # 因此不能用「完全没有 WARNING」做判据，只断言**这一条**（提到
+        # ``LINGXI_ADMIN_GROUP_CHAT_ID`` 的那条）没有出现。
+        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+            loop = build_loop(
+                SchedulerConfig.from_env(env),
+                roster_access_token=lambda: "employment-token",
+                audit=audit,
+            )
+        self.addCleanup(loop.request_stop)
+
+        names = [duty.name for duty in loop.duties]
+        self.assertIn("未开通首聊交接对账", names)
+        self.assertFalse(
+            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            captured.output,
+        )
+        self.assertNotIn("onboarding.admin_alert_channel_missing", audit.actions())
+
 
 class SchedulerConfigTests(unittest.TestCase):
     def test_defaults_keep_the_duty_optional(self) -> None:

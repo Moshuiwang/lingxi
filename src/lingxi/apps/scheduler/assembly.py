@@ -1425,6 +1425,25 @@ def build_loop(
     )
     if onboarding is not None:
         duties.append(onboarding)
+        if not config.admin_group_chat_id:
+            # 独立审查 codex P1-4：开通职责已注册（会真的产生 INTERNAL_ERROR /
+            # SYNC_TIMEOUT 终态），`onboarding_failed` 回调也已经接上（只要
+            # `alerting_duty` 存在，`main()` 里恒定存在），但没有配
+            # `LINGXI_ADMIN_GROUP_CHAT_ID` 时 `AlertDispatcher` 的送达出口会退化成
+            # `_LogOnlyAlertSender`（`V-告警-08` 既定语义：不失败关闭，状态机照常
+            # 运行）——用户看到的「已转交管理员处理」这句承诺因此没有任何人会真的
+            # 看到。这不是一个需要拒绝启动的错误（LogOnly 是产品接受的降级形态），
+            # 但必须在启动期留一条响亮日志，不能让这个组合悄悄运行。
+            logger.warning(
+                "已注册首次开通编排，但未配置 LINGXI_ADMIN_GROUP_CHAT_ID："
+                "「已转交管理员处理」的送达面将退化为仅结构化日志，管理群收不到任何"
+                "开通失败 / 同步超时告警（V-告警-08 既定语义，不阻止启动）"
+            )
+            sink.record(
+                "onboarding.admin_alert_channel_missing",
+                reason="missing_environment_variable",
+                variable="LINGXI_ADMIN_GROUP_CHAT_ID",
+            )
     # 迟到就绪恢复（V-开通-18）排在首次开通编排**之后**：它服务的是首次开通那次阻塞
     # 确认已经判过超时、后续再也没有人回来看的用户，位置只是"同一轮内先声明的职责先
     # 跑"的自然顺序，不构成数据依赖——它按自己的十五分钟节奏在候选查询里判到期，不是
