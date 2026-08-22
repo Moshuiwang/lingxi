@@ -719,9 +719,13 @@ def _build_onboarding_duty(
         directory=PostgresOrgSnapshotStore(dsn, timeouts=timeouts),
         employment=FeishuEmploymentReader(
             # `sleep=stop.wait`（Issue #284 A 组 #4）：节流/限频退避里的等待能被
-            # SIGTERM 立刻打断，同 `McpReadinessConfirmation`/`PermissionNoticeDispatcher`
-            # 已有的同一份 `stop` 用法。不中断进行中的单次 HTTP 请求，也不阻止已经
-            # 置位后发起下一次请求——只是让「要不要等」这一步能被提前结束。
+            # SIGTERM 立刻打断。这里刻意用裸传，不像组织快照那侧包
+            # `_stop_aware_sleep` 中止（登记不修，独立审查二轮 P2-B1）：开通链
+            # 工作线程处理的是**已认领的用户**，停机预算内完成当前链避免用户
+            # 结果丢失（重启不得造成结果丢失的红线）；其单用户请求量级小（数次
+            # 调用），与组织快照整轮数百次不同；置位后等待归零的暴露窗口有界。
+            # `test_scheduler_onboarding_assembly.py::…uses_stop_wait_as_its_sleeper`
+            # 已锁定此行为是刻意的。
             client=FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=stop.wait),
             access_token=employment_access_token,
         ),
