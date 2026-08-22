@@ -740,8 +740,10 @@ class InternalFaultTests(unittest.TestCase):
 
 
 class OnboardingFailedAlertCallbackTests(unittest.TestCase):
-    """管理员送达（Issue #280 §7.3 步 1）：只在真正走到 `INTERNAL_ERROR` 终态时调用
-    一次注入的可选回调，签名 `(reason, trace_id)`，不含 open_id / 姓名 / 任何资料值。"""
+    """管理员送达（Issue #280 §7.3 步 1；`SYNC_TIMEOUT` 覆盖见独立审查 codex
+    P1-3）：只在真正走到 `INTERNAL_ERROR` 或 `SYNC_TIMEOUT` 终态时调用一次注入的
+    可选回调，签名 `(reason, trace_id)`，不含 open_id / 姓名 / 任何资料值——
+    `SYNC_TIMEOUT` 的专用用例在 `SyncTimeoutTests` 里（离它自己的终态断言更近）。"""
 
     def test_an_internal_error_terminal_triggers_the_callback_exactly_once(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -856,6 +858,27 @@ class SyncTimeoutTests(unittest.TestCase):
         self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
         # Issue #280 裁定 B2-4：`onboarding.sync_timeout` 也加追溯号。
         self.assertEqual(parts["notifier"].terminal()[2], {"reference": "trace_1"})
+        self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
+        self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
+
+    def test_a_sync_timeout_terminal_also_triggers_the_admin_callback(self) -> None:
+        """独立审查 codex P1-3：产品合同对同步超时的措辞同样是"停止自动等待，
+        转交管理员处理"（``docs/产品合同与外部边界.md``「权限同步期间」一节），
+        与 ``INTERNAL_ERROR`` 分支承诺的"已转交管理员处理"是同一句产品承诺——
+        此前只有后者真的送达管理群，``sync_timeout`` 这句承诺背后没有任何送达
+        动作。``reason`` 用 ``mcp_sync_timeout``，与内部故障的原因码（如
+        ``directory_unavailable``）可区分，管理员据此分得清"这是同步超时在等"
+        还是"这是本侧真的坏了"。这条断言只覆盖告警侧，**不改变**
+        ``late_readiness_recovery`` 的自动恢复语义：``provisioning_state`` 仍然
+        停在 ``mcp_syncing``，不会因为这条告警被推进。"""
+
+        calls: list[tuple[str, str]] = []
+        parts, _ = run_once(
+            readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        self.assertEqual(calls, [("mcp_sync_timeout", "trace_1")])
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SYNC_TIMEOUT)
         self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
         self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
 

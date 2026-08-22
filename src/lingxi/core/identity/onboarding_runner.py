@@ -122,8 +122,11 @@ Issue #65 钉在开工卡上的「共用线程复核」在搬迁之后的同一�
 activate_after_late_readiness`，条件更新只在 `provisioning_state = 'mcp_syncing'`
 且账号仍启用且权限版本与探针绑定的那一版一致时才推进，同样只前进不回退）——因此
 `active` 现在有**两个**写入方，各自的条件更新虽不是同一个方法，但守卫口径一致
-（只前进、只在账号启用时推进），不构成竞态。**本模块自身不改**：它仍然在判超时时
-当场返回，恢复不在这条链的调用栈里发生。**这条缺口同时登记在**
+（只前进、只在账号启用时推进），不构成竞态。**本模块自身不改判超时时的状态推进**：
+它仍然在判超时时当场返回，`provisioning_state` 的推进与恢复不在这条链的调用栈里
+发生——**独立审查 codex P1-3 新增的只是告警侧的一次调用**（:meth:`_notify_admin_
+of_failure`），让「转交管理员处理」这句话对 `sync_timeout` 也有真实送达，不改变
+上面这条恢复语义半分毫。**这条缺口同时登记在**
 ``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
 ——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
 另一个 Story 的范围，本次改动只更新了验收矩阵。
@@ -505,11 +508,12 @@ class AutoOnboardingRunner:
         self._publish_allowed = publish_allowed
         if onboarding_failed is not None and not callable(onboarding_failed):
             raise TypeError("onboarding_failed 回调必须可调用或为 None")
-        #: 管理员送达回调（Issue #280 §7.3）。**可选**：不注入时行为等价于此前——
-        #: 用户仍然收到冻结文案，只是没有任何东西送到管理群。注入时只在真正走到
-        #: ``INTERNAL_ERROR`` 终态时调用一次，签名是 ``(reason, trace_id)``——两者
-        #: 都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也没有
-        #: 传这些的位置。
+        #: 管理员送达回调（Issue #280 §7.3；``SYNC_TIMEOUT`` 覆盖见独立审查
+        #: codex P1-3）。**可选**：不注入时行为等价于此前——用户仍然收到冻结
+        #: 文案，只是没有任何东西送到管理群。注入时在真正走到 ``INTERNAL_ERROR``
+        #: 或 ``SYNC_TIMEOUT`` 终态时各调用一次，签名是 ``(reason, trace_id)``——
+        #: 两者都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也
+        #: 没有传这些的位置。
         self._onboarding_failed = onboarding_failed
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
@@ -541,7 +545,7 @@ class AutoOnboardingRunner:
                 event_id=event_id,
                 trace_id=trace_id,
             )
-            self._notify_admin_of_internal_error(
+            self._notify_admin_of_failure(
                 reason="stopping", event_id=event_id, trace_id=trace_id
             )
             return _internal("stopping").as_result(trace_id=trace_id)
@@ -591,7 +595,7 @@ class AutoOnboardingRunner:
             self._audit.record(
                 "onboarding.rejected_by_executor", event_id=event_id, trace_id=trace_id
             )
-            self._notify_admin_of_internal_error(
+            self._notify_admin_of_failure(
                 reason="executor_unavailable", event_id=event_id, trace_id=trace_id
             )
             return _internal("executor_unavailable").as_result(trace_id=trace_id)
@@ -602,12 +606,12 @@ class AutoOnboardingRunner:
             if self._running.get(open_id) == event_id:
                 del self._running[open_id]
 
-    def _notify_admin_of_internal_error(
+    def _notify_admin_of_failure(
         self, *, reason: str, event_id: str, trace_id: str
     ) -> None:
-        """管理员送达（Issue #280 §7.3）的唯一触发点：只在真正走到本侧故障终态
-        （``OnboardingState.INTERNAL_ERROR``）时调用一次，与用户通知彼此独立——
-        告警回调失败不得带走这条链本该有的用户结论。
+        """管理员送达（Issue #280 §7.3）的唯一触发点：只在真正走到"承诺过转交
+        管理员处理"的终态时调用一次，与用户通知彼此独立——告警回调失败不得
+        带走这条链本该有的用户结论。
 
         独立审查（分支 fix/291-280-user-experience 收尾）：``start()`` 里两条
         **同步**返回 ``INTERNAL_ERROR`` 的分支（``stopping``——停机中拒绝开新链；
@@ -616,6 +620,18 @@ class AutoOnboardingRunner:
         是冻结文案「已转交管理员处理」，管理群却真的什么都没收到——文案承诺与
         实际行为对不上。现在三处（这两条同步分支 + ``_execute`` 自己的
         ``INTERNAL_ERROR`` 分支）共用这一个触发点，不允许再出现第四条漏网路径。
+
+        独立审查 codex P1-3：``_execute`` 的调用点现在同时覆盖
+        ``OnboardingState.SYNC_TIMEOUT``——产品合同（``docs/产品合同与外部边界.md``
+        「权限同步期间」一节）对十五分钟同步超时的措辞同样是"停止自动等待，
+        **转交管理员处理**"，与 ``INTERNAL_ERROR`` 分支承诺的"已转交管理员处理"
+        是同一句产品承诺，此前却只有后者真的送达管理群。``reason`` 沿用
+        ``_Terminal.reason``（``"mcp_sync_timeout"``），与内部故障的原因码
+        （如 ``"directory_unavailable"``）在归一化后的 ``scope`` 里天然可区分，
+        管理员据此能分清"这是同步超时在等"还是"这是本侧真的坏了"——**不改变**
+        :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的自动恢复语义：
+        这条告警只是"让管理群知道"，恢复仍然由该模块的迟到就绪恢复职责独立完成
+        （``V-开通-18``），两者不是同一件事，也不互相依赖。
         """
 
         if self._onboarding_failed is None:
@@ -681,8 +697,12 @@ class AutoOnboardingRunner:
             content_key=terminal.key,
             trace_id=trace_id,
         )
-        if terminal.state is OnboardingState.INTERNAL_ERROR:
-            self._notify_admin_of_internal_error(
+        if terminal.state in (OnboardingState.INTERNAL_ERROR, OnboardingState.SYNC_TIMEOUT):
+            # SYNC_TIMEOUT 与 INTERNAL_ERROR 是产品合同里两句独立措辞（`docs/产品
+            # 合同与外部边界.md`），但都承诺"转交管理员处理"——两者都必须真的送达
+            # 管理群（独立审查 codex P1-3）。reason 沿用各自终态的 terminal.reason，
+            # 不折叠成同一个值，管理员据此分得清是哪一类。
+            self._notify_admin_of_failure(
                 reason=terminal.reason or "unknown", event_id=event_id, trace_id=trace_id
             )
         delivered = self._notify(
