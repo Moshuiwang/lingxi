@@ -113,6 +113,68 @@ def _denied_tool_summary(report: Mapping[str, Any]) -> tuple[int, tuple[str, ...
     return count, tuple(names[:_MAX_LOG_DENIED_TOOL_NAMES])
 
 
+def _tool_result_count(report: Mapping[str, Any]) -> int:
+    """从一次回合报告里取出这一轮**真实**工具调用次数（Issue #291 L6 取证结论补的
+    可观测性缺口）。
+
+    2026-08-22 那次取证：模型（qwen3.7-plus）把工具调用非确定性地写成了正文散文，
+    回合仍然 ``closed=True`` 收口，一段被出口净化层遮蔽过的 tool_use JSON 被当成
+    「查询完成」交付给用户。定位这件事花了 40 分钟，因为运维手里没有任何一个字段
+    能直接回答"这一轮到底有没有真的调用过工具"——只能翻完整条 Claude Agent SDK
+    事件流去数。``report["audit"]["tool_result_count"]``（``report.py`` 的
+    ``stream.tool_result_count``）早就算出来了，只是从未随终态审计事件一起离开
+    进程。这里把它取出来，写进 ``worker.task.terminal``；今天有这个字段，同一次
+    取证是 1 分钟，不是 40 分钟。
+
+    ``tool_result_count == 0`` **单独不构成**异常信号——闲聊类问题本来就不需要
+    调用任何工具，这条字段只负责"如实记录事实"，不在这里做任何判定。真正的判定
+    见 ``_protocol_breakdown_reasons``：那条只认 ``output_safety.reasons``，与
+    这里的调用次数无关，不能把两者混为一谈（各自的判据必须能独立解释各自的
+    产品事实）。
+
+    ``report["audit"]`` 在早退分支（开工前已 ``stop_requested``、读用户 MCP 配置
+    失败、执行器抛出未预期异常）不存在，如实返回 0，理由与 ``_denied_tool_
+    summary`` 相同：不假装有据可查。
+    """
+
+    audit = report.get("audit") if isinstance(report, Mapping) else None
+    if not isinstance(audit, Mapping):
+        return 0
+    count = audit.get("tool_result_count")
+    return count if isinstance(count, int) else 0
+
+
+# P0 护栏（Issue #291 L6 取证结论）：模型正文里出现内部工具名或过程标记
+# （``mcp__``、``tool_use_id``、``trace_id`` 这类协议细节），**永远**是模型把
+# 工具调用协议写成了正文散文，不是"内容需要脱敏但业务结论还在"。
+# ``core/execution/input_safety.py`` 的净化层职责到"遮蔽敏感片段"为止——它不
+# 判断"这段正文根本不该被当成答案交付"，那个判断只能发生在这里（收到 `output_
+# safety.reasons` 的调用方）。刻意排除其余原因码（``forbidden_value``/
+# ``forbidden_fragment``/``system_prompt_marker``）：那三类是"内容含有已知敏感
+# 值/系统提示"，`withheld` 分支已经按"是否还有幸存业务内容"正确处理，不属于本
+# 护栏收紧的范围，收紧过窄的边界会误伤正常业务回答。
+_PROTOCOL_BREAKDOWN_REASON_CODES = frozenset({"internal_tool_name", "process_marker"})
+_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE = "model_protocol_breakdown"
+
+
+def _protocol_breakdown_reasons(output_safety: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """从 ``turn.output_safety.reasons`` 里取出命中 P0 护栏的原因码（如果有）。
+
+    只做字面判定，不猜测：``reasons`` 形状不对就如实返回空元组，交给上层按
+    "没有命中"处理——护栏要收紧的是"命中了却被当成成功"，不是"形状可疑就一律
+    判失败"（那会把真实的执行器异常伪装成协议异常，污染审计）。
+    """
+
+    if not isinstance(output_safety, Mapping):
+        return ()
+    raw_reasons = output_safety.get("reasons")
+    if not isinstance(raw_reasons, (list, tuple)):
+        return ()
+    return tuple(
+        str(reason) for reason in raw_reasons if str(reason) in _PROTOCOL_BREAKDOWN_REASON_CODES
+    )
+
+
 class WorkerService:
     """一个进程持续消费一个固定 target version 的任务。
 
@@ -272,11 +334,13 @@ class WorkerService:
         return terminals
 
     def _cleanup_agent_sessions(self) -> None:
-        """认领并物理删除一批到期的 Agent 会话 JSONL（Issue #153）。
+        """认领并（先归档、再）物理清理一批到期的 Agent 会话 JSONL（Issue #153；
+        归档见 Issue #291 L6 取证结论、``session_cleanup.py`` 模块文档「删除前先
+        归档」——``/new`` 等触发点排的清理不再直接销毁原始转录）。
 
         没有配置可用的会话根目录，或队列适配器不支持这组方法（旧测试用的假队列）
         时整体跳过——不半途认领又做不了事，让请求继续排队给下一个真正能处理它的
-        进程。单条删除失败不清 ``done_at``：下一轮的十分钟软领取窗口会重试，见迁移
+        进程。单条处理失败不清 ``done_at``：下一轮的十分钟软领取窗口会重试，见迁移
         0061 头部注释。
         """
 
@@ -314,10 +378,18 @@ class WorkerService:
         done_ids: list[str] = []
         for item in pending:
             try:
-                delete_agent_session_files(self._session_root, item.agent_session_id)
+                # 归档先于删除（Issue #291 L6 取证结论，见 session_cleanup.py
+                # 模块文档「删除前先归档」）：`/new` 等触发点排的清理如果直接
+                # 物理删除，会把验收/取证现场需要的原始 JSONL 一并销毁。
+                delete_agent_session_files(
+                    self._session_root,
+                    item.agent_session_id,
+                    user_env_root=self._config.user_env_root,
+                    user_id=item.user_id,
+                )
             except Exception as error:  # noqa: BLE001 - 单条失败不影响本轮其余条目
                 logger.error(
-                    "Agent 会话 JSONL 物理删除失败 reason=%s error=%s",
+                    "Agent 会话 JSONL 归档/物理删除失败 reason=%s error=%s",
                     item.reason,
                     type(error).__name__,
                 )
@@ -480,6 +552,14 @@ class WorkerService:
         # 改写成 redacted_withheld——运维丢失真实失败终态，验收拿到假阳性证据。
         deliverable = bool(turn.get("closed")) and not failure
         denied_count, denied_tool_names = _denied_tool_summary(report)
+        tool_result_count = _tool_result_count(report)
+        # P0 护栏（Issue #291 L6 取证结论，见 `_protocol_breakdown_reasons`）：
+        # `closed=True` 且没有 `failure` 只说明"SDK 认为这一轮正常收口"，不说明
+        # "这段正文是一个可以交付给用户的答案"。模型把工具调用协议细节写成正文
+        # 散文时，`output_safety` 的净化层会正确遮蔽敏感片段但仍然把（遮蔽后的）
+        # 残余正文当成有效业务内容放行——`withheld` 因此不会置位，旧实现就此把
+        # 一段协议残骸当成「查询完成」交付。这里单独判定，不依赖 `withheld`。
+        protocol_breakdown_reasons = _protocol_breakdown_reasons(output_safety)
 
         # 终态优先级（Issue #195）：真中断 → 其他失败 → withheld → 成功。
         # 此前第一分支是 `stop_requested or failure_code == "interrupted"`，
@@ -529,6 +609,7 @@ class WorkerService:
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
+                tool_result_count=tool_result_count,
             )
         elif not deliverable:
             error_kind, content = self._failure_content(failure_code)
@@ -545,6 +626,30 @@ class WorkerService:
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
+                tool_result_count=tool_result_count,
+            )
+        elif protocol_breakdown_reasons:
+            # P0 护栏（Issue #291 L6 取证结论）：模型正文里出现内部工具名或过程
+            # 标记，永远是模型把工具调用协议写成了正文散文，不是一个可以交付给
+            # 用户的答案——不得判 success。复用既有失败终态形状（`TerminalKind.
+            # FAILED`）与既有用户文案路径（`_failure_content` → `worker.failed`
+            # 通用失败文案）：#280 的追溯号机制只覆盖 `inbound_event`（首次开通
+            # 事件），`ClaimedTask`/`SessionCleanupTask` 都不携带能回查那张表的
+            # `trace_id`，在 worker 这条队列消费链路上不可达，因此不额外编造一个
+            # 走不通的追溯号占位符——用户看到的仍是通用失败文案，真实原因只进
+            # `failure_code`/审计日志，供运维用 `worker.task.terminal` 查询。
+            error_kind, content = self._failure_content(_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE)
+            self._finish_terminal(
+                claimed,
+                terminal_kind=TerminalKind.FAILED.value,
+                error_kind=error_kind,
+                content=content,
+                elapsed_seconds=elapsed_seconds,
+                failure_code=_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE,
+                output_safety=output_safety,
+                denied_count=denied_count,
+                denied_tool_names=denied_tool_names,
+                tool_result_count=tool_result_count,
             )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
@@ -560,11 +665,13 @@ class WorkerService:
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
+                tool_result_count=tool_result_count,
             )
         else:
-            # 走到这里必然 `deliverable and not withheld`：回合已收口、有结果、
-            # 没有失败。即使 stop 晚到，这份已经产出的结果照常交付，
-            # `session_id` 照常持久化（Issue #195）。
+            # 走到这里必然 `deliverable and not withheld and not protocol_
+            # breakdown_reasons`：回合已收口、有结果、没有失败、正文没有触发
+            # P0 护栏。即使 stop 晚到，这份已经产出的结果照常交付，`session_id`
+            # 照常持久化（Issue #195）。
             self._finish_terminal(
                 claimed,
                 terminal_kind=TerminalKind.SUCCESS.value,
@@ -576,6 +683,7 @@ class WorkerService:
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
+                tool_result_count=tool_result_count,
             )
 
     def _append_event(
@@ -620,6 +728,7 @@ class WorkerService:
         output_safety: Mapping[str, Any] | None = None,
         denied_count: int = 0,
         denied_tool_names: tuple[str, ...] = (),
+        tool_result_count: int = 0,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -630,8 +739,9 @@ class WorkerService:
 
         本方法是 ``_process_task`` 里所有终态写入的唯一收口点，因此低敏审计日志
         （Issue #90 评论 5306860255；``denied_count``/``denied_tool_names`` 见
-        Issue #291 独立审查）放在这里记一次，覆盖 stop/withheld/success/failure
-        全部分支，不必在每个分支各写一遍。
+        Issue #291 独立审查；``tool_result_count`` 见 Issue #291 L6 取证结论）
+        放在这里记一次，覆盖 stop/withheld/success/failure 全部分支，不必在每个
+        分支各写一遍。
         """
 
         self._log_terminal_outcome(
@@ -642,6 +752,7 @@ class WorkerService:
             output_safety=output_safety,
             denied_count=denied_count,
             denied_tool_names=denied_tool_names,
+            tool_result_count=tool_result_count,
         )
         self._queue.write_terminal_event(
             task_id=claimed.task_id,
@@ -663,19 +774,26 @@ class WorkerService:
         output_safety: Mapping[str, Any] | None,
         denied_count: int = 0,
         denied_tool_names: tuple[str, ...] = (),
+        tool_result_count: int = 0,
     ) -> None:
         """queue 收口低敏结构化审计事件（Issue #90 评论 5306860255）：queue 链路
         此前失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记
         分类性的失败码、落库 ``error_kind``、``terminal_kind``、安全判定的
-        布尔/原因码，以及本回合被 ``ToolPolicy`` 拒绝的调用计数与工具名——
-        **严禁**记录正文内容、用户 open_id、prompt、模型输出片段或工具入参
-        正文。
+        布尔/原因码、本回合被 ``ToolPolicy`` 拒绝的调用计数与工具名，以及这一轮
+        真实的工具调用次数——**严禁**记录正文内容、用户 open_id、prompt、模型
+        输出片段或工具入参正文。
 
         ``denied_count``/``denied_tool_names`` 是 Issue #291 独立审查补的一项：
         ``tool_policy.py`` 的拒绝文案对用户承诺"这是系统侧的临时限制、问题
         已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
         （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
         导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
+
+        ``tool_result_count`` 是 Issue #291 L6 取证结论补的一项（见
+        ``_tool_result_count`` 的完整说明）：2026-08-22 那次取证——模型把工具
+        调用协议写成正文散文、被净化层遮蔽后仍当成成功交付——运维定位"这一轮
+        到底有没有真的调用过工具"花了 40 分钟，因为这个字段此前同样从未离开
+        进程。
 
         独立复核 P1：这条事件不能直接调用 stdlib ``logging``——``WorkerService``
         不知道自己会被哪个进程入口装配，而真实队列 worker 的 ``apps/worker/
@@ -730,6 +848,7 @@ class WorkerService:
             "output_safety_reasons": tuple(capped_reasons),
             "denied_count": denied_count,
             "denied_tool_names": tuple(capped_denied_tool_names),
+            "tool_result_count": tool_result_count,
             "truncated": truncated,
         }
         try:
@@ -786,6 +905,12 @@ class WorkerService:
             # 而重试对"问题本身步骤太多"这种失败原因没有意义。这里给它一个
             # 独立、可查询的 error_kind 和产品负责人定稿的专属文案。
             return "max_turns_exceeded", self._catalog.text("worker.max_turns")
+        if code == _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE:
+            # Issue #291 L6 取证结论：不新增专属用户文案——「模型把工具调用协议
+            # 写成了正文」是运维需要知道的事实，不是用户需要（或应该）知道的
+            # 过程细节；把它说给用户听本身就是又一次过程泄漏。复用通用失败文案，
+            # 专属性只保留在 `failure_code`（审计/日志可查）。
+            return _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE, self._catalog.text("worker.failed")
         return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
