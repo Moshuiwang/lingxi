@@ -53,11 +53,12 @@ for loaded_name in sorted(sys.modules):
         loaded_name == forbidden
         or loaded_name.startswith(forbidden + ".")
         for forbidden in (
+            # 2026-08-23 #146 清退：feishu_onboarding/refresh_tokens/postgres_onboarding
+            # 三个 Bot-Test 资产模块已删除，不再需要在这里列出；core.identity.onboarding
+            # 与 oauth_bridge 是 #67 裁定保留的 E1 授权基础设施及其依赖，继续保留在
+            # 禁止名单里——它们仍然不属于正式渲染入口的传递依赖闭包。
             "lingxi.core.identity.onboarding",
-            "lingxi.adapters.feishu_onboarding",
             "lingxi.adapters.oauth_bridge",
-            "lingxi.adapters.refresh_tokens",
-            "lingxi.adapters.postgres_onboarding",
         )
     ):
         print(loaded_name)

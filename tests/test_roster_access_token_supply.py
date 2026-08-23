@@ -1388,11 +1388,6 @@ FORMAL_CLAIM_FILES = {
     # 唯一一处领取凭据（原子置位消费标记）的地方。同上，随 #237 搬去了子模块。
     "apps/scheduler/credential_rotation.py",
 }
-#: Bot-Test 受控验证资产：它们各有一套自己的续期实现，属于「正式开发的参考实现」，
-#: 不属于正式用户入口（代码框架第五节）。豁免不是白名单一写了事——下面两条自证
-#: 要求它们**仍然自己声明**是测试资产，且**没有被任何 apps/ 进程 import**。
-BOT_TEST_ASSETS = {"adapters/refresh_tokens.py"}
-BOT_TEST_DECLARATION = "不属于正式 Lingxi 用户入口"
 
 
 class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
@@ -1404,6 +1399,10 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
 
     源码扫描而不是行为用例，是因为这条要证明的是一条路径**不存在**——没有调用点
     可以断言，只能反向枚举。
+
+    2026-08-23 #146 清退：唯一的 Bot-Test 受控验证资产消费者 `adapters/
+    refresh_tokens.py` 已删除（生产侧无对应替代物，替换为正式凭据轮换职责的
+    唯一消费入口），下方扫描不再需要豁免集合——全仓库现在只有一处合法消费者。
     """
 
     def _sources(self):
@@ -1457,58 +1456,9 @@ class RefreshTokenHasExactlyOneConsumerTest(unittest.TestCase):
             if scanner.claim_sites:
                 claim_files.add(relative)
 
-        self.assertEqual(grant_type_files - BOT_TEST_ASSETS, FORMAL_GRANT_TYPE_FILES)
-        self.assertEqual(refresh_call_files - BOT_TEST_ASSETS, FORMAL_REFRESH_CALL_FILES)
-        self.assertEqual(claim_files - BOT_TEST_ASSETS, FORMAL_CLAIM_FILES)
-
-    def test_every_exempted_asset_still_declares_itself_a_test_asset(self) -> None:
-        """豁免的自证之一：资产头部声明还在。声明一旦被删掉（有人把它当正式代码用），
-        这里立刻变红。"""
-
-        for relative in BOT_TEST_ASSETS:
-            with self.subTest(module=relative):
-                source = (SOURCE_ROOT / relative).read_text(encoding="utf-8")
-                docstring = ast.get_docstring(ast.parse(source)) or ""
-                self.assertIn(BOT_TEST_DECLARATION, docstring)
-
-    def test_no_process_entry_point_imports_an_exempted_asset(self) -> None:
-        """豁免的自证之二：没有任何 ``apps/`` 进程 import 这些资产。
-
-        只看模块级 import 是不够的——本仓库的依赖大多写在函数体里（代码框架第六节），
-        因此这里扫的是整棵语法树上的全部 ``import`` 语句。
-        """
-
-        exempted_modules = {
-            "lingxi." + relative.removesuffix(".py").replace("/", ".")
-            for relative in BOT_TEST_ASSETS
-        }
-        offenders: list[str] = []
-        for path in sorted((SOURCE_ROOT / "apps").rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                imported: set[str] = set()
-                if isinstance(node, ast.Import):
-                    imported = {alias.name for alias in node.names}
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imported = {node.module} | {
-                        f"{node.module}.{alias.name}" for alias in node.names
-                    }
-                for module in imported & exempted_modules:
-                    offenders.append(f"{path.relative_to(SOURCE_ROOT).as_posix()}:{node.lineno} {module}")
-
-        self.assertEqual(offenders, [])
-
-    def test_the_import_scan_would_catch_a_function_level_import(self) -> None:
-        """防空扫：函数体内的 import 也必须被看见，否则上一条断言形同虚设。"""
-
-        tree = ast.parse("def build():\n    from lingxi.adapters.refresh_tokens import Vault\n")
-        found = [
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        ]
-
-        self.assertEqual(found, ["lingxi.adapters.refresh_tokens"])
+        self.assertEqual(grant_type_files, FORMAL_GRANT_TYPE_FILES)
+        self.assertEqual(refresh_call_files, FORMAL_REFRESH_CALL_FILES)
+        self.assertEqual(claim_files, FORMAL_CLAIM_FILES)
 
 
 # --------------------------------------------------------------------------

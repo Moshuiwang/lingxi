@@ -79,24 +79,12 @@ gateway = [
     "psycopg[binary]>=3.2,<4",
     "websockets>=15,<16",
 ]
-# Bot-Test 受控验证资产（代码框架第五节列举的那一批），**不是正式生产进程**；
-# `bot-test` 组本身不进生产镜像，但 `websockets` 也由正式 reauthorize 入口共享使用。
-# 含常驻长连接进程 `adapters/feishu_onboarding.run_long_connection_bot`
-# 与 `scripts/` 下的受控脚本。依据：
-#   lark-oapi   → adapters/feishu_onboarding.py（LarkCardSender 发卡片、长连接收事件）
-#   websockets  → adapters/oauth_bridge.py（旧 Bot-Test OAuth 结果桥接长连接）
-#   psycopg     → adapters/refresh_tokens.py、postgres_onboarding.py、galaxy_import.py 等
-#   cryptography→ adapters/refresh_tokens.py（refresh_token 加密轮换）
-# lark-oapi 保留为运行时依赖、不降为 CI-only：2026-08-06 产品负责人否决 #39 的替换
-# 建议（登记见 #39 收口评论与 #57）。正式 gateway 进程已于 #57 落地，长连接与发消息
-# 的依赖已提升为上面的 `gateway` 组；本组保留同名依赖是因为 Bot-Test 那套受控资产在
-# #67 交付前整体保留（代码框架第五节），两组各自独立声明、互不依赖。
-bot-test = [
-    "cryptography==45.0.7",
-    "lark-oapi==1.7.1",
-    "psycopg[binary]>=3.2,<4",
-    "websockets>=15,<16",
-]
+# 2026-08-23 #146 清退：`bot-test` 组随 feishu_onboarding.py/refresh_tokens.py/
+# postgres_onboarding.py 三个 Bot-Test 消费者一并删除——它们是这组里 lark-oapi、
+# cryptography、psycopg 三项依赖唯一的存在理由。保留件 `adapters/oauth_bridge.py`
+# （#67 裁定的 E1 授权基础设施参考实现）不需要独立 extra：它只用标准库加本地
+# `oauth_bridge_client` 传输，后者的 `websockets` 依赖已由 `scheduler`/`reauthorize`
+# 两组声明覆盖，没有第三个未被满足的依赖需要专设一组。详见代码框架第五、六节。
 # 数据库迁移（Issue #53）。**这一组不是常驻进程**，是部署时跑一次的迁移作业：
 # `LINGXI_MIGRATION_DSN=... python -m alembic upgrade head`。它单独成组而不是挂进
 # scheduler，有三个理由：

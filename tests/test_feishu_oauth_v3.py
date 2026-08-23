@@ -1,27 +1,16 @@
-"""飞书 OAuth v3 授权、令牌轮换的无网络断言。"""
+"""飞书 OAuth v3 授权的无网络断言。
+
+2026-08-23 #146 清退：本文件此前还覆盖 Bot-Test 测试资产 `adapters/refresh_tokens.py`
+的令牌轮换断言（`FakeVault`/`FeishuUserTokenRefresher` 两个用例），随该资产一并清退；
+`FeishuOAuthIdentityLoader` 属于保留件 `adapters/oauth_bridge.py`（#67 裁定的 E1 授权
+基础设施），其断言原样保留。
+"""
 
 from __future__ import annotations
 
 import unittest
 
 from lingxi.adapters.oauth_bridge import FeishuOAuthIdentityLoader, OAuthTokenGrant
-from lingxi.adapters.refresh_tokens import FeishuUserTokenRefresher
-
-
-class FakeVault:
-    def __init__(self, due: list[tuple[str, OAuthTokenGrant]]) -> None:
-        self._due = due
-        self.replaced: list[tuple[str, OAuthTokenGrant]] = []
-        self.removed: list[str] = []
-
-    def due(self) -> list[tuple[str, OAuthTokenGrant]]:
-        return self._due
-
-    def replace(self, open_id: str, grant: OAuthTokenGrant) -> None:
-        self.replaced.append((open_id, grant))
-
-    def remove(self, open_id: str) -> None:
-        self.removed.append(open_id)
 
 
 class FeishuOAuthV3Test(unittest.TestCase):
@@ -101,23 +90,3 @@ class FeishuOAuthV3Test(unittest.TestCase):
         self.assertEqual(report["组织遍历"]["可见成员条目数"], 1)  # type: ignore[index]
         self.assertEqual(report["王志鹏"], {"name": "王志鹏", "open_id": "ou_wan…", "job_title": "负责人", "parent_departments": []})
         self.assertTrue(any("target_department_id=od_root" in url for url in seen))
-
-    def test_successful_refresh_replaces_one_time_credential(self) -> None:
-        vault = FakeVault([("ou_test", OAuthTokenGrant("old", 100, "offline_access"))])
-        refresher = FeishuUserTokenRefresher(vault, "cli_test", "secret")
-        refresher._refresh = lambda _token: OAuthTokenGrant("new", 200, "offline_access")  # type: ignore[method-assign]
-
-        refresher.refresh_due_once()
-
-        self.assertEqual(vault.replaced, [("ou_test", OAuthTokenGrant("new", 200, "offline_access"))])
-        self.assertEqual(vault.removed, [])
-
-    def test_uncertain_refresh_removes_old_credential_without_retrying(self) -> None:
-        vault = FakeVault([("ou_test", OAuthTokenGrant("old", 100, "offline_access"))])
-        refresher = FeishuUserTokenRefresher(vault, "cli_test", "secret")
-        refresher._refresh = lambda _token: (_ for _ in ()).throw(OSError("network"))  # type: ignore[method-assign]
-
-        refresher.refresh_due_once()
-
-        self.assertEqual(vault.replaced, [])
-        self.assertEqual(vault.removed, ["ou_test"])

@@ -109,8 +109,9 @@ if [[ -d tests ]]; then
 fi
 
 if [[ -n "${LINGXI_POSTGRES_CONTAINER:-}" ]]; then
-  tests/test_identity_postgres.sh
-  printf 'PostgreSQL 自动测试：通过\n'
+  # 2026-08-23 #146 清退：tests/test_identity_postgres.sh 随 migrations/testing/
+  # 001-003（Bot-Test 资产）一并删除；001 相关断言已由 tests/test_identity_postgres_records.py
+  # 对正式表（006-008）覆盖，见 migrations/README.md。
 
   # 生产表结构在过渡期有两条血统：顶层编号 SQL（旧库按它建成）与 alembic revision 链
   # （新库按它建）。这一步把两条都实际建出来并要求 pg_dump 逐字节相等，然后 alembic
