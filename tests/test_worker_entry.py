@@ -2056,5 +2056,79 @@ class WorkerCliTest(unittest.TestCase):
         self.assertFalse(json.loads(stdout.getvalue())["turn"]["closed"])
 
 
+class SystemPromptFileConfigTests(unittest.TestCase):
+    """``LINGXI_WORKER_SYSTEM_PROMPT_FILE``（2026-08-23，提示词外置为挂载卷文件）
+    的启动期校验：形态合法、来源唯一、与 canary 互斥。文件内容的运行期语义
+    （每任务现读、降级、摘要）在 ``tests/test_worker_queue_consumer.py``。"""
+
+    def test_the_path_must_be_absolute_and_normalized(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        for bad in (
+            "relative/prompt.md",
+            "/etc/lingxi/../prompt.md",
+            "/etc//lingxi/prompt.md",
+            "/etc/lingxi/prompt.md/",
+            "/etc/lingxi/带 空格.md",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(WorkerConfigError):
+                    load_config(worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=bad))
+
+    def test_a_well_formed_path_is_accepted_without_touching_the_filesystem(self) -> None:
+        """只校验形态不碰文件系统：文件此刻不存在是合法状态（运维可以先起进程
+        后放文件），存在性在每个任务开始时现判。"""
+
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(
+            worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/none-yet.md")
+        )
+        self.assertEqual(config.system_prompt_file, "/etc/lingxi/runtime/none-yet.md")
+
+    def test_file_and_inline_prompt_are_mutually_exclusive(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/p.md",
+                    LINGXI_WORKER_SYSTEM_PROMPT="内联提示词",
+                )
+            )
+        self.assertIn("不得同时配置", str(raised.exception))
+
+    def test_file_and_canary_are_mutually_exclusive_with_a_precise_error(self) -> None:
+        """没有前置检查时，canary 的 loader 校验会抢先报「需要同时配置
+        SYSTEM_PROMPT」，把运维往错误方向带——错误必须点名真正的冲突对。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/p.md",
+                    LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+                )
+            )
+        self.assertIn("OUTPUT_SAFETY_CANARY", str(raised.exception))
+        self.assertIn("不得", str(raised.exception))
+
+    def test_direct_construction_enforces_the_same_exclusions(self) -> None:
+        """两条构造路径同等失败关闭（与 canary 不变量同一纪律）。"""
+
+        from lingxi.apps.worker.config import WorkerConfig, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            WorkerConfig(
+                question="",
+                read_only_tools=("mcp__q__read",),
+                trace_id="01J00000000000000000000000",
+                turn_timeout_seconds=1.0,
+                system_prompt="内联提示词",
+                system_prompt_file="/etc/lingxi/runtime/p.md",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

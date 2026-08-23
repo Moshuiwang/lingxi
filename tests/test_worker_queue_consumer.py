@@ -2570,3 +2570,121 @@ class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
             asyncio.run(service.process_once())
 
             self.assertFalse(jsonl.exists())
+
+
+class SystemPromptFileTests(unittest.TestCase):
+    """默认提示词文件（2026-08-23，产品负责人裁定：提示词不进代码、不进镜像，
+    随时可改、快速验证）：worker **每任务现读**文件，编辑后下一条消息即生效；
+    读不到时该任务降级为无提示词执行（提示词是行为调优，不是安全屏障，屏障是
+    PreToolUse 白名单）；每轮的提示词摘要随 ``worker.task.terminal`` 可追溯。"""
+
+    def _service(self, prompt_path: str, sink=None):
+        queue = FakeWorkerQueue()
+        captured: list[WorkerConfig] = []
+
+        class Executor:
+            def __init__(self, config: WorkerConfig) -> None:
+                captured.append(config)
+
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": None},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(system_prompt_file=prompt_path),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(config),
+            on_terminal_outcome=sink,
+        )
+        return service, queue, captured
+
+    def _rearm(self, queue: FakeWorkerQueue, task_id: str) -> None:
+        queue.claimed = ClaimedTask(
+            task_id=task_id,
+            conversation_id="cnv-1",
+            user_id="usr-1",
+            prompt="问题",
+            resumed_session=True,
+            target_worker_version="stable",
+            attempts=1,
+            reply_to_message_id="msg-1",
+            stop_requested=False,
+        )
+
+    def test_the_file_is_read_per_task_so_an_edit_takes_effect_on_the_next_message(self) -> None:
+        """机制的全部意义所在：改文件不改进程。同一个常驻 service、不重启，
+        两个任务分别拿到编辑前后的两版提示词。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            Path(path).write_text("第一版：回答必须注明查询的时间范围。", encoding="utf-8")
+            service, queue, captured = self._service(path)
+            asyncio.run(service.process_once())
+            self.assertEqual(captured[0].system_prompt, "第一版：回答必须注明查询的时间范围。")
+
+            Path(path).write_text("第二版：查询前必须先确认指标的可用维度。", encoding="utf-8")
+            self._rearm(queue, "tsk-2")
+            asyncio.run(service.process_once())
+            self.assertEqual(captured[1].system_prompt, "第二版：查询前必须先确认指标的可用维度。")
+
+    def test_a_missing_file_degrades_to_no_prompt_and_the_task_still_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "absent.md")
+            sink = RecordingTerminalOutcomeSink()
+            service, queue, captured = self._service(path, sink=sink)
+            asyncio.run(service.process_once())
+
+        self.assertIsNone(captured[0].system_prompt, "读不到文件时本任务以无提示词执行")
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success", "降级不得带走任务")
+        self.assertIsNone(sink.calls[0]["system_prompt_digest"])
+
+    def test_the_digest_of_the_served_prompt_lands_in_the_terminal_audit_event(self) -> None:
+        """「用户这一轮用的哪版提示词」的追溯依据；只记摘要，正文不进审计。"""
+
+        import hashlib as _hashlib
+
+        prompt = "查询纪律：必须限定时间范围与必要维度。"
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            Path(path).write_text(prompt, encoding="utf-8")
+            sink = RecordingTerminalOutcomeSink()
+            service, queue, _ = self._service(path, sink=sink)
+            asyncio.run(service.process_once())
+
+        expected = _hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        self.assertEqual(sink.calls[0]["system_prompt_digest"], expected)
+        self.assertNotIn(prompt, str(sink.calls[0]), "提示词正文不得进入低敏审计事件")
+        # 摘要断言必须与「任务真的成功」并联：首版实现里 replace() 重跑
+        # __post_init__ 炸掉任务，摘要仍会随失败终态如期出现，光看摘要会假绿。
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_a_prompt_colliding_with_a_fixed_terminal_text_is_dropped_for_the_task(self) -> None:
+        """出口安全会把提示词逐句派生成禁词：提示词若含固定终态文案，空产出回合
+        的终态自检会抛异常、炸掉「总是返回一份报告」的契约。现读时预演一遍，坏
+        提示词只废掉自己（降级），不废掉回合。"""
+
+        from lingxi.core.execution.input_safety import SAFE_OUTPUT_FALLBACK
+
+        prompt = f"规则一：必须限定时间范围。\n{SAFE_OUTPUT_FALLBACK}\n规则二：不得编造数据。"
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            Path(path).write_text(prompt, encoding="utf-8")
+            sink = RecordingTerminalOutcomeSink()
+            service, queue, captured = self._service(path, sink=sink)
+            asyncio.run(service.process_once())
+
+        self.assertIsNone(captured[0].system_prompt, "与固定终态文案互相命中的提示词必须整体弃用")
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+        self.assertIsNone(sink.calls[0]["system_prompt_digest"])
+
+    def test_an_oversized_file_is_refused_rather_than_stuffed_into_every_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            Path(path).write_text("盘" * (64 * 1024 + 1), encoding="utf-8")
+            service, queue, captured = self._service(path)
+            asyncio.run(service.process_once())
+
+        self.assertIsNone(captured[0].system_prompt)
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")

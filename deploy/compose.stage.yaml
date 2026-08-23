@@ -71,6 +71,14 @@ services:
       - ./.env.stage.worker-queue
     volumes:
       - lingxi-users:/var/lib/lingxi/users
+      # 默认提示词等运行时可调配置（2026-08-23，产品负责人裁定提示词不进代码不进
+      # 镜像）：绑定挂载**目录**而不是单个文件——vim 等编辑器按「写临时文件再
+      # rename」保存，单文件绑定会让容器停在旧 inode 上永远看不到新内容；目录
+      # 绑定不受影响。worker 每个任务现读 `LINGXI_WORKER_SYSTEM_PROMPT_FILE`
+      # 指向的文件（见 .env.example「文件五」），编辑后下一条消息即生效，不需要
+      # 重启容器。只读挂载：worker 没有任何理由写它。目录缺失时 docker 会以 root
+      # 建出空目录，worker 侧按「文件不可用」逐任务降级并留告警，不影响启动。
+      - ${LINGXI_WORKER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   migrate:
     env_file:
