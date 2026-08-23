@@ -242,11 +242,10 @@ class AgentOptionsShapeTest(_StubSDK):
         )
 
         self.assertEqual(options.max_buffer_size, DEFAULT_MAX_SDK_MESSAGE_BYTES)
-        self.assertGreater(
-            DEFAULT_MAX_SDK_MESSAGE_BYTES,
-            10 * 1024 * 1024,
-            "上限必须高于 2026-08-23 实测的约 9.3MiB 单条回执",
-        )
+        # 精确锁定取值（外部独立审查 2026-08-23 P2-1）：只断言「大于 10MiB」时，
+        # 常量被误改到 1GiB 也全绿——上限同时是进程内存预算的一部分（并发 16 路
+        # 每路一条最坏 32MiB 消息），涨它必须是一次显式、被审阅的决定。
+        self.assertEqual(DEFAULT_MAX_SDK_MESSAGE_BYTES, 32 * 1024 * 1024)
 
     def test_buffer_overflow_is_recognised_from_the_flattened_sdk_error(self) -> None:
         """SDK 0.2.128 把缓冲超限压平成裸 Exception（文本来自
@@ -264,6 +263,11 @@ class AgentOptionsShapeTest(_StubSDK):
         )
         self.assertFalse(is_message_buffer_overflow(Exception("connection reset by peer")))
         self.assertFalse(is_message_buffer_overflow(TimeoutError()))
+        # 收窄后的否定面（外部独立审查 2026-08-23 P2-2）：不带 SDK 固定前缀段的
+        # 相似措辞不得命中——别的子系统的"buffer size"类报错不是查询结果过大。
+        self.assertFalse(
+            is_message_buffer_overflow(Exception("socket recv exceeded maximum buffer size"))
+        )
 
 
 class MessageNormalisationTest(_StubSDK):

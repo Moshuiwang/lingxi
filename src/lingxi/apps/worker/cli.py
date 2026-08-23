@@ -178,6 +178,30 @@ def main(
             return 0
         return 0
 
+    if config.system_prompt_file:
+        # turn 模式同样服务提示词文件，但姿态是**失败关闭**而不是 queue 模式的
+        # 逐任务降级（外部独立审查 2026-08-23 P2-1）：一次性受控回合的存在意义
+        # 就是验证，"文件读不到就静默跑一个无提示词回合"会让验证结论失真——
+        # 无论把结果读成"提示词没效果"还是"已生效"都可能是错的。读不到即
+        # 启动失败，与 queue 模式缺 LINGXI_USER_ENV_ROOT 的启动预检同一姿态。
+        from dataclasses import replace as _replace
+
+        from .service import _load_task_system_prompt
+
+        prompt, _digest, degraded = _load_task_system_prompt(config.system_prompt_file)
+        if degraded is not None:
+            _log(
+                err,
+                config.trace_id,
+                "error",
+                "worker.turn.system_prompt_unavailable",
+                reason=degraded,
+            )
+            return EXIT_CONFIG_ERROR
+        # 与 queue 模式同一细节：注入已解析的提示词时必须清掉文件指针，否则
+        # replace 重跑 __post_init__ 会撞上 file 与 prompt 的互斥不变量。
+        config = _replace(config, system_prompt=prompt, system_prompt_file=None)
+
     _log(
         err,
         config.trace_id,

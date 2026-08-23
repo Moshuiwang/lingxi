@@ -2129,6 +2129,46 @@ class SystemPromptFileConfigTests(unittest.TestCase):
                 system_prompt_file="/etc/lingxi/runtime/p.md",
             )
 
+    def test_turn_mode_fails_closed_when_the_prompt_file_is_unreadable(self) -> None:
+        """外部独立审查 2026-08-23 P2-1：turn 模式（受控验证入口）不得静默吞掉
+        提示词文件——文件读不到就跑一个无提示词回合，会让"这次验证到底证明了
+        什么"失真。失败关闭，退出码与其他配置错误一致。"""
+
+        from lingxi.apps.worker.cli import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "absent.md")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            code = main(
+                env=worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=missing),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn("worker.turn.system_prompt_unavailable", stderr.getvalue())
+
+    def test_turn_mode_serves_the_prompt_file_to_the_session(self) -> None:
+        """turn 模式读到文件时，提示词必须真的进 SDK 会话选项——这是「编辑文件
+        → 发一条受控验证」这条快速回路的 turn 半边。"""
+
+        from lingxi.apps.worker.cli import main
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "已完成。"}])
+        sdk.install(self)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            pathlib.Path(path).write_text("受控验证提示词：只答结论。", encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            code = main(
+                env=worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=path),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(sdk.options[0].system_prompt, "受控验证提示词：只答结论。")
+
 
 if __name__ == "__main__":
     unittest.main()

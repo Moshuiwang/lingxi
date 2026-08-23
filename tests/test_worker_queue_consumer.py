@@ -2680,11 +2680,86 @@ class SystemPromptFileTests(unittest.TestCase):
         self.assertIsNone(sink.calls[0]["system_prompt_digest"])
 
     def test_an_oversized_file_is_refused_rather_than_stuffed_into_every_context(self) -> None:
+        """必须用**单字节**内容并锁定原因码（二级独立审查 2026-08-23 P2-2 变异
+        实测）：多字节内容在有界读取下会被截成非法 UTF-8、走 not_utf8 降级，
+        长度守卫删掉了用例照样绿——ASCII 截断后是合法文本，唯一能拦住它的就是
+        长度守卫本身；只断言 ``system_prompt is None`` 同样锁不住，必须断言
+        降级原因确实是 oversized。"""
+
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "system_prompt.md")
-            Path(path).write_text("盘" * (64 * 1024 + 1), encoding="utf-8")
+            Path(path).write_text("x" * (64 * 1024 + 1), encoding="ascii")
             service, queue, captured = self._service(path)
+            with self.assertLogs("lingxi.apps.worker.service", level="WARNING") as logs:
+                asyncio.run(service.process_once())
+
+        self.assertIsNone(captured[0].system_prompt)
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+        self.assertTrue(
+            any("reason=oversized" in line for line in logs.output),
+            f"降级原因必须是 oversized，实际告警：{logs.output}",
+        )
+
+    def test_the_digest_is_kept_on_a_failed_turn_as_the_attempted_version(self) -> None:
+        """字段口径的另一半（二级独立审查 2026-08-23 P3-1）：「本轮选定并交给
+        执行器装配的版本」——装配后失败的回合带着摘要落失败终态，它回答的是
+        "失败那一轮试图使用哪版"。"""
+
+        import hashlib as _hashlib
+
+        prompt = "查询纪律：必须限定时间范围。"
+        queue = FakeWorkerQueue()
+        sink = RecordingTerminalOutcomeSink()
+
+        class FailingExecutor:
+            def __init__(self, config: WorkerConfig) -> None:
+                pass
+
+            async def run_turn(self, prompt_text: str, **kwargs: object) -> dict:
+                raise RuntimeError("装配后失败")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            Path(path).write_text(prompt, encoding="utf-8")
+            service = WorkerService(
+                config=worker_config(system_prompt_file=path),
+                queue=queue,
+                executor_factory=lambda config, marker: FailingExecutor(config),
+                on_terminal_outcome=sink,
+            )
             asyncio.run(service.process_once())
+
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
+        self.assertEqual(
+            sink.calls[0]["system_prompt_digest"],
+            _hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12],
+        )
+
+    def test_a_symlink_is_refused_even_when_it_points_at_a_readable_file(self) -> None:
+        """外部独立审查 2026-08-23 P1-2：worker 同时挂着含用户 MCP 令牌的用户
+        环境卷，一个指向 .mcp.json 的符号链接会把凭据喂进模型上下文，而出口安全
+        撤不回已发送的系统提示。O_NOFOLLOW 结构性拒绝，不区分链接指向什么。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "looks-innocent.md")
+            Path(target).write_text("正常内容", encoding="utf-8")
+            link = os.path.join(directory, "system_prompt.md")
+            os.symlink(target, link)
+            service, queue, captured = self._service(link)
+            asyncio.run(service.process_once())
+
+        self.assertIsNone(captured[0].system_prompt, "符号链接必须被拒绝而不是被跟随")
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_a_fifo_does_not_block_the_worker(self) -> None:
+        """外部独立审查 2026-08-23 P1-3：对 FIFO 的普通 open 会无限阻塞——心跳
+        与停止处理一起停摆。O_NONBLOCK + 普通文件校验把它变成一次立即降级。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            os.mkfifo(path)
+            service, queue, captured = self._service(path)
+            asyncio.run(asyncio.wait_for(service.process_once(), timeout=10))
 
         self.assertIsNone(captured[0].system_prompt)
         self.assertEqual(queue.terminals[0]["terminal_kind"], "success")

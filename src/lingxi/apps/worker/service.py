@@ -156,10 +156,20 @@ def _load_task_system_prompt(path: str) -> tuple[str | None, str | None, str | N
     """每个任务开始时现读默认提示词文件，返回 ``(提示词, 内容摘要, 降级原因)``。
 
     现读（而不是启动时读一次）就是这个机制的全部意义：运维编辑挂载卷上的文件后
-    **下一条消息即生效**，不需要重启容器或重建镜像。三类不可用（缺失/不可读、
-    超限、空文件）一律降级为 ``(None, None, 原因码)``——提示词是行为调优不是安全
-    屏障，把任务押在一个随手可改的文件上才是更大的风险；降级必须留痕，由调用方
-    写结构化告警。
+    **下一条消息即生效**，不需要重启容器或重建镜像。各类不可用（缺失/不可读、
+    非普通文件、超限、空文件）一律降级为 ``(None, None, 原因码)``——提示词是行为
+    调优不是安全屏障，把任务押在一个随手可改的文件上才是更大的风险；降级必须
+    留痕，由调用方写结构化告警。
+
+    读取姿态（外部独立审查 2026-08-23 P1-2/P1-3）：``O_NOFOLLOW`` 拒绝符号链接
+    ——worker 同时挂着含用户 MCP 令牌的用户环境卷，一个指向 ``.mcp.json`` 的
+    链接会把凭据喂进模型上下文，而出口安全发生在模型执行之后、撤不回已发送的
+    系统提示；``O_NONBLOCK`` + 普通文件校验拒绝 FIFO/设备文件——对 FIFO 的
+    普通 open 会无限阻塞事件循环，心跳与停止处理一起停摆；**有界读取**（至多
+    上界 + 1 字节）保证误放一个数 GiB 文件时不整读进内存。残余边界（如实登记，
+    不在本层修）：路径本身来自部署配置（0600 的 env 文件，运维控制），本层不
+    再对路径做目录白名单——代码里写死允许目录违反「不硬编码路径」（V-部署-01），
+    换一个环境变量做白名单则只是把同一信任问题往上挪一层。
 
     读到内容后还有一道**终态文案自检**：出口安全层会把提示词逐句派生成禁词遮蔽
     模型正文（``input_safety._derive_fragments``），若提示词与固定终态文案
@@ -168,10 +178,14 @@ def _load_task_system_prompt(path: str) -> tuple[str | None, str | None, str | N
     公开函数预演一遍：命中即降级（原因码 ``terminal_text_collision``），坏提示词
     只废掉自己，不废掉回合。
 
-    摘要（sha256 前 12 位）随终态审计事件落日志——「用户这一轮到底用的哪版提示
-    词」与 content.toml 的版本纪律同一动机；只记摘要不记正文，提示词不属于低敏
-    审计事件可以携带的内容。
+    摘要（sha256 前 12 位）随终态审计事件落日志——「用户这一轮**选定**的是哪版
+    提示词」与 content.toml 的版本纪律同一动机；记录口径是"本轮解析出并交给
+    执行器装配的版本"，不声称模型一定收到了它（装配或建连失败的回合会带着摘要
+    落失败终态，此时摘要回答的是"失败那一轮试图使用哪版"）。只记摘要不记正文。
     """
+
+    import os as _os
+    import stat as _stat
 
     from lingxi.core.execution.input_safety import (
         SAFE_OUTPUT_FALLBACK,
@@ -181,9 +195,26 @@ def _load_task_system_prompt(path: str) -> tuple[str | None, str | None, str | N
     )
 
     try:
-        raw = Path(path).read_bytes()
+        fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK)
     except OSError:
         return None, None, "unreadable"
+    try:
+        if not _stat.S_ISREG(_os.fstat(fd).st_mode):
+            return None, None, "not_regular_file"
+        chunks: list[bytes] = []
+        remaining = _MAX_SYSTEM_PROMPT_BYTES + 1
+        while remaining > 0:
+            try:
+                chunk = _os.read(fd, remaining)
+            except OSError:
+                return None, None, "unreadable"
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        _os.close(fd)
     if len(raw) > _MAX_SYSTEM_PROMPT_BYTES:
         return None, None, "oversized"
     try:
@@ -530,8 +561,10 @@ class WorkerService:
         monitor = asyncio.create_task(self._monitor(claimed.task_id, stop_event))
         started_at = self._monotonic()
         progress_count = 0
-        # 提示词摘要在 try 之外初始化：读取失败/执行器异常的早退分支同样要把
-        # "这一轮没有（或没能）带提示词"如实写进终态审计事件。
+        # 提示词摘要在 try 之外初始化。字段口径（外部独立审查 2026-08-23 P2-4
+        # 定稿）：「本轮**选定**并交给执行器装配的提示词版本」——文件读失败时为
+        # None；读到之后装配/建连失败的回合会带着摘要落失败终态，此时它回答的是
+        # "失败那一轮试图使用哪版"，不声称模型已经收到。
         system_prompt_digest: str | None = None
 
         def on_stream_event(event: Mapping[str, Any]) -> None:

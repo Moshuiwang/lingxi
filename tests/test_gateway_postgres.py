@@ -989,6 +989,40 @@ class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
             self.scalar("SELECT count(*) FROM agent_session_cleanup"), 1
         )
 
+    def test_discard_rolls_back_with_the_failed_enqueue(self) -> None:
+        """外部独立审查 2026-08-23 P2-3：判废与入队同事务——``insert_task`` 失败
+        时，指针清空和 cleanup 排队必须一起消失。否则一次入队失败就把用户上下文
+        白白清掉，还留下一条会真删 JSONL 的清理待办（判废发生在 insert_task 之前，
+        这条注入恰好构造出「判废已执行、事务随后失败」的时序）。"""
+
+        self._finished_stale_conversation()
+        store = PostgresGatewayStore(self._dsn)
+        original = store.transaction
+
+        class Wrapper:
+            def transaction(self):
+                return _FailingTransaction(original())
+
+        broken = EventPipeline(
+            store=Wrapper(),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+        )
+        with self.assertRaises(RuntimeError):
+            broken.handle_message(inbound("evt_rotated"), now=NOW + timedelta(hours=3))
+
+        self.assertEqual(
+            self.scalar("SELECT agent_session_id FROM conversation"),
+            "ses_stale",
+            "入队失败时判废必须随事务一起回滚",
+        )
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM agent_session_cleanup"),
+            0,
+            "入队失败时不得留下物理清理待办",
+        )
+
     def test_a_failed_rotated_task_cannot_leak_the_stale_session(self) -> None:
         """事故本体重放：轮换后的首个任务失败（``finish`` 刷新
         ``last_task_ended_at``、不写回新 session id），下一条消息必须开全新会话。
