@@ -263,15 +263,17 @@ REQUIRED_MODULES = (
     "lingxi.adapters.postgres_stalled_provisioning",
 )
 
-# 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项：
-# `bot-test` extra 会单独校验它们，但正式制品关键模块清单必须明确写出不纳入的理由。
-# 这张表是固定政策，不是任意模块的逃生口；`check_module_manifests` 会对它逐项核对。
+# 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
+# 制品关键模块清单必须明确写出不纳入的理由。这张表是固定政策，不是任意模块的逃生口；
+# `check_module_manifests` 会对它逐项核对。2026-08-23 #146 清退后已没有专属进程组会
+# 装配这些模块（曾经的 `bot-test` extra 随其消费者一并删除）；它们随基础安装一起
+# 存在于制品里，只是不属于任何进程的运行时 import 闭包。
 MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {
     "lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单",
-    "lingxi.adapters.feishu_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.postgres_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+    # 2026-08-23 #146 清退：feishu_onboarding/refresh_tokens/postgres_onboarding
+    # 三个 bot-test 进程专属消费者已删除；oauth_bridge 是 #67 裁定保留的 E1 授权
+    # 基础设施参考实现，源码保留但当前没有任何常驻进程消费它，理由随之更新。
+    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证参考实现，#67/#146 裁定保留为 E1 授权基础设施；集群其余消费者已清退，当前无进程加载",
 }
 
 # 这是与上面实际登记表**独立维护**的批准快照。键集和理由全文都故意重复写在这里，
@@ -280,18 +282,12 @@ MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {
 _FROZEN_MODULE_MANIFEST_EXEMPTION_KEYS = frozenset(
     {
         "lingxi.adapters.feishu_bitable_association",
-        "lingxi.adapters.feishu_onboarding",
         "lingxi.adapters.oauth_bridge",
-        "lingxi.adapters.postgres_onboarding",
-        "lingxi.adapters.refresh_tokens",
     }
 )
 _FROZEN_MODULE_MANIFEST_EXEMPTION_REASONS: dict[str, str] = {
     "lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单",
-    "lingxi.adapters.feishu_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.postgres_onboarding": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
-    "lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载",
+    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证参考实现，#67/#146 裁定保留为 E1 授权基础设施；集群其余消费者已清退，当前无进程加载",
 }
 
 # 这个文件没有 `if __name__ == "__main__"` 保护，直接 import 会启动常驻 scheduler。
@@ -680,24 +676,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         # ``import websockets`` 成功证明不了子模块装全了。
         ("lark_oapi", "psycopg", "websockets.exceptions"),
     ),
-    # Bot-Test 受控验证资产（代码框架第五节），不是生产进程；四个 adapter 走显式
-    # 制品豁免，但它们依赖的正式 core.identity.onboarding 仍属于正式制品清单。
-    "bot-test": (
-        (
-            "lingxi",
-            "lingxi.adapters",
-            "lingxi.adapters.feishu_onboarding",
-            "lingxi.adapters.oauth_bridge",
-            "lingxi.adapters.oauth_bridge_client",
-            "lingxi.adapters.refresh_tokens",
-            "lingxi.adapters.postgres_onboarding",
-            "lingxi.adapters.postgres",
-            "lingxi.core",
-            "lingxi.core.identity",
-            "lingxi.core.identity.onboarding",
-        ),
-        ("cryptography.fernet", "lark_oapi", "psycopg", "websockets.sync.client"),
-    ),
+    # 2026-08-23 #146 清退：`bot-test` 进程组随其三个专属消费者
+    # （feishu_onboarding/refresh_tokens/postgres_onboarding）一并删除。保留件
+    # `adapters/oauth_bridge.py`（#67 裁定的 E1 授权基础设施参考实现）与它依赖的
+    # `core.identity.onboarding` 不再有对应进程组——它们没有独立于 scheduler/
+    # reauthorize 已声明依赖之外的第三方需求，见 MODULE_MANIFEST_EXEMPTIONS 的
+    # oauth_bridge 条目与 pyproject.toml 对应注释。
     # 迁移作业（Issue #53）：部署时跑一次 `python -m alembic upgrade head`，不是常驻
     # 进程。**lingxi 模块那一列刻意为空**——迁移工具链不得渗入运行时代码
     # （断言 V-迁移-04：`grep -rn "sqlalchemy\|alembic" src/` 必须为空），
@@ -731,12 +715,6 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         "lingxi.apps.gateway",
         "lingxi.apps.gateway.__main__",
         "lingxi.apps.healthcheck.__main__",
-    ),
-    "bot-test": (
-        "lingxi.adapters.feishu_onboarding",
-        "lingxi.adapters.oauth_bridge",
-        "lingxi.adapters.refresh_tokens",
-        "lingxi.adapters.postgres_onboarding",
     ),
     # 迁移作业运行 alembic，不加载任何 lingxi 模块；这是显式边界，不是漏登记。
     "migrate": (),
@@ -1016,7 +994,10 @@ def check_module_manifests(
             )
 
         for name in sorted(listed_set):
-            if name in actual_exemption_names and extra != "bot-test":
+            # 2026-08-23 #146 清退：此前 `bot-test` 进程组本身合法依赖自己的豁免
+            # 模块，此处曾有 `and extra != "bot-test"` 的特例放行；`bot-test` 组
+            # 删除后不再有任何进程组的用法属于这种自反例外，特例随之移除。
+            if name in actual_exemption_names:
                 failures.append(
                     f"进程 `{extra}`：模块 `{name}` 是正式制品豁免，不能被正式进程依赖。"
                 )
