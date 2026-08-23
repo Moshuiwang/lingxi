@@ -700,6 +700,9 @@ class WorkerServiceTests(unittest.TestCase):
             (True, None, "stopped", "stopped", "worker.stopped"),
             (False, "turn_timeout", "timeout", "running_timeout", "worker.running_timeout"),
             (False, "max_turns_exceeded", "failed", "max_turns_exceeded", "worker.max_turns"),
+            # 2026-08-23 真实故障：回执超过 SDK 读流缓冲上限（result_too_large，
+            # 分类在 apps/worker/turn.py）同样不得压平成「请稍后重试」。
+            (False, "result_too_large", "failed", "result_too_large", "worker.result_too_large"),
         ):
             with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
                 queue = FakeWorkerQueue(stopped=stopped)

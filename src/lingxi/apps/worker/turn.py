@@ -27,6 +27,7 @@ from lingxi.adapters.claude_agent_session import (
     AgentSessionInterrupted,
     DrainTimeoutError,
     build_agent_options,
+    is_message_buffer_overflow,
     run_single_turn,
 )
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
@@ -242,7 +243,15 @@ class WorkerTurnExecutor:
         except KeyboardInterrupt as error:
             failure = _failure("interrupted", error)
         except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
-            failure = _failure("session_failed", error)
+            if is_message_buffer_overflow(error):
+                # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
+                # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态
+                # 故障——同样的问题重试必然同样失败，必须与通用 session_failed
+                # 区分，让用户得到"缩小查询范围"的可行动建议（queue 收口的文案
+                # 映射见 apps/worker/service.py 的 _failure_content）。
+                failure = _failure("result_too_large", error)
+            else:
+                failure = _failure("session_failed", error)
 
         if failure is None:
             failure = _sdk_termination_failure(

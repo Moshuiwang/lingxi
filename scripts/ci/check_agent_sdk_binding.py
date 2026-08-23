@@ -120,6 +120,13 @@ def check_worker_entry(expected_events: set[str]) -> str | None:
         return "必须注入 SDK 子进程 stderr 的脱敏回调，否则原始错误绕过出口纪律直接继承 fd 2"
     if getattr(options, "strict_mcp_config", None) is not True:
         return "必须显式 strict_mcp_config=True：否则项目/用户级 MCP 配置会被加载，白名单工具可能被同名服务器顶替"
+    from lingxi.adapters.claude_agent_session import DEFAULT_MAX_SDK_MESSAGE_BYTES
+
+    if getattr(options, "max_buffer_size", None) != DEFAULT_MAX_SDK_MESSAGE_BYTES:
+        return (
+            "必须显式抬高 max_buffer_size（2026-08-23 真实故障：问数 MCP 约 9.3MiB 的"
+            "单条回执撞穿 SDK 默认 1MiB 读流缓冲，整个会话崩溃）"
+        )
 
     # 会话类本身也要在真实 SDK 上核对：run_single_turn 唯一依赖它，改名或
     # query/receive_response 签名变化只有这里能在 CI 抓到（独立复查发现）。

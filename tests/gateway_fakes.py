@@ -196,6 +196,7 @@ class FakeTransaction:
         self.staged_tasks: list[FakeTask] = []
         self.staged_claims: dict[str, str | None] = {}
         self.staged_session_clears: list[str] = []
+        self.staged_session_discards: list[str] = []
         self.staged_stops: list[str] = []
         self.staged_notifies = 0
 
@@ -273,6 +274,13 @@ class FakeTransaction:
         self.staged_session_clears.append(conversation_id)
         return True
 
+    def discard_stale_agent_session(self, *, conversation_id: str) -> None:
+        # 与真库同语义：不做忙碌判定（调用点已抢占话题），置空随事务提交生效。
+        # 物理清理排队属于真库副作用，由真库用例覆盖，假实现不建第二套队列。
+        self._log.add("store.discard_stale_agent_session", conversation_id=conversation_id)
+        self._maybe_fail("discard_stale_agent_session")
+        self.staged_session_discards.append(conversation_id)
+
     def request_stop(self, *, conversation_id: str) -> str | None:
         self._log.add("store.request_stop", conversation_id=conversation_id)
         conversation = self._find(conversation_id)
@@ -312,6 +320,8 @@ class FakeTransaction:
         for conversation_id, task_id in self.staged_claims.items():
             self._find(conversation_id).running_task_id = task_id
         for conversation_id in self.staged_session_clears:
+            self._find(conversation_id).agent_session_id = None
+        for conversation_id in self.staged_session_discards:
             self._find(conversation_id).agent_session_id = None
         for task_id in self.staged_stops:
             for task in self._state.tasks:

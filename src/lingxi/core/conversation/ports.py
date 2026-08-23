@@ -219,6 +219,11 @@ class GatewayTransaction(Protocol):
     def clear_agent_session(self, *, conversation_id: str) -> bool:
         """清空该话题的会话上下文；话题已被占用时返回 ``False`` 且不改任何行。"""
 
+    def discard_stale_agent_session(self, *, conversation_id: str) -> None:
+        """入队判定「不续用旧会话」时，把已判废的 ``agent_session_id`` 置空并排队
+        物理清理（与入队同事务）。与 ``clear_agent_session``（/new）不同：调用时
+        本事务已抢占话题，不做忙碌判定，也不触碰已送达正文的保留边界。"""
+
     def request_stop(self, *, conversation_id: str) -> str | None:
         """给该话题运行中的任务置 ``stop_requested``；返回被置的任务标识或 ``None``。"""
 

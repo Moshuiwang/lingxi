@@ -723,6 +723,19 @@ class EventPipeline:
             and bool(conversation.agent_session_id)
             and conversation.last_task_ended_at is not None
         )
+        if not resumed and conversation.agent_session_id:
+            # 判废即清（2026-08-23 真实故障）：此前这里只发提示、不动旧
+            # ``agent_session_id``，指望下一次入队的时间戳比较继续把它挡在 resume
+            # 之外。但轮换后的首个任务一旦失败（失败任务不写回新 session id，却会
+            # 刷新 ``last_task_ended_at``），下一条消息就落回两小时窗口内，把这个
+            # 早已判废、JSONL 也可能已被物理清理的旧会话当作可续用——用户连发几条
+            # 都撞在「会话不存在」的瞬间失败上，只能手动 `/new` 自救；就算旧文件
+            # 还在，续上的也是「已明确告知不携带」的过期上下文。清空动作同时把旧
+            # 会话排进物理清理队列，维持「凡被排队清理的 session id 都不再被
+            # conversation 指向」的不变量（只清指针不排队，空闲扫描
+            # ``sweep_idle_conversations`` 就永远找不到这份 JSONL）。上面
+            # ``session_rotated`` 的三种成因区分不受影响：它已在本次清空之前求值。
+            tx.discard_stale_agent_session(conversation_id=conversation.conversation_id)
         # 目标 worker 版本同样在入队时求值一次并写入（`V-灰度-01`）。
         # 重试、重启、心跳超时回收都不得改写它——数据库触发器兜底。
         version = self._resolve_version(user_id=user_id, now=now)

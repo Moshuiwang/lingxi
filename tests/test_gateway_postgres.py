@@ -528,9 +528,16 @@ class NewCommandRaceTests(GatewayPostgresTestCase):
         outcomes: dict[str, str] = {}
         errors: list[BaseException] = []
         barrier = threading.Barrier(2)
-        # 先把会话行与上下文建出来，两个线程竞争同一行
+        # 先把会话行与上下文建出来，两个线程竞争同一行。``last_task_ended_at`` 必须
+        # 一起铺（真库里它与 agent_session_id 在任务收口的同一条 UPDATE 写入，缺一个
+        # 是不可达状态）且落在两小时窗口内：否则提问那条线程会走「轮换判废」把
+        # ses_1 合法清掉（2026-08-23 修复），本用例要锁的就只剩 /new 与抢占的竞态。
         self.pipeline().handle_message(inbound("evt_seed"), now=NOW)
-        self.execute("UPDATE conversation SET running_task_id = NULL, agent_session_id = 'ses_1'")
+        self.execute(
+            "UPDATE conversation SET running_task_id = NULL, agent_session_id = 'ses_1',"
+            " last_task_ended_at = %s",
+            (NOW,),
+        )
         self.execute("DELETE FROM task")
 
         def deliver(label: str, text: str) -> None:
@@ -903,6 +910,119 @@ class SessionResumeTests(GatewayPostgresTestCase):
 
         with self.assertRaises(self._psycopg.errors.RaiseException):
             self.execute("UPDATE task SET resumed_session = TRUE WHERE id = %s", (task_id,))
+
+
+class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
+    """2026-08-23 真实故障回归（真库面）：入队判定「不续用」时，旧
+    ``agent_session_id`` 随同一事务置空，且旧会话进入 ``agent_session_cleanup``
+    物理清理队列（清指针不排队会让空闲扫描永远找不到那份 JSONL）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_user()
+
+    def _finished_stale_conversation(self) -> str:
+        """铺出「上次任务已结束、会话 id 仍在」的话题，返回 conversation_id。"""
+
+        pipeline = self.pipeline()
+        pipeline.handle_message(inbound("evt_seed"), now=NOW)
+        conversation_id = self.scalar("SELECT id FROM conversation")
+        task_id = self.scalar("SELECT id FROM task")
+        self.queue.claim(worker_id="w0", target_worker_version="stable")
+        self.queue.finish(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            status="succeeded",
+            worker_id="w0",
+        )
+        self.execute(
+            "UPDATE conversation SET agent_session_id = 'ses_stale', last_task_ended_at = %s",
+            (NOW,),
+        )
+        return conversation_id
+
+    def test_rotation_clears_the_stale_id_and_queues_its_cleanup(self) -> None:
+        conversation_id = self._finished_stale_conversation()
+
+        outcome = self.pipeline().handle_message(
+            inbound("evt_rotated"), now=NOW + timedelta(hours=3)
+        )
+
+        self.assertFalse(outcome.resumed_session)
+        self.assertIsNone(
+            self.scalar(
+                "SELECT agent_session_id FROM conversation WHERE id = %s",
+                (conversation_id,),
+            ),
+            "轮换判废的旧会话 id 必须随入队事务置空",
+        )
+        self.assertEqual(
+            self.query("SELECT agent_session_id, reason FROM agent_session_cleanup"),
+            [("ses_stale", "idle_timeout")],
+            "判废的旧会话必须同时进入物理清理队列",
+        )
+
+    def test_discard_is_idempotent_when_the_idle_sweep_queued_it_first(self) -> None:
+        """空闲扫描与入队轮换撞在同一个 session 上：唯一索引 + ON CONFLICT 保证
+        只有一条待办，入队不得因此失败。"""
+
+        conversation_id = self._finished_stale_conversation()
+        self.execute(
+            """
+            INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+            VALUES ('asc_sweep', 'usr_1', 'ses_stale', 'idle_timeout')
+            """
+        )
+
+        outcome = self.pipeline().handle_message(
+            inbound("evt_rotated"), now=NOW + timedelta(hours=3)
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertIsNone(
+            self.scalar(
+                "SELECT agent_session_id FROM conversation WHERE id = %s",
+                (conversation_id,),
+            )
+        )
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM agent_session_cleanup"), 1
+        )
+
+    def test_a_failed_rotated_task_cannot_leak_the_stale_session(self) -> None:
+        """事故本体重放：轮换后的首个任务失败（``finish`` 刷新
+        ``last_task_ended_at``、不写回新 session id），下一条消息必须开全新会话。
+        修复前它会带着 ``resumed_session = TRUE`` 去 resume 一个 JSONL 已被物理
+        清理的旧会话，用户连发几条都瞬间失败。"""
+
+        conversation_id = self._finished_stale_conversation()
+        pipeline = self.pipeline()
+        rotated = pipeline.handle_message(inbound("evt_rotated"), now=NOW + timedelta(hours=3))
+        self.assertFalse(rotated.resumed_session)
+
+        self.queue.claim(worker_id="w1", target_worker_version="stable")
+        self.queue.finish(
+            task_id=rotated.task_id,
+            conversation_id=conversation_id,
+            status="failed",
+            worker_id="w1",
+            error_kind="session_failed",
+        )
+
+        followup = pipeline.handle_message(
+            inbound("evt_followup"), now=NOW + timedelta(hours=3, minutes=1)
+        )
+
+        self.assertEqual(followup.handled_as, HandledAs.TASK_QUEUED)
+        self.assertFalse(
+            followup.resumed_session,
+            "修复前这里是 True：失败任务刷新了结束时间，旧 id 又没清",
+        )
+        self.assertFalse(
+            self.scalar(
+                "SELECT resumed_session FROM task WHERE id = %s", (followup.task_id,)
+            )
+        )
 
 
 class QueueClaimTests(GatewayPostgresTestCase):

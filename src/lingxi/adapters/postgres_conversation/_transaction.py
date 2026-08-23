@@ -234,6 +234,40 @@ class _Transaction:
                 )
         return cleared
 
+    def discard_stale_agent_session(self, *, conversation_id: str) -> None:
+        """入队判定「不续用」时，把已判废的 ``agent_session_id`` 置空并排队物理清理。
+
+        与 ``clear_agent_session``（/new）的三点差异：调用点在**已抢占成功**的入队
+        事务里（``running_task_id`` 是当前任务），不做忙碌判定；不清除已送达正文
+        ——数据保留边界仍由 /new 与空闲到点扫描负责；清理原因复用 ``idle_timeout``
+        （触发类别就是空闲超窗，只是在入队时观测到而不是被扫描发现，且 0061 的
+        CHECK 约束不含新值）。CTE 先锁定并读出旧值再置空，理由同
+        ``clear_agent_session``：直接 RETURNING 只会拿到刚写入的 NULL。
+        """
+
+        cursor = self._execute(
+            """
+            WITH target AS (
+                SELECT id, user_id, agent_session_id AS stale_session_id
+                  FROM conversation
+                 WHERE id = %s AND agent_session_id IS NOT NULL
+                 FOR UPDATE
+            )
+            UPDATE conversation AS c
+               SET agent_session_id = NULL
+              FROM target
+             WHERE c.id = target.id
+            RETURNING target.user_id, target.stale_session_id
+            """,
+            (conversation_id,),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            user_id, stale_session_id = row
+            self._queue_session_cleanup(
+                user_id=user_id, agent_session_id=stale_session_id, reason="idle_timeout"
+            )
+
     def _queue_session_cleanup(self, *, user_id: str, agent_session_id: str, reason: str) -> None:
         """登记一条 Agent 会话 JSONL 物理清理请求（Issue #153）。
 

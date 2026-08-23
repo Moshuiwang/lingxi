@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-21"
+version = "2026-08-23"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -45,6 +45,9 @@ version = "2026-08-21"
 "worker.failed" = "本次任务未取得可用结果，请稍后重试。"
 "worker.side_effect_uncertain" = "任务结果未能确认，未自动重试，请稍后重试。"
 "worker.context_too_long" = "当前对话过长，请使用 `/new` 开始新会话"
+# 2026-08-23 真实故障：未加窄过滤的指标查询返回体过大（约 9.3MB），此前被压平成
+# 「请稍后重试」——对确定性失败是误导。建议缩小范围而不是重试。
+"worker.result_too_large" = "本次查询返回的数据量过大，未能完成。请缩小查询范围（如指定时间段、区域或具体对象）后重试。"
 "worker.redacted_withheld" = "本次结果涉及需要保护的内容，已被安全策略拦截，未能提供结果；如有需要请联系管理员，系统不会自动重试。"
 
 "roster.report_title" = "花名册每日资料比对"

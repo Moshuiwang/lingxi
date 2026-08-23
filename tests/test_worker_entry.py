@@ -69,6 +69,7 @@ class StubAgentOptions:
         permission_mode=None,
         stderr=None,
         strict_mcp_config=None,
+        max_buffer_size=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.max_turns = max_turns
@@ -82,6 +83,7 @@ class StubAgentOptions:
         self.permission_mode = permission_mode
         self.stderr = stderr
         self.strict_mcp_config = strict_mcp_config
+        self.max_buffer_size = max_buffer_size
 
 
 class StubTextBlock:
@@ -485,6 +487,41 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "sdk_unavailable")
         self.assertFalse(report["turn"]["closed"])
+
+    def test_an_oversized_sdk_message_is_classified_as_result_too_large(self) -> None:
+        """2026-08-23 真实故障回归：SDK 0.2.128 把读流缓冲超限压平成**裸
+        Exception** 投回业务迭代器，此前落进通用 ``session_failed``——「请稍后
+        重试」对这种确定性失败是误导（同样的问题重试必然同样失败）。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = Exception(
+            "Failed to decode JSON: JSON message exceeded maximum buffer size of 1048576 bytes"
+        )
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertEqual(report["failure"]["code"], "result_too_large")
+        self.assertFalse(report["turn"]["closed"])
+
+    def test_other_flattened_session_errors_stay_session_failed(self) -> None:
+        """否定测试：普通传输失败不得被误分类成 ``result_too_large``。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = RuntimeError("connection reset by peer")
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertEqual(report["failure"]["code"], "session_failed")
 
 
 class ReadOnlyBoundaryTest(unittest.TestCase):

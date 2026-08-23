@@ -911,6 +911,11 @@ class WorkerService:
             # 过程细节；把它说给用户听本身就是又一次过程泄漏。复用通用失败文案，
             # 专属性只保留在 `failure_code`（审计/日志可查）。
             return _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE, self._catalog.text("worker.failed")
+        if code == "result_too_large":
+            # 2026-08-23 真实故障：未加窄过滤的指标查询回执超过 SDK 读流缓冲上限
+            # （分类在 apps/worker/turn.py）。与 max_turns_exceeded 同一姿态——
+            # 「请稍后重试」对确定性失败是误导，专属文案给出可行动的建议。
+            return "result_too_large", self._catalog.text("worker.result_too_large")
         return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
