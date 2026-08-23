@@ -40,6 +40,7 @@ class StubAgentOptions:
         permission_mode=None,
         stderr=None,
         strict_mcp_config=None,
+        max_buffer_size=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.max_turns = max_turns
@@ -53,6 +54,7 @@ class StubAgentOptions:
         self.permission_mode = permission_mode
         self.stderr = stderr
         self.strict_mcp_config = strict_mcp_config
+        self.max_buffer_size = max_buffer_size
 
 
 class StubTextBlock:
@@ -224,6 +226,48 @@ class AgentOptionsShapeTest(_StubSDK):
         )
 
         self.assertEqual(options.max_turns, 7)
+
+    def test_sdk_message_buffer_limit_is_always_raised_above_the_1mib_default(self) -> None:
+        """2026-08-23 真实故障回归：问数 MCP 一条未加窄过滤的指标查询回执约
+        9.3MiB，SDK 默认 1MiB 读流缓冲直接把整个会话打崩。上限必须显式传入，
+        且大于实测过的回执体量。"""
+
+        from lingxi.adapters.claude_agent_session import (
+            DEFAULT_MAX_SDK_MESSAGE_BYTES,
+            build_agent_options,
+        )
+
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+
+        self.assertEqual(options.max_buffer_size, DEFAULT_MAX_SDK_MESSAGE_BYTES)
+        # 精确锁定取值（外部独立审查 2026-08-23 P2-1）：只断言「大于 10MiB」时，
+        # 常量被误改到 1GiB 也全绿——上限同时是进程内存预算的一部分（并发 16 路
+        # 每路一条最坏 32MiB 消息），涨它必须是一次显式、被审阅的决定。
+        self.assertEqual(DEFAULT_MAX_SDK_MESSAGE_BYTES, 32 * 1024 * 1024)
+
+    def test_buffer_overflow_is_recognised_from_the_flattened_sdk_error(self) -> None:
+        """SDK 0.2.128 把缓冲超限压平成裸 Exception（文本来自
+        subprocess_cli 的固定措辞），识别只能按文本；普通失败不得被误判。"""
+
+        from lingxi.adapters.claude_agent_session import is_message_buffer_overflow
+
+        self.assertTrue(
+            is_message_buffer_overflow(
+                Exception(
+                    "Failed to decode JSON: JSON message exceeded maximum buffer "
+                    "size of 1048576 bytes"
+                )
+            )
+        )
+        self.assertFalse(is_message_buffer_overflow(Exception("connection reset by peer")))
+        self.assertFalse(is_message_buffer_overflow(TimeoutError()))
+        # 收窄后的否定面（外部独立审查 2026-08-23 P2-2）：不带 SDK 固定前缀段的
+        # 相似措辞不得命中——别的子系统的"buffer size"类报错不是查询结果过大。
+        self.assertFalse(
+            is_message_buffer_overflow(Exception("socket recv exceeded maximum buffer size"))
+        )
 
 
 class MessageNormalisationTest(_StubSDK):

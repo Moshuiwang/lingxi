@@ -49,6 +49,11 @@ services:
       - ./.env.prod.worker-queue
     volumes:
       - lingxi-users:/var/lib/lingxi/users
+      # 与 stage 覆盖结构一致（部署门禁要求两侧只许值不同）：默认提示词等运行时
+      # 可调配置的只读目录挂载，说明见 compose.stage.yaml 同位置注释与
+      # .env.example「文件五」。未配置 LINGXI_WORKER_SYSTEM_PROMPT_FILE 时 worker
+      # 不读它，行为与挂载前逐字节一致。
+      - ${LINGXI_WORKER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   migrate:
     env_file:

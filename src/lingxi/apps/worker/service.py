@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import replace
@@ -142,6 +143,94 @@ def _tool_result_count(report: Mapping[str, Any]) -> int:
         return 0
     count = audit.get("tool_result_count")
     return count if isinstance(count, int) else 0
+
+
+# 默认提示词文件的单次读取上界（2026-08-23，产品负责人裁定提示词外置为挂载卷
+# 文件、随时可改）：提示词是几百到几千字的行为指令，64KiB 已远超合理体量；不设
+# 上界，一次误操作（比如把数据文件拷成提示词文件名）就会把巨块文本塞进每一轮
+# 模型上下文，成本失控且难以察觉。超限按"不可用"降级，与文件缺失同一路径。
+_MAX_SYSTEM_PROMPT_BYTES = 64 * 1024
+
+
+def _load_task_system_prompt(path: str) -> tuple[str | None, str | None, str | None]:
+    """每个任务开始时现读默认提示词文件，返回 ``(提示词, 内容摘要, 降级原因)``。
+
+    现读（而不是启动时读一次）就是这个机制的全部意义：运维编辑挂载卷上的文件后
+    **下一条消息即生效**，不需要重启容器或重建镜像。各类不可用（缺失/不可读、
+    非普通文件、超限、空文件）一律降级为 ``(None, None, 原因码)``——提示词是行为
+    调优不是安全屏障，把任务押在一个随手可改的文件上才是更大的风险；降级必须
+    留痕，由调用方写结构化告警。
+
+    读取姿态（外部独立审查 2026-08-23 P1-2/P1-3）：``O_NOFOLLOW`` 拒绝符号链接
+    ——worker 同时挂着含用户 MCP 令牌的用户环境卷，一个指向 ``.mcp.json`` 的
+    链接会把凭据喂进模型上下文，而出口安全发生在模型执行之后、撤不回已发送的
+    系统提示；``O_NONBLOCK`` + 普通文件校验拒绝 FIFO/设备文件——对 FIFO 的
+    普通 open 会无限阻塞事件循环，心跳与停止处理一起停摆；**有界读取**（至多
+    上界 + 1 字节）保证误放一个数 GiB 文件时不整读进内存。残余边界（如实登记，
+    不在本层修）：路径本身来自部署配置（0600 的 env 文件，运维控制），本层不
+    再对路径做目录白名单——代码里写死允许目录违反「不硬编码路径」（V-部署-01），
+    换一个环境变量做白名单则只是把同一信任问题往上挪一层。
+
+    读到内容后还有一道**终态文案自检**：出口安全层会把提示词逐句派生成禁词遮蔽
+    模型正文（``input_safety._derive_fragments``），若提示词与固定终态文案
+    （空产出兜底/整段拒发）互相命中，空产出回合会在 ``constrain_output`` 的终态
+    自检里抛 ``InputSafetyError``，把"总是返回一份报告"的契约炸掉。这里用同一个
+    公开函数预演一遍：命中即降级（原因码 ``terminal_text_collision``），坏提示词
+    只废掉自己，不废掉回合。
+
+    摘要（sha256 前 12 位）随终态审计事件落日志——「用户这一轮**选定**的是哪版
+    提示词」与 content.toml 的版本纪律同一动机；记录口径是"本轮解析出并交给
+    执行器装配的版本"，不声称模型一定收到了它（装配或建连失败的回合会带着摘要
+    落失败终态，此时摘要回答的是"失败那一轮试图使用哪版"）。只记摘要不记正文。
+    """
+
+    import os as _os
+    import stat as _stat
+
+    from lingxi.core.execution.input_safety import (
+        SAFE_OUTPUT_FALLBACK,
+        WITHHELD_MESSAGE,
+        InputSafetyError,
+        constrain_output,
+    )
+
+    try:
+        fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK)
+    except OSError:
+        return None, None, "unreadable"
+    try:
+        if not _stat.S_ISREG(_os.fstat(fd).st_mode):
+            return None, None, "not_regular_file"
+        chunks: list[bytes] = []
+        remaining = _MAX_SYSTEM_PROMPT_BYTES + 1
+        while remaining > 0:
+            try:
+                chunk = _os.read(fd, remaining)
+            except OSError:
+                return None, None, "unreadable"
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        _os.close(fd)
+    if len(raw) > _MAX_SYSTEM_PROMPT_BYTES:
+        return None, None, "oversized"
+    try:
+        prompt = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None, None, "not_utf8"
+    if not prompt:
+        return None, None, "empty"
+    try:
+        for fixed_text in (SAFE_OUTPUT_FALLBACK, WITHHELD_MESSAGE):
+            if constrain_output(fixed_text, system_prompt=prompt).blocked:
+                return None, None, "terminal_text_collision"
+    except InputSafetyError:
+        return None, None, "terminal_text_collision"
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+    return prompt, digest, None
 
 
 # P0 护栏（Issue #291 L6 取证结论）：模型正文里出现内部工具名或过程标记
@@ -472,6 +561,11 @@ class WorkerService:
         monitor = asyncio.create_task(self._monitor(claimed.task_id, stop_event))
         started_at = self._monotonic()
         progress_count = 0
+        # 提示词摘要在 try 之外初始化。字段口径（外部独立审查 2026-08-23 P2-4
+        # 定稿）：「本轮**选定**并交给执行器装配的提示词版本」——文件读失败时为
+        # None；读到之后装配/建连失败的回合会带着摘要落失败终态，此时它回答的是
+        # "失败那一轮试图使用哪版"，不声称模型已经收到。
+        system_prompt_digest: str | None = None
 
         def on_stream_event(event: Mapping[str, Any]) -> None:
             nonlocal progress_count
@@ -497,7 +591,36 @@ class WorkerService:
             user_mcp_servers = load_user_mcp_servers(
                 root=self._config.user_env_root or "", user_id=claimed.user_id
             )
-            task_config = replace(self._config, mcp_servers=user_mcp_servers)
+            # 默认提示词**每任务现读**（2026-08-23，产品负责人裁定提示词外置）：
+            # 编辑挂载卷上的文件后下一条消息即生效。读不到就本任务降级为无提示词
+            # 执行并留结构化告警——config 层已保证 file 与进程级 system_prompt
+            # 互斥，这里的覆盖不会吃掉任何别处配置的值。
+            task_system_prompt = self._config.system_prompt
+            if self._config.system_prompt_file:
+                # to_thread：读取本身已有界（≤64KiB+1），但慢挂载/存储抖动下的
+                # 一次 open/read 仍可能停顿；放线程池里跑，不占事件循环（心跳与
+                # 停止处理都在循环上，codex 二轮复验指出）。
+                task_system_prompt, system_prompt_digest, prompt_degraded = (
+                    await asyncio.to_thread(
+                        _load_task_system_prompt, self._config.system_prompt_file
+                    )
+                )
+                if prompt_degraded is not None:
+                    logger.warning(
+                        "worker.system_prompt.degraded reason=%s task_id=%s（本任务以无提示词执行）",
+                        prompt_degraded,
+                        claimed.task_id,
+                    )
+            # ``replace`` 会重跑 ``__post_init__``：task_config 携带的是**已解析**
+            # 的提示词，必须同时清掉文件指针，否则「file 与 prompt 互斥」的不变量
+            # 会把每一个成功读到提示词的任务当场炸成 session_failed（首版实现
+            # 实测踩中，见 tests 的双任务用例）。
+            task_config = replace(
+                self._config,
+                mcp_servers=user_mcp_servers,
+                system_prompt=task_system_prompt,
+                system_prompt_file=None,
+            )
             executor = self._executor_factory(task_config, marker)
             report = await executor.run_turn(
                 context.prompt,
@@ -610,6 +733,7 @@ class WorkerService:
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
+                system_prompt_digest=system_prompt_digest,
             )
         elif not deliverable:
             error_kind, content = self._failure_content(failure_code)
@@ -627,6 +751,7 @@ class WorkerService:
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
+                system_prompt_digest=system_prompt_digest,
             )
         elif protocol_breakdown_reasons:
             # P0 护栏（Issue #291 L6 取证结论）：模型正文里出现内部工具名或过程
@@ -650,6 +775,7 @@ class WorkerService:
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
+                system_prompt_digest=system_prompt_digest,
             )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
@@ -666,6 +792,7 @@ class WorkerService:
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
+                system_prompt_digest=system_prompt_digest,
             )
         else:
             # 走到这里必然 `deliverable and not withheld and not protocol_
@@ -684,6 +811,7 @@ class WorkerService:
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
+                system_prompt_digest=system_prompt_digest,
             )
 
     def _append_event(
@@ -729,6 +857,7 @@ class WorkerService:
         denied_count: int = 0,
         denied_tool_names: tuple[str, ...] = (),
         tool_result_count: int = 0,
+        system_prompt_digest: str | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -753,6 +882,7 @@ class WorkerService:
             denied_count=denied_count,
             denied_tool_names=denied_tool_names,
             tool_result_count=tool_result_count,
+            system_prompt_digest=system_prompt_digest,
         )
         self._queue.write_terminal_event(
             task_id=claimed.task_id,
@@ -775,6 +905,7 @@ class WorkerService:
         denied_count: int = 0,
         denied_tool_names: tuple[str, ...] = (),
         tool_result_count: int = 0,
+        system_prompt_digest: str | None = None,
     ) -> None:
         """queue 收口低敏结构化审计事件（Issue #90 评论 5306860255）：queue 链路
         此前失败码与安全命中规则完全不可回读，r13 只能靠猜直接原因。这里只记
@@ -849,6 +980,11 @@ class WorkerService:
             "denied_count": denied_count,
             "denied_tool_names": tuple(capped_denied_tool_names),
             "tool_result_count": tool_result_count,
+            # 「这一轮**选定**的默认提示词版本」的唯一追溯依据（sha256 前 12 位；
+            # 未配置提示词文件或本轮降级时为 None；口径见 _process_task 的初始化
+            # 注释——记录"选定并交给执行器装配的版本"，不声称模型已收到）。摘要
+            # 是固定形态短标识，不过 _cap_log_token——它不可能携带自由文本。
+            "system_prompt_digest": system_prompt_digest,
             "truncated": truncated,
         }
         try:
@@ -911,6 +1047,11 @@ class WorkerService:
             # 过程细节；把它说给用户听本身就是又一次过程泄漏。复用通用失败文案，
             # 专属性只保留在 `failure_code`（审计/日志可查）。
             return _MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE, self._catalog.text("worker.failed")
+        if code == "result_too_large":
+            # 2026-08-23 真实故障：未加窄过滤的指标查询回执超过 SDK 读流缓冲上限
+            # （分类在 apps/worker/turn.py）。与 max_turns_exceeded 同一姿态——
+            # 「请稍后重试」对确定性失败是误导，专属文案给出可行动的建议。
+            return "result_too_large", self._catalog.text("worker.result_too_large")
         return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:

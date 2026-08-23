@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import sys
 import time
 
@@ -23,6 +24,32 @@ from lingxi.core.execution.hooks import ToolGateway
 from .claude_agent_hooks import build_hook_matchers
 
 DEFAULT_DRAIN_GRACE_SECONDS = 30.0
+
+# SDK 读流的单条消息缓冲上限。SDK 0.2.128 不传时默认 1MiB，而真实链路 2026-08-23
+# 实测：问数 MCP 一次未加窄过滤的指标查询返回约 9.3MiB 的**单条**工具回执消息
+# （CLI 的"大输出只留 2KB 预览"机制并没有阻止完整数据内嵌在同一条 NDJSON 里），
+# 默认上限直接把整个会话读流打崩，用户只看到通用失败文案。取 32MiB（约为实测
+# 最大回执的 3.4 倍）；这守的是传输层健壮性，不是部署旋钮，因此是常量而非配置。
+# 超过它的回执按 ``result_too_large`` 分类失败（见 ``apps/worker/turn.py``）。
+DEFAULT_MAX_SDK_MESSAGE_BYTES = 32 * 1024 * 1024
+
+# SDK 0.2.128 把读流侧的缓冲超限压平成**裸 Exception** 投回业务迭代器（reader 把
+# ``{"type": "error", "error": 文本}`` 放进消息流，query 侧再
+# ``raise Exception(error_text)``），类型信息在那一步已经丢失，只能按错误文本识别。
+# 匹配 SDK 固定模板的完整形状（``_internal/transport/subprocess_cli.py``：
+# "JSON message exceeded maximum buffer size of {n} bytes"，含字节数尾部）——
+# 外部独立审查 2026-08-23 两轮逐步收窄：裸的 "exceeded maximum buffer size"
+# 太通用，别的子系统报错撞上就会被误报成「查询结果过大」。升级 SDK 版本时随
+# 验证与门禁 10.0 的重跑一并核对该模板是否仍在。
+_MESSAGE_BUFFER_OVERFLOW_PATTERN = re.compile(
+    r"JSON message exceeded maximum buffer size of \d+ bytes"
+)
+
+
+def is_message_buffer_overflow(error: BaseException) -> bool:
+    """这次失败是否为「单条 SDK 消息超过读流缓冲上限」（工具回执过大的典型形状）。"""
+
+    return _MESSAGE_BUFFER_OVERFLOW_PATTERN.search(str(error)) is not None
 
 
 class AgentSessionInterrupted(Exception):
@@ -96,6 +123,9 @@ def build_agent_options(
         # L4a 已验证的取值（当前能力 2026-07-28 定向补测就是在 dontAsk 下确认
         # hook 拒绝真的阻止执行）；不传则落到 SDK 默认值，行为未经验证。
         "permission_mode": "dontAsk",
+        # 不传则落到 SDK 默认 1MiB，问数 MCP 的真实回执已经撞穿过一次
+        # （见模块顶部 DEFAULT_MAX_SDK_MESSAGE_BYTES 的说明）。
+        "max_buffer_size": DEFAULT_MAX_SDK_MESSAGE_BYTES,
     }
     # 未配置的字段一律不传，交给 SDK 自己的默认值；传 None 覆盖默认值是另一种错。
     if mcp_servers:

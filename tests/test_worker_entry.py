@@ -69,6 +69,7 @@ class StubAgentOptions:
         permission_mode=None,
         stderr=None,
         strict_mcp_config=None,
+        max_buffer_size=None,
     ) -> None:
         self.allowed_tools = allowed_tools
         self.max_turns = max_turns
@@ -82,6 +83,7 @@ class StubAgentOptions:
         self.permission_mode = permission_mode
         self.stderr = stderr
         self.strict_mcp_config = strict_mcp_config
+        self.max_buffer_size = max_buffer_size
 
 
 class StubTextBlock:
@@ -485,6 +487,41 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "sdk_unavailable")
         self.assertFalse(report["turn"]["closed"])
+
+    def test_an_oversized_sdk_message_is_classified_as_result_too_large(self) -> None:
+        """2026-08-23 真实故障回归：SDK 0.2.128 把读流缓冲超限压平成**裸
+        Exception** 投回业务迭代器，此前落进通用 ``session_failed``——「请稍后
+        重试」对这种确定性失败是误导（同样的问题重试必然同样失败）。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = Exception(
+            "Failed to decode JSON: JSON message exceeded maximum buffer size of 1048576 bytes"
+        )
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertEqual(report["failure"]["code"], "result_too_large")
+        self.assertFalse(report["turn"]["closed"])
+
+    def test_other_flattened_session_errors_stay_session_failed(self) -> None:
+        """否定测试：普通传输失败不得被误分类成 ``result_too_large``。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = RuntimeError("connection reset by peer")
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertEqual(report["failure"]["code"], "session_failed")
 
 
 class ReadOnlyBoundaryTest(unittest.TestCase):
@@ -2017,6 +2054,123 @@ class WorkerCliTest(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertFalse(json.loads(stdout.getvalue())["turn"]["closed"])
+
+
+class SystemPromptFileConfigTests(unittest.TestCase):
+    """``LINGXI_WORKER_SYSTEM_PROMPT_FILE``（2026-08-23，提示词外置为挂载卷文件）
+    的启动期校验：形态合法、来源唯一、与 canary 互斥。文件内容的运行期语义
+    （每任务现读、降级、摘要）在 ``tests/test_worker_queue_consumer.py``。"""
+
+    def test_the_path_must_be_absolute_and_normalized(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        for bad in (
+            "relative/prompt.md",
+            "/etc/lingxi/../prompt.md",
+            "/etc//lingxi/prompt.md",
+            "/etc/lingxi/prompt.md/",
+            "/etc/lingxi/带 空格.md",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(WorkerConfigError):
+                    load_config(worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=bad))
+
+    def test_a_well_formed_path_is_accepted_without_touching_the_filesystem(self) -> None:
+        """只校验形态不碰文件系统：文件此刻不存在是合法状态（运维可以先起进程
+        后放文件），存在性在每个任务开始时现判。"""
+
+        from lingxi.apps.worker.config import load_config
+
+        config = load_config(
+            worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/none-yet.md")
+        )
+        self.assertEqual(config.system_prompt_file, "/etc/lingxi/runtime/none-yet.md")
+
+    def test_file_and_inline_prompt_are_mutually_exclusive(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/p.md",
+                    LINGXI_WORKER_SYSTEM_PROMPT="内联提示词",
+                )
+            )
+        self.assertIn("不得同时配置", str(raised.exception))
+
+    def test_file_and_canary_are_mutually_exclusive_with_a_precise_error(self) -> None:
+        """没有前置检查时，canary 的 loader 校验会抢先报「需要同时配置
+        SYSTEM_PROMPT」，把运维往错误方向带——错误必须点名真正的冲突对。"""
+
+        from lingxi.apps.worker.config import WorkerConfigError, load_config
+
+        with self.assertRaises(WorkerConfigError) as raised:
+            load_config(
+                worker_env(
+                    LINGXI_WORKER_SYSTEM_PROMPT_FILE="/etc/lingxi/runtime/p.md",
+                    LINGXI_WORKER_OUTPUT_SAFETY_CANARY="masked",
+                )
+            )
+        self.assertIn("OUTPUT_SAFETY_CANARY", str(raised.exception))
+        self.assertIn("不得", str(raised.exception))
+
+    def test_direct_construction_enforces_the_same_exclusions(self) -> None:
+        """两条构造路径同等失败关闭（与 canary 不变量同一纪律）。"""
+
+        from lingxi.apps.worker.config import WorkerConfig, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            WorkerConfig(
+                question="",
+                read_only_tools=("mcp__q__read",),
+                trace_id="01J00000000000000000000000",
+                turn_timeout_seconds=1.0,
+                system_prompt="内联提示词",
+                system_prompt_file="/etc/lingxi/runtime/p.md",
+            )
+
+    def test_turn_mode_fails_closed_when_the_prompt_file_is_unreadable(self) -> None:
+        """外部独立审查 2026-08-23 P2-1：turn 模式（受控验证入口）不得静默吞掉
+        提示词文件——文件读不到就跑一个无提示词回合，会让"这次验证到底证明了
+        什么"失真。失败关闭，退出码与其他配置错误一致。"""
+
+        from lingxi.apps.worker.cli import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "absent.md")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            code = main(
+                env=worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=missing),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn("worker.turn.system_prompt_unavailable", stderr.getvalue())
+        # stdout 契约（codex 二轮复验）：配置错误同样恰好一个 JSON 对象。
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["failure"]["code"], "config_error")
+
+    def test_turn_mode_serves_the_prompt_file_to_the_session(self) -> None:
+        """turn 模式读到文件时，提示词必须真的进 SDK 会话选项——这是「编辑文件
+        → 发一条受控验证」这条快速回路的 turn 半边。"""
+
+        from lingxi.apps.worker.cli import main
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "已完成。"}])
+        sdk.install(self)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "system_prompt.md")
+            pathlib.Path(path).write_text("受控验证提示词：只答结论。", encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            code = main(
+                env=worker_env(LINGXI_WORKER_SYSTEM_PROMPT_FILE=path),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(sdk.options[0].system_prompt, "受控验证提示词：只答结论。")
 
 
 if __name__ == "__main__":

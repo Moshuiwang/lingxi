@@ -2,8 +2,10 @@
 
 只做形状：给定一个会话根目录与 ``agent_session_id``，删除匹配的 JSONL 文件。真正
 「这个 session id 该不该删」的判定住在数据库（``clear_agent_session`` /
-``sweep_idle_conversations`` / ``clear_delivered_content_for_user`` 三处触发点各自
-排队，三处各自的排队实现在 ``adapters/postgres_conversation/_transaction.py`` 的
+``sweep_idle_conversations`` / ``discard_stale_agent_session``（入队轮换判废，
+2026-08-23） / ``clear_delivered_content_for_user`` / ``_queue_overwritten_session``
+（收口写回覆盖旧值）五处触发点各自排队，排队实现在
+``adapters/postgres_conversation/_transaction.py`` 的
 ``_Transaction._queue_session_cleanup``；本文件消费的两个方法
 ``claim_session_cleanups``/``mark_session_cleanups_done`` 在
 ``adapters/postgres_conversation/_queue_session_cleanup.py``，Issue #239 起

@@ -655,6 +655,105 @@ class SessionRotationNoticeTests(PipelineTestCase):
         )
 
 
+class StaleSessionDiscardTests(PipelineTestCase):
+    """2026-08-23 真实故障回归：入队判定「不续用」的旧 ``agent_session_id`` 必须随
+    入队事务立即置空（判废即清），不能指望下一次入队的时间戳比较继续挡住它。
+
+    故障链：两小时轮换后的首个任务崩溃——失败任务不写回新 session id，却刷新
+    ``last_task_ended_at``——下一条消息落回两小时窗口内，resume 一个早已判废、
+    JSONL 已被物理清理的旧会话，连发几条都瞬间失败，用户只能手动 `/new` 自救；
+    就算旧文件还在，续上的也是「已明确告知不携带」的过期上下文。
+    """
+
+    def stale_conversation(self) -> FakeConversation:
+        conversation = FakeConversation(
+            conversation_id="cnv_1",
+            agent_session_id="ses_stale",
+            last_task_ended_at=NOW - timedelta(hours=5),
+        )
+        self.state.conversations[("usr_1", "oc_1", "")] = conversation
+        return conversation
+
+    def discard_calls(self) -> list[dict]:
+        return self.log.fields("store.discard_stale_agent_session")
+
+    def test_rotation_discards_the_stale_session_id_in_the_same_transaction(self) -> None:
+        conversation = self.stale_conversation()
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(len(self.discard_calls()), 1)
+        self.assertIsNone(
+            conversation.agent_session_id, "轮换判废的旧会话 id 必须随入队事务置空"
+        )
+        self.assertEqual(len(self.state.tasks), 1, "判废不改变入队本身")
+
+    def test_a_failed_rotated_task_cannot_leak_the_stale_session_to_the_next_message(self) -> None:
+        """事故本体的最小重放：轮换后的首个任务失败（只刷新结束时间、不写回新
+        session id），一分钟后的下一条消息必须开全新会话，而不是 resume 旧的。"""
+
+        conversation = self.stale_conversation()
+        pipeline = self.build()
+        pipeline.handle_message(message("evt_1"), now=NOW)
+
+        # 模拟任务失败收口：释放话题、刷新结束时间；失败不写回 agent_session_id。
+        conversation.running_task_id = None
+        conversation.last_task_ended_at = NOW + timedelta(seconds=30)
+
+        outcome = pipeline.handle_message(message("evt_2"), now=NOW + timedelta(minutes=1))
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertFalse(
+            outcome.resumed_session,
+            "修复前这里是 True：失败任务刷新了结束时间，旧 id 又没清，"
+            "下一条消息会去 resume 一个已判废的会话",
+        )
+        self.assertFalse(self.state.tasks[1].resumed_session)
+
+    def test_a_continuing_session_is_never_discarded(self) -> None:
+        conversation = FakeConversation(
+            conversation_id="cnv_1",
+            agent_session_id="ses_live",
+            last_task_ended_at=NOW - timedelta(minutes=30),
+        )
+        self.state.conversations[("usr_1", "oc_1", "")] = conversation
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertTrue(outcome.resumed_session)
+        self.assertEqual(self.discard_calls(), [], "续用中的会话绝不能被判废")
+        self.assertEqual(conversation.agent_session_id, "ses_live")
+
+    def test_nothing_to_discard_means_no_discard_call(self) -> None:
+        """首次提问 / `/new` 之后：``agent_session_id`` 本来就是空，不发多余写入。"""
+
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(self.discard_calls(), [])
+
+    def test_a_stale_session_without_a_finished_task_is_still_discarded(self) -> None:
+        """「有会话 id 但没有结束时间」的不可达组合（纵深防御，与
+        ``SessionRotationNoticeTests`` 的同名情形对应）：不提示，但同样判废——
+        它无论如何都不会再被 resume，留着只会等下一次事故。"""
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_1", agent_session_id="ses_orphan", last_task_ended_at=None
+        )
+        self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(len(self.discard_calls()), 1)
+
+    def test_a_busy_topic_does_not_discard_anything(self) -> None:
+        """忙碌分支根本不进入入队判定，判废不得发生——正在运行的任务结束时还要
+        把自己的新 session id 写回这一行。"""
+
+        conversation = self.stale_conversation()
+        conversation.running_task_id = "tsk_running"
+        self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(self.discard_calls(), [])
+
+
 class BusyCommandTests(PipelineTestCase):
     """`V-会话-09`（忙碌期 `/new`）与 `V-会话-10`（`/stop` 不被忙碌拦截）。"""
 

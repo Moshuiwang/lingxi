@@ -105,6 +105,17 @@ class WorkerConfig:
     workspace: str | None = None
     model: str | None = None
     system_prompt: str | None = None
+    # 默认提示词文件（2026-08-23 终验事故后补，产品负责人裁定「提示词不进代码、
+    # 不进镜像，随时可改、快速验证」）：指向挂载卷上的一个 UTF-8 文本文件，queue
+    # 模式**每个任务开始时现读**——编辑该文件后下一条消息即生效，不需要重启容器
+    # 或重建镜像。与 ``system_prompt``（进程级固定值）互斥：两个来源同时配置时无法
+    # 回答"这一轮到底用的哪份"，启动即失败。与 ``output_safety_canary`` 也互斥：
+    # canary 的全部子串不变量在启动期针对**固定**提示词校验（见
+    # ``_validate_output_safety_canary``），逐任务变化的文件内容无法在启动期背书。
+    # 文件缺失/不可读/超限时该任务**降级为无提示词执行**并留结构化告警——提示词
+    # 是行为调优，不是安全屏障（屏障是 PreToolUse 白名单），失败关闭在这里意味着
+    # 把整条问数服务押在一个运维随手可改的文件上，得不偿失。
+    system_prompt_file: str | None = None
     # S-A-07 受控验收专用开关（Issue #142 验收缺口，#154 r17 未通过后补）：在
     # 出口安全约束之前，把已配置的**合成** system prompt 确定性地注入最终正文，
     # 使真实 Queue 链路不依赖模型"恰好复述"提示词就能触发局部遮蔽（masked）或
@@ -159,6 +170,20 @@ class WorkerConfig:
         # 路径，只靠 loader 校验时，绕过 loader 的构造能带着拼错的档位或危险提示
         # 一路跑起来——注入退化成空字符串、canary 永远不触发，验收者会把"配置不
         # 完整"误读成"安全链路又没触发"。两条路径必须同等失败关闭。
+        # 提示词文件的两条互斥不变量放在类型自身（理由同下，两条构造路径同等
+        # 失败关闭），且**先于** canary 校验：canary 校验会因"canary 没配提示词"
+        # 或"提示词与固定文案互为子串"先行报错，把真正的问题（不该同时配文件）
+        # 说成别的。措辞用字段名口径，loader 侧另有环境变量口径的报错。
+        if self.system_prompt_file and self.system_prompt:
+            raise WorkerConfigError(
+                "system_prompt_file 与 system_prompt 不得同时配置：两个来源并存时"
+                "无法回答「这一轮到底用的哪份提示词」"
+            )
+        if self.system_prompt_file and self.output_safety_canary is not None:
+            raise WorkerConfigError(
+                "system_prompt_file 与 output_safety_canary 不得同时配置：canary 的"
+                "子串不变量在启动期针对固定提示词校验，逐任务变化的文件内容无法背书"
+            )
         _validate_output_safety_canary(
             self.output_safety_canary,
             self.system_prompt,
@@ -193,6 +218,21 @@ def load_config(
         )
 
     system_prompt = _text(env, "SYSTEM_PROMPT")
+    system_prompt_file = _system_prompt_file(env)
+    # 环境变量口径的互斥前置报错（dataclass 的 __post_init__ 另有字段名口径的
+    # 同等检查兜底直接构造路径）：不前置的话，canary 的 loader 校验会抢先用
+    # "需要同时配置 SYSTEM_PROMPT"误导运维往错误方向修配置。
+    if system_prompt_file and system_prompt:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 与 {ENV_PREFIX}SYSTEM_PROMPT 不得同时配置"
+            "：两个来源并存时无法回答「这一轮到底用的哪份提示词」"
+        )
+    if system_prompt_file and _text(env, "OUTPUT_SAFETY_CANARY"):
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 与 {ENV_PREFIX}OUTPUT_SAFETY_CANARY 不得"
+            "同时配置：canary 的子串不变量在启动期针对固定提示词校验，逐任务变化的"
+            "文件内容无法背书"
+        )
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tools=_read_only_tools(env),
@@ -226,6 +266,7 @@ def load_config(
         session_root=_text(env, "SESSION_ROOT"),
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
         user_env_root=_user_env_root(env),
+        system_prompt_file=system_prompt_file,
     )
 
 
@@ -367,6 +408,31 @@ def _user_env_root(env: Mapping[str, str]) -> str | None:
         # 同一条"误接进来的可能是别的东西"纪律，不因为这一条是路径就破例。
         raise WorkerConfigError(
             "环境变量 LINGXI_USER_ENV_ROOT 必须是绝对且已规范化的路径"
+            "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
+        )
+    return value
+
+
+def _system_prompt_file(env: Mapping[str, str]) -> str | None:
+    """读取 ``LINGXI_WORKER_SYSTEM_PROMPT_FILE``（默认提示词文件路径）。
+
+    形态校验照抄 ``_user_env_root``：可选、不得含空白、必须是绝对且已规范化的
+    路径（挡掉相对路径、``..`` 穿越、连续斜杠）。只校验形态不碰文件系统——
+    文件此刻不存在是合法状态（运维可以先起进程后放文件），存在性与可读性在
+    每个任务开始时现读现判（见 ``apps/worker/service.py``），读不到就该任务
+    降级为无提示词执行并留告警，不影响进程存活。
+    """
+
+    value = _text(env, "SYSTEM_PROMPT_FILE")
+    if not value:
+        return None
+    if any(character.isspace() for character in value):
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 不得包含空白字符（不回显取到的值）"
+        )
+    if not value.startswith("/") or posixpath.normpath(value) != value:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SYSTEM_PROMPT_FILE 必须是绝对且已规范化的路径"
             "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
         )
     return value
