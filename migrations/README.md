@@ -438,22 +438,33 @@ scheme 决定，少了它干净环境跑 `upgrade` 会报 `No module named 'psyc
 
 ## 测试资产（`migrations/testing/*.sql`）
 
-`001` / `002` / `003` / `005` 服务于 Bot-Test 受控验证与既有测试
-（[代码框架第五节](../docs/技术设计/代码框架.md)），其中 `001`/`003`/`005` 已分别被
-`008`/`006`/`007` 取代，`002` 所属的浏览器 OAuth 路径已被 2026-07-28 决策排除。
-它们**不属于生产链**、不参与上面的任何检查，也不在 alembic 的 `script_location` 扫描
-范围内（alembic 只读 `migrations/alembic/versions/` 下的 `.py`），仅供
-`tests/test_identity_postgres.sh`、`tests/test_refresh_token_postgres.py` 与
-`scripts/sync_feishu_org_snapshot.py` 使用。
+**2026-08-23 #146 清退：`001`/`002`/`003`/`005` 已全部删除，目录已随 #146 清退批（2026-08-23）整体移除（001/002/003/005 连同其唯一消费者一并清退；007/008 冻结文件头部「001/005 仍留在仓库里」的表述自此失准——冻结文件逐字节不可改，以本行登记为准）。** 它们此前
+服务于 Bot-Test 受控验证与既有测试（[代码框架第五节](../docs/技术设计/代码框架.md)），
+其中 `001`/`003`/`005` 已分别被正式迁移 `008`/`006`/`007` 取代，`002` 所属的浏览器
+OAuth 路径已被 2026-07-28 决策排除；它们此前**不属于生产链**、不参与上面的任何检查，
+也不在 alembic 的 `script_location` 扫描范围内。
 
-2026-08-06 登记（[#55 盘点](https://github.com/Moshuiwang/lingxi/issues/55#issuecomment-5201705742)）：按「保留最小集」口径，本轮清退清单为空。
-`002` 服务的**员工**浏览器 OAuth 路径确已排除，但 `onboarding_progress` 同时是
-「四达文档会议助手」重授权链的一环——卡片 `card_nonce` 即 OAuth `state`，回调换码前
-必须先占用该行（`src/lingxi/adapters/oauth_bridge.py:542`），因此现在删除会移除正式
-凭据代码「轮换失败 → 人工重新授权」的唯一落地手段。废弃时点改为：随
-[#67](https://github.com/Moshuiwang/lingxi/issues/67) 的正式重授权入口交付后执行。
+处置依据：真实 `OnboardingRunner` 已于 2026-08-21 通过 L4a，#67/本文件此前登记的清退
+解除条件成立，产品负责人授权按调用关系逐项核对后清退：
 
-2026-08-09 回写（#67 阶段 B）：正式重授权入口已交付并在 `biai-stage` 完成真实 L4a，
-但阶段 B 按缩小清单执行，**`migrations/testing/002`、`003` 继续保留**——它们仍是
-「飞书私聊卡片 → 首次开通」这条链目前唯一跑通过的验证入口（生产侧 `OnboardingRunner`
-当前唯一实现是失败关闭桩），废弃时点顺延到 E4 真实 onboarding runner 通过 L4a 之后。
+- `001_create_app_user.sql`（原供 `tests/test_identity_postgres.sh` 使用）：该测试脚本
+  自身头部已注明「本脚本断言的旧 `app_user` 形状只对 001 成立，随测试资产清退一并退休」，
+  001 相关断言已由 `tests/test_identity_postgres_records.py` 对正式表（006-008）等价覆盖；
+  冻结迁移 `008_create_app_user.sql` 头部注释本就把废弃时点显式委托给「验收人在 PR
+  阶段决定」。测试脚本随之整体删除，`verify_repository.sh` 里的调用一并移除。
+- `002_create_onboarding_progress.sql`、`003_create_feishu_user_refresh_token.sql`
+  （原供 `tests/test_identity_postgres.sh`、`tests/test_refresh_token_postgres.py`、
+  `adapters/refresh_tokens.py`、`adapters/postgres_onboarding.py` 使用）：随「飞书私聊卡片
+  → 首次开通」Bot-Test 资产簇整体清退，调用关系核对确认没有任何生产入口消费者。
+  `tests/test_refresh_token_postgres.py` 整体删除。
+- `005_create_feishu_org_snapshot.sql`（原供 `scripts/sync_feishu_org_snapshot.py` 使用）：
+  该脚本已被 [#250](https://github.com/Moshuiwang/lingxi/issues/250) 的 `OrgSnapshotSyncDuty`
+  取代（生产侧现在每 UTC 日写真实 `feishu_org_*` 快照表），脚本随之删除；冻结迁移
+  `007_create_feishu_org_snapshot.sql` 头部注释同样把废弃时点委托给「验收人在 PR 阶段
+  决定」，脚本删除后 005 已无任何消费者。
+
+历史沿革（保留供追溯）：2026-08-06 曾按「保留最小集」口径登记本轮清退清单为空
+（[#55 盘点](https://github.com/Moshuiwang/lingxi/issues/55#issuecomment-5201705742)）；
+2026-08-09 #67 阶段 B 交付正式重授权入口后，`002`、`003` 因仍是当时唯一跑通的开通验证
+入口而继续保留，废弃时点顺延到 E4 真实 onboarding runner 通过 L4a 之后——即本次触发
+清退的条件。

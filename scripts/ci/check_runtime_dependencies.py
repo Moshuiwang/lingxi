@@ -206,12 +206,8 @@ PROCESS_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
     "reauthorize": ("lingxi.apps.reauthorize", "lingxi.apps.reauthorize.__main__"),
     "worker": ("lingxi.apps.worker", "lingxi.apps.worker.cli", "lingxi.apps.worker.__main__"),
     "gateway": ("lingxi.apps.gateway", "lingxi.apps.gateway.config", "lingxi.apps.gateway.__main__"),
-    "bot-test": (
-        "lingxi.adapters.feishu_onboarding",
-        "lingxi.adapters.oauth_bridge",
-        "lingxi.adapters.refresh_tokens",
-        "lingxi.adapters.postgres_onboarding",
-    ),
+    # 2026-08-23 #146 清退：`bot-test` 进程组随其三个专属消费者一并删除，见
+    # check_installed_package.py 同一变更点的注释。
     # 迁移作业没有任何 lingxi 入口：迁移工具链不得渗入运行时代码（V-迁移-04）。
     "migrate": (),
 }

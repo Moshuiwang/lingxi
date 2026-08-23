@@ -151,16 +151,18 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         self.assertIn("不是已批准的模块豁免", output)
 
     def test_source_edit_module_exemption_reason_fails(self) -> None:
+        # 2026-08-23 #146 清退后示例改用 feishu_bitable_association——它未随本轮
+        # 清退变动，仍是 MODULE_MANIFEST_EXEMPTIONS 里理由文本保持不变的一项。
         def edit(source: str) -> str:
-            old = '"lingxi.adapters.refresh_tokens": "Bot-Test 受控验证资产，仅由 bot-test 进程加载"'
+            old = '"lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单"'
             self.assertIn(old, source)
-            return source.replace(old, '"lingxi.adapters.refresh_tokens": "被改写的豁免理由"', 1)
+            return source.replace(old, '"lingxi.adapters.feishu_bitable_association": "被改写的豁免理由"', 1)
 
         result = _run_source_only_with_edit(edit)
         output = result.stdout + result.stderr
 
         self.assertNotEqual(0, result.returncode, output)
-        self.assertIn("lingxi.adapters.refresh_tokens", output)
+        self.assertIn("lingxi.adapters.feishu_bitable_association", output)
         self.assertIn("理由与已批准政策不一致", output)
 
     def test_source_edit_migrate_entry_reason_fails(self) -> None:
@@ -177,10 +179,12 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         self.assertIn("进程入口豁免发生漂移", output)
 
     def test_a_process_cannot_depend_on_a_formal_artifact_exemption(self) -> None:
+        # 2026-08-23 #146 清退后示例改用 oauth_bridge——它是 #67 裁定保留、仍在
+        # MODULE_MANIFEST_EXEMPTIONS 里的豁免模块。
         process = dict(CHECKER.PROCESS_RUNTIME_IMPORTS)
         lingxi_modules, third_party_modules = process["scheduler"]
         process["scheduler"] = (
-            (*lingxi_modules, "lingxi.adapters.feishu_onboarding"),
+            (*lingxi_modules, "lingxi.adapters.oauth_bridge"),
             third_party_modules,
         )
 

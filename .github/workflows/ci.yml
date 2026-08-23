@@ -199,8 +199,9 @@ jobs:
     needs: [classify]
     if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
     runs-on: ubuntu-24.04
-    # 同一次波动里 bot-test 腿也曾 5 分钟触顶；migrate 腿在争抢下实测过 4m32s。
-    # 每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且仍能挡住真正的挂死。
+    # migrate 腿在争抢下实测过 4m32s（此前 bot-test 腿也曾 5 分钟触顶，该 extra 已随
+    # #146 清退删除）。每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且
+    # 仍能挡住真正的挂死。
     timeout-minutes: 8
     strategy:
       # 各组互相独立，一组坏了也要看到其余组的结论。
@@ -212,7 +213,7 @@ jobs:
         # migrate 是部署时跑一次的迁移作业，不是常驻进程，但同样要证明"单独装得上"：
         # #62 要为它构建镜像，那时缺依赖就是部署当场失败（Issue #53）。
         # reauthorize 复用 scheduler 镜像，但作为独立一次性入口单独验证其 import 闭包。
-        extra: [scheduler, reauthorize, worker, gateway, bot-test, migrate]
+        extra: [scheduler, reauthorize, worker, gateway, migrate]
 
     steps:
       - name: 检出代码
