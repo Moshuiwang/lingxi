@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import sys
 import time
 
@@ -35,17 +36,20 @@ DEFAULT_MAX_SDK_MESSAGE_BYTES = 32 * 1024 * 1024
 # SDK 0.2.128 把读流侧的缓冲超限压平成**裸 Exception** 投回业务迭代器（reader 把
 # ``{"type": "error", "error": 文本}`` 放进消息流，query 侧再
 # ``raise Exception(error_text)``），类型信息在那一步已经丢失，只能按错误文本识别。
-# 措辞取自 ``_internal/transport/subprocess_cli.py`` 的固定字符串，取到
-# ``JSON message`` 前缀段以收窄误判面（外部独立审查 2026-08-23 P2-2：裸的
-# "exceeded maximum buffer size" 太通用，别的子系统报错撞上就会被误报成
-# 「查询结果过大」）；升级 SDK 版本时随验证与门禁 10.0 的重跑一并核对它是否仍在。
-_MESSAGE_BUFFER_OVERFLOW_MARKER = "JSON message exceeded maximum buffer size"
+# 匹配 SDK 固定模板的完整形状（``_internal/transport/subprocess_cli.py``：
+# "JSON message exceeded maximum buffer size of {n} bytes"，含字节数尾部）——
+# 外部独立审查 2026-08-23 两轮逐步收窄：裸的 "exceeded maximum buffer size"
+# 太通用，别的子系统报错撞上就会被误报成「查询结果过大」。升级 SDK 版本时随
+# 验证与门禁 10.0 的重跑一并核对该模板是否仍在。
+_MESSAGE_BUFFER_OVERFLOW_PATTERN = re.compile(
+    r"JSON message exceeded maximum buffer size of \d+ bytes"
+)
 
 
 def is_message_buffer_overflow(error: BaseException) -> bool:
     """这次失败是否为「单条 SDK 消息超过读流缓冲上限」（工具回执过大的典型形状）。"""
 
-    return _MESSAGE_BUFFER_OVERFLOW_MARKER in str(error)
+    return _MESSAGE_BUFFER_OVERFLOW_PATTERN.search(str(error)) is not None
 
 
 class AgentSessionInterrupted(Exception):

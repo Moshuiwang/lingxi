@@ -597,8 +597,13 @@ class WorkerService:
             # 互斥，这里的覆盖不会吃掉任何别处配置的值。
             task_system_prompt = self._config.system_prompt
             if self._config.system_prompt_file:
+                # to_thread：读取本身已有界（≤64KiB+1），但慢挂载/存储抖动下的
+                # 一次 open/read 仍可能停顿；放线程池里跑，不占事件循环（心跳与
+                # 停止处理都在循环上，codex 二轮复验指出）。
                 task_system_prompt, system_prompt_digest, prompt_degraded = (
-                    _load_task_system_prompt(self._config.system_prompt_file)
+                    await asyncio.to_thread(
+                        _load_task_system_prompt, self._config.system_prompt_file
+                    )
                 )
                 if prompt_degraded is not None:
                     logger.warning(
@@ -975,9 +980,10 @@ class WorkerService:
             "denied_count": denied_count,
             "denied_tool_names": tuple(capped_denied_tool_names),
             "tool_result_count": tool_result_count,
-            # 「这一轮用的哪版默认提示词」的唯一追溯依据（sha256 前 12 位；未配置
-            # 提示词文件或本轮降级时为 None）。摘要是固定形态短标识，不过
-            # _cap_log_token——它不可能携带自由文本。
+            # 「这一轮**选定**的默认提示词版本」的唯一追溯依据（sha256 前 12 位；
+            # 未配置提示词文件或本轮降级时为 None；口径见 _process_task 的初始化
+            # 注释——记录"选定并交给执行器装配的版本"，不声称模型已收到）。摘要
+            # 是固定形态短标识，不过 _cap_log_token——它不可能携带自由文本。
             "system_prompt_digest": system_prompt_digest,
             "truncated": truncated,
         }

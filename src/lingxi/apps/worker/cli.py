@@ -197,6 +197,15 @@ def main(
                 "worker.turn.system_prompt_unavailable",
                 reason=degraded,
             )
+            # stdout 契约与其他配置错误一致：恰好一个 JSON 对象（codex 二轮
+            # 复验发现首版只写 stderr 就返回，破坏了 turn 模式的公开输出契约）。
+            _emit(
+                out,
+                config_error_report(
+                    trace_id=config.trace_id,
+                    message=f"system_prompt_file 不可用（{degraded}），受控回合失败关闭",
+                ),
+            )
             return EXIT_CONFIG_ERROR
         # 与 queue 模式同一细节：注入已解析的提示词时必须清掉文件指针，否则
         # replace 重跑 __post_init__ 会撞上 file 与 prompt 的互斥不变量。

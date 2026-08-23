@@ -2147,6 +2147,9 @@ class SystemPromptFileConfigTests(unittest.TestCase):
 
         self.assertEqual(code, 3)
         self.assertIn("worker.turn.system_prompt_unavailable", stderr.getvalue())
+        # stdout 契约（codex 二轮复验）：配置错误同样恰好一个 JSON 对象。
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["failure"]["code"], "config_error")
 
     def test_turn_mode_serves_the_prompt_file_to_the_session(self) -> None:
         """turn 模式读到文件时，提示词必须真的进 SDK 会话选项——这是「编辑文件
