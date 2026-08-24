@@ -18,17 +18,29 @@ FULL_PREFIXES = (".github/workflows/", "deploy/", "migrations/", "scripts/ci/")
 FULL_FILES = {".dockerignore", "Dockerfile", "alembic.ini", "pyproject.toml"}
 FAST_PREFIXES = ("experiments/", "scripts/dev/", "src/", "tests/", "workers/")
 
+# scripts/ci/ 整目录默认提级到完整门禁，但其中已知的纯数据文件不含可执行逻辑、
+# 不改变门禁脚本本身的判定行为，因此显式登记后单独按 fast 处理（Issue #298）。
+# 新增候选必须显式写进这里——不在清单内的 scripts/ci/ 文件（哪怕文件名看起来也
+# 像数据）默认仍然提级，防止「新增一个脚本文件、忘了登记」被静默当成数据放行。
+FULL_PREFIX_DATA_FILES = frozenset(
+    {
+        "scripts/ci/size_ratchet_baseline.txt",
+    }
+)
+
 
 def is_document(path: str) -> bool:
     return path in DOCUMENT_FILES or path.startswith(DOCUMENT_PREFIXES)
 
 
 def is_full(path: str) -> bool:
+    if path in FULL_PREFIX_DATA_FILES:
+        return False
     return path in FULL_FILES or path.startswith(FULL_PREFIXES)
 
 
 def is_fast(path: str) -> bool:
-    return path.startswith(FAST_PREFIXES)
+    return path.startswith(FAST_PREFIXES) or path in FULL_PREFIX_DATA_FILES
 
 
 def classify(paths: list[str]) -> str:
