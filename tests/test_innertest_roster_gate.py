@@ -19,9 +19,12 @@ from lingxi.core.identity.innertest_roster_gate import (
     parse_innertest_roster,
 )
 
-#: 名单里两名"存量用户"的化名 open_id（不是真实值，仅用于测试）。
-ROSTERED_A = "ou_roster_member_a"
-ROSTERED_B = "ou_roster_member_b"
+#: 名单里两名"存量用户"的化名 open_id（不是真实值，仅用于测试）。形状必须真的满足
+#: `_looks_like_open_id` 的正则（`ou_` 后接 20~64 位英文字母或数字，不含下划线这类
+#: 分隔符）——否则 `ParseValidConfigTests` 会在 `parse_innertest_roster` 这一步就
+#: 被当成格式非法，而不是走到真正要测的"合法配置正确解析"这条路径。
+ROSTERED_A = "ou_rostermembera00000000000"
+ROSTERED_B = "ou_rostermemberb00000000000"
 ROSTER = frozenset({ROSTERED_A, ROSTERED_B})
 
 #: 从未出现在任何名单、任何测试夹具中的未知对象——用于默认拒绝的否定断言。
@@ -114,6 +117,32 @@ class ParseInvalidConfigTests(unittest.TestCase):
         self.assertNotIn(secret_looking_garbage, str(ctx.exception))
 
 
+class TypoSeparatorRegressionTests(unittest.TestCase):
+    """opus 批量审查 P2 修复：`_looks_like_open_id` 此前只要求"以 ou_ 开头、不含
+    空白字符"——分号、全角逗号、顿号、句点这类粘连手误全部"看起来像"一个合法条目，
+    不会触发整份拒绝，而是被当成一个真实的、只是永远匹配不到任何人的 open_id
+    悄悄收进名单：名单静默变小，对应的人静默被全拒，部署日志里看不到任何异常
+    （opus 实测四种手误全部复现"静默全拒"）。收紧成 `ou_[0-9A-Za-z]{20,64}` 之后，
+    这四类手误都必须在**启动期**让整份配置响亮报错，而不是被悄悄接纳。
+    """
+
+    def test_semicolon_typo_used_as_a_separator_is_rejected(self) -> None:
+        with self.assertRaises(InnerTestRosterConfigError):
+            parse_innertest_roster(f"{ROSTERED_A};{ROSTERED_B}")
+
+    def test_fullwidth_comma_typo_used_as_a_separator_is_rejected(self) -> None:
+        with self.assertRaises(InnerTestRosterConfigError):
+            parse_innertest_roster(f"{ROSTERED_A}，{ROSTERED_B}")
+
+    def test_ideographic_comma_typo_used_as_a_separator_is_rejected(self) -> None:
+        with self.assertRaises(InnerTestRosterConfigError):
+            parse_innertest_roster(f"{ROSTERED_A}、{ROSTERED_B}")
+
+    def test_full_stop_typo_used_as_a_separator_is_rejected(self) -> None:
+        with self.assertRaises(InnerTestRosterConfigError):
+            parse_innertest_roster(f"{ROSTERED_A}。{ROSTERED_B}")
+
+
 class DefaultDenyTests(unittest.TestCase):
     """默认关闭＝全拒：空集合对任何输入都返回 ``False``。
 
@@ -152,7 +181,7 @@ class MembershipMatchTests(unittest.TestCase):
         self.assertFalse(is_open_id_innertest_allowed(different_case, ROSTER))
 
     def test_prefix_of_a_member_is_not_a_match(self) -> None:
-        """否定断言：前缀匹配会把 `ou_roster_member_a` 的一个真前缀误判为命中。"""
+        """否定断言：前缀匹配会把 ``ROSTERED_A`` 的一个真前缀误判为命中。"""
 
         self.assertFalse(is_open_id_innertest_allowed(ROSTERED_A[:-1], ROSTER))
 

@@ -40,9 +40,27 @@
 只做首尾空白裁剪、精确字符串相等，不做大小写归一化、不做前缀或模糊匹配——与
 ``core/identity/first_contact.py`` 的 ``locate_by_open_id`` 同一条纪律（``open_id``
 前缀在 710 人实测中已知有碰撞；模糊匹配违反"不猜测身份"的产品合同硬要求）。
+
+## 已知边界（不是缺陷，是这道闸的设计范围）
+
+这道闸只挡"还没开始走开通链"的人，不是一个持续生效的访问控制列表：
+
+- **移出名单不切断已开通用户**：本闸只在 gateway/scheduler 两处"进入开通链
+  最前端"的判定点被调用（`core/conversation/pipeline.py` 的 `NOT_PROVISIONED`
+  分支、`AutoOnboardingRunner._run` 的第一步）；一个用户一旦已经开通完成
+  （`app_user` 行存在、状态为 active），后续消息结构上根本不会再触达这道闸的
+  调用点，从名单里删掉这个人的 open_id 不会让他既有的开通与问数能力失效。
+- **在途开通链不复核名单**：`AutoOnboardingRunner._run` 只在链的最开头判一次
+  名单，链跑到中途（身份定位、匹配、建档、发布……最长可达十五分钟）期间名单
+  即使被改配置重新部署，这条已经在跑的链也不会重新判定或中止。
+- **真正的切断工具是管理员停用动作**，不是改这个环境变量：让一个已开通用户
+  停止使用，属于 S-M-02（#96，登记表撤销/停用写路径 + 本人确认卡）的产品范围，
+  本 Story（S-N-01）不提供，这道闸也从未打算提供这个能力。
 """
 
 from __future__ import annotations
+
+import re
 
 #: 飞书用户 open_id 的前缀，与 ``adapters/feishu_user_message.py`` 的
 #: ``USER_OPEN_ID_PREFIX`` 同一个字面量。这里不从 adapters 反向 import——``core/``
@@ -50,6 +68,16 @@ from __future__ import annotations
 #: 一份同一个前缀常量，形状同 ``publish_row.ALL_COMPANIES_KEY`` 与
 #: ``metric_translation.ALL_COMPANIES_KEY`` 的既有取舍。
 _OPEN_ID_PREFIX = "ou_"
+
+#: open_id 形状校验（opus 批量审查实测 P1 修复）。此前只要求"以 ou_ 开头、不含
+#: 空白字符"，宽到分号、全角逗号（，）、顿号（、）、句点（。）这类粘连手误全部
+#: "看起来像"一个合法条目——不会触发下面 `InnerTestRosterConfigError` 的整份拒绝，
+#: 而是被当成一个真实的、只是永远匹配不到任何人的 open_id 悄悄收进名单，名单因此
+#: 静默变小、对应的人静默被全拒，运维在部署日志里看不到任何异常。收紧成"ou_ 后面
+#: 只能是 20 到 64 位英文字母或数字"之后，这类手误里出现的任何一个非法字符都会让
+#: 整条目落在正则之外，从而让整份配置在**启动期**就响亮失败，而不是安静地漏掉一
+#: 个人。20–64 是留出余量的宽松边界，不是飞书官方公布的精确长度承诺。
+_OPEN_ID_PATTERN = re.compile(r"ou_[0-9A-Za-z]{20,64}")
 
 
 class InnerTestRosterConfigError(ValueError):
@@ -64,18 +92,15 @@ class InnerTestRosterConfigError(ValueError):
     def __init__(self, *, invalid_count: int) -> None:
         self.invalid_count = invalid_count
         super().__init__(
-            f"内测名单包含 {invalid_count} 条无法识别的条目（必须是以 "
-            f"{_OPEN_ID_PREFIX!r} 开头、不含空白字符的飞书用户 open_id，"
-            "用英文逗号或换行分隔，不回显取到的原始条目）"
+            f"内测名单包含 {invalid_count} 条无法识别的条目（必须是 "
+            f"{_OPEN_ID_PREFIX!r} 后接 20 到 64 位英文字母或数字的飞书用户 "
+            "open_id，用英文逗号或换行分隔——不得包含分号、全角标点或其他分隔符，"
+            "不回显取到的原始条目）"
         )
 
 
 def _looks_like_open_id(token: str) -> bool:
-    return (
-        token.startswith(_OPEN_ID_PREFIX)
-        and len(token) > len(_OPEN_ID_PREFIX)
-        and not any(character.isspace() for character in token)
-    )
+    return _OPEN_ID_PATTERN.fullmatch(token) is not None
 
 
 def parse_innertest_roster(raw: str | None) -> frozenset[str]:
