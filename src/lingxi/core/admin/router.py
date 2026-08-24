@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+from lingxi.core.admin.pending_action import PendingAction, PendingActionType
 from lingxi.core.admin.registry import AdminRegistryEntry, is_authorized_admin
 from lingxi.core.admin.views import AdminEventView, AdminUserStatusView
 
@@ -50,6 +51,47 @@ class AdminQueries(Protocol):
     ) -> Sequence[AdminEventView]: ...
 
 
+class _PrepareDecision(Protocol):
+    ok: bool
+    message: str
+    code: str
+
+
+class _PrepareOutcome(Protocol):
+    decision: _PrepareDecision
+    pending: PendingAction | None
+
+
+class PendingActionPreparer(Protocol):
+    """``prepare_action``（接口设计「八、领域服务接口」）的调用面：只建待确认操作，
+    不直接改变业务状态。与
+    ``adapters.postgres_pending_action.PostgresPendingActionStore.prepare`` 结构
+    相同，测试注入内存假实现。"""
+
+    def prepare(
+        self, *, action_type: PendingActionType, target_open_id: str, initiated_by_open_id: str
+    ) -> _PrepareOutcome: ...
+
+
+class _CardDispatchResult(Protocol):
+    delivered: bool
+
+
+class ConfirmCardSender(Protocol):
+    """把已经 prepare 好的待确认操作发送到发起管理员本人私聊——作为触发这条命令
+    的消息的回复（真实实现见 ``core/admin/card_dispatch.ConfirmCardDispatcher``）。
+    """
+
+    def send(
+        self,
+        *,
+        pending: PendingAction,
+        chat_id: str,
+        thread_id: str | None,
+        reply_to_message_id: str,
+    ) -> _CardDispatchResult: ...
+
+
 @dataclass(frozen=True)
 class AdminRouteOutcome:
     """一次 ``route()`` 调用的结论。
@@ -70,9 +112,24 @@ class AdminRouter(Protocol):
     """``core/conversation/pipeline.EventPipeline`` 依赖的最小接口。
 
     :class:`AdminCommandRouter` 结构上满足它；测试与调用方按这个签名注入假实现，
-    不需要 import 具体类。"""
+    不需要 import 具体类。
 
-    def route(self, *, open_id: str, text: str, trace_id: str) -> AdminRouteOutcome: ...
+    ``chat_id``/``thread_id``/``message_id`` 均带默认值（Issue #96 S-M-02 新增）：
+    只有 ``SUSPEND_USER``/``RESUME_USER`` 这类需要发送确认卡片的写命令才用得到
+    它们（卡片必须回复触发命令的那条消息），只读命令（``help``/``user``/``audit``）
+    完全不受影响。默认值保证既有调用点（不传这三个参数）行为逐字节不变。
+    """
+
+    def route(
+        self,
+        *,
+        open_id: str,
+        text: str,
+        trace_id: str,
+        chat_id: str = "",
+        thread_id: str | None = None,
+        message_id: str = "",
+    ) -> AdminRouteOutcome: ...
 
 
 #: 追溯/审计查询单次最多回显的事件行数——"最近关键事件"的 MVP 承诺，不是完整审计
@@ -90,11 +147,23 @@ class AdminCommandRouter:
     """管理命令面的唯一入口。见模块与 :meth:`route` 文档。"""
 
     def __init__(
-        self, *, registry: AdminRegistryLookup, queries: AdminQueries, audit: AuditSink
+        self,
+        *,
+        registry: AdminRegistryLookup,
+        queries: AdminQueries,
+        audit: AuditSink,
+        pending_actions: PendingActionPreparer | None = None,
+        confirm_cards: ConfirmCardSender | None = None,
     ) -> None:
         self._registry = registry
         self._queries = queries
         self._audit = audit
+        # 两者均可选、成对未装配时安全兜底（Issue #96 S-M-02）：suspend/resume
+        # 命令会被识别，但回复"该功能当前不可用"，不假装已经创建了待确认操作——
+        # 与既有"未装配=安全兜底而不是崩溃"的惯例同一姿态（见
+        # ``_dispatch_write_action``）。
+        self._pending_actions = pending_actions
+        self._confirm_cards = confirm_cards
 
     def _safe_record(self, action: str, /, **fields: object) -> bool:
         """给 ``self._audit.record`` 包一层保护（opus 批量审查 P2 修复）。
@@ -138,7 +207,16 @@ class AdminCommandRouter:
             return AdminRouteOutcome(handled=False)
         return outcome
 
-    def route(self, *, open_id: str, text: str, trace_id: str) -> AdminRouteOutcome:
+    def route(
+        self,
+        *,
+        open_id: str,
+        text: str,
+        trace_id: str,
+        chat_id: str = "",
+        thread_id: str | None = None,
+        message_id: str = "",
+    ) -> AdminRouteOutcome:
         """判定 ``open_id`` 是否为当前有效管理员，是则解析并执行命令。
 
         **每次调用都发起一次新的登记表读取**（通过注入的 ``registry``），不持有、
@@ -148,6 +226,11 @@ class AdminCommandRouter:
         已确认是管理员之后的执行失败则必须给出明确的错误回复，不能沉默。
 
         以上两条承诺都不得被审计器自身的异常打破——见 :meth:`_record_or_reject`。
+
+        ``chat_id``/``thread_id``/``message_id``（Issue #96 S-M-02 新增，均带默认值）
+        只有 ``suspend``/``resume`` 这类写命令才用得到——确认卡片必须作为触发这条
+        命令的消息的回复发出（真实 CardTransport 的结构性要求，见
+        ``adapters/feishu_admin_card.py``）。只读命令完全不读取这三个参数。
         """
 
         try:
@@ -174,7 +257,14 @@ class AdminCommandRouter:
         assert entry is not None  # is_authorized_admin 已确认非空
 
         try:
-            return self._dispatch(entry=entry, text=text, trace_id=trace_id)
+            return self._dispatch(
+                entry=entry,
+                text=text,
+                trace_id=trace_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+            )
         except Exception as error:  # noqa: BLE001 - 已确认是管理员，失败也必须有回复
             return self._record_or_reject(
                 "admin.command.internal_error",
@@ -190,7 +280,14 @@ class AdminCommandRouter:
             )
 
     def _dispatch(
-        self, *, entry: AdminRegistryEntry, text: str, trace_id: str
+        self,
+        *,
+        entry: AdminRegistryEntry,
+        text: str,
+        trace_id: str,
+        chat_id: str = "",
+        thread_id: str | None = None,
+        message_id: str = "",
     ) -> AdminRouteOutcome:
         command = parse_admin_command(text)
         roles = sorted(role.value for role in entry.roles)
@@ -250,8 +347,34 @@ class AdminCommandRouter:
                 trace_id=trace_id,
             )
 
+        if command.kind is AdminCommandKind.SUSPEND_USER:
+            assert command.identifier is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.SUSPEND_USER,
+                target_identifier=command.identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+            )
+
+        if command.kind is AdminCommandKind.RESUME_USER:
+            assert command.identifier is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.RESUME_USER,
+                target_identifier=command.identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+            )
+
         # UNKNOWN：语法封闭的落点——不认识的命令得到帮助/拒绝文案，绝不会被当成
-        # 任何查询条件执行（`commands.py` 已把语法钉死为四选一，这里只负责回复）。
+        # 任何查询条件执行（`commands.py` 已把语法钉死为六选一，这里只负责回复）。
         return self._record_or_reject(
             "admin.command.unknown",
             AdminRouteOutcome(
@@ -265,6 +388,137 @@ class AdminCommandRouter:
             trace_id=trace_id,
         )
 
+    def _dispatch_write_action(
+        self,
+        *,
+        entry: AdminRegistryEntry,
+        roles: Sequence[str],
+        action_type: PendingActionType,
+        target_identifier: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        trace_id: str,
+    ) -> AdminRouteOutcome:
+        """``suspend``/``resume`` 共用的写命令编排：角色核对 → ``prepare_action``
+        （只建待确认操作，不改业务状态）→ 发送确认卡片 → 回复管理员"已生成待确认
+        操作，请查收卡片"。真正的业务变更只发生在管理员本人点击卡片之后，见
+        ``core/admin/card_callback.AdminCardCallbackHandler``。
+
+        任何一步不通过都只回复文案、不产生第二条待确认操作或第二张卡片——本方法
+        对每种命令最多调用一次 ``prepare()``、最多调用一次卡片发送。
+        """
+
+        action_name = (
+            "admin.command.suspend_user"
+            if action_type is PendingActionType.SUSPEND_USER
+            else "admin.command.resume_user"
+        )
+
+        if self._pending_actions is None or self._confirm_cards is None:
+            # 未装配（例如尚未完成 gateway 接线的中间态，或测试只想覆盖只读命令）：
+            # 安全兜底，不假装已经创建了待确认操作——与本类既有"未装配=安全兜底"
+            # 的惯例同一姿态（对照 `core/conversation/pipeline.py` 的
+            # `admin_router is None` 分支）。
+            return self._record_or_reject(
+                action_name,
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.write_action_unavailable",
+                    content_version=_CONTENT_VERSION,
+                    reply_text="该功能当前不可用，请联系 Ops。",
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=target_identifier,
+                trace_id=trace_id,
+            )
+
+        if not message_id:
+            # 没有可回复的消息 ID 就没有地方挂载确认卡片——真实 CardTransport
+            # 只能回复一条已知消息（见 adapters/feishu_admin_card.py）。结构上只会
+            # 发生在调用方没有把 InboundMessage.message_id 传下来的时候，失败关闭。
+            return self._record_or_reject(
+                action_name,
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.write_action_unavailable",
+                    content_version=_CONTENT_VERSION,
+                    reply_text="当前上下文无法发送确认卡片，请重新发送该命令。",
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=target_identifier,
+                trace_id=trace_id,
+            )
+
+        # 不在这里重复核对 ``REQUIRED_ROLE[action_type]``：``route()`` 顶层的
+        # ``is_authorized_admin(entry)`` 已经要求 MVP 三类角色**全部**为真才能
+        # 走到 ``_dispatch``，因此"已通过顶层判定、但缺少某个具体角色"在当前
+        # 判定语义下结构上不可能同时成立——写一条测不到、也不该测到的分支会是
+        # 死代码。真正的"prepare 与 confirm 之间角色被撤销"防线在确认时刻重新
+        # 判定（``core/admin/pending_action.decide_confirm`` 的 ``ROLE_REVOKED``
+        # 分支，见 ``tests/test_pending_action.py``）——那一刻是唯一有意义的
+        # "角色是否仍然有效"的重新核验点，因为 prepare 到 confirm 之间存在真实的
+        # 时间窗口，而 prepare 内部这两步之间没有。
+        outcome = self._pending_actions.prepare(
+            action_type=action_type,
+            target_open_id=target_identifier,
+            initiated_by_open_id=entry.feishu_open_id,
+        )
+        if not outcome.decision.ok or outcome.pending is None:
+            return self._record_or_reject(
+                action_name,
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.write_action_rejected",
+                    content_version=_CONTENT_VERSION,
+                    reply_text=outcome.decision.message,
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=target_identifier,
+                code=outcome.decision.code,
+                trace_id=trace_id,
+            )
+
+        dispatch_result = self._confirm_cards.send(
+            pending=outcome.pending,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_message_id=message_id,
+        )
+        if not dispatch_result.delivered:
+            return self._record_or_reject(
+                action_name,
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.write_action_card_send_failed",
+                    content_version=_CONTENT_VERSION,
+                    reply_text="确认卡片发送失败，本次操作不会执行，请稍后重试。",
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=target_identifier,
+                pending_action_id=outcome.pending.id,
+                trace_id=trace_id,
+            )
+
+        return self._record_or_reject(
+            action_name,
+            AdminRouteOutcome(
+                handled=True,
+                content_key="admin.write_action_pending",
+                content_version=_CONTENT_VERSION,
+                reply_text="已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。",
+            ),
+            actor=entry.feishu_open_id,
+            roles=roles,
+            target=target_identifier,
+            pending_action_id=outcome.pending.id,
+            trace_id=trace_id,
+        )
+
 
 def _render_help(roles: Sequence[str]) -> str:
     role_line = "、".join(roles) if roles else "(无)"
@@ -273,6 +527,8 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin help — 显示本帮助\n"
         "/admin user <标识> — 查询用户开通状态\n"
         "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时）\n"
+        "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
+        "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
         f"当前角色：{role_line}"
     )
 

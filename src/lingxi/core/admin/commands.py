@@ -35,6 +35,8 @@ class AdminCommandKind(str, Enum):
     HELP = "help"
     QUERY_USER = "query_user"
     QUERY_AUDIT = "query_audit"
+    SUSPEND_USER = "suspend_user"
+    RESUME_USER = "resume_user"
     UNKNOWN = "unknown"
 
 
@@ -64,6 +66,9 @@ def parse_admin_command(text: object) -> AdminCommand:
     - ``/admin audit <hours>``                   → QUERY_AUDIT，无过滤、显式时间窗
       （单个额外参数全为数字时按小时数解释，否则按标识解释——两者不可能同时成立，
       判据因此是确定性的，不依赖顺序猜测）
+    - ``/admin suspend <identifier>``            → SUSPEND_USER（Issue #96 S-M-02：
+      只建待确认操作，不直接执行；执行前须经本人飞书确认卡片）
+    - ``/admin resume <identifier>``             → RESUME_USER（同上，对称动作）
 
     任何不匹配以上形状的输入（含空文本、非字符串、未知子命令、参数数量或形状不对、
     小时数越界）一律返回 ``UNKNOWN``——调用方据此回复帮助/拒绝文案，不猜测意图。
@@ -90,6 +95,16 @@ def parse_admin_command(text: object) -> AdminCommand:
 
     if sub == "audit":
         return _parse_audit(rest)
+
+    if sub == "suspend":
+        if len(rest) != 1 or not _IDENTIFIER_PATTERN.fullmatch(rest[0]):
+            return _unknown()
+        return AdminCommand(kind=AdminCommandKind.SUSPEND_USER, identifier=rest[0])
+
+    if sub == "resume":
+        if len(rest) != 1 or not _IDENTIFIER_PATTERN.fullmatch(rest[0]):
+            return _unknown()
+        return AdminCommand(kind=AdminCommandKind.RESUME_USER, identifier=rest[0])
 
     return _unknown()
 

@@ -1,8 +1,11 @@
-"""``core/admin/commands.py`` 的封闭语法解析（Issue #95 S-M-01）。
+"""``core/admin/commands.py`` 的封闭语法解析（Issue #95 S-M-01；Issue #96 S-M-02
+新增 ``suspend``/``resume`` 两个写命令的解析）。
 
-认领断言：V-管理-23（命令面语法封闭：任何不匹配四种已知形状的输入一律 ``UNKNOWN``，
+认领断言：V-管理-26（命令面语法封闭：任何不匹配已知形状的输入一律 ``UNKNOWN``，
 含典型的命令注入/任意查询形态——SQL 元字符、分号、空白、系统命令关键字——一律拒绝
-识别为可执行命令，不产生任何查询条件）。
+识别为可执行命令，不产生任何查询条件）。``suspend``/``resume`` 只做**语法**解析，
+不在这里判断目标是否存在或当前状态是否允许该动作——那是 ``core/admin/pending_
+action.decide_prepare`` 的职责（见 ``tests/test_pending_action.py``）。
 """
 
 from __future__ import annotations
@@ -106,6 +109,51 @@ class QueryAuditParsingTests(unittest.TestCase):
 
     def test_too_many_arguments_rejected(self) -> None:
         command = parse_admin_command("/admin audit ou_abc123 72 extra")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+
+class SuspendResumeParsingTests(unittest.TestCase):
+    def test_suspend_with_valid_identifier_recognized(self) -> None:
+        command = parse_admin_command("/admin suspend ou_abc123")
+        self.assertEqual(command.kind, AdminCommandKind.SUSPEND_USER)
+        self.assertEqual(command.identifier, "ou_abc123")
+
+    def test_resume_with_valid_identifier_recognized(self) -> None:
+        command = parse_admin_command("/admin resume ou_abc123")
+        self.assertEqual(command.kind, AdminCommandKind.RESUME_USER)
+        self.assertEqual(command.identifier, "ou_abc123")
+
+    def test_suspend_missing_identifier_is_unknown(self) -> None:
+        command = parse_admin_command("/admin suspend")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_resume_missing_identifier_is_unknown(self) -> None:
+        command = parse_admin_command("/admin resume")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_suspend_extra_argument_is_unknown(self) -> None:
+        command = parse_admin_command("/admin suspend ou_abc123 extra")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_resume_extra_argument_is_unknown(self) -> None:
+        command = parse_admin_command("/admin resume ou_abc123 extra")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_suspend_identifier_with_whitespace_is_unknown(self) -> None:
+        command = parse_admin_command("/admin suspend ou abc")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_suspend_case_insensitive_and_whitespace_tolerant(self) -> None:
+        command = parse_admin_command("  /ADMIN Suspend  ou_abc123  ")
+        self.assertEqual(command.kind, AdminCommandKind.SUSPEND_USER)
+        self.assertEqual(command.identifier, "ou_abc123")
+
+    def test_suspend_sql_injection_shaped_identifier_rejected(self) -> None:
+        command = parse_admin_command("/admin suspend 1; DROP TABLE app_user;--")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_resume_shell_metacharacter_identifier_rejected(self) -> None:
+        command = parse_admin_command("/admin resume $(rm -rf /)")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
 
 

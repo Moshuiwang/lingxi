@@ -298,6 +298,140 @@ class HandlerFailureTests(unittest.TestCase):
         self.assertIn("event.ignored", [action for action, _ in recorded])
 
 
+def card_action_event(
+    *, event_id: str = "evt_card_1", operator_open_id: str = "ou_admin", decision: str = "confirm"
+) -> dict:
+    return {
+        "header": {"event_id": event_id, "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": operator_open_id},
+            "action": {
+                "tag": "button",
+                "value": {"pending_action_id": "pac_1", "decision": decision},
+            },
+        },
+    }
+
+
+class CardActionDispatchTests(unittest.TestCase):
+    """Issue #96 S-M-02：``card.action.trigger`` 事件在 ``card_callback_handler``
+    被显式装配时才处理；未装配（``None``，既有默认值）时行为与
+    ``HandlerFailureTests.test_unsubscribed_event_type_does_not_break_the_
+    connection`` 逐字节一致——那条既有用例本身就是这一条不变量的回归哨兵，本类
+    只新增"确实装配了"这一侧的正向与否定覆盖。
+    """
+
+    def test_wired_handler_receives_the_parsed_operator_and_decision(self) -> None:
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, str]] = []
+
+        class FakeCardCallbackHandler:
+            def handle(
+                self, *, operator_open_id: str, pending_action_id: str, decision: str, trace_id: str
+            ) -> object:
+                calls.append(
+                    {
+                        "operator_open_id": operator_open_id,
+                        "pending_action_id": pending_action_id,
+                        "decision": decision,
+                    }
+                )
+                return None
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+        transport = ScriptedTransport([[card_action_event(operator_open_id="ou_admin")]])
+
+        _, reason, _, _ = run(transport, handler)
+
+        self.assertEqual(reason, TerminationReason.STOPPED)
+        self.assertEqual(
+            calls,
+            [{"operator_open_id": "ou_admin", "pending_action_id": "pac_1", "decision": "confirm"}],
+        )
+
+    def test_unparsable_card_event_is_recorded_and_does_not_break_the_connection(self) -> None:
+        """否定断言：卡片回调伪造/畸形事件体（缺 operator）→ 记审计、不崩溃、
+        不当成"未订阅事件类型"（区分 ``event.unparsable`` 与 ``event.ignored``，
+        便于运维定位"到底是没装配还是读不懂"）。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        recorded: list[tuple[str, dict]] = []
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                recorded.append((action, dict(fields)))
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("不该进消息管线")
+
+        class ExplodingCardCallbackHandler:
+            def handle(self, **kwargs: object) -> None:  # pragma: no cover
+                raise AssertionError("解析失败的事件不该到达回调处理器")
+
+        handler = make_event_handler(
+            ExplodingPipeline(),
+            audit=Audit(),
+            card_callback_handler=ExplodingCardCallbackHandler(),
+        )
+        malformed_event = {
+            "header": {"event_id": "evt_card_bad", "event_type": "card.action.trigger"},
+            "event": {},  # 缺 operator/action
+        }
+        transport = ScriptedTransport([[malformed_event]])
+
+        _, reason, _, _ = run(transport, handler)
+
+        self.assertEqual(reason, TerminationReason.STOPPED)
+        self.assertIn("event.unparsable", [action for action, _ in recorded])
+
+    def test_message_events_still_flow_normally_when_card_callback_handler_is_wired(
+        self,
+    ) -> None:
+        """两种事件类型共存时互不干扰：装配了 ``card_callback_handler`` 不改变
+        既有 ``im.message.receive_v1`` 的处理路径。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class NoOpCardCallbackHandler:
+            def handle(self, **kwargs: object) -> None:  # pragma: no cover
+                raise AssertionError("消息事件不该被当成卡片回调处理")
+
+        received: list[str] = []
+
+        class StubPipeline:
+            def handle_message(self, message) -> None:
+                received.append(message.event_id)
+
+        handler = make_event_handler(
+            StubPipeline(),  # type: ignore[arg-type]
+            audit=Audit(),
+            card_callback_handler=NoOpCardCallbackHandler(),
+        )
+        transport = ScriptedTransport([[event("evt_normal_1")]])
+
+        _, reason, _, _ = run(transport, handler)
+
+        self.assertEqual(reason, TerminationReason.STOPPED)
+        self.assertEqual(received, ["evt_normal_1"])
+
+
 class AckReportingTests(unittest.TestCase):
     """派发结果必须回报给传输层，SDK 才知道该向飞书回 OK 还是 500。"""
 

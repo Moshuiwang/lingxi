@@ -1,0 +1,461 @@
+"""``core/admin/card_callback.AdminCardCallbackHandler`` 的编排断言（Issue #96 S-M-02）。
+
+只测编排逻辑：卡片终态更新与管理群通知各自在什么条件下触发（含否定断言：非本人点击
+不产生任何终态更新或通知；伪造的待确认操作 ID 安全拒绝；审计写入失败时不假装已经
+更新了卡片）。真实状态机分支见 ``tests/test_pending_action.py``；真实事务见
+``tests/test_pending_action_postgres.py``。
+"""
+
+from __future__ import annotations
+
+import unittest
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from lingxi.core.admin.card_callback import AdminCardCallbackHandler
+from lingxi.core.admin.notification import DECISION_CANCEL, DECISION_CONFIRM
+from lingxi.core.admin.pending_action import (
+    ConfirmResultKind,
+    PendingAction,
+    PendingActionAuditWriteFailed,
+    PendingActionStatus,
+    PendingActionType,
+)
+
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _pending(*, status: PendingActionStatus = PendingActionStatus.EXECUTED) -> PendingAction:
+    return PendingAction(
+        id="pac_callback_test000000000",
+        action_type=PendingActionType.SUSPEND_USER,
+        target_open_id="ou_target",
+        target_state_snapshot="enabled",
+        initiated_by_open_id="ou_admin",
+        status=status,
+        card_delivered=True,
+        card_id="cardkit_id_1",
+        reason=None,
+        created_at=NOW,
+        expires_at=NOW + timedelta(minutes=10),
+        decided_at=NOW,
+        decided_by_open_id="ou_admin",
+    )
+
+
+@dataclass(frozen=True)
+class _FakeDecision:
+    kind: object
+    ok: bool
+    message: str
+    terminal_status: PendingActionStatus | None
+
+
+@dataclass(frozen=True)
+class _FakeOutcome:
+    decision: _FakeDecision
+    pending: PendingAction | None
+
+
+class _FakePendingActions:
+    def __init__(self) -> None:
+        self.confirm_calls: list[dict] = []
+        self.cancel_calls: list[dict] = []
+        self._confirm_result: _FakeOutcome | Exception | None = None
+        self._cancel_result: _FakeOutcome | Exception | None = None
+
+    def set_confirm_result(self, result) -> None:
+        self._confirm_result = result
+
+    def set_cancel_result(self, result) -> None:
+        self._cancel_result = result
+
+    def confirm(self, *, pending_action_id: str, clicker_open_id: str):
+        self.confirm_calls.append(
+            {"pending_action_id": pending_action_id, "clicker_open_id": clicker_open_id}
+        )
+        if isinstance(self._confirm_result, Exception):
+            raise self._confirm_result
+        assert self._confirm_result is not None
+        return self._confirm_result
+
+    def cancel(self, *, pending_action_id: str, clicker_open_id: str):
+        self.cancel_calls.append(
+            {"pending_action_id": pending_action_id, "clicker_open_id": clicker_open_id}
+        )
+        if isinstance(self._cancel_result, Exception):
+            raise self._cancel_result
+        assert self._cancel_result is not None
+        return self._cancel_result
+
+
+class _FakeCardTransport:
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self._raises = raises
+        self.update_calls: list[dict] = []
+
+    def create(self, **kwargs):  # pragma: no cover - 本类不测试 create
+        raise NotImplementedError
+
+    def update(self, *, card_id: str, card) -> None:
+        self.update_calls.append({"card_id": card_id, "card": card})
+        if self._raises is not None:
+            raise self._raises
+
+
+class _FakeGroupNotifier:
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self._raises = raises
+        self.sent: list[dict] = []
+
+    def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None:
+        self.sent.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
+        if self._raises is not None:
+            raise self._raises
+
+
+class _RecordingAudit:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict]] = []
+
+    def record(self, action: str, /, **fields: object) -> None:
+        self.records.append((action, fields))
+
+
+def _build_handler(
+    *,
+    pending_actions: _FakePendingActions,
+    confirm_cards: _FakeCardTransport | None = None,
+    group_notifier: _FakeGroupNotifier | None = None,
+    group_chat_id: str | None = "oc_admin_group",
+    audit: _RecordingAudit | None = None,
+) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
+    audit = audit or _RecordingAudit()
+    handler = AdminCardCallbackHandler(
+        pending_actions=pending_actions,
+        confirm_cards=confirm_cards or _FakeCardTransport(),
+        group_notifier=group_notifier,
+        group_chat_id=group_chat_id,
+        audit=audit,
+    )
+    return handler, audit
+
+
+class UnknownDecisionTests(unittest.TestCase):
+    def test_unknown_decision_literal_is_rejected_without_touching_the_store(self) -> None:
+        pending_actions = _FakePendingActions()
+        handler, audit = _build_handler(pending_actions=pending_actions)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_x",
+            decision="delete_everything",
+            trace_id="trc_1",
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(pending_actions.confirm_calls, [])
+        self.assertEqual(pending_actions.cancel_calls, [])
+        self.assertIn("admin.card_callback.unknown_decision", [action for action, _ in audit.records])
+
+
+class ConfirmExecutionTests(unittest.TestCase):
+    def test_successful_execution_updates_card_and_notifies_group_once(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.EXECUTE,
+                    ok=True,
+                    message="已确认执行。",
+                    terminal_status=PendingActionStatus.EXECUTED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_2",
+        )
+
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(cards.update_calls), 1)
+        self.assertEqual(cards.update_calls[0]["card_id"], "cardkit_id_1")
+        self.assertTrue(cards.update_calls[0]["card"].is_terminal)
+        self.assertEqual(len(group.sent), 1)
+        self.assertEqual(group.sent[0]["dedupe_key"], pending.id)
+
+
+class NotInitiatorTests(unittest.TestCase):
+    """否定断言：非本人点击 → 不更新卡片、不通知管理群（``pending`` 仍是
+    ``PENDING``，``terminal_status`` 为 ``None``）。"""
+
+    def test_wrong_clicker_does_not_update_card_or_notify_group(self) -> None:
+        pending = _pending(status=PendingActionStatus.PENDING)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.NOT_INITIATOR,
+                    ok=False,
+                    message="只有发起该操作的管理员本人可以确认。",
+                    terminal_status=None,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_someone_else",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_3",
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(cards.update_calls, [])
+        self.assertEqual(group.sent, [])
+
+
+class IdempotentReplayTests(unittest.TestCase):
+    """重复点击一个早已是终态的操作：卡片视觉收敛（允许再次 update，无害），
+    但**不**再发第二条群通知（避免刷屏）。"""
+
+    def test_already_terminal_replay_refreshes_card_but_does_not_renotify(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.ALREADY_TERMINAL,
+                    ok=False,
+                    message="该操作已经执行过，不会重复执行。",
+                    terminal_status=None,  # 幂等重放不产生新的终态转移
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_4",
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(len(cards.update_calls), 1, "卡片视觉仍应尝试收敛到终态")
+        self.assertEqual(group.sent, [], "重复点击不得重复通知管理群")
+
+
+class ForgedPendingActionIdTests(unittest.TestCase):
+    """否定断言：卡片回调伪造（不存在的动作 ID）→ 拒绝，安全处理不崩溃。"""
+
+    def test_never_existed_pending_action_id_is_handled_safely(self) -> None:
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.NOT_FOUND, ok=False, message="未找到该待确认操作。",
+                    terminal_status=None,
+                ),
+                pending=None,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_forged_does_not_exist",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_5",
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(cards.update_calls, [])
+        self.assertEqual(group.sent, [])
+        self.assertIn("admin.card_callback.not_found", [action for action, _ in audit.records])
+
+
+class AuditWriteFailureTests(unittest.TestCase):
+    """否定断言：审计 sink 异常 → 不执行（失败关闭），不更新卡片、不通知管理群，
+    因为对应的数据库事务已经整体回滚——这次点击结构上"没有发生过"。"""
+
+    def test_audit_write_failure_does_not_touch_card_or_group(self) -> None:
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            PendingActionAuditWriteFailed("确认操作的审计写入失败，事务已回滚，操作未执行")
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_audit_fail",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_6",
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(cards.update_calls, [])
+        self.assertEqual(group.sent, [])
+        self.assertIn(
+            "admin.card_callback.audit_write_failed", [action for action, _ in audit.records]
+        )
+
+
+class BestEffortSideEffectFailureTests(unittest.TestCase):
+    """卡片视觉更新失败、群通知失败都不影响已经落库的业务结果——两者是尽力而为
+    的展示层副作用，不是本次点击是否"发生过"的判据。"""
+
+    def test_card_update_failure_does_not_propagate(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    terminal_status=PendingActionStatus.EXECUTED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport(raises=RuntimeError("卡片更新网络异常"))
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_7",
+        )
+
+        self.assertTrue(outcome.ok, "卡片视觉更新失败不改变业务结果本身")
+        self.assertEqual(len(group.sent), 1, "群通知仍应正常发出")
+        self.assertIn(
+            "admin.card_callback.card_update_failed", [action for action, _ in audit.records]
+        )
+
+    def test_group_notify_failure_does_not_propagate(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    terminal_status=PendingActionStatus.EXECUTED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier(raises=RuntimeError("群消息发送失败"))
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_8",
+        )
+
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(cards.update_calls), 1, "卡片更新仍应正常发出")
+        self.assertIn(
+            "admin.card_callback.group_notify_failed", [action for action, _ in audit.records]
+        )
+
+    def test_missing_group_notifier_skips_notification_without_error(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                    terminal_status=PendingActionStatus.EXECUTED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=None
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_9",
+        )
+
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(cards.update_calls), 1)
+
+
+class CancelPathTests(unittest.TestCase):
+    def test_cancel_decision_routes_to_the_cancel_method(self) -> None:
+        pending = _pending(status=PendingActionStatus.CANCELLED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_cancel_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind="cancel", ok=True, message="已取消，未做任何变更。",
+                    terminal_status=PendingActionStatus.CANCELLED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CANCEL,
+            trace_id="trc_10",
+        )
+
+        self.assertTrue(outcome.ok)
+        self.assertEqual(pending_actions.confirm_calls, [])
+        self.assertEqual(len(pending_actions.cancel_calls), 1)
+        self.assertEqual(len(cards.update_calls), 1)
+        self.assertEqual(len(group.sent), 1)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

@@ -15,14 +15,23 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from lingxi.core.conversation.ports import InboundMessage
 from lingxi.core.ids import new_id
 
-# 本切片消费的事件类型。其余类型（card.action.trigger、
-# im.chat.member.bot.deleted_v1）不在本批处理，但收到时不得让长连接崩溃（`V-接入-12`）。
+# 本切片消费的事件类型。``im.chat.member.bot.deleted_v1`` 仍不在本批处理，但收到时
+# 不得让长连接崩溃（`V-接入-12`）。``card.action.trigger`` 自 Issue #96 S-M-02 起
+# 由 :func:`parse_card_action_event` 解析（管理员确认卡片的按钮回调）。
 MESSAGE_RECEIVE_EVENT = "im.message.receive_v1"
+
+#: 管理员确认卡片按钮点击回调（合同"待确认操作"闭环）。真实事件体字段未经真实
+#: 验证（证据等级 1，与本模块其余解析函数同一姿态）——解析形状依据飞书卡片
+#: 回传交互 2.0 的公开文档结构，真实字段由 `biai-stage` L4a 受控验收核实；
+#: 解析失败按 :class:`CardActionParseError` 处理，与 `EventParseError` 同一姿态
+#: （记审计后继续收下一条，不当作连接故障）。
+CARD_ACTION_TRIGGER_EVENT = "card.action.trigger"
 
 
 # 飞书私聊的 chat_type。合同「问数与多轮对话」开宗明义：
@@ -148,4 +157,82 @@ def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = No
         text=message_text(message.get("content"), message.get("message_type")),
         trace_id=trace_id or new_id("trc").split("_", 1)[1],
         message_type=message_type,
+    )
+
+
+class CardActionParseError(EventParseError):
+    """``card.action.trigger`` 事件体缺少必需字段或形状不对。与 ``EventParseError``
+    同一处理姿态：调用方记审计后继续收下一条，不当作连接故障。"""
+
+
+@dataclass(frozen=True)
+class CardActionEvent:
+    """一条已从飞书卡片回调事件体里解析出来的按钮点击。
+
+    ``operator_open_id`` 是唯一的点击身份来源——与 ``parse_message_event`` 对
+    ``sender_open_id`` 的既有取舍相同（只信事件体里飞书自己标注的操作者字段，不
+    信任回传值 ``action_value`` 里任何自称的身份）。``action_value`` 只保留
+    :func:`~lingxi.core.admin.notification.render_confirm_card` 建卡时写进按钮的
+    ``pending_action_id``/``decision`` 两个键（原样透传，具体校验交给
+    ``core/admin/card_callback.py``——本函数只负责"读出这段事件体写了什么"，不做
+    业务判断）。
+    """
+
+    event_id: str
+    operator_open_id: str
+    action_value: Mapping[str, str]
+    trace_id: str
+
+
+def parse_card_action_event(
+    payload: Mapping[str, Any], *, trace_id: str | None = None
+) -> CardActionEvent:
+    """把一条 ``card.action.trigger`` 事件体解析成 :class:`CardActionEvent`。
+
+    **证据等级 1**：真实事件体的确切字段未经真实回调验证（本切片全部断言跑在
+    构造的假事件体上），字段名依据飞书卡片回传交互 2.0 的公开文档结构；真实链路
+    验证属 `biai-stage` L4a（本 Story 明确留待验收窗口，见 PR 描述）。解析失败一律
+    ``CardActionParseError``，不抛 ``KeyError``/``TypeError``，与 ``parse_message_
+    event`` 同一姿态。
+    """
+
+    if not isinstance(payload, Mapping):
+        raise CardActionParseError("事件体不是一个对象")
+
+    header = payload.get("header")
+    event = payload.get("event")
+    event_id = _text(header, "event_id")
+    if event_id is None:
+        raise CardActionParseError("事件体缺少 event_id")
+
+    if not isinstance(event, Mapping):
+        raise CardActionParseError("事件体缺少 event 段")
+
+    operator = event.get("operator")
+    operator_open_id = _text(operator, "open_id")
+    if operator_open_id is None:
+        raise CardActionParseError("事件体缺少操作者 open_id")
+
+    action = event.get("action")
+    if not isinstance(action, Mapping):
+        raise CardActionParseError("事件体缺少 action 段")
+    raw_value = action.get("value")
+    if not isinstance(raw_value, Mapping):
+        raise CardActionParseError("action 段缺少 value")
+
+    # 只保留字符串/数字这类简单标量并统一转成字符串——回传值本就只应该携带
+    # render_confirm_card 建卡时写进去的两个键，不信任事件体里出现的任何嵌套结构
+    # 或意料之外的类型（结构上不给伪造回调可乘之机，即便真的出现了也不会在这里
+    # 崩溃，只会被 core/admin/card_callback.py 当成缺少必需字段拒绝）。
+    action_value = {
+        str(key): str(value)
+        for key, value in raw_value.items()
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+    }
+
+    return CardActionEvent(
+        event_id=event_id,
+        operator_open_id=operator_open_id,
+        action_value=action_value,
+        trace_id=trace_id or new_id("trc").split("_", 1)[1],
     )

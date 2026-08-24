@@ -26,9 +26,12 @@ import time
 from typing import Any, Callable, Mapping
 
 from lingxi.adapters.feishu_events import (
+    CARD_ACTION_TRIGGER_EVENT,
     MESSAGE_RECEIVE_EVENT,
+    CardActionParseError,
     EventParseError,
     NonPrivateChatError,
+    parse_card_action_event,
     parse_message_event,
 )
 from lingxi.adapters.feishu_longconn import (
@@ -202,18 +205,46 @@ class _RecordingOnboarding:
 
 
 def make_event_handler(
-    pipeline: EventPipeline, *, audit: Any, on_parse_error: Callable[[str], None] | None = None
+    pipeline: EventPipeline,
+    *,
+    audit: Any,
+    on_parse_error: Callable[[str], None] | None = None,
+    card_callback_handler: Any = None,
 ) -> Callable[[dict], None]:
     """把原始事件体接到管线上。
 
-    只处理 ``im.message.receive_v1``。其余类型（``card.action.trigger``、
-    ``im.chat.member.bot.deleted_v1``）本批不处理，但收到时必须**不致长连接崩溃**
-    ——直接返回，由 supervisor 记审计（`V-接入-12`）。
+    处理 ``im.message.receive_v1``（业务问数与管理命令面）。``card.action.trigger``
+    （管理员确认卡片按钮点击，Issue #96 S-M-02）只在 ``card_callback_handler`` 被
+    显式传入时才处理——未传入（``None``，例如尚未完成 gateway 接线的中间态，或
+    只测试消息路径的既有用例）时行为与本参数加入之前逐字节一致：仍然只记
+    ``event.ignored`` 并返回，不致长连接崩溃（`V-接入-12`）。其余类型
+    （``im.chat.member.bot.deleted_v1``）本批仍不处理，同样只记 ``event.ignored``。
     """
 
     def handle(payload: dict) -> None:
         header = payload.get("header") if isinstance(payload, dict) else None
         event_type = header.get("event_type") if isinstance(header, dict) else None
+
+        if event_type == CARD_ACTION_TRIGGER_EVENT and card_callback_handler is not None:
+            try:
+                action_event = parse_card_action_event(payload)
+            except CardActionParseError as error:
+                # 读不懂的卡片回调事件体记审计后继续收下一条，同 EventParseError
+                # 姿态——不当作连接故障，也不当作任何一种业务终态。
+                audit.record("event.unparsable", error=str(error))
+                if on_parse_error is not None:
+                    on_parse_error(str(error))
+                return
+            decision = action_event.action_value.get("decision", "")
+            pending_action_id = action_event.action_value.get("pending_action_id", "")
+            card_callback_handler.handle(
+                operator_open_id=action_event.operator_open_id,
+                pending_action_id=pending_action_id,
+                decision=decision,
+                trace_id=action_event.trace_id,
+            )
+            return
+
         if event_type != MESSAGE_RECEIVE_EVENT:
             audit.record("event.ignored", event_type=event_type)
             return
@@ -289,9 +320,14 @@ def build_supervisor(
     # 裁定，首次开通编排住在 scheduler）。两个模块名对同一个只读查询各自的取舍
     # 见 `adapters/delegated_subject_lookup.py` 模块文档。
     from lingxi.adapters.delegated_subject_lookup import registered_delegated_subject_open_id
+    from lingxi.adapters.feishu_admin_card import LarkAdminCardTransport
+    from lingxi.adapters.feishu_group_message import FeishuGroupMessages
     from lingxi.adapters.feishu_longconn import LarkEventTransport
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
+    from lingxi.core.admin.card_callback import AdminCardCallbackHandler
+    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
     from lingxi.core.admin.router import AdminCommandRouter
     from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
@@ -299,20 +335,73 @@ def build_supervisor(
     effective_onboarding = onboarding or _RecordingOnboarding()
     if on_onboarding_assembled is not None:
         on_onboarding_assembled(effective_onboarding)
+
+    # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
+    # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。取
+    # 四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
+    # 提前到这里构造（此前紧跟在 pipeline 之前）：确认卡片（Issue #96 S-M-02）
+    # 与业务问数共用同一个 SDK 客户端实例，不为两个用途各建一份。
+    outbound_timeout = max(1.0, config.shutdown_timeout_seconds / 4)
+    client = build_client(
+        app_id=config.app_id,
+        app_secret=str(config.app_secret),
+        timeout_seconds=outbound_timeout,
+    )
+
     # 管理命令面（Issue #95 S-M-01）：无条件装配，不受任何 feature flag 控制——安全
     # 落点在数据判定，不在装配开关。登记表为空（尚未播种，例如新环境或 biai-stage
     # 升级前）时 ``active_entry`` 对任何 open_id 都返回 None，`route()` 恒
     # ``handled=False``，管线原样落回既有业务/专用账号提示分支，行为与完全不装配
-    # 这个参数时逐字节一致。两个查询端口各自开自己的连接（与 ``registered_
+    # 这个参数时逐字节一致。查询端口各自开自己的连接（与 ``registered_
     # delegated_subject_open_id`` 同型），不共享 pipeline 自己的 ``PostgresGatewayStore``
     # 事务——管理查询是只读的，不需要参与入站事件那个写事务。
+    admin_registry_lookup = PostgresAdminRegistryLookup(
+        str(config.postgres_dsn), timeouts=config.postgres_timeouts
+    )
+    # 待确认操作（Issue #96 S-M-02）：写路径与只读查询共用同一个登记表判定口——
+    # confirm() 在确认时刻重新读一次它（合同"确认时重新读取……当前角色"）。
+    pending_action_store = PostgresPendingActionStore(
+        str(config.postgres_dsn),
+        timeouts=config.postgres_timeouts,
+        registry=admin_registry_lookup,
+        audit=audit,
+    )
+    # 确认卡片的出站发送与回调后的终态更新共用同一个 CardKit 传输实例。
+    admin_card_transport = LarkAdminCardTransport(client)
+    confirm_card_dispatcher = ConfirmCardDispatcher(
+        transport=admin_card_transport, tracker=pending_action_store
+    )
     admin_router = AdminCommandRouter(
-        registry=PostgresAdminRegistryLookup(
-            str(config.postgres_dsn), timeouts=config.postgres_timeouts
-        ),
+        registry=admin_registry_lookup,
         queries=PostgresAdminQueries(
             str(config.postgres_dsn), timeouts=config.postgres_timeouts
         ),
+        audit=audit,
+        pending_actions=pending_action_store,
+        confirm_cards=confirm_card_dispatcher,
+    )
+    # 管理群脱敏通知（Issue #96 S-M-02）：``admin_group_chat_id`` 未配置时——与既有
+    # `admin_group_chat_id: str | None = None` 的既定取舍相同——这是"一个尚未接线
+    # 的可选职责"，不让整个进程起不来；``AdminCardCallbackHandler`` 收到
+    # ``group_notifier=None`` 时直接跳过群通知，不报错、不重试（V-管理-11：管理群
+    # 从真实回调中只能收到脱敏通知，不能触发管理动作——本通知走
+    # ``FeishuGroupMessages.send_text``，结构上只发纯文本，不支持卡片或按钮）。
+    group_notifier: Any = None
+    if config.admin_group_chat_id is not None:
+        group_notifier = FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.app_id,
+            app_secret=str(config.app_secret),
+            # 与花名册日报、内测日报各自独立的 uuid 前缀同一纪律（见
+            # adapters/feishu_group_message.py 的 delivery_uuid 文档）：13 字符，
+            # 在全仓已钉住的 ≤18 字符预算内。
+            uuid_prefix="lingxi-admin-",
+        )
+    card_callback_handler = AdminCardCallbackHandler(
+        pending_actions=pending_action_store,
+        confirm_cards=admin_card_transport,
+        group_notifier=group_notifier,
+        group_chat_id=config.admin_group_chat_id,
         audit=audit,
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
@@ -339,15 +428,7 @@ def build_supervisor(
     def innertest_roster_gate(open_id: str) -> bool:
         return is_open_id_innertest_allowed(open_id, config.innertest_roster_open_ids)
 
-    # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
-    # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
-    # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
-    outbound_timeout = max(1.0, config.shutdown_timeout_seconds / 4)
-    client = build_client(
-        app_id=config.app_id,
-        app_secret=str(config.app_secret),
-        timeout_seconds=outbound_timeout,
-    )
+    # ``client``/``outbound_timeout`` 已在函数前部构造（供确认卡片传输复用，见上）。
     pipeline = EventPipeline(
         store=PostgresGatewayStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
         reactions=LarkReactions(client),
@@ -377,7 +458,9 @@ def build_supervisor(
             # 建连截止时间：超时未连上即判失败进重连，堵住「从未连上」的活性黑洞。
             handshake_timeout_seconds=config.shutdown_timeout_seconds,
         ),
-        handle_event=make_event_handler(pipeline, audit=audit),
+        handle_event=make_event_handler(
+            pipeline, audit=audit, card_callback_handler=card_callback_handler
+        ),
         backoff=BackoffPolicy(
             base_seconds=config.reconnect_base_seconds,
             factor=config.reconnect_factor,
