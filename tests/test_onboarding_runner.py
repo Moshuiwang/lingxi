@@ -23,9 +23,11 @@ from lingxi.core.identity.first_contact import (
     decide_first_contact,
     locate_by_open_id,
 )
+from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 from lingxi.core.identity.onboarding_runner import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
+    KEY_INNERTEST_NOT_OPEN,
     KEY_INTERNAL_ERROR,
     KEY_NOT_AUTHORIZED,
     KEY_SUSPENDED,
@@ -100,8 +102,12 @@ class FakeDirectory:
     ) -> None:
         self._lookup = FakeLookup(availability, members)
         self._error = error
+        #: 内测名单闸（Issue #302 S-N-01）用它证明"挡在最前面"：闸拒绝时这里必须
+        #: 保持空——组织快照读取压根不该发生。
+        self.calls: list[str] = []
 
     def lookup(self, open_id: str) -> Any:
+        self.calls.append(open_id)
         if self._error is not None:
             raise self._error
         return self._lookup
@@ -398,6 +404,9 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         ledger=parts["ledger"],
         audit=parts["audit"],
         role_function_map=overrides.get("role_function_map", ROLE_FUNCTION_MAP),
+        # 默认放行：本文件绝大多数用例守的是名单闸**之后**的链路，不该被这道新增的
+        # 前置闸挡住。内测名单闸自身的行为由 `InnerTestRosterGateTests` 专门覆盖。
+        innertest_roster_gate=overrides.get("innertest_roster_gate", lambda open_id: True),
         delegated_subject=overrides.get(
             "delegated_subject", lambda: overrides.get("delegated_subject_open_id", "ou_delegated")
         ),
@@ -1370,6 +1379,94 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(row.name, "王小明")
 
 
+class InnerTestRosterGateTests(unittest.TestCase):
+    """内测名单闸（Issue #302 S-N-01）：挡在整条链最前面。
+
+    认领 `V-开通-21`（名单外→内测未开放+零建档+脱敏审计）、`V-开通-22`（默认拒绝）、
+    `V-开通-23`（名单内正常通过）。
+    """
+
+    def test_rejected_open_id_gets_the_frozen_innertest_not_open_terminal(self) -> None:
+        parts, result = run_once(innertest_roster_gate=lambda open_id: False)
+
+        self.assertEqual(result.state, OnboardingState.STARTED)
+        open_id, key, _, _ = parts["notifier"].terminal()
+        self.assertEqual(key, KEY_INNERTEST_NOT_OPEN)
+        self.assertEqual(open_id, OPEN_ID)
+
+    def test_rejected_open_id_leaves_zero_business_footprint(self) -> None:
+        """否定断言：不建档、不发权限、不建环境、不推进状态——零业务状态残留。
+
+        闸必须挡在身份定位**之前**：`directory.calls`/`employment.calls` 全程为空，
+        证明组织快照读取与在职实时回读都没有发生，不只是"最终没建档"这一个结果。
+        """
+
+        parts, _ = run_once(innertest_roster_gate=lambda open_id: False)
+
+        self.assertEqual(parts["directory"].calls, [])
+        self.assertEqual(parts["employment"].calls, [])
+        self.assertEqual(parts["provisioning"].requests, [])
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["decisions"].rows, [])
+        self.assertEqual(parts["users"].advanced, [])
+
+    def test_rejection_audit_carries_no_identity_and_no_message_body(self) -> None:
+        """审计只带 `event_id`/`trace_id`，同本文件其余每一条 `_audit.record` 一致。
+
+        **不直接放 open_id（含 `redact_identifier()` 脱敏形式）**：脱敏值按其自身
+        文档字符串只能进日志、不可反查也不可比较，放进结构化审计字段会被误当成
+        可关联的身份键（`V-花名册-34`）。需要还原是谁时凭 `event_id` 回读
+        `inbound_event.user_open_id` 即可，不在这里重复一份。
+        """
+
+        parts, _ = run_once(innertest_roster_gate=lambda open_id: False)
+
+        audit = parts["audit"]
+        self.assertIn("onboarding.innertest_roster_rejected", audit.actions())
+        facts = audit.facts("onboarding.innertest_roster_rejected")
+        self.assertEqual(facts["event_id"], "evt_1")
+        self.assertEqual(facts["trace_id"], "trace_1")
+        # 不记身份、不记消息正文：字段集合恰好是事件与追溯号，没有第三个键。
+        self.assertEqual(set(facts), {"event_id", "trace_id"})
+        self.assertNotIn(OPEN_ID, str(facts))
+
+    def test_default_deny_rejects_an_open_id_that_is_on_no_list_at_all(self) -> None:
+        """`V-开通-22` 默认拒绝：闸绑定一个真正的空集合（不是硬编码 `lambda: False`），
+
+        用一个从未出现在任何测试夹具名单中的未知 open_id 证明——不是只证明某个
+        已知危险对象被禁（验证与门禁 §八第 4 条）。
+        """
+
+        gate = AutoOnboardingRunner.build_innertest_roster_gate(frozenset())
+        parts, _ = run_once(innertest_roster_gate=gate)
+
+        _, key, _, _ = parts["notifier"].terminal()
+        self.assertEqual(key, KEY_INNERTEST_NOT_OPEN)
+        self.assertEqual(parts["provisioning"].requests, [], "空名单必须零建档")
+
+    def test_open_id_on_the_roster_proceeds_through_the_normal_chain(self) -> None:
+        """`V-开通-23`：名单内 open_id 不受闸影响，正常推进到既有成功终态。"""
+
+        gate = AutoOnboardingRunner.build_innertest_roster_gate(frozenset({OPEN_ID}))
+        parts, result = run_once(innertest_roster_gate=gate)
+
+        self.assertEqual(result.state, OnboardingState.STARTED)
+        _, key, values, _ = parts["notifier"].terminal()
+        self.assertEqual(key, KEY_COMPLETED)
+        self.assertEqual(len(parts["provisioning"].requests), 1, "名单内用户应正常建档")
+
+    def test_build_innertest_roster_gate_wraps_the_pure_membership_function(self) -> None:
+        """静态方法只是把纯判定函数绑上一份具体集合，不改变其语义。"""
+
+        roster = frozenset({OPEN_ID})
+        gate = AutoOnboardingRunner.build_innertest_roster_gate(roster)
+
+        self.assertEqual(gate(OPEN_ID), is_open_id_innertest_allowed(OPEN_ID, roster))
+        self.assertTrue(gate(OPEN_ID))
+        self.assertFalse(gate("ou_never_listed_anywhere"))
+
+
 class ConstructionTests(unittest.TestCase):
     """两个注入口缺省就会静默改变行为，因此在类型层就不给这个选项。"""
 
@@ -1389,6 +1486,7 @@ class ConstructionTests(unittest.TestCase):
             ledger=FakeLedger(),
             audit=RecordingAudit(),
             role_function_map=ROLE_FUNCTION_MAP,
+            innertest_roster_gate=lambda open_id: True,
             delegated_subject=lambda: None,
             publish_allowed=lambda: True,
         )
@@ -1414,6 +1512,16 @@ class ConstructionTests(unittest.TestCase):
                 sleep=lambda seconds: None,
                 onboarding_failed="not-callable",  # type: ignore[arg-type]
                 **self._parts(),
+            )
+
+    def test_a_missing_innertest_roster_gate_is_refused_at_construction(self) -> None:
+        """没有默认放行（Issue #302 S-N-01）：缺省会让内测名单闸形同虚设。"""
+
+        parts = self._parts()
+        parts["innertest_roster_gate"] = None
+        with self.assertRaises(TypeError):
+            AutoOnboardingRunner(
+                submit=lambda task: True, sleep=lambda seconds: None, **parts  # type: ignore[arg-type]
             )
 
 

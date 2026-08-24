@@ -145,6 +145,13 @@ class SchedulerConfig:
     # 开通编排的执行线程数。**每条链最长会阻塞十五分钟**，因此它就是"同一时刻最多几个人
     # 在开通"；认领量由执行器剩余容量压住（见 apps/scheduler/onboarding.py）。
     onboarding_workers: int = DEFAULT_ONBOARDING_WORKERS
+    # 内测名单闸（Issue #302 S-N-01）：开通链最前端的白名单，只在 open_id 命中时才继续
+    # 走身份定位；命中之外一律得到「内测未开放」且零建档（详见
+    # `lingxi.core.identity.innertest_roster_gate` 模块文档）。**默认空集合＝全拒**，
+    # 不是"未启用"——空集合本身就是失败关闭的全部实现，不需要另一个开关字段。
+    # 配了但含无法识别条目会在 `from_env` 里快速失败（错配不是未配，同本文件其余
+    # 标识类变量的既有纪律），不会静默退化成一份"看起来配了、其实放行了别人"的名单。
+    innertest_roster_open_ids: frozenset[str] = frozenset()
     # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
     # （`LX-ONBOARD-001`），不是 MCP 同步超时。
     onboarding_publish_wait_seconds: float = 120.0
@@ -177,6 +184,7 @@ class SchedulerConfig:
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
         "LINGXI_USER_ENV_ROOT",
         "LINGXI_ONBOARDING_WORKERS",
+        "LINGXI_INNERTEST_ROSTER_OPEN_IDS",
         "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
@@ -295,6 +303,23 @@ class SchedulerConfig:
         else:
             onboarding_workers = DEFAULT_ONBOARDING_WORKERS
 
+        from lingxi.core.identity.innertest_roster_gate import (
+            InnerTestRosterConfigError,
+            parse_innertest_roster,
+        )
+
+        try:
+            # 未设置/空白解析成空集合（闸对任何人拒绝，见该模块「默认关闭＝全拒」）；
+            # 含无法识别条目在这里**快速失败**，与本文件其余「配了但格式不对」变量
+            # 同一条纪律——错配不是未配，静默降级会让人以为闸在正常放行内测名单。
+            innertest_roster_open_ids = parse_innertest_roster(
+                source.get("LINGXI_INNERTEST_ROSTER_OPEN_IDS")
+            )
+        except InnerTestRosterConfigError as error:
+            raise ValueError(
+                f"环境变量 LINGXI_INNERTEST_ROSTER_OPEN_IDS 不合法：{error}"
+            ) from None
+
         raw_org_snapshot_round_budget = (
             source.get("LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS") or ""
         ).strip()
@@ -371,5 +396,6 @@ class SchedulerConfig:
             query_mcp_timeout_seconds=probe_timeout,
             user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),
             onboarding_workers=onboarding_workers,
+            innertest_roster_open_ids=innertest_roster_open_ids,
             org_snapshot_round_budget_seconds=org_snapshot_round_budget_seconds,
         )
