@@ -16,6 +16,9 @@ python3 scripts/ci/check_acceptance_matrix.py
 # 之前会 EXIT=0）。同 check_acceptance_matrix.py 一样跨查合同文档，
 # 不连数据库、不装依赖，实测耗时量级一致（见代码框架「三、横切约定」）。
 python3 scripts/ci/check_contract_attribution.py
+# 开工必读集体量预算（产品负责人 2026-08-24）：代码框架 + 验证与门禁合计字节数
+# 设硬上限，超限即红——防膨胀的结构性门禁，与代码体量棘轮同一思路。
+python3 scripts/ci/check_docs_size_budget.py
 
 whitespace_files=$(git grep -Il -E '[[:blank:]]+$' -- . ':!.tmp/**' || true)
 if [[ -n "${whitespace_files}" ]]; then

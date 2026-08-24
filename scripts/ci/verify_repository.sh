@@ -66,6 +66,9 @@ python3 scripts/ci/check_core_layering.py
 # 2026-08-19 归属核对更正）；核对的是「归属已登记、登记与源句均未过期」，
 # 不是判定这句话在语义上是否真的成立（见 check_contract_attribution.py 头注释）。
 python3 scripts/ci/check_contract_attribution.py
+# 开工必读集体量预算（产品负责人 2026-08-24）：代码框架 + 验证与门禁合计字节数
+# 设硬上限，超限即红——防膨胀的结构性门禁，与代码体量棘轮同一思路。
+python3 scripts/ci/check_docs_size_budget.py
 # Issue #75：正式 PostgreSQL 连接必须走唯一工厂，迁移入口必须有独立且有限的连接参数。
 # 该检查登记在 #75 的共享位置；#76 的制品 / 进程依赖清单检查按编排者约定后续追加。
 python3 scripts/ci/check_db_timeouts.py
