@@ -25,10 +25,13 @@ from lingxi.core.admin.router import (
 
 
 class FakeAudit:
-    def __init__(self) -> None:
+    def __init__(self, *, raise_error: bool = False) -> None:
         self.records: list[tuple[str, dict]] = []
+        self.raise_error = raise_error
 
     def record(self, action: str, /, **fields: object) -> None:
+        if self.raise_error:
+            raise RuntimeError("模拟审计器本身故障（例如审计落库失败）")
         self.records.append((action, dict(fields)))
 
     def actions(self) -> list[str]:
@@ -270,6 +273,62 @@ class QueryAuditCommandTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertIn("没有找到", outcome.reply_text)
+
+
+class AuditFailureFailsClosedTests(unittest.TestCase):
+    """审计器本身抛异常时，路由仍必须返回确定性拒绝，不得跟着崩溃或误放行
+    （opus 批量审查 P2 修复）。四个场景覆盖 `_safe_record` 的全部调用点：
+    判定失败的拒绝分支、默认拒绝分支、成功命令分支（原本 `handled=True`，
+    此处必须收敛为 `handled=False`）、以及已确认管理员但执行失败的分支。
+    """
+
+    def test_lookup_failure_branch_does_not_propagate_the_audit_exception(self) -> None:
+        registry = FakeRegistry({ADMIN_OPEN_ID: _full_admin_entry()})
+        registry.raise_error = True
+        router, _, _, _ = _router(registry=registry, audit=FakeAudit(raise_error=True))
+
+        # 不抛异常：审计器故障不得从 route() 里逃出去打断 gateway 管线。
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertFalse(outcome.handled)
+
+    def test_default_deny_branch_does_not_propagate_the_audit_exception(self) -> None:
+        router, _, _, _ = _router(
+            registry=FakeRegistry({}), audit=FakeAudit(raise_error=True)
+        )
+
+        outcome = router.route(
+            open_id="ou_never_registered", text="/admin help", trace_id="t1"
+        )
+
+        self.assertFalse(outcome.handled)
+
+    def test_a_successful_command_degrades_to_rejection_when_audit_fails(self) -> None:
+        """关键场景：判定与执行本来都成功（本会得到 `handled=True` 的帮助文案），
+        但审计器这一步坏了——结论必须收敛为确定性拒绝，不能让一次没有审计记录
+        的放行悄悄发生。"""
+
+        router, _, _, _ = _router(audit=FakeAudit(raise_error=True))
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(outcome.reply_text, "")
+
+    def test_dispatch_failure_branch_does_not_propagate_the_audit_exception(self) -> None:
+        """已确认是管理员，但执行阶段抛异常（`admin.command.internal_error` 分支）
+        ——这一步的审计也失败时，同样必须收敛为确定性拒绝，不能让"执行失败但
+        没记上审计"悄悄发生，也不能让异常本身逃出 route()。"""
+
+        router, _, _, _ = _router(
+            queries=FakeQueries(raise_on_user=True), audit=FakeAudit(raise_error=True)
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertFalse(outcome.handled)
 
 
 class UnknownCommandTests(unittest.TestCase):
