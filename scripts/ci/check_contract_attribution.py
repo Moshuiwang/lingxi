@@ -174,11 +174,8 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         '核对更正，见 Issue #238）；但"不伪装成功"这个动机本身确有合同依据（结果',
         "交付规则",
     ),
-    GroundedAttribution(
-        "docs/参考证据/MVP联合验收执行卡.md",
-        '| E9 | 五类确定性无权限分支中另四类 + MCP 同步节奏的**窗口前**工程级证据（不是窗口内证据，也不能替代真实 Stage 等待） | 阶段②的 N1 只真实走通「查无对应记录」这一类；「同一人员ID多行」「双键冲突」「资料不完整」「无支持职能」四类，用与生产同一份判定函数核对的合成夹具在**窗口前**跑通，不占用产品负责人时间、也不需要为每一类另找一个真实测试账号，属 **L3**（合成输入 + 生产判定函数，不是 L4a，收口时单列，不并入 L4a 计数）。**MCP 同步「最多十五分钟」节奏的最小合法配置只用于这份夹具自己的纯单测**，已核实无法注入真实 Stage 进程（`ReadinessSchedule` 由调用方在代码里构造，不读环境变量；已知唯一运行期覆盖点 `LINGXI_QUERY_MCP_TIMEOUT_SECONDS` 只改探针超时，不改轮询间隔与总预算）——真实 Stage 窗口里的十五分钟等待要么按合同真等（阶段②已按此设计耗时预算），要么本轮不覆盖，**不得**暗示这份夹具能让窗口内的真实等待变短 | 见 [`scripts/acceptance_fixtures_identity.py`](../../scripts/acceptance_fixtures_identity.py) 与其[契约测试](../../tests/test_acceptance_fixtures_identity_contract.py) |',
-        "开通流程",
-    ),
+    # docs/参考证据/MVP联合验收执行卡.md 的登记项已随该一次性执行卡退场删除
+    # （2026-08-24 维护批；正文在 git 历史可追溯）。
     GroundedAttribution(
         "docs/参考证据/银河用户权限数据结构.md",
         "合同要求的「公司范围」与「职能范围」是两条互相独立的授权链，各自从 `user_id` 出发：",

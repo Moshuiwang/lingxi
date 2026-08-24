@@ -71,6 +71,9 @@ IMPORT_TO_DISTRIBUTION = {
 EXACT_PIN_REQUIRED = {
     "cryptography": "Fernet 是宿主机专用授权凭据文件的加密边界；升级须重跑凭据保管验证",
     "claude-agent-sdk": "执行层只读屏障依赖该版本的 hook 事件名与工具名；升级须重跑 L4a",
+    "lark-oapi": "长连接传输层改写该 SDK 模块级事件循环全局状态，线程生命周期假设"
+    "锁定在 1.7.1 实测行为上（feishu_longconn.py 已知边界）；升级须重跑"
+    " tests/test_gateway_transport.py 与受影响 L4a（#57 收口登记）",
 }
 
 # PEP 508 依赖串的最小解析：名字、可选 extras、其余全部当版本约束。

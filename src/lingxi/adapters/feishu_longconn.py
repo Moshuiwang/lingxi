@@ -374,6 +374,12 @@ class LarkEventTransport:
     - SDK 在 ``auto_reconnect=False`` 下，**连接中途**断开的异常抛在一个没人 await 的
       task 里会被吞掉（实测 ``client.py:211`` + ``:230``）。这里靠 ``start()`` 返回或
       线程结束来发现连接已死；真实断线重连的行为只有 L4a 能验。
+    - 建连超时（``handshake_timeout``）收尾对 pump 线程 ``join(timeout=2)``；若端点是
+      真正的网络层挂起（而非同一 asyncio loop 上可被 ``stop()`` 打断的等待），线程可能
+      不在 2 秒内退出，此时刻意**不关闭仍被占用的 loop**（见 ``stream()`` 的 finally
+      块——关掉一个在用的 loop 是把资源泄漏换成崩溃），线程留存。多次挂死重试是否累积、
+      有无上限，**未做真实部署观测**（原因未明层面不做频率判断）；接受为已知边界，
+      复审条件：stage 观测到线程数异常增长，或补一条线程存活数监控（#57 收口登记）。
     """
 
     def __init__(

@@ -270,10 +270,6 @@ REQUIRED_MODULES = (
 # 存在于制品里，只是不属于任何进程的运行时 import 闭包。
 MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {
     "lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单",
-    # 2026-08-23 #146 清退：feishu_onboarding/refresh_tokens/postgres_onboarding
-    # 三个 bot-test 进程专属消费者已删除；oauth_bridge 是 #67 裁定保留的 E1 授权
-    # 基础设施参考实现，源码保留但当前没有任何常驻进程消费它，理由随之更新。
-    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证参考实现，#67/#146 裁定保留为 E1 授权基础设施；集群其余消费者已清退，当前无进程加载",
 }
 
 # 这是与上面实际登记表**独立维护**的批准快照。键集和理由全文都故意重复写在这里，
@@ -282,12 +278,10 @@ MODULE_MANIFEST_EXEMPTIONS: dict[str, str] = {
 _FROZEN_MODULE_MANIFEST_EXEMPTION_KEYS = frozenset(
     {
         "lingxi.adapters.feishu_bitable_association",
-        "lingxi.adapters.oauth_bridge",
     }
 )
 _FROZEN_MODULE_MANIFEST_EXEMPTION_REASONS: dict[str, str] = {
     "lingxi.adapters.feishu_bitable_association": "Bot-Test 历史测试资产，不纳入正式用户路径清单",
-    "lingxi.adapters.oauth_bridge": "Bot-Test 受控验证参考实现，#67/#146 裁定保留为 E1 授权基础设施；集群其余消费者已清退，当前无进程加载",
 }
 
 # 这个文件没有 `if __name__ == "__main__"` 保护，直接 import 会启动常驻 scheduler。
@@ -677,11 +671,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("lark_oapi", "psycopg", "websockets.exceptions"),
     ),
     # 2026-08-23 #146 清退：`bot-test` 进程组随其三个专属消费者
-    # （feishu_onboarding/refresh_tokens/postgres_onboarding）一并删除。保留件
-    # `adapters/oauth_bridge.py`（#67 裁定的 E1 授权基础设施参考实现）与它依赖的
-    # `core.identity.onboarding` 不再有对应进程组——它们没有独立于 scheduler/
-    # reauthorize 已声明依赖之外的第三方需求，见 MODULE_MANIFEST_EXEMPTIONS 的
-    # oauth_bridge 条目与 pyproject.toml 对应注释。
+    # （feishu_onboarding/refresh_tokens/postgres_onboarding）一并删除。
+    # 2026-08-24 #203 清退：`adapters/oauth_bridge.py`（原 #67 裁定保留的 E1
+    # 授权基础设施参考实现，消费者复核为零后由产品负责人裁定清退）随之删除。
+    # 正式重授权入口的传输层是保留件 `adapters/oauth_bridge_client.py`，其依赖
+    # 已由 scheduler/reauthorize 两组声明覆盖，因此也不需要为它单独保留进程组；
+    # `core.identity.onboarding` 仍由 scheduler 多处消费，长期保留。
     # 迁移作业（Issue #53）：部署时跑一次 `python -m alembic upgrade head`，不是常驻
     # 进程。**lingxi 模块那一列刻意为空**——迁移工具链不得渗入运行时代码
     # （断言 V-迁移-04：`grep -rn "sqlalchemy\|alembic" src/` 必须为空），

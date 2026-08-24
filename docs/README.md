@@ -2,7 +2,7 @@
 
 > 本目录记录不会因为一个 Issue 关闭、一次发布完成或一个人离开而失效的产品与技术事实。它与代码一起版本化，并在推送后直接作为 GitHub 仓库中的正式正文；不要在 Issue、Project 或 Wiki 中维护它的副本。
 >
-> 唯一例外是长期执行方法 v12：产品负责人明确指定 GitHub [Issue #147](https://github.com/Moshuiwang/lingxi/issues/147) 为其完整正文与后续修订入口。仓库只保留跳转，不复制模板。
+> 唯一例外是长期执行方法：产品负责人明确指定 GitHub [Issue #147](https://github.com/Moshuiwang/lingxi/issues/147) 为其完整正文与后续修订入口（现行版本见该 Issue 顶部）。仓库只保留跳转，不复制模板。
 
 ## 先判断内容该放哪里
 
@@ -15,7 +15,7 @@
 | 规则**为什么**定成这样、否决了哪些选择、何时需要重新评估 | [决策记录](决策记录/README.md) | 决策被接受、替代或撤销时 |
 | 用什么架构、接口和数据结构**实现**合同里的规则 | [技术设计](技术设计/README.md) | 实现方案改变时 |
 | 跨设备研发、固定环境名称、生产交接，以及 TO PM、Draft PR 等 GitHub 操作规范 | [协作约定](协作约定.md) | 环境、权限、发布或 GitHub 操作改变时 |
-| 长期 Plan 的规划方法：Epic / Story / Task、角色路由、依赖与并行、冻结与统一修复 | GitHub [Issue #147：长期执行计划与 Execution Trace v12](https://github.com/Moshuiwang/lingxi/issues/147)；规划者据此生成或修订具体 `[tracking]` Execution Trace，实际执行合同只看获批 Trace | 长期执行方法改变时 |
+| 长期 Plan 的规划方法：Epic / Story / Task、角色路由、依赖与并行、冻结与统一修复 | GitHub [Issue #147：长期执行计划与 Execution Trace](https://github.com/Moshuiwang/lingxi/issues/147)；规划者据此生成或修订具体 `[tracking]` Execution Trace，实际执行合同只看获批 Trace | 长期执行方法改变时 |
 | 证据层级、风险门禁，以及产品与部署 `V-*` 断言 | [验证与门禁](技术设计/验证与门禁.md)与[产品验收矩阵](技术设计/验收矩阵.md) | 门禁含义或验收断言改变时 |
 | 可复用的外部平台事实、测试方法或脱敏证据 | `docs/参考证据/` | 仅在证据仍长期有用且已脱离一次性讨论时 |
 | 需求、缺陷、研究、方案比较、待决策、实施任务、验收过程和进度 | GitHub Issue / Project | 工作进行期间，完成后关闭 |
@@ -43,7 +43,7 @@ GitHub Issue：提出问题、讨论、实施、验收
         └─ 推送到 GitHub 后，成为可浏览的正式版本
 ```
 
-Issue 通常是工作历史，不是长期正文；关闭 Issue 不会删除它，但也不应要求后来的人从已关闭讨论中推断现行规则。仓库文档仍是“现在应当怎样理解产品”的唯一入口；长期执行方法 v12 仅以仍保持打开的 [#147](https://github.com/Moshuiwang/lingxi/issues/147) 为例外。
+Issue 通常是工作历史，不是长期正文；关闭 Issue 不会删除它，但也不应要求后来的人从已关闭讨论中推断现行规则。仓库文档仍是“现在应当怎样理解产品”的唯一入口；长期执行方法仅以仍保持打开的 [#147](https://github.com/Moshuiwang/lingxi/issues/147) 为例外。
 
 ## Issue 的关闭与回写
 

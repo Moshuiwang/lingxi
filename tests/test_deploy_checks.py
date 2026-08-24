@@ -84,7 +84,8 @@ class ExactPinTest(unittest.TestCase):
 
     def test_exact_pin_passes(self) -> None:
         failures = DEPENDENCIES.check_pins({"cryptography": [("scheduler", "==45.0.7")],
-                                            "claude-agent-sdk": [("worker", "==0.2.128")]})
+                                            "claude-agent-sdk": [("worker", "==0.2.128")],
+                                            "lark-oapi": [("gateway", "==1.7.1")]})
         self.assertEqual(failures, [])
 
 

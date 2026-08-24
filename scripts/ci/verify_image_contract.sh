@@ -129,8 +129,9 @@ for module in cryptography claude_agent_sdk; do
 done
 note "gateway: 合法持有 lark_oapi / websockets（#57 提升为 gateway 组），未混入 cryptography / claude_agent_sdk"
 # 刻意**不**断言"Bot-Test 的模块不可 import"：`pip install .` 装的是整个 lingxi 包，
-# adapters/oauth_bridge.py 这类测试资产模块（#67/#146 裁定保留的 E1 授权基础设施
-# 参考实现）因此存在于每个镜像里，这是打包方式决定的，不是编排缺陷。M2-62-11 管的是
+# adapters/feishu_bitable_association.py 这类测试资产模块因此存在于每个镜像里，
+# 这是打包方式决定的，不是编排缺陷（`adapters/oauth_bridge.py` 曾是同类模块，
+# 已随 #203 清退删除）。M2-62-11 管的是
 # scripts/ tests/ experiments/ workers/
 # migrations/testing/ 这些**目录**别被 COPY 进来（见第 4 步），M2-62-10 管的是
 # bot-test 那组**依赖**别被装上（见上）。第一版在这里写了一条"模块不可 import"的断言，
