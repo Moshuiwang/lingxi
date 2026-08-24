@@ -192,6 +192,77 @@ class RequiredConfigTests(unittest.TestCase):
                         load_config(dict(VALID_ENV, **{name: raw}))
 
 
+class InnertestRosterConfigTests(unittest.TestCase):
+    """内测名单闸的 gateway 侧解析（Issue #302 S-N-01 的纵深，opus 批量审查 P1）。
+
+    与 scheduler 侧 ``tests/test_scheduler_onboarding_assembly.py`` 里同名的四条
+    用例逐一对应——两边读**同一个**环境变量名 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
+    （不带 ``LINGXI_GATEWAY_`` 前缀），共用同一个解析函数，语义理应逐字一致。
+    """
+
+    def test_the_innertest_roster_defaults_to_an_empty_set(self) -> None:
+        """未配置＝空集合＝闸对任何人全拒；不是启动失败。"""
+
+        config = load_config(VALID_ENV)
+        self.assertEqual(config.innertest_roster_open_ids, frozenset())
+
+    def test_the_innertest_roster_parses_a_valid_list(self) -> None:
+        # opus 批量审查 P2 修复：_looks_like_open_id 收紧为 ou_ 后接 20~64 位英文
+        # 字母或数字，示例值必须真的满足这个形状，不能再用 "ou_a"/"ou_b" 这类过短
+        # 的占位符（那类值现在会被判定为格式非法）。
+        first = "ou_rostermembera00000000000"
+        second = "ou_rostermemberb00000000000"
+        config = load_config(
+            {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": f"{first},{second}, {second}"}
+        )
+        self.assertEqual(config.innertest_roster_open_ids, frozenset({first, second}))
+
+    def test_a_legal_roster_does_not_appear_in_the_config_repr(self) -> None:
+        """opus 批量审查 P2 修复：与 scheduler 侧同名字段同一条纪律（
+        `field(repr=False)`）——名单本身是一批飞书用户 open_id，不进
+        `repr(config)`。"""
+
+        legal_member = "ou_rostermembera00000000000"
+        config = load_config(
+            {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member}
+        )
+
+        self.assertEqual(config.innertest_roster_open_ids, frozenset({legal_member}))
+        self.assertNotIn(legal_member, repr(config))
+
+    def test_an_invalid_innertest_roster_entry_fails_startup(self) -> None:
+        """错配不是未配：gateway 拒绝启动，不是悄悄退化成放行或不拦截。"""
+
+        with self.assertRaises(GatewayConfigError):
+            load_config(
+                {
+                    **VALID_ENV,
+                    "LINGXI_INNERTEST_ROSTER_OPEN_IDS": (
+                        "ou_rostermembera00000000000,not-a-valid-open-id"
+                    ),
+                }
+            )
+
+    def test_an_invalid_innertest_roster_error_does_not_echo_the_raw_value(self) -> None:
+        with self.assertRaises(GatewayConfigError) as raised:
+            load_config(
+                {**VALID_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"}
+            )
+        self.assertNotIn("totally-not-an-open-id", str(raised.exception))
+
+    def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
+        """刻意与 `LINGXI_GATEWAY_` 前缀家族分开：两个进程共享同一份名单概念，
+        套上 gateway 专属前缀会让运维需要为同一份名单记两个不同的变量名。"""
+
+        env = {**VALID_ENV, f"{ENV_PREFIX}INNERTEST_ROSTER_OPEN_IDS": "ou_should_be_ignored"}
+        config = load_config(env)
+        self.assertEqual(
+            config.innertest_roster_open_ids,
+            frozenset(),
+            "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取",
+        )
+
+
 class BuildSupervisorTests(unittest.TestCase):
     """``build_supervisor`` 的装配，含空闲轮询间隔的推导。"""
 

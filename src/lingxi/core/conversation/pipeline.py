@@ -6,12 +6,24 @@
     1. 通道级认证        —— 长连接握手期完成，不在逐事件层做（见下方「关于第 1 步」）
     2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
     3. 加表情            失败 → 记审计，继续                  V-接入-07/08
-    4. 查用户状态        未开通 → 丢弃正文并认领开通；已停用 → 回提示 V-审计-05
+    4. 专用主体判定      发送者 open_id 命中配置中已解析好的专用授权主体
+       → 只能进管理命令面（登记表实时判定）或既有「确定性拒绝出口」
+       （`onboarding.delegated_subject`），绝无业务路径、绝不进入开通链；
+       比对的是装配期已经算好的单个 open_id，**不对全体消息新增登记表
+       查询**。未命中 → 原状态分派不变。结构性防的是"专用主体因数据漂移
+       获得 app_user 行、跳过管理面落入业务队列"这一类不该发生却理论上
+       可能发生的情形（opus P3-1 实测复现：此前这一分流嵌在下面「查用户状态」的
+       `NOT_PROVISIONED` 分支内，`state` 一旦不是 `NOT_PROVISIONED` 整段判定就
+       被跳过）。V-管理-24
+    5. 查用户状态        未开通 → 内测名单闸（名单外→既有「确定性拒绝出口」
+       `onboarding.innertest_not_open`，不发 `onboarding.checking`、不进入
+       开通；名单内→原行为不变）→ 丢弃正文并认领开通；已停用 → 回提示
+       V-审计-05
        （未开通分支内先按登记表实时判定是否为当前有效管理员：是 → 管理命令面，
        不进入开通；否 → 原有开通逻辑不变。Issue #95 S-M-01，V-管理-2x）
-    5. 解析命令          /stop /new                            V-会话-05/06
-    6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
-    7. 入队 + NOTIFY                                           V-队列-01…05
+    6. 解析命令          /stop /new                            V-会话-05/06
+    7. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
+    8. 入队 + NOTIFY                                           V-队列-01…05
 
 编号以[验证与门禁](../../../../docs/技术设计/验证与门禁.md)的矩阵为准（两位数字，
 不用字母后缀）；断言表里的 `V-会话-02a`/`05a`/`06a` 登记时续号为 08/09/10。
@@ -22,7 +34,7 @@ wss 地址），单条事件上没有可验的签名。承接同一产品意图�
 任何入站端口，事件只能从那条已认证的长连接进来。判定面比逐事件验签更严——不存在
 "签名对了就受理"的旁路，因为根本没有第二个入口。接口设计 3.2 随本切片同步修订。
 
-**关于事务边界。** 第 2 步到第 7 步跑在**同一个事务**里（`V-队列-01`）。这意味着任务
+**关于事务边界。** 第 2 步到第 8 步跑在**同一个事务**里（`V-队列-01`）。这意味着任务
 插入失败时 ``inbound_event`` 那一行也不存在，飞书重投时该消息能被重新完整处理；也意味着
 抢占会随事务一起回滚，话题不会永久停在"忙碌"（`V-队列-02`）。
 
@@ -161,6 +173,20 @@ class EventPipeline:
         # 无关的 worker 进程——平白多出一条 `core.admin.*` 依赖边（`scripts/ci/
         # check_installed_package.py` 的静态闭包检查会如实标红这条多余耦合）。
         admin_router: Any = None,
+        # 内测名单闸的 gateway 侧前移一份（opus 批量审查 P1，Issue #302 S-N-01 的
+        # 纵深）：``None`` 表示未装配，行为与本项加入之前逐字节一致（不做任何名单
+        # 判定，直接进入既有 AUTO_PROVISIONING 分支）。装配之后是纯粹的判定口——
+        # 传入的是已经在 ``apps/gateway`` 用 `core.identity.innertest_roster_gate`
+        # 解析好的名单，这里不重新解析、不读环境变量。scheduler 侧的同名闸原样
+        # 保留（纵深防御，两道闸各自独立判定）。
+        innertest_roster_gate: Callable[[str], bool] | None = None,
+        # 专用主体结构性出口前置（opus P3-1）：装配期已经解析好的单个 open_id，
+        # ``None`` 表示未装配，行为与本项加入之前逐字节一致。**刻意是一个已解析好
+        # 的值，不是一个每次调用都重新查登记表的回调**——这样"判断发送者是不是
+        # 专用主体"这件事，对着**全体消息**都只是一次内存里的字符串比较，不会给
+        # 每一条普通用户消息都额外加一次登记表查询（性能面，opus P3-5）。真正的
+        # 登记表实时判定只发生在命中之后、转给 ``admin_router.route()`` 的那一步。
+        delegated_subject_open_id: str | None = None,
     ) -> None:
         self._store = store
         self._reactions = reactions
@@ -178,6 +204,8 @@ class EventPipeline:
         # 一致。装配之后仍然是"登记表里没有有效条目就什么都不改变"——见
         # ``_within_transaction`` 里的调用点文档。
         self._admin_router = admin_router
+        self._innertest_roster_gate = innertest_roster_gate
+        self._delegated_subject_open_id = delegated_subject_open_id
         # 停机位。停机时**已提交的结论不动**，只跳过提交之后那些尽力而为的动作——
         # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
         # 跳过的有两样：出站回复，以及开通编排的触发（Issue #65 轻审 P2-3）。后者
@@ -319,7 +347,7 @@ class EventPipeline:
     def _within_transaction(
         self, message: InboundMessage, moment: datetime, deferred: list[RenderedContent]
     ) -> Outcome:
-        """第 2 步到第 7 步，全部落在同一个事务里。"""
+        """第 2 步到第 8 步，全部落在同一个事务里。"""
 
         with self._store.transaction() as tx:
             # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
@@ -342,47 +370,58 @@ class EventPipeline:
             # —— 第 3 步：加表情。合同：任何消息都加，失败不阻断后续处理。
             self._add_reaction(message)
 
-            # —— 第 4 步：用户状态。
+            # —— 第 4 步：专用主体判定（opus P3-1 修复，见类文档「关于第 4 步」）。
+            # 必须在按用户状态分派**之前**判定：数据漂移让专用主体意外获得 app_user
+            # 行时，state 就不再是 NOT_PROVISIONED，若判定仍嵌在那个分支内会被
+            # 整段跳过、直接落入下面的业务队列。这里比对的是装配期已经解析好的
+            # 单个 open_id（内存字符串比较），不查库，因此对全体消息零额外开销；
+            # 命中之后转给 ``admin_router`` 的那一次调用才是真正的登记表实时读取。
+            if (
+                self._delegated_subject_open_id is not None
+                and message.sender_open_id == self._delegated_subject_open_id
+            ):
+                return self._route_delegated_subject(tx, message, deferred)
+
+            # —— 第 5 步：用户状态。
             # 任务归属只由发送者标识解析而来（`V-接入-11`）：这里传的是
             # message.sender_open_id，而 InboundMessage 里根本没有第二个用户标识可传。
             user = tx.lookup_user(open_id=message.sender_open_id)
             state = user.state if user is not None else UserState.NOT_PROVISIONED
 
             if state is UserState.NOT_PROVISIONED:
-                # 管理命令面分流（Issue #95 S-M-01）先于开通判断：登记表里当前有效的
-                # 管理员（结构上只可能是从未建档的账号——专用授权主体永远不会有
-                # app_user 记录，`V-身份-02`）发来的私聊文本消息，从「确定性拒绝
-                # 出口」改道进入管理命令面，完全不进入自动开通/专用账号提示这条链。
-                # 登记表里没有当前有效条目的发送者（未登记、已撤销、或未装配本路由）
-                # 落回下面既有的、本项加入之前逐字节相同的分支——真正的判定发生在
+                # 管理命令面分流（Issue #95 S-M-01）：登记表里当前有效的管理员发来的
+                # 私聊文本消息，从「确定性拒绝出口」改道进入管理命令面，完全不进入
+                # 自动开通这条链。登记表里没有当前有效条目的发送者（未登记、已撤销、
+                # 或未装配本路由）落回下面既有分支——真正的判定发生在
                 # ``AdminCommandRouter.route`` 内部的实时读表，这里只负责按结果分流。
-                if self._admin_router is not None and message.message_type == TEXT_MESSAGE_TYPE:
-                    admin_outcome = self._admin_router.route(
-                        open_id=message.sender_open_id,
-                        text=message.text,
-                        trace_id=message.trace_id,
-                    )
-                    if admin_outcome.handled:
-                        deferred.append(
-                            RenderedContent(
-                                key=admin_outcome.content_key,
-                                version=admin_outcome.content_version,
-                                text=admin_outcome.reply_text,
-                            )
-                        )
+                # （专用授权主体本身已经在第 4 步被识别并短路返回，不会走到这里；
+                # 本分支覆盖的是登记表里*其他*当前有效条目，例如未来的人类管理员。）
+                if self._try_admin_route(tx, message, deferred):
+                    return Outcome(handled_as=HandledAs.COMMAND)
+
+                # 内测名单闸（Issue #302 S-N-01，opus 批量审查 P1 修复）：在发
+                # `onboarding.checking`、把这条事件标记成 AUTO_PROVISIONING 之前
+                # 判名单。名单外——包括名单未装配、名单为空——一律落到既有的
+                # 「确定性拒绝出口」`onboarding.innertest_not_open`，零建档、零
+                # 开通派发，只留一条与 scheduler 侧同名的审计（不带 open_id）。
+                # scheduler 侧的同名闸原样保留，两道闸独立判定，互为纵深。
+                if self._onboarding is not None:
+                    roster_gate = self._innertest_roster_gate
+                    if roster_gate is not None and not roster_gate(message.sender_open_id):
+                        deferred.append(self._texts.catalog.text("onboarding.innertest_not_open"))
                         self._audit.record(
-                            "inbound_event.admin_command",
+                            "onboarding.innertest_roster_rejected",
                             event_id=message.event_id,
                             trace_id=message.trace_id,
                         )
                         tx.mark_handled_as(
-                            event_id=message.event_id, handled_as=HandledAs.COMMAND
+                            event_id=message.event_id, handled_as=HandledAs.DROPPED
                         )
-                        return Outcome(handled_as=HandledAs.COMMAND)
+                        return Outcome(handled_as=HandledAs.DROPPED)
 
-                # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显（`V-审计-05`）。
-                # 注意审计里也不带消息正文：内容"不保存"包括不写进审计。
-                if self._onboarding is not None:
+                    # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显
+                    # （`V-审计-05`）。注意审计里也不带消息正文：内容"不保存"包括
+                    # 不写进审计。
                     self._audit.record(
                         "inbound_event.auto_provisioning",
                         event_id=message.event_id,
@@ -443,20 +482,20 @@ class EventPipeline:
             # 用户这次主动发消息：如果这个话题上一次问数因二十四小时未获得
             # platform_received 而到期（`delivery_expired`），且还没提示过，就在这里
             # 提示一次「请重新提问」（Issue #152、`V-投递-06` 后半句）。这条检查
-            # **不影响**当前消息接下来按第 5～7 步的正常处理——用户这条消息该入队
+            # **不影响**当前消息接下来按第 6～8 步的正常处理——用户这条消息该入队
             # 还是入队，该被判忙碌还是判忙碌，过期提示只是额外追加的一条回复，且
             # 只提示一次，不主动推送、不重放旧答案。
             if tx.consume_delivery_expired_notice(conversation_id=conversation.conversation_id):
                 deferred.append(self._texts.catalog.text("gateway.delivery_expired"))
 
-            # —— 第 5 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
+            # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)
 
-            # —— 第 6 步：忙碌判定。
+            # —— 第 7 步：忙碌判定。
             busy = conversation.running_task_id is not None
 
             if command is Command.STOP:
-                # `V-会话-10`：3.2 第 6 步的条件是「忙碌 **且非 /stop**」，
+                # `V-会话-10`：3.2 第 7 步的条件是「忙碌 **且非 /stop**」，
                 # 因此 /stop 在忙碌时照常被处理，而不是收到"当前任务仍在处理中"。
                 stopped = tx.request_stop(conversation_id=conversation.conversation_id)
                 self._audit.record(
@@ -526,7 +565,7 @@ class EventPipeline:
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
                 return Outcome(handled_as=HandledAs.DROPPED)
 
-            # —— 第 7 步：入队。
+            # —— 第 8 步：入队。
             return self._enqueue(
                 tx,
                 message,
@@ -722,6 +761,70 @@ class EventPipeline:
                 error=f"{type(error).__name__}: {error}",
                 trace_id=message.trace_id,
             )
+
+    def _try_admin_route(
+        self, tx, message: InboundMessage, deferred: list[RenderedContent]
+    ) -> bool:
+        """尝试把这条私聊文本消息交给管理命令面；两个调用点共用同一份接线
+        （第 4 步的专用主体判定、第 5 步 NOT_PROVISIONED 分支内的既有分流），
+        避免同一段"调 route、按结果落终态"逻辑各自维护一份而彼此漂移。
+
+        返回 ``True`` 表示已经处理完（``deferred``/审计/``mark_handled_as``
+        都已经落好，调用方只需要直接返回 ``Outcome(handled_as=HandledAs.COMMAND)``）；
+        返回 ``False`` 表示未命中——非文本消息、未装配路由，或登记表判定不通过
+        （未登记/已撤销/零角色）——调用方按各自的下一步兜底出口继续，这里不产生
+        任何副作用。
+        """
+
+        if self._admin_router is None or message.message_type != TEXT_MESSAGE_TYPE:
+            return False
+        admin_outcome = self._admin_router.route(
+            open_id=message.sender_open_id,
+            text=message.text,
+            trace_id=message.trace_id,
+        )
+        if not admin_outcome.handled:
+            return False
+        deferred.append(
+            RenderedContent(
+                key=admin_outcome.content_key,
+                version=admin_outcome.content_version,
+                text=admin_outcome.reply_text,
+            )
+        )
+        self._audit.record(
+            "inbound_event.admin_command",
+            event_id=message.event_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+        return True
+
+    def _route_delegated_subject(
+        self, tx, message: InboundMessage, deferred: list[RenderedContent]
+    ) -> Outcome:
+        """第 4 步命中专用授权主体之后的分流：管理命令面，或既有确定性拒绝出口。
+
+        **绝无业务路径**——不查 `state`、不进 `AUTO_PROVISIONING`、不入队。先试
+        管理命令面（登记表实时判定，命中即回话）；未命中（非文本消息、未装配
+        路由，或登记表判定不通过）则回落到本模块加入本项前就存在的确定性拒绝
+        文案 ``onboarding.delegated_subject``——与 `core/identity/onboarding_runner.
+        py` 的 `KEY_DELEGATED_SUBJECT` 是同一份产品文案，只是此前只能异步经开通链
+        才能触达；现在专用主体不再进入开通链，因此这条文案必须由本模块直接同步
+        发出，不能再指望开通链替它发。
+        """
+
+        if self._try_admin_route(tx, message, deferred):
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        deferred.append(self._texts.catalog.text("onboarding.delegated_subject"))
+        self._audit.record(
+            "inbound_event.delegated_subject_rejected",
+            event_id=message.event_id,
+            trace_id=message.trace_id,
+        )
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.DROPPED)
+        return Outcome(handled_as=HandledAs.DROPPED)
 
     def _enqueue(
         self,

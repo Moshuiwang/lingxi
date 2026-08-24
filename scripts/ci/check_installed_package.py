@@ -167,6 +167,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.delegated_subject_lookup",
     "lingxi.adapters.oauth_bridge_client",
     "lingxi.adapters.postgres",
     "lingxi.adapters.postgres_identity",
@@ -463,6 +464,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.config.content",
             "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
+            # `delegated_credentials.py` 自身 import 了 `delegated_subject_lookup`
+            # 做重新导出（opus 批量审查 P1 修复），因此这条边也在这两个进程的
+            # 闭包里——两者本来就已经声明 cryptography，这条新增不改变实际
+            # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
+            "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
             "lingxi.adapters.feishu_group_message",
@@ -548,6 +554,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.reauthorize.__main__",
             "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
+            # `delegated_credentials.py` 自身 import 了 `delegated_subject_lookup`
+            # 做重新导出（opus 批量审查 P1 修复），因此这条边也在这两个进程的
+            # 闭包里——两者本来就已经声明 cryptography，这条新增不改变实际
+            # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
+            "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
@@ -688,6 +699,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
             # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
             "lingxi.adapters.admin_registry",
+            # 专用主体结构性出口前置（opus P3-1）：build_supervisor 在函数内 import
+            # registered_delegated_subject_open_id，装配期读一次登记表把结果算成
+            # 一个普通字符串交给管线（见该函数内注释）。刻意登记
+            # `delegated_subject_lookup`（不是 `delegated_credentials`）：后者其余
+            # 部分依赖 cryptography（Fernet），而 gateway extras 组明确不含它
+            # （2026-08-18 裁定，见 `adapters/delegated_subject_lookup.py` 模块
+            # 文档）；这个更小的模块本身只依赖 `adapters.postgres`，不新增
+            # `core.identity.identifiers` 这条闭包。
+            "lingxi.adapters.delegated_subject_lookup",
+            # 内测名单闸的 gateway 侧前移一份（Issue #302 S-N-01 的纵深）：
+            # build_supervisor 在函数内 import is_open_id_innertest_allowed，
+            # 把 config.innertest_roster_open_ids 包成管线要的判定口。
+            "lingxi.core.identity.innertest_roster_gate",
             "lingxi.core",
             "lingxi.core.admin",
             "lingxi.core.admin.registry",

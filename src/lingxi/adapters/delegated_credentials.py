@@ -41,6 +41,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from lingxi.adapters.delegated_subject_lookup import (
+    DELEGATED_PURPOSE,
+    registered_delegated_subject_open_id,
+)
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.identity.credentials import (
     AuthorizationGrant,
@@ -54,8 +58,12 @@ from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
 
-# 登记表里唯一允许的用途。新增用途要走迁移，不能靠调用方传字符串。
-DELEGATED_PURPOSE = "org_directory_sync"
+# `DELEGATED_PURPOSE`/`registered_delegated_subject_open_id` 的定义搬到了
+# `adapters/delegated_subject_lookup.py`（opus 批量审查 P1 修复，见该模块文档）——
+# 这里保留 import 重新导出，本文件其余代码与既有调用方（scheduler/admin_bootstrap）
+# 继续用 `from lingxi.adapters.delegated_credentials import ...` 这个路径，不改一行。
+# gateway 改从新模块直接 import，避免把这个只读查询之外、本文件独有的 Fernet 依赖
+# 一并背上（`pyproject.toml` 的 `gateway` extras 组明确不含 cryptography）。
 
 # 领取后其他进程再领取的观感与数据库版一致：消费标记本身就是唯一的门。
 # 保留该常量只为兼容既有调用方签名。
@@ -74,31 +82,10 @@ DEFAULT_SUPPLY_MIN_INTERVAL = timedelta(minutes=5)
 #: 失败"的机会。
 DEFAULT_SUPPLY_DAILY_LIMIT = 100
 
-
-def registered_delegated_subject_open_id(
-    dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
-) -> str | None:
-    """读取正式登记的专用授权主体标识。**只读登记表，不碰凭据文件、不碰 refresh_token。**
-
-    做成模块级函数而不是只挂在 :class:`HostFileDelegatedCredentialVault` 上，是为了让
-    **不该持有凭据的进程**也能拿到这一个标识：首次开通编排（Epic D）必须知道"哪个
-    `open_id` 是专用授权账号"才能在判定第一步就把它排除（`V-身份-02`），而 gateway 既没有
-    Fernet 主密钥、也不该有宿主机凭据文件路径。经由那个类去读，等于逼 gateway 去构造一个
-    持有解密能力的对象——2026-08-08 的事故正是"多一个进程碰同一份专用授权凭据"的形状。
-
-    登记表里没有行、或值为空白时返回 ``None``。调用方据此判断"还没有专用主体"，
-    **不得**把 ``None`` 当成"任何人都不是专用主体"以外的含义。
-    """
-
-    with connect(dsn, timeouts=timeouts) as connection, connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT subject_open_id FROM feishu_delegated_subject WHERE purpose = %s",
-            (DELEGATED_PURPOSE,),
-        )
-        row = cursor.fetchone()
-    if row is None or not isinstance(row[0], str) or not row[0].strip():
-        return None
-    return row[0].strip()
+# `registered_delegated_subject_open_id` 的实现搬到了
+# `adapters/delegated_subject_lookup.py`；上面的 import 已经把它重新导出到这个
+# 模块的命名空间里，本文件其余部分（`HostFileDelegatedCredentialVault` 的 INSERT/
+# UPDATE/SELECT）继续用同一个 `DELEGATED_PURPOSE` 常量，未改变任何行为。
 
 
 @dataclass(frozen=True)

@@ -99,6 +99,9 @@ class PipelineTestCase(unittest.TestCase):
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
         should_stop=None,
+        admin_router=None,
+        innertest_roster_gate=None,
+        delegated_subject_open_id: str | None = None,
     ):
         return EventPipeline(
             store=FakeStore(
@@ -113,6 +116,9 @@ class PipelineTestCase(unittest.TestCase):
             audit=FakeAudit(self.log),
             onboarding=onboarding,
             should_stop=should_stop,
+            admin_router=admin_router,
+            innertest_roster_gate=innertest_roster_gate,
+            delegated_subject_open_id=delegated_subject_open_id,
         )
 
 
@@ -1095,6 +1101,78 @@ class AutomaticOnboardingTests(PipelineTestCase):
         # Issue #280 §7.1 渲染点 3（异常兜底）：正文必须带上这一次事件的追溯号，
         # 且不得泄露内部异常正文（上一条断言已覆盖后半）。
         self.assertIn("trc_evt_internal", self.log.fields("reply.send_text")[-1]["text"])
+
+
+class InnertestRosterGateTests(PipelineTestCase):
+    """内测名单闸的 gateway 侧前移一份（Issue #302 S-N-01 的纵深，opus 批量审查
+    P1 修复）：`DAILY_REPORT_UUID_PREFIX` 那条修复解决的是"通报发不出去"，
+    这一组解决的是"名单外用户两条消息 + 文案泄露 + 错误码兜底"——此前名单判定
+    只发生在 scheduler 侧异步的开通链深处，gateway 总是无条件先发一条
+    `onboarding.checking`，名单外用户因此总会收到两条消息，且第二条终态取决于
+    开通链跑到哪一步失败，不是稳定的「内测未开放」。
+    """
+
+    def test_roster_excluded_sender_gets_one_clean_reply_and_never_reaches_onboarding(
+        self,
+    ) -> None:
+        runner = FakeOnboarding()
+        pipeline = self.build(
+            onboarding=runner, innertest_roster_gate=lambda open_id: False
+        )
+
+        outcome = pipeline.handle_message(
+            message(event_id="evt_roster_out", open_id="ou_stranger"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
+        self.assertEqual(self.state.events["evt_roster_out"], "dropped")
+        # 开通编排完全没有被调用——不是「调用了但被名单闸截胡」，是根本没调用，
+        # 因此也不会有 checking 之外的第二条异步终态消息。
+        self.assertEqual(runner.calls, [])
+        self.assertNotIn("audit.inbound_event.auto_provisioning", self.log.names())
+        # 恰好一条回复，且就是内测未开放的固定文案键——不是两条，不是
+        # `onboarding.checking` 打头。
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual([fields["content_key"] for fields in sent], ["onboarding.innertest_not_open"])
+        # 拒绝审计只带 event_id/trace_id，不带 open_id（含脱敏形式）——与
+        # scheduler 侧 `onboarding.innertest_roster_rejected` 同一条纪律
+        # （`V-花名册-34`）。
+        rejections = self.log.fields("audit.onboarding.innertest_roster_rejected")
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(
+            set(rejections[0]), {"event_id", "trace_id"},
+            "拒绝审计只能带 event_id/trace_id，不能带 open_id",
+        )
+
+    def test_roster_included_sender_is_unaffected(self) -> None:
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+        pipeline = self.build(
+            onboarding=runner, innertest_roster_gate=lambda open_id: True
+        )
+
+        outcome = pipeline.handle_message(
+            message(event_id="evt_roster_in", open_id="ou_allowed"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertNotIn("audit.onboarding.innertest_roster_rejected", self.log.names())
+        sent = self.log.fields("audit.reply.sent")
+        self.assertEqual([fields["content_key"] for fields in sent], ["onboarding.checking"])
+
+    def test_gate_not_configured_matches_pre_existing_behavior(self) -> None:
+        """`innertest_roster_gate=None`（未装配，默认值）：行为与本项加入之前
+        逐字节一致——不做任何名单判定，直接进入既有 AUTO_PROVISIONING 分支。
+        与 `AdminRoutingPipelineTests` 里同名断言（未装配 admin_router）同一姿态。
+        """
+
+        runner = FakeOnboarding(result=OnboardingResult(state=OnboardingState.STARTED))
+        pipeline = self.build(onboarding=runner)
+
+        outcome = pipeline.handle_message(message(open_id="ou_whoever"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.AUTO_PROVISIONING)
+        self.assertEqual(len(runner.calls), 1)
 
 
 class OnboardingDispatchLedgerTests(PipelineTestCase):
