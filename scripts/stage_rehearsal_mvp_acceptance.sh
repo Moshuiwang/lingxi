@@ -2,7 +2,9 @@
 # Stage 演练脚本（Epic E 验收资产第 3 件，S-E-01，Issue #161）。
 #
 # 用途：让编排者在 `biai-stage` 上，先于产品负责人那一次集中验收窗口，自己把
-# [MVP联合验收执行卡](../docs/参考证据/MVP联合验收执行卡.md) 第③④阶段里"部署/
+# MVP 联合验收执行卡（一次性资产，已随 2026-08-24 维护批退场，存档见
+# https://github.com/Moshuiwang/lingxi/blob/256a905c5f370ab8c13f77c11a2cb6416badd6b2/docs/参考证据/MVP联合验收执行卡.md
+# ）第③④阶段里"部署/
 # 恢复"这一半跑一遍——安装、迁移、健康回读、持久化重启、回滚演练、清理——
 # 确认脚本本身没有笔误、命令顺序没有踩坑，而不是带着产品负责人一起试错。
 #
@@ -263,7 +265,7 @@ list_steps() {
     printf '%-24s %-8s %s\n' "${id}" "${minutes}" "${desc}"
   done
   printf '\n提示：这是编排者在 biai-stage 上先自己跑一遍的演练序列，不是产品负责人\n'
-  printf '窗口本身的耗时——执行卡①②③④阶段的耗时估算见 MVP联合验收执行卡.md。\n'
+  printf '窗口本身的耗时——历史耗时估算见已退场的 MVP 联合验收执行卡（git 历史存档）。\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -377,14 +379,16 @@ read_service_image() {
 
   image=$(docker compose --env-file "${ENV_FILE}" \
     -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
-    images --format '{{.Repository}}:{{.Tag}}' "${service}" 2>/dev/null || true)
-  if [[ -n "${image}" ]]; then
+    images --format '{{.Repository}}:{{.Tag}}' "${service}" 2>/dev/null | head -n1 || true)
+  # 形状校验：部分 compose 版本对 --format 半支持时可能吐出「:」之类的非空垃圾串，
+  # 只有形如 repo:tag（含冒号且含非冒号实字符）才算有效，否则照常降级（opus 审查 P3）。
+  if [[ -n "${image}" && "${image}" == *:* && "${image}" =~ [^:[:space:]] ]]; then
     log "    镜像回读（${service}）：走 compose images 路径" >&2
     printf '%s' "${image}"
     return 0
   fi
 
-  log "    镜像回读（${service}）：compose images 未返回结果，降级到 docker ps 按容器核对" >&2
+  log "    镜像回读（${service}）：compose images 未返回有效结果，降级到 docker ps 按容器核对" >&2
   local container_id
   container_id=$(docker compose --env-file "${ENV_FILE}" \
     -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
@@ -415,39 +419,46 @@ step_rollback_drill() {
   log "  操作前提：deploy/.env.stage 的 LINGXI_IMAGE_TAG 已经手工改成 ${ROLLBACK_TARGET_TAG}"
   log "  （本脚本不代为编辑 env 文件——tag 选择是产品与发布判断；下面会回读核对是否真的改对了）"
 
-  local before_image="" after_image=""
+  local drill_services=(scheduler gateway worker-queue)
+  local svc after_image
+  declare -A before_images=()
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
-    before_image=$(read_service_image scheduler || true)
-    log "  回滚前 scheduler 容器镜像：${before_image:-<未运行或读取失败>}"
+    for svc in "${drill_services[@]}"; do
+      before_images["${svc}"]=$(read_service_image "${svc}" || true)
+      log "  回滚前 ${svc} 容器镜像：${before_images[${svc}]:-<未运行或读取失败>}"
+    done
   else
-    printf '（dry-run）将回读回滚前 scheduler 容器镜像（优先 compose images，读不到则降级 docker ps）\n'
+    printf '（dry-run）将逐服务回读回滚前镜像（优先 compose images，读不到则降级 docker ps）\n'
   fi
 
-  # --force-recreate：同 step_up 的注释——只换 tag 时 compose 可能不重建全部
-  # 容器，回滚演练必须确保三个服务都真的切到目标候选镜像，不能只有 scheduler
-  # 切换、gateway/worker-queue 仍停在旧候选上却被判通过。
+  # --force-recreate：同 step_up 的注释——只换 tag 时 compose 可能不重建全部容器。
+  # --profile mvp：gateway/worker-queue 挂在 mvp profile 下，不带 profile 的 up
+  # 只会重建 scheduler（opus 审查 P2-2 实测 compose.yaml profiles 声明）；
+  # 回滚演练必须三个服务都真的切到目标候选，下面逐服务回读核对。
   run_or_print docker compose --env-file "${ENV_FILE}" \
-    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" up -d --force-recreate
+    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" --profile mvp up -d --force-recreate
 
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
-    after_image=$(read_service_image scheduler || true)
-    log "  回滚后 scheduler 容器镜像：${after_image:-<读取失败>}"
-    if [[ -z "${after_image}" ]]; then
-      log "  失败：读不到回滚后的镜像标签，不能确认切换生效"
-      return 1
-    fi
-    if [[ "${after_image}" != *"${ROLLBACK_TARGET_TAG}"* ]]; then
-      log "  失败：回滚后镜像标签（${after_image}）不包含目标 tag（${ROLLBACK_TARGET_TAG}），"
-      log "  env 文件可能没改对，本次演练不构成有效证据"
-      return 1
-    fi
-    if [[ -n "${before_image}" && "${before_image}" == "${after_image}" ]]; then
-      log "  失败：回滚前后镜像标签完全相同——这不是一次真实的候选切换，是空转，不得记为通过"
-      return 1
-    fi
-    log "  通过：镜像标签确实从「${before_image:-<未运行>}」切换到「${after_image}」"
+    for svc in "${drill_services[@]}"; do
+      after_image=$(read_service_image "${svc}" || true)
+      log "  回滚后 ${svc} 容器镜像：${after_image:-<读取失败>}"
+      if [[ -z "${after_image}" ]]; then
+        log "  失败：读不到 ${svc} 回滚后的镜像标签，不能确认切换生效"
+        return 1
+      fi
+      if [[ "${after_image}" != *"${ROLLBACK_TARGET_TAG}"* ]]; then
+        log "  失败：${svc} 回滚后镜像标签（${after_image}）不包含目标 tag（${ROLLBACK_TARGET_TAG}），"
+        log "  env 文件可能没改对或该服务未随队切换，本次演练不构成有效证据"
+        return 1
+      fi
+      if [[ -n "${before_images[${svc}]:-}" && "${before_images[${svc}]}" == "${after_image}" ]]; then
+        log "  失败：${svc} 回滚前后镜像标签完全相同——不是真实的候选切换，是空转，不得记为通过"
+        return 1
+      fi
+      log "  通过：${svc} 从「${before_images[${svc}]:-<未运行>}」切换到「${after_image}」"
+    done
   else
-    printf '（dry-run）将回读回滚后镜像标签，并核对与回滚前不同、且包含目标 tag\n'
+    printf '（dry-run）将逐服务（scheduler/gateway/worker-queue）回读回滚后镜像标签，核对包含目标 tag 且与回滚前不同\n'
   fi
 
   run_or_print docker compose --env-file "${ENV_FILE}" \
@@ -460,7 +471,7 @@ step_cleanup() {
   run_or_print docker compose --env-file "${ENV_FILE}" \
     -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" down
 
-  log "cleanup：受控触发夹具三面检查（用后撤除并回读，Trace v12 机制③；"
+  log "cleanup：受控触发夹具三面检查（用后撤除并回读，#147 现行方法的受控触发夹具合同；"
   log "  容器已 down，这一面自然为空，仍走同一函数保持判据一致）"
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
     log "  夹具检查 1/3：宿主 shell 进程环境"
