@@ -135,6 +135,12 @@ REQUIRED_MODULES = (
     # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
     "lingxi.core.identity.roster_snapshot",
     "lingxi.adapters.postgres_roster_snapshot",
+    # 内测每日通报（Issue #303 S-O-01）：聚合与渲染在 core，四段真库读取在
+    # adapters，均由 lingxi-scheduler 在运行时按需加载（见下面 PROCESS_RUNTIME_IMPORTS
+    # 的 scheduler 闭包）——"本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡
+    # 的形状。
+    "lingxi.core.daily_report",
+    "lingxi.adapters.postgres_daily_report",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -169,14 +175,16 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.permission_refresh",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
-    # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块。全部由包的
-    # `__init__.py` 在**模块级** import 以维持既有的 `lingxi.apps.scheduler.<名字>`
-    # 重导出契约，因此与上面两条同一姿态——漏登记会直接让 scheduler 起不来。
+    # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303 新增
+    # daily_report）。全部由包的 `__init__.py` 在**模块级** import 以维持既有的
+    # `lingxi.apps.scheduler.<名字>` 重导出契约，因此与上面两条同一姿态——漏登记
+    # 会直接让 scheduler 起不来。
     "lingxi.apps.scheduler.config",
     "lingxi.apps.scheduler.audit",
     "lingxi.apps.scheduler.credential_rotation",
     "lingxi.apps.scheduler.retention",
     "lingxi.apps.scheduler.roster_audit",
+    "lingxi.apps.scheduler.daily_report",
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
@@ -361,14 +369,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # （`_build_stalled_provisioning_duty` 在函数内 import）同样必须登记。
             "lingxi.apps.scheduler.stalled_provisioning",
             "lingxi.adapters.postgres_stalled_provisioning",
-            # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块，全部由
-            # 包的 `__init__.py` 在模块级 import（维持既有的 `lingxi.apps.scheduler.
-            # <名字>` 重导出契约），因此进程起来时这八个必然已经被 import 过一遍。
+            # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303
+            # 新增 daily_report），全部由包的 `__init__.py` 在模块级 import（维持
+            # 既有的 `lingxi.apps.scheduler.<名字>` 重导出契约），因此进程起来时
+            # 这九个必然已经被 import 过一遍。
             "lingxi.apps.scheduler.config",
             "lingxi.apps.scheduler.audit",
             "lingxi.apps.scheduler.credential_rotation",
             "lingxi.apps.scheduler.retention",
             "lingxi.apps.scheduler.roster_audit",
+            "lingxi.apps.scheduler.daily_report",
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
@@ -423,6 +433,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 花名册持久快照（#52 的 S-B-02）自 S-B-04 起有了真实调用方：
             # `build_loop` 在函数内 import 它，与上面两个 adapter 同一条理由。
             "lingxi.adapters.postgres_roster_snapshot",
+            # 内测每日通报（Issue #303 S-O-01）：`_build_daily_report_duty` 在函数内
+            # import 真库读取口，与上面两个花名册 adapter 同一条"函数内 import 证明
+            # 不了装得上"的理由。
+            "lingxi.adapters.postgres_daily_report",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
@@ -457,6 +471,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
             "lingxi.core.identity.roster_snapshot",
+            # 内测每日通报（Issue #303 S-O-01）：`apps/scheduler/daily_report.py`
+            # 模块级 import 聚合与渲染层，与上面三个花名册 core 模块同一条"进程
+            # 起来时必然已被 import 过一遍"的理由。
+            "lingxi.core.daily_report",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.

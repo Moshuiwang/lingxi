@@ -1577,7 +1577,11 @@ class AssembledSupplyTest(unittest.TestCase):
             }
         )
 
-    def test_the_daily_report_duty_is_registered_and_shares_the_rotation_duty(self) -> None:
+    def test_the_roster_audit_duty_is_registered_and_shares_the_rotation_duty(self) -> None:
+        # 方法名沿用「daily report」旧称改成「roster audit」以后（Issue #303 落地
+        # 前这个名字确实是「日报职责」的同义词）：现在真的存在一个叫
+        # `DailyReportDuty`（内测每日通报）的**另一个**职责，两者不能再共用同一个
+        # 描述性名字，否则读者会以为这条用例在验的是那一个。
         from lingxi.apps.scheduler import build_loop
 
         audit = RecordingAudit()
@@ -1592,6 +1596,9 @@ class AssembledSupplyTest(unittest.TestCase):
                 "空闲会话清理",
                 "权限链到期清理",
                 "花名册审计日报",
+                # 内测每日通报（Issue #303 S-O-01）：唯一前置同样是管理群 chat_id，
+                # 本夹具已配好，因此总会真实注册，紧跟花名册那一组之后。
+                "内测每日通报",
                 # 组织快照同步（Issue #250）：两个令牌供给（用户身份、应用身份）
                 # `build_loop` 默认都会建出来，与本夹具是否配置 MCP 主密钥、权限
                 # 发布表或管理群 ID 无关，因此总会真实注册。

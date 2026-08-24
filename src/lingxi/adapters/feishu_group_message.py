@@ -38,6 +38,10 @@ GROUP_CHAT_ID_PREFIX = "oc_"
 # 投递去重 ID。飞书的 `im/v1/messages` 接受一个开发者自备的 `uuid`，用于**服务端**
 # 对重复请求去重。长度上限 50，这里的取值恒为 14 + 32 = 46。
 DELIVERY_UUID_PREFIX = "lingxi-roster-"
+#: 内测每日通报（Issue #303 S-O-01）专用去重前缀——与花名册日报共用同一个群、
+#: 同一个 `im/v1/messages` 接口，但是两条独立的投递语义，必须各自的前缀（见
+#: `FeishuGroupMessages.__init__` 的 `uuid_prefix` 参数文档）。
+DAILY_REPORT_UUID_PREFIX = "lingxi-daily-report-"
 DELIVERY_UUID_MAX_LENGTH = 50
 SendOutcomeCallback = Callable[[str, bool], None]
 
@@ -130,12 +134,19 @@ class FeishuGroupMessages:
         app_secret: str,
         transport: Callable[..., Any] | None = None,
         on_send_outcome: SendOutcomeCallback | None = None,
+        uuid_prefix: str = DELIVERY_UUID_PREFIX,
     ) -> None:
         self._base_url = _require_https(base_url)
         self._app_id = app_id
         self._app_secret = app_secret
         self._transport: Callable[..., Any] = transport or urllib_transport
         self._on_send_outcome = on_send_outcome
+        # 每一条独立的群消息投递语义都要有自己的去重前缀（见 `delivery_uuid` 的
+        # `prefix` 参数文档）：两个调用方若共用同一个前缀，飞书服务端会把「今天的
+        # 花名册日报」与「今天的内测每日通报」误判成同一条逻辑投递的重试，静默丢掉
+        # 其中一条——尤其是两边恰好都用当天日期当 `dedupe_key` 时。默认值保持与
+        # 改动前完全一致（花名册日报的既有调用点不用改一行）。
+        self._uuid_prefix = uuid_prefix
 
     def _notify_send(self, operation: str, succeeded: bool) -> None:
         """把结果交给告警逻辑；告警回调失败不能改变发送语义。"""
@@ -194,7 +205,7 @@ class FeishuGroupMessages:
                     "msg_type": "text",
                     # 飞书把 content 定义成一段 **JSON 字符串**，不是对象。
                     "content": json.dumps({"text": text}, ensure_ascii=False),
-                    "uuid": delivery_uuid(chat_id, dedupe_key),
+                    "uuid": delivery_uuid(chat_id, dedupe_key, prefix=self._uuid_prefix),
                 },
                 token=token,
             )
