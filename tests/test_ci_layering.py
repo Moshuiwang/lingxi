@@ -51,6 +51,47 @@ class StoryClassificationTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(CLASSIFIER.classify([path]), "full")
 
+    def test_registered_ci_data_file_does_not_escalate_to_full_gate(self) -> None:
+        # Issue #298：scripts/ci/ 下显式登记的纯数据文件改动不再整目录提级，
+        # 单独走 fast——例如体量棘轮基线刷新，不必因此拖起整套 Epic Full。
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/size_ratchet_baseline.txt"]), "fast")
+
+    def test_registered_ci_data_file_mixed_with_source_stays_fast(self) -> None:
+        self.assertEqual(
+            CLASSIFIER.classify(["scripts/ci/size_ratchet_baseline.txt", "src/lingxi/core/ids.py"]),
+            "fast",
+        )
+
+    def test_classifier_script_itself_still_uses_full_gate(self) -> None:
+        # 否定用例：分类器自身的 .py 改动可能改变判定逻辑，必须继续提级，
+        # 不能因为「登记了一个数据文件豁免」就连带放松脚本改动。
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/classify_story_changes.py"]), "full")
+
+    def test_size_ratchet_checker_script_still_uses_full_gate(self) -> None:
+        # 否定用例：与被登记豁免的 size_ratchet_baseline.txt 同源但不同性质——
+        # 这是核对该数据文件的检查脚本本身，改动可能改变门禁判定，必须继续提级。
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/check_size_ratchet.py"]), "full")
+
+    def test_ci_gate_shell_script_still_uses_full_gate(self) -> None:
+        # 否定用例：scripts/ci/ 下的门禁 .sh 改动同样必须继续提级。
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/verify_repository.sh"]), "full")
+
+    def test_unregistered_ci_data_looking_file_still_uses_full_gate(self) -> None:
+        # 防御默认：清单外的 scripts/ci/ 新文件，哪怕文件名看起来也像纯数据，
+        # 默认仍然提级——不能靠「看起来像数据」自动放行，必须显式登记才能豁免，
+        # 否则新增一个未登记的高风险文件会被静默当成安全路径。
+        self.assertEqual(CLASSIFIER.classify(["scripts/ci/another_baseline.txt"]), "full")
+
+    def test_registered_data_file_alongside_another_full_path_still_escalates(self) -> None:
+        # 同一次改动里只要还有别的高风险路径，仍以最高风险为准——登记豁免不会
+        # 连带放行同一个 PR 里 scripts/ci/ 下的其他改动。
+        self.assertEqual(
+            CLASSIFIER.classify(
+                ["scripts/ci/size_ratchet_baseline.txt", "scripts/ci/verify_repository.sh"]
+            ),
+            "full",
+        )
+
     def test_unknown_path_fails_closed_to_full(self) -> None:
         self.assertEqual(CLASSIFIER.classify(["new-top-level/config.toml"]), "full")
 

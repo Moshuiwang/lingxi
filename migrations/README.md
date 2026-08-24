@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0066_onboarding_notice_outbox` |
+| head revision | `0067_admin_registry` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -332,6 +332,29 @@ provisioning_state` 推进到 `active` 与向本表排一条待发「开通完�
 
 本表本 revision 新增，前滚兼容；`downgrade()` 删表并删触发器函数，不存在需要回填的
 历史值。
+
+## `0067_admin_registry`（服务端管理员角色登记表）
+
+[Issue #95](https://github.com/Moshuiwang/lingxi/issues/95) S-M-01（2026-08-24 范围
+重定）。一张新表 `admin_registry`：飞书身份（`feishu_open_id`）+ 三类角色授予状态
+（`permission_admin_granted`/`ops_admin_granted`/`super_admin_granted` 三个布尔列，
+不拆成逐角色行——决策记录"三类角色合并授予"）+ 条目状态（`entry_status`，
+`active`/`revoked`）+ 时间戳（`granted_at`/`revoked_at`/`created_at`）。
+
+**不是**数据库设计早先为管理 MCP 预留的 `admin_identity`/`admin_role` 两张表——那两个
+名字继续标记"未建"，留给管理 MCP 真正立项时按那时的需要设计；本表只承接私聊管理
+命令面（方案 A）当前真正要用的最小字段。详见 revision 文件头部注释。
+
+判定语义：默认拒绝（没有一条 `entry_status='active'` 命中即非管理员）、每次请求
+实时读表（消费方代码不得引入缓存）、唯一活跃身份由部分唯一索引
+（`admin_registry_active_identity_idx`，只约束 `entry_status='active'` 的行）强制。
+
+本 revision 不提供任何写路径的触发器或应用代码——唯一的写入口是一次性种子命令
+`python -m lingxi.apps.admin_bootstrap`（幂等 `INSERT ... ON CONFLICT DO NOTHING`），
+不落任何真实 open_id 进仓库；登记表的授予/撤销写动作（本人确认卡 + 审计）留给
+S-M-02（[#96](https://github.com/Moshuiwang/lingxi/issues/96)）。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

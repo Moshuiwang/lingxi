@@ -282,14 +282,32 @@ def build_supervisor(
     而那正是断言要验的东西（缺省落桩就发生在这一行）。
     """
 
+    from lingxi.adapters.admin_registry import PostgresAdminQueries, PostgresAdminRegistryLookup
     from lingxi.adapters.feishu_longconn import LarkEventTransport
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.core.admin.router import AdminCommandRouter
 
     audit = _LoggingAudit()
     effective_onboarding = onboarding or _RecordingOnboarding()
     if on_onboarding_assembled is not None:
         on_onboarding_assembled(effective_onboarding)
+    # 管理命令面（Issue #95 S-M-01）：无条件装配，不受任何 feature flag 控制——安全
+    # 落点在数据判定，不在装配开关。登记表为空（尚未播种，例如新环境或 biai-stage
+    # 升级前）时 ``active_entry`` 对任何 open_id 都返回 None，`route()` 恒
+    # ``handled=False``，管线原样落回既有业务/专用账号提示分支，行为与完全不装配
+    # 这个参数时逐字节一致。两个查询端口各自开自己的连接（与 ``registered_
+    # delegated_subject_open_id`` 同型），不共享 pipeline 自己的 ``PostgresGatewayStore``
+    # 事务——管理查询是只读的，不需要参与入站事件那个写事务。
+    admin_router = AdminCommandRouter(
+        registry=PostgresAdminRegistryLookup(
+            str(config.postgres_dsn), timeouts=config.postgres_timeouts
+        ),
+        queries=PostgresAdminQueries(
+            str(config.postgres_dsn), timeouts=config.postgres_timeouts
+        ),
+        audit=audit,
+    )
     # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
     # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
     # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
@@ -305,6 +323,7 @@ def build_supervisor(
         replies=LarkReplies(client),
         audit=audit,
         onboarding=effective_onboarding,
+        admin_router=admin_router,
         # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
         should_stop=should_stop,
     )

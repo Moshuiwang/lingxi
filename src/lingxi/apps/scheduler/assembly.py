@@ -760,6 +760,8 @@ def _build_onboarding_duty(
         ledger=store,
         audit=audit,
         role_function_map=role_function_map,
+        # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
+        innertest_roster_gate=AutoOnboardingRunner.build_innertest_roster_gate(config.innertest_roster_open_ids),
         # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
         # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
         delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
@@ -804,9 +806,7 @@ def _build_onboarding_duty(
         onboarding=runner,
         audit=audit,
         stale_after=DISPATCH_AFTER,
-        # 本进程的 SchedulerLoop 已经按 `interval_seconds` 定速，认领循环不再自限——
-        # 自限会把「首次开通最多等一个扫描周期」这句承诺变成「一个扫描周期或一分钟，
-        # 取大的那个」。
+        # 本进程的 SchedulerLoop 已经按 `interval_seconds` 定速，认领循环不再自限——自限会把「首次开通最多等一个扫描周期」这句承诺变成「一个扫描周期或一分钟，取大的那个」。
         min_interval_seconds=0.0,
         should_stop=should_stop,
         capacity=executor.free_slots,
