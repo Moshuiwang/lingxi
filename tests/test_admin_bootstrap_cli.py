@@ -11,6 +11,7 @@ import io
 import unittest
 
 from lingxi.apps import admin_bootstrap
+from lingxi.core.admin.registry import AdminRegistrySeedConflict
 
 
 class MissingDsnTests(unittest.TestCase):
@@ -126,6 +127,31 @@ class ConfirmedWriteTests(unittest.TestCase):
         )
 
         self.assertEqual(code, 1)
+
+    def test_seed_conflict_with_an_inconsistent_existing_row_exits_one(self) -> None:
+        """已有不一致行→非零退出（opus 批量审查 P2 修复）：`seed` 检测到已存在
+        一条 active 登记、但字段与本次意图播种的内容不一致时，此前会被
+        `seed_returning_false...` 那条无条件当成"已存在有效登记"报告成功——
+        这条用例证明现在必须响亮拒绝，且报的差异只列字段名，不回显 open_id。"""
+
+        err = io.StringIO()
+
+        def conflicting_seed(open_id: str) -> bool:
+            raise AdminRegistrySeedConflict(mismatched_fields=("label",))
+
+        code = admin_bootstrap.run(
+            ["--confirm"],
+            env={"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"},
+            stderr=err,
+            lookup_delegated_subject=lambda: "ou_real_secret_identifier",
+            seed=conflicting_seed,
+        )
+
+        self.assertEqual(code, 1)
+        message = err.getvalue()
+        self.assertIn("不一致", message)
+        self.assertIn("label", message)
+        self.assertNotIn("ou_real_secret_identifier", message)
 
 
 if __name__ == "__main__":  # pragma: no cover
