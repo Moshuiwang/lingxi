@@ -74,6 +74,11 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
+    # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
+    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
+    # 装配前不在任何进程的模块级 import 闭包里，但必须随制品发布，理由同上一条。
+    "lingxi.core.identity.innertest_roster_gate",
     "lingxi.adapters.user_environment",
     # Epic D 闸⑥：按用户读取问数 MCP 配置的读侧适配器，配套上一条的写侧。由
     # `apps/worker/service.py` 在**模块级** import（queue 模式每个任务都要
@@ -339,6 +344,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
             "lingxi.core.identity.onboarding_runner",
+            # 内测名单闸（Issue #302 S-N-01）：`_build_onboarding_duty` 经
+            # `AutoOnboardingRunner.build_innertest_roster_gate` 函数内 import，
+            # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
+            # 时同样函数内 import——两个调用点都不在模块级，必须显式登记。
+            "lingxi.core.identity.innertest_roster_gate",
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.user_environment",

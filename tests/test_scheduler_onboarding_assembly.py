@@ -1084,6 +1084,55 @@ class SchedulerConfigTests(unittest.TestCase):
         config = SchedulerConfig.from_env({**BASE_ENV, "LINGXI_ONBOARDING_WORKERS": "16"})
         self.assertEqual(config.onboarding_workers, 16)
 
+    def test_the_innertest_roster_defaults_to_an_empty_set(self) -> None:
+        """未配置＝空集合＝闸对任何人全拒（Issue #302 S-N-01）；不是启动失败。"""
+
+        config = SchedulerConfig.from_env(BASE_ENV)
+        self.assertEqual(config.innertest_roster_open_ids, frozenset())
+
+    def test_the_innertest_roster_parses_a_valid_list(self) -> None:
+        config = SchedulerConfig.from_env(
+            {**BASE_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "ou_a,ou_b, ou_b"}
+        )
+        self.assertEqual(config.innertest_roster_open_ids, frozenset({"ou_a", "ou_b"}))
+
+    def test_an_invalid_innertest_roster_entry_fails_startup(self) -> None:
+        """错配不是未配：整个 scheduler 启动失败，而不是悄悄退化成放行或不拦截。"""
+
+        with self.assertRaises(ValueError):
+            SchedulerConfig.from_env(
+                {**BASE_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "ou_a,not-a-valid-open-id"}
+            )
+
+    def test_an_invalid_innertest_roster_error_does_not_echo_the_raw_value(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            SchedulerConfig.from_env(
+                {**BASE_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "totally-not-an-open-id"}
+            )
+        self.assertNotIn("totally-not-an-open-id", str(ctx.exception))
+
+
+class InnerTestRosterGateWiringTests(unittest.TestCase):
+    """`_build_onboarding_duty` 把 `SchedulerConfig` 已解析校验过的名单集合装配成
+    `AutoOnboardingRunner` 要的判定口，认领 `V-开通-21…23`。"""
+
+    def test_a_listed_open_id_is_allowed_and_an_unlisted_one_is_not(self) -> None:
+        env = {**WIRED_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": "ou_listed_member"}
+        duty, _ = build(env, token=lambda: "u-token")
+
+        gate = duty._onboarding._innertest_roster_gate
+        self.assertTrue(gate("ou_listed_member"))
+        self.assertFalse(gate("ou_never_listed_anywhere"))
+
+    def test_an_unconfigured_roster_rejects_everyone(self) -> None:
+        """默认关闭＝全拒：`WIRED_ENV` 本身不含该变量，闸必须仍然拒绝一切输入。"""
+
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token")
+
+        gate = duty._onboarding._innertest_roster_gate
+        self.assertFalse(gate("ou_never_listed_anywhere"))
+        self.assertFalse(gate("ou_listed_member"))
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
