@@ -761,6 +761,29 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
         run_once(onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)))
         self.assertEqual(calls, [], "开通完成不应该触发管理员告警")
 
+    def test_a_deterministic_business_failure_never_triggers_the_callback(self) -> None:
+        """否定断言（#251 开通告警：确定性业务失败不告警）：`NOT_AUTHORIZED`
+        （无可用银河权限一类的确定性失败）不是内部故障，不得触发管理员送达
+        回调——内测里这是预期结果，告警会变成噪音（Issue #251 正文原话）。
+
+        与 `test_a_non_failure_terminal_never_triggers_the_callback`（成功终态）
+        是两条独立的否定面：那一条挡的是"完成"，这一条挡的是"确定性地没有权限"，
+        两者都不是"内部故障"，但走的是不同的终态分支，必须分别取证。
+
+        触发方式与 `DeterministicRejectionTests.test_not_located` 同一个夹具
+        （花名册/组织快照查无此人），只是这里额外注入回调并断言其从未被调用。
+        """
+
+        calls: list[tuple[str, str]] = []
+        parts, _ = run_once(
+            directory=FakeDirectory(members=()),
+            onboarding_failed=lambda reason, trace_id: calls.append((reason, trace_id)),
+        )
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["state"], "not_authorized"
+        )
+        self.assertEqual(calls, [], "确定性业务失败（无可用权限）不应该触发管理员告警")
+
     def test_the_callback_never_receives_open_id_or_profile_values(self) -> None:
         """回调签名里根本没有传 open_id/姓名的位置——这里用真实签名反证：
         两个位置参数只可能是内部原因码与追溯号，两者都不是资料值。"""
