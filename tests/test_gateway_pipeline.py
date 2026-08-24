@@ -315,6 +315,76 @@ class TaskOwnershipTests(unittest.TestCase):
             parse_message_event(payload)
 
 
+class TaskClaimNonBlockingGuardTest(unittest.TestCase):
+    """Issue #248 缺口一：``PostgresTaskQueue.claim`` 的非阻塞领取属性只由
+    ``FOR UPDATE SKIP LOCKED`` 保证，源码级核对是仓库既有做法（同一形状见
+    ``test_gateway_postgres.py::WorkerVersionTests.
+    test_no_claim_path_writes_the_version_column_at_all``、
+    ``test_identity_provisioning_contract.py::
+    ReentryTouchesNoLifecycleColumnTest``）。
+
+    ``test_gateway_postgres.py::QueueClaimTests.
+    test_two_workers_never_claim_the_same_task`` 是这条 SQL 唯一的真库半边，但它
+    测的是**正确性**（不重复、不饿死）：PostgreSQL 在 READ COMMITTED 下对被锁行
+    做 EPQ 重判，去掉 ``SKIP LOCKED`` 退化成普通 ``FOR UPDATE`` 后结果仍然正确，
+    只是从「不阻塞」退化成「等锁」——那条真库用例因此不会变红（2026-08-19 对
+    #239 的独立审查实测确认）。「不阻塞」正是这条 SQL 存在的理由，多个 worker
+    并发领取时决定的是并发吞吐而不是正确性，且这个属性只能引入需要真实并发压力
+    才能判定的不稳定用例才能从行为上验证——按 Issue #248 的要求改用结构性断言，
+    直接钉住语句本身。
+    """
+
+    def test_claim_query_uses_skip_locked(self) -> None:
+        import inspect
+
+        from lingxi.adapters.postgres_conversation import PostgresTaskQueue
+
+        # ``claim`` 自己的文档字符串就写了一遍 ``FOR UPDATE SKIP LOCKED`` 来解释
+        # 这行 SQL 的作用——直接在整段源码（含文档字符串）上做 assertIn，即使把
+        # 真正的 SQL 削回 ``FOR UPDATE``，断言仍然会因为文档字符串里的原样引用
+        # 而误判通过。必须先去掉文档字符串，只扫代码本身（本仓库既有做法，见
+        # ``tests/test_mcp_readiness_machine.py::_code_without_docstrings``）。
+        source = _code_without_docstrings(inspect.getsource(PostgresTaskQueue.claim))
+        # 正向锚点：确认切到的确实是「领取 queued 任务」这条 SQL，不是一条扫不到
+        # 实现、永远为空的断言。
+        self.assertIn(
+            "status = 'queued'",
+            source,
+            "没有在 claim() 里找到领取 queued 任务的查询——本守卫的落点可能已经"
+            "漂移，需要重新核对",
+        )
+        self.assertIn(
+            "FOR UPDATE SKIP LOCKED",
+            source,
+            "worker 并发领取任务的语句退化成了普通 FOR UPDATE——不会产生错误数据，"
+            "但会把并发领取变成串行排队，且没有任何自动检查会发现（Issue #248）",
+        )
+
+
+def _code_without_docstrings(source: str) -> str:
+    """去掉全部文档字符串之后的正文；形状断言只该扫代码本身（同一形状见
+    ``tests/test_mcp_readiness_machine.py::_code_without_docstrings``）。"""
+
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(source))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            del body[0]
+            if not body:
+                body.append(ast.Pass())
+    return ast.unparse(tree)
+
+
 def _payload(chat_type: str | None = "p2p", message_type: str = "text") -> dict:
     message = {
         "message_id": "om_1",
