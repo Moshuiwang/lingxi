@@ -179,12 +179,13 @@ class ModuleManifestReconciliationTest(unittest.TestCase):
         self.assertIn("进程入口豁免发生漂移", output)
 
     def test_a_process_cannot_depend_on_a_formal_artifact_exemption(self) -> None:
-        # 2026-08-23 #146 清退后示例改用 oauth_bridge——它是 #67 裁定保留、仍在
-        # MODULE_MANIFEST_EXEMPTIONS 里的豁免模块。
+        # 2026-08-24 #203 清退后示例改用 feishu_bitable_association——原示例
+        # oauth_bridge 已随本轮清退删除，不再是 MODULE_MANIFEST_EXEMPTIONS 里的
+        # 豁免模块；feishu_bitable_association 是清退后仍保留的唯一豁免项。
         process = dict(CHECKER.PROCESS_RUNTIME_IMPORTS)
         lingxi_modules, third_party_modules = process["scheduler"]
         process["scheduler"] = (
-            (*lingxi_modules, "lingxi.adapters.oauth_bridge"),
+            (*lingxi_modules, "lingxi.adapters.feishu_bitable_association"),
             third_party_modules,
         )
 
