@@ -195,6 +195,20 @@ REQUIRED_MODULES = (
     # （不是常驻进程，不需要 compose 服务条目）。
     "lingxi.apps.trace",
     "lingxi.apps.trace.__main__",
+    # 管理员角色登记表的一次性种子命令（Issue #95 S-M-01）：同一姿态——scripts/
+    # 被 .dockerignore 排除，随 scheduler 镜像一起装，由运维在容器内以
+    # `docker exec` 语义手动调用，不是常驻进程。
+    "lingxi.apps.admin_bootstrap",
+    "lingxi.apps.admin_bootstrap.__main__",
+    # 管理员角色登记表判定/命令解析/路由（Issue #95 S-M-01）：纯逻辑，被
+    # admin_bootstrap（种子命令，只用 registry）与 gateway 的管理命令面
+    # （registry + commands + router）分别消费。
+    "lingxi.core.admin",
+    "lingxi.core.admin.registry",
+    "lingxi.core.admin.commands",
+    "lingxi.core.admin.router",
+    "lingxi.core.admin.views",
+    "lingxi.adapters.admin_registry",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -421,6 +435,20 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 由运维在容器内以 `docker exec` 语义手动调用，不是常驻进程的一部分。
             "lingxi.apps.trace",
             "lingxi.apps.trace.__main__",
+            # 管理员角色登记表种子命令（Issue #95 S-M-01），同一姿态：随 scheduler
+            # 镜像装、由运维以 `docker exec` 语义手动调用。模块级 import 用到
+            # `lingxi.core.admin.registry.ALL_ADMIN_ROLES`；函数内延迟 import
+            # `lingxi.adapters.admin_registry`（种子写入）与 `lingxi.adapters.
+            # delegated_credentials`（后者已在本闭包内，被首次开通编排用到），
+            # 因此没有新增第三方依赖，只补 lingxi 模块本身。`core.admin.commands`/
+            # `core.admin.router` 不在这里——它们只被 gateway 的管理命令面消费，
+            # 登记在 gateway 闭包里。
+            "lingxi.apps.admin_bootstrap",
+            "lingxi.apps.admin_bootstrap.__main__",
+            "lingxi.adapters.admin_registry",
+            "lingxi.core.admin",
+            "lingxi.core.admin.registry",
+            "lingxi.core.admin.views",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
@@ -638,7 +666,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_directory",
+            # 管理命令面（Issue #95 S-M-01）：build_supervisor 在函数内 import
+            # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
+            # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
+            "lingxi.adapters.admin_registry",
             "lingxi.core",
+            "lingxi.core.admin",
+            "lingxi.core.admin.registry",
+            "lingxi.core.admin.commands",
+            "lingxi.core.admin.router",
+            "lingxi.core.admin.views",
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
@@ -713,6 +750,10 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         # 追溯号只读查询 CLI（Issue #280 §7.2）：同一姿态，随镜像装、独立调用，
         # 加进来才能让静态闭包真的走到它函数内的 `lingxi.adapters.postgres` 导入。
         "lingxi.apps.trace.__main__",
+        # 管理员角色登记表种子命令（Issue #95 S-M-01），同一姿态：加进来才能让
+        # 静态闭包走到 `run()` 函数内的 `lingxi.adapters.admin_registry`/
+        # `lingxi.adapters.delegated_credentials` 延迟 import。
+        "lingxi.apps.admin_bootstrap.__main__",
     ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
     "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),

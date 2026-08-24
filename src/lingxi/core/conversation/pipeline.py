@@ -7,6 +7,8 @@
     2. event_id 落库     冲突 → 重复投递，直接返回成功        V-接入-01/02/09
     3. 加表情            失败 → 记审计，继续                  V-接入-07/08
     4. 查用户状态        未开通 → 丢弃正文并认领开通；已停用 → 回提示 V-审计-05
+       （未开通分支内先按登记表实时判定是否为当前有效管理员：是 → 管理命令面，
+       不进入开通；否 → 原有开通逻辑不变。Issue #95 S-M-01，V-管理-2x）
     5. 解析命令          /stop /new                            V-会话-05/06
     6. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
     7. 入队 + NOTIFY                                           V-队列-01…05
@@ -34,7 +36,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.ids import new_id
@@ -149,6 +151,16 @@ class EventPipeline:
         resolve_version: VersionResolver = fixed_stable_version,
         should_stop: Callable[[], bool] | None = None,
         onboarding: OnboardingRunner | None = None,
+        # 类型刻意是 Any，不 import 具体的 Protocol/实现：核对下方调用点即知，本模块
+        # 只用得到 ``.route(open_id=..., text=..., trace_id=...)``，返回值只读
+        # ``.handled``/``.content_key``/``.content_version``/``.reply_text`` 四个
+        # 属性——这正是「管理命令面」端口（`core/admin/router.AdminRouter`）的形状，
+        # 鸭子类型足够。真正 import 具体类型的是 ``apps/gateway`` 的函数内延迟
+        # import；这里 import 会让每一个只想要会话类型（例如 ``UserState``，经
+        # `core/conversation/__init__.py` 重导出）的调用方——包括与管理命令面完全
+        # 无关的 worker 进程——平白多出一条 `core.admin.*` 依赖边（`scripts/ci/
+        # check_installed_package.py` 的静态闭包检查会如实标红这条多余耦合）。
+        admin_router: Any = None,
     ) -> None:
         self._store = store
         self._reactions = reactions
@@ -162,6 +174,10 @@ class EventPipeline:
         # that have not opted into the #65 path; the gateway app passes it explicitly
         # when the product path is enabled.
         self._onboarding = onboarding
+        # 管理命令面（Issue #95 S-M-01）：可选注入，未装配时行为与本项加入之前逐字节
+        # 一致。装配之后仍然是"登记表里没有有效条目就什么都不改变"——见
+        # ``_within_transaction`` 里的调用点文档。
+        self._admin_router = admin_router
         # 停机位。停机时**已提交的结论不动**，只跳过提交之后那些尽力而为的动作——
         # 中途放弃一个快要提交完的事务只会把工作丢掉再让平台重投一次。
         # 跳过的有两样：出站回复，以及开通编排的触发（Issue #65 轻审 P2-3）。后者
@@ -333,6 +349,37 @@ class EventPipeline:
             state = user.state if user is not None else UserState.NOT_PROVISIONED
 
             if state is UserState.NOT_PROVISIONED:
+                # 管理命令面分流（Issue #95 S-M-01）先于开通判断：登记表里当前有效的
+                # 管理员（结构上只可能是从未建档的账号——专用授权主体永远不会有
+                # app_user 记录，`V-身份-02`）发来的私聊文本消息，从「确定性拒绝
+                # 出口」改道进入管理命令面，完全不进入自动开通/专用账号提示这条链。
+                # 登记表里没有当前有效条目的发送者（未登记、已撤销、或未装配本路由）
+                # 落回下面既有的、本项加入之前逐字节相同的分支——真正的判定发生在
+                # ``AdminCommandRouter.route`` 内部的实时读表，这里只负责按结果分流。
+                if self._admin_router is not None and message.message_type == TEXT_MESSAGE_TYPE:
+                    admin_outcome = self._admin_router.route(
+                        open_id=message.sender_open_id,
+                        text=message.text,
+                        trace_id=message.trace_id,
+                    )
+                    if admin_outcome.handled:
+                        deferred.append(
+                            RenderedContent(
+                                key=admin_outcome.content_key,
+                                version=admin_outcome.content_version,
+                                text=admin_outcome.reply_text,
+                            )
+                        )
+                        self._audit.record(
+                            "inbound_event.admin_command",
+                            event_id=message.event_id,
+                            trace_id=message.trace_id,
+                        )
+                        tx.mark_handled_as(
+                            event_id=message.event_id, handled_as=HandledAs.COMMAND
+                        )
+                        return Outcome(handled_as=HandledAs.COMMAND)
+
                 # 合同：未开通用户发来的业务内容不进入问数、不保存也不回显（`V-审计-05`）。
                 # 注意审计里也不带消息正文：内容"不保存"包括不写进审计。
                 if self._onboarding is not None:
