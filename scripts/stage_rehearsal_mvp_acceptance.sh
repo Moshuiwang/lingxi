@@ -301,9 +301,13 @@ step_migrate() {
 
 step_up() {
   log "up：以 mvp profile 启动 scheduler + gateway + 常驻 queue worker"
+  # --force-recreate：只换镜像 tag（env 文件里 LINGXI_IMAGE_TAG 变了、服务定义
+  # 本身没变）时，compose 的差异判定有时不会重建全部容器——2026-08-23
+  # biai-stage 实测：换 tag 后 up -d 只重建了 scheduler，gateway/worker-queue
+  # 仍在跑旧镜像。加 --force-recreate 保证每次都按当前 env 文件重建全部服务。
   run_or_print docker compose --env-file "${ENV_FILE}" \
     -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
-    --profile mvp up -d
+    --profile mvp up -d --force-recreate
 
   log "up：回读容器状态与 scheduler 日志"
   run_or_print docker compose --env-file "${ENV_FILE}" \
@@ -357,6 +361,49 @@ NOTE
   run_or_print docker volume ls --filter "name=lingxi-stage-users"
 }
 
+# ---------------------------------------------------------------------------
+# 镜像回读：rollback-drill 用来核对切换前后 scheduler 容器的镜像 tag。优先走
+# `docker compose images --format`；biai-stage 现有 compose 版本对 images 子
+# 命令的 --format 支持不完整，整段会返回空（2026-08-23 MVP 演练实测：脚本逻辑
+# 本身没错，是这条路径在该 compose 版本上读不到值，导致 rollback-drill 被判
+# 失败关闭——实为误报）。探测到空结果后自动降级：改用 `docker compose ps -q`
+# 拿容器 ID（这个子命令自 compose v1 起就稳定存在、不依赖 --format 格式支持），
+# 再用 `docker ps --filter id=<id> --format '{{.Image}}'` 取镜像 tag。两条路径
+# 都取不到时仍按失败处理，失败关闭语义不变。用了哪条路径打到标准错误，不污染
+# 函数的 stdout 返回值（调用方用 $(...) 取镜像 tag）。
+# ---------------------------------------------------------------------------
+read_service_image() {
+  local service="$1" image=""
+
+  image=$(docker compose --env-file "${ENV_FILE}" \
+    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
+    images --format '{{.Repository}}:{{.Tag}}' "${service}" 2>/dev/null || true)
+  if [[ -n "${image}" ]]; then
+    log "    镜像回读（${service}）：走 compose images 路径" >&2
+    printf '%s' "${image}"
+    return 0
+  fi
+
+  log "    镜像回读（${service}）：compose images 未返回结果，降级到 docker ps 按容器核对" >&2
+  local container_id
+  container_id=$(docker compose --env-file "${ENV_FILE}" \
+    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
+    ps -q "${service}" 2>/dev/null | head -n1 || true)
+  if [[ -z "${container_id}" ]]; then
+    log "    镜像回读（${service}）：docker ps 路径也拿不到容器 ID（服务可能未运行）" >&2
+    return 1
+  fi
+
+  image=$(docker ps --filter "id=${container_id}" --format '{{.Image}}' 2>/dev/null | head -n1 || true)
+  if [[ -z "${image}" ]]; then
+    log "    镜像回读（${service}）：docker ps 路径也读不到镜像 tag" >&2
+    return 1
+  fi
+  log "    镜像回读（${service}）：走 docker ps 降级路径" >&2
+  printf '%s' "${image}"
+  return 0
+}
+
 step_rollback_drill() {
   if [[ -z "${ROLLBACK_TARGET_TAG}" ]]; then
     log "rollback-drill：缺少 --rollback-tag <目标候选 tag>，拒绝执行"
@@ -370,21 +417,20 @@ step_rollback_drill() {
 
   local before_image="" after_image=""
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
-    before_image=$(docker compose --env-file "${ENV_FILE}" \
-      -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
-      images --format '{{.Repository}}:{{.Tag}}' scheduler 2>/dev/null || true)
+    before_image=$(read_service_image scheduler || true)
     log "  回滚前 scheduler 容器镜像：${before_image:-<未运行或读取失败>}"
   else
-    printf '（dry-run）将回读回滚前 scheduler 容器镜像\n'
+    printf '（dry-run）将回读回滚前 scheduler 容器镜像（优先 compose images，读不到则降级 docker ps）\n'
   fi
 
+  # --force-recreate：同 step_up 的注释——只换 tag 时 compose 可能不重建全部
+  # 容器，回滚演练必须确保三个服务都真的切到目标候选镜像，不能只有 scheduler
+  # 切换、gateway/worker-queue 仍停在旧候选上却被判通过。
   run_or_print docker compose --env-file "${ENV_FILE}" \
-    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" up -d
+    -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" up -d --force-recreate
 
   if [[ "${CONFIRM_REAL_RUN}" == "1" ]]; then
-    after_image=$(docker compose --env-file "${ENV_FILE}" \
-      -f "${COMPOSE_BASE}" -f "${COMPOSE_STAGE_OVERLAY}" \
-      images --format '{{.Repository}}:{{.Tag}}' scheduler 2>/dev/null || true)
+    after_image=$(read_service_image scheduler || true)
     log "  回滚后 scheduler 容器镜像：${after_image:-<读取失败>}"
     if [[ -z "${after_image}" ]]; then
       log "  失败：读不到回滚后的镜像标签，不能确认切换生效"
