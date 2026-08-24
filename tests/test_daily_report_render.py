@@ -422,17 +422,19 @@ class RenderContentSafetyTests(unittest.TestCase):
     def test_a_bare_lowercase_open_id_shaped_value_is_not_caught_by_the_shape_whitelist(
         self,
     ) -> None:
-        """诚实记录已知盲区（不是回归）：白名单只校验**形状**，一个通篇小写
-        字母/数字/下划线、没有混入其他字符的伪造 open_id（如
-        ``"ou_person_0001"``）与合法的蛇形小写 reason_code（如
-        ``"session_failed"``）形状上完全无法区分，因此会被当作合法值原样渲染
-        进正文——这条用例明确证伪"形状白名单能挡住任何 open_id 泄露"这个过强
-        的说法，只留下可以诚实复述的结论："挡住带有大写/CJK/标点等形状之外
-        字符的泄露"。真实分类逻辑今天不产生裸标识符（见模块文档「用户标识为
-        什么不出现在正文里」），这里只是记录纵深防线本身的边界，供未来改动
-        参考，不代表当前存在真实泄露路径。"""
+        """诚实记录已知盲区（不是回归）：白名单只校验**形状**，通篇小写字母/
+        数字/下划线的标识符与合法的蛇形小写 reason_code（如
+        ``"session_failed"``）在字符集层面完全无法区分。样例刻意使用**真实
+        飞书 open_id 的标准形态**（``ou_`` + 32 位小写十六进制）——它恰好整体
+        落在盲区里，即这道纵深对「它最想挡的那一类标识」覆盖率为零。这条用例
+        证伪"形状白名单能挡住任何 open_id 泄露"这个过强说法，只留下可诚实
+        复述的结论："挡住带大写/CJK/标点等形状外字符的泄露；对全小写标识符
+        （含真实形态 open_id）无效"。当前全仓 ``task.error_kind`` 写入点均为
+        固定蛇形小写字面量、无动态来源（见模块文档），本用例只记录纵深防线
+        自身边界，不代表当前存在真实泄露路径；若引入动态 error_kind，先改
+        枚举白名单。"""
 
-        hostile = "ou_person_0001"
+        hostile = "ou_a1b2c3d4e5f60718293a4b5c6d7e8f90"
         top = (FailureReasonCount(hostile, 1),)
         inputs = _all_determined_inputs(failure_top=top)
 
