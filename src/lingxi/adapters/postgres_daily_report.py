@@ -99,7 +99,16 @@ class PostgresDailyReportSource:
         return tuple(float(row[0]) for row in rows if row[0] is not None)
 
     def delivery_outcomes(self, *, window_start, window_end) -> tuple[DeliveryOutcomeRow, ...]:
-        """窗口内投递终态按 `(卡片/文本, 是否已确认送达, 是否已过 24h 到期)` 的分组计数。"""
+        """窗口内投递终态按 `(卡片/文本, 是否已确认送达, 是否已过 24h 到期)` 的分组计数。
+
+        **调用方通常传入与其余三个方法不同的窗口**（opus 批量审查 P2 修复，见
+        `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的
+        窗口」）：`expires_at = created_at + 24h`，如果这里查的是"昨天"这个刚
+        结束不久的窗口，绝大多数行的 24 小时确认期在通报运行时还没关闭，"过期"
+        这一桶会结构上恒为零。本方法自己不做任何日期偏移——完全信任调用方传入
+        的 `window_start`/`window_end` 就是它想要问的那个窗口，不在这里重新
+        计算或假设"应该"是哪一天。
+        """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(

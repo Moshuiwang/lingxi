@@ -10,7 +10,7 @@ V-通报-06（UTC+北京双时区标注）。真库聚合断言在
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from lingxi.core.daily_report import (
     CALL_COUNT_BASELINE_UNAVAILABLE_REASON,
@@ -36,6 +36,10 @@ from lingxi.core.daily_report import (
 
 WINDOW_START = datetime(2026, 8, 23, tzinfo=timezone.utc)
 WINDOW_END = datetime(2026, 8, 24, tzinfo=timezone.utc)
+# 投递结果段独立窗口（opus 批量审查 P2 修复）：比其余段落的统计窗口早一整天，
+# 见 `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的窗口」。
+DELIVERY_WINDOW_START = datetime(2026, 8, 22, tzinfo=timezone.utc)
+DELIVERY_WINDOW_END = datetime(2026, 8, 23, tzinfo=timezone.utc)
 
 # 用于「正文绝不含用户标识/原文」断言的固定敏感值：真实姓名、工号、邮箱、飞书标识、
 # 内部 ULID 各一个，一个都不许出现在渲染结果里。
@@ -50,6 +54,8 @@ def _all_determined_inputs(
     guard_triggered: int = 0,
     latency: LatencyStats | None = None,
     delivery_outcome: DeliveryOutcomeStats | None = None,
+    delivery_window_start: datetime = DELIVERY_WINDOW_START,
+    delivery_window_end: datetime = DELIVERY_WINDOW_END,
 ) -> DailyReportInputs:
     return DailyReportInputs(
         window_start=WINDOW_START,
@@ -66,6 +72,8 @@ def _all_determined_inputs(
         delivery_outcome=Section.of(
             delivery_outcome or DeliveryOutcomeStats(delivered_card=0, delivered_fallback_text=0, expired=0, pending=0)
         ),
+        delivery_window_start=delivery_window_start,
+        delivery_window_end=delivery_window_end,
     )
 
 
@@ -352,6 +360,8 @@ class RenderContentSafetyTests(unittest.TestCase):
     """`V-通报-05`：正文不含用户对话原文、姓名、工号、邮箱或任何形式的用户标识。"""
 
     def test_no_forbidden_values_appear_in_a_fully_populated_report(self) -> None:
+        """被动侧：干净输入（合法的 reason_code）渲染出的报告不含任何敏感值。"""
+
         top = (FailureReasonCount("session_failed", 1),)
         inputs = _all_determined_inputs(
             active_users=ActiveUserStats(3, (("1 条", 3),)),
@@ -365,6 +375,70 @@ class RenderContentSafetyTests(unittest.TestCase):
         text = render_daily_report(inputs, throttled_failure_lines=throttled)
         for forbidden in FORBIDDEN_VALUES:
             self.assertNotIn(forbidden, text)
+
+    #: 白名单是**形状**校验（`^[a-z0-9_]{1,64}$`），不是语义校验——它能挡住的是
+    #: "含有形状之外字符"的泄露（大写字母、CJK、``@``、``.``、空格……），挡不住
+    #: 一个恰好通篇小写字母/数字/下划线、没有其他字符混入的标识符本身。
+    #: `FORBIDDEN_VALUES` 里除 `"ou_person_0001"` 外的四个样例都带着形状之外的
+    #: 字符（CJK、大写字母或 `@`/`.`），因此都会被挡住；`"ou_person_0001"` 恰好
+    #: 全部落在白名单字符集内，是这条防线**已知且已在测试里诚实记录**的盲区——
+    #: 见 `test_a_bare_lowercase_open_id_shaped_value_is_not_caught_by_the_shape_
+    #: whitelist`。真实飞书 open_id 是否会恰好取到这个形状不由本模块控制。
+    HOSTILE_VALUES_CAUGHT_BY_THE_SHAPE_WHITELIST = tuple(
+        value for value in FORBIDDEN_VALUES if value != "ou_person_0001"
+    )
+
+    def test_a_hostile_reason_code_is_redacted_to_other(self) -> None:
+        """主动侧（opus 批量审查 P1 修复）：`reason_code` 结构上来自
+        `task.error_kind`，但本模块拿到的只是调用方传入的字符串，不持有任何
+        保证它恒为蛇形小写枚举值的类型约束。这里主动把每一个带有"形状之外
+        字符"的敏感样例（姓名/工号/邮箱/内部 ULID）当作分类逻辑意外产生的
+        `reason_code` 注入进去，证明渲染层的形状白名单真的挡住了它——不出现在
+        正文里，且被换成了 `other`，不是被静默丢弃成空白。"""
+
+        for hostile in self.HOSTILE_VALUES_CAUGHT_BY_THE_SHAPE_WHITELIST:
+            with self.subTest(hostile=hostile):
+                top = (FailureReasonCount(hostile, 1),)
+                inputs = _all_determined_inputs(failure_top=top)
+
+                text = render_daily_report(inputs)
+
+                self.assertNotIn(hostile, text)
+                self.assertIn("- other：1 次", text)
+
+    def test_a_hostile_reason_code_is_redacted_even_when_throttled(self) -> None:
+        """同一条白名单必须覆盖节流分支——不能只顶住未节流那一条渲染路径。"""
+
+        hostile = self.HOSTILE_VALUES_CAUGHT_BY_THE_SHAPE_WHITELIST[0]
+        top = (FailureReasonCount(hostile, 3),)
+        inputs = _all_determined_inputs(failure_top=top)
+        throttled = (ThrottledFailureLine(hostile, 3, streak_days=8, throttled=True),)
+
+        text = render_daily_report(inputs, throttled_failure_lines=throttled)
+
+        self.assertNotIn(hostile, text)
+        self.assertIn("- other：3 次（连续第 8 天，已节流）", text)
+
+    def test_a_bare_lowercase_open_id_shaped_value_is_not_caught_by_the_shape_whitelist(
+        self,
+    ) -> None:
+        """诚实记录已知盲区（不是回归）：白名单只校验**形状**，一个通篇小写
+        字母/数字/下划线、没有混入其他字符的伪造 open_id（如
+        ``"ou_person_0001"``）与合法的蛇形小写 reason_code（如
+        ``"session_failed"``）形状上完全无法区分，因此会被当作合法值原样渲染
+        进正文——这条用例明确证伪"形状白名单能挡住任何 open_id 泄露"这个过强
+        的说法，只留下可以诚实复述的结论："挡住带有大写/CJK/标点等形状之外
+        字符的泄露"。真实分类逻辑今天不产生裸标识符（见模块文档「用户标识为
+        什么不出现在正文里」），这里只是记录纵深防线本身的边界，供未来改动
+        参考，不代表当前存在真实泄露路径。"""
+
+        hostile = "ou_person_0001"
+        top = (FailureReasonCount(hostile, 1),)
+        inputs = _all_determined_inputs(failure_top=top)
+
+        text = render_daily_report(inputs)
+
+        self.assertIn(hostile, text)
 
     def test_the_report_contains_no_clickable_or_callback_entry(self) -> None:
         """管理群是通知面不是操作面，与花名册日报 `V-花名册-24` 同一条纪律：
@@ -384,6 +458,60 @@ class WindowHeaderTests(unittest.TestCase):
         text = render_daily_report(inputs)
         self.assertIn("2026-08-23 00:00–2026-08-24 00:00（UTC）", text)
         self.assertIn("2026-08-23 08:00–2026-08-24 08:00（北京时间）", text)
+
+
+class DeliveryOutcomeIndependentWindowTests(unittest.TestCase):
+    """投递结果段用一个独立、更早的窗口（opus 批量审查 P2 修复）：`[D-2, D-1)`，
+    比其余段落的 `[D-1, D)` 整整早一天，且正文必须单独标注这段窗口。
+    """
+
+    def test_the_delivery_window_is_exactly_one_day_before_the_main_window(self) -> None:
+        """钉住窗口边界：投递结果段的窗口终点等于其余段落窗口的起点（首尾相接，
+        不重叠、不留缺口），起点比终点早整整一天。"""
+
+        self.assertEqual(DELIVERY_WINDOW_END, WINDOW_START)
+        self.assertEqual(WINDOW_START - DELIVERY_WINDOW_START, timedelta(days=1))
+        self.assertEqual(WINDOW_END - WINDOW_START, timedelta(days=1))
+
+    def test_the_delivery_section_states_its_own_window_distinct_from_the_header(self) -> None:
+        inputs = _all_determined_inputs()
+        text = render_daily_report(inputs)
+
+        # 页首窗口（其余六段共用）与投递结果段窗口必须都出现，且是两个不同的
+        # 日期区间——不能让读者以为整份报告只有一个统计窗口。
+        self.assertIn("统计窗口：2026-08-23 00:00–2026-08-24 00:00（UTC）", text)
+        self.assertIn("本段窗口：2026-08-22 00:00–2026-08-23 00:00（UTC）", text)
+        self.assertIn("比上方统计窗口早一天", text)
+
+    def test_a_non_zero_expired_count_renders_correctly(self) -> None:
+        """正向证据：独立窗口不是只为了"看起来更早"，是为了让「过期」这一桶真的
+        可能非零——本用例直接注入一个非零过期数，证明渲染路径把它如实透出。"""
+
+        inputs = _all_determined_inputs(
+            delivery_outcome=DeliveryOutcomeStats(
+                delivered_card=5, delivered_fallback_text=1, expired=2, pending=0
+            )
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("过期 2", text)
+
+    def test_an_undetermined_delivery_section_still_states_the_window_it_asked_for(
+        self,
+    ) -> None:
+        """即使本轮查询失败（不可判定），也必须说明"本来打算问哪个窗口"——
+        `delivery_window_start`/`end` 与 `Section` 是否可判定相互独立。"""
+
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{**inputs.__dict__, "delivery_outcome": Section.undetermined("查询超时")}
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("投递结果分布：不可判定（原因：查询超时）", text)
+        self.assertIn("本段窗口：2026-08-22 00:00–2026-08-23 00:00（UTC）", text)
 
 
 if __name__ == "__main__":

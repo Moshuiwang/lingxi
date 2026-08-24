@@ -180,11 +180,31 @@ class WindowComputationTests(unittest.TestCase):
         self.assertEqual(window_start, datetime(2026, 8, 23, tzinfo=timezone.utc))
         self.assertEqual(window_end, datetime(2026, 8, 24, tzinfo=timezone.utc))
 
-    def test_all_four_sources_receive_the_same_window(self) -> None:
+    def test_three_of_four_sources_receive_the_same_window(self) -> None:
+        """`active_user_task_counts`/`task_outcomes`/`task_durations_seconds`
+        三段共用同一个窗口；`delivery_outcomes` 独立用一个更早的窗口——见下一条
+        用例（opus 批量审查 P2 修复，`core/daily_report.py` 模块文档「投递结果段
+        为什么用一个独立、更早的窗口」）。"""
+
         duty, parts = build_duty()
         duty.run_once()
-        windows = {name: calls[0] for name, calls in parts["source"].calls.items()}
-        self.assertEqual(len(set(windows.values())), 1, "四段数据源必须使用同一个统计窗口")
+        calls = parts["source"].calls
+        windows = {
+            name: calls[name][0]
+            for name in ("active_user_task_counts", "task_outcomes", "task_durations_seconds")
+        }
+        self.assertEqual(len(set(windows.values())), 1, "三段数据源必须使用同一个统计窗口")
+
+    def test_delivery_outcomes_receives_an_independent_window_one_day_earlier(self) -> None:
+        duty, parts = build_duty()
+        duty.run_once()
+        calls = parts["source"].calls
+        main_window_start, _main_window_end = calls["task_outcomes"][0]
+        delivery_window_start, delivery_window_end = calls["delivery_outcomes"][0]
+
+        # 首尾相接：投递结果窗口的终点正好是其余段落窗口的起点，整整早一天。
+        self.assertEqual(delivery_window_end, main_window_start)
+        self.assertEqual(main_window_start - delivery_window_start, timedelta(days=1))
 
 
 class SectionIndependentFailureTests(unittest.TestCase):
@@ -280,6 +300,44 @@ class SendFailureTests(unittest.TestCase):
         self.assertNotIn("连续第", text)
 
 
+class SendFailureReasonClassificationTests(unittest.TestCase):
+    """`daily_report.send_failed` 审计的安全原因分类（opus 批量审查 P3 修复）：
+    只看异常类型，不看异常消息文本，供运维快速区分"我们自己的 uuid 预算算错了"
+    还是"飞书/网络那一侧的问题"。"""
+
+    def _reason(self, *, error: Exception) -> str:
+        duty, parts = build_duty(sender=FakeSender(failures=1, error=error))
+        duty.run_once()
+        records = [fields for action, fields in parts["audit"].records if action == "daily_report.send_failed"]
+        self.assertEqual(len(records), 1)
+        return records[0]["reason"]
+
+    def test_a_value_error_is_classified_as_uuid_budget(self) -> None:
+        """`delivery_uuid()` 唯一会抛的异常类型——A1 修复的那类 bug。"""
+
+        self.assertEqual(self._reason(error=ValueError("投递去重 ID 超过飞书的 50 字符上限")), "uuid_budget")
+
+    def test_a_feishu_group_message_error_is_classified_as_transport(self) -> None:
+        from lingxi.adapters.feishu_group_message import FeishuGroupMessageError
+
+        self.assertEqual(
+            self._reason(error=FeishuGroupMessageError("feishu_code_99991663")), "transport"
+        )
+
+    def test_an_unrecognized_exception_is_classified_as_other(self) -> None:
+        self.assertEqual(self._reason(error=RuntimeError("模拟发送失败")), "other")
+
+    def test_the_reason_field_never_carries_the_exception_message_text(self) -> None:
+        """分类只是一个粗粒度类别字符串，异常消息本身（可能带正文片段）不得
+        出现在审计字段里的任何一处。"""
+
+        secret_looking_message = "投递到 oc_admin_group_secret 失败：正文片段泄露样例"
+        duty, parts = build_duty(sender=FakeSender(failures=1, error=RuntimeError(secret_looking_message)))
+        duty.run_once()
+        records = [fields for action, fields in parts["audit"].records if action == "daily_report.send_failed"]
+        self.assertNotIn(secret_looking_message, repr(records))
+
+
 class ThrottleAcrossDaysTests(unittest.TestCase):
     """节流状态随成功送达按天推进；由 `apply_repeat_throttle` 的纯函数断言覆盖具体
     数值语义（`tests/test_daily_report_render.py`），这里只验证职责层真的把状态
@@ -294,7 +352,9 @@ class ThrottleAcrossDaysTests(unittest.TestCase):
             last_text = duty.run_once()
             clock.advance(1)
         assert last_text is not None
-        self.assertIn("连续第 8 天在榜，已节流", last_text)
+        # 节流行必须真的更短（opus 批量审查 P3-4 修复），不再带"在榜"与"仅计数
+        # 不再展开明细"这类装饰性文字。
+        self.assertIn("连续第 8 天，已节流", last_text)
 
     def test_a_gap_day_resets_the_streak_across_rounds(self) -> None:
         clock = FixedClock(date(2026, 8, 1))

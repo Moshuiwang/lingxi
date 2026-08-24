@@ -1,7 +1,9 @@
 """内测每日通报职责：:class:`DailyReportDuty`（Issue #303 S-O-01）。
 
-一轮做三件事：分四段独立读取昨日（UTC 自然日）统计 → 纯函数聚合与节流 → 该发就发
-一条到管理群。形状照 `apps/scheduler/roster_audit.py` 的 :class:`~lingxi.apps.
+一轮做三件事：分四段独立读取统计（三段读昨日，投递结果段独立读前天——理由见
+`core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的窗口」，
+opus 批量审查 P2 修复）→ 纯函数聚合与节流 → 该发就发一条到管理群。形状照
+`apps/scheduler/roster_audit.py` 的 :class:`~lingxi.apps.
 scheduler.roster_audit.RosterAuditDuty`（同一天至多一次的判重水位、发送失败不置位、
 同一天的重试共用一个去重键），但**多了一条 RosterAuditDuty 没有的规则**：四段数据源
 各自独立失败，只让对应的段落显式「不可判定」，不拖累其余段落，也不拖累整轮发送
@@ -19,9 +21,11 @@ scheduler.roster_audit.RosterAuditDuty`（同一天至多一次的判重水位�
 
 ## 送达失败不静默
 
-发送异常时记一条 `daily_report.send_failed` 审计（只记异常类型，不记正文——正文
-虽已经过统计级脱敏，但它是给管理群的，不是给运维日志的，同花名册日报 `V-花名册-33`
-同一条纪律）并升级为 `logger.error`；水位与节流状态都**不**提交，下一轮照常重试。
+发送异常时记一条 `daily_report.send_failed` 审计（只记异常类型与一个安全的粗粒度
+原因分类——`uuid_budget`/`transport`/`other`，见 `_classify_send_failure`，opus
+批量审查 P3 修复——不记异常消息文本、不记正文；正文虽已经过统计级脱敏，但它是给
+管理群的，不是给运维日志的，同花名册日报 `V-花名册-33` 同一条纪律）并升级为
+`logger.error`；水位与节流状态都**不**提交，下一轮照常重试。
 真正让「送达失败不静默」成立的是**调用方注入的 `on_send_outcome` 回调**（装配时
 接到 `core/alerting.py` 的 `AlertingDuty.send_outcome_callback()`，与花名册日报
 共用同一条已验证的告警接线，见 `apps/scheduler/assembly.py`）——发送失败因此既有
@@ -59,6 +63,29 @@ from lingxi.apps.scheduler.audit import AuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
+
+#: 安全的发送失败原因分类（opus 批量审查 P3 修复）。此前 `daily_report.send_failed`
+#: 只记异常**类名**（`type(error).__name__`），运维要靠类名自己猜"这是我们自己的
+#: uuid 预算算错了，还是飞书/网络那一侧的问题"——两类问题的处置完全不同（前者是
+#: 代码 bug，后者多半会自愈重试）。分类只看异常**类型**，不看异常消息文本（消息
+#: 文本可能带正文片段），因此这个分类本身不含任何敏感值。
+def _classify_send_failure(error: Exception) -> str:
+    from lingxi.adapters.feishu_group_message import FeishuGroupMessageError
+
+    if isinstance(error, ValueError):
+        # delivery_uuid() 唯一会抛的异常类型：前缀非法，或折算出的投递去重 ID
+        # 超过飞书 50 字符上限（opus 批量审查 P1 修复的那一类 bug，见
+        # adapters/feishu_group_message.py 的 DAILY_REPORT_UUID_PREFIX 登记）。
+        return "uuid_budget"
+    if isinstance(error, FeishuGroupMessageError):
+        # 令牌获取失败、飞书业务错误码、响应形状不对——都是"消息确实发出去过
+        # 请求，但没能成功"的传输/平台层问题。
+        return "transport"
+    # 没有归类成 "render"：本职责的 `render_daily_report(...)` 调用发生在这个
+    # try 块**之外**（渲染失败会直接让 run_once 整体抛出，不会走到这条
+    # send_failed 审计），因此这里不虚构一个结构上到不了的分类，宁可归入更诚实
+    # 的 other，也不假装能区分一个实际不可达的类别。
+    return "other"
 
 
 class _DailyStatsSource(Protocol):
@@ -167,6 +194,12 @@ class DailyReportDuty:
         # scheduler 首轮 tick 落在当天早晚不同时刻而让统计口径每天不一样。
         window_end = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
         window_start = window_end - timedelta(days=1)
+        # 投递结果段独立用**再早一天**的窗口（opus 批量审查 P2 修复，见
+        # `core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的
+        # 窗口」）：`[D-1, D)` 里的投递行，24 小时确认期到今天通报运行时还没
+        # 关闭，「过期」这一桶在那个窗口下结构上恒为零。
+        delivery_window_end = window_start
+        delivery_window_start = delivery_window_end - timedelta(days=1)
 
         active_counts, active_reason = self._fetch(
             "active_users",
@@ -186,7 +219,9 @@ class DailyReportDuty:
         )
         delivery_rows, delivery_reason = self._fetch(
             "delivery_outcome",
-            lambda: self._source.delivery_outcomes(window_start=window_start, window_end=window_end),
+            lambda: self._source.delivery_outcomes(
+                window_start=delivery_window_start, window_end=delivery_window_end
+            ),
         )
 
         if self._stop.is_set():
@@ -251,6 +286,8 @@ class DailyReportDuty:
             latency=latency,
             resource_usage=resource_usage,
             delivery_outcome=delivery_outcome,
+            delivery_window_start=delivery_window_start,
+            delivery_window_end=delivery_window_end,
         )
         text = render_daily_report(inputs, throttled_failure_lines=throttled_lines)
 
@@ -266,12 +303,18 @@ class DailyReportDuty:
                 chat_id=self._chat_id, text=text, dedupe_key=f"daily-report:{today.isoformat()}"
             )
         except Exception as error:  # noqa: BLE001 - 发送失败不得带走同一轮的其他职责
+            reason = _classify_send_failure(error)
             self._audit.record(
                 "daily_report.send_failed",
                 report_date=today.isoformat(),
                 error=type(error).__name__,
+                reason=reason,
             )
-            logger.error("内测每日通报发送失败，下一轮重试 error=%s", type(error).__name__)
+            logger.error(
+                "内测每日通报发送失败，下一轮重试 error=%s reason=%s",
+                type(error).__name__,
+                reason,
+            )
             return None
 
         self._audit.record(
