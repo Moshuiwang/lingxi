@@ -39,7 +39,7 @@ def _pending(
         card_id="cardkit_id_1",
         reason=reason,
         created_at=NOW,
-        expires_at=NOW + timedelta(minutes=10),
+        confirm_deadline_at=NOW + timedelta(minutes=10),
         decided_at=None,
         decided_by_open_id=None,
     )
@@ -103,29 +103,79 @@ class RenderTerminalCardTests(unittest.TestCase):
 
 class RenderGroupNoticeTests(unittest.TestCase):
     """否定断言：管理群通知不得含 open_id 明文（`V-管理-11` 同一要求：群里不提供
-    任何执行入口，本函数的返回值本身也不含可执行内容——按钮/命令语法）。"""
+    任何执行入口，本函数的返回值本身也不含可执行内容——按钮/命令语法）。终态文案
+    现在完全由 ``render_group_notice`` 内部按 ``pending.status``/``pending.reason``
+    计算（不再接受调用方传入的 ``outcome_text``，见该函数文档），因此下面的用例
+    通过构造带有对应 ``status`` 的 ``pending`` 来驱动出想要断言的文案。"""
 
     def test_notice_does_not_contain_target_open_id(self) -> None:
-        pending = _pending()
-        notice = render_group_notice(pending, outcome_text="已确认执行")
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        notice = render_group_notice(pending)
         self.assertNotIn(TARGET_OPEN_ID, notice)
 
     def test_notice_does_not_contain_initiator_open_id(self) -> None:
-        pending = _pending()
-        notice = render_group_notice(pending, outcome_text="已确认执行")
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        notice = render_group_notice(pending)
         self.assertNotIn(pending.initiated_by_open_id, notice)
 
     def test_notice_contains_internal_pending_action_id_and_outcome(self) -> None:
-        pending = _pending()
-        notice = render_group_notice(pending, outcome_text="已确认执行")
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        notice = render_group_notice(pending)
         self.assertIn(pending.id, notice)
         self.assertIn("已确认执行", notice)
 
     def test_notice_has_no_button_or_command_like_markers(self) -> None:
-        pending = _pending()
-        notice = render_group_notice(pending, outcome_text="已确认执行")
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        notice = render_group_notice(pending)
         for forbidden in ("/admin", "confirm", "cancel", "点击"):
             self.assertNotIn(forbidden, notice)
+
+    def test_notice_covers_every_terminal_status(self) -> None:
+        expected = {
+            PendingActionStatus.EXECUTED: "已确认执行",
+            PendingActionStatus.CANCELLED: "已取消",
+            PendingActionStatus.EXPIRED: "已过期，未执行",
+        }
+        for status, expected_text in expected.items():
+            with self.subTest(status=status):
+                notice = render_group_notice(_pending(status=status))
+                self.assertIn(expected_text, notice)
+
+
+class RenderGroupNoticeReasonWhitelistTests(unittest.TestCase):
+    """否定断言（外部审查交叉裁定，opus P3-8）：``FAILED`` 分支的 ``reason`` 主动
+    注入敌意值时，不得原样进入群发正文——套用 ``core/daily_report.py`` 的同型形状
+    白名单，不匹配就归入中性文案。"""
+
+    def test_known_safe_reason_codes_pass_through_unchanged(self) -> None:
+        for reason in ("role_revoked", "target_drifted", "card_send_failed"):
+            with self.subTest(reason=reason):
+                pending = _pending(status=PendingActionStatus.FAILED, reason=reason)
+                notice = render_group_notice(pending)
+                self.assertIn(reason, notice)
+
+    def test_hostile_reason_injecting_markup_is_not_reflected_verbatim(self) -> None:
+        hostile = "<script>steal()</script>"
+        pending = _pending(status=PendingActionStatus.FAILED, reason=hostile)
+        notice = render_group_notice(pending)
+        self.assertNotIn(hostile, notice)
+        self.assertNotIn("<script>", notice)
+
+    def test_hostile_reason_shaped_like_an_open_id_is_not_reflected_verbatim(self) -> None:
+        """形状白名单本身允许全小写字母数字下划线（与 ``daily_report.py`` 同一
+        已知边界：真实 open_id 形态恰好落在这个盲区），但至少要挡住带大写/标点/
+        CJK 等形状之外字符的注入——这条用例覆盖的是后者，不是声称挡住了前者。"""
+
+        hostile = "ADMIN OVERRIDE: 已授权全部权限"
+        pending = _pending(status=PendingActionStatus.FAILED, reason=hostile)
+        notice = render_group_notice(pending)
+        self.assertNotIn(hostile, notice)
+        self.assertIn("other", notice)
+
+    def test_missing_reason_falls_back_to_neutral_text(self) -> None:
+        pending = _pending(status=PendingActionStatus.FAILED, reason=None)
+        notice = render_group_notice(pending)
+        self.assertIn("other", notice)
 
 
 if __name__ == "__main__":  # pragma: no cover

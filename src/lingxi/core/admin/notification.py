@@ -26,12 +26,14 @@ SDK，可以在没有装 SDK 的环境里测试全部渲染断言。
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
     PendingAction,
+    PendingActionStatus,
     PendingActionType,
 )
 
@@ -114,7 +116,7 @@ class AdminCardTransport(Protocol):
         card: RenderedConfirmCard,
     ) -> AdminCardCreated: ...
 
-    def update(self, *, card_id: str, card: RenderedConfirmCard) -> None: ...
+    def update(self, *, card_id: str, sequence: int, card: RenderedConfirmCard) -> None: ...
 
 
 class GroupNotifier(Protocol):
@@ -164,12 +166,54 @@ def render_terminal_card(
     return RenderedConfirmCard(title=f"{action_label}用户 · 已结束", body=body, buttons=())
 
 
-def render_group_notice(pending: PendingAction, *, outcome_text: str) -> str:
+#: 群通知 ``reason`` 渲染前的形状白名单（外部审查交叉裁定，opus P3-8）。套用
+#: ``core/daily_report.py`` 的 ``_safe_reason_code`` 同一形状与同一姿态：
+#: ``pending_action.reason`` 结构上只应是 ``core/admin/pending_action.py`` 里的固定
+#: snake_case 字面量（``expired``/``role_revoked``/``target_drifted``/
+#: ``cancelled_by_admin``/``card_send_failed``），但本模块拿到的只是数据库读出来的
+#: 一个字符串，不持有任何保证它恒为这个形状的类型系统约束——这一列没有 CHECK 约束
+#: 限定取值域（迁移 ``0068``），未来任何一次改动都可能意外把姓名、邮箱、open_id 或
+#: 原始异常文本写进这一列。渲染前用这个白名单兜底，不匹配的值一律归入中性文案，
+#: 不让任何不符合预期形状的取值直接进入群发的正文。这不是"这类值现在会出现"的
+#: 证据，是"即使出现也不会泄露"的结构性保证。
+_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def _safe_reason(reason: str | None) -> str:
+    if isinstance(reason, str) and _REASON_PATTERN.fullmatch(reason):
+        return reason
+    return "other"
+
+
+def _group_outcome_text(pending: PendingAction) -> str:
+    """群通知专用的终态文案。与 ``core/admin/card_callback._outcome_text`` 同一组
+    状态分支，但 ``FAILED`` 分支的 ``reason`` 经过上面的形状白名单——群消息是多人
+    可见的广播面，风险面比只发给发起管理员本人的私聊终态卡片更大，因此单独在这里
+    收窄，不影响 ``card_callback._outcome_text`` 展示给发起人本人的原始 reason。
+    """
+
+    if pending.status is PendingActionStatus.EXECUTED:
+        return "已确认执行"
+    if pending.status is PendingActionStatus.CANCELLED:
+        return "已取消"
+    if pending.status is PendingActionStatus.EXPIRED:
+        return "已过期，未执行"
+    if pending.status is PendingActionStatus.FAILED:
+        return f"未执行（{_safe_reason(pending.reason)}）"
+    return "状态未知"  # pragma: no cover - 调用点已确保 status 非 PENDING
+
+
+def render_group_notice(pending: PendingAction) -> str:
     """管理群脱敏通知正文：不含 open_id 明文、不含姓名，只含内部标识（``pac_*``）
     与结果摘要——与 ``core/identity/roster_report.py`` 用内部 ULID 而非外部平台
     标识做定位的既有取舍一致。群里没有任何按钮、命令提示或可执行入口（`V-管理-11`
     同一要求，复用 ``FeishuGroupMessages.send_text`` 本身就结构性不支持卡片）。
+
+    终态文案由本函数内部按 :func:`_group_outcome_text` 计算（不再接受调用方传入的
+    ``outcome_text``），确保 ``FAILED`` 分支的 ``reason`` 一定会经过形状白名单——
+    交给调用方传入拼好的文案，等于把"这段文本安不安全群发"的判断权交还给一个不了解
+    群通知安全要求的调用方（外部审查交叉裁定，opus P3-8）。
     """
 
     action_label = _ACTION_LABEL[pending.action_type]
-    return f"管理操作 {pending.id}：{action_label}用户 · {outcome_text}"
+    return f"管理操作 {pending.id}：{action_label}用户 · {_group_outcome_text(pending)}"

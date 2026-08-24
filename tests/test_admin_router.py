@@ -163,7 +163,7 @@ def _prepared_pending(
         card_id=None,
         reason=None,
         created_at=now,
-        expires_at=now + timedelta(minutes=10),
+        confirm_deadline_at=now + timedelta(minutes=10),
         decided_at=None,
         decided_by_open_id=None,
     )

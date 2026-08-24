@@ -18,18 +18,24 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from postgres_schema import ensure_production_schema, reset_production_rows
 
-from lingxi.adapters.admin_registry import PostgresAdminRegistryLookup, seed_admin_registry_entry
+from lingxi.adapters.admin_registry import seed_admin_registry_entry
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_pending_action import (
+    TARGET_HAS_PENDING_ACTION_CODE,
     PendingActionAuditWriteFailed,
     PostgresPendingActionStore,
 )
-from lingxi.core.admin.pending_action import PendingActionStatus, PendingActionType
+from lingxi.core.admin.pending_action import (
+    ConfirmResultKind,
+    PendingActionStatus,
+    PendingActionType,
+)
 from lingxi.core.ids import new_id
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
@@ -62,10 +68,7 @@ class PendingActionPostgresTestCase(unittest.TestCase):
     def setUp(self) -> None:
         reset_production_rows(self._dsn)
         self.audit = _RecordingAudit()
-        self.registry_lookup = PostgresAdminRegistryLookup(self._dsn)
-        self.store = PostgresPendingActionStore(
-            self._dsn, registry=self.registry_lookup, audit=self.audit
-        )
+        self.store = PostgresPendingActionStore(self._dsn, audit=self.audit)
         seed_admin_registry_entry(self._dsn, feishu_open_id=ADMIN_OPEN_ID, label="test-admin")
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
@@ -250,9 +253,7 @@ class DuplicateAndConcurrentConfirmTests(PendingActionPostgresTestCase):
                 # 每个线程用自己的 store（各自独立的审计记录器，避免共享可变状态
                 # 本身成为竞态源；数据库层面的序列化才是本用例真正要证明的东西）。
                 thread_audit = _RecordingAudit()
-                thread_store = PostgresPendingActionStore(
-                    self._dsn, registry=self.registry_lookup, audit=thread_audit
-                )
+                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit)
                 results[index] = thread_store.confirm(
                     pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
                 )
@@ -285,7 +286,8 @@ class ExpiryRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         pending_id = self.prepare_and_deliver()
         self.execute(
-            "UPDATE pending_action SET expires_at = now() - interval '1 second' WHERE id = %s",
+            "UPDATE pending_action SET confirm_deadline_at = now() - interval '1 second'"
+            " WHERE id = %s",
             (pending_id,),
         )
 
@@ -352,9 +354,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         pending_id = self.prepare_and_deliver()
         failing_audit = _RecordingAudit(raise_error=True)
-        failing_store = PostgresPendingActionStore(
-            self._dsn, registry=self.registry_lookup, audit=failing_audit
-        )
+        failing_store = PostgresPendingActionStore(self._dsn, audit=failing_audit)
 
         with self.assertRaises(PendingActionAuditWriteFailed):
             failing_store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
@@ -374,7 +374,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         pending_id = self.prepare_and_deliver()
         failing_store = PostgresPendingActionStore(
-            self._dsn, registry=self.registry_lookup, audit=_RecordingAudit(raise_error=True)
+            self._dsn, audit=_RecordingAudit(raise_error=True)
         )
 
         with self.assertRaises(PendingActionAuditWriteFailed):
@@ -481,6 +481,249 @@ class MarkCardDeliveredAndSendFailedTests(PendingActionPostgresTestCase):
         )
         self.assertFalse(result.decision.ok)
         self.assertEqual(self.current_account_state(), "enabled")
+
+
+class NextCardSequenceRealDbTests(PendingActionPostgresTestCase):
+    """外部审查交叉裁定（opus P2-1）：CardKit 整卡级 sequence 记账，见迁移 0068
+    文件头部「为什么需要 card_sequence 记账」。"""
+
+    def test_sequence_starts_at_zero_and_increments_by_one_each_call(self) -> None:
+        self.add_target_user(account_state="enabled")
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        assert outcome.pending is not None
+        self.assertEqual(outcome.pending.card_sequence, 0, "建卡不消耗 sequence")
+
+        first = self.store.next_card_sequence(pending_action_id=outcome.pending.id)
+        second = self.store.next_card_sequence(pending_action_id=outcome.pending.id)
+        third = self.store.next_card_sequence(pending_action_id=outcome.pending.id)
+
+        self.assertEqual((first, second, third), (1, 2, 3))
+        rows = self.query(
+            "SELECT card_sequence FROM pending_action WHERE id = %s", (outcome.pending.id,)
+        )
+        self.assertEqual(rows[0][0], 3, "落库的值必须与最后一次取号一致")
+
+    def test_unknown_pending_action_id_raises_lookup_error(self) -> None:
+        with self.assertRaises(LookupError):
+            self.store.next_card_sequence(pending_action_id="pac_never_existed_seq")
+
+
+class LockThenFetchTimeRealDbTests(PendingActionPostgresTestCase):
+    """否定断言（外部审查交叉裁定，codex P1-3）：``confirm()`` 判定过期用的时钟
+    必须在拿到行锁之后才读取，不能用等锁之前的旧时间——等锁期间如果被并发事务
+    卡住，锁前的旧时间会让本该过期的操作被误判为仍然有效。"""
+
+    def test_expiry_becomes_effective_while_confirm_is_waiting_for_the_row_lock(self) -> None:
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver()
+        # 有效期设成很快过期；真实时间会在下面持锁等待期间越过这条线。
+        self.execute(
+            "UPDATE pending_action SET confirm_deadline_at = now() + interval '0.4 seconds'"
+            " WHERE id = %s",
+            (pending_id,),
+        )
+
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        holder_errors: list[BaseException] = []
+
+        def hold_the_row_lock() -> None:
+            try:
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT id FROM pending_action WHERE id = %s FOR UPDATE",
+                                (pending_id,),
+                            )
+                            cursor.fetchone()
+                            lock_acquired.set()
+                            release_lock.wait(timeout=5)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                holder_errors.append(error)
+
+        holder = threading.Thread(target=hold_the_row_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(timeout=5), "持锁线程未能及时拿到行锁")
+        # 此刻真实时间还没到 0.4 秒过期线；立刻发起 confirm()，让它卡在等同一把
+        # 行锁上——旧代码会在这里（进入 confirm() 的瞬间）就取走 now()。
+
+        confirm_results: list[object] = []
+        confirm_errors: list[BaseException] = []
+
+        def call_confirm() -> None:
+            try:
+                confirm_results.append(
+                    self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+                )
+            except BaseException as error:  # noqa: BLE001
+                confirm_errors.append(error)
+
+        confirmer = threading.Thread(target=call_confirm)
+        confirmer.start()
+        time.sleep(0.9)  # confirm() 应该正卡在等锁上；真实时间已经越过 0.4 秒过期线
+        release_lock.set()
+        holder.join(timeout=5)
+        confirmer.join(timeout=5)
+
+        self.assertEqual(holder_errors, [], f"持锁线程不应抛出未预期的异常：{holder_errors}")
+        self.assertEqual(confirm_errors, [], f"confirm 线程不应抛出未预期的异常：{confirm_errors}")
+        self.assertEqual(len(confirm_results), 1)
+        result = confirm_results[0]
+
+        self.assertFalse(result.decision.ok, "锁前的旧时间不应被用来判定过期")
+        self.assertIs(result.decision.kind, ConfirmResultKind.EXPIRE)
+        self.assertEqual(self.current_account_state(), "enabled", "过期时不得执行")
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.EXPIRED)
+
+
+class RoleCheckWithinTransactionRealDbTests(PendingActionPostgresTestCase):
+    """否定断言（外部审查交叉裁定，codex P1-4）：确认时刻的角色核对必须在同一
+    事务内、对 admin_registry 目标行加锁完成，不能走一条独立、不受锁保护的连接
+    ——那样的读法在"撤权事务已经拿到行锁但还没提交"这段窗口里，仍然会读到撤权前
+    的旧数据，让确认在事务序列化的意义上"抢跑"在一次真正更早发生的撤权前面。"""
+
+    def test_confirm_sees_a_revocation_that_committed_while_it_was_waiting_on_the_registry_lock(
+        self,
+    ) -> None:
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver()
+
+        revoke_holding = threading.Event()
+        release_revoke = threading.Event()
+        revoke_errors: list[BaseException] = []
+
+        def hold_the_revoke_open() -> None:
+            try:
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE admin_registry SET entry_status = 'revoked',"
+                                " revoked_at = now() WHERE feishu_open_id = %s",
+                                (ADMIN_OPEN_ID,),
+                            )
+                            revoke_holding.set()
+                            release_revoke.wait(timeout=5)
+            except BaseException as error:  # noqa: BLE001
+                revoke_errors.append(error)
+
+        holder = threading.Thread(target=hold_the_revoke_open)
+        holder.start()
+        self.assertTrue(revoke_holding.wait(timeout=5), "撤权持锁线程未能及时拿到行锁")
+        # 撤权事务此刻已经拿到 admin_registry 该行的排它锁，但还没提交。
+
+        confirm_results: list[object] = []
+        confirm_errors: list[BaseException] = []
+
+        def call_confirm() -> None:
+            try:
+                confirm_results.append(
+                    self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+                )
+            except BaseException as error:  # noqa: BLE001
+                confirm_errors.append(error)
+
+        confirmer = threading.Thread(target=call_confirm)
+        confirmer.start()
+        time.sleep(0.4)  # 给 confirm() 机会跑到（并卡在）角色核对这一步
+        release_revoke.set()
+        holder.join(timeout=5)
+        confirmer.join(timeout=5)
+
+        self.assertEqual(revoke_errors, [], f"撤权线程不应抛出未预期的异常：{revoke_errors}")
+        self.assertEqual(confirm_errors, [], f"confirm 线程不应抛出未预期的异常：{confirm_errors}")
+        self.assertEqual(len(confirm_results), 1)
+        result = confirm_results[0]
+
+        self.assertFalse(result.decision.ok, "撤权先提交，确认必须看到撤权后的角色状态")
+        self.assertIs(result.decision.kind, ConfirmResultKind.ROLE_REVOKED)
+        self.assertEqual(self.current_account_state(), "enabled", "角色核对失败，目标账号状态不得改变")
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.FAILED)
+        self.assertEqual(result.pending.reason, "role_revoked")
+
+
+class SameTargetInFlightExclusionRealDbTests(PendingActionPostgresTestCase):
+    """否定断言（外部审查交叉裁定，codex P1-5，ABA）：同一目标同一时刻只允许一条
+    在途待确认操作；终态后可以重新发起。"""
+
+    def test_second_prepare_for_the_same_target_while_one_is_pending_is_rejected(self) -> None:
+        self.add_target_user(account_state="enabled")
+        first = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        self.assertTrue(first.decision.ok)
+
+        second = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertFalse(second.decision.ok)
+        self.assertEqual(second.decision.code, TARGET_HAS_PENDING_ACTION_CODE)
+        self.assertIsNone(second.pending)
+        rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s", (TARGET_OPEN_ID,)
+        )
+        self.assertEqual(rows[0][0], 1, "第二次 prepare 不得插入任何行")
+
+    def test_a_different_target_is_not_affected_by_an_in_flight_action(self) -> None:
+        other_target = "ou_pending_action_target_2"
+        self.add_target_user(open_id=TARGET_OPEN_ID, account_state="enabled")
+        self.add_target_user(open_id=other_target, account_state="enabled")
+        first = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        self.assertTrue(first.decision.ok)
+
+        second = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=other_target,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertTrue(second.decision.ok)
+
+    def test_after_the_first_terminates_the_same_target_can_be_prepared_again(self) -> None:
+        """同时消除 opus 实测到的「同目标可并存多条 pending」怪象与 codex 的 ABA
+        （A 停用→resume→旧 B 卡再次停用）：终态化之后允许重新发起，不是永久锁死。"""
+
+        self.add_target_user(account_state="enabled")
+        first = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        assert first.pending is not None
+        self.store.mark_card_delivered(pending_action_id=first.pending.id, card_id="cardkit_1")
+        cancelled = self.store.cancel(
+            pending_action_id=first.pending.id, clicker_open_id=ADMIN_OPEN_ID
+        )
+        self.assertTrue(cancelled.decision.ok)
+
+        second = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertTrue(second.decision.ok, "终态之后应当允许对同一目标重新发起")
+        rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s AND status = 'pending'",
+            (TARGET_OPEN_ID,),
+        )
+        self.assertEqual(rows[0][0], 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

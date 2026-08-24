@@ -37,7 +37,7 @@ def _pending(*, status: PendingActionStatus = PendingActionStatus.EXECUTED) -> P
         card_id="cardkit_id_1",
         reason=None,
         created_at=NOW,
-        expires_at=NOW + timedelta(minutes=10),
+        confirm_deadline_at=NOW + timedelta(minutes=10),
         decided_at=NOW,
         decided_by_open_id="ou_admin",
     )
@@ -61,8 +61,10 @@ class _FakePendingActions:
     def __init__(self) -> None:
         self.confirm_calls: list[dict] = []
         self.cancel_calls: list[dict] = []
+        self.next_card_sequence_calls: list[str] = []
         self._confirm_result: _FakeOutcome | Exception | None = None
         self._cancel_result: _FakeOutcome | Exception | None = None
+        self._next_sequence = 0
 
     def set_confirm_result(self, result) -> None:
         self._confirm_result = result
@@ -88,6 +90,11 @@ class _FakePendingActions:
         assert self._cancel_result is not None
         return self._cancel_result
 
+    def next_card_sequence(self, *, pending_action_id: str) -> int:
+        self.next_card_sequence_calls.append(pending_action_id)
+        self._next_sequence += 1
+        return self._next_sequence
+
 
 class _FakeCardTransport:
     def __init__(self, *, raises: Exception | None = None) -> None:
@@ -97,8 +104,8 @@ class _FakeCardTransport:
     def create(self, **kwargs):  # pragma: no cover - 本类不测试 create
         raise NotImplementedError
 
-    def update(self, *, card_id: str, card) -> None:
-        self.update_calls.append({"card_id": card_id, "card": card})
+    def update(self, *, card_id: str, sequence: int, card) -> None:
+        self.update_calls.append({"card_id": card_id, "sequence": sequence, "card": card})
         if self._raises is not None:
             raise self._raises
 
@@ -191,6 +198,10 @@ class ConfirmExecutionTests(unittest.TestCase):
         self.assertEqual(len(cards.update_calls), 1)
         self.assertEqual(cards.update_calls[0]["card_id"], "cardkit_id_1")
         self.assertTrue(cards.update_calls[0]["card"].is_terminal)
+        # sequence 必须真的从 pending_actions 端口换来，不能是硬编码或漏传
+        # （外部审查交叉裁定，opus P2-1）。
+        self.assertEqual(pending_actions.next_card_sequence_calls, [pending.id])
+        self.assertEqual(cards.update_calls[0]["sequence"], 1)
         self.assertEqual(len(group.sent), 1)
         self.assertEqual(group.sent[0]["dedupe_key"], pending.id)
 

@@ -97,16 +97,22 @@ class PendingAction:
     card_id: str | None
     reason: str | None
     created_at: datetime
-    expires_at: datetime
+    #: 十分钟动作确认窗口——与全库保留到期语义的 ``expires_at`` 同名反义，改名
+    #: 避免混淆（见迁移 ``0068`` 文件头部「为什么是 confirm_deadline_at」，opus P2-2）。
+    confirm_deadline_at: datetime
     decided_at: datetime | None
     decided_by_open_id: str | None
+    #: CardKit 整卡级 sequence 记账，见迁移 ``0068`` 文件头部「为什么需要 card_sequence
+    #: 记账」（opus P2-1）。默认值 0 与数据库列 DEFAULT 一致；大多数调用方不需要关心
+    #: 这个字段，只有 ``core/admin/card_callback.py`` 的终态更新路径会用到。
+    card_sequence: int = 0
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
     def is_expired(self, *, now: datetime) -> bool:
-        return self.expires_at <= now
+        return self.confirm_deadline_at <= now
 
 
 @dataclass(frozen=True)

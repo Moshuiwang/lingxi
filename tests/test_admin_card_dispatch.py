@@ -27,7 +27,7 @@ def _pending() -> PendingAction:
         card_id=None,
         reason=None,
         created_at=NOW,
-        expires_at=NOW + timedelta(minutes=10),
+        confirm_deadline_at=NOW + timedelta(minutes=10),
         decided_at=None,
         decided_by_open_id=None,
     )
@@ -53,8 +53,8 @@ class _FakeTransport:
             raise self._raises
         return AdminCardCreated(card_id=self._card_id, message_id="msg_1")
 
-    def update(self, *, card_id, card):
-        self.update_calls.append({"card_id": card_id, "card": card})
+    def update(self, *, card_id, sequence, card):
+        self.update_calls.append({"card_id": card_id, "sequence": sequence, "card": card})
 
 
 class _FakeTracker:

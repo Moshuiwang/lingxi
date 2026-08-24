@@ -25,6 +25,28 @@
 ``ConfirmDecision``/``CancelDecision`` 的 ``terminal_status`` 字段非空）时才发送，
 幂等重放（``ALREADY_TERMINAL``）与未改变任何状态的拒绝（``NOT_INITIATOR``）都不
 触发第二条通知。
+
+## 已知边界（外部审查交叉裁定，不是本轮要修的缺陷）
+
+- **回调未绑定具体是哪一张卡片（``card_id``）触发的点击（opus，纵深项）**：
+  :meth:`AdminCardCallbackHandler.handle` 只核对回调事件体里飞书自己标注的
+  ``operator.open_id`` 与回传值里的 ``pending_action_id``/``decision``（见类文档），
+  不会额外核对这次 ``card.action.trigger`` 事件是不是真的来自当初为这条
+  ``pending_action`` 建的那张卡片。这条纵深只在"``operator.open_id`` 已经能被
+  伪造"这个前提下才有意义——而那个前提一旦成立，飞书回调本身的身份来源已经失守，
+  是比"少校验一个 card_id"严重得多的问题（已排查为净，不是本模块能够补救的层次）。
+  真正阻止越权确认的是 :func:`~lingxi.core.admin.pending_action.decide_confirm`
+  对 ``initiated_by_open_id`` 的核对，不依赖 ``card_id`` 是否匹配。
+- **停用有被动提示，恢复没有主动通知（评估后不做，opus P3-1）**：用户被停用后
+  下一次问数会看到既有被动文案 ``gateway.suspended``（``core/conversation/
+  pipeline.py``）；恢复后用户不会主动收到"你现在可以问数了"这类推送——本模块没有
+  任何注入端口能够主动给一个任意 ``open_id`` 发私聊消息（``confirm_cards`` 只能
+  回复触发命令那条消息，``group_notifier`` 只能发进固定配置的管理群），要做到这一点
+  需要新增一个"主动私聊用户"端口（可复用 ``adapters/feishu_user_message.py`` 的
+  出站实现，成本可控）**并且**在 ``config/content.toml`` 里新增一条面向用户的文案
+  ——后者按既有纪律（见 ``core/permission/notification.py`` 模块文档）必须由产品
+  负责人逐字批准才能进版本锁定的内容目录，不是实现代理可以单方面决定的产品措辞。
+  因此本轮只登记这条边界，不新增端口或文案。
 """
 
 from __future__ import annotations
@@ -63,7 +85,7 @@ class _Outcome(Protocol):
 
 
 class PendingActionDecider(Protocol):
-    """confirm()/cancel() 两个真正改变状态的调用面。与
+    """confirm()/cancel() 两个真正改变状态的调用面，外加 CardKit sequence 记账。与
     ``adapters.postgres_pending_action.PostgresPendingActionStore`` 结构相同，
     测试注入内存假实现。真实实现在审计写入失败时抛出
     :class:`~lingxi.core.admin.pending_action.PendingActionAuditWriteFailed`。
@@ -72,6 +94,8 @@ class PendingActionDecider(Protocol):
     def confirm(self, *, pending_action_id: str, clicker_open_id: str) -> _Outcome: ...
 
     def cancel(self, *, pending_action_id: str, clicker_open_id: str) -> _Outcome: ...
+
+    def next_card_sequence(self, *, pending_action_id: str) -> int: ...
 
 
 class AuditSink(Protocol):
@@ -175,7 +199,7 @@ class AdminCardCallbackHandler:
 
         # 群通知：只在这次点击**首次**产生了新的终态时发送，避免幂等重放刷屏。
         if outcome.decision.terminal_status is not None:
-            self._notify_group(pending, outcome_message=outcome.decision.message)
+            self._notify_group(pending)
 
         return CardCallbackOutcome(ok=outcome.decision.ok, message=outcome.decision.message)
 
@@ -186,7 +210,11 @@ class AdminCardCallbackHandler:
             pending, target_label=pending.target_open_id, outcome_text=_outcome_text(pending)
         )
         try:
-            self._confirm_cards.update(card_id=pending.card_id, card=card)
+            # 换一个本次调用专用的 sequence（外部审查交叉裁定，opus P2-1）：同一张
+            # 卡片可能因为回调重投被多次调用 update，CardKit 要求每次调用携带严格
+            # 递增的 sequence，见 adapters/feishu_admin_card.py 该方法的文档。
+            sequence = self._pending_actions.next_card_sequence(pending_action_id=pending.id)
+            self._confirm_cards.update(card_id=pending.card_id, sequence=sequence, card=card)
         except Exception as error:  # noqa: BLE001 - 卡片视觉更新失败不影响已经落库的业务结果
             self._audit.record(
                 "admin.card_callback.card_update_failed",
@@ -194,11 +222,12 @@ class AdminCardCallbackHandler:
                 error=type(error).__name__,
             )
 
-    def _notify_group(self, pending: PendingAction, *, outcome_message: str) -> None:
-        del outcome_message  # 群通知只用脱敏摘要（见 render_group_notice），不转发原文
+    def _notify_group(self, pending: PendingAction) -> None:
         if self._group_notifier is None or not self._group_chat_id:
             return
-        text = render_group_notice(pending, outcome_text=_outcome_text(pending))
+        # 群通知只用 render_group_notice 内部按形状白名单渲染出的脱敏摘要（见该
+        # 函数文档），不转发本次点击结论的原始 message 文本。
+        text = render_group_notice(pending)
         try:
             self._group_notifier.send_text(
                 chat_id=self._group_chat_id, text=text, dedupe_key=pending.id

@@ -10,7 +10,18 @@
 **本模块的真实行为未验证（证据等级 1）。** 全部 L2 断言跑在注入的假实现上；真实
 CardKit 字段与真实回调闭环属 `biai-stage` L4a 受控验收（本 Story 明确留待验收窗口，
 见 PR 描述"未验证事项"）。红线（v13 §6.4 第 7 条）：测试中一律假 transport，不真实
-发送任何飞书卡片。
+发送任何飞书卡片。批次二审查修复（外部审查交叉裁定，opus P2-1）把 ``update()`` 的
+载荷形状（``card.type``/``card.data``/``sequence``）用真实 SDK 在本机做了离线构造
+核实（不发请求），比"未经验证的推断"更进一步，但仍不构成真实网络往返的 L4a 证据。
+
+**已知边界（L4a 未验证）**：:meth:`LarkAdminCardTransport.create` 的 ``chat_id`` 参数
+在方法体内从未被使用——真正决定卡片送到哪个私聊的是 ``reply_to_message_id``（回复
+触发这条命令的那条消息），``chat_id`` 只是 Protocol 签名里携带的展示性参数（与
+``adapters/feishu_delivery.py`` 的既有取舍相同）。"卡片结构上只会出现在发起管理员
+本人与机器人的私聊里"这条安全性质，因此完全依赖"飞书的回复接口确实总是把回复投递到
+被回复消息所在的那个会话，不存在别的路由方式"这条对真实 API 行为的假设——这个假设
+尚未在真实 SDK/API 上核实，留给 `biai-stage` L4a；本模块结构上不做、也做不到额外的
+收件人核对（Protocol 层面拿不到"这条消息原本属于哪个会话"以外的信息）。
 """
 
 from __future__ import annotations
@@ -132,26 +143,37 @@ class LarkAdminCardTransport:
             )
         return AdminCardCreated(card_id=card_id, message_id=send_response.data.message_id)
 
-    def update(self, *, card_id: str, card: RenderedConfirmCard) -> None:
+    def update(self, *, card_id: str, sequence: int, card: RenderedConfirmCard) -> None:
         """把已建好的卡片整体替换为新内容（用于终态更新：去掉按钮、展示结果）。
 
-        **SDK 精确方法名未经真实验证**（证据等级 1）：``lark_oapi.api.cardkit.v1``
-        是否确实提供 ``UpdateCardRequest``/``card.update`` 这个方法名、字段是否叫
-        ``card``，依据的是与 ``CreateCardRequest``/``CreateCardRequestBody`` 同一
-        命名惯例的推断，尚未在真实 SDK 上核实——留给 `biai-stage` L4a：若方法名
-        或字段名对不上，只需要改这一个方法体，不影响 ``AdminCardTransport``
-        Protocol 或调用方（``core/admin/card_dispatch.py``、
-        ``core/admin/card_callback.py``）的任何一行。
+        **载荷形状与 sequence 已用真实 SDK（``lark-oapi==1.7.1``）本地构造核实**
+        （外部审查交叉裁定，opus P2-1；不发真实请求，见类文档红线）：
+        ``UpdateCardRequestBody.card`` 的类型是 ``Card``（一个带 ``type``/``data``
+        两个字符串字段的独立模型，``lark_oapi/api/cardkit/v1/model/card.py``），
+        不是像 ``CreateCardRequestBody.data`` 那样直接接受 JSON 字符串——此前这里
+        错误地把整份 JSON 字符串直接传给 ``.card()``，且完全没有调用
+        ``.sequence()``。CardKit 要求同一 ``card_id`` 的每次更新调用携带严格递增
+        的 ``sequence``（与 ``adapters/feishu_delivery.py`` 的 ``update()``/
+        ``close()`` 同一要求，那两处一直正确地传了 ``sequence``），调用方
+        （``core/admin/card_callback.py``）通过
+        ``PostgresPendingActionStore.next_card_sequence()`` 换取本次要用的号。
+        真实网络往返仍未验证，留给 `biai-stage` L4a。
         """
 
-        from lark_oapi.api.cardkit.v1 import UpdateCardRequest, UpdateCardRequestBody
+        from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
 
         request = (
             UpdateCardRequest.builder()
             .card_id(card_id)
             .request_body(
                 UpdateCardRequestBody.builder()
-                .card(json.dumps(_card_payload(card), ensure_ascii=False))
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(json.dumps(_card_payload(card), ensure_ascii=False))
+                    .build()
+                )
+                .sequence(sequence)
                 .build()
             )
             .build()

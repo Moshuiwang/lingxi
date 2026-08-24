@@ -37,7 +37,7 @@ def _pending(
     card_delivered: bool = True,
     target_state_snapshot: str = "enabled",
     initiated_by_open_id: str = INITIATOR,
-    expires_at: datetime = NOW + timedelta(seconds=PENDING_ACTION_TTL_SECONDS),
+    confirm_deadline_at: datetime = NOW + timedelta(seconds=PENDING_ACTION_TTL_SECONDS),
     decided_at: datetime | None = None,
     reason: str | None = None,
 ) -> PendingAction:
@@ -52,7 +52,7 @@ def _pending(
         card_id="cardkit_test_id",
         reason=reason,
         created_at=NOW - timedelta(seconds=5),
-        expires_at=expires_at,
+        confirm_deadline_at=confirm_deadline_at,
         decided_at=decided_at,
         decided_by_open_id=None,
     )
@@ -220,7 +220,7 @@ class DecideConfirmExpiryTests(unittest.TestCase):
     """否定断言：过期后确认 → 不执行，转终态 EXPIRED。"""
 
     def test_expired_pending_action_is_rejected_and_transitions_to_expired(self) -> None:
-        pending = _pending(expires_at=NOW - timedelta(seconds=1))
+        pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
         decision = decide_confirm(
             pending=pending,
             clicker_open_id=INITIATOR,
@@ -234,10 +234,10 @@ class DecideConfirmExpiryTests(unittest.TestCase):
         self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)
 
     def test_expiry_boundary_is_inclusive(self) -> None:
-        """``expires_at`` 恰好等于 ``now`` 时按已过期处理（``<=`` 而不是 ``<``）——
+        """``confirm_deadline_at`` 恰好等于 ``now`` 时按已过期处理（``<=`` 而不是 ``<``）——
         有效期是一个确定性的边界，不留出"恰好这一秒还能点"的模糊窗口。"""
 
-        pending = _pending(expires_at=NOW)
+        pending = _pending(confirm_deadline_at=NOW)
         decision = decide_confirm(
             pending=pending,
             clicker_open_id=INITIATOR,
@@ -251,7 +251,7 @@ class DecideConfirmExpiryTests(unittest.TestCase):
         """一个过期的操作即使被错误的人点击，结论也是"已过期"而不是"非本人"——
         这是刻意的核对顺序（见 ``decide_confirm`` 文档），本用例把顺序钉死。"""
 
-        pending = _pending(expires_at=NOW - timedelta(seconds=1))
+        pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
         decision = decide_confirm(
             pending=pending,
             clicker_open_id=OTHER_OPEN_ID,
@@ -437,7 +437,7 @@ class DecideCancelTests(unittest.TestCase):
         self.assertIsNone(decision.terminal_status)
 
     def test_cancel_rejects_expired_action(self) -> None:
-        pending = _pending(expires_at=NOW - timedelta(seconds=1))
+        pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
         decision = decide_cancel(pending=pending, clicker_open_id=INITIATOR, now=NOW)
         self.assertIs(decision.kind, CancelResultKind.EXPIRE)
         self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)

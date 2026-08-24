@@ -51,6 +51,15 @@ from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
 
+#: 管理群终态通知（Issue #96 S-M-02）专用去重前缀——与花名册日报
+#: （``DELIVERY_UUID_PREFIX``）、内测每日通报（``DAILY_REPORT_UUID_PREFIX``）共用
+#: 同一个 `im/v1/messages` 接口，但是另一条独立投递语义，必须使用自己的前缀（同一
+#: 纪律见 ``adapters/feishu_group_message.py`` 的 ``uuid_prefix`` 参数文档）。命名
+#: 以 ``_UUID_PREFIX`` 结尾，落在 ``tests/test_scheduler_daily_report_assembly.py``
+#: 的 AST 预算扫描范围内（外部审查交叉裁定，opus P2-3：此前是函数体内联字符串，
+#: 不受该预算测试覆盖）。取值 13 + 32 = 45 字符，在飞书 50 字符上限内。
+ADMIN_NOTICE_UUID_PREFIX = "lingxi-admin-"
+
 
 def _combined_heartbeat(
     alerting_duty: Any, liveness_role: str, *, watchdog: Callable[[], None] | None = None
@@ -358,12 +367,15 @@ def build_supervisor(
     admin_registry_lookup = PostgresAdminRegistryLookup(
         str(config.postgres_dsn), timeouts=config.postgres_timeouts
     )
-    # 待确认操作（Issue #96 S-M-02）：写路径与只读查询共用同一个登记表判定口——
-    # confirm() 在确认时刻重新读一次它（合同"确认时重新读取……当前角色"）。
+    # 待确认操作（Issue #96 S-M-02）：confirm() 在确认时刻重新读一次登记表（合同
+    # "确认时重新读取……当前角色"），但不复用 admin_registry_lookup 这个独立查询口
+    # ——那条查询走另一条连接，读到的角色不受任何行锁保护，会在"读到角色"与"提交
+    # 这次确认"之间留出一个 TOCTOU 窗口（外部审查交叉裁定，codex P1-4）。
+    # PostgresPendingActionStore 自己在 confirm() 的同一事务、同一连接上对
+    # admin_registry 取 FOR SHARE，因此不再需要在这里注入 registry。
     pending_action_store = PostgresPendingActionStore(
         str(config.postgres_dsn),
         timeouts=config.postgres_timeouts,
-        registry=admin_registry_lookup,
         audit=audit,
     )
     # 确认卡片的出站发送与回调后的终态更新共用同一个 CardKit 传输实例。
@@ -395,7 +407,7 @@ def build_supervisor(
             # 与花名册日报、内测日报各自独立的 uuid 前缀同一纪律（见
             # adapters/feishu_group_message.py 的 delivery_uuid 文档）：13 字符，
             # 在全仓已钉住的 ≤18 字符预算内。
-            uuid_prefix="lingxi-admin-",
+            uuid_prefix=ADMIN_NOTICE_UUID_PREFIX,
         )
     card_callback_handler = AdminCardCallbackHandler(
         pending_actions=pending_action_store,

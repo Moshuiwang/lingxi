@@ -26,6 +26,31 @@ from lingxi.core.admin.views import AdminEventView, AdminUserStatusView
 from lingxi.core.ids import new_id
 
 
+#: 从一行 ``SELECT feishu_open_id, label, permission_admin_granted,
+#: ops_admin_granted, super_admin_granted, entry_status FROM admin_registry ...``
+#: 构造 :class:`AdminRegistryEntry`——列的顺序与取值形状是本模块与调用方之间的唯一
+#: 契约。导出（不加下划线前缀）供 ``adapters/postgres_pending_action.py`` 复用：
+#: 那个模块的 ``confirm()`` 需要在**自己的连接、自己的事务**里对这张表加
+#: ``FOR SHARE`` 重新查一次（避免独立注入的登记表查询端口带来的 TOCTOU 窗口，外部
+#: 审查交叉裁定，codex P1-4），SQL 本身必须留在调用方以便携带那个连接特有的锁子句，
+#: 但"行怎么解析成值对象"这段逻辑不必因此复制第二份。
+def admin_registry_entry_from_row(row: tuple) -> AdminRegistryEntry:
+    found_open_id, label, permission_granted, ops_granted, super_granted, entry_status = row
+    roles: set[AdminRole] = set()
+    if permission_granted:
+        roles.add(AdminRole.PERMISSION_ADMIN)
+    if ops_granted:
+        roles.add(AdminRole.OPS_ADMIN)
+    if super_granted:
+        roles.add(AdminRole.SUPER_ADMIN)
+    return AdminRegistryEntry(
+        feishu_open_id=found_open_id,
+        label=label,
+        roles=frozenset(roles),
+        entry_status=entry_status,
+    )
+
+
 class PostgresAdminRegistryLookup:
     """``AdminRegistryLookup`` 端口的真实实现。"""
 
@@ -49,20 +74,7 @@ class PostgresAdminRegistryLookup:
             row = cursor.fetchone()
         if row is None:
             return None
-        found_open_id, label, permission_granted, ops_granted, super_granted, entry_status = row
-        roles: set[AdminRole] = set()
-        if permission_granted:
-            roles.add(AdminRole.PERMISSION_ADMIN)
-        if ops_granted:
-            roles.add(AdminRole.OPS_ADMIN)
-        if super_granted:
-            roles.add(AdminRole.SUPER_ADMIN)
-        return AdminRegistryEntry(
-            feishu_open_id=found_open_id,
-            label=label,
-            roles=frozenset(roles),
-            entry_status=entry_status,
-        )
+        return admin_registry_entry_from_row(row)
 
 
 class PostgresAdminQueries:
