@@ -13,15 +13,19 @@ Create Date: 2026-08-24
 ## 为什么"最多成功一次"的真正机制是行锁，不是条件更新的影响行数
 
 [数据库设计「六、管理与待确认操作」](../../../docs/技术设计/数据库设计.md#六管理与待确认操作)
-把机制描述成"条件更新的影响行数"，但真实实现（`adapters/postgres_pending_action.py`）
-从未发出一条 `UPDATE ... WHERE status='pending' AND ...` 形态的单条原子语句去**决定**
-是否执行——`confirm()`/`cancel()` 先 `SELECT ... FOR UPDATE` 锁定待确认操作（`confirm()`
-还额外锁定目标 `app_user` 行），在 Python 里用纯函数 (`decide_confirm`/`decide_cancel`)
-读锁定后的行内容做出决策，通过才执行 `UPDATE`。真正提供"至多成功一次"保证的是**行锁
-本身**：第二个并发事务的 `SELECT ... FOR UPDATE` 会阻塞到第一个事务提交为止，届时它读到
-的已经是第一个事务写下的终态，`decide_confirm`/`decide_cancel` 会在纯函数层面判定
-`ALREADY_TERMINAL` 并拒绝——天然收敛为"返回既有结果"而不是重复执行，不依赖任何应用层
-分布式锁或"claimed"中间状态（真库并发用例见 `tests/test_pending_action_postgres.py`）。
+本身写得准确——"不依赖单条 `UPDATE` 语句的影响行数"。**本 revision 之前的这段文件头部
+文字与该设计条目不一致**：曾经把机制描述成"条件更新的影响行数：`UPDATE ... WHERE
+status='pending' AND expires_at > now() AND initiated_by_open_id=$clicker`，配合
+`SELECT ... FOR UPDATE` 先锁行"，但真实实现（`adapters/postgres_pending_action.py`）
+从未发出一条这种形态的单条原子语句去**决定**是否执行——`confirm()`/`cancel()` 先
+`SELECT ... FOR UPDATE` 锁定待确认操作（`confirm()` 还额外锁定目标 `app_user` 行），
+在 Python 里用纯函数 (`decide_confirm`/`decide_cancel`) 读锁定后的行内容做出决策，
+通过才执行 `UPDATE`。真正提供"至多成功一次"保证的是**行锁本身**：第二个并发事务的
+`SELECT ... FOR UPDATE` 会阻塞到第一个事务提交为止，届时它读到的已经是第一个事务写下
+的终态，`decide_confirm`/`decide_cancel` 会在纯函数层面判定 `ALREADY_TERMINAL` 并
+拒绝——天然收敛为"返回既有结果"而不是重复执行，不依赖任何应用层分布式锁或"claimed"
+中间状态（真库并发用例见 `tests/test_pending_action_postgres.py`）。本节把文件头部的
+描述改回与数据库设计文档、与真实实现一致（外部审查交叉裁定，opus P3-2）。
 
 外部审查交叉裁定（opus P3-2）之前，最终的 `UPDATE pending_action SET status = ...
 WHERE id = %s` 没有带 `AND status = 'pending'` 条件——本 revision 起补上这道条件更新
