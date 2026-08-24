@@ -50,6 +50,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.sync_timeout",
     "onboarding.internal_error",
     "onboarding.stalled",
+    "onboarding.innertest_not_open",
     "onboarding.delegated_subject",
     "gateway.busy_hint",
     "gateway.suspended",

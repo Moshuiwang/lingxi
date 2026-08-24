@@ -74,6 +74,11 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
+    # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
+    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
+    # 装配前不在任何进程的模块级 import 闭包里，但必须随制品发布，理由同上一条。
+    "lingxi.core.identity.innertest_roster_gate",
     "lingxi.adapters.user_environment",
     # Epic D 闸⑥：按用户读取问数 MCP 配置的读侧适配器，配套上一条的写侧。由
     # `apps/worker/service.py` 在**模块级** import（queue 模式每个任务都要
@@ -135,6 +140,12 @@ REQUIRED_MODULES = (
     # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
     "lingxi.core.identity.roster_snapshot",
     "lingxi.adapters.postgres_roster_snapshot",
+    # 内测每日通报（Issue #303 S-O-01）：聚合与渲染在 core，四段真库读取在
+    # adapters，均由 lingxi-scheduler 在运行时按需加载（见下面 PROCESS_RUNTIME_IMPORTS
+    # 的 scheduler 闭包）——"本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡
+    # 的形状。
+    "lingxi.core.daily_report",
+    "lingxi.adapters.postgres_daily_report",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -156,6 +167,7 @@ REQUIRED_MODULES = (
     "lingxi.adapters.feishu_tenant_token",
     "lingxi.adapters.feishu_directory",
     "lingxi.adapters.delegated_credentials",
+    "lingxi.adapters.delegated_subject_lookup",
     "lingxi.adapters.oauth_bridge_client",
     "lingxi.adapters.postgres",
     "lingxi.adapters.postgres_identity",
@@ -169,14 +181,16 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.permission_refresh",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
-    # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块。全部由包的
-    # `__init__.py` 在**模块级** import 以维持既有的 `lingxi.apps.scheduler.<名字>`
-    # 重导出契约，因此与上面两条同一姿态——漏登记会直接让 scheduler 起不来。
+    # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303 新增
+    # daily_report）。全部由包的 `__init__.py` 在**模块级** import 以维持既有的
+    # `lingxi.apps.scheduler.<名字>` 重导出契约，因此与上面两条同一姿态——漏登记
+    # 会直接让 scheduler 起不来。
     "lingxi.apps.scheduler.config",
     "lingxi.apps.scheduler.audit",
     "lingxi.apps.scheduler.credential_rotation",
     "lingxi.apps.scheduler.retention",
     "lingxi.apps.scheduler.roster_audit",
+    "lingxi.apps.scheduler.daily_report",
     "lingxi.apps.scheduler.loop",
     "lingxi.apps.scheduler.assembly",
     "lingxi.apps.scheduler.alerting_assembly",
@@ -190,6 +204,20 @@ REQUIRED_MODULES = (
     # （不是常驻进程，不需要 compose 服务条目）。
     "lingxi.apps.trace",
     "lingxi.apps.trace.__main__",
+    # 管理员角色登记表的一次性种子命令（Issue #95 S-M-01）：同一姿态——scripts/
+    # 被 .dockerignore 排除，随 scheduler 镜像一起装，由运维在容器内以
+    # `docker exec` 语义手动调用，不是常驻进程。
+    "lingxi.apps.admin_bootstrap",
+    "lingxi.apps.admin_bootstrap.__main__",
+    # 管理员角色登记表判定/命令解析/路由（Issue #95 S-M-01）：纯逻辑，被
+    # admin_bootstrap（种子命令，只用 registry）与 gateway 的管理命令面
+    # （registry + commands + router）分别消费。
+    "lingxi.core.admin",
+    "lingxi.core.admin.registry",
+    "lingxi.core.admin.commands",
+    "lingxi.core.admin.router",
+    "lingxi.core.admin.views",
+    "lingxi.adapters.admin_registry",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -339,6 +367,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
             "lingxi.core.identity.onboarding_runner",
+            # 内测名单闸（Issue #302 S-N-01）：`_build_onboarding_duty` 经
+            # `AutoOnboardingRunner.build_innertest_roster_gate` 函数内 import，
+            # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
+            # 时同样函数内 import——两个调用点都不在模块级，必须显式登记。
+            "lingxi.core.identity.innertest_roster_gate",
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.user_environment",
@@ -361,14 +394,16 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # （`_build_stalled_provisioning_duty` 在函数内 import）同样必须登记。
             "lingxi.apps.scheduler.stalled_provisioning",
             "lingxi.adapters.postgres_stalled_provisioning",
-            # #237：`apps/scheduler/__init__.py` 按职责边界拆成的八个子模块，全部由
-            # 包的 `__init__.py` 在模块级 import（维持既有的 `lingxi.apps.scheduler.
-            # <名字>` 重导出契约），因此进程起来时这八个必然已经被 import 过一遍。
+            # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303
+            # 新增 daily_report），全部由包的 `__init__.py` 在模块级 import（维持
+            # 既有的 `lingxi.apps.scheduler.<名字>` 重导出契约），因此进程起来时
+            # 这九个必然已经被 import 过一遍。
             "lingxi.apps.scheduler.config",
             "lingxi.apps.scheduler.audit",
             "lingxi.apps.scheduler.credential_rotation",
             "lingxi.apps.scheduler.retention",
             "lingxi.apps.scheduler.roster_audit",
+            "lingxi.apps.scheduler.daily_report",
             "lingxi.apps.scheduler.loop",
             "lingxi.apps.scheduler.assembly",
             "lingxi.apps.scheduler.alerting_assembly",
@@ -411,10 +446,29 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 由运维在容器内以 `docker exec` 语义手动调用，不是常驻进程的一部分。
             "lingxi.apps.trace",
             "lingxi.apps.trace.__main__",
+            # 管理员角色登记表种子命令（Issue #95 S-M-01），同一姿态：随 scheduler
+            # 镜像装、由运维以 `docker exec` 语义手动调用。模块级 import 用到
+            # `lingxi.core.admin.registry.ALL_ADMIN_ROLES`；函数内延迟 import
+            # `lingxi.adapters.admin_registry`（种子写入）与 `lingxi.adapters.
+            # delegated_credentials`（后者已在本闭包内，被首次开通编排用到），
+            # 因此没有新增第三方依赖，只补 lingxi 模块本身。`core.admin.commands`/
+            # `core.admin.router` 不在这里——它们只被 gateway 的管理命令面消费，
+            # 登记在 gateway 闭包里。
+            "lingxi.apps.admin_bootstrap",
+            "lingxi.apps.admin_bootstrap.__main__",
+            "lingxi.adapters.admin_registry",
+            "lingxi.core.admin",
+            "lingxi.core.admin.registry",
+            "lingxi.core.admin.views",
             "lingxi.config",
             "lingxi.config.content",
             "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
+            # `delegated_credentials.py` 自身 import 了 `delegated_subject_lookup`
+            # 做重新导出（opus 批量审查 P1 修复），因此这条边也在这两个进程的
+            # 闭包里——两者本来就已经声明 cryptography，这条新增不改变实际
+            # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
+            "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.retention",
             "lingxi.adapters.feishu_group_message",
@@ -423,6 +477,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 花名册持久快照（#52 的 S-B-02）自 S-B-04 起有了真实调用方：
             # `build_loop` 在函数内 import 它，与上面两个 adapter 同一条理由。
             "lingxi.adapters.postgres_roster_snapshot",
+            # 内测每日通报（Issue #303 S-O-01）：`_build_daily_report_duty` 在函数内
+            # import 真库读取口，与上面两个花名册 adapter 同一条"函数内 import 证明
+            # 不了装得上"的理由。
+            "lingxi.adapters.postgres_daily_report",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
@@ -457,6 +515,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.roster_audit",
             "lingxi.core.identity.roster_report",
             "lingxi.core.identity.roster_snapshot",
+            # 内测每日通报（Issue #303 S-O-01）：`apps/scheduler/daily_report.py`
+            # 模块级 import 聚合与渲染层，与上面三个花名册 core 模块同一条"进程
+            # 起来时必然已被 import 过一遍"的理由。
+            "lingxi.core.daily_report",
             "lingxi.core.alerting",
             "lingxi.core.ids",
             # 独立审查（分支 fix/291-280-user-experience 收尾）：`adapters.
@@ -492,6 +554,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.reauthorize.__main__",
             "lingxi.adapters",
             "lingxi.adapters.delegated_credentials",
+            # `delegated_credentials.py` 自身 import 了 `delegated_subject_lookup`
+            # 做重新导出（opus 批量审查 P1 修复），因此这条边也在这两个进程的
+            # 闭包里——两者本来就已经声明 cryptography，这条新增不改变实际
+            # extras 依赖，只是让静态闭包清单如实反映新的 import 边。
+            "lingxi.adapters.delegated_subject_lookup",
             "lingxi.adapters.feishu_directory",
             "lingxi.adapters.feishu_reauthorization",
             "lingxi.adapters.oauth_bridge_client",
@@ -628,7 +695,29 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 类型），因此这条链一并登记，与 scheduler 组同一份依赖来源。
             "lingxi.adapters.feishu_group_message",
             "lingxi.adapters.feishu_directory",
+            # 管理命令面（Issue #95 S-M-01）：build_supervisor 在函数内 import
+            # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
+            # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
+            "lingxi.adapters.admin_registry",
+            # 专用主体结构性出口前置（opus P3-1）：build_supervisor 在函数内 import
+            # registered_delegated_subject_open_id，装配期读一次登记表把结果算成
+            # 一个普通字符串交给管线（见该函数内注释）。刻意登记
+            # `delegated_subject_lookup`（不是 `delegated_credentials`）：后者其余
+            # 部分依赖 cryptography（Fernet），而 gateway extras 组明确不含它
+            # （2026-08-18 裁定，见 `adapters/delegated_subject_lookup.py` 模块
+            # 文档）；这个更小的模块本身只依赖 `adapters.postgres`，不新增
+            # `core.identity.identifiers` 这条闭包。
+            "lingxi.adapters.delegated_subject_lookup",
+            # 内测名单闸的 gateway 侧前移一份（Issue #302 S-N-01 的纵深）：
+            # build_supervisor 在函数内 import is_open_id_innertest_allowed，
+            # 把 config.innertest_roster_open_ids 包成管线要的判定口。
+            "lingxi.core.identity.innertest_roster_gate",
             "lingxi.core",
+            "lingxi.core.admin",
+            "lingxi.core.admin.registry",
+            "lingxi.core.admin.commands",
+            "lingxi.core.admin.router",
+            "lingxi.core.admin.views",
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
@@ -703,6 +792,10 @@ PROCESS_SOURCE_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
         # 追溯号只读查询 CLI（Issue #280 §7.2）：同一姿态，随镜像装、独立调用，
         # 加进来才能让静态闭包真的走到它函数内的 `lingxi.adapters.postgres` 导入。
         "lingxi.apps.trace.__main__",
+        # 管理员角色登记表种子命令（Issue #95 S-M-01），同一姿态：加进来才能让
+        # 静态闭包走到 `run()` 函数内的 `lingxi.adapters.admin_registry`/
+        # `lingxi.adapters.delegated_credentials` 延迟 import。
+        "lingxi.apps.admin_bootstrap.__main__",
     ),
     "reauthorize": ("lingxi.apps.reauthorize.__main__",),
     "worker": ("lingxi.apps.worker.__main__", "lingxi.apps.healthcheck.__main__"),

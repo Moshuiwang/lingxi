@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**十个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**十一个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -29,7 +29,8 @@
    （2026-08-21 首触冒烟实测坐实）。因此本职责未装配时，``build_loop`` 会改为尝试
    装配 :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty`——只依赖
    Base 坐标与令牌供给、不比对不发送的"只写"职责；两者**互斥**注册，同一时刻至多一个
-   在触发花名册读取，因此进程总职责数仍然是十个而不是十一个。见
+   在触发花名册读取，因此花名册这一组本身仍然只占一个职责位，不因为互斥切换而变成
+   两个。见
    :func:`~lingxi.apps.scheduler.assembly._build_roster_snapshot_sync_duty` 与
    :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 的文档字符串。
 
@@ -126,6 +127,26 @@
     :class:`~lingxi.core.permission.mcp_readiness.ReadinessRecoveryTicker`，与既有的
     阻塞式/tick 式就绪确认同一份判定实现），不新造第二套"就绪"的定义。语义、放在哪、
     节奏与"要试到什么时候为止"的产品决定缺口，见该模块自己的文档字符串。
+11. **内测每日通报**（:class:`~lingxi.apps.scheduler.daily_report.DailyReportDuty`，
+    Issue #303 S-O-01）——每天（UTC 日界）跑一轮：分四段独立读取昨日的
+    ``task``/``task_delivery_event`` 统计（活跃用户与任务量分布、成功/失败/超时/停止
+    分布与失败分类 Top、Agent 执行耗时分布、投递结果分布）→ 纯函数聚合、对失败分类
+    做连续在榜天数节流 → 渲染统计级正文 → 发送管理群。**唯一前置是管理群 chat_id**
+    （**恰一条**审计，形状照职责 5），没有其它外部标识或凭据依赖——本职责只读 Lingxi
+    自己的两张表。
+
+    **token 用量与成本估算、工具调用拒绝计数**这两段在当前架构下**恒为**「不可判定」：
+    它们只存在于 worker 进程自己的结构化日志（``worker.task.terminal`` 的
+    ``resources.usage``/``audit.denied_count``），scheduler 与 worker 是独立进程、
+    不共享文件系统或日志聚合通道，没有任何代码路径能读到——不是本轮查询失败，是这条
+    数据源在这个架构下压根不存在，须由 worker 侧新增落库字段才能取得（超出本 Story
+    范围，见 :mod:`lingxi.core.daily_report` 模块文档）。其余四段各自独立读取、独立
+    失败：任一段本轮读不出来只让**那一段**显式标「不可判定」，不拖累其余段落、也不
+    拖累整轮发送（与职责 5 的"整轮读不出来就整轮重试"不同，是 #303 明确要求的行为）。
+
+    判重水位（同一天至多发一条）与节流状态都是进程内存，重启清零，与职责 5 的
+    ``_completed_on`` 同一条已知残留，见该模块自己的文档字符串。发送失败记结构化
+    审计并通过与职责 5 共用的告警接线触发运行告警，不静默。
 
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
@@ -192,6 +213,7 @@ from lingxi.apps.scheduler.credential_rotation import (
     RotationReport,
     _is_definite_failure,
 )
+from lingxi.apps.scheduler.daily_report import DailyReportDuty, _build_daily_report_duty
 from lingxi.apps.scheduler.late_readiness_recovery import (
     DEFAULT_NOTICE_DRAIN_LIMIT,
     DEFAULT_RECOVERY_INTERVAL_SECONDS,

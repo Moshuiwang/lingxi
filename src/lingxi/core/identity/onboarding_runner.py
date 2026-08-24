@@ -13,7 +13,8 @@
 ## 一次开通的固定次序
 
 ```
-身份定位（组织快照 + 在职实时回读，Epic B）
+内测名单闸（Issue #302 S-N-01，见下方「三类拒绝」新增一行）
+  → 身份定位（组织快照 + 在职实时回读，Epic B）
   → 花名册工号 / 邮箱
   → 银河唯一匹配 + 权限聚合
   → 建档（#89 写侧合同，core/identity/provisioning.py）
@@ -31,6 +32,7 @@
 
 | 类别 | 例子 | 用户看到 |
 |---|---|---|
+| **内测名单外**（Issue #302 S-N-01，在最前面拦截，早于以下三类） | `open_id` 不在内测名单（未配置/空白 → 空名单，对任何人全拒；非空且非法 → 进程启动失败，不是退化成空名单，见 `core/identity/innertest_roster_gate.py` 模块文档「默认关闭＝全拒」） | 冻结的「内测未开放」，不建档、不发布权限 |
 | **确定性业务失败** | 定位不到、多条、双键冲突、资料不完整、非在职、无受支持职能、`incomplete_identity` | 冻结的「无可用银河权限」 |
 | **专用主体** | `delegated_subject`（判定层或建档触发器） | 冻结的「专用账号不提供问数服务」 |
 | **本侧故障** | 组织资料不可用、`storage_integrity`、用户环境写不出去、发布没能完成、探针技术失败 | 冻结的 `LX-ONBOARD-001` |
@@ -229,6 +231,12 @@ KEY_INTERNAL_ERROR = "onboarding.internal_error"
 KEY_STALLED = "onboarding.stalled"
 KEY_DELEGATED_SUBJECT = "onboarding.delegated_subject"
 KEY_SUSPENDED = "gateway.suspended"
+#: 内测名单闸拒绝时的文案键（Issue #302 S-N-01）。名单外的 open_id 在身份定位、
+#: 花名册与银河匹配、建档、用户环境与权限发布**发生之前**得到这句结论——不是
+#: 「无可用银河权限」（那会误导用户去银河申请一个与本闸无关的权限），也不带
+#: 追溯号（这是确定性业务结论，不是需要管理员介入的故障，见
+#: ``lingxi.core.identity.innertest_roster_gate`` 模块文档）。
+KEY_INNERTEST_NOT_OPEN = "onboarding.innertest_not_open"
 
 #: 需要追溯号占位（``{reference}``）的文案键集合（Issue #280 §7.1）。占位名**不能**叫
 #: ``trace_id``——那会命中 ``config/content.py`` 的内容安全正则，在目录加载期就让三个
@@ -455,6 +463,7 @@ class AutoOnboardingRunner:
         ledger: DispatchLedger,
         audit: _AuditSink,
         role_function_map: Mapping[str, str],
+        innertest_roster_gate: Callable[[str], bool],
         delegated_subject: Callable[[], str | None],
         submit: Callable[[Callable[[], None]], bool],
         sleep: Callable[[float], None],
@@ -465,6 +474,12 @@ class AutoOnboardingRunner:
         publish_allowed: Callable[[], bool] | None = None,
         onboarding_failed: Callable[[str, str], None] | None = None,
     ) -> None:
+        if not callable(innertest_roster_gate):
+            # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
+            # 「名单外的人要不要被挡在整条链最前面」，缺省放行会让内测名单闸形同虚设
+            # ——而 Bot-Test 全员可见，名单外任何真实用户都会真实触达（见
+            # ``lingxi.core.identity.innertest_roster_gate`` 模块文档「默认关闭＝全拒」）。
+            raise TypeError("必须注入内测名单闸：不能有默认放行")
         if not callable(delegated_subject):
             # 每次判定现读一次登记，而不是装配时读一次存着：换主体之后旧值会让
             # 新的专用授权账号落回普通员工路径。读它也不该发生在进程启动那一刻
@@ -490,6 +505,7 @@ class AutoOnboardingRunner:
         self._ledger = ledger
         self._audit = audit
         self._role_function_map = role_function_map
+        self._innertest_roster_gate = innertest_roster_gate
         self._delegated_subject = delegated_subject
         self._submit = submit
         self._sleep = sleep
@@ -522,6 +538,28 @@ class AutoOnboardingRunner:
         #: 长时间不可用把执行器永久占满。第二次仍然送不到就记账收口，并留一条 ``failed``
         #: 后缀的响亮审计。
         self._released_for_notify: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # 装配便捷方法
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]:
+        """把已解析的内测名单集合包成 ``innertest_roster_gate`` 要的判定口。
+
+        纯粹的装配便利：把 ``core/identity/innertest_roster_gate.py`` 的纯判定函数
+        ``is_open_id_innertest_allowed`` 绑上一份具体的名单集合，返回本类构造时要的
+        ``Callable[[str], bool]``。判据、为什么匹配键是 open_id、为什么空集合＝全拒，
+        全部写在该模块自己的文档字符串里，本方法不重复。放在这里（而不是散落在
+        ``apps/scheduler/assembly.py`` 里手写一个 lambda）只是为了让装配点的那一行
+        足够短——``assembly.py`` 是本仓库棘轮登记的体量封顶文件（`scripts/ci/
+        size_ratchet_baseline.txt`），新增依赖时优先把可复用的胶水代码放在有余量的
+        地方，而不是继续往它里面堆代码。
+        """
+
+        from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
+
+        return lambda open_id: is_open_id_innertest_allowed(open_id, roster)
 
     # ------------------------------------------------------------------
     # OnboardingRunner 合同
@@ -906,6 +944,31 @@ class AutoOnboardingRunner:
         """
 
         self._stop_guard()
+        if not self._innertest_roster_gate(open_id):
+            # **内测名单闸（Issue #302 S-N-01），挡在整条链最前面。** Bot-Test
+            # 全员可见（G-发现性核查，2026-08-24 编排者 API 回读），任何名单外员工
+            # 都能真实私聊触达；因此这里必须早于组织快照读取、在职状态实时回读
+            # （会消耗全系统独占的专用授权派生令牌）与任何数据库写入——名单外用户
+            # 不建档、不发布权限、零业务状态残留，只留一条审计。
+            #
+            # **审计只带 event_id/trace_id，不带 open_id（含脱敏形式）**：与本文件
+            # 其余每一条 `self._audit.record(...)` 同一条纪律——`redact_identifier()`
+            # 的返回值按其自身文档字符串**只能进日志**，不可反查也不可比较，放进
+            # 结构化审计字段会让人误以为它能用于关联或去重（`V-花名册-34`，
+            # `tests/test_roster_audit_duty.py::RedactedIdentifierUsageTest` 拦着）。
+            # 需要还原这个人是谁时，凭 `event_id` 回读 `inbound_event.user_open_id`
+            # 即可，不需要在这里重复一份。
+            self._audit.record(
+                "onboarding.innertest_roster_rejected",
+                event_id=event_id,
+                trace_id=trace_id,
+            )
+            return _Terminal(
+                OnboardingState.NOT_AUTHORIZED,
+                KEY_INNERTEST_NOT_OPEN,
+                reason="innertest_roster_rejected",
+            )
+
         located = self._locate(open_id)
         if isinstance(located, _Terminal):
             return located

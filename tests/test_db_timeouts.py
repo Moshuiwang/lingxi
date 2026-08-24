@@ -17,6 +17,10 @@ from lingxi.adapters.postgres import (
     PostgresTimeouts,
     connect,
 )
+from lingxi.adapters.postgres_conversation import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS as GATEWAY_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    PostgresGatewayStore,
+)
 from lingxi.adapters.retention import (
     RETENTION_CLEANUP_STATEMENT_TIMEOUT_SECONDS,
     RETENTION_CLEANUP_TIMEOUTS,
@@ -116,6 +120,26 @@ class PostgresTimeoutConfigTest(unittest.TestCase):
         self.assertEqual(kwargs["connect_timeout"], 5)
         self.assertEqual(kwargs["options"], "-c statement_timeout=3s -c lock_timeout=2s")
         self.assertTrue(kwargs["autocommit"])
+
+    def test_gateway_store_forwards_its_default_connect_timeout(self) -> None:
+        """Issue #248 缺口二：``postgres_conversation`` 包自己转发的默认建连超时
+        必须真的进了 ``PostgresGatewayStore`` 默认构造出的 ``PostgresTimeouts``，
+        不能只是模块顶层一个没人核对的「兼容导出」常量。
+
+        上面 ``test_factory_always_passes_all_three_boundaries_to_psycopg`` 只证明
+        连接工厂（``adapters.postgres.connect``）拿到什么 ``timeouts`` 就转发给
+        psycopg 什么——它压根不经过 ``PostgresGatewayStore.__init__`` 的默认构造
+        路径，因此就算这个包把默认值改错（例如把
+        ``_gateway_store.DEFAULT_CONNECT_TIMEOUT_SECONDS`` 悄悄改大），那条测试
+        仍然全绿。代码框架「PostgreSQL 连接与超时」明写：5 秒上界是由 scheduler
+        150 秒停机宽限反推出来的，不是随手定的数字，悄悄放大它必须有断言变红。
+        """
+
+        self.assertEqual(GATEWAY_DEFAULT_CONNECT_TIMEOUT_SECONDS, 5)
+
+        store = PostgresGatewayStore("postgresql://test/db")
+
+        self.assertEqual(store._timeouts.connect_timeout_seconds, 5)
 
     def test_callers_cannot_replace_factory_timeout_options(self) -> None:
         with self.assertRaises(TypeError):

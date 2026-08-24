@@ -137,6 +137,22 @@ class LocalLayerMatchesCiOnARealCommitHistoryTest(unittest.TestCase):
         _commit_file(self.repo, "new-top-level/config.toml", "a = 1\n", "未知顶层目录")
         self._assert_local_layer_matches_ci(pyproject_sha)
 
+    def test_ci_data_file_exception_matches(self) -> None:
+        # Issue #298：scripts/ci/ 下登记豁免的纯数据文件改动不提级，本机分层
+        # 必须自动跟随（复用同一份 classify()，不是另写一份判定）。
+        src_sha = _commit_file(self.repo, "src/lingxi/thing.py", "x = 1\n", "源码基线")
+        _commit_file(
+            self.repo,
+            "scripts/ci/size_ratchet_baseline.txt",
+            "100\tsrc/lingxi/thing.py\n",
+            "刷新体量棘轮基线",
+        )
+        self._assert_local_layer_matches_ci(src_sha)
+        # 不只是两条路径互相一致，也确认这次改动真的没有被提级——否则「两边
+        # 一致」有可能是两边都错误地判成了 full。
+        mode = LOCAL_LAYER.classify_local(src_sha, include_worktree=False, repository=self.repo)
+        self.assertEqual(mode, "fast")
+
     def test_mixed_docs_and_source_in_one_commit_matches(self) -> None:
         initial_sha = _commit_file(self.repo, "README.md", "# 占位\n", "初始提交")
         target = self.repo / "docs" / "notes.md"

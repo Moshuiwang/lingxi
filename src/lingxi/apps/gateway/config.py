@@ -75,6 +75,19 @@ class GatewayConfig:
     # `None`（不注入，装配路径与此前逐字节一致）；合法值只有四个，非法值必须
     # 启动即失败（失败关闭），不允许一个拼错的值悄悄在生产环境里长期放行。
     card_failure_injection: str | None = None
+    # 内测名单闸的 gateway 侧前移一份（Issue #302 S-N-01 的纵深，opus 批量审查
+    # P1 修复）：与 scheduler 侧 `SchedulerConfig.innertest_roster_open_ids`
+    # 读**同一个**环境变量名 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`——刻意不套
+    # `LINGXI_GATEWAY_` 前缀，因为这不是 gateway 私有配置，是两个进程各自独立
+    # 部署但必须表达"同一份内测名单"的共享概念；两处进程分别配置同一个变量名，
+    # 值理应一致（运维纪律，代码不做跨进程一致性校验）。**默认空集合＝全拒**，
+    # 语义与 scheduler 侧逐字一致，见 `lingxi.core.identity.innertest_roster_gate`
+    # 模块文档「默认关闭＝全拒」。`field(repr=False)`（opus 批量审查 P2 修复）：
+    # 名单本身是一批飞书用户 open_id，与本文件 `_Secret` 字段同一条纪律——不进
+    # `repr(config)`，不会随手一个 `logger.info("配置 %s", config)` 就把内测
+    # 名单整份写进日志。
+    innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
+
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(f"{ENV_PREFIX}{name}")
@@ -146,6 +159,34 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _innertest_roster_open_ids(env: Mapping[str, str]) -> frozenset[str]:
+    """内测名单闸的 gateway 侧解析（Issue #302 S-N-01 的纵深，opus 批量审查 P1）。
+
+    刻意直接读 ``env.get("LINGXI_INNERTEST_ROSTER_OPEN_IDS")``——不经过 `_text()`
+    那层 ``LINGXI_GATEWAY_`` 前缀包装：这不是 gateway 私有配置，是与 scheduler
+    共享同一个变量名的名单（见 :class:`GatewayConfig` 该字段的文档）。解析规则
+    也不重新实现：整段委托给
+    :func:`lingxi.core.identity.innertest_roster_gate.parse_innertest_roster`，
+    与 ``apps/scheduler/config.py`` 的 ``SchedulerConfig.from_env`` 复用同一个
+    函数——同一套「未配置/空白→空集合＝全拒；任意条目不合法→整份拒绝」的语义，
+    不写第二份解析逻辑等着两边慢慢漂移。
+    """
+
+    from lingxi.core.identity.innertest_roster_gate import (
+        InnerTestRosterConfigError,
+        parse_innertest_roster,
+    )
+
+    try:
+        return parse_innertest_roster(env.get("LINGXI_INNERTEST_ROSTER_OPEN_IDS"))
+    except InnerTestRosterConfigError as error:
+        # 错配不是未配：与本文件其余校验错误同一条纪律，只报变量名，不回显
+        # 取到的原始条目（那是身份标识）。
+        raise GatewayConfigError(
+            f"环境变量 LINGXI_INNERTEST_ROSTER_OPEN_IDS 不合法：{error}"
+        ) from None
+
+
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
@@ -197,6 +238,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         alert_policy=alert_policy,
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
         card_failure_injection=_card_failure_injection(env),
+        innertest_roster_open_ids=_innertest_roster_open_ids(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，
