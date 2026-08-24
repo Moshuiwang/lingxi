@@ -31,6 +31,7 @@ from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
+from lingxi.apps.scheduler.daily_report import _wire_daily_report_duty
 from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty, ReadinessFollowUp
 from lingxi.apps.scheduler.permission_refresh import PermissionRefreshDuty
@@ -1387,6 +1388,7 @@ def build_loop(
         )
         if roster_snapshot_sync is not None:
             duties.append(roster_snapshot_sync)
+    _wire_daily_report_duty(duties, config, stop=stop, audit=sink, alerting_duty=alerting_duty)
     # 每日权限重算排在花名册审计（或与它互斥的快照写入）**之后**：同一轮里花名册快照先被换成今天的那一份，
     # 重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。
     # 位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
@@ -1502,9 +1504,7 @@ def build_loop(
     # 跑"的自然顺序，不构成数据依赖——它按自己的十五分钟节奏在候选查询里判到期，不是
     # 每轮都真的发探针。**总能注册**（没有可选前置会让它整体不装配），因此不需要
     # `if ... is not None` 判断。
-    duties.append(
-        _build_late_readiness_recovery_duty(config, stop=stop, audit=sink)
-    )
+    duties.append(_build_late_readiness_recovery_duty(config, stop=stop, audit=sink))
     # 开通中途停摆收口（Issue #282，`V-开通-19`）排在迟到就绪恢复**之后**：两者是同一
     # 量级的"回来看已经安静下来的开通"职责，位置只是"同一轮内先声明的职责先跑"的自然
     # 顺序，不构成数据依赖——两者的候选集合按各自的判据互补（见
