@@ -90,16 +90,83 @@ class BuilderFunctionTests(unittest.TestCase):
     def test_the_duty_uses_a_dedicated_uuid_prefix_distinct_from_the_roster_report(self) -> None:
         """`FeishuGroupMessages` 的去重前缀必须与花名册日报不同（见该适配器
         `uuid_prefix` 参数文档）——同一天两边若共用前缀且去重键恰好相同，
-        飞书服务端会把其中一条误判成另一条的重试而丢弃。"""
+        飞书服务端会把其中一条误判成另一条的重试而丢弃。
 
-        from lingxi.adapters.feishu_group_message import DAILY_REPORT_UUID_PREFIX, DELIVERY_UUID_PREFIX
+        断言必须**真调用** `delivery_uuid`，不能只比较两个前缀常量本身是否
+        相等——只比较常量捕获不到「前缀 + 32 位摘要超过飞书 50 字符上限」这
+        类问题：`DAILY_REPORT_UUID_PREFIX` 曾经取值 `"lingxi-daily-report-"`
+        （20 字符），与 `DELIVERY_UUID_PREFIX` 确实不相等、这条断言当时也是
+        绿的，但 20 + 32 = 52 已经超限，导致 `delivery_uuid` 在发送前必抛
+        `ValueError`——通报永远发不出去（opus 批量审查 P1）。
+        """
+
+        from lingxi.adapters.feishu_group_message import (
+            DAILY_REPORT_UUID_PREFIX,
+            DELIVERY_UUID_PREFIX,
+            delivery_uuid,
+        )
 
         self.assertNotEqual(DAILY_REPORT_UUID_PREFIX, DELIVERY_UUID_PREFIX)
+
+        value = delivery_uuid(FAKE_CHAT_ID, "daily-report:2026-08-24", prefix=DAILY_REPORT_UUID_PREFIX)
+        self.assertLessEqual(len(value), 50, "投递去重 ID 不得超过飞书 uuid 字段的 50 字符上限")
 
         config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
         duty = _build_daily_report_duty(config, stop=threading.Event(), audit=RecordingAudit())
         assert duty is not None
         self.assertEqual(duty._sender._uuid_prefix, DAILY_REPORT_UUID_PREFIX)  # noqa: SLF001
+
+    def test_all_declared_uuid_prefixes_fit_within_the_delivery_budget(self) -> None:
+        """预算测试：仓库里任何一个 `..._UUID_PREFIX = "..."` 前缀常量，加上
+        32 位摘要都不能超过飞书 `uuid` 字段的 50 字符上限（见 `delivery_uuid`
+        的运行期校验）。用 AST 扫描 `src/lingxi` 全部源码而不是导入后枚举
+        已知模块的 `vars()`——这样以后在任何模块新增一个前缀常量，哪怕本测试
+        文件从没导入过那个模块，也会被这条预算测试自动纳入，不依赖开发者记得
+        手工把新前缀加进某个清单（这正是本条修复要补的洞：上一条用例过去只
+        比较两个具体常量，第三个前缀完全不会被覆盖）。
+        """
+
+        import ast
+
+        from lingxi.adapters.feishu_group_message import DELIVERY_UUID_MAX_LENGTH
+
+        source_root = REPOSITORY_ROOT / "src" / "lingxi"
+        found: dict[str, str] = {}
+
+        def _record(path: pathlib.Path, name: str, value: object) -> None:
+            if name.endswith("_UUID_PREFIX") and isinstance(value, str):
+                found[f"{path.relative_to(REPOSITORY_ROOT)}::{name}"] = value
+
+        for path in sorted(source_root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            _record(path, target.id, node.value.value)
+                elif (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                    and isinstance(node.value, ast.Constant)
+                ):
+                    _record(path, node.target.id, node.value.value)
+
+        # 扫描机制本身的冒烟检查：至少要找到当前已知的三个前缀常量
+        # （DELIVERY_UUID_PREFIX / DAILY_REPORT_UUID_PREFIX / NOTICE_UUID_PREFIX），
+        # 否则说明扫描逻辑本身失效（比如源码改用了扫描不识别的写法），这条
+        # 预算测试会静默失去意义而不自知。
+        self.assertGreaterEqual(
+            len(found), 3, f"至少应发现三个已知前缀常量，实际只找到：{sorted(found)}"
+        )
+
+        for location, prefix in sorted(found.items()):
+            with self.subTest(location=location, prefix=prefix):
+                self.assertLessEqual(
+                    len(prefix) + 32,
+                    DELIVERY_UUID_MAX_LENGTH,
+                    f"{location} 的前缀 {prefix!r} 加 32 位摘要会超过飞书 uuid 的"
+                    f" {DELIVERY_UUID_MAX_LENGTH} 字符上限",
+                )
 
 
 @unittest.skipUnless(
