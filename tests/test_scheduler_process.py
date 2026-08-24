@@ -169,6 +169,20 @@ class SchedulerConfigTest(unittest.TestCase):
             with self.subTest(secret=secret[:8]):
                 self.assertNotIn(secret, repr(config))
 
+    def test_a_legal_roster_does_not_appear_in_the_config_repr(self) -> None:
+        """opus 批量审查 P2 修复：`innertest_roster_open_ids` 是一批飞书用户
+        open_id，与本文件其余凭据字段同一条纪律——不进 `repr(config)`，即使
+        名单本身合法、值不敏感到需要单独脱敏类包装，也不该随手一个
+        `logger.info("配置 %s", config)` 就把整份名单写进日志。"""
+
+        legal_member = "ou_rostermembera00000000000"
+        config = SchedulerConfig.from_env(
+            {**COMPLETE_ENV, "LINGXI_INNERTEST_ROSTER_OPEN_IDS": legal_member}
+        )
+
+        self.assertEqual(config.innertest_roster_open_ids, frozenset({legal_member}))
+        self.assertNotIn(legal_member, repr(config))
+
     def test_an_unusable_interval_is_refused_instead_of_silently_defaulted(self) -> None:
         for value in ("0", "-5", "abc"):
             with self.subTest(value=value):

@@ -283,10 +283,17 @@ def build_supervisor(
     """
 
     from lingxi.adapters.admin_registry import PostgresAdminQueries, PostgresAdminRegistryLookup
+    # 刻意从 `delegated_subject_lookup`（不是 `delegated_credentials`）导入：后者
+    # 的其它函数用到 cryptography（Fernet 密文读写），而 `pyproject.toml` 的
+    # `gateway` extras 组明确不含 cryptography——gateway 不碰 Fernet（2026-08-18
+    # 裁定，首次开通编排住在 scheduler）。两个模块名对同一个只读查询各自的取舍
+    # 见 `adapters/delegated_subject_lookup.py` 模块文档。
+    from lingxi.adapters.delegated_subject_lookup import registered_delegated_subject_open_id
     from lingxi.adapters.feishu_longconn import LarkEventTransport
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
     from lingxi.core.admin.router import AdminCommandRouter
+    from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
     audit = _LoggingAudit()
     effective_onboarding = onboarding or _RecordingOnboarding()
@@ -308,6 +315,30 @@ def build_supervisor(
         ),
         audit=audit,
     )
+    # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
+    # 普通字符串交给管线——管线自己不再持有任何查询能力，对全体消息都只是内存
+    # 比较（见 `EventPipeline.__init__` 的 `delegated_subject_open_id` 文档）。
+    # `None`（登记表还没有行，或本次读取失败）时管线这一步整体是惰性的：不是
+    # "失败关闭挡住所有消息"，而是"这一次没有额外的结构性防护"，退回到本项加入
+    # 之前的行为——数据漂移场景本身极端罕见（结构上专用主体不该有 app_user 行），
+    # 用它换取"gateway 启动不因为一次瞬时数据库故障而整体失败"更划算：真正兜底
+    # 的仍然是 `V-身份-02` 的数据库触发器，这里只是纵深的一层。
+    try:
+        delegated_subject_open_id = registered_delegated_subject_open_id(
+            str(config.postgres_dsn), timeouts=config.postgres_timeouts
+        )
+    except Exception as error:  # noqa: BLE001 - 见上方注释，读取失败按"本次无此防护"处理
+        delegated_subject_open_id = None
+        audit.record(
+            "gateway.delegated_subject_lookup_failed", error=type(error).__name__
+        )
+    # 内测名单闸的 gateway 侧前移一份（Issue #302 S-N-01 的纵深）：装配期把已解析
+    # 好的 `config.innertest_roster_open_ids` 包成判定口，不在管线里重新读环境
+    # 变量或重新解析。空集合（未配置）＝对任何人返回 False，与该模块「默认关闭
+    # ＝全拒」的既有语义一致。
+    def innertest_roster_gate(open_id: str) -> bool:
+        return is_open_id_innertest_allowed(open_id, config.innertest_roster_open_ids)
+
     # 出站 HTTP 的超时从停机预算里分配，而不是用 SDK 的 30 秒默认值——后者比预算
     # 本身还长，一次卡住的加表情或回复就能让停机超出承诺（codex 二轮 P1-C）。
     # 取四分之一：一条事件最多经历「加表情 + 一次回复」两次出站，各留一份余量。
@@ -324,6 +355,8 @@ def build_supervisor(
         audit=audit,
         onboarding=effective_onboarding,
         admin_router=admin_router,
+        innertest_roster_gate=innertest_roster_gate,
+        delegated_subject_open_id=delegated_subject_open_id,
         # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
         should_stop=should_stop,
     )

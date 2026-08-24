@@ -1,7 +1,11 @@
 """``core/admin/registry.py`` 的默认拒绝谓词（Issue #95 S-M-01）。
 
-认领断言：V-管理-22（默认拒绝：不存在的条目、非 active 条目、零角色的 active 条目
-三者一律判定为非管理员，且判定结果彼此不可区分——不给探测者可利用的信号）。
+认领断言：V-管理-22（默认拒绝：不存在的条目、非 active 条目、角色不全的 active
+条目三者一律判定为非管理员，且判定结果彼此不可区分——不给探测者可利用的信号）。
+
+授权要求**三类角色全真**（PM 2026-08-24 终裁「三类角色合并授予」修复，opus 批量
+审查 P2）：只授予部分角色的 active 条目与零角色的 active 条目现在得到同一个
+判定结果（都不是有效管理员），不再是"有一个角色就放行"。
 """
 
 from __future__ import annotations
@@ -47,11 +51,24 @@ class DefaultDenyTests(unittest.TestCase):
         entry = _entry(status=ENTRY_STATUS_ACTIVE, roles=frozenset())
         self.assertFalse(is_authorized_admin(entry))
 
-    def test_active_entry_with_any_role_is_authorized(self) -> None:
+    def test_active_entry_with_only_one_role_is_not_authorized(self) -> None:
+        """三类角色合并授予（PM 2026-08-24 终裁）：只有一个角色的 active 条目
+        不再被判定为管理员——MVP 没有"部分权限的管理员"这个概念，见迁移 0067
+        的 CHECK 与本函数文档。"""
+
         for role in AdminRole:
             with self.subTest(role=role):
                 entry = _entry(status=ENTRY_STATUS_ACTIVE, roles=frozenset({role}))
-                self.assertTrue(is_authorized_admin(entry))
+                self.assertFalse(is_authorized_admin(entry))
+
+    def test_active_entry_with_two_of_three_roles_is_not_authorized(self) -> None:
+        """穷举三种"恰好缺一个角色"的组合，逐一钉住"必须全真"而不是"至少一个"。"""
+
+        for missing in AdminRole:
+            with self.subTest(missing=missing):
+                roles = ALL_ADMIN_ROLES - {missing}
+                entry = _entry(status=ENTRY_STATUS_ACTIVE, roles=roles)
+                self.assertFalse(is_authorized_admin(entry))
 
     def test_active_entry_with_all_roles_is_authorized(self) -> None:
         entry = _entry(status=ENTRY_STATUS_ACTIVE, roles=ALL_ADMIN_ROLES)

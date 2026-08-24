@@ -151,7 +151,10 @@ class SchedulerConfig:
     # 不是"未启用"——空集合本身就是失败关闭的全部实现，不需要另一个开关字段。
     # 配了但含无法识别条目会在 `from_env` 里快速失败（错配不是未配，同本文件其余
     # 标识类变量的既有纪律），不会静默退化成一份"看起来配了、其实放行了别人"的名单。
-    innertest_roster_open_ids: frozenset[str] = frozenset()
+    # `field(repr=False)`（opus 批量审查 P2 修复）：名单本身是一批飞书用户 open_id，
+    # 与本文件其余凭据字段同一条纪律——不进 `repr(config)`，也就不会随手一个
+    # `logger.info("配置 %s", config)` 就把内测名单整份写进日志。
+    innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
     # 排完发布意图之后，等发布消费职责把它真的写出去并读回一致的上限。等不到是本侧故障
     # （`LX-ONBOARD-001`），不是 MCP 同步超时。
     onboarding_publish_wait_seconds: float = 120.0

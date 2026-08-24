@@ -40,7 +40,7 @@ import os
 import sys
 from typing import Callable, Mapping, Sequence, TextIO
 
-from lingxi.core.admin.registry import ALL_ADMIN_ROLES
+from lingxi.core.admin.registry import AdminRegistrySeedConflict
 from lingxi.core.identity.identifiers import redact_identifier
 
 logger = logging.getLogger(__name__)
@@ -101,11 +101,13 @@ def run(
         from lingxi.adapters.admin_registry import seed_admin_registry_entry  # noqa: PLC0415
 
         def seed(open_id: str) -> bool:
+            # 三类角色固定合并授予：seed_admin_registry_entry 自 opus 批量审查
+            # P2 修复起不再接受角色子集入参，这里没有 roles= 可传，也不需要——
+            # 见该函数文档。
             return seed_admin_registry_entry(
                 dsn,
                 feishu_open_id=open_id,
                 label=DELEGATED_SUBJECT_LABEL,
-                roles=ALL_ADMIN_ROLES,
             )
 
     try:
@@ -139,6 +141,22 @@ def run(
 
     try:
         inserted = seed(subject_open_id)
+    except AdminRegistrySeedConflict as error:
+        # "没插入"曾经被无条件当成"已经登记过、幂等成功"——但已存在的那一行可能
+        # 根本不是这次意图播种的内容（opus 批量审查 P2）。这里必须响亮拒绝，不能
+        # 把一次真正的不一致悄悄放过。只报字段名，不回显任何取到的值。
+        print(
+            "已存在一条 active 登记，但与本次意图播种的内容不一致（不一致的字段："
+            + "、".join(error.mismatched_fields)
+            + "），拒绝当作幂等成功。请人工核实该条登记后再决定如何处理。",
+            file=err,
+        )
+        logger.error(
+            "admin_bootstrap.seed_conflict subject=%s fields=%s",
+            redact_identifier(subject_open_id),
+            error.mismatched_fields,
+        )
+        return 1
     except Exception as error:  # noqa: BLE001 - 写入失败必须响亮报告
         print("登记写入失败，详情已记入日志。", file=err)
         logger.error(

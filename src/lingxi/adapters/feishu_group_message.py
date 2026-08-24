@@ -40,8 +40,11 @@ GROUP_CHAT_ID_PREFIX = "oc_"
 DELIVERY_UUID_PREFIX = "lingxi-roster-"
 #: 内测每日通报（Issue #303 S-O-01）专用去重前缀——与花名册日报共用同一个群、
 #: 同一个 `im/v1/messages` 接口，但是两条独立的投递语义，必须各自的前缀（见
-#: `FeishuGroupMessages.__init__` 的 `uuid_prefix` 参数文档）。
-DAILY_REPORT_UUID_PREFIX = "lingxi-daily-report-"
+#: `FeishuGroupMessages.__init__` 的 `uuid_prefix` 参数文档）。取值恒为
+#: 13 + 32 = 45，仍在飞书的 50 字符上限内（由 `delivery_uuid` 校验；原
+#: `"lingxi-daily-report-"` 为 20 + 32 = 52，超限导致每日通报发送前必抛
+#: `ValueError`、通报永远发不出，opus 批量审查 P1 修复）。
+DAILY_REPORT_UUID_PREFIX = "lingxi-daily-"
 DELIVERY_UUID_MAX_LENGTH = 50
 SendOutcomeCallback = Callable[[str, bool], None]
 

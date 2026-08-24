@@ -41,12 +41,30 @@ redact_identifier` 文档字符串明确写着「**全仓库唯一允许缩短�
 
 #303 记录旧系统的实践结论：「高权限名单加 7 天节流」。本报告把同一条纪律用在**失败
 分类 Top** 上——:func:`apply_repeat_throttle` 记录每个原因码连续出现在 Top 榜的
-天数，连续第 8 天起收起明细、只报计数与「连续第 N 天在榜」，避免同一批陈旧问题
-天天占据管理群的注意力；一旦某天该原因码跌出 Top 榜，连续计数归零，重新出现按
-新一轮计。这套状态是调用方（`DailyReportDuty`）持有的进程内字典，与
+天数，连续第 8 天起收起明细、只报计数与「连续第 N 天，已节流」，避免同一批陈旧
+问题天天占据管理群的注意力，节流行本身也必须真的比未节流的一行更简短、不是
+反而更长的纯装饰（opus 批量审查 P3-4 修复，见 `_render_failure_top`）；一旦某天
+该原因码跌出 Top 榜，连续计数归零，重新出现按新一轮计。这套状态是调用方
+（`DailyReportDuty`）持有的进程内字典，与
 `RosterAuditDuty._completed_on` 同一条已知残留：**跨重启会清零重新计数**，不持久化
 ——本 Story 授权范围不含新迁移，且连续 7 天的节流阈值本身足够宽，一次重启不会让
 用户看到明显的行为回退。
+
+## 投递结果段为什么用一个独立、更早的窗口（opus 批量审查 P2 修复）
+
+其余六段统计窗口固定是「昨天」（`[D-1, D)`，`D` 为通报当天 UTC 零点，见
+`DailyReportDuty.run_once`）。投递结果段如果沿用同一个窗口就会有一个结构性缺陷：
+`task_delivery_event.expires_at` 是「投递创建时刻 + 24 小时」，而**「昨天」这个
+窗口里的行，24 小时到期时刻恰好落在今天**（早的落在今天凌晨，晚的落在今天深夜）；
+通报在今天刚过零点后不久就跑，此刻绝大多数昨天创建的投递行，它们的 24 小时确认
+期**根本还没关闭**——「过期」这一桶因此在结构上**恒为零**，不是"窗口内确实没有
+过期投递"这个真结论，是"这个窗口问的问题现在还答不出来"。
+
+修复：投递结果段改用**再早一天**的独立窗口 `[D-2, D-1)`（比其余六段整整早一个
+自然日）。这个窗口里的投递行创建于两天前，到今天通报运行时 24 小时确认期已经
+**完全关闭**，「过期」桶因此才有可能统计到真实的非零值。正文里这一段必须单独
+标注它的窗口起止（与页首统计窗口不同），不能让读者误以为整份报告说的是同一天，
+见 `_render_delivery_outcome`。
 
 ## 时区：UTC 计窗、正文双标注
 
@@ -59,12 +77,36 @@ UTC 约定一致），但正文标题**同时**标注对应的北京时间区间
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
+
+#: 失败分类 reason_code 渲染前的形状白名单（opus 批量审查 P1 修复）。`reason_code`
+#: 结构上来自 `task.error_kind`（`GUARD_ERROR_KINDS`/`TIMEOUT_ERROR_KINDS` 这类
+#: 蛇形小写枚举值），但本模块拿到的只是调用方传入的字符串，不持有任何保证它恒为
+#: 这个形状的类型系统约束——分类逻辑未来的一次改动完全可能意外把姓名、邮箱、
+#: open_id 或原始异常文本当成了 reason_code。渲染前用这个白名单兜底，不匹配的值
+#: 一律归入 `"other"`，不让任何不符合预期形状的取值直接进入群发的日报正文。这不是
+#: "这类值现在会出现"的证据，是"即使出现也不会泄露"的结构性保证。
+#:
+#: **已知边界（不是回归）**：这是**形状**校验，不是语义校验——挡得住带有形状之外
+#: 字符的泄露（大写字母、CJK、``@``/``.``、空格……），挡不住一个恰好通篇小写字母/
+#: 数字/下划线、没有混入其他字符的伪造标识符（例如全小写形态的 open_id），因为
+#: 它与合法的蛇形小写 reason_code 在字符集层面完全无法区分。见
+#: `tests/test_daily_report_render.py` 的
+#: `test_a_bare_lowercase_open_id_shaped_value_is_not_caught_by_the_shape_whitelist`
+#: 对这条边界的诚实记录。
+_REASON_CODE_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def _safe_reason_code(reason_code: str) -> str:
+    if isinstance(reason_code, str) and _REASON_CODE_PATTERN.fullmatch(reason_code):
+        return reason_code
+    return "other"
 
 #: 与旧系统「高权限名单加 7 天节流」同一量级的节流阈值（#303 继承的设计教训）。
 #: 连续出现天数超过这个数才折叠，即第 1–7 天正常展开、第 8 天起折叠。
@@ -194,6 +236,12 @@ class DailyReportInputs:
     latency: Section[LatencyStats]
     resource_usage: Section[str]
     delivery_outcome: Section[DeliveryOutcomeStats]
+    #: 投递结果段**独立**的统计窗口（opus 批量审查 P2 修复），与上面
+    #: `window_start`/`window_end` 不是同一对值——见模块文档「投递结果段为什么用
+    #: 一个独立、更早的窗口」。即使 `delivery_outcome` 本轮不可判定，这两个字段
+    #: 依然必须给出"本来打算问哪个窗口"，供正文标注与测试钉住边界。
+    delivery_window_start: datetime
+    delivery_window_end: datetime
 
 
 # --------------------------------------------------------------------------
@@ -420,14 +468,20 @@ def _render_failure_top(
     lines = ["失败分类 Top："]
     by_code = {line.reason_code: line for line in (throttled_lines or ())}
     for entry in entries:
+        # 匹配节流记录用原始 reason_code（与 apply_repeat_throttle 记账时用的是
+        # 同一个键），渲染进正文的展示值另外过一遍形状白名单——两者故意分开。
         throttled = by_code.get(entry.reason_code)
+        safe_code = _safe_reason_code(entry.reason_code)
         if throttled is not None and throttled.throttled:
+            # 节流行必须真的更短，不是比未节流行长（opus P3-4 修复）：此前这里
+            # 还带一句"仅计数不再展开明细"——本函数里未节流的行本来就从不展开
+            # 任何明细，这句说明纯属装饰，只会让"节流"看起来比它实际做的事更
+            # 复杂。现在只保留读者真正需要的两个新增信息：连续在榜天数、已节流。
             lines.append(
-                f"- {entry.reason_code}：{entry.count} 次（连续第 {throttled.streak_days} 天在榜，"
-                "已节流，仅计数不再展开明细）"
+                f"- {safe_code}：{entry.count} 次（连续第 {throttled.streak_days} 天，已节流）"
             )
         else:
-            lines.append(f"- {entry.reason_code}：{entry.count} 次")
+            lines.append(f"- {safe_code}：{entry.count} 次")
     return lines
 
 
@@ -472,15 +526,37 @@ def _render_resource_usage(section: Section[str]) -> str:
     return f"token 用量与成本估算：{section.value}"
 
 
-def _render_delivery_outcome(section: Section[DeliveryOutcomeStats]) -> str:
+def _format_delivery_window_note(window_start: datetime, window_end: datetime) -> str:
+    """投递结果段的窗口标注，刻意不复用 `_format_window_header` 的原样输出——
+    这一段的窗口本来就与页首、以及其余全部段落不同（见模块文档「投递结果段为
+    什么用一个独立、更早的窗口」），必须让读者一眼看出"这段说的是哪一天"，不能
+    默认它跟页首那一行是同一个窗口。
+    """
+
+    utc_start = window_start.astimezone(timezone.utc)
+    utc_end = window_end.astimezone(timezone.utc)
+    beijing_start = utc_start + _BEIJING_OFFSET
+    beijing_end = utc_end + _BEIJING_OFFSET
+    return (
+        f"（本段窗口：{utc_start:%Y-%m-%d %H:%M}–{utc_end:%Y-%m-%d %H:%M}（UTC）"
+        f" ／ {beijing_start:%Y-%m-%d %H:%M}–{beijing_end:%Y-%m-%d %H:%M}（北京时间），"
+        "比上方统计窗口早一天：24 小时投递确认期必须已经完全关闭，"
+        "「过期」这一桶才有可能统计到非零值）"
+    )
+
+
+def _render_delivery_outcome(
+    section: Section[DeliveryOutcomeStats], *, window_start: datetime, window_end: datetime
+) -> str:
+    window_note = _format_delivery_window_note(window_start, window_end)
     if not section.is_determined:
         assert section.undetermined_reason is not None
-        return f"投递结果分布：{_render_undetermined(section.undetermined_reason)}"
+        return f"投递结果分布：{_render_undetermined(section.undetermined_reason)}\n{window_note}"
     stats = section.value
     assert stats is not None
     return (
         f"投递结果：成功(卡片) {stats.delivered_card}，兜底(文本) {stats.delivered_fallback_text}，"
-        f"过期 {stats.expired}，待定(24h 窗口内) {stats.pending}"
+        f"过期 {stats.expired}，待定(24h 窗口内) {stats.pending}\n{window_note}"
     )
 
 
@@ -512,6 +588,10 @@ def render_daily_report(
         "",
         _render_resource_usage(inputs.resource_usage),
         "",
-        _render_delivery_outcome(inputs.delivery_outcome),
+        _render_delivery_outcome(
+            inputs.delivery_outcome,
+            window_start=inputs.delivery_window_start,
+            window_end=inputs.delivery_window_end,
+        ),
     ]
     return "\n".join(lines)

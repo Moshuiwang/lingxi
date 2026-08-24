@@ -3,16 +3,35 @@
 唯一索引、CHECK 约束、真实读表这类断言必须在真库上验证，不用 mock（验证与门禁
 第五节）。建库走 `tests/postgres_schema.py` 的整条 alembic 链，与生产同源。
 
-认领断言：
-- V-管理-21：登记表实时判定的数据库落点——``PostgresAdminRegistryLookup`` 每次
-  都发起新查询，撤销后立即读到新结果（``test_revoking_takes_effect_on_the_very_
-  next_read``，验证与门禁 §八 第 4 点的否定断言：默认拒绝用一个原本有效、随后被
-  撤销的对象证明"不缓存"，而不是只证明"从未注册的对象被拒绝"）。
-- V-管理-22：唯一活跃身份由部分唯一索引强制，不是应用层"恰好没有并发"；
-  ``entry_status``/``revoked_at`` 一致性由 CHECK 约束强制。
-- V-管理-27：种子命令的写入路径幂等，真库并发下不产生第二条 active 记录。
-- V-管理-28：只读查询命令组对真实 ``app_user``/``inbound_event`` 的读取正确性
-  （按标识过滤、按时间窗过滤、限制条数）。
+认领断言（opus 批量审查 P3 修复：与 `docs/技术设计/验收矩阵.md` 实际行号核对，
+此前四条 V-编号与矩阵实际定义逐条错位）：
+- V-管理-21：``RealTimeLookupTests`` 里"未登记 → ``None``"（``test_unknown_open_
+  id_returns_none``）与"已登记 → 读回完整条目、三类角色全授予"
+  （``test_seeded_identity_reads_back_with_all_roles``）——登记表按
+  ``feishu_open_id`` 判定当前是否为有效管理员的数据库落点。
+- V-管理-22：``RealTimeLookupTests.test_revoking_takes_effect_on_the_very_next_
+  read``——判定实时读表、不缓存：一个此前有效的条目被撤销后，下一次判定立即读到
+  拒绝结果（验证与门禁 §八 第 4 点的否定断言：用一个原本有效、随后被撤销的对象
+  证明"不缓存"，而不是只证明"从未注册的对象被拒绝"）。
+- V-管理-23：``UniqueActiveIdentityConstraintTests``——同一飞书身份同一时刻只
+  允许一条 ``active`` 登记，由部分唯一索引强制（不是应用层"恰好没有并发"）；
+  已撤销的历史行不阻挡同一身份重新登记为 ``active``。
+- V-管理-28：``SeedIdempotencyTests`` + ``SeedConflictDetectionTests``——种子
+  命令的写入路径幂等（真库并发下不产生第二条 ``active`` 记录），且"没插入"不再
+  无条件当成幂等成功：已有不一致的 ``active`` 行（标签或角色与本次意图播种的
+  内容不一致）时响亮拒绝（opus 批量审查 P2 修复）；三类角色合并授予的部分见
+  ``test_first_seed_inserts_and_grants_all_three_roles``。
+
+以下三个测试类没有一一对应的矩阵编号，是 B1（唯一管理员 + 三类角色合并授予的
+数据库编码）与 V-管理-21/23 判定逻辑的支撑性真库实现验证，不单独认领矩阵行：
+``EntryStatusRevokedAtConsistencyCheckTests``（``entry_status``/``revoked_at``
+一致性 CHECK、``label`` 非空 CHECK）、``SingleActiveAdminConstraintTests``
+（PM 2026-08-24 终裁"唯一管理员"——全表至多一条 ``active`` 行，比
+``UniqueActiveIdentityConstraintTests`` 的"同一身份至多一条"更严）、
+``MergedRoleGrantCheckConstraintTests``（同一终裁"三类角色合并授予"——``active``
+行三类角色列必须全为 ``TRUE``）。``AdminQueriesTests`` 是 V-管理-26 判定逻辑
+（该矩阵行的正式评据是"L2 纯逻辑，含伪造查询端口"）在真实 ``app_user``/
+``inbound_event`` 上的补充实现验证，同样不是该行的正式评据来源。
 """
 
 from __future__ import annotations
@@ -29,7 +48,7 @@ from lingxi.adapters.admin_registry import (
     seed_admin_registry_entry,
 )
 from lingxi.adapters.postgres import connect
-from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRole
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflict
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -93,20 +112,67 @@ class SeedIdempotencyTests(AdminRegistryPostgresTestCase):
         count = self.query("SELECT count(*) FROM admin_registry")[0][0]
         self.assertEqual(count, 0)
 
-    def test_partial_roles_grant_only_the_selected_columns(self) -> None:
-        seed_admin_registry_entry(
-            self._dsn,
-            feishu_open_id="ou_partial",
-            label="future-admin",
-            roles=frozenset({AdminRole.OPS_ADMIN}),
+    def test_seed_no_longer_accepts_a_roles_argument(self) -> None:
+        """三类角色固定合并授予（opus 批量审查 P2 修复）：`seed_admin_registry_entry`
+        结构上不再能被调用去只授予部分角色——这条用例钉住"参数已经被移除"这个
+        事实本身，取代此前验证"传子集只授予那几列"的
+        `test_partial_roles_grant_only_the_selected_columns`（该能力已被移除）。
+        """
+
+        with self.assertRaises(TypeError):
+            seed_admin_registry_entry(  # type: ignore[call-arg]
+                self._dsn,
+                feishu_open_id="ou_partial",
+                label="future-admin",
+                roles=frozenset(),
+            )
+
+
+class SeedConflictDetectionTests(AdminRegistryPostgresTestCase):
+    """种子写入检测到已有 active 行与本次意图播种的内容不一致时必须响亮拒绝，
+    不能把"没插入"直接当成"幂等成功"（opus 批量审查 P2 修复）。"""
+
+    def test_a_matching_existing_row_is_still_a_quiet_idempotent_success(self) -> None:
+        """对照组：字段完全一致时，"没插入"确实就是幂等成功，不抛异常。"""
+
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_consistent", label="same-label")
+
+        second = seed_admin_registry_entry(
+            self._dsn, feishu_open_id="ou_consistent", label="same-label"
         )
 
-        row = self.query(
-            "SELECT permission_admin_granted, ops_admin_granted, super_admin_granted"
-            " FROM admin_registry WHERE feishu_open_id = %s",
-            ("ou_partial",),
-        )[0]
-        self.assertEqual(row, (False, True, False))
+        self.assertFalse(second)
+
+    def test_an_existing_row_with_a_different_label_raises_a_conflict(self) -> None:
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_relabeled", label="original-label")
+
+        with self.assertRaises(AdminRegistrySeedConflict) as raised:
+            seed_admin_registry_entry(
+                self._dsn, feishu_open_id="ou_relabeled", label="a-different-label"
+            )
+
+        self.assertEqual(raised.exception.mismatched_fields, ("label",))
+        # 报错信息只列字段名，不回显任何取到的值——尤其不回显 open_id 或 label。
+        self.assertNotIn("ou_relabeled", str(raised.exception))
+        self.assertNotIn("original-label", str(raised.exception))
+        self.assertNotIn("a-different-label", str(raised.exception))
+
+    def test_roles_mismatch_branch_is_unreachable_now_that_the_check_exists(self) -> None:
+        """`seed_admin_registry_entry` 的回读核验同时比对"三类角色是否全真"
+        （不只是 label），但迁移 0067 新增的 CHECK 让"active 行角色不全"在
+        数据库层面已经无法插入或改出来——这条用例是**诚实的否定证据**：证明
+        那条角色分支此刻在真库上确实打不到（被 CHECK 挡在了更早的一层），
+        不是靠一个永远不会失败的假分支充数。角色比对因此是文档化的纵深防线，
+        不是当前唯一防线——本迁移的 CHECK 才是。"""
+
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_role_drift", label="x")
+
+        with self.assertRaises(Exception):
+            self.execute(
+                "UPDATE admin_registry SET ops_admin_granted = FALSE"
+                " WHERE feishu_open_id = %s",
+                ("ou_role_drift",),
+            )
 
 
 class UniqueActiveIdentityConstraintTests(AdminRegistryPostgresTestCase):
@@ -138,6 +204,54 @@ class UniqueActiveIdentityConstraintTests(AdminRegistryPostgresTestCase):
         self.assertEqual(active_count, 1)
 
 
+class SingleActiveAdminConstraintTests(AdminRegistryPostgresTestCase):
+    """否定断言：唯一管理员（PM 2026-08-24 终裁）由 `admin_registry_
+    single_active_admin_idx` 强制——**全表**至多一条 `active` 行，不只是
+    "同一 open_id 至多一条"（那是 `UniqueActiveIdentityConstraintTests` 已经
+    覆盖的更弱约束）。"""
+
+    def test_a_second_identity_cannot_also_become_active(self) -> None:
+        """两个不同的 open_id 都尝试成为当前有效管理员：第一个成功，第二个必须
+        被数据库拒绝——即使它们的 open_id 完全不同，不会撞上按身份分区的那条
+        部分唯一索引。"""
+
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_first_admin", label="a")
+
+        with self.assertRaises(Exception):
+            self.execute(
+                "INSERT INTO admin_registry"
+                " (id, feishu_open_id, label, permission_admin_granted,"
+                "  ops_admin_granted, super_admin_granted, entry_status)"
+                " VALUES ('adm_second', 'ou_second_admin', 'b', TRUE, TRUE, TRUE, 'active')"
+            )
+
+        active_count = self.query(
+            "SELECT count(*) FROM admin_registry WHERE entry_status = 'active'"
+        )[0][0]
+        self.assertEqual(active_count, 1)
+
+    def test_revoking_the_only_active_admin_frees_the_single_active_slot(self) -> None:
+        """撤销唯一的当前有效管理员之后，另一个身份可以成为新的唯一有效管理员——
+        约束挡的是"同时有两条 active"，不是"永远只能是同一个人"。"""
+
+        seed_admin_registry_entry(self._dsn, feishu_open_id="ou_outgoing_admin", label="a")
+        self.execute(
+            "UPDATE admin_registry SET entry_status = 'revoked', revoked_at = now()"
+            " WHERE feishu_open_id = %s",
+            ("ou_outgoing_admin",),
+        )
+
+        inserted = seed_admin_registry_entry(
+            self._dsn, feishu_open_id="ou_incoming_admin", label="b"
+        )
+
+        self.assertTrue(inserted)
+        active_count = self.query(
+            "SELECT count(*) FROM admin_registry WHERE entry_status = 'active'"
+        )[0][0]
+        self.assertEqual(active_count, 1)
+
+
 class EntryStatusRevokedAtConsistencyCheckTests(AdminRegistryPostgresTestCase):
     def test_revoked_without_timestamp_is_rejected(self) -> None:
         with self.assertRaises(Exception):
@@ -160,6 +274,62 @@ class EntryStatusRevokedAtConsistencyCheckTests(AdminRegistryPostgresTestCase):
                 "INSERT INTO admin_registry (id, feishu_open_id, label)"
                 " VALUES ('adm_bad3', 'ou_bad3', '   ')"
             )
+
+
+class MergedRoleGrantCheckConstraintTests(AdminRegistryPostgresTestCase):
+    """否定断言：三类角色合并授予（PM 2026-08-24 终裁）由迁移 0067 新增的 CHECK
+    强制——任何 `entry_status = 'active'` 的行，三类角色列必须全部为 TRUE，
+    数据库层面拒绝"active 但只授予部分角色"的半授权行。"""
+
+    def test_active_row_with_all_roles_true_is_accepted(self) -> None:
+        self.execute(
+            "INSERT INTO admin_registry"
+            " (id, feishu_open_id, label, permission_admin_granted,"
+            "  ops_admin_granted, super_admin_granted, entry_status)"
+            " VALUES ('adm_ok', 'ou_ok', 'x', TRUE, TRUE, TRUE, 'active')"
+        )
+
+        count = self.query("SELECT count(*) FROM admin_registry WHERE id = 'adm_ok'")[0][0]
+        self.assertEqual(count, 1)
+
+    def test_active_row_missing_any_single_role_is_rejected(self) -> None:
+        for missing_column in (
+            "permission_admin_granted",
+            "ops_admin_granted",
+            "super_admin_granted",
+        ):
+            with self.subTest(missing_column=missing_column):
+                columns = {
+                    "permission_admin_granted": "TRUE",
+                    "ops_admin_granted": "TRUE",
+                    "super_admin_granted": "TRUE",
+                }
+                columns[missing_column] = "FALSE"
+                with self.assertRaises(Exception):
+                    self.execute(
+                        "INSERT INTO admin_registry"
+                        " (id, feishu_open_id, label, permission_admin_granted,"
+                        "  ops_admin_granted, super_admin_granted, entry_status)"
+                        f" VALUES ('adm_partial_{missing_column}', 'ou_partial_{missing_column}',"
+                        f" 'x', {columns['permission_admin_granted']},"
+                        f" {columns['ops_admin_granted']}, {columns['super_admin_granted']},"
+                        " 'active')"
+                    )
+
+    def test_revoked_row_with_no_roles_is_accepted(self) -> None:
+        """已撤销行不受这条 CHECK 约束——撤销时不强制清空角色列，历史记录
+        原样保留（迁移 0067 文件头部的既定语义）。"""
+
+        self.execute(
+            "INSERT INTO admin_registry"
+            " (id, feishu_open_id, label, entry_status, revoked_at)"
+            " VALUES ('adm_revoked_no_roles', 'ou_revoked_no_roles', 'x', 'revoked', now())"
+        )
+
+        count = self.query(
+            "SELECT count(*) FROM admin_registry WHERE id = 'adm_revoked_no_roles'"
+        )[0][0]
+        self.assertEqual(count, 1)
 
 
 class RealTimeLookupTests(AdminRegistryPostgresTestCase):

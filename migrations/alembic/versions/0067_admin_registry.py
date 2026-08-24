@@ -62,7 +62,27 @@ MVP 唯一条目（组织资料同步的专用授权主体账号）三类角色*
   `feishu_delegated_subject.subject_open_id`（Issue #137 同一识别机制），仓库源码中
   不出现任何真实标识。
 
-``downgrade()`` 真实可执行：表与索引都是本 revision 新建的，不存在需要还原的历史行。
+## 唯一管理员 + 三类角色合并授予的数据库编码（PM 2026-08-24 终裁）
+
+[决策记录](../../../docs/决策记录/2026-08-24-管理员职责集与银河外权限动作边界.md)
+「唯一管理员 = 组织资料同步的专用授权主体账号……MVP 登记表唯一条目、三类角色合并
+授予」不只是部署期的运维事实，本 revision 把它编码成结构性约束，让违反它的写入
+在数据库层面就失败，不依赖应用层每次都记得校验：
+
+- `admin_registry_single_active_admin_idx`：对常量表达式建的部分唯一索引，
+  过滤条件仍是 `entry_status = 'active'`——同一个常量意味着**全表**至多一条
+  `active` 行，不只是"同一 open_id 至多一条"（那是既有的
+  `admin_registry_active_identity_idx` 已经保证的更弱约束，本 revision 予以
+  保留：它独立表达"同一身份不得重复登记为当前有效"，即便未来唯一管理员的
+  裁定被重新评估，这一条也不该被移除）。
+- 新增 `CHECK`：任何 `entry_status = 'active'` 的行，三类角色列必须全部为
+  `TRUE`——防止未来出现"active 但只授予了部分角色"的半授权行，与"三类角色
+  合并授予"这条终裁在结构上绑定，而不是靠种子命令的调用方自觉遵守。
+
+**``downgrade()`` 是数据破坏操作，不是无害回滚**：本 revision 从未在任何环境应用
+过，此刻执行没有需要还原的历史行；但一旦部署环境跑过 `upgrade()` 并由
+`admin_bootstrap` 播种了唯一管理员那一行，`downgrade()` 会把整张表连同这行一起
+`DROP`——回滚后必须重新执行 `admin_bootstrap` 播种，不是"结构撤销、数据无损"。
 """
 
 from __future__ import annotations
@@ -108,7 +128,14 @@ CREATE TABLE admin_registry (
 
     -- revoked_at 存在当且仅当条目已撤销：防止"标了撤销却没有时间戳"或反过来
     -- "还是 active 却带着撤销时间"这两种自相矛盾的行被写入。
-    CHECK ((entry_status = 'revoked') = (revoked_at IS NOT NULL))
+    CHECK ((entry_status = 'revoked') = (revoked_at IS NOT NULL)),
+
+    -- 三类角色合并授予（PM 2026-08-24 终裁，见文件头部）：任何当前有效条目
+    -- 三类角色必须全部为真，不允许"active 但只授予了部分角色"的半授权行。
+    -- 已撤销行不受约束——撤销时不强制清空角色列，历史记录原样保留。
+    CHECK (entry_status <> 'active' OR (
+        permission_admin_granted AND ops_admin_granted AND super_admin_granted
+    ))
 );
 
 -- 判定与路由的唯一入口索引：按 open_id 找当前有效条目。默认拒绝判定
@@ -120,8 +147,19 @@ CREATE INDEX admin_registry_open_id_idx ON admin_registry (feishu_open_id);
 -- 未来"撤销旧条目、登记新条目"的形态在结构上成立。
 CREATE UNIQUE INDEX admin_registry_active_identity_idx
     ON admin_registry (feishu_open_id) WHERE entry_status = 'active';
+
+-- 唯一管理员（PM 2026-08-24 终裁，见文件头部）：对常量表达式建部分唯一索引，
+-- 过滤条件仍是 entry_status = 'active'——同一个常量值意味着**全表**至多一条
+-- active 行，比上面那条"同一 open_id 至多一条"更严。任何试图让第二个身份
+-- 同时成为当前有效管理员的写入都会在这里被数据库拒绝，不依赖应用层自觉。
+CREATE UNIQUE INDEX admin_registry_single_active_admin_idx
+    ON admin_registry ((true)) WHERE entry_status = 'active';
 """
 
+#: **数据破坏操作**：一旦部署环境跑过 upgrade() 并由 admin_bootstrap 播种了唯一
+#: 管理员那一行，这条 DROP 会把整张表连同这行一起清空——回滚后必须重新执行
+#: `python -m lingxi.apps.admin_bootstrap` 播种，不是"结构撤销、数据无损"的普通
+#: 回滚（见文件头部「唯一管理员 + 三类角色合并授予的数据库编码」一节）。
 _DOWNGRADE_SQL = r"""
 DROP TABLE IF EXISTS admin_registry;
 """
