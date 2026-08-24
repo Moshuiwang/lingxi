@@ -35,14 +35,38 @@ from test_gateway_pipeline import message
 
 
 class FakeAdminRouter:
-    """可编程的管理路由假实现：按 ``open_id`` 查表返回预设结论，记录每次调用。"""
+    """可编程的管理路由假实现：按 ``open_id`` 查表返回预设结论，记录每次调用。
+
+    ``chat_id``/``thread_id``/``message_id``（Issue #96 S-M-02 新增，均带默认值，
+    与真实 ``AdminCommandRouter.route`` 签名同步）：``pipeline.py`` 现在无条件把
+    ``InboundMessage`` 的这三个字段传给 ``route()``，本假实现必须能接住这几个
+    关键字参数，否则全文件既有用例会在本 Story 落地后因 ``TypeError`` 集体失败。
+    """
 
     def __init__(self, outcomes: dict[str, AdminRouteOutcome] | None = None) -> None:
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, object]] = []
         self._outcomes = outcomes or {}
 
-    def route(self, *, open_id: str, text: str, trace_id: str) -> AdminRouteOutcome:
-        self.calls.append({"open_id": open_id, "text": text, "trace_id": trace_id})
+    def route(
+        self,
+        *,
+        open_id: str,
+        text: str,
+        trace_id: str,
+        chat_id: str = "",
+        thread_id: str | None = None,
+        message_id: str = "",
+    ) -> AdminRouteOutcome:
+        self.calls.append(
+            {
+                "open_id": open_id,
+                "text": text,
+                "trace_id": trace_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "message_id": message_id,
+            }
+        )
         return self._outcomes.get(open_id, AdminRouteOutcome(handled=False))
 
 
@@ -175,6 +199,64 @@ class AdminRoutingPipelineTests(unittest.TestCase):
 
         self.assertEqual(router.calls, [])
         self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+
+
+class WriteCommandContextThreadingTests(unittest.TestCase):
+    """Issue #96 S-M-02：``chat_id``/``thread_id``/``message_id`` 必须原样从
+    ``InboundMessage`` 传到 ``AdminRouter.route()``——``suspend``/``resume`` 这类
+    写命令要把确认卡片回复到触发命令的那条消息上，这三个字段是唯一的信息来源。
+    """
+
+    def setUp(self) -> None:
+        self.log = CallLog()
+        self.state = FakeState()
+
+    def test_route_receives_the_triggering_messages_chat_thread_and_message_id(
+        self,
+    ) -> None:
+        router = FakeAdminRouter(
+            {"ou_admin": AdminRouteOutcome(handled=True, reply_text="已生成待确认操作")}
+        )
+        pipeline = EventPipeline(
+            store=FakeStore(self.state, self.log),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+            admin_router=router,
+        )
+
+        pipeline.handle_message(
+            message(
+                event_id="evt_suspend_1",
+                open_id="ou_admin",
+                text="/admin suspend ou_target",
+                thread_id="thread_xyz",
+            )
+        )
+
+        self.assertEqual(len(router.calls), 1)
+        call = router.calls[0]
+        self.assertEqual(call["chat_id"], "oc_1")
+        self.assertEqual(call["thread_id"], "thread_xyz")
+        self.assertEqual(call["message_id"], "om_evt_suspend_1")
+
+    def test_main_window_message_passes_thread_id_none(self) -> None:
+        router = FakeAdminRouter(
+            {"ou_admin": AdminRouteOutcome(handled=True, reply_text="ok")}
+        )
+        pipeline = EventPipeline(
+            store=FakeStore(self.state, self.log),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+            admin_router=router,
+        )
+
+        pipeline.handle_message(
+            message(event_id="evt_suspend_2", open_id="ou_admin", text="/admin suspend ou_target")
+        )
+
+        self.assertIsNone(router.calls[0]["thread_id"])
 
 
 class DelegatedSubjectStructuralExitTests(unittest.TestCase):

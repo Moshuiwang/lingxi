@@ -218,6 +218,15 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.router",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
+    # 待确认操作：管理员写动作 prepare/confirm/cancel + 确认卡片/管理群通知渲染 +
+    # 卡片回调编排（Issue #96 S-M-02）。全部只被 gateway 的管理命令面消费，与
+    # 上面 admin_bootstrap 无关——admin_bootstrap 只播种登记表，不发起写动作。
+    "lingxi.core.admin.pending_action",
+    "lingxi.core.admin.notification",
+    "lingxi.core.admin.card_dispatch",
+    "lingxi.core.admin.card_callback",
+    "lingxi.adapters.postgres_pending_action",
+    "lingxi.adapters.feishu_admin_card",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -718,6 +727,21 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.commands",
             "lingxi.core.admin.router",
             "lingxi.core.admin.views",
+            # 待确认操作全链路（Issue #96 S-M-02）：build_supervisor 在函数内
+            # import PostgresPendingActionStore、LarkAdminCardTransport、
+            # ConfirmCardDispatcher、AdminCardCallbackHandler，无条件装配（与
+            # 管理命令面本身同一姿态，不受任何 feature flag 控制）；
+            # make_event_handler 把 card_callback_handler 接进
+            # card.action.trigger 事件分流，复用的 `parse_card_action_event`/
+            # `CARD_ACTION_TRIGGER_EVENT` 来自既有的 `adapters.feishu_events`
+            # 模块级 import（第 677 行已登记，不重复登记），这里只补
+            # core.admin 的四个新模块与两个新 adapter。
+            "lingxi.core.admin.pending_action",
+            "lingxi.core.admin.notification",
+            "lingxi.core.admin.card_dispatch",
+            "lingxi.core.admin.card_callback",
+            "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.feishu_admin_card",
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",

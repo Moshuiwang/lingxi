@@ -782,6 +782,11 @@ class EventPipeline:
             open_id=message.sender_open_id,
             text=message.text,
             trace_id=message.trace_id,
+            # Issue #96 S-M-02：suspend/resume 这类写命令要把确认卡片回复到触发
+            # 这条命令的同一条私聊消息上，需要这三个字段；只读命令忽略它们。
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            message_id=message.message_id,
         )
         if not admin_outcome.handled:
             return False

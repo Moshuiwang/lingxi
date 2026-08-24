@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import unittest
 
+from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, AdminRole
 from lingxi.core.admin.router import (
     AdminCommandRouter,
@@ -80,6 +81,94 @@ class FakeQueries:
         return list(self._events)
 
 
+class _FakePrepareDecision:
+    def __init__(self, *, ok: bool, message: str = "", code: str = "") -> None:
+        self.ok = ok
+        self.message = message
+        self.code = code
+
+
+class _FakePrepareOutcome:
+    def __init__(self, *, decision: _FakePrepareDecision, pending: PendingAction | None = None) -> None:
+        self.decision = decision
+        self.pending = pending
+
+
+class FakePendingActions:
+    """``PendingActionPreparer`` 的内存假实现：只记录调用参数并回放预设结论。"""
+
+    def __init__(self, *, outcome: _FakePrepareOutcome | None = None) -> None:
+        self.prepare_calls: list[dict[str, object]] = []
+        self._outcome = outcome
+
+    def prepare(
+        self, *, action_type: PendingActionType, target_open_id: str, initiated_by_open_id: str
+    ) -> _FakePrepareOutcome:
+        self.prepare_calls.append(
+            {
+                "action_type": action_type,
+                "target_open_id": target_open_id,
+                "initiated_by_open_id": initiated_by_open_id,
+            }
+        )
+        assert self._outcome is not None
+        return self._outcome
+
+
+class _FakeCardDispatchResult:
+    def __init__(self, *, delivered: bool) -> None:
+        self.delivered = delivered
+
+
+class FakeConfirmCards:
+    """``ConfirmCardSender`` 的内存假实现。"""
+
+    def __init__(self, *, delivered: bool = True) -> None:
+        self.send_calls: list[dict[str, object]] = []
+        self._delivered = delivered
+
+    def send(
+        self,
+        *,
+        pending: PendingAction,
+        chat_id: str,
+        thread_id: str | None,
+        reply_to_message_id: str,
+    ) -> _FakeCardDispatchResult:
+        self.send_calls.append(
+            {
+                "pending": pending,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        return _FakeCardDispatchResult(delivered=self._delivered)
+
+
+def _prepared_pending(
+    *, action_type: PendingActionType = PendingActionType.SUSPEND_USER
+) -> PendingAction:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+    return PendingAction(
+        id="pac_router_test0000000000",
+        action_type=action_type,
+        target_open_id="ou_target",
+        target_state_snapshot="enabled",
+        initiated_by_open_id=ADMIN_OPEN_ID,
+        status=PendingActionStatus.PENDING,
+        card_delivered=False,
+        card_id=None,
+        reason=None,
+        created_at=now,
+        confirm_deadline_at=now + timedelta(minutes=10),
+        decided_at=None,
+        decided_by_open_id=None,
+    )
+
+
 ADMIN_OPEN_ID = "ou_delegated_subject"
 
 
@@ -93,12 +182,28 @@ def _full_admin_entry() -> AdminRegistryEntry:
 
 
 def _router(
-    *, registry: FakeRegistry | None = None, queries: FakeQueries | None = None, audit: FakeAudit | None = None
+    *,
+    registry: FakeRegistry | None = None,
+    queries: FakeQueries | None = None,
+    audit: FakeAudit | None = None,
+    pending_actions: FakePendingActions | None = None,
+    confirm_cards: FakeConfirmCards | None = None,
 ) -> tuple[AdminCommandRouter, FakeRegistry, FakeQueries, FakeAudit]:
     reg = registry or FakeRegistry({ADMIN_OPEN_ID: _full_admin_entry()})
     qry = queries or FakeQueries()
     aud = audit or FakeAudit()
-    return AdminCommandRouter(registry=reg, queries=qry, audit=aud), reg, qry, aud
+    return (
+        AdminCommandRouter(
+            registry=reg,
+            queries=qry,
+            audit=aud,
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        ),
+        reg,
+        qry,
+        aud,
+    )
 
 
 class DefaultDenyTests(unittest.TestCase):
@@ -358,6 +463,240 @@ class UnknownCommandTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertEqual(queries.user_calls, [])
         self.assertEqual(audit.actions(), ["admin.command.unknown"])
+
+
+class SuspendResumeDispatchTests(unittest.TestCase):
+    """``suspend``/``resume`` 写命令编排（Issue #96 S-M-02）：只建待确认操作 +
+    发确认卡片，不直接改变业务状态——本文件全程注入假 ``pending_actions``/
+    ``confirm_cards``，真正的状态变更断言在 ``tests/test_pending_action.py``
+    （纯逻辑）与 ``tests/test_pending_action_postgres.py``（真库事务）。
+    """
+
+    def test_unregistered_sender_gets_default_deny_same_as_read_only_commands(self) -> None:
+        """否定断言（S-M-02 完成标准之一）：普通用户/未登记者发 suspend/resume
+        默认拒绝，沿用 S-M-01 既有的登记表判定——不因为是写命令就走一条不同的
+        身份判定路径。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, registry, _, audit = _router(
+            registry=FakeRegistry({}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id="ou_never_registered",
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_not_wired_replies_unavailable_without_crashing(self) -> None:
+        router, _, _, audit = _router()  # pending_actions/confirm_cards 均未传入
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("不可用", outcome.reply_text)
+
+    def test_missing_message_id_is_rejected_before_touching_pending_actions(self) -> None:
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="",  # 没有可回复的消息
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("无法发送确认卡片", outcome.reply_text)
+        self.assertEqual(pending_actions.prepare_calls, [])
+
+    def test_partial_role_entry_is_rejected_before_reaching_write_dispatch_at_all(self) -> None:
+        """一个只持有部分角色的条目（MVP 结构上不该出现，但核对逻辑不能依赖这个
+        假设）在 ``route()`` 顶层的 ``is_authorized_admin`` 就已经被拒绝——`
+        suspend`/`resume` 与 `help`/`user`/`audit` 共用同一个身份判定入口，不存在
+        绕开顶层判定单独进入写命令分支的路径。"""
+
+        partial_entry = AdminRegistryEntry(
+            feishu_open_id=ADMIN_OPEN_ID,
+            label="future-admin",
+            roles=frozenset({AdminRole.OPS_ADMIN, AdminRole.SUPER_ADMIN}),
+            entry_status="active",
+        )
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            registry=FakeRegistry({ADMIN_OPEN_ID: partial_entry}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_prepare_rejection_is_reported_without_sending_a_card(self) -> None:
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(
+                decision=_FakePrepareDecision(
+                    ok=False, code="not_found", message="未找到该用户记录。"
+                )
+            )
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_missing",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.reply_text, "未找到该用户记录。")
+        self.assertEqual(confirm_cards.send_calls, [])
+        self.assertEqual(pending_actions.prepare_calls[0]["target_open_id"], "ou_missing")
+        self.assertEqual(
+            pending_actions.prepare_calls[0]["action_type"], PendingActionType.SUSPEND_USER
+        )
+        self.assertEqual(
+            pending_actions.prepare_calls[0]["initiated_by_open_id"], ADMIN_OPEN_ID
+        )
+
+    def test_card_send_failure_is_reported_and_operation_does_not_proceed(self) -> None:
+        pending = _prepared_pending()
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(
+                decision=_FakePrepareDecision(ok=True), pending=pending
+            )
+        )
+        confirm_cards = FakeConfirmCards(delivered=False)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("发送失败", outcome.reply_text)
+        self.assertEqual(len(confirm_cards.send_calls), 1)
+
+    def test_successful_suspend_dispatch_creates_exactly_one_pending_action_and_one_card(
+        self,
+    ) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.SUSPEND_USER)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(
+                decision=_FakePrepareDecision(ok=True), pending=pending
+            )
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin suspend ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id="thread_1",
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("待确认", outcome.reply_text)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        self.assertEqual(len(confirm_cards.send_calls), 1)
+        send_call = confirm_cards.send_calls[0]
+        self.assertIs(send_call["pending"], pending)
+        self.assertEqual(send_call["chat_id"], "oc_1")
+        self.assertEqual(send_call["thread_id"], "thread_1")
+        self.assertEqual(send_call["reply_to_message_id"], "om_1")
+        self.assertEqual(audit.actions(), ["admin.command.suspend_user"])
+        self.assertEqual(audit.records[0][1]["pending_action_id"], pending.id)
+
+    def test_successful_resume_dispatch(self) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.RESUME_USER)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin resume ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(
+            pending_actions.prepare_calls[0]["action_type"], PendingActionType.RESUME_USER
+        )
+        self.assertEqual(audit.actions(), ["admin.command.resume_user"])
+
+    def test_help_text_now_mentions_suspend_and_resume(self) -> None:
+        router, _, _, _ = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertIn("suspend", outcome.reply_text)
+        self.assertIn("resume", outcome.reply_text)
 
 
 if __name__ == "__main__":  # pragma: no cover
