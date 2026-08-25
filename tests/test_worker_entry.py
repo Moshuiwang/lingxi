@@ -2173,5 +2173,70 @@ class SystemPromptFileConfigTests(unittest.TestCase):
         self.assertEqual(sdk.options[0].system_prompt, "受控验证提示词：只答结论。")
 
 
+class ContentCaptureEndToEndWiringTest(unittest.TestCase):
+    """内测轮内容级采集的完整装配路径（Issue #251/#304 批次 3）：真实
+    ``ToolGateway``/``TurnStreamRecorder``/``RawTurnCapture`` 三者是否真的被
+    接在了一起——与本文件其余用例同一姿态，假 SDK 只证明"本侧装配是通的"，
+    证明不了真实 SDK 会触发这些事件（那是 L4a 的职责）。``tests/test_
+    innertest_content_capture.py`` 已经用手工构造的 ``TurnAudit``/事件覆盖了
+    ``RawTurnCapture`` 自身的合并逻辑，这里只补"经真实 ``WorkerTurnExecutor.
+    run_turn()`` 装配路径接线是否正确"这一层，不重复断言细节。
+    """
+
+    def _run_turn_with_capture(self, script, *, capture: bool):
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK(script).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, capture_raw_content=capture)
+        report = asyncio.run(executor.run_turn(config.question))
+        return report, executor, config
+
+    def test_a_real_turn_produces_a_capture_record_matching_the_real_tool_call_and_answer(self) -> None:
+        report, executor, config = self._run_turn_with_capture(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "text", "text": "近 7 天日活是 1024。"},
+            ],
+            capture=True,
+        )
+
+        record = executor.build_content_capture_record(
+            task_id="tsk-e2e", worker_id="worker-e2e", question=config.question
+        )
+
+        self.assertTrue(report["turn"]["closed"])
+        self.assertIsNotNone(record)
+        self.assertEqual(record.question_content, config.question)
+        self.assertEqual(record.answer_content, "近 7 天日活是 1024。")
+        self.assertEqual(len(record.tool_calls), 1)
+        call = record.tool_calls[0]
+        self.assertEqual(call.tool_name, READ_ONLY_TOOL)
+        # 真实装配路径下同样拿到未经字段白名单裁剪的原始参数——不是
+        # report["audit"]["calls"] 里那份已经被 AuditRedactor 处理过的投影。
+        self.assertEqual(call.tool_input, {"metric": "dau"})
+        self.assertEqual(call.result_summary["result_kind"], "ok")
+        self.assertIn("1024", call.result_summary["content"])
+
+    def test_capture_disabled_by_default_produces_no_record_even_with_a_real_tool_call(self) -> None:
+        """``capture_raw_content`` 不传即 False——默认关闭在真实装配路径下同样
+        成立，不只是 core 层单测里的孤立断言。"""
+
+        _report, executor, config = self._run_turn_with_capture(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "text", "text": "近 7 天日活是 1024。"},
+            ],
+            capture=False,
+        )
+
+        record = executor.build_content_capture_record(
+            task_id="tsk-e2e", worker_id="worker-e2e", question=config.question
+        )
+
+        self.assertIsNone(record)
+
+
 if __name__ == "__main__":
     unittest.main()

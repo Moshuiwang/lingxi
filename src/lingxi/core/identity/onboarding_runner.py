@@ -191,10 +191,17 @@ from lingxi.core.identity.provisioning import (
     ProvisioningRequest,
     UserProvisioningStatus,
 )
+from lingxi.core.identity.stock_token_source import (
+    ADOPTABLE,
+    DECRYPT_FAILED,
+    StockTokenLookup,
+    StockTokenSource,
+)
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish_row import (
+    STATUS_APPROVED,
     aggregate_permission,
     build_publish_row,
     parse_permissions,
@@ -353,6 +360,12 @@ class TokenIssuer(Protocol):
 
     def issue_token(self, user_id: str) -> Any: ...
 
+    def adopt_token(self, user_id: str, secret: str) -> Any:
+        """采纳一份**已经解密**的存量令牌明文（Issue #281 改道）。语义同 ``issue_token``
+        ——已存在即返回既有那一份、绝不覆盖；候选明文的来源不是新生成，而是调用方从
+        存量源解出来的那一份。"""
+        ...
+
 
 class PermissionDecisionStore(Protocol):
     """权限决定 + 发布意图（同事务），以及意图状态的回读。"""
@@ -457,6 +470,7 @@ class AutoOnboardingRunner:
         users: UserStateStore,
         environment: UserEnvironmentSource,
         tokens: TokenIssuer,
+        stock_tokens: StockTokenSource | None = None,
         decisions: PermissionDecisionStore,
         readiness: ReadinessConfirmer,
         notifier: UserNotifier,
@@ -499,6 +513,9 @@ class AutoOnboardingRunner:
         self._users = users
         self._environment = environment
         self._tokens = tokens
+        #: 存量令牌只读源（Issue #281 改道）。``None``＝该能力关闭——坐标未配置时装配层
+        #: 不会建出这个对象，`_issue_token` 因此原样走 `issue_token`，与改动前逐字节一致。
+        self._stock_tokens = stock_tokens
         self._decisions = decisions
         self._readiness = readiness
         self._notifier = notifier
@@ -993,7 +1010,7 @@ class AutoOnboardingRunner:
             return recheck
 
         self._stop_guard()
-        issued = self._issue_token(user_id)
+        issued = self._issue_token(user_id, email=request.email)
         self._create_environment(user_id, issued)
         self._users.advance_provisioning_state(user_id, to=STATE_PROVISIONING)
         # **分水岭**（Issue #282 §0.1）：从这一行起，任何失败终态都会让这个人停在
@@ -1199,11 +1216,52 @@ class AutoOnboardingRunner:
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 
-    def _issue_token(self, user_id: str) -> Any:
+    def _issue_token(self, user_id: str, *, email: str) -> Any:
+        """签发或采纳该用户的问数 MCP 访问令牌（adopt-or-issue，#281 改道裁定）。
+
+        ``self._stock_tokens`` 为 ``None``（坐标未配置）时与改动前逐字节一致——直接走
+        原签发路径，这是"未接入存量令牌能力＝零行为变化"的哨兵。注入时先按邮箱查存量源：
+        无行 / 有行无密文都退回原路径签新；有行含密文则采纳；**解密失败响亮失败、绝不
+        退回签新**（签新会让用户环境令牌与正式表错位，造成真实 MCP 认证失败）。
+        """
+
+        if self._stock_tokens is not None:
+            lookup = self._stock_token_lookup(email)
+            if lookup.state == ADOPTABLE:
+                return self._adopt_token(user_id, lookup)
+            if lookup.state == DECRYPT_FAILED:
+                self._audit.record("onboarding.stock_token_decrypt_failed", user=user_id)
+                raise OnboardingChainError("stock_token_decrypt_failed")
+            self._audit.record(
+                "onboarding.stock_token_absent", user=user_id, state=lookup.state
+            )
         try:
             return self._tokens.issue_token(user_id)
         except Exception as error:  # noqa: BLE001
             raise OnboardingChainError(f"token_issue_failed_{type(error).__name__}") from error
+
+    def _stock_token_lookup(self, email: str) -> StockTokenLookup:
+        try:
+            return self._stock_tokens.lookup(email)
+        except Exception as error:  # noqa: BLE001
+            raise OnboardingChainError(
+                f"stock_token_lookup_failed_{type(error).__name__}"
+            ) from error
+
+    def _adopt_token(self, user_id: str, lookup: StockTokenLookup) -> Any:
+        try:
+            adopted = self._tokens.adopt_token(user_id, lookup.secret)
+        except Exception as error:  # noqa: BLE001
+            raise OnboardingChainError(f"token_adopt_failed_{type(error).__name__}") from error
+        # 权限面由银河同步权威决定，不由本步裁量——这里只审计标注，不改变采纳与否
+        # （#281 改道裁定第四条）。
+        approved = not lookup.status or lookup.status == STATUS_APPROVED
+        self._audit.record(
+            "onboarding.stock_token_adopted" if adopted.created else "onboarding.stock_token_existing_kept",
+            user=user_id,
+            status_approved=approved,
+        )
+        return adopted
 
     def _create_environment(self, user_id: str, issued: Any) -> None:
         """创建用户环境并把该用户的 MCP Bearer 落进它的 ``.mcp.json``。

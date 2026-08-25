@@ -69,11 +69,22 @@ class _FakeTracker:
         self.failed.append(pending_action_id)
 
 
+class _FakeAudit:
+    """记录每一次 ``record`` 调用的动作名与字段，供断言诊断缺口修复
+    （Issue #96 批次三：``card_dispatch.send()`` 的失败分支不再吞掉异常细节）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def record(self, action: str, /, **fields: object) -> None:
+        self.calls.append((action, fields))
+
+
 class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_successful_send_marks_delivered_with_the_returned_card_id(self) -> None:
         transport = _FakeTransport(card_id="cardkit_abc")
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker)
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
         pending = _pending()
 
         result = dispatcher.send(
@@ -89,7 +100,7 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_explicit_rejection_marks_send_failed_not_delivered(self) -> None:
         transport = _FakeTransport(raises=AdminCardDeliveryRejected("拒绝", code="9999"))
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker)
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
         pending = _pending()
 
         result = dispatcher.send(
@@ -108,7 +119,7 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
 
         transport = _FakeTransport(raises=RuntimeError("网络超时"))
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker)
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
         pending = _pending()
 
         result = dispatcher.send(
@@ -121,7 +132,7 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_card_is_sent_as_a_reply_to_the_triggering_message(self) -> None:
         transport = _FakeTransport()
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker)
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
         pending = _pending()
 
         dispatcher.send(
@@ -132,6 +143,90 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         self.assertEqual(call["reply_to_message_id"], "om_specific")
         self.assertEqual(call["thread_id"], "tid_1")
         self.assertEqual(call["chat_id"], "oc_1")
+
+
+class SendFailureAuditTests(unittest.TestCase):
+    """诊断缺口修复：发送失败时审计必须含错误分类，不能只留下
+    ``pending_action.status='failed'`` 这一行、看不出到底是哪一类失败
+    （2026-08-25 定位"确认卡片发送失败"故障时的真实教训，见
+    ``core/admin/card_dispatch.py`` 模块文档）。"""
+
+    def test_explicit_rejection_audit_carries_exception_class_code_and_log_id(self) -> None:
+        transport = _FakeTransport(
+            raises=AdminCardDeliveryRejected("拒绝", code="200861", log_id="log_abc")
+        )
+        tracker = _FakeTracker()
+        audit = _FakeAudit()
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        pending = _pending()
+
+        dispatcher.send(
+            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
+        )
+
+        self.assertEqual(len(audit.calls), 1)
+        action, fields = audit.calls[0]
+        self.assertEqual(action, "admin.card_dispatch.send_failed")
+        self.assertEqual(fields["pending_action_id"], pending.id)
+        self.assertEqual(fields["error"], "AdminCardDeliveryRejected")
+        self.assertEqual(fields["code"], "200861")
+        self.assertEqual(fields["log_id"], "log_abc")
+
+    def test_uncertain_result_audit_carries_exception_class_without_code_or_log_id(self) -> None:
+        """结果不明（例如 ``RuntimeError``）没有 ``code``/``log_id`` 可读——审计
+        字段里不应该凭空造出这两个键，只记确实拿到的异常类名。"""
+
+        transport = _FakeTransport(raises=RuntimeError("网络超时"))
+        tracker = _FakeTracker()
+        audit = _FakeAudit()
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        pending = _pending()
+
+        dispatcher.send(
+            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
+        )
+
+        self.assertEqual(len(audit.calls), 1)
+        action, fields = audit.calls[0]
+        self.assertEqual(action, "admin.card_dispatch.send_failed")
+        self.assertEqual(fields["pending_action_id"], pending.id)
+        self.assertEqual(fields["error"], "RuntimeError")
+        self.assertNotIn("code", fields)
+        self.assertNotIn("log_id", fields)
+
+    def test_audit_does_not_carry_card_body_or_external_identifiers(self) -> None:
+        """审计字段不含卡片正文、``chat_id``、``reply_to_message_id`` 或目标
+        ``open_id`` 明文——只带内部 ``pending_action_id``（与仓库既有
+        ``card_callback.py`` 审计同一姿态），避免把外部标识或展示文案写进审计。"""
+
+        transport = _FakeTransport(raises=RuntimeError("网络超时"))
+        tracker = _FakeTracker()
+        audit = _FakeAudit()
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        pending = _pending()
+
+        dispatcher.send(
+            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
+        )
+
+        _, fields = audit.calls[0]
+        self.assertEqual(set(fields), {"pending_action_id", "error"})
+
+    def test_successful_send_does_not_record_any_audit(self) -> None:
+        """本类只在失败分支记审计——成功路径的审计（若有）属于调用方
+        ``core/admin/router.py`` 的既有职责，不是本类新增的义务。"""
+
+        transport = _FakeTransport(card_id="cardkit_abc")
+        tracker = _FakeTracker()
+        audit = _FakeAudit()
+        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        pending = _pending()
+
+        dispatcher.send(
+            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
+        )
+
+        self.assertEqual(audit.calls, [])
 
 
 if __name__ == "__main__":  # pragma: no cover

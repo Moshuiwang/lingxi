@@ -25,6 +25,7 @@ from lingxi.apps.scheduler import (
     _build_onboarding_duty,
     _build_stalled_provisioning_duty,
 )
+from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
     PROBE_WATCHDOG_MARGIN_SECONDS,
@@ -33,6 +34,7 @@ from lingxi.apps.scheduler.onboarding import (
     assert_claim_limit_follows_capacity,
     assert_probe_timeouts_agree,
     assert_stalled_lease_exceeds_chain_budget,
+    build_stock_token_source,
     monotonic_utc_clock,
 )
 from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
@@ -176,6 +178,138 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIsInstance(duty, OnboardingReconciler)
         client = duty._onboarding._employment._client
         self.assertEqual(client._sleep, stop.wait, "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep")
+
+
+class StockTokenSourceWiringTests(unittest.TestCase):
+    """存量令牌只读源的装配（Issue #281 改道，`V-开通-24`）：坐标/主密钥/令牌供给
+    缺一即不装配，返回 ``None``——该能力不是首次开通编排的硬前提。
+
+    opus 批量审查 P2-1：「两个坐标都未配置」（刻意关闭）与「半配置/坐标齐但缺主密钥
+    或令牌供给」（错配）此前共用零审计信号，运维分不清。本类下半部分锁定四态各自的
+    审计信号：都配＝零审计，两个方向的半配置与另外两个错配分支各恰一条
+    ``onboarding.stock_token_source_not_wired``，两个坐标都未配置仍保持零信号。
+    """
+
+    STOCK_ENV = {
+        **WIRED_ENV,
+        "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake",
+        "LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID": "tblStockFake",
+    }
+
+    def test_missing_coordinates_returns_none(self) -> None:
+        """未传 ``audit`` 时也不报错——两个坐标都未配置这条分支从不调用 ``record``。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t"))
+
+    def test_partial_coordinates_returns_none(self) -> None:
+        """未传 ``audit`` 时也不报错：验证 ``audit is not None`` 守卫本身，不是靠
+        调用方总是会传一个替身才不崩。"""
+
+        env = {**WIRED_ENV, "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake"}
+        config = SchedulerConfig.from_env(env)
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t"))
+
+    def test_missing_access_token_returns_none_even_with_coordinates(self) -> None:
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        self.assertIsNone(build_stock_token_source(config, access_token=None))
+
+    def test_fully_configured_returns_a_decrypting_source(self) -> None:
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        source = build_stock_token_source(config, access_token=lambda: "t")
+        self.assertIsInstance(source, DecryptingStockTokenSource)
+
+    def test_fully_configured_reports_zero_audit(self) -> None:
+        """成功路径即使接了真实审计出口也不该留痕——零信号是「一切正常」的信号本身。"""
+
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        audit = RecordingAudit()
+        source = build_stock_token_source(config, access_token=lambda: "t", audit=audit)
+        self.assertIsInstance(source, DecryptingStockTokenSource)
+        self.assertEqual(audit.actions(), [])
+
+    def test_missing_coordinates_reports_zero_audit(self) -> None:
+        """「两个坐标都未配置」＝正常关闭：接了审计出口也必须保持零信号（P2-1 修复
+        唯一要保留的旧行为）。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        audit = RecordingAudit()
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t", audit=audit))
+        self.assertEqual(audit.actions(), [])
+
+    def test_partial_coordinates_app_token_only_reports_one_audit(self) -> None:
+        env = {**WIRED_ENV, "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake"}
+        config = SchedulerConfig.from_env(env)
+        audit = RecordingAudit()
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t", audit=audit))
+        self.assertEqual(audit.actions(), ["onboarding.stock_token_source_not_wired"])
+        self.assertEqual(audit.records[0][1], {"reason": "partial_coordinates"})
+
+    def test_partial_coordinates_table_id_only_reports_one_audit(self) -> None:
+        """半配置的另一个方向——只配 ``table_id``、不配 ``app_token``。改动前这个方向
+        与上面那个方向、以及「两个都没配」三者共用零信号，无法互相区分。"""
+
+        env = {**WIRED_ENV, "LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID": "tblStockFake"}
+        config = SchedulerConfig.from_env(env)
+        audit = RecordingAudit()
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t", audit=audit))
+        self.assertEqual(audit.actions(), ["onboarding.stock_token_source_not_wired"])
+        self.assertEqual(audit.records[0][1], {"reason": "partial_coordinates"})
+
+    def test_missing_encrypt_key_reports_one_audit(self) -> None:
+        """坐标齐、令牌供给也在，但 MCP 令牌主密钥没接线——``STOCK_ENV`` 之外单独
+        构造一份不含 ``LINGXI_MCP_TOKEN_ENCRYPT_KEY`` 的环境。"""
+
+        env = {
+            **BASE_ENV,
+            "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.internal/query",
+            "LINGXI_USER_ENV_ROOT": "/var/lib/lingxi/users",
+            "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake",
+            "LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID": "tblStockFake",
+        }
+        config = SchedulerConfig.from_env(env)
+        audit = RecordingAudit()
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t", audit=audit))
+        self.assertEqual(audit.actions(), ["onboarding.stock_token_source_not_wired"])
+        self.assertEqual(audit.records[0][1], {"reason": "missing_encrypt_key"})
+
+    def test_missing_access_token_reports_one_audit(self) -> None:
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        audit = RecordingAudit()
+        self.assertIsNone(build_stock_token_source(config, access_token=None, audit=audit))
+        self.assertEqual(audit.actions(), ["onboarding.stock_token_source_not_wired"])
+        self.assertEqual(audit.records[0][1], {"reason": "missing_access_token_supply"})
+
+    def test_the_onboarding_duty_forwards_the_built_source_into_the_runner(self) -> None:
+        """插入点断言：``_build_onboarding_duty`` 收到的 ``stock_tokens`` 原样进了
+        ``AutoOnboardingRunner``，不是被丢弃或替换。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        sentinel = object()
+        duty = _build_onboarding_duty(
+            config,
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+            stock_tokens=sentinel,
+        )
+        self.assertIs(duty._onboarding._stock_tokens, sentinel)
+
+    def test_the_default_is_none_matching_pre_change_behaviour(self) -> None:
+        """未传 ``stock_tokens`` 时默认 ``None``——哨兵：与改道前的调用点逐字节一致。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        duty = _build_onboarding_duty(
+            config,
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+        )
+        self.assertIsNone(duty._onboarding._stock_tokens)
 
 
 class AssemblyInvariantTests(unittest.TestCase):

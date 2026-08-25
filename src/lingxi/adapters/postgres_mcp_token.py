@@ -112,16 +112,49 @@ class PostgresMcpTokenStore:
         当前能用的那一个。重新签发会让库里的密文与外部表里的不一致，而更新路径不写
         ``token_cipher``（`V-权限-11`），新值永远送不出去——用户侧表现为"某天开始问数
         忽然没有权限"。
-
-        实现上先无条件加密一份新明文再 ``ON CONFLICT DO NOTHING``：多花一次加密，
-        换来"判断与写入在同一条语句里"，因此两个并发的首次签发只会有一个胜出，
-        另一个回读到胜出者的那一份。**先查后写**会在两次调用之间留一个窗口，
-        两边各自认为自己是第一个。
         """
 
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("签发令牌必须指明用户")
-        candidate = new_token()
+        return self._insert_new_token(user_id, new_token(), verb="签发")
+
+    def adopt_token(self, user_id: str, secret: str) -> IssuedToken:
+        """采纳一份**已经解密**的存量令牌明文（Issue #281 改道，产品负责人 2026-08-25）。
+
+        语义与 :meth:`issue_token` 完全相同——**已存在即返回既有那一份，绝不覆盖**：
+        库里已经有这个用户的令牌行时，以库内既有那份为准，本次传入的候选明文被丢弃，
+        不做比对也不做覆盖。区别只在候选明文的来源：不是本模块新生成的
+        ``secrets.token_urlsafe``，而是调用方从正式表存量令牌解密出来的那一份。
+
+        **本方法自己只校验非空，但迁移 ``0065`` 的 ``token_cipher`` CHECK 依然生效**
+        （``^[A-Za-z0-9+/]{86}==$``，见该迁移文件头部）：PKCS7 把明文补到 16 字节的
+        整数倍再加密，因此这条 CHECK 实际接受的是 **UTF-8 字节数落在 32–47 之间**的
+        候选明文（都补到 48 字节密文 → 64 字节信封 → 88 字符 base64），不是字面意义
+        "必须恰好 43 字符"——只是 :func:`~lingxi.adapters.mcp_token_cipher.new_token`
+        产出的 43 字节明文恰好落在这个区间里。候选明文的字节数落在区间外时，
+        ``INSERT`` 会被数据库拒绝、原样向上抛 ``psycopg`` 异常（不吞不折——采纳失败与
+        签发失败同一条纪律，调用方按"本侧故障"收口）。**这不是本方法新引入的限制**：
+        #281 改道评论的实测（2026-08-21，解密真实存量令牌）证实旧系统 biai-agent 的
+        签发同样是 ``secrets.token_urlsafe(32)``（43 字节，落在区间内），只是与
+        :meth:`issue_token` 共用同一列、同一条 CHECK 的自然结果，如实登记不隐瞒
+        ——``tests/test_mcp_token_postgres.py`` 的
+        ``test_adopting_a_secret_with_a_different_shape_is_rejected_by_the_database``
+        真实撞过一次并钉住这条边界。
+        """
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("采纳令牌必须指明用户")
+        if not isinstance(secret, str) or not secret:
+            raise ValueError("采纳令牌必须提供非空明文")
+        return self._insert_new_token(user_id, secret, verb="采纳存量")
+
+    def _insert_new_token(self, user_id: str, candidate: str, *, verb: str) -> IssuedToken:
+        """``issue_token``/``adopt_token`` 共用的写入与回读：先无条件加密候选明文再
+        ``ON CONFLICT DO NOTHING``，多花一次加密换来"判断与写入在同一条语句里"，两个
+        并发的首次写入只会有一个胜出，另一个回读到胜出者的那一份。**先查后写**会在
+        两次调用之间留一个窗口，两边各自认为自己是第一个。
+        """
+
         candidate_cipher = self._cipher.encrypt(candidate)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -137,12 +170,12 @@ class PostgresMcpTokenStore:
             row = cursor.fetchone()
         if row is None:
             # 只有 app_user 那一行在两条语句之间被删掉才会走到这里（CASCADE）。
-            raise LookupError("签发令牌的目标用户不存在")
+            raise LookupError(f"{verb}令牌的目标用户不存在")
         stored_cipher = str(row[0])
         if created:
-            logger.info("MCP 访问令牌已签发 user=%s", user_id)
+            logger.info("MCP 访问令牌已%s user=%s", verb, user_id)
             return IssuedToken(user_id, stored_cipher, True, candidate)
-        # 已存在：**解密既有那一份**返回，而不是把刚生成的明文当成结果。
+        # 已存在：**解密既有那一份**返回，而不是把刚生成/刚解出的明文当成结果。
         # 返回一个从没落过库的明文，会让调用方把它写进用户环境，然后永远匹配不上。
         return IssuedToken(user_id, stored_cipher, False, self._cipher.decrypt(stored_cipher))
 

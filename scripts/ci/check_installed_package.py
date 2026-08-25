@@ -115,6 +115,11 @@ REQUIRED_MODULES = (
     "lingxi.adapters.mcp_token_cipher",
     "lingxi.adapters.postgres_mcp_token",
     "lingxi.adapters.query_mcp_probe",
+    # 存量令牌 adopt-or-issue（Issue #281 改道，Trace #304 批次 3）：只读端口在 core，
+    # 飞书 bitable 读取 + 解密翻译在 adapters。生产调用方是 `lingxi-scheduler` 的首次
+    # 开通编排（见下面 PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包）。
+    "lingxi.core.identity.stock_token_source",
+    "lingxi.adapters.stock_token_bitable",
     # 权限变化通知（Issue #156 / S-C-03b）：正文渲染与「有限重试 + 审计」的发送编排在
     # core，向用户本人 open_id 的主动发送在 adapters。两者都有生产调用方——
     # `lingxi-scheduler` 的权限发布与就绪确认职责（见下面 PROCESS_RUNTIME_IMPORTS）。
@@ -146,6 +151,12 @@ REQUIRED_MODULES = (
     # 的形状。
     "lingxi.core.daily_report",
     "lingxi.adapters.postgres_daily_report",
+    # 内测轮内容级采集（Issue #251/#304 批次 3）：凭据形状过滤、原始素材收集与
+    # 记录构造在 core，落库在 adapters，均由 lingxi-worker 在运行时按开关按需
+    # 加载（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）——"本地测试全绿但
+    # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.innertest_content_capture",
+    "lingxi.adapters.postgres_content_capture",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -376,6 +387,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
             "lingxi.core.identity.onboarding_runner",
+            # 存量令牌 adopt-or-issue（Issue #281 改道，Trace #304 批次 3）：
+            # `build_loop` 模块级 import `build_stock_token_source`（`apps/scheduler/
+            # onboarding.py`），它在函数内 import 只读端口的飞书 bitable 适配器与
+            # `McpTokenCipher`——两者都不在模块级，必须显式登记（与本节其余
+            # "函数内 import 证明不了装得上"条目同一条理由）。
+            "lingxi.core.identity.stock_token_source",
+            "lingxi.adapters.stock_token_bitable",
             # 内测名单闸（Issue #302 S-N-01）：`_build_onboarding_duty` 经
             # `AutoOnboardingRunner.build_innertest_roster_gate` 函数内 import，
             # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
@@ -656,6 +674,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.execution.message_stream",
             "lingxi.core.execution.tool_policy",
             "lingxi.core.ids",
+            # 内测轮内容级采集（Issue #251/#304 批次 3），由 apps.worker.turn/
+            # apps.worker.service/apps.worker.cli 模块级 import。
+            "lingxi.core.innertest_content_capture",
+            "lingxi.adapters.postgres_content_capture",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),

@@ -131,6 +131,14 @@ class SchedulerConfig:
     # （`V-花名册-28` 的同一条理由）。
     permission_app_token: str | None = None
     permission_table_id: str | None = None
+    # 存量令牌只读源的 Base 与表标识（Issue #281 载体，Trace #304 批次 3）。**可选，
+    # 与上面这对同一姿态**：缺任一个，开通链的 adopt-or-issue 能力就不装配，直接走
+    # 原签发路径——不是"这一格必须先配好首次开通才能跑"（`V-开通-24`）。生产环境里
+    # 这两个坐标很可能与上面那对 permission_* 指向同一个 Base/表（同一份正式表），
+    # 但刻意用独立的环境变量注入：这条只读能力可以单独打开/关闭，不与发布面的读写
+    # 坐标绑在一起。
+    stock_token_app_token: str | None = None
+    stock_token_table_id: str | None = None
     # 问数 MCP 的就绪探针端点。**可选**：缺了只是**就绪与通知那一面**不装配，发布面照常
     # ——发布不依赖探针。配了但不是 https 则快速失败：误配 http 会让用户令牌明文上路。
     query_mcp_endpoint: str | None = None
@@ -183,6 +191,8 @@ class SchedulerConfig:
         "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
         "LINGXI_PERMISSION_BITABLE_APP_TOKEN",
         "LINGXI_PERMISSION_BITABLE_TABLE_ID",
+        "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN",
+        "LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID",
         "LINGXI_QUERY_MCP_ENDPOINT",
         "LINGXI_QUERY_MCP_TIMEOUT_SECONDS",
         "LINGXI_USER_ENV_ROOT",
@@ -395,6 +405,8 @@ class SchedulerConfig:
             mcp_token_encrypt_key=mcp_token_encrypt_key,
             permission_app_token=optional_identifier("LINGXI_PERMISSION_BITABLE_APP_TOKEN"),
             permission_table_id=optional_identifier("LINGXI_PERMISSION_BITABLE_TABLE_ID"),
+            stock_token_app_token=optional_identifier("LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN"),
+            stock_token_table_id=optional_identifier("LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID"),
             query_mcp_endpoint=query_mcp_endpoint,
             query_mcp_timeout_seconds=probe_timeout,
             user_env_root=optional_identifier("LINGXI_USER_ENV_ROOT"),

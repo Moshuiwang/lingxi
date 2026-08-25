@@ -381,7 +381,7 @@ def build_supervisor(
     # 确认卡片的出站发送与回调后的终态更新共用同一个 CardKit 传输实例。
     admin_card_transport = LarkAdminCardTransport(client)
     confirm_card_dispatcher = ConfirmCardDispatcher(
-        transport=admin_card_transport, tracker=pending_action_store
+        transport=admin_card_transport, tracker=pending_action_store, audit=audit
     )
     admin_router = AdminCommandRouter(
         registry=admin_registry_lookup,

@@ -6,4 +6,4 @@
 # 由 scripts/ci/check_size_ratchet.py --refresh 生成，请不要手工调大数值——
 # 「行数<TAB>路径」，门禁会核对这一行是否等于该文件的当前实际行数。
 # 门禁会重新丈量文件的实际行数，任何比这里记录的更大的实测值都直接判红；
-1535	src/lingxi/apps/scheduler/assembly.py
+1539	src/lingxi/apps/scheduler/assembly.py

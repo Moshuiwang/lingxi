@@ -527,6 +527,7 @@ def _build_onboarding_duty(
     employment_access_token: Callable[[], str] | None,
     metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
     permission_publish: PermissionPublishDuty | None,
+    stock_tokens: Any | None = None,
     onboarding_failed: Callable[[str, str], None] | None = None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
@@ -737,6 +738,7 @@ def _build_onboarding_duty(
         users=PostgresAppUserStore(dsn, timeouts=timeouts),
         environment=environment,
         tokens=tokens,
+        stock_tokens=stock_tokens,
         decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
         readiness=McpReadinessConfirmation(
             probe=guarded_probe,
@@ -1313,6 +1315,7 @@ def build_loop(
     from lingxi.adapters.feishu_directory import FeishuAuthorizationClient
     from lingxi.adapters.postgres_conversation import PostgresTaskQueue
     from lingxi.adapters.retention import RETENTION_CLEANUP_TIMEOUTS, PostgresRetentionCleaner
+    from lingxi.apps.scheduler.onboarding import build_stock_token_source
 
     # 一个停止标志贯穿所有职责：SIGTERM 只设它一次，全部职责同时停止领取新工作。
     stop = threading.Event()
@@ -1474,6 +1477,7 @@ def build_loop(
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
+        stock_tokens=build_stock_token_source(config, access_token=permission_table_supply, audit=sink),
         onboarding_failed=(
             alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
         ),

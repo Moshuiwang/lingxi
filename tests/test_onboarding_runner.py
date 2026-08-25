@@ -47,6 +47,13 @@ from lingxi.core.identity.provisioning import (
     ProvisioningResult,
     UserProvisioningStatus,
 )
+from lingxi.core.identity.stock_token_source import (
+    ADOPTABLE,
+    DECRYPT_FAILED,
+    NO_CIPHER,
+    NO_ROW,
+    StockTokenLookup,
+)
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
 
 UTC = timezone.utc
@@ -219,21 +226,56 @@ class FakeIssuedToken:
     # 是因为 `PublishRow` 会在构造时判形状——判错了这条链会在发布那一步炸掉，
     # 而那正是"明文不进外部表格"那道防线。
     token_cipher = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v"
+    created = True
 
     def reveal(self) -> str:
         return "plaintext-token-never-logged"
 
 
+class FakeAdoptedToken(FakeIssuedToken):
+    """``adopt_token`` 路径的假结果：``created`` 可控，``reveal()`` 原样返回调用方
+    传入的候选明文——用来在测试里观察"库里已有则返回既有那份"这条语义。"""
+
+    def __init__(self, secret: str, *, created: bool) -> None:
+        self._secret = secret
+        self.created = created
+
+    def reveal(self) -> str:
+        return self._secret
+
+
 class FakeTokens:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, *, adopt_created: bool = True) -> None:
         self._error = error
+        self._adopt_created = adopt_created
         self.calls: list[str] = []
+        self.adopt_calls: list[tuple[str, str]] = []
 
     def issue_token(self, user_id: str) -> Any:
         self.calls.append(user_id)
         if self._error is not None:
             raise self._error
         return FakeIssuedToken()
+
+    def adopt_token(self, user_id: str, secret: str) -> Any:
+        self.adopt_calls.append((user_id, secret))
+        if self._error is not None:
+            raise self._error
+        return FakeAdoptedToken(secret, created=self._adopt_created)
+
+
+class FakeStockTokens:
+    """存量令牌只读源的假实现：注入一个固定结果，或注入一个异常代表源端查询失败。"""
+
+    def __init__(self, result: StockTokenLookup | Exception | None = None) -> None:
+        self._result = result if result is not None else StockTokenLookup(state=NO_ROW)
+        self.calls: list[str] = []
+
+    def lookup(self, email: str) -> StockTokenLookup:
+        self.calls.append(email)
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
 
 
 class FakeDecision:
@@ -379,6 +421,10 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "users": FakeUsers(),
         "environment": FakeEnvironment(),
         "tokens": FakeTokens(),
+        # 默认 None：哨兵——不注入存量令牌源时，行为必须与改动前逐字节一致
+        # （本文件绝大多数用例走这条默认值，专门覆盖 adopt-or-issue 的用例见
+        # StockTokenAdoptionTests）。
+        "stock_tokens": None,
         "decisions": FakeDecisions(),
         "readiness": FakeReadiness(),
         "notifier": FakeNotifier(),
@@ -398,6 +444,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         users=parts["users"],
         environment=parts["environment"],
         tokens=parts["tokens"],
+        stock_tokens=parts["stock_tokens"],
         decisions=parts["decisions"],
         readiness=parts["readiness"],
         notifier=parts["notifier"],
@@ -746,6 +793,105 @@ class InternalFaultTests(unittest.TestCase):
 
         parts, _ = run_once(users=Exploding())
         self._assert_internal(parts, "unexpected_ZeroDivisionError")
+
+
+class StockTokenAdoptionTests(unittest.TestCase):
+    """`V-开通-24`：存量令牌 adopt-or-issue（Issue #281 改道，2026-08-25 裁定）。"""
+
+    EMAIL = "Xiaoming@Example.com"  # 与 ROSTER_ROWS[0]["email"] 同源，见模块顶部 fixture。
+
+    def test_sentinel_without_a_stock_token_source_matches_pre_change_behaviour(self) -> None:
+        """哨兵：不注入存量令牌源（``build_runner`` 默认 ``stock_tokens=None``）时，
+        行为必须与改动前逐字节一致——只签新，从不采纳。"""
+
+        parts, _ = run_once()
+        self.assertEqual(parts["tokens"].calls, [USER_ID])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+
+    def test_no_row_falls_back_to_issuing_a_new_token(self) -> None:
+        stock = FakeStockTokens(StockTokenLookup(state=NO_ROW))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(stock.calls, [self.EMAIL])
+        self.assertEqual(parts["tokens"].calls, [USER_ID])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["audit"].facts("onboarding.stock_token_absent")["state"], NO_ROW)
+
+    def test_no_cipher_falls_back_to_issuing_a_new_token(self) -> None:
+        stock = FakeStockTokens(StockTokenLookup(state=NO_CIPHER, status="pending"))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(parts["tokens"].calls, [USER_ID])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["audit"].facts("onboarding.stock_token_absent")["state"], NO_CIPHER)
+
+    def test_adoptable_secret_is_adopted_instead_of_issuing_a_new_one(self) -> None:
+        secret = "stock-plaintext-secret"
+        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status="approved"))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(parts["tokens"].calls, [], "有可用存量密文时不该再签新")
+        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)])
+        self.assertEqual(parts["environment"].tokens, [secret], "落进用户环境的必须是采纳的那份明文")
+        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True)
+
+    def test_adopting_an_existing_row_is_audited_distinctly_from_a_fresh_adoption(self) -> None:
+        """幂等：库里已经有这个用户的令牌行时，审计动作名必须与"首次采纳"可分辨。"""
+
+        secret = "stock-plaintext-secret"
+        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret))
+        parts, _ = run_once(stock_tokens=stock, tokens=FakeTokens(adopt_created=False))
+        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)])
+        self.assertIn("onboarding.stock_token_existing_kept", parts["audit"].actions())
+        self.assertNotIn("onboarding.stock_token_adopted", parts["audit"].actions())
+
+    def test_decrypt_failure_is_a_loud_failure_never_a_fallback_to_issuing_new(self) -> None:
+        """否定断言（#281 改道裁定）：解密失败必须响亮失败（`LX-ONBOARD-001`），
+        **绝不**退回签新——签新会让用户环境令牌与正式表令牌错位，造成真实 MCP 认证
+        静默失败。"""
+
+        stock = FakeStockTokens(StockTokenLookup(state=DECRYPT_FAILED, status="approved"))
+        parts, result = run_once(stock_tokens=stock)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "stock_token_decrypt_failed",
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["tokens"].calls, [], "解密失败绝不能回退签新")
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["environment"].calls, [], "没有可用令牌，环境不该被创建")
+        self.assertEqual(parts["decisions"].rows, [], "没有可用令牌，权限不该被发布")
+        self.assertIn("onboarding.stock_token_decrypt_failed", parts["audit"].actions())
+
+    def test_non_approved_status_is_annotated_but_does_not_block_adoption(self) -> None:
+        """权限面由银河同步权威决定，不由本步裁量——非 approved 只审计标注，仍然采纳。"""
+
+        secret = "stock-plaintext-secret"
+        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status="pending"))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(parts["tokens"].adopt_calls, [(USER_ID, secret)], "非 approved 不阻止采纳")
+        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], False)
+
+    def test_blank_status_counts_as_approved(self) -> None:
+        secret = "stock-plaintext-secret"
+        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret, status=""))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(parts["audit"].facts("onboarding.stock_token_adopted")["status_approved"], True)
+
+    def test_source_lookup_failure_is_an_internal_fault_not_a_business_rejection(self) -> None:
+        stock = FakeStockTokens(RuntimeError("源端不可用"))
+        parts, _ = run_once(stock_tokens=stock)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "internal_error")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "stock_token_lookup_failed_RuntimeError",
+        )
+
+    def test_the_secret_and_cipher_never_reach_the_audit_trail(self) -> None:
+        secret = "stock-plaintext-secret-never-audited"
+        stock = FakeStockTokens(StockTokenLookup(state=ADOPTABLE, secret=secret))
+        parts, _ = run_once(stock_tokens=stock)
+        rendered = repr(parts["audit"].records)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(self.EMAIL, rendered, "邮箱同样不得进审计（只留 user_id/trace）")
 
 
 class OnboardingFailedAlertCallbackTests(unittest.TestCase):
