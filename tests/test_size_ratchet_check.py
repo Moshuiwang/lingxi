@@ -134,12 +134,18 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         `assembly.py`（1535 行）——PR #292（装配期管理群警告）与 PR #293
         （停机接线与预算装配）各自都低于阈值，合并后组合首次突破；两侧均为
         必要改动，结构性拆分登记为 #284 后续（与背景线程改造同批评估），
-        不在合并窗口塞设计级重构。下一次这条测试失效时，同样在此登记理由。
+        不在合并窗口塞设计级重构。2026-08-25 调到 1539 行——Issue #281 改道
+        （Trace #304 批次 3）：`build_loop` 装配存量令牌只读源并把它传给
+        `_build_onboarding_duty`（新增一个构造参数 + 一次转发 + 一处函数内
+        import + 一次装配调用，净增 4 行），复用权限发布表既有的应用身份
+        令牌供给、不新增凭据材料；改动净增内容已尽量收在这四行，未随手夹带
+        本文件其余部分的重构。结构性拆分仍是 #284 后续。下一次这条测试失效
+        时，同样在此登记理由。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {"src/lingxi/apps/scheduler/assembly.py": 1535},
+            {"src/lingxi/apps/scheduler/assembly.py": 1539},
         )
 
 

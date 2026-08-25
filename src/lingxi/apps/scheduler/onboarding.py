@@ -490,3 +490,40 @@ def assert_stalled_lease_exceeds_chain_budget(
             f"最长时间（租约={lease_seconds}s，链预算={chain_budget}s）：不成立时，"
             "停摆扫描会把一条正在正常跑的开通误判成僵尸"
         )
+
+
+def build_stock_token_source(config: Any, *, access_token: Callable[[], str] | None) -> Any | None:
+    """装配存量令牌只读源（Issue #281 改道，产品负责人 2026-08-25）；坐标、MCP 令牌
+    主密钥或令牌供给缺一即不装配，返回 ``None``——开通链因此原样走原签发路径，与改动前
+    逐字节一致（``V-开通-24``）。
+
+    坐标（``config.stock_token_app_token``/``stock_token_table_id``）未配置是这里最常见
+    的分支：该能力当前默认关闭，不是首次开通编排的硬前提，因此不在 ``_build_onboarding_
+    duty`` 那组「缺了整个职责都不注册」的前置里，本函数只返回 ``None``、调用方原样往下走。
+
+    复用**权限发布表的应用身份令牌供给**（Issue #226 裁定 3，调用方传入
+    ``access_token``），不新增任何凭据材料：生产环境里这条只读能力很可能与发布表指向
+    同一个 Base，但坐标独立配置（见 ``SchedulerConfig.stock_token_app_token`` 的字段
+    注释），可以单独打开/关闭而不影响发布面。
+    """
+
+    if not config.stock_token_app_token or not config.stock_token_table_id:
+        return None
+    if not config.mcp_token_encrypt_key or access_token is None:
+        return None
+
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.stock_token_bitable import (
+        BitableStockTokenSource,
+        DecryptingStockTokenSource,
+    )
+
+    return DecryptingStockTokenSource(
+        BitableStockTokenSource(
+            base_url=config.feishu_base_url,
+            app_token=config.stock_token_app_token,
+            table_id=config.stock_token_table_id,
+            access_token=access_token,
+        ),
+        cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+    )

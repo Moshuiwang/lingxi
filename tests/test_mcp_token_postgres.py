@@ -315,6 +315,115 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
         self.assertEqual(self.store.token_cipher(USER_A), issued.token_cipher)
 
 
+class TokenAdoptionTest(McpTokenPostgresTestCase):
+    """``adopt_token``（Issue #281 改道，Trace #304 批次 3）：`V-开通-24` 的真库半边。
+
+    语义与 ``issue_token`` 完全相同（幂等、绝不覆盖、明文只在内存），下面只覆盖
+    ``adopt_token`` 独有的三件事：候选明文来自调用方而不是本模块生成、它与
+    ``issue_token`` 共用同一张表时的**跨方法**幂等（库里已经有一份，不管是哪个方法
+    签发的，采纳都不会覆盖）、以及它与 ``issue_token`` 共用同一条 ``token_cipher``
+    CHECK（`test_adopting_a_secret_with_a_different_shape_is_rejected_by_the_database`
+    ——本条**真实撞过一次**：初版测试固件用任意长度字符串当候选明文，被数据库真实拒绝，
+    坐实 ``adopt_token`` 文档字符串里"CHECK 依然生效"那句话不是猜测）。其余（触发器
+    拒绝覆盖、外键、全库扫描证明明文不落库）已由 ``TokenIssuanceTest`` 通过共用的
+    ``_insert_new_token`` 覆盖，不在这里重复断言同一段实现。
+
+    候选明文统一用 :func:`new_token` 生成——与 2026-08-21 #281 改道评论对真实存量令牌的
+    实测形状一致（``secrets.token_urlsafe(32)``，43 字符），不是随手一串字母。
+    """
+
+    def test_adopt_stores_only_ciphertext_and_returns_the_given_plaintext(self) -> None:
+        secret = new_token()
+        adopted = self.store.adopt_token(USER_A, secret)
+        self.assertTrue(adopted.created)
+        self.assertEqual(adopted.reveal(), secret)
+        self.assertNotEqual(adopted.token_cipher, secret)
+        self.assertEqual(self.cipher.decrypt(adopted.token_cipher), secret)
+        self.assertEqual(self._scan_for(secret), [])
+
+    def test_adopt_is_idempotent_and_never_overwrites(self) -> None:
+        first_candidate, second_candidate = new_token(), new_token()
+        first = self.store.adopt_token(USER_A, first_candidate)
+        second = self.store.adopt_token(USER_A, second_candidate)
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(first.token_cipher, second.token_cipher)
+        self.assertEqual(second.reveal(), first_candidate, "库内既有那份优先，候选被丢弃")
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM mcp_access_token WHERE user_id = %s", (USER_A,))
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_adopting_over_an_issued_token_keeps_the_issued_one(self) -> None:
+        """跨方法幂等：这个人已经走过 ``issue_token`` 签发，再采纳存量令牌**不覆盖**。"""
+
+        issued = self.store.issue_token(USER_A)
+        adopted = self.store.adopt_token(USER_A, new_token())
+        self.assertFalse(adopted.created)
+        self.assertEqual(adopted.token_cipher, issued.token_cipher)
+        self.assertEqual(adopted.reveal(), issued.reveal())
+
+    def test_issuing_after_an_adoption_keeps_the_adopted_one(self) -> None:
+        """反向同样成立：先采纳过存量令牌，之后开通链任何路径重新签发都拿到同一份。"""
+
+        legacy_secret = new_token()
+        adopted = self.store.adopt_token(USER_A, legacy_secret)
+        issued = self.store.issue_token(USER_A)
+        self.assertFalse(issued.created)
+        self.assertEqual(issued.reveal(), legacy_secret)
+        self.assertEqual(issued.token_cipher, adopted.token_cipher)
+
+    def test_adopt_rejects_an_empty_secret(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.adopt_token(USER_A, "")
+        self.assertIsNone(self.store.token_cipher(USER_A))
+
+    def test_adopt_rejects_a_blank_user_id(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.adopt_token("   ", new_token())
+
+    def test_adopt_unknown_user_is_rejected_by_the_foreign_key(self) -> None:
+        with self.assertRaises(Exception):
+            self.store.adopt_token("usr_不存在", new_token())
+
+    def test_adopting_a_secret_with_a_different_shape_is_rejected_by_the_database(self) -> None:
+        """真实撞过一次：``token_cipher`` CHECK 钉的是"明文 43 字符"这一形状
+        （迁移 ``0065``），与 ``issue_token`` 共用同一列、同一条约束。**PKCS7 补位到
+        16 字节的整数倍**，因此这条 CHECK 实际接受的是「UTF-8 字节数在 32–46 之间」
+        的候选明文（都补到 48 字节密文）——本用例特意选一个**远短于**这个区间的
+        候选（12 字节），确保真的撞上 CHECK 而不是恰好落进同一个补位桶。加密后的
+        信封长度不落在这个区间时，写不进这一列——数据库层面就地拒绝，不会静默存
+        一份"形状不对"的密文。"""
+
+        short_secret = "short-secret"  # 12 字节，远短于 32–46 字节的合规区间。
+        self.assertLess(len(short_secret.encode("utf-8")), 32)
+        with self.assertRaises(Exception):
+            self.store.adopt_token(USER_A, short_secret)
+        self.assertIsNone(self.store.token_cipher(USER_A), "拒绝的候选不得留下半截行")
+
+    def test_two_users_adopting_get_independent_rows(self) -> None:
+        secret_a, secret_b = new_token(), new_token()
+        a = self.store.adopt_token(USER_A, secret_a)
+        b = self.store.adopt_token(USER_B, secret_b)
+        self.assertNotEqual(a.token_cipher, b.token_cipher)
+        self.assertEqual(a.reveal(), secret_a)
+        self.assertEqual(b.reveal(), secret_b)
+
+    def test_adopted_plaintext_never_appears_in_the_object_repr(self) -> None:
+        adopted = self.store.adopt_token(USER_A, new_token())
+        self.assertNotIn(adopted.reveal(), repr(adopted))
+
+    def test_wrong_master_key_fails_loudly_on_readback_instead_of_silently_reissuing(self) -> None:
+        legacy_secret = new_token()
+        self.store.adopt_token(USER_A, legacy_secret)
+        other = PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(OTHER_MASTER_KEY))
+        with self.assertRaises(McpTokenCipherError):
+            other.read_token(USER_A)
+        # 那一行原封不动——不会被"读不懂就重签"悄悄破坏。
+        with self.assertRaises(McpTokenCipherError):
+            other.adopt_token(USER_A, new_token())
+        self.assertEqual(self.store.read_token(USER_A), legacy_secret)
+
+
 class SyncCheckRecordTest(McpTokenPostgresTestCase):
     def test_every_attempt_gets_its_own_row(self) -> None:
         for _ in range(3):
