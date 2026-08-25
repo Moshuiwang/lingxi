@@ -31,6 +31,7 @@ from typing import Any, Callable, Mapping, TextIO
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
+from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
 
 from lingxi.apps.liveness import touch_liveness
 
@@ -86,6 +87,40 @@ def main(
             message=(
                 "此开关仅供 S-A-07 受控验收使用，默认应为关闭；如果这不是一次"
                 "受控验收启动，请立即核实并清空 LINGXI_WORKER_OUTPUT_SAFETY_CANARY"
+            ),
+        )
+
+    if config.innertest_content_capture_enabled:
+        # 与上面的 output_safety_canary 同一纪律：一个默认应为关闭的能力一旦
+        # 真的开启，必须在启动日志里足够扎眼（Issue #251/#304 批次 3）。
+        _log(
+            err,
+            config.trace_id,
+            "warning",
+            "worker.innertest_content_capture_enabled",
+            message=(
+                "内测轮内容级采集已开启，本进程处理的每个任务的用户问题/模型"
+                "回答/工具调用详情（凭据形状已过滤）将写入 "
+                "innertest_content_capture 表；此开关仅供 stage 内测轮使用，"
+                "如果这不是一次内测轮启动，请立即核实并清空 "
+                "LINGXI_INNERTEST_CONTENT_CAPTURE"
+            ),
+        )
+    elif config.innertest_content_capture_misconfigured:
+        # 主开关已配置但第二确认变量缺失/不匹配：采集仍然关闭（结构性保证生
+        # 效），但这通常意味着运维"以为开了但其实没开"，值得一条显眼告警帮助
+        # 发现，而不是安静地什么都不做。
+        _log(
+            err,
+            config.trace_id,
+            "warning",
+            "worker.innertest_content_capture_blocked",
+            message=(
+                "已配置 LINGXI_INNERTEST_CONTENT_CAPTURE=1，但第二确认变量 "
+                "LINGXI_INNERTEST_CONTENT_CAPTURE_ENVIRONMENT_CONFIRM 缺失或不匹配"
+                "（不回显取到的值），内容级采集本次运行不生效（结构性保证：正式"
+                "环境即使误配了主开关也不会生效）；若这是一次真实要开启采集的 "
+                "stage 部署，请核对第二确认变量的取值"
             ),
         )
 
@@ -154,6 +189,16 @@ def main(
                 message="取不到会话根目录（HOME 未设置且未显式配置 "
                 "LINGXI_WORKER_SESSION_ROOT），Agent 会话 JSONL 物理清理本次运行将不生效",
             )
+        # 内测轮内容级采集（Issue #251/#304 批次 3）：只在开关真正开启时才构造
+        # 写入方，与该 DSN 建立的是完全独立于队列消费的写路径。开关关闭时
+        # `content_capture_writer` 恒为 None，`WorkerService`/`WorkerTurnExecutor`
+        # 都不会构造任何采集相关对象——这是"默认关闭不产生额外行为"在启动组装
+        # 这一层的体现。
+        content_capture_writer = (
+            PostgresContentCaptureWriter(dsn).write
+            if config.innertest_content_capture_enabled
+            else None
+        )
         service = WorkerService(
             config=config,
             queue=queue,
@@ -164,6 +209,7 @@ def main(
             on_terminal_outcome=_terminal_outcome_sink(err=err, trace_id=config.trace_id),
             session_root=session_root,
             session_cleanup_batch_limit=config.session_cleanup_batch_limit,
+            content_capture_writer=content_capture_writer,
         )
         try:
             asyncio.run(

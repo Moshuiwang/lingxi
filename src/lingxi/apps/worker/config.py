@@ -80,6 +80,21 @@ OUTPUT_SAFETY_CANARY_MODES = ("masked", "withheld")
 # 否则 masked 档位的"幸存句必然幸存"前提会被自己打破。
 OUTPUT_SAFETY_CANARY_SURVIVOR_BODY = "受控验收合成正文：本句由输出安全注入夹具生成，保留可展示的业务结论。"
 
+# 内测轮内容级采集（Issue #251/#304 批次 3）：两个裸变量名，**不带**
+# ``LINGXI_WORKER_`` 前缀——与 ``LINGXI_USER_ENV_ROOT``/
+# ``LINGXI_INNERTEST_ROSTER_OPEN_IDS`` 同一惯例，因为"内测轮"是横切概念，不是
+# worker 私有配置。完整判定语义见 `_innertest_content_capture` 与
+# docs/技术设计/数据库设计.md「保留与删除」内测采集小节。
+CONTENT_CAPTURE_FLAG_VAR = "LINGXI_INNERTEST_CONTENT_CAPTURE"
+CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR = "LINGXI_INNERTEST_CONTENT_CAPTURE_ENVIRONMENT_CONFIRM"
+# 第二确认变量要求的**精确**取值。选一句不像布尔值、不像会被误抄的短标签的
+# 字面量，是"结构性保证不是文档约定"这条要求在只有环境变量可用时的具体落地：
+# 单一开关容易被整份部署文件复制/续用带进不该带进的环境；要求同时命中这个
+# 精确字面量，把"部署配置漂移"与"确有其人显式选择开启"的门槛拉开一截。
+# `scripts/ci/check_deploy_contract.py` 的 `check_content_capture_prod_guard`
+# 断言这个值永不出现在任何 compose 编排文件里（尤其是 deploy/compose.prod.yaml）。
+CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE = "stage-innertest-explicit-opt-in"
+
 
 class WorkerConfigError(ValueError):
     """配置不合法。启动即失败，不留到会话建立之后。"""
@@ -163,6 +178,15 @@ class WorkerConfig:
     # （`EXIT_CONFIG_ERROR`），不是在这里强制必填——否则会连累不需要它的 `turn`
     # 模式与直接构造 ``WorkerConfig`` 的测试/嵌入路径。
     user_env_root: str | None = None
+    # 内测轮内容级采集（Issue #251/#304 批次 3）：见 `_innertest_content_capture`
+    # 的完整判定说明。默认 False——关闭状态必须可被断言证明，因此这里**不**
+    # 提供任何会让默认值意外变真的构造路径（直接构造 WorkerConfig 的测试与
+    # 嵌入调用方同样默认关闭，与 loader 路径行为一致）。
+    innertest_content_capture_enabled: bool = False
+    # 主开关已配置但第二确认变量缺失/不匹配：采集**仍然关闭**，这个字段只用于
+    # 让 apps/worker/cli.py 在启动期打一条显眼告警，帮助运维发现"以为开了但
+    # 其实结构性没生效"，不参与任何功能判断。
+    innertest_content_capture_misconfigured: bool = False
 
     def __post_init__(self) -> None:
         # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
@@ -233,6 +257,7 @@ def load_config(
             "同时配置：canary 的子串不变量在启动期针对固定提示词校验，逐任务变化的"
             "文件内容无法背书"
         )
+    content_capture_enabled, content_capture_misconfigured = _innertest_content_capture(env)
     return WorkerConfig(
         question=_text(env, "QUESTION") or "",
         read_only_tools=_read_only_tools(env),
@@ -267,6 +292,8 @@ def load_config(
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
         user_env_root=_user_env_root(env),
         system_prompt_file=system_prompt_file,
+        innertest_content_capture_enabled=content_capture_enabled,
+        innertest_content_capture_misconfigured=content_capture_misconfigured,
     )
 
 
@@ -411,6 +438,51 @@ def _user_env_root(env: Mapping[str, str]) -> str | None:
             "（不含 `..`、`.`、连续斜杠或多余的尾部斜杠；不回显取到的值）"
         )
     return value
+
+
+def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
+    """内测轮内容级采集开关（Issue #251/#304 批次 3），返回
+    ``(enabled, misconfigured)``。
+
+    - 主开关（``CONTENT_CAPTURE_FLAG_VAR``）未配置或为空：``(False, False)``
+      ——未配置就是未启用，不是"某个开关关着"，是这项能力压根没被提起过。
+    - 主开关配置了但不是精确的 ``"1"``：**启动即失败**（与
+      ``apps/gateway/config.py`` 的 ``_card_failure_injection`` 同一姿态）——
+      错配不是未配，宁可拒绝启动也不静默按未启用处理，否则真想开启却打错值的
+      部署会悄悄以为自己开着。不回显收到的值。
+    - 主开关为 ``"1"`` 但第二确认变量（``CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR``）
+      不等于要求的精确字面量（``CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE``）：
+      ``(False, True)``——这是"正式环境即使配了也不得生效"在只有环境变量可用、
+      且 stage/prod 两侧镜像与编排结构完全相同（无任何既有代码可读的环境判据）
+      时的保守方案：单一开关容易随整份部署文件被误续用带进不该带进的环境，
+      要求同时命中一个不像会被顺手抄对的精确字面量，把"部署配置漂移"与"确有
+      其人显式选择在 stage 开启"的门槛拉开一截。**不让整个进程启动失败**：
+      这只是一项可选能力被结构性挡住，worker 仍要正常服务用户问数；
+      ``misconfigured=True`` 只用于让 ``apps/worker/cli.py`` 打一条显眼的启动
+      期告警。
+    - 两者都对：``(True, False)``。
+
+    **已知残余风险（如实登记，不得声称已彻底堵住）**：stage 与生产当前共用
+    完全相同的容器镜像与 compose 结构，唯一差异是各服务从哪个不入库的宿主机
+    本地 env 文件读取变量（见 deploy/compose.stage.yaml 与 compose.prod.yaml
+    头部说明）。如果有人把 stage 的 worker-queue env 文件**整份**复制进生产
+    的对应文件，两个变量会一起被带过去，这道双变量确认无法在代码层面识别出
+    "这其实是从 stage 抄过来的"。`scripts/ci/check_deploy_contract.py` 的
+    `check_content_capture_prod_guard` 断言精确字面量与两个变量名都不出现在
+    任何入库的 compose 编排文件里，`deploy/验收前部署配置清单.md` 与
+    `deploy/.env.example` 同步登记"生产环境禁止配置"；这些是仓库能提供的最强
+    机械保证，真正的最后一道防线仍是部署操作纪律。
+    """
+
+    flag = (env.get(CONTENT_CAPTURE_FLAG_VAR) or "").strip()
+    if not flag:
+        return False, False
+    if flag != "1":
+        raise WorkerConfigError(f'环境变量 {CONTENT_CAPTURE_FLAG_VAR} 只接受精确值 "1"（不回显收到的值）')
+    confirm = (env.get(CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR) or "").strip()
+    if confirm != CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE:
+        return False, True
+    return True, False
 
 
 def _system_prompt_file(env: Mapping[str, str]) -> str | None:
