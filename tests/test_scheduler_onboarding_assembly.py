@@ -25,6 +25,7 @@ from lingxi.apps.scheduler import (
     _build_onboarding_duty,
     _build_stalled_provisioning_duty,
 )
+from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
     PROBE_WATCHDOG_MARGIN_SECONDS,
@@ -33,6 +34,7 @@ from lingxi.apps.scheduler.onboarding import (
     assert_claim_limit_follows_capacity,
     assert_probe_timeouts_agree,
     assert_stalled_lease_exceeds_chain_budget,
+    build_stock_token_source,
     monotonic_utc_clock,
 )
 from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
@@ -176,6 +178,66 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIsInstance(duty, OnboardingReconciler)
         client = duty._onboarding._employment._client
         self.assertEqual(client._sleep, stop.wait, "节流/退避的 sleeper 必须绑定这一份 stop，不是默认的 time.sleep")
+
+
+class StockTokenSourceWiringTests(unittest.TestCase):
+    """存量令牌只读源的装配（Issue #281 改道，`V-开通-24`）：坐标/主密钥/令牌供给
+    缺一即不装配，返回 ``None``——该能力不是首次开通编排的硬前提。"""
+
+    STOCK_ENV = {
+        **WIRED_ENV,
+        "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake",
+        "LINGXI_STOCK_TOKEN_BITABLE_TABLE_ID": "tblStockFake",
+    }
+
+    def test_missing_coordinates_returns_none(self) -> None:
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t"))
+
+    def test_partial_coordinates_returns_none(self) -> None:
+        env = {**WIRED_ENV, "LINGXI_STOCK_TOKEN_BITABLE_APP_TOKEN": "bascnStockFake"}
+        config = SchedulerConfig.from_env(env)
+        self.assertIsNone(build_stock_token_source(config, access_token=lambda: "t"))
+
+    def test_missing_access_token_returns_none_even_with_coordinates(self) -> None:
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        self.assertIsNone(build_stock_token_source(config, access_token=None))
+
+    def test_fully_configured_returns_a_decrypting_source(self) -> None:
+        config = SchedulerConfig.from_env(self.STOCK_ENV)
+        source = build_stock_token_source(config, access_token=lambda: "t")
+        self.assertIsInstance(source, DecryptingStockTokenSource)
+
+    def test_the_onboarding_duty_forwards_the_built_source_into_the_runner(self) -> None:
+        """插入点断言：``_build_onboarding_duty`` 收到的 ``stock_tokens`` 原样进了
+        ``AutoOnboardingRunner``，不是被丢弃或替换。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        sentinel = object()
+        duty = _build_onboarding_duty(
+            config,
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+            stock_tokens=sentinel,
+        )
+        self.assertIs(duty._onboarding._stock_tokens, sentinel)
+
+    def test_the_default_is_none_matching_pre_change_behaviour(self) -> None:
+        """未传 ``stock_tokens`` 时默认 ``None``——哨兵：与改道前的调用点逐字节一致。"""
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        duty = _build_onboarding_duty(
+            config,
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+        )
+        self.assertIsNone(duty._onboarding._stock_tokens)
 
 
 class AssemblyInvariantTests(unittest.TestCase):
