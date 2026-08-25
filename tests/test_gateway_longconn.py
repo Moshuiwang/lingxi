@@ -431,6 +431,61 @@ class CardActionDispatchTests(unittest.TestCase):
         self.assertEqual(reason, TerminationReason.STOPPED)
         self.assertEqual(received, ["evt_normal_1"])
 
+    def test_card_branch_returns_the_callback_handlers_response(self) -> None:
+        """Issue #96 载体修复：``card_callback_handler.handle(...)`` 的返回值必须
+        被 ``make_event_handler`` 的 ``handle()`` 原样 ``return``，而不是像此前
+        那样被丢弃——这正是卡片回调应答链路的入口，返回值最终经
+        ``LongConnectionSupervisor._dispatch`` 回报给传输层，再由 SDK marshal
+        进飞书要的应答帧。直接调用 ``handle()`` 而不经过 supervisor，只验证这
+        一层的透传本身。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        expected_response = {"toast": {"type": "success", "content": "已确认执行。"}}
+
+        class FakeCardCallbackHandler:
+            def handle(self, **kwargs: object) -> dict:
+                return expected_response
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        result = handler(card_action_event())
+
+        self.assertEqual(result, expected_response)
+
+    def test_message_branch_still_returns_none(self) -> None:
+        """普通消息事件分支必须保持返回 ``None``——本参数加入之前的既有行为
+        逐字节不变，只有卡片回调分支的返回值现在被透传。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        received: list[str] = []
+
+        class StubPipeline:
+            def handle_message(self, message) -> None:
+                received.append(message.event_id)
+
+        handler = make_event_handler(StubPipeline(), audit=Audit())  # type: ignore[arg-type]
+
+        result = handler(event("evt_normal_direct"))
+
+        self.assertIsNone(result)
+        self.assertEqual(received, ["evt_normal_direct"])
+
 
 class AckReportingTests(unittest.TestCase):
     """派发结果必须回报给传输层，SDK 才知道该向飞书回 OK 还是 500。"""
@@ -438,16 +493,18 @@ class AckReportingTests(unittest.TestCase):
     class ReportingTransport(ScriptedTransport):
         def __init__(self, episodes):
             super().__init__(episodes)
-            self.reports: list[tuple[str, str | None]] = []
+            self.reports: list[tuple[str, str | None, dict | None]] = []
 
-        def report(self, payload, error):
-            self.reports.append((payload["header"]["event_id"], type(error).__name__ if error else None))
+        def report(self, payload, error, response=None):
+            self.reports.append(
+                (payload["header"]["event_id"], type(error).__name__ if error else None, response)
+            )
 
     def test_a_successful_dispatch_reports_no_error(self) -> None:
         transport = self.ReportingTransport([[event("evt_ok")]])
         run(transport, lambda payload: None)
 
-        self.assertEqual(transport.reports, [("evt_ok", None)])
+        self.assertEqual(transport.reports, [("evt_ok", None, None)])
 
     def test_a_failed_dispatch_reports_the_error(self) -> None:
         """注入落库失败 → 必须回报错误，否则飞书会把丢失的消息当成已投递。"""
@@ -458,7 +515,7 @@ class AckReportingTests(unittest.TestCase):
         transport = self.ReportingTransport([[event("evt_bad")]])
         run(transport, explode)
 
-        self.assertEqual(transport.reports, [("evt_bad", "RuntimeError")])
+        self.assertEqual(transport.reports, [("evt_bad", "RuntimeError", None)])
 
     def test_a_transport_without_report_still_works(self) -> None:
         """假传输层不实现 report 时不得报错——它是可选协议。"""
@@ -466,6 +523,54 @@ class AckReportingTests(unittest.TestCase):
         transport = ScriptedTransport([[event("evt_ok")]])
         _, reason, _, _ = run(transport, lambda payload: None)
         self.assertEqual(reason, TerminationReason.STOPPED)
+
+
+class ResponsePipelineTests(unittest.TestCase):
+    """Issue #96 卡片回调应答修复：处理器的返回值必须原样回报给传输层
+    （``report(payload, error, response)``），最终由
+    ``adapters/feishu_longconn._RawEventSink._do_without_validation`` 交给 SDK
+    marshal 进应答帧 ``resp.data``——SDK 据此决定要不要把飞书卡片换成新内容
+    （见 ``core/admin/card_callback.py`` 模块文档「载体 #96」）。"""
+
+    def test_a_handler_returning_a_response_dict_is_reported_alongside_no_error(
+        self,
+    ) -> None:
+        """卡片回调分支：handler 返回一个应答字典（模拟
+        ``AdminCardCallbackHandler.handle`` 的返回值），必须原样出现在
+        ``report`` 的第三个参数里。"""
+
+        card_response = {
+            "toast": {"type": "success", "content": "已确认执行。"},
+            "card": {"type": "raw", "data": {"schema": "2.0"}},
+        }
+        transport = AckReportingTests.ReportingTransport([[event("evt_card")]])
+
+        run(transport, lambda payload: card_response)
+
+        self.assertEqual(transport.reports, [("evt_card", None, card_response)])
+
+    def test_a_normal_message_handler_returning_none_reports_no_response(self) -> None:
+        """普通消息事件分支：handler 隐式返回 ``None``——本通道加入之前的既有
+        行为必须逐字节保持不变，不能悄悄变成空字典或其它哨兵值。"""
+
+        transport = AckReportingTests.ReportingTransport([[event("evt_msg")]])
+
+        run(transport, lambda payload: None)
+
+        self.assertEqual(transport.reports, [("evt_msg", None, None)])
+
+    def test_a_failed_dispatch_reports_the_error_and_no_response(self) -> None:
+        """处理器抛异常时不产出应答——``error`` 已经足够让传输层向飞书回失败，
+        ``response`` 必须保持 ``None``，不能把处理器崩溃前算出的半成品当应答。"""
+
+        def explode(payload: dict) -> dict:
+            raise RuntimeError("处理失败")
+
+        transport = AckReportingTests.ReportingTransport([[event("evt_bad")]])
+
+        run(transport, explode)
+
+        self.assertEqual(transport.reports, [("evt_bad", "RuntimeError", None)])
 
 
 class InterruptibleBackoffTests(unittest.TestCase):

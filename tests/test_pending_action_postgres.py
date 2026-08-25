@@ -458,6 +458,54 @@ class MarkCardDeliveredAndSendFailedTests(PendingActionPostgresTestCase):
         )
         self.assertEqual(rows[0], (True, "cardkit_abc"))
 
+    def test_mark_card_delivered_advances_card_sequence_baseline_to_two(self) -> None:
+        """Issue #96 卡片回调应答修复：CardKit 建卡 + 发送各自消耗一次整卡级
+        sequence（实测依据见 ``mark_card_delivered`` 文档）——序号 1、2 的全量
+        更新会被平台幂等吞掉，真正生效的更新必须携带 sequence>=3。"""
+
+        self.add_target_user(account_state="enabled")
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        assert outcome.pending is not None
+
+        self.store.mark_card_delivered(
+            pending_action_id=outcome.pending.id, card_id="cardkit_seq_baseline"
+        )
+
+        rows = self.query(
+            "SELECT card_sequence FROM pending_action WHERE id = %s", (outcome.pending.id,)
+        )
+        self.assertGreaterEqual(rows[0][0], 2, "送达后的 sequence 基线必须至少为 2")
+        next_sequence = self.store.next_card_sequence(pending_action_id=outcome.pending.id)
+        self.assertEqual(next_sequence, 3, "送达后第一次终态更新必须使用 sequence>=3 才会生效")
+
+    def test_mark_card_delivered_does_not_regress_an_already_advanced_sequence(self) -> None:
+        """``GREATEST`` 而非覆盖式赋值：万一 ``mark_card_delivered`` 被重复调用，
+        不能把已经因为其它路径前进过的 sequence 倒退回 2。"""
+
+        self.add_target_user(account_state="enabled")
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+        assert outcome.pending is not None
+        self.execute(
+            "UPDATE pending_action SET card_sequence = 5 WHERE id = %s", (outcome.pending.id,)
+        )
+
+        self.store.mark_card_delivered(
+            pending_action_id=outcome.pending.id, card_id="cardkit_seq_no_regress"
+        )
+
+        rows = self.query(
+            "SELECT card_sequence FROM pending_action WHERE id = %s", (outcome.pending.id,)
+        )
+        self.assertEqual(rows[0][0], 5, "已经前进过的 sequence 不得被 mark_card_delivered 拉低")
+
     def test_mark_send_failed_voids_the_action(self) -> None:
         self.add_target_user(account_state="enabled")
         outcome = self.store.prepare(

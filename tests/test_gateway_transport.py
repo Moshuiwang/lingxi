@@ -88,6 +88,47 @@ class AckTimingTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             sink._do_without_validation(b"{}")
 
+    def test_it_returns_the_reported_response_on_success(self) -> None:
+        """Issue #96 卡片回调应答修复：``pending.response`` 必须原样成为
+        ``_do_without_validation`` 的返回值——SDK 由此把它 marshal 进应答帧
+        ``resp.data``（见模块文档「本方法的返回值就是卡片回调应答通道」）。"""
+
+        sink, submitted = self._sink()
+        result: list[object] = []
+
+        def deliver() -> None:
+            result.append(sink._do_without_validation(b'{"header": {"event_id": "e"}}'))
+
+        thread = threading.Thread(target=deliver, daemon=True)
+        thread.start()
+        while not submitted:
+            pass
+        response = {"toast": {"type": "success", "content": "已确认执行。"}}
+        submitted[0].complete(None, response)
+        thread.join(timeout=2)
+
+        self.assertEqual(result, [response])
+
+    def test_a_plain_message_event_with_no_response_returns_none(self) -> None:
+        """普通消息事件的处理器不产出应答内容：不传 ``response``（默认值）时
+        必须返回 ``None``，不是空字典或其它哨兵值——行为与本通道加入之前逐字节
+        一致。"""
+
+        sink, submitted = self._sink()
+        result: list[object] = []
+
+        def deliver() -> None:
+            result.append(sink._do_without_validation(b'{"header": {"event_id": "e"}}'))
+
+        thread = threading.Thread(target=deliver, daemon=True)
+        thread.start()
+        while not submitted:
+            pass
+        submitted[0].complete(None)  # 不传 response
+        thread.join(timeout=2)
+
+        self.assertEqual(result, [None])
+
 
 class ExceptionTranslationTests(unittest.TestCase):
     """`V-接入-06`：SDK 异常 → 我们自己的 ``HandshakeFailure``。"""
@@ -382,6 +423,52 @@ class HeartbeatTests(_StubSDKTestCase):
 
             transport.report(payload, None)
             self.assertTrue(acked.wait(2), "report 之后 SDK 侧才应解除阻塞")
+        finally:
+            stream.close()
+
+    def test_a_response_passed_to_report_is_returned_from_do_without_validation(
+        self,
+    ) -> None:
+        """端到端：``report(payload, error, response)`` 传入的卡片回调应答必须
+        原样成为 ``_do_without_validation`` 的返回值——这正是 SDK 用来决定要不要
+        把飞书卡片换成新内容的那个值（Issue #96 卡片回调应答修复）。"""
+
+        from lingxi.adapters.feishu_longconn import LarkEventTransport
+
+        transport = LarkEventTransport(
+            app_id="cli_fake", app_secret="fake", poll_seconds=0.02, ack_timeout_seconds=5
+        )
+        stream = transport.stream()
+        try:
+            next(stream)  # 建连
+            client = self.clients[0]
+            results: list[object] = []
+
+            def deliver() -> None:
+                results.append(
+                    client.event_handler._do_without_validation(
+                        json.dumps({"header": {"event_id": "evt_card"}}).encode("utf-8")
+                    )
+                )
+
+            threading.Thread(target=deliver, daemon=True).start()
+
+            payload = None
+            for _ in range(200):
+                payload = next(stream)
+                if payload is not None:
+                    break
+            self.assertIsNotNone(payload, "投递的事件应当从 stream 里出来")
+
+            response = {"toast": {"type": "success", "content": "已确认执行。"}}
+            transport.report(payload, None, response)
+
+            deadline = threading.Event()
+            for _ in range(100):
+                if results:
+                    break
+                deadline.wait(0.02)
+            self.assertEqual(results, [response])
         finally:
             stream.close()
 

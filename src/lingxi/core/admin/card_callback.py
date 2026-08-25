@@ -4,6 +4,34 @@
 只依赖注入的 ``Protocol`` 端口，不 import ``adapters/``（代码框架第二节）。真实装配
 见 ``apps/gateway/__init__.py``；测试注入内存假实现。
 
+## 载体 #96：``handle()`` 的返回值就是飞书卡片回调的应答帧
+
+**根因（编排者用真实探针 + SDK 源码坐实）**：产品负责人真实点击确认卡后，业务执行
+成功、群通知成功，但卡片永远回弹为原始带按钮状态。飞书卡片 2.0 的
+``card.action.trigger`` 回调期望应答帧携带处理结果——lark SDK ws client
+（``lark_oapi/ws/client.py`` 的 ``_handle_data_frame``，实测 1.7.1）把
+``event_handler._do_without_validation`` 的**返回值** marshal 进应答帧
+``resp.data``；``adapters/feishu_longconn.py`` 的 ``_RawEventSink.
+_do_without_validation`` 此前对一切事件都返回 ``None``（=空 OK），平台收到空
+``resp.data`` 便按"维持原卡"处理，视觉回滚——即使 ``_update_card_to_terminal``
+出带外调用了 ``AdminCardTransport.update()`` 也一样：同一次点击的响应窗口内，
+出带外更新会被这次回调自己的空应答盖掉（窗口外的同一实体更新则正常生效，两组真实
+探针已证）。
+
+修复方式：:meth:`AdminCardCallbackHandler.handle` 不再返回 ``CardCallbackOutcome``
+这类内部结构，而是**直接返回飞书要的应答字典**——``apps/gateway/__init__.py`` 的
+``make_event_handler`` 把它原样 ``return``，经
+``lingxi.adapters.feishu_longconn.LongConnectionSupervisor._dispatch`` 一路透传到
+``_RawEventSink._do_without_validation`` 的返回值，SDK 据此在应答帧里换上新卡片。
+应答形状（SDK ``lark_oapi/event/callback/model/p2_card_action_trigger.py`` 的
+``P2CardActionTriggerResponse``）：
+``{"toast": {"type": "success"|"error"|"info", "content": "..."},
+"card": {"type": "raw", "data": <卡片 2.0 JSON 对象>}}``；不带 ``card`` 键时飞书
+不改变卡片当前展示，四类分支的具体形状见 :meth:`~AdminCardCallbackHandler.handle`
+方法文档。出带外的 ``_update_card_to_terminal``/``_notify_group`` 两个 best-effort
+分支保留不变——应答换卡是本次修复后的主路径，出带外更新降级为冗余纵深（即使它
+失败，只要终态卡渲染本身没有异常，应答里仍然带着正确的终态卡）。
+
 ## 为什么是一个独立类而不是塞进 ``core/admin/router.py``
 
 ``AdminCommandRouter`` 处理的是私聊**文本**命令；本类处理的是**卡片按钮回调**，
@@ -51,14 +79,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
     AdminCardTransport,
     GroupNotifier,
+    render_card_payload,
     render_group_notice,
     render_terminal_card,
 )
@@ -106,17 +134,6 @@ class AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 
 
-@dataclass(frozen=True)
-class CardCallbackOutcome:
-    """交给调用方（``apps/gateway``）的最终结论。``ok`` 只表示"这次点击是否让
-    对应的写动作真正执行成功"——``ok=False`` 覆盖取消、过期、拒绝等全部非执行结果，
-    调用方不需要（也不应该）在这个结论之外再做任何业务判断。
-    """
-
-    ok: bool
-    message: str
-
-
 class AdminCardCallbackHandler:
     """``card.action.trigger`` 事件的唯一处理入口。见模块文档。"""
 
@@ -137,8 +154,29 @@ class AdminCardCallbackHandler:
 
     def handle(
         self, *, operator_open_id: str, pending_action_id: str, decision: str, trace_id: str
-    ) -> CardCallbackOutcome:
-        """处理一次卡片按钮点击。
+    ) -> dict[str, Any]:
+        """处理一次卡片按钮点击，返回飞书卡片回调的应答载荷（见模块文档「载体 #96」）。
+
+        返回值不是内部结论，是**要直接交给飞书的应答帧**——``apps/gateway`` 原样
+        ``return`` 它，一路透传到 ``adapters/feishu_longconn.py`` 的
+        ``_RawEventSink._do_without_validation``，由 lark SDK marshal 进
+        ``resp.data``。四类应答形状：
+
+        1. 点击后达到/已处于终态（``executed``/``cancelled``/``expired``/
+           ``failed``，含幂等重放）：``{"toast": {"type": "success"（仅
+           ``executed``）/"info"（其余三种）, "content": <终态文案>},
+           "card": {"type": "raw", "data": <终态卡 2.0 JSON 对象>}}``——终态卡
+           JSON 复用 :func:`~lingxi.core.admin.notification.render_card_payload`，
+           与出带外 ``update()`` 调用共用同一份构造，不允许分叉出第二份。
+        2. 点击人不是发起人：``pending_action`` 保持 ``pending`` 不变（见
+           ``decide_confirm``/``decide_cancel`` 文档），toast error，**不带
+           ``card``**——不能把终态卡展示给非发起人，也不能改动发起人正在看的
+           那张卡片。
+        3. 动作不存在（``decision`` 不是 ``"confirm"``/``"cancel"``，或
+           ``pending_action_id`` 从未存在过/未真正送达）：toast error，不带
+           ``card``。
+        4. 审计写入失败（:class:`PendingActionAuditWriteFailed`，事务已整体
+           回滚）：toast error「系统繁忙请重试」，不带 ``card``。
 
         ``decision`` 只识别 ``"confirm"``/``"cancel"`` 两个字面量（见
         ``core/admin/notification.py`` 的 ``DECISION_CONFIRM``/``DECISION_CANCEL``
@@ -149,7 +187,7 @@ class AdminCardCallbackHandler:
             self._audit.record(
                 "admin.card_callback.unknown_decision", trace_id=trace_id
             )
-            return CardCallbackOutcome(ok=False, message="")
+            return _toast_error("操作不存在或已失效")
 
         try:
             if decision == DECISION_CONFIRM:
@@ -162,26 +200,24 @@ class AdminCardCallbackHandler:
                 )
         except PendingActionAuditWriteFailed:
             # 审计写入失败：事务已回滚，pending_action 与目标账号均未改变。不更新
-            # 卡片终态（这次点击结构上"没有发生过"，卡片仍然是可以重新点击的
-            # pending 态，符合接口设计错误码 audit_write_failed 的"调用方可重试"），
-            # 只记一条审计。
+            # 卡片终态、不带 card（这次点击结构上"没有发生过"，卡片仍然是可以
+            # 重新点击的 pending 态，符合接口设计错误码 audit_write_failed 的
+            # "调用方可重试"），只记一条审计。
             self._audit.record(
                 "admin.card_callback.audit_write_failed",
                 pending_action_id=pending_action_id,
                 trace_id=trace_id,
             )
-            return CardCallbackOutcome(
-                ok=False, message="本次操作因内部错误未能完成，请稍后重试。"
-            )
+            return _toast_error("系统繁忙请重试")
 
         if outcome.pending is None:
-            # 从未存在过的待确认操作 ID（含伪造回调）——没有可更新的卡片，只记审计。
+            # 从未存在过的待确认操作 ID（含伪造回调）——没有可展示的卡片，只记审计。
             self._audit.record(
                 "admin.card_callback.not_found",
                 pending_action_id=pending_action_id,
                 trace_id=trace_id,
             )
-            return CardCallbackOutcome(ok=False, message="")
+            return _toast_error("操作不存在或已失效")
 
         pending = outcome.pending
         self._audit.record(
@@ -192,23 +228,49 @@ class AdminCardCallbackHandler:
             trace_id=trace_id,
         )
 
-        # 卡片视觉收敛：只要这一行**现在**是终态就尝试刷新展示，不要求这次点击本身
-        # 是让它第一次落进终态的那一次（见模块文档）。
+        # 卡片视觉收敛：只要这一行**现在**是终态就渲染终态卡 JSON，不要求这次点击
+        # 本身是让它第一次落进终态的那一次（见模块文档，含幂等重放）。出带外
+        # update() 调用是冗余纵深，即使它失败，card_payload 已经在
+        # _update_card_to_terminal 内部算好并原样返回——应答本身仍然带着正确的
+        # 终态卡（模块文档「载体 #96」）。
+        card_payload: dict[str, Any] | None = None
         if pending.status is not PendingActionStatus.PENDING:
-            self._update_card_to_terminal(pending)
+            card_payload = self._update_card_to_terminal(pending)
 
         # 群通知：只在这次点击**首次**产生了新的终态时发送，避免幂等重放刷屏。
         if outcome.decision.terminal_status is not None:
             self._notify_group(pending)
 
-        return CardCallbackOutcome(ok=outcome.decision.ok, message=outcome.decision.message)
+        if pending.status is PendingActionStatus.PENDING:
+            # 到这里仍是 pending 的唯一分支是点击人不是发起人——其余分支都会让
+            # pending_action 落进某个终态（见 decide_confirm/decide_cancel）。
+            return _toast_error("只有发起人本人可以操作此卡片")
 
-    def _update_card_to_terminal(self, pending: PendingAction) -> None:
+        response: dict[str, Any] = {
+            "toast": {
+                "type": "success" if pending.status is PendingActionStatus.EXECUTED else "info",
+                "content": _outcome_text(pending),
+            }
+        }
+        if card_payload is not None:
+            response["card"] = {"type": "raw", "data": card_payload}
+        return response
+
+    def _update_card_to_terminal(self, pending: PendingAction) -> dict[str, Any] | None:
+        """渲染终态卡的 CardKit JSON，并尽力而为地出带外更新已发出的那张卡片。
+
+        **返回值与出带外调用的成败无关**：``card_payload`` 在进入 ``try`` 块之前
+        就已经算好，``self._confirm_cards.update()`` 失败只记审计、不影响返回值
+        ——回调应答（``handle()`` 的主路径）需要在出带外更新失败时仍然携带正确
+        的终态卡（模块文档「载体 #96」：应答换卡是主路径，出带外更新是冗余纵深）。
+        """
+
         if pending.card_id is None:
-            return
+            return None
         card = render_terminal_card(
             pending, target_label=pending.target_open_id, outcome_text=_outcome_text(pending)
         )
+        card_payload = render_card_payload(card)
         try:
             # 换一个本次调用专用的 sequence（外部审查交叉裁定，opus P2-1）：同一张
             # 卡片可能因为回调重投被多次调用 update，CardKit 要求每次调用携带严格
@@ -221,6 +283,7 @@ class AdminCardCallbackHandler:
                 pending_action_id=pending.id,
                 error=type(error).__name__,
             )
+        return card_payload
 
     def _notify_group(self, pending: PendingAction) -> None:
         if self._group_notifier is None or not self._group_chat_id:
@@ -238,6 +301,15 @@ class AdminCardCallbackHandler:
                 pending_action_id=pending.id,
                 error=type(error).__name__,
             )
+
+
+def _toast_error(content: str) -> dict[str, Any]:
+    """错误类应答的公共形状：只有 toast，不带 ``card``（见模块文档「载体 #96」
+    ``handle()`` 的分支 2-4：这三类分支都不产生可以安全展示给这次点击者的卡片，
+    要么点击者不是发起人，要么这次点击对应的动作根本不存在或没有留下可信状态）。
+    """
+
+    return {"toast": {"type": "error", "content": content}}
 
 
 def _outcome_text(pending: PendingAction) -> str:

@@ -151,7 +151,7 @@ class LongConnectionSupervisor:
         self,
         *,
         transport: EventTransport,
-        handle_event: Callable[[dict], None],
+        handle_event: Callable[[dict], dict | None],
         backoff: BackoffPolicy | None = None,
         # 签名带 ``should_stop``：退避等待必须可被停机打断，不能是一个不可中断的
         # ``time.sleep``。把它做进类型里，注入的假实现也就不会退化成不可打断的。
@@ -244,7 +244,7 @@ class LongConnectionSupervisor:
                 )
 
     def _dispatch(self, payload: dict) -> None:
-        """把一条事件交给处理器，并把结果回报给传输层。
+        """把一条事件交给处理器，并把结果（含处理器的返回值）回报给传输层。
 
         `V-接入-12`：处理器抛异常（含收到未订阅、无处理器的事件类型）时，长连接不断开、
         后续事件照常处理。捕获 ``Exception`` 是刻意的——一条事件的失败不该影响整条连接。
@@ -252,33 +252,51 @@ class LongConnectionSupervisor:
         **结果必须回报给传输层。** 真实传输层的 SDK 线程正阻塞在这条事件上等 ack：
         成功才让它向飞书回 OK，失败要让它回 500 由平台重投。不回报的话，落库失败
         依然会被飞书当成投递成功，消息静默丢失（验收 P1-2）。
+
+        **处理器的返回值随 ``response`` 一起回报（Issue #96 卡片回调应答修复）。**
+        普通消息事件的处理器不返回任何东西（隐式 ``None``），行为与本参数加入之前
+        逐字节一致；``card.action.trigger`` 回调的处理器（``AdminCardCallbackHandler.
+        handle``，经 ``apps/gateway.make_event_handler`` 接线）返回一个应答字典，
+        经这里、``LarkEventTransport.report``、``PendingEvent.complete`` 一路传到
+        ``_RawEventSink._do_without_validation`` 的返回值，供 lark SDK marshal 进
+        应答帧 ``resp.data``（见 ``core/admin/card_callback.py`` 模块文档「载体
+        #96」）。处理器抛异常时 ``response`` 保持 ``None``——失败没有应答可言，
+        ``error`` 本身已经足够让传输层向飞书回失败。
         """
 
         error: BaseException | None = None
+        response: dict | None = None
         try:
-            self._handle_event(payload)
+            response = self._handle_event(payload)
         except Exception as caught:  # noqa: BLE001 - 见 docstring
             error = caught
             self._audit("event.handler_failed", error=f"{type(caught).__name__}: {caught}")
         finally:
             report = getattr(self._transport, "report", None)
             if report is not None:
-                report(payload, error)
+                report(payload, error, response)
 
 
 class PendingEvent:
     """一条正在处理中的事件，以及它的落库结果。
 
     ``_RawEventSink`` 提交它、阻塞等待；supervisor 处理完之后回填结果并唤醒。
+
+    ``response``（Issue #96 卡片回调应答修复）承载处理器成功时的返回值——普通消息
+    事件的处理器不返回东西，恒为 ``None``；``card.action.trigger`` 回调的处理器
+    返回一个应答字典，``_RawEventSink._do_without_validation`` 在成功时把它原样
+    作为自己的返回值交回给 SDK（见该方法文档）。
     """
 
     def __init__(self, payload: dict) -> None:
         self.payload = payload
         self.done = threading.Event()
         self.error: BaseException | None = None
+        self.response: dict | None = None
 
-    def complete(self, error: BaseException | None) -> None:
+    def complete(self, error: BaseException | None, response: dict | None = None) -> None:
         self.error = error
+        self.response = response
         self.done.set()
 
 
@@ -300,6 +318,15 @@ class _RawEventSink:
     超时或落库失败一律**向 SDK 抛异常**，让它回 500、由飞书按平台语义重投；
     我们这边因为整条入队是一个事务，回滚后 ``inbound_event`` 没有该行，重投能被
     重新完整处理（`V-队列-01`）。
+
+    **本方法的返回值就是卡片回调应答通道（Issue #96 卡片回调应答修复）。** 成功时
+    返回 ``pending.response``（不是恒为 ``None``）：``ws.Client._handle_data_frame``
+    实测（``lark_oapi/ws/client.py:341`` 起，1.7.1）把这里的返回值 marshal 进应答帧
+    ``resp.data``——``result = self._event_handler._do_without_validation(pl)``，
+    非 ``None`` 时 ``resp.data = base64.b64encode(JSON.marshal(result)...)``。普通
+    消息事件的处理器不产出应答内容，``pending.response`` 恒为 ``None``，行为与本
+    通道加入之前逐字节一致；``card.action.trigger`` 回调需要飞书据此换上新卡片，
+    见 ``core/admin/card_callback.py`` 模块文档「载体 #96」。
     """
 
     def __init__(
@@ -308,7 +335,7 @@ class _RawEventSink:
         self._submit = submit
         self._ack_timeout_seconds = ack_timeout_seconds
 
-    def _do_without_validation(self, payload: bytes) -> None:
+    def _do_without_validation(self, payload: bytes) -> dict | None:
         import json
 
         pending = PendingEvent(json.loads(payload.decode("utf-8")))
@@ -320,7 +347,7 @@ class _RawEventSink:
             )
         if pending.error is not None:
             raise pending.error
-        return None
+        return pending.response
 
 
 def translate_sdk_exception(error: BaseException) -> HandshakeFailure:
@@ -412,12 +439,15 @@ class LarkEventTransport:
         # （线程退出 vs 静默死亡），只记一句"连接结束"分不出是哪一种（内审 P2-4）。
         self.last_close_reason: str | None = None
 
-    def report(self, payload: dict, error: BaseException | None) -> None:
-        """supervisor 处理完一条事件后回填结果，唤醒还在等 ack 的 SDK 线程。"""
+    def report(
+        self, payload: dict, error: BaseException | None, response: dict | None = None
+    ) -> None:
+        """supervisor 处理完一条事件后回填结果（成功时含处理器的返回值，例如卡片
+        回调应答，Issue #96），唤醒还在等 ack 的 SDK 线程。"""
 
         pending = self._pending.pop(id(payload), None)
         if pending is not None:
-            pending.complete(error)
+            pending.complete(error, response)
 
     def stream(self) -> Iterator[dict | None]:
         """建连并逐条产出事件；空闲时定期产出 ``None`` 心跳。
