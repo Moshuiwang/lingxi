@@ -219,7 +219,7 @@ def make_event_handler(
     audit: Any,
     on_parse_error: Callable[[str], None] | None = None,
     card_callback_handler: Any = None,
-) -> Callable[[dict], None]:
+) -> Callable[[dict], dict | None]:
     """把原始事件体接到管线上。
 
     处理 ``im.message.receive_v1``（业务问数与管理命令面）。``card.action.trigger``
@@ -228,9 +228,18 @@ def make_event_handler(
     只测试消息路径的既有用例）时行为与本参数加入之前逐字节一致：仍然只记
     ``event.ignored`` 并返回，不致长连接崩溃（`V-接入-12`）。其余类型
     （``im.chat.member.bot.deleted_v1``）本批仍不处理，同样只记 ``event.ignored``。
+
+    **卡片回调分支的返回值必须原样透传（Issue #96 卡片回调应答修复）**：
+    ``card_callback_handler.handle(...)`` 返回的是要交给飞书的应答字典（见
+    ``core/admin/card_callback.py`` 模块文档「载体 #96」），本函数把它
+    ``return`` 出去，经 ``LongConnectionSupervisor._dispatch`` 一路传到 SDK。
+    此前这里只调用不返回，SDK 收到空应答，飞书按"维持原卡"处理，卡片永远回弹
+    为原始带按钮状态——这正是本次要修的缺陷，根因不在这一行本身（本函数从未
+    尝试构造应答），而在于它把已经算好的应答值原地丢弃。普通消息事件分支
+    （``pipeline.handle_message``）不返回任何东西，隐式 ``None``，行为不变。
     """
 
-    def handle(payload: dict) -> None:
+    def handle(payload: dict) -> dict | None:
         header = payload.get("header") if isinstance(payload, dict) else None
         event_type = header.get("event_type") if isinstance(header, dict) else None
 
@@ -243,16 +252,15 @@ def make_event_handler(
                 audit.record("event.unparsable", error=str(error))
                 if on_parse_error is not None:
                     on_parse_error(str(error))
-                return
+                return None
             decision = action_event.action_value.get("decision", "")
             pending_action_id = action_event.action_value.get("pending_action_id", "")
-            card_callback_handler.handle(
+            return card_callback_handler.handle(
                 operator_open_id=action_event.operator_open_id,
                 pending_action_id=pending_action_id,
                 decision=decision,
                 trace_id=action_event.trace_id,
             )
-            return
 
         if event_type != MESSAGE_RECEIVE_EVENT:
             audit.record("event.ignored", event_type=event_type)

@@ -4,6 +4,13 @@
 不产生任何终态更新或通知；伪造的待确认操作 ID 安全拒绝；审计写入失败时不假装已经
 更新了卡片）。真实状态机分支见 ``tests/test_pending_action.py``；真实事务见
 ``tests/test_pending_action_postgres.py``。
+
+**``handle()`` 的返回值即飞书卡片回调的应答载荷（Issue #96 卡片回调应答修复）**：
+本文件的每一条用例都断言 ``outcome`` 这个字典的形状——``outcome["toast"]["type"]``、
+``outcome["toast"]["content"]``，以及是否存在 ``outcome["card"]``——而不是像批次二
+那样断言一个内部 ``CardCallbackOutcome.ok``/``.message`` 结构。这不是测试风格的
+偏好：这个返回值本身就是要直接交给 SDK marshal 进应答帧的东西（见
+``core/admin/card_callback.py`` 模块文档），断言错了形状，回归就网不住。
 """
 
 from __future__ import annotations
@@ -160,7 +167,9 @@ class UnknownDecisionTests(unittest.TestCase):
             trace_id="trc_1",
         )
 
-        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "操作不存在或已失效")
+        self.assertNotIn("card", outcome, "不存在的动作不能带任何卡片")
         self.assertEqual(pending_actions.confirm_calls, [])
         self.assertEqual(pending_actions.cancel_calls, [])
         self.assertIn("admin.card_callback.unknown_decision", [action for action, _ in audit.records])
@@ -194,7 +203,13 @@ class ConfirmExecutionTests(unittest.TestCase):
             trace_id="trc_2",
         )
 
-        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success")
+        self.assertEqual(outcome["toast"]["content"], "已确认执行")
+        self.assertEqual(outcome["card"]["type"], "raw")
+        # 终态卡 data 必须是对象（dict），不是字符串——飞书要的是可以直接被
+        # SDK JSON 序列化的结构，不是我们提前 json.dumps 过的字符串。
+        self.assertIsInstance(outcome["card"]["data"], dict)
+        self.assertEqual(outcome["card"]["data"]["schema"], "2.0")
         self.assertEqual(len(cards.update_calls), 1)
         self.assertEqual(cards.update_calls[0]["card_id"], "cardkit_id_1")
         self.assertTrue(cards.update_calls[0]["card"].is_terminal)
@@ -237,7 +252,11 @@ class NotInitiatorTests(unittest.TestCase):
             trace_id="trc_3",
         )
 
-        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "只有发起人本人可以操作此卡片")
+        self.assertNotIn(
+            "card", outcome, "不能把任何卡片（含终态卡）展示给非发起人，也不能改动发起人的卡"
+        )
         self.assertEqual(cards.update_calls, [])
         self.assertEqual(group.sent, [])
 
@@ -273,7 +292,11 @@ class IdempotentReplayTests(unittest.TestCase):
             trace_id="trc_4",
         )
 
-        self.assertFalse(outcome.ok)
+        # 幂等重放：这次点击本身没有让状态"新"落进终态（decision.ok=False），
+        # 但 pending.status 现在确实是 executed——应答形状只看当前状态，因此仍是
+        # success + 终态卡（与首次确认时看到的应答一致，见 handle() 文档分支 1）。
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("card", outcome)
         self.assertEqual(len(cards.update_calls), 1, "卡片视觉仍应尝试收敛到终态")
         self.assertEqual(group.sent, [], "重复点击不得重复通知管理群")
 
@@ -305,7 +328,9 @@ class ForgedPendingActionIdTests(unittest.TestCase):
             trace_id="trc_5",
         )
 
-        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "操作不存在或已失效")
+        self.assertNotIn("card", outcome)
         self.assertEqual(cards.update_calls, [])
         self.assertEqual(group.sent, [])
         self.assertIn("admin.card_callback.not_found", [action for action, _ in audit.records])
@@ -333,7 +358,9 @@ class AuditWriteFailureTests(unittest.TestCase):
             trace_id="trc_6",
         )
 
-        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "系统繁忙请重试")
+        self.assertNotIn("card", outcome)
         self.assertEqual(cards.update_calls, [])
         self.assertEqual(group.sent, [])
         self.assertIn(
@@ -370,7 +397,13 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
             trace_id="trc_7",
         )
 
-        self.assertTrue(outcome.ok, "卡片视觉更新失败不改变业务结果本身")
+        # 核心回归断言（Issue #96 根因场景）：出带外 update() 调用失败，不得让
+        # 应答本身也丢掉终态卡——应答换卡是主路径，出带外更新只是冗余纵深，见
+        # core/admin/card_callback.py 模块文档「载体 #96」与
+        # _update_card_to_terminal 方法文档。
+        self.assertEqual(outcome["toast"]["type"], "success", "卡片视觉更新失败不改变业务结果本身")
+        self.assertIn("card", outcome, "出带外 update() 失败不得连累应答本身携带正确的终态卡")
+        self.assertEqual(outcome["card"]["data"]["schema"], "2.0")
         self.assertEqual(len(group.sent), 1, "群通知仍应正常发出")
         self.assertIn(
             "admin.card_callback.card_update_failed", [action for action, _ in audit.records]
@@ -401,7 +434,8 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
             trace_id="trc_8",
         )
 
-        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("card", outcome)
         self.assertEqual(len(cards.update_calls), 1, "卡片更新仍应正常发出")
         self.assertIn(
             "admin.card_callback.group_notify_failed", [action for action, _ in audit.records]
@@ -431,7 +465,8 @@ class BestEffortSideEffectFailureTests(unittest.TestCase):
             trace_id="trc_9",
         )
 
-        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("card", outcome)
         self.assertEqual(len(cards.update_calls), 1)
 
 
@@ -461,7 +496,11 @@ class CancelPathTests(unittest.TestCase):
             trace_id="trc_10",
         )
 
-        self.assertTrue(outcome.ok)
+        # cancelled 不是 executed：toast 类型必须是 info，不是 success（见
+        # handle() 文档分支 1 的 success/info 映射）。
+        self.assertEqual(outcome["toast"]["type"], "info")
+        self.assertEqual(outcome["toast"]["content"], "已取消")
+        self.assertIn("card", outcome)
         self.assertEqual(pending_actions.confirm_calls, [])
         self.assertEqual(len(pending_actions.cancel_calls), 1)
         self.assertEqual(len(cards.update_calls), 1)

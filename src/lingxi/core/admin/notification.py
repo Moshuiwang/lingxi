@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
@@ -74,6 +74,51 @@ class RenderedConfirmCard:
     @property
     def is_terminal(self) -> bool:
         return not self.buttons
+
+
+def render_card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
+    """把 :class:`RenderedConfirmCard` 编码成 CardKit JSON 2.0 的 ``data`` 载荷。
+
+    从 ``adapters/feishu_admin_card.py`` 迁移到这里（Issue #96 卡片回调应答修复）：
+    ``card.action.trigger`` 回调的应答帧需要携带同一份终态卡 JSON（见
+    ``core/admin/card_callback.py`` 的 ``handle()`` 文档），而那个调用方按代码框架
+    第二节不得 import ``adapters/``。载荷构造本身是纯字典拼接、不依赖任何飞书 SDK，
+    移到这个不 import SDK 的展示层模块后，两个调用点（真实出站发送、回调应答）
+    复用同一份实现，不允许分叉出第二份。
+
+    按钮是 ``body.elements`` 的顶层元素，不套 ``{"tag": "action", "actions": [...]}``
+    容器——后者已被真实 CardKit 拒绝（``code=200861``，见
+    ``adapters/feishu_admin_card.py`` 模块文档「2026-08-25 建卡环节已被真实探针
+    证伪并修复」）。回调形态用 ``"behaviors": [{"type": "callback", "value": {...}}]``
+    （飞书文档《配置卡片交互》描述的 2.0 标准写法），``value`` 内容仍是
+    ``pending_action_id``/``decision`` 两个键。
+
+    ``buttons`` 为空（终态卡片）时只有一个 markdown 元素、没有任何按钮元素——这就是
+    "卡片更新为不可再次操作的最终状态"在 CardKit 层面的落点：终态卡片结构上不存在
+    任何可点击的按钮，不是靠禁用态按钮或前端约定"这张卡片已经不能点了"。
+    """
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": f"**{card.title}**\n\n{card.body}"}
+    ]
+    for button in card.buttons:
+        elements.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": button.label},
+                "type": "primary" if button.value.get("decision") == "confirm" else "default",
+                "behaviors": [
+                    {
+                        "type": "callback",
+                        # 按钮回传值：飞书文档标注 behaviors 里的 value 会原样出现在
+                        # card.action.trigger 事件的 action.value 字段（见
+                        # adapters/feishu_events.parse_card_action_event）。
+                        "value": dict(button.value),
+                    }
+                ],
+            }
+        )
+    return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
 
 
 @dataclass(frozen=True)

@@ -233,11 +233,27 @@ class PostgresPendingActionStore:
         return PrepareOutcome(decision=decision, pending=pending)
 
     def mark_card_delivered(self, *, pending_action_id: str, card_id: str) -> None:
-        """卡片确认送达（收到权威"平台已接收"回读）后置真。"""
+        """卡片确认送达（收到权威"平台已接收"回读）后置真。
+
+        **同时把 ``card_sequence`` 基线抬到至少 2**（Issue #96 卡片回调应答修复，
+        序号基线正式化）：编排者在 `biai-stage` 用受控探针实测——CardKit 建卡
+        （``cardkit.v1.card.create``）与随后作为消息发出（``im.v1.message.reply``）
+        各自消耗一次整卡级 sequence，序号 1、2 两次全量更新会被平台判定为
+        "内容未变"而幂等吞掉（``code=0`` 但卡片视觉不刷新）；真正生效的更新必须
+        携带 ``sequence>=3``。这条基线此前只在 stage 用临时数据库触发器验证，本次
+        改动把探针验证过的事实正式落进代码——部署本修复后，stage 侧的临时触发器
+        随之撤除。``next_card_sequence()`` 因此在卡片送达后第一次调用会返回 3，
+        与真实 CardKit 的整卡计数器对齐。
+
+        用 ``GREATEST`` 而不是覆盖式赋值 ``= 2``：``mark_card_delivered`` 结构上
+        不会被同一条待确认操作调用第二次，但 ``GREATEST`` 让这条语句即使被重复
+        调用也不会把已经因为其它路径前进过的 sequence 倒退回 2。
+        """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE pending_action SET card_delivered = TRUE, card_id = %s"
+                "UPDATE pending_action SET card_delivered = TRUE, card_id = %s,"
+                " card_sequence = GREATEST(card_sequence, 2)"
                 " WHERE id = %s AND status = 'pending'",
                 (card_id, pending_action_id),
             )

@@ -37,6 +37,14 @@ action 容器移到顶层元素，回调形态选用飞书《配置卡片交互�
 符合文档描述、卡片视觉表现是否符合预期**，这些仍是本段落上下两处已经登记的
 `biai-stage` L4a 受控验收范围，本次改动不改变它们的证据等级。
 
+**同日晚些时候：``_card_payload()`` 迁出本文件**（Issue #96 卡片回调应答修复，载体
+#96）：``card.action.trigger`` 回调的应答帧需要携带同一份终态卡 JSON（见
+``core/admin/card_callback.py`` 的 ``handle()`` 文档），而应答的构造方按代码框架
+第二节不得 import ``adapters/``。函数改名为 ``render_card_payload()``，迁移到不 import
+任何飞书 SDK 的 ``core/admin/notification.py``；本文件的 ``create()``/``update()``
+改为从那里导入复用，不再持有本地定义——上面两段历史记叙提到的 ``_card_payload()``
+就是这个函数搬家前的名字，行为未变。
+
 **已知边界（L4a 未验证）**：:meth:`LarkAdminCardTransport.create` 的 ``chat_id`` 参数
 在方法体内从未被使用——真正决定卡片送到哪个私聊的是 ``reply_to_message_id``（回复
 触发这条命令的那条消息），``chat_id`` 只是 Protocol 签名里携带的展示性参数（与
@@ -52,49 +60,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from lingxi.core.admin.notification import AdminCardCreated, AdminCardDeliveryRejected, RenderedConfirmCard
-
-
-def _card_payload(card: RenderedConfirmCard) -> dict[str, Any]:
-    """CardKit JSON 2.0 的 ``data`` 载荷。
-
-    按钮是 ``body.elements`` 的顶层元素，不套 ``{"tag": "action", "actions": [...]}``
-    容器——后者已被真实 CardKit 拒绝（``code=200861``），见模块文档"2026-08-25
-    建卡环节已被真实探针证伪并修复"。回调形态用
-    ``"behaviors": [{"type": "callback", "value": {...}}]``（飞书文档《配置卡片
-    交互》描述的 2.0 标准写法），``value`` 内容仍是 ``pending_action_id``/
-    ``decision`` 两个键，只是回传数据的落点从按钮自身的 ``value`` 属性挪到了
-    ``behaviors[0]["value"]``——回调事件里 ``action.value`` 是否原样等于这里写入的
-    内容，字段路径已经过飞书文档核实（见
-    ``adapters/feishu_events.parse_card_action_event`` 文档），真实点击触发的事件体
-    是否逐字符合文档描述仍是 L4a 未验证项。
-
-    ``buttons`` 为空（终态卡片）时只有一个 markdown 元素、没有任何按钮元素——这就是
-    "卡片更新为不可再次操作的最终状态"在 CardKit 层面的落点：终态卡片结构上不存在
-    任何可点击的按钮，不是靠禁用态按钮或前端约定"这张卡片已经不能点了"。
-    """
-
-    elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": f"**{card.title}**\n\n{card.body}"}
-    ]
-    for button in card.buttons:
-        elements.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": button.label},
-                "type": "primary" if button.value.get("decision") == "confirm" else "default",
-                "behaviors": [
-                    {
-                        "type": "callback",
-                        # 按钮回传值：飞书文档标注 behaviors 里的 value 会原样出现在
-                        # card.action.trigger 事件的 action.value 字段（见函数文档、
-                        # adapters/feishu_events.parse_card_action_event）。
-                        "value": dict(button.value),
-                    }
-                ],
-            }
-        )
-    return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
+from lingxi.core.admin.notification import (
+    AdminCardCreated,
+    AdminCardDeliveryRejected,
+    RenderedConfirmCard,
+    render_card_payload,
+)
 
 
 class LarkAdminCardTransport:
@@ -124,7 +95,7 @@ class LarkAdminCardTransport:
             .request_body(
                 CreateCardRequestBody.builder()
                 .type("card_json")
-                .data(json.dumps(_card_payload(card), ensure_ascii=False))
+                .data(json.dumps(render_card_payload(card), ensure_ascii=False))
                 .build()
             )
             .build()
@@ -204,7 +175,7 @@ class LarkAdminCardTransport:
                 .card(
                     Card.builder()
                     .type("card_json")
-                    .data(json.dumps(_card_payload(card), ensure_ascii=False))
+                    .data(json.dumps(render_card_payload(card), ensure_ascii=False))
                     .build()
                 )
                 .sequence(sequence)
