@@ -645,7 +645,7 @@ def redact_free_text_with_count(text: str) -> tuple[str, int]:
     """与 :func:`redact_free_text` 输出**逐字节相同**的脱敏结果，额外返回命中次数。
 
     唯一消费方是内测轮内容级采集（Issue #251/#304 批次 3，
-    ``core/innertest/content_capture.py``）：采集要求"凭据类命中即以占位符替换
+    ``core/innertest_content_capture.py``）：采集要求"凭据类命中即以占位符替换
     并计数标注"，而 :func:`redact_free_text` 只回答"替换后的文本"，回答不了
     "替换了几处"。这里不重新发明一套脱敏规则——三段替换（赋值语句、
     ``bearer``/``basic`` 认证头、含数字或超长的裸令牌串）与 :func:`_redact_free_text`
