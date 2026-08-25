@@ -129,15 +129,20 @@ def _report_guard_denied_count(report: Mapping[str, Any]) -> int | None:
 
     ``report["audit"]`` 不存在（早退分支：开工前已 ``stop_requested``、读用户
     MCP 配置失败、执行器抛出未预期异常，均从未真正跑过一次 ``PreToolUse``
-    判定）时返回 ``None``；``denied_count`` 存在但不是 ``int``（结构不符预期，
-    结构性地不可信）同样返回 ``None``。其余情况原样返回真实整数，包括合法的 0。
+    判定）时返回 ``None``；``denied_count`` 存在但不是 ``int``、或是负数
+    （结构不符预期，结构性地不可信——拒绝计数不存在"负几次"，出现负数只可能是
+    上游数据被破坏，与 :func:`_report_token_usage` 对同一类不可信数字的处理
+    对称，批次 4 opus 审查 P3-2）同样返回 ``None``。其余情况原样返回真实整数，
+    包括合法的 0。
     """
 
     audit = report.get("audit") if isinstance(report, Mapping) else None
     if not isinstance(audit, Mapping):
         return None
     count = audit.get("denied_count")
-    return count if isinstance(count, int) and not isinstance(count, bool) else None
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
 
 
 #: ``core/execution/message_stream.py::_usage_summary`` 产出的四个已知 token
