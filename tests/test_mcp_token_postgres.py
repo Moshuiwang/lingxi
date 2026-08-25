@@ -388,13 +388,13 @@ class TokenAdoptionTest(McpTokenPostgresTestCase):
     def test_adopting_a_secret_with_a_different_shape_is_rejected_by_the_database(self) -> None:
         """真实撞过一次：``token_cipher`` CHECK 钉的是"明文 43 字符"这一形状
         （迁移 ``0065``），与 ``issue_token`` 共用同一列、同一条约束。**PKCS7 补位到
-        16 字节的整数倍**，因此这条 CHECK 实际接受的是「UTF-8 字节数在 32–46 之间」
+        16 字节的整数倍**，因此这条 CHECK 实际接受的是「UTF-8 字节数在 32–47 之间」
         的候选明文（都补到 48 字节密文）——本用例特意选一个**远短于**这个区间的
         候选（12 字节），确保真的撞上 CHECK 而不是恰好落进同一个补位桶。加密后的
         信封长度不落在这个区间时，写不进这一列——数据库层面就地拒绝，不会静默存
         一份"形状不对"的密文。"""
 
-        short_secret = "short-secret"  # 12 字节，远短于 32–46 字节的合规区间。
+        short_secret = "short-secret"  # 12 字节，远短于 32–47 字节的合规区间。
         self.assertLess(len(short_secret.encode("utf-8")), 32)
         with self.assertRaises(Exception):
             self.store.adopt_token(USER_A, short_secret)
