@@ -67,6 +67,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
+from lingxi.apps.scheduler.audit import AuditSink
+
 logger = logging.getLogger(__name__)
 
 _UTC = timezone.utc
@@ -492,14 +494,33 @@ def assert_stalled_lease_exceeds_chain_budget(
         )
 
 
-def build_stock_token_source(config: Any, *, access_token: Callable[[], str] | None) -> Any | None:
+def build_stock_token_source(
+    config: Any,
+    *,
+    access_token: Callable[[], str] | None,
+    audit: AuditSink | None = None,
+) -> Any | None:
     """装配存量令牌只读源（Issue #281 改道，产品负责人 2026-08-25）；坐标、MCP 令牌
     主密钥或令牌供给缺一即不装配，返回 ``None``——开通链因此原样走原签发路径，与改动前
     逐字节一致（``V-开通-24``）。
 
-    坐标（``config.stock_token_app_token``/``stock_token_table_id``）未配置是这里最常见
-    的分支：该能力当前默认关闭，不是首次开通编排的硬前提，因此不在 ``_build_onboarding_
-    duty`` 那组「缺了整个职责都不注册」的前置里，本函数只返回 ``None``、调用方原样往下走。
+    坐标（``config.stock_token_app_token``/``stock_token_table_id``）**都**未配置是唯一
+    保持零信号的分支：该能力当前默认关闭，不是首次开通编排的硬前提，因此不在
+    ``_build_onboarding_duty`` 那组「缺了整个职责都不注册」的前置里，本函数只返回
+    ``None``、调用方原样往下走。
+
+    其余三个返回 ``None`` 的分支都是**半开的错误配置**，不是「这个能力被关掉了」，
+    各留恰一条 ``onboarding.stock_token_source_not_wired`` 审计（形状与注入方式照
+    :mod:`~lingxi.apps.scheduler.assembly` 里六处既有 ``*_duty_not_registered``：
+    只报症状分类，不回显任何配置值；`audit` 未传时静默跳过，不新增硬依赖）：
+
+    - ``partial_coordinates``：两个坐标只配了一个——这是部署时最容易手误留下的形状
+      （改一个环境变量时漏改另一个），改动前与「两个都没配」共用零信号，运维看不出
+      这里其实是半开的错误配置；
+    - ``missing_encrypt_key``：坐标齐但 MCP 令牌主密钥没接线；
+    - ``missing_access_token_supply``：坐标与主密钥都齐，但调用方没有交出令牌供给
+      （与 ``roster_audit.duty_not_registered`` 的同名原因码同一个含义：调用方真的
+      没有供给，不是「配了但取不到令牌」那种运行期失败）。
 
     复用**权限发布表的应用身份令牌供给**（Issue #226 裁定 3，调用方传入
     ``access_token``），不新增任何凭据材料：生产环境里这条只读能力很可能与发布表指向
@@ -507,9 +528,23 @@ def build_stock_token_source(config: Any, *, access_token: Callable[[], str] | N
     注释），可以单独打开/关闭而不影响发布面。
     """
 
-    if not config.stock_token_app_token or not config.stock_token_table_id:
+    app_token = config.stock_token_app_token
+    table_id = config.stock_token_table_id
+    if not app_token and not table_id:
         return None
-    if not config.mcp_token_encrypt_key or access_token is None:
+    if not app_token or not table_id:
+        if audit is not None:
+            audit.record("onboarding.stock_token_source_not_wired", reason="partial_coordinates")
+        return None
+    if not config.mcp_token_encrypt_key:
+        if audit is not None:
+            audit.record("onboarding.stock_token_source_not_wired", reason="missing_encrypt_key")
+        return None
+    if access_token is None:
+        if audit is not None:
+            audit.record(
+                "onboarding.stock_token_source_not_wired", reason="missing_access_token_supply"
+            )
         return None
 
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
@@ -521,8 +556,8 @@ def build_stock_token_source(config: Any, *, access_token: Callable[[], str] | N
     return DecryptingStockTokenSource(
         BitableStockTokenSource(
             base_url=config.feishu_base_url,
-            app_token=config.stock_token_app_token,
-            table_id=config.stock_token_table_id,
+            app_token=app_token,
+            table_id=table_id,
             access_token=access_token,
         ),
         cipher=McpTokenCipher(config.mcp_token_encrypt_key),

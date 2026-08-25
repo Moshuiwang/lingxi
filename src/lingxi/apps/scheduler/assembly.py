@@ -1477,7 +1477,7 @@ def build_loop(
         employment_access_token=supply,
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
-        stock_tokens=build_stock_token_source(config, access_token=permission_table_supply),
+        stock_tokens=build_stock_token_source(config, access_token=permission_table_supply, audit=sink),
         onboarding_failed=(
             alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
         ),
