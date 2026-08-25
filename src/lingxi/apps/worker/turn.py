@@ -35,6 +35,7 @@ from lingxi.core.execution.hooks import ToolGateway
 from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
+from lingxi.core.innertest_content_capture import ContentCaptureRecord, RawTurnCapture
 
 from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
@@ -84,6 +85,7 @@ class WorkerTurnExecutor:
         clock: Callable[[], float] | None = None,
         mark_external_side_effect: Callable[[], None] | None = None,
         propagate_cancellation: bool = False,
+        capture_raw_content: bool = False,
     ) -> None:
         self._config = config
         self._policy = ToolPolicy(allowed_tools=config.read_only_tools)
@@ -91,10 +93,16 @@ class WorkerTurnExecutor:
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
             redactor=AuditRedactor(allowed_input_fields=config.audit_input_fields),
         )
+        # 内测轮内容级采集（Issue #251/#304 批次 3）：默认 False，此时
+        # `self._raw_capture` 恒为 None，不构造任何收集器、不产生任何额外开销
+        # ——这正是"默认关闭可被断言证明"在这一层的形状。`apps/worker/service.py`
+        # 按 `WorkerConfig.innertest_content_capture_enabled` 决定是否传 True。
+        self._raw_capture = RawTurnCapture() if capture_raw_content else None
         self._gateway = ToolGateway(
             policy=self._policy,
             audit=self._audit,
             mark_external_side_effect=mark_external_side_effect,
+            raw_pre_tool_use=(self._raw_capture.on_pre_tool_use if self._raw_capture else None),
         )
         self._options: Any = None
         self._stderr_stream = sys.stderr if stderr_stream is None else stderr_stream
@@ -181,6 +189,8 @@ class WorkerTurnExecutor:
 
         def handle_event(event: Mapping[str, Any]) -> None:
             recorder.handle(event)
+            if self._raw_capture is not None:
+                self._raw_capture.on_stream_event(event)
             if on_stream_event is not None:
                 on_stream_event(event)
 
@@ -309,6 +319,27 @@ class WorkerTurnExecutor:
             business_execution_budget_seconds=self._config.turn_timeout_seconds,
             business_duration_seconds=business_duration_seconds,
             drain_duration_seconds=drain_duration_seconds,
+        )
+
+    def build_content_capture_record(
+        self, *, task_id: str, worker_id: str, question: str
+    ) -> ContentCaptureRecord | None:
+        """内测轮内容级采集的落库记录，只在 ``capture_raw_content=True`` 时非空。
+
+        必须在 :meth:`run_turn` 返回**之后**调用——``self._audit.summary()`` 读的是
+        本回合累积到此刻的记账，与 :meth:`run_turn` 内部传给 ``build_report`` 的
+        是同一份纯投影（``TurnAudit.summary()`` 不产生副作用，调用两次结果一致）。
+        调用方（``apps/worker/service.py``）拿到非 None 结果后仍需自行按开关决定
+        是否真的写库——这个方法只负责"有没有可采集的内容"，不做写库判断。
+        """
+
+        if self._raw_capture is None:
+            return None
+        return self._raw_capture.build_record(
+            task_id=task_id,
+            worker_id=worker_id,
+            question=question,
+            summary=self._audit.summary(),
         )
 
 

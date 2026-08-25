@@ -151,6 +151,12 @@ REQUIRED_MODULES = (
     # 的形状。
     "lingxi.core.daily_report",
     "lingxi.adapters.postgres_daily_report",
+    # 内测轮内容级采集（Issue #251/#304 批次 3）：凭据形状过滤、原始素材收集与
+    # 记录构造在 core，落库在 adapters，均由 lingxi-worker 在运行时按开关按需
+    # 加载（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）——"本地测试全绿但
+    # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.innertest_content_capture",
+    "lingxi.adapters.postgres_content_capture",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -668,6 +674,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.execution.message_stream",
             "lingxi.core.execution.tool_policy",
             "lingxi.core.ids",
+            # 内测轮内容级采集（Issue #251/#304 批次 3），由 apps.worker.turn/
+            # apps.worker.service/apps.worker.cli 模块级 import。
+            "lingxi.core.innertest_content_capture",
+            "lingxi.adapters.postgres_content_capture",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),

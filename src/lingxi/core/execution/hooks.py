@@ -51,10 +51,21 @@ class ToolGateway:
         policy: ToolPolicy,
         audit: TurnAudit,
         mark_external_side_effect: Callable[[], None] | None = None,
+        raw_pre_tool_use: Callable[[str | None, Any], None] | None = None,
     ) -> None:
         self._policy = policy
         self._audit = audit
         self._mark_external_side_effect = mark_external_side_effect
+        # 内测轮内容级采集的唯一原始入参出口（Issue #251/#304 批次 3，可选、默认
+        # None）：`self._audit` 记的是**经字段白名单裁剪过**的入参（见
+        # `AuditRedactor.redact`），采集要的是裁剪之前的原始值——因此不能从
+        # `self._audit` 反推，必须在这里另开一个独立分支，在传给审计之前把原始
+        # `tool_input` 递给调用方注入的收集器。默认 `None` 时这个分支整体不存在，
+        # 不产生任何额外调用、不额外持有一份原始入参——这是"默认关闭"在这一层的
+        # 具体形状：不是多一个 if 分支跳过写库，而是这份收集器压根没被构造出来
+        # （构造方见 apps/worker/turn.py）。失败必须被这里兜住、不得影响工具判定
+        # 本身（同 `_mark_side_effect` 的既有姿态）。
+        self._raw_pre_tool_use = raw_pre_tool_use
 
     @property
     def audit(self) -> TurnAudit:
@@ -112,6 +123,11 @@ class ToolGateway:
 
     def _on_pre_tool_use(self, tool_name: Any, tool_input: Any, call_id: str | None) -> dict[str, Any]:
         verdict = self._policy.decide(tool_name, tool_input if isinstance(tool_input, Mapping) else None)
+        if self._raw_pre_tool_use is not None:
+            try:
+                self._raw_pre_tool_use(call_id, tool_input)
+            except Exception:  # noqa: BLE001 - 采集失败不得影响工具判定本身
+                pass
         # 先把响应算出来，再记账：记账处理的是模型可控的入参，一旦它抛异常，
         # 异常会沿 hook 回调向上抛，把这次拒绝一起带走。审计可以失败，拒绝不能。
         response: dict[str, Any] = {}

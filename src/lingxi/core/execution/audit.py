@@ -641,6 +641,56 @@ def redact_free_text(text: str) -> str:
     return _redact_free_text(text)
 
 
+def redact_free_text_with_count(text: str) -> tuple[str, int]:
+    """与 :func:`redact_free_text` 输出**逐字节相同**的脱敏结果，额外返回命中次数。
+
+    唯一消费方是内测轮内容级采集（Issue #251/#304 批次 3，
+    ``core/innertest/content_capture.py``）：采集要求"凭据类命中即以占位符替换
+    并计数标注"，而 :func:`redact_free_text` 只回答"替换后的文本"，回答不了
+    "替换了几处"。这里不重新发明一套脱敏规则——三段替换（赋值语句、
+    ``bearer``/``basic`` 认证头、含数字或超长的裸令牌串）与 :func:`_redact_free_text`
+    逐条对应，只是把"是否真的发生了替换"从 ``sub()`` 的静默副作用改成显式计数。
+
+    ``_TOKEN_RUN`` 那一段尤其不能直接用 ``re.subn()`` 数：``_mask_token_run`` 对
+    纯字母且短于 32 字符的候选串**原样放行**（这正是 `V-审计-03` 登记的已知残余
+    缺口），``subn()`` 只统计"正则命中了几次"而不管回调有没有真的改写内容，会把
+    未被脱敏的候选也计入命中数——因此改用回调内部按"替换前后是否不同"自行计数。
+
+    这个计数只服务采集侧的可观测性标注，**不是**安全边界的一部分：安全边界仍然是
+    返回的文本本身。计数带有与 `V-审计-03` 相同的已知局限（纯字母短秘密不计入），
+    不得据此声称"命中数为零"等价于"这段文本没有凭据"。
+    """
+
+    count = 0
+
+    def _sub_assignment(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group(1)}[REDACTED]"
+
+    def _sub_scheme(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group(1)} [REDACTED]"
+
+    def _sub_token(match: re.Match[str]) -> str:
+        nonlocal count
+        run = match.group(0)
+        masked = _mask_token_run(match)
+        if masked != run:
+            count += 1
+        return masked
+
+    step = _SECRET_ASSIGNMENT.sub(_sub_assignment, text)
+    step = _SECRET_SCHEME.sub(_sub_scheme, step)
+    step = _TOKEN_RUN.sub(_sub_token, step)
+    # 内部一致性核对（本仓库无 -O 优化运行、assert 在生产路径已有先例见
+    # core/daily_report.py）：两条实现必须逐字节同文，任何一次改动让它们分岔
+    # 都必须响亮失败，而不是让「计数」与「实际替换的文本」各说各话。
+    assert step == _redact_free_text(text)
+    return step, count
+
+
 #: 匹配 URL 查询串里形如 ``?key=value``/``&key=value`` 的一段，只捕获**值**
 #: （group 1 是含分隔符与等号的前缀，原样保留；group 2 是要盖住的值）。不要求
 #: 完整解析成合法 URL——第三方 SDK 的连接日志可能把 URL 嵌在别的文字里

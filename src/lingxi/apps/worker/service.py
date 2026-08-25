@@ -18,6 +18,7 @@ from lingxi.apps.worker.session_cleanup import delete_agent_session_files
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import TerminalKind
+from lingxi.core.innertest_content_capture import ContentCaptureRecord
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +295,7 @@ class WorkerService:
         session_cleanup_batch_limit: int = 20,
         on_alert_tick: Callable[[], None] | None = None,
         on_terminal_outcome: TerminalOutcomeCallback | None = None,
+        content_capture_writer: Callable[[ContentCaptureRecord], None] | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -310,6 +312,13 @@ class WorkerService:
                 # 写成一次可能失真的 FAILED 终态。见 `WorkerTurnExecutor.run_turn`
                 # 里 `propagate_cancellation` 的完整说明。
                 propagate_cancellation=True,
+                # 内测轮内容级采集（Issue #251/#304 批次 3）：`worker_config` 是
+                # `_process_task` 按任务覆盖出的 `task_config`（见该方法），
+                # `innertest_content_capture_enabled` 未被那次覆盖触碰，取值恒等
+                # 于装配时的 `config.innertest_content_capture_enabled`。默认
+                # False 时这里传 False，`WorkerTurnExecutor` 不构造任何收集器
+                # ——与"默认关闭不产生额外行为"同一条纪律在这一层的体现。
+                capture_raw_content=worker_config.innertest_content_capture_enabled,
             )
         )
         self._listener_factory = listener_factory
@@ -330,6 +339,11 @@ class WorkerService:
         # P1）：``None`` 时 `_log_terminal_outcome` 整体跳过——没有装配方就没有
         # 输出，不假装写了一条实际被吞掉的日志。
         self._on_terminal_outcome = on_terminal_outcome
+        # 内测轮内容级采集的落库出口（Issue #251/#304 批次 3）：``None`` 时
+        # `_capture_content_if_enabled` 整体跳过，不构造记录、不尝试写库——与
+        # `_on_terminal_outcome` 同一姿态，没有装配方就没有输出。真正的装配
+        # 判断（是否按开关构造一个真实写入方）在 `apps/worker/cli.py`。
+        self._content_capture_writer = content_capture_writer
         # SIGTERM 收到后由 run() 设置：在途任务的 `_monitor` 据此把"进程正在停机"
         # 与"用户发了 /stop"同等看待，主动请求 Agent SDK 中断当前回合（Issue #153
         # 完成标准第 3 条）。默认 None，保持 process_once()/白盒测试的既有行为不变。
@@ -566,6 +580,11 @@ class WorkerService:
         # None；读到之后装配/建连失败的回合会带着摘要落失败终态，此时它回答的是
         # "失败那一轮试图使用哪版"，不声称模型已经收到。
         system_prompt_digest: str | None = None
+        # 内测轮内容级采集（Issue #251/#304 批次 3）：只在 try 主体真的构造出
+        # executor 之后才非 None（见下）；`UserMcpConfigError` 等在构造 executor
+        # 之前就失败的路径没有任何回合内容可采集，`_capture_content_if_enabled`
+        # 据此判断是否跳过。
+        executor: WorkerTurnExecutor | None = None
 
         def on_stream_event(event: Mapping[str, Any]) -> None:
             nonlocal progress_count
@@ -812,6 +831,47 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+            )
+
+        # 内测轮内容级采集（Issue #251/#304 批次 3）：无论上面走了哪条终态分支
+        # 都尝试采集——失败/超时回合的问题原文与已尝试的工具调用同样是"以日志
+        # 分析缺陷"要看的信号，不只是成功回合才有采集价值。必须排在全部终态
+        # 分支之后：终态收口（用户结果）优先于采集（旁路观测），即使这里失败
+        # 也不能影响上面已经写好的终态。
+        self._capture_content_if_enabled(claimed, executor=executor, question=context.prompt)
+
+    def _capture_content_if_enabled(
+        self, claimed: ClaimedTask, *, executor: WorkerTurnExecutor | None, question: str
+    ) -> None:
+        """内测轮内容级采集的写入点（Issue #251/#304 批次 3）。
+
+        失败必须整体降级为一条结构化审计日志、不得向上抛——采集是旁路观测，
+        不是任务能否完成的一部分（结构约束「采集失败不影响任务主流程」，见
+        docs/技术设计/数据库设计.md 与 apps/worker/config.py 的模块文档）。
+
+        ``executor`` 为 ``None``（进入 try 主体前就失败——例如
+        ``UserMcpConfigError`` 从未走到构造 executor 那一步，或任务在开头就
+        因带着 ``stop_requested`` 提前收口）时没有任何可采集的回合内容，直接
+        跳过；``self._content_capture_writer`` 为 ``None``（未装配写入方，见
+        ``apps/worker/cli.py`` 只在开关开启时才构造）同样跳过——两个判断分别
+        兜住"这次没有回合内容"与"这次没有落库出口"，都不是错误，不记日志。
+        """
+
+        if executor is None or self._content_capture_writer is None:
+            return
+        try:
+            record = executor.build_content_capture_record(
+                task_id=claimed.task_id,
+                worker_id=self._config.worker_id,
+                question=question,
+            )
+            if record is not None:
+                self._content_capture_writer(record)
+        except Exception as error:  # noqa: BLE001 - 采集失败降级为日志，不丢用户结果
+            logger.error(
+                "内测轮内容级采集写入失败，任务结果不受影响 task_id=%s error=%s",
+                claimed.task_id,
+                type(error).__name__,
             )
 
     def _append_event(

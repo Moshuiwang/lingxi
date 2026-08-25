@@ -44,6 +44,7 @@ from lingxi.adapters.postgres_conversation import (
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
+from lingxi.core.innertest_content_capture import ContentCaptureRecord
 from lingxi.core.conversation import EventPipeline, InboundMessage
 from lingxi.core.execution.card_stream import (
     CardCreated,
@@ -2762,4 +2763,215 @@ class SystemPromptFileTests(unittest.TestCase):
             asyncio.run(asyncio.wait_for(service.process_once(), timeout=10))
 
         self.assertIsNone(captured[0].system_prompt)
+
+
+class ContentCaptureWiringTests(unittest.TestCase):
+    """内测轮内容级采集的写入点（Issue #251/#304 批次 3，`_capture_content_if_enabled`）。
+
+    默认（不传 ``content_capture_writer``）时行为必须与本文件其余全部既有测试
+    的 fake ``Executor`` 完全兼容——那些类都**没有**定义 ``build_content_capture_record``
+    方法，如果关闭状态下仍然调用它，整个文件会因 ``AttributeError`` 集体报错。
+    本组第一条用例把这条隐含前提显式断言出来（`test_default_disabled_never_
+    touches_the_executor_capture_hook` 就是 V-采集-01/02 的变异验红锚点）。
+    """
+
+    def _sample_record(self, *, task_id: str = "tsk-1", worker_id: str = "worker-test") -> ContentCaptureRecord:
+        return ContentCaptureRecord(
+            task_id=task_id,
+            worker_id=worker_id,
+            question_content="问题",
+            question_redaction_count=0,
+            answer_content="结果",
+            answer_redaction_count=0,
+            tool_calls=(),
+        )
+
+    def test_default_disabled_never_touches_the_executor_capture_hook(self) -> None:
+        """默认关闭可被断言证明：不配置 ``content_capture_writer`` 时，
+        ``executor.build_content_capture_record`` 从未被调用——用一个**压根不
+        定义**该方法的 Executor 证明，调用了就会 ``AttributeError``。
+
+        **变异验红**：把 ``WorkerService._capture_content_if_enabled`` 的守卫条件
+        从 ``executor is None or self._content_capture_writer is None`` 改成
+        只判 ``executor is None``（即默认也尝试调用），本用例必须变红
+        （``AttributeError: 'Executor' object has no attribute
+        'build_content_capture_record'``）。
+        """
+
+        queue = FakeWorkerQueue()
+
+        class Executor:  # 刻意不定义 build_content_capture_record
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s1"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        asyncio.run(service.process_once())  # 不抛 AttributeError 即通过
+
         self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_writer_receives_the_record_built_by_the_executor_when_capture_enabled(self) -> None:
+        queue = FakeWorkerQueue()
+        record = self._sample_record()
+        received: list[ContentCaptureRecord] = []
+        build_calls: list[dict[str, object]] = []
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s1"},
+                    "failure": None,
+                }
+
+            def build_content_capture_record(self, **kwargs: object) -> ContentCaptureRecord:
+                build_calls.append(kwargs)
+                return record
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            content_capture_writer=received.append,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(received, [record])
+        # question 必须来自这次任务真实的 context.prompt（FakeWorkerQueue 固定
+        # 为 "问题"），task_id/worker_id 必须来自这次任务本身，不是随便传的值。
+        self.assertEqual(
+            build_calls,
+            [{"task_id": "tsk-1", "worker_id": "worker-test", "question": "问题"}],
+        )
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_writer_is_not_called_when_the_executor_reports_nothing_to_capture(self) -> None:
+        """``build_content_capture_record`` 返回 ``None``（执行器自己判断这次没有
+        可采集内容，见 ``WorkerTurnExecutor`` 未开启 ``capture_raw_content`` 时的
+        真实行为）时，写入方不得被调用——不能拿一个 ``None`` 硬写进数据库。"""
+
+        queue = FakeWorkerQueue()
+        received: list[ContentCaptureRecord] = []
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s1"},
+                    "failure": None,
+                }
+
+            def build_content_capture_record(self, **kwargs: object) -> None:
+                return None
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            content_capture_writer=received.append,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(received, [])
+
+    def test_capture_failure_does_not_affect_the_task_terminal_outcome(self) -> None:
+        """结构约束「采集失败不影响任务主流程」：写入方抛异常时，真实的回合
+        结果（成功、含正文、含 session_id）必须原样收口，不受采集失败牵连。"""
+
+        queue = FakeWorkerQueue()
+        record = self._sample_record()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s1"},
+                    "failure": None,
+                }
+
+            def build_content_capture_record(self, **kwargs: object) -> ContentCaptureRecord:
+                return record
+
+        def failing_writer(record: ContentCaptureRecord) -> None:
+            raise RuntimeError("模拟数据库写入失败")
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            content_capture_writer=failing_writer,
+        )
+        asyncio.run(service.process_once())  # 不得向上抛出 RuntimeError
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertEqual(terminal["content"], "结果")
+        self.assertEqual(terminal["agent_session_id"], "s1")
+
+    def test_capture_is_attempted_even_when_the_turn_itself_failed(self) -> None:
+        """失败/超时回合同样值得采集——问题原文与已尝试的工具调用是"以日志分析
+        缺陷"要看的信号，不只是成功回合才有采集价值。"""
+
+        queue = FakeWorkerQueue()
+        record = self._sample_record()
+        received: list[ContentCaptureRecord] = []
+
+        class FailingExecutor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise RuntimeError("装配后失败")
+
+            def build_content_capture_record(self, **kwargs: object) -> ContentCaptureRecord:
+                return record
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: FailingExecutor(),
+            content_capture_writer=received.append,
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
+        self.assertEqual(received, [record])
+
+    def test_capture_is_skipped_when_the_executor_was_never_constructed(self) -> None:
+        """Epic D 闸⑥红线路径（读不到用户自己的 MCP 配置）从不构造 executor；
+        采集必须随之跳过，不得因为 ``executor is None`` 而抛异常。"""
+
+        queue = FakeWorkerQueue()
+        received: list[ContentCaptureRecord] = []
+        executor_calls: list[None] = []
+        unused_record = self._sample_record()
+
+        class Executor:
+            def __init__(self) -> None:
+                executor_calls.append(None)
+
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "不该被用到", "session_id": None},
+                    "failure": None,
+                }
+
+            def build_content_capture_record(self, **kwargs: object) -> ContentCaptureRecord:
+                # 本用例断言这个方法从未被调用；给一个可用的返回值只是防止
+                # "万一真的被调用了" 时报错混淆了断言失败的真正原因。
+                return unused_record
+
+        with tempfile.TemporaryDirectory() as empty_root:
+            service = WorkerService(
+                config=worker_config(user_env_root=empty_root),
+                queue=queue,
+                executor_factory=lambda config, marker: Executor(),
+                content_capture_writer=received.append,
+            )
+            asyncio.run(service.process_once())
+
+        self.assertEqual(executor_calls, [])
+        self.assertEqual(received, [])
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")

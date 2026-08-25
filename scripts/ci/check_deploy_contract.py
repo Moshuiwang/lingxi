@@ -38,6 +38,7 @@ COMPOSE_BASE = REPOSITORY_ROOT / "deploy" / "compose.yaml"
 COMPOSE_STAGE = REPOSITORY_ROOT / "deploy" / "compose.stage.yaml"
 COMPOSE_PROD = REPOSITORY_ROOT / "deploy" / "compose.prod.yaml"
 ENV_EXAMPLE = REPOSITORY_ROOT / "deploy" / ".env.example"
+DEPLOY_CHECKLIST = REPOSITORY_ROOT / "deploy" / "验收前部署配置清单.md"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
@@ -463,6 +464,93 @@ def check_onboarding_gate_env_example() -> list[str]:
                 "它是 Epic D 闸⑤相关的开通配置项，缺失文档示范容易让人不知道这个变量存在"
                 "（详见 deploy/验收前部署配置清单.md「一、闸⑤」）。"
             )
+    return failures
+
+
+def check_content_capture_prod_guard() -> list[str]:
+    """内测轮内容级采集开关（Issue #251/#304 批次 3）的"正式环境不得生效"结构性
+    保证：机械核对而不是只活在文档里的约定。
+
+    研究结论（见 ``apps/worker/config.py`` 的 ``_innertest_content_capture`` 与
+    迁移 ``0069_innertest_content_capture`` 的模块文档）：``deploy/compose.stage.
+    yaml`` 与 ``compose.prod.yaml`` 结构完全相同，代码里不存在任何"这是 stage
+    还是生产"的运行期判据，因此选用的方案是"双变量确认 + 精确字面量 + 本检查"，
+    而不是声称已有某种运行期环境探测。本检查覆盖这个方案里**唯一可由仓库静态
+    核对**的一环：
+
+    1. 两个变量名与第二确认变量要求的精确字面量，一个都不允许出现在任何**入库**
+       的 compose 编排文件里（尤其是 ``deploy/compose.prod.yaml``）——它们只能来自
+       逐服务、不入库的宿主机本地 env 文件（``.env.<env>.worker-queue``）。这挡住
+       "有人把默认值写进 compose 的 ``environment:`` 块"这一类会让开关无论各环境
+       env 文件如何配置都统一生效/失效的错误。
+    2. ``deploy/.env.example`` 的 worker-queue 小节（「文件五」）确实示范了主开关
+       变量名，且文件中出现"生产环境禁止配置"一类的明确警示——照抄
+       ``check_worker_queue_env_example``/``check_onboarding_gate_env_example``
+       的"变量名的赋值行是否存在"判定形状，具体字面量来自 ``apps/worker/
+       config.py`` 的模块级常量（``module_constant``，不 import 业务代码）。
+
+    **本检查不能证明、也不声称证明**"运维不会把两个变量的值一起复制进生产的
+    未入库 env 文件"——那是当前 stage/生产共用完全相同镜像与编排结构下，任何
+    静态仓库检查都做不到的事，最后一道防线仍是部署操作纪律（见
+    ``deploy/验收前部署配置清单.md`` 与迁移文件头部「已知残余风险」的如实登记）。
+    """
+
+    flag_var = module_constant(WORKER_CONFIG, "CONTENT_CAPTURE_FLAG_VAR")
+    confirm_var = module_constant(WORKER_CONFIG, "CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR")
+    confirm_value = module_constant(WORKER_CONFIG, "CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE")
+    failures: list[str] = []
+    if not flag_var or not confirm_var or not confirm_value:
+        return [
+            "读不到 apps/worker/config.py 的 CONTENT_CAPTURE_FLAG_VAR / "
+            "CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR / "
+            "CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE 三个模块级常量之一"
+            "（常量被重命名或改写成非字面量赋值时，check_content_capture_prod_guard "
+            "需要同步更新）"
+        ]
+
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+        stripped = strip_comments(read(path))
+        for needle in (flag_var, confirm_var, confirm_value):
+            if needle in stripped:
+                failures.append(
+                    f"{display(path)} 中出现 {needle!r}：内测轮内容级采集开关的变量名"
+                    "与第二确认变量的精确字面量不得写进任何 compose 编排文件本身"
+                    "（尤其不得出现在 deploy/compose.prod.yaml），只能来自逐服务、"
+                    "不入库的宿主机本地 env 文件（.env.<env>.worker-queue）"
+                )
+
+    env_text = read(ENV_EXAMPLE)
+    match = re.search(
+        r"文件五：deploy/\.env\.stage\.worker-queue.*?(?=\n# ={10,}\n# 文件六)",
+        env_text,
+        re.DOTALL,
+    )
+    if match is None:
+        failures.append(
+            "deploy/.env.example 找不到「文件五：…worker-queue」小节"
+            "（或小节顺序/编号被改动，check_content_capture_prod_guard 的定位正则"
+            "需要同步更新）"
+        )
+    else:
+        section = match.group(0)
+        if not re.search(rf"^#?\s*{re.escape(flag_var)}=", section, re.MULTILINE):
+            failures.append(
+                f"deploy/.env.example 的 worker-queue 小节（「文件五」）没有示范 {flag_var}。"
+                "内测轮内容级采集开关缺失文档示范容易让人不知道这个变量存在。"
+            )
+        if "生产" not in section or "禁止" not in section:
+            failures.append(
+                "deploy/.env.example 的 worker-queue 小节（「文件五」）缺少内测轮内容级"
+                "采集开关「生产环境禁止配置」的明确警示行（结构性保证之外，仍须有醒目"
+                "的文档提醒——两者互补，不是二选一）。"
+            )
+
+    checklist_text = read(DEPLOY_CHECKLIST)
+    if flag_var not in checklist_text:
+        failures.append(
+            f"deploy/验收前部署配置清单.md 未登记 {flag_var}：按本文件既有惯例，"
+            "新增的可选配置项须登记在清单里，说明它属于哪一类、缺失时行为如何。"
+        )
     return failures
 
 
@@ -1150,6 +1238,7 @@ def main() -> int:
         ("数据库超时与停机上界依据", check_database_timeouts),
         ("worker-queue env.example 示范值", check_worker_queue_env_example),
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
+        ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
