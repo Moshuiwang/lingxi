@@ -34,6 +34,7 @@ from lingxi.adapters.postgres_pending_action import (
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingActionStatus,
+    PendingActionTransientFailure,
     PendingActionType,
 )
 from lingxi.core.ids import new_id
@@ -772,6 +773,331 @@ class SameTargetInFlightExclusionRealDbTests(PendingActionPostgresTestCase):
             (TARGET_OPEN_ID,),
         )
         self.assertEqual(rows[0][0], 1)
+
+
+class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
+    """停用「感知即清」的接入（Issue #304 批次 4）：``suspend_user`` 确认执行时，
+    在 ``confirm()`` 自己的同一个数据库事务里为该用户排队全部会话保留正文的
+    清理——复用 ``_Transaction.clear_delivered_content_for_user``（Issue #153
+    冻结接口，历史上只被 ``clear_delivered_content_for_user`` 独立开事务的入口
+    调用过，从未被真正触发）。``resume_user`` 不做任何清理（不可逆、合同语义）。
+    """
+
+    def user_id_for(self, open_id: str) -> str:
+        rows = self.query("SELECT id FROM app_user WHERE feishu_open_id = %s", (open_id,))
+        self.assertEqual(len(rows), 1)
+        return rows[0][0]
+
+    def seed_delivered_conversation(
+        self, *, conversation_id: str, task_id: str, user_id: str, agent_session_id: str
+    ) -> None:
+        """建一条已经送达、仍随会话保留正文、且持有当前 Agent 会话的会话——
+        与 `test_delivery_outbox.py::_seed_delivered` 同一手法，这里用原生 SQL
+        直写，不为此额外引入 `PostgresTaskQueue` 依赖。"""
+
+        self.execute(
+            """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (conversation_id, user_id, f"chat-{conversation_id}", f"topic-{conversation_id}", agent_session_id),
+        )
+        self.execute(
+            """INSERT INTO task
+                   (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                    target_worker_version, attempts, content_expires_at)
+               VALUES (%s, %s, %s, %s, '问题', 'awaiting_delivery', 'stable', 1, now())""",
+            (task_id, conversation_id, user_id, f"event-{task_id}"),
+        )
+        self.execute(
+            """INSERT INTO task_delivery_event
+                   (id, task_id, sequence, event_type, terminal_kind, worker_id,
+                    idempotency_key, platform_received_at, content)
+               VALUES (%s, %s, 1, 'terminal', 'success', 'worker-1', %s, now(), '已送达的答案')""",
+            (new_id("tde"), task_id, f"{task_id}:terminal"),
+        )
+
+    def pending_reasons(self, *, agent_session_id: str) -> list[str]:
+        return [
+            row[0]
+            for row in self.query(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id = %s",
+                (agent_session_id,),
+            )
+        ]
+
+    def test_suspend_confirm_queues_cleanup_for_every_conversation_of_that_user_only(self) -> None:
+        self.add_target_user(account_state="enabled")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        self.seed_delivered_conversation(
+            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+        )
+        self.seed_delivered_conversation(
+            conversation_id="cnv-a2", task_id="tsk-a2", user_id=target_user_id, agent_session_id="sess-a2"
+        )
+        # 另一个用户的会话完全不受影响。
+        self.add_target_user(open_id="ou_other_user", account_state="enabled")
+        other_user_id = self.user_id_for("ou_other_user")
+        self.seed_delivered_conversation(
+            conversation_id="cnv-b1", task_id="tsk-b1", user_id=other_user_id, agent_session_id="sess-b1"
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        self.assertEqual(self.current_account_state(), "suspended")
+        # Outbox 正文：目标用户的两个会话都被清空。
+        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0])
+        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a2'")[0][0])
+        # 会话上下文指针：硬失效，立即置空，不等两小时规则。
+        self.assertIsNone(self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0])
+        self.assertIsNone(self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a2'")[0][0])
+        # Agent 会话 JSONL 物理清理已排队，user_id 是目标用户的内部 id。
+        self.assertEqual(self.pending_reasons(agent_session_id="sess-a1"), ["user_cleared"])
+        self.assertEqual(self.pending_reasons(agent_session_id="sess-a2"), ["user_cleared"])
+        self.assertEqual(
+            self.query("SELECT user_id FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            target_user_id,
+        )
+        # 另一个用户的会话（正文、会话指针、清理队列）完全不受影响。
+        self.assertEqual(
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'")[0][0], "已送达的答案"
+        )
+        self.assertEqual(
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-b1'")[0][0], "sess-b1"
+        )
+        self.assertEqual(self.pending_reasons(agent_session_id="sess-b1"), [])
+
+    def test_resume_confirm_does_not_purge_anything(self) -> None:
+        self.add_target_user(account_state="suspended")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        self.seed_delivered_conversation(
+            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.RESUME_USER)
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        self.assertEqual(self.current_account_state(), "enabled")
+        # resume 不恢复已清正文（本用例里正文从未被清过），也不主动清除任何东西
+        # ——合同只对停用/权限变化两类触发感知即清，resume 不在其中。
+        self.assertEqual(
+            self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0], "已送达的答案"
+        )
+        self.assertEqual(
+            self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0], "sess-a1"
+        )
+        self.assertEqual(self.pending_reasons(agent_session_id="sess-a1"), [])
+
+    def test_repeated_confirm_does_not_queue_cleanup_twice(self) -> None:
+        """幂等：`decide_confirm` 早已是终态的第二次点击不再进入 EXECUTE 分支
+        （见 `core/admin/pending_action.py`），因此清理排队结构上只可能发生一次；
+        即使未来这条不变量被打破，`agent_session_cleanup.agent_session_id` 上的
+        唯一索引仍是数据库层面的最终保险。"""
+
+        self.add_target_user(account_state="enabled")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        self.seed_delivered_conversation(
+            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        first = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        second = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(first.decision.ok)
+        self.assertEqual(second.decision.kind, ConfirmResultKind.ALREADY_TERMINAL)
+        self.assertEqual(
+            self.query("SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            1,
+            "重复确认（幂等重放）不得排出第二条清理待办",
+        )
+
+    def test_resume_confirm_does_not_disturb_a_cleanup_already_queued_by_an_earlier_suspend(
+        self,
+    ) -> None:
+        """resume 不产生清理，**也不阻止已排队清理**：一个此前停用时排出的
+        `agent_session_cleanup` 待办，不会因为随后一次 resume 确认而被清空、
+        标记完成或改变——resume 的 EXECUTE 分支结构上完全不触碰这张表，物理
+        清理仍归 Worker 周期性收口独立处理。"""
+
+        self.add_target_user(account_state="suspended")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        # 模拟"此前一次停用已经排过队，但 Worker 还没来得及物理清理"：直接插入
+        # 一条待处理的 agent_session_cleanup 行，不经过 confirm()。
+        self.execute(
+            """INSERT INTO agent_session_cleanup (id, user_id, agent_session_id, reason)
+               VALUES (%s, %s, 'sess-already-queued', 'user_cleared')""",
+            (new_id("asc"), target_user_id),
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.RESUME_USER)
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        self.assertEqual(self.current_account_state(), "enabled")
+        row = self.query(
+            "SELECT reason, done_at FROM agent_session_cleanup WHERE agent_session_id='sess-already-queued'"
+        )
+        self.assertEqual(len(row), 1, "已排队的清理待办必须原样保留，不能被 resume 清空")
+        self.assertEqual(row[0][0], "user_cleared")
+        self.assertIsNone(row[0][1], "resume 不得替 Worker 提前把这条待办标记完成")
+
+    def test_two_real_concurrent_confirms_queue_cleanup_exactly_once(self) -> None:
+        """真实并发用例（与 `DuplicateAndConcurrentConfirmTests.test_two_real_
+        concurrent_confirms_only_one_succeeds` 同一手法）：两个线程各自开自己的
+        数据库连接，几乎同时对同一条 suspend 待确认操作发起确认——``SELECT ...
+        FOR UPDATE`` 序列化后只有一个线程真正进入 `EXECUTE` 分支，清理排队因此
+        结构上只可能发生一次；`agent_session_cleanup.agent_session_id` 唯一索引
+        是数据库层面的最终保险。"""
+
+        self.add_target_user(account_state="enabled")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        self.seed_delivered_conversation(
+            conversation_id="cnv-a1", task_id="tsk-a1", user_id=target_user_id, agent_session_id="sess-a1"
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        barrier = threading.Barrier(2)
+        results: list[object] = [None, None]
+        errors: list[BaseException] = []
+
+        def confirm_from_thread(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                thread_store = PostgresPendingActionStore(self._dsn, audit=_RecordingAudit())
+                results[index] = thread_store.confirm(
+                    pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
+                )
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors.append(error)
+
+        threads = [threading.Thread(target=confirm_from_thread, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(errors, [], f"并发确认不应抛出未预期的异常：{errors}")
+        outcomes = sorted(result.decision.ok for result in results)
+        self.assertEqual(outcomes, [False, True], "恰好一个线程执行成功，另一个必须被拒绝")
+        self.assertEqual(self.current_account_state(), "suspended")
+        self.assertEqual(
+            self.query("SELECT count(*) FROM agent_session_cleanup WHERE agent_session_id='sess-a1'")[0][0],
+            1,
+            "真实并发的两次确认，清理待办也只能出现恰好一条",
+        )
+        self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0])
+
+
+class TransientFailureRealDbTests(PendingActionPostgresTestCase):
+    """批次 4 F1（Issue #304，opus 审查）：``confirm()`` 现在对目标用户全部会话
+    一次性 ``FOR UPDATE``（见 ``_transaction.py`` 的 ``clear_delivered_content_
+    for_user`` 锁序修复）——这是死锁之外的**非死锁变体**：如果其中一个会话恰好
+    被另一个事务（本用例模拟 gateway 入站事务）持锁超过 ``lock_timeout``
+    （2 秒，``adapters/postgres.py`` 的 ``PostgresTimeouts`` 默认值），
+    ``confirm()`` 必须把裸 psycopg 的 ``LockNotAvailable`` 转译成
+    :class:`~lingxi.core.admin.pending_action.PendingActionTransientFailure`
+    （事务已回滚、可重试），不能让它一路抛到调用方，也不能无界等待——「停用一个
+    正在聊天的用户」最容易撞见这一种。
+    """
+
+    def _user_id_for(self, open_id: str) -> str:
+        # 与 SuspendPurgeRealDbTests.user_id_for 同一内容——不继承那个类，是为了
+        # 不把它已有的用例方法当成本类的一部分再跑一遍（unittest 按类收集
+        # test_* 方法，继承会让同一批用例在两个类名下各跑一次）。
+        rows = self.query("SELECT id FROM app_user WHERE feishu_open_id = %s", (open_id,))
+        self.assertEqual(len(rows), 1)
+        return rows[0][0]
+
+    def _seed_delivered_conversation(
+        self, *, conversation_id: str, task_id: str, user_id: str, agent_session_id: str
+    ) -> None:
+        # 与 SuspendPurgeRealDbTests.seed_delivered_conversation 同一内容，理由同上。
+        self.execute(
+            """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (conversation_id, user_id, f"chat-{conversation_id}", f"topic-{conversation_id}", agent_session_id),
+        )
+        self.execute(
+            """INSERT INTO task
+                   (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                    target_worker_version, attempts, content_expires_at)
+               VALUES (%s, %s, %s, %s, '问题', 'awaiting_delivery', 'stable', 1, now())""",
+            (task_id, conversation_id, user_id, f"event-{task_id}"),
+        )
+        self.execute(
+            """INSERT INTO task_delivery_event
+                   (id, task_id, sequence, event_type, terminal_kind, worker_id,
+                    idempotency_key, platform_received_at, content)
+               VALUES (%s, %s, 1, 'terminal', 'success', 'worker-1', %s, now(), '已送达的答案')""",
+            (new_id("tde"), task_id, f"{task_id}:terminal"),
+        )
+
+    def test_confirm_raises_transient_failure_when_a_conversation_is_held_past_lock_timeout(
+        self,
+    ) -> None:
+        self.add_target_user(account_state="enabled")
+        target_user_id = self._user_id_for(TARGET_OPEN_ID)
+        self._seed_delivered_conversation(
+            conversation_id="cnv-lockwait",
+            task_id="tsk-lockwait",
+            user_id=target_user_id,
+            agent_session_id="sess-lockwait",
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        holder_errors: list[BaseException] = []
+
+        def hold_the_conversation_lock() -> None:
+            # 模拟 gateway 入站事务：抢占并长时间持有该用户某一个会话的行锁
+            # （真实场景是 ensure_conversation/claim_conversation 所在的事务
+            # 意外变慢），不提交也不回滚，直到测试主动释放。
+            try:
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT id FROM conversation WHERE id = %s FOR UPDATE",
+                                ("cnv-lockwait",),
+                            )
+                            cursor.fetchone()
+                            lock_acquired.set()
+                            release_lock.wait(timeout=10)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                holder_errors.append(error)
+
+        holder = threading.Thread(target=hold_the_conversation_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(timeout=5), "持锁线程未能及时拿到 conversation 行锁")
+
+        started_at = time.monotonic()
+        try:
+            with self.assertRaises(PendingActionTransientFailure) as raised:
+                self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        finally:
+            release_lock.set()
+            holder.join(timeout=5)
+
+        elapsed = time.monotonic() - started_at
+        self.assertEqual(holder_errors, [], f"持锁线程不应抛出未预期的异常：{holder_errors}")
+        self.assertEqual(
+            raised.exception.classification,
+            "LockNotAvailable",
+            "必须是锁等待超时（sqlstate 55P03），不是别的操作性故障",
+        )
+        self.assertGreaterEqual(
+            elapsed, 1.9, "应当等到 lock_timeout（2 秒）附近才失败，不能提前放弃或无界等待"
+        )
+
+        # 事务已整体回滚：pending_action 与目标账号均保持事务开始前的状态，
+        # 调用方（card_callback.py）据此认为"这次点击结构上没有发生过"，可以
+        # 直接重新点击重试。
+        self.assertEqual(self.current_account_state(TARGET_OPEN_ID), "enabled")
+        rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
+        self.assertEqual(rows[0][0], "pending")
 
 
 if __name__ == "__main__":  # pragma: no cover

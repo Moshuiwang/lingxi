@@ -115,6 +115,83 @@ def _denied_tool_summary(report: Mapping[str, Any]) -> tuple[int, tuple[str, ...
     return count, tuple(names[:_MAX_LOG_DENIED_TOOL_NAMES])
 
 
+def _report_guard_denied_count(report: Mapping[str, Any]) -> int | None:
+    """从一次回合报告里取出**供落库**的守卫拒绝计数（Issue #303/#304 批次 4，
+    迁移 ``0070``）。
+
+    与 :func:`_denied_tool_summary` 故意**不共享**同一个返回值：那个函数服务
+    低敏结构化日志，"取不到就如实记 0"是它自己文档写明的姿态，对人工看
+    stderr 排障是合理的简化。这里要写进 ``task.guard_denied_count``，供
+    ``core/daily_report.py`` 做统计聚合——聚合层必须能区分"这一轮真的查过、
+    结果是零次拒绝"与"这一轮没有可用的审计数据"，把后者也算成 0 会让通报正文
+    悄悄低估真实拒绝次数，且**没有任何信号**能让读者发现这一段被低估过（"不可
+    判定"纪律要挡的正是这种静默失真，见 ``core/daily_report.py`` 模块文档）。
+
+    ``report["audit"]`` 不存在（早退分支：开工前已 ``stop_requested``、读用户
+    MCP 配置失败、执行器抛出未预期异常，均从未真正跑过一次 ``PreToolUse``
+    判定）时返回 ``None``；``denied_count`` 存在但不是 ``int``、或是负数
+    （结构不符预期，结构性地不可信——拒绝计数不存在"负几次"，出现负数只可能是
+    上游数据被破坏，与 :func:`_report_token_usage` 对同一类不可信数字的处理
+    对称，批次 4 opus 审查 P3-2）同样返回 ``None``。其余情况原样返回真实整数，
+    包括合法的 0。
+    """
+
+    audit = report.get("audit") if isinstance(report, Mapping) else None
+    if not isinstance(audit, Mapping):
+        return None
+    count = audit.get("denied_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
+
+
+#: ``core/execution/message_stream.py::_usage_summary`` 产出的四个已知 token
+#: 计数字段名，与该模块的 ``_USAGE_TOKEN_FIELDS`` 同源——这里独立列一份常量
+#: 而不是 import 那个私有名字，避免给 ``core/execution`` 增加一个只为了这四个
+#: 字符串常量存在的跨层依赖（``apps/`` 依赖 ``core/`` 是允许方向，但没必要为
+#: 四个字面量常量新增一条 import 边界）。真正的口径来源仍是那个模块，字段名
+#: 一旦那边改动，这里也要跟着改（无自动化保证，人工同步）。
+_TOKEN_USAGE_FIELD_NAMES = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def _report_token_usage(report: Mapping[str, Any]) -> dict[str, int] | None:
+    """从一次回合报告里取出**供落库**的 token 用量（Issue #303/#304 批次 4，
+    迁移 ``0070``）。
+
+    ``report["resources"]["usage"]``（与 ``report["audit"]["usage"]`` 是同一个
+    对象，见 ``apps/worker/report.py::build_report``）恒为
+    ``{"status": "known"|"unknown", "source": ..., ["fields": {...}]}``
+    （``core/execution/message_stream.py::_usage_summary``）。只有
+    ``status == "known"`` 时才有真正可信的计数——``"unknown"`` 覆盖"这一轮从未
+    收到 SDK 的 ``ResultMessage``""SDK 没给 usage 字段""给了字段但一个已知计数
+    都不认识"三种取不到的原因，共同点是**没有可入库的数字**，返回 ``None``
+    如实反映，不编造 0（与 :func:`_report_guard_denied_count` 同一纪律）。
+
+    早退分支（``report`` 不带 ``resources``）同样返回 ``None``。返回值只包含
+    ``fields`` 里实际出现的键——``_usage_summary`` 本来就"取到几个算几个"，这里
+    原样透传，不为缺失的字段补零。
+    """
+
+    resources = report.get("resources") if isinstance(report, Mapping) else None
+    usage = resources.get("usage") if isinstance(resources, Mapping) else None
+    if not isinstance(usage, Mapping) or usage.get("status") != "known":
+        return None
+    fields = usage.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    result: dict[str, int] = {}
+    for name in _TOKEN_USAGE_FIELD_NAMES:
+        candidate = fields.get(name)
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            result[name] = candidate
+    return result or None
+
+
 def _tool_result_count(report: Mapping[str, Any]) -> int:
     """从一次回合报告里取出这一轮**真实**工具调用次数（Issue #291 L6 取证结论补的
     可观测性缺口）。
@@ -695,6 +772,12 @@ class WorkerService:
         deliverable = bool(turn.get("closed")) and not failure
         denied_count, denied_tool_names = _denied_tool_summary(report)
         tool_result_count = _tool_result_count(report)
+        # 通报补数落库值（Issue #303/#304 批次 4，迁移 0070）：与上面
+        # denied_count（低敏结构化日志用，取不到时如实记 0）故意分开计算——
+        # 这两个是"取不到就留 NULL、不编造"，服务的是 core/daily_report.py 的
+        # 统计聚合，两套值的"取不到"语义不同，不能共用同一次求值结果。
+        guard_denied_count_for_report = _report_guard_denied_count(report)
+        token_usage_for_report = _report_token_usage(report)
         # P0 护栏（Issue #291 L6 取证结论，见 `_protocol_breakdown_reasons`）：
         # `closed=True` 且没有 `failure` 只说明"SDK 认为这一轮正常收口"，不说明
         # "这段正文是一个可以交付给用户的答案"。模型把工具调用协议细节写成正文
@@ -753,6 +836,8 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+                guard_denied_count=guard_denied_count_for_report,
+                token_usage=token_usage_for_report,
             )
         elif not deliverable:
             error_kind, content = self._failure_content(failure_code)
@@ -771,6 +856,8 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+                guard_denied_count=guard_denied_count_for_report,
+                token_usage=token_usage_for_report,
             )
         elif protocol_breakdown_reasons:
             # P0 护栏（Issue #291 L6 取证结论）：模型正文里出现内部工具名或过程
@@ -795,6 +882,8 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+                guard_denied_count=guard_denied_count_for_report,
+                token_usage=token_usage_for_report,
             )
         elif withheld:
             # #141/#149：整段正文因安全策略被拒发，即使 closed=True 也不得记
@@ -812,6 +901,8 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+                guard_denied_count=guard_denied_count_for_report,
+                token_usage=token_usage_for_report,
             )
         else:
             # 走到这里必然 `deliverable and not withheld and not protocol_
@@ -831,6 +922,8 @@ class WorkerService:
                 denied_tool_names=denied_tool_names,
                 tool_result_count=tool_result_count,
                 system_prompt_digest=system_prompt_digest,
+                guard_denied_count=guard_denied_count_for_report,
+                token_usage=token_usage_for_report,
             )
 
         # 内测轮内容级采集（Issue #251/#304 批次 3）：无论上面走了哪条终态分支
@@ -918,6 +1011,8 @@ class WorkerService:
         denied_tool_names: tuple[str, ...] = (),
         tool_result_count: int = 0,
         system_prompt_digest: str | None = None,
+        guard_denied_count: int | None = None,
+        token_usage: Mapping[str, int] | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -930,7 +1025,11 @@ class WorkerService:
         （Issue #90 评论 5306860255；``denied_count``/``denied_tool_names`` 见
         Issue #291 独立审查；``tool_result_count`` 见 Issue #291 L6 取证结论）
         放在这里记一次，覆盖 stop/withheld/success/failure 全部分支，不必在每个
-        分支各写一遍。
+        分支各写一遍。``guard_denied_count``/``token_usage``（Issue #303/#304
+        批次 4，迁移 ``0070``）同样在这里落库一次——两者是"取不到就留 NULL、
+        不编造"的通报统计用值，与上面供日志用的 ``denied_count``（取不到时如实
+        记 0）故意不是同一份计算结果，见调用方 ``_report_guard_denied_count``/
+        ``_report_token_usage`` 的文档。
         """
 
         self._log_terminal_outcome(
@@ -952,6 +1051,8 @@ class WorkerService:
             content=content.text,
             elapsed_seconds=elapsed_seconds,
             agent_session_id=session_id,
+            token_usage=token_usage,
+            guard_denied_count=guard_denied_count,
         )
 
     def _log_terminal_outcome(

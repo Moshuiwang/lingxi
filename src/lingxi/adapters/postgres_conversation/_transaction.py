@@ -287,6 +287,96 @@ class _Transaction:
             (new_id("asc"), user_id, agent_session_id, reason),
         )
 
+    def clear_delivered_content_for_user(self, *, user_id: str, reason: str = "user_cleared") -> int:
+        """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
+        并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
+
+        与 ``clear_delivered_content_for_conversation`` 同型（Issue #304 批次 4 从
+        ``_queue_outbox.py`` 的独立事务实现下沉到这里）：本方法运行在**调用方已经
+        开启的事务**里，不建连接、不提交、不回滚——"停用确认与会话保留正文清理
+        必须同一事务"这条约束落在类型上，对应产品合同「数据保留与删除」一节
+        （停用触发感知即清，且触发时统一、全部、不可逆清除）。``adapters/
+        postgres_pending_action.py`` 的 ``PostgresPendingActionStore.confirm()``
+        在 ``suspend_user`` 执行分支里，用它已经持有行锁的同一个 ``connection``
+        构造 ``_Transaction`` 并调用本方法，使清理排队与 ``account_state`` 翻转、
+        审计写入落在同一个数据库事务：审计写入失败导致整体回滚时，已经排队的
+        清理请求一并撤销，不会出现"账号其实没停用成功、但清理已经生效"的不一致。
+
+        没有独立事务的调用方（scheduler、非 gateway 事务的一次性调用）请改用
+        ``_queue_outbox._OutboxMixin.clear_delivered_content_for_user``——那个
+        入口自己开连接、开事务，再委托到这里，公开签名与语义不变。
+
+        ``reason`` 默认 ``user_cleared``：这是迁移 ``0061`` 就已经预留、专门覆盖
+        "停用感知、权限变化感知"这一类硬失效触发的分类值（与 ``/new`` 的
+        ``new_command``、空闲到点的 ``idle_timeout`` 区分），不是本次新增。当前
+        唯一的真实调用方是停用；未来权限变化感知接入时可以继续复用同一个值，
+        也可以按需传入更细分的原因——签名保留这个可能性，不强制。
+
+        与 ``/new``、空闲到点两类触发不同，停用/权限变化是**硬失效**：即使这个
+        会话本来还没到两小时空闲阈值，也不该在下一次消息到来时被 resume——因此
+        这里显式把 ``conversation.agent_session_id`` 置空（另外两类触发要么本来
+        就在清空它，要么依赖既有的两小时时间戳比较，不需要在这里提前置空）。
+
+        **加锁顺序：先 conversation 后 task_delivery_event（批次 4 F1，Issue #304，
+        opus 审查真库三次复现的死锁）**。此前这里先 UPDATE ``task_delivery_event``
+        （跨该用户全部会话，无序）再对 ``conversation`` FOR UPDATE；而 ``/new``
+        （:meth:`clear_agent_session`）与空闲到点扫描（``_queue_outbox.py`` 的
+        ``sweep_idle_conversations``）都是先锁 ``conversation`` 后碰
+        ``task_delivery_event``。两个方向相反的事务在同一个会话上交叉持有对方
+        需要的下一把锁时，会被 Postgres 判定为死锁（``DeadlockDetected``）——不
+        需要两个会话：本方法这条 UPDATE 本来就横跨该用户的全部会话，只要其中
+        一个会话恰好也是 ``/new`` 正在处理的那个，同一会话内部就能形成环路。
+        现在改为：先 ``SELECT id FROM conversation ... ORDER BY id FOR UPDATE``
+        一次性锁定该用户的全部会话（按 id 排序，与下面「为什么要排序」呼应），
+        再按同一顺序逐个会话清 tde、清会话指针、排队清理——与 ``/new``、
+        ``expire_undelivered_terminals``（``_queue_outbox.py``）既有的
+        "先 conversation 后 tde" 顺序对齐。
+
+        **为什么要按 id 排序**：本方法一次可能锁住同一用户名下的多个会话；如果
+        锁的先后顺序不确定（例如依赖数据库返回行的物理顺序），本方法自己的两次
+        并发调用之间也可能因为顺序不同而互相死锁（例如权限变化感知与停用几乎
+        同时触发同一用户）。固定用主键升序，是本仓这一组表目前对"一次锁多行"
+        的统一约定（``expire_undelivered_terminals`` 用 ``ORDER BY e.created_at,
+        t.id`` 锁 ``task``；``reclaim_stale`` 同理）。空闲到点扫描
+        （``sweep_idle_conversations``）此前跨会话遍历顺序不定（``SELECT
+        DISTINCT`` 无 ``ORDER BY``），已经在同一批次改为按 conversation id 排序
+        遍历，消除它与本方法交叉时的多会话死锁面（两者都不会在同一会话集合上
+        以不同顺序持锁）。
+        """
+
+        # 一次性锁定该用户名下全部会话（按 id 升序），同时把 agent_session_id 现值
+        # 一并读出——两次 FOR UPDATE 打在同一批行上纯属浪费，这一条 SELECT 之后
+        # 全部目标行已经锁到本事务提交为止，后面的 UPDATE 不需要再 FOR UPDATE 一次。
+        cursor = self._execute(
+            "SELECT id, agent_session_id FROM conversation WHERE user_id = %s ORDER BY id FOR UPDATE",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+        conversation_ids = [row[0] for row in rows]
+        # RETURNING 反映的是 UPDATE 之后的行，直接对 UPDATE 语句 RETURNING
+        # agent_session_id 只会拿到刚写入的 NULL——旧值必须在这里、UPDATE 之前，
+        # 从已经锁定的行本身读出（与 clear_agent_session 的 CTE 手法同一目的，
+        # 只是这里锁已经在上一条语句里拿到，不需要再借 CTE 现场取）。
+        sessions_to_retire = [(row[0], row[1]) for row in rows if row[1] is not None]
+
+        cleared_events = 0
+        for conversation_id in conversation_ids:
+            cleared_events += self.clear_delivered_content_for_conversation(
+                conversation_id=conversation_id
+            )
+
+        if sessions_to_retire:
+            self._execute(
+                "UPDATE conversation SET agent_session_id = NULL"
+                " WHERE user_id = %s AND agent_session_id IS NOT NULL",
+                (user_id,),
+            )
+            for _conversation_id, agent_session_id in sessions_to_retire:
+                self._queue_session_cleanup(
+                    user_id=user_id, agent_session_id=agent_session_id, reason=reason
+                )
+        return cleared_events
+
     def clear_delivered_content_for_conversation(self, *, conversation_id: str) -> int:
         """把已确认送达（``platform_received``）但仍随会话保留的投递正文清空。
 

@@ -1,14 +1,15 @@
-"""内测每日通报职责：:class:`DailyReportDuty`（Issue #303 S-O-01）。
+"""内测每日通报职责：:class:`DailyReportDuty`（Issue #303 S-O-01；`denied_count`/
+`resource_usage` 两段自 Issue #304 批次 4 起改为真实数据源，见下）。
 
-一轮做三件事：分四段独立读取统计（三段读昨日，投递结果段独立读前天——理由见
-`core/daily_report.py` 模块文档「投递结果段为什么用一个独立、更早的窗口」，
-opus 批量审查 P2 修复）→ 纯函数聚合与节流 → 该发就发一条到管理群。形状照
-`apps/scheduler/roster_audit.py` 的 :class:`~lingxi.apps.
-scheduler.roster_audit.RosterAuditDuty`（同一天至多一次的判重水位、发送失败不置位、
-同一天的重试共用一个去重键），但**多了一条 RosterAuditDuty 没有的规则**：四段数据源
-各自独立失败，只让对应的段落显式「不可判定」，不拖累其余段落，也不拖累整轮发送
-——这是 #303 明确要求、而花名册日报当前不需要的行为（它的判重逻辑是「整轮读不出来
-就整轮重试」，不是「分段降级」）。
+一轮做三件事：分六段独立读取统计（四段读昨日、`denied_count`/`resource_usage`
+也读昨日与前四段同一个窗口，投递结果段独立读前天——理由见 `core/daily_report.py`
+模块文档「投递结果段为什么用一个独立、更早的窗口」，opus 批量审查 P2 修复）→
+纯函数聚合与节流 → 该发就发一条到管理群。形状照 `apps/scheduler/roster_audit.py`
+的 :class:`~lingxi.apps.scheduler.roster_audit.RosterAuditDuty`（同一天至多一次
+的判重水位、发送失败不置位、同一天的重试共用一个去重键），但**多了一条
+RosterAuditDuty 没有的规则**：六段数据源各自独立失败，只让对应的段落显式「不可
+判定」，不拖累其余段落，也不拖累整轮发送——这是 #303 明确要求、而花名册日报当前
+不需要的行为（它的判重逻辑是「整轮读不出来就整轮重试」，不是「分段降级」）。
 
 ## 判重水位与节流状态都是进程内存
 
@@ -41,21 +42,25 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Protocol
 
 from lingxi.core.daily_report import (
-    DENIED_COUNT_UNAVAILABLE_REASON,
-    RESOURCE_USAGE_UNAVAILABLE_REASON,
+    DENIED_COUNT_ALL_NULL_REASON,
+    RESOURCE_USAGE_ALL_NULL_REASON,
     ActiveUserStats,
     DailyReportInputs,
     DeliveryOutcomeRow,
+    PartialCount,
     Section,
     StatusDistribution,
     TaskOutcomeRow,
+    TokenUsageStats,
     apply_repeat_throttle,
     build_active_user_stats,
     build_delivery_outcome,
+    build_denied_count_stats,
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
     build_status_distribution,
+    build_token_usage_stats,
     render_daily_report,
 )
 
@@ -110,6 +115,14 @@ class _DailyStatsSource(Protocol):
     def delivery_outcomes(
         self, *, window_start: datetime, window_end: datetime
     ) -> Sequence[DeliveryOutcomeRow]: ...
+
+    def guard_denied_count_stats(
+        self, *, window_start: datetime, window_end: datetime
+    ) -> tuple[int, int, int]: ...
+
+    def token_usage_stats(
+        self, *, window_start: datetime, window_end: datetime
+    ) -> tuple[int, int, int, int, int, int]: ...
 
 
 class _GroupSender(Protocol):
@@ -223,6 +236,20 @@ class DailyReportDuty:
                 window_start=delivery_window_start, window_end=delivery_window_end
             ),
         )
+        # 通报补数（Issue #303/#304 批次 4）：与其余四段同一个窗口（task.created_at）、
+        # 同一条 _fetch 单段失败纪律——查询本身失败时这一段照样只标不可判定，不
+        # 拖累其余段落。是否"全部 NULL"因此需要整段判不可判定，是另一层判断，
+        # 在下面拿到查询结果之后交给 core/daily_report.py 的纯函数。
+        guard_denied_raw, guard_denied_fetch_reason = self._fetch(
+            "denied_count",
+            lambda: self._source.guard_denied_count_stats(
+                window_start=window_start, window_end=window_end
+            ),
+        )
+        token_usage_raw, token_usage_fetch_reason = self._fetch(
+            "resource_usage",
+            lambda: self._source.token_usage_stats(window_start=window_start, window_end=window_end),
+        )
 
         if self._stop.is_set():
             # 停止信号可能落在四段读取期间到达：干净中断，不发送、不置位、不提交
@@ -268,12 +295,44 @@ class DailyReportDuty:
         else:
             delivery_outcome = Section.of(build_delivery_outcome(delivery_rows or ()))
 
-        # 这两段在当前架构下**恒为**不可判定：token 用量与 PreToolUse 拒绝计数只存在
-        # 于 worker 进程自己的结构化日志，scheduler 没有任何代码路径能读到（见
-        # `core/daily_report.py` 模块文档「数据从哪来」一节的完整理由）。不是本轮
-        # 查询失败，是这条数据源在这个架构下压根不存在，因此不经过 `_fetch`。
-        resource_usage = Section.undetermined(RESOURCE_USAGE_UNAVAILABLE_REASON)
-        denied_count = Section.undetermined(DENIED_COUNT_UNAVAILABLE_REASON)
+        # Issue #303/#304 批次 4：两段改为真实聚合（迁移 0070，见 core/daily_report.py
+        # 模块文档「数据从哪来」）。查询本身失败 → 走 _fetch 的既有不可判定路径；
+        # 查询成功但窗口内的任务在这个字段上全部是 NULL → 纯函数返回 None，这里
+        # 才降级为不可判定（与查询失败是两种不同原因，用不同的 reason 文案区分）。
+        denied_count: Section[PartialCount]
+        if guard_denied_fetch_reason is not None:
+            denied_count = Section.undetermined(guard_denied_fetch_reason)
+        else:
+            covered, uncovered, total = guard_denied_raw
+            denied_stats = build_denied_count_stats(
+                covered_tasks=covered, uncovered_tasks=uncovered, total=total
+            )
+            denied_count = (
+                Section.of(denied_stats)
+                if denied_stats is not None
+                else Section.undetermined(DENIED_COUNT_ALL_NULL_REASON)
+            )
+
+        resource_usage: Section[TokenUsageStats]
+        if token_usage_fetch_reason is not None:
+            resource_usage = Section.undetermined(token_usage_fetch_reason)
+        else:
+            covered, uncovered, input_tokens, output_tokens, cache_creation, cache_read = (
+                token_usage_raw
+            )
+            usage_stats = build_token_usage_stats(
+                covered_tasks=covered,
+                uncovered_tasks=uncovered,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+            )
+            resource_usage = (
+                Section.of(usage_stats)
+                if usage_stats is not None
+                else Section.undetermined(RESOURCE_USAGE_ALL_NULL_REASON)
+            )
 
         inputs = DailyReportInputs(
             window_start=window_start,
@@ -329,6 +388,8 @@ class DailyReportDuty:
                     ("failure_top", failure_top),
                     ("latency", latency),
                     ("delivery_outcome", delivery_outcome),
+                    ("denied_count", denied_count),
+                    ("resource_usage", resource_usage),
                 )
                 if not section.is_determined
             ],

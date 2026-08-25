@@ -94,6 +94,7 @@ from lingxi.core.admin.pending_action import (
     PendingAction,
     PendingActionAuditWriteFailed,
     PendingActionStatus,
+    PendingActionTransientFailure,
 )
 
 
@@ -160,7 +161,7 @@ class AdminCardCallbackHandler:
         返回值不是内部结论，是**要直接交给飞书的应答帧**——``apps/gateway`` 原样
         ``return`` 它，一路透传到 ``adapters/feishu_longconn.py`` 的
         ``_RawEventSink._do_without_validation``，由 lark SDK marshal 进
-        ``resp.data``。四类应答形状：
+        ``resp.data``。五类应答形状：
 
         1. 点击后达到/已处于终态（``executed``/``cancelled``/``expired``/
            ``failed``，含幂等重放）：``{"toast": {"type": "success"（仅
@@ -177,6 +178,12 @@ class AdminCardCallbackHandler:
            ``card``。
         4. 审计写入失败（:class:`PendingActionAuditWriteFailed`，事务已整体
            回滚）：toast error「系统繁忙请重试」，不带 ``card``。
+        5. 数据库瞬时故障（:class:`PendingActionTransientFailure`——死锁、锁等待
+           超时或其他操作性错误，事务已整体回滚，批次 4 F1，Issue #304）：toast
+           error「系统繁忙，请稍后重试」，不带 ``card``。与分支 4 分开列是因为
+           触发条件不同（分支 4 是审计 sink 本身失败；这里是数据库锁冲突）且文案
+           故意不同（多一个逗号与"稍后"，便于审计日志按文案徒手区分两类故障），
+           但产品含义相同：这次点击结构上"没有发生过"，可以直接重新点击卡片重试。
 
         ``decision`` 只识别 ``"confirm"``/``"cancel"`` 两个字面量（见
         ``core/admin/notification.py`` 的 ``DECISION_CONFIRM``/``DECISION_CANCEL``
@@ -209,6 +216,29 @@ class AdminCardCallbackHandler:
                 trace_id=trace_id,
             )
             return _toast_error("系统繁忙请重试")
+        except PendingActionTransientFailure as error:
+            # 数据库瞬时故障（死锁、锁等待超时，或其他操作性错误）：事务已回滚，
+            # pending_action 与目标账号均未改变，与上面的审计写入失败同一姿态
+            # （不更新卡片、不带 card，可以直接重新点击重试）——批次 4 F1，
+            # Issue #304：opus 审查在真库上三次复现清理路径（``clear_delivered_
+            # content_for_user``）与 ``/new``/空闲扫描锁序相反导致的死锁；「停用
+            # 正在聊天的用户」还容易撞见非死锁的锁等待超时变体（confirm 对目标
+            # 用户全部会话 FOR UPDATE，其中一个恰好被 gateway 入站事务持锁超过
+            # lock_timeout）。审计记录带上 ``error.classification``（抛出方
+            # psycopg 异常的类名，例如 ``DeadlockDetected``/``LockNotAvailable``）
+            # 供事后按故障类别检索，不进 toast 文案（管理员不需要知道底层是哪种
+            # 数据库异常）。不吞其他异常：只有这一个具体类型被捕获，见模块文档
+            # 「只依赖注入的 Protocol 端口」——本类不 import adapters/，因此不能
+            # 直接 except psycopg 的异常类型，真正的捕获与转译在
+            # ``adapters/postgres_pending_action.py`` 完成（见
+            # ``PendingActionTransientFailure`` 类文档）。
+            self._audit.record(
+                "admin.card_callback.transient_failure",
+                pending_action_id=pending_action_id,
+                trace_id=trace_id,
+                classification=error.classification,
+            )
+            return _toast_error("系统繁忙，请稍后重试")
 
         if outcome.pending is None:
             # 从未存在过的待确认操作 ID（含伪造回调）——没有可展示的卡片，只记审计。

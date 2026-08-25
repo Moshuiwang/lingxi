@@ -5,24 +5,51 @@
 daily_report.py` 编排）作为参数传入，符合[代码框架](../../../docs/技术设计/代码框架.md)
 「二、三层之间的 import 规则」对 `core/` 的约束。
 
-## 数据从哪来、为什么有的段落恒为「不可判定」
+## 数据从哪来、为什么有的段落曾经恒为「不可判定」
 
 #303 的通报字段清单要求七类统计：活跃用户与逐用户任务量、成功/失败/超时/停止分布、
-失败分类 Top、时延分布（对照 #296 的 262 秒基线）、token 用量与成本估算、守卫触发与
-拒绝计数、投递结果分布。核对现有数据库设计（`docs/技术设计/数据库设计.md` 第二节）
-后发现：**`task` 表与 `task_delivery_event` 表能撑起前面五类里的大部分**（状态、
+失败分类 Top、时延分布（对照 #296 的 262 秒基线）、token 用量、守卫触发与拒绝计数、
+投递结果分布。核对现有数据库设计（`docs/技术设计/数据库设计.md` 第二节）后发现：
+**`task` 表与 `task_delivery_event` 表能撑起前面五类里的大部分**（状态、
 `error_kind` 失败分类、`started_at`/`ended_at` 时延、`platform_message_kind`/
-`platform_received_at`/`expires_at` 投递结果），但 **token 用量与 PreToolUse 拒绝
-计数从未落库**——它们只存在于 worker 进程自己的结构化日志行 `worker.task.terminal`
-（`resources.usage`、`audit.call_count`/`audit.denied_count`，见
-`src/lingxi/apps/worker/service.py`）。scheduler 与 worker 是两个独立部署的进程，
-不共享文件系统、不接入任何日志聚合系统（`代码框架.md` 三：「结构化输出到
-stdout/stderr，不写日志文件、不自行轮转」）——scheduler **没有任何代码路径能读到**
-worker 的这两个字段。
+`platform_received_at`/`expires_at` 投递结果）。
 
-这正是 #303 要求的「不可判定」显式呈现原则要处理的真实场景，不是为了凑一个测试用例
-而假造的缺口：`resource_usage`/`denied_count` 两段在当前架构下**恒为**「不可判定」，
-原因见 :data:`RESOURCE_USAGE_UNAVAILABLE_REASON`/:data:`DENIED_COUNT_UNAVAILABLE_REASON`。
+**token 用量与 PreToolUse 拒绝计数曾经从未落库**（#303 首版）——它们只存在于
+worker 进程自己的结构化日志行 `worker.task.terminal`（`resources.usage`、
+`audit.call_count`/`audit.denied_count`，见 `src/lingxi/apps/worker/service.py`），
+scheduler 与 worker 是两个独立部署的进程、不共享文件系统或任何日志聚合系统
+（`代码框架.md` 三：「结构化输出到 stdout/stderr，不写日志文件、不自行轮转」），
+scheduler 当时没有任何代码路径能读到 worker 的这两个字段，因此这两段在当时的
+架构下**恒为**「不可判定」。**Issue #303/#304 批次 4 起补上这个缺口**：迁移
+``0070`` 给 ``task`` 表新增 ``token_usage``/``guard_denied_count`` 两列，
+``apps/worker/service.py`` 的终态收口点（唯一收口点 ``_finish_terminal``）与
+写终态事件同一事务落库；这两段因此改为**真实聚合**，不再结构性地不可判定。
+
+**"不可判定"没有整段消失，含义变窄了**：改造后仍然可能出现"这一窗口内的段落
+不可判定"——(1) 适配器查询本身失败（数据库暂时不可达等，走 :func:`_fetch`
+既有的单段失败路径，与其余五段同一条纪律）；(2) 窗口内**存在**任务，但这两个
+新列**全部**是 ``NULL``（例如窗口内的任务全部产生于迁移 ``0070`` 落地之前，
+或该任务从未真正跑过一次回合、结构性地没有可落库的数字——见
+:func:`_report_guard_denied_count`/:func:`_report_token_usage` 在
+``apps/worker/service.py`` 里的文档）。**"NULL 行归入不可判定、不静默计为零"
+是逐行纪律，不是逐段纪律**：一个窗口里部分任务有值、部分任务是 ``NULL`` 时，
+本模块只对有值的任务求和，并把"多少个任务缺这个字段"作为一个独立的、显式的
+数字一并呈现（:class:`PartialCount`/:class:`TokenUsageStats` 的
+``uncovered_tasks``），不悄悄把 ``NULL`` 当 0 揉进总数、也不因为有缺失就让
+整段变成「不可判定」——那会把"部分已知"错误地降级成"完全未知"，丢失已经拿到
+的真实信息。只有窗口内**一个任务都没有可用值**时（``covered_tasks == 0`` 且
+``uncovered_tasks > 0``），才整段判「不可判定」，理由见
+:data:`RESOURCE_USAGE_ALL_NULL_REASON`/:data:`DENIED_COUNT_ALL_NULL_REASON`——
+两列全部 ``NULL`` 有三类真实成因，不止"迁移 0070 之前"与"从未真正进入过执行
+回合"两种：**窗口内的任务此刻可能全部仍在排队或运行中**，还没有走到终态
+写入那一步（这两列只在终态收口点落库，见 ``apps/worker/service.py`` 的
+``_report_guard_denied_count``/``_report_token_usage`` 文档），这是最常见的
+一种、且会随任务陆续收口而自然消失，与另外两种"结构性、不会自愈"的成因
+性质不同（批次 4 opus 审查 P3-3 补齐，此前两个原因字符串都漏了这一种，读者
+可能误以为窗口内的任务都已经跑完却查不到数据）。窗口内**没有任何任务**
+（两个计数都是 0）是一个合法的确定结论（"这一天没有任务"），不是不可判定，
+与本模块其余段落对"空窗口"的既有处理方式一致。
+
 守卫触发（`turn_timeout`/`max_turns_exceeded`/`drain_timeout`，与 `V-护栏-01/02/08`
 的原因码同源）恰好会写进 `task.error_kind`，因此单独可判定，与「拒绝计数」拆成两个
 独立段落——同一条 #303 条目里能拿到的部分不因拿不到的另一半被一起隐藏。
@@ -129,14 +156,30 @@ GUARD_ERROR_KINDS = frozenset({"turn_timeout", "max_turns_exceeded", "drain_time
 #: 不是时间超限，因此不进这个集合——它仍计入「失败」桶，也仍计入 `GUARD_ERROR_KINDS`。
 TIMEOUT_ERROR_KINDS = frozenset({"running_timeout", "turn_timeout", "drain_timeout"})
 
-RESOURCE_USAGE_UNAVAILABLE_REASON = (
-    "token 用量与成本估算仅存在于 worker 进程的结构化日志（worker.task.terminal 的 "
-    "resources.usage 字段），scheduler 与 worker 是独立部署进程、不共享文件系统或日志"
-    "聚合通道，当前架构下无法读取；需 worker 侧新增落库字段才能取得，超出本 Story 范围"
+#: 窗口内**存在**任务、但 ``task.token_usage`` **全部**为 ``NULL`` 时使用（模块
+#: 文档「NULL 行归入不可判定、不静默计为零」）——不是查询本身失败，是这批任务
+#: 结构性地没有可用的 token 用量数字，三类真实成因见下面文案本身（批次 4 opus
+#: 审查 P3-1/P3-3：此前只列了"迁移 0070 之前"与"从未真正跑过一次回合"两种，
+#: 漏了最常见的"窗口内任务此刻仍在排队/运行中、还没收口"；且旧文案在
+#: ``DENIED_COUNT_ALL_NULL_REASON`` 里直接嵌了一句「见
+#: RESOURCE_USAGE_ALL_NULL_REASON」——这段文案会随通报正文直接展示给管理群，
+#: 是 Python 源码里的变量名，读者看不到、也不该需要认识它才能看懂通报在说
+#: 什么，已改为两段各自白话复述，不互相引用标识符）。
+RESOURCE_USAGE_ALL_NULL_REASON = (
+    "本窗口内的任务在 token 用量这一项上全部没有可用数字：可能是这些任务此刻"
+    "仍在排队或运行中、还没有跑完收口，也可能是任务本身产生于这项统计上线"
+    "之前，或任务虽然已经结束但从未真正进入过一次执行回合（例如开工前就被"
+    "中止、读取用户配置失败、执行器出现未预期异常），因此没有任何数字可以聚合"
 )
-DENIED_COUNT_UNAVAILABLE_REASON = (
-    "工具调用拒绝计数（worker.task.terminal 的 audit.denied_count）同样仅存在于 worker "
-    "结构化日志、未落库，原因与 token 用量一致（scheduler 与 worker 不共享日志通道）"
+#: 与 :data:`RESOURCE_USAGE_ALL_NULL_REASON` 成因相同（``task.guard_denied_count``
+#: 与 ``task.token_usage`` 在同一次终态写入里同时落库）；独立成一份文案而不是
+#: 互相引用对方变量名，理由同上——读者不该需要跳到另一段、认出一个 Python
+#: 标识符才能看懂这一段在说什么。
+DENIED_COUNT_ALL_NULL_REASON = (
+    "本窗口内的任务在守卫拒绝计数这一项上全部没有可用数字：可能是这些任务此刻"
+    "仍在排队或运行中、还没有跑完收口，也可能是任务本身产生于这项统计上线"
+    "之前，或任务虽然已经结束但从未真正进入过一次执行回合（例如开工前就被"
+    "中止、读取用户配置失败、执行器出现未预期异常），因此没有任何数字可以聚合"
 )
 CALL_COUNT_BASELINE_UNAVAILABLE_REASON = (
     "MCP 调用次数（对照 #296 的 16 次/任务基线）同样仅见于 worker 结构化日志的 "
@@ -227,6 +270,40 @@ class DeliveryOutcomeStats:
 
 
 @dataclass(frozen=True)
+class PartialCount:
+    """一段可能只覆盖窗口内**部分**任务的计数（Issue #303/#304 批次 4：
+    ``task.guard_denied_count`` 逐行可能是 ``NULL``）。
+
+    ``total`` 只是 ``covered_tasks`` 那些任务的求和——``uncovered_tasks`` 那些
+    任务的字段是 ``NULL``，不参与求和，也不被静默当成 0（模块文档「NULL 行归入
+    不可判定、不静默计为零」）。``uncovered_tasks > 0`` 时渲染层必须把这个数字
+    一并显示，不能只展示 ``total`` 让读者误以为它是窗口内全部任务的准确总和。
+    """
+
+    total: int
+    covered_tasks: int
+    uncovered_tasks: int
+
+
+@dataclass(frozen=True)
+class TokenUsageStats:
+    """窗口内 token 用量的部分聚合，与 :class:`PartialCount` 同一条「NULL 行不
+    静默计零」纪律，只是四个字段（对应 ``core/execution/message_stream.py::
+    _usage_summary`` 的四个已知计数字段）各自求和，覆盖度只按整行
+    ``task.token_usage`` 是否为 ``NULL`` 判断（行内单个字段缺失是否存在，不在
+    本模块的判断范围——见 ``apps/worker/service.py::_report_token_usage`` 文档
+    「取到几个算几个」）。
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+    covered_tasks: int
+    uncovered_tasks: int
+
+
+@dataclass(frozen=True)
 class DailyReportInputs:
     """一轮通报要渲染的全部数据，每段各自可能「不可判定」。"""
 
@@ -236,9 +313,9 @@ class DailyReportInputs:
     status_distribution: Section[StatusDistribution]
     failure_top: Section[tuple[FailureReasonCount, ...]]
     guard_triggered: Section[int]
-    denied_count: Section[int]
+    denied_count: Section[PartialCount]
     latency: Section[LatencyStats]
-    resource_usage: Section[str]
+    resource_usage: Section[TokenUsageStats]
     delivery_outcome: Section[DeliveryOutcomeStats]
     #: 投递结果段**独立**的统计窗口（opus 批量审查 P2 修复），与上面
     #: `window_start`/`window_end` 不是同一对值——见模块文档「投递结果段为什么用
@@ -322,6 +399,47 @@ def build_failure_top(
 
 def build_guard_triggered_count(rows: Sequence[TaskOutcomeRow]) -> int:
     return sum(count for _status, error_kind, count in rows if error_kind in GUARD_ERROR_KINDS)
+
+
+def build_denied_count_stats(
+    *, covered_tasks: int, uncovered_tasks: int, total: int
+) -> PartialCount | None:
+    """从适配器的哑聚合（``COUNT(*) FILTER``/``SUM``，见
+    ``adapters/postgres_daily_report.py::guard_denied_count_stats``）构造
+    :class:`PartialCount`；窗口内**有**任务但**全部**是 ``NULL``（一个都没覆盖到）
+    时返回 ``None``，调用方据此构造 ``Section.undetermined(DENIED_COUNT_ALL_
+    NULL_REASON)``（模块文档「NULL 行归入不可判定、不静默计为零」）。窗口内
+    没有任何任务（``covered_tasks == uncovered_tasks == 0``）是合法的确定零，
+    不走这条 ``None`` 分支。
+    """
+
+    if covered_tasks == 0 and uncovered_tasks > 0:
+        return None
+    return PartialCount(total=total, covered_tasks=covered_tasks, uncovered_tasks=uncovered_tasks)
+
+
+def build_token_usage_stats(
+    *,
+    covered_tasks: int,
+    uncovered_tasks: int,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+) -> TokenUsageStats | None:
+    """与 :func:`build_denied_count_stats` 同一条判定，对应
+    ``adapters/postgres_daily_report.py::token_usage_stats`` 的哑聚合结果。"""
+
+    if covered_tasks == 0 and uncovered_tasks > 0:
+        return None
+    return TokenUsageStats(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        covered_tasks=covered_tasks,
+        uncovered_tasks=uncovered_tasks,
+    )
 
 
 def apply_repeat_throttle(
@@ -496,11 +614,28 @@ def _render_guard_triggered(section: Section[int]) -> str:
     return f"守卫触发计数（超轮数/超时/收尾超时）：{section.value} 次"
 
 
-def _render_denied_count(section: Section[int]) -> str:
+def _render_coverage_note(*, covered_tasks: int, uncovered_tasks: int) -> str:
+    """``uncovered_tasks > 0`` 时附加的覆盖度说明——告诉读者这个数字不是窗口内
+    全部任务的准确总和，还有多少个任务因为字段缺失没有参与求和（模块文档
+    「NULL 行归入不可判定、不静默计为零」）。``uncovered_tasks == 0`` 时不附加
+    任何说明，避免给完全覆盖的正常情形也画蛇添足。
+    """
+
+    if uncovered_tasks <= 0:
+        return ""
+    total_tasks = covered_tasks + uncovered_tasks
+    return f"（覆盖 {covered_tasks}/{total_tasks} 个任务；另有 {uncovered_tasks} 个任务因字段缺失未计入，不计为零）"
+
+
+def _render_denied_count(section: Section[PartialCount]) -> str:
+    label = "工具调用拒绝计数（PreToolUse 拒绝）"
     if not section.is_determined:
         assert section.undetermined_reason is not None
-        return f"工具调用拒绝计数（PreToolUse 拒绝）：{_render_undetermined(section.undetermined_reason)}"
-    return f"工具调用拒绝计数（PreToolUse 拒绝）：{section.value} 次"
+        return f"{label}：{_render_undetermined(section.undetermined_reason)}"
+    stats = section.value
+    assert stats is not None
+    note = _render_coverage_note(covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks)
+    return f"{label}：{stats.total} 次{note}"
 
 
 def _render_latency(section: Section[LatencyStats]) -> str:
@@ -523,11 +658,23 @@ def _render_latency(section: Section[LatencyStats]) -> str:
     return f"{header}{body}\n{call_count_note}"
 
 
-def _render_resource_usage(section: Section[str]) -> str:
+def _render_resource_usage(section: Section[TokenUsageStats]) -> str:
+    # 标题不写"与成本估算"：本段现在是 task.token_usage 的真实聚合（Issue
+    # #303/#304 批次 4），但没有接入任何模型定价表——展示的是原始 token 计数，
+    # 不是货币成本，标题不能承诺一个本模块没有计算的数字。
+    label = "token 用量"
     if not section.is_determined:
         assert section.undetermined_reason is not None
-        return f"token 用量与成本估算：{_render_undetermined(section.undetermined_reason)}"
-    return f"token 用量与成本估算：{section.value}"
+        return f"{label}：{_render_undetermined(section.undetermined_reason)}"
+    stats = section.value
+    assert stats is not None
+    note = _render_coverage_note(covered_tasks=stats.covered_tasks, uncovered_tasks=stats.uncovered_tasks)
+    body = (
+        f"input={stats.input_tokens}，output={stats.output_tokens}，"
+        f"cache_creation={stats.cache_creation_input_tokens}，"
+        f"cache_read={stats.cache_read_input_tokens}"
+    )
+    return f"{label}：{body}{note}"
 
 
 def _format_delivery_window_note(window_start: datetime, window_end: datetime) -> str:

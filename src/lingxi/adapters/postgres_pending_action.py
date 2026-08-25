@@ -36,6 +36,7 @@ from typing import Protocol
 
 from lingxi.adapters.admin_registry import admin_registry_entry_from_row
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
     CancelDecision,
@@ -43,6 +44,7 @@ from lingxi.core.admin.pending_action import (
     PendingAction,
     PendingActionAuditWriteFailed,
     PendingActionStatus,
+    PendingActionTransientFailure,
     PendingActionType,
     PrepareDecision,
     decide_cancel,
@@ -327,6 +329,47 @@ class PostgresPendingActionStore:
         但会与任何试图 ``UPDATE`` 该行（撤权）的并发事务互斥：撤权事务若已经拿到该行
         的排它锁但还没提交，本方法的 ``FOR SHARE`` 会等它提交或回滚，读到的必然是
         "撤权前"或"撤权后"两个确定状态之一，不会出现两者之间的中间态。
+
+        **数据库瞬时故障不向上传播成裸 psycopg 异常（批次 4 F1，Issue #304）**：本方法
+        捕获 ``psycopg.errors.OperationalError`` 并转译为
+        :class:`~lingxi.core.admin.pending_action.PendingActionTransientFailure`
+        （事务已整体回滚，语义与转译方式见该类文档）。选 ``OperationalError`` 而不是
+        分别列举 ``DeadlockDetected``/``LockNotAvailable`` 两个具体子类：psycopg 把
+        这两者都归在 ``OperationalError`` 之下（分别对应 SQLSTATE 类 40「事务回滚」
+        与类 55「对象当前状态不满足操作前提」），与仓库既有的"只取异常基类"分类
+        惯例一致（对照 ``adapters/postgres_identity.py`` 的 ``provision()``：那里按
+        ``sqlstate`` 在 ``DriverError``（``psycopg.errors.Error``）这一最宽的基类下
+        再细分拒绝原因；本方法不需要细分到"因为哪种操作性故障"再分别处理——两者
+        对调用方（``core/admin/card_callback.py``）而言是同一个结论"稍后重试"，
+        细分类只作为 ``classification`` 字段进审计，不分叉控制流，因此在
+        ``OperationalError`` 这一层捕获就足够，不必逐个 import 更具体的子类）。
+        真正实现"执行体"的是 :meth:`_confirm_locked`——拆成独立方法是为了让这层
+        ``try/except`` 不必重新缩进整段已经很深的事务体（外层方法只做"调用 + 转译
+        异常"，不改变内层任何一行原有逻辑）。
+        """
+
+        from psycopg.errors import OperationalError
+
+        try:
+            pending, decision = self._confirm_locked(
+                pending_action_id=pending_action_id, clicker_open_id=clicker_open_id, now=now
+            )
+        except OperationalError as error:
+            raise PendingActionTransientFailure(type(error).__name__) from error
+
+        if pending is None:
+            return ConfirmOutcome(decision=decision, pending=None)
+        refreshed = self.get(pending_action_id=pending_action_id)
+        assert refreshed is not None
+        return ConfirmOutcome(decision=decision, pending=refreshed)
+
+    def _confirm_locked(
+        self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None
+    ) -> tuple[PendingAction | None, ConfirmDecision]:
+        """:meth:`confirm` 的事务体本身，逐字保留自拆分前的 ``confirm()``——拆分
+        只为了让 :meth:`confirm` 能在外层包一层不影响这里任何缩进的
+        ``try/except OperationalError``（见 :meth:`confirm` 文档"数据库瞬时故障"
+        一节）。不单独对外暴露，不是 :class:`PendingActionDecider` 协议的一部分。
         """
 
         pending: PendingAction | None = None
@@ -361,14 +404,21 @@ class PostgresPendingActionStore:
                         )
 
                     current_account_state: str | None = None
+                    # 内部 user_id（而非发起/核对全程使用的 feishu_open_id）只在
+                    # suspend_user 真正 EXECUTE 时才用得到——排队会话保留正文清理
+                    # （见下方 decision.ok 分支）落在 agent_session_cleanup.user_id
+                    # 这一列，它引用的是 app_user.id，不是飞书身份。同一条
+                    # SELECT ... FOR UPDATE 顺带取出，不为此再加一次查询。
+                    target_user_id: str | None = None
                     if pending is not None:
                         cursor.execute(
-                            "SELECT account_state FROM app_user WHERE feishu_open_id = %s"
+                            "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s"
                             " FOR UPDATE",
                             (pending.target_open_id,),
                         )
                         target_row = cursor.fetchone()
-                        current_account_state = target_row[0] if target_row is not None else None
+                        target_user_id = target_row[0] if target_row is not None else None
+                        current_account_state = target_row[1] if target_row is not None else None
 
                     # 两把行锁（待确认操作、目标账号）与 admin_registry 的 FOR SHARE
                     # 都已经拿到——现在才取时钟（外部审查交叉裁定，codex P1-3）：等锁
@@ -403,6 +453,33 @@ class PostgresPendingActionStore:
                                 raise RuntimeError(
                                     "并发修改目标账号状态，预期影响 1 行，"
                                     f"实际 {cursor.rowcount} 行"
+                                )
+
+                            if pending.action_type is PendingActionType.SUSPEND_USER:
+                                # 停用「感知即清」（产品合同「数据保留与删除」：
+                                # 停用一经感知即触发，统一、全部、不可逆清除，
+                                # 不等待下一次问数任务入队）——本事务已经持有目标
+                                # app_user 行锁，"感知"这一刻就是这里：在
+                                # account_state 真正翻转为 suspended 的同一个数据库
+                                # 事务、同一个连接上，为该用户的全部会话排队保留
+                                # 正文清理。用的是 assert 之前已经证明非空的
+                                # target_user_id（本分支能走到，说明上面按
+                                # feishu_open_id 查到的行确实存在且刚被本事务改过）。
+                                # 复用 _Transaction 上与 clear_delivered_content_
+                                # for_conversation 同型的方法（Issue #304 批次 4 从
+                                # postgres_conversation 独立事务实现下沉而来，见该
+                                # 方法文档"为什么"）：这不是新发明一条同事务写路径
+                                # ——_Transaction 本就是 postgres_conversation 包
+                                # __init__.py 显式 re-export、供包外调用方复用的
+                                # 类型（模块文档"既有调用点用到的名字全部保留"）。
+                                # 审计写入失败、或本方法后面任何一步导致事务整体
+                                # 回滚时，这里已经排队的清理请求随事务一起撤销，
+                                # 不会出现"账号其实没改成功、清理却已经生效"的
+                                # 不一致（PendingActionAuditWriteFailed 分支同一
+                                # 姿态）。
+                                assert target_user_id is not None
+                                _Transaction(connection).clear_delivered_content_for_user(
+                                    user_id=target_user_id, reason="user_cleared"
                                 )
 
                         try:
@@ -442,11 +519,7 @@ class PostgresPendingActionStore:
                                 f"实际 {cursor.rowcount} 行"
                             )
 
-        if pending is None:
-            return ConfirmOutcome(decision=decision, pending=None)
-        refreshed = self.get(pending_action_id=pending_action_id)
-        assert refreshed is not None
-        return ConfirmOutcome(decision=decision, pending=refreshed)
+        return pending, decision
 
     def cancel(
         self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None = None
@@ -455,7 +528,33 @@ class PostgresPendingActionStore:
         先写审计、失败即整体回滚。"审计与时钟"两条注意事项与 :meth:`~.confirm`
         文档同一姿态（结构化日志出口的"同一事务"只在失败方向成立；时钟在拿到行锁
         之后才取，外部审查交叉裁定，codex P1-3）。
+
+        数据库瞬时故障的捕获与转译同 :meth:`~.confirm`（批次 4 F1，Issue #304）：
+        本方法风险面更小（不涉及 ``clear_delivered_content_for_user`` 那组容易
+        撞锁序的写入），但 ``pending_action``/``app_user`` 的 ``FOR UPDATE`` 本身
+        仍可能撞上并发持锁超过 ``lock_timeout``，同一姿态兜底，不留一个不对称的
+        缺口。
         """
+
+        from psycopg.errors import OperationalError
+
+        try:
+            pending, decision = self._cancel_locked(
+                pending_action_id=pending_action_id, clicker_open_id=clicker_open_id, now=now
+            )
+        except OperationalError as error:
+            raise PendingActionTransientFailure(type(error).__name__) from error
+
+        if pending is None:
+            return CancelOutcome(decision=decision, pending=None)
+        refreshed = self.get(pending_action_id=pending_action_id)
+        assert refreshed is not None
+        return CancelOutcome(decision=decision, pending=refreshed)
+
+    def _cancel_locked(
+        self, *, pending_action_id: str, clicker_open_id: str, now: datetime | None
+    ) -> tuple[PendingAction | None, CancelDecision]:
+        """:meth:`cancel` 的事务体本身，拆分理由与 :meth:`_confirm_locked` 相同。"""
 
         pending: PendingAction | None = None
         decision: CancelDecision
@@ -510,8 +609,4 @@ class PostgresPendingActionStore:
                                 f"实际 {cursor.rowcount} 行"
                             )
 
-        if pending is None:
-            return CancelOutcome(decision=decision, pending=None)
-        refreshed = self.get(pending_action_id=pending_action_id)
-        assert refreshed is not None
-        return CancelOutcome(decision=decision, pending=refreshed)
+        return pending, decision

@@ -1,6 +1,8 @@
-"""内测每日通报的统计读取（Issue #303 S-O-01）。**本模块只读，一个写语句都没有。**
+"""内测每日通报的统计读取（Issue #303 S-O-01；`guard_denied_count_stats`/
+`token_usage_stats` 两个方法为 Issue #304 批次 4 新增）。**本模块只读，一个写
+语句都没有。**
 
-四个方法各对应 `core/daily_report.py` 里独立的一段统计，刻意分开而不是一次查询
+六个方法各对应 `core/daily_report.py` 里独立的一段统计，刻意分开而不是一次查询
 返回全部——这样`apps/scheduler/daily_report.py` 才能在其中任意一段查询失败时，
 只把那一段标记「不可判定」，其余段落照常渲染（#303 的「不可判定」显式呈现要求）。
 
@@ -53,6 +55,35 @@ SELECT platform_message_kind,
  WHERE event_type = 'terminal'
    AND created_at >= %(window_start)s AND created_at < %(window_end)s
  GROUP BY 1, 2, 3
+"""
+
+# 通报补数（Issue #303/#304 批次 4，迁移 0070）：两段哑聚合，只做 COUNT/SUM，
+# 不判断"取不到算不算不可判定"——那条判定在 core/daily_report.py 的
+# build_denied_count_stats/build_token_usage_stats（模块文档「SQL 只做哑分组」
+# 同一条纪律）。`SUM` 对 SQL NULL 天然跳过不计入，`->>'字段名'` 对整行是 NULL
+# 或该字段缺失都返回 NULL，因此"覆盖的任务只对有值的部分求和"不需要额外的
+# CASE 分支。
+_GUARD_DENIED_COUNT_STATS_SQL = """
+SELECT
+    COUNT(*) FILTER (WHERE guard_denied_count IS NOT NULL) AS covered_tasks,
+    COUNT(*) FILTER (WHERE guard_denied_count IS NULL) AS uncovered_tasks,
+    COALESCE(SUM(guard_denied_count), 0) AS total
+  FROM task
+ WHERE created_at >= %(window_start)s AND created_at < %(window_end)s
+"""
+
+_TOKEN_USAGE_STATS_SQL = """
+SELECT
+    COUNT(*) FILTER (WHERE token_usage IS NOT NULL) AS covered_tasks,
+    COUNT(*) FILTER (WHERE token_usage IS NULL) AS uncovered_tasks,
+    COALESCE(SUM((token_usage->>'input_tokens')::bigint), 0) AS input_tokens,
+    COALESCE(SUM((token_usage->>'output_tokens')::bigint), 0) AS output_tokens,
+    COALESCE(SUM((token_usage->>'cache_creation_input_tokens')::bigint), 0)
+        AS cache_creation_input_tokens,
+    COALESCE(SUM((token_usage->>'cache_read_input_tokens')::bigint), 0)
+        AS cache_read_input_tokens
+  FROM task
+ WHERE created_at >= %(window_start)s AND created_at < %(window_end)s
 """
 
 
@@ -118,4 +149,46 @@ class PostgresDailyReportSource:
             rows = cursor.fetchall()
         return tuple(
             (kind, bool(received), bool(expired), int(count)) for kind, received, expired, count in rows
+        )
+
+    def guard_denied_count_stats(self, *, window_start, window_end) -> tuple[int, int, int]:
+        """窗口内 ``task.guard_denied_count`` 的哑聚合：``(covered_tasks,
+        uncovered_tasks, total)``——分别是"该字段非 NULL 的任务数"「该字段是
+        NULL 的任务数」「非 NULL 那些任务的求和」。分类判断（是否整段不可判定）
+        留给 ``core/daily_report.py::build_denied_count_stats``。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                _GUARD_DENIED_COUNT_STATS_SQL,
+                {"window_start": window_start, "window_end": window_end},
+            )
+            covered, uncovered, total = cursor.fetchone()
+        return int(covered), int(uncovered), int(total)
+
+    def token_usage_stats(
+        self, *, window_start, window_end
+    ) -> tuple[int, int, int, int, int, int]:
+        """窗口内 ``task.token_usage`` 的哑聚合：``(covered_tasks,
+        uncovered_tasks, input_tokens, output_tokens,
+        cache_creation_input_tokens, cache_read_input_tokens)``。四个 token
+        计数各自独立求和（`SUM` 对 SQL NULL 天然跳过，取到几个算几个）；分类
+        判断留给 ``core/daily_report.py::build_token_usage_stats``。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                _TOKEN_USAGE_STATS_SQL,
+                {"window_start": window_start, "window_end": window_end},
+            )
+            covered, uncovered, input_tokens, output_tokens, cache_creation, cache_read = (
+                cursor.fetchone()
+            )
+        return (
+            int(covered),
+            int(uncovered),
+            int(input_tokens),
+            int(output_tokens),
+            int(cache_creation),
+            int(cache_read),
         )

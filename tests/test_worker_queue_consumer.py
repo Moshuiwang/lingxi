@@ -1478,6 +1478,101 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(fields["denied_count"], 0)
         self.assertEqual(fields["denied_tool_names"], ())
 
+    def test_write_terminal_event_receives_token_usage_and_guard_denied_count_for_report(
+        self,
+    ) -> None:
+        """通报补数（Issue #303/#304 批次 4，迁移 0070）：终态写入调用必须携带
+        从 ``report`` 里取出的 ``token_usage``/``guard_denied_count``——这两个
+        值与低敏日志用的 ``denied_count``（同一份 report 里的同一个数字）故意
+        分开求值，这里钉住它们确实被传给了 ``queue.write_terminal_event``。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "日活是 1024。",
+                        "session_id": "s",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                    },
+                    "audit": {"denied_count": 2, "denied": [], "usage": {"status": "known", "fields": {}}},
+                    "resources": {
+                        "usage": {
+                            "status": "known",
+                            "source": "sdk",
+                            "fields": {"input_tokens": 1000, "output_tokens": 200},
+                        }
+                    },
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(), queue=queue, executor_factory=lambda config, marker: Executor()
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(queue.terminals), 1)
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["guard_denied_count"], 2)
+        self.assertEqual(terminal["token_usage"], {"input_tokens": 1000, "output_tokens": 200})
+
+    def test_write_terminal_event_treats_a_negative_denied_count_as_untrustworthy(self) -> None:
+        """批次 4 opus 审查 P3-2：``guard_denied_count`` 不存在"负几次"——一个负数
+        只可能是上游数据被破坏，与 ``_report_token_usage`` 对 token 字段的
+        ``candidate >= 0`` 校验对称，``_report_guard_denied_count`` 也必须拒绝
+        负数、按结构性不可信处理（返回 ``None``），不能把它当成一个"合法但奇怪"
+        的整数原样落库——那会让 ``core/daily_report.py`` 的聚合把一个坏数字当
+        真实拒绝次数计入总和。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {
+                        "closed": True,
+                        "final_text": "日活是 1024。",
+                        "session_id": "s",
+                        "output_safety": {"blocked": False, "withheld": False, "reasons": ()},
+                    },
+                    "audit": {"denied_count": -1, "denied": []},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(), queue=queue, executor_factory=lambda config, marker: Executor()
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(queue.terminals), 1)
+        terminal = queue.terminals[0]
+        self.assertIsNone(terminal["guard_denied_count"], "负数必须按结构性不可信处理，不能原样落库")
+
+    def test_write_terminal_event_gets_none_not_zero_when_the_turn_never_really_ran(self) -> None:
+        """早退分支（这里用执行器抛未预期异常模拟）从未真正跑过一次回合，
+        ``report`` 不带 ``audit``/``resources``——``token_usage``/
+        ``guard_denied_count`` 必须是 ``None``（结构性地取不到），不能被悄悄
+        编造成 0 或空字典。删掉 ``_report_guard_denied_count``/``_report_
+        token_usage`` 里"结构不符就返回 None"的判断，会让本用例变红。"""
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise RuntimeError("模拟执行器未预期异常")
+
+        service = WorkerService(
+            config=worker_config(), queue=queue, executor_factory=lambda config, marker: Executor()
+        )
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(queue.terminals), 1)
+        terminal = queue.terminals[0]
+        self.assertIsNone(terminal["guard_denied_count"])
+        self.assertIsNone(terminal["token_usage"])
+
     def test_terminal_outcome_callback_caps_failure_code_and_reason_length(self) -> None:
         """Issue #90 评论 5306860255 独立复核 P3-2：``failure_code`` 与
         ``output_safety`` 的每个原因码目前都来自本仓库固定的枚举式常量，但审计

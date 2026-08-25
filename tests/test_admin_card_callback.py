@@ -26,6 +26,7 @@ from lingxi.core.admin.pending_action import (
     PendingAction,
     PendingActionAuditWriteFailed,
     PendingActionStatus,
+    PendingActionTransientFailure,
     PendingActionType,
 )
 
@@ -365,6 +366,78 @@ class AuditWriteFailureTests(unittest.TestCase):
         self.assertEqual(group.sent, [])
         self.assertIn(
             "admin.card_callback.audit_write_failed", [action for action, _ in audit.records]
+        )
+
+
+class TransientFailureTests(unittest.TestCase):
+    """批次 4 F1（Issue #304，opus 审查）：数据库瞬时故障（死锁、锁等待超时或其他
+    操作性错误）与审计写入失败同一姿态——不更新卡片、不通知管理群，因为对应的
+    数据库事务已经整体回滚（这次点击结构上"没有发生过"），但文案与审计动作名
+    刻意不同（见 ``card_callback.py`` 的 ``handle()`` 文档分支 5），便于事后按
+    故障类别检索。"""
+
+    def test_transient_failure_does_not_touch_card_or_group(self) -> None:
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(PendingActionTransientFailure("DeadlockDetected"))
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions, confirm_cards=cards, group_notifier=group
+        )
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_transient_fail",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_7",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "系统繁忙，请稍后重试")
+        self.assertNotIn("card", outcome)
+        self.assertEqual(cards.update_calls, [])
+        self.assertEqual(group.sent, [])
+        transient_records = [
+            fields for action, fields in audit.records
+            if action == "admin.card_callback.transient_failure"
+        ]
+        self.assertEqual(len(transient_records), 1)
+        self.assertEqual(transient_records[0]["classification"], "DeadlockDetected")
+
+    def test_transient_failure_toast_differs_from_audit_write_failure_toast(self) -> None:
+        """两条分支产品含义相同（可以直接重试）但文案故意不同——回归防止未来
+        有人为了"看起来一致"把两条 toast 文案悄悄合并成同一句。"""
+
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(PendingActionTransientFailure("LockNotAvailable"))
+        handler, _audit = _build_handler(pending_actions=pending_actions)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_transient_fail_2",
+            decision=DECISION_CONFIRM,
+            trace_id="trc_8",
+        )
+
+        self.assertNotEqual(outcome["toast"]["content"], "系统繁忙请重试")
+        self.assertEqual(outcome["toast"]["content"], "系统繁忙，请稍后重试")
+
+    def test_cancel_path_also_translates_transient_failure(self) -> None:
+        pending_actions = _FakePendingActions()
+        pending_actions.set_cancel_result(PendingActionTransientFailure("OperationalError"))
+        handler, audit = _build_handler(pending_actions=pending_actions)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id="pac_transient_fail_3",
+            decision=DECISION_CANCEL,
+            trace_id="trc_9",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "error")
+        self.assertEqual(outcome["toast"]["content"], "系统繁忙，请稍后重试")
+        self.assertIn(
+            "admin.card_callback.transient_failure", [action for action, _ in audit.records]
         )
 
 

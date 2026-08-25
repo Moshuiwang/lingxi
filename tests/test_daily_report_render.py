@@ -14,23 +14,27 @@ from datetime import datetime, timedelta, timezone
 
 from lingxi.core.daily_report import (
     CALL_COUNT_BASELINE_UNAVAILABLE_REASON,
-    DENIED_COUNT_UNAVAILABLE_REASON,
-    RESOURCE_USAGE_UNAVAILABLE_REASON,
+    DENIED_COUNT_ALL_NULL_REASON,
+    RESOURCE_USAGE_ALL_NULL_REASON,
     ActiveUserStats,
     DailyReportInputs,
     DeliveryOutcomeStats,
     FailureReasonCount,
     LatencyStats,
+    PartialCount,
     Section,
     StatusDistribution,
     ThrottledFailureLine,
+    TokenUsageStats,
     apply_repeat_throttle,
     build_active_user_stats,
     build_delivery_outcome,
+    build_denied_count_stats,
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
     build_status_distribution,
+    build_token_usage_stats,
     render_daily_report,
 )
 
@@ -52,7 +56,9 @@ def _all_determined_inputs(
     status_distribution: StatusDistribution | None = None,
     failure_top: tuple[FailureReasonCount, ...] = (),
     guard_triggered: int = 0,
+    denied_count: PartialCount | None = None,
     latency: LatencyStats | None = None,
+    resource_usage: TokenUsageStats | None = None,
     delivery_outcome: DeliveryOutcomeStats | None = None,
     delivery_window_start: datetime = DELIVERY_WINDOW_START,
     delivery_window_end: datetime = DELIVERY_WINDOW_END,
@@ -66,9 +72,19 @@ def _all_determined_inputs(
         ),
         failure_top=Section.of(failure_top),
         guard_triggered=Section.of(guard_triggered),
-        denied_count=Section.undetermined(DENIED_COUNT_UNAVAILABLE_REASON),
+        denied_count=Section.of(denied_count or PartialCount(total=0, covered_tasks=0, uncovered_tasks=0)),
         latency=Section.of(latency),
-        resource_usage=Section.undetermined(RESOURCE_USAGE_UNAVAILABLE_REASON),
+        resource_usage=Section.of(
+            resource_usage
+            or TokenUsageStats(
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+                covered_tasks=0,
+                uncovered_tasks=0,
+            )
+        ),
         delivery_outcome=Section.of(
             delivery_outcome or DeliveryOutcomeStats(delivered_card=0, delivered_fallback_text=0, expired=0, pending=0)
         ),
@@ -345,15 +361,123 @@ class RenderUndeterminedSegmentTests(unittest.TestCase):
         self.assertIn("投递结果分布：不可判定（原因：表不可访问）", text)
         self.assertIn("活跃用户：2 人", text)
 
-    def test_resource_usage_and_denied_count_are_always_undetermined_by_construction(self) -> None:
-        """当前架构下这两段恒为不可判定，是产品架构的真实现状——不是测试构造出的
-        假设，见 `core/daily_report.py` 模块文档「数据从哪来」一节。"""
+    def test_call_count_baseline_is_always_undetermined_by_construction(self) -> None:
+        """MCP 调用次数对照（#296 基线）当前架构下恒为不可判定——这一条与
+        `denied_count`/`resource_usage` 不同：批次 4 只给后两者接了真实落库，
+        调用次数对照仍然没有任何数据源，见 `core/daily_report.py` 模块文档。"""
 
         inputs = _all_determined_inputs()
         text = self._render(inputs)
-        self.assertIn(RESOURCE_USAGE_UNAVAILABLE_REASON, text)
-        self.assertIn(DENIED_COUNT_UNAVAILABLE_REASON, text)
         self.assertIn(CALL_COUNT_BASELINE_UNAVAILABLE_REASON, text)
+
+    def test_resource_usage_and_denied_count_render_real_aggregates_when_determined(self) -> None:
+        """Issue #303/#304 批次 4：两段脱离「恒不可判定」，`Section.of(...)` 时
+        渲染真实数字，不再是固定的不可判定文案。"""
+
+        inputs = _all_determined_inputs(
+            denied_count=PartialCount(total=3, covered_tasks=10, uncovered_tasks=0),
+            resource_usage=TokenUsageStats(
+                input_tokens=1000,
+                output_tokens=200,
+                cache_creation_input_tokens=50,
+                cache_read_input_tokens=25,
+                covered_tasks=10,
+                uncovered_tasks=0,
+            ),
+        )
+        text = self._render(inputs)
+        self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：3 次", text)
+        self.assertNotIn("工具调用拒绝计数（PreToolUse 拒绝）：不可判定", text)
+        self.assertIn("token 用量：input=1000，output=200，cache_creation=50，cache_read=25", text)
+        self.assertNotIn("token 用量：不可判定", text)
+        # 完全覆盖（uncovered_tasks=0）时不画蛇添足附加覆盖度说明。
+        self.assertNotIn("因字段缺失未计入", text)
+
+    def test_partial_coverage_is_shown_explicitly_not_silently_zeroed(self) -> None:
+        """窗口内一部分任务的字段是 NULL 时，覆盖度必须显式出现在正文里——不能
+        让读者误以为渲染出的总数就是窗口内全部任务的准确总和（模块文档「NULL
+        行归入不可判定、不静默计为零」）。"""
+
+        inputs = _all_determined_inputs(
+            denied_count=PartialCount(total=7, covered_tasks=8, uncovered_tasks=2),
+            resource_usage=TokenUsageStats(
+                input_tokens=500,
+                output_tokens=100,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+                covered_tasks=8,
+                uncovered_tasks=2,
+            ),
+        )
+        text = self._render(inputs)
+        self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：7 次（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）", text)
+        self.assertIn("token 用量：input=500，output=100，cache_creation=0，cache_read=0（覆盖 8/10 个任务；另有 2 个任务因字段缺失未计入，不计为零）", text)
+
+    def test_resource_usage_and_denied_count_undetermined_when_window_is_entirely_null(self) -> None:
+        """窗口内有任务，但这两个字段全部是 NULL（例如全是迁移 0070 之前产生的
+        历史任务）——纯函数返回 ``None``，调用方据此构造 `Section.undetermined`，
+        正文必须显式说明，不能悄悄渲染成 0。"""
+
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{
+                **inputs.__dict__,
+                "denied_count": Section.undetermined(DENIED_COUNT_ALL_NULL_REASON),
+                "resource_usage": Section.undetermined(RESOURCE_USAGE_ALL_NULL_REASON),
+            }
+        )
+        text = self._render(inputs)
+        self.assertIn(DENIED_COUNT_ALL_NULL_REASON, text)
+        self.assertIn(RESOURCE_USAGE_ALL_NULL_REASON, text)
+
+
+class DeniedCountAndResourceUsageBuildTests(unittest.TestCase):
+    """`build_denied_count_stats`/`build_token_usage_stats` 纯函数断言：NULL 行
+    不静默计零、全 NULL 时返回 ``None``、无任务时是合法的确定零。"""
+
+    def test_no_tasks_in_window_is_a_determined_zero_not_undetermined(self) -> None:
+        stats = build_denied_count_stats(covered_tasks=0, uncovered_tasks=0, total=0)
+        self.assertEqual(stats, PartialCount(total=0, covered_tasks=0, uncovered_tasks=0))
+
+    def test_all_null_returns_none_so_the_caller_can_mark_the_section_undetermined(self) -> None:
+        self.assertIsNone(build_denied_count_stats(covered_tasks=0, uncovered_tasks=5, total=0))
+
+    def test_partial_coverage_only_sums_the_covered_tasks(self) -> None:
+        stats = build_denied_count_stats(covered_tasks=3, uncovered_tasks=2, total=9)
+        self.assertEqual(stats, PartialCount(total=9, covered_tasks=3, uncovered_tasks=2))
+
+    def test_token_usage_no_tasks_in_window_is_a_determined_zero(self) -> None:
+        stats = build_token_usage_stats(
+            covered_tasks=0,
+            uncovered_tasks=0,
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+        self.assertEqual(
+            stats,
+            TokenUsageStats(
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+                covered_tasks=0,
+                uncovered_tasks=0,
+            ),
+        )
+
+    def test_token_usage_all_null_returns_none(self) -> None:
+        self.assertIsNone(
+            build_token_usage_stats(
+                covered_tasks=0,
+                uncovered_tasks=4,
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            )
+        )
 
 
 class RenderContentSafetyTests(unittest.TestCase):

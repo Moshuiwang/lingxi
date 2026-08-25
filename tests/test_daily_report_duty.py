@@ -21,7 +21,13 @@ FAKE_CHAT_ID = "oc_fake_admin_group_for_tests"
 
 
 class FakeSource:
-    """四段数据源的可注入替身：任意一段可以配置成抛异常，模拟「这段数据源没了」。"""
+    """六段数据源的可注入替身：任意一段可以配置成抛异常，模拟「这段数据源没了」。
+
+    ``guard_denied_stats``/``token_usage_stats_value`` 默认给出一份**全部覆盖、
+    零拒绝、零用量**的确定结果（``uncovered_tasks=0``）——Issue #303/#304 批次 4
+    起这两段不再恒为不可判定，默认值因此也不该再是"没有这个数据源"，而是"这个
+    数据源正常答完，答案恰好是零"，与其余四段的既有默认值同一条纪律。
+    """
 
     def __init__(
         self,
@@ -30,6 +36,8 @@ class FakeSource:
         outcome_rows: tuple = (("succeeded", None, 5), ("failed", "session_failed", 1)),
         durations: tuple[float, ...] = (100.0, 200.0),
         delivery_rows: tuple = (("card", True, False, 5),),
+        guard_denied_stats: tuple[int, int, int] = (0, 0, 0),
+        token_usage_stats_value: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0),
         raise_on: str | None = None,
         error: Exception | None = None,
     ) -> None:
@@ -37,6 +45,8 @@ class FakeSource:
         self._outcome_rows = outcome_rows
         self._durations = durations
         self._delivery_rows = delivery_rows
+        self._guard_denied_stats = guard_denied_stats
+        self._token_usage_stats = token_usage_stats_value
         self._raise_on = raise_on
         self._error = error or RuntimeError("模拟数据源故障")
         self.calls: dict[str, list[tuple[datetime, datetime]]] = {
@@ -44,6 +54,8 @@ class FakeSource:
             "task_outcomes": [],
             "task_durations_seconds": [],
             "delivery_outcomes": [],
+            "guard_denied_count_stats": [],
+            "token_usage_stats": [],
         }
 
     def _maybe_raise(self, name: str) -> None:
@@ -69,6 +81,16 @@ class FakeSource:
         self.calls["delivery_outcomes"].append((window_start, window_end))
         self._maybe_raise("delivery_outcome")
         return self._delivery_rows
+
+    def guard_denied_count_stats(self, *, window_start: datetime, window_end: datetime):
+        self.calls["guard_denied_count_stats"].append((window_start, window_end))
+        self._maybe_raise("denied_count")
+        return self._guard_denied_stats
+
+    def token_usage_stats(self, *, window_start: datetime, window_end: datetime):
+        self.calls["token_usage_stats"].append((window_start, window_end))
+        self._maybe_raise("resource_usage")
+        return self._token_usage_stats
 
 
 class FakeSender:
@@ -251,14 +273,57 @@ class SectionIndependentFailureTests(unittest.TestCase):
         duty.run_once()
         self.assertNotIn("daily_report.section_read_failed", parts["audit"].actions())
 
-    def test_resource_usage_and_denied_count_are_always_undetermined_even_when_everything_else_succeeds(
+    def test_resource_usage_and_denied_count_render_real_numbers_when_the_source_has_data(
         self,
     ) -> None:
-        duty, _ = build_duty()
+        """Issue #303/#304 批次 4：两段脱离「恒不可判定」——数据源答得出真实数字
+        时，正文渲染这两段的真实聚合，不再是固定的不可判定文案。"""
+
+        duty, _ = build_duty(
+            source=FakeSource(guard_denied_stats=(10, 0, 4), token_usage_stats_value=(10, 0, 1000, 200, 0, 0))
+        )
         text = duty.run_once()
         assert text is not None
-        self.assertIn("token 用量与成本估算：不可判定", text)
+        self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：4 次", text)
+        self.assertIn("token 用量：input=1000，output=200", text)
+
+    def test_resource_usage_and_denied_count_source_failing_only_marks_those_sections(
+        self,
+    ) -> None:
+        """`V-通报-01` 对这两段的延伸：数据源查询本身失败时只标这一段不可判定，
+        不拖累其余段落——与 active_users/task_outcomes/delivery_outcome 同一条
+        `_fetch` 纪律。"""
+
+        duty, parts = build_duty(source=FakeSource(raise_on="denied_count"))
+        text = duty.run_once()
+        assert text is not None
         self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：不可判定", text)
+        # token 用量这一段独立查询，不受 denied_count 失败影响；默认夹具是确定的零。
+        self.assertIn("token 用量：input=0，output=0", text)
+        self.assertIn("活跃用户：", text)
+        failed_sections = [
+            fields["section"] for fields in parts["audit"].fields_for("daily_report.section_read_failed")
+        ]
+        self.assertEqual(failed_sections, ["denied_count"])
+
+    def test_all_null_window_marks_undetermined_with_the_all_null_reason(self) -> None:
+        """查询成功，但窗口内的任务在这两个字段上全部是 NULL（例如全是迁移 0070
+        之前的历史任务）——与"查询失败"是不同的不可判定原因。"""
+
+        duty, _ = build_duty(
+            source=FakeSource(guard_denied_stats=(0, 6, 0), token_usage_stats_value=(0, 6, 0, 0, 0, 0))
+        )
+        text = duty.run_once()
+        assert text is not None
+        self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：不可判定", text)
+        self.assertIn("token 用量：不可判定", text)
+        # 批次 4 opus 审查 P3-1：原因文案改为白话复述、不再点 Python 常量名
+        # （见 core/daily_report.py 的 RESOURCE_USAGE_ALL_NULL_REASON 文档），
+        # 断言随之改锚定新文案里的关键短语，不是原来的「全部为 NULL」字面量。
+        self.assertIn("全部没有可用数字", text)
+        # F5：ALL_NULL 原因必须包含"窗口内任务仍在排队/运行中"这一最常见成因，
+        # 不能只列"迁移之前"与"从未真正进入过执行回合"两种。
+        self.assertIn("仍在排队或运行中", text)
 
 
 class SendFailureTests(unittest.TestCase):

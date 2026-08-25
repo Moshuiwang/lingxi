@@ -362,6 +362,37 @@ class PendingActionAuditWriteFailed(RuntimeError):
     """
 
 
+class PendingActionTransientFailure(RuntimeError):
+    """确认/取消操作命中数据库瞬时故障（死锁、锁等待超时，或其他操作性错误）：
+    事务已整体回滚，``pending_action`` 与目标 ``app_user`` 均未发生任何变化，
+    调用方可以安全重试（批次 4 F1，Issue #304，opus 审查真库三次复现）。
+
+    两类真实触发场景：① ``清理路径锁序修复``——``adapters/postgres_conversation/
+    _transaction.py`` 的 ``clear_delivered_content_for_user`` 此前先 UPDATE
+    ``task_delivery_event`` 再对 ``conversation`` FOR UPDATE，与 ``/new``、空闲
+    扫描既有的"先 conversation 后 tde"顺序相反，两个事务交叉持有对方需要的下一把
+    锁时被 Postgres 判定为死锁（``DeadlockDetected``，已随本批次修复对齐顺序）；
+    ② 非死锁的锁等待超时变体——``confirm()`` 对目标用户全部会话 FOR UPDATE 时，
+    若其中任一会话恰好被 gateway 入站事务持锁超过 ``lock_timeout``（2 秒，见
+    ``adapters/postgres.py`` 的 ``PostgresTimeouts``），命中 ``LockNotAvailable``；
+    「停用一个正在聊天的用户」最容易撞见这一种。
+
+    定义在这个纯类型模块而不是 ``adapters/postgres_pending_action.py``，与
+    ``PendingActionAuditWriteFailed`` 同一取舍（见其文档）：让
+    ``core/admin/card_callback.py`` 能在不引入 psycopg 依赖链的情况下拿到这个
+    类型去写 ``except``。真正抛出它的地方是 adapter 的 ``confirm()``/
+    ``cancel()``——按 SQLSTATE 分类捕获 psycopg 的 ``OperationalError``（其子类
+    覆盖 ``DeadlockDetected``/``LockNotAvailable`` 等具体操作性故障，见该方法
+    文档"为什么选这一层基类"）。``classification`` 只是抛出方 psycopg 异常的类名
+    （例如 ``"DeadlockDetected"``/``"LockNotAvailable"``），仅用于审计记录，不
+    参与、也不应该参与控制流判断——调用方对所有子类一视同仁地提示"稍后重试"。
+    """
+
+    def __init__(self, classification: str) -> None:
+        super().__init__(f"数据库瞬时故障，事务已回滚，可重试：{classification}")
+        self.classification = classification
+
+
 def _terminal_message(status: PendingActionStatus) -> str:
     if status is PendingActionStatus.EXECUTED:
         return "该操作已经执行过，不会重复执行。"
