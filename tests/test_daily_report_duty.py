@@ -317,7 +317,13 @@ class SectionIndependentFailureTests(unittest.TestCase):
         assert text is not None
         self.assertIn("工具调用拒绝计数（PreToolUse 拒绝）：不可判定", text)
         self.assertIn("token 用量：不可判定", text)
-        self.assertIn("全部为 NULL", text)
+        # 批次 4 opus 审查 P3-1：原因文案改为白话复述、不再点 Python 常量名
+        # （见 core/daily_report.py 的 RESOURCE_USAGE_ALL_NULL_REASON 文档），
+        # 断言随之改锚定新文案里的关键短语，不是原来的「全部为 NULL」字面量。
+        self.assertIn("全部没有可用数字", text)
+        # F5：ALL_NULL 原因必须包含"窗口内任务仍在排队/运行中"这一最常见成因，
+        # 不能只列"迁移之前"与"从未真正进入过执行回合"两种。
+        self.assertIn("仍在排队或运行中", text)
 
 
 class SendFailureTests(unittest.TestCase):
