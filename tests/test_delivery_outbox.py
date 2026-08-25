@@ -265,6 +265,42 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         )[0]
         self.assertEqual(row, ("success", "答案", "sess-new"))
 
+    def test_write_terminal_event_persists_token_usage_and_guard_denied_count(self) -> None:
+        """通报补数（迁移 0070，Issue #303/#304 批次 4）：终态写入同事务落
+        ``task.token_usage``/``task.guard_denied_count``——真实 JSONB 往返，
+        不是应用层假装写入。"""
+
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="答案",
+            token_usage={"input_tokens": 100, "output_tokens": 20},
+            guard_denied_count=3,
+        )
+
+        row = self.query("SELECT token_usage, guard_denied_count FROM task WHERE id='tsk-1'")[0]
+        self.assertEqual(row[0], {"input_tokens": 100, "output_tokens": 20})
+        self.assertEqual(row[1], 3)
+
+    def test_write_terminal_event_without_usage_leaves_both_columns_null_not_zero(self) -> None:
+        """取不到时必须是真正的 SQL NULL（``token_usage IS NULL``），不能是
+        ``'null'::jsonb`` 或 ``0``——否则通报聚合会把"取不到"误判成"取到了、
+        值是零/空对象"（见 ``adapters/postgres_conversation/_queue_outbox.py``
+        的 ``_jsonb_or_none`` 文档）。"""
+
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
+            error_kind="session_failed", content=None,
+        )
+
+        row = self.query(
+            "SELECT token_usage, guard_denied_count,"
+            " (token_usage IS NULL) AS usage_is_sql_null"
+            " FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+        self.assertTrue(row[2])
+
     def test_second_terminal_write_is_rejected_not_a_second_valid_terminal(self) -> None:
         first = self.queue.write_terminal_event(
             task_id="tsk-1", worker_id="worker-1", terminal_kind="success",

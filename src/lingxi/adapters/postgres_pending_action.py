@@ -36,6 +36,7 @@ from typing import Protocol
 
 from lingxi.adapters.admin_registry import admin_registry_entry_from_row
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
     CancelDecision,
@@ -361,14 +362,21 @@ class PostgresPendingActionStore:
                         )
 
                     current_account_state: str | None = None
+                    # 内部 user_id（而非发起/核对全程使用的 feishu_open_id）只在
+                    # suspend_user 真正 EXECUTE 时才用得到——排队会话保留正文清理
+                    # （见下方 decision.ok 分支）落在 agent_session_cleanup.user_id
+                    # 这一列，它引用的是 app_user.id，不是飞书身份。同一条
+                    # SELECT ... FOR UPDATE 顺带取出，不为此再加一次查询。
+                    target_user_id: str | None = None
                     if pending is not None:
                         cursor.execute(
-                            "SELECT account_state FROM app_user WHERE feishu_open_id = %s"
+                            "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s"
                             " FOR UPDATE",
                             (pending.target_open_id,),
                         )
                         target_row = cursor.fetchone()
-                        current_account_state = target_row[0] if target_row is not None else None
+                        target_user_id = target_row[0] if target_row is not None else None
+                        current_account_state = target_row[1] if target_row is not None else None
 
                     # 两把行锁（待确认操作、目标账号）与 admin_registry 的 FOR SHARE
                     # 都已经拿到——现在才取时钟（外部审查交叉裁定，codex P1-3）：等锁
@@ -403,6 +411,33 @@ class PostgresPendingActionStore:
                                 raise RuntimeError(
                                     "并发修改目标账号状态，预期影响 1 行，"
                                     f"实际 {cursor.rowcount} 行"
+                                )
+
+                            if pending.action_type is PendingActionType.SUSPEND_USER:
+                                # 停用「感知即清」（产品合同「数据保留与删除」：
+                                # 停用一经感知即触发，统一、全部、不可逆清除，
+                                # 不等待下一次问数任务入队）——本事务已经持有目标
+                                # app_user 行锁，"感知"这一刻就是这里：在
+                                # account_state 真正翻转为 suspended 的同一个数据库
+                                # 事务、同一个连接上，为该用户的全部会话排队保留
+                                # 正文清理。用的是 assert 之前已经证明非空的
+                                # target_user_id（本分支能走到，说明上面按
+                                # feishu_open_id 查到的行确实存在且刚被本事务改过）。
+                                # 复用 _Transaction 上与 clear_delivered_content_
+                                # for_conversation 同型的方法（Issue #304 批次 4 从
+                                # postgres_conversation 独立事务实现下沉而来，见该
+                                # 方法文档"为什么"）：这不是新发明一条同事务写路径
+                                # ——_Transaction 本就是 postgres_conversation 包
+                                # __init__.py 显式 re-export、供包外调用方复用的
+                                # 类型（模块文档"既有调用点用到的名字全部保留"）。
+                                # 审计写入失败、或本方法后面任何一步导致事务整体
+                                # 回滚时，这里已经排队的清理请求随事务一起撤销，
+                                # 不会出现"账号其实没改成功、清理却已经生效"的
+                                # 不一致（PendingActionAuditWriteFailed 分支同一
+                                # 姿态）。
+                                assert target_user_id is not None
+                                _Transaction(connection).clear_delivered_content_for_user(
+                                    user_id=target_user_id, reason="user_cleared"
                                 )
 
                         try:

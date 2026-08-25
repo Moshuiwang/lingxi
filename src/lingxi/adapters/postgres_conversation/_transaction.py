@@ -287,6 +287,78 @@ class _Transaction:
             (new_id("asc"), user_id, agent_session_id, reason),
         )
 
+    def clear_delivered_content_for_user(self, *, user_id: str, reason: str = "user_cleared") -> int:
+        """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
+        并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
+
+        与 ``clear_delivered_content_for_conversation`` 同型（Issue #304 批次 4 从
+        ``_queue_outbox.py`` 的独立事务实现下沉到这里）：本方法运行在**调用方已经
+        开启的事务**里，不建连接、不提交、不回滚——"停用确认与会话保留正文清理
+        必须同一事务"这条约束落在类型上，对应产品合同「数据保留与删除」一节
+        （停用触发感知即清，且触发时统一、全部、不可逆清除）。``adapters/
+        postgres_pending_action.py`` 的 ``PostgresPendingActionStore.confirm()``
+        在 ``suspend_user`` 执行分支里，用它已经持有行锁的同一个 ``connection``
+        构造 ``_Transaction`` 并调用本方法，使清理排队与 ``account_state`` 翻转、
+        审计写入落在同一个数据库事务：审计写入失败导致整体回滚时，已经排队的
+        清理请求一并撤销，不会出现"账号其实没停用成功、但清理已经生效"的不一致。
+
+        没有独立事务的调用方（scheduler、非 gateway 事务的一次性调用）请改用
+        ``_queue_outbox._OutboxMixin.clear_delivered_content_for_user``——那个
+        入口自己开连接、开事务，再委托到这里，公开签名与语义不变。
+
+        ``reason`` 默认 ``user_cleared``：这是迁移 ``0061`` 就已经预留、专门覆盖
+        "停用感知、权限变化感知"这一类硬失效触发的分类值（与 ``/new`` 的
+        ``new_command``、空闲到点的 ``idle_timeout`` 区分），不是本次新增。当前
+        唯一的真实调用方是停用；未来权限变化感知接入时可以继续复用同一个值，
+        也可以按需传入更细分的原因——签名保留这个可能性，不强制。
+
+        与 ``/new``、空闲到点两类触发不同，停用/权限变化是**硬失效**：即使这个
+        会话本来还没到两小时空闲阈值，也不该在下一次消息到来时被 resume——因此
+        这里显式把 ``conversation.agent_session_id`` 置空（另外两类触发要么本来
+        就在清空它，要么依赖既有的两小时时间戳比较，不需要在这里提前置空）。
+        """
+
+        cursor = self._execute(
+            """
+            UPDATE task_delivery_event AS e
+               SET content = NULL
+              FROM task AS t
+             WHERE e.task_id = t.id
+               AND t.user_id = %s
+               AND e.platform_received_at IS NOT NULL
+               AND e.content IS NOT NULL
+            """,
+            (user_id,),
+        )
+        cleared_events = cursor.rowcount
+
+        # 与 clear_agent_session 同一手法：RETURNING 反映的是 UPDATE 之后的行，
+        # 直接 RETURNING agent_session_id 只会拿到刚写入的 NULL。用 CTE 在置空前
+        # 先锁定并读出旧值（实测：改前的写法会让 _queue_session_cleanup 拿到
+        # None，撞上 agent_session_id 的 NOT NULL 约束——见对应真库负向用例）。
+        cursor = self._execute(
+            """
+            WITH targets AS (
+                SELECT id, agent_session_id AS previous_session_id
+                  FROM conversation
+                 WHERE user_id = %s AND agent_session_id IS NOT NULL
+                 FOR UPDATE
+            )
+            UPDATE conversation AS c
+               SET agent_session_id = NULL
+              FROM targets
+             WHERE c.id = targets.id
+            RETURNING targets.previous_session_id
+            """,
+            (user_id,),
+        )
+        retired_sessions = [row[0] for row in cursor.fetchall()]
+        for agent_session_id in retired_sessions:
+            self._queue_session_cleanup(
+                user_id=user_id, agent_session_id=agent_session_id, reason=reason
+            )
+        return cleared_events
+
     def clear_delivered_content_for_conversation(self, *, conversation_id: str) -> int:
         """把已确认送达（``platform_received``）但仍随会话保留的投递正文清空。
 

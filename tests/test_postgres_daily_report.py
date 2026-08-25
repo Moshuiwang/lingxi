@@ -76,27 +76,44 @@ class DailyReportPostgresTestCase(unittest.TestCase):
         created_at_sql: str = "now()",
         started_at_sql: str | None = "now()",
         ended_at_sql: str | None = "now()",
+        token_usage: dict | None = None,
+        guard_denied_count: int | None = None,
     ) -> None:
         """插一条任意状态/时刻的任务，跳过完整入队/领取流程（与
         `test_delivery_outbox.py::seed_running_task` 同一手法）。`created_at_sql`/
         `started_at_sql`/`ended_at_sql` 是受控的 SQL 字面量表达式，不是绑定参数——
         测窗口边界需要精确控制 `created_at` 落在真实 `now()` 的哪一侧。
+
+        `token_usage`/`guard_denied_count`（迁移 0070，Issue #303/#304 批次 4）：
+        默认 `None`，与生产默认值一致——模拟"这个任务在这两列上结构性地没有落库
+        值"（历史行、或早退分支从未真正跑过一次回合）。
         """
 
         conversation_id = conversation_id or f"conv-{task_id}"
         self._seed_conversation(conversation_id, user_id=user_id)
         started_sql = "NULL" if started_at_sql is None else started_at_sql
         ended_sql = "NULL" if ended_at_sql is None else ended_at_sql
+        from psycopg.types.json import Jsonb
+
         self.execute(
             f"""
             INSERT INTO task
                 (id, conversation_id, user_id, inbound_event_id, prompt, status, error_kind,
                  target_worker_version, attempts, created_at, started_at, ended_at,
-                 content_expires_at)
+                 content_expires_at, token_usage, guard_denied_count)
             VALUES (%s, %s, %s, %s, '问题', %s, %s, 'stable', 1,
-                    {created_at_sql}, {started_sql}, {ended_sql}, {created_at_sql})
+                    {created_at_sql}, {started_sql}, {ended_sql}, {created_at_sql}, %s, %s)
             """,
-            (task_id, conversation_id, user_id, f"event-{task_id}", status, error_kind),
+            (
+                task_id,
+                conversation_id,
+                user_id,
+                f"event-{task_id}",
+                status,
+                error_kind,
+                Jsonb(token_usage) if token_usage is not None else None,
+                guard_denied_count,
+            ),
         )
 
     def seed_delivery_event(
@@ -223,6 +240,97 @@ class DeliveryOutcomesTests(DailyReportPostgresTestCase):
         rows = self.source.delivery_outcomes(window_start=window_start, window_end=window_end)
 
         self.assertIn((None, False, True, 1), rows)
+
+
+class GuardDeniedCountStatsTests(DailyReportPostgresTestCase):
+    """`guard_denied_count_stats`（迁移 0070，Issue #303/#304 批次 4）：真实
+    `SUM`/`COUNT(*) FILTER` 在真库上按窗口边界正确聚合，NULL 行只计入
+    `uncovered_tasks`、不计入 `total`。"""
+
+    def _window(self) -> tuple[datetime, datetime]:
+        return (
+            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    def test_covered_and_uncovered_tasks_are_counted_separately_and_null_is_not_summed_as_zero(
+        self,
+    ) -> None:
+        self.seed_task(task_id="t1", guard_denied_count=3)
+        self.seed_task(task_id="t2", guard_denied_count=0)
+        self.seed_task(task_id="t3", guard_denied_count=None)
+
+        window_start, window_end = self._window()
+        covered, uncovered, total = self.source.guard_denied_count_stats(
+            window_start=window_start, window_end=window_end
+        )
+
+        self.assertEqual((covered, uncovered, total), (2, 1, 3))
+
+    def test_no_tasks_in_window_is_a_real_zero_not_an_error(self) -> None:
+        far_future_start = datetime.now(timezone.utc) + timedelta(days=365)
+        covered, uncovered, total = self.source.guard_denied_count_stats(
+            window_start=far_future_start, window_end=far_future_start + timedelta(hours=1)
+        )
+        self.assertEqual((covered, uncovered, total), (0, 0, 0))
+
+    def test_tasks_outside_the_window_are_excluded(self) -> None:
+        self.seed_task(
+            task_id="t-old", guard_denied_count=99, created_at_sql="now() - interval '10 days'"
+        )
+
+        window_start, window_end = self._window()
+        covered, uncovered, total = self.source.guard_denied_count_stats(
+            window_start=window_start, window_end=window_end
+        )
+        self.assertEqual((covered, uncovered, total), (0, 0, 0))
+
+
+class TokenUsageStatsTests(DailyReportPostgresTestCase):
+    """`token_usage_stats`（迁移 0070，Issue #303/#304 批次 4）：JSONB 四字段
+    各自求和，NULL 行只计入 `uncovered_tasks`、缺失的子字段视为 0 参与求和
+    （`->>'字段名'` 对 NULL 返回 NULL，`SUM` 天然跳过）。"""
+
+    def _window(self) -> tuple[datetime, datetime]:
+        return (
+            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    def test_four_fields_are_summed_independently_across_covered_tasks(self) -> None:
+        self.seed_task(
+            task_id="t1",
+            token_usage={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 1,
+            },
+        )
+        self.seed_task(
+            task_id="t2",
+            token_usage={"input_tokens": 50, "output_tokens": 10},  # 只含两个字段，取到几个算几个
+        )
+        self.seed_task(task_id="t3", token_usage=None)
+
+        window_start, window_end = self._window()
+        covered, uncovered, input_tokens, output_tokens, cache_creation, cache_read = (
+            self.source.token_usage_stats(window_start=window_start, window_end=window_end)
+        )
+
+        self.assertEqual(covered, 2)
+        self.assertEqual(uncovered, 1)
+        self.assertEqual(input_tokens, 150)
+        self.assertEqual(output_tokens, 30)
+        self.assertEqual(cache_creation, 5)
+        self.assertEqual(cache_read, 1)
+
+    def test_no_tasks_in_window_is_a_real_zero_not_an_error(self) -> None:
+        far_future_start = datetime.now(timezone.utc) + timedelta(days=365)
+        result = self.source.token_usage_stats(
+            window_start=far_future_start, window_end=far_future_start + timedelta(hours=1)
+        )
+        self.assertEqual(result, (0, 0, 0, 0, 0, 0))
 
 
 if __name__ == "__main__":

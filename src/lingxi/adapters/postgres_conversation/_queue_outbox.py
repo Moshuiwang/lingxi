@@ -9,7 +9,7 @@ Gateway 侧确认送达（``confirm_delivery``）、二十四小时到期强制�
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any
+from typing import Any, Mapping
 
 from lingxi.adapters.postgres import connect
 from lingxi.core.delivery.ports import DeliveryEventType, resolve_delivered_outcome
@@ -24,6 +24,24 @@ from ._transaction import _Transaction
 # 处理过多行。500 是与 Worker 侧消费能力（`claim_session_cleanups` 默认单批 20、
 # 每约 2 秒的收口轮询一次）比较后留出的宽裕量，不是精确调校值。
 _IDLE_SESSION_CLEANUP_SWEEP_LIMIT = 500
+
+
+def _jsonb_or_none(value: Mapping[str, int] | None) -> Any:
+    """``task.token_usage``（迁移 ``0070``）的参数适配：``None`` 必须原样作为
+    Python ``None`` 传给 psycopg，写出真正的 SQL ``NULL``——``Jsonb(None)`` 写的
+    是 JSON 字面量 ``null``（``'null'::jsonb``），那是一个"已知值为空"，与
+    ``IS NULL``（"取不到"）在 SQL 里可以被区分但语义完全不同，会让
+    ``adapters/postgres_daily_report.py`` 的 ``WHERE token_usage IS NOT NULL``
+    把"结构性取不到"误判成"取到了、值是空对象"。延迟导入 ``Jsonb``：与仓库既有
+    惯例（``adapters/postgres_content_capture.py`` 等）一致，没有驱动的机器仍能
+    import 本模块。
+    """
+
+    if value is None:
+        return None
+    from psycopg.types.json import Jsonb
+
+    return Jsonb(dict(value))
 
 
 class _OutboxMixin:
@@ -109,6 +127,8 @@ class _OutboxMixin:
         content: str | None,
         elapsed_seconds: int | None = None,
         agent_session_id: str | None = None,
+        token_usage: Mapping[str, int] | None = None,
+        guard_denied_count: int | None = None,
     ) -> AppendedEvent | None:
         """写入 ``terminal`` 事件并把任务从 ``running`` 转为 ``awaiting_delivery``。
 
@@ -122,6 +142,16 @@ class _OutboxMixin:
         重复调用（同一次写入的网络重试）即使任务此刻已经不在 ``running``（正是
         第一次调用成功转移之后的样子），也应原样返回 ``duplicate=True``，而不是
         误判成"所有权已丢失"返回 ``None``。
+
+        ``token_usage``/``guard_denied_count``（迁移 ``0070``，Issue #303/#304
+        批次 4）：通报补数——落 ``task.token_usage``/``task.guard_denied_count``
+        两列，供 ``adapters/postgres_daily_report.py`` 聚合，脱离
+        ``core/daily_report.py`` 此前"恒不可判定"的两段。``None`` 是精确语义
+        （这次真的取不到，见迁移 ``0070`` 文件头部），不编造 0 或空对象——调用方
+        （``apps/worker/service.py``）已经按同一纪律区分"取到 0"与"取不到"，这里
+        原样透传，不做二次判断。``token_usage`` 是一个只含四个已知 token 计数
+        字段的普通 dict（不含 ``status``/``source`` 信封，见迁移文件头部），由
+        ``_jsonb_or_none`` 适配成 ``JSONB``。
         """
 
         idempotency_key = f"{task_id}:terminal"
@@ -159,10 +189,18 @@ class _OutboxMixin:
                     UPDATE task
                        SET status = 'awaiting_delivery',
                            error_kind = COALESCE(%s, error_kind),
-                           ended_at = now()
+                           ended_at = now(),
+                           token_usage = %s,
+                           guard_denied_count = %s
                      WHERE id = %s AND worker_id = %s AND status = 'running'
                     """,
-                    (error_kind, task_id, worker_id),
+                    (
+                        error_kind,
+                        _jsonb_or_none(token_usage),
+                        guard_denied_count,
+                        task_id,
+                        worker_id,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     # 上面的 FOR UPDATE 已经锁定并校验过持有者与状态；到这里还失败
@@ -430,66 +468,26 @@ class _OutboxMixin:
                     conversation_id=conversation_id
                 )
 
-    def clear_delivered_content_for_user(self, *, user_id: str) -> int:
+    def clear_delivered_content_for_user(self, *, user_id: str, reason: str = "user_cleared") -> int:
         """停用感知、权限变化感知触发：清除该用户名下全部会话已送达的投递正文，
         并使该用户全部会话的当前 Agent 会话失效、排队物理清理其 JSONL（Issue #153）。
 
-        这是留给识别停用/权限变化的模块（身份、权限、管理域，均「待建立」）在
-        感知到事件那一刻调用的冻结接口；本 Story 不实现那两类事件的探测本身。
-
-        与 ``/new``、空闲到点两类触发不同，停用/权限变化是**硬失效**：即使这个
-        会话本来还没到两小时空闲阈值，也不该在下一次消息到来时被 resume——因此
-        这里显式把 ``conversation.agent_session_id`` 置空（另外两类触发要么本来
-        就在清空它，要么依赖既有的两小时时间戳比较，不需要在这里提前置空）。
+        独立开一个事务，供 scheduler 与非 gateway-事务调用方使用——与
+        ``clear_delivered_content_for_conversation`` 同一分工。**Issue #304 批次
+        4 起**：``suspend_user`` 确认执行（``adapters/postgres_pending_action.py``
+        的 ``PostgresPendingActionStore.confirm()``）改为在它自己已经开启的事务里
+        直接调用 ``_Transaction.clear_delivered_content_for_user``（本方法真正的
+        逻辑现在住在那里），不再经过这个独立开事务的入口——这是"停用确认与清理
+        排队必须同一事务"的要求。本方法继续存在、签名与行为不变，服务未来会在
+        **自己独立事务**里触发这个动作的调用方（例如权限变化感知，若其触发点不
+        与某个已有事务共享连接）。
         """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
-                cursor = connection.cursor()
-                cursor.execute(
-                    """
-                    UPDATE task_delivery_event AS e
-                       SET content = NULL
-                      FROM task AS t
-                     WHERE e.task_id = t.id
-                       AND t.user_id = %s
-                       AND e.platform_received_at IS NOT NULL
-                       AND e.content IS NOT NULL
-                    """,
-                    (user_id,),
+                return _Transaction(connection).clear_delivered_content_for_user(
+                    user_id=user_id, reason=reason
                 )
-                cleared_events = cursor.rowcount
-
-                # 与 _Transaction.clear_agent_session 同一手法：RETURNING 反映的是
-                # UPDATE 之后的行，直接 RETURNING agent_session_id 只会拿到刚写入的
-                # NULL。用 CTE 在置空前先锁定并读出旧值（实测：改前的写法会让
-                # _queue_session_cleanup 拿到 None，撞上 agent_session_id 的
-                # NOT NULL 约束——见本方法对应的真库负向用例）。
-                cursor.execute(
-                    """
-                    WITH targets AS (
-                        SELECT id, agent_session_id AS previous_session_id
-                          FROM conversation
-                         WHERE user_id = %s AND agent_session_id IS NOT NULL
-                         FOR UPDATE
-                    )
-                    UPDATE conversation AS c
-                       SET agent_session_id = NULL
-                      FROM targets
-                     WHERE c.id = targets.id
-                    RETURNING targets.previous_session_id
-                    """,
-                    (user_id,),
-                )
-                retired_sessions = [row[0] for row in cursor.fetchall()]
-                transaction = _Transaction(connection)
-                for agent_session_id in retired_sessions:
-                    transaction._queue_session_cleanup(
-                        user_id=user_id,
-                        agent_session_id=agent_session_id,
-                        reason="user_cleared",
-                    )
-                return cleared_events
 
     def sweep_idle_conversations(self, *, idle_after: timedelta) -> int:
         """会话空闲满两小时由 scheduler 周期调用：到点主动清除已送达的投递正文，
