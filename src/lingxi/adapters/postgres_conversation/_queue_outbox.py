@@ -507,6 +507,21 @@ class _OutboxMixin:
         天然幂等：清正文与排队清理都只在满足各自条件时才发生，重复调用不产生第二次
         副作用（`agent_session_cleanup` 的 `agent_session_id` 唯一索引兜底去重）。
         返回本轮实际清理的会话数，供 scheduler 写运行日志。
+
+        **两条查询都按 conversation id 升序遍历（批次 4 F1，Issue #304）**：此前
+        第一条查询是 ``SELECT DISTINCT`` 且没有 ``ORDER BY``，跨会话的遍历顺序不
+        确定。本方法逐个会话调用 ``clear_delivered_content_for_conversation``，
+        与 ``_transaction.py`` 的 ``clear_delivered_content_for_user``（停用/权限
+        变化感知触发，同样一次处理该用户名下多个会话，已在同一批次改为按 id 排序
+        锁定）如果分别以不同顺序触碰同一个用户名下的多个会话的
+        ``task_delivery_event`` 行，两个事务可能在这些 tde 行上互相交叉持有对方
+        下一步需要的锁，形成死锁——不需要经过 ``conversation`` 表本身：本方法从
+        不对 ``conversation`` 加锁（两条查询都是不加锁的 ``SELECT``），纯粹是
+        「同一批 tde 行，两个事务遍历顺序不同」就足以成环。固定按 id 升序，与
+        ``clear_delivered_content_for_user`` 现在的顺序对齐，消除这一多会话交叉
+        死锁面。第二条查询（会话物理清理排队）只 ``INSERT ... ON CONFLICT DO
+        NOTHING`` 进 ``agent_session_cleanup``，不参与这组死锁面，但同一批次一并
+        排序，避免它成为将来叠加其他写路径时的下一个隐患。
         """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection:
@@ -524,6 +539,7 @@ class _OutboxMixin:
                        AND c.last_task_ended_at <= now() - %s::interval
                        AND e.platform_received_at IS NOT NULL
                        AND e.content IS NOT NULL
+                     ORDER BY c.id
                     """,
                     (idle_after,),
                 )
@@ -553,6 +569,7 @@ class _OutboxMixin:
                            SELECT 1 FROM agent_session_cleanup AS a
                             WHERE a.agent_session_id = c.agent_session_id
                        )
+                     ORDER BY c.id
                      LIMIT %s
                     """,
                     (idle_after, _IDLE_SESSION_CLEANUP_SWEEP_LIMIT),

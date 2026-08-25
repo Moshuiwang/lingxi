@@ -34,6 +34,7 @@ from lingxi.adapters.postgres_pending_action import (
 from lingxi.core.admin.pending_action import (
     ConfirmResultKind,
     PendingActionStatus,
+    PendingActionTransientFailure,
     PendingActionType,
 )
 from lingxi.core.ids import new_id
@@ -987,6 +988,116 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
             "真实并发的两次确认，清理待办也只能出现恰好一条",
         )
         self.assertIsNone(self.query("SELECT content FROM task_delivery_event WHERE task_id='tsk-a1'")[0][0])
+
+
+class TransientFailureRealDbTests(PendingActionPostgresTestCase):
+    """批次 4 F1（Issue #304，opus 审查）：``confirm()`` 现在对目标用户全部会话
+    一次性 ``FOR UPDATE``（见 ``_transaction.py`` 的 ``clear_delivered_content_
+    for_user`` 锁序修复）——这是死锁之外的**非死锁变体**：如果其中一个会话恰好
+    被另一个事务（本用例模拟 gateway 入站事务）持锁超过 ``lock_timeout``
+    （2 秒，``adapters/postgres.py`` 的 ``PostgresTimeouts`` 默认值），
+    ``confirm()`` 必须把裸 psycopg 的 ``LockNotAvailable`` 转译成
+    :class:`~lingxi.core.admin.pending_action.PendingActionTransientFailure`
+    （事务已回滚、可重试），不能让它一路抛到调用方，也不能无界等待——「停用一个
+    正在聊天的用户」最容易撞见这一种。
+    """
+
+    def _user_id_for(self, open_id: str) -> str:
+        # 与 SuspendPurgeRealDbTests.user_id_for 同一内容——不继承那个类，是为了
+        # 不把它已有的用例方法当成本类的一部分再跑一遍（unittest 按类收集
+        # test_* 方法，继承会让同一批用例在两个类名下各跑一次）。
+        rows = self.query("SELECT id FROM app_user WHERE feishu_open_id = %s", (open_id,))
+        self.assertEqual(len(rows), 1)
+        return rows[0][0]
+
+    def _seed_delivered_conversation(
+        self, *, conversation_id: str, task_id: str, user_id: str, agent_session_id: str
+    ) -> None:
+        # 与 SuspendPurgeRealDbTests.seed_delivered_conversation 同一内容，理由同上。
+        self.execute(
+            """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (conversation_id, user_id, f"chat-{conversation_id}", f"topic-{conversation_id}", agent_session_id),
+        )
+        self.execute(
+            """INSERT INTO task
+                   (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                    target_worker_version, attempts, content_expires_at)
+               VALUES (%s, %s, %s, %s, '问题', 'awaiting_delivery', 'stable', 1, now())""",
+            (task_id, conversation_id, user_id, f"event-{task_id}"),
+        )
+        self.execute(
+            """INSERT INTO task_delivery_event
+                   (id, task_id, sequence, event_type, terminal_kind, worker_id,
+                    idempotency_key, platform_received_at, content)
+               VALUES (%s, %s, 1, 'terminal', 'success', 'worker-1', %s, now(), '已送达的答案')""",
+            (new_id("tde"), task_id, f"{task_id}:terminal"),
+        )
+
+    def test_confirm_raises_transient_failure_when_a_conversation_is_held_past_lock_timeout(
+        self,
+    ) -> None:
+        self.add_target_user(account_state="enabled")
+        target_user_id = self._user_id_for(TARGET_OPEN_ID)
+        self._seed_delivered_conversation(
+            conversation_id="cnv-lockwait",
+            task_id="tsk-lockwait",
+            user_id=target_user_id,
+            agent_session_id="sess-lockwait",
+        )
+        pending_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        holder_errors: list[BaseException] = []
+
+        def hold_the_conversation_lock() -> None:
+            # 模拟 gateway 入站事务：抢占并长时间持有该用户某一个会话的行锁
+            # （真实场景是 ensure_conversation/claim_conversation 所在的事务
+            # 意外变慢），不提交也不回滚，直到测试主动释放。
+            try:
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT id FROM conversation WHERE id = %s FOR UPDATE",
+                                ("cnv-lockwait",),
+                            )
+                            cursor.fetchone()
+                            lock_acquired.set()
+                            release_lock.wait(timeout=10)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                holder_errors.append(error)
+
+        holder = threading.Thread(target=hold_the_conversation_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(timeout=5), "持锁线程未能及时拿到 conversation 行锁")
+
+        started_at = time.monotonic()
+        try:
+            with self.assertRaises(PendingActionTransientFailure) as raised:
+                self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        finally:
+            release_lock.set()
+            holder.join(timeout=5)
+
+        elapsed = time.monotonic() - started_at
+        self.assertEqual(holder_errors, [], f"持锁线程不应抛出未预期的异常：{holder_errors}")
+        self.assertEqual(
+            raised.exception.classification,
+            "LockNotAvailable",
+            "必须是锁等待超时（sqlstate 55P03），不是别的操作性故障",
+        )
+        self.assertGreaterEqual(
+            elapsed, 1.9, "应当等到 lock_timeout（2 秒）附近才失败，不能提前放弃或无界等待"
+        )
+
+        # 事务已整体回滚：pending_action 与目标账号均保持事务开始前的状态，
+        # 调用方（card_callback.py）据此认为"这次点击结构上没有发生过"，可以
+        # 直接重新点击重试。
+        self.assertEqual(self.current_account_state(TARGET_OPEN_ID), "enabled")
+        rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
+        self.assertEqual(rows[0][0], "pending")
 
 
 if __name__ == "__main__":  # pragma: no cover

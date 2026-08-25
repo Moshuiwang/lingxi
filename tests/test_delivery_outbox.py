@@ -19,6 +19,7 @@ import os
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from postgres_schema import ensure_production_schema, reset_production_rows
 
@@ -27,6 +28,7 @@ from lingxi.adapters.postgres_conversation import (
     AppendedEvent,
     PostgresGatewayStore,
     PostgresTaskQueue,
+    _Transaction,
 )
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
@@ -668,6 +670,149 @@ class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
         self.assertEqual(
             self.scalar("SELECT content FROM task_delivery_event WHERE task_id='tsk-b1'"), "已送达的答案"
         )
+
+
+class _PausingTransaction(_Transaction):
+    """测试专用：在"第一次触碰一张此前没碰过的表"这个切换点暂停，等待外部放行
+    信号——用于确定性地构造两个事务交叉持有对方下一步需要的锁，不依赖线程调度
+    运气（批次 4 F1，Issue #304）。只跟踪 ``conversation``、``task_delivery_event``
+    两张表，这正是 F1 死锁涉及的两类资源；第一次 ``_execute`` 调用永远不暂停
+    （此时已触碰表集合为空，谈不上"切换"）。
+    """
+
+    def __init__(
+        self, connection: Any, *, ready_event: threading.Event, go_event: threading.Event
+    ) -> None:
+        super().__init__(connection)
+        self._ready_event = ready_event
+        self._go_event = go_event
+        self._touched: set[str] = set()
+        self._paused = False
+
+    @staticmethod
+    def _tables_in(sql: str) -> set[str]:
+        tables = set()
+        if "conversation" in sql:
+            tables.add("conversation")
+        if "task_delivery_event" in sql:
+            tables.add("task_delivery_event")
+        return tables
+
+    def _execute(self, sql: str, parameters: tuple = ()) -> Any:
+        if not self._paused and self._touched:
+            candidate = self._tables_in(sql)
+            if candidate - self._touched:
+                self._paused = True
+                self._ready_event.set()
+                self._go_event.wait(timeout=15)
+        result = super()._execute(sql, parameters)
+        self._touched |= self._tables_in(sql)
+        return result
+
+
+class LockOrderingDeadlockTests(DeliveryOutboxTestCase):
+    """批次 4 F1（Issue #304，opus 审查真库三次复现）：``clear_delivered_content_
+    for_user``（停用/权限变化感知清理路径）此前先 UPDATE ``task_delivery_event``
+    再对 ``conversation`` FOR UPDATE，与 ``/new``（``clear_agent_session``）既有的
+    "先 conversation 后 tde" 顺序相反——两个事务在同一个会话上交叉持有对方需要的
+    下一把锁时被 Postgres 判定为死锁（``DeadlockDetected``，sqlstate ``40P01``）。
+
+    用 ``_PausingTransaction`` 确定性构造交叉持锁，不依赖线程调度运气：这是
+    "同一探针"在红（未修代码，opus 审查记录的死锁）与绿（本用例，修复后 20 轮）
+    两侧都使用的构造手法——诊断阶段先在未修代码上用它验证死锁能被稳定复现
+    （5/5 轮命中 ``DeadlockDetected``，记录在 PR 素材，不重复放进本文件），修复后
+    这里断言同一构造连续 20 轮都不再出现死锁或锁等待超时。
+    """
+
+    def _seed_delivered(self, *, task_id: str, conversation_id: str, user_id: str = "usr-1") -> None:
+        """与 ``SessionRetentionCleanupTests._seed_delivered`` 同一内容——不继承
+        那个类，是为了不把它已有的用例方法当成本类的一部分再跑一遍（unittest
+        按类收集 ``test_*`` 方法，继承会让同一批用例在两个类名下各跑一次）。
+        """
+
+        self.seed_running_task(task_id=task_id, conversation_id=conversation_id, user_id=user_id)
+        self.queue.write_terminal_event(
+            task_id=task_id, worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="已送达的答案",
+        )
+        self.queue.confirm_delivery(
+            task_id=task_id, platform_message_kind="card", platform_message_id="c-" + task_id
+        )
+
+    def _run_one_round(self, *, suffix: str) -> tuple[BaseException | None, BaseException | None]:
+        conversation_id = f"cnv-lock-{suffix}"
+        task_id = f"tsk-lock-{suffix}"
+        self._seed_delivered(task_id=task_id, conversation_id=conversation_id, user_id="usr-1")
+        self.execute(
+            f"UPDATE conversation SET agent_session_id='sess-{suffix}' WHERE id='{conversation_id}'"
+        )
+
+        conn_a = connect(self._dsn)
+        conn_b = connect(self._dsn)
+        a_ready = threading.Event()
+        b_ready = threading.Event()
+        a_go = threading.Event()
+        b_go = threading.Event()
+        errors: dict[str, BaseException | None] = {"a": None, "b": None}
+
+        def run_purge() -> None:
+            try:
+                _PausingTransaction(
+                    conn_a, ready_event=a_ready, go_event=a_go
+                ).clear_delivered_content_for_user(user_id="usr-1", reason="user_cleared")
+                conn_a.commit()
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["a"] = error
+                conn_a.rollback()
+            finally:
+                a_ready.set()
+                conn_a.close()
+
+        def run_new_command() -> None:
+            try:
+                _PausingTransaction(
+                    conn_b, ready_event=b_ready, go_event=b_go
+                ).clear_agent_session(conversation_id=conversation_id)
+                conn_b.commit()
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors["b"] = error
+                conn_b.rollback()
+            finally:
+                b_ready.set()
+                conn_b.close()
+
+        thread_a = threading.Thread(target=run_purge)
+        thread_b = threading.Thread(target=run_new_command)
+
+        thread_a.start()
+        self.assertTrue(a_ready.wait(timeout=5), "A 未在 5 秒内到达第一个暂停点/结束")
+        thread_b.start()
+        # B 是否也很快到达自己的暂停点，取决于修复前后的锁序：修复前 A 只碰了
+        # tde，B 的 conversation 锁不受阻，能很快到达；修复后 A 已经先锁了
+        # conversation，B 会卡在数据库层等 A（不会走到 Python 层的暂停点）。
+        # 两种情况下都必须放行 A（否则修复后 B 会一直等到 lock_timeout），
+        # b_go 提前置位不影响修复前的构造——那种情况下 A/B 几乎同时放行，
+        # 与显式的双放行等价。
+        b_ready.wait(timeout=1.5)
+        a_go.set()
+        b_go.set()
+
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+        self.assertFalse(thread_a.is_alive(), "A 线程 15 秒内未结束")
+        self.assertFalse(thread_b.is_alive(), "B 线程 15 秒内未结束")
+        return errors["a"], errors["b"]
+
+    def test_purge_and_new_command_never_deadlock_across_twenty_rounds(self) -> None:
+        for round_index in range(20):
+            with self.subTest(round=round_index):
+                a_error, b_error = self._run_one_round(suffix=str(round_index))
+                self.assertIsNone(
+                    a_error, f"round {round_index}: 清理路径出现未预期异常：{a_error!r}"
+                )
+                self.assertIsNone(
+                    b_error, f"round {round_index}: /new 路径出现未预期异常：{b_error!r}"
+                )
 
 
 class AgentSessionCleanupQueueTests(DeliveryOutboxTestCase):
