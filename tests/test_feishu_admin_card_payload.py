@@ -3,6 +3,13 @@
 只测 ``_card_payload``——不依赖 ``lark_oapi``（``LarkAdminCardTransport`` 本身在方法
 内部延迟导入 SDK，真实字段与真实发送形态留给 `biai-stage` 的 L4a）。与
 ``tests/test_feishu_delivery_card_payload.py`` 同一姿态。
+
+**2026-08-25 按钮形状改动（批次三 #96 修复）**：本文件此前断言按钮包在
+``{"tag": "action", "actions": [...]}`` 容器里——那个形状已被真实 CardKit 拒绝
+（``code=200861``，见 ``adapters/feishu_admin_card.py`` 模块文档），本文件的断言
+已同步改为"按钮是 ``body.elements`` 顶层元素、零 ``action`` tag、``behaviors``
+回调式回传值"。变异验证（把按钮改回 action 容器包裹，确认形状断言变红，再改回
+顶层元素恢复绿）见 PR 描述。
 """
 
 from __future__ import annotations
@@ -47,33 +54,49 @@ class CardPayloadShapeTests(unittest.TestCase):
         self.assertIn(card.title, markdown_elements[0]["content"])
         self.assertIn("ou_target", markdown_elements[0]["content"])
 
-    def test_action_element_carries_two_buttons_with_bound_values(self) -> None:
+    def test_no_action_container_element(self) -> None:
+        """核心回归断言：真实 CardKit 已经拒绝 action 容器形状（``code=200861``），
+        elements 里不能再出现任何 ``tag == "action"`` 的元素——这是本次修复要网住
+        的具体回归。"""
+
+        payload = _card_payload(_card_with_buttons())
+        tags = [element["tag"] for element in payload["body"]["elements"]]
+        self.assertNotIn("action", tags)
+
+    def test_buttons_are_top_level_elements_with_bound_callback_values(self) -> None:
         payload = _card_payload(_card_with_buttons())
         elements = payload["body"]["elements"]
-        action_elements = [element for element in elements if element["tag"] == "action"]
-        self.assertEqual(len(action_elements), 1)
-        actions = action_elements[0]["actions"]
-        self.assertEqual(len(actions), 2)
-        decisions = {action["value"]["decision"] for action in actions}
+        button_elements = [element for element in elements if element["tag"] == "button"]
+        # button_elements 直接来自 elements 的顶层过滤（不是从某个容器元素的
+        # 子字段里取出来的）——这本身就断言了按钮是顶层元素，不嵌在任何容器里。
+        self.assertEqual(len(button_elements), 2)
+        for button in button_elements:
+            self.assertIn("text", button)
+            behaviors = button["behaviors"]
+            self.assertEqual(len(behaviors), 1)
+            self.assertEqual(behaviors[0]["type"], "callback")
+            self.assertEqual(behaviors[0]["value"]["pending_action_id"], "pac_1")
+        decisions = {button["behaviors"][0]["value"]["decision"] for button in button_elements}
         self.assertEqual(decisions, {"confirm", "cancel"})
-        for action in actions:
-            self.assertEqual(action["value"]["pending_action_id"], "pac_1")
-            self.assertIn("text", action)
-            self.assertEqual(action["tag"], "button")
 
     def test_confirm_button_is_primary_type_and_cancel_is_default(self) -> None:
         payload = _card_payload(_card_with_buttons())
-        actions = payload["body"]["elements"][1]["actions"]
-        by_decision = {action["value"]["decision"]: action for action in actions}
+        button_elements = [
+            element for element in payload["body"]["elements"] if element["tag"] == "button"
+        ]
+        by_decision = {
+            button["behaviors"][0]["value"]["decision"]: button for button in button_elements
+        }
         self.assertEqual(by_decision["confirm"]["type"], "primary")
         self.assertEqual(by_decision["cancel"]["type"], "default")
 
-    def test_terminal_card_has_no_action_element(self) -> None:
+    def test_terminal_card_has_no_button_elements(self) -> None:
         """终态卡片结构上不存在任何可点击按钮，不是靠禁用态表达"不能再点了"。"""
 
         payload = _card_payload(_terminal_card())
         tags = [element["tag"] for element in payload["body"]["elements"]]
         self.assertNotIn("action", tags)
+        self.assertNotIn("button", tags)
         self.assertEqual(tags, ["markdown"])
 
 

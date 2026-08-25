@@ -194,6 +194,19 @@ def parse_card_action_event(
     验证属 `biai-stage` L4a（本 Story 明确留待验收窗口，见 PR 描述）。解析失败一律
     ``CardActionParseError``，不抛 ``KeyError``/``TypeError``，与 ``parse_message_
     event`` 同一姿态。
+
+    **2026-08-25 与 ``adapters/feishu_admin_card._card_payload`` 的按钮改动（顶层
+    元素 + ``behaviors`` 回调，替换此前的 ``action`` 容器）核对兼容性**：飞书
+    《配置卡片交互》与《卡片回传交互回调》两篇官方文档
+    （https://open.feishu.cn/document/feishu-cards/configuring-card-interactions、
+    https://open.feishu.cn/document/feishu-cards/card-callback-communication）的
+    示例代码都把 ``behaviors: [{"type": "callback", "value": {...}}]`` 里的
+    ``value`` 标注为回调事件 ``event.action.value`` 字段的来源，与本函数已经在读
+    的路径（``payload["event"]["action"]["value"]``）一致；两篇文档都没有把这个
+    路径描述成随按钮是否套 ``action`` 容器、或按钮是新 2.0 顶层形态还是旧形态而
+    变化。本函数因此不需要为新按钮形状新增兼容分支或改动解析路径。**这只是官方
+    文档层面的核实，证据等级仍是 1**：真实点击触发的事件体是否逐字符合文档描述，
+    仍是 `biai-stage` L4a 受控验收范围，未经真实回调验证。
     """
 
     if not isinstance(payload, Mapping):
