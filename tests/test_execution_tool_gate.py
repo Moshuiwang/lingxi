@@ -891,5 +891,61 @@ class MalformedToolNameRedactionTest(unittest.TestCase):
         self.assertIn("[REDACTED]", recorded)
 
 
+class RawPreToolUseSinkTest(unittest.TestCase):
+    """``ToolGateway`` 的 ``raw_pre_tool_use`` 可选注入点（Issue #251/#304 批次 3，
+    内测轮内容级采集的唯一原始入参出口）。默认 ``None`` 时的既有行为由本文件
+    其余全部用例（均不传这个参数）持续覆盖，本组只测新增分支本身。
+    """
+
+    def test_sink_receives_the_raw_unredacted_tool_input(self) -> None:
+        """采集要的正是审计侧**不会**保留的东西：字段白名单裁剪之前的原始值。"""
+
+        received: list[tuple[str | None, object]] = []
+        audit = TurnAudit(redactor=AuditRedactor(allowed_input_fields=()))  # 空白名单
+        gateway = ToolGateway(
+            policy=build_policy(), audit=audit, raw_pre_tool_use=lambda call_id, tool_input: received.append((call_id, tool_input)),
+        )
+
+        pre_tool_use(
+            gateway, "mcp__bi-metric__list_metrics", {"metric": "sk-live-should-survive-here"}, tool_use_id="t1",
+        )
+
+        self.assertEqual(received, [("t1", {"metric": "sk-live-should-survive-here"})])
+        # 对照：同一次调用在审计侧因为空白名单被裁成 {"omitted": True}——证明
+        # sink 拿到的确实是审计裁剪**之前**的原始值，不是同一份数据的两个引用。
+        self.assertEqual(
+            gateway.audit.summary().calls[0].tool_input["metric"], {"omitted": True}
+        )
+
+    def test_sink_is_invoked_for_denied_calls_too(self) -> None:
+        """模型试图调用什么，即使被拒绝，同样是内容级采集要看的信号。"""
+
+        received: list[tuple[str | None, object]] = []
+        gateway = build_gateway()
+        gateway_with_sink = ToolGateway(
+            policy=build_policy(), audit=TurnAudit(),
+            raw_pre_tool_use=lambda call_id, tool_input: received.append((call_id, tool_input)),
+        )
+        del gateway  # 只是复用 build_policy() 的白名单常量，不复用这个网关实例
+
+        result = pre_tool_use(gateway_with_sink, "Bash", {"cmd": "rm -rf /"}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), "deny")
+        self.assertEqual(received, [("t1", {"cmd": "rm -rf /"})])
+
+    def test_sink_exception_does_not_break_the_gating_decision(self) -> None:
+        """采集失败不得影响工具判定本身——与 `_mark_side_effect` 既有姿态一致。"""
+
+        def failing_sink(call_id: str | None, tool_input: object) -> None:
+            raise RuntimeError("模拟采集收集器故障")
+
+        gateway = ToolGateway(policy=build_policy(), audit=TurnAudit(), raw_pre_tool_use=failing_sink)
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), None)  # 白名单内工具，放行不受影响
+        self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
+
+
 if __name__ == "__main__":
     unittest.main()

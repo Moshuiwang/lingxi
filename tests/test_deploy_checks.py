@@ -868,5 +868,113 @@ class RealRepositoryTest(unittest.TestCase):
             self.assertTrue(path.is_file(), f"{path} 不存在，对应的检查会变成空转")
 
 
+class ContentCaptureProdGuardTest(unittest.TestCase):
+    """`check_content_capture_prod_guard`（Issue #251/#304 批次 3）：内测轮内容级
+    采集开关的变量名与第二确认变量的精确字面量不得出现在任何入库 compose 文件里。
+    """
+
+    def _with_compose_overrides(self, *, base: str = "", stage: str = "", prod: str = ""):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        paths = {}
+        for name, body in (("compose.yaml", base), ("compose.stage.yaml", stage), ("compose.prod.yaml", prod)):
+            path = directory / name
+            path.write_text(f"services:\n{textwrap.indent(textwrap.dedent(body), '  ')}", encoding="utf-8")
+            paths[name] = path
+        originals = (CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD)
+        CONTRACT.COMPOSE_BASE = paths["compose.yaml"]
+        CONTRACT.COMPOSE_STAGE = paths["compose.stage.yaml"]
+        CONTRACT.COMPOSE_PROD = paths["compose.prod.yaml"]
+        try:
+            return CONTRACT.check_content_capture_prod_guard()
+        finally:
+            CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = originals
+
+    def test_real_repository_state_passes(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_content_capture_prod_guard(), [])
+
+    def test_the_confirm_literal_leaking_into_compose_prod_is_caught(self) -> None:
+        """变异验红：把第二确认变量要求的精确字面量误写进
+        ``compose.prod.yaml``（例如有人图省事把 stage 覆盖的值抄了一份当默认值），
+        必须让本检查变红。"""
+
+        confirm_value = CONTRACT.module_constant(
+            CONTRACT.WORKER_CONFIG, "CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE"
+        )
+        failures = self._with_compose_overrides(
+            prod=f"worker-queue:\n  environment:\n    LEAKED: {confirm_value}\n"
+        )
+        self.assertTrue(
+            any("compose.prod.yaml" in f and confirm_value in f for f in failures), failures
+        )
+
+    def test_the_flag_variable_name_leaking_into_compose_base_is_caught(self) -> None:
+        """不止 prod：写进 ``compose.yaml``（stage/prod 都会继承）同样必须被挡住。"""
+
+        flag_var = CONTRACT.module_constant(CONTRACT.WORKER_CONFIG, "CONTENT_CAPTURE_FLAG_VAR")
+        failures = self._with_compose_overrides(
+            base=f"worker-queue:\n  environment:\n    {flag_var}: '1'\n"
+        )
+        self.assertTrue(any("compose.yaml" in f and flag_var in f for f in failures), failures)
+
+    def test_a_clean_compose_set_passes(self) -> None:
+        failures = self._with_compose_overrides(
+            stage="worker-queue:\n  env_file:\n    - ./.env.stage.worker-queue\n",
+            prod="worker-queue:\n  env_file:\n    - ./.env.prod.worker-queue\n",
+        )
+        self.assertEqual(failures, [])
+
+    def test_env_example_missing_the_flag_variable_is_caught(self) -> None:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        path = directory / ".env.example"
+        path.write_text(
+            "# 文件五：deploy/.env.stage.worker-queue —— 常驻队列消费者\n"
+            "LINGXI_POSTGRES_DSN=postgresql://x\n"
+            "# ===========================================================================\n"
+            "# 文件六：deploy/.env.stage.migrate\n",
+            encoding="utf-8",
+        )
+        original = CONTRACT.ENV_EXAMPLE
+        CONTRACT.ENV_EXAMPLE = path
+        try:
+            failures = CONTRACT.check_content_capture_prod_guard()
+        finally:
+            CONTRACT.ENV_EXAMPLE = original
+        flag_var = CONTRACT.module_constant(CONTRACT.WORKER_CONFIG, "CONTENT_CAPTURE_FLAG_VAR")
+        self.assertTrue(any(flag_var in f for f in failures), failures)
+
+    def test_env_example_missing_the_production_forbidden_warning_is_caught(self) -> None:
+        flag_var = CONTRACT.module_constant(CONTRACT.WORKER_CONFIG, "CONTENT_CAPTURE_FLAG_VAR")
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        path = directory / ".env.example"
+        path.write_text(
+            "# 文件五：deploy/.env.stage.worker-queue —— 常驻队列消费者\n"
+            f"# {flag_var}=1\n"
+            "# ===========================================================================\n"
+            "# 文件六：deploy/.env.stage.migrate\n",
+            encoding="utf-8",
+        )
+        original = CONTRACT.ENV_EXAMPLE
+        CONTRACT.ENV_EXAMPLE = path
+        try:
+            failures = CONTRACT.check_content_capture_prod_guard()
+        finally:
+            CONTRACT.ENV_EXAMPLE = original
+        self.assertTrue(any("警示" in f for f in failures), failures)
+
+    def test_checklist_missing_the_variable_is_caught(self) -> None:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        path = directory / "checklist.md"
+        path.write_text("这份清单没有登记内容级采集开关。", encoding="utf-8")
+        original = CONTRACT.DEPLOY_CHECKLIST
+        CONTRACT.DEPLOY_CHECKLIST = path
+        try:
+            failures = CONTRACT.check_content_capture_prod_guard()
+        finally:
+            CONTRACT.DEPLOY_CHECKLIST = original
+        self.assertTrue(any("验收前部署配置清单.md" in f for f in failures), failures)
+
+
 if __name__ == "__main__":
     unittest.main()
