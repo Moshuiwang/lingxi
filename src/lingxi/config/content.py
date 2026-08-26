@@ -307,16 +307,25 @@ class ContentCatalog:
         self,
         key: str,
         variables: Mapping[str, object] | None = None,
+        *,
+        contains_model_text: bool = False,
         **values: object,
     ) -> RenderedContent:
-        """按语义键渲染文案，调用方变量集合必须与模板集合相等。"""
+        """按语义键渲染文案，调用方变量集合必须与模板集合相等。
+
+        ``contains_model_text=True``：本次渲染的变量里带有模型生成的终端正文
+        （目前只有 ``worker.stopped_result`` 的 ``result``），出口校验因此只保留
+        协议泄漏检查，见 ``_validate_user_visible_text`` 与 Issue #322。
+        """
 
         template = self._texts.get(key)
         if template is None:
             raise ContentRenderError("未登记的文案键")
         provided = _merge_variables(variables, values)
         rendered = _render_template(template, provided)
-        _validate_user_visible_text(rendered, internal_terms=())
+        _validate_user_visible_text(
+            rendered, internal_terms=(), contains_model_text=contains_model_text
+        )
         return RenderedContent(key=key, version=self.version, text=rendered)
 
     def card(
@@ -325,9 +334,16 @@ class ContentCatalog:
         variables: Mapping[str, object] | None = None,
         *,
         internal_terms: Sequence[str] = (),
+        contains_model_text: bool = False,
         **values: object,
     ) -> RenderedCard:
-        """渲染只含展示字段的卡片，并在出口拦截内部过程文本。"""
+        """渲染只含展示字段的卡片，并在出口拦截内部过程文本。
+
+        ``contains_model_text=True``：本次渲染的变量里带有模型生成的终端正文
+        （``query.result`` 的 ``result``、``query.failure`` 的 ``message``），
+        出口校验因此只保留协议泄漏检查、跳过 ``internal_terms``/固定词表，
+        见 ``_validate_user_visible_text`` 与 Issue #322。
+        """
 
         template = self._cards.get(key)
         if template is None:
@@ -340,7 +356,9 @@ class ContentCatalog:
         body = _format_template(template.body.template, provided)
         labels = tuple(_format_template(label.template, provided) for label in template.button_labels)
         for rendered in (title, body, *labels):
-            _validate_user_visible_text(rendered, internal_terms=internal_terms)
+            _validate_user_visible_text(
+                rendered, internal_terms=internal_terms, contains_model_text=contains_model_text
+            )
         return RenderedCard(
             key=key,
             version=self.version,
@@ -428,10 +446,35 @@ def _validate_fixed_template_safety(templates: Sequence[str], key: str) -> None:
             raise ContentValidationError(f"内容键 {key} 含不允许的用户可见过程信息") from error
 
 
-def _validate_user_visible_text(text: str, *, internal_terms: Sequence[str]) -> None:
-    lowered = text.casefold()
+def _validate_user_visible_text(
+    text: str, *, internal_terms: Sequence[str], contains_model_text: bool = False
+) -> None:
+    """校验一段即将展示给用户的文本。
+
+    两道防线的职责不同：
+
+    1. **协议泄漏**（``_PROCESS_MARKER_PATTERN``：``mcp__``/``trace_id=``/
+       ``pretooluse`` 等）对任何来源的文本都生效，模型生成的正文也不例外——
+       这是投递前最后一道兜底，worker 出口安全
+       （``core.execution.input_safety.constrain_output``）虽然已经用更强的
+       归一化处理过同类标记，但两层各自独立生效，不能因为“这是模型正文”就
+       整体跳过。
+    2. **固定词表**（``_UNSAFE_FIXED_MARKERS``：「还需/权限不足/剩余时间」等
+       自然语言）只为我们自己撰写的固定文案设计，用来防止模板承诺不实的等待
+       时间或误导权限状态；模型可以自由使用中文的终态正文撞上这类日常措辞是
+       高频误伤面（Issue #322 内测两次实测：模型答案结尾「还需要看其他维度
+       吗」被当成过程日志拦截，任务卡死 uncertain）。调用方用
+       ``contains_model_text=True`` 显式声明“这次渲染的是模型生成的终态
+       正文”时，跳过这一层与 ``internal_terms``；``content.toml`` 模板本身在
+       加载期仍然无条件过两道检查（见 ``_validate_fixed_template_safety``，
+       不受这个参数影响，模板闸不因此放宽）。
+    """
+
     if _PROCESS_MARKER_PATTERN.search(text):
         raise ContentSafetyError("用户可见内容包含内部过程标识")
+    if contains_model_text:
+        return
+    lowered = text.casefold()
     markers = (*_UNSAFE_FIXED_MARKERS, *(term.casefold() for term in internal_terms if term))
     if any(marker.casefold() in lowered for marker in markers):
         raise ContentSafetyError("用户可见内容包含内部过程或误导性权限表达")

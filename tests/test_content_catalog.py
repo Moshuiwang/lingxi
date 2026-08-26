@@ -388,5 +388,84 @@ class UserVisibleOutputTests(unittest.TestCase):
         self.assertEqual(validate_user_visible_text("本次未取得可用结果。"), "本次未取得可用结果。")
 
 
+class ModelGeneratedTextValidationTests(unittest.TestCase):
+    """Issue #322：投递层模板校验器误伤模型正文的根因回归。
+
+    两次内测实测：模型终态答案以「还需」收尾或提到「过程日志」，被为固定模板
+    设计的 ``_UNSAFE_FIXED_MARKERS`` 词表拦截成 ``ContentSafetyError`` →
+    投递层判定失败 → 任务卡死 uncertain，用户等不到答案。产品负责人裁定的目标
+    设计：模型生成的终态正文只保留协议泄漏级防线（``_PROCESS_MARKER_PATTERN``），
+    调用方用 ``contains_model_text=True`` 显式声明；``content.toml`` 模板本身
+    的校验一字不动（见 ``test_content_toml_template_gate_...``）。
+    """
+
+    def test_model_final_answer_with_everyday_wording_delivers_through_the_result_card(
+        self,
+    ) -> None:
+        """两次内测真实复现的原句：模型答案以「还需」收尾、或提到「过程日志」，
+        都必须能正常渲染进终态卡片——这正是本次要修的两起 uncertain 卡死。"""
+
+        catalog = default_content_catalog()
+        for answer in (
+            "已完成周环比分析，还需要看其他维度吗？",
+            "已核对排查过程日志，结论如下：无异常。",
+        ):
+            with self.subTest(answer=answer):
+                card = catalog.card("query.result", result=answer, contains_model_text=True)
+                self.assertEqual(card.body, answer)
+
+    def test_model_stopped_partial_answer_with_everyday_wording_still_renders(self) -> None:
+        """``/stop`` 中断时的残余正文同样是模型生成的终态正文
+        （``worker.stopped_result``），同一类日常措辞不应该在 worker 侧就抛
+        ``ContentSafetyError``（否则连投递层都到不了）。"""
+
+        rendered = default_content_catalog().text(
+            "worker.stopped_result", result="还需要继续挖掘吗", contains_model_text=True
+        )
+        self.assertIn("还需要继续挖掘吗", rendered.text)
+
+    def test_model_text_still_faces_the_protocol_leak_defense(self) -> None:
+        """放宽只针对自然语言固定词表；协议泄漏（内部工具名/trace_id 等）对模型
+        正文仍然是响亮拒绝——这是刻意保留的唯一防线，不能被这次修复一并放开。"""
+
+        for leak in ("mcp__bi_metric__list_metrics 调用失败", "trace_id=trc_fake 排查完成"):
+            with self.subTest(leak=leak):
+                with self.assertRaises(ContentSafetyError):
+                    default_content_catalog().card(
+                        "query.result", result=leak, contains_model_text=True
+                    )
+
+    def test_calls_without_the_model_text_flag_still_reject_the_fixed_marker_word_list(
+        self,
+    ) -> None:
+        """默认行为（省略 ``contains_model_text``）必须保持原有强度不变——放宽
+        只对显式声明"这是模型正文"的调用生效，不是全局降级。"""
+
+        with self.assertRaises(ContentSafetyError):
+            default_content_catalog().card("query.result", result="还需要继续吗")
+        with self.assertRaises(ContentSafetyError):
+            default_content_catalog().text("worker.stopped_result", result="还需要继续吗")
+
+    def test_content_toml_template_gate_still_rejects_fixed_markers_at_load_time(self) -> None:
+        """模板闸不回退：``content.toml`` 里我们自己写的固定文案一旦混入固定
+        词表标记，仍必须在目录**加载期**拒绝——这条闸不经过运行时渲染、也不受
+        ``contains_model_text`` 影响，本次放宽只发生在渲染期的模型正文变量上。"""
+
+        for key, poisoned in (
+            ("gateway.busy_hint", "当前任务还需要处理"),
+            ("worker.failed", "本次任务权限不足，请稍后重试。"),
+        ):
+            with self.subTest(key=key):
+                document = _document()
+                document["texts"][key] = poisoned
+                with self.assertRaises(ContentValidationError):
+                    ContentCatalog.from_mapping(document)
+
+        card_document = _document()
+        card_document["cards"]["query.result"]["title"] = "查询完成，还需确认"
+        with self.assertRaises(ContentValidationError):
+            ContentCatalog.from_mapping(card_document)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -278,9 +278,20 @@ class CardStream:
                 elapsed_seconds=max(0, elapsed_seconds),
             ).text
             body = f"{completed}\n{body}"
-            card = self._catalog.card("query.result", result=body)
+            # `result` 是模型生成的终态正文（Issue #322）：worker 出口安全
+            # （`constrain_output`/`redact_free_text`）已经做过协议泄漏与凭据
+            # 净化，这里的目录校验只再保留协议泄漏这一道，不能再用为固定模板
+            # 设计的自然语言词表（「还需/权限不足」等）拦截模型的日常措辞。
+            card = self._catalog.card("query.result", result=body, contains_model_text=True)
         else:
-            card = self._catalog.card("query.failure", message=failure.text)
+            # `failure.text` 可能是我们自己的固定失败文案，也可能是 STOPPED
+            # 终态携带的模型残余正文（`worker.stopped_result`，同样已经在
+            # worker 侧出口净化过）——这里已经无法区分两者，统一按“可能含模型
+            # 正文”处理；我们自己的固定文案已经在 content.toml 加载期校验过，
+            # 不会因此漏检（Issue #322）。
+            card = self._catalog.card(
+                "query.failure", message=failure.text, contains_model_text=True
+            )
 
         self._sequence += 1
         try:
