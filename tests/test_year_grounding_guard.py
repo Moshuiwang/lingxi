@@ -32,13 +32,39 @@ class _FakeToolCall:
     tool_input: Mapping[str, Any]
 
 
-def _query_call(*, start_date: Any = None, end_date: Any = None, tool_name: str = QUERY_METRIC_TOOL_NAME) -> _FakeToolCall:
+def _query_call(
+    *,
+    start_date: Any = None,
+    end_date: Any = None,
+    tool_name: str = QUERY_METRIC_TOOL_NAME,
+    filters: Any = None,
+) -> _FakeToolCall:
     tool_input: dict[str, Any] = {}
     if start_date is not None:
         tool_input["start_date"] = start_date
     if end_date is not None:
         tool_input["end_date"] = end_date
+    if filters is not None:
+        tool_input["filters"] = filters
     return _FakeToolCall(tool_name=tool_name, tool_input=tool_input)
+
+
+def _real_captured_tool_input(*, start_date: str, end_date: str) -> dict[str, Any]:
+    """还原 Issue #326 L4a 追评记录的真实 ``query_metric`` 入参形状（2026-08-26 部署
+    ``20260826-cbf16354a85b`` 后容器内直测）：日期字段嵌在 ``filters`` 对象下，取值是
+    紧凑 ``YYYYMMDD`` 八位数字。``business``/``group_by``/``metric_id`` 用占位内容
+    还原"这些键确实存在"这一形状事实，不含真实业务线或指标名称。
+    """
+
+    return {
+        "filters": {
+            "business": ["示例业务线A", "示例业务线B"],
+            "end_date": end_date,
+            "start_date": start_date,
+        },
+        "group_by": ["day"],
+        "metric_id": "示例指标ID",
+    }
 
 
 class RelativeTimeTermDetectionTests(unittest.TestCase):
@@ -116,6 +142,68 @@ class QueryYearExtractionTests(unittest.TestCase):
     def test_empty_tool_calls_yield_no_years(self) -> None:
         self.assertEqual(extract_query_years(()), ())
 
+    # -- L4a 真实形状修复（Issue #326 追评，2026-08-26）：以下用例覆盖两处根因 --
+
+    def test_extracts_years_from_filters_nested_iso_formatted_dates(self) -> None:
+        """**变异验红锚点 A**：只隔离"读 ``filters`` 嵌套"这一处修复。
+
+        用分隔符日期（不是紧凑格式），确保本用例只会因为"没有读 ``filters``
+        嵌套"而失败，不会被紧凑日期解析的正确性掩盖。把 ``extract_query_years``
+        里读 ``filters`` 嵌套的两行（``years.update(_years_from_date_fields(
+        filters))`` 那一段）删掉/注释掉，本用例必须变红；人工执行记录见本卡
+        最终报告的「变异验红记录」一节。
+        """
+
+        calls = [_query_call(filters={"start_date": "2025-01-01", "end_date": "2025-08-25"})]
+        self.assertEqual(extract_query_years(calls), (2025,))
+
+    def test_extracts_years_from_top_level_compact_dates(self) -> None:
+        """**变异验红锚点 B**：只隔离"紧凑 YYYYMMDD 解析"这一处修复。
+
+        用顶层字段（不走 ``filters`` 嵌套），确保本用例只会因为"紧凑日期解析
+        不到年份"而失败，不会被 filters 嵌套读取的正确性掩盖。把
+        ``_years_in_value`` 里 ``_COMPACT_DATE_PATTERN`` 相关的那一行删掉/
+        注释掉，本用例必须变红；人工执行记录见本卡最终报告的「变异验红记录」
+        一节。
+        """
+
+        calls = [_query_call(start_date="20260819", end_date="20260826")]
+        self.assertEqual(extract_query_years(calls), (2026,))
+
+    def test_extracts_years_from_the_real_captured_shape(self) -> None:
+        """正例：Issue #326 L4a 追评记录的真实捕获形状——``filters`` 嵌套 **且**
+        紧凑 ``YYYYMMDD`` 日期同时出现，两处修复合起来才能让本用例通过。"""
+
+        calls = [_FakeToolCall(tool_name=QUERY_METRIC_TOOL_NAME, tool_input=_real_captured_tool_input(start_date="20260819", end_date="20260826"))]
+        self.assertEqual(extract_query_years(calls), (2026,))
+
+    def test_collects_years_from_both_top_level_and_nested_filters_when_both_present(self) -> None:
+        """两处"都可能有"是刻意的冗余设计，不是假设互斥：同一次调用顶层与
+        ``filters`` 各给一个不同年份时，两个年份都要被收集到（模块文档「检测
+        口径」）。"""
+
+        calls = [_query_call(start_date="2025-01-01", filters={"start_date": "20260101"})]
+        self.assertEqual(extract_query_years(calls), (2025, 2026))
+
+    def test_ignores_an_eight_digit_number_that_is_not_a_valid_compact_date(self) -> None:
+        """负例：8 位纯数字但月/日不在合法范围内，不得被误当成紧凑日期提取
+        出年份——即使它的前四位恰好数值上"看起来像"年份。"""
+
+        calls = [
+            _query_call(start_date="12345678"),  # 年份前缀非 19xx/20xx，月份"56"也非法
+            _query_call(start_date="20261301"),  # 月份 13 非法
+            _query_call(start_date="20260132"),  # 日期 32 非法
+            _query_call(start_date="20260100"),  # 日期 00 非法
+        ]
+        self.assertEqual(extract_query_years(calls), ())
+
+    def test_ignores_filters_that_is_not_a_mapping(self) -> None:
+        """防御性：``filters`` 键存在但形状异常（非 Mapping）不得让整体解析
+        抛异常，安静跳过该处、不影响顶层字段的正常解析。"""
+
+        calls = [_query_call(start_date="2025-01-01", filters="not-a-mapping")]
+        self.assertEqual(extract_query_years(calls), (2025,))
+
 
 class DetectYearGroundingSuspectTests(unittest.TestCase):
     """``detect_year_grounding_suspect``：三条件与的完整判定（V-326 主断言）。"""
@@ -140,6 +228,35 @@ class DetectYearGroundingSuspectTests(unittest.TestCase):
         self.assertEqual(suspect.matched_terms, ("最近", "7月之后"))
         self.assertEqual(suspect.query_years, (2025,))
         self.assertEqual(suspect.current_year, 2026)
+
+    def test_fires_end_to_end_on_the_real_captured_shape_with_relative_wording_and_a_past_compact_year(
+        self,
+    ) -> None:
+        """端到端接线用例（Issue #326 L4a 追评）：相对时间问句 + ``filters`` 嵌套
+        紧凑 ``YYYYMMDD`` 全 2025 年查询 → 告警必发。
+
+        这是此前因两处形状根因（顶层读取/分隔符日期）测不到的真实路径——修复
+        之前，同样的输入会因为 ``extract_query_years`` 恒返回空集而在
+        ``if not query_years: return None`` 处静默放行，检测层在真实数据上
+        形同虚设（Issue #326 L4a 追评原话）。本用例把这条真实路径钉死：任何
+        回归都会让本用例从"必须命中"变回"静默不命中"。
+        """
+
+        calls = [
+            _FakeToolCall(
+                tool_name=QUERY_METRIC_TOOL_NAME,
+                tool_input=_real_captured_tool_input(start_date="20250115", end_date="20250825"),
+            )
+        ]
+        suspect = detect_year_grounding_suspect(
+            task_id="tsk-real-shape-end-to-end",
+            question="最近，尤其是7月之后数据下滑得厉害",
+            tool_calls=calls,
+            current_year=2026,
+        )
+        self.assertIsNotNone(suspect)
+        assert suspect is not None  # for type-checkers
+        self.assertEqual(suspect.query_years, (2025,))
 
     def test_mutation_anchor_does_not_fire_when_a_query_year_matches_the_current_year(self) -> None:
         """**变异验红锚点**：本用例是"全部查询年份均≠当前年份"这一条件的红线。
