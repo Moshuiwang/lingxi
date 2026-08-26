@@ -315,6 +315,32 @@ class TokenIssuanceTest(McpTokenPostgresTestCase):
         self.assertEqual(self.store.token_cipher(USER_A), issued.token_cipher)
 
 
+class AnyTokenHolderTest(McpTokenPostgresTestCase):
+    """``any_token_holder``（Issue #320 并入项：每日「MCP 指标目录 vs 映射表覆盖面」
+    日检取数用）。"""
+
+    def test_no_token_issued_yet_returns_none(self) -> None:
+        self.assertIsNone(self.store.any_token_holder())
+
+    def test_returns_a_real_issued_user_id(self) -> None:
+        self.store.issue_token(USER_A)
+
+        self.assertEqual(self.store.any_token_holder(), USER_A)
+
+    def test_with_multiple_holders_returns_one_of_the_real_ones(self) -> None:
+        """不测严格的"最新优先"排序——两次签发在真库上可能落在同一个
+        ``issued_at`` 微秒时间戳内，断言严格次序会引入与本方法核心承诺无关的
+        计时脆弱性（见 ``any_token_holder`` 文档字符串「不针对特定身份」一节：
+        任意一个真实存在的令牌都足以满足调用方的需要）。只断言返回值确实是
+        已签发的两人之一，不是 ``None`` 或第三个不存在的值。
+        """
+
+        self.store.issue_token(USER_A)
+        self.store.issue_token(USER_B)
+
+        self.assertIn(self.store.any_token_holder(), {USER_A, USER_B})
+
+
 class TokenAdoptionTest(McpTokenPostgresTestCase):
     """``adopt_token``（Issue #281 改道，Trace #304 批次 3）：`V-开通-24` 的真库半边。
 

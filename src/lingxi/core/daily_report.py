@@ -304,6 +304,21 @@ class TokenUsageStats:
 
 
 @dataclass(frozen=True)
+class MetricCoverageGap:
+    """「MCP 指标目录 vs 映射表覆盖面」差集的非空结果（Issue #320 并入项，来自
+    #303 准入巡检对照，旧系统「指标准入」的等价物）。
+
+    只在**存在**未覆盖指标时才会被构造——「无差异」由 :func:`build_metric_coverage_gap`
+    返回 ``None`` 表达，不是一个 ``uncovered_metric_ids=()`` 的空实例，理由见该函数
+    文档「无差异不报」一节。
+    """
+
+    #: 已排序去重的指标 ID：出现在 MCP 目录里、但当前映射表（``company_function_
+    #: metric_map.toml``）任何一个「公司+职能」条目都没有覆盖到的那些。
+    uncovered_metric_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class DailyReportInputs:
     """一轮通报要渲染的全部数据，每段各自可能「不可判定」。"""
 
@@ -323,6 +338,22 @@ class DailyReportInputs:
     #: 依然必须给出"本来打算问哪个窗口"，供正文标注与测试钉住边界。
     delivery_window_start: datetime
     delivery_window_end: datetime
+    #: 「未覆盖新指标」日检（Issue #320 并入项）。**默认 ``None``，且与其余七段的
+    #: 「不可判定」不是同一件事**：
+    #:
+    #: - ``None``（未接线，本字段的默认值）：本职责这一轮**根本没有尝试**这项检查
+    #:   （前置配置不全，见 ``apps/scheduler/daily_report.py`` 的装配文档）——正文
+    #:   里完全不出现这一段，不是"检查了，不确定"；
+    #: - ``Section.undetermined(reason)``：接线了，但这一轮取数失败（MCP 查不到，
+    #:   或映射表读取失败）——正文出现一行不可判定说明，与其余段落同一条纪律
+    #:   （"绝不能把「取不到」悄悄渲染成 0 或干脆省略"）；
+    #: - ``Section.of(None)``：接线了，真查了，两边一致，没有差异——「无差异不报」，
+    #:   正文同样不出现这一段；
+    #: - ``Section.of(gap)``（``gap`` 非空）：存在未覆盖的新指标，正文出现「待分配」段。
+    #:
+    #: 放在字段列表末尾并给默认值，是为了不打破既有全部调用点（生产代码与测试）
+    #: 现有的关键字参数构造方式——本字段是纯新增，不重排、不改动任何既有字段。
+    metric_coverage_gap: "Section[MetricCoverageGap | None] | None" = None
 
 
 # --------------------------------------------------------------------------
@@ -526,6 +557,35 @@ def build_delivery_outcome(rows: Sequence[DeliveryOutcomeRow]) -> DeliveryOutcom
     )
 
 
+def build_metric_coverage_gap(
+    mcp_metric_ids: Sequence[str], mapped_metric_ids: Sequence[str]
+) -> MetricCoverageGap | None:
+    """「MCP 指标目录 vs 映射表覆盖面」差集（Issue #320 并入项）：纯集合运算，
+    不做任何 I/O——调用方（``apps/scheduler/daily_report.py``）负责分别取到这两组
+    指标 ID 再传进来。
+
+    **无差异不报**：`mcp_metric_ids` 里的每一个 ID 都能在 `mapped_metric_ids` 里
+    找到时返回 ``None``，调用方据此不往正文里插入这一段——这不是「不可判定」，是
+    「判定过，没有问题」，与 :class:`Section` 的既有二分法（判定值 / 不可判定原因）
+    不完全对齐，因此 :attr:`DailyReportInputs.metric_coverage_gap` 用
+    ``Section[MetricCoverageGap | None]`` 而不是 ``Section[MetricCoverageGap]``——
+    「有值」这件事本身分「有差异」与「查过，无差异」两种，只有前者需要占用正文篇幅。
+
+    结果按字符串排序、去重（`dict.fromkeys` 保序后再 `sorted`，与本仓库其余聚合层
+    同一条纪律），保证同一组输入产出同一份输出——正文因此不会因为集合迭代顺序不同
+    而每天字节不同。**不做任何大小写或全半角归一**：指标 ID 逐字符透传，与
+    ``core/permission/publish_row.py`` 的「零归一」纪律一致，这里比对的是"MCP 报告
+    的 ID 字符串"与"映射表里写的 ID 字符串"是否**逐字**相等，不是"看起来像不像
+    同一个指标"。
+    """
+
+    mapped = set(mapped_metric_ids)
+    gap = sorted(dict.fromkeys(metric_id for metric_id in mcp_metric_ids if metric_id not in mapped))
+    if not gap:
+        return None
+    return MetricCoverageGap(uncovered_metric_ids=tuple(gap))
+
+
 # --------------------------------------------------------------------------
 # 渲染：纯函数，输入相同则输出逐字节相同
 # --------------------------------------------------------------------------
@@ -711,6 +771,28 @@ def _render_delivery_outcome(
     )
 
 
+def _render_metric_coverage_gap(section: "Section[MetricCoverageGap | None] | None") -> str:
+    """「待分配」段（Issue #320 并入项）。返回空字符串表示**这一段完全不出现**——
+    与其余段落不同，本段允许彻底不出现，见 :attr:`DailyReportInputs.metric_coverage_gap`
+    的三态说明。未接线（``section is None``）与「接线了、查过、没有差异」
+    （``section.value is None``）都返回空字符串，调用方据此不往正文里插入这一段。
+    """
+
+    if section is None:
+        return ""
+    if not section.is_determined:
+        assert section.undetermined_reason is not None
+        return f"待分配（新指标未覆盖核对）：{_render_undetermined(section.undetermined_reason)}"
+    gap = section.value
+    if gap is None or not gap.uncovered_metric_ids:
+        return ""
+    ids = "、".join(gap.uncovered_metric_ids)
+    return (
+        f"待分配（新指标未覆盖核对）：MCP 指标目录中发现映射表尚未覆盖的指标 {ids}，"
+        "需要产品负责人补充 company_function_metric_map.toml"
+    )
+
+
 def render_daily_report(
     inputs: DailyReportInputs,
     *,
@@ -745,4 +827,7 @@ def render_daily_report(
             window_end=inputs.delivery_window_end,
         ),
     ]
+    coverage_line = _render_metric_coverage_gap(inputs.metric_coverage_gap)
+    if coverage_line:
+        lines.extend(["", coverage_line])
     return "\n".join(lines)

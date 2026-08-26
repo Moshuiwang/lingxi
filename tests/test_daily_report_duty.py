@@ -188,6 +188,7 @@ def build_duty(
     audit: RecordingAudit | None = None,
     clock: FixedClock | None = None,
     stop: threading.Event | None = None,
+    metric_coverage=None,
 ) -> tuple[DailyReportDuty, dict[str, object]]:
     parts = {
         "source": source or FakeSource(),
@@ -204,6 +205,7 @@ def build_duty(
         chat_id=FAKE_CHAT_ID,
         clock=parts["clock"],
         stop=stop,
+        metric_coverage=metric_coverage,
     )
     return duty, parts
 
@@ -632,6 +634,63 @@ class AggregationDoesNotBlockCallerTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while duty.completed_on is None and time.monotonic() < deadline:
             time.sleep(0.02)
+
+
+class MetricCoverageWiringTests(unittest.TestCase):
+    """「未覆盖新指标」日检的职责层接线（Issue #320 并入项）：未接线不出现、
+    接线且取数失败留不可判定审计、接线且有差异出现在正文与审计里。
+    """
+
+    def test_unwired_produces_no_coverage_section_and_no_audit_entry(self) -> None:
+        duty, parts = build_duty(metric_coverage=None)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("待分配", text)
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_a_failing_coverage_check_is_marked_undetermined_and_the_rest_still_sends(self) -> None:
+        def _boom() -> tuple[tuple[str, ...], tuple[str, ...]]:
+            raise RuntimeError("模拟 MCP 查询失败")
+
+        duty, parts = build_duty(metric_coverage=_boom)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("待分配", text)
+        self.assertIn("不可判定", text)
+        # 单段失败不拖累其余段落——活跃用户段的真实数字照常出现。
+        self.assertIn("活跃用户", text)
+        section_reads = parts["audit"].fields_for("daily_report.section_read_failed")
+        self.assertTrue(any(entry["section"] == "metric_coverage" for entry in section_reads))
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_a_detected_gap_appears_in_the_sent_text(self) -> None:
+        duty, parts = build_duty(
+            metric_coverage=lambda: (("brand_new_metric", "exchange_rate"), ("exchange_rate",))
+        )
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("待分配", text)
+        self.assertIn("brand_new_metric", text)
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_no_gap_produces_no_coverage_section(self) -> None:
+        duty, parts = build_duty(
+            metric_coverage=lambda: (("exchange_rate",), ("exchange_rate", "vat_rate"))
+        )
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("待分配", text)
 
 
 if __name__ == "__main__":

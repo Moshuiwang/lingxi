@@ -30,8 +30,10 @@ from lingxi.adapters.query_mcp_probe import (
     McpHttpResponse,
     QueryMcpProbe,
     _no_redirect_opener,
+    content_text_metric_ids_reader,
     content_text_metrics_reader,
     default_metrics_reader,
+    fetch_metric_catalog,
 )
 from lingxi.core.permission.mcp_readiness import McpProbeError
 
@@ -774,6 +776,100 @@ class ReaderBehaviorContrastTest(unittest.TestCase):
 
     def _probe_with(self, reader):
         return _probe(self._real_response, metrics_reader=reader)
+
+
+class ContentTextMetricIdsReaderTest(unittest.TestCase):
+    """``content_text_metric_ids_reader``（Issue #320 并入项）：与
+    ``content_text_metrics_reader`` 同一份真实响应形状，只是返回 ``metric_id`` 集合
+    而不是条数。"""
+
+    def test_reads_every_metric_id_from_the_real_fixture(self) -> None:
+        ids = content_text_metric_ids_reader(_real_list_metrics_result())
+
+        self.assertEqual(ids, frozenset(record["metric_id"] for record in REAL_METRICS))
+
+    def test_an_empty_metrics_list_yields_an_empty_set(self) -> None:
+        self.assertEqual(content_text_metric_ids_reader(_real_list_metrics_result([])), frozenset())
+
+    def test_missing_structured_content_shape_is_rejected(self) -> None:
+        with self.assertRaises(McpProbeError):
+            content_text_metric_ids_reader({"structuredContent": {"metrics": []}})
+
+    def test_a_record_missing_metric_id_is_rejected(self) -> None:
+        broken = [{"name": "新增用户数", "name_en": "New User Count"}]
+        with self.assertRaises(McpProbeError):
+            content_text_metric_ids_reader(_real_list_metrics_result(broken))
+
+
+class FetchMetricCatalogTest(unittest.TestCase):
+    """``fetch_metric_catalog``（Issue #320 并入项）：每日「MCP 指标目录 vs 映射表
+    覆盖面」日检的取数入口。独立于 :class:`QueryMcpProbe` 的就绪判定路径，只测传输
+    与解析对接，不重复它已经覆盖过的协议细节断言。
+    """
+
+    def _real_response(self, request_id: str) -> McpHttpResponse:
+        return McpHttpResponse(
+            200,
+            {"jsonrpc": "2.0", "id": request_id, "result": _real_list_metrics_result()},
+        )
+
+    def test_a_successful_call_returns_the_metric_id_set(self) -> None:
+        transport = RecordingTransport(self._real_response)
+
+        result = fetch_metric_catalog(endpoint=ENDPOINT, token=TOKEN, transport=transport)
+
+        self.assertEqual(result, frozenset(record["metric_id"] for record in REAL_METRICS))
+        # 令牌只进请求头，不进 URL。
+        self.assertEqual(transport.calls[0]["token"], TOKEN)
+        self.assertEqual(transport.calls[0]["url"], ENDPOINT)
+
+    def test_a_non_https_endpoint_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            fetch_metric_catalog(
+                endpoint="http://mcp.example.invalid/query",
+                token=TOKEN,
+                transport=RecordingTransport(self._real_response),
+            )
+
+    def test_an_empty_token_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            fetch_metric_catalog(
+                endpoint=ENDPOINT, token="", transport=RecordingTransport(self._real_response)
+            )
+
+    def test_a_denied_status_still_raises_not_returns_an_empty_set(self) -> None:
+        """明确拒绝（401/403）不是"这个人没有指标"，与 :class:`QueryMcpProbe` 的就绪
+        判定不同——本函数只有一种失败语义：读不到就整体不可判定，绝不悄悄返回空集合
+        冒充"读到了，恰好是空的"。
+        """
+
+        transport = RecordingTransport(McpHttpResponse(401, {"error": {"message": "Unauthorized"}}))
+
+        with self.assertRaises(McpProbeError):
+            fetch_metric_catalog(endpoint=ENDPOINT, token=TOKEN, transport=transport)
+
+    def test_a_mismatched_response_id_is_rejected(self) -> None:
+        """响应必须自证是这次请求的答复——与 :class:`QueryMcpProbe` 同一条纪律。"""
+
+        transport = RecordingTransport(
+            McpHttpResponse(
+                200,
+                {"jsonrpc": "2.0", "id": "some-other-request", "result": _real_list_metrics_result()},
+            )
+        )
+
+        with self.assertRaises(McpProbeError):
+            fetch_metric_catalog(endpoint=ENDPOINT, token=TOKEN, transport=transport)
+
+    def test_a_tool_error_is_rejected(self) -> None:
+        transport = RecordingTransport(
+            lambda request_id: McpHttpResponse(
+                200, {"jsonrpc": "2.0", "id": request_id, "result": {"isError": True}}
+            )
+        )
+
+        with self.assertRaises(McpProbeError):
+            fetch_metric_catalog(endpoint=ENDPOINT, token=TOKEN, transport=transport)
 
 
 if __name__ == "__main__":  # pragma: no cover

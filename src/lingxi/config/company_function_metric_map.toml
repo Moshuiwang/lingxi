@@ -35,7 +35,29 @@
 # permissions 的读侧允许值列表里写 "*" 表示「该公司下所有指标」，但本仓库的写侧
 # 目前不产出这种形态。因此「CEO / 运营 = 全部指标」在这里是把当时已知的 9 个 ID
 # 逐条列出。**后果**：将来问数 MCP 新增指标时，这两个职能不会自动获得新指标，需要
-# 回来改本文件。要改成「自动获得」需要产品负责人另行决定并改写侧代码。
+# 回来改本文件。要改成「自动获得」需要产品负责人另行决定并改写侧代码。「后台管理员」
+# （见下）延续同一条取舍，同样逐条列出而不是写 "*"。
+#
+# ── 「后台管理员」条目（Issue #320，产品负责人 2026-08-26 裁定）───────────
+# 银河「后台管理员」角色（role_id 513）此前完全没有 Lingxi 职能映射——内测首日
+# U1（该用户仅持有这一个银河角色）因此被开通链拒绝三次。产品负责人 2026-08-26
+# 裁定：「银河管理员理论上所有指标都可以看，是我忘了建这条通道」，即「全公司 ×
+# 全指标」（`*×*`）。落地方式：
+#
+#   1. galaxy_role_function_map.toml 新增 "后台管理员" = "后台管理员"
+#      （银河角色名 → Lingxi 职能标签，独立职能，不复用 CEO/运营）；
+#   2. 本文件给**每一个**公司键（含 "*"）都补上 "后台管理员" 这一条职能，取值与
+#      当前已知的「全部指标」（CEO/运营同一份 9 个 ID）逐字相同——原因同上一节
+#      「全部指标为什么逐条列出」，以及「展开规则」一节「为什么每家公司都列了
+#      全部职能」：银河实际授予这个人的公司范围既可能是「全非」通配（此时翻译层
+#      只查 "*" 键），也可能是具体公司枚举（此时翻译层按公司逐一查）——两种情况
+#      都不该在翻译层 fail-closed，因此不是只写 [companies."*"] 一条就够。
+#      这不是本文件放宽了任何人的实际授予面：一个人能不能拿到「后台管理员」这个
+#      职能仍然完全由银河的角色决定；本文件只回答「已经确定持有这个职能的人，
+#      对应哪些指标」——与本文件其余七个职能同一条纪律。
+#   3. 已知差异（如实登记，非反对）：U1 在旧系统正式表里是 44 家公司的枚举授权，
+#      本条目生效后翻译层将给出全公司——比旧系统实际授予面宽，产品负责人已明示
+#      这是意图，此处仅留档差异事实（Issue #320「如实登记的一个后果」一节）。
 #
 # ── 怎么维护 ─────────────────────────────────────────────────────────
 # 1. 在 [companies] 下面按「公司 → 职能 → 指标名列表」三层加条目：
@@ -68,20 +90,21 @@
 #
 # 格式为 TOML，由 Python 标准库 tomllib 解析，不引入任何新依赖。
 #
-# ── 职能 → 指标（产品负责人 2026-08-19 决定，全国统一）─────────────────
-#   CEO   全部 9 个
-#   OTT   exchange_rate, vat_rate
-#   内容  exchange_rate, vat_rate, channel_rate, channel_market_sharing
-#   商务  exchange_rate, vat_rate
-#   财务  sub_new_count, sub_recharge_count, sub_recharge_money,
-#         sub_deduction_count, sub_deduction_money, exchange_rate, vat_rate
-#   运营  全部 9 个
-#   销售  sub_new_count, exchange_rate, vat_rate
+# ── 职能 → 指标（产品负责人 2026-08-19 决定，全国统一；后台管理员为 2026-08-26 补充）──
+#   CEO       全部 9 个
+#   OTT       exchange_rate, vat_rate
+#   内容      exchange_rate, vat_rate, channel_rate, channel_market_sharing
+#   商务      exchange_rate, vat_rate
+#   财务      sub_new_count, sub_recharge_count, sub_recharge_money,
+#             sub_deduction_count, sub_deduction_money, exchange_rate, vat_rate
+#   运营      全部 9 个
+#   销售      sub_new_count, exchange_rate, vat_rate
+#   后台管理员 全部 9 个（Issue #320，`*×*`，见上方专节）
 
 [meta]
 # 决策来源与最后一次由产品负责人确认的时间，改动规则时一并更新。
-decision = "Issue #227 / 2026-08-19 产品负责人给出职能→指标内容，编排者机械展开"
-last_reviewed = "2026-08-19"
+decision = "Issue #227 / 2026-08-19 产品负责人给出职能→指标内容，编排者机械展开；Issue #320 / 2026-08-26 补充「后台管理员」全公司×全指标"
+last_reviewed = "2026-08-26"
 
 
 [companies."1"]
@@ -92,6 +115,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."2"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -101,6 +125,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."3"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -110,6 +135,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."4"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -119,6 +145,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."5"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -128,6 +155,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."6"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -137,6 +165,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."7"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -146,6 +175,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."8"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -155,6 +185,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."9"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -164,6 +195,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."10"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -173,6 +205,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."11"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -182,6 +215,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."12"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -191,6 +225,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."13"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -200,6 +235,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."14"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -209,6 +245,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."15"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -218,6 +255,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."16"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -227,6 +265,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."17"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -236,6 +275,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."18"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -245,6 +285,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."19"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -254,6 +295,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."20"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -263,6 +305,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."21"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -272,6 +315,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."22"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -281,6 +325,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."23"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -290,6 +335,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."24"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -299,6 +345,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."25"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -308,6 +355,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."26"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -317,6 +365,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."27"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -326,6 +375,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."28"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -335,6 +385,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."29"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -344,6 +395,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."30"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -353,6 +405,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."31"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -362,6 +415,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."32"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -371,6 +425,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."33"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -380,6 +435,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."34"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -389,6 +445,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."35"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -398,6 +455,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."36"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -407,6 +465,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."37"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -416,6 +475,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."38"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -425,6 +485,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."39"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -434,6 +495,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."44"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -443,6 +505,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."50"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -452,6 +515,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."61"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -461,6 +525,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."49368"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -470,6 +535,7 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 
 [companies."*"]
 "CEO" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
@@ -479,3 +545,4 @@ last_reviewed = "2026-08-19"
 "财务" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate"]
 "运营" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]
 "销售" = ["sub_new_count", "exchange_rate", "vat_rate"]
+"后台管理员" = ["sub_new_count", "sub_recharge_count", "sub_recharge_money", "sub_deduction_count", "sub_deduction_money", "exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"]

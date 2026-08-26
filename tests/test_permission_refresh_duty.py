@@ -1613,6 +1613,73 @@ class DutyRegistrationTest(unittest.TestCase):
     def test_the_variable_is_registered_in_the_environment_key_list(self) -> None:
         self.assertIn("LINGXI_MCP_TOKEN_ENCRYPT_KEY", SchedulerConfig.ENVIRONMENT_KEYS)
 
+    # ------------------------------------------------------------------
+    # 外置指标映射路径（Issue #320）：存在则优先、未配置回落包内默认、
+    # 配置了但缺失/非法响亮失败——装配层这一侧的证据。loader 本身的三条
+    # 独立证据在 tests/test_company_function_metric_map_file.py 的
+    # ExternalPathOverrideTest；这里只证明 SchedulerConfig 字段确实流到了
+    # load_company_function_metric_map 的 path 参数，而不是被装配层悄悄忽略。
+    # ------------------------------------------------------------------
+
+    def test_the_external_metric_map_path_variable_is_registered(self) -> None:
+        self.assertIn(
+            "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH", SchedulerConfig.ENVIRONMENT_KEYS
+        )
+
+    def test_an_invalid_external_metric_map_path_is_not_registered(self) -> None:
+        """配了但指向的文件不存在：**必须**响亮失败——如果装配层没有真的把这个变量
+        传给 loader（例如实现时手误漏接线），包内默认文件永远有效，这条用例就会
+        观察不到 ``duty_not_registered``，从而直接暴露"变量声明了但没有被使用"这
+        类接线遗漏。
+        """
+
+        import tempfile
+
+        audit = RecordingAudit()
+        with tempfile.TemporaryDirectory() as tmp:
+            bogus_path = str(pathlib.Path(tmp) / "does-not-exist.toml")
+
+            loop = build_loop(
+                self._config(
+                    LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                    LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH=bogus_path,
+                ),
+                audit=audit,
+            )
+
+        self.assertNotIn("每日权限重算", [duty.name for duty in loop.duties])
+        records = self._own_records(audit)
+        self.assertEqual(len(records), 1, "前置缺项时本职责的审计恰 1 条")
+        action, fields = records[0]
+        self.assertEqual(action, "permission_refresh.duty_not_registered")
+        self.assertEqual(fields["reason"], "metric_translation_map_unavailable")
+        self.assertNotIn("path", fields, "审计里不回显外置路径的取值")
+
+    def test_a_valid_external_metric_map_path_registers_the_duty(self) -> None:
+        """配了且指向一份合法的外置文件：职责正常注册，不因为路径来自环境变量就
+        被额外挡住——外置能力只改变"从哪里读"，不改变"读到合法内容就该正常工作"。
+        """
+
+        import tempfile
+
+        audit = RecordingAudit()
+        with tempfile.TemporaryDirectory() as tmp:
+            external_path = pathlib.Path(tmp) / "override.toml"
+            external_path.write_text(
+                '[companies."9001"]\n"运营" = ["外置专用指标"]\n', encoding="utf-8"
+            )
+
+            loop = build_loop(
+                self._config(
+                    LINGXI_MCP_TOKEN_ENCRYPT_KEY=SPEC_MASTER_KEY,
+                    LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH=str(external_path),
+                ),
+                audit=audit,
+            )
+
+        self.assertIn("每日权限重算", [duty.name for duty in loop.duties])
+        self.assertEqual(self._own_records(audit), [], "前置齐备时不该有『未注册』审计")
+
 
 if __name__ == "__main__":
     unittest.main()

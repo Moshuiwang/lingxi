@@ -125,6 +125,7 @@ from lingxi.core.daily_report import (
     ActiveUserStats,
     DailyReportInputs,
     DeliveryOutcomeRow,
+    MetricCoverageGap,
     PartialCount,
     Section,
     StatusDistribution,
@@ -137,6 +138,7 @@ from lingxi.core.daily_report import (
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
+    build_metric_coverage_gap,
     build_status_distribution,
     build_token_usage_stats,
     render_daily_report,
@@ -246,6 +248,7 @@ class DailyReportDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
         aggregation_join_timeout_seconds: float = DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS,
+        metric_coverage: Callable[[], tuple[Sequence[str], Sequence[str]]] | None = None,
     ) -> None:
         self._source = source
         self._watermark = watermark
@@ -261,6 +264,18 @@ class DailyReportDuty:
         # 线程」）。``None`` 或已经跑完都表示"可以派发下一轮"；还活着就说明上一轮
         # 还没收工，本轮不重复派发。
         self._pending_thread: threading.Thread | None = None
+        # 「未覆盖新指标」日检（Issue #320 并入项）。**可选，默认 None**——独立于
+        # 其余六段数据源，不接线时这一段完全不出现在正文里（见 core/daily_report.py
+        # 的 DailyReportInputs.metric_coverage_gap 三态说明）。返回值是
+        # ``(mcp_metric_ids, mapped_metric_ids)``：两组指标 ID，纯集合运算
+        # （`build_metric_coverage_gap`）留在 core 层，这里只负责取数与调度。**取数
+        # 含一次真实 MCP 网络调用**（`fetch_metric_catalog`）——本回调只会在
+        # `_aggregate_and_send`（Issue #325 起跑在后台聚合线程，见类文档「重聚合
+        # 为什么要挪出主线程」）里被 `_fetch("metric_coverage", ...)` 调用，绝不会
+        # 被 `run_once` 本身（调用方所在的线程，`SchedulerLoop` 主循环与
+        # `AlertingDuty` 心跳评估共用这条线程）直接调用，因此不会重新引入 #325
+        # 刚修好的"耗时职责挤占心跳评估"问题。
+        self._metric_coverage = metric_coverage
 
     @property
     def stopping(self) -> bool:
@@ -428,6 +443,17 @@ class DailyReportDuty:
             "resource_usage",
             lambda: self._source.token_usage_stats(window_start=window_start, window_end=window_end),
         )
+        # 「未覆盖新指标」日检（Issue #320 并入项）。与其余六段不同，本段**允许
+        # 完全不接线**（`self._metric_coverage is None`）——那种情况下连尝试都不
+        # 尝试，不产生 `_fetch` 的失败留痕，因为"没有接线"不是"这一轮取数失败"。
+        metric_coverage_raw: tuple[Sequence[str], Sequence[str]] | None
+        metric_coverage_fetch_reason: str | None
+        if self._metric_coverage is not None:
+            metric_coverage_raw, metric_coverage_fetch_reason = self._fetch(
+                "metric_coverage", self._metric_coverage
+            )
+        else:
+            metric_coverage_raw, metric_coverage_fetch_reason = None, None
 
         if self._stop.is_set():
             # 停止信号可能落在四段读取期间到达：干净中断，不发送、不置位、不提交
@@ -512,6 +538,21 @@ class DailyReportDuty:
                 else Section.undetermined(RESOURCE_USAGE_ALL_NULL_REASON)
             )
 
+        # 三态见 core/daily_report.py 的 DailyReportInputs.metric_coverage_gap 文档：
+        # 未接线保持 None；接线但本轮取数失败 → 不可判定；取数成功 → 纯函数算差集
+        # （差集为空时 `Section.of(None)`，正文因此完全不出现这一段——无差异不报）。
+        metric_coverage_gap: Section[MetricCoverageGap | None] | None
+        if self._metric_coverage is None:
+            metric_coverage_gap = None
+        elif metric_coverage_fetch_reason is not None:
+            metric_coverage_gap = Section.undetermined(metric_coverage_fetch_reason)
+        else:
+            assert metric_coverage_raw is not None
+            mcp_metric_ids, mapped_metric_ids = metric_coverage_raw
+            metric_coverage_gap = Section.of(
+                build_metric_coverage_gap(mcp_metric_ids, mapped_metric_ids)
+            )
+
         inputs = DailyReportInputs(
             window_start=window_start,
             window_end=window_end,
@@ -523,6 +564,7 @@ class DailyReportDuty:
             latency=latency,
             resource_usage=resource_usage,
             delivery_outcome=delivery_outcome,
+            metric_coverage_gap=metric_coverage_gap,
             delivery_window_start=delivery_window_start,
             delivery_window_end=delivery_window_end,
         )
@@ -562,22 +604,27 @@ class DailyReportDuty:
         # 写入本身幂等（`ON CONFLICT DO NOTHING`），重复调用不产生第二行。
         self._watermark.mark_sent(chat_id=self._chat_id, report_date=today)
 
+        # 「未覆盖新指标」日检未接线（`metric_coverage_gap is None`）时不出现在这个
+        # 列表的候选里——它不是"这一轮不可判定"，是"这一轮根本没有这一段"，混进
+        # 同一份 `undetermined_sections` 会让"没接线"与"接线了但取数失败"变成同一
+        # 种审计表现，无从分辨该找运维配置还是找 MCP 连通性。
+        determinable_sections: list[tuple[str, Section]] = [
+            ("active_users", active_users),
+            ("status_distribution", status_distribution),
+            ("failure_top", failure_top),
+            ("latency", latency),
+            ("delivery_outcome", delivery_outcome),
+            ("denied_count", denied_count),
+            ("resource_usage", resource_usage),
+        ]
+        if metric_coverage_gap is not None:
+            determinable_sections.append(("metric_coverage", metric_coverage_gap))
         self._audit.record(
             "daily_report.sent",
             report_date=today.isoformat(),
             active_users=active_users.value.active_user_count if active_users.is_determined else None,
             undetermined_sections=[
-                name
-                for name, section in (
-                    ("active_users", active_users),
-                    ("status_distribution", status_distribution),
-                    ("failure_top", failure_top),
-                    ("latency", latency),
-                    ("delivery_outcome", delivery_outcome),
-                    ("denied_count", denied_count),
-                    ("resource_usage", resource_usage),
-                )
-                if not section.is_determined
+                name for name, section in determinable_sections if not section.is_determined
             ],
         )
         self._completed_on = today
@@ -656,7 +703,87 @@ def _build_daily_report_duty(
         audit=audit,
         chat_id=config.admin_group_chat_id,
         stop=stop,
+        metric_coverage=_build_metric_coverage_check(config, audit=audit),
     )
+
+
+def _build_metric_coverage_check(
+    config: SchedulerConfig, *, audit: AuditSink
+) -> Callable[[], tuple[Sequence[str], Sequence[str]]] | None:
+    """装配「未覆盖新指标」日检的取数回调（Issue #320 并入项）。前置不齐**只关掉
+    这一段**，不影响内测每日通报的其余六段——因此这里**不**走
+    `permission_refresh.duty_not_registered` 那一套「恰一条审计 + 整个职责不注册」
+    的纪律：本段是内测每日通报众多段落里的一段，不是一个独立职责，缺前置时只是
+    正文少一段，其余段落与本职责本身照常。
+
+    **两个前置，同一把复用的钥匙**（都是每日权限重算/就绪确认已经在用的既有配置，
+    不新增任何环境变量）：
+
+    - ``LINGXI_MCP_TOKEN_ENCRYPT_KEY``——本段需要读一份已签发的 MCP 令牌明文
+      （:meth:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore.read_token`），
+      而唯一的读取口在构造时就要求已校验主密钥的加解密对象，与
+      ``_build_permission_refresh_duty``/``_build_readiness_follow_up`` 同一条理由。
+    - ``LINGXI_QUERY_MCP_ENDPOINT``——本段要真的调一次 ``list_metrics``。
+
+    **返回的回调每次调用都重新读取映射表**（不在装配时读一次缓存）：外置路径
+    （Issue #320，见 ``SchedulerConfig.metric_map_path``）承诺"编辑即生效"，日检
+    如果只在启动时读一次，产品负责人当天改的内容要等下次重启才会被日检看见，
+    与"编辑即生效"这句承诺矛盾。映射表读取失败（文件损坏/外置路径配错）会让
+    这一次日检本轮标记为不可判定（`DailyReportDuty._fetch` 既有的单段失败纪律），
+    不影响每日权限重算职责自己那一次独立的读取与判定。
+    """
+
+    if not config.mcp_token_encrypt_key or not config.query_mcp_endpoint:
+        # 恰一条审计，形状照 `permission_readiness.probe_not_wired`（同一姿态：只
+        # 关掉一个可选面，不影响承载它的职责本身）。只报变量名，不回显任何值。
+        missing = [
+            name
+            for name, value in (
+                ("LINGXI_MCP_TOKEN_ENCRYPT_KEY", config.mcp_token_encrypt_key),
+                ("LINGXI_QUERY_MCP_ENDPOINT", config.query_mcp_endpoint),
+            )
+            if not value
+        ]
+        audit.record(
+            "daily_report.metric_coverage_not_wired",
+            reason="missing_environment_variable",
+            variables=missing,
+        )
+        logger.info(
+            "未同时配置 LINGXI_MCP_TOKEN_ENCRYPT_KEY 与 LINGXI_QUERY_MCP_ENDPOINT，"
+            "内测每日通报的「未覆盖新指标」日检不接线；通报其余段落照常"
+        )
+        return None
+
+    from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+    from lingxi.adapters.query_mcp_probe import fetch_metric_catalog
+
+    endpoint = config.query_mcp_endpoint
+    tokens = PostgresMcpTokenStore(
+        config.postgres_dsn,
+        cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+        timeouts=config.postgres_timeouts,
+    )
+
+    def _check() -> tuple[Sequence[str], Sequence[str]]:
+        mapping = load_company_function_metric_map(config.metric_map_path)
+        mapped_metric_ids = sorted(
+            {metric_id for functions in mapping.values() for metrics in functions.values() for metric_id in metrics}
+        )
+        user_id = tokens.any_token_holder()
+        if user_id is None:
+            # 没有任何人签发过令牌：还没有真实用户走完首次开通，日检本轮无法进行
+            # （不是"没有差异"）——响亮抛出，交给 `_fetch` 标记为不可判定。
+            raise RuntimeError("no_issued_mcp_token_available_for_catalog_probe")
+        token = tokens.read_token(user_id)
+        if not token:
+            raise RuntimeError("issued_token_holder_has_no_readable_token")
+        mcp_metric_ids = fetch_metric_catalog(endpoint=endpoint, token=token)
+        return sorted(mcp_metric_ids), mapped_metric_ids
+
+    return _check
 
 
 def _wire_daily_report_duty(

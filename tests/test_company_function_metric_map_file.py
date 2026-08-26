@@ -1,13 +1,17 @@
-"""随包发布的「公司 + 职能 → 指标名」翻译映射配置文件（Issue #227）。
+"""随包发布的「公司 + 职能 → 指标名」翻译映射配置文件（Issue #227；外置与「后台管理员」
+条目为 Issue #320）。
 
 镜像 ``tests/test_galaxy_role_function.py`` 的 ``ShippedRoleFunctionMapFileTest``
 写法。2026-08-19 产品负责人给出了七个职能各自对应的指标 ID，编排者按「同一职能全国
-统一」机械展开进随包文件，本组断言把**那个决定**钉住：任何人改动映射内容却不同步改
-这里，门禁就红。文件缺失或格式错误则仍然按配置错误处理（不静默退化）。
+统一」机械展开进随包文件；2026-08-26 补充「后台管理员」全公司×全指标一条。本组断言
+把**这些决定**钉住：任何人改动映射内容却不同步改这里，门禁就红。文件缺失或格式错误
+则仍然按配置错误处理（不静默退化）；外置路径下同一条纪律同样成立，见
+``ExternalPathOverrideTest``。
 """
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,20 +22,23 @@ from lingxi.adapters.company_function_metric_map_file import (
 )
 from lingxi.adapters.role_function_map_file import load_role_function_map
 
-#: 产品负责人 2026-08-19 给出的「职能 → 指标 ID 列表」。值是 ``metric_id``（权限发布表
-#: permissions 列的权威结构，Issue #155），不是中文指标名。
+#: 产品负责人 2026-08-19 给出的「职能 → 指标 ID 列表」（2026-08-26 补充「后台管理员」，
+#: Issue #320）。值是 ``metric_id``（权限发布表 permissions 列的权威结构，Issue #155），
+#: 不是中文指标名。
+_ALL_NINE_METRICS = (
+    "sub_new_count",
+    "sub_recharge_count",
+    "sub_recharge_money",
+    "sub_deduction_count",
+    "sub_deduction_money",
+    "exchange_rate",
+    "vat_rate",
+    "channel_rate",
+    "channel_market_sharing",
+)
+
 OWNER_DECISION = {
-    "CEO": (
-        "sub_new_count",
-        "sub_recharge_count",
-        "sub_recharge_money",
-        "sub_deduction_count",
-        "sub_deduction_money",
-        "exchange_rate",
-        "vat_rate",
-        "channel_rate",
-        "channel_market_sharing",
-    ),
+    "CEO": _ALL_NINE_METRICS,
     "OTT": ("exchange_rate", "vat_rate"),
     "内容": ("exchange_rate", "vat_rate", "channel_rate", "channel_market_sharing"),
     "商务": ("exchange_rate", "vat_rate"),
@@ -44,18 +51,12 @@ OWNER_DECISION = {
         "exchange_rate",
         "vat_rate",
     ),
-    "运营": (
-        "sub_new_count",
-        "sub_recharge_count",
-        "sub_recharge_money",
-        "sub_deduction_count",
-        "sub_deduction_money",
-        "exchange_rate",
-        "vat_rate",
-        "channel_rate",
-        "channel_market_sharing",
-    ),
+    "运营": _ALL_NINE_METRICS,
     "销售": ("sub_new_count", "exchange_rate", "vat_rate"),
+    # Issue #320 / 2026-08-26 裁定：银河「后台管理员」（role_id 513）= 全公司×全指标。
+    # 取值与 CEO/运营同一份「全部指标」，独立职能标签（不复用 CEO/运营），理由见
+    # config/company_function_metric_map.toml 的「后台管理员条目」一节。
+    "后台管理员": _ALL_NINE_METRICS,
 }
 
 #: 2026-08-06 银河受控导出中实际出现的公司编号，外加「全非」通配键。
@@ -79,11 +80,15 @@ class ShippedConfigFileTest(unittest.TestCase):
                     f"公司 {company} 的职能 {function} 与产品负责人 2026-08-19 的决定不一致",
                 )
 
-    def test_every_company_key_carries_all_seven_functions(self) -> None:
-        """「同一职能全国统一」的机械展开：每个公司键都必须写满七个职能。
+    def test_every_company_key_carries_all_eight_functions(self) -> None:
+        """「同一职能全国统一」的机械展开：每个公司键都必须写满全部职能（现为八个，
+        含 2026-08-26 补充的「后台管理员」）。
 
         缺一条不是"这个人在这里没有这项指标"，而是翻译层对这个组合 fail-closed
         ——那会让真的持有该职能的用户在这个公司下发布不出去，且现象是静默跳过。
+        「后台管理员」同样必须写满**每一个**公司键（不是只写 ``[companies."*"]``
+        一条）：持有该角色的人在银河那一侧的公司范围可能是「全非」通配，也可能是
+        具体公司枚举，只写 "*" 会让后一种情形在翻译层 fail-closed。
         """
         mapping = load_company_function_metric_map(default_company_function_metric_map_path())
 
@@ -116,6 +121,11 @@ class ShippedConfigFileTest(unittest.TestCase):
         self.assertIn("metric_id", text)
         self.assertIn("list_metrics", text)
         self.assertIn("全国统一", text)
+        # 「后台管理员」条目（Issue #320）同样必须在文件里留痕决策来源与日期，
+        # 不能只活在这条测试或 PR 正文里。
+        self.assertIn("2026-08-26", text)
+        self.assertIn("后台管理员", text)
+        self.assertIn("320", text)
 
     def test_the_config_file_is_shipped_inside_the_python_package(self) -> None:
         path = default_company_function_metric_map_path()
@@ -163,6 +173,122 @@ class LoaderFailureModeTest(unittest.TestCase):
             mapping = load_company_function_metric_map(filled)
 
             self.assertEqual(mapping, {"9001": {"运营": ("示例指标A", "示例指标B")}})
+
+
+class ExternalPathOverrideTest(unittest.TestCase):
+    """外置路径的三条验收标准（Issue #320）：存在则优先、未配置回落包内默认、
+    配置了但缺失/非法响亮失败——与系统提示词文件同一模式。
+
+    本组断言只练 :func:`load_company_function_metric_map` 本身（``path`` 参数），
+    不牵涉环境变量解析——那部分由 ``tests/test_permission_refresh_duty.py`` 的
+    ``DutyRegistrationTest`` 覆盖装配层「``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH``
+    如何流到这个参数」，两层各自独立可证伪。
+    """
+
+    def test_a_present_external_file_takes_priority_over_the_packaged_default(self) -> None:
+        """外置文件存在则优先：内容与包内默认不同，读到的必须是外置那一份。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            external = Path(tmp) / "override.toml"
+            external.write_text(
+                '[companies."9999"]\n"运营" = ["外置专用指标"]\n',
+                encoding="utf-8",
+            )
+
+            mapping = load_company_function_metric_map(external)
+
+            self.assertEqual(mapping, {"9999": {"运营": ("外置专用指标",)}})
+            # 反证：外置内容与包内默认（44 个公司键，含 "后台管理员"）截然不同，
+            # 证明确实没有悄悄回落到包内默认再叠加。
+            default_mapping = load_company_function_metric_map(default_company_function_metric_map_path())
+            self.assertNotEqual(mapping, default_mapping)
+
+    def test_no_path_argument_falls_back_to_the_packaged_default(self) -> None:
+        """未配置（``path=None``）回落包内默认——外置能力交付前后行为逐字节一致。"""
+
+        self.assertEqual(
+            load_company_function_metric_map(None),
+            load_company_function_metric_map(default_company_function_metric_map_path()),
+        )
+
+    def test_a_configured_but_missing_external_path_fails_loudly_not_silently(self) -> None:
+        """配置了外置路径但文件缺失：响亮失败（``OSError``），不静默回落包内默认。
+
+        这是「翻译映射不可用→告警」既有纪律在外置路径上的落点：一个指向不存在
+        文件的外置路径必须让调用方（`_build_permission_refresh_duty`）判定
+        ``metric_translation_map_unavailable`` 并不注册职责，而不是悄悄用回
+        包内那份「安全」内容——错配不是未配。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_external = Path(tmp) / "configured-but-missing.toml"
+
+            with self.assertRaises(OSError):
+                load_company_function_metric_map(missing_external)
+
+    def test_a_configured_but_malformed_external_path_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            malformed = Path(tmp) / "configured-but-malformed.toml"
+            malformed.write_text("not [ valid toml at all", encoding="utf-8")
+
+            with self.assertRaises(Exception):
+                load_company_function_metric_map(malformed)
+
+    def test_loading_successfully_logs_a_content_digest(self) -> None:
+        """加载成功时记录内容 digest 到日志（沿用系统提示词 digest 先例）。
+
+        两次加载**内容相同**的外置文件必须得到**相同**的 digest（可用于产品负责人
+        编辑后自行核对"这次改动是否真的被读到"）；内容不同则 digest 不同——否则
+        digest 退化成一个恒定的装饰字段，起不到"内容变没变"的判别作用。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a.toml"
+            first.write_text('[companies."1"]\n"运营" = ["指标A"]\n', encoding="utf-8")
+            second = Path(tmp) / "b.toml"
+            second.write_text('[companies."1"]\n"运营" = ["指标A"]\n', encoding="utf-8")
+            third = Path(tmp) / "c.toml"
+            third.write_text('[companies."1"]\n"运营" = ["指标B"]\n', encoding="utf-8")
+
+            logger_name = "lingxi.adapters.company_function_metric_map_file"
+            with self.assertLogs(logger_name, level="INFO") as first_log:
+                load_company_function_metric_map(first)
+            with self.assertLogs(logger_name, level="INFO") as second_log:
+                load_company_function_metric_map(second)
+            with self.assertLogs(logger_name, level="INFO") as third_log:
+                load_company_function_metric_map(third)
+
+            def digest_of(records: list[str]) -> str:
+                self.assertEqual(len(records), 1, "加载成功恰记一条日志")
+                self.assertIn("digest=", records[0])
+                return records[0].split("digest=", 1)[1].split()[0]
+
+            digest_first = digest_of(first_log.output)
+            digest_second = digest_of(second_log.output)
+            digest_third = digest_of(third_log.output)
+
+            self.assertEqual(digest_first, digest_second, "内容相同的文件 digest 必须相同")
+            self.assertNotEqual(digest_first, digest_third, "内容不同的文件 digest 必须不同")
+
+    def test_a_failed_load_does_not_log_a_digest_line(self) -> None:
+        """加载失败（文件缺失/格式非法）不产生 digest 日志行——digest 只描述
+        "读到了什么"，不该在什么都没读到时也输出一个看似有效的值。
+        """
+
+        logger_name = "lingxi.adapters.company_function_metric_map_file"
+        logger = logging.getLogger(logger_name)
+        handler = logging.Handler()
+        records: list[logging.LogRecord] = []
+        handler.emit = records.append  # type: ignore[method-assign]
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.toml"
+            with self.assertRaises(OSError):
+                load_company_function_metric_map(missing)
+
+        self.assertEqual(records, [], "加载失败时不该有任何一条来自本模块的日志")
 
 
 if __name__ == "__main__":  # pragma: no cover

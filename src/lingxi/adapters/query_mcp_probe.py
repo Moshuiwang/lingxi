@@ -367,6 +367,127 @@ def content_text_metrics_reader(result: Mapping[str, Any]) -> int:
     return len(metrics)
 
 
+def content_text_metric_ids_reader(result: Mapping[str, Any]) -> frozenset[str]:
+    """``list_metrics`` 的 ``metric_id`` 集合读取（Issue #320 并入项：每日「MCP 指标
+    目录 vs 映射表覆盖面」日检）。
+
+    与 :func:`content_text_metrics_reader` 出自**同一份**已实测响应形状（见该函数
+    文档「诚实边界」），校验规则逐条相同（``content`` 恰一个文本块、内层 JSON 顶层
+    恰为 ``{"metrics"}``、每条记录恰有 ``metric_id``/``name``/``name_en`` 三个字符串
+    字段），唯一差异是返回值——那个函数只数条数（就绪判定只关心"数目对不对"），
+    这个函数要拿到**逐个 ``metric_id`` 字符串**（日检要知道"具体是哪个指标"）。
+
+    刻意不改造 :func:`content_text_metrics_reader` 本身去复用：那个函数在就绪确认的
+    生产关键路径上，任何改动都要重新过一遍它的验收面；两个读取器各自独立、各自
+    在自己的调用点被测试覆盖，比合并成一个"既算数又收集"的函数更安全——合并后
+    一次改动会同时影响两条互不相关的调用路径。**但底层的严格 JSON 解析
+    （:func:`_parse_json_strictly`）与单条记录校验（:func:`_require_valid_metric_record`）
+    两个小工具照旧复用**——那两个不是"判定逻辑"，是纯粹的形状硬化（拒绝深递归、
+    非标常量、重复键、缺字段），复用它们不会把两条调用路径的语义耦合在一起，重写
+    一份等价逻辑反而会让将来两处硬化规则悄悄漂移。因此本函数与
+    :func:`content_text_metrics_reader` 一样，抛出的是 :class:`McpProbeError`
+    （``denied=False``）而不是裸 ``ValueError``——``denied`` 标志对本函数的调用方
+    （每日指标覆盖面日检）没有意义，调用方只关心"这一步失败了"，不区分"明确拒绝"
+    与"技术失败"，但沿用同一个异常类型好过为同一份数据形状发明第二套错误分类。
+
+    与本模块「诚实边界」一节同一条纪律：**未知形状一律抛错，绝不返回一个可能不完整
+    的集合**——半份指标目录会让日检把"读不懂响应"误判成"这些指标本来就不存在"，
+    从而漏报真实存在的未覆盖指标。
+    """
+
+    content = result.get(CONTENT_KEY)
+    if not isinstance(content, list) or len(content) != 1:
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    block = content[0]
+    if not isinstance(block, Mapping) or block.get("type") != CONTENT_TEXT_TYPE:
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    text = block.get("text")
+    if not isinstance(text, str):
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    parsed = _parse_json_strictly(text)
+    if not isinstance(parsed, Mapping) or set(parsed.keys()) != {METRIC_LIST_KEY}:
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    metrics = parsed[METRIC_LIST_KEY]
+    if not isinstance(metrics, list):
+        raise McpProbeError("unrecognized_result_shape", denied=False)
+    metric_ids: list[str] = []
+    for record in metrics:
+        _require_valid_metric_record(record)
+        metric_ids.append(record["metric_id"])
+    return frozenset(metric_ids)
+
+
+def fetch_metric_catalog(
+    *,
+    endpoint: str,
+    token: str,
+    transport: Callable[..., McpHttpResponse] | None = None,
+    tool_name: str = DEFAULT_TOOL_NAME,
+    timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
+) -> frozenset[str]:
+    """执行一次 ``list_metrics``，返回响应里出现的全部 ``metric_id`` 集合（Issue #320
+    并入项）。
+
+    与 :class:`QueryMcpProbe` 是两条**独立**的调用路径，不共用状态、不共用判定语义：
+    那个类回答"这个人的权限同步好了没有"（就绪 / 同步中 / 技术失败三分类，服务
+    ``AutoOnboardingRunner``/``ReadinessTicker`` 的生产关键路径），本函数只回答
+    "MCP 现在报告的指标 ID 有哪些"（服务每日通报里的一项运维可见性日检，Issue #320
+    对照 #303 准入巡检并入的「顺带」补充）。两者都会调用同一个 ``list_metrics``
+    工具、走同一套 JSON-RPC 信封与传输层（:func:`urllib_mcp_transport`），因此复用
+    这两个模块级函数；除此之外不共享任何状态或分类逻辑，刻意不合并成一个类——
+    合并会让"日检失败"有意外影响"就绪判定"的风险面，两者的可用性预算与失败后果
+    完全不同（就绪判定失败会让用户开不了通，日检失败只是运维少看一段可选的报告）。
+
+    **两类失败分两种异常类型**：调用方传参本身不合法（空令牌、非 ``https://`` 端点）
+    在发出请求**之前**就以 ``ValueError`` 快速失败——这是调用方的错误，不是 MCP 的
+    响应；一旦请求发出去，"响应不是我们能读懂的形状"统一折成 :class:`McpProbeError`
+    （``denied=False``），与 :func:`content_text_metric_ids_reader` 同一套错误类型
+    ——两者本来就是同一条"解析 MCP 响应"的判定链，用同一个类型比引入第二套只为了
+    区分"HTTP 层"与"内容层"更一致。**不做的事**：不把任何失败折成"当作零个指标"
+    的安全默认值——把"读不懂响应"悄悄当成"这个人现在没有任何指标"，会让日检把
+    服务端契约变化误判成"映射表突然完全够用了"，方向是**漏报**真实存在的未覆盖
+    指标，比响亮失败更危险。调用方（``apps/scheduler/daily_report.py`` 的 ``_fetch``
+    既有单段失败纪律）据此把这一整段标记为"不可判定"，不是"没有差异"。
+
+    ``token`` 明文只进请求头、只在本函数调用栈内存活，与 :class:`QueryMcpProbe`
+    同一条纪律；不进日志、不进异常消息。
+    """
+
+    if not isinstance(token, str) or not token:
+        raise ValueError("查询指标目录必须提供令牌")
+    request_id = new_ulid()
+    request = {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": request_id,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": {}},
+    }
+    active_transport = transport or urllib_mcp_transport
+    response = active_transport(
+        "POST", _require_https(endpoint), body=request, token=token, timeout=timeout_seconds
+    )
+    del token  # 明文不再需要，尽早从本帧移除。
+    if not isinstance(response, McpHttpResponse):
+        raise McpProbeError("invalid_transport_result", denied=False)
+    if response.status != 200:
+        # 与就绪探针不同，本函数不区分「明确拒绝」与「技术失败」（模块文档「两类
+        # 失败分两种异常类型」）：日检只需要知道"这一轮读不到"，不需要区分原因。
+        raise McpProbeError(f"http_{response.status}", denied=False)
+    payload = response.payload
+    if not isinstance(payload, Mapping):
+        raise McpProbeError("invalid_response_shape", denied=False)
+    if payload.get("jsonrpc") != JSONRPC_VERSION or payload.get("id") != request_id:
+        raise McpProbeError("invalid_jsonrpc_response", denied=False)
+    if payload.get("error") is not None:
+        raise McpProbeError("jsonrpc_error", denied=False)
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        raise McpProbeError("invalid_result_shape", denied=False)
+    if result.get("isError") is True:
+        raise McpProbeError("tool_error", denied=False)
+    return content_text_metric_ids_reader(result)
+
+
 class QueryMcpProbe:
     """问数 MCP 的就绪探针。构造只存参数，不做任何 I/O、不读凭据。"""
 
@@ -530,7 +651,9 @@ __all__ = [
     "QueryMcpProbe",
     "REQUEST_TIMEOUT_SECONDS",
     "STRUCTURED_CONTENT_KEY",
+    "content_text_metric_ids_reader",
     "content_text_metrics_reader",
     "default_metrics_reader",
+    "fetch_metric_catalog",
     "urllib_mcp_transport",
 ]
