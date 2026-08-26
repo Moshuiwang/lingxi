@@ -1326,6 +1326,35 @@ class WorkerServiceTests(unittest.TestCase):
                 self.assertEqual(terminal["error_kind"], "stopped")
                 self.assertEqual(terminal["content"], expected_content)
 
+    def test_a_stopped_turn_with_everyday_wording_in_the_partial_result_does_not_crash(
+        self,
+    ) -> None:
+        """Issue #322：``worker.stopped_result`` 渲染模型生成的残余正文时，不能
+        再被为固定模板设计的自然语言词表（「还需」等）拦截。此前会在这里直接抛
+        ``ContentSafetyError``，让 worker 在收口前就崩溃——比投递层误伤更严重：
+        投递层好歹能转 uncertain 等人工抢救，这里是整个任务处理直接失败。"""
+
+        partial_text = "已查到部分结果，还需要继续挖掘吗"
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": False, "final_text": partial_text, "session_id": None},
+                    "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "stopped")
+        self.assertIn(partial_text, terminal["content"])
+
     def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
         self,
     ) -> None:

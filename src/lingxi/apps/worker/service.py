@@ -819,8 +819,12 @@ class WorkerService:
         stop_is_the_outcome = failure_code == "interrupted"
 
         if stop_is_the_outcome:
+            # `result=final_text` 是模型生成的终态正文（Issue #322），出口校验
+            # 只保留协议泄漏检查——理由见 `content._validate_user_visible_text`。
             content = (
-                self._catalog.text("worker.stopped_result", result=final_text)
+                self._catalog.text(
+                    "worker.stopped_result", result=final_text, contains_model_text=True
+                )
                 if final_text
                 else self._catalog.text("worker.stopped")
             )
