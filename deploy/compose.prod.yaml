@@ -31,6 +31,11 @@ services:
       # 首次开通编排（S-D-02）在这里给每个用户建家目录、写各自的 .mcp.json
       # （Epic D 闸⑤），理由见 compose.stage.yaml 同名 service 的注释。
       - lingxi-users:/var/lib/lingxi/users
+      # 闸①指标映射表外置只读挂载（Issue #320 / #328 S-P0-2），结构与 stage 覆盖
+      # 一致，说明见 compose.stage.yaml 同名 service 的卷注释（含生效时机：启动
+      # 时一次加载，编辑外置文件后需 `docker compose up -d scheduler` 重启才
+      # 生效；每日通报「未覆新指标」日检段现读，不受此限）。
+      - ${LINGXI_SCHEDULER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   gateway:
     env_file:
