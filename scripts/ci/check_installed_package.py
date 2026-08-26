@@ -688,7 +688,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.innertest_content_capture",
             "lingxi.adapters.postgres_content_capture",
             # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：由 apps/worker/
-            # service.py 模块级 import，不依赖内容采集开关是否开启。
+            # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
+            # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
             "lingxi.core.year_grounding_guard",
         ),
         ("claude_agent_sdk", "psycopg"),
