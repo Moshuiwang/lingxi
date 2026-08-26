@@ -16,6 +16,8 @@
 | 用什么架构、接口和数据结构**实现**合同里的规则 | [技术设计](技术设计/README.md) | 实现方案改变时 |
 | 跨设备研发、固定环境名称、生产交接，以及 TO PM、Draft PR 等 GitHub 操作规范 | [协作约定](协作约定.md) | 环境、权限、发布或 GitHub 操作改变时 |
 | 长期 Plan 的规划方法：Epic / Story / Task、角色路由、依赖与并行、冻结与统一修复 | GitHub [Issue #147：长期执行计划与 Execution Trace](https://github.com/Moshuiwang/lingxi/issues/147)；规划者据此生成或修订具体 `[tracking]` Execution Trace，实际执行合同只看获批 Trace | 长期执行方法改变时 |
+| 具体 Trace 的**合同、任务表状态与验收账**（执行态正文） | [docs/traces/](traces/README.md)（每 Trace 一目录三件套；对应 `[tracking]` Issue 只作瘦指针与裁定界面） | 合同修订走 PR；任务/验收状态随执行 commit |
+| 单台研发机的工具用法、踩坑与环境事实（对产品无约束力） | 该机 Claude Code 会话记忆（`~/.claude/projects/*/memory/`），不入仓库 | 该机事实变化时 |
 | 证据层级、风险门禁，以及产品与部署 `V-*` 断言 | [验证与门禁](技术设计/验证与门禁.md)与[产品验收矩阵](技术设计/验收矩阵.md) | 门禁含义或验收断言改变时 |
 | 可复用的外部平台事实、测试方法或脱敏证据 | `docs/参考证据/` | 仅在证据仍长期有用且已脱离一次性讨论时 |
 | 需求、缺陷、研究、方案比较、待决策、实施任务、验收过程和进度 | GitHub Issue / Project | 工作进行期间，完成后关闭 |
