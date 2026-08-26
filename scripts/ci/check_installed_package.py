@@ -157,6 +157,11 @@ REQUIRED_MODULES = (
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
+    # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
+    # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
+    # 要挡的形状。
+    "lingxi.core.year_grounding_guard",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -678,6 +683,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # apps.worker.service/apps.worker.cli 模块级 import。
             "lingxi.core.innertest_content_capture",
             "lingxi.adapters.postgres_content_capture",
+            # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：由 apps/worker/
+            # service.py 模块级 import，不依赖内容采集开关是否开启。
+            "lingxi.core.year_grounding_guard",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),

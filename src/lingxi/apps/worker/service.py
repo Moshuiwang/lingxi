@@ -7,7 +7,7 @@ import hashlib
 import logging
 import time
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -19,6 +19,7 @@ from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import TerminalKind
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
+from lingxi.core.year_grounding_guard import detect_year_grounding_suspect
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,12 @@ TaskStuckCallback = Callable[[str, int], None]
 # `heartbeat`/`on_task_stuck`/`on_alert_tick` 一样由装配层注入真正的输出出口，
 # 不能自己直接调 `logging`。
 TerminalOutcomeCallback = Callable[[Mapping[str, object]], None]
+# 年份接地护栏第二层的结构化告警出口（Issue #326）：与 ``TerminalOutcomeCallback``
+# 同一条纪律——``WorkerService`` 不直接调 stdlib ``logging``（理由同上），检测到
+# 的信号必须交给装配层注入的回调，由 ``apps/worker/cli.py`` 接到既有的结构化
+# stderr 出口（``worker.year_grounding_suspect``，带 trace_id）。``None`` 时
+# ``_check_year_grounding_suspect`` 整体跳过，不做检测、不产生任何额外开销。
+YearGroundingSuspectCallback = Callable[[Mapping[str, object]], None]
 _MAX_LOG_TOKEN_CHARS = 64
 # 独立审查（Issue #291 拒绝文案对用户承诺"问题已经被记录"）：一次回合里模型
 # 可能反复撞同一个越界工具，工具名列表上界防止一次异常回合把收口日志撑大。
@@ -373,6 +380,7 @@ class WorkerService:
         on_alert_tick: Callable[[], None] | None = None,
         on_terminal_outcome: TerminalOutcomeCallback | None = None,
         content_capture_writer: Callable[[ContentCaptureRecord], None] | None = None,
+        on_year_grounding_suspect: YearGroundingSuspectCallback | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -421,6 +429,11 @@ class WorkerService:
         # `_on_terminal_outcome` 同一姿态，没有装配方就没有输出。真正的装配
         # 判断（是否按开关构造一个真实写入方）在 `apps/worker/cli.py`。
         self._content_capture_writer = content_capture_writer
+        # 年份接地护栏第二层（Issue #326）：``None`` 时 `_check_year_grounding_
+        # suspect` 整体跳过——没有装配方就不做检测，与 `_on_terminal_outcome`/
+        # `_content_capture_writer` 同一姿态。真正的装配（是否接一个真实 sink）
+        # 在 `apps/worker/cli.py`。
+        self._on_year_grounding_suspect = on_year_grounding_suspect
         # SIGTERM 收到后由 run() 设置：在途任务的 `_monitor` 据此把"进程正在停机"
         # 与"用户发了 /stop"同等看待，主动请求 Agent SDK 中断当前回合（Issue #153
         # 完成标准第 3 条）。默认 None，保持 process_once()/白盒测试的既有行为不变。
@@ -952,10 +965,15 @@ class WorkerService:
         跳过；``self._content_capture_writer`` 为 ``None``（未装配写入方，见
         ``apps/worker/cli.py`` 只在开关开启时才构造）同样跳过——两个判断分别
         兜住"这次没有回合内容"与"这次没有落库出口"，都不是错误，不记日志。
+
+        成功构造出记录后还会调用 :meth:`_check_year_grounding_suspect`（Issue
+        #326 批次 5 卡 E，年份接地护栏第二层检测），复用同一个 ``record`` 里
+        已经解析好的问句与工具调用，不重新解析一遍。
         """
 
         if executor is None or self._content_capture_writer is None:
             return
+        record: ContentCaptureRecord | None = None
         try:
             record = executor.build_content_capture_record(
                 task_id=claimed.task_id,
@@ -968,6 +986,44 @@ class WorkerService:
             logger.error(
                 "内测轮内容级采集写入失败，任务结果不受影响 task_id=%s error=%s",
                 claimed.task_id,
+                type(error).__name__,
+            )
+        # 年份接地护栏第二层（Issue #326）：独立于上面采集写入的 try/except——
+        # 检测本身的缺陷不能连带影响"记录有没有落库"的判断，也不能与写库失败
+        # 共用同一条日志、分不清是采集坏了还是检测坏了。写库失败但记录已经在
+        # 内存里构造出来时（`record is not None`）仍然照常检测：本护栏只依赖
+        # 内存中的问句与工具调用，不依赖这次落库是否成功。
+        if record is not None:
+            self._check_year_grounding_suspect(record)
+
+    def _check_year_grounding_suspect(self, record: ContentCaptureRecord) -> None:
+        """年份接地护栏第二层：结构性检测 + 告警（Issue #326，批次 5 卡 E）。
+
+        只做检测与告警，**不拦截、不改答案投递路径**——调用方
+        ``_capture_content_if_enabled`` 已经在全部终态分支收口之后才调用本方法
+        （见该方法末尾的调用点），本方法自身再包一层独立 try/except，双重保证
+        检测代码的任何异常都不可能影响任务终态或已经完成的内容采集写入。
+
+        判定逻辑（相对时间词表、年份提取、三条件与）全部在 ``core/
+        year_grounding_guard.py``——本方法只负责"取当前年份、调用纯逻辑判定、
+        把结果交给装配层注入的告警出口"这三步组装，不重复任何判定规则。
+        """
+
+        if self._on_year_grounding_suspect is None:
+            return
+        try:
+            suspect = detect_year_grounding_suspect(
+                task_id=record.task_id,
+                question=record.question_content,
+                tool_calls=record.tool_calls,
+                current_year=datetime.now().year,
+            )
+            if suspect is not None:
+                self._on_year_grounding_suspect(suspect.to_alert_fields())
+        except Exception as error:  # noqa: BLE001 - 检测是旁路，异常不得影响任务终态
+            logger.error(
+                "年份接地护栏检测异常，任务结果不受影响 task_id=%s error=%s",
+                record.task_id,
                 type(error).__name__,
             )
 
