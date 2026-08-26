@@ -67,7 +67,56 @@ class BuilderFunctionTests(unittest.TestCase):
 
         self.assertIsInstance(duty, DailyReportDuty)
         self.assertEqual(duty.name, "内测每日通报")
-        self.assertEqual(audit.daily_report_records(), [], "前置齐备时不该有『未注册』审计")
+        # chat_id 仍是本职责**注册**的唯一前置：不产生 `duty_not_registered`。
+        self.assertNotIn(
+            "daily_report.duty_not_registered",
+            [action for action, _ in audit.daily_report_records()],
+        )
+
+    def test_a_configured_chat_id_alone_leaves_the_optional_coverage_check_unwired(self) -> None:
+        """Issue #320 并入项：`chat_id` 齐备但没有额外配置
+        `LINGXI_MCP_TOKEN_ENCRYPT_KEY`/`LINGXI_QUERY_MCP_ENDPOINT` 时，「未覆盖新
+        指标」日检这个**可选子段**不接线，留一条与 `duty_not_registered` 不同名的
+        信息性审计——职责本身照常注册，这条记录只影响正文里会不会出现「待分配」段。
+        """
+
+        audit = RecordingAudit()
+        config = SchedulerConfig.from_env({**COMPLETE_ENV, "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID})
+
+        duty = _build_daily_report_duty(config, stop=threading.Event(), audit=audit)
+
+        self.assertIsInstance(duty, DailyReportDuty)
+        self.assertEqual(
+            audit.daily_report_records(),
+            [
+                (
+                    "daily_report.metric_coverage_not_wired",
+                    {
+                        "reason": "missing_environment_variable",
+                        "variables": [
+                            "LINGXI_MCP_TOKEN_ENCRYPT_KEY",
+                            "LINGXI_QUERY_MCP_ENDPOINT",
+                        ],
+                    },
+                )
+            ],
+        )
+
+    def test_configuring_both_coverage_prerequisites_wires_the_optional_check(self) -> None:
+        audit = RecordingAudit()
+        config = SchedulerConfig.from_env(
+            {
+                **COMPLETE_ENV,
+                "LINGXI_ADMIN_GROUP_CHAT_ID": FAKE_CHAT_ID,
+                "LINGXI_MCP_TOKEN_ENCRYPT_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                "LINGXI_QUERY_MCP_ENDPOINT": "https://mcp.example.invalid/query",
+            }
+        )
+
+        duty = _build_daily_report_duty(config, stop=threading.Event(), audit=audit)
+
+        self.assertIsInstance(duty, DailyReportDuty)
+        self.assertEqual(audit.daily_report_records(), [], "两项前置齐备时不留『未接线』审计")
 
     def test_the_on_send_outcome_callback_is_forwarded_to_the_sender(self) -> None:
         """告警接线断言：注入的 `on_send_outcome` 必须真的被交给发送适配器，
@@ -221,7 +270,15 @@ class FullAssemblyTests(unittest.TestCase):
         names = [duty.name for duty in loop.duties]
         self.assertIn("内测每日通报", names)
         self.assertNotIn("花名册审计日报", names)
-        self.assertEqual(audit.daily_report_records(), [])
+        # chat_id 齐备 ⇒ 职责本身注册（不产生 `duty_not_registered`）；「未覆盖新
+        # 指标」日检这个可选子段没有额外配置 LINGXI_MCP_TOKEN_ENCRYPT_KEY/
+        # LINGXI_QUERY_MCP_ENDPOINT，因此**预期**留一条不同名的信息性记录
+        # （`test_a_configured_chat_id_alone_leaves_the_optional_coverage_check_
+        # unwired` 已经钉住这条记录的完整形状，这里只需确认它不是注册失败）。
+        self.assertNotIn(
+            "daily_report.duty_not_registered",
+            [action for action, _ in audit.daily_report_records()],
+        )
 
     def test_with_every_prerequisite_the_duty_registers_right_after_roster_audit(self) -> None:
         audit = RecordingAudit()
@@ -238,7 +295,10 @@ class FullAssemblyTests(unittest.TestCase):
         names = [duty.name for duty in loop.duties]
         self.assertIn("内测每日通报", names)
         self.assertIn("花名册审计日报", names)
-        self.assertEqual(audit.daily_report_records(), [])
+        self.assertNotIn(
+            "daily_report.duty_not_registered",
+            [action for action, _ in audit.daily_report_records()],
+        )
         self.assertEqual(
             names.index("内测每日通报"),
             names.index("花名册审计日报") + 1,

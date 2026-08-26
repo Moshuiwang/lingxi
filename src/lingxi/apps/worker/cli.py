@@ -210,6 +210,7 @@ def main(
             session_root=session_root,
             session_cleanup_batch_limit=config.session_cleanup_batch_limit,
             content_capture_writer=content_capture_writer,
+            on_year_grounding_suspect=_year_grounding_suspect_sink(err=err, trace_id=config.trace_id),
         )
         try:
             asyncio.run(
@@ -381,6 +382,27 @@ def _terminal_outcome_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[s
         denied_count = fields.get("denied_count")
         level = "warning" if isinstance(denied_count, int) and denied_count > 0 else "info"
         _log(err, trace_id, level, "worker.task.terminal", **fields)
+
+    return sink
+
+
+def _year_grounding_suspect_sink(*, err: TextIO, trace_id: str) -> Callable[[Mapping[str, Any]], None]:
+    """年份接地护栏第二层的结构化告警出口（Issue #326，批次 5 卡 E）。
+
+    与 :func:`_terminal_outcome_sink` 同一条纪律与同一个理由：``WorkerService``
+    不直接调 stdlib ``logging``（本文件 ``main()`` 从不调用 ``logging.
+    basicConfig()``），检测结果必须由装配层接到本文件既有的结构化 ``_log()``
+    出口才能真正落到运维能看到的地方。这就是本卡"复用既有运行告警进管理群的
+    通道"的落点——worker 进程结构上从不直接持有飞书凭据（见
+    ``_build_alerting_duty`` 的"只走日志出口"），它对外唯一的信号出口是带
+    ``trace_id`` 的结构化 stderr（``V-部署-04``），本函数复用的正是这一条通道，
+    不新开一条。事件名固定为 ``worker.year_grounding_suspect``；``fields`` 来自
+    ``core/year_grounding_guard.YearGroundingSuspect.to_alert_fields()``，只有
+    ``task_id``/命中的相对时间词/查询年份集合/当前年份四项，不含问句或答案正文。
+    """
+
+    def sink(fields: Mapping[str, Any]) -> None:
+        _log(err, trace_id, "warning", "worker.year_grounding_suspect", **fields)
 
     return sink
 

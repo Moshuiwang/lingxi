@@ -22,7 +22,7 @@ from lingxi.apps.scheduler import (
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.core.alerting import AlertManager, AlertPolicy
-from lingxi.core.execution.card_stream import CardStream, DeliveryRejected
+from lingxi.core.execution.card_stream import CardCreated, CardStream, DeliveryRejected
 from lingxi.config.content import default_content_catalog
 
 
@@ -226,6 +226,88 @@ class AdapterOutcomeTests(unittest.TestCase):
             outcomes,
             [("card_non_final", False), ("message_final", True)],
         )
+
+
+class _RecordingCardTransport:
+    """建卡永远成功；``update``/``close`` 只记录调用，不做网络/DB 交互。"""
+
+    def __init__(self) -> None:
+        self.update_calls: list[dict] = []
+        self.close_calls: list[dict] = []
+
+    def create(self, **kwargs: object) -> CardCreated:
+        return CardCreated(card_id="card-1", message_id="msg-1")
+
+    def update(self, **kwargs: object) -> None:
+        self.update_calls.append(kwargs)
+
+    def close(self, **kwargs: object) -> None:
+        self.close_calls.append(kwargs)
+
+
+class _RefusingTextTransport:
+    """卡片路径预期不降级；一旦真的被调用说明本次修复没有生效，让用例立刻失败。"""
+
+    def send_text(self, **_kwargs: object) -> str:
+        raise AssertionError("卡片路径应该成功，不应该降级到文本兜底")
+
+
+class CardStreamModelGeneratedTextDeliveryTests(unittest.TestCase):
+    """Issue #322：``CardStream.finish()`` 对模型生成的终态正文不再用为固定
+    模板设计的自然语言词表拦截。纯内存假 transport，不连数据库、不连真实飞书——
+    直接证明"含日常措辞的模型终态正文可以正常完成投递路径构建"这条回归。
+    """
+
+    def test_a_successful_answer_ending_in_everyday_wording_finishes_without_raising(
+        self,
+    ) -> None:
+        """两次内测真实复现的原句之一：模型答案以「还需」收尾。此前会在
+        ``finish()`` 内部抛 ``ContentSafetyError``，被 ``apps.gateway.delivery``
+        当作"结果不明"转入 uncertain，任务卡死。"""
+
+        answer = "已完成周环比分析，还需要看其他维度吗？"
+        cards = _RecordingCardTransport()
+        stream = CardStream(
+            chat_id="chat",
+            thread_id="thread",
+            reply_to_message_id="message",
+            transport=cards,
+            fallback=_RefusingTextTransport(),
+        )
+        stream.start()
+
+        stream.finish(result=answer, elapsed_seconds=12)
+
+        self.assertFalse(stream.fallback_needed, "不应该降级为文本兜底")
+        self.assertEqual(len(cards.update_calls), 1)
+        self.assertEqual(len(cards.close_calls), 1)
+        self.assertIn(answer, cards.update_calls[0]["card"].body)
+
+    def test_a_stopped_partial_answer_relayed_as_failure_finishes_without_raising(
+        self,
+    ) -> None:
+        """``/stop`` 中断的残余正文经 ``worker.stopped_result`` 渲染后，以
+        ``failure=`` 形状交给 ``finish()``（gateway 侧非 SUCCESS 终态都走这条
+        分支，见 ``apps/gateway/delivery.py::_handle_terminal``）——同样不能被
+        固定词表拦住。"""
+
+        stopped_content = default_content_catalog().text(
+            "worker.stopped_result", result="还需要继续挖掘吗", contains_model_text=True
+        )
+        cards = _RecordingCardTransport()
+        stream = CardStream(
+            chat_id="chat",
+            thread_id="thread",
+            reply_to_message_id="message",
+            transport=cards,
+            fallback=_RefusingTextTransport(),
+        )
+        stream.start()
+
+        stream.finish(failure=stopped_content, elapsed_seconds=5)
+
+        self.assertFalse(stream.fallback_needed)
+        self.assertIn("还需要继续挖掘吗", cards.update_calls[0]["card"].body)
 
 
 class HeartbeatAndWorkerEntryPointTests(unittest.TestCase):

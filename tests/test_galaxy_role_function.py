@@ -92,6 +92,9 @@ class ShippedRoleFunctionMapFileTest(unittest.TestCase):
         mapping = load_role_function_map(default_role_function_map_path())
 
         expected = {
+            # Issue #320 / 2026-08-26 裁定：银河「后台管理员」（role_id 513）独立职能，
+            # 全公司×全指标，见 config/galaxy_role_function_map.toml 的专节说明。
+            "后台管理员": "后台管理员",
             "A商务": "商务",
             "A海外CEO门户": "CEO",
             "A海外收视率样本户": "内容",

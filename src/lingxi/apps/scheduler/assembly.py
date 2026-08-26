@@ -295,7 +295,7 @@ def _build_permission_refresh_duty(
         return None, None
 
     try:
-        metric_translation_map = load_company_function_metric_map()
+        metric_translation_map = load_company_function_metric_map(config.metric_map_path)
     except (OSError, ValueError) as error:
         # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；
         # 这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。

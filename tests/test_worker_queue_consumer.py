@@ -44,7 +44,8 @@ from lingxi.adapters.postgres_conversation import (
 from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 from lingxi.config.content import default_content_catalog
-from lingxi.core.innertest_content_capture import ContentCaptureRecord
+from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
+from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 from lingxi.core.conversation import EventPipeline, InboundMessage
 from lingxi.core.execution.card_stream import (
     CardCreated,
@@ -1325,6 +1326,35 @@ class WorkerServiceTests(unittest.TestCase):
                 self.assertEqual(terminal["terminal_kind"], "stopped")
                 self.assertEqual(terminal["error_kind"], "stopped")
                 self.assertEqual(terminal["content"], expected_content)
+
+    def test_a_stopped_turn_with_everyday_wording_in_the_partial_result_does_not_crash(
+        self,
+    ) -> None:
+        """Issue #322：``worker.stopped_result`` 渲染模型生成的残余正文时，不能
+        再被为固定模板设计的自然语言词表（「还需」等）拦截。此前会在这里直接抛
+        ``ContentSafetyError``，让 worker 在收口前就崩溃——比投递层误伤更严重：
+        投递层好歹能转 uncertain 等人工抢救，这里是整个任务处理直接失败。"""
+
+        partial_text = "已查到部分结果，还需要继续挖掘吗"
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": False, "final_text": partial_text, "session_id": None},
+                    "failure": {"code": "interrupted", "message": "AgentSessionInterrupted"},
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "stopped")
+        self.assertIn(partial_text, terminal["content"])
 
     def test_terminal_outcome_callback_receives_failure_code_and_reasons_without_leaking_content(
         self,
@@ -3070,3 +3100,216 @@ class ContentCaptureWiringTests(unittest.TestCase):
         self.assertEqual(executor_calls, [])
         self.assertEqual(received, [])
         self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
+
+
+class YearGroundingSuspectAlertTests(unittest.TestCase):
+    """年份接地护栏第二层的 worker 侧接线（Issue #326，批次 5 卡 E）。
+
+    覆盖 ``WorkerService._capture_content_if_enabled``/``_check_year_grounding_
+    suspect`` 这一层的组装：检测到位、告警经既有 ``on_year_grounding_suspect``
+    出口发出、检测异常不传染任务终态或内容采集写入。纯逻辑判定本身（词表命中、
+    年份提取、三条件与、已知边界）由 ``tests/test_year_grounding_guard.py`` 覆盖，
+    这里不重复断言判定细节，只用一次"全 2025 查询"的正例与三次否定用例核对接线。
+    """
+
+    def _record_with_query(
+        self,
+        *,
+        task_id: str = "tsk-1",
+        question: str,
+        start_date: str | None = "2025-01-01",
+        end_date: str | None = "2025-08-25",
+        with_query_call: bool = True,
+    ) -> ContentCaptureRecord:
+        tool_calls: tuple[CapturedToolCall, ...] = ()
+        if with_query_call:
+            tool_input: dict[str, object] = {}
+            if start_date is not None:
+                tool_input["start_date"] = start_date
+            if end_date is not None:
+                tool_input["end_date"] = end_date
+            tool_calls = (
+                CapturedToolCall(
+                    tool_use_id="call-1",
+                    tool_name=QUERY_METRIC_TOOL_NAME,
+                    tool_input=tool_input,
+                    result_summary={"result_kind": "success", "allowed": True, "executed": True},
+                    redaction_count=0,
+                ),
+            )
+        return ContentCaptureRecord(
+            task_id=task_id,
+            worker_id="worker-test",
+            question_content=question,
+            question_redaction_count=0,
+            answer_content="结果",
+            answer_redaction_count=0,
+            tool_calls=tool_calls,
+        )
+
+    def _run_with_record(
+        self,
+        record: ContentCaptureRecord,
+        *,
+        on_year_grounding_suspect: Any = None,
+        content_capture_writer: Any = None,
+    ) -> "FakeWorkerQueue":
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s1"},
+                    "failure": None,
+                }
+
+            def build_content_capture_record(self, **kwargs: object) -> ContentCaptureRecord:
+                return record
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            content_capture_writer=(
+                content_capture_writer if content_capture_writer is not None else (lambda _r: None)
+            ),
+            on_year_grounding_suspect=on_year_grounding_suspect,
+        )
+        asyncio.run(service.process_once())
+        return queue
+
+    def test_alert_fires_for_relative_wording_with_all_non_current_year_queries(self) -> None:
+        """①正例：相对时间问句 + 全部查询年份都不是当前年份（2025，固定写死的
+        过去年份，恒不等于任何真实运行时的当前年份）→ 告警必发，且携带
+        task_id/命中词/查询年份，不携带问句与答案正文。"""
+
+        record = self._record_with_query(
+            task_id="tsk-year-suspect",
+            question="最近，尤其是7月之后数据下滑得厉害",
+            start_date="2025-01-01",
+            end_date="2025-08-25",
+        )
+        received: list[Mapping[str, object]] = []
+        queue = self._run_with_record(record, on_year_grounding_suspect=received.append)
+
+        self.assertEqual(len(received), 1)
+        fields = received[0]
+        self.assertEqual(fields["task_id"], "tsk-year-suspect")
+        self.assertEqual(fields["matched_relative_time_terms"], ["最近", "7月之后"])
+        self.assertEqual(fields["query_years"], [2025])
+        self.assertNotIn("question", fields)
+        self.assertNotIn("answer", fields)
+        self.assertNotIn("question_content", fields)
+        self.assertNotIn("answer_content", fields)
+        # 检测是旁路：答案照常投递，不拦截。
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+        self.assertEqual(queue.terminals[0]["content"], "结果")
+
+    def test_no_alert_when_a_query_year_is_the_current_year(self) -> None:
+        """②-a 否定：相对时间问句命中，但查询年份含真实当前年份 → 零告警。"""
+
+        current_year = datetime.now().year
+        record = self._record_with_query(
+            question="最近的数据表现怎么样",
+            start_date=f"{current_year}-01-01",
+            end_date=f"{current_year}-08-25",
+        )
+        received: list[Mapping[str, object]] = []
+        self._run_with_record(record, on_year_grounding_suspect=received.append)
+
+        self.assertEqual(received, [])
+
+    def test_no_alert_without_relative_time_wording(self) -> None:
+        """②-b 否定：全部查询年份都不是当前年份，但问句没有相对时间表述 →
+        零告警。"""
+
+        record = self._record_with_query(
+            question="查一下2025年1月到8月的充值数据",
+            start_date="2025-01-01",
+            end_date="2025-08-25",
+        )
+        received: list[Mapping[str, object]] = []
+        self._run_with_record(record, on_year_grounding_suspect=received.append)
+
+        self.assertEqual(received, [])
+
+    def test_no_alert_with_zero_queries(self) -> None:
+        """②-c 否定：相对时间问句命中，但本任务零次 query_metric 调用 → 零告警。"""
+
+        record = self._record_with_query(question="最近的数据表现怎么样", with_query_call=False)
+        received: list[Mapping[str, object]] = []
+        self._run_with_record(record, on_year_grounding_suspect=received.append)
+
+        self.assertEqual(received, [])
+
+    def test_default_disabled_never_calls_the_pure_detector(self) -> None:
+        """默认（不传 ``on_year_grounding_suspect``）时整体跳过——用
+        ``unittest.mock.patch`` 直接证明 ``detect_year_grounding_suspect`` 从未
+        被调用，不只是"调用了但没人处理"。即使这次任务的问句/查询组合本该判定
+        可疑，没有装配告警出口就没有检测，与 ``_on_terminal_outcome``/
+        ``_content_capture_writer`` 同一姿态（Issue #326 批次 5 卡 E）。
+        """
+
+        from unittest.mock import patch
+
+        record = self._record_with_query(
+            question="最近，尤其是7月之后数据下滑得厉害",
+            start_date="2025-01-01",
+            end_date="2025-08-25",
+        )
+        with patch("lingxi.apps.worker.service.detect_year_grounding_suspect") as mock_detect:
+            queue = self._run_with_record(record)  # 不传 on_year_grounding_suspect
+
+        mock_detect.assert_not_called()
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_detector_exception_does_not_affect_task_terminal_or_content_capture(self) -> None:
+        """③防御用例：告警出口异常时，任务终态与内容采集写入均不受影响，异常
+        不得向上传播（检测代码异常不得影响任务终态——包一层防御并留结构化
+        日志）。"""
+
+        record = self._record_with_query(
+            question="最近，尤其是7月之后数据下滑得厉害",
+            start_date="2025-01-01",
+            end_date="2025-08-25",
+        )
+
+        def _raising_sink(_fields: Mapping[str, object]) -> None:
+            raise RuntimeError("模拟告警出口异常")
+
+        captured: list[ContentCaptureRecord] = []
+        queue = self._run_with_record(
+            record,
+            on_year_grounding_suspect=_raising_sink,
+            content_capture_writer=captured.append,
+        )  # 不得向上抛出 RuntimeError
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertEqual(terminal["content"], "结果")
+        self.assertEqual(terminal["agent_session_id"], "s1")
+        # 检测/告警失败不影响内容采集本身已经成功写入。
+        self.assertEqual(captured, [record])
+
+    def test_detector_exception_inside_pure_logic_does_not_affect_task_terminal(self) -> None:
+        """③防御用例（补充）：纯判定函数本身抛异常（而不是告警出口）时同样必须
+        被兜住——两处独立的防御缺一不可。"""
+
+        from unittest.mock import patch
+
+        record = self._record_with_query(
+            question="最近，尤其是7月之后数据下滑得厉害",
+            start_date="2025-01-01",
+            end_date="2025-08-25",
+        )
+        received: list[Mapping[str, object]] = []
+        with patch(
+            "lingxi.apps.worker.service.detect_year_grounding_suspect",
+            side_effect=RuntimeError("模拟纯判定函数异常"),
+        ):
+            queue = self._run_with_record(record, on_year_grounding_suspect=received.append)
+
+        self.assertEqual(received, [])  # 判定失败，告警出口从未被调用
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertEqual(terminal["content"], "结果")

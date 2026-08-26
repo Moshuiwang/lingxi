@@ -10,6 +10,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Mapping
 
 from lingxi.adapters.postgres import (
@@ -172,6 +173,18 @@ class SchedulerConfig:
     # `org_snapshot_sync.read_failed` → 退避 → 保留上一份完成批次路径（不覆盖库里
     # 最近一次成功批次），只影响"一轮最多愿意为限频重试花多久"，不改变任何产品语义。
     org_snapshot_round_budget_seconds: float = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
+    # 「公司+职能→指标名」翻译映射的外置路径（Issue #320）。**可选**：缺省时 loader
+    # 回落随包发布的默认文件（`lingxi/config/company_function_metric_map.toml`）,
+    # 与此前行为逐字节一致。配了就**优先**于包内默认——不是"包内文件缺失时的兜底"，
+    # 是"只要配了这个变量，这台机器就只认这个文件"，让指标映射表的维护人（产品负责人，
+    # 见决策记录 2026-08-24《管理员职责集与银河体系外权限动作边界》「归属」一节）能够
+    # 编辑即生效，不必再为一行映射改动走一次完整镜像构建发布。**错配不是未配**：
+    # 配了但指向的文件缺失或格式非法，与主密钥/花名册坐标那几个变量同一条纪律——
+    # `_build_permission_refresh_duty` 在 `load_company_function_metric_map` 抛出
+    # `OSError`/`ValueError` 时既有的 `metric_translation_map_unavailable` 分支原样
+    # 覆盖这条路径，职责响亮地不注册，不静默回落包内默认（与「翻译映射不可用→告警」
+    # 的既有纪律一致，见 `adapters/company_function_metric_map_file.py` 模块文档）。
+    company_function_metric_map_path: str | None = None
 
     ENVIRONMENT_KEYS = (
         "LINGXI_POSTGRES_DSN",
@@ -199,6 +212,7 @@ class SchedulerConfig:
         "LINGXI_ONBOARDING_WORKERS",
         "LINGXI_INNERTEST_ROSTER_OPEN_IDS",
         "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
+        "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH",
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -370,6 +384,13 @@ class SchedulerConfig:
         else:
             org_snapshot_round_budget_seconds = DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS
 
+        # 外置指标映射路径：与 LINGXI_USER_ENV_ROOT 同一条纪律（`optional_identifier`——
+        # 不得包含空白字符），文件是否真的存在/合法留给 loader 在读取时判定（错配不是
+        # 未配，这里不重复做存在性检查，否则两处判据会漂移）。
+        company_function_metric_map_path = optional_identifier(
+            "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH"
+        )
+
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
             from lingxi.adapters.feishu_group_message import validate_group_chat_id
@@ -413,4 +434,16 @@ class SchedulerConfig:
             onboarding_workers=onboarding_workers,
             innertest_roster_open_ids=innertest_roster_open_ids,
             org_snapshot_round_budget_seconds=org_snapshot_round_budget_seconds,
+            company_function_metric_map_path=company_function_metric_map_path,
         )
+
+    @property
+    def metric_map_path(self) -> Path | None:
+        """``company_function_metric_map_path`` 解析成 ``Path``；未配置为 ``None``。
+
+        供 ``apps/scheduler/assembly.py`` 直接传给 ``load_company_function_metric_map``
+        ——把字符串转 ``Path`` 的这一步放在配置对象自己身上，而不是每个调用点各写一次
+        三元表达式，理由见 :data:`company_function_metric_map_path` 字段文档。
+        """
+
+        return Path(self.company_function_metric_map_path) if self.company_function_metric_map_path else None

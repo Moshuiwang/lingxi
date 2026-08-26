@@ -21,6 +21,7 @@ from lingxi.core.daily_report import (
     DeliveryOutcomeStats,
     FailureReasonCount,
     LatencyStats,
+    MetricCoverageGap,
     PartialCount,
     Section,
     StatusDistribution,
@@ -33,6 +34,7 @@ from lingxi.core.daily_report import (
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
+    build_metric_coverage_gap,
     build_status_distribution,
     build_token_usage_stats,
     render_daily_report,
@@ -638,6 +640,112 @@ class DeliveryOutcomeIndependentWindowTests(unittest.TestCase):
 
         self.assertIn("投递结果分布：不可判定（原因：查询超时）", text)
         self.assertIn("本段窗口：2026-08-22 00:00–2026-08-23 00:00（UTC）", text)
+
+
+class MetricCoverageGapBuildTests(unittest.TestCase):
+    """:func:`build_metric_coverage_gap` 纯集合运算（Issue #320 并入项）：有差/无差。"""
+
+    def test_a_metric_present_in_mcp_but_absent_from_the_mapping_is_reported(self) -> None:
+        gap = build_metric_coverage_gap(
+            mcp_metric_ids=("sub_new_count", "brand_new_metric"),
+            mapped_metric_ids=("sub_new_count", "exchange_rate"),
+        )
+
+        self.assertIsNotNone(gap)
+        assert gap is not None  # narrow for type checkers
+        self.assertEqual(gap.uncovered_metric_ids, ("brand_new_metric",))
+
+    def test_full_coverage_reports_no_difference(self) -> None:
+        gap = build_metric_coverage_gap(
+            mcp_metric_ids=("sub_new_count", "exchange_rate"),
+            mapped_metric_ids=("exchange_rate", "sub_new_count", "vat_rate"),
+        )
+
+        self.assertIsNone(gap, "映射表覆盖面是 MCP 目录的超集时，无差异不报")
+
+    def test_an_empty_mcp_catalog_reports_no_difference(self) -> None:
+        self.assertIsNone(build_metric_coverage_gap(mcp_metric_ids=(), mapped_metric_ids=("exchange_rate",)))
+
+    def test_the_result_is_sorted_and_deduplicated(self) -> None:
+        gap = build_metric_coverage_gap(
+            mcp_metric_ids=("z_metric", "a_metric", "z_metric", "a_metric"),
+            mapped_metric_ids=(),
+        )
+
+        self.assertIsNotNone(gap)
+        assert gap is not None
+        self.assertEqual(gap.uncovered_metric_ids, ("a_metric", "z_metric"))
+
+    def test_comparison_is_verbatim_no_case_or_width_folding(self) -> None:
+        """与 ``publish_row.py`` 的「零归一」纪律一致：``OTT`` 与 ``ott`` 是不同的
+        指标 ID，本函数不得替使用方做任何大小写/全半角折叠。"""
+
+        gap = build_metric_coverage_gap(mcp_metric_ids=("OTT",), mapped_metric_ids=("ott",))
+
+        self.assertIsNotNone(gap)
+        assert gap is not None
+        self.assertEqual(gap.uncovered_metric_ids, ("OTT",))
+
+
+class MetricCoverageGapRenderTests(unittest.TestCase):
+    """待分配段的渲染三态：未接线不出现、接线且无差异不出现、有差异才出现；
+    以及查询失败时的「不可判定」提示（Issue #320 并入项）。
+    """
+
+    def test_unwired_section_produces_no_text_at_all(self) -> None:
+        """``metric_coverage_gap`` 缺省为 ``None``（未接线）：正文完全不含「待分配」
+        字样——不是"检查了，没有问题"，是"这一轮根本没有做这项检查"。
+        """
+
+        inputs = _all_determined_inputs()
+
+        text = render_daily_report(inputs)
+
+        self.assertNotIn("待分配", text)
+
+    def test_wired_but_no_gap_produces_no_text(self) -> None:
+        """接线了、真查了、两边一致：无差异不报，正文同样不含「待分配」字样。"""
+
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{**inputs.__dict__, "metric_coverage_gap": Section.of(None)}
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertNotIn("待分配", text)
+
+    def test_a_detected_gap_appears_in_the_pending_assignment_section(self) -> None:
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{
+                **inputs.__dict__,
+                "metric_coverage_gap": Section.of(
+                    MetricCoverageGap(uncovered_metric_ids=("brand_new_metric", "another_new_metric"))
+                ),
+            }
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("待分配", text)
+        self.assertIn("brand_new_metric", text)
+        self.assertIn("another_new_metric", text)
+        self.assertIn("company_function_metric_map.toml", text)
+
+    def test_a_failed_check_is_shown_as_undetermined_not_silently_skipped(self) -> None:
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{
+                **inputs.__dict__,
+                "metric_coverage_gap": Section.undetermined("问数 MCP 查询超时"),
+            }
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("待分配", text)
+        self.assertIn("不可判定（原因：问数 MCP 查询超时）", text)
 
 
 if __name__ == "__main__":

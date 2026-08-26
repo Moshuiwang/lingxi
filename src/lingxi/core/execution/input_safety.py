@@ -1,9 +1,12 @@
 """外部文本的角色边界与模型输出的最后一道约束。
 
-这不是通用内容审核器，也不是把模型行为假设成可靠的 prompt firewall。它只做两件
-确定性的事：把外部系统返回的自由文本包成不可伪造的「待分析内容」数据段，并在
-worker 输出离开进程前移除已知的敏感值、内部工具标识和系统提示。工具是否能执行
-仍由 ``ToolGateway`` 判定；这里不复制工具白名单或权限规则。
+这不是通用内容审核器，也不是把模型行为假设成可靠的 prompt firewall。它只做三件
+确定性的事：把外部系统返回的自由文本包成不可伪造的「待分析内容」数据段；在用户
+问题交给执行层前，把「第一个字符是 /」的文本中性化，防止 Agent SDK 底层的 Claude
+Code CLI 把它解析成系统斜杠命令而不是用户问题（见 ``compose_agent_prompt``，
+Trace #304 批次 5 直修）；并在 worker 输出离开进程前移除已知的敏感值、内部工具
+标识和系统提示。工具是否能执行仍由 ``ToolGateway`` 判定；这里不复制工具白名单或
+权限规则。
 
 模块保持在 ``core``，不读环境、不访问网络或文件，便于用固定夹具证明负向边界。
 
@@ -245,13 +248,43 @@ def render_external_context(values: ExternalTextItems | None) -> str:
     return "\n\n".join(wrap_external_text(source, text) for source, text in normalize_external_texts(values))
 
 
+# Trace #304 批次 5 直修：gateway 管线（`core/conversation/pipeline.py` 第 6 步）
+# 是主防线，业务用户以 / 开头的消息在入队前就被拦下、根本到不了这里。这个前缀是
+# 纵深防御——万一文本经其他路径入队（历史任务重试、未来新入口），交给执行层前仍
+# 要保证它不可能被 CLI 解析成命令。不用零宽字符或删除首字符：那类做法要么可能被
+# CLI 自身的归一化/裁剪逆转，要么会改写用户原始问题的可读内容；前置一段不可能是
+# 空白、不可能是 / 的中文短语，无论 CLI 内部是否再做一次 strip，整串的第一个非空白
+# 字符都不会是 /。
+_SLASH_NEUTRALIZATION_PREFIX = "用户消息："
+
+
+def _neutralize_leading_slash(question: str) -> str:
+    """去除首尾空白后以 ``/`` 开头的问题，前面加一段中性前缀；其余文本原样返回。
+
+    判断用 ``question.strip()`` 的副本，前缀却拼在**原始** ``question`` 前面：
+    原文本身可能带有的首尾空白与全部字节都原样保留，只在最终交给执行层的整串
+    开头插入一段不会被误认成命令的中文前缀。不触发中性化的文本**逐字节不变**
+    ——这是哨兵测试（``test_input_safety.py``）钉住的不变量，正常问答（含中间
+    出现的 /，如日期、URL）不受任何影响。
+    """
+
+    if question.strip().startswith("/"):
+        return f"{_SLASH_NEUTRALIZATION_PREFIX}{question}"
+    return question
+
+
 def compose_agent_prompt(question: str, external_texts: ExternalTextItems | None = None) -> str:
-    """为受控测试 / 编排调用构造带数据边界的 Agent 输入。"""
+    """为受控测试 / 编排调用构造带数据边界的 Agent 输入。
+
+    ``question`` 在拼接外部上下文之前先经过 :func:`_neutralize_leading_slash`——
+    这一步只影响「/ 开头」的问题，其余输入不变。
+    """
 
     if not isinstance(question, str):
         raise InputSafetyError("Agent 问题必须是字符串")
+    safe_question = _neutralize_leading_slash(question)
     context = render_external_context(external_texts)
-    return question if not context else f"{question}\n\n{context}"
+    return safe_question if not context else f"{safe_question}\n\n{context}"
 
 
 def constrain_output(

@@ -199,6 +199,29 @@ class PostgresMcpTokenStore:
         cipher = self.token_cipher(user_id)
         return None if cipher is None else self._cipher.decrypt(cipher)
 
+    def any_token_holder(self) -> str | None:
+        """取**签发时间最新**的一个已签发令牌的 ``user_id``（Issue #320 并入项：
+        每日「MCP 指标目录 vs 映射表覆盖面」日检）。没有任何人签发过令牌时返回
+        ``None``。
+
+        **不针对特定身份**：调用方（每日指标覆盖面日检）要问的是"MCP 现在报告的
+        指标目录里有哪些 ID"，不是"这个具体的人能看见哪些指标"——`list_metrics`
+        是否按调用者的已同步权限过滤尚未被真实验证（见 ``adapters/query_mcp_probe.py``
+        模块文档「诚实边界」），本方法因此不承诺"拿到的是全局完整目录"，只承诺
+        "拿到的是当前某一个真实、有效的令牌"，日检据此得到的是**这个人视角下**的
+        指标目录——这个已知边界写在调用方的装配文档里，不在这里重复。
+
+        按 ``issued_at`` 取最新一条（迁移 ``0065`` 的 ``mcp_access_token`` 定义），
+        只是为了让"同一天多次运行日检"倾向于稳定选中同一个人（新令牌不会在两次
+        运行之间频繁产生），不是因为"更新的令牌更可信"这类判断——任意一个真实
+        存在的令牌都足以满足调用方的需要。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT user_id FROM mcp_access_token ORDER BY issued_at DESC LIMIT 1")
+            row = cursor.fetchone()
+        return None if row is None else str(row[0])
+
     # ------------------------------------------------------------------
     # 就绪判定记录
     # ------------------------------------------------------------------

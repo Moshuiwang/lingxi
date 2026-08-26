@@ -145,18 +145,25 @@ REQUIRED_MODULES = (
     # 闭包里（见下面的 PROCESS_RUNTIME_IMPORTS）。
     "lingxi.core.identity.roster_snapshot",
     "lingxi.adapters.postgres_roster_snapshot",
-    # 内测每日通报（Issue #303 S-O-01）：聚合与渲染在 core，四段真库读取在
+    # 内测每日通报（Issue #303 S-O-01）：聚合与渲染在 core，六段真库读取在
     # adapters，均由 lingxi-scheduler 在运行时按需加载（见下面 PROCESS_RUNTIME_IMPORTS
     # 的 scheduler 闭包）——"本地测试全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡
-    # 的形状。
+    # 的形状。判重水位持久化（Issue #325）新增独立的 watermark 适配器，读写路径
+    # 分开（`postgres_daily_report` 只读，本模块只写判重标记），同样按需加载。
     "lingxi.core.daily_report",
     "lingxi.adapters.postgres_daily_report",
+    "lingxi.adapters.postgres_daily_report_watermark",
     # 内测轮内容级采集（Issue #251/#304 批次 3）：凭据形状过滤、原始素材收集与
     # 记录构造在 core，落库在 adapters，均由 lingxi-worker 在运行时按开关按需
     # 加载（见下面 PROCESS_RUNTIME_IMPORTS 的 worker 闭包）——"本地测试全绿但
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
+    # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
+    # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
+    # 要挡的形状。
+    "lingxi.core.year_grounding_guard",
     # 花名册日报的短期令牌供给规则（Issue #215 主接线）：进程内持有者、每日频率上界与
     # 失败分类。由 lingxi-scheduler 在 `build_loop` 里模块级 import，缺了它进程起不来。
     "lingxi.core.identity.access_token_supply",
@@ -506,8 +513,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_roster_snapshot",
             # 内测每日通报（Issue #303 S-O-01）：`_build_daily_report_duty` 在函数内
             # import 真库读取口，与上面两个花名册 adapter 同一条"函数内 import 证明
-            # 不了装得上"的理由。
+            # 不了装得上"的理由。判重水位持久化（Issue #325）：同一个函数同时
+            # import 了独立的 watermark 适配器，理由相同。
             "lingxi.adapters.postgres_daily_report",
+            "lingxi.adapters.postgres_daily_report_watermark",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
@@ -678,6 +687,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # apps.worker.service/apps.worker.cli 模块级 import。
             "lingxi.core.innertest_content_capture",
             "lingxi.adapters.postgres_content_capture",
+            # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：由 apps/worker/
+            # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
+            # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
+            "lingxi.core.year_grounding_guard",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),

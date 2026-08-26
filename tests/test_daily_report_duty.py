@@ -1,17 +1,21 @@
-"""`apps/scheduler/daily_report.py` 的职责层断言（Issue #303 S-O-01）。
+"""`apps/scheduler/daily_report.py` 的职责层断言（Issue #303 S-O-01；判重水位
+持久化与重聚合挪出主线程为 Issue #325）。
 
 覆盖：V-通报-01（挖掉一段数据源→该段不可判定、其余照常，职责层的调度接线）、
 V-通报-03（每日一条，同日不重发）、V-通报-04（节流状态只在成功送达后提交）、
-V-通报-07（送达失败降级为结构化日志、不静默、下一轮重试、水位不置位）。
+V-通报-07（送达失败降级为结构化日志、不静默、下一轮重试、水位不置位）、
+V-通报-10（判重水位持久化，跨进程重启不重发同一窗口）、V-通报-11（重聚合耗时
+不占用调用方所在的线程）。
 
 纯渲染与聚合断言在 `tests/test_daily_report_render.py`；真库断言在
-`tests/test_postgres_daily_report.py`；装配（前置判定、告警接线）断言在
-`tests/test_scheduler_daily_report_assembly.py`。
+`tests/test_postgres_daily_report.py`/`tests/test_postgres_daily_report_watermark.py`；
+装配（前置判定、告警接线）断言在 `tests/test_scheduler_daily_report_assembly.py`。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 
@@ -93,6 +97,49 @@ class FakeSource:
         return self._token_usage_stats
 
 
+class BlockingSource(FakeSource):
+    """`task_outcomes` 阻塞直到测试放行——用于证明聚合耗时不再占用调用方所在的
+    线程（Issue #325，`DailyReportDuty` 类文档「重聚合为什么要挪出主线程」）。
+    """
+
+    def __init__(self, *, gate: threading.Event, released: threading.Event, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._gate = gate
+        self._released = released
+
+    def task_outcomes(self, *, window_start: datetime, window_end: datetime):
+        self._gate.wait(timeout=5.0)
+        result = super().task_outcomes(window_start=window_start, window_end=window_end)
+        self._released.set()
+        return result
+
+
+class FakeWatermark:
+    """判重水位的内存替身（Issue #325）——模拟 `daily_report_watermark` 表的行为：
+    ``already_sent``/``mark_sent`` 按 ``(report_date, chat_id)`` 判存在，
+    ``mark_sent`` 幂等（重复调用不追加第二条记录）。**跨 `DailyReportDuty` 实例
+    共享同一个 `FakeWatermark` 正是「模拟进程重启」的手法**——重启在真实世界里
+    产生一个全新的进程（因此是全新的 `_completed_on` 内存状态），但读到的是
+    同一个数据库；这里用「共享同一个 FakeWatermark、构造第二个 DailyReportDuty
+    实例」还原这个形状，不需要真的启动第二个进程。
+    """
+
+    def __init__(self) -> None:
+        self._sent: set[tuple[str, str]] = set()
+        self.already_sent_calls: list[tuple[str, str]] = []
+        self.mark_sent_calls: list[tuple[str, str]] = []
+
+    def already_sent(self, *, report_date: date, chat_id: str) -> bool:
+        key = (report_date.isoformat(), chat_id)
+        self.already_sent_calls.append(key)
+        return key in self._sent
+
+    def mark_sent(self, *, report_date: date, chat_id: str) -> None:
+        key = (report_date.isoformat(), chat_id)
+        self.mark_sent_calls.append(key)
+        self._sent.add(key)
+
+
 class FakeSender:
     def __init__(self, *, failures: int = 0, error: Exception | None = None) -> None:
         self._failures = failures
@@ -136,24 +183,29 @@ class FixedClock:
 def build_duty(
     *,
     source: FakeSource | None = None,
+    watermark: FakeWatermark | None = None,
     sender: FakeSender | None = None,
     audit: RecordingAudit | None = None,
     clock: FixedClock | None = None,
     stop: threading.Event | None = None,
+    metric_coverage=None,
 ) -> tuple[DailyReportDuty, dict[str, object]]:
     parts = {
         "source": source or FakeSource(),
+        "watermark": watermark or FakeWatermark(),
         "sender": sender or FakeSender(),
         "audit": audit or RecordingAudit(),
         "clock": clock or FixedClock(),
     }
     duty = DailyReportDuty(
         source=parts["source"],
+        watermark=parts["watermark"],
         sender=parts["sender"],
         audit=parts["audit"],
         chat_id=FAKE_CHAT_ID,
         clock=parts["clock"],
         stop=stop,
+        metric_coverage=metric_coverage,
     )
     return duty, parts
 
@@ -438,6 +490,207 @@ class ThrottleAcrossDaysTests(unittest.TestCase):
         assert text is not None
         self.assertIn("session_failed：1 次", text)
         self.assertNotIn("连续第", text)
+
+
+class PersistedWatermarkTests(unittest.TestCase):
+    """`V-通报-10`（Issue #325）：判重水位持久化，跨进程重启不重发同一窗口的
+    通报。管理群实测坐实的形状——scheduler 每次重启都把 `_completed_on` 清零，
+    同一窗口被重新判定成「还没发」。这里用「共享同一个 `FakeWatermark`、构造第二
+    个 `DailyReportDuty` 实例」模拟重启（见 `FakeWatermark` 的文档字符串）。
+    """
+
+    def test_a_fresh_instance_sharing_the_watermark_does_not_resend(self) -> None:
+        watermark = FakeWatermark()
+        sender = FakeSender()
+        audit = RecordingAudit()
+        clock = FixedClock()
+        first_duty, _ = build_duty(watermark=watermark, sender=sender, audit=audit, clock=clock)
+        first_result = first_duty.run_once()
+        self.assertIsNotNone(first_result)
+        self.assertEqual(len(sender.payloads), 1)
+
+        # "重启"：全新实例，进程内存里的 _completed_on 是 None，但水位是共享的
+        # 持久存储——这正是重启后新进程读到旧进程写的水位这件事的还原。
+        restarted_duty, _ = build_duty(watermark=watermark, sender=sender, audit=audit, clock=clock)
+        self.assertIsNone(restarted_duty.completed_on)
+
+        second_result = restarted_duty.run_once()
+
+        self.assertIsNone(second_result)
+        self.assertEqual(len(sender.payloads), 1, "重启后的新实例不得重发同一窗口的通报")
+        self.assertEqual(restarted_duty.completed_on, date(2026, 8, 24))
+
+    def test_four_simulated_restarts_within_the_same_window_send_exactly_once(self) -> None:
+        """对应实测形状：2026-08-25 单日同窗口因多次部署重启收到四条通报——这里
+        用四个共享同一份持久水位的独立实例模拟四次"重启"，断言恰一次发送。"""
+
+        watermark = FakeWatermark()
+        sender = FakeSender()
+        clock = FixedClock()
+        results = []
+        for _ in range(4):
+            duty, _ = build_duty(watermark=watermark, sender=sender, clock=clock)
+            results.append(duty.run_once())
+
+        self.assertEqual(sum(1 for result in results if result is not None), 1, "四次模拟重启只应有一次真正发送")
+        self.assertEqual(len(sender.payloads), 1)
+
+    def test_a_successful_send_marks_the_persisted_watermark(self) -> None:
+        watermark = FakeWatermark()
+        duty, _ = build_duty(watermark=watermark, clock=FixedClock())
+        duty.run_once()
+        self.assertIn(("2026-08-24", FAKE_CHAT_ID), watermark.mark_sent_calls)
+        self.assertTrue(watermark.already_sent(report_date=date(2026, 8, 24), chat_id=FAKE_CHAT_ID))
+
+    def test_a_send_failure_does_not_mark_the_persisted_watermark(self) -> None:
+        watermark = FakeWatermark()
+        duty, _ = build_duty(watermark=watermark, sender=FakeSender(failures=1), clock=FixedClock())
+        duty.run_once()
+        self.assertEqual(watermark.mark_sent_calls, [])
+        self.assertFalse(watermark.already_sent(report_date=date(2026, 8, 24), chat_id=FAKE_CHAT_ID))
+
+    def test_the_in_memory_fast_path_avoids_a_second_watermark_lookup_the_same_day(self) -> None:
+        """判重水位查询是每一轮的"第一道最快的一关"之后才会碰的第二关：同一
+        进程同一天里，一旦内存水位置位，后续轮次不该再去查持久水位——这条快速
+        路径的性能理由（避免同一进程存活期间每一轮都查库）本身值得钉住。"""
+
+        watermark = FakeWatermark()
+        clock = FixedClock()
+        duty, _ = build_duty(watermark=watermark, clock=clock)
+        duty.run_once()
+        calls_after_first_send = len(watermark.already_sent_calls)
+        duty.run_once()
+        duty.run_once()
+        self.assertEqual(len(watermark.already_sent_calls), calls_after_first_send)
+
+
+class AggregationDoesNotBlockCallerTests(unittest.TestCase):
+    """`V-通报-11`（Issue #325）：重聚合耗时不得占用调用方所在的线程（scheduler
+    主循环：心跳与其余职责，含 `AlertingDuty` 的心跳评估，都在这条线程上）。
+    用可注入的慢聚合桩（`BlockingSource`）证明：聚合还没收工时，`run_once` 已经
+    把控制权交还调用方。
+    """
+
+    def test_run_once_returns_before_a_deliberately_slow_aggregation_finishes(self) -> None:
+        gate = threading.Event()
+        released = threading.Event()
+        source = BlockingSource(gate=gate, released=released)
+        self.addCleanup(gate.set)  # 防止后台线程残留到用例结束之后
+        duty, parts = build_duty(source=source)
+        duty._aggregation_join_timeout_seconds = 0.05  # noqa: SLF001 - 白盒调短等待上限
+
+        started = time.monotonic()
+        result = duty.run_once()
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(result, "聚合还没收工，调用方本轮拿不到正文")
+        self.assertLess(elapsed, 1.0, "调用方必须在很短时间内拿回控制权，不等聚合收工")
+        self.assertFalse(released.is_set(), "调用方返回时，聚合确实还没跑完（不是恰好跑完）")
+
+        gate.set()
+        self.assertTrue(released.wait(timeout=5.0), "放行后后台聚合应当很快完成")
+        self._wait_for_completion(duty)
+        self.assertEqual(duty.completed_on, date(2026, 8, 24))
+        self.assertEqual(len(parts["sender"].payloads), 1)
+
+    def test_a_fast_aggregation_still_returns_the_text_synchronously(self) -> None:
+        """默认关口（`DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS`）下，正常速度的
+        聚合（全部既有测试用的假数据源）行为与改动前完全一致：同步拿到正文。"""
+
+        duty, parts = build_duty()
+        text = duty.run_once()
+        self.assertIsNotNone(text)
+        self.assertEqual(len(parts["sender"].payloads), 1)
+
+    def test_a_second_tick_while_aggregation_is_still_running_does_not_dispatch_twice(self) -> None:
+        """派发去重：后台聚合还没收工时，下一轮 `run_once` 不得再起第二个后台
+        线程——否则两轮同时读库、同时可能尝试发送。"""
+
+        gate = threading.Event()
+        released = threading.Event()
+        source = BlockingSource(gate=gate, released=released)
+        self.addCleanup(gate.set)
+        duty, parts = build_duty(source=source)
+        duty._aggregation_join_timeout_seconds = 0.05  # noqa: SLF001
+
+        first = duty.run_once()  # 派发后台聚合，卡在闸门上
+        second = duty.run_once()  # 同一轮还没收工，这次调用不该再派发
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        gate.set()
+        released.wait(timeout=5.0)
+        self._wait_for_completion(duty)
+        # `task_outcomes` 只应该被调用一次，证明第二次 run_once 没有起第二个
+        # 后台聚合；发送也只应该真正发生一次。
+        self.assertEqual(len(source.calls["task_outcomes"]), 1)
+        self.assertEqual(len(parts["sender"].payloads), 1)
+
+    @staticmethod
+    def _wait_for_completion(duty: DailyReportDuty, *, timeout: float = 5.0) -> None:
+        """轮询等待后台聚合线程收尾（`completed_on` 置位）；不引入 sleep 循环
+        以外的同步原语，代价是有界轮询而不是事件通知——测试范围内可接受。"""
+
+        deadline = time.monotonic() + timeout
+        while duty.completed_on is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+
+class MetricCoverageWiringTests(unittest.TestCase):
+    """「未覆盖新指标」日检的职责层接线（Issue #320 并入项）：未接线不出现、
+    接线且取数失败留不可判定审计、接线且有差异出现在正文与审计里。
+    """
+
+    def test_unwired_produces_no_coverage_section_and_no_audit_entry(self) -> None:
+        duty, parts = build_duty(metric_coverage=None)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("待分配", text)
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_a_failing_coverage_check_is_marked_undetermined_and_the_rest_still_sends(self) -> None:
+        def _boom() -> tuple[tuple[str, ...], tuple[str, ...]]:
+            raise RuntimeError("模拟 MCP 查询失败")
+
+        duty, parts = build_duty(metric_coverage=_boom)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("待分配", text)
+        self.assertIn("不可判定", text)
+        # 单段失败不拖累其余段落——活跃用户段的真实数字照常出现。
+        self.assertIn("活跃用户", text)
+        section_reads = parts["audit"].fields_for("daily_report.section_read_failed")
+        self.assertTrue(any(entry["section"] == "metric_coverage" for entry in section_reads))
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_a_detected_gap_appears_in_the_sent_text(self) -> None:
+        duty, parts = build_duty(
+            metric_coverage=lambda: (("brand_new_metric", "exchange_rate"), ("exchange_rate",))
+        )
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("待分配", text)
+        self.assertIn("brand_new_metric", text)
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("metric_coverage", sent_fields["undetermined_sections"])
+
+    def test_no_gap_produces_no_coverage_section(self) -> None:
+        duty, parts = build_duty(
+            metric_coverage=lambda: (("exchange_rate",), ("exchange_rate", "vat_rate"))
+        )
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("待分配", text)
 
 
 if __name__ == "__main__":
