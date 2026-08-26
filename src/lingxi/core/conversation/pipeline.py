@@ -21,7 +21,12 @@
        V-审计-05
        （未开通分支内先按登记表实时判定是否为当前有效管理员：是 → 管理命令面，
        不进入开通；否 → 原有开通逻辑不变。Issue #95 S-M-01，V-管理-2x）
-    6. 解析命令          /stop /new                            V-会话-05/06
+    6. 解析命令          /stop /new；以 / 开头但不被认识的文本直接回绝、不入队，
+       且**不受下面第 7 步忙碌判定影响**——这条消息不管忙不忙碌都不会被受理，
+       没有理由先让用户等一轮忙碌提示再重发一遍（Trace #304 批次 5 直修，
+       产品负责人 biai-stage 实测暴露：执行层把 / 开头文本解析成系统命令而
+       不是用户文本，/config /model /help 令会话瞬断，/loop 触发内部工具
+       误用）                                                  V-会话-05/06/11
     7. 话题忙碌判定      忙碌 且 非 /stop → 只回提示，不入队    V-会话-04/09/10
     8. 入队 + NOTIFY                                           V-队列-01…05
 
@@ -53,7 +58,7 @@ from typing import Any, Callable
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.ids import new_id
 
-from .commands import Command, parse_command
+from .commands import Command, is_unrecognized_slash_message, parse_command
 from .ports import (
     AuditSink,
     GatewayStore,
@@ -490,6 +495,32 @@ class EventPipeline:
 
             # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)
+
+            # 第 6 步的延伸（Trace #304 批次 5 直修，产品负责人 biai-stage 真实测试
+            # 暴露）：以 / 开头、但不是上面 parse_command 认识的任何命令的文本消息，
+            # 在这里直接回绝——执行层（Agent SDK 底层的 Claude Code CLI）把这类文本
+            # 解析成系统斜杠命令而不是用户问题，不是我们能控制的解析行为：
+            # /config、/model、/help 令会话在一两秒内瞬断（session_failed），/loop
+            # 会让模型尝试调用内部工具（被工具白名单拦下、无真实副作用，但已构成
+            # model_protocol_breakdown 失败）。同样放在忙碌判定**之前**、且刻意不
+            # 受它影响：这条消息不管话题忙不忙碌都不会被受理，没有理由先回一轮
+            # 「当前任务仍在处理中」，逼用户在任务结束后重新发一遍同样会被拒的输入。
+            # 只看整条消息去除首尾空白后的第一个字符，句子中间的 /（日期、URL）
+            # 不受影响；判断复用 parse_command 的整条匹配语义，/new /stop 不会被
+            # 误伤（`is_unrecognized_slash_message`）。管理员的 /admin 命令面分流
+            # 发生在更早的第 4/5 步（专用主体判定、NOT_PROVISIONED 分支内的登记表
+            # 判定），到这里说明发送者已经确认是普通业务用户，不影响管理面。
+            if is_unrecognized_slash_message(message.text):
+                deferred.append(self._texts.catalog.text("gateway.slash_rejected"))
+                self._audit.record(
+                    "command.unsupported_slash",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    conversation_id=conversation.conversation_id,
+                    trace_id=message.trace_id,
+                )
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+                return Outcome(handled_as=HandledAs.COMMAND)
 
             # —— 第 7 步：忙碌判定。
             busy = conversation.running_task_id is not None

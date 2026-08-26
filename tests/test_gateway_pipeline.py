@@ -61,6 +61,9 @@ NEW_SESSION_TEXT = "已开启新会话，可以开始提问。"
 # 方案 A：独立文本回复）。同上，下方 ``SessionRotationNoticeTests`` 另有一条用例
 # 断言内容目录里的实际值与这个定稿一致。
 SESSION_ROTATED_TEXT = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"
+# Trace #304 批次 5 直修：以 / 开头但不被认识的业务消息的固定拒绝文案。同上，下方
+# ``SlashCommandRejectionTests`` 另有一条用例断言内容目录里的实际值与这里一致。
+SLASH_REJECTED_TEXT = "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
 
 
 def message(
@@ -946,6 +949,132 @@ class BusyCommandTests(PipelineTestCase):
 
         self.assertEqual(
             default_content_catalog().text("gateway.new_session").text, NEW_SESSION_TEXT
+        )
+
+
+class SlashCommandRejectionTests(PipelineTestCase):
+    """`V-会话-11`（Trace #304 批次 5 直修）：产品负责人在 biai-stage 真实测试发现，
+    以 `/` 开头的业务消息会被执行层（Agent SDK 底层的 Claude Code CLI）解析成系统
+    斜杠命令而不是用户文本——`/config`/`/model`/`/help` 令会话瞬断（session_failed），
+    `/loop` 让模型尝试调用内部工具（触发 model_protocol_breakdown）。这里是 gateway
+    层的主防线：入队前直接拦截，不建任务、不耗模型轮次。
+    """
+
+    def test_unrecognized_slash_messages_are_rejected_without_queueing(self) -> None:
+        """真实故障复现的四个 prompt：/config、/model、/help、/loop 变体。"""
+
+        cases = ("/config", "/model", "/help", '/loop 10m "检查赞比亚充值数据"')
+        for text in cases:
+            with self.subTest(text=text):
+                self.log = CallLog()
+                self.state = FakeState()
+                self.state.users["ou_1"] = provisioned_user()
+
+                outcome = self.build().handle_message(message(text=text), now=NOW)
+
+                self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+                self.assertEqual(len(self.state.tasks), 0, f"{text!r} 不得入队")
+                replies = self.log.fields("reply.send_text")
+                self.assertEqual(len(replies), 1, f"{text!r} 应恰好一条回复")
+                self.assertEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
+
+                sent = self.log.fields("audit.reply.sent")
+                self.assertEqual(sent[0]["content_key"], "gateway.slash_rejected")
+                self.assertTrue(sent[0]["content_version"])
+                self.assertIn(
+                    "audit.command.unsupported_slash",
+                    self.log.names(),
+                    "必须落一条可分类的审计动作",
+                )
+
+    def test_audit_records_classification_not_raw_message_text(self) -> None:
+        """审计只记 handled_as 分类，不记正文——`/loop` 的参数（可能带业务敏感
+        描述）不得出现在审计字段里。"""
+
+        outcome = self.build().handle_message(
+            message(text='/loop 10m "检查赞比亚充值数据"'), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        recorded = self.log.fields("audit.command.unsupported_slash")
+        self.assertEqual(len(recorded), 1)
+        self.assertNotIn("text", recorded[0])
+        for value in recorded[0].values():
+            self.assertNotIn("赞比亚", str(value))
+            self.assertNotIn("检查", str(value))
+
+    def test_mid_sentence_slash_is_not_intercepted(self) -> None:
+        """否定断言：句中含 / 的正常文本（日期、URL）必须正常入队，不受影响。"""
+
+        cases = ("8/26 的销售额是多少", "帮我看看 https://example.com/report 这个链接")
+        for text in cases:
+            with self.subTest(text=text):
+                self.log = CallLog()
+                self.state = FakeState()
+                self.state.users["ou_1"] = provisioned_user()
+
+                outcome = self.build().handle_message(message(text=text), now=NOW)
+
+                self.assertEqual(
+                    outcome.handled_as, HandledAs.TASK_QUEUED, f"{text!r} 不应被拦截"
+                )
+                self.assertEqual(len(self.state.tasks), 1)
+
+    def test_known_commands_still_work(self) -> None:
+        """回归：`/new`（大小写不敏感的整条匹配）不受新拦截影响，行为不变。"""
+
+        outcome = self.build().handle_message(message(text="/NEW"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(replies[0]["text"], NEW_SESSION_TEXT)
+        self.assertNotEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
+
+    def test_busy_topic_gets_the_same_rejection_not_the_busy_hint(self) -> None:
+        """设计取舍：拦截判定放在忙碌判定之前——这条消息不管话题忙不忙碌都不会被
+        受理，busy 状态下也应得到同一条拒绝文案，而不是「当前任务仍在处理中」
+        （否则用户要等任务结束后重发一遍才会看到真正有用的提示）。"""
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_running"
+        )
+
+        outcome = self.build().handle_message(message(text="/model"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
+        self.assertNotEqual(
+            replies[0]["text"], BUSY_HINT_TEXT, "否定测试：忙碌分支不得掩盖斜杠拒绝文案"
+        )
+
+    def test_roster_gate_takes_priority_for_unlisted_users(self) -> None:
+        """名单外用户仍走内测名单闸优先：`NOT_PROVISIONED` 分支的既有判定顺序
+        不受本行影响，斜杠拦截只发生在已确认是业务用户之后。"""
+
+        onboarding = FakeOnboarding()
+        pipeline = self.build(onboarding=onboarding, innertest_roster_gate=lambda open_id: False)
+
+        outcome = pipeline.handle_message(
+            message(open_id="ou_not_listed", text="/config"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.DROPPED)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(
+            replies[0]["text"],
+            default_content_catalog().text("onboarding.innertest_not_open").text,
+        )
+        self.assertNotEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
+
+    def test_slash_rejected_text_matches_content_catalog(self) -> None:
+        """内容目录里的 ``gateway.slash_rejected`` 必须逐字等于本文件测试用的
+        字面量，两头不得漂移。"""
+
+        self.assertEqual(
+            default_content_catalog().text("gateway.slash_rejected").text, SLASH_REJECTED_TEXT
         )
 
 

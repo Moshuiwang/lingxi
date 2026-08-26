@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-24"
+version = "2026-08-26"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -37,6 +37,11 @@ version = "2026-08-24"
 "gateway.delivery_expired" = "上一次问数结果因超过投递时限未能确认送达，已过期，请重新提问。"
 "gateway.new_session" = "已开启新会话，可以开始提问。"
 "gateway.session_rotated" = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"
+# Trace #304 批次 5 直修：产品负责人 biai-stage 真实测试发现，以 / 开头的业务消息
+# （/config、/model、/help、/loop 等）会被执行层当作系统命令解析，导致会话瞬断或
+# 触发内部工具误用。这条文案用于 gateway 在入队前直接回绝这类消息，不说明内部
+# 解析细节，只给用户一个可行动的改法。
+"gateway.slash_rejected" = "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
 
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"

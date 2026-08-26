@@ -200,6 +200,27 @@ class AdminRoutingPipelineTests(unittest.TestCase):
         self.assertEqual(router.calls, [])
         self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
 
+    def test_already_provisioned_users_slash_message_still_never_reaches_admin_router(
+        self,
+    ) -> None:
+        """Trace #304 批次 5 直修的回归哨兵：gateway 新增的「以 / 开头未识别文本
+        拦截」（`V-会话-11`）插在第 6 步（解析命令），结构上晚于第 4/5 步的管理面
+        分流——已开通业务用户发送形如 `/admin` 的文本，同样不触达管理路由，只会
+        落进新的斜杠拦截分支，得到通用拒绝文案而不是管理命令的回复。"""
+
+        router = FakeAdminRouter(
+            {"ou_1": AdminRouteOutcome(handled=True, reply_text="不应该被看到")}
+        )
+        pipeline = self._pipeline(admin_router=router)
+
+        outcome = pipeline.handle_message(message(open_id="ou_1", text="/admin help"))
+
+        self.assertEqual(router.calls, [], "已开通业务用户的消息不得触达管理路由")
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertNotEqual(replies[0]["text"], "不应该被看到")
+
 
 class WriteCommandContextThreadingTests(unittest.TestCase):
     """Issue #96 S-M-02：``chat_id``/``thread_id``/``message_id`` 必须原样从

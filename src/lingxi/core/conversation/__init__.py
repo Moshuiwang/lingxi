@@ -8,7 +8,7 @@ gateway 侧——事件管线、``/new`` 与 ``/stop``、两小时规则；Agent
 
 from __future__ import annotations
 
-from .commands import Command, parse_command
+from .commands import Command, is_unrecognized_slash_message, parse_command
 from .onboarding_recovery import OnboardingReconciler
 from .pipeline import BUSY_HINT_TEXT, DEFAULT_WORKER_VERSION, EventPipeline, GatewayTexts
 from .ports import (
@@ -45,6 +45,7 @@ __all__ = [
     "SESSION_IDLE_WINDOW",
     "UserRecord",
     "UserState",
+    "is_unrecognized_slash_message",
     "parse_command",
     "should_resume_session",
 ]

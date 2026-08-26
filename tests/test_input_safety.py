@@ -401,6 +401,66 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertLess(ordered.index('source="a-source"'), ordered.index('source="z-source"'))
 
 
+SLASH_NEUTRALIZATION_PREFIX = "用户消息："
+
+
+class SlashCommandNeutralizationTests(unittest.TestCase):
+    """`V-注入-10`（Trace #304 批次 5 直修）：worker 把用户问题交给执行层前，对
+    「去除首尾空白后以 / 开头」的问题做中性化处理——Agent SDK 底层的 Claude Code
+    CLI 会把这类文本解析成系统斜杠命令而不是用户问题，产品负责人在 biai-stage 真实
+    测试中复现（/config、/model、/help 令会话瞬断，/loop 触发内部工具误用）。这是
+    gateway 层拦截（主防线）之外的纵深防御，覆盖历史任务重试等绕过 gateway 拦截
+    入队的路径。
+    """
+
+    def test_leading_slash_question_is_neutralized(self) -> None:
+        prompt = compose_agent_prompt("/config")
+
+        self.assertFalse(prompt.startswith("/"))
+        self.assertEqual(prompt, f"{SLASH_NEUTRALIZATION_PREFIX}/config")
+
+    def test_leading_slash_with_external_texts_still_wraps_context(self) -> None:
+        prompt = compose_agent_prompt("/loop 10m 检查数据", {"metric.description": "日活"})
+
+        self.assertTrue(prompt.startswith(SLASH_NEUTRALIZATION_PREFIX))
+        self.assertIn("/loop 10m 检查数据", prompt)
+        self.assertIn(EXTERNAL_TEXT_LABEL, prompt)
+
+    def test_whitespace_before_the_slash_is_still_neutralized(self) -> None:
+        """纵深防御按「去除首尾空白后的第一个字符」判断，不是字面意义上必须
+        零偏移——防的是执行层自己做一次 strip 之后仍然把它认成命令。"""
+
+        prompt = compose_agent_prompt("  /model")
+
+        self.assertFalse(prompt.strip().startswith("/"))
+        self.assertEqual(prompt, f"{SLASH_NEUTRALIZATION_PREFIX}  /model")
+
+    def test_sentinel_normal_text_is_byte_for_byte_unchanged(self) -> None:
+        """哨兵测试：不以 / 开头的正常文本（含中间出现的 /，如日期、URL、路径）
+        必须逐字节不变——中性化前缀只加在触发条件成立的输入前面。"""
+
+        sentinels = (
+            "本月销售额是多少",
+            "8/26 的充值数据",
+            "帮我看看 https://example.com/report 这个链接",
+            "帮我查一下 /config 命令是干什么用的",  # / 出现在句中，不在首字符
+            "",
+            "   ",
+            "只有空白包裹的问题 ",
+        )
+        for sentinel in sentinels:
+            with self.subTest(sentinel=sentinel):
+                self.assertEqual(compose_agent_prompt(sentinel), sentinel)
+
+    def test_non_slash_question_with_external_texts_is_unaffected(self) -> None:
+        """正常问题拼接外部上下文时的形状不因本次改动变化。"""
+
+        prompt = compose_agent_prompt("查询日活", {"metric.description": "说明"})
+
+        self.assertTrue(prompt.startswith("查询日活"))
+        self.assertNotIn(SLASH_NEUTRALIZATION_PREFIX, prompt)
+
+
 class WorkerReportProjectionTests(unittest.TestCase):
     """出口投影必须把同一安全约束带到最终正文、卡片和日志载荷。"""
 
@@ -563,6 +623,63 @@ class WorkerTurnInputSafetyTests(unittest.TestCase):
         self.assertNotIn(INJECTION, report["turn"]["final_text"])
         self.assertTrue(report["turn"]["output_safety"]["blocked"])
         self.assertFalse(report["turn"]["output_safety"]["withheld"])
+
+    def test_worker_turn_neutralizes_a_leading_slash_before_it_reaches_the_sdk(self) -> None:
+        """`V-注入-10` 的接线证明：即使一条以 / 开头的问题绕过 gateway 拦截、真的
+        被 worker 领到（历史任务重试等路径），``run_single_turn`` 实际收到的
+        ``prompt`` 也必须已经不再以 / 开头——这是唯一能防止 Agent SDK 底层 CLI
+        把它解析成系统命令的一步。"""
+
+        config = WorkerConfig(
+            question="/config",
+            read_only_tools=(READ_ONLY_TOOL,),
+            trace_id="01J0000000000000000TEST003",
+            turn_timeout_seconds=1.0,
+            system_prompt=SYSTEM_PROMPT,
+        )
+        executor = WorkerTurnExecutor(config)
+        seen_prompt: dict[str, str] = {}
+
+        async def fake_run_single_turn(*, options, prompt, sink, **kwargs) -> None:
+            del options, kwargs
+            seen_prompt["value"] = prompt
+            sink({"kind": "assistant_message", "text": "已回答"})
+            await executor.gateway.on_hook_event({"hook_event_name": "Stop"})
+            sink({"kind": "result", "subtype": "success", "is_error": False})
+
+        with patch.object(executor, "build_session_options", return_value=object()):
+            with patch("lingxi.apps.worker.turn.run_single_turn", new=fake_run_single_turn):
+                asyncio.run(executor.run_turn(config.question))
+
+        self.assertFalse(seen_prompt["value"].startswith("/"))
+        self.assertEqual(seen_prompt["value"], "用户消息：/config")
+
+    def test_worker_turn_leaves_a_normal_question_byte_for_byte_unchanged(self) -> None:
+        """回归：既有任务（不以 / 开头的正常问题）经过本次改动后收到的 prompt
+        必须逐字节不变。"""
+
+        config = WorkerConfig(
+            question="查询本月销售额",
+            read_only_tools=(READ_ONLY_TOOL,),
+            trace_id="01J0000000000000000TEST004",
+            turn_timeout_seconds=1.0,
+            system_prompt=SYSTEM_PROMPT,
+        )
+        executor = WorkerTurnExecutor(config)
+        seen_prompt: dict[str, str] = {}
+
+        async def fake_run_single_turn(*, options, prompt, sink, **kwargs) -> None:
+            del options, kwargs
+            seen_prompt["value"] = prompt
+            sink({"kind": "assistant_message", "text": "已回答"})
+            await executor.gateway.on_hook_event({"hook_event_name": "Stop"})
+            sink({"kind": "result", "subtype": "success", "is_error": False})
+
+        with patch.object(executor, "build_session_options", return_value=object()):
+            with patch("lingxi.apps.worker.turn.run_single_turn", new=fake_run_single_turn):
+                asyncio.run(executor.run_turn(config.question))
+
+        self.assertEqual(seen_prompt["value"], "查询本月销售额")
 
 
 class StreamingOutputGuardTests(unittest.TestCase):

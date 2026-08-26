@@ -58,6 +58,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "gateway.delivery_expired",
     "gateway.new_session",
     "gateway.session_rotated",
+    "gateway.slash_rejected",
     "worker.action.processing",
     "worker.action.completed",
     "worker.status",
