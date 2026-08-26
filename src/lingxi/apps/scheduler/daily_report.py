@@ -11,14 +11,92 @@ RosterAuditDuty 没有的规则**：六段数据源各自独立失败，只让�
 判定」，不拖累其余段落，也不拖累整轮发送——这是 #303 明确要求、而花名册日报当前
 不需要的行为（它的判重逻辑是「整轮读不出来就整轮重试」，不是「分段降级」）。
 
-## 判重水位与节流状态都是进程内存
+## 判重水位已持久化，节流状态仍是进程内存（Issue #325）
 
-`_completed_on`（今天发过了没有）与 `_reason_streaks`（失败分类 Top 每个原因码
-连续在榜几天）都只在这个职责实例的内存里，与 `RosterAuditDuty._completed_on` 同一条
-已知残留：**重启后水位清零，当天可能重发一份内容相近的通报**；`_reason_streaks`
-重启后从零重新计数，节流的效果会短暂消失几天再重新生效。两者都是 2026-08-06
-产品负责人对花名册日报同一形状残留的知情接受（裁定 C2 / R2）的自然延伸——真幂等
-需要给判重水位与节流状态各自的持久列，属新迁移，不在本 Story 授权范围内。
+**`_completed_on`（今天发过了没有）现在有两层**：进程内存里的这个日期水位仍然是
+每一轮判重的**第一道**、最快的一关（避免同一进程存活期间的每一轮都去查库）；
+真正跨重启存活的是数据库里的 `daily_report_watermark` 表（迁移 `0071`，
+`adapters/postgres_daily_report_watermark.py`）——发送**成功**之后立刻写一行，
+下一轮（含重启后的新进程）判重时，内存水位落空就去查这张表，查到即说明"这个
+窗口、这个目的地已经发过"，直接补齐内存水位、不重新聚合、不重新发送。
+
+**这修的是什么**：管理群实测坐实的残留——scheduler 每次重启（部署升级、进程
+恢复）都把 `_completed_on` 清零，同一个统计窗口被重新判定成"还没发"，重新跑
+一遍聚合与发送。2026-08-25 单日同窗口收到四条通报，对应当天多次部署重启。
+`RosterAuditDuty` 的同形状残留（本文件模块文档开头提到的"同一条已知残留"）
+**不在本次修复范围**——#325 只认领内测每日通报，花名册日报的判重水位是否同样
+持久化留给它自己的 Story。
+
+**`_reason_streaks`（失败分类 Top 每个原因码连续在榜几天）仍然只在进程内存
+里**——这是 #325 明确没有认领的部分（Issue 正文「代码变动面」只提判重水位与
+心跳假告警两项）。跨重启节流效果仍会短暂消失几天再重新生效，与 2026-08-06
+产品负责人裁定（C2 / R2）的知情接受一致：连续 7 天的节流阈值本身足够宽，一次
+重启不会让用户看到明显的行为回退。要给它也上持久列，属另一次新迁移，留给需要
+时的后续 Story。
+
+**「发送成功与标记写入」不是字面同一个数据库事务**：发送是一次 HTTP 调用，不是
+数据库操作，两者结构上不可能被塞进同一个 `BEGIN`/`COMMIT`。真正的幂等保证来自
+两层纵深——数据库水位挡住"隔了几小时甚至几天的重启"（本次实测的形状：部署
+升级、进程恢复）；`send_text` 的 `dedupe_key` 与飞书服务端投递去重（见
+`adapters/feishu_group_message.py::delivery_uuid` 文档）挡住"发送成功与水位
+写入之间那道极窄缝隙里恰好发生崩溃重启"这类更罕见的情形。`mark_sent` 本身也是
+幂等的（`ON CONFLICT DO NOTHING`），即使被调用两次也只留一行——这道防线因此
+在两个不同的时间尺度上分别成立，合起来才是"进程崩在中间不产生第二条"的完整
+论证，不是靠一句"同事务"就能诚实概括的单一机制。
+
+## 重聚合为什么要挪出主线程（Issue #325）
+
+管理群实测还坐实了第二个残留：2026-08-25/08-26 连续两天 00:06 出现
+`scheduler.process_inactive` 告警、00:12 自愈。根因不是心跳真的停了，是**评估
+心跳是否新鲜这件事，被本职责的聚合耗时挤到了心跳被记录之后很久**：
+
+- `apps/scheduler/assembly.py::build_loop` 把 `AlertingDuty` 注册在 `duties`
+  列表**最后**（"它汇总本轮观察到的信号，排在被观察者后面才看得到这一轮的
+  事实"，见该文件 `build_loop` 文档字符串）——这个顺序本身是对的，不能靠调整
+  顺序来"修"这个问题。
+- `apps/scheduler/loop.py::SchedulerLoop.run_once()` 在**这一轮全部职责开始
+  之前**记一次心跳，然后依次同步调用每个职责的 `run_once()`，`AlertingDuty`
+  排在最后一个才轮到。
+- 本职责在被调用时如果同步跑完六段聚合 + 渲染 + 发送（正常情况下很快，但没有
+  任何机制保证它总是很快——大表扫描、飞书接口慢响应都可能把它拖到几分钟），
+  `AlertingDuty.run_once()` 就要等聚合真正跑完才轮到自己执行；它内部
+  `AlertManager.check_heartbeats(at=now)` 用的 `now` 是**它自己被调用那一刻**
+  的时钟读数，而心跳是**这一整轮开始之前**记的——两者之间隔着本职责刚刚花掉
+  的全部聚合耗时。一旦这段耗时超过 `AlertPolicy.heartbeat_timeout_seconds`
+  （默认 120 秒），`check_heartbeats` 就会诚实地判定"心跳不新鲜"并发出
+  `PROCESS_INACTIVE` 告警——进程其实一直活着，只是这一轮的评估时机被本职责的
+  聚合耗时顶到了阈值之外。下一轮心跳刷新，`AlertingDuty` 观察到连续新鲜，
+  `recovery_stable_seconds`（默认 300 秒）满足后自动发出恢复通知——这与实测的
+  "00:06 告警、00:12 自愈"（相隔约 6 分钟，略高于 5 分钟的稳定恢复窗口）完全
+  吻合。
+
+  **这不是已知未修复缺口（PR #173 P2-2，见验收矩阵「运行告警」一节）的同一个
+  问题**：那条登记的是"循环本身彻底停摆时没有任何东西检查停摆"（一个更深的
+  结构性限制，仍然接受不修）；这里是"循环仍在正常推进，只是某一轮里排在前面
+  的一个职责耗时较长，挤晚了排在后面的心跳评估"——两者的成因、影响面和修法
+  都不同，本次只修后者，且只动本职责自己，不改 `SchedulerLoop`/`AlertingDuty`
+  的既有顺序或语义（那两者的既有形状经过审查、有意为之，见上面引用的文档
+  字符串）。
+
+**修法**：六段聚合 + 渲染 + 发送 + 收尾（水位、审计、`_completed_on`/
+`_reason_streaks`）整体挪进一个后台线程（:meth:`DailyReportDuty._aggregate_and_send`），
+调用方所在的线程只等一个很短的上限
+（`DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS`，默认 2 秒）就拿回控制权——聚合
+本身没有超时、不会被打断，只是不再占着 `SchedulerLoop` 的主线程。正常情况下
+（聚合速度远小于这个上限）行为与改动前完全一致：`run_once()` 同步等到结果、
+原样返回正文。真正变慢的那一轮，`run_once()` 提前返回 `None`（"这一轮只是确认
+聚合还在跑"），后台线程自己收尾，下一轮 `SchedulerLoop` 能立刻推进到
+`AlertingDuty`，心跳评估拿到的是新鲜的时钟读数，不再被本职责的聚合耗时拖累。
+与 worker 侧 `asyncio.to_thread` 挪文件读取出事件循环（`apps/worker/service.py`
+的既有注释：「不占事件循环（心跳与停止处理都在循环上）」）是同一条纪律在
+同步/线程模型下的对应写法——scheduler 是 `threading`（同步）模型、不是
+`asyncio`，因此用后台线程而不是协程调度让出。
+
+**同一时刻至多一个后台聚合在飞**：`_pending_thread` 记着上一次派发的线程，
+还活着就不再派发第二个——两轮聚合同时读库、同时可能尝试发送，是比"聚合慢"
+本身更糟的形状。停止信号（`SIGTERM`/`SIGINT`）在聚合期间到达时，后台线程仍然
+走既有的"读取阶段/渲染完成后再看一眼 `_stop`"两处检查点，干净中断、不发送、
+不置位——这条纪律没有变，只是现在跑在另一条线程上。
 
 ## 送达失败不静默
 
@@ -93,6 +171,18 @@ def _classify_send_failure(error: Exception) -> str:
     return "other"
 
 
+#: 后台聚合线程的主线程等待上限（Issue #325，见类文档「重聚合为什么要挪出主
+#: 线程」）。**不是聚合本身的超时**——聚合没有边界，慢就慢，后台线程会一直跑
+#: 到收工或停止信号生效；这个数字只控制"调用方（scheduler 主循环所在的那条
+#: 线程，心跳与 `AlertingDuty` 的心跳评估都在上面）最多为这一轮愿意等多久才
+#: 把控制权拿回去"。取值远小于 `core/alerting.py` `AlertPolicy.
+#: heartbeat_timeout_seconds` 的默认值（120 秒）——本职责单独占用的等待时间
+#: 必须给其余职责与下一轮心跳留出充裕余量，不能自己就把预算花完；也远大于
+#: 测试用假数据源的实际耗时（微秒级），因此全部既有测试在这个等待窗口内都能
+#: 正常拿到同步返回值，行为不变。
+DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS = 2.0
+
+
 class _DailyStatsSource(Protocol):
     """四段独立统计的读取口；实现是
     :class:`~lingxi.adapters.postgres_daily_report.PostgresDailyReportSource`。
@@ -129,6 +219,17 @@ class _GroupSender(Protocol):
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
 
 
+class _SentWatermark(Protocol):
+    """通报送达水位的持久化端口（Issue #325）；实现是
+    :class:`~lingxi.adapters.postgres_daily_report_watermark.PostgresDailyReportWatermark`。
+    职责只依赖这个签名，因此跨重启判重断言也能在没有数据库、没有网络的机器上跑完。
+    """
+
+    def already_sent(self, *, report_date: date, chat_id: str) -> bool: ...
+
+    def mark_sent(self, *, report_date: date, chat_id: str) -> None: ...
+
+
 class DailyReportDuty:
     """内测每日统计通报（Issue #303 S-O-01）。"""
 
@@ -138,20 +239,28 @@ class DailyReportDuty:
         self,
         *,
         source: _DailyStatsSource,
+        watermark: _SentWatermark,
         sender: _GroupSender,
         audit: AuditSink,
         chat_id: str,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
+        aggregation_join_timeout_seconds: float = DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS,
     ) -> None:
         self._source = source
+        self._watermark = watermark
         self._sender = sender
         self._audit = audit
         self._chat_id = chat_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._stop = threading.Event() if stop is None else stop
+        self._aggregation_join_timeout_seconds = aggregation_join_timeout_seconds
         self._completed_on: date | None = None
         self._reason_streaks: dict[str, int] = {}
+        # 上一次派发的后台聚合线程（Issue #325，见类文档「重聚合为什么要挪出主
+        # 线程」）。``None`` 或已经跑完都表示"可以派发下一轮"；还活着就说明上一轮
+        # 还没收工，本轮不重复派发。
+        self._pending_thread: threading.Thread | None = None
 
     @property
     def stopping(self) -> bool:
@@ -159,7 +268,9 @@ class DailyReportDuty:
 
     @property
     def completed_on(self) -> date | None:
-        """已完成通报的那一天。``None`` 表示本进程实例今天还没发过。"""
+        """已完成通报的那一天（本进程内观察到的事实）。可能是本进程自己发的，
+        也可能是读到持久水位后才确认"已经发过"（见类文档「判重水位已持久化」）。
+        ``None`` 表示本进程实例还没确认今天已经处理完。"""
 
         return self._completed_on
 
@@ -191,14 +302,29 @@ class DailyReportDuty:
             return None, reason
 
     def run_once(self) -> str | None:
-        """跑一轮。返回 ``None`` 表示本轮没有发送（停止中，或今天已经做完）；
-        否则返回已发送的正文（供测试断言）。"""
+        """跑一轮。返回 ``None`` 表示本轮没有发送（停止中、今天已经做完，或本轮
+        只是确认了一次"后台聚合还在跑，调用方不等"）；否则返回已发送的正文
+        （供测试断言）——语义与改动前完全一致，差异只在于：聚合速度远慢于
+        `_aggregation_join_timeout_seconds` 时，`run_once` 会先返回 `None`，
+        真正的发送与收尾在后台线程里完成（见类文档「重聚合为什么要挪出主
+        线程」，Issue #325）。"""
 
         if self._stop.is_set():
             return None
         now = self._clock()
         today = now.date()
         if self._completed_on == today:
+            return None
+        if self._pending_thread is not None and self._pending_thread.is_alive():
+            # 上一次派发的后台聚合还没收工：不重复派发——两轮聚合同时读库、
+            # 同时可能尝试发送，是比"聚合慢"本身更糟的形状。下一轮再看。
+            return None
+
+        if self._watermark.already_sent(chat_id=self._chat_id, report_date=today):
+            # 持久水位显示本窗口已经发过——可能是本进程更早一轮成功后设的，也
+            # 可能是重启前的旧进程设的（这正是 #325 要修的残留：内存水位重启即
+            # 清零，数据库水位不会）。直接补齐内存水位，不重新聚合、不重新发送。
+            self._completed_on = today
             return None
 
         # 统计窗口固定为「昨天」的完整 UTC 自然日：与花名册审计同样的 UTC 日界
@@ -213,6 +339,58 @@ class DailyReportDuty:
         # 关闭，「过期」这一桶在那个窗口下结构上恒为零。
         delivery_window_end = window_start
         delivery_window_start = delivery_window_end - timedelta(days=1)
+
+        result: dict[str, str | None] = {}
+
+        def worker() -> None:
+            try:
+                result["text"] = self._aggregate_and_send(
+                    today,
+                    window_start=window_start,
+                    window_end=window_end,
+                    delivery_window_start=delivery_window_start,
+                    delivery_window_end=delivery_window_end,
+                )
+            except Exception as error:  # noqa: BLE001 - 后台线程异常不能无声消失
+                logger.error(
+                    "内测每日通报：后台聚合线程出现未预期异常，本轮未完成 error=%s",
+                    type(error).__name__,
+                )
+
+        thread = threading.Thread(
+            target=worker, name="lingxi-daily-report-aggregate", daemon=True
+        )
+        self._pending_thread = thread
+        thread.start()
+        thread.join(timeout=self._aggregation_join_timeout_seconds)
+        if thread.is_alive():
+            # 聚合仍在跑：不再等——这正是本次修复的核心，聚合耗时不得占用调用方
+            # 所在的线程（scheduler 主循环：心跳与其余职责，含 AlertingDuty 的
+            # 心跳评估，都在这条线程上）。后台线程会自己收尾（水位、审计、
+            # `_completed_on`），下一轮由持久水位或内存 `_completed_on` 观察到。
+            logger.info(
+                "内测每日通报：聚合仍在后台线程运行，主循环不再等待 timeout=%ss",
+                self._aggregation_join_timeout_seconds,
+            )
+            return None
+        return result.get("text")
+
+    def _aggregate_and_send(
+        self,
+        today: date,
+        *,
+        window_start: datetime,
+        window_end: datetime,
+        delivery_window_start: datetime,
+        delivery_window_end: datetime,
+    ) -> str | None:
+        """六段聚合 + 渲染 + 发送 + 收尾——``run_once`` 派发进后台线程的那部分
+        （Issue #325，见类文档「重聚合为什么要挪出主线程」）。跑在调用方之外的
+        另一条线程上；本职责原本就只编排注入的协作者（数据源、发送器、水位、
+        审计），不碰任何线程局部或全局可变状态之外的东西，因此这里不需要额外的
+        线程安全考量——`self._completed_on`/`self._reason_streaks` 只在成功路径
+        末尾写一次，且同一时刻至多一个后台聚合在飞（`run_once` 的
+        `_pending_thread` 存活检查保证），不存在两条线程同时写的可能。"""
 
         active_counts, active_reason = self._fetch(
             "active_users",
@@ -376,6 +554,14 @@ class DailyReportDuty:
             )
             return None
 
+        # 发送成功后立刻持久化水位（Issue #325）：即使这一步与上面的发送之间
+        # 进程崩溃，也只是回到"水位没置位、下一轮按送达失败的既有语义重试"这个
+        # 早已验证过的路径（`V-通报-07`）——真正防止"那次重试变成第二条可见
+        # 消息"的是 `send_text` 的 `dedupe_key` 与飞书服务端去重，两者一起构成
+        # 纵深（见类文档「判重水位已持久化」的「不是字面同一个数据库事务」一节）。
+        # 写入本身幂等（`ON CONFLICT DO NOTHING`），重复调用不产生第二行。
+        self._watermark.mark_sent(chat_id=self._chat_id, report_date=today)
+
         self._audit.record(
             "daily_report.sent",
             report_date=today.isoformat(),
@@ -423,10 +609,12 @@ def _build_daily_report_duty(
 
     **唯一前置是管理群 chat_id**，形状照 `_build_roster_audit_duty`（`V-花名册-29` 的
     同一条纪律：缺项只报变量名、审计恰一条、其余职责照常运行）——但理由不同：花名册
-    那三个前置里有两个是外部 Base 坐标（要连去哪张表），本职责只读 Lingxi 自己的
-    ``task``/``task_delivery_event`` 两张表，两者都已经在 ``config.postgres_dsn`` 这个
-    进程级必需配置里，不需要任何额外的外部标识。它唯一服务的目的地就是管理群，没有
-    目的地也就没有必要跑四段查询。
+    那三个前置里有两个是外部 Base 坐标（要连去哪张表），本职责读 Lingxi 自己的
+    ``task``/``task_delivery_event`` 两张表、写自己的 ``daily_report_watermark`` 一张表
+    （Issue #325，见 :class:`~lingxi.adapters.postgres_daily_report_watermark.
+    PostgresDailyReportWatermark`），三者都已经在 ``config.postgres_dsn`` 这个进程级
+    必需配置里，不需要任何额外的外部标识。它唯一服务的目的地就是管理群，没有目的地
+    也就没有必要跑六段查询。
 
     ``on_send_outcome`` 复用与花名册日报**同一条**已验证的告警接线
     （``alerting_duty.send_outcome_callback()``，见 ``build_loop`` 调用点）：两个职责
@@ -448,9 +636,13 @@ def _build_daily_report_duty(
 
     from lingxi.adapters.feishu_group_message import DAILY_REPORT_UUID_PREFIX, FeishuGroupMessages
     from lingxi.adapters.postgres_daily_report import PostgresDailyReportSource
+    from lingxi.adapters.postgres_daily_report_watermark import PostgresDailyReportWatermark
 
     return DailyReportDuty(
         source=PostgresDailyReportSource(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        watermark=PostgresDailyReportWatermark(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
         sender=FeishuGroupMessages(
             base_url=config.feishu_base_url,
             app_id=config.feishu_app_id,
