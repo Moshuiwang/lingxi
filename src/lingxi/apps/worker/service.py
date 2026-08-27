@@ -13,11 +13,17 @@ from typing import Any, Callable, Mapping, Protocol
 
 from lingxi.adapters.postgres_conversation import ClaimedTask, PostgresTaskQueue, TerminalTask
 from lingxi.adapters.user_mcp_config import UserMcpConfigError, load_user_mcp_servers
-from lingxi.apps.worker.config import WorkerConfig
+from lingxi.apps.worker.config import QUERY_MCP_TOOL_PREFIX, WorkerConfig
 from lingxi.apps.worker.session_cleanup import delete_agent_session_files
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
-from lingxi.core.delivery.ports import TerminalKind
+from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
+from lingxi.core.execution.card_stream import (
+    PROGRESS_ACTION_COMPOSING,
+    PROGRESS_ACTION_PROCESSING,
+    PROGRESS_ACTION_QUERYING,
+    encode_progress_action,
+)
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
 from lingxi.core.year_grounding_guard import detect_year_grounding_suspect
 
@@ -36,6 +42,20 @@ logger = logging.getLogger(__name__)
 # 5 轮，在实测必需的 3 轮之上留出实现细节漂移的余量；一旦提前观测到
 # `is_set()` 就立即返回，不多空转。
 _STOP_SIGNAL_DRAIN_YIELDS = 5
+
+# 语义化等待进度（Issue #321 方向 C，产品负责人 2026-08-27 裁定，留痕 #321 评论
+# 5434086490）：长问数期间卡片显示阶段性文案（「正在第 N 次查询指标数据」/「正在
+# 整理与生成回答」），覆盖两次模型输出之间卡片完全静止的问题。两个阈值共享同一份
+# 「上次真正写库的进度更新是什么时候」状态（见 `_process_task` 里的
+# `_write_progress_if_due`），从两个不同的调用点检查：
+# - 事件驱动（工具调用开始、模型文本输出）最短间隔 `_PROGRESS_MIN_UPDATE_
+#   INTERVAL_SECONDS`——防止工具事件密集时把 outbox 写爆、把 CardKit 限流(500ms/
+#   话题)进一步逼近；
+# - 兜底计时驱动（`_monitor` 每轮调用一次）最长间隔 `_PROGRESS_FALLBACK_SECONDS`
+#   ——距上次更新超过这个阈值时强制推一次纯用时更新，即使没有任何新信号。
+# 两者是同一个节流函数在同一份状态上的两种阈值，不是两套独立机制。
+_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS = 5.0
+_PROGRESS_FALLBACK_SECONDS = 30.0
 
 
 class QueueListener(Protocol):
@@ -687,7 +707,6 @@ class WorkerService:
                 content=self._catalog.text("worker.stopped"),
             )
             return
-        monitor = asyncio.create_task(self._monitor(claimed.task_id, stop_event))
         started_at = self._monotonic()
         progress_count = 0
         # 提示词摘要在 try 之外初始化。字段口径（外部独立审查 2026-08-23 P2-4
@@ -701,17 +720,127 @@ class WorkerService:
         # 据此判断是否跳过。
         executor: WorkerTurnExecutor | None = None
 
-        def on_stream_event(event: Mapping[str, Any]) -> None:
-            nonlocal progress_count
-            if event.get("kind") == "assistant_message":
-                elapsed = int(max(0.0, self._monotonic() - started_at))
-                progress_count += 1
-                self._append_event(
+        # 语义化等待进度（Issue #321 方向 C）：三个信号源——模型文本输出
+        # （`on_stream_event` 的 `assistant_message`）、工具调用开始
+        # （`on_tool_call`，数据来自 `ToolGateway.set_tool_call_listener`，见
+        # `apps/worker/turn.py::run_turn`）、30 秒兜底计时（`_monitor` 的
+        # `on_stall_tick`）——共享这一份状态，只区分两类文案：问数查询工具
+        # （`QUERY_MCP_TOOL_PREFIX` 前缀）与其它/生成阶段。`last_progress_write_at`
+        # 以任务开始时刻为锚点：`_process_task` 开头的 "started" 事件已经让
+        # Gateway 建卡并展示过一次默认文案（`start()`），下面的节流窗口紧接着它
+        # 算起，不是从零开始。
+        last_progress_write_at = started_at
+        progress_action = PROGRESS_ACTION_PROCESSING
+        query_count = 0
+        # P2-4（Issue #328 opus 审查）：进度写库丢进线程池、不在调用方所在的同步
+        # 回调里等待（与 `system_prompt_file` 读取同一手法，见上方 `asyncio.
+        # to_thread` 用法）。`_last_progress_write_task` 把连续几次写入串成一条
+        # 链——每个写入任务先等前一个跑完才真正发起自己的 `to_thread` 调用，
+        # 保证同一任务的 progress 事件仍然严格按调用顺序落库（默认线程池允许
+        # 多个 worker 线程并发跑，若各写各的、不定序完成，`sequence` 与
+        # `query_count` 递增的先后关系就可能和真实调用顺序对不上）；
+        # `background_progress_writes` 额外持有全部在途任务的引用，防止在完成
+        # 前被垃圾回收——`asyncio` 只对运行中的任务保留弱引用。收口点见下方
+        # `finally` 块。
+        background_progress_writes: set[asyncio.Task[None]] = set()
+        last_progress_write_task: asyncio.Task[None] | None = None
+
+        def _write_progress_if_due(min_gap_seconds: float) -> None:
+            """任意两次真正写库的 progress 更新间隔 ≥`min_gap_seconds` 才放行
+            （节流保护，防频控；工具事件密集时合并成一次、只保留最新状态）。
+
+            写库本身丢进线程池执行、不在这里等待结果（与 `service.py` 别处的
+            `asyncio.to_thread` 同一手法）：这个函数被 SDK 流式回调
+            （`on_stream_event`/`on_tool_call`，同步、由 `turn.py` 的迭代循环
+            直接调用）与 30 秒兜底 tick（`on_stall_tick`，同步、由 `_monitor`
+            的轮询循环直接调用）共用，三处调用方都不是 `async def`、改不成
+            `await`。真实 psycopg 同步写最坏可能卡住数秒（锁等待/网络抖动），
+            不丢进线程池会直接拖住事件循环、连带心跳与停止处理跟着变慢。
+            fire-and-forget 是安全的：`_append_event` 内部已经把一切异常都吞成
+            一条结构化日志（失败不中断任务，见其文档），调用方不需要等待结果；
+            即使这次写入排在终态写入之后才真正落库，`append_delivery_event` 的
+            所有权校验（任务此时已不在 `running`）也会让它安全地什么都不做，
+            不产生游离事件。真正的收口点在 `_process_task` 的 `finally` 块：
+            那里会等齐本回合排出的全部后台写入，保证终态判定之前它们已落库、
+            不留下未完成的写入线程。
+
+            **节流状态本身（`last_progress_write_at`/`progress_count`/
+            `last_progress_write_task` 这三个 `nonlocal`）的读取与更新全程不
+            `await`**：这个函数从进入到把新写入任务排出去为止是一段连续的
+            同步代码，中途没有任何让出点。三个调用方（`on_stream_event`/
+            `on_tool_call`/`on_stall_tick`）虽然可能来自不同的异步任务
+            （`turn.py` 的流式循环 vs `_monitor`），但事件循环单线程运行、
+            协作式调度只在 `await` 处才可能切换——没有 `await` 就没有交叉，
+            因此这里不需要锁也不会有竞态。这条前提只对**这个函数自身**成立；
+            函数末尾创建的写入任务本身是异步的，不在这条前提覆盖范围内。
+            """
+
+            nonlocal last_progress_write_at, progress_count, last_progress_write_task
+            now = self._monotonic()
+            if now - last_progress_write_at < min_gap_seconds:
+                return
+            last_progress_write_at = now
+            progress_count += 1
+            content: str | None = None
+            if progress_action == PROGRESS_ACTION_QUERYING:
+                content = encode_progress_action(PROGRESS_ACTION_QUERYING, query_count=query_count)
+            elif progress_action == PROGRESS_ACTION_COMPOSING:
+                content = encode_progress_action(PROGRESS_ACTION_COMPOSING)
+            idempotency_key_suffix = f"progress:{progress_count}"
+            elapsed_seconds = int(max(0.0, now - started_at))
+            previous_write_task = last_progress_write_task
+
+            async def _write_after_previous() -> None:
+                if previous_write_task is not None:
+                    # 只是排队等前一次写完，不关心它是否成功——失败已经在
+                    # `_append_event` 内部记过日志，这里再等一次异常没有意义。
+                    await asyncio.gather(previous_write_task, return_exceptions=True)
+                await asyncio.to_thread(
+                    self._append_event,
                     claimed,
                     event_type="progress",
-                    idempotency_key_suffix=f"progress:{progress_count}",
-                    elapsed_seconds=elapsed,
+                    idempotency_key_suffix=idempotency_key_suffix,
+                    elapsed_seconds=elapsed_seconds,
+                    content=content,
                 )
+
+            # 不在这里用 `add_done_callback` 提前从 `background_progress_writes`
+            # 摘除已完成的任务：那样会让它的异常（即使实际上从不会发生，见上）
+            # 在被 `finally` 块的 `gather` 取走之前就被摘掉，触发 asyncio 的
+            # "exception was never retrieved" 噪音日志。这个集合按回合生命周期
+            # 存在，一次回合内的写入次数有限，留着已完成的任务不构成内存问题。
+            write_task = asyncio.create_task(_write_after_previous())
+            last_progress_write_task = write_task
+            background_progress_writes.add(write_task)
+
+        def on_stream_event(event: Mapping[str, Any]) -> None:
+            nonlocal progress_action
+            if event.get("kind") == "assistant_message":
+                # 模型在两次工具调用之间/收尾前输出的正文——归入"生成阶段"文案。
+                progress_action = PROGRESS_ACTION_COMPOSING
+                _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
+
+        def on_tool_call(tool_name: str) -> None:
+            nonlocal progress_action, query_count
+            # 只区分两类文案（产品负责人裁定）：问数查询工具单独计数、给出"第 N
+            # 次"文案；其它任何工具（含被拒绝的越界调用）一律并入"生成阶段"——
+            # 不回显工具名、参数或任何查询内容。
+            if isinstance(tool_name, str) and tool_name.startswith(QUERY_MCP_TOOL_PREFIX):
+                query_count += 1
+                progress_action = PROGRESS_ACTION_QUERYING
+            else:
+                progress_action = PROGRESS_ACTION_COMPOSING
+            _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
+
+        def on_stall_tick() -> None:
+            # `_monitor` 每个 `stop_poll_interval_seconds` 调用一次：距上次真正
+            # 写库的更新 ≥30 秒时强制推一次纯用时更新（沿用当前的 progress_
+            # action/query_count，即使没有任何新信号）。
+            _write_progress_if_due(_PROGRESS_FALLBACK_SECONDS)
+
+        monitor = asyncio.create_task(
+            self._monitor(claimed.task_id, stop_event, on_stall_tick=on_stall_tick)
+        )
 
         try:
             # Epic D 闸⑥红线：每个用户的问数必须用他自己的那份 MCP 配置，绝不
@@ -763,6 +892,7 @@ class WorkerService:
                 ),
                 stop_event=stop_event,
                 on_stream_event=on_stream_event,
+                on_tool_call=on_tool_call,
                 external_texts=self._config.external_texts,
             )
         except UserMcpConfigError as error:
@@ -786,6 +916,15 @@ class WorkerService:
                 await monitor
             except asyncio.CancelledError:
                 pass
+            # 等齐本回合排出的全部后台 progress 写入（P2-4）：`run_turn()` 与
+            # `_monitor` 都已经收尾，期间同步回调可能排出的写入任务此刻已经
+            # 全部创建完毕，只是不保证已经跑完。终态判定与 `_finish_terminal`
+            # 依赖"这一轮的进度写入已经落库或明确失败"这个前提（尤其是真库
+            # 测试按事件计数断言），因此在这里一次性等完，不在每次写入时单独
+            # 等——`return_exceptions=True` 只是双保险：`_append_event` 内部已
+            # 经吞掉了一切异常，这里不应该、也不允许再被它带走终态收口。
+            if background_progress_writes:
+                await asyncio.gather(*background_progress_writes, return_exceptions=True)
 
         # 这里刻意**不再**回读队列侧的 stop 标志（此前是
         # `stop_requested = stop_event.is_set() or self._queue.stop_requested(...)`）：
@@ -1072,6 +1211,13 @@ class WorkerService:
         """写入非终态事件；失败不中断任务执行——它是可恢复的运行信号，不是结果。"""
 
         try:
+            # 写入前自查（Issue #328 opus 审查 R1）：在这里、在这次调用真正携带
+            # 的 `content` 上再用一次 `CONTENT_BEARING_EVENT_TYPES`/
+            # `PROGRESS_CONTENT_MAX_LENGTH` 自查——不依赖 `self._queue` 具体实现
+            # 是否也做了同一层校验（真实 `PostgresTaskQueue` 做了，测试用的
+            # fake 队列未必做）。命中问题时抛出的 `ValueError` 与真实数据库写入
+            # 失败走同一条"失败不中断任务"的收口路径，不区分对待。
+            assert_content_allowed(DeliveryEventType(event_type), content)
             self._queue.append_delivery_event(
                 task_id=claimed.task_id,
                 worker_id=self._config.worker_id,
@@ -1084,7 +1230,7 @@ class WorkerService:
             import logging
 
             logging.getLogger(__name__).error(
-                "投递事件写入失败，任务继续执行 event_type=%s error=%s",
+                "worker.delivery_event_write_failed event_type=%s error=%s",
                 event_type,
                 type(error).__name__,
             )
@@ -1256,7 +1402,13 @@ class WorkerService:
                 "终态收口审计事件回调失败，任务收口继续 error=%s", type(error).__name__
             )
 
-    async def _monitor(self, task_id: str, stop_event: asyncio.Event) -> None:
+    async def _monitor(
+        self,
+        task_id: str,
+        stop_event: asyncio.Event,
+        *,
+        on_stall_tick: Callable[[], None] | None = None,
+    ) -> None:
         last_heartbeat = self._monotonic()
         while True:
             # 活性文件必须在这条循环里戳，不能只靠 `process_once()` 开头那一次
@@ -1286,6 +1438,14 @@ class WorkerService:
                 ):
                     return
                 last_heartbeat = now
+            if on_stall_tick is not None:
+                try:
+                    on_stall_tick()
+                except Exception as error:  # noqa: BLE001 - 兜底刷新失败不能带走任务职责
+                    logger.error(
+                        "语义化进度兜底刷新失败，任务职责继续运行 error=%s",
+                        type(error).__name__,
+                    )
             await self._sleep(self._config.stop_poll_interval_seconds)
 
     def _failure_content(self, code: object) -> tuple[str, RenderedContent]:

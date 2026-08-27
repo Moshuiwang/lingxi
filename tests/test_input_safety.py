@@ -552,6 +552,52 @@ class WorkerReportProjectionTests(unittest.TestCase):
         self.assertEqual(report["turn"]["result_delivery"], "not_confirmed")
         self.assertNotIn(INJECTION, json.dumps(report, ensure_ascii=False))
 
+    def test_report_projects_the_mcp_oversize_rewrite_count(self) -> None:
+        """P2-1（Issue #328 opus 审查）：钉住出口投影里的
+        `audit.oversize_rewrite_count`（#323）——`report.py` 模块注释说这是
+        worker 离开进程时唯一能观测「MCP 截断提示确实被改写过」的出口，此前
+        只有内部 `TurnAuditSummary` 属性本身被测过，没有用例证明它真的经
+        `build_report` 投影到了最终报告里（杀 M14：把这行投影删掉或改成恒 0，
+        本用例会变红）。"""
+
+        audit = TurnAudit()
+        gateway = ToolGateway(policy=ToolPolicy(allowed_tools=(READ_ONLY_TOOL,)), audit=audit)
+        audit.start_turn()
+        truncated = (
+            "Tool result exceeds maximum allowed tokens (25000). "
+            "Actual tokens: 551234. Output has been saved to /tmp/x/mcp-output.json. "
+            "Use offset and limit parameters to read specific portions of the file."
+        )
+        asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": READ_ONLY_TOOL,
+                    "tool_response": truncated,
+                    "tool_use_id": "toolu-1",
+                }
+            )
+        )
+        # 前置条件：确实触发了一次改写，不是测了一个从未发生过的分支。
+        self.assertEqual(audit.summary().oversize_rewrite_count, 1)
+
+        stream = TurnStreamRecorder(audit)
+        stream.handle({"kind": "assistant_message", "text": "结果"})
+        stream.handle({"kind": "result", "subtype": "success", "is_error": False})
+        audit.record_terminal_result()
+
+        report = build_report(
+            trace_id="01J0000000000000000TEST002",
+            question="查询日活",
+            allowed_tools=(READ_ONLY_TOOL,),
+            summary=audit.summary(),
+            stream=stream,
+            final_text=stream.final_text,
+            duration_seconds=0.1,
+        )
+
+        self.assertEqual(report["audit"]["oversize_rewrite_count"], 1)
+
 
 class WorkerTurnInputSafetyTests(unittest.TestCase):
     """从 worker 入口验证外部文本标记与最终正文约束同时接线。"""

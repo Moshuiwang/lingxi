@@ -97,6 +97,14 @@ class GatewayConfig:
     # 显式提供。
     tenant_domain: str | None = None
 
+    # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，
+    # 只用于精确判定"这条群消息是不是 @ 了机器人本身"。刻意不套 `LINGXI_GATEWAY_`
+    # 前缀——命名由裁定 #5 拍板，这是机器人这个身份本身的事实，不是 gateway 进程的
+    # 私有配置项，与 `innertest_roster_open_ids` 不套前缀同一条纪律。**未配置＝这
+    # 条功能整体关闭＝维持此前"群聊完全静默"的现状（失败关闭）**；部署时把它填成
+    # 什么值（经 bot info 接口取一次落 env）不在本次改动范围内。
+    bot_open_id: str | None = None
+
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(f"{ENV_PREFIX}{name}")
@@ -215,6 +223,23 @@ def _tenant_domain(env: Mapping[str, str]) -> str | None:
     except ValueError as error:
         raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
 
+def _bot_open_id(env: Mapping[str, str]) -> str | None:
+    """机器人自身 open_id（Issue #318 群聊@机器人固定引导）。
+
+    刻意直接读 ``env.get("LINGXI_BOT_OPEN_ID")``，不经过本文件 ``_text()`` 的
+    ``LINGXI_GATEWAY_`` 前缀包装——理由见 :class:`GatewayConfig` 该字段的文档。
+    未配置或空白都当作"未配置"（功能整体关闭），不校验取值形状：读到的值只用于
+    跟事件体里的 mentions 做字符串精确比较，格式不对顶多是永远比对不上、不产生
+    任何额外风险，因此不必像 `LINGXI_INNERTEST_ROSTER_OPEN_IDS` 那样失败关闭拒绝
+    启动。
+    """
+
+    raw = env.get("LINGXI_BOT_OPEN_ID")
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped or None
+
 
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
@@ -269,6 +294,8 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         card_failure_injection=_card_failure_injection(env),
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
         tenant_domain=_tenant_domain(env),
+
+        bot_open_id=_bot_open_id(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

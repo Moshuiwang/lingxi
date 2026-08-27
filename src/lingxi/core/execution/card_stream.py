@@ -42,6 +42,57 @@ from typing import Callable, Protocol
 from lingxi.config.content import ContentCatalog, RenderedCard, RenderedContent, default_content_catalog
 
 
+# 语义化进度动作码（Issue #321 方向 C，产品负责人 2026-08-27 裁定）：
+# ``apps/worker/service.py`` 编码写入 ``task_delivery_event.content``，
+# ``apps/gateway/delivery.py`` 的消费循环解码后交给 ``CardStream.update()``。
+# 两侧共享同一份常量，不各写一份字符串字面量、悄悄漂移。
+PROGRESS_ACTION_PROCESSING = "processing"
+PROGRESS_ACTION_QUERYING = "querying"
+PROGRESS_ACTION_COMPOSING = "composing"
+PROGRESS_ACTION_COMPLETED = "completed"
+
+
+def encode_progress_action(action: str, *, query_count: int | None = None) -> str:
+    """把语义化进度状态编码进一条 progress 事件的 ``content`` 字段（worker 侧）。
+
+    只认 ``PROGRESS_ACTION_QUERYING``（必须带一个 ``>=1`` 的 ``query_count``，
+    渲染成"正在第 N 次查询指标数据"）与 ``PROGRESS_ACTION_COMPOSING``（渲染成
+    "正在整理与生成回答"）。``PROGRESS_ACTION_PROCESSING``——尚未发生任何可
+    分类信号时的默认状态——不经过这个函数：调用方直接传 ``content=None``，
+    没有语义需要编码。**不回显工具名、参数或任何查询内容**（Issue #321 方向 C
+    的产品红线）：编码后的字符串只可能是这两种固定形状之一，永远不含调用方
+    传入的工具名或输入正文。
+    """
+
+    if action == PROGRESS_ACTION_QUERYING:
+        if query_count is None or query_count < 1:
+            raise ValueError("querying 动作必须带一个 >=1 的 query_count")
+        return f"{PROGRESS_ACTION_QUERYING}:{query_count}"
+    if action == PROGRESS_ACTION_COMPOSING:
+        return PROGRESS_ACTION_COMPOSING
+    raise ValueError(f"未知的进度动作：{action!r}")
+
+
+def decode_progress_action(content: str | None) -> tuple[str, int | None]:
+    """反解析（Gateway 消费侧）。
+
+    任何无法识别的形状——``None``（进度事件从未携带语义、或来自旧版 worker）、
+    格式不对的字符串、越界的计数——一律退回 ``(PROGRESS_ACTION_PROCESSING,
+    None)``：这只是一张状态卡片要选哪句文案，宁可显示默认文案，也不能让一条
+    脏数据炸掉整条投递消费循环。
+    """
+
+    if content == PROGRESS_ACTION_COMPOSING:
+        return PROGRESS_ACTION_COMPOSING, None
+    if isinstance(content, str) and content.startswith(f"{PROGRESS_ACTION_QUERYING}:"):
+        _, _, raw_count = content.partition(":")
+        if raw_count.isdigit():
+            count = int(raw_count)
+            if count >= 1:
+                return PROGRESS_ACTION_QUERYING, count
+    return PROGRESS_ACTION_PROCESSING, None
+
+
 @dataclass(frozen=True)
 class CardCreated:
     """建卡并把它作为消息发出后的结果。
@@ -209,7 +260,7 @@ class CardStream:
 
         if self._card_id is not None or self._fallback_needed:
             return
-        card = self._status_card(action="processing", elapsed_seconds=0)
+        card = self._status_card(action=PROGRESS_ACTION_PROCESSING, elapsed_seconds=0)
         try:
             self._before_external()
             created = self._transport.create(
@@ -232,13 +283,21 @@ class CardStream:
             # 不能假装明确失败——原样抛给调用方，不降级、不清预留位、不重试。
             raise
 
-    def update(self, *, elapsed_seconds: int, action: str = "processing") -> None:
+    def update(
+        self,
+        *,
+        elapsed_seconds: int,
+        action: str = PROGRESS_ACTION_PROCESSING,
+        query_count: int | None = None,
+    ) -> None:
         if self._card_id is None or self._fallback_needed:
             return
         now = self._monotonic()
         if not self._rate_limiter.allow(topic=self._topic, now=now):
             return
-        card = self._status_card(action=action, elapsed_seconds=max(0, elapsed_seconds))
+        card = self._status_card(
+            action=action, elapsed_seconds=max(0, elapsed_seconds), query_count=query_count
+        )
         self._sequence += 1
         try:
             self._before_external()
@@ -355,9 +414,27 @@ class CardStream:
         self._notify_send("message_final", True)
         return message_id
 
-    def _status_card(self, *, action: str, elapsed_seconds: int) -> RenderedCard:
-        action_key = "worker.action.completed" if action == "completed" else "worker.action.processing"
-        action_text = self._catalog.text(action_key).text
+    def _status_card(
+        self, *, action: str, elapsed_seconds: int, query_count: int | None = None
+    ) -> RenderedCard:
+        """按语义化进度动作码选文案（Issue #321 方向 C）。
+
+        ``query_count`` 缺失（``None``）时 ``querying`` 退化为默认 ``processing``
+        文案而不是抛错或渲染出一句缺占位符的残句——这只可能发生在
+        ``decode_progress_action`` 解析到脏数据、或调用方传参不一致时，卡片
+        渲染必须失败关闭到一个安全默认值，不能把内部状态不一致带给用户。
+        """
+
+        if action == PROGRESS_ACTION_COMPLETED:
+            action_text = self._catalog.text("worker.action.completed").text
+        elif action == PROGRESS_ACTION_QUERYING and query_count is not None:
+            action_text = self._catalog.text(
+                "worker.action.querying_metrics", count=query_count
+            ).text
+        elif action == PROGRESS_ACTION_COMPOSING:
+            action_text = self._catalog.text("worker.action.composing").text
+        else:
+            action_text = self._catalog.text("worker.action.processing").text
         status = self._catalog.text(
             "worker.status", action=action_text, elapsed_seconds=elapsed_seconds
         ).text

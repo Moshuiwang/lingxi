@@ -394,15 +394,23 @@ def _code_without_docstrings(source: str) -> str:
     return ast.unparse(tree)
 
 
-def _payload(chat_type: str | None = "p2p", message_type: str = "text") -> dict:
+def _payload(
+    chat_type: str | None = "p2p",
+    message_type: str = "text",
+    *,
+    mentions: list[dict] | None = None,
+    chat_id: str = "oc_1",
+) -> dict:
     message = {
         "message_id": "om_1",
-        "chat_id": "oc_1",
+        "chat_id": chat_id,
         "message_type": message_type,
         "content": '{"text": "你好"}',
     }
     if chat_type is not None:
         message["chat_type"] = chat_type
+    if mentions is not None:
+        message["mentions"] = mentions
     return {
         "header": {"event_id": "evt_1", "event_type": "im.message.receive_v1"},
         "event": {"sender": {"sender_id": {"open_id": "ou_1"}}, "message": message},
@@ -427,6 +435,24 @@ class ChatBoundaryTests(unittest.TestCase):
         with self.assertRaises(NonPrivateChatError):
             parse_message_event(_payload(None), trace_id="t")
 
+    def test_group_chat_error_carries_mentions_chat_and_message_ids(self) -> None:
+        """Issue #318：这三个字段只服务「要不要回一句固定引导」的判定。"""
+
+        mentions = [{"id": {"open_id": "ou_bot"}}, {"id": {"open_id": "ou_other"}}]
+        with self.assertRaises(NonPrivateChatError) as raised:
+            parse_message_event(_payload("group", mentions=mentions), trace_id="t")
+        error = raised.exception
+        self.assertEqual(error.mentioned_open_ids, ("ou_bot", "ou_other"))
+        self.assertEqual(error.chat_id, "oc_1")
+        self.assertEqual(error.message_id, "om_1")
+
+    def test_group_chat_error_defaults_to_no_mentions_when_absent(self) -> None:
+        """没有 mentions 段（普通群消息、未 @ 任何人）取空元组，不是抛错。"""
+
+        with self.assertRaises(NonPrivateChatError) as raised:
+            parse_message_event(_payload("group"), trace_id="t")
+        self.assertEqual(raised.exception.mentioned_open_ids, ())
+
     def test_handler_neither_reacts_nor_replies_to_a_group_message(self) -> None:
         from lingxi.apps.gateway import make_event_handler
 
@@ -445,6 +471,198 @@ class ChatBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(log.count("reaction.add"), 0, "群里不得加表情")
         self.assertEqual(log.count("reply.send_text"), 0, "群里不得回复")
+
+
+class _ExplodingPipeline:
+    """群聊@机器人固定引导测试专用：管线一旦被调用就说明越界判定失效。"""
+
+    def handle_message(self, message: object) -> None:  # pragma: no cover
+        raise AssertionError("群聊消息不得进入管线，不入队不建档")
+
+
+class GroupMentionHintTests(unittest.TestCase):
+    """群聊 @ 机器人固定引导（Issue #318，#328 v1.0 裁定 #5 排入实施）。
+
+    可观察完成标准（对齐 Issue #318）：群聊 @ 机器人 → 恰一条固定引导文案 +
+    审计；群聊普通消息/@别人仍完全静默（否定用例，含变异锚点）；未配置机器人
+    open_id 时功能整体关闭；同一个群一小时内最多发一条。私聊路径的哨兵覆盖见
+    ``ChatBoundaryTests``/其余既有测试类，本类不重复。
+    """
+
+    BOT_OPEN_ID = "ou_bot_open_id"
+
+    def _handler(self, *, bot_open_id: str | None, log: CallLog, clock=None, replies=None):
+        from lingxi.apps.gateway import (
+            GroupMentionHintResponder,
+            build_group_mention_hint_throttle,
+            make_event_handler,
+        )
+
+        throttle = build_group_mention_hint_throttle(clock=clock or (lambda: 0.0))
+        hint = GroupMentionHintResponder(
+            bot_open_id=bot_open_id,
+            replies=replies if replies is not None else FakeReplies(log),
+            audit=FakeAudit(log),
+            throttle=throttle,
+        )
+        return make_event_handler(
+            _ExplodingPipeline(), audit=FakeAudit(log), group_mention_hint=hint
+        )
+
+    def test_mentioning_the_bot_itself_gets_exactly_one_fixed_hint_and_audit(self) -> None:
+        log = CallLog()
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log)
+
+        handler(_payload("group", mentions=[{"id": {"open_id": self.BOT_OPEN_ID}}]))
+
+        self.assertEqual(log.count("reply.send_text"), 1, "恰一条固定引导")
+        sent = log.fields("reply.send_text")[0]
+        self.assertEqual(sent["chat_id"], "oc_1")
+        self.assertEqual(sent["reply_to_message_id"], "om_1")
+        expected_text = default_content_catalog().text("gateway.group_mention_hint").text
+        self.assertEqual(sent["text"], expected_text)
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 1)
+        self.assertEqual(log.count("audit.event.rejected_non_private_chat"), 1)
+        self.assertEqual(log.count("reaction.add"), 0, "群里不得加表情")
+
+    def test_mentioning_someone_else_stays_silent(self) -> None:
+        """变异锚点：把 GroupMentionHintResponder 的精确匹配改成恒 True，本例变红。"""
+
+        log = CallLog()
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log)
+
+        handler(_payload("group", mentions=[{"id": {"open_id": "ou_someone_else"}}]))
+
+        self.assertEqual(log.count("reply.send_text"), 0)
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0)
+
+    def test_a_plain_group_message_without_any_mention_stays_silent(self) -> None:
+        log = CallLog()
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log)
+
+        handler(_payload("group"))
+
+        self.assertEqual(log.count("reply.send_text"), 0)
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0)
+
+    def test_without_a_configured_bot_open_id_the_feature_is_entirely_off(self) -> None:
+        log = CallLog()
+        handler = self._handler(bot_open_id=None, log=log)
+
+        handler(_payload("group", mentions=[{"id": {"open_id": self.BOT_OPEN_ID}}]))
+
+        self.assertEqual(log.count("reply.send_text"), 0)
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0)
+
+    def test_without_the_group_mention_hint_wiring_the_feature_is_entirely_off(self) -> None:
+        """``group_mention_hint=None``（既有 9 处用例的默认调用形状）逐字节不变。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        log = CallLog()
+        handler = make_event_handler(_ExplodingPipeline(), audit=FakeAudit(log))
+
+        handler(_payload("group", mentions=[{"id": {"open_id": self.BOT_OPEN_ID}}]))
+
+        self.assertEqual(log.count("reply.send_text"), 0)
+        self.assertEqual(log.count("audit.event.rejected_non_private_chat"), 1)
+
+    def test_a_private_chat_message_never_triggers_the_hint_judgement(self) -> None:
+        """哨兵：私聊路径根本不经过 group_mention_hint，逐字节不变。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        log = CallLog()
+
+        class _ExplodingHint:
+            def maybe_respond(self, error: object) -> None:  # pragma: no cover
+                raise AssertionError("私聊消息不得触碰群聊 @ 引导判定")
+
+        class _RecordingPipeline:
+            def __init__(self) -> None:
+                self.handled: list[object] = []
+
+            def handle_message(self, message: object) -> None:
+                self.handled.append(message)
+
+        pipeline = _RecordingPipeline()
+        handler = make_event_handler(
+            pipeline, audit=FakeAudit(log), group_mention_hint=_ExplodingHint()
+        )
+
+        handler(_payload("p2p"))
+
+        self.assertEqual(len(pipeline.handled), 1)
+        self.assertEqual(log.count("reply.send_text"), 0)
+
+    def test_a_second_mention_within_the_hour_is_throttled_to_silence(self) -> None:
+        log = CallLog()
+        clock = [0.0]
+        handler = self._handler(
+            bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: clock[0]
+        )
+        mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
+
+        handler(_payload("group", mentions=mentions))
+        clock[0] += 60.0  # 一分钟后同一个群再次 @
+        handler(_payload("group", mentions=mentions))
+
+        self.assertEqual(log.count("reply.send_text"), 1, "一小时内第二次 @ 应保持零输出")
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 1)
+
+        clock[0] += 3600.0  # 节流窗口之后，第三次 @ 应该重新放行
+        handler(_payload("group", mentions=mentions))
+        self.assertEqual(log.count("reply.send_text"), 2)
+
+    def test_a_send_failure_still_acks_and_does_not_consume_the_throttle_slot(self) -> None:
+        """P1-1（Issue #328 opus 审查真库实测）：`send_text` 抛出未预期异常时，
+        此前节流位在发送**之前**已经记上、异常又会原样抛穿 `make_event_handler`
+        ——飞书按事件处理失败重投，重投的这条又被同一节流窗口拦下，表现为
+        「@ 了一次，什么都没发生，且一小时内都不会再试」。修复后：事件必须
+        正常 ack（不抛出）、留一条 `event.group_mention_hint_failed` 审计（只含
+        异常类名）、且这次失败不消耗节流额度——同一个群下一条 @ 仍能正常收到
+        引导。"""
+
+        log = CallLog()
+        clock = [0.0]
+        failing_replies = FakeReplies(log, fail_with=RuntimeError("模拟发送失败"))
+        handler = self._handler(
+            bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: clock[0], replies=failing_replies
+        )
+        mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
+
+        result = handler(_payload("group", mentions=mentions))
+
+        self.assertIsNone(result, "失败必须被吞掉，事件正常 ack、不向上抛异常")
+        self.assertEqual(log.count("reply.send_text"), 1, "确实尝试过发送")
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0, "发送没有成功")
+        self.assertEqual(log.count("audit.event.group_mention_hint_failed"), 1)
+        self.assertEqual(
+            log.fields("audit.event.group_mention_hint_failed")[0]["error"], "RuntimeError",
+            "只留异常类名，不带正文",
+        )
+
+        # 恢复正常发送：下一条同一个群的 @ 仍然可以成功——失败的那次没有把
+        # 节流额度提前消耗掉。
+        failing_replies.fail_with = None
+        handler(_payload("group", mentions=mentions))
+        self.assertEqual(log.count("reply.send_text"), 2, "失败的发送不消耗节流额度，下次可再发")
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 1)
+
+    def test_different_chat_ids_do_not_throttle_each_other(self) -> None:
+        """P3-6：节流字典按 `chat_id` 分键，不同群各自独立计时——同一时刻两个
+        不同的群各自 @ 一次都应该正常收到引导，不应该被彼此的节流窗口误伤。"""
+
+        log = CallLog()
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: 0.0)
+        mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
+
+        handler(_payload("group", mentions=mentions, chat_id="oc_a"))
+        handler(_payload("group", mentions=mentions, chat_id="oc_b"))
+
+        self.assertEqual(log.count("reply.send_text"), 2, "两个不同的群各自恰一条引导")
+        sent = log.fields("reply.send_text")
+        self.assertEqual({call["chat_id"] for call in sent}, {"oc_a", "oc_b"})
 
 
 class UnsupportedMessageTypeTests(PipelineTestCase):

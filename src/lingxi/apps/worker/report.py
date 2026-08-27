@@ -173,6 +173,11 @@ def build_report(
             "denied_count": len(summary.denied_calls),
             "failed_count": len(summary.failed_calls),
             "ungated_count": len(summary.ungated_calls),
+            # #323：MCP 结果被截断提示改写为重查引导的次数。放在这里而不是只
+            # 留在进程内的 TurnAuditSummary 上，是因为本函数的输出就是 worker
+            # 离开进程时唯一的出口（见文件头）——批终 stage 冒烟要观测「改写确实
+            # 发生过」，只能靠这份 JSON 里能查到，不能靠内部对象属性。
+            "oversize_rewrite_count": summary.oversize_rewrite_count,
             # 工具调用本身的分类结论（不受出口安全策略影响）；用户实际拿到了
             # 什么必须看 turn.user_result，两者一旦分岔以后者为准（见文件头）。
             "tool_call_result": summary.user_result.value,

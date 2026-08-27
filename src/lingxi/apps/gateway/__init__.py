@@ -40,9 +40,11 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.apps.liveness import touch_liveness
+from lingxi.config.content import default_content_catalog
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
+from lingxi.core.identity.identifiers import redact_identifier
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
@@ -192,11 +194,16 @@ class _LoggingAudit:
     （非文本消息被判不支持、不建任务）——r19 首轮误判正是这一类。名单只收
     **用户本应得到回应却什么都没发生**的动作。据此：未开通、已停用这类有明确
     用户回复的拒绝分支不在此列；``event.rejected_non_private_chat`` 也不在此列，
-    但理由不同（PR #186 补审 P3-6）——群聊拒绝**不加表情、不回复、不入队**
-    （见上方 ``NonPrivateChatError`` 分支），这份静默是刻意的产品边界：机器人
-    不在群里暴露任何工作痕迹。既然"什么都不发生"就是这条分支承诺的结果，它就
-    不是诊断缺口，维持 ``INFO``。停机期间的 ``reply.skipped_while_stopping``
-    属正常停机路径，同样不在此列。
+    但理由不同（PR #186 补审 P3-6，Issue #318 修订边界描述）——**群聊边界从
+    "完全静默"收窄为"默认静默，精确 @ 机器人本身时回一句固定引导"**：绝大多数
+    群聊消息（未 @、@别人、未配置机器人 open_id、或同群刚发过还在节流窗口内）
+    仍然不加表情、不回复、不入队，机器人不在群里暴露除这一句固定引导之外的任何
+    工作痕迹；只有精确 @ 到机器人本身且未被节流的那一条消息，才会额外触发一次
+    ``event.group_mention_hint_sent``（见下方 ``GroupMentionHintResponder``）。
+    后者本身带用户可见回复，不是"什么都没发生"，因此也不进
+    ``_EXTRA_WARNING_ACTIONS``。``event.rejected_non_private_chat`` 这条审计在
+    两种情况下都照常记录，维持 ``INFO``。停机期间的 ``reply.skipped_while_
+    stopping`` 属正常停机路径，同样不在此列。
     """
 
     _EXTRA_WARNING_ACTIONS = frozenset({"message.unsupported_type"})
@@ -234,12 +241,167 @@ class _RecordingOnboarding:
         return OnboardingResult(state=OnboardingState.STARTED)
 
 
+#: 内容目录里群聊@机器人固定引导的键（Issue #318）。
+GROUP_MENTION_HINT_CONTENT_KEY = "gateway.group_mention_hint"
+#: 同一个群一小时内最多发一条固定引导（Issue #318 待决点 1：防刷屏）。
+GROUP_MENTION_HINT_THROTTLE_SECONDS = 3600.0
+
+
+class GroupMentionHintThrottle:
+    """按 ``chat_id`` 节流的进程内存节流器（Issue #318）。
+
+    **已知限制，登记于此**：状态只活在这个 Python 进程的内存里，不落库、不加
+    迁移——进程重启（部署、崩溃重启）会让节流窗口清零，重启后紧接着的一次 @
+    有可能在"上一次窗口内"又放行一条。代价止步于"同一个群多收到一条不涉及任何
+    数据或权限的固定文案"，与本卡「进程内存节流、不建表」的既定取舍一致，不是
+    需要另开工作项修的缺陷。
+
+    **判定（``allow``）与记账（``mark_sent``）拆成两个方法**（Issue #328 opus
+    审查 P1-1）：此前是一次调用就顺带把节流位记上，`GroupMentionHintResponder`
+    因此必须在**发送之前**就消耗掉这次的节流额度——`send_text` 抛出未预期异常
+    时，额度已经烧掉但消息其实没发出去，且异常会原样向上抛出 `make_event_
+    handler`，飞书按未处理事件重投，重投的这条又被同一节流窗口拦下，形成
+    "点了却什么都没发生、之后一小时内都不会再试"的静默故障。现在只有真正调用
+    `send_text` **成功之后**才调用 `mark_sent`，失败的发送不消耗额度、下一次
+    到来的同一群消息仍然可以重试。
+
+    ``last_sent_at`` 只增不减：本类没有清理路径，键域随「被 @ 过至少一次的
+    群」数量增长，量级与真实群聊数同阶，不是无界增长（长期运行如需回收可以
+    另开加固项，这里只登记现状，不是缺陷）。
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = GROUP_MENTION_HINT_THROTTLE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._last_sent_at: dict[str, float] = {}
+
+    def allow(self, chat_id: str) -> bool:
+        """只读判定，不产生任何副作用——多次调用（例如失败重试）互不影响。"""
+
+        last = self._last_sent_at.get(chat_id)
+        if last is None:
+            return True
+        return self._clock() - last >= self._window_seconds
+
+    def mark_sent(self, chat_id: str) -> None:
+        """真正发送成功之后才调用，记下这次节流窗口的起点。"""
+
+        self._last_sent_at[chat_id] = self._clock()
+
+
+def build_group_mention_hint_throttle(
+    *,
+    window_seconds: float = GROUP_MENTION_HINT_THROTTLE_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> GroupMentionHintThrottle:
+    return GroupMentionHintThrottle(window_seconds=window_seconds, clock=clock)
+
+
+class GroupMentionHintResponder:
+    """群聊 @ 机器人固定引导（Issue #318）：要不要发这条提示的唯一判定入口。
+
+    三个条件同时成立才发送，任一不成立都维持此前"群聊完全静默"的行为：
+
+    1. ``bot_open_id`` 已配置——未配置＝功能整体关闭，失败关闭（合同边界见
+       ``GatewayConfig.bot_open_id`` 文档）；
+    2. 精确命中：机器人自身 open_id 出现在这条消息的 ``mentioned_open_ids`` 里
+       ——@ 别的同事、或者压根没有任何 @，都不算；
+    3. 同一个 ``chat_id`` 没有被节流器拦下。
+
+    发送用的是 gateway 既有的出站回复通道（与私聊问数共用同一个
+    ``Replies.send_text`` 实现，见 ``build_supervisor``），不新开一条出站路径。
+    ``chat_id`` 只进模块 logger 的脱敏日志行（``redact_identifier``，全仓库唯一
+    允许缩短飞书标识的地方），不进结构化审计字段——`V-花名册-34` 与
+    ``tests/test_roster_audit_duty.py::RedactedIdentifierUsageTest`` 要求它的
+    返回值只能作日志参数使用（不可反查也不可比较），与
+    ``credential_rotation.py``/``admin_bootstrap/__init__.py`` 等既有先例同一
+    姿态；结构化审计（``event.group_mention_hint_sent``）只带内容目录的键/
+    版本，不带任何身份或群标识，与 ``onboarding_runner.py``「审计不带 open_id
+    （含脱敏形式）」同一条纪律，也不记消息正文——与 ``_LoggingAudit``「审计不记
+    用户正文」的既有纪律一致。
+
+    **``maybe_respond`` 整体是尽力而为、失败关闭的旁路**（Issue #328 opus 审查
+    P1-1）：`make_event_handler` 在记完 `event.rejected_non_private_chat` 之后
+    直接调用它、不包一层 try/except（见调用点文档），此前 `send_text` 抛出的
+    任何未预期异常都会原样向上抛穿 `make_event_handler`，被飞书判定为事件处理
+    失败而重投——但节流位在发送**之前**已经记上（见 `GroupMentionHintThrottle`
+    文档），重投的这条又被同一节流窗口拦下，用户侧表现为"@了一次，什么都没
+    发生，之后一小时都不会再试"。现在整个判定与发送过程包在一个 try/except
+    里：任何异常都记一条 `event.group_mention_hint_failed`（只含异常类名，不含
+    正文或标识）然后正常返回——事件正常 ack，不阻塞、不重投、不带崩本次群聊
+    越界判定的其余职责；节流额度只在 `send_text` 真正成功之后才消耗。
+    """
+
+    def __init__(
+        self,
+        *,
+        bot_open_id: str | None,
+        replies: Any,
+        audit: Any,
+        throttle: GroupMentionHintThrottle,
+    ) -> None:
+        self._bot_open_id = bot_open_id
+        self._replies = replies
+        self._audit = audit
+        self._throttle = throttle
+
+    def maybe_respond(self, error: "NonPrivateChatError") -> None:
+        try:
+            self._maybe_respond(error)
+        except Exception as failure:  # noqa: BLE001 - 引导是尽力而为的旁路，
+            # 失败不得带走事件 ack、不得让飞书判定为处理失败而重投（见类文档）。
+            logger.error(
+                "gateway.group_mention_hint.failed chat_id=%s error=%s",
+                redact_identifier(error.chat_id) if error.chat_id else None,
+                type(failure).__name__,
+            )
+            self._audit.record("event.group_mention_hint_failed", error=type(failure).__name__)
+
+    def _maybe_respond(self, error: "NonPrivateChatError") -> None:
+        if not self._bot_open_id:
+            return
+        if self._bot_open_id not in error.mentioned_open_ids:
+            return
+        if not error.chat_id or not error.message_id:
+            # 结构异常导致读不出 chat_id/message_id：没有地方可回，维持静默
+            # （与本类其余分支同一条"读不出就当没有"的纪律）。
+            return
+        if not self._throttle.allow(error.chat_id):
+            return
+
+        content = default_content_catalog().text(GROUP_MENTION_HINT_CONTENT_KEY)
+        self._replies.send_text(
+            chat_id=error.chat_id,
+            thread_id=None,
+            reply_to_message_id=error.message_id,
+            text=content.text,
+        )
+        # 只有发送真正成功才消耗节流额度——见 `GroupMentionHintThrottle` 文档。
+        self._throttle.mark_sent(error.chat_id)
+        # `chat_id` 只写进这一行脱敏日志，不进下面的结构化审计字段——见本类文档
+        # 「`V-花名册-34`」段落。
+        logger.info(
+            "gateway.group_mention_hint.sent chat_id=%s", redact_identifier(error.chat_id)
+        )
+        self._audit.record(
+            "event.group_mention_hint_sent",
+            content_key=content.key,
+            content_version=content.version,
+        )
+
+
 def make_event_handler(
     pipeline: EventPipeline,
     *,
     audit: Any,
     on_parse_error: Callable[[str], None] | None = None,
     card_callback_handler: Any = None,
+    group_mention_hint: Any = None,
 ) -> Callable[[dict], dict | None]:
     """把原始事件体接到管线上。
 
@@ -249,6 +411,13 @@ def make_event_handler(
     只测试消息路径的既有用例）时行为与本参数加入之前逐字节一致：仍然只记
     ``event.ignored`` 并返回，不致长连接崩溃（`V-接入-12`）。其余类型
     （``im.chat.member.bot.deleted_v1``）本批仍不处理，同样只记 ``event.ignored``。
+
+    ``group_mention_hint``（Issue #318，可选）：群聊越界分支（见下方
+    ``NonPrivateChatError``）记完 ``event.rejected_non_private_chat`` 审计之后，
+    如果传入了这个参数就调用它的 ``maybe_respond(error)``——要不要真的发那句
+    固定引导由它自己判定（见 ``GroupMentionHintResponder``），本函数不做二次
+    判断。未传入（``None``，例如尚未完成 gateway 接线的中间态，或只测试既有拒绝
+    行为的用例）时行为与本参数加入之前逐字节一致。
 
     **卡片回调分支的返回值必须原样透传（Issue #96 卡片回调应答修复）**：
     ``card_callback_handler.handle(...)`` 返回的是要交给飞书的应答字典（见
@@ -289,10 +458,14 @@ def make_event_handler(
         try:
             message = parse_message_event(payload)
         except NonPrivateChatError as error:
-            # 群聊越界：合同「问数与多轮对话」只适用于飞书私聊入口。在这里就返回，
-            # 因此**不加表情、不回复、不入队**——加表情本身也是一个用户可见动作，
-            # 在群里给一条消息加表情等于宣告「我在这个群里工作」。
+            # 群聊越界：合同「问数与多轮对话」只适用于飞书私聊入口。默认分支
+            # 仍然**不加表情、不入队**——加表情本身也是一个用户可见动作，在群里
+            # 给一条消息加表情等于宣告「我在这个群里工作」。是否额外回一句固定
+            # 引导（Issue #318）交给 group_mention_hint 自己判定，它的失败关闭
+            # 语义见 GroupMentionHintResponder。
             audit.record("event.rejected_non_private_chat", chat_type=error.chat_type)
+            if group_mention_hint is not None:
+                group_mention_hint.maybe_respond(error)
             return
         except EventParseError as error:
             # 读不懂的事件体记审计后继续收下一条，不抛给 supervisor 当成连接故障。
@@ -470,10 +643,22 @@ def build_supervisor(
         return is_open_id_innertest_allowed(open_id, config.innertest_roster_open_ids)
 
     # ``client``/``outbound_timeout`` 已在函数前部构造（供确认卡片传输复用，见上）。
+    # 群聊@机器人固定引导（Issue #318）复用同一个 Replies 实现/同一个 SDK 客户端，
+    # 不为这条边界分支单独开一条出站路径。无条件装配——与本文件其余「安全落点
+    # 在数据判定，不在装配开关」同一姿态（见上方管理命令面同类注释）：未配置
+    # `bot_open_id` 时 `GroupMentionHintResponder.maybe_respond` 对任何消息都
+    # 直接返回，装配它本身不产生任何外部副作用或可观察行为变化。
+    replies = LarkReplies(client)
+    group_mention_hint = GroupMentionHintResponder(
+        bot_open_id=config.bot_open_id,
+        replies=replies,
+        audit=audit,
+        throttle=build_group_mention_hint_throttle(),
+    )
     pipeline = EventPipeline(
         store=PostgresGatewayStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
         reactions=LarkReactions(client),
-        replies=LarkReplies(client),
+        replies=replies,
         audit=audit,
         onboarding=effective_onboarding,
         admin_router=admin_router,
@@ -500,7 +685,10 @@ def build_supervisor(
             handshake_timeout_seconds=config.shutdown_timeout_seconds,
         ),
         handle_event=make_event_handler(
-            pipeline, audit=audit, card_callback_handler=card_callback_handler
+            pipeline,
+            audit=audit,
+            card_callback_handler=card_callback_handler,
+            group_mention_hint=group_mention_hint,
         ),
         backoff=BackoffPolicy(
             base_seconds=config.reconnect_base_seconds,

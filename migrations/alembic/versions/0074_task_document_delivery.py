@@ -99,7 +99,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0074_task_document_delivery"
-down_revision: str | None = "0071_daily_report_watermark"
+down_revision: str | None = "0075_progress_event_content"
 branch_labels: str | None = None
 depends_on: str | None = None
 

@@ -122,21 +122,39 @@ class FakeWatermark:
     产生一个全新的进程（因此是全新的 `_completed_on` 内存状态），但读到的是
     同一个数据库；这里用「共享同一个 FakeWatermark、构造第二个 DailyReportDuty
     实例」还原这个形状，不需要真的启动第二个进程。
+
+    ``raise_on_already_sent``/``raise_on_mark_sent``（#325 尾账，opus 批次 5
+    审查留痕）：注入一次性异常，模拟这两次库调用各自失败——两者此前都没有被
+    `_fetch` 那套单段失败保护包住，抛出会被更上层的通用 except 静默吞掉。异常
+    只抛一次（第一次调用），之后恢复正常返回，方便用例断言"下一轮重试能恢复"。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        raise_on_already_sent: Exception | None = None,
+        raise_on_mark_sent: Exception | None = None,
+    ) -> None:
         self._sent: set[tuple[str, str]] = set()
         self.already_sent_calls: list[tuple[str, str]] = []
         self.mark_sent_calls: list[tuple[str, str]] = []
+        self._raise_on_already_sent = raise_on_already_sent
+        self._raise_on_mark_sent = raise_on_mark_sent
 
     def already_sent(self, *, report_date: date, chat_id: str) -> bool:
         key = (report_date.isoformat(), chat_id)
         self.already_sent_calls.append(key)
+        if self._raise_on_already_sent is not None:
+            error, self._raise_on_already_sent = self._raise_on_already_sent, None
+            raise error
         return key in self._sent
 
     def mark_sent(self, *, report_date: date, chat_id: str) -> None:
         key = (report_date.isoformat(), chat_id)
         self.mark_sent_calls.append(key)
+        if self._raise_on_mark_sent is not None:
+            error, self._raise_on_mark_sent = self._raise_on_mark_sent, None
+            raise error
         self._sent.add(key)
 
 
@@ -562,6 +580,62 @@ class PersistedWatermarkTests(unittest.TestCase):
         duty.run_once()
         duty.run_once()
         self.assertEqual(len(watermark.already_sent_calls), calls_after_first_send)
+
+
+class WatermarkCallFailureAuditTests(unittest.TestCase):
+    """`#325` 尾账（opus 批次 5 审查留痕）：`already_sent`/`mark_sent` 是主线程里
+    仅有的两次没有被 `_fetch` 那套单段失败保护包住的库调用——此前抛出会被更
+    上层的通用 except 静默吞掉，留不下任何 `daily_report.*` 审计。这里分别钉住
+    两处修复后的审计留痕与降级语义。"""
+
+    def test_already_sent_raising_is_audited_and_skips_the_round_fail_closed(self) -> None:
+        """fail-closed：查不到持久水位时保守跳过本轮，不冒险重新聚合并可能
+        重复发送——宁可晚发一轮，不可重发。"""
+
+        watermark = FakeWatermark(raise_on_already_sent=RuntimeError("模拟水位查询故障"))
+        duty, parts = build_duty(watermark=watermark)
+
+        result = duty.run_once()
+
+        self.assertIsNone(result, "查不到水位时本轮不得发送")
+        self.assertIsNone(duty.completed_on)
+        self.assertEqual(parts["sender"].payloads, [])
+        self.assertIn("daily_report.watermark_check_failed", parts["audit"].actions())
+        failed_fields = parts["audit"].fields_for("daily_report.watermark_check_failed")[0]
+        self.assertEqual(failed_fields["error"], "RuntimeError")
+        # 异常没有冒泡带走整轮——上面这次 run_once() 调用本身没有抛出。
+
+        # 下一轮水位查询恢复正常：不是永久卡死，照常聚合并发送。
+        second = duty.run_once()
+        self.assertIsNotNone(second)
+        self.assertEqual(len(parts["sender"].payloads), 1)
+
+    def test_mark_sent_raising_still_audits_sent_and_marks_completed_in_memory(self) -> None:
+        """消息已经真实发出的前提下，水位写入失败不得掩盖这件事：`daily_report.sent`
+        仍然记录（带 `watermark_persisted=False`），额外留一条告警级
+        `watermark_persist_failed`；内存态照常置位，本进程存活期间不重发。"""
+
+        watermark = FakeWatermark(raise_on_mark_sent=RuntimeError("模拟水位写入故障"))
+        duty, parts = build_duty(watermark=watermark)
+
+        result = duty.run_once()
+
+        self.assertIsNotNone(result, "水位写入失败不得阻止消息已经发出这件事")
+        self.assertEqual(len(parts["sender"].payloads), 1)
+
+        self.assertIn("daily_report.sent", parts["audit"].actions())
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertFalse(sent_fields["watermark_persisted"])
+
+        self.assertIn("daily_report.watermark_persist_failed", parts["audit"].actions())
+        persist_failed_fields = parts["audit"].fields_for("daily_report.watermark_persist_failed")[0]
+        self.assertEqual(persist_failed_fields["error"], "RuntimeError")
+
+        # 内存态照常置位：本进程存活期间不会重发同一窗口的通报。
+        self.assertEqual(duty.completed_on, date(2026, 8, 24))
+        second = duty.run_once()
+        self.assertIsNone(second)
+        self.assertEqual(len(parts["sender"].payloads), 1)
 
 
 class AggregationDoesNotBlockCallerTests(unittest.TestCase):
