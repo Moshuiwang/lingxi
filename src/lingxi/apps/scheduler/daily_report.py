@@ -344,7 +344,25 @@ class DailyReportDuty:
             # 同时可能尝试发送，是比"聚合慢"本身更糟的形状。下一轮再看。
             return None
 
-        if self._watermark.already_sent(chat_id=self._chat_id, report_date=today):
+        try:
+            already_sent = self._watermark.already_sent(chat_id=self._chat_id, report_date=today)
+        except Exception as error:  # noqa: BLE001 - 查不了水位时保守跳过本轮，不冒泡
+            # fail-closed（#325 尾账，opus 批次 5 审查留痕）：这是主线程里唯一没有
+            # 被 `_fetch` 那套「单段失败」保护包住的库调用——不包会被循环层的通用
+            # except 静默吞掉、留不下任何 `daily_report.*` 审计。查不到持久水位就
+            # 无法确认"这个窗口是不是已经发过"，两种猜测都有代价：当作"没发过"
+            # 继续跑，若水位其实已经写过就会重复发送；当作"已经发过"跳过，若水位
+            # 其实没写就会晚发一轮。选保守跳过——宁可晚发、不可重发，与本类文档
+            # 「判重水位已持久化」整段幂等纪律的方向一致，下一轮（含很快重试的
+            # 下一次 tick）照常再查一次。
+            self._audit.record("daily_report.watermark_check_failed", error=type(error).__name__)
+            logger.warning(
+                "内测每日通报：持久水位查询失败，保守跳过本轮，下一轮重试 error=%s",
+                type(error).__name__,
+            )
+            return None
+
+        if already_sent:
             # 持久水位显示本窗口已经发过——可能是本进程更早一轮成功后设的，也
             # 可能是重启前的旧进程设的（这正是 #325 要修的残留：内存水位重启即
             # 清零，数据库水位不会）。直接补齐内存水位，不重新聚合、不重新发送。
@@ -611,7 +629,35 @@ class DailyReportDuty:
         # 消息"的是 `send_text` 的 `dedupe_key` 与飞书服务端去重，两者一起构成
         # 纵深（见类文档「判重水位已持久化」的「不是字面同一个数据库事务」一节）。
         # 写入本身幂等（`ON CONFLICT DO NOTHING`），重复调用不产生第二行。
-        self._watermark.mark_sent(chat_id=self._chat_id, report_date=today)
+        #
+        # 这里额外包一层 try/except（#325 尾账，opus 批次 5 审查留痕）：`mark_sent`
+        # 抛异常与上面注释里"进程崩溃"是两种不同的坏形状——崩溃时下面的
+        # `daily_report.sent` 审计与 `_completed_on` 赋值根本来不及跑，本轮结构上
+        # 就是"什么都没留下"；但这里若不捕获，异常会顺着 `_aggregate_and_send`
+        # 冒泡到 `worker()` 的通用 except（消息已经真实发出、却只留一条含糊的
+        # "后台聚合线程出现未预期异常"日志，既没有 `daily_report.sent` 审计，
+        # `_completed_on`/`_reason_streaks` 也不会置位）——用户已经在群里看到这条
+        # 通报，运维却查不到"发过"的痕迹，下一轮还会按"没发过"重新聚合并尝试
+        # 再发一次。因此：写入失败不得吞掉"消息已经发出"这件事本身，`sent` 审计
+        # 照常记（带 `watermark_persisted=False` 如实标注这一步没能落盘），内存
+        # `_completed_on`/`_reason_streaks` 也照常置位（本进程存活期间不会重发）；
+        # 跨重启的重发风险如实登记在 `watermark_persist_failed` 里，留给运维按需
+        # 处理，不假装这次持久化成功了。
+        watermark_persisted = True
+        try:
+            self._watermark.mark_sent(chat_id=self._chat_id, report_date=today)
+        except Exception as error:  # noqa: BLE001 - 水位写入失败不得掩盖"消息已发出"
+            watermark_persisted = False
+            self._audit.record(
+                "daily_report.watermark_persist_failed",
+                report_date=today.isoformat(),
+                error=type(error).__name__,
+            )
+            logger.error(
+                "内测每日通报：消息已发送，但判重水位写入失败，跨重启存在重发"
+                "风险，本进程存活期间不会重发 error=%s",
+                type(error).__name__,
+            )
 
         # 「未覆盖新指标」日检未接线（`metric_coverage_gap is None`）时不出现在这个
         # 列表的候选里——它不是"这一轮不可判定"，是"这一轮根本没有这一段"，混进
@@ -635,6 +681,10 @@ class DailyReportDuty:
             undetermined_sections=[
                 name for name, section in determinable_sections if not section.is_determined
             ],
+            # `False` 时如实标注这一轮的判重水位没能落盘（`watermark_persist_failed`
+            # 审计记着具体异常类型），消息本身确实已经发出——见上面 try/except 的
+            # 注释。默认 `True`：绝大多数轮次里水位写入与发送一样成功。
+            watermark_persisted=watermark_persisted,
         )
         self._completed_on = today
         self._reason_streaks = updated_streaks
