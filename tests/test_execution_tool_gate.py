@@ -21,7 +21,7 @@ from lingxi.core.execution.audit import (
     UserResultStatus,
     classify_tool_result,
 )
-from lingxi.core.execution.hooks import ToolGateway
+from lingxi.core.execution.hooks import MCP_OVERSIZE_RESULT_REWRITE, ToolGateway
 from lingxi.core.execution.tool_policy import (
     DenyReasonCode,
     ToolDecision,
@@ -945,6 +945,88 @@ class RawPreToolUseSinkTest(unittest.TestCase):
 
         self.assertEqual(deny_decision(result), None)  # 白名单内工具，放行不受影响
         self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
+
+
+class McpOversizeResultRewriteTest(unittest.TestCase):
+    """#323：CLI「存文件+分页读取」截断提示改写为重查引导，只作用于 MCP 工具。
+
+    真造假的截断文本样本，摹写实测（2026-08-26，task
+    ``tsk_01M0YA8C1P1PFTZVWF3PY92P4Q``）观察到的 CLI 通用截断模板骨架：
+    「exceeds maximum allowed tokens ... Output has been saved to
+    /tmp/... Use offset and limit parameters to read specific portions of
+    the file」。数字与路径两次实测都不同，因此样本里也换成不同的占位值，
+    证明正则不依赖具体字节数或路径。
+    """
+
+    _TRUNCATED_TEXT = (
+        "Tool result exceeds maximum allowed tokens (25000). "
+        "Actual tokens: 551234. "
+        "Output has been saved to /tmp/claude-abc123/mcp-output-9f2e.json. "
+        "Use offset and limit parameters to read specific portions of the file, "
+        "or use the Read tool to view sections."
+    )
+
+    def _post_tool_use(self, gateway: ToolGateway, tool_name: str, tool_response: object, tool_use_id: str = "toolu_big") -> dict:
+        return asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": tool_name,
+                    "tool_response": tool_response,
+                    "tool_use_id": tool_use_id,
+                }
+            )
+        )
+
+    def test_mcp_tool_truncated_result_is_rewritten_with_updated_mcp_tool_output(self) -> None:
+        for shape, payload in (
+            ("plain string", self._TRUNCATED_TEXT),
+            ("content block list", [{"type": "text", "text": self._TRUNCATED_TEXT}]),
+            ("mapping with text", {"text": self._TRUNCATED_TEXT}),
+        ):
+            with self.subTest(shape=shape):
+                gateway = build_gateway()
+                result = self._post_tool_use(gateway, "mcp__bi-metric__list_metrics", payload)
+
+                output = result.get("hookSpecificOutput", {})
+                self.assertEqual(output.get("hookEventName"), "PostToolUse")
+                rewritten = output.get("updatedMCPToolOutput")
+                self.assertIsInstance(rewritten, str)
+                self.assertNotIn("/tmp", rewritten)
+                self.assertNotIn("offset and limit", rewritten)
+                self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 1)
+
+    def test_non_mcp_tool_truncated_result_is_left_untouched(self) -> None:
+        """范围只限只读问数 MCP：非 MCP 工具即使输出撞上同一段特征也不改写。"""
+
+        gateway = build_gateway()
+        result = self._post_tool_use(gateway, "Bash", self._TRUNCATED_TEXT)
+
+        self.assertEqual(result, {})
+        self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 0)
+
+    def test_normal_mcp_result_is_not_rewritten(self) -> None:
+        """否定用例：改写只作用于截断提示形态，正常结果逐字节不变。"""
+
+        gateway = build_gateway()
+        result = self._post_tool_use(
+            gateway,
+            "mcp__bi-metric__list_metrics",
+            '{"metrics": [{"metric_id": "revenue"}]}',
+        )
+
+        self.assertEqual(result, {})
+        self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 0)
+
+    def test_rewrite_text_never_points_the_model_at_a_local_file(self) -> None:
+        """钉住验收标准本身：模型可见的改写文本不含 /tmp 路径、不含读文件分页引导。"""
+
+        self.assertNotIn("/tmp", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("offset", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("limit", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("分页", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertIn("不要尝试读取", MCP_OVERSIZE_RESULT_REWRITE, "必须显式禁止走读文件这条死胡同")
+        self.assertIn("缩小查询范围", MCP_OVERSIZE_RESULT_REWRITE)
 
 
 if __name__ == "__main__":

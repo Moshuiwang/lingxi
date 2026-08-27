@@ -154,6 +154,11 @@ class TurnAuditSummary:
     final_text_bytes: int
     terminal_result_count: int
     terminal_ok: bool
+    # #323：MCP 结果被 CLI 截断（"存文件+读分页"提示）后改写为重查引导的次数。
+    # 只是一个计数，不额外记入参或正文——这次调用本身的放行/执行/结果归类不受
+    # 影响（同一条调用仍会出现在 ``calls`` 里），这里单独统计只为批终 stage 冒烟
+    # 能观测"改写确实发生了几次"，配合 ``denied_calls`` 为空一起判断 #323 是否生效。
+    oversize_rewrite_count: int
 
     @property
     def denied_tool_names(self) -> tuple[str, ...]:
@@ -229,6 +234,7 @@ class TurnAudit:
         self._by_tool_use_id: dict[str, dict[str, Any]] = {}
         self._final_text: str = ""
         self._terminal_result_count: int = 0
+        self._oversize_rewrite_count: int = 0
 
     # ---- 来源一 / 来源二：hook 记账 ----
 
@@ -347,6 +353,18 @@ class TurnAudit:
     def record_terminal_result(self) -> None:
         self._terminal_result_count += 1
 
+    def record_oversize_rewrite(self, *, tool_name: str, tool_use_id: str | None) -> None:
+        """记一次「MCP 超限结果被改写为重查引导」（#323）。
+
+        只累加计数，不重新归类这次调用——``record_executed`` 已经在同一次
+        ``PostToolUse`` 回调里把它记成"确实执行了"，改写换的是模型看到的文本，
+        不是这次调用发生过什么。计数不区分工具名：批终冒烟只需要知道"这一路上
+        发生过几次"，具体是哪个工具触发的可以从 ``calls`` 里的 ``tool_use_id``
+        反查，不需要在这里重复保留。
+        """
+
+        self._oversize_rewrite_count += 1
+
     def summary(self) -> TurnAuditSummary:
         calls = tuple(ToolCallAudit(**record) for record in self._calls)
         denied = tuple(call for call in calls if call.denied)
@@ -364,6 +382,7 @@ class TurnAudit:
             final_text_bytes=len(self._final_text.encode("utf-8")),
             terminal_result_count=self._terminal_result_count,
             terminal_ok=bool(self._final_text.strip()) and self._terminal_result_count == 1,
+            oversize_rewrite_count=self._oversize_rewrite_count,
         )
 
     @staticmethod
