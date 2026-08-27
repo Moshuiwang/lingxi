@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-26"
+version = "2026-08-27"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -97,6 +97,12 @@ version = "2026-08-26"
 "permission.range_updated" = "你的数据查询可用范围已更新。当前可用范围——公司：{company_name}；职能：{function_name}。你可以直接发起一次查询验证，如有疑问请联系管理员。"
 "permission.range_revoked" = "你的数据查询可用范围已更新，当前暂无可用的数据范围。如有疑问请联系管理员。"
 "permission.all_companies" = "全部公司"
+
+# Issue #341 S-ES-3：文档投递独立消费循环成功建档、写正文、授予可管理并读回
+# 确认后，作为一条追加消息发给提问用户（不进入任何已有话题的卡片/文本终态，
+# 见 apps/gateway/document_delivery.py 模块说明）。{url} 是纯本地拼接的文档
+# 链接，不含用户数据或凭据。
+"delivery.document_ready" = "你要的文档已生成：{url}（你已获得可管理权限）"
 
 [cards."query.status"]
 title = "正在查询"

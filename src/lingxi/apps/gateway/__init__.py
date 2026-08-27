@@ -46,6 +46,10 @@ from lingxi.core.execution.card_stream import CardCreated, CardTransport, Delive
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
+from .document_delivery import (
+    LOOP_ALERT_TRACE_ID as DOCUMENT_DELIVERY_LOOP_ALERT_TRACE_ID,
+    assemble_document_delivery_consumer,
+)
 from .log_redaction import install_credential_redaction
 from .onboarding import assert_gateway_onboarding_is_inert
 
@@ -149,6 +153,23 @@ def delivery_thread_watchdog(
             return
         reported[0] = True
         on_dead("thread_not_alive")
+
+    return check
+
+
+def _combined_watchdog(*checks: Callable[[], None]) -> Callable[[], None]:
+    """把多个看门狗检查合成一个（Issue #341 S-ES-3）：长连接主线程的心跳回调只
+    接受一个 ``watchdog`` 参数，而现在最多有两条独立的后台线程（既有投递消费
+    循环、新增的文档投递消费循环）各自需要被确认还活着。一次检查异常不能连累
+    另一条的检查——`delivery_thread_watchdog` 返回的 ``check`` 各自已经把"只
+    上报一次"的状态封装在自己的闭包里，这里只是顺序调用，不需要额外的异常隔离
+    （`_combined_heartbeat` 的调用方已经把整个 ``watchdog`` 调用包在
+    try/except 里）。
+    """
+
+    def check() -> None:
+        for one in checks:
+            one()
 
     return check
 
@@ -715,6 +736,32 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
             logger.error("投递线程退出告警发送失败 error=%s", type(error).__name__)
 
+    document_delivery_death_reported: list[bool] = [False]
+
+    def report_document_delivery_thread_dead(cause: str) -> None:
+        """文档投递消费线程退出的唯一上报出口（Issue #341 S-ES-3）。
+
+        与 ``report_delivery_thread_dead`` 同一姿态、独立成一份——两条循环各自
+        独立部署、独立轮询、互不阻塞（见 ``apps/gateway/document_delivery.py``
+        模块说明「独立于既有 DeliveryConsumer」），共用同一个上报函数会让管理群
+        收到的告警文案分不清究竟是哪一条循环死了。
+        """
+
+        if document_delivery_death_reported[0]:
+            return
+        document_delivery_death_reported[0] = True
+        logger.error(
+            "文档投递消费线程已退出，Gateway 仍在收消息但不会再有新文档被交付 cause=%s",
+            cause,
+        )
+        try:
+            delivery_alert(
+                "document_delivery_loop_dead:" + cause, DOCUMENT_DELIVERY_LOOP_ALERT_TRACE_ID
+            )
+            alerting_duty.run_once()
+        except Exception as error:  # noqa: BLE001 - 告警自身失败不能再抛回退出路径
+            logger.error("文档投递线程退出告警发送失败 error=%s", type(error).__name__)
+
     # 首次开通（Epic D / S-D-02）：**gateway 只记事件**。真正的编排住在
     # `lingxi-scheduler`（产品负责人 2026-08-18 裁定），按 `claim_stale_onboarding`
     # 认领这里落下的 `auto_provisioning` 事件。本进程因此不持有任何会产生外部副作用的
@@ -740,8 +787,47 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         # 进程退出时硬收掉这个线程，不会让一个卡住的外部调用把整个进程焊住。
         daemon=True,
     )
+
+    # 文档投递独立消费循环（Issue #341 S-ES-3）：``assemble_document_delivery_
+    # consumer`` 未配置 ``LINGXI_GATEWAY_TENANT_DOMAIN`` 时返回 ``None``——本进程
+    # 不起第二条后台线程，watchdog 只看既有的投递消费线程，行为与本能力加入
+    # 之前逐字节一致（失败关闭，见该函数文档）。**不与既有 ``delivery_thread``
+    # 共用同一条循环**：见 ``apps/gateway/document_delivery.py`` 模块说明——建档
+    # 四步里的真实飞书 HTTP 调用不得阻塞其他用户的终态卡片/文本送达。
+    document_delivery_consumer = assemble_document_delivery_consumer(
+        config, alerting_duty=alerting_duty
+    )
+    document_delivery_thread: threading.Thread | None = None
+    if document_delivery_consumer is not None:
+        document_delivery_thread = threading.Thread(
+            target=run_delivery_loop,
+            args=(document_delivery_consumer,),
+            kwargs={
+                "stop": stop_event,
+                "poll_interval_seconds": config.delivery_poll_interval_seconds,
+                "heartbeat": _combined_heartbeat(alerting_duty, "gateway-document-delivery"),
+                "on_tick": alerting_duty.run_once,
+                "on_dead": report_document_delivery_thread_dead,
+            },
+            name="lingxi-gateway-document-delivery",
+            # 同 delivery_thread 的取舍（独立审核 P3-5）：守护线程，停机预算耗尽
+            # 就不再等它，不会让一个卡住的外部调用把整个进程焊住。
+            daemon=True,
+        )
+
     # 长连接的心跳回调里挂上投递线程的看门狗（Issue #191），因此 supervisor 必须在
     # 线程对象存在之后再装配。两者之间没有别的依赖，换顺序不改变任何既有行为。
+    watchdog_checks = [
+        delivery_thread_watchdog(delivery_thread, stop=stop_event, on_dead=report_delivery_thread_dead)
+    ]
+    if document_delivery_thread is not None:
+        watchdog_checks.append(
+            delivery_thread_watchdog(
+                document_delivery_thread,
+                stop=stop_event,
+                on_dead=report_document_delivery_thread_dead,
+            )
+        )
     supervisor_onboarding: list[OnboardingRunner] = []
     supervisor = build_supervisor(
         config,
@@ -751,9 +837,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
         heartbeat=_combined_heartbeat(
             alerting_duty,
             "gateway-longconn",
-            watchdog=delivery_thread_watchdog(
-                delivery_thread, stop=stop_event, on_dead=report_delivery_thread_dead
-            ),
+            watchdog=_combined_watchdog(*watchdog_checks),
         ),
     )
     # **gateway 侧的开通装配断言**（搬迁后的形态）：本进程实际接到管线上的那个实现
@@ -762,6 +846,8 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     # 只会表现为"gateway 忽然收不到消息"。
     assert_gateway_onboarding_is_inert(*supervisor_onboarding)
     delivery_thread.start()
+    if document_delivery_thread is not None:
+        document_delivery_thread.start()
 
     try:
         reason = supervisor.run(should_stop=stop_event.is_set)
@@ -786,6 +872,19 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             logger.error(
                 "投递消费线程未能在停机预算内退出，进程将不再等待它、直接关闭"
             )
+        if document_delivery_thread is not None:
+            # 与上面同一条纪律：用**剩余**预算，从信号那一刻起算，不是重新给满
+            # 一份——两条线程顺序 join，第二次 join 前重新算一次剩余预算，避免
+            # 第一条线程的等待时间被第二条线程重复计费。
+            elapsed_after_first_join = time.monotonic() - shutdown_requested_at[0]
+            remaining_after_first_join = max(
+                0.0, config.shutdown_timeout_seconds - elapsed_after_first_join
+            )
+            document_delivery_thread.join(timeout=remaining_after_first_join)
+            if document_delivery_thread.is_alive():
+                logger.error(
+                    "文档投递消费线程未能在停机预算内退出，进程将不再等待它、直接关闭"
+                )
 
     if reason is TerminationReason.TERMINAL_ERROR:
         # 终止型错误（403 / 514 超连接数上限）：进程进入明确的终止态，退出码非 0，
