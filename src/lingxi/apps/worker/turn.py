@@ -31,6 +31,13 @@ from lingxi.adapters.claude_agent_session import (
     run_single_turn,
 )
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
+from lingxi.core.execution.document_delivery import (
+    DELIVER_DOCUMENT_TOOL_NAME,
+    DELIVERY_MCP_SERVER_NAME,
+    DocumentDeliveryError,
+    DocumentRequest,
+    build_document_request,
+)
 from lingxi.core.execution.hooks import ToolGateway
 from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
 from lingxi.core.execution.message_stream import TurnStreamRecorder
@@ -88,7 +95,15 @@ class WorkerTurnExecutor:
         capture_raw_content: bool = False,
     ) -> None:
         self._config = config
-        self._policy = ToolPolicy(allowed_tools=config.read_only_tools)
+        # 文档交付触发机制（Issue #341 S-ES-2，审定设计第 3 条）：字面量只并入
+        # ToolPolicy 的实际判定集合，**不塞进 config.read_only_tools**——那个字段
+        # 的装配期校验（apps/worker/config.py::_read_only_tools）要求每一项都是
+        # mcp__query__ 前缀的问数只读工具，这是字段名本身的名义纪律；本地变量
+        # ``policy_tools`` 只影响这一次会话构造，不回写 config。
+        policy_tools = config.read_only_tools
+        if config.document_delivery_enabled:
+            policy_tools = tuple(policy_tools) + (DELIVER_DOCUMENT_TOOL_NAME,)
+        self._policy = ToolPolicy(allowed_tools=policy_tools)
         self._audit = TurnAudit(
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
             redactor=AuditRedactor(allowed_input_fields=config.audit_input_fields),
@@ -111,6 +126,10 @@ class WorkerTurnExecutor:
         # 独立复核 P1-3）：默认 False，保持一次性 turn 模式 CLI 的既有行为
         # （stdout 必须恰好一个 JSON 报告，取消也要留下可辨认的失败回合）。
         self._propagate_cancellation = propagate_cancellation
+        # 文档交付触发机制（Issue #341 S-ES-2）：本轮登记的文档请求。回合级状态，
+        # 在 run_turn() 开头与 self._audit.start_turn() 同时重置——不跨回合复用，
+        # 否则第二回合会带着上一回合遗留的请求。
+        self._document_request: DocumentRequest | None = None
 
     @property
     def policy(self) -> ToolPolicy:
@@ -125,20 +144,109 @@ class WorkerTurnExecutor:
 
         ``hooks`` 是会话级配置，因此只建一次；每回合的隔离靠 ``start_turn()``，
         不靠重建会话。
+
+        ``allowed_tools`` 传的是 ``self._policy.allowed_tools``（ToolPolicy 实际
+        判定的完整集合），不是 ``self._config.read_only_tools``——与
+        ``run_turn()`` 最终调用 ``build_report(allowed_tools=self._policy.
+        allowed_tools, ...)`` 是同一个既有惯例：SDK 侧 ``allowed_tools`` 只是纵深
+        防御（真正判定层是 hooks 里的 PreToolUse），但一个"whole tool"级别的
+        ``allowed_tools`` 条目会让 SDK 在到达我们的回调前就自动放行——开关开启
+        时如果这里仍只传 ``config.read_only_tools``，``mcp__delivery__
+        deliver_document`` 就不在这份"已预先批准"的名单里，dontAsk 权限模式会
+        在我们的 PreToolUse 判定之前就拒绝这次调用，功能上根本打不通；两处必须
+        用同一份集合，不能一个用 config 原始值、一个用合并后的值。
         """
 
         if self._options is None:
+            mcp_servers = dict(self._config.mcp_servers)
+            if self._config.document_delivery_enabled:
+                mcp_servers[DELIVERY_MCP_SERVER_NAME] = self._build_delivery_mcp_server()
             self._options = build_agent_options(
                 self._gateway,
-                allowed_tools=self._config.read_only_tools,
+                allowed_tools=self._policy.allowed_tools,
                 max_turns=self._config.max_turns,
-                mcp_servers=self._config.mcp_servers,
+                mcp_servers=mcp_servers,
                 cwd=self._config.workspace,
                 model=self._config.model,
                 system_prompt=self._config.system_prompt,
                 stderr_sink=self._sdk_stderr_sink,
             )
         return self._options
+
+    def _build_delivery_mcp_server(self) -> Any:
+        """装配进程内 SDK MCP 服务（Issue #341 S-ES-2 审定设计第 1 条）。
+
+        处理函数**不发任何外部请求**：只做校验（``build_document_request``）并
+        把请求登记为进程内"本轮文档请求"，返回明确的成功/失败文案给模型。
+        第三方 SDK 的 import 延迟到这里——仓库约定 ``src/lingxi/`` 不做模块级
+        第三方 import（见 ``pyproject.toml`` 顶部说明），只有真正开启这个开关的
+        进程才会付出这次 import 成本。
+        """
+
+        from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
+
+        executor = self
+
+        @sdk_tool(
+            "deliver_document",
+            "登记一次文档交付请求：任务完成后系统会为用户生成该文档。"
+            "此工具只登记请求本身，不会立即发送任何内容给用户，也不产生任何"
+            "外部副作用；同一回合内多次调用以最后一次为准。",
+            {"title": str, "markdown": str},
+        )
+        async def deliver_document(args: dict[str, Any]) -> dict[str, Any]:
+            return executor._handle_deliver_document(args.get("title"), args.get("markdown"))
+
+        return create_sdk_mcp_server(name=DELIVERY_MCP_SERVER_NAME, tools=[deliver_document])
+
+    def _handle_deliver_document(self, title: Any, markdown: Any) -> dict[str, Any]:
+        """``deliver_document`` 工具调用的唯一处理逻辑（同步、无外部请求）。"""
+
+        if not self._config.document_delivery_enabled:
+            # 正常装配下这个分支不可达——服务器只在开关开启时才会被挂载
+            # （见 build_session_options）。保留这道防御是纵深防线，不是主判定
+            # 层：真正阻止未开关时调用这个工具的是它压根不会出现在这一回合的
+            # mcp_servers/ToolPolicy 白名单里。
+            self._emit_stderr_record(
+                level="warning", event="worker.document_request_rejected", reason="disabled"
+            )
+            return {
+                "content": [{"type": "text", "text": "文档交付能力当前未开启。"}],
+                "is_error": True,
+            }
+        try:
+            request = build_document_request(
+                title=title,
+                markdown=markdown,
+                forbidden_values=self._config.external_texts,
+                internal_tool_names=self._policy.allowed_tools,
+                system_prompt=self._config.system_prompt,
+            )
+        except DocumentDeliveryError as error:
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.document_request_rejected",
+                reason=error.reason_code,
+            )
+            return {
+                "content": [{"type": "text", "text": f"文档请求被拒绝：{error}"}],
+                "is_error": True,
+            }
+        replaced = self._document_request is not None
+        self._document_request = request
+        if replaced:
+            self._emit_stderr_record(level="warning", event="worker.document_request_replaced")
+        self._emit_stderr_record(
+            level="warning",
+            event="worker.document_request_registered",
+            paragraph_count=len(request.paragraphs),
+            total_chars=request.total_chars,
+        )
+        return {
+            "content": [
+                {"type": "text", "text": "文档请求已登记，任务完成后为用户生成。"}
+            ]
+        }
 
     def _sdk_stderr_sink(self, line: object) -> None:
         """SDK 子进程 stderr 的唯一落点：脱敏、截断、结构化，带 trace_id。
@@ -175,6 +283,10 @@ class WorkerTurnExecutor:
         normalized_external_texts = normalize_external_texts(external_texts)
         agent_prompt = compose_agent_prompt(question, normalized_external_texts)
         self._audit.start_turn()
+        # 文档交付触发机制（Issue #341 S-ES-2）：回合级状态，与审计一起清零——
+        # 不清零的话，第二回合在模型没有再次调用这个工具时也会带着上一回合
+        # 登记过的请求，与"仅当模型本轮调用过该工具时非空"的报告契约矛盾。
+        self._document_request = None
         recorder = TurnStreamRecorder(self._audit)
         failure: dict[str, str] | None = None
         started_at = self._clock()
@@ -319,6 +431,10 @@ class WorkerTurnExecutor:
             business_execution_budget_seconds=self._config.turn_timeout_seconds,
             business_duration_seconds=business_duration_seconds,
             drain_duration_seconds=drain_duration_seconds,
+            # 仅当任务成功（本地 ``failure is None``，与上面 output_safety_canary
+            # 注入判断同一个信号）且模型本轮确实调用过该工具时才非空——真实失败
+            # 回合即使工具调用发生在失败之前也不承诺这份请求会被消费。
+            document_request=self._document_request if failure is None else None,
         )
 
     def build_content_capture_record(

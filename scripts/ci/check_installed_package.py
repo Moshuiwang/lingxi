@@ -91,6 +91,10 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
     "lingxi.core.execution.card_stream",
+    # 文档交付触发机制的纯逻辑校验（Issue #341 S-ES-2）。由 `apps/worker/turn.py`
+    # 与 `apps/worker/report.py` 函数内/模块级 import，装配前不在任何进程的模块级
+    # import 闭包里，但必须随制品发布，理由同上面几条只读工具白名单模块。
+    "lingxi.core.execution.document_delivery",
     # 投递事件 outbox 的纯领域逻辑（Issue #151）：终态分类与解析规则，
     # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
     "lingxi.core.delivery",
@@ -682,6 +686,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
             "lingxi.core.execution.tool_policy",
+            # 文档交付触发机制（Issue #341 S-ES-2），由 apps/worker/turn.py 与
+            # apps/worker/report.py 模块级 import（构造 ToolPolicy 白名单合入、
+            # 报告投影都需要它，不是按开关才用到的分支）。
+            "lingxi.core.execution.document_delivery",
             "lingxi.core.ids",
             # 内测轮内容级采集（Issue #251/#304 批次 3），由 apps.worker.turn/
             # apps.worker.service/apps.worker.cli 模块级 import。

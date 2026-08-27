@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
+from lingxi.core.execution.document_delivery import DocumentRequest
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.input_safety import constrain_output
 
@@ -51,6 +52,7 @@ def build_report(
     business_execution_budget_seconds: float | None = None,
     business_duration_seconds: float | None = None,
     drain_duration_seconds: float | None = None,
+    document_request: DocumentRequest | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
 
@@ -64,6 +66,13 @@ def build_report(
     界，不因预算耗尽被截断）；``duration_seconds`` 是实际总耗时——用户如果看到
     耗时，看到的必须是这一个，不是配置值。三个新字段由调用方按需提供，缺省时
     保持未知（``None``），不构造数据。
+
+    ``document_request``（Issue #341 S-ES-2 报告契约）：``None`` 或已通过硬上限
+    与出口安全检查的 :class:`~lingxi.core.execution.document_delivery.
+    DocumentRequest`，由调用方（``apps/worker/turn.py``）只在任务成功且模型本轮
+    确实调用过 ``deliver_document`` 时传入非 ``None``。这里只做投影——把已经是
+    受信任内部结构的 ``title``/``paragraphs`` 转成 JSON 可序列化的字典，不重复
+    上游已经做过的校验或出口安全检查。
     """
 
     allowed_tool_names = tuple(allowed_tools)
@@ -179,6 +188,11 @@ def build_report(
         },
         "resources": resources,
         "failure": effective_failure,
+        "document_request": (
+            {"title": document_request.title, "paragraphs": list(document_request.paragraphs)}
+            if document_request is not None
+            else None
+        ),
     }
 
 
