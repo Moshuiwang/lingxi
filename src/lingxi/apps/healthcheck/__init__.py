@@ -82,8 +82,20 @@ def _check_database(role: str, env: Mapping[str, str]) -> None:
         raise HealthcheckError(f"数据库不可达：{type(error).__name__}") from error
 
 
-def _check_liveness(role: str, max_age_seconds: float) -> None:
-    for key in _LIVENESS_KEYS_BY_ROLE[role]:
+def _check_liveness(role: str, max_age_seconds: float, env: Mapping[str, str]) -> None:
+    keys = _LIVENESS_KEYS_BY_ROLE[role]
+    if role == "gateway" and (env.get("LINGXI_GATEWAY_TENANT_DOMAIN") or "").strip():
+        # 文档投递独立消费循环（Issue #341 S-ES-3，P3 顺手）是**可选**的第三条
+        # gateway 线程——只在配置了 `LINGXI_GATEWAY_TENANT_DOMAIN` 时才会被装配
+        # 并起跑（`assemble_document_delivery_consumer`，见该函数文档）。因此不
+        # 能像 `gateway-longconn`/`gateway-delivery` 那样无条件加进
+        # `_LIVENESS_KEYS_BY_ROLE`——没配这项能力的 gateway 部署永远不会写这个
+        # 活性文件，无条件检查会让它们的健康检查恒为不健康。只在**这个进程自己
+        # 的配置**表明它应该起这条线程时，才把它纳入检查——与业务代码判断"要不要
+        # 装配"用的是同一个变量，healthcheck 不构造完整 `GatewayConfig`（避免
+        # 拖进飞书凭据校验等与健康检查无关的前置），直接读这一个变量足够。
+        keys = keys + ("gateway-document-delivery",)
+    for key in keys:
         age = read_liveness_age_seconds(key)
         if age is None:
             raise HealthcheckError(f"没有找到活性文件 {key}（进程可能尚未完成首轮启动）")
@@ -121,7 +133,7 @@ def run(
     started = time.monotonic()
     try:
         _check_database(args.role, source)
-        _check_liveness(args.role, max_age)
+        _check_liveness(args.role, max_age, source)
     except HealthcheckError as error:
         print(f"unhealthy role={args.role} reason={error}", file=err)
         return 1

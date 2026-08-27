@@ -800,15 +800,34 @@ class AlertingDuty:
             #   后者是一次不可逆事件，再让告警状态机攒第二遍等于重复计数，且会
             #   原样踩中上面那个 300 秒撞 300 秒的陷阱——那意味着"整条投递能力
             #   已经停摆"这件事永远发不出告警，正是 #191 要消灭的"无声"。
+            # - `document_delivery_failed`/`document_delivery_uncertain`/
+            #   `document_delivery_notice_failed`/`document_delivery_loop_dead:*`
+            #   （Issue #341，opus 审查 R-1）——``apps/gateway/document_delivery.py``
+            #   文档交付独立消费循环的同型四类：前三个各自对应一行请求的确定性终态
+            #   （明确拒绝 / 结果不明 / 交付已确认但通知发送失败）或一次不可逆的
+            #   循环退出事件，与上面 `dispatch_uncertain:*`/`delivery_loop_*` 同一条
+            #   理由——要么"结果不明只能人工核对，不能等阈值"，要么"这条循环已经
+            #   死了，再让状态机攒第二遍等于重复计数"；且文档交付本身是低频动作
+            #   （见该模块 `DEFAULT_BATCH_LIMIT` 的文档），单个任务在 300 秒窗口内
+            #   几乎不可能自然重复三次触发同一条 `(kind, task_id)`，原样套用
+            #   "攒够阈值次数"会让这三类实质上永远发不出告警，同一个 300 秒撞
+            #   300 秒的陷阱。
             # 三者都改成 `final=True`：命中即报，不等阈值；仍然受
             # `alert_min_interval_seconds`（上报节流）与 `dedupe_window_seconds`
             # （重复告警去重）双重约束，不会因为"立即"而刷屏。其余 kind
             # （目前只有 `progress_persist_failed:*`，一次可恢复的 DB 写入
-            # 抖动）继续走"攒够阈值次数"的既有降噪路径。
+            # 抖动；以及 `document_delivery_attempts_exhausted:*`/
+            # `document_delivery_reclaim_failed:*`/`document_delivery_pending_
+            # expired:*` 这类批量计数告警——持续复现时本来就会在窗口内自然攒够
+            # 阈值，不属于"一次性事件"）继续走"攒够阈值次数"的既有降噪路径。
             final = (
                 kind.startswith("dispatch_uncertain:")
                 or kind.startswith("fallback_send_failed:")
                 or kind.startswith("delivery_loop_")
+                or kind == "document_delivery_failed"
+                or kind == "document_delivery_uncertain"
+                or kind == "document_delivery_notice_failed"
+                or kind.startswith("document_delivery_loop_dead")
             )
             try:
                 signal = AlertSignal(

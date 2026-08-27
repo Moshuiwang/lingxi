@@ -32,6 +32,7 @@ from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
 from lingxi.apps.scheduler.daily_report import _wire_daily_report_duty
+from lingxi.apps.scheduler.document_delivery_dead_letter import _wire_document_delivery_maintenance_duty
 from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty, ReadinessFollowUp
 from lingxi.apps.scheduler.permission_refresh import PermissionRefreshDuty
@@ -297,8 +298,7 @@ def _build_permission_refresh_duty(
     try:
         metric_translation_map = load_company_function_metric_map(config.metric_map_path)
     except (OSError, ValueError) as error:
-        # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；
-        # 这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。
+        # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。
         audit.record(
             "permission_refresh.duty_not_registered",
             reason="metric_translation_map_unavailable",
@@ -582,8 +582,7 @@ def _build_onboarding_duty(
         # 自己那一层的原因（那一层已经在自己的装配点留过审计：`permission_publish.
         # duty_not_registered` 或 `permission_publish.publish_not_wired`）——两条审计
         # 合起来才是完整的因果链，各自只认领自己那一段。两个分支的原因码**可分辨**：
-        # 「整个职责没装配」要去补 MCP 那一组配置，「只有发布面没装配」要去补权限表
-        # Base 坐标。
+        # 「整个职责没装配」要去补 MCP 那一组配置，「只有发布面没装配」要去补权限表 Base 坐标。
         reason = (
             "permission_publish_not_assembled"
             if permission_publish is None
@@ -1526,6 +1525,7 @@ def build_loop(
             ),
         )
     )
+    _wire_document_delivery_maintenance_duty(duties, config, stop=stop, audit=sink, alerting_duty=alerting_duty)
     if alerting_duty is not None:
         duties.append(alerting_duty)
         if heartbeat is None:

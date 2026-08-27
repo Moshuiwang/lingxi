@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-27-3"
-digest = "sha256:b51ba58237ec3ce60cf5080ac85b0ce9c9695f9d052e934ee10b3df555a40817"
+version = "2026-08-27-4"
+digest = "sha256:a3532d1dd8bf1ab8772d0c5e150296fc9ffd173214fad1f9f4701932fec7fa3e"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -19,6 +19,7 @@ retired_versions = [
   "2026-08-26",
   "2026-08-27",
   "2026-08-27-2",
+  "2026-08-27-3",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -31,6 +32,9 @@ retired_versions = [
 "cards.query.result.title" = "463b2262ebe14a9f"
 "cards.query.status.body" = "c9f9dfcfdf7bd324"
 "cards.query.status.title" = "61a2d0066ab40f32"
+"texts.delivery.document_failed" = "ca1a6cd54a25a5b9"
+"texts.delivery.document_ready" = "b1877a81322f75a3"
+"texts.delivery.document_uncertain" = "96c0bce63615ee08"
 "texts.gateway.busy_hint" = "7984bc41c89b9e08"
 "texts.gateway.delivery_expired" = "650d1541a4369696"
 "texts.gateway.group_mention_hint" = "6ff88d15b2832edb"

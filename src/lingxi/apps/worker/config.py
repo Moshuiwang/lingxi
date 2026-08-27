@@ -95,6 +95,14 @@ CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR = "LINGXI_INNERTEST_CONTENT_CAPTURE_ENVI
 # 断言这个值永不出现在任何 compose 编排文件里（尤其是 deploy/compose.prod.yaml）。
 CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE = "stage-innertest-explicit-opt-in"
 
+# 文档交付触发机制（Issue #341 S-ES-2）：默认关闭——关闭时 apps/worker/turn.py
+# 完全不挂 delivery MCP 服务、不把 mcp__delivery__deliver_document 并入
+# ToolPolicy 白名单，行为与本开关加入之前逐字节一致。校验姿态照抄
+# ``_innertest_content_capture`` 的主开关：只接受精确值 ``"1"``，错配（拼错的
+# 值）按启动即失败处理，不悄悄当作未开启——宁可拒绝启动也不让"以为开了但其实
+# 没生效"的部署静默发生。
+DOCUMENT_DELIVERY_ENABLED_VAR = "DOCUMENT_DELIVERY_ENABLED"
+
 
 class WorkerConfigError(ValueError):
     """配置不合法。启动即失败，不留到会话建立之后。"""
@@ -187,6 +195,13 @@ class WorkerConfig:
     # 让 apps/worker/cli.py 在启动期打一条显眼告警，帮助运维发现"以为开了但
     # 其实结构性没生效"，不参与任何功能判断。
     innertest_content_capture_misconfigured: bool = False
+    # 文档交付触发机制（Issue #341 S-ES-2）：默认 False——关闭状态必须可被断言
+    # 证明，直接构造 WorkerConfig 的测试/嵌入调用方同样默认关闭，与 loader 路径
+    # 行为一致。为真时 apps/worker/turn.py 才会挂 delivery MCP 服务、把
+    # mcp__delivery__deliver_document 并入 ToolPolicy 白名单——这里只是一个开关
+    # 位，不持有工具名字面量（字面量的唯一事实来源是
+    # core/execution/document_delivery.py 的 DELIVER_DOCUMENT_TOOL_NAME）。
+    document_delivery_enabled: bool = False
 
     def __post_init__(self) -> None:
         # canary 的**全部**不变量放在类型自身而不是只放在 load_config（独立审核
@@ -294,6 +309,7 @@ def load_config(
         system_prompt_file=system_prompt_file,
         innertest_content_capture_enabled=content_capture_enabled,
         innertest_content_capture_misconfigured=content_capture_misconfigured,
+        document_delivery_enabled=_document_delivery_enabled(env),
     )
 
 
@@ -483,6 +499,22 @@ def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
     if confirm != CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE:
         return False, True
     return True, False
+
+
+def _document_delivery_enabled(env: Mapping[str, str]) -> bool:
+    """文档交付触发开关（Issue #341 S-ES-2）。未配置或为空：``False``——未配置
+    就是未启用。配置了但不是精确的 ``"1"``：启动即失败（与
+    ``_innertest_content_capture`` 的主开关同一姿态）——错配不是未配。
+    """
+
+    flag = (env.get(f"{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR}") or "").strip()
+    if not flag:
+        return False
+    if flag != "1":
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}{DOCUMENT_DELIVERY_ENABLED_VAR} 只接受精确值 \"1\"（不回显收到的值）"
+        )
+    return True
 
 
 def _system_prompt_file(env: Mapping[str, str]) -> str | None:

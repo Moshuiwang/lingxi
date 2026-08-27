@@ -522,8 +522,9 @@ class BuildLoopTest(unittest.TestCase):
             [duty.name for duty in loop.duties],
             # 组织快照同步（Issue #250）的两个令牌供给 `build_loop` 总能建出默认值，
             # 因此总会真实注册，排在这个夹具唯二会注册的职责之后；迟到就绪恢复
-            # （V-开通-18）与开通中途停摆收口（Issue #282，V-开通-19）都没有可选
-            # 前置会让它们整体不装配，因此也总会注册，排在最后（后者紧跟前者）。
+            # （V-开通-18）、开通中途停摆收口（Issue #282，V-开通-19）与文档投递
+            # 死信扫描（Issue #341 R-2/`V-投递-06`）都没有可选前置会让它们整体不
+            # 装配，因此也总会注册，排在最后（按加入顺序依次紧跟）。
             [
                 "凭据轮换",
                 "保留清理",
@@ -532,6 +533,7 @@ class BuildLoopTest(unittest.TestCase):
                 "组织快照同步",
                 "迟到就绪恢复",
                 "开通中途停摆收口",
+                "文档投递死信扫描与正文到期擦除",
             ],
         )
         self.assertIsInstance(loop, SchedulerLoop)
