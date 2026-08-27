@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0074_task_document_delivery` |
+| head revision | `0073_pending_action_perm_types` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -355,6 +355,77 @@ provisioning_state` 推进到 `active` 与向本表排一条待发「开通完�
 S-M-02（[#96](https://github.com/Moshuiwang/lingxi/issues/96)）。
 
 表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值。
+
+## `0072_local_permission_override`（本地权限覆盖表）
+
+[Issue #319](https://github.com/Moshuiwang/lingxi/issues/319) S-P-1a（产品负责人
+2026-08-26 裁定，推翻 [2026-08-24 决策记录](../docs/决策记录/2026-08-24-管理员职责集与银河外权限动作边界.md)
+第 4 条「本地开通/扩权：不做」）。一张新表 `local_permission_override`：管理员经
+确认卡对个别用户补授（`grant`）或收窄（`suppress`）的公司×指标级权限，供未来
+每日权限重算/开通链聚合与银河翻译结果取并集再减集（真实权限 `= (银河翻译 ∪
+本地授权) − 本地抑制`）。
+
+**一张表双极性**（编排者裁定，覆盖 #319 字面把「本地授权」「本地抑制」写成并列
+两个机制的读法）：`direction IN ('grant', 'suppress')` 同表，理由是两者共享完全
+相同的形状且需要合并判定「同一 user×公司×指标 同时有一条 grant 与一条
+suppress 时 suppress 赢」，拆两张表会让这类判定变成一次跨表 UNION。
+
+三条约束刻意写进数据库而不是留给调用方自觉：
+
+1. `pending_action_id NOT NULL REFERENCES pending_action(id)`——结构性堵死"没有
+   确认卡就能写入本地权限"这条路径（#319「可观察完成标准」第二条），任何一次
+   `INSERT` 如果不先有一条真实存在的 `pending_action` 行可引用，在数据库层面
+   就会失败；
+2. `entry_status`（`active`/`revoked`）与 `admin_registry`（迁移 `0067`）同一
+   惯例，收回是同一行状态翻转（软删除，历史留痕），配套 CHECK 让
+   `revoked_at`/`revoked_pending_action_id` 与 `entry_status='revoked'` 互为
+   充要；
+3. `local_permission_override_active_unique_idx`（`user_id, direction,
+   company_id, metric_name` 上 `WHERE entry_status = 'active'` 的部分唯一
+   索引）防止重复发起同一笔授权/抑制堆出多条冗余生效行，但不同 `direction`
+   允许共存——那正是「suppress 赢」判定需要的输入。
+
+**没有任何有效期/到期/复核列**：产品负责人在 #319 明确裁定本地覆盖「不设有效期、
+不设定期复核」，与 `pending_action` 的十分钟确认窗口是两回事，不适用。
+
+本卡（S-P-1a）只交付表结构 + 纯函数语义（`core/permission/local_override.py`）
++ 读写适配器（`adapters/postgres_local_permission.py`）；命令面（管理员如何发起
+一笔授权/收回，S-P-1b）与聚合点接线（银河翻译结果与本地覆盖取并集，S-P-3）均
+不在本 revision 范围。当前 `pending_action.action_type` 的 CHECK（迁移 `0068`）
+尚未加入本地权限专属取值，S-P-1b 落地时需要一次新增迁移补上。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值
+（本 revision 未在任何环境应用过）。
+
+**不可回滚前置条件（Trace #328 opus 审查补记）**：上一句"不存在需要回填的历史值"
+只在部署环境从未真实写入过本表时成立——迁移文件头部注释同一句写着"数据破坏操作，
+与 0067/0068 同型：一旦部署环境写入过真实本地覆盖，DROP 会把它们连同确认卡留痕
+一起清空，不是无损回滚"。一旦本地授权/抑制被真实使用过，`downgrade()` 的
+`DROP TABLE` 就是一次不可逆的数据丢失，不是"无损回滚"；本节这句概述在初版遗漏了
+这条前置条件，容易被读成"downgrade 总是安全的"。
+
+## `0073_pending_action_perm_types`（待确认操作扩容本地权限动作类型）
+
+[Issue #319](https://github.com/Moshuiwang/lingxi/issues/319) S-P-1b。把
+`pending_action.action_type` 的 CHECK 从两值（`suspend_user`/`resume_user`）
+一次性扩到五值（新增本地权限授权/抑制/收回三类，理由见迁移文件头部「为什么
+revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这三类动作确认执行
+所需的结构化参数（公司×指标×原因，JSON 字符串），并加一条「存在性」自洽 CHECK：
+本地权限三类必须携带非空白 `payload`，`suspend_user`/`resume_user` 必须不携带
+——**这条 CHECK 只管存在性，不校验 `payload` 的内容形状**（是否合法 JSON、键是否
+齐全），那部分校验在应用层（`json.loads` 失败时的兜底见
+`core/admin/notification.py` 的 `_permission_payload`）。
+
+**不可回滚前置条件**：`downgrade()` 无条件先 `DROP COLUMN payload`（不管当时是否
+已有真实的公司/指标/原因内容），再把 CHECK 收窄回两值——若届时表中仍有
+`local_permission_grant`/`suppress`/`revoke` 取值的行，最后一步 `ADD CONSTRAINT`
+会因违反收窄后的 CHECK 而失败，整条 revision 在同一事务内原子回滚（`env.py` 的
+`transaction_per_migration=True`，不留半应用状态，与 `0054` 的既有先例一致）。
+因此：只要本地权限三类动作被真实使用过，这条 `downgrade` 在实践中不可执行，
+除非先手工清空/迁出这些业务行——而那本身就是一次不可逆的数据丢失。
+
+表本 revision 只新增列与约束，前滚兼容；`downgrade()` 未在任何环境验证过真实
+回滚（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
+    REQUIRED_ROLE,
+    TARGET_ACCOUNT_STATE,
+    VALID_SOURCE_STATES,
     CancelResultKind,
     ConfirmResultKind,
     PendingAction,
@@ -118,6 +121,168 @@ class DecidePrepareTests(unittest.TestCase):
                 self.assertFalse(decision.ok)
 
 
+class DecidePrepareLocalPermissionTests(unittest.TestCase):
+    """#319 S-P-1b：本地权限授权/抑制复用同一个 ``decide_prepare``，基线语义是
+    该 ``(user, direction, company, metric)`` 键当前"无生效行"（``"absent"``）。
+    ``adapters/postgres_pending_action.py`` 负责把这个字符串观测出来，本模块
+    只验证纯函数对这两个新取值的判定本身。
+    """
+
+    def test_grant_allowed_when_key_is_absent(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="absent"
+        )
+        self.assertTrue(decision.ok)
+
+    def test_suppress_allowed_when_key_is_absent(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="absent"
+        )
+        self.assertTrue(decision.ok)
+
+    def test_grant_rejected_when_key_already_present(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="present"
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "target_state_changed")
+
+    def test_suppress_rejected_when_key_already_present(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="present"
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "target_state_changed")
+
+    def test_grant_rejects_unknown_target_same_as_suspend_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state=None
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "not_found")
+
+    def test_grant_rejection_message_does_not_mention_resume(self) -> None:
+        """拒绝文案按类型分化（Trace #328 opus 审查升级的 P2）：此前本地权限三类
+        动作全部落进"suspend 之外都当 resume 处理"的 ``else`` 分支，字面导向
+        "请去 /admin resume"——对一个授权命令毫无意义，是一条真实的误导面。"""
+
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="present"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+    def test_suppress_rejection_message_does_not_mention_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="present"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+
+class DecidePrepareRevokeTests(unittest.TestCase):
+    """卡 B 新增：``LOCAL_PERMISSION_REVOKE`` 的基线语义与 grant/suppress 相反
+    ——要求覆盖行当前 ``entry_status`` 必须是"active"才允许发起收回。
+    ``adapters/postgres_pending_action.py`` 负责按 override_id 查出这个字符串，
+    本模块只验证纯函数对这个新取值的判定本身（同 grant/suppress 的既有分工）。
+    """
+
+    def test_revoke_allowed_when_entry_is_active(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state="active"
+        )
+        self.assertTrue(decision.ok)
+
+    def test_revoke_rejected_when_entry_already_revoked(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state="revoked"
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "target_state_changed")
+
+    def test_revoke_rejects_unknown_override_id_same_as_suspend_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state=None
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "not_found")
+
+    def test_revoke_not_found_message_talks_about_the_override_not_a_user(self) -> None:
+        """拒绝文案按类型分化：收回场景下 ``current_account_state is None`` 说的是
+        "没查到这一条本地权限登记"——``target_open_id`` 形参此刻装的是
+        override_id，不是任何人的身份标识，通用的"未找到该用户记录"说错了对象。"""
+
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state=None
+        )
+        self.assertNotIn("用户", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+    def test_revoke_rejection_message_does_not_mention_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state="revoked"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+
+class SuspendResumeMappingsUnchangedTests(unittest.TestCase):
+    """哨兵测试：泛化 ``PendingActionType``/``VALID_SOURCE_STATES``/
+    ``REQUIRED_ROLE``/``TARGET_ACCOUNT_STATE`` 以承载本地权限新动作类型时，
+    ``SUSPEND_USER``/``RESUME_USER``/既有的 grant/suppress 取值必须逐项相等、
+    一个字符都不变——这是"新类型加法式扩展、旧类型零改动"这条设计约束的可执行
+    证据（#319 S-P-1b 设计卡；卡 B 沿用同一纪律扩展 revoke 项）。"""
+
+    def test_valid_source_states_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.SUSPEND_USER], frozenset({"enabled"}))
+        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.RESUME_USER], frozenset({"suspended"}))
+
+    def test_required_role_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(REQUIRED_ROLE[PendingActionType.SUSPEND_USER], AdminRole.PERMISSION_ADMIN)
+        self.assertEqual(REQUIRED_ROLE[PendingActionType.RESUME_USER], AdminRole.PERMISSION_ADMIN)
+
+    def test_target_account_state_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(TARGET_ACCOUNT_STATE[PendingActionType.SUSPEND_USER], "suspended")
+        self.assertEqual(TARGET_ACCOUNT_STATE[PendingActionType.RESUME_USER], "enabled")
+
+    def test_local_permission_action_types_map_to_no_account_state_change(self) -> None:
+        """新类型的 ``TARGET_ACCOUNT_STATE`` 必须是 ``None``（不改
+        ``app_user.account_state``），这是 confirm 侧选择"更新 app_user 还是写
+        local_permission_override"分支判断所依赖的不变量。"""
+
+        self.assertIsNone(TARGET_ACCOUNT_STATE[PendingActionType.LOCAL_PERMISSION_GRANT])
+        self.assertIsNone(TARGET_ACCOUNT_STATE[PendingActionType.LOCAL_PERMISSION_SUPPRESS])
+
+    def test_grant_and_suppress_mappings_unchanged_by_card_b(self) -> None:
+        """卡 B 只新增 revoke 项，不改卡 A 已登记的 grant/suppress 取值——逐值
+        断言，抓"改了不该改的既有取值"这类变异。"""
+
+        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_GRANT], frozenset({"absent"}))
+        self.assertEqual(
+            VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_SUPPRESS], frozenset({"absent"})
+        )
+        self.assertEqual(
+            REQUIRED_ROLE[PendingActionType.LOCAL_PERMISSION_GRANT], AdminRole.PERMISSION_ADMIN
+        )
+        self.assertEqual(
+            REQUIRED_ROLE[PendingActionType.LOCAL_PERMISSION_SUPPRESS], AdminRole.PERMISSION_ADMIN
+        )
+
+    def test_revoke_is_now_registered_with_active_source_state_and_permission_admin_role(
+        self,
+    ) -> None:
+        """卡 B 新增：``LOCAL_PERMISSION_REVOKE`` 的基线语义与 grant/suppress
+        相反——要求当前必须"active"才允许发起收回。"""
+
+        self.assertEqual(
+            VALID_SOURCE_STATES[PendingActionType.LOCAL_PERMISSION_REVOKE], frozenset({"active"})
+        )
+        self.assertEqual(
+            REQUIRED_ROLE[PendingActionType.LOCAL_PERMISSION_REVOKE], AdminRole.PERMISSION_ADMIN
+        )
+        self.assertIsNone(TARGET_ACCOUNT_STATE[PendingActionType.LOCAL_PERMISSION_REVOKE])
+
+
 class DecideConfirmHappyPathTests(unittest.TestCase):
     def test_suspend_executes_when_every_check_passes(self) -> None:
         pending = _pending(action_type=PendingActionType.SUSPEND_USER, target_state_snapshot="enabled")
@@ -146,6 +311,27 @@ class DecideConfirmHappyPathTests(unittest.TestCase):
         )
         self.assertTrue(decision.ok)
         self.assertEqual(decision.new_account_state, "enabled")
+
+    def test_revoke_executes_when_every_check_passes(self) -> None:
+        """卡 B 新增：``LOCAL_PERMISSION_REVOKE`` 走完全相同的核对链——真正的
+        写入分支（条件 UPDATE local_permission_override）在
+        ``adapters/postgres_pending_action.py``，本函数只判定"是否应该
+        EXECUTE"，不关心具体写哪张表（``new_account_state`` 恒为 ``None``，
+        与 grant/suppress 同一姿态）。"""
+
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, target_state_snapshot="active"
+        )
+        decision = decide_confirm(
+            pending=pending,
+            clicker_open_id=INITIATOR,
+            now=NOW,
+            registry_entry=_full_admin_entry(),
+            current_account_state="active",
+        )
+        self.assertTrue(decision.ok)
+        self.assertIsNone(decision.new_account_state)
+        self.assertIs(decision.terminal_status, PendingActionStatus.EXECUTED)
 
 
 class DecideConfirmNotFoundTests(unittest.TestCase):

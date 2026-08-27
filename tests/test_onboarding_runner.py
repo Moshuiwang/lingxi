@@ -54,7 +54,11 @@ from lingxi.core.identity.stock_token_source import (
     NO_ROW,
     StockTokenLookup,
 )
+from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
+from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.publish import ExistingPermissionRow
 
 UTC = timezone.utc
 OPEN_ID = "ou_employee_1"
@@ -364,6 +368,77 @@ class FakeLedger:
         self.released.append((event_id, claim_token))
 
 
+class FakeLocalOverrides:
+    """本地权限覆盖读取口的假实现（S-P-3，Issue #319）。同构于
+    ``tests/test_permission_refresh_duty.py`` 的同名类（各自独立一份，理由见
+    ``LocalOverrideSource`` 协议文档：``core/`` 不 import ``apps/``）。"""
+
+    def __init__(
+        self,
+        entries: dict[str, tuple[LocalPermissionOverrideEntry, ...]] | None = None,
+        *,
+        fail_for: set[str] | None = None,
+    ) -> None:
+        self._entries = entries or {}
+        self._fail_for = fail_for or set()
+        self.calls: list[str] = []
+
+    def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
+        self.calls.append(user_id)
+        if user_id in self._fail_for:
+            raise RuntimeError("注入的本地覆盖读取失败")
+        return self._entries.get(user_id, ())
+
+
+class FakeLegacyTable:
+    """存量权限只读源的假实现（S-P-2，Issue #319 / Trace #328）。同构于
+    ``tests/test_permission_refresh_duty.py`` 的同名类——``LegacyPermissionTable``
+    协议本身定义在 ``core/permission/legacy_source.py``，两个调用点的测试各自留一份
+    假实现是测试夹具的既有惯例（同 ``FakeLocalOverrides``），不是层级约束要求的。"""
+
+    def __init__(
+        self,
+        rows_by_email: dict[str, str] | None = None,
+        *,
+        find_error: Exception | None = None,
+        duplicate_for: set[str] | None = None,
+    ) -> None:
+        self._rows = rows_by_email or {}
+        self._find_error = find_error
+        self._duplicate_for = duplicate_for or set()
+        self.find_calls: list[tuple[str, str]] = []
+
+    def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
+        self.find_calls.append((record_key, email))
+        if self._find_error is not None:
+            raise self._find_error
+        if email not in self._rows:
+            return ()
+        row = ExistingPermissionRow(
+            record_id=f"rec_{email}",
+            fields={"record_key": email, "email": email, "permissions": self._rows[email]},
+        )
+        return (row, row) if email in self._duplicate_for else (row,)
+
+
+class FakePublishHistory:
+    """「这个人在发布链上有没有留下过足迹」的假实现（红线-1，Trace #328 opus 审查）。
+    同构于 ``tests/test_permission_refresh_duty.py`` 的同名类（各自独立一份，理由与
+    ``PublishHistorySource`` 协议文档一致：``core/`` 不 import ``apps/``）。
+
+    默认**谁都没有**：首次开通的用户结构上通常也确实还没有任何发布足迹，因此这是
+    ``LegacySourceMergeTests`` 既有正向用例的自然默认值。
+    """
+
+    def __init__(self, published_users: set[str] | None = None) -> None:
+        self._published = published_users or set()
+        self.calls: list[str] = []
+
+    def has_publish_footprint(self, user_id: str) -> bool:
+        self.calls.append(user_id)
+        return user_id in self._published
+
+
 class RecordingAudit:
     def __init__(self) -> None:
         self.records: list[tuple[str, dict[str, object]]] = []
@@ -431,6 +506,18 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "ledger": FakeLedger(),
         "audit": RecordingAudit(),
         "onboarding_failed": None,
+        # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
+        # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
+        "local_overrides": None,
+        # 默认 None：哨兵——不注入存量权限只读源时，行为必须与接线之前逐字节一致
+        # （S-P-2 #328，见 LegacySourceMergeTests.test_table_absent_matches_todays_behavior）。
+        "legacy_source": None,
+        # 默认「谁都没有」：红线-1 有界化（Trace #328 opus 审查）的默认值——首次
+        # 开通的用户结构上通常也确实还没有任何发布足迹，因此本文件绝大多数用例
+        # （legacy 参与合并的既有正向路径）继续成立；``publish_history=None``
+        # （装配层未接线）走保守分支同样按"不参与"处理，见
+        # ``LegacySourceMergeTests.test_publish_history_absent_also_blocks_legacy``。
+        "publish_history": FakePublishHistory(),
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -465,6 +552,9 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         should_stop=overrides.get("should_stop", lambda: False),
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
         onboarding_failed=parts["onboarding_failed"],
+        local_overrides=parts["local_overrides"],
+        legacy_source=parts["legacy_source"],
+        publish_history=parts["publish_history"],
     )
     return runner, parts
 
@@ -561,6 +651,218 @@ class HappyPathTests(unittest.TestCase):
         rendered = repr(parts["audit"].records)
         self.assertNotIn(secret, rendered, "令牌明文不得出现在审计里")
         self.assertIn(secret, parts["environment"].tokens, "明文只该到达用户环境写入口")
+
+
+def _override_entry(
+    *,
+    user_id: str = USER_ID,
+    direction: OverrideDirection = OverrideDirection.GRANT,
+    company_id: str = "88",
+    metric_name: str = "本地指标",
+) -> LocalPermissionOverrideEntry:
+    return LocalPermissionOverrideEntry(
+        user_id=user_id,
+        direction=direction,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason="U1 特批",
+        initiated_by_open_id="ou_admin",
+        pending_action_id="pac_fake",
+        created_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+
+
+class TwoCompanyGalaxySnapshot(FakeGalaxySnapshot):
+    """两家公司的银河快照：供抑制用例证明"只有被抑制到空的公司键消失，另一家
+    不受影响"（``merge_sources`` 模块文档「空结果」一节）。"""
+
+    country_rows = (
+        {"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},
+        {"country_key": "c_2", "name": "Nigeria", "name_cn": "尼日利亚", "boss_company_id": "99"},
+    )
+
+    def datacountry_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return (
+            {"user_id": galaxy_user_id, "datacountry_id": "c_1"},
+            {"user_id": galaxy_user_id, "datacountry_id": "c_2"},
+        )
+
+
+class LocalOverrideMergeTests(unittest.TestCase):
+    """开通侧的四源合并接线（S-P-3，Issue #319）：与
+    ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 同一组断言，
+    证明两个调用点消费的是同一个 ``merge_permission_sources``。开通侧的 ``galaxy``
+    输入是**未翻译**的职能标签映射（onboarding 目前不调用翻译层，见
+    ``merge_sources`` 模块文档「挂点」一节），本地覆盖的指标名字符串仍然精确并入/
+    减去，不受周围标签影响。"""
+
+    def test_store_absent_matches_todays_behavior(self) -> None:
+        parts, result = run_once()
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+
+    def test_local_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """本地授权后聚合含并集（#319 验收断言）。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+        parts, _ = run_once(local_overrides=overrides)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["本地指标","销售分析"]}')
+        self.assertEqual(overrides.calls, [USER_ID])
+
+    def test_local_suppression_removes_a_galaxy_granted_metric(self) -> None:
+        """抑制后不含：本地抑制命中的是银河这一侧现算出的职能标签，不是本地授权
+        自己加的那条；只有被抑制到空的公司键消失，另一家公司不受影响。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ID: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),)}
+        )
+        parts, _ = run_once(galaxy=FakeGalaxy(TwoCompanyGalaxySnapshot()), local_overrides=overrides)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"99":["销售分析"]}')
+
+    def test_read_failure_skips_local_source_and_audits(self) -> None:
+        overrides = FakeLocalOverrides(fail_for={USER_ID})
+        parts, result = run_once(local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertIn("onboarding.local_override_skipped", parts["audit"].actions())
+        facts = parts["audit"].facts("onboarding.local_override_skipped")
+        self.assertEqual(facts["user"], USER_ID)
+        self.assertEqual(facts["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
+
+    def test_a_fully_suppressed_grant_is_not_authorized_not_a_crash(self) -> None:
+        """红线-2（Trace #328 opus 审查）「onboarding 侧同分支核对」：银河这一侧
+        原本是有效授权（默认夹具只有一个公司/一个职能），但本地抑制把它压光到
+        空字典。``_publish`` 走的是**新建**行路径，一个内容为空的新建行对问数
+        MCP 毫无意义（既没有指标可读，也不该为一个净权限为零的人耗费一份令牌），
+        因此归类为确定性业务失败（``not_authorized``），不落到
+        ``build_translated_publish_row`` 对空输入的 ``ValueError`` 冒泡成一条
+        不可分辨的 ``INTERNAL_ERROR``。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ID: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),)}
+        )
+        parts, result = run_once(local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "not_authorized")
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "fully_suppressed_by_local_override",
+        )
+        self.assertEqual(parts["decisions"].rows, [], "全抑制时不得排出任何发布意图")
+
+    def test_a_partially_suppressed_grant_still_publishes_normally(self) -> None:
+        """否定断言：只抑掉**一部分**指标（不是全部）时走的仍是正常发布，不是
+        ``not_authorized``——证明判据是"合并结果整体为空"，不是"发生过任何抑制"。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),
+                )
+            }
+        )
+        parts, result = run_once(local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["额外授权"]}')
+
+
+class LegacySourceMergeTests(unittest.TestCase):
+    """开通侧的存量权限沿用接线（S-P-2，Issue #319 / Trace #328）：与
+    ``tests/test_permission_refresh_duty.py::LegacySourceMergeTest`` 同一组断言，
+    证明两个调用点消费的是同一个 ``resolve_legacy_source``/``merge_permission_sources``。
+    查找键取**规范化邮箱**（小写），与 ``ROSTER_ROWS[0]["email"]``（混合大小写）同源。"""
+
+    NORMALIZED_EMAIL = "xiaoming@example.com"
+
+    def test_table_absent_matches_todays_behavior(self) -> None:
+        parts, result = run_once()
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+
+    def test_no_matching_legacy_row_is_also_identity(self) -> None:
+        legacy = FakeLegacyTable({})
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertEqual(legacy.find_calls, [(self.NORMALIZED_EMAIL, self.NORMALIZED_EMAIL)])
+
+    def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
+        """存量沿用后聚合含并集（本卡验收断言①）。"""
+
+        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'})
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["存量指标","销售分析"]}')
+
+    def test_read_failure_skips_legacy_source_and_audits(self) -> None:
+        """本卡验收断言②：读取失败只跳过存量源，不整链失败。"""
+
+        legacy = FakeLegacyTable(find_error=RuntimeError("注入的存量表读取失败"))
+        parts, result = run_once(legacy_source=legacy)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertIn("onboarding.legacy_source_skipped", parts["audit"].actions())
+        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
+        self.assertEqual(facts["user"], USER_ID)
+        self.assertEqual(facts["reason"], REASON_LEGACY_READ_FAILED)
+        self.assertEqual(facts["error"], "RuntimeError")
+
+    def test_conflicting_legacy_rows_are_skipped_with_a_distinct_reason(self) -> None:
+        """本卡验收断言⑤：命中多行失败关闭，原因码与读取失败可分辨。"""
+
+        legacy = FakeLegacyTable(
+            {self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'}, duplicate_for={self.NORMALIZED_EMAIL}
+        )
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
+        self.assertEqual(facts["reason"], "multiple_rows")
+        self.assertNotIn("error", facts)
+
+    def test_a_user_with_a_publish_footprint_never_reads_legacy(self) -> None:
+        """红线-1 否定用例（Trace #328 opus 审查）：这个用户已经在发布链上留下过
+        足迹——发生在一条因下游步骤失败而重跑的链上，``_publish`` 被第二次调用时，
+        第一次调用可能已经排出过一条发布意图。有界化判据必须挡住存量沿用，**连
+        find_rows 都不发起**（省读放大）。存量行故意携带一个当前银河聚合结果里
+        没有的指标，模拟"上一次调用发布的内容被当作存量沿用原样读了回来"的自
+        反馈环风险。"""
+
+        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["上一次已发布的指标"]}'})
+        parts, result = run_once(
+            legacy_source=legacy, publish_history=FakePublishHistory({USER_ID})
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"88":["销售分析"]}',
+            "有发布足迹时存量沿用不生效",
+        )
+        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起")
+
+    def test_publish_history_absent_also_blocks_legacy(self) -> None:
+        """装配层未接线发布足迹口（``publish_history=None``）时按保守分支处理：
+        判据答不出来，legacy 一律不参与——与"未接线 store 静默不参与"的既有姿态
+        一致，但方向反过来（未接线时**不放行**，不是**放行**），因为放行的风险
+        是自反馈环，不放行的代价只是这一轮少沿用一份本该沿用的存量权限。"""
+
+        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'})
+        parts, result = run_once(legacy_source=legacy, publish_history=None)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertEqual(legacy.find_calls, [], "判据答不出来时不该发起 find_rows")
 
 
 class ThreadingTests(unittest.TestCase):

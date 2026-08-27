@@ -26,11 +26,13 @@ SDK，可以在没有装 SDK 的环境里测试全部渲染断言。
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from lingxi.core.admin.pending_action import (
+    LOCAL_PERMISSION_ACTION_TYPES,
     PENDING_ACTION_TTL_SECONDS,
     PendingAction,
     PendingActionStatus,
@@ -40,12 +42,122 @@ from lingxi.core.admin.pending_action import (
 _ACTION_LABEL: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "停用",
     PendingActionType.RESUME_USER: "恢复",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "授权",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "抑制",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "收回",
 }
+
+#: 零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus 审查 P1）：
+#: 只在**授权**这条动作的确认卡上出现——四源合并挂在 `aggregate.granted` 判据之后，
+#: 一个当前没有任何银河权限的用户走的是撤权分支，本地授权此刻不生效；本地抑制则
+#: 无此问题（银河那一侧本就是零，抑制与否结果一样，不会制造虚假期待）。判据本身
+#: 不在这里改（产品裁定项，编排者已挂待裁），只如实提示这条边界，见
+#: `core/admin/router.py::_ZERO_GALAXY_PERMISSION_CAVEAT` 同一条边界在 `/admin user`
+#: 输出侧的呼应。
+_ZERO_GALAXY_PERMISSION_CAVEAT = "若该用户当前无任何银河权限，本地授权暂不生效（边界见 V-权限-15）。"
 
 _IMPACT_TEXT: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "该用户将立即无法发起新的问数或开通；已在进行中的任务不受影响、正常完成交付。",
     PendingActionType.RESUME_USER: "该用户将恢复可以正常问数；此前被收回的权限不会自动恢复。",
+    PendingActionType.LOCAL_PERMISSION_GRANT: (
+        "该用户将获得下方指定公司×指标的问数权限（本地授权，独立于银河翻译结果，"
+        f"不影响其余已有权限）。{_ZERO_GALAXY_PERMISSION_CAVEAT}"
+    ),
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该用户将被限制访问下方指定公司×指标（本地抑制优先级最高，即使银河翻译结果授予也会被拦截）。",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "下方指定的本地覆盖行将被收回，不再影响该用户的权限聚合结果（银河翻译结果与其余本地覆盖不受影响）。",
 }
+
+#: 迁移 ``0072`` ``direction`` 列取值 → 中文展示文案，只在收回的确认卡/终态卡/
+#: 群通知里出现——授权/抑制两类动作本身的 ``_ACTION_LABEL`` 已经隐式表达了方向
+#: （模块文档「本地权限授权/抑制两类确认卡/终态卡/群通知的渲染扩展」），只有
+#: 收回需要额外说明"被收回的是哪个方向"（卡 B 设计卡「含被收回的方向/公司/
+#: 指标」）。
+_DIRECTION_LABEL: dict[str, str] = {"grant": "授权", "suppress": "抑制"}
+
+
+def _permission_payload(pending: PendingAction) -> dict[str, Any] | None:
+    """解析 ``pending.payload``（JSON 字符串，仅本地权限三类动作非空，见迁移
+    ``0073``）。解析失败或缺失时返回 ``None``——调用方据此跳过范围行的渲染，不让
+    一条格式异常的历史行让整个渲染函数崩溃（本模块全程是纯函数，不允许因为一条
+    脏数据抛出未预期的异常）。
+    """
+
+    if not pending.payload:
+        return None
+    try:
+        data = json.loads(pending.payload)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _direction_prefix(payload: dict[str, Any]) -> str:
+    """收回的 payload 携带 ``direction``（被收回那一行原本是授权还是抑制，见
+    ``adapters/postgres_pending_action.py`` 模块文档「本地权限收回如何复用同一
+    套机制」）；授权/抑制两类动作的 payload 从不携带这个键（`.get` 落空返回
+    ``""``），对它们完全不改变既有渲染——这条"方向"信息只有收回才需要额外说明。
+    """
+
+    direction = payload.get("direction")
+    if not direction:
+        return ""
+    label = _DIRECTION_LABEL.get(direction, direction)
+    return f"方向：{label}\n"
+
+
+#: payload 异常时的降级文案（Trace #328 opus 审查 P2）：非本地权限动作的
+#: "范围+原因"区块结构上就不存在（本来就该是空字符串），但**本地权限动作**的
+#: payload 解析失败（缺失、非法 JSON、非对象）此前会静默退化成同一个空字符串——
+#: 管理员看到的确认卡直接漏掉"范围：公司 ... · 指标 ..."这一行，等于让他在不知道
+#: 自己要授权/抑制/收回哪个公司哪个指标的情况下点确认。改成显式的降级提示，
+#: 而不是让这条本该出现的信息悄悄消失。
+_SCOPE_UNAVAILABLE_TEXT = "范围信息不可用，请取消本卡重新发起。\n"
+
+
+def _permission_scope_block(pending: PendingAction) -> str:
+    """确认卡/终态卡正文里的"范围+原因"多行区块（含结尾换行）。
+
+    非本地权限动作（``suspend``/``resume``）返回空字符串——这类动作结构上就没有
+    范围概念，调用方按行拼接，空字符串不产生多余空行。
+
+    本地权限三类动作（授权/抑制/收回）的 payload 解析失败时**不再静默返回空
+    字符串**（Trace #328 opus 审查 P2：那会让管理员在确认卡上完全看不到"范围"
+    这一行，误以为这张卡不涉及具体范围，实际是数据异常被吞掉了）——改为渲染
+    :data:`_SCOPE_UNAVAILABLE_TEXT` 这行显式降级提示，指引管理员取消本卡重新
+    发起，而不是带着一个他没看到的范围去确认。
+
+    正常解析成功时，收回额外插入一行"方向：..."（说明被收回的是授权还是抑制，
+    卡 B 设计卡「含被收回的方向/公司/指标」），授权/抑制两类动作不受影响
+    （见 :func:`_direction_prefix`）。
+    """
+
+    if pending.action_type not in LOCAL_PERMISSION_ACTION_TYPES:
+        return ""
+    payload = _permission_payload(pending)
+    if payload is None:
+        return _SCOPE_UNAVAILABLE_TEXT
+    company_id = payload.get("company_id", "")
+    metric_name = payload.get("metric_name", "")
+    reason = payload.get("reason", "")
+    return (
+        f"{_direction_prefix(payload)}"
+        f"范围：公司 {company_id} · 指标 {metric_name}\n原因：{reason}\n"
+    )
+
+
+def _permission_scope_suffix(pending: PendingAction) -> str:
+    """管理群通知（单行文案）里的范围后缀；非本地权限动作返回空字符串。收回的
+    后缀额外带上方向（同上，见 :func:`_direction_prefix`）。"""
+
+    payload = _permission_payload(pending)
+    if payload is None:
+        return ""
+    company_id = payload.get("company_id", "")
+    metric_name = payload.get("metric_name", "")
+    reason = payload.get("reason", "")
+    direction = payload.get("direction")
+    direction_infix = f"{_DIRECTION_LABEL.get(direction, direction)} · " if direction else ""
+    return f"（{direction_infix}公司 {company_id} · 指标 {metric_name} · 原因 {reason}）"
 
 #: 卡片按钮点击回传的 ``decision`` 取值，与
 #: ``adapters/feishu_events.parse_card_action_event``/``core/admin/card_callback``
@@ -175,13 +287,17 @@ class GroupNotifier(Protocol):
 
 def render_confirm_card(pending: PendingAction, *, target_label: str) -> RenderedConfirmCard:
     """建卡时的初始展示：动作、目标（回显管理员自己刚输入的标识，不引入新的资料
-    披露）、影响范围与有效期。"""
+    披露）、影响范围与有效期。本地权限三类动作（授权/抑制/收回）额外插入一行
+    "范围+原因"（公司×指标 + 管理员填写的理由，解析自 ``pending.payload``，见
+    迁移 ``0073``）；收回再多一行"方向"（说明被收回的原本是授权还是抑制，卡 B
+    设计卡）。不回显该用户的其余任何权限内容，只讲这一次动作本身涉及的键。"""
 
     action_label = _ACTION_LABEL[pending.action_type]
     ttl_minutes = PENDING_ACTION_TTL_SECONDS // 60
     body = (
         f"动作：{action_label}用户\n"
         f"目标：{target_label}\n"
+        f"{_permission_scope_block(pending)}"
         f"影响：{_IMPACT_TEXT[pending.action_type]}\n"
         f"有效期：{ttl_minutes} 分钟内有效，过期后需重新查询并发起。"
     )
@@ -204,10 +320,12 @@ def render_confirm_card(pending: PendingAction, *, target_label: str) -> Rendere
 def render_terminal_card(
     pending: PendingAction, *, target_label: str, outcome_text: str
 ) -> RenderedConfirmCard:
-    """终态更新：不再带任何按钮（合同"更新为不可再次操作的最终状态"）。"""
+    """终态更新：不再带任何按钮（合同"更新为不可再次操作的最终状态"）。本地权限
+    三类动作同样带上"范围+原因"（收回再多一行"方向"）这一行，与确认卡同一姿态
+    （模块文档 ``render_confirm_card``）。"""
 
     action_label = _ACTION_LABEL[pending.action_type]
-    body = f"目标：{target_label}\n结果：{outcome_text}"
+    body = f"目标：{target_label}\n{_permission_scope_block(pending)}结果：{outcome_text}"
     return RenderedConfirmCard(title=f"{action_label}用户 · 已结束", body=body, buttons=())
 
 
@@ -258,7 +376,20 @@ def render_group_notice(pending: PendingAction) -> str:
     ``outcome_text``），确保 ``FAILED`` 分支的 ``reason`` 一定会经过形状白名单——
     交给调用方传入拼好的文案，等于把"这段文本安不安全群发"的判断权交还给一个不了解
     群通知安全要求的调用方（外部审查交叉裁定，opus P3-8）。
+
+    本地权限三类动作额外带一个"（公司 ... · 指标 ... · 原因 ...）"后缀（#319
+    S-P-1b：执行广播需要含公司/指标/方向/理由）——授权/抑制两类的方向已经由
+    ``action_label`` 本身表达，不重复渲染；收回的 ``action_label``（"收回"）
+    不能表达被收回的原本是授权还是抑制，因此后缀在收回场景下额外多带一段方向
+    文案（卡 B 设计卡「含被收回的方向/公司/指标」，见 :func:`_permission_scope_
+    suffix`）。仍然只讲这一次动作涉及的单一键，不回显该用户的其余任何权限内容。
+    管理员填写的 ``reason`` 是自由文本，本函数不对它做形状白名单（与
+    ``pending.reason`` 那条机器可读的状态码不同，这段文本来自当前唯一管理员本人
+    的输入，信任级别与确认卡私聊正文相同）。
     """
 
     action_label = _ACTION_LABEL[pending.action_type]
-    return f"管理操作 {pending.id}：{action_label}用户 · {_group_outcome_text(pending)}"
+    scope_suffix = _permission_scope_suffix(pending)
+    return (
+        f"管理操作 {pending.id}：{action_label}用户{scope_suffix} · {_group_outcome_text(pending)}"
+    )

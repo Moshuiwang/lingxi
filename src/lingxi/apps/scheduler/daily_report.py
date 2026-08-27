@@ -134,6 +134,7 @@ from lingxi.core.daily_report import (
     ActiveUserStats,
     DailyReportInputs,
     DeliveryOutcomeRow,
+    LocalOverrideActivity,
     MetricCoverageGap,
     PartialCount,
     Section,
@@ -147,6 +148,7 @@ from lingxi.core.daily_report import (
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
+    build_local_override_activity,
     build_metric_coverage_gap,
     build_status_distribution,
     build_token_usage_stats,
@@ -226,6 +228,21 @@ class _DailyStatsSource(Protocol):
     ) -> tuple[int, int, int, int, int, int]: ...
 
 
+class _LocalOverrideActivitySource(Protocol):
+    """「本地权限覆盖活动」段的可选取数口（Issue #319 S-P-1c）；实现是
+    :meth:`~lingxi.adapters.postgres_local_permission.PostgresLocalPermissionOverrideStore.
+    daily_activity_stats`。与 `metric_coverage`（下方 `DailyReportDuty.__init__`
+    的同名参数）同一条「可选取数回调」纪律，但本段需要统计窗口——`metric_coverage`
+    问的是"当前"的全局覆盖面差集，不随统计窗口变化；本段问的是"这一天"发生了
+    什么，因此签名比 `metric_coverage` 多了 `window_start`/`window_end` 两个
+    参数，与 `_DailyStatsSource` 其余六个方法同一个窗口口径。
+    """
+
+    def __call__(
+        self, *, window_start: datetime, window_end: datetime
+    ) -> tuple[int, int, int, int, int, int]: ...
+
+
 class _GroupSender(Protocol):
     def send_text(self, *, chat_id: str, text: str, dedupe_key: str) -> None: ...
 
@@ -258,6 +275,7 @@ class DailyReportDuty:
         stop: threading.Event | None = None,
         aggregation_join_timeout_seconds: float = DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS,
         metric_coverage: Callable[[], tuple[Sequence[str], Sequence[str]]] | None = None,
+        local_override_activity: _LocalOverrideActivitySource | None = None,
     ) -> None:
         self._source = source
         self._watermark = watermark
@@ -285,6 +303,15 @@ class DailyReportDuty:
         # `AlertingDuty` 心跳评估共用这条线程）直接调用，因此不会重新引入 #325
         # 刚修好的"耗时职责挤占心跳评估"问题。
         self._metric_coverage = metric_coverage
+        # 「本地权限覆盖活动」段（Issue #319 S-P-1c）。**可选，默认 None**——
+        # 与 `metric_coverage` 同一条纪律：不接线时这一段完全不出现在正文里
+        # （见 core/daily_report.py 的 DailyReportInputs.local_override_activity
+        # 三态说明）。取数只查 Lingxi 自己的 `local_permission_override` 表，不
+        # 含任何网络调用，因此不需要单独考虑「重新引入 #325 心跳阻塞问题」——
+        # 与 `metric_coverage`（含一次真实 MCP 网络调用）不同，但仍然只会在
+        # `_aggregate_and_send`（后台聚合线程）里被 `_fetch` 调用，不会被
+        # `run_once` 本身直接调用，理由同上（保持两段接线方式一致，便于阅读）。
+        self._local_override_activity = local_override_activity
 
     @property
     def stopping(self) -> bool:
@@ -482,6 +509,22 @@ class DailyReportDuty:
         else:
             metric_coverage_raw, metric_coverage_fetch_reason = None, None
 
+        # 「本地权限覆盖活动」段（Issue #319 S-P-1c）。与 `metric_coverage` 同一
+        # 条「未接线不产生 _fetch 失败留痕」纪律，但用主统计窗口（`window_start`/
+        # `window_end`，与前五段同一个窗口）而不是 `metric_coverage` 那种无窗口
+        # 的全局查询——见 `_LocalOverrideActivitySource` 的文档。
+        local_override_raw: tuple[int, int, int, int, int, int] | None
+        local_override_fetch_reason: str | None
+        if self._local_override_activity is not None:
+            local_override_raw, local_override_fetch_reason = self._fetch(
+                "local_override_activity",
+                lambda: self._local_override_activity(
+                    window_start=window_start, window_end=window_end
+                ),
+            )
+        else:
+            local_override_raw, local_override_fetch_reason = None, None
+
         if self._stop.is_set():
             # 停止信号可能落在四段读取期间到达：干净中断，不发送、不置位、不提交
             # 节流状态，与 RosterAuditDuty 的同一条纪律（停止之后必须 0 次发送）。
@@ -580,6 +623,36 @@ class DailyReportDuty:
                 build_metric_coverage_gap(mcp_metric_ids, mapped_metric_ids)
             )
 
+        # 三态见 core/daily_report.py 的 DailyReportInputs.local_override_activity
+        # 文档：未接线保持 None；接线但本轮取数失败 → 不可判定；取数成功 → 纯函数
+        # 判定（当日零活动且当前生效总数为零时 `Section.of(None)`，正文因此完全
+        # 不出现这一段——无差异不报，Issue #319 S-P-1c）。
+        local_override_activity: Section[LocalOverrideActivity | None] | None
+        if self._local_override_activity is None:
+            local_override_activity = None
+        elif local_override_fetch_reason is not None:
+            local_override_activity = Section.undetermined(local_override_fetch_reason)
+        else:
+            assert local_override_raw is not None
+            (
+                granted_today,
+                suppressed_today,
+                revoked_today,
+                active_grant_total,
+                active_suppress_total,
+                affected_user_count,
+            ) = local_override_raw
+            local_override_activity = Section.of(
+                build_local_override_activity(
+                    granted_today=granted_today,
+                    suppressed_today=suppressed_today,
+                    revoked_today=revoked_today,
+                    active_grant_total=active_grant_total,
+                    active_suppress_total=active_suppress_total,
+                    affected_user_count=affected_user_count,
+                )
+            )
+
         inputs = DailyReportInputs(
             window_start=window_start,
             window_end=window_end,
@@ -592,6 +665,7 @@ class DailyReportDuty:
             resource_usage=resource_usage,
             delivery_outcome=delivery_outcome,
             metric_coverage_gap=metric_coverage_gap,
+            local_override_activity=local_override_activity,
             delivery_window_start=delivery_window_start,
             delivery_window_end=delivery_window_end,
         )
@@ -674,6 +748,10 @@ class DailyReportDuty:
         ]
         if metric_coverage_gap is not None:
             determinable_sections.append(("metric_coverage", metric_coverage_gap))
+        # 「本地权限覆盖活动」未接线（`local_override_activity is None`）同理不
+        # 出现在这个列表里——理由与上面 `metric_coverage_gap` 的同一段注释一致。
+        if local_override_activity is not None:
+            determinable_sections.append(("local_override_activity", local_override_activity))
         self._audit.record(
             "daily_report.sent",
             report_date=today.isoformat(),
@@ -763,7 +841,44 @@ def _build_daily_report_duty(
         chat_id=config.admin_group_chat_id,
         stop=stop,
         metric_coverage=_build_metric_coverage_check(config, audit=audit),
+        local_override_activity=_build_local_override_activity_check(config, audit=audit),
     )
+
+
+def _build_local_override_activity_check(
+    config: SchedulerConfig, *, audit: AuditSink
+) -> _LocalOverrideActivitySource | None:
+    """装配「本地权限覆盖活动」段的取数回调（Issue #319 S-P-1c）。
+
+    **与 :func:`_build_metric_coverage_check` 同一形状，但没有对应的「缺前置」
+    分支**：后者需要两个额外的可选环境变量（`LINGXI_MCP_TOKEN_ENCRYPT_KEY`/
+    `LINGXI_QUERY_MCP_ENDPOINT`）才能真的调一次 MCP；本段唯一依赖的是
+    `config.postgres_dsn`/`config.postgres_timeouts`——两者是 `SchedulerConfig.
+    from_env` 自身的必需项（`LINGXI_POSTGRES_DSN` 缺失时，进程在装配到这里之前
+    就已经拒绝启动，见 `SchedulerConfig.from_env` 的 `required(...)`），因此
+    **不存在**"这个前置缺了、只关掉这一段"的真实场景，本函数恒返回一个真实
+    回调。保留 `... | None` 的返回类型只是为了与 `_build_metric_coverage_check`
+    同一签名形状，供 `_build_daily_report_duty` 用统一的调用方式装配两段可选
+    子功能，不是暗示这里真的会返回 `None`。
+
+    表本身可能还没有被迁移过的环境（`local_permission_override` 是新增于
+    本批次的表，见迁移 `0072`/`0073`）不在本函数的判断范围——那属于「装配时
+    无法预知、只能在真的查询那一刻才会暴露」的运行期故障，与"表已存在但这次
+    查询超时"没有本质区别，已经由 `DailyReportDuty._fetch` 的既有单段失败纪律
+    覆盖（本段查询失败时只让这一段显式「不可判定」，不影响通报其余段落），
+    不需要在装配阶段另建一条 `..._not_wired` 审计去重复这件事。
+    """
+
+    from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+
+    store = PostgresLocalPermissionOverrideStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
+
+    def _check(*, window_start: datetime, window_end: datetime) -> tuple[int, int, int, int, int, int]:
+        return store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+    return _check
 
 
 def _build_metric_coverage_check(

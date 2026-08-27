@@ -180,9 +180,16 @@ class DenyReasonTextTest(unittest.TestCase):
         reason = build_policy().decide("CronCreate", {}).model_reason or ""
 
         self.assertIn("系统侧", reason)
-        self.assertIn("已经被记录", reason)
         self.assertIn("不要说这与用户的账号、权限或登录状态有关", reason)
         self.assertIn("不要建议用户重新登录、联系管理员或自行申请权限", reason)
+
+    def test_reason_no_longer_promises_that_the_denial_was_recorded(self) -> None:
+        """Issue #349：判定层本身不写任何记录/告警系统，"问题已经被记录"是一句
+        兑现不了的承诺，已从模板中删除（两个拒绝模板都不得再出现这句话）。"""
+
+        reason = build_policy().decide("CronCreate", {}).model_reason or ""
+
+        self.assertNotIn("已经被记录", reason)
 
 
 class DeniedTurnStillClosesTest(unittest.TestCase):

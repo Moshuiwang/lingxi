@@ -72,6 +72,46 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
 **本职责仍然不通知**：通知的触发点在发布读回一致（撤权）或就绪探针成功（增权）之后，
 属 :mod:`lingxi.apps.scheduler.permission_publish`。这里连一个发送端口都没有。
 
+## 全抑制（本地覆盖压光全部权限）同样走撤权出口（红线-2，Trace #328 opus 审查）
+
+四源合并（下文「本地权限覆盖合并」一节）之后，``merged.permissions`` 可能是空字典——
+这个人银河这一侧原本是有效授权（否则更早的 ``aggregate.granted`` 判据已经把他分流进
+上面的撤权分支，走不到翻译与合并这一步），但本地抑制把翻译出的全部指标都抑制掉了。
+**这不是"无可用银河权限"**（``no_galaxy_roles``/``no_supported_function``/
+``no_company_scope`` 三个原因码都不适用），是"银河给了、本地行政性地收回到零"——语义
+上与撤权完全一致（这个人此刻确实没有任何可发布内容），因此复用同一套
+:meth:`_revoke` 机制（保行清空 ``permissions``、只对发布链上留过足迹的人发、走
+:data:`PERMISSION_REVOKE_REASON`），但传一个**可分辨**的原因码
+（:data:`REASON_FULLY_SUPPRESSED`）。修复前的实际行为是：直接把空字典传给
+``build_translated_publish_row`` → ``serialize_translated_permissions`` 对空输入抛
+``ValueError``，这个异常不被任何分支捕获，冒泡到 ``run_once`` 的单用户异常兜底，
+记成一条不可分辨的通用 ``permission_refresh.user_failed``——审计上完全看不出"这个人
+是被本地抑制清空的"，与真正的技术故障混在同一个原因桶里。
+
+## 已送达正文同步清（S-P-5，Trace #328）
+
+授权、撤权两条路径调用 :meth:`~lingxi.adapters.postgres_permission_publish.
+PostgresPermissionPublishStore.record_decision` 时都传 ``clear_delivered_content=True``：
+权限确实变化（``decision.enqueued`` 为真，即这次不是 ``UNCHANGED``）时，该方法在**自己
+的同一个数据库事务**里顺带清空这个用户全部会话已送达、随会话保留的投递正文，并排队
+失效当前 Agent 会话——机制与理由见该方法文档，本职责这里只是**接入点**，不复制其锁序
+或事务边界的任何细节。
+
+**开关放在调用方而不是 ``record_decision`` 内部自行判断**：同一个方法也服务首次开通
+（``core/identity/onboarding_runner.py``），那条路径的用户结构上不可能有历史会话，因此
+不传这个开关——见 ``record_decision`` 文档「为什么是调用方显式传入的开关」一节。
+
+清理**发生**时（即 ``decision.enqueued`` 为真，不管这次实际清出多少条事件）记一条
+``permission_refresh.delivered_content_cleared`` 审计，``cleared`` 字段是清出的事件数
+（可能是 0——一个刚被授权、还没有任何历史会话的人）；不含正文本身，与本职责其余审计
+同一条纪律（模块文档顶部 :class:`PermissionRefreshReport` 的说明）。``UNCHANGED`` 分支
+不记这条审计，因为清理压根没有发生。
+
+**``trigger`` 字段**（``grant``/``revoke``，:data:`TRIGGER_GRANT`/:data:`TRIGGER_REVOKE`，
+Trace #328 opus 审查）：这条审计的两个调用点分别在 :meth:`_refresh_user`（授权，含
+红线-2 的全抑制撤权，见「全抑制」一节）与 :meth:`_revoke`（银河侧撤权），运维排查时
+不必回头核对同一批次里的其他审计行才能分辨"这次清理是哪条路径触发的"。
+
 ## 令牌：只读既有，绝不签发
 
 需要新建发布行的用户，其 ``token_cipher`` 只取该用户**已经登记在令牌表里**的那一份
@@ -135,6 +175,21 @@ PostgresPermissionPublishStore.record_decision` 判 ``UNCHANGED``，不推进版
 并计入报告，而"有失败就整轮重来"会让一次持续的数据库故障变成每分钟重跑一遍全员——
 那既救不了那个用户，又会把其余职责的时间预算吃掉。失败的用户等下一天那一轮，这正是
 "每日刷新"的语义。收到停止信号而中断的那一轮**不置位**：它没走完。
+
+## 本地权限覆盖合并（S-P-3，Issue #319）与存量权限沿用（S-P-2，Trace #328）
+
+授权侧翻译成功（``company_metrics``）之后、结算发布行之前，`_refresh_user` 调用
+:func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 把该用户当前
+生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）与存量沿用
+（正式权限发布表里该用户的既有行，:class:`~lingxi.core.permission.legacy_source.
+LegacyPermissionTable`，装配层未接线时同样为 ``None``）并进去：真实权限 =
+(银河翻译结果 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。语义细节（通配角 v1、空结果丢键、
+``legacy=None`` 恒等）见该模块文档，不在这里复述。存量源的读取与失败降级由
+:func:`~lingxi.core.permission.legacy_source.resolve_legacy_source` 承担——读取/解析
+失败只跳过这一个用户的存量源、响亮记 ``permission_refresh.legacy_source_skipped``
+审计，不整轮/整人失败；装配层未接线时静默按"没有存量源"处理，与本地覆盖同一姿态。
+本地覆盖与存量沿用都**只影响授权路径**，不影响 ``_revoke``——撤权写的是不含指标名
+的 ``{}``，两者对它都没有作用面，与翻译层「与撤权无关」同一条边界。
 """
 
 from __future__ import annotations
@@ -149,6 +204,17 @@ from typing import Any, Protocol
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.local_override import (
+    LocalPermissionOverrideEntry,
+    ResolvedLocalOverrides,
+    resolve_local_overrides,
+)
+from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
+from lingxi.core.permission.merge_sources import (
+    ALL_COMPANIES_KEY,
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    merge_permission_sources,
+)
 from lingxi.core.permission.metric_translation import (
     UncoveredPermissionCombination,
     metric_translation_available,
@@ -172,6 +238,19 @@ PERMISSION_REFRESH_REASON = "daily_permission_refresh"
 #: 在 outbox 里一眼可辨——两者的 payload 差别只有 ``permissions`` 一列的内容，
 #: 靠肉眼比对 JSON 文本来分辨一次不可逆的外部写入，不是可接受的运维姿态。
 PERMISSION_REVOKE_REASON = "daily_permission_revoke"
+
+#: 银河这一侧原本有效授权，但本地抑制把翻译结果压光到空字典时的撤权原因码
+#: （红线-2，Trace #328 opus 审查）。与匹配失败、聚合层 fail-closed 的三个原因码
+#: （``no_galaxy_roles``/``no_supported_function``/``no_company_scope``）区分开，
+#: 让审计能一眼看出"这个人是被本地抑制清空的"，不是"银河本来就没给他权限"。
+REASON_FULLY_SUPPRESSED = "fully_suppressed"
+
+#: ``permission_refresh.delivered_content_cleared`` 审计的 ``trigger`` 字段取值
+#: （S-P-5 措辞如实化，Trace #328 opus 审查）：区分这次清理是授权路径（含全抑制
+#: 撤权，见 :data:`REASON_FULLY_SUPPRESSED`）还是银河撤权路径触发的，供运维排查
+#: 时不必回头核对 ``reason`` 列才能分辨。
+TRIGGER_GRANT = "grant"
+TRIGGER_REVOKE = "revoke"
 
 # ---- 跳过原因码。全部是**固定字面量**，不含任何字段值 -----------------------
 #: 花名册快照压根不存在。
@@ -299,6 +378,11 @@ class _PublishHistory(Protocol):
 
 class _Decision(Protocol):
     enqueued: bool
+    # 本次决定顺带清掉的已送达、随会话保留投递正文事件数（S-P-5，
+    # Trace #328）。只有调用 ``record_decision(clear_delivered_content=True)`` 且
+    # 真的走到 ``ENQUEUED`` 时才可能非零；本职责只如实把它写进审计计数，不自己
+    # 判断"要不要清"——那条判定连同事务边界只有 ``record_decision`` 一处实现。
+    cleared_events: int
 
 
 class _DecisionStore(Protocol):
@@ -310,8 +394,33 @@ class _DecisionStore(Protocol):
     """
 
     def record_decision(
-        self, *, user_id: str, row: Any, reason: str, decided_at: datetime
+        self,
+        *,
+        user_id: str,
+        row: Any,
+        reason: str,
+        decided_at: datetime,
+        clear_delivered_content: bool = False,
     ) -> _Decision: ...
+
+
+class _LocalOverrideReader(Protocol):
+    """本地权限覆盖的按用户读取口（S-P-3，Issue #319）。
+
+    实现是 :meth:`~lingxi.adapters.postgres_local_permission.
+    PostgresLocalPermissionOverrideStore.effective_entries` 经装配层适配（返回值从
+    ``StoredLocalPermissionOverride`` 解出 ``.entry``——本协议只认纯类型
+    :class:`~lingxi.core.permission.local_override.LocalPermissionOverrideEntry`，
+    不认数据库分配的行标识，理由与 :class:`_PublishHistory` 只声明一个方法相同：
+    本职责只需要"这个用户当前生效的覆盖条目有哪些"，不需要收回单条覆盖的能力）。
+
+    ``None``（装配层未装配）与本方法读取失败在调用方眼里是**不同**的两件事：前者
+    静默按"没有本地源"处理（部署事实，不告警）；后者响亮审计
+    （:data:`~lingxi.core.permission.merge_sources.REASON_LOCAL_OVERRIDE_READ_FAILED`），
+    但结果都是"这一轮/这个用户跳过本地源"——不整轮失败、不静默吞掉异常。
+    """
+
+    def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
 
 
 @dataclass(frozen=True)
@@ -425,6 +534,8 @@ class PermissionRefreshDuty:
         audit: _AuditSink,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
+        local_overrides: _LocalOverrideReader | None = None,
+        legacy_source: LegacyPermissionTable | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
         self._roster_snapshot = roster_snapshot
@@ -435,6 +546,15 @@ class PermissionRefreshDuty:
         self._role_function_map = role_function_map
         self._metric_translation_map = metric_translation_map
         self._audit = audit
+        # 本地权限覆盖读取口（S-P-3）：``None`` 表示装配层还没接这个 store——本轮/
+        # 本用户的合并按"没有本地源"处理，产出与今天逐字节一致（模块文档「翻译」
+        # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
+        # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
+        self._local_overrides = local_overrides
+        # 存量权限只读源（S-P-2，Trace #328）：``None`` 表示装配层还没接这个 store——
+        # 本轮/本用户的合并按"没有存量源"处理，产出与今天逐字节一致（同
+        # ``local_overrides=None`` 的既有姿态）。真实实现见 ``apps/scheduler/assembly.py``。
+        self._legacy_source = legacy_source
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
@@ -656,11 +776,38 @@ class PermissionRefreshDuty:
             self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
             return
 
+        # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328）：真实权限 =
+        # (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。挂在「翻译完成之后、结算发布行
+        # 之前」——`company_metrics` 就是银河那一侧已经翻译好的 `{公司: (指标名, …)}`。
+        # 见 `core/permission/merge_sources.py` 模块文档；存量源的失败降级见
+        # `core/permission/legacy_source.py` 模块文档。
+        local = self._resolve_local_overrides(identity.app_user_id)
+        legacy = self._resolve_legacy_source(identity.app_user_id, identity.email, company_metrics)
+        merged = merge_permission_sources(galaxy=company_metrics, local=local, legacy=legacy)
+        for reason in merged.skipped_reasons:
+            # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
+            # `merge_permission_sources` 模块文档「通配角」一节。
+            self._audit.record(
+                "permission_refresh.local_override_skipped",
+                user=identity.app_user_id,
+                reason=reason,
+            )
+
+        if not merged.permissions:
+            # 红线-2（Trace #328 opus 审查）：银河这一侧原本是有效授权
+            # （company_metrics 非空，翻译已经成功），但本地抑制把合并结果压光到
+            # 空字典——这个人此刻没有任何可发布内容，语义上等同于撤权。走
+            # `_revoke` 同一套机制（保行清空、只对发布链上留过足迹的人发），但带一个
+            # 可分辨的原因码，不落到 `build_translated_publish_row` 对空输入的
+            # `ValueError` → 通用 `user_failed`（模块文档「全抑制」一节）。
+            self._revoke(tally, identity, REASON_FULLY_SUPPRESSED, now)
+            return
+
         # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
         # 失败关闭）。这里没有、也不允许有任何签发路径。
         token_cipher = self._token_ciphers.token_cipher(identity.app_user_id)
         row = build_translated_publish_row(
-            company_metrics=company_metrics,
+            company_metrics=merged.permissions,
             email=identity.email,
             display_name=identity.display_name,
             decided_at=now,
@@ -671,13 +818,91 @@ class PermissionRefreshDuty:
             row=row,
             reason=PERMISSION_REFRESH_REASON,
             decided_at=now,
+            # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
+            # 已送达、随会话保留的投递正文（S-P-5，Trace #328）。
+            clear_delivered_content=True,
         )
         if decision.enqueued:
             tally.enqueued += 1
+            self._audit.record(
+                "permission_refresh.delivered_content_cleared",
+                user=identity.app_user_id,
+                cleared=decision.cleared_events,
+                trigger=TRIGGER_GRANT,
+            )
         else:
             # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
-            # 不排新意图——判定在 ``record_decision`` 里，本职责只如实计数。
+            # 不排新意图、不清理——判定在 ``record_decision`` 里，本职责只如实计数。
             tally.unchanged += 1
+
+    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
+        """读该用户当前生效的本地覆盖条目并解决成 ``ResolvedLocalOverrides``。
+
+        两种情形都返回 ``None``（对 :func:`merge_permission_sources` 恒等），但审计
+        姿态不同：
+
+        - **装配层没有接这个 store**（``self._local_overrides is None``）：部署事实，
+          不告警——与「store 缺席=行为一致」的既有装配纪律同一姿态。
+        - **读取失败**（数据库异常）：该用户本轮跳过本地源，**响亮**记一条
+          ``permission_refresh.local_override_skipped``（``reason=local_override_read_failed``），
+          异常本身不冒泡——一个用户的本地覆盖读取失败不得带走这个人当轮的银河权限
+          发布，更不能带走整轮（`_refresh_user` 外层的 ``run_once`` 也兜底捕获单用户
+          异常，这里提前捕获是为了把"翻译失败"与"本地覆盖读取失败"两种原因分开
+          审计，而不是让两者都落进同一个笼统的 ``permission_refresh.user_failed``）。
+        """
+
+        if self._local_overrides is None:
+            return None
+        try:
+            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整轮/整人失败
+            self._audit.record(
+                "permission_refresh.local_override_skipped",
+                user=user_id,
+                reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+            )
+            logger.error(
+                "本地权限覆盖读取失败，本轮该用户跳过本地源 user=%s error=%s",
+                user_id,
+                type(error).__name__,
+            )
+            return None
+        return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _resolve_legacy_source(
+        self, user_id: str, email: str, company_metrics: Mapping[str, Sequence[str]]
+    ) -> dict[str, tuple[str, ...]] | None:
+        """按红线-1 的有界条件（Trace #328 opus 审查）决定这个用户本轮要不要读存量源。
+
+        两条判据都会让本方法直接返回 ``None``、**不发起任何 ``find_rows`` 调用**
+        （省一次读放大）：
+
+        1. **通配用户**（``company_metrics`` 出现 :data:`~lingxi.core.permission.
+           merge_sources.ALL_COMPANIES_KEY` 键）：:func:`~lingxi.core.permission.
+           merge_sources.merge_permission_sources` 的通配分支本就完全不读 ``legacy``
+           参数（该模块文档「通配角」一节），读来的存量权限必然被丢弃——读了也是白读。
+        2. **已经在发布链上留下过足迹**（:meth:`_PublishHistory.has_publish_footprint`
+           为真：发布成功过，或当前还有 ``pending``/``publishing`` 的意图在途）：正式
+           权限发布表此刻很可能已经是 Lingxi 自己写的内容，不再是"旧系统遗留、我们
+           从未碰过"的存量——参与合并会把自己昨天的发布内容原样并回来，形成自反馈环
+           （详见 ``core/permission/legacy_source.py`` 模块文档「有界条件」一节）。
+
+        两条判据都不成立（未通配、且从未有过发布足迹）时才真正调用
+        :func:`~lingxi.core.permission.legacy_source.resolve_legacy_source`，读取/解析
+        失败的降级与审计姿态见该函数文档，本方法不重复。
+        """
+
+        if ALL_COMPANIES_KEY in company_metrics:
+            return None
+        if self._publish_history.has_publish_footprint(user_id):
+            return None
+        return resolve_legacy_source(
+            email=email,
+            table=self._legacy_source,
+            audit=self._audit,
+            action="permission_refresh.legacy_source_skipped",
+            user=user_id,
+        )
 
     def _revoke(
         self,
@@ -733,12 +958,22 @@ class PermissionRefreshDuty:
             row=row,
             reason=PERMISSION_REVOKE_REASON,
             decided_at=now,
+            # 权限确实变化（真的排出撤权意图）时，在 record_decision 自己的同一个
+            # 事务里顺带清空该用户已送达、随会话保留的投递正文（S-P-5，Trace #328），
+            # 与授权侧同一个开关、同一条理由。
+            clear_delivered_content=True,
         )
         if decision.enqueued:
             tally.enqueued += 1
             tally.revoked_published += 1
+            self._audit.record(
+                "permission_refresh.delivered_content_cleared",
+                user=identity.app_user_id,
+                cleared=decision.cleared_events,
+                trigger=TRIGGER_REVOKE,
+            )
         else:
-            # 上一条意图已经是同一份空权限：不推进版本、不排新意图。
+            # 上一条意图已经是同一份空权限：不推进版本、不排新意图、不清理。
             tally.unchanged += 1
         self._audit.record(
             "permission_refresh.user_revoked",
@@ -805,7 +1040,10 @@ __all__ = [
     "PERMISSION_REVOKE_REASON",
     "PermissionRefreshDuty",
     "PermissionRefreshReport",
+    "REASON_FULLY_SUPPRESSED",
     "SKIP_METRIC_TRANSLATION_UNAVAILABLE",
     "SKIP_METRIC_TRANSLATION_UNCOVERED",
     "SKIP_NO_PUBLISHED_ROW",
+    "TRIGGER_GRANT",
+    "TRIGGER_REVOKE",
 ]

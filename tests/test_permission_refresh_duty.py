@@ -42,16 +42,29 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.apps.scheduler.permission_refresh import (
+    REASON_FULLY_SUPPRESSED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
     SKIP_METRIC_TRANSLATION_UNCOVERED,
     SKIP_MISSING_PERSONNEL_ID,
     SKIP_MISSING_SNAPSHOT,
     SKIP_NO_GALAXY_BATCH,
+    SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
+    TRIGGER_GRANT,
+    TRIGGER_REVOKE,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
+from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.merge_sources import (
+    REASON_GRANT_REDUNDANT_WILDCARD,
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
+)
+from lingxi.core.permission.publish import ExistingPermissionRow
+from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 DUTY_SOURCE = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py"
@@ -243,22 +256,105 @@ class FakePublishHistory:
         return user_id in self._published
 
 
+class FakeLocalOverrides:
+    """本地权限覆盖读取口的假实现（S-P-3，Issue #319）。
+
+    ``entries`` 按用户登记条目；``fail_for`` 里的用户读取时直接抛异常，供
+    :class:`LocalOverrideMergeTest` 钉住"读取失败只降级、不整用户/整轮失败"。
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, tuple[LocalPermissionOverrideEntry, ...]] | None = None,
+        *,
+        fail_for: set[str] | None = None,
+    ) -> None:
+        self._entries = entries or {}
+        self._fail_for = fail_for or set()
+        self.calls: list[str] = []
+
+    def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
+        self.calls.append(user_id)
+        if user_id in self._fail_for:
+            raise RuntimeError("注入的本地覆盖读取失败")
+        return self._entries.get(user_id, ())
+
+
+class FakeLegacyTable:
+    """存量权限只读源的假实现（S-P-2，Issue #319 / Trace #328）。
+
+    ``rows_by_email`` 按（规范化）邮箱登记该用户存量行的 ``permissions`` 单元格文本；
+    ``find_error`` 非空时直接抛异常；``duplicate_for`` 里的邮箱命中两行，供
+    :class:`LegacySourceMergeTest` 钉住"读取失败/多行冲突只降级、不整用户/整轮失败"。
+    """
+
+    def __init__(
+        self,
+        rows_by_email: dict[str, str] | None = None,
+        *,
+        find_error: Exception | None = None,
+        duplicate_for: set[str] | None = None,
+    ) -> None:
+        self._rows = rows_by_email or {}
+        self._find_error = find_error
+        self._duplicate_for = duplicate_for or set()
+        self.find_calls: list[tuple[str, str]] = []
+
+    def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
+        self.find_calls.append((record_key, email))
+        if self._find_error is not None:
+            raise self._find_error
+        if email not in self._rows:
+            return ()
+        row = ExistingPermissionRow(
+            record_id=f"rec_{email}",
+            fields={"record_key": email, "email": email, "permissions": self._rows[email]},
+        )
+        return (row, row) if email in self._duplicate_for else (row,)
+
+
 class _FakeDecision:
-    def __init__(self, enqueued: bool) -> None:
+    def __init__(self, enqueued: bool, *, cleared_events: int = 0) -> None:
         self.enqueued = enqueued
+        self.cleared_events = cleared_events
 
 
 class FakeDecisions:
-    def __init__(self, *, unchanged_users: set[str] | None = None, failing_users: set[str] | None = None) -> None:
+    """``record_decision`` 的假实现。``cleared_events_by_user`` 配置「假装真的清出了
+    多少条已送达正文事件」（S-P-5，Trace #328）——只在 ``enqueued`` 且调用方传了
+    ``clear_delivered_content=True`` 时才会被使用，与真实 ``record_decision`` 的
+    "``UNCHANGED`` 恒为 0、清理开关必须调用方显式打开"同一条语义，供
+    :class:`DeliveredContentPurgeTest` 钉住职责层的接入面。"""
+
+    def __init__(
+        self,
+        *,
+        unchanged_users: set[str] | None = None,
+        failing_users: set[str] | None = None,
+        cleared_events_by_user: dict[str, int] | None = None,
+    ) -> None:
         self.calls: list[dict] = []
         self._unchanged = unchanged_users or set()
         self._failing = failing_users or set()
+        self._cleared_events_by_user = cleared_events_by_user or {}
 
-    def record_decision(self, *, user_id, row, reason, decided_at):
+    def record_decision(
+        self, *, user_id, row, reason, decided_at, clear_delivered_content: bool = False
+    ):
         if user_id in self._failing:
             raise RuntimeError("注入的落库失败")
-        self.calls.append({"user_id": user_id, "row": row, "reason": reason, "decided_at": decided_at})
-        return _FakeDecision(user_id not in self._unchanged)
+        self.calls.append(
+            {
+                "user_id": user_id,
+                "row": row,
+                "reason": reason,
+                "decided_at": decided_at,
+                "clear_delivered_content": clear_delivered_content,
+            }
+        )
+        enqueued = user_id not in self._unchanged
+        cleared = self._cleared_events_by_user.get(user_id, 0) if clear_delivered_content and enqueued else 0
+        return _FakeDecision(enqueued, cleared_events=cleared)
 
 
 class FixedClock:
@@ -353,6 +449,9 @@ def build_duty(
     stop: threading.Event | None = None,
     published_users: set[str] | None = None,
     metric_translation_map=None,
+    role_function_map=None,
+    local_overrides: FakeLocalOverrides | None = None,
+    legacy_source: FakeLegacyTable | None = None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
@@ -370,13 +469,15 @@ def build_duty(
         decisions=decisions,
         publish_history=history,
         token_ciphers=tokens,
-        role_function_map=ROLE_FUNCTION_MAP,
+        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
         metric_translation_map=(
             METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
         ),
         audit=audit,
         clock=clock or FixedClock(TODAY),
         stop=stop,
+        local_overrides=local_overrides,
+        legacy_source=legacy_source,
     )
     return duty, {
         "audit": audit,
@@ -914,6 +1015,256 @@ class MetricTranslationGateTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 三点六、本地权限覆盖合并（S-P-3，Issue #319）
+# --------------------------------------------------------------------------
+
+
+def _override_entry(
+    *,
+    user_id: str = USER_ONE,
+    direction: OverrideDirection = OverrideDirection.GRANT,
+    company_id: str = COMPANY_ID,
+    metric_name: str = "本地指标",
+) -> LocalPermissionOverrideEntry:
+    return LocalPermissionOverrideEntry(
+        user_id=user_id,
+        direction=direction,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason="U1 特批",
+        initiated_by_open_id="ou_admin",
+        pending_action_id="pac_fake",
+        created_at=TODAY,
+    )
+
+
+class LocalOverrideMergeTest(unittest.TestCase):
+    """授权侧翻译成功之后的四源合并接线：真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) −
+    本地抑制，挂在结算发布行之前（``merge_sources.merge_permission_sources`` 模块
+    文档「挂点」一节）。"""
+
+    def test_store_absent_matches_todays_behavior(self) -> None:
+        """装配层未接本地覆盖 store（``local_overrides=None``，默认值）：产出与
+        接线之前逐字节一致——`GrantedUserTest.
+        test_the_published_row_is_built_from_the_archived_identity` 的同一断言。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+
+    def test_local_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """本地授权后聚合含并集（#319 验收断言）：银河翻译出的指标名与本地授权的
+        指标名同时出现在同一个公司键下。"""
+
+        overrides = FakeLocalOverrides({USER_ONE: (_override_entry(),)})
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["本地指标","{METRIC_NAME}"]}}')
+        self.assertEqual(overrides.calls, [USER_ONE])
+
+    def test_local_suppression_removes_a_galaxy_granted_metric(self) -> None:
+        """抑制后不含：本地抑制命中的是**银河翻译产出**的指标名（不是本地授权自己
+        加的那条），证明减法作用于并集之后的整体结果，不只是"本地授权 vs 本地抑制"
+        内部打架那一层（那一层由 ``resolve_local_overrides`` 早就处理过）。第二家
+        公司的指标不受影响，只有被抑制到空的那个公司键从结果里消失
+        （`merge_sources` 模块文档「空结果」一节）。"""
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_ONE, "NG")),
+            country_rows=(
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+                ("NG", "NIGERIA", "尼日利亚", COMPANY_ID_TWO),
+            ),
+        )
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+        )
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy, local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID_TWO}":["{METRIC_NAME_TWO}"]}}')
+
+    def test_read_failure_skips_local_source_and_audits(self) -> None:
+        """读取失败：该用户本轮跳过本地源并响亮审计，不整轮失败、不静默——发布仍然
+        照常进行（只是不含本地覆盖），不计入 ``report.failed``。"""
+
+        overrides = FakeLocalOverrides(fail_for={USER_ONE})
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        report = duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(report.failed, 0, "本地覆盖读取失败不得记成整用户失败")
+        self.assertIn("permission_refresh.local_override_skipped", parts["audit"].actions())
+        fields = parts["audit"].fields_for("permission_refresh.local_override_skipped")[0]
+        self.assertEqual(fields["user"], USER_ONE)
+        self.assertEqual(fields["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
+
+    def test_wildcard_admin_skips_both_grant_and_suppress_with_audit(self) -> None:
+        """通配角 v1（编排者裁定）：``all_companies=True`` 时本地授权与抑制**整体
+        不参与合并**，结果与银河原始的通配映射逐字节相同；两个理由各记一条
+        ``permission_refresh.local_override_skipped`` 审计，动作名与原因码可分辨。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
+        )
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=((GALAXY_ACCOUNT_ONE, ADMIN_FULL_ACCESS_FUNCTION),)),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: (METRIC_NAME,)}},
+            local_overrides=overrides,
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"*":["{METRIC_NAME}"]}}', "通配下本地源整体不生效")
+        skipped = parts["audit"].fields_for("permission_refresh.local_override_skipped")
+        reasons = {fields["reason"] for fields in skipped}
+        self.assertEqual(
+            reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
+        )
+
+
+class LegacySourceMergeTest(unittest.TestCase):
+    """存量权限沿用接线（S-P-2，Issue #319 / Trace #328）：与
+    ``tests/test_permission_legacy_source.py`` 的纯函数用例同一组语义，这里钉的是
+    ``PermissionRefreshDuty`` 真的把它接进四源合并、真的按失败语义降级审计。"""
+
+    def test_table_absent_matches_todays_behavior(self) -> None:
+        """装配层未接线（``legacy_source=None``，默认值）：产出与接线之前逐字节
+        一致——`GrantedUserTest.test_the_published_row_is_built_from_the_archived_identity`
+        的同一断言。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+
+    def test_no_matching_legacy_row_is_also_identity(self) -> None:
+        """接线了但这个用户没有存量行：与"没有接线"同一个结果——新用户的常见形态。"""
+
+        legacy = FakeLegacyTable({})
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(legacy.find_calls, [(EMAIL_ONE, EMAIL_ONE)])
+
+    def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
+        """存量沿用后聚合含并集（本卡验收断言①）。**同时是红线-1 的正向不回归
+        用例**（Trace #328 opus 审查）：这个用户从未发布过（默认夹具，
+        ``published_users`` 为空），有界化判据必须放行——存量沿用照常生效。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["legacy_metric"]}}'})
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["legacy_metric","{METRIC_NAME}"]}}')
+
+    def test_a_user_with_a_publish_footprint_never_reads_legacy(self) -> None:
+        """红线-1 否定用例（Trace #328 opus 审查）：这个用户已经在发布链上留下过
+        足迹（``published_users`` 命中），legacy 有界化判据必须挡住存量沿用——
+        **连 ``find_rows`` 都不发起**（省读放大，见 ``_resolve_legacy_source``
+        文档）。存量行故意携带一个当前银河翻译结果里没有的指标，模拟"Lingxi 昨天
+        发布过的内容被当作存量沿用原样读了回来"的自反馈环风险：今天的发布内容
+        必须不含它，收窄才是真的生效，不是被自己的存量行悄悄抵消。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["昨日已发布的指标"]}}'})
+        duty, parts = build_duty(
+            identities=(identity(),), published_users={USER_ONE}, legacy_source=legacy
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            row.permissions,
+            f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}',
+            "有发布足迹时存量沿用不生效，收窄才能真正生效，不被自己昨天的发布内容原样并回来",
+        )
+        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起——省读放大")
+
+    def test_read_failure_skips_legacy_source_and_audits(self) -> None:
+        """读取失败：该用户本轮跳过存量源并响亮审计，不整轮失败——发布仍然照常
+        进行（只是不含存量沿用），不计入 ``report.failed``（本卡验收断言②）。"""
+
+        legacy = FakeLegacyTable(find_error=RuntimeError("注入的存量表读取失败"))
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        report = duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(report.failed, 0, "存量源读取失败不得记成整用户失败")
+        self.assertIn("permission_refresh.legacy_source_skipped", parts["audit"].actions())
+        fields = parts["audit"].fields_for("permission_refresh.legacy_source_skipped")[0]
+        self.assertEqual(fields["user"], USER_ONE)
+        self.assertEqual(fields["reason"], REASON_LEGACY_READ_FAILED)
+        self.assertEqual(fields["error"], "RuntimeError")
+
+    def test_conflicting_legacy_rows_are_skipped_with_a_distinct_reason(self) -> None:
+        """命中多行：不知道该沿用哪一行，失败关闭并跳过——原因码与读取失败
+        可分辨（本卡验收断言⑤）。"""
+
+        legacy = FakeLegacyTable(
+            {EMAIL_ONE: f'{{"{COMPANY_ID}":["legacy_metric"]}}'}, duplicate_for={EMAIL_ONE}
+        )
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}', "冲突时存量源整体不生效")
+        fields = parts["audit"].fields_for("permission_refresh.legacy_source_skipped")[0]
+        self.assertEqual(fields["reason"], "multiple_rows")
+        self.assertNotIn("error", fields, "多行冲突不源自某个被捕获的异常，没有可报告的错误类名")
+
+    def test_wildcard_admin_skips_legacy_too(self) -> None:
+        """通配角 v1：``all_companies=True`` 时存量沿用同样整体不参与合并（本卡验收
+        断言④），结果与银河原始的通配映射逐字节相同——即使这个用户确实有一行存量
+        权限。**读放大修复**（Issue #319 P2，Trace #328 opus 审查）：合并前就按
+        ``all_companies`` 跳过，连 ``find_rows`` 都不发起，不是"读了、合并时才
+        丢弃"。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: '{"1099":["额外存量指标"]}'})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=((GALAXY_ACCOUNT_ONE, ADMIN_FULL_ACCESS_FUNCTION),)),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: (METRIC_NAME,)}},
+            legacy_source=legacy,
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"*":["{METRIC_NAME}"]}}', "通配下存量源整体不生效")
+        self.assertEqual(legacy.find_calls, [], "通配用户合并前就该跳过，不发起 find_rows")
+
+
+# --------------------------------------------------------------------------
 # 四、撤权与输入不完整：全部失败关闭
 # --------------------------------------------------------------------------
 
@@ -1143,6 +1494,200 @@ class RevocationPublishTest(unittest.TestCase):
         rendered = " ".join(f"{key}={value}" for key, value in fields.items())
         for secret in (EMAIL_ONE, NAME_ONE, EMPLOYEE_ONE, COMPANY_ID, TOKEN_CIPHER):
             self.assertNotIn(secret, rendered)
+
+
+# --------------------------------------------------------------------------
+# 三点七、全抑制走撤权出口（红线-2，Trace #328 opus 审查）
+# --------------------------------------------------------------------------
+
+
+class FullSuppressionRevocationTest(unittest.TestCase):
+    """银河这一侧原本是有效授权，但本地抑制把翻译出的全部权限压光到空字典：
+    不再落 ``build_translated_publish_row`` 对空输入的 ``ValueError``（冒泡成一条
+    不可分辨的 ``permission_refresh.user_failed``），而是复用 ``_revoke`` 同一套
+    机制（保行清空、只对发布链上留过足迹的人发），带一个可分辨的原因码
+    :data:`REASON_FULLY_SUPPRESSED`。"""
+
+    def _suppressed_overrides(self) -> FakeLocalOverrides:
+        # 默认夹具的 identity 只持有一个公司（COMPANY_ID）一个指标（METRIC_NAME）——
+        # 抑制它就是把合并结果压到空字典，不是"这个公司没了、别的公司还在"。
+        return FakeLocalOverrides(
+            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+        )
+
+    def test_a_fully_suppressed_grant_with_a_publish_footprint_gets_an_empty_revocation(self) -> None:
+        """否定用例（Trace #328 opus 审查）：抑掉用户全部指标 → 发布 ``{}`` 撤权行 +
+        专属审计，不是 ``ValueError`` 冒泡成通用失败。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            local_overrides=self._suppressed_overrides(),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.failed, 0, "全抑制不是技术故障")
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REVOKE_REASON)
+        row = call["row"]
+        self.assertEqual(row.permissions, "{}", "全抑制走撤权出口：保行清空")
+        revoked = parts["audit"].fields_for("permission_refresh.user_revoked")
+        self.assertEqual(len(revoked), 1)
+        self.assertEqual(
+            revoked[0]["reason"], REASON_FULLY_SUPPRESSED,
+            "原因码必须可分辨——不是银河本来就没给他权限，是本地抑制清空的",
+        )
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["trigger"], TRIGGER_REVOKE)
+
+    def test_a_fully_suppressed_grant_without_any_publish_footprint_is_skipped(self) -> None:
+        """从未发布过的用户被全抑制：与银河侧撤权同一条边界——不为他新建一行空
+        权限，只跳过并计数，不产生任何发布意图。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=self._suppressed_overrides()
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "从未发布过的人不新建空权限行")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.reasons[REASON_FULLY_SUPPRESSED], 1)
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], REASON_FULLY_SUPPRESSED, "原因码仍是可分辨的全抑制")
+        self.assertEqual(skipped[0]["revocation"], SKIP_NO_PUBLISHED_ROW)
+
+    def test_a_partially_suppressed_grant_still_publishes_normally(self) -> None:
+        """否定断言：只抑掉**一部分**指标（不是全部）时走的仍是正常授权发布，不是
+        撤权出口——证明红线-2 的判据是"合并结果整体为空"，不是"发生过任何抑制"。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
+        )
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.enqueued, 1)
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REFRESH_REASON)
+        self.assertEqual(call["row"].permissions, f'{{"{COMPANY_ID}":["额外授权"]}}')
+
+
+# --------------------------------------------------------------------------
+# 五、已送达正文同步清（S-P-5，Trace #328）
+# --------------------------------------------------------------------------
+
+
+class DeliveredContentPurgeTest(unittest.TestCase):
+    """授权、撤权两条路径都必须把 ``clear_delivered_content=True`` 传给
+    ``record_decision``；真正"要不要清、清没清、清了多少条"由 ``record_decision``
+    自己的同一个事务决定（真库证据在 ``tests/test_permission_publish_postgres.py``），
+    本职责这里只钉两件纯逻辑面的事：**接入面**（开关确实传了）与**审计面**（清理
+    发生时记一条不含正文的计数审计，``UNCHANGED`` 时不记）。
+    """
+
+    def test_a_grant_passes_the_clear_switch(self) -> None:
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        self.assertTrue(parts["decisions"].calls[0]["clear_delivered_content"])
+
+    def test_a_revocation_passes_the_clear_switch(self) -> None:
+        duty, parts = build_duty(
+            identities=(identity(),), published_users={USER_ONE}, galaxy=galaxy_snapshot(roles=())
+        )
+
+        duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        self.assertTrue(parts["decisions"].calls[0]["clear_delivered_content"])
+
+    def test_a_granted_change_that_actually_clears_something_is_audited_with_the_count(self) -> None:
+        decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 3})
+        duty, parts = build_duty(identities=(identity(),), decisions=decisions)
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0], {"user": USER_ONE, "cleared": 3, "trigger": "grant"})
+
+    def test_a_grant_that_clears_nothing_is_still_audited_with_a_zero_count(self) -> None:
+        """一个刚被授权、还没有任何历史会话的人：清理**发生过**（record_decision 真的
+        跑了这一步），只是清出 0 条——审计如实记 0，不因为"没清到东西"就整条略过。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 0, "trigger": "grant"}])
+
+    def test_an_unchanged_grant_is_not_audited_as_a_clear(self) -> None:
+        """否定断言：``UNCHANGED`` 时清理根本没有发生（``record_decision`` 内部只在
+        真的推进版本时才碰 ``clear_delivered_content_for_user``），因此不记这条审计
+        ——即使调用方一样传了 ``clear_delivered_content=True``。"""
+
+        decisions = FakeDecisions(unchanged_users={USER_ONE}, cleared_events_by_user={USER_ONE: 5})
+        duty, parts = build_duty(identities=(identity(),), decisions=decisions)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+
+    def test_a_revocation_that_actually_clears_something_is_audited_with_the_count(self) -> None:
+        decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 2})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            galaxy=galaxy_snapshot(roles=()),
+            decisions=decisions,
+        )
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 2, "trigger": "revoke"}])
+
+    def test_an_unchanged_revocation_is_not_audited_as_a_clear(self) -> None:
+        decisions = FakeDecisions(unchanged_users={USER_ONE}, cleared_events_by_user={USER_ONE: 5})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            galaxy=galaxy_snapshot(roles=()),
+            decisions=decisions,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+
+    def test_a_skipped_revocation_without_any_published_row_never_reaches_record_decision(self) -> None:
+        """从无发布行的撤权用户零发布意图（既有断言）：连 ``record_decision`` 都没被
+        调用，自然也不会有任何清理或清理审计——不是"清了 0 条"，是"这一步压根没发生"。
+        """
+
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy_snapshot(roles=()))
+
+        duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [])
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
 
 
 class IncompleteInputTest(unittest.TestCase):

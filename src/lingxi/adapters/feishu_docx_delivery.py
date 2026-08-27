@@ -39,8 +39,9 @@ feishu_tenant_token` 同一习惯：标准库 ``urllib``、零新增依赖、构
 四个会发起真实调用的方法都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
 :class:`FeishuDocxDeliveryError`（``definite=True``，判别口径同
 :class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`）；响应本身成功
-（``code`` 为 0）但缺失可回读标识（``document_id``/``members`` 字段缺失或形状
-不对）时抛出 ``LookupError``——这种"结果不明"不属于飞书明确拒绝，同
+（``code`` 为 0）但缺失可回读标识（``document_id``/``items`` 字段缺失或形状
+不对；``read_members`` 详见该方法文档字符串里的真实响应形状说明）时抛出
+``LookupError``——这种"结果不明"不属于飞书明确拒绝，同
 :mod:`lingxi.adapters.feishu_delivery` 模块文档字符串里的既有分类（成功响应缺
 标识 → ``LookupError``，业务错误码 → 专用异常）。传输层异常（连接失败、超时、
 JSON 解析失败）由默认传输 :func:`urllib_transport` 分类为
@@ -335,19 +336,30 @@ class LarkDocxDelivery:
     def read_members(self, document_id: str) -> list[dict[str, Any]]:
         """读回协作者列表，供调用方判定"真实创建 + 权限读回后才算成功"。
 
-        ``GET /drive/v1/permissions/{document_id}/members?type=docx``。返回的
-        每一项只保留 ``member_type``/``member_id``/``perm`` 三个字段（同
-        ``scripts/probe_drive_folder_permissions.py`` 的 ``_member_signature``
-        取值口径），不透传飞书响应里可能携带的其它字段。
+        ``GET /drive/v1/permissions/{document_id}/members?type=docx``。真实响应
+        把协作者数组放在 ``data.items``（编排者 2026-08-27 stage 真实调用实测：
+        ``data`` 只有一个键 ``items``，每一项形状是
+        ``{member_id, member_type, perm, perm_type}``），**不是**
+        ``scripts/probe_drive_folder_permissions.py`` 探针文档里记的
+        ``members``——那份探针针对的是 folder 权限对象类型，docx 类型的真实响应
+        形状与其不同，此前的实现照抄了探针的字段名，导致读回在真实调用里必然
+        ``LookupError``（四步全成功后仍判定 ``uncertain``）。优先读 ``items``；
+        取不到时降级读一次 ``members``（兼容旧探针形状或未来可能的回归，不代表
+        它是当前真实形状）。返回的每一项只保留 ``member_type``/``member_id``/
+        ``perm`` 三个字段（同 ``scripts/probe_drive_folder_permissions.py`` 的
+        ``_member_signature`` 取值口径），不透传飞书响应里可能携带的其它字段
+        （例如真实响应额外带的 ``perm_type``）。
         """
 
         doc_id = _require_document_id(document_id)
         data = self._data(
             self._call("GET", f"/drive/v1/permissions/{doc_id}/members", params={"type": DOCX_PERMISSION_TYPE})
         )
-        members = data.get("members")
+        members = data.get("items")
         if not isinstance(members, list):
-            raise LookupError("读回协作者响应缺少 members 字段：结果不明")
+            members = data.get("members")
+        if not isinstance(members, list):
+            raise LookupError("读回协作者响应缺少 items/members 字段：结果不明")
         return [
             {
                 "member_type": member.get("member_type"),

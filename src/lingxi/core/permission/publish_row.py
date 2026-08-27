@@ -245,6 +245,15 @@ _UTC = timezone.utc
 #: 通配展开成几十个重复条目——展开规则是我们这一侧的解释，消费方已有自己的约定。
 ALL_COMPANIES_KEY = "*"
 
+#: 触发「角色即全公司」特例的 Lingxi 职能标签（银河「后台管理员」角色，role_id 513，
+#: 经 ``galaxy_role_function_map.toml`` 的「"后台管理员" = "后台管理员"」映射得到）。
+#: 产品负责人 2026-08-27 裁定（Trace #328 裁定 #1，取代 [#320](https://github.com/
+#: Moshuiwang/lingxi/issues/320) 落地的 A 口径）：持有这个职能就是「全公司 × 全指标」，
+#: **含未来新增公司**——不依赖任何一次银河快照里枚举到了哪些公司。见
+#: :func:`aggregate_permission` 里唯一引用它的那处特例分支；其余各处一律引用这个
+#: 常量，不重复写字面量。
+ADMIN_FULL_ACCESS_FUNCTION = "后台管理员"
+
 #: 发布行的 ``status`` 值。取 ``approved`` 是因为既有 26 行全是它（2026-08-17 全表回源
 #: 核对）；这一列的取值域由消费方定义，不由我们定义。
 #:
@@ -330,12 +339,24 @@ class PermissionAggregate:
 
         公司编号（``boss_company_id``）与职能标签不是人员资料，可以留痕；邮箱、姓名、
         工号一个都不在这里（纪律同 ``adapters/feishu_roster_bitable.audit_facts``）。
+
+        **``companies`` 在 ``all_companies=True`` 时输出 ``None``，不输出
+        ``len(self.companies)``**（Trace #328 opus 审查 P2）：「角色即全公司」特例
+        （本模块「角色即全公司」特例一节，产品负责人 2026-08-27 裁定，Trace #328
+        裁定 #1）让 ``all_companies`` 可以在 ``companies`` 只有一两个具体公司时仍然
+        为真——``companies`` 此刻只是"这次快照恰好解释出了哪些公司"，与实际覆盖
+        范围（全公司，含未来新增公司）毫无关系。继续输出这个数字会在审计行里读出
+        一句自相矛盾的话（"companies: 1, all_companies: true"，像是"覆盖 1 家公司
+        却又说是全公司"），银河「全非」通配展开成的大列表同样如此——那也只是"这次
+        快照当时能看到多少国家"，不是真正的覆盖范围上界。``all_companies`` 为真时
+        这个数字对任何读者都没有意义，因此显式置空，不写一个会被误读成"范围只有
+        这么大"的数字。
         """
 
         return {
             "granted": self.granted,
             "reason": self.reason,
-            "companies": len(self.companies),
+            "companies": None if self.all_companies else len(self.companies),
             "functions": list(self.functions),
             "all_companies": self.all_companies,
             "roles": self.role_count,
@@ -391,6 +412,24 @@ def aggregate_permission(
        没有公司编号就没法向 MCP 申请，写进发布行只会得到一个消费方看不懂的空值。
 
     两处收窄都只产出**计数**留痕；收窄到空集时照常 fail-closed。
+
+    **「角色即全公司」特例（产品负责人 2026-08-27 裁定，Trace #328 裁定 #1，B 口径，
+    取代 [#320](https://github.com/Moshuiwang/lingxi/issues/320) 落地的 A 口径）**：
+    持有 :data:`ADMIN_FULL_ACCESS_FUNCTION` 这个职能时，``all_companies`` 强制为真，
+    **不看这个用户的 datacountry 行解析出的银河侧范围**——不论银河那一侧授予的是
+    「全非」通配还是具体公司枚举。A 口径（给 44 个已知公司键各写一条「后台管理员」
+    映射）已被证明不足：具体公司枚举的持有人，聚合结果只覆盖枚举到的那些公司，银河
+    将来新增公司时还得回来手改 ``company_function_metric_map.toml``（见
+    ``tests/test_admin_role_full_access.py`` 的
+    ``AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest``）。B 口径把判据从
+    「这个人枚举到了哪些公司」搬到「这个人有没有这个职能」，因此**天然覆盖未来新增
+    公司**——不需要新公司出现时再补一条配置，通配键 :data:`ALL_COMPANIES_KEY` 从一
+    开始就不按公司数量枚举。特例只改 ``all_companies``，不改 :attr:`PermissionAggregate.
+    companies`——后者仍然是这次快照解释出的具体公司列表，满足 ``__post_init__`` 「有效
+    权限必须同时有公司范围」的不变量；序列化与翻译层（:func:`serialize_permissions`、
+    :func:`~lingxi.core.permission.metric_translation.translate_company_functions`）
+    在 ``all_companies=True`` 时本来就只查通配键、完全不看 ``companies`` 字段，因此这里
+    不发明新形状，只是让已有的通配分支多一条触发路径。
     """
 
     account = _text(galaxy_user_id)
@@ -438,12 +477,22 @@ def aggregate_permission(
             countries_without_company_id=missing_company_id,
         )
 
+    # 「角色即全公司」特例（产品负责人 2026-08-27 裁定，Trace #328 裁定 #1，B 口径）：
+    # 持有 ADMIN_FULL_ACCESS_FUNCTION 时强制 all_companies=True，不依赖 scope 从
+    # datacountry 行解析出的范围——银河那一侧给的可能是「全非」通配，也可能是具体
+    # 公司枚举，两种都不改这条特例的结论。company_ids 仍然是这次快照解释出的具体
+    # 公司列表（不清空、不改写），只是序列化与翻译层在 all_companies=True 时本来就
+    # 只查 ALL_COMPANIES_KEY、不看 companies 字段——因此这里天然满足「含未来新增
+    # 公司」：新公司出现时不需要再回来改任何配置或代码。完整推理见本函数上方文档
+    # 「角色即全公司」特例一节。
+    all_companies = scope.all_countries or ADMIN_FULL_ACCESS_FUNCTION in functions
+
     return PermissionAggregate(
         granted=True,
         reason=REASON_GRANTED,
         companies=company_ids,
         functions=functions,
-        all_companies=scope.all_countries,
+        all_companies=all_companies,
         role_count=len(role_names),
         unmapped_role_count=unmapped,
         unresolved_country_keys=scope.unresolved_country_keys,

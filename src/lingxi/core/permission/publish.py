@@ -147,6 +147,34 @@ class PermissionTableError(RuntimeError):
         self.definite = definite if definite is not None else code.startswith("feishu_code_")
 
 
+class PermissionDecisionTransientFailure(RuntimeError):
+    """一次权限决定（:meth:`~lingxi.adapters.postgres_permission_publish.
+    PostgresPermissionPublishStore.record_decision`）命中数据库瞬时故障（死锁、
+    锁等待超时，或其他操作性错误）：事务已整体回滚，``app_user.permission_version``
+    与 ``publish_outbox`` 均未发生任何变化，调用方可以安全重试——姿态与
+    ``core/admin/pending_action.PendingActionTransientFailure`` 完全对称（Trace #328
+    opus 审查 P1，"照停用路径已有的捕获形状"）：``record_decision`` 与
+    ``PostgresPendingActionStore.confirm()`` 一样，都在同一个事务里先 ``FOR UPDATE``
+    锁住目标行、再做后续写入，因此暴露在同一类锁冲突之下。
+
+    定义在这个纯类型模块而不是 ``adapters/postgres_permission_publish.py``，是为了
+    让调用方（``apps/scheduler/permission_refresh.py``）能在不引入 psycopg 依赖链的
+    情况下拿到这个类型去写 ``except``，与 ``PendingActionTransientFailure`` 的既有
+    取舍同一理由。真正抛出它的地方是 ``PostgresPermissionPublishStore.
+    record_decision()``——按 SQLSTATE 分类捕获 psycopg 的 ``OperationalError``（其
+    子类覆盖 ``DeadlockDetected``/``LockNotAvailable`` 等具体操作性故障）。
+    ``classification`` 只是抛出方 psycopg 异常的类名（例如 ``"DeadlockDetected"``/
+    ``"LockNotAvailable"``），仅用于审计记录，不参与、也不应该参与控制流判断——
+    调用方对所有子类一视同仁地记一条可分辨审计、等下一轮重算再试，不当场重试
+    （每日刷新的语义本就是"这一轮没成功就等明天"，见 ``permission_refresh.py``
+    模块文档「水位在一轮走完之后置位」一节）。
+    """
+
+    def __init__(self, classification: str) -> None:
+        super().__init__(f"权限决定命中数据库瞬时故障，事务已回滚，可重试：{classification}")
+        self.classification = classification
+
+
 class ExistingPermissionRow(NamedTuple):
     """发布表里已经存在的一行：外部记录标识 + 原始字段。
 

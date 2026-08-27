@@ -22,6 +22,7 @@ from lingxi.core.admin.router import (
     AdminCommandRouter,
     AdminEventView,
     AdminUserStatusView,
+    LocalPermissionOverrideView,
 )
 
 
@@ -102,13 +103,23 @@ class FakePendingActions:
         self._outcome = outcome
 
     def prepare(
-        self, *, action_type: PendingActionType, target_open_id: str, initiated_by_open_id: str
+        self,
+        *,
+        action_type: PendingActionType,
+        target_open_id: str,
+        initiated_by_open_id: str,
+        company_id: str | None = None,
+        metric_name: str | None = None,
+        reason: str | None = None,
     ) -> _FakePrepareOutcome:
         self.prepare_calls.append(
             {
                 "action_type": action_type,
                 "target_open_id": target_open_id,
                 "initiated_by_open_id": initiated_by_open_id,
+                "company_id": company_id,
+                "metric_name": metric_name,
+                "reason": reason,
             }
         )
         assert self._outcome is not None
@@ -350,6 +361,133 @@ class QueryUserCommandTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertTrue(outcome.reply_text)
         self.assertEqual(audit.actions(), ["admin.command.internal_error"])
+
+    def test_user_with_no_local_overrides_shows_the_empty_line(self) -> None:
+        """⑥/admin user 无覆盖用户输出零回归（卡 B）：``local_overrides`` 为空
+        元组时回显一行「无本地覆盖」，不留空段、不报错。"""
+
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("无本地覆盖", outcome.reply_text)
+
+    def test_user_with_local_overrides_lists_id_direction_scope_and_truncated_reason(
+        self,
+    ) -> None:
+        """/admin user 新增「当前生效本地覆盖」段（卡 B，revoke 的 UX 前置）：
+        列出 id（lpo_*）、方向、company_id、metric_name、创建时间，且 reason
+        不回显全文（截断 20 字）。"""
+
+        long_reason = "这是一段超过二十个字符的很长很长的收回或授权原因说明文本"
+        self.assertGreater(len(long_reason), 20)
+        override = LocalPermissionOverrideView(
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            direction="grant",
+            company_id="1011",
+            metric_name="daily_active",
+            reason=long_reason,
+            created_at="2026-08-24T00:00:00+00:00",
+        )
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                    local_overrides=(override,),
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("lpo_01JGFJJZ008XSHEADGG8V74SPC", outcome.reply_text)
+        self.assertIn("授权", outcome.reply_text)
+        self.assertIn("1011", outcome.reply_text)
+        self.assertIn("daily_active", outcome.reply_text)
+        self.assertIn(long_reason[:20], outcome.reply_text)
+        self.assertNotIn(long_reason, outcome.reply_text, "reason 不得回显全文")
+        self.assertNotIn("无本地覆盖", outcome.reply_text)
+
+    def test_a_user_with_local_overrides_carries_the_zero_galaxy_permission_caveat(self) -> None:
+        """零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus
+        审查 P1）：有本地覆盖行时，输出必须提示"若该用户当前无任何银河权限，
+        本地授权暂不生效"——四源合并挂在 `aggregate.granted` 判据之后，这类用户
+        的本地授权此刻结构上不生效，不能让管理员误以为查询到覆盖行就等于生效。"""
+
+        override = LocalPermissionOverrideView(
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            direction="grant",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            created_at="2026-08-24T00:00:00+00:00",
+        )
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                    local_overrides=(override,),
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("若该用户当前无任何银河权限，本地授权暂不生效", outcome.reply_text)
+        self.assertIn("V-权限-15", outcome.reply_text)
+
+    def test_a_user_without_local_overrides_does_not_carry_the_caveat(self) -> None:
+        """否定断言：没有任何本地覆盖行时不该出现这句提示——这是提示，不是
+        对每个用户都成立的通用免责声明。"""
+
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertNotIn("暂不生效", outcome.reply_text)
 
 
 class QueryAuditCommandTests(unittest.TestCase):
@@ -697,6 +835,406 @@ class SuspendResumeDispatchTests(unittest.TestCase):
 
         self.assertIn("suspend", outcome.reply_text)
         self.assertIn("resume", outcome.reply_text)
+
+
+class GrantSuppressPermissionDispatchTests(unittest.TestCase):
+    """``grant_permission``/``suppress_permission`` 写命令编排（#319 S-P-1b 设计
+    卡）：与 ``suspend``/``resume`` 共用同一套 ``_dispatch_write_action`` 骨架，
+    额外核对①新命令不绕过既有身份判定、⑤自我目标防呆。
+    """
+
+    def _grant_text(self, target: str = "ou_target") -> str:
+        return f"/admin grant_permission {target} 1011 daily_active 特批"
+
+    def _suppress_text(self, target: str = "ou_target") -> str:
+        return f"/admin suppress_permission {target} 1011 daily_active 特批"
+
+    def test_unregistered_sender_is_default_denied_same_as_read_only_commands(self) -> None:
+        """①新命令不绕过 ``is_authorized_admin``：未登记者发 grant_permission
+        必须走与 help/user/audit/suspend/resume 完全相同的默认拒绝路径——不因为
+        是新命令就走一条独立的身份判定分支。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, registry, _, audit = _router(
+            registry=FakeRegistry({}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id="ou_never_registered",
+            text=self._grant_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_partial_role_entry_is_rejected_before_reaching_write_dispatch(self) -> None:
+        """同 suspend/resume：只持有部分角色的条目在 ``route()`` 顶层就被拒绝，
+        走不到 grant/suppress 的写命令分支。"""
+
+        partial_entry = AdminRegistryEntry(
+            feishu_open_id=ADMIN_OPEN_ID,
+            label="future-admin",
+            roles=frozenset({AdminRole.OPS_ADMIN, AdminRole.SUPER_ADMIN}),
+            entry_status="active",
+        )
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            registry=FakeRegistry({ADMIN_OPEN_ID: partial_entry}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._grant_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+
+    def test_self_target_grant_is_rejected_without_calling_prepare(self) -> None:
+        """⑤自我目标防呆：管理员对自己发起授权被拒绝，且 ``prepare()`` 从未被
+        调用——不合法的意图不应该先创建一条待确认操作再补救。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._grant_text(target=ADMIN_OPEN_ID),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("不能对自己", outcome.reply_text)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_self_target_suppress_is_rejected_without_calling_prepare(self) -> None:
+        """对称动作同一防呆。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._suppress_text(target=ADMIN_OPEN_ID),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("不能对自己", outcome.reply_text)
+        self.assertEqual(pending_actions.prepare_calls, [])
+
+    def test_self_target_guard_is_always_false_for_suspend_and_resume(self) -> None:
+        """自我目标防呆是"显式条件门，suspend/resume 恒为假"：管理员对自己发起
+        停用/恢复不会被这条新规则拦截——沿用既有 ``decide_prepare``/角色核对
+        判定这次操作是否合理，不属于本条防呆的关注范围。"""
+
+        pending = _prepared_pending(action_type=PendingActionType.SUSPEND_USER)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f"/admin suspend {ADMIN_OPEN_ID}",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        self.assertNotIn("不能对自己", outcome.reply_text)
+
+    def test_successful_grant_dispatch_forwards_payload_fields_to_prepare(self) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._grant_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id="thread_1",
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("待确认", outcome.reply_text)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        call = pending_actions.prepare_calls[0]
+        self.assertEqual(call["action_type"], PendingActionType.LOCAL_PERMISSION_GRANT)
+        self.assertEqual(call["target_open_id"], "ou_target")
+        self.assertEqual(call["company_id"], "1011")
+        self.assertEqual(call["metric_name"], "daily_active")
+        self.assertEqual(call["reason"], "特批")
+        self.assertEqual(audit.actions(), ["admin.command.grant_permission"])
+
+    def test_successful_suppress_dispatch(self) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._suppress_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(
+            pending_actions.prepare_calls[0]["action_type"],
+            PendingActionType.LOCAL_PERMISSION_SUPPRESS,
+        )
+        self.assertEqual(audit.actions(), ["admin.command.suppress_permission"])
+
+    def test_grant_prepare_rejection_is_reported_without_sending_a_card(self) -> None:
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(
+                decision=_FakePrepareDecision(
+                    ok=False, code="target_state_changed", message="该公司×指标已有生效的本地覆盖。"
+                )
+            )
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._grant_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.reply_text, "该公司×指标已有生效的本地覆盖。")
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_help_text_mentions_grant_and_suppress_permission(self) -> None:
+        router, _, _, _ = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertIn("grant_permission", outcome.reply_text)
+        self.assertIn("suppress_permission", outcome.reply_text)
+
+
+#: 与 test_admin_commands.py 同一固定字面量（`lpo_` 前缀 + 26 位 Crockford
+#: Base32 ULID），供本文件的收回派发用例复用。
+_VALID_OVERRIDE_ID = "lpo_01JGFJJZ008XSHEADGG8V74SPC"
+
+
+class RevokePermissionDispatchTests(unittest.TestCase):
+    """``revoke_permission`` 写命令编排（卡 B 设计卡）：与 suspend/resume/
+    grant/suppress 共用同一套 ``_dispatch_write_action`` 骨架，但自我目标防呆
+    **不**在这一层（见 ``core/admin/router._dispatch_write_action`` 文档「检查点
+    位置不同」）——``target_identifier`` 对 revoke 命令而言是 override_id，不是
+    open_id，router 层拿不到属主信息，因此本类不重复卡 A 那条
+    ``self_target_grant_is_rejected`` 用例，那条防呆的真库断言在
+    ``tests/test_pending_action_postgres.py``。
+    """
+
+    def _revoke_text(self, override_id: str = _VALID_OVERRIDE_ID, reason: str = "离职") -> str:
+        return f"/admin revoke_permission {override_id} {reason}"
+
+    def test_unregistered_sender_is_default_denied_same_as_read_only_commands(self) -> None:
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, registry, _, audit = _router(
+            registry=FakeRegistry({}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id="ou_never_registered",
+            text=self._revoke_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_partial_role_entry_is_rejected_before_reaching_write_dispatch(self) -> None:
+        partial_entry = AdminRegistryEntry(
+            feishu_open_id=ADMIN_OPEN_ID,
+            label="future-admin",
+            roles=frozenset({AdminRole.OPS_ADMIN, AdminRole.SUPER_ADMIN}),
+            entry_status="active",
+        )
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            registry=FakeRegistry({ADMIN_OPEN_ID: partial_entry}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(pending_actions.prepare_calls, [])
+
+    def test_successful_revoke_dispatch_forwards_override_id_and_reason_to_prepare(self) -> None:
+        """成功路径：``command.identifier``（override_id）原样作为
+        ``target_open_id`` 传给 ``prepare()``（真正解析出属主 open_id 是
+        adapter 的职责，见 ``adapters/postgres_pending_action.py``），
+        ``company_id``/``metric_name`` 保持 ``None``。"""
+
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_REVOKE)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_text(reason="离职 交接"),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id="thread_1",
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("待确认", outcome.reply_text)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        call = pending_actions.prepare_calls[0]
+        self.assertEqual(call["action_type"], PendingActionType.LOCAL_PERMISSION_REVOKE)
+        self.assertEqual(call["target_open_id"], _VALID_OVERRIDE_ID)
+        self.assertIsNone(call["company_id"])
+        self.assertIsNone(call["metric_name"])
+        self.assertEqual(call["reason"], "离职 交接")
+        self.assertEqual(audit.actions(), ["admin.command.revoke_permission"])
+        self.assertEqual(audit.records[0][1]["pending_action_id"], pending.id)
+
+    def test_prepare_rejection_is_reported_without_sending_a_card(self) -> None:
+        """否定断言：override_id 不存在/已撤销/属主等于操作者——adapter 层拒绝，
+        router 只负责把拒绝文案透传，不发卡片（真库断言见
+        ``tests/test_pending_action_postgres.py``）。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(
+                decision=_FakePrepareDecision(
+                    ok=False, code="self_target_forbidden", message="不能对自己发起该操作。"
+                )
+            )
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, _, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.reply_text, "不能对自己发起该操作。")
+        self.assertEqual(confirm_cards.send_calls, [])
+
+    def test_not_wired_replies_unavailable_without_crashing(self) -> None:
+        router, _, _, audit = _router()  # pending_actions/confirm_cards 均未传入
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("不可用", outcome.reply_text)
+
+    def test_help_text_mentions_revoke_permission(self) -> None:
+        router, _, _, _ = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertIn("revoke_permission", outcome.reply_text)
 
 
 if __name__ == "__main__":  # pragma: no cover

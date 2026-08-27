@@ -198,12 +198,16 @@ from lingxi.core.identity.stock_token_source import (
     StockTokenSource,
 )
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
+from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish_row import (
+    ALL_COMPANIES_KEY,
     STATUS_APPROVED,
     aggregate_permission,
-    build_publish_row,
+    build_translated_publish_row,
     parse_permissions,
     serialize_permissions,
 )
@@ -377,6 +381,20 @@ class PermissionDecisionStore(Protocol):
     def load(self, outbox_id: str) -> Any: ...
 
 
+class LocalOverrideSource(Protocol):
+    """本地权限覆盖的按用户读取口（S-P-3 #319）。与 permission_refresh.py 的同名协议各自独立一份：``core/`` 不 import ``apps/``（代码框架第二节）。"""
+
+    def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
+
+
+class PublishHistorySource(Protocol):
+    """「这个人在发布链上有没有留下过足迹」的只读口（红线-1，legacy 有界化，
+    Trace #328 opus 审查；对称于 ``apps/scheduler/permission_refresh._PublishHistory``，
+    各自一份因为 ``core/`` 不 import ``apps/``）。"""
+
+    def has_publish_footprint(self, user_id: str) -> bool: ...
+
+
 class ReadinessConfirmer(Protocol):
     """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness.McpReadinessConfirmation``）。"""
 
@@ -487,6 +505,8 @@ class AutoOnboardingRunner:
         notify_attempts: int = 3,
         publish_allowed: Callable[[], bool] | None = None,
         onboarding_failed: Callable[[str, str], None] | None = None,
+        local_overrides: LocalOverrideSource | None = None, legacy_source: LegacyPermissionTable | None = None,
+        publish_history: PublishHistorySource | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -548,6 +568,11 @@ class AutoOnboardingRunner:
         #: 两者都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也
         #: 没有传这些的位置。
         self._onboarding_failed = onboarding_failed
+        # 本地权限覆盖读取口（S-P-3）与存量权限只读源（S-P-2 #328）：均为 ``None``＝装配层未接线，行为与改动前逐字节一致。
+        self._local_overrides, self._legacy_source = local_overrides, legacy_source
+        # 发布足迹只读口（红线-1）：``None``（未接线）按"保守未知"处理，legacy 一律
+        # 不参与，不冒自反馈环风险（见 ``_resolve_legacy_source``）。
+        self._publish_history = publish_history
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -1292,8 +1317,22 @@ class AutoOnboardingRunner:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
             # 没有"这一行是谁的"的答案。归确定性业务失败，不是本侧故障。
             return _not_authorized("archived_identity_incomplete")
-        row = build_publish_row(
-            aggregate=aggregate,
+        # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328），接线点在这里而非更早的 `_match`——本地覆盖的 `user_id` 是内部 `app_user.id`，聚合时还没有它。
+        # `galaxy` 是现算的职能标签映射（onboarding 尚未接翻译层），详见 `merge_sources.py` 模块文档「挂点」一节；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
+        galaxy_map = {ALL_COMPANIES_KEY: aggregate.functions} if aggregate.all_companies else {company: aggregate.functions for company in aggregate.companies}
+        local = self._resolve_local_overrides(user_id)
+        legacy = self._resolve_legacy_source(user_id, request.email, galaxy_map)
+        merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=legacy)
+        for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
+            self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
+        if not merged.permissions:
+            # 红线-2：galaxy_map 非空（`_match` 已确保 granted），但本地抑制把合并
+            # 结果压光到空字典。onboarding 是首次建行，空内容的新建行对 MCP 无意义，
+            # 归类为确定性业务失败（同 `_match` 的 `not granted → _not_authorized`），
+            # 不落到 `build_translated_publish_row` 对空输入的 `ValueError`。
+            return _not_authorized("fully_suppressed_by_local_override")
+        row = build_translated_publish_row(
+            company_metrics=merged.permissions,
             email=request.email,
             display_name=request.identity.display_name,
             decided_at=self._clock(),
@@ -1314,6 +1353,44 @@ class AutoOnboardingRunner:
         if waited is not None:
             return waited
         return version, row.permissions
+
+    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
+        """读该用户当前生效的本地覆盖条目。``None``（未装配/读取失败）时对
+        ``merge_permission_sources`` 恒等；读取失败额外响亮记一条
+        ``onboarding.local_override_skipped``（``reason=local_override_read_failed``），
+        异常不冒泡——一次开通不因本地覆盖读取失败而整链失败。"""
+
+        if self._local_overrides is None:
+            return None
+        try:
+            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整链失败
+            self._audit.record("onboarding.local_override_skipped", user=user_id, reason=REASON_LOCAL_OVERRIDE_READ_FAILED)
+            logger.error("本地权限覆盖读取失败，本次开通跳过本地源 user=%s error=%s", user_id, type(error).__name__)
+            return None
+        return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _resolve_legacy_source(
+        self, user_id: str, email: str, galaxy_map: Mapping[str, Sequence[str]]
+    ) -> dict[str, tuple[str, ...]] | None:
+        """红线-1 有界条件（对称于 ``permission_refresh.py`` 同名方法，理由见该方法
+        与 ``legacy_source.py``「有界条件」文档，这里不复述）：通配用户
+        （``ALL_COMPANIES_KEY``）或该用户已有发布足迹（含 ``publish_history`` 未
+        接线时的保守判断）都不参与，只有从未发布过才读存量源——即使首次开通结构上
+        通常还没有足迹，一条因下游失败重跑的链也可能让 :meth:`_publish` 第二次
+        调用，重蹈自反馈环风险。"""
+
+        if ALL_COMPANIES_KEY in galaxy_map:
+            return None
+        if self._publish_history is None or self._publish_history.has_publish_footprint(user_id):
+            return None
+        return resolve_legacy_source(
+            email=email,
+            table=self._legacy_source,
+            audit=self._audit,
+            action="onboarding.legacy_source_skipped",
+            user=user_id,
+        )
 
     def _await_published(self, outbox_id: str) -> _Terminal | None:
         """等发布意图真的被写出去并逐字段读回一致。

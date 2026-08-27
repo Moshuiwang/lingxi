@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 
@@ -48,6 +49,31 @@ from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
 
 _MAX_FAILURE_TEXT = 500
+
+# 会话 resume 失配的特征串（2026-08-27 生产事故 #2）：worker 容器 HOME=/tmp，
+# CLI 会话文件随容器重建消失，但 conversation.agent_session_id 仍留在库里——
+# 部署后每个活跃会话的下一条消息都会尝试 resume 一个已经不存在的会话。真实 CLI
+# 子进程对此的失败形状是**自己的 stderr** 里一行 "No conversation found with
+# session ID: <uuid>" 后非零退出；Python SDK 侧捕获到的 `ProcessError` **不携带**
+# 这行原文（`claude_agent_sdk` 0.2.128 的 `_read_messages_impl` 只写死
+# "Check stderr output for details"，读源码实测确认），因此这个特征串只能从
+# `_sdk_stderr_sink` 已经落过的 `worker.sdk.stderr` 那份文本里认；`run_turn` 里
+# 额外兜底检查抛出的会话异常对象本身，两处任一命中即可，防的是"某个未来 SDK 版本
+# 把这行原文塞进了异常文本"这种此刻验证不到、但不该让降级路径悄悄失效的情形。
+# 大小写不敏感、只认这一段固定英文前缀，不含冒号后的会话 id 本身——`redact_free_
+# text` 的长串脱敏规则会先把 32 字符以上的会话 id 盖成 `[REDACTED:N字符]`，固定
+# 前缀不受影响；也不会把其他 session_failed（连接被拒、传输中断等）误判成这一种
+# 可自动恢复的失配。
+_SESSION_RESUME_MISS_PATTERN = re.compile(
+    r"no conversation found with session id", re.IGNORECASE
+)
+
+
+def _looks_like_session_resume_miss(text: str) -> bool:
+    """这段文本是否带着「resume 的会话已经不存在」的特征。"""
+
+    return bool(_SESSION_RESUME_MISS_PATTERN.search(text))
+
 
 def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: str) -> str:
     """把合成 system prompt 确定性注入最终正文，供出口安全约束命中（#142）。
@@ -130,6 +156,11 @@ class WorkerTurnExecutor:
         # 在 run_turn() 开头与 self._audit.start_turn() 同时重置——不跨回合复用，
         # 否则第二回合会带着上一回合遗留的请求。
         self._document_request: DocumentRequest | None = None
+        # 会话 resume 失配自动降级（2026-08-27 生产事故 #2）：每次 `run_turn()`
+        # 的每次尝试开始时重置为 False；`_sdk_stderr_sink` 命中特征串时置位，
+        # `run_turn` 据此决定要不要对这次尝试的 `session_failed` 做一次降级重试。
+        # 这里的初始化只是防御性的——真正生效的重置在 `run_turn` 每轮尝试开头。
+        self._resume_miss_detected = False
 
     @property
     def policy(self) -> ToolPolicy:
@@ -266,9 +297,18 @@ class WorkerTurnExecutor:
         """SDK 子进程 stderr 的唯一落点：脱敏、截断、结构化，带 trace_id。
 
         不设回调时子进程直接继承 fd 2，启动失败的原始错误（可能含令牌）会绕过
-        全部出口纪律（Codex 复查发现）。"""
+        全部出口纪律（Codex 复查发现）。
+
+        会话 resume 失配自动降级（2026-08-27 生产事故 #2）的唯一可靠信号来源：
+        真实 CLI 子进程把 "No conversation found with session ID: ..." 写在
+        **自己的 stderr**，Python SDK 侧的 `ProcessError` 不携带这行原文。这里在
+        脱敏截断之后匹配特征串并置位 `self._resume_miss_detected`，供 `run_turn`
+        决定是否降级重试；不改变这个回调本身落 `worker.sdk.stderr` 日志的行为。
+        """
 
         text = redact_free_text(str(line))[:500]
+        if _looks_like_session_resume_miss(text):
+            self._resume_miss_detected = True
         self._emit_stderr_record(level="warning", event="worker.sdk.stderr", line=text)
 
     def _emit_stderr_record(self, **fields: object) -> None:
@@ -288,6 +328,7 @@ class WorkerTurnExecutor:
         on_stream_event: Callable[[Mapping[str, Any]], None] | None = None,
         on_tool_call: Callable[[str], None] | None = None,
         external_texts: Iterable[tuple[str, object]] | Mapping[str, object] | None = None,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
         """执行一个回合，**总是**返回一份报告。
 
@@ -300,118 +341,166 @@ class WorkerTurnExecutor:
         会话级对象（构造时机见 ``__init__``），只在这里、每次 ``run_turn()`` 调用
         开始时重新挂载，理由是这个回调闭包了调用方（``apps/worker/service.py``）
         为**这一次任务**维护的进度状态，不能提前固定在构造期。
+
+        会话 resume 失配自动降级（2026-08-27 生产事故 #2）：`resume_session_id`
+        非空的这次尝试如果撞上「会话不存在」特征（见 `_looks_like_session_resume_
+        miss`），在**同一次 `run_turn()` 调用内**自动退回无 resume 的全新会话重试
+        **恰好一次**——旧会话在库里记的仍是同一个 `agent_session_id`，重试成功后
+        新 id 会随成功报告正常落库（既有机制），下一条消息据此续聊，用户不再重复
+        撞见硬错。非失配特征的 `session_failed`、或重试后仍然失败，都保持原有失败
+        路径不变，不会被这次降级掩盖。`task_id` 只用于给 `worker.session_resume_
+        miss` 审计事件带上任务标识（不落库、不参与判定），queue 模式之外的调用方
+        （一次性 turn CLI、既有测试）留空即可。
         """
 
         self._gateway.set_tool_call_listener(on_tool_call)
         normalized_external_texts = normalize_external_texts(external_texts)
         agent_prompt = compose_agent_prompt(question, normalized_external_texts)
-        self._audit.start_turn()
-        # 文档交付触发机制（Issue #341 S-ES-2）：回合级状态，与审计一起清零——
-        # 不清零的话，第二回合在模型没有再次调用这个工具时也会带着上一回合
-        # 登记过的请求，与"仅当模型本轮调用过该工具时非空"的报告契约矛盾。
-        self._document_request = None
-        recorder = TurnStreamRecorder(self._audit)
-        failure: dict[str, str] | None = None
         started_at = self._clock()
-        # #143：业务耗时由适配器在业务阶段结束时回填一次；收尾耗时事后用
-        # "总耗时 - 业务耗时" 推得。适配器没有机会调用回调时（例如构造选项就
-        # 失败）保持未知，不能构造数据。
-        business_phase: dict[str, float] = {}
-        # #201：本进程是否**真的**向 SDK 发出过 `interrupt()`。这是本地事实，不是
-        # 对队列侧 stop 标志的推断——只有它成立，才允许把 SDK 自报的 `aborted_*`
-        # 收尾判成中断（见 `_sdk_termination_failure`）。
-        local_interrupt: dict[str, bool] = {}
 
-        def handle_event(event: Mapping[str, Any]) -> None:
-            recorder.handle(event)
-            if self._raw_capture is not None:
-                self._raw_capture.on_stream_event(event)
-            if on_stream_event is not None:
-                on_stream_event(event)
+        attempt_resume_session_id = resume_session_id
+        resume_fallback_applied = False
 
-        try:
+        while True:
+            self._audit.start_turn()
+            # 文档交付触发机制（Issue #341 S-ES-2）：回合级状态，与审计一起在
+            # **每次尝试**开头清零（resume 降级重试的第二次尝试同样不得带着第一次
+            # 尝试登记的请求，报告契约="仅当模型本轮调用过该工具时非空"）。
+            self._document_request = None
+            recorder = TurnStreamRecorder(self._audit)
+            failure: dict[str, str] | None = None
+            # #143：业务耗时由适配器在业务阶段结束时回填一次；收尾耗时事后用
+            # "总耗时 - 业务耗时" 推得。适配器没有机会调用回调时（例如构造选项就
+            # 失败）保持未知，不能构造数据。
+            business_phase: dict[str, float] = {}
+            # #201：本进程是否**真的**向 SDK 发出过 `interrupt()`。这是本地事实，不是
+            # 对队列侧 stop 标志的推断——只有它成立，才允许把 SDK 自报的 `aborted_*`
+            # 收尾判成中断（见 `_sdk_termination_failure`）。
+            local_interrupt: dict[str, bool] = {}
+            # 每次尝试开头重置（2026-08-27 生产事故 #2）：`_sdk_stderr_sink` 命中
+            # 特征串时置位，只反映**这一次**尝试观测到的信号，不带着上一次失败
+            # 尝试的痕迹进入这一轮的降级判定。
+            self._resume_miss_detected = False
+
+            def handle_event(event: Mapping[str, Any]) -> None:
+                recorder.handle(event)
+                if self._raw_capture is not None:
+                    self._raw_capture.on_stream_event(event)
+                if on_stream_event is not None:
+                    on_stream_event(event)
+
             try:
-                options = self.build_session_options()
-            except ImportError as error:
-                # 只有"构造会话选项时就 import 不到 SDK"才叫 sdk_unavailable；
-                # 会话中途的 ImportError（缺传递依赖、缺 CLI 组件）是另一种故障，
-                # 标错码会把排障方向带偏成"去装 SDK"（独立复查发现）。
-                failure = _failure("sdk_unavailable", error)
-                options = None
-            if options is not None:
-                await run_single_turn(
-                    options=options,
-                    prompt=agent_prompt,
-                    sink=handle_event,
-                    timeout_seconds=self._config.turn_timeout_seconds,
-                    resume_session_id=resume_session_id,
-                    stop_event=stop_event,
-                    drain_grace_seconds=self._config.drain_grace_seconds,
-                    clock=self._clock,
-                    on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
-                    on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
+                try:
+                    options = self.build_session_options()
+                except ImportError as error:
+                    # 只有"构造会话选项时就 import 不到 SDK"才叫 sdk_unavailable；
+                    # 会话中途的 ImportError（缺传递依赖、缺 CLI 组件）是另一种故障，
+                    # 标错码会把排障方向带偏成"去装 SDK"（独立复查发现）。
+                    failure = _failure("sdk_unavailable", error)
+                    options = None
+                if options is not None:
+                    await run_single_turn(
+                        options=options,
+                        prompt=agent_prompt,
+                        sink=handle_event,
+                        timeout_seconds=self._config.turn_timeout_seconds,
+                        resume_session_id=attempt_resume_session_id,
+                        stop_event=stop_event,
+                        drain_grace_seconds=self._config.drain_grace_seconds,
+                        clock=self._clock,
+                        on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
+                        on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
+                    )
+            except AgentSessionInterrupted as error:
+                failure = _failure("interrupted", error)
+            except DrainTimeoutError as error:
+                # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
+                # 成 turn_timeout（#143：收尾宽限独立且有界）。
+                failure = _failure_message(
+                    "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
                 )
-        except AgentSessionInterrupted as error:
-            failure = _failure("interrupted", error)
-        except DrainTimeoutError as error:
-            # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
-            # 成 turn_timeout（#143：收尾宽限独立且有界）。
-            failure = _failure_message(
-                "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
-            )
-            del error
-        except TimeoutError as error:
-            # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
-            # 没有这个分支整个回合会永久等待（Codex 复查发现）。
-            del error
-            failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
-        except asyncio.CancelledError:
-            # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
-            # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
-            # 失败回合，不能伪装成正常完成或墙钟超时。
-            #
-            # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
-            # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
-            # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
-            # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
-            # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
-            # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
-            # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
-            # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
-            # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
-            # 路径。真实证据：`tests/test_worker_process.py` 的
-            # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
-            # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
-            if self._propagate_cancellation:
-                raise
-            failure = _failure_message("cancelled", "任务已取消，未继续执行")
-        except KeyboardInterrupt as error:
-            failure = _failure("interrupted", error)
-        except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
-            if is_message_buffer_overflow(error):
-                # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
-                # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态
-                # 故障——同样的问题重试必然同样失败，必须与通用 session_failed
-                # 区分，让用户得到"缩小查询范围"的可行动建议（queue 收口的文案
-                # 映射见 apps/worker/service.py 的 _failure_content）。
-                failure = _failure("result_too_large", error)
-            else:
-                failure = _failure("session_failed", error)
+                del error
+            except TimeoutError as error:
+                # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
+                # 没有这个分支整个回合会永久等待（Codex 复查发现）。
+                del error
+                failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
+            except asyncio.CancelledError:
+                # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
+                # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
+                # 失败回合，不能伪装成正常完成或墙钟超时。
+                #
+                # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
+                # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
+                # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
+                # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
+                # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
+                # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
+                # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
+                # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
+                # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
+                # 路径。真实证据：`tests/test_worker_process.py` 的
+                # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
+                # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
+                if self._propagate_cancellation:
+                    raise
+                failure = _failure_message("cancelled", "任务已取消，未继续执行")
+            except KeyboardInterrupt as error:
+                failure = _failure("interrupted", error)
+            except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
+                if is_message_buffer_overflow(error):
+                    # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
+                    # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态
+                    # 故障——同样的问题重试必然同样失败，必须与通用 session_failed
+                    # 区分，让用户得到"缩小查询范围"的可行动建议（queue 收口的文案
+                    # 映射见 apps/worker/service.py 的 _failure_content）。
+                    failure = _failure("result_too_large", error)
+                else:
+                    failure = _failure("session_failed", error)
+                    # 兜底信号源（2026-08-27 生产事故 #2）：正常情况下特征串已经
+                    # 由 `_sdk_stderr_sink` 从子进程 stderr 里认出来了；这里再看一遍
+                    # 异常对象本身，防的是"某个未来 SDK 版本把这行原文塞进了异常
+                    # 文本"这种此刻验证不到、但不该让降级路径悄悄失效的情形。
+                    if _looks_like_session_resume_miss(str(error)):
+                        self._resume_miss_detected = True
 
-        if failure is None:
-            failure = _sdk_termination_failure(
-                recorder, interrupt_requested=bool(local_interrupt.get("requested"))
-            )
-            if failure is not None and failure["code"] == "interrupted":
-                # 这条线只在 #201 的竞态真的发生时出现一次：本进程已发出
-                # `interrupt()`，SDK 却抢在它返回之前把这一轮以 `aborted_*` 收完，
-                # 因此 `AgentSessionInterrupted` 没有抛出。留一条可计数的低敏结构化
-                # 痕迹（不含提示词或正文），用来观察该竞态在真实链路的发生频率。
+            if failure is None:
+                failure = _sdk_termination_failure(
+                    recorder, interrupt_requested=bool(local_interrupt.get("requested"))
+                )
+                if failure is not None and failure["code"] == "interrupted":
+                    # 这条线只在 #201 的竞态真的发生时出现一次：本进程已发出
+                    # `interrupt()`，SDK 却抢在它返回之前把这一轮以 `aborted_*` 收完，
+                    # 因此 `AgentSessionInterrupted` 没有抛出。留一条可计数的低敏结构化
+                    # 痕迹（不含提示词或正文），用来观察该竞态在真实链路的发生频率。
+                    self._emit_stderr_record(
+                        level="warning",
+                        event="worker.stop.interrupt_race",
+                        terminal_reason=recorder.terminal_reason,
+                    )
+
+            if (
+                not resume_fallback_applied
+                and attempt_resume_session_id is not None
+                and failure is not None
+                and failure.get("code") == "session_failed"
+                and self._resume_miss_detected
+            ):
+                # 降级只发生一次（`resume_fallback_applied` 是本次 `run_turn()`
+                # 调用内的哨兵，防止把真故障重试掩盖）：容器重建导致的会话文件
+                # 丢失是「这一次尝试」的确定性故障，退回无 resume 的全新会话后
+                # 同样的问题不会再复现；真正无法恢复的 session_failed（网络、
+                # 鉴权等）不匹配特征串，不会走到这里，仍按原有失败路径收口。
                 self._emit_stderr_record(
                     level="warning",
-                    event="worker.stop.interrupt_race",
-                    terminal_reason=recorder.terminal_reason,
+                    event="worker.session_resume_miss",
+                    task_id=task_id,
                 )
+                resume_fallback_applied = True
+                attempt_resume_session_id = None
+                continue
+
+            break
 
         duration_seconds = max(0.0, self._clock() - started_at)
         business_duration_seconds = business_phase.get("seconds")

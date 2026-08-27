@@ -47,9 +47,13 @@ from typing import Any
 from postgres_schema import ensure_production_schema, reset_production_rows
 
 from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
+from lingxi.adapters.feishu_user_message import FeishuUserMessages
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
-from lingxi.adapters.postgres_document_delivery import PostgresDocumentDeliveryStore
+from lingxi.adapters.postgres_document_delivery import (
+    DocumentDeliveryClaim,
+    PostgresDocumentDeliveryStore,
+)
 from lingxi.apps.gateway.config import GatewayConfig, _Secret
 from lingxi.apps.gateway.document_delivery import (
     DocumentDeliveryConsumer,
@@ -995,6 +999,220 @@ class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
         asyncio.run(service.process_once())
 
         self.assertEqual(self._document_request_rows(task_id), [])
+
+
+class _RecordingUserMessageTransport:
+    """真实形状假传输层：按顺序返回预置响应，记录每次调用（同
+    ``test_feishu_docx_delivery.py::RecordingTransport`` 的形状）。"""
+
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, object] | None, str | None]] = []
+
+    def __call__(self, method: str, url: str, *, body=None, token=None):
+        self.calls.append((method, url, body, token))
+        if not self._responses:
+            raise AssertionError("假传输层收到了超出预置数量的调用")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _real_shape_tenant_token_response() -> dict[str, Any]:
+    """``/auth/v3/tenant_access_token/internal`` 的真实响应形状。"""
+
+    return {"code": 0, "msg": "ok", "tenant_access_token": "t-fake-tenant-access-token", "expire": 7200}
+
+
+def _real_shape_send_message_response() -> dict[str, Any]:
+    """``/im/v1/messages`` 的真实响应形状（字段取自飞书开放平台文档；本模块的
+    调用方只检查 ``code``，不解析 ``data``，这里带全字段只为形状真实）。"""
+
+    return {
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "message_id": "om_fake_message_id",
+            "root_id": "om_fake_message_id",
+            "parent_id": "",
+            "msg_type": "text",
+            "create_time": "1700000000000",
+            "update_time": "1700000000000",
+            "deleted": False,
+            "updated": False,
+            "chat_id": "oc_fake_chat_id",
+            "sender": {"id": "cli_fake_app", "id_type": "app_id", "sender_type": "app", "tenant_key": "tk_fake"},
+        },
+    }
+
+
+class _NoopNotifyStore:
+    """只实现 ``_send_ready_notice``/``_uncertain``/``_fail`` 会用到的那几个
+    方法——本测试类不接触数据库，专门钉住"通知发送路径本身是否真的能调通"这一
+    件事，不是终态落库的正确性（那部分见 ``DocumentDeliveryTransportTestCase``
+    的真库用例）。"""
+
+    def __init__(self) -> None:
+        self.notified: list[str] = []
+
+    def mark_notified(self, *, request_id: str) -> None:
+        self.notified.append(request_id)
+
+    def mark_uncertain(self, *, request_id: str, last_error: str) -> None:
+        del request_id, last_error
+
+    def mark_failed(self, *, request_id: str, last_error: str) -> None:
+        del request_id, last_error
+
+
+def _notify_test_claim(
+    *, requester_open_id: str, claim_id: str = "tdd-notify-1", task_id: str = "tsk-notify-1"
+) -> DocumentDeliveryClaim:
+    return DocumentDeliveryClaim(
+        id=claim_id,
+        task_id=task_id,
+        requester_open_id=requester_open_id,
+        title="标题",
+        paragraphs=("正文",),
+        document_id="doc-1",
+        attempts=1,
+    )
+
+
+class RealNotifierWiringTest(unittest.TestCase):
+    """真实装配 + 真实形状：证明 gateway 侧文档投递用户通知发送路径没有断线
+    （2026-08-27 编排者 stage 自测排查项之一，不接触数据库或网络）。
+
+    **背景与复核结论**：stage 真实日志出现过
+    ``alert.recorded {'event_type': 'document_delivery_uncertain.feishu_send_failed', ...}``，
+    起初怀疑是 ``_send_terminal_notice``/``_send_ready_notice`` 的用户通知发送
+    路径本身断线（候选：``FeishuUserMessages`` 依赖注入缺失、``receive_id_type``
+    口径、``send_text`` 方法签名不匹配）。逐项核对**未发现**这类断线：
+    ``assemble_document_delivery_consumer`` 对 ``FeishuUserMessages`` 的构造参数
+    与其 ``__init__`` 签名逐字匹配，``send_text`` 的调用点关键字参数
+    （``open_id``/``text``/``dedupe_key``）与其方法签名逐字匹配，
+    ``receive_id_type=open_id`` 写死在 URL 上未被参数化误传。
+
+    真正原因是：``event_type`` 里的 ``feishu_send_failed`` 不是"这次消息发送调用
+    失败了"的字面意思，而是 ``core/alerting.py::AlertingDuty.
+    delivery_alert_callback`` 把**所有**投递告警统一归入的历史沿用伞形标签
+    ``AlertKind.FEISHU_SEND_FAILED``（见该方法文档字符串："语义上都是投递/飞书
+    发送这条链路出了结果不明或失败"）——``DocumentDeliveryConsumer._uncertain``
+    无条件调用 ``self._alert("document_delivery_uncertain", claim.task_id)``，
+    不管随后的通知是否真的发出去都会产生这一条审计行（本地可逐字复现：单独调用
+    ``AlertingDuty.delivery_alert_callback()("document_delivery_uncertain",
+    task_id)`` 即得到同一个 ``event_type``，不需要触碰 notifier）。触发这条
+    ``uncertain`` 判定的真正故障是 defect 1（``read_members`` 读错字段名，见
+    ``tests/test_feishu_docx_delivery.py::ReadMembersTest``）——四步全成功后
+    读回必然 ``LookupError``，白名单反转把它判成 ``uncertain``。defect 1 修好
+    后，真实成功的交付不会再落进这条分支。
+
+    本测试类用与 ``assemble_document_delivery_consumer`` 完全相同的构造方式
+    （只多注入一个假传输层，不发真实网络请求）装配一个真实的
+    ``FeishuUserMessages``，驱动 ``_send_ready_notice``/``_uncertain``/
+    ``_fail`` 三条通知路径各真实走一遍，用真实形状响应证明它们都不抛异常、也
+    不会额外触发 ``document_delivery_notice_failed`` 告警。
+
+    变异锚点：把 ``document_delivery.py`` 任一处 ``self._notifier.send_text``
+    的关键字参数名改错（例如 ``dedupe_key`` 改成 ``dedup_key``），或把
+    ``assemble_document_delivery_consumer`` 里 ``FeishuUserMessages(...)`` 的
+    某个构造参数删掉/改错，本类用例会从"零 notice_failed 告警"变红成抛出
+    ``TypeError``/多出一条 ``document_delivery_notice_failed`` 告警。
+    """
+
+    OPEN_ID = "ou_real_shaped_user"
+    BASE_URL = "https://feishu.invalid/open-apis"
+
+    def _real_notifier(self, transport: _RecordingUserMessageTransport) -> FeishuUserMessages:
+        # 与 assemble_document_delivery_consumer 里的构造逐字同形（app_id/
+        # app_secret/uuid_prefix 取值不同不影响验证目标：真实值来自配置注入，
+        # 这里只需要合法形状）。
+        return FeishuUserMessages(
+            base_url=self.BASE_URL,
+            app_id="cli_fake_app",
+            app_secret="fake_app_secret",
+            uuid_prefix="lingxi-doc-ready-",
+            transport=transport,
+        )
+
+    def test_ready_notice_sends_through_the_real_adapter_without_error(self) -> None:
+        transport = _RecordingUserMessageTransport(
+            [_real_shape_tenant_token_response(), _real_shape_send_message_response()]
+        )
+        store = _NoopNotifyStore()
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=store,
+            docx=_SpyDocx(),
+            notifier=self._real_notifier(transport),
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+        )
+
+        consumer._send_ready_notice(
+            request_id="tdd-ready-1",
+            task_id="tsk-ready-1",
+            requester_open_id=self.OPEN_ID,
+            document_id="doc-ready-1",
+        )
+
+        self.assertEqual(alerts, [], "真实形状下不应该触发 notice_failed 告警")
+        self.assertEqual(store.notified, ["tdd-ready-1"])
+        self.assertEqual(len(transport.calls), 2)
+        method, url, body, token = transport.calls[1]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
+        self.assertEqual(body["receive_id"], self.OPEN_ID)
+        self.assertEqual(body["msg_type"], "text")
+        self.assertIn("已生成", json.loads(body["content"])["text"])
+        self.assertEqual(token, "t-fake-tenant-access-token")
+
+    def test_uncertain_terminal_notice_sends_through_the_real_adapter_without_error(self) -> None:
+        transport = _RecordingUserMessageTransport(
+            [_real_shape_tenant_token_response(), _real_shape_send_message_response()]
+        )
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=_NoopNotifyStore(),
+            docx=_SpyDocx(),
+            notifier=self._real_notifier(transport),
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+        )
+        claim = _notify_test_claim(requester_open_id=self.OPEN_ID)
+
+        consumer._uncertain(claim, last_error="LookupError")
+
+        # 唯一一条告警必须是 `_uncertain` 自身预期产生的那条（见上方类文档字符
+        # 串重现说明），不能再叠加 notice_failed——如果通知发送本身也失败，会
+        # 多出第二条 (`document_delivery_notice_failed`, ...)。
+        self.assertEqual(alerts, [("document_delivery_uncertain", claim.task_id)])
+        self.assertEqual(len(transport.calls), 2)
+        method, url, body, token = transport.calls[1]
+        self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
+        self.assertEqual(body["receive_id"], self.OPEN_ID)
+        self.assertIn("暂无法确认", json.loads(body["content"])["text"])
+
+    def test_failed_terminal_notice_sends_through_the_real_adapter_without_error(self) -> None:
+        transport = _RecordingUserMessageTransport(
+            [_real_shape_tenant_token_response(), _real_shape_send_message_response()]
+        )
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=_NoopNotifyStore(),
+            docx=_SpyDocx(),
+            notifier=self._real_notifier(transport),
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+        )
+        claim = _notify_test_claim(requester_open_id=self.OPEN_ID)
+
+        consumer._fail(claim, last_error="feishu_code_99991400")
+
+        self.assertEqual(alerts, [("document_delivery_failed", claim.task_id)])
+        self.assertEqual(len(transport.calls), 2)
+        method, url, body, token = transport.calls[1]
+        self.assertEqual(url, f"{self.BASE_URL}/im/v1/messages?receive_id_type=open_id")
+        self.assertEqual(body["receive_id"], self.OPEN_ID)
+        self.assertIn("生成失败", json.loads(body["content"])["text"])
 
 
 class TenantDomainNotConfiguredSentinelTest(unittest.TestCase):
