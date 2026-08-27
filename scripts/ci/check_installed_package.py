@@ -874,7 +874,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 的 LocalPermissionOverrideEntry/OverrideDirection（纯类型，供
             # confirm() 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
-            "lingxi.core.permission",
             "lingxi.core.permission.local_override",
             "lingxi.core.alerting",
             "lingxi.core.identity",
