@@ -1,9 +1,20 @@
-"""银河「后台管理员」（role_id 513）→ 全公司 × 全指标（Issue #320）端到端验收。
+"""银河「后台管理员」（role_id 513）→ 全公司 × 全指标（Issue #320；B 口径见 Trace
+#328 裁定 #1，2026-08-27）端到端验收。
 
 背景：内测首日实证——用户代号 U1（化名，非真实姓名/工号/邮箱）银河角色仅持有
 「后台管理员」这一个角色、没有任何其他业务角色，开通链因此在「银河角色→职能」
 这一层查不到受支持职能而三连拒。产品负责人 2026-08-26 裁定「银河管理员理论上
 所有指标都可以看，是我忘了建这条通道」，即「全公司 × 全指标」（``*×*``）。
+
+**A 口径 → B 口径（2026-08-27）**：首版实现（#320）在配置文件里给每一个已知公司键
+各写一条「后台管理员」映射（A 口径）。真实验收发现它不等于「全公司」：具体公司
+枚举的持有人，聚合结果只覆盖枚举到的那些公司，银河新增公司时还得回来手改配置——
+``AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest`` 曾经钉住的正是这个
+（当时是有意为之的健壮性断言，事后被认定不满足「全公司」的字面要求）。产品负责人
+裁定改用 B 口径：聚合层（``core/permission/publish_row.aggregate_permission``）
+直接认「有没有这个职能」，不看这次快照枚举到了哪些公司——``all_companies`` 强制为
+真，天然覆盖未来新增公司。该测试类已按 B 口径反转断言，新增负例钉住特例不会误伤
+普通职能用户（见 ``NonAdminFunctionUserIsUnaffectedByTheSpecialCaseTest``）。
 
 本文件与 ``tests/test_galaxy_role_function.py`` / ``tests/test_company_function_
 metric_map_file.py`` 的分工不同：那两个文件各自钉住**单个**随包配置文件的内容，
@@ -22,6 +33,7 @@ from lingxi.adapters.company_function_metric_map_file import load_company_functi
 from lingxi.adapters.role_function_map_file import load_role_function_map
 from lingxi.core.permission.metric_translation import translate_company_functions
 from lingxi.core.permission.publish_row import (
+    ADMIN_FULL_ACCESS_FUNCTION,
     ALL_COMPANIES_KEY,
     REASON_GRANTED,
     aggregate_permission,
@@ -36,6 +48,11 @@ U1_GALAXY_USER_ID = "u1-fake-galaxy-user"
 #: 职能判定的是 role_name——见 core/permission/galaxy_scope.py 的 role_names_for_user
 #: 与 role_ids_for_user 分工）。
 ADMIN_ROLE_ID = "513"
+#: 这是**银河角色名**（映射的左边），恰好与聚合层触发全公司特例的**职能标签**
+#: （映射的右边，:data:`~lingxi.core.permission.publish_row.ADMIN_FULL_ACCESS_FUNCTION`）
+#: 逐字相同——两者是配置文件里 `"后台管理员" = "后台管理员"` 这一行的左右两侧，
+#: 概念不同（一个是银河的输入，一个是 Lingxi 的输出），因此各自留一个常量，不合并；
+#: 下面 ``AdminFunctionLabelMatchesGalaxyRoleNameTest`` 钉住这条巧合关系不会静默漂移。
 ADMIN_ROLE_NAME = "后台管理员"
 
 #: 期望的「全部指标」集合：与 config/company_function_metric_map.toml 里 CEO/运营/
@@ -167,17 +184,25 @@ class AdminRoleGrantsAllCompaniesAllMetricsTest(unittest.TestCase):
 
 
 class AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest(unittest.TestCase):
-    """健壮性：若某个「后台管理员」持有人在银河那一侧不是「全非」而是具体公司枚举
-    （不同于 U1 的既知情形，但同一角色的其他 10 名持有人形态未知），翻译层也不能
-    对这个组合 fail-closed——这正是「后台管理员」条目写进**每一个**公司键、而不是
-    只写 ``[companies."*"]`` 一条的原因（见两份配置文件里的对应说明）。
+    """B 口径核心断言（产品负责人 2026-08-27 裁定，Trace #328 裁定 #1，取代 #320 的
+    A 口径）：若某个「后台管理员」持有人在银河那一侧不是「全非」而是具体公司枚举
+    （不同于 U1 的既知情形，但同一角色的其他 10 名持有人形态未知），聚合结果**仍然**
+    是全公司——``all_companies`` 由聚合层的「角色即全公司」特例强制为真，不依赖这次
+    快照解释出的具体公司列表。
+
+    **这条断言在 A 口径下曾经是反过来的**（``all_companies`` 为假、翻译只覆盖枚举到
+    的那个具体公司键）：A 口径给每一个已知公司键各写一条「后台管理员」映射，银河将来
+    新增公司时还得回来手改 ``config/company_function_metric_map.toml``。B 口径把判据
+    从「这个人枚举到了哪些公司」搬到「这个人有没有这个职能」，翻译结果因此恒定落在
+    通配键——**含未来新增公司**，因为通配键从一开始就不按公司数量枚举，不需要新公司
+    出现时再补配置。
     """
 
     def setUp(self) -> None:
         self.role_function_map = load_role_function_map()
         self.metric_translation_map = load_company_function_metric_map()
 
-    def test_specific_company_scope_without_all_non_still_covers_all_metrics(self) -> None:
+    def test_specific_company_scope_is_overridden_to_all_companies(self) -> None:
         aggregate = aggregate_permission(
             galaxy_user_id=U1_GALAXY_USER_ID,
             user_role_rows=_role_rows(role_id=ADMIN_ROLE_ID, role_name=ADMIN_ROLE_NAME),
@@ -189,7 +214,14 @@ class AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest(unittest.TestCase)
         )
 
         self.assertTrue(aggregate.granted)
-        self.assertFalse(aggregate.all_companies)
+        # B 口径的核心分歧点：即使银河那一侧只枚举了公司 "1"（不是「全非」），
+        # 聚合结果的 all_companies 仍必须是 True——这是本条修复要证明的事。
+        self.assertTrue(
+            aggregate.all_companies,
+            "持有「后台管理员」时 all_companies 必须恒为真，不依赖具体公司枚举（B 口径）",
+        )
+        # companies 字段不被特例清空或改写：它仍然是这次快照解释出的具体公司列表，
+        # 只是序列化/翻译层在 all_companies=True 时根本不会读它（见下面的翻译结果）。
         self.assertEqual(aggregate.companies, ("1",))
 
         translated = translate_company_functions(
@@ -199,8 +231,55 @@ class AdminRoleWithoutWildcardCompanyScopeStillTranslatesTest(unittest.TestCase)
             mapping=self.metric_translation_map,
         )
 
-        self.assertEqual(set(translated), {"1"})
-        self.assertEqual(set(translated["1"]), EXPECTED_ALL_METRICS)
+        # 翻译结果落在通配键，不是具体公司 "1"——这就是「全公司（含未来新增公司）」
+        # 在发布内容里的最终形状：新公司出现时这条判据不需要任何变化。
+        self.assertEqual(set(translated), {ALL_COMPANIES_KEY})
+        self.assertEqual(set(translated[ALL_COMPANIES_KEY]), EXPECTED_ALL_METRICS)
+
+
+class NonAdminFunctionUserIsUnaffectedByTheSpecialCaseTest(unittest.TestCase):
+    """负例：不持有「后台管理员」的普通职能用户，聚合结果完全不受这条特例影响——
+    具体公司枚举依然是具体公司枚举，不会被误判成全公司。
+
+    **变异锚点**：把 ``aggregate_permission`` 里的特例条件
+    （``ADMIN_FULL_ACCESS_FUNCTION in functions``）改成恒为 ``True``，本用例必红
+    （``all_companies`` 会被误判成 ``True``）——这是钉住「特例只对持有该职能的人生效」
+    的唯一手段，前一个测试类只能证明「持有时生效」，证明不了「不持有时不生效」。
+    """
+
+    def setUp(self) -> None:
+        self.role_function_map = load_role_function_map()
+
+    def test_ordinary_function_holder_keeps_specific_company_scope(self) -> None:
+        aggregate = aggregate_permission(
+            galaxy_user_id=U1_GALAXY_USER_ID,
+            user_role_rows=_role_rows(role_id="8", role_name="A运营"),
+            datacountry_rows=[{"user_id": U1_GALAXY_USER_ID, "datacountry_id": "11"}],
+            country_rows=[
+                {"country_key": "11", "name": "示例国家", "name_cn": "示例国家", "boss_company_id": "1"},
+            ],
+            role_function_map=self.role_function_map,
+        )
+
+        self.assertTrue(aggregate.granted)
+        self.assertEqual(aggregate.functions, ("运营",))
+        self.assertNotIn(ADMIN_FULL_ACCESS_FUNCTION, aggregate.functions)
+        self.assertFalse(
+            aggregate.all_companies,
+            "不持有「后台管理员」时，all_companies 必须仍由银河侧的实际范围决定",
+        )
+        self.assertEqual(aggregate.companies, ("1",))
+
+
+class AdminFunctionLabelMatchesGalaxyRoleNameTest(unittest.TestCase):
+    """钉住模块顶部的巧合关系：本文件的 ``ADMIN_ROLE_NAME``（银河角色名，映射左边）
+    与 ``publish_row.ADMIN_FULL_ACCESS_FUNCTION``（Lingxi 职能标签，触发全公司特例的
+    判据，映射右边）逐字相同。两者是配置文件里同一行的左右两侧，各自独立维护；
+    这条用例只是防止其中一边改名时另一边被静默遗漏。
+    """
+
+    def test_role_name_and_function_label_are_the_same_literal(self) -> None:
+        self.assertEqual(ADMIN_ROLE_NAME, ADMIN_FULL_ACCESS_FUNCTION)
 
 
 class WithoutTheMappingEntryTheUserWouldStillBeDeniedTest(unittest.TestCase):
