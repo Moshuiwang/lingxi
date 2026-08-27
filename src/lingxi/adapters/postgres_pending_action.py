@@ -57,6 +57,42 @@
   SAVEPOINT）里，撞索引时只回滚这条 INSERT 本身，外层事务（``pending_action``
   终态更新、审计）仍然可以正常提交——与 :meth:`~.prepare` 对同一类冲突
   （``pending_action_single_pending_target_idx``）的处理同一姿态。
+
+## 本地权限收回（迁移 0073 已扩容 CHECK，#319 S-P-1b 卡 B）如何复用同一套机制
+
+``LOCAL_PERMISSION_REVOKE`` 与 grant/suppress 共用同一个 prepare/confirm 骨架，
+但输入形状相反——grant/suppress 按"用户+方向+公司+指标"这个键定位；revoke
+按 override_id 这一行本身定位（管理员从 ``/admin user`` 回显里复制这个 id，
+不需要重新填一遍公司/指标）。差异集中在三处：
+
+- ``prepare()``：复用既有的 ``target_open_id`` 形参承载 override_id（不是真实
+  的 open_id——router 层拿到的 ``command.identifier`` 对 revoke 命令而言就是
+  override_id，见 ``core/admin/router.py`` 的 ``_dispatch_write_action`` 调用点），
+  按这个 id 联表 ``local_permission_override``/``app_user`` 一次查出：这一行现在
+  的 ``entry_status``（写进 ``target_state_snapshot``，取值域收窄成
+  ``VALID_SOURCE_STATES[REVOKE] = {"active"}``）、这一行的属主真实 open_id（写进
+  ``PendingAction.target_open_id``，供确认卡展示"目标：xxx"）、以及这一行的
+  ``direction``/``company_id``/``metric_name``（连同管理员这次填写的收回
+  ``reason`` 一起序列化进 ``payload``，供 ``core/admin/notification.py`` 渲染
+  "含被收回的方向/公司/指标"——卡 B 设计卡显式要求）。行不存在时把 current_state
+  置 ``None``，与 grant/suppress 对"目标不存在"的处理同一姿态，落进
+  ``decide_prepare`` 既有的"未找到"拒绝分支，不产生任何新代码路径。
+- 自我目标防呆放在这里、不在 router 层（设计卡"检查点位置不同"）：router 拿到
+  的 ``target_identifier`` 只是一个不透明的 override_id 字符串，在查库之前无法
+  判断它的属主是不是操作者本人——查到属主 open_id 之后立刻核对，相等则直接拒绝、
+  不继续往下建任何 ``pending_action`` 行，与 router 层同语义（见
+  :data:`_REVOKE_SELF_TARGET_FORBIDDEN_CODE`，取值与 ``core/admin/router.
+  _SELF_TARGET_FORBIDDEN_CODE`` 相同字符串，两处不互相 import，各自独立定义
+  ——与全仓库既有的"结构相同、不共享导入"的 Protocol/常量惯例一致）。
+- ``confirm()``：EXECUTE 分支解析 ``payload`` 取出 override_id，调用
+  :func:`~lingxi.adapters.postgres_local_permission._revoke_locked`（条件
+  ``UPDATE ... WHERE entry_status = 'active'``）。与 grant/suppress 的 INSERT
+  撞唯一索引不同，这里没有异常可捕获——``_revoke_locked`` 用返回的布尔值
+  （``rowcount == 1``）直接说明这一行在 prepare 到这一刻之间是否仍然是
+  ``active``：如果不是（已经被另一条路径抢先收回），同样降级为既有
+  ``ConfirmResultKind.TARGET_DRIFTED``/``FAILED``/``reason="target_drifted"``，
+  不新增错误码——与 grant/suppress 那条 SAVEPOINT 降级路径同一姿态，只是这里的
+  冲突信号是条件更新的影响行数，不是唯一索引异常。
 """
 
 from __future__ import annotations
@@ -69,7 +105,11 @@ from typing import Protocol
 from lingxi.adapters.admin_registry import admin_registry_entry_from_row
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_conversation import _Transaction
-from lingxi.adapters.postgres_local_permission import DuplicateActiveOverride, _insert_locked
+from lingxi.adapters.postgres_local_permission import (
+    DuplicateActiveOverride,
+    _insert_locked,
+    _revoke_locked,
+)
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
     CancelDecision,
@@ -97,10 +137,21 @@ from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, 
 TARGET_HAS_PENDING_ACTION_CODE = "target_has_pending_action"
 TARGET_HAS_PENDING_ACTION_MESSAGE = "该用户当前已有一条待确认操作在途，请先处理（确认或取消）后再重新发起。"
 
-#: 本地权限两类动作类型 → 迁移 ``0072`` ``direction`` 列取值的映射（``REVOKE``
-#: 未登记：其执行留给卡 B，见 ``core/admin/pending_action.PendingActionType``
-#: 文档）。``prepare()`` 的基线观测查询、``confirm()`` 的 EXECUTE 写入分支共用
-#: 同一张表。
+#: 收回的自我目标防呆拒绝码/文案（#319 S-P-1b 卡 B）：取值与 ``core/admin/
+#: router._SELF_TARGET_FORBIDDEN_CODE``/拒绝文案相同字符串——两个模块结构上
+#: 不互相 import（``core/admin/router.py`` 不 import adapters/），因此各自独立
+#: 定义同一取值，与全仓库既有的"结构相同、不共享导入"的 Protocol/常量惯例一致
+#: （对照本模块自己的 ``AuditSink`` Protocol 与 ``core/admin/router.AuditSink``
+#: 结构相同但分别定义）。检查点为什么在这里而不在 router 层，见模块文档「本地
+#: 权限收回如何复用同一套机制」。
+_REVOKE_SELF_TARGET_FORBIDDEN_CODE = "self_target_forbidden"
+_REVOKE_SELF_TARGET_FORBIDDEN_MESSAGE = "不能对自己发起该操作。"
+
+#: 本地权限授权/抑制两类动作类型 → 迁移 ``0072`` ``direction`` 列取值的映射
+#: （``REVOKE`` 不在这张表里，且这不是"未登记"的历史遗留——收回的 ``direction``
+#: 不是一个固定值，而是要按 override_id 从被收回的那一行本身读出来，见模块文档
+#: 「本地权限收回如何复用同一套机制」）。``prepare()`` 的基线观测查询、
+#: ``confirm()`` 的 EXECUTE 写入分支共用同一张表。
 _DIRECTION_BY_ACTION_TYPE: dict[PendingActionType, OverrideDirection] = {
     PendingActionType.LOCAL_PERMISSION_GRANT: OverrideDirection.GRANT,
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: OverrideDirection.SUPPRESS,
@@ -227,12 +278,15 @@ class PostgresPendingActionStore:
         :meth:`mark_card_delivered`，失败调用 :meth:`mark_send_failed`）。
 
         ``company_id``/``metric_name``/``reason`` 三个参数只有
-        ``action_type in LOCAL_PERMISSION_ACTION_TYPES``（授权/抑制）时才会被
-        使用：序列化成 JSON 写入新增的 ``payload`` 列（迁移 ``0073``），并且
-        "目标当前状态"改按这个键去查迁移 ``0072`` 的表是否已有生效行（模块文档
-        「本地权限授权/抑制如何复用同一套机制」）。``suspend_user``/
-        ``resume_user`` 两类动作忽略这三个参数（保持沿用 ``account_state`` 的
-        既有行为，逐字节不变）。
+        ``action_type in LOCAL_PERMISSION_ACTION_TYPES``（授权/抑制/收回）时才会
+        被使用。授权/抑制：三个参数原样序列化成 JSON 写入新增的 ``payload`` 列
+        （迁移 ``0073``），"目标当前状态"改按这个键去查迁移 ``0072`` 的表是否
+        已有生效行（模块文档「本地权限授权/抑制如何复用同一套机制」）。收回：
+        只用 ``reason``（管理员这次填写的收回原因），``company_id``/
+        ``metric_name`` 被忽略——``target_open_id`` 这个形参改为承载 override_id，
+        真正的公司/指标/方向从这一行本身查出来（模块文档「本地权限收回如何复用
+        同一套机制」）。``suspend_user``/``resume_user`` 两类动作忽略全部三个
+        参数（保持沿用 ``account_state`` 的既有行为，逐字节不变）。
         """
 
         from psycopg.errors import UniqueViolation
@@ -240,6 +294,7 @@ class PostgresPendingActionStore:
         moment = now or datetime.now(timezone.utc)
         pending_id = new_id("pac")
         is_local_permission_action = action_type in _DIRECTION_BY_ACTION_TYPE
+        is_revoke_action = action_type is PendingActionType.LOCAL_PERMISSION_REVOKE
         payload = (
             json.dumps(
                 {"company_id": company_id, "metric_name": metric_name, "reason": reason},
@@ -248,18 +303,67 @@ class PostgresPendingActionStore:
             if is_local_permission_action
             else None
         )
+        # 收回的 INSERT 目标是被收回那一行的真实属主 open_id，不是本方法收到的
+        # ``target_open_id`` 形参（那里装的是 override_id）——见下面 revoke 分支
+        # 对这个变量的重新赋值；grant/suppress/suspend/resume 三类动作里它恒等于
+        # 收到的 ``target_open_id``，不改变既有行为。
+        resolved_target_open_id = target_open_id
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
-                        (target_open_id,),
-                    )
-                    row = cursor.fetchone()
-                    user_id = row[0] if row is not None else None
-                    account_state = row[1] if row is not None else None
+                    if is_revoke_action:
+                        override_id = target_open_id
+                        cursor.execute(
+                            "SELECT lpo.entry_status, lpo.direction, lpo.company_id,"
+                            "       lpo.metric_name, au.feishu_open_id"
+                            "  FROM local_permission_override lpo"
+                            "  JOIN app_user au ON au.id = lpo.user_id"
+                            " WHERE lpo.id = %s",
+                            (override_id,),
+                        )
+                        revoke_row = cursor.fetchone()
+                        if revoke_row is None:
+                            current_state = None
+                        else:
+                            (
+                                entry_status,
+                                direction_value,
+                                found_company_id,
+                                found_metric_name,
+                                owner_open_id,
+                            ) = revoke_row
+                            if owner_open_id == initiated_by_open_id:
+                                # 自我目标防呆（模块文档「本地权限收回如何复用同一
+                                # 套机制」）：查到属主之后立刻核对，相等则直接拒绝，
+                                # 不再往下调用 decide_prepare、不产生任何
+                                # pending_action 行。
+                                return PrepareOutcome(
+                                    decision=PrepareDecision(
+                                        ok=False,
+                                        code=_REVOKE_SELF_TARGET_FORBIDDEN_CODE,
+                                        message=_REVOKE_SELF_TARGET_FORBIDDEN_MESSAGE,
+                                    )
+                                )
+                            current_state = entry_status
+                            resolved_target_open_id = owner_open_id
+                            payload = json.dumps(
+                                {
+                                    "override_id": override_id,
+                                    "direction": direction_value,
+                                    "company_id": found_company_id,
+                                    "metric_name": found_metric_name,
+                                    "reason": reason,
+                                },
+                                ensure_ascii=False,
+                            )
+                    elif is_local_permission_action:
+                        cursor.execute(
+                            "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
+                            (target_open_id,),
+                        )
+                        row = cursor.fetchone()
+                        user_id = row[0] if row is not None else None
 
-                    if is_local_permission_action:
                         if user_id is None:
                             current_state = None
                         else:
@@ -272,7 +376,12 @@ class PostgresPendingActionStore:
                             )
                             current_state = "present" if cursor.fetchone() is not None else "absent"
                     else:
-                        current_state = account_state
+                        cursor.execute(
+                            "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
+                            (target_open_id,),
+                        )
+                        row = cursor.fetchone()
+                        current_state = row[1] if row is not None else None
 
                     decision = decide_prepare(
                         action_type=action_type, current_account_state=current_state
@@ -298,7 +407,7 @@ class PostgresPendingActionStore:
                                 (
                                     pending_id,
                                     action_type.value,
-                                    target_open_id,
+                                    resolved_target_open_id,
                                     current_state,
                                     initiated_by_open_id,
                                     moment,
@@ -517,6 +626,13 @@ class PostgresPendingActionStore:
                             current_account_state = (
                                 pending.target_state_snapshot if target_user_id is not None else None
                             )
+                        elif pending.action_type is PendingActionType.LOCAL_PERMISSION_REVOKE:
+                            # 同一手法（模块文档「本地权限收回如何复用同一套机制」）：
+                            # 真正的漂移检测不经过这里的字符串比较，而是让下面 EXECUTE
+                            # 分支的条件 UPDATE（_revoke_locked）的 rowcount 说话。
+                            current_account_state = (
+                                pending.target_state_snapshot if target_user_id is not None else None
+                            )
 
                     # 两把行锁（待确认操作、目标账号）与 admin_registry 的 FOR SHARE
                     # 都已经拿到——现在才取时钟（外部审查交叉裁定，codex P1-3）：等锁
@@ -617,6 +733,33 @@ class PostgresPendingActionStore:
                                     with connection.transaction():
                                         _insert_locked(cursor, override_id=override_id, entry=entry)
                                 except DuplicateActiveOverride:
+                                    decision = ConfirmDecision(
+                                        kind=ConfirmResultKind.TARGET_DRIFTED,
+                                        message="目标用户状态已经变化，请重新查询后再发起。",
+                                        terminal_status=PendingActionStatus.FAILED,
+                                        reason="target_drifted",
+                                    )
+                            elif pending.action_type is PendingActionType.LOCAL_PERMISSION_REVOKE:
+                                # 本地权限收回的 EXECUTE 分支：不改 app_user，条件
+                                # UPDATE 迁移 0072 的 local_permission_override 表
+                                # （模块文档「本地权限收回如何复用同一套机制」）。
+                                # payload 在 prepare() 时刻已经把 override_id 连同
+                                # 被收回那一行的方向/公司/指标一起写入（供
+                                # core/admin/notification.py 渲染）。
+                                assert pending.payload is not None
+                                payload_data = json.loads(pending.payload)
+                                revoked = _revoke_locked(
+                                    cursor,
+                                    override_id=payload_data["override_id"],
+                                    revoked_pending_action_id=pending.id,
+                                    moment=moment,
+                                )
+                                if not revoked:
+                                    # 与 grant/suppress 的 DuplicateActiveOverride
+                                    # 降级同一姿态，只是这里的冲突信号是条件更新的
+                                    # 影响行数（rowcount == 0），不是唯一索引异常
+                                    # ——prepare 到这一刻之间，这一行已经被另一条
+                                    # 路径抢先收回（entry_status 不再是 'active'）。
                                     decision = ConfirmDecision(
                                         kind=ConfirmResultKind.TARGET_DRIFTED,
                                         message="目标用户状态已经变化，请重新查询后再发起。",

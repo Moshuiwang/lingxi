@@ -49,6 +49,18 @@ def _pending(
 
 _GRANT_PAYLOAD = '{"company_id": "1011", "metric_name": "daily_active", "reason": "特批"}'
 
+#: 收回的 payload 形状（卡 B）：比授权/抑制多一个 ``override_id``（confirm() 用它
+#: 定位要收回的行）与 ``direction``（被收回那一行原本的方向，供渲染「含被收回的
+#: 方向/公司/指标」）——见 ``adapters/postgres_pending_action.py`` 模块文档。
+_REVOKE_GRANT_PAYLOAD = (
+    '{"override_id": "lpo_01JGFJJZ008XSHEADGG8V74SPC", "direction": "grant",'
+    ' "company_id": "1011", "metric_name": "daily_active", "reason": "离职交接"}'
+)
+_REVOKE_SUPPRESS_PAYLOAD = (
+    '{"override_id": "lpo_01JGFJJZ008XSHEADGG8V74SPC", "direction": "suppress",'
+    ' "company_id": "1011", "metric_name": "daily_active", "reason": "误抑制"}'
+)
+
 
 class RenderConfirmCardTests(unittest.TestCase):
     def test_card_has_two_buttons_with_correct_bound_values(self) -> None:
@@ -168,6 +180,80 @@ class LocalPermissionRenderingTests(unittest.TestCase):
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
         self.assertNotIn("范围：", card.body)
+
+
+class RevokeRenderingTests(unittest.TestCase):
+    """本地权限收回（卡 B）确认卡/终态卡/群通知的渲染扩展：含被收回的方向/公司/
+    指标，沿卡 A 形状——复用同一套 ``_permission_scope_block``/
+    ``_permission_scope_suffix``，只多一行"方向"。"""
+
+    def test_revoke_card_mentions_revoke_action_and_scope_and_direction(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, payload=_REVOKE_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertIn("收回", card.title)
+        self.assertIn("1011", card.body)
+        self.assertIn("daily_active", card.body)
+        self.assertIn("离职交接", card.body)
+        # 「含被收回的方向」：被收回的这一行原本是授权（grant），不是抑制。
+        self.assertIn("授权", card.body)
+
+    def test_revoke_card_mentions_suppress_direction_when_revoking_a_suppression(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
+            payload=_REVOKE_SUPPRESS_PAYLOAD,
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertIn("抑制", card.body)
+
+    def test_grant_and_suppress_cards_have_no_direction_line(self) -> None:
+        """授权/抑制的 payload 从不携带 ``direction`` 键：既有卡片正文逐字节
+        不变——抓"给 grant/suppress 也渲染了方向行"这类变异。"""
+
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertNotIn("方向：", card.body)
+
+    def test_terminal_card_includes_scope_and_direction_for_revoke(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
+            status=PendingActionStatus.EXECUTED,
+            payload=_REVOKE_GRANT_PAYLOAD,
+        )
+        card = render_terminal_card(pending, target_label=TARGET_OPEN_ID, outcome_text="已确认执行")
+
+        self.assertIn("1011", card.body)
+        self.assertIn("daily_active", card.body)
+        self.assertIn("授权", card.body)
+
+    def test_group_notice_includes_scope_and_direction_suffix_for_revoke(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
+            status=PendingActionStatus.EXECUTED,
+            payload=_REVOKE_GRANT_PAYLOAD,
+        )
+        notice = render_group_notice(pending)
+
+        self.assertIn("1011", notice)
+        self.assertIn("daily_active", notice)
+        self.assertIn("离职交接", notice)
+        self.assertIn("收回", notice)
+        self.assertIn("授权", notice)
+
+    def test_malformed_revoke_payload_does_not_crash_rendering(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, payload="not-json{"
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertNotIn("范围：", card.body)
+        self.assertNotIn("方向：", card.body)
 
 
 class RenderTerminalCardTests(unittest.TestCase):

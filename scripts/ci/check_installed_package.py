@@ -499,6 +499,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.admin_bootstrap",
             "lingxi.apps.admin_bootstrap.__main__",
             "lingxi.adapters.admin_registry",
+            # #319 S-P-1b 卡 B：`adapters/admin_registry.py` 的 `PostgresAdminQueries`
+            # 新增「/admin user 回显当前生效本地覆盖」，模块级 import 了
+            # `PostgresLocalPermissionOverrideStore`（复用其 `effective_entries()`
+            # 读路径，不重新拼一遍同样的 SQL）——这条边把
+            # `adapters.postgres_local_permission` 与它引用的
+            # `core.permission.local_override` 一并拉进 scheduler 闭包（`admin_
+            # registry.py` 本就在这个闭包里，供 admin_bootstrap 种子写入使用）。
+            # 不新增第三方依赖：两个模块都只用标准库 + 已在本闭包内的 `adapters.
+            # postgres`/`core.ids`。
+            "lingxi.adapters.postgres_local_permission",
+            "lingxi.core.permission.local_override",
             "lingxi.core.admin",
             "lingxi.core.admin.registry",
             "lingxi.core.admin.views",
