@@ -780,6 +780,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
+            # 群聊@机器人固定引导（Issue #318）：`GroupMentionHintResponder` 在
+            # `apps/gateway/__init__.py` **模块级** import `redact_identifier`，
+            # 把要发这条提示的 chat_id 记进日志（不是结构化审计字段，见该函数
+            # 内注释与 `V-花名册-34`）。
+            "lingxi.core.identity.identifiers",
             # `adapters/feishu_directory.py` 的在职状态读取口把成员详情折成
             # `core.identity.first_contact.EmploymentStatus`。gateway 本身不用那个读取口
             # （首次开通编排在 scheduler），但它模块级 import 了同一个 adapter。
