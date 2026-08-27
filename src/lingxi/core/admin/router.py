@@ -24,7 +24,11 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
-from lingxi.core.admin.pending_action import PendingAction, PendingActionType
+from lingxi.core.admin.pending_action import (
+    LOCAL_PERMISSION_ACTION_TYPES,
+    PendingAction,
+    PendingActionType,
+)
 from lingxi.core.admin.registry import AdminRegistryEntry, is_authorized_admin
 from lingxi.core.admin.views import AdminEventView, AdminUserStatusView
 
@@ -66,10 +70,21 @@ class PendingActionPreparer(Protocol):
     """``prepare_action``（接口设计「八、领域服务接口」）的调用面：只建待确认操作，
     不直接改变业务状态。与
     ``adapters.postgres_pending_action.PostgresPendingActionStore.prepare`` 结构
-    相同，测试注入内存假实现。"""
+    相同，测试注入内存假实现。
+
+    ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）只有
+    ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 两条写命令会填——``suspend``/
+    ``resume`` 沿用既有调用形状，不传这三个参数。"""
 
     def prepare(
-        self, *, action_type: PendingActionType, target_open_id: str, initiated_by_open_id: str
+        self,
+        *,
+        action_type: PendingActionType,
+        target_open_id: str,
+        initiated_by_open_id: str,
+        company_id: str | None = None,
+        metric_name: str | None = None,
+        reason: str | None = None,
     ) -> _PrepareOutcome: ...
 
 
@@ -141,6 +156,24 @@ DEFAULT_EVENT_LIMIT = 20
 #: 动态变化，不适合模板变量的强匹配约束）。version 字段固定这个字面量，审计里能一眼
 #: 区分"这条内容来自目录"还是"来自管理命令面"。
 _CONTENT_VERSION = "internal"
+
+#: 写命令 → 审计动作名，供 :meth:`AdminCommandRouter._dispatch_write_action`
+#: 统一查表（#319 S-P-1b 从原先的二选一 suspend/resume 三元表达式泛化而来）。
+#: ``LOCAL_PERMISSION_REVOKE`` 未登记——收回命令留给卡 B，本模块不解析、也不
+#: 派发它。
+_WRITE_ACTION_NAMES: dict[PendingActionType, str] = {
+    PendingActionType.SUSPEND_USER: "admin.command.suspend_user",
+    PendingActionType.RESUME_USER: "admin.command.resume_user",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "admin.command.grant_permission",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "admin.command.suppress_permission",
+}
+
+#: 自我目标防呆的拒绝码（#319 S-P-1b 设计卡新增）：不属于接口设计「通用约定·
+#: 错误模型」的既有错误码表——那张表描述的是 prepare/confirm 核对链内部的判定
+#: 分支，这里是 router 层在调用 prepare() 之前就能确定性拒绝的一条独立业务规则，
+#: 与 ``adapters/postgres_pending_action.TARGET_HAS_PENDING_ACTION_CODE`` 同一
+#: 取舍（新的拒绝原因就该有自己的字面量，不勉强套进不描述它的既有取值）。
+_SELF_TARGET_FORBIDDEN_CODE = "self_target_forbidden"
 
 
 class AdminCommandRouter:
@@ -373,6 +406,44 @@ class AdminCommandRouter:
                 trace_id=trace_id,
             )
 
+        if command.kind is AdminCommandKind.GRANT_PERMISSION:
+            assert command.identifier is not None
+            assert command.company_id is not None
+            assert command.metric_name is not None
+            assert command.reason is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+                target_identifier=command.identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+                company_id=command.company_id,
+                metric_name=command.metric_name,
+                reason=command.reason,
+            )
+
+        if command.kind is AdminCommandKind.SUPPRESS_PERMISSION:
+            assert command.identifier is not None
+            assert command.company_id is not None
+            assert command.metric_name is not None
+            assert command.reason is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS,
+                target_identifier=command.identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+                company_id=command.company_id,
+                metric_name=command.metric_name,
+                reason=command.reason,
+            )
+
         # UNKNOWN：语法封闭的落点——不认识的命令得到帮助/拒绝文案，绝不会被当成
         # 任何查询条件执行（`commands.py` 已把语法钉死为六选一，这里只负责回复）。
         return self._record_or_reject(
@@ -399,21 +470,47 @@ class AdminCommandRouter:
         thread_id: str | None,
         message_id: str,
         trace_id: str,
+        company_id: str | None = None,
+        metric_name: str | None = None,
+        reason: str | None = None,
     ) -> AdminRouteOutcome:
-        """``suspend``/``resume`` 共用的写命令编排：角色核对 → ``prepare_action``
-        （只建待确认操作，不改业务状态）→ 发送确认卡片 → 回复管理员"已生成待确认
-        操作，请查收卡片"。真正的业务变更只发生在管理员本人点击卡片之后，见
+        """``suspend``/``resume``/``grant_permission``/``suppress_permission``
+        共用的写命令编排：角色核对 → 自我目标防呆 → ``prepare_action``（只建待
+        确认操作，不改业务状态）→ 发送确认卡片 → 回复管理员"已生成待确认操作，
+        请查收卡片"。真正的业务变更只发生在管理员本人点击卡片之后，见
         ``core/admin/card_callback.AdminCardCallbackHandler``。
+
+        ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）
+        只有 ``LOCAL_PERMISSION_GRANT``/``LOCAL_PERMISSION_SUPPRESS`` 会传，原样
+        转交给 ``prepare()``——``suspend``/``resume`` 保持既有调用形状不变。
 
         任何一步不通过都只回复文案、不产生第二条待确认操作或第二张卡片——本方法
         对每种命令最多调用一次 ``prepare()``、最多调用一次卡片发送。
         """
 
-        action_name = (
-            "admin.command.suspend_user"
-            if action_type is PendingActionType.SUSPEND_USER
-            else "admin.command.resume_user"
-        )
+        action_name = _WRITE_ACTION_NAMES[action_type]
+
+        if action_type in LOCAL_PERMISSION_ACTION_TYPES and target_identifier == entry.feishu_open_id:
+            # 自我目标防呆（#319 S-P-1b 设计卡）：管理员不能对自己发起本地权限
+            # 授权/抑制/收回——显式条件门，suspend/resume 恒为假（它们不在
+            # ``LOCAL_PERMISSION_ACTION_TYPES`` 里），不改变既有写命令的行为。
+            # 放在 prepare() 之前：这条拒绝不依赖 pending_actions/confirm_cards
+            # 是否已装配，也不产生任何待确认操作——不合法的意图不应该先创建一条
+            # 记录再补救，而是从一开始就不让它进入 prepare() 的调用面。
+            return self._record_or_reject(
+                action_name,
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.write_action_rejected",
+                    content_version=_CONTENT_VERSION,
+                    reply_text="不能对自己发起该操作。",
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=target_identifier,
+                code=_SELF_TARGET_FORBIDDEN_CODE,
+                trace_id=trace_id,
+            )
 
         if self._pending_actions is None or self._confirm_cards is None:
             # 未装配（例如尚未完成 gateway 接线的中间态，或测试只想覆盖只读命令）：
@@ -465,6 +562,9 @@ class AdminCommandRouter:
             action_type=action_type,
             target_open_id=target_identifier,
             initiated_by_open_id=entry.feishu_open_id,
+            company_id=company_id,
+            metric_name=metric_name,
+            reason=reason,
         )
         if not outcome.decision.ok or outcome.pending is None:
             return self._record_or_reject(
@@ -529,6 +629,8 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时）\n"
         "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
+        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权（需本人飞书确认卡片）\n"
+        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起本地抑制（需本人飞书确认卡片）\n"
         f"当前角色：{role_line}"
     )
 

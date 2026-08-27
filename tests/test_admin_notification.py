@@ -27,6 +27,7 @@ def _pending(
     action_type: PendingActionType = PendingActionType.SUSPEND_USER,
     status: PendingActionStatus = PendingActionStatus.PENDING,
     reason: str | None = None,
+    payload: str | None = None,
 ) -> PendingAction:
     return PendingAction(
         id="pac_notif_test000000000000",
@@ -42,7 +43,11 @@ def _pending(
         confirm_deadline_at=NOW + timedelta(minutes=10),
         decided_at=None,
         decided_by_open_id=None,
+        payload=payload,
     )
+
+
+_GRANT_PAYLOAD = '{"company_id": "1011", "metric_name": "daily_active", "reason": "特批"}'
 
 
 class RenderConfirmCardTests(unittest.TestCase):
@@ -86,6 +91,83 @@ class RenderConfirmCardTests(unittest.TestCase):
         lowered = (card.title + card.body).lower()
         for forbidden in ("token", "secret", "password", "凭据"):
             self.assertNotIn(forbidden, lowered)
+
+
+class LocalPermissionRenderingTests(unittest.TestCase):
+    """本地权限授权/抑制（#319 S-P-1b）确认卡/终态卡/群通知的渲染扩展：含
+    公司/指标/方向/理由，方向由 ``_ACTION_LABEL`` 隐式表达；不回显该用户的
+    其余任何权限内容，只讲这一次动作涉及的单一键。"""
+
+    def test_grant_card_mentions_grant_action_and_scope(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertIn("授权", card.title)
+        self.assertIn("1011", card.body)
+        self.assertIn("daily_active", card.body)
+        self.assertIn("特批", card.body)
+
+    def test_suppress_card_mentions_suppress_action(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertIn("抑制", card.title)
+
+    def test_suspend_card_has_no_scope_line(self) -> None:
+        """非本地权限动作（``payload`` 恒为 ``None``）不产生任何范围行——
+        既有 suspend/resume 卡片正文逐字节不变。"""
+
+        pending = _pending(action_type=PendingActionType.SUSPEND_USER)
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertNotIn("范围：", card.body)
+        self.assertNotIn("原因：", card.body)
+
+    def test_terminal_card_includes_scope_for_local_permission_action(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            status=PendingActionStatus.EXECUTED,
+            payload=_GRANT_PAYLOAD,
+        )
+        card = render_terminal_card(pending, target_label=TARGET_OPEN_ID, outcome_text="已确认执行")
+
+        self.assertIn("1011", card.body)
+        self.assertIn("daily_active", card.body)
+
+    def test_group_notice_includes_scope_suffix_for_local_permission_action(self) -> None:
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            status=PendingActionStatus.EXECUTED,
+            payload=_GRANT_PAYLOAD,
+        )
+        notice = render_group_notice(pending)
+
+        self.assertIn("1011", notice)
+        self.assertIn("daily_active", notice)
+        self.assertIn("特批", notice)
+        self.assertIn("授权", notice)
+
+    def test_group_notice_has_no_scope_suffix_for_suspend(self) -> None:
+        pending = _pending(action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED)
+        notice = render_group_notice(pending)
+
+        self.assertNotIn("公司", notice)
+        self.assertNotIn("指标", notice)
+
+    def test_malformed_payload_does_not_crash_rendering(self) -> None:
+        """脏数据兜底：``payload`` 不是合法 JSON 时渲染函数不得抛异常，只是
+        跳过范围行——纯函数不允许因为一条历史脏数据整体崩溃。"""
+
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload="not-json{"
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertNotIn("范围：", card.body)
 
 
 class RenderTerminalCardTests(unittest.TestCase):

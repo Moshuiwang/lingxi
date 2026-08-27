@@ -26,6 +26,7 @@ from postgres_schema import ensure_production_schema, reset_production_rows
 
 from lingxi.adapters.admin_registry import seed_admin_registry_entry
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_pending_action import (
     TARGET_HAS_PENDING_ACTION_CODE,
     PendingActionAuditWriteFailed,
@@ -38,6 +39,7 @@ from lingxi.core.admin.pending_action import (
     PendingActionType,
 )
 from lingxi.core.ids import new_id
+from lingxi.core.permission.local_override import OverrideDirection
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -1098,6 +1100,342 @@ class TransientFailureRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(self.current_account_state(TARGET_OPEN_ID), "enabled")
         rows = self.query("SELECT status FROM pending_action WHERE id = %s", (pending_id,))
         self.assertEqual(rows[0][0], "pending")
+
+
+class LocalPermissionGrantSuppressRealDbTests(PendingActionPostgresTestCase):
+    """本地权限授权/抑制全链路真库断言（迁移 ``0073``，#319 S-P-1b 设计卡）。
+
+    覆盖设计卡登记的行为锚点：①新命令不绕过身份判定见 ``tests/test_admin_router.py``
+    （本文件只覆盖 adapter 层）；②"未确认不落行"；③漂移黑盒（SAVEPOINT 降级）；
+    ⑥同目标在途互斥覆盖新类型。变异锚点（登记后已还原，见任务收口说明）：删
+    SAVEPOINT 降级会让 ``test_confirm_downgrades_to_target_drifted_when_key_
+    is_taken_before_confirm`` 变红（未捕获的 ``DuplicateActiveOverride``
+    直接从 ``confirm()`` 冒泡）；把 ``VALID_SOURCE_STATES[GRANT]`` 改成
+    ``{"present"}`` 会让 prepare 阶段本身直接拒绝，本类多个用例连锁变红。
+    """
+
+    COMPANY_ID = "1011"
+    METRIC_NAME = "daily_active"
+    REASON = "特批"
+
+    def user_id_for(self, open_id: str = TARGET_OPEN_ID) -> str:
+        rows = self.query("SELECT id FROM app_user WHERE feishu_open_id = %s", (open_id,))
+        self.assertEqual(len(rows), 1)
+        return rows[0][0]
+
+    def active_override_count(
+        self, *, user_id: str, company_id: str = COMPANY_ID, metric_name: str = METRIC_NAME
+    ) -> int:
+        rows = self.query(
+            "SELECT count(*) FROM local_permission_override"
+            " WHERE user_id = %s AND company_id = %s AND metric_name = %s"
+            "   AND entry_status = 'active'",
+            (user_id, company_id, metric_name),
+        )
+        return rows[0][0]
+
+    def prepare_and_deliver_permission(
+        self,
+        *,
+        action_type: PendingActionType = PendingActionType.LOCAL_PERMISSION_GRANT,
+        target_open_id: str = TARGET_OPEN_ID,
+        company_id: str = COMPANY_ID,
+        metric_name: str = METRIC_NAME,
+        reason: str = REASON,
+    ) -> str:
+        outcome = self.store.prepare(
+            action_type=action_type,
+            target_open_id=target_open_id,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            company_id=company_id,
+            metric_name=metric_name,
+            reason=reason,
+        )
+        self.assertTrue(outcome.decision.ok, outcome.decision.message)
+        assert outcome.pending is not None
+        self.store.mark_card_delivered(
+            pending_action_id=outcome.pending.id, card_id="cardkit_test"
+        )
+        return outcome.pending.id
+
+    def add_bystander_pending_action(self, *, pending_id: str) -> str:
+        """插入一条已经处于终态的最小 pending_action 行，仅用于满足迁移 ``0072``
+        的 ``pending_action_id`` 外键——不代表本用例正在测试的确认卡流程本身，
+        与 ``tests/test_local_permission_postgres.py`` 的 ``add_pending_action``
+        同一手法（这里额外把它终态化，因为它不该占用
+        ``pending_action_single_pending_target_idx`` 的名额）。
+        """
+
+        now = datetime.now(timezone.utc)
+        self.execute(
+            """INSERT INTO pending_action
+                   (id, action_type, target_open_id, target_state_snapshot,
+                    initiated_by_open_id, status, confirm_deadline_at,
+                    decided_at, decided_by_open_id)
+                 VALUES (%s, 'suspend_user', %s, 'enabled', %s, 'executed', %s, %s, %s)""",
+            (
+                pending_id,
+                f"ou_bystander_for_{pending_id}",
+                ADMIN_OPEN_ID,
+                now + timedelta(minutes=10),
+                now,
+                ADMIN_OPEN_ID,
+            ),
+        )
+        return pending_id
+
+    def test_grant_confirm_inserts_a_local_permission_override_row(self) -> None:
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver_permission()
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.EXECUTED)
+        user_id = self.user_id_for()
+        self.assertEqual(self.active_override_count(user_id=user_id), 1)
+        row = self.query(
+            "SELECT direction, reason, initiated_by_open_id, pending_action_id"
+            " FROM local_permission_override WHERE user_id = %s AND entry_status = 'active'",
+            (user_id,),
+        )[0]
+        self.assertEqual(row[0], "grant")
+        self.assertEqual(row[1], self.REASON)
+        self.assertEqual(row[2], ADMIN_OPEN_ID)
+        self.assertEqual(row[3], pending_id)
+        # 本地权限动作不改 account_state（suspend/resume 才改）。
+        self.assertEqual(self.current_account_state(), "enabled")
+
+    def test_suppress_confirm_inserts_a_local_permission_override_row(self) -> None:
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver_permission(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS
+        )
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        user_id = self.user_id_for()
+        row = self.query(
+            "SELECT direction FROM local_permission_override"
+            " WHERE user_id = %s AND entry_status = 'active'",
+            (user_id,),
+        )[0]
+        self.assertEqual(row[0], "suppress")
+
+    def test_prepare_alone_does_not_write_any_override_row(self) -> None:
+        """②行为级『未确认不落行』：``prepare()`` 只建待确认操作，不写
+        ``local_permission_override``——抓「写早了」变异。"""
+
+        self.add_target_user(account_state="enabled")
+        self.prepare_and_deliver_permission()
+
+        store = PostgresLocalPermissionOverrideStore(self._dsn)
+        self.assertEqual(store.effective_entries(user_id=self.user_id_for()), ())
+
+    def test_cancel_does_not_write_any_override_row(self) -> None:
+        """②的另一半：取消同样不落行。"""
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver_permission()
+
+        cancelled = self.store.cancel(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(cancelled.decision.ok)
+        store = PostgresLocalPermissionOverrideStore(self._dsn)
+        self.assertEqual(store.effective_entries(user_id=self.user_id_for()), ())
+
+    def test_confirm_downgrades_to_target_drifted_when_key_is_taken_before_confirm(self) -> None:
+        """③漂移黑盒：prepare grant 后，另一笔（模拟一次已经独立完成的授权）
+        抢先在同一个键上落地 → confirm 落 FAILED/target_drifted，且该键最终
+        恰好 1 条生效行。真正的检测机制是 confirm() 的 INSERT 直接撞迁移
+        ``0072`` 的部分唯一索引，被 SAVEPOINT 捕获后降级——不经过
+        ``decide_confirm`` 的字符串比较（``adapters/postgres_pending_action.py``
+        模块文档「本地权限授权/抑制如何复用同一套机制」）。
+        """
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver_permission()
+        user_id = self.user_id_for()
+
+        bystander_pending_id = self.add_bystander_pending_action(pending_id=new_id("pac"))
+        other_store = PostgresLocalPermissionOverrideStore(self._dsn)
+        other_store.insert(
+            user_id=user_id,
+            direction=OverrideDirection.GRANT,
+            company_id=self.COMPANY_ID,
+            metric_name=self.METRIC_NAME,
+            reason="抢先落地",
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            pending_action_id=bystander_pending_id,
+        )
+
+        result = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertFalse(result.decision.ok)
+        self.assertIs(result.decision.kind, ConfirmResultKind.TARGET_DRIFTED)
+        assert result.pending is not None
+        self.assertEqual(result.pending.status, PendingActionStatus.FAILED)
+        self.assertEqual(result.pending.reason, "target_drifted")
+        self.assertEqual(self.active_override_count(user_id=user_id), 1)
+        # 我们自己这次 confirm 没有额外写入——生效的仍然是"抢先落地"那一条。
+        row = self.query(
+            "SELECT reason FROM local_permission_override"
+            " WHERE user_id = %s AND entry_status = 'active'",
+            (user_id,),
+        )[0]
+        self.assertEqual(row[0], "抢先落地")
+
+    def test_second_permission_prepare_for_a_target_already_in_flight_is_rejected(self) -> None:
+        """⑥同目标在途互斥覆盖新类型：迁移 ``0068`` 的
+        ``pending_action_single_pending_target_idx`` 按 ``target_open_id``
+        分区，不区分 ``action_type``——本地权限动作与 suspend/resume 共用同一条
+        唯一索引，不需要任何新代码。"""
+
+        self.add_target_user(account_state="enabled")
+        self.prepare_and_deliver_permission()
+
+        second_outcome = self.store.prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            company_id="1012",
+            metric_name="other_metric",
+            reason="另一笔",
+        )
+
+        self.assertFalse(second_outcome.decision.ok)
+        self.assertEqual(second_outcome.decision.code, TARGET_HAS_PENDING_ACTION_CODE)
+        rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s", (TARGET_OPEN_ID,)
+        )
+        self.assertEqual(rows[0][0], 1)
+
+    def test_suspend_prepare_is_also_blocked_by_an_in_flight_grant_for_the_same_target(
+        self,
+    ) -> None:
+        """交叉方向同理：一笔本地权限动作在途时，suspend 同样被同一条唯一索引
+        挡住——证明这条索引按 ``target_open_id`` 泛化生效，不是"同类型才互斥"。
+        """
+
+        self.add_target_user(account_state="enabled")
+        self.prepare_and_deliver_permission()
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertFalse(outcome.decision.ok)
+        self.assertEqual(outcome.decision.code, TARGET_HAS_PENDING_ACTION_CODE)
+
+    def test_prepare_rejects_when_key_already_has_an_active_override(self) -> None:
+        """prepare 的基线观测查询在真库上生效：已经有一条生效覆盖时，
+        对同一个键重新发起被 ``decide_prepare`` 拒绝（``target_state_changed``），
+        且不产生新的 ``pending_action`` 行。"""
+
+        self.add_target_user(account_state="enabled")
+        first_pending_id = self.prepare_and_deliver_permission()
+        confirmed = self.store.confirm(pending_action_id=first_pending_id, clicker_open_id=ADMIN_OPEN_ID)
+        self.assertTrue(confirmed.decision.ok)
+
+        second_outcome = self.store.prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            company_id=self.COMPANY_ID,
+            metric_name=self.METRIC_NAME,
+            reason="重复授权",
+        )
+
+        self.assertFalse(second_outcome.decision.ok)
+        self.assertEqual(second_outcome.decision.code, "target_state_changed")
+        rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s", (TARGET_OPEN_ID,)
+        )
+        self.assertEqual(rows[0][0], 1, "被拒绝的第二次 prepare 不得插入任何新行")
+
+    def test_prepare_allows_a_different_key_for_the_same_target_after_confirm(self) -> None:
+        """观测查询按公司×指标键精确匹配，不是笼统地按用户拒绝一切：同一用户
+        confirm 一个键之后，另一个键仍然可以正常发起。"""
+
+        self.add_target_user(account_state="enabled")
+        first_pending_id = self.prepare_and_deliver_permission()
+        self.store.confirm(pending_action_id=first_pending_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        second_outcome = self.store.prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            company_id="1099",
+            metric_name="other_metric",
+            reason="另一个指标",
+        )
+
+        self.assertTrue(second_outcome.decision.ok, second_outcome.decision.message)
+
+
+class PayloadActionTypeConsistencyRealDbTests(PendingActionPostgresTestCase):
+    """迁移 ``0073`` 的自洽 CHECK 在真库上生效：本地权限三类动作必须携带非空白
+    ``payload``，``suspend_user``/``resume_user`` 必须不携带——否定断言，直接
+    对表发裸 SQL，不经过应用层校验（应用层本身不会拼出这种行，但数据库约束
+    必须独立成立，不依赖调用方自觉）。"""
+
+    def test_permission_action_type_without_payload_is_rejected(self) -> None:
+        with self.assertRaises(Exception):
+            self.execute(
+                """INSERT INTO pending_action
+                       (id, action_type, target_open_id, target_state_snapshot,
+                        initiated_by_open_id, confirm_deadline_at)
+                     VALUES (%s, 'local_permission_grant', %s, 'absent', %s,
+                             now() + interval '10 minutes')""",
+                (new_id("pac"), TARGET_OPEN_ID, ADMIN_OPEN_ID),
+            )
+
+    def test_suspend_action_type_with_payload_is_rejected(self) -> None:
+        with self.assertRaises(Exception):
+            self.execute(
+                """INSERT INTO pending_action
+                       (id, action_type, target_open_id, target_state_snapshot,
+                        initiated_by_open_id, confirm_deadline_at, payload)
+                     VALUES (%s, 'suspend_user', %s, 'enabled', %s,
+                             now() + interval '10 minutes', '{"company_id": "1011"}')""",
+                (new_id("pac"), TARGET_OPEN_ID, ADMIN_OPEN_ID),
+            )
+
+    def test_permission_action_type_with_blank_payload_is_rejected(self) -> None:
+        """``payload`` 非 NULL 但整段都是空白字符——``NULLIF(BTRIM(...), '')``
+        把它当成"没有 payload"，与 suspend/resume 用的空白校验同一姿态。"""
+
+        with self.assertRaises(Exception):
+            self.execute(
+                """INSERT INTO pending_action
+                       (id, action_type, target_open_id, target_state_snapshot,
+                        initiated_by_open_id, confirm_deadline_at, payload)
+                     VALUES (%s, 'local_permission_suppress', %s, 'absent', %s,
+                             now() + interval '10 minutes', '   ')""",
+                (new_id("pac"), TARGET_OPEN_ID, ADMIN_OPEN_ID),
+            )
+
+    def test_local_permission_revoke_is_a_legal_action_type_value(self) -> None:
+        """迁移 ``0073`` 的 ``action_type`` CHECK 一次性扩到全部五值（文件头部
+        「为什么 revoke 取值本次一并加入」）：``local_permission_revoke`` 本身
+        是合法取值，即使卡 B 才会真正执行它。"""
+
+        self.execute(
+            """INSERT INTO pending_action
+                   (id, action_type, target_open_id, target_state_snapshot,
+                    initiated_by_open_id, confirm_deadline_at, payload)
+                 VALUES (%s, 'local_permission_revoke', %s, 'present', %s,
+                         now() + interval '10 minutes', '{"company_id": "1011", "metric_name": "m", "reason": "r"}')""",
+            (new_id("pac"), TARGET_OPEN_ID, ADMIN_OPEN_ID),
+        )
+        rows = self.query(
+            "SELECT action_type FROM pending_action WHERE action_type = 'local_permission_revoke'"
+        )
+        self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

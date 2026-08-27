@@ -31,11 +31,38 @@ PENDING_ACTION_TTL_SECONDS = 600
 
 
 class PendingActionType(str, Enum):
-    """MVP 唯一两条写动作。取值即数据库 ``action_type`` 列，两处一致靠约定
-    （与 ``AdminRole`` 相同的取舍，见 ``core/admin/registry.py``）。"""
+    """待确认操作支持的写动作。取值即数据库 ``action_type`` 列，两处一致靠约定
+    （与 ``AdminRole`` 相同的取舍，见 ``core/admin/registry.py``）。
+
+    后三个成员（本地权限授权/抑制/收回）由迁移 ``0073``（#319 S-P-1b 设计卡，
+    2026-08-27）扩容进 ``pending_action_action_type_check``——迁移 ``0068``
+    最初只登记了前两个 MVP 写动作。``LOCAL_PERMISSION_REVOKE`` 目前只是一个
+    可以被引用的枚举成员：``VALID_SOURCE_STATES``/``REQUIRED_ROLE`` 均未登记
+    它的取值，``core/admin/commands.py``/``core/admin/router.py`` 也不解析或
+    派发对应命令——收回的执行留给卡 B，本卡只交付授权（grant）与抑制
+    （suppress）两条全链路。
+    """
 
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
+    LOCAL_PERMISSION_GRANT = "local_permission_grant"
+    LOCAL_PERMISSION_SUPPRESS = "local_permission_suppress"
+    LOCAL_PERMISSION_REVOKE = "local_permission_revoke"
+
+
+#: 本地权限动作类型的集合（授权/抑制/收回三者），供 ``core/admin/router.py`` 的
+#: 自我目标防呆（禁止管理员对自己发起本地权限动作）与
+#: ``adapters/postgres_pending_action.py`` 的 payload 分支复用——两处都需要
+#: "这是不是一个本地权限动作" 这个判断，集中成一个集合，不在两处各自枚举三个
+#: 字面量（枚举三个字面量的写法一旦未来再新增第四个本地权限动作类型，两处都要
+#: 记得同步维护，容易漏掉其中一处）。
+LOCAL_PERMISSION_ACTION_TYPES: frozenset[PendingActionType] = frozenset(
+    {
+        PendingActionType.LOCAL_PERMISSION_GRANT,
+        PendingActionType.LOCAL_PERMISSION_SUPPRESS,
+        PendingActionType.LOCAL_PERMISSION_REVOKE,
+    }
+)
 
 
 class PendingActionStatus(str, Enum):
@@ -61,9 +88,16 @@ TERMINAL_STATUSES = frozenset(
 #: （见 2026-08-24 决策记录「复审或替代条件」：真实管理员达到两人以上时重估角色模型），
 #: 本模块不需要改一行就能表达"停用/恢复只需要权限管理员角色"这条本来就存在的合同
 #: 要求（产品合同「权限管理员可以……准备停用、恢复」）。
+#: 本地权限授权/抑制两条同样要求 ``permission_admin`` 角色（对照现有取值惯例，
+#: 与 suspend/resume 同一角色而不是新开一个角色维度——MVP 仍是三类角色合并授予
+#: 给唯一管理员的阶段，见上面 ``SUSPEND_USER``/``RESUME_USER`` 两条的注释）。
+#: ``LOCAL_PERMISSION_REVOKE`` 未登记：其执行留给卡 B，见 ``PendingActionType``
+#: 文档。
 REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
     PendingActionType.SUSPEND_USER: AdminRole.PERMISSION_ADMIN,
     PendingActionType.RESUME_USER: AdminRole.PERMISSION_ADMIN,
+    PendingActionType.LOCAL_PERMISSION_GRANT: AdminRole.PERMISSION_ADMIN,
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: AdminRole.PERMISSION_ADMIN,
 }
 
 #: 账号状态五取值中，允许发起对应动作的当前状态。合同没有独立的"终止开通"动作
@@ -71,15 +105,31 @@ REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
 #: 有效——不区分开通中还是已开通完成，停用同样能挡住后续问数与开通；resume 只对
 #: ``suspended`` 有效。``deleting``/``deleted`` 不接受任何一种（删除编排是另一条
 #: 独立机制，未来批次，本 Story 明确不做）。
+#: 本地权限授权/抑制的基线语义：该 ``(user, direction, company, metric)`` 键
+#: 当前必须"无生效行"（``absent``）才允许发起——与 suspend/resume 的
+#: ``account_state`` 字符串不同维度，这里的"当前状态"由
+#: ``adapters/postgres_pending_action.py`` 按 payload 键查询迁移 ``0072`` 的表
+#: 是否已有 ``entry_status='active'`` 行得出，只有两个取值
+#: ``"absent"``/``"present"``。``LOCAL_PERMISSION_REVOKE`` 未登记（留给卡 B——
+#: 收回的基线语义相反，要求键当前"present"才允许发起）。
 VALID_SOURCE_STATES: dict[PendingActionType, frozenset[str]] = {
     PendingActionType.SUSPEND_USER: frozenset({"enabled"}),
     PendingActionType.RESUME_USER: frozenset({"suspended"}),
+    PendingActionType.LOCAL_PERMISSION_GRANT: frozenset({"absent"}),
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: frozenset({"absent"}),
 }
 
-#: 每种写动作执行后写入的目标账号状态。
-TARGET_ACCOUNT_STATE: dict[PendingActionType, str] = {
+#: 每种写动作执行后写入的目标账号状态；本地权限三类动作不改变 ``account_state``
+#: （它们写入的是迁移 ``0072`` 的 ``local_permission_override`` 表，不是
+#: ``app_user``），映射为 ``None``——``adapters/postgres_pending_action.py`` 据此
+#: 判断"这次 EXECUTE 需不需要更新 app_user.account_state"，不是把 ``None`` 当成
+#: 一个真实的账号状态字面量。
+TARGET_ACCOUNT_STATE: dict[PendingActionType, str | None] = {
     PendingActionType.SUSPEND_USER: "suspended",
     PendingActionType.RESUME_USER: "enabled",
+    PendingActionType.LOCAL_PERMISSION_GRANT: None,
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: None,
+    PendingActionType.LOCAL_PERMISSION_REVOKE: None,
 }
 
 
@@ -106,6 +156,12 @@ class PendingAction:
     #: 记账」（opus P2-1）。默认值 0 与数据库列 DEFAULT 一致；大多数调用方不需要关心
     #: 这个字段，只有 ``core/admin/card_callback.py`` 的终态更新路径会用到。
     card_sequence: int = 0
+    #: 本地权限三类动作（授权/抑制/收回）确认执行所需的结构化参数，JSON 字符串
+    #: ``{"company_id": ..., "metric_name": ..., "reason": ...}``；迁移 ``0073``
+    #: 新增列，``suspend_user``/``resume_user`` 恒为 ``None``（数据库 CHECK 强制
+    #: 这条对应关系，见该迁移文件头部）。默认值 ``None`` 保持既有构造点（本卡之前
+    #: 写下的全部 ``PendingAction(...)`` 调用点）不需要改一行。
+    payload: str | None = None
 
     @property
     def is_terminal(self) -> bool:

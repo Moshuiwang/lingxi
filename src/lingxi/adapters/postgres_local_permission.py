@@ -7,17 +7,34 @@
    一次查询命中迁移 ``0072`` 的 ``local_permission_override_user_active_idx``。
    调用方把返回值里的 :attr:`StoredLocalPermissionOverride.entry` 逐条喂给
    :func:`lingxi.core.permission.local_override.resolve_local_overrides`。
-2. :meth:`~.insert`/:meth:`~.revoke` —— 写路径，供 S-P-1b 的确认卡执行器调用。
-   **本卡只交付这两个方法本身，不接调用方**——本仓库当前没有任何代码调用它们
-   （AGENTS.md「不做卡外改动」）。
+2. :meth:`~.insert`/:meth:`~.revoke` —— 写路径，供确认卡执行器调用（S-P-1b，
+   #319）。真正实现"没有确认卡不能写入"的是迁移 ``0072`` 的
+   ``pending_action_id NOT NULL`` 外键（见该迁移文件头部「为什么 pending_action_id
+   是 NOT NULL」）；本模块只是把这条约束包装成 Python 接口并在写入前完成字段
+   校验，不重新发明一层能够绕开该外键的应用层判断去代替它。
 
-真正实现"没有确认卡不能写入"的是迁移 ``0072`` 的 ``pending_action_id NOT NULL``
-外键（见该迁移文件头部「为什么 pending_action_id 是 NOT NULL」）；本模块的
-:meth:`~.insert` 只是把这条约束包装成 Python 接口并在写入前完成字段校验，不重新
-发明一层能够绕开该外键的应用层判断去代替它。S-P-1b 落地时，确认卡执行器必须
-先在同一事务里核实"这次确认卡决策确实通过"，再调用 :meth:`~.insert`——本模块
-不做也不能替它做那层判定（同一姿态见 ``adapters/postgres_pending_action.py`` 的
-``_confirm_locked``）。
+## 为什么 ``insert``/``revoke`` 拆成 ``_insert_locked``/``_revoke_locked`` + 公开包装
+
+S-P-1b 落地后，``adapters/postgres_pending_action.py`` 的 ``_confirm_locked``
+需要在**自己已经打开的那个事务、那个 cursor** 上执行这条 INSERT/UPDATE——"写行
+先于审计"这条要求（同一姿态见 ``PostgresPendingActionStore.confirm`` 文档「同一
+事务」一节）意味着这条写入不能另开一条独立连接，否则审计失败回滚时这条本地权限
+覆盖行不会跟着回滚，产生"卡说没执行、库说已执行"的不一致——这正是 S-P-1a 遗留
+下来需要补的一课。拆分手法与 ``postgres_pending_action.py`` 的
+``confirm``/``_confirm_locked`` 相同：``_insert_locked``/``_revoke_locked`` 是
+模块级函数（不是方法，因为它们只需要调用方已经持有的 ``cursor``，不需要
+``self._dsn``/``self._timeouts``），供两处调用方复用：
+
+1. 本类的公开 :meth:`~.insert`/:meth:`~.revoke`——各自开一条独立连接/事务，
+   行为与拆分前逐字节相同（既有测试 ``tests/test_local_permission_postgres.py``
+   不受影响）；
+2. ``adapters/postgres_pending_action.py`` 的 ``_confirm_locked``——直接从模块
+   导入这两个私有函数，传入自己事务内的 ``cursor``，让本地权限覆盖行与
+   ``pending_action`` 终态更新、审计写入落在同一个数据库事务里。与
+   ``adapters/postgres_pending_action.py`` 从 ``adapters/postgres_conversation``
+   导入私有类型 ``_Transaction`` 是同一个跨模块复用惯例（见该文件的 import 与
+   ``postgres_conversation`` 模块文档"既有调用点用到的名字全部保留"），不是本模块
+   新开的先例。
 """
 
 from __future__ import annotations
@@ -125,20 +142,21 @@ class PostgresLocalPermissionOverrideStore:
         pending_action_id: str,
         now: datetime | None = None,
     ) -> StoredLocalPermissionOverride:
-        """插入一条新的生效本地覆盖条目。
+        """插入一条新的生效本地覆盖条目，独立开一条连接/事务。
 
         **先构造** :class:`~lingxi.core.permission.local_override.
         LocalPermissionOverrideEntry`（触发它的 ``__post_init__`` 全部字段校验），
         **再**发出 ``INSERT``——非法字段在这里就响亮失败，不会打到数据库
         （与 ``adapters/admin_registry.seed_admin_registry_entry`` 的"校验先于任何
-        写入"同一姿态）。
+        写入"同一姿态）。实际 ``INSERT`` 由 :func:`_insert_locked` 执行（模块文档
+        「为什么拆分」）；本方法只负责校验、开连接、生成主键。
 
         撞上迁移 ``0072`` 的部分唯一索引（同用户同极性同公司同指标已有生效条目）
-        时转译为 :class:`DuplicateActiveOverride`，不让裸 ``IntegrityError`` 冒泡。
-        一个不存在的 ``pending_action_id``（或已删除用户的 ``user_id``）会撞上该
-        迁移的外键约束，本方法不额外捕获——那是"没有确认卡/没有这个用户就不能
-        写入"这条结构性保证本身，让它以数据库原生异常的形式暴露，好过本方法悄悄
-        把它也翻译成一个看似"正常业务分支"的返回值。
+        时 :func:`_insert_locked` 转译为 :class:`DuplicateActiveOverride`，不让
+        裸 ``IntegrityError`` 冒泡。一个不存在的 ``pending_action_id``（或已删除
+        用户的 ``user_id``）会撞上该迁移的外键约束，本方法不额外捕获——那是
+        "没有确认卡/没有这个用户就不能写入"这条结构性保证本身，让它以数据库原生
+        异常的形式暴露，好过本方法悄悄把它也翻译成一个看似"正常业务分支"的返回值。
         """
 
         moment = now or datetime.now(timezone.utc)
@@ -156,34 +174,9 @@ class PostgresLocalPermissionOverrideStore:
             created_at=moment,
         )
 
-        from psycopg.errors import UniqueViolation
-
         override_id = new_id("lpo")
-        try:
-            with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO local_permission_override
-                        (id, user_id, direction, company_id, metric_name, reason,
-                         initiated_by_open_id, pending_action_id, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        override_id,
-                        entry.user_id,
-                        entry.direction.value,
-                        entry.company_id,
-                        entry.metric_name,
-                        entry.reason,
-                        entry.initiated_by_open_id,
-                        entry.pending_action_id,
-                        entry.created_at,
-                    ),
-                )
-        except UniqueViolation as error:
-            raise DuplicateActiveOverride(
-                "该用户在这个公司×指标上已经有一条同极性的生效本地覆盖"
-            ) from error
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            _insert_locked(cursor, override_id=override_id, entry=entry)
         return StoredLocalPermissionOverride(id=override_id, entry=entry)
 
     def revoke(
@@ -193,16 +186,16 @@ class PostgresLocalPermissionOverrideStore:
         revoked_pending_action_id: str,
         now: datetime | None = None,
     ) -> bool:
-        """把一条生效条目标记为 ``revoked``（同一行状态翻转，历史留痕，见迁移
-        ``0072`` 文件头部「为什么用『同一行状态翻转』」）。
+        """把一条生效条目标记为 ``revoked``，独立开一条连接/事务（同一行状态翻转，
+        历史留痕，见迁移 ``0072`` 文件头部「为什么用『同一行状态翻转』」）。
 
         条件更新 ``WHERE entry_status = 'active'``：目标条目不存在、或已经处于
         ``revoked`` 状态时影响 0 行，返回 ``False``——"收回一条已经不存在/已经
-        被收回的条目"与"收回失败"是同一个结论，调用方（S-P-1b 确认卡执行器）
-        据此判定这次收回是否真的改变了状态，而不是无条件当成成功（与
-        ``adapters/postgres_pending_action.py`` 的 ``mark_card_delivered`` 类
-        条件更新同一姿态：不满足前提时静默影响 0 行，由 ``rowcount`` 让调用方
-        自行判断，不在这里猜测"0 行"应该是异常还是正常）。
+        被收回的条目"与"收回失败"是同一个结论，调用方据此判定这次收回是否真的
+        改变了状态，而不是无条件当成成功（与 ``adapters/postgres_pending_action.py``
+        的 ``mark_card_delivered`` 类条件更新同一姿态：不满足前提时静默影响 0 行，
+        由 ``rowcount`` 让调用方自行判断，不在这里猜测"0 行"应该是异常还是正常）。
+        实际 ``UPDATE`` 由 :func:`_revoke_locked` 执行（模块文档「为什么拆分」）。
 
         一个不存在的 ``revoked_pending_action_id`` 会撞上迁移 ``0072`` 的外键
         约束，与 :meth:`insert` 同一姿态，不在本方法内额外捕获或翻译。
@@ -210,11 +203,64 @@ class PostgresLocalPermissionOverrideStore:
 
         moment = now or datetime.now(timezone.utc)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE local_permission_override"
-                " SET entry_status = 'revoked', revoked_at = %s,"
-                "     revoked_pending_action_id = %s"
-                " WHERE id = %s AND entry_status = 'active'",
-                (moment, revoked_pending_action_id, override_id),
+            return _revoke_locked(
+                cursor, override_id=override_id, revoked_pending_action_id=revoked_pending_action_id, moment=moment
             )
-            return cursor.rowcount == 1
+
+
+def _insert_locked(cursor, *, override_id: str, entry: LocalPermissionOverrideEntry) -> None:
+    """在调用方已经持有的 ``cursor``（及其所在事务）上执行实际 ``INSERT``。
+
+    模块级函数而不是实例方法：调用方（本类的 :meth:`~PostgresLocalPermissionOverrideStore.insert`
+    与 ``adapters/postgres_pending_action.py`` 的 ``_confirm_locked``）都只需要
+    传入自己已经打开的 ``cursor``，不需要 ``self._dsn``/``self._timeouts``——见
+    模块文档「为什么拆分」。撞上迁移 ``0072`` 的部分唯一索引时转译为
+    :class:`DuplicateActiveOverride`，两处调用方按各自需要处理这个异常（本类的
+    ``insert()`` 直接让它冒泡；``_confirm_locked`` 捕获后降级为
+    ``ConfirmResultKind.TARGET_DRIFTED``，见该方法文档）。
+    """
+
+    from psycopg.errors import UniqueViolation
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO local_permission_override
+                (id, user_id, direction, company_id, metric_name, reason,
+                 initiated_by_open_id, pending_action_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                override_id,
+                entry.user_id,
+                entry.direction.value,
+                entry.company_id,
+                entry.metric_name,
+                entry.reason,
+                entry.initiated_by_open_id,
+                entry.pending_action_id,
+                entry.created_at,
+            ),
+        )
+    except UniqueViolation as error:
+        raise DuplicateActiveOverride(
+            "该用户在这个公司×指标上已经有一条同极性的生效本地覆盖"
+        ) from error
+
+
+def _revoke_locked(
+    cursor, *, override_id: str, revoked_pending_action_id: str, moment: datetime
+) -> bool:
+    """在调用方已经持有的 ``cursor``（及其所在事务）上执行实际收回 ``UPDATE``。
+
+    模块级函数，理由与 :func:`_insert_locked` 相同（模块文档「为什么拆分」）。
+    """
+
+    cursor.execute(
+        "UPDATE local_permission_override"
+        " SET entry_status = 'revoked', revoked_at = %s,"
+        "     revoked_pending_action_id = %s"
+        " WHERE id = %s AND entry_status = 'active'",
+        (moment, revoked_pending_action_id, override_id),
+    )
+    return cursor.rowcount == 1

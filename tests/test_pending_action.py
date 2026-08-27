@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 
 from lingxi.core.admin.pending_action import (
     PENDING_ACTION_TTL_SECONDS,
+    REQUIRED_ROLE,
+    TARGET_ACCOUNT_STATE,
+    VALID_SOURCE_STATES,
     CancelResultKind,
     ConfirmResultKind,
     PendingAction,
@@ -116,6 +119,75 @@ class DecidePrepareTests(unittest.TestCase):
                     action_type=PendingActionType.RESUME_USER, current_account_state=state
                 )
                 self.assertFalse(decision.ok)
+
+
+class DecidePrepareLocalPermissionTests(unittest.TestCase):
+    """#319 S-P-1b：本地权限授权/抑制复用同一个 ``decide_prepare``，基线语义是
+    该 ``(user, direction, company, metric)`` 键当前"无生效行"（``"absent"``）。
+    ``adapters/postgres_pending_action.py`` 负责把这个字符串观测出来，本模块
+    只验证纯函数对这两个新取值的判定本身。
+    """
+
+    def test_grant_allowed_when_key_is_absent(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="absent"
+        )
+        self.assertTrue(decision.ok)
+
+    def test_suppress_allowed_when_key_is_absent(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="absent"
+        )
+        self.assertTrue(decision.ok)
+
+    def test_grant_rejected_when_key_already_present(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="present"
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "target_state_changed")
+
+    def test_suppress_rejected_when_key_already_present(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="present"
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "target_state_changed")
+
+    def test_grant_rejects_unknown_target_same_as_suspend_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state=None
+        )
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.code, "not_found")
+
+
+class SuspendResumeMappingsUnchangedTests(unittest.TestCase):
+    """哨兵测试：泛化 ``PendingActionType``/``VALID_SOURCE_STATES``/
+    ``REQUIRED_ROLE``/``TARGET_ACCOUNT_STATE`` 以承载本地权限两类新动作时，
+    ``SUSPEND_USER``/``RESUME_USER`` 原有取值必须逐项相等、一个字符都不变——
+    这是"新类型加法式扩展、旧类型零改动"这条设计约束的可执行证据（#319 S-P-1b
+    设计卡）。"""
+
+    def test_valid_source_states_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.SUSPEND_USER], frozenset({"enabled"}))
+        self.assertEqual(VALID_SOURCE_STATES[PendingActionType.RESUME_USER], frozenset({"suspended"}))
+
+    def test_required_role_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(REQUIRED_ROLE[PendingActionType.SUSPEND_USER], AdminRole.PERMISSION_ADMIN)
+        self.assertEqual(REQUIRED_ROLE[PendingActionType.RESUME_USER], AdminRole.PERMISSION_ADMIN)
+
+    def test_target_account_state_unchanged_for_suspend_and_resume(self) -> None:
+        self.assertEqual(TARGET_ACCOUNT_STATE[PendingActionType.SUSPEND_USER], "suspended")
+        self.assertEqual(TARGET_ACCOUNT_STATE[PendingActionType.RESUME_USER], "enabled")
+
+    def test_local_permission_action_types_map_to_no_account_state_change(self) -> None:
+        """新类型的 ``TARGET_ACCOUNT_STATE`` 必须是 ``None``（不改
+        ``app_user.account_state``），这是 confirm 侧选择"更新 app_user 还是写
+        local_permission_override"分支判断所依赖的不变量。"""
+
+        self.assertIsNone(TARGET_ACCOUNT_STATE[PendingActionType.LOCAL_PERMISSION_GRANT])
+        self.assertIsNone(TARGET_ACCOUNT_STATE[PendingActionType.LOCAL_PERMISSION_SUPPRESS])
 
 
 class DecideConfirmHappyPathTests(unittest.TestCase):
