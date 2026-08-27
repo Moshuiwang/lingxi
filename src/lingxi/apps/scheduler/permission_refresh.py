@@ -135,6 +135,16 @@ PostgresPermissionPublishStore.record_decision` 判 ``UNCHANGED``，不推进版
 并计入报告，而"有失败就整轮重来"会让一次持续的数据库故障变成每分钟重跑一遍全员——
 那既救不了那个用户，又会把其余职责的时间预算吃掉。失败的用户等下一天那一轮，这正是
 "每日刷新"的语义。收到停止信号而中断的那一轮**不置位**：它没走完。
+
+## 本地权限覆盖合并（S-P-3，Issue #319）
+
+授权侧翻译成功（``company_metrics``）之后、结算发布行之前，`_refresh_user` 调用
+:func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 把该用户当前
+生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）并进去：
+真实权限 = (银河翻译结果 ∪ 本地授权 ∪ 存量沿用) − 本地抑制，``legacy`` 本卡不接
+（S-P-2 批二），恒为 ``None``。语义细节（通配角 v1、空结果丢键）见该模块文档，不在
+这里复述。本地覆盖**只影响授权路径**，不影响 ``_revoke``——撤权写的是不含指标名
+的 ``{}``，本地覆盖对它没有作用面，与翻译层「与撤权无关」同一条边界。
 """
 
 from __future__ import annotations
@@ -149,6 +159,15 @@ from typing import Any, Protocol
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.local_override import (
+    LocalPermissionOverrideEntry,
+    ResolvedLocalOverrides,
+    resolve_local_overrides,
+)
+from lingxi.core.permission.merge_sources import (
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    merge_permission_sources,
+)
 from lingxi.core.permission.metric_translation import (
     UncoveredPermissionCombination,
     metric_translation_available,
@@ -314,6 +333,25 @@ class _DecisionStore(Protocol):
     ) -> _Decision: ...
 
 
+class _LocalOverrideReader(Protocol):
+    """本地权限覆盖的按用户读取口（S-P-3，Issue #319）。
+
+    实现是 :meth:`~lingxi.adapters.postgres_local_permission.
+    PostgresLocalPermissionOverrideStore.effective_entries` 经装配层适配（返回值从
+    ``StoredLocalPermissionOverride`` 解出 ``.entry``——本协议只认纯类型
+    :class:`~lingxi.core.permission.local_override.LocalPermissionOverrideEntry`，
+    不认数据库分配的行标识，理由与 :class:`_PublishHistory` 只声明一个方法相同：
+    本职责只需要"这个用户当前生效的覆盖条目有哪些"，不需要收回单条覆盖的能力）。
+
+    ``None``（装配层未装配）与本方法读取失败在调用方眼里是**不同**的两件事：前者
+    静默按"没有本地源"处理（部署事实，不告警）；后者响亮审计
+    （:data:`~lingxi.core.permission.merge_sources.REASON_LOCAL_OVERRIDE_READ_FAILED`），
+    但结果都是"这一轮/这个用户跳过本地源"——不整轮失败、不静默吞掉异常。
+    """
+
+    def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
+
+
 @dataclass(frozen=True)
 class PermissionRefreshReport:
     """一轮重算的结果。**只有计数与固定原因码，没有任何字段值。**
@@ -425,6 +463,7 @@ class PermissionRefreshDuty:
         audit: _AuditSink,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
+        local_overrides: _LocalOverrideReader | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
         self._roster_snapshot = roster_snapshot
@@ -435,6 +474,11 @@ class PermissionRefreshDuty:
         self._role_function_map = role_function_map
         self._metric_translation_map = metric_translation_map
         self._audit = audit
+        # 本地权限覆盖读取口（S-P-3）：``None`` 表示装配层还没接这个 store——本轮/
+        # 本用户的合并按"没有本地源"处理，产出与今天逐字节一致（模块文档「翻译」
+        # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
+        # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
+        self._local_overrides = local_overrides
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
@@ -656,11 +700,26 @@ class PermissionRefreshDuty:
             self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
             return
 
+        # 四源合并（S-P-3，Issue #319）：真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) −
+        # 本地抑制。挂在「翻译完成之后、结算发布行之前」——`company_metrics` 就是
+        # 银河那一侧已经翻译好的 `{公司: (指标名, …)}`，`legacy` 本卡不接（S-P-2
+        # 批二），恒为 `None`。见 `core/permission/merge_sources.py` 模块文档。
+        local = self._resolve_local_overrides(identity.app_user_id)
+        merged = merge_permission_sources(galaxy=company_metrics, local=local)
+        for reason in merged.skipped_reasons:
+            # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
+            # `merge_permission_sources` 模块文档「通配角」一节。
+            self._audit.record(
+                "permission_refresh.local_override_skipped",
+                user=identity.app_user_id,
+                reason=reason,
+            )
+
         # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
         # 失败关闭）。这里没有、也不允许有任何签发路径。
         token_cipher = self._token_ciphers.token_cipher(identity.app_user_id)
         row = build_translated_publish_row(
-            company_metrics=company_metrics,
+            company_metrics=merged.permissions,
             email=identity.email,
             display_name=identity.display_name,
             decided_at=now,
@@ -678,6 +737,40 @@ class PermissionRefreshDuty:
             # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
             # 不排新意图——判定在 ``record_decision`` 里，本职责只如实计数。
             tally.unchanged += 1
+
+    def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
+        """读该用户当前生效的本地覆盖条目并解决成 ``ResolvedLocalOverrides``。
+
+        两种情形都返回 ``None``（对 :func:`merge_permission_sources` 恒等），但审计
+        姿态不同：
+
+        - **装配层没有接这个 store**（``self._local_overrides is None``）：部署事实，
+          不告警——与「store 缺席=行为一致」的既有装配纪律同一姿态。
+        - **读取失败**（数据库异常）：该用户本轮跳过本地源，**响亮**记一条
+          ``permission_refresh.local_override_skipped``（``reason=local_override_read_failed``），
+          异常本身不冒泡——一个用户的本地覆盖读取失败不得带走这个人当轮的银河权限
+          发布，更不能带走整轮（`_refresh_user` 外层的 ``run_once`` 也兜底捕获单用户
+          异常，这里提前捕获是为了把"翻译失败"与"本地覆盖读取失败"两种原因分开
+          审计，而不是让两者都落进同一个笼统的 ``permission_refresh.user_failed``）。
+        """
+
+        if self._local_overrides is None:
+            return None
+        try:
+            entries = tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception as error:  # noqa: BLE001 - 本地源读取失败只降级，不整轮/整人失败
+            self._audit.record(
+                "permission_refresh.local_override_skipped",
+                user=user_id,
+                reason=REASON_LOCAL_OVERRIDE_READ_FAILED,
+            )
+            logger.error(
+                "本地权限覆盖读取失败，本轮该用户跳过本地源 user=%s error=%s",
+                user_id,
+                type(error).__name__,
+            )
+            return None
+        return resolve_local_overrides(user_id=user_id, entries=entries)
 
     def _revoke(
         self,

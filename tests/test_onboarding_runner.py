@@ -54,7 +54,9 @@ from lingxi.core.identity.stock_token_source import (
     NO_ROW,
     StockTokenLookup,
 )
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
+from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
 
 UTC = timezone.utc
 OPEN_ID = "ou_employee_1"
@@ -364,6 +366,28 @@ class FakeLedger:
         self.released.append((event_id, claim_token))
 
 
+class FakeLocalOverrides:
+    """本地权限覆盖读取口的假实现（S-P-3，Issue #319）。同构于
+    ``tests/test_permission_refresh_duty.py`` 的同名类（各自独立一份，理由见
+    ``LocalOverrideSource`` 协议文档：``core/`` 不 import ``apps/``）。"""
+
+    def __init__(
+        self,
+        entries: dict[str, tuple[LocalPermissionOverrideEntry, ...]] | None = None,
+        *,
+        fail_for: set[str] | None = None,
+    ) -> None:
+        self._entries = entries or {}
+        self._fail_for = fail_for or set()
+        self.calls: list[str] = []
+
+    def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
+        self.calls.append(user_id)
+        if user_id in self._fail_for:
+            raise RuntimeError("注入的本地覆盖读取失败")
+        return self._entries.get(user_id, ())
+
+
 class RecordingAudit:
     def __init__(self) -> None:
         self.records: list[tuple[str, dict[str, object]]] = []
@@ -431,6 +455,9 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "ledger": FakeLedger(),
         "audit": RecordingAudit(),
         "onboarding_failed": None,
+        # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
+        # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
+        "local_overrides": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -465,6 +492,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         should_stop=overrides.get("should_stop", lambda: False),
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
         onboarding_failed=parts["onboarding_failed"],
+        local_overrides=parts["local_overrides"],
     )
     return runner, parts
 
@@ -561,6 +589,87 @@ class HappyPathTests(unittest.TestCase):
         rendered = repr(parts["audit"].records)
         self.assertNotIn(secret, rendered, "令牌明文不得出现在审计里")
         self.assertIn(secret, parts["environment"].tokens, "明文只该到达用户环境写入口")
+
+
+def _override_entry(
+    *,
+    user_id: str = USER_ID,
+    direction: OverrideDirection = OverrideDirection.GRANT,
+    company_id: str = "88",
+    metric_name: str = "本地指标",
+) -> LocalPermissionOverrideEntry:
+    return LocalPermissionOverrideEntry(
+        user_id=user_id,
+        direction=direction,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason="U1 特批",
+        initiated_by_open_id="ou_admin",
+        pending_action_id="pac_fake",
+        created_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+
+
+class TwoCompanyGalaxySnapshot(FakeGalaxySnapshot):
+    """两家公司的银河快照：供抑制用例证明"只有被抑制到空的公司键消失，另一家
+    不受影响"（``merge_sources`` 模块文档「空结果」一节）。"""
+
+    country_rows = (
+        {"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},
+        {"country_key": "c_2", "name": "Nigeria", "name_cn": "尼日利亚", "boss_company_id": "99"},
+    )
+
+    def datacountry_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return (
+            {"user_id": galaxy_user_id, "datacountry_id": "c_1"},
+            {"user_id": galaxy_user_id, "datacountry_id": "c_2"},
+        )
+
+
+class LocalOverrideMergeTests(unittest.TestCase):
+    """开通侧的四源合并接线（S-P-3，Issue #319）：与
+    ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 同一组断言，
+    证明两个调用点消费的是同一个 ``merge_permission_sources``。开通侧的 ``galaxy``
+    输入是**未翻译**的职能标签映射（onboarding 目前不调用翻译层，见
+    ``merge_sources`` 模块文档「挂点」一节），本地覆盖的指标名字符串仍然精确并入/
+    减去，不受周围标签影响。"""
+
+    def test_store_absent_matches_todays_behavior(self) -> None:
+        parts, result = run_once()
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+
+    def test_local_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """本地授权后聚合含并集（#319 验收断言）。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+        parts, _ = run_once(local_overrides=overrides)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["本地指标","销售分析"]}')
+        self.assertEqual(overrides.calls, [USER_ID])
+
+    def test_local_suppression_removes_a_galaxy_granted_metric(self) -> None:
+        """抑制后不含：本地抑制命中的是银河这一侧现算出的职能标签，不是本地授权
+        自己加的那条；只有被抑制到空的公司键消失，另一家公司不受影响。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ID: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),)}
+        )
+        parts, _ = run_once(galaxy=FakeGalaxy(TwoCompanyGalaxySnapshot()), local_overrides=overrides)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"99":["销售分析"]}')
+
+    def test_read_failure_skips_local_source_and_audits(self) -> None:
+        overrides = FakeLocalOverrides(fail_for={USER_ID})
+        parts, result = run_once(local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertIn("onboarding.local_override_skipped", parts["audit"].actions())
+        facts = parts["audit"].facts("onboarding.local_override_skipped")
+        self.assertEqual(facts["user"], USER_ID)
+        self.assertEqual(facts["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
 
 
 class ThreadingTests(unittest.TestCase):

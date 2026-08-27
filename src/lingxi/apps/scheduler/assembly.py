@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from lingxi.adapters.postgres_local_permission import local_override_reader
 from lingxi.core.alerting import AlertingDuty
 from lingxi.core.identity.access_token_supply import (
     DerivedAccessTokenHolder,
@@ -27,7 +28,6 @@ from lingxi.core.permission.table_access_token_supply import (
     PermissionTableAccessTokenProvider,
 )
 from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
-
 from lingxi.apps.scheduler.audit import AuditSink, StructuredLogAuditSink
 from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
@@ -333,7 +333,7 @@ def _build_permission_refresh_duty(
         role_function_map=role_function_map,
         metric_translation_map=metric_translation_map,
         audit=audit,
-        stop=stop,
+        stop=stop, local_overrides=local_override_reader(config.postgres_dsn, timeouts=config.postgres_timeouts),
     )
     return duty, metric_translation_map
 
@@ -801,7 +801,7 @@ def _build_onboarding_duty(
         # 管理员送达（Issue #280 §7.3）：调用方（``build_loop``）没有装配告警职责时
         # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
         # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
-        onboarding_failed=onboarding_failed,
+        onboarding_failed=onboarding_failed, local_overrides=local_override_reader(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(
         store=store,

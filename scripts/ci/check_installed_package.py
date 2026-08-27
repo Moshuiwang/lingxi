@@ -175,14 +175,16 @@ REQUIRED_MODULES = (
     # 但载体本身必须在制品里，否则内容到位那天才发现 wheel 里没有加载它的代码。
     "lingxi.core.permission.metric_translation",
     "lingxi.adapters.company_function_metric_map_file",
-    # 本地权限覆盖表地基（Issue #319 S-P-1a，产品负责人 2026-08-26 裁定推翻
-    # 2026-08-24 决策记录第 4 条「本地开通/扩权：不做」）：条目类型与「suppress
-    # 赢」冲突判定在 core，迁移 0072 的读写在 adapters。本卡只交付地基——命令面
-    # （S-P-1b 的确认卡执行器）与聚合接线（S-P-3）尚未消费它们，装配前不在任何
-    # 进程的 import 闭包里，与上面 metric_translation 一组同一姿态："本地测试
-    # 全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    # 本地权限覆盖（Issue #319）：条目类型与「suppress 赢」冲突判定在 core，迁移
+    # 0072 的读写在 adapters（S-P-1a 地基），四源集中合并纯函数同样在 core（S-P-3，
+    # 见下一行）。**S-P-3 落地之后这三个模块已经有真实进程调用方**——
+    # `permission_refresh.py`/`onboarding_runner.py` 都消费它们，见下面
+    # PROCESS_RUNTIME_IMPORTS 的 scheduler 闭包同名注释；这里仍然登记是因为
+    # REQUIRED_MODULES 与 PROCESS_RUNTIME_IMPORTS 各自回答不同的问题（制品完整 vs
+    # 某个进程的运行时依赖装得上），两处都要有。
     "lingxi.core.permission.local_override",
     "lingxi.adapters.postgres_local_permission",
+    "lingxi.core.permission.merge_sources",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
     # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
     # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
@@ -465,6 +467,18 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 证明不了"这个模块装得上"）。
             "lingxi.core.permission.metric_translation",
             "lingxi.adapters.company_function_metric_map_file",
+            # 四源聚合集中合并（Issue #319 S-P-3）：`permission_refresh.py` 与
+            # `onboarding_runner.py` 都模块级 import 本地覆盖的纯逻辑
+            # （`resolve_local_overrides`）与合并纯函数（`merge_permission_sources`），
+            # `_build_permission_refresh_duty`/`_build_onboarding_duty` 各自函数内
+            # import 真实的 Postgres 读取口——这是 `local_override`/
+            # `postgres_local_permission` 这两个模块**第一次**有真实进程调用方（S-P-1a
+            # 落地时随制品发布但装配前不在任何进程闭包里，见 REQUIRED_MODULES 同名
+            # 注释；那条注释现在已经过期，S-P-3 之后它们确实在 scheduler 的运行时
+            # 闭包里了）。
+            "lingxi.core.permission.local_override",
+            "lingxi.adapters.postgres_local_permission",
+            "lingxi.core.permission.merge_sources",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
