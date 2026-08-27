@@ -136,15 +136,20 @@ PostgresPermissionPublishStore.record_decision` 判 ``UNCHANGED``，不推进版
 那既救不了那个用户，又会把其余职责的时间预算吃掉。失败的用户等下一天那一轮，这正是
 "每日刷新"的语义。收到停止信号而中断的那一轮**不置位**：它没走完。
 
-## 本地权限覆盖合并（S-P-3，Issue #319）
+## 本地权限覆盖合并（S-P-3，Issue #319）与存量权限沿用（S-P-2，Trace #328）
 
 授权侧翻译成功（``company_metrics``）之后、结算发布行之前，`_refresh_user` 调用
 :func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 把该用户当前
-生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）并进去：
-真实权限 = (银河翻译结果 ∪ 本地授权 ∪ 存量沿用) − 本地抑制，``legacy`` 本卡不接
-（S-P-2 批二），恒为 ``None``。语义细节（通配角 v1、空结果丢键）见该模块文档，不在
-这里复述。本地覆盖**只影响授权路径**，不影响 ``_revoke``——撤权写的是不含指标名
-的 ``{}``，本地覆盖对它没有作用面，与翻译层「与撤权无关」同一条边界。
+生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）与存量沿用
+（正式权限发布表里该用户的既有行，:class:`~lingxi.core.permission.legacy_source.
+LegacyPermissionTable`，装配层未接线时同样为 ``None``）并进去：真实权限 =
+(银河翻译结果 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。语义细节（通配角 v1、空结果丢键、
+``legacy=None`` 恒等）见该模块文档，不在这里复述。存量源的读取与失败降级由
+:func:`~lingxi.core.permission.legacy_source.resolve_legacy_source` 承担——读取/解析
+失败只跳过这一个用户的存量源、响亮记 ``permission_refresh.legacy_source_skipped``
+审计，不整轮/整人失败；装配层未接线时静默按"没有存量源"处理，与本地覆盖同一姿态。
+本地覆盖与存量沿用都**只影响授权路径**，不影响 ``_revoke``——撤权写的是不含指标名
+的 ``{}``，两者对它都没有作用面，与翻译层「与撤权无关」同一条边界。
 """
 
 from __future__ import annotations
@@ -164,6 +169,7 @@ from lingxi.core.permission.local_override import (
     ResolvedLocalOverrides,
     resolve_local_overrides,
 )
+from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
 from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     merge_permission_sources,
@@ -464,6 +470,7 @@ class PermissionRefreshDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
         local_overrides: _LocalOverrideReader | None = None,
+        legacy_source: LegacyPermissionTable | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
         self._roster_snapshot = roster_snapshot
@@ -479,6 +486,10 @@ class PermissionRefreshDuty:
         # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
         # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
         self._local_overrides = local_overrides
+        # 存量权限只读源（S-P-2，Trace #328）：``None`` 表示装配层还没接这个 store——
+        # 本轮/本用户的合并按"没有存量源"处理，产出与今天逐字节一致（同
+        # ``local_overrides=None`` 的既有姿态）。真实实现见 ``apps/scheduler/assembly.py``。
+        self._legacy_source = legacy_source
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
@@ -700,12 +711,20 @@ class PermissionRefreshDuty:
             self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
             return
 
-        # 四源合并（S-P-3，Issue #319）：真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) −
-        # 本地抑制。挂在「翻译完成之后、结算发布行之前」——`company_metrics` 就是
-        # 银河那一侧已经翻译好的 `{公司: (指标名, …)}`，`legacy` 本卡不接（S-P-2
-        # 批二），恒为 `None`。见 `core/permission/merge_sources.py` 模块文档。
+        # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328）：真实权限 =
+        # (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。挂在「翻译完成之后、结算发布行
+        # 之前」——`company_metrics` 就是银河那一侧已经翻译好的 `{公司: (指标名, …)}`。
+        # 见 `core/permission/merge_sources.py` 模块文档；存量源的失败降级见
+        # `core/permission/legacy_source.py` 模块文档。
         local = self._resolve_local_overrides(identity.app_user_id)
-        merged = merge_permission_sources(galaxy=company_metrics, local=local)
+        legacy = resolve_legacy_source(
+            email=identity.email,
+            table=self._legacy_source,
+            audit=self._audit,
+            action="permission_refresh.legacy_source_skipped",
+            user=identity.app_user_id,
+        )
+        merged = merge_permission_sources(galaxy=company_metrics, local=local, legacy=legacy)
         for reason in merged.skipped_reasons:
             # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
             # `merge_permission_sources` 模块文档「通配角」一节。

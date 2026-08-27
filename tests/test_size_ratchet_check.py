@@ -139,13 +139,20 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         `_build_onboarding_duty`（新增一个构造参数 + 一次转发 + 一处函数内
         import + 一次装配调用，净增 4 行），复用权限发布表既有的应用身份
         令牌供给、不新增凭据材料；改动净增内容已尽量收在这四行，未随手夹带
-        本文件其余部分的重构。结构性拆分仍是 #284 后续。下一次这条测试失效
-        时，同样在此登记理由。
+        本文件其余部分的重构。2026-08-27 调到 1538 行——Trace #328 S-P-2（存量
+        权限沿用）：`permission_table_supply` 的构造从「发布消费」调用点之前
+        挪到「每日权限重算」调用点之前（两个新调用点都要复用同一条供给），
+        紧邻处新增同构的 `legacy_source`（`BitablePermissionTable` 实例，坐标
+        缺失时为 `None`）并转发给两个 `_build_*_duty`；净变化包含新增代码与
+        一段注释重排（把一段 10 行的既有说明合并成同义的更短句），两者相抵后
+        文件净**减少** 1 行——`--refresh` 因此把基线调小而不是调大，纪律仍是
+        「先改动本文件、再同步这条测试」。结构性拆分仍是 #284 后续。下一次
+        这条测试失效时，同样在此登记理由。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {"src/lingxi/apps/scheduler/assembly.py": 1539},
+            {"src/lingxi/apps/scheduler/assembly.py": 1538},
         )
 
 

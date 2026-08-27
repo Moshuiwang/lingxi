@@ -54,9 +54,11 @@ from lingxi.core.identity.stock_token_source import (
     NO_ROW,
     StockTokenLookup,
 )
+from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.publish import ExistingPermissionRow
 
 UTC = timezone.utc
 OPEN_ID = "ou_employee_1"
@@ -388,6 +390,41 @@ class FakeLocalOverrides:
         return self._entries.get(user_id, ())
 
 
+class FakeLegacyTable:
+    """存量权限只读源的假实现（S-P-2，Issue #319 / Trace #328）。同构于
+    ``tests/test_permission_refresh_duty.py`` 的同名类——``LegacyPermissionTable``
+    协议本身定义在 ``core/permission/legacy_source.py``，两个调用点的测试各自留一份
+    假实现是测试夹具的既有惯例（同 ``FakeLocalOverrides``），不是层级约束要求的。"""
+
+    def __init__(
+        self,
+        rows_by_email: dict[str, str] | None = None,
+        *,
+        find_error: Exception | None = None,
+        duplicate_for: set[str] | None = None,
+    ) -> None:
+        self._rows = rows_by_email or {}
+        self._find_error = find_error
+        self._duplicate_for = duplicate_for or set()
+        self.find_calls: list[tuple[str, str]] = []
+
+    def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
+        self.find_calls.append((record_key, email))
+        if self._find_error is not None:
+            raise self._find_error
+        if email not in self._rows:
+            return ()
+        row = ExistingPermissionRow(
+            record_id=f"rec_{email}",
+            fields={"record_key": email, "email": email, "permissions": self._rows[email]},
+        )
+        return (row, row) if email in self._duplicate_for else (row,)
+
+    def read_row(self, record_id: str) -> dict[str, str]:
+        email = record_id.removeprefix("rec_")
+        return {"permissions": self._rows[email]}
+
+
 class RecordingAudit:
     def __init__(self) -> None:
         self.records: list[tuple[str, dict[str, object]]] = []
@@ -458,6 +495,9 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
         # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
         "local_overrides": None,
+        # 默认 None：哨兵——不注入存量权限只读源时，行为必须与接线之前逐字节一致
+        # （S-P-2 #328，见 LegacySourceMergeTests.test_table_absent_matches_todays_behavior）。
+        "legacy_source": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -493,6 +533,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
         onboarding_failed=parts["onboarding_failed"],
         local_overrides=parts["local_overrides"],
+        legacy_source=parts["legacy_source"],
     )
     return runner, parts
 
@@ -670,6 +711,63 @@ class LocalOverrideMergeTests(unittest.TestCase):
         facts = parts["audit"].facts("onboarding.local_override_skipped")
         self.assertEqual(facts["user"], USER_ID)
         self.assertEqual(facts["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
+
+
+class LegacySourceMergeTests(unittest.TestCase):
+    """开通侧的存量权限沿用接线（S-P-2，Issue #319 / Trace #328）：与
+    ``tests/test_permission_refresh_duty.py::LegacySourceMergeTest`` 同一组断言，
+    证明两个调用点消费的是同一个 ``resolve_legacy_source``/``merge_permission_sources``。
+    查找键取**规范化邮箱**（小写），与 ``ROSTER_ROWS[0]["email"]``（混合大小写）同源。"""
+
+    NORMALIZED_EMAIL = "xiaoming@example.com"
+
+    def test_table_absent_matches_todays_behavior(self) -> None:
+        parts, result = run_once()
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+
+    def test_no_matching_legacy_row_is_also_identity(self) -> None:
+        legacy = FakeLegacyTable({})
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertEqual(legacy.find_calls, [(self.NORMALIZED_EMAIL, self.NORMALIZED_EMAIL)])
+
+    def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
+        """存量沿用后聚合含并集（本卡验收断言①）。"""
+
+        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'})
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["存量指标","销售分析"]}')
+
+    def test_read_failure_skips_legacy_source_and_audits(self) -> None:
+        """本卡验收断言②：读取失败只跳过存量源，不整链失败。"""
+
+        legacy = FakeLegacyTable(find_error=RuntimeError("注入的存量表读取失败"))
+        parts, result = run_once(legacy_source=legacy)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        self.assertIn("onboarding.legacy_source_skipped", parts["audit"].actions())
+        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
+        self.assertEqual(facts["user"], USER_ID)
+        self.assertEqual(facts["reason"], REASON_LEGACY_READ_FAILED)
+        self.assertEqual(facts["error"], "RuntimeError")
+
+    def test_conflicting_legacy_rows_are_skipped_with_a_distinct_reason(self) -> None:
+        """本卡验收断言⑤：命中多行失败关闭，原因码与读取失败可分辨。"""
+
+        legacy = FakeLegacyTable(
+            {self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'}, duplicate_for={self.NORMALIZED_EMAIL}
+        )
+        parts, _ = run_once(legacy_source=legacy)
+
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
+        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
+        self.assertEqual(facts["reason"], "multiple_rows")
+        self.assertNotIn("error", facts)
 
 
 class ThreadingTests(unittest.TestCase):
