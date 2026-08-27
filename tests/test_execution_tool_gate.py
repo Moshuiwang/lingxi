@@ -947,5 +947,76 @@ class RawPreToolUseSinkTest(unittest.TestCase):
         self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
 
 
+class ToolCallListenerTest(unittest.TestCase):
+    """``ToolGateway.set_tool_call_listener``（Issue #321 方向 C，语义化等待
+    进度的数据管路）：与 ``raw_pre_tool_use`` 同一姿态，是一个可选的、构造之后
+    才挂载的通知点，默认不挂载时的既有行为由本文件其余全部用例覆盖，本组只测
+    新增分支本身。
+    """
+
+    def test_listener_receives_the_normalized_tool_name_after_a_decision(self) -> None:
+        """回调收到的是判定后的规范化 ``tool_name``（合法工具名原样），不是
+        hook 事件里未经校验的原始值。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(received, ["mcp__bi-metric__list_metrics"])
+
+    def test_listener_is_invoked_for_denied_calls_too(self) -> None:
+        """模型试图调用什么，即使被拒绝，同样是"发生过一次调用"这个语义化进度
+        信号——与 ``raw_pre_tool_use`` 的既有姿态一致。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+
+        result = pre_tool_use(gateway, "Bash", {"cmd": "rm -rf /"}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), "deny")
+        self.assertEqual(received, ["Bash"])
+
+    def test_listener_exception_does_not_break_the_gating_decision(self) -> None:
+        """通知失败不得影响工具判定本身——与 ``_mark_side_effect``/
+        ``raw_pre_tool_use`` 既有姿态一致。"""
+
+        gateway = build_gateway()
+
+        def failing_listener(tool_name: str) -> None:
+            raise RuntimeError("模拟进度监听器故障")
+
+        gateway.set_tool_call_listener(failing_listener)
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), None)  # 白名单内工具，放行不受影响
+        self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
+
+    def test_clearing_the_listener_stops_further_notifications(self) -> None:
+        """``set_tool_call_listener(None)`` 必须真的清除——不是"追加一个空回调"。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+        gateway.set_tool_call_listener(None)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(received, [])
+
+    def test_default_gateway_never_touches_an_unset_listener(self) -> None:
+        """默认（从未调用 ``set_tool_call_listener``）不产生任何额外行为——沿用
+        本文件其余全部用例的既有断言路径，这里只确认不抛异常。"""
+
+        gateway = build_gateway()
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), None)
+
+
 if __name__ == "__main__":
     unittest.main()

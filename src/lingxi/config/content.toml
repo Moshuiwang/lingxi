@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-26"
+version = "2026-08-27-2"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -45,6 +45,14 @@ version = "2026-08-26"
 
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"
+# 语义化等待进度（Issue #321 方向 C，产品负责人 2026-08-27 裁定，留痕 #321 评论
+# 5434086490）：长问数期间在这两句之间切换，覆盖两次模型输出之间卡片完全静止的
+# 问题；30 秒仍无新信号则由兜底计时强制刷新一次纯用时更新（沿用当前这句文案，
+# 只跳动 worker.status 的 elapsed_seconds）。只区分"问数查询工具"与"其它/生成
+# 阶段"两类，不回显工具名、参数或任何查询内容（`{count}` 只是第几次调用的序数，
+# 不携带具体工具信息）。文案为实施草案，产品负责人过目前不作为最终定稿。
+"worker.action.querying_metrics" = "正在第 {count} 次查询指标数据"
+"worker.action.composing" = "正在整理与生成回答"
 "worker.status" = "{action} · {elapsed_seconds} 秒"
 "worker.queued_timeout" = "任务尚未开始，当前排队已超过等待时间，请稍后重试。"
 "worker.version_unavailable" = "任务尚未开始，当前执行能力暂时不可用，请稍后重试。"

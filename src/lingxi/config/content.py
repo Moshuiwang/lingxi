@@ -61,6 +61,8 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "gateway.slash_rejected",
     "worker.action.processing",
     "worker.action.completed",
+    "worker.action.querying_metrics",
+    "worker.action.composing",
     "worker.status",
     "worker.queued_timeout",
     "worker.version_unavailable",
