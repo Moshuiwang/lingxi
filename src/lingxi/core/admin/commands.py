@@ -28,6 +28,11 @@ _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 DEFAULT_AUDIT_WINDOW_HOURS = 24
 MAX_AUDIT_WINDOW_HOURS = 720
 
+#: 本地权限授权/抑制命令的原因文本上限（#319 S-P-1b 设计卡）：自由文本，非空白、
+#: ≤500 字符——足够写清楚一次特批的来龙去脉，同时防止一次输入把审计字段撑成
+#: 不可读的长文。
+_PERMISSION_REASON_MAX_LENGTH = 500
+
 _COMMAND_PREFIX = "/admin"
 
 
@@ -37,16 +42,26 @@ class AdminCommandKind(str, Enum):
     QUERY_AUDIT = "query_audit"
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
+    GRANT_PERMISSION = "grant_permission"
+    SUPPRESS_PERMISSION = "suppress_permission"
     UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
 class AdminCommand:
-    """解析结果。``UNKNOWN`` 之外的取值只填各自需要的字段，其余保持默认。"""
+    """解析结果。``UNKNOWN`` 之外的取值只填各自需要的字段，其余保持默认。
+
+    ``company_id``/``metric_name``/``reason`` 三个字段只有
+    ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 会填（``identifier`` 复用做
+    目标用户标识，与既有 ``suspend``/``resume`` 同一惯例）。
+    """
 
     kind: AdminCommandKind
     identifier: str | None = None
     window_hours: int | None = None
+    company_id: str | None = None
+    metric_name: str | None = None
+    reason: str | None = None
 
 
 def _unknown() -> AdminCommand:
@@ -69,6 +84,12 @@ def parse_admin_command(text: object) -> AdminCommand:
     - ``/admin suspend <identifier>``            → SUSPEND_USER（Issue #96 S-M-02：
       只建待确认操作，不直接执行；执行前须经本人飞书确认卡片）
     - ``/admin resume <identifier>``             → RESUME_USER（同上，对称动作）
+    - ``/admin grant_permission <identifier> <company_id> <metric_name> <reason...>``
+      → GRANT_PERMISSION（#319 S-P-1b：同样只建待确认操作，不直接执行；
+      ``company_id``/``metric_name`` 与 ``<identifier>`` 同一形状约束，``reason``
+      是尾部剩余全部 token 拼接成的自由文本，非空白、≤500 字符）
+    - ``/admin suppress_permission <identifier> <company_id> <metric_name> <reason...>``
+      → SUPPRESS_PERMISSION（同上，对称动作）
 
     任何不匹配以上形状的输入（含空文本、非字符串、未知子命令、参数数量或形状不对、
     小时数越界）一律返回 ``UNKNOWN``——调用方据此回复帮助/拒绝文案，不猜测意图。
@@ -106,7 +127,46 @@ def parse_admin_command(text: object) -> AdminCommand:
             return _unknown()
         return AdminCommand(kind=AdminCommandKind.RESUME_USER, identifier=rest[0])
 
+    if sub == "grant_permission":
+        return _parse_permission_command(rest, kind=AdminCommandKind.GRANT_PERMISSION)
+
+    if sub == "suppress_permission":
+        return _parse_permission_command(rest, kind=AdminCommandKind.SUPPRESS_PERMISSION)
+
     return _unknown()
+
+
+def _parse_permission_command(rest: list[str], *, kind: AdminCommandKind) -> AdminCommand:
+    """``grant_permission``/``suppress_permission`` 共用的解析：
+    ``<identifier> <company_id> <metric_name> <reason...>``——前三个 token 与既有
+    ``user``/``suspend``/``resume`` 同一形状约束（``_IDENTIFIER_PATTERN``），
+    第四个及以后全部 token 按空白拼接还原成一段自由文本 ``reason``。
+
+    至少需要 4 个 token（标识 + 公司 + 指标 + 至少一个原因词）；拼接后的 ``reason``
+    去除首尾空白后为空，或超过 :data:`_PERMISSION_REASON_MAX_LENGTH` 字符，均视为
+    形状不对，返回 ``UNKNOWN``——与本模块"识别不出来的输入一律 UNKNOWN"的既有纪律
+    一致，不对越界输入做截断或静默修正。
+    """
+
+    if len(rest) < 4:
+        return _unknown()
+    identifier, company_id, metric_name, *reason_tokens = rest
+    if not _IDENTIFIER_PATTERN.fullmatch(identifier):
+        return _unknown()
+    if not _IDENTIFIER_PATTERN.fullmatch(company_id):
+        return _unknown()
+    if not _IDENTIFIER_PATTERN.fullmatch(metric_name):
+        return _unknown()
+    reason = " ".join(reason_tokens).strip()
+    if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
+        return _unknown()
+    return AdminCommand(
+        kind=kind,
+        identifier=identifier,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason=reason,
+    )
 
 
 def _parse_audit(rest: list[str]) -> AdminCommand:
