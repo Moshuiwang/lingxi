@@ -556,7 +556,10 @@ class ReadOnlyBoundaryTest(unittest.TestCase):
 
         denied = report["audit"]["denied"]
         self.assertEqual([entry["tool_name"] for entry in denied], ["Write"])
-        self.assertEqual(denied[0]["deny_reason_code"], "not_in_whitelist")
+        # Issue #349：白名单里有 READ_ONLY_TOOL（mcp__query__ 前缀），所以 Write
+        # 被拒时命中「查询包装式越界」的重定向场景，reason_code 比通用的
+        # not_in_whitelist 更精确——见 tests/test_tool_policy_redirect.py。
+        self.assertEqual(denied[0]["deny_reason_code"], "not_in_whitelist_query_redirect")
         self.assertFalse(denied[0]["executed"])
         self.assertEqual(report["audit"]["denied_count"], 1)
 
