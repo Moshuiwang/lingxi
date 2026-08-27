@@ -51,13 +51,21 @@ KNOWN_EVENTS: frozenset[str] = frozenset(HOOK_EVENTS) | frozenset(OBSERVATION_ON
 # 短语的正常业务结果（例如指标名称、说明文字里偶然出现"tokens"）。
 # 大小写不敏感只是防御性的，未在真实样本里见过大小写变体。
 #
+# **中段距离上限 2000 字符**（独立审核 P3-5）：两段固定短语之间实测只隔着字节数
+# 与一个 ``/tmp`` 文件路径，远小于这个上限；加上限不是为了贴合真实样本长度，
+# 而是防御性地给 `.*?` 的搜索范围封顶——`_tool_result_text` 现在会在拿不到标准
+# 文本字段时兜底整段 JSON dump（见该函数文档），被扫描的文本可能远比"一段错误
+# 提示"大得多，不加距离上限时两个固定短语一旦分别出现在一份很大的正常业务结果
+# 里相距很远的位置，仍然可能被巧合命中；加了上限后，这类跨越业务数据两端偶然
+# 撞在一起的极端假阳性被排除，真实截断提示（两段紧邻）不受影响。
+#
 # **这条边界与 `_MESSAGE_BUFFER_OVERFLOW_PATTERN`（见
 # ``lingxi.adapters.claude_agent_session``）不是同一个问题**：那个匹配的是
 # SDK 读流缓冲上限压平成的裸异常（会话级、整条消息读不出来）；这个匹配的是
 # 单次 MCP 工具调用**正常返回**、但被 CLI 自己截断改写过的回执内容
 # （PostToolUse 能正常收到，只是文本在骗模型去读文件）。
 _MCP_OVERSIZE_RESULT_PATTERN = re.compile(
-    r"exceeds maximum allowed tokens.*?offset and limit parameters",
+    r"exceeds maximum allowed tokens.{0,2000}?offset and limit parameters",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -75,31 +83,66 @@ MCP_OVERSIZE_RESULT_REWRITE = (
 )
 
 
+def _iter_tool_result_text_fragments(value: Any) -> list[str]:
+    """从任意 MCP 回执结构里递归捞出全部文本片段。
+
+    真实 MCP 回执常见形状不止字符串/``{"text": ...}``/纯内容块数组三种——典型
+    还有 ``{"content": [{"type": "text", "text": ...}], "isError": ...}``
+    （Agent SDK 的 ``CallToolResult`` 外层信封，`isError` 与其它非文本字段一起
+    被忽略）。此前 Mapping 分支只读顶层 ``"text"``，这一形状因为没有顶层
+    ``text`` 键、只有嵌套在 ``content`` 里的文本块，永远拿不到文本，改写因此
+    对这一最典型的真实回执形状**静默不生效**（Issue #328 opus 审查 P1-2）。
+    这里改为递归下钻：``Mapping`` 既读自己的 ``"text"`` 也读 ``"content"``
+    的内容（`content` 本身可能是字符串或块数组），``list``/``tuple`` 逐项递归。
+    """
+
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        fragments: list[str] = []
+        text = value.get("text")
+        if isinstance(text, str):
+            fragments.append(text)
+        content = value.get("content")
+        if content is not None:
+            fragments.extend(_iter_tool_result_text_fragments(content))
+        return fragments
+    if isinstance(value, (list, tuple)):
+        fragments = []
+        for item in value:
+            fragments.extend(_iter_tool_result_text_fragments(item))
+        return fragments
+    return []
+
+
+def _tool_result_text(tool_response: Any) -> str:
+    """把 :func:`_iter_tool_result_text_fragments` 拼成一段文本；递归没能捞出
+    任何文本片段时（既没有标准 ``content``/``text`` 字段，也不是数组/字符串），
+    兜底整体 JSON dump 一遍再交给正则——不追求精确字段路径，只求不因为一个没
+    预料到的形状而漏判一条本该被改写的截断提示。dump 失败（例如出现不可序列
+    化对象）时退回空串，等价于"不识别"，不是误判为截断。
+    """
+
+    fragments = _iter_tool_result_text_fragments(tool_response)
+    if fragments:
+        return "\n".join(fragments)
+    try:
+        import json
+
+        return json.dumps(tool_response, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001 - 拿不出文本时退回"不识别"
+        return ""
+
+
 def _is_oversize_tool_result(tool_response: Any) -> bool:
     """``tool_response`` 是否命中 CLI 截断提示的特征。
 
-    只做粗略拉平：CLI 截断提示是纯文本，真实 MCP 正常回执要么是字符串，要么是
-    ``[{"type": "text", "text": ...}]`` 这类内容块数组，要么是 ``{"text": ...}``。
-    拿不出文本时返回空串——正则必然不命中，等价于"不识别"，不是误判为截断。
     这里不追求 :mod:`audit` 模块 ``_coerce`` 那种完整归类，两者目的不同：那边要把
-    回执分类成功/失败，这里只要够用来判断"是不是那条截断提示"。
+    回执分类成功/失败，这里只要够用来判断"是不是那条截断提示"。文本提取本身见
+    :func:`_tool_result_text`。
     """
 
-    if isinstance(tool_response, str):
-        text = tool_response
-    elif isinstance(tool_response, Mapping):
-        value = tool_response.get("text")
-        text = value if isinstance(value, str) else ""
-    elif isinstance(tool_response, (list, tuple)):
-        parts = [
-            block.get("text")
-            for block in tool_response
-            if isinstance(block, Mapping) and isinstance(block.get("text"), str)
-        ]
-        text = "\n".join(parts)
-    else:
-        text = ""
-    return bool(_MCP_OVERSIZE_RESULT_PATTERN.search(text))
+    return bool(_MCP_OVERSIZE_RESULT_PATTERN.search(_tool_result_text(tool_response)))
 
 
 class ToolGateway:

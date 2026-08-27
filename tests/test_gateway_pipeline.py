@@ -399,10 +399,11 @@ def _payload(
     message_type: str = "text",
     *,
     mentions: list[dict] | None = None,
+    chat_id: str = "oc_1",
 ) -> dict:
     message = {
         "message_id": "om_1",
-        "chat_id": "oc_1",
+        "chat_id": chat_id,
         "message_type": message_type,
         "content": '{"text": "你好"}',
     }
@@ -490,7 +491,7 @@ class GroupMentionHintTests(unittest.TestCase):
 
     BOT_OPEN_ID = "ou_bot_open_id"
 
-    def _handler(self, *, bot_open_id: str | None, log: CallLog, clock=None):
+    def _handler(self, *, bot_open_id: str | None, log: CallLog, clock=None, replies=None):
         from lingxi.apps.gateway import (
             GroupMentionHintResponder,
             build_group_mention_hint_throttle,
@@ -500,7 +501,7 @@ class GroupMentionHintTests(unittest.TestCase):
         throttle = build_group_mention_hint_throttle(clock=clock or (lambda: 0.0))
         hint = GroupMentionHintResponder(
             bot_open_id=bot_open_id,
-            replies=FakeReplies(log),
+            replies=replies if replies is not None else FakeReplies(log),
             audit=FakeAudit(log),
             throttle=throttle,
         )
@@ -612,6 +613,56 @@ class GroupMentionHintTests(unittest.TestCase):
         clock[0] += 3600.0  # 节流窗口之后，第三次 @ 应该重新放行
         handler(_payload("group", mentions=mentions))
         self.assertEqual(log.count("reply.send_text"), 2)
+
+    def test_a_send_failure_still_acks_and_does_not_consume_the_throttle_slot(self) -> None:
+        """P1-1（Issue #328 opus 审查真库实测）：`send_text` 抛出未预期异常时，
+        此前节流位在发送**之前**已经记上、异常又会原样抛穿 `make_event_handler`
+        ——飞书按事件处理失败重投，重投的这条又被同一节流窗口拦下，表现为
+        「@ 了一次，什么都没发生，且一小时内都不会再试」。修复后：事件必须
+        正常 ack（不抛出）、留一条 `event.group_mention_hint_failed` 审计（只含
+        异常类名）、且这次失败不消耗节流额度——同一个群下一条 @ 仍能正常收到
+        引导。"""
+
+        log = CallLog()
+        clock = [0.0]
+        failing_replies = FakeReplies(log, fail_with=RuntimeError("模拟发送失败"))
+        handler = self._handler(
+            bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: clock[0], replies=failing_replies
+        )
+        mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
+
+        result = handler(_payload("group", mentions=mentions))
+
+        self.assertIsNone(result, "失败必须被吞掉，事件正常 ack、不向上抛异常")
+        self.assertEqual(log.count("reply.send_text"), 1, "确实尝试过发送")
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 0, "发送没有成功")
+        self.assertEqual(log.count("audit.event.group_mention_hint_failed"), 1)
+        self.assertEqual(
+            log.fields("audit.event.group_mention_hint_failed")[0]["error"], "RuntimeError",
+            "只留异常类名，不带正文",
+        )
+
+        # 恢复正常发送：下一条同一个群的 @ 仍然可以成功——失败的那次没有把
+        # 节流额度提前消耗掉。
+        failing_replies.fail_with = None
+        handler(_payload("group", mentions=mentions))
+        self.assertEqual(log.count("reply.send_text"), 2, "失败的发送不消耗节流额度，下次可再发")
+        self.assertEqual(log.count("audit.event.group_mention_hint_sent"), 1)
+
+    def test_different_chat_ids_do_not_throttle_each_other(self) -> None:
+        """P3-6：节流字典按 `chat_id` 分键，不同群各自独立计时——同一时刻两个
+        不同的群各自 @ 一次都应该正常收到引导，不应该被彼此的节流窗口误伤。"""
+
+        log = CallLog()
+        handler = self._handler(bot_open_id=self.BOT_OPEN_ID, log=log, clock=lambda: 0.0)
+        mentions = [{"id": {"open_id": self.BOT_OPEN_ID}}]
+
+        handler(_payload("group", mentions=mentions, chat_id="oc_a"))
+        handler(_payload("group", mentions=mentions, chat_id="oc_b"))
+
+        self.assertEqual(log.count("reply.send_text"), 2, "两个不同的群各自恰一条引导")
+        sent = log.fields("reply.send_text")
+        self.assertEqual({call["chat_id"] for call in sent}, {"oc_a", "oc_b"})
 
 
 class UnsupportedMessageTypeTests(PipelineTestCase):

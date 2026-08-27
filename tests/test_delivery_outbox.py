@@ -557,6 +557,53 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
         )
 
 
+class ProgressEventContentTests(DeliveryOutboxTestCase):
+    """R1（Issue #328 opus 审查真库实测）：迁移 0075 放宽 ``task_delivery_event``
+    的 CHECK 之后，``progress`` 事件真的能带语义化进度内容
+    （``card_stream.encode_progress_action`` 产出的两种固定形状），机制本身
+    可用——放宽前的真实故障是真库实测 100% ``CheckViolation``，被
+    ``apps/worker/service.py::WorkerService._append_event`` 的通用
+    ``except Exception`` 吞成一条 ``logger.error``，真实环境卡片完全不动，
+    比不做语义化进度还差。
+
+    变异锚点：回退 0075 对 ``task_delivery_event_check2`` 的 CHECK 放宽（改回
+    只允许 ``safely_releasable_answer``/``terminal`` 带 content）→ 本类三个用例
+    全部因 ``CheckViolation`` 变红。33 字符越界的否定用例见
+    ``NegativeConstraintTests.test_progress_content_over_length_contract_is_rejected``。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+
+    def _assert_progress_content_round_trips(self, content: str | None) -> None:
+        appended = self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1", content=content,
+        )
+        self.assertFalse(appended.duplicate)
+        self.assertEqual(
+            self.scalar(
+                "SELECT content FROM task_delivery_event WHERE idempotency_key=%s",
+                ("tsk-1:a1:progress:1",),
+            ),
+            content,
+        )
+
+    def test_progress_content_querying_shape_writes_successfully(self) -> None:
+        self._assert_progress_content_round_trips("querying:3")
+
+    def test_progress_content_composing_shape_writes_successfully(self) -> None:
+        self._assert_progress_content_round_trips("composing")
+
+    def test_progress_content_none_shape_still_writes_successfully(self) -> None:
+        """默认 processing 阶段没有语义信号、``content`` 为 ``None``——这是改动前
+        就一直成立的既有形状，与前两个形状并排放在一起构成"三形状全覆盖"的
+        证据，不是本次放宽新增的行为。"""
+
+        self._assert_progress_content_round_trips(None)
+
+
 class SessionRetentionCleanupTests(DeliveryOutboxTestCase):
     """V-投递-05/10：会话边界触发（/new、空闲到点、按用户）统一清除已送达正文，
     送达前的正文不受影响（独立走二十四小时到期路径）。"""
@@ -1105,6 +1152,16 @@ class NegativeConstraintTests(DeliveryOutboxTestCase):
     def test_content_rejected_on_non_content_bearing_event_types(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
             self._insert(event_type="started", content="不该允许出现在这里")
+
+    def test_progress_content_over_length_contract_is_rejected(self) -> None:
+        """迁移 0075 放宽 CHECK 允许 ``progress`` 带 content，但同时加了
+        ``char_length(content) <= 32`` 的长度上限——这条否定用例证明上限是
+        数据库层真正强制的，不是只在 Python 自查
+        （``core/delivery/ports.assert_content_allowed``）里写了一句注释。
+        绕过应用层直接 INSERT，与本类其余真库约束用例同一姿态。"""
+
+        with self.assertRaises(self._psycopg.errors.CheckViolation):
+            self._insert(event_type="progress", content="x" * 33)
 
     def test_platform_received_at_rejected_outside_terminal(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
