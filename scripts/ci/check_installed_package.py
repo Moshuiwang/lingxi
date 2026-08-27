@@ -678,6 +678,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.delivery.ports",
             "lingxi.core.execution",
             "lingxi.core.execution.audit",
+            # 语义化等待进度（Issue #321 方向 C）：worker 用它的
+            # encode_progress_action/PROGRESS_ACTION_* 常量把工具调用阶段编码进
+            # progress 事件的 content 字段，由 apps.worker.service 模块级
+            # import；渲染卡片的另一半（decode_progress_action/CardStream 本身）
+            # 仍只在 gateway 闭包运行。
+            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",

@@ -131,10 +131,35 @@ class ToolGateway:
         # （构造方见 apps/worker/turn.py）。失败必须被这里兜住、不得影响工具判定
         # 本身（同 `_mark_side_effect` 的既有姿态）。
         self._raw_pre_tool_use = raw_pre_tool_use
+        # 语义化进度的工具调用开始通知（Issue #321 方向 C）：默认 ``None``，由
+        # ``set_tool_call_listener`` 按回合装配（见 ``apps/worker/turn.py`` 的
+        # ``run_turn``）。不做成构造参数——``ToolGateway`` 在
+        # ``WorkerTurnExecutor.__init__`` 里只建一次，而这个监听器要跟着每一次
+        # ``run_turn()`` 调用传入的回调走（回调闭包了那一次任务的进度状态），
+        # 因此需要一个可以在构造之后重新挂载的入口，与固定在构造期的
+        # ``raw_pre_tool_use``（内容级采集，语义上跟着整个执行器实例、不是单次
+        # 回合）用途不同。
+        self._on_tool_call: Callable[[str], None] | None = None
 
     @property
     def audit(self) -> TurnAudit:
         return self._audit
+
+    def set_tool_call_listener(self, callback: Callable[[str], None] | None) -> None:
+        """登记（或清除）本回合的工具调用开始通知（Issue #321 方向 C）。
+
+        回调收到的是 :class:`~lingxi.core.execution.tool_policy.PolicyVerdict` 的
+        ``tool_name``——判定之后的规范化值（合法工具名原样、畸形输入已经被
+        ``ToolPolicy._display_name`` 投影成 ``"<空>"``/``"<类型名>"`` 这类占位符，
+        见 ``tool_policy.py``），不是 hook 事件里未经校验的原始 ``tool_name``。
+        既被允许也被拒绝的调用都会通知——这只是"用户可见的语义化进度"要看的
+        「模型发起过一次调用」信号，不代表调用真的执行了；调用是否真的执行、
+        是否成功由 ``PostToolUse``/``PostToolUseFailure`` 记账，两者互不影响、
+        互不覆盖。回调异常必须被 ``_on_pre_tool_use`` 兜住，不能影响工具判定
+        本身（与 ``raw_pre_tool_use`` 同一姿态）。
+        """
+
+        self._on_tool_call = callback
 
     async def on_hook_event(
         self,
@@ -207,6 +232,11 @@ class ToolGateway:
             try:
                 self._raw_pre_tool_use(call_id, tool_input)
             except Exception:  # noqa: BLE001 - 采集失败不得影响工具判定本身
+                pass
+        if self._on_tool_call is not None:
+            try:
+                self._on_tool_call(verdict.tool_name)
+            except Exception:  # noqa: BLE001 - 进度通知失败不得影响工具判定本身
                 pass
         # 先把响应算出来，再记账：记账处理的是模型可控的入参，一旦它抛异常，
         # 异常会沿 hook 回调向上抛，把这次拒绝一起带走。审计可以失败，拒绝不能。
