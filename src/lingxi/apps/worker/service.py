@@ -739,6 +739,10 @@ class WorkerService:
                 stop_event=stop_event,
                 on_stream_event=on_stream_event,
                 external_texts=self._config.external_texts,
+                # 会话 resume 失配自动降级审计事件（`worker.session_resume_miss`，
+                # 见 `turn.py::run_turn`）需要任务标识才能定位是哪个任务触发的
+                # 降级；本方法持有 `claimed.task_id`，是唯一知道它的调用层。
+                task_id=claimed.task_id,
             )
         except UserMcpConfigError as error:
             # error.code 是本模块自定的安全码（不含路径 / 内容 / 令牌），供运维
