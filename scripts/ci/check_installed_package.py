@@ -316,6 +316,12 @@ REQUIRED_MODULES = (
     # 停摆候选查询的持久化面：由 `_build_stalled_provisioning_duty` 在函数内
     # import，同 `postgres_late_readiness_recovery` 一条理由。
     "lingxi.adapters.postgres_stalled_provisioning",
+    # 飞书 docx 交付适配器（Issue #341 S-ES-1）：建文档/写正文/授予「可管理」/协作者
+    # 读回四个方法，已由 S0 探针（2026-08-27，四步全通）验证过调用形态。生产调用方
+    # 是 S-ES-3 的投递链路，装配前它不在任何进程的 import 闭包里，但同
+    # `lingxi.core.identity.provisioning` 一条理由——必须随制品发布，否则接线那天
+    # 才发现 wheel 里没有它。
+    "lingxi.adapters.feishu_docx_delivery",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式

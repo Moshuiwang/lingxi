@@ -1,0 +1,381 @@
+"""飞书 docx 文档交付适配器（Issue #341 S-ES-1：生产适配器，只做 API 面，不接线）。
+
+来源：#341 S0 探针（2026-08-27，四步全通，[评论](
+https://github.com/Moshuiwang/lingxi/issues/341#issuecomment-5385558864)，证据
+等级 6，Bot-Test 真实调用）——建文档、写正文段落、对个人 ``open_id`` 授予文档级
+``full_access``（未被平台降级）、协作者读回，四个动作全部用应用身份令牌
+（``tenant_access_token``）真实调通。交付形态依据决策记录
+``docs/决策记录/2026-08-23-正式产物路由为随对话文档与文档级可管理授权.md``：
+随对话交付给个人 + 文档级 ``full_access`` + 所有权留机器人。
+
+本模块只做协议细节——"什么时候该建文档、发给谁、失败要不要重试、幂等"都不是这里
+的职责，那些属于 S-ES-3 的投递链路（``core.execution``/``apps.gateway`` 的对应
+Protocol 实现）；这里只保证一件事：调用形态与飞书契约完全对齐，失败不静默。
+
+## 姿态选择：裸 HTTP，不用 lark-oapi
+
+与 :mod:`lingxi.adapters.feishu_directory` / :mod:`lingxi.adapters.
+feishu_tenant_token` 同一习惯：标准库 ``urllib``、零新增依赖、构造函数只存参数、
+不建 client、不发请求；传输层可注入，默认实现在函数内部延迟 import（本模块用的
+是标准库 ``urllib``，没有第三方 SDK 需要延迟导入，仍保留"构造函数不做 I/O"这条
+纪律）。理由与 :mod:`lingxi.adapters.feishu_group_message` 相同：这个能力目前
+没有接线的调用方（S-ES-3 未做），不该现在就把 ``lark-oapi`` 拉进任何常驻进程的
+运行时依赖。``scripts/probe_drive_folder_permissions.py`` 的 ``LarkDriveTransport``
+已经用同一条裸 HTTP 路径验证过 ``/drive/v1/permissions/{token}/members`` 与
+``/docx/v1/documents`` 两个端点的形状，这里额外补上 S0 新验证过的写正文端点
+（``blocks/{document_id}/children``）。
+
+## 令牌供给：``Callable[[], str]``
+
+构造函数接收的是 ``tenant_access_token: Callable[[], str]``，不是
+``app_id``/``app_secret``——形状对齐
+:class:`~lingxi.core.permission.tenant_token_supply.TenantAccessTokenSupply`
+（同样是"要一份当下能用的令牌"这一个动作）。上层缓存与续期节奏已经是一个独立、
+被测试钉住的组件，本模块不重新发明"要不要现在去换一次令牌"的判断，每次调用只管
+去要一份。
+
+## 失败语义：不静默
+
+四个会发起真实调用的方法都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
+:class:`FeishuDocxDeliveryError`（``definite=True``，判别口径同
+:class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`）；响应本身成功
+（``code`` 为 0）但缺失可回读标识（``document_id``/``members`` 字段缺失或形状
+不对）时抛出 ``LookupError``——这种"结果不明"不属于飞书明确拒绝，同
+:mod:`lingxi.adapters.feishu_delivery` 模块文档字符串里的既有分类（成功响应缺
+标识 → ``LookupError``，业务错误码 → 专用异常）。传输层异常（连接失败、超时、
+JSON 解析失败）由默认传输 :func:`urllib_transport` 分类为
+``FeishuDocxDeliveryError(definite=False)``。
+
+## 凭据与内容边界
+
+日志与异常消息不落 ``tenant_access_token``、请求/响应正文（文档标题、段落文字、
+``open_id``）。业务错误码只以货真价实的 ``int`` 形式拼进 ``code`` 字段（同
+``feishu_directory._safe_feishu_code`` 的注入防护理由：响应体是不可信的外部
+数据），不透传飞书 ``msg`` 原文。
+
+## 文档 URL 的构造
+
+飞书 ``docx/v1/documents`` 建文档响应未见 ``url`` 字段（S0 探针实测响应只有
+``document.document_id``/``document.revision_id``/``document.title``），真实
+链接形如 ``https://<tenant>.feishu.cn/docx/{document_id}``——``<tenant>`` 是与
+API host（``open.feishu.cn``）无关的租户子域，无法从 ``base_url`` 推出。因此
+:meth:`LarkDocxDelivery.document_url` 在构造时单独接收 ``tenant_domain``（S0
+探针实测的值是 ``gv3qfk4q2rp.feishu.cn``；生产租户域名留给 S-ES-3 接线时从配置
+注入，本模块不猜测、不写死）。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Any, Callable, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
+
+logger = logging.getLogger(__name__)
+
+#: 出站超时。与其它裸 HTTP 飞书适配器同量级（``feishu_tenant_token``/
+#: ``feishu_directory``）：一次调用挂死不该无界占住调用方。
+REQUEST_TIMEOUT_SECONDS = 20
+
+#: 权限接口的 ``type`` 查询参数：docx 文档（区别于 folder/sheet 等其它对象类型）。
+DOCX_PERMISSION_TYPE = "docx"
+
+#: 决策记录 2026-08-23 裁定的授予档位：文档级「可管理」。
+FULL_ACCESS_PERM = "full_access"
+
+#: 授权的成员标识类型：飞书用户 ``open_id``（区别于 ``email``/``unionid`` 等）。
+OPENID_MEMBER_TYPE = "openid"
+
+#: 飞书用户 ``open_id`` 前缀，用于入口形状校验（同
+#: :data:`lingxi.adapters.feishu_user_message.USER_OPEN_ID_PREFIX` 的理由：
+#: 把群/租户标识误传成用户 open_id，要在**发出去之前**失败）。
+USER_OPEN_ID_PREFIX = "ou_"
+
+#: docx 正文段落 block 的 ``block_type``：S0 探针实测的纯文本段落类型。
+_TEXT_PARAGRAPH_BLOCK_TYPE = 2
+
+_DOCX_DOCUMENTS_PATH = "/docx/v1/documents"
+
+
+class FeishuDocxDeliveryError(RuntimeError):
+    """飞书 docx 交付失败。``code`` 供程序判断，消息里不含凭据、正文或标识符。
+
+    ``definite``：``True`` 表示飞书明确拒绝（收到业务错误码），``False`` 表示
+    结果不明（传输层异常、超时、响应形状不对）。判别口径同
+    :class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`。
+    """
+
+    def __init__(self, code: str, *, definite: bool | None = None) -> None:
+        super().__init__(f"飞书 docx 交付失败：{code}")
+        self.code = code
+        self.definite = definite if definite is not None else code.startswith("feishu_code_")
+
+
+def _require_https(base_url: str) -> str:
+    """飞书出站必须 HTTPS：误配 ``http://`` 会把 Bearer token 明文上路。"""
+
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("base_url 必须由配置注入，不得写死在代码里")
+    text = base_url.strip()
+    parsed = urlparse(text)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise ValueError("飞书 base_url 必须使用不含凭据的 HTTPS 地址")
+    if parsed.fragment:
+        raise ValueError("飞书 base_url 不得包含 URL fragment")
+    return text.rstrip("/")
+
+
+def _require_tenant_domain(value: str) -> str:
+    """校验用于拼文档链接的裸域名（不是 API base_url，见模块文档「文档 URL 的
+    构造」一节）：不含协议、路径或空白，避免把一段可注入的值悄悄拼进对外链接。
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("tenant_domain 必须由配置注入，不得写死在代码里")
+    text = value.strip()
+    if "://" in text or "/" in text or any(character.isspace() for character in text):
+        raise ValueError("tenant_domain 必须是裸域名（不含协议、路径或空白），例如 example.feishu.cn")
+    return text
+
+
+def _require_document_id(document_id: str) -> str:
+    text = (document_id or "").strip()
+    if not text:
+        raise ValueError("document_id 不能为空")
+    if any(character.isspace() for character in text):
+        raise ValueError("document_id 不得包含空白字符，不回显收到的值")
+    return text
+
+
+def _require_user_open_id(open_id: str) -> str:
+    """校验用户 ``open_id`` 形状；不合法就快速失败，且不回显取到的值——理由同
+    :func:`lingxi.adapters.feishu_user_message.validate_user_open_id`（把群/
+    租户标识误传成用户 open_id，要在**发出去之前**失败，而不是把「可管理」权限
+    授予一个错误的收件人）。"""
+
+    text = (open_id or "").strip()
+    if not text.startswith(USER_OPEN_ID_PREFIX) or len(text) <= len(USER_OPEN_ID_PREFIX):
+        raise ValueError(f"open_id 必须是飞书用户 open_id（以 {USER_OPEN_ID_PREFIX} 开头），不回显收到的值")
+    if any(character.isspace() for character in text):
+        raise ValueError("open_id 不得包含空白字符，不回显收到的值")
+    return text
+
+
+def _safe_feishu_code(value: object) -> str:
+    """把飞书业务错误码渲染成审计安全的分类标签。理由与
+    ``feishu_directory._safe_feishu_code`` 相同：响应体是不可信的外部数据，只在
+    ``value`` 是货真价实的 ``int``（排除 ``bool``，它是 ``int`` 子类）时插值，
+    否则退化成固定标签，防止响应内容注入进异常消息/审计行。
+    """
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"feishu_code_{value}"
+    return "feishu_code_invalid"
+
+
+class Transport(Protocol):
+    def __call__(
+        self, method: str, url: str, *, body: Mapping[str, Any] | None = ..., token: str | None = ...
+    ) -> Any: ...
+
+
+def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
+    """默认传输层：只发 HTTPS，不重试有副作用的请求（同
+    :func:`lingxi.adapters.feishu_tenant_token.urllib_transport` 的姿态：飞书
+    调用失败按已知分类抛出，交由调用方决定要不要重试）。
+    """
+
+    payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - 地址来自受控配置且已校验 https
+            return json.loads(response.read())
+    except HTTPError as error:
+        try:
+            return json.loads(error.read())
+        except Exception as parse_error:
+            raise FeishuDocxDeliveryError(f"http_{error.code}", definite=False) from parse_error
+    except (URLError, OSError, TimeoutError) as error:
+        raise FeishuDocxDeliveryError("transport_error", definite=False) from error
+    except ValueError as error:
+        raise FeishuDocxDeliveryError("invalid_json", definite=False) from error
+
+
+class LarkDocxDelivery:
+    """飞书 docx 文档交付：建文档、写正文、授予「可管理」、协作者读回。
+
+    构造函数**只存参数**：不发请求、不缓存令牌（纪律同
+    :class:`lingxi.adapters.feishu_group_message.FeishuGroupMessages`）。传输层
+    由 ``transport`` 注入，默认是本模块的 :func:`urllib_transport`。
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        tenant_access_token: Callable[[], str],
+        tenant_domain: str,
+        transport: Callable[..., Any] | None = None,
+    ) -> None:
+        self._base_url = _require_https(base_url)
+        if not callable(tenant_access_token):
+            raise ValueError("tenant_access_token 必须是返回令牌字符串的可调用对象")
+        self._tenant_access_token = tenant_access_token
+        self._tenant_domain = _require_tenant_domain(tenant_domain)
+        self._transport: Callable[..., Any] = transport or urllib_transport
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        body: Mapping[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self._base_url}{path}"
+        if params:
+            url = f"{url}?{urlencode(dict(params))}"
+        token = self._tenant_access_token()
+        if not isinstance(token, str) or not token:
+            # 结果不明：令牌供给没有按约定返回非空字符串。不是飞书拒绝，是调用方
+            # 传入的供给本身坏了——同样不能静默，必须让调用方看见。
+            raise FeishuDocxDeliveryError("tenant_access_token_missing", definite=False)
+        return self._transport(method, url, body=body, token=token)
+
+    def _data(self, response: Any) -> Mapping[str, Any]:
+        """飞书业务错误码非 0 → 抛出 :class:`FeishuDocxDeliveryError`
+        （``definite=True``）；这是本模块唯一判定"飞书明确拒绝"的位置，**刻意
+        不做静默降级**——一旦这里被改成"记日志后继续"，所有写操作都会在飞书拒绝
+        的情况下被上层误判为成功。"""
+
+        if not isinstance(response, Mapping):
+            raise FeishuDocxDeliveryError("invalid_response_shape", definite=False)
+        code = response.get("code")
+        if code not in (None, 0, "0"):
+            raise FeishuDocxDeliveryError(_safe_feishu_code(code), definite=True)
+        data = response.get("data")
+        return data if isinstance(data, Mapping) else {}
+
+    def create_document(self, title: str) -> str:
+        """建一篇新文档，返回 ``document_id``。
+
+        ``POST /docx/v1/documents``，S0 探针实测的请求体只有 ``title`` 一个字段
+        （不传 ``folder_token`` 时飞书把文档建在应用的默认位置）。
+        """
+
+        text = (title or "").strip()
+        if not text:
+            raise ValueError("文档标题不能为空")
+        data = self._data(self._call("POST", _DOCX_DOCUMENTS_PATH, body={"title": text}))
+        document = data.get("document")
+        if not isinstance(document, Mapping):
+            raise LookupError("建文档响应缺少 document 字段：结果不明，不能确定文档是否已建好")
+        document_id = document.get("document_id")
+        if not isinstance(document_id, str) or not document_id:
+            raise LookupError("建文档响应缺少可回读标识 document_id：结果不明")
+        logger.info("飞书 docx 文档已建 document_id_len=%s", len(document_id))
+        return document_id
+
+    def write_paragraphs(self, document_id: str, paragraphs: Sequence[str]) -> None:
+        """把 ``paragraphs`` 逐段写成正文，一次调用消费掉一次外部写请求预算。
+
+        ``POST /docx/v1/documents/{document_id}/blocks/{document_id}/children``：
+        S0 探针实测根 block 的 ``block_id`` 就是 ``document_id`` 本身，多段正文
+        对应 ``children`` 数组里的多个 ``block_type=2``（文本段落）block，一次
+        请求的 ``index`` 固定为 0（本模块只服务"整篇正文一次写完"这个场景，不
+        提供中途插入）。
+        """
+
+        doc_id = _require_document_id(document_id)
+        texts = list(paragraphs) if paragraphs is not None else []
+        if not texts:
+            raise ValueError("正文段落不能为空")
+        for index, text in enumerate(texts):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"第 {index + 1} 段正文不能为空")
+        children = [
+            {"block_type": _TEXT_PARAGRAPH_BLOCK_TYPE, "text": {"elements": [{"text_run": {"content": text}}]}}
+            for text in texts
+        ]
+        self._data(
+            self._call(
+                "POST",
+                f"{_DOCX_DOCUMENTS_PATH}/{doc_id}/blocks/{doc_id}/children",
+                body={"children": children, "index": 0},
+            )
+        )
+        logger.info("飞书 docx 正文已写入 document_id_len=%s 段落数=%s", len(doc_id), len(texts))
+
+    def grant_full_access(self, document_id: str, open_id: str) -> None:
+        """对 ``open_id`` 这个人授予文档级「可管理」（决策记录 2026-08-23 裁定的
+        唯一授予档位）。
+
+        ``POST /drive/v1/permissions/{document_id}/members?type=docx``，S0 探针
+        实测：对个人 openid 原样接受、无降级。
+        """
+
+        doc_id = _require_document_id(document_id)
+        member_id = _require_user_open_id(open_id)
+        self._data(
+            self._call(
+                "POST",
+                f"/drive/v1/permissions/{doc_id}/members",
+                params={"type": DOCX_PERMISSION_TYPE},
+                body={"member_type": OPENID_MEMBER_TYPE, "member_id": member_id, "perm": FULL_ACCESS_PERM},
+            )
+        )
+        logger.info("飞书 docx 已授予可管理 document_id_len=%s", len(doc_id))
+
+    def read_members(self, document_id: str) -> list[dict[str, Any]]:
+        """读回协作者列表，供调用方判定"真实创建 + 权限读回后才算成功"。
+
+        ``GET /drive/v1/permissions/{document_id}/members?type=docx``。返回的
+        每一项只保留 ``member_type``/``member_id``/``perm`` 三个字段（同
+        ``scripts/probe_drive_folder_permissions.py`` 的 ``_member_signature``
+        取值口径），不透传飞书响应里可能携带的其它字段。
+        """
+
+        doc_id = _require_document_id(document_id)
+        data = self._data(
+            self._call("GET", f"/drive/v1/permissions/{doc_id}/members", params={"type": DOCX_PERMISSION_TYPE})
+        )
+        members = data.get("members")
+        if not isinstance(members, list):
+            raise LookupError("读回协作者响应缺少 members 字段：结果不明")
+        return [
+            {
+                "member_type": member.get("member_type"),
+                "member_id": member.get("member_id"),
+                "perm": member.get("perm"),
+            }
+            for member in members
+            if isinstance(member, Mapping)
+        ]
+
+    def document_url(self, document_id: str) -> str:
+        """拼出用户可直接打开的文档链接（见模块文档「文档 URL 的构造」一节）。
+
+        纯本地拼接，不发起任何请求。
+        """
+
+        doc_id = _require_document_id(document_id)
+        return f"https://{self._tenant_domain}/docx/{doc_id}"
+
+
+__all__ = [
+    "DOCX_PERMISSION_TYPE",
+    "FULL_ACCESS_PERM",
+    "OPENID_MEMBER_TYPE",
+    "USER_OPEN_ID_PREFIX",
+    "FeishuDocxDeliveryError",
+    "LarkDocxDelivery",
+    "REQUEST_TIMEOUT_SECONDS",
+    "Transport",
+    "urllib_transport",
+]
