@@ -17,7 +17,8 @@
 - ①：把字面量工具名从 ``ToolPolicy`` 白名单合入去掉；
 - ③：``document_delivery.py`` 跳过硬上限校验（段数/总字符）；
 - ④：``document_delivery.py`` 跳过 ``constrain_output`` 调用；
-- ⑤：``hooks.py`` 的 ``_is_side_effecting_tool`` 还原成"一切 mcp__ 都无副作用"。
+- ⑤：``hooks.py`` 的 ``_is_side_effecting_tool`` 把 ``deliver_document`` 改回显式
+  列为侧效例外（P2-1 opus 审查撤销了这条例外，见 ``SideEffectClassificationTest``）。
 
 真实 SDK 触发 ``PreToolUse``/挂载 MCP 服务这件事本身不在本文件验证范围内——那
 只有 ``biai-stage`` 的 L4a 能回答，与本仓库既有的假 SDK 装配测试（见
@@ -322,6 +323,42 @@ class DeliverDocumentHandlerTest(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
         self.assertEqual(events[-1]["reason"], "leak_detected")
 
+    def test_handler_rejects_when_body_leaks_a_configured_external_text_via_real_assembly(
+        self,
+    ) -> None:
+        """P1-1（opus 审查）：``config.external_texts`` 是 ``tuple[tuple[str, str],
+        ...]``（`(键, 文本)` 对），把它整体（而不是拆出的文本值）传给
+        ``constrain_output`` 会让每一条禁止值变成一个二元组对象，与真实正文逐字
+        比对永远不命中——出口安全检查因此对文档交付**整串失效**，且这个错误只有
+        通过真实装配路径（``load_config`` 解析 ``LINGXI_WORKER_METRIC_DESCRIPTION``
+        → ``WorkerConfig.external_texts`` → ``_handle_deliver_document``）才能被
+        测出来；直接调用 ``build_document_request(forbidden_values=(text,))`` 的
+        既有用例（见 ``BuildDocumentRequestTest``）传的已经是拆好的文本，测不出
+        这个类型不匹配。把 ``turn.py`` 里的 `tuple(text for _, text in ...)` 拆包
+        改回直接传 `self._config.external_texts`，本用例会变绿（不再拒绝）。
+        """
+
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(
+                _env(
+                    LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1",
+                    LINGXI_WORKER_METRIC_DESCRIPTION="内部专用指标口径说明，不得外传",
+                )
+            ),
+            stderr_stream=buffer,
+        )
+
+        result = executor._handle_deliver_document(
+            "标题", "正文里不慎抄了一遍：内部专用指标口径说明，不得外传"
+        )
+
+        self.assertTrue(result.get("is_error"))
+        self.assertIsNone(executor._document_request)
+        events = _stderr_events(buffer)
+        self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
+        self.assertEqual(events[-1]["reason"], "leak_detected")
+
     def test_second_call_within_the_same_turn_replaces_the_first_and_is_audited(self) -> None:
         buffer = io.StringIO()
         executor = WorkerTurnExecutor(
@@ -435,11 +472,17 @@ class RunTurnReportContractTest(unittest.TestCase):
 
 
 class SideEffectClassificationTest(unittest.TestCase):
-    """变异锚点⑤：把 ``_is_side_effecting_tool`` 还原成"一切 mcp__ 都无副作用"
-    会让这条用例变红。"""
+    """P2-1（opus 审查，撤销原 S-ES-2 变异锚点⑤）：``deliver_document`` 只登记
+    一次回合级内存状态，没有任何跨进程副作用——真正落库的一步（``write_terminal_
+    event``）由 ``task_document_delivery_request.task_id`` 的 UNIQUE 约束保证
+    幂等。把它标成"有副作用"的代价是崩溃恢复（``adapters/postgres_conversation/
+    _queue_lifecycle.py::reclaim_stale``）会因为 ``side_effect_state='possible'``
+    拒绝安全重试，让一个只是想要文档的用户平白收到失败终态。变异锚点：把
+    ``_is_side_effecting_tool`` 改回显式把它列为例外（``return True``），本用例
+    会变红。"""
 
-    def test_deliver_document_tool_is_classified_as_side_effecting(self) -> None:
-        self.assertTrue(ToolGateway._is_side_effecting_tool(DELIVER_DOCUMENT_TOOL_NAME))
+    def test_deliver_document_tool_is_not_classified_as_side_effecting(self) -> None:
+        self.assertFalse(ToolGateway._is_side_effecting_tool(DELIVER_DOCUMENT_TOOL_NAME))
 
     def test_read_only_query_tools_remain_non_side_effecting(self) -> None:
         self.assertFalse(ToolGateway._is_side_effecting_tool("mcp__query__list_metrics"))

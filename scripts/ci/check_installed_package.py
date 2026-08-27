@@ -333,6 +333,11 @@ REQUIRED_MODULES = (
     # 让 gateway 起不来）。
     "lingxi.apps.gateway.document_delivery",
     "lingxi.adapters.postgres_document_delivery",
+    # 文档投递死信扫描 + 正文到期擦除职责（Issue #341 R-2/`V-投递-06`）：
+    # `apps/scheduler/assembly.py` 在**模块级** import（同 late_readiness_recovery/
+    # stalled_provisioning 那一条理由，漏登记会直接让 scheduler 起不来）。持久化面
+    # 复用上面已经登记过的 `adapters.postgres_document_delivery`，不重复登记。
+    "lingxi.apps.scheduler.document_delivery_dead_letter",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
@@ -445,6 +450,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # （`_build_stalled_provisioning_duty` 在函数内 import）同样必须登记。
             "lingxi.apps.scheduler.stalled_provisioning",
             "lingxi.adapters.postgres_stalled_provisioning",
+            # 文档投递死信扫描 + 正文到期擦除职责（Issue #341 R-2/`V-投递-06`）：
+            # `apps/scheduler/assembly.py` 模块级 import，与 late_readiness_recovery/
+            # stalled_provisioning 一节同一条"漏登记会直接让 scheduler 起不来"的
+            # 理由；它复用的持久化面（`adapters.postgres_document_delivery`）已经
+            # 因为 gateway 那一节在制品清单里登记过，这里是 scheduler 进程**自己
+            # 的**闭包，两个进程各自独立登记，互不代替。
+            "lingxi.apps.scheduler.document_delivery_dead_letter",
+            "lingxi.adapters.postgres_document_delivery",
             # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303
             # 新增 daily_report），全部由包的 `__init__.py` 在模块级 import（维持
             # 既有的 `lingxi.apps.scheduler.<名字>` 重导出契约），因此进程起来时

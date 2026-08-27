@@ -189,7 +189,8 @@ class WorkerTurnExecutor:
 
         @sdk_tool(
             "deliver_document",
-            "登记一次文档交付请求：任务完成后系统会为用户生成该文档。"
+            "登记一次文档交付请求：任务完成后系统会尝试为用户生成该文档；"
+            "若生成失败，用户会收到通知（不是无条件承诺一定成功）。"
             "此工具只登记请求本身，不会立即发送任何内容给用户，也不产生任何"
             "外部副作用；同一回合内多次调用以最后一次为准。",
             {"title": str, "markdown": str},
@@ -218,7 +219,16 @@ class WorkerTurnExecutor:
             request = build_document_request(
                 title=title,
                 markdown=markdown,
-                forbidden_values=self._config.external_texts,
+                # P1-1（opus 审查）：`config.external_texts` 是
+                # `tuple[tuple[str, str], ...]`（`(键, 文本)` 对，见
+                # `apps/worker/config.py::_external_texts`），不是文本本身。此前
+                # 原样传入 `constrain_output` 会把每个二元组整体当成一条禁止值——
+                # `_unique_texts` 只会拿到形如 `('key', 'text')` 的对象，与真实
+                # 正文逐字比对必然不命中，等于这条出口安全检查对文档交付**整串
+                # 失效**。与 `run_turn` 里 `build_report(external_texts=tuple(text
+                # for _, text in normalized_external_texts), ...)` 用同一种拆法，
+                # 只取文本值。
+                forbidden_values=tuple(text for _, text in self._config.external_texts),
                 internal_tool_names=self._policy.allowed_tools,
                 system_prompt=self._config.system_prompt,
             )
@@ -244,7 +254,11 @@ class WorkerTurnExecutor:
         )
         return {
             "content": [
-                {"type": "text", "text": "文档请求已登记，任务完成后为用户生成。"}
+                # opus 审查 R-1 第 4 条：与工具描述、与 `content.toml` 新增的用户可见
+                # 失败文案（`delivery.document_failed`）同向措辞——不再无条件承诺
+                # "会生成"，只承诺"已登记；失败会有通知"，模型据此措辞回复用户时
+                # 不会说出系统兑现不了的承诺。
+                {"type": "text", "text": "已登记文档请求；若生成失败你会收到通知。"}
             ]
         }
 

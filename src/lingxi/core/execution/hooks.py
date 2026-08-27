@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping
 
 from .audit import TurnAudit
-from .document_delivery import DELIVER_DOCUMENT_TOOL_NAME
 from .tool_policy import ToolPolicy
 
 # 需要注册的 hook 事件。``PostToolUseFailure`` 是工具抛错的唯一来源；
@@ -121,15 +120,20 @@ class ToolGateway:
         # 本 Story 的唯一放行能力是只读 MCP；其它真正执行到的工具都按可能有副作用
         # 处理。未经过 PreToolUse 的旁路仍由报告的 ungated_calls 拦截收口。
         #
-        # `mcp__delivery__deliver_document`（Issue #341 S-ES-2）是这条"mcp__ 一律
-        # 无副作用"经验规则下**唯一**的例外：它调用一次就会在进程内登记/覆盖本轮
-        # 的文档交付请求，是有副作用的写操作，不是只读查询。显式列出而不是继续
-        # 让通配前缀判定它，是正确性修复本身——如果继续把它当无副作用，一次因
-        # 传输抖动触发的自动重试会在模型不知情的情况下悄悄重复调用只读查询之外
-        # 的写工具，而 `mark_external_side_effect` 正是上层据以决定"能不能重试"
-        # 的唯一信号。
-        if tool_name == DELIVER_DOCUMENT_TOOL_NAME:
-            return True
+        # `mcp__delivery__deliver_document`（Issue #341 S-ES-2）**不是**这条经验
+        # 规则的例外（opus 审查 P2-1，撤销此前把它显式列为例外的修复）。这个工具
+        # 调用一次确实会在进程内登记/覆盖本轮的文档交付请求，但它**没有任何跨进程
+        # 副作用**：不发外部请求、不落任何持久化数据，只是回合级内存状态。真正落库
+        # 的一步在 `adapters/postgres_conversation/_queue_outbox.py::
+        # write_terminal_event`——那一步由 `task_document_delivery_request.task_id`
+        # 的 UNIQUE 约束（迁移 0074）与"终态写入同一个事务"两条防线保证幂等：同一个
+        # `task_id` 重放多次，至多插入一行。把这个工具错误地标成"有副作用"，代价是
+        # 崩溃恢复路径（`adapters/postgres_conversation/_queue_lifecycle.py::
+        # reclaim_stale`）会因为 `side_effect_state='possible'` 判定 `safe_retry=
+        # False`，把本可以安全重排回 `queued` 的任务转判 `side_effect_uncertain`
+        # 失败终态——一个只是想要一份文档的用户，因为这个工具调用被错误归类，反而
+        # 从"重试一次就能拿到答案"变成"当场收到失败通知"，而它本该是全部 mcp__
+        # 工具里最经得起重放的那一个。
         return not tool_name.startswith("mcp__")
 
     def _on_pre_tool_use(self, tool_name: Any, tool_input: Any, call_id: str | None) -> dict[str, Any]:

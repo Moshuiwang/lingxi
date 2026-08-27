@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-27"
+version = "2026-08-27-2"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -103,6 +103,15 @@ version = "2026-08-27"
 # 见 apps/gateway/document_delivery.py 模块说明）。{url} 是纯本地拼接的文档
 # 链接，不含用户数据或凭据。
 "delivery.document_ready" = "你要的文档已生成：{url}（你已获得可管理权限）"
+# opus 审查 R-1 第 3 条：此前 mark_failed/mark_uncertain 只落终态与日志/告警，
+# 提出文档请求的用户本人从未收到任何消息——表现成"点了要文档，然后再也没有
+# 下文"。与 delivery.document_ready 同一条出站信道（追加消息，不进入任何已有
+# 话题终态），成功/失败/结果不明三种终态现在各自都有对应的用户可见文案。
+"delivery.document_failed" = "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。"
+# uncertain 与 failed 措辞刻意区分（V-交付-03：结果不明不自动重发，转人工核对，
+# 不是"确定失败、你可以重试"——重试可能造成重复建档/重复授权，见
+# apps/gateway/document_delivery.py 模块说明「白名单反转」）。
+"delivery.document_uncertain" = "文档生成结果暂无法确认，已转人工核对。"
 
 [cards."query.status"]
 title = "正在查询"
