@@ -175,6 +175,14 @@ REQUIRED_MODULES = (
     # 但载体本身必须在制品里，否则内容到位那天才发现 wheel 里没有加载它的代码。
     "lingxi.core.permission.metric_translation",
     "lingxi.adapters.company_function_metric_map_file",
+    # 本地权限覆盖表地基（Issue #319 S-P-1a，产品负责人 2026-08-26 裁定推翻
+    # 2026-08-24 决策记录第 4 条「本地开通/扩权：不做」）：条目类型与「suppress
+    # 赢」冲突判定在 core，迁移 0072 的读写在 adapters。本卡只交付地基——命令面
+    # （S-P-1b 的确认卡执行器）与聚合接线（S-P-3）尚未消费它们，装配前不在任何
+    # 进程的 import 闭包里，与上面 metric_translation 一组同一姿态："本地测试
+    # 全绿但 wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
+    "lingxi.core.permission.local_override",
+    "lingxi.adapters.postgres_local_permission",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
     # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
     # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
