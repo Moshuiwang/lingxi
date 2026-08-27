@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from lingxi.core.ids import is_ulid
+
 #: 目标标识（当前只用于 open_id）允许的形状：字母、数字、下划线、连字符、点、冒号，
 #: 1–128 字符。刻意排除空白、引号、分号等 SQL / shell 元字符——不是因为下游会拼接
 #: 字符串（真实查询走参数化语句），而是让"格式一望而知安全"成为语法层面的性质，
@@ -28,10 +30,15 @@ _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 DEFAULT_AUDIT_WINDOW_HOURS = 24
 MAX_AUDIT_WINDOW_HOURS = 720
 
-#: 本地权限授权/抑制命令的原因文本上限（#319 S-P-1b 设计卡）：自由文本，非空白、
-#: ≤500 字符——足够写清楚一次特批的来龙去脉，同时防止一次输入把审计字段撑成
-#: 不可读的长文。
+#: 本地权限授权/抑制/收回命令的原因文本上限（授权/抑制：#319 S-P-1b 设计卡；
+#: 收回：卡 B 沿用同一上限）：自由文本，非空白、≤500 字符——足够写清楚一次特批
+#: 或收回的来龙去脉，同时防止一次输入把审计字段撑成不可读的长文。
 _PERMISSION_REASON_MAX_LENGTH = 500
+
+#: ``revoke_permission`` 的目标标识形状：本地权限覆盖行的内部主键前缀
+#: （``adapters/postgres_local_permission.py`` 用 ``new_id("lpo")`` 生成），不是
+#: open_id——收回命令按行本身定位，不是按用户+公司+指标定位（卡 B 设计卡）。
+_OVERRIDE_ID_PREFIX = "lpo_"
 
 _COMMAND_PREFIX = "/admin"
 
@@ -44,6 +51,7 @@ class AdminCommandKind(str, Enum):
     RESUME_USER = "resume_user"
     GRANT_PERMISSION = "grant_permission"
     SUPPRESS_PERMISSION = "suppress_permission"
+    REVOKE_PERMISSION = "revoke_permission"
     UNKNOWN = "unknown"
 
 
@@ -53,7 +61,12 @@ class AdminCommand:
 
     ``company_id``/``metric_name``/``reason`` 三个字段只有
     ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 会填（``identifier`` 复用做
-    目标用户标识，与既有 ``suspend``/``resume`` 同一惯例）。
+    目标用户标识，与既有 ``suspend``/``resume`` 同一惯例）。``REVOKE_PERMISSION``
+    只填 ``identifier``（复用同一字段承载 override_id，不是 open_id——见
+    ``_parse_revoke_permission_command`` 文档）与 ``reason``，``company_id``/
+    ``metric_name`` 保持默认 ``None``（收回按行本身定位，命令里不需要重复提供
+    这两项——它们会在 ``adapters/postgres_pending_action.py`` 的 ``prepare()``
+    里从这一行本身查出来）。
     """
 
     kind: AdminCommandKind
@@ -90,6 +103,11 @@ def parse_admin_command(text: object) -> AdminCommand:
       是尾部剩余全部 token 拼接成的自由文本，非空白、≤500 字符）
     - ``/admin suppress_permission <identifier> <company_id> <metric_name> <reason...>``
       → SUPPRESS_PERMISSION（同上，对称动作）
+    - ``/admin revoke_permission <override_id> <reason...>``
+      → REVOKE_PERMISSION（卡 B：``override_id`` 是本地权限覆盖行的内部标识
+      ``lpo_*``——26 位 Crockford Base32 ULID 前缀，与 ``core/ids.is_ulid`` 同一
+      形状校验；``reason`` 是尾部剩余全部 token 拼接成的自由文本，非空白、
+      ≤500 字符，与 grant/suppress 同一纪律）
 
     任何不匹配以上形状的输入（含空文本、非字符串、未知子命令、参数数量或形状不对、
     小时数越界）一律返回 ``UNKNOWN``——调用方据此回复帮助/拒绝文案，不猜测意图。
@@ -133,6 +151,9 @@ def parse_admin_command(text: object) -> AdminCommand:
     if sub == "suppress_permission":
         return _parse_permission_command(rest, kind=AdminCommandKind.SUPPRESS_PERMISSION)
 
+    if sub == "revoke_permission":
+        return _parse_revoke_permission_command(rest)
+
     return _unknown()
 
 
@@ -166,6 +187,36 @@ def _parse_permission_command(rest: list[str], *, kind: AdminCommandKind) -> Adm
         company_id=company_id,
         metric_name=metric_name,
         reason=reason,
+    )
+
+
+def _is_override_id(token: str) -> bool:
+    """``lpo_`` 前缀 + 26 位 Crockford Base32 ULID——与 ``core/ids.new_id("lpo")``
+    的生成形状逐字对应，复用 ``core/ids.is_ulid`` 而不是自己重写一份大小写/
+    字母表校验（全仓库唯一一份 ULID 实现，见该模块文档）。"""
+
+    if not token.startswith(_OVERRIDE_ID_PREFIX):
+        return False
+    return is_ulid(token[len(_OVERRIDE_ID_PREFIX) :])
+
+
+def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
+    """``revoke_permission`` 的解析：``<override_id> <reason...>``——只有两段，
+    比 ``_parse_permission_command`` 少 ``company_id``/``metric_name`` 两个 token
+    （收回按行本身定位，见 ``AdminCommand`` 文档）。至少需要 2 个 token（override_id
+    + 至少一个原因词）；``reason`` 拼接规则与 :func:`_parse_permission_command`
+    相同（非空白、≤500 字符）。"""
+
+    if len(rest) < 2:
+        return _unknown()
+    override_id, *reason_tokens = rest
+    if not _is_override_id(override_id):
+        return _unknown()
+    reason = " ".join(reason_tokens).strip()
+    if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
+        return _unknown()
+    return AdminCommand(
+        kind=AdminCommandKind.REVOKE_PERMISSION, identifier=override_id, reason=reason
     )
 
 

@@ -48,7 +48,10 @@ from lingxi.adapters.admin_registry import (
     seed_admin_registry_entry,
 )
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflict
+from lingxi.core.ids import new_id
+from lingxi.core.permission.local_override import OverrideDirection
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -420,6 +423,94 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
         queries = PostgresAdminQueries(self._dsn)
 
         self.assertIsNone(queries.user_status(identifier="ou_missing"))
+
+    def add_pending_action_for_override(self, *, pending_id: str) -> str:
+        """插入一条最小可用的已终态 ``pending_action`` 行，仅用于满足迁移
+        ``0072`` 的 ``pending_action_id`` 外键——与
+        ``tests/test_pending_action_postgres.py`` 的
+        ``add_bystander_pending_action`` 同一手法。"""
+
+        now = datetime.now(timezone.utc)
+        self.execute(
+            """INSERT INTO pending_action
+                   (id, action_type, target_open_id, target_state_snapshot,
+                    initiated_by_open_id, status, confirm_deadline_at,
+                    decided_at, decided_by_open_id)
+                 VALUES (%s, 'suspend_user', %s, 'enabled', %s, 'executed', %s, %s, %s)""",
+            (
+                pending_id,
+                f"ou_bystander_for_{pending_id}",
+                "ou_admin",
+                now + timedelta(minutes=10),
+                now,
+                "ou_admin",
+            ),
+        )
+        return pending_id
+
+    def test_user_status_reports_zero_overrides_when_none_exist(self) -> None:
+        """⑥/admin user 无覆盖用户输出零回归：既有两个用例（``test_user_status_
+        found``/``test_user_status_not_found``）新增字段前完全不知道
+        ``local_overrides`` 这回事，本用例显式钉住"没有覆盖行时返回空元组"这个
+        契约，防止未来改动让默认值意外变成 ``None`` 或抛异常。"""
+
+        self.add_user(open_id="ou_target", provisioning_state="active", permission_version=1)
+        queries = PostgresAdminQueries(self._dsn)
+
+        status = queries.user_status(identifier="ou_target")
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.local_overrides, ())
+
+    def test_user_status_lists_active_overrides_and_excludes_revoked_ones(self) -> None:
+        """/admin user 回显「当前生效本地覆盖」段（卡 B）：只列 active 行，
+        每行含 override_id（``lpo_*``）、方向、公司、指标、原因、创建时间；
+        已撤销的历史行不出现。"""
+
+        self.add_user(user_id="usr_target", open_id="ou_target")
+        override_store = PostgresLocalPermissionOverrideStore(self._dsn)
+
+        grant_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        active_override = override_store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.GRANT,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批授权",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=grant_pending_id,
+        )
+
+        suppress_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        revoked_override = override_store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.SUPPRESS,
+            company_id="1012",
+            metric_name="revenue",
+            reason="临时抑制",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=suppress_pending_id,
+        )
+        revoke_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        override_store.revoke(
+            override_id=revoked_override.id, revoked_pending_action_id=revoke_pending_id
+        )
+
+        queries = PostgresAdminQueries(self._dsn)
+        status = queries.user_status(identifier="ou_target")
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(len(status.local_overrides), 1, "已撤销的行不应出现")
+        override_view = status.local_overrides[0]
+        self.assertEqual(override_view.override_id, active_override.id)
+        self.assertTrue(override_view.override_id.startswith("lpo_"))
+        self.assertEqual(override_view.direction, "grant")
+        self.assertEqual(override_view.company_id, "1011")
+        self.assertEqual(override_view.metric_name, "daily_active")
+        self.assertEqual(override_view.reason, "特批授权")
+        self.assertTrue(override_view.created_at)
 
     def test_recent_events_scoped_by_identifier_and_window(self) -> None:
         now = datetime.now(timezone.utc)

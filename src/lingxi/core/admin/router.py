@@ -30,7 +30,7 @@ from lingxi.core.admin.pending_action import (
     PendingActionType,
 )
 from lingxi.core.admin.registry import AdminRegistryEntry, is_authorized_admin
-from lingxi.core.admin.views import AdminEventView, AdminUserStatusView
+from lingxi.core.admin.views import AdminEventView, AdminUserStatusView, LocalPermissionOverrideView
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,12 @@ class PendingActionPreparer(Protocol):
 
     ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）只有
     ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 两条写命令会填——``suspend``/
-    ``resume`` 沿用既有调用形状，不传这三个参数。"""
+    ``resume`` 沿用既有调用形状，不传这三个参数。``REVOKE_PERMISSION``（卡 B）
+    只传 ``target_open_id``（复用同一形参承载 override_id，不是 open_id——
+    真正的目标用户 open_id 由 ``adapters/postgres_pending_action.py`` 的
+    ``prepare()`` 按这个 override_id 查表得出，写回 ``PendingAction.
+    target_open_id`` 供卡片展示）与 ``reason``，不传 ``company_id``/
+    ``metric_name``。"""
 
     def prepare(
         self,
@@ -159,13 +164,13 @@ _CONTENT_VERSION = "internal"
 
 #: 写命令 → 审计动作名，供 :meth:`AdminCommandRouter._dispatch_write_action`
 #: 统一查表（#319 S-P-1b 从原先的二选一 suspend/resume 三元表达式泛化而来）。
-#: ``LOCAL_PERMISSION_REVOKE`` 未登记——收回命令留给卡 B，本模块不解析、也不
-#: 派发它。
+#: ``LOCAL_PERMISSION_REVOKE`` 由卡 B 登记。
 _WRITE_ACTION_NAMES: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "admin.command.suspend_user",
     PendingActionType.RESUME_USER: "admin.command.resume_user",
     PendingActionType.LOCAL_PERMISSION_GRANT: "admin.command.grant_permission",
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: "admin.command.suppress_permission",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "admin.command.revoke_permission",
 }
 
 #: 自我目标防呆的拒绝码（#319 S-P-1b 设计卡新增）：不属于接口设计「通用约定·
@@ -444,6 +449,30 @@ class AdminCommandRouter:
                 reason=command.reason,
             )
 
+        if command.kind is AdminCommandKind.REVOKE_PERMISSION:
+            assert command.identifier is not None
+            assert command.reason is not None
+            # 自我目标防呆（#319 S-P-1b 设计卡新增；卡 B 沿用同一姿态）：这里
+            # **不**重复卡 A 的 ``target_identifier == entry.feishu_open_id``
+            # 判断——``command.identifier`` 对收回命令而言是覆盖行的内部标识
+            # （override_id），不是 open_id，与管理员自己的 ``feishu_open_id``
+            # 结构上不会相等，判断也就恒假、形同虚设。真正等价的防呆在
+            # ``adapters/postgres_pending_action.py`` 的 ``prepare()``：按
+            # override_id 查到覆盖行的属主 open_id 之后再核对，理由是"收回输入
+            # 是 id，须查库后才知属主"（同语义、检查点位置不同，见
+            # ``core/admin/pending_action.py`` 模块文档）。
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
+                target_identifier=command.identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+                reason=command.reason,
+            )
+
         # UNKNOWN：语法封闭的落点——不认识的命令得到帮助/拒绝文案，绝不会被当成
         # 任何查询条件执行（`commands.py` 已把语法钉死为六选一，这里只负责回复）。
         return self._record_or_reject(
@@ -474,15 +503,26 @@ class AdminCommandRouter:
         metric_name: str | None = None,
         reason: str | None = None,
     ) -> AdminRouteOutcome:
-        """``suspend``/``resume``/``grant_permission``/``suppress_permission``
-        共用的写命令编排：角色核对 → 自我目标防呆 → ``prepare_action``（只建待
-        确认操作，不改业务状态）→ 发送确认卡片 → 回复管理员"已生成待确认操作，
-        请查收卡片"。真正的业务变更只发生在管理员本人点击卡片之后，见
-        ``core/admin/card_callback.AdminCardCallbackHandler``。
+        """``suspend``/``resume``/``grant_permission``/``suppress_permission``/
+        ``revoke_permission`` 共用的写命令编排：角色核对 → 自我目标防呆 →
+        ``prepare_action``（只建待确认操作，不改业务状态）→ 发送确认卡片 →
+        回复管理员"已生成待确认操作，请查收卡片"。真正的业务变更只发生在管理员
+        本人点击卡片之后，见 ``core/admin/card_callback.AdminCardCallbackHandler``。
 
-        ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）
-        只有 ``LOCAL_PERMISSION_GRANT``/``LOCAL_PERMISSION_SUPPRESS`` 会传，原样
-        转交给 ``prepare()``——``suspend``/``resume`` 保持既有调用形状不变。
+        ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）只有
+        ``LOCAL_PERMISSION_GRANT``/``LOCAL_PERMISSION_SUPPRESS`` 会传全部三个；
+        ``LOCAL_PERMISSION_REVOKE``（卡 B）只传 ``reason``，``company_id``/
+        ``metric_name`` 保持 ``None``——``suspend``/``resume`` 三个都不传，保持
+        既有调用形状不变。
+
+        本方法下面的自我目标防呆判断（``target_identifier == entry.
+        feishu_open_id``）对 ``LOCAL_PERMISSION_REVOKE`` 结构上恒假：收回命令的
+        ``target_identifier`` 是覆盖行的内部标识（override_id，``lpo_*``），不是
+        open_id，与管理员自己的 ``feishu_open_id`` 不会撞同一种形状——真正的
+        自我目标防呆在 ``adapters/postgres_pending_action.py`` 的 ``prepare()``
+        里（同语义、检查点位置不同，见 ``core/admin/pending_action.py`` 模块
+        文档），这里的判断分支对 revoke 保留只是因为它是显式条件门、无害地
+        永远不命中，不是又实现了第二遍。
 
         任何一步不通过都只回复文案、不产生第二条待确认操作或第二张卡片——本方法
         对每种命令最多调用一次 ``prepare()``、最多调用一次卡片发送。
@@ -631,8 +671,45 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
         "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权（需本人飞书确认卡片）\n"
         "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起本地抑制（需本人飞书确认卡片）\n"
+        "/admin revoke_permission <覆盖ID> <原因> — 发起收回本地覆盖（需本人飞书确认卡片；"
+        "覆盖ID 见 /admin user 查询结果）\n"
         f"当前角色：{role_line}"
     )
+
+
+#: 覆盖行原因文本在 ``/admin user`` 回显时的截断长度（#319 S-P-1b 卡 B 设计
+#: 卡）：不回显 reason 全文，只给足够定位这是哪一次特批/收回的前 20 字预览——
+#: 与群通知的脱敏纪律（``core/admin/notification.render_group_notice``）同一
+#: 精神，管理员查询回显不是审计全文检索入口，完整原因见对应的确认卡终态文案
+#: 或未来的审计检索。
+_OVERRIDE_REASON_PREVIEW_LENGTH = 20
+
+#: 迁移 ``0072`` ``direction`` 列取值 → 中文展示文案，只在这里（展示层）出现，
+#: 不引入对 ``core/permission/local_override.OverrideDirection`` 的依赖——本模块
+#: 拿到的是 ``LocalPermissionOverrideView.direction`` 这个已经解出来的字符串，
+#: 与 ``core/admin/notification.py`` 的 ``_ACTION_LABEL`` 同一取舍（展示文案就地
+#: 维护一份，不反向依赖纯逻辑层的枚举类型）。
+_OVERRIDE_DIRECTION_LABEL: dict[str, str] = {"grant": "授权", "suppress": "抑制"}
+
+
+def _render_local_overrides(overrides: Sequence[LocalPermissionOverrideView]) -> str:
+    """``/admin user`` 回显的「当前生效本地覆盖」段——每行一条，无覆盖时一行
+    「无本地覆盖」（#319 S-P-1b 卡 B）。"""
+
+    if not overrides:
+        return "无本地覆盖"
+    lines = []
+    for override in overrides:
+        direction_label = _OVERRIDE_DIRECTION_LABEL.get(override.direction, override.direction)
+        reason = override.reason
+        if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
+            reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
+        lines.append(
+            f"- {override.override_id}（{direction_label}）"
+            f"公司 {override.company_id} · 指标 {override.metric_name} · "
+            f"原因 {reason} · {override.created_at}"
+        )
+    return "\n".join(lines)
 
 
 def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> str:
@@ -643,7 +720,8 @@ def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> 
         f"开通状态：{status.provisioning_state}\n"
         f"账号状态：{status.account_state}\n"
         f"权限版本：{status.permission_version}\n"
-        f"更新时间：{status.updated_at}"
+        f"更新时间：{status.updated_at}\n"
+        f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides)}"
     )
 
 

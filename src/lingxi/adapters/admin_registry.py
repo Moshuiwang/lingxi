@@ -5,8 +5,9 @@
 1. :class:`PostgresAdminRegistryLookup` —— 供 :class:`lingxi.core.admin.router.
    AdminCommandRouter` 注入的默认拒绝判定端口，**每次调用都是一条新查询**，不持有
    连接、不缓存结果（"角色收回后新请求立即拒绝"这条不变量的数据库侧兑现）。
-2. :class:`PostgresAdminQueries` —— 只读查询命令组的两条查询实现，只读 `app_user`
-   与 `inbound_event`，不提供任意 SQL 拼接入口。
+2. :class:`PostgresAdminQueries` —— 只读查询命令组的查询实现，只读 `app_user`/
+   `inbound_event`/`local_permission_override`（后者只为 `user_status()` 回显
+   「当前生效本地覆盖」段，#319 S-P-1b 卡 B），不提供任意 SQL 拼接入口。
 3. :func:`seed_admin_registry_entry` —— 唯一的写路径，供
    ``apps/admin_bootstrap`` 一次性种子命令调用；幂等（同一 open_id 已有 active
    条目时不重复插入），本 Story 之外没有任何其它写入口。
@@ -17,12 +18,17 @@ from __future__ import annotations
 from typing import Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.core.admin.registry import (
     AdminRegistryEntry,
     AdminRegistrySeedConflict,
     AdminRole,
 )
-from lingxi.core.admin.views import AdminEventView, AdminUserStatusView
+from lingxi.core.admin.views import (
+    AdminEventView,
+    AdminUserStatusView,
+    LocalPermissionOverrideView,
+)
 from lingxi.core.ids import new_id
 
 
@@ -78,19 +84,25 @@ class PostgresAdminRegistryLookup:
 
 
 class PostgresAdminQueries:
-    """``AdminQueries`` 端口的真实实现：只读 ``app_user``/``inbound_event``。"""
+    """``AdminQueries`` 端口的真实实现：只读 ``app_user``/``inbound_event``/
+    ``local_permission_override``（#319 S-P-1b 卡 B：``/admin user`` 新增
+    「当前生效本地覆盖」段，是 ``/admin revoke_permission`` 的 UX 前置）。"""
 
     def __init__(
         self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
     ) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
+        # 复用已有的读路径（``effective_entries``），不在本类里重新拼一遍同样的
+        # SQL——见 ``core/admin/pending_action.py`` 与卡 B 设计卡「数据经
+        # PostgresLocalPermissionOverrideStore.effective_entries（已有）」。
+        self._local_overrides = PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
 
     def user_status(self, *, identifier: str) -> AdminUserStatusView | None:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT provisioning_state, account_state, permission_version, updated_at
+                SELECT id, provisioning_state, account_state, permission_version, updated_at
                   FROM app_user
                  WHERE feishu_open_id = %s
                 """,
@@ -99,13 +111,27 @@ class PostgresAdminQueries:
             row = cursor.fetchone()
         if row is None:
             return None
-        provisioning_state, account_state, permission_version, updated_at = row
+        user_id, provisioning_state, account_state, permission_version, updated_at = row
+        # 独立的一次读（``effective_entries`` 自己开连接）：只读查询不需要与上面
+        # 这次 ``app_user`` 读共享事务，见该方法文档"供 S-P-3 聚合复用的读路径"。
+        local_overrides = tuple(
+            LocalPermissionOverrideView(
+                override_id=stored.id,
+                direction=stored.entry.direction.value,
+                company_id=stored.entry.company_id,
+                metric_name=stored.entry.metric_name,
+                reason=stored.entry.reason,
+                created_at=_isoformat(stored.entry.created_at),
+            )
+            for stored in self._local_overrides.effective_entries(user_id=user_id)
+        )
         return AdminUserStatusView(
             identifier=identifier,
             provisioning_state=provisioning_state,
             account_state=account_state,
             permission_version=permission_version,
             updated_at=_isoformat(updated_at),
+            local_overrides=local_overrides,
         )
 
     def recent_events(

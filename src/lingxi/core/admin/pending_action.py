@@ -36,11 +36,12 @@ class PendingActionType(str, Enum):
 
     后三个成员（本地权限授权/抑制/收回）由迁移 ``0073``（#319 S-P-1b 设计卡，
     2026-08-27）扩容进 ``pending_action_action_type_check``——迁移 ``0068``
-    最初只登记了前两个 MVP 写动作。``LOCAL_PERMISSION_REVOKE`` 目前只是一个
-    可以被引用的枚举成员：``VALID_SOURCE_STATES``/``REQUIRED_ROLE`` 均未登记
-    它的取值，``core/admin/commands.py``/``core/admin/router.py`` 也不解析或
-    派发对应命令——收回的执行留给卡 B，本卡只交付授权（grant）与抑制
-    （suppress）两条全链路。
+    最初只登记了前两个 MVP 写动作。卡 A 交付了授权（grant）与抑制（suppress）
+    两条全链路；``LOCAL_PERMISSION_REVOKE`` 由卡 B（2026-08-27）补全
+    ``VALID_SOURCE_STATES``/``REQUIRED_ROLE`` 登记与 ``core/admin/commands.py``/
+    ``core/admin/router.py`` 的解析、派发——与 grant/suppress 共用同一套
+    prepare/confirm 骨架，差异见 ``adapters/postgres_pending_action.py`` 模块
+    文档「本地权限收回（revoke）如何复用同一套机制」。
     """
 
     SUSPEND_USER = "suspend_user"
@@ -88,16 +89,17 @@ TERMINAL_STATUSES = frozenset(
 #: （见 2026-08-24 决策记录「复审或替代条件」：真实管理员达到两人以上时重估角色模型），
 #: 本模块不需要改一行就能表达"停用/恢复只需要权限管理员角色"这条本来就存在的合同
 #: 要求（产品合同「权限管理员可以……准备停用、恢复」）。
-#: 本地权限授权/抑制两条同样要求 ``permission_admin`` 角色（对照现有取值惯例，
-#: 与 suspend/resume 同一角色而不是新开一个角色维度——MVP 仍是三类角色合并授予
-#: 给唯一管理员的阶段，见上面 ``SUSPEND_USER``/``RESUME_USER`` 两条的注释）。
-#: ``LOCAL_PERMISSION_REVOKE`` 未登记：其执行留给卡 B，见 ``PendingActionType``
+#: 本地权限授权/抑制/收回三条同样要求 ``permission_admin`` 角色（对照现有取值
+#: 惯例，与 suspend/resume 同一角色而不是新开一个角色维度——MVP 仍是三类角色
+#: 合并授予给唯一管理员的阶段，见上面 ``SUSPEND_USER``/``RESUME_USER`` 两条的
+#: 注释）。``LOCAL_PERMISSION_REVOKE`` 由卡 B 登记，见 ``PendingActionType``
 #: 文档。
 REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
     PendingActionType.SUSPEND_USER: AdminRole.PERMISSION_ADMIN,
     PendingActionType.RESUME_USER: AdminRole.PERMISSION_ADMIN,
     PendingActionType.LOCAL_PERMISSION_GRANT: AdminRole.PERMISSION_ADMIN,
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: AdminRole.PERMISSION_ADMIN,
+    PendingActionType.LOCAL_PERMISSION_REVOKE: AdminRole.PERMISSION_ADMIN,
 }
 
 #: 账号状态五取值中，允许发起对应动作的当前状态。合同没有独立的"终止开通"动作
@@ -110,13 +112,17 @@ REQUIRED_ROLE: dict[PendingActionType, AdminRole] = {
 #: ``account_state`` 字符串不同维度，这里的"当前状态"由
 #: ``adapters/postgres_pending_action.py`` 按 payload 键查询迁移 ``0072`` 的表
 #: 是否已有 ``entry_status='active'`` 行得出，只有两个取值
-#: ``"absent"``/``"present"``。``LOCAL_PERMISSION_REVOKE`` 未登记（留给卡 B——
-#: 收回的基线语义相反，要求键当前"present"才允许发起）。
+#: ``"absent"``/``"present"``。``LOCAL_PERMISSION_REVOKE``（卡 B）复用同一列，
+#: 但基线语义相反——按 override_id 查到的那一条覆盖行当前的 ``entry_status``
+#: （"active"/"revoked"）本身就是取值域，要求当前必须"active"才允许发起收回；
+#: 行不存在时 ``adapters/postgres_pending_action.py`` 与 grant/suppress 同一
+#: 姿态地喂入 ``None``，落进下面 ``decide_prepare`` 的"未找到"分支。
 VALID_SOURCE_STATES: dict[PendingActionType, frozenset[str]] = {
     PendingActionType.SUSPEND_USER: frozenset({"enabled"}),
     PendingActionType.RESUME_USER: frozenset({"suspended"}),
     PendingActionType.LOCAL_PERMISSION_GRANT: frozenset({"absent"}),
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: frozenset({"absent"}),
+    PendingActionType.LOCAL_PERMISSION_REVOKE: frozenset({"active"}),
 }
 
 #: 每种写动作执行后写入的目标账号状态；本地权限三类动作不改变 ``account_state``
