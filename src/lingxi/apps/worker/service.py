@@ -893,9 +893,8 @@ class WorkerService:
                 on_stream_event=on_stream_event,
                 on_tool_call=on_tool_call,
                 external_texts=self._config.external_texts,
-                # 会话 resume 失配自动降级审计事件（`worker.session_resume_miss`，
-                # 见 `turn.py::run_turn`）需要任务标识才能定位是哪个任务触发的
-                # 降级；本方法持有 `claimed.task_id`，是唯一知道它的调用层。
+                # resume 失配降级审计（worker.session_resume_miss，见 turn.py）
+                # 需要任务标识；本方法是唯一持有 claimed.task_id 的调用层。
                 task_id=claimed.task_id,
             )
         except UserMcpConfigError as error:
@@ -1108,13 +1107,10 @@ class WorkerService:
                 system_prompt_digest=system_prompt_digest,
                 guard_denied_count=guard_denied_count_for_report,
                 token_usage=token_usage_for_report,
-                # 文档投递请求（Issue #341 S-ES-3 报告契约）：只在这一轮真正判定
-                # 为业务成功的分支才转发——其余分支（stop/failure/protocol
-                # breakdown/withheld）即使 report["document_request"] 恰好非空
-                # （理论上不会：turn.py 只在 failure is None 时才填充这个字段，
-                # 但这几个分支各自有自己判成非成功的独立理由，例如 withheld 是
-                # 安全策略事后拒发正文），也绝不建文档投递请求——用户既然没有
-                # 拿到问答本身的结果，就不该收到一份可能同样有问题的文档。
+                # 文档投递请求（#341 S-ES-3 契约）：只在真正业务成功的分支转发。
+                # 其余分支（stop/failure/breakdown/withheld）即使字段恰好非空也
+                # 绝不建投递请求——用户没拿到问答结果，就不该收到对应文档
+                # （withheld=安全策略事后拒发正文等各有独立判非成功的理由）。
                 document_request=_report_document_request(report),
             )
 
