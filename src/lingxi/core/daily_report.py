@@ -888,6 +888,16 @@ def _render_local_override_activity(
     正文只含计数：不含 open_id、公司 ID、指标名或理由文本——管理群通知需要
     知道「有没有人被本地授权/抑制」这一事实级别的信号，不需要知道「是谁、
     为了哪个公司哪个指标、理由是什么」，与 `V-花名册-34` 的隐私纪律同向。
+
+    **措辞如实化（Trace #328 opus 审查）**：正文用「本窗口」不用「今日」——本段
+    与本报告其余六段统计的是同一个 UTC 窗口，而这个窗口实际是「昨天」（`[D-1, D)`，
+    模块文档「投递结果段为什么用一个独立、更早的窗口」一节旁的既有约定），把它说成
+    「今日」并不准确。正文用「登记」不用「生效」——四源合并（`apps/scheduler/
+    permission_refresh.py::_refresh_user`）挂在 `aggregate.granted` 判据**之后**，
+    一个当前没有任何银河权限的用户走的是撤权分支，从不到达本地覆盖合并那一步；
+    「当前生效」这句话对这类用户不成立（#319 动机场景，`V-权限-15` 的显式已知
+    限制），「登记」只断言"这一行确实写进了本地覆盖表"，不断言它此刻是否真的
+    影响了这个人的最终权限——不虚假宣称。
     """
 
     if section is None:
@@ -899,9 +909,9 @@ def _render_local_override_activity(
     if activity is None:
         return ""
     return (
-        f"本地权限覆盖活动：今日新增 授权 {activity.granted_today} 笔、"
+        f"本地权限覆盖活动：本窗口新增 授权 {activity.granted_today} 笔、"
         f"抑制 {activity.suppressed_today} 笔、收回 {activity.revoked_today} 笔；"
-        f"当前生效 授权 {activity.active_grant_total} 条、"
+        f"当前登记 授权 {activity.active_grant_total} 条、"
         f"抑制 {activity.active_suppress_total} 条，"
         f"涉及 {activity.affected_user_count} 位用户"
     )

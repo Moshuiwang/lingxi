@@ -430,6 +430,65 @@ class QueryUserCommandTests(unittest.TestCase):
         self.assertNotIn(long_reason, outcome.reply_text, "reason 不得回显全文")
         self.assertNotIn("无本地覆盖", outcome.reply_text)
 
+    def test_a_user_with_local_overrides_carries_the_zero_galaxy_permission_caveat(self) -> None:
+        """零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus
+        审查 P1）：有本地覆盖行时，输出必须提示"若该用户当前无任何银河权限，
+        本地授权暂不生效"——四源合并挂在 `aggregate.granted` 判据之后，这类用户
+        的本地授权此刻结构上不生效，不能让管理员误以为查询到覆盖行就等于生效。"""
+
+        override = LocalPermissionOverrideView(
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            direction="grant",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            created_at="2026-08-24T00:00:00+00:00",
+        )
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                    local_overrides=(override,),
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("若该用户当前无任何银河权限，本地授权暂不生效", outcome.reply_text)
+        self.assertIn("V-权限-15", outcome.reply_text)
+
+    def test_a_user_without_local_overrides_does_not_carry_the_caveat(self) -> None:
+        """否定断言：没有任何本地覆盖行时不该出现这句提示——这是提示，不是
+        对每个用户都成立的通用免责声明。"""
+
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertNotIn("暂不生效", outcome.reply_text)
+
 
 class QueryAuditCommandTests(unittest.TestCase):
     def test_events_rendered_and_query_scoped_by_default_window(self) -> None:

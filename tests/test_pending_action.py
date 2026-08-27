@@ -161,6 +161,24 @@ class DecidePrepareLocalPermissionTests(unittest.TestCase):
         self.assertFalse(decision.ok)
         self.assertEqual(decision.code, "not_found")
 
+    def test_grant_rejection_message_does_not_mention_resume(self) -> None:
+        """拒绝文案按类型分化（Trace #328 opus 审查升级的 P2）：此前本地权限三类
+        动作全部落进"suspend 之外都当 resume 处理"的 ``else`` 分支，字面导向
+        "请去 /admin resume"——对一个授权命令毫无意义，是一条真实的误导面。"""
+
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, current_account_state="present"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+    def test_suppress_rejection_message_does_not_mention_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, current_account_state="present"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
+
 
 class DecidePrepareRevokeTests(unittest.TestCase):
     """卡 B 新增：``LOCAL_PERMISSION_REVOKE`` 的基线语义与 grant/suppress 相反
@@ -188,6 +206,24 @@ class DecidePrepareRevokeTests(unittest.TestCase):
         )
         self.assertFalse(decision.ok)
         self.assertEqual(decision.code, "not_found")
+
+    def test_revoke_not_found_message_talks_about_the_override_not_a_user(self) -> None:
+        """拒绝文案按类型分化：收回场景下 ``current_account_state is None`` 说的是
+        "没查到这一条本地权限登记"——``target_open_id`` 形参此刻装的是
+        override_id，不是任何人的身份标识，通用的"未找到该用户记录"说错了对象。"""
+
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state=None
+        )
+        self.assertNotIn("用户", decision.message)
+        self.assertIn("本地权限", decision.message)
+
+    def test_revoke_rejection_message_does_not_mention_resume(self) -> None:
+        decision = decide_prepare(
+            action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, current_account_state="revoked"
+        )
+        self.assertNotIn("恢复", decision.message)
+        self.assertIn("本地权限", decision.message)
 
 
 class SuspendResumeMappingsUnchangedTests(unittest.TestCase):

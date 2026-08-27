@@ -48,8 +48,20 @@ CHECK 的默认命名（``<表名>_<列名>_check``），与 ``0059`` 的 ``task
 "双向等价"写法：本地权限三类动作（授权/抑制/收回）**必须**携带非空白 ``payload``
 （``confirm()`` 需要从中解析出公司×指标×原因才能执行），``suspend_user``/
 ``resume_user`` 两类**必须不**携带 ``payload``（它们的执行参数已经是
-``target_open_id``/``target_state_snapshot`` 本身，不需要额外结构化数据）。两种
-自相矛盾的行都在数据库层面拒绝，不依赖应用层每次都记得同步维护这条对应关系。
+``target_open_id``/``target_state_snapshot`` 本身，不需要额外结构化数据）。
+
+**这条 CHECK 只管「存在性」，不校验内容形状（措辞更正，Trace #328 opus 审查）**：
+两种「存在性」层面自相矛盾的行——本地权限三类动作却没有 ``payload``（或整段
+空白），或 ``suspend_user``/``resume_user`` 却带了 ``payload``——在数据库层面
+被拒绝，不依赖应用层每次都记得同步维护这条最基本的对应关系。但它**不**校验
+``payload`` 是不是合法 JSON、键是否齐全（``company_id``/``metric_name``/
+``reason``）——一段非空白但形状不对的文本（例如 ``"x"``）照样能通过这条 CHECK。
+那部分校验是应用层的职责：写路径 ``adapters/postgres_pending_action.py`` 的
+``prepare()`` 自己构造 payload、形状天然正确；读路径的容错在展示层
+（``core/admin/notification.py`` 的 ``_permission_payload``：``json.loads`` 失败
+时不崩溃，渲染降级提示而不是静默丢弃「范围」段）。此前的措辞（"两种自相矛盾的
+行都在数据库层面拒绝"）读起来像是这条 CHECK 兜底了全部形状异常，是一句超额声明，
+这里改写成如实的范围。
 """
 
 from __future__ import annotations

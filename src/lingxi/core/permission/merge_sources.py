@@ -87,7 +87,7 @@ PermissionAggregate`，隐含假设是"两个调用点都消费翻译层产出�
 不在本卡。这里提前定死签名（``Mapping[str, Sequence[str]] | None``，默认 ``None``），
 避免 S-P-2 落地时需要改这个纯函数的对外签名、牵连两个已经接好线的调用点。``None``
 时对结果**恒等**（不参与任何键、不影响任何值）——见 ``tests/test_permission_merge_sources.py``
-的 ``LegacyNoneIsIdentityTests``。非通配、非 ``None`` 时的合并规则与本地授权对称：
+的 ``LegacyIdentityTests``。非通配、非 ``None`` 时的合并规则与本地授权对称：
 参与并集，**不参与抑制**（``legacy`` 没有"抑制"概念——它只是"这个键本来就该在"，
 被本地抑制命中同样会被减掉，因为减法作用于并集之后的结果，与这个键是从银河、本地
 授权还是存量沿用来的无关）。

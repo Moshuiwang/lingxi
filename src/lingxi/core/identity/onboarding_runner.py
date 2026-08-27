@@ -387,6 +387,14 @@ class LocalOverrideSource(Protocol):
     def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
 
 
+class PublishHistorySource(Protocol):
+    """「这个人在发布链上有没有留下过足迹」的只读口（红线-1，legacy 有界化，
+    Trace #328 opus 审查；对称于 ``apps/scheduler/permission_refresh._PublishHistory``，
+    各自一份因为 ``core/`` 不 import ``apps/``）。"""
+
+    def has_publish_footprint(self, user_id: str) -> bool: ...
+
+
 class ReadinessConfirmer(Protocol):
     """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness.McpReadinessConfirmation``）。"""
 
@@ -498,6 +506,7 @@ class AutoOnboardingRunner:
         publish_allowed: Callable[[], bool] | None = None,
         onboarding_failed: Callable[[str, str], None] | None = None,
         local_overrides: LocalOverrideSource | None = None, legacy_source: LegacyPermissionTable | None = None,
+        publish_history: PublishHistorySource | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -561,6 +570,9 @@ class AutoOnboardingRunner:
         self._onboarding_failed = onboarding_failed
         # 本地权限覆盖读取口（S-P-3）与存量权限只读源（S-P-2 #328）：均为 ``None``＝装配层未接线，行为与改动前逐字节一致。
         self._local_overrides, self._legacy_source = local_overrides, legacy_source
+        # 发布足迹只读口（红线-1）：``None``（未接线）按"保守未知"处理，legacy 一律
+        # 不参与，不冒自反馈环风险（见 ``_resolve_legacy_source``）。
+        self._publish_history = publish_history
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -1309,9 +1321,16 @@ class AutoOnboardingRunner:
         # `galaxy` 是现算的职能标签映射（onboarding 尚未接翻译层），详见 `merge_sources.py` 模块文档「挂点」一节；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
         galaxy_map = {ALL_COMPANIES_KEY: aggregate.functions} if aggregate.all_companies else {company: aggregate.functions for company in aggregate.companies}
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=resolve_legacy_source(email=request.email, table=self._legacy_source, audit=self._audit, action="onboarding.legacy_source_skipped", user=user_id))
+        legacy = self._resolve_legacy_source(user_id, request.email, galaxy_map)
+        merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=legacy)
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
+        if not merged.permissions:
+            # 红线-2：galaxy_map 非空（`_match` 已确保 granted），但本地抑制把合并
+            # 结果压光到空字典。onboarding 是首次建行，空内容的新建行对 MCP 无意义，
+            # 归类为确定性业务失败（同 `_match` 的 `not granted → _not_authorized`），
+            # 不落到 `build_translated_publish_row` 对空输入的 `ValueError`。
+            return _not_authorized("fully_suppressed_by_local_override")
         row = build_translated_publish_row(
             company_metrics=merged.permissions,
             email=request.email,
@@ -1350,6 +1369,28 @@ class AutoOnboardingRunner:
             logger.error("本地权限覆盖读取失败，本次开通跳过本地源 user=%s error=%s", user_id, type(error).__name__)
             return None
         return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _resolve_legacy_source(
+        self, user_id: str, email: str, galaxy_map: Mapping[str, Sequence[str]]
+    ) -> dict[str, tuple[str, ...]] | None:
+        """红线-1 有界条件（对称于 ``permission_refresh.py`` 同名方法，理由见该方法
+        与 ``legacy_source.py``「有界条件」文档，这里不复述）：通配用户
+        （``ALL_COMPANIES_KEY``）或该用户已有发布足迹（含 ``publish_history`` 未
+        接线时的保守判断）都不参与，只有从未发布过才读存量源——即使首次开通结构上
+        通常还没有足迹，一条因下游失败重跑的链也可能让 :meth:`_publish` 第二次
+        调用，重蹈自反馈环风险。"""
+
+        if ALL_COMPANIES_KEY in galaxy_map:
+            return None
+        if self._publish_history is None or self._publish_history.has_publish_footprint(user_id):
+            return None
+        return resolve_legacy_source(
+            email=email,
+            table=self._legacy_source,
+            audit=self._audit,
+            action="onboarding.legacy_source_skipped",
+            user=user_id,
+        )
 
     def _await_published(self, outbox_id: str) -> _Terminal | None:
         """等发布意图真的被写出去并逐字段读回一致。

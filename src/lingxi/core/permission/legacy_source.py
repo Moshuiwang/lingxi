@@ -54,12 +54,41 @@ Base 标识或记录内容片段）。
 :func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 的通配分支里
 生效——该分支直接返回 ``galaxy_map``、完全不读 ``legacy`` 参数，因此本模块读到的存量
 权限即使非空，也会在合并这一步被丢弃，不需要在读取侧重复判断一次。
+
+## 有界条件：只在「Lingxi 从未为该用户成功发布过」时参与合并（红线-1，Trace #328 opus 审查）
+
+**本模块读的表与发布通道写的是同一张表**（正式权限发布表
+``adapters/feishu_permission_bitable.BitablePermissionTable``）。如果不加边界，会形成
+一个自反馈环：Lingxi 今天发布收窄后的权限 → 写进这张表 → 明天这一轮重算把这一行当作
+「存量沿用」读回来、并进合并结果 → 收窄被自己昨天写的内容原样抵消，指标降权/公司收窄
+**永远不会真正生效**，且因为内容与上一条 ``pending``/``published`` 意图逐字段相同，
+``record_decision`` 会判 ``UNCHANGED``，连一条新审计都不会有——从审计上完全看不出这个
+回归正在发生（审查探针坐实）。
+
+因此两个调用点（``apps/scheduler/permission_refresh.py`` 的 ``_refresh_user``、
+``core/identity/onboarding_runner.py`` 的 ``_publish``）在调用
+:func:`resolve_legacy_source` 之前，先查该用户在发布链上「有没有留下过足迹」
+（:meth:`~lingxi.adapters.postgres_permission_publish.PostgresPermissionPublishStore.
+has_publish_footprint`——与撤权侧复用的同一个只读口，见
+``apps/scheduler/permission_refresh.py`` 模块文档「撤权」一节）：
+
+- **有过足迹**（发布成功过，或当前还有 ``pending``/``publishing`` 的意图在途）：
+  legacy 直接按 ``None`` 处理，**且不调用** :func:`read_legacy_permissions`（连
+  ``find_rows`` 都不发起，省一次读放大）——这张表此刻很可能已经是 Lingxi 自己写的
+  内容，不再是「旧系统遗留、我们从未碰过」的存量。
+- **从未有过足迹**：legacy 照旧参与合并——这才是「存量沿用」要覆盖的真实场景：这个
+  人的权限行是旧系统 biai-agent 写的，Lingxi 第一次为他结算发布内容时，要把这份旧
+  权限并进来，不能让「切到 Lingxi」变成一次静默降权。
+
+这条边界只影响**是否读取并参与合并**，不改变 :func:`merge_permission_sources` 本身
+（`legacy=None` 恒等，模块文档「``legacy`` 参数」一节）——有界化发生在调用方，本模块
+与合并层都不需要知道"为什么这次是 None"。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any, Protocol
+from collections.abc import Sequence
+from typing import Protocol
 
 from lingxi.core.permission.account_match import normalize_email
 from lingxi.core.permission.publish import ExistingPermissionRow
@@ -71,7 +100,7 @@ REASON_LEGACY_MULTIPLE_ROWS = "multiple_rows"
 REASON_LEGACY_KEY_MISMATCH = "record_key_mismatch"
 #: 命中的行 permissions 列解析失败（空文本 / 非法 JSON / 形状不对）。
 REASON_LEGACY_UNPARSEABLE = "unparseable"
-#: 传输层调用失败（find_rows/read_row 抛出的异常，含 PermissionTableError 与其余未预期异常）。
+#: 传输层调用失败（find_rows 抛出的异常，含 PermissionTableError 与其余未预期异常）。
 REASON_LEGACY_READ_FAILED = "read_failed"
 
 
@@ -92,19 +121,22 @@ class LegacySourceError(RuntimeError):
 
 
 class LegacyPermissionTable(Protocol):
-    """正式权限发布表的只读子集——只声明 ``find_rows``/``read_row`` 两个方法。
+    """正式权限发布表的只读子集——只声明 ``find_rows`` 一个方法（读放大修复，Trace #328
+    opus 审查 P2：``find_rows`` 的整表分页扫描已经把命中行的全部字段带回来了，见
+    :meth:`~lingxi.adapters.feishu_permission_bitable.BitablePermissionTable.find_rows`
+    的实现——逐条 ``ExistingPermissionRow.fields`` 就是那一行在列表接口里返回的完整
+    字段映射，不需要再对同一行发一次 ``read_row`` 详情查询）。
 
     实现是 :class:`~lingxi.adapters.feishu_permission_bitable.BitablePermissionTable`
-    （签名不改：装配层把同一个实例既喂给发布执行器，也喂给本协议）。故意不声明
-    ``create_row``/``update_row``：本模块只读，把写方法排除在类型之外，让"存量沿用
-    路径不会意外写这张表"这件事在类型上就说得清楚——与
+    （签名不改：装配层把同一个实例既喂给发布执行器，也喂给本协议，那个类仍然保留
+    ``read_row``/``create_row``/``update_row`` 给发布执行器用，本协议只声明存量沿用
+    路径真正用到的这一个方法）。故意不声明写方法：本模块只读，把它们排除在类型之外，
+    让"存量沿用路径不会意外写这张表"这件事在类型上就说得清楚——与
     :class:`~lingxi.apps.scheduler.permission_refresh._TokenCipherReader` 只声明
     一个只读方法同一条理由。
     """
 
     def find_rows(self, *, record_key: str, email: str) -> Sequence[ExistingPermissionRow]: ...
-
-    def read_row(self, record_id: str) -> Mapping[str, Any]: ...
 
 
 class _AuditSink(Protocol):
@@ -135,12 +167,10 @@ def read_legacy_permissions(
     if not matches[0].matches_key(normalized):
         raise LegacySourceError(REASON_LEGACY_KEY_MISMATCH)
 
-    try:
-        fields = table.read_row(matches[0].record_id)
-    except Exception as error:  # noqa: BLE001 - 同上
-        raise LegacySourceError(REASON_LEGACY_READ_FAILED, detail=type(error).__name__) from error
-
-    text = readback_text(fields.get("permissions"))
+    # 读放大修复（Trace #328 opus 审查 P2）：`find_rows` 的整表分页扫描已经把命中行
+    # 的全部字段带回来了（见 `LegacyPermissionTable` 文档），直接用它，不再对同一行
+    # 发第二次 `read_row` 详情查询——省一次外部表往返。
+    text = readback_text(matches[0].fields.get("permissions"))
     try:
         return parse_permissions(text)
     except ValueError as error:
