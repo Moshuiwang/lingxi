@@ -319,6 +319,35 @@ class MetricCoverageGap:
 
 
 @dataclass(frozen=True)
+class LocalOverrideActivity:
+    """本地权限覆盖当日活动与当前生效总量的非空结果（Issue #319 S-P-1c，管理员
+    经确认卡对个别用户完成的授权/抑制/收回，见迁移 ``0072``/``0073``）。
+
+    只在**存在**当日活动或当前有生效条目时才会被构造——「无差异」（当日零活动
+    且当前生效总数为零）由 :func:`build_local_override_activity` 返回 ``None``
+    表达，与 :class:`MetricCoverageGap` 同一条「无差异不报」纪律（该类文档
+    「只在存在未覆盖指标时才会被构造」一节）。
+    """
+
+    #: 当日（对齐日报既有 UTC 日界统计窗口）新增的授权/抑制笔数，按 `direction`
+    #: 分列。
+    granted_today: int
+    suppressed_today: int
+    #: 当日被收回的笔数，**不分原方向**——收回是同一行状态翻转（迁移 `0072`
+    #: 文件头部「为什么用『同一行状态翻转』」），一笔收回既可能翻转自一条历史
+    #: grant 行也可能翻转自 suppress 行；读者需要的是「今天发生了几次收回操作」
+    #: 这一个数字，拆成两个方向反而制造虚假精度（哪个方向被收回不改变这个事实）。
+    revoked_today: int
+    #: 当前生效（`entry_status = 'active'`）条目总数，按方向分列——与「当日新增
+    #: 笔数」不是同一件事：历史上分多天新增、至今未被收回的条目都计入这里。
+    active_grant_total: int
+    active_suppress_total: int
+    #: 当前生效条目覆盖的去重用户数（两个方向取并集）——同一用户可能同时命中
+    #: 多条公司×指标覆盖，本字段回答「影响了多少个人」而不是「有多少行」。
+    affected_user_count: int
+
+
+@dataclass(frozen=True)
 class DailyReportInputs:
     """一轮通报要渲染的全部数据，每段各自可能「不可判定」。"""
 
@@ -354,6 +383,20 @@ class DailyReportInputs:
     #: 放在字段列表末尾并给默认值，是为了不打破既有全部调用点（生产代码与测试）
     #: 现有的关键字参数构造方式——本字段是纯新增，不重排、不改动任何既有字段。
     metric_coverage_gap: "Section[MetricCoverageGap | None] | None" = None
+    #: 「本地权限覆盖活动」段（Issue #319 S-P-1c）。三态语义与
+    #: :attr:`metric_coverage_gap` 完全一致（只是数据源换成 `local_permission_
+    #: override` 表，见 ``apps/scheduler/daily_report.py`` 的装配文档）：
+    #:
+    #: - ``None``（未接线，默认值）：本轮**没有尝试**读取——正文完全不出现这一段；
+    #: - ``Section.undetermined(reason)``：接线了，但本轮取数失败——正文出现一行
+    #:   不可判定说明；
+    #: - ``Section.of(None)``：接线了，真查了，当日零活动且当前生效总数为零——
+    #:   「无差异不报」，正文同样不出现这一段；
+    #: - ``Section.of(activity)``（非空）：存在当日活动或当前有生效条目，正文
+    #:   出现「本地权限覆盖活动」段，只含计数，不含 open_id/公司/指标名/理由。
+    #:
+    #: 同样放在字段列表末尾并给默认值，理由与 `metric_coverage_gap` 相同。
+    local_override_activity: "Section[LocalOverrideActivity | None] | None" = None
 
 
 # --------------------------------------------------------------------------
@@ -586,6 +629,46 @@ def build_metric_coverage_gap(
     return MetricCoverageGap(uncovered_metric_ids=tuple(gap))
 
 
+def build_local_override_activity(
+    *,
+    granted_today: int,
+    suppressed_today: int,
+    revoked_today: int,
+    active_grant_total: int,
+    active_suppress_total: int,
+    affected_user_count: int,
+) -> LocalOverrideActivity | None:
+    """从适配器的哑聚合（``COUNT(*) FILTER``/``COUNT(DISTINCT ...)``，见
+    ``adapters/postgres_local_permission.py::PostgresLocalPermissionOverrideStore.
+    daily_activity_stats``）构造 :class:`LocalOverrideActivity`（Issue #319
+    S-P-1c）：纯集合运算，不做任何 I/O。
+
+    **无差异不报**：当日零新增（`granted_today == suppressed_today ==
+    revoked_today == 0`）且当前生效总数为零（`active_grant_total ==
+    active_suppress_total == 0`）时返回 ``None``，调用方据此不往正文里插入这
+    一段——与 :func:`build_metric_coverage_gap` 同一条「判定过，没有问题」纪律，
+    不是「取不到」。`affected_user_count` 不单独参与这条判断：两个方向的生效
+    总数都是零时，覆盖它们的去重用户数结构上也必然是零，不需要重复核对。
+    """
+
+    if (
+        granted_today == 0
+        and suppressed_today == 0
+        and revoked_today == 0
+        and active_grant_total == 0
+        and active_suppress_total == 0
+    ):
+        return None
+    return LocalOverrideActivity(
+        granted_today=granted_today,
+        suppressed_today=suppressed_today,
+        revoked_today=revoked_today,
+        active_grant_total=active_grant_total,
+        active_suppress_total=active_suppress_total,
+        affected_user_count=affected_user_count,
+    )
+
+
 # --------------------------------------------------------------------------
 # 渲染：纯函数，输入相同则输出逐字节相同
 # --------------------------------------------------------------------------
@@ -793,6 +876,37 @@ def _render_metric_coverage_gap(section: "Section[MetricCoverageGap | None] | No
     )
 
 
+def _render_local_override_activity(
+    section: "Section[LocalOverrideActivity | None] | None",
+) -> str:
+    """「本地权限覆盖活动」段（Issue #319 S-P-1c）。返回空字符串表示这一段完全
+    不出现——与 :func:`_render_metric_coverage_gap` 同一姿态：未接线
+    （``section is None``）与「接线了、查过、当日无变化且当前无生效条目」
+    （``section.value is None``）都返回空字符串，见
+    :attr:`DailyReportInputs.local_override_activity` 的三态说明。
+
+    正文只含计数：不含 open_id、公司 ID、指标名或理由文本——管理群通知需要
+    知道「有没有人被本地授权/抑制」这一事实级别的信号，不需要知道「是谁、
+    为了哪个公司哪个指标、理由是什么」，与 `V-花名册-34` 的隐私纪律同向。
+    """
+
+    if section is None:
+        return ""
+    if not section.is_determined:
+        assert section.undetermined_reason is not None
+        return f"本地权限覆盖活动：{_render_undetermined(section.undetermined_reason)}"
+    activity = section.value
+    if activity is None:
+        return ""
+    return (
+        f"本地权限覆盖活动：今日新增 授权 {activity.granted_today} 笔、"
+        f"抑制 {activity.suppressed_today} 笔、收回 {activity.revoked_today} 笔；"
+        f"当前生效 授权 {activity.active_grant_total} 条、"
+        f"抑制 {activity.active_suppress_total} 条，"
+        f"涉及 {activity.affected_user_count} 位用户"
+    )
+
+
 def render_daily_report(
     inputs: DailyReportInputs,
     *,
@@ -830,4 +944,7 @@ def render_daily_report(
     coverage_line = _render_metric_coverage_gap(inputs.metric_coverage_gap)
     if coverage_line:
         lines.extend(["", coverage_line])
+    local_override_line = _render_local_override_activity(inputs.local_override_activity)
+    if local_override_line:
+        lines.extend(["", local_override_line])
     return "\n".join(lines)

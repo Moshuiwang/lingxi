@@ -189,6 +189,7 @@ def build_duty(
     clock: FixedClock | None = None,
     stop: threading.Event | None = None,
     metric_coverage=None,
+    local_override_activity=None,
 ) -> tuple[DailyReportDuty, dict[str, object]]:
     parts = {
         "source": source or FakeSource(),
@@ -206,6 +207,7 @@ def build_duty(
         clock=parts["clock"],
         stop=stop,
         metric_coverage=metric_coverage,
+        local_override_activity=local_override_activity,
     )
     return duty, parts
 
@@ -691,6 +693,103 @@ class MetricCoverageWiringTests(unittest.TestCase):
 
         assert text is not None
         self.assertNotIn("待分配", text)
+
+
+class LocalOverrideActivityWiringTests(unittest.TestCase):
+    """「本地权限覆盖活动」段的职责层接线（Issue #319 S-P-1c）：未接线不出现、
+    接线且取数失败留不可判定审计（只关本段，其余段照常）、接线且有活动出现在
+    正文与审计里、零活动零生效不出现。
+    """
+
+    @staticmethod
+    def _stub(
+        *, granted: int = 0, suppressed: int = 0, revoked: int = 0, active_grant: int = 0,
+        active_suppress: int = 0, affected: int = 0,
+    ):
+        def _fetch(*, window_start, window_end):
+            return (granted, suppressed, revoked, active_grant, active_suppress, affected)
+
+        return _fetch
+
+    def test_unwired_produces_no_section_and_the_rest_still_sends(self) -> None:
+        """回调缺席：只关本段，其余段照常——`daily_report.sent` 恰一条，
+        `undetermined_sections` 里不出现 `local_override_activity`。"""
+
+        duty, parts = build_duty(local_override_activity=None)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("本地权限覆盖活动", text)
+        self.assertIn("活跃用户", text)  # 其余段落照常渲染
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("local_override_activity", sent_fields["undetermined_sections"])
+
+    def test_a_failing_fetch_is_marked_undetermined_and_the_rest_still_sends(self) -> None:
+        def _boom(*, window_start, window_end):
+            raise RuntimeError("模拟本地权限覆盖查询失败")
+
+        duty, parts = build_duty(local_override_activity=_boom)
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("本地权限覆盖活动", text)
+        self.assertIn("不可判定", text)
+        # 单段失败不拖累其余段落——活跃用户段的真实数字照常出现。
+        self.assertIn("活跃用户", text)
+        section_reads = parts["audit"].fields_for("daily_report.section_read_failed")
+        self.assertTrue(
+            any(entry["section"] == "local_override_activity" for entry in section_reads)
+        )
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertIn("local_override_activity", sent_fields["undetermined_sections"])
+
+    def test_todays_activity_appears_in_the_sent_text_with_correct_counts(self) -> None:
+        duty, parts = build_duty(
+            local_override_activity=self._stub(
+                granted=2, suppressed=1, revoked=1, active_grant=5, active_suppress=3, affected=6
+            )
+        )
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertIn("本地权限覆盖活动", text)
+        self.assertIn("授权 2 笔", text)
+        self.assertIn("抑制 1 笔", text)
+        self.assertIn("收回 1 笔", text)
+        self.assertIn("涉及 6 位用户", text)
+        sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
+        self.assertNotIn("local_override_activity", sent_fields["undetermined_sections"])
+
+    def test_zero_activity_and_zero_active_total_produces_no_section(self) -> None:
+        duty, parts = build_duty(local_override_activity=self._stub())
+
+        text = duty.run_once()
+
+        assert text is not None
+        self.assertNotIn("本地权限覆盖活动", text)
+
+    def test_the_fetch_is_called_with_the_primary_report_window_not_the_delivery_window(
+        self,
+    ) -> None:
+        """本段与其余五段共用主统计窗口（`window_start`/`window_end`），不是
+        投递结果段那个独立的更早窗口——对齐日报既有 UTC 日界口径（任务卡明确
+        要求）。"""
+
+        observed: list[tuple] = []
+
+        def _fetch(*, window_start, window_end):
+            observed.append((window_start, window_end))
+            return (0, 0, 0, 0, 0, 0)
+
+        duty, parts = build_duty(local_override_activity=_fetch)
+        duty.run_once()
+
+        self.assertEqual(len(observed), 1)
+        active_users_window = parts["source"].calls["active_user_task_counts"][0]
+        self.assertEqual(observed[0], active_users_window)
 
 
 if __name__ == "__main__":

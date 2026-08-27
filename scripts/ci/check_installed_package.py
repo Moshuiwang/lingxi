@@ -525,6 +525,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # import 了独立的 watermark 适配器，理由相同。
             "lingxi.adapters.postgres_daily_report",
             "lingxi.adapters.postgres_daily_report_watermark",
+            # 「本地权限覆盖活动」段（Issue #319 S-P-1c）：
+            # `_build_local_override_activity_check` 在函数内 import 本地权限
+            # 覆盖表的读路径，与上面两个通报 adapter 同一条"函数内 import 证明
+            # 不了装得上"的理由；该 adapter 模块级 import 了
+            # `core.permission.local_override` 的纯类型（`LocalPermissionOverrideEntry`/
+            # `OverrideDirection`），因此一并登记（与 gateway 闭包里 S-P-1b 那条
+            # 同款传递依赖同一姿态，见下方 gateway 组「本地权限授权/抑制全链路」）。
+            "lingxi.adapters.postgres_local_permission",
+            "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`
