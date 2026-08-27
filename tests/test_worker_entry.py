@@ -167,6 +167,8 @@ class FakeAgentSDK:
         terminal_reason: str | None = None,
         usage_source: str = "mock",
         skip_pre_tool_use: bool = False,
+        resume_miss_stderr_line: str | None = None,
+        resume_miss_persists: bool = False,
     ) -> None:
         self.script = list(script)
         self.options = []
@@ -187,6 +189,21 @@ class FakeAgentSDK:
         self.skip_pre_tool_use = skip_pre_tool_use
         # 步骤走完后抛异常：模拟「已有绕过调用、随后传输又失败」的叠加形状。
         self.raise_after_steps: Exception | None = None
+        # 会话 resume 失配自动降级（2026-08-27 生产事故 #2）：非 None 时，
+        # 一次尝试的 `options.resume` 非空（或 `resume_miss_persists=True` 时
+        # 不论有没有 resume）就不回放 `script`，改为先把这行文本喂给
+        # `options.stderr(...)`（真实 `_handle_stderr` 对每行子进程 stderr 的
+        # 调用形状），再抛出一个**不携带**这行原文的通用异常——与
+        # `claude_agent_sdk` 0.2.128 的 `ProcessError` 真实形状同构
+        # （见 `turn.py` 顶部对该源码的说明）。这样测试走的是生产环境唯一
+        # 可靠的信号路径（`_sdk_stderr_sink`），不是靠测试自己在异常文本里
+        # 塞特征串取巧。
+        self.resume_miss_stderr_line = resume_miss_stderr_line
+        # True 时资源耗尽/失配特征在**每一次**尝试（含退回无 resume 后的重试）
+        # 都会重演，用来测试「重试后仍失败」与「无 resume 任务零行为差异」两种
+        # 场景——前者验证降级只发生一次，后者验证没有 resume 就不会进入降级
+        # 分支，即使特征信号照样出现。
+        self.resume_miss_persists = resume_miss_persists
 
     def install(self, testcase) -> "FakeAgentSDK":
         module = types.ModuleType("claude_agent_sdk")
@@ -232,9 +249,31 @@ class FakeAgentSDK:
                 harness.prompts.append(prompt)
 
             def receive_response(self):
+                if harness.resume_miss_stderr_line is not None and (
+                    harness.resume_miss_persists or getattr(self.options, "resume", None)
+                ):
+                    return harness._play_resume_miss(self.options)
                 return harness._play(self.options)
 
         return StubClient
+
+    async def _play_resume_miss(self, options):
+        """回放"这次尝试撞见 resume 失配"的最小脚本。
+
+        不发任何正常消息：真实 CLI 子进程对此的形状是直接以非零退出收场，
+        `run_single_turn` 从 `receive_response()` 的迭代里直接拿到一个裸异常
+        （对齐 `_read_messages_impl` 的 `ProcessError` 路径）。
+        """
+
+        stderr_sink = getattr(options, "stderr", None)
+        if callable(stderr_sink):
+            stderr_sink(self.resume_miss_stderr_line)
+        if False:
+            yield  # pragma: no cover - 强制这是一个异步生成器
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
 
     async def _play(self, options):
         counter = 0
@@ -522,6 +561,151 @@ class WorkerWiringTest(unittest.TestCase):
         report = asyncio.run(executor.run_turn("查一下频道收视率"))
 
         self.assertEqual(report["failure"]["code"], "session_failed")
+
+
+class SessionResumeFallbackTest(unittest.TestCase):
+    """会话 resume 失配自动降级（2026-08-27 生产事故 #2）。
+
+    worker 容器 HOME=/tmp，CLI 会话文件随容器重建消失，但库里
+    ``conversation.agent_session_id`` 仍指向那个已经不存在的会话——下一条消息据此
+    resume 时，真实 CLI 子进程会以 "No conversation found with session ID: ..."
+    非零退出（这行原文只在子进程**自己的 stderr**，`_sdk_stderr_sink` 是唯一可靠
+    的信号入口，见 ``turn.py`` 顶部对 SDK 源码的说明）。这里验证
+    ``WorkerTurnExecutor.run_turn`` 在**同一次调用内**自动退回无 resume 的全新
+    会话重试一次，且只有这一种特征失配才触发、只触发一次、不触碰没有 resume 的
+    任务。
+    """
+
+    _FAKE_SESSION_ID = "9f472b7e-6c1f-4c1a-8f39-6a2f6c9d7c31"
+
+    def _resume_miss_line(self) -> str:
+        return f"No conversation found with session ID: {self._FAKE_SESSION_ID}"
+
+    @staticmethod
+    def _events(captured: io.StringIO) -> list:
+        return [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+
+    def test_a_resume_miss_falls_back_to_a_fresh_session_and_succeeds(self) -> None:
+        """①：失配特征命中 → 自动退回无 resume 重试一次，成功报告 + 审计事件。
+
+        变异锚点：删掉 `run_turn` 里的降级分支（`if (... resume_fallback_
+        applied ...): ... continue`）会让这个用例变红——报告会停在第一次尝试的
+        `session_failed`，不会有第二次会话尝试。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK(
+            [{"kind": "text", "text": "已完成。"}],
+            resume_miss_stderr_line=self._resume_miss_line(),
+        )
+        sdk.install(self)
+
+        captured = io.StringIO()
+        executor = WorkerTurnExecutor(load_config(worker_env()), stderr_stream=captured)
+        report = asyncio.run(
+            executor.run_turn(
+                "查一下频道收视率",
+                resume_session_id=self._FAKE_SESSION_ID,
+                task_id="task-001",
+            )
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        self.assertEqual(report["turn"]["final_text"], "已完成。")
+        self.assertEqual(len(sdk.options), 2, "必须恰好两次会话尝试：原始 resume + 一次降级重试")
+        self.assertIsNone(getattr(sdk.options[1], "resume", None), "重试必须是无 resume 的全新会话")
+
+        events = self._events(captured)
+        resume_miss_events = [e for e in events if e["event"] == "worker.session_resume_miss"]
+        self.assertEqual(len(resume_miss_events), 1)
+        self.assertEqual(resume_miss_events[0]["task_id"], "task-001")
+        self.assertNotIn(self._FAKE_SESSION_ID, captured.getvalue(), "审计输出不得含会话 id 明文")
+
+    def test_a_non_matching_session_failed_does_not_retry(self) -> None:
+        """②否定测试（哨兵）：resume 已设置，但失败文本不带失配特征——不得重试，
+        真实故障必须原样收口成 ``session_failed``，不能被这次降级掩盖。
+
+        变异锚点：把 `_looks_like_session_resume_miss` 改成恒真会让这个用例变
+        红——一次普通的传输失败也会被误判成失配特征，触发一次不该发生的重试。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = RuntimeError("connection reset by peer")
+        sdk.install(self)
+
+        captured = io.StringIO()
+        executor = WorkerTurnExecutor(load_config(worker_env()), stderr_stream=captured)
+        report = asyncio.run(
+            executor.run_turn(
+                "查一下频道收视率",
+                resume_session_id=self._FAKE_SESSION_ID,
+                task_id="task-002",
+            )
+        )
+
+        self.assertEqual(report["failure"]["code"], "session_failed")
+        self.assertEqual(len(sdk.options), 1, "非失配特征的失败不得触发降级重试")
+        events = self._events(captured)
+        self.assertFalse(any(e["event"] == "worker.session_resume_miss" for e in events))
+
+    def test_a_resume_miss_that_persists_only_retries_once(self) -> None:
+        """③：重试之后仍然撞见同样的失配特征——只重试一次，最终仍是失败终态。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK(
+            [{"kind": "text", "text": "不会被回放到"}],
+            resume_miss_stderr_line=self._resume_miss_line(),
+            resume_miss_persists=True,
+        )
+        sdk.install(self)
+
+        captured = io.StringIO()
+        executor = WorkerTurnExecutor(load_config(worker_env()), stderr_stream=captured)
+        report = asyncio.run(
+            executor.run_turn(
+                "查一下频道收视率",
+                resume_session_id=self._FAKE_SESSION_ID,
+                task_id="task-003",
+            )
+        )
+
+        self.assertEqual(report["failure"]["code"], "session_failed")
+        self.assertFalse(report["turn"]["closed"])
+        self.assertEqual(len(sdk.options), 2, "必须恰好重试一次，不能因为再次撞见同样特征而继续重试")
+        events = self._events(captured)
+        resume_miss_events = [e for e in events if e["event"] == "worker.session_resume_miss"]
+        self.assertEqual(len(resume_miss_events), 1, "降级审计事件只应出现一次")
+
+    def test_a_task_without_resume_is_unaffected(self) -> None:
+        """④：没有 resume 的任务即使撞见同样的失配特征文本，也不得进入降级分支
+        ——它本来就没有一个"要退回"的旧会话，必须与改动前零行为差异。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK(
+            [{"kind": "text", "text": "不会被回放到"}],
+            resume_miss_stderr_line=self._resume_miss_line(),
+            resume_miss_persists=True,
+        )
+        sdk.install(self)
+
+        captured = io.StringIO()
+        executor = WorkerTurnExecutor(load_config(worker_env()), stderr_stream=captured)
+        report = asyncio.run(executor.run_turn("查一下频道收视率", task_id="task-004"))
+
+        self.assertEqual(report["failure"]["code"], "session_failed")
+        self.assertEqual(len(sdk.options), 1, "没有 resume 就不该有第二次尝试")
+        events = self._events(captured)
+        self.assertFalse(any(e["event"] == "worker.session_resume_miss" for e in events))
 
 
 class ReadOnlyBoundaryTest(unittest.TestCase):
