@@ -32,6 +32,7 @@ from lingxi.adapters.postgres_permission_publish import (
     PublishClaimLost,
 )
 from lingxi.apps.scheduler.permission_publish import DEFAULT_PUBLISH_LIMIT
+from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     DEFAULT_MAX_ATTEMPTS,
     PermissionPublishExecutor,
@@ -437,6 +438,188 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("DELETE FROM app_user WHERE id = %s", (USER_A,))
         self.assertEqual(self._count(), 0)
+
+
+class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
+    """``record_decision(clear_delivered_content=True)`` 接入权限变化感知即清
+    （Trace #328 S-P-5，迁移 0061 预留的 ``user_cleared`` 分类值）：真正推进版本时，
+    在**同一个数据库事务**里顺带清空该用户在途未送达（已送达、随会话保留）的投递
+    正文，并排队失效当前 Agent 会话——与 ``tests/test_pending_action_postgres.py::
+    SuspendPurgeRealDbTests``（suspend_user 复用的同一个底层接口）同一手法、同一组
+    断言形状，这里钉的是 ``record_decision`` 这一个新增入口自己的行为。"""
+
+    def seed_delivered_conversation(
+        self, *, conversation_id: str, task_id: str, user_id: str, agent_session_id: str
+    ) -> None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO conversation
+                       (id, user_id, feishu_chat_id, feishu_thread_id, agent_session_id)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    conversation_id,
+                    user_id,
+                    f"chat-{conversation_id}",
+                    f"topic-{conversation_id}",
+                    agent_session_id,
+                ),
+            )
+            cursor.execute(
+                """INSERT INTO task
+                       (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                        target_worker_version, attempts, content_expires_at)
+                   VALUES (%s, %s, %s, %s, '问题', 'awaiting_delivery', 'stable', 1, now())""",
+                (task_id, conversation_id, user_id, f"event-{task_id}"),
+            )
+            cursor.execute(
+                """INSERT INTO task_delivery_event
+                       (id, task_id, sequence, event_type, terminal_kind, worker_id,
+                        idempotency_key, platform_received_at, content)
+                   VALUES (%s, %s, 1, 'terminal', 'success', 'worker-1', %s, now(), '已送达的答案')""",
+                (new_id("tde"), task_id, f"{task_id}:terminal"),
+            )
+
+    def delivered_content(self, *, task_id: str) -> str | None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT content FROM task_delivery_event WHERE task_id = %s", (task_id,))
+            return cursor.fetchone()[0]
+
+    def agent_session_id_of(self, *, conversation_id: str) -> str | None:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT agent_session_id FROM conversation WHERE id = %s", (conversation_id,)
+            )
+            return cursor.fetchone()[0]
+
+    def pending_cleanup_reasons(self, *, agent_session_id: str) -> list[str]:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT reason FROM agent_session_cleanup WHERE agent_session_id = %s",
+                (agent_session_id,),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def test_a_changed_decision_clears_delivered_content_and_queues_session_cleanup(self) -> None:
+        """①：权限变化（新版本，非 UNCHANGED）→ 该用户在途未送达正文被清 + 清出计数
+        进 ``PermissionDecision.cleared_events`` + Agent 会话清理入队（0061 队列既有
+        断言形状：``reason='user_cleared'``）。"""
+
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p1", task_id="tsk-p1", user_id=USER_A, agent_session_id="sess-p1"
+        )
+
+        decision = self.store.record_decision(
+            user_id=USER_A,
+            row=_row(),
+            reason="daily_permission_refresh",
+            decided_at=NOW,
+            clear_delivered_content=True,
+        )
+
+        self.assertEqual(decision.outcome, DecisionOutcome.ENQUEUED)
+        self.assertEqual(decision.cleared_events, 1)
+        self.assertIsNone(self.delivered_content(task_id="tsk-p1"))
+        self.assertIsNone(
+            self.agent_session_id_of(conversation_id="cnv-p1"), "硬失效：立即置空，不等两小时规则"
+        )
+        self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p1"), ["user_cleared"])
+
+    def test_an_unchanged_decision_clears_nothing(self) -> None:
+        """②（否定）：``UNCHANGED`` 时压根没有清理动作发生。"""
+
+        self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+        )
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p2", task_id="tsk-p2", user_id=USER_A, agent_session_id="sess-p2"
+        )
+
+        decision = self.store.record_decision(
+            user_id=USER_A,
+            row=_row(),
+            reason="daily_permission_refresh",
+            decided_at=NOW + timedelta(days=1),
+            clear_delivered_content=True,
+        )
+
+        self.assertEqual(decision.outcome, DecisionOutcome.UNCHANGED)
+        self.assertEqual(decision.cleared_events, 0)
+        self.assertEqual(self.delivered_content(task_id="tsk-p2"), "已送达的答案")
+        self.assertEqual(self.agent_session_id_of(conversation_id="cnv-p2"), "sess-p2")
+        self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p2"), [])
+
+    def test_the_switch_defaults_to_off_for_callers_like_first_onboarding(self) -> None:
+        """开关默认关闭：首次开通既有调用形状不传它时，即使这次决定真的
+        ``ENQUEUED``，也不触碰任何会话——这是"开通链侧不接"的运行期落点。"""
+
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p3", task_id="tsk-p3", user_id=USER_A, agent_session_id="sess-p3"
+        )
+
+        decision = self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="first_onboarding", decided_at=NOW
+        )
+
+        self.assertEqual(decision.outcome, DecisionOutcome.ENQUEUED)
+        self.assertEqual(decision.cleared_events, 0)
+        self.assertEqual(self.delivered_content(task_id="tsk-p3"), "已送达的答案")
+        self.assertEqual(self.agent_session_id_of(conversation_id="cnv-p3"), "sess-p3")
+        self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p3"), [])
+
+    def test_a_purge_failure_rolls_back_the_whole_decision(self) -> None:
+        """③：清理与决定写入**同一个事务**——注入清理失败，版本推进与发布意图入队
+        随事务一起回滚（响亮，不留半套状态），已经"清空"的正文因为从未真正提交，
+        回滚后原样还在。"""
+
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p4", task_id="tsk-p4", user_id=USER_A, agent_session_id="sess-p4"
+        )
+
+        with mock.patch(
+            "lingxi.adapters.postgres_permission_publish._ConversationTransaction"
+            ".clear_delivered_content_for_user",
+            side_effect=RuntimeError("注入的清理失败"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.record_decision(
+                    user_id=USER_A,
+                    row=_row(),
+                    reason="daily_permission_refresh",
+                    decided_at=NOW,
+                    clear_delivered_content=True,
+                )
+
+        self.assertEqual(self._version(), 0, "推进的版本必须随事务一起回滚")
+        self.assertEqual(self._count(), 0, "入队的发布意图必须随事务一起回滚")
+        self.assertEqual(
+            self.delivered_content(task_id="tsk-p4"),
+            "已送达的答案",
+            "清理从未真正提交，正文必须原样还在——不是「清了又恢复」，是「根本没发生过」",
+        )
+        self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p4"), [])
+
+    def test_other_users_content_is_not_touched(self) -> None:
+        """④：其他用户的正文、会话指针、清理队列完全不受影响。"""
+
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p5a", task_id="tsk-p5a", user_id=USER_A, agent_session_id="sess-p5a"
+        )
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p5b", task_id="tsk-p5b", user_id=USER_B, agent_session_id="sess-p5b"
+        )
+
+        self.store.record_decision(
+            user_id=USER_A,
+            row=_row(),
+            reason="daily_permission_refresh",
+            decided_at=NOW,
+            clear_delivered_content=True,
+        )
+
+        self.assertIsNone(self.delivered_content(task_id="tsk-p5a"))
+        self.assertEqual(self.delivered_content(task_id="tsk-p5b"), "已送达的答案")
+        self.assertEqual(self.agent_session_id_of(conversation_id="cnv-p5b"), "sess-p5b")
+        self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p5b"), [])
 
 
 class ClaimTest(PermissionPublishPostgresTestCase):

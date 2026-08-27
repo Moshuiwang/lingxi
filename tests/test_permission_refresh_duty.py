@@ -314,21 +314,47 @@ class FakeLegacyTable:
 
 
 class _FakeDecision:
-    def __init__(self, enqueued: bool) -> None:
+    def __init__(self, enqueued: bool, *, cleared_events: int = 0) -> None:
         self.enqueued = enqueued
+        self.cleared_events = cleared_events
 
 
 class FakeDecisions:
-    def __init__(self, *, unchanged_users: set[str] | None = None, failing_users: set[str] | None = None) -> None:
+    """``record_decision`` 的假实现。``cleared_events_by_user`` 配置「假装真的清出了
+    多少条在途未送达正文事件」（S-P-5，Trace #328）——只在 ``enqueued`` 且调用方传了
+    ``clear_delivered_content=True`` 时才会被使用，与真实 ``record_decision`` 的
+    "``UNCHANGED`` 恒为 0、清理开关必须调用方显式打开"同一条语义，供
+    :class:`DeliveredContentPurgeTest` 钉住职责层的接入面。"""
+
+    def __init__(
+        self,
+        *,
+        unchanged_users: set[str] | None = None,
+        failing_users: set[str] | None = None,
+        cleared_events_by_user: dict[str, int] | None = None,
+    ) -> None:
         self.calls: list[dict] = []
         self._unchanged = unchanged_users or set()
         self._failing = failing_users or set()
+        self._cleared_events_by_user = cleared_events_by_user or {}
 
-    def record_decision(self, *, user_id, row, reason, decided_at):
+    def record_decision(
+        self, *, user_id, row, reason, decided_at, clear_delivered_content: bool = False
+    ):
         if user_id in self._failing:
             raise RuntimeError("注入的落库失败")
-        self.calls.append({"user_id": user_id, "row": row, "reason": reason, "decided_at": decided_at})
-        return _FakeDecision(user_id not in self._unchanged)
+        self.calls.append(
+            {
+                "user_id": user_id,
+                "row": row,
+                "reason": reason,
+                "decided_at": decided_at,
+                "clear_delivered_content": clear_delivered_content,
+            }
+        )
+        enqueued = user_id not in self._unchanged
+        cleared = self._cleared_events_by_user.get(user_id, 0) if clear_delivered_content and enqueued else 0
+        return _FakeDecision(enqueued, cleared_events=cleared)
 
 
 class FixedClock:
@@ -1440,6 +1466,121 @@ class RevocationPublishTest(unittest.TestCase):
         rendered = " ".join(f"{key}={value}" for key, value in fields.items())
         for secret in (EMAIL_ONE, NAME_ONE, EMPLOYEE_ONE, COMPANY_ID, TOKEN_CIPHER):
             self.assertNotIn(secret, rendered)
+
+
+# --------------------------------------------------------------------------
+# 五、在途未送达正文同步清（S-P-5，Trace #328）
+# --------------------------------------------------------------------------
+
+
+class DeliveredContentPurgeTest(unittest.TestCase):
+    """授权、撤权两条路径都必须把 ``clear_delivered_content=True`` 传给
+    ``record_decision``；真正"要不要清、清没清、清了多少条"由 ``record_decision``
+    自己的同一个事务决定（真库证据在 ``tests/test_permission_publish_postgres.py``），
+    本职责这里只钉两件纯逻辑面的事：**接入面**（开关确实传了）与**审计面**（清理
+    发生时记一条不含正文的计数审计，``UNCHANGED`` 时不记）。
+    """
+
+    def test_a_grant_passes_the_clear_switch(self) -> None:
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        self.assertTrue(parts["decisions"].calls[0]["clear_delivered_content"])
+
+    def test_a_revocation_passes_the_clear_switch(self) -> None:
+        duty, parts = build_duty(
+            identities=(identity(),), published_users={USER_ONE}, galaxy=galaxy_snapshot(roles=())
+        )
+
+        duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        self.assertTrue(parts["decisions"].calls[0]["clear_delivered_content"])
+
+    def test_a_granted_change_that_actually_clears_something_is_audited_with_the_count(self) -> None:
+        decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 3})
+        duty, parts = build_duty(identities=(identity(),), decisions=decisions)
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0], {"user": USER_ONE, "cleared": 3})
+
+    def test_a_grant_that_clears_nothing_is_still_audited_with_a_zero_count(self) -> None:
+        """一个刚被授权、还没有任何历史会话的人：清理**发生过**（record_decision 真的
+        跑了这一步），只是清出 0 条——审计如实记 0，不因为"没清到东西"就整条略过。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 0}])
+
+    def test_an_unchanged_grant_is_not_audited_as_a_clear(self) -> None:
+        """否定断言：``UNCHANGED`` 时清理根本没有发生（``record_decision`` 内部只在
+        真的推进版本时才碰 ``clear_delivered_content_for_user``），因此不记这条审计
+        ——即使调用方一样传了 ``clear_delivered_content=True``。"""
+
+        decisions = FakeDecisions(unchanged_users={USER_ONE}, cleared_events_by_user={USER_ONE: 5})
+        duty, parts = build_duty(identities=(identity(),), decisions=decisions)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+
+    def test_a_revocation_that_actually_clears_something_is_audited_with_the_count(self) -> None:
+        decisions = FakeDecisions(cleared_events_by_user={USER_ONE: 2})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            galaxy=galaxy_snapshot(roles=()),
+            decisions=decisions,
+        )
+
+        duty.run_once()
+
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 2}])
+
+    def test_an_unchanged_revocation_is_not_audited_as_a_clear(self) -> None:
+        decisions = FakeDecisions(unchanged_users={USER_ONE}, cleared_events_by_user={USER_ONE: 5})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            galaxy=galaxy_snapshot(roles=()),
+            decisions=decisions,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.unchanged, 1)
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+
+    def test_a_skipped_revocation_without_any_published_row_never_reaches_record_decision(self) -> None:
+        """从无发布行的撤权用户零发布意图（既有断言）：连 ``record_decision`` 都没被
+        调用，自然也不会有任何清理或清理审计——不是"清了 0 条"，是"这一步压根没发生"。
+        """
+
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy_snapshot(roles=()))
+
+        duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [])
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
+
+    def test_onboarding_never_sees_this_switch(self) -> None:
+        """形状断言：重算职责源码里只有这一个新增关键字，且只出现在两处调用——
+        证明"首次开通不接入"不是靠运气（onboarding_runner.py 是另一个模块，
+        本断言不扫描它；这里只钉本职责自己确实把开关焊死在授权、撤权两条路径上，
+        不是某条可以被第三条调用点悄悄绕过的可选项）。"""
+
+        source = duty_code()
+        self.assertEqual(source.count("clear_delivered_content=True"), 2)
 
 
 class IncompleteInputTest(unittest.TestCase):

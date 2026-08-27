@@ -1,7 +1,7 @@
 """权限决定与发布意图的 PostgreSQL 存取（Issue #156 / S-C-01）。
 
 表结构与逐条理由以迁移 ``0064_permission_publish_outbox`` 为准，本模块不复述。这里只
-落实三件在**代码里**才成立的事：
+落实四件在**代码里**才成立的事：
 
 1. **同事务**：一次权限决定把 ``app_user`` 的权限版本推进与 ``publish_outbox`` 的发布
    意图写在**同一个事务**里。回滚之后库里既没有新版本，也没有孤立的发布意图
@@ -16,6 +16,12 @@
    不改 ``created_at``，没有这一条它会在同一轮里被立刻重新认领（Epic C 冻结缺陷 F2）。
 3. **到期擦除**：``payload`` 里有邮箱与姓名，九十天上限由 :meth:`redact_expired_payloads`
    把它擦成 ``'{}'`` 落实（迁移文件头部有为什么不进 ``0054`` 受限清理函数的取舍）。
+4. **权限变化感知即清**（Trace #328 S-P-5）：:meth:`record_decision` 的
+   ``clear_delivered_content=True`` 在**同一事务**里顺带清空该用户全部会话已送达、
+   随会话保留的投递正文，接入迁移 ``0061`` 早就给"权限变化感知"预留的
+   ``user_cleared`` 分类值。默认关闭，只由每日刷新的授权、撤权两条路径
+   （``apps/scheduler/permission_refresh.py``）显式打开——为什么不对首次开通也打开，
+   见 :meth:`record_decision` 文档「为什么是调用方显式传入的开关」一节。
 
 **没有新增 ``app_user.publish_state`` 列**：数据库设计蓝本里有这一列，当前迁移链没有
 建它。发布进度已经完整地由 ``publish_outbox.status`` 承载，再加一列等于制造第二个真相
@@ -36,6 +42,7 @@ from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.adapters.postgres_conversation import _Transaction as _ConversationTransaction
 from lingxi.core.ids import new_id
 from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
@@ -79,6 +86,12 @@ class PermissionDecision:
     user_id: str
     permission_version: int
     outbox_id: str | None = None
+    # 本次决定顺带清掉的「已送达、随会话保留」投递正文事件数（Trace #328 S-P-5）。
+    # 只有 ``record_decision(clear_delivered_content=True)`` 且真的推进了版本
+    # （``outcome`` 为 ``ENQUEUED``）时才可能非零；``UNCHANGED`` 恒为 0——内容没变，
+    # 没有清理动作发生。默认 0 而不是 ``None``：调用方（``permission_refresh.py``）
+    # 把它直接写进审计计数字段，``None`` 会让那条审计行需要多一次判空。
+    cleared_events: int = 0
 
     @property
     def enqueued(self) -> bool:
@@ -147,7 +160,13 @@ class PostgresPermissionPublishStore:
     # ------------------------------------------------------------------
 
     def record_decision(
-        self, *, user_id: str, row: PublishRow, reason: str, decided_at: datetime | None = None
+        self,
+        *,
+        user_id: str,
+        row: PublishRow,
+        reason: str,
+        decided_at: datetime | None = None,
+        clear_delivered_content: bool = False,
     ) -> PermissionDecision:
         """把一次权限决定与它的发布意图写进**同一个事务**。
 
@@ -163,6 +182,31 @@ class PostgresPermissionPublishStore:
            相同但那条意图已经 ``failed``/``superseded`` 时**照常排新意图**——内容没变
            不等于已经发布成功，把它压成"无变化"会让一次失败的发布永远没人再试。
         3. 推进 ``app_user.permission_version`` 并插入意图。
+        4. ``clear_delivered_content=True`` 且这次真的走到了第 3 步（即将返回
+           ``ENQUEUED``）时，在**同一个事务**里追加一次
+           ``clear_delivered_content_for_user``，清空该用户全部会话已送达、随会话
+           保留的投递正文，并排队失效当前 Agent 会话（Trace #328 S-P-5）。
+           ``reason`` 固定传 ``user_cleared``——迁移 ``0061`` 早就给「停用感知、权限
+           变化感知」两类触发预留的分类值，这里接入的正是其中"权限变化感知"那一半；
+           ``UNCHANGED`` 分支不清理，内容没变没有什么需要失效。
+
+        **为什么是调用方显式传入的开关，不是本方法内部自己判断"这是权限变化所以该
+        清"**：本方法同时服务首次开通（``core/identity/onboarding_runner.py``，
+        ``reason=first_onboarding``）与每日刷新的授权、撤权两条路径
+        （``apps/scheduler/permission_refresh.py``）。首次开通的用户结构上还没有
+        任何历史会话——为一个刚建档的人去锁 ``conversation``/``task_delivery_event``
+        除了白付一次查询和两把用不上的行锁没有任何效果。默认 ``False`` 让首次开通
+        这条路径保持结构上"不碰"，不依赖"反正没数据所以无害"这种偶然；只有明确
+        代表权限变化感知的两个调用点（每日刷新的授权、撤权分支）才把它打开。
+
+        **同一事务、同一姿态**：``adapters/postgres_pending_action.py`` 的
+        ``PostgresPendingActionStore.confirm()`` 在 ``suspend_user`` 执行分支里，
+        用它已经持有 ``app_user`` 行锁的同一个连接构造
+        ``postgres_conversation._Transaction`` 并调用
+        ``clear_delivered_content_for_user``，让清理排队与 ``account_state`` 翻转、
+        审计写入落在同一个数据库事务——这是本方法第 4 步复用的同一个姿态：清理若
+        失败，第 3 步刚推进的 ``permission_version`` 与刚入队的发布意图随事务一起
+        回滚，不会出现"权限已经变了、旧正文却还留着"的半套状态。
 
         ``decided_at`` 只用于 ``permission_checked_at``；发布行里的时间戳已经在
         ``row.updated_at`` 里冻结好了（见 ``core/permission/publish_row.py``）。
@@ -228,8 +272,20 @@ class PostgresPermissionPublishStore:
                         permission_version=version,
                         tx=connection,
                     )
+
+                cleared_events = 0
+                if clear_delivered_content:
+                    # 同一个连接、同一个事务：上面 SELECT ... FOR UPDATE 拿到的
+                    # app_user 行锁在这里仍然有效，enqueue_publish 的 INSERT 也还
+                    # 没提交。清理若抛异常，version 推进与发布意图入队随事务一起
+                    # 回滚（方法文档第 4 步、"同一事务、同一姿态"两节）。
+                    cleared_events = _ConversationTransaction(connection).clear_delivered_content_for_user(
+                        user_id=user_id, reason="user_cleared"
+                    )
         logger.info("权限发布意图已排入 user=%s version=%s reason=%s", user_id, version, reason)
-        return PermissionDecision(DecisionOutcome.ENQUEUED, user_id, version, outbox_id)
+        return PermissionDecision(
+            DecisionOutcome.ENQUEUED, user_id, version, outbox_id, cleared_events=cleared_events
+        )
 
     def enqueue_publish(
         self,
