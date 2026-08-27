@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from lingxi.core.admin.pending_action import (
+    LOCAL_PERMISSION_ACTION_TYPES,
     PENDING_ACTION_TTL_SECONDS,
     PendingAction,
     PendingActionStatus,
@@ -46,10 +47,22 @@ _ACTION_LABEL: dict[PendingActionType, str] = {
     PendingActionType.LOCAL_PERMISSION_REVOKE: "收回",
 }
 
+#: 零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus 审查 P1）：
+#: 只在**授权**这条动作的确认卡上出现——四源合并挂在 `aggregate.granted` 判据之后，
+#: 一个当前没有任何银河权限的用户走的是撤权分支，本地授权此刻不生效；本地抑制则
+#: 无此问题（银河那一侧本就是零，抑制与否结果一样，不会制造虚假期待）。判据本身
+#: 不在这里改（产品裁定项，编排者已挂待裁），只如实提示这条边界，见
+#: `core/admin/router.py::_ZERO_GALAXY_PERMISSION_CAVEAT` 同一条边界在 `/admin user`
+#: 输出侧的呼应。
+_ZERO_GALAXY_PERMISSION_CAVEAT = "若该用户当前无任何银河权限，本地授权暂不生效（边界见 V-权限-15）。"
+
 _IMPACT_TEXT: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "该用户将立即无法发起新的问数或开通；已在进行中的任务不受影响、正常完成交付。",
     PendingActionType.RESUME_USER: "该用户将恢复可以正常问数；此前被收回的权限不会自动恢复。",
-    PendingActionType.LOCAL_PERMISSION_GRANT: "该用户将获得下方指定公司×指标的问数权限（本地授权，独立于银河翻译结果，不影响其余已有权限）。",
+    PendingActionType.LOCAL_PERMISSION_GRANT: (
+        "该用户将获得下方指定公司×指标的问数权限（本地授权，独立于银河翻译结果，"
+        f"不影响其余已有权限）。{_ZERO_GALAXY_PERMISSION_CAVEAT}"
+    ),
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该用户将被限制访问下方指定公司×指标（本地抑制优先级最高，即使银河翻译结果授予也会被拦截）。",
     PendingActionType.LOCAL_PERMISSION_REVOKE: "下方指定的本地覆盖行将被收回，不再影响该用户的权限聚合结果（银河翻译结果与其余本地覆盖不受影响）。",
 }
@@ -92,15 +105,37 @@ def _direction_prefix(payload: dict[str, Any]) -> str:
     return f"方向：{label}\n"
 
 
-def _permission_scope_block(pending: PendingAction) -> str:
-    """确认卡/终态卡正文里的"范围+原因"多行区块（含结尾换行）；非本地权限动作
-    返回空字符串——调用方按行拼接，空字符串不产生多余空行。收回额外插入一行
-    "方向：..."（说明被收回的是授权还是抑制，卡 B 设计卡「含被收回的方向/公司/
-    指标」），授权/抑制两类动作不受影响（见 :func:`_direction_prefix`）。"""
+#: payload 异常时的降级文案（Trace #328 opus 审查 P2）：非本地权限动作的
+#: "范围+原因"区块结构上就不存在（本来就该是空字符串），但**本地权限动作**的
+#: payload 解析失败（缺失、非法 JSON、非对象）此前会静默退化成同一个空字符串——
+#: 管理员看到的确认卡直接漏掉"范围：公司 ... · 指标 ..."这一行，等于让他在不知道
+#: 自己要授权/抑制/收回哪个公司哪个指标的情况下点确认。改成显式的降级提示，
+#: 而不是让这条本该出现的信息悄悄消失。
+_SCOPE_UNAVAILABLE_TEXT = "范围信息不可用，请取消本卡重新发起。\n"
 
+
+def _permission_scope_block(pending: PendingAction) -> str:
+    """确认卡/终态卡正文里的"范围+原因"多行区块（含结尾换行）。
+
+    非本地权限动作（``suspend``/``resume``）返回空字符串——这类动作结构上就没有
+    范围概念，调用方按行拼接，空字符串不产生多余空行。
+
+    本地权限三类动作（授权/抑制/收回）的 payload 解析失败时**不再静默返回空
+    字符串**（Trace #328 opus 审查 P2：那会让管理员在确认卡上完全看不到"范围"
+    这一行，误以为这张卡不涉及具体范围，实际是数据异常被吞掉了）——改为渲染
+    :data:`_SCOPE_UNAVAILABLE_TEXT` 这行显式降级提示，指引管理员取消本卡重新
+    发起，而不是带着一个他没看到的范围去确认。
+
+    正常解析成功时，收回额外插入一行"方向：..."（说明被收回的是授权还是抑制，
+    卡 B 设计卡「含被收回的方向/公司/指标」），授权/抑制两类动作不受影响
+    （见 :func:`_direction_prefix`）。
+    """
+
+    if pending.action_type not in LOCAL_PERMISSION_ACTION_TYPES:
+        return ""
     payload = _permission_payload(pending)
     if payload is None:
-        return ""
+        return _SCOPE_UNAVAILABLE_TEXT
     company_id = payload.get("company_id", "")
     metric_name = payload.get("metric_name", "")
     reason = payload.get("reason", "")

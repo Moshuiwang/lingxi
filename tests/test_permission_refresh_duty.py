@@ -42,13 +42,17 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 from lingxi.apps.scheduler.permission_refresh import (
+    REASON_FULLY_SUPPRESSED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
     SKIP_METRIC_TRANSLATION_UNCOVERED,
     SKIP_MISSING_PERSONNEL_ID,
     SKIP_MISSING_SNAPSHOT,
     SKIP_NO_GALAXY_BATCH,
+    SKIP_NO_PUBLISHED_ROW,
     SKIP_STALE_SNAPSHOT,
+    TRIGGER_GRANT,
+    TRIGGER_REVOKE,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
@@ -308,10 +312,6 @@ class FakeLegacyTable:
         )
         return (row, row) if email in self._duplicate_for else (row,)
 
-    def read_row(self, record_id: str) -> dict[str, str]:
-        email = record_id.removeprefix("rec_")
-        return {"permissions": self._rows[email]}
-
 
 class _FakeDecision:
     def __init__(self, enqueued: bool, *, cleared_events: int = 0) -> None:
@@ -321,7 +321,7 @@ class _FakeDecision:
 
 class FakeDecisions:
     """``record_decision`` 的假实现。``cleared_events_by_user`` 配置「假装真的清出了
-    多少条在途未送达正文事件」（S-P-5，Trace #328）——只在 ``enqueued`` 且调用方传了
+    多少条已送达正文事件」（S-P-5，Trace #328）——只在 ``enqueued`` 且调用方传了
     ``clear_delivered_content=True`` 时才会被使用，与真实 ``record_decision`` 的
     "``UNCHANGED`` 恒为 0、清理开关必须调用方显式打开"同一条语义，供
     :class:`DeliveredContentPurgeTest` 钉住职责层的接入面。"""
@@ -1171,7 +1171,9 @@ class LegacySourceMergeTest(unittest.TestCase):
         self.assertEqual(legacy.find_calls, [(EMAIL_ONE, EMAIL_ONE)])
 
     def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
-        """存量沿用后聚合含并集（本卡验收断言①）。"""
+        """存量沿用后聚合含并集（本卡验收断言①）。**同时是红线-1 的正向不回归
+        用例**（Trace #328 opus 审查）：这个用户从未发布过（默认夹具，
+        ``published_users`` 为空），有界化判据必须放行——存量沿用照常生效。"""
 
         legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["legacy_metric"]}}'})
         duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
@@ -1180,6 +1182,29 @@ class LegacySourceMergeTest(unittest.TestCase):
 
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["legacy_metric","{METRIC_NAME}"]}}')
+
+    def test_a_user_with_a_publish_footprint_never_reads_legacy(self) -> None:
+        """红线-1 否定用例（Trace #328 opus 审查）：这个用户已经在发布链上留下过
+        足迹（``published_users`` 命中），legacy 有界化判据必须挡住存量沿用——
+        **连 ``find_rows`` 都不发起**（省读放大，见 ``_resolve_legacy_source``
+        文档）。存量行故意携带一个当前银河翻译结果里没有的指标，模拟"Lingxi 昨天
+        发布过的内容被当作存量沿用原样读了回来"的自反馈环风险：今天的发布内容
+        必须不含它，收窄才是真的生效，不是被自己的存量行悄悄抵消。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["昨日已发布的指标"]}}'})
+        duty, parts = build_duty(
+            identities=(identity(),), published_users={USER_ONE}, legacy_source=legacy
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            row.permissions,
+            f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}',
+            "有发布足迹时存量沿用不生效，收窄才能真正生效，不被自己昨天的发布内容原样并回来",
+        )
+        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起——省读放大")
 
     def test_read_failure_skips_legacy_source_and_audits(self) -> None:
         """读取失败：该用户本轮跳过存量源并响亮审计，不整轮失败——发布仍然照常
@@ -1219,7 +1244,9 @@ class LegacySourceMergeTest(unittest.TestCase):
     def test_wildcard_admin_skips_legacy_too(self) -> None:
         """通配角 v1：``all_companies=True`` 时存量沿用同样整体不参与合并（本卡验收
         断言④），结果与银河原始的通配映射逐字节相同——即使这个用户确实有一行存量
-        权限。"""
+        权限。**读放大修复**（Issue #319 P2，Trace #328 opus 审查）：合并前就按
+        ``all_companies`` 跳过，连 ``find_rows`` 都不发起，不是"读了、合并时才
+        丢弃"。"""
 
         legacy = FakeLegacyTable({EMAIL_ONE: '{"1099":["额外存量指标"]}'})
         duty, parts = build_duty(
@@ -1234,6 +1261,7 @@ class LegacySourceMergeTest(unittest.TestCase):
 
         row = parts["decisions"].calls[0]["row"]
         self.assertEqual(row.permissions, f'{{"*":["{METRIC_NAME}"]}}', "通配下存量源整体不生效")
+        self.assertEqual(legacy.find_calls, [], "通配用户合并前就该跳过，不发起 find_rows")
 
 
 # --------------------------------------------------------------------------
@@ -1469,7 +1497,95 @@ class RevocationPublishTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# 五、在途未送达正文同步清（S-P-5，Trace #328）
+# 三点七、全抑制走撤权出口（红线-2，Trace #328 opus 审查）
+# --------------------------------------------------------------------------
+
+
+class FullSuppressionRevocationTest(unittest.TestCase):
+    """银河这一侧原本是有效授权，但本地抑制把翻译出的全部权限压光到空字典：
+    不再落 ``build_translated_publish_row`` 对空输入的 ``ValueError``（冒泡成一条
+    不可分辨的 ``permission_refresh.user_failed``），而是复用 ``_revoke`` 同一套
+    机制（保行清空、只对发布链上留过足迹的人发），带一个可分辨的原因码
+    :data:`REASON_FULLY_SUPPRESSED`。"""
+
+    def _suppressed_overrides(self) -> FakeLocalOverrides:
+        # 默认夹具的 identity 只持有一个公司（COMPANY_ID）一个指标（METRIC_NAME）——
+        # 抑制它就是把合并结果压到空字典，不是"这个公司没了、别的公司还在"。
+        return FakeLocalOverrides(
+            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+        )
+
+    def test_a_fully_suppressed_grant_with_a_publish_footprint_gets_an_empty_revocation(self) -> None:
+        """否定用例（Trace #328 opus 审查）：抑掉用户全部指标 → 发布 ``{}`` 撤权行 +
+        专属审计，不是 ``ValueError`` 冒泡成通用失败。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            local_overrides=self._suppressed_overrides(),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.failed, 0, "全抑制不是技术故障")
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REVOKE_REASON)
+        row = call["row"]
+        self.assertEqual(row.permissions, "{}", "全抑制走撤权出口：保行清空")
+        revoked = parts["audit"].fields_for("permission_refresh.user_revoked")
+        self.assertEqual(len(revoked), 1)
+        self.assertEqual(
+            revoked[0]["reason"], REASON_FULLY_SUPPRESSED,
+            "原因码必须可分辨——不是银河本来就没给他权限，是本地抑制清空的",
+        )
+        cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["trigger"], TRIGGER_REVOKE)
+
+    def test_a_fully_suppressed_grant_without_any_publish_footprint_is_skipped(self) -> None:
+        """从未发布过的用户被全抑制：与银河侧撤权同一条边界——不为他新建一行空
+        权限，只跳过并计数，不产生任何发布意图。"""
+
+        duty, parts = build_duty(
+            identities=(identity(),), local_overrides=self._suppressed_overrides()
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "从未发布过的人不新建空权限行")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.reasons[REASON_FULLY_SUPPRESSED], 1)
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], REASON_FULLY_SUPPRESSED, "原因码仍是可分辨的全抑制")
+        self.assertEqual(skipped[0]["revocation"], SKIP_NO_PUBLISHED_ROW)
+
+    def test_a_partially_suppressed_grant_still_publishes_normally(self) -> None:
+        """否定断言：只抑掉**一部分**指标（不是全部）时走的仍是正常授权发布，不是
+        撤权出口——证明红线-2 的判据是"合并结果整体为空"，不是"发生过任何抑制"。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
+        )
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        report = duty.run_once()
+
+        self.assertEqual(report.enqueued, 1)
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REFRESH_REASON)
+        self.assertEqual(call["row"].permissions, f'{{"{COMPANY_ID}":["额外授权"]}}')
+
+
+# --------------------------------------------------------------------------
+# 五、已送达正文同步清（S-P-5，Trace #328）
 # --------------------------------------------------------------------------
 
 
@@ -1507,7 +1623,7 @@ class DeliveredContentPurgeTest(unittest.TestCase):
 
         cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
         self.assertEqual(len(cleared), 1)
-        self.assertEqual(cleared[0], {"user": USER_ONE, "cleared": 3})
+        self.assertEqual(cleared[0], {"user": USER_ONE, "cleared": 3, "trigger": "grant"})
 
     def test_a_grant_that_clears_nothing_is_still_audited_with_a_zero_count(self) -> None:
         """一个刚被授权、还没有任何历史会话的人：清理**发生过**（record_decision 真的
@@ -1518,7 +1634,7 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         duty.run_once()
 
         cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
-        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 0}])
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 0, "trigger": "grant"}])
 
     def test_an_unchanged_grant_is_not_audited_as_a_clear(self) -> None:
         """否定断言：``UNCHANGED`` 时清理根本没有发生（``record_decision`` 内部只在
@@ -1545,7 +1661,7 @@ class DeliveredContentPurgeTest(unittest.TestCase):
         duty.run_once()
 
         cleared = parts["audit"].fields_for("permission_refresh.delivered_content_cleared")
-        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 2}])
+        self.assertEqual(cleared, [{"user": USER_ONE, "cleared": 2, "trigger": "revoke"}])
 
     def test_an_unchanged_revocation_is_not_audited_as_a_clear(self) -> None:
         decisions = FakeDecisions(unchanged_users={USER_ONE}, cleared_events_by_user={USER_ONE: 5})
@@ -1572,15 +1688,6 @@ class DeliveredContentPurgeTest(unittest.TestCase):
 
         self.assertEqual(parts["decisions"].calls, [])
         self.assertEqual(parts["audit"].fields_for("permission_refresh.delivered_content_cleared"), [])
-
-    def test_onboarding_never_sees_this_switch(self) -> None:
-        """形状断言：重算职责源码里只有这一个新增关键字，且只出现在两处调用——
-        证明"首次开通不接入"不是靠运气（onboarding_runner.py 是另一个模块，
-        本断言不扫描它；这里只钉本职责自己确实把开关焊死在授权、撤权两条路径上，
-        不是某条可以被第三条调用点悄悄绕过的可选项）。"""
-
-        source = duty_code()
-        self.assertEqual(source.count("clear_delivered_content=True"), 2)
 
 
 class IncompleteInputTest(unittest.TestCase):

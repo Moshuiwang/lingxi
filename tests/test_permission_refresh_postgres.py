@@ -30,11 +30,18 @@ from lingxi.adapters.feishu_roster_bitable import RosterRow
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
+from lingxi.adapters.postgres_local_permission import local_override_reader
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
-from lingxi.apps.scheduler.permission_refresh import PermissionRefreshDuty
+from lingxi.apps.scheduler.permission_refresh import (
+    PERMISSION_REVOKE_REASON,
+    REASON_FULLY_SUPPRESSED,
+    SKIP_NO_PUBLISHED_ROW,
+    PermissionRefreshDuty,
+)
+from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     STATUS_PUBLISHED,
     PublishAttempt,
@@ -249,7 +256,9 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
     def _token_store(self) -> PostgresMcpTokenStore:
         return PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
 
-    def _duty(self, *, metric_translation_map=None) -> PermissionRefreshDuty:
+    def _duty(
+        self, *, metric_translation_map=None, legacy_source=None, local_overrides=None
+    ) -> PermissionRefreshDuty:
         publish_store = PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
             baseline_reader=PostgresRosterBaselineReader(self._dsn),
@@ -264,6 +273,8 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             ),
             audit=self.audit,
             clock=self.clock,
+            legacy_source=legacy_source,
+            local_overrides=local_overrides,
         )
 
     # ---- 断言辅助 ----------------------------------------------------
@@ -597,6 +608,223 @@ class RevokedUserTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(self._version(ACTIVE_USER), 0, "撤权不推进权限版本")
         skipped = [fields for action, fields in self.audit.records if action.endswith("user_skipped")]
         self.assertEqual(skipped[0]["reason"], "no_galaxy_roles")
+
+
+class _FakeLegacyTable:
+    """存量权限只读源的假实现，仅用于红线-1 真库用例——真实存量表是 Feishu
+    多维表格（外部系统，本沙箱不可达），本类只承担"legacy 这一侧给了什么"；
+    被真正验证的是 :meth:`PostgresPermissionPublishStore.has_publish_footprint`
+    这一半真库判据，见 :class:`LegacyBoundednessRealDbTest` 文档。"""
+
+    def __init__(self, rows_by_email: dict[str, str]) -> None:
+        self._rows = rows_by_email
+        self.find_calls: list[tuple[str, str]] = []
+
+    def find_rows(self, *, record_key: str, email: str):
+        from lingxi.core.permission.publish import ExistingPermissionRow
+
+        self.find_calls.append((record_key, email))
+        if email not in self._rows:
+            return ()
+        return (
+            ExistingPermissionRow(
+                record_id=f"rec_{email}",
+                fields={"record_key": email, "email": email, "permissions": self._rows[email]},
+            ),
+        )
+
+
+class LegacyBoundednessRealDbTest(PermissionRefreshPostgresTestCase):
+    """红线-1（Trace #328 opus 审查）真库实测：legacy 只在「Lingxi 从未为该用户
+    成功发布过」时参与合并。``has_publish_footprint`` 是唯一只有真库能证伪的
+    那一半——它读的是真实 ``publish_outbox``，假 store 上这条判据无论实现怎么写
+    都是绿的（发布链上真实留没留下过足迹，是数据库状态，不是可以摆样子伪造的
+    输入）。legacy 表本身（Feishu 多维表格）不可达，用轻量假实现承担。"""
+
+    def _publish_current_intent(self) -> None:
+        """把当前这条 pending 意图推到 ``published``，模拟"我们发布成功过"。
+        与 ``RevokedUserTest`` 同一内容，各自一份——unittest 按类收集用例，
+        继承会让同一批用例在两个类名下各跑一次（同一条既有理由）。"""
+
+        store = PostgresPermissionPublishStore(self._dsn)
+        claimed = store.claim_next()
+        assert claimed is not None
+        store.complete(
+            PublishAttempt(
+                outcome=PublishOutcome.PUBLISHED,
+                outbox_id=claimed.outbox_id,
+                user_id=claimed.user_id,
+                permission_version=claimed.permission_version,
+                attempts=claimed.attempts,
+                action="create",
+                external_record_id="rec_fake",
+            ),
+            status=STATUS_PUBLISHED,
+        )
+
+    def test_a_user_with_a_real_publish_footprint_never_reads_legacy(self) -> None:
+        """否定用例：昨日已发布行含今日银河没有的指标 → 今日发布内容不含它
+        （收窄生效）——``has_publish_footprint`` 读到的是真实 ``publish_outbox``
+        里这个用户第一轮发布成功产生的那一行。"""
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+
+        legacy = _FakeLegacyTable({EMAIL[ACTIVE_USER]: '{"BC-甲":["昨日已发布的指标"]}'})
+        self._duty(legacy_source=legacy).run_once()
+        self._publish_current_intent()
+
+        # 第二天再跑一轮：这个用户此刻已经在真实 publish_outbox 里留下发布成功
+        # 的足迹。同一个 legacy 表这一轮依然有那行存量数据，但不该被读取/合并。
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        legacy.find_calls.clear()
+
+        self._duty(legacy_source=legacy).run_once()
+
+        payload = self._latest_payload(ACTIVE_USER)
+        self.assertEqual(
+            payload["permissions"],
+            f'{{"BC-甲":["{METRIC_NAME}"]}}',
+            "有真实发布足迹时存量沿用不生效，不被自己昨天的内容原样并回来",
+        )
+        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起——省读放大")
+
+    def test_a_never_published_user_still_uses_legacy(self) -> None:
+        """正向不回归：从未发布用户 + 存量行 → 沿用生效——真实 ``publish_outbox``
+        里这个用户此刻没有任何行，``has_publish_footprint`` 必须为假。"""
+
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        legacy = _FakeLegacyTable({EMAIL[ACTIVE_USER]: '{"BC-甲":["存量指标"]}'})
+
+        self._duty(legacy_source=legacy).run_once()
+
+        payload = self._latest_payload(ACTIVE_USER)
+        self.assertEqual(payload["permissions"], f'{{"BC-甲":["存量指标","{METRIC_NAME}"]}}')
+
+
+class _FullSuppressionFixture(PermissionRefreshPostgresTestCase):
+    """全抑制走撤权出口（红线-2，Trace #328 opus 审查）真库实测的共同底座：种一条
+    真实 ``local_permission_override`` 生效抑制行（迁移 0072），FK 要求的
+    ``pending_action`` 行一并种下（迁移 0068/0073），只用直接 SQL——完整的管理员
+    命令面/确认卡流程不在本用例覆盖范围。"""
+
+    def _publish_current_intent(self) -> None:
+        """把当前这条 pending 意图推到 ``published``，模拟"我们发布成功过"。
+        与 ``RevokedUserTest`` 同一内容，各自一份（同一条既有理由）。"""
+
+        store = PostgresPermissionPublishStore(self._dsn)
+        claimed = store.claim_next()
+        assert claimed is not None
+        store.complete(
+            PublishAttempt(
+                outcome=PublishOutcome.PUBLISHED,
+                outbox_id=claimed.outbox_id,
+                user_id=claimed.user_id,
+                permission_version=claimed.permission_version,
+                attempts=claimed.attempts,
+                action="create",
+                external_record_id="rec_fake",
+            ),
+            status=STATUS_PUBLISHED,
+        )
+
+    def _seed_active_suppression(self, *, user_id: str) -> None:
+        # status='pending'：迁移 0068 的 CHECK 要求 (status='pending') = (decided_at
+        # IS NULL)——本用例只需要这一行满足外键与 payload 自洽两条约束，不需要
+        # 真的走完确认卡流程，因此不必额外填 decided_at/decided_by_open_id。
+        pending_id = new_id("pac")
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO pending_action
+                       (id, action_type, target_open_id, target_state_snapshot,
+                        initiated_by_open_id, status, card_delivered, confirm_deadline_at, payload)
+                   VALUES (%s, 'local_permission_suppress', %s, 'absent', 'ou_admin_fake',
+                           'pending', TRUE, now() + interval '10 minutes',
+                           '{"company_id":"BC-甲","metric_name":"' || %s || '","reason":"真库用例"}')""",
+                (pending_id, f"ou_{user_id}", METRIC_NAME),
+            )
+        store = local_override_reader(self._dsn)
+        # 直接调用底层 store（不经 LocalOverrideEntryReader 适配）以拿到 insert()。
+        from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+        from lingxi.core.permission.local_override import OverrideDirection
+
+        PostgresLocalPermissionOverrideStore(self._dsn).insert(
+            user_id=user_id,
+            direction=OverrideDirection.SUPPRESS,
+            company_id="BC-甲",
+            metric_name=METRIC_NAME,
+            reason="真库用例：抑掉这个人唯一的指标",
+            initiated_by_open_id="ou_admin_fake",
+            pending_action_id=pending_id,
+        )
+        return store
+
+
+class FullSuppressionRealDbTest(_FullSuppressionFixture):
+    """红线-2 真库实测：抑掉用户全部指标 → 发布 ``{}`` 撤权行 + 专属审计。只有真库
+    能证伪的那一半是 ``record_decision`` 的撤权分支真的把行写成 ``permissions={}``
+    并推进版本——假 store 上这条判据无论实现怎么写都是绿的。"""
+
+    def test_a_fully_suppressed_grant_with_a_real_publish_footprint_gets_an_empty_revocation(
+        self,
+    ) -> None:
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+
+        # 第一轮：正常授权发布，建立真实发布足迹。
+        self._duty().run_once()
+        self._publish_current_intent()
+
+        # 第二轮：管理员对这个人本地抑制了唯一的指标——合并结果压光到空字典。
+        store = self._seed_active_suppression(user_id=ACTIVE_USER)
+        self.clock.moment = NOW + timedelta(days=1)
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+
+        report = self._duty(local_overrides=store).run_once()
+
+        self.assertEqual(report.failed, 0, "全抑制不是技术故障")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(self._version(ACTIVE_USER), 2, "撤权是一次新的权限决定")
+        reasons = [reason for _user, _version, reason in self._outbox()]
+        self.assertIn(PERMISSION_REVOKE_REASON, reasons)
+        payload = self._latest_payload(ACTIVE_USER)
+        self.assertEqual(payload["permissions"], "{}", "全抑制走撤权出口：保行清空")
+        revoked_audit = [
+            fields for action, fields in self.audit.records if action.endswith("user_revoked")
+        ]
+        self.assertEqual(len(revoked_audit), 1)
+        self.assertEqual(
+            revoked_audit[0]["reason"],
+            REASON_FULLY_SUPPRESSED,
+            "原因码必须可分辨——不是银河本来就没给他权限，是本地抑制清空的",
+        )
+
+    def test_a_fully_suppressed_grant_without_any_publish_footprint_is_skipped(self) -> None:
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        store = self._seed_active_suppression(user_id=ACTIVE_USER)
+
+        report = self._duty(local_overrides=store).run_once()
+
+        self.assertEqual(self._outbox(), [], "从未发布过的人不新建空权限行")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.reasons[REASON_FULLY_SUPPRESSED], 1)
+        skipped = [
+            fields for action, fields in self.audit.records if action.endswith("user_skipped")
+        ]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], REASON_FULLY_SUPPRESSED)
+        self.assertEqual(skipped[0]["revocation"], SKIP_NO_PUBLISHED_ROW)
 
 
 class RosterFreshnessGateTest(PermissionRefreshPostgresTestCase):

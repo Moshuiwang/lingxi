@@ -1,6 +1,8 @@
 """``core/permission/legacy_source.py`` 的纯逻辑测试（S-P-2，Issue #319 / Trace #328）。
 
-不需要数据库、不需要真实飞书调用——``find_rows``/``read_row`` 都是注入的假传输层。
+不需要数据库、不需要真实飞书调用——``find_rows`` 是注入的假传输层（读放大修复，
+Trace #328 opus 审查 P2：``read_legacy_permissions`` 只发一次 ``find_rows``，直接用
+命中行的 ``fields["permissions"]``，不再发第二次 ``read_row`` 详情查询）。
 两个调用点各自的接线测试（真实的 ``PermissionRefreshDuty``/``AutoOnboardingRunner``
 装配 + 审计事件）分别在 ``tests/test_permission_refresh_duty.py::LegacySourceMergeTest``
 与 ``tests/test_onboarding_runner.py::LegacySourceMergeTests``。
@@ -44,44 +46,41 @@ def _row(
     record_id: str = "rec_1",
     record_key: str = NORMALIZED_EMAIL,
     email: str = NORMALIZED_EMAIL,
-    permissions: str = '{"1011":["legacy_metric"]}',
+    permissions: str | None = '{"1011":["legacy_metric"]}',
 ) -> ExistingPermissionRow:
-    return ExistingPermissionRow(
-        record_id=record_id,
-        fields={"record_key": record_key, "email": email, "permissions": permissions},
-    )
+    """构造一行 ``find_rows`` 会返回的命中行。``permissions=None`` 模拟"这一行的
+    ``permissions`` 列在列表接口里缺失"（``fields`` 里干脆没有这个键，与空白值是
+    ``parse_permissions`` 眼里同一种"解析不出内容"，见
+    ``test_a_missing_permissions_cell_on_an_existing_row_is_unparseable_not_empty``）。
+    """
+
+    fields: dict[str, Any] = {"record_key": record_key, "email": email}
+    if permissions is not None:
+        fields["permissions"] = permissions
+    return ExistingPermissionRow(record_id=record_id, fields=fields)
 
 
 class FakeLegacyTable:
-    """``LegacyPermissionTable`` 的假实现：``find_rows``/``read_row`` 都可以注入
-    固定返回值或直接抛异常，供失败路径用例复现传输层故障。"""
+    """``LegacyPermissionTable`` 的假实现：``find_rows`` 可以注入固定返回值或直接
+    抛异常，供失败路径用例复现传输层故障。命中行的 ``permissions`` 一律随行本身
+    在 ``fields`` 里给出（与真实 ``BitablePermissionTable.find_rows`` 同形状，见
+    该协议文档「读放大修复」一节）——不再需要单独注入 ``read_row`` 的返回值。"""
 
     def __init__(
         self,
         *,
         rows: tuple[ExistingPermissionRow, ...] = (),
         find_error: Exception | None = None,
-        fields_by_record_id: dict[str, dict[str, Any]] | None = None,
-        read_error: Exception | None = None,
     ) -> None:
         self._rows = rows
         self._find_error = find_error
-        self._fields = fields_by_record_id or {}
-        self._read_error = read_error
         self.find_calls: list[tuple[str, str]] = []
-        self.read_calls: list[str] = []
 
     def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
         self.find_calls.append((record_key, email))
         if self._find_error is not None:
             raise self._find_error
         return self._rows
-
-    def read_row(self, record_id: str) -> dict[str, Any]:
-        self.read_calls.append(record_id)
-        if self._read_error is not None:
-            raise self._read_error
-        return self._fields.get(record_id, {})
 
 
 class RecordingAudit:
@@ -115,14 +114,25 @@ class ReadLegacyPermissionsTests(unittest.TestCase):
 
     def test_a_matching_row_parses_permissions_into_company_metric_map(self) -> None:
         row = _row(permissions='{"1011":["日活","收入"]}')
-        table = FakeLegacyTable(
-            rows=(row,), fields_by_record_id={"rec_1": {"permissions": '{"1011":["日活","收入"]}'}}
-        )
+        table = FakeLegacyTable(rows=(row,))
 
         result = read_legacy_permissions(email=EMAIL, table=table)
 
         self.assertEqual(result, {"1011": ("日活", "收入")})
-        self.assertEqual(table.read_calls, ["rec_1"])
+
+    def test_reading_a_matching_row_does_not_issue_a_second_lookup(self) -> None:
+        """读放大修复（Trace #328 opus 审查 P2）：只发一次 ``find_rows``，命中行的
+        ``permissions`` 直接取自那次调用返回的 ``fields``，不再对同一行发第二次
+        详情查询。``FakeLegacyTable`` 结构上只声明 ``find_rows`` 一个方法（本模块
+        协议已经把 ``read_row`` 移出 ``LegacyPermissionTable``），这条用例本身就是
+        对"不需要第二次调用"的形状证明——多一次调用在这个假实现里根本无处可发。
+        """
+
+        table = FakeLegacyTable(rows=(_row(),))
+
+        read_legacy_permissions(email=EMAIL, table=table)
+
+        self.assertEqual(len(table.find_calls), 1)
 
     def test_multiple_matching_rows_raise_conflict(self) -> None:
         table = FakeLegacyTable(rows=(_row(record_id="rec_1"), _row(record_id="rec_2")))
@@ -132,7 +142,6 @@ class ReadLegacyPermissionsTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, REASON_LEGACY_MULTIPLE_ROWS)
         self.assertIsNone(ctx.exception.detail)
-        self.assertEqual(table.read_calls, [], "冲突时不该再去读任何一行")
 
     def test_a_row_with_a_different_record_key_raises_key_mismatch(self) -> None:
         """命中的行 ``record_key`` 与我们要查的口径不一致：与 ``publish_claim`` 的
@@ -156,19 +165,8 @@ class ReadLegacyPermissionsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.detail, "RuntimeError")
         self.assertIs(ctx.exception.__cause__.__class__, RuntimeError, "原始异常经 __cause__ 保留")
 
-    def test_read_row_failure_raises_read_failed_with_the_error_class_name(self) -> None:
-        table = FakeLegacyTable(rows=(_row(),), read_error=ValueError("注入的读回故障"))
-
-        with self.assertRaises(LegacySourceError) as ctx:
-            read_legacy_permissions(email=EMAIL, table=table)
-
-        self.assertEqual(ctx.exception.code, REASON_LEGACY_READ_FAILED)
-        self.assertEqual(ctx.exception.detail, "ValueError")
-
     def test_unparseable_permissions_text_raises_unparseable_with_the_error_class_name(self) -> None:
-        table = FakeLegacyTable(
-            rows=(_row(),), fields_by_record_id={"rec_1": {"permissions": "不是合法 JSON"}}
-        )
+        table = FakeLegacyTable(rows=(_row(permissions="不是合法 JSON"),))
 
         with self.assertRaises(LegacySourceError) as ctx:
             read_legacy_permissions(email=EMAIL, table=table)
@@ -176,11 +174,12 @@ class ReadLegacyPermissionsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, REASON_LEGACY_UNPARSEABLE)
         self.assertEqual(ctx.exception.detail, "ValueError")
 
-    def test_a_blank_permissions_cell_on_an_existing_row_is_unparseable_not_empty(self) -> None:
-        """行存在但 ``permissions`` 列缺失/空白：与 ``parse_permissions`` 自身的既有
-        判据一致——不当作"没有存量权限"静默放过，按无法解析处理。"""
+    def test_a_missing_permissions_cell_on_an_existing_row_is_unparseable_not_empty(self) -> None:
+        """行存在但 ``permissions`` 列在 ``find_rows`` 返回的 ``fields`` 里缺失：与
+        ``parse_permissions`` 自身的既有判据一致——不当作"没有存量权限"静默放过，
+        按无法解析处理。"""
 
-        table = FakeLegacyTable(rows=(_row(),), fields_by_record_id={"rec_1": {}})
+        table = FakeLegacyTable(rows=(_row(permissions=None),))
 
         with self.assertRaises(LegacySourceError) as ctx:
             read_legacy_permissions(email=EMAIL, table=table)
@@ -204,9 +203,7 @@ class ResolveLegacySourceTests(unittest.TestCase):
         self.assertEqual(audit.records, [])
 
     def test_success_returns_the_parsed_mapping_without_any_audit(self) -> None:
-        table = FakeLegacyTable(
-            rows=(_row(),), fields_by_record_id={"rec_1": {"permissions": '{"1011":["日活"]}'}}
-        )
+        table = FakeLegacyTable(rows=(_row(permissions='{"1011":["日活"]}'),))
         audit = RecordingAudit()
 
         result = resolve_legacy_source(

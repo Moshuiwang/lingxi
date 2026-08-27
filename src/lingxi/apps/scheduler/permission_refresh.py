@@ -72,7 +72,23 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
 **本职责仍然不通知**：通知的触发点在发布读回一致（撤权）或就绪探针成功（增权）之后，
 属 :mod:`lingxi.apps.scheduler.permission_publish`。这里连一个发送端口都没有。
 
-## 在途未送达正文同步清（S-P-5，Trace #328）
+## 全抑制（本地覆盖压光全部权限）同样走撤权出口（红线-2，Trace #328 opus 审查）
+
+四源合并（下文「本地权限覆盖合并」一节）之后，``merged.permissions`` 可能是空字典——
+这个人银河这一侧原本是有效授权（否则更早的 ``aggregate.granted`` 判据已经把他分流进
+上面的撤权分支，走不到翻译与合并这一步），但本地抑制把翻译出的全部指标都抑制掉了。
+**这不是"无可用银河权限"**（``no_galaxy_roles``/``no_supported_function``/
+``no_company_scope`` 三个原因码都不适用），是"银河给了、本地行政性地收回到零"——语义
+上与撤权完全一致（这个人此刻确实没有任何可发布内容），因此复用同一套
+:meth:`_revoke` 机制（保行清空 ``permissions``、只对发布链上留过足迹的人发、走
+:data:`PERMISSION_REVOKE_REASON`），但传一个**可分辨**的原因码
+（:data:`REASON_FULLY_SUPPRESSED`）。修复前的实际行为是：直接把空字典传给
+``build_translated_publish_row`` → ``serialize_translated_permissions`` 对空输入抛
+``ValueError``，这个异常不被任何分支捕获，冒泡到 ``run_once`` 的单用户异常兜底，
+记成一条不可分辨的通用 ``permission_refresh.user_failed``——审计上完全看不出"这个人
+是被本地抑制清空的"，与真正的技术故障混在同一个原因桶里。
+
+## 已送达正文同步清（S-P-5，Trace #328）
 
 授权、撤权两条路径调用 :meth:`~lingxi.adapters.postgres_permission_publish.
 PostgresPermissionPublishStore.record_decision` 时都传 ``clear_delivered_content=True``：
@@ -90,6 +106,11 @@ PostgresPermissionPublishStore.record_decision` 时都传 ``clear_delivered_cont
 （可能是 0——一个刚被授权、还没有任何历史会话的人）；不含正文本身，与本职责其余审计
 同一条纪律（模块文档顶部 :class:`PermissionRefreshReport` 的说明）。``UNCHANGED`` 分支
 不记这条审计，因为清理压根没有发生。
+
+**``trigger`` 字段**（``grant``/``revoke``，:data:`TRIGGER_GRANT`/:data:`TRIGGER_REVOKE`，
+Trace #328 opus 审查）：这条审计的两个调用点分别在 :meth:`_refresh_user`（授权，含
+红线-2 的全抑制撤权，见「全抑制」一节）与 :meth:`_revoke`（银河侧撤权），运维排查时
+不必回头核对同一批次里的其他审计行才能分辨"这次清理是哪条路径触发的"。
 
 ## 令牌：只读既有，绝不签发
 
@@ -190,6 +211,7 @@ from lingxi.core.permission.local_override import (
 )
 from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
 from lingxi.core.permission.merge_sources import (
+    ALL_COMPANIES_KEY,
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     merge_permission_sources,
 )
@@ -216,6 +238,19 @@ PERMISSION_REFRESH_REASON = "daily_permission_refresh"
 #: 在 outbox 里一眼可辨——两者的 payload 差别只有 ``permissions`` 一列的内容，
 #: 靠肉眼比对 JSON 文本来分辨一次不可逆的外部写入，不是可接受的运维姿态。
 PERMISSION_REVOKE_REASON = "daily_permission_revoke"
+
+#: 银河这一侧原本有效授权，但本地抑制把翻译结果压光到空字典时的撤权原因码
+#: （红线-2，Trace #328 opus 审查）。与匹配失败、聚合层 fail-closed 的三个原因码
+#: （``no_galaxy_roles``/``no_supported_function``/``no_company_scope``）区分开，
+#: 让审计能一眼看出"这个人是被本地抑制清空的"，不是"银河本来就没给他权限"。
+REASON_FULLY_SUPPRESSED = "fully_suppressed"
+
+#: ``permission_refresh.delivered_content_cleared`` 审计的 ``trigger`` 字段取值
+#: （S-P-5 措辞如实化，Trace #328 opus 审查）：区分这次清理是授权路径（含全抑制
+#: 撤权，见 :data:`REASON_FULLY_SUPPRESSED`）还是银河撤权路径触发的，供运维排查
+#: 时不必回头核对 ``reason`` 列才能分辨。
+TRIGGER_GRANT = "grant"
+TRIGGER_REVOKE = "revoke"
 
 # ---- 跳过原因码。全部是**固定字面量**，不含任何字段值 -----------------------
 #: 花名册快照压根不存在。
@@ -343,7 +378,7 @@ class _PublishHistory(Protocol):
 
 class _Decision(Protocol):
     enqueued: bool
-    # 本次决定顺带清掉的在途未送达（已送达、随会话保留）投递正文事件数（S-P-5，
+    # 本次决定顺带清掉的已送达、随会话保留投递正文事件数（S-P-5，
     # Trace #328）。只有调用 ``record_decision(clear_delivered_content=True)`` 且
     # 真的走到 ``ENQUEUED`` 时才可能非零；本职责只如实把它写进审计计数，不自己
     # 判断"要不要清"——那条判定连同事务边界只有 ``record_decision`` 一处实现。
@@ -747,13 +782,7 @@ class PermissionRefreshDuty:
         # 见 `core/permission/merge_sources.py` 模块文档；存量源的失败降级见
         # `core/permission/legacy_source.py` 模块文档。
         local = self._resolve_local_overrides(identity.app_user_id)
-        legacy = resolve_legacy_source(
-            email=identity.email,
-            table=self._legacy_source,
-            audit=self._audit,
-            action="permission_refresh.legacy_source_skipped",
-            user=identity.app_user_id,
-        )
+        legacy = self._resolve_legacy_source(identity.app_user_id, identity.email, company_metrics)
         merged = merge_permission_sources(galaxy=company_metrics, local=local, legacy=legacy)
         for reason in merged.skipped_reasons:
             # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
@@ -763,6 +792,16 @@ class PermissionRefreshDuty:
                 user=identity.app_user_id,
                 reason=reason,
             )
+
+        if not merged.permissions:
+            # 红线-2（Trace #328 opus 审查）：银河这一侧原本是有效授权
+            # （company_metrics 非空，翻译已经成功），但本地抑制把合并结果压光到
+            # 空字典——这个人此刻没有任何可发布内容，语义上等同于撤权。走
+            # `_revoke` 同一套机制（保行清空、只对发布链上留过足迹的人发），但带一个
+            # 可分辨的原因码，不落到 `build_translated_publish_row` 对空输入的
+            # `ValueError` → 通用 `user_failed`（模块文档「全抑制」一节）。
+            self._revoke(tally, identity, REASON_FULLY_SUPPRESSED, now)
+            return
 
         # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
         # 失败关闭）。这里没有、也不允许有任何签发路径。
@@ -780,7 +819,7 @@ class PermissionRefreshDuty:
             reason=PERMISSION_REFRESH_REASON,
             decided_at=now,
             # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
-            # 在途未送达（已送达、随会话保留）的投递正文（S-P-5，Trace #328）。
+            # 已送达、随会话保留的投递正文（S-P-5，Trace #328）。
             clear_delivered_content=True,
         )
         if decision.enqueued:
@@ -789,6 +828,7 @@ class PermissionRefreshDuty:
                 "permission_refresh.delivered_content_cleared",
                 user=identity.app_user_id,
                 cleared=decision.cleared_events,
+                trigger=TRIGGER_GRANT,
             )
         else:
             # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
@@ -828,6 +868,41 @@ class PermissionRefreshDuty:
             )
             return None
         return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _resolve_legacy_source(
+        self, user_id: str, email: str, company_metrics: Mapping[str, Sequence[str]]
+    ) -> dict[str, tuple[str, ...]] | None:
+        """按红线-1 的有界条件（Trace #328 opus 审查）决定这个用户本轮要不要读存量源。
+
+        两条判据都会让本方法直接返回 ``None``、**不发起任何 ``find_rows`` 调用**
+        （省一次读放大）：
+
+        1. **通配用户**（``company_metrics`` 出现 :data:`~lingxi.core.permission.
+           merge_sources.ALL_COMPANIES_KEY` 键）：:func:`~lingxi.core.permission.
+           merge_sources.merge_permission_sources` 的通配分支本就完全不读 ``legacy``
+           参数（该模块文档「通配角」一节），读来的存量权限必然被丢弃——读了也是白读。
+        2. **已经在发布链上留下过足迹**（:meth:`_PublishHistory.has_publish_footprint`
+           为真：发布成功过，或当前还有 ``pending``/``publishing`` 的意图在途）：正式
+           权限发布表此刻很可能已经是 Lingxi 自己写的内容，不再是"旧系统遗留、我们
+           从未碰过"的存量——参与合并会把自己昨天的发布内容原样并回来，形成自反馈环
+           （详见 ``core/permission/legacy_source.py`` 模块文档「有界条件」一节）。
+
+        两条判据都不成立（未通配、且从未有过发布足迹）时才真正调用
+        :func:`~lingxi.core.permission.legacy_source.resolve_legacy_source`，读取/解析
+        失败的降级与审计姿态见该函数文档，本方法不重复。
+        """
+
+        if ALL_COMPANIES_KEY in company_metrics:
+            return None
+        if self._publish_history.has_publish_footprint(user_id):
+            return None
+        return resolve_legacy_source(
+            email=email,
+            table=self._legacy_source,
+            audit=self._audit,
+            action="permission_refresh.legacy_source_skipped",
+            user=user_id,
+        )
 
     def _revoke(
         self,
@@ -884,8 +959,8 @@ class PermissionRefreshDuty:
             reason=PERMISSION_REVOKE_REASON,
             decided_at=now,
             # 权限确实变化（真的排出撤权意图）时，在 record_decision 自己的同一个
-            # 事务里顺带清空该用户在途未送达的投递正文（S-P-5，Trace #328），与
-            # 授权侧同一个开关、同一条理由。
+            # 事务里顺带清空该用户已送达、随会话保留的投递正文（S-P-5，Trace #328），
+            # 与授权侧同一个开关、同一条理由。
             clear_delivered_content=True,
         )
         if decision.enqueued:
@@ -895,6 +970,7 @@ class PermissionRefreshDuty:
                 "permission_refresh.delivered_content_cleared",
                 user=identity.app_user_id,
                 cleared=decision.cleared_events,
+                trigger=TRIGGER_REVOKE,
             )
         else:
             # 上一条意图已经是同一份空权限：不推进版本、不排新意图、不清理。
@@ -964,7 +1040,10 @@ __all__ = [
     "PERMISSION_REVOKE_REASON",
     "PermissionRefreshDuty",
     "PermissionRefreshReport",
+    "REASON_FULLY_SUPPRESSED",
     "SKIP_METRIC_TRANSLATION_UNAVAILABLE",
     "SKIP_METRIC_TRANSLATION_UNCOVERED",
     "SKIP_NO_PUBLISHED_ROW",
+    "TRIGGER_GRANT",
+    "TRIGGER_REVOKE",
 ]

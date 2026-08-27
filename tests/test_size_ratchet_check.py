@@ -146,13 +146,24 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         缺失时为 `None`）并转发给两个 `_build_*_duty`；净变化包含新增代码与
         一段注释重排（把一段 10 行的既有说明合并成同义的更短句），两者相抵后
         文件净**减少** 1 行——`--refresh` 因此把基线调小而不是调大，纪律仍是
-        「先改动本文件、再同步这条测试」。结构性拆分仍是 #284 后续。下一次
-        这条测试失效时，同样在此登记理由。
+        「先改动本文件、再同步这条测试」。结构性拆分仍是 #284 后续。2026-08-27
+        新增 `onboarding_runner.py`（1541 行，Trace #328 E-P opus 审查修复包）：
+        红线-1 legacy 有界化在开通侧同判据接线——新增 `PublishHistorySource`
+        Protocol、构造参数、`_resolve_legacy_source` 判定方法（通配跳过 + 发布
+        足迹有界化）与红线-2 全抑制走 `_not_authorized` 出口的判断，均为本包
+        「必修」红线修复要求的新代码，已尽量压缩注释（原始净增约 60 行，压到
+        42 行）；`assembly.py` 同一批改动净增 1 行（`publish_history=` 转发），
+        与既有 `legacy_source=` 转发合并成同一行以省出这一行，基线数值不变。
+        `--refresh` 不会自动登记新文件（onboarding_runner.py 此前从未超过阈值），
+        本条目按门禁提示人工加入基线。下一次这条测试失效时，同样在此登记理由。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {"src/lingxi/apps/scheduler/assembly.py": 1538},
+            {
+                "src/lingxi/apps/scheduler/assembly.py": 1538,
+                "src/lingxi/core/identity/onboarding_runner.py": 1541,
+            },
         )
 
 

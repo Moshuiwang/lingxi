@@ -397,6 +397,36 @@ suppress 时 suppress 赢」，拆两张表会让这类判定变成一次跨表 
 表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值
 （本 revision 未在任何环境应用过）。
 
+**不可回滚前置条件（Trace #328 opus 审查补记）**：上一句"不存在需要回填的历史值"
+只在部署环境从未真实写入过本表时成立——迁移文件头部注释同一句写着"数据破坏操作，
+与 0067/0068 同型：一旦部署环境写入过真实本地覆盖，DROP 会把它们连同确认卡留痕
+一起清空，不是无损回滚"。一旦本地授权/抑制被真实使用过，`downgrade()` 的
+`DROP TABLE` 就是一次不可逆的数据丢失，不是"无损回滚"；本节这句概述在初版遗漏了
+这条前置条件，容易被读成"downgrade 总是安全的"。
+
+## `0073_pending_action_perm_types`（待确认操作扩容本地权限动作类型）
+
+[Issue #319](https://github.com/Moshuiwang/lingxi/issues/319) S-P-1b。把
+`pending_action.action_type` 的 CHECK 从两值（`suspend_user`/`resume_user`）
+一次性扩到五值（新增本地权限授权/抑制/收回三类，理由见迁移文件头部「为什么
+revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这三类动作确认执行
+所需的结构化参数（公司×指标×原因，JSON 字符串），并加一条「存在性」自洽 CHECK：
+本地权限三类必须携带非空白 `payload`，`suspend_user`/`resume_user` 必须不携带
+——**这条 CHECK 只管存在性，不校验 `payload` 的内容形状**（是否合法 JSON、键是否
+齐全），那部分校验在应用层（`json.loads` 失败时的兜底见
+`core/admin/notification.py` 的 `_permission_payload`）。
+
+**不可回滚前置条件**：`downgrade()` 无条件先 `DROP COLUMN payload`（不管当时是否
+已有真实的公司/指标/原因内容），再把 CHECK 收窄回两值——若届时表中仍有
+`local_permission_grant`/`suppress`/`revoke` 取值的行，最后一步 `ADD CONSTRAINT`
+会因违反收窄后的 CHECK 而失败，整条 revision 在同一事务内原子回滚（`env.py` 的
+`transaction_per_migration=True`，不留半应用状态，与 `0054` 的既有先例一致）。
+因此：只要本地权限三类动作被真实使用过，这条 `downgrade` 在实践中不可执行，
+除非先手工清空/迁出这些业务行——而那本身就是一次不可逆的数据丢失。
+
+表本 revision 只新增列与约束，前滚兼容；`downgrade()` 未在任何环境验证过真实
+回滚（本 revision 未在任何环境应用过）。
+
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
 1. **四个数据库角色**（`lingxi_app` / `lingxi_scheduler` / `lingxi_retention_owner` /

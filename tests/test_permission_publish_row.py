@@ -189,6 +189,28 @@ class AggregateTest(unittest.TestCase):
         self.assertNotIn(FAKE_NAME, rendered)
         self.assertNotIn(FAKE_GALAXY_USER, rendered)
 
+    def test_audit_facts_reports_the_actual_company_count_when_not_wildcard(self) -> None:
+        aggregate = _aggregate(roles=_roles("A商务", "A运营（OTT）"), countries=_countries("11", "12"))
+        facts = aggregate.audit_facts()
+        self.assertEqual(facts["companies"], 2)
+        self.assertFalse(facts["all_companies"])
+
+    def test_audit_facts_blanks_the_company_count_under_the_wildcard(self) -> None:
+        """审计输出的矛盾修正（Trace #328 opus 审查 P2）：``all_companies=True`` 时
+        ``companies`` 具体数量与实际覆盖范围毫无关系（可能来自银河「全非」通配
+        展开出的一大串，也可能来自「角色即全公司」特例下只解释出一两个具体公司），
+        继续输出会读出一句自相矛盾的话（"companies: 1, all_companies: true"）。
+        置空之后不再有这个数字，读者不会被误导成"范围只有这么大"。"""
+
+        aggregate = _aggregate(countries=_countries("0"))  # 银河「全非」通配
+        self.assertTrue(aggregate.all_companies)
+        self.assertEqual(aggregate.companies, ("1011", "1012", "1013"), "companies 字段本身不受影响")
+
+        facts = aggregate.audit_facts()
+
+        self.assertIsNone(facts["companies"], "all_companies=True 时不输出具体数量")
+        self.assertTrue(facts["all_companies"])
+
 
 class SerializationTest(unittest.TestCase):
     """格式依据：2026-08-17 编排者对正式表的全表只读回源核对（26/26 行）。

@@ -47,6 +47,7 @@ from lingxi.core.ids import new_id
 from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
     ClaimedPublish,
+    PermissionDecisionTransientFailure,
     PublishAttempt,
     PublishOutcome,
 )
@@ -183,12 +184,26 @@ class PostgresPermissionPublishStore:
            不等于已经发布成功，把它压成"无变化"会让一次失败的发布永远没人再试。
         3. 推进 ``app_user.permission_version`` 并插入意图。
         4. ``clear_delivered_content=True`` 且这次真的走到了第 3 步（即将返回
-           ``ENQUEUED``）时，在**同一个事务**里追加一次
-           ``clear_delivered_content_for_user``，清空该用户全部会话已送达、随会话
-           保留的投递正文，并排队失效当前 Agent 会话（Trace #328 S-P-5）。
-           ``reason`` 固定传 ``user_cleared``——迁移 ``0061`` 早就给「停用感知、权限
-           变化感知」两类触发预留的分类值，这里接入的正是其中"权限变化感知"那一半；
-           ``UNCHANGED`` 分支不清理，内容没变没有什么需要失效。
+           ``ENQUEUED``）**且 ``permissions`` 列内容真的变了**时，在**同一个事务**
+           里追加一次 ``clear_delivered_content_for_user``，清空该用户全部会话已
+           送达、随会话保留的投递正文，并排队失效当前 Agent 会话（Trace #328
+           S-P-5）。``reason`` 固定传 ``user_cleared``——迁移 ``0061`` 早就给「停用
+           感知、权限变化感知」两类触发预留的分类值，这里接入的正是其中"权限变化
+           感知"那一半；``UNCHANGED`` 分支不清理，内容没变没有什么需要失效。
+
+           **「``permissions`` 列内容真的变了」是一条独立于 ENQUEUED/UNCHANGED 判定
+           的比较**（Trace #328 opus 审查 P1）：ENQUEUED 只说明**整行**（含
+           ``record_key``/``email``/``name``/``permissions``/``status``）与上一条
+           **仍然有效**（``pending``/``publishing``/``published``）的意图不同，
+           不等于"这个人的实际可用权限变了"——两种情形会让 ENQUEUED 成立、但
+           ``permissions`` 文本其实没变：① 上一条意图已经 ``failed``/``superseded``
+           （不算"仍然有效"，因此按上面第 2 步会照常排新意图，即使内容与那条失效
+           意图逐字节相同——这是重试，不是变化）；② 存档身份的 ``email``/
+           ``display_name`` 变了（例如改名），导致 ``record_key``/``name`` 两列
+           不同、整行判定为"变化"，但这个人的实际可用权限一个字符都没动。清理触发
+           因此单独比较 ``row.permissions`` 与该用户**上一条意图**（不论其状态）
+           的 ``permissions`` 列文本，与整行 ENQUEUED/UNCHANGED 判定完全分开：
+           清理只在这个更窄的比较判真时才发生，见 :func:`_permissions_changed`。
 
         **为什么是调用方显式传入的开关，不是本方法内部自己判断"这是权限变化所以该
         清"**：本方法同时服务首次开通（``core/identity/onboarding_runner.py``，
@@ -210,6 +225,15 @@ class PostgresPermissionPublishStore:
 
         ``decided_at`` 只用于 ``permission_checked_at``；发布行里的时间戳已经在
         ``row.updated_at`` 里冻结好了（见 ``core/permission/publish_row.py``）。
+
+        **数据库瞬时故障不向上传播成裸 psycopg 异常**（Trace #328 opus 审查 P1，
+        "照停用路径已有的捕获形状"）：本方法捕获 ``psycopg.errors.OperationalError``
+        并转译为 :class:`~lingxi.core.permission.publish.
+        PermissionDecisionTransientFailure`（事务已整体回滚，语义与转译方式见该类
+        文档，与 ``adapters/postgres_pending_action.py`` 的 ``confirm()`` 完全同一
+        姿态——同样是"先 ``FOR UPDATE`` 锁目标行，再做后续写入"的形状，暴露在同一类
+        锁冲突之下）。真正实现"执行体"的是 :meth:`_record_decision_locked`——拆成
+        独立方法是为了让这层 ``try/except`` 不必重新缩进整段已经很深的事务体。
         """
 
         if not isinstance(row, PublishRow):
@@ -217,6 +241,32 @@ class PostgresPermissionPublishStore:
         moment = decided_at or datetime.now(_UTC)
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("权限决定时间必须带时区")
+
+        from psycopg.errors import OperationalError
+
+        try:
+            return self._record_decision_locked(
+                user_id=user_id,
+                row=row,
+                reason=reason,
+                moment=moment,
+                clear_delivered_content=clear_delivered_content,
+            )
+        except OperationalError as error:
+            raise PermissionDecisionTransientFailure(type(error).__name__) from error
+
+    def _record_decision_locked(
+        self,
+        *,
+        user_id: str,
+        row: PublishRow,
+        reason: str,
+        moment: datetime,
+        clear_delivered_content: bool,
+    ) -> PermissionDecision:
+        """:meth:`record_decision` 的事务体本身，逐字保留自拆分前的
+        ``record_decision``——拆分只为了让 :meth:`record_decision` 能在外层包一层
+        不影响这里任何缩进的 ``try/except OperationalError``。"""
 
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
@@ -239,6 +289,10 @@ class PostgresPermissionPublishStore:
                         (user_id,),
                     )
                     latest = cursor.fetchone()
+                    # 清理触发的判据（第 4 步文档）：与上面的 ENQUEUED/UNCHANGED
+                    # 判定完全独立，只比较 permissions 列文本，不看 email/name 等
+                    # 资料字段，也不看上一条意图的状态。
+                    permissions_changed = latest is None or _permissions_changed(latest[1], row)
                     if latest is not None and _same_content(latest[1], row) and latest[2] in (
                         "pending",
                         "publishing",
@@ -274,11 +328,14 @@ class PostgresPermissionPublishStore:
                     )
 
                 cleared_events = 0
-                if clear_delivered_content:
+                if clear_delivered_content and permissions_changed:
                     # 同一个连接、同一个事务：上面 SELECT ... FOR UPDATE 拿到的
                     # app_user 行锁在这里仍然有效，enqueue_publish 的 INSERT 也还
                     # 没提交。清理若抛异常，version 推进与发布意图入队随事务一起
                     # 回滚（方法文档第 4 步、"同一事务、同一姿态"两节）。
+                    # ``permissions_changed`` 收窄（Trace #328 opus 审查 P1）：
+                    # ENQUEUED 但 permissions 列文本没变时（改名重发、失败重排同
+                    # 内容）不清——见方法文档第 4 步的完整理由。
                     cleared_events = _ConversationTransaction(connection).clear_delivered_content_for_user(
                         user_id=user_id, reason="user_cleared"
                     )
@@ -781,6 +838,26 @@ def _same_content(payload: Any, row: PublishRow) -> bool:
         return False
     expected = row.content_fields
     return all(str(payload.get(name, "")) == value for name, value in expected.items())
+
+
+def _permissions_changed(payload: Any, row: PublishRow) -> bool:
+    """已送达正文清理触发的专属判据（Trace #328 opus 审查 P1）：这次决定的
+    ``permissions`` 文本是否与该用户**上一条意图**（不论其状态——失败、被取代、
+    仍然有效都一样，见 :meth:`PostgresPermissionPublishStore.record_decision`
+    文档第 4 步）不同。
+
+    刻意不复用 :func:`_same_content`：那个函数比较的是**整行**（含
+    ``record_key``/``email``/``name``），服务的是 ENQUEUED/UNCHANGED 判定——回答
+    "要不要排一条新的发布意图"；这里回答的是完全不同的问题——"这个人**实际可用
+    权限**变了吗"，只有这一个答案能决定要不要清空已送达正文。改名（``email``/
+    ``display_name`` 变化）或对同一份权限内容的重试发布都会让前者判真，但都不该
+    触发清理——分开两个函数，让"哪个判定服务哪个决定"在类型上说得清楚，不是靠
+    调用方记得只取子集字段。
+    """
+
+    if not isinstance(payload, Mapping):
+        return True
+    return str(payload.get("permissions", "")) != row.permissions
 
 
 def _error_detail(attempt: PublishAttempt) -> str | None:

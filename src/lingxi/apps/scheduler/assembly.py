@@ -804,7 +804,7 @@ def _build_onboarding_duty(
         # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
         # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
         onboarding_failed=onboarding_failed, local_overrides=local_override_reader(dsn, timeouts=timeouts),
-        legacy_source=legacy_source,
+        legacy_source=legacy_source, publish_history=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(
         store=store,

@@ -339,12 +339,24 @@ class PermissionAggregate:
 
         公司编号（``boss_company_id``）与职能标签不是人员资料，可以留痕；邮箱、姓名、
         工号一个都不在这里（纪律同 ``adapters/feishu_roster_bitable.audit_facts``）。
+
+        **``companies`` 在 ``all_companies=True`` 时输出 ``None``，不输出
+        ``len(self.companies)``**（Trace #328 opus 审查 P2）：「角色即全公司」特例
+        （本模块「角色即全公司」特例一节，产品负责人 2026-08-27 裁定，Trace #328
+        裁定 #1）让 ``all_companies`` 可以在 ``companies`` 只有一两个具体公司时仍然
+        为真——``companies`` 此刻只是"这次快照恰好解释出了哪些公司"，与实际覆盖
+        范围（全公司，含未来新增公司）毫无关系。继续输出这个数字会在审计行里读出
+        一句自相矛盾的话（"companies: 1, all_companies: true"，像是"覆盖 1 家公司
+        却又说是全公司"），银河「全非」通配展开成的大列表同样如此——那也只是"这次
+        快照当时能看到多少国家"，不是真正的覆盖范围上界。``all_companies`` 为真时
+        这个数字对任何读者都没有意义，因此显式置空，不写一个会被误读成"范围只有
+        这么大"的数字。
         """
 
         return {
             "granted": self.granted,
             "reason": self.reason,
-            "companies": len(self.companies),
+            "companies": None if self.all_companies else len(self.companies),
             "functions": list(self.functions),
             "all_companies": self.all_companies,
             "roles": self.role_count,

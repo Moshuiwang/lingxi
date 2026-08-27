@@ -129,6 +129,31 @@ class LocalPermissionRenderingTests(unittest.TestCase):
 
         self.assertIn("抑制", card.title)
 
+    def test_grant_card_carries_the_zero_galaxy_permission_caveat(self) -> None:
+        """零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus
+        审查 P1）：授权确认卡必须提示"若该用户当前无任何银河权限，本地授权
+        暂不生效"——四源合并挂在 `aggregate.granted` 判据之后，管理员点确认前
+        应当知道这条边界。"""
+
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertIn("若该用户当前无任何银河权限，本地授权暂不生效", card.body)
+        self.assertIn("V-权限-15", card.body)
+
+    def test_suppress_card_does_not_carry_the_zero_galaxy_permission_caveat(self) -> None:
+        """否定断言：本地抑制没有这个问题——银河那一侧本就是零时，抑制与否
+        结果一样，不会制造虚假期待，因此不该出现这句只适用于授权的提示。"""
+
+        pending = _pending(
+            action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, payload=_GRANT_PAYLOAD
+        )
+        card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
+
+        self.assertNotIn("暂不生效", card.body)
+
     def test_suspend_card_has_no_scope_line(self) -> None:
         """非本地权限动作（``payload`` 恒为 ``None``）不产生任何范围行——
         既有 suspend/resume 卡片正文逐字节不变。"""
@@ -171,15 +196,17 @@ class LocalPermissionRenderingTests(unittest.TestCase):
         self.assertNotIn("指标", notice)
 
     def test_malformed_payload_does_not_crash_rendering(self) -> None:
-        """脏数据兜底：``payload`` 不是合法 JSON 时渲染函数不得抛异常，只是
-        跳过范围行——纯函数不允许因为一条历史脏数据整体崩溃。"""
+        """脏数据兜底：``payload`` 不是合法 JSON 时渲染函数不得抛异常（纯函数不
+        允许因为一条历史脏数据整体崩溃），且**不再静默丢弃「范围」段**（Trace #328
+        opus 审查 P2）——降级为一行可读的提示，指引管理员取消本卡重新发起，而不是
+        让他在没看到范围的情况下点确认。"""
 
         pending = _pending(
             action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload="not-json{"
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertNotIn("范围：", card.body)
+        self.assertIn("范围信息不可用，请取消本卡重新发起", card.body)
 
 
 class RevokeRenderingTests(unittest.TestCase):
@@ -247,12 +274,16 @@ class RevokeRenderingTests(unittest.TestCase):
         self.assertIn("授权", notice)
 
     def test_malformed_revoke_payload_does_not_crash_rendering(self) -> None:
+        """同 ``LocalPermissionRenderingTests.test_malformed_payload_does_not_
+        crash_rendering``（Trace #328 opus 审查 P2）：不崩溃，且不静默丢弃「范围」
+        段——降级为可读提示。"""
+
         pending = _pending(
             action_type=PendingActionType.LOCAL_PERMISSION_REVOKE, payload="not-json{"
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertNotIn("范围：", card.body)
+        self.assertIn("范围信息不可用，请取消本卡重新发起", card.body)
         self.assertNotIn("方向：", card.body)
 
 

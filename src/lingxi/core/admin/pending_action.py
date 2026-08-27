@@ -186,6 +186,31 @@ class PrepareDecision:
     message: str = ""
 
 
+#: ``not_found`` 分支的文案，按动作类型分化（Trace #328 opus 审查升级的 P2：此前
+#: 收回也会落到一句"未找到该用户记录"，而收回场景下 ``current_account_state is
+#: None`` 说的是"没查到这一条本地权限登记"——``target_open_id`` 形参此刻装的是
+#: override_id，不是任何人的身份标识，"用户记录"这个词本身就说错了对象）。
+_NOT_FOUND_MESSAGE: dict[PendingActionType, str] = {
+    PendingActionType.SUSPEND_USER: "未找到该用户记录。",
+    PendingActionType.RESUME_USER: "未找到该用户记录。",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "未找到该用户记录。",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "未找到该用户记录。",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "未找到该条本地权限登记。",
+}
+
+#: ``target_state_changed`` 分支的文案，按动作类型分化（Trace #328 opus 审查升级
+#: 的 P2：此前本地权限三类动作全部落进"suspend 之外都当 resume 处理"的 ``else``
+#: 分支，字面导向"请去 /admin resume"——对一个授权/抑制/收回命令毫无意义，是一条
+#: 真实的误导面）。
+_TARGET_STATE_CHANGED_MESSAGE: dict[PendingActionType, str] = {
+    PendingActionType.SUSPEND_USER: "该用户当前不是启用状态，无需停用（或当前状态不支持停用）。",
+    PendingActionType.RESUME_USER: "该用户当前不是停用状态，无需恢复（或当前状态不支持恢复）。",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先收回）。",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先收回）。",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "该条本地权限当前不是生效状态，无需收回（或已被收回/替代）。",
+}
+
+
 def decide_prepare(
     *, action_type: PendingActionType, current_account_state: str | None
 ) -> PrepareDecision:
@@ -196,14 +221,16 @@ def decide_prepare(
     """
 
     if current_account_state is None:
-        return PrepareDecision(ok=False, code="not_found", message="未找到该用户记录。")
+        return PrepareDecision(
+            ok=False, code="not_found", message=_NOT_FOUND_MESSAGE[action_type]
+        )
     valid_states = VALID_SOURCE_STATES[action_type]
     if current_account_state not in valid_states:
-        if action_type is PendingActionType.SUSPEND_USER:
-            message = "该用户当前不是启用状态，无需停用（或当前状态不支持停用）。"
-        else:
-            message = "该用户当前不是停用状态，无需恢复（或当前状态不支持恢复）。"
-        return PrepareDecision(ok=False, code="target_state_changed", message=message)
+        return PrepareDecision(
+            ok=False,
+            code="target_state_changed",
+            message=_TARGET_STATE_CHANGED_MESSAGE[action_type],
+        )
     return PrepareDecision(ok=True)
 
 
