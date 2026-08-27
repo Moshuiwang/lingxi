@@ -199,6 +199,31 @@ def _report_token_usage(report: Mapping[str, Any]) -> dict[str, int] | None:
     return result or None
 
 
+def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """从一次回合报告里取出**供落库**的文档投递请求（Issue #341 S-ES-3）。
+
+    ``report["document_request"]`` 由 ``apps/worker/report.py::build_report``
+    投影（见该函数文档）：``None`` 或已经通过硬上限与出口安全检查的
+    ``{"title": str, "paragraphs": list[str]}``。这里只做结构校验、不重复上游
+    已经做过的业务校验——形状不对（早退分支、字段类型不符预期）一律返回
+    ``None``，与 :func:`_report_guard_denied_count`/:func:`_report_token_usage`
+    同一纪律：结构性地不可信就不传，不猜测、不编造。
+    """
+
+    request = report.get("document_request") if isinstance(report, Mapping) else None
+    if not isinstance(request, Mapping):
+        return None
+    title = request.get("title")
+    paragraphs = request.get("paragraphs")
+    if not isinstance(title, str) or not title:
+        return None
+    if not isinstance(paragraphs, list) or not paragraphs or not all(
+        isinstance(paragraph, str) for paragraph in paragraphs
+    ):
+        return None
+    return {"title": title, "paragraphs": paragraphs}
+
+
 def _tool_result_count(report: Mapping[str, Any]) -> int:
     """从一次回合报告里取出这一轮**真实**工具调用次数（Issue #291 L6 取证结论补的
     可观测性缺口）。
@@ -941,6 +966,14 @@ class WorkerService:
                 system_prompt_digest=system_prompt_digest,
                 guard_denied_count=guard_denied_count_for_report,
                 token_usage=token_usage_for_report,
+                # 文档投递请求（Issue #341 S-ES-3 报告契约）：只在这一轮真正判定
+                # 为业务成功的分支才转发——其余分支（stop/failure/protocol
+                # breakdown/withheld）即使 report["document_request"] 恰好非空
+                # （理论上不会：turn.py 只在 failure is None 时才填充这个字段，
+                # 但这几个分支各自有自己判成非成功的独立理由，例如 withheld 是
+                # 安全策略事后拒发正文），也绝不建文档投递请求——用户既然没有
+                # 拿到问答本身的结果，就不该收到一份可能同样有问题的文档。
+                document_request=_report_document_request(report),
             )
 
         # 内测轮内容级采集（Issue #251/#304 批次 3）：无论上面走了哪条终态分支
@@ -1073,6 +1106,7 @@ class WorkerService:
         system_prompt_digest: str | None = None,
         guard_denied_count: int | None = None,
         token_usage: Mapping[str, int] | None = None,
+        document_request: Mapping[str, Any] | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -1090,6 +1124,12 @@ class WorkerService:
         不编造"的通报统计用值，与上面供日志用的 ``denied_count``（取不到时如实
         记 0）故意不是同一份计算结果，见调用方 ``_report_guard_denied_count``/
         ``_report_token_usage`` 的文档。
+
+        ``document_request``（Issue #341 S-ES-3，迁移 ``0074``）：只有调用方
+        （``_process_task`` 的真正成功分支）判定过这一轮同时满足"业务成功"与
+        "报告契约携带非空 document_request"时才非 ``None``——原样透传给
+        ``self._queue.write_terminal_event``，由它在写终态事件的同一事务里插入
+        一行文档投递请求。其余分支恒传默认值 ``None``，不产生任何行为差异。
         """
 
         self._log_terminal_outcome(
@@ -1113,6 +1153,7 @@ class WorkerService:
             agent_session_id=session_id,
             token_usage=token_usage,
             guard_denied_count=guard_denied_count,
+            document_request=document_request,
         )
 
     def _log_terminal_outcome(

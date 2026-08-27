@@ -112,6 +112,8 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.range_updated",
     "permission.range_revoked",
     "permission.all_companies",
+    # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
+    "delivery.document_ready",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

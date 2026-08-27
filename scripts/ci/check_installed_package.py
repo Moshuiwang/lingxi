@@ -326,6 +326,13 @@ REQUIRED_MODULES = (
     # `lingxi.core.identity.provisioning` 一条理由——必须随制品发布，否则接线那天
     # 才发现 wheel 里没有它。
     "lingxi.adapters.feishu_docx_delivery",
+    # 文档投递独立消费循环（Issue #341 S-ES-3）：`apps/gateway/document_delivery.py`
+    # 认领 `task_document_delivery_request` 行、驱动 S-ES-1 的四步交付，持久化面
+    # 在 `adapters/postgres_document_delivery.py`。由 `apps/gateway/__init__.py`
+    # 在**模块级** import（同 `apps/gateway/delivery.py` 那一条理由，漏登记会直接
+    # 让 gateway 起不来）。
+    "lingxi.apps.gateway.document_delivery",
+    "lingxi.adapters.postgres_document_delivery",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
@@ -825,6 +832,26 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 2026-08-18 裁定把编排整体移进 scheduler）。因此这里只有那条装配断言模块，
             # 整条判定链与它的适配器都在 scheduler 组，不在本进程的闭包里。
             "lingxi.apps.gateway.onboarding",
+            # 文档投递独立消费循环（Issue #341 S-ES-3）：由 `apps/gateway/__init__.py`
+            # 模块级 import `apps.gateway.document_delivery`（同 `apps.gateway.delivery`
+            # 那一条理由）；`assemble_document_delivery_consumer` 在函数内 import
+            # 建文档四步适配器（`feishu_docx_delivery`）、令牌供给三件套
+            # （`core.identity.access_token_supply`/`core.permission`/
+            # `core.permission.table_access_token_supply`/
+            # `core.permission.tenant_token_supply`/`feishu_tenant_token`，与
+            # scheduler 组「应用身份令牌」那条闭包同一来源）、完成通知出口
+            # （`feishu_user_message`，已因 scheduler 权限变化通知在 REQUIRED_MODULES
+            # 里，这里是它第一次进入 gateway 自己的运行时闭包）、以及持久化面
+            # （`postgres_document_delivery`）。
+            "lingxi.apps.gateway.document_delivery",
+            "lingxi.adapters.postgres_document_delivery",
+            "lingxi.adapters.feishu_docx_delivery",
+            "lingxi.adapters.feishu_tenant_token",
+            "lingxi.adapters.feishu_user_message",
+            "lingxi.core.identity.access_token_supply",
+            "lingxi.core.permission",
+            "lingxi.core.permission.table_access_token_supply",
+            "lingxi.core.permission.tenant_token_supply",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
         # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import

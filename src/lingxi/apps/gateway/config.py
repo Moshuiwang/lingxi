@@ -87,6 +87,15 @@ class GatewayConfig:
     # `repr(config)`，不会随手一个 `logger.info("配置 %s", config)` 就把内测
     # 名单整份写进日志。
     innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
+    # 文档投递独立消费循环（Issue #341 S-ES-3）的租户域名——不是密钥，是拼文档
+    # 链接用的裸域名（例如 gv3qfk4q2rp.feishu.cn，见
+    # ``adapters/feishu_docx_delivery.py`` 模块文档「文档 URL 的构造」）。**可选，
+    # 默认 ``None``**：未配置时 ``apps/gateway/document_delivery.py`` 的
+    # ``assemble_document_delivery_consumer`` 整体不注册这条循环（失败关闭，与
+    # ``roster_audit.duty_not_registered`` 等既有姿态一致），不是"用一个猜测的
+    # 域名硬跑"。飞书没有开放接口能查询"当前租户的裸域名"，只能由运维在部署时
+    # 显式提供。
+    tenant_domain: str | None = None
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -187,6 +196,26 @@ def _innertest_roster_open_ids(env: Mapping[str, str]) -> frozenset[str]:
         ) from None
 
 
+def _tenant_domain(env: Mapping[str, str]) -> str | None:
+    """文档投递独立消费循环的租户域名（Issue #341 S-ES-3）：未配置即 ``None``
+    （循环不注册，见 :class:`GatewayConfig` 该字段的文档）；配了就在构造期校验
+    形状——裸域名、不含协议/路径/空白，与
+    ``adapters.feishu_docx_delivery._require_tenant_domain`` 同一条校验，这里
+    提前跑一遍是为了让一个拼错的域名在**启动期**就失败关闭，而不是等到第一次
+    真正建文档、准备拼链接时才发现。
+    """
+
+    raw = _text(env, "TENANT_DOMAIN")
+    if raw is None:
+        return None
+    from lingxi.adapters.feishu_docx_delivery import _require_tenant_domain
+
+    try:
+        return _require_tenant_domain(raw)
+    except ValueError as error:
+        raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
+
+
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
@@ -239,6 +268,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
         card_failure_injection=_card_failure_injection(env),
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
+        tenant_domain=_tenant_domain(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，
