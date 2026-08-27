@@ -983,6 +983,13 @@ class McpOversizeResultRewriteTest(unittest.TestCase):
             ("plain string", self._TRUNCATED_TEXT),
             ("content block list", [{"type": "text", "text": self._TRUNCATED_TEXT}]),
             ("mapping with text", {"text": self._TRUNCATED_TEXT}),
+            # 独立审核 P1-2：Agent SDK `CallToolResult` 的典型信封形状——此前
+            # `_is_oversize_tool_result` 的 Mapping 分支只读顶层 "text"，这一
+            # 形状因为文本嵌在 "content" 里、没有顶层 "text"，改写从未生效过。
+            (
+                "mapping with content blocks (CallToolResult envelope)",
+                {"content": [{"type": "text", "text": self._TRUNCATED_TEXT}], "isError": False},
+            ),
         ):
             with self.subTest(shape=shape):
                 gateway = build_gateway()
