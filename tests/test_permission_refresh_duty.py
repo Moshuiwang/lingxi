@@ -52,12 +52,14 @@ from lingxi.apps.scheduler.permission_refresh import (
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
+from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.merge_sources import (
     REASON_GRANT_REDUNDANT_WILDCARD,
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
+from lingxi.core.permission.publish import ExistingPermissionRow
 from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
@@ -274,6 +276,43 @@ class FakeLocalOverrides:
         return self._entries.get(user_id, ())
 
 
+class FakeLegacyTable:
+    """存量权限只读源的假实现（S-P-2，Issue #319 / Trace #328）。
+
+    ``rows_by_email`` 按（规范化）邮箱登记该用户存量行的 ``permissions`` 单元格文本；
+    ``find_error`` 非空时直接抛异常；``duplicate_for`` 里的邮箱命中两行，供
+    :class:`LegacySourceMergeTest` 钉住"读取失败/多行冲突只降级、不整用户/整轮失败"。
+    """
+
+    def __init__(
+        self,
+        rows_by_email: dict[str, str] | None = None,
+        *,
+        find_error: Exception | None = None,
+        duplicate_for: set[str] | None = None,
+    ) -> None:
+        self._rows = rows_by_email or {}
+        self._find_error = find_error
+        self._duplicate_for = duplicate_for or set()
+        self.find_calls: list[tuple[str, str]] = []
+
+    def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
+        self.find_calls.append((record_key, email))
+        if self._find_error is not None:
+            raise self._find_error
+        if email not in self._rows:
+            return ()
+        row = ExistingPermissionRow(
+            record_id=f"rec_{email}",
+            fields={"record_key": email, "email": email, "permissions": self._rows[email]},
+        )
+        return (row, row) if email in self._duplicate_for else (row,)
+
+    def read_row(self, record_id: str) -> dict[str, str]:
+        email = record_id.removeprefix("rec_")
+        return {"permissions": self._rows[email]}
+
+
 class _FakeDecision:
     def __init__(self, enqueued: bool) -> None:
         self.enqueued = enqueued
@@ -386,6 +425,7 @@ def build_duty(
     metric_translation_map=None,
     role_function_map=None,
     local_overrides: FakeLocalOverrides | None = None,
+    legacy_source: FakeLegacyTable | None = None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
@@ -411,6 +451,7 @@ def build_duty(
         clock=clock or FixedClock(TODAY),
         stop=stop,
         local_overrides=local_overrides,
+        legacy_source=legacy_source,
     )
     return duty, {
         "audit": audit,
@@ -1072,6 +1113,101 @@ class LocalOverrideMergeTest(unittest.TestCase):
         self.assertEqual(
             reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
         )
+
+
+class LegacySourceMergeTest(unittest.TestCase):
+    """存量权限沿用接线（S-P-2，Issue #319 / Trace #328）：与
+    ``tests/test_permission_legacy_source.py`` 的纯函数用例同一组语义，这里钉的是
+    ``PermissionRefreshDuty`` 真的把它接进四源合并、真的按失败语义降级审计。"""
+
+    def test_table_absent_matches_todays_behavior(self) -> None:
+        """装配层未接线（``legacy_source=None``，默认值）：产出与接线之前逐字节
+        一致——`GrantedUserTest.test_the_published_row_is_built_from_the_archived_identity`
+        的同一断言。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+
+    def test_no_matching_legacy_row_is_also_identity(self) -> None:
+        """接线了但这个用户没有存量行：与"没有接线"同一个结果——新用户的常见形态。"""
+
+        legacy = FakeLegacyTable({})
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(legacy.find_calls, [(EMAIL_ONE, EMAIL_ONE)])
+
+    def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
+        """存量沿用后聚合含并集（本卡验收断言①）。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["legacy_metric"]}}'})
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["legacy_metric","{METRIC_NAME}"]}}')
+
+    def test_read_failure_skips_legacy_source_and_audits(self) -> None:
+        """读取失败：该用户本轮跳过存量源并响亮审计，不整轮失败——发布仍然照常
+        进行（只是不含存量沿用），不计入 ``report.failed``（本卡验收断言②）。"""
+
+        legacy = FakeLegacyTable(find_error=RuntimeError("注入的存量表读取失败"))
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        report = duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(report.failed, 0, "存量源读取失败不得记成整用户失败")
+        self.assertIn("permission_refresh.legacy_source_skipped", parts["audit"].actions())
+        fields = parts["audit"].fields_for("permission_refresh.legacy_source_skipped")[0]
+        self.assertEqual(fields["user"], USER_ONE)
+        self.assertEqual(fields["reason"], REASON_LEGACY_READ_FAILED)
+        self.assertEqual(fields["error"], "RuntimeError")
+
+    def test_conflicting_legacy_rows_are_skipped_with_a_distinct_reason(self) -> None:
+        """命中多行：不知道该沿用哪一行，失败关闭并跳过——原因码与读取失败
+        可分辨（本卡验收断言⑤）。"""
+
+        legacy = FakeLegacyTable(
+            {EMAIL_ONE: f'{{"{COMPANY_ID}":["legacy_metric"]}}'}, duplicate_for={EMAIL_ONE}
+        )
+        duty, parts = build_duty(identities=(identity(),), legacy_source=legacy)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}', "冲突时存量源整体不生效")
+        fields = parts["audit"].fields_for("permission_refresh.legacy_source_skipped")[0]
+        self.assertEqual(fields["reason"], "multiple_rows")
+        self.assertNotIn("error", fields, "多行冲突不源自某个被捕获的异常，没有可报告的错误类名")
+
+    def test_wildcard_admin_skips_legacy_too(self) -> None:
+        """通配角 v1：``all_companies=True`` 时存量沿用同样整体不参与合并（本卡验收
+        断言④），结果与银河原始的通配映射逐字节相同——即使这个用户确实有一行存量
+        权限。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: '{"1099":["额外存量指标"]}'})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=((GALAXY_ACCOUNT_ONE, ADMIN_FULL_ACCESS_FUNCTION),)),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: (METRIC_NAME,)}},
+            legacy_source=legacy,
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"*":["{METRIC_NAME}"]}}', "通配下存量源整体不生效")
 
 
 # --------------------------------------------------------------------------

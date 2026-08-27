@@ -185,6 +185,10 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.adapters.postgres_local_permission",
     "lingxi.core.permission.merge_sources",
+    # 存量权限只读源（S-P-2，Issue #319 / Trace #328）：读正式权限发布表的纯逻辑
+    # （`read_legacy_permissions`/`resolve_legacy_source`）在 core，真实传输在
+    # `adapters.feishu_permission_bitable`（已经登记，见下方权限发布表一节）。
+    "lingxi.core.permission.legacy_source",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
     # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
     # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
@@ -479,6 +483,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
             "lingxi.core.permission.merge_sources",
+            # 存量权限只读源（S-P-2，Issue #319 / Trace #328）：`permission_refresh.py`
+            # 与 `onboarding_runner.py` 都模块级 import 了
+            # `resolve_legacy_source`/`read_legacy_permissions`；`build_loop` 在函数内
+            # import 真实传输 `BitablePermissionTable`（已在 `feishu_permission_bitable`
+            # 一节登记，这里不重复）。
+            "lingxi.core.permission.legacy_source",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
@@ -520,10 +530,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `adapters.postgres_local_permission` 与它引用的
             # `core.permission.local_override` 一并拉进 scheduler 闭包（`admin_
             # registry.py` 本就在这个闭包里，供 admin_bootstrap 种子写入使用）。
-            # 不新增第三方依赖：两个模块都只用标准库 + 已在本闭包内的 `adapters.
-            # postgres`/`core.ids`。
-            "lingxi.adapters.postgres_local_permission",
-            "lingxi.core.permission.local_override",
+            # 两个模块已经在上面「四源聚合集中合并」一节登记过（S-P-3 落地更早），
+            # 这里不重复登记同一个字面量——门禁对首列的重复做静态核对，一处登记
+            # 已经证明"装得上"，重复只会让核对本身变得可疑。
             "lingxi.core.admin",
             "lingxi.core.admin.registry",
             "lingxi.core.admin.views",
@@ -555,10 +564,8 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 覆盖表的读路径，与上面两个通报 adapter 同一条"函数内 import 证明
             # 不了装得上"的理由；该 adapter 模块级 import 了
             # `core.permission.local_override` 的纯类型（`LocalPermissionOverrideEntry`/
-            # `OverrideDirection`），因此一并登记（与 gateway 闭包里 S-P-1b 那条
-            # 同款传递依赖同一姿态，见下方 gateway 组「本地权限授权/抑制全链路」）。
-            "lingxi.adapters.postgres_local_permission",
-            "lingxi.core.permission.local_override",
+            # `OverrideDirection`）——两者都已在「四源聚合集中合并」一节登记过，
+            # 这里不重复登记同一个字面量（理由同「本地权限授权/抑制全链路」一节）。
             "lingxi.adapters.postgres",
             # 空闲会话到点清理职责（内审 P2-2）在 `build_loop` 里 import
             # `PostgresTaskQueue`；它的模块级 import 又把整个 `core.conversation`

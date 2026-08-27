@@ -198,6 +198,7 @@ from lingxi.core.identity.stock_token_source import (
     StockTokenSource,
 )
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
@@ -496,7 +497,7 @@ class AutoOnboardingRunner:
         notify_attempts: int = 3,
         publish_allowed: Callable[[], bool] | None = None,
         onboarding_failed: Callable[[str, str], None] | None = None,
-        local_overrides: LocalOverrideSource | None = None,
+        local_overrides: LocalOverrideSource | None = None, legacy_source: LegacyPermissionTable | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -558,8 +559,8 @@ class AutoOnboardingRunner:
         #: 两者都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也
         #: 没有传这些的位置。
         self._onboarding_failed = onboarding_failed
-        # 本地权限覆盖读取口（S-P-3）：``None``＝装配层未接线，行为与改动前逐字节一致。
-        self._local_overrides = local_overrides
+        # 本地权限覆盖读取口（S-P-3）与存量权限只读源（S-P-2 #328）：均为 ``None``＝装配层未接线，行为与改动前逐字节一致。
+        self._local_overrides, self._legacy_source = local_overrides, legacy_source
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -1304,12 +1305,11 @@ class AutoOnboardingRunner:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
             # 没有"这一行是谁的"的答案。归确定性业务失败，不是本侧故障。
             return _not_authorized("archived_identity_incomplete")
-        # 四源合并（S-P-3 #319），接线点在这里而非更早的 `_match`——本地覆盖的
-        # `user_id` 是内部 `app_user.id`，聚合时还没有它；`galaxy` 是现算的职能标签
-        # 映射（onboarding 尚未接翻译层），详见 `merge_sources.py` 模块文档「挂点」一节。
+        # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328），接线点在这里而非更早的 `_match`——本地覆盖的 `user_id` 是内部 `app_user.id`，聚合时还没有它。
+        # `galaxy` 是现算的职能标签映射（onboarding 尚未接翻译层），详见 `merge_sources.py` 模块文档「挂点」一节；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
         galaxy_map = {ALL_COMPANIES_KEY: aggregate.functions} if aggregate.all_companies else {company: aggregate.functions for company in aggregate.companies}
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy=galaxy_map, local=local)
+        merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=resolve_legacy_source(email=request.email, table=self._legacy_source, audit=self._audit, action="onboarding.legacy_source_skipped", user=user_id))
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
         row = build_translated_publish_row(
