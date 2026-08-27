@@ -263,6 +263,35 @@ class InnertestRosterConfigTests(unittest.TestCase):
         )
 
 
+class BotOpenIdConfigTests(unittest.TestCase):
+    """机器人自身 open_id 的 gateway 侧解析（Issue #318 群聊@机器人固定引导，
+    #328 v1.0 裁定 #5）。
+
+    刻意不带 ``LINGXI_GATEWAY_`` 前缀——理由见 ``GatewayConfig.bot_open_id`` 的
+    字段文档。未配置＝功能整体关闭（失败关闭），不是启动失败：这是一个可选职责，
+    与 ``admin_group_chat_id`` 同一取舍。
+    """
+
+    def test_bot_open_id_defaults_to_none(self) -> None:
+        config = load_config(VALID_ENV)
+        self.assertIsNone(config.bot_open_id)
+
+    def test_bot_open_id_is_read_from_the_unprefixed_variable(self) -> None:
+        config = load_config({**VALID_ENV, "LINGXI_BOT_OPEN_ID": "ou_bot_0000000000"})
+        self.assertEqual(config.bot_open_id, "ou_bot_0000000000")
+
+    def test_blank_bot_open_id_counts_as_not_configured(self) -> None:
+        config = load_config({**VALID_ENV, "LINGXI_BOT_OPEN_ID": "   "})
+        self.assertIsNone(config.bot_open_id)
+
+    def test_the_variable_name_is_not_prefixed_with_lingxi_gateway(self) -> None:
+        env = {**VALID_ENV, f"{ENV_PREFIX}BOT_OPEN_ID": "ou_should_be_ignored"}
+        config = load_config(env)
+        self.assertIsNone(
+            config.bot_open_id, "带 LINGXI_GATEWAY_ 前缀的同名变量不应该被读取"
+        )
+
+
 class BuildSupervisorTests(unittest.TestCase):
     """``build_supervisor`` 的装配，含空闲轮询间隔的推导。"""
 

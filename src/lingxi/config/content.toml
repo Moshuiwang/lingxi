@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-26"
+version = "2026-08-27"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -42,6 +42,11 @@ version = "2026-08-26"
 # 触发内部工具误用。这条文案用于 gateway 在入队前直接回绝这类消息，不说明内部
 # 解析细节，只给用户一个可行动的改法。
 "gateway.slash_rejected" = "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
+# Issue #318（#328 v1.0 裁定 #5 排入实施）：群聊里精确 @ 到机器人本身时的固定引导，
+# 只在这一种情况下才打破「群聊完全静默」（普通群消息、@别人仍完全静默）。判定与
+# 节流实现见 adapters/feishu_events.py 的 NonPrivateChatError、apps/gateway/__init__.py
+# 的 GroupMentionHintResponder。**文案为实现草案，产品负责人过目前不作为最终定稿。**
+"gateway.group_mention_hint" = "我目前只在私聊里提供问数服务。请点我的头像发起私聊，把问题直接发给我就可以。"
 
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"
