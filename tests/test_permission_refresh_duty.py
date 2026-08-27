@@ -2136,10 +2136,11 @@ class DutyRegistrationTest(unittest.TestCase):
         # 组织快照同步（Issue #250）两个令牌供给默认总能建出来，因此总会真实注册，
         # 排在权限发布消费之后（本文件不是这条位置断言的权威归属，只需不被带崩）。
         self.assertIn("组织快照同步", names)
-        # 迟到就绪恢复（V-开通-18）与开通中途停摆收口（Issue #282，V-开通-19）都
-        # 没有可选前置会让它们整体不装配，因此**总是**排在最后（本用例没有传
-        # alerting_duty；本文件同样不是这条位置断言的权威归属，只需不被带崩）。
-        self.assertEqual(names[-1], "开通中途停摆收口")
+        # 迟到就绪恢复（V-开通-18）、开通中途停摆收口（Issue #282，V-开通-19）与
+        # 文档投递死信扫描（Issue #341 R-2）都没有可选前置会让它们整体不装配，
+        # 因此**总是**排在最后（本用例没有传 alerting_duty；本文件同样不是这条
+        # 位置断言的权威归属，只需不被带崩）。
+        self.assertEqual(names[-1], "文档投递死信扫描与正文到期擦除")
         self.assertEqual(self._own_records(audit), [], "前置齐备时不该有『未注册』审计")
         loop.request_stop()
         self.assertTrue(all(duty.stopping for duty in loop.duties))

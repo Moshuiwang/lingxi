@@ -278,6 +278,43 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
         )
         self.assertTrue(received)
 
+    def test_progress_content_decodes_to_the_semantic_status_text(self) -> None:
+        """P2-2（Issue #328 opus 审查）：`_handle_progress` 真的把
+        `event.content` 交给 `decode_progress_action` 解码、再传给
+        `CardStream.update`——不是只把游标推进了、内容字段被忽略（杀 M15：把
+        `decode_progress_action(event.content)` 换成恒 `(processing, None)`
+        或者直接不传 `content`，本用例会变红，因为渲染出的状态文案会退回默认
+        「正在处理」而不是这里断言的"第 2 次查询"文案）。"""
+
+        from lingxi.core.execution.card_stream import (
+            PROGRESS_ACTION_QUERYING,
+            encode_progress_action,
+        )
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        clock = [0.0]
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+        )
+        consumer.run_once()  # 只处理 started：建卡。
+
+        clock[0] = 0.6  # 越过 `V-卡片-02` 的 500ms 单话题节流窗口
+        self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=5,
+            content=encode_progress_action(PROGRESS_ACTION_QUERYING, query_count=2),
+        )
+        consumer.run_once()
+
+        self.assertEqual(len(cards.update_calls), 1, "确实推进到了 progress 更新这一步")
+        rendered_body = cards.update_calls[0]["card"].body
+        self.assertIn("正在第 2 次查询指标数据", rendered_body)
+        self.assertNotIn("正在处理", rendered_body, "不应该退回默认 processing 文案")
+
     def test_a_second_round_with_no_new_events_does_not_repeat_delivery(self) -> None:
         """重复轮询（没有新事件）不应该产生第二次外部调用（状态合同第 7 条）。"""
 

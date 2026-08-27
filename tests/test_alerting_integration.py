@@ -661,6 +661,44 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
                 )
                 self.assertIn("trace_id=gateway-delivery-loop", sender.calls[0]["text"])
 
+    def test_document_delivery_terminal_kinds_alert_immediately_under_production_defaults(
+        self,
+    ) -> None:
+        """Issue #341 opus 审查 R-1：文档交付独立消费循环的三类单行终态（明确失败、
+        结果不明、成功但通知发送失败）与循环死亡必须**单条即达讫**——不能等攒够
+        阈值。文档交付是低频动作（见 ``apps/gateway/document_delivery.py`` 的
+        ``DEFAULT_BATCH_LIMIT`` 文档），同一个任务在 300 秒窗口内几乎不可能自然
+        重复三次触发同一个 ``(kind, task_id)``，原样套用"攒够阈值次数"等于让这
+        几类实质上永远发不出告警——与 PR #173 独立复核 P1-4 是同一个 300 秒撞
+        300 秒陷阱。把 ``delivery_alert_callback`` 里新增的
+        ``document_delivery_*`` 判断删掉，本用例会变红（发出的告警条数变成 0）。
+        """
+
+        for kind in (
+            "document_delivery_failed",
+            "document_delivery_uncertain",
+            "document_delivery_notice_failed",
+            "document_delivery_loop_dead:RuntimeError",
+        ):
+            with self.subTest(kind=kind):
+                sender = FakeAlertSender()
+                clock = ManualClock()
+                duty = AlertingDuty(
+                    manager=AlertManager(policy=AlertPolicy()),
+                    dispatcher=AlertDispatcher(sender=sender, chat_id="oc_group", clock=clock),
+                    clock=clock,
+                )
+
+                duty.delivery_alert_callback()(kind, "01J00000000000000000000TASK")
+                duty.dispatcher.run_once(at=clock.value)
+
+                self.assertEqual(
+                    len(sender.calls),
+                    1,
+                    "文档交付终态告警必须在第一次上报时就发出，不能等攒够阈值",
+                )
+                self.assertIn("trace_id=01J00000000000000000000TASK", sender.calls[0]["text"])
+
 
 class OnboardingFailedAlertCallbackTests(unittest.TestCase):
     """Issue #280 §7.3 步 1：开通失败真实送达管理群

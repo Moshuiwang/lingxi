@@ -87,6 +87,23 @@ class GatewayConfig:
     # `repr(config)`，不会随手一个 `logger.info("配置 %s", config)` 就把内测
     # 名单整份写进日志。
     innertest_roster_open_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
+    # 文档投递独立消费循环（Issue #341 S-ES-3）的租户域名——不是密钥，是拼文档
+    # 链接用的裸域名（例如 gv3qfk4q2rp.feishu.cn，见
+    # ``adapters/feishu_docx_delivery.py`` 模块文档「文档 URL 的构造」）。**可选，
+    # 默认 ``None``**：未配置时 ``apps/gateway/document_delivery.py`` 的
+    # ``assemble_document_delivery_consumer`` 整体不注册这条循环（失败关闭，与
+    # ``roster_audit.duty_not_registered`` 等既有姿态一致），不是"用一个猜测的
+    # 域名硬跑"。飞书没有开放接口能查询"当前租户的裸域名"，只能由运维在部署时
+    # 显式提供。
+    tenant_domain: str | None = None
+
+    # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，
+    # 只用于精确判定"这条群消息是不是 @ 了机器人本身"。刻意不套 `LINGXI_GATEWAY_`
+    # 前缀——命名由裁定 #5 拍板，这是机器人这个身份本身的事实，不是 gateway 进程的
+    # 私有配置项，与 `innertest_roster_open_ids` 不套前缀同一条纪律。**未配置＝这
+    # 条功能整体关闭＝维持此前"群聊完全静默"的现状（失败关闭）**；部署时把它填成
+    # 什么值（经 bot info 接口取一次落 env）不在本次改动范围内。
+    bot_open_id: str | None = None
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -187,6 +204,43 @@ def _innertest_roster_open_ids(env: Mapping[str, str]) -> frozenset[str]:
         ) from None
 
 
+def _tenant_domain(env: Mapping[str, str]) -> str | None:
+    """文档投递独立消费循环的租户域名（Issue #341 S-ES-3）：未配置即 ``None``
+    （循环不注册，见 :class:`GatewayConfig` 该字段的文档）；配了就在构造期校验
+    形状——裸域名、不含协议/路径/空白，与
+    ``adapters.feishu_docx_delivery._require_tenant_domain`` 同一条校验，这里
+    提前跑一遍是为了让一个拼错的域名在**启动期**就失败关闭，而不是等到第一次
+    真正建文档、准备拼链接时才发现。
+    """
+
+    raw = _text(env, "TENANT_DOMAIN")
+    if raw is None:
+        return None
+    from lingxi.adapters.feishu_docx_delivery import _require_tenant_domain
+
+    try:
+        return _require_tenant_domain(raw)
+    except ValueError as error:
+        raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
+
+def _bot_open_id(env: Mapping[str, str]) -> str | None:
+    """机器人自身 open_id（Issue #318 群聊@机器人固定引导）。
+
+    刻意直接读 ``env.get("LINGXI_BOT_OPEN_ID")``，不经过本文件 ``_text()`` 的
+    ``LINGXI_GATEWAY_`` 前缀包装——理由见 :class:`GatewayConfig` 该字段的文档。
+    未配置或空白都当作"未配置"（功能整体关闭），不校验取值形状：读到的值只用于
+    跟事件体里的 mentions 做字符串精确比较，格式不对顶多是永远比对不上、不产生
+    任何额外风险，因此不必像 `LINGXI_INNERTEST_ROSTER_OPEN_IDS` 那样失败关闭拒绝
+    启动。
+    """
+
+    raw = env.get("LINGXI_BOT_OPEN_ID")
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped or None
+
+
 def load_config(env: Mapping[str, str]) -> GatewayConfig:
     """从环境变量构造配置。缺失或不合法时抛 :class:`GatewayConfigError`。"""
 
@@ -239,6 +293,9 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
         card_failure_injection=_card_failure_injection(env),
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
+        tenant_domain=_tenant_domain(env),
+
+        bot_open_id=_bot_open_id(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

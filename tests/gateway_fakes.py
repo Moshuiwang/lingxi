@@ -63,8 +63,13 @@ class FakeReactions:
 
 
 class FakeReplies:
-    def __init__(self, log: CallLog) -> None:
+    """``fail_with`` 是公开、可在用例中途改写的开关（与 ``RecordingText.fail``
+    同一惯例，见 ``test_gateway_delivery.py``）：群聊 @ 引导的失败重试用例需要
+    先注入一次失败、再在同一个假实现上切回成功，不必新建第二个假对象。"""
+
+    def __init__(self, log: CallLog, *, fail_with: Exception | None = None) -> None:
         self._log = log
+        self.fail_with = fail_with
 
     def send_text(
         self, *, chat_id: str, thread_id: str | None, reply_to_message_id: str, text: str
@@ -76,6 +81,8 @@ class FakeReplies:
             reply_to_message_id=reply_to_message_id,
             text=text,
         )
+        if self.fail_with is not None:
+            raise self.fail_with
 
 
 class FakeAudit:

@@ -110,7 +110,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0072_local_permission_override"
-down_revision: str | None = "0071_daily_report_watermark"
+down_revision: str | None = "0074_task_document_delivery"
 branch_labels: str | None = None
 depends_on: str | None = None
 

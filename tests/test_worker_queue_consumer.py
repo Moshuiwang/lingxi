@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import io
+import itertools
 import json
 import os
 import signal
@@ -52,6 +53,10 @@ from lingxi.core.execution.card_stream import (
     CardRateLimiter,
     CardStream,
     DeliveryRejected,
+    PROGRESS_ACTION_COMPOSING,
+    PROGRESS_ACTION_PROCESSING,
+    PROGRESS_ACTION_QUERYING,
+    decode_progress_action,
 )
 from postgres_schema import ensure_production_schema, reset_production_rows
 
@@ -205,6 +210,40 @@ class CardStreamTests(unittest.TestCase):
         )
         self.assertIn("已完成 · 1 秒", cards.bodies[-2])
         self.assertEqual(text.texts, [])
+
+    def test_querying_and_composing_actions_render_without_leaking_any_tool_identity(
+        self,
+    ) -> None:
+        """Issue #321 方向 C ⑤：语义化进度文案只暴露"第几次查询"这个序数与用时，
+        不回显工具名、参数或任何查询内容——``update()`` 的调用方（Gateway）只传
+        得进 ``query_count: int``，从数据类型上就不可能把一个工具名字符串传成
+        这个参数；这里核对渲染结果确实不含 ``mcp__``/``query__`` 字样。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+
+        stream.start()
+        now[0] = 1.0
+        stream.update(elapsed_seconds=5, action=PROGRESS_ACTION_QUERYING, query_count=3)
+        now[0] = 2.0
+        stream.update(elapsed_seconds=9, action=PROGRESS_ACTION_COMPOSING)
+
+        self.assertEqual(cards.bodies[-2], "正在第 3 次查询指标数据 · 5 秒")
+        self.assertEqual(cards.bodies[-1], "正在整理与生成回答 · 9 秒")
+        for body in cards.bodies:
+            self.assertNotIn("mcp__", body)
+            self.assertNotIn("query__", body)
 
     def test_finish_counts_toward_the_shared_global_rate_budget(self) -> None:
         """独立审核 P2-2：``finish()`` 刻意不经过单话题 500ms 节流（终态帧是结果
@@ -555,12 +594,17 @@ class WorkerServiceTests(unittest.TestCase):
                 }
 
         executor = Executor()
+        # Issue #321 方向 C：progress 更新之间要求 >=5 秒的节流窗口（防频控），
+        # 这里用一个每次调用都前进 6 秒的假单调时钟，确保这次 assistant_message
+        # 触发的更新不会被节流吞掉——本用例只关心"确实产生了一条 progress 事件"，
+        # 语义化文案本身由下面新增的 SemanticProgressTests 覆盖。
         service = WorkerService(
             config=worker_config(
                 external_texts=(("metric.description", "指标目录中的已知描述"),),
             ),
             queue=queue,
             executor_factory=lambda config, marker: executor,
+            monotonic=itertools.count(0.0, 6.0).__next__,
         )
         asyncio.run(service.process_once())
 
@@ -1941,6 +1985,226 @@ class WorkerServiceTests(unittest.TestCase):
             queue.claimed, "任务必须仍留在可领取状态，留给下一次启动的 worker 领走"
         )
         self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
+
+
+class SemanticProgressTests(unittest.TestCase):
+    """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 30 秒兜底刷新
+    （产品负责人 2026-08-27 裁定，留痕 #321 评论 5434086490）。
+
+    只测数据管路与节流判据本身（谁写了几条 progress 事件、``content`` 字段解码
+    后是什么语义），不测 CardKit 真实渲染（L4a）；文案本身不回显工具名/参数的
+    校验见 ``CardStreamTests.
+    test_querying_and_composing_actions_render_without_leaking_any_tool_identity``。
+    """
+
+    def test_two_spaced_out_tool_calls_produce_two_correctly_numbered_query_updates(
+        self,
+    ) -> None:
+        """①：长任务两次工具调用（间隔远超过 5 秒节流窗口）——各自产生一条独立
+        更新，计数正确递增。
+
+        变异存活证据：把 ``on_tool_call`` 里的 ``query_count += 1`` 删掉（改成
+        恒为某个固定值），本用例第二条更新的计数断言必须变红。
+        """
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                on_tool_call = kwargs["on_tool_call"]
+                clock["now"] = 10.0
+                on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
+                clock["now"] = 20.0
+                on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 2, "两次间隔充分的工具调用应各产生一条更新")
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_QUERYING, 1),
+        )
+        self.assertEqual(
+            decode_progress_action(progress_events[1]["content"]),
+            (PROGRESS_ACTION_QUERYING, 2),
+        )
+
+    def test_a_burst_of_tool_calls_within_five_seconds_is_merged_into_one_update(
+        self,
+    ) -> None:
+        """③：5 秒内密集工具事件——不能逐条落库，必须合并；最终写入的一条必须
+        反映最新（不是最早）的调用计数，被合并掉的调用不能凭空消失。
+
+        变异存活证据：把节流判据 ``now - last_progress_write_at < min_gap_
+        seconds`` 改成恒 ``False``（从不节流），本用例的"只有一条 progress"
+        断言必须变红（会变成 4 条）。
+        """
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                on_tool_call = kwargs["on_tool_call"]
+                for offset in (0.5, 1.5, 2.5):  # 全部落在 5 秒节流窗口内，应被合并
+                    clock["now"] = offset
+                    on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
+                clock["now"] = 12.0  # 跨过节流窗口，触发一次真正的写入
+                on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 1, "5 秒内的密集调用必须合并，不能逐条写库")
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_QUERYING, 4),
+            "被合并掉的三次调用不能凭空消失——最终写入的必须是最新的调用计数",
+        )
+
+    def test_a_non_query_tool_call_is_reported_as_composing_not_querying(self) -> None:
+        """只区分两类文案：非问数工具（含被拒绝的越界调用）一律归入"生成阶段"，
+        不单独计数、不回显工具名。"""
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                clock["now"] = 10.0
+                kwargs["on_tool_call"]("Bash")  # type: ignore[index]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 1)
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_COMPOSING, None),
+        )
+
+    def test_a_stalled_long_task_gets_exactly_one_thirty_second_fallback_update(
+        self,
+    ) -> None:
+        """②：30 秒无任何事件——``_monitor`` 的兜底计时必须恰好推一次纯用时更新，
+        不多不少。走真实的 ``_monitor`` 循环（不是直接调用 ``on_stall_tick``），
+        用一个只由 ``sleep()`` 推进的虚拟时钟把 30 秒虚拟等待压缩进近乎零的真实
+        墙钟时间——``monotonic()`` 只读、``sleep()`` 才是唯一的推进点，因此耗时
+        完全由 ``_monitor`` 自己的循环次数（乘以 ``stop_poll_interval_seconds``）
+        决定，不依赖真实时钟或调度器的时序抖动。
+
+        变异存活证据：把 ``_monitor`` 里 ``on_stall_tick()`` 那次调用整段删掉，
+        本用例会等到 500 次让出用尽、拿到 0 条 progress 事件，断言变红。
+        """
+
+        queue = FakeWorkerQueue()
+
+        class _VirtualClock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            async def sleep(self, seconds: float) -> None:
+                self.now += seconds
+                await asyncio.sleep(0)
+
+        clock = _VirtualClock()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                for _ in range(500):
+                    if len(queue.events) >= 2:
+                        break
+                    await asyncio.sleep(0)
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(stop_poll_interval_seconds=5.0),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 1, "30 秒无事件应恰好触发一次兜底用时更新")
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_PROCESSING, None),
+            "本用例从未发生任何可分类信号，兜底更新沿用默认 processing 语义",
+        )
+        self.assertGreaterEqual(progress_events[0]["elapsed_seconds"], 30)
+
+    def test_a_short_task_with_no_tool_calls_keeps_its_terminal_content_byte_for_byte(
+        self,
+    ) -> None:
+        """④哨兵：短任务（没有工具调用、没有 assistant_message 中间事件）的终态
+        内容必须逐字节不变，也不应该凭空产生进度更新——语义化进度只改变卡片
+        中途的样子，不改变最终答案，也不该在什么都没发生时无中生有。
+        """
+
+        queue = FakeWorkerQueue()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "success")
+        self.assertIsNone(terminal["error_kind"])
+        self.assertEqual(terminal["content"], "结果")
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(
+            progress_events, [], "没有任何工具调用/文本事件时不应凭空产生进度更新"
+        )
 
 
 @unittest.skipUnless(DSN, SKIP_DB)

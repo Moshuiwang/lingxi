@@ -131,7 +131,7 @@ class HealthcheckLivenessCheckTests(unittest.TestCase):
             with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
                 for key in healthcheck._LIVENESS_KEYS_BY_ROLE["gateway"]:
                     liveness.touch_liveness(key)
-                healthcheck._check_liveness("gateway", 30.0)  # 不应抛异常
+                healthcheck._check_liveness("gateway", 30.0, {})  # 不应抛异常
 
     def test_stale_key_on_the_gateway_delivery_side_fails_even_though_longconn_is_fresh(
         self,
@@ -145,7 +145,7 @@ class HealthcheckLivenessCheckTests(unittest.TestCase):
                 liveness.touch_liveness("gateway-longconn")
                 # gateway-delivery 从未写过：模拟投递消费后台线程已经死掉。
                 with self.assertRaises(healthcheck.HealthcheckError) as ctx:
-                    healthcheck._check_liveness("gateway", 30.0)
+                    healthcheck._check_liveness("gateway", 30.0, {})
                 self.assertIn("gateway-delivery", str(ctx.exception))
 
     def test_an_old_liveness_file_exceeding_the_threshold_fails(self) -> None:
@@ -154,8 +154,46 @@ class HealthcheckLivenessCheckTests(unittest.TestCase):
             return_value=999999.0,
         ):
             with self.assertRaises(healthcheck.HealthcheckError) as ctx:
-                healthcheck._check_liveness("worker", 30.0)
+                healthcheck._check_liveness("worker", 30.0, {})
         self.assertIn("999999.0", str(ctx.exception))
+
+    def test_document_delivery_key_is_not_required_when_the_feature_is_unconfigured(
+        self,
+    ) -> None:
+        """P3 顺手（Issue #341）：没配 ``LINGXI_GATEWAY_TENANT_DOMAIN`` 的 gateway
+        部署里，文档投递独立消费循环压根不会被装配、永远不会写这个活性文件——
+        健康检查不能因此判它不健康。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                liveness.touch_liveness("gateway-longconn")
+                liveness.touch_liveness("gateway-delivery")
+                healthcheck._check_liveness("gateway", 30.0, {})  # 不应抛异常
+
+    def test_document_delivery_key_is_required_when_the_feature_is_configured(self) -> None:
+        """配了这项能力时，第三条线程的活性同样必须新鲜——否则一个已经死掉的
+        文档投递消费线程会被健康检查静默放过。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                liveness.touch_liveness("gateway-longconn")
+                liveness.touch_liveness("gateway-delivery")
+                # gateway-document-delivery 从未写过：模拟这条线程已经死掉。
+                with self.assertRaises(healthcheck.HealthcheckError) as ctx:
+                    healthcheck._check_liveness(
+                        "gateway", 30.0, {"LINGXI_GATEWAY_TENANT_DOMAIN": "example.feishu.cn"}
+                    )
+                self.assertIn("gateway-document-delivery", str(ctx.exception))
+
+    def test_document_delivery_key_healthy_when_configured_and_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                liveness.touch_liveness("gateway-longconn")
+                liveness.touch_liveness("gateway-delivery")
+                liveness.touch_liveness("gateway-document-delivery")
+                healthcheck._check_liveness(
+                    "gateway", 30.0, {"LINGXI_GATEWAY_TENANT_DOMAIN": "example.feishu.cn"}
+                )  # 不应抛异常
 
 
 @unittest.skipUnless(DSN, SKIP_DB)

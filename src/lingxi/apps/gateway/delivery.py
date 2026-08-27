@@ -100,6 +100,7 @@ from lingxi.core.execution.card_stream import (
     DeliveryRejected,
     SendOutcomeCallback,
     TextTransport,
+    decode_progress_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -403,7 +404,15 @@ class DeliveryConsumer:
         # `safely_releasable_answer` 走同一条状态区更新路径：Worker 侧目前没有生产
         # 写入方（#151 已登记留白），流式正文本体的卡片渲染留待该写入方接上之后
         # 再做——这里先保证"消费到了、游标推进了"是安全、不会重复的（见模块说明）。
-        stream.update(elapsed_seconds=event.elapsed_seconds or 0)
+        #
+        # `event.content` 编码语义化进度状态（Issue #321 方向 C）：worker 侧在
+        # `apps/worker/service.py` 用 `encode_progress_action` 写入，这里对称
+        # 解码。没有内容（旧格式、或从未发生过可分类信号）时 `decode_progress_
+        # action` 退回 `(processing, None)`，与改动前的行为逐字节一致。
+        action, query_count = decode_progress_action(event.content)
+        stream.update(
+            elapsed_seconds=event.elapsed_seconds or 0, action=action, query_count=query_count
+        )
         try:
             self._queue.record_delivery_progress(
                 task_id=task.task_id,

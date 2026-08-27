@@ -59,8 +59,11 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "gateway.new_session",
     "gateway.session_rotated",
     "gateway.slash_rejected",
+    "gateway.group_mention_hint",
     "worker.action.processing",
     "worker.action.completed",
+    "worker.action.querying_metrics",
+    "worker.action.composing",
     "worker.status",
     "worker.queued_timeout",
     "worker.version_unavailable",
@@ -112,6 +115,12 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.range_updated",
     "permission.range_revoked",
     "permission.all_companies",
+    # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
+    "delivery.document_ready",
+    # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
+    # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
+    "delivery.document_failed",
+    "delivery.document_uncertain",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

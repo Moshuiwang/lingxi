@@ -53,11 +53,27 @@ class NonPrivateChatError(EventParseError):
 
     单独成类而不是复用 ``EventParseError``：这不是"读不懂"，是"读懂了、而且明确
     不该受理"。调用方要能把它记成一条**越界拒绝**的审计，而不是混进解析失败里。
+
+    ``mentioned_open_ids``/``chat_id``/``message_id``（Issue #318 群聊@机器人固定
+    引导）：三者只服务"要不要回一句固定引导"这一个判定，不是任务归属来源——
+    `V-接入-11` 仍然只认 ``sender.sender_id.open_id`` 一个键，本类完全不参与任务
+    归属。三者都按"读不出就是没有"处理：缺字段、类型不对时一律取空值，绝不会
+    因为这几个新字段读取失败而改变本类原有的抛出行为或 ``chat_type``/消息文案。
     """
 
-    def __init__(self, chat_type: str | None) -> None:
+    def __init__(
+        self,
+        chat_type: str | None,
+        *,
+        mentioned_open_ids: tuple[str, ...] = (),
+        chat_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
         super().__init__(f"非私聊消息，本产品只服务飞书私聊：chat_type={chat_type!r}")
         self.chat_type = chat_type
+        self.mentioned_open_ids = mentioned_open_ids
+        self.chat_id = chat_id
+        self.message_id = message_id
 
 
 def _text(container: Mapping[str, Any] | None, key: str) -> str | None:
@@ -98,6 +114,34 @@ def message_text(content: object, message_type: object) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _mentioned_open_ids(message: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """从消息体的 ``mentions`` 段读出被 @ 的飞书用户 open_id（Issue #318）。
+
+    只服务群聊@机器人固定引导这一条判定路径，不是任务归属来源——`V-接入-11`
+    的唯一来源仍然是 ``sender.sender_id.open_id``，本函数读到的值从不进入
+    ``InboundMessage``。**证据等级 1**：字段形状（``message.mentions[].id.open_id``）
+    依据飞书《接收消息》事件回调的公开文档结构
+    （https://open.feishu.cn/document/server-docs/im-v1/message/events/receive），
+    真实群聊 @ 事件体是否逐字段吻合未经真实回调验证。结构不对、字段缺失一律返回
+    空元组而不是抛错——读不出被 @ 的人只意味着"当作没有人被 @"，不能因为这一段
+    可选信息影响 ``NonPrivateChatError`` 本身的抛出（见该类文档）。
+    """
+
+    if not isinstance(message, Mapping):
+        return ()
+    mentions = message.get("mentions")
+    if not isinstance(mentions, list):
+        return ()
+    open_ids: list[str] = []
+    for item in mentions:
+        if not isinstance(item, Mapping):
+            continue
+        open_id = _text(item.get("id"), "open_id")
+        if open_id is not None:
+            open_ids.append(open_id)
+    return tuple(open_ids)
+
+
 def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = None) -> InboundMessage:
     """把一条 ``im.message.receive_v1`` 事件体解析成 ``InboundMessage``。
 
@@ -136,9 +180,19 @@ def parse_message_event(payload: Mapping[str, Any], *, trace_id: str | None = No
     # **只认显式的 `p2p`，缺字段也拒绝。** 与仓库既有的拒绝式白名单同一姿态：
     # 默认放行的代价是把群聊内容当私聊处理（越界、且可能泄漏到不该看见的人面前），
     # 默认拒绝的代价只是漏收——后者可观察、可修，前者不可逆。
+    #
+    # 抛出之前顺手读一份 mentions/chat_id/message_id（Issue #318 群聊@机器人固定
+    # 引导）：只能在这里读，`NonPrivateChatError` 一旦抛出，调用方手里就只有异常
+    # 对象本身，没有别的机会再摸一次原始事件体。三者都经 `_text`/`_mentioned_
+    # open_ids`——两者都不会抛错，因此这几行不改变本分支原有的抛出行为。
     chat_type = _text(message, "chat_type")
     if chat_type != PRIVATE_CHAT_TYPE:
-        raise NonPrivateChatError(chat_type)
+        raise NonPrivateChatError(
+            chat_type,
+            mentioned_open_ids=_mentioned_open_ids(message),
+            chat_id=_text(message, "chat_id"),
+            message_id=_text(message, "message_id"),
+        )
 
     message_id = _require(_text(message, "message_id"), "message_id")
     chat_id = _require(_text(message, "chat_id"), "chat_id")

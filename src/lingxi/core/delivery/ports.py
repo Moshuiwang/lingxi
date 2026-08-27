@@ -21,11 +21,58 @@ class DeliveryEventType(str, Enum):
     TERMINAL = "terminal"
 
 
-#: 只有这两类事件允许携带正文；其余事件类型的 ``content`` 必须是 ``None``
-#: （由迁移 0059 的 CHECK 在数据库层再确认一次，这里的常量供调用方在写入前自查）。
+#: 只有这几类事件允许携带正文；其余事件类型的 ``content`` 必须是 ``None``
+#: （由迁移 0059/0075 的 CHECK 在数据库层再确认一次，这里的常量供调用方在写入前
+#: 自查——真正调用它自查的写入方见 ``adapters/postgres_conversation/
+#: _queue_outbox.py::append_delivery_event`` 与 ``apps/worker/service.py::
+#: WorkerService._append_event``；Issue #328 opus 审查 R1 之前这个常量定义了但
+#: 零调用方，写入方从未真正用它自查过）。
+#:
+#: ``PROGRESS``（迁移 0075 新增）：语义化进度动作码（Issue #321 方向 C）——
+#: ``"querying:N"``/``"composing"`` 这两种固定形状之一，是 worker 侧内部生成的
+#: 短令牌，绝不是用户输入或模型输出的自由文本，因此可以在这里放行、同时受
+#: ``PROGRESS_CONTENT_MAX_LENGTH`` 这条长度契约约束（迁移 0075 的 CHECK
+#: ``char_length(content) <= 32`` 是同一条契约的数据库层落地）。
 CONTENT_BEARING_EVENT_TYPES = frozenset(
-    {DeliveryEventType.SAFELY_RELEASABLE_ANSWER, DeliveryEventType.TERMINAL}
+    {
+        DeliveryEventType.PROGRESS,
+        DeliveryEventType.SAFELY_RELEASABLE_ANSWER,
+        DeliveryEventType.TERMINAL,
+    }
 )
+
+#: ``progress`` 事件 ``content`` 的长度上限（迁移 0075 的 CHECK 同步约束）。
+#: 已知形状只有两种：``"composing"``（9 字节）与 ``"querying:" + 位数不多的
+#: 计数``（`card_stream.encode_progress_action` 的输出），32 留了充裕余量，
+#: 不是精确贴着已知最长值算出来的。只约束 ``PROGRESS``——``SAFELY_RELEASABLE_
+#: ANSWER``/``TERMINAL`` 携带的是用户可见的问数结果正文，篇幅由业务内容决定，
+#: 不适用这条上限。
+PROGRESS_CONTENT_MAX_LENGTH = 32
+
+
+def assert_content_allowed(event_type: DeliveryEventType, content: str | None) -> None:
+    """写入前自查：``content`` 是否被允许出现在这个 ``event_type`` 上。
+
+    与迁移 0059/0075 的 CHECK 约束表达同一条规则的两份独立校验之一——数据库层
+    是最终防线（写入方即使跳过这个函数，数据库仍会用 ``CheckViolation`` 拒绝
+    违规写入），这里让调用方在真正写库前就能拿到一个可读的 ``ValueError``，
+    不必等 CheckViolation 从数据库连接弹回来才发现，也不会被调用方常见的
+    "写库失败只记日志、不中断任务"这类宽泛 ``except Exception`` 悄悄吞掉却查
+    不出具体是哪条规则触发（Issue #328 opus 审查 R1 的真实事故：progress 事件
+    的 content 撞了当时还没放宽的 CHECK，100% 失败，但只留下一条看不出根因的
+    ``logger.error``，真实环境卡片完全不动）。
+    """
+
+    if content is None:
+        return
+    if event_type not in CONTENT_BEARING_EVENT_TYPES:
+        allowed = sorted(item.value for item in CONTENT_BEARING_EVENT_TYPES)
+        raise ValueError(f"{event_type.value} 事件不允许携带 content（仅 {allowed} 可以）")
+    if event_type is DeliveryEventType.PROGRESS and len(content) > PROGRESS_CONTENT_MAX_LENGTH:
+        raise ValueError(
+            f"progress 事件 content 长度 {len(content)} 超过契约上限 "
+            f"{PROGRESS_CONTENT_MAX_LENGTH}（应为 querying:N/composing 类内部短令牌）"
+        )
 
 
 class TerminalKind(str, Enum):

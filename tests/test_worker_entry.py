@@ -2241,5 +2241,63 @@ class ContentCaptureEndToEndWiringTest(unittest.TestCase):
         self.assertIsNone(record)
 
 
+class ToolCallProgressWiringTest(unittest.TestCase):
+    """Issue #321 方向 C：``run_turn(on_tool_call=...)`` 经真实装配路径接到
+    ``ToolGateway`` 的 ``PreToolUse`` 判定（``apps/worker/service.py`` 的语义化
+    等待进度只测过这条回调本身收到通知之后怎么分类计数——见 ``tests/test_
+    worker_queue_consumer.py::SemanticProgressTests``；本文件证明的是"这条回调
+    真的被接到了真实 SDK hooks 上"，不是又测一遍分类逻辑）。
+
+    与本文件其余用例同一姿态：假 SDK 只能证明"本侧装配是通的"，证明不了真实
+    SDK 会触发这些事件（那是 L4a 的职责）。
+    """
+
+    def _run_turn_with_listener(self, script):
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK(script).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+        received: list[str] = []
+        report = asyncio.run(
+            executor.run_turn(config.question, on_tool_call=received.append)
+        )
+        return report, received
+
+    def test_listener_is_notified_for_both_an_allowed_and_a_denied_real_tool_call(
+        self,
+    ) -> None:
+        _report, received = self._run_turn_with_listener(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "tool", "tool": "Write", "input": {"file_path": "/tmp/x", "content": "x"}},
+                {"kind": "text", "text": "日活是 1024；另一部分我无法查询。"},
+            ]
+        )
+
+        self.assertEqual(received, [READ_ONLY_TOOL, "Write"])
+
+    def test_no_listener_is_the_unaffected_default(self) -> None:
+        """不传 ``on_tool_call``（本文件其余全部既有用例）必须保持零行为差异——
+        这里只确认不传时不会抛异常。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        FakeAgentSDK(
+            [
+                {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+                {"kind": "text", "text": "日活是 1024。"},
+            ]
+        ).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        report = asyncio.run(executor.run_turn(config.question))
+
+        self.assertTrue(report["turn"]["closed"])
+
+
 if __name__ == "__main__":
     unittest.main()

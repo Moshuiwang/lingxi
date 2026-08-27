@@ -91,6 +91,10 @@ REQUIRED_MODULES = (
     "lingxi.core.execution.input_safety",
     "lingxi.core.execution.message_stream",
     "lingxi.core.execution.card_stream",
+    # 文档交付触发机制的纯逻辑校验（Issue #341 S-ES-2）。由 `apps/worker/turn.py`
+    # 与 `apps/worker/report.py` 函数内/模块级 import，装配前不在任何进程的模块级
+    # import 闭包里，但必须随制品发布，理由同上面几条只读工具白名单模块。
+    "lingxi.core.execution.document_delivery",
     # 投递事件 outbox 的纯领域逻辑（Issue #151）：终态分类与解析规则，
     # 由 adapters.postgres_conversation 与 apps.worker.service 共同依赖。
     "lingxi.core.delivery",
@@ -330,6 +334,24 @@ REQUIRED_MODULES = (
     # 停摆候选查询的持久化面：由 `_build_stalled_provisioning_duty` 在函数内
     # import，同 `postgres_late_readiness_recovery` 一条理由。
     "lingxi.adapters.postgres_stalled_provisioning",
+    # 飞书 docx 交付适配器（Issue #341 S-ES-1）：建文档/写正文/授予「可管理」/协作者
+    # 读回四个方法，已由 S0 探针（2026-08-27，四步全通）验证过调用形态。生产调用方
+    # 是 S-ES-3 的投递链路，装配前它不在任何进程的 import 闭包里，但同
+    # `lingxi.core.identity.provisioning` 一条理由——必须随制品发布，否则接线那天
+    # 才发现 wheel 里没有它。
+    "lingxi.adapters.feishu_docx_delivery",
+    # 文档投递独立消费循环（Issue #341 S-ES-3）：`apps/gateway/document_delivery.py`
+    # 认领 `task_document_delivery_request` 行、驱动 S-ES-1 的四步交付，持久化面
+    # 在 `adapters/postgres_document_delivery.py`。由 `apps/gateway/__init__.py`
+    # 在**模块级** import（同 `apps/gateway/delivery.py` 那一条理由，漏登记会直接
+    # 让 gateway 起不来）。
+    "lingxi.apps.gateway.document_delivery",
+    "lingxi.adapters.postgres_document_delivery",
+    # 文档投递死信扫描 + 正文到期擦除职责（Issue #341 R-2/`V-投递-06`）：
+    # `apps/scheduler/assembly.py` 在**模块级** import（同 late_readiness_recovery/
+    # stalled_provisioning 那一条理由，漏登记会直接让 scheduler 起不来）。持久化面
+    # 复用上面已经登记过的 `adapters.postgres_document_delivery`，不重复登记。
+    "lingxi.apps.scheduler.document_delivery_dead_letter",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
@@ -442,6 +464,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # （`_build_stalled_provisioning_duty` 在函数内 import）同样必须登记。
             "lingxi.apps.scheduler.stalled_provisioning",
             "lingxi.adapters.postgres_stalled_provisioning",
+            # 文档投递死信扫描 + 正文到期擦除职责（Issue #341 R-2/`V-投递-06`）：
+            # `apps/scheduler/assembly.py` 模块级 import，与 late_readiness_recovery/
+            # stalled_provisioning 一节同一条"漏登记会直接让 scheduler 起不来"的
+            # 理由；它复用的持久化面（`adapters.postgres_document_delivery`）已经
+            # 因为 gateway 那一节在制品清单里登记过，这里是 scheduler 进程**自己
+            # 的**闭包，两个进程各自独立登记，互不代替。
+            "lingxi.apps.scheduler.document_delivery_dead_letter",
+            "lingxi.adapters.postgres_document_delivery",
             # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303
             # 新增 daily_report），全部由包的 `__init__.py` 在模块级 import（维持
             # 既有的 `lingxi.apps.scheduler.<名字>` 重导出契约），因此进程起来时
@@ -727,10 +757,20 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.delivery.ports",
             "lingxi.core.execution",
             "lingxi.core.execution.audit",
+            # 语义化等待进度（Issue #321 方向 C）：worker 用它的
+            # encode_progress_action/PROGRESS_ACTION_* 常量把工具调用阶段编码进
+            # progress 事件的 content 字段，由 apps.worker.service 模块级
+            # import；渲染卡片的另一半（decode_progress_action/CardStream 本身）
+            # 仍只在 gateway 闭包运行。
+            "lingxi.core.execution.card_stream",
             "lingxi.core.execution.hooks",
             "lingxi.core.execution.input_safety",
             "lingxi.core.execution.message_stream",
             "lingxi.core.execution.tool_policy",
+            # 文档交付触发机制（Issue #341 S-ES-2），由 apps/worker/turn.py 与
+            # apps/worker/report.py 模块级 import（构造 ToolPolicy 白名单合入、
+            # 报告投影都需要它，不是按开关才用到的分支）。
+            "lingxi.core.execution.document_delivery",
             "lingxi.core.ids",
             # 内测轮内容级采集（Issue #251/#304 批次 3），由 apps.worker.turn/
             # apps.worker.service/apps.worker.cli 模块级 import。
@@ -839,6 +879,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
+            # 群聊@机器人固定引导（Issue #318）：`GroupMentionHintResponder` 在
+            # `apps/gateway/__init__.py` **模块级** import `redact_identifier`，
+            # 把要发这条提示的 chat_id 记进日志（不是结构化审计字段，见该函数
+            # 内注释与 `V-花名册-34`）。
+            "lingxi.core.identity.identifiers",
             # `adapters/feishu_directory.py` 的在职状态读取口把成员详情折成
             # `core.identity.first_contact.EmploymentStatus`。gateway 本身不用那个读取口
             # （首次开通编排在 scheduler），但它模块级 import 了同一个 adapter。
@@ -870,6 +915,26 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 2026-08-18 裁定把编排整体移进 scheduler）。因此这里只有那条装配断言模块，
             # 整条判定链与它的适配器都在 scheduler 组，不在本进程的闭包里。
             "lingxi.apps.gateway.onboarding",
+            # 文档投递独立消费循环（Issue #341 S-ES-3）：由 `apps/gateway/__init__.py`
+            # 模块级 import `apps.gateway.document_delivery`（同 `apps.gateway.delivery`
+            # 那一条理由）；`assemble_document_delivery_consumer` 在函数内 import
+            # 建文档四步适配器（`feishu_docx_delivery`）、令牌供给三件套
+            # （`core.identity.access_token_supply`/`core.permission`/
+            # `core.permission.table_access_token_supply`/
+            # `core.permission.tenant_token_supply`/`feishu_tenant_token`，与
+            # scheduler 组「应用身份令牌」那条闭包同一来源）、完成通知出口
+            # （`feishu_user_message`，已因 scheduler 权限变化通知在 REQUIRED_MODULES
+            # 里，这里是它第一次进入 gateway 自己的运行时闭包）、以及持久化面
+            # （`postgres_document_delivery`）。
+            "lingxi.apps.gateway.document_delivery",
+            "lingxi.adapters.postgres_document_delivery",
+            "lingxi.adapters.feishu_docx_delivery",
+            "lingxi.adapters.feishu_tenant_token",
+            "lingxi.adapters.feishu_user_message",
+            "lingxi.core.identity.access_token_supply",
+            "lingxi.core.permission",
+            "lingxi.core.permission.table_access_token_supply",
+            "lingxi.core.permission.tenant_token_supply",
         ),
         # websockets 显式列出，尽管 lark-oapi 传递携带它——理由见 pyproject.toml
         # 的 [gateway] 组注释。这里取 ``websockets.exceptions``（lark 实际 import
