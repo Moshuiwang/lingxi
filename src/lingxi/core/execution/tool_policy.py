@@ -207,7 +207,12 @@ class ToolPolicy:
         许诺一个实际不存在的替代路径）。
         """
 
-        if tool_name.startswith(_QUERY_TOOL_PREFIX):
+        if tool_name.startswith("mcp__"):
+            # 任何原生 MCP 工具（含 mcp__query__ 自身与 mcp__delivery__ 等其他
+            # 服务器的工具）被拒都不是「包装式越界」：模型用的已经是原生调用
+            # 形态，只是该工具本身未获批准——导回「查询工具」在语义上答非所问
+            # （2026-08-27 跨批合流时 test_document_delivery 的开关关用例坐实），
+            # 维持通用模板。重定向只面向 Bash 之类的非 MCP 包装通道。
             return False
         return any(name.startswith(_QUERY_TOOL_PREFIX) for name in self._allowed_tools)
 
