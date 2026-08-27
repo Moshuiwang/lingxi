@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-26"
-digest = "sha256:69d2a92c1058c794a095cd2fd05338bcdf83e337f537baba6678c496139ae255"
+version = "2026-08-27-3"
+digest = "sha256:b51ba58237ec3ce60cf5080ac85b0ce9c9695f9d052e934ee10b3df555a40817"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -16,6 +16,9 @@ retired_versions = [
   "2026-08-21",
   "2026-08-23",
   "2026-08-24",
+  "2026-08-26",
+  "2026-08-27",
+  "2026-08-27-2",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -30,6 +33,7 @@ retired_versions = [
 "cards.query.status.title" = "61a2d0066ab40f32"
 "texts.gateway.busy_hint" = "7984bc41c89b9e08"
 "texts.gateway.delivery_expired" = "650d1541a4369696"
+"texts.gateway.group_mention_hint" = "6ff88d15b2832edb"
 "texts.gateway.new_session" = "914f6fa8697310f6"
 "texts.gateway.queue_failed" = "c5c6ac5c10a031fa"
 "texts.gateway.session_rotated" = "df77349f3165a8cb"
@@ -82,7 +86,9 @@ retired_versions = [
 "texts.roster.summary_not_compared" = "199ba9605d467096"
 "texts.roster.value_absent" = "74e9907bf9a62de2"
 "texts.worker.action.completed" = "f28461bb49c85647"
+"texts.worker.action.composing" = "d721250554c3e20b"
 "texts.worker.action.processing" = "3b7e27cb4379da3c"
+"texts.worker.action.querying_metrics" = "71f01435c81ae105"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"
 "texts.worker.max_turns" = "166d8e19f4b2f3b4"

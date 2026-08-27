@@ -21,7 +21,7 @@ from lingxi.core.execution.audit import (
     UserResultStatus,
     classify_tool_result,
 )
-from lingxi.core.execution.hooks import ToolGateway
+from lingxi.core.execution.hooks import MCP_OVERSIZE_RESULT_REWRITE, ToolGateway
 from lingxi.core.execution.tool_policy import (
     DenyReasonCode,
     ToolDecision,
@@ -945,6 +945,166 @@ class RawPreToolUseSinkTest(unittest.TestCase):
 
         self.assertEqual(deny_decision(result), None)  # 白名单内工具，放行不受影响
         self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
+
+
+class McpOversizeResultRewriteTest(unittest.TestCase):
+    """#323：CLI「存文件+分页读取」截断提示改写为重查引导，只作用于 MCP 工具。
+
+    真造假的截断文本样本，摹写实测（2026-08-26，task
+    ``tsk_01M0YA8C1P1PFTZVWF3PY92P4Q``）观察到的 CLI 通用截断模板骨架：
+    「exceeds maximum allowed tokens ... Output has been saved to
+    /tmp/... Use offset and limit parameters to read specific portions of
+    the file」。数字与路径两次实测都不同，因此样本里也换成不同的占位值，
+    证明正则不依赖具体字节数或路径。
+    """
+
+    _TRUNCATED_TEXT = (
+        "Tool result exceeds maximum allowed tokens (25000). "
+        "Actual tokens: 551234. "
+        "Output has been saved to /tmp/claude-abc123/mcp-output-9f2e.json. "
+        "Use offset and limit parameters to read specific portions of the file, "
+        "or use the Read tool to view sections."
+    )
+
+    def _post_tool_use(self, gateway: ToolGateway, tool_name: str, tool_response: object, tool_use_id: str = "toolu_big") -> dict:
+        return asyncio.run(
+            gateway.on_hook_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": tool_name,
+                    "tool_response": tool_response,
+                    "tool_use_id": tool_use_id,
+                }
+            )
+        )
+
+    def test_mcp_tool_truncated_result_is_rewritten_with_updated_mcp_tool_output(self) -> None:
+        for shape, payload in (
+            ("plain string", self._TRUNCATED_TEXT),
+            ("content block list", [{"type": "text", "text": self._TRUNCATED_TEXT}]),
+            ("mapping with text", {"text": self._TRUNCATED_TEXT}),
+            # 独立审核 P1-2：Agent SDK `CallToolResult` 的典型信封形状——此前
+            # `_is_oversize_tool_result` 的 Mapping 分支只读顶层 "text"，这一
+            # 形状因为文本嵌在 "content" 里、没有顶层 "text"，改写从未生效过。
+            (
+                "mapping with content blocks (CallToolResult envelope)",
+                {"content": [{"type": "text", "text": self._TRUNCATED_TEXT}], "isError": False},
+            ),
+        ):
+            with self.subTest(shape=shape):
+                gateway = build_gateway()
+                result = self._post_tool_use(gateway, "mcp__bi-metric__list_metrics", payload)
+
+                output = result.get("hookSpecificOutput", {})
+                self.assertEqual(output.get("hookEventName"), "PostToolUse")
+                rewritten = output.get("updatedMCPToolOutput")
+                self.assertIsInstance(rewritten, str)
+                self.assertNotIn("/tmp", rewritten)
+                self.assertNotIn("offset and limit", rewritten)
+                self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 1)
+
+    def test_non_mcp_tool_truncated_result_is_left_untouched(self) -> None:
+        """范围只限只读问数 MCP：非 MCP 工具即使输出撞上同一段特征也不改写。"""
+
+        gateway = build_gateway()
+        result = self._post_tool_use(gateway, "Bash", self._TRUNCATED_TEXT)
+
+        self.assertEqual(result, {})
+        self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 0)
+
+    def test_normal_mcp_result_is_not_rewritten(self) -> None:
+        """否定用例：改写只作用于截断提示形态，正常结果逐字节不变。"""
+
+        gateway = build_gateway()
+        result = self._post_tool_use(
+            gateway,
+            "mcp__bi-metric__list_metrics",
+            '{"metrics": [{"metric_id": "revenue"}]}',
+        )
+
+        self.assertEqual(result, {})
+        self.assertEqual(gateway.audit.summary().oversize_rewrite_count, 0)
+
+    def test_rewrite_text_never_points_the_model_at_a_local_file(self) -> None:
+        """钉住验收标准本身：模型可见的改写文本不含 /tmp 路径、不含读文件分页引导。"""
+
+        self.assertNotIn("/tmp", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("offset", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("limit", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertNotIn("分页", MCP_OVERSIZE_RESULT_REWRITE)
+        self.assertIn("不要尝试读取", MCP_OVERSIZE_RESULT_REWRITE, "必须显式禁止走读文件这条死胡同")
+        self.assertIn("缩小查询范围", MCP_OVERSIZE_RESULT_REWRITE)
+
+
+class ToolCallListenerTest(unittest.TestCase):
+    """``ToolGateway.set_tool_call_listener``（Issue #321 方向 C，语义化等待
+    进度的数据管路）：与 ``raw_pre_tool_use`` 同一姿态，是一个可选的、构造之后
+    才挂载的通知点，默认不挂载时的既有行为由本文件其余全部用例覆盖，本组只测
+    新增分支本身。
+    """
+
+    def test_listener_receives_the_normalized_tool_name_after_a_decision(self) -> None:
+        """回调收到的是判定后的规范化 ``tool_name``（合法工具名原样），不是
+        hook 事件里未经校验的原始值。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(received, ["mcp__bi-metric__list_metrics"])
+
+    def test_listener_is_invoked_for_denied_calls_too(self) -> None:
+        """模型试图调用什么，即使被拒绝，同样是"发生过一次调用"这个语义化进度
+        信号——与 ``raw_pre_tool_use`` 的既有姿态一致。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+
+        result = pre_tool_use(gateway, "Bash", {"cmd": "rm -rf /"}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), "deny")
+        self.assertEqual(received, ["Bash"])
+
+    def test_listener_exception_does_not_break_the_gating_decision(self) -> None:
+        """通知失败不得影响工具判定本身——与 ``_mark_side_effect``/
+        ``raw_pre_tool_use`` 既有姿态一致。"""
+
+        gateway = build_gateway()
+
+        def failing_listener(tool_name: str) -> None:
+            raise RuntimeError("模拟进度监听器故障")
+
+        gateway.set_tool_call_listener(failing_listener)
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), None)  # 白名单内工具，放行不受影响
+        self.assertEqual(gateway.audit.summary().calls[0].allowed, True)
+
+    def test_clearing_the_listener_stops_further_notifications(self) -> None:
+        """``set_tool_call_listener(None)`` 必须真的清除——不是"追加一个空回调"。"""
+
+        received: list[str] = []
+        gateway = build_gateway()
+        gateway.set_tool_call_listener(received.append)
+        gateway.set_tool_call_listener(None)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(received, [])
+
+    def test_default_gateway_never_touches_an_unset_listener(self) -> None:
+        """默认（从未调用 ``set_tool_call_listener``）不产生任何额外行为——沿用
+        本文件其余全部用例的既有断言路径，这里只确认不抛异常。"""
+
+        gateway = build_gateway()
+
+        result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
+
+        self.assertEqual(deny_decision(result), None)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-26"
+version = "2026-08-27-3"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -42,9 +42,22 @@ version = "2026-08-26"
 # 触发内部工具误用。这条文案用于 gateway 在入队前直接回绝这类消息，不说明内部
 # 解析细节，只给用户一个可行动的改法。
 "gateway.slash_rejected" = "以 / 开头的内容会被识别为系统命令，暂不支持。请去掉开头的斜杠，用自然语言重新描述你的问题。"
+# Issue #318（#328 v1.0 裁定 #5 排入实施）：群聊里精确 @ 到机器人本身时的固定引导，
+# 只在这一种情况下才打破「群聊完全静默」（普通群消息、@别人仍完全静默）。判定与
+# 节流实现见 adapters/feishu_events.py 的 NonPrivateChatError、apps/gateway/__init__.py
+# 的 GroupMentionHintResponder。**文案为实现草案，产品负责人过目前不作为最终定稿。**
+"gateway.group_mention_hint" = "我目前只在私聊里提供问数服务。请点我的头像发起私聊，把问题直接发给我就可以。"
 
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"
+# 语义化等待进度（Issue #321 方向 C，产品负责人 2026-08-27 裁定，留痕 #321 评论
+# 5434086490）：长问数期间在这两句之间切换，覆盖两次模型输出之间卡片完全静止的
+# 问题；30 秒仍无新信号则由兜底计时强制刷新一次纯用时更新（沿用当前这句文案，
+# 只跳动 worker.status 的 elapsed_seconds）。只区分"问数查询工具"与"其它/生成
+# 阶段"两类，不回显工具名、参数或任何查询内容（`{count}` 只是第几次调用的序数，
+# 不携带具体工具信息）。文案为实施草案，产品负责人过目前不作为最终定稿。
+"worker.action.querying_metrics" = "正在第 {count} 次查询指标数据"
+"worker.action.composing" = "正在整理与生成回答"
 "worker.status" = "{action} · {elapsed_seconds} 秒"
 "worker.queued_timeout" = "任务尚未开始，当前排队已超过等待时间，请稍后重试。"
 "worker.version_unavailable" = "任务尚未开始，当前执行能力暂时不可用，请稍后重试。"

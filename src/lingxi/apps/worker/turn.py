@@ -164,14 +164,23 @@ class WorkerTurnExecutor:
         resume_session_id: str | None = None,
         stop_event: asyncio.Event | None = None,
         on_stream_event: Callable[[Mapping[str, Any]], None] | None = None,
+        on_tool_call: Callable[[str], None] | None = None,
         external_texts: Iterable[tuple[str, object]] | Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         """执行一个回合，**总是**返回一份报告。
 
         会话抛错也要出报告：一个只在日志里留下堆栈的失败回合，对上层来说与"什么都
         没发生"无法区分，而这两者的处置完全不同。
+
+        ``on_tool_call``（Issue #321 方向 C，语义化等待进度）：每次 ``PreToolUse``
+        判定之后调用一次，传入判定后的规范化工具名——见
+        ``ToolGateway.set_tool_call_listener`` 的完整语义。``self._gateway`` 是
+        会话级对象（构造时机见 ``__init__``），只在这里、每次 ``run_turn()`` 调用
+        开始时重新挂载，理由是这个回调闭包了调用方（``apps/worker/service.py``）
+        为**这一次任务**维护的进度状态，不能提前固定在构造期。
         """
 
+        self._gateway.set_tool_call_listener(on_tool_call)
         normalized_external_texts = normalize_external_texts(external_texts)
         agent_prompt = compose_agent_prompt(question, normalized_external_texts)
         self._audit.start_turn()

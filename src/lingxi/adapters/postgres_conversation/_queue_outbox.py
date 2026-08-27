@@ -12,7 +12,11 @@ from datetime import timedelta
 from typing import Any, Mapping
 
 from lingxi.adapters.postgres import connect
-from lingxi.core.delivery.ports import DeliveryEventType, resolve_delivered_outcome
+from lingxi.core.delivery.ports import (
+    DeliveryEventType,
+    assert_content_allowed,
+    resolve_delivered_outcome,
+)
 from lingxi.core.ids import new_id
 
 from ._dataclasses import AppendedEvent, TerminalTask
@@ -90,6 +94,11 @@ class _OutboxMixin:
             DeliveryEventType.SAFELY_RELEASABLE_ANSWER.value,
         ):
             raise ValueError("append_delivery_event 只处理非终态事件类型")
+        # 写入前自查（Issue #328 opus 审查 R1）：在真正打开数据库连接之前就用
+        # ``CONTENT_BEARING_EVENT_TYPES``/``PROGRESS_CONTENT_MAX_LENGTH`` 校验
+        # 一遍，命中问题时抛出一个可读的 ``ValueError``——数据库层的 CHECK 仍然
+        # 是最终防线，这里只是让"写库前就能发现"，不依赖调用方自己记得遵守合同。
+        assert_content_allowed(DeliveryEventType(event_type), content)
         with connect(self._dsn, timeouts=self._timeouts) as connection:
             with connection.transaction():
                 cursor = connection.cursor()
