@@ -20,11 +20,20 @@ worker 侧（``apps/worker/service.py`` 经
 **四步的失败分类只有两种，均在 :meth:`DocumentDeliveryConsumer._process_claim`
 里体现**：
 
-1. **definite（飞书明确拒绝）** → ``failed``：
-   ``adapters.feishu_docx_delivery.FeishuDocxDeliveryError(definite=True)``，
-   即收到非 0 的飞书业务错误码。这是系统已经确定、不会因为重试而改变结论的
-   失败，不需要人工核对具体是哪一次调用；``last_error`` 只记错误分类码
-   （``feishu_code_<n>`` 形态），不含正文、不含凭据。
+1. **definite** → ``failed``——两个来源：
+   （a）``adapters.feishu_docx_delivery.FeishuDocxDeliveryError(definite=True)``，
+   即收到非 0 的飞书业务错误码；（b）``adapters.feishu_docx_delivery`` 四个
+   动作各自的入参校验（``_require_document_id``/``_require_user_open_id``/
+   ``write_paragraphs`` 的空段落检查）抛出的 ``ValueError``（P3 顺手，opus
+   审查）——这些校验在**发出任何 HTTP 请求之前**就会失败，与"有副作用的调用
+   结果不明"是完全不同的情形：没有请求真的发出去，重放同一份数据必然得到
+   同一个结论，不存在"可能已经生效"的空间。两者都是系统已经确定、不会因为
+   重试而改变结论的失败，不需要人工核对具体是哪一次调用；``last_error`` 只记
+   错误分类码/异常类名，不含正文、不含凭据。**"不需要人工核对具体是哪一次
+   调用"不等于"不需要被看见"**（opus 审查 R-1）：此前 :meth:`_fail` 只落
+   日志，一条 ``failed`` 终态因此从不触发任何管理群告警——用户没拿到文档这件
+   事只有翻日志才能发现。现在 :meth:`_fail` 与 :meth:`_uncertain` 对称，命中
+   即记一条 ``document_delivery_failed`` 告警。
 2. **结果不明（网络类异常、响应缺失可回读标识、读回不含目标或权限档位不对）**
    → ``uncertain``：白名单反转——只有第 1 类明确失败才归 ``failed``，
    **其余一切**（``FeishuDocxDeliveryError(definite=False)``、
@@ -141,14 +150,50 @@ class DocumentDeliveryConsumer:
         """跑一轮，返回本轮实际认领并处理的行数。"""
 
         try:
-            self._store.fail_exhausted_pending()
+            exhausted = self._store.fail_exhausted_pending()
         except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
             logger.error("文档投递：清理耗尽重试预算的待认领行失败 error=%s", type(error).__name__)
+        else:
+            if exhausted > 0:
+                # R-1 独立审核：这类行此前被直接丢弃——转 failed 却从不上报，管理员
+                # 永远看不到"有请求耗尽重试预算被清出队列"这件事。不带具体 task_id
+                # （这是一次批量转态，不是单行结果），退化为不带 trace_id 的信号
+                # （见 `delivery_alert_callback` 对空/非法 task_id 的既有容错）。
+                logger.error(
+                    "gateway.document_delivery.attempts_exhausted count=%s", exhausted
+                )
+                self._alert("document_delivery_attempts_exhausted", "")
 
         try:
-            self._store.reclaim_stale_processing()
+            requeued, reclaim_failed = self._store.reclaim_stale_processing()
         except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
             logger.error("文档投递：回收卡住的处理中行失败 error=%s", type(error).__name__)
+        else:
+            del requeued  # 退回 pending 等下一轮重来，不是失败结果，不必上报。
+            if reclaim_failed > 0:
+                # 同上：回收时直接判定 failed 的那部分（重试预算已耗尽）此前同样
+                # 只落日志、不上报。
+                logger.error(
+                    "gateway.document_delivery.reclaim_failed count=%s", reclaim_failed
+                )
+                self._alert("document_delivery_reclaim_failed", "")
+
+        # P2-2（opus 审查）：补发"文档已就绪"通知排在认领新行**之前**——已经
+        # succeeded 却没能通知到用户是最靠近"用户体感落空"的一类残留，不能因为
+        # 本轮新到的建档请求把批量配额占满就一直排不上号。查询失败只降级这一段
+        # （同上面两段），不阻塞新行的正常认领与处理。
+        try:
+            pending_notices = self._store.claim_unnotified_succeeded(limit=self._limit)
+        except Exception as error:  # noqa: BLE001 - 见类文档：只降级这一段
+            logger.error("文档投递：查询待补发通知的行失败 error=%s", type(error).__name__)
+        else:
+            for item in pending_notices:
+                self._send_ready_notice(
+                    request_id=item.id,
+                    task_id=item.task_id,
+                    requester_open_id=item.requester_open_id,
+                    document_id=item.document_id,
+                )
 
         try:
             claims = self._store.claim_pending(limit=self._limit)
@@ -172,6 +217,7 @@ class DocumentDeliveryConsumer:
 
     def _process_claim(self, claim: DocumentDeliveryClaim) -> None:
         from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
 
         document_id = claim.document_id
         try:
@@ -182,16 +228,42 @@ class DocumentDeliveryConsumer:
             self._docx.write_paragraphs(document_id, list(claim.paragraphs))
             self._docx.grant_full_access(document_id, claim.requester_open_id)
             members = self._docx.read_members(document_id)
+        except DocumentDeliveryOwnershipLost:
+            # P1-2（opus 审查）：建档检查点提交时发现持有权已经不在本次调用手里
+            # （典型：这次调用是一个被 `reclaim_stale_processing` 判定为"卡住"
+            # 并回收过的慢消费者）。当场中止——不写正文、不授权、不读回、不发
+            # 通知，把这一行交给真正持有它的那次调用或它已经落下的终态。
+            logger.warning(
+                "文档投递：建档成功但持有权已丢失，放弃本行续做 task_id=%s", claim.task_id
+            )
+            return
         except FeishuDocxDeliveryError as error:
             if error.definite:
                 self._fail(claim, last_error=error.code)
             else:
                 self._uncertain(claim, last_error=error.code)
             return
+        except ValueError as error:
+            # P3 顺手（opus 审查）：``adapters.feishu_docx_delivery`` 四个动作各自
+            # 的入参校验（``_require_document_id``/``_require_user_open_id``/
+            # ``write_paragraphs`` 的空段落检查）在**发出任何 HTTP 请求之前**就
+            # 会失败，抛的是纯 ``ValueError``——这与"白名单反转"要挡的"有副作用
+            # 的调用因为网络异常而结果不明"是完全不同的情形：没有任何请求真的
+            # 发出去，重放同一份数据必然得到同一个 ``ValueError``，不存在"再等等
+            # 说不定就好了"的空间。这类行归 ``uncertain``（V-交付-03：不自动
+            # 重试，转人工核对）与归 ``failed``（同样不自动重试）在"要不要重试"
+            # 这件事上结果相同，但 ``uncertain`` 会误导排查方向——它暗示"可能已经
+            # 生效，需要人工核对飞书那一侧"，而这里连请求都没发出去，真正需要
+            # 核对的是这一行本身的数据（``requester_open_id`` 形状不对、正文段落
+            # 到了处理时点仍然是空——例如已经被 `V-投递-06` 到期擦除却仍然停在
+            # 非终态，理论上不该发生但没有硬性防线保证）。
+            self._fail(claim, last_error=type(error).__name__)
+            return
         except Exception as error:  # noqa: BLE001 - 白名单反转（同 delivery.py R-1）：
-            # 只有上面显式捕获的 definite FeishuDocxDeliveryError 才归 failed，
-            # 其余一切（LookupError、未预期异常）都归结果不明——不能假设一次
-            # 有副作用的调用在异常时一定没有生效。
+            # 只有上面显式捕获的 definite FeishuDocxDeliveryError 与确定性入参
+            # 校验错误（ValueError）才归 failed，其余一切（LookupError、未预期
+            # 异常）都归结果不明——不能假设一次有副作用的调用在异常时一定没有
+            # 生效。
             self._uncertain(claim, last_error=type(error).__name__)
             return
 
@@ -204,6 +276,16 @@ class DocumentDeliveryConsumer:
 
         try:
             self._store.mark_succeeded(request_id=claim.id)
+        except DocumentDeliveryOwnershipLost:
+            # 四步已经全部跑完（文档已经建好、正文已经写、权限已经授予、读回
+            # 也确认了），但落终态这一步才发现持有权已经丢失——同上，不发通知：
+            # 这一行现在究竟是什么状态由真正持有它的那次调用决定，我们没有
+            # 资格覆盖，也没有资格代表它去通知用户。
+            logger.warning(
+                "文档投递：四步已跑完但持有权已丢失，放弃写入终态与通知 task_id=%s",
+                claim.task_id,
+            )
+            return
         except Exception as error:  # noqa: BLE001 - 落库失败仍按结果不明处理，不假装成功
             self._uncertain(claim, last_error=type(error).__name__)
             return
@@ -211,11 +293,27 @@ class DocumentDeliveryConsumer:
         logger.info(
             "gateway.document_delivery.succeeded task_id=%s attempts=%s", claim.task_id, claim.attempts
         )
-        self._send_ready_notice(claim, document_id)
+        self._send_ready_notice(
+            request_id=claim.id,
+            task_id=claim.task_id,
+            requester_open_id=claim.requester_open_id,
+            document_id=document_id,
+        )
 
     def _fail(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+
         try:
             self._store.mark_failed(request_id=claim.id, last_error=last_error)
+        except DocumentDeliveryOwnershipLost:
+            # P1-2：这一行已经不是我们的了——另一次调用可能已经落下了不同的
+            # 结论。不覆盖、不告警：告警必须描述真实发生的终态，而不是我们
+            # 本来打算落的那一个。
+            logger.warning(
+                "文档投递：判定为 failed 但持有权已丢失，放弃写入终态与告警 task_id=%s",
+                claim.task_id,
+            )
+            return
         except Exception as error:  # noqa: BLE001 - 记录失败不能让异常逃出本方法
             logger.error(
                 "文档投递终态写入失败（failed）task_id=%s error=%s", claim.task_id, type(error).__name__
@@ -226,10 +324,30 @@ class DocumentDeliveryConsumer:
             claim.attempts,
             last_error,
         )
+        # R-1 独立审核：definite 失败此前只落日志，管理员看不到——与 `_uncertain`
+        # 已有的告警对称补上；`V-交付-03`「未确认成功不自动重发」覆盖的是重试语义，
+        # 不代表 failed 终态本身不需要人工核对（飞书明确拒绝仍然是"用户没拿到文档"）。
+        self._alert("document_delivery_failed", claim.task_id)
+        # R-1 第 3 条：此前只有 succeeded 会追加消息，用户请求生成文档失败后从未
+        # 收到任何后续消息——表现成"发起之后再也没有下文"。措辞与 uncertain 区分
+        # （见 content.toml「delivery.document_failed」）：failed 是确定结论，
+        # 可以直接建议用户重新发起。
+        self._send_terminal_notice(
+            claim, key="delivery.document_failed", dedupe_prefix="document-failed"
+        )
 
     def _uncertain(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+
         try:
             self._store.mark_uncertain(request_id=claim.id, last_error=last_error)
+        except DocumentDeliveryOwnershipLost:
+            # 同 `_fail`：持有权已经不在我们手里，不覆盖、不告警。
+            logger.warning(
+                "文档投递：判定为 uncertain 但持有权已丢失，放弃写入终态与告警 task_id=%s",
+                claim.task_id,
+            )
+            return
         except Exception as error:  # noqa: BLE001 - 记录失败不能让异常逃出本方法
             logger.error(
                 "文档投递终态写入失败（uncertain）task_id=%s error=%s", claim.task_id, type(error).__name__
@@ -242,25 +360,71 @@ class DocumentDeliveryConsumer:
         )
         # V-交付-03：未确认成功不自动重发，转人工核对——记告警级审计。
         self._alert("document_delivery_uncertain", claim.task_id)
+        # R-1 第 3 条：措辞与 failed 区分（见 content.toml
+        # 「delivery.document_uncertain」）——不建议用户自行重试：uncertain 的
+        # 成因可能是一次有副作用的调用（建档/写正文/授权）网络异常，无法证明
+        # 没有生效，重试可能造成重复建档/重复授权，必须转人工核对。
+        self._send_terminal_notice(
+            claim, key="delivery.document_uncertain", dedupe_prefix="document-uncertain"
+        )
 
-    def _send_ready_notice(self, claim: DocumentDeliveryClaim, document_id: str) -> None:
+    def _send_ready_notice(
+        self, *, request_id: str, task_id: str, requester_open_id: str, document_id: str
+    ) -> None:
         """成功后把文档链接作为追加消息发给提问用户；失败只记日志/告警，不改写
         已经落库的 ``succeeded`` 终态——文档已经建好且用户已经拿到权限，通知只是
         一次锦上添花的提醒，不是这条请求"是否成功"的判据。
+
+        显式字段而不是接受整个 ``DocumentDeliveryClaim``（P2-2，opus 审查）：
+        本方法有两个调用点——刚跑完四步的原发送路径（``claim`` 现成可用），与
+        补发未确认送达通知的路径（``run_once`` 里的 :class:`UnnotifiedSuccess`，
+        没有完整 claim——``title``/``paragraphs``/``attempts`` 对补发通知无关）。
+
+        **成功才置位 ``notified_at``**：与 :meth:`PostgresDocumentDeliveryStore.
+        mark_notified` 的幂等闸配合，补发路径（
+        :meth:`DocumentDeliveryConsumer.run_once`）下一轮会自然跳过已经确认送达
+        的行，不需要在这里额外判断"这是不是补发"。
         """
 
         try:
             url = self._docx.document_url(document_id)
             content = self._catalog.text("delivery.document_ready", url=url)
             self._notifier.send_text(
-                open_id=claim.requester_open_id,
+                open_id=requester_open_id,
                 text=content.text,
-                dedupe_key=f"document-ready:{claim.id}",
+                dedupe_key=f"document-ready:{request_id}",
             )
+            self._store.mark_notified(request_id=request_id)
         except Exception as error:  # noqa: BLE001 - 通知失败不得回滚已经确认的交付结果
             logger.error(
                 "文档投递完成通知发送失败，交付结果不受影响 task_id=%s error=%s",
+                task_id,
+                type(error).__name__,
+            )
+            self._alert("document_delivery_notice_failed", task_id)
+
+    def _send_terminal_notice(
+        self, claim: DocumentDeliveryClaim, *, key: str, dedupe_prefix: str
+    ) -> None:
+        """failed/uncertain 终态后把固定文案作为追加消息发给提问用户（opus 审查
+        R-1 第 3 条）；失败只记日志/告警，不改写已经落库的终态——同
+        :meth:`_send_ready_notice` 的姿态：通知是终态判定之后锦上添花的告知，
+        不是终态本身的一部分。``dedupe_prefix`` 与 ``document-ready``（成功那一路
+        的既有前缀）各自独立，三种终态各自的通知不会互相去重掉。
+        """
+
+        try:
+            content = self._catalog.text(key)
+            self._notifier.send_text(
+                open_id=claim.requester_open_id,
+                text=content.text,
+                dedupe_key=f"{dedupe_prefix}:{claim.id}",
+            )
+        except Exception as error:  # noqa: BLE001 - 通知失败不得回滚已经落库的终态
+            logger.error(
+                "文档投递终态通知发送失败 task_id=%s key=%s error=%s",
                 claim.task_id,
+                key,
                 type(error).__name__,
             )
             self._alert("document_delivery_notice_failed", claim.task_id)

@@ -48,6 +48,50 @@ status='pending'``），供崩溃恢复的重试上限判断（应用层常量�
 
 ``downgrade()`` 真实可执行：本表是本 revision 新建，直接整表删除，不存在需要
 还原的历史行。
+
+---
+
+**原地修订（opus 审查 R-S/#341 review round，P1-3）**：本 revision 在提交这次修订
+时**尚未在任何环境执行过**（未合并进 main、未部署），因此按仓库既有纪律（迁移
+只在真正落过地之后才只能"新增 revision 修正"，落地前发现的问题原地改这个文件
+本身更安全，不留一段从未被任何库真正跑过的历史形态）直接原地改写，不新增
+revision。补两件事：
+
+1. **``content_expires_at`` 列 + 到期触发器**（对齐 ``V-投递-06``：待投递/失败/
+   结果不明的正文最迟 24 小时清除，与 ``task_delivery_event``——迁移 0059——
+   同一条产品口径与同一个 24 小时窗口）。形状照 0059
+   ``task_delivery_event_fix_expiry()``/0066
+   ``onboarding_completion_notice_fix_expiry()``：``BEFORE INSERT`` 触发器把
+   ``content_expires_at`` 锁定为 ``created_at + 24 小时``，应用层传什么都会被
+   覆盖。**只在 ``INSERT`` 上触发，不覆盖 ``UPDATE``**——与 0059/0066 的
+   ``BEFORE INSERT OR UPDATE``（那两张表需要额外挡住"通过 UPDATE 悄悄改写
+   created_at/幂等键"）不同，是刻意收窄：本表全部应用层 ``UPDATE`` 语句（认领、
+   四个 ``mark_*``、两条回收/死信扫描）都不触碰 ``title``/``paragraphs``/
+   ``created_at``/``content_expires_at`` 本身，没有需要在 ``UPDATE`` 路径上
+   额外防御的攻击面，加一层不服务任何真实调用点的触发器分支只会增加维护成本。
+   到期擦除职责见 ``adapters/postgres_document_delivery.py`` 的
+   ``redact_expired_content``（正文擦空、行保留运行事实——``status``/
+   ``attempts``/``document_id``/时间戳原样留下，形状照 0064 ``publish_outbox``
+   的 ``redact_expired_payloads``：那张表擦 ``payload`` 成 ``'{}'::jsonb``，
+   这里擦 ``title``/``paragraphs`` 成空字符串/空数组），由
+   ``apps/scheduler/document_delivery_dead_letter.py`` 的定时职责调用（Issue
+   #341 R-2，与死信扫描共用同一个轻量周期职责，不为一次 ``UPDATE`` 语句单开
+   一整个职责）。
+2. **``title``/``paragraphs`` 形状 CHECK**（P3 顺手）：真实内容态要求非空标题
+   与非空段落数组；擦除态要求两者都为空——**两者都合法，之间没有第三态**，
+   数据库层直接挡住"标题空了但段落还在"或"两者都非空却是一个空数组"这类
+   自相矛盾的行，不依赖应用层每次都记得同步擦两个字段。
+3. **``notified_at`` 列**（P2-2，opus 审查）：成功建档、写正文、授权并确认读回
+   （``status='succeeded'``）之后，"文档已就绪"这条追加消息可能因为一次瞬时的
+   出站故障没有真正发出去——此前这一步失败只落日志/告警，没有任何机制补发，
+   用户可能永远收不到这条通知，即使文档本身已经建好、他也已经拿到了可管理
+   权限。``notified_at`` 只在通知**真正确认送达**（``FeishuUserMessages.
+   send_text`` 未抛异常）时置位；``NULL`` 即"还没确认送达"。gateway 侧独立
+   消费循环每轮**优先**扫描 ``status='succeeded' AND notified_at IS NULL`` 且
+   已经过了退避窗口（``NOTIFY_RETRY_AFTER`` = 10 分钟，见
+   ``adapters/postgres_document_delivery.py``）的行补发，不放在 scheduler——
+   补发本质是"重放一次 gateway 侧已有的出站信道调用"，scheduler 没有面向单个
+   用户的出站信道。
 """
 
 from __future__ import annotations
@@ -90,10 +134,22 @@ CREATE TABLE task_document_delivery_request (
 
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    content_expires_at      TIMESTAMPTZ NOT NULL,               -- 触发器固定为 created_at + 24 小时
+
+    -- "文档已就绪"追加消息确认送达的时点（P2-2）；NULL 即还没确认送达，
+    -- gateway 消费循环据此判断要不要补发，见文件头部「原地修订」第 3 条。
+    notified_at             TIMESTAMPTZ,
 
     -- 与迁移 0068 同一纪律：两种自相矛盾的行（标成功却没有确认时间／有确认时间
     -- 却不是成功状态）都在数据库层面直接拒绝，见文件头部。
-    CHECK ((status = 'succeeded') = (permission_confirmed_at IS NOT NULL))
+    CHECK ((status = 'succeeded') = (permission_confirmed_at IS NOT NULL)),
+
+    -- P1-3 顺手（P3）：真实内容态（非空标题 + 非空段落数组）与到期擦除后的标记态
+    -- （两者都为空）都合法，之间没有第三态——见文件头部「原地修订」第 2 条。
+    CHECK (
+        (title <> '' AND jsonb_typeof(paragraphs) = 'array' AND jsonb_array_length(paragraphs) > 0)
+        OR (title = '' AND paragraphs = '[]'::jsonb)
+    )
 );
 
 -- gateway 消费循环的认领查询谓词（status='pending'，按 created_at 排队）；部分
@@ -108,10 +164,41 @@ CREATE INDEX task_document_delivery_request_pending_idx
 CREATE INDEX task_document_delivery_request_processing_idx
     ON task_document_delivery_request (updated_at)
     WHERE status = 'processing';
+
+-- V-投递-06 到期擦除的扫描谓词（见 adapters/postgres_document_delivery.py 的
+-- redact_expired_content）：只覆盖尚未擦除的行（title <> ''），已擦除的行永远
+-- 不会再次命中这条查询，索引大小只随"尚未到期"的积压量增长。
+CREATE INDEX task_document_delivery_request_content_purge_idx
+    ON task_document_delivery_request (content_expires_at)
+    WHERE title <> '';
+
+-- P2-2：gateway 消费循环补发"文档已就绪"通知的扫描谓词（见
+-- adapters/postgres_document_delivery.py 的 claim_unnotified_succeeded）：只覆盖
+-- 已经成功但还没确认通知送达的行，一旦补发确认成功（notified_at 非空）就永久
+-- 退出这条索引，索引大小只随"待补发"的积压量增长。
+CREATE INDEX task_document_delivery_request_unnotified_idx
+    ON task_document_delivery_request (updated_at)
+    WHERE status = 'succeeded' AND notified_at IS NULL;
+
+-- 到期时间由来源时间推导，与 0059/0066 同型：应用层传什么都会被覆盖。只在
+-- INSERT 上触发的理由见文件头部「原地修订」第 1 条。
+CREATE OR REPLACE FUNCTION task_document_delivery_request_fix_expiry() RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.content_expires_at := NEW.created_at + INTERVAL '24 hours';
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER task_document_delivery_request_expiry
+    BEFORE INSERT ON task_document_delivery_request
+    FOR EACH ROW EXECUTE FUNCTION task_document_delivery_request_fix_expiry();
 """
 
 _DOWNGRADE_SQL = r"""
 DROP TABLE IF EXISTS task_document_delivery_request;
+DROP FUNCTION IF EXISTS task_document_delivery_request_fix_expiry();
 """
 
 

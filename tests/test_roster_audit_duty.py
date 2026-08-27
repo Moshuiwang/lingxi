@@ -1153,9 +1153,9 @@ class DutyRegistrationTest(unittest.TestCase):
         self.assertEqual(
             [duty.name for duty in loop.duties],
             # 组织快照同步（Issue #250）的两个令牌供给与花名册配置无关，`build_loop`
-            # 总能建出默认供给，因此总会真实注册；迟到就绪恢复（V-开通-18）与开通
-            # 中途停摆收口（Issue #282，V-开通-19）都没有可选前置会让它们整体不
-            # 装配，因此也总会真实注册，排在最后。
+            # 总能建出默认供给，因此总会真实注册；迟到就绪恢复（V-开通-18）、开通
+            # 中途停摆收口（Issue #282，V-开通-19）与文档投递死信扫描（Issue #341
+            # R-2）都没有可选前置会让它们整体不装配，因此也总会真实注册，排在最后。
             [
                 "凭据轮换",
                 "保留清理",
@@ -1164,6 +1164,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "组织快照同步",
                 "迟到就绪恢复",
                 "开通中途停摆收口",
+                "文档投递死信扫描与正文到期擦除",
             ],
         )
         roster_records = self._roster_records(audit)
@@ -1206,6 +1207,7 @@ class DutyRegistrationTest(unittest.TestCase):
                         "组织快照同步",
                         "迟到就绪恢复",
                         "开通中途停摆收口",
+                        "文档投递死信扫描与正文到期擦除",
                     ],
                 )
                 roster_records = self._roster_records(audit)
@@ -1250,6 +1252,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "组织快照同步",
                 "迟到就绪恢复",
                 "开通中途停摆收口",
+                "文档投递死信扫描与正文到期擦除",
             ],
         )
         # 按 ``roster_audit.`` 前缀取本职责的审计：同一个 `build_loop` 还会为每日权限重算
@@ -1333,6 +1336,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "组织快照同步",
                 "迟到就绪恢复",
                 "开通中途停摆收口",
+                "文档投递死信扫描与正文到期擦除",
             ],
         )
         self.assertEqual(self._roster_records(audit), [], "前置齐备时不该有『未注册』审计")

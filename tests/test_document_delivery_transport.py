@@ -13,8 +13,12 @@
    None``）→ 循环不注册，零行为差异（哨兵，不需要真库）；
 ⑥ worker 侧：终态成功且报告契约 ``document_request`` 非空 → 恰一行 ``pending``；
    终态失败，或字段为空 → 零行。
+⑦（opus 审查 P1-2）：一次被 ``reclaim_stale_processing`` 回收过的"慢消费者"最终
+   跑完建档，写检查点时发现持有权已经丢失（这一行已经被另一次认领接手并跑出了
+   不同的结论）→ 当场中止，全程 no-op（不写正文、不授权、不读回、不发通知），
+   已经落下的真实终态原样保留、不被覆盖。
 
-①-④、⑥ 需要真库（唯一约束、CHECK、以及 ``write_terminal_event`` 与终态事务的
+①-④、⑥-⑦ 需要真库（唯一约束、CHECK、以及 ``write_terminal_event`` 与终态事务的
 真实交互不能靠假连接验证）；⑤ 是纯装配层判断，不接触数据库或网络。
 
 变异锚点（任务卡登记，2026-08-27 实测还原）：
@@ -22,7 +26,11 @@
 - 把 ``DocumentDeliveryConsumer._process_claim`` 的 ``if document_id is None``
   判断去掉（每次都调用 ``create_document``）→ ②红；
 - 把成功判据从"``read_members`` 确认 full_access"改成"四步没有抛异常就
-  succeeded"（去掉 ``_has_confirmed_full_access`` 校验）→ ③红。
+  succeeded"（去掉 ``_has_confirmed_full_access`` 校验）→ ③红；
+- 把 ``adapters/postgres_document_delivery.py`` 四个 ``mark_*`` 的 ``rowcount``
+  检查删掉（静默无视 0 行）→ ⑦红（``docx.write_calls``/``grant_calls``/
+  ``read_calls`` 会变成非空，``notifier.sent`` 也会非空，且 ``document_id`` 会被
+  慢消费者的建档结果覆盖）。
 """
 
 from __future__ import annotations
@@ -178,14 +186,36 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             row = connection.execute(sql, parameters).fetchone()
         return row[0] if row is not None else None
 
-    def _seed_pending_request(self, *, request_id: str = "tdd-1", document_id: str | None = None) -> None:
+    def _seed_extra_task(self, task_id: str) -> None:
+        """``task_document_delivery_request.task_id`` 是 UNIQUE + 外键——一个用例
+        要种两行请求时，第二行必须挂在一个不同的 ``task`` 上，不能复用
+        ``self.TASK_ID``。"""
+
+        conversation_id = f"cnv-{task_id}"
+        self.execute(
+            """INSERT INTO conversation
+               (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
+               VALUES (%s,'usr-doc',%s,%s,NULL)""",
+            (conversation_id, f"chat-{task_id}", f"topic-{task_id}"),
+        )
+        self.execute(
+            """INSERT INTO task
+               (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                target_worker_version,attempts,content_expires_at)
+               VALUES (%s,%s,'usr-doc',%s,'问题','succeeded','stable',1,now())""",
+            (task_id, conversation_id, f"event-{task_id}"),
+        )
+
+    def _seed_pending_request(
+        self, *, request_id: str = "tdd-1", document_id: str | None = None, task_id: str | None = None
+    ) -> None:
         self.execute(
             """INSERT INTO task_document_delivery_request
                (id, task_id, requester_open_id, title, paragraphs, document_id)
                VALUES (%s, %s, %s, '标题', %s, %s)""",
             (
                 request_id,
-                self.TASK_ID,
+                task_id or self.TASK_ID,
                 self.REQUESTER_OPEN_ID,
                 json.dumps(["段落一", "段落二"], ensure_ascii=False),
                 document_id,
@@ -249,6 +279,77 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 "SELECT count(*) FROM task_document_delivery_request WHERE task_id = %s", (task_id,)
             ),
             1,
+        )
+
+    def test_a_null_open_id_requester_degrades_to_no_document_without_losing_the_answer(
+        self,
+    ) -> None:
+        """P2-3（opus 审查）：提问用户的 ``feishu_open_id`` 为 ``NULL``
+        （``app_user`` 全有全无 CHECK 下的合法 guest 态，如尚未匹配身份、或组织
+        资料同步专用账号）时，迁移 0074 的 ``requester_open_id`` CHECK 会拒绝
+        插入这一行——**这不能拖累已经真实产生的终态答案**：``write_terminal_
+        event`` 必须照常成功、``task`` 照常转入 ``awaiting_delivery``，只有文档
+        投递请求这一行不存在。
+
+        变异锚点：把插入语句外面的 SAVEPOINT（嵌套 ``connection.transaction()``）
+        去掉，本用例会变红——``CheckViolation`` 会一路冲垮外层事务，
+        ``write_terminal_event`` 抛异常而不是返回一份成功的 ``AppendedEvent``，
+        终态答案与 ``task`` 状态转移也会被一并回滚。
+        """
+
+        queue = PostgresTaskQueue(DSN)
+        conversation_id = "cnv-null-open-id"
+        task_id = "tsk-null-open-id"
+        with connect(DSN) as connection:
+            with connection.transaction():
+                # 全有全无 CHECK：identity 五列必须同为 NULL 或同为非 NULL。
+                connection.execute(
+                    """INSERT INTO app_user
+                       (id, provisioning_state, tenant_key)
+                       VALUES ('usr-null-open-id', 'guest', NULL)"""
+                )
+                connection.execute(
+                    """INSERT INTO conversation
+                       (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
+                       VALUES (%s,'usr-null-open-id',%s,%s,%s)""",
+                    (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+                )
+                connection.execute(
+                    """INSERT INTO task
+                       (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                        target_worker_version,worker_id,heartbeat_at,attempts,content_expires_at)
+                       VALUES (%s,%s,'usr-null-open-id',%s,'问题','running','stable',
+                               'worker-1',now(),1,now())""",
+                    (task_id, conversation_id, f"event-{task_id}"),
+                )
+
+        appended = queue.write_terminal_event(
+            task_id=task_id,
+            worker_id="worker-1",
+            terminal_kind="success",
+            error_kind=None,
+            content="答案",
+            document_request={"title": "标题", "paragraphs": ["段落一"]},
+        )
+
+        self.assertIsNotNone(appended, "终态答案必须成功写入，不能被文档请求插入失败拖累")
+        self.assertFalse(appended.duplicate)
+        self.assertEqual(
+            self.scalar("SELECT status FROM task WHERE id = %s", (task_id,)),
+            "awaiting_delivery",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT content FROM task_delivery_event WHERE task_id = %s AND event_type = 'terminal'",
+                (task_id,),
+            ),
+            "答案",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM task_document_delivery_request WHERE task_id = %s", (task_id,)
+            ),
+            0,
         )
 
     # -- ② 检查点恢复 ----------------------------------------------------------
@@ -358,7 +459,8 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
     def test_definite_feishu_rejection_is_failed_with_last_error(self) -> None:
         """飞书明确拒绝（``FeishuDocxDeliveryError(definite=True)``）→ ``failed``，
-        ``last_error`` 记错误分类码，不含正文。
+        ``last_error`` 记错误分类码，不含正文。opus 审查 R-1 第 3 条：用户本人也要
+        收到一条对应的追加消息（此前只有 succeeded 会发）。
         """
 
         self._seed_pending_request(request_id="tdd-definite")
@@ -369,7 +471,11 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 raise FeishuDocxDeliveryError("feishu_code_99999", definite=True)
 
         docx = RejectingDocx()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=_SpyNotifier())
+        notifier = _SpyNotifier()
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=self.store, docx=docx, notifier=notifier, on_alert=lambda kind, task_id: alerts.append((kind, task_id))
+        )
 
         consumer.run_once()
 
@@ -386,10 +492,20 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             self.store.claim_pending(limit=10),
             [],
         )
+        # R-1 独立审核（必修 1）：definite 失败必须记一条告警——此前只落日志。
+        self.assertIn(("document_delivery_failed", "tsk-doc-1"), alerts)
+        # R-1（必修 3）：用户本人收到一条对应文案的追加消息，与成功那一路
+        # （``document-ready:``）用不同的 dedupe 前缀，不会互相去重掉。
+        self.assertEqual(len(notifier.sent), 1)
+        open_id, text, dedupe_key = notifier.sent[0]
+        self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
+        self.assertEqual(text, "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。")
+        self.assertEqual(dedupe_key, "document-failed:tdd-definite")
 
     def test_indefinite_error_is_uncertain_not_failed(self) -> None:
         """结果不明（非 definite 的异常，例如网络类）→ ``uncertain``，不是 ``failed``
-        ——白名单反转：只有明确拒绝才归 ``failed``。
+        ——白名单反转：只有明确拒绝才归 ``failed``。opus 审查 R-1 第 3 条：用户本人
+        也要收到一条措辞与 failed 区分的追加消息（不建议直接重试）。
         """
 
         self._seed_pending_request(request_id="tdd-indefinite")
@@ -400,7 +516,8 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 raise FeishuDocxDeliveryError("transport_error", definite=False)
 
         docx = FlakyDocx()
-        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=_SpyNotifier())
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
 
         consumer.run_once()
 
@@ -408,6 +525,328 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-indefinite'"),
             "uncertain",
         )
+        self.assertEqual(len(notifier.sent), 1)
+        open_id, text, dedupe_key = notifier.sent[0]
+        self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
+        self.assertEqual(text, "文档生成结果暂无法确认，已转人工核对。")
+        self.assertEqual(dedupe_key, "document-uncertain:tdd-indefinite")
+
+    def test_a_deterministic_precondition_valueerror_is_failed_not_uncertain(self) -> None:
+        """P3 顺手（opus 审查）：``adapters.feishu_docx_delivery`` 的入参校验在
+        发出任何 HTTP 请求之前失败（例如 ``requester_open_id`` 形状不对），抛的
+        是 ``ValueError``——这类"没有任何请求真的发出去、重放必然同一个结论"的
+        确定性配置错误必须归 ``failed``，不是 ``uncertain``（后者暗示"可能已经
+        生效，需要人工核对飞书那一侧"，对这类从未发出请求的情形是误导）。
+        """
+
+        self._seed_pending_request(request_id="tdd-bad-openid")
+
+        class BadOpenIdDocx(_SpyDocx):
+            def grant_full_access(self, document_id: str, open_id: str) -> None:
+                self.grant_calls.append((document_id, open_id))
+                raise ValueError("open_id 必须是飞书用户 open_id，不回显收到的值")
+
+        docx = BadOpenIdDocx(create_result="doc-bad-openid")
+        notifier = _SpyNotifier()
+        alerts: list[tuple[str, str]] = []
+        consumer = DocumentDeliveryConsumer(
+            store=self.store,
+            docx=docx,
+            notifier=notifier,
+            on_alert=lambda kind, task_id: alerts.append((kind, task_id)),
+        )
+
+        consumer.run_once()
+
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-bad-openid'"),
+            "failed",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-bad-openid'"
+            ),
+            "ValueError",
+        )
+        self.assertIn(("document_delivery_failed", "tsk-doc-1"), alerts)
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertEqual(notifier.sent[0][1], "抱歉，你要的文档生成失败了。你可以重新发起问数再试一次；问题已记录。")
+
+    # -- ⑦ P1-2：回收后慢消费者全程 no-op --------------------------------------
+
+    def test_slow_consumer_after_reclaim_is_a_total_no_op_and_sends_no_notice(self) -> None:
+        """一个"慢消费者"认领了一行，还没来得及提交建档检查点就被
+        ``reclaim_stale_processing`` 判定为卡住并回收；这一行随后被一个更快的
+        消费者重新认领并跑到 ``succeeded``。慢消费者终于跑完自己的
+        ``create_document`` 后尝试提交检查点——此时持有权早已不在它手里，必须
+        当场中止、全程 no-op：不覆盖已经真实生效的终态，不写正文、不授权、
+        不读回、不发通知。
+
+        变异锚点：删掉 ``mark_document_created`` 的 rowcount 检查，本用例会变红
+        （``write_calls``/``grant_calls``/``read_calls`` 变成非空，
+        ``notifier.sent`` 也会非空，且 ``document_id`` 会被慢消费者的建档结果
+        "doc-slow" 覆盖，快消费者留下的 "doc-fast" 与 ``succeeded`` 终态都会
+        被悄悄破坏）。
+        """
+
+        self._seed_pending_request(request_id="tdd-slow")
+
+        # 阶段一：慢消费者认领（attempts 1 -> processing，document_id 仍为 None）。
+        slow_claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(slow_claims), 1)
+        slow_claim = slow_claims[0]
+        self.assertIsNone(slow_claim.document_id)
+
+        # 让它"卡住"：回拨 updated_at 到回收窗口之外，reclaim 把它退回 pending。
+        self.execute(
+            "UPDATE task_document_delivery_request SET updated_at = now() - interval '10 minutes' "
+            "WHERE id = %s",
+            (slow_claim.id,),
+        )
+        requeued, failed = self.store.reclaim_stale_processing()
+        self.assertEqual((requeued, failed), (1, 0))
+
+        # 阶段二：一个更快的消费者重新认领并跑完全部四步、落 succeeded。
+        fast_claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(fast_claims), 1)
+        fast_claim = fast_claims[0]
+        self.store.mark_document_created(request_id=fast_claim.id, document_id="doc-fast")
+        self.store.mark_succeeded(request_id=fast_claim.id)
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-slow'"),
+            "succeeded",
+        )
+
+        # 阶段三：慢消费者这才跑完自己的 create_document，尝试提交检查点——用它
+        # 自己在阶段一拿到的、已经过期的 claim 对象（document_id 仍是 None）。
+        docx = _SpyDocx(create_result="doc-slow")
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+
+        consumer._process_claim(slow_claim)
+
+        self.assertEqual(docx.create_calls, ["标题"], "慢消费者自己的建档调用确实发生了")
+        self.assertEqual(docx.write_calls, [], "不得续写正文")
+        self.assertEqual(docx.grant_calls, [], "不得续授权")
+        self.assertEqual(docx.read_calls, [], "不得续读回")
+        self.assertEqual(notifier.sent, [], "不得发出任何通知")
+        # 快消费者落下的真实终态原样保留，没有被慢消费者的迟到写入覆盖。
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-slow'"),
+            "succeeded",
+        )
+        self.assertEqual(
+            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = 'tdd-slow'"),
+            "doc-fast",
+        )
+
+    # -- ⑧ R-2 死信 + `V-投递-06` 正文到期擦除（opus 审查 R-2/P1-3） -------------
+
+    def test_fail_expired_pending_converts_only_the_stale_unconsumed_row(self) -> None:
+        """R-2 死信面：``pending`` 超过窗口仍未被任何消费循环认领 → 转
+        ``failed``（``last_error = 'pending_expired_unconsumed'``）；窗口内的行
+        原样不动。"""
+
+        self._seed_pending_request(request_id="tdd-dead-letter")
+        self._seed_extra_task("tsk-doc-fresh")
+        self._seed_pending_request(request_id="tdd-fresh", task_id="tsk-doc-fresh")
+        self.execute(
+            "UPDATE task_document_delivery_request SET created_at = now() - interval '31 minutes' "
+            "WHERE id = 'tdd-dead-letter'"
+        )
+
+        from datetime import timedelta
+
+        converted = self.store.fail_expired_pending(older_than=timedelta(minutes=30))
+
+        self.assertEqual(converted, 1)
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-dead-letter'"),
+            "failed",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT last_error FROM task_document_delivery_request WHERE id = 'tdd-dead-letter'"
+            ),
+            "pending_expired_unconsumed",
+        )
+        # 窗口内的行不受影响：仍然是 pending，认领谓词照常能捞到它。
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-fresh'"),
+            "pending",
+        )
+
+    def test_redact_expired_content_empties_title_and_paragraphs_but_keeps_operational_facts(
+        self,
+    ) -> None:
+        """``V-投递-06``：过了 24 小时上限的正文被擦空（``title``/``paragraphs``），
+        ``status``/``document_id``/``attempts`` 等运行事实原样保留；未到期的行
+        一个字都不动。"""
+
+        self._seed_pending_request(request_id="tdd-content-expired", document_id="doc-kept")
+        self._seed_extra_task("tsk-doc-content-fresh")
+        self._seed_pending_request(request_id="tdd-content-fresh", task_id="tsk-doc-content-fresh")
+        self.execute(
+            "UPDATE task_document_delivery_request SET status = 'failed', attempts = 3, "
+            "last_error = 'feishu_code_1', content_expires_at = now() - interval '1 hour' "
+            "WHERE id = 'tdd-content-expired'"
+        )
+
+        redacted = self.store.redact_expired_content()
+
+        self.assertEqual(redacted, 1)
+        row = self.execute_and_fetchone(
+            "SELECT title, paragraphs, status, document_id, attempts, last_error "
+            "FROM task_document_delivery_request WHERE id = 'tdd-content-expired'"
+        )
+        self.assertEqual(row[0], "")
+        self.assertEqual(row[1], [])
+        # 运行事实原样保留——只擦正文，不擦"发生过什么"。
+        self.assertEqual(row[2], "failed")
+        self.assertEqual(row[3], "doc-kept")
+        self.assertEqual(row[4], 3)
+        self.assertEqual(row[5], "feishu_code_1")
+        # 未到期的行一个字都不动。
+        self.assertEqual(
+            self.scalar("SELECT title FROM task_document_delivery_request WHERE id = 'tdd-content-fresh'"),
+            "标题",
+        )
+        # 已经擦过的行不会被同一次调用重复计数（谓词是 title <> ''）。
+        self.assertEqual(self.store.redact_expired_content(), 0)
+
+    def test_title_paragraphs_shape_check_rejects_half_redacted_rows(self) -> None:
+        """P1-3 顺手：真实内容态（非空标题 + 非空段落数组）与擦除态（两者都为空）
+        都合法，"半擦"（只擦了一边）被数据库层直接拒绝。"""
+
+        import psycopg
+
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.execute(
+                """INSERT INTO task_document_delivery_request
+                   (id, task_id, requester_open_id, title, paragraphs, document_id)
+                   VALUES ('tdd-half-a', %s, %s, '', %s, NULL)""",
+                (self.TASK_ID, self.REQUESTER_OPEN_ID, json.dumps(["段落一"])),
+            )
+
+    def test_title_paragraphs_shape_check_rejects_empty_paragraphs_array_with_a_title(
+        self,
+    ) -> None:
+        import psycopg
+
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.execute(
+                """INSERT INTO task_document_delivery_request
+                   (id, task_id, requester_open_id, title, paragraphs, document_id)
+                   VALUES ('tdd-half-b', %s, %s, '标题', '[]'::jsonb, NULL)""",
+                (self.TASK_ID, self.REQUESTER_OPEN_ID),
+            )
+
+    # -- ⑨ P2-2：通知未确认送达补发 ---------------------------------------------
+
+    def test_successful_notify_sets_notified_at(self) -> None:
+        """成功路径下通知一旦确认送达，``notified_at`` 立刻置位——补发扫描
+        （``notified_at IS NULL``）不会再捞到这一行。"""
+
+        self._seed_pending_request(request_id="tdd-notify-ok")
+        docx = _SpyDocx(
+            create_result="doc-notify-ok",
+            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+
+        consumer.run_once()
+
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertIsNotNone(
+            self.scalar(
+                "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-notify-ok'"
+            )
+        )
+
+    def test_run_once_resends_a_stale_unnotified_success_before_claiming_new_rows(self) -> None:
+        """P2-2：``succeeded`` 但通知从未确认送达、且已经过了退避窗口的行，
+        ``run_once`` 优先补发；补发成功后置位 ``notified_at``，同一行不会再被
+        下一轮捞到。
+        """
+
+        self._seed_pending_request(request_id="tdd-unnotified", document_id="doc-unnotified")
+        self.execute(
+            "UPDATE task_document_delivery_request "
+            "SET status = 'succeeded', permission_confirmed_at = now(), "
+            "updated_at = now() - interval '11 minutes' WHERE id = 'tdd-unnotified'"
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=_SpyDocx(), notifier=notifier)
+
+        consumer.run_once()
+
+        self.assertEqual(len(notifier.sent), 1)
+        open_id, text, dedupe_key = notifier.sent[0]
+        self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
+        self.assertIn("doc-unnotified", text)
+        self.assertEqual(dedupe_key, "document-ready:tdd-unnotified")
+        self.assertIsNotNone(
+            self.scalar(
+                "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-unnotified'"
+            )
+        )
+
+        # 下一轮：notified_at 已经非空，不再被补发扫描捞到，不重复发送。
+        notifier.sent.clear()
+        consumer.run_once()
+        self.assertEqual(notifier.sent, [])
+
+    def test_a_fresh_unnotified_success_within_the_backoff_window_is_not_resent_yet(
+        self,
+    ) -> None:
+        """还没到退避窗口（10 分钟）的未确认通知不会被本轮补发——避免对一次刚刚
+        失败、原因可能还没消失的通知无节制重试。"""
+
+        self._seed_pending_request(request_id="tdd-fresh-unnotified", document_id="doc-fresh")
+        self.execute(
+            "UPDATE task_document_delivery_request "
+            "SET status = 'succeeded', permission_confirmed_at = now(), updated_at = now() "
+            "WHERE id = 'tdd-fresh-unnotified'"
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=_SpyDocx(), notifier=notifier)
+
+        consumer.run_once()
+
+        self.assertEqual(notifier.sent, [])
+        self.assertIsNone(
+            self.scalar(
+                "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-fresh-unnotified'"
+            )
+        )
+
+    def test_mark_notified_is_idempotent_and_never_overwrites_the_first_confirmation(
+        self,
+    ) -> None:
+        self._seed_pending_request(request_id="tdd-mark-notified", document_id="doc-x")
+        self.execute(
+            "UPDATE task_document_delivery_request "
+            "SET status = 'succeeded', permission_confirmed_at = now() "
+            "WHERE id = 'tdd-mark-notified'"
+        )
+
+        self.store.mark_notified(request_id="tdd-mark-notified")
+        first = self.scalar(
+            "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-mark-notified'"
+        )
+        self.assertIsNotNone(first)
+
+        self.store.mark_notified(request_id="tdd-mark-notified")  # 第二次调用：no-op
+        second = self.scalar(
+            "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-mark-notified'"
+        )
+        self.assertEqual(first, second)
+
+    def execute_and_fetchone(self, sql: str, parameters: tuple[object, ...] = ()) -> tuple:
+        assert DSN is not None
+        with connect(DSN) as connection:
+            return connection.execute(sql, parameters).fetchone()
 
 
 @unittest.skipUnless(DSN, SKIP_REASON)

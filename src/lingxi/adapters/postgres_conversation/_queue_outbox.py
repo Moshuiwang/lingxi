@@ -8,6 +8,7 @@ Gateway 侧确认送达（``confirm_delivery``）、二十四小时到期强制�
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import Any, Mapping
 
@@ -17,6 +18,8 @@ from lingxi.core.ids import new_id
 
 from ._dataclasses import AppendedEvent, TerminalTask
 from ._transaction import _Transaction
+
+logger = logging.getLogger(__name__)
 
 # ``sweep_idle_conversations`` 每次扫描新增排队的会话数上限（PR #173 独立复核
 # P2-5）：查询本身已经用 NOT EXISTS 把候选集收窄到"尚未排过队"的那些，这里只是
@@ -158,11 +161,21 @@ class _OutboxMixin:
         ``{"title": str, "paragraphs": list[str]}``——``apps/worker/service.py``
         只在这一轮终态是 :attr:`~lingxi.core.delivery.ports.TerminalKind.SUCCESS`
         且报告契约的 ``document_request`` 字段非空时才传非 ``None``。非
-        ``None`` 时在**这同一个事务**里插入一行 ``task_document_delivery_request``
-        （状态 ``pending``），供 gateway 侧独立消费循环认领；``requester_open_id``
-        取自这个任务的提问用户（``task.user_id`` JOIN ``app_user.feishu_open_id``）。
+        ``None`` 时插入一行 ``task_document_delivery_request``（状态
+        ``pending``），供 gateway 侧独立消费循环认领；``requester_open_id`` 取自
+        这个任务的提问用户（``task.user_id`` JOIN ``app_user.feishu_open_id``）。
         非成功终态传非 ``None`` 是调用方的契约错误，这里直接拒绝（失败关闭，不
         悄悄按成功处理插入一行）。
+
+        **这一插入套在一个独立的 SAVEPOINT 里（P2-3，opus 审查），不与终态事件/
+        task 状态转移共享失败命运**：文档请求插入失败（结构性、会重复发生的
+        情形——例如提问用户 ``app_user.feishu_open_id`` 为 ``NULL``，如组织资料
+        同步专用账号）只会回滚这个 SAVEPOINT 本身，降级为"这次问数没有文档"，
+        终态答案照常提交，用户仍然拿到他的问数结果；失败记一条响亮审计
+        （``worker.document_request_insert_failed``），不吞声。**之前一版会让
+        这类失败连坐整个事务回滚**——一次纯粹是"文档交付这个附加功能插不进去"
+        的失败，代价是用户连本来已经产生的正常问数答案都拿不到，这与产品合同
+        "重启/重试不得造成用户结果丢失"的红线直接冲突。
         """
 
         if document_request is not None and terminal_kind != TerminalKind.SUCCESS.value:
@@ -225,9 +238,32 @@ class _OutboxMixin:
                     # 插入文档投递请求——``duplicate=True`` 分支在上面已经直接
                     # ``return existing``，走不到这里；这个判断是防御性的，理由
                     # 与本方法其余分支一致：不能让一次网络重试悄悄产生第二行。
-                    self._insert_document_delivery_request(
-                        cursor, task_id=task_id, document_request=document_request
-                    )
+                    #
+                    # P2-3（opus 审查）：这一步套一层 SAVEPOINT（嵌套
+                    # ``connection.transaction()``，psycopg3 在已有外层事务时
+                    # 自动降级为 SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT），
+                    # **不能让文档请求插入失败连坐这次问数已经真实产生的终态
+                    # 答案**——上面两条语句（终态事件、task 状态转移到
+                    # ``awaiting_delivery``）已经在同一个数据库往返里成立，用户
+                    # 已经"拿到答案"是这一刻唯一该被保证的事实。已知会命中这条
+                    # 路径的情形：请求发起用户的 ``app_user.feishu_open_id`` 为
+                    # ``NULL``（如组织资料同步的专用账号，见
+                    # ``onboarding.delegated_subject`` 文案）——迁移 0074 的
+                    # ``requester_open_id`` CHECK 会拒绝这类行，属于结构性、
+                    # 会重复发生的失败，不是瞬时抖动，因此**不重试**，只降级为
+                    # "这次问数没有文档"并响亮记一条审计，让运维能追出"这个用户
+                    # 请求过文档但没生成"。
+                    try:
+                        with connection.transaction():
+                            self._insert_document_delivery_request(
+                                cursor, task_id=task_id, document_request=document_request
+                            )
+                    except Exception as error:  # noqa: BLE001 - 降级但绝不吞声
+                        logger.error(
+                            "worker.document_request_insert_failed task_id=%s error=%s",
+                            task_id,
+                            type(error).__name__,
+                        )
                 return appended
 
     @staticmethod
