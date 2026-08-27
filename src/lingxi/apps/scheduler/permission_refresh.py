@@ -72,6 +72,25 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
 **本职责仍然不通知**：通知的触发点在发布读回一致（撤权）或就绪探针成功（增权）之后，
 属 :mod:`lingxi.apps.scheduler.permission_publish`。这里连一个发送端口都没有。
 
+## 在途未送达正文同步清（S-P-5，Trace #328）
+
+授权、撤权两条路径调用 :meth:`~lingxi.adapters.postgres_permission_publish.
+PostgresPermissionPublishStore.record_decision` 时都传 ``clear_delivered_content=True``：
+权限确实变化（``decision.enqueued`` 为真，即这次不是 ``UNCHANGED``）时，该方法在**自己
+的同一个数据库事务**里顺带清空这个用户全部会话已送达、随会话保留的投递正文，并排队
+失效当前 Agent 会话——机制与理由见该方法文档，本职责这里只是**接入点**，不复制其锁序
+或事务边界的任何细节。
+
+**开关放在调用方而不是 ``record_decision`` 内部自行判断**：同一个方法也服务首次开通
+（``core/identity/onboarding_runner.py``），那条路径的用户结构上不可能有历史会话，因此
+不传这个开关——见 ``record_decision`` 文档「为什么是调用方显式传入的开关」一节。
+
+清理**发生**时（即 ``decision.enqueued`` 为真，不管这次实际清出多少条事件）记一条
+``permission_refresh.delivered_content_cleared`` 审计，``cleared`` 字段是清出的事件数
+（可能是 0——一个刚被授权、还没有任何历史会话的人）；不含正文本身，与本职责其余审计
+同一条纪律（模块文档顶部 :class:`PermissionRefreshReport` 的说明）。``UNCHANGED`` 分支
+不记这条审计，因为清理压根没有发生。
+
 ## 令牌：只读既有，绝不签发
 
 需要新建发布行的用户，其 ``token_cipher`` 只取该用户**已经登记在令牌表里**的那一份
@@ -324,6 +343,11 @@ class _PublishHistory(Protocol):
 
 class _Decision(Protocol):
     enqueued: bool
+    # 本次决定顺带清掉的在途未送达（已送达、随会话保留）投递正文事件数（S-P-5，
+    # Trace #328）。只有调用 ``record_decision(clear_delivered_content=True)`` 且
+    # 真的走到 ``ENQUEUED`` 时才可能非零；本职责只如实把它写进审计计数，不自己
+    # 判断"要不要清"——那条判定连同事务边界只有 ``record_decision`` 一处实现。
+    cleared_events: int
 
 
 class _DecisionStore(Protocol):
@@ -335,7 +359,13 @@ class _DecisionStore(Protocol):
     """
 
     def record_decision(
-        self, *, user_id: str, row: Any, reason: str, decided_at: datetime
+        self,
+        *,
+        user_id: str,
+        row: Any,
+        reason: str,
+        decided_at: datetime,
+        clear_delivered_content: bool = False,
     ) -> _Decision: ...
 
 
@@ -749,12 +779,20 @@ class PermissionRefreshDuty:
             row=row,
             reason=PERMISSION_REFRESH_REASON,
             decided_at=now,
+            # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
+            # 在途未送达（已送达、随会话保留）的投递正文（S-P-5，Trace #328）。
+            clear_delivered_content=True,
         )
         if decision.enqueued:
             tally.enqueued += 1
+            self._audit.record(
+                "permission_refresh.delivered_content_cleared",
+                user=identity.app_user_id,
+                cleared=decision.cleared_events,
+            )
         else:
             # ``UNCHANGED``：权限内容与上一条仍然有效的意图逐字段相同。不推进版本、
-            # 不排新意图——判定在 ``record_decision`` 里，本职责只如实计数。
+            # 不排新意图、不清理——判定在 ``record_decision`` 里，本职责只如实计数。
             tally.unchanged += 1
 
     def _resolve_local_overrides(self, user_id: str) -> ResolvedLocalOverrides | None:
@@ -845,12 +883,21 @@ class PermissionRefreshDuty:
             row=row,
             reason=PERMISSION_REVOKE_REASON,
             decided_at=now,
+            # 权限确实变化（真的排出撤权意图）时，在 record_decision 自己的同一个
+            # 事务里顺带清空该用户在途未送达的投递正文（S-P-5，Trace #328），与
+            # 授权侧同一个开关、同一条理由。
+            clear_delivered_content=True,
         )
         if decision.enqueued:
             tally.enqueued += 1
             tally.revoked_published += 1
+            self._audit.record(
+                "permission_refresh.delivered_content_cleared",
+                user=identity.app_user_id,
+                cleared=decision.cleared_events,
+            )
         else:
-            # 上一条意图已经是同一份空权限：不推进版本、不排新意图。
+            # 上一条意图已经是同一份空权限：不推进版本、不排新意图、不清理。
             tally.unchanged += 1
         self._audit.record(
             "permission_refresh.user_revoked",
