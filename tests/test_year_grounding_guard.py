@@ -197,6 +197,33 @@ class QueryYearExtractionTests(unittest.TestCase):
         ]
         self.assertEqual(extract_query_years(calls), ())
 
+    def test_ignores_a_longer_digit_run_with_an_embedded_valid_compact_date_leading_extra_digit(
+        self,
+    ) -> None:
+        """负例 + **变异验红锚点 C（前边界）**：长数字串中间嵌了一段合法的
+        8 位 ``YYYYMMDD``（"20260819"，年月日都合法），但前面多出一位数字
+        （"1"）——不得因为中间恰好存在一段合法日期就提取出年份。本用例只在
+        ``_COMPACT_DATE_PATTERN`` 的前边界 ``(?<!\\d)`` 生效时通过：把
+        ``year_grounding_guard.py`` 定义 ``_COMPACT_DATE_PATTERN`` 那三行
+        （现约 119-121 行）里的 ``(?<!\\d)`` 删掉，本用例必须变红——正则会在
+        "120260819" 中间的 "20260819" 处匹配出年份 2026。"""
+
+        calls = [_query_call(start_date="120260819")]
+        self.assertEqual(extract_query_years(calls), ())
+
+    def test_ignores_a_longer_digit_run_with_an_embedded_valid_compact_date_trailing_extra_digit(
+        self,
+    ) -> None:
+        """负例 + **变异验红锚点 D（后边界）**：与上一条对称——合法的 8 位
+        ``YYYYMMDD``（"20260819"）出现在数字串开头，但后面多出一位数字
+        （"12"里的"1"），不得提取出年份。本用例只在 ``_COMPACT_DATE_PATTERN``
+        的后边界 ``(?!\\d)`` 生效时通过：把同一处定义里的 ``(?!\\d)`` 删掉，
+        本用例必须变红——正则会在 "2026081912" 开头的 "20260819" 处匹配出
+        年份 2026。与上一条合起来覆盖两处边界各自独立被删除的情形。"""
+
+        calls = [_query_call(start_date="2026081912")]
+        self.assertEqual(extract_query_years(calls), ())
+
     def test_ignores_filters_that_is_not_a_mapping(self) -> None:
         """防御性：``filters`` 键存在但形状异常（非 Mapping）不得让整体解析
         抛异常，安静跳过该处、不影响顶层字段的正常解析。"""

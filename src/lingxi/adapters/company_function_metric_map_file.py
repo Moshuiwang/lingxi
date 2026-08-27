@@ -14,9 +14,14 @@
 任务开始时现读，编辑后下一条消息即生效；本模块的读取点
 ``apps/scheduler/assembly.py`` 的 ``_build_permission_refresh_duty`` 在 scheduler
 进程启动时只被 ``build_loop`` 调用**一次**（防止两处读文件互相漂移的刻意设计），
-因此编辑外置文件后需要重启 scheduler 容器（``docker compose up -d scheduler``，
-不需重建镜像）才会被读到新内容；下方「加载成功时记录内容 digest 到日志」一节的
-digest 行是重启后核对"读到了哪一版"的手段。例外：`apps/scheduler/daily_report.py`
+因此编辑外置文件后需要重启 scheduler 容器
+（``docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f
+deploy/compose.stage.yaml restart scheduler``，prod 同构换成
+``.env.prod``/``compose.prod.yaml``；不需重建镜像）才会被读到新内容——不能用
+``docker compose up -d`` 重启 scheduler：compose 配置本身未变时它判定 up-to-date 不会
+重启，而这里改的是外置文件、不是 compose 配置，正是此情形；下方「加载成功时记录
+内容 digest 到日志」一节的 digest 行是重启后核对"读到了哪一版"的手段。例外：
+`apps/scheduler/daily_report.py`
 的每日通报「未覆新指标」日检段每次现读，不受此限、无需重启。因此
 :func:`load_company_function_metric_map` 从
 ``apps/scheduler/assembly.py`` 接收的 ``path`` 参数不再总是包内默认路径：装配层会先读
