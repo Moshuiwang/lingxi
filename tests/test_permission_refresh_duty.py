@@ -52,6 +52,13 @@ from lingxi.apps.scheduler.permission_refresh import (
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
+from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.merge_sources import (
+    REASON_GRANT_REDUNDANT_WILDCARD,
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
+)
+from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 DUTY_SOURCE = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py"
@@ -243,6 +250,30 @@ class FakePublishHistory:
         return user_id in self._published
 
 
+class FakeLocalOverrides:
+    """本地权限覆盖读取口的假实现（S-P-3，Issue #319）。
+
+    ``entries`` 按用户登记条目；``fail_for`` 里的用户读取时直接抛异常，供
+    :class:`LocalOverrideMergeTest` 钉住"读取失败只降级、不整用户/整轮失败"。
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, tuple[LocalPermissionOverrideEntry, ...]] | None = None,
+        *,
+        fail_for: set[str] | None = None,
+    ) -> None:
+        self._entries = entries or {}
+        self._fail_for = fail_for or set()
+        self.calls: list[str] = []
+
+    def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
+        self.calls.append(user_id)
+        if user_id in self._fail_for:
+            raise RuntimeError("注入的本地覆盖读取失败")
+        return self._entries.get(user_id, ())
+
+
 class _FakeDecision:
     def __init__(self, enqueued: bool) -> None:
         self.enqueued = enqueued
@@ -353,6 +384,8 @@ def build_duty(
     stop: threading.Event | None = None,
     published_users: set[str] | None = None,
     metric_translation_map=None,
+    role_function_map=None,
+    local_overrides: FakeLocalOverrides | None = None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
@@ -370,13 +403,14 @@ def build_duty(
         decisions=decisions,
         publish_history=history,
         token_ciphers=tokens,
-        role_function_map=ROLE_FUNCTION_MAP,
+        role_function_map=ROLE_FUNCTION_MAP if role_function_map is None else role_function_map,
         metric_translation_map=(
             METRIC_TRANSLATION_MAP if metric_translation_map is None else metric_translation_map
         ),
         audit=audit,
         clock=clock or FixedClock(TODAY),
         stop=stop,
+        local_overrides=local_overrides,
     )
     return duty, {
         "audit": audit,
@@ -910,6 +944,133 @@ class MetricTranslationGateTest(unittest.TestCase):
         self.assertEqual(
             row.permissions,
             f'{{"{COMPANY_ID}":["{METRIC_NAME}"],"{COMPANY_ID_TWO}":["{METRIC_NAME_TWO}"]}}',
+        )
+
+
+# --------------------------------------------------------------------------
+# 三点六、本地权限覆盖合并（S-P-3，Issue #319）
+# --------------------------------------------------------------------------
+
+
+def _override_entry(
+    *,
+    user_id: str = USER_ONE,
+    direction: OverrideDirection = OverrideDirection.GRANT,
+    company_id: str = COMPANY_ID,
+    metric_name: str = "本地指标",
+) -> LocalPermissionOverrideEntry:
+    return LocalPermissionOverrideEntry(
+        user_id=user_id,
+        direction=direction,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason="U1 特批",
+        initiated_by_open_id="ou_admin",
+        pending_action_id="pac_fake",
+        created_at=TODAY,
+    )
+
+
+class LocalOverrideMergeTest(unittest.TestCase):
+    """授权侧翻译成功之后的四源合并接线：真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) −
+    本地抑制，挂在结算发布行之前（``merge_sources.merge_permission_sources`` 模块
+    文档「挂点」一节）。"""
+
+    def test_store_absent_matches_todays_behavior(self) -> None:
+        """装配层未接本地覆盖 store（``local_overrides=None``，默认值）：产出与
+        接线之前逐字节一致——`GrantedUserTest.
+        test_the_published_row_is_built_from_the_archived_identity` 的同一断言。"""
+
+        duty, parts = build_duty(identities=(identity(),))
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+
+    def test_local_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """本地授权后聚合含并集（#319 验收断言）：银河翻译出的指标名与本地授权的
+        指标名同时出现在同一个公司键下。"""
+
+        overrides = FakeLocalOverrides({USER_ONE: (_override_entry(),)})
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["本地指标","{METRIC_NAME}"]}}')
+        self.assertEqual(overrides.calls, [USER_ONE])
+
+    def test_local_suppression_removes_a_galaxy_granted_metric(self) -> None:
+        """抑制后不含：本地抑制命中的是**银河翻译产出**的指标名（不是本地授权自己
+        加的那条），证明减法作用于并集之后的整体结果，不只是"本地授权 vs 本地抑制"
+        内部打架那一层（那一层由 ``resolve_local_overrides`` 早就处理过）。第二家
+        公司的指标不受影响，只有被抑制到空的那个公司键从结果里消失
+        （`merge_sources` 模块文档「空结果」一节）。"""
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_ONE, "NG")),
+            country_rows=(
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+                ("NG", "NIGERIA", "尼日利亚", COMPANY_ID_TWO),
+            ),
+        )
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),)}
+        )
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy, local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID_TWO}":["{METRIC_NAME_TWO}"]}}')
+
+    def test_read_failure_skips_local_source_and_audits(self) -> None:
+        """读取失败：该用户本轮跳过本地源并响亮审计，不整轮失败、不静默——发布仍然
+        照常进行（只是不含本地覆盖），不计入 ``report.failed``。"""
+
+        overrides = FakeLocalOverrides(fail_for={USER_ONE})
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        report = duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"{COMPANY_ID}":["{METRIC_NAME}"]}}')
+        self.assertEqual(report.failed, 0, "本地覆盖读取失败不得记成整用户失败")
+        self.assertIn("permission_refresh.local_override_skipped", parts["audit"].actions())
+        fields = parts["audit"].fields_for("permission_refresh.local_override_skipped")[0]
+        self.assertEqual(fields["user"], USER_ONE)
+        self.assertEqual(fields["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
+
+    def test_wildcard_admin_skips_both_grant_and_suppress_with_audit(self) -> None:
+        """通配角 v1（编排者裁定）：``all_companies=True`` 时本地授权与抑制**整体
+        不参与合并**，结果与银河原始的通配映射逐字节相同；两个理由各记一条
+        ``permission_refresh.local_override_skipped`` 审计，动作名与原因码可分辨。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name=METRIC_NAME),
+                )
+            }
+        )
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=((GALAXY_ACCOUNT_ONE, ADMIN_FULL_ACCESS_FUNCTION),)),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: (METRIC_NAME,)}},
+            local_overrides=overrides,
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(row.permissions, f'{{"*":["{METRIC_NAME}"]}}', "通配下本地源整体不生效")
+        skipped = parts["audit"].fields_for("permission_refresh.local_override_skipped")
+        reasons = {fields["reason"] for fields in skipped}
+        self.assertEqual(
+            reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
         )
 
 

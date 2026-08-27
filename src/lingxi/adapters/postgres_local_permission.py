@@ -6,7 +6,9 @@
    聚合复用的读路径：按用户取全部当前生效（``entry_status='active'``）条目，
    一次查询命中迁移 ``0072`` 的 ``local_permission_override_user_active_idx``。
    调用方把返回值里的 :attr:`StoredLocalPermissionOverride.entry` 逐条喂给
-   :func:`lingxi.core.permission.local_override.resolve_local_overrides`。
+   :func:`lingxi.core.permission.local_override.resolve_local_overrides`——
+   S-P-3 落地后这一步由 :class:`LocalOverrideEntryReader` 统一代劳（两个接线点
+   共用同一份适配，见其类文档），调用方不必各自重写这行解包代码。
 2. :meth:`~.insert`/:meth:`~.revoke` —— 写路径，供确认卡执行器调用（S-P-1b，
    #319）。真正实现"没有确认卡不能写入"的是迁移 ``0072`` 的
    ``pending_action_id NOT NULL`` 外键（见该迁移文件头部「为什么 pending_action_id
@@ -50,6 +52,44 @@ from datetime import datetime, timezone
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+
+
+class LocalOverrideEntryReader:
+    """把 :class:`PostgresLocalPermissionOverrideStore` 的按用户读取口适配成
+    S-P-3（Issue #319）两个调用点各自协议要求的形状：``effective_entries(*, user_id)
+    -> Sequence[LocalPermissionOverrideEntry]``——纯类型，不带数据库分配的行标识。
+
+    :meth:`PostgresLocalPermissionOverrideStore.effective_entries` 返回的是
+    :class:`StoredLocalPermissionOverride`（``id`` + ``entry``），因为写路径
+    （S-P-1b 的收回流程）需要那个 ``id`` 定位要撤销的具体行；S-P-3 的合并只关心
+    条目内容，不需要、也不应该知道行标识——两个调用点
+    （:mod:`lingxi.apps.scheduler.permission_refresh`、
+    :mod:`lingxi.core.identity.onboarding_runner`）各自声明的协议因此只认
+    :class:`~lingxi.core.permission.local_override.LocalPermissionOverrideEntry`。
+    这个适配器是两处装配（``apps/scheduler/assembly.py``）共用的**唯一**一份，避免
+    "从 ``StoredLocalPermissionOverride`` 解出 ``.entry``"这行代码在两处重复、
+    迟早漂移。
+    """
+
+    def __init__(self, store: PostgresLocalPermissionOverrideStore) -> None:
+        self._store = store
+
+    def effective_entries(self, *, user_id: str) -> tuple[LocalPermissionOverrideEntry, ...]:
+        return tuple(item.entry for item in self._store.effective_entries(user_id=user_id))
+
+
+def local_override_reader(
+    dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS
+) -> LocalOverrideEntryReader:
+    """装配层的一步到位入口：新建一个 store 并包上 :class:`LocalOverrideEntryReader`。
+
+    两处装配（``apps/scheduler/assembly.py`` 的每日权限重算与首次开通编排）各自
+    调用一次，避免"先建 store 再包一层适配"这两步各自重复一份、迟早漂移；store
+    本身轻量、无状态，两处各自新建互不共享是刻意的（与文件里其余 Postgres 读写口
+    同一惯例），本函数只是把这两步合成一步，不引入共享实例。
+    """
+
+    return LocalOverrideEntryReader(PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts))
 
 
 class DuplicateActiveOverride(Exception):
