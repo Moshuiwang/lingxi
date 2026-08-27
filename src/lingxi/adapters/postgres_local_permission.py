@@ -1,6 +1,6 @@
 """本地权限覆盖（``local_permission_override``，迁移 ``0072``）的唯一 PostgreSQL 落点。
 
-两个职责：
+三个职责：
 
 1. :meth:`PostgresLocalPermissionOverrideStore.effective_entries` —— 供 S-P-3
    聚合复用的读路径：按用户取全部当前生效（``entry_status='active'``）条目，
@@ -12,6 +12,11 @@
    ``pending_action_id NOT NULL`` 外键（见该迁移文件头部「为什么 pending_action_id
    是 NOT NULL」）；本模块只是把这条约束包装成 Python 接口并在写入前完成字段
    校验，不重新发明一层能够绕开该外键的应用层判断去代替它。
+3. :meth:`~.daily_activity_stats` —— 供内测每日通报「本地权限覆盖活动」段
+   （S-P-1c，#319）复用的哑聚合读路径：当日新增/收回笔数与当前生效总量，
+   不返回任何一行的 ``user_id``/``company_id``/``metric_name``/``reason`` 明细，
+   只返回计数——与 :meth:`effective_entries` 面向单用户的明细读取是两种不同
+   的读路径，不复用同一条 SQL。
 
 ## 为什么 ``insert``/``revoke`` 拆成 ``_insert_locked``/``_revoke_locked`` + 公开包装
 
@@ -77,6 +82,42 @@ _SELECT_COLUMNS = (
     " pending_action_id, created_at"
 )
 
+#: 内测每日通报「本地权限覆盖活动」段的哑聚合（Issue #319 S-P-1c，唯一调用方
+#: 见 :meth:`PostgresLocalPermissionOverrideStore.daily_activity_stats`）。与
+#: `adapters/postgres_daily_report.py` 其余哑聚合 SQL 同一条纪律：只做
+#: `COUNT(*) FILTER`/`COUNT(DISTINCT ...)`，不做任何分类判断或格式化——「当日
+#: 零活动且当前生效总数为零时不出现该段」这条判定留给
+#: `core/daily_report.py::build_local_override_activity`。
+#:
+#: `granted_today`/`suppressed_today` 按 `created_at` 落在窗口内的新增行数分
+#: 方向计数（`created_at` 是这张表天然的「新增时刻」，与 `task.created_at` 同一
+#: 语义）；`revoked_today` 按 `revoked_at` 落在窗口内计数，**不分原方向**——收回
+#: 是同一行状态翻转（迁移 `0072` 文件头部「为什么用『同一行状态翻转』」），
+#: 一笔收回可能翻转自 grant 也可能翻转自 suppress，管理群需要的是「今天发生了
+#: 几次收回操作」这一个数字。`active_grant_total`/`active_suppress_total` **不
+#: 限时间窗口**：当前生效（`entry_status = 'active'`）条目总数，历史上分多天
+#: 新增、至今未被收回的条目都计入——这是「现在有多少条覆盖在生效」而不是
+#: 「今天新增了多少条」。`affected_user_count` 是当前生效条目（两个方向取并集）
+#: 覆盖的去重用户数。
+_DAILY_ACTIVITY_STATS_SQL = """
+SELECT
+    COUNT(*) FILTER (
+        WHERE direction = 'grant'
+          AND created_at >= %(window_start)s AND created_at < %(window_end)s
+    ) AS granted_today,
+    COUNT(*) FILTER (
+        WHERE direction = 'suppress'
+          AND created_at >= %(window_start)s AND created_at < %(window_end)s
+    ) AS suppressed_today,
+    COUNT(*) FILTER (
+        WHERE revoked_at >= %(window_start)s AND revoked_at < %(window_end)s
+    ) AS revoked_today,
+    COUNT(*) FILTER (WHERE direction = 'grant' AND entry_status = 'active') AS active_grant_total,
+    COUNT(*) FILTER (WHERE direction = 'suppress' AND entry_status = 'active') AS active_suppress_total,
+    COUNT(DISTINCT user_id) FILTER (WHERE entry_status = 'active') AS affected_user_count
+  FROM local_permission_override
+"""
+
 
 def _row_to_stored(row: tuple) -> StoredLocalPermissionOverride:
     (
@@ -129,6 +170,43 @@ class PostgresLocalPermissionOverrideStore:
             )
             rows = cursor.fetchall()
         return tuple(_row_to_stored(row) for row in rows)
+
+    def daily_activity_stats(
+        self, *, window_start: datetime, window_end: datetime
+    ) -> tuple[int, int, int, int, int, int]:
+        """内测每日通报「本地权限覆盖活动」段的哑聚合（Issue #319 S-P-1c，唯一
+        调用方是 ``apps/scheduler/daily_report.py`` 装配的可选取数回调）。
+
+        返回 ``(granted_today, suppressed_today, revoked_today,
+        active_grant_total, active_suppress_total, affected_user_count)``——
+        六个字段的精确定义见 :data:`_DAILY_ACTIVITY_STATS_SQL` 文档；本方法
+        只读，不做任何写入，也不做「是否该整段判不可判定」这类分类判断，那层
+        判定留给 ``core/daily_report.py::build_local_override_activity``。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                _DAILY_ACTIVITY_STATS_SQL,
+                {"window_start": window_start, "window_end": window_end},
+            )
+            row = cursor.fetchone()
+        assert row is not None  # 聚合查询恒返回恰一行，即使表为空（COUNT 的 0）
+        (
+            granted_today,
+            suppressed_today,
+            revoked_today,
+            active_grant_total,
+            active_suppress_total,
+            affected_user_count,
+        ) = row
+        return (
+            int(granted_today),
+            int(suppressed_today),
+            int(revoked_today),
+            int(active_grant_total),
+            int(active_suppress_total),
+            int(affected_user_count),
+        )
 
     def insert(
         self,

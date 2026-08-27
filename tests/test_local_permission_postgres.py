@@ -300,6 +300,128 @@ class RevokeTests(LocalPermissionOverridePostgresTestCase):
         self.assertFalse(changed)
 
 
+class DailyActivityStatsTests(LocalPermissionOverridePostgresTestCase):
+    """:meth:`PostgresLocalPermissionOverrideStore.daily_activity_stats`（Issue
+    #319 S-P-1c，内测每日通报「本地权限覆盖活动」段的哑聚合）。"""
+
+    def test_an_empty_table_reports_all_zeros(self) -> None:
+        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+        stats = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+        self.assertEqual(stats, (0, 0, 0, 0, 0, 0))
+
+    def test_grant_and_suppress_created_inside_the_window_are_counted_separately(self) -> None:
+        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        inside_window = window_start + timedelta(hours=6)
+
+        self.insert_override(
+            company_id="1011", metric_name="日活", direction=OverrideDirection.GRANT,
+        )
+        self.execute(
+            "UPDATE local_permission_override SET created_at = %s WHERE company_id = %s",
+            (inside_window, "1011"),
+        )
+        self.insert_override(
+            company_id="1012", metric_name="收入", direction=OverrideDirection.SUPPRESS,
+        )
+        self.execute(
+            "UPDATE local_permission_override SET created_at = %s WHERE company_id = %s",
+            (inside_window, "1012"),
+        )
+
+        (
+            granted_today,
+            suppressed_today,
+            revoked_today,
+            active_grant_total,
+            active_suppress_total,
+            affected_user_count,
+        ) = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+        self.assertEqual(granted_today, 1)
+        self.assertEqual(suppressed_today, 1)
+        self.assertEqual(revoked_today, 0)
+        self.assertEqual(active_grant_total, 1)
+        self.assertEqual(active_suppress_total, 1)
+        self.assertEqual(affected_user_count, 1)  # 同一用户两条覆盖，去重后仍是 1
+
+    def test_a_row_created_outside_the_window_is_excluded_from_todays_counts(self) -> None:
+        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        before_window = window_start - timedelta(hours=1)
+
+        stored = self.insert_override(company_id="1011", metric_name="日活")
+        self.execute(
+            "UPDATE local_permission_override SET created_at = %s WHERE id = %s",
+            (before_window, stored.id),
+        )
+
+        stats = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+        # 窗口外新增：不计入今日新增，但仍计入当前生效总量（不限时间窗口）。
+        self.assertEqual(stats[0], 0)  # granted_today
+        self.assertEqual(stats[3], 1)  # active_grant_total
+
+    def test_a_revocation_inside_the_window_is_counted_regardless_of_original_direction(
+        self,
+    ) -> None:
+        window_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        window_end = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        inside_window = window_start + timedelta(hours=3)
+
+        stored = self.insert_override(
+            company_id="1011", metric_name="日活", direction=OverrideDirection.SUPPRESS,
+        )
+        revoke_pending_id = new_id("pac")
+        self.add_pending_action(pending_id=revoke_pending_id)
+        self.store.revoke(override_id=stored.id, revoked_pending_action_id=revoke_pending_id)
+        self.execute(
+            "UPDATE local_permission_override SET revoked_at = %s WHERE id = %s",
+            (inside_window, stored.id),
+        )
+
+        (
+            granted_today,
+            suppressed_today,
+            revoked_today,
+            active_grant_total,
+            active_suppress_total,
+            affected_user_count,
+        ) = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+        self.assertEqual(revoked_today, 1)
+        # 已收回：不再计入当前生效总量，也不再计入受影响用户数。
+        self.assertEqual(active_grant_total, 0)
+        self.assertEqual(active_suppress_total, 0)
+        self.assertEqual(affected_user_count, 0)
+
+    def test_affected_user_count_deduplicates_across_users_and_directions(self) -> None:
+        self.add_user(user_id="usr_other_local_override_user")
+        self.insert_override(
+            user_id=TARGET_USER_ID, company_id="1011", metric_name="日活",
+            direction=OverrideDirection.GRANT,
+        )
+        self.insert_override(
+            user_id=TARGET_USER_ID, company_id="1012", metric_name="收入",
+            direction=OverrideDirection.SUPPRESS,
+        )
+        self.insert_override(
+            user_id="usr_other_local_override_user", company_id="1011", metric_name="日活",
+            direction=OverrideDirection.GRANT,
+        )
+
+        window_start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        window_end = datetime(2020, 1, 2, tzinfo=timezone.utc)
+        stats = self.store.daily_activity_stats(window_start=window_start, window_end=window_end)
+
+        self.assertEqual(stats[3], 2)  # active_grant_total
+        self.assertEqual(stats[4], 1)  # active_suppress_total
+        self.assertEqual(stats[5], 2)  # affected_user_count：两个用户，去重后为 2
+
+
 class EntryStatusConsistencyCheckTests(LocalPermissionOverridePostgresTestCase):
     """否定断言：迁移 ``0072`` 的 ``entry_status``/``revoked_at``/
     ``revoked_pending_action_id`` 一致性 CHECK 由数据库强制，不是应用层自觉。"""

@@ -21,6 +21,7 @@ from lingxi.core.daily_report import (
     DeliveryOutcomeStats,
     FailureReasonCount,
     LatencyStats,
+    LocalOverrideActivity,
     MetricCoverageGap,
     PartialCount,
     Section,
@@ -34,6 +35,7 @@ from lingxi.core.daily_report import (
     build_failure_top,
     build_guard_triggered_count,
     build_latency_stats,
+    build_local_override_activity,
     build_metric_coverage_gap,
     build_status_distribution,
     build_token_usage_stats,
@@ -746,6 +748,147 @@ class MetricCoverageGapRenderTests(unittest.TestCase):
 
         self.assertIn("待分配", text)
         self.assertIn("不可判定（原因：问数 MCP 查询超时）", text)
+
+
+class LocalOverrideActivityBuildTests(unittest.TestCase):
+    """:func:`build_local_override_activity` 纯集合运算（Issue #319 S-P-1c）：
+    有活动/无差异。"""
+
+    def test_any_today_activity_is_reported(self) -> None:
+        activity = build_local_override_activity(
+            granted_today=2,
+            suppressed_today=1,
+            revoked_today=0,
+            active_grant_total=5,
+            active_suppress_total=3,
+            affected_user_count=6,
+        )
+
+        self.assertIsNotNone(activity)
+        assert activity is not None
+        self.assertEqual(activity.granted_today, 2)
+        self.assertEqual(activity.suppressed_today, 1)
+        self.assertEqual(activity.revoked_today, 0)
+        self.assertEqual(activity.active_grant_total, 5)
+        self.assertEqual(activity.active_suppress_total, 3)
+        self.assertEqual(activity.affected_user_count, 6)
+
+    def test_only_a_revocation_today_is_still_reported(self) -> None:
+        """哪怕只有收回、没有新增，只要不是全零就要报——「无差异」专指全部为零。"""
+
+        activity = build_local_override_activity(
+            granted_today=0,
+            suppressed_today=0,
+            revoked_today=1,
+            active_grant_total=0,
+            active_suppress_total=0,
+            affected_user_count=0,
+        )
+
+        self.assertIsNotNone(activity)
+
+    def test_only_a_nonzero_active_total_with_no_activity_today_is_still_reported(self) -> None:
+        """今天没有任何新增/收回，但历史上还有生效条目在——同样不是「无差异」。"""
+
+        activity = build_local_override_activity(
+            granted_today=0,
+            suppressed_today=0,
+            revoked_today=0,
+            active_grant_total=2,
+            active_suppress_total=0,
+            affected_user_count=1,
+        )
+
+        self.assertIsNotNone(activity)
+
+    def test_all_zero_reports_no_difference(self) -> None:
+        activity = build_local_override_activity(
+            granted_today=0,
+            suppressed_today=0,
+            revoked_today=0,
+            active_grant_total=0,
+            active_suppress_total=0,
+            affected_user_count=0,
+        )
+
+        self.assertIsNone(activity, "当日零活动且当前生效总数为零时，无差异不报")
+
+
+class LocalOverrideActivityRenderTests(unittest.TestCase):
+    """本地权限覆盖活动段的渲染三态：未接线不出现、接线且无差异不出现、有活动
+    才出现；以及查询失败时的「不可判定」提示（Issue #319 S-P-1c）。
+    """
+
+    def test_unwired_section_produces_no_text_at_all(self) -> None:
+        """``local_override_activity`` 缺省为 ``None``（未接线）：正文完全不含
+        「本地权限覆盖活动」字样——不是"检查了，没有问题"，是"这一轮根本没有
+        做这项检查"。
+        """
+
+        inputs = _all_determined_inputs()
+
+        text = render_daily_report(inputs)
+
+        self.assertNotIn("本地权限覆盖活动", text)
+
+    def test_wired_but_no_activity_produces_no_text(self) -> None:
+        """接线了、真查了、当日零活动且当前生效总数为零：无差异不报。"""
+
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{**inputs.__dict__, "local_override_activity": Section.of(None)}
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertNotIn("本地权限覆盖活动", text)
+
+    def test_activity_appears_with_correct_counts(self) -> None:
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{
+                **inputs.__dict__,
+                "local_override_activity": Section.of(
+                    LocalOverrideActivity(
+                        granted_today=2,
+                        suppressed_today=1,
+                        revoked_today=1,
+                        active_grant_total=5,
+                        active_suppress_total=3,
+                        affected_user_count=6,
+                    )
+                ),
+            }
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("本地权限覆盖活动", text)
+        self.assertIn("授权 2 笔", text)
+        self.assertIn("抑制 1 笔", text)
+        self.assertIn("收回 1 笔", text)
+        self.assertIn("授权 5 条", text)
+        self.assertIn("抑制 3 条", text)
+        self.assertIn("涉及 6 位用户", text)
+        # 正文只含计数，不含任何形式的用户标识、公司 ID 或指标名——
+        # `LocalOverrideActivity` 本身就只携带六个整数字段，结构上没有承载
+        # 这些值的字段，这里额外核对渲染结果不引入任何形状可疑的片段。
+        for forbidden in FORBIDDEN_VALUES:
+            self.assertNotIn(forbidden, text)
+
+    def test_a_failed_check_is_shown_as_undetermined_not_silently_skipped(self) -> None:
+        inputs = _all_determined_inputs()
+        inputs = DailyReportInputs(
+            **{
+                **inputs.__dict__,
+                "local_override_activity": Section.undetermined("数据库查询超时"),
+            }
+        )
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("本地权限覆盖活动", text)
+        self.assertIn("不可判定（原因：数据库查询超时）", text)
 
 
 if __name__ == "__main__":
