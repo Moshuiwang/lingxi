@@ -274,15 +274,31 @@ class GrantFullAccessTest(unittest.TestCase):
 
 
 class ReadMembersTest(unittest.TestCase):
-    def test_a_successful_read_matches_the_probed_shape_and_reports_full_access(self) -> None:
+    def test_a_successful_read_matches_the_real_shape_and_reports_full_access(self) -> None:
+        """真实形状（编排者 2026-08-27 stage 真实调用实测，见 ``read_members``
+        文档字符串）：协作者数组在 ``data.items``，不是 ``data.members``；每一项
+        额外带 ``perm_type`` 字段（本方法只保留 ``member_type``/``member_id``/
+        ``perm`` 三个字段，``perm_type`` 与其它任何多余字段一样被丢弃）。
+
+        变异锚点：把 ``read_members`` 里 ``data.get("items")`` 这一行删掉（只留
+        ``data.get("members")``），本用例从返回目标协作者变红成
+        ``LookupError``——这正是 2026-08-27 stage 自测坐实的真实故障：四步全成功
+        后读回必然判定结果不明。
+        """
+
         transport = RecordingTransport(
             [
                 {
                     "code": 0,
                     "data": {
-                        "members": [
-                            {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access", "extra": "ignored"},
-                            {"member_type": "app", "member_id": "cli_fake_app", "perm": "owner"},
+                        "items": [
+                            {
+                                "member_type": "openid",
+                                "member_id": OPEN_ID,
+                                "perm": "full_access",
+                                "perm_type": "container",
+                            },
+                            {"member_type": "app", "member_id": "cli_fake_app", "perm": "full_access", "perm_type": "container"},
                         ]
                     },
                 }
@@ -302,7 +318,31 @@ class ReadMembersTest(unittest.TestCase):
         target = next(m for m in members if m["member_id"] == OPEN_ID)
         self.assertEqual(target["member_type"], "openid")
         self.assertEqual(target["perm"], "full_access")
-        self.assertNotIn("extra", target)
+        self.assertNotIn("perm_type", target)
+
+    def test_a_legacy_members_shaped_response_is_still_accepted_as_a_degraded_fallback(self) -> None:
+        """降级读：``items`` 缺失但 ``members`` 存在时仍要能读出协作者——不是当前
+        真实形状（见上一条用例），只是不排除历史响应或未来回归会回到这个形状，
+        兼容读不应该让调用方多做一次判断。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "members": [
+                            {"member_type": "openid", "member_id": OPEN_ID, "perm": "full_access"},
+                        ]
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        members = client.read_members(DOCUMENT_ID)
+
+        target = next(m for m in members if m["member_id"] == OPEN_ID)
+        self.assertEqual(target["perm"], "full_access")
 
     def test_a_feishu_business_error_code_is_rejected(self) -> None:
         transport = RecordingTransport([{"code": 99991400, "msg": "rate limited"}])
@@ -313,7 +353,7 @@ class ReadMembersTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "feishu_code_99991400")
 
-    def test_a_success_response_missing_members_is_a_lookup_error(self) -> None:
+    def test_a_success_response_missing_items_and_members_is_a_lookup_error(self) -> None:
         transport = RecordingTransport([{"code": 0, "data": {}}])
         client = _client(transport)
 
