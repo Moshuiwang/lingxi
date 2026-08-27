@@ -33,8 +33,11 @@ services:
       - lingxi-users:/var/lib/lingxi/users
       # 闸①指标映射表外置只读挂载（Issue #320 / #328 S-P0-2），结构与 stage 覆盖
       # 一致，说明见 compose.stage.yaml 同名 service 的卷注释（含生效时机：启动
-      # 时一次加载，编辑外置文件后需 `docker compose up -d scheduler` 重启才
-      # 生效；每日通报「未覆新指标」日检段现读，不受此限）。
+      # 时一次加载，编辑外置文件后需
+      # `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f
+      # deploy/compose.prod.yaml restart scheduler` 重启才生效，不能用
+      # `up -d` 重启 scheduler——compose 配置未变时它判 up-to-date 不重启；每日通报
+      # 「未覆新指标」日检段现读，不受此限）。
       - ${LINGXI_SCHEDULER_RUNTIME_CONFIG_DIR:-/opt/lingxi/runtime-config}:/etc/lingxi/runtime:ro
 
   gateway:

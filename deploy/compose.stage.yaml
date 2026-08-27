@@ -60,9 +60,14 @@ services:
       # 照读随包默认映射表。**生效时机与 worker-queue 不同，不要套用"编辑即
       # 生效"**：权限重算职责在进程启动时只装配一次（`apps/scheduler/assembly.py`
       # 的 `build_loop` 只调一次 `_build_permission_refresh_duty`，是防止两处
-      # 读文件互相漂移的刻意设计），编辑外置文件后需要 `docker compose up -d
-      # scheduler` 重启 scheduler 容器才生效（不需要重建镜像）；重启后可用
-      # digest 日志行（logger
+      # 读文件互相漂移的刻意设计），编辑外置文件后需要
+      # `docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f
+      # deploy/compose.stage.yaml restart scheduler` 重启 scheduler 容器才生效
+      # （不需要重建镜像；prod 同构，把 `.env.stage`/`compose.stage.yaml` 换成
+      # `.env.prod`/`compose.prod.yaml`）。不能用 `up -d` 重启 scheduler：compose 配置
+      # 未变时它判 up-to-date 不重启，而这里改的正是外置文件、不是 compose 配置；
+      # 裸跑 `restart` 缺 `--env-file`/`-f` 也不行，会按 base compose 重建出缺
+      # env_file 的容器。重启后可用 digest 日志行（logger
       # `lingxi.adapters.company_function_metric_map_file`，字段
       # path/digest/companies）核对读到了哪一版。例外：每日通报「未覆新指标」
       # 日检段（`apps/scheduler/daily_report.py` 的 `_check`）每次现读，不受
