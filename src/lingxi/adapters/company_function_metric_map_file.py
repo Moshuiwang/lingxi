@@ -8,9 +8,22 @@
 ## 外置路径（Issue #320）
 
 产品负责人 2026-08-26 就 Issue #320 裁定：指标映射表的维护人（产品负责人本人）应当
-能够编辑即生效，不必为一行映射改动走一次完整镜像构建发布——与系统提示词文件同一
-模式（见 ``apps/worker/service.py`` 的
-``_load_task_system_prompt``）。因此 :func:`load_company_function_metric_map` 从
+能够直接编辑这份文件，不必为一行映射改动走一次完整镜像构建发布——挂载方式与
+系统提示词文件同一模式（见 ``apps/worker/service.py`` 的
+``_load_task_system_prompt``）。**但生效时机不同**：系统提示词文件是 worker 每个
+任务开始时现读，编辑后下一条消息即生效；本模块的读取点
+``apps/scheduler/assembly.py`` 的 ``_build_permission_refresh_duty`` 在 scheduler
+进程启动时只被 ``build_loop`` 调用**一次**（防止两处读文件互相漂移的刻意设计），
+因此编辑外置文件后需要重启 scheduler 容器
+（``docker compose --env-file deploy/.env.stage -f deploy/compose.yaml -f
+deploy/compose.stage.yaml restart scheduler``，prod 同构换成
+``.env.prod``/``compose.prod.yaml``；不需重建镜像）才会被读到新内容——不能用
+``docker compose up -d`` 重启 scheduler：compose 配置本身未变时它判定 up-to-date 不会
+重启，而这里改的是外置文件、不是 compose 配置，正是此情形；下方「加载成功时记录
+内容 digest 到日志」一节的 digest 行是重启后核对"读到了哪一版"的手段。例外：
+`apps/scheduler/daily_report.py`
+的每日通报「未覆新指标」日检段每次现读，不受此限、无需重启。因此
+:func:`load_company_function_metric_map` 从
 ``apps/scheduler/assembly.py`` 接收的 ``path`` 参数不再总是包内默认路径：装配层会先读
 ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH``（``apps/scheduler/config.py`` 的
 ``SchedulerConfig.company_function_metric_map_path``），配了就把它转成 ``Path`` 传进来，
@@ -27,8 +40,8 @@ map_unavailable` 审计记录里因此既可能是包内文件损坏，也可能
 **加载成功时记录内容 digest 到日志**（沿用系统提示词的先例：`hashlib.sha256(...).
 hexdigest()[:12]`，短摘要足以判断"内容变没变"，不需要可逆）——digest 取的是**文件原始
 字节**，不是解析后的 Python 结构，这样同一份文件不论换行符、键序如何书写，只要字节
-完全相同就得到相同 digest，反之亦然；产品负责人编辑外置文件后可以直接对照这一行日志
-确认"这次改动确实被 scheduler 读到了"，不需要额外核对手段。
+完全相同就得到相同 digest，反之亦然；产品负责人编辑外置文件、重启 scheduler 容器后
+可以直接对照这一行日志确认"这次改动确实被 scheduler 读到了"，不需要额外核对手段。
 """
 
 from __future__ import annotations

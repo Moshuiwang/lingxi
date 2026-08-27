@@ -32,12 +32,16 @@ Issue #326 记录的内测事故：用户问「最近、尤其是 7 月之后」
   :data:`RELATIVE_TIME_PATTERNS` 中任意正则（"近N天/月/年""N月之后/以来"一类，
   N 是变量）。词表刻意留在模块顶层常量，扩展只需要加一行，不是本模块要解决的问题。
 - **查询年份**：只看 ``mcp__query__query_metric``（:data:`QUERY_METRIC_TOOL_NAME`）
-  一种工具调用的 ``start_date``/``end_date`` 两个字段，从字段取值里抠出全部形如
-  19xx/20xx 的四位年份 token（不假设具体日期分隔符格式——真实问数 MCP 的
-  ``query_metric`` 入参形状本仓库从未实测，见
-  ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``「不适用范围」，因此只能
-  按"看得懂的年份 token"这种最不容易因格式差异漏报的方式解析，代价见下面
-  「已知边界」）。
+  一种工具调用的 ``start_date``/``end_date`` 两个字段，**顶层与 ``filters`` 嵌套
+  对象下各读一遍**——Issue #326 L4a 追评（2026-08-26，部署 ``20260826-cbf16354a85b``
+  后容器内直测）确认真实 ``query_metric`` 入参把两个日期字段放在 ``filters`` 对象
+  下，形如 ``{"filters": {"start_date": "20260819", "end_date": "20260826", ...},
+  "group_by": [...], "metric_id": ...}``；顶层同名字段继续保留读取，两处都可能有，
+  未来形状变化留冗余，不因为只观察到一种真实形状就收窄成单一读取路径。年份解析
+  支持两类形状：分隔符日期（``"2025-01-01"`` 一类）抠取 19xx/20xx 四位年份 token；
+  以及真实观测到的紧凑 ``YYYYMMDD`` 八位数字（例如 ``"20260819"``），取前四位为
+  年份，同时校验整体恰为 8 位纯数字、年份前缀在 1900-2099、月份 01-12、日期 01-31
+  合法范围内，避免把任意 8 位数字误认成日期，代价见下面「已知边界」。
 - **判定**：问句命中词表 **且** 至少解析出一个查询年份 **且** 当前年份不在解析出
   的年份集合里，三者同时成立才判定为可疑。三个条件都取"宁可不报，不可错报"的
   保守方向——见「已知边界」。
@@ -49,13 +53,28 @@ Issue #326 记录的内测事故：用户问「最近、尤其是 7 月之后」
   真的没问题，而是没有证据支持"全部查询年份都不是当前年份"这句话。这会让参数
   格式异常的调用漏报，而不是错误地对着一批解析失败的调用报警（宁可漏报，不可
   在证据不足时误报）。
-- 只看 ``start_date``/``end_date`` 两个字段名；外部问数 MCP 若换成别的参数名
-  （例如单一的 ``date_range``），本模块会读不到年份，同样保守地判定为"不可疑"，
-  需要跟着现网真实参数形状同步更新——这是结构性护栏依赖外部工具参数约定的固有
-  局限，不是实现缺陷。
+- 只看 ``start_date``/``end_date`` 两个字段名（顶层或 ``filters`` 嵌套均可）；
+  外部问数 MCP 若换成别的参数名（例如单一的 ``date_range``）或换到 ``filters``
+  以外的第三个位置，本模块会读不到年份，同样保守地判定为"不可疑"，需要跟着
+  现网真实参数形状同步更新——这是结构性护栏依赖外部工具参数约定的固有局限，
+  不是实现缺陷。
+- 紧凑 ``YYYYMMDD`` 解析不做逐月天数上限校验（例如不会拒绝"2月30日"）——月份
+  01-12、日期 01-31 的范围校验目的是过滤明显不是日期的 8 位数字，不是实现完整
+  日历校验；真实问数 MCP 不会给出日历上不存在的日期，这不是本层要防的风险。
 - 相对时间词表是启发式列表，不是自然语言理解——不在词表里的表述（例如纯"7月
   怎么样"不含"之后/以来"）不会被命中；这类问句本来就无法仅从字面判断是否隐含
   "相对当前"的语义，不属于本层能力范围。
+- **年初边界（已知误报，本批起由死路变活路）**：年初（例如 1 月）问「上个月/
+  上周」一类相对时间表述时，如果模型正确地把它换算成了上一年（1 月的"上个月"
+  应查上一年 12 月），查询年份会全部落在上一年、``current_year`` 不在解析出的
+  集合里——这是模型算对了，却会被本模块三个条件字面同时成立判定为可疑，是已知
+  误报，本模块只有结构性判据、不理解"这次换算对不对"这层语义。处置已限定为
+  仅产出结构化信号交给调用方记 stderr 告警（见模块顶部「背景与分层」），不进
+  用户侧回复、不进管理群通知，代价可接受。**在本批修复 ``filters`` 嵌套与紧凑
+  ``YYYYMMDD`` 两处解析之前，``extract_query_years`` 对真实 ``query_metric``
+  入参恒返回空集，这条误报路径从未被真实触发过（死路）；本批修复后年初场景才会
+  真正走到这条路径（变活）**，如实登记供后续判断是否需要为"模型换算正确"这类
+  情形单独排除。
 """
 
 from __future__ import annotations
@@ -102,6 +121,15 @@ _DATE_FIELD_NAMES: tuple[str, ...] = ("start_date", "end_date")
 #: 四位年份 token：1900-2099，前后不能紧跟其它数字（避免把更长数字里的中间四位
 #: 误认成年份）。
 _YEAR_TOKEN_PATTERN = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+
+#: 紧凑 8 位日期 ``YYYYMMDD``（真实问数 MCP 观测形状，见模块文档「检测口径」）：
+#: 年份仍按 1900-2099（与四位年份 token 同一约束），月份 01-12，日期 01-31。
+#: 前后不能紧跟其它数字，与四位年份 token 同一处理方式——避免把更长数字串里的
+#: 中间 8 位误认成日期，也避免把 6 位/7 位残缺数字误当成 8 位紧凑日期解析。
+#: 只捕获年份这一段（第 1 组），月/日两段只参与校验、不需要取值。
+_COMPACT_DATE_PATTERN = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?!\d)"
+)
 
 
 class ToolCallLike(Protocol):
@@ -160,9 +188,12 @@ def find_relative_time_terms(question: str) -> tuple[str, ...]:
 def extract_query_years(tool_calls: Iterable[ToolCallLike]) -> tuple[int, ...]:
     """从全部 ``query_metric`` 调用的 ``start_date``/``end_date`` 里解析出年份集合。
 
-    去重排序返回；同一次调用两个字段都能解析出年份时两个都计入（例如跨年区间）。
-    非 ``query_metric`` 调用、缺失字段、非字符串取值都安静跳过——本函数只负责
-    "抠出看得懂的年份"，形状异常不算错误，见模块文档「已知边界」。
+    顶层与 ``filters`` 嵌套对象下各读一遍——见模块文档「检测口径」，真实
+    ``query_metric`` 入参把日期字段放在 ``filters`` 下，顶层保留读取是为未来
+    形状变化留冗余，不是假设两处会同时出现。去重排序返回；同一次调用、同一个
+    位置的两个字段都能解析出年份时两个都计入（例如跨年区间）。非 ``query_metric``
+    调用、缺失字段、非字符串取值、``filters`` 不是 Mapping 都安静跳过——本函数
+    只负责"抠出看得懂的年份"，形状异常不算错误，见模块文档「已知边界」。
     """
 
     years: set[int] = set()
@@ -173,15 +204,40 @@ def extract_query_years(tool_calls: Iterable[ToolCallLike]) -> tuple[int, ...]:
         tool_input = getattr(call, "tool_input", None)
         if not isinstance(tool_input, Mapping):
             continue
-        for field_name in _DATE_FIELD_NAMES:
-            years.update(_years_in_value(tool_input.get(field_name)))
+        years.update(_years_from_date_fields(tool_input))
+        filters = tool_input.get("filters")
+        if isinstance(filters, Mapping):
+            years.update(_years_from_date_fields(filters))
     return tuple(sorted(years))
 
 
+def _years_from_date_fields(mapping: Mapping[str, Any]) -> set[int]:
+    """从一个"可能含 start_date/end_date"的映射里抠出年份集合。
+
+    顶层 ``tool_input`` 与嵌套的 ``filters`` 对象共用同一套字段名与解析规则，
+    抽成一个函数避免两处各写一遍、日后修改字段名或解析规则时漏改一处。
+    """
+
+    years: set[int] = set()
+    for field_name in _DATE_FIELD_NAMES:
+        years.update(_years_in_value(mapping.get(field_name)))
+    return years
+
+
 def _years_in_value(value: Any) -> tuple[int, ...]:
+    """从一个日期字段取值里解析年份，支持分隔符日期与紧凑 ``YYYYMMDD`` 两类形状。
+
+    两个正则的 ``(?<!\\d)``/``(?!\\d)`` 边界互斥（一个要求命中后紧跟非数字，
+    一个要求恰好 8 位纯数字且前后不紧跟数字），同一段文本不会被两条规则重复
+    计入同一个年份来源；调用方 :func:`extract_query_years` 用 ``set`` 合并去重，
+    这里不需要预先去重。
+    """
+
     if not isinstance(value, str):
         return ()
-    return tuple(int(match.group(0)) for match in _YEAR_TOKEN_PATTERN.finditer(value))
+    separated = (int(match.group(0)) for match in _YEAR_TOKEN_PATTERN.finditer(value))
+    compact = (int(match.group(1)) for match in _COMPACT_DATE_PATTERN.finditer(value))
+    return tuple(separated) + tuple(compact)
 
 
 def detect_year_grounding_suspect(
