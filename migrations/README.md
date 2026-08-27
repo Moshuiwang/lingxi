@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0071_daily_report_watermark` |
+| head revision | `0072_local_permission_override` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -355,6 +355,47 @@ provisioning_state` 推进到 `active` 与向本表排一条待发「开通完�
 S-M-02（[#96](https://github.com/Moshuiwang/lingxi/issues/96)）。
 
 表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值。
+
+## `0072_local_permission_override`（本地权限覆盖表）
+
+[Issue #319](https://github.com/Moshuiwang/lingxi/issues/319) S-P-1a（产品负责人
+2026-08-26 裁定，推翻 [2026-08-24 决策记录](../docs/决策记录/2026-08-24-管理员职责集与银河外权限动作边界.md)
+第 4 条「本地开通/扩权：不做」）。一张新表 `local_permission_override`：管理员经
+确认卡对个别用户补授（`grant`）或收窄（`suppress`）的公司×指标级权限，供未来
+每日权限重算/开通链聚合与银河翻译结果取并集再减集（真实权限 `= (银河翻译 ∪
+本地授权) − 本地抑制`）。
+
+**一张表双极性**（编排者裁定，覆盖 #319 字面把「本地授权」「本地抑制」写成并列
+两个机制的读法）：`direction IN ('grant', 'suppress')` 同表，理由是两者共享完全
+相同的形状且需要合并判定「同一 user×公司×指标 同时有一条 grant 与一条
+suppress 时 suppress 赢」，拆两张表会让这类判定变成一次跨表 UNION。
+
+三条约束刻意写进数据库而不是留给调用方自觉：
+
+1. `pending_action_id NOT NULL REFERENCES pending_action(id)`——结构性堵死"没有
+   确认卡就能写入本地权限"这条路径（#319「可观察完成标准」第二条），任何一次
+   `INSERT` 如果不先有一条真实存在的 `pending_action` 行可引用，在数据库层面
+   就会失败；
+2. `entry_status`（`active`/`revoked`）与 `admin_registry`（迁移 `0067`）同一
+   惯例，收回是同一行状态翻转（软删除，历史留痕），配套 CHECK 让
+   `revoked_at`/`revoked_pending_action_id` 与 `entry_status='revoked'` 互为
+   充要；
+3. `local_permission_override_active_unique_idx`（`user_id, direction,
+   company_id, metric_name` 上 `WHERE entry_status = 'active'` 的部分唯一
+   索引）防止重复发起同一笔授权/抑制堆出多条冗余生效行，但不同 `direction`
+   允许共存——那正是「suppress 赢」判定需要的输入。
+
+**没有任何有效期/到期/复核列**：产品负责人在 #319 明确裁定本地覆盖「不设有效期、
+不设定期复核」，与 `pending_action` 的十分钟确认窗口是两回事，不适用。
+
+本卡（S-P-1a）只交付表结构 + 纯函数语义（`core/permission/local_override.py`）
++ 读写适配器（`adapters/postgres_local_permission.py`）；命令面（管理员如何发起
+一笔授权/收回，S-P-1b）与聚合点接线（银河翻译结果与本地覆盖取并集，S-P-3）均
+不在本 revision 范围。当前 `pending_action.action_type` 的 CHECK（迁移 `0068`）
+尚未加入本地权限专属取值，S-P-1b 落地时需要一次新增迁移补上。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值
+（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
