@@ -223,11 +223,10 @@ def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | N
     """从一次回合报告里取出**供落库**的文档投递请求（Issue #341 S-ES-3）。
 
     ``report["document_request"]`` 由 ``apps/worker/report.py::build_report``
-    投影（见该函数文档）：``None`` 或已经通过硬上限与出口安全检查的
-    ``{"title": str, "paragraphs": list[str]}``。这里只做结构校验、不重复上游
-    已经做过的业务校验——形状不对（早退分支、字段类型不符预期）一律返回
-    ``None``，与 :func:`_report_guard_denied_count`/:func:`_report_token_usage`
-    同一纪律：结构性地不可信就不传，不猜测、不编造。
+    投影（见该函数文档）：``None`` 或已过硬上限与出口安全检查的
+    ``{"title": str, "paragraphs": list[str]}``。这里只做结构校验，形状不对一律
+    返回 ``None``——与 :func:`_report_guard_denied_count` 同一纪律：结构性地
+    不可信就不传，不猜测、不编造。
     """
 
     request = report.get("document_request") if isinstance(report, Mapping) else None
@@ -1271,11 +1270,10 @@ class WorkerService:
         记 0）故意不是同一份计算结果，见调用方 ``_report_guard_denied_count``/
         ``_report_token_usage`` 的文档。
 
-        ``document_request``（Issue #341 S-ES-3，迁移 ``0074``）：只有调用方
-        （``_process_task`` 的真正成功分支）判定过这一轮同时满足"业务成功"与
-        "报告契约携带非空 document_request"时才非 ``None``——原样透传给
-        ``self._queue.write_terminal_event``，由它在写终态事件的同一事务里插入
-        一行文档投递请求。其余分支恒传默认值 ``None``，不产生任何行为差异。
+        ``document_request``（Issue #341 S-ES-3，迁移 ``0074``）：仅当调用方
+        （``_process_task`` 真正成功分支）判定"业务成功且报告契约携带非空
+        document_request"时才非 ``None``——原样透传 ``write_terminal_event``，
+        由它在写终态的同一事务里插入文档投递请求行；其余分支恒 ``None``。
         """
 
         self._log_terminal_outcome(
