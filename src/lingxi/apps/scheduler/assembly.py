@@ -33,7 +33,13 @@ from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
 from lingxi.apps.scheduler.daily_report import _wire_daily_report_duty
 from lingxi.apps.scheduler.document_delivery_dead_letter import _wire_document_delivery_maintenance_duty
 from lingxi.apps.scheduler.loop import SchedulerLoop
-from lingxi.apps.scheduler.permission_publish import PermissionPublishDuty, ReadinessFollowUp
+from lingxi.apps.scheduler.permission_publish import (
+    PermissionPublishDuty,
+    ReadinessFollowUp,
+    _build_permission_publish_duty,
+    _permission_readiness_alert,
+)
+from lingxi.apps.scheduler.permission_readiness_assembly import _build_readiness_follow_up
 from lingxi.apps.scheduler.permission_refresh import (
     PermissionRefreshDuty,
     _build_permission_refresh_duty,
@@ -54,116 +60,6 @@ from lingxi.apps.scheduler.roster_audit import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _build_readiness_follow_up(
-    config: SchedulerConfig,
-    *,
-    audit: AuditSink,
-    stop: threading.Event,
-) -> ReadinessFollowUp | None:
-    """装配「就绪确认 + 变化通知」这一面；前置不齐就**不装配**并留下**恰一条**审计。
-
-    **两个前置各自只关掉自己那一块**（二级审查 N6）：
-
-    1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）——**整面的前置**。它不只是
-       解密令牌用：就绪判定记录（``mcp_sync_check``）的读写口在同一个存储类上，而"这条
-       变化通知过了"这个**唯一水位**就落在那张表里。没有它，连撤权通知都没有"只发一次"
-       的载体，只能整面不装配。
-    2. **问数 MCP 端点**（``LINGXI_QUERY_MCP_ENDPOINT``）——**只关掉探针**。撤权通知不
-       依赖探针（权限文本为空的那一路本来就不发探针），因此端点没配时这一面照常装配，
-       只是把 ``probe=None`` 交给 :class:`ReadinessTicker`：需要探针的那一路本轮不推进、
-       不落任何记录，端点配好后从库里的进度原样继续。装一个指向空地址的假探针则相反，
-       会让每条确认以技术失败耗满预算再转运维——把"还没接线"伪装成"接线了但一直失败"。
-
-    **探针超时与就绪节奏用同一个数**：``ReadinessSchedule(probe_timeout_seconds=…)`` 与
-    ``QueryMcpProbe(timeout_seconds=…)`` 都取 ``config.query_mcp_timeout_seconds``。
-    两边不一致时，就绪那一侧算出来的"结论最晚什么时候落地"就是假的，因此这里在装配后
-    立刻断言相等——装配层的错配不该等到生产才暴露。
-
-    **探针的 ``metrics_reader`` 显式注入为已验证的
-    :func:`~lingxi.adapters.query_mcp_probe.content_text_metrics_reader`**（Issue #253）：
-    2026-08-19 对真实问数 MCP 的第一次实测（``docs/参考证据/问数MCP-list_metrics真实响应形状.md``）
-    发现返回里没有 ``structuredContent``，指标挂在 ``result.content[0].text`` 的一段
-    JSON 字符串里；``QueryMcpProbe`` 默认的 :func:`~lingxi.adapters.query_mcp_probe.default_metrics_reader`
-    只认前者，因此不注入的话就绪探针在真实 MCP 上会**永远**技术失败。
-    ``default_metrics_reader`` 本身不改——保留它作为"真实形状还没实测时"的收窄兜底，
-    这里只是**装配层按证据放宽**，而不是放宽默认值本身。
-    """
-
-    if not config.mcp_token_encrypt_key:
-        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
-
-        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
-        audit.record(
-            "permission_readiness.not_wired",
-            reason="missing_environment_variable",
-            variable=MASTER_KEY_ENV,
-        )
-        logger.warning(
-            "未配置 %s，MCP 就绪确认与权限变化通知不装配；权限发布照常运行", MASTER_KEY_ENV
-        )
-        return None
-
-    from lingxi.adapters.feishu_user_message import FeishuUserMessages
-    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
-    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
-    from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
-    from lingxi.core.permission.mcp_readiness import ReadinessTicker
-    from lingxi.core.permission.notification import PermissionNoticeDispatcher
-
-    tokens = PostgresMcpTokenStore(
-        config.postgres_dsn,
-        cipher=McpTokenCipher(config.mcp_token_encrypt_key),
-        timeouts=config.postgres_timeouts,
-    )
-    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
-    probe = None
-    if config.query_mcp_endpoint:
-        probe = QueryMcpProbe(
-            endpoint=config.query_mcp_endpoint,
-            token_provider=token_cipher_provider(tokens),
-            timeout_seconds=config.query_mcp_timeout_seconds,
-            # 已验证的 reader（Issue #253 / L4a）：真实 MCP 的 list_metrics 返回没有
-            # structuredContent，见本函数文档与 docs/参考证据/问数MCP-list_metrics真实响应形状.md。
-            metrics_reader=content_text_metrics_reader,
-        )
-        if probe.timeout_seconds != schedule.probe_timeout_seconds:  # pragma: no cover - 装配自证
-            raise RuntimeError(
-                "探针传输超时必须与就绪节奏的单次超时一致，否则收口上界是假的"
-            )
-    else:
-        # **恰一条**审计：只关掉探针，撤权通知照常。
-        audit.record(
-            "permission_readiness.probe_not_wired",
-            reason="missing_environment_variable",
-            variable="LINGXI_QUERY_MCP_ENDPOINT",
-        )
-        logger.warning(
-            "未配置 LINGXI_QUERY_MCP_ENDPOINT，MCP 就绪探针不装配；"
-            "撤权通知与权限发布照常运行，已发布的授权待端点配好后继续确认"
-        )
-    return ReadinessFollowUp(
-        ticker=ReadinessTicker(
-            probe=probe,
-            store=tokens,
-            audit=audit,
-            clock=lambda: datetime.now(timezone.utc),
-            schedule=schedule,
-        ),
-        checks=tokens,
-        notices=PermissionNoticeDispatcher(
-            sender=FeishuUserMessages(
-                base_url=config.feishu_base_url,
-                app_id=config.feishu_app_id,
-                app_secret=config.feishu_app_secret,
-            ),
-            audit=audit,
-            # 退避用 `stop.wait` 而不是 `time.sleep`：SIGTERM 能立刻打断它
-            # （同 `CredentialRotationLoop._save_with_retry`）。
-            sleep=stop.wait,
-        ),
-    )
 
 
 def _build_onboarding_duty(
@@ -780,120 +676,6 @@ def _build_org_snapshot_sync_duty(
         source_app_id=config.feishu_app_id,
         stop=stop,
     )
-
-
-def _build_permission_publish_duty(
-    config: SchedulerConfig,
-    *,
-    stop: threading.Event,
-    audit: AuditSink,
-    permission_table_access_token: Callable[[], str] | None,
-) -> PermissionPublishDuty | None:
-    """装配权限发布消费职责；**三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6）。
-
-    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
-    每一面**恰一条**审计、其余职责照常运行）。
-
-    **发布面**的三个前置：
-
-    1. **权限发布 Base ``app_token``** 与 2. **表 ``table_id``**：写哪张表不能进代码，
-       只从环境变量来。
-    3. **发布表读写所用的短期令牌供给**。产品负责人 2026-08-18 就 Issue
-       [#226](https://github.com/Moshuiwang/lingxi/issues/226) 裁定方向 3（应用身份），
-       ``build_loop`` 因此**总能**建出一条默认供给（见 ``build_loop`` 文档）——``None``
-       现在的含义与花名册那条同一条（Issue #215 之后确立的口径）：**"调用方真的没有
-       交出任何供给"**，不再是"这条链还没接线"，正式装配路径不会走到这一分支。
-       ``permission_table_access_token_unwired`` 这条原因码因此仍然存在（供直接构造
-       本函数的测试与非默认调用方使用），但生产 `main()` → `build_loop` 这条路径上不再
-       触发。
-
-    **缺发布面前置时职责仍然注册**，只要就绪/通知那一面装得起来：已经发布出去的那些
-    权限还等着被确认、被通知，没有理由因为"暂时写不了新的一行"就把它们一起停掉。
-    反过来也一样——MCP 端点没配时发布照常。两个面都装不起来才不注册。
-    """
-
-    executor = None
-    unwired: tuple[str, str] | None = None
-    for variable, value in (
-        ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),
-        ("LINGXI_PERMISSION_BITABLE_TABLE_ID", config.permission_table_id),
-    ):
-        if not value:
-            unwired = ("missing_environment_variable", variable)
-            break
-    if unwired is None and permission_table_access_token is None:
-        unwired = ("permission_table_access_token_unwired", "")
-
-    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-
-    store = PostgresPermissionPublishStore(
-        config.postgres_dsn, timeouts=config.postgres_timeouts
-    )
-    if unwired is None:
-        from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
-        from lingxi.core.permission.publish import PermissionPublishExecutor
-
-        executor = PermissionPublishExecutor(
-            store=store,
-            transport=BitablePermissionTable(
-                base_url=config.feishu_base_url,
-                app_token=config.permission_app_token,
-                table_id=config.permission_table_id,
-                access_token=permission_table_access_token,
-            ),
-            audit=audit,
-        )
-
-    readiness = _build_readiness_follow_up(config, audit=audit, stop=stop)
-    if executor is None and readiness is None:
-        # 两面都装不起来：注册一个什么都做不了的职责只会每分钟记一条空报告。
-        reason, variable = unwired or ("unknown", "")
-        facts = {"reason": reason}
-        if variable:
-            facts["variable"] = variable
-        audit.record("permission_publish.duty_not_registered", **facts)
-        logger.warning("权限发布与就绪确认两面都未装配，职责不注册；其余定时职责照常运行")
-        return None
-    if executor is None:
-        reason, variable = unwired or ("unknown", "")
-        facts = {"reason": reason}
-        if variable:
-            facts["variable"] = variable
-        # **恰一条**：只说发布面没装配，就绪与通知面照常。
-        audit.record("permission_publish.publish_not_wired", **facts)
-        logger.warning(
-            "权限发布面未装配（%s），已发布权限的就绪确认与变化通知照常运行", reason
-        )
-
-    return PermissionPublishDuty(
-        executor=executor,
-        intents=store,
-        audit=audit,
-        readiness=readiness,
-        on_alert=_permission_readiness_alert(audit),
-        stop=stop,
-    )
-
-
-def _permission_readiness_alert(audit: AuditSink) -> Callable[[str, str], None]:
-    """刷新链就绪超时的告警出口：一条**可告警的结构化事实**。
-
-    **刻意不接 ``core/alerting.py`` 的状态机**（与 ``core/permission/publish.py`` 的
-    ``on_alert`` 同一条已登记理由，也与 ``_log_snapshot_alert`` 同一姿态）：那套状态机
-    只认心跳、任务滞留与飞书发送连续失败三类信号，把"某个用户的权限同步没能在十五分钟
-    内确认"塞进其中任何一类，都会让那一类的阈值、去重与恢复计时同时失真——尤其是塞进
-    ``FEISHU_SEND_FAILED``，会让真正的发送故障被权限超时淹没。
-
-    它属于"权限发布失败是新增一类信号还是复用一类"这个尚未做出的决定；在那之前，这里
-    先把事实**留成可 grep、可进工单的一条审计 + 一条 WARNING**，而不是让刷新链的超时
-    只剩计数。用户标识是内部 ULID，不含人员资料。
-    """
-
-    def report(kind: str, user_id: str) -> None:
-        audit.record("permission_readiness.alert", kind=kind, user=user_id)
-        logger.warning("权限就绪确认需要人工关注 kind=%s user=%s", kind, user_id)
-
-    return report
 
 
 def build_loop(

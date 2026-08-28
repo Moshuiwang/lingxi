@@ -113,6 +113,9 @@ from lingxi.core.permission.mcp_readiness import (
 )
 from lingxi.core.permission.notification import NoticeResult
 
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
+
 logger = logging.getLogger(__name__)
 
 _UTC = timezone.utc
@@ -632,6 +635,126 @@ class PermissionPublishDuty:
             self._on_alert(kind, item.user_id)
         except Exception as error:  # noqa: BLE001 - 观察者不是这条链的一部分
             logger.error("权限就绪告警回调失败 error=%s", type(error).__name__)
+
+
+def _build_permission_publish_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    permission_table_access_token: Callable[[], str] | None,
+) -> PermissionPublishDuty | None:
+    """装配权限发布消费职责；**三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6）。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
+    每一面**恰一条**审计、其余职责照常运行）。
+
+    **发布面**的三个前置：
+
+    1. **权限发布 Base ``app_token``** 与 2. **表 ``table_id``**：写哪张表不能进代码，
+       只从环境变量来。
+    3. **发布表读写所用的短期令牌供给**。产品负责人 2026-08-18 就 Issue
+       [#226](https://github.com/Moshuiwang/lingxi/issues/226) 裁定方向 3（应用身份），
+       ``build_loop`` 因此**总能**建出一条默认供给（见 ``build_loop`` 文档）——``None``
+       现在的含义与花名册那条同一条（Issue #215 之后确立的口径）：**"调用方真的没有
+       交出任何供给"**，不再是"这条链还没接线"，正式装配路径不会走到这一分支。
+       ``permission_table_access_token_unwired`` 这条原因码因此仍然存在（供直接构造
+       本函数的测试与非默认调用方使用），但生产 `main()` → `build_loop` 这条路径上不再
+       触发。
+
+    **缺发布面前置时职责仍然注册**，只要就绪/通知那一面装得起来：已经发布出去的那些
+    权限还等着被确认、被通知，没有理由因为"暂时写不了新的一行"就把它们一起停掉。
+    反过来也一样——MCP 端点没配时发布照常。两个面都装不起来才不注册。
+    """
+
+    executor = None
+    unwired: tuple[str, str] | None = None
+    for variable, value in (
+        ("LINGXI_PERMISSION_BITABLE_APP_TOKEN", config.permission_app_token),
+        ("LINGXI_PERMISSION_BITABLE_TABLE_ID", config.permission_table_id),
+    ):
+        if not value:
+            unwired = ("missing_environment_variable", variable)
+            break
+    if unwired is None and permission_table_access_token is None:
+        unwired = ("permission_table_access_token_unwired", "")
+
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+
+    store = PostgresPermissionPublishStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
+    if unwired is None:
+        from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
+        from lingxi.core.permission.publish import PermissionPublishExecutor
+
+        executor = PermissionPublishExecutor(
+            store=store,
+            transport=BitablePermissionTable(
+                base_url=config.feishu_base_url,
+                app_token=config.permission_app_token,
+                table_id=config.permission_table_id,
+                access_token=permission_table_access_token,
+            ),
+            audit=audit,
+        )
+
+    # 延迟导入（而不是模块顶层）：`permission_readiness_assembly` 反向 import 本模块的
+    # `ReadinessFollowUp`（构造它要用到），模块顶层互相 import 会成环；两个模块分开
+    # 的理由本身见 `permission_readiness_assembly` 的模块文档——它承载的
+    # `sleep=stop.wait` 会被本文件 `NonBlockingTest` 的全文件级否定扫描连坐命中。
+    from lingxi.apps.scheduler.permission_readiness_assembly import _build_readiness_follow_up
+
+    readiness = _build_readiness_follow_up(config, audit=audit, stop=stop)
+    if executor is None and readiness is None:
+        # 两面都装不起来：注册一个什么都做不了的职责只会每分钟记一条空报告。
+        reason, variable = unwired or ("unknown", "")
+        facts = {"reason": reason}
+        if variable:
+            facts["variable"] = variable
+        audit.record("permission_publish.duty_not_registered", **facts)
+        logger.warning("权限发布与就绪确认两面都未装配，职责不注册；其余定时职责照常运行")
+        return None
+    if executor is None:
+        reason, variable = unwired or ("unknown", "")
+        facts = {"reason": reason}
+        if variable:
+            facts["variable"] = variable
+        # **恰一条**：只说发布面没装配，就绪与通知面照常。
+        audit.record("permission_publish.publish_not_wired", **facts)
+        logger.warning(
+            "权限发布面未装配（%s），已发布权限的就绪确认与变化通知照常运行", reason
+        )
+
+    return PermissionPublishDuty(
+        executor=executor,
+        intents=store,
+        audit=audit,
+        readiness=readiness,
+        on_alert=_permission_readiness_alert(audit),
+        stop=stop,
+    )
+
+
+def _permission_readiness_alert(audit: AuditSink) -> Callable[[str, str], None]:
+    """刷新链就绪超时的告警出口：一条**可告警的结构化事实**。
+
+    **刻意不接 ``core/alerting.py`` 的状态机**（与 ``core/permission/publish.py`` 的
+    ``on_alert`` 同一条已登记理由，也与 ``_log_snapshot_alert`` 同一姿态）：那套状态机
+    只认心跳、任务滞留与飞书发送连续失败三类信号，把"某个用户的权限同步没能在十五分钟
+    内确认"塞进其中任何一类，都会让那一类的阈值、去重与恢复计时同时失真——尤其是塞进
+    ``FEISHU_SEND_FAILED``，会让真正的发送故障被权限超时淹没。
+
+    它属于"权限发布失败是新增一类信号还是复用一类"这个尚未做出的决定；在那之前，这里
+    先把事实**留成可 grep、可进工单的一条审计 + 一条 WARNING**，而不是让刷新链的超时
+    只剩计数。用户标识是内部 ULID，不含人员资料。
+    """
+
+    def report(kind: str, user_id: str) -> None:
+        audit.record("permission_readiness.alert", kind=kind, user=user_id)
+        logger.warning("权限就绪确认需要人工关注 kind=%s user=%s", kind, user_id)
+
+    return report
 
 
 __all__ = [

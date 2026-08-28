@@ -233,6 +233,13 @@ REQUIRED_MODULES = (
     "lingxi.apps.scheduler.permission_refresh",
     # 权限发布消费与就绪确认职责（Issue #156 / S-C-03b），同样是模块级 import。
     "lingxi.apps.scheduler.permission_publish",
+    # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：就绪确认+
+    # 变化通知装配（`_build_readiness_follow_up`）单独成文件而不并入
+    # `permission_publish.py`——那个文件承载 `tests/test_permission_publish_duty.py::
+    # NonBlockingTest` 的全文件级否定扫描（禁止出现 `sleep` 等等待类词汇），而本函数
+    # 装配的通知退避是合法的 `sleep=stop.wait`，会被连坐命中。`assembly.py` 顶部
+    # **模块级** import 本模块，漏登记会直接让 scheduler 起不来。
+    "lingxi.apps.scheduler.permission_readiness_assembly",
     # #237：`apps/scheduler/__init__.py` 按职责边界拆成的九个子模块（#303 新增
     # daily_report）。全部由包的 `__init__.py` 在**模块级** import 以维持既有的
     # `lingxi.apps.scheduler.<名字>` 重导出契约，因此与上面两条同一姿态——漏登记
@@ -441,6 +448,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # S-C-02 的就绪状态机与探针、以及权限变化通知全部接进了本进程，因此发布表
             # 传输、问数 MCP 探针与用户私聊出站三个 adapter 也进了运行时闭包。
             "lingxi.apps.scheduler.permission_publish",
+            # Trace #358 S-H-2 纯移动拆分：`assembly.py` 顶部**模块级** import
+            # 本模块（理由见 REQUIRED_MODULES 同名条目——避免 `permission_publish.py`
+            # 的全文件级 NonBlockingTest 否定扫描连坐命中合法的通知退避 `sleep`）。
+            "lingxi.apps.scheduler.permission_readiness_assembly",
             # 首次开通编排（Epic D / S-D-02）：`build_loop` 在函数内 import 本模块与
             # 它的适配器，因此必须显式登记——不列进来，extras 那条干净环境的腿永远
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
