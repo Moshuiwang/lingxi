@@ -28,9 +28,15 @@ from typing import Protocol
 
 from lingxi.core.identity.roster_audit import ArchivedIdentity, RosterAuditReport, compare_roster
 from lingxi.core.identity.roster_report import render_daily_report_content
-from lingxi.core.identity.roster_snapshot import RosterRound, SnapshotDecision
+from lingxi.core.identity.roster_snapshot import (
+    DailyRosterSource,
+    RosterRound,
+    RosterSnapshotUpdater,
+    SnapshotDecision,
+)
 
 from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -389,3 +395,160 @@ def _log_snapshot_alert(decision: SnapshotDecision) -> None:
         decision.failure_code,
         decision.previous_row_count,
     )
+
+
+def _build_roster_audit_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    roster_access_token: Callable[[], str] | None,
+    on_send_outcome: Callable[[str, bool], None] | None = None,
+) -> RosterAuditDuty | None:
+    """装配审计日报职责；前置不齐就**不注册**并留下**恰一条**审计，返回 ``None``。
+
+    四个前置按固定次序检查，缺第一个就返回：`V-花名册-29` 要求「缺群 ID → 审计
+    **恰 1 条**」，逐条报会让一个什么都没配的部署一次刷出四条审计，反而看不出该先配哪个。
+    """
+
+    if not config.admin_group_chat_id:
+        # 只报变量名，不回显任何值（`V-花名册-29`）。
+        audit.record(
+            "roster_audit.duty_not_registered",
+            reason="missing_environment_variable",
+            variable="LINGXI_ADMIN_GROUP_CHAT_ID",
+        )
+        logger.warning(
+            "未配置 LINGXI_ADMIN_GROUP_CHAT_ID，花名册审计日报职责不注册；其余定时职责照常运行"
+        )
+        return None
+    for variable, value in (
+        ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
+        ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
+    ):
+        if not value:
+            audit.record(
+                "roster_audit.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，花名册审计日报职责不注册；其余定时职责照常运行", variable)
+            return None
+    if roster_access_token is None:
+        # 调用方没有交出任何令牌供给。**这条分支现在的含义是"真的没有供给"**，
+        # 不再是"这条链还没接线"：Issue #215 之后 `build_loop` 总会建出一个供给
+        # （凭据轮换职责按需换、进程内持有者转交），因此正式装配路径不会走到这里。
+        #
+        # 「配了但拿不到令牌」不走这条分支——那时职责照常注册，失败发生在运行期并按
+        # 分类审计（`roster_access_token.unavailable`）。两者必须可分辨：把运行期的
+        # 授权失败记成「未注册」，会让排障去找配置；反过来则会让「还没接线」看起来
+        # 像「接线了但一直失败」（R3 的原始教训）。
+        audit.record("roster_audit.duty_not_registered", reason="missing_access_token_supply")
+        logger.warning("调用方未提供花名册读取令牌供给，花名册审计日报职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_group_message import FeishuGroupMessages
+    from lingxi.adapters.feishu_roster_bitable import BitableRosterPages, read_roster_snapshot
+    from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    pages = BitableRosterPages(
+        base_url=config.feishu_base_url,
+        app_token=config.roster_app_token,
+        table_id=config.roster_table_id,
+        access_token=roster_access_token,
+    )
+    store = PostgresRosterSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    roster_source = DailyRosterSource(
+        # 走 `read_roster_snapshot` 而不是逐页归一：日报必须能区分「花名册真的空了」
+        # 与「这一轮没读完」，而只有前者会让保旧判定拿到 `EMPTY_SOURCE`。
+        read_round=lambda: read_roster_snapshot(pages),
+        updater=RosterSnapshotUpdater(store=store, audit=audit, on_alert=_log_snapshot_alert),
+        load_snapshot=store.load,
+        stale_after=config.roster_snapshot_stale_after,
+    )
+
+    return RosterAuditDuty(
+        baseline_reader=PostgresRosterBaselineReader(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        roster_source=roster_source,
+        sender=FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.feishu_app_id,
+            app_secret=config.feishu_app_secret,
+            on_send_outcome=on_send_outcome,
+        ),
+        audit=audit,
+        chat_id=config.admin_group_chat_id,
+        stop=stop,
+    )
+
+
+def _build_roster_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    roster_access_token: Callable[[], str] | None,
+) -> RosterSnapshotSyncDuty | None:
+    """装配花名册快照写入职责（写侧，Issue #275）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    **只有两个前置——花名册 Base 坐标（`app_token`/`table_id`）与读取令牌供给，
+    刻意不含管理群 chat_id**：`roster_snapshot` 表是首次开通链第二步
+    （`core/identity/onboarding_runner.py::_match`）与每日权限重算的共同数据前提，
+    两者都直接读这张表，从不经过管理群那条通知链路。`_build_roster_audit_duty`
+    此前把三者捆在同一道门后面，导致"日报发到哪个群"这个纯通知配置决定"员工能不能
+    被开通"——2026-08-21 首触冒烟实测坐实了这个缺口（Issue #275）。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报
+    变量名、审计恰一条、其余职责照常运行），但**审计动作前缀改成
+    `roster_snapshot_sync.`**——与 `roster_audit.duty_not_registered` 保持可分辨
+    （约束：「没配管理群所以不发日报」与「花名册没接线所以不写快照」必须是两条不同的
+    审计原因码）。
+
+    **调用方（`build_loop`）只在 `_build_roster_audit_duty` 返回 `None` 时才会调用
+    本函数**：两个职责互斥注册，避免管理群与 Base 坐标都齐全时同时跑出两条各自独立
+    的 `DailyRosterSource`，让"今天到底读了几次花名册"失去唯一性（见
+    :class:`~lingxi.apps.scheduler.roster_audit.RosterSnapshotSyncDuty` 文档字符串
+    与 `build_loop` 调用点的注释）。
+    """
+
+    for variable, value in (
+        ("LINGXI_ROSTER_BITABLE_APP_TOKEN", config.roster_app_token),
+        ("LINGXI_ROSTER_BITABLE_TABLE_ID", config.roster_table_id),
+    ):
+        if not value:
+            audit.record(
+                "roster_snapshot_sync.duty_not_registered",
+                reason="missing_environment_variable",
+                variable=variable,
+            )
+            logger.warning("未配置 %s，花名册快照写入职责不注册；其余定时职责照常运行", variable)
+            return None
+    if roster_access_token is None:
+        # 同 `_build_roster_audit_duty` 的同一条纪律：这条分支现在的含义是"调用方
+        # 真的没有交出任何供给"，不是"这条链还没接线"（Issue #215 之后 `build_loop`
+        # 总会建出一条默认供给）；"配了但拿不到令牌"不走这条分支，职责照常注册，
+        # 失败发生在运行期并按分类审计。
+        audit.record("roster_snapshot_sync.duty_not_registered", reason="missing_access_token_supply")
+        logger.warning("调用方未提供花名册读取令牌供给，花名册快照写入职责不注册")
+        return None
+
+    from lingxi.adapters.feishu_roster_bitable import BitableRosterPages, read_roster_snapshot
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+
+    pages = BitableRosterPages(
+        base_url=config.feishu_base_url,
+        app_token=config.roster_app_token,
+        table_id=config.roster_table_id,
+        access_token=roster_access_token,
+    )
+    store = PostgresRosterSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts)
+    roster_source = DailyRosterSource(
+        read_round=lambda: read_roster_snapshot(pages),
+        updater=RosterSnapshotUpdater(store=store, audit=audit, on_alert=_log_snapshot_alert),
+        load_snapshot=store.load,
+        stale_after=config.roster_snapshot_stale_after,
+    )
+    return RosterSnapshotSyncDuty(roster_source=roster_source, stop=stop)

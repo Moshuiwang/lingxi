@@ -1145,7 +1145,13 @@ class InvariantBuildLoopTests(unittest.TestCase):
         self.assertNotIn("LINGXI_ADMIN_GROUP_CHAT_ID", env)
         audit = RecordingAudit()
 
-        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+        # 捕获目标是包一级 logger `lingxi.apps.scheduler`：Trace #358 S-H-2 把
+        # `_build_onboarding_duty` 纯移动到 `onboarding.py` 后，这条 WARNING
+        # 由 `build_loop`（仍在 `assembly.py`）直接发出，用的是 `assembly` 自己
+        # 的子 logger；`assertLogs` 按名字前缀匹配并沿日志传播链向上捕获，包
+        # 一级名字不随未来哪个子模块具体发出这条 WARNING 而碎（同下一条否定
+        # 用例的同一处理由）。
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
             loop = build_loop(
                 SchedulerConfig.from_env(env),
                 roster_access_token=lambda: "employment-token",
@@ -1156,9 +1162,11 @@ class InvariantBuildLoopTests(unittest.TestCase):
         names = [duty.name for duty in loop.duties]
         self.assertIn("未开通首聊交接对账", names, "本用例的前提是开通编排真的注册了")
         self.assertTrue(
-            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            any("已注册首次开通编排" in line for line in captured.output),
             captured.output,
-        )
+        )  # 判据用这条 WARNING 独有的正文子串而非环境变量名——同一装配轮里
+        # roster_audit/daily_report 的无关 WARNING 也含变量名字样，会让"删掉
+        # 本条 WARNING"的变异静默通过（S-H-2 批审查 P2-1 变异实测坐实）
         self.assertIn(
             (
                 "onboarding.admin_alert_channel_missing",
@@ -1180,10 +1188,16 @@ class InvariantBuildLoopTests(unittest.TestCase):
         audit = RecordingAudit()
 
         # 本用例的环境仍然没配花名册 Base 坐标，会各自留一条与本条无关的 WARNING
-        # （见 ``_build_roster_audit_duty``/``_build_roster_snapshot_sync_duty``）；
+        # （见 ``_build_roster_audit_duty``/``_build_roster_snapshot_sync_duty``，
+        # Trace #358 S-H-2 后住在 ``roster_audit.py``、用自己的子 logger 发出）；
         # 因此不能用「完全没有 WARNING」做判据，只断言**这一条**（提到
-        # ``LINGXI_ADMIN_GROUP_CHAT_ID`` 的那条）没有出现。
-        with self.assertLogs("lingxi.apps.scheduler.assembly", level="WARNING") as captured:
+        # ``LINGXI_ADMIN_GROUP_CHAT_ID`` 的那条）没有出现。捕获目标改为包一级
+        # logger `lingxi.apps.scheduler`（而不是 `.assembly` 子 logger）：子
+        # logger 的记录会沿传播链向上被父级 handler 捕获，包一级名字与「哪个
+        # 子模块具体发出了这些不相关 WARNING」解耦，S-H-2 把
+        # `_build_roster_audit_duty` 等移出 `assembly.py` 之后这条判据仍然
+        # 成立，不随未来再拆分而碎。
+        with self.assertLogs("lingxi.apps.scheduler", level="WARNING") as captured:
             loop = build_loop(
                 SchedulerConfig.from_env(env),
                 roster_access_token=lambda: "employment-token",

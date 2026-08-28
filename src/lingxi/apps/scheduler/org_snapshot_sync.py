@@ -107,9 +107,12 @@ import re
 import threading
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 from lingxi.core.identity.org_snapshot import SnapshotBatch, SnapshotIntegrityError
+
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -625,3 +628,124 @@ class OrgSnapshotSyncDuty:
             )
             return None
         return result.get("run_id")
+
+
+def _stop_aware_sleep(stop: threading.Event) -> Callable[[float], None]:
+    """把 `stop.wait` 包一层，让「停机置位后的等待」变成「中止」而不是
+    「假装等过了、照样放行」（二级独立审查 2026-08-21 P2）。
+
+    直接把 `stop.wait` 当 `FeishuDirectoryClient` 的 `sleep` 注入时，`stop`
+    一旦置位，`_throttle()`/限频重试的等待会立即返回、与"真的等过了"在
+    调用方看来完全无法区分——节流因此悄悄失效，在途一轮剩余的数百次分页
+    请求会以无节流速度打出，撞上 `_throttle` 文档字符串描述的真实频率限制。
+    这里改成：`stop.wait(seconds)` 返回 `True`（已置位）时抛出
+    `FeishuDirectoryError("stopping")` 中止当前调用，异常原样冒泡进
+    `OrgSnapshotSyncDuty._run_round()` 既有的 `read_failed`→退避→保留上一份
+    完成批次路径，符合「停止后不再发起新请求」，不是「停止后不再等待就发」。
+    只挡"要不要发起下一次等待/请求"，不中断正在进行中的单次 HTTP 请求，与
+    `McpReadinessConfirmation`/`PermissionNoticeDispatcher` 打断等待、不打断
+    在途请求的既有纪律一致。
+
+    （Trace #358 S-H-2 搬入时更正：本函数文档原写 ``run_once()``；Issue #340
+    把整轮判定改名为私有 ``_run_round``、``run_once`` 改成只做本地无 I/O 判断
+    并把整轮派进后台线程的薄封装，此处的 ``read_failed``→退避→保留上一份完成
+    批次链路实际发生在 ``_run_round`` 内，随搬家一并按事实修正措辞。）
+    """
+
+    from lingxi.adapters.feishu_directory import FeishuDirectoryError
+
+    def sleep(seconds: float) -> None:
+        if stop.wait(seconds):
+            raise FeishuDirectoryError("stopping")
+
+    return sleep
+
+
+def _build_org_snapshot_sync_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    user_access_token: Callable[[], str] | None,
+    app_access_token: Callable[[], str] | None,
+) -> Any | None:
+    """装配组织快照同步职责（Issue #250）；前置不齐就**不注册**并留下**恰一条**审计。
+
+    形状照 :func:`_build_onboarding_duty`：两个令牌供给都是调用方必须交出的前置，
+    ``None`` 表示调用方真的没有交出任何供给（"未接线"）——正式装配路径
+    ``build_loop`` 总会建出两条（花名册/开通那条用户身份供给自 Issue #215 起是
+    默认值，权限发布表那条应用身份供给自 Issue #226 起也是默认值），因此这两条
+    分支正常不会在生产触发。**"配了但拿不到令牌"不走这里**：那时职责照常注册，
+    失败发生在 ``run_once`` 内部并按分类审计（``org_snapshot_sync.read_failed``），
+    两者必须可分辨——把运行期的授权失败记成"未注册"会让排障去找配置，反过来会让
+    "还没接线"看起来像"接线了但一直失败"（`V-花名册-29` 的同一条纪律，R3 的原始
+    教训）。
+    """
+
+    if user_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="user_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照用户身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+    if app_access_token is None:
+        audit.record("org_snapshot_sync.duty_not_registered", reason="app_access_token_unwired")
+        logger.warning(
+            "调用方未提供组织快照应用身份读取令牌供给，组织快照同步职责不注册；"
+            "其余定时职责照常运行"
+        )
+        return None
+
+    from lingxi.adapters.feishu_directory import FeishuDirectoryClient
+    from lingxi.adapters.feishu_org_snapshot_reader import read_org_snapshot
+    from lingxi.adapters.postgres_identity import PostgresOrgSnapshotStore
+
+    # `sleep=_stop_aware_sleep(stop)`（Issue #284 A 组 #4，中止行为按二级独立审查
+    # P2 修正）：不能直接注入裸的 `stop.wait`——那会让节流/限频退避在停机置位后
+    # 的每一次等待都立刻返回 `True` 而**不是真的等过那么久**，`_throttle()` 因此
+    # 悄悄失去节流，在途一轮剩余的数百次分页请求会以无节流速度打出，正撞上
+    # `_throttle` 文档字符串要防的那种突发（真实撞过飞书累计频率限制）。这里改成
+    # 「停机置位就中止」而不是「停机置位就假装等过了、照样发下一次请求」：见
+    # `_stop_aware_sleep` 的文档字符串。不中断进行中的单次 HTTP 请求——中止点仍然
+    # 只在两次请求之间的等待里，同 SIGTERM 只打断等待、不打断在途请求的既有纪律。
+    client = FeishuDirectoryClient(base_url=config.feishu_base_url, sleep=_stop_aware_sleep(stop))
+
+    def read_snapshot() -> Any:
+        # 令牌各解析一次、用于本轮**整趟**递归遍历（数百次分页请求，Issue #250
+        # 编排者 2026-08-19 实测规模），不逐次请求都重新取——两条供给都会在有效期内
+        # 直接返回缓存值，这里只是不给每一次分页调用都加一次令牌新鲜度判定的开销。
+        #
+        # 两个供给分别包一层 `TokenSupplyFailure`（Issue #250 编排者复查 F6）：不这样
+        # 做的话，应用令牌、用户令牌、真实扫描三种失败在 `run_once` 的
+        # `org_snapshot_sync.read_failed` 审计里全都只剩 `error=<异常类型>`，分辨不出
+        # 该去查哪一条。只重分类、不改变失败语义——原始异常仍通过 `from error` 保留
+        # 因果链，只是审计只读安全的 `supply` 标签。
+        try:
+            app_token = app_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("app_access_token") from error
+        try:
+            user_token = user_access_token()
+        except Exception as error:  # noqa: BLE001 - 立即重分类，不吞
+            raise TokenSupplyFailure("user_access_token") from error
+        # 整轮预算（Issue #284 A 组 #2；取值可运维配置，见
+        # `config.org_snapshot_round_budget_seconds` 与
+        # `DEFAULT_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 的文档）：只包住这一整趟
+        # 递归遍历，`round_budget` 是 `client` 这一个实例的作用域化状态，不影响
+        # 开通链那个独立的 client。撞线时 `_request` 抛出的
+        # `FeishuDirectoryError("round_budget_exceeded")` 原样冒泡，落进本函数
+        # 上面两个 `except Exception` 同一条路径之外的、
+        # `OrgSnapshotSyncDuty._run_round()` 现有的 `except Exception` 分支——走
+        # 完全相同的「记 `read_failed` 审计→推进退避→保留上一份完成批次」路径，
+        # 这里不需要再单独处理。
+        with client.round_budget(seconds=config.org_snapshot_round_budget_seconds):
+            return read_org_snapshot(client=client, app_token=app_token, user_token=user_token)
+
+    return OrgSnapshotSyncDuty(
+        read_snapshot=read_snapshot,
+        store=PostgresOrgSnapshotStore(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        audit=audit,
+        source_app_id=config.feishu_app_id,
+        stop=stop,
+    )

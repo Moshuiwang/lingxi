@@ -201,6 +201,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Protocol
 
+from lingxi.adapters.postgres_local_permission import local_override_reader
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
@@ -225,6 +226,9 @@ from lingxi.core.permission.publish_row import (
     build_revocation_row,
     build_translated_publish_row,
 )
+
+from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -1033,6 +1037,138 @@ class PermissionRefreshDuty:
         action = _ROUND_SKIP_ACTIONS.get(reason, "permission_refresh.skipped_roster_not_fresh")
         self._audit.record(action, report_date=today.isoformat(), reason=reason, **facts)
         logger.warning("每日权限重算本轮不执行 reason=%s", reason)
+
+
+def _build_permission_refresh_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+    legacy_source: Any | None = None,
+) -> tuple[
+    PermissionRefreshDuty | None,
+    Mapping[str, Mapping[str, Sequence[str]]] | None,
+]:
+    """装配每日权限重算职责；前置不齐就**不注册**并留下**恰一条**审计。
+
+    返回 ``(duty, metric_translation_map)``：第二个元素是本函数**唯一一次**读取
+    ``lingxi/config/company_function_metric_map.toml`` 得到的对象（前置不齐、连
+    读取都没发生时是 ``None``）。``build_loop`` 把它原样转给
+    :func:`_build_onboarding_duty` 构造 ``publish_allowed``——**同一个已加载对象**，
+    不在开通侧另开一次文件 I/O（见 Issue #227 开通侧整合的取舍说明，
+    ``build_loop`` 内注入点上方的注释）。
+
+    形状照 :func:`_build_roster_audit_duty`（`V-花名册-29` 的同一条纪律：缺项只报变量名、
+    审计恰一条、其余职责照常运行）。前置有三个，逐个说明为什么它是真前置：
+
+    1. **MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）。重算要读该用户**已有**的
+       令牌密文，而唯一的读取口
+       :class:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 只接受已经校验
+       过主密钥的加解密对象（它同时承载解密路径，构造时就要求密钥）。**没有它就没有令牌
+       读取口**，而"读不到"与"这个人没有令牌"在下游是同一个 ``None``——那会让每个需要
+       新建发布行的人都以 ``missing_token_cipher`` 失败关闭，表现成"接线了但一直失败"，
+       正是 R3 那条注释要避免的伪装。因此这里显式不注册并留痕。
+
+       **本职责一次都不解密、也不签发**：密钥在这里只用于构造那个读取口
+       （见 :mod:`lingxi.apps.scheduler.permission_refresh` 的模块文档）。
+    2. **角色职能映射配置**。它随包发布（``lingxi/config/galaxy_role_function_map.toml``）。
+       读不出来时**不能**退化成空映射——那会让所有角色变成"未映射"，于是全员被算成无可用
+       权限，是一种看起来正常的失败（``role_function_map_file`` 的模块文档同一条理由）。
+    3. **公司+职能→指标名翻译映射配置**（Issue #227）。它同样随包发布
+       （``lingxi/config/company_function_metric_map.toml``），**文件读不出来或格式不对**
+       才不注册——**空映射本身是合法内容**（``[companies]`` 表存在但没有条目，代表映射
+       内容尚未由产品负责人填入），不是一种要拒绝注册的前置缺失：职责本该正常跑起来，
+       只是每个人都会在翻译那一步 fail-closed 并跳过（模块文档「翻译」一节），这与"配置
+       文件本身损坏"是两件不同的事，必须分开判断——前者是"内容还没到"，后者是"部署配置
+       本身有问题"，把两者混在一起会让"运维发现配置文件语法错了"和"产品负责人还没填映射"
+       表现成同一种"职责不注册"，无从分辨该找谁。
+
+    数据库连接串是必需配置，进程起得来就一定有，因此它不构成一个能变红的前置判定；
+    职责真正的运行前置（花名册今天更新过、银河有当前有效批次）是**数据**而不是配置，
+    由 ``run_once`` 每轮重新判定。
+    """
+
+    if not config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，每日权限重算职责不注册；其余定时职责照常运行", MASTER_KEY_ENV
+        )
+        return None, None
+
+    from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
+    from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+    from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+    from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
+    from lingxi.adapters.company_function_metric_map_file import (
+        load_company_function_metric_map,
+    )
+    from lingxi.adapters.role_function_map_file import load_role_function_map
+
+    try:
+        role_function_map = load_role_function_map()
+    except (OSError, ValueError) as error:
+        # 只记异常类型：配置解析失败的正文可能带上文件内容片段。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="role_function_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error(
+            "角色职能映射配置不可用，每日权限重算职责不注册 error=%s", type(error).__name__
+        )
+        return None, None
+
+    try:
+        metric_translation_map = load_company_function_metric_map(config.metric_map_path)
+    except (OSError, ValueError) as error:
+        # 同上：只记异常类型。**空映射不会走到这里**——它是合法内容，解析成功即返回；这里挡的是文件缺失或格式不对，二者都是部署配置问题，不是"内容还没填"。
+        audit.record(
+            "permission_refresh.duty_not_registered",
+            reason="metric_translation_map_unavailable",
+            error=type(error).__name__,
+        )
+        logger.error(
+            "公司+职能→指标名翻译映射配置不可用，每日权限重算职责不注册 error=%s",
+            type(error).__name__,
+        )
+        return None, None
+
+    publish_store = PostgresPermissionPublishStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
+    duty = PermissionRefreshDuty(
+        baseline_reader=PostgresRosterBaselineReader(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        roster_snapshot=PostgresRosterSnapshotStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        galaxy=PostgresGalaxySnapshotReader(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        decisions=publish_store,
+        # 同一个存储对象喂两个端口：一个只写权限决定，一个只读"发布过没有"。分成两个
+        # 参数是为了让撤权那条判据在类型上说得清楚（见 permission_refresh 的两个协议）。
+        publish_history=publish_store,
+        token_ciphers=PostgresMcpTokenStore(
+            config.postgres_dsn,
+            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+            timeouts=config.postgres_timeouts,
+        ),
+        role_function_map=role_function_map,
+        metric_translation_map=metric_translation_map,
+        audit=audit,
+        stop=stop, local_overrides=local_override_reader(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        legacy_source=legacy_source,
+    )
+    return duty, metric_translation_map
 
 
 __all__ = [
