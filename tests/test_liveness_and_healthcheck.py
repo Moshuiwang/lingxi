@@ -15,10 +15,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from postgres_schema import psycopg_available
+
 from lingxi.apps import healthcheck, liveness
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_DB = "LINGXI_POSTGRES_DSN 未设置：跳过需要真实数据库的健康检查断言"
+SKIP_DB = (
+    "LINGXI_POSTGRES_DSN 未设置：跳过需要真实数据库的健康检查断言"
+    if not DSN
+    else "LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动：跳过需要真实数据库的健康检查断言"
+)
 
 
 class LivenessFileTests(unittest.TestCase):
@@ -196,7 +202,7 @@ class HealthcheckLivenessCheckTests(unittest.TestCase):
                 )  # 不应抛异常
 
 
-@unittest.skipUnless(DSN, SKIP_DB)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_DB)
 class HealthcheckCommandRealDatabaseTests(unittest.TestCase):
     """端到端：真实 ``run()`` 入口对着一个真实可达的 PostgreSQL 判健康，
     对着一个明确不可达的连接串判不健康——不是只测内部函数分支。

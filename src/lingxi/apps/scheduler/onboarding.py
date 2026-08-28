@@ -801,6 +801,12 @@ def _build_onboarding_duty(
         ledger=store,
         audit=audit,
         role_function_map=role_function_map,
+        # 「公司+职能→指标名」翻译映射（Issue #227 / #346 修复）：与下面 ``publish_
+        # allowed`` 闸门共用**同一个已加载对象**（不在这里另读一份文件），供
+        # ``AutoOnboardingRunner._publish`` 调用 ``translate_company_functions`` 时
+        # 使用——此前 ``_publish`` 只用这个对象构造了布尔闸门、从未真正拿它翻译过
+        # 发布行的值列表（#346 坐实的缺陷）。
+        metric_translation_map=metric_translation_map,
         # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
         innertest_roster_gate=AutoOnboardingRunner.build_innertest_roster_gate(config.innertest_roster_open_ids),
         # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰

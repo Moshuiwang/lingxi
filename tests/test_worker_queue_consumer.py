@@ -58,11 +58,16 @@ from lingxi.core.execution.card_stream import (
     PROGRESS_ACTION_QUERYING,
     decode_progress_action,
 )
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_DB = "需要 LINGXI_POSTGRES_DSN 才能运行真库队列断言"
+SKIP_DB = (
+    "需要 LINGXI_POSTGRES_DSN 才能运行真库队列断言"
+    if not DSN
+    else "LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，无法运行真库队列断言"
+)
+POSTGRES_READY = bool(DSN) and psycopg_available()
 
 # Epic D 闸⑥：_process_task 现在按任务的 user_id 读
 # <user_env_root>/<user_id>/.mcp.json，读不到就失败关闭（结构上不存在回退到
@@ -2207,7 +2212,7 @@ class SemanticProgressTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(DSN, SKIP_DB)
+@unittest.skipUnless(POSTGRES_READY, SKIP_DB)
 class RealQueueTerminalTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -2817,7 +2822,7 @@ class RealQueueTerminalTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(DSN, SKIP_DB)
+@unittest.skipUnless(POSTGRES_READY, SKIP_DB)
 class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
     """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
     的完整链路——真库 + 真实临时目录，不在任何一段打桩。三个触发点各自排队的

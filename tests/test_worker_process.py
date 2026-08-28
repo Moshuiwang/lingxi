@@ -38,12 +38,17 @@ import time
 import unittest
 from pathlib import Path
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，队列 worker 真实子进程断言未验证"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，队列 worker 真实子进程断言未验证"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，队列 worker 真实子进程断言未验证"
+)
+POSTGRES_READY = bool(DSN) and psycopg_available()
 
 
 def _make_user_env_root(testcase: unittest.TestCase, *, seed_user_id: str | None = None) -> str:
@@ -78,7 +83,7 @@ def _make_user_env_root(testcase: unittest.TestCase, *, seed_user_id: str | None
     return str(directory)
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class QueueModeSigtermTest(unittest.TestCase):
     """真实子进程：空队列（没有可领取的任务）下，SIGTERM 必须让进程迅速、
     干净地退出——不等到 45 秒的停机预算耗尽（那个预算是"在途任务收口"的上限，
@@ -227,7 +232,7 @@ def _write_hanging_agent_sdk(directory: Path) -> None:
     (directory / "claude_agent_sdk.py").write_text(_HANGING_AGENT_SDK_SOURCE, encoding="utf-8")
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
     """真实子进程 + 在途任务：SIGTERM 后必须在停机预算内退出，任务保持
     ``running``（PR #173 独立复核 P1-3）。
@@ -399,7 +404,7 @@ class QueueModeSigtermWithInFlightTaskTest(unittest.TestCase):
         self.assertEqual(worker_id, self.WORKER_ID, "任务仍应记着是这次领取，没有被别的路径抢走")
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class QueueModeTerminalOutcomeLoggingTest(unittest.TestCase):
     """真实子进程 + 真实 PostgreSQL：终态收口低敏审计事件必须真正落到队列
     worker 进程的 stderr（Issue #90 评论 5306860255 独立复核 P1）。

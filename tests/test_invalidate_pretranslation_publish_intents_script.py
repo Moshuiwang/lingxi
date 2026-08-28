@@ -15,6 +15,8 @@ import unittest
 from io import StringIO
 from unittest import mock
 
+from postgres_schema import psycopg_available
+
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "invalidate_pretranslation_publish_intents.py"
 
@@ -41,8 +43,10 @@ class MissingDsnTest(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("LINGXI_POSTGRES_DSN"),
-    "跳过：未设置 LINGXI_POSTGRES_DSN，脚本的真库行为未验证（需真实 PostgreSQL 16）",
+    bool(os.environ.get("LINGXI_POSTGRES_DSN")) and psycopg_available(),
+    "跳过：未设置 LINGXI_POSTGRES_DSN，脚本的真库行为未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，脚本的真库行为未验证",
 )
 class RealDatabaseTest(unittest.TestCase):
     """真库对照：演练模式不写、``--apply`` 才写、且幂等。"""

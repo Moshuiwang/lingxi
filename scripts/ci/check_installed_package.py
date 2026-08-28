@@ -336,6 +336,12 @@ REQUIRED_MODULES = (
     # 首次开通编排的装配（Epic D / S-D-02）：由 `apps/gateway/__init__.py` 模块级
     # import，漏登记会直接让 gateway 起不来。
     "lingxi.apps.gateway.onboarding",
+    # 群聊@机器人固定引导（Issue #318，Trace #373 S-H1-2 纯移动拆出到独立模块）：
+    # `GroupMentionHintThrottle`/`GroupMentionHintResponder` 原实现在
+    # `apps/gateway/__init__.py`，现住在 `apps/gateway/group_mention_hint.py`；
+    # 由 `apps/gateway/__init__.py` 在**模块级** import，漏登记会直接让 gateway
+    # 起不来。
+    "lingxi.apps.gateway.group_mention_hint",
     # 首次开通编排的装配（Epic D / S-D-02）：产品负责人 2026-08-18 裁定后它住在
     # scheduler，由 `apps/scheduler/__init__.py` 在函数内 import。
     "lingxi.apps.scheduler.onboarding",
@@ -923,10 +929,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
-            # 群聊@机器人固定引导（Issue #318）：`GroupMentionHintResponder` 在
-            # `apps/gateway/__init__.py` **模块级** import `redact_identifier`，
-            # 把要发这条提示的 chat_id 记进日志（不是结构化审计字段，见该函数
-            # 内注释与 `V-花名册-34`）。
+            # 群聊@机器人固定引导（Issue #318，Trace #373 S-H1-2 纯移动拆出到
+            # `apps/gateway/group_mention_hint.py`）：`apps/gateway/__init__.py`
+            # 在**模块级** import 该子模块（构造 `GroupMentionHintResponder`
+            # 装配进 `build_supervisor`），该子模块自己再模块级 import
+            # `redact_identifier`，把要发这条提示的 chat_id 记进日志（不是结构化
+            # 审计字段，见该模块内注释与 `V-花名册-34`）。
+            "lingxi.apps.gateway.group_mention_hint",
             "lingxi.core.identity.identifiers",
             # `adapters/feishu_directory.py` 的在职状态读取口把成员详情折成
             # `core.identity.first_contact.EmploymentStatus`。gateway 本身不用那个读取口

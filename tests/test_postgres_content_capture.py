@@ -14,16 +14,20 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
 from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptureRecord
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，内测轮内容级采集的真库断言未验证"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，内测轮内容级采集的真库断言未验证"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，内测轮内容级采集的真库断言未验证"
+)
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class ContentCapturePostgresTestCase(unittest.TestCase):
     """本文件全部真库用例的共同底座。"""
 

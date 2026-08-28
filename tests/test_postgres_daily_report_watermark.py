@@ -13,13 +13,15 @@ import os
 import unittest
 from datetime import date
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_daily_report_watermark import PostgresDailyReportWatermark
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，内测每日通报送达水位的真库断言未验证"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，内测每日通报送达水位的真库断言未验证"
 )
 
 CHAT_A = "oc_fake_admin_group_a"
@@ -28,7 +30,7 @@ DAY_1 = date(2026, 8, 24)
 DAY_2 = date(2026, 8, 25)
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class DailyReportWatermarkPostgresTestCase(unittest.TestCase):
     """本文件全部真库用例的共同底座。"""
 

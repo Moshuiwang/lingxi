@@ -20,7 +20,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from postgres_schema import ensure_production_schema
+from postgres_schema import ensure_production_schema, psycopg_available
 
 from lingxi.adapters import postgres_roster_snapshot
 from lingxi.adapters.feishu_roster_bitable import (
@@ -32,7 +32,11 @@ from lingxi.adapters.feishu_roster_bitable import (
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，花名册快照的真库断言未验证（需真实 PostgreSQL 16）"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，花名册快照的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，花名册快照的真库断言未验证"
+)
 
 FAKE_NAME = "化名甲"
 FAKE_EMAIL = "jiaming.jia@example.invalid"
@@ -71,7 +75,7 @@ def _integrity(row_count: int) -> RosterIntegrity:
     )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class RosterSnapshotPostgresTestCase(unittest.TestCase):
     """真库断言的共同底座。"""
 

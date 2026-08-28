@@ -45,11 +45,15 @@ from lingxi.core.identity.provisioning import (
     ProvisioningRequest,
 )
 
-from postgres_schema import reset_production_rows
+from postgres_schema import psycopg_available, reset_production_rows
 
 FAKE_TOKEN = "fake-refresh-token-for-tests-only"
 DELEGATED_SUBJECT = "ou_delegated_authorization_subject"
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，数据库约束类断言未验证"
+)
 
 
 def member(
@@ -84,7 +88,7 @@ def batch(members: tuple[SnapshotMember, ...], *, app_keys: frozenset[str] | Non
     )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class IdentityPostgresTestCase(unittest.TestCase):
     """所有真库用例的共同底座：每个用例前重建 006 / 007 / 008 三张迁移的表。"""
 

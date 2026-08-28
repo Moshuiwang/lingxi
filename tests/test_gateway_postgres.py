@@ -23,7 +23,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from gateway_fakes import CallLog, FakeAudit, FakeOnboarding, FakeReactions, FakeReplies
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 from lingxi.adapters.postgres_conversation import (
     TASK_QUEUED_CHANNEL,
     PostgresGatewayStore,
@@ -33,7 +33,11 @@ from lingxi.core.conversation import BUSY_HINT_TEXT, EventPipeline, InboundMessa
 from lingxi.core.conversation.ports import HandledAs, OnboardingResult, OnboardingState
 from lingxi.core.ids import new_id
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，数据库约束类断言未验证（需真实 PostgreSQL）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，数据库约束类断言未验证"
+)
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
 
 
@@ -57,7 +61,7 @@ def inbound(
     )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class GatewayPostgresTestCase(unittest.TestCase):
     """所有 gateway 真库用例的共同底座：进程内建一次库，每个用例前只清行。"""
 
