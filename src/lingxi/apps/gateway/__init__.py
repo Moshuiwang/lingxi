@@ -802,7 +802,16 @@ def assemble_delivery_consumer(
     return build_delivery_consumer(
         client=client,
         queue=queue
-        or PostgresTaskQueue(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
+        or PostgresTaskQueue(
+            str(config.postgres_dsn),
+            timeouts=config.postgres_timeouts,
+            # S-H1-6（#359 根因取证方案第 2 条）：本实例只服务这一条单线程投递
+            # 消费循环（见模块说明「同一进程内跑两条独立职责」），安全打开常驻
+            # 轮询连接复用——`list_pending_delivery_tasks`/
+            # `list_uncertain_delivery_tasks` 从此持有并复用同一条连接，不再
+            # 每 poll_interval_seconds（默认 1s）新建一条物理连接。
+            reuse_polling_connection=True,
+        ),
         cards=cards,
         limit=config.delivery_batch_limit,
         on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,

@@ -60,7 +60,11 @@ class _TaskLifecycleMixin:
         改写（`V-灰度-01`）；迁移 013 的触发器兜底，这里写它会直接抛异常。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        # S-H1-6（#359 根因取证方案第 2 条）：这是 worker 主循环每个 poll_interval
+        # 都会执行一次的发现查询——即使空转也照样命中，因此走
+        # `_connect_for_polling`（默认逐字节等价于原来的 `connect(...)`，只有
+        # 装配方显式打开复用时才改为持有常驻连接，见该方法文档）。
+        with self._connect_for_polling() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE task SET status = 'running',
