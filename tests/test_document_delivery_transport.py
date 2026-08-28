@@ -5,7 +5,10 @@
 ① ``task_document_delivery_request.task_id`` 的 UNIQUE 约束真实生效（幂等键，
    真库断言，不用 mock）；
 ② 检查点恢复：注入"建档成功后崩溃"，续做时不二次 ``create_document``（spy 断言
-   恰一次调用），并从下一步续走到底；
+   恰一次调用），并从下一步续走到底，恢复后正文不重复（同一段落不出现两次）；
+②b（Issue #353）幂等判据封死"外部写成功但检查点未推进"的崩溃窗口：注入"正文
+   已经写入飞书、但进程在写检查点之前崩溃"，续做时读回正文根 block 判定非空，
+   跳过重驱 ``write_paragraphs``，正文全程单份；
 ③ ``read_members`` 不含目标 open_id 或档位不是 ``full_access`` → ``uncertain``，
    不得判 ``succeeded``；
 ④ definite 错误（飞书明确拒绝）→ ``failed`` + ``last_error``；
@@ -25,6 +28,13 @@
 - 删掉迁移 0074 的 ``task_id UNIQUE`` 约束 → ①红；
 - 把 ``DocumentDeliveryConsumer._process_claim`` 的 ``if document_id is None``
   判断去掉（每次都调用 ``create_document``）→ ②红；
+- 把 ``_process_claim`` 里 ``recovering_from_checkpoint`` 的幂等判据整段删掉
+  （恢复路径无条件重驱 ``write_paragraphs``）→ ②b 红（正文写两遍）；
+- 把 ``recovering_from_checkpoint and bool(...)`` 的判空条件写反（改成
+  ``not bool(...)``，即"非空才重写、空反而跳过"）→ ②b 红（方向倒了，正文写
+  两遍且首次路径反而会漏写）；
+- 让 ``recovering_from_checkpoint`` 恒为 ``False``（幂等判据分支永远不生效，
+  等价于把整条恢复分支废掉）→ ②b 红（正文写两遍）；
 - 把成功判据从"``read_members`` 确认 full_access"改成"四步没有抛异常就
   succeeded"（去掉 ``_has_confirmed_full_access`` 校验）→ ③红；
 - 把 ``adapters/postgres_document_delivery.py`` 四个 ``mark_*`` 的 ``rowcount``
@@ -106,6 +116,7 @@ class _SpyDocx:
         self.write_calls: list[tuple[str, list[str]]] = []
         self.grant_calls: list[tuple[str, str]] = []
         self.read_calls: list[str] = []
+        self.read_body_children_calls: list[str] = []
         self._create_result = create_result
         self._members = members
 
@@ -117,6 +128,22 @@ class _SpyDocx:
 
     def write_paragraphs(self, document_id: str, paragraphs: list[str]) -> None:
         self.write_calls.append((document_id, list(paragraphs)))
+
+    def read_body_children(self, document_id: str) -> list[dict[str, Any]]:
+        """Issue #353 幂等判据的假实现：一份文档"是否已经写过正文"完全由
+        ``write_calls`` 里是否已经有过针对这个 ``document_id`` 的写入决定——不
+        单独维护一份影子状态，就是"外部系统真实发生过什么"这件事本身，与生产
+        实现（读飞书真实 block 列表）对应的语义完全一致：写没写过，读回就照实
+        反映什么。
+        """
+
+        self.read_body_children_calls.append(document_id)
+        return [
+            {"block_type": 2, "text": text}
+            for doc_id, paragraphs in self.write_calls
+            if doc_id == document_id
+            for text in paragraphs
+        ]
 
     def grant_full_access(self, document_id: str, open_id: str) -> None:
         self.grant_calls.append((document_id, open_id))
@@ -398,9 +425,17 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
         self.assertEqual(processed, 1)
         self.assertEqual(docx.create_calls, ["标题"], "create_document 全程只应被调用一次")
+        # Issue #353：这个用例里"崩溃"发生在检查点提交之后、write_paragraphs
+        # 从未被调用过之前——恢复读回正文根 block 应为空，write_paragraphs 照常
+        # 被调用恰一次，不多不少。
+        self.assertEqual(docx.read_body_children_calls, ["doc-checkpoint-1"])
         self.assertEqual(len(docx.write_calls), 1)
         self.assertEqual(len(docx.grant_calls), 1)
         self.assertEqual(len(docx.read_calls), 1)
+        # 恢复后正文不重复：全程写入的段落逐段恰好各出现一次，不是"段落一/段落二"
+        # 各出现两次。
+        all_written_paragraphs = [text for _, paragraphs in docx.write_calls for text in paragraphs]
+        self.assertEqual(all_written_paragraphs, ["段落一", "段落二"])
         self.assertEqual(
             self.scalar("SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
             "succeeded",
@@ -416,6 +451,100 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         )
         self.assertEqual(len(notifier.sent), 1)
         self.assertEqual(notifier.sent[0][0], self.REQUESTER_OPEN_ID)
+
+    def test_checkpoint_recovery_after_body_already_written_skips_rewrite_and_stays_single_copy(
+        self,
+    ) -> None:
+        """Issue #353 崩溃窗口用例：正文已经真实写入飞书，但进程在写下一个检查点
+        （或任何后续动作）之前就崩溃了——不存在"写正文已完成"这个本地记录，唯一
+        能封死这个窗口的判据是读外部系统的真实状态。
+
+        阶段一手工模拟"外部写成功、进程随后崩溃"：认领、建档、写检查点、直接调用
+        一次 ``docx.write_paragraphs``（代表这次外部调用确实成功了），到此为止不
+        再往下走——不调用 grant_full_access/read_members/mark_succeeded，模拟
+        进程就在这一刻死掉，这一行停在 ``processing``、``document_id`` 已经非空。
+
+        阶段二回收 + 全新消费者续做：读回判定正文非空，跳过重驱
+        ``write_paragraphs``，直接继续 grant_full_access/read_members，最终成功。
+
+        变异锚点：把 ``_process_claim`` 幂等判据删掉/写反/废掉（见模块文档字符串
+        变异锚点列表），本用例应变红——``write_calls`` 会变成 2（同一份正文写
+        两遍）。
+        """
+
+        self._seed_pending_request(request_id="tdd-crash-window")
+        docx = _SpyDocx(
+            create_result="doc-crash-window-1",
+            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+        )
+        notifier = _SpyNotifier()
+
+        # 阶段一：认领 + 建档 + 检查点提交 + 正文外部写入成功，随后"崩溃"。
+        claims = self.store.claim_pending(limit=1)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        document_id = docx.create_document(claim.title)
+        self.store.mark_document_created(request_id=claim.id, document_id=document_id)
+        docx.write_paragraphs(document_id, list(claim.paragraphs))
+        self.assertEqual(docx.create_calls, ["标题"])
+        self.assertEqual(len(docx.write_calls), 1, "阶段一：外部写入确实发生了恰一次")
+
+        # 回拨 updated_at 模拟"卡住了一段时间"，让 reclaim_stale_processing 能捞到。
+        self.execute(
+            "UPDATE task_document_delivery_request SET updated_at = now() - interval '10 minutes' WHERE id = %s",
+            (claim.id,),
+        )
+
+        # 阶段二：全新消费者续做——同一个 docx（代表同一个外部飞书系统），
+        # document_id 已经检查点持久化，读回判定正文非空，跳过重驱写正文。
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(docx.create_calls, ["标题"], "create_document 全程只应被调用一次")
+        self.assertEqual(docx.read_body_children_calls, ["doc-crash-window-1"])
+        self.assertEqual(
+            len(docx.write_calls), 1, "write_paragraphs 全程只应被调用一次——恢复路径必须跳过重驱"
+        )
+        all_written_paragraphs = [text for _, paragraphs in docx.write_calls for text in paragraphs]
+        self.assertEqual(all_written_paragraphs, ["段落一", "段落二"], "正文不得重复出现")
+        self.assertEqual(len(docx.grant_calls), 1)
+        self.assertEqual(len(docx.read_calls), 1)
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            "succeeded",
+        )
+        self.assertEqual(
+            self.scalar("SELECT document_id FROM task_document_delivery_request WHERE id = %s", (claim.id,)),
+            "doc-crash-window-1",
+        )
+        self.assertEqual(len(notifier.sent), 1)
+
+    def test_first_time_path_never_calls_read_body_children_and_behaves_unchanged(
+        self,
+    ) -> None:
+        """首次路径回归（Issue #353）：``document_id`` 本次调用才建出来时，行为
+        必须与修复前逐字相同——不多调用一次 ``read_body_children``，``write_
+        paragraphs`` 正常无条件被调用恰一次。"""
+
+        self._seed_pending_request(request_id="tdd-first-time")
+        docx = _SpyDocx(
+            create_result="doc-first-time-1",
+            members=[{"member_type": "openid", "member_id": self.REQUESTER_OPEN_ID, "perm": "full_access"}],
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=docx, notifier=notifier)
+
+        processed = consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(docx.create_calls, ["标题"])
+        self.assertEqual(docx.read_body_children_calls, [], "首次路径不得多做这次读回")
+        self.assertEqual(len(docx.write_calls), 1)
+        self.assertEqual(
+            self.scalar("SELECT status FROM task_document_delivery_request WHERE id = 'tdd-first-time'"),
+            "succeeded",
+        )
 
     # -- ③ read_members 判据 ----------------------------------------------------
 

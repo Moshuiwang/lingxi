@@ -361,6 +361,78 @@ class ReadMembersTest(unittest.TestCase):
             client.read_members(DOCUMENT_ID)
 
 
+class ReadBodyChildrenTest(unittest.TestCase):
+    """Issue #353 幂等判据新增方法：读回正文根 block 的现有子块。"""
+
+    def test_a_successful_read_returns_the_existing_children(self) -> None:
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"block_id": "blk-1", "block_type": 2, "text": {"elements": []}},
+                        ]
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        children = client.read_body_children(DOCUMENT_ID)
+
+        self.assertEqual(len(transport.calls), 1)
+        method, url, body, token = transport.calls[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertIsNone(body)
+        self.assertEqual(token, FAKE_TOKEN)
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["block_id"], "blk-1")
+
+    def test_a_freshly_created_document_has_no_children(self) -> None:
+        """判据的正常起点：从未写过正文的文档，根 block 的子块应当是空列表。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {"items": []}}])
+        client = _client(transport)
+
+        self.assertEqual(client.read_body_children(DOCUMENT_ID), [])
+
+    def test_a_blank_document_id_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.read_body_children("   ")
+
+        self.assertEqual(transport.calls, [])
+
+    def test_a_feishu_business_error_code_is_rejected(self) -> None:
+        transport = RecordingTransport([{"code": 99991400, "msg": "rate limited"}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.read_body_children(DOCUMENT_ID)
+
+        self.assertEqual(raised.exception.code, "feishu_code_99991400")
+
+    def test_a_success_response_missing_items_is_a_lookup_error(self) -> None:
+        """结果不明：响应成功但没有可回读的 ``items`` 字段——不能当成"确定为空"，
+        否则会把"读不出真实状态"悄悄误判成"正文没写过"，让恢复路径继续重驱写
+        正文，正是这条判据要防的洞。
+
+        变异锚点：把这里"检查 items 是否是 list"这条判据删掉、直接
+        ``return data.get("items") or []``，本用例会从抛出 ``LookupError``
+        变红成返回 ``[]``。
+        """
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+
+        with self.assertRaises(LookupError):
+            client.read_body_children(DOCUMENT_ID)
+
+
 class DocumentUrlTest(unittest.TestCase):
     def test_the_url_is_built_from_the_configured_tenant_domain_with_no_network_call(self) -> None:
         transport = RecordingTransport([])

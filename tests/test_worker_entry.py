@@ -169,6 +169,7 @@ class FakeAgentSDK:
         skip_pre_tool_use: bool = False,
         resume_miss_stderr_line: str | None = None,
         resume_miss_persists: bool = False,
+        mcp_status: dict | None = None,
     ) -> None:
         self.script = list(script)
         self.options = []
@@ -204,6 +205,13 @@ class FakeAgentSDK:
         # 场景——前者验证降级只发生一次，后者验证没有 resume 就不会进入降级
         # 分支，即使特征信号照样出现。
         self.resume_miss_persists = resume_miss_persists
+        # MCP 会话级连接失败审计（Issue #349 剩余范围，Gate G-2 结论 A）：默认
+        # 「没有配置任何 MCP server」这个最贴近现状的空载荷，与改动前的行为
+        # 逐字等价——没有 server 就没有 failed/needs-auth，`_audit_mcp_status`
+        # 不发任何事件，因此本仓库全部既有用例（含 F-1 熔断用例）不需要因为
+        # 这次改动而改写任何既有断言。要断言审计事件的新用例显式传入非空值。
+        self.mcp_status: dict = mcp_status if mcp_status is not None else {"mcpServers": []}
+        self.mcp_status_calls = 0
 
     def install(self, testcase) -> "FakeAgentSDK":
         module = types.ModuleType("claude_agent_sdk")
@@ -254,6 +262,10 @@ class FakeAgentSDK:
                 ):
                     return harness._play_resume_miss(self.options)
                 return harness._play(self.options)
+
+            async def get_mcp_status(self):
+                harness.mcp_status_calls += 1
+                return harness.mcp_status
 
         return StubClient
 
@@ -2481,6 +2493,422 @@ class ToolCallProgressWiringTest(unittest.TestCase):
         report = asyncio.run(executor.run_turn(config.question))
 
         self.assertTrue(report["turn"]["closed"])
+
+
+class WrapperDenialFuseWiringTest(unittest.TestCase):
+    """Issue #352：包装拒绝熔断经真实装配路径接到 ``apps/worker/turn.py`` 的
+    回合编排。``ToolGateway`` 的计数/触发去抖断言在
+    ``tests/test_execution_tool_gate.py::WrapperDenialFuseTest``；本文件证明的
+    是"熔断触发之后回合真的按现有失败文案快速失败"，以及"真的向 SDK 会话发出
+    了 interrupt() 请求，不是等回合自然烧完再贴标签"。
+
+    与本文件其余用例同一姿态：假 SDK 只能证明"本侧装配是通的"，证明不了真实
+    SDK 会触发这些事件（那是 L4a 的职责）。
+    """
+
+    @staticmethod
+    def _wrapper_style_denied_step(index: int) -> dict:
+        """摹写 Issue #352 现象：模型用内置 ``Bash`` 包装调用 ``claude mcp
+        call`` 绕过白名单，而不是直接调用被拒的原生工具。"""
+
+        return {
+            "kind": "tool",
+            "tool": "Bash",
+            "input": {"command": f"claude mcp call query_metric --arg {index}"},
+        }
+
+    def test_five_wrapper_denials_trip_the_fuse_and_reuse_the_max_turns_failure_path(
+        self,
+    ) -> None:
+        """正用例：同回合累计 5 次达标拒绝 → 熔断 → 复用现有「达到单次处理轮数
+        上限」失败路径（``max_turns_exceeded``），不是新造的文案；``apps/worker/
+        service.py::_failure_content`` 现成分支会把这个 code 映射到
+        ``worker.max_turns`` 文案（本文件不复测那条映射本身，只钉住 code）。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(5)] + [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+        ]
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNotNone(report["failure"])
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertEqual(report["audit"]["denied_count"], 5)
+        self.assertTrue(report["turn"]["guard_triggered"])
+        self.assertEqual(report["turn"]["termination_state"], "guarded")
+        self.assertFalse(report["turn"]["closed"])
+
+    def test_four_wrapper_denials_do_not_trip_the_fuse_and_the_turn_closes_normally(
+        self,
+    ) -> None:
+        """否定用例：未达阈值时行为必须与现状逐字相同——回合正常收口，没有失败，
+        不触发护栏。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(4)] + [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "日活是 1024；其余部分我无法查询。"},
+        ]
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 4)
+        self.assertTrue(report["turn"]["closed"])
+        self.assertFalse(report["turn"]["guard_triggered"])
+
+    def test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_denial_count(
+        self,
+    ) -> None:
+        """跨回合不累计：连续两次 ``run_turn()``、每次都只有 4 次拒绝（未达阈值）。
+        若熔断计数没有在每次尝试开头清零，第二次会带着第一次的计数一起超过阈值，
+        提前熔断——这条用例钉住 ``apps/worker/turn.py`` 确实在每次尝试开头调用
+        了 ``ToolGateway.reset_wrapper_denial_fuse()``。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(4)] + [
+            {"kind": "text", "text": "其余部分我无法查询。"},
+        ]
+        report, _fake, _executor = run_turn(self, script, turns=2)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 4)
+
+    def test_the_fuse_asks_the_sdk_to_interrupt_instead_of_burning_the_full_script(
+        self,
+    ) -> None:
+        """熔断必须真的向 SDK 会话请求中断，不是等整段脚本自然烧完再改标签——
+        与 ``apps/worker/turn.py`` 里已经过验证的 "/stop → interrupt()" 是同一
+        条路径（见 ``StopCausalTerminationTest``），这里证明包装拒绝熔断也走
+        上了这条路径。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(10)]
+        FakeAgentSDK(script).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_calls: list[str] = []
+        base_client = module.ClaudeSDKClient
+
+        class InterruptRecordingClient(base_client):  # type: ignore[misc, valid-type]
+            async def interrupt(self):
+                interrupt_calls.append("called")
+
+            def receive_response(self):
+                inner = super().receive_response()
+
+                async def _gen():
+                    async for message in inner:
+                        yield message
+                        # 真实 SDK 的 receive_response() 由子进程管道驱动，消息
+                        # 之间天然有 I/O 挂起，中断监听任务才有机会被调度到；
+                        # 假 SDK 是纯内存回放、脚本步骤之间不会真的让出事件
+                        # 循环，这里显式插入一个真正的挂起点来还原这一点，不然
+                        # 熔断即使触发也永远没有机会真正打断脚本回放。
+                        await asyncio.sleep(0)
+
+                return _gen()
+
+        module.ClaudeSDKClient = InterruptRecordingClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        config = load_config(worker_env())
+        report = asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+
+        self.assertEqual(interrupt_calls, ["called"], "熔断必须真的请求 SDK 中断一次")
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertLess(
+            report["audit"]["denied_count"],
+            10,
+            "中断生效后不应该把脚本剩余的拒绝全部烧完，回合必须提前终止",
+        )
+
+    def test_the_fuse_trip_leaves_a_structured_worker_audit_event(self) -> None:
+        """熔断触发时必须留结构化审计痕迹（沿用既有 ``worker.*`` 事件习惯），
+        供后续 L6 机会型观察。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(5)]
+        FakeAgentSDK(script).install(self)
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id="tsk-fuse-1"))
+
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.wrapper_denial_fuse_tripped"]
+        self.assertEqual(len(events), 1, "熔断只应该通知一次，不能每多一次拒绝就重复留痕")
+        self.assertEqual(events[0]["denied_count"], 5)
+        self.assertEqual(events[0]["threshold"], 5)
+        self.assertEqual(events[0]["task_id"], "tsk-fuse-1")
+        self.assertEqual(events[0]["trace_id"], config.trace_id)
+
+    def test_a_stop_event_still_reaches_the_sdk_when_the_fuse_never_trips(self) -> None:
+        """回归锁：包装拒绝熔断新增的转发机制不得影响既有 `/stop` 行为——熔断从
+        未触发时，外部 `stop_event` 依然要能让回合以 ``interrupted`` 收口，与
+        ``StopCausalTerminationTest`` 断言的既有姿态一致。"""
+
+        FakeAgentSDK([]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_sent = asyncio.Event()
+
+        class RacingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def interrupt(self):
+                interrupt_sent.set()
+                await asyncio.sleep(3600)
+
+            def receive_response(self):
+                async def _gen():
+                    await interrupt_sent.wait()
+                    yield StubResultMessage(
+                        subtype="error_during_execution",
+                        is_error=True,
+                        terminal_reason="aborted_streaming",
+                    )
+
+                return _gen()
+
+        module.ClaudeSDKClient = RacingClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        async def scenario():
+            stop_event = asyncio.Event()
+            stop_event.set()
+            return await executor.run_turn(config.question, stop_event=stop_event)
+
+        report = asyncio.run(scenario())
+
+        self.assertEqual(report["failure"]["code"], "interrupted")
+
+    def test_a_prior_granted_native_mcp_call_suppresses_the_trip_end_to_end(self) -> None:
+        """P2-1 裁定（触发口径收窄到"拒绝达阈值 且 本回合零次放行原生 MCP 调用"）
+        端到端接线证明：本回合已经放行过一次原生 MCP 调用之后，即使随后包装
+        拒绝次数达到阈值，回合也必须正常收口——不是只在 ``ToolGateway`` 单元
+        测试（``tests/test_execution_tool_gate.py::WrapperDenialFuseTest``）里
+        自证，而是真的走一遍 ``apps/worker/turn.py`` 的编排、真实中断监听协程。
+        """
+
+        script = (
+            [{"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()}]
+            + [self._wrapper_style_denied_step(i) for i in range(5)]
+            + [{"kind": "text", "text": "日活是 1024；其余部分我无法查询。"}]
+        )
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 5)
+        self.assertTrue(report["turn"]["closed"])
+        self.assertFalse(report["turn"]["guard_triggered"])
+
+    def test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_granted_mcp_count(
+        self,
+    ) -> None:
+        """独立审查 P3-5 关注点：P2-1 新增的合取项计数同样必须是"同一回合内"
+        的窗口状态——第一次 ``run_turn()`` 里放行过的原生 MCP 调用，不得残留
+        到第二次调用、把本该正常触发的熔断错误地拦下来。``apps/worker/turn.py``
+        的 while 循环在**每一次尝试**开头（含 resume-fallback 在同一次
+        ``run_turn()`` 调用内发起的第二次尝试）都会调用同一处
+        ``ToolGateway.reset_wrapper_denial_fuse()``——这里用两次独立的顶层
+        ``run_turn()`` 调用复现同一条清零路径，与既有
+        ``test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_denial_
+        count`` 对 ``wrapper_denial_count`` 的验证方式同一姿态。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        granted_script = [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "日活是 1024。"},
+        ]
+        fake = FakeAgentSDK(granted_script).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        report_first = asyncio.run(executor.run_turn(config.question))
+        self.assertIsNone(report_first["failure"])
+
+        fake.script = [self._wrapper_style_denied_step(i) for i in range(5)]
+        report_second = asyncio.run(executor.run_turn(config.question))
+
+        self.assertEqual(
+            report_second["failure"]["code"],
+            "max_turns_exceeded",
+            "上一次调用放行过的原生 MCP 调用不得残留到这一次，熔断必须正常触发",
+        )
+        self.assertTrue(report_second["turn"]["guard_triggered"])
+
+
+class McpStatusAuditTest(unittest.TestCase):
+    """MCP 会话级连接失败审计埋点（Issue #349 剩余范围，Trace #358 S-F-2，Gate G-2
+    结论 A：直接埋点）。
+
+    与本文件其余用例同一姿态：假 SDK 只能证明"本侧装配是通的"——`get_mcp_status()`
+    真的会在真实链路上返回什么、CLI 版本是否支持这个 control subtype，只有
+    `biai-stage` 的 L4a 能答（见 Gate G-2 结论的"实现前需补验的边界"）。
+    """
+
+    def _run(self, *, mcp_status: dict, task_id: str | None = "tsk-mcp-1"):
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        fake = FakeAgentSDK(
+            [{"kind": "text", "text": "日活 1024。"}], mcp_status=mcp_status
+        ).install(self)
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id=task_id))
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.mcp_server_unavailable"]
+        return report, fake, events
+
+    def test_mixed_statuses_emit_exactly_one_event_per_failed_or_needs_auth_server(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "connected"},
+                    {"name": "billing", "status": "failed", "error": "connection refused"},
+                    {"name": "roster", "status": "needs-auth", "error": "token expired"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1, "同一回合只应该查一次 MCP 状态，不轮询")
+        self.assertEqual(len(events), 2)
+        by_server = {event["server"]: event for event in events}
+        self.assertEqual(by_server["billing"]["status"], "failed")
+        self.assertEqual(by_server["billing"]["error"], "connection refused")
+        self.assertEqual(by_server["roster"]["status"], "needs-auth")
+        self.assertEqual(by_server["roster"]["error"], "token expired")
+        for event in events:
+            self.assertEqual(event["task_id"], "tsk-mcp-1")
+            self.assertEqual(event["trace_id"], "01J0000000000000000TEST000")
+            self.assertEqual(event["level"], "warning")
+
+    def test_all_connected_servers_emit_zero_events(self) -> None:
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "connected"},
+                    {"name": "billing", "status": "connected"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(events, [])
+
+    def test_pending_and_disabled_are_not_treated_as_failures(self) -> None:
+        """G-2 已知边界：`pending`（慢连接、`__aenter__()` 返回时还没到终态）与
+        `disabled`（部署/用户主动关闭）都不是故障态，不得被计入
+        ``mcp_server_unavailable``——判定只认 `failed`/`needs-auth` 两种。"""
+
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "slow", "status": "pending"},
+                    {"name": "off", "status": "disabled"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(events, [])
+
+    def test_error_text_carries_no_credential_shaped_content(self) -> None:
+        """范围红线：审计事件不含任何凭据形状字段——error 文本经既有脱敏规则
+        （与 `WorkerOutputRedactionTest` 同一条 `redact_free_text` 底线）。"""
+
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "billing", "status": "failed", "error": f"token={FAKE_CREDENTIAL}"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(FAKE_CREDENTIAL, events[0]["error"])
+        # 变异锚点：把发送字段从「name/status/error」扩成整份 server dict 会带上
+        # `config`/`tools`/`serverInfo`；这条断言钉住事件里只有这三个业务字段
+        # （加上通用的 trace_id/level/event/task_id），不会顺带带出别的键。
+        self.assertEqual(
+            set(events[0]) - {"trace_id", "level", "event", "task_id"},
+            {"server", "status", "error"},
+        )
+
+    def test_missing_or_malformed_status_shapes_are_ignored_not_guessed(self) -> None:
+        """``get_mcp_status()`` 形状不对时如实什么都不做，不猜测——与本仓库
+        "护栏要收紧的是命中了却被当成成功，不是形状可疑就一律判失败"同一纪律。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+
+        for malformed in (
+            None,
+            {},
+            {"mcpServers": "not-a-list"},
+            "unexpected",
+            {"mcpServers": [1, 2, "not-a-dict"]},
+            {"mcpServers": [{"status": "failed"}]},  # 缺 name，仍然应该发事件但 server=None
+        ):
+            with self.subTest(malformed=malformed):
+                executor._audit_mcp_status(malformed)
+
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.mcp_server_unavailable"]
+        # 唯一应该产出事件的输入是最后一档（合法 server 记录只是缺 name）。
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["server"])
+        self.assertEqual(events[0]["status"], "failed")
+
+    def test_get_mcp_status_raising_does_not_fail_the_turn_and_leaves_a_trace(self) -> None:
+        """``get_mcp_status()`` 自身异常不得让回合失败（观测缺口修复不能反过来
+        制造新的故障面）；异常经既有 stderr 通道（`worker.sdk.stderr`）留痕。"""
+
+        FakeAgentSDK([{"kind": "text", "text": "日活 1024。"}]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        base_client = module.ClaudeSDKClient
+
+        class FailingMcpStatusClient(base_client):  # type: ignore[misc, valid-type]
+            async def get_mcp_status(self):
+                raise RuntimeError("mcp status probe boom")
+
+        module.ClaudeSDKClient = FailingMcpStatusClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-err"))
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        sdk_stderr_lines = [line for line in lines if line["event"] == "worker.sdk.stderr"]
+        self.assertTrue(
+            any("get_mcp_status probe failed" in line.get("line", "") for line in sdk_stderr_lines),
+            "探针异常必须经既有 worker.sdk.stderr 通道留痕",
+        )
+        self.assertFalse(
+            any(line["event"] == "worker.mcp_server_unavailable" for line in lines),
+            "探针失败时不应该伪造任何 server 的审计事件",
+        )
 
 
 if __name__ == "__main__":

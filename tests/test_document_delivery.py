@@ -402,9 +402,10 @@ class RunTurnReportContractTest(unittest.TestCase):
             clock=None,
             on_business_duration=None,
             on_interrupt_requested=None,
+            on_mcp_status=None,
         ):
             del options, prompt, timeout_seconds, resume_session_id
-            del stop_event, drain_grace_seconds, clock, on_interrupt_requested
+            del stop_event, drain_grace_seconds, clock, on_interrupt_requested, on_mcp_status
             executor._handle_deliver_document(title, markdown)
             if fail:
                 raise TimeoutError("simulated turn timeout")
