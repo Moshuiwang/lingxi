@@ -153,7 +153,14 @@ def verified_candidate(
             return pr, document
         if len(runs) < 100:
             break
-    raise CandidateError(f"找不到 PR #{pr['number']} 对应且内容一致的成功 Epic Full 候选证明")
+    raise CandidateError(
+        f"找不到 PR #{pr['number']} 对应且内容一致的成功 Epic Full 候选证明。"
+        "最常见成因（2026-08-28 Trace #373 H1 实例）：epic/* → main 的 PR 首跑只在 PR 头提交带"
+        "独占一行的 git trailer `Image-Candidate: true` 时才构建镜像与候选证明（ci.yml image job"
+        " 的 Issue #278 条件）；漏了标记则 Epic Full 绿但无证明，本检查失败关闭。补救：给 epic 分支"
+        "补一个带该 trailer 的提交重新走 PR，或由具备 Actions 写权限者重跑该 Epic Full run"
+        "（attempt≥2 无条件构建），或从非 epic/* 分支重走一次 PR。"
+    )
 
 
 def main() -> int:
