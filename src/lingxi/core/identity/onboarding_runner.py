@@ -251,6 +251,10 @@ from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_
 from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
+from lingxi.core.permission.metric_translation import (
+    UncoveredPermissionCombination,
+    translate_company_functions,
+)
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
@@ -293,6 +297,7 @@ class AutoOnboardingRunner:
         ledger: DispatchLedger,
         audit: _AuditSink,
         role_function_map: Mapping[str, str],
+        metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
         innertest_roster_gate: Callable[[str], bool],
         delegated_subject: Callable[[], str | None],
         submit: Callable[[Callable[[], None]], bool],
@@ -340,6 +345,14 @@ class AutoOnboardingRunner:
         self._ledger = ledger
         self._audit = audit
         self._role_function_map = role_function_map
+        # 「公司+职能→指标名」翻译映射（Issue #227 / #346 修复）：与 ``publish_allowed``
+        # 闸门共用装配层加载的**同一个对象**（``apps/scheduler/onboarding.py`` 的
+        # ``_build_onboarding_duty``），不在这里另读一份文件。``None``（未加载/加载
+        # 失败）与空映射在使用处按同一个结论处理——归一化成 ``{}``，交给
+        # ``translate_company_functions`` 自己判定 fail-closed（见 ``_publish``），
+        # 不在构造期额外做一次判断，理由与 ``permission_refresh._refresh_user`` 同一
+        # 处注释一致：这条逐用户判据的正确性不该依赖"调用方一定会先做整轮判据"。
+        self._metric_translation_map = metric_translation_map or {}
         self._innertest_roster_gate = innertest_roster_gate
         self._delegated_subject = delegated_subject
         self._submit = submit
@@ -1115,9 +1128,47 @@ class AutoOnboardingRunner:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
             # 没有"这一行是谁的"的答案。归确定性业务失败，不是本侧故障。
             return _not_authorized("archived_identity_incomplete")
+        # 翻译「公司 + 职能」→ 指标名（Issue #227 / #346 修复）：与每日重算
+        # （`permission_refresh.py::_refresh_user`）共用同一个纯函数
+        # `translate_company_functions`，不复制翻译逻辑——两个写发布行的调用点因此
+        # 产出同一语义的值列表（均为指标名，不是未翻译的职能标签）。整轮判据（映射
+        # 整体为空）已经在 `_match` 里挡住（`publish_allowed`，Issue #227 开通侧
+        # 整合），这里仍然按 `error.mapping_is_empty` 的真实值分类而不是硬编码，
+        # 理由同 `permission_refresh._refresh_user` 同一处注释：不让这条逐用户判据
+        # 的正确性依赖"调用方一定会先做整轮判据"这条外部不变量。
+        try:
+            company_metrics = translate_company_functions(
+                companies=aggregate.companies,
+                functions=aggregate.functions,
+                all_companies=aggregate.all_companies,
+                mapping=self._metric_translation_map,
+            )
+        except UncoveredPermissionCombination as error:
+            # fail-closed（#346）：存在未覆盖的「公司 + 职能」组合时，这条开通链
+            # **整条**拒绝发布——不猜测、不回落成未翻译的职能标签、不产出部分结果
+            # （`metric_translation.py` 模块文档「fail-closed」一节同一条纪律）。
+            # 这不是"银河说他没有权限"（`aggregate.granted` 已经为真），是我们这
+            # 一侧的翻译内容缺口，因此归本侧故障（`_internal`），不落
+            # `_not_authorized`——后者会把一个权限完全正常的人错误地引去银河申请一个
+            # 他已经有的权限。走到这里之前 `record_decision` 从未被调用，外部表零
+            # 写入。
+            self._audit.record(
+                "onboarding.publish_gate_closed",
+                user=user_id,
+                reason=(
+                    "permission_translation_unavailable"
+                    if error.mapping_is_empty
+                    else "permission_translation_uncovered"
+                ),
+            )
+            return _internal(
+                "permission_translation_unavailable"
+                if error.mapping_is_empty
+                else "permission_translation_uncovered"
+            )
         # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328），接线点在这里而非更早的 `_match`——本地覆盖的 `user_id` 是内部 `app_user.id`，聚合时还没有它。
-        # `galaxy` 是现算的职能标签映射（onboarding 尚未接翻译层），详见 `merge_sources.py` 模块文档「挂点」一节；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
-        galaxy_map = {ALL_COMPANIES_KEY: aggregate.functions} if aggregate.all_companies else {company: aggregate.functions for company in aggregate.companies}
+        # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
+        galaxy_map = company_metrics
         local = self._resolve_local_overrides(user_id)
         legacy = self._resolve_legacy_source(user_id, request.email, galaxy_map)
         merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=legacy)

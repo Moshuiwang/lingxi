@@ -58,6 +58,7 @@ from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.metric_translation import translate_company_functions
 from lingxi.core.permission.publish import ExistingPermissionRow
 
 UTC = timezone.utc
@@ -90,6 +91,16 @@ ROLE_ROWS = ({"user_id": "g_1", "role_id": "r_1", "role_name": "销售分析师"
 DATACOUNTRY_ROWS = ({"user_id": "g_1", "datacountry_id": "c_1"},)
 COUNTRY_ROWS = ({"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},)
 ROLE_FUNCTION_MAP = {"销售分析师": "销售分析"}
+#: 「公司+职能→指标名」翻译映射（Issue #227 / #346）默认夹具：**恒等**翻译（职能
+#: 标签"销售分析"逐字符翻译成同名指标名），让本文件绝大多数既有断言（此前编码的是
+#: 修复前"未翻译"行为，值列表恰好都是"销售分析"）在 `_publish` 真正接入
+#: `translate_company_functions` 之后原样成立，同时仍然真实走一遍翻译层——正向/
+#: 否定/变异专用断言见 ``PublishTranslationTests``，它用一个翻译结果与职能标签
+#: **不同**的映射，证明翻译真的发生了（恒等映射本身无法区分"翻译过"与"直接透传"）。
+METRIC_TRANSLATION_MAP: Mapping[str, Mapping[str, Sequence[str]]] = {
+    "88": {"销售分析": ("销售分析",)},
+    "99": {"销售分析": ("销售分析",)},
+}
 
 
 # ----------------------------------------------------------------------
@@ -538,6 +549,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         ledger=parts["ledger"],
         audit=parts["audit"],
         role_function_map=overrides.get("role_function_map", ROLE_FUNCTION_MAP),
+        metric_translation_map=overrides.get("metric_translation_map", METRIC_TRANSLATION_MAP),
         # 默认放行：本文件绝大多数用例守的是名单闸**之后**的链路，不该被这道新增的
         # 前置闸挡住。内测名单闸自身的行为由 `InnerTestRosterGateTests` 专门覆盖。
         innertest_roster_gate=overrides.get("innertest_roster_gate", lambda open_id: True),
@@ -692,9 +704,11 @@ class LocalOverrideMergeTests(unittest.TestCase):
     """开通侧的四源合并接线（S-P-3，Issue #319）：与
     ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 同一组断言，
     证明两个调用点消费的是同一个 ``merge_permission_sources``。开通侧的 ``galaxy``
-    输入是**未翻译**的职能标签映射（onboarding 目前不调用翻译层，见
-    ``merge_sources`` 模块文档「挂点」一节），本地覆盖的指标名字符串仍然精确并入/
-    减去，不受周围标签影响。"""
+    输入自 #346 修复起是 ``translate_company_functions`` **翻译后**的指标名映射
+    （与每日重算同一条路径，见 ``merge_sources`` 模块文档「挂点」一节
+    「2026-08-28 更正」；本文件默认夹具 ``METRIC_TRANSLATION_MAP`` 对"销售分析"是
+    恒等翻译，因此本类既有断言的值列表原样成立），本地覆盖的指标名字符串仍然精确
+    并入/减去，不受翻译结果影响。"""
 
     def test_store_absent_matches_todays_behavior(self) -> None:
         parts, result = run_once()
@@ -772,6 +786,89 @@ class LocalOverrideMergeTests(unittest.TestCase):
         self.assertIs(result.state, OnboardingState.STARTED)
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["额外授权"]}')
+
+
+class PublishTranslationTests(unittest.TestCase):
+    """`_publish` 接入 `translate_company_functions`（Issue #346，Trace #373
+    S-H1-5）：开通链产出的发布行值列表必须是**翻译后的指标名**，与每日重算
+    （`permission_refresh.py::_refresh_user`）走同一个函数、同一条 fail-closed
+    语义——不是 `#346` 修复前那样直接把未翻译的职能标签写进正式权限表。
+
+    默认夹具 `METRIC_TRANSLATION_MAP` 是恒等翻译（"销售分析" → "销售分析"），
+    本类用一个翻译结果**明确不同于**职能标签的映射，才能证明翻译真的发生了
+    （恒等映射下"翻译过"与"直接透传未翻译标签"产出逐字节相同，无法区分）。
+    """
+
+    #: 翻译结果故意与职能标签"销售分析"不同，证明发布行里的值列表来自翻译，
+    #: 不是原样透传的职能标签。
+    DISTINCT_TRANSLATION_MAP: Mapping[str, Mapping[str, Sequence[str]]] = {
+        "88": {"销售分析": ("日活万人",)},
+    }
+
+    def test_the_published_row_carries_translated_metric_names_not_function_labels(
+        self,
+    ) -> None:
+        """正向：产出值列表＝翻译后指标名，与 `translate_company_functions` 本身
+        （每日重算共用的同一个函数）的产出逐字节一致——「同一函数、同一姿势」。"""
+
+        parts, result = run_once(metric_translation_map=self.DISTINCT_TRANSLATION_MAP)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        expected = translate_company_functions(
+            companies=("88",),
+            functions=("销售分析",),
+            all_companies=False,
+            mapping=self.DISTINCT_TRANSLATION_MAP,
+        )
+        self.assertEqual(expected, {"88": ("日活万人",)})
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["日活万人"]}')
+        self.assertNotIn("销售分析", parts["decisions"].rows[0].permissions, "不得残留未翻译的职能标签")
+
+    def test_an_uncovered_combination_fails_closed_with_zero_external_writes(self) -> None:
+        """否定用例（本卡核心）：存在未翻译（未覆盖）的「公司 + 职能」组合时，
+        这条开通链**整条**拒绝发布——不产出部分结果，`record_decision`（唯一能把
+        内容写进 `publish_outbox` 的入口）一次都不被调用，外部表零写入。"""
+
+        empty_for_this_company = {"77": {"销售分析": ("日活万人",)}}  # 覆盖了别的公司，唯独没有"88"
+        parts, result = run_once(metric_translation_map=empty_for_this_company)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        # 拒绝如何向上表达：INTERNAL_ERROR 终态（本侧数据缺口，不是"没有银河权限"），
+        # 用户看到冻结的 LX-ONBOARD-001，不是静默吞掉。
+        facts = parts["audit"].facts("onboarding.result")
+        self.assertEqual(facts["state"], "internal_error")
+        self.assertEqual(facts["failure_reason"], "permission_translation_uncovered")
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        # 可观察性：专门的翻译门审计事件，原因码可分辨（与整轮判据的
+        # `permission_translation_unavailable` 不是同一个值）。
+        self.assertIn("onboarding.publish_gate_closed", parts["audit"].actions())
+        gate_facts = parts["audit"].facts("onboarding.publish_gate_closed")
+        self.assertEqual(gate_facts["reason"], "permission_translation_uncovered")
+        # 核心否定断言：外部写入口一次都没被调用——零写入，不是"写了又回滚"。
+        self.assertEqual(parts["decisions"].rows, [], "翻译未覆盖时一条发布意图都不得排")
+        self.assertEqual(parts["decisions"].reasons, [])
+        # 环境与令牌在翻译判据之前已经建好（次序如此，`_publish` 是链的第 7 步），
+        # 但 MCP 就绪确认与 active 推进绝不能发生——半开的人不能被宣告成功。
+        self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
+        self.assertEqual(parts["readiness"].bindings, [], "翻译失败时不进入就绪确认")
+
+    def test_a_completely_empty_mapping_is_treated_the_same_as_the_round_level_gate(
+        self,
+    ) -> None:
+        """防御性分支：即便调用方没有先做整轮判据（`_match` 的 `publish_allowed`），
+        `_publish` 自己遇到整体为空的映射时同样 fail-closed，原因码与整轮判据复用
+        同一个值（`permission_translation_unavailable`）——不依赖"调用方一定会先
+        做整轮判据"这条外部不变量，与 `permission_refresh._refresh_user` 同一处
+        防御性注释同一条纪律。"""
+
+        parts, result = run_once(metric_translation_map={}, publish_allowed=lambda: True)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        facts = parts["audit"].facts("onboarding.result")
+        self.assertEqual(facts["state"], "internal_error")
+        self.assertEqual(facts["failure_reason"], "permission_translation_unavailable")
+        self.assertEqual(parts["decisions"].rows, [], "映射整体为空时同样零写入")
 
 
 class LegacySourceMergeTests(unittest.TestCase):
@@ -1957,6 +2054,7 @@ class ConstructionTests(unittest.TestCase):
             ledger=FakeLedger(),
             audit=RecordingAudit(),
             role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP,
             innertest_roster_gate=lambda open_id: True,
             delegated_subject=lambda: None,
             publish_allowed=lambda: True,

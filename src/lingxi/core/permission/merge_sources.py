@@ -12,41 +12,53 @@ publish_row`、:mod:`lingxi.core.permission.metric_translation`）与「本地�
 "*"：值字符串列表}`` 这个粒度上做集合运算——即 :func:`merge_permission_sources` 的
 输出形状。
 
-## 挂点与输入类型：与设计初稿的差异（本卡定稿，编排者授权由实施方按代码实况修正）
+## 挂点与输入类型：与设计初稿的差异（历史事实，如实保留；#346 已把两个调用点收敛
+## 到同一种输入形状，见下方「2026-08-28 更正」）
 
 设计初稿把 ``galaxy`` 参数的类型定为 :class:`~lingxi.core.permission.publish_row.
 PermissionAggregate`，隐含假设是"两个调用点都消费翻译层产出的 ``{公司:[指标名]}``
-映射"。核对当前实现（读 ``core/identity/onboarding_runner.py`` 与
-``apps/scheduler/permission_refresh.py`` 的现状代码）发现这个假设只对**其中一个**
-调用点成立：
+映射"。核对 S-P-3 落地时（2026-08-27）的实现（读 ``core/identity/onboarding_
+runner.py`` 与 ``apps/scheduler/permission_refresh.py`` 的当时代码）发现这个假设
+只对**其中一个**调用点成立：
 
 1. **只有 ``permission_refresh.py`` 的 ``_refresh_user`` 真正调用了翻译层**
    （:func:`~lingxi.core.permission.metric_translation.translate_company_functions`），
    产出 ``{公司: (指标名, …)}``。``core/identity/onboarding_runner.py`` 的
-   ``AutoOnboardingRunner._publish`` 目前用的是
+   ``AutoOnboardingRunner._publish`` 当时用的是
    :func:`~lingxi.core.permission.publish_row.build_publish_row`（**未翻译**，值列表
    是 :attr:`PermissionAggregate.functions` 的职能标签，从未调用
-   ``translate_company_functions``）——这不是本卡引入的新事实，是当前生产代码已经
-   如此（``V-权限-13`` 矩阵条目里"``OnboardingRunner`` 生产唯一实现是失败关闭桩"
+   ``translate_company_functions``）——这不是 S-P-3 引入的新事实，是当时生产代码
+   已经如此（``V-权限-13`` 矩阵条目里"``OnboardingRunner`` 生产唯一实现是失败关闭桩"
    一句写于 2026-08-18，晚于它的是 2026-08-19 把真实 ``PostgresPermissionPublishStore``
    接上开通链的那次合并——矩阵那句注记因此已经过期，不能作为"开通侧也翻译过"的依据）。
-   因此"银河翻译产出 ``{公司:[指标名]}``"并**不是**两个调用点共享的唯一位置。
+   因此当时"银河翻译产出 ``{公司:[指标名]}``"并**不是**两个调用点共享的唯一位置。
 
-   本模块的取舍：把 ``galaxy`` 参数的类型从 ``PermissionAggregate`` 放宽成通用的
+   本模块当时的取舍：把 ``galaxy`` 参数的类型从 ``PermissionAggregate`` 放宽成通用的
    ``Mapping[str, Sequence[str]]``（公司ID 或通配键 ``"*"`` → 值字符串列表）——本函数
    对值字符串的**语义**完全不关心，只做集合代数，因此两种输入天然都能正确合并：
-   ``permission_refresh`` 一侧传入翻译后的指标名映射，``onboarding`` 一侧传入从
+   ``permission_refresh`` 一侧传入翻译后的指标名映射，``onboarding`` 一侧当时传入从
    ``aggregate.companies``/``functions``/``all_companies`` 现算出的职能标签映射（在
    ``_publish`` 里现算，形状与 :func:`~lingxi.core.permission.publish_row.
    serialize_permissions` 内部构造 ``document`` 的逻辑一致，只是这里不经过
-   ``json.dumps``）。**修复开通侧"从未翻译"这件事本身不在本卡范围内**——那是一次
-   远超"四源聚合手术"的行为变更（会改变开通首次发布的实际内容），S-P-3 只负责让
-   本地覆盖在开通侧"无论银河那一侧给的是职能标签还是指标名"都能正确生效：本地覆盖
-   条目本身永远是具体指标名，把它们并入职能标签列表虽然让该列表出现"标签与指标名并存"
-   的过渡态，但**local 那一份被并入/减去的每一个字符串仍然是精确的指标名**，问数 MCP
-   按公司键取值列表做逐字匹配，因此这一个用户在这一个公司下被本地覆盖显式点名的那个
-   指标名，无论周围混着什么职能标签，都会被正确放行/拒绝——这正是本地覆盖机制要保证
-   的最小承诺，不依赖开通侧翻译问题何时被修。
+   ``json.dumps``）。**S-P-3 明确声明"修复开通侧'从未翻译'这件事本身不在本卡范围
+   内"**——那是一次远超"四源聚合手术"的行为变更（会改变开通首次发布的实际内容），
+   S-P-3 只负责让本地覆盖在开通侧"无论银河那一侧给的是职能标签还是指标名"都能正确
+   生效：本地覆盖条目本身永远是具体指标名，把它们并入职能标签列表虽然让该列表出现
+   "标签与指标名并存"的过渡态，但**local 那一份被并入/减去的每一个字符串仍然是精确
+   的指标名**，问数 MCP 按公司键取值列表做逐字匹配，因此这一个用户在这一个公司下被
+   本地覆盖显式点名的那个指标名，无论周围混着什么职能标签，都会被正确放行/拒绝——
+   这正是本地覆盖机制当时要保证的最小承诺，不依赖开通侧翻译问题何时被修。
+
+   **2026-08-28 更正（`Issue #346`，Trace #373 S-H1-5）**：开通侧"从未翻译"已被
+   坐实为硬切（`#263`）前必修的缺陷——硬切后开通链是权威源，未翻译的职能标签消费方
+   读不懂。``AutoOnboardingRunner._publish`` 现在在构造 ``galaxy`` 参数之前先调用
+   与 ``permission_refresh._refresh_user`` 同一个 ``translate_company_functions``
+   （同一条 fail-closed 语义：存在未覆盖的「公司+职能」组合时整条链拒绝发布、外部表
+   零写入），因此**两个调用点现在传入的都是翻译后的指标名映射**，上面第 1 点描述的
+   "职能标签 vs 指标名"差异是历史事实，不再是当前代码的实况。本模块的签名与实现
+   不需要跟着改——它早已放宽成语义无关的 ``Mapping[str, Sequence[str]]``，本来就
+   兼容这一种输入收敛；只有这段文档需要如实更正，避免继续把一个已经修复的缺陷描述
+   成"设计取舍"。
 
 2. **本地覆盖条目的 ``user_id`` 是内部 ``app_user.id``**（迁移 ``0072``，见
    :mod:`lingxi.adapters.postgres_local_permission` 的建表与
@@ -98,11 +110,10 @@ PermissionAggregate`，隐含假设是"两个调用点都消费翻译层产出�
 纪律的边界配合：那个函数的既有测试
 （``TranslatedSerializationTest.test_an_empty_metric_list_for_any_company_is_rejected``）
 钉着"写侧不产出空列表"，本卡刻意不去碰这条纪律、不去改它的测试——因为**不需要**。
-非通配分支里，``galaxy``（无论是翻译后的指标名映射还是开通侧现算的职能标签映射）
-从不含 ``"*"`` 键（:func:`~lingxi.core.permission.metric_translation.
-translate_company_functions` 的产出与本模块调用点在 ``onboarding_runner.py`` 里现算
-的映射都是"要么整份是 ``{"*": …}``、要么整份是具体公司键"，两者不会在同一份里混），
-因此在非通配分支里，丢弃一个被抑制到空的公司键与保留它写成空列表，对读侧
+非通配分支里，``galaxy``（`#346` 之后两个调用点都传入
+:func:`~lingxi.core.permission.metric_translation.translate_company_functions` 的
+产出——翻译后的指标名映射）从不含 ``"*"`` 键（该函数的产出恒为"要么整份是
+``{"*": …}``、要么整份是具体公司键"，两者不会在同一份里混），因此在非通配分支里，丢弃一个被抑制到空的公司键与保留它写成空列表，对读侧
 :func:`~lingxi.core.permission.publish_row.lookup_metrics` 是**完全等价**的结果
 （该公司键缺失时回退查 ``"*"``，而这一支里 ``"*"`` 根本不存在，回退查不到，两条路径
 都收敛到空元组）。选择丢弃键而不是保留空列表，换来的是不用去放宽
@@ -162,11 +173,12 @@ def merge_permission_sources(
 ) -> MergedPermissionSources:
     """真实权限 ``= (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制``。
 
-    ``galaxy``：银河这一侧已经算好的 ``{公司ID 或 "*"：值字符串列表}``——可以是
-    :func:`~lingxi.core.permission.metric_translation.translate_company_functions`
-    翻译后的指标名映射，也可以是调用方从 ``PermissionAggregate`` 现算出的职能标签
-    映射（开通侧当前的实况，见模块文档「挂点」一节）。本函数不关心值字符串的语义，
-    只做集合代数，因此两种输入都能正确合并。
+    ``galaxy``：银河这一侧已经算好的 ``{公司ID 或 "*"：值字符串列表}``——`#346` 之后
+    两个调用点都传入 :func:`~lingxi.core.permission.metric_translation.
+    translate_company_functions` 翻译后的指标名映射（历史上开通侧曾经传入未翻译的
+    职能标签映射，见模块文档「挂点」一节「2026-08-28 更正」）。本函数不关心值字符串
+    的语义，只做集合代数，因此两种输入都能正确合并——这也是签名仍然保留通用
+    ``Mapping[str, Sequence[str]]``、不收紧回 ``PermissionAggregate`` 的原因。
 
     ``local``：:func:`~lingxi.core.permission.local_override.resolve_local_overrides`
     的结果，``None`` 表示"这一轮本地源不参与"（store 未装配、或读取失败后调用方
