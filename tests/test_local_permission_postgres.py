@@ -19,7 +19,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import (
@@ -32,13 +32,15 @@ from lingxi.core.permission.local_override import OverrideDirection, resolve_loc
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，本地权限覆盖表的真库断言未验证（需真实 PostgreSQL 16）"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，本地权限覆盖表的真库断言未验证"
 )
 
 TARGET_USER_ID = "usr_local_override_target"
 ADMIN_OPEN_ID = "ou_local_override_admin"
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_REASON)
 class LocalPermissionOverridePostgresTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

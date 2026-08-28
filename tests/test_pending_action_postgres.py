@@ -23,7 +23,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.admin_registry import seed_admin_registry_entry
 from lingxi.adapters.postgres import connect
@@ -45,6 +45,8 @@ from lingxi.core.permission.local_override import OverrideDirection, resolve_loc
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，待确认操作的真库断言未验证（需真实 PostgreSQL 16）"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，待确认操作的真库断言未验证"
 )
 
 ADMIN_OPEN_ID = "ou_pending_action_admin"
@@ -62,7 +64,7 @@ class _RecordingAudit:
         self.records.append((action, dict(fields)))
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_REASON)
 class PendingActionPostgresTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
