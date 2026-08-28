@@ -1283,6 +1283,82 @@ class WrapperDenialFuseTest(unittest.TestCase):
         pre_tool_use(gateway, "Bash", {"command": "2"}, tool_use_id="toolu_2")
         self.assertEqual(received, [2])
 
+    def test_a_prior_granted_native_mcp_call_suppresses_the_trip(self) -> None:
+        """P2-1 裁定的合取项正用例（独立审查裁定，取证依据见
+        ``lingxi.core.execution.hooks.WRAPPER_DENIAL_FUSE_THRESHOLD`` 上方注释）：
+        本回合已经放行过至少一次原生 ``mcp__`` 调用之后，即使随后包装拒绝次数
+        达到阈值，也不应该触发熔断——这正是 stage 全史 95 个成功任务的共同
+        特征。拒绝次数本身仍如实累计，只是不触发熔断，回合行为与"没有这条
+        熔断"时相同。
+
+        变异锚点①：删掉 ``_on_pre_tool_use`` 里 ``and self._granted_mcp_count
+        == 0`` 这个合取条件，会让 ``received`` 变成 ``[5]``，本用例变红。
+        """
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_granted")
+        self.assertEqual(gateway.granted_mcp_count, 1)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"f{index}"}, tool_use_id=f"toolu_f{index}")
+
+        self.assertEqual(received, [], "已有放行的原生调用，不应触发熔断")
+        self.assertEqual(
+            gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD, "拒绝次数仍如实累计，只是不触发熔断"
+        )
+
+    def test_a_granted_native_mcp_call_after_the_trip_does_not_retract_it(self) -> None:
+        """P2-1 裁定的边界用例——"先拒后放"：放行发生在第 N 次（N>=阈值）拒绝
+        之后，熔断已经在那一刻用"瞬时读取"的合取项触发过了，不因为回合后面才
+        摸对工具就回溯撤销。事故语义是"连续打转即熔断"，不是"回合结束时结算"。
+        """
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"g{index}"}, tool_use_id=f"toolu_g{index}")
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "熔断应已在第五次拒绝时触发")
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_granted_after")
+
+        self.assertEqual(
+            received,
+            [WRAPPER_DENIAL_FUSE_THRESHOLD],
+            "触发之后才发生的放行调用不得追溯撤销已经发出的通知",
+        )
+        self.assertEqual(gateway.granted_mcp_count, 1)
+
+    def test_reset_also_clears_the_granted_mcp_count(self) -> None:
+        """``reset_wrapper_denial_fuse()`` 必须把 P2-1 新增的合取项计数一起
+        清零（独立审查 P3-5 关注点）——否则跨尝试（resume-fallback 在同一次
+        ``run_turn()`` 内的第二次尝试）会带着上一次尝试里放行过的原生调用痕迹，
+        让本该正常触发的熔断被错误地拦下来。
+
+        变异锚点②：把 ``reset_wrapper_denial_fuse()`` 里 ``self._granted_mcp_
+        count = 0`` 那一行删掉，第一处断言直接变红；即使只看第二处断言，清零
+        新一轮的拒绝也不会正常触发熔断（``received`` 停在 ``[]``），同样变红。
+        """
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="toolu_pre_reset")
+        self.assertEqual(gateway.granted_mcp_count, 1)
+
+        gateway.reset_wrapper_denial_fuse()
+        self.assertEqual(gateway.granted_mcp_count, 0, "回合边界必须清零合取项计数，不能带着上一次尝试的痕迹")
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"h{index}"}, tool_use_id=f"toolu_h{index}")
+
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "清零之后新一轮达到阈值必须正常触发")
+
 
 if __name__ == "__main__":
     unittest.main()

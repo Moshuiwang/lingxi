@@ -2685,6 +2685,64 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "interrupted")
 
+    def test_a_prior_granted_native_mcp_call_suppresses_the_trip_end_to_end(self) -> None:
+        """P2-1 裁定（触发口径收窄到"拒绝达阈值 且 本回合零次放行原生 MCP 调用"）
+        端到端接线证明：本回合已经放行过一次原生 MCP 调用之后，即使随后包装
+        拒绝次数达到阈值，回合也必须正常收口——不是只在 ``ToolGateway`` 单元
+        测试（``tests/test_execution_tool_gate.py::WrapperDenialFuseTest``）里
+        自证，而是真的走一遍 ``apps/worker/turn.py`` 的编排、真实中断监听协程。
+        """
+
+        script = (
+            [{"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()}]
+            + [self._wrapper_style_denied_step(i) for i in range(5)]
+            + [{"kind": "text", "text": "日活是 1024；其余部分我无法查询。"}]
+        )
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 5)
+        self.assertTrue(report["turn"]["closed"])
+        self.assertFalse(report["turn"]["guard_triggered"])
+
+    def test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_granted_mcp_count(
+        self,
+    ) -> None:
+        """独立审查 P3-5 关注点：P2-1 新增的合取项计数同样必须是"同一回合内"
+        的窗口状态——第一次 ``run_turn()`` 里放行过的原生 MCP 调用，不得残留
+        到第二次调用、把本该正常触发的熔断错误地拦下来。``apps/worker/turn.py``
+        的 while 循环在**每一次尝试**开头（含 resume-fallback 在同一次
+        ``run_turn()`` 调用内发起的第二次尝试）都会调用同一处
+        ``ToolGateway.reset_wrapper_denial_fuse()``——这里用两次独立的顶层
+        ``run_turn()`` 调用复现同一条清零路径，与既有
+        ``test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_denial_
+        count`` 对 ``wrapper_denial_count`` 的验证方式同一姿态。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        granted_script = [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "日活是 1024。"},
+        ]
+        fake = FakeAgentSDK(granted_script).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        report_first = asyncio.run(executor.run_turn(config.question))
+        self.assertIsNone(report_first["failure"])
+
+        fake.script = [self._wrapper_style_denied_step(i) for i in range(5)]
+        report_second = asyncio.run(executor.run_turn(config.question))
+
+        self.assertEqual(
+            report_second["failure"]["code"],
+            "max_turns_exceeded",
+            "上一次调用放行过的原生 MCP 调用不得残留到这一次，熔断必须正常触发",
+        )
+        self.assertTrue(report_second["turn"]["guard_triggered"])
+
 
 class McpStatusAuditTest(unittest.TestCase):
     """MCP 会话级连接失败审计埋点（Issue #349 剩余范围，Trace #358 S-F-2，Gate G-2

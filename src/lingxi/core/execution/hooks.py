@@ -153,6 +153,21 @@ def _is_oversize_tool_result(tool_response: Any) -> bool:
 # 熔断」：同一回合内非 MCP 工具被拒累计达到该阈值即终止回合，不再烧尽单次处理
 # 轮数上限。默认值 5 是 Issue #352 登记的产品负责人已批值；调整它必须回到该
 # Issue 或后续 Issue 重新裁定，不在这里静默改。
+#
+# **触发口径收窄（Issue #352 独立审查 P2-1，产品负责人 2026-08-28 裁定）**：
+# 熔断触发条件从"单看拒绝次数"改为合取——拒绝次数达阈值 **且** 本回合零次放行的
+# 原生 MCP 调用。这是事故签名原文"零原生调用"的直接收窄，不是新发明的口径。
+# 取证依据（stage 全史 95 个真实任务实测复核）：成功任务的 `guard_denied_count`
+# 最高为 4、达到或超过阈值 5 的任务为零——阈值单独看已经没有太多裕度（4 距 5
+# 只差 1）；但这 95 个成功任务无一例外都有至少一次放行的原生调用（模型最终
+# 还是摸到了正确工具，只是路上包装式试探了几次）。加上合取项之后：正常任务
+# 哪怕撞到 4 次包装拒绝的边缘情形，只要有过一次放行调用就不会被误熔断——
+# 经验误伤面归零；事故签名本身（连续多次包装拒绝、零原生调用）完整保留在
+# 触发范围内；最坏情况（模型全程零放行、拒绝次数远超阈值）合取项恒真，等价于
+# 收窄前的现状，不会比没有这条合取项更差。这是"宁可漏保、不可误伤"的取舍：
+# 放宽触发口径换来的是绝不会打断一个正在正常工作的回合，代价是极少数"模型
+# 全程只包装调用、一次原生调用都没有但还没攒够阈值次拒绝"的场景要多等几次
+# 拒绝才谈得上熔断——这类场景本来就在阈值本身的等待窗口内，不是新引入的风险。
 WRAPPER_DENIAL_FUSE_THRESHOLD = 5
 
 
@@ -206,6 +221,11 @@ class ToolGateway:
         # run_single_turn` 的中断竞态）不得重复触发回调、重复留痕。
         self._wrapper_denial_fuse_tripped = False
         self._on_wrapper_fuse_tripped: Callable[[int], None] | None = None
+        # 熔断触发条件的合取项（Issue #352 P2-1 裁定，见 WRAPPER_DENIAL_FUSE_
+        # THRESHOLD 上方注释）：本回合累计的「放行的 mcp__ 前缀工具调用」次数。
+        # 与 `_wrapper_denial_count` 同一姿态——回合级窗口状态，必须跟着
+        # `reset_wrapper_denial_fuse()` 一起清零，不得跨回合/跨尝试累计。
+        self._granted_mcp_count = 0
 
     @property
     def audit(self) -> TurnAudit:
@@ -217,16 +237,29 @@ class ToolGateway:
 
         return self._wrapper_denial_count
 
+    @property
+    def granted_mcp_count(self) -> int:
+        """本回合累计的「放行的 mcp__ 前缀工具调用」次数（Issue #352 P2-1 裁定），
+        供调用方观测/断言；也是熔断触发条件的合取项——见 ``_on_pre_tool_use``
+        尾部的判定与 ``WRAPPER_DENIAL_FUSE_THRESHOLD`` 上方注释里的取证依据。
+        """
+
+        return self._granted_mcp_count
+
     def reset_wrapper_denial_fuse(self) -> None:
         """开始新的一个回合前清零包装拒绝熔断计数（Issue #352）。
 
         与 ``TurnAudit.start_turn()`` 同一时机、同一姿态：这是"同一回合内"的
         窗口计数，跨回合不累计。调用方必须在每次尝试开头（与
-        ``self._audit.start_turn()`` 同一时机）显式调用。
+        ``self._audit.start_turn()`` 同一时机）显式调用。``_granted_mcp_count``
+        （P2-1 裁定新增的合取项计数）与 ``_wrapper_denial_count`` 同一时机一起
+        清零——否则 resume-fallback 的第二次尝试会带着第一次尝试里放行过的
+        原生调用痕迹，让本该正常触发的熔断被错误地拦下来。
         """
 
         self._wrapper_denial_count = 0
         self._wrapper_denial_fuse_tripped = False
+        self._granted_mcp_count = 0
 
     def set_wrapper_fuse_listener(self, callback: Callable[[int], None] | None) -> None:
         """登记（或清除）包装拒绝熔断触发时的回调（Issue #352）。
@@ -377,12 +410,24 @@ class ToolGateway:
         # 产品负责人的裁定原文是"非 MCP 工具被拒累计"，没有按原因码再收窄；被拒的
         # `mcp__` 工具（例如模型请求了一个真实存在但未获批准的 MCP 工具名）不计入
         # ——那是"选错了具体工具"，不是这次事故里的"用内置工具包装绕过白名单"。
-        # 放行的调用、以及未达阈值时的全部行为，都不受这段代码影响——不改变现状。
+        # 未达阈值时的全部行为不受这段代码影响——不改变现状。放行的调用不计入
+        # 拒绝计数本身，但从 P2-1 裁定起会计入下面这段独立的合取项计数，见下。
+        #
+        # 合取项判定（Issue #352 P2-1 裁定，取证依据见 WRAPPER_DENIAL_FUSE_
+        # THRESHOLD 上方注释）：`self._granted_mcp_count == 0` 是在**这一次拒绝
+        # 发生的瞬间**读取的，不是回合结束后回溯重算。这个"瞬时读取"的写法本身
+        # 就带出了产品负责人要的边界语义——如果放行发生在第 N 次（N>=阈值）拒绝
+        # 之后，熔断已经在第 N 次拒绝那一刻用 `granted_mcp_count == 0` 触发过了
+        # （`_wrapper_denial_fuse_tripped` 哨兵已置位），后续的放行调用不会、也
+        # 不应该撤销已经发生的触发；如果放行发生在阈值达成之前，等到第 N 次拒绝
+        # 时 `granted_mcp_count` 已经 >= 1，合取项判定为假，不触发。即"连续打转
+        # 即熔断，不回溯撤销"。
         if verdict.denied and not verdict.tool_name.startswith("mcp__"):
             self._wrapper_denial_count += 1
             if (
                 not self._wrapper_denial_fuse_tripped
                 and self._wrapper_denial_count >= self._wrapper_denial_fuse_threshold
+                and self._granted_mcp_count == 0
             ):
                 self._wrapper_denial_fuse_tripped = True
                 if self._on_wrapper_fuse_tripped is not None:
@@ -390,4 +435,9 @@ class ToolGateway:
                         self._on_wrapper_fuse_tripped(self._wrapper_denial_count)
                     except Exception:  # noqa: BLE001 - 熔断通知失败不得影响工具判定本身
                         pass
+        elif not verdict.denied and verdict.tool_name.startswith("mcp__"):
+            # 熔断合取项计数：本回合放行过至少一次原生 MCP 调用，说明模型没有
+            # 陷入"只会包装绕过、完全摸不到正确工具"的事故模式（见上方合取项
+            # 判定注释），不再计入拒绝分支，两支互斥、各自独立计数。
+            self._granted_mcp_count += 1
         return response
