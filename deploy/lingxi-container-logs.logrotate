@@ -1,0 +1,36 @@
+# 宿主侧容器日志留存轮转（Issue #343 / Trace #373 H2，S-H2-2）。
+#
+# 目标：产品要求的 30 天取证窗口（≤90 天合规上限），同时受 stage 磁盘紧张约束，
+# 总量上限硬封顶 ≤2GB（PM 2026-08-28 裁定）。
+#
+# 预算核算（不依赖 compress 带来的收益，作为压缩失效时仍然成立的硬上限）：
+#   6 个服务 × maxsize 10M × rotate 30 = 1800MB ≤ 2048MB（=2G）
+# 实际占用会因 compress 显著更低——结构化日志高度重复，10x 左右压缩比很常见，
+# 因此正常情况下远小于这个上限；这里给出的是不依赖该收益的保守上限。
+#
+# `maxsize`（不是 `size`）+ `daily`：按天轮转，但当天日志一旦超过 maxsize 会提前
+# 轮转，不等到当天结束——避免某个服务某天日志暴涨时把其余服务的预算挤占掉。
+# 代价：极端高日志量的一天可能触发多次轮转，消耗多个 `rotate` 名额，导致那一段
+# 时期的实际保留窗口短于 30 天——这是为保总量上限刻意接受的权衡（已知限制，
+# 完整说明见 deploy/日志留存.md「已知限制」一节），不是本轮要修的缺陷。
+#
+# 安装步骤、cron 配置见 deploy/日志留存.md「安装」一节；本文件只是被安装的配置
+# 本体，不重复安装步骤。
+
+/var/log/lingxi/scheduler.log
+/var/log/lingxi/gateway.log
+/var/log/lingxi/worker.log
+/var/log/lingxi/worker-queue.log
+/var/log/lingxi/migrate.log
+/var/log/lingxi/reauthorize.log
+{
+    daily
+    rotate 30
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d-%s
+}

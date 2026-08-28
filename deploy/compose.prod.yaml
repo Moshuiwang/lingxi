@@ -26,6 +26,14 @@ services:
       - ./.env.prod.scheduler
     environment:
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-60}
+    # 资源限制：生产建议值，按架构设计「九、容量与资源」定档（推导见
+    # deploy/README.md「资源限制」）。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_SCHEDULER_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_SCHEDULER_MEM_LIMIT:-1G}
+          pids: ${LINGXI_SCHEDULER_PIDS_LIMIT:-512}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
       # 首次开通编排（S-D-02）在这里给每个用户建家目录、写各自的 .mcp.json
@@ -43,10 +51,22 @@ services:
   gateway:
     env_file:
       - ./.env.prod.gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_GATEWAY_MEM_LIMIT:-1G}
+          pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-512}
 
   worker:
     env_file:
       - ./.env.prod.worker
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_CPU_LIMIT:-2.0}"
+          memory: ${LINGXI_WORKER_MEM_LIMIT:-4G}
+          pids: ${LINGXI_WORKER_PIDS_LIMIT:-1024}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
@@ -55,6 +75,15 @@ services:
   worker-queue:
     env_file:
       - ./.env.prod.worker-queue
+    # 架构设计「九、容量与资源」：峰值并发任务 10–16 × 单任务内存 300–500MB =
+    # worker 内存需求 8–16GB；这里取上限并按建议服务器 8 核 / 32GB 留出与
+    # scheduler/gateway 及宿主机自身共用的余量（完整推导见 deploy/README.md）。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-16G}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-4096}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
       # 与 stage 覆盖结构一致（部署门禁要求两侧只许值不同）：默认提示词等运行时
@@ -66,10 +95,22 @@ services:
   migrate:
     env_file:
       - ./.env.prod.migrate
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_MIGRATE_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_MIGRATE_MEM_LIMIT:-1G}
+          pids: ${LINGXI_MIGRATE_PIDS_LIMIT:-512}
 
   reauthorize:
     env_file:
       - ./.env.prod.reauthorize
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_REAUTHORIZE_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_REAUTHORIZE_MEM_LIMIT:-1G}
+          pids: ${LINGXI_REAUTHORIZE_PIDS_LIMIT:-512}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
 
