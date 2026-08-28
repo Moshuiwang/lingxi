@@ -143,6 +143,7 @@ class _OutboxMixin:
         token_usage: Mapping[str, int] | None = None,
         guard_denied_count: int | None = None,
         document_request: Mapping[str, Any] | None = None,
+        sheet_request: Mapping[str, Any] | None = None,
     ) -> AppendedEvent | None:
         """写入 ``terminal`` 事件并把任务从 ``running`` 转为 ``awaiting_delivery``。
 
@@ -177,6 +178,16 @@ class _OutboxMixin:
         非成功终态传非 ``None`` 是调用方的契约错误，这里直接拒绝（失败关闭，不
         悄悄按成功处理插入一行）。
 
+        ``sheet_request``（迁移 ``0078``，Issue #354 S-H3-2 表格分支）：``None``
+        或 ``{"title": str, "rows": list[list[str]]}``——与 ``document_request``
+        同一机制新增的并列分支，不是第二套独立通道：同一张表
+        （``task_document_delivery_request``）、同一条 ``UNIQUE(task_id)`` 幂等键、
+        同一个 SAVEPOINT 隔离、同一条"非成功终态不得传非 None"契约。调用方
+        （``apps/worker/turn.py`` 的回合级请求槽位，见该模块「表格分支」文档）
+        保证同一次调用 ``document_request``/``sheet_request`` 至多一个非
+        ``None``——这里仍然响亮校验这条不变式（纵深防线，不假设上游一定守约）：
+        两者都非 ``None`` 视为调用方契约错误，直接拒绝，不猜测该用哪一个。
+
         **这一插入套在一个独立的 SAVEPOINT 里（P2-3，opus 审查），不与终态事件/
         task 状态转移共享失败命运**：文档请求插入失败（结构性、会重复发生的
         情形——例如提问用户 ``app_user.feishu_open_id`` 为 ``NULL``，如组织资料
@@ -190,6 +201,10 @@ class _OutboxMixin:
 
         if document_request is not None and terminal_kind != TerminalKind.SUCCESS.value:
             raise ValueError("document_request 只能在 terminal_kind='success' 时提供")
+        if sheet_request is not None and terminal_kind != TerminalKind.SUCCESS.value:
+            raise ValueError("sheet_request 只能在 terminal_kind='success' 时提供")
+        if document_request is not None and sheet_request is not None:
+            raise ValueError("document_request 与 sheet_request 不能同时提供")
 
         idempotency_key = f"{task_id}:terminal"
         with connect(self._dsn, timeouts=self._timeouts) as connection:
@@ -243,17 +258,21 @@ class _OutboxMixin:
                     # 上面的 FOR UPDATE 已经锁定并校验过持有者与状态；到这里还失败
                     # 说明状态机被绕过，宁可响亮失败也不要悄悄不释放/不占用。
                     raise RuntimeError(f"任务 {task_id} 在写终态事件时状态发生了竞态")
-                if document_request is not None and not appended.duplicate:
+                delivery_request = document_request or sheet_request
+                delivery_type = (
+                    "docx" if document_request is not None else "sheet"
+                ) if delivery_request is not None else None
+                if delivery_request is not None and not appended.duplicate:
                     # 只在这次真正插入了新终态事件（不是幂等重试命中已有行）时才
-                    # 插入文档投递请求——``duplicate=True`` 分支在上面已经直接
-                    # ``return existing``，走不到这里；这个判断是防御性的，理由
-                    # 与本方法其余分支一致：不能让一次网络重试悄悄产生第二行。
+                    # 插入文档/表格投递请求——``duplicate=True`` 分支在上面已经
+                    # 直接 ``return existing``，走不到这里；这个判断是防御性的，
+                    # 理由与本方法其余分支一致：不能让一次网络重试悄悄产生第二行。
                     #
                     # P2-3（opus 审查）：这一步套一层 SAVEPOINT（嵌套
                     # ``connection.transaction()``，psycopg3 在已有外层事务时
                     # 自动降级为 SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT），
-                    # **不能让文档请求插入失败连坐这次问数已经真实产生的终态
-                    # 答案**——上面两条语句（终态事件、task 状态转移到
+                    # **不能让文档/表格请求插入失败连坐这次问数已经真实产生的
+                    # 终态答案**——上面两条语句（终态事件、task 状态转移到
                     # ``awaiting_delivery``）已经在同一个数据库往返里成立，用户
                     # 已经"拿到答案"是这一刻唯一该被保证的事实。已知会命中这条
                     # 路径的情形：请求发起用户的 ``app_user.feishu_open_id`` 为
@@ -261,26 +280,41 @@ class _OutboxMixin:
                     # ``onboarding.delegated_subject`` 文案）——迁移 0074 的
                     # ``requester_open_id`` CHECK 会拒绝这类行，属于结构性、
                     # 会重复发生的失败，不是瞬时抖动，因此**不重试**，只降级为
-                    # "这次问数没有文档"并响亮记一条审计，让运维能追出"这个用户
-                    # 请求过文档但没生成"。
+                    # "这次问数没有文档/表格"并响亮记一条审计，让运维能追出
+                    # "这个用户请求过文档/表格但没生成"。
                     try:
                         with connection.transaction():
                             self._insert_document_delivery_request(
-                                cursor, task_id=task_id, document_request=document_request
+                                cursor,
+                                task_id=task_id,
+                                delivery_request=delivery_request,
+                                delivery_type=delivery_type,
                             )
                     except Exception as error:  # noqa: BLE001 - 降级但绝不吞声
+                        # 审计事件名沿用既有 ``worker.document_request_insert_failed``
+                        # ——docx 观测口径不变；``delivery_type`` 是新增的附加字段
+                        # （Issue #354 S-H3-2），只是多一个可过滤维度，不改变事件
+                        # 本身的含义或触发条件。
                         logger.error(
-                            "worker.document_request_insert_failed task_id=%s error=%s",
+                            "worker.document_request_insert_failed task_id=%s delivery_type=%s error=%s",
                             task_id,
+                            delivery_type,
                             type(error).__name__,
                         )
                 return appended
 
     @staticmethod
     def _insert_document_delivery_request(
-        cursor: Any, *, task_id: str, document_request: Mapping[str, Any]
+        cursor: Any, *, task_id: str, delivery_request: Mapping[str, Any], delivery_type: str
     ) -> None:
-        """插入一行 ``pending`` 的文档投递请求（迁移 ``0074``，Issue #341 S-ES-3）。
+        """插入一行 ``pending`` 的文档/表格投递请求（迁移 ``0074`` 建表，迁移
+        ``0078`` 加 ``delivery_type`` 列，Issue #341 S-ES-3 / #354 S-H3-2）。
+
+        ``delivery_type='docx'`` 时 ``delivery_request`` 形状是
+        ``{"title", "paragraphs"}``；``delivery_type='sheet'`` 时形状是
+        ``{"title", "rows"}``——两者的第二个字段名不同（``paragraphs`` 是段落
+        文本数组，``rows`` 是行×列的单元格文本二维数组），但都落进同一个
+        ``paragraphs`` JSONB 列（复用理由见迁移 0078 文件头部「为什么复用」）。
 
         ``requester_open_id`` 直接在 SQL 里用 ``task.user_id`` JOIN
         ``app_user.feishu_open_id`` 求值，不在应用层多打一次往返——调用方
@@ -296,31 +330,34 @@ class _OutboxMixin:
         幂等保护在上面的 ``appended.duplicate`` 判断，这里是纵深防线）。
         """
 
-        title = document_request.get("title")
-        paragraphs = document_request.get("paragraphs")
+        if delivery_type not in ("docx", "sheet"):
+            raise ValueError(f"delivery_type 必须是 docx 或 sheet，收到：{delivery_type!r}")
+        content_field = "paragraphs" if delivery_type == "docx" else "rows"
+        title = delivery_request.get("title")
+        content = delivery_request.get(content_field)
         if not isinstance(title, str) or not title:
-            raise ValueError("document_request.title 必须是非空字符串")
-        if not isinstance(paragraphs, (list, tuple)) or not paragraphs:
-            raise ValueError("document_request.paragraphs 必须是非空列表")
+            raise ValueError(f"{delivery_type}_request.title 必须是非空字符串")
+        if not isinstance(content, (list, tuple)) or not content:
+            raise ValueError(f"{delivery_type}_request.{content_field} 必须是非空列表")
 
         from psycopg.types.json import Jsonb
 
         cursor.execute(
             """
             INSERT INTO task_document_delivery_request
-                (id, task_id, requester_open_id, title, paragraphs)
-            SELECT %s, t.id, u.feishu_open_id, %s, %s
+                (id, task_id, requester_open_id, title, paragraphs, delivery_type)
+            SELECT %s, t.id, u.feishu_open_id, %s, %s, %s
               FROM task AS t
               JOIN app_user AS u ON u.id = t.user_id
              WHERE t.id = %s
             """,
-            (new_id("tdd"), title, Jsonb(list(paragraphs)), task_id),
+            (new_id("tdd"), title, Jsonb(list(content)), delivery_type, task_id),
         )
         if cursor.rowcount != 1:
             # task 行已经在调用方的 FOR UPDATE 里被锁定、确认存在；到这里插不进
             # 去只可能是 app_user 那一侧的 JOIN 没有命中（结构性不应发生：task.
             # user_id 有外键约束指向 app_user），宁可响亮失败也不要悄悄不建这行。
-            raise RuntimeError(f"任务 {task_id} 写文档投递请求时未能关联到发起用户")
+            raise RuntimeError(f"任务 {task_id} 写文档/表格投递请求时未能关联到发起用户")
 
     @staticmethod
     def _find_by_idempotency_key(cursor: Any, idempotency_key: str) -> AppendedEvent | None:

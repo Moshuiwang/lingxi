@@ -34,10 +34,13 @@ from lingxi.adapters.claude_agent_session import (
 from lingxi.core.execution.audit import AuditRedactor, ResultRules, TurnAudit, redact_free_text
 from lingxi.core.execution.document_delivery import (
     DELIVER_DOCUMENT_TOOL_NAME,
+    DELIVER_SPREADSHEET_TOOL_NAME,
     DELIVERY_MCP_SERVER_NAME,
     DocumentDeliveryError,
     DocumentRequest,
+    SheetRequest,
     build_document_request,
+    build_sheet_request,
 )
 from lingxi.core.execution.hooks import WRAPPER_DENIAL_FUSE_THRESHOLD, ToolGateway
 from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
@@ -159,7 +162,14 @@ class WorkerTurnExecutor:
         # ``policy_tools`` 只影响这一次会话构造，不回写 config。
         policy_tools = config.read_only_tools
         if config.document_delivery_enabled:
-            policy_tools = tuple(policy_tools) + (DELIVER_DOCUMENT_TOOL_NAME,)
+            # 表格分支（Issue #354 S-H3-2）：同一个开关、同一个 MCP 服务，新增
+            # 一个并列工具——与 DELIVER_DOCUMENT_TOOL_NAME 同时并入白名单，不是
+            # 单独一个开关。见 core/execution/document_delivery.py 模块文档
+            # 「表格分支」一节。
+            policy_tools = tuple(policy_tools) + (
+                DELIVER_DOCUMENT_TOOL_NAME,
+                DELIVER_SPREADSHEET_TOOL_NAME,
+            )
         self._policy = ToolPolicy(allowed_tools=policy_tools)
         self._audit = TurnAudit(
             rules=ResultRules(failure_text_markers=config.failure_text_markers),
@@ -185,8 +195,16 @@ class WorkerTurnExecutor:
         self._propagate_cancellation = propagate_cancellation
         # 文档交付触发机制（Issue #341 S-ES-2）：本轮登记的文档请求。回合级状态，
         # 在 run_turn() 开头与 self._audit.start_turn() 同时重置——不跨回合复用，
-        # 否则第二回合会带着上一回合遗留的请求。
+        # 否则第二回合会带着上一回合遗留的请求。**保持这个属性名/类型/既有语义
+        # 逐字不变**（Issue #354 S-H3-2 边界：不改 docx 既有行为）——既有测试
+        # 直接读 ``executor._document_request``，改名会连坐一批与表格分支无关
+        # 的既有断言。
         self._document_request: DocumentRequest | None = None
+        # 表格分支（Issue #354 S-H3-2）：与上面并列的独立槽位，不是同一个槽位的
+        # 改名——两个工具各自维护自己的槽位，跨类型的"最后一次调用为准"通过
+        # "登记自己时清空对方"实现（见 _handle_deliver_document/_handle_deliver_
+        # spreadsheet），不需要合并成一个联合类型槽位。
+        self._sheet_request: SheetRequest | None = None
         # 会话 resume 失配自动降级（2026-08-27 生产事故 #2）：每次 `run_turn()`
         # 的每次尝试开始时重置为 False；`_sdk_stderr_sink` 命中特征串时置位，
         # `run_turn` 据此决定要不要对这次尝试的 `session_failed` 做一次降级重试。
@@ -236,13 +254,14 @@ class WorkerTurnExecutor:
         return self._options
 
     def _build_delivery_mcp_server(self) -> Any:
-        """装配进程内 SDK MCP 服务（Issue #341 S-ES-2 审定设计第 1 条）。
+        """装配进程内 SDK MCP 服务（Issue #341 S-ES-2 审定设计第 1 条；
+        Issue #354 S-H3-2 新增 ``deliver_spreadsheet`` 并列工具）。
 
-        处理函数**不发任何外部请求**：只做校验（``build_document_request``）并
-        把请求登记为进程内"本轮文档请求"，返回明确的成功/失败文案给模型。
-        第三方 SDK 的 import 延迟到这里——仓库约定 ``src/lingxi/`` 不做模块级
-        第三方 import（见 ``pyproject.toml`` 顶部说明），只有真正开启这个开关的
-        进程才会付出这次 import 成本。
+        处理函数**不发任何外部请求**：只做校验（``build_document_request``/
+        ``build_sheet_request``）并把请求登记为进程内"本轮交付请求"，返回明确的
+        成功/失败文案给模型。第三方 SDK 的 import 延迟到这里——仓库约定
+        ``src/lingxi/`` 不做模块级第三方 import（见 ``pyproject.toml`` 顶部
+        说明），只有真正开启这个开关的进程才会付出这次 import 成本。
         """
 
         from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
@@ -254,13 +273,29 @@ class WorkerTurnExecutor:
             "登记一次文档交付请求：任务完成后系统会尝试为用户生成该文档；"
             "若生成失败，用户会收到通知（不是无条件承诺一定成功）。"
             "此工具只登记请求本身，不会立即发送任何内容给用户，也不产生任何"
-            "外部副作用；同一回合内多次调用以最后一次为准。",
+            "外部副作用；同一回合内多次调用（含调用 deliver_spreadsheet）以"
+            "最后一次为准。",
             {"title": str, "markdown": str},
         )
         async def deliver_document(args: dict[str, Any]) -> dict[str, Any]:
             return executor._handle_deliver_document(args.get("title"), args.get("markdown"))
 
-        return create_sdk_mcp_server(name=DELIVERY_MCP_SERVER_NAME, tools=[deliver_document])
+        @sdk_tool(
+            "deliver_spreadsheet",
+            "登记一次电子表格交付请求：任务完成后系统会尝试为用户生成该表格；"
+            "若生成失败，用户会收到通知（不是无条件承诺一定成功）。"
+            "rows 是行×列的单元格文本二维数组，每一行是一个字符串列表；"
+            "此工具只登记请求本身，不会立即发送任何内容给用户，也不产生任何"
+            "外部副作用；同一回合内多次调用（含调用 deliver_document）以"
+            "最后一次为准。",
+            {"title": str, "rows": list},
+        )
+        async def deliver_spreadsheet(args: dict[str, Any]) -> dict[str, Any]:
+            return executor._handle_deliver_spreadsheet(args.get("title"), args.get("rows"))
+
+        return create_sdk_mcp_server(
+            name=DELIVERY_MCP_SERVER_NAME, tools=[deliver_document, deliver_spreadsheet]
+        )
 
     def _handle_deliver_document(self, title: Any, markdown: Any) -> dict[str, Any]:
         """``deliver_document`` 工具调用的唯一处理逻辑（同步、无外部请求）。"""
@@ -304,8 +339,12 @@ class WorkerTurnExecutor:
                 "content": [{"type": "text", "text": f"文档请求被拒绝：{error}"}],
                 "is_error": True,
             }
-        replaced = self._document_request is not None
+        # 跨类型互斥（Issue #354 S-H3-2）：登记文档请求时清空表格槽位——"同一
+        # 回合内多次调用以最后一次为准"扩展到跨类型同样成立，两个槽位不会同时
+        # 非空。docx-only 场景（sheet 槽位从未被写过）这里恒是 no-op，行为不变。
+        replaced = self._document_request is not None or self._sheet_request is not None
         self._document_request = request
+        self._sheet_request = None
         if replaced:
             self._emit_stderr_record(level="warning", event="worker.document_request_replaced")
         self._emit_stderr_record(
@@ -321,6 +360,58 @@ class WorkerTurnExecutor:
                 # "会生成"，只承诺"已登记；失败会有通知"，模型据此措辞回复用户时
                 # 不会说出系统兑现不了的承诺。
                 {"type": "text", "text": "已登记文档请求；若生成失败你会收到通知。"}
+            ]
+        }
+
+    def _handle_deliver_spreadsheet(self, title: Any, rows: Any) -> dict[str, Any]:
+        """``deliver_spreadsheet`` 工具调用的唯一处理逻辑（同步、无外部请求）。
+
+        与 :meth:`_handle_deliver_document` 逐项对称（Issue #354 S-H3-2），唯一
+        差异是校验函数（``build_sheet_request``）与登记的审计事件字段
+        （``row_count`` 而不是 ``paragraph_count``）。
+        """
+
+        if not self._config.document_delivery_enabled:
+            self._emit_stderr_record(
+                level="warning", event="worker.document_request_rejected", reason="disabled"
+            )
+            return {
+                "content": [{"type": "text", "text": "表格交付能力当前未开启。"}],
+                "is_error": True,
+            }
+        try:
+            request = build_sheet_request(
+                title=title,
+                rows=rows,
+                forbidden_values=tuple(text for _, text in self._config.external_texts),
+                internal_tool_names=self._policy.allowed_tools,
+                system_prompt=self._config.system_prompt,
+            )
+        except DocumentDeliveryError as error:
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.document_request_rejected",
+                reason=error.reason_code,
+            )
+            return {
+                "content": [{"type": "text", "text": f"表格请求被拒绝：{error}"}],
+                "is_error": True,
+            }
+        # 跨类型互斥（Issue #354 S-H3-2）：同上，登记表格请求时清空文档槽位。
+        replaced = self._sheet_request is not None or self._document_request is not None
+        self._sheet_request = request
+        self._document_request = None
+        if replaced:
+            self._emit_stderr_record(level="warning", event="worker.document_request_replaced")
+        self._emit_stderr_record(
+            level="warning",
+            event="worker.document_request_registered",
+            row_count=len(request.rows),
+            total_chars=request.total_chars,
+        )
+        return {
+            "content": [
+                {"type": "text", "text": "已登记表格请求；若生成失败你会收到通知。"}
             ]
         }
 
@@ -474,10 +565,12 @@ class WorkerTurnExecutor:
             # 尝试（resume 降级重试）的痕迹进入这一轮判断。
             self._gateway.reset_wrapper_denial_fuse()
             fuse_event.clear()
-            # 文档交付触发机制（Issue #341 S-ES-2）：回合级状态，与审计一起在
-            # **每次尝试**开头清零（resume 降级重试的第二次尝试同样不得带着第一次
-            # 尝试登记的请求，报告契约="仅当模型本轮调用过该工具时非空"）。
+            # 文档/表格交付触发机制（Issue #341 S-ES-2；Issue #354 S-H3-2）：
+            # 回合级状态，与审计一起在**每次尝试**开头清零（resume 降级重试的
+            # 第二次尝试同样不得带着第一次尝试登记的请求，报告契约="仅当模型
+            # 本轮调用过对应工具时非空"）。
             self._document_request = None
+            self._sheet_request = None
             recorder = TurnStreamRecorder(self._audit)
             failure: dict[str, str] | None = None
             # #143：业务耗时由适配器在业务阶段结束时回填一次；收尾耗时事后用
@@ -683,6 +776,13 @@ class WorkerTurnExecutor:
                 mode=self._config.output_safety_canary,
             )
 
+        # 仅当任务成功（本地 ``failure is None``，与上面 output_safety_canary
+        # 注入判断同一个信号）且模型本轮确实调用过该工具时才非空——真实失败
+        # 回合即使工具调用发生在失败之前也不承诺这份请求会被消费。document_
+        # request 这一行与改动前逐字相同（Issue #354 S-H3-2 边界：不改 docx
+        # 既有行为）；sheet_request 是并列新增的同构参数，两个槽位互斥见
+        # self._document_request/self._sheet_request 赋值处的说明，因此两个
+        # 参数不会同时非 None。
         return build_report(
             trace_id=self._config.trace_id,
             question=question,
@@ -697,10 +797,8 @@ class WorkerTurnExecutor:
             business_execution_budget_seconds=self._config.turn_timeout_seconds,
             business_duration_seconds=business_duration_seconds,
             drain_duration_seconds=drain_duration_seconds,
-            # 仅当任务成功（本地 ``failure is None``，与上面 output_safety_canary
-            # 注入判断同一个信号）且模型本轮确实调用过该工具时才非空——真实失败
-            # 回合即使工具调用发生在失败之前也不承诺这份请求会被消费。
             document_request=self._document_request if failure is None else None,
+            sheet_request=self._sheet_request if failure is None else None,
         )
 
     def build_content_capture_record(

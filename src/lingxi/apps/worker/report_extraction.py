@@ -176,6 +176,30 @@ def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | N
     return {"title": title, "paragraphs": paragraphs}
 
 
+def _report_sheet_request(report: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """从一次回合报告里取出**供落库**的表格投递请求（Issue #354 S-H3-2）。
+
+    与 :func:`_report_document_request` 逐项对称：``report["sheet_request"]``
+    由 ``apps/worker/report.py::build_report`` 投影为 ``None`` 或
+    ``{"title": str, "rows": list[list[str]]}``，这里只做结构校验，形状不对一律
+    返回 ``None``——同一纪律：结构性地不可信就不传，不猜测、不编造。
+    """
+
+    request = report.get("sheet_request") if isinstance(report, Mapping) else None
+    if not isinstance(request, Mapping):
+        return None
+    title = request.get("title")
+    rows = request.get("rows")
+    if not isinstance(title, str) or not title:
+        return None
+    if not isinstance(rows, list) or not rows or not all(
+        isinstance(row, list) and row and all(isinstance(cell, str) for cell in row)
+        for row in rows
+    ):
+        return None
+    return {"title": title, "rows": rows}
+
+
 def _tool_result_count(report: Mapping[str, Any]) -> int:
     """从一次回合报告里取出这一轮**真实**工具调用次数（Issue #291 L6 取证结论补的
     可观测性缺口）。

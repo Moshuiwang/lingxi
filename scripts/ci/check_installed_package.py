@@ -375,6 +375,11 @@ REQUIRED_MODULES = (
     # `lingxi.core.identity.provisioning` 一条理由——必须随制品发布，否则接线那天
     # 才发现 wheel 里没有它。
     "lingxi.adapters.feishu_docx_delivery",
+    # 飞书电子表格交付适配器（Issue #354 S-H3-2）：建表/写值/授予「可管理」/协作者
+    # 读回，同 `feishu_docx_delivery` 一条理由——生产调用方是同一条 S-ES-3 投递
+    # 链路（`apps/gateway/document_delivery.py` 按 `delivery_type` 分派），必须
+    # 随制品发布。
+    "lingxi.adapters.feishu_sheets_delivery",
     # 文档投递独立消费循环（Issue #341 S-ES-3）：`apps/gateway/document_delivery.py`
     # 认领 `task_document_delivery_request` 行、驱动 S-ES-1 的四步交付，持久化面
     # 在 `adapters/postgres_document_delivery.py`。由 `apps/gateway/__init__.py`
@@ -978,10 +983,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # scheduler 组「应用身份令牌」那条闭包同一来源）、完成通知出口
             # （`feishu_user_message`，已因 scheduler 权限变化通知在 REQUIRED_MODULES
             # 里，这里是它第一次进入 gateway 自己的运行时闭包）、以及持久化面
-            # （`postgres_document_delivery`）。
+            # （`postgres_document_delivery`）。表格分支（Issue #354 S-H3-2）在同一个
+            # 函数里同时 import 建表适配器（`feishu_sheets_delivery`），复用同一套
+            # 令牌供给与持久化面，不新增闭包分支。
             "lingxi.apps.gateway.document_delivery",
             "lingxi.adapters.postgres_document_delivery",
             "lingxi.adapters.feishu_docx_delivery",
+            "lingxi.adapters.feishu_sheets_delivery",
             "lingxi.adapters.feishu_tenant_token",
             "lingxi.adapters.feishu_user_message",
             "lingxi.core.identity.access_token_supply",

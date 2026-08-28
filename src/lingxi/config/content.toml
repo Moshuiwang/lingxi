@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-27-4"
+version = "2026-08-28-2"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -125,6 +125,21 @@ version = "2026-08-27-4"
 # 不是"确定失败、你可以重试"——重试可能造成重复建档/重复授权，见
 # apps/gateway/document_delivery.py 模块说明「白名单反转」）。
 "delivery.document_uncertain" = "文档生成结果暂无法确认，已转人工核对。"
+
+# Issue #354 S-H3-2：表格分支，与 delivery.document_ready/failed/uncertain 基本
+# 对称（同一条出站信道、同一失败关闭姿态），唯一差异是"文档"改成"表格"。{url}
+# 是建表响应直接返回、落检查点的表格链接（见 adapters/feishu_sheets_delivery.py
+# 模块文档「与文档交付的差异点」第 1 条），不含用户数据或凭据。
+"delivery.sheet_ready" = "你要的表格已生成：{url}（你已获得可管理权限）"
+# S-H3-2 卡片明确要求失败/结果不明文案携带追溯号（姿态照 Issue #280 裁定
+# B2-4：占位名不能叫 trace_id，用 {reference} 代替）——docx 分支的两条对应文案
+# （delivery.document_failed/uncertain）先于 #280 落地，暂不追加改写（不改
+# docx 既有行为，见 S-H3-2 卡边界）；表格分支从今天起按现行姿态实现，两者的
+# 差异是历史先后，不是产品对两种产物的差别对待。{reference} 取值是这次交付
+# 请求所属的 task_id（apps/gateway/document_delivery.py 已经在结构化日志里
+# 用同一个标识关联问题，用户侧看到的即是同一份追溯依据）。
+"delivery.sheet_failed" = "抱歉，你要的表格生成失败了。你可以重新发起问数再试一次；问题已记录。追溯号：{reference}。"
+"delivery.sheet_uncertain" = "表格生成结果暂无法确认，已转人工核对。追溯号：{reference}。"
 
 [cards."query.status"]
 title = "正在查询"

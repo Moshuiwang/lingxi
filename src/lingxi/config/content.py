@@ -121,6 +121,10 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",
     "delivery.document_uncertain",
+    # 表格分支（Issue #354 S-H3-2）：与上面三条 document.* 逐字对称。
+    "delivery.sheet_ready",
+    "delivery.sheet_failed",
+    "delivery.sheet_uncertain",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (
