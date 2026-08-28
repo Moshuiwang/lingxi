@@ -57,6 +57,19 @@ worker 侧（``apps/worker/service.py`` 经
 paragraphs`` 续做，绝不二次调用 ``create_document``（S0 探针实测：飞书建文档
 接口没有幂等键，重放会真的多建一篇孤儿文档）。
 
+**写正文步的幂等判据（Issue #353 修复）**：``write_paragraphs`` 同样没有幂等键
+——检查点恢复路径（``claim.document_id`` 进来时已经非空）如果无条件重新调用它，
+会把正文再追加一遍（#328 E-S 验收发现，P3）。不能靠再加一列本地检查点
+（例如"正文已写"标记）来堵这个洞：飞书写入与本地检查点提交是两次独立的数据库/
+网络往返，非原子，"写正文成功了、但推进本地检查点之前进程崩溃"这个窗口永远存在
+——加检查点列只能缩短这个窗口，不能封死它。因此判据必须直接问外部系统的真实
+状态：只在**检查点恢复路径**（``document_id`` 是从 ``claim`` 带进来的，不是本
+次调用刚建出来的）先调用 ``adapters.feishu_docx_delivery.LarkDocxDelivery.
+read_body_children`` 读一次正文根 block 的现有子块，非空即跳过 ``write_
+paragraphs``；首次路径（``document_id`` 本次调用才建出来，必然从未写过正文）
+不做这次多余的读回，行为与修复前逐字相同。该方法已知未被真实验证的假设与后续
+建议见其模块文档字符串。
+
 **成功通知走"追加消息"，不进入任何已有话题的投递 outbox**：文档交付可能发生在
 原问数任务已经确认送达很久之后（``uncertain``/``failed`` 转 ``pending`` 的
 重试窗口、gateway 与 worker 各自的处理延迟），复用 ``core.execution.card_stream``
@@ -220,12 +233,21 @@ class DocumentDeliveryConsumer:
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
 
         document_id = claim.document_id
+        # Issue #353：只有检查点恢复路径（document_id 从 claim 带进来，不是本次
+        # 调用刚建出来的）才需要在写正文前多问一句"是不是已经写过了"——首次路径
+        # 的 document_id 必然是全新文档，从未写过正文，不需要这次额外读回，行为
+        # 与修复前逐字相同（见模块说明「写正文步的幂等判据」）。
+        recovering_from_checkpoint = document_id is not None
         try:
             if document_id is None:
                 document_id = self._docx.create_document(claim.title)
                 # 检查点：独立提交，不与下面三步共享事务（见模块说明）。
                 self._store.mark_document_created(request_id=claim.id, document_id=document_id)
-            self._docx.write_paragraphs(document_id, list(claim.paragraphs))
+            already_has_body = recovering_from_checkpoint and bool(
+                self._docx.read_body_children(document_id)
+            )
+            if not already_has_body:
+                self._docx.write_paragraphs(document_id, list(claim.paragraphs))
             self._docx.grant_full_access(document_id, claim.requester_open_id)
             members = self._docx.read_members(document_id)
         except DocumentDeliveryOwnershipLost:
