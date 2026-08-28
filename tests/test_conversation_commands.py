@@ -68,6 +68,74 @@ class ListClearParsingTests(unittest.TestCase):
         )
 
 
+class NewlineInjectionGuardTests(unittest.TestCase):
+    """P2（Trace #373 H3 批 codex 外审②修复②）：``/memory`` 的子命令/参数
+    词边界只在**第一行**内认水平空白（``[ \\t]+``）——消息里若存在换行且换行
+    之后还有非空内容，一律判定为不构成合法 /memory 命令，落 ``NONE``（调用方
+    渲染 usage_help），不能被当成"第一行是前缀、第二行是子命令"这样跨行拼出
+    一个真实命令来执行。上一修复包把词边界判定改成 ``str.split()`` 默认空白
+    语义（含换行）是这条洞口的成因：``/memory\\nclear`` 这种两行消息的第一行
+    恰好是 ``/memory``、第二行恰好是 ``clear``，会被旧逻辑当成合法 clear 命令。
+
+    变异锚点：把 ``parse_memory_command`` 里「``has_newline and
+    after_newline.strip()`` → 直接 ``NONE``」这段判据删掉，本组用例会从
+    ``NONE`` 变红成 ``CLEAR``/``FORGET``。
+    """
+
+    def test_newline_then_clear_is_none_not_a_real_clear(self) -> None:
+        self.assertEqual(parse_memory_command("/memory\nclear").kind, MemoryCommandKind.NONE)
+
+    def test_newline_then_forget_with_a_valid_id_is_none(self) -> None:
+        valid_id = "mem_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        self.assertEqual(
+            parse_memory_command(f"/memory\nforget {valid_id}").kind, MemoryCommandKind.NONE
+        )
+
+    def test_a_complete_first_line_command_with_trailing_prose_is_none(self) -> None:
+        """更典型的意外触发场景：多行粘贴消息，第一行本身就是一条完整命令
+        ``/memory clear``，第二行往后是用户真正想问的正文——这不是"跨行拼出
+        子命令"（``first_line`` 已经足够识别出 ``clear``），必须靠「换行后还
+        有非空内容」这条独立判据拦下，否则粘贴一段以 ``/memory clear`` 开头
+        的多行消息会被误判成真实清空指令。
+
+        变异锚点：这条用例专门用来区分"用 first_line 而不是整条消息做子命令
+        提取"与「换行后有非空内容 → NONE」这两道防线——只去掉后者（前者仍在），
+        本用例会从 ``NONE`` 变红成 ``CLEAR``。
+        """
+
+        self.assertEqual(
+            parse_memory_command("/memory clear\n请帮我看看这段话怎么翻译").kind,
+            MemoryCommandKind.NONE,
+        )
+
+    def test_trailing_newline_with_only_whitespace_after_is_unaffected(self) -> None:
+        """反向哨兵：单行命令后面只是跟了个换行/空白收尾（常见于聊天客户端
+        自动加的结尾换行），不该被这道新判据误伤——依然是合法的 clear。"""
+
+        self.assertEqual(
+            parse_memory_command("/memory clear\n").kind, MemoryCommandKind.CLEAR
+        )
+        self.assertEqual(
+            parse_memory_command("/memory clear\n   \n").kind, MemoryCommandKind.CLEAR
+        )
+
+    def test_single_line_tab_separated_subcommand_still_recognized(self) -> None:
+        """反向哨兵：本修复只收紧「跨行」，不影响同一行内的 Tab 分隔词边界
+        （上一修复包 P2-4 的既有意图，见 ``ListClearParsingTests``
+        对应用例）。"""
+
+        self.assertEqual(
+            parse_memory_command("/memory\tlist").kind, MemoryCommandKind.LIST
+        )
+
+    def test_still_belongs_to_the_memory_command_surface_not_unrecognized_slash(self) -> None:
+        """即使子命令解析因跨行而判 NONE，这条消息依然属于 /memory 命令面
+        （渲染专属 usage_help，不是与 /config 共用的泛用拒绝文案）——回归
+        ``is_unrecognized_slash_message`` 的既有豁免边界。"""
+
+        self.assertFalse(is_unrecognized_slash_message("/memory\nclear"))
+
+
 class ForgetParsingTests(unittest.TestCase):
     VALID_ID = "mem_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 

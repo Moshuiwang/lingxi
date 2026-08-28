@@ -2000,6 +2000,39 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertEqual(len(cleared), 1)
         self.assertEqual(cleared[0]["cleared_count"], 2)
 
+    def test_a_multiline_message_starting_with_memory_clear_does_not_actually_clear(self) -> None:
+        """P2（Trace #373 H3 批 codex 外审②修复②）端到端回归：多行粘贴消息
+        ``/memory\\nclear`` 必须落 usage_help、零删除——不能被当成真实的 clear
+        命令执行。这是 pipeline 分发层面的确认，字符串解析层面的覆盖见
+        ``tests/test_conversation_commands.py`` 的 ``NewlineInjectionGuardTests``。
+
+        变异锚点：把 ``commands.parse_memory_command`` 的换行守卫删掉，本用例
+        会从「零删除 + usage_help」变红成「两条记忆被清空」。
+        """
+
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k1 => v1"), now=NOW
+        )
+        self.build().handle_message(
+            message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
+            now=NOW,
+        )
+        self.assertEqual(len(self.state.user_memory.get("usr_1", [])), 2)
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_3", text="/memory\nclear"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(
+            len(self.state.user_memory.get("usr_1", [])),
+            2,
+            "换行拼出的 /memory\\nclear 不是合法命令，两条已登记记忆必须原样保留",
+        )
+        self.assertEqual(self.log.fields("audit.command.memory_clear"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("支持的记忆命令", replies[-1]["text"])
+
     def test_limit_exceeded_is_rejected_without_writing_and_without_audit(self) -> None:
         from lingxi.core.user_memory import MAX_MEMORY_ENTRIES_PER_USER
 
