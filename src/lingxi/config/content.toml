@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-28-3"
+version = "2026-08-28-4"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -146,6 +146,7 @@ version = "2026-08-28-3"
 # /memory clear 可清。文案为实施草案，产品负责人过目前不作为最终定稿。
 "memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <id> 删除一条；/memory clear 清空全部。"
 "memory.remembered" = "已登记这条记忆，下一次提问开始生效，可以用 /memory list 查看全部。"
+"memory.remember_unsafe" = "这条记忆的内容未能登记：其中包含疑似系统指令或内部标识的文本，无法安全展示或使用，请修改关键词/说明后重试。"
 "memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <id> 删除几条后再登记。"
 "memory.forgotten" = "已删除这条记忆。"
 "memory.forget_not_found" = "没有找到这条记忆，可能已被删除或不属于你。"

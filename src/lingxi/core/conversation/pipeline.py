@@ -60,6 +60,7 @@ from lingxi.config.content import (
     ContentSafetyError,
     RenderedContent,
     default_content_catalog,
+    validate_user_visible_text,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.user_memory import UserMemoryEntry
@@ -836,6 +837,16 @@ class EventPipeline:
         审计（``command.memory_remember``/``command.memory_forget``/
         ``command.memory_clear``），与既有 ``command.new``/``command.stop`` 同一
         姿态；``list`` 与格式不对的用法提示是只读/无副作用操作，不单独记审计。
+
+        ``remember`` 在真正写库之前先过一遍 ``config.content.validate_user_visible_
+        text`` 安全校验（Trace #373 H3 批 codex 外审②修复③）：与 worker 注入路径
+        （``adapters/postgres_user_memory.PostgresUserMemoryReader._is_entry_safe``）
+        和 ``/memory list`` 展示路径（``_render_memory_list``）复用同一道检查器，
+        撞线（协议词、看起来像系统指令的多行文本）时**直接拒绝登记**并回执
+        ``memory.remember_unsafe`` 说明原因，不写库、不记 ``command.memory_remember``
+        审计——此前登记侧没有这道校验，用户会先收到「已登记，下一次提问开始生效」的
+        回执，实际这条记忆在每次注入时都被注入侧静默跳过、永远不生效，回执与事实
+        不符。
         """
 
         if memory_command.kind is MemoryCommandKind.LIST:
@@ -880,6 +891,26 @@ class EventPipeline:
             return Outcome(handled_as=HandledAs.COMMAND)
 
         if memory_command.kind is MemoryCommandKind.REMEMBER:
+            # 登记前先过一遍与注入侧同一道安全校验（Trace #373 H3 批 codex 外审②
+            # 修复③）：此前只有 worker 注入路径（``adapters/postgres_user_memory.
+            # PostgresUserMemoryReader._is_entry_safe``）与 ``/memory list`` 展示
+            # 路径复用了 ``validate_user_visible_text``，登记路径本身没有——用户
+            # 登记一条撞线内容（协议词、看起来像系统指令的多行文本）会先收到
+            # ``memory.remembered``「已登记，下一次提问开始生效」的回执，实际
+            # 这条记忆在每一次注入时都会被静默跳过、永远不生效，回执与事实不符。
+            # 这里在真正写库之前拒绝，回执明确告诉用户「没有登记成功、为什么」，
+            # 不产生「说了成功但其实没生效」的落差。检查内容同注入侧：
+            # ``f"{memory_key}\n{memory_value}"`` 一起校验（同一次撞线判定，不
+            # 分别校验两个字段——理由同 ``_is_entry_safe`` 的调用形状）。
+            try:
+                validate_user_visible_text(
+                    f"{memory_command.memory_key}\n{memory_command.memory_value}"
+                )
+            except ContentSafetyError:
+                deferred.append(self._texts.catalog.text("memory.remember_unsafe"))
+                tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+                return Outcome(handled_as=HandledAs.COMMAND)
+
             memory_id = tx.remember_user_memory(
                 user_id=user.user_id,
                 memory_type=memory_command.memory_type,

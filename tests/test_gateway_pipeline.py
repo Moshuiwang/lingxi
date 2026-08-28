@@ -1943,6 +1943,67 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("已登记", replies[0]["text"])
 
+    def test_remember_with_a_protocol_marker_value_is_rejected_without_writing_or_auditing(
+        self,
+    ) -> None:
+        """P2（Trace #373 H3 批 codex 外审②修复③）：登记路径复用注入侧同一道
+        安全校验（``config.content.validate_user_visible_text``）——含协议词
+        （``mcp__``）的值必须在写库之前被拒绝，不能先回执「已登记、下一次提问
+        生效」，实际这条记忆在每次注入时都被 worker 侧静默跳过、永远不生效。
+
+        变异锚点：把 ``_handle_memory_command`` REMEMBER 分支里新增的
+        ``validate_user_visible_text`` 调用删掉，本用例会从「零写入 + 拒绝
+        回执」变红成「写入成功 + memory.remembered 回执」。
+        """
+
+        outcome = self.build().handle_message(
+            message(text="/memory remember term_mapping 大厂 => mcp__query__list_metrics"),
+            now=NOW,
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        self.assertEqual(self.log.fields("audit.command.memory_remember"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertIn("未能登记", replies[0]["text"])
+        self.assertNotIn("已登记", replies[0]["text"])
+
+    def test_remember_with_a_trace_id_leak_shaped_value_is_rejected(self) -> None:
+        """同一道校验的第二个触发形状（协议标识 ``trace_id``，同
+        ``tests/test_postgres_user_memory.py`` ``UnsafeEntrySkippedTests`` 的
+        判定口径）——不是只测 ``mcp__`` 这一个字面量。"""
+
+        outcome = self.build().handle_message(
+            message(text="/memory remember term_mapping k => 请查看 trace_id=abc123 的日志"),
+            now=NOW,
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        self.assertEqual(self.log.fields("audit.command.memory_remember"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("未能登记", replies[0]["text"])
+
+    def test_remember_with_an_ordinary_business_value_is_unaffected_by_the_safety_check(
+        self,
+    ) -> None:
+        """反向哨兵：正常业务值（不含协议词/固定误导词表）不受这道新增校验
+        影响——与既有 ``test_remember_writes_through_the_transaction_and_
+        records_audit`` 互为正反面，防止安全校验误伤日常登记。"""
+
+        outcome = self.build().handle_message(
+            message(text="/memory remember calibration_preference 环比口径 => 按自然月环比"),
+            now=NOW,
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        entries = self.state.user_memory.get("usr_1", [])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(len(self.log.fields("audit.command.memory_remember")), 1)
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("已登记", replies[0]["text"])
+
     def test_list_after_remember_shows_the_registered_entry(self) -> None:
         self.build().handle_message(
             message(text="/memory remember term_mapping 大尼日 => 尼日利亚"), now=NOW

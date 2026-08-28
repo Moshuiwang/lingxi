@@ -129,6 +129,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # list/remember/forget/clear 四个子命令的回执与用法提示。
     "memory.usage_help",
     "memory.remembered",
+    "memory.remember_unsafe",
     "memory.limit_exceeded",
     "memory.forgotten",
     "memory.forget_not_found",
