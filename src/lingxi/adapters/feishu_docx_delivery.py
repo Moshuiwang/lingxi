@@ -36,16 +36,50 @@ feishu_tenant_token` 同一习惯：标准库 ``urllib``、零新增依赖、构
 
 ## 失败语义：不静默
 
-四个会发起真实调用的方法都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
+五个会发起真实调用的方法都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
 :class:`FeishuDocxDeliveryError`（``definite=True``，判别口径同
 :class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`）；响应本身成功
 （``code`` 为 0）但缺失可回读标识（``document_id``/``items`` 字段缺失或形状
-不对；``read_members`` 详见该方法文档字符串里的真实响应形状说明）时抛出
-``LookupError``——这种"结果不明"不属于飞书明确拒绝，同
+不对；``read_members``/``read_body_children`` 详见各自方法文档字符串里的真实
+响应形状说明）时抛出 ``LookupError``——这种"结果不明"不属于飞书明确拒绝，同
 :mod:`lingxi.adapters.feishu_delivery` 模块文档字符串里的既有分类（成功响应缺
 标识 → ``LookupError``，业务错误码 → 专用异常）。传输层异常（连接失败、超时、
 JSON 解析失败）由默认传输 :func:`urllib_transport` 分类为
 ``FeishuDocxDeliveryError(definite=False)``。
+
+## 幂等判据新增方法：``read_body_children``（Issue #353）
+
+原四步（建档、写正文、授权、读回协作者）之外新增的第五个真实调用，只服务一件事：
+让 ``apps/gateway/document_delivery.py`` 的检查点恢复路径能在**重驱"写正文"步
+之前**先问一句"这篇文档是不是已经写过正文了"，而不是无条件重放
+:meth:`write_paragraphs`（S-F-3 修复 #353：检查点恢复会把正文再追加一遍）。
+
+选它而不是新增数据库检查点列的理由：飞书写入与本地检查点提交是分布式非原子的
+两次独立往返——如果幂等判据只看本地是否已经记录过"写过正文"，"外部写成功但
+本地检查点还没来得及推进"这个崩溃窗口永远封不死（这类崩溃发生在两次独立往返
+之间的任意时刻，本地状态天然滞后于外部真实状态，无法通过让本地记录"更快"来
+消除）。判据必须直接问外部系统本身的真实状态，而不是本地对这个状态的一份缓存。
+
+选它而不是读文档基本信息（``revision_id`` 之类）的理由：:meth:`write_paragraphs`
+写入的位置精确是"``document_id`` 自身这个根 block 的 children"（S0 探针实测，
+见该方法文档字符串），``read_body_children`` 读的是完全相同的一个位置——两者
+读写同一个坐标，不依赖任何第二个信号（例如某个计数器在写入后是否必然变化）来
+间接推断，语义上不存在错位空间。
+
+**已知未被本仓库任何 S0/S-ES-1 探针验证过的假设**（如实标注，不静默宣称已验证）：
+飞书文档标题（``document.title``）在创建时写入的是文档元数据，不是根 block 的
+子块——因此一篇刚建好、从未调用过 :meth:`write_paragraphs` 的文档，其根 block
+应当没有任何子块，"子块非空"精确对应"正文已经写过"，不存在"标题占位"与"正文
+已写"的混淆空间。这个假设来自飞书开放平台 docx 数据模型的公开文档口径，与本
+模块既有的 ``block_type=2`` 文本段落约定一致，但**尚未在本仓库任何真实调用中
+实测确认**（本 Story 明确不接触真实飞书端点）。如果这个假设不成立（例如标题
+真的作为一个子块存在），后果是检查点恢复会把"刚建档、从未写过正文"误判成"已经
+写过"，从而**跳过本该发生的首次写正文**——比本次修复要解决的"重复写"更严重。
+因此**在这条判据依赖真实飞书接口投入生产前，应当补一次 L4a 真实探针**：确认
+（a）新建文档的根 block children 确实为空，（b）
+``GET /docx/v1/documents/{id}/blocks/{id}/children`` 的响应形状确实是
+``data.items``（同 ``read_members`` 现有形状口径）。补探针前，这条判据只有
+L1（代码 + 假传输层测试）证据，不是 L4a。
 
 ## 凭据与内容边界
 
@@ -370,6 +404,30 @@ class LarkDocxDelivery:
             if isinstance(member, Mapping)
         ]
 
+    def read_body_children(self, document_id: str) -> list[dict[str, Any]]:
+        """读回正文根 block（``document_id`` 自身）当前的子块列表（Issue #353）。
+
+        ``GET /docx/v1/documents/{document_id}/blocks/{document_id}/children``：
+        与 :meth:`write_paragraphs` 写入的是同一个坐标（同一个根 block、同一个
+        ``children`` 集合），这里只是把同一个位置反过来读一遍，不做任何推断。
+        调用方（``apps/gateway/document_delivery.py``）据此判断"这篇文档是否
+        已经写过正文"，非空即跳过重驱写正文步——完整理由、已知未验证的假设与
+        真实链路验证建议见模块文档字符串「幂等判据新增方法」一节。
+
+        真实响应形状比照 :meth:`read_members`（本模块另一处"读列表"调用）：
+        协作者列表放在 ``data.items``，这里假定同一接口族同一口径，一并抛
+        ``LookupError`` 归类为结果不明（成功响应缺可回读结构 ≠ 确定为空）。
+        """
+
+        doc_id = _require_document_id(document_id)
+        data = self._data(
+            self._call("GET", f"{_DOCX_DOCUMENTS_PATH}/{doc_id}/blocks/{doc_id}/children")
+        )
+        children = data.get("items")
+        if not isinstance(children, list):
+            raise LookupError("读回正文根 block 子块响应缺少 items 字段：结果不明")
+        return [child for child in children if isinstance(child, Mapping)]
+
     def document_url(self, document_id: str) -> str:
         """拼出用户可直接打开的文档链接（见模块文档「文档 URL 的构造」一节）。
 
@@ -391,3 +449,7 @@ __all__ = [
     "Transport",
     "urllib_transport",
 ]
+
+# 说明：`read_body_children` 是 `LarkDocxDelivery` 的实例方法，不单独导出符号
+# ——同 `create_document`/`write_paragraphs`/`grant_full_access`/`read_members`
+# 既有的四个真实调用方法一样，只通过类本身暴露。
