@@ -9,7 +9,14 @@ from __future__ import annotations
 import os
 import unittest
 
-from postgres_schema import force_rebuild_schema
+from postgres_schema import force_rebuild_schema, psycopg_available
+
+_DSN = os.environ.get("LINGXI_POSTGRES_DSN")
+_SKIP_REASON = (
+    "仅在 CI 或本机受控 PostgreSQL 中运行：未设置 LINGXI_POSTGRES_DSN"
+    if not _DSN
+    else "仅在 CI 或本机受控 PostgreSQL 中运行：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动"
+)
 
 _GALAXY_TABLES = (
     "galaxy_user",
@@ -78,7 +85,7 @@ def _tables() -> dict[str, list[dict[str, str]]]:
     }
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), "仅在 CI 或本机受控 PostgreSQL 中运行")
+@unittest.skipUnless(bool(_DSN) and psycopg_available(), _SKIP_REASON)
 class GalaxyImportPostgresTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

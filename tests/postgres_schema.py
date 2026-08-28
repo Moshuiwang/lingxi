@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import threading
 from pathlib import Path
@@ -27,6 +28,26 @@ MIGRATIONS_DIRECTORY = REPOSITORY_ROOT / "migrations"
 ALEMBIC_INI = REPOSITORY_ROOT / "alembic.ini"
 VERSIONS_DIRECTORY = MIGRATIONS_DIRECTORY / "alembic" / "versions"
 RETENTION_REVISION = VERSIONS_DIRECTORY / "0054_retention_cleanup.py"
+
+
+def psycopg_available() -> bool:
+    """``psycopg`` 驱动是否可以导入（只探测 spec，不实际 import、不发起连接）。
+
+    真库用例此前只按 ``LINGXI_POSTGRES_DSN`` 门控：DSN 设了但环境缺 ``psycopg``
+    时，``ensure_production_schema``/`` connect``（经
+    ``lingxi.adapters.postgres.connect`` 里的惰性 ``import psycopg``）会在
+    ``setUpClass`` 内直接抛 ``ModuleNotFoundError``，表现成一串 ``ERROR`` 而不是
+    清晰的 skip，掩盖了"只是没装驱动"这个事实——与数据库本身是否健康无关
+    （Issue #370 修 2）。真库测试类应把门控统一成 ``DSN 存在 且 本函数为真``
+    两个条件都满足才跑，缺哪个就在跳过原因里点名哪个。
+
+    与 ``scripts/ci/verify_repository.sh`` 「容器设了却没 DSN 直接失败」的半开
+    守卫互补、不冲突：那条守卫防的是「有容器却漏配 DSN」的误配置假通过；这里防
+    的是「有 DSN 却没装驱动」这另一半的假通过（ERROR 假装成红，实则是环境缺
+    依赖）。
+    """
+
+    return importlib.util.find_spec("psycopg") is not None
 
 # 建库只做一次：alembic 整链前滚每次约几百毫秒，而 IdentityPostgresTestCase 是
 # **每个用例**都要重置的。重复建库会把真库这一段的耗时抬到门禁超时的量级。

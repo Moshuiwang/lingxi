@@ -24,7 +24,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.feishu_roster_bitable import RosterRow
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher
@@ -70,6 +70,8 @@ REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，每日权限重算的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，每日权限重算的真库断言未验证"
 )
 
 #: biai-agent 加密规格 v1 的**公开测试向量**（非生产密钥）。
@@ -172,7 +174,7 @@ class _Audit:
         return [action for action, _ in self.records]
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class PermissionRefreshPostgresTestCase(unittest.TestCase):
     """真库底座：整条 alembic 链建库，用例之间只清行。"""
 

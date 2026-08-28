@@ -14,7 +14,7 @@ import os
 import unittest
 from datetime import date, datetime, timezone
 
-from postgres_schema import ensure_production_schema
+from postgres_schema import ensure_production_schema, psycopg_available
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
@@ -26,7 +26,11 @@ from lingxi.core.identity.roster_snapshot import (
     RosterSnapshotStatus,
 )
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，花名册审计的真库断言未验证（需真实 PostgreSQL 16）"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，花名册审计的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，花名册审计的真库断言未验证"
+)
 
 # 存档三字段之外的一切都不进比对，但它们必须真的落在库里才能证明"没被读进来"。
 ARCHIVED_FIELDS_SQL = ("display_name", "employee_no", "email")
@@ -85,7 +89,7 @@ class FreshSnapshotSource:
         )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class RosterAuditPostgresTestCase(unittest.TestCase):
     """真库断言的共同底座。"""
 
@@ -628,10 +632,13 @@ class RealDatabaseCoverageGuardTest(unittest.TestCase):
             container_only,
             "设了 LINGXI_POSTGRES_CONTAINER 却没有 LINGXI_POSTGRES_DSN：真库断言会被静默跳过",
         )
-        if configured:
+        # Issue #370 修 2：门控升级为「DSN 存在 且 psycopg 可导入」双条件——DSN 配了但
+        # 驱动没装是合法的清晰 skip（不是本守卫要抓的"静默跳过"），只有两个条件都满足
+        # 却仍被跳过才是真正的覆盖率漏洞。
+        if configured and psycopg_available():
             self.assertFalse(
                 getattr(SyntheticEndToEndTest, "__unittest_skip__", False),
-                "配置了真库时端到端用例不得被跳过",
+                "配置了真库且驱动可用时端到端用例不得被跳过",
             )
 
 
