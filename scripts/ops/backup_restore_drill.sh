@@ -51,7 +51,16 @@
 #                                     ghcr.io/moshuiwang/lingxi-scheduler:<tag>）。
 #                                     不设默认值：用哪个候选镜像跑清理，必须是
 #                                     调用方的显式选择，不能悄悄落到 latest。
-#   LINGXI_DRILL_DUMP_PATH            dump 文件落盘路径，默认 mktemp 生成
+#   LINGXI_DRILL_DUMP_PATH            dump 文件落盘路径，默认 mktemp 生成——
+#                                     这是明文 SQL dump，含全部业务数据；本脚本
+#                                     当前只在 stage 验证过，成功路径下 step_destroy
+#                                     会删除它，失败路径下按上面"失败后如何处理"
+#                                     留作取证。**若未来把本脚本用于生产环境**，
+#                                     dump 落盘必须加密（不能沿用 stage 这条明文
+#                                     落盘路径），且用毕（核对完成或确认不再需要）
+#                                     必须立即销毁，不依赖操作者记得手动清理
+#                                     （独立审查 P2-15；本次改动只补这条登记，不
+#                                     改变 stage 现行行为）。
 #   LINGXI_DRILL_INJECT_SYNTHETIC     是否注入合成到期样本并核对清理语义，
 #                                     默认 1；设为 0 时只做备份/恢复完整性检查
 #                                     （生产 runbook 里最简的"确认能恢复"子集，
@@ -80,6 +89,20 @@ require_cmd() {
 
 step_preflight() {
   log "== 预检 =="
+  # 命名碰撞断言（独立审查 P2-12）：本脚本后续步骤会对 DRILL_DB_CONTAINER 做
+  # 注入、跑清理代码路径、最终 `docker rm -f -v` 销毁——这些动作全部假定这个
+  # 容器是脚本自己新建的一次性隔离实例，绝不能是运行库容器本身。同理
+  # DRILL_DB_CONTAINER 与 DRILL_NETWORK 是脚本同时创建、同时存在的两个不同类型
+  # 对象，同名会让不显式声明对象类型的排查命令（`docker inspect <名字>`）产生
+  # 歧义。两条都是纯字符串比较，不依赖任何 docker 调用，放在最前面先查。
+  if [[ "${DRILL_DB_CONTAINER}" == "${SOURCE_DB_CONTAINER}" ]]; then
+    echo "配置错误：LINGXI_DRILL_DB_CONTAINER 与运行库容器名 ${SOURCE_DB_CONTAINER} 相同——后续注入/清理/销毁步骤会直接操作这个容器，一旦两者同名，动的就是运行库本身" >&2
+    exit 1
+  fi
+  if [[ "${DRILL_DB_CONTAINER}" == "${DRILL_NETWORK}" ]]; then
+    echo "配置错误：LINGXI_DRILL_DB_CONTAINER 与 LINGXI_DRILL_NETWORK 同名（${DRILL_DB_CONTAINER}）——容器与网络是两类不同 docker 对象，但同名会让不显式声明对象类型的 docker 命令产生歧义" >&2
+    exit 1
+  fi
   require_cmd docker
   require_cmd openssl
   df -h /
@@ -123,7 +146,20 @@ step_isolate_and_restore() {
   # 不带 `-v` 不会删这个匿名卷——数据库容器没了，装数据的卷还留在宿主机上，
   # 是一种不会报错的残留（本 Story 演练时实测踩到，登记在 PR 里）。这里记下卷名，
   # 销毁步骤按名核对它确实被删干净，不只信 `docker rm -v` 的退出码。
-  DRILL_VOLUME=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Type "volume" }}{{ .Name }}{{ end }}{{ end }}' "${DRILL_DB_CONTAINER}")
+  #
+  # go-template 输出加一个换行分隔（独立审查 P2-14）：不加分隔符时，如果这个
+  # 容器意外挂了不止一个匿名卷，多个卷名会被原样拼接成一整段无法拆分的字符串
+  # ——静默把"这里其实有两个卷"读成"这里只有一个奇怪名字的卷"。加分隔符后逐行
+  # 判空，发现多于一个非空行就是需要人工确认的异常，不沿用"当作只有一个卷"
+  # 继续往下跑。
+  drill_volume_raw=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Type "volume" }}{{ .Name }}{{ "\n" }}{{ end }}{{ end }}' "${DRILL_DB_CONTAINER}")
+  drill_volume_count=$(printf '%s\n' "${drill_volume_raw}" | grep -c . || true)
+  if (( drill_volume_count > 1 )); then
+    echo "隔离数据库容器 ${DRILL_DB_CONTAINER} 挂了 ${drill_volume_count} 个匿名卷，超出预期的至多一个，需要人工确认后再继续：" >&2
+    printf '%s\n' "${drill_volume_raw}" >&2
+    exit 1
+  fi
+  DRILL_VOLUME=$(printf '%s\n' "${drill_volume_raw}" | grep . || true)
 
   local tries=0
   until docker exec "${DRILL_DB_CONTAINER}" pg_isready -U "${SOURCE_DB_USER}" -d "${SOURCE_DB_NAME}" >/dev/null 2>&1; do
@@ -197,9 +233,19 @@ step_inject_synthetic() {
 
 step_run_real_cleanup() {
   log "== 用真实清理代码路径补跑一次保留清理（scheduler 镜像，非手写 SQL）=="
-  docker run --rm --network "${DRILL_NETWORK}" --entrypoint python "${DRILL_SCHEDULER_IMAGE}" -c "
+  # DRILL_DSN（含隔离实例的现场随机密码）改用 `-e` 环境变量传入容器，不拼进
+  # `-c` 后面的 Python 源码文本（独立审查 P2-11）：后者会让密码原样出现在
+  # `docker run` 这条命令自身的 argv 里——本机 `ps aux`/`/proc/<pid>/cmdline`
+  # 能看到完整命令行的任何账户都会看到明文密码；改成环境变量后，读取面收紧到
+  # 需要读该进程 `/proc/<pid>/environ`（同用户或 root）的账户，与本文件头部
+  # "密码只作为该容器的环境变量存在，容器销毁即失效，不落盘、不打印"的既有
+  # 边界一致——DRILL_DSN 本来就已经是环境变量语义，这里只是不再多绕一圈把它
+  # 变成 argv。
+  docker run --rm --network "${DRILL_NETWORK}" -e "LINGXI_DRILL_DSN=${DRILL_DSN}" \
+    --entrypoint python "${DRILL_SCHEDULER_IMAGE}" -c "
+import os
 from lingxi.adapters.retention import PostgresRetentionCleaner
-cleaner = PostgresRetentionCleaner(\"${DRILL_DSN}\")
+cleaner = PostgresRetentionCleaner(os.environ[\"LINGXI_DRILL_DSN\"])
 report = cleaner.run_once()
 print(report.summary())
 for t in report.tables:
@@ -211,9 +257,26 @@ step_verify() {
   log "== 核对：过期合成行已清，未过期行（含真实恢复行）逐行保留 =="
   docker exec "${DRILL_DB_CONTAINER}" psql -U "${SOURCE_DB_USER}" -d "${SOURCE_DB_NAME}" \
     -c "SELECT id, started_at, expires_at FROM galaxy_import_batch ORDER BY started_at;" \
-    -c "SELECT id, started_at, expires_at FROM feishu_org_sync_run ORDER BY started_at;" \
-    -c "SELECT count(*) AS orphan_galaxy_children FROM galaxy_user WHERE batch_id NOT IN (SELECT id FROM galaxy_import_batch);" \
-    -c "SELECT count(*) AS orphan_org_children FROM feishu_org_member_snapshot WHERE sync_run_id NOT IN (SELECT id FROM feishu_org_sync_run);"
+    -c "SELECT id, started_at, expires_at FROM feishu_org_sync_run ORDER BY started_at;"
+
+  # 孤儿行核对（独立审查 P2-13）：此前这两条只用 `-c` 打印计数，人不盯着看
+  # 就会漏掉——计数非零并不会让脚本非零退出。改成取值断言：清理逻辑如果破坏了
+  # 引用完整性（子表还在、父行已被删），这里必须让脚本失败退出,而不是只在
+  # 输出里留一行容易被忽略的数字。
+  local orphan_galaxy_children
+  orphan_galaxy_children=$(docker exec "${DRILL_DB_CONTAINER}" psql -U "${SOURCE_DB_USER}" -d "${SOURCE_DB_NAME}" -Atc \
+    "SELECT count(*) FROM galaxy_user WHERE batch_id NOT IN (SELECT id FROM galaxy_import_batch);")
+  if [[ "${orphan_galaxy_children}" != "0" ]]; then
+    echo "核对失败：galaxy_user 出现 ${orphan_galaxy_children} 行孤儿数据（batch_id 指向已不存在的 galaxy_import_batch），清理逻辑破坏了引用完整性" >&2
+    exit 1
+  fi
+  local orphan_org_children
+  orphan_org_children=$(docker exec "${DRILL_DB_CONTAINER}" psql -U "${SOURCE_DB_USER}" -d "${SOURCE_DB_NAME}" -Atc \
+    "SELECT count(*) FROM feishu_org_member_snapshot WHERE sync_run_id NOT IN (SELECT id FROM feishu_org_sync_run);")
+  if [[ "${orphan_org_children}" != "0" ]]; then
+    echo "核对失败：feishu_org_member_snapshot 出现 ${orphan_org_children} 行孤儿数据（sync_run_id 指向已不存在的 feishu_org_sync_run），清理逻辑破坏了引用完整性" >&2
+    exit 1
+  fi
 
   local still_present
   still_present=$(docker exec "${DRILL_DB_CONTAINER}" psql -U "${SOURCE_DB_USER}" -d "${SOURCE_DB_NAME}" -Atc \

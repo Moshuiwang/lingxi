@@ -62,7 +62,7 @@ name: lingxi
 services:
   # 常驻服务：专用授权凭据（「四达文档会议助手」refresh_token）到期轮换扫描。
   scheduler:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_SCHEDULER_IMAGE_DIGEST:-}
     restart: unless-stopped
 
     # ---- 停止宽限期（断言 V-部署-03 / M2-62-24 / M2-62-25）--------------------
@@ -162,7 +162,7 @@ services:
   # profiles 删掉即可转为默认服务，届时它与 scheduler 同型。
   # 这与 #57 的登记一致：组件已交付，尚未接线。
   gateway:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_GATEWAY_IMAGE_DIGEST:-}
     # ---- profile 归属（Issue #153）------------------------------------------
     # 仍然保留独立的 `gateway` profile：`deploy/README.md` 里 `--profile gateway`
     # 这条既有命令继续按原样工作，不因本次改动改变含义。同时加入新的 `mvp`
@@ -234,7 +234,7 @@ services:
   # **不是常驻服务**，因此没有 restart 策略、没有 stop_grace_period、没有 healthcheck。
   # 它跑完一个回合就退出，退出码 0/2/3/4/5 是调用方的判定依据。
   worker:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_WORKER_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"
@@ -277,7 +277,7 @@ services:
   # 一起构成 Epic A 的候选/Stage 验收对象，不静默改变生产发布入口（#153 范围第 1
   # 条、可观察完成标准第 1 条）。
   worker-queue:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_WORKER_IMAGE_DIGEST:-}
     profiles: ["mvp"]
     restart: unless-stopped
 
@@ -356,7 +356,7 @@ services:
   # **不得配 restart 策略**（断言 M2-62-23）：迁移失败必须停下来让人看见。自动重启会
   # 把一次失败的迁移变成一个反复撞墙的循环，并掩盖真正的失败原因。
   migrate:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-migrate:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-migrate:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_MIGRATE_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"
@@ -390,7 +390,7 @@ services:
   # state 文件与凭据文件均在同一个持久卷中，由入口启动前拒绝路径/锁文件冲突。
   # 浏览器回调经 OAuth Bridge 主动回传，不接收终端粘贴的回跳地址。
   reauthorize:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_SCHEDULER_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"

@@ -33,4 +33,12 @@
     notifempty
     dateext
     dateformat -%Y%m%d-%s
+    # 轮转后新建的空日志文件权限（独立审查 P2-9）：不写 create 时新文件权限
+    # 落在 logrotate 运行账户当时的 umask 上，容易在不同宿主机上得到不一致、
+    # 可能过宽的结果——这些文件里是容器 stdout/stderr 的完整转发内容，与
+    # LOG_DIR 本身的 0750 目录权限（见 deploy/collect-container-logs.sh 与
+    # deploy/日志留存.md「安装」一节）同一收紧方向。不写 owner/group，沿用
+    # 触发轮转的账户（与安装步骤里 `install -o "$(id -un)" -g "$(id -gn)"`
+    # 同一账户）。
+    create 0640
 }
