@@ -1,4 +1,10 @@
-"""飞书组织快照与多维表格记录的纯关联分析。"""
+"""飞书组织快照与多维表格记录的纯关联分析。
+
+测试资产 / 不属于正式用户路径：Bot-Test 受控验证阶段产出，被
+`feishu_roster_bitable.py` docstring 引用为已验证过的读取模式参考，本身不在
+正式调用链上（代码框架「五、测试资产与正式代码的边界」现存件清单；
+`scripts/ci/check_installed_package.py` 同步登记为豁免）。
+"""
 
 from __future__ import annotations
 
