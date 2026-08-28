@@ -168,19 +168,16 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from lingxi.core.conversation.ports import (
-    OnboardingMessage,
     OnboardingResult,
     OnboardingState,
 )
 from lingxi.core.identity.first_contact import (
     EmploymentStatus,
     FirstContactOutcome,
-    IdentityRecordDraft,
     decide_first_contact,
     locate_by_open_id,
 )
@@ -188,6 +185,10 @@ from lingxi.core.identity.onboarding_ports import (
     DirectorySource,
     DispatchLedger,
     EmploymentSource,
+    # 本文件不直接使用 ``EnvironmentResult``（是 ``_environment.ensure()`` 的返回
+    # 类型，方法体不需要按名字标注它），导入只是为了让它继续作为 ``onboarding_
+    # runner`` 模块的属性可见——``adapters/user_environment.py:102`` 与
+    # ``tests/test_onboarding_runner.py`` 都从这里导入。
     EnvironmentResult,
     GalaxySource,
     LocalOverrideSource,
@@ -206,15 +207,19 @@ from lingxi.core.identity.onboarding_terminal import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
     KEY_INNERTEST_NOT_OPEN,
+    # ``KEY_INTERNAL_ERROR``/``KEY_NOT_AUTHORIZED``/``KEY_STALLED`` 三个本文件不
+    # 直接使用（``_internal``/``_not_authorized`` 两个工厂已经在 onboarding_
+    # terminal.py 内部自包含），导入只是为了让它们继续作为 ``onboarding_runner``
+    # 模块的属性可见——``tests/test_onboarding_runner.py``（前两个）与
+    # ``apps/scheduler/stalled_provisioning.py``/``tests/test_stalled_
+    # provisioning.py``（``KEY_STALLED``）都从这里导入。
     KEY_INTERNAL_ERROR,
-    KEY_MATCHED,
     KEY_NOT_AUTHORIZED,
     KEY_STALLED,
     KEY_SUSPENDED,
     KEY_SYNCING,
     KEY_SYNC_TIMEOUT,
     STATE_ACTIVE,
-    STATE_MATCHING,
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
     OnboardingChainError,
@@ -234,7 +239,6 @@ from lingxi.core.identity.provisioning import (
     IdentityProvisioning,
     ProvisioningRejection,
     ProvisioningRequest,
-    UserProvisioningStatus,
 )
 from lingxi.core.identity.stock_token_source import (
     ADOPTABLE,
@@ -244,7 +248,7 @@ from lingxi.core.identity.stock_token_source import (
 )
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
-from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, ResolvedLocalOverrides, resolve_local_overrides
+from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
 from lingxi.core.permission.notification import describe_scope
