@@ -41,6 +41,14 @@ services:
     environment:
       # stage 扫得勤一些，便于受控验证时尽快观察到一轮扫描。
       LINGXI_SCHEDULER_INTERVAL_SECONDS: ${LINGXI_SCHEDULER_INTERVAL_SECONDS:-30}
+    # 资源限制：stage 建议值（推导见 deploy/README.md「资源限制」）。stage 主机只有
+    # 2 核 / 3.7GiB，六个服务加总必须留出宿主机与 Docker 守护进程本身的余量。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_SCHEDULER_CPU_LIMIT:-0.5}"
+          memory: ${LINGXI_SCHEDULER_MEM_LIMIT:-512M}
+          pids: ${LINGXI_SCHEDULER_PIDS_LIMIT:-256}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
       # 首次开通编排（S-D-02）在这里给每个用户建家目录、写各自的 .mcp.json
@@ -77,10 +85,24 @@ services:
   gateway:
     env_file:
       - ./.env.stage.gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-0.5}"
+          memory: ${LINGXI_GATEWAY_MEM_LIMIT:-512M}
+          pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-256}
 
   worker:
     env_file:
       - ./.env.stage.worker
+    # Agent SDK 一个回合会拉起 Claude CLI 与多个 MCP 子进程；pids 限制过低会
+    # 在正常负载下直接杀死本该成功的回合（PM 2026-08-28 裁定明确点名的风险）。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_CPU_LIMIT:-1.5}"
+          memory: ${LINGXI_WORKER_MEM_LIMIT:-2G}
+          pids: ${LINGXI_WORKER_PIDS_LIMIT:-512}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
 
@@ -92,6 +114,14 @@ services:
   worker-queue:
     env_file:
       - ./.env.stage.worker-queue
+    # 与一次性 worker job 同一量级（stage 主机预算所限，见 deploy/README.md）；
+    # 生产档远高于此，两者不能互相照抄。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-1.5}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-2G}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-512}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
       # 默认提示词等运行时可调配置（2026-08-23，产品负责人裁定提示词不进代码不进
@@ -106,10 +136,22 @@ services:
   migrate:
     env_file:
       - ./.env.stage.migrate
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_MIGRATE_CPU_LIMIT:-0.5}"
+          memory: ${LINGXI_MIGRATE_MEM_LIMIT:-512M}
+          pids: ${LINGXI_MIGRATE_PIDS_LIMIT:-256}
 
   reauthorize:
     env_file:
       - ./.env.stage.reauthorize
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_REAUTHORIZE_CPU_LIMIT:-0.5}"
+          memory: ${LINGXI_REAUTHORIZE_MEM_LIMIT:-512M}
+          pids: ${LINGXI_REAUTHORIZE_PIDS_LIMIT:-256}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
 

@@ -351,6 +351,11 @@ done
 
 ## 安装与升级
 
+> **升级/重部署前置步骤**：容器 stdout 日志不会跨重部署持久（旧容器被替换即丢失，
+> 见 [#343](https://github.com/Moshuiwang/lingxi/issues/343)）。执行下面的 `up -d`
+> 之前，先手动跑一次日志收集脚本把当前容器的最新日志 flush 到宿主机持久目录，
+> 完整说明见 [deploy/日志留存.md](日志留存.md)。
+
 **`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。
 
 ```bash
@@ -520,6 +525,63 @@ Docker 默认 10 秒，**不满足**。`SIGKILL` 若落在"已经向飞书换过
 
 活性文件写在容器内 `/tmp`（已有 tmpfs 挂载），随容器重启自然清空，不需要跨重启
 持久化，也不需要跨容器共享。
+
+## 资源限制
+
+Trace #373 H2（S-H2-1）、产品负责人 2026-08-28 先行裁定：六个服务在
+`deploy/compose.yaml` 都用 `deploy.resources.limits`（`cpus`/`memory`/`pids`）声明
+资源上限，此前完全没有限制——一个服务失控（内存泄漏、fork 炸弹式的子进程）能
+饿死同一台机器上的其他服务而没有任何机制拦住。
+
+**语法选型**：`deploy.resources.limits`，不是顶层 `mem_limit`/`cpus`/`pids_limit`。
+两种写法在 `docker compose up`（非 swarm 模式）下都真实生效——本机 Docker
+29.1.3 + Compose 2.40.3 实测核对过两者渲染后的 `HostConfig.Memory` /
+`HostConfig.NanoCpus` / `HostConfig.PidsLimit`逐位相同；选 `deploy.resources.limits`
+是因为三项限制归在同一个键下，覆盖文件整块替换不容易漏改某一项。stage 实际的
+Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在 `biai-stage`
+用下面「结构渲染」加一次真实 `up` + `docker inspect` 回读复核（留作 L4a）。
+
+**数值必须分环境，`compose.yaml`（基线）只给一个安全默认值，真正生效的数值来自
+`compose.stage.yaml`/`compose.prod.yaml` 的覆盖，覆盖来自 `--env-file`**（与
+`LINGXI_SCHEDULER_INTERVAL_SECONDS` 同一套既有写法）：
+
+| 服务 | stage（cpus / mem / pids） | 生产（cpus / mem / pids） | 依据 |
+| --- | --- | --- | --- |
+| `scheduler` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程 |
+| `gateway` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 长连接接入 + 事件落库，无子进程扇出 |
+| `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
+| `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
+| `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
+| `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **4.0 / 16G / 4096** | 架构设计「九、容量与资源」：峰值并发任务 10–16 × 单任务内存 300–500MB = 8–16GB；这是六个服务里唯一直接对应该估算的服务，取估算上限 |
+
+**stage 主机只有 2 核 / 3.7GiB**：`scheduler`（512M）+ `gateway`（512M）+
+`worker-queue`（2G）三个常驻服务加总约 3G，给宿主机与 Docker 守护进程留下约
+700MB 余量；`worker`/`migrate`/`reauthorize` 是一次性作业，通常不与常驻服务的
+峰值重叠。**生产按建议服务器 8 核 / 32GB 定档**：`worker-queue` 单独顶格
+16G，是六个服务里资源需求最大、也是唯一处理真实并发用户负载的服务——把它的
+限制配得比这张表更紧，后果是在真实并发负载下系统性杀死本该成功的 Agent SDK
+回合，而不是"资源紧张时排队变慢"这种更温和的降级；这是本轮裁定判定"比限制
+偏松更严重"的错误方向，`pids` 一项尤其如此（Agent SDK 一个回合会拉起 Claude
+CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直接 kill，不是排队）。
+
+**改数值不需要改 compose 文件本身**：全部 18 个变量（6 服务 × 3 项）都在
+`deploy/.env.example`「文件一」小节登记为可选覆盖，默认值已经内置在
+`compose.stage.yaml`/`compose.prod.yaml` 里，只有需要单独调整某个服务时才需要
+在 `deploy/.env.stage`/`deploy/.env.prod` 里显式设置对应变量。
+
+**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并）：
+
+```bash
+docker compose --env-file deploy/.env.stage \
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml config | grep -A4 'deploy:'
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml config | grep -A4 'deploy:'
+```
+
+**门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的
+`check_resource_limits`）：六个服务是否都声明了 `cpus`/`memory`/`pids` 三项键，
+不核对具体数值——数值对错是容量判断，不是机械可判定的对错，门禁只保证"没有
+任何服务被漏掉、漏配了限制"。
 
 ## 本地验证
 
