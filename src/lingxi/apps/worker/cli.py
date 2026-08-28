@@ -32,6 +32,7 @@ from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue, PostgresTaskQueueListener
 from lingxi.adapters.postgres_content_capture import PostgresContentCaptureWriter
+from lingxi.adapters.postgres_user_memory import PostgresUserMemoryReader
 
 from lingxi.apps.liveness import touch_liveness
 
@@ -205,6 +206,9 @@ def main(
             if config.innertest_content_capture_enabled
             else None
         )
+        # 用户记忆注入（Issue #357 S-H3-3 d 节）：与 content_capture_writer 同一
+        # 姿态，用同一个 dsn 构造一个独立的只读适配器——queue 模式是唯一真正处理
+        # 用户任务的路径，因此这里恒装配（不像内容采集那样受开关控制）。
         service = WorkerService(
             config=config,
             queue=queue,
@@ -217,6 +221,7 @@ def main(
             session_cleanup_batch_limit=config.session_cleanup_batch_limit,
             content_capture_writer=content_capture_writer,
             on_year_grounding_suspect=_year_grounding_suspect_sink(err=err, trace_id=config.trace_id),
+            user_memory_reader=PostgresUserMemoryReader(dsn),
         )
         try:
             asyncio.run(

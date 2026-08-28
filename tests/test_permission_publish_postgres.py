@@ -28,6 +28,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_permission_publish import (
     DecisionOutcome,
     PostgresPermissionPublishStore,
@@ -506,14 +507,35 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
             )
             return [row[0] for row in cursor.fetchall()]
 
+    def remember_memory(self, *, user_id: str, memory_key: str = "k", memory_value: str = "v") -> None:
+        """给某个用户直接写一条记忆（Issue #357 S-H3-3），供权限变化清除钩子测试
+        复用。"""
+
+        with connect(self._dsn) as connection:
+            with connection.transaction():
+                memory_id = _Transaction(connection).remember_user_memory(
+                    user_id=user_id,
+                    memory_type="term_mapping",
+                    memory_key=memory_key,
+                    memory_value=memory_value,
+                )
+        assert memory_id is not None
+
+    def memory_count(self, *, user_id: str) -> int:
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM user_memory WHERE user_id = %s", (user_id,))
+            return cursor.fetchone()[0]
+
     def test_a_changed_decision_clears_delivered_content_and_queues_session_cleanup(self) -> None:
         """①：权限变化（新版本，非 UNCHANGED，且 permissions 内容真的变了）→ 该
         用户已送达正文被清 + 清出计数进 ``PermissionDecision.cleared_events`` +
-        Agent 会话清理入队（0061 队列既有断言形状：``reason='user_cleared'``）。"""
+        Agent 会话清理入队（0061 队列既有断言形状：``reason='user_cleared'``）+
+        用户记忆同一事务一并清除（Issue #357 S-H3-3 c 节、设计文 e 节第 4 项）。"""
 
         self.seed_delivered_conversation(
             conversation_id="cnv-p1", task_id="tsk-p1", user_id=USER_A, agent_session_id="sess-p1"
         )
+        self.remember_memory(user_id=USER_A)
 
         decision = self.store.record_decision(
             user_id=USER_A,
@@ -530,9 +552,11 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
             self.agent_session_id_of(conversation_id="cnv-p1"), "硬失效：立即置空，不等两小时规则"
         )
         self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p1"), ["user_cleared"])
+        self.assertEqual(self.memory_count(user_id=USER_A), 0)
 
     def test_an_unchanged_decision_clears_nothing(self) -> None:
-        """②（否定）：``UNCHANGED`` 时压根没有清理动作发生。"""
+        """②（否定）：``UNCHANGED`` 时压根没有清理动作发生，用户记忆同样不受影响
+        （设计文 e 节第 4 项「UNCHANGED 不误清」）。"""
 
         self.store.record_decision(
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
@@ -540,6 +564,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.seed_delivered_conversation(
             conversation_id="cnv-p2", task_id="tsk-p2", user_id=USER_A, agent_session_id="sess-p2"
         )
+        self.remember_memory(user_id=USER_A)
 
         decision = self.store.record_decision(
             user_id=USER_A,
@@ -554,6 +579,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.assertEqual(self.delivered_content(task_id="tsk-p2"), "已送达的答案")
         self.assertEqual(self.agent_session_id_of(conversation_id="cnv-p2"), "sess-p2")
         self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p2"), [])
+        self.assertEqual(self.memory_count(user_id=USER_A), 1, "UNCHANGED 不误清记忆")
 
     def test_the_switch_defaults_to_off_for_callers_like_first_onboarding(self) -> None:
         """开关默认关闭：首次开通既有调用形状不传它时，即使这次决定真的
@@ -576,11 +602,14 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
     def test_a_purge_failure_rolls_back_the_whole_decision(self) -> None:
         """③：清理与决定写入**同一个事务**——注入清理失败，版本推进与发布意图入队
         随事务一起回滚（响亮，不留半套状态），已经"清空"的正文因为从未真正提交，
-        回滚后原样还在。"""
+        回滚后原样还在。这次注入的失败点在 ``clear_delivered_content_for_user``
+        （先于 ``clear_user_memory`` 执行，见 adapter 文件头部同一姿态说明），
+        因此记忆压根没有被触碰过，同样必须原样还在。"""
 
         self.seed_delivered_conversation(
             conversation_id="cnv-p4", task_id="tsk-p4", user_id=USER_A, agent_session_id="sess-p4"
         )
+        self.remember_memory(user_id=USER_A)
 
         with mock.patch(
             "lingxi.adapters.postgres_permission_publish._ConversationTransaction"
@@ -604,9 +633,45 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
             "清理从未真正提交，正文必须原样还在——不是「清了又恢复」，是「根本没发生过」",
         )
         self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p4"), [])
+        self.assertEqual(self.memory_count(user_id=USER_A), 1)
+
+    def test_a_memory_clear_failure_also_rolls_back_the_delivered_content_purge(self) -> None:
+        """③的对称面：注入失败点换成 ``clear_user_memory`` 本身（它在
+        ``clear_delivered_content_for_user`` **之后**执行，见 adapter 文件头部）
+        ——此时正文清理已经真正执行过，断言它同样随事务一起回滚，不出现「正文已经
+        清空、记忆清除却失败」的半套状态（设计文 e 节第 5 项精神的延伸：不局限于
+        审计出口失败，任何同一事务内的后续步骤失败都必须回滚早前已执行的清理）。"""
+
+        self.seed_delivered_conversation(
+            conversation_id="cnv-p4b", task_id="tsk-p4b", user_id=USER_A, agent_session_id="sess-p4b"
+        )
+        self.remember_memory(user_id=USER_A)
+
+        with mock.patch(
+            "lingxi.adapters.postgres_permission_publish._ConversationTransaction"
+            ".clear_user_memory",
+            side_effect=RuntimeError("注入的记忆清理失败"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.record_decision(
+                    user_id=USER_A,
+                    row=_row(),
+                    reason="daily_permission_refresh",
+                    decided_at=NOW,
+                    clear_delivered_content=True,
+                )
+
+        self.assertEqual(self._version(), 0, "推进的版本必须随事务一起回滚")
+        self.assertEqual(self._count(), 0, "入队的发布意图必须随事务一起回滚")
+        self.assertEqual(
+            self.delivered_content(task_id="tsk-p4b"),
+            "已送达的答案",
+            "先执行的正文清理必须跟着后一步的失败一起回滚",
+        )
+        self.assertEqual(self.memory_count(user_id=USER_A), 1)
 
     def test_other_users_content_is_not_touched(self) -> None:
-        """④：其他用户的正文、会话指针、清理队列完全不受影响。"""
+        """④：其他用户的正文、会话指针、清理队列与记忆完全不受影响。"""
 
         self.seed_delivered_conversation(
             conversation_id="cnv-p5a", task_id="tsk-p5a", user_id=USER_A, agent_session_id="sess-p5a"
@@ -614,6 +679,8 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.seed_delivered_conversation(
             conversation_id="cnv-p5b", task_id="tsk-p5b", user_id=USER_B, agent_session_id="sess-p5b"
         )
+        self.remember_memory(user_id=USER_A)
+        self.remember_memory(user_id=USER_B)
 
         self.store.record_decision(
             user_id=USER_A,
@@ -627,6 +694,8 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.assertEqual(self.delivered_content(task_id="tsk-p5b"), "已送达的答案")
         self.assertEqual(self.agent_session_id_of(conversation_id="cnv-p5b"), "sess-p5b")
         self.assertEqual(self.pending_cleanup_reasons(agent_session_id="sess-p5b"), [])
+        self.assertEqual(self.memory_count(user_id=USER_A), 0)
+        self.assertEqual(self.memory_count(user_id=USER_B), 1, "B 的记忆不受 A 的权限变化影响")
 
 
 class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):

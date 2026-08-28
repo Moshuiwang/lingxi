@@ -76,6 +76,58 @@ paragraphs``；首次路径（``document_id`` 本次调用才建出来，必然�
 那一整套"同话题终态"语义没有意义——这里只是**另主动**发一条独立的文本消息给
 这个人，复用 ``adapters.feishu_user_message.FeishuUserMessages``（与权限变化
 通知同一条出站信道：``im/v1/messages`` + ``receive_id_type=open_id``）。
+
+## 表格分支（Issue #354 S-H3-2，D2 裁定：同构 #341 文档交付路由）
+
+同一条消费循环、同一张检查点表、同一个状态机——不新起第二条循环。
+:meth:`DocumentDeliveryConsumer._process_claim` 按认领到的行的
+``delivery_type`` 分派到 :meth:`_process_docx_claim`（既有逻辑，逐字未改）或
+:meth:`_process_sheet_claim`（新增）：建表 → 查默认 sheet_id（纯只读，检查点
+恢复路径无条件重放，不需要判据）→ 写值（``PUT`` 覆盖式接口，天然幂等，检查点
+恢复路径同样无条件重放）→ 授「可管理」→ 读回确认，失败分类（definite →
+``failed``、其余 → ``uncertain``）与检查点持久化（只有 ``create_spreadsheet``
+成功后单独提交，绝不二次调用）的姿态与 docx 分支逐项对应，差异点见
+``adapters/feishu_sheets_delivery.py`` 模块文档「与文档交付的差异点」。
+
+## 已知边界（Trace #373 codex 外审②登记）
+
+以下三点是 docx/sheet 共用状态机的既有架构特征，本批只登记、不改动——按当前
+威胁模型（部署层单实例纪律已生效、生产不做灰度并发部署）判定为可接受，登记
+只为避免后续审查重复发现同一件事：
+
+1. **检查点没有租约 owner 判据**：:meth:`PostgresDocumentDeliveryStore.
+   claim_pending` 用 ``UPDATE ... WHERE status='pending' ... RETURNING``
+   配合 ``FOR UPDATE SKIP LOCKED`` 保证同一时刻的并发认领互斥，但这只在
+   「认领」这一次原子语句内生效——认领成功之后的四步流程（可能跨多次真实
+   HTTP 调用、数十秒量级）没有租约字段（owner + 过期时间）标记"这一行正在
+   被哪一个进程处理"，行状态在流程跑完前始终停在中间态。如果真的有第二个
+   gateway 实例同时在跑（本模块不假设不会发生，见
+   ``postgres_document_delivery.py`` 模块文档），两个实例各自认领到的必然是
+   不同行（``SKIP LOCKED`` 保证不重复认领同一行本身），但**没有代码层面的
+   机制阻止两个实例同时存在**——去重实际依赖部署层单实例纪律（``deploy/
+   生产部署runbook.md``「四、单实例纪律」，Trace #373 D11 决策：
+   ``docs/traces/373-清仓冲刺/合同.md``），不是本模块自己强制的边界。
+2. **恢复路径无条件重放写值**：写正文/写值步骤的幂等判据（见上文「写正文步
+   的幂等判据」与表格分支说明）只保证"重放不会把内容越写越长/越写越错"，
+   不保证"重放不会覆盖用户自己在这期间做的编辑"。如果进程在
+   ``grant_full_access`` 成功（用户此刻已经拿到「可管理」权限、随时可能开始
+   编辑）之后、``mark_succeeded`` 之前崩溃，恢复后的下一轮认领会依据检查点
+   判据决定是否重新调用写步骤——sheets 分支的写值判据是"天然幂等、无条件
+   重放"（不像 docx 分支那样先读一次现有内容判断是否跳过），因此这条恢复
+   路径上，用户在崩溃-恢复窗口期间对表格做的编辑存在被下一轮无条件重放的
+   写值请求覆盖的风险（秒级窗口，取决于崩溃发生的时间点与恢复调度间隔）。
+3. **``read_members`` 在授权成功之后失败时终态判 ``failed``，但用户已经
+   持有可管理权限**：按「失败分类只有两种」的白名单反转规则，
+   ``read_members`` 返回明确的飞书业务错误码（``definite=True``）会让整条
+   认领落 ``failed``；但如果这次失败发生在 ``grant_full_access`` 已经成功
+   之后（读回确认这一步本身失败，不代表授权没有生效），用户此时实际已经
+   对这份文档/表格拥有「可管理」权限，只是没有收到成功通知、系统记录的终态
+   也是"失败"——状态机的记录与外部世界的真实状态在这一种失败形状下不一致。
+
+三者都不是本次修复的范围（不产生新的安全或数据丢失风险，是这套「认领 + 检查点
++ 独立提交」架构本身的既有取舍），如需收紧需要新的设计决策（例如引入带租约的
+认领、写步骤的乐观锁/版本号、或 ``read_members`` 失败时的补偿通知），留给后续
+Trace 按需评估。
 """
 
 from __future__ import annotations
@@ -85,6 +137,8 @@ import threading
 from typing import Any, Callable
 
 from lingxi.adapters.postgres_document_delivery import (
+    DELIVERY_TYPE_DOCX,
+    DELIVERY_TYPE_SHEET,
     DocumentDeliveryClaim,
     PostgresDocumentDeliveryStore,
 )
@@ -113,16 +167,31 @@ def _default_alert(kind: str, task_id: str) -> None:
     logger.error("文档投递告警 kind=%s task_id=%s", kind, task_id)
 
 
-def _has_confirmed_full_access(members: list[dict[str, Any]], open_id: str) -> bool:
+def _has_confirmed_full_access(
+    members: list[dict[str, Any]], open_id: str, *, delivery_type: str = DELIVERY_TYPE_DOCX
+) -> bool:
     """判定 read_members 读回结果是否确认目标 open_id 具备 full_access。
 
     与 ``scripts/probe_drive_folder_permissions.py`` 的 ``_member_signature`` 取值
     口径一致（``member_type``/``member_id``/``perm`` 三元组），只是这里只关心
     "有没有恰好一条命中目标 open_id 且档位是 full_access 的记录"这一个布尔结论，
     不需要整份签名。
+
+    ``delivery_type``（Trace #373 H3 批量审查 P2-2）：``FULL_ACCESS_PERM``/
+    ``OPENID_MEMBER_TYPE`` 两个常量在 ``feishu_docx_delivery`` 与
+    ``feishu_sheets_delivery`` 各自独立定义（两个结构对称、不互相 import 的
+    并列适配器，见 ``feishu_sheets_delivery`` 模块文档「姿态选择」）。本方法同时
+    服务 docx 与 sheet 两条 ``_finalize_claim`` 路径，此前**恒从 docx 模块**导入
+    这两个常量——sheet 侧若独立改动自己的取值，这里读到的仍然是 docx 侧的旧值，
+    判定悄悄对不上。按 ``delivery_type`` 选取对应模块的常量，保证改 sheets 侧
+    真的生效；两个模块当前取值逐字相同（``"full_access"``/``"openid"``），本次
+    只是让"从哪里读"这件事对，不改变任何现有行为。
     """
 
-    from lingxi.adapters.feishu_docx_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
+    if delivery_type == DELIVERY_TYPE_SHEET:
+        from lingxi.adapters.feishu_sheets_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
+    else:
+        from lingxi.adapters.feishu_docx_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
 
     return any(
         member.get("member_type") == OPENID_MEMBER_TYPE
@@ -148,12 +217,18 @@ class DocumentDeliveryConsumer:
         store: PostgresDocumentDeliveryStore,
         docx: Any,
         notifier: Any,
+        sheets: Any = None,
         catalog: ContentCatalog | None = None,
         on_alert: AlertCallback | None = None,
         limit: int = DEFAULT_BATCH_LIMIT,
     ) -> None:
         self._store = store
         self._docx = docx
+        # 表格分支（Issue #354 S-H3-2）：可选——单测/未装配表格能力时可以不传，
+        # 只要队列里不出现 delivery_type='sheet' 的行就不会被触碰
+        # （见 :meth:`_process_claim` 的分派）。真实装配见
+        # :func:`assemble_document_delivery_consumer`。
+        self._sheets = sheets
         self._notifier = notifier
         self._catalog = catalog or default_content_catalog()
         self._alert = on_alert or _default_alert
@@ -206,6 +281,8 @@ class DocumentDeliveryConsumer:
                     task_id=item.task_id,
                     requester_open_id=item.requester_open_id,
                     document_id=item.document_id,
+                    delivery_type=item.delivery_type,
+                    resource_url=item.resource_url,
                 )
 
         try:
@@ -229,6 +306,17 @@ class DocumentDeliveryConsumer:
         return len(claims)
 
     def _process_claim(self, claim: DocumentDeliveryClaim) -> None:
+        """按 ``claim.delivery_type`` 分派（Issue #354 S-H3-2）：docx 走
+        :meth:`_process_docx_claim`（既有逻辑，逐字未改），sheet 走
+        :meth:`_process_sheet_claim`（新增）。见模块文档「表格分支」一节。
+        """
+
+        if claim.delivery_type == DELIVERY_TYPE_SHEET:
+            self._process_sheet_claim(claim)
+        else:
+            self._process_docx_claim(claim)
+
+    def _process_docx_claim(self, claim: DocumentDeliveryClaim) -> None:
         from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
 
@@ -289,7 +377,81 @@ class DocumentDeliveryConsumer:
             self._uncertain(claim, last_error=type(error).__name__)
             return
 
-        if not _has_confirmed_full_access(members, claim.requester_open_id):
+        self._finalize_claim(claim, document_id=document_id, members=members, resource_url=None)
+
+    def _process_sheet_claim(self, claim: DocumentDeliveryClaim) -> None:
+        """表格分支（Issue #354 S-H3-2）：与 :meth:`_process_docx_claim` 逐项
+        对应，差异点见 ``adapters/feishu_sheets_delivery.py`` 模块文档「与文档
+        交付的差异点」：写值天然幂等（无条件重放，不需要 docx 那样的
+        ``read_body_children`` 判据）、查默认 sheet_id 是纯只读调用（同样无条件
+        重放，不需要检查点）、建表响应自带链接（与 ``document_id`` 一起随
+        :meth:`mark_document_created` 落检查点，不需要 ``tenant_domain``）。
+        """
+
+        from lingxi.adapters.feishu_sheets_delivery import FeishuSheetsDeliveryError
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+
+        spreadsheet_token = claim.document_id
+        resource_url = claim.resource_url
+        try:
+            if spreadsheet_token is None:
+                spreadsheet_token, resource_url = self._sheets.create_spreadsheet(claim.title)
+                # 检查点：独立提交，不与下面三步共享事务——同 docx 的
+                # mark_document_created 姿态，只是这里额外一并落 resource_url
+                # （sheet 独有：链接随建表响应一起拿到，不需要第二次调用）。
+                self._store.mark_document_created(
+                    request_id=claim.id, document_id=spreadsheet_token, resource_url=resource_url
+                )
+            sheet_id = self._sheets.get_default_sheet_id(spreadsheet_token)
+            # 写值天然幂等（PUT 覆盖式接口），检查点恢复路径无条件重放——不需要
+            # docx 那样先读一遍判断"是否已经写过"（见模块文档「表格分支」）。
+            self._sheets.write_values(spreadsheet_token, sheet_id, [list(row) for row in claim.paragraphs])
+            self._sheets.grant_full_access(spreadsheet_token, claim.requester_open_id)
+            members = self._sheets.read_members(spreadsheet_token)
+        except DocumentDeliveryOwnershipLost:
+            logger.warning(
+                "文档投递：建表成功但持有权已丢失，放弃本行续做 task_id=%s", claim.task_id
+            )
+            return
+        except FeishuSheetsDeliveryError as error:
+            if error.definite:
+                self._fail(claim, last_error=error.code)
+            else:
+                self._uncertain(claim, last_error=error.code)
+            return
+        except ValueError as error:
+            # 同 docx 分支的理由（见 _process_docx_claim 对应分支注释）：
+            # ``adapters.feishu_sheets_delivery`` 各方法的入参校验在**发出任何
+            # HTTP 请求之前**就会失败，没有"可能已经生效"的空间，归 failed。
+            self._fail(claim, last_error=type(error).__name__)
+            return
+        except Exception as error:  # noqa: BLE001 - 白名单反转，同 docx 分支
+            self._uncertain(claim, last_error=type(error).__name__)
+            return
+
+        self._finalize_claim(
+            claim, document_id=spreadsheet_token, members=members, resource_url=resource_url
+        )
+
+    def _finalize_claim(
+        self,
+        claim: DocumentDeliveryClaim,
+        *,
+        document_id: str,
+        members: list[dict[str, Any]],
+        resource_url: str | None,
+    ) -> None:
+        """docx/sheet 两条分支共用的收口：验证权限读回、落终态、发送通知
+        （Issue #354 S-H3-2 从 ``_process_claim`` 提炼，行为对 docx 零变化——
+        判断顺序、异常处理、日志/告警内容逐字相同，只多了 ``delivery_type``
+        字段用于分派通知文案）。
+        """
+
+        from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
+
+        if not _has_confirmed_full_access(
+            members, claim.requester_open_id, delivery_type=claim.delivery_type
+        ):
             # 读回结构正常，但没有找到目标 open_id 的 full_access 记录：结果不明
             # （可能是权限还没有生效、也可能是授权那一步实际没有成功），不得判
             # succeeded（测试③锚点）。
@@ -299,12 +461,12 @@ class DocumentDeliveryConsumer:
         try:
             self._store.mark_succeeded(request_id=claim.id)
         except DocumentDeliveryOwnershipLost:
-            # 四步已经全部跑完（文档已经建好、正文已经写、权限已经授予、读回
+            # 流程已经全部跑完（资源已经建好、内容已经写入、权限已经授予、读回
             # 也确认了），但落终态这一步才发现持有权已经丢失——同上，不发通知：
             # 这一行现在究竟是什么状态由真正持有它的那次调用决定，我们没有
             # 资格覆盖，也没有资格代表它去通知用户。
             logger.warning(
-                "文档投递：四步已跑完但持有权已丢失，放弃写入终态与通知 task_id=%s",
+                "文档投递：流程已跑完但持有权已丢失，放弃写入终态与通知 task_id=%s",
                 claim.task_id,
             )
             return
@@ -313,13 +475,18 @@ class DocumentDeliveryConsumer:
             return
 
         logger.info(
-            "gateway.document_delivery.succeeded task_id=%s attempts=%s", claim.task_id, claim.attempts
+            "gateway.document_delivery.succeeded task_id=%s attempts=%s delivery_type=%s",
+            claim.task_id,
+            claim.attempts,
+            claim.delivery_type,
         )
         self._send_ready_notice(
             request_id=claim.id,
             task_id=claim.task_id,
             requester_open_id=claim.requester_open_id,
             document_id=document_id,
+            delivery_type=claim.delivery_type,
+            resource_url=resource_url,
         )
 
     def _fail(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
@@ -353,10 +520,18 @@ class DocumentDeliveryConsumer:
         # R-1 第 3 条：此前只有 succeeded 会追加消息，用户请求生成文档失败后从未
         # 收到任何后续消息——表现成"发起之后再也没有下文"。措辞与 uncertain 区分
         # （见 content.toml「delivery.document_failed」）：failed 是确定结论，
-        # 可以直接建议用户重新发起。
-        self._send_terminal_notice(
-            claim, key="delivery.document_failed", dedupe_prefix="document-failed"
+        # 可以直接建议用户重新发起。表格分支（Issue #354 S-H3-2）按
+        # ``claim.delivery_type`` 选用对称的 sheet 文案/去重前缀，docx 分支的
+        # 取值逐字不变。
+        # 表格分支文案带追溯号（S-H3-2 卡明确要求，姿态照 Issue #280 裁定
+        # B2-4）——docx 分支的既有文案没有这个占位符，`_send_terminal_notice`
+        # 只在模板真的声明了 {reference} 时才传，docx 调用点因此逐字不变。
+        key, dedupe_prefix, variables = (
+            ("delivery.sheet_failed", "sheet-failed", {"reference": claim.task_id})
+            if claim.delivery_type == DELIVERY_TYPE_SHEET
+            else ("delivery.document_failed", "document-failed", {})
         )
+        self._send_terminal_notice(claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables)
 
     def _uncertain(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
@@ -385,22 +560,41 @@ class DocumentDeliveryConsumer:
         # R-1 第 3 条：措辞与 failed 区分（见 content.toml
         # 「delivery.document_uncertain」）——不建议用户自行重试：uncertain 的
         # 成因可能是一次有副作用的调用（建档/写正文/授权）网络异常，无法证明
-        # 没有生效，重试可能造成重复建档/重复授权，必须转人工核对。
-        self._send_terminal_notice(
-            claim, key="delivery.document_uncertain", dedupe_prefix="document-uncertain"
+        # 没有生效，重试可能造成重复建档/重复授权，必须转人工核对。表格分支
+        # （Issue #354 S-H3-2）同 `_fail` 一样按 ``claim.delivery_type`` 选用
+        # 对称文案，docx 分支取值逐字不变。
+        key, dedupe_prefix, variables = (
+            ("delivery.sheet_uncertain", "sheet-uncertain", {"reference": claim.task_id})
+            if claim.delivery_type == DELIVERY_TYPE_SHEET
+            else ("delivery.document_uncertain", "document-uncertain", {})
         )
+        self._send_terminal_notice(claim, key=key, dedupe_prefix=dedupe_prefix, template_variables=variables)
 
     def _send_ready_notice(
-        self, *, request_id: str, task_id: str, requester_open_id: str, document_id: str
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        requester_open_id: str,
+        document_id: str,
+        delivery_type: str = "docx",
+        resource_url: str | None = None,
     ) -> None:
-        """成功后把文档链接作为追加消息发给提问用户；失败只记日志/告警，不改写
-        已经落库的 ``succeeded`` 终态——文档已经建好且用户已经拿到权限，通知只是
-        一次锦上添花的提醒，不是这条请求"是否成功"的判据。
+        """成功后把文档/表格链接作为追加消息发给提问用户；失败只记日志/告警，
+        不改写已经落库的 ``succeeded`` 终态——文档/表格已经建好且用户已经拿到
+        权限，通知只是一次锦上添花的提醒，不是这条请求"是否成功"的判据。
 
         显式字段而不是接受整个 ``DocumentDeliveryClaim``（P2-2，opus 审查）：
-        本方法有两个调用点——刚跑完四步的原发送路径（``claim`` 现成可用），与
+        本方法有两个调用点——刚跑完流程的原发送路径（``claim`` 现成可用），与
         补发未确认送达通知的路径（``run_once`` 里的 :class:`UnnotifiedSuccess`，
         没有完整 claim——``title``/``paragraphs``/``attempts`` 对补发通知无关）。
+
+        ``delivery_type``/``resource_url``（迁移 0078，Issue #354 S-H3-2）：
+        docx 分支不传（保持默认值，取值/行为逐字不变，链接由
+        :meth:`~lingxi.adapters.feishu_docx_delivery.LarkDocxDelivery.
+        document_url` 纯本地拼接）；sheet 分支必须传非 ``None`` 的
+        ``resource_url``——表格链接不做格式猜测，只用建表检查点里已经落盘的值
+        （见迁移 0078 文件头部）。
 
         **成功才置位 ``notified_at``**：与 :meth:`PostgresDocumentDeliveryStore.
         mark_notified` 的幂等闸配合，补发路径（
@@ -409,12 +603,24 @@ class DocumentDeliveryConsumer:
         """
 
         try:
-            url = self._docx.document_url(document_id)
-            content = self._catalog.text("delivery.document_ready", url=url)
+            if delivery_type == DELIVERY_TYPE_SHEET:
+                if not isinstance(resource_url, str) or not resource_url:
+                    # 结构性不应发生：sheet 分支的 resource_url 与 document_id
+                    # 在同一次 mark_document_created 调用里一起落盘（见
+                    # _process_sheet_claim）。响亮失败而不是猜测/拼一个链接。
+                    raise LookupError("sheet 分支缺少可用的 resource_url")
+                url = resource_url
+                content_key = "delivery.sheet_ready"
+                dedupe_prefix = "sheet-ready"
+            else:
+                url = self._docx.document_url(document_id)
+                content_key = "delivery.document_ready"
+                dedupe_prefix = "document-ready"
+            content = self._catalog.text(content_key, url=url)
             self._notifier.send_text(
                 open_id=requester_open_id,
                 text=content.text,
-                dedupe_key=f"document-ready:{request_id}",
+                dedupe_key=f"{dedupe_prefix}:{request_id}",
             )
             self._store.mark_notified(request_id=request_id)
         except Exception as error:  # noqa: BLE001 - 通知失败不得回滚已经确认的交付结果
@@ -426,17 +632,30 @@ class DocumentDeliveryConsumer:
             self._alert("document_delivery_notice_failed", task_id)
 
     def _send_terminal_notice(
-        self, claim: DocumentDeliveryClaim, *, key: str, dedupe_prefix: str
+        self,
+        claim: DocumentDeliveryClaim,
+        *,
+        key: str,
+        dedupe_prefix: str,
+        template_variables: dict[str, Any] | None = None,
     ) -> None:
         """failed/uncertain 终态后把固定文案作为追加消息发给提问用户（opus 审查
         R-1 第 3 条）；失败只记日志/告警，不改写已经落库的终态——同
         :meth:`_send_ready_notice` 的姿态：通知是终态判定之后锦上添花的告知，
         不是终态本身的一部分。``dedupe_prefix`` 与 ``document-ready``（成功那一路
         的既有前缀）各自独立，三种终态各自的通知不会互相去重掉。
+
+        ``template_variables``（Issue #354 S-H3-2）：``ContentCatalog.text`` 要求
+        调用方变量集合与模板变量集合逐一相等，多传/少传都会报错——docx 分支的
+        两个既有 key（``delivery.document_failed``/``uncertain``）没有任何占位
+        变量，调用点因此不传（默认 ``None`` → 空字典 → 与改动前逐字相同的
+        ``self._catalog.text(key)`` 调用）；sheet 分支的 key 带 ``{reference}``，
+        由调用方（``_fail``/``_uncertain``）显式传 ``{"reference": claim.
+        task_id}``。
         """
 
         try:
-            content = self._catalog.text(key)
+            content = self._catalog.text(key, **(template_variables or {}))
             self._notifier.send_text(
                 open_id=claim.requester_open_id,
                 text=content.text,
@@ -485,12 +704,17 @@ class DocumentDeliveryConsumer:
 def assemble_document_delivery_consumer(
     config: Any, *, store: Any = None, alerting_duty: Any = None
 ) -> DocumentDeliveryConsumer | None:
-    """装配文档投递独立消费循环（Issue #341 S-ES-3）。
+    """装配文档/表格投递独立消费循环（Issue #341 S-ES-3；Issue #354 S-H3-2 新增
+    表格分支的装配）。
 
-    ``config.tenant_domain`` 未配置时返回 ``None``——循环整体不注册，与既有
-    ``roster_audit.duty_not_registered`` 等姿态一致的失败关闭（调用方
+    ``config.tenant_domain`` 未配置时返回 ``None``——循环整体不注册（docx 与
+    sheet 共用同一条循环，同一个失败关闭开关，见模块文档「表格分支」一节），
+    与既有 ``roster_audit.duty_not_registered`` 等姿态一致（调用方
     ``apps/gateway/__init__.py::main`` 据此决定要不要起第二条后台线程），不会
     用一个猜测的域名硬跑，也不会尝试装配任何飞书客户端或数据库连接。
+    ``LarkSheetsDelivery`` 本身不需要 ``tenant_domain``（见该模块文档「与文档
+    交付的差异点」第 1 条），这里仍然复用同一个开关只是为了不新增第二个装配
+    条件——两条分支本就共用同一条循环，拆开判断徒增复杂度。
     """
 
     if config.tenant_domain is None:
@@ -498,6 +722,7 @@ def assemble_document_delivery_consumer(
         return None
 
     from lingxi.adapters.feishu_docx_delivery import LarkDocxDelivery
+    from lingxi.adapters.feishu_sheets_delivery import LarkSheetsDelivery
     from lingxi.adapters.feishu_tenant_token import FeishuTenantTokenClient
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.core.permission.tenant_token_supply import TenantAccessTokenSupply
@@ -520,6 +745,10 @@ def assemble_document_delivery_consumer(
         tenant_access_token=tenant_access_token,
         tenant_domain=config.tenant_domain,
     )
+    sheets = LarkSheetsDelivery(
+        base_url=config.feishu_base_url,
+        tenant_access_token=tenant_access_token,
+    )
     notifier = FeishuUserMessages(
         base_url=config.feishu_base_url,
         app_id=config.app_id,
@@ -530,6 +759,7 @@ def assemble_document_delivery_consumer(
         store=store
         or PostgresDocumentDeliveryStore(str(config.postgres_dsn), timeouts=config.postgres_timeouts),
         docx=docx,
+        sheets=sheets,
         notifier=notifier,
         on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
     )

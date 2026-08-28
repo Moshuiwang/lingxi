@@ -164,6 +164,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from lingxi.core.identity.onboarding_ports import FailureReasonRecorder
 from lingxi.core.identity.onboarding_runner import (
     KEY_STALLED,
     STATE_MCP_SYNCING,
@@ -335,6 +336,7 @@ class StalledProvisioningDuty:
         audit: _AuditSink,
         notifier: _Notifier | None = None,
         alert: Callable[[int], None] | None = None,
+        failure_reasons: FailureReasonRecorder | None = None,
         lease_seconds: int = DEFAULT_STALLED_LEASE_SECONDS,
         limit: int = DEFAULT_STALLED_LIMIT,
         notify_backoff_seconds: int = DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS,
@@ -356,6 +358,9 @@ class StalledProvisioningDuty:
         self._notifier = notifier
         self._alert = alert
         self._audit = audit
+        #: 失败原因落库口（Issue #337，可选，见 ``FailureReasonRecorder`` 协议
+        #: 文档）。``None``＝未装配，行为与接线之前逐字节一致。
+        self._failure_reasons = failure_reasons
         self._lease_seconds = lease_seconds
         self._limit = limit
         self._notify_backoff_seconds = notify_backoff_seconds
@@ -525,6 +530,32 @@ class StalledProvisioningDuty:
             reason="stalled_lease_expired",
             trace_id=item.trace_id,
         )
+        # 失败原因落库（Issue #337）：紧邻上面那条既有审计。这条路径覆盖的是
+        # ``onboarding.result`` 从未写出的那一半——链本身死掉、``_execute`` 从未
+        # 跑完（见 ``core/identity/onboarding_runner.py`` 模块文档「同一类缺口的
+        # 另一半」）——``reason`` 固定复用上面这条审计已经在用的同一个字面量。
+        self._record_failure_reason(trace_id=item.trace_id)
+
+    def _record_failure_reason(self, *, trace_id: str) -> None:
+        """把这次租约到期收口的失败原因落库。**最佳努力**：与
+        ``core.identity.onboarding_runner.AutoOnboardingRunner._record_failure_
+        reason`` 同一条纪律——落库失败不得带走已经完成的收口，只改记一条自己的
+        失败审计。"""
+
+        if self._failure_reasons is None:
+            return
+        try:
+            self._failure_reasons.record_failure(
+                trace_id=trace_id,
+                failure_reason="stalled_lease_expired",
+                event_type="stalled_provisioning.aborted",
+            )
+        except Exception as error:  # noqa: BLE001 - 落库失败不得带走已完成的收口
+            self._audit.record(
+                "stalled_provisioning.failure_reason_record_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
 
 
 def _build_stalled_provisioning_duty(
@@ -557,6 +588,7 @@ def _build_stalled_provisioning_duty(
 
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.postgres_identity import PostgresAppUserStore
+    from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
     from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
     from lingxi.apps.scheduler.onboarding import (
         CatalogNotifier,
@@ -587,6 +619,7 @@ def _build_stalled_provisioning_duty(
         ),
         alert=alert,
         audit=audit,
+        failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
         lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
         stop=stop,
     )

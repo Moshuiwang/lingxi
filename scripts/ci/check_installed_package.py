@@ -277,6 +277,13 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.router",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
+    # 失败原因落库（Issue #337，S-H3-1）：`onboarding_failure` 表（迁移 0077）的
+    # 唯一 PostgreSQL 落点。被两处消费——`adapters.admin_registry.
+    # PostgresAdminQueries.trace_lookup`（`/admin trace` 查询，只 import
+    # `fetch_failure_reason`）与 `apps.scheduler.onboarding`/
+    # `apps.scheduler.stalled_provisioning`（`PostgresFailureReasonRecorder`
+    # 写入方，两处各自的构造函数内 import，见下面 scheduler 闭包同名条目）。
+    "lingxi.adapters.postgres_onboarding_failure",
     # 待确认操作：管理员写动作 prepare/confirm/cancel + 确认卡片/管理群通知渲染 +
     # 卡片回调编排（Issue #96 S-M-02）。全部只被 gateway 的管理命令面消费，与
     # 上面 admin_bootstrap 无关——admin_bootstrap 只播种登记表，不发起写动作。
@@ -307,6 +314,14 @@ REQUIRED_MODULES = (
     "lingxi.core.conversation.pipeline",
     # Issue #65 轻审 P2-2：未开通首聊交接对账扫描，由 apps/gateway 的 main() 装配。
     "lingxi.core.conversation.onboarding_recovery",
+    # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：core.conversation.commands/
+    # pipeline/ports 与 adapters.postgres_conversation._transaction 均模块级 import
+    # 本模块——数据形状（`UserMemoryEntry`）、取值域常量（`MEMORY_TYPES`）与写入/
+    # 提示词字符上限集中在这里，两侧调用方共用同一份事实。
+    "lingxi.core.user_memory",
+    # worker 侧只读拼装（Issue #357 S-H3-3 d 节）：查 user_memory、拼提示词段落，
+    # 由 apps/worker/cli.py 在 queue 模式模块级 import（恒装配，不受开关控制）。
+    "lingxi.adapters.postgres_user_memory",
     "lingxi.adapters.feishu_events",
     "lingxi.adapters.feishu_longconn",
     "lingxi.adapters.feishu_outbound",
@@ -375,6 +390,11 @@ REQUIRED_MODULES = (
     # `lingxi.core.identity.provisioning` 一条理由——必须随制品发布，否则接线那天
     # 才发现 wheel 里没有它。
     "lingxi.adapters.feishu_docx_delivery",
+    # 飞书电子表格交付适配器（Issue #354 S-H3-2）：建表/写值/授予「可管理」/协作者
+    # 读回，同 `feishu_docx_delivery` 一条理由——生产调用方是同一条 S-ES-3 投递
+    # 链路（`apps/gateway/document_delivery.py` 按 `delivery_type` 分派），必须
+    # 随制品发布。
+    "lingxi.adapters.feishu_sheets_delivery",
     # 文档投递独立消费循环（Issue #341 S-ES-3）：`apps/gateway/document_delivery.py`
     # 认领 `task_document_delivery_request` 行、驱动 S-ES-1 的四步交付，持久化面
     # 在 `adapters/postgres_document_delivery.py`。由 `apps/gateway/__init__.py`
@@ -493,6 +513,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.user_environment",
+            # 失败原因落库（Issue #337，S-H3-1）：`_build_onboarding_duty`
+            # （`apps/scheduler/onboarding.py`）与 `_build_stalled_provisioning_
+            # duty`（`apps/scheduler/stalled_provisioning.py`）各自在函数内
+            # import `PostgresFailureReasonRecorder`，两个调用点都不在模块级，
+            # 必须显式登记。
+            "lingxi.adapters.postgres_onboarding_failure",
             # 组织快照同步（Issue #250）：`apps/scheduler/__init__.py` 模块级 import
             # `OrgSnapshotSyncDuty`；读取编排 `feishu_org_snapshot_reader` 由
             # `_build_org_snapshot_sync_duty` 函数内 import，与 onboarding 一节
@@ -661,6 +687,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._queue_session_cleanup",
             "lingxi.adapters.postgres_conversation._task_queue",
             "lingxi.adapters.postgres_conversation._transaction",
+            # 用户记忆（Issue #357 S-H3-3）：`postgres_conversation._transaction`
+            # 模块级 import 本模块，`postgres_permission_publish.record_decision`
+            # 的权限真变分支复用 `_transaction` 调用 `clear_user_memory`——同上面
+            # "间接依赖也要显式登记"的既有理由，漏登记会直接让 scheduler 制品的
+            # 完整性核对判红。
+            "lingxi.core.user_memory",
             "lingxi.core",
             "lingxi.core.identity",
             # 花名册日报的短期令牌供给（Issue #215）：由 `apps/scheduler/credential_
@@ -831,6 +863,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
             # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
             "lingxi.core.year_grounding_guard",
+            # 用户记忆注入（Issue #357 S-H3-3 d 节）：`apps/worker/service.py` 在
+            # 模块级 import `RenderedUserMemoryPrompt`（Protocol 返回类型标注），
+            # `apps/worker/cli.py` 在模块级 import `PostgresUserMemoryReader`
+            # （queue 模式恒装配，不像内容采集那样受开关控制），漏登记会直接让
+            # worker 制品的完整性核对判红——与上面 postgres_content_capture 同一
+            # 条理由。
+            "lingxi.core.user_memory",
+            "lingxi.adapters.postgres_user_memory",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),
@@ -883,6 +923,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
             # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
             "lingxi.adapters.admin_registry",
+            # `/admin trace <追溯号>`（Issue #337，S-H3-1）：`PostgresAdminQueries.
+            # trace_lookup` 模块级 import `fetch_failure_reason`，随
+            # `admin_registry` 一起进了 gateway 的运行时闭包。
+            "lingxi.adapters.postgres_onboarding_failure",
             # 专用主体结构性出口前置（opus P3-1）：build_supervisor 在函数内 import
             # registered_delegated_subject_open_id，装配期读一次登记表把结果算成
             # 一个普通字符串交给管线（见该函数内注释）。刻意登记
@@ -948,6 +992,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # 用户记忆（Issue #357 S-H3-3）：core.conversation.commands/pipeline/
+            # ports 与 adapters.postgres_conversation._transaction 均模块级 import
+            # 本模块（/memory 命令面数据形状），漏登记会直接让 gateway 制品的完整性
+            # 核对判红——同上面几条"间接依赖也要显式登记"的既有理由。
+            "lingxi.core.user_memory",
             # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
             # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
             # 终态解析规则。apps.gateway.delivery 额外直接依赖 core.execution.*
@@ -978,10 +1027,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # scheduler 组「应用身份令牌」那条闭包同一来源）、完成通知出口
             # （`feishu_user_message`，已因 scheduler 权限变化通知在 REQUIRED_MODULES
             # 里，这里是它第一次进入 gateway 自己的运行时闭包）、以及持久化面
-            # （`postgres_document_delivery`）。
+            # （`postgres_document_delivery`）。表格分支（Issue #354 S-H3-2）在同一个
+            # 函数里同时 import 建表适配器（`feishu_sheets_delivery`），复用同一套
+            # 令牌供给与持久化面，不新增闭包分支。
             "lingxi.apps.gateway.document_delivery",
             "lingxi.adapters.postgres_document_delivery",
             "lingxi.adapters.feishu_docx_delivery",
+            "lingxi.adapters.feishu_sheets_delivery",
             "lingxi.adapters.feishu_tenant_token",
             "lingxi.adapters.feishu_user_message",
             "lingxi.core.identity.access_token_supply",

@@ -67,6 +67,7 @@ from lingxi.adapters.postgres_document_delivery import (
 from lingxi.apps.gateway.config import GatewayConfig, _Secret
 from lingxi.apps.gateway.document_delivery import (
     DocumentDeliveryConsumer,
+    _has_confirmed_full_access,
     assemble_document_delivery_consumer,
 )
 from lingxi.apps.worker.config import WorkerConfig
@@ -380,6 +381,67 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 (task_id,),
             ),
             "答案",
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM task_document_delivery_request WHERE task_id = %s", (task_id,)
+            ),
+            0,
+        )
+
+    def test_an_empty_dict_document_request_is_not_silently_skipped(self) -> None:
+        """P2-3（opus 审查）：``document_request={}`` 是合法的非 ``None`` 值，
+        但布尔求值为假——此前 ``document_request or sheet_request`` 会把它当成
+        "没提供"，既不尝试插入，也不触发 ``worker.document_request_insert_
+        failed`` 审计，调用方（未来任何按这条事件名聚合失败的运维消费方）永远
+        看不到这类畸形输入。修复后必须走到插入这一步、因缺少 ``title``/
+        ``paragraphs`` 被拒绝为 ``ValueError``，并落一条审计日志——终态答案本身
+        仍然必须成功写入，不受这次注定失败的插入拖累（同 P2-3 既有的 null
+        open_id 用例姿态）。
+
+        变异锚点：把 ``delivery_request = document_request if document_request
+        is not None else sheet_request`` 改回 ``document_request or sheet_
+        request``，本用例会从"确实尝试插入并记审计"变红成"整段被静默跳过、
+        assertLogs 收不到任何 ERROR"。
+        """
+
+        queue = PostgresTaskQueue(DSN)
+        conversation_id = "cnv-empty-dict-request"
+        task_id = "tsk-empty-dict-request"
+        with connect(DSN) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """INSERT INTO conversation
+                       (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
+                       VALUES (%s,'usr-doc',%s,%s,%s)""",
+                    (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+                )
+                connection.execute(
+                    """INSERT INTO task
+                       (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                        target_worker_version,worker_id,heartbeat_at,attempts,content_expires_at)
+                       VALUES (%s,%s,'usr-doc',%s,'问题','running','stable',
+                               'worker-1',now(),1,now())""",
+                    (task_id, conversation_id, f"event-{task_id}"),
+                )
+
+        with self.assertLogs(
+            "lingxi.adapters.postgres_conversation._queue_outbox", level="ERROR"
+        ) as logs:
+            appended = queue.write_terminal_event(
+                task_id=task_id,
+                worker_id="worker-1",
+                terminal_kind="success",
+                error_kind=None,
+                content="答案",
+                document_request={},
+            )
+
+        self.assertIsNotNone(appended, "终态答案必须成功写入，不能被这次畸形插入拖累")
+        self.assertFalse(appended.duplicate)
+        self.assertTrue(
+            any("document_request_insert_failed" in message for message in logs.output),
+            f"必须记一条插入失败审计，实际日志：{logs.output}",
         )
         self.assertEqual(
             self.scalar(
@@ -1386,6 +1448,46 @@ class TenantDomainNotConfiguredSentinelTest(unittest.TestCase):
         result = assemble_document_delivery_consumer(config)
 
         self.assertIsInstance(result, DocumentDeliveryConsumer)
+
+
+class HasConfirmedFullAccessNegativeTests(unittest.TestCase):
+    """P2-9（opus 审查）：``_has_confirmed_full_access`` 是纯逻辑判定，此前只在
+    真库层（``LINGXI_POSTGRES_DSN`` 门控）间接覆盖，未设置真库时这条红线——
+    ``perm`` 不是 ``full_access``（例如飞书只给了 ``view``/``edit`` 只读/可编辑
+    档位）绝不能被判定为"已确认"——在这台机器上零覆盖。这里补一个不依赖真库的
+    直接单测。
+
+    变异锚点：把 ``_has_confirmed_full_access`` 里 ``member.get("perm") ==
+    FULL_ACCESS_PERM`` 这个条件删掉（或改成只看 ``member_type``/``member_id``
+    是否匹配），本用例会从 ``False`` 变红成 ``True``。
+    """
+
+    TARGET_OPEN_ID = "ou_target_user"
+
+    def test_view_permission_is_not_confirmed_as_full_access(self) -> None:
+        members = [{"member_type": "openid", "member_id": self.TARGET_OPEN_ID, "perm": "view"}]
+
+        self.assertFalse(_has_confirmed_full_access(members, self.TARGET_OPEN_ID))
+        self.assertFalse(
+            _has_confirmed_full_access(members, self.TARGET_OPEN_ID, delivery_type="sheet")
+        )
+
+    def test_edit_permission_is_not_confirmed_as_full_access(self) -> None:
+        members = [{"member_type": "openid", "member_id": self.TARGET_OPEN_ID, "perm": "edit"}]
+
+        self.assertFalse(_has_confirmed_full_access(members, self.TARGET_OPEN_ID))
+        self.assertFalse(
+            _has_confirmed_full_access(members, self.TARGET_OPEN_ID, delivery_type="sheet")
+        )
+
+    def test_full_access_permission_is_confirmed_as_a_positive_control(self) -> None:
+        """反向哨兵：不是这个函数对任何输入都返回 False。"""
+
+        members = [
+            {"member_type": "openid", "member_id": self.TARGET_OPEN_ID, "perm": "full_access"}
+        ]
+
+        self.assertTrue(_has_confirmed_full_access(members, self.TARGET_OPEN_ID))
 
 
 if __name__ == "__main__":

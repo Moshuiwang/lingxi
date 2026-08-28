@@ -20,6 +20,7 @@ from lingxi.apps.worker.report_extraction import (
     _protocol_breakdown_reasons,
     _report_document_request,
     _report_guard_denied_count,
+    _report_sheet_request,
     _report_token_usage,
     _tool_result_count,
 )
@@ -34,6 +35,7 @@ from lingxi.core.execution.card_stream import (
     encode_progress_action,
 )
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
+from lingxi.core.user_memory import RenderedUserMemoryPrompt
 from lingxi.core.year_grounding_guard import detect_year_grounding_suspect
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,16 @@ _PROGRESS_FALLBACK_SECONDS = 30.0
 
 class QueueListener(Protocol):
     def wait(self, *, timeout_seconds: float) -> bool: ...
+
+
+class UserMemoryReader(Protocol):
+    """用户记忆注入口（Issue #357 S-H3-3 d 节）。真实实现是
+    ``adapters.postgres_user_memory.PostgresUserMemoryReader``；本模块只依赖这个
+    签名，鸭子类型足够，不 import 具体的 adapters 类型（与 `queue: Any` 同一姿态，
+    保持 `apps/worker` 对 `adapters` 的依赖只经装配层注入，不在类型签名里写死）。
+    """
+
+    def fetch_prompt_segment(self, *, user_id: str) -> RenderedUserMemoryPrompt | None: ...
 
 
 ExecutorFactory = Callable[[WorkerConfig, Callable[[], None]], Any]
@@ -124,6 +136,7 @@ class WorkerService:
         on_terminal_outcome: TerminalOutcomeCallback | None = None,
         content_capture_writer: Callable[[ContentCaptureRecord], None] | None = None,
         on_year_grounding_suspect: YearGroundingSuspectCallback | None = None,
+        user_memory_reader: UserMemoryReader | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -177,6 +190,11 @@ class WorkerService:
         # `_content_capture_writer` 同一姿态。真正的装配（是否接一个真实 sink）
         # 在 `apps/worker/cli.py`。
         self._on_year_grounding_suspect = on_year_grounding_suspect
+        # 用户记忆注入（Issue #357 S-H3-3 d 节）：``None`` 时 ``_process_task``
+        # 整体跳过——没有装配方就不查、不拼，行为与本项加入之前逐字节一致。真正
+        # 的装配（是否构造一个真实的 `PostgresUserMemoryReader`）在
+        # `apps/worker/cli.py` 的 queue 分支，与 `content_capture_writer` 同一姿态。
+        self._user_memory_reader = user_memory_reader
         # SIGTERM 收到后由 run() 设置：在途任务的 `_monitor` 据此把"进程正在停机"
         # 与"用户发了 /stop"同等看待，主动请求 Agent SDK 中断当前回合（Issue #153
         # 完成标准第 3 条）。默认 None，保持 process_once()/白盒测试的既有行为不变。
@@ -572,6 +590,38 @@ class WorkerService:
                         prompt_degraded,
                         claimed.task_id,
                     )
+            # 用户记忆注入（Issue #357 S-H3-3 d 节）：查到该用户的 user_memory 行
+            # （用 claimed.user_id，与上面 load_user_mcp_servers 同一个字段来源），
+            # 拼进 task_system_prompt 尾部。**fail-open，与 .mcp.json 的失败关闭
+            # 相反**——记忆查询失败/超时不应该拖累用户本来能拿到的问数结果，照抄
+            # 本文件已有的 prompt_degraded 降级先例：留一条 worker.user_memory.
+            # degraded 结构化日志，本任务不带记忆继续跑，不中断任务。
+            if self._user_memory_reader is not None:
+                try:
+                    memory_result = await asyncio.to_thread(
+                        self._user_memory_reader.fetch_prompt_segment,
+                        user_id=claimed.user_id,
+                    )
+                except Exception as error:  # noqa: BLE001 - fail-open，见上方说明
+                    logger.warning(
+                        "worker.user_memory.degraded error=%s task_id=%s（本任务不带记忆继续执行）",
+                        type(error).__name__,
+                        claimed.task_id,
+                    )
+                else:
+                    if memory_result is not None and memory_result.text:
+                        if memory_result.truncated:
+                            logger.warning(
+                                "worker.user_memory.prompt_truncated kept=%d total=%d task_id=%s",
+                                memory_result.kept_entries,
+                                memory_result.total_entries,
+                                claimed.task_id,
+                            )
+                        task_system_prompt = (
+                            f"{task_system_prompt}\n\n{memory_result.text}"
+                            if task_system_prompt
+                            else memory_result.text
+                        )
             # ``replace`` 会重跑 ``__post_init__``：task_config 携带的是**已解析**
             # 的提示词，必须同时清掉文件指针，否则「file 与 prompt 互斥」的不变量
             # 会把每一个成功读到提示词的任务当场炸成 session_failed（首版实现
@@ -811,6 +861,9 @@ class WorkerService:
                 # 绝不建投递请求——用户没拿到问答结果，就不该收到对应文档
                 # （withheld=安全策略事后拒发正文等各有独立判非成功的理由）。
                 document_request=_report_document_request(report),
+                # 表格投递请求（Issue #354 S-H3-2 契约）：与 document_request 同一
+                # 判断分支、同一转发时机，不是独立的第二条路径。
+                sheet_request=_report_sheet_request(report),
             )
 
         # 内测轮内容级采集（Issue #251/#304 批次 3）：无论上面走了哪条终态分支
@@ -951,6 +1004,7 @@ class WorkerService:
         guard_denied_count: int | None = None,
         token_usage: Mapping[str, int] | None = None,
         document_request: Mapping[str, Any] | None = None,
+        sheet_request: Mapping[str, Any] | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -973,6 +1027,11 @@ class WorkerService:
         （``_process_task`` 真正成功分支）判定"业务成功且报告契约携带非空
         document_request"时才非 ``None``——原样透传 ``write_terminal_event``，
         由它在写终态的同一事务里插入文档投递请求行；其余分支恒 ``None``。
+
+        ``sheet_request``（Issue #354 S-H3-2，迁移 ``0078``）：与
+        ``document_request`` 同一判断分支、同一转发时机的并列字段，原样透传，
+        不在这一层做互斥校验（真正的互斥校验在
+        ``write_terminal_event``——见该方法文档）。
         """
 
         self._log_terminal_outcome(
@@ -997,6 +1056,7 @@ class WorkerService:
             token_usage=token_usage,
             guard_denied_count=guard_denied_count,
             document_request=document_request,
+            sheet_request=sheet_request,
         )
 
     def _log_terminal_outcome(

@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-27-4"
-digest = "sha256:a3532d1dd8bf1ab8772d0c5e150296fc9ffd173214fad1f9f4701932fec7fa3e"
+version = "2026-08-28-4"
+digest = "sha256:9604f82a0764e85336b06a735c98ec047fac2207c98cf7958b2ef53b53714a99"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -20,6 +20,10 @@ retired_versions = [
   "2026-08-27",
   "2026-08-27-2",
   "2026-08-27-3",
+  "2026-08-27-4",
+  "2026-08-28-1",
+  "2026-08-28-2",
+  "2026-08-28-3",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -35,6 +39,9 @@ retired_versions = [
 "texts.delivery.document_failed" = "ca1a6cd54a25a5b9"
 "texts.delivery.document_ready" = "b1877a81322f75a3"
 "texts.delivery.document_uncertain" = "96c0bce63615ee08"
+"texts.delivery.sheet_failed" = "41e6b7f46e1de788"
+"texts.delivery.sheet_ready" = "3e7fbf93015d32a9"
+"texts.delivery.sheet_uncertain" = "6cb0ac2f13362da1"
 "texts.gateway.busy_hint" = "7984bc41c89b9e08"
 "texts.gateway.delivery_expired" = "650d1541a4369696"
 "texts.gateway.group_mention_hint" = "6ff88d15b2832edb"
@@ -43,6 +50,20 @@ retired_versions = [
 "texts.gateway.session_rotated" = "df77349f3165a8cb"
 "texts.gateway.slash_rejected" = "9b97c561e83c0302"
 "texts.gateway.suspended" = "367f5c5462e3358e"
+"texts.memory.cleared" = "69a517b197f284af"
+"texts.memory.forget_not_found" = "230bcb25eb539164"
+"texts.memory.forgotten" = "8dd2951f8b668251"
+"texts.memory.limit_exceeded" = "04fe51feb442a36c"
+"texts.memory.list" = "7417464c7145de9c"
+"texts.memory.list_empty" = "f25239a6855eb251"
+"texts.memory.list_entry" = "fe4361b6a8f4c1e5"
+"texts.memory.list_entry_unsafe" = "6908c89a084dc5ff"
+"texts.memory.remember_unsafe" = "186bff87bab87ad4"
+"texts.memory.remembered" = "284fff1c7a19ba43"
+"texts.memory.type_label.calibration_preference" = "fd959acebfa8d8f3"
+"texts.memory.type_label.convention_template" = "95271099604f4d6e"
+"texts.memory.type_label.term_mapping" = "6030911f16b8b73d"
+"texts.memory.usage_help" = "6abdb399dc856115"
 "texts.onboarding.checking" = "738d208e40a19f0b"
 "texts.onboarding.completed" = "4733d8c930485684"
 "texts.onboarding.delegated_subject" = "2d5caff476da0546"

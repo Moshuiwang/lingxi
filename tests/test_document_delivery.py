@@ -37,12 +37,17 @@ from lingxi.apps.worker.config import WorkerConfigError, load_config
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.core.execution.document_delivery import (
     DELIVER_DOCUMENT_TOOL_NAME,
+    DELIVER_SPREADSHEET_TOOL_NAME,
     DELIVERY_MCP_SERVER_NAME,
     DocumentDeliveryError,
     MAX_PARAGRAPHS,
+    MAX_SHEET_COLUMNS,
+    MAX_SHEET_ROWS,
+    MAX_SHEET_TOTAL_CHARS,
     MAX_TITLE_CHARS,
     MAX_TOTAL_CHARS,
     build_document_request,
+    build_sheet_request,
     normalize_markdown,
 )
 from lingxi.core.execution.hooks import ToolGateway
@@ -177,6 +182,122 @@ class BuildDocumentRequestTest(unittest.TestCase):
         self.assertEqual(ctx.exception.reason_code, "leak_detected")
 
 
+# ----------------------------------------------------------- 纯逻辑：build_sheet_request（Issue #354 S-H3-2）
+
+
+class BuildSheetRequestTest(unittest.TestCase):
+    """与 ``BuildDocumentRequestTest`` 逐项对称——见
+    ``core/execution/document_delivery.py`` 模块文档「表格分支」一节。"""
+
+    def test_valid_request_round_trips_title_and_rows(self) -> None:
+        request = build_sheet_request(title="销售汇总", rows=[["月份", "销售额"], ["1月", "100"]])
+
+        self.assertEqual(request.title, "销售汇总")
+        self.assertEqual(request.rows, (("月份", "销售额"), ("1月", "100")))
+        self.assertEqual(request.total_chars, sum(len(cell) for row in request.rows for cell in row))
+
+    def test_title_out_of_bounds_is_rejected(self) -> None:
+        for bad_title in ("", "   ", "x" * (MAX_TITLE_CHARS + 1)):
+            with self.subTest(title=bad_title):
+                with self.assertRaises(DocumentDeliveryError) as ctx:
+                    build_sheet_request(title=bad_title, rows=[["a"]])
+                self.assertEqual(ctx.exception.reason_code, "invalid_title")
+
+    def test_non_string_title_is_rejected_not_coerced(self) -> None:
+        with self.assertRaises(DocumentDeliveryError):
+            build_sheet_request(title=None, rows=[["a"]])
+
+    def test_empty_rows_is_rejected(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[])
+        self.assertEqual(ctx.exception.reason_code, "empty_rows")
+
+    def test_rows_that_is_not_a_list_is_rejected(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows="不是列表")
+        self.assertEqual(ctx.exception.reason_code, "empty_rows")
+
+    def test_an_empty_row_is_rejected(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[["a"], []])
+        self.assertEqual(ctx.exception.reason_code, "invalid_row")
+
+    def test_a_row_that_is_not_a_list_is_rejected(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[["a"], "b"])
+        self.assertEqual(ctx.exception.reason_code, "invalid_row")
+
+    def test_a_non_string_cell_is_rejected_not_coerced(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[["a", 1]])
+        self.assertEqual(ctx.exception.reason_code, "invalid_cell")
+
+    def test_too_many_rows_is_rejected_without_silent_truncation(self) -> None:
+        """变异锚点（对称①）：跳过硬上限校验会让这条用例变绿（不再拒绝）。"""
+
+        rows = [[f"第{i}行"] for i in range(MAX_SHEET_ROWS + 1)]
+
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=rows)
+
+        self.assertEqual(ctx.exception.reason_code, "too_many_rows")
+
+    def test_too_many_columns_is_rejected_without_silent_truncation(self) -> None:
+        row = [f"c{i}" for i in range(MAX_SHEET_COLUMNS + 1)]
+
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[row])
+
+        self.assertEqual(ctx.exception.reason_code, "too_many_columns")
+
+    def test_total_chars_over_limit_is_rejected_without_silent_truncation(self) -> None:
+        rows = [["A" * 5000] for _ in range(5)]  # 5 格、总长 25000 > 上限 20000
+
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=rows)
+
+        self.assertEqual(ctx.exception.reason_code, "too_many_chars")
+        self.assertLessEqual(MAX_SHEET_TOTAL_CHARS, 20000)
+
+    def test_body_leaking_an_internal_tool_name_pattern_is_rejected(self) -> None:
+        """变异锚点（对称④）：跳过 constrain_output 会让这条用例变绿。"""
+
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(title="标题", rows=[["mcp__query__list_metrics"]])
+
+        self.assertEqual(ctx.exception.reason_code, "leak_detected")
+
+    def test_body_leaking_a_configured_forbidden_value_is_rejected(self) -> None:
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_sheet_request(
+                title="标题",
+                rows=[["绝密业务指标口径ABC"]],
+                forbidden_values=("绝密业务指标口径ABC",),
+            )
+
+        self.assertEqual(ctx.exception.reason_code, "leak_detected")
+
+    def test_short_rows_are_padded_to_the_longest_row_with_empty_strings(self) -> None:
+        """P1（Trace #373 H3 批量审查）：短行补齐空字符串到最长行的列数，返回
+        的 ``rows`` 始终是矩形——飞书对不规则 ``range`` 输入的真实语义未经验证，
+        补齐比原样透传更保守。
+
+        变异锚点：把补齐逻辑改坏（例如漏掉补齐、或补的不是空字符串），本用例
+        会从矩形结果变红。
+        """
+
+        request = build_sheet_request(title="标题", rows=[["a", "b", "c"], ["d"]])
+
+        self.assertEqual(request.rows, (("a", "b", "c"), ("d", "", "")))
+        # 补齐只加空字符串，不改变总字符数。
+        self.assertEqual(request.total_chars, 4)
+
+    def test_all_rows_already_the_same_length_are_unaffected_by_padding(self) -> None:
+        request = build_sheet_request(title="标题", rows=[["a", "b"], ["c", "d"]])
+
+        self.assertEqual(request.rows, (("a", "b"), ("c", "d")))
+
+
 # ----------------------------------------------------------- 开关解析
 
 
@@ -201,6 +322,7 @@ class DocumentDeliveryConfigFlagTest(unittest.TestCase):
 
         config = load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1"))
         self.assertNotIn(DELIVER_DOCUMENT_TOOL_NAME, config.read_only_tools)
+        self.assertNotIn(DELIVER_SPREADSHEET_TOOL_NAME, config.read_only_tools)
 
 
 # ----------------------------------------------------------- 装配：ToolPolicy 合入与拒绝姿态
@@ -215,10 +337,22 @@ class ToolPolicyMergeTest(unittest.TestCase):
         self.assertIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
         self.assertIn(READ_ONLY_TOOL, executor.policy.allowed_tools, "合入不能挤掉既有只读工具")
 
+    def test_enabled_merges_the_spreadsheet_tool_name_too(self) -> None:
+        """表格分支（Issue #354 S-H3-2）：同一个开关新增并列工具，不是单独开关。
+
+        变异锚点：不合入白名单会让这条用例变绿。
+        """
+
+        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+
+        self.assertIn(DELIVER_SPREADSHEET_TOOL_NAME, executor.policy.allowed_tools)
+        self.assertIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
+
     def test_disabled_keeps_the_tool_out_of_the_policy_whitelist(self) -> None:
         executor = WorkerTurnExecutor(load_config(_env()))
 
         self.assertNotIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
+        self.assertNotIn(DELIVER_SPREADSHEET_TOOL_NAME, executor.policy.allowed_tools)
 
     def test_disabled_denies_the_tool_with_the_existing_wording_posture(self) -> None:
         """②：开关关时，若这个工具名仍被调用，走的是与任何越界工具完全相同的
@@ -245,6 +379,27 @@ class ToolPolicyMergeTest(unittest.TestCase):
         self.assertEqual(denied[0].tool_name, DELIVER_DOCUMENT_TOOL_NAME)
         self.assertIs(denied[0].deny_reason_code, DenyReasonCode.NOT_IN_WHITELIST)
 
+    def test_disabled_denies_the_spreadsheet_tool_with_the_existing_wording_posture(self) -> None:
+        executor = WorkerTurnExecutor(load_config(_env()))
+
+        response = asyncio.run(
+            executor.gateway.on_hook_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": DELIVER_SPREADSHEET_TOOL_NAME,
+                    "tool_input": {"title": "x", "rows": [["y"]]},
+                    "tool_use_id": "toolu_sheet_denied",
+                }
+            )
+        )
+
+        decision = response.get("hookSpecificOutput", {})
+        self.assertEqual(decision.get("permissionDecision"), "deny")
+        denied = executor.gateway.audit.summary().denied_calls
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].tool_name, DELIVER_SPREADSHEET_TOOL_NAME)
+        self.assertIs(denied[0].deny_reason_code, DenyReasonCode.NOT_IN_WHITELIST)
+
 
 # ----------------------------------------------------------- 装配：真实 SDK MCP 服务挂载
 
@@ -264,12 +419,25 @@ class DeliveryMcpServerMountTest(unittest.TestCase):
         self.assertIn(DELIVER_DOCUMENT_TOOL_NAME, options.allowed_tools)
         self.assertIn(READ_ONLY_TOOL, options.allowed_tools)
 
+    def test_enabled_mounts_the_spreadsheet_tool_on_the_same_server(self) -> None:
+        """表格分支（Issue #354 S-H3-2）：同一个 MCP 服务下的并列工具，不是
+        另开一个服务——见 core/execution/document_delivery.py 模块文档
+        「表格分支」一节。"""
+
+        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+
+        options = executor.build_session_options()
+
+        self.assertIn(DELIVERY_MCP_SERVER_NAME, options.mcp_servers)
+        self.assertIn(DELIVER_SPREADSHEET_TOOL_NAME, options.allowed_tools)
+
     def test_disabled_never_builds_the_server(self) -> None:
         executor = WorkerTurnExecutor(load_config(_env()))
 
         options = executor.build_session_options()
 
         self.assertNotIn(DELIVERY_MCP_SERVER_NAME, options.mcp_servers or {})
+        self.assertNotIn(DELIVER_SPREADSHEET_TOOL_NAME, options.allowed_tools)
 
 
 # ----------------------------------------------------------- 处理函数：登记 / 拒绝 / 覆盖
@@ -393,6 +561,152 @@ class DeliverDocumentHandlerTest(unittest.TestCase):
         self.assertIn("worker.document_request_replaced", event_names)
 
 
+# ----------------------------------------------------------- 处理函数：表格分支（Issue #354 S-H3-2）
+
+
+class DeliverSpreadsheetHandlerTest(unittest.TestCase):
+    """与 ``DeliverDocumentHandlerTest`` 逐项对称，外加两个跨类型互斥用例。"""
+
+    def test_handler_rejects_defensively_when_switch_is_off(self) -> None:
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(load_config(_env()), stderr_stream=buffer)
+
+        result = executor._handle_deliver_spreadsheet("标题", [["a"]])
+
+        self.assertTrue(result.get("is_error"))
+        self.assertIsNone(executor._sheet_request)
+        events = _stderr_events(buffer)
+        # P2-8（opus 审查）：表格分支记独立的 worker.sheet_request_rejected，
+        # 不复用文档分支的事件名——运维按事件名过滤时能区分来源。
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
+        self.assertEqual(events[-1]["reason"], "disabled")
+
+    def test_handler_registers_a_valid_request_and_audits_it(self) -> None:
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
+        )
+
+        result = executor._handle_deliver_spreadsheet("销售汇总", [["月份", "销售额"], ["1月", "100"]])
+
+        self.assertNotIn("is_error", result)
+        self.assertIsNotNone(executor._sheet_request)
+        self.assertEqual(executor._sheet_request.title, "销售汇总")
+        self.assertEqual(executor._sheet_request.rows, (("月份", "销售额"), ("1月", "100")))
+        events = _stderr_events(buffer)
+        self.assertEqual(events[-1]["event"], "worker.document_request_registered")
+        self.assertEqual(events[-1]["row_count"], 2)
+        self.assertNotIn("title", events[-1])
+        self.assertNotIn("rows", events[-1])
+
+    def test_handler_rejects_oversize_request_without_silent_truncation(self) -> None:
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
+        )
+        oversized_rows = [[f"第{i}行"] for i in range(MAX_SHEET_ROWS + 1)]
+
+        result = executor._handle_deliver_spreadsheet("标题", oversized_rows)
+
+        self.assertTrue(result.get("is_error"))
+        self.assertIsNone(executor._sheet_request)
+        events = _stderr_events(buffer)
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
+        self.assertEqual(events[-1]["reason"], "too_many_rows")
+
+    def test_handler_rejects_when_body_leaks_internal_tool_name_pattern(self) -> None:
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
+        )
+
+        result = executor._handle_deliver_spreadsheet("标题", [["mcp__query__list_metrics"]])
+
+        self.assertTrue(result.get("is_error"))
+        self.assertIsNone(executor._sheet_request)
+        events = _stderr_events(buffer)
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
+        self.assertEqual(events[-1]["reason"], "leak_detected")
+
+    def test_handler_rejects_when_body_leaks_a_configured_external_text_via_real_assembly(self) -> None:
+        """同 ``DeliverDocumentHandlerTest`` 的 P1-1 用例：``config.external_
+        texts`` 拆包必须在表格分支同样生效，不是只有文档分支修过。"""
+
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(
+                _env(
+                    LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1",
+                    LINGXI_WORKER_METRIC_DESCRIPTION="内部专用指标口径说明，不得外传",
+                )
+            ),
+            stderr_stream=buffer,
+        )
+
+        result = executor._handle_deliver_spreadsheet("标题", [["内部专用指标口径说明，不得外传"]])
+
+        self.assertTrue(result.get("is_error"))
+        self.assertIsNone(executor._sheet_request)
+        events = _stderr_events(buffer)
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
+        self.assertEqual(events[-1]["reason"], "leak_detected")
+
+    def test_second_call_within_the_same_turn_replaces_the_first_and_is_audited(self) -> None:
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
+        )
+
+        executor._handle_deliver_spreadsheet("第一版标题", [["a"]])
+        result = executor._handle_deliver_spreadsheet("第二版标题", [["b"]])
+
+        self.assertNotIn("is_error", result)
+        self.assertEqual(executor._sheet_request.title, "第二版标题")
+        events = _stderr_events(buffer)
+        event_names = [event["event"] for event in events]
+        self.assertEqual(event_names.count("worker.document_request_registered"), 2)
+        self.assertIn("worker.document_request_replaced", event_names)
+
+    def test_calling_deliver_document_then_deliver_spreadsheet_leaves_only_the_sheet_slot_set(
+        self,
+    ) -> None:
+        """跨类型互斥（Issue #354 S-H3-2）：这一回合先调用 deliver_document、
+        再调用 deliver_spreadsheet——"最后一次调用为准"跨类型同样成立，文档
+        槽位必须被清空，不能两个槽位同时非空（否则 write_terminal_event 会
+        同时收到 document_request 与 sheet_request，触发它的互斥校验）。
+
+        变异锚点：把 _handle_deliver_spreadsheet 里 ``self._document_request =
+        None`` 这一行删掉，本用例会从"文档槽位为 None"变红成"文档槽位仍是第
+        一次调用登记的那个请求"。
+        """
+
+        buffer = io.StringIO()
+        executor = WorkerTurnExecutor(
+            load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")), stderr_stream=buffer
+        )
+
+        executor._handle_deliver_document("文档标题", "文档正文")
+        executor._handle_deliver_spreadsheet("表格标题", [["a"]])
+
+        self.assertIsNone(executor._document_request)
+        self.assertIsNotNone(executor._sheet_request)
+        self.assertEqual(executor._sheet_request.title, "表格标题")
+
+    def test_calling_deliver_spreadsheet_then_deliver_document_leaves_only_the_document_slot_set(
+        self,
+    ) -> None:
+        """同上，反过来调用顺序。"""
+
+        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+
+        executor._handle_deliver_spreadsheet("表格标题", [["a"]])
+        executor._handle_deliver_document("文档标题", "文档正文")
+
+        self.assertIsNone(executor._sheet_request)
+        self.assertIsNotNone(executor._document_request)
+        self.assertEqual(executor._document_request.title, "文档标题")
+
+
 # ----------------------------------------------------------- 端到端：run_turn() 报告契约
 
 
@@ -486,6 +800,48 @@ class RunTurnReportContractTest(unittest.TestCase):
         self.assertIsNotNone(first_report["document_request"])
         self.assertIsNone(second_report["document_request"])
 
+    def _run_with_sheet_delivery_call(
+        self, *, title: str = "销售汇总", rows=None, fail: bool = False
+    ):
+        from unittest.mock import patch
+
+        rows = rows if rows is not None else [["月份", "销售额"], ["1月", "100"]]
+        executor = WorkerTurnExecutor(load_config(_env(LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED="1")))
+
+        async def fake_run_single_turn(*, options, prompt, sink, timeout_seconds, **_kwargs):
+            del options, prompt, timeout_seconds
+            executor._handle_deliver_spreadsheet(title, rows)
+            if fail:
+                raise TimeoutError("simulated turn timeout")
+            sink({"kind": "assistant_message", "text": "表格请求已经登记好了。"})
+            sink({"kind": "result", "is_error": False, "subtype": "success"})
+            await executor.gateway.on_hook_event({"hook_event_name": "Stop"})
+
+        with patch("lingxi.apps.worker.turn.run_single_turn", fake_run_single_turn):
+            report = asyncio.run(executor.run_turn("请给我一张销售汇总表"))
+        return report, executor
+
+    def test_successful_turn_carries_the_sheet_request_in_the_report(self) -> None:
+        """与 ``test_successful_turn_carries_the_document_request_in_the_report``
+        对称：报告带 sheet_request，字段形状是 title + rows；document_request
+        恒为 None（两个槽位互斥）。"""
+
+        report, _executor = self._run_with_sheet_delivery_call()
+
+        self.assertTrue(report["turn"]["closed"])
+        self.assertIsNone(report["failure"])
+        self.assertEqual(
+            report["sheet_request"],
+            {"title": "销售汇总", "rows": [["月份", "销售额"], ["1月", "100"]]},
+        )
+        self.assertIsNone(report["document_request"])
+
+    def test_failed_turn_does_not_carry_the_sheet_request(self) -> None:
+        report, _executor = self._run_with_sheet_delivery_call(fail=True)
+
+        self.assertIsNotNone(report["failure"])
+        self.assertIsNone(report["sheet_request"])
+
 
 # ----------------------------------------------------------- 侧效判定修正
 
@@ -498,10 +854,15 @@ class SideEffectClassificationTest(unittest.TestCase):
     _queue_lifecycle.py::reclaim_stale``）会因为 ``side_effect_state='possible'``
     拒绝安全重试，让一个只是想要文档的用户平白收到失败终态。变异锚点：把
     ``_is_side_effecting_tool`` 改回显式把它列为例外（``return True``），本用例
-    会变红。"""
+    会变红。``deliver_spreadsheet`` 同一形状（``mcp__`` 前缀），不需要改
+    ``_is_side_effecting_tool`` 本身——它对任何 ``mcp__`` 前缀工具都成立，
+    见 ``core/execution/document_delivery.py`` 模块文档「表格分支」一节。"""
 
     def test_deliver_document_tool_is_not_classified_as_side_effecting(self) -> None:
         self.assertFalse(ToolGateway._is_side_effecting_tool(DELIVER_DOCUMENT_TOOL_NAME))
+
+    def test_deliver_spreadsheet_tool_is_not_classified_as_side_effecting(self) -> None:
+        self.assertFalse(ToolGateway._is_side_effecting_tool(DELIVER_SPREADSHEET_TOOL_NAME))
 
     def test_read_only_query_tools_remain_non_side_effecting(self) -> None:
         self.assertFalse(ToolGateway._is_side_effecting_tool("mcp__query__list_metrics"))
@@ -533,9 +894,11 @@ class SentinelNormalQaUnaffectedTest(unittest.TestCase):
         )
 
         self.assertIsNone(report.get("document_request"))
+        self.assertIsNone(report.get("sheet_request"))
         self.assertTrue(report["turn"]["closed"])
         self.assertEqual(report["turn"]["final_text"], "近 7 天活跃用户数是 1024。")
         self.assertNotIn(DELIVER_DOCUMENT_TOOL_NAME, executor.policy.allowed_tools)
+        self.assertNotIn(DELIVER_SPREADSHEET_TOOL_NAME, executor.policy.allowed_tools)
 
 
 if __name__ == "__main__":

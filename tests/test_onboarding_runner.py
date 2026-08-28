@@ -467,6 +467,22 @@ class RecordingAudit:
         raise AssertionError(f"没有记到 {action}：{self.actions()}")
 
 
+class RecordingFailureReasons:
+    """``FailureReasonRecorder`` 的内存假实现（Issue #337）：记录每一次调用的
+    完整关键字参数，供断言核对。"""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.raise_error = raise_error
+
+    def record_failure(self, *, trace_id: str, failure_reason: str, event_type: str) -> None:
+        if self.raise_error:
+            raise RuntimeError("模拟失败原因落库故障")
+        self.calls.append(
+            {"trace_id": trace_id, "failure_reason": failure_reason, "event_type": event_type}
+        )
+
+
 class InlineExecutor:
     """同步跑掉提交的任务，让链路断言不依赖线程调度。"""
 
@@ -517,6 +533,10 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "ledger": FakeLedger(),
         "audit": RecordingAudit(),
         "onboarding_failed": None,
+        # 默认 None：哨兵——不注入失败原因落库口时，行为必须与接线之前逐字节
+        # 一致（Issue #337，见 FailureReasonRecordingTests.test_no_recorder_
+        # injected_keeps_prior_behavior）。
+        "failure_reasons": None,
         # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
         # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
         "local_overrides": None,
@@ -564,6 +584,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         should_stop=overrides.get("should_stop", lambda: False),
         publish_wait_seconds=overrides.get("publish_wait_seconds", 3.0),
         onboarding_failed=parts["onboarding_failed"],
+        failure_reasons=parts["failure_reasons"],
         local_overrides=parts["local_overrides"],
         legacy_source=parts["legacy_source"],
         publish_history=parts["publish_history"],
@@ -1424,6 +1445,81 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
 
         self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
         self.assertIn("onboarding.alert_callback_failed", parts["audit"].actions())
+
+
+class FailureReasonRecordingTests(unittest.TestCase):
+    """失败原因落库（Issue #337，可选，见 ``FailureReasonRecorder`` 协议
+    文档）：紧邻既有 ``onboarding.result`` 审计，只在真的是一次失败终态时调用
+    一次注入的可选口，不含 open_id / 姓名 / 任何资料值。"""
+
+    def test_an_internal_error_terminal_records_the_failure_reason(self) -> None:
+        recorder = RecordingFailureReasons()
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            failure_reasons=recorder,
+        )
+        self.assertEqual(
+            recorder.calls,
+            [
+                {
+                    "trace_id": "trace_1",
+                    "failure_reason": "directory_unavailable",
+                    "event_type": "onboarding.result",
+                }
+            ],
+        )
+
+    def test_a_non_failure_terminal_never_records_anything(self) -> None:
+        """否定断言：成功终态（``terminal.reason`` 恒为 ``None``）不得落任何
+        失败原因行——本测试证明它压根不会被调用。"""
+
+        recorder = RecordingFailureReasons()
+        run_once(failure_reasons=recorder)
+        self.assertEqual(recorder.calls, [], "开通完成不应该落任何失败原因行")
+
+    def test_a_deterministic_business_failure_also_records_the_failure_reason(self) -> None:
+        """与管理员告警回调（只覆盖 INTERNAL_ERROR/SYNC_TIMEOUT）不同：失败原因
+        落库覆盖**任何**非空 ``terminal.reason``，包含确定性业务失败
+        （``NOT_AUTHORIZED``）——`/admin trace` 需要能如实回答"这条追溯号当时
+        判的是什么"，不只是"本侧故障"这一类。"""
+
+        recorder = RecordingFailureReasons()
+        parts, _ = run_once(directory=FakeDirectory(members=()), failure_reasons=recorder)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["state"], "not_authorized"
+        )
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(recorder.calls[0]["event_type"], "onboarding.result")
+
+    def test_the_recorder_never_receives_open_id_or_profile_values(self) -> None:
+        recorder = RecordingFailureReasons()
+        run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            failure_reasons=recorder,
+        )
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertNotIn(OPEN_ID, recorder.calls[0].values())
+        self.assertEqual(set(recorder.calls[0]), {"trace_id", "failure_reason", "event_type"})
+
+    def test_a_raising_recorder_does_not_break_notification_or_ledger(self) -> None:
+        """否定断言：落库失败不得带走用户结论——**故意破坏**确认变红的对照组
+        是「没有这条 try/except 时同一用例会抛穿 `_execute`」。"""
+
+        recorder = RecordingFailureReasons(raise_error=True)
+        parts, _ = run_once(
+            directory=FakeDirectory(availability=DirectoryAvailability.STALE),
+            failure_reasons=recorder,
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
+        self.assertEqual(parts["ledger"].marked, ["evt_1"])
+        self.assertIn("onboarding.failure_reason_record_failed", parts["audit"].actions())
+
+    def test_no_recorder_injected_keeps_prior_behavior(self) -> None:
+        """默认 ``failure_reasons=None``：不注入时用户仍然收到冻结文案，行为与
+        接线之前逐字节一致。"""
+
+        parts, _ = run_once(directory=FakeDirectory(availability=DirectoryAvailability.STALE))
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_INTERNAL_ERROR)
 
 
 class SyncTimeoutTests(unittest.TestCase):

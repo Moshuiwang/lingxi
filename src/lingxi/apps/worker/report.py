@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 from lingxi.core.execution.audit import ToolCallAudit, TurnAuditSummary, redact_free_text
-from lingxi.core.execution.document_delivery import DocumentRequest
+from lingxi.core.execution.document_delivery import DocumentRequest, SheetRequest
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.input_safety import constrain_output
 
@@ -53,6 +53,7 @@ def build_report(
     business_duration_seconds: float | None = None,
     drain_duration_seconds: float | None = None,
     document_request: DocumentRequest | None = None,
+    sheet_request: SheetRequest | None = None,
 ) -> dict[str, Any]:
     """构造 worker 的输出报告。
 
@@ -73,6 +74,14 @@ def build_report(
     确实调用过 ``deliver_document`` 时传入非 ``None``。这里只做投影——把已经是
     受信任内部结构的 ``title``/``paragraphs`` 转成 JSON 可序列化的字典，不重复
     上游已经做过的校验或出口安全检查。
+
+    ``sheet_request``（Issue #354 S-H3-2 表格分支）：与 ``document_request`` 同一
+    机制新增的并列字段，形状对称——``None`` 或已通过硬上限与出口安全检查的
+    :class:`~lingxi.core.execution.document_delivery.SheetRequest`，只在模型本轮
+    调用过 ``deliver_spreadsheet`` 时非 ``None``。调用方（``apps/worker/turn.py``
+    的回合级请求槽位）保证两者至多一个非 ``None``，这里不做互斥校验（真正的
+    互斥校验在 ``adapters/postgres_conversation/_queue_outbox.py::
+    write_terminal_event``，本层只做投影）。
     """
 
     allowed_tool_names = tuple(allowed_tools)
@@ -196,6 +205,11 @@ def build_report(
         "document_request": (
             {"title": document_request.title, "paragraphs": list(document_request.paragraphs)}
             if document_request is not None
+            else None
+        ),
+        "sheet_request": (
+            {"title": sheet_request.title, "rows": [list(row) for row in sheet_request.rows]}
+            if sheet_request is not None
             else None
         ),
     }

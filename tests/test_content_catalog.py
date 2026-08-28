@@ -261,12 +261,19 @@ class ContentDirectoryTests(unittest.TestCase):
            会在真正渲染时因为缺 reference 而失败关闭，却没有任何一处代码为
            这个后果留过痕迹。
         3. content.toml 里声明 ``{reference}`` 的全部键，必须等于 "全量需要补
-           reference 的集合" 并上一个**唯一**、已知、已文档化的例外——
-           ``onboarding.stalled``：它由 ``apps/scheduler/stalled_provisioning.py``
-           在调用处直接传 ``values={"reference": ...}``，不经过这三处的补值
-           分支，因此不需要出现在任何一份"需要补"集合里。这条例外只登记这一个
-           键；将来出现第二个，说明有一条新终态文案在悄悄假设"某处会自动补
-           reference"，而实际上没有任何一处真的补了它。
+           reference 的集合" 并上一组已知、已文档化的例外——它们各自在调用处
+           **直接**传 ``reference``，不经过 onboarding/first_contact 这条三层
+           补值分支，因此不需要出现在任何一份"需要补"集合里：
+           ``onboarding.stalled``（``apps/scheduler/stalled_provisioning.py``
+           直传 ``values={"reference": ...}``）；``delivery.sheet_failed``/
+           ``delivery.sheet_uncertain``（Issue #354 S-H3-2，
+           ``apps/gateway/document_delivery.py::DocumentDeliveryConsumer.
+           _fail``/``_uncertain`` 在调用处直传 ``template_variables=
+           {"reference": claim.task_id}``——这条渲染路径是 gateway 独立消费
+           循环的终态通知，与 onboarding 首聊/开通通知完全是两条不相交的调用
+           链，天然不会、也不该经过 onboarding 那三层的补值分支）。每新增一个
+           例外都必须像这样指名调用点、说明它为什么走的是一条不同的渲染路径；
+           只登记数字上限、不写清楚理由的新增例外应当被拒绝。
 
         改动任意一处集合、或在 content.toml 新增/移除一个 ``{reference}`` 键
         却没有同步其余各处，本用例都会变红。
@@ -308,9 +315,16 @@ class ContentDirectoryTests(unittest.TestCase):
             "与全量『需要补 reference』集合的交集",
         )
 
-        # 唯一已知、已文档化的直传值例外，见本用例说明第 3 条与
-        # apps/scheduler/stalled_provisioning.py 的 KEY_STALLED 渲染调用。
-        known_direct_value_exceptions = frozenset({"onboarding.stalled"})
+        # 已知、已文档化的直传值例外，见本用例说明第 3 条：
+        # - onboarding.stalled → apps/scheduler/stalled_provisioning.py 的
+        #   KEY_STALLED 渲染调用；
+        # - delivery.sheet_failed/delivery.sheet_uncertain（Issue #354
+        #   S-H3-2）→ apps/gateway/document_delivery.py 的
+        #   DocumentDeliveryConsumer._fail/_uncertain，走 gateway 独立消费
+        #   循环的终态通知，与 onboarding 三层补值分支不相交。
+        known_direct_value_exceptions = frozenset(
+            {"onboarding.stalled", "delivery.sheet_failed", "delivery.sheet_uncertain"}
+        )
         self.assertEqual(
             catalog_reference_keys,
             onboarding_keys | known_direct_value_exceptions,
