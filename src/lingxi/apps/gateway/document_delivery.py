@@ -97,6 +97,7 @@ import threading
 from typing import Any, Callable
 
 from lingxi.adapters.postgres_document_delivery import (
+    DELIVERY_TYPE_DOCX,
     DELIVERY_TYPE_SHEET,
     DocumentDeliveryClaim,
     PostgresDocumentDeliveryStore,
@@ -126,16 +127,31 @@ def _default_alert(kind: str, task_id: str) -> None:
     logger.error("文档投递告警 kind=%s task_id=%s", kind, task_id)
 
 
-def _has_confirmed_full_access(members: list[dict[str, Any]], open_id: str) -> bool:
+def _has_confirmed_full_access(
+    members: list[dict[str, Any]], open_id: str, *, delivery_type: str = DELIVERY_TYPE_DOCX
+) -> bool:
     """判定 read_members 读回结果是否确认目标 open_id 具备 full_access。
 
     与 ``scripts/probe_drive_folder_permissions.py`` 的 ``_member_signature`` 取值
     口径一致（``member_type``/``member_id``/``perm`` 三元组），只是这里只关心
     "有没有恰好一条命中目标 open_id 且档位是 full_access 的记录"这一个布尔结论，
     不需要整份签名。
+
+    ``delivery_type``（Trace #373 H3 批量审查 P2-2）：``FULL_ACCESS_PERM``/
+    ``OPENID_MEMBER_TYPE`` 两个常量在 ``feishu_docx_delivery`` 与
+    ``feishu_sheets_delivery`` 各自独立定义（两个结构对称、不互相 import 的
+    并列适配器，见 ``feishu_sheets_delivery`` 模块文档「姿态选择」）。本方法同时
+    服务 docx 与 sheet 两条 ``_finalize_claim`` 路径，此前**恒从 docx 模块**导入
+    这两个常量——sheet 侧若独立改动自己的取值，这里读到的仍然是 docx 侧的旧值，
+    判定悄悄对不上。按 ``delivery_type`` 选取对应模块的常量，保证改 sheets 侧
+    真的生效；两个模块当前取值逐字相同（``"full_access"``/``"openid"``），本次
+    只是让"从哪里读"这件事对，不改变任何现有行为。
     """
 
-    from lingxi.adapters.feishu_docx_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
+    if delivery_type == DELIVERY_TYPE_SHEET:
+        from lingxi.adapters.feishu_sheets_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
+    else:
+        from lingxi.adapters.feishu_docx_delivery import FULL_ACCESS_PERM, OPENID_MEMBER_TYPE
 
     return any(
         member.get("member_type") == OPENID_MEMBER_TYPE
@@ -393,7 +409,9 @@ class DocumentDeliveryConsumer:
 
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
 
-        if not _has_confirmed_full_access(members, claim.requester_open_id):
+        if not _has_confirmed_full_access(
+            members, claim.requester_open_id, delivery_type=claim.delivery_type
+        ):
             # 读回结构正常，但没有找到目标 open_id 的 full_access 记录：结果不明
             # （可能是权限还没有生效、也可能是授权那一步实际没有成功），不得判
             # succeeded（测试③锚点）。

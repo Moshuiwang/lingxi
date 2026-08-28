@@ -566,6 +566,17 @@ class _Transaction:
         触发路径不会各自维护一份"怎么删 user_memory"的实现，不会彼此漂移。硬
         ``DELETE``：与 ``resume_user`` "不恢复已清正文"的既有语义一致，被清除的
         记忆不可恢复。
+
+        **锁顺序不变量**（Trace #373 H3 批量审查 P2-7）：本方法只对 ``user_
+        memory`` 单表做无条件 ``DELETE``（不显式 ``FOR UPDATE`` 其它表），不参与
+        ``clear_delivered_content_for_user`` 那组 conversation/task_delivery_
+        event 死锁面（见该方法文档「加锁顺序」）。两处清除钩子（
+        ``postgres_pending_action.py`` SUSPEND_USER EXECUTE 分支、
+        ``postgres_permission_publish.py`` 权限真变分支）都固定在同一事务里先调
+        用 ``clear_delivered_content_for_user`` 再调用本方法——两次调用在同一个
+        连接上顺序执行，不是两个并发事务，因此不构成新的交叉持锁风险；未来新增
+        调用点须保持这个顺序（先按既有不变量清会话正文，本方法放在最后），不要
+        让本方法先于 ``clear_delivered_content_for_user`` 执行或与其并发调用。
         """
 
         cursor = self._execute("DELETE FROM user_memory WHERE user_id = %s", (user_id,))

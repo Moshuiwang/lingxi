@@ -46,7 +46,13 @@ revision 的文件名编号与它们在链上的真实先后顺序并不一致�
 ## 索引
 
 ``user_memory_user_type_key_idx``（唯一索引）：同一用户同一类型同一 key 只保留
-一条当前值——重复登记＝更新（``ON CONFLICT ... DO UPDATE``），不是堆历史行。
+一条当前值——重复登记＝更新，不是堆历史行。实现是 ``adapters/postgres_
+conversation/_transaction.py::remember_user_memory`` 的 ``SELECT ... FOR
+UPDATE`` 锁定目标行 + 存在则 ``UPDATE``/不存在则 ``INSERT``（不是 ``ON
+CONFLICT (user_id, memory_type, memory_key) DO UPDATE``——拆成两步是为了让
+"新增是否超过上限"这条业务判断能在写入前拿到一个确定的计数，见该方法文档），
+本索引只负责让这两步读到的行与并发写者天然对齐同一唯一约束，不是给
+``ON CONFLICT`` 用的。
 
 ``user_memory_user_idx``：``/memory list`` 与 worker 注入的天然读路径，按用户取
 全部记忆。
