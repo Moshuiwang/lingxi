@@ -1195,6 +1195,25 @@ class NoFakeHeartbeatTest(unittest.TestCase):
             "本模块不得调用 touch_liveness——这是设计文明令禁止的假心跳变体",
         )
 
+    def test_t7_the_read_chain_modules_never_reference_the_liveness_module(self) -> None:
+        """B1 变体的字面位置在读取链路（分页请求/读取回调），不在本模块——
+        把断言扩到真正发 HTTP 请求与组装读取回调的三个模块，堵住"心跳埋进
+        分页中途"的每一处落点（Epic G 批次审查 P2-1）。"""
+        from lingxi.adapters import feishu_directory, feishu_org_snapshot_reader
+        from lingxi.apps.scheduler import assembly
+
+        for module in (feishu_directory, feishu_org_snapshot_reader, assembly):
+            with self.subTest(module=module.__name__):
+                source = inspect.getsource(module)
+                self.assertNotIn(
+                    "apps.liveness", source,
+                    f"{module.__name__} 不得依赖进程活性心跳机制所在的模块",
+                )
+                self.assertNotIn(
+                    "touch_liveness", source,
+                    f"{module.__name__} 不得调用 touch_liveness（假心跳变体）",
+                )
+
 
 class BaseExceptionInThreadTests(unittest.TestCase):
     """T8：线程内抛 ``BaseException`` 留同形状日志不静默。变异验红 M8：把
@@ -1239,8 +1258,10 @@ class FullLoopIntegrationTest(unittest.TestCase):
     """T9：整循环集成——慢组织快照职责 + 记录型职责并存，记录型职责每 tick
     都跑、``heartbeat`` 每 tick 都被调用。变异验红 M9：把职责改回同步执行
     （即撤销 Issue #340 本次改动），``SchedulerLoop.run_once()`` 会被一整轮
-    阻塞式读取拖住，`recorded_duty`/`heartbeat` 计数在慢轮跑完之前都不会推进，
-    断言从 3 变红成 1。
+    阻塞式读取拖住。真正承担红点的是 ``assertLess(elapsed, 2.0)``——假读取的
+    ``gate.wait(timeout=5.0)`` 超时后照样返回批次，三个 tick 最终都会跑完、
+    两个计数仍是 3（Epic G 批次审查 P2-2 实测更正），但整体耗时会从毫秒级
+    涨到 ≥5 秒，被时长断言可靠抓红。
     """
 
     def test_t9_other_duties_and_heartbeat_keep_ticking_while_a_round_is_in_flight(

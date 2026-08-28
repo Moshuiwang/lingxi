@@ -180,8 +180,10 @@ CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD = 3
 # 同步返回值，快路径行为不变。
 DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS = 2.0
 
-# 后台"跑一轮"线程存活超过这个秒数（用 `self._clock()` 注入时钟计算，不是墙钟
-# `time.monotonic()`——保持与本模块其余全部时间判断同一个可测试的时钟来源）
+# 后台"跑一轮"线程存活超过这个秒数（用 `self._clock()` 注入时钟计算——生产注入
+# 的是墙钟 `datetime.now(timezone.utc)`，受 NTP 步进影响：回拨会推迟甚至跳过一次
+# 告警、前跳会提前误报一次；不用单调钟 `time.monotonic()` 是为了保持与本模块其余
+# 全部时间判断同一个可注入、可测试的时钟来源，接受上述步进代价）
 # 判定为疑似僵死，额外记一条独立审计 `org_snapshot_sync.round_thread_stuck` +
 # WARNING 日志（只记一次，见 `run_once` 里的 `_round_thread_stuck_alerted` 布尔
 # 位，形状照 `apps/gateway/__init__.py::delivery_thread_watchdog` 的 `reported`
@@ -533,6 +535,14 @@ class OrgSnapshotSyncDuty:
         这里提前返回 ``None``——不是"这一轮失败了"，只是"调用方不再等"；
         本轮真正的结果（`completed_on`、审计、退避状态）由后台线程自己收口，
         下一个 tick 或审计里能看到。
+
+        并发前提（单飞守卫无锁成立的条件）：本方法只被 `SchedulerLoop` 那一条
+        调度线程**串行**调用（`loop.py` 顺序遍历职责，单线程 `run_forever`），
+        检查-派发之间因此没有竞态窗口。全部可变状态
+        （`_completed_on`/`_next_attempt_at`/`_failure_streak` 等）的唯一写者是
+        后台线程里的 `_run_round`；本方法只读其中两个不可变对象的整体重绑定，
+        GIL 下无撕裂（论证形状同 `daily_report.py` 的单飞守卫）。若未来出现第二
+        个调用方，必须先给守卫加锁。
         """
 
         if self._stop.is_set():
