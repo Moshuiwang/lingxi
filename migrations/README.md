@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0073_pending_action_perm_types` |
+| head revision | `0076_user_memory` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -426,6 +426,25 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 
 表本 revision 只新增列与约束，前滚兼容；`downgrade()` 未在任何环境验证过真实
 回滚（本 revision 未在任何环境应用过）。
+
+## `0076_user_memory`（用户记忆表：显式登记式术语映射 / 口径偏好 / 惯例模板）
+
+[Issue #357](https://github.com/Moshuiwang/lingxi/issues/357) S-H3-3（D1 范围）。
+新建 `user_memory` 表：用户通过 `/memory remember` 显式登记的术语映射/口径偏好/
+惯例模板三类记忆，`(user_id, memory_type, memory_key)` 唯一索引，重复登记即更新，
+不堆历史行；硬 `DELETE` 语义（无 `entry_status`/软删除），与 `resume_user`「不
+恢复已清正文」的既有语义（`V-管理-39`）保持一致。
+
+**down_revision 与文件名编号不连续，如实登记**：本 revision 实际链在
+`0073_pending_action_perm_types`（真实链头，`check_alembic_revisions.py` 核实）
+之后，不是本卡设计蓝图原先假定的 `0075_progress_event_content`——`0072`–`0075`
+四个文件名编号与它们在链上的真实先后顺序本就不一致（`...0071 → 0075 → 0074 →
+0072 → 0073`）。取下一个未使用的文件名编号 `0076` 保持命名单调递增，具体理由见
+迁移文件头部。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值
+（本 revision 未在任何环境应用过）。**不可回滚前置条件同 `0072`/`0073`**：一旦
+部署环境写入过真实用户记忆，`DROP TABLE` 是不可逆的数据丢失，不是无损回滚。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

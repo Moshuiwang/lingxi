@@ -121,6 +121,21 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",
     "delivery.document_uncertain",
+    # 用户记忆命令面（Issue #357 S-H3-3，D1 显式登记范围）：/memory
+    # list/remember/forget/clear 四个子命令的回执与用法提示。
+    "memory.usage_help",
+    "memory.remembered",
+    "memory.limit_exceeded",
+    "memory.forgotten",
+    "memory.forget_not_found",
+    "memory.cleared",
+    "memory.list_empty",
+    "memory.list",
+    "memory.list_entry",
+    "memory.list_entry_unsafe",
+    "memory.type_label.term_mapping",
+    "memory.type_label.calibration_preference",
+    "memory.type_label.convention_template",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

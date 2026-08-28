@@ -339,6 +339,10 @@ class PostgresPermissionPublishStore:
                     cleared_events = _ConversationTransaction(connection).clear_delivered_content_for_user(
                         user_id=user_id, reason="user_cleared"
                     )
+                    # 用户记忆同一姿态一并清除（Issue #357 S-H3-3 c 节）：同一个
+                    # 已持有的 connection/事务，version 推进、发布意图入队与本次
+                    # 清除失败一起回滚，不产生"权限已变、记忆却还在"的半套状态。
+                    _ConversationTransaction(connection).clear_user_memory(user_id=user_id)
         logger.info("权限发布意图已排入 user=%s version=%s reason=%s", user_id, version, reason)
         return PermissionDecision(
             DecisionOutcome.ENQUEUED, user_id, version, outbox_id, cleared_events=cleared_events

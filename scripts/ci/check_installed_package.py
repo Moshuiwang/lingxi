@@ -307,6 +307,14 @@ REQUIRED_MODULES = (
     "lingxi.core.conversation.pipeline",
     # Issue #65 轻审 P2-2：未开通首聊交接对账扫描，由 apps/gateway 的 main() 装配。
     "lingxi.core.conversation.onboarding_recovery",
+    # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）：core.conversation.commands/
+    # pipeline/ports 与 adapters.postgres_conversation._transaction 均模块级 import
+    # 本模块——数据形状（`UserMemoryEntry`）、取值域常量（`MEMORY_TYPES`）与写入/
+    # 提示词字符上限集中在这里，两侧调用方共用同一份事实。
+    "lingxi.core.user_memory",
+    # worker 侧只读拼装（Issue #357 S-H3-3 d 节）：查 user_memory、拼提示词段落，
+    # 由 apps/worker/cli.py 在 queue 模式模块级 import（恒装配，不受开关控制）。
+    "lingxi.adapters.postgres_user_memory",
     "lingxi.adapters.feishu_events",
     "lingxi.adapters.feishu_longconn",
     "lingxi.adapters.feishu_outbound",
@@ -661,6 +669,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_conversation._queue_session_cleanup",
             "lingxi.adapters.postgres_conversation._task_queue",
             "lingxi.adapters.postgres_conversation._transaction",
+            # 用户记忆（Issue #357 S-H3-3）：`postgres_conversation._transaction`
+            # 模块级 import 本模块，`postgres_permission_publish.record_decision`
+            # 的权限真变分支复用 `_transaction` 调用 `clear_user_memory`——同上面
+            # "间接依赖也要显式登记"的既有理由，漏登记会直接让 scheduler 制品的
+            # 完整性核对判红。
+            "lingxi.core.user_memory",
             "lingxi.core",
             "lingxi.core.identity",
             # 花名册日报的短期令牌供给（Issue #215）：由 `apps/scheduler/credential_
@@ -831,6 +845,14 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # service.py 模块级 import，import 本身不依赖开关；运行时检测仅在
             # 内容采集开启（content_capture_writer 非空）时才会被调用执行。
             "lingxi.core.year_grounding_guard",
+            # 用户记忆注入（Issue #357 S-H3-3 d 节）：`apps/worker/service.py` 在
+            # 模块级 import `RenderedUserMemoryPrompt`（Protocol 返回类型标注），
+            # `apps/worker/cli.py` 在模块级 import `PostgresUserMemoryReader`
+            # （queue 模式恒装配，不像内容采集那样受开关控制），漏登记会直接让
+            # worker 制品的完整性核对判红——与上面 postgres_content_capture 同一
+            # 条理由。
+            "lingxi.core.user_memory",
+            "lingxi.adapters.postgres_user_memory",
         ),
         ("claude_agent_sdk", "psycopg"),
     ),
@@ -948,6 +970,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # 用户记忆（Issue #357 S-H3-3）：core.conversation.commands/pipeline/
+            # ports 与 adapters.postgres_conversation._transaction 均模块级 import
+            # 本模块（/memory 命令面数据形状），漏登记会直接让 gateway 制品的完整性
+            # 核对判红——同上面几条"间接依赖也要显式登记"的既有理由。
+            "lingxi.core.user_memory",
             # gateway 通过 adapters.postgres_conversation 间接依赖投递事件 outbox
             # 的纯领域逻辑（Issue #151）：任务/会话查询共用同一份 core.delivery.ports
             # 终态解析规则。apps.gateway.delivery 额外直接依赖 core.execution.*

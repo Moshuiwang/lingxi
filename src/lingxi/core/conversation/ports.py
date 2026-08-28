@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import ContextManager, Protocol
 
+from lingxi.core.user_memory import UserMemoryEntry
+
 
 @dataclass(frozen=True)
 class InboundMessage:
@@ -233,6 +235,22 @@ class GatewayTransaction(Protocol):
     def consume_delivery_expired_notice(self, *, conversation_id: str) -> bool:
         """该话题是否有尚未提示过的「投递已过期」任务；命中即原子标记为已提示
         （Issue #152、`V-投递-06` 后半句）。"""
+
+    def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:
+        """按用户取全部记忆，``/memory list`` 用（Issue #357 S-H3-3）。"""
+
+    def remember_user_memory(
+        self, *, user_id: str, memory_type: str, memory_key: str, memory_value: str
+    ) -> str | None:
+        """登记一条记忆（同 key 已存在则更新）；新增触达上限时返回 ``None`` 且
+        不写入，不做静默截断。"""
+
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
+        """删除属于该用户的一条记忆；跨用户传入他人 memory_id 结构性地不生效。"""
+
+    def clear_user_memory(self, *, user_id: str) -> int:
+        """清空该用户的全部记忆，返回清掉的行数；``/memory clear`` 与停用/权限
+        真变两处清除钩子共用同一个方法。"""
 
 
 class GatewayStore(Protocol):
