@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-27-4"
+version = "2026-08-28-1"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -125,6 +125,23 @@ version = "2026-08-27-4"
 # 不是"确定失败、你可以重试"——重试可能造成重复建档/重复授权，见
 # apps/gateway/document_delivery.py 模块说明「白名单反转」）。
 "delivery.document_uncertain" = "文档生成结果暂无法确认，已转人工核对。"
+
+# 用户记忆命令面（Issue #357 S-H3-3，D1 显式登记范围）：用户显式登记术语映射/
+# 口径偏好/惯例模板，下一次问数生效；/memory list 可查、/memory forget <id>/
+# /memory clear 可清。文案为实施草案，产品负责人过目前不作为最终定稿。
+"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <id> 删除一条；/memory clear 清空全部。"
+"memory.remembered" = "已登记这条记忆，下一次提问开始生效，可以用 /memory list 查看全部。"
+"memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <id> 删除几条后再登记。"
+"memory.forgotten" = "已删除这条记忆。"
+"memory.forget_not_found" = "没有找到这条记忆，可能已被删除或不属于你。"
+"memory.cleared" = "已清空你的全部记忆（共 {count} 条）。"
+"memory.list_empty" = "你还没有登记任何记忆。可以用 /memory remember <类型> <关键词> => <说明> 登记，类型可选 term_mapping（术语映射）/calibration_preference（口径偏好）/convention_template（惯例模板）。"
+"memory.list" = "已登记的记忆：\n{entries}"
+"memory.list_entry" = "- [{type_label}] {memory_key} => {memory_value}（id: {memory_id}）"
+"memory.list_entry_unsafe" = "- [{type_label}] （该条内容无法安全展示，可用 /memory forget <id> 删除，id: {memory_id}）"
+"memory.type_label.term_mapping" = "术语映射"
+"memory.type_label.calibration_preference" = "口径偏好"
+"memory.type_label.convention_template" = "惯例模板"
 
 [cards."query.status"]
 title = "正在查询"

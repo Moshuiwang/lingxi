@@ -27,6 +27,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 
 from lingxi.adapters.admin_registry import seed_admin_registry_entry
 from lingxi.adapters.postgres import connect
+from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 from lingxi.adapters.postgres_pending_action import (
     TARGET_HAS_PENDING_ACTION_CODE,
@@ -124,6 +125,25 @@ class PendingActionPostgresTestCase(unittest.TestCase):
             pending_action_id=outcome.pending.id, card_id="cardkit_test"
         )
         return outcome.pending.id
+
+    def remember_memory(self, *, user_id: str, memory_key: str = "k", memory_value: str = "v") -> str:
+        """给某个用户直接写一条记忆（Issue #357 S-H3-3），供停用清除钩子测试复用。"""
+
+        with connect(self._dsn) as connection:
+            with connection.transaction():
+                memory_id = _Transaction(connection).remember_user_memory(
+                    user_id=user_id,
+                    memory_type="term_mapping",
+                    memory_key=memory_key,
+                    memory_value=memory_value,
+                )
+        assert memory_id is not None
+        return memory_id
+
+    def memory_count(self, *, user_id: str) -> int:
+        return self.query(
+            "SELECT count(*) FROM user_memory WHERE user_id = %s", (user_id,)
+        )[0][0]
 
 
 class PrepareTests(PendingActionPostgresTestCase):
@@ -358,6 +378,14 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
 
     def test_audit_failure_rolls_back_both_pending_action_and_app_user(self) -> None:
         self.add_target_user(account_state="enabled")
+        target_user_id = self.query(
+            "SELECT id FROM app_user WHERE feishu_open_id = %s", (TARGET_OPEN_ID,)
+        )[0][0]
+        # Issue #357 S-H3-3 设计文 e 节第 5 项：这个用户此刻已经登记了一条记忆——
+        # SUSPEND_USER 的 EXECUTE 分支会在账号状态翻转之后、审计写入之前，同一个
+        # 事务里先把它清掉；审计写失败必须让这一步也跟着回滚，不是只回滚
+        # account_state。
+        self.remember_memory(user_id=target_user_id, memory_key="k", memory_value="v")
         pending_id = self.prepare_and_deliver()
         failing_audit = _RecordingAudit(raise_error=True)
         failing_store = PostgresPendingActionStore(self._dsn, audit=failing_audit)
@@ -370,11 +398,20 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
             "SELECT status FROM pending_action WHERE id = %s", (pending_id,)
         )
         self.assertEqual(status_rows[0][0], "pending", "待确认操作必须仍停在 pending，可以重试")
+        self.assertEqual(
+            self.memory_count(user_id=target_user_id),
+            1,
+            "审计失败后已经排队的记忆清除必须跟着回滚，不出现"
+            "「记忆已经被清、但账号状态其实没变」的半套状态",
+        )
 
         # 换回正常审计器后重试确实能成功——「调用方可重试」不是一句空话。
         retry = self.store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
         self.assertTrue(retry.decision.ok)
         self.assertEqual(self.current_account_state(), "suspended")
+        self.assertEqual(
+            self.memory_count(user_id=target_user_id), 0, "重试成功后记忆才真正被清"
+        )
 
     def test_audit_failure_on_cancel_also_rolls_back(self) -> None:
         self.add_target_user(account_state="enabled")
@@ -893,6 +930,40 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
             self.query("SELECT agent_session_id FROM conversation WHERE id='cnv-a1'")[0][0], "sess-a1"
         )
         self.assertEqual(self.pending_reasons(agent_session_id="sess-a1"), [])
+
+    def test_suspend_confirm_clears_user_memory_and_resume_does_not_restore_it(self) -> None:
+        """Issue #357 S-H3-3 c 节接线，设计文 e 节第 3 项：停用清除钩子同一事务里
+        一并清空该用户的全部记忆；resume 不恢复已清正文的既有语义
+        （``V-管理-39``）同样适用于记忆——硬 DELETE，不是软删除，resume 之后
+        仍然为 0。"""
+
+        self.add_target_user(account_state="enabled")
+        target_user_id = self.user_id_for(TARGET_OPEN_ID)
+        self.remember_memory(user_id=target_user_id, memory_key="大尼日", memory_value="尼日利亚")
+        # 另一个用户的记忆完全不受影响。
+        self.add_target_user(open_id="ou_other_user_memory", account_state="enabled")
+        other_user_id = self.user_id_for("ou_other_user_memory")
+        self.remember_memory(user_id=other_user_id, memory_key="k", memory_value="v")
+        suspend_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        result = self.store.confirm(pending_action_id=suspend_id, clicker_open_id=ADMIN_OPEN_ID)
+
+        self.assertTrue(result.decision.ok)
+        self.assertEqual(self.memory_count(user_id=target_user_id), 0)
+        self.assertEqual(
+            self.memory_count(user_id=other_user_id), 1, "其他用户的记忆不受影响"
+        )
+
+        resume_id = self.prepare_and_deliver(action_type=PendingActionType.RESUME_USER)
+        resume_result = self.store.confirm(
+            pending_action_id=resume_id, clicker_open_id=ADMIN_OPEN_ID
+        )
+
+        self.assertTrue(resume_result.decision.ok)
+        self.assertEqual(self.current_account_state(), "enabled")
+        self.assertEqual(
+            self.memory_count(user_id=target_user_id), 0, "resume 不恢复已清记忆"
+        )
 
     def test_repeated_confirm_does_not_queue_cleanup_twice(self) -> None:
         """幂等：`decide_confirm` 早已是终态的第二次点击不再进入 EXECUTE 分支

@@ -699,6 +699,15 @@ class PostgresPendingActionStore:
                                     _Transaction(connection).clear_delivered_content_for_user(
                                         user_id=target_user_id, reason="user_cleared"
                                     )
+                                    # 用户记忆同一姿态一并清除（Issue #357 S-H3-3
+                                    # c 节）：同一个已持有的 connection/事务，失败
+                                    # 一起回滚，不产生"账号已停用、记忆却还在"的
+                                    # 半套状态。记忆没有"resume 恢复"语义（硬
+                                    # DELETE，见迁移 0076），与上面的保留正文清理
+                                    # 同一条不变量。
+                                    _Transaction(connection).clear_user_memory(
+                                        user_id=target_user_id
+                                    )
                             elif pending.action_type in _DIRECTION_BY_ACTION_TYPE:
                                 # 本地权限授权/抑制的 EXECUTE 分支：不改 app_user，
                                 # 改写迁移 0072 的 local_permission_override 表
