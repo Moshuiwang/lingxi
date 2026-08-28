@@ -21,7 +21,11 @@ from lingxi.core.execution.audit import (
     UserResultStatus,
     classify_tool_result,
 )
-from lingxi.core.execution.hooks import MCP_OVERSIZE_RESULT_REWRITE, ToolGateway
+from lingxi.core.execution.hooks import (
+    MCP_OVERSIZE_RESULT_REWRITE,
+    WRAPPER_DENIAL_FUSE_THRESHOLD,
+    ToolGateway,
+)
 from lingxi.core.execution.tool_policy import (
     DenyReasonCode,
     ToolDecision,
@@ -1112,6 +1116,172 @@ class ToolCallListenerTest(unittest.TestCase):
         result = pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id="t1")
 
         self.assertEqual(deny_decision(result), None)
+
+
+class WrapperDenialFuseTest(unittest.TestCase):
+    """包装拒绝熔断（Issue #352）：同一回合内非 MCP 工具被拒累计达到阈值即触发。
+
+    这里只测 ``ToolGateway`` 这一层的计数、去抖与回合边界——它是纯逻辑，不涉及
+    SDK 会话或 interrupt。"真的让回合提前终止" 是 ``apps/worker/turn.py`` 的接线
+    职责，断言在 ``tests/test_worker_entry.py``。
+    """
+
+    def test_the_registered_default_threshold_is_five(self) -> None:
+        """产品负责人 2026-08-28 裁定的登记值；改动这个常量必须回到 Issue #352
+        重新裁定，这里钉住当前值不被静默改掉。"""
+
+        self.assertEqual(WRAPPER_DENIAL_FUSE_THRESHOLD, 5)
+
+    def test_denials_below_the_threshold_do_not_trip_the_fuse(self) -> None:
+        """否定用例：未达阈值时不得触发，且计数如实反映次数。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD - 1):
+            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+
+        self.assertEqual(received, [])
+        self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD - 1)
+
+    def test_the_threshold_th_denial_trips_the_fuse_exactly_once(self) -> None:
+        """正用例：第 N 次非 MCP 拒绝触发熔断，回调收到的是累计次数本身。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD])
+        self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD)
+
+    def test_the_fuse_does_not_retrigger_for_denials_past_the_threshold(self) -> None:
+        """中断请求发出后到真的停下来之间存在窗口（见 `claude_agent_session.
+        run_single_turn` 的中断竞态），这段窗口内可能还有几次拒绝溜进来——熔断
+        通知只应该在第一次达标时触发一次，不能每多一次拒绝就重复通知。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD + 3):
+            pre_tool_use(gateway, "Bash", {"command": f"claude mcp call {index}"}, tool_use_id=f"toolu_{index}")
+
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD])
+        self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD + 3)
+
+    def test_denied_mcp_tool_names_do_not_count_toward_the_fuse(self) -> None:
+        """计数口径是「非 MCP 工具被拒」：模型请求了一个真实存在但未获批准的
+        `mcp__` 工具名，是"选错了具体工具"，不是这次事故里"用内置工具包装绕过
+        白名单"，不应计入熔断——即使拒绝次数远超阈值。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD + 5):
+            pre_tool_use(
+                gateway,
+                "mcp__bi-metric__unapproved_write_tool",
+                {},
+                tool_use_id=f"toolu_mcp_{index}",
+            )
+
+        self.assertEqual(received, [])
+        self.assertEqual(gateway.wrapper_denial_count, 0)
+
+    def test_allowed_calls_do_not_count_toward_the_fuse(self) -> None:
+        """放行的调用（即使反复调用很多次）不是"拒绝"，不计入熔断。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD + 5):
+            pre_tool_use(gateway, "mcp__bi-metric__list_metrics", {}, tool_use_id=f"toolu_ok_{index}")
+
+        self.assertEqual(received, [])
+        self.assertEqual(gateway.wrapper_denial_count, 0)
+
+    def test_reset_clears_the_count_and_rearms_the_fuse(self) -> None:
+        """``reset_wrapper_denial_fuse()``（回合边界，跨回合不累计）之后，必须
+        重新累计满一整轮阈值才会再次触发——不是"少几次就够"。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"a{index}"}, tool_use_id=f"toolu_a{index}")
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD])
+
+        gateway.reset_wrapper_denial_fuse()
+        self.assertEqual(gateway.wrapper_denial_count, 0)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD - 1):
+            pre_tool_use(gateway, "Bash", {"command": f"b{index}"}, tool_use_id=f"toolu_b{index}")
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD], "还没到新一轮的阈值，不应再次触发")
+
+        pre_tool_use(gateway, "Bash", {"command": "final"}, tool_use_id="toolu_final")
+        self.assertEqual(received, [WRAPPER_DENIAL_FUSE_THRESHOLD, WRAPPER_DENIAL_FUSE_THRESHOLD], "新一轮满阈值后必须能再次触发")
+
+    def test_listener_exception_does_not_break_the_gating_decision(self) -> None:
+        """通知失败不得影响工具判定本身——与 ``_mark_side_effect``/其它监听器
+        既有姿态一致。"""
+
+        def failing_listener(denied_count: int) -> None:
+            raise RuntimeError("模拟熔断监听器故障")
+
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(failing_listener)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            result = pre_tool_use(gateway, "Bash", {"command": f"c{index}"}, tool_use_id=f"toolu_c{index}")
+            self.assertEqual(deny_decision(result), "deny", "监听器异常不得影响拒绝判定本身")
+
+        self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD)
+
+    def test_clearing_the_listener_stops_further_notifications(self) -> None:
+        """``set_wrapper_fuse_listener(None)`` 必须真的清除，但底层计数继续累加
+        （计数是 ``ToolGateway`` 自己的状态，不依赖有没有人在监听）。"""
+
+        received: list[int] = []
+        gateway = build_gateway()
+        gateway.set_wrapper_fuse_listener(received.append)
+        gateway.set_wrapper_fuse_listener(None)
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            pre_tool_use(gateway, "Bash", {"command": f"d{index}"}, tool_use_id=f"toolu_d{index}")
+
+        self.assertEqual(received, [])
+        self.assertEqual(gateway.wrapper_denial_count, WRAPPER_DENIAL_FUSE_THRESHOLD)
+
+    def test_default_gateway_never_touches_an_unset_fuse_listener(self) -> None:
+        """默认（从未调用 ``set_wrapper_fuse_listener``）不产生任何额外行为——
+        只确认不抛异常，拒绝判定与本文件其余全部用例保持一致。"""
+
+        gateway = build_gateway()
+
+        for index in range(WRAPPER_DENIAL_FUSE_THRESHOLD):
+            result = pre_tool_use(gateway, "Bash", {"command": f"e{index}"}, tool_use_id=f"toolu_e{index}")
+            self.assertEqual(deny_decision(result), "deny")
+
+    def test_a_lower_threshold_can_be_configured_for_fast_tests(self) -> None:
+        """构造参数可覆盖默认阈值——只用于测试场景加速；生产装配
+        （``apps/worker/turn.py``）不传这个参数，沿用产品负责人已批的默认值。"""
+
+        received: list[int] = []
+        audit = TurnAudit(redactor=AuditRedactor(allowed_input_fields=("metric",)))
+        gateway = ToolGateway(policy=build_policy(), audit=audit, wrapper_denial_fuse_threshold=2)
+        gateway.set_wrapper_fuse_listener(received.append)
+
+        pre_tool_use(gateway, "Bash", {"command": "1"}, tool_use_id="toolu_1")
+        self.assertEqual(received, [])
+        pre_tool_use(gateway, "Bash", {"command": "2"}, tool_use_id="toolu_2")
+        self.assertEqual(received, [2])
 
 
 if __name__ == "__main__":
