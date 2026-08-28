@@ -163,13 +163,25 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         两个模块级纯函数搬进 `onboarding_support.py`；核心文件只剩模块文档字符串
         + `AutoOnboardingRunner` 主类，实测 1295 行，退回阈值以下，`--refresh`
         按规则自动移除该条目。三个新文件均远低于阈值，未新增基线登记。
+
+        2026-08-28 移除 `assembly.py`——Trace #358 S-H-2（Issue #350 Gate G-3
+        裁定 Option A）纯移动拆分：十个 `_build_*` 装配函数（花名册审计+快照
+        写入→`roster_audit.py`；权限重算→`permission_refresh.py`；权限链到期
+        清理→`retention.py`；就绪跟进+权限发布+告警出口→`permission_publish.py`
+        与新文件 `permission_readiness_assembly.py`（就绪跟进单独成文——它含
+        合法的通知重试 `sleep=stop.wait`，并入 `permission_publish.py` 会被
+        `test_permission_publish_duty.py::NonBlockingTest` 的全文件级否定扫描
+        连坐命中）；开通装配→`onboarding.py`；迟到就绪恢复→
+        `late_readiness_recovery.py`；停摆收口→`stalled_provisioning.py`；
+        组织快照同步+`_stop_aware_sleep`→`org_snapshot_sync.py`）逐组搬空，
+        核心文件只剩 `build_loop` 总装配 + 全部 `_build_*` 名字的 re-export，
+        实测 337 行，远退回阈值以下，`--refresh` 按规则自动移除该条目。七个
+        目标文件（六个既有 + 一个新文件）均远低于阈值，未新增基线登记。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {
-                "src/lingxi/apps/scheduler/assembly.py": 1538,
-            },
+            {},
         )
 
 
