@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, Protocol
 
 from lingxi.apps.scheduler.audit import AuditSink
+from lingxi.apps.scheduler.config import SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -275,3 +276,74 @@ class PermissionRetentionSweepDuty:
             )
             logger.error("权限链到期清理失败 table=%s error=%s", table, type(error).__name__)
             raise
+
+
+def _build_permission_retention_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> PermissionRetentionSweepDuty:
+    """装配权限链到期清理职责。**它总是注册**，只有判定记录那一面按前置条件装配。
+
+    **``publish_outbox`` 那一面没有任何配置前置**：擦 ``payload`` 只需要数据库连接串，
+    而连接串是必需配置、进程起得来就一定有。这一面恰恰是带个人数据的那一面（邮箱与
+    姓名），因此它必须无条件跑起来——给一条纯粹是"擦自己库里的内容"的路径加一个能让它
+    不注册的开关，等于给保留上界加了一个可以被关掉的旁路。
+
+    **``mcp_sync_check`` 那一面的前置是 MCP 令牌主密钥**（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）：
+    唯一的读写口 :class:`~lingxi.adapters.postgres_mcp_token.PostgresMcpTokenStore` 构造时
+    就要求一个**已经校验过主密钥**的加解密对象（它同时承载解密路径）。删过期行本身用不到
+    密钥，但绕过那个构造约束就得给这个调用点单开一个不校验密钥的口子——那正是该类刻意
+    拒绝的事（它对非 :class:`McpTokenCipher` 直接抛 ``TypeError``）。缺密钥时这一面**不装配**
+    并留下**恰一条**审计，形状照 :func:`_build_readiness_follow_up` 的探针那一面（缺项只报
+    变量名、不回显任何值——它还是一把主密钥），发布 outbox 那一面照常。
+
+    这条取舍的产品后果是可接受的、也已写明：``mcp_sync_check`` **没有可识别内容列**，
+    到期不删的后果是一张只含内部 ULID 与结论码的表继续变长；而真正含邮箱与姓名的
+    ``publish_outbox.payload`` 一轮都不会少擦。
+
+    **``onboarding_completion_notice``（V-开通-18，迁移 ``0066``）与 ``publish_outbox``
+    同一面**：只需要数据库连接串，没有可选前置，因此无条件装配。
+    """
+
+    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
+    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+
+    checks: Any = None
+    if config.mcp_token_encrypt_key:
+        from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+        from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
+
+        checks = PostgresMcpTokenStore(
+            config.postgres_dsn,
+            cipher=McpTokenCipher(config.mcp_token_encrypt_key),
+            timeouts=config.postgres_timeouts,
+        )
+    else:
+        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
+
+        # **恰一条**审计：只关掉判定记录那一面，发布 outbox 的内容擦除照常。
+        audit.record(
+            "permission_retention.checks_not_wired",
+            reason="missing_environment_variable",
+            variable=MASTER_KEY_ENV,
+        )
+        logger.warning(
+            "未配置 %s，mcp_sync_check 的到期删除不装配；publish_outbox 的到期内容擦除照常运行",
+            MASTER_KEY_ENV,
+        )
+
+    return PermissionRetentionSweepDuty(
+        outbox=PostgresPermissionPublishStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        checks=checks,
+        # onboarding_completion_notice（迁移 0066，V-开通-18）同样没有可选前置——
+        # 只需要数据库连接串，因此这一面与 publish_outbox 那一面同样无条件装配。
+        notices=PostgresLateReadinessStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        audit=audit,
+        stop=stop,
+    )
