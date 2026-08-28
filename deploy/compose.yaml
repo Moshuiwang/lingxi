@@ -32,10 +32,37 @@ name: lingxi
 # tag 语义见 deploy/README.md：`<YYYYMMDD>-<commit sha 前 12 位>`，不可变、可回溯到源码。
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 资源限制（Trace #373 H2 / S-H2-1，产品负责人 2026-08-28 先行裁定）。完整推导、
+# 逐服务数值表与两档预算见 deploy/README.md「资源限制」一节，这里只说结构。
+#
+# 语法选型：`deploy.resources.limits`（cpus/memory/pids），不是顶层
+# `mem_limit`/`cpus`/`pids_limit`——两者在 `docker compose up`（非 swarm）下都
+# 真实生效（本机 Docker 29.1.3 + Compose 2.40.3 实测核对过），选前者是因为
+# 三项限制归在同一个键下，覆盖文件用 `deploy: resources: limits: {...}` 整块替换
+# 更不容易漏改某一项；`docker compose config` 会把两种写法都渲染成生效值，验证
+# 方式见 deploy/README.md 同一节。
+#
+# **结构在这份基线文件里统一定义、数值分环境覆盖**：每个服务的三项限制都写成
+# `${LINGXI_<SERVICE>_{MEM,CPU,PIDS}_LIMIT:-<安全默认值>}`，基线的默认值等于
+# 生产档（与 LINGXI_SCHEDULER_INTERVAL_SECONDS 的既有写法同一惯例：基线默认值
+# 取更保守/更宽松的那一档，避免漏挂 --env-file 时退化成一个明显偏紧、可能杀死
+# 正常负载的数值）；`compose.stage.yaml`/`compose.prod.yaml` 用同一个变量名各自
+# 覆盖成本环境的建议值。**数值必须分环境**：stage 主机只有 2 核 / 3.7GiB 内存，
+# 按生产档（worker 类 8–16GB）配置会在 stage 上直接顶穿物理内存；反过来照抄 stage
+# 的紧张预算去配生产，会在真实负载下把 worker-queue 的 Agent SDK 回合（Claude CLI
+# + 多个 MCP 子进程）系统性地杀掉——这是本轮设计里判定"比限制偏松更严重"的错误，
+# 因此 pids 一项尤其不能照抄 stage 的量级。
+#
+# 门禁只核对结构（`scripts/ci/check_deploy_contract.py` 的 `check_resource_limits`）：
+# 六个服务是否都声明了这三项键，不核对具体数值——具体数值是产品/容量判断，不是
+# 机械可判定的对错。
+# ---------------------------------------------------------------------------
+
 services:
   # 常驻服务：专用授权凭据（「四达文档会议助手」refresh_token）到期轮换扫描。
   scheduler:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_SCHEDULER_IMAGE_DIGEST:-}
     restart: unless-stopped
 
     # ---- 停止宽限期（断言 V-部署-03 / M2-62-24 / M2-62-25）--------------------
@@ -75,13 +102,25 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    # ---- 日志（断言 V-部署-04）-----------------------------------------------
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_SCHEDULER_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_SCHEDULER_MEM_LIMIT:-1G}
+          pids: ${LINGXI_SCHEDULER_PIDS_LIMIT:-512}
+
+    # ---- 日志（断言 V-部署-04 / #343 取证留存下限）----------------------------
     # 进程只往 stdout / stderr 写，不写日志文件、不自行轮转（apps/scheduler 的
     # logging.basicConfig(stream=sys.stdout)）。轮转交给 Docker 的日志驱动。
+    # max-size/max-file 是 #343 取证窗口的第一层缓冲（宿主侧增量收集见
+    # deploy/日志留存.md，那才是跨重部署持久的那一份）；下限由
+    # scripts/ci/check_deploy_contract.py 的 check_log_retention_floor 守住，
+    # 改小了会直接打红门禁。
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
 
     # ---- 配置与凭据 -----------------------------------------------------------
@@ -123,7 +162,7 @@ services:
   # profiles 删掉即可转为默认服务，届时它与 scheduler 同型。
   # 这与 #57 的登记一致：组件已交付，尚未接线。
   gateway:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-gateway:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_GATEWAY_IMAGE_DIGEST:-}
     # ---- profile 归属（Issue #153）------------------------------------------
     # 仍然保留独立的 `gateway` profile：`deploy/README.md` 里 `--profile gateway`
     # 这条既有命令继续按原样工作，不因本次改动改变含义。同时加入新的 `mvp`
@@ -158,10 +197,19 @@ services:
       - /tmp:mode=1777,size=16m
     security_opt:
       - no-new-privileges:true
+
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_GATEWAY_MEM_LIMIT:-1G}
+          pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-512}
+
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
     # 不挂任何持久卷：gateway 的状态全部在数据库里，容器内不写需要持久化的东西
     # （断言 V-部署-02）。凭据走 env_file，见各环境的覆盖文件。
@@ -186,7 +234,7 @@ services:
   # **不是常驻服务**，因此没有 restart 策略、没有 stop_grace_period、没有 healthcheck。
   # 它跑完一个回合就退出，退出码 0/2/3/4/5 是调用方的判定依据。
   worker:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_WORKER_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"
@@ -197,10 +245,21 @@ services:
       - /tmp:mode=1777,size=256m
     security_opt:
       - no-new-privileges:true
+
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    # 单回合受控执行：一次只跑一个 Agent SDK 回合，不像 worker-queue 要同时装下
+    # LINGXI_WORKER_MAX_CONCURRENCY 个并发回合，因此限制远小于 worker-queue。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_CPU_LIMIT:-2.0}"
+          memory: ${LINGXI_WORKER_MEM_LIMIT:-4G}
+          pids: ${LINGXI_WORKER_PIDS_LIMIT:-1024}
+
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
     volumes:
       # 用户环境目录：与凭据**不同的卷**（断言 M2-62-28）。用户产物与会话在这里，
@@ -218,7 +277,7 @@ services:
   # 一起构成 Epic A 的候选/Stage 验收对象，不静默改变生产发布入口（#153 范围第 1
   # 条、可观察完成标准第 1 条）。
   worker-queue:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-worker:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_WORKER_IMAGE_DIGEST:-}
     profiles: ["mvp"]
     restart: unless-stopped
 
@@ -252,10 +311,25 @@ services:
       - /tmp:mode=1777,size=256m
     security_opt:
       - no-new-privileges:true
+
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    # 这是六个服务里唯一直接对应架构设计「九、容量与资源」worker 内存估算
+    # （峰值并发任务 × 单任务内存 = 8–16GB）的服务：常驻领取真实用户任务，
+    # 一个容器内同时装下 LINGXI_WORKER_MAX_CONCURRENCY 个并发 Agent SDK 回合，
+    # 每个回合各自的 Claude CLI 子进程与多个 MCP 子进程都算在这一个容器的
+    # cgroup 里。pids 限制尤其不能照抄 worker（一次性 job）或其余服务的量级
+    # ——低估这一项会在真实并发负载下杀掉本该正常完成的用户任务。
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-16G}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-4096}
+
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
     volumes:
       - lingxi-users:/var/lib/lingxi/users
@@ -282,7 +356,7 @@ services:
   # **不得配 restart 策略**（断言 M2-62-23）：迁移失败必须停下来让人看见。自动重启会
   # 把一次失败的迁移变成一个反复撞墙的循环，并掩盖真正的失败原因。
   migrate:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-migrate:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-migrate:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_MIGRATE_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"
@@ -291,10 +365,19 @@ services:
       - /tmp:mode=1777,size=16m
     security_opt:
       - no-new-privileges:true
+
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_MIGRATE_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_MIGRATE_MEM_LIMIT:-1G}
+          pids: ${LINGXI_MIGRATE_PIDS_LIMIT:-512}
+
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
     # LINGXI_MIGRATION_DSN 与业务的 LINGXI_POSTGRES_DSN 是**两个变量**，迁移不回落到
     # 后者：迁移要 DDL 权限、业务进程不要，两者本就该是不同的数据库角色
@@ -307,7 +390,7 @@ services:
   # state 文件与凭据文件均在同一个持久卷中，由入口启动前拒绝路径/锁文件冲突。
   # 浏览器回调经 OAuth Bridge 主动回传，不接收终端粘贴的回跳地址。
   reauthorize:
-    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}
+    image: ${LINGXI_IMAGE_REGISTRY:?必须指定镜像仓库}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?必须指定不可变镜像 tag}${LINGXI_SCHEDULER_IMAGE_DIGEST:-}
     profiles: ["job"]
     restart: "no"
     user: "10001:10001"
@@ -316,10 +399,19 @@ services:
       - /tmp:mode=1777,size=16m
     security_opt:
       - no-new-privileges:true
+
+    # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINGXI_REAUTHORIZE_CPU_LIMIT:-1.0}"
+          memory: ${LINGXI_REAUTHORIZE_MEM_LIMIT:-1G}
+          pids: ${LINGXI_REAUTHORIZE_PIDS_LIMIT:-512}
+
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "5"
     command: ["python", "-m", "lingxi.apps.reauthorize"]
     environment:

@@ -32,7 +32,7 @@ printf '解释器版本：python3 = %s，满足声明的 >=%s\n' "${actual_pytho
 tracked_scripts=()
 while IFS= read -r script_path; do
   tracked_scripts+=("${script_path}")
-done < <(git ls-files 'scripts/*.sh' 'tests/*.sh')
+done < <(git ls-files 'scripts/*.sh' 'tests/*.sh' 'deploy/*.sh')
 
 if ((${#tracked_scripts[@]} == 0)); then
   printf '没有找到受版本控制的 Bash 脚本。\n' >&2
