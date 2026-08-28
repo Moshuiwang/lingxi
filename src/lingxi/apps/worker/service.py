@@ -20,6 +20,7 @@ from lingxi.apps.worker.report_extraction import (
     _protocol_breakdown_reasons,
     _report_document_request,
     _report_guard_denied_count,
+    _report_sheet_request,
     _report_token_usage,
     _tool_result_count,
 )
@@ -860,6 +861,9 @@ class WorkerService:
                 # 绝不建投递请求——用户没拿到问答结果，就不该收到对应文档
                 # （withheld=安全策略事后拒发正文等各有独立判非成功的理由）。
                 document_request=_report_document_request(report),
+                # 表格投递请求（Issue #354 S-H3-2 契约）：与 document_request 同一
+                # 判断分支、同一转发时机，不是独立的第二条路径。
+                sheet_request=_report_sheet_request(report),
             )
 
         # 内测轮内容级采集（Issue #251/#304 批次 3）：无论上面走了哪条终态分支
@@ -1000,6 +1004,7 @@ class WorkerService:
         guard_denied_count: int | None = None,
         token_usage: Mapping[str, int] | None = None,
         document_request: Mapping[str, Any] | None = None,
+        sheet_request: Mapping[str, Any] | None = None,
     ) -> None:
         """写终态事件、把任务转入 ``awaiting_delivery``（Issue #151 状态合同第 2
         条）。话题继续占用直到投递解析，因此新建立的 ``session_id``（只在业务
@@ -1022,6 +1027,11 @@ class WorkerService:
         （``_process_task`` 真正成功分支）判定"业务成功且报告契约携带非空
         document_request"时才非 ``None``——原样透传 ``write_terminal_event``，
         由它在写终态的同一事务里插入文档投递请求行；其余分支恒 ``None``。
+
+        ``sheet_request``（Issue #354 S-H3-2，迁移 ``0078``）：与
+        ``document_request`` 同一判断分支、同一转发时机的并列字段，原样透传，
+        不在这一层做互斥校验（真正的互斥校验在
+        ``write_terminal_event``——见该方法文档）。
         """
 
         self._log_terminal_outcome(
@@ -1046,6 +1056,7 @@ class WorkerService:
             token_usage=token_usage,
             guard_denied_count=guard_denied_count,
             document_request=document_request,
+            sheet_request=sheet_request,
         )
 
     def _log_terminal_outcome(

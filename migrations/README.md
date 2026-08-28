@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0077_onboarding_failure_reason` |
+| head revision | `0078_document_delivery_sheet` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -463,6 +463,19 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 表本 revision 新增，前滚兼容；`downgrade()` 直接删表，是数据丢失操作（一旦部署
 环境写过失败原因，`DROP TABLE` 会把它们连同表一起清空），不存在需要回填的历史值
 （本 revision 未在任何环境应用过）。
+
+## `0078_document_delivery_sheet`（表格分支：检查点表新增两列）
+
+[Issue #354](https://github.com/Moshuiwang/lingxi/issues/354)（Trace #373 S-H3-2）。
+不新建表：`task_document_delivery_request` 复用同一张检查点表/同一状态机，新增
+`delivery_type`（默认 `'docx'`，CHECK 二值，历史行零回填自动归类）与
+`resource_url`（CHECK 约束 docx 行恒为 NULL）两列；两列语义与判据见迁移文件
+头部完整说明。`down_revision` 同批改链：实施时指实测真实链头 `0073`，`0076`/
+`0077` 按既定次序先行合入后由编排者在合并队列改链至
+`0077_onboarding_failure_reason`（当前值），链单头 `...0076 → 0077 → 0078`。
+
+`downgrade()` 直接删两列及其 CHECK，有损（`sheet` 行的类型标记与表格链接随列
+丢失，不删行本身），与 `0075` 既有先例同一姿态（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

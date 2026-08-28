@@ -1,4 +1,5 @@
-"""``task_document_delivery_request`` 的 Postgres 存取（迁移 0074，Issue #341 S-ES-3/R-2）。
+"""``task_document_delivery_request`` 的 Postgres 存取（迁移 0074，Issue #341 S-ES-3/R-2；
+迁移 0078 新增 ``delivery_type``/``resource_url`` 两列，Issue #354 S-H3-2 表格分支）。
 
 主要服务 gateway 侧独立消费循环（``apps/gateway/document_delivery.py``）：认领
 ``pending`` 行、在建档成功的那一刻单独提交检查点列 ``document_id``、把最终结果
@@ -94,17 +95,37 @@ class DocumentDeliveryOwnershipLost(RuntimeError):
         self.request_id = request_id
 
 
+#: 支持的交付类型（迁移 0078 CHECK 同一取值集合）：``docx`` 走
+#: ``adapters/feishu_docx_delivery.py``，``sheet`` 走
+#: ``adapters/feishu_sheets_delivery.py``（Issue #354 S-H3-2）。
+DELIVERY_TYPE_DOCX = "docx"
+DELIVERY_TYPE_SHEET = "sheet"
+
+
 @dataclass(frozen=True)
 class DocumentDeliveryClaim:
-    """gateway 消费循环认领到的一行文档投递请求。"""
+    """gateway 消费循环认领到的一行文档/表格投递请求。
+
+    ``paragraphs``：docx 时是段落文本数组；sheet 时是行×列的单元格文本二维数组
+    （复用同一列存两种内容形状，理由见迁移 0078 文件头部）——调用方
+    （``apps/gateway/document_delivery.py``）按 ``delivery_type`` 决定怎么解读。
+    ``document_id``：docx 时是 ``document_id``，sheet 时是 ``spreadsheet_token``
+    ——同样是复用同一列的检查点标识，见迁移 0078 文件头部「为什么复用」一节。
+    """
 
     id: str
     task_id: str
     requester_open_id: str
     title: str
-    paragraphs: tuple[str, ...]
+    paragraphs: tuple[Any, ...]
     document_id: str | None
     attempts: int
+    # 默认值指向 docx（迁移 0078 该列自身的 DEFAULT 'docx'）：保持既有直接构造
+    # `DocumentDeliveryClaim(...)` 的调用点（本模块之外，测试里手工搭 claim 的
+    # 场景）不必因为新增这两个字段而逐个改写——docx 是修改前唯一存在的类型，
+    # 默认成它就是"不传等价于旧行为"。
+    delivery_type: str = DELIVERY_TYPE_DOCX
+    resource_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,12 +134,19 @@ class UnnotifiedSuccess:
     :meth:`PostgresDocumentDeliveryStore.claim_unnotified_succeeded` 的返回单元。
     只带补发通知这一件事所需的最小字段，不是 :class:`DocumentDeliveryClaim` 的
     子集（``title``/``paragraphs``/``attempts`` 与补发无关）。
+
+    ``delivery_type``/``resource_url``（迁移 0078，Issue #354 S-H3-2）：补发通知
+    时要拼哪种链接同样要看类型——docx 本地拼接（不需要 ``resource_url``），
+    sheet 直接读这一列（建表时已经落检查点，见
+    :meth:`PostgresDocumentDeliveryStore.mark_document_created`）。
     """
 
     id: str
     task_id: str
     requester_open_id: str
     document_id: str
+    delivery_type: str
+    resource_url: str | None
 
 
 def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
@@ -131,6 +159,8 @@ def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
         paragraphs=tuple(paragraphs) if isinstance(paragraphs, list) else tuple(),
         document_id=row[5],
         attempts=row[6],
+        delivery_type=row[7],
+        resource_url=row[8],
     )
 
 
@@ -162,18 +192,26 @@ class PostgresDocumentDeliveryStore:
                         FOR UPDATE SKIP LOCKED
                       LIMIT %s
                  )
-                RETURNING id, task_id, requester_open_id, title, paragraphs, document_id, attempts
+                RETURNING id, task_id, requester_open_id, title, paragraphs, document_id, attempts,
+                          delivery_type, resource_url
                 """,
                 (max_attempts, limit),
             )
             return [_row_to_claim(row) for row in cursor.fetchall()]
 
-    def mark_document_created(self, *, request_id: str, document_id: str) -> None:
-        """检查点：建档成功后单独提交，不与四步里的其余动作共享事务。
+    def mark_document_created(
+        self, *, request_id: str, document_id: str, resource_url: str | None = None
+    ) -> None:
+        """检查点：建档/建表成功后单独提交，不与其余动作共享事务。
 
         ``document_id IS NULL`` 守卫（而不仅是 ``status = 'processing'``）：即使
         因为某种竞态被调用第二次，也不会用一次新的调用覆盖已经持久化的
-        ``document_id``——第一次成功写入的那个值才是真正建出来的那篇文档。
+        ``document_id``——第一次成功写入的那个值才是真正建出来的那篇文档/表格。
+
+        ``resource_url``（迁移 0078，Issue #354 S-H3-2）：**只有 sheet 分支传
+        非 None**——sheet 的链接由建表响应直接给出，docx 分支永远不传（保持
+        默认 ``None``，docx 调用点零改动，行为逐字不变）。同一条 ``UPDATE``
+        原子写入两列，不需要第二次数据库往返。
 
         P1-2（opus 审查）：命中 0 行时抛出 :class:`DocumentDeliveryOwnershipLost`
         ——见该类文档"慢消费者"场景。此前静默无视 0 行，会让一次迟到的建档检查点
@@ -184,10 +222,10 @@ class PostgresDocumentDeliveryStore:
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
-                   SET document_id = %s, updated_at = now()
+                   SET document_id = %s, resource_url = %s, updated_at = now()
                  WHERE id = %s AND status = 'processing' AND document_id IS NULL
                 """,
-                (document_id, request_id),
+                (document_id, resource_url, request_id),
             )
             if cursor.rowcount != 1:
                 raise DocumentDeliveryOwnershipLost(request_id)
@@ -228,7 +266,7 @@ class PostgresDocumentDeliveryStore:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, task_id, requester_open_id, document_id
+                SELECT id, task_id, requester_open_id, document_id, delivery_type, resource_url
                   FROM task_document_delivery_request
                  WHERE status = 'succeeded' AND notified_at IS NULL
                    AND document_id IS NOT NULL
@@ -449,6 +487,8 @@ class PostgresDocumentDeliveryStore:
 
 
 __all__ = [
+    "DELIVERY_TYPE_DOCX",
+    "DELIVERY_TYPE_SHEET",
     "MAX_CLAIM_ATTEMPTS",
     "NOTIFY_RETRY_AFTER",
     "PENDING_DEAD_LETTER_AFTER",
