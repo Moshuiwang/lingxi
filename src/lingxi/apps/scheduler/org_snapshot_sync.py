@@ -60,6 +60,44 @@ RosterAuditDuty` 的 ``_completed_on`` 水位（同一天只做一次，不做�
   不再另起一条 ``TenantAccessTokenSupply``：两处消费的是同一个 ``app_id``/
   ``app_secret`` 换来的同一类令牌，与访问哪个资源无关，复用只是省一次多余的换取，
   不产生新的凭据材料或新的失败模式。
+
+## 为什么整轮要挪出主循环线程（Issue #340）
+
+``SchedulerLoop``（``apps/scheduler/loop.py``）是单线程串行派发器：整轮开始前
+只戳**一次**心跳，之后依次同步调用每个职责的 ``run_once()``，跑完再等一个
+interval（默认 60s）。本职责一整轮同步扫描（8 个关联租户 × 约 25 个部门的递归
+下钻 × 应用/用户两条路径）stage 2026-08-21 实测约 **345 秒**——如果这段耗时全部
+占在 ``SchedulerLoop`` 的调用线程上，会同时撞上两道既有阈值：容器健康检查
+scheduler 角色阈值 **180 秒**（``apps/healthcheck/__init__.py``），以及
+``AlertManager.heartbeat_timeout_seconds`` 默认 **120 秒**（``core/alerting.py``，
+评估用它自己被调用那一刻的时钟，而 ``AlertingDuty`` 排在 duties 列表最后
+——见 ``assembly.py::build_loop`` 文档）。两次心跳最大间隔 = 345 + 60 = 405s，
+两道阈值都是**结构必然**会被击穿，不是概率事件：容器每天一次假 unhealthy，
+管理群每天一条假 ``PROCESS_INACTIVE`` 告警——2026-08-28 编排者取证已经实测坐实
+后者。
+
+**修法**：把「读一整轮 + 校验 + 提交 + 收口」整体派进一个后台线程，
+``SchedulerLoop`` 所在的调用线程只等一个很短的上限
+（``DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS``）就拿回控制权——不是新机制，是
+``apps/scheduler/daily_report.py``（Issue #325，同一个"耗时职责挤占心跳评估"
+形状）已审查上线做法在同一个进程内的第二次应用。正常情况（既有测试用的假读取
+都是微秒级）行为与改动前完全一致：``run_once()`` 同步返回 ``run_id``。真正
+跑满 345 秒的那一轮，``run_once()`` 提前返回 ``None``，下一个 tick
+``SchedulerLoop`` 立刻推进到其余职责与 ``AlertingDuty``，心跳评估拿到的是
+新鲜的时钟读数。
+
+**活性文件证明主循环在派发，不证明本轮在推进，不得在读取过程中回调心跳。**
+把「进程活性」心跳回调埋进分页读取的中途（"轮内分片心跳"的 B1 变体）会让活性
+语义退化成"最近发过一次 HTTP 请求"——全部其余 13 个职责槽位停摆 345 秒依然
+全绿，本职责真的读到卡死也全绿，这是明令禁止的缺陷而不是可选项（本模块因此不
+依赖那一套活性心跳机制的任何符号，见 ``tests/test_scheduler_org_snapshot_sync.py``
+的源码级反假心跳断言）。本职责自身那一轮是否在推进，由单请求硬超时
+（``adapters/feishu_directory.py``）、
+整轮墙钟预算（默认 1200 秒，见 ``apps/scheduler/config.py``）、连续撞预算升级
+（上方 ``CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD``）三条既有
+墙钟兜底，加上下方新增的僵尸线程告警（``ROUND_THREAD_STUCK_AFTER_SECONDS``）
+共同证明——**方案 A 之后，组织快照轮的可观测出口是审计 + 告警，不是容器健康
+检查颜色**，这是本次改动唯一需要产品负责人知情的取舍（Gate G-1 裁定已确认）。
 """
 
 from __future__ import annotations
@@ -131,6 +169,33 @@ READ_FAILURE_BACKOFF_CEILING_SECONDS = 3600
 # 合理、但对当前关联组织规模而言其实不够"的配置在运行期持续暴露出来。
 CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD = 3
 
+# 派发后台"跑一轮"线程后，主线程（`SchedulerLoop` 所在的调用方）愿意同步等待的
+# 上限（Issue #340，见模块文档「为什么整轮要挪出主循环线程」）。不是这一轮本身
+# 的超时——那一轮该跑多久跑多久，交给既有的两道墙钟兜底（单请求 20s、整轮预算
+# 默认 1200s）；这里只是"调用方最多为这一次调用愿意占用多久"。取值与
+# `apps/scheduler/daily_report.py::DEFAULT_AGGREGATION_JOIN_TIMEOUT_SECONDS`
+# 同值同理由（Issue #325 先例）：远小于 `AlertPolicy.heartbeat_timeout_seconds`
+# 默认值（120 秒），给其余职责与下一轮心跳评估留出充裕余量；也远大于既有测试
+# 假读取函数的实际耗时（微秒级），因此全部既有测试在这个等待窗口内都能正常拿到
+# 同步返回值，快路径行为不变。
+DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS = 2.0
+
+# 后台"跑一轮"线程存活超过这个秒数（用 `self._clock()` 注入时钟计算，不是墙钟
+# `time.monotonic()`——保持与本模块其余全部时间判断同一个可测试的时钟来源）
+# 判定为疑似僵死，额外记一条独立审计 `org_snapshot_sync.round_thread_stuck` +
+# WARNING 日志（只记一次，见 `run_once` 里的 `_round_thread_stuck_alerted` 布尔
+# 位，形状照 `apps/gateway/__init__.py::delivery_thread_watchdog` 的 `reported`
+# 纪律）。取值 = `READ_FAILURE_BACKOFF_CEILING_SECONDS`（退避封顶，3600 秒）——
+# 线程如果真的还在忙于重试或读取，正常情况下不可能连续存活超过这个数字还没有
+# 任何一次成功或失败收口；且严格大于整轮预算的默认值（1200 秒，
+# `LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 的默认档），避免正常一轮跑满预算
+# 时被误报。**刻意不做成可配置的构造参数**——那会新增 `OrgSnapshotSyncDuty` 的
+# 构造签名，把 `assembly.py` 调用点即便不用也置于体量棘轮（1538/1500）视线内；
+# 接受的代价是：如果运维把 `LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS` 配置超过
+# 1 小时，这里会多一次误报 WARNING（仍然只报一次，不影响单飞守卫本身的正确性），
+# 仅此而已。
+ROUND_THREAD_STUCK_AFTER_SECONDS = 3600
+
 
 class TokenSupplyFailure(RuntimeError):
     """令牌供给失败的安全分类（Issue #250 编排者复查 F6）。
@@ -186,6 +251,7 @@ class OrgSnapshotSyncDuty:
         source_app_id: str,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
+        round_join_timeout_seconds: float = DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS,
     ) -> None:
         if not source_app_id:
             raise ValueError("source_app_id 不能为空——它是写进 feishu_org_sync_run 的必填列")
@@ -195,6 +261,18 @@ class OrgSnapshotSyncDuty:
         self._source_app_id = source_app_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._stop = threading.Event() if stop is None else stop
+        self._round_join_timeout_seconds = round_join_timeout_seconds
+        # 上一次派发的后台"跑一轮"线程（Issue #340，见模块文档「为什么整轮要挪出
+        # 主循环线程」）。``None`` 或已经跑完都表示"可以派发下一轮"；还活着就说明
+        # 上一轮还没收工，本轮 `run_once` 的单飞守卫不重复派发。
+        self._pending_thread: threading.Thread | None = None
+        # `_pending_thread` 派发那一刻的时钟读数（用注入时钟，不是墙钟）——仅用于
+        # 判断"这条线程存活了多久"，供僵尸线程告警使用。
+        self._pending_thread_started_at: datetime | None = None
+        # 当前这条 `_pending_thread` 是否已经因为「存活超硬上限」告警过一次
+        # （`ROUND_THREAD_STUCK_AFTER_SECONDS`）。每派发一条新线程时重置为
+        # ``False``——同一条线程只告警一次，不同线程各自独立计。
+        self._round_thread_stuck_alerted = False
         self._completed_on: date | None = None
         # 本进程今天是否已经问过持久化水位（F8）。只问一次：问过之后，"今天到底
         # 完成没有"完全由 `_completed_on`（本进程自己跑出来的结果）决定，不需要
@@ -256,13 +334,20 @@ class OrgSnapshotSyncDuty:
         self._failure_streak = 0
         self._consecutive_round_budget_exceeded = 0
 
-    def run_once(self) -> str | None:
-        """跑一轮。返回写入的 ``run_id``；未执行或本轮未能提交时返回 ``None``。"""
+    def _run_round(self, now: datetime, today: date) -> str | None:
+        """跑一轮：读一整份组织通讯录 → 校验批次完整性 → 写四张快照表 → 收口。
+
+        方法体照旧（Issue #340 只是把调用方从 ``run_once`` 同步调用改成
+        ``run_once`` 派进后台线程调用，`now`/`today` 因此从"方法内部现取"改为
+        "调用方在派发那一刻取好、原样传入"——两者取的是同一个时刻，行为不变）。
+        返回写入的 ``run_id``；未执行或本轮未能提交时返回 ``None``。**这个返回值
+        只有本轮真的在 ``run_once`` 的 join 上限内跑完才会被调用方同步拿到**；
+        跑得更久时，调用方早已带着 ``None`` 返回，本方法仍在后台线程里跑到底，
+        对 ``self._completed_on``/退避状态的收口不受影响（见 `run_once` 与模块
+        文档「为什么整轮要挪出主循环线程」）。"""
 
         if self._stop.is_set():
             return None
-        now = self._clock()
-        today = now.date()
         if self._completed_on == today:
             return None
 
@@ -401,8 +486,9 @@ class OrgSnapshotSyncDuty:
             # 处在流水线同一个位置——同样是两条身份路径都已经读完一整轮（数百次
             # 分页请求）之后才撞上的失败，贴着 tick 立即重试的外部成本同一个量级，
             # 上面给 `integrity_rejected` 扩大退避范围的理由逐字适用于这里。
-            # `raise` 本身不变：写库失败仍然原样冒泡，让 `SchedulerLoop` 按既有
-            # 纪律记录并隔离，这里只是在冒泡前先把退避记上。
+            # `raise` 本身不变：写库失败仍然原样冒泡——`run_once` 派发的后台
+            # 线程会接住它、记同形状日志（Issue #340，见 `run_once` 的
+            # `worker()`），这里只是在冒泡前先把退避记上。
             backoff_seconds = self._advance_backoff()
             # 同上：本轮读取已经完整跑完，不是撞预算，清零连续计数。
             self._consecutive_round_budget_exceeded = 0
@@ -434,3 +520,98 @@ class OrgSnapshotSyncDuty:
             len(batch.members),
         )
         return run_id
+
+    def run_once(self) -> str | None:
+        """调用方（`SchedulerLoop`）每个 tick 调用的入口。只做本地、无 I/O 的
+        判断决定"该不该起一轮"；真正的一轮（`_run_round`）整体派进后台线程，
+        本方法只同步等一个很短的上限就把控制权交还调用方（Issue #340，见模块
+        文档「为什么整轮要挪出主循环线程」）。
+
+        正常情况下（既有测试的假读取都是微秒级，真实一轮跑得比
+        `_round_join_timeout_seconds` 快得多的场景理论上也算）行为与改动前
+        完全一致：同步拿到 `_run_round` 的返回值。真正跑满整轮预算的那一轮，
+        这里提前返回 ``None``——不是"这一轮失败了"，只是"调用方不再等"；
+        本轮真正的结果（`completed_on`、审计、退避状态）由后台线程自己收口，
+        下一个 tick 或审计里能看到。
+        """
+
+        if self._stop.is_set():
+            return None
+        now = self._clock()
+        today = now.date()
+        if self._completed_on == today:
+            # 当日水位已满：纯内存比较，不需要看一眼后台线程或退避状态。
+            return None
+
+        if self._pending_thread is not None and self._pending_thread.is_alive():
+            # 单飞守卫：上一次派发的后台线程还没收工，不重复派发——两条线程
+            # 同时读一整份组织通讯录、同时可能 `commit_batch`，是比"这一轮慢"
+            # 本身更糟的形状（数据竞争、外部调用量翻倍）。
+            if (
+                not self._round_thread_stuck_alerted
+                and self._pending_thread_started_at is not None
+                and (now - self._pending_thread_started_at).total_seconds()
+                > ROUND_THREAD_STUCK_AFTER_SECONDS
+            ):
+                # 存活超硬上限：疑似僵死，响亮告警一次（见
+                # `ROUND_THREAD_STUCK_AFTER_SECONDS` 的取值依据）。只记一次——
+                # 这条线程死没死是同一个持续事实，每个 tick 都重复上报只会
+                # 刷屏，形状照 `apps/gateway/__init__.py::delivery_thread_watchdog`
+                # 的 `reported` 纪律。
+                self._round_thread_stuck_alerted = True
+                alive_seconds = int((now - self._pending_thread_started_at).total_seconds())
+                self._audit.record(
+                    "org_snapshot_sync.round_thread_stuck", alive_seconds=alive_seconds
+                )
+                logger.warning(
+                    "组织快照后台线程存活 %s 秒仍未收工，超过僵死判定上限 %s 秒——"
+                    "单飞守卫会继续拒绝派发新线程，快照将持续停在旧数据上，"
+                    "需要人工介入排查或重启进程 alive_seconds=%s",
+                    alive_seconds,
+                    ROUND_THREAD_STUCK_AFTER_SECONDS,
+                    alive_seconds,
+                )
+            return None
+
+        if self._next_attempt_at is not None and now < self._next_attempt_at:
+            # 退避门禁留在主线程（纯本地时刻比较，与 `_run_round` 内部同一条
+            # 判据一致）：退避窗口内连线程都不派，不产生任何线程创建开销，也
+            # 不重复记审计（`_run_round` 内部若被调用到同样会安静跳过，这里
+            # 提前挡住只是省一次线程调度）。
+            return None
+
+        result: dict[str, str | None] = {}
+
+        def worker() -> None:
+            try:
+                result["run_id"] = self._run_round(now, today)
+            except BaseException as error:  # noqa: BLE001 - 线程异常不能无声消失
+                # 只记异常类型，不记正文——同 `loop.py::SchedulerLoop.run_once`
+                # 逐职责隔离异常时的同一条纪律（那里因为本轮读一整份组织通讯录、
+                # 已经整体挪进了这条后台线程，`SchedulerLoop` 自己再也看不到这个
+                # 异常，因此这里补上同形状的留痕，不能让它无声消失在线程里）。
+                logger.error(
+                    "组织快照后台线程出现未预期异常，其余定时职责与下一轮不受影响 error=%s",
+                    type(error).__name__,
+                )
+
+        thread = threading.Thread(
+            target=worker, name="lingxi-org-snapshot-round", daemon=True
+        )
+        self._pending_thread = thread
+        self._pending_thread_started_at = now
+        self._round_thread_stuck_alerted = False
+        thread.start()
+        thread.join(timeout=self._round_join_timeout_seconds)
+        if thread.is_alive():
+            # 仍在跑：不再等——这正是本次修复的核心，一轮的耗时不得占用调用方
+            # 所在的线程（`SchedulerLoop` 主循环：心跳与其余职责，含
+            # `AlertingDuty` 的心跳评估，都在这条线程上）。线程会自己收工
+            # （`completed_on`/审计/退避状态），下一个 tick 由内存水位或持久化
+            # 水位观察到。
+            logger.info(
+                "组织快照仍在后台线程运行，主循环不再等待 timeout=%ss",
+                self._round_join_timeout_seconds,
+            )
+            return None
+        return result.get("run_id")

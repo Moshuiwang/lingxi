@@ -11,14 +11,18 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from lingxi.apps.scheduler import org_snapshot_sync as org_snapshot_sync_module
 from lingxi.apps.scheduler.org_snapshot_sync import (
     CONSECUTIVE_ROUND_BUDGET_EXCEEDED_ESCALATION_THRESHOLD,
     READ_FAILURE_BACKOFF_CEILING_SECONDS,
     READ_FAILURE_BACKOFF_STEP_SECONDS,
+    ROUND_THREAD_STUCK_AFTER_SECONDS,
     OrgSnapshotSyncDuty,
 )
 from lingxi.core.identity.org_snapshot import (
@@ -213,8 +217,16 @@ class BaselineProtectionTest(unittest.TestCase):
         self.assertEqual(audit.actions(), ["org_snapshot_sync.committed"])
         self.assertEqual(duty.completed_on, FIXED_NOW.date())
 
-    def test_an_unexpected_commit_failure_is_audited_and_re_raised(self) -> None:
-        """写库阶段的非预期异常（连接失败等）不得被吞掉、也不能置位水位。"""
+    def test_an_unexpected_commit_failure_is_audited_and_leaves_no_committed_trace(self) -> None:
+        """写库阶段的非预期异常（连接失败等）不得被吞掉、也不能置位水位。
+
+        Issue #340 后，「跑一轮」整体派进后台线程（见
+        ``org_snapshot_sync.py`` 模块文档「为什么整轮要挪出主循环线程」）：
+        `_run_round` 内部的 ``raise`` 不再能穿透线程边界同步冒泡回
+        ``run_once()`` 的调用方——它被 `run_once` 派发的 `worker()` 接住、
+        记同形状日志（``T8``），调用方这次改成同步拿到 ``None``（不是异常）。
+        审计与水位两条断言不受影响：无论异常在哪条线程里发生，`commit_failed`
+        审计与"不置位水位"这两条产品语义必须逐字不变。"""
 
         store = FakeStore(raises=RuntimeError("connection_lost"))
         audit = RecordingAudit()
@@ -226,9 +238,9 @@ class BaselineProtectionTest(unittest.TestCase):
             clock=lambda: FIXED_NOW,
         )
 
-        with self.assertRaises(RuntimeError):
-            duty.run_once()
+        result = duty.run_once()
 
+        self.assertIsNone(result, "写库失败的一轮不再同步抛出异常，而是同步拿到 None")
         self.assertEqual(audit.actions(), ["org_snapshot_sync.commit_failed"])
         self.assertIsNone(duty.completed_on)
 
@@ -669,11 +681,13 @@ class BackoffTest(unittest.TestCase):
     def test_a_commit_failure_also_backs_off_and_blocks_an_immediate_retry(self) -> None:
         """独立审查必修 D：写库失败（`commit_failed`）与读取失败、完整性校验失败
         处在流水线同一个位置——都要先跑完一轮昂贵的外部读取才会撞上——因此也要
-        推进同一条退避。`raise` 本身不变：这里既要证明异常照常冒泡，又要证明
-        状态已经在冒泡前记好，下一次调用会被退避挡住。变异锚点：把
-        `self._advance_backoff()` 从 `commit_failed` 分支删掉，本用例的
-        `call_count` 断言会从 1 变红成 2（且 `backoff_seconds`/`attempt` 字段
-        会从审计里消失）。"""
+        推进同一条退避。**`raise` 本身在 `_run_round` 内部仍然不变**（Issue #340
+        后由 `run_once` 派发的后台线程接住、记同形状日志，不再穿透线程边界同步
+        冒泡到 `run_once()` 调用方，见 `BaselineProtectionTest` 同一场景的
+        专门用例）——这里既要证明状态已经在冒泡前记好，又要证明下一次调用会被
+        退避挡住。变异锚点：把 `self._advance_backoff()` 从 `commit_failed`
+        分支删掉，本用例的 `call_count` 断言会从 1 变红成 2（且
+        `backoff_seconds`/`attempt` 字段会从审计里消失）。"""
 
         call_count = {"n": 0}
 
@@ -687,9 +701,9 @@ class BackoffTest(unittest.TestCase):
             read_snapshot=counting_read, store=store, audit=audit, source_app_id="cli_test", clock=lambda: FIXED_NOW
         )
 
-        with self.assertRaises(RuntimeError):
-            duty.run_once()
+        result = duty.run_once()
 
+        self.assertIsNone(result)
         self.assertEqual(audit.actions(), ["org_snapshot_sync.commit_failed"])
         fields = audit.records[0][1]
         self.assertEqual(fields["attempt"], 1)
@@ -892,6 +906,393 @@ class RoundBudgetEscalationTest(unittest.TestCase):
             audit.actions(),
             "中间的成功提交必须清零连续计数，否则第四轮会被误判成第三轮连续撞线",
         )
+
+
+def _poll_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """轮询直到 ``predicate()`` 为真或超时，返回是否等到。不引入除有界轮询以外
+    的额外同步原语，测试范围内可接受（同 ``tests/test_daily_report_duty.py`` 的
+    ``_wait_for_completion`` 纪律：后台线程完成的确切时刻本来就不可预知，事件
+    通知需要被测代码额外配合，轮询是测试这一侧最简单可靠的做法）。"""
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+    return True
+
+
+class ThreadedRoundTests(unittest.TestCase):
+    """Issue #340：「跑一轮」（``_run_round``）整体派进后台线程，``run_once``
+    只同步等一个很短的 join 上限（``DEFAULT_ROUND_JOIN_TIMEOUT_SECONDS``）就
+    把控制权交还调用方——见 ``org_snapshot_sync.py`` 模块文档「为什么整轮要
+    挪出主循环线程」。T1/T2/T3/T6。
+    """
+
+    def test_t1_a_slow_round_returns_within_the_join_timeout(self) -> None:
+        """T1：慢轮进行中 ``run_once`` 有界时间内返回。
+
+        变异验红 M1：把 ``thread.join(timeout=self._round_join_timeout_seconds)``
+        换成裸 ``thread.join()``——本用例会因为 ``run_once()`` 一直卡到闸门放行
+        才返回、``elapsed`` 远超断言上限而变红（实测时需要给测试命令本身加一层
+        外部超时，防止真的无限期挂起）。
+        """
+
+        gate = threading.Event()
+        released = threading.Event()
+
+        def blocking_read() -> SnapshotBatch:
+            gate.wait(timeout=5.0)
+            released.set()
+            return _committable_batch()
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        started = time.monotonic()
+        result = duty.run_once()
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(result, "慢轮还没收工，调用方本轮拿不到 run_id")
+        self.assertLess(elapsed, 1.0, "调用方必须在很短时间内拿回控制权，不等一整轮跑完")
+        self.assertFalse(released.is_set(), "调用方返回时，这一轮确实还没跑完（不是恰好跑完）")
+
+        gate.set()
+        self.assertTrue(released.wait(timeout=5.0), "放行后后台线程应当很快完成")
+        self.assertTrue(_poll_until(lambda: len(store.committed) >= 1))
+        self.assertEqual(len(store.committed), 1)
+
+    def test_t2_a_second_call_while_a_round_is_in_flight_does_not_dispatch_twice(
+        self,
+    ) -> None:
+        """T2：连续两次 ``run_once`` 撞同一在飞线程只派一个。
+
+        变异验红 M2：删掉单飞守卫（让 ``run_once`` 无视 ``_pending_thread``
+        是否存活、每次调用都派发新线程去读一轮）——本用例的 ``call_count``
+        断言会从 1 变红成 2。
+        """
+
+        gate = threading.Event()
+        call_count = {"n": 0}
+
+        def blocking_read() -> SnapshotBatch:
+            call_count["n"] += 1
+            gate.wait(timeout=5.0)
+            return _committable_batch()
+
+        store = FakeStore()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_read,
+            store=store,
+            audit=RecordingAudit(),
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        first = duty.run_once()
+        second = duty.run_once()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        gate.set()
+        self.assertTrue(_poll_until(lambda: len(store.committed) >= 1))
+        self.assertEqual(call_count["n"], 1, "同一条在飞线程期间不该派发第二个")
+        self.assertEqual(len(store.committed), 1)
+
+    def test_t3_the_background_thread_is_a_daemon(self) -> None:
+        """T3：线程为 daemon。变异验红 M3：把 ``daemon=True`` 改成
+        ``daemon=False``。"""
+
+        gate = threading.Event()
+
+        def blocking_read() -> SnapshotBatch:
+            gate.wait(timeout=5.0)
+            return _committable_batch()
+
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_read,
+            store=FakeStore(),
+            audit=RecordingAudit(),
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        duty.run_once()
+
+        thread = duty._pending_thread  # noqa: SLF001 - 白盒确认线程属性
+        self.assertIsNotNone(thread)
+        assert thread is not None  # 收窄类型，便于下面直接访问属性
+        self.assertTrue(thread.daemon, "后台线程必须是 daemon，不得阻止进程退出")
+        self.assertEqual(thread.name, "lingxi-org-snapshot-round")
+        gate.set()
+
+    def test_t6_a_fast_round_still_returns_the_run_id_synchronously(self) -> None:
+        """T6：快轮行为与改动前逐字相同：同步返回 ``run_id``、``committed``
+        审计字段不变。变异验红 M6：把快路径也改成返回 ``None``（例如无论
+        ``thread.is_alive()`` 结果如何都 ``return None``），本用例的
+        ``result == "orgsync_fixed"`` 断言会变红。
+        """
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=lambda: _committable_batch(),
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+        )
+
+        result = duty.run_once()
+
+        self.assertEqual(result, "orgsync_fixed")
+        self.assertEqual(len(store.committed), 1)
+        self.assertEqual(audit.actions(), ["org_snapshot_sync.committed"])
+        self.assertEqual(duty.completed_on, FIXED_NOW.date())
+
+
+class StuckThreadAlertTests(unittest.TestCase):
+    """T4：存活超硬上限恰记一条 ``round_thread_stuck`` 审计 + WARNING，重复
+    tick 不重复记。变异验红 M4：删掉告警分支，或删掉 ``_round_thread_stuck_alerted``
+    这个"只记一次"布尔位（改成每次都记）。
+    """
+
+    def test_t4_a_stuck_thread_is_alerted_exactly_once(self) -> None:
+        gate = threading.Event()
+        clock = {"now": FIXED_NOW}
+
+        def blocking_read() -> SnapshotBatch:
+            gate.wait(timeout=5.0)
+            return _committable_batch()
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        first = duty.run_once()  # 派发，卡在闸门上，join 超时提前返回
+        self.assertIsNone(first)
+
+        # 还没到硬上限：不该告警。
+        clock["now"] = FIXED_NOW + timedelta(seconds=ROUND_THREAD_STUCK_AFTER_SECONDS - 1)
+        duty.run_once()
+        self.assertNotIn("org_snapshot_sync.round_thread_stuck", audit.actions())
+
+        # 越过硬上限：第一次告警，且必须带 WARNING 日志。
+        clock["now"] = FIXED_NOW + timedelta(seconds=ROUND_THREAD_STUCK_AFTER_SECONDS + 1)
+        with self.assertLogs(
+            "lingxi.apps.scheduler.org_snapshot_sync", level="WARNING"
+        ) as captured:
+            duty.run_once()
+        stuck_records = [
+            fields for action, fields in audit.records if action == "org_snapshot_sync.round_thread_stuck"
+        ]
+        self.assertEqual(len(stuck_records), 1)
+        self.assertTrue(
+            any("存活" in line and "僵" in line for line in captured.output),
+            "告警日志必须明确说明这是疑似僵死、长期存活的后台线程",
+        )
+
+        # 再来一个 tick：同一条线程仍然存活、仍然超过硬上限——不重复记。
+        clock["now"] = clock["now"] + timedelta(seconds=1)
+        duty.run_once()
+        stuck_records_again = [
+            fields for action, fields in audit.records if action == "org_snapshot_sync.round_thread_stuck"
+        ]
+        self.assertEqual(len(stuck_records_again), 1, "同一条僵死线程只告警一次")
+
+        gate.set()
+        self.assertTrue(_poll_until(lambda: len(store.committed) >= 1))
+
+
+class DispatchIsNotCompletionTests(unittest.TestCase):
+    """T5：派发 ≠ 完成——线程内读取失败时当日水位不置位、退避推进、下一 tick
+    按退避跳过。变异验红 M5：把 ``_completed_on = today`` 提到派发处（即
+    ``run_once`` 一旦成功起了线程就乐观置位水位，不等线程真正跑完）。
+    """
+
+    def test_t5_a_failing_round_does_not_mark_completed_until_it_actually_finishes(
+        self,
+    ) -> None:
+        gate = threading.Event()
+        finished = threading.Event()
+        clock = {"now": FIXED_NOW}
+        call_count = {"n": 0}
+
+        def blocking_failing_read() -> SnapshotBatch:
+            call_count["n"] += 1
+            gate.wait(timeout=5.0)
+            finished.set()
+            raise RuntimeError("transport_error")
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_failing_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: clock["now"],
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        result = duty.run_once()
+
+        self.assertIsNone(result)
+        self.assertIsNone(duty.completed_on, "派发不等于完成：线程还没收工时不该有任何状态更新")
+        self.assertEqual(audit.actions(), [], "线程还没收工时也不该有任何审计")
+
+        gate.set()
+        self.assertTrue(finished.wait(timeout=5.0))
+        self.assertTrue(_poll_until(lambda: "org_snapshot_sync.read_failed" in audit.actions()))
+
+        self.assertIsNone(duty.completed_on, "读取失败的一轮依然不得置位当日水位")
+        self.assertIsNotNone(duty._next_attempt_at, "读取失败必须推进退避")  # noqa: SLF001
+
+        # 下一 tick 落在退避窗口内：应该被挡住，不再发起外部读取。
+        clock["now"] = clock["now"] + timedelta(seconds=1)
+        again = duty.run_once()
+        self.assertIsNone(again)
+        self.assertEqual(call_count["n"], 1, "退避窗口内不得再发起外部读取")
+
+
+class NoFakeHeartbeatTest(unittest.TestCase):
+    """T7：反假心跳——源码级断言本模块不依赖"进程活性"心跳机制的任何符号
+    （Issue #340 明令禁止的 B1 变体：把心跳回调埋进读取回调的中途，会让活性
+    语义退化成"最近发过一次 HTTP 请求"）。变异验红 M7：在读取回调（或
+    ``_run_round``）里插入一次 ``touch_liveness(...)`` 调用/对应的 import。
+    """
+
+    def test_t7_the_module_source_never_references_the_liveness_module(self) -> None:
+        source = inspect.getsource(org_snapshot_sync_module)
+        self.assertNotIn(
+            "apps.liveness", source, "本模块不得依赖进程活性心跳机制所在的模块"
+        )
+        self.assertNotIn(
+            "touch_liveness",
+            source,
+            "本模块不得调用 touch_liveness——这是设计文明令禁止的假心跳变体",
+        )
+
+
+class BaseExceptionInThreadTests(unittest.TestCase):
+    """T8：线程内抛 ``BaseException`` 留同形状日志不静默。变异验红 M8：把
+    ``except BaseException`` 缩成 ``except Exception``（或整个删掉这层
+    try/except）——``SystemExit`` 不是 ``Exception`` 的子类，不会被
+    ``_run_round`` 内部既有的 ``except Exception`` 分支捕获，本用例的
+    ``assertLogs`` 断言会因为"没有任何日志被记录"直接报 AssertionError 而变红。
+    """
+
+    def test_t8_a_base_exception_escaping_the_round_is_logged_not_silenced(
+        self,
+    ) -> None:
+        def read_and_exit() -> SnapshotBatch:
+            raise SystemExit("boom-should-not-appear-in-logs")
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        duty = OrgSnapshotSyncDuty(
+            read_snapshot=read_and_exit,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+        )
+
+        with self.assertLogs(
+            "lingxi.apps.scheduler.org_snapshot_sync", level="ERROR"
+        ) as captured:
+            result = duty.run_once()
+
+        self.assertIsNone(result)
+        self.assertEqual(store.committed, [])
+        self.assertEqual(audit.actions(), [], "BaseException 不经过既有任何一条审计分支")
+        self.assertTrue(
+            any("未预期异常" in line and "SystemExit" in line for line in captured.output)
+        )
+        for line in captured.output:
+            self.assertNotIn("boom-should-not-appear-in-logs", line, "只记异常类型，不记正文")
+
+
+class FullLoopIntegrationTest(unittest.TestCase):
+    """T9：整循环集成——慢组织快照职责 + 记录型职责并存，记录型职责每 tick
+    都跑、``heartbeat`` 每 tick 都被调用。变异验红 M9：把职责改回同步执行
+    （即撤销 Issue #340 本次改动），``SchedulerLoop.run_once()`` 会被一整轮
+    阻塞式读取拖住，`recorded_duty`/`heartbeat` 计数在慢轮跑完之前都不会推进，
+    断言从 3 变红成 1。
+    """
+
+    def test_t9_other_duties_and_heartbeat_keep_ticking_while_a_round_is_in_flight(
+        self,
+    ) -> None:
+        from lingxi.apps.scheduler.loop import SchedulerLoop
+
+        gate = threading.Event()
+
+        def blocking_read() -> SnapshotBatch:
+            gate.wait(timeout=5.0)
+            return _committable_batch()
+
+        store = FakeStore()
+        audit = RecordingAudit()
+        org_duty = OrgSnapshotSyncDuty(
+            read_snapshot=blocking_read,
+            store=store,
+            audit=audit,
+            source_app_id="cli_test",
+            clock=lambda: FIXED_NOW,
+            round_join_timeout_seconds=0.05,
+        )
+        self.addCleanup(gate.set)
+
+        counters = {"heartbeat": 0, "recorded_duty": 0}
+
+        class RecordingDuty:
+            name = "记录型职责"
+
+            def run_once(self) -> None:
+                counters["recorded_duty"] += 1
+                return None
+
+        loop = SchedulerLoop(
+            duties=[org_duty, RecordingDuty()],
+            heartbeat=lambda: counters.__setitem__("heartbeat", counters["heartbeat"] + 1),
+        )
+
+        started = time.monotonic()
+        for _ in range(3):
+            loop.run_once()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 2.0, "组织快照全量轮在飞期间不得拖慢整轮调度")
+        self.assertEqual(counters["heartbeat"], 3, "心跳每 tick 都必须被调用，不受慢轮影响")
+        self.assertEqual(
+            counters["recorded_duty"], 3, "排在组织快照之后的记录型职责每 tick 都要照常运行"
+        )
+
+        gate.set()
+        self.assertTrue(_poll_until(lambda: len(store.committed) >= 1))
 
 
 def _committable_batch() -> SnapshotBatch:
