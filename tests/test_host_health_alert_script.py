@@ -47,20 +47,22 @@ class ParseInspectEntryTests(unittest.TestCase):
         self.assertIsNone(observation.health_status)
 
     def test_running_healthy_container(self) -> None:
-        entry = {"State": {"Running": True, "Health": {"Status": "healthy"}}}
-        observation = host_health_alert.parse_inspect_entry("c", entry)
+        # 入参就是 `docker container inspect --format '{{json .State}}'` 的
+        # 输出本身——已经只剩 State 那一段，不再包了一层 "State" 键。
+        state = {"Running": True, "Health": {"Status": "healthy"}}
+        observation = host_health_alert.parse_inspect_entry("c", state)
         self.assertTrue(observation.exists)
         self.assertTrue(observation.running)
         self.assertEqual(observation.health_status, "healthy")
 
     def test_no_healthcheck_configured(self) -> None:
-        entry = {"State": {"Running": True}}
-        observation = host_health_alert.parse_inspect_entry("c", entry)
+        state = {"Running": True}
+        observation = host_health_alert.parse_inspect_entry("c", state)
         self.assertTrue(observation.running)
         self.assertIsNone(observation.health_status)
 
     def test_malformed_state_does_not_raise(self) -> None:
-        observation = host_health_alert.parse_inspect_entry("c", {"State": "not-a-mapping"})
+        observation = host_health_alert.parse_inspect_entry("c", "not-a-mapping")
         self.assertTrue(observation.exists)
         self.assertIsNone(observation.running)
         self.assertIsNone(observation.health_status)
@@ -221,6 +223,19 @@ class CredentialLoadingTests(unittest.TestCase):
         with self.assertRaises(host_health_alert.HostMonitorError):
             host_health_alert.load_credentials(Path(self._tmp.name) / "does-not-exist")
 
+    def test_rejects_file_not_owned_by_caller(self) -> None:
+        # 独立审查 P2-4：文档口径是"0600 且属主为运行 cron 的账户"，此前的实现
+        # 只核对了权限位。这里用 monkeypatch `os.getuid` 模拟"文件确实是 0600，
+        # 但属主不是当前运行账户"这一错配——不依赖能否真的 chown 成另一个账户
+        # （测试环境通常没有权限这么做）。
+        self._write(
+            "LINGXI_FEISHU_APP_ID=a\nLINGXI_FEISHU_APP_SECRET=b\nLINGXI_ADMIN_GROUP_CHAT_ID=oc_x\n"
+        )
+        with mock.patch.object(host_health_alert.os, "getuid", return_value=os.getuid() + 999):
+            with self.assertRaises(host_health_alert.HostMonitorError) as ctx:
+                host_health_alert.load_credentials(self.env_path)
+        self.assertIn("owner", str(ctx.exception))
+
     def test_missing_required_key_raises(self) -> None:
         self._write("LINGXI_FEISHU_APP_ID=a\nLINGXI_FEISHU_APP_SECRET=b\n")
         with self.assertRaises(host_health_alert.HostMonitorError) as ctx:
@@ -277,6 +292,28 @@ class StatePersistenceTests(unittest.TestCase):
 
 
 class DockerInspectTests(unittest.TestCase):
+    """`docker_inspect_one` 改用 `docker container inspect --format
+    '{{json .State}}'` 后的行为（独立审查 P2-1/P2-2/P2-3）：不依赖真实 docker
+    （真实 docker 属 L4a），用一个自制的伪 `docker_bin` 脚本模拟三种情形。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _fake_docker(self, *, stderr: str, exit_code: int = 1, record_argv: Path | None = None) -> Path:
+        path = Path(self._tmp.name) / "fake-docker"
+        record_line = f'echo "$@" > "{record_argv}"\n' if record_argv is not None else ""
+        path.write_text(
+            "#!/bin/sh\n"
+            f"{record_line}"
+            f'echo "{stderr}" >&2\n'
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o755)
+        return path
+
     def test_missing_binary_raises_host_monitor_error(self) -> None:
         with self.assertRaises(host_health_alert.HostMonitorError):
             host_health_alert.docker_inspect_one(
@@ -284,10 +321,39 @@ class DockerInspectTests(unittest.TestCase):
             )
 
     def test_nonexistent_container_returns_none(self) -> None:
-        # 用一个必然存在、行为可预测的可执行文件伪装 docker_bin，通过非零退出码
-        # 模拟"容器不存在"；不依赖真实 docker（真实 docker inspect 属 L4a）。
-        result = host_health_alert.docker_inspect_one("whatever", docker_bin="false")
+        # stderr 含 "No such container"（`docker container inspect` 对不存在
+        # 的容器名的真实文案）——这是正常情况，不是脚本故障。
+        docker_bin = self._fake_docker(stderr="Error: No such container: whatever")
+        result = host_health_alert.docker_inspect_one("whatever", docker_bin=str(docker_bin))
         self.assertIsNone(result)
+
+    def test_daemon_unreachable_raises_host_monitor_error(self) -> None:
+        # daemon 不可达（或权限不足）时 stderr 不含 "No such container"/"No
+        # such object"——必须区分对待，抛出脚本级故障，不能悄悄当成"容器不
+        # 存在"（P2-3：否则 daemon 抖动又恢复会被误判成一次假恢复）。
+        docker_bin = self._fake_docker(
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+            "Is the docker daemon running?"
+        )
+        with self.assertRaises(host_health_alert.HostMonitorError) as ctx:
+            host_health_alert.docker_inspect_one("whatever", docker_bin=str(docker_bin))
+        self.assertIn("daemon_error", str(ctx.exception))
+
+    def test_uses_container_inspect_subcommand_with_state_only_format(self) -> None:
+        # 核对确实调用的是 `container inspect --format '{{json .State}}'`，
+        # 不是裸 `inspect`（P2-2：裸 inspect 跨对象类型查找，可能被同名的
+        # 镜像/网络/卷对象误命中；且只取 State，不该出现 Config 字样）。
+        argv_path = Path(self._tmp.name) / "argv.txt"
+        docker_bin = self._fake_docker(
+            stderr="Error: No such container: x", record_argv=argv_path
+        )
+        host_health_alert.docker_inspect_one("x", docker_bin=str(docker_bin))
+        recorded = argv_path.read_text(encoding="utf-8")
+        self.assertIn("container", recorded.split())
+        self.assertIn("inspect", recorded.split())
+        self.assertIn("--format", recorded)
+        self.assertIn(".State", recorded)
+        self.assertNotIn("Config", recorded)
 
 
 class RunIntegrationTests(unittest.TestCase):
@@ -308,13 +374,16 @@ class RunIntegrationTests(unittest.TestCase):
         )
         os.chmod(self.env_path, 0o600)
 
-        # 伪造的 `docker` 可执行文件：`inspect` 子命令原样吐出预先写好的 JSON，
-        # 让 run() 走真实的 subprocess 调用路径，但结果由测试完全控制。
+        # 伪造的 `docker` 可执行文件：`container inspect` 子命令原样吐出预先
+        # 写好的 `State` JSON（与真实 `--format '{{json .State}}'` 的输出形状
+        # 一致——只是 State 那一段，不包一层数组或 "State" 键），让 run() 走
+        # 真实的 subprocess 调用路径，但结果由测试完全控制。
         self.inspect_output = tmp_path / "inspect_output.json"
         self.docker_bin = tmp_path / "fake-docker"
         self.docker_bin.write_text(
             "#!/bin/sh\n"
-            f'if [ "$1" = "inspect" ]; then cat "{self.inspect_output}"; exit 0; fi\n'
+            f'if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then '
+            f'cat "{self.inspect_output}"; exit 0; fi\n'
             "exit 1\n",
             encoding="utf-8",
         )
@@ -328,7 +397,7 @@ class RunIntegrationTests(unittest.TestCase):
         state: dict = {"Running": running}
         if health_status is not None:
             state["Health"] = {"Status": health_status}
-        self.inspect_output.write_text(json.dumps([{"State": state}]), encoding="utf-8")
+        self.inspect_output.write_text(json.dumps(state), encoding="utf-8")
 
     def _run(self, extra_argv: list[str] | None = None) -> int:
         argv = [
@@ -364,6 +433,32 @@ class RunIntegrationTests(unittest.TestCase):
         state = host_health_alert.load_state(self.state_path)
         self.assertTrue(state["target-container"].alerting)
         self.assertEqual(state["target-container"].reason, host_health_alert.REASON_UNHEALTHY)
+
+    def test_unexpected_send_exception_does_not_crash_or_persist_state(self) -> None:
+        # 独立审查 P2-5：发送路径此前只兜住 `HostMonitorError`，任何其它异常类型
+        # （标准库网络/JSON 原语可能抛出的、没被脚本主动枚举到的那些）会让
+        # `run()` 整体崩溃退出，退化成"这一轮别的容器也没被检查"，而不是"这一个
+        # 容器的发送失败被记录并等待下一轮重试"。这里故意用一个不属于
+        # `HostMonitorError` 家族的普通异常验证兜底生效。
+        self._set_container_state(running=True, health_status="unhealthy")
+
+        with mock.patch.object(
+            host_health_alert,
+            "feishu_send_text",
+            side_effect=ValueError("simulated_unexpected_error"),
+        ) as sender:
+            exit_code = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sender.call_count, 1)
+        # 状态未落盘：下一轮仍会重新判定为"首次触发"并重试发送。
+        self.assertEqual(host_health_alert.load_state(self.state_path), {})
+
+        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            exit_code = self._run()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sender.call_count, 1)
+        state = host_health_alert.load_state(self.state_path)
+        self.assertTrue(state["target-container"].alerting)
 
     def test_successful_alert_then_dedupe_then_recovery_round_trip(self) -> None:
         self._set_container_state(running=True, health_status="unhealthy")

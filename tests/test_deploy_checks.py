@@ -497,6 +497,47 @@ class ResourceLimitsTest(unittest.TestCase):
 
         self.assertEqual(CONTRACT.check_resource_limits(), [])
 
+    # -- 独立审查 P1-2：此前只读基线 compose.yaml，stage/prod 覆盖文件把某一
+    # 项悄悄改成 0/空不会被发现，而覆盖文件的值才是真正部署时生效的值。--------
+
+    def _with_stage_override(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        stage = directory / "compose.stage.yaml"
+        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_STAGE
+        CONTRACT.COMPOSE_STAGE = stage
+        try:
+            return CONTRACT.check_resource_limits()
+        finally:
+            CONTRACT.COMPOSE_STAGE = original
+
+    def test_stage_override_zero_pids_is_caught(self) -> None:
+        """变异验红对应用例：stage 覆盖文件把 pids 改成 0——Compose 对
+        ``pids: 0`` 的语义是整个不下发这项限制，等于没设，必须变红。"""
+
+        body = (
+            'scheduler:\n'
+            '  deploy:\n'
+            '    resources:\n'
+            '      limits:\n'
+            '        cpus: "1.0"\n'
+            '        memory: 1G\n'
+            '        pids: 0\n'
+        )
+        failures = self._with_stage_override(body)
+        self.assertTrue(any("scheduler" in f and "`pids`" in f for f in failures), failures)
+
+    def test_stage_override_declaring_none_of_the_block_is_not_required(self) -> None:
+        """覆盖文件本身可以完全不声明 deploy.resources.limits（沿用基线），
+        这条不该被当成缺失——只有"声明了但不合规"才判红。"""
+
+        failures = self._with_stage_override('scheduler:\n  user: "10001:10001"\n')
+        self.assertEqual([f for f in failures if "scheduler" in f], [])
+
+    def test_stage_override_with_valid_values_passes(self) -> None:
+        failures = self._with_stage_override(self.FULL_SERVICE)
+        self.assertEqual([f for f in failures if "scheduler" in f], [])
+
 
 class LogRetentionFloorTest(unittest.TestCase):
     """json-file 的 max-size/max-file 不得低于取证留存下限（Issue #343 /
@@ -567,6 +608,40 @@ class LogRetentionFloorTest(unittest.TestCase):
         """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
 
         self.assertEqual(CONTRACT.check_log_retention_floor(), [])
+
+    # -- 独立审查 P1-2：stage/prod 覆盖文件一旦覆盖了 logging.options，同样
+    # 不得低于下限。------------------------------------------------------------
+
+    def _with_stage_override(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        stage = directory / "compose.stage.yaml"
+        stage.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_STAGE
+        CONTRACT.COMPOSE_STAGE = stage
+        try:
+            return CONTRACT.check_log_retention_floor()
+        finally:
+            CONTRACT.COMPOSE_STAGE = original
+
+    def test_stage_override_max_size_below_floor_is_caught(self) -> None:
+        """变异验红对应用例：stage 覆盖文件把 max-size 改成 1m，必须变红。"""
+
+        body = (
+            'scheduler:\n'
+            '  logging:\n'
+            '    driver: json-file\n'
+            '    options:\n'
+            '      max-size: "1m"\n'
+            '      max-file: "5"\n'
+        )
+        failures = self._with_stage_override(body)
+        self.assertTrue(any("scheduler" in f and "max-size" in f for f in failures), failures)
+
+    def test_stage_override_declaring_no_logging_is_not_required(self) -> None:
+        """覆盖文件当前并不覆盖 logging（沿用基线），这条不该被当成缺失。"""
+
+        failures = self._with_stage_override('scheduler:\n  user: "10001:10001"\n')
+        self.assertEqual([f for f in failures if "scheduler" in f], [])
 
 
 class PublishJobGuardTest(unittest.TestCase):

@@ -656,37 +656,101 @@ RESOURCE_LIMITED_SERVICES = (
 )
 
 
-def check_resource_limits() -> list[str]:
-    """`deploy/compose.yaml` 的六个服务都必须声明 `deploy.resources.limits`
-    的 `cpus`/`memory`/`pids` 三项。
+def _extract_positive_default(raw: str) -> float | None:
+    """从 compose 一段键值文本里提取"静态可判定的数值"，供 >0 校验使用
+    （独立审查 P1-2）。
 
-    只做结构核对（键是否存在），不核对具体数值——具体数值由环境决定，见
-    `deploy/README.md`「资源限制」一节；门禁只保证"没有任何服务被漏掉、漏配了
-    限制"，不重复容量判断。
+    本仓库的 `deploy.resources.limits` 全部写成 `${VAR:-默认值}` 形态（基线与
+    stage/prod 覆盖文件同一套写法），门禁不起 docker、不渲染 compose，只能从
+    源文本里的这个默认值判断"至少这个默认值本身是不是安全的正数"——这不是
+    运行时真正生效的值（真正生效的值取决于环境是否覆盖了这个变量），但如果
+    连默认值本身都判定不出是正数，静态层面就已经拦不住 `pids: 0` 这类会被
+    Compose 解读成"整个不下发这项限制"的写法。
+
+    支持两种形状：`${VAR:-N}`（取 `N`，两侧可选引号）与裸字面量（数字，允许
+    `512M`/`16G` 这类 Compose 内存单位后缀，取数字前缀）。其余形状（例如没有
+    默认值的 `${VAR:?...}`，或整段都不是数字）返回 ``None``——调用方把
+    ``None`` 当"判定不出安全数值"处理，同样判红，不当放行处理。
+    """
+
+    value = raw.strip()
+    match = re.fullmatch(r'"?\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}"?', value)
+    if match:
+        value = match.group(1)
+    value = value.strip().strip("'\"")
+    number_match = re.match(r"-?\d+(?:\.\d+)?", value)
+    if number_match is None:
+        return None
+    try:
+        return float(number_match.group(0))
+    except ValueError:  # pragma: no cover - re.match 已保证是合法数字文本
+        return None
+
+
+def _check_resource_limits_in(compose_path: pathlib.Path, *, require_all_services: bool) -> list[str]:
+    """核对一份 compose 文本里，出现了 `deploy.resources.limits` 的服务是否
+    合规：三键齐全、且各自能从静态文本判定出一个 >0 的默认值。
+
+    `require_all_services=True`（基线 `compose.yaml`）：全部六个服务必须都
+    声明这个块。`require_all_services=False`（stage/prod 覆盖文件）：声明这
+    个块本身是可选的——覆盖文件可以什么都不改、直接沿用基线；但**一旦声明
+    了**，标准不会降低，同样要三键齐全、数值 >0——覆盖文件的值才是真正部署
+    时生效的值，只核对基线管不住"覆盖文件把某一项悄悄改成 0"（独立审查
+    P1-2）。
     """
 
     failures: list[str] = []
-    base = strip_comments(read(COMPOSE_BASE))
+    text = strip_comments(read(compose_path))
     for service in RESOURCE_LIMITED_SERVICES:
-        block = service_block(base, service)
+        block = service_block(text, service)
         if block is None:
-            failures.append(f"deploy/compose.yaml 找不到 service `{service}`")
+            if require_all_services:
+                failures.append(f"{display(compose_path)} 找不到 service `{service}`")
             continue
         deploy_block = service_block(block, "deploy") or ""
         resources_block = service_block(deploy_block, "resources") or ""
         limits_block = service_block(resources_block, "limits") or ""
         if not limits_block.strip():
-            failures.append(
-                f"{service} 在 deploy/compose.yaml 里没有 deploy.resources.limits "
-                "声明。stage 主机只有 2 核 / 3.7GiB，不限制的容器会互相饿死；"
-                "缺一个服务的限制就是缺一个失控风险。"
-            )
+            if require_all_services:
+                failures.append(
+                    f"{service} 在 {display(compose_path)} 里没有 deploy.resources.limits "
+                    "声明。stage 主机只有 2 核 / 3.7GiB，不限制的容器会互相饿死；"
+                    "缺一个服务的限制就是缺一个失控风险。"
+                )
             continue
         for key in ("cpus", "memory", "pids"):
-            if not re.search(rf"^\s*{key}:\s*\S", limits_block, re.MULTILINE):
+            value_match = re.search(rf"^\s*{key}:\s*(\S.*?)\s*$", limits_block, re.MULTILINE)
+            if value_match is None:
                 failures.append(
-                    f"{service} 的 deploy.resources.limits 缺 `{key}`"
+                    f"{service} 的 deploy.resources.limits 在 {display(compose_path)} 缺 `{key}`"
                 )
+                continue
+            numeric = _extract_positive_default(value_match.group(1))
+            if numeric is None or numeric <= 0:
+                failures.append(
+                    f"{service} 的 `{key}` 在 {display(compose_path)} 判定不出安全的正数默认值"
+                    f"（原文 `{value_match.group(1).strip()}`）。Compose 对 `pids: 0`/`memory: 0`"
+                    "这类 0/null/空值的语义是整个不下发这项限制，等于没设——必须是可判定的正数。"
+                )
+    return failures
+
+
+def check_resource_limits() -> list[str]:
+    """六个服务在基线 `deploy/compose.yaml` 都必须声明 `deploy.resources.limits`
+    的 `cpus`/`memory`/`pids` 三项且各自的静态默认值 >0；`compose.stage.yaml`/
+    `compose.prod.yaml` 一旦也声明了同一个块，同样要三键齐全、数值 >0（独立
+    审查 P1-2：此前只读基线，覆盖文件把某一项悄悄改成 `0`/空——而覆盖文件的
+    值才是真正部署时生效的值——不会被这条门禁发现）。
+
+    只做结构 + 静态数值核对，不核对具体数值"合不合理"——合理性是容量判断，
+    见 `deploy/README.md`「资源限制」一节；这里只保证"没有任何服务被漏掉、
+    没有任何一项会被 Docker/Compose 悄悄解读成不限制"。
+    """
+
+    failures: list[str] = []
+    failures += _check_resource_limits_in(COMPOSE_BASE, require_all_services=True)
+    failures += _check_resource_limits_in(COMPOSE_STAGE, require_all_services=False)
+    failures += _check_resource_limits_in(COMPOSE_PROD, require_all_services=False)
     return failures
 
 
@@ -716,8 +780,60 @@ def _parse_log_size_mb(raw: str) -> float | None:
     return value / 1024 / 1024
 
 
+def _check_log_retention_floor_in(compose_path: pathlib.Path, *, require_all_services: bool) -> list[str]:
+    """核对一份 compose 文本里，出现了 `logging.options` 的服务是否达到取证
+    留存下限。
+
+    `require_all_services=True`（基线 `compose.yaml`）：全部六个服务必须都
+    声明 `logging.options`。`require_all_services=False`（stage/prod 覆盖
+    文件）：声明本身可选——覆盖文件当前并不覆盖 `logging`，完全不声明时不
+    报错；但**一旦声明了**（哪怕只覆盖其中一个服务），标准同样是不得低于
+    下限，不因为"这是覆盖文件"就放宽（独立审查 P1-2：覆盖文件的值才是真正
+    部署时生效的值）。
+    """
+
+    failures: list[str] = []
+    text = strip_comments(read(compose_path))
+    for service in RESOURCE_LIMITED_SERVICES:
+        block = service_block(text, service)
+        if block is None:
+            if require_all_services:
+                failures.append(f"{display(compose_path)} 找不到 service `{service}`")
+            continue
+        logging_block = service_block(block, "logging") or ""
+        options_block = service_block(logging_block, "options") or ""
+        if not options_block.strip():
+            if require_all_services:
+                failures.append(
+                    f"{service} 的 logging.options 缺 max-size 或 max-file（{display(compose_path)}）"
+                )
+            continue
+        size_match = re.search(r'^\s*max-size:\s*"?([\w.]+)"?\s*$', options_block, re.MULTILINE)
+        file_match = re.search(r'^\s*max-file:\s*"?(\d+)"?\s*$', options_block, re.MULTILINE)
+        if size_match is None or file_match is None:
+            failures.append(
+                f"{service} 的 logging.options 在 {display(compose_path)} 缺 max-size 或 max-file"
+            )
+            continue
+        size_mb = _parse_log_size_mb(size_match.group(1))
+        if size_mb is None or size_mb < LOG_MAX_SIZE_FLOOR_MB:
+            failures.append(
+                f"{service} 的 json-file max-size 在 {display(compose_path)} 是 {size_match.group(1)}，"
+                f"低于取证留存要求的下限 {LOG_MAX_SIZE_FLOOR_MB:.0f}m（Issue #343）"
+            )
+        file_count = int(file_match.group(1))
+        if file_count < LOG_MAX_FILE_FLOOR:
+            failures.append(
+                f"{service} 的 json-file max-file 在 {display(compose_path)} 是 {file_count}，"
+                f"低于取证留存要求的下限 {LOG_MAX_FILE_FLOOR}（Issue #343）"
+            )
+    return failures
+
+
 def check_log_retention_floor() -> list[str]:
-    """六个服务的 json-file `max-size`/`max-file` 不得低于取证留存下限（#343）。
+    """六个服务的 json-file `max-size`/`max-file` 不得低于取证留存下限（#343）；
+    `compose.stage.yaml`/`compose.prod.yaml` 一旦也覆盖了 `logging.options`，
+    同样不得低于下限（独立审查 P1-2）。
 
     下限本身是"容器存活期间的第一层缓冲够不够宽"，不是 30 天窗口本身——30 天
     窗口由宿主侧收集脚本 + logrotate 独立保证（deploy/日志留存.md），门禁这里
@@ -725,31 +841,9 @@ def check_log_retention_floor() -> list[str]:
     """
 
     failures: list[str] = []
-    base = strip_comments(read(COMPOSE_BASE))
-    for service in RESOURCE_LIMITED_SERVICES:
-        block = service_block(base, service)
-        if block is None:
-            failures.append(f"deploy/compose.yaml 找不到 service `{service}`")
-            continue
-        logging_block = service_block(block, "logging") or ""
-        options_block = service_block(logging_block, "options") or ""
-        size_match = re.search(r'^\s*max-size:\s*"?([\w.]+)"?\s*$', options_block, re.MULTILINE)
-        file_match = re.search(r'^\s*max-file:\s*"?(\d+)"?\s*$', options_block, re.MULTILINE)
-        if size_match is None or file_match is None:
-            failures.append(f"{service} 的 logging.options 缺 max-size 或 max-file")
-            continue
-        size_mb = _parse_log_size_mb(size_match.group(1))
-        if size_mb is None or size_mb < LOG_MAX_SIZE_FLOOR_MB:
-            failures.append(
-                f"{service} 的 json-file max-size 是 {size_match.group(1)}，低于取证"
-                f"留存要求的下限 {LOG_MAX_SIZE_FLOOR_MB:.0f}m（Issue #343）"
-            )
-        file_count = int(file_match.group(1))
-        if file_count < LOG_MAX_FILE_FLOOR:
-            failures.append(
-                f"{service} 的 json-file max-file 是 {file_count}，低于取证留存"
-                f"要求的下限 {LOG_MAX_FILE_FLOOR}（Issue #343）"
-            )
+    failures += _check_log_retention_floor_in(COMPOSE_BASE, require_all_services=True)
+    failures += _check_log_retention_floor_in(COMPOSE_STAGE, require_all_services=False)
+    failures += _check_log_retention_floor_in(COMPOSE_PROD, require_all_services=False)
     return failures
 
 

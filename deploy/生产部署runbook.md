@@ -59,30 +59,50 @@ docker compose --env-file deploy/.env.prod \
 
 ## 三、镜像 digest 固定
 
-`deploy/compose.yaml` 的镜像引用固定为 `${LINGXI_IMAGE_REGISTRY:?}/lingxi-<服务>:${LINGXI_IMAGE_TAG:?}`；`LINGXI_IMAGE_TAG` 的值本身允许写成 `<日期>-<commit sha 前 12 位>@sha256:<digest>` ——Docker 镜像引用语法允许 tag 与 digest 同时出现（tag 供人读，digest 才是实际拉取依据），因此不需要改动 compose 文件结构即可把生产引用锁定到具体 digest，而不是浮动 tag。
+`deploy/compose.yaml` 的六个服务镜像引用固定为
+`${LINGXI_IMAGE_REGISTRY:?}/lingxi-<服务>:${LINGXI_IMAGE_TAG:?}${LINGXI_<服务组>_IMAGE_DIGEST:-}`
+——`Trace #373 H2` 批 P1-1 修复：每个服务的 `image:` 行在既有共用 `LINGXI_IMAGE_TAG` 之后
+追加了一个**可选**的 digest 后缀变量，默认空，不设时渲染结果与本节修订前逐字节一致。
+按镜像分**四个**变量（六个服务只对应四份镜像，`scheduler`/`reauthorize` 共用一个镜像，
+`worker`/`worker-queue` 共用一个镜像）：
 
-**把 tag 解析为 digest（二选一，不需要本机预先 `docker pull`）**：
+| 变量 | 覆盖的 compose service |
+| --- | --- |
+| `LINGXI_SCHEDULER_IMAGE_DIGEST` | `scheduler`、`reauthorize`（同一镜像） |
+| `LINGXI_GATEWAY_IMAGE_DIGEST` | `gateway` |
+| `LINGXI_WORKER_IMAGE_DIGEST` | `worker`、`worker-queue`（同一镜像） |
+| `LINGXI_MIGRATE_IMAGE_DIGEST` | `migrate` |
+
+**这条修复的由来（本节修订前的版本有一个未闭合的执行缺口，见 [Issue #369](https://github.com/Moshuiwang/lingxi/issues/369) 第 7 条）**：上一版本节让运维把单个 digest 直接写进共用的 `LINGXI_IMAGE_TAG`（`LINGXI_IMAGE_TAG=<tag>@sha256:<digest>`），但四份镜像各有独立 digest、compose 里却只暴露一个共用的 tag 变量——固定其中一个镜像的 digest 之后，另外三份镜像的引用会解析成"这个 tag 对应的是另一份镜像的 digest"，实际拉取时报 `manifest unknown`。改成按镜像分四个变量之后，`LINGXI_IMAGE_TAG` 继续只承载对人可读的 `<日期>-<commit sha 前 12 位>`，四个 digest 变量各自独立锁定各自的镜像。
+
+值的形状是 `@sha256:<digest>`（**注意前导 `@`**）——Docker 镜像引用语法允许在 `tag` 之后再接 `@digest`（`tag@digest` 是合法镜像引用，digest 优先生效，tag 仍供人读），因此不需要改动 `LINGXI_IMAGE_TAG` 本身，也不需要改动 compose 文件结构。
+
+**把 tag 解析为 digest（二选一，不需要本机预先 `docker pull`；对四份镜像各做一次）**：
 
 ```bash
 # 方式一：直接查询远端 registry（推荐，不占本机磁盘）
 docker buildx imagetools inspect ghcr.io/moshuiwang/lingxi-scheduler:20260806-7a9bcf3fac4a
-# 输出的 Digest: sha256:... 即为该 tag 当前指向的 manifest digest
+docker buildx imagetools inspect ghcr.io/moshuiwang/lingxi-gateway:20260806-7a9bcf3fac4a
+docker buildx imagetools inspect ghcr.io/moshuiwang/lingxi-worker:20260806-7a9bcf3fac4a
+docker buildx imagetools inspect ghcr.io/moshuiwang/lingxi-migrate:20260806-7a9bcf3fac4a
+# 每条输出的 Digest: sha256:... 即为该 tag 当前指向的 manifest digest
 
-# 方式二：已经 pull 到本机时，从本地元数据回读
+# 方式二：已经 pull 到本机时，从本地元数据回读（以 scheduler 为例，其余三份同构）
 docker pull ghcr.io/moshuiwang/lingxi-scheduler:20260806-7a9bcf3fac4a
 docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/moshuiwang/lingxi-scheduler:20260806-7a9bcf3fac4a
-# 输出形如 ghcr.io/moshuiwang/lingxi-scheduler@sha256:...
+# 输出形如 ghcr.io/moshuiwang/lingxi-scheduler@sha256:...，取 @ 之后的部分
 ```
 
-对四个服务镜像（`scheduler`、`gateway`、`worker`、`migrate`）各解析一次 digest，写入 `.env.prod`：
+写入 `.env.prod`（四行，覆盖六个服务；**前提是四份镜像确实来自同一次 `Epic Full / image` 构建**——`deploy/README.md`「安装与升级」已保证生产只拉不建，不会出现分别对应不同批次的情况）：
 
 ```bash
-LINGXI_IMAGE_TAG=20260806-7a9bcf3fac4a@sha256:<该批次实际 digest>
+LINGXI_SCHEDULER_IMAGE_DIGEST=@sha256:<scheduler 镜像本批次 digest>
+LINGXI_GATEWAY_IMAGE_DIGEST=@sha256:<gateway 镜像本批次 digest>
+LINGXI_WORKER_IMAGE_DIGEST=@sha256:<worker 镜像本批次 digest>
+LINGXI_MIGRATE_IMAGE_DIGEST=@sha256:<migrate 镜像本批次 digest>
 ```
 
-四个服务共用同一批次 tag，因此共用同一个 `LINGXI_IMAGE_TAG` 值——**前提是四个镜像确实来自同一次 `Epic Full / image` 构建**（`deploy/README.md`「安装与升级」已保证生产只拉不建，不会出现四个服务分别对应不同批次的情况）。
-
-**部署时核对**：`up -d` 完成后执行 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml images`，逐行核对每个服务实际运行的镜像 digest 与 `.env.prod` 中固定的值一致；不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
+**部署时核对**：`up -d` 完成后执行 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml images`，逐行核对每个服务实际运行的镜像 digest 与上面四个变量固定的值一致；不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
 
 ## 四、单实例纪律
 
@@ -111,41 +131,39 @@ LINGXI_IMAGE_TAG=20260806-7a9bcf3fac4a@sha256:<该批次实际 digest>
 **回滚 = 回退镜像引用后 `up -d`，不重建**（[Issue #369 第 12 条](https://github.com/Moshuiwang/lingxi/issues/369)）：本仓库不锁传递依赖（代码框架既有选择），同一 commit 在不同日期重新构建不保证逐字节一致；镜像制品本身才是可信的回滚单位，回滚绝不能通过「回退代码 + 现场重新 `docker build`」实现。
 
 ```bash
-# 1. 把 deploy/.env.prod 的 LINGXI_IMAGE_TAG 改回上一个候选的完整引用
-#    （含 digest，例如 20260805-abcdef012345@sha256:<上一批次 digest>）
+# 1. 把 deploy/.env.prod 的 LINGXI_IMAGE_TAG 改回上一个候选的 tag，并把四个
+#    LINGXI_<服务组>_IMAGE_DIGEST 变量改回该批次各自的 digest（见「三、镜像
+#    digest 固定」的变量对照表——四个变量、不是把 digest 塞进 LINGXI_IMAGE_TAG）
 
 # 2. 执行 up -d，compose 按「四、单实例纪律」的替换流程逐个服务先停旧再起新
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 
-# 3. 回读确认实际运行 digest 与目标 tag 一致（见「三、镜像 digest 固定」）
+# 3. 回读确认实际运行 digest 与目标一致（见「三、镜像 digest 固定」）
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml images
 ```
 
-**回滚不触碰数据库与持久卷**：不执行 `down` 移除 volumes，不执行任何迁移降级操作。这一前提成立的条件是迁移遵守「先加后删」——破坏性变更必须拆成两次发布，否则回滚就从「切镜像重启」变成「恢复数据库备份」；该前提由 `V-部署-05`（[验收矩阵](../docs/技术设计/验证与门禁.md#十二部署对代码的约束)）在每次 CI 上机械核对，2026-08-23 已有 `biai-stage` 真实回滚演练证据（整队切回旧候选、三容器在当前库结构上全部 healthy）。
+**回滚不触碰数据库与持久卷**：不执行 `down` 移除 volumes，不执行任何迁移降级操作。这一前提成立的条件是迁移遵守「先加后删」——破坏性变更必须拆成两次发布，否则回滚就从「切镜像重启」变成「恢复数据库备份」；该前提由 `V-部署-05`（[验收矩阵第三节](../docs/技术设计/验收矩阵.md#三部署与迁移断言)）在每次 CI 上机械核对，2026-08-23 已有 `biai-stage` 真实回滚演练证据（整队切回旧候选、三容器在当前库结构上全部 healthy）。
 
 ## 七、观察期
 
-`biai-stage` 2026-08-28 实测（S-W0-1 取证 + S-H1-6 修复后，[Issue #359](https://github.com/Moshuiwang/lingxi/issues/359) 关闭评论、opus 审查 P2-3 留痕项）：错峰调整健康检查间隔后，从「最后一次健康」到「判定 unhealthy」的发现时延变长——
+> **时延数值的单一事实源是 [`deploy/监控告警.md`「五、时延估算：从故障发生到告警送达」](监控告警.md#五时延估算从故障发生到告警送达单一事实源)**——公式（A 类/B 类）、三服务的 `interval`/`timeout`/`retries`/活性阈值现值与逐项算出的最坏时延都在那张表，本文件不维护第二份数字。改健康检查参数或活性阈值时，只需要更新那一份表，这里的判据不受影响（判据只引用"最坏时延"这个结论，不复制推导过程）。
 
-| 服务 | 发现时延（实测） | 健康检查参数（`deploy/compose.yaml`） |
-| --- | --- | --- |
-| `gateway` | 45s → **69s** | interval 23s |
-| `worker-queue` | 65s → **119s** | interval 29s，start_period 32s |
-| `scheduler` | 未改变（本次调整不涉及） | interval 30s |
-
-**部署后观察窗口**：至少持续观察 **15 分钟**（覆盖 worker-queue 最坏发现时延 119s 的数倍，留出多个健康检查周期的余量），期间：
+**部署后观察窗口**：至少持续观察 **15 分钟**（覆盖三服务里最坏的 B 类端到端时延——scheduler 约 6 分钟——的两倍以上，留出多个健康检查周期的余量），期间：
 
 - 每隔 1-2 分钟 `docker compose ... ps` 一次，确认三个常驻服务的状态列均为 `healthy`、`restarts` 计数不再增长（部署本身触发的一次容器创建不计入异常重启）；
 - 用 `docker inspect --format='{{json .State.Health.Log}}' <容器>` 抽查最近若干次健康检查记录，确认没有非预期的失败探测；
 - 核对应用层信号：`scheduler` 日志无持续报错、`gateway` 日志显示长连接已建立、`worker-queue` 日志显示能正常进入领取循环（不要求已经真实处理业务任务）。
 
-**判定标准**：观察窗口结束时三项常驻服务全部 `healthy` 且无非预期重启，判定本次部署成功，转入正常运行；若在对应服务的最坏发现时延内（`gateway` ≥ 69s、`worker-queue` ≥ 119s）仍未转为 `healthy`，或观察期内出现非预期重启，判定部署失败，进入「六、回滚判据与步骤」。
+**判定标准（两条判据分属不同窗口，不要互相替代——独立审查，时延口径统一）**：
+
+1. **转 healthy**：部署刚执行完时，各服务应在自身 `start_period` 加一个探测周期（`interval + timeout`）内转为 `healthy`（gateway `start_period` 20s、worker-queue 32s、scheduler 30s，见 `deploy/compose.yaml`；判据推导见 `deploy/监控告警.md`「转 healthy 判据」小节）——**这条判据用的是 `start_period`，不是「五、时延估算」里"服务持续 unhealthy 需要多久才被发现"的 A/B 类数字**；本节修订前的版本曾把 A 类发现时延（`gateway` ≥ 69s、`worker-queue` ≥ 119s）当成"多久应该转 healthy"的期限，这是两个不同判定窗口的概念混用，已更正。
+2. **观察窗口内保持 healthy**：15 分钟观察窗口结束时三项常驻服务全部 `healthy` 且无非预期重启，判定本次部署成功，转入正常运行；观察期内出现非预期重启，或任一服务转回非 `healthy` 状态，判定部署失败，进入「六、回滚判据与步骤」。
 
 ## 八、恢复演练要求
 
-数据库从备份恢复后，在重新对外提供服务（即允许新的问数流量、重新拉起三个常驻服务处理正常任务）之前，**必须先按内容原始写入时间重新执行一轮保留清理**（`V-投递-07` 语义，[验收矩阵](../docs/技术设计/验证与门禁.md#十二部署对代码的约束)）：备份或 WAL 中无法逐条即时删除的内容（含尚未结束的会话保留窗口）按原写入时间计算到期，不能把恢复完成的时间当成新的保留起点，也不能借这次恢复重新打开一个已经结束的会话窗口。恢复历史备份可能重新带回备份时已有的用户内容，这是已经接受的灾备取舍，但「重新提供服务前先补清理」是这条取舍成立的前提，不是可选步骤。
+数据库从备份恢复后，在重新对外提供服务（即允许新的问数流量、重新拉起三个常驻服务处理正常任务）之前，**必须先按内容原始写入时间重新执行一轮保留清理**（`V-投递-07` 语义，见[验收矩阵「一、关键机制验收矩阵」](../docs/技术设计/验收矩阵.md#一关键机制验收矩阵)）：备份或 WAL 中无法逐条即时删除的内容（含尚未结束的会话保留窗口）按原写入时间计算到期，不能把恢复完成的时间当成新的保留起点，也不能借这次恢复重新打开一个已经结束的会话窗口。恢复历史备份可能重新带回备份时已有的用户内容，这是已经接受的灾备取舍，但「重新提供服务前先补清理」是这条取舍成立的前提，不是可选步骤。
 
 一次真实的数据库恢复演练目前尚未执行（[Issue #369 第 4 条](https://github.com/Moshuiwang/lingxi/issues/369)）；生产首次部署前应至少完成一次真实恢复演练，核对上述补清理动作确实被执行且结果符合预期，本 runbook 只登记要求，不代为执行。
 

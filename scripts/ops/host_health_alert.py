@@ -15,8 +15,10 @@ scheduler/gateway/worker-queue **自己的进程里**——它们能发现"数�
 - **不 import `lingxi` 包**：这个脚本要能在 `src/lingxi` 所在的容器全部起不来、
   甚至 `git` 工作区都不在宿主上的情况下依然跑得动——它只依赖 Python3 标准库与
   `docker`/`curl` 等宿主命令行工具，由宿主 cron 直接调用，不进任何镜像。
-- **不发起任何入站网络监听**：只读 `docker inspect`（宿主 Docker socket 权限），
-  只发出站 HTTP 请求（飞书开放平台 API），不扩大攻击面。
+- **不发起任何入站网络监听**：只读 `docker container inspect --format
+  '{{json .State}}'`（宿主 Docker socket 权限，只取 `State` 字段，不读含
+  凭据的 `Config.Env`，也不会被同名的非容器对象误命中），只发出站 HTTP
+  请求（飞书开放平台 API），不扩大攻击面。
 - **凭据边界**：飞书应用凭据与管理群 chat_id 从 `--env-file` 指定的 `KEY=VALUE`
   文件读取，调用方必须保证该文件 0600 且属主为运行 cron 的账户——本脚本在读取前
   会先校验一次，不满足直接拒绝启动（不回显取到的权限位以外的任何内容）。凭据
@@ -195,17 +197,18 @@ class ContainerState:
     reason: str | None = None
 
 
-def parse_inspect_entry(name: str, entry: Mapping[str, object] | None) -> Observation:
-    """把一条 `docker inspect` JSON 结果（或 ``None``＝容器不存在）转成 Observation。
+def parse_inspect_entry(name: str, state: Mapping[str, object] | None) -> Observation:
+    """把 `docker container inspect --format '{{json .State}}'` 的结果
+    （或 ``None``＝容器不存在）转成 Observation。
 
-    只读 `State.Running` 与 `State.Health.Status` 两个字段；其余字段（镜像、
-    网络、挂载等）与本脚本的判定无关，刻意不解析、不保留，减少这份观察结构
-    意外携带敏感信息的空间。
+    入参已经只是 `State` 那一段（`docker_inspect_one` 用 `--format` 在
+    docker CLI 那一步就把其余字段——尤其是含凭据的 `Config.Env`——过滤掉了，
+    这里不需要也不应该再从更大的结构里剥一层）。只读 `Running` 与
+    `Health.Status` 两个字段。
     """
 
-    if entry is None:
+    if state is None:
         return Observation(name=name, exists=False)
-    state = entry.get("State")
     state = state if isinstance(state, Mapping) else {}
     running = state.get("Running")
     running = running if isinstance(running, bool) else None
@@ -283,19 +286,41 @@ def render_message(action: str, classification: Classification, *, host: str, no
 # ---------------------------------------------------------------------------
 
 
+#: `docker container inspect` 在容器确实不存在时的错误文案子串（跨常见 docker
+#: CLI 版本，`docker container inspect` 报 `No such container`，通用 `docker
+#: inspect` 报 `No such object`——两者都判定为"正常的不存在"，不是脚本故障）。
+_NOT_FOUND_STDERR_MARKERS: tuple[str, ...] = ("No such container", "No such object")
+
+
 def docker_inspect_one(
     name: str, *, docker_bin: str = "docker", timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 ) -> Mapping[str, object] | None:
-    """探测单个容器；返回 ``None`` 表示"容器不存在"这一正常情况，不是错误。
+    """探测单个容器的 `State` 字段；返回 ``None`` 表示"容器不存在"这一正常情况。
 
-    只有 `docker` 命令本身跑不起来（不在 PATH、挂起超时）或返回了无法解析的
-    输出，才算脚本级故障并抛出 :class:`HostMonitorError`——那种情况下我们连
-    "容器存不存在"这个最基本的事实都确认不了，不能悄悄当成"不存在"处理。
+    用 ``docker container inspect --format '{{json .State}}'``，而不是裸
+    ``docker inspect``，收紧两层（独立审查 P2-1/P2-2）：
+
+    1. **`container inspect` 只在容器命名空间里查找**：裸 `docker inspect`
+       跨镜像/网络/卷/容器等多种对象类型按名字查找，一旦有同名的非容器对象
+       存在会被优先命中、返回一份与容器毫不相关的结构，`State` 字段读不到，
+       静默误判成"容器不存在"。
+    2. **`--format '{{json .State}}'` 只取 `State` 字段**：裸 `docker
+       inspect` 的完整输出含 `Config.Env`——`scheduler`/`gateway`/
+       `worker-queue` 的容器环境变量正装着数据库连接串、Fernet 密钥与飞书
+       应用密钥，这个宿主脚本没有任何理由读到它们，即使读到后只取 `State`
+       也不该让凭据先落进这个进程的内存/子进程输出里。
+
+    `returncode != 0` 时区分两种情况（P2-3）：stderr 提示"没有这个对象/容器"
+    是正常情况（容器确实不存在），返回 `None`；其余任何非零退出（Docker
+    daemon 不可达、权限不足等）都是脚本自身故障，抛出 `HostMonitorError`，
+    交由调用方以 `exit=2` 收尾、**不对这一轮的观察结果做任何判定**——不能把
+    "问不到 daemon"悄悄当成"容器不存在"，那样会在 daemon 短暂抖动又恢复时，
+    把"从来没问到过"误判成一次"从缺失变健康"的假恢复。
     """
 
     try:
         proc = subprocess.run(
-            [docker_bin, "inspect", name],
+            [docker_bin, "container", "inspect", "--format", "{{json .State}}", name],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -306,14 +331,17 @@ def docker_inspect_one(
     except subprocess.TimeoutExpired as error:
         raise HostMonitorError("docker_inspect_timeout") from error
     if proc.returncode != 0:
-        return None
+        stderr = proc.stderr or ""
+        if any(marker in stderr for marker in _NOT_FOUND_STDERR_MARKERS):
+            return None
+        raise HostMonitorError(f"docker_inspect_daemon_error:{proc.returncode}")
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError as error:
         raise HostMonitorError("docker_inspect_invalid_json") from error
-    if not isinstance(data, list) or not data or not isinstance(data[0], Mapping):
+    if not isinstance(data, Mapping):
         return None
-    return data[0]
+    return data
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -342,13 +370,23 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def load_credentials(path: Path) -> dict[str, str]:
-    """校验权限、解析并抽取本脚本需要的三个字段；错误信息不回显任何取值。"""
+    """校验权限与属主、解析并抽取本脚本需要的三个字段；错误信息不回显任何取值。
+
+    模块文档「凭据边界」写的是"调用方必须保证该文件 0600 **且属主为运行 cron
+    的账户**"——此前的实现只核对了权限位，没有核对属主，文档口径与代码口径
+    不一致（独立审查 P2-4）：0600 只挡住"其他账户能不能读"，挡不住"这个文件
+    其实属于另一个账户，运行 cron 的账户凭某种历史原因（例如属主账户被删）
+    仍然读得到"这类错配。两项一起核对才是文档承诺的边界。
+    """
 
     if not path.is_file():
         raise HostMonitorError("env_file_not_found")
-    mode = os.stat(path).st_mode & 0o777
+    file_stat = os.stat(path)
+    mode = file_stat.st_mode & 0o777
     if mode != 0o600:
         raise HostMonitorError(f"env_file_permission_unsafe:{oct(mode)}")
+    if file_stat.st_uid != os.getuid():
+        raise HostMonitorError("env_file_owner_mismatch")
     raw = _parse_env_file(path)
     missing = [key for key in REQUIRED_ENV_KEYS if not raw.get(key)]
     if missing:
@@ -631,7 +669,17 @@ def run(argv: Sequence[str] | None = None) -> int:
                     text=text,
                     timeout_seconds=args.timeout_seconds,
                 )
-            except HostMonitorError as error:
+            except Exception as error:  # noqa: BLE001 - 发送路径任何异常都不能
+                # 让整轮崩掉（独立审查 P2-5）。上面几处 HostMonitorError 是脚本
+                # 自己主动识别的已知故障；这里改用兜底 Exception 是因为
+                # `feishu_send_text` 内部调用的是标准库网络/JSON 原语，任何一个
+                # 没被枚举到的异常类型（连接被重置的具体子类、意外的证书错误等）
+                # 都不该让本轮剩余容器的检查、乃至整个 cron 调用直接崩溃退出——
+                # 那样反而会丢掉"失败不落盘、下一轮据此重试"这条既有语义：一次
+                # 未捕获异常会让 `run()` 整体抛出，cron 记录一次非零退出，但当轮
+                # 已经判定过的其它容器结果同样不会被保存，行为上退化成"部分容器
+                # 这一轮完全没被检查过"而不是"这一个容器的发送失败被记录并等待
+                # 重试"。
                 logger.error(
                     "告警发送失败，状态未落盘，下一轮 cron 会重试 container=%s action=%s error=%s",
                     name,
