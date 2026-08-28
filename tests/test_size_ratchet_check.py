@@ -156,13 +156,19 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         与既有 `legacy_source=` 转发合并成同一行以省出这一行，基线数值不变。
         `--refresh` 不会自动登记新文件（onboarding_runner.py 此前从未超过阈值），
         本条目按门禁提示人工加入基线。下一次这条测试失效时，同样在此登记理由。
+        2026-08-28 移除 `onboarding_runner.py`——Trace #358 S-H-1（Issue #350
+        Gate G-3 裁定 Option A）纯移动拆分：14 个 Protocol + `EnvironmentResult`
+        搬进新文件 `onboarding_ports.py`、`_Terminal`/异常类/`_with_reference`/
+        两个失败工厂/全部 `STATE_*`/`KEY_*` 常量搬进 `onboarding_terminal.py`、
+        两个模块级纯函数搬进 `onboarding_support.py`；核心文件只剩模块文档字符串
+        + `AutoOnboardingRunner` 主类，实测 1295 行，退回阈值以下，`--refresh`
+        按规则自动移除该条目。三个新文件均远低于阈值，未新增基线登记。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
             {
                 "src/lingxi/apps/scheduler/assembly.py": 1538,
-                "src/lingxi/core/identity/onboarding_runner.py": 1541,
             },
         )
 
