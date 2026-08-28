@@ -14,7 +14,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher
 from lingxi.adapters.postgres import connect
@@ -31,6 +31,8 @@ SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，开通中途停摆收口候选查询的真库断言未验证"
     "（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，开通中途停摆收口候选查询的真库断言未验证"
 )
 
 LEASE_SECONDS = 2700
@@ -64,7 +66,7 @@ def _publish_attempt(outbox_id: str, *, version: int, user_id: str) -> PublishAt
     )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class StalledProvisioningPostgresTestCase(unittest.TestCase):
     """候选查询真库断言的共同底座。"""
 

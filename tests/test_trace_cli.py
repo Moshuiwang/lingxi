@@ -14,13 +14,17 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.apps import trace
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_DB = "LINGXI_POSTGRES_DSN 未设置：跳过追溯号 CLI 的真库断言"
+SKIP_DB = (
+    "LINGXI_POSTGRES_DSN 未设置：跳过追溯号 CLI 的真库断言"
+    if not DSN
+    else "LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动：跳过追溯号 CLI 的真库断言"
+)
 
 _MODULE_PATH = Path(trace.__file__)
 
@@ -107,7 +111,7 @@ class RunArgumentAndFailureClosedTests(unittest.TestCase):
         self.assertNotIn("u:p", err.getvalue())
 
 
-@unittest.skipUnless(DSN, SKIP_DB)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_DB)
 class TraceLookupRealDatabaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

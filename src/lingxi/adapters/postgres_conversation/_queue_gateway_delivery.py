@@ -30,7 +30,11 @@ class _GatewayDeliveryMixin:
         这里允许多个候选同时被读到，抢占失败的一方在预留时自然让路。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        # S-H1-6（#359 根因取证方案第 2 条）：gateway 投递循环每 poll_interval 都
+        # 会跑这条发现查询，空转时也不例外——走 `_connect_for_polling`（默认逐字
+        # 节等价于原来的 `connect(...)`，只有装配方显式打开复用时才改为持有常驻
+        # 连接，见该方法文档）。
+        with self._connect_for_polling() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
@@ -82,7 +86,9 @@ class _GatewayDeliveryMixin:
         本身也不再有意义（不会再被任何投递路径读取或写入）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+        # S-H1-6（#359 根因取证方案第 2 条）：同 `list_pending_delivery_tasks`——
+        # 每 poll_interval 都会跑，同样走 `_connect_for_polling`。
+        with self._connect_for_polling() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT id, dispatch_reserved_kind FROM task

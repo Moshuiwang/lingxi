@@ -24,7 +24,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, new_token
 from lingxi.adapters.postgres import connect
@@ -53,6 +53,8 @@ TOKEN_CIPHER = "RklYRURJVjEyMzQ1Njc4OX5gpf2vKqJiLgzu2n4kug1V1rz6DDt1OCgAZVpg1pL+
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，权限发布 outbox 的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，权限发布 outbox 的真库断言未验证"
 )
 
 NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
@@ -110,7 +112,7 @@ class _Rollback(Exception):
     """
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class PermissionPublishPostgresTestCase(unittest.TestCase):
     """真库断言的共同底座。"""
 
