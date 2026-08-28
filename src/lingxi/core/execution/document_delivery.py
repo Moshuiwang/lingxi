@@ -78,8 +78,10 @@ _BLANK_LINE_SPLIT = re.compile(r"\n\s*\n")
 class DocumentDeliveryError(ValueError):
     """一次文档交付登记请求不满足硬性约束。
 
-    ``reason_code`` 是机器可读的拒绝原因，供调用方记审计
-    ``worker.document_request_rejected``；不进模型上下文、不进用户可见文案。
+    ``reason_code`` 是机器可读的拒绝原因，供调用方记审计——文档分支记
+    ``worker.document_request_rejected``，表格分支记 ``worker.sheet_request_
+    rejected``（Trace #373 H3 批量审查 P2-8，两个事件名各自独立，不复用同一个
+    让消费方无法区分来源）；不进模型上下文、不进用户可见文案。
     """
 
     def __init__(self, reason_code: str, message: str) -> None:
@@ -103,8 +105,8 @@ class DocumentRequest:
 class SheetRequest:
     """一次登记成功的表格交付请求（Issue #354 S-H3-2）——报告契约
     ``sheet_request`` 字段的来源。``rows`` 是行×列的单元格文本二维数组，外层是
-    行，内层是该行各列的单元格文本；每一行的列数可以不同（不强制矩形），飞书
-    写值接口本身按 ``range`` 覆盖对应区域，不要求每行等长。
+    行，内层是该行各列的单元格文本；:func:`build_sheet_request` 保证返回的
+    ``rows`` 始终是矩形（每一行列数相同，短行已补齐空字符串，见该函数文档）。
     """
 
     title: str
@@ -203,10 +205,15 @@ def build_sheet_request(
     都抛 :class:`DocumentDeliveryError`，绝不静默降级或截断——与
     :func:`build_document_request` 逐项对应，见模块文档「表格分支」一节。
 
-    ``rows`` 必须是非空列表，每一行必须是非空的字符串列表（单元格文本）；不做
-    任何自动补齐/裁剪成矩形——飞书写值接口本身按 ``range`` 覆盖，行与行之间列数
-    可以不同。``forbidden_values``/``internal_tool_names``/``system_prompt`` 与
-    :func:`build_document_request` 同一组值、同一出口安全检查。
+    ``rows`` 必须是非空列表，每一行必须是非空的字符串列表（单元格文本）；校验
+    通过后**短行会被补齐空字符串到最长行的列数**，返回的 ``SheetRequest.rows``
+    因此始终是矩形矩阵（Trace #373 H3 批量审查 P1）——适配器 ``write_values``
+    的 ``range=A1:{end}{rows}`` 覆盖的是整个矩形区域，飞书对「``range`` 宽度大于
+    某一行实际长度」这种不规则输入的真实语义本仓库从未验证过（探针只测过单格
+    ``A1:A1``），把不规则矩阵原样透传给适配器有静默写出错位数据的风险；补齐成
+    矩形更保守，真实多行多列语义留待 S-H3-4 L4a 验证。``forbidden_values``/
+    ``internal_tool_names``/``system_prompt`` 与 :func:`build_document_request`
+    同一组值、同一出口安全检查。
     """
 
     if not isinstance(title, str) or not (
@@ -250,9 +257,21 @@ def build_sheet_request(
             "too_many_chars", f"表格内容总长度 {total_chars} 超过上限 {MAX_SHEET_TOTAL_CHARS}"
         )
 
+    # P1（Trace #373 H3 批量审查）：补齐成矩形——短行在这里用空字符串补到最长行
+    # 的列数。放在硬上限校验之后：补齐只会让行更长，若放在校验之前会让"是否超过
+    # MAX_SHEET_COLUMNS"这条判断意外受补齐影响；这里补齐前每一行已经确认
+    # <= MAX_SHEET_COLUMNS，补齐后的最大列数同样 <= MAX_SHEET_COLUMNS，不会绕过
+    # 硬上限。空字符串不改变 total_chars（len("") == 0），已经做过的总字符数校验
+    # 不需要重算。
+    max_row_length = max(len(row) for row in normalized_rows)
+    padded_rows = tuple(
+        row if len(row) == max_row_length else row + ("",) * (max_row_length - len(row))
+        for row in normalized_rows
+    )
+
     normalized_title = title.strip()
     combined_text = "\n".join(
-        (normalized_title, *(cell for row in normalized_rows for cell in row))
+        (normalized_title, *(cell for row in padded_rows for cell in row))
     )
     output_safety = constrain_output(
         combined_text,
@@ -265,4 +284,4 @@ def build_sheet_request(
             "leak_detected", "标题或表格内容命中输出安全检查，登记被拒绝"
         )
 
-    return SheetRequest(title=normalized_title, rows=tuple(normalized_rows))
+    return SheetRequest(title=normalized_title, rows=padded_rows)

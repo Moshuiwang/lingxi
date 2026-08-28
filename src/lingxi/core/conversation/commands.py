@@ -128,13 +128,26 @@ def is_memory_command_message(text: object) -> bool:
     已知子命令：哪怕格式写错，这条消息的「命令归属」依然是 /memory 命令面，见
     :func:`is_unrecognized_slash_message` 的文档。``/memoryabc`` 这类没有词边界
     的输入不算——它不是 /memory 命令，是一条恰好以这几个字符开头的普通消息。
+
+    **词边界判定用 ``str.split()`` 的默认空白语义**（Trace #373 H3 批量审查
+    P2-4），不是只认字面 ASCII 空格：此前用 ``startswith(prefix + " ")`` 只认
+    半角空格这一个字符，``/memory\\tlist``（Tab 分隔）、``/memory\\nlist`` 这类
+    输入的第一个词其实就是 ``/memory``，却因为紧跟的不是半角空格而判定失败，
+    落到通用的 ``slash_rejected`` 泛用拒绝文案，而不是本函数注释声明的
+    ``/memory`` 专属用法提示——与设计意图相反（这不是安全绕过：两条路径都是
+    拒绝，只是拒绝文案不对）。``str.split(maxsplit=1)`` 不传分隔符时按任意空白
+    游程切分（空格、Tab、换行等），取切出的第一个词与 ``/memory`` 比较，天然
+    覆盖这些形状，且不改变现有语义（多个连续空格、大小写不敏感、``/memoryabc``
+    无词边界不算，都不受影响）。
     """
 
     if not isinstance(text, str):
         return False
     stripped = text.strip()
-    lowered = stripped.lower()
-    return lowered == _MEMORY_COMMAND_PREFIX or lowered.startswith(_MEMORY_COMMAND_PREFIX + " ")
+    if not stripped:
+        return False
+    first_token = stripped.split(maxsplit=1)[0]
+    return first_token.lower() == _MEMORY_COMMAND_PREFIX
 
 
 def parse_memory_command(text: object) -> MemoryCommand:

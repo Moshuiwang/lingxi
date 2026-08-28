@@ -277,12 +277,25 @@ class BuildSheetRequestTest(unittest.TestCase):
 
         self.assertEqual(ctx.exception.reason_code, "leak_detected")
 
-    def test_rows_do_not_need_to_be_rectangular(self) -> None:
-        """飞书写值接口按 range 覆盖，不要求每行等长——不做自动补齐/裁剪。"""
+    def test_short_rows_are_padded_to_the_longest_row_with_empty_strings(self) -> None:
+        """P1（Trace #373 H3 批量审查）：短行补齐空字符串到最长行的列数，返回
+        的 ``rows`` 始终是矩形——飞书对不规则 ``range`` 输入的真实语义未经验证，
+        补齐比原样透传更保守。
+
+        变异锚点：把补齐逻辑改坏（例如漏掉补齐、或补的不是空字符串），本用例
+        会从矩形结果变红。
+        """
 
         request = build_sheet_request(title="标题", rows=[["a", "b", "c"], ["d"]])
 
-        self.assertEqual(request.rows, (("a", "b", "c"), ("d",)))
+        self.assertEqual(request.rows, (("a", "b", "c"), ("d", "", "")))
+        # 补齐只加空字符串，不改变总字符数。
+        self.assertEqual(request.total_chars, 4)
+
+    def test_all_rows_already_the_same_length_are_unaffected_by_padding(self) -> None:
+        request = build_sheet_request(title="标题", rows=[["a", "b"], ["c", "d"]])
+
+        self.assertEqual(request.rows, (("a", "b"), ("c", "d")))
 
 
 # ----------------------------------------------------------- 开关解析
@@ -563,7 +576,9 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
         self.assertTrue(result.get("is_error"))
         self.assertIsNone(executor._sheet_request)
         events = _stderr_events(buffer)
-        self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
+        # P2-8（opus 审查）：表格分支记独立的 worker.sheet_request_rejected，
+        # 不复用文档分支的事件名——运维按事件名过滤时能区分来源。
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
         self.assertEqual(events[-1]["reason"], "disabled")
 
     def test_handler_registers_a_valid_request_and_audits_it(self) -> None:
@@ -596,7 +611,7 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
         self.assertTrue(result.get("is_error"))
         self.assertIsNone(executor._sheet_request)
         events = _stderr_events(buffer)
-        self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
         self.assertEqual(events[-1]["reason"], "too_many_rows")
 
     def test_handler_rejects_when_body_leaks_internal_tool_name_pattern(self) -> None:
@@ -610,7 +625,7 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
         self.assertTrue(result.get("is_error"))
         self.assertIsNone(executor._sheet_request)
         events = _stderr_events(buffer)
-        self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
         self.assertEqual(events[-1]["reason"], "leak_detected")
 
     def test_handler_rejects_when_body_leaks_a_configured_external_text_via_real_assembly(self) -> None:
@@ -633,7 +648,7 @@ class DeliverSpreadsheetHandlerTest(unittest.TestCase):
         self.assertTrue(result.get("is_error"))
         self.assertIsNone(executor._sheet_request)
         events = _stderr_events(buffer)
-        self.assertEqual(events[-1]["event"], "worker.document_request_rejected")
+        self.assertEqual(events[-1]["event"], "worker.sheet_request_rejected")
         self.assertEqual(events[-1]["reason"], "leak_detected")
 
     def test_second_call_within_the_same_turn_replaces_the_first_and_is_audited(self) -> None:

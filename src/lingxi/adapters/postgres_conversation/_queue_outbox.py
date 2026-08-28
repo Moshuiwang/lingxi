@@ -258,7 +258,15 @@ class _OutboxMixin:
                     # 上面的 FOR UPDATE 已经锁定并校验过持有者与状态；到这里还失败
                     # 说明状态机被绕过，宁可响亮失败也不要悄悄不释放/不占用。
                     raise RuntimeError(f"任务 {task_id} 在写终态事件时状态发生了竞态")
-                delivery_request = document_request or sheet_request
+                # P2-3（Trace #373 H3 批量审查）：不能用 `document_request or
+                # sheet_request` 判定——`{}` 是合法的非 None 值但布尔求值为假，
+                # `or` 会把它当成"没提供"悄悄跳过下面整段插入与失败审计
+                # （`worker.document_request_insert_failed` 永远不会为这类输入
+                # 触发）。改成显式 `is not None`，`{}` 会照常走到
+                # `_insert_document_delivery_request`（因缺少 title/内容字段被
+                # 拒绝为 ValueError），命中下面的 `except` 分支记一条响亮审计，
+                # 不再静默失踪。
+                delivery_request = document_request if document_request is not None else sheet_request
                 delivery_type = (
                     "docx" if document_request is not None else "sheet"
                 ) if delivery_request is not None else None

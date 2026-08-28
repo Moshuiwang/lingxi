@@ -366,14 +366,18 @@ class WorkerTurnExecutor:
     def _handle_deliver_spreadsheet(self, title: Any, rows: Any) -> dict[str, Any]:
         """``deliver_spreadsheet`` 工具调用的唯一处理逻辑（同步、无外部请求）。
 
-        与 :meth:`_handle_deliver_document` 逐项对称（Issue #354 S-H3-2），唯一
-        差异是校验函数（``build_sheet_request``）与登记的审计事件字段
-        （``row_count`` 而不是 ``paragraph_count``）。
+        与 :meth:`_handle_deliver_document` 逐项对称（Issue #354 S-H3-2），差异
+        除校验函数（``build_sheet_request``）与登记的审计事件字段（``row_count``
+        而不是 ``paragraph_count``）外，拒绝事件名也不同：本分支记
+        ``worker.sheet_request_rejected``，不复用文档分支的 ``worker.document_
+        request_rejected``（Trace #373 H3 批量审查 P2-8）——两个事件名各自独立，
+        运维按事件名过滤时才能区分"这是表格请求被拒还是文档请求被拒"，不需要再
+        去解析 payload 里的其它字段才能分清来源。
         """
 
         if not self._config.document_delivery_enabled:
             self._emit_stderr_record(
-                level="warning", event="worker.document_request_rejected", reason="disabled"
+                level="warning", event="worker.sheet_request_rejected", reason="disabled"
             )
             return {
                 "content": [{"type": "text", "text": "表格交付能力当前未开启。"}],
@@ -390,7 +394,7 @@ class WorkerTurnExecutor:
         except DocumentDeliveryError as error:
             self._emit_stderr_record(
                 level="warning",
-                event="worker.document_request_rejected",
+                event="worker.sheet_request_rejected",
                 reason=error.reason_code,
             )
             return {

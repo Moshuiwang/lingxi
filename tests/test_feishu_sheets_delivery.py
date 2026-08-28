@@ -225,11 +225,16 @@ class WriteValuesTest(unittest.TestCase):
         )
         self.assertEqual(token, FAKE_TOKEN)
 
-    def test_range_end_column_accounts_for_the_longest_row(self) -> None:
+    def test_range_end_column_matches_the_row_width_for_a_rectangular_matrix(self) -> None:
+        """上游 ``build_sheet_request`` 已经把矩阵补齐成矩形（Trace #373 H3
+        批量审查 P1），本模块只需要覆盖"多列"这一形状本身——不规则输入见
+        ``RectangularMatrixDefenseTest``（本模块的防御断言，拒绝而不是猜测）。
+        """
+
         transport = RecordingTransport([{"code": 0, "data": {}}])
         client = _client(transport)
 
-        client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a"], ["b", "c", "d"]])
+        client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a", "b", "c"], ["d", "e", "f"]])
 
         _, _, body, _ = transport.calls[0]
         self.assertEqual(body["valueRange"]["range"], f"{SHEET_ID}!A1:C2")
@@ -269,6 +274,64 @@ class WriteValuesTest(unittest.TestCase):
             client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a"]])
 
         self.assertTrue(raised.exception.definite)
+
+
+class RectangularMatrixDefenseTest(unittest.TestCase):
+    """P1（Trace #373 H3 批量审查）：适配器侧的第二道纵深防线——即使上游
+    ``build_sheet_request`` 已经把矩阵补齐成矩形，本模块自己收到不规则矩阵时
+    仍然拒绝，不猜测该怎么补（失败关闭）。
+
+    变异锚点：把 ``write_values`` 里 ``row_lengths`` 的矩形校验删掉，本用例会
+    从抛出 ``ValueError`` 变红（不规则矩阵会被放行、按最长行拼出 range 发出去）。
+    """
+
+    def test_an_irregular_matrix_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a"], ["b", "c", "d"]])
+
+        self.assertEqual(transport.calls, [])
+
+    def test_a_rectangular_matrix_is_accepted(self) -> None:
+        """反向哨兵：矩形矩阵本身不受这道防御影响。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+
+        client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a", "b"], ["c", "d"]])
+
+        self.assertEqual(len(transport.calls), 1)
+
+
+class RowsShapeValidationTest(unittest.TestCase):
+    """P2-1（opus 审查）：``rows`` 或其中某一行不是列表/元组时，必须在
+    ``list(row)`` 之前就失败关闭成本模块 ``ValueError``——不能让 Python 内建的
+    ``TypeError`` 先冒出来，被调用方 ``_process_sheet_claim`` 误判为"结果不明"
+    （``uncertain``）而不是"入参形状错误，一定还没发出请求"（``failed``）。
+
+    变异锚点：把这里新增的形状校验（``rows``/``row`` 的 ``isinstance`` 检查）
+    删掉，本用例会从抛出 ``ValueError`` 变红成抛出 ``TypeError``。
+    """
+
+    def test_a_none_row_is_a_value_error_not_a_type_error(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [None])  # type: ignore[list-item]
+
+        self.assertEqual(transport.calls, [])
+
+    def test_rows_itself_not_being_a_list_is_a_value_error(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_values(SPREADSHEET_TOKEN, SHEET_ID, None)  # type: ignore[arg-type]
+
+        self.assertEqual(transport.calls, [])
 
 
 class GrantFullAccessTest(unittest.TestCase):

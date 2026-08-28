@@ -52,6 +52,21 @@ class ListClearParsingTests(unittest.TestCase):
         self.assertEqual(parse_memory_command("/memory").kind, MemoryCommandKind.NONE)
         self.assertEqual(parse_memory_command("/memory   ").kind, MemoryCommandKind.NONE)
 
+    def test_tab_separated_subcommand_is_recognized(self) -> None:
+        """P2-4（opus 审查）：词边界判定不能只认 ASCII 半角空格——``/memory``
+        后面紧跟 Tab 时，这条消息的第一个词依然是 ``/memory``，必须落进 /memory
+        命令面（哪怕子命令解析结果仍然可能是 NONE，见
+        ``IsMemoryCommandMessageTests``/``UnrecognizedSlashInteractionTests`` 的
+        对应用例），不能被当成完全无关的斜杠输入。
+
+        变异锚点：把 ``is_memory_command_message`` 的 ``str.split()`` 词边界
+        判定改回 ``startswith(prefix + " ")``，本用例会从 LIST 变红成 NONE。
+        """
+
+        self.assertEqual(
+            parse_memory_command("/memory\tlist"), MemoryCommand(kind=MemoryCommandKind.LIST)
+        )
+
 
 class ForgetParsingTests(unittest.TestCase):
     VALID_ID = "mem_01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -211,6 +226,12 @@ class IsMemoryCommandMessageTests(unittest.TestCase):
 
     def test_case_insensitive(self) -> None:
         self.assertTrue(is_memory_command_message("/MEMORY list"))
+
+    def test_tab_or_newline_separated_is_true(self) -> None:
+        """P2-4（opus 审查）：词边界不只认半角空格。"""
+
+        self.assertTrue(is_memory_command_message("/memory\tlist"))
+        self.assertTrue(is_memory_command_message("/memory\nlist"))
 
     def test_no_word_boundary_is_false(self) -> None:
         self.assertFalse(is_memory_command_message("/memoryabc"))

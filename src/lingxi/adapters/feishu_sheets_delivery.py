@@ -316,11 +316,32 @@ class LarkSheetsDelivery:
         ``A1`` 起始、按最长行的列数与总行数算出结束坐标（S-W0-3 探针实测的最小
         形状是单元格 ``A1:A1``，这里推广到多行多列，仍是同一个"整块覆盖"语义：
         天然幂等，见模块文档「与文档交付的差异点」第 3 条）。
+
+        **入参在 :meth:`list`/:meth:`list(row)` 之前先做形状校验**（Trace #373
+        H3 批量审查 P2-1）：``rows`` 或其中某一行不是可迭代的列表/元组时（例如
+        单行是 ``None``），直接抛本模块 ``ValueError``——不能让 ``list(row)``
+        先撞上 ``TypeError`` 才失败：调用方 ``_process_sheet_claim`` 按异常类型
+        分流终态（``ValueError`` → 明确 ``failed``，未列入白名单的异常类型 →
+        ``uncertain``），发出任何 HTTP 请求之前的入参形状错误没有"可能已经生效"
+        的空间，必须落 ``failed`` 而不是误判成结果不明。
+
+        **矩形防御断言**（Trace #373 H3 批量审查 P1）：飞书对「``range`` 宽度
+        大于某一行实际列数」这种不规则输入的真实语义本仓库从未验证过（探针只测
+        过单格 ``A1:A1``），静默把不规则矩阵连同按最长行算出的 ``range`` 一起
+        发出去，有写出错位数据且不被飞书拒绝的风险。上游 ``core.execution.
+        document_delivery.build_sheet_request`` 已经把矩阵补齐成矩形，这里是
+        第二道纵深防线：不假设上游一定守约，收到不规则矩阵直接 ``ValueError``
+        失败关闭，不猜测该怎么补。
         """
 
         token = _require_spreadsheet_token(spreadsheet_token)
         sid = _require_sheet_id(sheet_id)
-        matrix = [list(row) for row in rows] if rows is not None else []
+        if rows is None or not isinstance(rows, (list, tuple)):
+            raise ValueError("表格内容必须是行的列表")
+        for index, row in enumerate(rows):
+            if not isinstance(row, (list, tuple)):
+                raise ValueError(f"第 {index + 1} 行必须是单元格列表")
+        matrix = [list(row) for row in rows]
         if not matrix:
             raise ValueError("表格内容不能为空")
         for index, row in enumerate(matrix):
@@ -329,6 +350,9 @@ class LarkSheetsDelivery:
             for cell in row:
                 if not isinstance(cell, str):
                     raise ValueError(f"第 {index + 1} 行包含非字符串单元格")
+        row_lengths = {len(row) for row in matrix}
+        if len(row_lengths) > 1:
+            raise ValueError("表格内容必须是矩形矩阵：各行列数必须相同（调用方未按约定补齐）")
         row_count = len(matrix)
         column_count = max(len(row) for row in matrix)
         end_column = _column_letter(column_count)
