@@ -1201,8 +1201,16 @@ class NoFakeHeartbeatTest(unittest.TestCase):
         分页中途"的每一处落点（Epic G 批次审查 P2-1）。"""
         from lingxi.adapters import feishu_directory, feishu_org_snapshot_reader
         from lingxi.apps.scheduler import assembly
+        from lingxi.apps.scheduler import org_snapshot_sync as org_snapshot_sync_home
 
-        for module in (feishu_directory, feishu_org_snapshot_reader, assembly):
+        # S-H-2 把组织快照装配从 assembly 搬进 org_snapshot_sync 本体——读取回调
+        # 组装的现居地一并纳入扫描（S-H-2 批审查 P3-1）
+        for module in (
+            feishu_directory,
+            feishu_org_snapshot_reader,
+            assembly,
+            org_snapshot_sync_home,
+        ):
             with self.subTest(module=module.__name__):
                 source = inspect.getsource(module)
                 self.assertNotIn(

@@ -1162,9 +1162,11 @@ class InvariantBuildLoopTests(unittest.TestCase):
         names = [duty.name for duty in loop.duties]
         self.assertIn("未开通首聊交接对账", names, "本用例的前提是开通编排真的注册了")
         self.assertTrue(
-            any("LINGXI_ADMIN_GROUP_CHAT_ID" in line for line in captured.output),
+            any("已注册首次开通编排" in line for line in captured.output),
             captured.output,
-        )
+        )  # 判据用这条 WARNING 独有的正文子串而非环境变量名——同一装配轮里
+        # roster_audit/daily_report 的无关 WARNING 也含变量名字样，会让"删掉
+        # 本条 WARNING"的变异静默通过（S-H-2 批审查 P2-1 变异实测坐实）
         self.assertIn(
             (
                 "onboarding.admin_alert_channel_missing",
