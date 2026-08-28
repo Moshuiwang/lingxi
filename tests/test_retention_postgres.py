@@ -27,10 +27,15 @@ from postgres_schema import (
     applied_head,
     ensure_production_schema,
     force_rebuild_schema,
+    psycopg_available,
     revision_sql,
 )
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，保留清理断言未验证（需真实 PostgreSQL 16）"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，保留清理断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，保留清理断言未验证"
+)
 
 RETENTION_WINDOW = timedelta(hours=2160)
 # DDL 自 #53 起只存在于 revision 文件里（编号 SQL 已冻结），要重放它就从那里取。
@@ -54,7 +59,7 @@ CASCADE_EDGES = (
 UNTOUCHED_TABLES = ("feishu_delegated_subject", "app_user")
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class RetentionPostgresTestCase(unittest.TestCase):
     """所有保留清理用例的共同底座。"""
 

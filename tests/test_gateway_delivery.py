@@ -17,14 +17,18 @@ import os
 import unittest
 from typing import Any
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
 from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
 
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，Gateway 投递消费的数据库约束类断言未验证"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，Gateway 投递消费的数据库约束类断言未验证"
+)
 
 
 class RecordingCards:
@@ -163,7 +167,7 @@ class _RecordDeliveryProgressFailsOnce:
         self._queue.record_delivery_progress(**kwargs)
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class DeliveryConsumerTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

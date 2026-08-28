@@ -22,7 +22,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.mcp_token_cipher import McpTokenCipher, McpTokenCipherError, new_token
@@ -35,6 +35,8 @@ from lingxi.core.permission.mcp_readiness import (
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，MCP 令牌与就绪记录的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，MCP 令牌与就绪记录的真库断言未验证"
 )
 
 # 规格公开的测试向量主密钥（= ASCII "0123456789abcdef0123456789abcdef"），**非生产密钥**。
@@ -69,7 +71,7 @@ def _attempt(
     )
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class McpTokenPostgresTestCase(unittest.TestCase):
     """真库断言的共同底座。"""
 

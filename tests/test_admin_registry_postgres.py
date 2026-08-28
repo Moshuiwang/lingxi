@@ -40,7 +40,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.admin_registry import (
     PostgresAdminQueries,
@@ -56,10 +56,12 @@ from lingxi.core.permission.local_override import OverrideDirection
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，管理员登记表的真库断言未验证（需真实 PostgreSQL 16）"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，管理员登记表的真库断言未验证"
 )
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_REASON)
 class AdminRegistryPostgresTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
