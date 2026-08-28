@@ -11,12 +11,40 @@
 
 凭据边界：`app_secret` 与 `refresh_token` 只出现在**请求体**里，不进 URL、
 不进日志、不进异常消息。
+
+## 已知边界（Issue #284 B 组，Trace #373 D7 裁定：登记不改行为）
+
+以下两条防御性判据的宽容/收紧窗口是刻意留白的已知边界，触发都需要飞书平台侧的
+响应形状发生变化（不是本仓库代码路径本身的缺陷），一旦复审条件成立就重新评估，
+不在本次修复范围内：
+
+- **`_pages` 对非法类型的 `has_more` 宽容当"读完了"**（见该方法文档字符串
+  「`has_more` 不是合法 `bool` 时刻意不再抛错」一节）：`_pages_multi` 对同一情形
+  硬抛 `has_more_invalid`，两者不对齐是刻意的——`_pages` 这条判据背后的证据本身
+  互相矛盾（历史脚本与改动前的既有实现都对缺失/非法类型宽容，而收紧的理由不足以
+  排除"结果为空时字段本就缺失"这一更常见的解释）。**触发条件**：飞书对
+  `list_collaboration_tenants`/`list_visible_organization` 这两个真实端点返回的
+  `has_more` 变成非法类型（当前只观察到合法 `bool`）。**兜底**：非法类型时只记一条
+  WARNING 日志留痕，不阻塞本轮；若飞书响应形状真的漂移成"半页当空页"，最终会在
+  `core/identity/org_snapshot.verify_batch` 的整轮完整性交叉校验里以"两条身份路径
+  成员集合不一致"的形式被发现，只是比在这里直接硬抛晚一步、粒度粗一级。
+- **陌生键检测只覆盖"候选键全部缺失"这一种窗口**（见 `_pages`/`_pages_multi` 文档
+  字符串"独立审查 2026-08-20 推翻了…"一节）：`_pages_multi` 只要 `list_keys`
+  里**任意一个**候选键命中（哪怕是空列表），就不会去检查响应里是否存在一个不在
+  候选表里的陌生非空列表字段——一侧字段被平台改名、另一侧候选键仍然存在（哪怕
+  恰好是空的）时，改名不会被这道检测捕获。**触发条件**：`share_departments`/
+  `share_users`（或 `_pages` 那组四个候选键）中的某一个被飞书改名，且同一次响应里
+  另一个候选键仍然存在。**兜底**：不是完全不漏——`core/identity/org_snapshot.
+  verify_batch` 的整轮交叉校验（两条身份路径的成员集合必须相等）会在改名侧的数据
+  持续缺失时最终报错，只是诊断粒度从"这一次分页调用具体缺了哪个字段"退化成
+  "这一轮两条路径对不上"，需要人工再排查一层。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import time
 from contextlib import contextmanager
@@ -42,6 +70,17 @@ REQUEST_TIMEOUT_SECONDS = 20
 # scripts/sync_feishu_org_snapshot.py 用过的配方，这里照抄同一个数值，
 # 不新造节流算法。详见 _PagedClient._throttle 的文档字符串。
 REQUEST_PAUSE_SECONDS = 0.12
+
+# 节流抖动上限（Issue #284 A 组 #3，Trace #373 D7 裁定修复）：首次开通编排的
+# 8 条工作线程共享同一个 `FeishuDirectoryClient` 实例（`apps/scheduler/onboarding.py`
+# 的 `FeishuEmploymentReader`）；固定停顿量本身没有错，但如果多条线程恰好同时进入
+# `_throttle()`，会一起睡 `REQUEST_PAUSE_SECONDS`、又一起醒来，在飞书那侧看到的是
+# 一次 8 倍尖峰而不是分散的 8 req/s。抖动量取节流步长的一半（0.06 秒）：足以在多数
+# 情况下把同时到达的几条线程错开到不同的真实发起时刻，又不至于把单线程场景（组织
+# 快照同步、开通链只有一条链在跑）的平均节流步长拉长太多——最坏多等一个步长的一半，
+# 相对 REQUEST_PAUSE_SECONDS 本身留的节流余量可以忽略。这不是重型令牌桶或漏桶节流器，
+# 只是给固定停顿量加一点随机错相，见 _PagedClient._throttle 的文档字符串。
+REQUEST_PAUSE_JITTER_SECONDS = REQUEST_PAUSE_SECONDS / 2
 
 # 频率限制的窄而有界重试（Issue #271 编排者 2026-08-20 补充压测证据）：
 # 0.12 秒节流在 2 倍真实规模（564 次调用）下实测未撞限频，但对照的无节流
@@ -206,7 +245,9 @@ class _PagedClient:
         base_url: str,
         transport: Callable[..., Any] | None = None,
         request_pause_seconds: float = REQUEST_PAUSE_SECONDS,
+        request_pause_jitter_seconds: float = REQUEST_PAUSE_JITTER_SECONDS,
         sleep: Callable[[float], None] | None = None,
+        random_source: Callable[[], float] = random.random,
         rate_limit_retry_backoffs: tuple[float, ...] = RATE_LIMIT_RETRY_BACKOFFS_SECONDS,
         round_deadline_clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -218,6 +259,11 @@ class _PagedClient:
         # （REQUEST_PAUSE_SECONDS 非零），不靠调用方记得手动打开；测试注入
         # 假 sleeper 或把 request_pause_seconds 设成 0 来跳过真实等待。
         self._request_pause_seconds = request_pause_seconds
+        # 抖动上限与随机源同样可注入（Issue #284 A 组 #3）：默认值本身就生效
+        # （REQUEST_PAUSE_JITTER_SECONDS 非零），测试注入固定返回值的 `random_source`
+        # 或把 `request_pause_jitter_seconds` 设成 0 来得到确定性的停顿量。
+        self._request_pause_jitter_seconds = request_pause_jitter_seconds
+        self._random_source: Callable[[], float] = random_source
         self._sleep: Callable[[float], None] = sleep or time.sleep
         # 频率限制的窄而有界重试也可注入（Issue #271 编排者 2026-08-20 补充压测
         # 证据后追加，见 `_request` 文档字符串）：默认值本身就是生效的三次递增
@@ -302,10 +348,32 @@ class _PagedClient:
         假值（如 ``0``）时**完全不调用** ``self._sleep``，不是调用
         ``sleep(0)``——单元测试据此既能验证"确实节流"，也能验证"可以关掉"，
         且默认构造出来的客户端就是生效状态，不需要调用方额外接线。
+
+        **停顿量额外叠加一段随机抖动**（Issue #284 A 组 #3，Trace #373 D7 裁定
+        修复）：固定停顿量本身对单条调用链有效，但首次开通编排的 8 条工作线程
+        共享**同一个** client 实例（`apps/scheduler/onboarding.py` 的
+        `FeishuEmploymentReader`）——多条线程若恰好同时进入本方法，会一起睡
+        `REQUEST_PAUSE_SECONDS`、又几乎同时醒来再一起发请求，在飞书那侧看到的
+        是周期性的 N 倍尖峰，而不是分散的稳定速率，这正是 `_request_pause_seconds`
+        本身要防的那种突发的另一种形状。抖动量是 ``[0, request_pause_jitter_seconds)``
+        的均匀随机值（默认上限是节流步长的一半），加在固定停顿量之上——只是给同一个
+        停顿量加一点随机错相，**不是**引入令牌桶/漏桶那类需要维护跨调用状态的重型
+        节流器，单线程调用方（组织快照同步、开通链只有一条链在跑时）的行为只是平均
+        停顿量略微变长，不改变"发起请求前必须先等一等"这条语义。
+
+        抖动量为假值（``request_pause_jitter_seconds`` 为 ``0``）时**完全不调用**
+        ``self._random_source``，与 ``request_pause_seconds`` 同一条"可以关掉"的
+        纪律——单元测试可以注入固定返回值的 `random_source` 换来确定性的停顿量，
+        也可以把抖动上限设成 0 验证"关掉之后就是原来那个固定值"。
         """
 
         if self._request_pause_seconds:
-            self._sleep(self._request_pause_seconds)
+            jitter = (
+                self._request_pause_jitter_seconds * self._random_source()
+                if self._request_pause_jitter_seconds
+                else 0.0
+            )
+            self._sleep(self._request_pause_seconds + jitter)
 
     def _request(self, url: str, *, token: str) -> dict[str, Any]:
         """节流后发起一次 ``GET`` 请求并解码，只对飞书的频率限制业务错误码做

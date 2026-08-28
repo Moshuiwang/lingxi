@@ -171,6 +171,14 @@
 新工作**，把已经领取的那一次做完，然后退出。半途中断一次轮换会留下一个"已经向飞书
 换过、但没写回数据库"的窗口，而 ``refresh_token`` 一次性有效——那个窗口等于凭据丢失。
 清理侧没有对应窗口：一次调用就是一个数据库事务，被打断只会整体回滚。
+
+首次开通编排的执行器有自己独立的线程池（``apps/scheduler/onboarding.py::
+OnboardingExecutor``），不跑在 ``SchedulerLoop`` 的调用线程上——``run_forever()``
+返回只说明各职责不再被 tick 调用，不代表这些独立线程也已经停止领取新工作、收工
+退出。``main()`` 因此在 ``run_forever()`` 返回之后额外调用一次
+:func:`~lingxi.apps.scheduler.onboarding.join_onboarding_executors`（Issue #284
+C 组 #8，Trace #373 D7 裁定修复），把"停止领取、等在途工作在预算内收尾"这条退出
+语义显式接到这条独立线程池上，见该函数文档字符串。
 """
 
 from __future__ import annotations
@@ -222,6 +230,7 @@ from lingxi.apps.scheduler.late_readiness_recovery import (
     LateReadinessRecoveryReport,
 )
 from lingxi.apps.scheduler.loop import SchedulerLoop, install_signal_handlers
+from lingxi.apps.scheduler.onboarding import join_onboarding_executors
 from lingxi.apps.scheduler.org_snapshot_sync import OrgSnapshotSyncDuty
 from lingxi.apps.scheduler.permission_publish import (
     PermissionPublishDuty,
@@ -282,4 +291,8 @@ def main(argv: list[str] | None = None) -> int:
     install_signal_handlers(loop)
     logger.info("lingxi-scheduler 已启动 interval_seconds=%s", config.interval_seconds)
     loop.run_forever()
+    # Issue #284 C 组 #8：`run_forever()` 只保证不再有新一轮 tick，开通执行器自己
+    # 的独立线程池需要单独接线停止领取新工作、并在预算内等在途链收尾（见模块文档
+    # 「退出语义」一节）。
+    join_onboarding_executors(loop.duties)
     return 0
