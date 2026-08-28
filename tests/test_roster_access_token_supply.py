@@ -301,6 +301,80 @@ class ProviderAuditLockTest(unittest.TestCase):
         self.assertIn("no_credential_available", provider._audited_reasons)
 
 
+class ProviderAuditDateMonotonicTest(unittest.TestCase):
+    """P2-D（codex 外审 · Trace #373 H1 批终修复包②）：``_audited_on`` 只单调
+    前进，不因为一次迟到的旧日期调用而倒退。
+
+    ``now`` 在 ``__call__`` 开头取、``_record`` 迟后才进锁——跨 UTC 午夜时，一个
+    在午夜前取到 ``now`` 但被线程调度（或先经历一次耗时的 ``refresh()``）延后
+    才进锁的调用，可能带着"前一天"的日期到达，晚于另一个已经把 ``_audited_on``
+    推进到"新一天"的调用。旧写法只判断 ``_audited_on != today`` 就重置去重集合，
+    这一倒退会把新一天已经记过的分类清空，导致同一天同一分类被重复审计。"""
+
+    def test_a_late_call_with_an_earlier_date_does_not_rewind_the_dedup_state(self) -> None:
+        holder = DerivedAccessTokenHolder()
+        provider = RosterAccessTokenProvider(holder=holder, refresh=lambda: None)
+
+        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=timezone.utc)
+        day_two = datetime(2026, 8, 28, 0, 0, 1, tzinfo=timezone.utc)
+
+        # 先到达的是"新一天"的调用（模拟它先进锁），把 _audited_on 推进到 day_two，
+        # 并记下一个分类。
+        provider._record("refresh_error", day_two)
+        self.assertEqual(provider._audited_on, day_two.date())
+        self.assertIn("refresh_error", provider._audited_reasons)
+
+        # 一个"旧一天"（跨午夜前取到的 now）的调用迟到——必须不倒退 _audited_on，
+        # 也不清空 day_two 已经记下的去重集合。
+        provider._record("no_credential_available", day_one)
+
+        self.assertEqual(
+            provider._audited_on,
+            day_two.date(),
+            "迟到的旧日期调用不得把 _audited_on 倒退回前一天",
+        )
+        self.assertIn(
+            "refresh_error",
+            provider._audited_reasons,
+            "旧日期调用不得清空新一天已经记下的去重集合",
+        )
+
+        # day_two 同一分类此后再来一次，必须仍然只算一条（没有因为中途被倒退清空
+        # 而重新放行）。
+        provider._record("refresh_error", day_two)
+        self.assertEqual(
+            len(provider._audited_reasons), 2, "不应该出现同一天同一分类被重复计入"
+        )
+
+    def test_out_of_order_calls_do_not_duplicate_audits_across_midnight(self) -> None:
+        """端到端形状：交替喂入乱序的日期，最终审计出口不应该看到同一天同一分类
+        出现两条 ``roster_access_token.unavailable`` 记录。"""
+
+        holder = DerivedAccessTokenHolder()
+        audit = RecordingAudit()
+        provider = RosterAccessTokenProvider(holder=holder, refresh=lambda: None, audit=audit)
+
+        day_one = datetime(2026, 8, 27, 23, 59, 59, tzinfo=timezone.utc)
+        day_two_first = datetime(2026, 8, 28, 0, 0, 1, tzinfo=timezone.utc)
+        day_two_again = datetime(2026, 8, 28, 0, 5, 0, tzinfo=timezone.utc)
+
+        provider._record("refresh_error", day_two_first)  # 新一天先到
+        provider._record("refresh_error", day_one)  # 旧一天迟到
+        provider._record("refresh_error", day_two_again)  # 新一天同一分类再来一次
+
+        unavailable_records = [
+            fields
+            for action, fields in audit.records
+            if action == "roster_access_token.unavailable"
+        ]
+        self.assertEqual(
+            len(unavailable_records),
+            1,
+            "同一天同一分类只应该发出一条审计，不因跨午夜乱序调用而重复",
+        )
+        self.assertEqual(unavailable_records[0]["report_date"], day_two_first.date().isoformat())
+
+
 # --------------------------------------------------------------------------
 # 二、频率上界：唯一权威在凭据文件里
 # --------------------------------------------------------------------------

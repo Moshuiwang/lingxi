@@ -924,6 +924,111 @@ class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
         join_mock.assert_called_once_with(sentinel_duties)
 
 
+class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
+    """P1-B（codex 外审 · Trace #373 H1 批终修复包②）：``main()`` 里
+    ``join_onboarding_executors(loop.duties)`` 此前放在 ``loop.run_forever()``
+    之后、没有 ``finally`` 覆盖——主循环抛出未处理异常时这一行会被绕过，开通
+    执行器的独立线程池只能靠解释器退出时被任意截断，而不是走"停止领取、等在途
+    工作在预算内收尾"的退出语义。本用例钉住修复后的行为：``run_forever()`` 抛
+    异常时 join 仍必须被调用，且原始异常必须原样向上传播（不能被收尾覆盖或吞掉）。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里包住 ``run_forever()``
+    的 ``try``/``finally`` 去掉、改回顺序调用（``loop.run_forever()`` 后面直接
+    跟 ``join_onboarding_executors(loop.duties)``）重跑本用例，
+    ``join_mock.assert_called_once_with(...)`` 会因为异常路径跳过了 join 调用
+    而失败。
+    """
+
+    def test_run_forever_exception_still_joins_and_propagates(self) -> None:
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(), object())
+        boom = RuntimeError("主循环崩了")
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                raise boom
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch(
+                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
+            ) as build_loop_mock,
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            with self.assertRaises(RuntimeError) as ctx:
+                main([])
+
+        self.assertIs(ctx.exception, boom, "原始异常必须原样向上传播，不能被收尾覆盖")
+        install_mock.assert_called_once_with(stub_loop)
+        build_loop_mock.assert_called_once()
+        # 主循环抛异常时 join_onboarding_executors 仍必须被调用。
+        join_mock.assert_called_once_with(sentinel_duties)
+
+    def test_join_failure_during_exception_exit_does_not_mask_the_original_error(self) -> None:
+        """收尾自身失败不得覆盖原始故障：``run_forever()`` 与
+        ``join_onboarding_executors`` 都抛异常时，向上传播的必须是
+        ``run_forever()`` 的原始异常。"""
+
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(),)
+        original_error = RuntimeError("主循环的原始故障")
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                raise original_error
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
+            mock.patch(
+                "lingxi.apps.scheduler.join_onboarding_executors",
+                side_effect=RuntimeError("收尾 join 也失败了"),
+            ),
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            with self.assertRaises(RuntimeError) as ctx:
+                main([])
+
+        self.assertIs(
+            ctx.exception, original_error, "收尾失败不得覆盖 run_forever() 的原始异常"
+        )
+
+
 class StopSentinelRaceTests(unittest.TestCase):
     """F2（外部集成面审查，应修）：``stop()`` 在队列满时哨兵全部丢失、``_loop`` 有
     check-then-get 竞态导致工作线程无超时地永久卡死。

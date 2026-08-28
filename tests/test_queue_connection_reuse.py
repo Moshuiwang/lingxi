@@ -58,18 +58,24 @@ class _FakeConnection:
     后被关闭）。
     """
 
-    def __init__(self, rows: list[tuple] | None = None) -> None:
+    def __init__(self, rows: list[tuple] | None = None, *, commit_error: Exception | None = None) -> None:
         self.closed = False
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
         self._rows = rows or []
+        # P1-A（codex 外审 · Trace #373 H1 批终修复包②）：可选地让 `commit()`
+        # 抛出，模拟"COMMIT 回执因断线丢失"这种结果不确定的场景——不管抛不抛，
+        # `commit_calls` 都照常计数，用来断言 `commit()` 确实被调用过一次。
+        self._commit_error = commit_error
 
     def cursor(self) -> _FakeCursor:
         return _FakeCursor(self._rows)
 
     def commit(self) -> None:
         self.commit_calls += 1
+        if self._commit_error is not None:
+            raise self._commit_error
 
     def rollback(self) -> None:
         self.rollback_calls += 1
@@ -276,6 +282,100 @@ class ConnectionReuseHelperTests(unittest.TestCase):
         self.assertEqual(len(connections), 1, "新建连接失败不应该重试、不应该再建第二条连接")
         self.assertIsNone(base._pooled_connection)
         self.assertTrue(connections[0].closed)
+
+    def test_commit_failure_is_never_replayed(self) -> None:
+        """P1-A（codex 外审 · Trace #373 H1 批终修复包②）：**复用命中**的连接上
+        ``operation()`` 成功、但 ``commit()`` 抛错（模拟 COMMIT 回执因断线丢失、
+        数据库端其实已经提交）——这次异常必须原样上抛，绝不能被当成"复用连接
+        首次失败"走重试分支，否则会把已经提交过的 ``operation``（例如
+        ``claim()``）完整重放一遍，第二次再抢一批任务，第一批已经 ``running``
+        却无人认领。
+
+        必须先建立一条**真正复用命中**（``reused=True``）的缓存连接再触发这次
+        commit 失败——不这样做的话，`_run_polling_operation` 第一次调用本身走的
+        是"新建连接"分支（``reused=False``），那条分支任何失败都不重试，测不出
+        "复用命中 + commit 失败"这条专属路径的行为。
+        """
+
+        connections: list[_FakeConnection] = []
+
+        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+            connection = _FakeConnection()
+            connections.append(connection)
+            return connection
+
+        base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
+        with mock.patch(
+            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
+        ):
+            base._run_polling_operation(lambda connection: None)  # 建立缓存里的复用连接
+            self.assertEqual(len(connections), 1)
+            first = connections[0]
+            first._commit_error = RuntimeError("COMMIT 回执因断线丢失")
+
+            calls = {"count": 0}
+
+            def operation(connection: _FakeConnection) -> str:
+                calls["count"] += 1
+                return "claimed"
+
+            with self.assertRaises(RuntimeError):
+                base._run_polling_operation(operation)
+
+        self.assertEqual(calls["count"], 1, "commit() 失败不得触发 operation 重放")
+        self.assertEqual(len(connections), 1, "commit() 阶段失败不应该重建第二条连接去重试")
+        self.assertEqual(
+            first.commit_calls,
+            2,
+            "建立缓存那一次成功 commit 一次，本次失败 commit 又一次，一共两次",
+        )
+        self.assertTrue(first.closed, "commit() 失败的连接必须被丢弃")
+        self.assertIsNone(base._pooled_connection, "commit() 失败后不能把这条连接留在缓存里")
+
+    def test_commit_failure_after_a_successful_retry_is_also_not_replayed(self) -> None:
+        """P1-A 的重试分支同样拆分：复用连接首次失败触发重试，重试的
+        ``operation()`` 成功后如果重建连接的 ``commit()`` 又失败，同样只丢弃 +
+        原样上抛，不再重试第二次。"""
+
+        connections: list[_FakeConnection] = []
+
+        def fake_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+            connection = _FakeConnection()
+            connections.append(connection)
+            return connection
+
+        base = _TaskQueueBase("postgresql://test/db", reuse_polling_connection=True)
+        with mock.patch(
+            "lingxi.adapters.postgres_conversation._queue_base.connect", fake_connect
+        ):
+            base._run_polling_operation(lambda connection: None)  # 建立缓存里的第一条连接
+            self.assertEqual(len(connections), 1)
+
+            # 第二条连接（重试用）的 operation 阶段能成功，但 commit() 会抛错。
+            def flaky_connect(dsn: str, *, timeouts: object = None) -> _FakeConnection:
+                connection = _FakeConnection(commit_error=RuntimeError("重试后 COMMIT 依然失败"))
+                connections.append(connection)
+                return connection
+
+            calls = {"count": 0}
+
+            def operation(connection: _FakeConnection) -> str:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise RuntimeError("模拟服务端悄悄断开这条复用连接")
+                return "ok"
+
+            with mock.patch(
+                "lingxi.adapters.postgres_conversation._queue_base.connect", flaky_connect
+            ):
+                with self.assertRaises(RuntimeError):
+                    base._run_polling_operation(operation)
+
+        self.assertEqual(calls["count"], 2, "operation 应该恰好重试一次（首次失败 + 重试成功）")
+        self.assertEqual(len(connections), 2, "重试只应该重建一条新连接，不因 commit() 失败再建第三条")
+        self.assertEqual(connections[1].commit_calls, 1)
+        self.assertTrue(connections[1].closed, "重试后 commit() 失败的连接必须被丢弃")
+        self.assertIsNone(base._pooled_connection, "commit() 失败后不能把这条连接留在缓存里")
 
 
 class QueueHotPathWiringTests(unittest.TestCase):
