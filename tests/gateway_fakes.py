@@ -25,6 +25,8 @@ from lingxi.core.conversation.ports import (
     UserRecord,
     UserState,
 )
+from lingxi.core.ids import new_id
+from lingxi.core.user_memory import MAX_MEMORY_ENTRIES_PER_USER, UserMemoryEntry
 
 
 class CallLog:
@@ -170,6 +172,13 @@ class FakeState:
     # 已认领、超过对账窗口仍未交接的孤儿事件（对账扫描的输入）。认领即摘除，与真库
     # 「UPDATE … RETURNING 同一条语句里记账」同语义：同一条不会被认领两次。
     stale_onboardings: list[PendingOnboarding] = field(default_factory=list)
+    # 用户记忆（Issue #357 S-H3-3）：user_id → 记忆列表。**简化，不走暂存区**——
+    # 与本类其余写方法不同，这里直接改 FakeState（不经 commit 才生效）：/memory
+    # 命令面每条消息只触发四个方法之一，没有"同一事务内先写记忆、后面步骤又失败
+    # 需要回滚"的组合场景需要在假实现里复现；真正的同事务回滚由真库测试
+    # （tests/test_pending_action_postgres.py、tests/test_permission_publish_
+    # postgres.py 的清除钩子用例、tests/test_postgres_user_memory.py）覆盖。
+    user_memory: dict[str, list[UserMemoryEntry]] = field(default_factory=dict)
 
 
 class FakeTransaction:
@@ -314,6 +323,52 @@ class FakeTransaction:
         # adapters.postgres_conversation）。
         self._state.pending_delivery_expired_notices.discard(conversation_id)
         return True
+
+    def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:
+        self._log.add("store.list_user_memory", user_id=user_id)
+        return list(self._state.user_memory.get(user_id, ()))
+
+    def remember_user_memory(
+        self, *, user_id: str, memory_type: str, memory_key: str, memory_value: str
+    ) -> str | None:
+        self._log.add(
+            "store.remember_user_memory",
+            user_id=user_id,
+            memory_type=memory_type,
+            memory_key=memory_key,
+        )
+        self._maybe_fail("remember_user_memory")
+        entries = self._state.user_memory.setdefault(user_id, [])
+        for index, entry in enumerate(entries):
+            if entry.memory_type == memory_type and entry.memory_key == memory_key:
+                updated = dataclasses.replace(entry, memory_value=memory_value)
+                entries[index] = updated
+                return updated.memory_id
+        if len(entries) >= MAX_MEMORY_ENTRIES_PER_USER:
+            return None
+        new_entry = UserMemoryEntry(
+            memory_id=new_id("mem"),
+            memory_type=memory_type,
+            memory_key=memory_key,
+            memory_value=memory_value,
+            created_at=datetime.now(timezone.utc),
+        )
+        entries.append(new_entry)
+        return new_entry.memory_id
+
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
+        self._log.add("store.forget_user_memory", user_id=user_id, memory_id=memory_id)
+        entries = self._state.user_memory.get(user_id, [])
+        for index, entry in enumerate(entries):
+            if entry.memory_id == memory_id:
+                del entries[index]
+                return True
+        return False
+
+    def clear_user_memory(self, *, user_id: str) -> int:
+        self._log.add("store.clear_user_memory", user_id=user_id)
+        entries = self._state.user_memory.pop(user_id, [])
+        return len(entries)
 
     def _find(self, conversation_id: str) -> FakeConversation:
         for conversation in self._state.conversations.values():

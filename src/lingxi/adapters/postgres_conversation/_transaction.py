@@ -18,6 +18,7 @@ from lingxi.core.conversation.ports import (
     UserState,
 )
 from lingxi.core.ids import new_id
+from lingxi.core.user_memory import MAX_MEMORY_ENTRIES_PER_USER, UserMemoryEntry
 
 # 入队后发的通知通道名。worker 监听它以便"提交即领取"，但**不能只靠它**：
 # NOTIFY 在连接断开、监听方重启的窗口里会整批丢失，兜底轮询是必需的（`V-队列-05`）。
@@ -453,3 +454,119 @@ class _Transaction:
             (conversation_id,),
         )
         return cursor.fetchone() is not None
+
+    # ------------------------------------------------------------------
+    # 用户记忆（Issue #357 S-H3-3，D1 显式登记范围）
+    # ------------------------------------------------------------------
+    #
+    # 四个方法服务两条调用路径：``/memory`` 命令面（``core/conversation/pipeline.py``
+    # 的分发分支，直接复用当次事件事务里已经打开的 ``tx``）与两处清除钩子
+    # （``postgres_pending_action.py`` 的 SUSPEND_USER EXECUTE 分支、
+    # ``postgres_permission_publish.py`` 的权限真变分支）——后两者用调用方已经持有
+    # 行锁的同一个 ``connection`` 构造 ``_Transaction`` 并直接调用
+    # ``clear_user_memory``，与 ``clear_delivered_content_for_user`` 同一姿态：清除
+    # 与账号状态翻转/权限决定落在同一个数据库事务，失败一起回滚，不产生"账号已停用
+    # /权限已变、记忆却还在"的半套状态。
+
+    def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:
+        """按用户取全部记忆，按登记时间升序——``/memory list`` 与 worker 注入
+        （``adapters/postgres_user_memory.py``）共用的天然读路径。"""
+
+        cursor = self._execute(
+            """
+            SELECT id, memory_type, memory_key, memory_value, created_at
+              FROM user_memory
+             WHERE user_id = %s
+             ORDER BY created_at ASC
+            """,
+            (user_id,),
+        )
+        return [
+            UserMemoryEntry(
+                memory_id=row[0],
+                memory_type=row[1],
+                memory_key=row[2],
+                memory_value=row[3],
+                created_at=row[4],
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def remember_user_memory(
+        self, *, user_id: str, memory_type: str, memory_key: str, memory_value: str
+    ) -> str | None:
+        """登记一条记忆；同一用户同一类型同一 key 已存在时是更新（不计入上限、
+        不产生第二行），否则是新增。
+
+        返回新增/更新后那一行的内部标识；**新增**时若该用户已达
+        :data:`~lingxi.core.user_memory.MAX_MEMORY_ENTRIES_PER_USER` 条上限，
+        返回 ``None`` 且不写入任何行——调用方据此渲染"已达上限"的拒绝文案，不做
+        静默截断（设计文 b 节：静默丢用户看不见，违反"用户可查可清"的信任底线）。
+
+        ``SELECT ... FOR UPDATE`` 锁定目标 key 那一行（若存在）：与
+        ``ON CONFLICT (user_id, memory_type, memory_key) DO UPDATE`` 达到的效果
+        相同（同一唯一索引），这里拆成两步是为了让"新增是否超过上限"这条业务判断
+        能在写入前拿到一个确定的计数，同一事务内不会被本方法自己的重复调用打乱
+        （行锁挡住同一 key 的并发更新；不同 key 之间的计数竞态是已知的从紧简化，
+        见 PR 说明）。
+        """
+
+        cursor = self._execute(
+            """
+            SELECT id FROM user_memory
+             WHERE user_id = %s AND memory_type = %s AND memory_key = %s
+             FOR UPDATE
+            """,
+            (user_id, memory_type, memory_key),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            memory_id = existing[0]
+            self._execute(
+                "UPDATE user_memory SET memory_value = %s, updated_at = now() WHERE id = %s",
+                (memory_value, memory_id),
+            )
+            return memory_id
+
+        count_cursor = self._execute(
+            "SELECT count(*) FROM user_memory WHERE user_id = %s", (user_id,)
+        )
+        (count,) = count_cursor.fetchone()
+        if count >= MAX_MEMORY_ENTRIES_PER_USER:
+            return None
+
+        memory_id = new_id("mem")
+        self._execute(
+            """
+            INSERT INTO user_memory (id, user_id, memory_type, memory_key, memory_value)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (memory_id, user_id, memory_type, memory_key, memory_value),
+        )
+        return memory_id
+
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
+        """删除**属于该用户**的一条记忆；返回是否真的删了。
+
+        ``AND user_id = %s`` 结构性地堵死跨用户删除——即使调用方传入的
+        ``memory_id`` 属于另一个用户，这条语句也影响 0 行，不需要先查一次"这条
+        记忆是不是我的"再判断，避免 TOCTOU 窗口。
+        """
+
+        cursor = self._execute(
+            "DELETE FROM user_memory WHERE id = %s AND user_id = %s",
+            (memory_id, user_id),
+        )
+        return cursor.rowcount == 1
+
+    def clear_user_memory(self, *, user_id: str) -> int:
+        """清空该用户的全部记忆，返回清掉的行数。
+
+        ``/memory clear`` 与两处清除钩子（停用、权限真变）共用同一个方法——三条
+        触发路径不会各自维护一份"怎么删 user_memory"的实现，不会彼此漂移。硬
+        ``DELETE``：与 ``resume_user`` "不恢复已清正文"的既有语义一致，被清除的
+        记忆不可恢复。
+        """
+
+        cursor = self._execute("DELETE FROM user_memory WHERE user_id = %s", (user_id,))
+        return cursor.rowcount

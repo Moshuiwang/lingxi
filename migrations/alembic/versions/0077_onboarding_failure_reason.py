@@ -32,6 +32,12 @@ perm_types`，保证本分支单独跑 `check_migration_chain.sh` 时链是绿�
 实际合并次序重新排链（谁先合并、后合并者的 `down_revision` 改指向先合并者的
 revision id），不能假设本文件写下这段话时的排序就是最终排序。
 
+**改链已执行（编排者，2026-08-28 合并队列）**：`0076_user_memory`（其
+`down_revision` 实测同样指向 `0073`，未受错误假设影响）已先行合入
+`epic/h3-features`，本 revision 的 `down_revision` 随之由 `0073_pending_action_
+perm_types` 改链至 `0076_user_memory`（当前值），链恢复单头
+`...0073 → 0076 → 0077`。
+
 ## 为什么是一张新窄表，不是 S9 那张大而全的 ``audit_event``
 
 `docs/技术设计/接口设计.md` 联合设计 §7.2「级 2」把 `failure_reason` 落库列为「可选的
@@ -95,7 +101,7 @@ from alembic import op
 
 revision: str = "0077_onboarding_failure_reason"
 #: 实测当前链头（见文件头部「合并次序」订正说明）——不是派工卡原话的 0075。
-down_revision: str | None = "0073_pending_action_perm_types"
+down_revision: str | None = "0076_user_memory"
 branch_labels: str | None = None
 depends_on: str | None = None
 

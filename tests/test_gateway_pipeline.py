@@ -1902,5 +1902,192 @@ class OnboardingInFlightTests(PipelineTestCase):
         self.assertEqual(len(self.state.tasks), 0, "同步期间不入队")
 
 
+class MemoryCommandDispatchTests(PipelineTestCase):
+    """``/memory`` 命令面的分发断言（Issue #357 S-H3-3）。真正的读写语义（唯一
+    索引、上限、跨用户隔离）在 ``tests/test_postgres_user_memory.py`` 真库覆盖；
+    这里只钉「pipeline 第 6 步的分发是否按设计文接线正确」——四个子命令各自
+    调用了正确的 ``tx`` 方法、正确的审计事件、正确的回执文案键。"""
+
+    def test_list_when_empty_gets_the_empty_hint_and_no_write_audit(self) -> None:
+        outcome = self.build().handle_message(message(text="/memory list"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertIn("还没有登记任何记忆", replies[0]["text"])
+        self.assertEqual(
+            [
+                action
+                for action in self.log.names()
+                if action.startswith("audit.command.memory_")
+            ],
+            [],
+            "list 是只读操作，不产生三个写审计事件之一",
+        )
+
+    def test_remember_writes_through_the_transaction_and_records_audit(self) -> None:
+        outcome = self.build().handle_message(
+            message(text="/memory remember term_mapping 大尼日 => 尼日利亚"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        entries = self.state.user_memory.get("usr_1", [])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].memory_key, "大尼日")
+        self.assertEqual(entries[0].memory_value, "尼日利亚")
+        remembered = self.log.fields("audit.command.memory_remember")
+        self.assertEqual(len(remembered), 1)
+        self.assertEqual(remembered[0]["user_id"], "usr_1")
+        self.assertEqual(remembered[0]["memory_type"], "term_mapping")
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertIn("已登记", replies[0]["text"])
+
+    def test_list_after_remember_shows_the_registered_entry(self) -> None:
+        self.build().handle_message(
+            message(text="/memory remember term_mapping 大尼日 => 尼日利亚"), now=NOW
+        )
+
+        outcome = self.build().handle_message(message(event_id="evt_2", text="/memory list"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        listed = replies[-1]["text"]
+        self.assertIn("大尼日", listed)
+        self.assertIn("尼日利亚", listed)
+
+    def test_forget_an_existing_entry_deletes_it_and_records_audit(self) -> None:
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k => v"), now=NOW
+        )
+        memory_id = self.state.user_memory["usr_1"][0].memory_id
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_2", text=f"/memory forget {memory_id}"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        forgotten = self.log.fields("audit.command.memory_forget")
+        self.assertEqual(len(forgotten), 1)
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("已删除", replies[-1]["text"])
+
+    def test_forget_an_unknown_id_gets_the_not_found_hint_and_no_audit(self) -> None:
+        outcome = self.build().handle_message(
+            message(text="/memory forget mem_01ARZ3NDEKTSV4RRFFQ69G5FAV"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.log.fields("audit.command.memory_forget"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("没有找到", replies[0]["text"])
+
+    def test_clear_removes_all_entries_and_records_the_cleared_count(self) -> None:
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k1 => v1"), now=NOW
+        )
+        self.build().handle_message(
+            message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
+            now=NOW,
+        )
+
+        outcome = self.build().handle_message(message(event_id="evt_3", text="/memory clear"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        cleared = self.log.fields("audit.command.memory_clear")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["cleared_count"], 2)
+
+    def test_limit_exceeded_is_rejected_without_writing_and_without_audit(self) -> None:
+        from lingxi.core.user_memory import MAX_MEMORY_ENTRIES_PER_USER
+
+        for index in range(MAX_MEMORY_ENTRIES_PER_USER):
+            outcome = self.build().handle_message(
+                message(event_id=f"evt_fill_{index}", text=f"/memory remember term_mapping k{index} => v{index}"),
+                now=NOW,
+            )
+            self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(len(self.state.user_memory["usr_1"]), MAX_MEMORY_ENTRIES_PER_USER)
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_over", text="/memory remember term_mapping one_too_many => v"),
+            now=NOW,
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(
+            len(self.state.user_memory["usr_1"]),
+            MAX_MEMORY_ENTRIES_PER_USER,
+            "超过上限的登记不得写入任何行",
+        )
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("已达到记忆条数上限", replies[-1]["text"])
+
+    def test_malformed_memory_command_gets_usage_help_not_a_write(self) -> None:
+        outcome = self.build().handle_message(
+            message(text="/memory remember bad_type k => v"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("支持的记忆命令", replies[0]["text"])
+        self.assertEqual(
+            [
+                action
+                for action in self.log.names()
+                if action.startswith("audit.command.memory_")
+            ],
+            [],
+        )
+
+    def test_malformed_memory_command_does_not_get_the_generic_slash_rejected_text(self) -> None:
+        """安全回归：/memory 的豁免必须精确——格式写错的 /memory 消息得到专属用法
+        提示，不是与 /config 共用的泛用「不支持的命令」文案（否则用户会被引导去
+        『用自然语言重新描述问题』，却永远学不会正确的 /memory 语法）。"""
+
+        outcome = self.build().handle_message(message(text="/memory rember typo"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertNotEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
+        self.assertEqual(self.log.fields("audit.command.unsupported_slash"), [])
+
+
+class MemoryCommandBypassesBusyTests(PipelineTestCase):
+    """设计文 b 节／pipeline 类文档「第 6 步的延伸」：/memory 与 /stop 同一姿态，
+    忙碌期间照常被处理，不回「当前任务仍在处理中」。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.conversation = FakeConversation(
+            conversation_id="cnv_busy_memory",
+            agent_session_id="ses_1",
+            running_task_id="tsk_running",
+        )
+        self.state.conversations[("usr_1", "oc_1", "")] = self.conversation
+
+    def test_memory_list_during_busy_is_processed_not_deflected(self) -> None:
+        outcome = self.build().handle_message(message(text="/memory list"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertNotEqual(
+            replies[0]["text"], BUSY_HINT_TEXT, "/memory 不受忙碌判定拦截"
+        )
+
+    def test_memory_remember_during_busy_still_writes(self) -> None:
+        outcome = self.build().handle_message(
+            message(text="/memory remember term_mapping k => v"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(len(self.state.user_memory.get("usr_1", [])), 1)
+        self.assertEqual(len(self.state.tasks), 0, "/memory 不是问数任务，不入队")
+
+
 if __name__ == "__main__":
     unittest.main()

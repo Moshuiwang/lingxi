@@ -427,6 +427,25 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 表本 revision 只新增列与约束，前滚兼容；`downgrade()` 未在任何环境验证过真实
 回滚（本 revision 未在任何环境应用过）。
 
+## `0076_user_memory`（用户记忆表：显式登记式术语映射 / 口径偏好 / 惯例模板）
+
+[Issue #357](https://github.com/Moshuiwang/lingxi/issues/357) S-H3-3（D1 范围）。
+新建 `user_memory` 表：用户通过 `/memory remember` 显式登记的术语映射/口径偏好/
+惯例模板三类记忆，`(user_id, memory_type, memory_key)` 唯一索引，重复登记即更新，
+不堆历史行；硬 `DELETE` 语义（无 `entry_status`/软删除），与 `resume_user`「不
+恢复已清正文」的既有语义（`V-管理-39`）保持一致。
+
+**down_revision 与文件名编号不连续，如实登记**：本 revision 实际链在
+`0073_pending_action_perm_types`（真实链头，`check_alembic_revisions.py` 核实）
+之后，不是本卡设计蓝图原先假定的 `0075_progress_event_content`——`0072`–`0075`
+四个文件名编号与它们在链上的真实先后顺序本就不一致（`...0071 → 0075 → 0074 →
+0072 → 0073`）。取下一个未使用的文件名编号 `0076` 保持命名单调递增，具体理由见
+迁移文件头部。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，不存在需要回填的历史值
+（本 revision 未在任何环境应用过）。**不可回滚前置条件同 `0072`/`0073`**：一旦
+部署环境写入过真实用户记忆，`DROP TABLE` 是不可逆的数据丢失，不是无损回滚。
+
 ## `0077_onboarding_failure_reason`（开通失败原因落库）
 
 [Issue #337](https://github.com/Moshuiwang/lingxi/issues/337)（Trace #373 S-H3-1）。
@@ -435,10 +454,11 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 才能拿到的失败原因；不是 S9 那张大而全的 `audit_event` 表，判据与写入方/幂等
 策略见迁移文件头部完整说明。
 
-**`down_revision` 实测订正**（本 revision 文件头部同一说明的摘要）：链的真实拓扑
-是`...0071 → 0075 → 0074 → 0072 → 0073`（头），文件名数字不是合并顺序；本 revision
-因此以实测的真实头 `0073_pending_action_perm_types` 为 `down_revision`，不是按
-文件名数字假设的 `0075`。
+**`down_revision` 两次订正，如实登记**：实施时先以实测真实链头
+`0073_pending_action_perm_types`（不是按文件名数字假设的 `0075`，真实拓扑
+`...0071 → 0075 → 0074 → 0072 → 0073`）为 `down_revision`；同批 `0076_user_memory`
+先行合入后，编排者在合并队列按既定次序把本 revision 改链至 `0076_user_memory`
+（当前值）。
 
 表本 revision 新增，前滚兼容；`downgrade()` 直接删表，是数据丢失操作（一旦部署
 环境写过失败原因，`DROP TABLE` 会把它们连同表一起清空），不存在需要回填的历史值
