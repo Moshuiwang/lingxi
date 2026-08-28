@@ -291,6 +291,12 @@ REQUIRED_MODULES = (
     "lingxi.apps.worker.report",
     "lingxi.apps.worker.turn",
     "lingxi.apps.worker.service",
+    # Trace #358 S-H-2（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：8 个
+    # 报告字段提取纯函数从 service.py 搬出。`service.py` 顶部**模块级** import
+    # 本模块，`apps/worker/cli.py` 也直接 `from .service import
+    # _load_task_system_prompt`（经 service.py re-export），漏登记会让两条
+    # 路径都装不上。
+    "lingxi.apps.worker.report_extraction",
     "lingxi.apps.worker.session_cleanup",
     "lingxi.apps.worker.__main__",
     # S4 前半（#57）新增的 gateway 进程与它的会话领域包。core/conversation/ 是
@@ -741,6 +747,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.worker.report",
             "lingxi.apps.worker.turn",
             "lingxi.apps.worker.service",
+            # Trace #358 S-H-2 纯移动拆分：`service.py` 顶部**模块级** import
+            # 本模块（理由见 REQUIRED_MODULES 同名条目）。
+            "lingxi.apps.worker.report_extraction",
             "lingxi.apps.worker.session_cleanup",
             "lingxi.apps.liveness",
             "lingxi.apps.healthcheck",
