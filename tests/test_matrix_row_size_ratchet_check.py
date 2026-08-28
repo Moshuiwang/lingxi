@@ -1,0 +1,341 @@
+"""`scripts/ci/check_matrix_row_size_ratchet.py` 的解析与判定用例（Issue #335）。
+
+跟 ``test_size_ratchet_check.py``/``test_acceptance_matrix_check.py`` 同一惯例：
+每个用例先构造一份会违规的输入，断言它被具体地拒绝，而不是只跑一遍真实矩阵看它
+绿——一份只会通过的检查等于没有检查。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPT = Path(__file__).parents[1] / "scripts" / "ci" / "check_matrix_row_size_ratchet.py"
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("matrix_row_size_ratchet_check_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+CHECK = _load_script()
+
+
+def matrix_document(rows: str, *, extra_table: str = "") -> str:
+    """构造一份最小合法矩阵文档：一张 MATRIX_HEADER 表 + 可选的额外表格。"""
+
+    return (
+        "# 产品验收矩阵\n\n"
+        "> 状态：测试夹具。\n\n"
+        "## 一、关键机制验收矩阵\n\n"
+        "| # | 可验证断言 | 层级 | 状态 |\n"
+        "|---|---|---|---|\n"
+        f"{rows}"
+        f"{extra_table}"
+    )
+
+
+class BaselineParsingTest(unittest.TestCase):
+    def test_good_baseline_parses(self) -> None:
+        text = "# 注释行\n\n11485\tV-权限-15\n2840\tV-开通-19\n"
+        self.assertEqual(
+            CHECK.parse_baseline(text),
+            {"V-权限-15": 11485, "V-开通-19": 2840},
+        )
+
+    def test_malformed_row_fails_closed(self) -> None:
+        with self.assertRaises(CHECK.BaselineError):
+            CHECK.parse_baseline("not-a-number\tV-开通-19\n")
+
+    def test_missing_tab_fails_closed(self) -> None:
+        with self.assertRaises(CHECK.BaselineError):
+            CHECK.parse_baseline("2840 V-开通-19\n")
+
+    def test_duplicate_identifier_fails_closed(self) -> None:
+        with self.assertRaises(CHECK.BaselineError):
+            CHECK.parse_baseline("100\tV-开通-19\n200\tV-开通-19\n")
+
+    def test_invalid_identifier_fails_closed(self) -> None:
+        with self.assertRaises(CHECK.BaselineError):
+            CHECK.parse_baseline("100\t不是断言编号\n")
+
+
+class RenderRoundTripTest(unittest.TestCase):
+    def test_render_then_parse_round_trips(self) -> None:
+        entries = {"V-开通-19": 2840, "V-权限-15": 11485}
+        rendered = CHECK.render_baseline(entries)
+        self.assertEqual(CHECK.parse_baseline(rendered), entries)
+
+
+class AssertionRowParsingTest(unittest.TestCase):
+    """断言行解析：只认 MATRIX_HEADER 表下、编号格是合法 V-* 编号的行。"""
+
+    def test_row_under_matrix_header_is_measured(self) -> None:
+        text = matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n")
+        current = CHECK.measure_rows(text)
+        self.assertIn("V-开通-01", current)
+        expected_bytes = len(
+            "| V-开通-01 | 一句判定 | L2（真库） | 已认领 |".encode("utf-8")
+        )
+        self.assertEqual(current["V-开通-01"], expected_bytes)
+
+    def test_row_under_a_different_table_header_is_ignored(self) -> None:
+        """表头不是 MATRIX_HEADER 的表格（例如合同覆盖清单）不参与丈量，
+        即使某一格文本里出现 V-* 字样也不会被误当成断言行。"""
+
+        extra = (
+            "\n### 覆盖清单\n\n"
+            "| 合同章节 | 对应断言 | 说明 |\n"
+            "|---|---|---|\n"
+            "| 首次对话 | V-开通-01…03 | — |\n"
+        )
+        text = matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n", extra_table=extra)
+        current = CHECK.measure_rows(text)
+        self.assertEqual(set(current), {"V-开通-01"})
+
+    def test_row_inside_fenced_code_block_is_ignored(self) -> None:
+        text = matrix_document(
+            "```\n"
+            "| V-开通-99 | 示例，不是真实登记 | L2 | 已认领 |\n"
+            "```\n"
+        )
+        current = CHECK.measure_rows(text)
+        self.assertEqual(current, {})
+
+    def test_row_missing_from_matrix_header_table_is_ignored_even_if_it_looks_like_one(self) -> None:
+        """编号格开头是 V- 但所在表没有 MATRIX_HEADER 表头：本检查不认，
+        这类问题由 check_acceptance_matrix.py 负责判红，本检查不重复也不漏。"""
+
+        text = (
+            "# 产品验收矩阵\n\n"
+            "| 编号 | 说明 |\n"
+            "|---|---|\n"
+            "| V-开通-01 | 表头不对，不是合法矩阵行 |\n"
+        )
+        current = CHECK.measure_rows(text)
+        self.assertEqual(current, {})
+
+    def test_duplicate_identifier_across_two_rows_takes_the_larger_byte_count(self) -> None:
+        """按行独立计的防御性兜底：同一编号出现两行时，取较大字节数代表该编号，
+        确保任意一行超标都会被抓到，不被同编号下的短行掩盖（见模块文档字符串）。"""
+
+        short_row = "| V-开通-01 | 短 | L2 | 已认领 |\n"
+        long_row = "| V-开通-01 | " + ("很长的裁定沿革" * 40) + " | L2 | 已认领 |\n"
+        current = CHECK.measure_rows(matrix_document(short_row + long_row))
+        self.assertEqual(
+            current["V-开通-01"],
+            max(len(short_row.rstrip("\n").encode("utf-8")), len(long_row.rstrip("\n").encode("utf-8"))),
+        )
+
+
+class EvaluateTest(unittest.TestCase):
+    """核心判定逻辑：不依赖磁盘，直接喂 (baseline, current) 字典。"""
+
+    def test_growth_beyond_recorded_ceiling_is_rejected(self) -> None:
+        baseline = {"V-权限-15": 11485}
+        current = {"V-权限-15": 11486}
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(any("超过棘轮基线记录的上限" in f for f in failures), failures)
+
+    def test_shrinking_below_recorded_ceiling_is_rejected_until_refreshed(self) -> None:
+        baseline = {"V-权限-15": 11485}
+        current = {"V-权限-15": 9000}
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(any("与实测" in f and "不一致" in f for f in failures), failures)
+
+    def test_exact_match_passes(self) -> None:
+        baseline = {"V-权限-15": 11485}
+        current = {"V-权限-15": 11485}
+        self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_new_row_crossing_threshold_unregistered_is_rejected(self) -> None:
+        baseline: dict[str, int] = {}
+        current = {"V-开通-01": CHECK.THRESHOLD_BYTES + 1}
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(any("新超过单行体量棘轮阈值" in f for f in failures), failures)
+
+    def test_row_exactly_at_threshold_and_unregistered_passes(self) -> None:
+        baseline: dict[str, int] = {}
+        current = {"V-开通-01": CHECK.THRESHOLD_BYTES}
+        self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_row_under_threshold_and_unregistered_passes(self) -> None:
+        baseline: dict[str, int] = {}
+        current = {"V-开通-01": 42}
+        self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_deleted_identifier_leaving_baseline_is_not_a_failure(self) -> None:
+        """断言编号已经不在矩阵里（删除/改名）：棘轮的目的已经达成，不强制立即刷新。"""
+
+        baseline = {"V-权限-15": 11485}
+        current: dict[str, int] = {}
+        self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_manually_inflating_the_baseline_without_touching_the_row_is_rejected(self) -> None:
+        baseline = {"V-权限-15": 99999}
+        current = {"V-权限-15": 11485}
+        failures = CHECK.evaluate(baseline, current)
+        self.assertTrue(any("与实测" in f and "不一致" in f for f in failures), failures)
+
+
+class TotalSizeNoticeTest(unittest.TestCase):
+    """总量触发线：只提示、不卡红——本类断言提示内容本身，
+    RunCheckDoesNotBlockOnTotalTriggerTest 断言 run_check() 的退出码不受影响。"""
+
+    def test_below_both_trigger_lines_reports_plain_status(self) -> None:
+        text = "短文档\n" * 3
+        notice = CHECK.render_total_size_notice(text)
+        self.assertIn("未触及分册触发线", notice)
+        self.assertNotIn("下一次改动", notice)  # 该句只出现在触线横幅里
+        self.assertNotIn("\n", notice)  # 未触线是单行状态，不是多行横幅
+
+    def test_over_byte_trigger_reports_banner(self) -> None:
+        text = "字" * (CHECK.TOTAL_BYTES_TRIGGER // 3 + 10)  # 每个汉字 3 字节，确保过线
+        notice = CHECK.render_total_size_notice(text)
+        self.assertIn("分册", notice)
+        self.assertIn("提示", notice)
+
+    def test_over_line_trigger_reports_banner(self) -> None:
+        text = "\n".join(f"行{i}" for i in range(CHECK.TOTAL_LINES_TRIGGER + 1))
+        notice = CHECK.render_total_size_notice(text)
+        self.assertIn("分册", notice)
+        self.assertIn("提示", notice)
+
+
+class RunCheckDoesNotBlockOnTotalTriggerTest(unittest.TestCase):
+    """行为级验证：即便总量触线，只要单行棘轮本身没有违规，run_check() 仍必须
+    退出 0——这是「非阻断」这条规则唯一真正生效的地方，字符串提示本身不够。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.matrix_path = root / "matrix.md"
+        self.baseline_path = root / "baseline.txt"
+
+        self._orig_matrix = CHECK.MATRIX_DOCUMENT
+        self._orig_baseline = CHECK.BASELINE_PATH
+        CHECK.MATRIX_DOCUMENT = self.matrix_path
+        CHECK.BASELINE_PATH = self.baseline_path
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        CHECK.MATRIX_DOCUMENT = self._orig_matrix
+        CHECK.BASELINE_PATH = self._orig_baseline
+
+    def test_total_over_line_trigger_with_clean_rows_still_exits_zero(self) -> None:
+        rows = "".join(
+            f"| V-开通-{index:02d} | 一句判定 | L2（真库） | 已认领 |\n" for index in range(1, 3)
+        )
+        # 用大量非表格正文行把总行数推过 1500 行触发线，行内容本身与断言无关。
+        padding = "\n".join(f"填充说明第 {i} 行。" for i in range(CHECK.TOTAL_LINES_TRIGGER + 5))
+        text = matrix_document(rows) + "\n" + padding + "\n"
+        self.matrix_path.write_text(text, encoding="utf-8")
+        self.baseline_path.write_text(CHECK.render_baseline({}), encoding="utf-8")
+
+        self.assertGreater(len(text.splitlines()), CHECK.TOTAL_LINES_TRIGGER)
+        exit_code = CHECK.run_check()
+        self.assertEqual(exit_code, 0)
+
+
+class RunRefreshClassificationTest(unittest.TestCase):
+    """``run_refresh`` 只挡「超过上限」与「新行未登记」两类失败，放行
+    「基线记录 > 实测」（那正是它该修的陈旧记录）——与 check_size_ratchet.py 的
+    run_refresh 同一纪律（见该脚本模块文档字符串 B1 回归教训）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.matrix_path = root / "matrix.md"
+        self.baseline_path = root / "baseline.txt"
+
+        self._orig_repository_root = CHECK.REPOSITORY_ROOT
+        self._orig_matrix = CHECK.MATRIX_DOCUMENT
+        self._orig_baseline = CHECK.BASELINE_PATH
+        # evaluate() 在报「新超过阈值」失败时会算 BASELINE_PATH.relative_to
+        # (REPOSITORY_ROOT) 来拼提示文案；一并打桩成同一棵临时目录，否则真实
+        # 仓库根与临时 BASELINE_PATH 不在同一棵树下会直接抛 ValueError。
+        CHECK.REPOSITORY_ROOT = root
+        CHECK.MATRIX_DOCUMENT = self.matrix_path
+        CHECK.BASELINE_PATH = self.baseline_path
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        CHECK.REPOSITORY_ROOT = self._orig_repository_root
+        CHECK.MATRIX_DOCUMENT = self._orig_matrix
+        CHECK.BASELINE_PATH = self._orig_baseline
+
+    def _row(self, identifier: str, filler_char: str, filler_count: int) -> str:
+        return f"| {identifier} | {filler_char * filler_count} | L2 | 已认领 |\n"
+
+    def test_refresh_lowers_a_shrunk_entry(self) -> None:
+        row = self._row("V-开通-01", "长", 300)  # 仍超 800B 阈值，但比下面登记的旧上限小
+        text = matrix_document(row)
+        actual_bytes = CHECK.measure_rows(text)["V-开通-01"]
+        self.assertGreater(actual_bytes, CHECK.THRESHOLD_BYTES)  # 夹具自检：这条用例测「调低」不是「移除」
+        self.matrix_path.write_text(text, encoding="utf-8")
+        self.baseline_path.write_text(
+            CHECK.render_baseline({"V-开通-01": actual_bytes + 500}), encoding="utf-8"
+        )
+
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-开通-01": actual_bytes})
+
+    def test_refresh_removes_an_entry_that_shrank_below_threshold(self) -> None:
+        row = self._row("V-开通-01", "短", 3)
+        self.matrix_path.write_text(matrix_document(row), encoding="utf-8")
+        self.baseline_path.write_text(CHECK.render_baseline({"V-开通-01": 2000}), encoding="utf-8")
+
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {})
+
+    def test_refresh_refuses_when_an_unregistered_row_newly_crosses_threshold(self) -> None:
+        registered_row = self._row("V-开通-01", "短", 3)
+        new_giant_row = self._row("V-开通-02", "巨", 400)  # 远超 800B，未登记
+        self.matrix_path.write_text(matrix_document(registered_row + new_giant_row), encoding="utf-8")
+        self.baseline_path.write_text(CHECK.render_baseline({"V-开通-01": 2000}), encoding="utf-8")
+
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 1)
+        # 拒绝时不得动基线文件——既有的合法收紧也不该被这次失败连累着丢失。
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-开通-01": 2000})
+
+    def test_refresh_refuses_when_a_registered_row_grew_past_its_ceiling(self) -> None:
+        grown_row = self._row("V-开通-01", "长", 400)
+        self.matrix_path.write_text(matrix_document(grown_row), encoding="utf-8")
+        self.baseline_path.write_text(CHECK.render_baseline({"V-开通-01": 50}), encoding="utf-8")
+
+        exit_code = CHECK.run_refresh()
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-开通-01": 50})
+
+
+class RealBaselineIsHonestTest(unittest.TestCase):
+    """反向验证：仓库里已经提交的基线文件与真实矩阵文档必须诚实（记录值与实测
+    精确相等），且脚本对当前真实矩阵实跑必须是绿——与 test_size_ratchet_check.py
+    的 RealBaselineIsHonestTest 同一惯例。"""
+
+    def test_committed_baseline_matches_actual_row_byte_counts(self) -> None:
+        baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
+        current = CHECK.measure_rows(CHECK.read_matrix_text())
+        self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_committed_baseline_entries_are_all_valid_assertion_identifiers(self) -> None:
+        baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
+        for identifier in baseline:
+            self.assertRegex(identifier, CHECK.ASSERTION_ID.pattern)
+
+    def test_run_check_passes_against_the_real_repository_matrix(self) -> None:
+        self.assertEqual(CHECK.run_check(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
