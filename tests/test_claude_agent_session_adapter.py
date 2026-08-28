@@ -127,7 +127,10 @@ class _StubSDK(unittest.TestCase):
     calls: dict = {}
 
     def setUp(self) -> None:
-        self.calls = {"clients": [], "prompts": [], "closed": 0}
+        self.calls = {"clients": [], "prompts": [], "closed": 0, "mcp_status": 0}
+        # MCP 会话级连接失败审计（Issue #349 剩余范围）：默认返回值形状对齐真实
+        # SDK 的 ``McpStatusResponse``（``{"mcpServers": [...]}``），测试按需覆盖。
+        self.mcp_status: object = {"mcpServers": []}
         outer = self
 
         class StubClient:
@@ -148,6 +151,10 @@ class _StubSDK(unittest.TestCase):
             async def receive_response(self):
                 for message in outer.messages:
                     yield message
+
+            async def get_mcp_status(self):
+                outer.calls["mcp_status"] += 1
+                return outer.mcp_status
 
         module = types.ModuleType("claude_agent_sdk")
         module.HookMatcher = StubHookMatcher
@@ -647,6 +654,96 @@ class LocalInterruptCausalityTest(_StubSDK):
         )
 
         self.assertEqual(marks, [])
+
+
+class McpStatusProbeTest(_StubSDK):
+    """建连后 ``get_mcp_status()`` 的单次拉取（Issue #349 剩余范围，Gate G-2 结论
+    A）。本模块"只做形状转换"：这里只证明本侧接线（调用一次、原样转发、异常不
+    传播），不证明真实 SDK 会不会真的返回这些状态——那是 L4a 的职责。"""
+
+    def test_probe_fires_once_after_aenter_and_passes_the_raw_dict_through(self) -> None:
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [StubResultMessage()]
+        self.mcp_status = {
+            "mcpServers": [{"name": "query", "status": "failed", "error": "boom"}]
+        }
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+        seen_status: list = []
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=lambda event: None,
+                timeout_seconds=30,
+                on_mcp_status=seen_status.append,
+            )
+        )
+
+        self.assertEqual(self.calls["mcp_status"], 1)
+        self.assertEqual(seen_status, [self.mcp_status])
+        # 原样转发：不是深拷贝也不是重新构造，本层不解读、不改写任何字段。
+        self.assertIs(seen_status[0], self.mcp_status)
+
+    def test_no_callback_means_the_probe_is_never_called(self) -> None:
+        """回调未注入（``None``，默认值）→ 行为与改动前逐字相同：不多一次
+        control-protocol 往返。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [StubResultMessage()]
+        options = build_agent_options(self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None)
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=lambda event: None,
+                timeout_seconds=30,
+            )
+        )
+
+        self.assertEqual(self.calls["mcp_status"], 0)
+
+    def test_get_mcp_status_failure_does_not_fail_the_turn_and_is_traced(self) -> None:
+        """``get_mcp_status()`` 自身异常不得让回合失败：包住、经既有 ``options.
+        stderr`` 通道留痕后继续——观测缺口修复不能反过来制造新的故障面。"""
+
+        from lingxi.adapters.claude_agent_session import build_agent_options, run_single_turn
+
+        self.messages = [StubAssistantMessage([StubTextBlock("日活 1024。")]), StubResultMessage()]
+        module = sys.modules["claude_agent_sdk"]
+
+        class FailingMcpStatusClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def get_mcp_status(self):
+                raise RuntimeError("probe boom")
+
+        module.ClaudeSDKClient = FailingMcpStatusClient
+        stderr_lines: list = []
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=stderr_lines.append
+        )
+        seen: list = []
+        callback_calls: list = []
+
+        asyncio.run(
+            run_single_turn(
+                options=options,
+                prompt="问题",
+                sink=seen.append,
+                timeout_seconds=30,
+                on_mcp_status=callback_calls.append,
+            )
+        )
+
+        # 回合本身正常收口：消息流照常被处理，异常没有从这次探针"漏"到业务路径。
+        self.assertEqual([event["kind"] for event in seen], ["assistant_message", "result"])
+        self.assertEqual(callback_calls, [], "探针失败时不应该拿到任何伪造的状态")
+        self.assertTrue(
+            any("get_mcp_status probe failed" in line for line in stderr_lines),
+            "探针异常必须经既有 stderr 通道留痕，不能静默吞掉",
+        )
 
 
 if __name__ == "__main__":

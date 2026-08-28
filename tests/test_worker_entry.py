@@ -169,6 +169,7 @@ class FakeAgentSDK:
         skip_pre_tool_use: bool = False,
         resume_miss_stderr_line: str | None = None,
         resume_miss_persists: bool = False,
+        mcp_status: dict | None = None,
     ) -> None:
         self.script = list(script)
         self.options = []
@@ -204,6 +205,13 @@ class FakeAgentSDK:
         # 场景——前者验证降级只发生一次，后者验证没有 resume 就不会进入降级
         # 分支，即使特征信号照样出现。
         self.resume_miss_persists = resume_miss_persists
+        # MCP 会话级连接失败审计（Issue #349 剩余范围，Gate G-2 结论 A）：默认
+        # 「没有配置任何 MCP server」这个最贴近现状的空载荷，与改动前的行为
+        # 逐字等价——没有 server 就没有 failed/needs-auth，`_audit_mcp_status`
+        # 不发任何事件，因此本仓库全部既有用例（含 F-1 熔断用例）不需要因为
+        # 这次改动而改写任何既有断言。要断言审计事件的新用例显式传入非空值。
+        self.mcp_status: dict = mcp_status if mcp_status is not None else {"mcpServers": []}
+        self.mcp_status_calls = 0
 
     def install(self, testcase) -> "FakeAgentSDK":
         module = types.ModuleType("claude_agent_sdk")
@@ -254,6 +262,10 @@ class FakeAgentSDK:
                 ):
                     return harness._play_resume_miss(self.options)
                 return harness._play(self.options)
+
+            async def get_mcp_status(self):
+                harness.mcp_status_calls += 1
+                return harness.mcp_status
 
         return StubClient
 
@@ -2672,6 +2684,173 @@ class WrapperDenialFuseWiringTest(unittest.TestCase):
         report = asyncio.run(scenario())
 
         self.assertEqual(report["failure"]["code"], "interrupted")
+
+
+class McpStatusAuditTest(unittest.TestCase):
+    """MCP 会话级连接失败审计埋点（Issue #349 剩余范围，Trace #358 S-F-2，Gate G-2
+    结论 A：直接埋点）。
+
+    与本文件其余用例同一姿态：假 SDK 只能证明"本侧装配是通的"——`get_mcp_status()`
+    真的会在真实链路上返回什么、CLI 版本是否支持这个 control subtype，只有
+    `biai-stage` 的 L4a 能答（见 Gate G-2 结论的"实现前需补验的边界"）。
+    """
+
+    def _run(self, *, mcp_status: dict, task_id: str | None = "tsk-mcp-1"):
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        fake = FakeAgentSDK(
+            [{"kind": "text", "text": "日活 1024。"}], mcp_status=mcp_status
+        ).install(self)
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id=task_id))
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.mcp_server_unavailable"]
+        return report, fake, events
+
+    def test_mixed_statuses_emit_exactly_one_event_per_failed_or_needs_auth_server(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "connected"},
+                    {"name": "billing", "status": "failed", "error": "connection refused"},
+                    {"name": "roster", "status": "needs-auth", "error": "token expired"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1, "同一回合只应该查一次 MCP 状态，不轮询")
+        self.assertEqual(len(events), 2)
+        by_server = {event["server"]: event for event in events}
+        self.assertEqual(by_server["billing"]["status"], "failed")
+        self.assertEqual(by_server["billing"]["error"], "connection refused")
+        self.assertEqual(by_server["roster"]["status"], "needs-auth")
+        self.assertEqual(by_server["roster"]["error"], "token expired")
+        for event in events:
+            self.assertEqual(event["task_id"], "tsk-mcp-1")
+            self.assertEqual(event["trace_id"], "01J0000000000000000TEST000")
+            self.assertEqual(event["level"], "warning")
+
+    def test_all_connected_servers_emit_zero_events(self) -> None:
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "connected"},
+                    {"name": "billing", "status": "connected"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(events, [])
+
+    def test_pending_and_disabled_are_not_treated_as_failures(self) -> None:
+        """G-2 已知边界：`pending`（慢连接、`__aenter__()` 返回时还没到终态）与
+        `disabled`（部署/用户主动关闭）都不是故障态，不得被计入
+        ``mcp_server_unavailable``——判定只认 `failed`/`needs-auth` 两种。"""
+
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "slow", "status": "pending"},
+                    {"name": "off", "status": "disabled"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(events, [])
+
+    def test_error_text_carries_no_credential_shaped_content(self) -> None:
+        """范围红线：审计事件不含任何凭据形状字段——error 文本经既有脱敏规则
+        （与 `WorkerOutputRedactionTest` 同一条 `redact_free_text` 底线）。"""
+
+        report, _fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "billing", "status": "failed", "error": f"token={FAKE_CREDENTIAL}"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(FAKE_CREDENTIAL, events[0]["error"])
+        # 变异锚点：把发送字段从「name/status/error」扩成整份 server dict 会带上
+        # `config`/`tools`/`serverInfo`；这条断言钉住事件里只有这三个业务字段
+        # （加上通用的 trace_id/level/event/task_id），不会顺带带出别的键。
+        self.assertEqual(
+            set(events[0]) - {"trace_id", "level", "event", "task_id"},
+            {"server", "status", "error"},
+        )
+
+    def test_missing_or_malformed_status_shapes_are_ignored_not_guessed(self) -> None:
+        """``get_mcp_status()`` 形状不对时如实什么都不做，不猜测——与本仓库
+        "护栏要收紧的是命中了却被当成成功，不是形状可疑就一律判失败"同一纪律。"""
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+
+        for malformed in (
+            None,
+            {},
+            {"mcpServers": "not-a-list"},
+            "unexpected",
+            {"mcpServers": [1, 2, "not-a-dict"]},
+            {"mcpServers": [{"status": "failed"}]},  # 缺 name，仍然应该发事件但 server=None
+        ):
+            with self.subTest(malformed=malformed):
+                executor._audit_mcp_status(malformed)
+
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.mcp_server_unavailable"]
+        # 唯一应该产出事件的输入是最后一档（合法 server 记录只是缺 name）。
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["server"])
+        self.assertEqual(events[0]["status"], "failed")
+
+    def test_get_mcp_status_raising_does_not_fail_the_turn_and_leaves_a_trace(self) -> None:
+        """``get_mcp_status()`` 自身异常不得让回合失败（观测缺口修复不能反过来
+        制造新的故障面）；异常经既有 stderr 通道（`worker.sdk.stderr`）留痕。"""
+
+        FakeAgentSDK([{"kind": "text", "text": "日活 1024。"}]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        base_client = module.ClaudeSDKClient
+
+        class FailingMcpStatusClient(base_client):  # type: ignore[misc, valid-type]
+            async def get_mcp_status(self):
+                raise RuntimeError("mcp status probe boom")
+
+        module.ClaudeSDKClient = FailingMcpStatusClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-err"))
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        sdk_stderr_lines = [line for line in lines if line["event"] == "worker.sdk.stderr"]
+        self.assertTrue(
+            any("get_mcp_status probe failed" in line.get("line", "") for line in sdk_stderr_lines),
+            "探针异常必须经既有 worker.sdk.stderr 通道留痕",
+        )
+        self.assertFalse(
+            any(line["event"] == "worker.mcp_server_unavailable" for line in lines),
+            "探针失败时不应该伪造任何 server 的审计事件",
+        )
 
 
 if __name__ == "__main__":

@@ -156,6 +156,7 @@ async def run_single_turn(
     clock: Callable[[], float] | None = None,
     on_business_duration: Callable[[float], None] | None = None,
     on_interrupt_requested: Callable[[], None] | None = None,
+    on_mcp_status: Callable[[Any], None] | None = None,
 ) -> None:
     """跑**一个**回合：建会话、发一次提问、把消息流规范化后交给 ``sink``。
 
@@ -176,6 +177,13 @@ async def run_single_turn(
     失败；没有这个回调，同一件事只能靠"有人 stop 过 + SDK 自报 abort"反推因果，
     而 ``aborted_*`` 在无人 stop 时也会出现，反推会把真实的 SDK 终止失败改写成
     "已停止"（PR #198 一级独立审查 P1-2 裁定）。
+
+    ``on_mcp_status``（Issue #349，Gate G-2 结论 A）在建连（``__aenter__()`` 返回）
+    之后被调用**至多一次**，参数是 ``client.get_mcp_status()`` 的原始返回值——
+    本层不解读其中任何一个字段，判定（哪些 server 算故障、要不要发审计事件）在
+    ``apps/worker/turn.py``，与本模块"只做形状转换"的既有约定一致。不传时（或
+    ``get_mcp_status()`` 本身失败时）不影响本函数其余行为，见 ``_probe_mcp_
+    status`` 的说明。
     """
 
     from claude_agent_sdk import ClaudeSDKClient
@@ -203,6 +211,8 @@ async def run_single_turn(
             async with asyncio.timeout(timeout_seconds):
                 await client.__aenter__()
                 entered = True
+                if on_mcp_status is not None:
+                    await _probe_mcp_status(client, session_options, on_mcp_status)
                 interrupted = asyncio.Event()
 
                 async def interrupt_when_requested() -> None:
@@ -266,6 +276,38 @@ async def run_single_turn(
                     raise DrainTimeoutError(
                         f"会话收尾超过独立宽限 {drain_grace_seconds:g} 秒"
                     ) from None
+
+
+async def _probe_mcp_status(
+    client: Any, options: Any, on_mcp_status: Callable[[Any], None]
+) -> None:
+    """建连后查一次 MCP server 连接状态，原样交给调用方（Issue #349，Gate G-2）。
+
+    **只查一次，不轮询**：G-2 的独立探针（`__aenter__()` 一返回即为终态、3 秒后
+    复查不变；SDK `initialize` 握手本身已经等待 MCP 首连结果）证实固定版 SDK+CLI
+    下建连返回时状态已经是终态。**已知边界**（G-2 登记、未覆盖）：探针端点都是
+    "立即失败"型，真实链路里"慢连接"时 `__aenter__()` 返回时可能仍是
+    ``pending``——这种情况下这次查询会如实报告 ``pending``，本层与上层都不会把它
+    误判成故障（判定只认 ``failed``/``needs-auth``，见 ``apps/worker/turn.py``），
+    但也观察不到它之后是否变成 ``failed``。真的需要覆盖这条时序，需要另外加一次
+    收尾前的复查——本次实现按 G-2 结论范围不做。
+
+    ``get_mcp_status()`` 自身的异常不得让整个回合失败（观测缺口修复不能反过来
+    制造新的故障面）：这里包住它，经**已经接在 ``options.stderr`` 上的既有 stderr
+    通道**留一条痕迹再继续，不新开一条落点——``options.stderr`` 就是
+    ``build_agent_options(..., stderr_sink=...)`` 传入的那个回调（调用方通常是
+    ``WorkerTurnExecutor._sdk_stderr_sink``，最终落 ``worker.sdk.stderr`` 结构化
+    审计行），本来就是"这次会话的诊断文本出口"，不是只服务子进程 stderr 一种来源。
+    """
+
+    try:
+        status = await client.get_mcp_status()
+    except Exception as error:  # noqa: BLE001 - 决不能让观测探针拖垮整个回合
+        stderr_sink = getattr(options, "stderr", None)
+        if callable(stderr_sink):
+            stderr_sink(f"get_mcp_status probe failed: {type(error).__name__}: {error}")
+        return
+    on_mcp_status(status)
 
 
 def normalize_message(message: Any) -> tuple[dict[str, Any], ...]:

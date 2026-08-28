@@ -50,6 +50,13 @@ from .report import build_report
 
 _MAX_FAILURE_TEXT = 500
 
+# MCP 会话级连接失败审计（2026-08-28，Issue #349 剩余范围，Gate G-2 结论 A）：
+# 只有这两种状态是明确的故障态，值得响亮告警——`pending`（G-2 已知边界：慢连接
+# 时建连返回时可能还没到终态，不是失败）、`disabled`（用户/部署主动关闭，不是
+# 故障）、`connected`（正常）都不触发。判定只在这一层，`adapters/claude_agent_
+# session.py` 只转发 SDK 原始 dict，不含任何判定逻辑（该模块既有约定）。
+_MCP_UNAVAILABLE_STATUSES = frozenset({"failed", "needs-auth"})
+
 # 会话 resume 失配的特征串（2026-08-27 生产事故 #2）：worker 容器 HOME=/tmp，
 # CLI 会话文件随容器重建消失，但 conversation.agent_session_id 仍留在库里——
 # 部署后每个活跃会话的下一条消息都会尝试 resume 一个已经不存在的会话。真实 CLI
@@ -343,6 +350,62 @@ class WorkerTurnExecutor:
         self._stderr_stream.write("\n")
         self._stderr_stream.flush()
 
+    def _audit_mcp_status(self, status: object, *, task_id: str | None = None) -> None:
+        """把建连后的 MCP server 状态转成响亮的审计事件（Issue #349，Gate G-2 结论 A）。
+
+        ``status`` 是适配器原样转发的 ``client.get_mcp_status()`` 返回值（SDK
+        形状：``{"mcpServers": [{"name": ..., "status": ..., "error": ...}, ...]}``），
+        形状不对时如实什么都不做，不猜测——与 ``apps/worker/service.py`` 里
+        ``_protocol_breakdown_reasons`` 那类"形状不对就返回空、不当成命中"的
+        写法同一纪律。
+
+        只对 ``_MCP_UNAVAILABLE_STATUSES``（``failed``/``needs-auth``）逐个 server
+        发一条独立的 ``worker.mcp_server_unavailable`` 审计事件（warning 级）——
+        这就是本仓库 worker 侧"计入告警面"的既有姿势：worker 进程结构上从不持有
+        飞书出站凭据，唯一的信号出口是带 ``trace_id`` 的结构化 stderr（见
+        ``apps/worker/cli.py`` 的 ``_LogOnlyAlertSender``/``_year_grounding_
+        suspect_sink`` 同一姿态的完整说明），与本文件里 ``worker.wrapper_denial_
+        fuse_tripped``（#352）、``worker.session_resume_miss``（生产事故 #2）走的
+        是同一条通道，不新开一条；调查确认 worker 侧没有到 `core/alerting.py`
+        `AlertManager` 的现成 `AlertKind`（那套只覆盖进程心跳/任务滞留，且发送
+        端一样落到这条结构化 stderr——新增 `AlertKind` 不会多打通到真实管理群
+        的一条通路，只会多一层间接），也没有到每日通报统计的现成聚合口径
+        （`core/daily_report.py` 只读 `task` 表两个专用列，不扫 stderr 事件）；
+        因此不新造聚合通道，直接复用现成的结构化 stderr 出口。
+
+        字段只含 server 名、status、error 文本三项——不包含 ``config``/``tools``/
+        ``serverInfo``（SDK 原始形状里这些字段可能带 URL、鉴权配置等凭据形状
+        内容），符合代码框架「三、横切约定」的凭据不进日志底线。``error`` 文本
+        经 ``redact_free_text`` 脱敏、按其余失败文本同一上限截断——它来自外部
+        CLI/MCP 服务，不是本进程自己构造的可信文本。
+        """
+
+        if not isinstance(status, Mapping):
+            return
+        servers = status.get("mcpServers")
+        if not isinstance(servers, (list, tuple)):
+            return
+        for server in servers:
+            if not isinstance(server, Mapping):
+                continue
+            server_status = server.get("status")
+            if server_status not in _MCP_UNAVAILABLE_STATUSES:
+                continue
+            name = server.get("name")
+            error_text = server.get("error")
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.mcp_server_unavailable",
+                server=name if isinstance(name, str) else None,
+                status=server_status,
+                error=(
+                    redact_free_text(error_text)[:_MAX_FAILURE_TEXT]
+                    if isinstance(error_text, str)
+                    else None
+                ),
+                task_id=task_id,
+            )
+
     async def run_turn(
         self,
         question: str,
@@ -472,6 +535,7 @@ class WorkerTurnExecutor:
                             clock=self._clock,
                             on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
                             on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
+                            on_mcp_status=lambda status: self._audit_mcp_status(status, task_id=task_id),
                         )
                 except AgentSessionInterrupted as error:
                     failure = _failure("interrupted", error)
