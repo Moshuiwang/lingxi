@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
@@ -210,6 +211,94 @@ class HolderTest(unittest.TestCase):
 
         self.assertFalse(holder.has_token)
         self.assertIsNone(holder.fresh(now=DAY))
+
+
+class HolderConcurrencyTest(unittest.TestCase):
+    """Issue #284 C 组 #7（Trace #373 D7 裁定修复）：``store()`` 的两行赋值与
+    ``fresh()`` 的两行读取必须共享同一把锁，不能让读者读到"新 token 配旧
+    expires_at"（或反过来）这种半更新组合——装配层把同一个持有者交给主循环线程、
+    组织快照同步的后台线程与开通链的多条工作线程并发访问（见
+    ``apps/scheduler/assembly.py`` 对 ``holder``/``supply`` 的复用）。
+
+    这里直接钉住锁行为本身（持锁时另一个调用者确实会被挡住），而不是靠真实
+    多线程竞速去撞"半更新组合"这个概率极低的窗口——那种测试要么撞不上（测不出
+    回归），要么在 CI 上偶发抖动。持锁-验证阻塞-释放-验证放行是确定性的：只要
+    锁被真的持有，另一线程对同一把锁的 ``acquire()`` 就必然阻塞，不依赖具体
+    调度时序。
+    """
+
+    def test_store_blocks_while_the_lock_is_held_by_another_caller(self) -> None:
+        holder = DerivedAccessTokenHolder()
+        holder._lock.acquire()
+        try:
+            thread = threading.Thread(target=holder.store, args=(derived(),), kwargs={"now": DAY})
+            thread.start()
+            thread.join(timeout=0.2)
+            self.assertTrue(thread.is_alive(), "store() 在锁被占用时不该能继续执行")
+        finally:
+            holder._lock.release()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive(), "释放锁之后 store() 必须能收工")
+        self.assertTrue(holder.has_token)
+
+    def test_fresh_blocks_while_the_lock_is_held_by_another_caller(self) -> None:
+        holder = DerivedAccessTokenHolder()
+        holder.store(derived(), now=DAY)
+        observed: list[object] = []
+        holder._lock.acquire()
+        try:
+            thread = threading.Thread(target=lambda: observed.append(holder.fresh(now=DAY)))
+            thread.start()
+            thread.join(timeout=0.2)
+            self.assertTrue(thread.is_alive(), "fresh() 在锁被占用时不该能继续执行")
+        finally:
+            holder._lock.release()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive(), "释放锁之后 fresh() 必须能收工")
+        self.assertEqual(len(observed), 1)
+
+    def test_clear_blocks_while_the_lock_is_held_by_another_caller(self) -> None:
+        """``clear()`` 与 ``store()``/``fresh()`` 是同一把锁——否则 ``clear()``
+        能在一次 ``store()`` 的两行赋值之间插进来，把刚写了一半的状态清掉一半。"""
+
+        holder = DerivedAccessTokenHolder()
+        holder.store(derived(), now=DAY)
+        holder._lock.acquire()
+        try:
+            thread = threading.Thread(target=holder.clear)
+            thread.start()
+            thread.join(timeout=0.2)
+            self.assertTrue(thread.is_alive(), "clear() 在锁被占用时不该能继续执行")
+        finally:
+            holder._lock.release()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(holder.has_token)
+
+
+class ProviderAuditLockTest(unittest.TestCase):
+    """Issue #284 C 组 #7（Trace #373 D7 裁定修复）：``RosterAccessTokenProvider``
+    审计去重的读改写（``_audited_on``/``_audited_reasons``）必须在锁内完成——同一个
+    供给被主循环线程、组织快照同步的后台线程与开通链的多条工作线程并发调用（见
+    ``apps/scheduler/assembly.py`` 对 ``supply`` 的复用）。形状与
+    ``HolderConcurrencyTest`` 相同：直接钉住锁行为，不靠竞速撞概率。"""
+
+    def test_record_blocks_while_the_audit_lock_is_held_by_another_caller(self) -> None:
+        holder = DerivedAccessTokenHolder()
+        provider = RosterAccessTokenProvider(holder=holder, refresh=lambda: None, clock=lambda: DAY)
+        provider._audit_lock.acquire()
+        try:
+            thread = threading.Thread(
+                target=provider._record, args=("no_credential_available", DAY)
+            )
+            thread.start()
+            thread.join(timeout=0.2)
+            self.assertTrue(thread.is_alive(), "_record() 在锁被占用时不该能继续执行")
+        finally:
+            provider._audit_lock.release()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive(), "释放锁之后 _record() 必须能收工")
+        self.assertIn("no_credential_available", provider._audited_reasons)
 
 
 # --------------------------------------------------------------------------

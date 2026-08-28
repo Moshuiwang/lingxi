@@ -443,6 +443,22 @@ class HostFileDelegatedCredentialVault:
                     return None
                 # 不做频率判据，但把当日计数原样带过去（见上方 docstring）。
                 new_supply_count = count_today
+                # **刻意**（Issue #284 C 组 #9，Trace #373 D7 裁定：登记不改行为）：
+                # 这一支下面 `payload["consumed_at"] = moment.isoformat()`（本方法
+                # 结尾统一执行）同样会推进 `consumed_at`/`refresh_consumed_at`——
+                # `for_supply=False` 的到期驱动领取与 `for_supply=True` 的按需供给
+                # 共用同一处赋值，不分叉。但 `new_supply_count` 在这一支**不递增**，
+                # 只原样带回 `count_today`。两道频率上界的口径因此不对称：
+                # `refresh_consumed_at`（最小间隔判据）对**任何一次**成功领取都推进，
+                # `refresh_consumed_count`（当日次数上界）**只统计 `for_supply=True`
+                # 那一类消费**。这是有意为之，不是遗漏——`for_supply=True` 的每日
+                # 上界（默认 100 次）要挡的是"崩溃重启循环把按需供给这条路径变成
+                # 高频源"（见模块文档「已知并接受的残留」一节），到期驱动的轮换
+                # 本身已经由自己的到期节奏（约 5.6 天一次）天然限速，不需要占用同一个
+                # 计数器的配额；把它计进去反而会让按需供给的当日上界被一次完全不相关
+                # 的到期轮换悄悄消耗掉一格。最小间隔判据（`refresh_consumed_at`）则
+                # 对两类消费一视同仁，因为它防的是"任意一次消费之后过快再消费一次"，
+                # 与是哪条路径触发的这次消费无关。
 
             payload["consumed_at"] = moment.isoformat()
             self._write_encrypted(payload)

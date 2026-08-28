@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from lingxi.adapters.feishu_directory import (
     FEISHU_RATE_LIMIT_ERROR_CODE,
     RATE_LIMIT_RETRY_BACKOFFS_SECONDS,
+    REQUEST_PAUSE_JITTER_SECONDS,
     REQUEST_PAUSE_SECONDS,
     AuthorizationExchange,
     FeishuAuthorizationClient,
@@ -1042,7 +1045,9 @@ class RequestThrottleTest(unittest.TestCase):
                 page([{"tenant_key": "tenant_c"}], key="target_tenant_list"),
             ]
         )
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")
 
@@ -1065,7 +1070,9 @@ class RequestThrottleTest(unittest.TestCase):
                 multi_page({"share_departments": [], "share_users": [{"open_user_id": "ou_1"}]}),
             ]
         )
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         client.list_share_entities(token="fake-app-token", tenant_key="tenant_a", department_id="0")
 
@@ -1076,7 +1083,9 @@ class RequestThrottleTest(unittest.TestCase):
 
         pauses: list[float] = []
         transport = RecordingTransport([{"code": 0, "data": {"target_user": {"status": {"is_activated": True}}}}])
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         client.get_member_detail(token="fake-app-token", tenant_key="tenant_a", member_id="ou_1")
 
@@ -1089,7 +1098,9 @@ class RequestThrottleTest(unittest.TestCase):
 
         pauses: list[float] = []
         transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         client.list_collaboration_tenants(token="fake-user-token")
 
@@ -1128,6 +1139,114 @@ class RequestThrottleTest(unittest.TestCase):
         real_sleep.assert_not_called()
 
 
+class RequestPauseJitterTest(unittest.TestCase):
+    """Issue #284 A 组 #3（Trace #373 D7 裁定修复）：首次开通编排的 8 条工作线程
+    共享同一个 client 实例（`apps/scheduler/onboarding.py` 的
+    `FeishuEmploymentReader`），固定停顿量会让并发调用同步醒来、在飞书那侧形成
+    尖峰。这里覆盖抖动的默认生效、可注入、可关闭三条纪律（与 `RequestThrottleTest`
+    对 `request_pause_seconds` 本身的覆盖同一个形状），外加"多条线程真的会被
+    错开"的构造性证据。"""
+
+    def test_the_default_jitter_is_a_real_margin_not_silently_off(self) -> None:
+        """默认抖动上限非零——同 REQUEST_PAUSE_SECONDS 本身"默认就生效"的
+        纪律，不靠调用方记得手动打开。"""
+
+        self.assertGreater(REQUEST_PAUSE_JITTER_SECONDS, 0)
+        self.assertEqual(REQUEST_PAUSE_JITTER_SECONDS, REQUEST_PAUSE_SECONDS / 2)
+
+    def test_an_injected_random_source_at_the_lower_edge_reproduces_the_bare_pause(self) -> None:
+        """注入恒返回 0.0 的 random_source ⇒ 停顿量退化到抖动区间下界，恰好等于
+        不带抖动的固定步长——证明抖动是**叠加**在固定步长之上，不是替换它。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, random_source=lambda: 0.0
+        )
+
+        client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS])
+
+    def test_an_injected_random_source_at_the_upper_edge_adds_the_full_jitter(self) -> None:
+        """注入恒返回 1.0 的 random_source ⇒ 停顿量落在抖动区间上界（固定步长
+        + 完整抖动上限）。"""
+
+        pauses: list[float] = []
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, random_source=lambda: 1.0
+        )
+
+        client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS + REQUEST_PAUSE_JITTER_SECONDS])
+
+    def test_zero_jitter_disables_the_random_source_entirely(self) -> None:
+        """把 ``request_pause_jitter_seconds`` 显式设成 0 ⇒ 一次都不调用
+        ``random_source``（不是调用它再乘 0），停顿量退化回固定值——与
+        ``request_pause_seconds`` 为假值时"完全不调用 sleeper"同一条纪律。"""
+
+        def _forbidden() -> float:
+            raise AssertionError("抖动关闭后不应再调用 random_source")
+
+        pauses: list[float] = []
+        transport = RecordingTransport([page([{"tenant_key": "tenant_a"}], key="target_tenant_list")])
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL,
+            transport=transport,
+            sleep=pauses.append,
+            request_pause_jitter_seconds=0,
+            random_source=_forbidden,
+        )
+
+        client.list_collaboration_tenants(token="fake-user-token")
+
+        self.assertEqual(pauses, [REQUEST_PAUSE_SECONDS])
+
+    def test_concurrent_threads_sharing_one_client_wake_up_at_different_moments(self) -> None:
+        """构造性证据：8 条线程共享同一个 client 实例（与开通执行器默认线程数
+        同一个量级，见 ``SchedulerConfig.onboarding_workers``），用一道
+        ``Barrier`` 让它们几乎同时进入节流——**默认真实随机源**下，记录到的
+        停顿量不会全部相同，证明抖动确实把"同一时刻同步醒来"的尖峰打散了。
+        （固定步长本身当然是恒定的：没有抖动时这 8 个值原本会逐字节相同。）"""
+
+        worker_count = 8
+        transport = RecordingTransport(
+            [
+                {"code": 0, "data": {"target_user": {"status": {"is_activated": True}}}}
+                for _ in range(worker_count)
+            ]
+        )
+        pauses: queue.Queue[float] = queue.Queue()
+        # 不注入假 random_source：这里就是要用生产默认（`random.random`）证明
+        # 真实随机源下确实会产生离散的停顿量，不是靠测试自己钉死的可预测序列。
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=lambda seconds: pauses.put(seconds)
+        )
+        barrier = threading.Barrier(worker_count)
+
+        def worker() -> None:
+            barrier.wait(timeout=5.0)
+            client.get_member_detail(token="fake-app-token", tenant_key="tenant_a", member_id="ou_1")
+
+        threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive(), "节流抖动测试的工作线程未能在预算内收工")
+
+        collected = [pauses.get_nowait() for _ in range(worker_count)]
+        self.assertEqual(len(collected), worker_count)
+        for value in collected:
+            self.assertGreaterEqual(value, REQUEST_PAUSE_SECONDS)
+            self.assertLess(value, REQUEST_PAUSE_SECONDS + REQUEST_PAUSE_JITTER_SECONDS)
+        # 构造性核心断言：8 个几乎同时发起的停顿量不会全部相同（无抖动时它们
+        # 原本逐字节相同——正是 A3 要解决的"同步醒来"形状）。
+        self.assertGreater(len(set(collected)), 1)
+
+
 def _rate_limited_response() -> dict[str, object]:
     """飞书业务层面的频率限制响应（``_payload`` 会把 ``code=99991400`` 渲染成
     ``FeishuDirectoryError("feishu_code_99991400")``，与
@@ -1150,7 +1269,9 @@ class RateLimitRetryTest(unittest.TestCase):
         transport = RecordingTransport(
             [_rate_limited_response(), page([{"tenant_key": "tenant_a"}], key="target_tenant_list")]
         )
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         tenants = client.list_collaboration_tenants(token="fake-user-token")
 
@@ -1166,7 +1287,9 @@ class RateLimitRetryTest(unittest.TestCase):
         pauses: list[float] = []
         attempts = len(RATE_LIMIT_RETRY_BACKOFFS_SECONDS) + 1
         transport = RecordingTransport([_rate_limited_response() for _ in range(attempts)])
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
             client.list_collaboration_tenants(token="fake-user-token")
@@ -1186,7 +1309,9 @@ class RateLimitRetryTest(unittest.TestCase):
 
         pauses: list[float] = []
         transport = RecordingTransport([{"code": 99991663, "msg": "permission denied"}])
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
             client.list_collaboration_tenants(token="fake-user-token")
@@ -1206,7 +1331,9 @@ class RateLimitRetryTest(unittest.TestCase):
         transport = RecordingTransport(
             [{"code": 0, "data": {"target_tenant_list": "not-a-list", "has_more": False}}]
         )
-        client = FeishuDirectoryClient(base_url=BASE_URL, transport=transport, sleep=pauses.append)
+        client = FeishuDirectoryClient(
+            base_url=BASE_URL, transport=transport, sleep=pauses.append, request_pause_jitter_seconds=0
+        )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
             client.list_collaboration_tenants(token="fake-user-token")
@@ -1226,6 +1353,7 @@ class RateLimitRetryTest(unittest.TestCase):
             transport=transport,
             sleep=pauses.append,
             rate_limit_retry_backoffs=(3.0,),
+            request_pause_jitter_seconds=0,
         )
 
         with self.assertRaises(FeishuDirectoryError) as raised:
