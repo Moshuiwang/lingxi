@@ -54,7 +54,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
 from lingxi.adapters.feishu_user_message import FeishuUserMessages
@@ -73,7 +73,12 @@ from lingxi.apps.worker.config import WorkerConfig
 from lingxi.apps.worker.service import WorkerService
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，文档投递链路的真库断言未验证"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，文档投递链路的真库断言未验证"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，文档投递链路的真库断言未验证"
+)
+POSTGRES_READY = bool(DSN) and psycopg_available()
 
 _USER_ENV_ROOT_DIR = tempfile.TemporaryDirectory(prefix="lingxi-doc-delivery-user-env-")
 atexit.register(_USER_ENV_ROOT_DIR.cleanup)
@@ -166,7 +171,7 @@ class _SpyNotifier:
         self.sent.append((open_id, text, dedupe_key))
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class DocumentDeliveryTransportTestCase(unittest.TestCase):
     """①-④ 的共同底座：真库、一个既有的 task 行（供插入文档投递请求关联）。"""
 
@@ -982,7 +987,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
             return connection.execute(sql, parameters).fetchone()
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
     """⑥ worker 侧：终态成功且 document_request 非空 → 恰一行 pending；终态失败
     或字段为空 → 零行。真实 ``WorkerService.process_once()`` + 真实

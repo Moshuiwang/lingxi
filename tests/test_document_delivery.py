@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import io
 import json
 import unittest
@@ -48,6 +49,21 @@ from lingxi.core.execution.hooks import ToolGateway
 from lingxi.core.execution.tool_policy import DENY_REASON_TEMPLATE, DenyReasonCode
 
 READ_ONLY_TOOL = "mcp__query__list_metrics"
+
+
+def _claude_agent_sdk_available() -> bool:
+    return importlib.util.find_spec("claude_agent_sdk") is not None
+
+
+# Issue #370 修 1：本文件模块文档已声明"刻意不打桩、直接走真实 claude_agent_sdk"
+# 是设计选择（比自造桩更贴近真实失败面），但此前没有对应的 skipUnless 门控——
+# 未装 worker extras（`claude_agent_sdk`）的机器上，下面两个类会在
+# `build_session_options()` 内部 `ModuleNotFoundError`，表现成 2 ERROR + 2 FAIL
+# 而不是清晰的 skip，与代码框架 §四"全量套件须可在无外部依赖机器上运行"的承诺
+# 冲突。风格与仓库既有真库门控一致：`importlib.util.find_spec` 探测 + 明确原因。
+CLAUDE_AGENT_SDK_SKIP_REASON = (
+    "跳过：未安装 claude_agent_sdk（worker extras），真实 SDK 装配形状未验证"
+)
 
 
 def _env(**overrides: str | None) -> dict[str, str]:
@@ -233,6 +249,7 @@ class ToolPolicyMergeTest(unittest.TestCase):
 # ----------------------------------------------------------- 装配：真实 SDK MCP 服务挂载
 
 
+@unittest.skipUnless(_claude_agent_sdk_available(), CLAUDE_AGENT_SDK_SKIP_REASON)
 class DeliveryMcpServerMountTest(unittest.TestCase):
     """用真实 ``claude_agent_sdk``（本仓库 worker extras 的真实依赖）验证挂载
     形状；不涉及网络或模型额度，``create_sdk_mcp_server`` 只是纯 Python 对象
@@ -379,6 +396,7 @@ class DeliverDocumentHandlerTest(unittest.TestCase):
 # ----------------------------------------------------------- 端到端：run_turn() 报告契约
 
 
+@unittest.skipUnless(_claude_agent_sdk_available(), CLAUDE_AGENT_SDK_SKIP_REASON)
 class RunTurnReportContractTest(unittest.TestCase):
     """只把驱动模型输出的 ``run_single_turn`` 换成脚本化假实现——``build_session_
     options()`` 仍然照常调用真实 ``claude_agent_sdk``，只是不真的建立传输连接。"""
