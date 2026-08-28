@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from datetime import datetime, timezone
 from typing import Any
 
 from lingxi.core.alerting import AlertingDuty
@@ -20,7 +19,6 @@ from lingxi.core.identity.access_token_supply import (
     DerivedAccessTokenHolder,
     RosterAccessTokenProvider,
 )
-from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.table_access_token_supply import (
     PermissionTableAccessTokenProvider,
 )
@@ -30,6 +28,7 @@ from lingxi.apps.scheduler.config import SchedulerConfig
 from lingxi.apps.scheduler.credential_rotation import CredentialRotationLoop
 from lingxi.apps.scheduler.daily_report import _wire_daily_report_duty
 from lingxi.apps.scheduler.document_delivery_dead_letter import _wire_document_delivery_maintenance_duty
+from lingxi.apps.scheduler.late_readiness_recovery import _build_late_readiness_recovery_duty
 from lingxi.apps.scheduler.loop import SchedulerLoop
 from lingxi.apps.scheduler.onboarding import _build_onboarding_duty
 from lingxi.apps.scheduler.permission_publish import (
@@ -55,200 +54,9 @@ from lingxi.apps.scheduler.roster_audit import (
     _build_roster_snapshot_sync_duty,
     _log_snapshot_alert,
 )
+from lingxi.apps.scheduler.stalled_provisioning import _build_stalled_provisioning_duty
 
 logger = logging.getLogger(__name__)
-
-
-def _build_late_readiness_recovery_duty(
-    config: SchedulerConfig,
-    *,
-    stop: threading.Event,
-    audit: AuditSink,
-) -> Any:
-    """装配迟到就绪恢复职责（V-开通-18）。**不需要任何可选前置就能注册。**
-
-    补的是 ``core/identity/onboarding_runner.py`` 模块文档「一条链失败中断时」一节
-    登记的缺口：首次开通那次阻塞式就绪确认判超时之后，``provisioning_state`` 停在
-    ``mcp_syncing``，此前没有任何东西会再回来看这个人。语义、放在哪、节奏怎么定、
-    要试到什么时候为止，见 :mod:`lingxi.apps.scheduler.late_readiness_recovery` 的
-    模块文档；本函数只做装配。
-
-    形状照 :func:`_build_readiness_follow_up`，但比它宽松一格：候选查询、原子推进
-    （:class:`~lingxi.adapters.postgres_late_readiness_recovery.
-    PostgresLateReadinessStore`）与通知（:class:`~lingxi.apps.scheduler.onboarding.
-    CatalogNotifier`）都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用凭据——两者都是
-    :class:`SchedulerConfig` 的必填项，因此本职责**总能**注册。**唯一可选的是探针面**：
-    缺 MCP 令牌主密钥或问数 MCP 端点时，需要真探针才能推进的那一路本轮不推进，只把这
-    **恰一条**审计记下来（:class:`~lingxi.apps.scheduler.late_readiness_recovery._Ticker`
-    的文档）；通知面（认领已经排出的待发通知并重试直到送达）不依赖探针，照常运行。
-    """
-
-    from lingxi.adapters.feishu_user_message import FeishuUserMessages
-    from lingxi.adapters.postgres_late_readiness_recovery import PostgresLateReadinessStore
-    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-    from lingxi.apps.scheduler.late_readiness_recovery import LateReadinessRecoveryDuty
-    from lingxi.apps.scheduler.onboarding import CatalogNotifier
-    from lingxi.config.content import default_content_catalog
-    from lingxi.core.identity.onboarding_runner import FIRST_ONBOARDING_REASON
-
-    dsn = config.postgres_dsn
-    timeouts = config.postgres_timeouts
-    store = PostgresLateReadinessStore(dsn, timeouts=timeouts)
-    # 通知收件人查询是既有的只读方法，住在权限发布那份存取里
-    # （``notice_recipient_open_id``，与刷新链的变化通知共用同一条产品口径）。
-    recipients = PostgresPermissionPublishStore(dsn, timeouts=timeouts)
-
-    ticker = None
-    if not config.mcp_token_encrypt_key:
-        from lingxi.adapters.mcp_token_cipher import MASTER_KEY_ENV
-
-        # 只报变量名，不回显任何值（`V-花名册-29` 的同一条纪律；它还是一把主密钥）。
-        audit.record(
-            "late_readiness_recovery.probe_not_wired",
-            reason="missing_environment_variable",
-            variable=MASTER_KEY_ENV,
-        )
-        logger.warning(
-            "未配置 %s，迟到就绪恢复的探针面不装配；候选留在库里等配置齐备，"
-            "已经排出但还没送达的通知照常持久重试",
-            MASTER_KEY_ENV,
-        )
-    elif not config.query_mcp_endpoint:
-        audit.record(
-            "late_readiness_recovery.probe_not_wired",
-            reason="missing_environment_variable",
-            variable="LINGXI_QUERY_MCP_ENDPOINT",
-        )
-        logger.warning(
-            "未配置 LINGXI_QUERY_MCP_ENDPOINT，迟到就绪恢复的探针面不装配；"
-            "候选留在库里等端点配好，已经排出但还没送达的通知照常持久重试"
-        )
-    else:
-        from lingxi.adapters.mcp_token_cipher import McpTokenCipher
-        from lingxi.adapters.postgres_mcp_token import (
-            PostgresMcpTokenStore,
-            token_cipher_provider,
-        )
-        from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
-        from lingxi.apps.scheduler.onboarding import assert_probe_timeouts_agree
-        from lingxi.core.permission.mcp_readiness import ReadinessRecoveryTicker
-
-        tokens = PostgresMcpTokenStore(
-            dsn, cipher=McpTokenCipher(config.mcp_token_encrypt_key), timeouts=timeouts
-        )
-        schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
-        probe = QueryMcpProbe(
-            endpoint=config.query_mcp_endpoint,
-            token_provider=token_cipher_provider(tokens),
-            timeout_seconds=config.query_mcp_timeout_seconds,
-            # 已验证的 reader（Issue #253 / L4a），同 ``_build_readiness_follow_up`` 与
-            # 本文件修复过的 ``_build_onboarding_duty`` 那两份。
-            metrics_reader=content_text_metrics_reader,
-        )
-        assert_probe_timeouts_agree(probe=probe, schedule=schedule)
-        ticker = ReadinessRecoveryTicker(
-            probe=probe,
-            store=tokens,
-            audit=audit,
-            clock=lambda: datetime.now(timezone.utc),
-            schedule=schedule,
-        )
-
-    duty = LateReadinessRecoveryDuty(
-        candidates=store,
-        ticker=ticker,
-        activator=store,
-        notices=store,
-        recipients=recipients,
-        notifier=CatalogNotifier(
-            sender=FeishuUserMessages(
-                base_url=config.feishu_base_url,
-                app_id=config.feishu_app_id,
-                app_secret=config.feishu_app_secret,
-            ),
-            catalog=default_content_catalog(),
-        ),
-        audit=audit,
-        reason=FIRST_ONBOARDING_REASON,
-        stop=stop,
-    )
-    logger.info(
-        "迟到就绪恢复职责已装配 探针面=%s", "已接线" if ticker is not None else "未接线"
-    )
-    return duty
-
-
-def _build_stalled_provisioning_duty(
-    config: SchedulerConfig,
-    *,
-    stop: threading.Event,
-    audit: AuditSink,
-    alert: Callable[[int], None] | None = None,
-) -> Any:
-    """装配开通中途停摆收口职责（Issue #282，`V-开通-19`）。**总能注册**，不需要任何
-    可选前置——候选查询、收口写入（复用
-    :meth:`~lingxi.adapters.postgres_identity.PostgresAppUserStore.
-    abort_stalled_provisioning`）与通知都只需要 ``LINGXI_POSTGRES_DSN``/飞书应用
-    凭据，两者都是 :class:`SchedulerConfig` 的必填项，形状照
-    :func:`_build_late_readiness_recovery_duty`。
-
-    补的是 :mod:`lingxi.core.identity.onboarding_runner` 模块文档「同一类缺口的另一半」
-    一节登记的缺口：首次开通链在把用户推进到 ``provisioning`` 之后死掉、且编排自己的
-    「当场收口」也够不到（进程被强杀、收口写入自己那一次恰好失败），此前没有任何东西
-    会再回来看这个人。语义、放在哪、节奏怎么定见
-    :mod:`lingxi.apps.scheduler.stalled_provisioning` 的模块文档；本函数只做装配。
-
-    装配断言 5（本轮新增）：停摆租约必须严格长于一条链在 provisioning/mcp_syncing
-    两格上可能停留的最长时间——见
-    :func:`~lingxi.apps.scheduler.onboarding.assert_stalled_lease_exceeds_chain_budget`。
-    这里只是拿一份 :class:`ReadinessSchedule` 来核对预算数字，**不需要真的装配探针**
-    （本职责本身也不发探针，与迟到就绪恢复不同），因此这条断言在探针端点是否配置好之前
-    就能跑。
-    """
-
-    from lingxi.adapters.feishu_user_message import FeishuUserMessages
-    from lingxi.adapters.postgres_identity import PostgresAppUserStore
-    from lingxi.adapters.postgres_stalled_provisioning import PostgresStalledProvisioningStore
-    from lingxi.apps.scheduler.onboarding import (
-        CatalogNotifier,
-        assert_stalled_lease_exceeds_chain_budget,
-    )
-    from lingxi.apps.scheduler.stalled_provisioning import (
-        DEFAULT_STALLED_LEASE_SECONDS,
-        StalledProvisioningDuty,
-    )
-    from lingxi.config.content import default_content_catalog
-
-    dsn = config.postgres_dsn
-    timeouts = config.postgres_timeouts
-
-    schedule = ReadinessSchedule(probe_timeout_seconds=config.query_mcp_timeout_seconds)
-    assert_stalled_lease_exceeds_chain_budget(
-        lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
-        publish_wait_seconds=config.onboarding_publish_wait_seconds,
-        schedule=schedule,
-    )
-
-    duty = StalledProvisioningDuty(
-        candidates=PostgresStalledProvisioningStore(dsn, timeouts=timeouts),
-        aborter=PostgresAppUserStore(dsn, timeouts=timeouts),
-        notifier=CatalogNotifier(
-            sender=FeishuUserMessages(
-                base_url=config.feishu_base_url,
-                app_id=config.feishu_app_id,
-                app_secret=config.feishu_app_secret,
-            ),
-            catalog=default_content_catalog(),
-        ),
-        alert=alert,
-        audit=audit,
-        lease_seconds=DEFAULT_STALLED_LEASE_SECONDS,
-        stop=stop,
-    )
-    logger.info(
-        "开通中途停摆收口职责已装配 租约=%ss", DEFAULT_STALLED_LEASE_SECONDS
-    )
-    return duty
 
 
 def _stop_aware_sleep(stop: threading.Event) -> Callable[[float], None]:
