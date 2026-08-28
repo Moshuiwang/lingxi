@@ -190,6 +190,8 @@ from lingxi.core.identity.onboarding_ports import (
     # runner`` 模块的属性可见——``adapters/user_environment.py:102`` 与
     # ``tests/test_onboarding_runner.py`` 都从这里导入。
     EnvironmentResult,
+    # 失败原因落库口（Issue #337，可选，见该协议文档）。
+    FailureReasonRecorder,
     GalaxySource,
     LocalOverrideSource,
     PermissionDecisionStore,
@@ -308,6 +310,7 @@ class AutoOnboardingRunner:
         notify_attempts: int = 3,
         publish_allowed: Callable[[], bool] | None = None,
         onboarding_failed: Callable[[str, str], None] | None = None,
+        failure_reasons: FailureReasonRecorder | None = None,
         local_overrides: LocalOverrideSource | None = None, legacy_source: LegacyPermissionTable | None = None,
         publish_history: PublishHistorySource | None = None,
     ) -> None:
@@ -379,6 +382,10 @@ class AutoOnboardingRunner:
         #: 两者都是内部诊断标识，不是 open_id、姓名或任何资料值，回调签名里也
         #: 没有传这些的位置。
         self._onboarding_failed = onboarding_failed
+        #: 失败原因落库口（Issue #337，可选，见 ``FailureReasonRecorder`` 协议
+        #: 文档）。``None``＝未装配，行为与接线之前逐字节一致——``/admin trace``
+        #: 只是查不到这条链的失败原因，不影响链本身任何结论。
+        self._failure_reasons = failure_reasons
         # 本地权限覆盖读取口（S-P-3）与存量权限只读源（S-P-2 #328）：均为 ``None``＝装配层未接线，行为与改动前逐字节一致。
         self._local_overrides, self._legacy_source = local_overrides, legacy_source
         # 发布足迹只读口（红线-1）：``None``（未接线）按"保守未知"处理，legacy 一律
@@ -537,6 +544,28 @@ class AutoOnboardingRunner:
                 trace_id=trace_id,
             )
 
+    def _record_failure_reason(
+        self, *, trace_id: str, failure_reason: str, event_type: str
+    ) -> None:
+        """把这一次失败终态的原因落库（Issue #337，可选，见
+        :class:`~lingxi.core.identity.onboarding_ports.FailureReasonRecorder`
+        文档）供 ``/admin trace <追溯号>`` 消费。**最佳努力**：与
+        :meth:`_notify_admin_of_failure` 同一条纪律——落库失败不得带走已经决定的
+        终态或已经完成的通知/记账，只改记一条自己的失败审计。"""
+
+        if self._failure_reasons is None:
+            return
+        try:
+            self._failure_reasons.record_failure(
+                trace_id=trace_id, failure_reason=failure_reason, event_type=event_type
+            )
+        except Exception as error:  # noqa: BLE001 - 落库失败不得带走已经决定的终态
+            self._audit.record(
+                "onboarding.failure_reason_record_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
     # ------------------------------------------------------------------
     # 执行线程
     # ------------------------------------------------------------------
@@ -588,6 +617,14 @@ class AutoOnboardingRunner:
             content_key=terminal.key,
             trace_id=trace_id,
         )
+        if terminal.reason is not None:
+            # 失败原因落库（Issue #337）：紧邻上面那条既有审计，只在真的是一次
+            # 失败终态（``reason`` 非空，成功完成的 ``_completed()`` 从不设置它）
+            # 时落一行——见 :meth:`_record_failure_reason` 与 ``FailureReasonRecorder``
+            # 协议文档。
+            self._record_failure_reason(
+                trace_id=trace_id, failure_reason=terminal.reason, event_type="onboarding.result"
+            )
         if terminal.state in (OnboardingState.INTERNAL_ERROR, OnboardingState.SYNC_TIMEOUT):
             # SYNC_TIMEOUT 与 INTERNAL_ERROR 是产品合同里两句独立措辞（`docs/产品
             # 合同与外部边界.md`），但都承诺"转交管理员处理"——两者都必须真的送达

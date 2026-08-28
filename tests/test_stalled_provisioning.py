@@ -148,6 +148,9 @@ def build_duty(**overrides: Any) -> tuple[StalledProvisioningDuty, dict[str, Any
         "notifier": FakeNotifier(),
         "audit": RecordingAudit(),
         "alert": None,
+        # 默认 None：哨兵——不注入失败原因落库口时，行为必须与接线之前逐字节一致
+        # （Issue #337）。
+        "failure_reasons": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     duty = StalledProvisioningDuty(
@@ -156,6 +159,7 @@ def build_duty(**overrides: Any) -> tuple[StalledProvisioningDuty, dict[str, Any
         notifier=parts["notifier"],
         alert=parts["alert"],
         audit=parts["audit"],
+        failure_reasons=parts["failure_reasons"],
         lease_seconds=overrides.get("lease_seconds", DEFAULT_STALLED_LEASE_SECONDS),
         limit=overrides.get("limit", DEFAULT_STALLED_LIMIT),
         notify_backoff_seconds=overrides.get("notify_backoff_seconds", 300),
@@ -163,6 +167,21 @@ def build_duty(**overrides: Any) -> tuple[StalledProvisioningDuty, dict[str, Any
         stop=overrides.get("stop"),
     )
     return duty, parts
+
+
+class RecordingFailureReasons:
+    """``FailureReasonRecorder`` 的内存假实现（Issue #337）。"""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.raise_error = raise_error
+
+    def record_failure(self, *, trace_id: str, failure_reason: str, event_type: str) -> None:
+        if self.raise_error:
+            raise RuntimeError("模拟失败原因落库故障")
+        self.calls.append(
+            {"trace_id": trace_id, "failure_reason": failure_reason, "event_type": event_type}
+        )
 
 
 class FakeClock:
@@ -576,6 +595,93 @@ class StalledAlertCallbackTests(unittest.TestCase):
         assert report is not None
         self.assertEqual(report.aborted, 1)
         self.assertIn("stalled_provisioning.alert_callback_failed", audit.actions())
+
+
+class FailureReasonRecordingTests(unittest.TestCase):
+    """失败原因落库（Issue #337，可选，见 ``FailureReasonRecorder`` 协议
+    文档）：紧邻既有 ``stalled_provisioning.aborted`` 审计，只在真的收口成功
+    （CAS 命中）时落一行——覆盖 `onboarding.result` 从未写出的那一半（链本身
+    死掉、由本职责租约到期收口）。"""
+
+    def test_an_aborted_candidate_records_the_failure_reason(self) -> None:
+        recorder = RecordingFailureReasons()
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate()]), failure_reasons=recorder
+        )
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 1)
+        self.assertEqual(
+            recorder.calls,
+            [
+                {
+                    "trace_id": "trc_a",
+                    "failure_reason": "stalled_lease_expired",
+                    "event_type": "stalled_provisioning.aborted",
+                }
+            ],
+        )
+
+    def test_a_cas_refused_candidate_never_records_anything(self) -> None:
+        """否定断言：CAS 返回 0 行（状态被别的路径改写）时不收口，也不该落一行
+        「失败」——那个人此刻的真实状态未必真的失败了。"""
+
+        recorder = RecordingFailureReasons()
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate()]),
+            aborter=FakeAborter(result=False),
+            failure_reasons=recorder,
+        )
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 0)
+        self.assertEqual(recorder.calls, [])
+
+    def test_a_notify_failed_candidate_never_records_anything(self) -> None:
+        """否定断言：通知失败时不收口，同样不该落任何失败原因行。"""
+
+        recorder = RecordingFailureReasons()
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate()]),
+            notifier=FakeNotifier(error=RuntimeError("feishu down")),
+            failure_reasons=recorder,
+        )
+
+        duty.run_once()
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_a_raising_recorder_does_not_discard_the_rounds_result(self) -> None:
+        """否定断言：落库失败不得带走本轮已经完成的收口结果。"""
+
+        recorder = RecordingFailureReasons(raise_error=True)
+        audit = RecordingAudit()
+        duty, _ = build_duty(
+            candidates=FakeCandidates([_candidate()]),
+            failure_reasons=recorder,
+            audit=audit,
+        )
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 1)
+        self.assertIn("stalled_provisioning.failure_reason_record_failed", audit.actions())
+
+    def test_no_recorder_injected_keeps_prior_behavior(self) -> None:
+        """默认 ``failure_reasons=None``：不注入时行为与接线之前逐字节一致，
+        不抛异常。"""
+
+        duty, _ = build_duty(candidates=FakeCandidates([_candidate()]))
+
+        report = duty.run_once()
+
+        assert report is not None
+        self.assertEqual(report.aborted, 1)
 
 
 class ConstructionTests(unittest.TestCase):

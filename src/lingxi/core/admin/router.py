@@ -30,7 +30,12 @@ from lingxi.core.admin.pending_action import (
     PendingActionType,
 )
 from lingxi.core.admin.registry import AdminRegistryEntry, is_authorized_admin
-from lingxi.core.admin.views import AdminEventView, AdminUserStatusView, LocalPermissionOverrideView
+from lingxi.core.admin.views import (
+    AdminEventView,
+    AdminTraceView,
+    AdminUserStatusView,
+    LocalPermissionOverrideView,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,13 @@ class AdminQueries(Protocol):
     def recent_events(
         self, *, identifier: str | None, window_hours: int, limit: int
     ) -> Sequence[AdminEventView]: ...
+
+    def trace_lookup(self, *, trace_id: str) -> AdminTraceView | None:
+        """按追溯号查开通失败原因 + 事件时间线 + 开通状态（Issue #337）。查无
+        任何入站事件返回 ``None``——``core/admin/router._render_trace`` 据此回复
+        「查无此追溯号」。真实实现见
+        ``adapters/admin_registry.PostgresAdminQueries.trace_lookup``。"""
+        ...
 
 
 class _PrepareDecision(Protocol):
@@ -385,6 +397,24 @@ class AdminCommandRouter:
                 trace_id=trace_id,
             )
 
+        if command.kind is AdminCommandKind.QUERY_TRACE:
+            assert command.identifier is not None
+            trace = self._queries.trace_lookup(trace_id=command.identifier)
+            return self._record_or_reject(
+                "admin.command.query_trace",
+                AdminRouteOutcome(
+                    handled=True,
+                    content_key="admin.trace_query",
+                    content_version=_CONTENT_VERSION,
+                    reply_text=_render_trace(command.identifier, trace),
+                ),
+                actor=entry.feishu_open_id,
+                roles=roles,
+                target=command.identifier,
+                found=trace is not None,
+                trace_id=trace_id,
+            )
+
         if command.kind is AdminCommandKind.SUSPEND_USER:
             assert command.identifier is not None
             return self._dispatch_write_action(
@@ -667,6 +697,7 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin help — 显示本帮助\n"
         "/admin user <标识> — 查询用户开通状态\n"
         "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时）\n"
+        "/admin trace <追溯号> — 按追溯号查开通失败原因与事件时间线\n"
         "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
         "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权（需本人飞书确认卡片）\n"
@@ -753,6 +784,41 @@ def _render_audit_query(
         for event in events
     ]
     return "\n".join((header, *lines))
+
+
+def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
+    """``/admin trace`` 的回显（Issue #337 范围条目 4）：
+
+    - ``trace`` 为 ``None``（``inbound_event`` 里查无这个追溯号）→ 明确的
+      「不存在」文案，不是空白也不是报错。
+    - ``trace`` 非空但 ``failure_reason`` 为空 → 如实回「无失败记录」并带上
+      当前能查到的开通状态（如果定位得到用户的话）——不能因为没有失败原因
+      就假装这条追溯号也查无此人。
+    - ``failure_reason`` 非空 → 这正是 Issue #337 的验收关键：管理员能凭追溯号
+      拿到此前只能靠检索容器日志才能拿到的答案。
+    """
+
+    if trace is None:
+        return f"追溯号 {trace_id}：查无此追溯号"
+
+    lines = [
+        f"追溯号 {trace_id}：{trace.event_count} 条入站事件",
+        f"首次接收: {trace.first_received_at}",
+        f"最近事件类型: {trace.last_event_type}",
+        f"最近处理方式: {trace.last_handled_as or '(未标记)'}",
+        f"是否已认领: {'是' if trace.dispatched else '否'}",
+    ]
+    if trace.provisioning_state is not None:
+        lines.append(f"开通状态: {trace.provisioning_state}")
+        lines.append(f"账号状态: {trace.account_state}")
+    if trace.failure_reason is not None:
+        lines.append(
+            f"失败原因: {trace.failure_reason}"
+            f"（{trace.failure_event_type}，{trace.failure_occurred_at}）"
+        )
+    else:
+        lines.append("无失败记录")
+    return "\n".join(lines)
 
 
 def _render_unknown() -> str:

@@ -47,6 +47,7 @@ class AdminCommandKind(str, Enum):
     HELP = "help"
     QUERY_USER = "query_user"
     QUERY_AUDIT = "query_audit"
+    QUERY_TRACE = "query_trace"
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
     GRANT_PERMISSION = "grant_permission"
@@ -94,6 +95,11 @@ def parse_admin_command(text: object) -> AdminCommand:
     - ``/admin audit <hours>``                   → QUERY_AUDIT，无过滤、显式时间窗
       （单个额外参数全为数字时按小时数解释，否则按标识解释——两者不可能同时成立，
       判据因此是确定性的，不依赖顺序猜测）
+    - ``/admin trace <追溯号>``                   → QUERY_TRACE（Issue #337：按追溯号
+      查开通失败原因 + 入站事件时间线 + 开通状态，脱敏输出。``<追溯号>`` 必须是裸
+      ULID——``core/ids.is_ulid`` 同一形状校验，不加前缀，与 ``inbound_event.
+      trace_id``/``onboarding_failure.trace_id`` 的存储形状一致；不合形状一律
+      ``UNKNOWN``，不当成任意标识去查库）
     - ``/admin suspend <identifier>``            → SUSPEND_USER（Issue #96 S-M-02：
       只建待确认操作，不直接执行；执行前须经本人飞书确认卡片）
     - ``/admin resume <identifier>``             → RESUME_USER（同上，对称动作）
@@ -134,6 +140,11 @@ def parse_admin_command(text: object) -> AdminCommand:
 
     if sub == "audit":
         return _parse_audit(rest)
+
+    if sub == "trace":
+        if len(rest) != 1 or not is_ulid(rest[0]):
+            return _unknown()
+        return AdminCommand(kind=AdminCommandKind.QUERY_TRACE, identifier=rest[0])
 
     if sub == "suspend":
         if len(rest) != 1 or not _IDENTIFIER_PATTERN.fullmatch(rest[0]):
