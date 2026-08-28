@@ -177,7 +177,13 @@ def main(
             target_worker_version=config.target_worker_version,
             max_concurrency=config.max_concurrency,
         )
-        queue = PostgresTaskQueue(dsn)
+        # S-H1-6（#359 根因取证方案第 2 条）：`claim()` 是主循环每
+        # poll_interval_seconds（默认 2s）都会执行一次的发现查询，空转时也不
+        # 例外；`claim()` 本身在 `WorkerService.process_once()` 里是单次同步
+        # 调用（不经 `asyncio.to_thread`，也不在 `asyncio.gather` 的并发批次
+        # 内），因此对这个专属实例打开常驻轮询连接复用是安全的——不会有两次
+        # `claim()` 调用真正并发访问同一条连接。
+        queue = PostgresTaskQueue(dsn, reuse_polling_connection=True)
         alerting_duty = _build_alerting_duty(err=err, trace_id=config.trace_id)
         session_root = _resolve_session_root(config, env)
         if session_root is None:
