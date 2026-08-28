@@ -853,6 +853,77 @@ class ShutdownWiringTests(unittest.TestCase):
         self.assertGreater(ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS, 0)
 
 
+class SchedulerLoopDutiesPropertyTests(unittest.TestCase):
+    """P2-5（opus 批量审查 · Trace #373 H1 批终修复包）：``SchedulerLoop.duties``
+    property 是 ``apps/scheduler/__init__.py::main()`` 退出路径把职责集合原样交给
+    ``join_onboarding_executors`` 的唯一通道——这里先钉住 property 本身：暴露的必须
+    是构造时传入的那个职责集合，不是拷贝出的一份、也不是子集。"""
+
+    def test_the_duties_property_exposes_exactly_what_was_constructed(self) -> None:
+        from lingxi.apps.scheduler.loop import SchedulerLoop
+
+        duty_a, duty_b = object(), object()
+        loop = SchedulerLoop(duties=[duty_a, duty_b])
+
+        self.assertEqual(loop.duties, (duty_a, duty_b))
+
+
+class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
+    """Issue #284 C 组 #8（Trace #373 D7 裁定修复）：``main()`` 的退出路径必须真的
+    调用 ``join_onboarding_executors(loop.duties)``，不是文档写了但没接线。
+    ``ShutdownWiringTests`` 只覆盖 ``join_onboarding_executors`` 函数本身对不对
+    （直接传一个职责列表进去），从不经过 ``main()``——如果以后有人在 ``main()`` 里
+    删掉这一行调用，那组测试全绿也测不出来。这里用轻量桩顶掉 ``main()`` 里其余的真实
+    装配（配置读取、告警、``build_loop``、信号安装），只把"退出路径真的用
+    ``loop.duties`` 调用了 ``join_onboarding_executors``"这一段接线暴露成断言，不真的
+    起一个 scheduler 进程或后台线程（``loop.run_forever()`` 本身也是桩，立即返回）。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
+    ``join_onboarding_executors(loop.duties)`` 那一行删掉（或换成 ``pass``）重跑本
+    用例，``join_mock.assert_called_once_with(...)`` 会因为从未被调用而失败。
+    """
+
+    def test_main_calls_join_onboarding_executors_with_the_loops_duties(self) -> None:
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(), object())
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                return None
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch(
+                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
+            ) as build_loop_mock,
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            code = main([])
+
+        self.assertEqual(code, 0)
+        install_mock.assert_called_once_with(stub_loop)
+        build_loop_mock.assert_called_once()
+        join_mock.assert_called_once_with(sentinel_duties)
+
+
 class StopSentinelRaceTests(unittest.TestCase):
     """F2（外部集成面审查，应修）：``stop()`` 在队列满时哨兵全部丢失、``_loop`` 有
     check-then-get 竞态导致工作线程无超时地永久卡死。
