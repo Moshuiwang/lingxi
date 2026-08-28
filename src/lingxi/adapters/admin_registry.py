@@ -99,6 +99,16 @@ class PostgresAdminQueries:
         self._local_overrides = PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
 
     def user_status(self, *, identifier: str) -> AdminUserStatusView | None:
+        # 登记式收敛（#371-8，2026-08-28 评估：不改，行为不变）：
+        # `PostgresAppUserStore`（postgres_identity.py）没有一个现成方法能一次原子
+        # 查询出本方法需要的 (id, provisioning_state, account_state,
+        # permission_version, updated_at) 五列——`get_by_open_id` 按 open_id 查但
+        # 不带 account_state/updated_at，`read_status` 带 account_state 但按内部
+        # user_id 查、且不返回 updated_at。拆成"先 get_by_open_id 拿 id，再
+        # read_status 查状态"两次查询会丢掉单条 SELECT 的原子快照、多一次往返；
+        # 给 core 的 UserProvisioningStatus 加 updated_at 会改动 onboarding_runner
+        # 等其它消费方共享的形状。两条路径都不是"只读、行为不变"的收敛，因此保留
+        # 本模块自己的只读查询，留痕待新证据（如新增消费方）出现再复议。
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """

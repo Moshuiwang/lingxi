@@ -282,11 +282,6 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
     ),
     GroundedAttribution(
         "docs/技术设计/架构设计.md",
-        '- JumpServer 登录进的是同一个家目录，因此产物、工作文件在两个入口下一致（合同要求"路径、归属和访问控制与飞书私聊完全一致"）；',
-        "高级工作台",
-    ),
-    GroundedAttribution(
-        "docs/技术设计/架构设计.md",
         "合同要求的审计事实由 SDK 回调与 Lingxi 自己的任务编排层共同产生：",
         "审核、审计与持续优化方向",
     ),
@@ -319,11 +314,6 @@ GROUNDED_ATTRIBUTIONS: tuple[GroundedAttribution, ...] = (
         "docs/技术设计/架构设计.md",
         '- **脱敏**：合同要求"不在审计中保存凭据、完整令牌或无关个人信息"。审计写入统一走一个 `redact()` 出口，字段白名单制——新增字段默认不记录，必须显式加入白名单。',
         "管理员处理入口与安全确认",
-    ),
-    GroundedAttribution(
-        "docs/技术设计/架构设计.md",
-        '审批流程在飞书开通链路之外（合同规定），Lingxi 不实现审批，只在管理 MCP 里提供"标记某用户已获批高级工作台"的受控写操作。',
-        "高级工作台",
     ),
     GroundedAttribution(
         "docs/技术设计/架构设计.md",
