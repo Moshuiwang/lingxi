@@ -25,6 +25,7 @@ FAST_PREFIXES = ("experiments/", "scripts/dev/", "src/", "tests/", "workers/")
 FULL_PREFIX_DATA_FILES = frozenset(
     {
         "scripts/ci/size_ratchet_baseline.txt",
+        "scripts/ci/matrix_row_size_baseline.txt",
     }
 )
 
