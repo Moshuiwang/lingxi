@@ -7,4 +7,3 @@
 # 「行数<TAB>路径」，门禁会核对这一行是否等于该文件的当前实际行数。
 
 1538	src/lingxi/apps/scheduler/assembly.py
-1541	src/lingxi/core/identity/onboarding_runner.py

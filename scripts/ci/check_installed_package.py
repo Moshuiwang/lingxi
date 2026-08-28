@@ -74,6 +74,22 @@ REQUIRED_MODULES = (
     # `apps/gateway/onboarding.py` 在函数内 import，后者同理——两者都必须随制品发布，
     # 否则「本地测试全绿但 wheel 里没有这个模块」会在部署当天才暴露（`V-部署-10`）。
     "lingxi.core.identity.onboarding_runner",
+    # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：14 个
+    # Protocol + `EnvironmentResult` 搬进本模块，`onboarding_runner.py` 顶部
+    # `from .onboarding_ports import (...)`。随 `onboarding_runner.py` 同一条
+    # 发布理由——制品缺它会让 runner 装不起来。
+    "lingxi.core.identity.onboarding_ports",
+    # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
+    # roster_row_for/draft_from_member 两个模块级纯函数搬进本模块，
+    # `onboarding_runner.py` 顶部 `from .onboarding_support import (...)`。随
+    # `onboarding_runner.py` 同一条发布理由；`tests/test_onboarding_runner.py:27`
+    # 仍从 `onboarding_runner` 导入两者（re-export 成立）。
+    "lingxi.core.identity.onboarding_support",
+    # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：`_Terminal`/
+    # 两个异常类/`_with_reference`/两个失败工厂/全部 STATE_*、KEY_* 常量搬进本模块，
+    # `onboarding_runner.py` 顶部 `from .onboarding_terminal import (...)`。随
+    # `onboarding_runner.py` 同一条发布理由。
+    "lingxi.core.identity.onboarding_terminal",
     # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
     # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
     # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
@@ -430,6 +446,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 不会红（与本文件其余「函数内 import」条目同一条理由）。
             "lingxi.apps.scheduler.onboarding",
             "lingxi.core.identity.onboarding_runner",
+            # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
+            # `onboarding_runner.py` 顶部**模块级** import 本模块，因此它随
+            # `onboarding_runner.py` 一起进了 scheduler 的静态 import 闭包
+            # （`process_source_closure` 会自动展开，登记只是把它显式写出来）。
+            "lingxi.core.identity.onboarding_ports",
+            # Trace #358 S-H-1，同上一条理由：`onboarding_runner.py` 顶部同样
+            # **模块级** import 了本模块。
+            "lingxi.core.identity.onboarding_support",
+            "lingxi.core.identity.onboarding_terminal",
             # 存量令牌 adopt-or-issue（Issue #281 改道，Trace #304 批次 3）：
             # `build_loop` 模块级 import `build_stock_token_source`（`apps/scheduler/
             # onboarding.py`），它在函数内 import 只读端口的飞书 bitable 适配器与
