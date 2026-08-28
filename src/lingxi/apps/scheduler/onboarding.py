@@ -56,6 +56,32 @@ scheduler ：本模块每轮认领若干条 → AutoOnboardingRunner（专属线
 :class:`~lingxi.apps.scheduler.stalled_provisioning.StalledProvisioningDuty` 的租约常量
 与就绪节奏、发布等待上界之间的隐性耦合——三个数字分别定义在三个不同的模块里，靠人记住
 "改这个之前要看那个"迟早会有一次漏看。断言把这条耦合从注释升级成装配期真的会炸的事实。
+
+## 停机接线（Issue #284 C 组 #8，Trace #373 D7 裁定修复）
+
+:meth:`OnboardingExecutor.stop`/:meth:`OnboardingExecutor.join` 是 #266 就修好的停机竞态
+路径（见两方法各自文档字符串），但在本次修复之前**生产没有任何调用方**——``main()`` 只是
+让 :class:`~lingxi.apps.scheduler.loop.SchedulerLoop` 停止再调用各职责的 ``run_once()``，
+从来没人回头问过开通执行器自己那 ``config.onboarding_workers`` 条工作线程收没收工。它们是
+``daemon`` 线程，进程退出时会被直接砍断——不是数据风险（``_stop_guard`` 已经让在途链在
+检查点之间安全收口并释放认领，见 ``core/identity/onboarding_runner.py``），但确实违背
+"停止领取新工作、把已经领取的那一次做完，再退出"这条既有停机纪律（本包 ``__init__.py``
+模块文档「退出语义」一节）；不接线时那句承诺只对同一线程内跑的职责成立，对开通执行器
+自己的独立线程池是空话。
+
+修法照抄 ``apps/gateway/__init__.py`` 对投递线程的既有形状（"先停止领取、再在预算内等它
+收工，超时不再等"）：:func:`_build_onboarding_duty` 把构造好的 ``executor`` 挂在返回的
+``duty``（``OnboardingReconciler``）对象上一个动态属性 ``onboarding_executor``——不改
+``core/conversation/onboarding_recovery.py`` 的类定义（那是纯 core 层，不该认识
+``OnboardingExecutor`` 这个 apps/scheduler 层的概念），只在本模块（apps 层）从外部挂一个
+后续可以取回的句柄。``main()`` 在 :meth:`~lingxi.apps.scheduler.loop.SchedulerLoop.
+run_forever` 返回之后调用 :func:`join_onboarding_executors`，遍历 ``loop.duties`` 找到
+挂了这个句柄的那个（当前只可能有一个，未来若有第二个开通编排实例也天然支持），依次
+``stop()`` 再 ``join(timeout=ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS)``。收工预算取值
+同 ``apps/gateway/config.py::shutdown_timeout_seconds`` 的既有默认值（20 秒）——同一条
+"给在途工作一个有界窗口，不是无限等、也不是完全不等"纪律的第三次应用（gateway 投递线程、
+组织快照同步的整轮 join 之后，这是第三处）。超时未收工只留一条响亮日志，不阻塞进程退出：
+线程本身是 ``daemon``，进程退出时无论如何都不会被它焊住。
 """
 
 from __future__ import annotations
@@ -367,6 +393,43 @@ class OnboardingExecutor:
                 self._queue.task_done()
             if self._stopping.is_set() and self._queue.empty():
                 return
+
+
+#: 停机时等待开通执行器收工的预算（Issue #284 C 组 #8，见模块文档「停机接线」）。
+#: 取值同 ``apps/gateway/config.py::shutdown_timeout_seconds`` 的既有默认值：
+#: 在途链靠 ``_stop_guard`` 在检查点之间快速收口，正常情况下远快于这个上限；
+#: 执行器线程是 ``daemon``，超时未收工也不会阻塞进程退出，只留一条响亮日志。
+ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 20.0
+
+
+def join_onboarding_executors(duties: Sequence[Any]) -> None:
+    """停机收尾：让每一个挂了开通执行器的职责停止领取新链，并在预算内等它收工。
+
+    （Issue #284 C 组 #8，Trace #373 D7 裁定修复；见模块文档「停机接线」一节的完整
+    理由。）由 ``main()`` 在 ``SchedulerLoop.run_forever()`` 返回之后调用一次——此时
+    全部职责已经停止领取新一轮工作，正是"完成或安全中断在途工作，不是立刻放弃"
+    （``V-部署-03``）这条纪律该收口的时机。
+
+    只认**挂在 duty 上的 ``onboarding_executor`` 属性**，不是"扫描全部职责找
+    ``OnboardingReconciler`` 实例"——:func:`_build_onboarding_duty` 已经把这层判断
+    做过一次（前置不齐时整个职责都不装配，``duty`` 根本不会出现在 ``duties`` 里），
+    这里只需要认这一个约定好的接缝，不需要重新认识 ``OnboardingReconciler`` 这个
+    类型本身（保持与 ``core/conversation/onboarding_recovery.py`` 的隔离，见模块
+    文档「停机接线」）。没有任何职责挂了这个属性时（未装配开通编排、或调用方传入
+    了自己的测试替身）本函数是纯粹的空操作。
+    """
+
+    for duty in duties:
+        executor = getattr(duty, "onboarding_executor", None)
+        if executor is None:
+            continue
+        executor.stop()
+        executor.join(timeout=ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
+        if executor.alive:
+            logger.error(
+                "开通执行器未能在停机预算内收工（%s 秒），进程将不再等待、直接退出",
+                ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
+            )
 
 
 # ----------------------------------------------------------------------
@@ -801,6 +864,12 @@ def _build_onboarding_duty(
         ledger=store,
         audit=audit,
         role_function_map=role_function_map,
+        # 「公司+职能→指标名」翻译映射（Issue #227 / #346 修复）：与下面 ``publish_
+        # allowed`` 闸门共用**同一个已加载对象**（不在这里另读一份文件），供
+        # ``AutoOnboardingRunner._publish`` 调用 ``translate_company_functions`` 时
+        # 使用——此前 ``_publish`` 只用这个对象构造了布尔闸门、从未真正拿它翻译过
+        # 发布行的值列表（#346 坐实的缺陷）。
+        metric_translation_map=metric_translation_map,
         # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
         innertest_roster_gate=AutoOnboardingRunner.build_innertest_roster_gate(config.innertest_roster_open_ids),
         # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
@@ -855,6 +924,10 @@ def _build_onboarding_duty(
     )
     assert_claim_limit_follows_capacity(duty, executor)
     executor.start()
+    # Issue #284 C 组 #8：把执行器挂成 duty 的一个动态属性，供 `main()` 退出流程
+    # 用 `join_onboarding_executors` 接线 stop()/join()——不改 `OnboardingReconciler`
+    # 的类定义，见模块文档「停机接线」一节。
+    duty.onboarding_executor = executor
     logger.info(
         "首次开通编排已装配 线程数=%s 队列深度=%s 认领窗口=%s 就绪节奏=0/%s/%s",
         config.onboarding_workers,

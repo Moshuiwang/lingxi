@@ -99,6 +99,28 @@ class PostgresAdminQueries:
         self._local_overrides = PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
 
     def user_status(self, *, identifier: str) -> AdminUserStatusView | None:
+        # 登记式收敛（#371-8，2026-08-28 复审订正——下面这段原始评估被 Trace #373
+        # H1 批终修复包 opus 审查 P2-9 证明是伪二选一，订正见后半段）：
+        # `PostgresAppUserStore`（postgres_identity.py）没有一个现成方法能一次原子
+        # 查询出本方法需要的 (id, provisioning_state, account_state,
+        # permission_version, updated_at) 五列——`get_by_open_id` 按 open_id 查但
+        # 不带 account_state/updated_at，`read_status` 带 account_state 但按内部
+        # user_id 查、且不返回 updated_at。拆成"先 get_by_open_id 拿 id，再
+        # read_status 查状态"两次查询会丢掉单条 SELECT 的原子快照、多一次往返；
+        # 给 core 的 UserProvisioningStatus 加 updated_at 会改动 onboarding_runner
+        # 等其它消费方共享的形状。
+        #
+        # 订正：上面只权衡了"改 PostgresAppUserStore 的两种方式"，漏掉了第三条
+        # 路——`apps/trace/__init__.py::_fetch_user` 存在逐字节相同的这条 SELECT
+        # （同一张表、同一组列、同一个 WHERE），抽一个两边共用的只读 helper 本可
+        # 行为等价地消掉这处重复，原「两条路径都不是……因此保留」的结论是伪二选一。
+        # 本轮仍不抽取：`apps/trace` 的内联 SQL 刚在同一批里按产品负责人裁定登记为
+        # 受控只读 CLI 例外（`docs/技术设计/代码框架.md` §二「在案例外」，
+        # 2026-08-28，Issue #371）——这时候抽公共 helper 会让 trace 侧不再是"内联
+        # SQL"，部分推翻刚落的登记，在同一批修复包里自相矛盾，因此本轮接受这一处
+        # 重复。复议条件：下一次拆分批一并评估抽取两边共用的只读 helper，并同步
+        # 修订 `docs/技术设计/代码框架.md` §二对应的例外条目（届时如果真的抽取，
+        # trace 那条例外要么撤销，要么改写为"仅其余 3 条内联 SELECT"）。
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """

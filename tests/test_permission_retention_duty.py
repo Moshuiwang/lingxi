@@ -31,7 +31,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.apps.scheduler import (
     PermissionRetentionReport,
@@ -42,6 +42,8 @@ from lingxi.apps.scheduler import (
 
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，权限链到期清理的真库断言未验证（需真实 PostgreSQL 16）"
+    if not os.environ.get("LINGXI_POSTGRES_DSN")
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，权限链到期清理的真库断言未验证"
 )
 
 # 规格公开的测试向量主密钥（= ASCII "0123456789abcdef0123456789abcdef"），**非生产密钥**。
@@ -343,7 +345,7 @@ class AuditContentTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN"), SKIP_REASON)
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
 class RetentionSweepPostgresTest(unittest.TestCase):
     """只有真库能证伪这一组：到期判据是两条 SQL 的 ``content_expires_at`` 谓词，而那一列
     由触发器从 ``created_at`` / ``started_at`` 推导、调用方改不动。在假适配器上跑，

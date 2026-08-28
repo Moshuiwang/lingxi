@@ -60,44 +60,53 @@ class _TaskLifecycleMixin:
         改写（`V-灰度-01`）；迁移 013 的触发器兜底，这里写它会直接抛异常。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE task SET status = 'running',
-                                worker_id = %s,
-                                started_at = now(),
-                                heartbeat_at = now(),
-                                attempts = attempts + 1
-                 WHERE id IN (
-                     SELECT id FROM task
-                      WHERE status = 'queued'
-                        AND scheduled_at <= now()
-                        AND target_worker_version = %s
-                      ORDER BY scheduled_at, id
-                        FOR UPDATE SKIP LOCKED
-                      LIMIT %s
-                 )
-                RETURNING id, conversation_id, user_id, prompt,
-                          resumed_session, target_worker_version, attempts,
-                          reply_to_message_id, stop_requested, side_effect_state
-                """,
-                (worker_id, target_worker_version, limit),
-            )
-            return [
-                ClaimedTask(
-                    task_id=row[0],
-                    conversation_id=row[1],
-                    user_id=row[2],
-                    prompt=row[3],
-                    resumed_session=row[4],
-                    target_worker_version=row[5],
-                    attempts=row[6],
-                    reply_to_message_id=row[7],
-                    stop_requested=row[8],
-                    side_effect_state=row[9],
+        # S-H1-6（#359 根因取证方案第 2 条）：这是 worker 主循环每个 poll_interval
+        # 都会执行一次的发现查询——即使空转也照样命中，因此走
+        # `_run_polling_operation`（默认逐字节等价于原来的 `connect(...)`，只有
+        # 装配方显式打开复用时才改为持有常驻连接；打开时复用连接首次失败会重建
+        # 重试一次，见该方法文档，P2-1）。
+
+        def _claim(connection: Any) -> list[ClaimedTask]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE task SET status = 'running',
+                                    worker_id = %s,
+                                    started_at = now(),
+                                    heartbeat_at = now(),
+                                    attempts = attempts + 1
+                     WHERE id IN (
+                         SELECT id FROM task
+                          WHERE status = 'queued'
+                            AND scheduled_at <= now()
+                            AND target_worker_version = %s
+                          ORDER BY scheduled_at, id
+                            FOR UPDATE SKIP LOCKED
+                          LIMIT %s
+                     )
+                    RETURNING id, conversation_id, user_id, prompt,
+                              resumed_session, target_worker_version, attempts,
+                              reply_to_message_id, stop_requested, side_effect_state
+                    """,
+                    (worker_id, target_worker_version, limit),
                 )
-                for row in cursor.fetchall()
-            ]
+                return [
+                    ClaimedTask(
+                        task_id=row[0],
+                        conversation_id=row[1],
+                        user_id=row[2],
+                        prompt=row[3],
+                        resumed_session=row[4],
+                        target_worker_version=row[5],
+                        attempts=row[6],
+                        reply_to_message_id=row[7],
+                        stop_requested=row[8],
+                        side_effect_state=row[9],
+                    )
+                    for row in cursor.fetchall()
+                ]
+
+        return self._run_polling_operation(_claim)
 
     def finish(
         self,

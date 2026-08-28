@@ -28,6 +28,7 @@ from lingxi.apps.scheduler import (
 from lingxi.adapters.stock_token_bitable import DecryptingStockTokenSource
 from lingxi.apps.scheduler.onboarding import (
     DISPATCH_AFTER,
+    ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     PROBE_WATCHDOG_MARGIN_SECONDS,
     HardDeadlineProbe,
     OnboardingExecutor,
@@ -35,6 +36,7 @@ from lingxi.apps.scheduler.onboarding import (
     assert_probe_timeouts_agree,
     assert_stalled_lease_exceeds_chain_budget,
     build_stock_token_source,
+    join_onboarding_executors,
     monotonic_utc_clock,
 )
 from lingxi.apps.scheduler.stalled_provisioning import DEFAULT_STALLED_LEASE_SECONDS
@@ -793,6 +795,238 @@ class ExecutorTests(unittest.TestCase):
         self.addCleanup(executor.join, 2.0)
 
         self.assertTrue(ran.wait(timeout=5), "停机不得丢弃已排队的任务")
+
+
+class ShutdownWiringTests(unittest.TestCase):
+    """Issue #284 C 组 #8（Trace #373 D7 裁定修复）：``OnboardingExecutor.stop()``/
+    ``join()`` 在本次修复之前生产没有任何调用方——``_build_onboarding_duty`` 只
+    ``executor.start()``，从未有人回头 ``stop()``/``join()`` 过它。这里覆盖两段
+    接线：装配层把 ``executor`` 挂上 ``duty`` 的动态属性、``join_onboarding_executors``
+    真的会让它停止领取新工作并收工。
+    """
+
+    def test_a_wired_duty_carries_a_started_executor(self) -> None:
+        """装配产出的 ``duty`` 必须带上一个已经 ``start()`` 过的 ``OnboardingExecutor``
+        句柄——这是 ``main()`` 退出流程能找到它的唯一入口。"""
+
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token")
+        self.addCleanup(join_onboarding_executors, [duty])
+
+        executor = getattr(duty, "onboarding_executor", None)
+        self.assertIsInstance(executor, OnboardingExecutor)
+        self.assertTrue(executor.alive, "装配之后执行器必须已经 start() 过")
+
+    def test_join_onboarding_executors_stops_and_joins_the_executor(self) -> None:
+        """行为级证据（变异锚点）：调用 ``join_onboarding_executors`` 之后，执行器的
+        全部工作线程必须真的退出（``alive`` 变 ``False``），且必须已经停止领取新链
+        （``submit`` 返回 ``False``）——只 ``join()`` 不 ``stop()`` 测不出这一半，只
+        ``stop()`` 不 ``join()`` 测不出线程是否真的收工，两者都要断言。
+
+        变异验红：把 ``join_onboarding_executors`` 函数体换成 ``pass``（即"接线"
+        被撤销，回到修复前"生产没有调用方"的状态）重跑本用例，``executor.alive``
+        仍为 ``True``、``submit`` 仍返回 ``True``，两条断言都会失败。
+        """
+
+        duty, _ = build(WIRED_ENV, token=lambda: "u-token")
+        executor = duty.onboarding_executor
+        self.assertTrue(executor.alive, "前置：装配之后执行器应处于已启动状态")
+
+        join_onboarding_executors([duty])
+
+        self.assertFalse(executor.alive, "join_onboarding_executors 之后线程必须已经收工")
+        self.assertFalse(
+            executor.submit(lambda: None),
+            "join_onboarding_executors 之后执行器必须已经停止领取新链",
+        )
+
+    def test_a_duty_without_an_executor_attribute_is_a_no_op(self) -> None:
+        """没有挂 ``onboarding_executor`` 的对象（例如开通编排未装配、或调用方自己的
+        测试替身）必须被安全跳过，不抛异常——``join_onboarding_executors`` 遍历的是
+        全部职责，不能假设每一个都恰好是开通编排。"""
+
+        join_onboarding_executors([object(), None])
+
+    def test_the_shutdown_join_timeout_is_a_real_positive_budget(self) -> None:
+        """预算常量必须是正数——0 或负数会让 ``join`` 立即返回，退化成"根本没等"，
+        与「给在途工作一个有界窗口」这条纪律矛盾。"""
+
+        self.assertGreater(ONBOARDING_SHUTDOWN_JOIN_TIMEOUT_SECONDS, 0)
+
+
+class SchedulerLoopDutiesPropertyTests(unittest.TestCase):
+    """P2-5（opus 批量审查 · Trace #373 H1 批终修复包）：``SchedulerLoop.duties``
+    property 是 ``apps/scheduler/__init__.py::main()`` 退出路径把职责集合原样交给
+    ``join_onboarding_executors`` 的唯一通道——这里先钉住 property 本身：暴露的必须
+    是构造时传入的那个职责集合，不是拷贝出的一份、也不是子集。"""
+
+    def test_the_duties_property_exposes_exactly_what_was_constructed(self) -> None:
+        from lingxi.apps.scheduler.loop import SchedulerLoop
+
+        duty_a, duty_b = object(), object()
+        loop = SchedulerLoop(duties=[duty_a, duty_b])
+
+        self.assertEqual(loop.duties, (duty_a, duty_b))
+
+
+class MainExitJoinsOnboardingExecutorsTests(unittest.TestCase):
+    """Issue #284 C 组 #8（Trace #373 D7 裁定修复）：``main()`` 的退出路径必须真的
+    调用 ``join_onboarding_executors(loop.duties)``，不是文档写了但没接线。
+    ``ShutdownWiringTests`` 只覆盖 ``join_onboarding_executors`` 函数本身对不对
+    （直接传一个职责列表进去），从不经过 ``main()``——如果以后有人在 ``main()`` 里
+    删掉这一行调用，那组测试全绿也测不出来。这里用轻量桩顶掉 ``main()`` 里其余的真实
+    装配（配置读取、告警、``build_loop``、信号安装），只把"退出路径真的用
+    ``loop.duties`` 调用了 ``join_onboarding_executors``"这一段接线暴露成断言，不真的
+    起一个 scheduler 进程或后台线程（``loop.run_forever()`` 本身也是桩，立即返回）。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里
+    ``join_onboarding_executors(loop.duties)`` 那一行删掉（或换成 ``pass``）重跑本
+    用例，``join_mock.assert_called_once_with(...)`` 会因为从未被调用而失败。
+    """
+
+    def test_main_calls_join_onboarding_executors_with_the_loops_duties(self) -> None:
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(), object())
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                return None
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch(
+                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
+            ) as build_loop_mock,
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            code = main([])
+
+        self.assertEqual(code, 0)
+        install_mock.assert_called_once_with(stub_loop)
+        build_loop_mock.assert_called_once()
+        join_mock.assert_called_once_with(sentinel_duties)
+
+
+class MainExceptionExitStillJoinsOnboardingExecutorsTests(unittest.TestCase):
+    """P1-B（codex 外审 · Trace #373 H1 批终修复包②）：``main()`` 里
+    ``join_onboarding_executors(loop.duties)`` 此前放在 ``loop.run_forever()``
+    之后、没有 ``finally`` 覆盖——主循环抛出未处理异常时这一行会被绕过，开通
+    执行器的独立线程池只能靠解释器退出时被任意截断，而不是走"停止领取、等在途
+    工作在预算内收尾"的退出语义。本用例钉住修复后的行为：``run_forever()`` 抛
+    异常时 join 仍必须被调用，且原始异常必须原样向上传播（不能被收尾覆盖或吞掉）。
+
+    变异验红：把 ``lingxi/apps/scheduler/__init__.py`` 里包住 ``run_forever()``
+    的 ``try``/``finally`` 去掉、改回顺序调用（``loop.run_forever()`` 后面直接
+    跟 ``join_onboarding_executors(loop.duties)``）重跑本用例，
+    ``join_mock.assert_called_once_with(...)`` 会因为异常路径跳过了 join 调用
+    而失败。
+    """
+
+    def test_run_forever_exception_still_joins_and_propagates(self) -> None:
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(), object())
+        boom = RuntimeError("主循环崩了")
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                raise boom
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch(
+                "lingxi.apps.scheduler.build_loop", return_value=stub_loop
+            ) as build_loop_mock,
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers") as install_mock,
+            mock.patch("lingxi.apps.scheduler.join_onboarding_executors") as join_mock,
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            with self.assertRaises(RuntimeError) as ctx:
+                main([])
+
+        self.assertIs(ctx.exception, boom, "原始异常必须原样向上传播，不能被收尾覆盖")
+        install_mock.assert_called_once_with(stub_loop)
+        build_loop_mock.assert_called_once()
+        # 主循环抛异常时 join_onboarding_executors 仍必须被调用。
+        join_mock.assert_called_once_with(sentinel_duties)
+
+    def test_join_failure_during_exception_exit_does_not_mask_the_original_error(self) -> None:
+        """收尾自身失败不得覆盖原始故障：``run_forever()`` 与
+        ``join_onboarding_executors`` 都抛异常时，向上传播的必须是
+        ``run_forever()`` 的原始异常。"""
+
+        import types
+        from unittest import mock
+
+        sentinel_duties = (object(),)
+        original_error = RuntimeError("主循环的原始故障")
+
+        class _StubLoop:
+            duties = sentinel_duties
+
+            def run_forever(self) -> None:
+                raise original_error
+
+            def request_stop(self) -> None:
+                return None
+
+        stub_loop = _StubLoop()
+        stub_config = types.SimpleNamespace(interval_seconds=5)
+
+        with (
+            mock.patch("lingxi.apps.scheduler.SchedulerConfig") as config_cls,
+            mock.patch(
+                "lingxi.apps.scheduler.build_alerting_duty", return_value=mock.MagicMock()
+            ),
+            mock.patch("lingxi.apps.scheduler.build_loop", return_value=stub_loop),
+            mock.patch("lingxi.apps.scheduler.install_signal_handlers"),
+            mock.patch(
+                "lingxi.apps.scheduler.join_onboarding_executors",
+                side_effect=RuntimeError("收尾 join 也失败了"),
+            ),
+        ):
+            config_cls.from_env.return_value = stub_config
+
+            from lingxi.apps.scheduler import main
+
+            with self.assertRaises(RuntimeError) as ctx:
+                main([])
+
+        self.assertIs(
+            ctx.exception, original_error, "收尾失败不得覆盖 run_forever() 的原始异常"
+        )
 
 
 class StopSentinelRaceTests(unittest.TestCase):

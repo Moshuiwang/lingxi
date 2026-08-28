@@ -29,13 +29,18 @@ from postgres_schema import (
     ensure_production_schema,
     production_tables,
     production_tables_with_rows,
+    psycopg_available,
     reset_production_rows,
 )
 
 from lingxi.adapters.postgres import connect
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
-SKIP_REASON = "跳过：未设置 LINGXI_POSTGRES_DSN，真库用例之间的隔离契约未验证"
+SKIP_REASON = (
+    "跳过：未设置 LINGXI_POSTGRES_DSN，真库用例之间的隔离契约未验证"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，真库用例之间的隔离契约未验证"
+)
 
 # 标记行按主键点名查，不靠「表里有没有行」这种会被别的模块顺带满足的弱条件。
 _MARKERS = (
@@ -64,7 +69,7 @@ _WRITE_APP_USER, _WRITE_IMPORT_BATCH, _WRITE_INBOUND_EVENT = (
 _DIRTY_WRITES = (_WRITE_APP_USER, _WRITE_IMPORT_BATCH, _WRITE_INBOUND_EVENT)
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_REASON)
 class RealDatabaseIsolationContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from lingxi.adapters.postgres import connect
 
 from ._dataclasses import DeliveryEventRecord, PendingDeliveryTask, UncertainDeliveryTask
@@ -30,44 +32,52 @@ class _GatewayDeliveryMixin:
         这里允许多个候选同时被读到，抢占失败的一方在预留时自然让路。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
-                       t.reply_to_message_id, t.status, t.card_id, t.card_seq,
-                       t.delivery_message_id, t.fallback_text, t.delivery_consumed_sequence
-                  FROM task AS t
-                  JOIN conversation AS c ON c.id = t.conversation_id
-                 WHERE t.status IN ('running', 'awaiting_delivery')
-                   AND t.dispatch_reserved_kind IS NULL
-                   AND (
-                        EXISTS (
-                            SELECT 1 FROM task_delivery_event AS e
-                             WHERE e.task_id = t.id AND e.sequence > t.delivery_consumed_sequence
-                        )
-                        OR (t.status = 'awaiting_delivery' AND t.delivery_message_id IS NOT NULL)
-                   )
-                 ORDER BY t.created_at
-                 LIMIT %s
-                """,
-                (limit,),
-            )
-            return [
-                PendingDeliveryTask(
-                    task_id=row[0],
-                    conversation_id=row[1],
-                    chat_id=row[2],
-                    thread_id=row[3],
-                    reply_to_message_id=row[4],
-                    status=row[5],
-                    card_id=row[6],
-                    card_seq=row[7],
-                    message_id=row[8],
-                    fallback_text=row[9],
-                    consumed_sequence=row[10],
+        # S-H1-6（#359 根因取证方案第 2 条）：gateway 投递循环每 poll_interval 都
+        # 会跑这条发现查询，空转时也不例外——走 `_run_polling_operation`（默认
+        # 逐字节等价于原来的 `connect(...)`，只有装配方显式打开复用时才改为持有
+        # 常驻连接；打开时复用连接首次失败会重建重试一次，见该方法文档，P2-1）。
+
+        def _list_pending(connection: Any) -> list[PendingDeliveryTask]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT t.id, t.conversation_id, c.feishu_chat_id, c.feishu_thread_id,
+                           t.reply_to_message_id, t.status, t.card_id, t.card_seq,
+                           t.delivery_message_id, t.fallback_text, t.delivery_consumed_sequence
+                      FROM task AS t
+                      JOIN conversation AS c ON c.id = t.conversation_id
+                     WHERE t.status IN ('running', 'awaiting_delivery')
+                       AND t.dispatch_reserved_kind IS NULL
+                       AND (
+                            EXISTS (
+                                SELECT 1 FROM task_delivery_event AS e
+                                 WHERE e.task_id = t.id AND e.sequence > t.delivery_consumed_sequence
+                            )
+                            OR (t.status = 'awaiting_delivery' AND t.delivery_message_id IS NOT NULL)
+                       )
+                     ORDER BY t.created_at
+                     LIMIT %s
+                    """,
+                    (limit,),
                 )
-                for row in cursor.fetchall()
-            ]
+                return [
+                    PendingDeliveryTask(
+                        task_id=row[0],
+                        conversation_id=row[1],
+                        chat_id=row[2],
+                        thread_id=row[3],
+                        reply_to_message_id=row[4],
+                        status=row[5],
+                        card_id=row[6],
+                        card_seq=row[7],
+                        message_id=row[8],
+                        fallback_text=row[9],
+                        consumed_sequence=row[10],
+                    )
+                    for row in cursor.fetchall()
+                ]
+
+        return self._run_polling_operation(_list_pending)
 
     def list_uncertain_delivery_tasks(self, *, limit: int = 50) -> list[UncertainDeliveryTask]:
         """列出外发前预留位卡住的任务，供告警。见 ``reserve_dispatch`` 的说明。
@@ -82,21 +92,28 @@ class _GatewayDeliveryMixin:
         本身也不再有意义（不会再被任何投递路径读取或写入）。
         """
 
-        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id, dispatch_reserved_kind FROM task
-                 WHERE dispatch_reserved_kind IS NOT NULL
-                   AND status IN ('running', 'awaiting_delivery')
-                 ORDER BY created_at
-                 LIMIT %s
-                """,
-                (limit,),
-            )
-            return [
-                UncertainDeliveryTask(task_id=row[0], reserved_kind=row[1])
-                for row in cursor.fetchall()
-            ]
+        # S-H1-6（#359 根因取证方案第 2 条）：同 `list_pending_delivery_tasks`——
+        # 每 poll_interval 都会跑，同样走 `_run_polling_operation`（复用连接首次
+        # 失败会重建重试一次，见该方法文档，P2-1）。
+
+        def _list_uncertain(connection: Any) -> list[UncertainDeliveryTask]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, dispatch_reserved_kind FROM task
+                     WHERE dispatch_reserved_kind IS NOT NULL
+                       AND status IN ('running', 'awaiting_delivery')
+                     ORDER BY created_at
+                     LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return [
+                    UncertainDeliveryTask(task_id=row[0], reserved_kind=row[1])
+                    for row in cursor.fetchall()
+                ]
+
+        return self._run_polling_operation(_list_uncertain)
 
     def read_delivery_events(
         self, *, task_id: str, after_sequence: int

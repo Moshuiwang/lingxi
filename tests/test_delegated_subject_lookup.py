@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from postgres_schema import ensure_production_schema, reset_production_rows
+from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 from lingxi.adapters.delegated_subject_lookup import (
     DELEGATED_PURPOSE,
@@ -28,10 +28,12 @@ from lingxi.adapters.postgres import connect
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
     "跳过：未设置 LINGXI_POSTGRES_DSN，专用授权主体标识读取的真库断言未验证（需真实 PostgreSQL 16）"
+    if not DSN
+    else "跳过：LINGXI_POSTGRES_DSN 已设置但未安装 psycopg 驱动，专用授权主体标识读取的真库断言未验证"
 )
 
 
-@unittest.skipUnless(DSN, SKIP_REASON)
+@unittest.skipUnless(DSN and psycopg_available(), SKIP_REASON)
 class RegisteredDelegatedSubjectOpenIdTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
