@@ -277,6 +277,13 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.router",
     "lingxi.core.admin.views",
     "lingxi.adapters.admin_registry",
+    # 失败原因落库（Issue #337，S-H3-1）：`onboarding_failure` 表（迁移 0077）的
+    # 唯一 PostgreSQL 落点。被两处消费——`adapters.admin_registry.
+    # PostgresAdminQueries.trace_lookup`（`/admin trace` 查询，只 import
+    # `fetch_failure_reason`）与 `apps.scheduler.onboarding`/
+    # `apps.scheduler.stalled_provisioning`（`PostgresFailureReasonRecorder`
+    # 写入方，两处各自的构造函数内 import，见下面 scheduler 闭包同名条目）。
+    "lingxi.adapters.postgres_onboarding_failure",
     # 待确认操作：管理员写动作 prepare/confirm/cancel + 确认卡片/管理群通知渲染 +
     # 卡片回调编排（Issue #96 S-M-02）。全部只被 gateway 的管理命令面消费，与
     # 上面 admin_bootstrap 无关——admin_bootstrap 只播种登记表，不发起写动作。
@@ -493,6 +500,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             "lingxi.adapters.user_environment",
+            # 失败原因落库（Issue #337，S-H3-1）：`_build_onboarding_duty`
+            # （`apps/scheduler/onboarding.py`）与 `_build_stalled_provisioning_
+            # duty`（`apps/scheduler/stalled_provisioning.py`）各自在函数内
+            # import `PostgresFailureReasonRecorder`，两个调用点都不在模块级，
+            # 必须显式登记。
+            "lingxi.adapters.postgres_onboarding_failure",
             # 组织快照同步（Issue #250）：`apps/scheduler/__init__.py` 模块级 import
             # `OrgSnapshotSyncDuty`；读取编排 `feishu_org_snapshot_reader` 由
             # `_build_org_snapshot_sync_duty` 函数内 import，与 onboarding 一节
@@ -883,6 +896,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # PostgresAdminRegistryLookup/PostgresAdminQueries，无条件装配（不受
             # 任何 feature flag 控制，见该函数内注释），因此这条闭包必须显式登记。
             "lingxi.adapters.admin_registry",
+            # `/admin trace <追溯号>`（Issue #337，S-H3-1）：`PostgresAdminQueries.
+            # trace_lookup` 模块级 import `fetch_failure_reason`，随
+            # `admin_registry` 一起进了 gateway 的运行时闭包。
+            "lingxi.adapters.postgres_onboarding_failure",
             # 专用主体结构性出口前置（opus P3-1）：build_supervisor 在函数内 import
             # registered_delegated_subject_open_id，装配期读一次登记表把结果算成
             # 一个普通字符串交给管线（见该函数内注释）。刻意登记

@@ -18,6 +18,7 @@ from lingxi.core.admin.commands import (
     AdminCommandKind,
     parse_admin_command,
 )
+from lingxi.core.ids import new_ulid
 
 
 class HelpParsingTests(unittest.TestCase):
@@ -320,6 +321,52 @@ class RevokePermissionParsingTests(unittest.TestCase):
 
     def test_missing_override_id_is_unknown(self) -> None:
         command = parse_admin_command("/admin revoke_permission")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+
+class QueryTraceParsingTests(unittest.TestCase):
+    """``/admin trace <追溯号>``（Issue #337）：``<追溯号>`` 必须是裸 ULID，
+    与 ``inbound_event.trace_id``/``onboarding_failure.trace_id`` 的存储形状
+    一致——不加前缀，与 ``user``/``suspend`` 等命令用的 ``_IDENTIFIER_PATTERN``
+    是两条独立的校验（那条允许任意 1–128 字符标识形状，本命令刻意更窄）。"""
+
+    def test_valid_ulid_recognized(self) -> None:
+        trace_id = new_ulid()
+        command = parse_admin_command(f"/admin trace {trace_id}")
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_TRACE)
+        self.assertEqual(command.identifier, trace_id)
+
+    def test_lowercase_ulid_recognized(self) -> None:
+        """``is_ulid`` 大小写不敏感——与 ``core/ids.is_ulid`` 文档一致。"""
+
+        trace_id = new_ulid().lower()
+        command = parse_admin_command(f"/admin trace {trace_id}")
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_TRACE)
+        self.assertEqual(command.identifier, trace_id)
+
+    def test_missing_identifier_is_unknown(self) -> None:
+        self.assertEqual(parse_admin_command("/admin trace").kind, AdminCommandKind.UNKNOWN)
+
+    def test_extra_argument_is_unknown(self) -> None:
+        trace_id = new_ulid()
+        command = parse_admin_command(f"/admin trace {trace_id} extra")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_non_ulid_identifier_is_unknown(self) -> None:
+        """否定断言：不是合法 ULID 形状（长度不对、含非 Crockford Base32 字符）
+        一律 ``UNKNOWN``——``/admin user`` 那种宽松的 ``_IDENTIFIER_PATTERN``
+        不适用于本命令，防止把任意字符串当追溯号去查库。"""
+
+        command = parse_admin_command("/admin trace ou_abc123")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_ulid_shaped_but_wrong_length_is_unknown(self) -> None:
+        trace_id = new_ulid()[:-1]  # 少一位
+        command = parse_admin_command(f"/admin trace {trace_id}")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_sql_injection_shaped_trace_id_rejected(self) -> None:
+        command = parse_admin_command("/admin trace 1; DROP TABLE onboarding_failure;--")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
 
 

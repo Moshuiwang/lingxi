@@ -21,9 +21,11 @@ from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, Admi
 from lingxi.core.admin.router import (
     AdminCommandRouter,
     AdminEventView,
+    AdminTraceView,
     AdminUserStatusView,
     LocalPermissionOverrideView,
 )
+from lingxi.core.ids import new_ulid
 
 
 class FakeAudit:
@@ -59,13 +61,18 @@ class FakeQueries:
         *,
         users: dict[str, AdminUserStatusView] | None = None,
         events: list[AdminEventView] | None = None,
+        traces: dict[str, AdminTraceView] | None = None,
         raise_on_user: bool = False,
+        raise_on_trace: bool = False,
     ) -> None:
         self.user_calls: list[str] = []
         self.event_calls: list[dict[str, object]] = []
+        self.trace_calls: list[str] = []
         self._users = users or {}
         self._events = events or []
+        self._traces = traces or {}
         self._raise_on_user = raise_on_user
+        self._raise_on_trace = raise_on_trace
 
     def user_status(self, *, identifier: str) -> AdminUserStatusView | None:
         self.user_calls.append(identifier)
@@ -80,6 +87,12 @@ class FakeQueries:
             {"identifier": identifier, "window_hours": window_hours, "limit": limit}
         )
         return list(self._events)
+
+    def trace_lookup(self, *, trace_id: str) -> AdminTraceView | None:
+        self.trace_calls.append(trace_id)
+        if self._raise_on_trace:
+            raise RuntimeError("模拟查询失败")
+        return self._traces.get(trace_id)
 
 
 class _FakePrepareDecision:
@@ -488,6 +501,143 @@ class QueryUserCommandTests(unittest.TestCase):
         )
 
         self.assertNotIn("暂不生效", outcome.reply_text)
+
+
+class QueryTraceCommandTests(unittest.TestCase):
+    """``/admin trace <追溯号>``（Issue #337）。认领断言：管理员能凭追溯号查回
+    ``failure_reason``（`test_failure_reason_reported`）；查无追溯号明确回复
+    「不存在」（`test_unknown_trace_id_reported_as_not_found`，且不是空字符串
+    也不是异常）；追溯号存在但没有失败记录时如实回「无失败记录」而不是假装
+    查无此追溯号（`test_trace_without_failure_reason_reported_honestly`）。
+    脱敏断言：回复不带 open_id（`test_reply_never_echoes_open_id`）。"""
+
+    def test_failure_reason_reported(self) -> None:
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="auto_provisioning",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason="directory_unavailable",
+                    failure_event_type="onboarding.result",
+                    failure_occurred_at="2026-08-28T01:05:00+00:00",
+                )
+            }
+        )
+        router, _, queries, audit = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("directory_unavailable", outcome.reply_text)
+        self.assertIn("onboarding.result", outcome.reply_text)
+        self.assertEqual(queries.trace_calls, [trace_id])
+        self.assertEqual(audit.actions(), ["admin.command.query_trace"])
+        self.assertEqual(audit.records[0][1]["found"], True)
+        self.assertEqual(audit.records[0][1]["target"], trace_id)
+
+    def test_unknown_trace_id_reported_as_not_found(self) -> None:
+        """否定断言：查无此追溯号是明确的「不存在」文案，不是空白或报错。"""
+
+        trace_id = new_ulid()
+        router, _, queries, audit = _router(queries=FakeQueries())
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("查无此追溯号", outcome.reply_text)
+        self.assertEqual(queries.trace_calls, [trace_id])
+        self.assertEqual(audit.records[0][1]["found"], False)
+
+    def test_trace_without_failure_reason_reported_honestly(self) -> None:
+        """追溯号存在（例如成功开通、或仍在进行中）但没有失败记录：如实回
+        「无失败记录」并带上能查到的开通状态，不是假装这条追溯号也查无此人。"""
+
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="auto_provisioning",
+                    dispatched=True,
+                    provisioning_state="active",
+                    account_state="enabled",
+                    failure_reason=None,
+                    failure_event_type=None,
+                    failure_occurred_at=None,
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("无失败记录", outcome.reply_text)
+        self.assertIn("active", outcome.reply_text)
+        self.assertNotIn("查无此追溯号", outcome.reply_text)
+
+    def test_reply_never_echoes_open_id(self) -> None:
+        """脱敏断言（Issue #337 范围条目 3）：回复不带 open_id。"""
+
+        trace_id = new_ulid()
+        secret_open_id = "ou_should_never_appear"
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="auto_provisioning",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason="mcp_sync_timeout",
+                    failure_event_type="onboarding.result",
+                    failure_occurred_at="2026-08-28T01:20:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertNotIn(secret_open_id, outcome.reply_text)
+
+    def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
+        """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询
+        （与既有 `DefaultDenyTests` 同一姿态，本命令专用取证）。"""
+
+        trace_id = new_ulid()
+        router, registry, queries, audit = _router(registry=FakeRegistry({}))
+
+        outcome = router.route(
+            open_id="ou_never_registered_9f3e",
+            text=f"/admin trace {trace_id}",
+            trace_id="t1",
+        )
+
+        self.assertFalse(outcome.handled)
+        self.assertEqual(queries.trace_calls, [])
+        self.assertEqual(audit.actions(), ["admin.command.rejected"])
 
 
 class QueryAuditCommandTests(unittest.TestCase):

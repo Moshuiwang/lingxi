@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0073_pending_action_perm_types` |
+| head revision | `0077_onboarding_failure_reason` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -426,6 +426,23 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 
 表本 revision 只新增列与约束，前滚兼容；`downgrade()` 未在任何环境验证过真实
 回滚（本 revision 未在任何环境应用过）。
+
+## `0077_onboarding_failure_reason`（开通失败原因落库）
+
+[Issue #337](https://github.com/Moshuiwang/lingxi/issues/337)（Trace #373 S-H3-1）。
+新建窄表 `onboarding_failure`（`trace_id` 主键，`failure_reason`/`event_type`/
+`occurred_at`），供 `/admin trace <追溯号>` 查回此前只能靠检索 scheduler 容器日志
+才能拿到的失败原因；不是 S9 那张大而全的 `audit_event` 表，判据与写入方/幂等
+策略见迁移文件头部完整说明。
+
+**`down_revision` 实测订正**（本 revision 文件头部同一说明的摘要）：链的真实拓扑
+是`...0071 → 0075 → 0074 → 0072 → 0073`（头），文件名数字不是合并顺序；本 revision
+因此以实测的真实头 `0073_pending_action_perm_types` 为 `down_revision`，不是按
+文件名数字假设的 `0075`。
+
+表本 revision 新增，前滚兼容；`downgrade()` 直接删表，是数据丢失操作（一旦部署
+环境写过失败原因，`DROP TABLE` 会把它们连同表一起清空），不存在需要回填的历史值
+（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
