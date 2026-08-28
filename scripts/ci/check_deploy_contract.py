@@ -640,6 +640,119 @@ def check_scheduler_user_volume() -> list[str]:
     return failures
 
 
+# ---- 资源限制（Trace #373 H2 / S-H2-1，产品负责人 2026-08-28 先行裁定）--------
+# stage 主机只有 2 核 / 3.7GiB，不设限制的容器可能互相饿死；限制过低又会在正常
+# 负载下杀死真实的 Agent SDK 回合（Claude CLI + 多个 MCP 子进程）。具体数值分
+# 环境写在 compose.stage.yaml / compose.prod.yaml（deploy/README.md「资源限制」
+# 一节有完整推导），门禁只守「结构」：全部六个服务必须显式声明内存、CPU、pids
+# 三项限制，不核对具体数值——数值对错是容量判断，不是机械可判定的对错。
+RESOURCE_LIMITED_SERVICES = (
+    "scheduler",
+    "gateway",
+    "worker",
+    "worker-queue",
+    "migrate",
+    "reauthorize",
+)
+
+
+def check_resource_limits() -> list[str]:
+    """`deploy/compose.yaml` 的六个服务都必须声明 `deploy.resources.limits`
+    的 `cpus`/`memory`/`pids` 三项。
+
+    只做结构核对（键是否存在），不核对具体数值——具体数值由环境决定，见
+    `deploy/README.md`「资源限制」一节；门禁只保证"没有任何服务被漏掉、漏配了
+    限制"，不重复容量判断。
+    """
+
+    failures: list[str] = []
+    base = strip_comments(read(COMPOSE_BASE))
+    for service in RESOURCE_LIMITED_SERVICES:
+        block = service_block(base, service)
+        if block is None:
+            failures.append(f"deploy/compose.yaml 找不到 service `{service}`")
+            continue
+        deploy_block = service_block(block, "deploy") or ""
+        resources_block = service_block(deploy_block, "resources") or ""
+        limits_block = service_block(resources_block, "limits") or ""
+        if not limits_block.strip():
+            failures.append(
+                f"{service} 在 deploy/compose.yaml 里没有 deploy.resources.limits "
+                "声明。stage 主机只有 2 核 / 3.7GiB，不限制的容器会互相饿死；"
+                "缺一个服务的限制就是缺一个失控风险。"
+            )
+            continue
+        for key in ("cpus", "memory", "pids"):
+            if not re.search(rf"^\s*{key}:\s*\S", limits_block, re.MULTILINE):
+                failures.append(
+                    f"{service} 的 deploy.resources.limits 缺 `{key}`"
+                )
+    return failures
+
+
+# ---- 日志留存下限（Trace #373 H2 / S-H2-2，Issue #343）-----------------------
+# 提高 json-file 驱动内的单容器日志上限，作为宿主侧收集（deploy/collect-
+# container-logs.sh + deploy/lingxi-container-logs.logrotate）之外的第一层缓冲：
+# 收集脚本按增量追加，即便某一轮收集因故延迟，docker 自己的 json-file 也要留够
+# 窗口，不能让还没被收集走的部分先被 docker 自己的轮转吞掉。
+LOG_MAX_SIZE_FLOOR_MB = 50.0
+LOG_MAX_FILE_FLOOR = 5
+
+
+def _parse_log_size_mb(raw: str) -> float | None:
+    """把 compose 的 `max-size` 写法（如 `"50m"`、`"1g"`、裸数字字节）解析成 MB。"""
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kKmMgG]?)", raw.strip().strip("'\""))
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit in ("k", "K"):
+        return value / 1024
+    if unit in ("m", "M"):
+        return value
+    if unit in ("g", "G"):
+        return value * 1024
+    return value / 1024 / 1024
+
+
+def check_log_retention_floor() -> list[str]:
+    """六个服务的 json-file `max-size`/`max-file` 不得低于取证留存下限（#343）。
+
+    下限本身是"容器存活期间的第一层缓冲够不够宽"，不是 30 天窗口本身——30 天
+    窗口由宿主侧收集脚本 + logrotate 独立保证（deploy/日志留存.md），门禁这里
+    只挡"有人把 compose 里的 max-size/max-file 改回了取证要求之前的值"。
+    """
+
+    failures: list[str] = []
+    base = strip_comments(read(COMPOSE_BASE))
+    for service in RESOURCE_LIMITED_SERVICES:
+        block = service_block(base, service)
+        if block is None:
+            failures.append(f"deploy/compose.yaml 找不到 service `{service}`")
+            continue
+        logging_block = service_block(block, "logging") or ""
+        options_block = service_block(logging_block, "options") or ""
+        size_match = re.search(r'^\s*max-size:\s*"?([\w.]+)"?\s*$', options_block, re.MULTILINE)
+        file_match = re.search(r'^\s*max-file:\s*"?(\d+)"?\s*$', options_block, re.MULTILINE)
+        if size_match is None or file_match is None:
+            failures.append(f"{service} 的 logging.options 缺 max-size 或 max-file")
+            continue
+        size_mb = _parse_log_size_mb(size_match.group(1))
+        if size_mb is None or size_mb < LOG_MAX_SIZE_FLOOR_MB:
+            failures.append(
+                f"{service} 的 json-file max-size 是 {size_match.group(1)}，低于取证"
+                f"留存要求的下限 {LOG_MAX_SIZE_FLOOR_MB:.0f}m（Issue #343）"
+            )
+        file_count = int(file_match.group(1))
+        if file_count < LOG_MAX_FILE_FLOOR:
+            failures.append(
+                f"{service} 的 json-file max-file 是 {file_count}，低于取证留存"
+                f"要求的下限 {LOG_MAX_FILE_FLOOR}（Issue #343）"
+            )
+    return failures
+
+
 def check_compose_contract() -> list[str]:
     failures: list[str] = []
     base = strip_comments(read(COMPOSE_BASE))
@@ -1240,6 +1353,8 @@ def main() -> int:
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
+        ("六服务资源限制结构", check_resource_limits),
+        ("日志留存下限", check_log_retention_floor),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),
         (".dockerignore 覆盖面", check_dockerignore),
