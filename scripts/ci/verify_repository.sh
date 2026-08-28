@@ -57,6 +57,7 @@ python3 scripts/ci/check_acceptance_matrix.py
 # scripts/ci/size_ratchet_baseline.txt 里，只许变小、不许变大；未超阈值的文件不得
 # 新超过阈值。基线由 --refresh 生成，拒绝被手工调大——见该脚本头注释。
 python3 scripts/ci/check_size_ratchet.py
+python3 scripts/ci/check_matrix_row_size_ratchet.py
 # 代码框架「二、三层之间的 import 规则」第一条（Issue #238）：core/ 不得 import
 # adapters/、apps/ 或任何外部 SDK。用 ast 遍历整棵树，含函数内延迟导入。
 python3 scripts/ci/check_core_layering.py
