@@ -201,6 +201,7 @@ from lingxi.core.identity.onboarding_ports import (
     UserStateStore,
     _AuditSink,
 )
+from lingxi.core.identity.onboarding_support import draft_from_member, roster_row_for
 from lingxi.core.identity.onboarding_terminal import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
@@ -1288,47 +1289,3 @@ class AutoOnboardingRunner:
             KEY_COMPLETED,
             values=(("company_name", company), ("function_name", function)),
         )
-
-
-# ----------------------------------------------------------------------
-# 纯函数
-# ----------------------------------------------------------------------
-
-
-def roster_row_for(
-    personnel_id: str, rows: Sequence[Mapping[str, Any]]
-) -> Mapping[str, Any] | None:
-    """取该人员 ID 的**唯一**花名册行。
-
-    多行时返回 ``None``——但走到这里已经不可能了：``match_galaxy_account`` 对同一人员 ID
-    的多行一律判 ``not_found``（`V-开通-09`）。保留这一格是因为"建档时挑了其中一行"是一种
-    会静默把别人的工号挂到这个人身上的错误，不能靠上游记得拦。
-    """
-
-    needle = str(personnel_id).strip()
-    matched = [row for row in rows if str(row.get("personnel_id", "") or "").strip() == needle]
-    return matched[0] if len(matched) == 1 else None
-
-
-def draft_from_member(member: SnapshotMember) -> IdentityRecordDraft:
-    """从快照成员组装建档草稿。
-
-    与 ``decide_first_contact`` 内部的组装**逐字段相同**——那一份是判定的一部分、不外露，
-    这一份是编排层拿去建档的。两处必须一致，由 ``tests/test_onboarding_runner.py`` 的专项
-    用例钉住：不一致会让"判定说资料齐了"和"实际写进去的资料"分叉。
-    """
-
-    department = (
-        member.department_names[0].strip()
-        if member.department_names and member.department_names[0]
-        else ""
-    )
-    return IdentityRecordDraft(
-        feishu_open_id=member.open_id.strip(),
-        feishu_user_id=member.user_id.strip(),
-        feishu_union_id=member.union_id.strip(),
-        display_name=member.display_name.strip(),
-        display_name_locale=member.display_name_locale,
-        department=department,
-        tenant_key=member.tenant_key.strip(),
-    )

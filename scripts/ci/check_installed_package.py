@@ -79,6 +79,12 @@ REQUIRED_MODULES = (
     # `from .onboarding_ports import (...)`。随 `onboarding_runner.py` 同一条
     # 发布理由——制品缺它会让 runner 装不起来。
     "lingxi.core.identity.onboarding_ports",
+    # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：
+    # roster_row_for/draft_from_member 两个模块级纯函数搬进本模块，
+    # `onboarding_runner.py` 顶部 `from .onboarding_support import (...)`。随
+    # `onboarding_runner.py` 同一条发布理由；`tests/test_onboarding_runner.py:27`
+    # 仍从 `onboarding_runner` 导入两者（re-export 成立）。
+    "lingxi.core.identity.onboarding_support",
     # Trace #358 S-H-1（Issue #350 Gate G-3 裁定 Option A）纯移动拆分：`_Terminal`/
     # 两个异常类/`_with_reference`/两个失败工厂/全部 STATE_*、KEY_* 常量搬进本模块，
     # `onboarding_runner.py` 顶部 `from .onboarding_terminal import (...)`。随
@@ -447,6 +453,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.identity.onboarding_ports",
             # Trace #358 S-H-1，同上一条理由：`onboarding_runner.py` 顶部同样
             # **模块级** import 了本模块。
+            "lingxi.core.identity.onboarding_support",
             "lingxi.core.identity.onboarding_terminal",
             # 存量令牌 adopt-or-issue（Issue #281 改道，Trace #304 批次 3）：
             # `build_loop` 模块级 import `build_stock_token_source`（`apps/scheduler/
