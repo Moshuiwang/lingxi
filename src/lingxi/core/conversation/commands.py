@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -92,6 +93,11 @@ _MEMORY_SEPARATOR = "=>"
 #: `core/admin/commands.py` 的 `_PERMISSION_REASON_MAX_LENGTH` 同一姿态。
 _MEMORY_KEY_MAX_LENGTH = 200
 _MEMORY_VALUE_MAX_LENGTH = 2000
+#: 子命令/参数的词边界——**只认水平空白**（Trace #373 H3 批 codex 外审②
+#: 修复②），不用 ``str.split()`` 的默认空白语义（那会把换行也当分隔符）。只
+#: 在确认消息不含「换行 + 换行后非空内容」之后才会用到，见
+#: :func:`parse_memory_command` 文档。
+_HORIZONTAL_WHITESPACE_RE = re.compile(r"[ \t]+")
 
 
 class MemoryCommandKind(str, Enum):
@@ -167,10 +173,30 @@ def parse_memory_command(text: object) -> MemoryCommand:
       的落点（设计文 b/e 节）：只接受 ``key => value`` 这种键值对形状，不接受
       任意自由文本直接登记。
 
+    **只对首行做 token 化，水平空白 ``[ \\t]+`` 分隔**（Trace #373 H3 批 codex
+    外审②修复②）：上一修复包把词边界判定改成 ``str.split()`` 的默认空白语义
+    （空格、Tab、换行都算分隔符），本意只是让 ``/memory\\tlist`` 这类 Tab 分隔
+    输入落进 /memory 命令面（见 :func:`is_memory_command_message` 文档），但
+    连带让 ``/memory\\nclear`` 这种「消息第一行恰好是 ``/memory``、第二行恰好
+    是 ``clear``」的多行粘贴消息也被当成合法的 ``clear`` 命令执行——多行粘贴
+    是真实存在的输入形态（用户在别处复制一段文本贴进来），子命令/参数的词边界
+    不该跨行识别，否则一次意外的换行巧合就能触发不可恢复的清空。因此本函数在
+    确认 ``is_memory_command_message`` 之后，**消息里若存在换行且换行之后还有
+    非空内容，直接判定为不构成合法 /memory 命令**（不猜测该按第一行还是全文
+    解析），落 ``NONE`` 交调用方渲染用法提示；此时消息仍然属于 /memory 命令面
+    （不会被判成完全无关的斜杠输入），只是子命令解析失败。真正参与子命令/参数
+    切分的只有第一行，且只认水平空白（空格、Tab）为分隔符，不再用
+    ``str.split()`` 默认语义——``/memory\\tlist``（整条消息只有一行）不受影响，
+    仍然识别为 LIST（保留上一修复包的意图）。
+
     任何不匹配以上形状的输入（非字符串、空文本、未知子命令、参数数量或形状不对、
     ``memory_type`` 不在取值域内、``remember`` 缺少 ``=>``、``key``/``value`` 为空
     或越界）一律返回 ``NONE``——调用方据此渲染用法提示，不猜测意图，与
     ``core/admin/commands.py`` 的既有纪律一致。
+
+    变异锚点：把下面「换行且换行后有非空内容 → 直接 ``NONE``」这段判据删掉，
+    ``NewlineInjectionGuardTest`` 一组用例会从抛出 ``NONE``/零删除变红成
+    ``/memory\\nclear`` 被当作合法 ``clear`` 执行。
     """
 
     if not isinstance(text, str):
@@ -179,11 +205,18 @@ def parse_memory_command(text: object) -> MemoryCommand:
     if not is_memory_command_message(stripped):
         return _memory_none()
 
-    rest_raw = stripped[len(_MEMORY_COMMAND_PREFIX) :].strip()
+    first_line, has_newline, after_newline = stripped.partition("\n")
+    if has_newline and after_newline.strip():
+        # 换行后还有非空内容：不是合法的单行 /memory 命令，形状不对——落
+        # usage_help 路径，不猜测该按第一行还是全文解析。
+        return _memory_none()
+
+    rest_raw = first_line[len(_MEMORY_COMMAND_PREFIX) :]
+    rest_raw = rest_raw.strip(" \t")
     if not rest_raw:
         # 裸 "/memory"：没有子命令，形状不对。
         return _memory_none()
-    tokens = rest_raw.split(maxsplit=1)
+    tokens = _HORIZONTAL_WHITESPACE_RE.split(rest_raw, maxsplit=1)
     sub = tokens[0].lower()
     remainder = tokens[1] if len(tokens) > 1 else ""
 
@@ -223,11 +256,13 @@ def _is_memory_id(token: str) -> bool:
 def _parse_remember(remainder: str) -> MemoryCommand:
     """``remember`` 的解析：``<memory_type> <key> => <value>``。
 
-    先按空白切出第一个 token 作为 ``memory_type``，剩余部分必须包含 ``=>``（取
+    先按**水平空白**（``[ \\t]+``，同 :func:`parse_memory_command` 文档「只对
+    首行做 token 化」的口径——调用方已经保证 ``remainder`` 来自不含换行的第一
+    行）切出第一个 token 作为 ``memory_type``，剩余部分必须包含 ``=>``（取
     **第一次**出现的位置切分，允许 ``value`` 本身包含形似箭头的文本）；两侧各自
     ``strip()`` 后校验非空与长度上限。"""
 
-    type_tokens = remainder.split(maxsplit=1)
+    type_tokens = _HORIZONTAL_WHITESPACE_RE.split(remainder, maxsplit=1)
     if len(type_tokens) < 2:
         return _memory_none()
     memory_type, rest = type_tokens[0].lower(), type_tokens[1]

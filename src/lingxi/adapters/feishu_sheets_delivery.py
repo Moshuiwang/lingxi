@@ -54,7 +54,12 @@ https://github.com/Moshuiwang/lingxi/issues/354#issuecomment-5443426083)，证�
 :class:`FeishuSheetsDeliveryError`（``definite=True``，判别口径同
 :class:`lingxi.adapters.feishu_docx_delivery.FeishuDocxDeliveryError`）；响应本身
 成功（``code`` 为 0）但缺失可回读标识时抛出 ``LookupError``——这种"结果不明"
-不属于飞书明确拒绝。传输层异常（连接失败、超时、JSON 解析失败）由默认传输
+不属于飞书明确拒绝。**响应缺失 ``code`` 字段本身也不当作成功**（Trace #373
+H3 批 codex 外审②修复①）：``urllib_transport`` 对 ``HTTPError`` 若能从响应体
+解析出 JSON 就原样返回，不看这份 JSON 里有没有 ``code``——``_data`` 因此
+fail-closed，只有显式 ``0``/``"0"`` 才继续，``code`` 缺失一律抛
+``FeishuSheetsDeliveryError("missing_code", definite=False)``，防止「HTTP 500 +
+``{}``」被误判成功。传输层异常（连接失败、超时、JSON 解析失败）由默认传输
 :func:`urllib_transport` 分类为 ``FeishuSheetsDeliveryError(definite=False)``。
 
 ## 凭据与内容边界
@@ -247,12 +252,27 @@ class LarkSheetsDelivery:
         不做静默降级**——同 ``feishu_docx_delivery.LarkDocxDelivery._data`` 的
         理由：一旦这里被改成"记日志后继续"，所有写操作都会在飞书拒绝的情况下
         被上层误判为成功。
+
+        **fail-closed（Trace #373 H3 批 codex 外审②修复①）**：``code`` 字段
+        缺失（``None``）不当作成功放行——``urllib_transport`` 对 ``HTTPError``
+        若能从响应体解析出 JSON 就原样返回（不管这份 JSON 有没有 ``code``
+        字段），组合起来会出现「HTTP 500 + ``{}``」被当作成功响应、后续写值
+        照常进行、最终交付空表或未更新的表格这一路径。S-W0-3 探针（#354 最新
+        评论，证据等级 6）实测四个端点的真实成功响应**均带 ``code=0``**，因此
+        只有显式 ``0``/``"0"`` 才视为成功；``code`` 缺失一律判「结果不明」
+        （``definite=False``），交给调用方按传输层异常同等对待，不静默放行。
+
+        变异锚点：把 ``code is None`` 这条分支删掉（退回"``None`` 也算成功"），
+        本模块 ``MissingCodeTest`` 一组用例会从抛出
+        ``FeishuSheetsDeliveryError`` 变红成静默返回空 dict。
         """
 
         if not isinstance(response, Mapping):
             raise FeishuSheetsDeliveryError("invalid_response_shape", definite=False)
         code = response.get("code")
-        if code not in (None, 0, "0"):
+        if code is None:
+            raise FeishuSheetsDeliveryError("missing_code", definite=False)
+        if code not in (0, "0"):
             raise FeishuSheetsDeliveryError(_safe_feishu_code(code), definite=True)
         data = response.get("data")
         return data if isinstance(data, Mapping) else {}

@@ -19,8 +19,9 @@
 
 from __future__ import annotations
 
+import io
 import unittest
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from lingxi.adapters.feishu_sheets_delivery import (
     FeishuSheetsDeliveryError,
@@ -472,6 +473,68 @@ class ErrorClassificationTest(unittest.TestCase):
             client.create_spreadsheet("t")
 
         self.assertEqual(raised.exception.code, "feishu_code_invalid")
+
+
+class MissingCodeTest(unittest.TestCase):
+    """P1（Trace #373 H3 批 codex 外审②修复①）：``code`` 字段缺失（``None``）
+    不当作成功放行——组合场景是 ``urllib_transport`` 对 ``HTTPError`` 解析出
+    JSON 就原样返回，若这份 JSON 是 ``{}``（HTTP 500 但响应体没有 ``code``），
+    旧实现的 ``code not in (None, 0, "0")`` 判据会放行，写值被判"成功"，实际
+    交付空表/未更新表。
+
+    变异锚点：把 ``_data`` 里 ``code is None`` 这条分支删掉（退回旧的
+    ``code not in (None, 0, "0")`` 判据），本组用例会从抛出
+    ``FeishuSheetsDeliveryError`` 变红成静默放行。
+    """
+
+    def test_a_response_missing_code_is_rejected_and_indefinite(self) -> None:
+        transport = RecordingTransport([{"data": {"spreadsheet": {"spreadsheet_token": SPREADSHEET_TOKEN, "url": SPREADSHEET_URL}}}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuSheetsDeliveryError) as raised:
+            client.create_spreadsheet("本月销售分析")
+
+        self.assertEqual(raised.exception.code, "missing_code")
+        self.assertFalse(raised.exception.definite)
+
+    def test_write_values_with_a_missing_code_response_is_rejected(self) -> None:
+        """三个写操作（建表已单独覆盖）里挑 ``write_values`` 代表性覆盖一次：
+        缺 ``code`` 时不能被判"已写成功"。"""
+
+        transport = RecordingTransport([{}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuSheetsDeliveryError) as raised:
+            client.write_values(SPREADSHEET_TOKEN, SHEET_ID, [["a"]])
+
+        self.assertEqual(raised.exception.code, "missing_code")
+        self.assertFalse(raised.exception.definite)
+
+    def test_an_http_500_with_an_empty_json_body_is_rejected_end_to_end(self) -> None:
+        """端到端组合场景：``urllib_transport`` 对 ``HTTPError`` 解析出 JSON
+        就原样返回（不看有没有 ``code``），``{}`` 是这类响应体的真实最小形状
+        （HTTP 500 但服务端没有按飞书契约填充业务错误码）——本用例钉住
+        ``urllib_transport`` → ``_data`` 整条链路对这一形状 fail-closed，不是
+        只在 ``_data`` 单元测试层面成立。
+        """
+
+        import lingxi.adapters.feishu_sheets_delivery as module
+
+        def boom(*_args, **_kwargs):
+            raise HTTPError(f"{BASE_URL}/sheets/v3/spreadsheets", 500, "Internal Server Error", {}, io.BytesIO(b"{}"))
+
+        original = module.urlopen
+        module.urlopen = boom
+        try:
+            client = LarkSheetsDelivery(
+                base_url=BASE_URL, tenant_access_token=_token_supply(), transport=None
+            )
+            with self.assertRaises(FeishuSheetsDeliveryError) as raised:
+                client.create_spreadsheet("本月销售分析")
+            self.assertEqual(raised.exception.code, "missing_code")
+            self.assertFalse(raised.exception.definite)
+        finally:
+            module.urlopen = original
 
 
 class ColumnLetterTest(unittest.TestCase):
