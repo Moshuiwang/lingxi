@@ -7,7 +7,8 @@
    连接、不缓存结果（"角色收回后新请求立即拒绝"这条不变量的数据库侧兑现）。
 2. :class:`PostgresAdminQueries` —— 只读查询命令组的查询实现，只读 `app_user`/
    `inbound_event`/`local_permission_override`（后者只为 `user_status()` 回显
-   「当前生效本地覆盖」段，#319 S-P-1b 卡 B），不提供任意 SQL 拼接入口。
+   「当前生效本地覆盖」段，#319 S-P-1b 卡 B）/`onboarding_failure`（`trace_lookup()`
+   回显失败原因，Issue #337 迁移 `0077`），不提供任意 SQL 拼接入口。
 3. :func:`seed_admin_registry_entry` —— 唯一的写路径，供
    ``apps/admin_bootstrap`` 一次性种子命令调用；幂等（同一 open_id 已有 active
    条目时不重复插入），本 Story 之外没有任何其它写入口。
@@ -19,6 +20,7 @@ from typing import Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+from lingxi.adapters.postgres_onboarding_failure import fetch_failure_reason
 from lingxi.core.admin.registry import (
     AdminRegistryEntry,
     AdminRegistrySeedConflict,
@@ -26,6 +28,7 @@ from lingxi.core.admin.registry import (
 )
 from lingxi.core.admin.views import (
     AdminEventView,
+    AdminTraceView,
     AdminUserStatusView,
     LocalPermissionOverrideView,
 )
@@ -192,6 +195,67 @@ class PostgresAdminQueries:
                 trace_id=trace_id,
             )
             for received_at, event_type, handled_as, trace_id in rows
+        )
+
+    def trace_lookup(self, *, trace_id: str) -> AdminTraceView | None:
+        """``/admin trace <追溯号>`` 的查询实现（Issue #337）。
+
+        「按 trace_id 查 inbound_event」这条 SELECT 与 ``apps/trace/__init__.py::
+        _fetch_events`` 的既有查询逐字节同型（同一张表、同一组列、同一个
+        WHERE）——与本类 :meth:`user_status` 文档字符串登记的既有重复同一性质：
+        ``apps/trace`` 的内联 SQL 已经在 2026-08-28（Issue #371）被产品负责人
+        登记为「受控只读 CLI」的架构例外，本轮不重新抽取共用 helper（会推翻同一批
+        刚落的登记，见该例外的复议条件）。本方法只负责"给定追溯号，查一次
+        ``inbound_event``"，不 import ``apps.trace``——``core``/``adapters`` 层
+        不依赖 ``apps`` 模块（代码框架第二/三节）。
+
+        「开通状态」复用既有的 :meth:`user_status`（同一个已装配的适配器实例，
+        不重新拼一遍 ``app_user`` 查询）；「失败原因」复用
+        ``adapters/postgres_onboarding_failure.fetch_failure_reason``（写入方
+        :class:`~lingxi.adapters.postgres_onboarding_failure.
+        PostgresFailureReasonRecorder` 是同一张表的唯一写入口）。
+
+        取「最近一条」事件的 ``event_type``/``handled_as``/``onboarding_
+        dispatched_at`` 展示：同一个 trace_id 结构上通常只对应一条入站事件
+        （首次开通首聊），取最近一条只是为了在理论上出现多条时不崩溃，不是
+        本命令承诺聚合展示全部历史事件——完整时间线仍然是 ``/admin audit``
+        与 ``python -m lingxi.apps.trace`` 的职责。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT received_at, event_type, handled_as, user_open_id,
+                       onboarding_dispatched_at
+                  FROM inbound_event
+                 WHERE trace_id = %s
+                 ORDER BY received_at
+                """,
+                (trace_id,),
+            )
+            rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        event_count = len(rows)
+        first_received_at = _isoformat(rows[0][0])
+        _, last_event_type, last_handled_as, last_open_id, last_dispatched_at = rows[-1]
+
+        status = self.user_status(identifier=last_open_id) if last_open_id else None
+        failure = fetch_failure_reason(self._dsn, trace_id=trace_id, timeouts=self._timeouts)
+
+        return AdminTraceView(
+            trace_id=trace_id,
+            event_count=event_count,
+            first_received_at=first_received_at,
+            last_event_type=last_event_type,
+            last_handled_as=last_handled_as,
+            dispatched=last_dispatched_at is not None,
+            provisioning_state=status.provisioning_state if status is not None else None,
+            account_state=status.account_state if status is not None else None,
+            failure_reason=failure.failure_reason if failure is not None else None,
+            failure_event_type=failure.event_type if failure is not None else None,
+            failure_occurred_at=failure.occurred_at if failure is not None else None,
         )
 
 

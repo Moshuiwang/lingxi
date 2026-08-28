@@ -49,6 +49,7 @@ from lingxi.adapters.admin_registry import (
 )
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistrySeedConflict
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
@@ -79,6 +80,38 @@ class AdminRegistryPostgresTestCase(unittest.TestCase):
     def execute(self, sql: str, parameters: tuple = ()) -> None:
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(sql, parameters)
+
+    def add_user(
+        self,
+        *,
+        user_id: str = "usr_1",
+        open_id: str = "ou_1",
+        provisioning_state: str = "active",
+        permission_version: int = 2,
+    ) -> None:
+        self.execute(
+            """INSERT INTO app_user
+                 (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
+                  department, tenant_key, provisioning_state, permission_version)
+               VALUES (%s, %s, %s, %s, '化名', '测试部门', 'tk_1', %s, %s)""",
+            (user_id, open_id, f"fs_{open_id}", f"un_{open_id}", provisioning_state, permission_version),
+        )
+
+    def add_event(
+        self,
+        *,
+        event_id: str,
+        open_id: str = "ou_1",
+        received_at: datetime,
+        handled_as: str = "task_queued",
+        trace_id: str,
+    ) -> None:
+        self.execute(
+            """INSERT INTO inbound_event
+                 (feishu_event_id, received_at, event_type, user_open_id, handled_as, trace_id)
+               VALUES (%s, %s, 'im.message.receive_v1', %s, %s, %s)""",
+            (event_id, received_at, open_id, handled_as, trace_id),
+        )
 
 
 class SeedIdempotencyTests(AdminRegistryPostgresTestCase):
@@ -377,37 +410,9 @@ class RealTimeLookupTests(AdminRegistryPostgresTestCase):
 
 
 class AdminQueriesTests(AdminRegistryPostgresTestCase):
-    def add_user(
-        self,
-        *,
-        user_id: str = "usr_1",
-        open_id: str = "ou_1",
-        provisioning_state: str = "active",
-        permission_version: int = 2,
-    ) -> None:
-        self.execute(
-            """INSERT INTO app_user
-                 (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
-                  department, tenant_key, provisioning_state, permission_version)
-               VALUES (%s, %s, %s, %s, '化名', '测试部门', 'tk_1', %s, %s)""",
-            (user_id, open_id, f"fs_{open_id}", f"un_{open_id}", provisioning_state, permission_version),
-        )
-
-    def add_event(
-        self,
-        *,
-        event_id: str,
-        open_id: str = "ou_1",
-        received_at: datetime,
-        handled_as: str = "task_queued",
-        trace_id: str,
-    ) -> None:
-        self.execute(
-            """INSERT INTO inbound_event
-                 (feishu_event_id, received_at, event_type, user_open_id, handled_as, trace_id)
-               VALUES (%s, %s, 'im.message.receive_v1', %s, %s, %s)""",
-            (event_id, received_at, open_id, handled_as, trace_id),
-        )
+    # ``add_user``/``add_event`` 现由共同基类 ``AdminRegistryPostgresTestCase``
+    # 提供（Issue #337 新增的 ``TraceLookupTests`` 同样需要这两个夹具），本类
+    # 不再重复定义。
 
     def test_user_status_found(self) -> None:
         self.add_user(open_id="ou_target", provisioning_state="mcp_syncing", permission_version=3)
@@ -563,6 +568,99 @@ class AdminQueriesTests(AdminRegistryPostgresTestCase):
 
         self.assertEqual(len(events), 2)
         self.assertEqual([event.trace_id for event in events], ["trc_0", "trc_1"])
+
+
+class TraceLookupTests(AdminRegistryPostgresTestCase):
+    """``/admin trace <追溯号>`` 真库集成（Issue #337）：事件时间线 + 开通状态
+    （复用既有 ``user_status``）+ 失败原因（新表 ``onboarding_failure``，迁移
+    ``0077``，写入方 ``PostgresFailureReasonRecorder``）三者拼接。"""
+
+    def test_unknown_trace_id_returns_none(self) -> None:
+        """否定断言：查无此追溯号返回 ``None``，供 ``core/admin/router._render_
+        trace`` 回复「不存在」——不是空白也不是抛异常。"""
+
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(queries.trace_lookup(trace_id="trc_missing"))
+
+    def test_trace_without_failure_reason_reports_state_only(self) -> None:
+        """追溯号存在（有入站事件、有开通状态）但没有失败记录：如实回报状态，
+        ``failure_reason`` 为 ``None``，不是"查无此追溯号"。"""
+
+        self.add_user(user_id="usr_ok", open_id="ou_ok", provisioning_state="active")
+        self.add_event(
+            event_id="evt_ok",
+            open_id="ou_ok",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_ok",
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        trace = queries.trace_lookup(trace_id="trc_ok")
+
+        self.assertIsNotNone(trace)
+        assert trace is not None
+        self.assertEqual(trace.event_count, 1)
+        self.assertEqual(trace.provisioning_state, "active")
+        self.assertEqual(trace.account_state, "enabled")
+        self.assertIsNone(trace.failure_reason)
+
+    def test_trace_with_failure_reason_reports_it(self) -> None:
+        """Issue #337 的验收关键：管理员凭追溯号真的能查回 failure_reason。"""
+
+        self.add_user(user_id="usr_fail", open_id="ou_fail", provisioning_state="provisioning")
+        self.add_event(
+            event_id="evt_fail",
+            open_id="ou_fail",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_fail",
+        )
+        recorder = PostgresFailureReasonRecorder(self._dsn)
+        recorder.record_failure(
+            trace_id="trc_fail",
+            failure_reason="directory_unavailable",
+            event_type="onboarding.result",
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        trace = queries.trace_lookup(trace_id="trc_fail")
+
+        self.assertIsNotNone(trace)
+        assert trace is not None
+        self.assertEqual(trace.failure_reason, "directory_unavailable")
+        self.assertEqual(trace.failure_event_type, "onboarding.result")
+        self.assertTrue(trace.failure_occurred_at)
+
+    def test_trace_result_never_carries_open_id(self) -> None:
+        """脱敏断言（Issue #337 范围条目 3）：视图字段里没有任何一个是原始
+        open_id——只含运维事实。"""
+
+        self.add_user(
+            user_id="usr_secret", open_id="ou_should_not_appear", provisioning_state="active"
+        )
+        self.add_event(
+            event_id="evt_secret",
+            open_id="ou_should_not_appear",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_secret",
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        trace = queries.trace_lookup(trace_id="trc_secret")
+
+        self.assertIsNotNone(trace)
+        assert trace is not None
+        values = [
+            trace.trace_id,
+            trace.last_event_type,
+            trace.last_handled_as,
+            trace.provisioning_state,
+            trace.account_state,
+            trace.failure_reason,
+            trace.failure_event_type,
+            trace.failure_occurred_at,
+        ]
+        self.assertNotIn("ou_should_not_appear", values)
 
 
 if __name__ == "__main__":  # pragma: no cover

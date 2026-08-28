@@ -154,3 +154,29 @@ class DispatchLedger(Protocol):
 
 class _AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
+
+
+class FailureReasonRecorder(Protocol):
+    """把一次开通终态的失败原因落库（``onboarding_failure`` 表，迁移 ``0077``，
+    [Issue #337](https://github.com/Moshuiwang/lingxi/issues/337)）：供
+    ``/admin trace <追溯号>`` 只读命令消费，回答此前只能靠检索 scheduler 容器日志
+    才能拿到的 ``failure_reason``。真实实现见
+    ``adapters/postgres_onboarding_failure.PostgresFailureReasonRecorder``。
+
+    **可选**：``None`` 表示未装配，行为与接线之前逐字节一致——只是这一条终态查不到
+    失败原因（``/admin trace`` 会如实回「无失败记录」，不是崩溃或误报成功）。
+
+    调用方（:class:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner`、
+    :class:`~lingxi.apps.scheduler.stalled_provisioning.StalledProvisioningDuty`）
+    只在真正是失败终态时调用（``failure_reason`` 非空字符串），紧邻各自既有的
+    ``self._audit.record(...)`` 调用之后——两处都是「审计侧最佳努力」：落库失败
+    不得带走已经决定的用户终态或已完成的收口，调用方自己 try/except 并改记一条
+    独立的失败审计，本协议本身不承诺任何重试或补偿。
+
+    ``event_type`` 固定是 ``'onboarding.result'`` 或 ``'stalled_provisioning.
+    aborted'``（迁移 ``0077`` 的 ``CHECK`` 约束同一取值范围），标记这一行来自哪一个
+    写出点。``trace_id`` 是主键：同一条链正常只产生一次终态，真实实现按
+    ``ON CONFLICT (trace_id) DO NOTHING`` 幂等——不覆盖先落的那一行，不报错。
+    """
+
+    def record_failure(self, *, trace_id: str, failure_reason: str, event_type: str) -> None: ...

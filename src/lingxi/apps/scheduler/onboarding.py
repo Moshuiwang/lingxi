@@ -747,6 +747,7 @@ def _build_onboarding_duty(
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
+    from lingxi.adapters.postgres_onboarding_failure import PostgresFailureReasonRecorder
     from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
@@ -909,7 +910,11 @@ def _build_onboarding_duty(
         # 管理员送达（Issue #280 §7.3）：调用方（``build_loop``）没有装配告警职责时
         # 保持 ``None``——「已转交管理员处理」这句话此前就是这个默认值，行为不变；
         # 生产 main() 总会传一份真实回调（见 ``build_loop`` 调用点）。
-        onboarding_failed=onboarding_failed, local_overrides=local_override_reader(dsn, timeouts=timeouts),
+        onboarding_failed=onboarding_failed,
+        # 失败原因落库（Issue #337）：供 `/admin trace <追溯号>` 消费，见
+        # `core/identity/onboarding_ports.FailureReasonRecorder` 协议文档。
+        failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
+        local_overrides=local_override_reader(dsn, timeouts=timeouts),
         legacy_source=legacy_source, publish_history=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(

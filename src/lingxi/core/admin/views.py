@@ -58,3 +58,33 @@ class AdminEventView:
     event_type: str
     handled_as: str | None
     trace_id: str
+
+
+@dataclass(frozen=True)
+class AdminTraceView:
+    """``/admin trace <追溯号>`` 查询结果（Issue #337）：入站事件时间线摘要 +
+    该追溯号定位到的用户当前开通状态 + 失败原因（``onboarding_failure`` 表，
+    迁移 ``0077``）。
+
+    非 ``None``（即 ``inbound_event`` 里至少有一条这个 ``trace_id``）时才由
+    ``adapters/admin_registry.PostgresAdminQueries.trace_lookup`` 构造；查无
+    此追溯号返回 ``None``，由 ``core/admin/router._render_trace`` 回复
+    「查无此追溯号」——本视图不区分"表里没有"与"参数不合法"，后者已经在
+    ``commands.py`` 的 ``is_ulid`` 校验挡住。
+
+    脱敏（Issue #337 范围条目 3）：不带 open_id、不带用户问题正文、不带姓名/
+    邮箱——只含运维需要的状态、原因与时间事实，对照 ``apps/trace`` 已有的身份
+    最小化默认姿态（那个 CLI 默认也不打印 open_id）。
+    """
+
+    trace_id: str
+    event_count: int
+    first_received_at: str
+    last_event_type: str
+    last_handled_as: str | None
+    dispatched: bool
+    provisioning_state: str | None
+    account_state: str | None
+    failure_reason: str | None
+    failure_event_type: str | None
+    failure_occurred_at: str | None

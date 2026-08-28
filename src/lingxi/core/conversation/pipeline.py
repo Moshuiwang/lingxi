@@ -55,10 +55,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
+from lingxi.config.content import (
+    ContentCatalog,
+    ContentSafetyError,
+    RenderedContent,
+    default_content_catalog,
+)
 from lingxi.core.ids import new_id
+from lingxi.core.user_memory import UserMemoryEntry
 
-from .commands import Command, is_unrecognized_slash_message, parse_command
+from .commands import (
+    Command,
+    MemoryCommand,
+    MemoryCommandKind,
+    is_memory_command_message,
+    is_unrecognized_slash_message,
+    parse_command,
+    parse_memory_command,
+)
 from .ports import (
     AuditSink,
     GatewayStore,
@@ -495,6 +509,11 @@ class EventPipeline:
 
             # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)
+            # /memory 命令面（Issue #357 S-H3-3）：与 /stop 同一姿态——查/清/登记
+            # 记忆是元数据操作，不需要等当前任务跑完，不应该被"当前任务仍在处理
+            # 中"拦住。解析结果在下面 is_unrecognized_slash_message 判定之后、
+            # 忙碌判定之前分支处理，见该处注释。
+            memory_command = parse_memory_command(message.text)
 
             # 第 6 步的延伸（Trace #304 批次 5 直修，产品负责人 biai-stage 真实测试
             # 暴露）：以 / 开头、但不是上面 parse_command 认识的任何命令的文本消息，
@@ -539,6 +558,15 @@ class EventPipeline:
                 )
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
                 return Outcome(handled_as=HandledAs.COMMAND)
+
+            if memory_command.kind is not MemoryCommandKind.NONE or is_memory_command_message(
+                message.text
+            ):
+                # /memory 命令面：与 /stop 同一姿态，放在忙碌判定之前——见类顶部
+                # 文档「第 6 步的延伸」与 `_handle_memory_command` 的文档。
+                return self._handle_memory_command(
+                    tx, message, user, conversation, memory_command, deferred
+                )
 
             if busy:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
@@ -792,6 +820,127 @@ class EventPipeline:
                 error=f"{type(error).__name__}: {error}",
                 trace_id=message.trace_id,
             )
+
+    def _handle_memory_command(
+        self,
+        tx,
+        message: InboundMessage,
+        user,
+        conversation,
+        memory_command: MemoryCommand,
+        deferred: list[RenderedContent],
+    ) -> Outcome:
+        """``/memory`` 命令面：查/登记/删除/清空当前用户的记忆（Issue #357 S-H3-3，
+        D1 显式登记范围）。调用点放在忙碌判定之前，与 ``/stop`` 同一姿态——见
+        「第 6 步的延伸」调用处注释。三个写操作（remember/forget/clear）各自记一条
+        审计（``command.memory_remember``/``command.memory_forget``/
+        ``command.memory_clear``），与既有 ``command.new``/``command.stop`` 同一
+        姿态；``list`` 与格式不对的用法提示是只读/无副作用操作，不单独记审计。
+        """
+
+        if memory_command.kind is MemoryCommandKind.LIST:
+            entries = tx.list_user_memory(user_id=user.user_id)
+            deferred.append(self._render_memory_list(entries))
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        if memory_command.kind is MemoryCommandKind.CLEAR:
+            count = tx.clear_user_memory(user_id=user.user_id)
+            deferred.append(self._texts.catalog.text("memory.cleared", count=count))
+            self._audit.record(
+                "command.memory_clear",
+                event_id=message.event_id,
+                user_id=user.user_id,
+                conversation_id=conversation.conversation_id,
+                cleared_count=count,
+                trace_id=message.trace_id,
+            )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        if memory_command.kind is MemoryCommandKind.FORGET:
+            forgotten = tx.forget_user_memory(
+                user_id=user.user_id, memory_id=memory_command.memory_id
+            )
+            content_key = "memory.forgotten" if forgotten else "memory.forget_not_found"
+            deferred.append(self._texts.catalog.text(content_key))
+            if forgotten:
+                # 未命中（不存在/不属于本人）不审计为一次「删除」事件——结构上没有
+                # 发生任何写操作，与 forget_user_memory 的跨用户零生效同一条纪律
+                # （不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
+                self._audit.record(
+                    "command.memory_forget",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    conversation_id=conversation.conversation_id,
+                    memory_id=memory_command.memory_id,
+                    trace_id=message.trace_id,
+                )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        if memory_command.kind is MemoryCommandKind.REMEMBER:
+            memory_id = tx.remember_user_memory(
+                user_id=user.user_id,
+                memory_type=memory_command.memory_type,
+                memory_key=memory_command.memory_key,
+                memory_value=memory_command.memory_value,
+            )
+            if memory_id is None:
+                deferred.append(self._texts.catalog.text("memory.limit_exceeded"))
+            else:
+                deferred.append(self._texts.catalog.text("memory.remembered"))
+                self._audit.record(
+                    "command.memory_remember",
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    conversation_id=conversation.conversation_id,
+                    memory_id=memory_id,
+                    memory_type=memory_command.memory_type,
+                    trace_id=message.trace_id,
+                )
+            tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+            return Outcome(handled_as=HandledAs.COMMAND)
+
+        # NONE：以 /memory 开头但子命令形状不对——用法提示，不算错误也不审计
+        # （与合法但空操作的 list 同一姿态：读多写少，不是需要留痕的业务决定）。
+        deferred.append(self._texts.catalog.text("memory.usage_help"))
+        tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
+        return Outcome(handled_as=HandledAs.COMMAND)
+
+    def _render_memory_list(self, entries: list[UserMemoryEntry]) -> RenderedContent:
+        """把 ``/memory list`` 查到的记忆渲染成用户可见文本。
+
+        每一行单独过一次内容安全校验（``content.toml`` 的 ``_validate_user_visible_
+        text``）：``memory_key``/``memory_value`` 是用户自己写入的自由文本，结构上
+        无法保证它不会撞上协议泄漏词表（``mcp__``/``trace_id`` 等，见该文件文档）。
+        单条撞线时替换成不回显内容的安全占位行，不让**一条**记忆的内容让整个
+        ``/memory list`` 崩掉——那会让用户永久看不到自己登记过的其余记忆，除非先
+        盲猜是哪一条、用 ``/memory forget`` 删掉。
+        """
+
+        catalog = self._texts.catalog
+        if not entries:
+            return catalog.text("memory.list_empty")
+        lines: list[str] = []
+        for entry in entries:
+            type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
+            try:
+                rendered_entry = catalog.text(
+                    "memory.list_entry",
+                    type_label=type_label,
+                    memory_key=entry.memory_key,
+                    memory_value=entry.memory_value,
+                    memory_id=entry.memory_id,
+                )
+            except ContentSafetyError:
+                rendered_entry = catalog.text(
+                    "memory.list_entry_unsafe",
+                    type_label=type_label,
+                    memory_id=entry.memory_id,
+                )
+            lines.append(rendered_entry.text)
+        return catalog.text("memory.list", entries="\n".join(lines))
 
     def _try_admin_route(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]

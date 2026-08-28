@@ -25,9 +25,17 @@
 ## 能回答什么、回答不了什么
 
 能回答：这一次事件是谁、什么时候到的、有没有被认领、当前用户 ``provisioning_state``/
-``account_state``、发布意图状态、就绪探针历史。**回答不了** ``failure_reason``——那仍然
-只在日志里（联合设计 §7.2「级 2」：把 ``failure_reason`` 落库是可选的后续迁移，本次不做，
-见 Issue #280 联合设计 §5.2(b)，保持零迁移）。
+``account_state``、发布意图状态、就绪探针历史。**本命令自身回答不了**
+``failure_reason``——那不在本命令查询的四张表里。
+
+**这条缺口已由 Issue #337（Trace #373 S-H3-1）在别处补上，本命令登记式不动**：
+``failure_reason`` 现在同事务落进新表 ``onboarding_failure``（迁移 ``0077``），管理员
+私聊 ``/admin trace <追溯号>``（``core/admin/router.py``，真实查询见
+``adapters/admin_registry.PostgresAdminQueries.trace_lookup``）就能自助查到，不再需要
+检索容器日志。本模块保持零变更——它仍然是给持有容器访问权限的运维用的补充诊断视图
+（能看到发布意图与就绪探针历史，`/admin trace` 目前不展示这两项），不是要被
+``/admin trace`` 取代；给本命令也接上 ``onboarding_failure`` 查询是可选的后续加固，
+不在本次范围内。
 """
 
 from __future__ import annotations

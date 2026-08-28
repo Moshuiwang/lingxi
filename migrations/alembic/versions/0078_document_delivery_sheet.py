@@ -2,7 +2,7 @@
 新增 ``delivery_type``/``resource_url`` 两列区分文档与表格。
 
 Revision ID: 0078_document_delivery_sheet
-Revises: 0073_pending_action_perm_types
+Revises: 0077_onboarding_failure_reason
 Create Date: 2026-08-28
 
 Issue #354 S-H3-2（D2 裁定：同构 #341 文档交付路由；检查点接线明确要求"与
@@ -21,6 +21,12 @@ Story 各自并行新增迁移**，本 revision 很可能不是合并时排在�
 ``migrations/README.md`` 的 head 声明；本地单独验证（`alembic upgrade head`
 在一个新建库上跑通、`check_alembic_revisions.py` 单分支通过）已完成，改链
 后需要重新跑一次确认。
+
+**改链已执行（编排者，2026-08-28 合并队列）**：`0076_user_memory` 与
+`0077_onboarding_failure_reason` 已按既定次序先行合入 ``epic/h3-features``，
+本 revision 的 ``down_revision`` 随之由 ``0073_pending_action_perm_types``
+改链至 ``0077_onboarding_failure_reason``（当前值），链恢复单头
+``...0073 → 0076 → 0077 → 0078``；改链后 `check_alembic_revisions.py` 已复跑。
 
 ## 为什么复用 ``document_id``/``paragraphs`` 列而不是新增表格专属列
 
@@ -61,7 +67,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0078_document_delivery_sheet"
-down_revision: str | None = "0073_pending_action_perm_types"
+down_revision: str | None = "0077_onboarding_failure_reason"
 branch_labels: str | None = None
 depends_on: str | None = None
 
