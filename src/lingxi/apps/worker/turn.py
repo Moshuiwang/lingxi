@@ -39,7 +39,7 @@ from lingxi.core.execution.document_delivery import (
     DocumentRequest,
     build_document_request,
 )
-from lingxi.core.execution.hooks import ToolGateway
+from lingxi.core.execution.hooks import WRAPPER_DENIAL_FUSE_THRESHOLD, ToolGateway
 from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_external_texts
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
@@ -73,6 +73,30 @@ def _looks_like_session_resume_miss(text: str) -> bool:
     """这段文本是否带着「resume 的会话已经不存在」的特征。"""
 
     return bool(_SESSION_RESUME_MISS_PATTERN.search(text))
+
+
+async def _forward_first_signal(sources: tuple[asyncio.Event, ...], target: asyncio.Event) -> None:
+    """任一 ``sources`` 先被 set，就把 ``target`` 一起 set（Issue #352）。
+
+    包装拒绝熔断需要在**不改动** ``run_single_turn`` 现有 "/stop → interrupt()"
+    协议的前提下，让"本轮熔断触发"也能走同一条已经过验证的中断路径——那条路径
+    比新开一条平行的终止通道风险更低（同样的会话 interrupt 机制已经支撑
+    ``/stop`` 生产运行）。这个协程只做转发，不判断"为什么"要中断，也不修改任何
+    调用方持有的事件对象（只 ``.wait()``，从不 ``.set()`` 调用方传入的
+    ``stop_event``）；事后谁触发的、要不要改写失败原因，由 ``run_turn`` 按
+    ``fuse_event.is_set()`` 另行判断。
+    """
+
+    if not sources:
+        return
+    waiters = [asyncio.ensure_future(source.wait()) for source in sources]
+    try:
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+    target.set()
 
 
 def _inject_output_safety_canary(final_text: str, *, mode: str, system_prompt: str) -> str:
@@ -361,8 +385,32 @@ class WorkerTurnExecutor:
         attempt_resume_session_id = resume_session_id
         resume_fallback_applied = False
 
+        # 包装拒绝熔断（Issue #352）：`fuse_event` 是本方法内长期持有的信号——
+        # `ToolGateway` 只知道"阈值达到了"，不知道 SDK 会话的存在；这里登记的
+        # 回调把那个纯逻辑层通知转译成"这一次尝试该被中断"。回调本身跨越每次
+        # 尝试保持不变（都只是 set 同一个、每次尝试开头 `.clear()` 的事件），因此
+        # 与 `on_tool_call` 一样只在循环外挂载一次即可，不需要每次尝试重新注册。
+        fuse_event = asyncio.Event()
+
+        def _on_wrapper_fuse_tripped(denied_count: int) -> None:
+            fuse_event.set()
+            self._emit_stderr_record(
+                level="warning",
+                event="worker.wrapper_denial_fuse_tripped",
+                denied_count=denied_count,
+                threshold=WRAPPER_DENIAL_FUSE_THRESHOLD,
+                task_id=task_id,
+            )
+
+        self._gateway.set_wrapper_fuse_listener(_on_wrapper_fuse_tripped)
+
         while True:
             self._audit.start_turn()
+            # 包装拒绝熔断（Issue #352）：与审计同一时机清零——`ToolGateway` 的
+            # 拒绝计数和 `fuse_event` 都是"同一回合内"的窗口状态，不得带着上一次
+            # 尝试（resume 降级重试）的痕迹进入这一轮判断。
+            self._gateway.reset_wrapper_denial_fuse()
+            fuse_event.clear()
             # 文档交付触发机制（Issue #341 S-ES-2）：回合级状态，与审计一起在
             # **每次尝试**开头清零（resume 降级重试的第二次尝试同样不得带着第一次
             # 尝试登记的请求，报告契约="仅当模型本轮调用过该工具时非空"）。
@@ -389,80 +437,104 @@ class WorkerTurnExecutor:
                 if on_stream_event is not None:
                     on_stream_event(event)
 
+            # 包装拒绝熔断（Issue #352）：`effective_stop_event` 是 `run_single_turn`
+            # 真正会 `.wait()` 的对象——它在"外部 /stop"与"本轮熔断"任一触发时都会
+            # 被置位，但两者的调用方语义完全独立：这里只 `.wait()` 调用方传入的
+            # `stop_event`，从不 `.set()` 它，因此不会污染调用方（`apps/worker/
+            # service.py`）自己对那个事件对象的其它用途。`stop_event` 为
+            # `None`（一次性 turn CLI 等既有调用方）时只由 `fuse_event` 驱动。
+            effective_stop_event = asyncio.Event()
+            forward_task = asyncio.create_task(
+                _forward_first_signal(
+                    tuple(event for event in (stop_event, fuse_event) if event is not None),
+                    effective_stop_event,
+                )
+            )
             try:
                 try:
-                    options = self.build_session_options()
-                except ImportError as error:
-                    # 只有"构造会话选项时就 import 不到 SDK"才叫 sdk_unavailable；
-                    # 会话中途的 ImportError（缺传递依赖、缺 CLI 组件）是另一种故障，
-                    # 标错码会把排障方向带偏成"去装 SDK"（独立复查发现）。
-                    failure = _failure("sdk_unavailable", error)
-                    options = None
-                if options is not None:
-                    await run_single_turn(
-                        options=options,
-                        prompt=agent_prompt,
-                        sink=handle_event,
-                        timeout_seconds=self._config.turn_timeout_seconds,
-                        resume_session_id=attempt_resume_session_id,
-                        stop_event=stop_event,
-                        drain_grace_seconds=self._config.drain_grace_seconds,
-                        clock=self._clock,
-                        on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
-                        on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
+                    try:
+                        options = self.build_session_options()
+                    except ImportError as error:
+                        # 只有"构造会话选项时就 import 不到 SDK"才叫 sdk_unavailable；
+                        # 会话中途的 ImportError（缺传递依赖、缺 CLI 组件）是另一种故障，
+                        # 标错码会把排障方向带偏成"去装 SDK"（独立复查发现）。
+                        failure = _failure("sdk_unavailable", error)
+                        options = None
+                    if options is not None:
+                        await run_single_turn(
+                            options=options,
+                            prompt=agent_prompt,
+                            sink=handle_event,
+                            timeout_seconds=self._config.turn_timeout_seconds,
+                            resume_session_id=attempt_resume_session_id,
+                            stop_event=effective_stop_event,
+                            drain_grace_seconds=self._config.drain_grace_seconds,
+                            clock=self._clock,
+                            on_business_duration=lambda seconds: business_phase.__setitem__("seconds", seconds),
+                            on_interrupt_requested=lambda: local_interrupt.__setitem__("requested", True),
+                        )
+                except AgentSessionInterrupted as error:
+                    failure = _failure("interrupted", error)
+                except DrainTimeoutError as error:
+                    # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
+                    # 成 turn_timeout（#143：收尾宽限独立且有界）。
+                    failure = _failure_message(
+                        "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
                     )
-            except AgentSessionInterrupted as error:
-                failure = _failure("interrupted", error)
-            except DrainTimeoutError as error:
-                # 收尾本身超过独立宽限：与业务墙钟超时是不同的失败原因，不得混报
-                # 成 turn_timeout（#143：收尾宽限独立且有界）。
-                failure = _failure_message(
-                    "drain_timeout", "任务已完成业务执行但收尾超过独立宽限，终态或用量可能不完整"
-                )
-                del error
-            except TimeoutError as error:
-                # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
-                # 没有这个分支整个回合会永久等待（Codex 复查发现）。
-                del error
-                failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
-            except asyncio.CancelledError:
-                # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
-                # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
-                # 失败回合，不能伪装成正常完成或墙钟超时。
-                #
-                # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
-                # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
-                # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
-                # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
-                # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
-                # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
-                # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
-                # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
-                # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
-                # 路径。真实证据：`tests/test_worker_process.py` 的
-                # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
-                # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
-                if self._propagate_cancellation:
-                    raise
-                failure = _failure_message("cancelled", "任务已取消，未继续执行")
-            except KeyboardInterrupt as error:
-                failure = _failure("interrupted", error)
-            except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
-                if is_message_buffer_overflow(error):
-                    # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
-                    # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态
-                    # 故障——同样的问题重试必然同样失败，必须与通用 session_failed
-                    # 区分，让用户得到"缩小查询范围"的可行动建议（queue 收口的文案
-                    # 映射见 apps/worker/service.py 的 _failure_content）。
-                    failure = _failure("result_too_large", error)
-                else:
-                    failure = _failure("session_failed", error)
-                    # 兜底信号源（2026-08-27 生产事故 #2）：正常情况下特征串已经
-                    # 由 `_sdk_stderr_sink` 从子进程 stderr 里认出来了；这里再看一遍
-                    # 异常对象本身，防的是"某个未来 SDK 版本把这行原文塞进了异常
-                    # 文本"这种此刻验证不到、但不该让降级路径悄悄失效的情形。
-                    if _looks_like_session_resume_miss(str(error)):
-                        self._resume_miss_detected = True
+                    del error
+                except TimeoutError as error:
+                    # 墙钟超时是明确的会话失败：SDK 传输挂住不发终止消息时，
+                    # 没有这个分支整个回合会永久等待（Codex 复查发现）。
+                    del error
+                    failure = _failure_message("turn_timeout", "任务提前结束：达到墙钟上限，结果可能不完整")
+                except asyncio.CancelledError:
+                    # 默认（一次性 turn 模式 CLI）：BaseException 不接住就没有报告，违反
+                    # cli 的 stdout 契约「恰好一个 JSON 对象」；取消也要留下一份可辨认的
+                    # 失败回合，不能伪装成正常完成或墙钟超时。
+                    #
+                    # `propagate_cancellation=True`（常驻 queue worker，Issue #153 / PR #173
+                    # 独立复核 P1-3）：**必须原样重新抛出，不能吞。** 这里如果像默认那样
+                    # 就地生成一份"cancelled"失败报告，`run_turn()` 就会正常返回而不是
+                    # 让异常继续传播——`_process_task` 随后会把这份"正常返回的报告"当成
+                    # 一次真实完成的回合，同步写一条 FAILED 终态并把任务转入
+                    # `awaiting_delivery`。但这次取消来自 `_run_queue_worker` 的 SIGTERM
+                    # 停机预算耗尽，此时 Agent SDK 传输側可能仍在收尾甚至仍在执行
+                    # ——写一条"已取消、未继续执行"的终态既可能是假话，也绕开了
+                    # V-部署-12/`reclaim_stale_with_outcomes` 那条已验证的心跳超时回收
+                    # 路径。真实证据：`tests/test_worker_process.py` 的
+                    # ``QueueModeSigtermWithInFlightTaskTest`` 在改成 ``propagate_cancellation=True``
+                    # 之前会看到任务被写成 ``awaiting_delivery`` 而不是保持 ``running``。
+                    if self._propagate_cancellation:
+                        raise
+                    failure = _failure_message("cancelled", "任务已取消，未继续执行")
+                except KeyboardInterrupt as error:
+                    failure = _failure("interrupted", error)
+                except Exception as error:  # noqa: BLE001 - 入口必须把任何失败变成一份报告
+                    if is_message_buffer_overflow(error):
+                        # 工具回执大到超过 SDK 读流缓冲上限（典型：未加窄过滤条件的全量
+                        # 指标查询，2026-08-23 真实故障）。这不是"稍后重试"能解决的瞬态
+                        # 故障——同样的问题重试必然同样失败，必须与通用 session_failed
+                        # 区分，让用户得到"缩小查询范围"的可行动建议（queue 收口的文案
+                        # 映射见 apps/worker/service.py 的 _failure_content）。
+                        failure = _failure("result_too_large", error)
+                    else:
+                        failure = _failure("session_failed", error)
+                        # 兜底信号源（2026-08-27 生产事故 #2）：正常情况下特征串已经
+                        # 由 `_sdk_stderr_sink` 从子进程 stderr 里认出来了；这里再看一遍
+                        # 异常对象本身，防的是"某个未来 SDK 版本把这行原文塞进了异常
+                        # 文本"这种此刻验证不到、但不该让降级路径悄悄失效的情形。
+                        if _looks_like_session_resume_miss(str(error)):
+                            self._resume_miss_detected = True
+            finally:
+                # 包装拒绝熔断（Issue #352）：不管这次尝试是正常收口、被拒绝拦截、
+                # 还是任何一种异常路径退出，转发任务都必须被收回——它只在这次尝试
+                # 的生命周期内有意义，不能悬挂到下一次尝试或调用方的事件循环里。
+                # 与 `run_single_turn` 内部 `monitor.cancel()` 同一姿态。
+                forward_task.cancel()
+                try:
+                    await forward_task
+                except asyncio.CancelledError:
+                    pass
 
             if failure is None:
                 failure = _sdk_termination_failure(
@@ -478,6 +550,24 @@ class WorkerTurnExecutor:
                         event="worker.stop.interrupt_race",
                         terminal_reason=recorder.terminal_reason,
                     )
+
+            if fuse_event.is_set():
+                # 包装拒绝熔断（Issue #352）：不管这次尝试最终被 SDK 收口成
+                # `AgentSessionInterrupted`、`aborted_streaming`/`aborted_tools`，
+                # 还是（竞态下）干脆正常收尾，只要是本轮熔断发出的中断请求，产品
+                # 语义都不是"用户主动 /stop"（`interrupted`）也不是"外部取消"
+                # （`cancelled`）——而是"模型反复越界被拒、系统主动提前收口"。这里
+                # 无条件覆盖上面算出的 `failure`，复用现有的 `max_turns_exceeded`
+                # 失败路径（`apps/worker/service.py::_failure_content` 现成分支，
+                # 映射到 `worker.max_turns` 文案「本次查询步骤较多，达到单次处理
+                # 轮数上限，未能完成」）——不新造用户文案，也不让 interrupted/
+                # cancelled 掩盖真实原因。`_GUARD_FAILURE_CODES`
+                # （`apps/worker/report.py`）已经收了这个 code，`guard_triggered`/
+                # `termination_state="guarded"` 不需要额外改动就正确投影。
+                failure = _failure_message(
+                    "max_turns_exceeded",
+                    "任务提前终止：同一回合内包装拒绝达到熔断阈值，结果可能不完整（Issue #352）",
+                )
 
             if (
                 not resume_fallback_applied

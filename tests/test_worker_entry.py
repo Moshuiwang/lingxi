@@ -2483,5 +2483,196 @@ class ToolCallProgressWiringTest(unittest.TestCase):
         self.assertTrue(report["turn"]["closed"])
 
 
+class WrapperDenialFuseWiringTest(unittest.TestCase):
+    """Issue #352：包装拒绝熔断经真实装配路径接到 ``apps/worker/turn.py`` 的
+    回合编排。``ToolGateway`` 的计数/触发去抖断言在
+    ``tests/test_execution_tool_gate.py::WrapperDenialFuseTest``；本文件证明的
+    是"熔断触发之后回合真的按现有失败文案快速失败"，以及"真的向 SDK 会话发出
+    了 interrupt() 请求，不是等回合自然烧完再贴标签"。
+
+    与本文件其余用例同一姿态：假 SDK 只能证明"本侧装配是通的"，证明不了真实
+    SDK 会触发这些事件（那是 L4a 的职责）。
+    """
+
+    @staticmethod
+    def _wrapper_style_denied_step(index: int) -> dict:
+        """摹写 Issue #352 现象：模型用内置 ``Bash`` 包装调用 ``claude mcp
+        call`` 绕过白名单，而不是直接调用被拒的原生工具。"""
+
+        return {
+            "kind": "tool",
+            "tool": "Bash",
+            "input": {"command": f"claude mcp call query_metric --arg {index}"},
+        }
+
+    def test_five_wrapper_denials_trip_the_fuse_and_reuse_the_max_turns_failure_path(
+        self,
+    ) -> None:
+        """正用例：同回合累计 5 次达标拒绝 → 熔断 → 复用现有「达到单次处理轮数
+        上限」失败路径（``max_turns_exceeded``），不是新造的文案；``apps/worker/
+        service.py::_failure_content`` 现成分支会把这个 code 映射到
+        ``worker.max_turns`` 文案（本文件不复测那条映射本身，只钉住 code）。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(5)] + [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+        ]
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNotNone(report["failure"])
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertEqual(report["audit"]["denied_count"], 5)
+        self.assertTrue(report["turn"]["guard_triggered"])
+        self.assertEqual(report["turn"]["termination_state"], "guarded")
+        self.assertFalse(report["turn"]["closed"])
+
+    def test_four_wrapper_denials_do_not_trip_the_fuse_and_the_turn_closes_normally(
+        self,
+    ) -> None:
+        """否定用例：未达阈值时行为必须与现状逐字相同——回合正常收口，没有失败，
+        不触发护栏。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(4)] + [
+            {"kind": "tool", "tool": READ_ONLY_TOOL, "input": {"metric": "dau"}, "result": ok_result()},
+            {"kind": "text", "text": "日活是 1024；其余部分我无法查询。"},
+        ]
+        report, _fake, _executor = run_turn(self, script)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 4)
+        self.assertTrue(report["turn"]["closed"])
+        self.assertFalse(report["turn"]["guard_triggered"])
+
+    def test_a_fresh_run_turn_call_does_not_inherit_the_previous_calls_denial_count(
+        self,
+    ) -> None:
+        """跨回合不累计：连续两次 ``run_turn()``、每次都只有 4 次拒绝（未达阈值）。
+        若熔断计数没有在每次尝试开头清零，第二次会带着第一次的计数一起超过阈值，
+        提前熔断——这条用例钉住 ``apps/worker/turn.py`` 确实在每次尝试开头调用
+        了 ``ToolGateway.reset_wrapper_denial_fuse()``。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(4)] + [
+            {"kind": "text", "text": "其余部分我无法查询。"},
+        ]
+        report, _fake, _executor = run_turn(self, script, turns=2)
+
+        self.assertIsNone(report["failure"])
+        self.assertEqual(report["audit"]["denied_count"], 4)
+
+    def test_the_fuse_asks_the_sdk_to_interrupt_instead_of_burning_the_full_script(
+        self,
+    ) -> None:
+        """熔断必须真的向 SDK 会话请求中断，不是等整段脚本自然烧完再改标签——
+        与 ``apps/worker/turn.py`` 里已经过验证的 "/stop → interrupt()" 是同一
+        条路径（见 ``StopCausalTerminationTest``），这里证明包装拒绝熔断也走
+        上了这条路径。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(10)]
+        FakeAgentSDK(script).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_calls: list[str] = []
+        base_client = module.ClaudeSDKClient
+
+        class InterruptRecordingClient(base_client):  # type: ignore[misc, valid-type]
+            async def interrupt(self):
+                interrupt_calls.append("called")
+
+            def receive_response(self):
+                inner = super().receive_response()
+
+                async def _gen():
+                    async for message in inner:
+                        yield message
+                        # 真实 SDK 的 receive_response() 由子进程管道驱动，消息
+                        # 之间天然有 I/O 挂起，中断监听任务才有机会被调度到；
+                        # 假 SDK 是纯内存回放、脚本步骤之间不会真的让出事件
+                        # 循环，这里显式插入一个真正的挂起点来还原这一点，不然
+                        # 熔断即使触发也永远没有机会真正打断脚本回放。
+                        await asyncio.sleep(0)
+
+                return _gen()
+
+        module.ClaudeSDKClient = InterruptRecordingClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        config = load_config(worker_env())
+        report = asyncio.run(WorkerTurnExecutor(config).run_turn(config.question))
+
+        self.assertEqual(interrupt_calls, ["called"], "熔断必须真的请求 SDK 中断一次")
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        self.assertLess(
+            report["audit"]["denied_count"],
+            10,
+            "中断生效后不应该把脚本剩余的拒绝全部烧完，回合必须提前终止",
+        )
+
+    def test_the_fuse_trip_leaves_a_structured_worker_audit_event(self) -> None:
+        """熔断触发时必须留结构化审计痕迹（沿用既有 ``worker.*`` 事件习惯），
+        供后续 L6 机会型观察。"""
+
+        script = [self._wrapper_style_denied_step(i) for i in range(5)]
+        FakeAgentSDK(script).install(self)
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        captured = io.StringIO()
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config, stderr_stream=captured)
+        report = asyncio.run(executor.run_turn(config.question, task_id="tsk-fuse-1"))
+
+        self.assertEqual(report["failure"]["code"], "max_turns_exceeded")
+        lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        events = [line for line in lines if line["event"] == "worker.wrapper_denial_fuse_tripped"]
+        self.assertEqual(len(events), 1, "熔断只应该通知一次，不能每多一次拒绝就重复留痕")
+        self.assertEqual(events[0]["denied_count"], 5)
+        self.assertEqual(events[0]["threshold"], 5)
+        self.assertEqual(events[0]["task_id"], "tsk-fuse-1")
+        self.assertEqual(events[0]["trace_id"], config.trace_id)
+
+    def test_a_stop_event_still_reaches_the_sdk_when_the_fuse_never_trips(self) -> None:
+        """回归锁：包装拒绝熔断新增的转发机制不得影响既有 `/stop` 行为——熔断从
+        未触发时，外部 `stop_event` 依然要能让回合以 ``interrupted`` 收口，与
+        ``StopCausalTerminationTest`` 断言的既有姿态一致。"""
+
+        FakeAgentSDK([]).install(self)
+        module = sys.modules["claude_agent_sdk"]
+        interrupt_sent = asyncio.Event()
+
+        class RacingClient(module.ClaudeSDKClient):  # type: ignore[misc]
+            async def interrupt(self):
+                interrupt_sent.set()
+                await asyncio.sleep(3600)
+
+            def receive_response(self):
+                async def _gen():
+                    await interrupt_sent.wait()
+                    yield StubResultMessage(
+                        subtype="error_during_execution",
+                        is_error=True,
+                        terminal_reason="aborted_streaming",
+                    )
+
+                return _gen()
+
+        module.ClaudeSDKClient = RacingClient
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        async def scenario():
+            stop_event = asyncio.Event()
+            stop_event.set()
+            return await executor.run_turn(config.question, stop_event=stop_event)
+
+        report = asyncio.run(scenario())
+
+        self.assertEqual(report["failure"]["code"], "interrupted")
+
+
 if __name__ == "__main__":
     unittest.main()

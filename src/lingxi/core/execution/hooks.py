@@ -145,6 +145,17 @@ def _is_oversize_tool_result(tool_response: Any) -> bool:
     return bool(_MCP_OVERSIZE_RESULT_PATTERN.search(_tool_result_text(tool_response)))
 
 
+# 包装拒绝熔断阈值（Issue #352；产品负责人 2026-08-27/28 裁定留痕）：2026-08-27
+# 生产事故里，qwen3.7-plus 在一次「查询+成文」组合任务中连续 20 次用
+# ``Bash: claude mcp call …`` 包装调用问数 MCP（外加 1 次 ``Agent`` 工具），全部
+# 撞白名单拒绝、零原生调用，烧尽 20 轮上限才失败——用户体验与成本都很差，且
+# 已确认导回文案（#349）逐字送达也劝不动模型。产品负责人裁定方案 1「包装拒绝
+# 熔断」：同一回合内非 MCP 工具被拒累计达到该阈值即终止回合，不再烧尽单次处理
+# 轮数上限。默认值 5 是 Issue #352 登记的产品负责人已批值；调整它必须回到该
+# Issue 或后续 Issue 重新裁定，不在这里静默改。
+WRAPPER_DENIAL_FUSE_THRESHOLD = 5
+
+
 class ToolGateway:
     """执行层的唯一工具判定入口。
 
@@ -160,6 +171,7 @@ class ToolGateway:
         audit: TurnAudit,
         mark_external_side_effect: Callable[[], None] | None = None,
         raw_pre_tool_use: Callable[[str | None, Any], None] | None = None,
+        wrapper_denial_fuse_threshold: int = WRAPPER_DENIAL_FUSE_THRESHOLD,
     ) -> None:
         self._policy = policy
         self._audit = audit
@@ -183,10 +195,51 @@ class ToolGateway:
         # ``raw_pre_tool_use``（内容级采集，语义上跟着整个执行器实例、不是单次
         # 回合）用途不同。
         self._on_tool_call: Callable[[str], None] | None = None
+        # 包装拒绝熔断（Issue #352）：同一回合内累计的「非 MCP 工具被拒」次数。
+        # 与 `TurnAudit` 的回合级状态同一姿态——按调用方约定，必须在每次尝试
+        # 开头调 `reset_wrapper_denial_fuse()`（见 `apps/worker/turn.py` 的
+        # `run_turn`），否则第二个回合会带着第一个回合的计数继续累加。
+        self._wrapper_denial_fuse_threshold = wrapper_denial_fuse_threshold
+        self._wrapper_denial_count = 0
+        # 熔断只通知一次：达到阈值之后同一回合内继续出现的拒绝（中断请求已发出
+        # 但 SDK 还没来得及停下来这段真实存在的窗口，见 `claude_agent_session.
+        # run_single_turn` 的中断竞态）不得重复触发回调、重复留痕。
+        self._wrapper_denial_fuse_tripped = False
+        self._on_wrapper_fuse_tripped: Callable[[int], None] | None = None
 
     @property
     def audit(self) -> TurnAudit:
         return self._audit
+
+    @property
+    def wrapper_denial_count(self) -> int:
+        """本回合累计的「非 MCP 工具被拒」次数（Issue #352），供调用方观测/断言。"""
+
+        return self._wrapper_denial_count
+
+    def reset_wrapper_denial_fuse(self) -> None:
+        """开始新的一个回合前清零包装拒绝熔断计数（Issue #352）。
+
+        与 ``TurnAudit.start_turn()`` 同一时机、同一姿态：这是"同一回合内"的
+        窗口计数，跨回合不累计。调用方必须在每次尝试开头（与
+        ``self._audit.start_turn()`` 同一时机）显式调用。
+        """
+
+        self._wrapper_denial_count = 0
+        self._wrapper_denial_fuse_tripped = False
+
+    def set_wrapper_fuse_listener(self, callback: Callable[[int], None] | None) -> None:
+        """登记（或清除）包装拒绝熔断触发时的回调（Issue #352）。
+
+        回调只在阈值**第一次**被达到的那一次调用（由 ``_wrapper_denial_fuse_
+        tripped`` 哨兵防重入），入参是触发时的累计拒绝次数。这里只负责"发现
+        熔断条件已满足"；真正让回合停下来（向 Agent SDK 会话发出 interrupt）
+        是调用方（``apps/worker/turn.py``）的职责——本类是纯逻辑层，不知道、
+        也不需要知道 SDK 会话的存在（见文件头）。回调异常与 ``set_tool_call_
+        listener`` 同一姿态：不得影响工具判定本身。
+        """
+
+        self._on_wrapper_fuse_tripped = callback
 
     def set_tool_call_listener(self, callback: Callable[[str], None] | None) -> None:
         """登记（或清除）本回合的工具调用开始通知（Issue #321 方向 C）。
@@ -316,4 +369,25 @@ class ToolGateway:
             )
         except Exception:  # noqa: BLE001 - 见上：审计失败不得降级为放行
             self._audit.record_audit_fault(tool_name=verdict.tool_name, tool_use_id=call_id)
+        # 包装拒绝熔断（Issue #352）：计数口径是「非 MCP 工具被拒」——真实事故里
+        # 模型用 `Bash: claude mcp call …` 之类的内置工具包装调用问数 MCP，一律
+        # 落在 `verdict.tool_name` 不以 `mcp__` 开头这一支（与 `_is_side_effecting_
+        # tool` 判非 MCP 同一条件，但语义不同，不复用那个方法名）。刻意不区分
+        # `NOT_IN_WHITELIST` 与 `NOT_IN_WHITELIST_QUERY_REDIRECT` 两种拒绝原因码：
+        # 产品负责人的裁定原文是"非 MCP 工具被拒累计"，没有按原因码再收窄；被拒的
+        # `mcp__` 工具（例如模型请求了一个真实存在但未获批准的 MCP 工具名）不计入
+        # ——那是"选错了具体工具"，不是这次事故里的"用内置工具包装绕过白名单"。
+        # 放行的调用、以及未达阈值时的全部行为，都不受这段代码影响——不改变现状。
+        if verdict.denied and not verdict.tool_name.startswith("mcp__"):
+            self._wrapper_denial_count += 1
+            if (
+                not self._wrapper_denial_fuse_tripped
+                and self._wrapper_denial_count >= self._wrapper_denial_fuse_threshold
+            ):
+                self._wrapper_denial_fuse_tripped = True
+                if self._on_wrapper_fuse_tripped is not None:
+                    try:
+                        self._on_wrapper_fuse_tripped(self._wrapper_denial_count)
+                    except Exception:  # noqa: BLE001 - 熔断通知失败不得影响工具判定本身
+                        pass
         return response
