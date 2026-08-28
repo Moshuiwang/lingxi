@@ -260,7 +260,12 @@ class ReplayTransport:
             yield self._envelope
         self.exhausted = True
 
-    def report(self, payload: dict, error: BaseException | None) -> None:
+    def report(
+        self, payload: dict, error: BaseException | None, response: dict | None = None
+    ) -> None:
+        # ``response`` 与 ``LarkEventTransport.report`` 的现行签名对齐（Issue #96 起
+        # supervisor 以三实参调用；旧的两参定义会让 supervisor 不干净退出——
+        # Trace #373 H3 L4a 实踩，见 #373 S-H3-4 副发现）。摘要不需要它。
         actions = list(self._audit.actions)
         self._audit.actions.clear()
         summary = {
