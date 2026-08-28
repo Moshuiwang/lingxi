@@ -432,6 +432,143 @@ class SchedulerUserVolumeTest(unittest.TestCase):
         self.assertEqual(CONTRACT.check_scheduler_user_volume(), [])
 
 
+class ResourceLimitsTest(unittest.TestCase):
+    """六个服务必须在 ``deploy.resources.limits`` 声明 cpus/memory/pids 三项
+    （Trace #373 H2 / S-H2-1，产品负责人 2026-08-28 先行裁定）。
+    """
+
+    FULL_SERVICE = (
+        "scheduler:\n"
+        '  image: ${LINGXI_IMAGE_REGISTRY:?x}/lingxi-scheduler:${LINGXI_IMAGE_TAG:?y}\n'
+        '  user: "10001:10001"\n'
+        "  deploy:\n"
+        "    resources:\n"
+        "      limits:\n"
+        '        cpus: "1.0"\n'
+        "        memory: 1G\n"
+        "        pids: 512\n"
+    )
+
+    def _with_base(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        base = directory / "compose.yaml"
+        base.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_BASE
+        CONTRACT.COMPOSE_BASE = base
+        try:
+            return CONTRACT.check_resource_limits()
+        finally:
+            CONTRACT.COMPOSE_BASE = original
+
+    def test_missing_service_is_reported(self) -> None:
+        failures = self._with_base("worker:\n  image: x\n")
+        self.assertTrue(any("找不到 service `scheduler`" in f for f in failures), failures)
+
+    def test_missing_limits_block_entirely_is_caught(self) -> None:
+        """变异验红：完全没有 deploy.resources.limits 声明，必须变红——这正是
+        本卡修复前六个服务的真实状态。"""
+
+        failures = self._with_base('scheduler:\n  user: "10001:10001"\n')
+        self.assertTrue(
+            any("scheduler" in f and "deploy.resources.limits" in f for f in failures), failures
+        )
+
+    def test_missing_a_single_key_is_caught(self) -> None:
+        """漏掉 pids 这一项（比如复制粘贴时漏了一行）也必须变红，不能只核对
+        deploy.resources.limits 这个块存在。"""
+
+        body = (
+            'scheduler:\n'
+            '  deploy:\n'
+            '    resources:\n'
+            '      limits:\n'
+            '        cpus: "1.0"\n'
+            '        memory: 1G\n'
+        )
+        failures = self._with_base(body)
+        self.assertTrue(any("scheduler" in f and "`pids`" in f for f in failures), failures)
+
+    def test_well_formed_service_passes(self) -> None:
+        failures = self._with_base(self.FULL_SERVICE)
+        self.assertEqual([f for f in failures if "scheduler" in f], [])
+
+    def test_real_compose_declares_limits_for_all_six_services(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_resource_limits(), [])
+
+
+class LogRetentionFloorTest(unittest.TestCase):
+    """json-file 的 max-size/max-file 不得低于取证留存下限（Issue #343 /
+    Trace #373 H2，S-H2-2）。
+    """
+
+    def _with_base(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        base = directory / "compose.yaml"
+        base.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_BASE
+        CONTRACT.COMPOSE_BASE = base
+        try:
+            return CONTRACT.check_log_retention_floor()
+        finally:
+            CONTRACT.COMPOSE_BASE = original
+
+    def test_size_parsing_understands_the_compose_units(self) -> None:
+        self.assertEqual(CONTRACT._parse_log_size_mb("50m"), 50.0)
+        self.assertEqual(CONTRACT._parse_log_size_mb('"50m"'), 50.0)
+        self.assertEqual(CONTRACT._parse_log_size_mb("1g"), 1024.0)
+        self.assertEqual(CONTRACT._parse_log_size_mb("2048k"), 2.0)
+        self.assertIsNone(CONTRACT._parse_log_size_mb("很多"))
+
+    def test_a_max_size_below_the_floor_is_caught(self) -> None:
+        """变异验红：把 max-size 改回本卡修复前的 20m，必须变红。"""
+
+        body = (
+            'scheduler:\n'
+            '  logging:\n'
+            '    driver: json-file\n'
+            '    options:\n'
+            '      max-size: "20m"\n'
+            '      max-file: "5"\n'
+        )
+        failures = self._with_base(body)
+        self.assertTrue(any("scheduler" in f and "max-size" in f for f in failures), failures)
+
+    def test_a_max_file_below_the_floor_is_caught(self) -> None:
+        body = (
+            'scheduler:\n'
+            '  logging:\n'
+            '    driver: json-file\n'
+            '    options:\n'
+            '      max-size: "50m"\n'
+            '      max-file: "3"\n'
+        )
+        failures = self._with_base(body)
+        self.assertTrue(any("scheduler" in f and "max-file" in f for f in failures), failures)
+
+    def test_missing_logging_options_is_caught(self) -> None:
+        failures = self._with_base('scheduler:\n  user: "10001:10001"\n')
+        self.assertTrue(any("scheduler" in f and "logging.options" in f for f in failures), failures)
+
+    def test_at_the_floor_passes(self) -> None:
+        body = (
+            'scheduler:\n'
+            '  logging:\n'
+            '    driver: json-file\n'
+            '    options:\n'
+            '      max-size: "50m"\n'
+            '      max-file: "5"\n'
+        )
+        failures = self._with_base(body)
+        self.assertEqual([f for f in failures if "scheduler" in f], [])
+
+    def test_real_compose_meets_the_retention_floor_for_all_six_services(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_log_retention_floor(), [])
+
+
 class PublishJobGuardTest(unittest.TestCase):
     """Epic Full 候选与 main Publish 之间不能被一行配置绕过。"""
 
