@@ -174,11 +174,14 @@
 
 首次开通编排的执行器有自己独立的线程池（``apps/scheduler/onboarding.py::
 OnboardingExecutor``），不跑在 ``SchedulerLoop`` 的调用线程上——``run_forever()``
-返回只说明各职责不再被 tick 调用，不代表这些独立线程也已经停止领取新工作、收工
-退出。``main()`` 因此在 ``run_forever()`` 返回之后额外调用一次
+返回（或抛出未处理异常）只说明各职责不再被 tick 调用，不代表这些独立线程也已经
+停止领取新工作、收工退出。``main()`` 因此用 ``try``/``finally`` 包住
+``run_forever()``，在 finally 里无条件调用一次
 :func:`~lingxi.apps.scheduler.onboarding.join_onboarding_executors`（Issue #284
-C 组 #8，Trace #373 D7 裁定修复），把"停止领取、等在途工作在预算内收尾"这条退出
-语义显式接到这条独立线程池上，见该函数文档字符串。
+C 组 #8，Trace #373 D7 裁定修复；P1-B，Trace #373 H1 批终修复包② codex 外审），
+把"停止领取、等在途工作在预算内收尾"这条退出语义显式接到这条独立线程池上——正常
+返回与主循环抛出未处理异常两条退出路径都会走到，不再只覆盖正常返回那一条；收尾
+本身失败只记日志，不覆盖 ``run_forever()`` 的原始异常。见该函数文档字符串。
 """
 
 from __future__ import annotations
@@ -290,9 +293,19 @@ def main(argv: list[str] | None = None) -> int:
 
     install_signal_handlers(loop)
     logger.info("lingxi-scheduler 已启动 interval_seconds=%s", config.interval_seconds)
-    loop.run_forever()
-    # Issue #284 C 组 #8：`run_forever()` 只保证不再有新一轮 tick，开通执行器自己
-    # 的独立线程池需要单独接线停止领取新工作、并在预算内等在途链收尾（见模块文档
-    # 「退出语义」一节）。
-    join_onboarding_executors(loop.duties)
+    try:
+        loop.run_forever()
+    finally:
+        # Issue #284 C 组 #8 + P1-B（codex 外审 · Trace #373 H1 批终修复包②）：
+        # `run_forever()` 只保证不再有新一轮 tick，开通执行器自己的独立线程池
+        # 需要单独接线停止领取新工作、并在预算内等在途链收尾（见模块文档「退出
+        # 语义」一节）。此前这一行放在 `run_forever()` 之后、没有 finally 覆盖：
+        # 主循环抛出未处理异常时这一行会被绕过，daemon 线程只能靠解释器退出时
+        # 被任意截断，而不是走"停止领取、等在途工作在预算内收尾"这条退出语义。
+        # 收尾自身的异常不得覆盖原始故障——记一条日志后放行，让 `run_forever()`
+        # 的原始异常（如果有）继续原样向上传播。
+        try:
+            join_onboarding_executors(loop.duties)
+        except Exception:
+            logger.exception("lingxi-scheduler 收尾 join_onboarding_executors 失败")
     return 0
