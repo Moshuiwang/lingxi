@@ -47,21 +47,21 @@ _ACTION_LABEL: dict[PendingActionType, str] = {
     PendingActionType.LOCAL_PERMISSION_REVOKE: "收回",
 }
 
-#: 零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus 审查 P1）：
-#: 只在**授权**这条动作的确认卡上出现——四源合并挂在 `aggregate.granted` 判据之后，
-#: 一个当前没有任何银河权限的用户走的是撤权分支，本地授权此刻不生效；本地抑制则
-#: 无此问题（银河那一侧本就是零，抑制与否结果一样，不会制造虚假期待）。判据本身
-#: 不在这里改（产品裁定项，编排者已挂待裁），只如实提示这条边界，见
-#: `core/admin/router.py::_ZERO_GALAXY_PERMISSION_CAVEAT` 同一条边界在 `/admin user`
-#: 输出侧的呼应。
-_ZERO_GALAXY_PERMISSION_CAVEAT = "若该用户当前无任何银河权限，本地授权暂不生效（边界见 V-权限-15）。"
+#: 零银河权限用户的本地授权边界提示（#319 动机场景，Trace #328 opus 审查 P1）
+#: **已随 PM 2026-08-29 裁定（Issue #419）撤销**：四源合并不再挂在 `aggregate.
+#: granted` 判据之后——零银河权限用户的本地授权现在无条件参与合并（下一轮重算或
+#: 下一次开通链会把它发布出去，见 `permission_refresh.py`/`onboarding_runner.py`
+#: 各自新增的分支），因此"暂不生效"这句提示已经不实，直接删除，不再改成条件性
+#: 文案（判定这一刻是否零银河需要额外一次聚合查询，成本与确认卡渲染的判定层级
+#: 不匹配，且删除后不再需要判定）。历史常量名与位置如实保留在这条注释里，供以后
+#: 检索这段沿革。
 
 _IMPACT_TEXT: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "该用户将立即无法发起新的问数或开通；已在进行中的任务不受影响、正常完成交付。",
     PendingActionType.RESUME_USER: "该用户将恢复可以正常问数；此前被收回的权限不会自动恢复。",
     PendingActionType.LOCAL_PERMISSION_GRANT: (
         "该用户将获得下方指定公司×指标的问数权限（本地授权，独立于银河翻译结果，"
-        f"不影响其余已有权限）。{_ZERO_GALAXY_PERMISSION_CAVEAT}"
+        "不影响其余已有权限）。"
     ),
     PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该用户将被限制访问下方指定公司×指标（本地抑制优先级最高，即使银河翻译结果授予也会被拦截）。",
     PendingActionType.LOCAL_PERMISSION_REVOKE: "下方指定的本地覆盖行将被收回，不再影响该用户的权限聚合结果（银河翻译结果与其余本地覆盖不受影响）。",
