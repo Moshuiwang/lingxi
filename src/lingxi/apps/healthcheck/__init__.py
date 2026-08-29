@@ -19,6 +19,33 @@
 
 任何一段失败都以非零退出码结束，原因写到 stderr（不写业务正文，只写类别与
 耗时/年龄这类低敏诊断信息）。
+
+## 依赖可达判定的成本与缓存（Issue #409）
+
+每次探测都是 ``docker exec`` 起一个全新 Python 进程；``import psycopg`` 本身
+（拉 ``asyncio``/``logging``/``importlib.metadata``/C 扩展 ``psycopg_binary``
+等一整条依赖链）在本机实测约 **450ms**，是单次探测里压倒性的主要开销——冷
+解释器启动只有约 20-30ms，``argparse`` 只有约 11ms，两者都不是主因（Issue
+#409 root cause 取证）。这笔成本不能靠"精简 import"消掉：只要每次探测都要
+真的证明数据库可达，就绕不开这次 import 与随之而来的新建连接。
+
+因此依赖可达这一段判定引入一层**有效期极短的成功结果缓存**：一次真实探测
+成功后，把结果戳进 ``{role}-db`` 这个活性文件键（复用 ``apps/liveness`` 的
+通用机制，与"主循环是否跳动"用的活性文件键各自独立、不冲突）；只要缓存年龄
+未超过 ``db_cache_ttl_seconds``，后续探测直接信任缓存、跳过 ``import
+psycopg`` 与新建连接这整段开销。**缓存只在成功时写入**：一旦真实探测失败，
+缓存不刷新，之后每一轮都会立刻重新做真实探测直到恢复——不存在"故障期间反而
+不再检查"的空间。
+
+**缓存不弱化"依赖不可达必须如实变红"这条硬约束，只是把发现窗口从"每一轮都
+探测"改成"每一轮都可能探测，最坏情况下最多晚 ``db_cache_ttl_seconds``"**——
+与既有的"主循环活性阈值"是同一种权衡（那也是"最多容忍一段陈旧"而不是"每次
+都重新证明"）。每个角色的 ``db_cache_ttl_seconds`` 默认值刻意取该角色自身
+"主循环活性阈值"的 80%（留 20% 安全余量），使得"依赖不可达"新的最坏发现时延
+仍然低于既有的"主循环停摆"最坏发现时延——不改变 ``deploy/监控告警.md``「五、
+时延估算」表格里已经登记的、以主循环停摆为准的端到端最坏时延结论，只需要在
+该文件补一列缓存 TTL 与更新后的"依赖不可达"分项数字（该文件是时延数值的
+唯一事实源，本模块不复制推导）。
 """
 
 from __future__ import annotations
@@ -28,7 +55,7 @@ import sys
 import time
 from typing import Mapping, Sequence
 
-from lingxi.apps.liveness import read_liveness_age_seconds
+from lingxi.apps.liveness import read_liveness_age_seconds, touch_liveness
 
 # 三个进程读数据库连接串用的环境变量名不统一（scheduler/worker 用不带前缀的
 # LINGXI_POSTGRES_DSN；gateway 的配置整体加了 LINGXI_GATEWAY_ 前缀，见
@@ -50,6 +77,18 @@ _DEFAULT_MAX_LIVENESS_AGE_SECONDS: Mapping[str, float] = {
     "gateway": 30.0,
 }
 
+# 依赖可达判定的成功结果缓存有效期（Issue #409，见模块说明「依赖可达判定的成本
+# 与缓存」）。刻意取各角色 `_DEFAULT_MAX_LIVENESS_AGE_SECONDS` 的 80%（留 20%
+# 安全余量）：这保证"依赖不可达"新的最坏发现时延（`db_cache_ttl_seconds +
+# retries × (interval + timeout)`）仍然低于既有的"主循环停摆"最坏发现时延
+# （`活性阈值 + retries × (interval + timeout)`），因此不改变
+# `deploy/监控告警.md` 里以主循环停摆为准的端到端最坏时延结论。
+_DEFAULT_DB_CACHE_TTL_SECONDS: Mapping[str, float] = {
+    "scheduler": 144.0,
+    "worker": 48.0,
+    "gateway": 24.0,
+}
+
 # gateway 一个进程里跑两条独立循环（长连接主线程、投递消费后台线程，见
 # apps/gateway/__init__.py 模块说明），任一条停摆都是"进程活着但消费停止"的
 # 真实形状——只测其中一条会让另一条静默死亡时仍然报健康。因此 gateway 对应
@@ -65,11 +104,29 @@ class HealthcheckError(RuntimeError):
     """健康检查判定失败；``reason`` 是安全的分类文本，不含业务正文或凭据。"""
 
 
-def _check_database(role: str, env: Mapping[str, str]) -> None:
+def _db_cache_liveness_key(role: str) -> str:
+    return f"{role}-db"
+
+
+def _check_database(role: str, db_cache_ttl_seconds: float, env: Mapping[str, str]) -> None:
+    # DSN 校验永远先做、永远不受缓存影响：这是免费的输入校验，不是"证明可达"
+    # 本身要缓存的那部分开销，且必须在任何环境下都能准确报告"读错了哪个变量名"
+    # （不能被一份恰好新鲜的缓存戳悄悄掩盖）。
     dsn_var = _DSN_ENV_VAR_BY_ROLE[role]
     dsn = (env.get(dsn_var) or "").strip()
     if not dsn:
         raise HealthcheckError(f"缺少数据库连接串环境变量 {dsn_var}")
+
+    cache_key = _db_cache_liveness_key(role)
+    # `db_cache_ttl_seconds <= 0` 显式判"永不信任缓存"，不依赖"age > 0"这类
+    # 计时巧合——两次探测理论上可能落在同一个墙钟秒内，`age` 会精确为 0.0。
+    if db_cache_ttl_seconds > 0:
+        cached_age = read_liveness_age_seconds(cache_key)
+        if cached_age is not None and cached_age <= db_cache_ttl_seconds:
+            # 近期已经真实证明过可达，本轮跳过——省下的正是 `import psycopg`
+            # 这一整条依赖链（模块说明「依赖可达判定的成本与缓存」实测约
+            # 450ms）。
+            return
 
     from lingxi.adapters.postgres import connect
 
@@ -80,6 +137,9 @@ def _check_database(role: str, env: Mapping[str, str]) -> None:
                 cursor.fetchone()
     except Exception as error:  # noqa: BLE001 - 健康检查只需要区分"能不能连上"
         raise HealthcheckError(f"数据库不可达：{type(error).__name__}") from error
+    # 只在真正探测成功时刷新缓存——探测失败绝不写入，保证故障期间每一轮都会
+    # 重新做真实探测，直到真的恢复为止。
+    touch_liveness(cache_key)
 
 
 def _check_liveness(role: str, max_age_seconds: float, env: Mapping[str, str]) -> None:
@@ -122,6 +182,15 @@ def run(
         default=None,
         help="主循环活性文件的最大可接受年龄（秒）；缺省按角色取合理默认值",
     )
+    parser.add_argument(
+        "--db-cache-ttl-seconds",
+        type=float,
+        default=None,
+        help=(
+            "依赖可达判定的成功结果缓存有效期（秒，Issue #409）；缺省按角色取"
+            "合理默认值。0 等价于关闭缓存，每轮都做真实探测"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     source = os.environ if env is None else env
@@ -129,10 +198,13 @@ def run(
     max_age = args.max_age_seconds
     if max_age is None:
         max_age = _DEFAULT_MAX_LIVENESS_AGE_SECONDS[args.role]
+    db_cache_ttl = args.db_cache_ttl_seconds
+    if db_cache_ttl is None:
+        db_cache_ttl = _DEFAULT_DB_CACHE_TTL_SECONDS[args.role]
 
     started = time.monotonic()
     try:
-        _check_database(args.role, source)
+        _check_database(args.role, db_cache_ttl, source)
         _check_liveness(args.role, max_age, source)
     except HealthcheckError as error:
         print(f"unhealthy role={args.role} reason={error}", file=err)

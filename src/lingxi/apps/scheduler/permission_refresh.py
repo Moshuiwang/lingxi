@@ -63,6 +63,9 @@
    "我们认不出这个人是谁"，不是"银河说他没有权限"。据一次花名册歧义或数据陈旧去清空
    一个人的权限，方向与花名册那一侧的既定口径正好相反——那边对"花名册查无此人"的处置
    是**仅提示、不做任何自动处置**（``roster.note.removed``），由管理员在日报里判断。
+   **这一条自 2026-08-29 起有一个显式例外**：聚合层判定"无可用权限"不再直接等于
+   撤权，还要先看这个人有没有本地授权兜底——见下文「零银河权限用户的本地授权兜底」
+   一节。
 
 幂等由 :meth:`~lingxi.adapters.postgres_permission_publish.
 PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：第二天仍然无权限时，
@@ -71,6 +74,35 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
 
 **本职责仍然不通知**：通知的触发点在发布读回一致（撤权）或就绪探针成功（增权）之后，
 属 :mod:`lingxi.apps.scheduler.permission_publish`。这里连一个发送端口都没有。
+
+## 零银河权限用户的本地授权兜底（PM 2026-08-29 裁定，Issue #419，消 `V-权限-15` 已知限制）
+
+产品负责人原话：「权限管理不仅仅依靠银河，管理员也可以赋权，管理员额外赋权后，和银河
+取并集作为用户真实的权限」——**并集无条件成立，包括银河侧为零权限的用户**。此前四源
+合并（下文「本地权限覆盖合并」一节）挂在 ``aggregate.granted`` 判据之后，一个当前没有
+任何银河权限的用户结构上走的是 :meth:`_revoke`、从不到达合并那一步，管理员对这类用户
+发起的本地授权因此结构上不生效——这是实现顺序留下的缺口，不是产品裁定，本次修复消除它。
+
+:meth:`_refresh_zero_galaxy_user` 是新的分支：``aggregate.granted`` 为假时不再直接
+:meth:`_revoke`，而是把 ``galaxy={}``（银河这一侧对合并的贡献恒为空——不翻译，见该方法
+文档）传给同一个 :func:`~lingxi.core.permission.merge_sources.merge_permission_sources`，
+查一次本地授权（S-P-3）与存量沿用（S-P-2）：
+
+- **合并结果非空**（本地授权未被同键抑制清空，或存量沿用未被有界化判据挡住）→ 走发布
+  分支，发布内容精确等于合并结果（这个人没有银河内容，因此结果只由本地授权/存量沿用
+  决定），复用 :meth:`_enqueue_publish`——与银河授权路径共用同一段收尾（令牌只读、结算
+  发布行、落决定、清送达正文），两条路径殊途同归。
+- **合并结果仍为空**（既无银河也无本地授权，或本地授权已被同键抑制清空）→ 维持现行
+  撤权语义不变，:meth:`_revoke` 一个字节都不改，撤权侧的两条既有边界（只对发布链上
+  留过足迹的人发、聚合层判定无可用权限）继续生效。
+
+**存档不全时不查本地覆盖/存量沿用，直接撤权**：撤权行与发布行都需要 ``email``/
+``display_name``，任何合并结果都救不了一个存档不全的人，提前判掉省一次读放大，也与
+:meth:`_revoke` 自己"完整性检查在查发布足迹之前短路"的既有观测行为逐字节一致（见
+:meth:`_refresh_zero_galaxy_user` 文档）。
+
+**``suspend`` 停用触发的撤权链不受影响**：那是账号状态机的独立分支（管理命令面 →
+``account_state``），不经过本职责的 ``aggregate.granted`` 判据，本卡完全没有触碰它。
 
 ## 全抑制（本地覆盖压光全部权限）同样走撤权出口（红线-2，Trace #328 opus 审查）
 
@@ -188,8 +220,16 @@ LegacyPermissionTable`，装配层未接线时同样为 ``None``）并进去：�
 :func:`~lingxi.core.permission.legacy_source.resolve_legacy_source` 承担——读取/解析
 失败只跳过这一个用户的存量源、响亮记 ``permission_refresh.legacy_source_skipped``
 审计，不整轮/整人失败；装配层未接线时静默按"没有存量源"处理，与本地覆盖同一姿态。
-本地覆盖与存量沿用都**只影响授权路径**，不影响 ``_revoke``——撤权写的是不含指标名
-的 ``{}``，两者对它都没有作用面，与翻译层「与撤权无关」同一条边界。
+
+**``_refresh_user`` 之外的第二个挂点（PM 2026-08-29 裁定，Issue #419）**：
+``aggregate.granted`` 为假时，:meth:`_refresh_zero_galaxy_user` 同样调用这个纯函数，
+只是 ``galaxy`` 参数换成恒为空的 ``{}``（银河这一侧没有可翻译的内容，见该方法文档）。
+两个调用点因此都决定"是否走撤权路径"，不再是「本地覆盖与存量沿用只影响授权路径、
+与 ``_revoke`` 完全无关」——准确的说法是：本地覆盖/存量沿用现在决定**是发布还是
+撤权**这件事本身（合并结果空则撤权、非空则发布），一旦真的走到 ``_revoke``，它写的
+仍然是不含指标名的 ``{}``，本地覆盖/存量沿用对撤权行**本身的内容**依旧没有作用面
+——这一半（撤权行永远是空对象、不受本地覆盖影响）与翻译层「与撤权无关」仍是同一条
+边界，没有改变。
 """
 
 from __future__ import annotations
@@ -745,8 +785,15 @@ class PermissionRefreshDuty:
             role_function_map=self._role_function_map,
         )
         if not aggregate.granted:
-            # 撤权侧：**保行清空**，且只对"我们发布过的人"发（模块文档「撤权」一节）。
-            self._revoke(tally, identity, aggregate.reason, now)
+            # **零银河权限：不再无条件撤权**（PM 2026-08-29 裁定，Issue #419，消
+            # `V-权限-15` 此前登记的已知限制）。管理员的本地授权是「银河之外的兜底
+            # 赋权」，产品语义上与用户此刻有没有银河权限无关——挂在 `aggregate.
+            # granted` 判据之后只是实现上的历史顺序，不是产品裁定。因此这里把「银河
+            # 这一侧完全没有可翻译的内容」当成 `merge_permission_sources` 的一个
+            # 合法空输入（`galaxy={}`），查一次本地授权/存量沿用，合并结果非空才算
+            # 数——既无银河也无本地授权（或本地授权已被同键抑制清空）时，合并结果
+            # 仍是空字典，维持现行撤权语义不变，`_revoke` 一个字节都不改。
+            self._refresh_zero_galaxy_user(tally, identity, aggregate, now)
             return
 
         if not identity.email or not identity.display_name:
@@ -807,11 +854,80 @@ class PermissionRefreshDuty:
             self._revoke(tally, identity, REASON_FULLY_SUPPRESSED, now)
             return
 
+        self._enqueue_publish(tally, identity, merged.permissions, now)
+
+    def _refresh_zero_galaxy_user(
+        self,
+        tally: _Tally,
+        identity: ArchivedIdentity,
+        aggregate: Any,
+        now: datetime,
+    ) -> None:
+        """银河这一侧判定"无可用权限"（`no_galaxy_roles`/`no_supported_function`/
+        `no_company_scope`）时的新分支（PM 2026-08-29 裁定，Issue #419）：查一次
+        本地授权/存量沿用，合并结果非空就发布，仍为空才撤权。
+
+        **存档不全时直接走撤权、不先查本地覆盖/存量沿用**：撤权行与发布行都需要
+        `email`/`display_name` 这两列，任何合并结果都救不了一个存档不全的人，提前
+        判掉能省一次读放大——`_revoke` 自己的完整性检查本就在查发布足迹之前短路
+        （模块文档「撤权」一节），这里保持与它逐字节一致的观测行为
+        （`tests/test_permission_refresh_duty.py::RevocationPublishTest.
+        test_a_revoked_user_with_an_incomplete_archive_is_skipped` 钉住
+        "存档不全时连发布足迹都不查"，本方法不得破坏这条既有断言）。
+
+        **不翻译**：`aggregate.granted` 为假时 `aggregate.companies`/`functions`
+        恒为空（`PermissionAggregate.__post_init__` 的不变式），银河这一侧对合并
+        的贡献直接是 `galaxy={}`——不调用 `translate_company_functions`（对空输入
+        它会直接拒绝，那是"参数缺失"，不是"没有内容"），因此这条分支与翻译层整轮/
+        逐用户两层判据（模块文档「翻译」一节）完全没有交集：翻译层不可用不影响它，
+        它也不消费翻译结果。
+        """
+
+        if not identity.email or not identity.display_name:
+            self._revoke(tally, identity, aggregate.reason, now)
+            return
+
+        local = self._resolve_local_overrides(identity.app_user_id)
+        legacy = self._resolve_legacy_source(identity.app_user_id, identity.email, {})
+        merged = merge_permission_sources(galaxy={}, local=local, legacy=legacy)
+        for reason in merged.skipped_reasons:
+            # 通配角 v1 结构上不会在这条分支出现（`galaxy` 恒为空字典，不含
+            # `ALL_COMPANIES_KEY`），保留同一姿态只是让两条分支的代码形状一致。
+            self._audit.record(
+                "permission_refresh.local_override_skipped",
+                user=identity.app_user_id,
+                reason=reason,
+            )
+
+        if not merged.permissions:
+            # 既无银河也无本地授权（或本地授权已被同键抑制清空）：维持现行撤权
+            # 语义不变，`_revoke` 一个字节都不改。
+            self._revoke(tally, identity, aggregate.reason, now)
+            return
+
+        # 本地授权（可能叠加存量沿用）非空：管理员的兜底赋权生效，发布内容=合并
+        # 结果（精确等于本地授权/存量沿用集合，因为 galaxy 侧贡献为空）。
+        self._enqueue_publish(tally, identity, merged.permissions, now)
+
+    def _enqueue_publish(
+        self,
+        tally: _Tally,
+        identity: ArchivedIdentity,
+        company_metrics: Mapping[str, Sequence[str]],
+        now: datetime,
+    ) -> None:
+        """结算并落一次授权发布决定，供 `_refresh_user`（银河授权路径）与
+        `_refresh_zero_galaxy_user`（零银河 + 本地授权兜底路径）共用同一段收尾——
+        两条路径殊途同归：都在四源合并之后拿到非空的 `company_metrics`，剩下的
+        （只读令牌密文、结算发布行、落决定、计数、清送达正文）与"这份内容是从
+        银河翻译来的还是纯本地授权来的"无关。
+        """
+
         # 只取**已有**密文，取不到就是 None（发布层随后以 ``missing_token_cipher``
         # 失败关闭）。这里没有、也不允许有任何签发路径。
         token_cipher = self._token_ciphers.token_cipher(identity.app_user_id)
         row = build_translated_publish_row(
-            company_metrics=merged.permissions,
+            company_metrics=company_metrics,
             email=identity.email,
             display_name=identity.display_name,
             decided_at=now,

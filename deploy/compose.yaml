@@ -142,6 +142,15 @@ services:
     # 该命令同时探测数据库可达性与主循环活性文件——依赖不可用或主循环停摆都会
     # 让它如实变红，不接受"PID 存活即健康"（`scripts/ci/check_deploy_contract.py`
     # 会核对每个常驻服务都配了 healthcheck）。
+    #
+    # 数据库可达性探测自 Issue #409 起带一层短期成功结果缓存（默认 TTL 144s，
+    # 即本角色活性阈值 180s 的 80%）：`import psycopg` 本身实测约占单次冷启动
+    # 探测成本的绝大部分，缓存命中时整段跳过，不再新建连接。缓存只在探测成功
+    # 时刷新，故障期间每一轮仍会真实重新探测；发现"依赖不可达"的最坏时延因此
+    # 从"每轮都探测"变成"最坏多等一个 TTL"，具体数字与推导见
+    # `deploy/监控告警.md`「五、时延估算」（唯一事实源）与
+    # `src/lingxi/apps/healthcheck/__init__.py` 模块说明。判定逻辑本身不变：
+    # 仍是"依赖不可达或主循环停摆必须如实变红"。
     healthcheck:
       test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "scheduler"]
       interval: 30s
@@ -222,6 +231,11 @@ services:
     # 的 29s 互质——LCM(23,29)=667s，两条检查此后只会每约 11 分钟短暂重合一次，
     # 而不是像 15s/15s 那样几乎每轮都可能重叠，Python 冷启动次数同时降约 35%。
     # 不改判定逻辑：仍是"依赖不可达或主循环停摆必须如实变红"，只改触发节奏。
+    #
+    # Issue #409 顺手：这一轮冷启动本身也变轻了——数据库可达性探测带一层短期
+    # 成功结果缓存（默认 TTL 24s，即本角色活性阈值 30s 的 80%），缓存命中时
+    # 跳过 `import psycopg` 与新建连接这部分开销（实测占单次探测的绝大部分）。
+    # 详见 scheduler 服务块同型注释与 `deploy/监控告警.md`「五、时延估算」。
     healthcheck:
       test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "gateway"]
       interval: 23s
@@ -339,6 +353,10 @@ services:
     # 与 gateway 的 23s 互质错开稳态相位；start_period 顺带偏移到 32s（约 gateway
     # interval 的一半），让两者第一轮检查也不再落在 compose up 同一时刻的 ≤2s
     # 窗口内。同样不改判定逻辑，只改触发节奏——见 gateway 服务块的完整推导。
+    #
+    # Issue #409 顺手：数据库可达性探测带一层短期成功结果缓存（默认 TTL 48s，
+    # 即本角色活性阈值 60s 的 80%），缓存命中时跳过 `import psycopg` 与新建
+    # 连接。详见 scheduler 服务块同型注释与 `deploy/监控告警.md`「五、时延估算」。
     healthcheck:
       test: ["CMD", "python", "-m", "lingxi.apps.healthcheck", "--role", "worker"]
       interval: 29s
