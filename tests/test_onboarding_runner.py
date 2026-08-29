@@ -811,10 +811,10 @@ class LocalOverrideMergeTests(unittest.TestCase):
 
 class ZeroGalaxyLocalGrantTests(unittest.TestCase):
     """`V-权限-15` 已消除的已知限制在开通侧的对应断言（PM 2026-08-29 裁定，
-    Issue #419）：``aggregate.granted`` 为假不再让 `_match` 直接拒绝，先看本地
-    授权/存量沿用能否兜底出可发布内容——与
-    ``tests/test_permission_refresh_duty.py::ZeroGalaxyLocalGrantTest`` 同一组
-    断言，证明两个调用点消费的是同一条产品语义。"""
+    Issue #419）：``aggregate.granted`` 为假不再让 `_match` 直接拒绝，先看
+    **本地授权**（不含存量沿用，P0-1 独立审查坐实并修复）能否兜底出可发布内容
+    ——与 ``tests/test_permission_refresh_duty.py::ZeroGalaxyLocalGrantTest``
+    同一组断言，证明两个调用点消费的是同一条产品语义。"""
 
     def test_zero_galaxy_user_with_a_local_grant_completes_with_exactly_the_local_set(
         self,
@@ -878,6 +878,25 @@ class ZeroGalaxyLocalGrantTests(unittest.TestCase):
         self.assertEqual(parts["environment"].calls, [])
         self.assertEqual(parts["decisions"].rows, [])
         self.assertEqual(parts["users"].advanced, [])
+
+    def test_a_legacy_row_alone_does_not_authorize_a_never_granted_user(self) -> None:
+        """否定（P0-1，独立审查坐实并修复）：零银河 + 零本地授权 + 旧系统表遗留行
+        → 存量沿用不构成独立授权来源，维持 ``not_authorized`` 语义。修复前
+        ``_reject_zero_galaxy_without_local_grant`` 会把 ``_resolve_legacy_
+        source`` 的结果也并进判据，让这个人被误判成有效授权、真的开通并发布；
+        修复后这一步固定传 ``legacy=None``，连 ``find_rows`` 都不发起。"""
+
+        legacy = FakeLegacyTable({"xiaoming@example.com": '{"88":["旧系统遗留指标"]}'})
+        parts, result = run_once(role_function_map={}, legacy_source=legacy)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"], "no_supported_function"
+        )
+        self.assertEqual(parts["environment"].calls, [], "无权限终态不得创建用户环境")
+        self.assertEqual(parts["decisions"].rows, [], "无权限终态不得排发布意图")
+        self.assertEqual(parts["users"].advanced, [], "无权限终态不得推进开通状态")
+        self.assertEqual(legacy.find_calls, [], "零银河兜底判据不得读取存量沿用")
 
     def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
         """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从

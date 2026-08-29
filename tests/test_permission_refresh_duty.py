@@ -1591,8 +1591,8 @@ class FullSuppressionRevocationTest(unittest.TestCase):
 
 class ZeroGalaxyLocalGrantTest(unittest.TestCase):
     """`V-权限-15` 已消除的已知限制：`aggregate.granted` 为假不再无条件撤权，先看
-    本地授权/存量沿用能否兜底出可发布内容——``_refresh_zero_galaxy_user`` 的三条
-    否定/正向断言。"""
+    **本地授权**（不含存量沿用，P0-1 独立审查坐实并修复）能否兜底出可发布内容
+    ——``_refresh_zero_galaxy_user`` 的否定/正向断言。"""
 
     def test_zero_galaxy_user_with_a_local_grant_publishes_exactly_the_local_set(
         self,
@@ -1666,6 +1666,46 @@ class ZeroGalaxyLocalGrantTest(unittest.TestCase):
         self.assertEqual(parts["decisions"].calls, [], "既无银河也无本地授权，零发布意图")
         self.assertEqual(report.revoked, 1)
         self.assertEqual(report.reasons["no_galaxy_roles"], 1)
+
+    def test_a_legacy_row_alone_does_not_authorize_a_never_granted_user(self) -> None:
+        """否定（P0-1，独立审查坐实并修复）：零银河 + 零本地授权 + 旧系统表遗留行
+        → 存量沿用不构成独立授权来源，维持撤权语义。修复前
+        ``_refresh_zero_galaxy_user`` 会把 ``_resolve_legacy_source`` 的结果也并进
+        判据，让这个人被误判成有效授权、真的排出发布意图；修复后这一步固定传
+        ``legacy=None``，连 ``find_rows`` 都不发起。"""
+
+        legacy = FakeLegacyTable({EMAIL_ONE: f'{{"{COMPANY_ID}":["旧系统遗留指标"]}}'})
+        duty, parts = build_duty(
+            identities=(identity(),), galaxy=galaxy_snapshot(roles=()), legacy_source=legacy
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "存量沿用不得单独兜底出发布内容")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.reasons["no_galaxy_roles"], 1)
+        self.assertEqual(legacy.find_calls, [], "零银河兜底判据不得读取存量沿用")
+
+    def test_a_local_override_read_failure_skips_the_user_without_revoking(self) -> None:
+        """否定（P1-1，独立审查坐实并修复）：零银河分支里本地覆盖读取失败 ≠
+        「没有本地授权」——修复前两者都落到 ``None``，会让这个人被真的撤权、
+        同事务清空已送达正文；修复后读取失败本轮直接跳过这个人：零发布意图、
+        零撤权、只留 ``_resolve_local_overrides`` 已经记过的那一条
+        ``local_override_skipped`` 审计，不额外多记。"""
+
+        overrides = FakeLocalOverrides(fail_for={USER_ONE})
+        duty, parts = build_duty(
+            identities=(identity(),), galaxy=galaxy_snapshot(roles=()), local_overrides=overrides
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "读取失败时零发布行为变化")
+        self.assertEqual(report.revoked, 0, "读取失败不得被误判成撤权")
+        self.assertEqual(report.enqueued, 0)
+        skipped = parts["audit"].fields_for("permission_refresh.local_override_skipped")
+        self.assertEqual(len(skipped), 1, "只留一条审计，不重复记")
+        self.assertEqual(skipped[0]["reason"], REASON_LOCAL_OVERRIDE_READ_FAILED)
 
     def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
         """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从

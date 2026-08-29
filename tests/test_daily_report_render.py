@@ -867,9 +867,14 @@ class LocalOverrideActivityRenderTests(unittest.TestCase):
         self.assertIn("授权 2 笔", text)
         self.assertIn("抑制 1 笔", text)
         self.assertIn("收回 1 笔", text)
-        self.assertIn("授权 5 条", text)
+        self.assertIn("当前登记 授权 5 条", text)
         self.assertIn("抑制 3 条", text)
         self.assertIn("涉及 6 位用户", text)
+        # P1-2（独立审查坐实并修复）：现网每日重算未跑，不得笼统断言「生效」——
+        # 正文改用「登记」计数本身，另加一句口径说明区分开通链（已生效）与
+        # 重算侧（待每日重算恢复运行），与 `daily_report.py` 模块措辞同步。
+        self.assertIn("生效口径：开通链已生效，重算侧待每日重算恢复运行", text)
+        self.assertNotIn("当前生效", text)
         # 正文只含计数，不含任何形式的用户标识、公司 ID 或指标名——
         # `LocalOverrideActivity` 本身就只携带六个整数字段，结构上没有承载
         # 这些值的字段，这里额外核对渲染结果不引入任何形状可疑的片段。
