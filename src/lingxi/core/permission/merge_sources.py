@@ -69,6 +69,35 @@ runner.py`` 与 ``apps/scheduler/permission_refresh.py`` 的当时代码）发�
    在开通侧的实际接线点是 ``_publish``，不是设计初稿写的"聚合后"那一行——聚合发生
    的地方还没有本地覆盖查询所需要的键。
 
+   **2026-08-29 更正（PM 裁定，Issue #419）**：上一段仍然成立——``_publish`` 依旧是
+   "结算发布行、真正把合并结果写进外部表"的唯一位置——但开通侧现在多了**第二个**
+   调用点：``_recheck_still_provisionable`` 之后、``_issue_token``/
+   ``_create_environment`` 之前的 ``_reject_zero_galaxy_without_local_grant``。
+   它在 ``aggregate.granted`` 为假时提前查一次**本地覆盖**（``galaxy={}``，
+   ``legacy`` 固定传 ``None``——存量沿用不参与这一步的授权判据，P0-1 独立审查
+   2026-08-29 坐实并修复，理由见该方法文档字符串「P0-1 收窄」一节），只为回答
+   "要不要继续往下走"，不结算发布行；`_publish` 随后仍然会用同一个函数再算一次
+   并真正落决定（`legacy` 在那里不受影响，照常参与）。之所以多出这一次提前查询，
+   是为了不为一个最终仍会被拒绝的零银河用户签发问数 MCP 令牌、创建带凭据的用户
+   环境——理由与取舍见 ``onboarding_runner.py`` 该方法自己的文档字符串，本模块
+   不重复。
+
+## 调用时机：``aggregate.granted`` 不再是本函数被调用的前提条件（PM 2026-08-29 裁定，Issue #419）
+
+设计初稿（乃至 S-P-3 落地时）默认两个调用点只在"银河这一侧判定有效授权"时才会走到
+本函数——``permission_refresh.py::_refresh_user`` 与 ``onboarding_runner.py::
+AutoOnboardingRunner._publish`` 都曾经把 ``aggregate.granted`` 当作"要不要合并"的
+前置闸门，零银河权限的用户结构上从不到达合并这一步，管理员对这类用户发起的本地
+授权因此结构上不生效（`V-权限-15` 此前登记的已知限制）。产品负责人 2026-08-29
+裁定「并集无条件成立，包括银河侧为零权限的用户」之后，两个调用点都新增了一条
+"``aggregate.granted`` 为假时改传 ``galaxy={}`` 继续调用本函数"的分支——本函数
+自身**一行代码都没有变**：它从 S-P-3 起就把 ``galaxy`` 参数放宽成语义无关的
+``Mapping[str, Sequence[str]]``，``{}`` 只是这个类型的一个普通空值，走的仍然是
+非通配分支的既有代数（`keys = set(galaxy_map) | set(local_grants) | set(legacy_map)`
+在 ``galaxy_map`` 为空时天然只剩本地授权与存量沿用的键）。这正是当初"签名放宽到
+语义无关"这个取舍的红利：上游多出一种新的合法输入形状，下游纯函数不需要跟着改一
+个字符。
+
 ## 通配角 v1 语义（编排者裁定，逐字执行）
 
 目标用户聚合为 ``all_companies=True``（当前唯一形态：银河「后台管理员」角色，见

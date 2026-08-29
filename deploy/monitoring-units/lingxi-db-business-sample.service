@@ -1,0 +1,15 @@
+[Unit]
+Description=Lingxi 数据库/业务层监控单轮采样（S-RC20-410，Issue #410）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wangzhipeng
+WorkingDirectory=/opt/lingxi/scripts/monitoring
+# 凭据只经 EnvironmentFile 注入进程环境，不进 ExecStart 命令行（argv 对同机其他
+# 账户可见，环境变量只对能读 /proc/<pid>/environ 的账户可见，收紧一层）；文件须
+# 0600，内容只有一行 LINGXI_POSTGRES_DSN=...，见 deploy/监控告警.md 安装步骤。
+EnvironmentFile=/opt/lingxi/monitoring/db-business.env
+ExecStart=/usr/bin/env bash /opt/lingxi/scripts/monitoring/db_business_sample.sh
+TimeoutStartSec=30

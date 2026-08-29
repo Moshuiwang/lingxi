@@ -168,8 +168,10 @@ class _OutboxMixin:
         字段的普通 dict（不含 ``status``/``source`` 信封，见迁移文件头部），由
         ``_jsonb_or_none`` 适配成 ``JSONB``。
 
-        ``document_request``（迁移 ``0074``，Issue #341 S-ES-3）：``None`` 或
-        ``{"title": str, "paragraphs": list[str]}``——``apps/worker/service.py``
+        ``document_request``（迁移 ``0074``，Issue #341 S-ES-3；迁移 ``0079``
+        新增可选 ``markdown``，Issue #408 正式方案接线）：``None`` 或
+        ``{"title": str, "paragraphs": list[str], "markdown": str | None}``——
+        ``apps/worker/service.py``
         只在这一轮终态是 :attr:`~lingxi.core.delivery.ports.TerminalKind.SUCCESS`
         且报告契约的 ``document_request`` 字段非空时才传非 ``None``。非
         ``None`` 时插入一行 ``task_document_delivery_request``（状态
@@ -316,13 +318,24 @@ class _OutboxMixin:
         cursor: Any, *, task_id: str, delivery_request: Mapping[str, Any], delivery_type: str
     ) -> None:
         """插入一行 ``pending`` 的文档/表格投递请求（迁移 ``0074`` 建表，迁移
-        ``0078`` 加 ``delivery_type`` 列，Issue #341 S-ES-3 / #354 S-H3-2）。
+        ``0078`` 加 ``delivery_type`` 列，迁移 ``0079`` 加 ``markdown`` 列，
+        Issue #341 S-ES-3 / #354 S-H3-2 / #408 正式方案接线）。
 
         ``delivery_type='docx'`` 时 ``delivery_request`` 形状是
-        ``{"title", "paragraphs"}``；``delivery_type='sheet'`` 时形状是
-        ``{"title", "rows"}``——两者的第二个字段名不同（``paragraphs`` 是段落
-        文本数组，``rows`` 是行×列的单元格文本二维数组），但都落进同一个
-        ``paragraphs`` JSONB 列（复用理由见迁移 0078 文件头部「为什么复用」）。
+        ``{"title", "paragraphs", "markdown"}``（``markdown`` 见下）；
+        ``delivery_type='sheet'`` 时形状是 ``{"title", "rows"}``——两者的第二个
+        字段名不同（``paragraphs`` 是段落文本数组，``rows`` 是行×列的单元格
+        文本二维数组），但都落进同一个 ``paragraphs`` JSONB 列（复用理由见迁移
+        0078 文件头部「为什么复用」）。
+
+        ``markdown``（迁移 0079，Issue #408 正式方案接线）：只在
+        ``delivery_type='docx'`` 时读取并落库——``sheet`` 类型没有"markdown
+        排版"这个概念，迁移 0079 的 CHECK（``delivery_type = 'docx' OR markdown
+        IS NULL``）在数据库层面也会拒绝把这一列的值写进 sheet 行，这里提前按
+        类型收窄是纵深防线，不是唯一防线。取不到（缺失、非字符串、空字符串）
+        一律落 ``NULL``——不拒绝整条请求：``markdown`` 是段落之外的附加值，
+        gateway 侧读到 ``NULL`` 会回退段落路径（零行为变化），比因为这一个
+        可选字段让用户连基础的段落交付都拿不到更保守。
 
         ``requester_open_id`` 直接在 SQL 里用 ``task.user_id`` JOIN
         ``app_user.feishu_open_id`` 求值，不在应用层多打一次往返——调用方
@@ -348,18 +361,22 @@ class _OutboxMixin:
         if not isinstance(content, (list, tuple)) or not content:
             raise ValueError(f"{delivery_type}_request.{content_field} 必须是非空列表")
 
+        markdown = delivery_request.get("markdown") if delivery_type == "docx" else None
+        if not isinstance(markdown, str) or not markdown:
+            markdown = None
+
         from psycopg.types.json import Jsonb
 
         cursor.execute(
             """
             INSERT INTO task_document_delivery_request
-                (id, task_id, requester_open_id, title, paragraphs, delivery_type)
-            SELECT %s, t.id, u.feishu_open_id, %s, %s, %s
+                (id, task_id, requester_open_id, title, paragraphs, delivery_type, markdown)
+            SELECT %s, t.id, u.feishu_open_id, %s, %s, %s, %s
               FROM task AS t
               JOIN app_user AS u ON u.id = t.user_id
              WHERE t.id = %s
             """,
-            (new_id("tdd"), title, Jsonb(list(content)), delivery_type, task_id),
+            (new_id("tdd"), title, Jsonb(list(content)), delivery_type, markdown, task_id),
         )
         if cursor.rowcount != 1:
             # task 行已经在调用方的 FOR UPDATE 里被锁定、确认存在；到这里插不进

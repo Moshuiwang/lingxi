@@ -319,6 +319,61 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
         self.assertIn("正在第 2 次查询指标数据", rendered_body)
         self.assertNotIn("正在处理", rendered_body, "不应该退回默认 processing 文案")
 
+    def test_the_accumulated_step_list_survives_across_separate_poll_rounds(self) -> None:
+        """Issue #407 方向 B：``_process_task`` 每一轮都会构造一个全新的
+        ``CardStream``（本类文件头「过程流式的正文累积」已说明）——这条用例
+        证明第二轮轮询构造的新实例仍然能从 outbox 找回第一轮已经追加过的行，
+        卡片正文只会变长，不会在跨轮询边界"变短"。
+
+        变异存活证据：把 ``DeliveryConsumer._prior_progress_history`` 改成恒
+        返回 ``()``（不重建历史），本用例的第二次断言会变红——第二轮的正文
+        会只剩第二行，缺掉第一轮已经展示过的第一行。
+        """
+
+        from lingxi.core.execution.card_stream import (
+            PROGRESS_ACTION_COMPOSING,
+            PROGRESS_ACTION_QUERYING,
+            encode_progress_action,
+        )
+
+        self.seed_running_task(task_id="tsk-1", conversation_id="cnv-1")
+        self.start_task("tsk-1")
+
+        clock = [0.0]
+        cards = RecordingCards()
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=cards, texts=texts, monotonic=lambda: clock[0]
+        )
+        consumer.run_once()  # 第一轮：只处理 started，建卡。
+
+        clock[0] = 0.6
+        self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:1", elapsed_seconds=5,
+            content=encode_progress_action(
+                PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+            ),
+        )
+        consumer.run_once()  # 第二轮：新建一个 CardStream 处理第一条 progress。
+        first_round_body = cards.update_calls[-1]["card"].body
+        self.assertEqual(first_round_body, "正在第 1 次查询可用指标列表 · 5 秒")
+
+        clock[0] = 1.2
+        self.queue.append_delivery_event(
+            task_id="tsk-1", worker_id="worker-1", event_type="progress",
+            idempotency_key="tsk-1:a1:progress:2", elapsed_seconds=9,
+            content=encode_progress_action(PROGRESS_ACTION_COMPOSING),
+        )
+        consumer.run_once()  # 第三轮：又一次全新的 CardStream，处理第二条 progress。
+        second_round_body = cards.update_calls[-1]["card"].body
+
+        self.assertEqual(
+            second_round_body,
+            "正在第 1 次查询可用指标列表 · 5 秒\n正在整理与生成回答 · 9 秒",
+            "第三轮（全新的 CardStream 实例）必须找回第二轮已经追加过的第一行",
+        )
+
     def test_a_second_round_with_no_new_events_does_not_repeat_delivery(self) -> None:
         """重复轮询（没有新事件）不应该产生第二次外部调用（状态合同第 7 条）。"""
 

@@ -41,6 +41,7 @@ from lingxi.core.execution.document_delivery import (
     DELIVERY_MCP_SERVER_NAME,
     DocumentDeliveryError,
     MAX_PARAGRAPHS,
+    MAX_RAW_MARKDOWN_CHARS,
     MAX_SHEET_COLUMNS,
     MAX_SHEET_ROWS,
     MAX_SHEET_TOTAL_CHARS,
@@ -89,16 +90,31 @@ def _stderr_events(buffer: io.StringIO) -> list[dict]:
 
 
 class NormalizeMarkdownTest(unittest.TestCase):
-    def test_strips_markdown_syntax_and_splits_on_blank_lines(self) -> None:
+    def test_splits_on_blank_lines_and_collapses_intra_paragraph_newlines(self) -> None:
+        """Issue #408：不再剥离 Markdown 语法字符，`#`/`-`/`*`/反引号原样保留在
+        段落里——只做空行切段、段内折叠。"""
+
         markdown = "# 标题\n\n- 第一条\n- 第二条\n\n**加粗内容** 和 `代码`。"
 
         paragraphs = normalize_markdown(markdown)
 
-        self.assertEqual(paragraphs, ("标题", "第一条 第二条", "加粗内容 和 代码。"))
+        self.assertEqual(
+            paragraphs, ("# 标题", "- 第一条 - 第二条", "**加粗内容** 和 `代码`。")
+        )
 
-    def test_blank_or_pure_syntax_input_normalizes_to_no_paragraphs(self) -> None:
+    def test_blank_input_normalizes_to_no_paragraphs(self) -> None:
         self.assertEqual(normalize_markdown("   \n\n   \n"), ())
-        self.assertEqual(normalize_markdown("# \n\n---\n\n***"), ())
+
+    def test_negative_numbers_and_percentage_ranges_are_preserved_verbatim(self) -> None:
+        """Issue #408 数据正确性修复的核心断言：此前的字符剥离会把连字符一并
+        吃掉——「周环比 -12.85%」变成「周环比 12.85%」（负号丢失）、「3-5%」
+        变成「35%」（区间被拼接）。这里必须逐字保真。"""
+
+        markdown = "周环比 -12.85%\n\n销售额同比增长 3-5%"
+
+        paragraphs = normalize_markdown(markdown)
+
+        self.assertEqual(paragraphs, ("周环比 -12.85%", "销售额同比增长 3-5%"))
 
 
 # ----------------------------------------------------------- 纯逻辑：build_document_request
@@ -111,6 +127,9 @@ class BuildDocumentRequestTest(unittest.TestCase):
         self.assertEqual(request.title, "周报")
         self.assertEqual(request.paragraphs, ("第一段。", "第二段。"))
         self.assertEqual(request.total_chars, len("第一段。") + len("第二段。"))
+        # Issue #408 正式方案接线：原始 markdown 全文原样保留（不是从 paragraphs
+        # 拼回去的近似值），供 gateway 官方转换路径消费。
+        self.assertEqual(request.markdown, "第一段。\n\n第二段。")
 
     def test_title_out_of_bounds_is_rejected(self) -> None:
         for bad_title in ("", "   ", "x" * (MAX_TITLE_CHARS + 1)):
@@ -130,10 +149,14 @@ class BuildDocumentRequestTest(unittest.TestCase):
             build_document_request(title="标题", markdown="   ")
         self.assertEqual(ctx.exception.reason_code, "empty_markdown")
 
-    def test_markdown_that_normalizes_to_nothing_is_rejected(self) -> None:
-        with self.assertRaises(DocumentDeliveryError) as ctx:
-            build_document_request(title="标题", markdown="# \n\n---\n\n***")
-        self.assertEqual(ctx.exception.reason_code, "empty_markdown")
+    def test_markdown_with_only_markdown_syntax_characters_is_accepted_verbatim(self) -> None:
+        """Issue #408：不再剥离语法字符，`# \n\n---\n\n***` 每一块都还剩下非空
+        白字符，因此不再被判定为"归一化后无可用段落"——与
+        ``NormalizeMarkdownTest`` 的新行为对称。"""
+
+        request = build_document_request(title="标题", markdown="# \n\n---\n\n***")
+
+        self.assertEqual(request.paragraphs, ("#", "---", "***"))
 
     def test_too_many_paragraphs_is_rejected_without_silent_truncation(self) -> None:
         """变异锚点③（上半）：跳过硬上限校验会让这条用例变绿（不再拒绝）。"""
@@ -156,6 +179,33 @@ class BuildDocumentRequestTest(unittest.TestCase):
         self.assertEqual(ctx.exception.reason_code, "too_many_chars")
         self.assertLessEqual(MAX_PARAGRAPHS, 80)
         self.assertLessEqual(MAX_TOTAL_CHARS, 20000)
+
+    def test_raw_markdown_over_limit_is_rejected_even_when_normalized_paragraphs_are_tiny(
+        self,
+    ) -> None:
+        """P2 顺手（独立审查）：只校验归一化后的 ``total_chars`` 挡不住一种
+        绕过——``normalize_markdown`` 会把纯空白/纯空行的"段"折叠成空字符串
+        直接丢弃（``if collapsed:`` 判据），因此可以塞进海量这样的段落，
+        原始 ``markdown`` 长度不受控地膨胀，但归一化后 ``paragraphs``/
+        ``total_chars`` 仍然很小、逃过既有的 ``too_many_chars`` 检查——而
+        ``DocumentRequest.markdown`` 存的是**原始**入参，会逐字持久化进迁移
+        0079 的 ``markdown`` 列。这里构造这种"归一化后几乎为零、原始却超限"
+        的输入，必须被独立的原始长度上限拒绝。
+
+        变异锚点：删掉 ``MAX_RAW_MARKDOWN_CHARS`` 校验，本用例会从抛
+        ``DocumentDeliveryError`` 变红成正常构造出一个 ``DocumentRequest``。
+        """
+
+        # 一段真实内容 + 大量"纯空白行组成的空段落"（每个空段落归一化后长度为
+        # 0，不计入 total_chars），让原始字符串远超上限、但归一化后段落极少。
+        blank_blocks = "\n\n".join("   " for _ in range(MAX_RAW_MARKDOWN_CHARS))
+        markdown = f"真实内容\n\n{blank_blocks}"
+        self.assertGreater(len(markdown), MAX_RAW_MARKDOWN_CHARS)
+
+        with self.assertRaises(DocumentDeliveryError) as ctx:
+            build_document_request(title="标题", markdown=markdown)
+
+        self.assertEqual(ctx.exception.reason_code, "markdown_too_long")
 
     def test_body_leaking_an_internal_tool_name_pattern_is_rejected(self) -> None:
         """变异锚点④：跳过 constrain_output 会让这条用例变绿（不再拒绝）。"""
@@ -752,7 +802,8 @@ class RunTurnReportContractTest(unittest.TestCase):
         return report, executor
 
     def test_successful_turn_carries_the_document_request_in_the_report(self) -> None:
-        """①：报告带 document_request，字段形状是 title + paragraphs。"""
+        """①：报告带 document_request，字段形状是 title + paragraphs + markdown
+        （Issue #408 正式方案接线新增 markdown，供 gateway 官方转换路径消费）。"""
 
         report, _executor = self._run_with_delivery_call()
 
@@ -760,7 +811,11 @@ class RunTurnReportContractTest(unittest.TestCase):
         self.assertIsNone(report["failure"])
         self.assertEqual(
             report["document_request"],
-            {"title": "周报", "paragraphs": ["第一段。", "第二段。"]},
+            {
+                "title": "周报",
+                "paragraphs": ["第一段。", "第二段。"],
+                "markdown": "第一段。\n\n第二段。",
+            },
         )
 
     def test_failed_turn_does_not_carry_the_document_request(self) -> None:

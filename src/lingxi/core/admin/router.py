@@ -743,31 +743,25 @@ def _render_local_overrides(overrides: Sequence[LocalPermissionOverrideView]) ->
     return "\n".join(lines)
 
 
-#: 零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus 审查 P1）：
-#: `_refresh_user` 的四源合并挂在 `aggregate.granted` 判据**之后**——一个当前没有
-#: 任何银河权限（`no_galaxy_roles`/`no_supported_function`）的用户走的是撤权分支，
-#: 从不到达本地覆盖合并那一步，因此管理员对这类用户发起的本地授权此刻**不生效**。
-#: 本包不改这条闸门语义（产品裁定项，编排者已挂待裁）；`decide_prepare` 只知道
-#: 「这个 (user, direction, company, metric) 键当前有没有生效行」，答不出「这个人
-#: 当前有没有任何银河权限」（需要额外一次聚合查询，prepare() 时现查成本高，且会让
-#: 一次命令解析多出一条对银河快照的依赖），因此不在 prepare() 拒绝，退而求其次在
-#: 这里的展示层加一句如实的边界提示（边界写成 `V-权限-15` 的显式已知限制）。
-_ZERO_GALAXY_PERMISSION_CAVEAT = (
-    "若该用户当前无任何银河权限，本地授权暂不生效（边界见 V-权限-15）。"
-)
+#: 零银河权限用户的本地授权边界提示（#319 动机场景，Trace #328 opus 审查 P1）
+#: **已随 PM 2026-08-29 裁定（Issue #419）撤销**：`_refresh_user`/`_publish` 的
+#: 四源合并不再挂在 `aggregate.granted` 判据之后，管理员对这类用户发起的本地
+#: 授权现在无条件参与合并（下一轮重算或下一次开通链会把它发布出去），"暂不
+#: 生效"这句提示已经不实，直接删除——不需要在 `_render_user_status` 里再判断
+#: 是否附加它，也不再需要 `decide_prepare` 额外查一次银河权限才能决定要不要
+#: 提示（那正是删除前留着这句提示的唯一理由）。
 
 
 def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> str:
     if status is None:
         return f"未找到标识为 {identifier} 的用户记录。"
-    caveat = f"\n{_ZERO_GALAXY_PERMISSION_CAVEAT}" if status.local_overrides else ""
     return (
         f"用户 {identifier}：\n"
         f"开通状态：{status.provisioning_state}\n"
         f"账号状态：{status.account_state}\n"
         f"权限版本：{status.permission_version}\n"
         f"更新时间：{status.updated_at}\n"
-        f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides)}{caveat}"
+        f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides)}"
     )
 
 

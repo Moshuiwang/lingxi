@@ -49,15 +49,20 @@ from lingxi.core.innertest_content_capture import CapturedToolCall, ContentCaptu
 from lingxi.core.year_grounding_guard import QUERY_METRIC_TOOL_NAME
 from lingxi.core.conversation import EventPipeline, InboundMessage
 from lingxi.core.execution.card_stream import (
+    CARD_AUTO_CLOSE_HANDOFF_SECONDS,
     CardCreated,
     CardRateLimiter,
     CardStream,
     DeliveryRejected,
+    KNOWN_QUERY_STEPS,
     PROGRESS_ACTION_COMPOSING,
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
+    PROGRESS_ACTION_WORKING,
     decode_progress_action,
+    encode_progress_action,
 )
+from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 
@@ -223,6 +228,9 @@ class CardStreamTests(unittest.TestCase):
         不回显工具名、参数或任何查询内容——``update()`` 的调用方（Gateway）只传
         得进 ``query_count: int``，从数据类型上就不可能把一个工具名字符串传成
         这个参数；这里核对渲染结果确实不含 ``mcp__``/``query__`` 字样。
+
+        Issue #407 方向 B：卡片正文现在是"已走过的步骤名"追加式列表，第二次
+        更新的正文必须仍然包含第一次那一行（不是被替换掉），断言同步覆盖这一点。
         """
 
         now = [0.0]
@@ -245,10 +253,212 @@ class CardStreamTests(unittest.TestCase):
         stream.update(elapsed_seconds=9, action=PROGRESS_ACTION_COMPOSING)
 
         self.assertEqual(cards.bodies[-2], "正在第 3 次查询指标数据 · 5 秒")
-        self.assertEqual(cards.bodies[-1], "正在整理与生成回答 · 9 秒")
+        self.assertEqual(
+            cards.bodies[-1],
+            "正在第 3 次查询指标数据 · 5 秒\n正在整理与生成回答 · 9 秒",
+            "第二次更新必须追加新行，不能把第一行的历史挤掉",
+        )
         for body in cards.bodies:
             self.assertNotIn("mcp__", body)
             self.assertNotIn("query__", body)
+
+    def test_working_action_renders_its_own_distinct_text(self) -> None:
+        """Issue #407：其它工具调用（working）现在有独立于 composing 的文案。"""
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(elapsed_seconds=4, action=PROGRESS_ACTION_WORKING)
+
+        self.assertEqual(cards.bodies[-1], "正在处理其它步骤 · 4 秒")
+
+    def test_each_known_query_step_renders_its_own_mapped_text(self) -> None:
+        """Issue #407 方向 A：四个已知问数查询子步骤各自选到不同的文案，覆盖
+        「工具名→用户语文案」白名单式映射表的正例分支。Issue #407 方向 B：
+        每次更新都追加一行，最终正文是四行都在的累积列表，不是只剩最新一行。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        expected_lines = [
+            "正在第 1 次查询可用指标列表 · 1 秒",
+            "正在第 2 次查询指标说明 · 1 秒",
+            "正在第 3 次查询维度信息 · 1 秒",
+            "正在第 4 次查询指标数据 · 1 秒",
+        ]
+        steps = ["list_metrics", "describe_metric", "search_dimension", "query_metric"]
+        for index, step in enumerate(steps, start=1):
+            now[0] = float(index)
+            stream.update(
+                elapsed_seconds=1, action=PROGRESS_ACTION_QUERYING, query_count=index, query_step=step
+            )
+            with self.subTest(step=step):
+                self.assertEqual(cards.bodies[-1], "\n".join(expected_lines[:index]))
+        # 全部各不相同——四种子步骤确实映射到四句不同的文案，不是巧合地都落回
+        # 同一句通用文案。
+        self.assertEqual(len(set(expected_lines)), 4)
+
+    def test_the_longest_known_query_step_encoding_stays_within_the_32_byte_contract(
+        self,
+    ) -> None:
+        """P2 顺手（独立审查）：`card_stream.py` 顶部已经把这条不变量钉成一条
+        import 期 `assert`（`_WORST_CASE_QUERYING_CONTENT_LENGTH <= 32`），这里
+        用真实调用 `encode_progress_action` 的方式再验证一遍——白名单里最长的
+        子步骤名（``search_dimension``，16 字节）配两位数计数，编码出的
+        ``content`` 必须不超过迁移 0075 CHECK 与
+        `core.delivery.ports.PROGRESS_CONTENT_MAX_LENGTH` 约定的 32 字节契约。
+        Issue #328 opus 审查 R1 的真实事故正是"编码形状撞上数据库层长度 CHECK、
+        写库失败只记日志、卡片静默不动"——这里把它钉成可执行断言，不只是注释。
+        """
+
+        longest_step = max(KNOWN_QUERY_STEPS, key=len)
+        encoded = encode_progress_action(
+            PROGRESS_ACTION_QUERYING, query_count=99, query_step=longest_step
+        )
+
+        self.assertLessEqual(len(encoded), PROGRESS_CONTENT_MAX_LENGTH)
+        self.assertEqual(encoded, f"querying:99:{longest_step}")
+
+    def test_an_unmapped_query_step_falls_back_to_the_generic_text_without_leaking_it(
+        self,
+    ) -> None:
+        """否定用例（Issue #407 出口安全红线）：即使有人绕过 worker 侧的
+        `encode_progress_action` 白名单、直接把一个未登记的 `query_step` 字符串
+        传给 `CardStream.update()`（模拟"上游过滤被绕过"这一更坏的场景），卡片
+        渲染层本身也必须再挡一次——不得把这个字符串拼进渲染文案。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(
+            elapsed_seconds=7,
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=1,
+            query_step="mcp__query__internal_admin_delete_all",
+        )
+
+        self.assertEqual(cards.bodies[-1], "正在第 1 次查询指标数据 · 7 秒")
+        for body in cards.bodies:
+            self.assertNotIn("internal_admin_delete_all", body)
+            self.assertNotIn("mcp__", body)
+
+    def test_approaching_the_auto_close_threshold_hands_off_to_text_before_the_platform_would(
+        self,
+    ) -> None:
+        """Issue #407：G-CARD 10 分钟自动关闭的提前收口。用时跨过阈值后，这一帧
+        不再是常规进度文案，而是明确的"即将改用文字消息"提示，并立即降级——
+        之后的 `update`/`finish` 都必须直接走文本兜底，不再尝试更新卡片。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 100.0
+        stream.update(elapsed_seconds=100, action=PROGRESS_ACTION_QUERYING, query_count=1)
+        self.assertFalse(stream.fallback_needed)
+
+        now[0] = CARD_AUTO_CLOSE_HANDOFF_SECONDS
+        stream.update(
+            elapsed_seconds=int(CARD_AUTO_CLOSE_HANDOFF_SECONDS),
+            action=PROGRESS_ACTION_QUERYING,
+            query_count=2,
+        )
+
+        self.assertTrue(stream.fallback_needed, "跨过阈值后必须立即降级")
+        self.assertEqual(
+            cards.bodies[-1],
+            "本次处理时间较长，此卡片可能很快不再更新；处理完成后结果将以新消息发送，请留意。",
+        )
+        update_calls_after_handoff = len(cards.calls)
+
+        # 降级之后：后续 progress 更新必须直接跳过卡片，不产生新的 update 调用。
+        now[0] = CARD_AUTO_CLOSE_HANDOFF_SECONDS + 30
+        stream.update(
+            elapsed_seconds=int(CARD_AUTO_CLOSE_HANDOFF_SECONDS + 30),
+            action=PROGRESS_ACTION_COMPOSING,
+        )
+        self.assertEqual(len(cards.calls), update_calls_after_handoff, "降级后不应再调用卡片 update")
+
+        # 终态改走既有文本兜底通道，不再尝试卡片 finish。
+        stream.finish(result="最终答案", elapsed_seconds=600)
+        self.assertEqual(len(cards.calls), update_calls_after_handoff, "降级后 finish 不应触碰卡片")
+
+    def test_the_auto_close_handoff_notice_fires_at_most_once_per_stream(self) -> None:
+        """两次调用都跨过阈值——只有第一次真正触发提示并降级；第二次必须被
+        ``update()`` 顶部既有的 ``_fallback_needed`` 早退分支挡下，不再产生第
+        二次卡片 ``update`` 调用。
+
+        变异存活证据：把 ``_emit_handoff_notice`` 的 ``finally`` 块里
+        ``self._fallback_needed = True`` 这一行删掉，本用例的"只有一次 update"
+        断言会变红（会变成 2）。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        for offset in (0, 30):
+            now[0] = CARD_AUTO_CLOSE_HANDOFF_SECONDS + offset
+            stream.update(
+                elapsed_seconds=int(CARD_AUTO_CLOSE_HANDOFF_SECONDS + offset),
+                action=PROGRESS_ACTION_QUERYING,
+                query_count=1,
+            )
+        update_calls = sum(1 for kind, _ in cards.calls if kind == "update")
+        self.assertEqual(update_calls, 1, "第二次跨阈值调用必须被既有降级状态挡下，不重复发提示")
 
     def test_finish_counts_toward_the_shared_global_rate_budget(self) -> None:
         """独立审核 P2-2：``finish()`` 刻意不经过单话题 500ms 节流（终态帧是结果
@@ -2039,11 +2249,11 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertEqual(len(progress_events), 2, "两次间隔充分的工具调用应各产生一条更新")
         self.assertEqual(
             decode_progress_action(progress_events[0]["content"]),
-            (PROGRESS_ACTION_QUERYING, 1),
+            (PROGRESS_ACTION_QUERYING, 1, "list_metrics"),
         )
         self.assertEqual(
             decode_progress_action(progress_events[1]["content"]),
-            (PROGRESS_ACTION_QUERYING, 2),
+            (PROGRESS_ACTION_QUERYING, 2, "list_metrics"),
         )
 
     def test_a_burst_of_tool_calls_within_five_seconds_is_merged_into_one_update(
@@ -2067,7 +2277,9 @@ class SemanticProgressTests(unittest.TestCase):
                     clock["now"] = offset
                     on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
                 clock["now"] = 12.0  # 跨过节流窗口，触发一次真正的写入
-                on_tool_call("mcp__query__list_metrics")  # type: ignore[misc]
+                # 步骤名换成另一个已知子步骤，核对合并后落库的是最新一次的
+                # 步骤名，不是被合并掉的早期调用留下的旧值。
+                on_tool_call("mcp__query__query_metric")  # type: ignore[misc]
                 return {
                     "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
                     "failure": None,
@@ -2085,12 +2297,13 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertEqual(len(progress_events), 1, "5 秒内的密集调用必须合并，不能逐条写库")
         self.assertEqual(
             decode_progress_action(progress_events[0]["content"]),
-            (PROGRESS_ACTION_QUERYING, 4),
-            "被合并掉的三次调用不能凭空消失——最终写入的必须是最新的调用计数",
+            (PROGRESS_ACTION_QUERYING, 4, "query_metric"),
+            "被合并掉的三次调用不能凭空消失——最终写入的必须是最新的调用计数与步骤名",
         )
 
-    def test_a_non_query_tool_call_is_reported_as_composing_not_querying(self) -> None:
-        """只区分两类文案：非问数工具（含被拒绝的越界调用）一律归入"生成阶段"，
+    def test_a_non_query_tool_call_is_reported_as_working_not_composing(self) -> None:
+        """Issue #407：区分三类文案。非问数工具（含被拒绝的越界调用）现在归入
+        独立的"working"文案，不再与"模型正在输出文本"的 composing 共用一句话；
         不单独计数、不回显工具名。"""
 
         queue = FakeWorkerQueue()
@@ -2117,7 +2330,89 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertEqual(len(progress_events), 1)
         self.assertEqual(
             decode_progress_action(progress_events[0]["content"]),
-            (PROGRESS_ACTION_COMPOSING, None),
+            (PROGRESS_ACTION_WORKING, None, None),
+        )
+
+    def test_model_text_output_is_reported_as_composing_distinct_from_working(self) -> None:
+        """Issue #407：模型文本输出（``assistant_message``）与其它工具调用现在
+        各自独立文案——同一回合先后触发两种信号，必须解码出两种不同的动作码，
+        不能像改动前那样都归并成同一句"生成阶段"文案。"""
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                clock["now"] = 10.0
+                kwargs["on_tool_call"]("Bash")  # type: ignore[index]
+                clock["now"] = 20.0
+                kwargs["on_stream_event"]({"kind": "assistant_message"})  # type: ignore[index]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 2)
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_WORKING, None, None),
+        )
+        self.assertEqual(
+            decode_progress_action(progress_events[1]["content"]),
+            (PROGRESS_ACTION_COMPOSING, None, None),
+        )
+
+    def test_an_unmapped_query_tool_suffix_falls_back_to_the_generic_querying_text_without_leaking_it(
+        self,
+    ) -> None:
+        """否定用例（Issue #407 出口安全红线）：模型可能调用一个仍然落在
+        ``mcp__query__`` 前缀下、但不是四个已知子步骤之一的工具名（臆造的工具名、
+        或注入的内部标识）。这条子步骤名必须在编码这一步就被白名单挡下，进度
+        事件的 ``content`` 字段里不得出现这个原始字符串——否则 Gateway 侧后续
+        任何处理疏漏都可能把它带进用户可见卡片。"""
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+        injected_suffix = "mcp__query__internal_admin_delete_all"
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                clock["now"] = 10.0
+                kwargs["on_tool_call"](injected_suffix)  # type: ignore[index]
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 1)
+        raw_content = progress_events[0]["content"]
+        self.assertNotIn(
+            "internal_admin_delete_all",
+            raw_content or "",
+            "未知子步骤名不得原样落进 outbox content 字段",
+        )
+        self.assertEqual(
+            decode_progress_action(raw_content),
+            (PROGRESS_ACTION_QUERYING, 1, None),
+            "未映射的子步骤退回不带步骤名的通用查询状态，不是拒绝或报错",
         )
 
     def test_a_stalled_long_task_gets_exactly_one_thirty_second_fallback_update(
@@ -2173,7 +2468,7 @@ class SemanticProgressTests(unittest.TestCase):
         self.assertEqual(len(progress_events), 1, "30 秒无事件应恰好触发一次兜底用时更新")
         self.assertEqual(
             decode_progress_action(progress_events[0]["content"]),
-            (PROGRESS_ACTION_PROCESSING, None),
+            (PROGRESS_ACTION_PROCESSING, None, None),
             "本用例从未发生任何可分类信号，兜底更新沿用默认 processing 语义",
         )
         self.assertGreaterEqual(progress_events[0]["elapsed_seconds"], 30)

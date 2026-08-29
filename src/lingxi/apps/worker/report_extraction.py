@@ -153,13 +153,19 @@ def _report_token_usage(report: Mapping[str, Any]) -> dict[str, int] | None:
 
 
 def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    """从一次回合报告里取出**供落库**的文档投递请求（Issue #341 S-ES-3）。
+    """从一次回合报告里取出**供落库**的文档投递请求（Issue #341 S-ES-3；Issue
+    #408 正式方案接线新增 ``markdown``）。
 
     ``report["document_request"]`` 由 ``apps/worker/report.py::build_report``
     投影（见该函数文档）：``None`` 或已过硬上限与出口安全检查的
-    ``{"title": str, "paragraphs": list[str]}``。这里只做结构校验，形状不对一律
-    返回 ``None``——与 :func:`_report_guard_denied_count` 同一纪律：结构性地
-    不可信就不传，不猜测、不编造。
+    ``{"title": str, "paragraphs": list[str], "markdown": str}``。这里只做结构
+    校验，形状不对一律返回 ``None``——与 :func:`_report_guard_denied_count` 同一
+    纪律：结构性地不可信就不传，不猜测、不编造。
+
+    ``markdown`` 单独降级：它是「段落之外的附加值」，不是幂等判据也不是兜底
+    路径依赖的字段（那两者都只看 ``paragraphs``）——形状不对时这里只丢弃
+    ``markdown`` 本身（落库为 ``NULL``，gateway 侧据此回退段落路径），不因为
+    这一个字段拒绝整条本来合法的登记请求。
     """
 
     request = report.get("document_request") if isinstance(report, Mapping) else None
@@ -173,7 +179,12 @@ def _report_document_request(report: Mapping[str, Any]) -> Mapping[str, Any] | N
         isinstance(paragraph, str) for paragraph in paragraphs
     ):
         return None
-    return {"title": title, "paragraphs": paragraphs}
+    markdown = request.get("markdown")
+    return {
+        "title": title,
+        "paragraphs": paragraphs,
+        "markdown": markdown if isinstance(markdown, str) and markdown else None,
+    }
 
 
 def _report_sheet_request(report: Mapping[str, Any]) -> Mapping[str, Any] | None:
