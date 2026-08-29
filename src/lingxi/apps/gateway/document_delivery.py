@@ -57,18 +57,33 @@ worker 侧（``apps/worker/service.py`` 经
 paragraphs`` 续做，绝不二次调用 ``create_document``（S0 探针实测：飞书建文档
 接口没有幂等键，重放会真的多建一篇孤儿文档）。
 
-**写正文步的幂等判据（Issue #353 修复）**：``write_paragraphs`` 同样没有幂等键
-——检查点恢复路径（``claim.document_id`` 进来时已经非空）如果无条件重新调用它，
-会把正文再追加一遍（#328 E-S 验收发现，P3）。不能靠再加一列本地检查点
-（例如"正文已写"标记）来堵这个洞：飞书写入与本地检查点提交是两次独立的数据库/
-网络往返，非原子，"写正文成功了、但推进本地检查点之前进程崩溃"这个窗口永远存在
-——加检查点列只能缩短这个窗口，不能封死它。因此判据必须直接问外部系统的真实
-状态：只在**检查点恢复路径**（``document_id`` 是从 ``claim`` 带进来的，不是本
-次调用刚建出来的）先调用 ``adapters.feishu_docx_delivery.LarkDocxDelivery.
-read_body_children`` 读一次正文根 block 的现有子块，非空即跳过 ``write_
-paragraphs``；首次路径（``document_id`` 本次调用才建出来，必然从未写过正文）
-不做这次多余的读回，行为与修复前逐字相同。该方法已知未被真实验证的假设与后续
-建议见其模块文档字符串。
+**写正文步的幂等判据（Issue #353 修复）**：``write_paragraphs``/``write_body``
+同样没有幂等键——检查点恢复路径（``claim.document_id`` 进来时已经非空）如果无
+条件重新调用它，会把正文再追加一遍（#328 E-S 验收发现，P3）。不能靠再加一列本地
+检查点（例如"正文已写"标记）来堵这个洞：飞书写入与本地检查点提交是两次独立的
+数据库/网络往返，非原子，"写正文成功了、但推进本地检查点之前进程崩溃"这个窗口
+永远存在——加检查点列只能缩短这个窗口，不能封死它。因此判据必须直接问外部系统
+的真实状态：只在**检查点恢复路径**（``document_id`` 是从 ``claim`` 带进来的，
+不是本次调用刚建出来的）先调用 ``adapters.feishu_docx_delivery.LarkDocxDelivery.
+read_body_children`` 读一次正文根 block 的现有子块，非空即跳过写正文；首次路径
+（``document_id`` 本次调用才建出来，必然从未写过正文）不做这次多余的读回，行为
+与修复前逐字相同。该方法已知未被真实验证的假设与后续建议见其模块文档字符串。
+这条判据对官方转换路径同样成立——``write_paragraphs``/官方转换（
+``convert_markdown_to_blocks`` + ``write_blocks``）写的是完全相同的坐标（同一个
+根 block 的 ``children``），``read_body_children`` 不区分"这个坐标上的内容是
+段落写的还是转换写的"，因此不需要为转换路径单独设计幂等判据。
+
+**markdown 官方转换路径的接线（迁移 0079，Issue #408 正式方案接线）**：
+``task_document_delivery_request.markdown`` 非 ``None`` 才有资格走
+``LarkDocxDelivery.write_body`` 的转换分支，是否真的转换由 gateway 配置
+``LINGXI_DOCX_MARKDOWN_CONVERT``（装配进 ``LarkDocxDelivery`` 构造函数的
+``markdown_convert_enabled``）决定；``markdown`` 为 ``None``（历史行、或登记侧
+未能落上原文）**无条件**回退 :meth:`~lingxi.adapters.feishu_docx_delivery.
+LarkDocxDelivery.write_paragraphs`，与转换开关是否打开无关——详见
+:meth:`DocumentDeliveryConsumer._process_docx_claim` 写正文步的分支注释。转换
+失败（业务错误码、结果不明、超过 ``MAX_CONVERTED_BLOCKS``）沿用本模块既有的
+definite/结果不明分类，不单独处理，也绝不静默退回段落路径（``LarkDocxDelivery.
+write_body`` 自身的姿态，见该方法文档字符串）。
 
 **成功通知走"追加消息"，不进入任何已有话题的投递 outbox**：文档交付可能发生在
 原问数任务已经确认送达很久之后（``uncertain``/``failed`` 转 ``pending`` 的
@@ -335,7 +350,25 @@ class DocumentDeliveryConsumer:
                 self._docx.read_body_children(document_id)
             )
             if not already_has_body:
-                self._docx.write_paragraphs(document_id, list(claim.paragraphs))
+                # Issue #408 正式方案接线：``claim.markdown`` 是否非 None 才是
+                # "有没有资格走官方转换路径"的判据——是否真的转换仍然由
+                # ``LarkDocxDelivery.write_body`` 内部的转换开关
+                # （构造期传入的 ``markdown_convert_enabled``）决定（开关关闭
+                # 时 write_body 逐字调用 write_paragraphs，等价于本分支直接调
+                # write_paragraphs）。这里必须显式分两支、不能无条件都走
+                # write_body(markdown=claim.markdown)：如果转换开关已经打开
+                # 但这一行的 markdown 列是 NULL（历史行、或登记侧因为某种原因
+                # 没能落上原文），传 None 进 write_body 会被
+                # convert_markdown_to_blocks 判定为空正文而失败关闭——那不是
+                # 这里要的结果，"markdown 列为 NULL"必须无条件回退段落路径，
+                # 与转换开关状态无关（同 write_body 幂等判据一致：两条路径写的
+                # 是同一个坐标）。
+                if claim.markdown is not None:
+                    self._docx.write_body(
+                        document_id, paragraphs=list(claim.paragraphs), markdown=claim.markdown
+                    )
+                else:
+                    self._docx.write_paragraphs(document_id, list(claim.paragraphs))
             self._docx.grant_full_access(document_id, claim.requester_open_id)
             members = self._docx.read_members(document_id)
         except DocumentDeliveryOwnershipLost:
@@ -744,6 +777,9 @@ def assemble_document_delivery_consumer(
         base_url=config.feishu_base_url,
         tenant_access_token=tenant_access_token,
         tenant_domain=config.tenant_domain,
+        # Issue #408 正式方案接线：装配层把已经读好的布尔值传进去
+        # （adapters/ 不直接读 os.environ，见代码框架「三、横切约定」）。
+        markdown_convert_enabled=config.markdown_convert_enabled,
     )
     sheets = LarkSheetsDelivery(
         base_url=config.feishu_base_url,

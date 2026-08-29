@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0078_document_delivery_sheet` |
+| head revision | `0079_document_delivery_markdown` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -476,6 +476,20 @@ revoke 取值本次一并加入」）；新增 `payload TEXT NULL` 列承载这�
 
 `downgrade()` 直接删两列及其 CHECK，有损（`sheet` 行的类型标记与表格链接随列
 丢失，不删行本身），与 `0075` 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0079_document_delivery_markdown`（正式方案管线接线：检查点表新增 markdown 列）
+
+Issue #408 正式方案第二步。不新建表：`task_document_delivery_request` 新增可空
+`markdown` 列，持久化模型传入的原始 markdown 全文，供 gateway 侧官方转换路径
+（`adapters/feishu_docx_delivery.py::LarkDocxDelivery.write_body`）在开关打开
+时消费；`paragraphs` 列继续是段落兜底路径与既有幂等判据的唯一依据，两列并存
+不互相替代。`CHECK (delivery_type = 'docx' OR markdown IS NULL)` 与 `0078` 的
+`resource_url` CHECK 同一姿态，挡住 `sheet` 行携带这一列的值。`V-投递-06` 的
+24 小时到期擦除同批扩到这一列（擦除态写回 `NULL`）。列语义与判据见迁移文件
+头部完整说明。
+
+`downgrade()` 直接删该列及其 CHECK，有损（非空 `markdown` 随列丢失，不删行
+本身），与 `0078` 既有先例同一姿态（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
