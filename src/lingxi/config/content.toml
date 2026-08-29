@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-28-4"
+version = "2026-08-29-1"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -51,13 +51,30 @@ version = "2026-08-28-4"
 "worker.action.processing" = "正在处理"
 "worker.action.completed" = "已完成"
 # 语义化等待进度（Issue #321 方向 C，产品负责人 2026-08-27 裁定，留痕 #321 评论
-# 5434086490）：长问数期间在这两句之间切换，覆盖两次模型输出之间卡片完全静止的
-# 问题；30 秒仍无新信号则由兜底计时强制刷新一次纯用时更新（沿用当前这句文案，
-# 只跳动 worker.status 的 elapsed_seconds）。只区分"问数查询工具"与"其它/生成
-# 阶段"两类，不回显工具名、参数或任何查询内容（`{count}` 只是第几次调用的序数，
-# 不携带具体工具信息）。文案为实施草案，产品负责人过目前不作为最终定稿。
+# 5434086490；Issue #407 增粒度，产品负责人 2026-08-29 方向 A+B 裁定）：长问数
+# 期间在这些句子之间切换，覆盖两次真实执行信号之间卡片文字长时间不变的问题；
+# 30 秒仍无新信号则由兜底计时强制刷新一次纯用时更新（沿用当前这句文案，只跳动
+# worker.status 的 elapsed_seconds）。三大类：问数查询工具（细分四个已知子步骤，
+# 见下方 querying_* 四条与 core/execution/card_stream.py 的白名单式映射表
+# `_QUERY_STEP_ACTION_TEXT_KEYS`）、模型文本输出（composing）、其它工具调用
+# （working，含被拒绝的越界包装调用）。不回显工具名、参数或任何查询内容
+# （`{count}` 只是第几次问数查询调用的序数，不携带具体工具信息）。文案为实施
+# 草案，产品负责人过目前不作为最终定稿。
 "worker.action.querying_metrics" = "正在第 {count} 次查询指标数据"
+# 下面四条是问数查询工具四个已知子步骤各自的文案（Issue #407 方向 A）——只有
+# 落在白名单里的子步骤名才会选到对应这一条，未映射的工具一律显示上面的通用
+# worker.action.querying_metrics（同样的措辞，作为安全兜底，不因为映射表漏登
+# 而让用户看到不一致的用词）。
+"worker.action.querying_list_metrics" = "正在第 {count} 次查询可用指标列表"
+"worker.action.querying_describe_metric" = "正在第 {count} 次查询指标说明"
+"worker.action.querying_search_dimension" = "正在第 {count} 次查询维度信息"
+"worker.action.querying_query_metric" = "正在第 {count} 次查询指标数据"
 "worker.action.composing" = "正在整理与生成回答"
+"worker.action.working" = "正在处理其它步骤"
+# G-CARD 10 分钟自动关闭提前收口（Issue #407，见 core/execution/card_stream.py
+# 的 CARD_AUTO_CLOSE_HANDOFF_SECONDS）：接近平台自动关闭阈值时的最后一帧卡片
+# 提示，之后改由文字消息发送最终结果。
+"worker.card_handoff_notice" = "本次处理时间较长，此卡片可能很快不再更新；处理完成后结果将以新消息发送，请留意。"
 "worker.status" = "{action} · {elapsed_seconds} 秒"
 "worker.queued_timeout" = "任务尚未开始，当前排队已超过等待时间，请稍后重试。"
 "worker.version_unavailable" = "任务尚未开始，当前执行能力暂时不可用，请稍后重试。"

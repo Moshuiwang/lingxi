@@ -17,6 +17,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -493,6 +494,286 @@ class RunIntegrationTests(unittest.TestCase):
             exit_code = self._run()
         self.assertEqual(exit_code, 2)
         inspector.assert_not_called()
+
+
+class ClassifyThresholdTests(unittest.TestCase):
+    """`classify_threshold` 的连续计数与去重/恢复判定（S-RC20-410，Issue #410）。"""
+
+    def test_single_breach_below_requirement_does_not_alert(self) -> None:
+        action, state = host_health_alert.classify_threshold(
+            True, host_health_alert.ThresholdState(), consecutive_required=3
+        )
+        self.assertEqual(action, host_health_alert.ACTION_NONE)
+        self.assertEqual(state, host_health_alert.ThresholdState(alerting=False, consecutive=1))
+
+    def test_reaching_requirement_alerts_once(self) -> None:
+        state = host_health_alert.ThresholdState()
+        for _ in range(2):
+            _, state = host_health_alert.classify_threshold(True, state, consecutive_required=3)
+        action, state = host_health_alert.classify_threshold(True, state, consecutive_required=3)
+        self.assertEqual(action, host_health_alert.ACTION_ALERT)
+        self.assertEqual(state, host_health_alert.ThresholdState(alerting=True, consecutive=3))
+
+    def test_continuing_breach_after_alert_does_not_realert(self) -> None:
+        alerting_state = host_health_alert.ThresholdState(alerting=True, consecutive=3)
+        action, state = host_health_alert.classify_threshold(True, alerting_state, consecutive_required=3)
+        self.assertEqual(action, host_health_alert.ACTION_NONE)
+        self.assertEqual(state, host_health_alert.ThresholdState(alerting=True, consecutive=4))
+
+    def test_single_non_breach_resets_consecutive_count(self) -> None:
+        mid_count_state = host_health_alert.ThresholdState(alerting=False, consecutive=2)
+        action, state = host_health_alert.classify_threshold(False, mid_count_state, consecutive_required=3)
+        self.assertEqual(action, host_health_alert.ACTION_NONE)
+        self.assertEqual(state, host_health_alert.ThresholdState(alerting=False, consecutive=0))
+
+    def test_recovery_after_alerting(self) -> None:
+        alerting_state = host_health_alert.ThresholdState(alerting=True, consecutive=5)
+        action, state = host_health_alert.classify_threshold(False, alerting_state, consecutive_required=3)
+        self.assertEqual(action, host_health_alert.ACTION_RECOVERY)
+        self.assertEqual(state, host_health_alert.ThresholdState(alerting=False, consecutive=0))
+
+    def test_consecutive_required_one_alerts_immediately(self) -> None:
+        # 磁盘/停更两项用 consecutive_required=1：单次超阈值即告警,不需要"持续"
+        # 多轮确认——只有负载检查按 issue 原文要求"持续"用更大的 required。
+        action, _ = host_health_alert.classify_threshold(
+            True, host_health_alert.ThresholdState(), consecutive_required=1
+        )
+        self.assertEqual(action, host_health_alert.ACTION_ALERT)
+
+
+class ThresholdIOTests(unittest.TestCase):
+    """磁盘/负载/采样文件停更三个 I/O 读取函数，与阈值状态文件读写、消息渲染。"""
+
+    def test_read_disk_usage_percent_returns_reasonable_value(self) -> None:
+        percent = host_health_alert.read_disk_usage_percent("/")
+        self.assertGreaterEqual(percent, 0.0)
+        self.assertLessEqual(percent, 100.0)
+
+    def test_read_disk_usage_percent_raises_for_missing_mount(self) -> None:
+        with self.assertRaises(OSError):
+            host_health_alert.read_disk_usage_percent("/this/path/does/not/exist/at/all")
+
+    def test_read_load_per_cpu_returns_positive_cpu_count(self) -> None:
+        load1, cpu_count = host_health_alert.read_load_per_cpu()
+        self.assertGreaterEqual(load1, 0.0)
+        self.assertGreaterEqual(cpu_count, 1)
+
+    def test_read_sample_age_seconds_missing_both_candidates_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            age = host_health_alert.read_sample_age_seconds(
+                Path(tmp), "resource", now=datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
+            )
+        self.assertIsNone(age)
+
+    def test_read_sample_age_seconds_uses_todays_file_when_present(self) -> None:
+        now = datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            today_file = tmp_path / "resource-20260829.log"
+            today_file.write_text("{}\n", encoding="utf-8")
+            written_at = (now - timedelta(minutes=3)).timestamp()
+            os.utime(today_file, (written_at, written_at))
+            age = host_health_alert.read_sample_age_seconds(tmp_path, "resource", now=now)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 180, delta=1)
+
+    def test_read_sample_age_seconds_falls_back_to_yesterdays_file_near_midnight(self) -> None:
+        # 刚过 UTC 零点，今天的文件还不存在——不应该被误判成"停更"，应该拿昨天
+        # 文件的 mtime 作为参照（见函数文档「同时看两个候选」）。
+        now = datetime(2026, 8, 29, 0, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            yesterday_file = tmp_path / "resource-20260828.log"
+            yesterday_file.write_text("{}\n", encoding="utf-8")
+            written_at = (now - timedelta(minutes=1)).timestamp()
+            os.utime(yesterday_file, (written_at, written_at))
+            age = host_health_alert.read_sample_age_seconds(tmp_path, "resource", now=now)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 60, delta=1)
+
+    def test_render_threshold_alert_and_recovery(self) -> None:
+        alert_text = host_health_alert.render_threshold_message(
+            host_health_alert.ACTION_ALERT, label="磁盘用量", detail="已用 90%", host="h", now="t"
+        )
+        self.assertIn("告警", alert_text)
+        self.assertIn("磁盘用量", alert_text)
+        self.assertIn("已用 90%", alert_text)
+
+        recovery_text = host_health_alert.render_threshold_message(
+            host_health_alert.ACTION_RECOVERY, label="磁盘用量", detail="已用 90%", host="h", now="t"
+        )
+        self.assertIn("恢复", recovery_text)
+
+        with self.assertRaises(ValueError):
+            host_health_alert.render_threshold_message(
+                host_health_alert.ACTION_NONE, label="x", detail="y", host="h", now="t"
+            )
+
+    def test_threshold_state_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "threshold-state.json"
+            states = {
+                host_health_alert.THRESHOLD_DISK: host_health_alert.ThresholdState(alerting=True, consecutive=2),
+                host_health_alert.THRESHOLD_LOAD: host_health_alert.ThresholdState(),
+            }
+            host_health_alert.save_threshold_state(path, states)
+            loaded = host_health_alert.load_threshold_state(path)
+        self.assertEqual(loaded, states)
+
+    def test_threshold_state_missing_file_returns_empty(self) -> None:
+        self.assertEqual(host_health_alert.load_threshold_state(Path("/no/such/file.json")), {})
+
+
+class RunThresholdIntegrationTests(unittest.TestCase):
+    """`run(--enable-resource-thresholds)` 端到端：monkeypatch 三个采集函数，验证
+    去重/持续确认/恢复/发送失败重试在真正的 `run()` 调用路径上成立，且默认关闭
+    时完全不影响既有容器检查行为（S-RC20-410）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp_path = Path(self._tmp.name)
+
+        self.env_path = tmp_path / "env"
+        self.env_path.write_text(
+            "LINGXI_FEISHU_APP_ID=a\nLINGXI_FEISHU_APP_SECRET=b\nLINGXI_ADMIN_GROUP_CHAT_ID=oc_x\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.env_path, 0o600)
+
+        # 容器检查部分用一个"运行中、无 healthcheck 配置"的伪造 docker——这个
+        # 状态不满足任何触发条件（见 `classify`），保持容器层安静、不干扰阈值
+        # 检查的断言（本测试类只关心 `_run_threshold_checks` 这条独立路径）。
+        self.docker_bin = tmp_path / "fake-docker"
+        self.docker_bin.write_text('#!/bin/sh\necho \'{"Running": true}\'\nexit 0\n', encoding="utf-8")
+        os.chmod(self.docker_bin, 0o755)
+
+        self.state_path = tmp_path / "state.json"
+        self.threshold_state_path = tmp_path / "threshold-state.json"
+        self.log_path = tmp_path / "log.txt"
+        self.lock_path = tmp_path / "lock"
+        self.monitoring_dir = tmp_path / "monitoring"
+        self.monitoring_dir.mkdir()
+        # 默认放两份"新鲜"的采样文件，让不针对停更判据的用例不会被停更检查的
+        # 告警噪声污染 `sender.call_count`；专门测停更的用例自己删掉这两个文件。
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        (self.monitoring_dir / f"resource-{today}.log").write_text("{}\n", encoding="utf-8")
+        (self.monitoring_dir / f"db_business-{today}.log").write_text("{}\n", encoding="utf-8")
+
+    def _run(self, extra_argv: list[str] | None = None) -> int:
+        argv = [
+            "--env-file", str(self.env_path),
+            "--containers", "unused-container",
+            "--state-file", str(self.state_path),
+            "--log-file", str(self.log_path),
+            "--lock-file", str(self.lock_path),
+            "--docker-bin", str(self.docker_bin),
+            "--enable-resource-thresholds",
+            "--threshold-state-file", str(self.threshold_state_path),
+            "--monitoring-dir", str(self.monitoring_dir),
+            "--load-consecutive", "2",
+        ]
+        if extra_argv:
+            argv.extend(extra_argv)
+        return host_health_alert.run(argv)
+
+    def test_disabled_by_default_no_threshold_state_file_written(self) -> None:
+        argv = [
+            "--env-file", str(self.env_path),
+            "--containers", "unused-container",
+            "--state-file", str(self.state_path),
+            "--log-file", str(self.log_path),
+            "--lock-file", str(self.lock_path),
+            "--docker-bin", str(self.docker_bin),
+        ]
+        with mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            exit_code = host_health_alert.run(argv)
+        self.assertEqual(exit_code, 0)
+        sender.assert_not_called()
+        self.assertFalse(self.threshold_state_path.exists())
+
+    def test_disk_breach_alerts_once_then_dedupes_then_recovers(self) -> None:
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        self.assertEqual(sender.call_count, 1)
+        sent_text = sender.call_args.kwargs["text"]
+        self.assertIn("磁盘用量", sent_text)
+        self.assertIn("告警", sent_text)
+
+        # 同样超阈值：不应该重复告警。
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=91.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        self.assertEqual(sender.call_count, 0)
+
+        # 恢复到阈值以下：应该收到一条恢复通知。
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=10.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        self.assertEqual(sender.call_count, 1)
+        self.assertIn("恢复", sender.call_args.kwargs["text"])
+
+    def test_load_requires_consecutive_breaches_before_alerting(self) -> None:
+        # --load-consecutive 2：第一轮超阈值不应该告警，第二轮才应该。
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        self.assertEqual(sender.call_count, 0)
+
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(20.0, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        self.assertEqual(sender.call_count, 1)
+        self.assertIn("系统负载", sender.call_args.kwargs["text"])
+
+    def test_staleness_breach_when_sample_file_missing(self) -> None:
+        for sample_file in self.monitoring_dir.glob("*.log"):
+            sample_file.unlink()
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=1.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        sent_labels = {call.kwargs["text"].splitlines()[1].split("：")[0] for call in sender.call_args_list}
+        self.assertIn("资源采样文件停更", sent_labels)
+        self.assertIn("数据库/业务采样文件停更", sent_labels)
+
+    def test_send_failure_does_not_advance_alerting_but_keeps_consecutive_count(self) -> None:
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(
+                 host_health_alert,
+                 "feishu_send_text",
+                 side_effect=host_health_alert.HostMonitorError("simulated_send_failure"),
+             ):
+            self._run()
+        state = host_health_alert.load_threshold_state(self.threshold_state_path)
+        self.assertFalse(state[host_health_alert.THRESHOLD_DISK].alerting)
+
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run()
+        # 上一轮发送失败但连续计数已经达标（consecutive_required=1），这一轮应
+        # 该重新尝试发送并成功。
+        disk_calls = [c for c in sender.call_args_list if "磁盘用量" in c.kwargs["text"]]
+        self.assertEqual(len(disk_calls), 1)
+        state = host_health_alert.load_threshold_state(self.threshold_state_path)
+        self.assertTrue(state[host_health_alert.THRESHOLD_DISK].alerting)
+
+    def test_dry_run_does_not_send_or_persist_threshold_state(self) -> None:
+        with mock.patch.object(host_health_alert, "read_disk_usage_percent", return_value=90.0), \
+             mock.patch.object(host_health_alert, "read_load_per_cpu", return_value=(0.1, 4)), \
+             mock.patch.object(host_health_alert, "feishu_send_text") as sender:
+            self._run(["--dry-run"])
+        sender.assert_not_called()
+        self.assertFalse(self.threshold_state_path.exists())
 
 
 if __name__ == "__main__":

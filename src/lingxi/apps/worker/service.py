@@ -32,6 +32,7 @@ from lingxi.core.execution.card_stream import (
     PROGRESS_ACTION_COMPOSING,
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
+    PROGRESS_ACTION_WORKING,
     encode_progress_action,
 )
 from lingxi.core.innertest_content_capture import ContentCaptureRecord
@@ -436,18 +437,29 @@ class WorkerService:
         # 据此判断是否跳过。
         executor: WorkerTurnExecutor | None = None
 
-        # 语义化等待进度（Issue #321 方向 C）：三个信号源——模型文本输出
-        # （`on_stream_event` 的 `assistant_message`）、工具调用开始
-        # （`on_tool_call`，数据来自 `ToolGateway.set_tool_call_listener`，见
-        # `apps/worker/turn.py::run_turn`）、30 秒兜底计时（`_monitor` 的
-        # `on_stall_tick`）——共享这一份状态，只区分两类文案：问数查询工具
-        # （`QUERY_MCP_TOOL_PREFIX` 前缀）与其它/生成阶段。`last_progress_write_at`
-        # 以任务开始时刻为锚点：`_process_task` 开头的 "started" 事件已经让
-        # Gateway 建卡并展示过一次默认文案（`start()`），下面的节流窗口紧接着它
-        # 算起，不是从零开始。
+        # 语义化等待进度（Issue #321 方向 C；Issue #407 增粒度，产品负责人
+        # 2026-08-29 方向 A+B 裁定）：三个信号源——模型文本输出（`on_stream_
+        # event` 的 `assistant_message`）、工具调用开始（`on_tool_call`，数据
+        # 来自 `ToolGateway.set_tool_call_listener`，见 `apps/worker/turn.py::
+        # run_turn`）、30 秒兜底计时（`_monitor` 的 `on_stall_tick`）——共享这
+        # 一份状态，区分三类文案：问数查询工具（`QUERY_MCP_TOOL_PREFIX` 前缀，
+        # 再按去掉前缀后的子步骤名白名单式细分四种更具体的文案，见
+        # `core.execution.card_stream._QUERY_STEP_ACTION_TEXT_KEYS`）、模型
+        # 文本输出（composing）、其它工具调用（working，含被拒绝的越界包装
+        # 调用）。`last_progress_write_at` 以任务开始时刻为锚点：`_process_task`
+        # 开头的 "started" 事件已经让 Gateway 建卡并展示过一次默认文案
+        # （`start()`），下面的节流窗口紧接着它算起，不是从零开始。
         last_progress_write_at = started_at
         progress_action = PROGRESS_ACTION_PROCESSING
         query_count = 0
+        # 本回合最近一次问数查询调用的子步骤名（Issue #407 方向 A）——只在
+        # `progress_action == PROGRESS_ACTION_QUERYING` 时才有意义，其它动作
+        # 不消费它。取值要么是 `QUERY_MCP_TOOL_PREFIX` 之后的原始后缀（可能不在
+        # `KNOWN_QUERY_STEPS` 白名单里，例如模型臆造的工具名），要么是 `None`；
+        # 白名单过滤发生在 `encode_progress_action`（`core.execution.
+        # card_stream`），这里刻意不提前过滤——把"是否已知子步骤"这个判断集中在
+        # 一处，避免两处白名单各自维护、悄悄漂移。
+        query_step: str | None = None
         # P2-4（Issue #328 opus 审查）：进度写库丢进线程池、不在调用方所在的同步
         # 回调里等待（与 `system_prompt_file` 读取同一手法，见上方 `asyncio.
         # to_thread` 用法）。`_last_progress_write_task` 把连续几次写入串成一条
@@ -499,9 +511,13 @@ class WorkerService:
             progress_count += 1
             content: str | None = None
             if progress_action == PROGRESS_ACTION_QUERYING:
-                content = encode_progress_action(PROGRESS_ACTION_QUERYING, query_count=query_count)
+                content = encode_progress_action(
+                    PROGRESS_ACTION_QUERYING, query_count=query_count, query_step=query_step
+                )
             elif progress_action == PROGRESS_ACTION_COMPOSING:
                 content = encode_progress_action(PROGRESS_ACTION_COMPOSING)
+            elif progress_action == PROGRESS_ACTION_WORKING:
+                content = encode_progress_action(PROGRESS_ACTION_WORKING)
             idempotency_key_suffix = f"progress:{progress_count}"
             elapsed_seconds = int(max(0.0, now - started_at))
             previous_write_task = last_progress_write_task
@@ -530,22 +546,29 @@ class WorkerService:
             background_progress_writes.add(write_task)
 
         def on_stream_event(event: Mapping[str, Any]) -> None:
-            nonlocal progress_action
+            nonlocal progress_action, query_step
             if event.get("kind") == "assistant_message":
-                # 模型在两次工具调用之间/收尾前输出的正文——归入"生成阶段"文案。
+                # 模型在两次工具调用之间/收尾前输出的正文——归入"生成阶段"文案，
+                # 与"其它工具调用"（working）区分开（Issue #407）。
                 progress_action = PROGRESS_ACTION_COMPOSING
+                query_step = None
                 _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
 
         def on_tool_call(tool_name: str) -> None:
-            nonlocal progress_action, query_count
-            # 只区分两类文案（产品负责人裁定）：问数查询工具单独计数、给出"第 N
-            # 次"文案；其它任何工具（含被拒绝的越界调用）一律并入"生成阶段"——
-            # 不回显工具名、参数或任何查询内容。
+            nonlocal progress_action, query_count, query_step
+            # 区分三类文案（Issue #407，产品负责人 2026-08-29 方向 A+B 裁定）：
+            # 问数查询工具单独计数、给出"第 N 次查询……"文案（子步骤名再按白名单
+            # 细分，见 `encode_progress_action` 的 `query_step` 参数）；模型文本
+            # 输出（composing）与其它任何工具调用（working，含被拒绝的越界调用）
+            # 现在各自独立文案，不再合并——不回显工具名、参数或任何查询内容，
+            # `query_step` 是否落进白名单由 `encode_progress_action` 统一把关。
             if isinstance(tool_name, str) and tool_name.startswith(QUERY_MCP_TOOL_PREFIX):
                 query_count += 1
                 progress_action = PROGRESS_ACTION_QUERYING
+                query_step = tool_name[len(QUERY_MCP_TOOL_PREFIX):]
             else:
-                progress_action = PROGRESS_ACTION_COMPOSING
+                progress_action = PROGRESS_ACTION_WORKING
+                query_step = None
             _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
 
         def on_stall_tick() -> None:

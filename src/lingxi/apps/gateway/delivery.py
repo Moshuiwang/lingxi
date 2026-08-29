@@ -25,6 +25,17 @@ R-1 白名单）发生在提交预留位与清空之间时**，下一轮
 **才走 `clear_dispatch_reservation` 立即清空、允许下一轮重试**；除它以外的一切
 异常都归结果不明，绝不清空，统一转 ``uncertain``。
 
+**过程流式的正文累积（Issue #407 方向 B）**：``_process_task`` 每次被调用都会
+构造一个全新的 ``CardStream``——没有跨轮次的进程内状态，这是本模块一贯的
+"无状态消费循环"设计（同 `_handle_started`/`_handle_progress` 的幂等姿态）。
+`CardStream` 现在把"已走过的步骤名"以追加式列表流出（正文随进度更新持续
+变长，飞书官方流式打字机效果天然承担"新行出现"的动态观感），因此必须能在
+每次重新构造时找回上一轮已经追加过的行——`_prior_progress_history` 从
+outbox 里已经持久化的 ``progress``/``safely_releasable_answer`` 历史事件
+重放出这份状态，交给 `CardStream(initial_progress_history=...)`，效果与
+"从任务一开始就用同一个 CardStream 实例"一致，不会出现"轮询到下一轮卡片
+正文突然变短"的回退观感。
+
 **人工恢复（独立审核 B-2 补全，2026-08-14）**：处理一个 ``uncertain`` 任务之前，
 必须先核对对应的外发调用**是否实际已经成功**，核对手段按 ``reserved_kind``：
 
@@ -59,14 +70,21 @@ R-1 白名单）发生在提交预留位与清空之间时**，下一轮
    这才允许调用 ``clear_dispatch_reservation`` 清空预留位，交给下一轮按既有逻辑
    重新外发。
 
-**已知残留风险：G-CARD 10 分钟流式自动关闭**（独立审核 P2-5，#162 评论
-5290545953/5291111636 实测；[验收矩阵](../../../../docs/技术设计/验收矩阵.md)
-``V-卡片-02``/``V-卡片-03`` 补充段落有同一份登记）。未手动关闭的流式卡片距上次
-开启 10 分钟后由平台自动关闭；本消费循环允许卡片跨任意时长恢复（任务寿命只受
-24 小时到期约束，问数任务运行超过 10 分钟并不罕见）。一旦流式已经被平台自动
-关闭，恢复后的 ``update``/``close`` 会失败——中途 ``update`` 失败按既有语义整体
-降级为文本兜底（不构成重复投递），用户会看到一张停在某个中间状态的旧卡片、
-外加一条文本答案。未消除，留待 Bot-Test/Stage 真实验证平台侧关闭行为后再评估。
+**G-CARD 10 分钟流式自动关闭：已实现提前收口缓解（Issue #407）**（独立审核
+P2-5，#162 评论 5290545953/5291111636 实测；[验收矩阵](../../../../docs/技术设计/验收矩阵.md)
+``V-卡片-02``/``V-卡片-03`` 补充段落有同一份登记）。未手动关闭的流式卡片**距上次
+开启**（不是距上次更新）10 分钟后由平台自动关闭；本消费循环允许卡片跨任意
+时长恢复（任务寿命只受 24 小时到期约束，问数任务运行超过 10 分钟并不罕见）。
+常规的 ``update`` 调用不会重置这个"距上次开启"的计时锚点，因此单靠更频繁刷新
+无法真正避免自动关闭——两种代价对比后（见
+``core.execution.card_stream.CARD_AUTO_CLOSE_HANDOFF_SECONDS`` 上方的完整
+取舍说明）选定"提前收口文案"：``CardStream.update()`` 在累计用时接近阈值
+（9 分钟，留 1 分钟安全余量）时主动把最后一帧卡片正文换成明确的"即将改用文字
+消息"提示并立即降级，之后的 ``update``/``finish`` 全部改走既有文本兜底通道，
+不再尝试更新可能已经/即将被平台关闭的卡片。**未消除的部分**：这段主动切换
+逻辑本身只在 L1/L2（本机单测）验证过白名单、节流与降级路径，真实飞书 CardKit
+是否恰好在这个时间窗口内仍然接受更新（即"提前 1 分钟切换"这个安全余量在真实
+网络延迟下是否足够）尚未做 L4a 验证，留待 Bot-Test/Stage 真实取证。
 
 **循环级异常隔离（Issue #191）**：本模块此前只对**单个任务**做异常隔离，两条
 循环级查询（``list_uncertain_delivery_tasks``/``list_pending_delivery_tasks``）
@@ -98,6 +116,7 @@ from lingxi.core.execution.card_stream import (
     CardStream,
     CardTransport,
     DeliveryRejected,
+    ProgressStepSnapshot,
     SendOutcomeCallback,
     TextTransport,
     decode_progress_action,
@@ -323,6 +342,60 @@ class DeliveryConsumer:
             self._note_loop_recovered()
         return len(tasks)
 
+    def _prior_progress_history(self, task: Any) -> tuple[ProgressStepSnapshot, ...]:
+        """重建这个任务在本轮批次**之前**已经持久化的进度信号历史（Issue #407
+        方向 B：卡片正文过程流式）。
+
+        本消费循环按批次轮询、``_process_task`` 每次都会重新构造一个全新的
+        ``CardStream``（没有跨轮次的进程内状态，见类文档「重复投递防线」）。
+        累积正文因此不能只活在某一次调用的内存里——否则下一轮轮询构造的新
+        ``CardStream`` 会让卡片正文突然"变短"（丢掉上一轮已经追加过的行），
+        比不做累积还差。真正的持久化来源就是 outbox 里已经写入的
+        ``progress``/``safely_releasable_answer`` 事件本身（worker 侧
+        ``encode_progress_action`` 编码写入，见 ``apps/worker/service.py``）
+        ——按顺序重放它们，与继续在本轮内存里累积（`_handle_progress`）拼接
+        起来，效果与"从任务一开始就用同一个 CardStream 实例"完全一致。
+
+        只取 ``sequence <= task.consumed_sequence`` 的部分：`task.consumed_
+        sequence` 之后的事件属于本轮 ``events``，会在下面的主循环里通过
+        `_handle_progress` 正常处理并追加，这里重复读取只是为了取"历史"，
+        不能把同一条事件算两次（否则同一步骤的行会在正文里出现两次）。
+
+        ``task.consumed_sequence == 0`` 时（任务从未被消费过一条事件）历史
+        必然为空，直接跳过这次查询——这是压倒性多数轮询批次的常见情形（新
+        任务的第一轮），省一次没有意义的数据库往返。
+        """
+
+        if task.consumed_sequence <= 0:
+            return ()
+        try:
+            full_history = self._queue.read_delivery_events(task_id=task.task_id, after_sequence=0)
+        except Exception as error:  # noqa: BLE001 - 重建失败不能带走本轮正常消费；
+            # 退回空历史——最坏情况是这一次的卡片正文从当前信号重新开始累积
+            # （与本 Story 改动前的单行行为一致），不是任务失败、不影响终态。
+            logger.error(
+                "进度累积历史重建失败，本轮卡片正文从当前信号重新开始 task_id=%s error=%s",
+                task.task_id,
+                type(error).__name__,
+            )
+            return ()
+        snapshots: list[ProgressStepSnapshot] = []
+        for record in full_history:
+            if record.sequence > task.consumed_sequence:
+                break  # 按 sequence 升序返回；越过已消费边界后交给本轮主循环处理
+            if record.event_type not in ("progress", "safely_releasable_answer"):
+                continue
+            action, query_count, query_step = decode_progress_action(record.content)
+            snapshots.append(
+                ProgressStepSnapshot(
+                    elapsed_seconds=record.elapsed_seconds or 0,
+                    action=action,
+                    query_count=query_count,
+                    query_step=query_step,
+                )
+            )
+        return tuple(snapshots)
+
     def _process_task(self, task: Any) -> None:
         events = self._queue.read_delivery_events(
             task_id=task.task_id, after_sequence=task.consumed_sequence
@@ -341,6 +414,7 @@ class DeliveryConsumer:
             initial_sequence=task.card_seq,
             initial_message_id=task.message_id,
             initial_fallback_needed=task.fallback_text,
+            initial_progress_history=self._prior_progress_history(task),
         )
 
         confirm_safe = True
@@ -405,13 +479,18 @@ class DeliveryConsumer:
         # 写入方（#151 已登记留白），流式正文本体的卡片渲染留待该写入方接上之后
         # 再做——这里先保证"消费到了、游标推进了"是安全、不会重复的（见模块说明）。
         #
-        # `event.content` 编码语义化进度状态（Issue #321 方向 C）：worker 侧在
-        # `apps/worker/service.py` 用 `encode_progress_action` 写入，这里对称
-        # 解码。没有内容（旧格式、或从未发生过可分类信号）时 `decode_progress_
-        # action` 退回 `(processing, None)`，与改动前的行为逐字节一致。
-        action, query_count = decode_progress_action(event.content)
+        # `event.content` 编码语义化进度状态（Issue #321 方向 C；Issue #407
+        # 增粒度）：worker 侧在 `apps/worker/service.py` 用 `encode_progress_
+        # action` 写入，这里对称解码。没有内容（旧格式、或从未发生过可分类
+        # 信号）时 `decode_progress_action` 退回 `(processing, None, None)`；
+        # `query_step` 未落在 `KNOWN_QUERY_STEPS` 白名单里时同样退回 `None`
+        # （已在 `decode_progress_action` 内部把关，这里不用再重复过滤）。
+        action, query_count, query_step = decode_progress_action(event.content)
         stream.update(
-            elapsed_seconds=event.elapsed_seconds or 0, action=action, query_count=query_count
+            elapsed_seconds=event.elapsed_seconds or 0,
+            action=action,
+            query_count=query_count,
+            query_step=query_step,
         )
         try:
             self._queue.record_delivery_progress(
