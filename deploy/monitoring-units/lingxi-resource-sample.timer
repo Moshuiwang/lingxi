@@ -1,0 +1,12 @@
+[Unit]
+Description=每分钟触发一次 Lingxi 资源层监控采样（S-RC20-410，Issue #410）
+
+[Timer]
+# 分层采集清单「资源」行目标区间 30-60s，取上限对齐 1 分钟节奏，与 D5
+# lingxi-host-monitor.timer 同一惯例（deploy/监控告警.md）。
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

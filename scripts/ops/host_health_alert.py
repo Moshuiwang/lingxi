@@ -80,6 +80,23 @@ cron 调用间隔（1-2 分钟）与单轮最坏耗时（三个容器 × `docker
 - ``2``：脚本自身故障，本轮未能完成检查（凭据文件缺失/权限不对/字段不全、
   `docker` 命令不可用、状态文件读写失败）——这类需要人工介入，值得让 cron 的
   日志/退出码体现出来。
+
+# 可选的资源阈值检查（S-RC20-410，Issue #410）
+
+``--enable-resource-thresholds`` 打开后，在既有的三容器健康检查之外，额外做
+三项独立判定：磁盘用量、系统负载、`scripts/ops/monitoring/` 两个采样脚本
+（`resource_sample.sh`/`db_business_sample.sh`）产出的本机文件是否停更。默认
+关闭，不改变既有部署（未传这个参数的现有 crontab/timer 行为与此前完全一致）。
+
+这三项复用同一套"简短警报一句话"渲染与飞书群通道，但**去重规则与容器判据不同
+一份状态**：容器判据是"原因变化即新事件"，阈值判据是"连续 N 轮都超过阈值才算
+真正告警"（磁盘/停更连续 1 轮即告警，负载默认要求连续 3 轮——对应issue 原文
+"load 持续 >2×核数"里的"持续"，磁盘用量与停更本身已经是持续性状态，不需要
+额外的多轮确认）。两套状态各自存自己的状态文件，互不干扰、互不共享去重记忆。
+
+这三项检查只读取本机数据（`/proc`、`shutil.disk_usage`、采样文件 mtime），不
+依赖 `scripts/ops/monitoring/` 里任何脚本正在运行——即使采样管线整体挂了，
+"采样文件停更"这条判据本身依然能独立算出来并告警,这正是它存在的意义。
 """
 
 from __future__ import annotations
@@ -97,7 +114,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
@@ -118,6 +135,16 @@ DEFAULT_LOG_FILE = "/opt/lingxi/monitoring/host-monitor.log"
 DEFAULT_LOCK_FILE = "/opt/lingxi/monitoring/host-monitor.lock"
 DEFAULT_BASE_URL = "https://open.feishu.cn/open-apis"
 DEFAULT_TIMEOUT_SECONDS = 10.0
+
+#: 可选阈值检查（S-RC20-410）的默认值，独立于上面三个容器检查的状态/日志路径，
+#: 避免两套判据共享同一份状态文件导致 JSON 形状混淆。
+DEFAULT_THRESHOLD_STATE_FILE = "/opt/lingxi/monitoring/threshold-state.json"
+DEFAULT_MONITORING_DIR = "/var/log/lingxi/monitoring"
+DEFAULT_DISK_MOUNT = "/"
+DEFAULT_DISK_THRESHOLD_PERCENT = 85.0
+DEFAULT_LOAD_MULTIPLIER = 2.0
+DEFAULT_LOAD_CONSECUTIVE = 3
+DEFAULT_STALENESS_THRESHOLD_MINUTES = 10.0
 
 REQUIRED_ENV_KEYS: tuple[str, ...] = (
     "LINGXI_FEISHU_APP_ID",
@@ -282,6 +309,66 @@ def render_message(action: str, classification: Classification, *, host: str, no
 
 
 # ---------------------------------------------------------------------------
+# 可选阈值检查的纯逻辑（S-RC20-410，Issue #410）：磁盘用量、系统负载、采样文件
+# 停更。与上面的容器判据共用 ACTION_* 常量，但去重状态的形状不同，见模块文档
+# 「可选的资源阈值检查」一节，单独一个 ThresholdState 而不是复用 ContainerState。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThresholdState:
+    """阈值检查各自独立的连续触发计数与告警态记忆，与 ContainerState 分开维护。"""
+
+    alerting: bool = False
+    consecutive: int = 0
+
+
+#: 三项阈值检查在状态字典里各自的 key，用于状态文件与日志里区分是哪一项。
+THRESHOLD_DISK = "disk"
+THRESHOLD_LOAD = "load"
+THRESHOLD_STALE_RESOURCE = "stale_resource_sample"
+THRESHOLD_STALE_DB_BUSINESS = "stale_db_business_sample"
+
+
+def classify_threshold(
+    breached: bool, prior: ThresholdState, *, consecutive_required: int
+) -> tuple[str, ThresholdState]:
+    """通用阈值判定：连续 `consecutive_required` 次观测都超过阈值才真正告警一次
+    ——与 docker healthcheck.retries 同一条"连续才算数"纪律：任意一次没有超过
+    阈值都会把连续计数清零重新数起，不做"允许中间抖动一次"的宽松处理，保持判定
+    规则简单可推理。
+
+    返回的 `next_state` 是"这一轮观测之后，状态**应该**变成什么"——它的
+    `consecutive` 字段是纯观测事实，不受"消息有没有发送成功"影响；但 `alerting`
+    字段表示"已经真正通知过"，调用方在发送失败时应该保留 `prior.alerting`、
+    只采纳 `next_state.consecutive`，让下一轮在计数仍然达标时重新尝试发送
+    （与容器判据"发送失败不落盘，下一轮据此重试"同一条纪律）。
+    """
+
+    if breached:
+        consecutive = prior.consecutive + 1
+        if consecutive >= consecutive_required:
+            action = ACTION_NONE if prior.alerting else ACTION_ALERT
+            return action, ThresholdState(alerting=True, consecutive=consecutive)
+        return ACTION_NONE, ThresholdState(alerting=prior.alerting, consecutive=consecutive)
+    if prior.alerting:
+        return ACTION_RECOVERY, ThresholdState(alerting=False, consecutive=0)
+    return ACTION_NONE, ThresholdState(alerting=False, consecutive=0)
+
+
+def render_threshold_message(action: str, *, label: str, detail: str, host: str, now: str) -> str:
+    """渲染阈值告警/恢复的纯文本消息，保持"简短警报一句话"原则（issue #410 目标
+    形态）：一个判据名 + 一句话细节，不像容器告警那样需要从取值域里查文案。
+    """
+
+    if action == ACTION_ALERT:
+        return f"[Lingxi 资源监控] 告警\n{label}：{detail}\n主机：{host}\n时间：{now}"
+    if action == ACTION_RECOVERY:
+        return f"[Lingxi 资源监控] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
+    raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
+
+
+# ---------------------------------------------------------------------------
 # I/O：docker inspect、凭据文件、状态文件、飞书发送、单实例锁
 # ---------------------------------------------------------------------------
 
@@ -438,6 +525,89 @@ def save_state(path: Path, states: Mapping[str, ContainerState]) -> None:
         os.replace(tmp_path, path)
     except OSError as error:
         raise HostMonitorError(f"state_file_write_failed:{type(error).__name__}") from error
+
+
+def load_threshold_state(path: Path) -> dict[str, ThresholdState]:
+    """与 `load_state` 同一套"缺失/损坏都当空状态"纪律，形状换成 ThresholdState。"""
+
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    result: dict[str, ThresholdState] = {}
+    for name, value in raw.items():
+        if not isinstance(value, Mapping):
+            continue
+        consecutive = value.get("consecutive", 0)
+        result[str(name)] = ThresholdState(
+            alerting=bool(value.get("alerting", False)),
+            consecutive=consecutive if isinstance(consecutive, int) and not isinstance(consecutive, bool) else 0,
+        )
+    return result
+
+
+def save_threshold_state(path: Path, states: Mapping[str, ThresholdState]) -> None:
+    """与 `save_state` 同一套原子落盘手法，独立文件、不与容器状态混在一起。"""
+
+    payload = {
+        name: {"alerting": state.alerting, "consecutive": state.consecutive}
+        for name, state in states.items()
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError as error:
+        raise HostMonitorError(f"threshold_state_file_write_failed:{type(error).__name__}") from error
+
+
+def read_disk_usage_percent(mount: str) -> float:
+    """磁盘已用百分比；只依赖标准库 `shutil.disk_usage`，不额外拉起 `df` 子进程。"""
+
+    usage = shutil.disk_usage(mount)
+    if usage.total <= 0:
+        return 0.0
+    return usage.used / usage.total * 100
+
+
+def read_load_per_cpu() -> tuple[float, int]:
+    """返回 `(load1, cpu_count)`；判定用的"倍数"由调用方自己算，这里只取原始值，
+    方便渲染消息时同时展示两个数字，不是只展示一个已经算好的比值。
+    """
+
+    load1 = os.getloadavg()[0]
+    cpu_count = os.cpu_count() or 1
+    return load1, cpu_count
+
+
+def read_sample_age_seconds(monitoring_dir: Path, file_prefix: str, *, now: datetime) -> float | None:
+    """采样文件停更判定：取"今天"与"昨天"两个按 UTC 日期切分的候选文件（对应
+    `scripts/ops/monitoring/resource_sample.sh` / `db_business_sample.sh` 的按日
+    切分约定）里较新的 mtime，返回它与 `now` 的差值（秒）。
+
+    同时看两个候选是为了避免"刚过 UTC 零点、今天的文件还没写出第一行"这类边界
+    情况被误判成"停更"——采样脚本每 1-5 分钟才追加一行，零点前后那一小段窗口里
+    今天的文件本就该是空的，此时昨天文件的 mtime 仍然是唯一有意义的参照。两个
+    候选都不存在时返回 ``None``，由调用方决定怎么处理（通常等同于"从未采样过"，
+    但那是调用方的判断，不属于本函数职责）。
+    """
+
+    mtimes: list[float] = []
+    for day_offset in (0, 1):
+        date_str = (now - timedelta(days=day_offset)).strftime("%Y%m%d")
+        candidate = monitoring_dir / f"{file_prefix}-{date_str}.log"
+        try:
+            mtimes.append(candidate.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None
+    return now.timestamp() - max(mtimes)
 
 
 def _feishu_tenant_access_token(
@@ -599,6 +769,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只判定、打日志，不真实发送飞书消息、不落盘状态变化（用于安装后先验证判定逻辑）",
     )
+    parser.add_argument(
+        "--enable-resource-thresholds",
+        action="store_true",
+        help="额外检查磁盘用量、系统负载与 scripts/ops/monitoring/ 采样文件是否停更三项阈值"
+        "（默认关闭，见模块文档「可选的资源阈值检查」一节；--dry-run 同样适用于这三项）",
+    )
+    parser.add_argument(
+        "--monitoring-dir",
+        default=DEFAULT_MONITORING_DIR,
+        help="resource_sample.sh/db_business_sample.sh 的本机样本文件目录，用于停更判定",
+    )
+    parser.add_argument(
+        "--threshold-state-file",
+        default=DEFAULT_THRESHOLD_STATE_FILE,
+        help="阈值检查的去重状态文件路径，与 --state-file 是两份独立文件",
+    )
+    parser.add_argument("--disk-mount", default=DEFAULT_DISK_MOUNT, help="磁盘用量检查的挂载点")
+    parser.add_argument(
+        "--disk-threshold-percent",
+        type=float,
+        default=DEFAULT_DISK_THRESHOLD_PERCENT,
+        help="磁盘已用超过这个百分比告警",
+    )
+    parser.add_argument(
+        "--load-multiplier",
+        type=float,
+        default=DEFAULT_LOAD_MULTIPLIER,
+        help="load1 超过「核数 × 这个倍数」计入一次超阈值观测",
+    )
+    parser.add_argument(
+        "--load-consecutive",
+        type=int,
+        default=DEFAULT_LOAD_CONSECUTIVE,
+        help="负载连续超阈值多少轮才算「持续」并真正告警",
+    )
+    parser.add_argument(
+        "--staleness-threshold-minutes",
+        type=float,
+        default=DEFAULT_STALENESS_THRESHOLD_MINUTES,
+        help="resource/db_business 采样文件超过多少分钟没有新样本视为停更",
+    )
     return parser
 
 
@@ -701,7 +912,120 @@ def run(argv: Sequence[str] | None = None) -> int:
                 logger.error("状态文件写入失败，下一轮可能重复告警 error=%s", error)
                 fatal = True
 
+        if args.enable_resource_thresholds:
+            _run_threshold_checks(args, credentials, host=host, logger=logger)
+
         return 2 if fatal else 0
+
+
+def _run_threshold_checks(
+    args: argparse.Namespace, credentials: Mapping[str, str], *, host: str, logger: logging.Logger
+) -> None:
+    """磁盘用量/系统负载/采样文件停更三项检查（S-RC20-410）。独立于容器检查的
+    去重状态与退出码——这三项目前设计为"尽力而为的补充信号"，采集失败（例如
+    挂载点不存在）只记警告并跳过那一项，不把整个 host_health_alert 调用判成
+    脚本自身故障（`fatal`/退出码 2 仍然只由容器检查那条主线决定）。
+    """
+
+    threshold_state_path = Path(args.threshold_state_file)
+    threshold_states = load_threshold_state(threshold_state_path)
+
+    checks: list[tuple[str, str, bool, str, int]] = []  # (key, label, breached, detail, consecutive_required)
+
+    try:
+        disk_percent = read_disk_usage_percent(args.disk_mount)
+        checks.append(
+            (
+                THRESHOLD_DISK,
+                "磁盘用量",
+                disk_percent > args.disk_threshold_percent,
+                f"{args.disk_mount} 已用 {disk_percent:.1f}%（阈值 {args.disk_threshold_percent:.0f}%）",
+                1,
+            )
+        )
+    except OSError as error:
+        logger.warning("磁盘用量阈值检查跳过 mount=%s error=%s", args.disk_mount, error)
+
+    try:
+        load1, cpu_count = read_load_per_cpu()
+        multiple = load1 / cpu_count if cpu_count else 0.0
+        checks.append(
+            (
+                THRESHOLD_LOAD,
+                "系统负载",
+                multiple > args.load_multiplier,
+                f"load1={load1:.2f}，{cpu_count} 核（{multiple:.1f}x，阈值 {args.load_multiplier:.1f}x）",
+                max(1, args.load_consecutive),
+            )
+        )
+    except OSError as error:
+        logger.warning("负载阈值检查跳过 error=%s", error)
+
+    monitoring_dir = Path(args.monitoring_dir)
+    now_dt = datetime.now(timezone.utc)
+    for key, prefix, label in (
+        (THRESHOLD_STALE_RESOURCE, "resource", "资源采样文件停更"),
+        (THRESHOLD_STALE_DB_BUSINESS, "db_business", "数据库/业务采样文件停更"),
+    ):
+        age_seconds = read_sample_age_seconds(monitoring_dir, prefix, now=now_dt)
+        threshold_minutes = args.staleness_threshold_minutes
+        if age_seconds is None:
+            breached = True
+            detail = f"{prefix}-*.log 不存在（从未成功采样，或已超过一天未写入）"
+        else:
+            age_minutes = age_seconds / 60
+            breached = age_minutes > threshold_minutes
+            detail = f"最近一次样本 {age_minutes:.1f} 分钟前（阈值 {threshold_minutes:.0f} 分钟）"
+        checks.append((key, label, breached, detail, 1))
+
+    threshold_changed = False
+    for key, label, breached, detail, consecutive_required in checks:
+        prior = threshold_states.get(key, ThresholdState())
+        action, next_state = classify_threshold(breached, prior, consecutive_required=consecutive_required)
+
+        if action == ACTION_NONE:
+            if not args.dry_run and next_state != prior:
+                threshold_states[key] = next_state
+                threshold_changed = True
+            continue
+
+        text = render_threshold_message(action, label=label, detail=detail, host=host, now=_now_iso())
+
+        if args.dry_run:
+            logger.info("dry-run，未真实发送 threshold=%s action=%s detail=%s", key, action, detail)
+            continue
+
+        try:
+            feishu_send_text(
+                base_url=args.base_url,
+                chat_id=credentials["chat_id"],
+                app_id=credentials["app_id"],
+                app_secret=credentials["app_secret"],
+                text=text,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except Exception as error:  # noqa: BLE001 - 与容器告警发送路径同一条纪律
+            # 发送失败：保留旧的 `alerting` 记忆（下一轮达标时会重新尝试发送），
+            # 但连续计数本身是纯观测事实，不因为通知没发出去而回退到 0。
+            threshold_states[key] = ThresholdState(alerting=prior.alerting, consecutive=next_state.consecutive)
+            threshold_changed = True
+            logger.error(
+                "阈值告警发送失败，告警记忆未推进，下一轮达标会重试 threshold=%s action=%s error=%s",
+                key,
+                action,
+                error,
+            )
+            continue
+
+        threshold_states[key] = next_state
+        threshold_changed = True
+        logger.info("阈值告警已发送 threshold=%s action=%s detail=%s", key, action, detail)
+
+    if threshold_changed and not args.dry_run:
+        try:
+            save_threshold_state(threshold_state_path, threshold_states)
+        except HostMonitorError as error:
+            logger.error("阈值状态文件写入失败，下一轮可能重复告警 error=%s", error)
 
 
 def main() -> int:  # pragma: no cover - 由 __main__ 调用，逻辑全部委托给 run()
