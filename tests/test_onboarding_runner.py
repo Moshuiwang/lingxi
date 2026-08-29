@@ -809,6 +809,112 @@ class LocalOverrideMergeTests(unittest.TestCase):
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["额外授权"]}')
 
 
+class ZeroGalaxyLocalGrantTests(unittest.TestCase):
+    """`V-权限-15` 已消除的已知限制在开通侧的对应断言（PM 2026-08-29 裁定，
+    Issue #419）：``aggregate.granted`` 为假不再让 `_match` 直接拒绝，先看本地
+    授权/存量沿用能否兜底出可发布内容——与
+    ``tests/test_permission_refresh_duty.py::ZeroGalaxyLocalGrantTest`` 同一组
+    断言，证明两个调用点消费的是同一条产品语义。"""
+
+    def test_zero_galaxy_user_with_a_local_grant_completes_with_exactly_the_local_set(
+        self,
+    ) -> None:
+        """正向：零银河权限 + 本地授权（未被同键抑制）→ 正常完成开通，发布内容
+        精确等于本地授权集合——不出现任何翻译产物（"销售分析"）。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+        parts, result = run_once(role_function_map={}, local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["本地指标"]}')
+        # 走的是发布分支，因此令牌、环境、状态推进都正常发生——与"确定性业务失败
+        # 不建环境、不发布"的既有边界（`DeterministicRejectionTests`）互不矛盾：
+        # 那条边界只适用于最终真的没有任何可发布内容的人。
+        self.assertEqual(parts["environment"].calls, [USER_ID])
+        self.assertIn(STATE_ACTIVE, parts["users"].advanced)
+
+    def test_a_same_key_suppressed_grant_still_stays_unauthorized_with_zero_footprint(
+        self,
+    ) -> None:
+        """否定：本地授权被**同一个键**（同公司同指标）的本地抑制清空后，合并
+        结果仍是空字典——维持"无可用银河权限"终态不变，且**不为这个人签发令牌、
+        创建用户环境、推进开通状态**（`_reject_zero_galaxy_without_local_grant`
+        排在 `_issue_token`/`_create_environment` 之前，不是像红线-2 那样先建
+        环境再在 `_publish` 里拒绝）。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="本地指标"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="本地指标"),
+                )
+            }
+        )
+        parts, result = run_once(role_function_map={}, local_overrides=overrides)
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        facts = parts["audit"].facts("onboarding.result")
+        self.assertEqual(facts["state"], "not_authorized")
+        self.assertEqual(
+            facts["failure_reason"],
+            "no_supported_function",
+            "原因是银河本来就没给（aggregate.reason），不是红线-2 的本地行政性收回",
+        )
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_NOT_AUTHORIZED)
+        self.assertEqual(parts["environment"].calls, [], "无权限终态不得创建用户环境")
+        self.assertEqual(parts["decisions"].rows, [], "无权限终态不得排发布意图")
+        self.assertEqual(parts["users"].advanced, [], "无权限终态不得推进开通状态")
+
+    def test_a_never_granted_user_with_no_local_override_stays_unauthorized(self) -> None:
+        """否定：既无银河也无本地授权（默认 ``local_overrides=None``，装配层未
+        接线）→ 与改动前逐字节一致——`DeterministicRejectionTests.
+        test_no_supported_function_is_an_unauthorized_terminal` 的同一断言，
+        这里额外证明它在新分支下依然成立。"""
+
+        parts, _ = run_once(role_function_map={})
+
+        self.assertEqual(parts["audit"].facts("onboarding.result")["failure_reason"], "no_supported_function")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["decisions"].rows, [])
+        self.assertEqual(parts["users"].advanced, [])
+
+    def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
+        """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从
+        「精确本地集合」变回「银河翻译结果 ∪ 本地授权」——两条分支共用同一个
+        ``merge_permission_sources``，不是两套互相独立的合并逻辑。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+
+        zero_parts, zero_result = run_once(role_function_map={}, local_overrides=overrides)
+        self.assertIs(zero_result.state, OnboardingState.STARTED)
+        self.assertEqual(zero_parts["decisions"].rows[0].permissions, '{"88":["本地指标"]}')
+
+        recovered_parts, recovered_result = run_once(local_overrides=overrides)
+        self.assertIs(recovered_result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            recovered_parts["decisions"].rows[0].permissions,
+            '{"88":["本地指标","销售分析"]}',
+            "银河恢复后并集恢复",
+        )
+
+    def test_the_translation_gate_does_not_block_a_local_only_publish(self) -> None:
+        """`publish_allowed` 闸门的适用范围没有变（Issue #419「既有出口闸门全部
+        保持」）：它只保护"银河内容需要翻译才能安全发布"这件事。零银河用户没有
+        银河内容，与改动前"零银河用户结构上从不到达这道检查"逐字节一致——闸门
+        关闭时，一个零银河 + 本地授权的用户仍然能正常完成开通。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+        parts, result = run_once(
+            role_function_map={}, local_overrides=overrides, publish_allowed=lambda: False
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["本地指标"]}')
+        self.assertNotIn("onboarding.publish_gate_closed", parts["audit"].actions())
+
+
 class PublishTranslationTests(unittest.TestCase):
     """`_publish` 接入 `translate_company_functions`（Issue #346，Trace #373
     S-H1-5）：开通链产出的发布行值列表必须是**翻译后的指标名**，与每日重算
