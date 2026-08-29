@@ -51,11 +51,26 @@ def touch_liveness(
 def read_liveness_age_seconds(
     role: str, *, directory: Path | None = None, now: Callable[[], float] = time.time
 ) -> float | None:
-    """返回活性文件距今的秒数；文件不存在或内容不可解析时返回 ``None``。"""
+    """返回活性文件距今的秒数；文件不存在或内容不可解析时返回 ``None``。
+
+    P1-5（独立审查）：时钟回拨（NTP 校时、容器迁移、手工调时钟）会让
+    ``now() - written_at`` 算出负数——此前用 ``max(0.0, ...)`` 把负差值钳到
+    ``0.0``，这等于把"回拨窗口内的任何一次探测"都说成"心跳恰好刚刚写入"，
+    也就是"最新鲜"，而 healthcheck/DB 可达性缓存两处调用方都拿"年龄很小"当
+    "近期已经真实验证过"的证据——于是回拨越久，缓存越显得新鲜、可信任窗口
+    越长，一段本该触发真实探测的陈旧期反而被钳成了永远不过期的"刚刚发生"。
+    负差值意味着"这份时间戳相对当前时钟不可信"（不知道是回拨了多久、还是
+    活性文件被写进了未来），因此改为返回 ``None``——与"从未写过心跳"同一
+    个信号：调用方据此退回真实探测/判定不健康，而不是错误地信任一份年龄
+    根本无法确定的缓存。
+    """
 
     path = liveness_path(role, directory=directory)
     try:
         written_at = float(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return max(0.0, now() - written_at)
+    age = now() - written_at
+    if age < 0:
+        return None
+    return age

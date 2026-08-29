@@ -137,15 +137,19 @@ env -i PATH="${push_bin_dir}:${PATH}" MONITORING_DSN="postgresql://fake" \
   bash "${monitoring_dir}/push_to_monitoring.sh" >/dev/null 2>&1
 
 cursor_file="${push_data_dir}/.push-state/resource-20260829.log.cursor"
-insert_count=$(grep -c "INSERT INTO _lingxi_push_staging" "${last_sql_file}" 2>/dev/null || echo 0)
+# P1-7（独立审查）：不再生成单条 `INSERT INTO _lingxi_push_staging`，改为每行
+# 一个独立 `DO $lingxi_do$ ... $lingxi_do$;` 块（见 push_to_monitoring.sh 的
+# push_file() 注释）；用 `-- lingxi_push_row` 这个逐行都会打印一次的注释标记
+# 数行数，断言仍然是"2 行新样本各生成一个独立处理块"，只是识别标记换了。
+row_block_count=$(grep -c -- "-- lingxi_push_row" "${last_sql_file}" 2>/dev/null || echo 0)
 push_log_lines_after_first=$(wc -l < "${push_data_dir}/.push-state/push.log" 2>/dev/null || echo 0)
 
-if [[ "$(cat "${cursor_file}" 2>/dev/null)" == "2" ]] && [[ "${insert_count}" == "2" ]]; then
-  printf 'PASS: push_to_monitoring.sh 首轮把 2 行新样本各生成一条 INSERT，cursor 前移到 2\n'
+if [[ "$(cat "${cursor_file}" 2>/dev/null)" == "2" ]] && [[ "${row_block_count}" == "2" ]]; then
+  printf 'PASS: push_to_monitoring.sh 首轮把 2 行新样本各生成一个独立 DO 块，cursor 前移到 2\n'
   pass_count=$((pass_count + 1))
 else
-  printf 'FAIL: push_to_monitoring.sh 首轮增量推送结果不符合预期（cursor=%s insert_count=%s）\n' \
-    "$(cat "${cursor_file}" 2>/dev/null)" "${insert_count}" >&2
+  printf 'FAIL: push_to_monitoring.sh 首轮增量推送结果不符合预期（cursor=%s row_block_count=%s）\n' \
+    "$(cat "${cursor_file}" 2>/dev/null)" "${row_block_count}" >&2
   fail_count=$((fail_count + 1))
 fi
 
@@ -165,6 +169,44 @@ else
 fi
 
 rm -rf "${push_work_dir}"
+
+# --- push_to_monitoring.sh：P1-7 坏行跳过计数解析（伪造 psql 模拟部分行失败）---
+# 真实"坏行被 DO 块吞掉、其余行照常提交"的行为已在真库（docker postgres）验证
+# 过（PR 描述），这里只覆盖 bash 侧"从 psql 输出里解析 LINGXI_PUSH_ERROR_COUNT
+# 并写进本地错误计数行"这一段——伪造 psql 不会真的跑 SQL，但会像真库那样在
+# 输出最后一行打印这个标记，用来单独验证解析逻辑，不依赖真实数据库。
+error_count_work_dir=$(mktemp -d)
+error_count_bin_dir="${error_count_work_dir}/bin"
+mkdir -p "${error_count_bin_dir}"
+cat > "${error_count_bin_dir}/psql" <<'FAKE_PSQL_WITH_ERRORS'
+#!/bin/sh
+# 伪造 psql：不真的执行 SQL，只打印一行 LINGXI_PUSH_ERROR_COUNT=1 模拟"这一轮
+# 有一行坏数据被 DO 块吞掉、其余行正常提交"，用来单独验证 bash 侧的解析逻辑。
+echo "LINGXI_PUSH_ERROR_COUNT=1"
+exit 0
+FAKE_PSQL_WITH_ERRORS
+chmod +x "${error_count_bin_dir}/psql"
+
+error_count_data_dir="${error_count_work_dir}/data"
+mkdir -p "${error_count_data_dir}"
+printf '{"a":1}\n{"a":2}\n{"a":3}\n' > "${error_count_data_dir}/resource-20260829.log"
+
+env -i PATH="${error_count_bin_dir}:${PATH}" MONITORING_DSN="postgresql://fake" \
+  LINGXI_MONITORING_DIR="${error_count_data_dir}" \
+  bash "${monitoring_dir}/push_to_monitoring.sh" >/dev/null 2>&1
+
+error_cursor_file="${error_count_data_dir}/.push-state/resource-20260829.log.cursor"
+if [[ "$(cat "${error_cursor_file}" 2>/dev/null)" == "3" ]] \
+   && grep -q "skipped_bad_rows=1" "${error_count_data_dir}/.push-state/push.log" 2>/dev/null; then
+  printf 'PASS: push_to_monitoring.sh 正确解析坏行计数并前移 cursor（坏行不阻塞游标前移）\n'
+  pass_count=$((pass_count + 1))
+else
+  printf 'FAIL: push_to_monitoring.sh 未正确解析/记录坏行计数\n' >&2
+  cat "${error_count_data_dir}/.push-state/push.log" 2>&1 >&2
+  fail_count=$((fail_count + 1))
+fi
+
+rm -rf "${error_count_work_dir}"
 
 printf '\n%s 通过，%s 失败\n' "${pass_count}" "${fail_count}"
 if (( fail_count > 0 )); then

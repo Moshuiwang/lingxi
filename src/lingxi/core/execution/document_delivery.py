@@ -58,6 +58,26 @@ MAX_TOTAL_CHARS = 20000
 MIN_TITLE_CHARS = 1
 MAX_TITLE_CHARS = 100
 
+#: 原始 markdown 全文长度硬上限（P2 顺手，独立审查）。``normalize_markdown``
+#: 按空行切分段落时，纯空白/纯空行的"段"会折叠成空字符串直接被丢弃（不进
+#: ``paragraphs``，见该函数 ``if collapsed:`` 判据）——只校验归一化后的
+#: ``total_chars`` 挡不住"正文里塞进海量空白或海量纯空行段落，归一化后总
+#: 字符数很小，但原始 ``markdown`` 本身可以无限大"这种绕过：`DocumentRequest.
+#: markdown` 会把入参**逐字**存进返回值（不是归一化后的版本），最终经迁移
+#: 0079 的 ``markdown`` 列持久化，必须独立设一道原始长度上限，不能只信任
+#: 派生值。取 ``MAX_TOTAL_CHARS`` 的 2 倍（同一数量级，不是任意加大）：
+#: 归一化只会让字符数变少或持平（逐行 strip、块间分隔符不计入任何段落），
+#: 因此正常（未刻意构造）的 markdown 里"归一化后 total_chars"与"原始长度"
+#: 通常同一量级、不会相差悬殊——2 倍上限既能继续让 ``too_many_chars``
+#: （校验归一化后内容，见下方 ``build_document_request``）覆盖真实内容超限
+#: 这一常见场景，又能单独兜住上面这种刻意用空白膨胀原始长度的绕过；若两者
+#: 取同一个值，几乎所有会触发 ``too_many_chars`` 的输入都会先撞上这道更早
+#: 执行的原始长度检查，`too_many_chars` 这条分支反而变成事实上的死代码
+#: （本地验证发现：跑既有 `test_total_chars_over_limit_is_rejected_
+#: without_silent_truncation` 用例时曾经因此报错码从 `too_many_chars` 变成
+#: `markdown_too_long`）。
+MAX_RAW_MARKDOWN_CHARS = MAX_TOTAL_CHARS * 2
+
 #: 表格分支的硬上限（Issue #354 S-H3-2）：与 ``MAX_PARAGRAPHS``/``MAX_TOTAL_CHARS``
 #: 同一取舍量级，独立取值——表格是行×列的单元格集合，不是段落文本，不共用同一个
 #: 常量（共用会让两条互不相关的产品规则改一个就影响另一个）。80 行、每行至多
@@ -171,6 +191,14 @@ def build_document_request(
         )
     if not isinstance(markdown, str) or not markdown.strip():
         raise DocumentDeliveryError("empty_markdown", "正文不能为空")
+    # P2 顺手（独立审查）：先校验原始长度、再做归一化——见 MAX_RAW_MARKDOWN_CHARS
+    # 文档字符串。放在 normalize_markdown 调用之前，也避免对一个刻意构造的
+    # 超大字符串白跑一次正则切分。
+    if len(markdown) > MAX_RAW_MARKDOWN_CHARS:
+        raise DocumentDeliveryError(
+            "markdown_too_long",
+            f"原始正文长度 {len(markdown)} 超过上限 {MAX_RAW_MARKDOWN_CHARS}",
+        )
 
     paragraphs = normalize_markdown(markdown)
     # Issue #408 起 normalize_markdown 不再剥离字符：只要上面的 markdown.strip()

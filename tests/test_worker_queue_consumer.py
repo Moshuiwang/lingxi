@@ -54,6 +54,7 @@ from lingxi.core.execution.card_stream import (
     CardRateLimiter,
     CardStream,
     DeliveryRejected,
+    KNOWN_QUERY_STEPS,
     PROGRESS_ACTION_COMPOSING,
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
@@ -61,6 +62,7 @@ from lingxi.core.execution.card_stream import (
     decode_progress_action,
     encode_progress_action,
 )
+from lingxi.core.delivery.ports import PROGRESS_CONTENT_MAX_LENGTH
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
 
@@ -317,6 +319,27 @@ class CardStreamTests(unittest.TestCase):
         # 全部各不相同——四种子步骤确实映射到四句不同的文案，不是巧合地都落回
         # 同一句通用文案。
         self.assertEqual(len(set(expected_lines)), 4)
+
+    def test_the_longest_known_query_step_encoding_stays_within_the_32_byte_contract(
+        self,
+    ) -> None:
+        """P2 顺手（独立审查）：`card_stream.py` 顶部已经把这条不变量钉成一条
+        import 期 `assert`（`_WORST_CASE_QUERYING_CONTENT_LENGTH <= 32`），这里
+        用真实调用 `encode_progress_action` 的方式再验证一遍——白名单里最长的
+        子步骤名（``search_dimension``，16 字节）配两位数计数，编码出的
+        ``content`` 必须不超过迁移 0075 CHECK 与
+        `core.delivery.ports.PROGRESS_CONTENT_MAX_LENGTH` 约定的 32 字节契约。
+        Issue #328 opus 审查 R1 的真实事故正是"编码形状撞上数据库层长度 CHECK、
+        写库失败只记日志、卡片静默不动"——这里把它钉成可执行断言，不只是注释。
+        """
+
+        longest_step = max(KNOWN_QUERY_STEPS, key=len)
+        encoded = encode_progress_action(
+            PROGRESS_ACTION_QUERYING, query_count=99, query_step=longest_step
+        )
+
+        self.assertLessEqual(len(encoded), PROGRESS_CONTENT_MAX_LENGTH)
+        self.assertEqual(encoded, f"querying:99:{longest_step}")
 
     def test_an_unmapped_query_step_falls_back_to_the_generic_text_without_leaking_it(
         self,

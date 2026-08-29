@@ -493,6 +493,36 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         with self.assertRaises(LookupError):
             client.convert_markdown_to_blocks("# 标题")
 
+    def test_a_response_whose_blocks_are_all_non_mapping_is_a_definite_docx_error(
+        self,
+    ) -> None:
+        """P2 顺手（独立审查）：``blocks`` 字段本身是非空 list（不落进上面那条
+        ``LookupError`` 分支），但每一项都不是期望的 block 形状——过滤掉非
+        Mapping 项后剩下空列表。此前这里直接返回空列表，让它流进
+        :meth:`LarkDocxDelivery.write_blocks`，在那里撞上一条与"入参校验、
+        还没发出任何请求"同型的裸 ``ValueError("blocks 不能为空")``——把"转换
+        接口已经真实调用、拿到的响应形状不对"误归成了
+        `apps/gateway/document_delivery.py` 白名单里"发起请求前的确定性入参
+        校验"那一类。应改为在这里直接判定失败，抛
+        :class:`FeishuDocxDeliveryError`（``definite=True``——转换端点不写入
+        任何文档、无外部副作用，同一份 markdown 重放会得到同样的转换结果，
+        是确定性失败，不是"结果不明"）。
+
+        变异锚点：删掉"过滤后是否为空"这条判据，本用例会从抛
+        ``FeishuDocxDeliveryError`` 变红成静默返回 ``[]``。
+        """
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"blocks": ["not-a-block", 42, None]}}]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("# 标题")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_blocks_not_mapping")
+
 
 class WriteBlocksTest(unittest.TestCase):
     def test_blocks_are_written_via_the_existing_children_endpoint(self) -> None:
