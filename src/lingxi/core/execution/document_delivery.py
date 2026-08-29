@@ -95,10 +95,19 @@ class DocumentDeliveryError(ValueError):
 
 @dataclass(frozen=True)
 class DocumentRequest:
-    """一次登记成功的文档交付请求——报告契约 ``document_request`` 字段的来源。"""
+    """一次登记成功的文档交付请求——报告契约 ``document_request`` 字段的来源。
+
+    ``markdown``（Issue #408 正式方案接线）：模型传入的原始 markdown 全文，
+    与 ``paragraphs``（由它归一化派生）一起持久化——``paragraphs`` 继续是兜底
+    路径与检查点幂等判据（``adapters/feishu_docx_delivery.py::read_body_children``
+    对应的写入内容判断）的唯一依据，``markdown`` 只在 gateway 侧官方转换开关
+    （``LINGXI_DOCX_MARKDOWN_CONVERT``）打开时才会被消费；开关关闭或这一列取不到
+    时行为与「先立即停止字符剥离」批次逐字相同。
+    """
 
     title: str
     paragraphs: tuple[str, ...]
+    markdown: str
 
     @property
     def total_chars(self) -> int:
@@ -193,7 +202,7 @@ def build_document_request(
             "leak_detected", "标题或正文命中输出安全检查，登记被拒绝"
         )
 
-    return DocumentRequest(title=normalized_title, paragraphs=paragraphs)
+    return DocumentRequest(title=normalized_title, paragraphs=paragraphs, markdown=markdown)
 
 
 def build_sheet_request(

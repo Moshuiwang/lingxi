@@ -126,6 +126,9 @@ class BuildDocumentRequestTest(unittest.TestCase):
         self.assertEqual(request.title, "周报")
         self.assertEqual(request.paragraphs, ("第一段。", "第二段。"))
         self.assertEqual(request.total_chars, len("第一段。") + len("第二段。"))
+        # Issue #408 正式方案接线：原始 markdown 全文原样保留（不是从 paragraphs
+        # 拼回去的近似值），供 gateway 官方转换路径消费。
+        self.assertEqual(request.markdown, "第一段。\n\n第二段。")
 
     def test_title_out_of_bounds_is_rejected(self) -> None:
         for bad_title in ("", "   ", "x" * (MAX_TITLE_CHARS + 1)):
@@ -771,7 +774,8 @@ class RunTurnReportContractTest(unittest.TestCase):
         return report, executor
 
     def test_successful_turn_carries_the_document_request_in_the_report(self) -> None:
-        """①：报告带 document_request，字段形状是 title + paragraphs。"""
+        """①：报告带 document_request，字段形状是 title + paragraphs + markdown
+        （Issue #408 正式方案接线新增 markdown，供 gateway 官方转换路径消费）。"""
 
         report, _executor = self._run_with_delivery_call()
 
@@ -779,7 +783,11 @@ class RunTurnReportContractTest(unittest.TestCase):
         self.assertIsNone(report["failure"])
         self.assertEqual(
             report["document_request"],
-            {"title": "周报", "paragraphs": ["第一段。", "第二段。"]},
+            {
+                "title": "周报",
+                "paragraphs": ["第一段。", "第二段。"],
+                "markdown": "第一段。\n\n第二段。",
+            },
         )
 
     def test_failed_turn_does_not_carry_the_document_request(self) -> None:

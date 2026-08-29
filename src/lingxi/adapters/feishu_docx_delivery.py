@@ -90,7 +90,12 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
 「周环比 -12.85%」被剥成「周环比 12.85%」，负号丢失，属于数据正确性缺陷。产品
 负责人 2026-08-29 裁定分两步修：立即停止字符剥离（小修，`core` 侧已完成，见该
 模块），正式排版走飞书官方转换接口——本节是正式方案在本模块的落点，**默认
-关闭**，尚未被任何生产调用路径接线。
+关闭**。管线接线（迁移 0079 持久化原始 markdown、gateway 配置读取
+``LINGXI_DOCX_MARKDOWN_CONVERT``）已随本批完成，见
+``apps/gateway/document_delivery.py`` 模块文档「markdown 官方转换路径的接线」
+一节与 ``apps/gateway/config.py``——开关默认值仍是 ``False``，接线本身不改变
+现网行为，只是把"开关打开后会发生什么"从"能力已就绪但够不到"变成"配置一个
+环境变量即可生效"。
 
 - :meth:`LarkDocxDelivery.convert_markdown_to_blocks`：``POST /docx/v1/documents/
   blocks/convert``（``content_type=markdown``），把一段 markdown 转换成飞书官方
@@ -120,15 +125,16 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   与本模块 :meth:`_data` 一贯的"绝不静默降级"姿态一致。
 - **开关本身不是环境变量**：`adapters/` 不直接读 ``os.environ``（[代码框架
   「三、横切约定」](../../../../docs/技术设计/代码框架.md)的硬性约束），
-  ``markdown_convert_enabled`` 是构造函数参数——真正的环境变量（例如
-  ``LINGXI_DOCX_MARKDOWN_CONVERT``）由装配层（``apps/gateway/``）读取后作为
-  普通布尔值传进来。**本 Story 只交付这个能力本身，不接线任何生产调用路径**：
-  ``apps/gateway/document_delivery.py`` 现有的 :meth:`_process_docx_claim`
-  仍然只调用 :meth:`write_paragraphs`（逐字未改），因为检查点表当前只持久化
-  归一化后的段落（``task_document_delivery_request.paragraphs``），不持久化
-  原始 markdown——把开关真正接上生产路径，需要额外的检查点表改动（持久化原始
-  markdown）与 gateway 配置读取，留给后续 Story；本模块提前把能力做好、加上
-  测试，但保持默认关闭、零现网行为影响。
+  ``markdown_convert_enabled`` 是构造函数参数——真正的环境变量
+  ``LINGXI_DOCX_MARKDOWN_CONVERT`` 由装配层 ``apps/gateway/config.py`` 读取后
+  作为普通布尔值传进来（默认关，非空且不精确等于 ``"1"`` 时启动即失败，与
+  ``apps/worker/config.py`` 既有开关同一姿态）。**接线已完成**（迁移 0079、
+  Issue #408 正式方案接线批次）：``task_document_delivery_request`` 新增可空
+  ``markdown`` 列持久化原始 markdown 全文，``apps/gateway/document_delivery.py``
+  的 :meth:`DocumentDeliveryConsumer._process_docx_claim` 按这一列是否非
+  ``None`` 决定要不要调用 :meth:`write_body`（非 ``None`` 才调用；``None`` 无
+  条件回退 :meth:`write_paragraphs`，与开关是否打开无关）——完整接线细节见该
+  模块文档「markdown 官方转换路径的接线」一节。
 
 ## 凭据与内容边界
 

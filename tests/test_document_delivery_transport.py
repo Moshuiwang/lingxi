@@ -56,7 +56,7 @@ from typing import Any
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError
+from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError, LarkDocxDelivery
 from lingxi.adapters.feishu_user_message import FeishuUserMessages
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
@@ -172,6 +172,35 @@ class _SpyNotifier:
         self.sent.append((open_id, text, dedupe_key))
 
 
+class _RecordingDeliveryStore:
+    """``PostgresDocumentDeliveryStore`` 的假实现，只记录调用、不接触数据库
+    ——供不需要真库的 gateway 分支单测使用（Issue #408 正式方案接线）。"""
+
+    def __init__(self) -> None:
+        self.document_created: list[tuple[str, str, str | None]] = []
+        self.succeeded: list[str] = []
+        self.uncertain: list[tuple[str, str]] = []
+        self.failed: list[tuple[str, str]] = []
+        self.notified: list[str] = []
+
+    def mark_document_created(
+        self, *, request_id: str, document_id: str, resource_url: str | None = None
+    ) -> None:
+        self.document_created.append((request_id, document_id, resource_url))
+
+    def mark_succeeded(self, *, request_id: str) -> None:
+        self.succeeded.append(request_id)
+
+    def mark_notified(self, *, request_id: str) -> None:
+        self.notified.append(request_id)
+
+    def mark_uncertain(self, *, request_id: str, last_error: str) -> None:
+        self.uncertain.append((request_id, last_error))
+
+    def mark_failed(self, *, request_id: str, last_error: str) -> None:
+        self.failed.append((request_id, last_error))
+
+
 @unittest.skipUnless(POSTGRES_READY, SKIP_REASON)
 class DocumentDeliveryTransportTestCase(unittest.TestCase):
     """①-④ 的共同底座：真库、一个既有的 task 行（供插入文档投递请求关联）。"""
@@ -244,18 +273,24 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         )
 
     def _seed_pending_request(
-        self, *, request_id: str = "tdd-1", document_id: str | None = None, task_id: str | None = None
+        self,
+        *,
+        request_id: str = "tdd-1",
+        document_id: str | None = None,
+        task_id: str | None = None,
+        markdown: str | None = None,
     ) -> None:
         self.execute(
             """INSERT INTO task_document_delivery_request
-               (id, task_id, requester_open_id, title, paragraphs, document_id)
-               VALUES (%s, %s, %s, '标题', %s, %s)""",
+               (id, task_id, requester_open_id, title, paragraphs, document_id, markdown)
+               VALUES (%s, %s, %s, '标题', %s, %s, %s)""",
             (
                 request_id,
                 task_id or self.TASK_ID,
                 self.REQUESTER_OPEN_ID,
                 json.dumps(["段落一", "段落二"], ensure_ascii=False),
                 document_id,
+                markdown,
             ),
         )
 
@@ -879,11 +914,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
     def test_redact_expired_content_empties_title_and_paragraphs_but_keeps_operational_facts(
         self,
     ) -> None:
-        """``V-投递-06``：过了 24 小时上限的正文被擦空（``title``/``paragraphs``），
-        ``status``/``document_id``/``attempts`` 等运行事实原样保留；未到期的行
-        一个字都不动。"""
+        """``V-投递-06``：过了 24 小时上限的正文被擦空（``title``/``paragraphs``/
+        迁移 0079 新增的 ``markdown``），``status``/``document_id``/``attempts``
+        等运行事实原样保留；未到期的行一个字都不动。"""
 
-        self._seed_pending_request(request_id="tdd-content-expired", document_id="doc-kept")
+        self._seed_pending_request(
+            request_id="tdd-content-expired", document_id="doc-kept", markdown="# 标题\n\n正文"
+        )
         self._seed_extra_task("tsk-doc-content-fresh")
         self._seed_pending_request(request_id="tdd-content-fresh", task_id="tsk-doc-content-fresh")
         self.execute(
@@ -896,7 +933,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
         self.assertEqual(redacted, 1)
         row = self.execute_and_fetchone(
-            "SELECT title, paragraphs, status, document_id, attempts, last_error "
+            "SELECT title, paragraphs, status, document_id, attempts, last_error, markdown "
             "FROM task_document_delivery_request WHERE id = 'tdd-content-expired'"
         )
         self.assertEqual(row[0], "")
@@ -906,6 +943,8 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(row[3], "doc-kept")
         self.assertEqual(row[4], 3)
         self.assertEqual(row[5], "feishu_code_1")
+        # markdown 原文与 title/paragraphs 同一次擦除一起清，不留在库里过期不清。
+        self.assertIsNone(row[6])
         # 未到期的行一个字都不动。
         self.assertEqual(
             self.scalar("SELECT title FROM task_document_delivery_request WHERE id = 'tdd-content-fresh'"),
@@ -940,6 +979,39 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                    VALUES ('tdd-half-b', %s, %s, '标题', '[]'::jsonb, NULL)""",
                 (self.TASK_ID, self.REQUESTER_OPEN_ID),
             )
+
+    def test_markdown_column_check_rejects_sheet_rows_carrying_a_markdown_value(self) -> None:
+        """迁移 0079 的 CHECK（``delivery_type = 'docx' OR markdown IS NULL``）：
+        ``sheet`` 类型没有"markdown 排版"这个概念，数据库层直接拒绝把这一列的
+        值写进 sheet 行——与迁移 0078 ``resource_url`` 的既有同型 CHECK 同一
+        姿态。"""
+
+        import psycopg
+
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.execute(
+                """INSERT INTO task_document_delivery_request
+                   (id, task_id, requester_open_id, title, paragraphs, delivery_type, markdown)
+                   VALUES ('tdd-sheet-markdown', %s, %s, '标题', %s, 'sheet', '# 不该出现在表格行')""",
+                (
+                    self.TASK_ID,
+                    self.REQUESTER_OPEN_ID,
+                    json.dumps([["月份", "销售额"]], ensure_ascii=False),
+                ),
+            )
+
+    def test_markdown_column_accepts_a_docx_row_with_a_non_null_value_as_a_positive_control(
+        self,
+    ) -> None:
+        """反向哨兵：不是这一列对任何输入都拒绝——docx 行携带 markdown 是合法
+        的真实内容态。"""
+
+        self._seed_pending_request(request_id="tdd-docx-markdown", markdown="# 标题\n\n正文")
+
+        self.assertEqual(
+            self.scalar("SELECT markdown FROM task_document_delivery_request WHERE id = 'tdd-docx-markdown'"),
+            "# 标题\n\n正文",
+        )
 
     # -- ⑨ P2-2：通知未确认送达补发 ---------------------------------------------
 
@@ -1147,6 +1219,81 @@ class WorkerDocumentRequestInsertionTestCase(unittest.TestCase):
                 ).fetchone()[0],
                 "ou-doc-worker",
             )
+
+    def test_successful_task_with_document_request_markdown_persists_the_raw_markdown_column(
+        self,
+    ) -> None:
+        """迁移 0079（Issue #408 正式方案接线）：报告契约里的 ``markdown`` 字段
+        原样落进新增的 ``markdown`` 列，段落列同时照常落库——两列并存，互不
+        替代。"""
+
+        task_id = "tsk-doc-markdown"
+        self._insert_queued_task(task_id=task_id, conversation_id="cnv-doc-markdown")
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "问答结果", "session_id": None},
+                    "failure": None,
+                    "audit": {"denied_count": 0, "tool_result_count": 1},
+                    "document_request": {
+                        "title": "月度报告",
+                        "paragraphs": ["第一段", "第二段"],
+                        "markdown": "第一段\n\n第二段",
+                    },
+                }
+
+        service = WorkerService(
+            config=self._worker_config(),
+            queue=self.queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT status, title, paragraphs, markdown "
+                "FROM task_document_delivery_request WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "pending")
+        self.assertEqual(row[1], "月度报告")
+        self.assertEqual(row[2], ["第一段", "第二段"])
+        self.assertEqual(row[3], "第一段\n\n第二段")
+
+    def test_successful_task_with_document_request_missing_markdown_leaves_the_column_null(
+        self,
+    ) -> None:
+        """``markdown`` 是段落之外的附加值：报告契约里缺失这个字段（旧形状、或
+        取不到）不拒绝整条登记请求，只是这一列落 ``NULL``——段落照常落库，
+        gateway 侧据此回退段落路径。"""
+
+        task_id = "tsk-doc-no-markdown"
+        self._insert_queued_task(task_id=task_id, conversation_id="cnv-doc-no-markdown")
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": True, "final_text": "问答结果", "session_id": None},
+                    "failure": None,
+                    "audit": {"denied_count": 0, "tool_result_count": 1},
+                    "document_request": {"title": "月度报告", "paragraphs": ["第一段", "第二段"]},
+                }
+
+        service = WorkerService(
+            config=self._worker_config(),
+            queue=self.queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        asyncio.run(service.process_once())
+
+        with connect(DSN) as connection:
+            row = connection.execute(
+                "SELECT status, markdown FROM task_document_delivery_request WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "pending")
+        self.assertIsNone(row[1])
 
     def test_failed_task_inserts_zero_document_request_rows(self) -> None:
         task_id = "tsk-doc-failed"
@@ -1448,6 +1595,285 @@ class TenantDomainNotConfiguredSentinelTest(unittest.TestCase):
         result = assemble_document_delivery_consumer(config)
 
         self.assertIsInstance(result, DocumentDeliveryConsumer)
+
+
+class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
+    """Issue #408 正式方案接线：证明 gateway 配置 → ``LarkDocxDelivery`` 构造 →
+    ``DocumentDeliveryConsumer._process_docx_claim`` 的分支决策 → 真实 HTTP 调用
+    形状是逐段接起来的一整条链路，不只是"各自的单元测试都通过"。转换开关自身
+    的分支语义（成功/超限/业务错误码分别产生什么调用序列）已由
+    ``tests/test_feishu_docx_delivery.py::WriteBodySwitchTest`` 在适配器层验证
+    过，本类不重复；只钉住 gateway 这一层特有的决策：**``claim.markdown`` 是否
+    非 ``None`` 才决定要不要调用 ``write_body``**，与转换开关状态无关。不接触
+    数据库或网络（传输层全部注入）。
+
+    覆盖四条分支（任务卡登记的测试矩阵）：
+    - 开关关 + markdown 非空 → 段落路径零变化；
+    - 开关开 + markdown 非空 → 转换成功；
+    - 开关开 + markdown 非空 + 飞书明确拒绝转换 → 失败关闭，沿用既有 definite
+      分类，不静默退回段落路径；
+    - markdown 为 ``None``（不论开关状态）→ 无条件回退段落路径。
+
+    变异锚点：把 ``_process_docx_claim`` 里 ``if claim.markdown is not None``
+    的判断删掉、改成恒调用 ``write_body``——最后一条用例（NULL markdown）会从
+    "只发生 4 次调用、没有 convert"变红成"发生 convert 调用后因空 markdown
+    被 ``convert_markdown_to_blocks`` 判定为空正文而失败"；把判断写反（改成
+    ``is None`` 才调用 ``write_body``）——前两条用例会互换预期，"开关关零变化"
+    那条会变成发生 convert 调用。
+    """
+
+    BASE_URL = "https://feishu.invalid/open-apis"
+    TENANT_DOMAIN = "gv3qfk4q2rp.feishu.cn"
+    OPEN_ID = "ou_wiring_target_user"
+    DOCUMENT_ID = "doc-wire-1"
+
+    def _docx(self, transport: Any, *, markdown_convert_enabled: bool) -> LarkDocxDelivery:
+        return LarkDocxDelivery(
+            base_url=self.BASE_URL,
+            tenant_access_token=lambda: "t-fake-tenant-access-token",
+            tenant_domain=self.TENANT_DOMAIN,
+            transport=transport,
+            markdown_convert_enabled=markdown_convert_enabled,
+        )
+
+    def _claim(self, *, markdown: str | None) -> DocumentDeliveryClaim:
+        return DocumentDeliveryClaim(
+            id="tdd-wire-1",
+            task_id="tsk-wire-1",
+            requester_open_id=self.OPEN_ID,
+            title="标题",
+            paragraphs=("正文段落",),
+            document_id=None,
+            attempts=1,
+            markdown=markdown,
+        )
+
+    def _create_document_response(self) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": {"document": {"document_id": self.DOCUMENT_ID, "revision_id": 1, "title": "标题"}},
+        }
+
+    @staticmethod
+    def _children_write_response() -> dict[str, Any]:
+        return {"code": 0, "data": {}}
+
+    @staticmethod
+    def _convert_response() -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": {
+                "blocks": [
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "转换后正文"}}]}}
+                ]
+            },
+        }
+
+    @staticmethod
+    def _grant_response() -> dict[str, Any]:
+        return {"code": 0, "data": {}}
+
+    def _read_members_response(self) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "data": {"items": [{"member_type": "openid", "member_id": self.OPEN_ID, "perm": "full_access"}]},
+        }
+
+    def test_switch_off_with_markdown_present_takes_the_paragraph_path_unchanged(self) -> None:
+        """开关关：即使这一行带着 markdown 原文，也必须逐字沿用段落路径——只
+        应该看到一次 children 插入调用，绝不会发生 blocks/convert 调用。"""
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _RecordingDeliveryStore()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=False), notifier=_SpyNotifier()
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 4)
+        _, write_url, write_body, _ = transport.calls[1]
+        self.assertEqual(
+            write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
+        )
+        self.assertEqual(
+            write_body,
+            {
+                "children": [
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}
+                ],
+                "index": 0,
+            },
+        )
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(store.failed, [])
+
+    def test_switch_on_with_markdown_present_converts_then_succeeds(self) -> None:
+        """开成功：转换开关打开、这一行带着 markdown 原文——依次发生 convert
+        调用与用转换结果写入的 children 插入调用，最终判定成功。"""
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._convert_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _RecordingDeliveryStore()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 5)
+        _, convert_url, convert_body, _ = transport.calls[1]
+        self.assertEqual(convert_url, f"{self.BASE_URL}/docx/v1/documents/blocks/convert")
+        self.assertEqual(convert_body, {"content_type": "markdown", "content": "# 标题\n\n正文段落"})
+        _, write_url, write_body, _ = transport.calls[2]
+        self.assertEqual(
+            write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
+        )
+        self.assertEqual(write_body["children"], self._convert_response()["data"]["blocks"])
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(store.failed, [])
+
+    def test_switch_on_convert_failure_fails_closed_via_the_existing_definite_classification(
+        self,
+    ) -> None:
+        """开失败关闭：转换调用收到飞书明确的业务错误码——沿用状态机既有的
+        definite 分类判 ``failed``，绝不静默退回段落路径（因此不会再发生任何
+        grant/read 调用）。"""
+
+        transport = _RecordingUserMessageTransport(
+            [self._create_document_response(), {"code": 99991400, "msg": "rate limited"}]
+        )
+        store = _RecordingDeliveryStore()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 2, "convert 失败后不该再发生 grant/read 调用")
+        self.assertEqual(store.succeeded, [])
+        self.assertEqual(store.failed, [("tdd-wire-1", "feishu_code_99991400")])
+        self.assertEqual(store.document_created, [("tdd-wire-1", self.DOCUMENT_ID, None)])
+
+    def test_null_markdown_falls_back_to_paragraphs_regardless_of_the_switch_state(self) -> None:
+        """NULL markdown 回退段落：即使转换开关打开，这一行的 ``markdown`` 列是
+        ``NULL``（历史行、或登记侧未能落上原文）也必须无条件回退段落路径——
+        判据是 ``claim.markdown is None``，与开关状态无关。"""
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _RecordingDeliveryStore()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
+        )
+        claim = self._claim(markdown=None)
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 4, "不该发生任何 blocks/convert 调用")
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("blocks/convert", url)
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(store.failed, [])
+
+
+class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
+    """``LINGXI_DOCX_MARKDOWN_CONVERT`` 的 ``apps/gateway/config.py`` 解析——默认
+    关、只接受精确值 ``"1"``、错配失败关闭（同 ``apps/worker/config.py`` 既有
+    ``LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED`` 开关同一姿态），以及
+    ``assemble_document_delivery_consumer`` 把解析结果原样传进
+    ``LarkDocxDelivery`` 构造函数（不接触数据库或网络：``tenant_domain`` 配置了
+    合法值即可装配出一个真实消费者，两个适配器的构造函数都只存参数）。"""
+
+    def _base_env(self, **overrides: str) -> dict[str, str]:
+        env = {
+            "LINGXI_GATEWAY_APP_ID": "cli_x",
+            "LINGXI_GATEWAY_APP_SECRET": "secret_x",
+            "LINGXI_GATEWAY_POSTGRES_DSN": "postgresql://localhost/lingxi_test",
+        }
+        env.update(overrides)
+        return env
+
+    def test_unset_defaults_to_disabled(self) -> None:
+        from lingxi.apps.gateway.config import load_config
+
+        config = load_config(self._base_env())
+
+        self.assertFalse(config.markdown_convert_enabled)
+
+    def test_exact_value_one_enables_it(self) -> None:
+        from lingxi.apps.gateway.config import load_config
+
+        config = load_config(self._base_env(LINGXI_DOCX_MARKDOWN_CONVERT="1"))
+
+        self.assertTrue(config.markdown_convert_enabled)
+
+    def test_any_other_value_fails_closed_at_startup(self) -> None:
+        """错配不是未配：与 ``apps/worker/config.py::_document_delivery_enabled``
+        同一纪律，一个拼错的值不该被静默当成"关闭"长期放行。"""
+
+        from lingxi.apps.gateway.config import GatewayConfigError, load_config
+
+        for bad_value in ("true", "0", "yes", "10"):
+            with self.subTest(value=bad_value):
+                with self.assertRaises(GatewayConfigError):
+                    load_config(self._base_env(LINGXI_DOCX_MARKDOWN_CONVERT=bad_value))
+
+    def test_assembled_consumer_wires_the_flag_into_the_docx_adapter(self) -> None:
+        """装配层把已经读好的布尔值传进 ``LarkDocxDelivery`` 构造函数（Issue #408
+        正式方案接线）。只读私有属性断言，不驱动真实调用——``assemble_document_
+        delivery_consumer`` 构造的令牌供给包着一个真实 ``FeishuTenantTokenClient``
+        （走独立的 urllib 传输，不是这里注入的假传输层），真正调用 ``write_body``
+        会触发它去发一次真实网络请求，与本类"不接触数据库或网络"的边界冲突；
+        读私有属性是这里唯一不产生副作用的验证方式，且这个属性正是「布尔值有没有
+        被传进构造函数」这件事本身的真值来源（``LarkDocxDelivery.__init__`` 里
+        ``self._markdown_convert_enabled = bool(markdown_convert_enabled)``）。"""
+
+        enabled_config = GatewayConfig(
+            app_id="cli_x",
+            app_secret=_Secret("secret_x"),
+            postgres_dsn=_Secret("postgresql://localhost/lingxi_test"),
+            tenant_domain="example.feishu.cn",
+            markdown_convert_enabled=True,
+        )
+        disabled_config = GatewayConfig(
+            app_id="cli_x",
+            app_secret=_Secret("secret_x"),
+            postgres_dsn=_Secret("postgresql://localhost/lingxi_test"),
+            tenant_domain="example.feishu.cn",
+            markdown_convert_enabled=False,
+        )
+
+        enabled_consumer = assemble_document_delivery_consumer(enabled_config)
+        disabled_consumer = assemble_document_delivery_consumer(disabled_config)
+
+        self.assertIsInstance(enabled_consumer, DocumentDeliveryConsumer)
+        self.assertIsInstance(disabled_consumer, DocumentDeliveryConsumer)
+        self.assertTrue(enabled_consumer._docx._markdown_convert_enabled)
+        self.assertFalse(disabled_consumer._docx._markdown_convert_enabled)
 
 
 class HasConfirmedFullAccessNegativeTests(unittest.TestCase):

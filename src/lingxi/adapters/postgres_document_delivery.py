@@ -1,5 +1,6 @@
 """``task_document_delivery_request`` 的 Postgres 存取（迁移 0074，Issue #341 S-ES-3/R-2；
-迁移 0078 新增 ``delivery_type``/``resource_url`` 两列，Issue #354 S-H3-2 表格分支）。
+迁移 0078 新增 ``delivery_type``/``resource_url`` 两列，Issue #354 S-H3-2 表格分支；
+迁移 0079 新增 ``markdown`` 列，Issue #408 正式方案接线）。
 
 主要服务 gateway 侧独立消费循环（``apps/gateway/document_delivery.py``）：认领
 ``pending`` 行、在建档成功的那一刻单独提交检查点列 ``document_id``、把最终结果
@@ -111,6 +112,15 @@ class DocumentDeliveryClaim:
     （``apps/gateway/document_delivery.py``）按 ``delivery_type`` 决定怎么解读。
     ``document_id``：docx 时是 ``document_id``，sheet 时是 ``spreadsheet_token``
     ——同样是复用同一列的检查点标识，见迁移 0078 文件头部「为什么复用」一节。
+
+    ``markdown``（迁移 0079，Issue #408 正式方案接线）：docx 类型的原始 markdown
+    全文，``NULL`` 即"这一行没有可转换的原文"（历史行、或 sheet 类型——sheet
+    恒为 ``NULL``，迁移 0079 的 CHECK 约束）。gateway 侧
+    （``apps/gateway/document_delivery.py::_process_docx_claim``）据此在"官方
+    转换路径"与"段落路径"之间选择：非 ``None`` 才有资格走转换，``None`` 一律
+    回退段落路径——与转换开关是否打开无关，两个条件都满足才会真正调用
+    :meth:`~lingxi.adapters.feishu_docx_delivery.LarkDocxDelivery.write_body`
+    的转换分支。
     """
 
     id: str
@@ -126,6 +136,10 @@ class DocumentDeliveryClaim:
     # 默认成它就是"不传等价于旧行为"。
     delivery_type: str = DELIVERY_TYPE_DOCX
     resource_url: str | None = None
+    # 默认 None（迁移 0079 该列自身的默认值）：既有直接构造
+    # `DocumentDeliveryClaim(...)` 的调用点不传这个字段即等价于"没有 markdown
+    # 原文"，与新增列之前逐字相同的行为。
+    markdown: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +175,7 @@ def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
         attempts=row[6],
         delivery_type=row[7],
         resource_url=row[8],
+        markdown=row[9],
     )
 
 
@@ -193,7 +208,7 @@ class PostgresDocumentDeliveryStore:
                       LIMIT %s
                  )
                 RETURNING id, task_id, requester_open_id, title, paragraphs, document_id, attempts,
-                          delivery_type, resource_url
+                          delivery_type, resource_url, markdown
                 """,
                 (max_attempts, limit),
             )
@@ -454,12 +469,17 @@ class PostgresDocumentDeliveryStore:
         """``V-投递-06``（opus 审查 P1-3）：把过了 24 小时上限（迁移 0074 的触发器
         锁定的 ``content_expires_at``）的正文擦空，返回擦除条数。
 
-        擦的是 ``title``/``paragraphs``（问数结果生成的文档标题与正文）；
-        ``status``/``document_id``/``attempts``/``last_error``/时间戳留下——它们是
-        "谁在什么时候请求过一份文档、结果如何"这类运行事实，本身不含用户资料，
-        形状照 ``adapters/postgres_permission_publish.py`` 的
-        ``redact_expired_payloads``（那张表擦 ``payload`` 成 ``'{}'::jsonb``，这里
-        擦成空字符串/空数组——两者都是迁移 0074 那条形状 CHECK 认可的"擦除态"）。
+        擦的是 ``title``/``paragraphs``/``markdown``（问数结果生成的文档标题、正文
+        与原始 markdown 全文——迁移 0079 新增的 ``markdown`` 是"原始正文"的另一种
+        形态，信息量不小于 ``paragraphs``，同一次擦除必须一起清，不能只擦段落列却
+        把原文留在库里过期不清）；``status``/``document_id``/``attempts``/
+        ``last_error``/时间戳留下——它们是"谁在什么时候请求过一份文档、结果如何"
+        这类运行事实，本身不含用户资料，形状照 ``adapters/postgres_permission_
+        publish.py`` 的 ``redact_expired_payloads``（那张表擦 ``payload`` 成
+        ``'{}'::jsonb``，这里擦成空字符串/空数组/``NULL``——三者都是迁移
+        0074/0079 那条形状 CHECK 认可的"擦除态"；``markdown`` 擦成 ``NULL`` 而不是
+        空字符串，与"从未提供 markdown"是同一个可表达状态，不需要为擦除态另设
+        哨兵值）。
 
         **不区分 succeeded/uncertain/failed/pending**：``V-投递-06`` 覆盖的是"待
         投递、失败、``uncertain`` 或尚未证明清除后可访问的正文"，24 小时上限对
@@ -473,7 +493,7 @@ class PostgresDocumentDeliveryStore:
             cursor.execute(
                 """
                 UPDATE task_document_delivery_request
-                   SET title = '', paragraphs = '[]'::jsonb, updated_at = now()
+                   SET title = '', paragraphs = '[]'::jsonb, markdown = NULL, updated_at = now()
                  WHERE id IN (
                          SELECT id FROM task_document_delivery_request
                           WHERE content_expires_at <= now() AND title <> ''

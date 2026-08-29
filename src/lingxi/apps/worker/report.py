@@ -68,12 +68,13 @@ def build_report(
     耗时，看到的必须是这一个，不是配置值。三个新字段由调用方按需提供，缺省时
     保持未知（``None``），不构造数据。
 
-    ``document_request``（Issue #341 S-ES-2 报告契约）：``None`` 或已通过硬上限
-    与出口安全检查的 :class:`~lingxi.core.execution.document_delivery.
+    ``document_request``（Issue #341 S-ES-2 报告契约；Issue #408 正式方案接线
+    新增 ``markdown``）：``None`` 或已通过硬上限与出口安全检查的
+    :class:`~lingxi.core.execution.document_delivery.
     DocumentRequest`，由调用方（``apps/worker/turn.py``）只在任务成功且模型本轮
     确实调用过 ``deliver_document`` 时传入非 ``None``。这里只做投影——把已经是
-    受信任内部结构的 ``title``/``paragraphs`` 转成 JSON 可序列化的字典，不重复
-    上游已经做过的校验或出口安全检查。
+    受信任内部结构的 ``title``/``paragraphs``/``markdown`` 转成 JSON 可序列化的
+    字典，不重复上游已经做过的校验或出口安全检查。
 
     ``sheet_request``（Issue #354 S-H3-2 表格分支）：与 ``document_request`` 同一
     机制新增的并列字段，形状对称——``None`` 或已通过硬上限与出口安全检查的
@@ -203,7 +204,13 @@ def build_report(
         "resources": resources,
         "failure": effective_failure,
         "document_request": (
-            {"title": document_request.title, "paragraphs": list(document_request.paragraphs)}
+            {
+                "title": document_request.title,
+                "paragraphs": list(document_request.paragraphs),
+                # Issue #408 正式方案接线：原始 markdown 随段落一起投影，供
+                # gateway 侧官方转换路径消费；段落继续是兜底与幂等判据的来源。
+                "markdown": document_request.markdown,
+            }
             if document_request is not None
             else None
         ),

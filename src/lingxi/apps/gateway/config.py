@@ -97,6 +97,19 @@ class GatewayConfig:
     # 显式提供。
     tenant_domain: str | None = None
 
+    # markdown 官方转换开关（Issue #408 正式方案接线）——不套 `LINGXI_GATEWAY_`
+    # 前缀，环境变量名固定为 `LINGXI_DOCX_MARKDOWN_CONVERT`（任务合同明确给定
+    # 的名字，未来若有第二个进程需要判断同一份开关，两处读同一个变量名，同
+    # `bot_open_id`/`innertest_roster_open_ids` 不套前缀的理由一致）。默认
+    # `False`（关）：``apps/gateway/document_delivery.py`` 的
+    # ``_process_docx_claim`` 与 ``adapters/feishu_docx_delivery.py::
+    # LarkDocxDelivery.write_body`` 在这个值为 `False` 时逐字沿用段落路径，
+    # 零行为变化。打开前提：Bot 权限含 ``docx:document.block:convert``，且
+    # 打开后转换失败一律交付失败（失败关闭），不静默降级回段落路径——见
+    # ``deploy/.env.example`` 对应条目与 ``LarkDocxDelivery.write_body`` 模块
+    # 文档「markdown 官方转换开关」一节。
+    markdown_convert_enabled: bool = False
+
     # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，
     # 只用于精确判定"这条群消息是不是 @ 了机器人本身"。刻意不套 `LINGXI_GATEWAY_`
     # 前缀——命名由裁定 #5 拍板，这是机器人这个身份本身的事实，不是 gateway 进程的
@@ -223,6 +236,27 @@ def _tenant_domain(env: Mapping[str, str]) -> str | None:
     except ValueError as error:
         raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
 
+def _markdown_convert_enabled(env: Mapping[str, str]) -> bool:
+    """markdown 官方转换开关（Issue #408 正式方案接线）：未配置或为空——
+    ``False``（未配置就是未启用）。配置了但不是精确的 ``"1"``——启动即失败，
+    与 ``apps/worker/config.py::_document_delivery_enabled`` 同一姿态（错配
+    不是未配，一个拼错的值不该被静默当成"关闭"长期放行）。
+
+    刻意直接读 ``env.get("LINGXI_DOCX_MARKDOWN_CONVERT")``，不经过本文件
+    ``_text()`` 的 ``LINGXI_GATEWAY_`` 前缀包装——变量名由任务合同显式给定，
+    理由同 ``bot_open_id``/``innertest_roster_open_ids`` 不套前缀。
+    """
+
+    flag = (env.get("LINGXI_DOCX_MARKDOWN_CONVERT") or "").strip()
+    if not flag:
+        return False
+    if flag != "1":
+        raise GatewayConfigError(
+            'LINGXI_DOCX_MARKDOWN_CONVERT 只接受精确值 "1"（不回显收到的值）'
+        )
+    return True
+
+
 def _bot_open_id(env: Mapping[str, str]) -> str | None:
     """机器人自身 open_id（Issue #318 群聊@机器人固定引导）。
 
@@ -294,6 +328,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         card_failure_injection=_card_failure_injection(env),
         innertest_roster_open_ids=_innertest_roster_open_ids(env),
         tenant_domain=_tenant_domain(env),
+        markdown_convert_enabled=_markdown_convert_enabled(env),
 
         bot_open_id=_bot_open_id(env),
     )
