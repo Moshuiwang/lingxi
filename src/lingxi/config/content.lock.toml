@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-28-4"
-digest = "sha256:9604f82a0764e85336b06a735c98ec047fac2207c98cf7958b2ef53b53714a99"
+version = "2026-08-29-1"
+digest = "sha256:d74b57f86686ca59353373d9b0365baa7d1fb19ae22adf89f51e17a2cfdc1c65"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -24,6 +24,7 @@ retired_versions = [
   "2026-08-28-1",
   "2026-08-28-2",
   "2026-08-28-3",
+  "2026-08-28-4",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -113,7 +114,13 @@ retired_versions = [
 "texts.worker.action.completed" = "f28461bb49c85647"
 "texts.worker.action.composing" = "d721250554c3e20b"
 "texts.worker.action.processing" = "3b7e27cb4379da3c"
+"texts.worker.action.querying_describe_metric" = "066818d6f9cc2839"
+"texts.worker.action.querying_list_metrics" = "0482a62d7a042185"
 "texts.worker.action.querying_metrics" = "71f01435c81ae105"
+"texts.worker.action.querying_query_metric" = "71f01435c81ae105"
+"texts.worker.action.querying_search_dimension" = "87b8b522d0a66b0d"
+"texts.worker.action.working" = "7306c419b0fb0d14"
+"texts.worker.card_handoff_notice" = "f926d145f0f18496"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"
 "texts.worker.max_turns" = "166d8e19f4b2f3b4"

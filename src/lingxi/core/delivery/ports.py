@@ -28,11 +28,15 @@ class DeliveryEventType(str, Enum):
 #: WorkerService._append_event``；Issue #328 opus 审查 R1 之前这个常量定义了但
 #: 零调用方，写入方从未真正用它自查过）。
 #:
-#: ``PROGRESS``（迁移 0075 新增）：语义化进度动作码（Issue #321 方向 C）——
-#: ``"querying:N"``/``"composing"`` 这两种固定形状之一，是 worker 侧内部生成的
+#: ``PROGRESS``（迁移 0075 新增；Issue #407 增粒度）：语义化进度动作码
+#: （Issue #321 方向 C）——``"querying:N"``、``"querying:N:<已知子步骤>"``、
+#: ``"composing"``、``"working"`` 这几种固定形状之一，是 worker 侧内部生成的
 #: 短令牌，绝不是用户输入或模型输出的自由文本，因此可以在这里放行、同时受
 #: ``PROGRESS_CONTENT_MAX_LENGTH`` 这条长度契约约束（迁移 0075 的 CHECK
-#: ``char_length(content) <= 32`` 是同一条契约的数据库层落地）。
+#: ``char_length(content) <= 32`` 是同一条契约的数据库层落地）。子步骤名只
+#: 来自 ``card_stream.KNOWN_QUERY_STEPS`` 这份白名单（最长
+#: ``"search_dimension"`` 16 字节），`"querying:" + 计数 + ":" + 子步骤名` 的
+#: 最坏长度在计数达到 6 位数之前都不会触顶——远超任何真实任务的问数调用次数。
 CONTENT_BEARING_EVENT_TYPES = frozenset(
     {
         DeliveryEventType.PROGRESS,
@@ -42,11 +46,13 @@ CONTENT_BEARING_EVENT_TYPES = frozenset(
 )
 
 #: ``progress`` 事件 ``content`` 的长度上限（迁移 0075 的 CHECK 同步约束）。
-#: 已知形状只有两种：``"composing"``（9 字节）与 ``"querying:" + 位数不多的
-#: 计数``（`card_stream.encode_progress_action` 的输出），32 留了充裕余量，
-#: 不是精确贴着已知最长值算出来的。只约束 ``PROGRESS``——``SAFELY_RELEASABLE_
-#: ANSWER``/``TERMINAL`` 携带的是用户可见的问数结果正文，篇幅由业务内容决定，
-#: 不适用这条上限。
+#: 已知形状（`card_stream.encode_progress_action` 的输出）：``"composing"``
+#: （9 字节）、``"working"``（7 字节）、``"querying:" + 计数``、
+#: ``"querying:" + 计数 + ":" + 已知子步骤名``（Issue #407，最长子步骤名
+#: ``"search_dimension"`` 16 字节，实测两位数计数时 28 字节）。32 留了充裕
+#: 余量，不是精确贴着已知最长值算出来的。只约束 ``PROGRESS``——
+#: ``SAFELY_RELEASABLE_ANSWER``/``TERMINAL`` 携带的是用户可见的问数结果正文，
+#: 篇幅由业务内容决定，不适用这条上限。
 PROGRESS_CONTENT_MAX_LENGTH = 32
 
 
