@@ -106,6 +106,33 @@ _QUERY_STEP_ACTION_TEXT_KEYS: dict[str, str] = {
     QUERY_STEP_QUERY_METRIC: "worker.action.querying_query_metric",
 }
 
+# 静态防回归（P2 顺手，独立审查）：`encode_progress_action` 编码出的
+# `PROGRESS_ACTION_QUERYING` 形态（``"querying:<计数>[:<子步骤名>]"``）最终会
+# 落进 ``task_delivery_event.content``，迁移 0075 给这一列的 `progress` 事件
+# 加了 ``char_length(content) <= 32`` 的数据库层 CHECK 约束，
+# ``core/delivery/ports.py`` 的 ``PROGRESS_CONTENT_MAX_LENGTH`` 是同一条契约
+# 的应用层落地（两处常量各自独立登记，互不 import，同 0075 迁移文件头注一贯
+# 的"没有自动化门禁跨文件互相核对，这一条纪律"）。``ports.py`` 那边的注释
+# 手算过"两位数计数时 28 字节"，但只是注释、不是可执行断言——未来谁往
+# `KNOWN_QUERY_STEPS` 加一个更长的子步骤名却忘了回头核对这条 32 字节契约，
+# 原本要等真实环境撞上与 0075 修复前同一形状的 `CheckViolation`（写库失败
+# 只记日志、卡片静默不动，Issue #328 opus 审查 R1 的真实事故）才会被发现。
+# 这里把"白名单最长子步骤名 + 两位数计数"的最坏编码长度钉成一条 import 期
+# 静态断言，回归时直接炸在 import，`tests/test_worker_queue_consumer.py` 的
+# `CardStreamTests` 另有一条等价的可读性更好的单测断言同一件事。
+_MAX_KNOWN_QUERY_STEP_NAME_LENGTH = max(len(step) for step in KNOWN_QUERY_STEPS)
+# "querying:"（9 字节）+ 两位数计数上界 "99"（2 字节）+ ":"（1 字节）+ 最长
+# 子步骤名——与 `core/delivery/ports.py::PROGRESS_CONTENT_MAX_LENGTH` 注释里
+# "两位数计数"这条假设一致，不是本模块凭空另设的预算。
+_WORST_CASE_QUERYING_CONTENT_LENGTH = (
+    len(f"{PROGRESS_ACTION_QUERYING}:") + len("99") + len(":") + _MAX_KNOWN_QUERY_STEP_NAME_LENGTH
+)
+assert _WORST_CASE_QUERYING_CONTENT_LENGTH <= 32, (
+    "KNOWN_QUERY_STEPS 里最长子步骤名让 encode_progress_action 的最坏输出超过了"
+    "迁移 0075 CHECK 与 core/delivery/ports.PROGRESS_CONTENT_MAX_LENGTH 约定的"
+    "32 字节契约——新增子步骤名前必须先核对这条预算，不能只改这里不改那两处"
+)
+
 
 def encode_progress_action(
     action: str, *, query_count: int | None = None, query_step: str | None = None

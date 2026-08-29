@@ -11,8 +11,17 @@
 # exec 进本地容器——那是旧的本地库测试姿势，见 `scripts/ops/backup_restore_drill.sh`
 # 与 `scripts/ops/onboarding_preflight.sh` 的 `lingxi-test-db`，与云托管业务库是
 # 两回事）。DSN 只经环境变量 `LINGXI_POSTGRES_DSN` 传入，脚本不接受它作为参数、
-# 不打印它、不写进任何日志——不进 argv/日志是与 `host_health_alert.py` 凭据边界
-# 同一条纪律。
+# 不打印它、不写进任何日志。
+#
+# 口令不进 argv（P1-3，独立审查）：DSN 读进环境变量本身是安全的，但此前脚本会
+# 把整串 DSN（含明文口令）原样交给 psql 当位置参数——同机其它账号不需要同用户
+# 或 root 权限就能读任意进程的 `/proc/<pid>/cmdline`（读 `/proc/<pid>/environ`
+# 才需要那道门槛），整串带口令的 DSN 一旦进 argv 就等于把数据库密码摊给同机
+# 所有账号。做法是"拆分"：只把密码段从 DSN 里剥离，经 `PGPASSWORD` 环境变量
+# 传给 psql（libpq 官方支持的姿势），DSN 其余部分（host/port/dbname/
+# connect_timeout/options 等非密参数）原样保留、继续作为 psql 的位置参数——
+# 不改变这些参数的既有语义、不需要重新拼装整条连接串，也不需要新增
+# `~/.pg_service.conf` 这类额外安装步骤。见下方 `_pg_dsn_without_argv_password`。
 #
 # 输出格式：一行 JSON，字段 `{ts, host, layer:"db_business", metrics:{database:
 # {...}, business:{...}}}`；database/business 合并成一个 `layer` 标签而不是拆成
@@ -23,6 +32,35 @@
 # 不写业务表一个字节；`token_usage`/`error_kind` 等字段本身不含用户消息正文，
 # 只有计数、耗时、分位数与按内部 user_id（不透传姓名/open_id）的聚合。
 set -euo pipefail
+
+# 见上方脚本头注「口令不进 argv」。DSN 没有 `user[:password]@` 形状时（例如
+# 测试用的占位 DSN）原样透传，不强行要求密码存在。
+_pg_urldecode() {
+  # 密码段按 URI 规则可能被 percent-encode 过；PGPASSWORD 要的是解码后的原始
+  # 字节，不能把 %XX 逐字符传给 psql，否则真实密码含特殊字符时会连接失败。
+  printf '%b' "${1//%/\\x}"
+}
+
+# 结果写进全局变量 `PG_SAFE_DSN`（而不是 `printf` 返回值经 `$(...)` 捕获）：
+# 命令替换会在子 shell 里跑，函数内部对 `PGPASSWORD` 的 `export` 不会传回
+# 调用它的这个 shell——之前一版就是这样悄悄把密码丢在子 shell 里，PGPASSWORD
+# 从未真正被主 shell 看到（本地验证发现，见 PR 描述）。调用方必须以普通语句
+# 形式调用本函数（不包 `$(...)`），才能让这里对 PGPASSWORD/PG_SAFE_DSN 的赋值
+# 生效在当前 shell。
+_pg_dsn_without_argv_password() {
+  local dsn="$1"
+  if [[ "${dsn}" =~ ^(postgres(ql)?://)([^:@/]*)(:([^@/]*))?@(.*)$ ]]; then
+    local scheme="${BASH_REMATCH[1]}" user="${BASH_REMATCH[3]}"
+    local password="${BASH_REMATCH[5]}" rest="${BASH_REMATCH[6]}"
+    if [[ -n "${password}" ]]; then
+      PGPASSWORD="$(_pg_urldecode "${password}")"
+      export PGPASSWORD
+    fi
+    PG_SAFE_DSN="${scheme}${user}@${rest}"
+  else
+    PG_SAFE_DSN="${dsn}"
+  fi
+}
 
 if [[ -z "${LINGXI_POSTGRES_DSN:-}" ]]; then
   echo "缺少环境变量 LINGXI_POSTGRES_DSN：db_business_sample.sh 需要业务库连接串才能采样，未设置时拒绝启动（不静默跳过——那样会造成「看起来在跑但从来没写过数据」的假象）" >&2
@@ -45,6 +83,8 @@ fi
 
 install -d -m 750 "${OUTPUT_DIR}" "${STATE_DIR}"
 
+_pg_dsn_without_argv_password "${LINGXI_POSTGRES_DSN}"
+
 HOST_NAME="$(hostname)"
 NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DATE_UTC="$(date -u +%Y%m%d)"
@@ -55,7 +95,7 @@ ERROR_LOG="${STATE_DIR}/db_business_last_error.log"
 # 一次最简查询 `SELECT 1`，用纳秒时间戳前后打点——不解析 psql `\timing` 的输出
 # 格式，那个格式跨版本、跨语言环境不稳定，不适合机器解析。
 rt_start_ns=$(date +%s%N)
-if ! psql "${LINGXI_POSTGRES_DSN}" -Atc "SELECT 1;" >/dev/null 2>"${ERROR_LOG}"; then
+if ! psql "${PG_SAFE_DSN}" -Atc "SELECT 1;" >/dev/null 2>"${ERROR_LOG}"; then
   echo "端到端探测失败：SELECT 1 未成功，业务库当前不可达，本轮不写样本（详见 ${ERROR_LOG}，该文件不含凭据只含 psql 错误文本）" >&2
   exit 1
 fi
@@ -63,6 +103,20 @@ rt_end_ns=$(date +%s%N)
 ROUNDTRIP_MS=$(( (rt_end_ns - rt_start_ns) / 1000000 ))
 
 SQL_QUERY=$(cat <<'SQL'
+-- P1-8（独立审查）：DSN 本身沿用与业务连接同一份 Supabase 连接串，携带
+-- `lingxi.adapters.postgres` 那套 3 秒 statement_timeout / 2 秒 lock_timeout
+-- 启动参数（见上方脚本头注「口令不进 argv」段与 `deploy/README.md`「数据库
+-- 凭据源」）——那是给正式业务的短查询定的边界，本脚本这条聚合查询要在同一次
+-- 往返里跑多个窗口聚合（状态分布/耗时分位/token 用量按用户聚合等），远比一条
+-- 业务语句重，3 秒经常不够、会被 DSN 继承的启动参数打断。这里在批次最前面显式
+-- `SET`：会话级设置覆盖启动参数（同一条连接内，后设的会话参数生效），只作用
+-- 于这一次 psql 调用、不影响其它任何连接。30 秒是"给一次周期性只读聚合留够
+-- 裕量、又不至于长期占着一条慢连接"的量级选择；lock_timeout 保持 5 秒（比默认
+-- 2 秒宽松，但聚合查询本身不加任何锁，这里放宽是为了不因为与其它只读会话的
+-- 偶发争用而误伤，不是因为这条查询需要真的持锁）。
+SET statement_timeout = '30s';
+SET lock_timeout = '5s';
+
 WITH window_bounds AS (
   SELECT now() - (:'window_interval')::interval AS window_start, now() AS window_end
 ),
@@ -174,11 +228,23 @@ SELECT jsonb_build_object(
 SQL
 )
 
-JSON_LINE=$(psql "${LINGXI_POSTGRES_DSN}" \
+# 用 -f 读临时文件，不用 -c 传整串（本地验证发现的独立缺陷）：psql 文档明确
+# `-c`/`--command` 的参数"必须是服务器可以完全解析的命令字符串（即不含任何
+# psql 专属特性），或者是单条反斜杠命令"——`:'ts'`/`:'host'` 这类变量替换是
+# psql 专属特性，`-c` 从不做这层替换，字面量 `:` 会原样发给服务器变成语法
+# 错误。改为把 `SQL_QUERY` 写进一个仅当前用户可读的临时文件、经 `-f` 执行——
+# 变量替换只在 psql 读脚本文件/标准输入时才生效，`-c` 单命令模式生来不支持，
+# 与本次改动无关，是这条查询此前从未真正跑通过的独立缺陷（P1-8 顺手发现，见
+# 本批报告）。临时文件只含 SQL 文本，不含任何凭据，用完立即删除。
+SQL_FILE=$(mktemp)
+trap 'rm -f "${SQL_FILE}"' EXIT
+printf '%s\n' "${SQL_QUERY}" > "${SQL_FILE}"
+
+JSON_LINE=$(psql "${PG_SAFE_DSN}" \
   -v ON_ERROR_STOP=1 -X -q \
   -v "ts=${NOW_UTC}" -v "host=${HOST_NAME}" -v "window_minutes=${WINDOW_MINUTES}" \
   -v "window_interval=${WINDOW_MINUTES} minutes" -v "roundtrip_ms=${ROUNDTRIP_MS}" \
-  -Atc "${SQL_QUERY}" \
+  -At -f "${SQL_FILE}" \
   2>"${ERROR_LOG}") || {
   echo "业务聚合查询失败，本轮不写样本（详见 ${ERROR_LOG}，该文件不含凭据只含 psql 错误文本）" >&2
   exit 1

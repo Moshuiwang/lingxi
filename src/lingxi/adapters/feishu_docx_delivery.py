@@ -444,7 +444,27 @@ class LarkDocxDelivery:
         blocks = data.get("blocks")
         if not isinstance(blocks, list) or not blocks:
             raise LookupError("markdown 转换响应缺少可用的 blocks 字段：结果不明")
-        return [block for block in blocks if isinstance(block, Mapping)]
+        mapping_blocks = [block for block in blocks if isinstance(block, Mapping)]
+        if not mapping_blocks:
+            # P2 顺手（独立审查）：转换请求本身已经成功拿到响应（走到这里说明
+            # `data.get("blocks")` 是非空列表，上面那条 `LookupError` 分支没有
+            # 触发），只是列表里每一项都不是期望的 block 形状（例如飞书返回了
+            # 一串字符串/数字，或本仓库对响应形状的假设本身有误）——这与"入参
+            # 校验，还没发出任何请求"的 :class:`ValueError` 是两类不同的问题：
+            # 这里已经真实调用了转换接口、已经拿到一个响应，只是内容形状不对。
+            # 之前这里静默返回空列表，让空列表流进
+            # :meth:`write_blocks`，那里再触发一条与"未发起任何请求的入参校验"
+            # 同型的裸 ``ValueError("blocks 不能为空")``——把"飞书响应形状不对"
+            # 误归进了 gateway 消费循环白名单里"发出请求前的确定性入参校验"
+            # 那一类（模块 `apps/gateway/document_delivery.py` 文档「四步的
+            # 失败分类只有两种」a 项），而它其实应该走同一个白名单里的
+            # `FeishuDocxDeliveryError` 分支。这个失败是确定性的（转换端点
+            # 不写入任何文档、没有外部副作用，同一份 markdown 重放会得到同样
+            # 的转换结果），因此标 ``definite=True``——与
+            # :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"转换/写入
+            # 前置校验发现的确定性失败"。
+            raise FeishuDocxDeliveryError("markdown_convert_blocks_not_mapping", definite=True)
+        return mapping_blocks
 
     def write_blocks(self, document_id: str, blocks: Sequence[Mapping[str, Any]]) -> None:
         """把已经是飞书 block 形状的 ``blocks`` 写进正文，沿用与

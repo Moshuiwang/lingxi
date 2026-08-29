@@ -38,10 +38,22 @@ Create Date: 2026-08-29
 ``markdown``/blocks 转换只服务 docx 分支——``adapters/feishu_sheets_delivery.py``
 的写值走 ``PUT`` 覆盖式接口，没有"markdown 排版"这个概念，``rows``（同样存在
 ``paragraphs`` 这一列里，见迁移 0078 文件头部「为什么复用」）不需要、也不应该
-有对应的原文快照。``CHECK (delivery_type = 'docx' OR markdown IS NULL)`` 与
-迁移 0078 的 ``resource_url`` CHECK（``delivery_type = 'sheet' OR resource_url
-IS NULL``）同一姿态：把"哪个类型该有哪个附加列"从应用层自觉收紧成数据库层
-的结构性拒绝。
+有对应的原文快照。``CHECK (markdown IS NULL OR delivery_type IS NOT DISTINCT
+FROM 'docx')`` 与迁移 0078 的 ``resource_url`` CHECK（``delivery_type =
+'sheet' OR resource_url IS NULL``）同一姿态：把"哪个类型该有哪个附加列"从
+应用层自觉收紧成数据库层的结构性拒绝。
+
+**为什么是 ``IS NOT DISTINCT FROM`` 而不是 ``delivery_type = 'docx'``**（P2
+顺手，独立审查）：``delivery_type`` 目前有迁移 0078 的 ``NOT NULL`` 兜底，
+理论上不会真的出现 ``NULL``，但 CHECK 约束不应该依赖"另一张列的约束恰好还在"
+才成立——用普通 ``=`` 比较时，若 ``delivery_type`` 一旦是 ``NULL``（例如未来
+某次迁移放宽了 0078 的 ``NOT NULL``），``delivery_type = 'docx'`` 求值为
+``UNKNOWN``，而 Postgres 的 CHECK 语义是"只有明确 ``FALSE`` 才拒绝、
+``UNKNOWN`` 一律放行"——原写法因此会在那种假设不成立时悄悄放行一行
+``delivery_type IS NULL AND markdown IS NOT NULL`` 的自相矛盾数据，绕开这条
+本该挡住它的约束。``IS NOT DISTINCT FROM``（NULL-safe 比较，`NULL IS NOT
+DISTINCT FROM 'docx'` 明确求值为 ``FALSE``）不依赖这个假设，任何时候
+``delivery_type`` 不等于 ``'docx'``（含 ``NULL``）都会被明确拒绝。
 
 ## 到期擦除同步覆盖
 
@@ -70,7 +82,7 @@ depends_on: str | None = None
 _UPGRADE_SQL = r"""
 ALTER TABLE task_document_delivery_request
     ADD COLUMN markdown TEXT
-        CHECK (delivery_type = 'docx' OR markdown IS NULL);
+        CHECK (markdown IS NULL OR delivery_type IS NOT DISTINCT FROM 'docx');
 """
 
 _DOWNGRADE_SQL = r"""
