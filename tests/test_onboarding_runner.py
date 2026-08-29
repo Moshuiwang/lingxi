@@ -898,6 +898,39 @@ class ZeroGalaxyLocalGrantTests(unittest.TestCase):
         self.assertEqual(parts["users"].advanced, [], "无权限终态不得推进开通状态")
         self.assertEqual(legacy.find_calls, [], "零银河兜底判据不得读取存量沿用")
 
+    def test_a_legacy_row_does_not_leak_into_the_publish_row_when_a_local_grant_authorizes(
+        self,
+    ) -> None:
+        """否定（NEW-1，独立审查复核 2026-08-29 坐实并修复）：零银河 + 一条本地
+        授权（通过前置门 `_reject_zero_galaxy_without_local_grant`）+ 旧系统表
+        也有一行 → `_publish` 里真正结算发布行的那次合并同样必须传
+        ``legacy=None``，发布内容精确等于本地授权集合，**不含旧表指标**。
+
+        与上一条用例（``test_a_legacy_row_alone_does_not_authorize_a_never_
+        granted_user``）不同：那一条覆盖的是前置门自己那次合并（零本地授权，
+        走不到 ``_publish``）；本用例专门覆盖 ``_publish`` 结算发布行的那次合并
+        （前置门已放行，`_publish` 内部曾无条件调用 `_resolve_legacy_source`，
+        与前置门的收窄判据自相矛盾——独立审查坐实：修复前旧表行会悄悄并进
+        发布内容）。修复后两处判据同型：`aggregate.granted` 为假时 `legacy`
+        恒为 ``None``，`_resolve_legacy_source`/`find_rows` 都不被调用。"""
+
+        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
+        legacy = FakeLegacyTable({"xiaoming@example.com": '{"88":["旧系统遗留指标"]}'})
+        parts, result = run_once(
+            role_function_map={}, local_overrides=overrides, legacy_source=legacy
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"88":["本地指标"]}',
+            "发布内容必须精确等于本地授权集合，不得混入旧表遗留指标",
+        )
+        self.assertEqual(
+            legacy.find_calls, [], "_publish 结算发布行时零银河分支不得读取存量沿用"
+        )
+
     def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
         """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从
         「精确本地集合」变回「银河翻译结果 ∪ 本地授权」——两条分支共用同一个
