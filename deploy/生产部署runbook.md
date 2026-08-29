@@ -24,6 +24,15 @@
 
 按 [`deploy/README.md`「准备」](README.md#准备)为 `.env.prod`、`.env.prod.scheduler`、`.env.prod.gateway`、`.env.prod.worker`、`.env.prod.worker-queue`、`.env.prod.migrate`、`.env.prod.reauthorize` 七个文件写入生产凭据。生产凭据集与研发/Stage 凭据集完全隔离，任何一个值都不得与 `.env.stage.*` 系列重复（百炼模型端点凭据除外，见本文件「九」）；不得把研发环境的任何文件复制改名后当作生产文件使用。
 
+其中**数据库连接串不手工编辑**：生产数据库为 Supabase `lingxi-prod`（eu-west-1，Issue #411），凭据事实源是 `biplus-prod` 上的私有文件 `/home/bi-ai-deploy/.config/lingxi/supabase-prod.env`（0600，已就位并验证过登录），用同步脚本按服务写入——scheduler/gateway/worker-queue/reauthorize 得运行 DSN、migrate 得迁移 DSN、worker 零数据库凭据：
+
+```bash
+scripts/ops/sync_db_env_from_credentials.sh \
+  /home/bi-ai-deploy/.config/lingxi/supabase-prod.env deploy .env.prod
+```
+
+机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)（含 session 模式连接约束）。**截至 2026-08-29 生产尚未切换/部署**：本节只登记同构加载方式，实际执行在生产发布的独立 ops 卡内。
+
 ### 2.2 部署前置检查（preflight）
 
 逐条通过 [`deploy/README.md`「部署前置检查」](README.md)的两项：七个文件均 `0600` 且属主为部署用户；部署机已用只读拉取身份登录 GHCR。任一项不符不得执行下一步。

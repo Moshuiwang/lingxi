@@ -75,6 +75,26 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
+### 数据库凭据源：Supabase 私有凭据文件（Issue #411）
+
+stage 与生产的数据库为 Supabase 云托管（[#40 决策](https://github.com/Moshuiwang/lingxi/issues/40)，2026-08-05）。数据库连接串的**唯一事实源**是目标机器上、仓库工作副本之外的私有凭据文件（0600，属主为部署用户）：
+
+| 环境 | 机器 | 凭据文件 |
+| --- | --- | --- |
+| stage | `biai-stage` | `/home/wangzhipeng/.config/lingxi/supabase-stage.env` |
+| 生产 | `biplus-prod` | `/home/bi-ai-deploy/.config/lingxi/supabase-prod.env` |
+
+文件含 `LINGXI_POSTGRES_DSN`、`LINGXI_GATEWAY_POSTGRES_DSN`、`LINGXI_MIGRATION_DSN`（及项目号/区域两个非敏感说明变量）。**凭据不复制到研发机 tz，不进日志、Git、Issue 或 PR**；`.env.<环境>.*` 各服务文件里的 DSN 行由它派生，用同步脚本写入（先按下文「安装与升级」备份 env 文件再跑）：
+
+```bash
+scripts/ops/sync_db_env_from_credentials.sh ~/.config/lingxi/supabase-stage.env deploy .env.stage
+# 生产同构：…/supabase-prod.env deploy .env.prod（仅在生产发布 ops 卡内执行）
+```
+
+脚本按「每个服务只拿自己那一个变量」写入 scheduler / gateway / worker-queue / reauthorize（运行 DSN）与 migrate（迁移 DSN），并核对 `.env.<环境>.worker` 零数据库凭据（上文红线）；只输出文件名与变量名，永不回显值。不把凭据文件整份挂成 `env_file`：它同时含迁移 DSN（DDL 权限），整挂会送进业务进程。
+
+**连接模式约束**：DSN 必须保持 Supavisor **session 模式**（池化主机 `:5432`）或直连；**禁止改为 `:6543` transaction 模式**——worker 的常驻 `LISTEN` 连接在 transaction 模式下不可用且会占死池连接（Supavisor 维护者答复，见 #411 调研评论）。
+
 ## 部署前置检查（preflight，逐条通过才能 `up`）
 
 ### 1. 凭据文件权限（P1-3）
