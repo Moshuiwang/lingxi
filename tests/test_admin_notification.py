@@ -129,23 +129,23 @@ class LocalPermissionRenderingTests(unittest.TestCase):
 
         self.assertIn("抑制", card.title)
 
-    def test_grant_card_carries_the_zero_galaxy_permission_caveat(self) -> None:
-        """零银河权限用户的本地授权边界如实化（#319 动机场景，Trace #328 opus
-        审查 P1）：授权确认卡必须提示"若该用户当前无任何银河权限，本地授权
-        暂不生效"——四源合并挂在 `aggregate.granted` 判据之后，管理员点确认前
-        应当知道这条边界。"""
+    def test_grant_card_no_longer_carries_the_zero_galaxy_permission_caveat(self) -> None:
+        """否定断言：零银河权限用户的本地授权边界提示（#319 动机场景，Trace #328
+        opus 审查 P1）**已随 PM 2026-08-29 裁定（Issue #419）撤销**——四源合并不再
+        挂在 `aggregate.granted` 判据之后，「暂不生效」这句提示已经不实，授权确认
+        卡不得再出现它。"""
 
         pending = _pending(
             action_type=PendingActionType.LOCAL_PERMISSION_GRANT, payload=_GRANT_PAYLOAD
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertIn("若该用户当前无任何银河权限，本地授权暂不生效", card.body)
-        self.assertIn("V-权限-15", card.body)
+        self.assertNotIn("暂不生效", card.body)
+        self.assertNotIn("V-权限-15", card.body)
 
     def test_suppress_card_does_not_carry_the_zero_galaxy_permission_caveat(self) -> None:
-        """否定断言：本地抑制没有这个问题——银河那一侧本就是零时，抑制与否
-        结果一样，不会制造虚假期待，因此不该出现这句只适用于授权的提示。"""
+        """否定断言：本地抑制同样不该出现这句只适用于授权动作的提示——银河那一侧
+        本就是零时，抑制与否结果一样，不会制造虚假期待。"""
 
         pending = _pending(
             action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS, payload=_GRANT_PAYLOAD

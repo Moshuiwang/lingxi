@@ -100,35 +100,118 @@ class HealthcheckDatabaseCheckTests(unittest.TestCase):
 
     def test_missing_dsn_env_var_is_unhealthy(self) -> None:
         with self.assertRaises(healthcheck.HealthcheckError):
-            healthcheck._check_database("scheduler", {})
+            healthcheck._check_database("scheduler", 0.0, {})
 
     def test_unreachable_host_is_unhealthy_within_a_bounded_time(self) -> None:
         """真实网络尝试：连一个必然连不上的地址（保留地址段 + 连接工厂的默认
         超时）。断言的是"确实失败"这个结果，不是具体异常类型——连接工厂本身的
         超时边界已经由 adapters/postgres.py 与 check_deploy_contract.py 覆盖。
+
+        显式用一个空缓存目录：这条断言测的是"真实探测确实失败"，不能被恰好
+        残留在真实 ``/tmp`` 里的一份陈旧缓存戳悄悄跳过。
         """
 
-        started = time.monotonic()
-        with self.assertRaises(healthcheck.HealthcheckError):
-            healthcheck._check_database(
-                "scheduler",
-                {
-                    # TEST-NET-1（RFC 5737）：保证不可路由，连接会超时或立即拒绝，
-                    # 不会误连到真实数据库。
-                    "LINGXI_POSTGRES_DSN": "postgresql://u:p@192.0.2.1:5",
-                },
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                started = time.monotonic()
+                with self.assertRaises(healthcheck.HealthcheckError):
+                    healthcheck._check_database(
+                        "scheduler",
+                        60.0,
+                        {
+                            # TEST-NET-1（RFC 5737）：保证不可路由，连接会超时或
+                            # 立即拒绝，不会误连到真实数据库。
+                            "LINGXI_POSTGRES_DSN": "postgresql://u:p@192.0.2.1:5",
+                        },
+                    )
         # 连接工厂的 connect_timeout 默认 5 秒；给测试留够裕量但仍然是"有界"。
         self.assertLess(time.monotonic() - started, 15.0)
 
     def test_gateway_role_reads_its_own_prefixed_variable(self) -> None:
         """gateway 与 scheduler/worker 的 DSN 变量名不同（见模块头注释），
         healthcheck 必须按角色读对应变量，读错变量会把"根本没连接"误判成别的。
+
+        DSN 校验必须先于缓存判定发生（见 ``_check_database`` 实现注释）：这里
+        故意不预置任何缓存，用来证明这条报错不依赖缓存状态。
         """
 
         with self.assertRaises(healthcheck.HealthcheckError) as ctx:
-            healthcheck._check_database("gateway", {"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"})
+            healthcheck._check_database(
+                "gateway", 60.0, {"LINGXI_POSTGRES_DSN": "postgresql://u:p@x/y"}
+            )
         self.assertIn("LINGXI_GATEWAY_POSTGRES_DSN", str(ctx.exception))
+
+
+class HealthcheckDatabaseCacheTests(unittest.TestCase):
+    """Issue #409：依赖可达判定的成功结果缓存——新鲜/过期/缺失三态。
+
+    缓存必须只在真实探测成功时才被信任，且从不弱化"数据库不可达必须如实
+    变红"这条硬约束：过期或缺失都必须落回真实探测。
+    """
+
+    DSN = "postgresql://u:p@192.0.2.1:5"  # TEST-NET-1，保证不可路由。
+
+    def test_missing_cache_falls_back_to_a_real_probe_and_reports_failure(self) -> None:
+        """三态之一：从未探测成功过（容器刚启动）——必须做真实探测，不能凭空
+        判健康。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                with self.assertRaises(healthcheck.HealthcheckError):
+                    healthcheck._check_database(
+                        "scheduler", 60.0, {"LINGXI_POSTGRES_DSN": self.DSN}
+                    )
+
+    def test_fresh_cache_skips_the_real_probe(self) -> None:
+        """三态之二：缓存新鲜——即使 DSN 指向一个连不上的地址，也必须信任缓存、
+        不再尝试真实连接（用一个必然会失败的 DSN 恰好证明"根本没有真的去连"）。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                liveness.touch_liveness("scheduler-db")
+                # 不应抛异常：缓存年龄远小于 60s 的 TTL，真实探测被跳过。
+                healthcheck._check_database("scheduler", 60.0, {"LINGXI_POSTGRES_DSN": self.DSN})
+
+    def test_expired_cache_falls_back_to_a_real_probe(self) -> None:
+        """三态之三：缓存存在但已过期——必须重新做真实探测，不能继续信任一份
+        陈旧的"曾经可达"记录。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                # 戳一个纪元起点的时间戳：`read_liveness_age_seconds` 内部用的是
+                # 真实 `time.time()`，因此这份缓存相对当下必然早已过期，不需要
+                # 真的睡够 60 秒或去 patch 默认参数已经绑死的 `time.time` 引用。
+                liveness.touch_liveness("scheduler-db", clock=lambda: 0.0)
+                with self.assertRaises(healthcheck.HealthcheckError):
+                    healthcheck._check_database(
+                        "scheduler", 60.0, {"LINGXI_POSTGRES_DSN": self.DSN}
+                    )
+
+    def test_failed_probe_does_not_refresh_the_cache(self) -> None:
+        """探测失败绝不写入缓存——不能让"故障期间"反而不再检查。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                with self.assertRaises(healthcheck.HealthcheckError):
+                    healthcheck._check_database(
+                        "scheduler", 60.0, {"LINGXI_POSTGRES_DSN": self.DSN}
+                    )
+                age = liveness.read_liveness_age_seconds("scheduler-db")
+        self.assertIsNone(age, "探测失败后不应该出现任何缓存戳")
+
+    def test_zero_ttl_disables_the_cache_even_immediately_after_a_success(self) -> None:
+        """``db_cache_ttl_seconds<=0`` 必须永远做真实探测——即使缓存戳刚刚在同一
+        墙钟秒内写入（age 精确为 0.0），也不能被"age <= 0"这类计时巧合误判为
+        "缓存命中"。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"LINGXI_LIVENESS_DIR": tmp}):
+                liveness.touch_liveness("scheduler-db")
+                with self.assertRaises(healthcheck.HealthcheckError):
+                    healthcheck._check_database(
+                        "scheduler", 0.0, {"LINGXI_POSTGRES_DSN": self.DSN}
+                    )
 
 
 class HealthcheckLivenessCheckTests(unittest.TestCase):

@@ -1,0 +1,15 @@
+[Unit]
+Description=Lingxi 本机监控样本增量上推监控库（S-RC20-410，Issue #410）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wangzhipeng
+WorkingDirectory=/opt/lingxi/scripts/monitoring
+# 凭据只经 EnvironmentFile 注入，文件须 0600，内容只有一行 MONITORING_DSN=...
+# ——独立于业务库凭据的监控库最小权限角色（monitoring_schema.sql
+# lingxi_monitoring_app），见 deploy/监控告警.md 安装步骤。
+EnvironmentFile=/opt/lingxi/monitoring/push.env
+ExecStart=/usr/bin/env bash /opt/lingxi/scripts/monitoring/push_to_monitoring.sh
+TimeoutStartSec=60
