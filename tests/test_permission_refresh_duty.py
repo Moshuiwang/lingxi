@@ -1585,6 +1585,118 @@ class FullSuppressionRevocationTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 三点八、零银河权限用户的本地授权兜底（PM 2026-08-29 裁定，Issue #419）
+# --------------------------------------------------------------------------
+
+
+class ZeroGalaxyLocalGrantTest(unittest.TestCase):
+    """`V-权限-15` 已消除的已知限制：`aggregate.granted` 为假不再无条件撤权，先看
+    本地授权/存量沿用能否兜底出可发布内容——``_refresh_zero_galaxy_user`` 的三条
+    否定/正向断言。"""
+
+    def test_zero_galaxy_user_with_a_local_grant_publishes_exactly_the_local_set(
+        self,
+    ) -> None:
+        """正向：零银河权限 + 本地授权（未被同键抑制）→ 发布内容精确等于本地授权
+        集合——银河这一侧贡献为空，不出现任何翻译产物（``METRIC_NAME``）。"""
+
+        overrides = FakeLocalOverrides({USER_ONE: (_override_entry(),)})
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            local_overrides=overrides,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REFRESH_REASON)
+        self.assertEqual(
+            call["row"].permissions,
+            f'{{"{COMPANY_ID}":["本地指标"]}}',
+            "精确等于本地授权集合，不含任何银河翻译产物",
+        )
+        self.assertEqual(report.enqueued, 1)
+        self.assertEqual(report.revoked, 0, "走的是发布分支，不计入撤权计数")
+
+    def test_a_same_key_suppressed_grant_still_revokes(self) -> None:
+        """否定：本地授权被**同一个键**（同公司同指标）的本地抑制清空后，合并
+        结果仍是空字典——维持现行撤权语义不变，`_revoke` 一个字节都不改（走的是
+        `aggregate.reason`，不是红线-2 专用的 ``REASON_FULLY_SUPPRESSED``——两者
+        原因不同：银河本来就没给，不是本地行政性收回）。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="本地指标"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="本地指标"),
+                )
+            }
+        )
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            published_users={USER_ONE},
+            local_overrides=overrides,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(len(parts["decisions"].calls), 1)
+        call = parts["decisions"].calls[0]
+        self.assertEqual(call["reason"], PERMISSION_REVOKE_REASON)
+        self.assertEqual(call["row"].permissions, "{}", "同键抑制清空后仍是撤权行")
+        revoked = parts["audit"].fields_for("permission_refresh.user_revoked")
+        self.assertEqual(len(revoked), 1)
+        self.assertEqual(
+            revoked[0]["reason"],
+            "no_galaxy_roles",
+            "原因是银河本来就没给（aggregate.reason），不是红线-2 的本地行政性收回",
+        )
+
+    def test_a_never_published_user_with_no_local_grant_still_skips(self) -> None:
+        """否定：既无银河也无本地授权（默认 ``local_overrides=None``，装配层未
+        接线）→ 与改动前逐字节一致——从无发布行的撤权用户零发布意图。"""
+
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy_snapshot(roles=()))
+
+        report = duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "既无银河也无本地授权，零发布意图")
+        self.assertEqual(report.revoked, 1)
+        self.assertEqual(report.reasons["no_galaxy_roles"], 1)
+
+    def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
+        """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从
+        「精确本地集合」变回「银河翻译结果 ∪ 本地授权」——两个分支共用同一个
+        ``merge_permission_sources``，不是两套互相独立的合并逻辑。"""
+
+        overrides = FakeLocalOverrides({USER_ONE: (_override_entry(),)})
+
+        zero_duty, zero_parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            local_overrides=overrides,
+        )
+        zero_duty.run_once()
+        self.assertEqual(
+            zero_parts["decisions"].calls[0]["row"].permissions,
+            f'{{"{COMPANY_ID}":["本地指标"]}}',
+        )
+
+        recovered_duty, recovered_parts = build_duty(
+            identities=(identity(),), local_overrides=overrides
+        )
+        recovered_duty.run_once()
+        self.assertEqual(
+            recovered_parts["decisions"].calls[0]["row"].permissions,
+            f'{{"{COMPANY_ID}":["本地指标","{METRIC_NAME}"]}}',
+            "银河恢复后并集恢复",
+        )
+
+
+# --------------------------------------------------------------------------
 # 五、已送达正文同步清（S-P-5，Trace #328）
 # --------------------------------------------------------------------------
 

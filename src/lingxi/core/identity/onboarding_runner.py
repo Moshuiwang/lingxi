@@ -882,6 +882,17 @@ class AutoOnboardingRunner:
         if recheck is not None:
             return recheck
 
+        if not aggregate.granted:
+            # 零银河权限：现在才有 `app_user.id`，查一次本地授权/存量沿用（PM
+            # 2026-08-29 裁定，Issue #419）。放在令牌签发/用户环境创建**之前**——
+            # 不为一个最终会被拒绝的人签发问数 MCP 令牌、写一份带凭据的用户环境，
+            # 见该方法文档。
+            rejected = self._reject_zero_galaxy_without_local_grant(
+                user_id, aggregate, email=request.email, trace_id=trace_id
+            )
+            if rejected is not None:
+                return rejected
+
         self._stop_guard()
         issued = self._issue_token(user_id, email=request.email)
         self._create_environment(user_id, issued)
@@ -1011,11 +1022,17 @@ class AutoOnboardingRunner:
             role_function_map=self._role_function_map,
         )
         self._audit.record("onboarding.aggregated", trace_id=trace_id, **aggregate.audit_facts())
-        if not aggregate.granted:
-            # 没有受支持职能 / 没有公司范围：同一条无权限出口。
-            return _not_authorized(aggregate.reason)
+        # **不再在这里直接判定"无可用银河权限"**（PM 2026-08-29 裁定，Issue #419，
+        # 消 `V-权限-15` 此前登记的已知限制）：零银河权限的用户如果存在本地授权
+        # （管理员兜底赋权），仍应当继续开通并发布本地授权集合，与每日重算
+        # （`permission_refresh.py::_refresh_user`）的语义保持一致。这里还没有
+        # `app_user.id`（本地覆盖条目的键，迁移 `0072`；本方法发生在 `_provision`
+        # 之前），查不了本地覆盖，因此真正的"这个人到底有没有可发布内容"判定推迟
+        # 到建档、账号状态复核之后（`_run` 新增的 `_reject_zero_galaxy_without_
+        # local_grant` 调用点），不在这里提前拒绝——但也不为一个注定被拒绝的人
+        # （既无银河也无本地授权）签发令牌、建用户环境，见该方法文档。
 
-        if not self._publish_allowed():
+        if aggregate.granted and not self._publish_allowed():
             # **翻译层不可用：一条发布意图都不排**（与 Issue #227 在每日重算那一侧的
             # 整轮判据同一条纪律，授权与撤权都不例外）。停在这里而不是继续：
             #
@@ -1026,7 +1043,11 @@ class AutoOnboardingRunner:
             #   为前提，半开的用户会一直停在 mcp_syncing 而没有任何人会来收拾。
             #
             # 因此按本侧故障收口（`LX-ONBOARD-001`，已转交管理员），且**在建档之前**，
-            # 不留下任何半成品。
+            # 不留下任何半成品。**这道闸门的适用范围没有变**（Issue #419「既有出口
+            # 闸门全部保持」）：只保护"银河内容需要翻译才能安全发布"这件事——零银河
+            # 权限的用户没有银河内容需要翻译，本地授权本身已经是精确指标名，与改动前
+            # "零银河用户结构上从不到达这道检查"逐字节一致（该检查此前挂在
+            # `aggregate.granted` 的早退之后，零银河用户从未走到过这里）。
             self._audit.record("onboarding.publish_gate_closed", trace_id=trace_id)
             return _internal("permission_translation_unavailable")
 
@@ -1086,6 +1107,51 @@ class AutoOnboardingRunner:
             self._audit.record("onboarding.already_active", user=user_id, trace_id=trace_id)
             return self._completed(serialize_permissions(aggregate))
         return None
+
+    # ---- 5.5 零银河权限的本地授权兜底（PM 2026-08-29 裁定，Issue #419）--------
+
+    def _reject_zero_galaxy_without_local_grant(
+        self, user_id: str, aggregate: Any, *, email: str, trace_id: str
+    ) -> _Terminal | None:
+        """零银河权限用户提前查一次本地授权/存量沿用：合并结果非空（管理员兜底
+        赋权、或存量沿用未被抑制清空）→ 返回 ``None``，放行继续正常链路（令牌
+        签发、用户环境、`_publish` 会再做一次同样的合并并真正结算发布行——见
+        `_publish` 里的对应分支，这里重复一次查询换来的是"不为一个注定被拒绝的
+        人签发令牌、建环境"，取舍见下）；合并结果仍为空 → 返回"无可用银河权限"
+        的确定性业务失败终态，**在这里**拒绝——早于 `_issue_token`/
+        `_create_environment`，不为一个注定被拒绝的人签发问数 MCP 令牌、不创建
+        带凭据的用户环境。
+
+        **为什么在这里而不是 `_publish`**：`_publish` 需要已签发的令牌
+        （`issued.token_cipher` 要写进发布行），因此结构上只能排在令牌签发**之后**；
+        零银河用户里绝大多数既无银河也无本地授权（`aggregate.granted` 为假的
+        用户里，只有极少数会恰好也被管理员发过本地授权），把最终判定放在这里能
+        让大多数人在签发令牌/建环境之前就了结，换来的代价是"确实有本地授权兜底
+        的那一小撮人"会被查两次本地覆盖/存量沿用（一次这里、一次 `_publish`）——
+        两次都是只读查询，且第二次结果理论上应当与这次一致（除非管理员在这两步
+        之间的极短窗口收回了授权，那种情况下 `_publish` 会用它自己重新算出的
+        结果，不会用这次的陈旧结论）。
+
+        **不翻译**：`aggregate.granted` 为假时 `aggregate.companies`/`functions`
+        恒为空（`PermissionAggregate.__post_init__` 的不变式），`translate_
+        company_functions` 对空输入直接拒绝（那是"参数缺失"，不是"没有内容"，
+        见其自身校验），因此银河这一侧对合并的贡献直接是 ``{}``，不经过翻译层。
+        这也是这条分支不受 `publish_allowed` 闸门约束的理由——那道闸只保护"银河
+        内容需要翻译才能安全发布"这件事，零银河用户没有银河内容，与改动前"零银河
+        用户结构上从不到达 `publish_allowed` 检查"逐字节一致（见 `_match`）。
+        """
+
+        local = self._resolve_local_overrides(user_id)
+        legacy = self._resolve_legacy_source(user_id, email, {})
+        merged = merge_permission_sources(galaxy={}, local=local, legacy=legacy)
+        for reason in merged.skipped_reasons:  # 通配角 v1 结构上不会出现（galaxy 恒为空）
+            self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
+        if merged.permissions:
+            return None
+        self._audit.record(
+            "onboarding.no_local_grant_after_zero_galaxy", user=user_id, trace_id=trace_id
+        )
+        return _not_authorized(aggregate.reason)
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 
@@ -1165,46 +1231,55 @@ class AutoOnboardingRunner:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
             # 没有"这一行是谁的"的答案。归确定性业务失败，不是本侧故障。
             return _not_authorized("archived_identity_incomplete")
-        # 翻译「公司 + 职能」→ 指标名（Issue #227 / #346 修复）：与每日重算
-        # （`permission_refresh.py::_refresh_user`）共用同一个纯函数
-        # `translate_company_functions`，不复制翻译逻辑——两个写发布行的调用点因此
-        # 产出同一语义的值列表（均为指标名，不是未翻译的职能标签）。整轮判据（映射
-        # 整体为空）已经在 `_match` 里挡住（`publish_allowed`，Issue #227 开通侧
-        # 整合），这里仍然按 `error.mapping_is_empty` 的真实值分类而不是硬编码，
-        # 理由同 `permission_refresh._refresh_user` 同一处注释：不让这条逐用户判据
-        # 的正确性依赖"调用方一定会先做整轮判据"这条外部不变量。
-        try:
-            company_metrics = translate_company_functions(
-                companies=aggregate.companies,
-                functions=aggregate.functions,
-                all_companies=aggregate.all_companies,
-                mapping=self._metric_translation_map,
-            )
-        except UncoveredPermissionCombination as error:
-            # fail-closed（#346）：存在未覆盖的「公司 + 职能」组合时，这条开通链
-            # **整条**拒绝发布——不猜测、不回落成未翻译的职能标签、不产出部分结果
-            # （`metric_translation.py` 模块文档「fail-closed」一节同一条纪律）。
-            # 这不是"银河说他没有权限"（`aggregate.granted` 已经为真），是我们这
-            # 一侧的翻译内容缺口，因此归本侧故障（`_internal`），不落
-            # `_not_authorized`——后者会把一个权限完全正常的人错误地引去银河申请一个
-            # 他已经有的权限。走到这里之前 `record_decision` 从未被调用，外部表零
-            # 写入。
-            self._audit.record(
-                "onboarding.publish_gate_closed",
-                user=user_id,
-                reason=(
+        if aggregate.granted:
+            # 翻译「公司 + 职能」→ 指标名（Issue #227 / #346 修复）：与每日重算
+            # （`permission_refresh.py::_refresh_user`）共用同一个纯函数
+            # `translate_company_functions`，不复制翻译逻辑——两个写发布行的调用点因此
+            # 产出同一语义的值列表（均为指标名，不是未翻译的职能标签）。整轮判据（映射
+            # 整体为空）已经在 `_match` 里挡住（`publish_allowed`，Issue #227 开通侧
+            # 整合），这里仍然按 `error.mapping_is_empty` 的真实值分类而不是硬编码，
+            # 理由同 `permission_refresh._refresh_user` 同一处注释：不让这条逐用户判据
+            # 的正确性依赖"调用方一定会先做整轮判据"这条外部不变量。
+            try:
+                company_metrics = translate_company_functions(
+                    companies=aggregate.companies,
+                    functions=aggregate.functions,
+                    all_companies=aggregate.all_companies,
+                    mapping=self._metric_translation_map,
+                )
+            except UncoveredPermissionCombination as error:
+                # fail-closed（#346）：存在未覆盖的「公司 + 职能」组合时，这条开通链
+                # **整条**拒绝发布——不猜测、不回落成未翻译的职能标签、不产出部分结果
+                # （`metric_translation.py` 模块文档「fail-closed」一节同一条纪律）。
+                # 这不是"银河说他没有权限"（`aggregate.granted` 已经为真），是我们这
+                # 一侧的翻译内容缺口，因此归本侧故障（`_internal`），不落
+                # `_not_authorized`——后者会把一个权限完全正常的人错误地引去银河申请一个
+                # 他已经有的权限。走到这里之前 `record_decision` 从未被调用，外部表零
+                # 写入。
+                self._audit.record(
+                    "onboarding.publish_gate_closed",
+                    user=user_id,
+                    reason=(
+                        "permission_translation_unavailable"
+                        if error.mapping_is_empty
+                        else "permission_translation_uncovered"
+                    ),
+                )
+                return _internal(
                     "permission_translation_unavailable"
                     if error.mapping_is_empty
                     else "permission_translation_uncovered"
-                ),
-            )
-            return _internal(
-                "permission_translation_unavailable"
-                if error.mapping_is_empty
-                else "permission_translation_uncovered"
-            )
+                )
+        else:
+            # 零银河权限（PM 2026-08-29 裁定，Issue #419）：走到这里说明
+            # `_reject_zero_galaxy_without_local_grant` 已经确认过合并结果非空，
+            # 银河这一侧对合并的贡献恒为空——`aggregate.companies`/`functions` 此时
+            # 必为空（`PermissionAggregate.__post_init__` 的不变式），不调用
+            # `translate_company_functions`（对空输入它会直接拒绝，那是"参数缺失"，
+            # 不是"没有内容"）。
+            company_metrics = {}
         # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328），接线点在这里而非更早的 `_match`——本地覆盖的 `user_id` 是内部 `app_user.id`，聚合时还没有它。
-        # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
+        # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；零银河用户则是恒为空的 `{}`（见上）；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
         galaxy_map = company_metrics
         local = self._resolve_local_overrides(user_id)
         legacy = self._resolve_legacy_source(user_id, request.email, galaxy_map)
@@ -1212,6 +1287,14 @@ class AutoOnboardingRunner:
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
         if not merged.permissions:
+            if not aggregate.granted:
+                # 防御性分支，理论上不会发生：`_reject_zero_galaxy_without_local_
+                # grant` 已经用同一个合并函数确认过非空结果，两次调用之间只隔着
+                # 令牌签发/环境创建（都不写本地覆盖表），除非管理员恰好在这个极短
+                # 窗口收回了授权（TOCTOU）。归回"无可用银河权限"而不是下面的
+                # `fully_suppressed_by_local_override`——原因不同：不是本地抑制
+                # 把银河给的压光到零，是银河本来就没给，且这一刻本地授权也没了。
+                return _not_authorized(aggregate.reason)
             # 红线-2：galaxy_map 非空（`_match` 已确保 granted），但本地抑制把合并
             # 结果压光到空字典。onboarding 是首次建行，空内容的新建行对 MCP 无意义，
             # 归类为确定性业务失败（同 `_match` 的 `not granted → _not_authorized`），
