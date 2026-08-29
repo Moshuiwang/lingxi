@@ -73,11 +73,14 @@ runner.py`` 与 ``apps/scheduler/permission_refresh.py`` 的当时代码）发�
    "结算发布行、真正把合并结果写进外部表"的唯一位置——但开通侧现在多了**第二个**
    调用点：``_recheck_still_provisionable`` 之后、``_issue_token``/
    ``_create_environment`` 之前的 ``_reject_zero_galaxy_without_local_grant``。
-   它在 ``aggregate.granted`` 为假时提前查一次本地覆盖/存量沿用（``galaxy={}``），
-   只为回答"要不要继续往下走"，不结算发布行；`_publish` 随后仍然会用同一个函数
-   再算一次并真正落决定。之所以多出这一次提前查询，是为了不为一个最终仍会被拒绝
-   的零银河用户签发问数 MCP 令牌、创建带凭据的用户环境——理由与取舍见
-   ``onboarding_runner.py`` 该方法自己的文档字符串，本模块不重复。
+   它在 ``aggregate.granted`` 为假时提前查一次**本地覆盖**（``galaxy={}``，
+   ``legacy`` 固定传 ``None``——存量沿用不参与这一步的授权判据，P0-1 独立审查
+   2026-08-29 坐实并修复，理由见该方法文档字符串「P0-1 收窄」一节），只为回答
+   "要不要继续往下走"，不结算发布行；`_publish` 随后仍然会用同一个函数再算一次
+   并真正落决定（`legacy` 在那里不受影响，照常参与）。之所以多出这一次提前查询，
+   是为了不为一个最终仍会被拒绝的零银河用户签发问数 MCP 令牌、创建带凭据的用户
+   环境——理由与取舍见 ``onboarding_runner.py`` 该方法自己的文档字符串，本模块
+   不重复。
 
 ## 调用时机：``aggregate.granted`` 不再是本函数被调用的前提条件（PM 2026-08-29 裁定，Issue #419）
 
