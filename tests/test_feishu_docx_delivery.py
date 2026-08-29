@@ -21,6 +21,7 @@ import unittest
 from urllib.error import URLError
 
 from lingxi.adapters.feishu_docx_delivery import (
+    MAX_CONVERTED_BLOCKS,
     FeishuDocxDeliveryError,
     LarkDocxDelivery,
     urllib_transport,
@@ -55,12 +56,13 @@ def _token_supply(token: str = FAKE_TOKEN):
     return lambda: token
 
 
-def _client(transport, *, tenant_access_token=None) -> LarkDocxDelivery:
+def _client(transport, *, tenant_access_token=None, markdown_convert_enabled: bool = False) -> LarkDocxDelivery:
     return LarkDocxDelivery(
         base_url=BASE_URL,
         tenant_access_token=tenant_access_token or _token_supply(),
         tenant_domain=TENANT_DOMAIN,
         transport=transport,
+        markdown_convert_enabled=markdown_convert_enabled,
     )
 
 
@@ -431,6 +433,198 @@ class ReadBodyChildrenTest(unittest.TestCase):
 
         with self.assertRaises(LookupError):
             client.read_body_children(DOCUMENT_ID)
+
+
+class ConvertMarkdownToBlocksTest(unittest.TestCase):
+    """Issue #408 正式方案：官方 markdown→blocks 转换（默认关闭，见
+    ``LarkDocxDelivery.write_body`` 与模块文档「markdown 官方转换开关」）。
+    请求/响应形状未经真实探针验证，本文件只钉住"调用形态与本模块自己声明的
+    契约一致"，同既有惯例。"""
+
+    def test_a_successful_convert_returns_the_blocks_and_matches_the_request_shape(self) -> None:
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"blocks": [{"block_type": 1, "page": {}}, {"block_type": 2}]}}]
+        )
+        client = _client(transport)
+
+        blocks = client.convert_markdown_to_blocks("# 标题\n\n正文")
+
+        self.assertEqual(len(transport.calls), 1)
+        method, url, body, token = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/blocks/convert")
+        self.assertEqual(body, {"content_type": "markdown", "content": "# 标题\n\n正文"})
+        self.assertEqual(token, FAKE_TOKEN)
+        self.assertEqual(blocks, [{"block_type": 1, "page": {}}, {"block_type": 2}])
+
+    def test_an_empty_markdown_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.convert_markdown_to_blocks("   ")
+
+        self.assertEqual(transport.calls, [])
+
+    def test_a_feishu_business_error_code_is_rejected_and_definite(self) -> None:
+        transport = RecordingTransport([{"code": 99991400, "msg": "rate limited"}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("# 标题")
+
+        self.assertEqual(raised.exception.code, "feishu_code_99991400")
+        self.assertTrue(raised.exception.definite)
+
+    def test_a_success_response_missing_blocks_is_a_lookup_error_not_a_silent_empty_result(
+        self,
+    ) -> None:
+        """结果不明：飞书说成功（``code=0``）但拿不到 ``blocks`` 字段——不能
+        当成"转换出一份空文档"，必须是 ``LookupError``。
+
+        变异锚点：把"检查 blocks 是否是非空 list"这条判据删掉、直接
+        ``return data.get("blocks") or []``，本用例会从抛出 ``LookupError``
+        变红成返回 ``[]``。
+        """
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+
+        with self.assertRaises(LookupError):
+            client.convert_markdown_to_blocks("# 标题")
+
+
+class WriteBlocksTest(unittest.TestCase):
+    def test_blocks_are_written_via_the_existing_children_endpoint(self) -> None:
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+        blocks = [{"block_type": 1, "page": {}}, {"block_type": 2}]
+
+        client.write_blocks(DOCUMENT_ID, blocks)
+
+        self.assertEqual(len(transport.calls), 1)
+        method, url, body, token = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertEqual(body, {"children": blocks, "index": 0})
+        self.assertEqual(token, FAKE_TOKEN)
+
+    def test_an_empty_blocks_sequence_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_blocks(DOCUMENT_ID, [])
+
+        self.assertEqual(transport.calls, [])
+
+    def test_more_than_the_cap_is_rejected_with_a_definite_reason_code_before_any_call(self) -> None:
+        """变异锚点：把 ``len(children) > MAX_CONVERTED_BLOCKS`` 这条判据删掉，
+        本用例会从抛出 ``FeishuDocxDeliveryError`` 变红成真的发起一次插入请求。
+        """
+
+        transport = RecordingTransport([])
+        client = _client(transport)
+        blocks = [{"block_type": 2}] * (MAX_CONVERTED_BLOCKS + 1)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_blocks(DOCUMENT_ID, blocks)
+
+        self.assertEqual(raised.exception.code, "too_many_blocks")
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(transport.calls, [], "本地检查先于请求发出，不该真的发起 HTTP 调用")
+
+    def test_exactly_the_cap_is_accepted(self) -> None:
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+        blocks = [{"block_type": 2}] * MAX_CONVERTED_BLOCKS
+
+        client.write_blocks(DOCUMENT_ID, blocks)
+
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_a_blank_document_id_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_blocks("   ", [{"block_type": 2}])
+
+        self.assertEqual(transport.calls, [])
+
+
+class WriteBodySwitchTest(unittest.TestCase):
+    """Issue #408：``write_body`` 是「markdown 官方转换开关」唯一的可执行分支
+    点——默认关闭时逐字调用既有 ``write_paragraphs``（零行为变化），打开时改走
+    convert + write_blocks，失败一律直接向上抛出，不静默退回纯文本路径。"""
+
+    def test_default_disabled_calls_write_paragraphs_with_zero_convert_calls(self) -> None:
+        """变异锚点：把 ``write_body`` 里 ``if self._markdown_convert_enabled``
+        分支反过来（默认走 convert），本用例会从"只发生一次 children 插入调用"
+        变红成"先发生一次 convert 调用"。"""
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)  # markdown_convert_enabled 默认 False
+
+        client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题\n\n第一段正文")
+
+        self.assertEqual(len(transport.calls), 1)
+        method, url, body, _ = transport.calls[0]
+        self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertEqual(
+            body,
+            {
+                "children": [
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "第一段正文"}}]}}
+                ],
+                "index": 0,
+            },
+        )
+
+    def test_enabled_calls_convert_then_writes_the_returned_blocks(self) -> None:
+        converted_blocks = [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "标题"}}]}}]
+        transport = RecordingTransport(
+            [
+                {"code": 0, "data": {"blocks": converted_blocks}},
+                {"code": 0, "data": {}},
+            ]
+        )
+        client = _client(transport, markdown_convert_enabled=True)
+
+        client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
+
+        self.assertEqual(len(transport.calls), 2)
+        convert_method, convert_url, convert_body, _ = transport.calls[0]
+        self.assertEqual(convert_method, "POST")
+        self.assertEqual(convert_url, f"{BASE_URL}/docx/v1/documents/blocks/convert")
+        self.assertEqual(convert_body, {"content_type": "markdown", "content": "# 标题"})
+        write_method, write_url, write_body, _ = transport.calls[1]
+        self.assertEqual(write_url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
+        self.assertEqual(write_body, {"children": converted_blocks, "index": 0})
+
+    def test_enabled_convert_failure_fails_closed_without_falling_back_to_paragraphs(self) -> None:
+        """开关打开时 convert 调用失败必须失败关闭，绝不静默退回纯文本段落
+        路径——只应该看到一次 convert 调用，看不到任何 children 插入调用。"""
+
+        transport = RecordingTransport([{"code": 99991400, "msg": "rate limited"}])
+        client = _client(transport, markdown_convert_enabled=True)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_enabled_over_cap_blocks_fail_closed_without_any_insert_call(self) -> None:
+        oversized_blocks = [{"block_type": 2}] * (MAX_CONVERTED_BLOCKS + 1)
+        transport = RecordingTransport([{"code": 0, "data": {"blocks": oversized_blocks}}])
+        client = _client(transport, markdown_convert_enabled=True)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="超长 markdown")
+
+        self.assertEqual(raised.exception.code, "too_many_blocks")
+        self.assertEqual(len(transport.calls), 1, "只应该发生一次 convert 调用，不该真的尝试插入")
 
 
 class DocumentUrlTest(unittest.TestCase):

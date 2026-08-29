@@ -89,16 +89,31 @@ def _stderr_events(buffer: io.StringIO) -> list[dict]:
 
 
 class NormalizeMarkdownTest(unittest.TestCase):
-    def test_strips_markdown_syntax_and_splits_on_blank_lines(self) -> None:
+    def test_splits_on_blank_lines_and_collapses_intra_paragraph_newlines(self) -> None:
+        """Issue #408：不再剥离 Markdown 语法字符，`#`/`-`/`*`/反引号原样保留在
+        段落里——只做空行切段、段内折叠。"""
+
         markdown = "# 标题\n\n- 第一条\n- 第二条\n\n**加粗内容** 和 `代码`。"
 
         paragraphs = normalize_markdown(markdown)
 
-        self.assertEqual(paragraphs, ("标题", "第一条 第二条", "加粗内容 和 代码。"))
+        self.assertEqual(
+            paragraphs, ("# 标题", "- 第一条 - 第二条", "**加粗内容** 和 `代码`。")
+        )
 
-    def test_blank_or_pure_syntax_input_normalizes_to_no_paragraphs(self) -> None:
+    def test_blank_input_normalizes_to_no_paragraphs(self) -> None:
         self.assertEqual(normalize_markdown("   \n\n   \n"), ())
-        self.assertEqual(normalize_markdown("# \n\n---\n\n***"), ())
+
+    def test_negative_numbers_and_percentage_ranges_are_preserved_verbatim(self) -> None:
+        """Issue #408 数据正确性修复的核心断言：此前的字符剥离会把连字符一并
+        吃掉——「周环比 -12.85%」变成「周环比 12.85%」（负号丢失）、「3-5%」
+        变成「35%」（区间被拼接）。这里必须逐字保真。"""
+
+        markdown = "周环比 -12.85%\n\n销售额同比增长 3-5%"
+
+        paragraphs = normalize_markdown(markdown)
+
+        self.assertEqual(paragraphs, ("周环比 -12.85%", "销售额同比增长 3-5%"))
 
 
 # ----------------------------------------------------------- 纯逻辑：build_document_request
@@ -130,10 +145,14 @@ class BuildDocumentRequestTest(unittest.TestCase):
             build_document_request(title="标题", markdown="   ")
         self.assertEqual(ctx.exception.reason_code, "empty_markdown")
 
-    def test_markdown_that_normalizes_to_nothing_is_rejected(self) -> None:
-        with self.assertRaises(DocumentDeliveryError) as ctx:
-            build_document_request(title="标题", markdown="# \n\n---\n\n***")
-        self.assertEqual(ctx.exception.reason_code, "empty_markdown")
+    def test_markdown_with_only_markdown_syntax_characters_is_accepted_verbatim(self) -> None:
+        """Issue #408：不再剥离语法字符，`# \n\n---\n\n***` 每一块都还剩下非空
+        白字符，因此不再被判定为"归一化后无可用段落"——与
+        ``NormalizeMarkdownTest`` 的新行为对称。"""
+
+        request = build_document_request(title="标题", markdown="# \n\n---\n\n***")
+
+        self.assertEqual(request.paragraphs, ("#", "---", "***"))
 
     def test_too_many_paragraphs_is_rejected_without_silent_truncation(self) -> None:
         """变异锚点③（上半）：跳过硬上限校验会让这条用例变绿（不再拒绝）。"""

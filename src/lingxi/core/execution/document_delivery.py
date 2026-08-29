@@ -68,10 +68,14 @@ MAX_SHEET_TOTAL_CHARS = 20000
 MIN_SHEET_TITLE_CHARS = MIN_TITLE_CHARS
 MAX_SHEET_TITLE_CHARS = MAX_TITLE_CHARS
 
-#: 轻量归一化会剥离的 Markdown 语法字符——只做字面字符剔除，不是通用 Markdown
-#: 解析器；代价（例如正文里的连字符 "3-5%" 会被剥成 "35%"）是这份「触发机制」
-#: 卡片明确接受的简化，真正的排版仍由 S-ES-3 消费段落时决定。
-_MARKDOWN_SYNTAX_CHARS = "#*`-[]()"
+#: 段落切分用的空行分隔符（Issue #408 之前还有一个 ``_MARKDOWN_SYNTAX_CHARS``
+#: 常量：对 ``#*`-[]()`` 八个字符逐字符剔除，本是「触发机制」卡片明确接受的
+#: 简化，但连字符也在剔除清单里——正文「周环比 -12.85%」会被剥成「周环比
+#: 12.85%」、「3-5%」会被剥成「35%」，负号/区间数字丢失，数据产品交付的文档
+#: 可能把负增长呈现为正增长，这是数据正确性缺陷。产品负责人 2026-08-29 裁定
+#: 先行停止字符剥离（真正的排版交给 ``adapters/feishu_docx_delivery.py`` 的
+#: 官方 markdown→blocks 转换路径，默认关闭，见该模块文档「markdown 官方转换
+#: 开关」一节）：这里现在只按空行切段、段内折叠，不再做任何字符级改写。
 _BLANK_LINE_SPLIT = re.compile(r"\n\s*\n")
 
 
@@ -117,22 +121,17 @@ class SheetRequest:
         return sum(len(cell) for row in self.rows for cell in row)
 
 
-def _strip_markdown_syntax(text: str) -> str:
-    for character in _MARKDOWN_SYNTAX_CHARS:
-        text = text.replace(character, "")
-    return text
-
-
 def normalize_markdown(markdown: str) -> tuple[str, ...]:
-    """轻量归一化：剥离常见 Markdown 语法字符，按空行切分为段落。
+    """轻量归一化：按空行切分为段落，段内换行折叠为空格。
 
-    段内换行折叠为空格——这里产出的是"段落列表"，不是要保留原始换行版式的
-    文本块；空段（连续空行、纯语法字符行剥完后变空）不进入结果。
+    Issue #408 起不再剥离 Markdown 语法字符（原因见 ``_BLANK_LINE_SPLIT``
+    上方注释）——用户暂时会看到原样的 ``**``/``#`` 等符号，换来负号、区间
+    数字这类正文内容不再被字符级改写破坏。这里产出的仍然是"段落列表"，不是
+    要保留原始换行版式的文本块；空段（连续空行）不进入结果。
     """
 
-    stripped = _strip_markdown_syntax(markdown)
     paragraphs: list[str] = []
-    for block in _BLANK_LINE_SPLIT.split(stripped):
+    for block in _BLANK_LINE_SPLIT.split(markdown):
         collapsed = " ".join(line.strip() for line in block.splitlines()).strip()
         if collapsed:
             paragraphs.append(collapsed)
@@ -165,6 +164,10 @@ def build_document_request(
         raise DocumentDeliveryError("empty_markdown", "正文不能为空")
 
     paragraphs = normalize_markdown(markdown)
+    # Issue #408 起 normalize_markdown 不再剥离字符：只要上面的 markdown.strip()
+    # 检查已经通过（正文含至少一个非空白字符），空行切分必然保留住那个字符，
+    # 这条分支因此不会再被触发——保留作为防御性检查（normalize_markdown 未来
+    # 若改变实现，这里仍然兜底），不是判定"有没有用"的主要防线。
     if not paragraphs:
         raise DocumentDeliveryError("empty_markdown", "正文归一化后没有任何可用段落")
     if len(paragraphs) > MAX_PARAGRAPHS:
