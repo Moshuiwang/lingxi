@@ -564,15 +564,17 @@ class DeliveryResolutionTests(DeliveryOutboxTestCase):
 class ProgressEventContentTests(DeliveryOutboxTestCase):
     """R1（Issue #328 opus 审查真库实测）：迁移 0075 放宽 ``task_delivery_event``
     的 CHECK 之后，``progress`` 事件真的能带语义化进度内容
-    （``card_stream.encode_progress_action`` 产出的两种固定形状），机制本身
+    （``card_stream.encode_progress_action`` 产出的固定形状），机制本身
     可用——放宽前的真实故障是真库实测 100% ``CheckViolation``，被
     ``apps/worker/service.py::WorkerService._append_event`` 的通用
     ``except Exception`` 吞成一条 ``logger.error``，真实环境卡片完全不动，
-    比不做语义化进度还差。
+    比不做语义化进度还差。Issue #407 增粒度后新增两种形状（``querying:N:
+    <已知子步骤>``、``working``），一并覆盖，证明放宽后的 CHECK 上限（32 字节）
+    确实能容纳新形状的实测最长值，不是只在 Python 层算过、真库层没试过。
 
     变异锚点：回退 0075 对 ``task_delivery_event_check2`` 的 CHECK 放宽（改回
-    只允许 ``safely_releasable_answer``/``terminal`` 带 content）→ 本类三个用例
-    全部因 ``CheckViolation`` 变红。33 字符越界的否定用例见
+    只允许 ``safely_releasable_answer``/``terminal`` 带 content）→ 本类全部用例
+    因 ``CheckViolation`` 变红。33 字符越界的否定用例见
     ``NegativeConstraintTests.test_progress_content_over_length_contract_is_rejected``。
     """
 
@@ -597,13 +599,25 @@ class ProgressEventContentTests(DeliveryOutboxTestCase):
     def test_progress_content_querying_shape_writes_successfully(self) -> None:
         self._assert_progress_content_round_trips("querying:3")
 
+    def test_progress_content_querying_with_known_step_shape_writes_successfully(self) -> None:
+        """Issue #407 方向 A：带子步骤名的形状；用最长的已知子步骤名
+        （``search_dimension``，16 字节）与两位数计数验证真库层的实测最长值，
+        不只是 Python 层算过。"""
+
+        self._assert_progress_content_round_trips("querying:99:search_dimension")
+
     def test_progress_content_composing_shape_writes_successfully(self) -> None:
         self._assert_progress_content_round_trips("composing")
 
+    def test_progress_content_working_shape_writes_successfully(self) -> None:
+        """Issue #407：非问数查询工具调用的独立文案形状。"""
+
+        self._assert_progress_content_round_trips("working")
+
     def test_progress_content_none_shape_still_writes_successfully(self) -> None:
         """默认 processing 阶段没有语义信号、``content`` 为 ``None``——这是改动前
-        就一直成立的既有形状，与前两个形状并排放在一起构成"三形状全覆盖"的
-        证据，不是本次放宽新增的行为。"""
+        就一直成立的既有形状，与其它形状并排放在一起构成"全形状覆盖"的证据，
+        不是本次改动新增的行为。"""
 
         self._assert_progress_content_round_trips(None)
 

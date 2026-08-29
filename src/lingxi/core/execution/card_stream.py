@@ -8,6 +8,17 @@
 ``message_id``/``fallback_needed`` 作为 ``initial_*`` 参数传回来，本类从那一点继续，
 不产生第二张有效卡片（`V-卡片-01`、状态合同第 7 条）。
 
+**Issue #407 方向 B 起，卡片正文是"已走过的步骤名"追加式列表**：``update()`` 每次
+调用不再用最新状态整体覆盖正文，而是把这一次信号追加成新的一行（同一状态连续
+出现时原地刷新用时，不重复追加，见 ``_accumulate_step``）——正文随进度更新持续
+变长，飞书官方的流式打字机效果因此天然承担"新行出现"的动态观感，本类不做任何
+字符级动画模拟。这份累积状态同样要支持 resume：``initial_progress_history``
+参数（``ProgressStepSnapshot`` 的有序序列）由调用方从 outbox 里已经持久化的历史
+信号重建后传入，构造期原样重放一遍——Gateway 消费循环本身是无状态的，**每一轮
+轮询都会重新构造一个全新的 ``CardStream``**（不止是崩溃重启才会遇到 resume），
+这份参数因此不是可选的锦上添花，而是"正文不会跨轮询边界变短"的唯一依据，见
+``apps/gateway/delivery.py`` 模块说明「过程流式的正文累积」。
+
 **「明确失败」与「结果不明」不是同一件事，判别用白名单而不是黑名单**（独立审核
 B-1 首次修复于 2026-08-14；独立审核 R-1 于同日把判别方向从黑名单反转为白名单，
 红线：重复投递）。``start()``/``finish()`` 的终态更新/``send_fallback()`` 这三处
@@ -37,60 +48,119 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from lingxi.config.content import ContentCatalog, RenderedCard, RenderedContent, default_content_catalog
 
 
-# 语义化进度动作码（Issue #321 方向 C，产品负责人 2026-08-27 裁定）：
-# ``apps/worker/service.py`` 编码写入 ``task_delivery_event.content``，
-# ``apps/gateway/delivery.py`` 的消费循环解码后交给 ``CardStream.update()``。
-# 两侧共享同一份常量，不各写一份字符串字面量、悄悄漂移。
+# 语义化进度动作码（Issue #321 方向 C，产品负责人 2026-08-27 裁定；Issue #407
+# 增粒度，产品负责人 2026-08-29 方向 A+B 裁定）：``apps/worker/service.py`` 编码
+# 写入 ``task_delivery_event.content``，``apps/gateway/delivery.py`` 的消费循环
+# 解码后交给 ``CardStream.update()``。两侧共享同一份常量，不各写一份字符串
+# 字面量、悄悄漂移。
 PROGRESS_ACTION_PROCESSING = "processing"
 PROGRESS_ACTION_QUERYING = "querying"
 PROGRESS_ACTION_COMPOSING = "composing"
+# 非问数查询工具的调用（含被拒绝的越界包装调用）——Issue #407 从 COMPOSING 拆出
+# 独立文案，不再与"模型正在输出文本"共用同一句话，覆盖两者交替出现时卡片长时间
+# 显示同一句文案的观感（issue 背景「读秒卡住感」）。
+PROGRESS_ACTION_WORKING = "working"
 PROGRESS_ACTION_COMPLETED = "completed"
 
+# 问数查询工具的已知子步骤（Issue #407 方向 A：提取步骤名信息）。这四个是真实
+# 问数 MCP 注册的原生只读工具全集（``apps/worker/config.py`` 白名单前缀注释、
+# ``docs/参考证据/问数MCP-list_metrics真实响应形状.md``、``core/year_grounding_
+# guard.py`` 的 ``QUERY_METRIC_TOOL_NAME`` 交叉印证）。**白名单式映射**（Issue
+# #407 出口安全红线）：只有落在这个集合里的子步骤名才会被编码进 progress 事件、
+# 进而映射成用户可见文案；任何不在其中的字符串（模型臆造的工具名、未来协议
+# 新增但本侧还未登记的工具、注入的内部标识）在 `encode_progress_action`/
+# `decode_progress_action` 两处都会被静默丢弃、退回不带步骤名的通用文案——不是
+# 只在其中一处过滤，两处都过滤是因为 `decode_progress_action` 的输入来自数据库
+# 里已经落库的 `content` 字段，不能假设它一定是本侧刚刚编码出来的那一份（防
+# 御性纵深，见模块顶部关于"结果不明"异常分类同一条纪律：宁可多判一层）。
+QUERY_STEP_LIST_METRICS = "list_metrics"
+QUERY_STEP_DESCRIBE_METRIC = "describe_metric"
+QUERY_STEP_SEARCH_DIMENSION = "search_dimension"
+QUERY_STEP_QUERY_METRIC = "query_metric"
+KNOWN_QUERY_STEPS: frozenset[str] = frozenset(
+    {
+        QUERY_STEP_LIST_METRICS,
+        QUERY_STEP_DESCRIBE_METRIC,
+        QUERY_STEP_SEARCH_DIMENSION,
+        QUERY_STEP_QUERY_METRIC,
+    }
+)
 
-def encode_progress_action(action: str, *, query_count: int | None = None) -> str:
+# 工具名 → 用户语文案键的白名单式映射表（Issue #407 出口安全红线）。只覆盖
+# :data:`KNOWN_QUERY_STEPS` 里的四个已知子步骤；具体文案由 ``content.toml``
+# 维护（产品负责人可独立调整每一句的措辞），这里只登记"哪个子步骤对应哪个
+# 文案键"这份结构性映射。查不到的键（``dict.get`` 的默认分支，见
+# ``CardStream._render_step_line``）一律落回既有通用文案 ``worker.action.
+# querying_metrics``——这正是"未映射的工具一律显示通用文案"这条要求的具体
+# 落地：即使未来协议新增了第五个查询工具、这里忘了同步登记，效果也只是退化
+# 成通用文案，不会把新工具的原始名字泄漏出去。
+_QUERY_STEP_ACTION_TEXT_KEYS: dict[str, str] = {
+    QUERY_STEP_LIST_METRICS: "worker.action.querying_list_metrics",
+    QUERY_STEP_DESCRIBE_METRIC: "worker.action.querying_describe_metric",
+    QUERY_STEP_SEARCH_DIMENSION: "worker.action.querying_search_dimension",
+    QUERY_STEP_QUERY_METRIC: "worker.action.querying_query_metric",
+}
+
+
+def encode_progress_action(
+    action: str, *, query_count: int | None = None, query_step: str | None = None
+) -> str:
     """把语义化进度状态编码进一条 progress 事件的 ``content`` 字段（worker 侧）。
 
-    只认 ``PROGRESS_ACTION_QUERYING``（必须带一个 ``>=1`` 的 ``query_count``，
-    渲染成"正在第 N 次查询指标数据"）与 ``PROGRESS_ACTION_COMPOSING``（渲染成
-    "正在整理与生成回答"）。``PROGRESS_ACTION_PROCESSING``——尚未发生任何可
-    分类信号时的默认状态——不经过这个函数：调用方直接传 ``content=None``，
-    没有语义需要编码。**不回显工具名、参数或任何查询内容**（Issue #321 方向 C
-    的产品红线）：编码后的字符串只可能是这两种固定形状之一，永远不含调用方
-    传入的工具名或输入正文。
+    认识三种动作：``PROGRESS_ACTION_QUERYING``（必须带一个 ``>=1`` 的
+    ``query_count``，渲染成"正在第 N 次查询……"；可选带一个 ``query_step``，
+    只有落在 :data:`KNOWN_QUERY_STEPS` 白名单里才会被编码，否则静默丢弃、
+    退回不带步骤名的通用编码——见上方模块常量注释）、``PROGRESS_ACTION_
+    COMPOSING``（渲染成"正在整理与生成回答"）与 ``PROGRESS_ACTION_WORKING``
+    （渲染成"正在处理其它步骤"）。``PROGRESS_ACTION_PROCESSING``——尚未发生
+    任何可分类信号时的默认状态——不经过这个函数：调用方直接传 ``content=
+    None``，没有语义需要编码。**不回显工具名、参数或任何查询内容**（Issue
+    #321 方向 C / #407 出口安全红线的产品红线）：编码后的字符串只可能是白名单
+    内的固定形状，永远不含调用方传入的原始工具名或输入正文。
     """
 
     if action == PROGRESS_ACTION_QUERYING:
         if query_count is None or query_count < 1:
             raise ValueError("querying 动作必须带一个 >=1 的 query_count")
+        if isinstance(query_step, str) and query_step in KNOWN_QUERY_STEPS:
+            return f"{PROGRESS_ACTION_QUERYING}:{query_count}:{query_step}"
         return f"{PROGRESS_ACTION_QUERYING}:{query_count}"
     if action == PROGRESS_ACTION_COMPOSING:
         return PROGRESS_ACTION_COMPOSING
+    if action == PROGRESS_ACTION_WORKING:
+        return PROGRESS_ACTION_WORKING
     raise ValueError(f"未知的进度动作：{action!r}")
 
 
-def decode_progress_action(content: str | None) -> tuple[str, int | None]:
-    """反解析（Gateway 消费侧）。
+def decode_progress_action(content: str | None) -> tuple[str, int | None, str | None]:
+    """反解析（Gateway 消费侧）。返回 ``(action, query_count, query_step)``。
 
     任何无法识别的形状——``None``（进度事件从未携带语义、或来自旧版 worker）、
-    格式不对的字符串、越界的计数——一律退回 ``(PROGRESS_ACTION_PROCESSING,
-    None)``：这只是一张状态卡片要选哪句文案，宁可显示默认文案，也不能让一条
-    脏数据炸掉整条投递消费循环。
+    格式不对的字符串、越界的计数、不在 :data:`KNOWN_QUERY_STEPS` 白名单里的
+    步骤名——一律退回安全默认值（整体退回 ``(PROGRESS_ACTION_PROCESSING, None,
+    None)``，或仅步骤名退回 ``None``）：这只是一张状态卡片要选哪句文案，宁可
+    显示默认文案，也不能让一条脏数据（含蓄意构造、注入内部标识的 `content`）
+    炸掉整条投递消费循环，或把不可信内容带进用户可见卡片。
     """
 
     if content == PROGRESS_ACTION_COMPOSING:
-        return PROGRESS_ACTION_COMPOSING, None
+        return PROGRESS_ACTION_COMPOSING, None, None
+    if content == PROGRESS_ACTION_WORKING:
+        return PROGRESS_ACTION_WORKING, None, None
     if isinstance(content, str) and content.startswith(f"{PROGRESS_ACTION_QUERYING}:"):
-        _, _, raw_count = content.partition(":")
+        _, _, remainder = content.partition(":")
+        raw_count, _, raw_step = remainder.partition(":")
         if raw_count.isdigit():
             count = int(raw_count)
             if count >= 1:
-                return PROGRESS_ACTION_QUERYING, count
-    return PROGRESS_ACTION_PROCESSING, None
+                step = raw_step if raw_step in KNOWN_QUERY_STEPS else None
+                return PROGRESS_ACTION_QUERYING, count, step
+    return PROGRESS_ACTION_PROCESSING, None, None
 
 
 @dataclass(frozen=True)
@@ -154,6 +224,31 @@ class TextTransport(Protocol):
 SendOutcomeCallback = Callable[[str, bool], None]
 
 
+# G-CARD 已知平台行为（独立审核 P2-5，#162 评论 5290545953/5291111636 实测）：
+# 未手动关闭的流式卡片**距上次开启**（不是距上次更新）10 分钟后由平台自动关闭；
+# 之后任何 ``update``/``close`` 调用都会失败。问数任务运行超过 10 分钟并不
+# 罕见（硬上限 900 秒，见 ``apps/worker/config.py``），被动等到那次调用失败才
+# 发现只能带来"卡片停在某个中间态、用户又收到一条不相关的文本答案"的观感。
+# Issue #407 的处理方案（两种代价对比后选定"提前收口文案"）：
+# - 保活刷新（试图在 10 分钟前反复调用 ``update`` 续命）在这个平台事实下**不
+#   成立**——计时锚点是"上次开启"，不是"上次更新"，常规的 ``update`` 调用不会
+#   重置它，因此单靠更频繁地刷新卡片无法真正避免自动关闭；真正能续命的做法是
+#   主动关闭旧卡片、另开一张新卡片，但那需要新增"卡片轮换"这一整套状态（旧
+#   卡片如何收尾、新卡片如何接续 sequence、Gateway 消费循环如何识别"这是同一
+#   任务的第二张卡片"），实现与验证代价明显更高。
+# - 提前收口文案：接近阈值时主动把这最后一帧卡片正文换成明确的"即将改用文字
+#   消息"提示，并立即把 ``_fallback_needed`` 置位——后续 ``update``（progress）
+#   自然直接跳过、``finish``（terminal）也直接跳过卡片，改走既有的文本兜底
+#   通道（``CardStream.send_fallback``，Issue #151/#152 已验证的机制）。全部
+#   改动只是复用现成的降级路径提前触发一次，不需要新增任何状态机分支，代价
+#   明显更低——选定为本次实现。
+# 阈值取 9 分钟（留 1 分钟安全余量）：事件驱动进度更新最短 5 秒、兜底计时最长
+# 30 秒（``apps/worker/service.py``），跨过阈值后最多 30 秒内就会有下一次
+# ``update`` 调用触发这条提示，届时距真实的 10 分钟平台自动关闭仍有≥30 秒
+# 余量，可靠地在平台真的关闭之前完成主动切换。
+CARD_AUTO_CLOSE_HANDOFF_SECONDS = 540.0
+
+
 class CardRateLimiter:
     """一个 worker 进程共享：单话题 500ms、全进程 50 次/秒。"""
 
@@ -196,6 +291,30 @@ class CardStreamResult:
     fallback_text: bool
 
 
+@dataclass(frozen=True)
+class ProgressStepSnapshot:
+    """一条已经持久化的进度信号，按时间顺序重放用来重建卡片正文的累积状态
+    （Issue #407 方向 B）。字段与 ``decode_progress_action`` 的返回值加一个
+    ``elapsed_seconds`` 对齐——``apps/gateway/delivery.py`` 从 outbox 里读出
+    历史 ``progress``/``safely_releasable_answer`` 事件后解码成这个形状，见
+    ``CardStream.__init__`` 的 ``initial_progress_history`` 参数。
+    """
+
+    elapsed_seconds: int
+    action: str
+    query_count: int | None = None
+    query_step: str | None = None
+
+
+# 卡片正文累积列表的行数上限（Issue #407 方向 B 的防御性上限，不是产品承诺）。
+# 真实任务受 `apps/worker/config.py` 的 `MAX_TURNS_HARD_LIMIT`（30）与执行预算
+# 约束，正常情况下远远不会触顶；这里只是防止极端/异常场景（例如未来某次改动
+# 引入了一个永不重复的信号源）让卡片正文无界增长。触顶后丢弃最旧的行，保留
+# 最近发生的步骤——用户此刻最关心的是"最近发生了什么"，不是任务刚开始时的
+# 第一步。
+MAX_ACCUMULATED_STEP_LINES = 40
+
+
 class CardStream:
     """一个任务一个实例；绝不跨话题共享卡片序号或限流状态。"""
 
@@ -216,6 +335,7 @@ class CardStream:
         initial_sequence: int = 0,
         initial_message_id: str | None = None,
         initial_fallback_needed: bool = False,
+        initial_progress_history: Sequence[ProgressStepSnapshot] = (),
     ) -> None:
         self._chat_id = chat_id
         self._thread_id = thread_id
@@ -232,6 +352,24 @@ class CardStream:
         self._message_id: str | None = initial_message_id
         self._fallback_needed = initial_fallback_needed
         self._last_update: float | None = None
+        # 过程流式的累积正文（Issue #407 方向 B）：Gateway 消费循环按批次轮询、
+        # 每一批次都会重新构造一个全新的 ``CardStream`` 实例（没有跨轮次的进程内
+        # 状态），因此这份"已经走过的步骤"列表不能只活在内存里——``__init__``
+        # 用调用方传入的 ``initial_progress_history``（从 outbox 里已经持久化
+        # 的历史信号重建）重放一遍，找回上一轮结束时的累积状态，再由后续
+        # ``update()`` 调用在这个基础上继续追加，不会出现"新一轮卡片正文突然
+        # 变短"这种回退观感。``_last_step_identity`` 记录"最近一次累积的是
+        # 哪一种信号"——同一种信号连续出现时（例如 30 秒兜底刷新复用同一个
+        # 状态）只原地刷新用时，不重复追加同一句话；换成不同信号才追加新行。
+        self._step_lines: list[str] = []
+        self._last_step_identity: tuple[str, int | None, str | None] | None = None
+        for snapshot in initial_progress_history:
+            self._accumulate_step(
+                action=snapshot.action,
+                elapsed_seconds=snapshot.elapsed_seconds,
+                query_count=snapshot.query_count,
+                query_step=snapshot.query_step,
+            )
         self._rate_limiter = rate_limiter or CardRateLimiter()
         self._on_send_outcome = on_send_outcome
 
@@ -260,7 +398,17 @@ class CardStream:
 
         if self._card_id is not None or self._fallback_needed:
             return
-        card = self._status_card(action=PROGRESS_ACTION_PROCESSING, elapsed_seconds=0)
+        # 初始占位文案（"正在处理 · 0 秒"）刻意**不**计入累积步骤列表（Issue
+        # #407 方向 B）：它在这一刻还没有对应任何持久化的 progress 事件（只是
+        # 建卡时的固定起点），Gateway 侧的历史重建（`initial_progress_history`）
+        # 只能从 outbox 里真实存在的信号重放——如果这里把它算进
+        # `_step_lines`，下一轮轮询重新构造的 `CardStream` 无法找回这一行，
+        # 会让正文出现"重启后少一行"的回退观感。真正的第一条累积行来自第一次
+        # 真实信号触发的 `update()`。
+        card = self._catalog.card(
+            "query.status",
+            status=self._render_step_line(action=PROGRESS_ACTION_PROCESSING, elapsed_seconds=0),
+        )
         try:
             self._before_external()
             created = self._transport.create(
@@ -289,15 +437,32 @@ class CardStream:
         elapsed_seconds: int,
         action: str = PROGRESS_ACTION_PROCESSING,
         query_count: int | None = None,
+        query_step: str | None = None,
     ) -> None:
         if self._card_id is None or self._fallback_needed:
+            return
+        if elapsed_seconds >= CARD_AUTO_CLOSE_HANDOFF_SECONDS:
+            # G-CARD 10 分钟自动关闭提前收口（Issue #407，见 ``CARD_AUTO_CLOSE_
+            # HANDOFF_SECONDS`` 上方的完整取舍说明）：这一帧不再渲染常规进度
+            # 文案，改写成明确的"即将改用文字消息"提示，并立即降级——调用方
+            # （Gateway）之后的每一次 ``update``/``finish`` 都会走既有的文本
+            # 兜底路径，不需要任何新增分支。**只会触发一次**：`_emit_handoff_
+            # notice()` 的 `finally` 块无条件把 `_fallback_needed` 置位，本方法
+            # 顶部的早退分支从此拦住这个实例后续的每一次调用——不需要单独的
+            # "是否已经通知过"标记，复用既有的降级状态就是这份"只发一次"保证
+            # 的唯一来源，见该方法文档。
+            self._emit_handoff_notice()
             return
         now = self._monotonic()
         if not self._rate_limiter.allow(topic=self._topic, now=now):
             return
-        card = self._status_card(
-            action=action, elapsed_seconds=max(0, elapsed_seconds), query_count=query_count
+        self._accumulate_step(
+            action=action,
+            elapsed_seconds=max(0, elapsed_seconds),
+            query_count=query_count,
+            query_step=query_step,
         )
+        card = self._accumulated_status_card()
         self._sequence += 1
         try:
             self._before_external()
@@ -306,6 +471,81 @@ class CardStream:
             self._last_update = now
         except Exception:  # noqa: BLE001
             self._notify_send("card_non_final", False)
+            self._fallback_needed = True
+
+    def _accumulate_step(
+        self,
+        *,
+        action: str,
+        elapsed_seconds: int,
+        query_count: int | None = None,
+        query_step: str | None = None,
+    ) -> None:
+        """过程流式（Issue #407 方向 B）：把这一次信号记进"已走过的步骤"列表。
+
+        识别一次信号是不是"新步骤"，只看语义身份 ``(action, query_count,
+        query_step)`` 是否与上一次不同——问数查询的 ``query_count`` 递增
+        （即使 ``query_step`` 相同）也算新步骤，因为"第几次查询"本身就是
+        Issue #321/#407 要求的"有业务含义的文字变化"。身份不变时（例如 30 秒
+        兜底刷新复用同一个状态、还没有任何新信号）只原地刷新这一行的用时，
+        不重复追加同一句话——否则长任务会在同一个阶段反复刷屏一模一样的行，
+        与"只到步骤名深度"的产品意图背道而驰。
+
+        只有 ``PROGRESS_ACTION_QUERYING`` 才把 ``query_count``/``query_step``
+        计入身份——其它动作即使调用方误传了这两个参数也不区分，防止调用方
+        传参不一致时把同一个 composing/working 状态错误地拆成多行。
+        """
+
+        if action == PROGRESS_ACTION_QUERYING:
+            identity = (action, query_count, query_step)
+        else:
+            identity = (action, None, None)
+        line = self._render_step_line(
+            action=action, elapsed_seconds=elapsed_seconds, query_count=query_count, query_step=query_step
+        )
+        if self._step_lines and self._last_step_identity == identity:
+            self._step_lines[-1] = line
+        else:
+            self._step_lines.append(line)
+            if len(self._step_lines) > MAX_ACCUMULATED_STEP_LINES:
+                del self._step_lines[0]
+        self._last_step_identity = identity
+
+    def _accumulated_status_card(self) -> RenderedCard:
+        """把当前累积的步骤列表渲染成一张 ``query.status`` 卡片（Issue #407
+        方向 B）：正文是"已走过的步骤名"按时间顺序换行追加，飞书官方的流式
+        打字机效果天然承担"新行逐字出现"的动态观感，这里只负责让正文本身
+        持续变长，不做任何字符级动画模拟。
+        """
+
+        return self._catalog.card("query.status", status="\n".join(self._step_lines))
+
+    def _emit_handoff_notice(self) -> None:
+        """接近 G-CARD 10 分钟自动关闭阈值时的最后一帧卡片更新（Issue #407）。
+
+        刻意不经过 ``CardRateLimiter.allow()`` 的单话题 500ms 节流——这是一次
+        性的关键提示（同一实例生命周期最多触发一次，见 ``update()`` 顶部早退
+        分支与本方法 ``finally`` 里 ``_fallback_needed`` 置位的说明），被节流
+        吞掉就等于用户永远看不到这句解释；与 ``finish()`` 的终态两帧同一
+        姿态，改用 ``record()`` 无条件记入全进程 50 次/秒预算。发送本身失败
+        （任何异常）不改变"接下来改走文本通道"这个既定动作——``finally`` 保证
+        ``_fallback_needed`` 一定被置位，不需要调用方感知这次调用是否真的
+        成功送达；即使这一帧没有送达，卡片本身也已经停在上一帧，后续文本
+        终态仍会正常送达最终答案，不构成结果丢失。
+        """
+
+        now = self._monotonic()
+        card = self._status_card_handoff_notice()
+        self._sequence += 1
+        try:
+            self._before_external()
+            self._rate_limiter.record(topic=self._topic, now=now)
+            self._transport.update(card_id=self._card_id, sequence=self._sequence, card=card)
+            self._notify_send("card_non_final", True)
+            self._last_update = now
+        except Exception:  # noqa: BLE001 - 见方法文档：发送失败不改变既定降级动作
+            self._notify_send("card_non_final", False)
+        finally:
             self._fallback_needed = True
 
     def finish(
@@ -414,31 +654,55 @@ class CardStream:
         self._notify_send("message_final", True)
         return message_id
 
-    def _status_card(
-        self, *, action: str, elapsed_seconds: int, query_count: int | None = None
-    ) -> RenderedCard:
-        """按语义化进度动作码选文案（Issue #321 方向 C）。
+    def _render_step_line(
+        self,
+        *,
+        action: str,
+        elapsed_seconds: int,
+        query_count: int | None = None,
+        query_step: str | None = None,
+    ) -> str:
+        """按语义化进度动作码选文案，渲染成累积列表里的一行（Issue #321 方向
+        C；Issue #407 增粒度／方向 B）。
 
         ``query_count`` 缺失（``None``）时 ``querying`` 退化为默认 ``processing``
         文案而不是抛错或渲染出一句缺占位符的残句——这只可能发生在
         ``decode_progress_action`` 解析到脏数据、或调用方传参不一致时，卡片
         渲染必须失败关闭到一个安全默认值，不能把内部状态不一致带给用户。
+
+        ``query_step``——白名单式映射（Issue #407 出口安全红线）：只有落在
+        :data:`_QUERY_STEP_ACTION_TEXT_KEYS` 这张"工具名→用户语文案键"的映射表
+        里才会选到对应的更细文案；``None``、或调用方传入任何不在表中的字符串
+        （已经在 ``encode_progress_action``/``decode_progress_action`` 两处
+        过滤过，这里是第三层防御——直接用 ``dict.get`` 查不到就落回默认值，
+        不做任何字符串拼接或动态键名，因此不存在"传入未知值就把它拼进渲染键"
+        这条注入面）一律落回通用文案 ``worker.action.querying_metrics``。
         """
 
         if action == PROGRESS_ACTION_COMPLETED:
             action_text = self._catalog.text("worker.action.completed").text
         elif action == PROGRESS_ACTION_QUERYING and query_count is not None:
-            action_text = self._catalog.text(
-                "worker.action.querying_metrics", count=query_count
-            ).text
+            text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(query_step, "worker.action.querying_metrics")
+            action_text = self._catalog.text(text_key, count=query_count).text
         elif action == PROGRESS_ACTION_COMPOSING:
             action_text = self._catalog.text("worker.action.composing").text
+        elif action == PROGRESS_ACTION_WORKING:
+            action_text = self._catalog.text("worker.action.working").text
         else:
             action_text = self._catalog.text("worker.action.processing").text
-        status = self._catalog.text(
+        return self._catalog.text(
             "worker.status", action=action_text, elapsed_seconds=elapsed_seconds
         ).text
-        return self._catalog.card("query.status", status=status)
+
+    def _status_card_handoff_notice(self) -> RenderedCard:
+        """G-CARD 10 分钟自动关闭提前收口的固定文案（Issue #407），复用
+        ``query.status`` 卡片形状——不是常规的"{action} · {elapsed_seconds} 秒"
+        状态句，直接展示一句完整、不含占位符的说明。
+        """
+
+        return self._catalog.card(
+            "query.status", status=self._catalog.text("worker.card_handoff_notice").text
+        )
 
     @property
     def _topic(self) -> str:
