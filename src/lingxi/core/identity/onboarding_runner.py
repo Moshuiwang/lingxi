@@ -883,12 +883,12 @@ class AutoOnboardingRunner:
             return recheck
 
         if not aggregate.granted:
-            # 零银河权限：现在才有 `app_user.id`，查一次本地授权/存量沿用（PM
-            # 2026-08-29 裁定，Issue #419）。放在令牌签发/用户环境创建**之前**——
-            # 不为一个最终会被拒绝的人签发问数 MCP 令牌、写一份带凭据的用户环境，
-            # 见该方法文档。
+            # 零银河权限：现在才有 `app_user.id`，查一次**本地授权**（不含存量
+            # 沿用，见该方法文档「P0-1 收窄」一节，独立审查 2026-08-29 坐实并
+            # 修复）。放在令牌签发/用户环境创建**之前**——不为一个最终会被拒绝
+            # 的人签发问数 MCP 令牌、写一份带凭据的用户环境。
             rejected = self._reject_zero_galaxy_without_local_grant(
-                user_id, aggregate, email=request.email, trace_id=trace_id
+                user_id, aggregate, trace_id=trace_id
             )
             if rejected is not None:
                 return rejected
@@ -1111,26 +1111,38 @@ class AutoOnboardingRunner:
     # ---- 5.5 零银河权限的本地授权兜底（PM 2026-08-29 裁定，Issue #419）--------
 
     def _reject_zero_galaxy_without_local_grant(
-        self, user_id: str, aggregate: Any, *, email: str, trace_id: str
+        self, user_id: str, aggregate: Any, *, trace_id: str
     ) -> _Terminal | None:
-        """零银河权限用户提前查一次本地授权/存量沿用：合并结果非空（管理员兜底
-        赋权、或存量沿用未被抑制清空）→ 返回 ``None``，放行继续正常链路（令牌
-        签发、用户环境、`_publish` 会再做一次同样的合并并真正结算发布行——见
-        `_publish` 里的对应分支，这里重复一次查询换来的是"不为一个注定被拒绝的
-        人签发令牌、建环境"，取舍见下）；合并结果仍为空 → 返回"无可用银河权限"
-        的确定性业务失败终态，**在这里**拒绝——早于 `_issue_token`/
-        `_create_environment`，不为一个注定被拒绝的人签发问数 MCP 令牌、不创建
-        带凭据的用户环境。
+        """零银河权限用户提前查一次**本地授权**：合并结果非空（管理员兜底赋权）
+        → 返回 ``None``，放行继续正常链路（令牌签发、用户环境、`_publish` 会再
+        做一次同样的合并并真正结算发布行——见 `_publish` 里的对应分支，这里
+        重复一次查询换来的是"不为一个注定被拒绝的人签发令牌、建环境"，取舍见
+        下）；合并结果仍为空 → 返回"无可用银河权限"的确定性业务失败终态，
+        **在这里**拒绝——早于 `_issue_token`/`_create_environment`，不为一个
+        注定被拒绝的人签发问数 MCP 令牌、不创建带凭据的用户环境。
+
+        **P0-1 收窄（独立审查 2026-08-29 坐实并修复）**：这一步传给
+        `merge_permission_sources` 的 `legacy` **固定为 `None`，不参与**——
+        存量沿用（旧系统表遗留行）不构成一个人"是否该被独立授权开通"的判据，
+        只有管理员的本地授权（`local`）才是。修复前把 `_resolve_legacy_source`
+        的结果也接了进来，导致"零银河 + 零管理员授权 + 旧系统表遗留行"的用户
+        被这条兜底误判成有效授权并真的开通、发布（实测坐实）。`legacy` 是否要
+        在这类用户身上生效仍是 PM 未裁的开放问题，收窄之前不得让实现抢跑一个
+        产品还没做的决定。**否定用例**：零银河 + 零本地 + 有旧表遗留行 → 仍是
+        `not_authorized`（`ZeroGalaxyLocalGrantTests.
+        test_a_legacy_row_alone_does_not_authorize_a_never_granted_user`）。
+        `_publish` 里真正结算发布行那一次合并**不受影响**：`legacy` 只是这一步
+        提前查询的兜底判据被收窄，不是存量沿用整体功能被关掉。
 
         **为什么在这里而不是 `_publish`**：`_publish` 需要已签发的令牌
         （`issued.token_cipher` 要写进发布行），因此结构上只能排在令牌签发**之后**；
         零银河用户里绝大多数既无银河也无本地授权（`aggregate.granted` 为假的
         用户里，只有极少数会恰好也被管理员发过本地授权），把最终判定放在这里能
         让大多数人在签发令牌/建环境之前就了结，换来的代价是"确实有本地授权兜底
-        的那一小撮人"会被查两次本地覆盖/存量沿用（一次这里、一次 `_publish`）——
-        两次都是只读查询，且第二次结果理论上应当与这次一致（除非管理员在这两步
-        之间的极短窗口收回了授权，那种情况下 `_publish` 会用它自己重新算出的
-        结果，不会用这次的陈旧结论）。
+        的那一小撮人"会被查两次本地覆盖（一次这里、一次 `_publish`）——两次都是
+        只读查询，且第二次结果理论上应当与这次一致（除非管理员在这两步之间的
+        极短窗口收回了授权，那种情况下 `_publish` 会用它自己重新算出的结果，
+        不会用这次的陈旧结论）。
 
         **不翻译**：`aggregate.granted` 为假时 `aggregate.companies`/`functions`
         恒为空（`PermissionAggregate.__post_init__` 的不变式），`translate_
@@ -1142,8 +1154,7 @@ class AutoOnboardingRunner:
         """
 
         local = self._resolve_local_overrides(user_id)
-        legacy = self._resolve_legacy_source(user_id, email, {})
-        merged = merge_permission_sources(galaxy={}, local=local, legacy=legacy)
+        merged = merge_permission_sources(galaxy={}, local=local, legacy=None)
         for reason in merged.skipped_reasons:  # 通配角 v1 结构上不会出现（galaxy 恒为空）
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
         if merged.permissions:
