@@ -473,6 +473,20 @@ class HealthcheckTtlLatencyContractTests(unittest.TestCase):
     _RETRIES = {"scheduler": 3, "worker": 3, "gateway": 3}
 
     def test_ttl_plus_retry_budget_never_exceeds_the_liveness_stall_worst_case(self) -> None:
+        """A 类公式必须带上网格量化项 ``interval``（NEW-2，独立审查复核 2026-08-29
+        坐实并修复）：`_compute_db_cache_ttl_seconds` 文档字符串的推导本身是
+        ``(TTL + interval) + retries×(interval+timeout)``——缓存过期只在
+        healthcheck 被调用的离散节拍上被发现，不是过期那一刻就立刻触发真实探测，
+        因此比"天真地把 TTL 当成精确到期时刻"多付出最多一个 ``interval``。修复前
+        本断言漏了这一项（直接 ``ttl + retry_budget``），旧 gateway TTL=24s 那种
+        "网格量化把最坏时延从 123s 推到 145s、悄悄超过 B 类 129s"的缺陷不会被这条
+        守卫拦下——正是 P1-4 原始事故的形状，若断言本身不带这一项，它只是看起来
+        钉住了这条不变量，实际上验证的是一条更宽松、通不过就不该通过的假公式。
+
+        ``TTL=0``（禁用缓存）不加这一项：那时"每一轮都做真实探测"，退化成没有
+        TTL 项的 ``retries×(interval+timeout)``，不存在"缓存过期要等下一个节拍
+        才被发现"这件事，见该函数文档字符串同一节。"""
+
         for role, liveness_max_age in healthcheck._DEFAULT_MAX_LIVENESS_AGE_SECONDS.items():
             with self.subTest(role=role):
                 interval = self._INTERVAL_SECONDS[role]
@@ -482,13 +496,15 @@ class HealthcheckTtlLatencyContractTests(unittest.TestCase):
 
                 retry_budget = retries * (interval + timeout)
                 b_worst_case = liveness_max_age + retry_budget
-                a_worst_case = ttl + retry_budget
+                grid_quantization = interval if ttl > 0 else 0.0
+                a_worst_case = ttl + grid_quantization + retry_budget
 
                 self.assertLessEqual(
                     a_worst_case,
                     b_worst_case,
-                    f"{role}: TTL({ttl})+重试预算({retry_budget})={a_worst_case} "
-                    f"超过了 B 类最坏时延 {b_worst_case}——TTL 公式失去了安全余量",
+                    f"{role}: TTL({ttl})+网格量化({grid_quantization})+重试预算"
+                    f"({retry_budget})={a_worst_case} 超过了 B 类最坏时延 "
+                    f"{b_worst_case}——TTL 公式失去了安全余量",
                 )
 
     def test_ttl_is_never_negative_and_zero_means_disabled_not_a_calculation_artifact(

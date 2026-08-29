@@ -1293,7 +1293,22 @@ class AutoOnboardingRunner:
         # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；零银河用户则是恒为空的 `{}`（见上）；`legacy` 的失败降级见 `legacy_source.py` 模块文档。
         galaxy_map = company_metrics
         local = self._resolve_local_overrides(user_id)
-        legacy = self._resolve_legacy_source(user_id, request.email, galaxy_map)
+        # **零银河权限固定传 `legacy=None`（独立审查复核 2026-08-29 坐实并修复，
+        # NEW-1）**：`_reject_zero_galaxy_without_local_grant` 已经把"存量沿用
+        # 不构成零银河用户的独立授权判据"收窄成 `legacy=None`（其文档「P0-1
+        # 收窄」一节），但那次收窄只管前置的早退门；`_publish` 里真正结算发布行
+        # 的这次合并此前仍无条件调用 `_resolve_legacy_source`——一个零银河 +
+        # 有本地授权（通过了前置门）+ 旧系统表有遗留行的人，会被这里悄悄把旧表
+        # 行也并进发布内容，与前置门的判据自相矛盾。收窄到与前置门、以及重算侧
+        # `permission_refresh.py::_refresh_zero_galaxy_user` 同型：`aggregate.
+        # granted` 为假时 `legacy` 恒为 `None`，`_resolve_legacy_source` 都不
+        # 调用（连 `find_rows` 都不发起）。银河已授权路径（`aggregate.granted`
+        # 为真）不受影响，`legacy` 在那里照常参与合并。
+        legacy = (
+            self._resolve_legacy_source(user_id, request.email, galaxy_map)
+            if aggregate.granted
+            else None
+        )
         merged = merge_permission_sources(galaxy=galaxy_map, local=local, legacy=legacy)
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
