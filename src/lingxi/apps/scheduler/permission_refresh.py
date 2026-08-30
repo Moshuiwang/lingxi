@@ -261,6 +261,7 @@ from lingxi.core.permission.metric_translation import (
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import (
+    ADMIN_FULL_ACCESS_FUNCTION,
     aggregate_permission,
     build_revocation_row,
     build_translated_publish_row,
@@ -848,7 +849,15 @@ class PermissionRefreshDuty:
         # 之前」——`company_metrics` 就是银河那一侧已经翻译好的 `{公司: (指标名, …)}`。
         # 见 `core/permission/merge_sources.py` 模块文档。
         local = self._resolve_local_overrides(identity.app_user_id)
-        merged = merge_permission_sources(galaxy=company_metrics, local=local)
+        # 通配角 v2（Issue #440）：`all_companies=True` 有两个互相独立的成因
+        # （`scope.all_countries` 或持有 `ADMIN_FULL_ACCESS_FUNCTION`），只有后者
+        # 是「真全指标通配」——`merge_permission_sources` 自己不猜测，调用方必须
+        # 显式声明（见该函数「通配角 v2」文档）。
+        merged = merge_permission_sources(
+            galaxy=company_metrics,
+            local=local,
+            full_access_wildcard=ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions,
+        )
         for reason in merged.skipped_reasons:
             # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
             # `merge_permission_sources` 模块文档「通配角」一节。

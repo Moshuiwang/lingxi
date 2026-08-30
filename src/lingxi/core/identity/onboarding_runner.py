@@ -257,6 +257,7 @@ from lingxi.core.permission.metric_translation import (
 )
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish_row import (
+    ADMIN_FULL_ACCESS_FUNCTION,
     STATUS_APPROVED,
     aggregate_permission,
     build_translated_publish_row,
@@ -1272,7 +1273,16 @@ class AutoOnboardingRunner:
         # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；零银河用户则是恒为空的 `{}`（见上）。
         galaxy_map = company_metrics
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy=galaxy_map, local=local)
+        # 通配角 v2（Issue #440）：`all_companies=True` 有两个互相独立的成因
+        # （`scope.all_countries` 或持有 `ADMIN_FULL_ACCESS_FUNCTION`），只有后者
+        # 是「真全指标通配」——`merge_permission_sources` 自己不猜测，调用方必须
+        # 显式声明（见该函数「通配角 v2」文档）。零银河分支 `aggregate.functions`
+        # 恒为空元组，`in` 判据天然为 False，参数在 `galaxy={}` 时本就无效果。
+        merged = merge_permission_sources(
+            galaxy=galaxy_map,
+            local=local,
+            full_access_wildcard=ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions,
+        )
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
         if not merged.permissions:
