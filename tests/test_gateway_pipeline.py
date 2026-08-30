@@ -33,6 +33,7 @@ from gateway_fakes import (
     FakeReplies,
     FakeState,
     FakeStore,
+    FakeTask,
     provisioned_user,
 )
 from lingxi.adapters.feishu_events import (
@@ -846,20 +847,27 @@ class SessionRotationNoticeTests(PipelineTestCase):
     def test_no_notice_when_the_task_could_not_be_queued(self) -> None:
         """`V-队列-03` 的姿态：入队没成功就不给任何「已经换新会话了」的告知。
 
-        这条属性有**三道**互相独立的保险：追加发生在 ``insert_task`` 成功之后；
-        入队失败路径整体丢弃 ``deferred``；注入 store 没有独立发送权时事务失败直接
-        上抛。因此改坏其中任意一道（甚至前两道同时）都不会让本用例变红——它锁的是
-        那条对用户成立的产品属性本身，不是某一处实现位置，与
-        ``EnqueueFailureTests`` 对整条入队失败路径的断言同一姿态。
+        这条属性有**两道**互相独立的保险：追加发生在 ``insert_task`` 成功之后；
+        入队失败路径整体丢弃 ``deferred``——即使两者同时被改坏，入队失败时发出的
+        是 `EnqueueFailureTests` 断言的诚实排队失败提示（`gateway.queue_failed`，
+        Issue #465），不是"已经换新会话了"这句话本身，因此这条用例仍然锁得住
+        "新会话告知不会泄漏进失败路径"这条对用户成立的产品属性（此前第三道保险
+        是"注入 store 没有独立发送权时事务失败直接上抛"，但那只是测试替身的
+        缺口——生产 store 一直都实现着这个发送权；Issue #465 把测试替身补齐后
+        这条分支不再依赖异常穿透，见 ``EnqueueFailureTests`` 的同一处更新）。
         """
 
         self.stale_conversation()
         pipeline = self.build(fail_on="insert_task")
 
-        with self.assertRaises(RuntimeError):
-            pipeline.handle_message(message(), now=NOW)
+        outcome = pipeline.handle_message(message(), now=NOW)
 
-        self.assertEqual(self.texts(), [], "入队失败时不得发出新会话告知")
+        self.assertIsNone(outcome.handled_as)
+        self.assertEqual(
+            self.texts(),
+            [default_content_catalog().text("gateway.queue_failed").text],
+            "入队失败时应收到诚实的排队失败提示，但不得发出新会话告知",
+        )
 
     def test_continuing_session_gets_no_notice(self) -> None:
         """会话延续（间隔在两小时内）：一个字都不多说。"""
@@ -1297,17 +1305,27 @@ class SlashCommandRejectionTests(PipelineTestCase):
 
 
 class EnqueueFailureTests(PipelineTestCase):
-    """`V-队列-03`：入队未成功时不给已受理回复，事件不被标记为已成功处理。"""
+    """`V-队列-03`：入队未成功时不给已受理回复，事件不被标记为已成功处理。
 
-    def test_task_insert_failure_leaves_no_acceptance_signal(self) -> None:
+    Issue #465 更新（100% 响应覆盖）：`V-队列-03` 原文只禁止"表示已受理或已开始
+    处理"的回复，从未要求零回复——本组此前用 ``assertRaises(RuntimeError)`` +
+    零回复来断言，是因为共用的 ``FakeStore`` 当时没有实现
+    ``claim_queue_failure_notice``（真实生产 ``PostgresGatewayStore`` 一直都
+    实现着它），暴露的是测试替身的缺口，不是生产行为。补上假实现后，这里改为
+    断言生产环境真正会发生的事：不抛异常、用户收到一条诚实的
+    ``gateway.queue_failed`` 提示（"消息已收到，但当前暂时无法开始处理"——不是
+    "已受理/已开始处理"），`outcome.handled_as` 仍为 ``None``。
+    """
+
+    def test_task_insert_failure_sends_an_honest_queue_failed_reply(self) -> None:
         pipeline = self.build(fail_on="insert_task")
 
-        with self.assertRaises(RuntimeError):
-            pipeline.handle_message(message("evt_fail"), now=NOW)
+        outcome = pipeline.handle_message(message("evt_fail"), now=NOW)
 
-        self.assertEqual(
-            self.log.count("reply.send_text"), 0, "入队未成功时用户不得收到任何回复"
-        )
+        self.assertIsNone(outcome.handled_as)
+        self.assertEqual(self.log.count("reply.send_text"), 1, "必须收到一条诚实的失败提示")
+        sent = self.log.fields("reply.send_text")[0]
+        self.assertEqual(sent["text"], default_content_catalog().text("gateway.queue_failed").text)
         self.assertEqual(len(self.state.tasks), 0)
         self.assertNotIn(
             "evt_fail",
@@ -1315,6 +1333,18 @@ class EnqueueFailureTests(PipelineTestCase):
             "事务未提交，事件行不得存在——否则飞书重投时会被当成重复投递而静默丢弃",
         )
         self.assertEqual(self.state.notifies, 0, "入队失败不得发出 NOTIFY")
+
+    def test_task_insert_failure_notice_is_sent_only_once_per_event(self) -> None:
+        """同一条事件被飞书重投多次时，诚实失败提示只发一次——与真库
+        ``queue_failure_notice`` 表的去重语义一致（否则每次重投都再发一条，
+        持续失败的事件会把用户刷屏）。"""
+
+        pipeline = self.build(fail_on="insert_task")
+
+        pipeline.handle_message(message("evt_fail"), now=NOW)
+        pipeline.handle_message(message("evt_fail"), now=NOW)
+
+        self.assertEqual(self.log.count("reply.send_text"), 1)
 
     def test_claim_failure_rolls_back_the_claim(self) -> None:
         """`V-队列-02` 的可注入面：抢占成功但入队失败，话题不得永久忙碌。"""
@@ -1324,9 +1354,9 @@ class EnqueueFailureTests(PipelineTestCase):
         )
         pipeline = self.build(fail_on="insert_task")
 
-        with self.assertRaises(RuntimeError):
-            pipeline.handle_message(message("evt_fail"), now=NOW)
+        outcome = pipeline.handle_message(message("evt_fail"), now=NOW)
 
+        self.assertIsNone(outcome.handled_as)
         self.assertIsNone(
             self.state.conversations[("usr_1", "oc_1", "")].running_task_id,
             "抢占必须随事务一起回滚，否则该话题永久停在「当前任务仍在处理中」",
@@ -2181,6 +2211,151 @@ class MemoryCommandBypassesBusyTests(PipelineTestCase):
         self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
         self.assertEqual(len(self.state.user_memory.get("usr_1", [])), 1)
         self.assertEqual(len(self.state.tasks), 0, "/memory 不是问数任务，不入队")
+
+
+class BusyHintHonestyTests(PipelineTestCase):
+    """Issue #465（rc22 S-3）：忙碌期提示区分"排队中"与"处理中"两种真实状态，
+    不再对两者一概说"当前任务仍在处理中"（触发现场：批闸缺陷下重任务霸占
+    worker、轻任务迟迟没被领取时，用户发第二条消息只会被一句"处理中"误导，
+    以为系统正在忙它这条消息）。"""
+
+    def _busy_conversation(self, *, task_status: str) -> None:
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_running"
+        )
+        self.state.tasks.append(
+            FakeTask(
+                task_id="tsk_running",
+                conversation_id="cnv_busy",
+                user_id="usr_1",
+                inbound_event_id="evt_prior",
+                prompt="之前的问题",
+                resumed_session=False,
+                target_worker_version="stable",
+                status=task_status,
+            )
+        )
+
+    def test_says_queued_when_the_running_task_has_not_been_claimed(self) -> None:
+        self._busy_conversation(task_status="queued")
+
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(
+            replies[0]["text"],
+            default_content_catalog().text("gateway.busy_hint_queued").text,
+        )
+
+    def test_says_processing_when_the_running_task_is_actually_running(self) -> None:
+        self._busy_conversation(task_status="running")
+
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+
+    def test_unknown_or_missing_task_status_defaults_to_processing(self) -> None:
+        """`running_task_status` 为 ``None``（结构上不该出现，见 ``ConversationRecord``
+        文档）时保守落回既有"处理中"文案，不猜成"排队中"。"""
+
+        self.state.conversations[("usr_1", "oc_1", "")] = FakeConversation(
+            conversation_id="cnv_busy", running_task_id="tsk_unknown"
+        )
+
+        outcome = self.build().handle_message(message(), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(replies[0]["text"], BUSY_HINT_TEXT)
+
+
+class ResponseCoverageTests(PipelineTestCase):
+    """Issue #465（rc22 S-3）：100% 响应覆盖产品合同——集成测试枚举
+    ``EventPipeline.handle_message`` 全部尚未被专门识别的异常出口，逐一验证
+    最终都以给用户发一条诚实提示收尾，而不是让异常穿透到
+    ``apps/gateway/__init__.py``/``adapters/feishu_longconn.py`` 那一层只留一条
+    ``event.handler_failed`` 审计、用户什么都收不到（触发现场：批闸缺陷下
+    「你好」排队 5+ 分钟零反馈）。
+
+    枚举面：``_within_transaction`` 内部三个此前从未被任何既有用例覆盖过的
+    异常源头——事务最开始的幂等写入（``insert_inbound_event``）、入队时的话题
+    抢占（``claim_conversation``）、``/memory remember`` 写路径
+    （``remember_user_memory``）。三者分别代表"事务最前端"、"业务分支中段"、
+    "命令面写路径"三类不同位置，共同证明这道兜底不是只补了某一个具体调用点，
+    而是整个方法级别的安全网（`QueueInsertFailure`/``insert_task`` 那条已识别
+    的失败路径见 ``EnqueueFailureTests``，不在本组重复覆盖）。
+
+    **变异验红**（验证与门禁第八节）：临时把 ``EventPipeline.handle_message``
+    的 ``except Exception`` 缩窄成 ``except QueueInsertFailure``（去掉本条
+    兜底分支）后，本组用例全部由绿转红（异常原样穿出 ``handle_message``）；
+    恢复后复绿。红/绿证据见交付报告，不在本文件重复记录。
+    """
+
+    def test_insert_inbound_event_failure_gets_an_honest_fallback_reply(self) -> None:
+        outcome = self.build(fail_on="insert_inbound_event").handle_message(
+            message("evt_boom"), now=NOW
+        )
+
+        self.assertIsNone(outcome.handled_as)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1, "任何未被识别的异常都必须换成一条用户可见回复")
+        self.assertEqual(
+            replies[0]["text"],
+            default_content_catalog().text(
+                "gateway.unexpected_error", reference="trc_evt_boom"
+            ).text,
+        )
+        failed = self.log.fields("audit.event.pipeline_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("RuntimeError", failed[0]["error"])
+
+    def test_claim_conversation_failure_gets_an_honest_fallback_reply(self) -> None:
+        outcome = self.build(fail_on="claim_conversation").handle_message(
+            message("evt_boom"), now=NOW
+        )
+
+        self.assertIsNone(outcome.handled_as)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(
+            replies[0]["text"],
+            default_content_catalog().text(
+                "gateway.unexpected_error", reference="trc_evt_boom"
+            ).text,
+        )
+
+    def test_memory_remember_write_failure_gets_an_honest_fallback_reply(self) -> None:
+        outcome = self.build(fail_on="remember_user_memory").handle_message(
+            message("evt_boom", text="/memory remember term_mapping k => v"), now=NOW
+        )
+
+        self.assertIsNone(outcome.handled_as)
+        replies = self.log.fields("reply.send_text")
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(
+            replies[0]["text"],
+            default_content_catalog().text(
+                "gateway.unexpected_error", reference="trc_evt_boom"
+            ).text,
+        )
+
+    def test_fallback_reply_is_skipped_while_stopping_not_forced(self) -> None:
+        """停机中：结论（此处是"处理失败"这件事本身）已经无法再落库改变，回复是
+        尽力而为的那一部分——与既有 `deferred` 停机跳过姿态一致，不因为是兜底
+        路径就破例在停机预算之外硬发一次出站调用。"""
+
+        outcome = self.build(
+            fail_on="insert_inbound_event", should_stop=lambda: True
+        ).handle_message(message("evt_boom"), now=NOW)
+
+        self.assertIsNone(outcome.handled_as)
+        self.assertEqual(self.log.count("reply.send_text"), 0)
+        self.assertEqual(self.log.count("audit.reply.skipped_while_stopping"), 1)
 
 
 if __name__ == "__main__":

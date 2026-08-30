@@ -4,11 +4,17 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from lingxi.adapters.postgres import connect
 
-from ._dataclasses import DeliveryEventRecord, PendingDeliveryTask, UncertainDeliveryTask
+from ._dataclasses import (
+    DeliveryEventRecord,
+    PendingDeliveryTask,
+    StaleQueuedTask,
+    UncertainDeliveryTask,
+)
 
 
 class _GatewayDeliveryMixin:
@@ -78,6 +84,43 @@ class _GatewayDeliveryMixin:
                 ]
 
         return self._run_polling_operation(_list_pending)
+
+    def list_stale_queued_tasks(
+        self, *, older_than: timedelta, limit: int = 50
+    ) -> list[StaleQueuedTask]:
+        """列出已入队超过 ``older_than``、仍然 ``queued``（还没有任何 worker 领取）
+        的任务（Issue #465，S-3：排队可感知）。
+
+        只读查询，不加锁、不写任何标记——是否已经通知过完全由调用方
+        （``apps/gateway/delivery.DeliveryConsumer``）在进程内维护，与该消费者
+        既有的 ``_last_alerted_at``/``_fallback_next_attempt_at`` 同一姿态：
+        重启清零是已知的可接受降级（这是一条尽力而为的体验提示，不是需要跨
+        重启持久化的业务结论；`worker.queued_timeout` 那条更长阈值的诚实失败
+        终态仍然走 outbox，不受这条提示影响）。``status = 'queued'`` 复用既有
+        ``task_queue_idx`` 部分索引的过滤前提，积压量通常很小。
+        """
+
+        def _list_stale(connection: Any) -> list[StaleQueuedTask]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT t.id, c.feishu_chat_id, c.feishu_thread_id, t.reply_to_message_id
+                      FROM task AS t
+                      JOIN conversation AS c ON c.id = t.conversation_id
+                     WHERE t.status = 'queued' AND t.created_at < now() - %s::interval
+                     ORDER BY t.created_at
+                     LIMIT %s
+                    """,
+                    (older_than, limit),
+                )
+                return [
+                    StaleQueuedTask(
+                        task_id=row[0], chat_id=row[1], thread_id=row[2], reply_to_message_id=row[3]
+                    )
+                    for row in cursor.fetchall()
+                ]
+
+        return self._run_polling_operation(_list_stale)
 
     def list_uncertain_delivery_tasks(self, *, limit: int = 50) -> list[UncertainDeliveryTask]:
         """列出外发前预留位卡住的任务，供告警。见 ``reserve_dispatch`` 的说明。

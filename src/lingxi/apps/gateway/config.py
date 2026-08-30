@@ -62,6 +62,13 @@ class GatewayConfig:
     # Worker 进程，不在本进程内——轮询间隔是唯一的发现机制，因此默认取一个较短的值。
     delivery_poll_interval_seconds: float = 1.0
     delivery_batch_limit: int = 20
+    # 排队可感知（Issue #465，rc22 S-3）：入队后超过这个阈值仍未被任何 worker
+    # 领取时补发一条"前面还有任务在排队"。定值理由（10~15 秒区间取中值 12 秒）
+    # 见 ``apps/gateway/delivery.DeliveryConsumer.DEFAULT_QUEUE_DELAY_HINT_
+    # SECONDS`` 上方注释；两处各自独立登记默认值、互不 import（`apps/config`
+    # 与 `apps/delivery` 之间不建立仅为一个常量的依赖边），改其一记得同步改
+    # 另一处。
+    queue_delay_hint_seconds: float = 12.0
     # 最小告警装配（Issue #153）：管理群 chat_id **可选**——没有它进程照常启动，
     # 只是告警只落到结构化日志、不真正发进管理群，与 scheduler 的
     # `admin_group_chat_id` 同一取舍（一个尚未接线的可选职责不该让整个进程起不来）。
@@ -332,6 +339,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         shutdown_timeout_seconds=_number(env, "SHUTDOWN_TIMEOUT_SECONDS", 20.0),
         delivery_poll_interval_seconds=_number(env, "DELIVERY_POLL_INTERVAL_SECONDS", 1.0),
         delivery_batch_limit=_positive_int(env, "DELIVERY_BATCH_LIMIT", 20),
+        queue_delay_hint_seconds=_number(env, "QUEUE_DELAY_HINT_SECONDS", 12.0),
         admin_group_chat_id=admin_group_chat_id,
         alert_policy=alert_policy,
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,

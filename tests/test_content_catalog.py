@@ -342,9 +342,20 @@ class ContentDirectoryTests(unittest.TestCase):
         # - delivery.sheet_failed/delivery.sheet_uncertain（Issue #354
         #   S-H3-2）→ apps/gateway/document_delivery.py 的
         #   DocumentDeliveryConsumer._fail/_uncertain，走 gateway 独立消费
-        #   循环的终态通知，与 onboarding 三层补值分支不相交。
+        #   循环的终态通知，与 onboarding 三层补值分支不相交；
+        # - gateway.unexpected_error（Issue #465，100% 响应覆盖）→
+        #   core/conversation/pipeline.py 的
+        #   EventPipeline._handle_unexpected_failure 在调用处**直传**
+        #   ``reference=message.trace_id``——这是 handle_message 的方法级异常
+        #   兜底出口，不经过开通结果渲染（_render_onboarding_result）那条三层
+        #   补值分支，天然不相交，理由同 delivery.sheet_* 两条。
         known_direct_value_exceptions = frozenset(
-            {"onboarding.stalled", "delivery.sheet_failed", "delivery.sheet_uncertain"}
+            {
+                "onboarding.stalled",
+                "delivery.sheet_failed",
+                "delivery.sheet_uncertain",
+                "gateway.unexpected_error",
+            }
         )
         self.assertEqual(
             catalog_reference_keys,
