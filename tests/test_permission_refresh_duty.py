@@ -31,7 +31,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 from lingxi.adapters.postgres_galaxy_snapshot import GalaxyPermissionSnapshot
-from lingxi.adapters.postgres_roster_audit import ACTIVE_BASELINE_SQL
+from lingxi.adapters.postgres_permission_publish import PERMISSION_REFRESH_BASELINE_SQL
 from lingxi.apps.scheduler import (
     PERMISSION_REFRESH_REASON,
     PERMISSION_REVOKE_REASON,
@@ -1898,15 +1898,28 @@ class WatermarkAndStopTest(unittest.TestCase):
 
 
 class ActiveFilterTest(unittest.TestCase):
-    def test_the_filter_lives_in_sql_and_is_shared_with_the_roster_audit(self) -> None:
-        """否定断言的一半：本职责**不复制**筛选条件，直接复用同一条只读 SQL。
+    def test_the_filter_lives_in_sql_and_is_not_duplicated_in_the_duty(self) -> None:
+        """否定断言的一半：本职责**不复制**筛选条件，只调用注入的基线读取口。
 
-        另一半（非 active / deleting / deleted 用户绝不进入重算）只有真库能证伪，
-        在 ``tests/test_permission_refresh_postgres.py``。
+        Issue #468（2026-08-30）之前，这条只读 SQL与花名册审计基线
+        （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）是同一条；停用
+        （``suspended``）没有被两边共用的那条 SQL 排除，导致管理员的停用会被次日批量
+        重算静默突破。修复后本职责改用**专属**的
+        :data:`~lingxi.adapters.postgres_permission_publish.PERMISSION_REFRESH_BASELINE_SQL`
+        （额外排除 ``suspended``），花名册审计基线保持不变——两条 SQL 从此各自独立
+        演进，见 :class:`~lingxi.apps.scheduler.permission_refresh._BaselineReader`
+        文档。这条用例钉的是"筛选仍然只写在 SQL 里、职责代码里不再复制一份"这条不变式
+        本身没有被这次拆分打破。
+
+        另一半（非 active / deleting / deleted / suspended 用户绝不进入重算）只有
+        真库能证伪，在 ``tests/test_permission_refresh_postgres.py``。
         """
 
-        self.assertIn("provisioning_state = 'active'", ACTIVE_BASELINE_SQL)
-        self.assertIn("account_state NOT IN ('deleting', 'deleted')", ACTIVE_BASELINE_SQL)
+        self.assertIn("provisioning_state = 'active'", PERMISSION_REFRESH_BASELINE_SQL)
+        self.assertIn(
+            "account_state NOT IN ('deleting', 'deleted', 'suspended')",
+            PERMISSION_REFRESH_BASELINE_SQL,
+        )
         source = duty_code()
         for forbidden in ("provisioning_state", "account_state", "SELECT"):
             self.assertNotIn(forbidden, source, f"筛选不得在职责里再写一份：{forbidden}")
