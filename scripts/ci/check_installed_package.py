@@ -205,10 +205,6 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.local_override",
     "lingxi.adapters.postgres_local_permission",
     "lingxi.core.permission.merge_sources",
-    # 存量权限只读源（S-P-2，Issue #319 / Trace #328）：读正式权限发布表的纯逻辑
-    # （`read_legacy_permissions`/`resolve_legacy_source`）在 core，真实传输在
-    # `adapters.feishu_permission_bitable`（已经登记，见下方权限发布表一节）。
-    "lingxi.core.permission.legacy_source",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
     # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
     # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
@@ -594,12 +590,6 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
             "lingxi.core.permission.merge_sources",
-            # 存量权限只读源（S-P-2，Issue #319 / Trace #328）：`permission_refresh.py`
-            # 与 `onboarding_runner.py` 都模块级 import 了
-            # `resolve_legacy_source`/`read_legacy_permissions`；`build_loop` 在函数内
-            # import 真实传输 `BitablePermissionTable`（已在 `feishu_permission_bitable`
-            # 一节登记，这里不重复）。
-            "lingxi.core.permission.legacy_source",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。

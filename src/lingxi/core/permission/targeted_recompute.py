@@ -25,12 +25,10 @@
    代价：如果快照本身就滞后（例如这个人已经离职但花名册还没刷新），定向重算
    可能用旧数据算出与预期不符的结果——但这与"什么都不做、原样等每日批"相比不
    更差：发布表此刻的内容本来就是上一次某一轮用同样滞后数据算出来的。
-2. **``legacy`` 固定传 ``None``**（存量沿用不参与）。存量沿用的真实数据源是
-   飞书多维表格（``adapters/feishu_bitable_association.py`` 一类只读凭据），只有
-   scheduler 进程持有其访问配置；本模块的真实调用方是 gateway 进程（管理员确认
-   卡的回调就发生在那里），不应该为了这一个纵深字段让 gateway 额外持有一份多维
-   表格凭据。``merge_permission_sources(legacy=None)`` 对结果恒等（模块文档），
-   因此这是一个安全的降级，不是错误——下一轮每日批会用完整的四源重新合并一次。
+2. **存量沿用（legacy source）机制已退役**（PM 2026-08-30 裁定，Issue #441）：
+   ``merge_permission_sources`` 不再有 ``legacy`` 参数，本模块与每日批同用
+   「银河 ∪ 本地授权 − 本地抑制」两源合并，无需任何多维表格凭据——原设计中
+   「gateway 不为存量沿用额外持有多维表格凭据」的边界诉求自然满足。
 3. **``token_cipher`` 固定传 ``None``**。新建发布行才需要密文，而触发本模块的
    五种管理员动作里，除了极端边界（一个从未发布过的人被停用又恢复）不会新建行
    ——``RESUME_USER``/``LOCAL_PERMISSION_*`` 只会发生在这个人已经存在开通历史
@@ -281,7 +279,7 @@ class TargetedPermissionRecompute:
             cause = aggregate.reason
 
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy=company_metrics, local=local, legacy=None)
+        merged = merge_permission_sources(galaxy=company_metrics, local=local)
         for reason in merged.skipped_reasons:
             # 通配用户（银河「后台管理员」，all_companies=True）场景：本地覆盖整体
             # 不参与合并——审计明确说明这次调用为什么没有产生预期变化（Issue #438

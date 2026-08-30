@@ -196,7 +196,7 @@ def build_loop(
     # 权限发布表令牌供给：Issue #226 裁定方向 3（应用身份）。换取用的 app_id/app_secret
     # 是 scheduler 本来就必需的应用配置，因此这里**总能**建出一条默认供给——不像花名册
     # 那条依赖凭据轮换职责先跑起来，应用身份没有"还没轮换过一次"这种中间状态。挪到每日
-    # 重算之前构造：重算的存量沿用源（S-P-2 #328）与发布面共用同一条供给、同一张表。
+    # 重算之前构造：重算与发布面共用同一条供给、同一张表。
     from lingxi.adapters.feishu_tenant_token import FeishuTenantTokenClient
     permission_table_supply = (
         permission_table_access_token
@@ -212,14 +212,11 @@ def build_loop(
             audit=sink,
         )
     )
-    # 存量权限只读源（S-P-2，Trace #328）：复用上面同一条供给与坐标，不新增环境变量；坐标缺失时保持 None，两个消费点各自按"没有存量源"降级，不阻塞各自其余前置。
-    from lingxi.adapters.feishu_permission_bitable import BitablePermissionTable
-    legacy_source = BitablePermissionTable(base_url=config.feishu_base_url, app_token=config.permission_app_token, table_id=config.permission_table_id, access_token=permission_table_supply) if config.permission_app_token and config.permission_table_id else None
     # 每日权限重算排在花名册审计（或与它互斥的快照写入）**之后**：同一轮里花名册快照先被换成今天的那一份，重算才可能通过它自己的新鲜度判据（`V-权限-07` 的「先花名册、再银河」）。位置只保证同一轮内的先后；"用的是今天的花名册"由职责自己的判据保证。
     #
     # ``metric_translation_map`` 是这一次调用**唯一一次**读取 ``lingxi/config/company_function_metric_map.toml`` 的结果（前置不齐、连读取都没发生时是 ``None``）；下面首次开通编排的发布闸复用**同一个对象**（Issue #227 开通侧整合），不在那里另读一份文件——两份来源迟早会漂移，而漂移的方向是错误发布，见 ``_build_permission_refresh_duty`` 与 ``_build_onboarding_duty`` 的参数文档。
     permission_refresh, metric_translation_map = _build_permission_refresh_duty(
-        config, stop=stop, audit=sink, legacy_source=legacy_source
+        config, stop=stop, audit=sink
     )
     if permission_refresh is not None:
         duties.append(permission_refresh)
@@ -274,7 +271,6 @@ def build_loop(
         metric_translation_map=metric_translation_map,
         permission_publish=permission_publish,
         stock_tokens=build_stock_token_source(config, access_token=permission_table_supply, audit=sink),
-        legacy_source=legacy_source,
         onboarding_failed=(
             alerting_duty.onboarding_failed_callback() if alerting_duty is not None else None
         ),

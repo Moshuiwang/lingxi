@@ -259,7 +259,7 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
         return PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
 
     def _duty(
-        self, *, metric_translation_map=None, legacy_source=None, local_overrides=None
+        self, *, metric_translation_map=None, local_overrides=None
     ) -> PermissionRefreshDuty:
         publish_store = PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
@@ -275,7 +275,6 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             ),
             audit=self.audit,
             clock=self.clock,
-            legacy_source=legacy_source,
             local_overrides=local_overrides,
         )
 
@@ -610,104 +609,6 @@ class RevokedUserTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(self._version(ACTIVE_USER), 0, "撤权不推进权限版本")
         skipped = [fields for action, fields in self.audit.records if action.endswith("user_skipped")]
         self.assertEqual(skipped[0]["reason"], "no_galaxy_roles")
-
-
-class _FakeLegacyTable:
-    """存量权限只读源的假实现，仅用于红线-1 真库用例——真实存量表是 Feishu
-    多维表格（外部系统，本沙箱不可达），本类只承担"legacy 这一侧给了什么"；
-    被真正验证的是 :meth:`PostgresPermissionPublishStore.has_publish_footprint`
-    这一半真库判据，见 :class:`LegacyBoundednessRealDbTest` 文档。"""
-
-    def __init__(self, rows_by_email: dict[str, str]) -> None:
-        self._rows = rows_by_email
-        self.find_calls: list[tuple[str, str]] = []
-
-    def find_rows(self, *, record_key: str, email: str):
-        from lingxi.core.permission.publish import ExistingPermissionRow
-
-        self.find_calls.append((record_key, email))
-        if email not in self._rows:
-            return ()
-        return (
-            ExistingPermissionRow(
-                record_id=f"rec_{email}",
-                fields={"record_key": email, "email": email, "permissions": self._rows[email]},
-            ),
-        )
-
-
-class LegacyBoundednessRealDbTest(PermissionRefreshPostgresTestCase):
-    """红线-1（Trace #328 opus 审查）真库实测：legacy 只在「Lingxi 从未为该用户
-    成功发布过」时参与合并。``has_publish_footprint`` 是唯一只有真库能证伪的
-    那一半——它读的是真实 ``publish_outbox``，假 store 上这条判据无论实现怎么写
-    都是绿的（发布链上真实留没留下过足迹，是数据库状态，不是可以摆样子伪造的
-    输入）。legacy 表本身（Feishu 多维表格）不可达，用轻量假实现承担。"""
-
-    def _publish_current_intent(self) -> None:
-        """把当前这条 pending 意图推到 ``published``，模拟"我们发布成功过"。
-        与 ``RevokedUserTest`` 同一内容，各自一份——unittest 按类收集用例，
-        继承会让同一批用例在两个类名下各跑一次（同一条既有理由）。"""
-
-        store = PostgresPermissionPublishStore(self._dsn)
-        claimed = store.claim_next()
-        assert claimed is not None
-        store.complete(
-            PublishAttempt(
-                outcome=PublishOutcome.PUBLISHED,
-                outbox_id=claimed.outbox_id,
-                user_id=claimed.user_id,
-                permission_version=claimed.permission_version,
-                attempts=claimed.attempts,
-                action="create",
-                external_record_id="rec_fake",
-            ),
-            status=STATUS_PUBLISHED,
-        )
-
-    def test_a_user_with_a_real_publish_footprint_never_reads_legacy(self) -> None:
-        """否定用例：昨日已发布行含今日银河没有的指标 → 今日发布内容不含它
-        （收窄生效）——``has_publish_footprint`` 读到的是真实 ``publish_outbox``
-        里这个用户第一轮发布成功产生的那一行。"""
-
-        self._insert_users()
-        self._write_roster_snapshot()
-        self._import_galaxy()
-        self._token_store().issue_token(ACTIVE_USER)
-
-        legacy = _FakeLegacyTable({EMAIL[ACTIVE_USER]: '{"BC-甲":["昨日已发布的指标"]}'})
-        self._duty(legacy_source=legacy).run_once()
-        self._publish_current_intent()
-
-        # 第二天再跑一轮：这个用户此刻已经在真实 publish_outbox 里留下发布成功
-        # 的足迹。同一个 legacy 表这一轮依然有那行存量数据，但不该被读取/合并。
-        self.clock.moment = NOW + timedelta(days=1)
-        self._write_roster_snapshot(captured_at=self.clock.moment)
-        legacy.find_calls.clear()
-
-        self._duty(legacy_source=legacy).run_once()
-
-        payload = self._latest_payload(ACTIVE_USER)
-        self.assertEqual(
-            payload["permissions"],
-            f'{{"BC-甲":["{METRIC_NAME}"]}}',
-            "有真实发布足迹时存量沿用不生效，不被自己昨天的内容原样并回来",
-        )
-        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起——省读放大")
-
-    def test_a_never_published_user_still_uses_legacy(self) -> None:
-        """正向不回归：从未发布用户 + 存量行 → 沿用生效——真实 ``publish_outbox``
-        里这个用户此刻没有任何行，``has_publish_footprint`` 必须为假。"""
-
-        self._insert_users()
-        self._write_roster_snapshot()
-        self._import_galaxy()
-        self._token_store().issue_token(ACTIVE_USER)
-        legacy = _FakeLegacyTable({EMAIL[ACTIVE_USER]: '{"BC-甲":["存量指标"]}'})
-
-        self._duty(legacy_source=legacy).run_once()
-
-        payload = self._latest_payload(ACTIVE_USER)
-        self.assertEqual(payload["permissions"], f'{{"BC-甲":["存量指标","{METRIC_NAME}"]}}')
 
 
 class _FullSuppressionFixture(PermissionRefreshPostgresTestCase):

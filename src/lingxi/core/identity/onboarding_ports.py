@@ -112,14 +112,6 @@ class LocalOverrideSource(Protocol):
     def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
 
 
-class PublishHistorySource(Protocol):
-    """「这个人在发布链上有没有留下过足迹」的只读口（红线-1，legacy 有界化，
-    Trace #328 opus 审查；对称于 ``apps/scheduler/permission_refresh._PublishHistory``，
-    各自一份因为 ``core/`` 不 import ``apps/``）。"""
-
-    def has_publish_footprint(self, user_id: str) -> bool: ...
-
-
 class ReadinessConfirmer(Protocol):
     """阻塞式 MCP 就绪确认（``core/permission/mcp_readiness.McpReadinessConfirmation``）。"""
 

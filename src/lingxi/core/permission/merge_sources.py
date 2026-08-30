@@ -1,4 +1,4 @@
-"""四源聚合的集中合并（纯函数）：银河 ∪ 本地授权 ∪ 存量沿用 − 本地抑制。
+"""两源合并的集中合并（纯函数）：银河 ∪ 本地授权 − 本地抑制。
 
 [Issue #319](https://github.com/Moshuiwang/lingxi/issues/319) 的 S-P-3（Trace #328
 E-P 批次）。上游已经分别把「银河这一侧解释出什么」（:mod:`lingxi.core.permission.
@@ -6,11 +6,18 @@ publish_row`、:mod:`lingxi.core.permission.metric_translation`）与「本地�
 解决出什么」（:mod:`lingxi.core.permission.local_override` 的
 :func:`~lingxi.core.permission.local_override.resolve_local_overrides`，``suppress``
 赢已经内化——``grants`` 字段本身就是本地净授权）分别答完；本模块只回答最后一步：
-**这个用户最终真实拥有的权限，是把三个已经算好的来源按什么规则拼成一份**。
+**这个用户最终真实拥有的权限，是把两个已经算好的来源按什么规则拼成一份**。
 
-真实权限 ``= (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制``，在 ``{公司ID 或全公司通配
+真实权限 ``= (银河 ∪ 本地授权) − 本地抑制``，在 ``{公司ID 或全公司通配
 "*"：值字符串列表}`` 这个粒度上做集合运算——即 :func:`merge_permission_sources` 的
 输出形状。
+
+**存量沿用（legacy source）机制已退役**（PM 2026-08-30 裁定，Issue #441）：旧系统
+权限多维表格的存量用户权限改走差集导入为管理员本地授权（`local_permission_
+override`，方向 grant，原因「2.0 迁移导入」），不再有单独的「存量沿用」来源参与
+合并；``core/permission/legacy_source.py`` 与本模块曾经的 ``legacy`` 参数已一并
+删除，历史设计与「发布足迹有界化」取舍见 Git 历史（本模块 2026-08-30 之前的版本）
+与 `Issue #328`/`#419`，不在当前文档复述。
 
 ## 挂点与输入类型：与设计初稿的差异（历史事实，如实保留；#346 已把两个调用点收敛
 ## 到同一种输入形状，见下方「2026-08-28 更正」）
@@ -73,14 +80,11 @@ runner.py`` 与 ``apps/scheduler/permission_refresh.py`` 的当时代码）发�
    "结算发布行、真正把合并结果写进外部表"的唯一位置——但开通侧现在多了**第二个**
    调用点：``_recheck_still_provisionable`` 之后、``_issue_token``/
    ``_create_environment`` 之前的 ``_reject_zero_galaxy_without_local_grant``。
-   它在 ``aggregate.granted`` 为假时提前查一次**本地覆盖**（``galaxy={}``，
-   ``legacy`` 固定传 ``None``——存量沿用不参与这一步的授权判据，P0-1 独立审查
-   2026-08-29 坐实并修复，理由见该方法文档字符串「P0-1 收窄」一节），只为回答
-   "要不要继续往下走"，不结算发布行；`_publish` 随后仍然会用同一个函数再算一次
-   并真正落决定（`legacy` 在那里不受影响，照常参与）。之所以多出这一次提前查询，
-   是为了不为一个最终仍会被拒绝的零银河用户签发问数 MCP 令牌、创建带凭据的用户
-   环境——理由与取舍见 ``onboarding_runner.py`` 该方法自己的文档字符串，本模块
-   不重复。
+   它在 ``aggregate.granted`` 为假时提前查一次**本地覆盖**（``galaxy={}``），只为
+   回答"要不要继续往下走"，不结算发布行；`_publish` 随后仍然会用同一个函数再算
+   一次并真正落决定。之所以多出这一次提前查询，是为了不为一个最终仍会被拒绝的
+   零银河用户签发问数 MCP 令牌、创建带凭据的用户环境——理由与取舍见
+   ``onboarding_runner.py`` 该方法自己的文档字符串，本模块不重复。
 
 ## 调用时机：``aggregate.granted`` 不再是本函数被调用的前提条件（PM 2026-08-29 裁定，Issue #419）
 
@@ -93,8 +97,8 @@ AutoOnboardingRunner._publish`` 都曾经把 ``aggregate.granted`` 当作"要不
 "``aggregate.granted`` 为假时改传 ``galaxy={}`` 继续调用本函数"的分支——本函数
 自身**一行代码都没有变**：它从 S-P-3 起就把 ``galaxy`` 参数放宽成语义无关的
 ``Mapping[str, Sequence[str]]``，``{}`` 只是这个类型的一个普通空值，走的仍然是
-非通配分支的既有代数（`keys = set(galaxy_map) | set(local_grants) | set(legacy_map)`
-在 ``galaxy_map`` 为空时天然只剩本地授权与存量沿用的键）。这正是当初"签名放宽到
+非通配分支的既有代数（`keys = set(galaxy_map) | set(local_grants)`
+在 ``galaxy_map`` 为空时天然只剩本地授权的键）。这正是当初"签名放宽到
 语义无关"这个取舍的红利：上游多出一种新的合法输入形状，下游纯函数不需要跟着改一
 个字符。
 
@@ -120,14 +124,6 @@ AutoOnboardingRunner._publish`` 都曾经把 ``aggregate.granted`` 当作"要不
 只把"为什么被跳过"作为事实告诉调用方（:attr:`MergedPermissionSources.skipped_reasons`），
 由调用方决定用什么审计事件名记下来（两个调用点各自的动作名不同，命名姿态相同，
 见两处调用点模块文档）。
-
-``legacy``（存量沿用）在通配下同一条理由，同样不参与合并——即便本卡不接线任何
-真实的 ``legacy`` 数据源（见下）。**2026-08-30 之后**：这条不参与的结论只对本节
-描述的这一支（``full_access_wildcard=True``，函数默认值，向后兼容）继续成立；
-「通配角 v2」新增的另一支（``full_access_wildcard=False``）同样不接 ``legacy``
-参与合并——不是因为同一条"拦不住"的理由，而是本卡（#440）范围明确只覆盖本地
-``grant``/``suppress`` 两个源，``legacy`` 是否要在有限指标通配下参与是留给
-``legacy_source.py`` 退役工作（`Issue #441`）或后续裁定的开放问题，本卡不抢跑。
 
 ## 通配角 v2：区分「真全指标通配」与「有限指标通配」（Issue #440，2026-08-30 修复）
 
@@ -188,17 +184,6 @@ publish_row.aggregate_permission` 让 ``all_companies`` 为真的条件是
   变化，也不登记这个理由码——因为在有限指标形态下，"清单外的指标不能被补授"
   这个假设本身就是错的，登记"冗余"会重新暗示这个假设成立）。
 
-## ``legacy`` 参数：本卡只定签名，不接数据源
-
-`Issue #319` 的存量迁移（把旧系统已经生效的权限「沿用」进来）是 S-P-2 批二的范围，
-不在本卡。这里提前定死签名（``Mapping[str, Sequence[str]] | None``，默认 ``None``），
-避免 S-P-2 落地时需要改这个纯函数的对外签名、牵连两个已经接好线的调用点。``None``
-时对结果**恒等**（不参与任何键、不影响任何值）——见 ``tests/test_permission_merge_sources.py``
-的 ``LegacyIdentityTests``。非通配、非 ``None`` 时的合并规则与本地授权对称：
-参与并集，**不参与抑制**（``legacy`` 没有"抑制"概念——它只是"这个键本来就该在"，
-被本地抑制命中同样会被减掉，因为减法作用于并集之后的结果，与这个键是从银河、本地
-授权还是存量沿用来的无关）。
-
 ## 空结果：合并后某个公司的值集合被抑制到空时**丢弃这个键**，不写空列表
 
 与 :func:`~lingxi.core.permission.publish_row.serialize_translated_permissions` 现有
@@ -247,7 +232,7 @@ REASON_LOCAL_OVERRIDE_READ_FAILED = "local_override_read_failed"
 
 @dataclass(frozen=True)
 class MergedPermissionSources:
-    """一次四源合并的结果：最终权限映射 + 为什么某些输入被跳过。
+    """一次两源合并的结果：最终权限映射 + 为什么某些输入被跳过。
 
     :attr:`skipped_reasons` 只在**真全指标通配**（``full_access_wildcard=True``，
     默认值）生效时非空（本地授权/抑制因为通配而被整体跳过，见模块文档「通配角
@@ -267,10 +252,9 @@ def merge_permission_sources(
     *,
     galaxy: Mapping[str, Sequence[str]],
     local: ResolvedLocalOverrides | None,
-    legacy: Mapping[str, Sequence[str]] | None = None,
     full_access_wildcard: bool = True,
 ) -> MergedPermissionSources:
-    """真实权限 ``= (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制``。
+    """真实权限 ``= (银河 ∪ 本地授权) − 本地抑制``。
 
     ``galaxy``：银河这一侧已经算好的 ``{公司ID 或 "*"：值字符串列表}``——`#346` 之后
     两个调用点都传入 :func:`~lingxi.core.permission.metric_translation.
@@ -282,10 +266,7 @@ def merge_permission_sources(
     ``local``：:func:`~lingxi.core.permission.local_override.resolve_local_overrides`
     的结果，``None`` 表示"这一轮本地源不参与"（store 未装配、或读取失败后调用方
     降级传入）——对结果**恒等**：产出与 ``galaxy`` 逐字节相同（键集合与值集合都
-    只由 ``galaxy``/``legacy`` 决定）。
-
-    ``legacy``：本卡只定签名、不接数据源（S-P-2 批二接线），默认 ``None``，恒等，
-    详见模块文档。
+    只由 ``galaxy`` 决定）。
 
     ``full_access_wildcard``：``galaxy`` 出现 :data:`ALL_COMPANIES_KEY` 键时，这个
     通配到底是「真全指标通配」（默认 ``True``，`V-权限-14` 银河后台管理员）还是
@@ -296,7 +277,7 @@ def merge_permission_sources(
     参数无效果。
 
     **通配角 v1**（``full_access_wildcard=True``，默认值，向后兼容）：``local``
-    （与 ``legacy``）整体不参与合并，产出与 ``galaxy`` 逐字节相同；
+    整体不参与合并，产出与 ``galaxy`` 逐字节相同；
     :attr:`MergedPermissionSources.skipped_reasons` 按"``local`` 是否带着非空
     授权/抑制"分别登记
     :data:`REASON_GRANT_REDUNDANT_WILDCARD`/:data:`REASON_SUPPRESS_INAPPLICABLE_WILDCARD`。
@@ -307,11 +288,9 @@ def merge_permission_sources(
     键，**不产出任何具体公司键**（防窄化回归，见模块文档）；``skipped_reasons``
     恒为空元组——两个理由码字面量在这一支代码里不出现，`Issue #440` 修正的正是
     "有限指标 ``*`` 用户的补授被打上 ``grant_redundant_wildcard``" 这个误判。
-    ``legacy`` 在这一支同样不参与（本卡范围只覆盖本地授权/抑制两个源，见模块
-    文档）。
 
-    **非通配**：结果键集合 = ``galaxy`` 键 ∪ 本地授权命中的公司键 ∪ ``legacy`` 键。
-    每个键的值 = ``(galaxy[key] ∪ 本地授权[key] ∪ legacy[key]) − 本地抑制[key]``
+    **非通配**：结果键集合 = ``galaxy`` 键 ∪ 本地授权命中的公司键。
+    每个键的值 = ``(galaxy[key] ∪ 本地授权[key]) − 本地抑制[key]``
     （缺席一律按空集合处理），按字符串排序去重成 ``tuple``。**减到空集合的键会被
     丢弃**，不产出空列表——理由与"为什么不产出空列表不违反读侧语义"见模块文档
     「空结果」一节。
@@ -350,18 +329,11 @@ def merge_permission_sources(
 
     local_grants = to_company_metric_map(local.grants) if local is not None else {}
     local_suppressions = to_company_metric_map(local.suppressions) if local is not None else {}
-    legacy_map: dict[str, tuple[str, ...]] = {
-        key: tuple(values) for key, values in (legacy or {}).items()
-    }
 
-    keys = set(galaxy_map) | set(local_grants) | set(legacy_map)
+    keys = set(galaxy_map) | set(local_grants)
     merged: dict[str, tuple[str, ...]] = {}
     for key in keys:
-        values = (
-            set(galaxy_map.get(key, ()))
-            | set(local_grants.get(key, ()))
-            | set(legacy_map.get(key, ()))
-        )
+        values = set(galaxy_map.get(key, ())) | set(local_grants.get(key, ()))
         values -= set(local_suppressions.get(key, ()))
         if values:
             merged[key] = tuple(sorted(values))
