@@ -117,6 +117,25 @@ _QUERY_STEP_ACTION_TEXT_KEYS: dict[str, str] = {
     QUERY_STEP_QUERY_METRIC: "worker.action.querying_query_metric",
 }
 
+# 历史行的完成时措辞（Trace #469 S-1 TOP-9）：与上面 `_QUERY_STEP_ACTION_TEXT_
+# KEYS` 一一对应的"已..."变体，供 `_render_step_line(completed=True)` 选用——
+# 累积列表里除最后一行外，全部行代表"已经翻篇的步骤"，不该继续用"正在..."
+# 这类现在时措辞。
+_QUERY_STEP_ACTION_TEXT_KEYS_DONE: dict[str, str] = {
+    QUERY_STEP_LIST_METRICS: "worker.action.querying_list_metrics_done",
+    QUERY_STEP_DESCRIBE_METRIC: "worker.action.querying_describe_metric_done",
+    QUERY_STEP_SEARCH_DIMENSION: "worker.action.querying_search_dimension_done",
+    QUERY_STEP_QUERY_METRIC: "worker.action.querying_query_metric_done",
+}
+
+# 非查询类动作的完成时措辞（同上一条注释）。
+_ACTION_DONE_TEXT_KEYS: dict[str, str] = {
+    PROGRESS_ACTION_PROCESSING: "worker.action.processing_done",
+    PROGRESS_ACTION_COMPOSING: "worker.action.composing_done",
+    PROGRESS_ACTION_WORKING: "worker.action.working_done",
+}
+_DEFAULT_QUERYING_DONE_TEXT_KEY = "worker.action.querying_metrics_done"
+
 # 静态防回归（P2 顺手，独立审查）：`encode_progress_action` 编码出的
 # `PROGRESS_ACTION_QUERYING` 形态（``"querying:<计数>[:<子步骤名>]"``）最终会
 # 落进 ``task_delivery_event.content``，迁移 0075 给这一列的 `progress` 事件
@@ -331,6 +350,23 @@ class CardStreamResult:
 
 
 @dataclass(frozen=True)
+class _StepRecord:
+    """累积列表里的一条原始信号（Trace #469 S-1 TOP-9 重构：此前 ``_step_lines``
+    直接存已经渲染好的字符串，导致"历史行"与"当前行"用的是同一句"正在..."
+    措辞——一旦追加了新行，前一行本该变成"已经发生过的事"，却还停在"正在
+    发生"。改成保留原始信号，交给 :meth:`CardStream._accumulated_status_card`
+    在**每次渲染时**决定"这一行是不是列表里的最后一行"，只有最后一行才用
+    "正在..."的现在时措辞，其余全部改用"已..."的完成时措辞——见
+    :func:`CardStream._render_step_line` 的 ``completed`` 参数。
+    """
+
+    action: str
+    elapsed_seconds: int
+    query_count: int | None = None
+    query_step: str | None = None
+
+
+@dataclass(frozen=True)
 class ProgressStepSnapshot:
     """一条已经持久化的进度信号，按时间顺序重放用来重建卡片正文的累积状态
     （Issue #407 方向 B）。字段与 ``decode_progress_action`` 的返回值加一个
@@ -437,7 +473,7 @@ class CardStream:
         # 持续了多久"，而不是"任务总共跑了多久"，两者在有多个步骤的长任务里
         # 并不相等。resume 重放同样会正确重建这个锚点，因为回放本身就是逐条
         # 调用 ``_accumulate_step``，与实时调用走同一份逻辑。
-        self._step_lines: list[str] = []
+        self._step_records: list[_StepRecord] = []
         self._last_step_identity: tuple[str, int | None, str | None] | None = None
         self._current_step_started_at: int = 0
         for snapshot in initial_progress_history:
@@ -587,27 +623,20 @@ class CardStream:
             identity = (action, query_count, query_step)
         else:
             identity = (action, None, None)
-        is_repeat = bool(self._step_lines) and self._last_step_identity == identity
-        stalled_seconds: int | None = None
-        if is_repeat:
-            duration = max(0, elapsed_seconds - self._current_step_started_at)
-            if duration >= STALL_THRESHOLD_SECONDS:
-                stalled_seconds = duration
-        else:
-            self._current_step_started_at = elapsed_seconds
-        line = self._render_step_line(
+        is_repeat = bool(self._step_records) and self._last_step_identity == identity
+        record = _StepRecord(
             action=action,
             elapsed_seconds=elapsed_seconds,
             query_count=query_count,
             query_step=query_step,
-            stalled_seconds=stalled_seconds,
         )
         if is_repeat:
-            self._step_lines[-1] = line
+            self._step_records[-1] = record
         else:
-            self._step_lines.append(line)
-            if len(self._step_lines) > MAX_ACCUMULATED_STEP_LINES:
-                del self._step_lines[0]
+            self._current_step_started_at = elapsed_seconds
+            self._step_records.append(record)
+            if len(self._step_records) > MAX_ACCUMULATED_STEP_LINES:
+                del self._step_records[0]
         self._last_step_identity = identity
 
     def _accumulated_status_card(self) -> RenderedCard:
@@ -615,9 +644,43 @@ class CardStream:
         方向 B）：正文是"已走过的步骤名"按时间顺序换行追加，飞书官方的流式
         打字机效果天然承担"新行逐字出现"的动态观感，这里只负责让正文本身
         持续变长，不做任何字符级动画模拟。
+
+        **每次调用都重新渲染全部行**（Trace #469 S-1 TOP-9）：只有列表里
+        **最后一行**（当前正在发生的步骤）用"正在..."的现在时措辞，其余
+        历史行一律改用"已..."的完成时措辞——此前 ``_step_lines`` 直接缓存
+        已经渲染好的字符串，一条历史行永远停在它被追加那一刻的现在时措辞，
+        读起来像"过去发生的事現在还在发生"。停滞判定（``STALL_THRESHOLD_
+        SECONDS``）只对最后一行计算——历史行代表"已经翻篇的步骤"，不存在
+        "停滞"这个概念。
         """
 
-        return self._catalog.card("query.status", status="\n".join(self._step_lines))
+        last_index = len(self._step_records) - 1
+        lines: list[str] = []
+        for index, record in enumerate(self._step_records):
+            if index == last_index:
+                duration = max(0, record.elapsed_seconds - self._current_step_started_at)
+                stalled_seconds = duration if duration >= STALL_THRESHOLD_SECONDS else None
+                lines.append(
+                    self._render_step_line(
+                        action=record.action,
+                        elapsed_seconds=record.elapsed_seconds,
+                        query_count=record.query_count,
+                        query_step=record.query_step,
+                        stalled_seconds=stalled_seconds,
+                        completed=False,
+                    )
+                )
+            else:
+                lines.append(
+                    self._render_step_line(
+                        action=record.action,
+                        elapsed_seconds=record.elapsed_seconds,
+                        query_count=record.query_count,
+                        query_step=record.query_step,
+                        completed=True,
+                    )
+                )
+        return self._catalog.card("query.status", status="\n".join(lines))
 
     def _emit_handoff_notice(self) -> None:
         """接近 G-CARD 10 分钟自动关闭阈值时的最后一帧卡片更新（Issue #407）。
@@ -669,18 +732,27 @@ class CardStream:
         if self._card_id is None or self._fallback_needed:
             return
         if failure is None:
-            body = result or self._catalog.card("query.empty").body
-            completed = self._catalog.text(
-                "worker.status",
-                action=self._catalog.text("worker.action.completed").text,
-                elapsed_seconds=max(0, elapsed_seconds),
-            ).text
-            body = f"{completed}\n{body}"
-            # `result` 是模型生成的终态正文（Issue #322）：worker 出口安全
-            # （`constrain_output`/`redact_free_text`）已经做过协议泄漏与凭据
-            # 净化，这里的目录校验只再保留协议泄漏这一道，不能再用为固定模板
-            # 设计的自然语言词表（「还需/权限不足」等）拦截模型的日常措辞。
-            card = self._catalog.card("query.result", result=body, contains_model_text=True)
+            if result:
+                completed = self._catalog.text(
+                    "worker.status",
+                    action=self._catalog.text("worker.action.completed").text,
+                    elapsed_seconds=max(0, elapsed_seconds),
+                ).text
+                body = f"{completed}\n{result}"
+                # `result` 是模型生成的终态正文（Issue #322）：worker 出口安全
+                # （`constrain_output`/`redact_free_text`）已经做过协议泄漏与
+                # 凭据净化，这里的目录校验只再保留协议泄漏这一道，不能再用为
+                # 固定模板设计的自然语言词表（「还需/权限不足」等）拦截模型的
+                # 日常措辞。
+                card = self._catalog.card("query.result", result=body, contains_model_text=True)
+            else:
+                # Trace #469 S-1 TOP-9：此前这里也会先拼一行"已完成 · N 秒"，
+                # 再换行拼 `query.empty` 卡的固定正文"本次未取得可用结果。"——
+                # 两行紧挨着读像自相矛盾（"已完成"暗示成功，紧接着又说"没有
+                # 结果"）。改成 `query.empty` 卡自己的模板一次性把两件事说成
+                # 一句连贯的话（见 content.toml 该卡片的 body 模板），不再由
+                # 这里分两行拼接。
+                card = self._catalog.card("query.empty", elapsed_seconds=max(0, elapsed_seconds))
         else:
             # `failure.text` 可能是我们自己的固定失败文案，也可能是 STOPPED
             # 终态携带的模型残余正文（`worker.stopped_result`，同样已经在
@@ -761,9 +833,19 @@ class CardStream:
         query_count: int | None = None,
         query_step: str | None = None,
         stalled_seconds: int | None = None,
+        completed: bool = False,
     ) -> str:
         """按语义化进度动作码选文案，渲染成累积列表里的一行（Issue #321 方向
-        C；Issue #407 增粒度／方向 B；Issue #444 停滞明示）。
+        C；Issue #407 增粒度／方向 B；Issue #444 停滞明示；Trace #469 S-1
+        TOP-9 历史行改完成时措辞）。
+
+        ``completed``——``True`` 时选用"已..."的完成时措辞（
+        :data:`_ACTION_DONE_TEXT_KEYS`/:data:`_QUERY_STEP_ACTION_TEXT_KEYS_DONE`），
+        供 :meth:`CardStream._accumulated_status_card` 渲染"已经翻篇的历史
+        步骤"；``False``（默认）时保留既有"正在..."现在时措辞，只用于列表里
+        最后一行（当前正在发生的步骤）。``stalled_seconds`` 与 ``completed=True``
+        不会同时出现——停滞是"当前步骤"才有意义的判断，调用方（
+        ``_accumulated_status_card``）只对最后一行计算 ``stalled_seconds``。
 
         ``query_count`` 缺失（``None``）时 ``querying`` 退化为默认 ``processing``
         文案而不是抛错或渲染出一句缺占位符的残句——这只可能发生在
@@ -789,14 +871,22 @@ class CardStream:
         if action == PROGRESS_ACTION_COMPLETED:
             action_text = self._catalog.text("worker.action.completed").text
         elif action == PROGRESS_ACTION_QUERYING and query_count is not None:
-            text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(query_step, "worker.action.querying_metrics")
+            if completed:
+                text_key = _QUERY_STEP_ACTION_TEXT_KEYS_DONE.get(
+                    query_step, _DEFAULT_QUERYING_DONE_TEXT_KEY
+                )
+            else:
+                text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(query_step, "worker.action.querying_metrics")
             action_text = self._catalog.text(text_key, count=query_count).text
         elif action == PROGRESS_ACTION_COMPOSING:
-            action_text = self._catalog.text("worker.action.composing").text
+            key = "worker.action.composing_done" if completed else "worker.action.composing"
+            action_text = self._catalog.text(key).text
         elif action == PROGRESS_ACTION_WORKING:
-            action_text = self._catalog.text("worker.action.working").text
+            key = "worker.action.working_done" if completed else "worker.action.working"
+            action_text = self._catalog.text(key).text
         else:
-            action_text = self._catalog.text("worker.action.processing").text
+            key = "worker.action.processing_done" if completed else "worker.action.processing"
+            action_text = self._catalog.text(key).text
         if stalled_seconds is not None:
             return self._catalog.text(
                 "worker.status_stalled", action=action_text, stalled_seconds=stalled_seconds

@@ -232,6 +232,10 @@ class CardStreamTests(unittest.TestCase):
 
         Issue #407 方向 B：卡片正文现在是"已走过的步骤名"追加式列表，第二次
         更新的正文必须仍然包含第一次那一行（不是被替换掉），断言同步覆盖这一点。
+
+        Trace #469 S-1 TOP-9：第一行在追加第二行之后从"正在..."现在时改为
+        "已完成..."完成时——它已经不是"当前正在发生的步骤"，只有列表最后一行
+        才用现在时措辞。
         """
 
         now = [0.0]
@@ -256,8 +260,8 @@ class CardStreamTests(unittest.TestCase):
         self.assertEqual(cards.bodies[-2], "正在第 3 次查询指标数据 · 5 秒")
         self.assertEqual(
             cards.bodies[-1],
-            "正在第 3 次查询指标数据 · 5 秒\n正在整理与生成回答 · 9 秒",
-            "第二次更新必须追加新行，不能把第一行的历史挤掉",
+            "已完成第 3 次查询指标数据 · 5 秒\n正在整理与生成回答 · 9 秒",
+            "第二次更新必须追加新行，不能把第一行的历史挤掉；已经翻篇的第一行改用完成时措辞",
         )
         for body in cards.bodies:
             self.assertNotIn("mcp__", body)
@@ -288,6 +292,11 @@ class CardStreamTests(unittest.TestCase):
         """Issue #407 方向 A：四个已知问数查询子步骤各自选到不同的文案，覆盖
         「工具名→用户语文案」白名单式映射表的正例分支。Issue #407 方向 B：
         每次更新都追加一行，最终正文是四行都在的累积列表，不是只剩最新一行。
+
+        Trace #469 S-1 TOP-9：只有**当前追加的这一行**（列表最后一行）用
+        "正在..."现在时措辞，此前已经追加过的历史行改用"已完成..."完成时
+        措辞——``expected_current``/``expected_done`` 因此分别维护现在时/
+        完成时两种文案，按"是不是当前最后一行"选用。
         """
 
         now = [0.0]
@@ -303,11 +312,17 @@ class CardStreamTests(unittest.TestCase):
             rate_limiter=CardRateLimiter(),
         )
         stream.start()
-        expected_lines = [
+        expected_current = [
             "正在第 1 次查询可用指标列表 · 1 秒",
             "正在第 2 次查询指标说明 · 1 秒",
             "正在第 3 次查询维度信息 · 1 秒",
             "正在第 4 次查询指标数据 · 1 秒",
+        ]
+        expected_done = [
+            "已完成第 1 次查询可用指标列表 · 1 秒",
+            "已完成第 2 次查询指标说明 · 1 秒",
+            "已完成第 3 次查询维度信息 · 1 秒",
+            "已完成第 4 次查询指标数据 · 1 秒",
         ]
         steps = ["list_metrics", "describe_metric", "search_dimension", "query_metric"]
         for index, step in enumerate(steps, start=1):
@@ -316,10 +331,11 @@ class CardStreamTests(unittest.TestCase):
                 elapsed_seconds=1, action=PROGRESS_ACTION_QUERYING, query_count=index, query_step=step
             )
             with self.subTest(step=step):
-                self.assertEqual(cards.bodies[-1], "\n".join(expected_lines[:index]))
+                expected_lines = expected_done[: index - 1] + [expected_current[index - 1]]
+                self.assertEqual(cards.bodies[-1], "\n".join(expected_lines))
         # 全部各不相同——四种子步骤确实映射到四句不同的文案，不是巧合地都落回
         # 同一句通用文案。
-        self.assertEqual(len(set(expected_lines)), 4)
+        self.assertEqual(len(set(expected_current)), 4)
 
     def test_the_longest_known_query_step_encoding_stays_within_the_32_byte_contract(
         self,
@@ -466,6 +482,12 @@ class CardStreamTests(unittest.TestCase):
         """Issue #444 关卡条件：停滞明示之后，一旦出现真正的新信号（换了一枚
         不同的步骤身份），必须"恢复后正常续进"——新的一行用常规措辞、不再带
         停滞后缀，且此前的停滞行仍然保留在累积历史里，不因为恢复而被抹掉。
+
+        Trace #469 S-1 TOP-9：此前的停滞行不再是列表最后一行，改用完成时
+        措辞展示——"已完成第 N 次查询..."不再适用停滞语义（停滞是"当前仍在
+        发生、迟迟没有新进展"，一旦翻篇成历史行，"是否曾经停滞过"这件事不再
+        需要继续提醒），因此完成时措辞就是普通的"已完成第 1 次查询可用指标
+        列表"，不带"（已 N 秒无新进展）"后缀。
         """
 
         now = [0.0]
@@ -495,8 +517,9 @@ class CardStreamTests(unittest.TestCase):
 
         self.assertEqual(
             cards.bodies[-1],
-            "正在第 1 次查询可用指标列表（已 25 秒无新进展）\n正在整理与生成回答 · 28 秒",
-            "恢复后的新一行必须是常规措辞，且此前的停滞行不能被抹掉",
+            "已完成第 1 次查询可用指标列表 · 27 秒\n正在整理与生成回答 · 28 秒",
+            "恢复后的新一行必须是常规措辞，且此前的停滞行不能被抹掉"
+            "（翻篇成历史行后改用完成时措辞，不再带停滞后缀）",
         )
 
     def test_resume_replays_a_stalled_history_and_preserves_the_stalled_wording(

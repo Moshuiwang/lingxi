@@ -182,7 +182,7 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(catalog.card("query.status", status="处理中").title, "正在查询")
         self.assertEqual(catalog.card("query.result", result="结果").title, "查询完成")
         self.assertEqual(catalog.card("query.failure", message="失败").title, "查询未完成")
-        self.assertEqual(catalog.card("query.empty").title, "查询完成")
+        self.assertEqual(catalog.card("query.empty", elapsed_seconds=1).title, "查询完成")
 
     def test_placeholder_variables_must_match_in_both_directions(self) -> None:
         catalog = default_content_catalog()
