@@ -198,12 +198,19 @@ class FakeTransaction:
         log: CallLog,
         *,
         fail_on: str | None = None,
+        fail_error: Exception | None = None,
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
         self._fail_on = fail_on
+        # 默认注入一个内容不带外部标识的通用 RuntimeError；``fail_error``
+        # （Issue #469 opus 独立审查 P2-5）在用例需要断言"审计不含异常正文里的
+        # 外部标识原值"时，替换成一个携带真实驱动异常常见形状（例如 psycopg 的
+        # `DETAIL: Key (...)=(...)` 串）的自定义异常——与 ``FakeReactions``/
+        # ``FakeReplies`` 的既有 ``fail_with`` 同一惯例。
+        self._fail_error = fail_error
         # Issue #175 P2-1：注入「busy 快照读到空闲，但 clear_agent_session 真正写入
         # 时已经影响 0 行」的竞态，不依赖真实并发线程调度。``None`` 时走原有的按
         # staged_claims/running_task_id 计算的语义，与真库条件更新同构。
@@ -222,7 +229,9 @@ class FakeTransaction:
 
     def _maybe_fail(self, step: str) -> None:
         if self._fail_on == step:
-            raise RuntimeError(f"注入失败：{step}")
+            raise self._fail_error if self._fail_error is not None else RuntimeError(
+                f"注入失败：{step}"
+            )
 
     def insert_inbound_event(
         self, *, event_id: str, event_type: str, user_open_id: str, trace_id: str
@@ -424,12 +433,14 @@ class FakeStore:
         log: CallLog,
         *,
         fail_on: str | None = None,
+        fail_error: Exception | None = None,
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
         self._fail_on = fail_on
+        self._fail_error = fail_error
         self._force_clear_agent_session_result = force_clear_agent_session_result
         self._force_claim_conversation_result = force_claim_conversation_result
 
@@ -513,6 +524,7 @@ class FakeStore:
             self._state,
             self._log,
             fail_on=self._fail_on,
+            fail_error=self._fail_error,
             force_clear_agent_session_result=self._force_clear_agent_session_result,
             force_claim_conversation_result=self._force_claim_conversation_result,
         )
