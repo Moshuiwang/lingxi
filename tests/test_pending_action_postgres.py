@@ -925,6 +925,48 @@ class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
         )[0][0]
         self.assertEqual(stale_status, "expired")
 
+    def test_lazy_expiry_is_audited_with_the_flipped_rows_identity(self) -> None:
+        """opus 审查坐实并修复：懒清扫真的翻转一行时必须留痕，与 confirm()/
+        cancel() 每次状态改变都记一条审计的既有纪律对齐——此前这一步完全没有
+        任何审计。"""
+
+        self.add_target_user(account_state="enabled")
+        stale_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self._expire_pending_row(stale_id)
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertTrue(outcome.decision.ok, outcome.decision.message)
+        [fields] = [
+            fields
+            for action, fields in self.audit.records
+            if action == "admin.pending_action.lazily_expired"
+        ]
+        self.assertEqual(fields["pending_action_id"], stale_id, "必须点名被翻转的是旧行，不是新行")
+        self.assertEqual(fields["target"], TARGET_OPEN_ID)
+        self.assertEqual(fields["triggered_by"], ADMIN_OPEN_ID)
+
+    def test_no_flip_means_no_lazy_expiry_audit(self) -> None:
+        """否定断言：``rowcount == 0``（没有过期行可翻）时不得凭空记一条审计。"""
+
+        self.add_target_user(account_state="enabled")
+        self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertNotIn(
+            "admin.pending_action.lazily_expired",
+            [action for action, _ in self.audit.records],
+        )
+
     def test_two_concurrent_prepares_against_an_expired_row_only_one_creates_a_new_pending_row(
         self,
     ) -> None:

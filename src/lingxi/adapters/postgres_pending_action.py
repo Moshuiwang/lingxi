@@ -289,6 +289,7 @@ class PostgresPendingActionStore:
         metric_name: str | None = None,
         reason: str | None = None,
         now: datetime | None = None,
+        trace_id: str | None = None,
     ) -> PrepareOutcome:
         """读目标当前状态、判定是否可以发起，通过则插入一行 ``pending`` 记录
         （``card_delivered=FALSE``，调用方随后发卡片，成功再调用
@@ -299,7 +300,18 @@ class PostgresPendingActionStore:
         见模块文档「懒清扫兜底」一节。仍然撞上同目标在途唯一索引时，拒绝文案携带
         这条在途操作的摘要（动作/发起时间/截止时间）与自助指引（已过期会自动
         释放/未过期请先处理旧卡），见 :func:`~lingxi.core.admin.pending_action.
-        format_in_flight_conflict_message`。
+        format_in_flight_conflict_message`。**真的翻转了一行时补一条
+        ``admin.pending_action.lazily_expired`` 审计**（opus 审查坐实并修复：
+        此前这条 UPDATE 真的改了一行状态却完全没有留痕，与 :meth:`confirm`/
+        :meth:`cancel` 每次状态改变都记一条 ``admin.pending_action.*`` 审计的
+        既有纪律不对称）——``target``/``triggered_by`` 分别是被清掉那一行的
+        目标与触发这次懒清扫的**这次新** ``prepare()`` 调用的发起人（不是被
+        清掉那一行自己的原发起人，那个信息已经在 ``pending_action`` 表里，不
+        重复搬进审计字段）。``trace_id`` 形参当前没有真实生产调用方传入
+        （``core/admin/router.py::_dispatch_write_action`` 调用 ``prepare()``
+        时还没有把它的 trace_id 传进来，这条接线不在本次修复的分域范围内），
+        因此审计里这个字段目前恒为 ``None``——本参数已经就位，接线打通后不需要
+        再改这个方法一次。
 
         ``company_id``/``metric_name``/``reason`` 三个参数只有
         ``action_type in LOCAL_PERMISSION_ACTION_TYPES``（授权/抑制/收回）时才会
@@ -443,9 +455,24 @@ class PostgresPendingActionStore:
                            SET status = 'expired', reason = 'expired', decided_at = %s
                          WHERE target_open_id = %s AND status = 'pending'
                            AND confirm_deadline_at <= %s
+                        RETURNING id
                         """,
                         (moment, resolved_target_open_id, moment),
                     )
+                    if cursor.rowcount == 1:
+                        # 真的翻转了一行——按方法文档「懒清扫兜底」一节补一条
+                        # 可分辨审计，与 confirm()/cancel() 的既有姿态对齐
+                        # （opus 审查坐实并修复：此前这一步完全没有留痕）。
+                        # `rowcount == 1` 是上面注释里"同一目标同一时刻至多一条
+                        # pending 行"这条既有不变量的直接推论，不是新增假设。
+                        (expired_pending_action_id,) = cursor.fetchone()
+                        self._audit.record(
+                            "admin.pending_action.lazily_expired",
+                            pending_action_id=expired_pending_action_id,
+                            target=resolved_target_open_id,
+                            triggered_by=initiated_by_open_id,
+                            trace_id=trace_id,
+                        )
 
                     # 嵌套事务块 = psycopg 的 SAVEPOINT：撞上迁移 0068 的同目标在途
                     # 唯一索引时，只回滚这条 INSERT 本身，外层事务（上面的懒清扫
