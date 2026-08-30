@@ -231,6 +231,44 @@ class ThreeEnvelopeShapeTests(unittest.TestCase):
 
         self.assertEqual(result.action_value, {})
 
+    def test_a_deeply_nested_json_string_does_not_escape_as_unhandled_error(self) -> None:
+        """加固（Issue #469 rc22 codex 外审第 1 轮）：伪造回调把 ``action.value``
+        塞成深层嵌套 JSON（``[[[…]]]``），``json.loads`` 抛的是 ``RecursionError``
+        （``RuntimeError`` 子类，不是 ``ValueError``）。修复前它逃出
+        ``(TypeError, ValueError)`` 捕获、被上层当成未处理异常，一条伪造回调即可
+        变成可重复的 gateway 可用性攻击；修复后按"不可用"降级、继续走 form_value
+        兜底或下游拒绝，**绝不抛未处理异常**。"""
+
+        deep = "[" * 20000 + "0" + "]" * 20000
+        payload = _form_submit_payload(
+            action_value=deep,
+            form_value={"company_id": "1011", "metric_name": "sub_new_count", "reason": "特批"},
+        )
+
+        # 不抛任何异常（尤其不是 RecursionError）：畸形 value 降级为不可用，
+        # 事件仍由 form_value 兜底构造。
+        result = parse_card_action_event(payload)
+
+        self.assertEqual(result.action_value, {})
+        self.assertEqual(result.form_value["company_id"], "1011")
+
+    def test_an_oversized_string_value_is_rejected_before_parsing(self) -> None:
+        """超过长度上限的 ``action.value`` 字符串在 ``json.loads`` 之前即按不可用
+        丢弃——挡住"塞一大段畸形 JSON"这类可用性攻击，正常几百字节的真实回调不
+        受影响。"""
+
+        oversized = json.dumps({"admin_action": "grant", "pad": "x" * 9000})
+        payload = _form_submit_payload(
+            action_value=oversized,
+            form_value={"company_id": "1011", "metric_name": "sub_new_count", "reason": "特批"},
+        )
+
+        result = parse_card_action_event(payload)
+
+        # 超限直接不采纳 value（即便它本身是合法 JSON），改由 form_value 兜底。
+        self.assertEqual(result.action_value, {})
+        self.assertEqual(result.form_value["company_id"], "1011")
+
     def test_neither_value_nor_form_value_usable_still_rejects(self) -> None:
         """反伪造姿态不放宽：两者都没有可用内容时仍然失败关闭。"""
 

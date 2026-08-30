@@ -266,6 +266,14 @@ def _stringify_scalars(mapping: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+# ``action.value`` 是字符串形态时允许的最大字节数。真实表单回调里 value 只装
+# render 建卡时写进去的少量标量键（admin_action/identifier/override_id 一类），
+# 正常在几百字节内；给一个宽松但有限的上限，专门挡住"伪造回调塞一大段畸形
+# JSON"这类可用性攻击（Issue #469 rc22 codex 外审第 1 轮抓到：深层嵌套 JSON 会
+# 触发 RecursionError，逃出下面的解析捕获升级成 gateway 未处理异常）。
+_MAX_ACTION_VALUE_JSON_BYTES = 8192
+
+
 def _parse_action_value(raw_value: object) -> Mapping[str, Any] | None:
     """把 ``action.value`` 解析成 Mapping；三种到达形态兼容（W0-1 追加结论，
     2026-08-30，真实点击实测坐实）：
@@ -280,14 +288,23 @@ def _parse_action_value(raw_value: object) -> Mapping[str, Any] | None:
     表单提交回调实测到的字符串/缺失形态不一致——按"文档不明处以真实行为为准"
     处理，本函数因此比文档描述更宽松，不因为文档只写了一种形态就拒绝其余两种
     真实观察到的形态。
+
+    **加固（Issue #469 rc22 codex 外审第 1 轮）**：字符串形态先卡长度上限，再
+    ``json.loads``；捕获面从 ``(TypeError, ValueError)`` 扩到并含
+    ``RecursionError``——深层嵌套 JSON（``[[[…]]]``）抛的是 ``RecursionError``
+    （``RuntimeError`` 子类，不是 ``ValueError``），此前会逃出捕获、被上层当成
+    代码 bug 型未处理异常，让一条伪造回调升级成可重复的 gateway 可用性攻击。
+    任何解析失败一律按"不可用"返回 ``None``，与其余畸形形态同一失败关闭姿态。
     """
 
     if isinstance(raw_value, Mapping):
         return raw_value
     if isinstance(raw_value, str):
+        if len(raw_value.encode("utf-8")) > _MAX_ACTION_VALUE_JSON_BYTES:
+            return None
         try:
             parsed = json.loads(raw_value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             return None
         return parsed if isinstance(parsed, Mapping) else None
     return None
