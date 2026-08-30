@@ -655,6 +655,38 @@ class ManagementCardSendTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertEqual(len(cards.calls), 1)
         self.assertEqual(cards.calls[0]["display_identifier"], "ou_target")
+
+    def test_admin_user_with_an_email_identifier_resolves_and_sends_the_management_card(
+        self,
+    ) -> None:
+        """自证闭环条款的完整受控注入场景：``/admin user <邮箱>`` 一次调用里
+        同时验证①标识按邮箱正确反查、②管理卡确实调出（发送）、③卡片收到的
+        ``status`` 就是反查后拿到的那份真实状态——三件事在同一次 ``route()``
+        调用里一起成立，不是三个互不相关的独立断言拼出来的假象。"""
+
+        status = self._status()
+        cards = FakeManagementCards()
+        queries = FakeQueries(
+            users={"ou_target": status},
+            identifier_aliases={"admin-user-test@example.com": "ou_target"},
+        )
+        router, _, _, _ = _router(queries=queries, management_cards=cards)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user admin-user-test@example.com",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("admin-user-test@example.com", outcome.reply_text)
+        self.assertEqual(len(cards.calls), 1)
+        self.assertEqual(cards.calls[0]["display_identifier"], "admin-user-test@example.com")
+        self.assertIs(cards.calls[0]["status"], status)
+        self.assertEqual(cards.calls[0]["reply_to_message_id"], "om_1")
         self.assertEqual(cards.calls[0]["reply_to_message_id"], "om_1")
         self.assertEqual(cards.calls[0]["chat_id"], "oc_1")
 
