@@ -288,6 +288,55 @@ class CardStreamTests(unittest.TestCase):
 
         self.assertEqual(cards.bodies[-1], "正在处理其它步骤 · 4 秒")
 
+    def test_composing_working_and_processing_historical_lines_use_the_shared_done_text_table(
+        self,
+    ) -> None:
+        """B-4（Trace #469 修复包 B）：composing/working/默认(processing) 三类
+        动作翻篇成历史行时，改走 ``_ACTION_DONE_TEXT_KEYS`` 这张此前定义了却
+        从未被引用的映射表选文案，取值与改动前的内联字面量逐字节相同——本
+        用例钉住三种"翻篇成历史行"的渲染文本，防止未来改表内容时悄悄改变
+        产品可见文案却没有测试报警。**变异验红**：若把
+        ``_render_step_line`` 里三处查表改回不经过 ``_ACTION_DONE_TEXT_KEYS``
+        的独立字面量拼接，只要拼接结果不变本用例仍然通过——真正验红的是
+        直接删掉/改坏 ``_ACTION_DONE_TEXT_KEYS`` 里任一取值时，因为查表结果
+        变了、渲染文本随之改变而必然被本用例捕获。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+
+        now[0] = 1.0
+        stream.update(elapsed_seconds=2, action=PROGRESS_ACTION_PROCESSING)
+        now[0] = 2.0
+        stream.update(elapsed_seconds=4, action=PROGRESS_ACTION_WORKING)
+        now[0] = 3.0
+        stream.update(elapsed_seconds=6, action=PROGRESS_ACTION_COMPOSING)
+        now[0] = 4.0
+        stream.update(elapsed_seconds=8, action=PROGRESS_ACTION_WORKING)
+
+        self.assertEqual(
+            cards.bodies[-1],
+            "\n".join(
+                [
+                    "已处理 · 2 秒",
+                    "已处理其它步骤 · 4 秒",
+                    "已整理与生成回答 · 6 秒",
+                    "正在处理其它步骤 · 8 秒",
+                ]
+            ),
+        )
+
     def test_each_known_query_step_renders_its_own_mapped_text(self) -> None:
         """Issue #407 方向 A：四个已知问数查询子步骤各自选到不同的文案，覆盖
         「工具名→用户语文案」白名单式映射表的正例分支。Issue #407 方向 B：

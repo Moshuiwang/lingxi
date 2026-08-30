@@ -310,6 +310,25 @@ class AdminCardCallbackHandler:
             return _toast_error("请选择指标")
         if not reason.strip():
             return _toast_error("请填写原因")
+        # 纵深加固（Trace #469 修复包 B，B-2）：上面的"非空"校验挡不住一个
+        # 非空但含空白字符的取值——`str.split()` 按任意空白切分（含全角空格
+        # U+3000，Python `str.isspace()` 同样判它为空白），审查实测
+        # `company_id="1011 sub_new_count"` 能把管理员选的指标静默左移替换掉
+        # （与上面 identifier 为空时同一个根因：拼接前不拦住，下游语法校验
+        # 认不出这类错位）。当前调用点全部来自服务端渲染的下拉选项/受控字段，
+        # 结构上不可达，但值得纵深——不假设未来的调用点也一样受控。三个字段
+        # 分别落回各自既有的拒绝文案，不新造一套措辞。
+        if any(ch.isspace() for ch in identifier):
+            self._audit.record(
+                "admin.card_callback.management_missing_identifier",
+                admin_action=admin_action,
+                trace_id=trace_id,
+            )
+            return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
+        if any(ch.isspace() for ch in company_id):
+            return _toast_error("请选择公司")
+        if any(ch.isspace() for ch in metric_name):
+            return _toast_error("请选择指标")
 
         sub_command = "grant_permission" if admin_action == ADMIN_ACTION_GRANT else "suppress_permission"
         text = f"/admin {sub_command} {identifier} {company_id} {metric_name} {reason.strip()}"

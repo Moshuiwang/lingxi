@@ -48,7 +48,12 @@ class RaisingCatalog:
 
 class FakeDisplayNames:
     """``AdminDisplayNames`` 的内存假实现（Trace #469 S-1）。默认原样透传
-    公司/指标编号（不是需要隐藏的内部标识），可选注入映射覆盖单个值。"""
+    公司/指标编号（不是需要隐藏的内部标识），可选注入映射覆盖单个值。
+
+    批量方法（Trace #469 修复包 B，B-7）就地委托给单个查询——内存假实现没有
+    真实实现要收敛的"每次调用新建连接"这个成本，批量与逐个调用在这里语义
+    完全等价；真正验证"确实只调用了一次批量端口、不再逐项调用"的是
+    ``ConnectionCountingDisplayNames``（见下方）。"""
 
     def __init__(
         self,
@@ -67,6 +72,12 @@ class FakeDisplayNames:
 
     def metric_label(self, *, metric_id: str) -> str:
         return self._metric_labels.get(metric_id, metric_id)
+
+    def company_labels(self, *, company_ids):
+        return {company_id: self.company_label(company_id=company_id) for company_id in company_ids}
+
+    def metric_labels(self, *, metric_ids):
+        return {metric_id: self.metric_label(metric_id=metric_id) for metric_id in metric_ids}
 
 
 def _status(
@@ -492,7 +503,9 @@ class ZeroInternalIdTests(unittest.TestCase):
 
         original = management_card_module._override_row_elements
 
-        def _broken_override_row_elements(override, *, display_identifier, display_names):
+        def _broken_override_row_elements(
+            override, *, display_identifier, company_label_for, metric_label_for
+        ):
             # 模拟"忘记调用 display_names"这一类回归：直接展示原始 ID。
             description = management_card_module._markdown(
                 f"- 公司 {override.company_id} · 指标 {override.metric_name}"
@@ -519,6 +532,105 @@ class ZeroInternalIdTests(unittest.TestCase):
             self.assertNotIn("公司 壹壹测试公司（1011） · 指标 新增订户数", text)
         finally:
             management_card_module._override_row_elements = original
+
+
+class ConnectionCountingDisplayNames:
+    """模拟真实实现连接成本的计数假实现（Trace #469 修复包 B，B-7）：批量
+    方法（``company_labels``/``metric_labels``）与单项方法
+    （``company_label``/``metric_label``）各自记一次调用花费的"连接数"——
+    与真实 ``adapters/admin_registry.PostgresAdminQueries`` 同一数量级
+    （批量整批 2 条连接；单项每次调用也是 2 条连接，且不管一次调用翻译
+    多少个编号，成本都一样是 2——这正是"批量"与"逐项"唯一的可观察差异：
+    调用**次数**，不是每次调用本身的开销）。用于证明渲染函数确实改走了
+    批量端口一次性处理整批编号，而不是对每个编号各自触发一次单项调用。
+    """
+
+    _COST_PER_CALL = 2
+
+    def __init__(
+        self,
+        *,
+        companies: dict[str, str] | None = None,
+        metrics: dict[str, str] | None = None,
+    ) -> None:
+        self._companies = companies or {}
+        self._metrics = metrics or {}
+        self.connection_count = 0
+        self.company_label_calls = 0
+        self.metric_label_calls = 0
+        self.company_labels_calls = 0
+        self.metric_labels_calls = 0
+
+    def user_label(self, *, open_id: str) -> str:
+        return "该用户"
+
+    def company_label(self, *, company_id: str) -> str:
+        self.company_label_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return self._companies.get(company_id, company_id)
+
+    def metric_label(self, *, metric_id: str) -> str:
+        self.metric_label_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return self._metrics.get(metric_id, metric_id)
+
+    def company_labels(self, *, company_ids):
+        self.company_labels_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return {cid: self._companies.get(cid, cid) for cid in company_ids}
+
+    def metric_labels(self, *, metric_ids):
+        self.metric_labels_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return {mid: self._metrics.get(mid, mid) for mid in metric_ids}
+
+
+class ConnectionStormRegressionTests(unittest.TestCase):
+    """Trace #469 修复包 B，B-7：管理卡渲染此前对下拉里每一个公司/指标编号
+    各自调用一次 ``company_label``/``metric_label``——真实实现每次调用都
+    新建两条数据库连接，公司目录当前 43 个编号，一张卡片因此打开约 90 条
+    连接（审查实测坐实）。修复后单次渲染的连接数应当是一个与目录规模无关
+    的常数上界。"""
+
+    def test_a_single_render_stays_within_a_small_connection_budget(self) -> None:
+        display_names = ConnectionCountingDisplayNames(
+            companies={f"c{i}": f"公司{i}" for i in range(40)},
+            metrics={f"m{i}": f"指标{i}" for i in range(9)},
+        )
+        override = LocalPermissionOverrideView(
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            direction="grant",
+            company_id="c0",
+            metric_name="m0",
+            reason="特批",
+            created_at="2026-08-30T00:00:00+00:00",
+        )
+        summary = GalaxySourceSummary(
+            granted=True, reason="granted", companies=("c1", "c2"), functions=("运营",)
+        )
+        catalog = FakeCatalog(
+            companies=[f"c{i}" for i in range(40)], metrics=[f"m{i}" for i in range(9)]
+        )
+
+        render_management_card(
+            _status(local_overrides=(override,), galaxy_source=summary),
+            display_identifier="ou_admin_typed_this",
+            catalog=catalog,
+            display_names=display_names,
+        )
+
+        self.assertLessEqual(
+            display_names.connection_count,
+            5,
+            "一次渲染的连接数应当是与目录规模无关的常数上界（本用例用 40 个"
+            "公司、9 个指标模拟真实 43/9 规模），不应随公司/指标数量线性增长",
+        )
+        # 精确核对：批量端口各自恰好只被调用一次，单项端口一次都没被调用——
+        # 不是"总连接数凑巧够低"，而是真的走了批量姿势。
+        self.assertEqual(display_names.company_labels_calls, 1)
+        self.assertEqual(display_names.metric_labels_calls, 1)
+        self.assertEqual(display_names.company_label_calls, 0)
+        self.assertEqual(display_names.metric_label_calls, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

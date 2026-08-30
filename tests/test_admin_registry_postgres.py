@@ -943,6 +943,65 @@ class DisplayNamesTests(AdminRegistryPostgresTestCase):
 
         self.assertEqual(queries.metric_label(metric_id="not_a_real_metric"), "not_a_real_metric")
 
+    # ---- company_labels/metric_labels（批量，Trace #469 修复包 B，B-7）------
+
+    def test_company_labels_batch_matches_per_item_results_for_every_id(self) -> None:
+        """批量方法必须与逐个调用 ``company_label`` 结果逐项相同——含命中、
+        未命中、以及混合在同一批里的情形，一次真库调用覆盖三种取值。"""
+
+        batch_id = self.insert_current_galaxy_batch()
+        self.add_galaxy_country(
+            batch_id=batch_id, source_id="7", boss_company_id="1011", name_cn="壹壹测试公司"
+        )
+        self.add_galaxy_country(
+            batch_id=batch_id, source_id="8", boss_company_id="1012", name_cn="壹贰测试公司"
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        result = queries.company_labels(company_ids=["1011", "1012", "9999"])
+
+        self.assertEqual(
+            result,
+            {
+                "1011": "壹壹测试公司（1011）",
+                "1012": "壹贰测试公司（1012）",
+                "9999": "9999",
+            },
+        )
+
+    def test_company_labels_without_a_current_batch_falls_back_to_raw_ids(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        result = queries.company_labels(company_ids=["1011", "1012"])
+
+        self.assertEqual(result, {"1011": "1011", "1012": "1012"})
+
+    def test_company_labels_empty_input_returns_empty_mapping_without_querying(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.company_labels(company_ids=[]), {})
+
+    def test_metric_labels_batch_matches_per_item_results_for_every_id(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        result = queries.metric_labels(
+            metric_ids=["sub_new_count", "exchange_rate", "not_a_real_metric"]
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "sub_new_count": "新增订户数",
+                "exchange_rate": "汇率",
+                "not_a_real_metric": "not_a_real_metric",
+            },
+        )
+
+    def test_metric_labels_empty_input_returns_empty_mapping(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.metric_labels(metric_ids=[]), {})
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

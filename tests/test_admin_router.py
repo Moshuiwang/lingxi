@@ -934,6 +934,79 @@ class QueryTraceCommandTests(unittest.TestCase):
 
         self.assertNotIn(secret_open_id, outcome.reply_text)
 
+    def test_known_event_type_handled_as_and_failure_reason_are_humanized(self) -> None:
+        """Trace #469 修复包 B，B-6：已登记的机器码不再直出——事件类型、
+        处理方式、失败原因三项各自换成中文显示名，且不再包含原始机器码
+        字面量（与下面"未登记回退"用例互补：这里验证"认识的"分支，那边
+        验证"不认识的"分支）。"""
+
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="not_provisioned",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason="mcp_sync_timeout",
+                    failure_event_type="onboarding.result",
+                    failure_occurred_at="2026-08-28T01:20:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertIn("用户消息", outcome.reply_text)
+        self.assertNotIn("im.message.receive_v1", outcome.reply_text)
+        self.assertIn("未开通，未受理", outcome.reply_text)
+        self.assertNotIn("not_provisioned", outcome.reply_text)
+        self.assertIn("问数权限同步超时", outcome.reply_text)
+        self.assertNotIn("mcp_sync_timeout", outcome.reply_text)
+
+    def test_unregistered_handled_as_falls_back_to_the_raw_value_with_a_visible_marker(
+        self,
+    ) -> None:
+        """未登记的机器码不能崩、也不能悄悄消失——回退成"原值（未登记显示名）"
+        这个统一样式，管理员至少还能看到原始取值。**变异验红**：把
+        ``_display_or_unregistered`` 里的回退分支改成直接返回空字符串或抛
+        异常，本用例必红。"""
+
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="some_future_value_not_yet_registered",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason=None,
+                    failure_event_type=None,
+                    failure_occurred_at=None,
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertIn(
+            "some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text
+        )
+
     def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
         """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询
         （与既有 `DefaultDenyTests` 同一姿态，本命令专用取证）。"""
@@ -978,6 +1051,34 @@ class QueryAuditCommandTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertIn("没有找到", outcome.reply_text)
+        # Trace #469 修复包 B，B-5：`_render_audit_query` 的标识遮蔽此前无用例
+        # 锁住——审查变异实测去掉 `_safe_identifier_echo` 调用仍全绿。open_id
+        # 形状的标识（`ou_` 前缀）不得原样出现在管理员可见回复里。
+        self.assertNotIn("ou_x", outcome.reply_text)
+
+    def test_open_id_shaped_identifier_is_masked_in_the_events_header_too(self) -> None:
+        """Trace #469 修复包 B，B-5：有事件命中时回复走 header+lines 分支
+        （与"没有找到"分支不同的代码路径），标识遮蔽必须同样生效——两条分支
+        共用同一个 ``scope = f"标识 {_safe_identifier_echo(identifier)} 的"``
+        取值，这里独立锁住有事件分支，防止未来只改了其中一条分支的遮蔽逻辑。
+        **变异验红**：把 ``_render_audit_query`` 里的 ``_safe_identifier_echo(identifier)``
+        换回裸 ``identifier``，本用例必红。"""
+
+        events = [
+            AdminEventView(
+                received_at="2026-08-24T01:00:00+00:00",
+                event_type="im.message.receive_v1",
+                handled_as="not_provisioned",
+                trace_id="trc_abc",
+            )
+        ]
+        router, _, _, _ = _router(queries=FakeQueries(events=events))
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin audit ou_x 48", trace_id="t1")
+
+        self.assertTrue(outcome.handled)
+        self.assertNotIn("ou_x", outcome.reply_text)
+        self.assertIn("该用户", outcome.reply_text)
 
 
 class AuditFailureFailsClosedTests(unittest.TestCase):
@@ -1874,6 +1975,34 @@ class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
         self.assertEqual(pending_actions.prepare_calls, [])
         self.assertEqual(confirm_cards.send_calls, [])
         self.assertEqual(audit.records[-1][1]["code"], "override_not_found")
+
+    def test_unmatched_lookup_reply_points_to_a_reachable_recovery_path(self) -> None:
+        """Trace #469 修复包 B，B-3：此前这句兜底指引说"或改用覆盖ID精确指定
+        撤销"——本批起 ``/admin user`` 不再展示 override_id（Trace #469 S-1，
+        见 ``_render_local_overrides`` 文档），这条路径已经是死路，管理员看到
+        指引也无法照做。修复后必须改指真实可行路径（管理卡逐行「撤销」按钮），
+        且不能再提"覆盖ID"这个已经不可获得的东西。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, queries, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_shape_two_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertNotIn("覆盖ID", outcome.reply_text, "不得再指向已经死掉的覆盖ID路径")
+        self.assertIn("管理卡", outcome.reply_text)
+        self.assertIn("撤销", outcome.reply_text)
 
     def test_unregistered_sender_is_default_denied_same_as_shape_one(self) -> None:
         pending_actions = FakePendingActions(

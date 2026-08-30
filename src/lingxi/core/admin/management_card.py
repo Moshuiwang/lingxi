@@ -195,12 +195,19 @@ def _markdown(content: str) -> dict[str, Any]:
     return {"tag": "markdown", "content": content}
 
 
-def _galaxy_source_markdown(status: AdminUserStatusView, *, display_names: AdminDisplayNames) -> str:
+def _galaxy_source_markdown(
+    status: AdminUserStatusView, *, company_label_for: Callable[[str], str]
+) -> str:
     """与 ``core/admin/router._render_galaxy_source`` 同一段文案逻辑的卡片版
     （两处刻意不共享实现——一处是纯文本回复，一处是卡片 markdown 片段，各自的
     调用面很薄，抽公共函数换来的耦合大于收益，与 ``core/admin/notification.py``
-    与 ``router.py`` 对渲染层各自维护一份的既有取舍一致）。公司编号经
-    ``display_names.company_label`` 翻译成「中文名（编号）」（Trace #469 S-1）。
+    与 ``router.py`` 对渲染层各自维护一份的既有取舍一致）。
+
+    ``company_label_for``（Trace #469 修复包 B，B-7）：调用方
+    （:func:`render_management_card`）已经用批量端口一次性翻译好这次渲染
+    需要的全部公司编号，这里只做字典查找，不再直接持有
+    :class:`~lingxi.core.admin.display_names.AdminDisplayNames`、不再自己
+    触发任何一次单项查询。
     """
 
     summary = status.galaxy_source
@@ -217,8 +224,7 @@ def _galaxy_source_markdown(status: AdminUserStatusView, *, display_names: Admin
         company_label = "全部公司"
     else:
         company_label = (
-            "、".join(display_names.company_label(company_id=cid) for cid in summary.companies)
-            or "(无)"
+            "、".join(company_label_for(cid) for cid in summary.companies) or "(无)"
         )
     function_label = "、".join(summary.functions) or "(无)"
     return f"**银河来源**：公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
@@ -239,14 +245,19 @@ def _override_row_elements(
     override: LocalPermissionOverrideView,
     *,
     display_identifier: str,
-    display_names: AdminDisplayNames,
+    company_label_for: Callable[[str], str],
+    metric_label_for: Callable[[str], str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``company_label_for``/``metric_label_for``（Trace #469 修复包 B，
+    B-7）：与 :func:`_galaxy_source_markdown` 同一姿态——调用方已经批量翻译
+    好这次渲染需要的全部编号，这里只做字典查找。"""
+
     direction_label = _DIRECTION_LABEL.get(override.direction, override.direction)
     reason = override.reason
     if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
         reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
-    company_label = display_names.company_label(company_id=override.company_id)
-    metric_label = display_names.metric_label(metric_id=override.metric_name)
+    company_label = company_label_for(override.company_id)
+    metric_label = metric_label_for(override.metric_name)
     description = _markdown(
         f"- （{direction_label}）公司 {company_label} · 指标 {metric_label}"
         f" · 原因 {reason} · {override.created_at}"
@@ -288,6 +299,17 @@ def render_management_card(
     内部 ID 只出现在按钮的隐藏 ``value`` 字段里，供服务端识别，不出现在任何
     展示文本中）。
 
+    **请求级批量翻译（Trace #469 修复包 B，B-7：连接风暴收敛）**：本函数只
+    调用 ``display_names.company_labels``/``metric_labels`` 各**一次**，把
+    这次渲染用得到的全部公司/指标编号（下拉目录全集 + 银河来源展示 + 每一行
+    本地覆盖各自的公司/指标）一次性翻译好，银河来源/本地覆盖/下拉选项三处
+    全部改从这份内存映射里查，不再各自触发一次单项 ``company_label``/
+    ``metric_label`` 调用——真实实现（``adapters/admin_registry.
+    PostgresAdminQueries.company_label``）每次调用都新建两条数据库连接，
+    公司目录当前 43 个编号会让一张卡片打开约 90 条连接（审查实测坐实）；
+    批量端口把这个数字收敛到与编号数量无关的常数（两条：一次取当前银河
+    批次号、一次批量查 ``name_cn``）。
+
     返回值形状：``{"schema": "2.0", "config": {...}, "body": {"elements": [...]}}``，
     与 ``core/admin/notification.render_card_payload`` 的确认卡同一顶层形状
     （``elements`` 是 ``body`` 下的顶层列表，不套任何已知会被 CardKit 拒绝的容器，
@@ -307,9 +329,38 @@ def render_management_card(
     except Exception:  # noqa: BLE001 - 同上
         metrics = ()
 
+    galaxy_source = status.galaxy_source
+    galaxy_company_ids: tuple[str, ...] = (
+        ()
+        if galaxy_source is None or galaxy_source.all_companies
+        else tuple(galaxy_source.companies)
+    )
+    # 去重但保持顺序（``dict.fromkeys``，与 ``_select_static`` 既有的去重
+    # 姿势一致），三个来源合并成一次批量调用的完整输入集合。
+    company_ids_needed = list(
+        dict.fromkeys(
+            (
+                *companies,
+                *galaxy_company_ids,
+                *(override.company_id for override in status.local_overrides),
+            )
+        )
+    )
+    metric_ids_needed = list(
+        dict.fromkeys((*metrics, *(override.metric_name for override in status.local_overrides)))
+    )
+    company_label_map = dict(display_names.company_labels(company_ids=company_ids_needed))
+    metric_label_map = dict(display_names.metric_labels(metric_ids=metric_ids_needed))
+
+    def _company_label(company_id: str) -> str:
+        return company_label_map.get(company_id, company_id)
+
+    def _metric_label(metric_id: str) -> str:
+        return metric_label_map.get(metric_id, metric_id)
+
     elements: list[dict[str, Any]] = [
         _markdown(f"**用户权限管理卡** · 标识 {_safe_identifier_echo(display_identifier)}"),
-        _markdown(_galaxy_source_markdown(status, display_names=display_names)),
+        _markdown(_galaxy_source_markdown(status, company_label_for=_company_label)),
         _markdown("**本地覆盖**"),
     ]
     if not status.local_overrides:
@@ -317,7 +368,10 @@ def render_management_card(
     else:
         for override in status.local_overrides:
             description, button = _override_row_elements(
-                override, display_identifier=display_identifier, display_names=display_names
+                override,
+                display_identifier=display_identifier,
+                company_label_for=_company_label,
+                metric_label_for=_metric_label,
             )
             elements.append(description)
             elements.append(button)
@@ -328,13 +382,13 @@ def render_management_card(
             name="company_id",
             placeholder="选择公司",
             options=companies,
-            label_for=lambda company_id: display_names.company_label(company_id=company_id),
+            label_for=_company_label,
         ),
         _select_static(
             name="metric_name",
             placeholder="选择指标",
             options=metrics,
-            label_for=lambda metric_id: display_names.metric_label(metric_id=metric_id),
+            label_for=_metric_label,
         ),
         _input(name="reason", placeholder="填写原因"),
         button_row(

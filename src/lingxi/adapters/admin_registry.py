@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
@@ -366,6 +366,67 @@ class PostgresAdminQueries:
             if real_id == metric_id:
                 return alias
         return metric_id
+
+    def company_labels(self, *, company_ids: Sequence[str]) -> Mapping[str, str]:
+        """``AdminDisplayNames.company_labels`` 真实实现（Trace #469 修复包 B，
+        B-7：连接风暴收敛）。
+
+        修复前：管理卡渲染每翻译一个公司编号就调用一次 :meth:`company_label`，
+        该方法每次都新建两条连接（一次 ``PostgresGalaxyImportStore.
+        current_batch_id()``、一次 ``galaxy_country`` 查询）——公司目录当前
+        43 个编号，一张管理卡因此打开约 90 条连接（审查实测坐实）。
+
+        修复后：整批编号只建**两条**连接——一次取当前批次号，一次用
+        ``boss_company_id = ANY(%s)`` 一条 SQL 拿回全部命中的中文名，不随
+        ``company_ids`` 的长度线性增长。查无有效批次或查无中文名的编号在
+        返回映射里原样是该编号本身，与 :meth:`company_label` 的兜底语义
+        完全一致——调用方用同一个 ``dict.get(id, id)`` 姿势消费即可。
+        """
+
+        if not company_ids:
+            return {}
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return {company_id: company_id for company_id in company_ids}
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT boss_company_id, name_cn FROM galaxy_country"
+                " WHERE batch_id = %s AND boss_company_id = ANY(%s)",
+                (batch_id, list(company_ids)),
+            )
+            rows = cursor.fetchall()
+        name_cn_by_id = {row[0]: (row[1] or "").strip() for row in rows}
+        return {
+            company_id: (
+                f"{name_cn_by_id[company_id]}（{company_id}）"
+                if name_cn_by_id.get(company_id)
+                else company_id
+            )
+            for company_id in company_ids
+        }
+
+    def metric_labels(self, *, metric_ids: Sequence[str]) -> Mapping[str, str]:
+        """``AdminDisplayNames.metric_labels`` 真实实现（Trace #469 修复包 B，
+        B-7）：与 :meth:`metric_label` 同一份映射文件，只读**一次**（``load_
+        admin_metric_alias_map`` 本身已经现读不缓存，批量只是把"文件读取"这
+        一步从"每个指标各读一次"收敛成"整批读一次"），与逐个调用
+        :meth:`metric_label` 结果逐项相同（含"多个别名映射到同一个真实 ID 时
+        任取一个"的既有 tie-break：按别名表迭代顺序，先出现的别名生效）。
+        """
+
+        if not metric_ids:
+            return {}
+        from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
+
+        aliases = load_admin_metric_alias_map()
+        alias_by_metric_id: dict[str, str] = {}
+        for alias, real_id in aliases.items():
+            alias_by_metric_id.setdefault(real_id, alias)
+        return {
+            metric_id: alias_by_metric_id.get(metric_id, metric_id) for metric_id in metric_ids
+        }
 
     def resolve_override_id(
         self, *, open_id: str, company_id: str, metric_name: str

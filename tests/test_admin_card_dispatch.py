@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from lingxi.core.admin.card_dispatch import (
     CardDispatchResult,
     ConfirmCardDispatcher,
+    ManagementCardContextStore,
     ManagementCardDispatcher,
 )
 from lingxi.core.admin.notification import AdminCardCreated, AdminCardDeliveryRejected
@@ -109,6 +110,12 @@ class FakeDisplayNames:
     def metric_label(self, *, metric_id: str) -> str:
         self.metric_label_calls.append(metric_id)
         return f"某某指标（{metric_id}）"
+
+    def company_labels(self, *, company_ids):
+        return {company_id: self.company_label(company_id=company_id) for company_id in company_ids}
+
+    def metric_labels(self, *, metric_ids):
+        return {metric_id: self.metric_label(metric_id=metric_id) for metric_id in metric_ids}
 
 
 class ConfirmCardDispatcherTests(unittest.TestCase):
@@ -405,6 +412,121 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         action, fields = audit.calls[0]
         self.assertEqual(action, "admin.management_card_dispatch.send_failed")
         self.assertNotIn("code", fields)
+
+
+class ManagementCardContextStoreTests(unittest.TestCase):
+    """Trace #469 B-1：``message_id -> identifier`` 内存 TTL 映射的独立单测——
+    与 ``ManagementCardDispatcher.send()``/``apps/gateway/__init__.py`` 的接线
+    断言分开，先钉住这个类自身的存取、过期、容量上限行为。"""
+
+    def test_remember_then_lookup_recovers_the_identifier(self) -> None:
+        store = ManagementCardContextStore()
+        store.remember(message_id="om_1", identifier="u@example.invalid")
+        self.assertEqual(store.lookup(message_id="om_1"), "u@example.invalid")
+
+    def test_lookup_miss_returns_none(self) -> None:
+        store = ManagementCardContextStore()
+        self.assertIsNone(store.lookup(message_id="om_never_registered"))
+
+    def test_empty_message_id_or_identifier_is_not_remembered(self) -> None:
+        store = ManagementCardContextStore()
+        store.remember(message_id="", identifier="u@example.invalid")
+        store.remember(message_id="om_2", identifier="")
+        self.assertIsNone(store.lookup(message_id=""))
+        self.assertIsNone(store.lookup(message_id="om_2"))
+
+    def test_entry_expires_after_ttl(self) -> None:
+        clock = [0.0]
+        store = ManagementCardContextStore(ttl_seconds=1800.0, clock=lambda: clock[0])
+        store.remember(message_id="om_1", identifier="u@example.invalid")
+
+        clock[0] = 1799.0
+        self.assertEqual(store.lookup(message_id="om_1"), "u@example.invalid")
+
+        clock[0] = 1800.0
+        self.assertIsNone(store.lookup(message_id="om_1"))
+
+    def test_over_capacity_evicts_the_oldest_entry_first(self) -> None:
+        store = ManagementCardContextStore(max_entries=2)
+        store.remember(message_id="om_1", identifier="first")
+        store.remember(message_id="om_2", identifier="second")
+        store.remember(message_id="om_3", identifier="third")
+
+        self.assertIsNone(store.lookup(message_id="om_1"))
+        self.assertEqual(store.lookup(message_id="om_2"), "second")
+        self.assertEqual(store.lookup(message_id="om_3"), "third")
+
+
+class ManagementCardDispatcherContextRegistrationTests(unittest.TestCase):
+    """Trace #469 B-1：``ManagementCardDispatcher.send()`` 成功送达之后必须把
+    ``message_id -> display_identifier`` 登记进注入的 context_store——这是发送
+    侧登记链路的另一半（查询侧断言在 ``tests/test_gateway_longconn.py``
+    ``ManagementCardContextRecoveryTests``）。"""
+
+    def test_successful_send_remembers_the_message_id_to_identifier_mapping(self) -> None:
+        transport = _FakeManagementTransport()
+        store = ManagementCardContextStore()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
+            context_store=store,
+        )
+
+        dispatcher.send(
+            status=_status(),
+            display_identifier="u@example.invalid",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertEqual(store.lookup(message_id="msg_1"), "u@example.invalid")
+
+    def test_failed_send_does_not_remember_anything(self) -> None:
+        """**变异验红要点**：去掉"只在成功分支登记"这条判据、把 remember 挪到
+        try 之前，会让一个从未真正送达的 message_id 也能被查到——本用例钉住
+        失败分支不登记。"""
+
+        transport = _FakeManagementTransport(raises=RuntimeError("网络超时"))
+        store = ManagementCardContextStore()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport,
+            catalog=_FakeCatalog(),
+            audit=_FakeAudit(),
+            display_names=FakeDisplayNames(),
+            context_store=store,
+        )
+
+        dispatcher.send(
+            status=_status(),
+            display_identifier="u@example.invalid",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertIsNone(store.lookup(message_id="msg_1"))
+
+    def test_context_store_none_does_not_change_existing_behavior(self) -> None:
+        """未传 ``context_store``（既有调用点、既有测试）时不应该因为新增的
+        可选参数而报错或改变返回值——向后兼容断言。"""
+
+        transport = _FakeManagementTransport()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport, catalog=_FakeCatalog(), audit=_FakeAudit(), display_names=FakeDisplayNames()
+        )
+
+        result = dispatcher.send(
+            status=_status(),
+            display_identifier="u@example.invalid",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertTrue(result.delivered)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -168,6 +168,16 @@ class CompanyNameResolver(Protocol):
         "查不到"误渲染成一个空白公司名。"""
         ...
 
+    def names_for(self, *, company_ids: Sequence[str]) -> Mapping[str, str | None]:
+        """:meth:`name_for` 的批量变体（Trace #469 修复包 B，B-7：连接风暴
+        收敛）——一次调用翻译一份权限文档里的全部公司编号，语义与逐个调用
+        :meth:`name_for` 完全等价（查无中文名的编号在返回映射里是 ``None``）。
+        真实实现只需为整批编号建立一次数据库连接批次查询，不随编号数量线性
+        增长——见 :func:`describe_scope`、
+        ``adapters/postgres_galaxy_snapshot.PostgresCompanyNames.names_for``
+        的连接数对比。空输入返回空映射。"""
+        ...
+
 
 def describe_scope(
     document: Mapping[str, Sequence[str]],
@@ -203,23 +213,35 @@ def describe_scope(
     if ALL_COMPANIES_KEY in document:
         companies = source.text(CONTENT_KEY_ALL_COMPANIES).text
     else:
+        company_ids = sorted(document)
+        # 请求级批量翻译（Trace #469 修复包 B，B-7：连接风暴收敛，与
+        # core/admin/management_card.render_management_card 同一姿势）：一次
+        # 调用翻译这份权限文档涉及的全部公司编号，不再对每个编号各自触发一次
+        # CompanyNameResolver.name_for——真实实现（adapters/postgres_galaxy_
+        # snapshot.PostgresCompanyNames.name_for）每次调用都新建两条数据库
+        # 连接，公司位较多的权限文档会重演 core/admin 侧同一条连接风暴（外部
+        # 审查交叉裁定的同构问题）。
+        name_by_id: Mapping[str, str | None] = {}
+        if company_names is not None:
+            try:
+                name_by_id = company_names.names_for(company_ids=company_ids)
+            except Exception:  # noqa: BLE001 - 展示层降级：解析口本身故障不阻塞通知发送
+                logger.warning(
+                    "permission_notice.company_name_lookup_failed_batch company_count=%d",
+                    len(company_ids),
+                )
         companies = SCOPE_SEPARATOR.join(
-            _company_display(company_id, company_names) for company_id in sorted(document)
+            _company_display(company_id, name_by_id.get(company_id)) for company_id in company_ids
         )
     functions = SCOPE_SEPARATOR.join(lookup_metrics(document))
     return companies, functions
 
 
-def _company_display(company_id: str, company_names: CompanyNameResolver | None) -> str:
-    if company_names is None:
-        return company_id
-    try:
-        name_cn = company_names.name_for(company_id=company_id)
-    except Exception:  # noqa: BLE001 - 展示层降级：解析口本身故障不阻塞通知发送
-        logger.warning(
-            "permission_notice.company_name_lookup_failed company_id=%s", company_id
-        )
-        return company_id
+def _company_display(company_id: str, name_cn: str | None) -> str:
+    """把一个公司编号与它已经解析好的中文名拼成展示串（Trace #469 修复包 B，
+    B-7）：批量解析与异常处理已经上移到 :func:`describe_scope` 一次性完成，
+    这里只是纯字符串拼接，不再持有 :class:`CompanyNameResolver`。"""
+
     return f"{name_cn}（{company_id}）" if name_cn else company_id
 
 

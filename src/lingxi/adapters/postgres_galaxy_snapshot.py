@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.permission.galaxy_export import TARGET_TABLES
@@ -272,6 +272,36 @@ class PostgresCompanyNames:
             return None
         name_cn = (row[0] or "").strip()
         return name_cn or None
+
+    def names_for(self, *, company_ids: Sequence[str]) -> Mapping[str, str | None]:
+        """``CompanyNameResolver.names_for`` 真实实现（Trace #469 修复包 B，
+        B-7：连接风暴收敛）：与 ``adapters/admin_registry.PostgresAdminQueries.
+        company_labels`` 同一份批量查询姿势，独立各自维护（同上一条注释理由）。
+
+        修复前：``describe_scope`` 对权限文档里每一个公司编号各调用一次
+        :meth:`name_for`，每次都新建两条连接——公司位较多的权限文档会重演
+        ``core/admin`` 侧同一条连接风暴（审查交叉裁定的同构问题）。修复后：
+        整批编号只建两条连接。查无中文名的编号在返回映射里是 ``None``（与
+        :meth:`name_for` 的既有语义一致，不是空字符串），空输入返回空映射、
+        不发起任何查询。
+        """
+
+        if not company_ids:
+            return {}
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return {company_id: None for company_id in company_ids}
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT boss_company_id, name_cn FROM galaxy_country"
+                " WHERE batch_id = %s AND boss_company_id = ANY(%s)",
+                (batch_id, list(company_ids)),
+            )
+            rows = cursor.fetchall()
+        name_cn_by_id = {row[0]: ((row[1] or "").strip() or None) for row in rows}
+        return {company_id: name_cn_by_id.get(company_id) for company_id in company_ids}
 
 
 __all__ = [
