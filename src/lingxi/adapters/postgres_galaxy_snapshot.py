@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.permission.galaxy_export import TARGET_TABLES
@@ -236,7 +236,76 @@ class PostgresGalaxySnapshotReader:
         return snapshot
 
 
+class PostgresCompanyNames:
+    """``core.permission.notification.CompanyNameResolver`` 的真实实现（结构性
+    实现，不继承）：按当前有效银河批次查 ``galaxy_country.name_cn``（Trace
+    #469 S-1 TOP-8）。
+
+    与 ``adapters/admin_registry.PostgresAdminQueries.company_label`` 是同一份
+    查询姿势（当前批次 + ``boss_company_id`` 精确匹配），**独立各自维护，不
+    共享实现**——两处调用面不同（一处是管理员命令面展示，一处是普通用户权限
+    变化通知），与本仓库既有的"各自独立声明接口"惯例一致。只查
+    ``galaxy_country`` 一张表，不用 :meth:`PostgresGalaxySnapshotReader.
+    load_current`——那个方法额外读 ``galaxy_user``/``galaxy_user_role``/
+    ``galaxy_user_datacountry`` 三张表，本类每次调用只需要一次"给定编号查
+    中文名"的轻量读取，没有理由为此多付三张表的读取成本（``PermissionPublishDuty``
+    是高频 tick，代价差异会被放大）。
+    """
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    def name_for(self, *, company_id: str) -> str | None:
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return None
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT name_cn FROM galaxy_country WHERE batch_id = %s AND boss_company_id = %s LIMIT 1",
+                (batch_id, company_id),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        name_cn = (row[0] or "").strip()
+        return name_cn or None
+
+    def names_for(self, *, company_ids: Sequence[str]) -> Mapping[str, str | None]:
+        """``CompanyNameResolver.names_for`` 真实实现（Trace #469 修复包 B，
+        B-7：连接风暴收敛）：与 ``adapters/admin_registry.PostgresAdminQueries.
+        company_labels`` 同一份批量查询姿势，独立各自维护（同上一条注释理由）。
+
+        修复前：``describe_scope`` 对权限文档里每一个公司编号各调用一次
+        :meth:`name_for`，每次都新建两条连接——公司位较多的权限文档会重演
+        ``core/admin`` 侧同一条连接风暴（审查交叉裁定的同构问题）。修复后：
+        整批编号只建两条连接。查无中文名的编号在返回映射里是 ``None``（与
+        :meth:`name_for` 的既有语义一致，不是空字符串），空输入返回空映射、
+        不发起任何查询。
+        """
+
+        if not company_ids:
+            return {}
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return {company_id: None for company_id in company_ids}
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT boss_company_id, name_cn FROM galaxy_country"
+                " WHERE batch_id = %s AND boss_company_id = ANY(%s)",
+                (batch_id, list(company_ids)),
+            )
+            rows = cursor.fetchall()
+        name_cn_by_id = {row[0]: ((row[1] or "").strip() or None) for row in rows}
+        return {company_id: name_cn_by_id.get(company_id) for company_id in company_ids}
+
+
 __all__ = [
     "GalaxyPermissionSnapshot",
+    "PostgresCompanyNames",
     "PostgresGalaxySnapshotReader",
 ]

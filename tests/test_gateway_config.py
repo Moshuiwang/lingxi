@@ -167,6 +167,7 @@ class RequiredConfigTests(unittest.TestCase):
                 f"{ENV_PREFIX}RECONNECT_FACTOR",
                 f"{ENV_PREFIX}RECONNECT_CEILING_SECONDS",
                 f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS",
+                f"{ENV_PREFIX}QUEUE_DELAY_HINT_SECONDS",
             ):
                 with self.subTest(raw=raw, name=name):
                     with self.assertRaises(GatewayConfigError):
@@ -186,10 +187,20 @@ class RequiredConfigTests(unittest.TestCase):
                 f"{ENV_PREFIX}RECONNECT_FACTOR",
                 f"{ENV_PREFIX}RECONNECT_CEILING_SECONDS",
                 f"{ENV_PREFIX}SHUTDOWN_TIMEOUT_SECONDS",
+                f"{ENV_PREFIX}QUEUE_DELAY_HINT_SECONDS",
             ):
                 with self.subTest(raw=raw, name=name):
                     with self.assertRaises(GatewayConfigError):
                         load_config(dict(VALID_ENV, **{name: raw}))
+
+    def test_queue_delay_hint_seconds_default_and_override(self) -> None:
+        """Issue #465（rc22 S-3）：排队阈值提示定值默认 12 秒（10~15 秒区间
+        中值），可用 ``LINGXI_GATEWAY_QUEUE_DELAY_HINT_SECONDS`` 覆盖。"""
+
+        self.assertEqual(load_config(VALID_ENV).queue_delay_hint_seconds, 12.0)
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}QUEUE_DELAY_HINT_SECONDS": "15"})
+        self.assertEqual(load_config(env).queue_delay_hint_seconds, 15.0)
 
 
 class InnertestRosterConfigTests(unittest.TestCase):
@@ -554,6 +565,19 @@ class AssembleDeliveryConsumerCardInjectionTests(unittest.TestCase):
             "缺省时必须走 build_delivery_consumer 自己的默认真实类型，"
             "不额外传入任何 cards——装配路径与本开关加入之前逐字节一致",
         )
+
+    def test_queue_delay_hint_seconds_is_wired_from_config(self) -> None:
+        """Issue #465：排队阈值提示的定值从 ``GatewayConfig`` 一路传到
+        ``build_delivery_consumer``，不是装配时另起一份默认值。"""
+
+        from lingxi.apps.gateway import assemble_delivery_consumer
+
+        env = dict(VALID_ENV, **{f"{ENV_PREFIX}QUEUE_DELAY_HINT_SECONDS": "15"})
+        config = load_config(env)
+        with patch("lingxi.apps.gateway.delivery.build_delivery_consumer") as builder:
+            assemble_delivery_consumer(config, queue=object())
+
+        self.assertEqual(builder.call_args.kwargs["queue_delay_hint_seconds"], 15.0)
 
     def test_injected_configuration_wires_the_rejecting_transport(self) -> None:
         from lingxi.apps.gateway import _RejectingCards, assemble_delivery_consumer

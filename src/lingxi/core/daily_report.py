@@ -139,6 +139,49 @@ def _safe_reason_code(reason_code: str) -> str:
         return reason_code
     return "other"
 
+
+#: 失败分类原因码 → 中文（Trace #469 修复包 B，B-8 遗留第 2 项）：「失败分类
+#: Top」此前直出 ``task.error_kind`` 的英文机器码（``turn_timeout``/
+#: ``max_turns_exceeded`` 这类），管理员看不出对应哪一类真实故障——沿用
+#: ``core/admin/router.py`` B-6 建立的同一套显示名映射姿势（白名单式展示层
+#: 翻译，未登记的取值回退成「原值（未登记显示名）」，不崩、不假装认识）。
+#: 覆盖 :data:`GUARD_ERROR_KINDS`/:data:`TIMEOUT_ERROR_KINDS` 与
+#: ``apps/worker/service.py``/``core/delivery/ports.py``/
+#: ``adapters/postgres_conversation/`` 现有登记的全部 ``error_kind`` 取值。
+#: ``"other"`` 是 :func:`_safe_reason_code` 自己的安全哨兵值（形状白名单
+#: 兜底，不是真实 ``error_kind``），映射到它自身、不参与"未登记"回退——它
+#: 已经是一个管理员看得懂的英文词，不需要再包一层「未登记显示名」提示。
+_ERROR_KIND_LABEL: dict[str, str] = {
+    "other": "other",
+    "turn_timeout": "单轮对话超时",
+    "max_turns_exceeded": "对话轮数超限",
+    "drain_timeout": "收尾超时",
+    "running_timeout": "执行超时",
+    "context_too_long": "上下文过长",
+    "side_effect_uncertain": "执行结果不确定（需人工核实是否已生效）",
+    "model_protocol_breakdown": "模型输出协议异常",
+    "result_too_large": "查询结果过大",
+    "session_failed": "会话执行失败",
+    "stopped": "用户主动停止",
+    "redacted_withheld": "内容因安全策略被拦截",
+    "delivery_expired": "投递已过期",
+    "retry_exhausted": "重试次数耗尽",
+    "queued_timeout": "排队超时未领取",
+    "worker_version_unavailable": "目标执行版本不可用",
+}
+
+
+def _humanize_error_kind(safe_reason_code: str) -> str:
+    """把已经过 :func:`_safe_reason_code` 白名单校验的原因码翻译成中文显示名
+    （Trace #469 修复包 B，B-8）。未登记的取值（词表遗漏，或未来新增但没有
+    同步登记）回退成「原值（未登记显示名）」，与 ``core/admin/router.py``
+    ``_display_or_unregistered`` 同一样式。"""
+
+    label = _ERROR_KIND_LABEL.get(safe_reason_code)
+    if label is None:
+        return f"{safe_reason_code}（未登记显示名）"
+    return label
+
 #: 与旧系统「高权限名单加 7 天节流」同一量级的节流阈值（#303 继承的设计教训）。
 #: 连续出现天数超过这个数才折叠，即第 1–7 天正常展开、第 8 天起折叠。
 REPEAT_THROTTLE_DAYS = 7
@@ -737,16 +780,20 @@ def _render_failure_top(
         # 同一个键），渲染进正文的展示值另外过一遍形状白名单——两者故意分开。
         throttled = by_code.get(entry.reason_code)
         safe_code = _safe_reason_code(entry.reason_code)
+        # 展示用中文显示名（Trace #469 修复包 B，B-8）：节流匹配、streak 记账
+        # 仍然全部用上面的原始英文 safe_code 做字典键，只有拼进正文这一步换
+        # 成人话，不影响任何既有的键值逻辑。
+        display_code = _humanize_error_kind(safe_code)
         if throttled is not None and throttled.throttled:
             # 节流行必须真的更短，不是比未节流行长（opus P3-4 修复）：此前这里
             # 还带一句"仅计数不再展开明细"——本函数里未节流的行本来就从不展开
             # 任何明细，这句说明纯属装饰，只会让"节流"看起来比它实际做的事更
             # 复杂。现在只保留读者真正需要的两个新增信息：连续在榜天数、已节流。
             lines.append(
-                f"- {safe_code}：{entry.count} 次（连续第 {throttled.streak_days} 天，已节流）"
+                f"- {display_code}：{entry.count} 次（连续第 {throttled.streak_days} 天，已节流）"
             )
         else:
-            lines.append(f"- {safe_code}：{entry.count} 次")
+            lines.append(f"- {display_code}：{entry.count} 次")
     return lines
 
 

@@ -122,6 +122,37 @@ class FakeQueries:
         return self._overrides_by_key.get(key)
 
 
+class FakeDisplayNames:
+    """``AdminDisplayNames`` 的内存假实现（Trace #469 S-1）。
+
+    ``user_label`` 默认退化为通用占位「该用户」——绝不把入参 ``open_id`` 编进
+    返回值，与真实实现的"零 ou_"承诺同一姿态；需要展示具体姓名/邮箱的测试
+    显式传入 ``user_labels`` 映射。``company_label``/``metric_label`` 默认原样
+    透传——公司编号/指标 ID 不是需要隐藏的内部系统标识，多数既有用例不关心这层
+    展示翻译，透传让它们不必逐个改断言。
+    """
+
+    def __init__(
+        self,
+        *,
+        user_labels: dict[str, str] | None = None,
+        company_labels: dict[str, str] | None = None,
+        metric_labels: dict[str, str] | None = None,
+    ) -> None:
+        self._user_labels = user_labels or {}
+        self._company_labels = company_labels or {}
+        self._metric_labels = metric_labels or {}
+
+    def user_label(self, *, open_id: str) -> str:
+        return self._user_labels.get(open_id, "该用户")
+
+    def company_label(self, *, company_id: str) -> str:
+        return self._company_labels.get(company_id, company_id)
+
+    def metric_label(self, *, metric_id: str) -> str:
+        return self._metric_labels.get(metric_id, metric_id)
+
+
 class _FakePrepareDecision:
     def __init__(self, *, ok: bool, message: str = "", code: str = "") -> None:
         self.ok = ok
@@ -240,6 +271,7 @@ def _router(
     pending_actions: FakePendingActions | None = None,
     confirm_cards: FakeConfirmCards | None = None,
     management_cards: object | None = None,
+    display_names: FakeDisplayNames | None = None,
 ) -> tuple[AdminCommandRouter, FakeRegistry, FakeQueries, FakeAudit]:
     reg = registry or FakeRegistry({ADMIN_OPEN_ID: _full_admin_entry()})
     qry = queries or FakeQueries()
@@ -249,6 +281,7 @@ def _router(
             registry=reg,
             queries=qry,
             audit=aud,
+            display_names=display_names or FakeDisplayNames(),
             pending_actions=pending_actions,
             confirm_cards=confirm_cards,
             management_cards=management_cards,
@@ -410,15 +443,19 @@ class QueryUserCommandTests(unittest.TestCase):
                 )
             }
         )
-        router, _, _, audit = _router(queries=queries)
+        display_names = FakeDisplayNames(user_labels={"ou_target": "张三（zhangsan@example.com）"})
+        router, _, _, audit = _router(queries=queries, display_names=display_names)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("ou_target", outcome.reply_text)
-        self.assertIn("active", outcome.reply_text)
+        # Trace #469 S-1：不再回显 open_id，改经 AdminDisplayNames 展示姓名+邮箱；
+        # 开通状态英文码同样翻译成中文。
+        self.assertIn("张三（zhangsan@example.com）", outcome.reply_text)
+        self.assertNotIn("ou_target", outcome.reply_text)
+        self.assertIn("已开通", outcome.reply_text)
         self.assertEqual(queries.user_calls, ["ou_target"])
         self.assertEqual(audit.actions(), ["admin.command.query_user"])
         self.assertTrue(audit.records[0][1]["found"])
@@ -431,7 +468,10 @@ class QueryUserCommandTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("ou_missing", outcome.reply_text)
+        # Trace #469 S-1：查无记录时，长得像内部 open_id 的输入退化为通用占位
+        # 「该用户」，不把 open_id 原样拼回去（管理员可见文案零 ou_）。
+        self.assertIn("该用户", outcome.reply_text)
+        self.assertNotIn("ou_missing", outcome.reply_text)
         self.assertFalse(audit.records[0][1]["found"])
 
     def test_query_failure_yields_internal_error_reply_not_crash(self) -> None:
@@ -469,12 +509,15 @@ class QueryUserCommandTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertIn("无本地覆盖", outcome.reply_text)
 
-    def test_user_with_local_overrides_lists_id_direction_scope_and_truncated_reason(
+    def test_user_with_local_overrides_lists_direction_scope_and_truncated_reason(
         self,
     ) -> None:
         """/admin user 新增「当前生效本地覆盖」段（卡 B，revoke 的 UX 前置）：
-        列出 id（lpo_*）、方向、company_id、metric_name、创建时间，且 reason
-        不回显全文（截断 20 字）。"""
+        列出方向、company_id、metric_name、创建时间，且 reason 不回显全文
+        （截断 20 字）。**自 Trace #469 S-1 起不再列出 override_id**——内部 ID
+        只留审计，管理员发起撤销改用「标识+公司+指标」形式或管理卡逐行撤销
+        按钮，均不需要先看到这个内部 ID（见 ``core/admin/router.
+        _render_local_overrides`` 文档）。"""
 
         long_reason = "这是一段超过二十个字符的很长很长的收回或授权原因说明文本"
         self.assertGreater(len(long_reason), 20)
@@ -505,7 +548,7 @@ class QueryUserCommandTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("lpo_01JGFJJZ008XSHEADGG8V74SPC", outcome.reply_text)
+        self.assertNotIn("lpo_01JGFJJZ008XSHEADGG8V74SPC", outcome.reply_text)
         self.assertIn("授权", outcome.reply_text)
         self.assertIn("1011", outcome.reply_text)
         self.assertIn("daily_active", outcome.reply_text)
@@ -577,8 +620,10 @@ class QueryUserCommandTests(unittest.TestCase):
 
 class EmailIdentifierResolutionTests(unittest.TestCase):
     """#439 A 档：``/admin user`` 的标识参数经 ``AdminQueries.resolve_identifier``
-    反查——命中时按反查出的 open_id 查询，回复仍展示管理员实际输入的标识（不强迫
-    管理员在回复里看到内部 open_id）。"""
+    反查——命中时按反查出的 open_id 查询。**Trace #469 S-1 起**回复头部改经
+    ``AdminDisplayNames.user_label`` 展示姓名+邮箱，不再是"管理员自己输入的
+    标识原样回显"（那条既有姿态曾经是为了不强迫管理员看到内部 open_id；现在
+    统一升级成更友好的姓名+邮箱展示，同时也满足零 ou_ 这条更严格的要求）。"""
 
     def test_email_identifier_is_resolved_before_querying_user_status(self) -> None:
         queries = FakeQueries(
@@ -593,7 +638,8 @@ class EmailIdentifierResolutionTests(unittest.TestCase):
             },
             identifier_aliases={"someone@example.com": "ou_target"},
         )
-        router, _, _, _ = _router(queries=queries)
+        display_names = FakeDisplayNames(user_labels={"ou_target": "李四（someone@example.com）"})
+        router, _, _, _ = _router(queries=queries, display_names=display_names)
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID, text="/admin user someone@example.com", trace_id="t1"
@@ -603,8 +649,10 @@ class EmailIdentifierResolutionTests(unittest.TestCase):
         # 反查确实发生过一次，且 user_status 用的是反查出的 open_id，不是原始邮箱。
         self.assertEqual(queries.resolve_identifier_calls, ["someone@example.com"])
         self.assertEqual(queries.user_calls, ["ou_target"])
-        # 回复仍然展示管理员自己输入的标识（邮箱），不是反查出的内部 open_id。
-        self.assertIn("someone@example.com", outcome.reply_text)
+        # 回复头部展示 AdminDisplayNames 解析出的姓名+邮箱（这里恰好与查询用的
+        # 邮箱相同，真实场景下 app_user.email 与反查命中的邮箱本就应当一致）。
+        self.assertIn("李四（someone@example.com）", outcome.reply_text)
+        self.assertNotIn("ou_target", outcome.reply_text)
         self.assertNotIn("未找到", outcome.reply_text)
 
     def test_unresolvable_email_falls_through_to_the_existing_not_found_reply(self) -> None:
@@ -692,7 +740,6 @@ class ManagementCardSendTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("admin-user-test@example.com", outcome.reply_text)
         self.assertEqual(len(cards.calls), 1)
         self.assertEqual(cards.calls[0]["display_identifier"], "admin-user-test@example.com")
         self.assertIs(cards.calls[0]["status"], status)
@@ -717,7 +764,7 @@ class ManagementCardSendTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("ou_target", outcome.reply_text)
+        self.assertIn("该用户", outcome.reply_text)
 
     def test_missing_message_id_skips_card_send(self) -> None:
         """没有可回复的消息 ID（既有全部只读命令调用点的默认值）不发送卡片——
@@ -745,7 +792,7 @@ class ManagementCardSendTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("ou_target", outcome.reply_text)
+        self.assertIn("该用户", outcome.reply_text)
         self.assertIn("admin.command.management_card_send_failed", audit.actions())
         # 主查询审计（admin.command.query_user）仍然照常记录，不被卡片失败挤掉。
         self.assertIn("admin.command.query_user", audit.actions())
@@ -853,7 +900,8 @@ class QueryTraceCommandTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertIn("无失败记录", outcome.reply_text)
-        self.assertIn("active", outcome.reply_text)
+        # Trace #469 S-1：英文状态码翻译成中文。
+        self.assertIn("已开通", outcome.reply_text)
         self.assertNotIn("查无此追溯号", outcome.reply_text)
 
     def test_reply_never_echoes_open_id(self) -> None:
@@ -885,6 +933,79 @@ class QueryTraceCommandTests(unittest.TestCase):
         )
 
         self.assertNotIn(secret_open_id, outcome.reply_text)
+
+    def test_known_event_type_handled_as_and_failure_reason_are_humanized(self) -> None:
+        """Trace #469 修复包 B，B-6：已登记的机器码不再直出——事件类型、
+        处理方式、失败原因三项各自换成中文显示名，且不再包含原始机器码
+        字面量（与下面"未登记回退"用例互补：这里验证"认识的"分支，那边
+        验证"不认识的"分支）。"""
+
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="not_provisioned",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason="mcp_sync_timeout",
+                    failure_event_type="onboarding.result",
+                    failure_occurred_at="2026-08-28T01:20:00+00:00",
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertIn("用户消息", outcome.reply_text)
+        self.assertNotIn("im.message.receive_v1", outcome.reply_text)
+        self.assertIn("未开通，未受理", outcome.reply_text)
+        self.assertNotIn("not_provisioned", outcome.reply_text)
+        self.assertIn("问数权限同步超时", outcome.reply_text)
+        self.assertNotIn("mcp_sync_timeout", outcome.reply_text)
+
+    def test_unregistered_handled_as_falls_back_to_the_raw_value_with_a_visible_marker(
+        self,
+    ) -> None:
+        """未登记的机器码不能崩、也不能悄悄消失——回退成"原值（未登记显示名）"
+        这个统一样式，管理员至少还能看到原始取值。**变异验红**：把
+        ``_display_or_unregistered`` 里的回退分支改成直接返回空字符串或抛
+        异常，本用例必红。"""
+
+        trace_id = new_ulid()
+        queries = FakeQueries(
+            traces={
+                trace_id: AdminTraceView(
+                    trace_id=trace_id,
+                    event_count=1,
+                    first_received_at="2026-08-28T01:00:00+00:00",
+                    last_event_type="im.message.receive_v1",
+                    last_handled_as="some_future_value_not_yet_registered",
+                    dispatched=True,
+                    provisioning_state="provisioning",
+                    account_state="enabled",
+                    failure_reason=None,
+                    failure_event_type=None,
+                    failure_occurred_at=None,
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+
+        self.assertIn(
+            "some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text
+        )
 
     def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
         """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询
@@ -930,6 +1051,34 @@ class QueryAuditCommandTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertIn("没有找到", outcome.reply_text)
+        # Trace #469 修复包 B，B-5：`_render_audit_query` 的标识遮蔽此前无用例
+        # 锁住——审查变异实测去掉 `_safe_identifier_echo` 调用仍全绿。open_id
+        # 形状的标识（`ou_` 前缀）不得原样出现在管理员可见回复里。
+        self.assertNotIn("ou_x", outcome.reply_text)
+
+    def test_open_id_shaped_identifier_is_masked_in_the_events_header_too(self) -> None:
+        """Trace #469 修复包 B，B-5：有事件命中时回复走 header+lines 分支
+        （与"没有找到"分支不同的代码路径），标识遮蔽必须同样生效——两条分支
+        共用同一个 ``scope = f"标识 {_safe_identifier_echo(identifier)} 的"``
+        取值，这里独立锁住有事件分支，防止未来只改了其中一条分支的遮蔽逻辑。
+        **变异验红**：把 ``_render_audit_query`` 里的 ``_safe_identifier_echo(identifier)``
+        换回裸 ``identifier``，本用例必红。"""
+
+        events = [
+            AdminEventView(
+                received_at="2026-08-24T01:00:00+00:00",
+                event_type="im.message.receive_v1",
+                handled_as="not_provisioned",
+                trace_id="trc_abc",
+            )
+        ]
+        router, _, _, _ = _router(queries=FakeQueries(events=events))
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin audit ou_x 48", trace_id="t1")
+
+        self.assertTrue(outcome.handled)
+        self.assertNotIn("ou_x", outcome.reply_text)
+        self.assertIn("该用户", outcome.reply_text)
 
 
 class AuditFailureFailsClosedTests(unittest.TestCase):
@@ -1826,6 +1975,34 @@ class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
         self.assertEqual(pending_actions.prepare_calls, [])
         self.assertEqual(confirm_cards.send_calls, [])
         self.assertEqual(audit.records[-1][1]["code"], "override_not_found")
+
+    def test_unmatched_lookup_reply_points_to_a_reachable_recovery_path(self) -> None:
+        """Trace #469 修复包 B，B-3：此前这句兜底指引说"或改用覆盖ID精确指定
+        撤销"——本批起 ``/admin user`` 不再展示 override_id（Trace #469 S-1，
+        见 ``_render_local_overrides`` 文档），这条路径已经是死路，管理员看到
+        指引也无法照做。修复后必须改指真实可行路径（管理卡逐行「撤销」按钮），
+        且不能再提"覆盖ID"这个已经不可获得的东西。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, queries, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_shape_two_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertNotIn("覆盖ID", outcome.reply_text, "不得再指向已经死掉的覆盖ID路径")
+        self.assertIn("管理卡", outcome.reply_text)
+        self.assertIn("撤销", outcome.reply_text)
 
     def test_unregistered_sender_is_default_denied_same_as_shape_one(self) -> None:
         pending_actions = FakePendingActions(

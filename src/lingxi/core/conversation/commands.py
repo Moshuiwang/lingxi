@@ -113,10 +113,19 @@ class MemoryCommand:
     """``/memory`` 的解析结果。``NONE`` 表示这条消息不以 ``/memory`` 开头，或者
     以 ``/memory`` 开头但子命令形状不对——两种情况调用方都不应该当作已知命令处理，
     区分它们与「这条消息该不该被当成 /memory 命令面」是 :func:`is_memory_command_message`
-    的职责，不是本类型的职责。"""
+    的职责，不是本类型的职责。
+
+    ``memory_id``/``memory_serial`` 只在 ``kind is FORGET`` 时二选一非空
+    （rc22 B-8-1，#439 TOP-10）：``memory_serial`` 是 ``/memory list`` 展示的
+    短序号（1、2、3……），``memory_id`` 是原始 ``mem_`` 前缀 id（向后兼容旧
+    习惯与已经复制在别处的 id）。序号到具体 ``mem_`` id 的解析需要查一次当前
+    用户的记忆列表，属于 I/O，因此不在本模块（纯解析、无副作用）完成，留给
+    调用方（``core/conversation/pipeline.py`` 的 ``_resolve_forget_target_id``）
+    在真正执行删除前解析。"""
 
     kind: MemoryCommandKind
     memory_id: str | None = None
+    memory_serial: int | None = None
     memory_type: str | None = None
     memory_key: str | None = None
     memory_value: str | None = None
@@ -163,9 +172,11 @@ def parse_memory_command(text: object) -> MemoryCommand:
 
     - ``/memory list``                                     → LIST，无附加参数
     - ``/memory clear``                                    → CLEAR，无附加参数
-    - ``/memory forget <memory_id>``                        → FORGET，
-      ``memory_id`` 必须是 ``mem_`` 前缀 + 26 位 Crockford ULID（与
-      ``core/ids.new_id("mem")`` 的生成形状逐字对应）
+    - ``/memory forget <序号或 memory_id>``                  → FORGET，参数二选一
+      （rc22 B-8-1，#439 TOP-10）：不带前导零、不带符号的十进制正整数解析成
+      ``memory_serial``（对应 ``/memory list`` 展示的短序号）；否则必须是
+      ``mem_`` 前缀 + 26 位 Crockford ULID（与 ``core/ids.new_id("mem")`` 的
+      生成形状逐字对应）才解析成 ``memory_id``——两种形状都不匹配时落 ``NONE``
     - ``/memory remember <memory_type> <key> => <value>``   → REMEMBER，
       ``memory_type`` 必须精确等于 :data:`~lingxi.core.user_memory.MEMORY_TYPES`
       三值之一；``<key>`` 与 ``<value>`` 是 ``=>`` 两侧的自由文本，各自去除首尾
@@ -231,10 +242,15 @@ def parse_memory_command(text: object) -> MemoryCommand:
         return MemoryCommand(kind=MemoryCommandKind.CLEAR)
 
     if sub == "forget":
-        memory_id = remainder.strip()
-        if not memory_id or " " in memory_id or not _is_memory_id(memory_id):
+        token = remainder.strip()
+        if not token or " " in token:
             return _memory_none()
-        return MemoryCommand(kind=MemoryCommandKind.FORGET, memory_id=memory_id)
+        if _is_memory_id(token):
+            return MemoryCommand(kind=MemoryCommandKind.FORGET, memory_id=token)
+        serial = _parse_memory_serial(token)
+        if serial is not None:
+            return MemoryCommand(kind=MemoryCommandKind.FORGET, memory_serial=serial)
+        return _memory_none()
 
     if sub == "remember":
         return _parse_remember(remainder)
@@ -251,6 +267,27 @@ def _is_memory_id(token: str) -> bool:
     if not token.startswith(_MEMORY_ID_PREFIX):
         return False
     return is_ulid(token[len(_MEMORY_ID_PREFIX) :])
+
+
+def _parse_memory_serial(token: str) -> int | None:
+    """把 ``/memory forget`` 的参数解析成短序号（rc22 B-8-1，#439 TOP-10）：
+    ``/memory list`` 把裸 ``mem_`` ULID 换成了 1、2、3…… 这种对普通用户友好的
+    展示序号（``pipeline._render_memory_list``），这里是它在 forget 侧的镜像
+    入口。
+
+    只接受**不带符号、不带前导零**的十进制正整数字面量——``01``、``+1``、
+    ``1.0`` 一律判 ``None``，不是"这不是数字"，是不让同一个字符串对应两种
+    解析结果产生歧义（``01`` 到底是序号 1 还是格式错误）。真正把序号换算成
+    具体 ``memory_id`` 需要查一次当前用户的记忆列表（I/O），留给调用方在
+    真正执行删除前解析，见 :class:`MemoryCommand` 文档。
+    """
+
+    if not token.isdigit():
+        return None
+    if token != str(int(token)):
+        return None
+    value = int(token)
+    return value if value >= 1 else None
 
 
 def _parse_remember(remainder: str) -> MemoryCommand:

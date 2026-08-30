@@ -44,6 +44,8 @@ from lingxi.core.admin.management_card import (
     ADMIN_ACTION_GRANT,
     ADMIN_ACTION_REVOKE,
     ADMIN_ACTION_SUPPRESS,
+    GRANT_SUBMIT_BUTTON_NAME,
+    SUPPRESS_SUBMIT_BUTTON_NAME,
 )
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
@@ -246,38 +248,6 @@ class _RecordingOnboarding:
         return OnboardingResult(state=OnboardingState.STARTED)
 
 
-def _management_card_form_value(payload: dict) -> dict[str, str]:
-    """从原始 ``card.action.trigger`` 事件体里取出表单容器提交的字段值
-    （``event.action.form_value``）。
-
-    **证据等级 1**：``parse_card_action_event``（``adapters/feishu_events.py``）
-    只解析按钮自己的 ``action.value``（``core/admin/management_card.py`` 建卡时
-    写进按钮 ``behaviors[].value`` 的那几个键：``admin_action``/``identifier``/
-    ``override_id``），不解析表单容器（``form``）字段——``company_id``/
-    ``metric_name``/``reason`` 是管理员在下拉/输入框里填的，按飞书卡片 2.0
-    《配置卡片交互》文档的表单回传形状，随提交事件出现在与 ``action.value``
-    同级的 ``action.form_value``（``{字段 name: 已填值}``），不在 ``value``
-    本身里。真实回调事件体是否逐字符合仍未经真实网络往返验证（`biai-stage`
-    L4a 范围，与 ``management_card.py`` 模块文档同一等级标注）。
-
-    只保留字符串/数字这类简单标量并统一转字符串——与
-    ``parse_card_action_event`` 对 ``action.value`` 的既有过滤同一姿态（不信任
-    事件体里出现的任何嵌套结构，读不出就是缺这个字段，交给
-    ``card_callback.py`` 的必填校验拒绝，不在这里抛错）。
-    """
-
-    event = payload.get("event") if isinstance(payload, dict) else None
-    action = event.get("action") if isinstance(event, dict) else None
-    raw_form_value = action.get("form_value") if isinstance(action, dict) else None
-    if not isinstance(raw_form_value, dict):
-        return {}
-    return {
-        str(key): str(value)
-        for key, value in raw_form_value.items()
-        if isinstance(value, (str, int, float)) and not isinstance(value, bool)
-    }
-
-
 def _management_card_context(payload: dict) -> tuple[str, str]:
     """从原始事件体的 ``event.context`` 里取出触发这次点击的 ``chat_id``/
     ``message_id``——管理卡表单提交/收回按钮转译成的等价命令文本要经
@@ -308,6 +278,7 @@ def make_event_handler(
     on_parse_error: Callable[[str], None] | None = None,
     card_callback_handler: Any = None,
     group_mention_hint: Any = None,
+    management_card_context_store: Any = None,
 ) -> Callable[[dict], dict | None]:
     """把原始事件体接到管线上。
 
@@ -346,14 +317,39 @@ def make_event_handler(
       调用 :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
       handle_management_revoke`。
     - ``admin_action`` 是 ``"grant"``/``"suppress"``（表单提交）：额外从
-      ``action.form_value``（:func:`_management_card_form_value`）取出
-      ``company_id``/``metric_name``/``reason``，调用
-      :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
+      ``action_event.form_value``（``adapters/feishu_events.py`` 集中解析，见
+      ``CardActionEvent`` 文档）取出 ``company_id``/``metric_name``/``reason``，
+      调用 :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
       handle_management_form_submit`。
-    - 其余取值（含 ``admin_action`` 缺失/空）：不认识的 action 维持既有兜底
-      行为逐字节不变——落到下面 ``decision``/``pending_action_id`` 这条既有
-      分支，读不到有效 ``decision`` 时由 ``handle()`` 自己的
+    - **``admin_action`` 缺失/空时的按钮名后备路由**（W0-1 追加结论，
+      2026-08-30，真实点击实测坐实）：form 内提交按钮的真实回调
+      ``action.value`` 经常不带 ``admin_action``（缺失或需要反序列化的字符串），
+      这时改用按钮自己的 ``action.name``（建卡时写入的
+      ``grant_submit``/``suppress_submit``）兜底判定是哪一次提交——不这样做，
+      点击后会静默落进下面"未知 decision"分支，管理卡补充授权/屏蔽指标从此
+      全部失效（真实点击已实测复现，见 ``adapters/feishu_events.py`` 的
+      ``_parse_action_value`` 文档）。逐行「撤销」按钮不受影响——它不在 form
+      内，真实回调的 ``value`` 已经带着 ``admin_action`` 正常到达。
+    - 两条路径都用不到 ``admin_action`` 时（含按钮名也不认识）：不认识的
+      action 维持既有兜底行为——落到下面 ``decision``/``pending_action_id``
+      这条既有分支，读不到有效 ``decision`` 时由 ``handle()`` 自己的
       ``unknown_decision`` 分支拒绝，与本次改动之前完全一致。
+
+    **表单提交 ``identifier`` 缺失时的发送侧登记恢复（Trace #469 修复包 B，
+    B-1）**：按钮名兜底解决了"识别出这是哪一个提交按钮"，但没有解决
+    ``action.value`` 整体缺失时 ``identifier`` 本身也一起丢失的问题——这时
+    ``action_event.action_value`` 是空字典，``.get("identifier", "")`` 恒为
+    空串。``management_card_context_store``（可选，未传入时行为与本参数加入
+    之前逐字节一致）是发送管理卡时登记的 ``message_id -> identifier`` 内存
+    TTL 映射（见 ``core/admin/card_dispatch.ManagementCardContextStore``
+    模块文档）：``identifier`` 为空且这个参数不是 ``None`` 时，用
+    ``_management_card_context`` 已经取出的 ``message_id``（回调事件体
+    ``context.open_message_id``，与建卡成功后 ``ManagementCardCreated.
+    message_id`` 是同一个值——这条消息正是管理卡自己）去查表补回；查不到
+    （未登记/已过期/已被逐出容量上限）时 ``identifier`` 仍是空串，交给
+    ``handle_management_form_submit`` 自己既有的必填校验给出「请重新查询
+    /admin user」——此时这句指引恰好是准确操作。逐行「撤销」按钮不受影响：
+    ``override_id`` 走的是另一个字段，不经过这个恢复路径。
     """
 
     def handle(payload: dict) -> dict | None:
@@ -371,6 +367,21 @@ def make_event_handler(
                     on_parse_error(str(error))
                 return None
             admin_action = action_event.action_value.get("admin_action", "")
+            if not admin_action:
+                # 表单提交按钮名后备路由（W0-1 追加结论，2026-08-30，真实点击
+                # 实测坐实）：form 内提交按钮的真实回调 action.value 经常不带
+                # admin_action（缺失或需要反序列化的字符串，见
+                # adapters/feishu_events.py 的 _parse_action_value 文档），但
+                # 回调事件本就会带回按钮自己的 action.name
+                # （grant_submit/suppress_submit）——用它兜底识别是哪一个
+                # 提交按钮，不这样做，点击后会静默落进下面"未知 decision"分支，
+                # 管理卡补充授权/屏蔽指标从此全部失效（真实点击已实测复现）。
+                # 逐行「撤销」按钮不需要这条后备——它不在 form 内，真实回调的
+                # value 已经带着 admin_action 正常到达。
+                if action_event.action_name == GRANT_SUBMIT_BUTTON_NAME:
+                    admin_action = ADMIN_ACTION_GRANT
+                elif action_event.action_name == SUPPRESS_SUBMIT_BUTTON_NAME:
+                    admin_action = ADMIN_ACTION_SUPPRESS
             if admin_action == ADMIN_ACTION_REVOKE:
                 chat_id, message_id = _management_card_context(payload)
                 return card_callback_handler.handle_management_revoke(
@@ -382,15 +393,22 @@ def make_event_handler(
                     trace_id=action_event.trace_id,
                 )
             if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
-                form_value = _management_card_form_value(payload)
                 chat_id, message_id = _management_card_context(payload)
+                identifier = action_event.action_value.get("identifier", "")
+                if not identifier and management_card_context_store is not None:
+                    # 发送侧登记恢复（Trace #469 B-1，见本函数文档该节）：
+                    # value 缺失形态下 identifier 唯一的另一个来源。查不到
+                    # 时 identifier 维持空串，交给下游既有必填校验拒绝。
+                    identifier = (
+                        management_card_context_store.lookup(message_id=message_id) or ""
+                    )
                 return card_callback_handler.handle_management_form_submit(
                     operator_open_id=action_event.operator_open_id,
                     admin_action=admin_action,
-                    identifier=action_event.action_value.get("identifier", ""),
-                    company_id=form_value.get("company_id", ""),
-                    metric_name=form_value.get("metric_name", ""),
-                    reason=form_value.get("reason", ""),
+                    identifier=identifier,
+                    company_id=action_event.form_value.get("company_id", ""),
+                    metric_name=action_event.form_value.get("metric_name", ""),
+                    reason=action_event.form_value.get("reason", ""),
                     chat_id=chat_id,
                     thread_id=None,
                     message_id=message_id,
@@ -502,7 +520,11 @@ def build_supervisor(
         PermissionRecomputeAdapter,
     )
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
-    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher, ManagementCardDispatcher
+    from lingxi.core.admin.card_dispatch import (
+        ConfirmCardDispatcher,
+        ManagementCardContextStore,
+        ManagementCardDispatcher,
+    )
     from lingxi.core.admin.router import AdminCommandRouter
     from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
@@ -544,10 +566,21 @@ def build_supervisor(
         timeouts=config.postgres_timeouts,
         audit=audit,
     )
+    # 管理员可见展示名解析口（Trace #469 S-1）：open_id→姓名+邮箱、公司编号→
+    # 中文名、指标 ID→中文别名三个真库/真配置查询集中在 ``PostgresAdminQueries``
+    # 一个实例上（结构性实现 ``AdminDisplayNames``，不继承），与下面 ``queries=``
+    # 复用同一个对象——两个 Protocol 的调用面不同，但没有理由为了"各自独立声明
+    # Protocol"这条既有惯例而在这里也建两份连接。
+    admin_display_names = PostgresAdminQueries(
+        str(config.postgres_dsn), timeouts=config.postgres_timeouts
+    )
     # 确认卡片的出站发送与回调后的终态更新共用同一个 CardKit 传输实例。
     admin_card_transport = LarkAdminCardTransport(client)
     confirm_card_dispatcher = ConfirmCardDispatcher(
-        transport=admin_card_transport, tracker=pending_action_store, audit=audit
+        transport=admin_card_transport,
+        tracker=pending_action_store,
+        audit=audit,
+        display_names=admin_display_names,
     )
     # 用户权限管理卡发送侧（#439 B 档，Trace #445 opus 审查坐实并修复）：此前
     # 只有渲染层（`core/admin/management_card.render_management_card`）接进
@@ -558,17 +591,23 @@ def build_supervisor(
     # 实例（同上 `confirm_card_dispatcher` 的取舍，两者生命周期相同、都随本次
     # 装配一起建立）；发送失败只降级（`ManagementCardDispatcher` 自己的姿态，
     # 见该类文档），不影响 `/admin user` 既有的文本回复这条主路径。
+    # 表单提交 identifier 缺失形态下的发送侧登记（Trace #469 B-1）：单实例
+    # 进程内内存 TTL 映射，与 management_card_dispatcher 生命周期相同、
+    # 装配层的同一个实例同时喂给发送侧（登记）与 make_event_handler（查询），
+    # 见 core/admin/card_dispatch.ManagementCardContextStore 模块文档。
+    management_card_context_store = ManagementCardContextStore()
     management_card_dispatcher = ManagementCardDispatcher(
         transport=LarkAdminManagementCardTransport(client),
         catalog=TomlCompanyMetricCatalog(),
         audit=audit,
+        display_names=admin_display_names,
+        context_store=management_card_context_store,
     )
     admin_router = AdminCommandRouter(
         registry=admin_registry_lookup,
-        queries=PostgresAdminQueries(
-            str(config.postgres_dsn), timeouts=config.postgres_timeouts
-        ),
+        queries=admin_display_names,
         audit=audit,
+        display_names=admin_display_names,
         pending_actions=pending_action_store,
         confirm_cards=confirm_card_dispatcher,
         management_cards=management_card_dispatcher,
@@ -596,6 +635,7 @@ def build_supervisor(
         group_notifier=group_notifier,
         group_chat_id=config.admin_group_chat_id,
         audit=audit,
+        display_names=admin_display_names,
         # 管理卡表单提交/逐行收回（Issue #439 B 档接线）：复用已经在上面装好的
         # 同一个 AdminCommandRouter 实例——`handle_management_form_submit`/
         # `handle_management_revoke` 把管理卡交互转译成等价的 `/admin ...`
@@ -690,6 +730,7 @@ def build_supervisor(
             audit=audit,
             card_callback_handler=card_callback_handler,
             group_mention_hint=group_mention_hint,
+            management_card_context_store=management_card_context_store,
         ),
         backoff=BackoffPolicy(
             base_seconds=config.reconnect_base_seconds,
@@ -816,6 +857,7 @@ def assemble_delivery_consumer(
         cards=cards,
         limit=config.delivery_batch_limit,
         on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
+        queue_delay_hint_seconds=config.queue_delay_hint_seconds,
     )
 
 

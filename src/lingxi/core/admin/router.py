@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.pending_action import (
     LOCAL_PERMISSION_ACTION_TYPES,
     PendingAction,
@@ -268,6 +269,7 @@ class AdminCommandRouter:
         registry: AdminRegistryLookup,
         queries: AdminQueries,
         audit: AuditSink,
+        display_names: AdminDisplayNames,
         pending_actions: PendingActionPreparer | None = None,
         confirm_cards: ConfirmCardSender | None = None,
         management_cards: ManagementCardSender | None = None,
@@ -275,6 +277,12 @@ class AdminCommandRouter:
         self._registry = registry
         self._queries = queries
         self._audit = audit
+        # 必填（Trace #469 S-1）：文本回复端（_render_user_status/
+        # _render_local_overrides/_render_galaxy_source/_render_audit_query/
+        # _render_trace）全部经这个端口翻译 open_id/公司编号/指标 ID，不允许
+        # "未装配则原样回显内部标识"的安全兜底——见 core/admin/display_names.
+        # AdminDisplayNames 模块文档「安全边界」一节。
+        self._display_names = display_names
         # 两者均可选、成对未装配时安全兜底（Issue #96 S-M-02）：suspend/resume
         # 命令会被识别，但回复"该功能当前不可用"，不假装已经创建了待确认操作——
         # 与既有"未装配=安全兜底而不是崩溃"的惯例同一姿态（见
@@ -447,7 +455,9 @@ class AdminCommandRouter:
                     handled=True,
                     content_key="admin.user_status",
                     content_version=_CONTENT_VERSION,
-                    reply_text=_render_user_status(command.identifier, status),
+                    reply_text=_render_user_status(
+                        command.identifier, status, display_names=self._display_names
+                    ),
                 ),
                 actor=entry.feishu_open_id,
                 roles=roles,
@@ -474,7 +484,7 @@ class AdminCommandRouter:
                     handled=True,
                     content_key="admin.audit_query",
                     content_version=_CONTENT_VERSION,
-                    reply_text=_render_audit_query(command.identifier, window_hours, events),
+                    reply_text=_render_audit_query(resolved_audit_identifier, window_hours, events),
                 ),
                 actor=entry.feishu_open_id,
                 roles=roles,
@@ -495,6 +505,9 @@ class AdminCommandRouter:
                     content_version=_CONTENT_VERSION,
                     reply_text=_render_trace(command.identifier, trace),
                 ),
+                # _render_trace 不展示 open_id/公司/指标（只展示追溯号本身与
+                # 已经过 _render_user_status 同款状态翻译的开通/账号状态，见
+                # 该函数实现），因此不需要额外传入 display_names。
                 actor=entry.feishu_open_id,
                 roles=roles,
                 target=command.identifier,
@@ -597,9 +610,9 @@ class AdminCommandRouter:
                             content_version=_CONTENT_VERSION,
                             reply_text=(
                                 "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
-                                "或已被收回，或同一键同时存在授权与抑制两条需要精确"
-                                "指定），请用 /admin user 查询后核对，或改用"
-                                " override_id 精确指定收回。"
+                                "或已被撤销，或同一键同时存在补充授权与屏蔽指标两条"
+                                "需要精确指定），请用 /admin user 查询后核对，或使用"
+                                "查询结果附带的管理卡逐行撤销按钮精确指定撤销。"
                             ),
                         ),
                         actor=entry.feishu_open_id,
@@ -720,7 +733,7 @@ class AdminCommandRouter:
                     handled=True,
                     content_key="admin.write_action_unavailable",
                     content_version=_CONTENT_VERSION,
-                    reply_text="该功能当前不可用，请联系 Ops。",
+                    reply_text="该功能当前不可用，请联系技术支持。",
                 ),
                 actor=entry.feishu_open_id,
                 roles=roles,
@@ -860,6 +873,14 @@ class AdminCommandRouter:
 
 
 def _render_help(roles: Sequence[str]) -> str:
+    """术语统一（Trace #469 S-1，PM 补充裁定第 4 条）：命令说明改用「补充授权」
+    「屏蔽指标」「撤销」，与管理卡按钮、确认卡/终态卡/群通知同一份说法。最后一行
+    不再声称"覆盖ID 见 /admin user 查询结果"——`/admin user` 回显自本批起不再
+    展示裸 override_id（内部 ID 只留审计，见 ``_render_local_overrides``），已知
+    覆盖ID 时仍可直接使用，但多数场景请改用上一行的「标识+公司+指标」形式或管理卡
+    逐行「撤销」按钮。
+    """
+
     role_line = "、".join(roles) if roles else "(无)"
     return (
         "BI Plus 管理命令：\n"
@@ -869,13 +890,13 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin trace <追溯号> — 按追溯号查开通失败原因与事件时间线\n"
         "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
-        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权"
+        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起补充授权"
         "（需本人飞书确认卡片；指标支持已配置的中文别名）\n"
-        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起本地抑制（同上）\n"
-        "/admin revoke_permission <标识> <公司> <指标> <原因> — 发起收回本地覆盖"
+        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起屏蔽指标（同上）\n"
+        "/admin revoke_permission <标识> <公司> <指标> <原因> — 发起撤销本地覆盖"
         "（需本人飞书确认卡片；与 grant/suppress 同一参数形状，服务端反查覆盖ID）\n"
-        "/admin revoke_permission <覆盖ID> <原因> — 按覆盖ID直接发起收回（覆盖ID 见"
-        " /admin user 查询结果）\n"
+        "/admin revoke_permission <覆盖ID> <原因> — 已知覆盖ID时按覆盖ID直接发起撤销"
+        "（多数场景请改用上一行的标识+公司+指标形式，或使用管理卡逐行撤销按钮）\n"
         f"当前角色：{role_line}"
     )
 
@@ -891,13 +912,23 @@ _OVERRIDE_REASON_PREVIEW_LENGTH = 20
 #: 不引入对 ``core/permission/local_override.OverrideDirection`` 的依赖——本模块
 #: 拿到的是 ``LocalPermissionOverrideView.direction`` 这个已经解出来的字符串，
 #: 与 ``core/admin/notification.py`` 的 ``_ACTION_LABEL`` 同一取舍（展示文案就地
-#: 维护一份，不反向依赖纯逻辑层的枚举类型）。
-_OVERRIDE_DIRECTION_LABEL: dict[str, str] = {"grant": "授权", "suppress": "抑制"}
+#: 维护一份，不反向依赖纯逻辑层的枚举类型）。术语与 ``notification._ACTION_
+#: LABEL``、``management_card._DIRECTION_LABEL`` 三处同步（Trace #469 S-1）。
+_OVERRIDE_DIRECTION_LABEL: dict[str, str] = {"grant": "补充授权", "suppress": "屏蔽指标"}
 
 
-def _render_local_overrides(overrides: Sequence[LocalPermissionOverrideView]) -> str:
+def _render_local_overrides(
+    overrides: Sequence[LocalPermissionOverrideView], *, display_names: AdminDisplayNames
+) -> str:
     """``/admin user`` 回显的「当前生效本地覆盖」段——每行一条，无覆盖时一行
-    「无本地覆盖」（#319 S-P-1b 卡 B）。"""
+    「无本地覆盖」（#319 S-P-1b 卡 B）。
+
+    自 Trace #469 S-1 起**不再展示 override_id**（内部 ID 只留审计，管理员需要
+    发起撤销时用「标识+公司+指标」形式或管理卡逐行撤销按钮，均不需要先看到这个
+    内部 ID）；公司/指标经 ``display_names`` 翻译成人类可读文本，与管理卡
+    ``_override_row_elements`` 的「公司中文名 · 指标中文名 · 原因 · 时间」同一
+    格式。
+    """
 
     if not overrides:
         return "无本地覆盖"
@@ -907,9 +938,11 @@ def _render_local_overrides(overrides: Sequence[LocalPermissionOverrideView]) ->
         reason = override.reason
         if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
             reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
+        company_label = display_names.company_label(company_id=override.company_id)
+        metric_label = display_names.metric_label(metric_id=override.metric_name)
         lines.append(
-            f"- {override.override_id}（{direction_label}）"
-            f"公司 {override.company_id} · 指标 {override.metric_name} · "
+            f"- （{direction_label}）"
+            f"公司 {company_label} · 指标 {metric_label} · "
             f"原因 {reason} · {override.created_at}"
         )
     return "\n".join(lines)
@@ -937,37 +970,170 @@ _GALAXY_SOURCE_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
 )
 
 
-def _render_galaxy_source(summary: GalaxySourceSummary | None) -> str:
+def _render_galaxy_source(
+    summary: GalaxySourceSummary | None, *, display_names: AdminDisplayNames
+) -> str:
     """``/admin user`` 回显的「银河来源」段（#439 B 档，见
-    ``views.GalaxySourceSummary`` 文档）。仅供展示，不参与任何权限判定。"""
+    ``views.GalaxySourceSummary`` 文档）。仅供展示，不参与任何权限判定。公司
+    编号经 ``display_names.company_label`` 翻译成「中文名（编号）」（Trace
+    #469 S-1）。"""
 
     if summary is None or summary.reason in _GALAXY_SOURCE_UNAVAILABLE_REASONS:
         return "银河来源不可用（无法计算，不代表该用户没有银河权限）"
     if not summary.granted:
         return f"当前没有可用的银河权限（原因：{summary.reason}）"
-    company_label = "全部公司" if summary.all_companies else "、".join(summary.companies)
+    if summary.all_companies:
+        company_label = "全部公司"
+    else:
+        company_label = "、".join(
+            display_names.company_label(company_id=cid) for cid in summary.companies
+        )
     function_label = "、".join(summary.functions)
     return f"公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
 
 
-def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> str:
+#: 内部标识前缀白名单（Trace #469 S-1）：管理员可见文案零 ou_/lpo_/pac_ 是
+#: 结构性硬要求，即使这个值是管理员自己刚刚敲进来的输入也不例外——真正需要
+#: 隐藏的是"这串文本长得像系统内部标识"这件事本身，与它的来源（系统生成 /
+#: 管理员键入）无关。非内部 ID 形状的输入（多数情况下是邮箱，或管理员的一次
+#: 手误）原样回显，不额外做资料查找。
+_INTERNAL_ID_PREFIXES: tuple[str, ...] = ("ou_", "lpo_", "pac_")
+
+
+def _safe_identifier_echo(identifier: str) -> str:
+    if identifier.startswith(_INTERNAL_ID_PREFIXES):
+        return "该用户"
+    return identifier
+
+
+#: 开通/账号状态英文机器码 → 中文（Trace #469 S-1 TOP-6）：与迁移基线里
+#: ``app_user`` 表 ``provisioning_state``/``account_state`` 两个 CHECK 约束的
+#: 取值域一一对应。未登记的取值原样展示，不当成异常——两个 CHECK 约束已经在
+#: 数据库层面把取值收窄到这张表列出的全部成员，这里的 "未登记" 分支结构上只在
+#: 约束本身被修改、而这份词表忘了同步时才会命中，失败开放比拒绝渲染整条回复
+#: 更安全。
+_PROVISIONING_STATE_LABEL: dict[str, str] = {
+    "guest": "访客（尚未开始开通）",
+    "matching": "银河权限匹配中",
+    "manual_review": "待人工复核",
+    "provisioning": "开通中",
+    "mcp_syncing": "问数权限同步中",
+    "active": "已开通",
+    "aborted": "开通已中止",
+}
+_ACCOUNT_STATE_LABEL: dict[str, str] = {
+    "enabled": "启用",
+    "suspended": "已停用",
+    "deleting": "删除中",
+    "deleted": "已删除",
+}
+
+#: ``/admin trace`` 回显里的入站事件类型 → 中文（Trace #469 修复包 B，B-6）：
+#: 与 ``adapters/feishu_events.py`` 的 ``MESSAGE_RECEIVE_EVENT``/
+#: ``CARD_ACTION_TRIGGER_EVENT`` 两个字面量一一对应——本模块历来不 import
+#: ``adapters/``（模块文档「只依赖注入的 Protocol 端口」），因此这里独立登记
+#: 一份取值，不反向依赖那个模块。未登记的取值走 :func:`_display_or_unregistered`
+#: 回退，不假装认识每一个未来可能新增的事件类型。
+_EVENT_TYPE_LABEL: dict[str, str] = {
+    "im.message.receive_v1": "用户消息",
+    "card.action.trigger": "卡片按钮/表单交互",
+}
+
+#: ``inbound_event.handled_as`` 枚举 → 中文（Trace #469 修复包 B，B-6）：与
+#: ``core/conversation/ports.HandledAs`` 的六个取值一一对应，同上一条注释
+#: 同一理由不反向 import 该枚举。
+_HANDLED_AS_LABEL: dict[str, str] = {
+    "task_queued": "已入队等待处理",
+    "busy_hint": "系统繁忙提示",
+    "not_provisioned": "未开通，未受理",
+    "auto_provisioning": "自动开通编排中",
+    "command": "管理命令",
+    "dropped": "重复投递，已丢弃",
+}
+
+#: 开通失败原因机器码 → 中文（Trace #469 修复包 B，B-6）：覆盖
+#: ``core/identity/onboarding_runner.py``/``apps/scheduler/stalled_
+#: provisioning.py`` 现有登记的全部原因码；与上面两张表同一姿态——白名单式
+#: 展示层翻译，不反向依赖产生这些字面量的具体模块。未登记的取值（未来新增
+#: 但这里忘了同步）走 :func:`_display_or_unregistered` 回退，不崩、不假装
+#: 认识。
+_FAILURE_REASON_LABEL: dict[str, str] = {
+    "account_not_enabled": "账号未启用",
+    "already_running": "该追溯号的开通已在处理中（重复触发）",
+    "app_access_token_unwired": "应用访问令牌未接线",
+    "delegated_subject": "专用主体，不走个人开通流程",
+    "executor_unavailable": "开通执行器不可用",
+    "innertest_roster_rejected": "不在内测名单中",
+    "mcp_sync_timeout": "问数权限同步超时",
+    "metric_translation_map_unavailable": "指标翻译映射不可用",
+    "missing_access_token_supply": "缺少访问令牌来源配置",
+    "missing_encrypt_key": "缺少加密密钥配置",
+    "missing_environment_variable": "缺少必需的环境变量",
+    "partial_coordinates": "银河权限坐标不完整",
+    "role_function_map_unavailable": "角色功能映射不可用",
+    "rotation_persist_failed": "凭据轮换结果落库失败",
+    "stalled_lease_expired": "认领租约已过期（长时间无进展）",
+    "stopping": "进程正在停机",
+    "user_access_token_unwired": "用户访问令牌未接线",
+    "user_environment_sweep_failed": "用户环境清理失败",
+}
+
+
+def _display_or_unregistered(value: str, table: dict[str, str]) -> str:
+    """未登记的机器码既不原样吞掉、也不假装认识——统一回退成"原值（未登记
+    显示名）"这个样式（Trace #469 修复包 B，B-6，产品负责人裁定的兜底样式）：
+    管理员至少能看到原始取值用于排查/反馈，同时明确知道这是词表遗漏而不是
+    真的没有这个状态，不会误以为系统坏了。"""
+
+    label = table.get(value)
+    if label is None:
+        return f"{value}（未登记显示名）"
+    return label
+
+
+def _render_user_status(
+    identifier: str, status: AdminUserStatusView | None, *, display_names: AdminDisplayNames
+) -> str:
+    """``/admin user`` 的文本回复（与管理卡并存，见 ``_dispatch`` 调用点）。
+
+    Trace #469 S-1 起，查到用户时头部一律显示 ``display_names.user_label``
+    解析出的「姓名（邮箱）」，不再回显管理员自己输入的标识——即使那是他自己
+    刚打进来的 ``open_id``，也必须满足"管理员可见文案零 ou_"这条结构性要求
+    （见 :data:`_INTERNAL_ID_PREFIXES` 上方注释）。查无记录时退回
+    :func:`_safe_identifier_echo`：非内部 ID 形状的输入原样回显（多数是邮箱，
+    帮助管理员核对是不是打错了），内部 ID 形状则退化为通用占位。
+    """
+
     if status is None:
-        return f"未找到标识为 {identifier} 的用户记录。"
+        return f"未找到标识为 {_safe_identifier_echo(identifier)} 的用户记录。"
+    label = display_names.user_label(open_id=status.identifier)
     return (
-        f"用户 {identifier}：\n"
-        f"开通状态：{status.provisioning_state}\n"
-        f"账号状态：{status.account_state}\n"
+        f"用户 {label}：\n"
+        f"开通状态：{_PROVISIONING_STATE_LABEL.get(status.provisioning_state, status.provisioning_state)}\n"
+        f"账号状态：{_ACCOUNT_STATE_LABEL.get(status.account_state, status.account_state)}\n"
         f"权限版本：{status.permission_version}\n"
         f"更新时间：{status.updated_at}\n"
-        f"银河来源：{_render_galaxy_source(status.galaxy_source)}\n"
-        f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides)}"
+        f"银河来源：{_render_galaxy_source(status.galaxy_source, display_names=display_names)}\n"
+        f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides, display_names=display_names)}"
     )
 
 
 def _render_audit_query(
     identifier: str | None, window_hours: int, events: Sequence[AdminEventView]
 ) -> str:
-    scope = f"标识 {identifier} 的" if identifier else ""
+    """``identifier`` 已经是 :meth:`AdminQueries.resolve_identifier` 反查过的
+    结果（``_dispatch`` 调用点传入 ``resolved_audit_identifier``）——邮箱形态的
+    输入反查失败时原样是那个邮箱，反查成功或管理员直接输入 open_id 时可能是
+    open_id。这里不做一次额外的用户资料查找（审计查询是高频诊断动作，多一次
+    DB 往返成本不值得）：非内部 ID 形状的值（多数是邮箱）原样展示，内部 ID
+    形状（``ou_``/``lpo_``/``pac_``）退化为通用占位——满足"管理员可见文案零
+    ou_"这条结构性要求（Trace #469 S-1），代价是 open_id 场景下不显示姓名，
+    这与 ``_render_user_status`` 会经 ``display_names.user_label`` 完整翻译不
+    同（那里已经确认这是一个真实存在的用户，多一次查找换来更好的可读性；这里
+    只是一次事件列表查询，不需要为了展示效果额外查一次 ``app_user``）。
+    """
+
+    scope = f"标识 {_safe_identifier_echo(identifier)} 的" if identifier else ""
     if not events:
         return f"最近 {window_hours} 小时内没有找到{scope}相关事件。"
     header = f"最近 {window_hours} 小时内{scope}最近事件（{len(events)} 条）："
@@ -997,16 +1163,27 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     lines = [
         f"追溯号 {trace_id}：{trace.event_count} 条入站事件",
         f"首次接收: {trace.first_received_at}",
-        f"最近事件类型: {trace.last_event_type}",
-        f"最近处理方式: {trace.last_handled_as or '(未标记)'}",
+        # 事件类型/处理方式机器码 → 中文（Trace #469 修复包 B，B-6）：此前
+        # 直出 im.message.receive_v1/not_provisioned 这类内部枚举取值。
+        f"最近事件类型: {_display_or_unregistered(trace.last_event_type, _EVENT_TYPE_LABEL)}",
+        f"最近处理方式: "
+        f"{_display_or_unregistered(trace.last_handled_as, _HANDLED_AS_LABEL) if trace.last_handled_as else '(未标记)'}",
         f"是否已认领: {'是' if trace.dispatched else '否'}",
     ]
     if trace.provisioning_state is not None:
-        lines.append(f"开通状态: {trace.provisioning_state}")
-        lines.append(f"账号状态: {trace.account_state}")
-    if trace.failure_reason is not None:
+        # 英文状态码 → 中文（Trace #469 S-1 TOP-6），复用 _render_user_status
+        # 同一份词表，不允许两处出现不同翻译。
         lines.append(
-            f"失败原因: {trace.failure_reason}"
+            f"开通状态: {_PROVISIONING_STATE_LABEL.get(trace.provisioning_state, trace.provisioning_state)}"
+        )
+        lines.append(
+            f"账号状态: {_ACCOUNT_STATE_LABEL.get(trace.account_state, trace.account_state)}"
+        )
+    if trace.failure_reason is not None:
+        # 失败原因机器码 → 中文（Trace #469 修复包 B，B-6）：此前直出
+        # role_revoked 这类内部原因码。
+        lines.append(
+            f"失败原因: {_display_or_unregistered(trace.failure_reason, _FAILURE_REASON_LABEL)}"
             f"（{trace.failure_event_type}，{trace.failure_occurred_at}）"
         )
     else:

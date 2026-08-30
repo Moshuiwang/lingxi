@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-30-2"
-digest = "sha256:a004225a5a155fd0dfc65b4cf020d65a4d1c5369e62a3b0658d3473c760394ad"
+version = "2026-08-30-5"
+digest = "sha256:b9dd535c5e9edc7ac1fad5411ec9e189109a34d3893c069e007aaef83b19cffb"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -27,11 +27,14 @@ retired_versions = [
   "2026-08-28-4",
   "2026-08-29-1",
   "2026-08-30-1",
+  "2026-08-30-2",
+  "2026-08-30-3",
+  "2026-08-30-4",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
 [keys]
-"cards.query.empty.body" = "e799c23e7c6c94a0"
+"cards.query.empty.body" = "b3cf697a38b609f5"
 "cards.query.empty.title" = "463b2262ebe14a9f"
 "cards.query.failure.body" = "9273d00cc73897fe"
 "cards.query.failure.title" = "61f9bd1ac5624140"
@@ -46,6 +49,7 @@ retired_versions = [
 "texts.delivery.sheet_ready" = "3e7fbf93015d32a9"
 "texts.delivery.sheet_uncertain" = "6cb0ac2f13362da1"
 "texts.gateway.busy_hint" = "7984bc41c89b9e08"
+"texts.gateway.busy_hint_queued" = "84cd962306594c84"
 "texts.gateway.delivery_expired" = "650d1541a4369696"
 "texts.gateway.group_mention_hint" = "6ff88d15b2832edb"
 "texts.gateway.new_session" = "914f6fa8697310f6"
@@ -53,20 +57,22 @@ retired_versions = [
 "texts.gateway.session_rotated" = "df77349f3165a8cb"
 "texts.gateway.slash_rejected" = "9b97c561e83c0302"
 "texts.gateway.suspended" = "dfe76626dc97ecce"
+"texts.gateway.unexpected_error" = "e73663772f0a3ee9"
 "texts.memory.cleared" = "69a517b197f284af"
-"texts.memory.forget_not_found" = "230bcb25eb539164"
-"texts.memory.forgotten" = "8dd2951f8b668251"
-"texts.memory.limit_exceeded" = "04fe51feb442a36c"
+"texts.memory.forget_not_found" = "09690dd72d85e7e1"
+"texts.memory.forgotten" = "45700689fc536d3a"
+"texts.memory.forgotten_unsafe" = "af2c737775f8522e"
+"texts.memory.limit_exceeded" = "aaa769f990b7c661"
 "texts.memory.list" = "7417464c7145de9c"
 "texts.memory.list_empty" = "f25239a6855eb251"
-"texts.memory.list_entry" = "fe4361b6a8f4c1e5"
-"texts.memory.list_entry_unsafe" = "6908c89a084dc5ff"
+"texts.memory.list_entry" = "1a4e33f7721ae949"
+"texts.memory.list_entry_unsafe" = "1bd42955e07f3219"
 "texts.memory.remember_unsafe" = "186bff87bab87ad4"
 "texts.memory.remembered" = "284fff1c7a19ba43"
 "texts.memory.type_label.calibration_preference" = "fd959acebfa8d8f3"
 "texts.memory.type_label.convention_template" = "95271099604f4d6e"
 "texts.memory.type_label.term_mapping" = "6030911f16b8b73d"
-"texts.memory.usage_help" = "6abdb399dc856115"
+"texts.memory.usage_help" = "d0c16b5987907005"
 "texts.onboarding.checking" = "738d208e40a19f0b"
 "texts.onboarding.completed" = "e6e721e2af6a2d7d"
 "texts.onboarding.delegated_subject" = "2d5caff476da0546"
@@ -115,13 +121,21 @@ retired_versions = [
 "texts.roster.value_absent" = "74e9907bf9a62de2"
 "texts.worker.action.completed" = "f28461bb49c85647"
 "texts.worker.action.composing" = "d721250554c3e20b"
+"texts.worker.action.composing_done" = "8b346b85cebf7dd7"
 "texts.worker.action.processing" = "3b7e27cb4379da3c"
+"texts.worker.action.processing_done" = "59f6c836929344e5"
 "texts.worker.action.querying_describe_metric" = "066818d6f9cc2839"
+"texts.worker.action.querying_describe_metric_done" = "15a3edc3ea3590fc"
 "texts.worker.action.querying_list_metrics" = "0482a62d7a042185"
+"texts.worker.action.querying_list_metrics_done" = "2046fb8eacdc8c1d"
 "texts.worker.action.querying_metrics" = "71f01435c81ae105"
+"texts.worker.action.querying_metrics_done" = "da8b26cf4d2c65a7"
 "texts.worker.action.querying_query_metric" = "71f01435c81ae105"
+"texts.worker.action.querying_query_metric_done" = "da8b26cf4d2c65a7"
 "texts.worker.action.querying_search_dimension" = "87b8b522d0a66b0d"
+"texts.worker.action.querying_search_dimension_done" = "b3f87e8fa8b6867d"
 "texts.worker.action.working" = "7306c419b0fb0d14"
+"texts.worker.action.working_done" = "ce61f50590320c2a"
 "texts.worker.card_handoff_notice" = "f926d145f0f18496"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"

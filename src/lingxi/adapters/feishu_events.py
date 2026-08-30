@@ -227,15 +227,87 @@ class CardActionEvent:
     ``sender_open_id`` 的既有取舍相同（只信事件体里飞书自己标注的操作者字段，不
     信任回传值 ``action_value`` 里任何自称的身份）。``action_value`` 只保留
     :func:`~lingxi.core.admin.notification.render_confirm_card` 建卡时写进按钮的
-    ``pending_action_id``/``decision`` 两个键（原样透传，具体校验交给
-    ``core/admin/card_callback.py``——本函数只负责"读出这段事件体写了什么"，不做
-    业务判断）。
+    ``pending_action_id``/``decision`` 两个键，或
+    :mod:`~lingxi.core.admin.management_card` 建卡时写进按钮的
+    ``admin_action``/``identifier``/``override_id`` 若干键（原样透传，具体校验
+    交给 ``core/admin/card_callback.py``——本函数只负责"读出这段事件体写了
+    什么"，不做业务判断）。
+
+    ``action_name``/``form_value``（W0-1 追加结论，2026-08-30，真实点击实测）：
+    分别是按钮自身的 ``action.name``（建卡时写入的 ``grant_submit``/
+    ``suppress_submit`` 等）与 form 容器提交的字段值（``action.form_value``，
+    ``{字段 name: 已填值}``）。真实回调坐实：form 内提交按钮的 ``action.value``
+    经常不以 Mapping 形态到达（缺失或需要反序列化的字符串），下游
+    （``apps/gateway/__init__.py``）因此需要 ``action_name`` 作为不依赖
+    ``value`` 内容的路由后备判据；``form_value`` 原本由 gateway 自己从原始
+    payload 里另行读取，现在与 ``action_value`` 一起在本函数集中解析，单一
+    出处，不留第二份解析逻辑。
     """
 
     event_id: str
     operator_open_id: str
     action_value: Mapping[str, str]
+    action_name: str | None
+    form_value: Mapping[str, str]
     trace_id: str
+
+
+def _stringify_scalars(mapping: Mapping[str, Any]) -> dict[str, str]:
+    """只保留字符串/数字这类简单标量并统一转成字符串。不信任事件体里出现的
+    任何嵌套结构或意料之外的类型（结构上不给伪造回调可乘之机，即便真的出现了
+    也不会在这里崩溃，只会被 ``core/admin/card_callback.py`` 当成缺少必需
+    字段拒绝）。``action.value`` 与 ``action.form_value`` 共用这一份过滤。
+    """
+
+    return {
+        str(key): str(value)
+        for key, value in mapping.items()
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+    }
+
+
+# ``action.value`` 是字符串形态时允许的最大字节数。真实表单回调里 value 只装
+# render 建卡时写进去的少量标量键（admin_action/identifier/override_id 一类），
+# 正常在几百字节内；给一个宽松但有限的上限，专门挡住"伪造回调塞一大段畸形
+# JSON"这类可用性攻击（Issue #469 rc22 codex 外审第 1 轮抓到：深层嵌套 JSON 会
+# 触发 RecursionError，逃出下面的解析捕获升级成 gateway 未处理异常）。
+_MAX_ACTION_VALUE_JSON_BYTES = 8192
+
+
+def _parse_action_value(raw_value: object) -> Mapping[str, Any] | None:
+    """把 ``action.value`` 解析成 Mapping；三种到达形态兼容（W0-1 追加结论，
+    2026-08-30，真实点击实测坐实）：
+
+    1. 已经是 Mapping——直接用（此前唯一认识的形态）。
+    2. 是一段字符串——尝试 ``json.loads``；解析结果是 Mapping 才采纳，否则
+       视为不可用（不是本函数应该猜测语义的场景）。
+    3. 缺失或其它类型——返回 ``None``，交给调用方决定是否还有
+       ``action.form_value`` 可以兜底（见 :func:`parse_card_action_event`）。
+
+    飞书官方文档（《卡片回传交互回调》）的示例把 ``value`` 标注为对象，与真实
+    表单提交回调实测到的字符串/缺失形态不一致——按"文档不明处以真实行为为准"
+    处理，本函数因此比文档描述更宽松，不因为文档只写了一种形态就拒绝其余两种
+    真实观察到的形态。
+
+    **加固（Issue #469 rc22 codex 外审第 1 轮）**：字符串形态先卡长度上限，再
+    ``json.loads``；捕获面从 ``(TypeError, ValueError)`` 扩到并含
+    ``RecursionError``——深层嵌套 JSON（``[[[…]]]``）抛的是 ``RecursionError``
+    （``RuntimeError`` 子类，不是 ``ValueError``），此前会逃出捕获、被上层当成
+    代码 bug 型未处理异常，让一条伪造回调升级成可重复的 gateway 可用性攻击。
+    任何解析失败一律按"不可用"返回 ``None``，与其余畸形形态同一失败关闭姿态。
+    """
+
+    if isinstance(raw_value, Mapping):
+        return raw_value
+    if isinstance(raw_value, str):
+        if len(raw_value.encode("utf-8")) > _MAX_ACTION_VALUE_JSON_BYTES:
+            return None
+        try:
+            parsed = json.loads(raw_value)
+        except (TypeError, ValueError, RecursionError):
+            return None
+        return parsed if isinstance(parsed, Mapping) else None
+    return None
 
 
 def parse_card_action_event(
@@ -243,11 +315,20 @@ def parse_card_action_event(
 ) -> CardActionEvent:
     """把一条 ``card.action.trigger`` 事件体解析成 :class:`CardActionEvent`。
 
-    **证据等级 1**：真实事件体的确切字段未经真实回调验证（本切片全部断言跑在
-    构造的假事件体上），字段名依据飞书卡片回传交互 2.0 的公开文档结构；真实链路
-    验证属 `biai-stage` L4a（本 Story 明确留待验收窗口，见 PR 描述）。解析失败一律
-    ``CardActionParseError``，不抛 ``KeyError``/``TypeError``，与 ``parse_message_
-    event`` 同一姿态。
+    **证据等级 1→部分 L4a**：``operator_open_id``/``event_id``/``action`` 段
+    结构本身仍未经真实回调验证；但 ``action.value`` 的到达形态（W0-1 追加
+    结论，2026-08-30）**已由真实点击坐实**——4 个 form 内提交按钮的真实回调
+    ``action.value`` 全部不以 Mapping 形态到达（缺失或字符串），此前的实现
+    （硬性要求 Mapping）会让这类真实回调在这里被整体拒绝
+    （``CardActionParseError``），管理卡表单提交因此从未真正到达
+    ``core/admin/card_callback.py``——这是本次要修的具体缺陷，不是假设性
+    加固。修复后的兼容策略见 :func:`_parse_action_value`。
+
+    **反伪造姿态不放宽**：``action.value`` 解析不出 Mapping、且
+    ``action.form_value`` 也不是 Mapping（两者都没有可用内容）时仍然
+    ``CardActionParseError``——"完全没有可用回传内容"与"有 form_value 说明这是
+    一次表单提交、只是 value 恰好没带上 admin_action"是两种不同的情况，前者
+    继续失败关闭，不猜测这是不是一次合法的卡片交互。
 
     **2026-08-25 与 ``adapters/feishu_admin_card._card_payload`` 的按钮改动（顶层
     元素 + ``behaviors`` 回调，替换此前的 ``action`` 容器）核对兼容性**：飞书
@@ -258,9 +339,8 @@ def parse_card_action_event(
     ``value`` 标注为回调事件 ``event.action.value`` 字段的来源，与本函数已经在读
     的路径（``payload["event"]["action"]["value"]``）一致；两篇文档都没有把这个
     路径描述成随按钮是否套 ``action`` 容器、或按钮是新 2.0 顶层形态还是旧形态而
-    变化。本函数因此不需要为新按钮形状新增兼容分支或改动解析路径。**这只是官方
-    文档层面的核实，证据等级仍是 1**：真实点击触发的事件体是否逐字符合文档描述，
-    仍是 `biai-stage` L4a 受控验收范围，未经真实回调验证。
+    变化。本函数因此不需要为新按钮形状新增兼容分支或改动解析路径本身（只改了
+    "读出来的值不是 Mapping 时怎么办"这一步，见上文）。
     """
 
     if not isinstance(payload, Mapping):
@@ -283,23 +363,23 @@ def parse_card_action_event(
     action = event.get("action")
     if not isinstance(action, Mapping):
         raise CardActionParseError("事件体缺少 action 段")
-    raw_value = action.get("value")
-    if not isinstance(raw_value, Mapping):
-        raise CardActionParseError("action 段缺少 value")
 
-    # 只保留字符串/数字这类简单标量并统一转成字符串——回传值本就只应该携带
-    # render_confirm_card 建卡时写进去的两个键，不信任事件体里出现的任何嵌套结构
-    # 或意料之外的类型（结构上不给伪造回调可乘之机，即便真的出现了也不会在这里
-    # 崩溃，只会被 core/admin/card_callback.py 当成缺少必需字段拒绝）。
-    action_value = {
-        str(key): str(value)
-        for key, value in raw_value.items()
-        if isinstance(value, (str, int, float)) and not isinstance(value, bool)
-    }
+    value_mapping = _parse_action_value(action.get("value"))
+    raw_form_value = action.get("form_value")
+    form_value_mapping = raw_form_value if isinstance(raw_form_value, Mapping) else None
+
+    if value_mapping is None and form_value_mapping is None:
+        raise CardActionParseError("action 段缺少可用的 value 或 form_value")
+
+    action_value = _stringify_scalars(value_mapping or {})
+    form_value = _stringify_scalars(form_value_mapping or {})
+    action_name = _text(action, "name")
 
     return CardActionEvent(
         event_id=event_id,
         operator_open_id=operator_open_id,
         action_value=action_value,
+        action_name=action_name,
+        form_value=form_value,
         trace_id=trace_id or new_id("trc").split("_", 1)[1],
     )

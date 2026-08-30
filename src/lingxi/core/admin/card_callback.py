@@ -81,12 +81,15 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.management_card import ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
     AdminCardTransport,
     GroupNotifier,
+    describe_failed_reason,
+    permission_scope_ids,
     render_card_payload,
     render_group_notice,
     render_terminal_card,
@@ -223,6 +226,7 @@ class AdminCardCallbackHandler:
         group_notifier: GroupNotifier | None,
         group_chat_id: str | None,
         audit: AuditSink,
+        display_names: AdminDisplayNames,
         management_actions: ManagementActionRouter | None = None,
         recompute_trigger: PermissionRecomputeTrigger | None = None,
     ) -> None:
@@ -231,6 +235,10 @@ class AdminCardCallbackHandler:
         self._group_notifier = group_notifier
         self._group_chat_id = group_chat_id
         self._audit = audit
+        # 必填（Trace #469 S-1）：终态卡「目标：」字段与管理群广播都不再允许
+        # 退回展示 open_id——见 core/admin/display_names.AdminDisplayNames 模块
+        # 文档「安全边界」一节，与 ConfirmCardDispatcher 同一条纪律。
+        self._display_names = display_names
         # 未装配时管理卡的表单/按钮交互回复"该功能当前不可用"，不假装已经路由
         # 过任何命令——与本类既有确认/取消两个端口"未装配=构造时必须传入"不同
         # （#439 新增，向后兼容既有全部调用点：不传这个参数时行为逐字节不变）。
@@ -302,6 +310,25 @@ class AdminCardCallbackHandler:
             return _toast_error("请选择指标")
         if not reason.strip():
             return _toast_error("请填写原因")
+        # 纵深加固（Trace #469 修复包 B，B-2）：上面的"非空"校验挡不住一个
+        # 非空但含空白字符的取值——`str.split()` 按任意空白切分（含全角空格
+        # U+3000，Python `str.isspace()` 同样判它为空白），审查实测
+        # `company_id="1011 sub_new_count"` 能把管理员选的指标静默左移替换掉
+        # （与上面 identifier 为空时同一个根因：拼接前不拦住，下游语法校验
+        # 认不出这类错位）。当前调用点全部来自服务端渲染的下拉选项/受控字段，
+        # 结构上不可达，但值得纵深——不假设未来的调用点也一样受控。三个字段
+        # 分别落回各自既有的拒绝文案，不新造一套措辞。
+        if any(ch.isspace() for ch in identifier):
+            self._audit.record(
+                "admin.card_callback.management_missing_identifier",
+                admin_action=admin_action,
+                trace_id=trace_id,
+            )
+            return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
+        if any(ch.isspace() for ch in company_id):
+            return _toast_error("请选择公司")
+        if any(ch.isspace() for ch in metric_name):
+            return _toast_error("请选择指标")
 
         sub_command = "grant_permission" if admin_action == ADMIN_ACTION_GRANT else "suppress_permission"
         text = f"/admin {sub_command} {identifier} {company_id} {metric_name} {reason.strip()}"
@@ -491,12 +518,40 @@ class AdminCardCallbackHandler:
         response: dict[str, Any] = {
             "toast": {
                 "type": "success" if pending.status is PendingActionStatus.EXECUTED else "info",
-                "content": _outcome_text(pending),
+                # 接线级修复（Trace #469 S-1 TOP-3）：直接用这次点击产生的
+                # ``decision.message``——``decide_confirm``/``decide_cancel``
+                # 已经为每个分支写好完整的友好中文（例如 ROLE_REVOKED 的"当前
+                # 角色已无权执行该操作，请重新查询后再发起。"），此前这里改用
+                # ``_outcome_text(pending)`` 重新按 ``pending.status`` 派生一句
+                # 更粗糙的文案（FAILED 分支曾经直出机器码 "未执行（role_
+                # revoked）"）。到这一行之前的分支已经排除了 NOT_FOUND/
+                # NOT_INITIATOR（未改变 pending 状态的情形），因此
+                # ``outcome.decision.message`` 在这里恒非空、且恰好描述"这次
+                # 点击的结果"——toast 本来就是对**这次点击**的即时反馈，用
+                # ``decision.message`` 比用只看持久状态的 ``_outcome_text``
+                # 更准确（例如幂等重放会说"该操作已经执行过，不会重复执行。"
+                # 而不是重新展示第一次的"已确认执行"）。
+                "content": outcome.decision.message,
             }
         }
         if card_payload is not None:
             response["card"] = {"type": "raw", "data": card_payload}
         return response
+
+    def _resolve_scope_labels(self, pending: PendingAction) -> tuple[str | None, str | None]:
+        """本地权限三类动作的「公司/指标」人性化展示标签（Trace #469 S-1）；
+        非本地权限动作或 payload 不可用时返回 ``(None, None)``，调用方据此让
+        渲染函数走既有的降级路径（见 ``notification.permission_scope_ids``
+        文档）。"""
+
+        scope_ids = permission_scope_ids(pending)
+        if scope_ids is None:
+            return None, None
+        company_id, metric_id = scope_ids
+        return (
+            self._display_names.company_label(company_id=company_id),
+            self._display_names.metric_label(metric_id=metric_id),
+        )
 
     def _update_card_to_terminal(self, pending: PendingAction) -> dict[str, Any] | None:
         """渲染终态卡的 CardKit JSON，并尽力而为地出带外更新已发出的那张卡片。
@@ -505,12 +560,25 @@ class AdminCardCallbackHandler:
         就已经算好，``self._confirm_cards.update()`` 失败只记审计、不影响返回值
         ——回调应答（``handle()`` 的主路径）需要在出带外更新失败时仍然携带正确
         的终态卡（模块文档「载体 #96」：应答换卡是主路径，出带外更新是冗余纵深）。
+
+        「目标：」字段与「范围」区块（Trace #469 S-1）经
+        :class:`~lingxi.core.admin.display_names.AdminDisplayNames` 翻译成人类
+        可读文本——持久化终态卡展示的是 ``pending`` 本身的状态，不随点击者是谁
+        而变化，因此这里的 ``outcome_text`` 继续由 :func:`_outcome_text` 按
+        ``pending.status``/``pending.reason`` 派生（与 ``handle()`` 里 toast 用
+        ``outcome.decision.message`` 是两件不同的事，见该处注释）。
         """
 
         if pending.card_id is None:
             return None
+        target_label = self._display_names.user_label(open_id=pending.target_open_id)
+        company_label, metric_label = self._resolve_scope_labels(pending)
         card = render_terminal_card(
-            pending, target_label=pending.target_open_id, outcome_text=_outcome_text(pending)
+            pending,
+            target_label=target_label,
+            outcome_text=_outcome_text(pending),
+            company_label=company_label,
+            metric_label=metric_label,
         )
         card_payload = render_card_payload(card)
         try:
@@ -543,8 +611,17 @@ class AdminCardCallbackHandler:
         if self._group_notifier is None or not self._group_chat_id:
             return
         # 群通知只用 render_group_notice 内部按形状白名单渲染出的脱敏摘要（见该
-        # 函数文档），不转发本次点击结论的原始 message 文本。
-        text = render_group_notice(pending)
+        # 函数文档），不转发本次点击结论的原始 message 文本。目标用户身份/公司/
+        # 指标同样经 AdminDisplayNames 翻译（Trace #469 S-1 C 项：管理群终态
+        # 广播不再维持隐私折衷，改为显示姓名+邮箱与可读内容）。
+        target_label = self._display_names.user_label(open_id=pending.target_open_id)
+        company_label, metric_label = self._resolve_scope_labels(pending)
+        text = render_group_notice(
+            pending,
+            target_label=target_label,
+            company_label=company_label,
+            metric_label=metric_label,
+        )
         try:
             self._group_notifier.send_text(
                 chat_id=self._group_chat_id, text=text, dedupe_key=pending.id
@@ -578,5 +655,11 @@ def _outcome_text(pending: PendingAction) -> str:
     if pending.status is PendingActionStatus.EXPIRED:
         return "已过期，未执行"
     if pending.status is PendingActionStatus.FAILED:
-        return f"未执行（{pending.reason or '内部原因'}）"
+        # 接线级修复（Trace #469 S-1 TOP-3）：``pending.reason`` 是
+        # ``adapters/postgres_pending_action.py`` 写入的机器码（例如
+        # "role_revoked"），此前原样拼进这句话直出给管理员——改用
+        # ``describe_failed_reason`` 翻译成中文，与群通知
+        # （``notification._group_outcome_text``）共用同一份词表，不允许两处
+        # 出现不同说法。
+        return f"未执行（{describe_failed_reason(pending.reason)}）"
     return "状态未知"  # pragma: no cover - 调用点已确保 status 非 PENDING

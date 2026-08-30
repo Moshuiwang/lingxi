@@ -294,6 +294,12 @@ REQUIRED_MODULES = (
     # 同一姿态。
     "lingxi.core.admin.management_card",
     "lingxi.adapters.admin_metric_alias_map_file",
+    # 管理卡片族共用的 CardKit JSON 拼装（按钮横排容器 + form 内 name 校验）与
+    # 管理员可见展示名解析口协议（Trace #469 S-1）——被 management_card/
+    # notification/card_dispatch/card_callback/router 五处消费，同一 gateway
+    # 管理命令面归类。
+    "lingxi.core.admin.card_layout",
+    "lingxi.core.admin.display_names",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -981,6 +987,12 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.admin_metric_alias_map_file",
             "lingxi.adapters.company_function_metric_map_file",
             "lingxi.core.permission.metric_translation",
+            # 管理卡片族共用的 CardKit JSON 拼装与管理员可见展示名解析口协议
+            # （Trace #469 S-1）：notification/management_card/card_dispatch/
+            # card_callback/router 五个既登记模块的模块级 import，跟随它们
+            # 一起进入 gateway 的运行时闭包。
+            "lingxi.core.admin.card_layout",
+            "lingxi.core.admin.display_names",
             # 本地权限授权/抑制全链路（#319 S-P-1b）：
             # adapters.postgres_pending_action 模块级 import 了
             # adapters.postgres_local_permission 的 _insert_locked/

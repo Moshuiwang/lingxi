@@ -137,6 +137,20 @@ class QueueInsertFailure(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
 
 
+class _InboundEventInsertFailure(RuntimeError):
+    """``insert_inbound_event`` 落库之前失败的内部标记（Issue #469 opus 独立
+    审查 P2-1）。
+
+    只在 :meth:`EventPipeline._within_transaction` 第 2 步、``tx.
+    insert_inbound_event(...)`` 这一次调用本身抛异常时使用，包一层
+    ``__cause__`` 原样带上原始异常，只为了让 ``handle_message`` 能在自己的
+    顶层 ``except`` 分流表里区分出"这条事件在 `inbound_event` 表里还没有留下
+    任何幂等记录"这一种特殊情况——真正的处理与提示逻辑仍然统一走
+    ``_handle_unexpected_failure``（见其 ``retryable`` 参数文档）。不对外
+    暴露、不在本模块之外被捕获或构造。
+    """
+
+
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
     """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
 
@@ -154,6 +168,12 @@ class GatewayTexts:
     busy_hint: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.busy_hint").text
     )
+    # Issue #465（rc22 S-3）：同一个"话题被占用"状态的另一种真话——任务已经入队，
+    # 但还没有任何 worker 领取（`task.status == 'queued'`）。默认值同样来自内容
+    # 目录，保留字符串字段是为了跟 ``busy_hint`` 一样兼容既有注入式测试直接赋值。
+    busy_hint_queued: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.busy_hint_queued").text
+    )
     suspended: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.suspended").text
     )
@@ -161,6 +181,9 @@ class GatewayTexts:
 
     def busy_hint_content(self) -> RenderedContent:
         return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
+
+    def busy_hint_queued_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.busy_hint_queued", self.busy_hint_queued)
 
     def suspended_content(self) -> RenderedContent:
         return _as_content(self.catalog, "gateway.suspended", self.suspended)
@@ -257,7 +280,124 @@ class EventPipeline:
         改成先把 ``handled_as`` 结论持久化并提交、再发回复之后：重投时事件行已经在
         库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
         可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
+
+        **本方法对绝大多数失败是全函数（Issue #465：100% 响应覆盖产品合同）：
+        不向调用方抛出异常。** 已被识别的失败（`QueueInsertFailure` 等）在
+        :meth:`_handle_message` 内部各自落到对应的诚实提示；本方法这一层只兜住
+        "没有被任何既有分支识别"的剩余异常——数据库瞬时错误、还没被枚举过的编程
+        缺陷等。没有这一层时，这类异常会一路穿透 ``apps/gateway/__init__.py`` 的
+        ``make_event_handler``，被 ``adapters/feishu_longconn.py`` 的
+        ``LongConnectionSupervisor._dispatch`` 接住——但那一层只记
+        ``event.handler_failed`` 审计，什么都不回给用户：飞书会按处理失败重投这条
+        事件，可一个稳定复现的缺陷会让重投一直撞在同一个异常上，用户永远等不到
+        任何回应（这正是 Issue #465 的触发现场）。因此这里改成"任何异常都必须换成
+        一条诚实的失败提示"，不再指望重投本身能替用户兜底。
+
+        **唯一的例外（Issue #469 opus 独立审查 P2-1）：`_InboundEventInsertFailure`
+        ——``insert_inbound_event`` 落库之前的失败。** 发完提示之后仍会破例向上
+        穿出原始异常，理由与分界见 :meth:`_handle_unexpected_failure` 的
+        ``retryable`` 参数文档。
         """
+
+        try:
+            return self._handle_message(message, now=now)
+        except _InboundEventInsertFailure as error:
+            return self._handle_unexpected_failure(
+                message, error.__cause__ or error, retryable=True
+            )
+        except Exception as error:  # noqa: BLE001 - 见上方 docstring：这是全函数的最后一道防线
+            return self._handle_unexpected_failure(message, error)
+
+    def _handle_unexpected_failure(
+        self, message: InboundMessage, error: BaseException, *, retryable: bool = False
+    ) -> Outcome:
+        """``handle_message`` 兜底出口：记审计＋尽力而为发一条诚实失败提示。
+
+        **不重新进入事务**——异常已经使当前这一轮的事务连同它可能做过的任何写入
+        一起回滚（Python ``with`` 语句在异常路径上的标准行为），这里只用
+        ``message`` 本身携带的、与数据库状态无关的字段（``chat_id``/``thread_id``/
+        ``message_id``/``trace_id``）尽力送一条提示。停机中跳过发送，姿态与
+        ``handle_message`` 末尾"尽力而为的出站副作用"一致。
+
+        **默认（``retryable=False``）吞掉异常、不重新抛出**——这是这里此前唯一
+        的行为，但下面这段说明此前写错了取舍前提（Issue #469 opus 独立审查
+        P2-1 纠偏）：吞掉之后 ``handle_message`` 正常返回，
+        ``LongConnectionSupervisor._dispatch`` 看到的是一次成功处理
+        （``error=None``），照此向飞书回 ack——**飞书不会因此重投这条事件**，
+        不存在"重投几次、用户就收到几条这条提示"这回事。真实后果反而是：一次
+        瞬时故障（DB 死锁、连接被重置等）在这层兜底加入之前，会被飞书按处理
+        失败重投、下一次尝试大概率自愈；加入之后，同一次瞬时故障变成"这条用户
+        消息被永久丢弃＋一条内部错误提示"，不再有任何自愈机会。
+
+        **``retryable=True``：唯一的例外，仅对应 `insert_inbound_event` 落库
+        之前的失败**（调用方 ``handle_message`` 只在这一种出口传 ``True``）。
+        这次失败发生在这条事件的幂等记录写进 ``inbound_event`` 表之前，飞书
+        重投这条事件会被当成一条全新事件正常处理、不会被去重挡下——是这条
+        分支里唯一"重投真的能带来恢复"的出口。因此这里在发完提示之后**重新
+        抛出**原始异常，让它破例穿出 ``handle_message``，`_dispatch` 收到真正
+        的失败（非 ``error=None``），照此向飞书返回失败以触发重投。其余出口
+        （幂等记录已经落库之后的任何失败）继续吞掉：重投只会撞上已经写好的
+        去重行，在 :meth:`_within_transaction` 第 2 步被判重直接短路返回，对
+        恢复没有任何帮助，穿出异常只是把同一条日志再刷一遍噪音。
+
+        已知取舍：``retryable=True`` 期间飞书按自己的重投策略再次投递同一条
+        事件，每次命中同一个瞬时故障都会再触发一次这条提示——用户可能在重投
+        窗口内收到最多 3 条重复的这条提示（飞书长连接对单条事件的重投次数
+        上限）；比起消息被永久丢弃且无法自愈，这是可以接受的已知取舍（已在
+        交付报告登记）。
+        """
+
+        content = self._texts.catalog.text("gateway.unexpected_error", reference=message.trace_id)
+        self._audit.record(
+            "event.pipeline_failed",
+            event_id=message.event_id,
+            # 只记异常类名，不记异常正文（Issue #469 opus 独立审查 P2-5，与
+            # `task.enqueue_failed`、`onboarding.failed` 等既有审计纪律一致）：
+            # 这里接住的是"没有被任何既有分支识别"的剩余异常，psycopg 等驱动的
+            # 异常串可能原样带着 `DETAIL: Key (feishu_open_id)=(ou_...)` 这类
+            # 外部标识原值，写进审计正文就抵触 V-花名册-33「审计与日志不含外部
+            # 标识原值」。
+            error=type(error).__name__,
+            trace_id=message.trace_id,
+        )
+        if self._should_stop():
+            self._audit.record(
+                "reply.skipped_while_stopping",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                trace_id=message.trace_id,
+            )
+        else:
+            try:
+                self._replies.send_text(
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
+                    text=content.text,
+                )
+                self._audit.record(
+                    "reply.sent",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
+                )
+            except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
+                self._audit.record(
+                    "reply.failed",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    error=f"{type(send_error).__name__}: {send_error}",
+                    trace_id=message.trace_id,
+                )
+        if retryable:
+            raise error
+        return Outcome(handled_as=None)
+
+    def _handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
+        """``handle_message`` 的实际业务逻辑；异常安全网见调用方。"""
 
         moment = now or datetime.now(timezone.utc)
         deferred: list[RenderedContent] = []
@@ -373,12 +513,18 @@ class EventPipeline:
             # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
             # 早退发生在加表情之前，因此重复投递在用户可见面同样不重复：不再加表情、
             # 不再发任何回复（`V-接入-09` 断的是出站调用次数，不只是数据库行数）。
-            first_time = tx.insert_inbound_event(
-                event_id=message.event_id,
-                event_type=message.event_type,
-                user_open_id=message.sender_open_id,
-                trace_id=message.trace_id,
-            )
+            try:
+                first_time = tx.insert_inbound_event(
+                    event_id=message.event_id,
+                    event_type=message.event_type,
+                    user_open_id=message.sender_open_id,
+                    trace_id=message.trace_id,
+                )
+            except Exception as error:  # noqa: BLE001 - 见 _InboundEventInsertFailure 文档
+                # 这一次调用本身失败：幂等记录还没有落库，是 handle_message 顶层
+                # 兜底里唯一"重投能真正带来恢复"的出口（Issue #469 opus 独立审查
+                # P2-1，见 _handle_unexpected_failure 的 retryable 参数文档）。
+                raise _InboundEventInsertFailure(error) from error
             if not first_time:
                 self._audit.record(
                     "inbound_event.duplicate",
@@ -573,7 +719,11 @@ class EventPipeline:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
                 # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                deferred.append(self._texts.busy_hint_content())
+                #
+                # 文案如实（Issue #465）：`conversation` 是这次事务**开始时**读到的
+                # 快照，`running_task_status` 与判定 `busy` 用的 `running_task_id`
+                # 同源、同一次查询——这里能可靠区分"已经在跑"与"还在排队没人领"。
+                deferred.append(self._busy_hint_for(conversation))
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                 return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -585,6 +735,11 @@ class EventPipeline:
                 # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
                 # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
                 if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
+                    # 竞态分支（Issue #465 不覆盖）：`conversation` 快照读到的是"空闲"，
+                    # 真正清空时才发现另一条连接已经抢占成功——抢占它的那个任务的
+                    # 状态从未被本次事务读到，无法诚实地判定"排队中"还是"处理中"，
+                    # 因此保留原有的"处理中"默认文案，不去猜。这条竞态本身极罕见
+                    # （两条消息几乎同时到达同一话题）。
                     deferred.append(self._texts.busy_hint_content())
                     tx.mark_handled_as(
                         event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
@@ -803,6 +958,21 @@ class EventPipeline:
             )
         return tuple(rendered)
 
+    def _busy_hint_for(self, conversation) -> RenderedContent:
+        """按话题当前占用任务的真实阶段选文案（Issue #465，rc22 S-3）。
+
+        只信 `running_task_status == "queued"` 这一个精确值：`task.status` 的其余
+        取值（`running`/`awaiting_delivery`/终态）都归入"处理中"这一桶——它们共同
+        的事实是"已经有 worker 或投递流程在处理这个任务，不是单纯地在队列里等"，
+        继续沿用既有的 `gateway.busy_hint` 文案不算说谎；`None`（结构上不应该在
+        `running_task_id` 非空时出现，见 `ConversationRecord` 的 LEFT JOIN）同样
+        保守地落回这一桶，不对不认识的取值猜测成"排队中"。
+        """
+
+        if conversation.running_task_status == "queued":
+            return self._texts.busy_hint_queued_content()
+        return self._texts.busy_hint_content()
+
     def _add_reaction(self, message: InboundMessage) -> None:
         """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
 
@@ -870,21 +1040,28 @@ class EventPipeline:
             return Outcome(handled_as=HandledAs.COMMAND)
 
         if memory_command.kind is MemoryCommandKind.FORGET:
-            forgotten = tx.forget_user_memory(
-                user_id=user.user_id, memory_id=memory_command.memory_id
+            # 短序号解析需要先查一次当前用户的记忆列表（rc22 B-8-1，#439
+            # TOP-10）：与随后的 tx.forget_user_memory 同一个数据库事务、同一个
+            # 连接，中途不会有别的写者插队——见 _resolve_forget_target_id 文档
+            # 「forget 时刻的同一确定性排序」这条口径的成立依据。
+            entries = tx.list_user_memory(user_id=user.user_id)
+            target_id = self._resolve_forget_target_id(memory_command, entries)
+            forgotten_entry = (
+                tx.forget_user_memory(user_id=user.user_id, memory_id=target_id)
+                if target_id is not None
+                else None
             )
-            content_key = "memory.forgotten" if forgotten else "memory.forget_not_found"
-            deferred.append(self._texts.catalog.text(content_key))
-            if forgotten:
-                # 未命中（不存在/不属于本人）不审计为一次「删除」事件——结构上没有
-                # 发生任何写操作，与 forget_user_memory 的跨用户零生效同一条纪律
-                # （不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
+            deferred.append(self._render_forget_receipt(forgotten_entry))
+            if forgotten_entry is not None:
+                # 未命中（不存在/不属于本人/序号越界）不审计为一次「删除」事件——
+                # 结构上没有发生任何写操作，与 forget_user_memory 的跨用户零生效
+                # 同一条纪律（不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
                 self._audit.record(
                     "command.memory_forget",
                     event_id=message.event_id,
                     user_id=user.user_id,
                     conversation_id=conversation.conversation_id,
-                    memory_id=memory_command.memory_id,
+                    memory_id=forgotten_entry.memory_id,
                     trace_id=message.trace_id,
                 )
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
@@ -942,6 +1119,17 @@ class EventPipeline:
     def _render_memory_list(self, entries: list[UserMemoryEntry]) -> RenderedContent:
         """把 ``/memory list`` 查到的记忆渲染成用户可见文本。
 
+        **短序号取代裸 id 展示**（rc22 B-8-1，#439 TOP-10）：此前每一行末尾都
+        带一个 ``mem_`` 前缀的裸 ULID（``id: mem_01ARZ...``）供 ``/memory
+        forget`` 引用——这是全仓库唯一波及普通用户的裸 ULID 展示面，对不熟悉
+        内部标识格式的用户不友好。这里改成按 ``entries`` 顺序从 1 开始编号的
+        短序号，``/memory forget <序号>`` 同样可以引用（原始 ``mem_`` id 仍然
+        兼容，见 ``commands.parse_memory_command`` 文档）。序号顺序与
+        ``forget`` 时刻 ``tx.list_user_memory`` 返回的顺序能对上，**不是靠两处
+        约定一致**，而是两处调用的是同一个 ``ORDER BY created_at ASC`` 查询
+        （``adapters/postgres_conversation/_transaction.py`` 的
+        ``list_user_memory``），结构上没有第二个排序键可以漂移。
+
         每一行单独过一次内容安全校验（``content.toml`` 的 ``_validate_user_visible_
         text``）：``memory_key``/``memory_value`` 是用户自己写入的自由文本，结构上
         无法保证它不会撞上协议泄漏词表（``mcp__``/``trace_id`` 等，见该文件文档）。
@@ -954,24 +1142,83 @@ class EventPipeline:
         if not entries:
             return catalog.text("memory.list_empty")
         lines: list[str] = []
-        for entry in entries:
+        for serial, entry in enumerate(entries, start=1):
             type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
             try:
                 rendered_entry = catalog.text(
                     "memory.list_entry",
+                    serial=serial,
                     type_label=type_label,
                     memory_key=entry.memory_key,
                     memory_value=entry.memory_value,
-                    memory_id=entry.memory_id,
                 )
             except ContentSafetyError:
                 rendered_entry = catalog.text(
                     "memory.list_entry_unsafe",
+                    serial=serial,
                     type_label=type_label,
-                    memory_id=entry.memory_id,
                 )
             lines.append(rendered_entry.text)
         return catalog.text("memory.list", entries="\n".join(lines))
+
+    def _resolve_forget_target_id(
+        self, memory_command: MemoryCommand, entries: list[UserMemoryEntry]
+    ) -> str | None:
+        """把 ``/memory forget`` 的入参（短序号或原始 ``mem_`` id）解析成要传给
+        ``tx.forget_user_memory`` 的具体 id（rc22 B-8-1，#439 TOP-10）。
+
+        序号解析用的是**本次调用内、真正执行删除之前**这一次 ``list_user_
+        memory`` 的查询结果——它与随后的 ``tx.forget_user_memory`` 共享同一个
+        数据库事务、同一个连接，中途不会有别的写者插队。``/memory list`` 展示
+        的序号和这里解析用的序号，只要两次查询之间用户自己的记忆集合没有变化，
+        指向的就是同一条记录；如果确实变化了（这次 forget 之前，用户又
+        remember/forget 了别的条目），这里按**当刻重新排序**解析，不去猜测
+        用户上一次看到的是哪一份快照——调用方（``_handle_memory_command``）在
+        回执里回显被删条目的实际内容（``_render_forget_receipt``），让用户能
+        自行核对删的是不是自己想删的那一条，这是覆盖这个「列表与删除之间
+        记忆集合变化」边缘情形取的口径，不是缺陷。
+
+        传入完整 ``mem_`` id 时原样透传，不在这里做存在性/归属预检查——那仍然
+        只由 ``forget_user_memory`` 自己的 ``WHERE ... AND user_id`` 结构性把关
+        （跨用户传入他人 id 时哪怕在 ``entries`` 里也找不到，因为 ``entries``
+        本身就已经是「按 user_id 过滤」的结果），保持这条路径与新增短序号解析
+        之前完全一致的行为，不因为新增能力改变旧路径的判定顺序。
+        """
+
+        if memory_command.memory_serial is not None:
+            index = memory_command.memory_serial - 1
+            if 0 <= index < len(entries):
+                return entries[index].memory_id
+            return None
+        return memory_command.memory_id
+
+    def _render_forget_receipt(self, entry: UserMemoryEntry | None) -> RenderedContent:
+        """``/memory forget`` 的回执（rc22 B-8-1，#439 TOP-10）：命中时回显被删
+        条目的实际内容，供用户自行核对删的是不是那一条——短序号解析存在「列表
+        与删除之间记忆集合变化」的边缘情形（见 ``_resolve_forget_target_id``
+        文档），回显内容是这个口径下用户唯一能自校验的手段。未命中（不存在/
+        不属于本人/序号越界，三者不区分，理由同既有 ``memory.forget_not_
+        found`` 文案）沿用既有拒绝文案。
+
+        被删内容本身撞上安全校验时（同 ``_render_memory_list`` 的道理：
+        ``memory_key``/``memory_value`` 是用户自由文本，无法结构性保证不撞协议
+        泄漏词表）退化成不回显内容的安全占位回执——「删除成功」这个正向结果
+        不能反过来让内容安全校验失效。
+        """
+
+        catalog = self._texts.catalog
+        if entry is None:
+            return catalog.text("memory.forget_not_found")
+        type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
+        try:
+            return catalog.text(
+                "memory.forgotten",
+                type_label=type_label,
+                memory_key=entry.memory_key,
+                memory_value=entry.memory_value,
+            )
+        except ContentSafetyError:
+            return catalog.text("memory.forgotten_unsafe", type_label=type_label)
 
     def _try_admin_route(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]
@@ -1059,6 +1306,8 @@ class EventPipeline:
         if not tx.claim_conversation(
             conversation_id=conversation.conversation_id, task_id=task_id
         ):
+            # 竞态分支（Issue #465 不覆盖，理由同 `/new` 的同类竞态注释）：抢占它
+            # 的任务同样是本次事务从未读到的一条，保留"处理中"默认文案。
             deferred.append(self._texts.busy_hint_content())
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)

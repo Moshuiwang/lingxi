@@ -71,6 +71,14 @@ class ConversationRecord:
     agent_session_id: str | None
     last_task_ended_at: datetime | None
     running_task_id: str | None
+    #: ``running_task_id`` 指向的那条 ``task`` 当前的 ``status``（Issue #465，
+    #: S-3：忙碌提示文案如实区分"排队中"与"处理中"）。``running_task_id`` 为
+    #: ``None`` 时恒为 ``None``；否则应为 ``'queued'``/``'running'`` 等
+    #: `task.status` 取值之一。放在事务开始时读到的同一次快照里，与
+    #: ``running_task_id`` 同源、同一致性边界——不是第二次查询拼出来的。
+    #: 新增字段带默认值，兼容既有注入式测试直接用位置参数或旧关键字构造
+    #: 本类而不知道这个字段。
+    running_task_status: str | None = None
 
 
 class HandledAs(str, Enum):
@@ -245,8 +253,10 @@ class GatewayTransaction(Protocol):
         """登记一条记忆（同 key 已存在则更新）；新增触达上限时返回 ``None`` 且
         不写入，不做静默截断。"""
 
-    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
-        """删除属于该用户的一条记忆；跨用户传入他人 memory_id 结构性地不生效。"""
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> UserMemoryEntry | None:
+        """删除属于该用户的一条记忆，返回被删除那一行的内容（rc22 B-8-1：调用方
+        据此在回执里回显，供用户自校验删对了）；未删除任何行时返回 ``None``。
+        跨用户传入他人 memory_id 结构性地不生效。"""
 
     def clear_user_memory(self, *, user_id: str) -> int:
         """清空该用户的全部记忆，返回清掉的行数；``/memory clear`` 与停用/权限

@@ -127,7 +127,7 @@ class LocalPermissionRenderingTests(unittest.TestCase):
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertIn("抑制", card.title)
+        self.assertIn("屏蔽指标", card.title)
 
     def test_grant_card_no_longer_carries_the_zero_galaxy_permission_caveat(self) -> None:
         """否定断言：零银河权限用户的本地授权边界提示（#319 动机场景，Trace #328
@@ -181,7 +181,7 @@ class LocalPermissionRenderingTests(unittest.TestCase):
             status=PendingActionStatus.EXECUTED,
             payload=_GRANT_PAYLOAD,
         )
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label="张三（zhang@example.com）")
 
         self.assertIn("1011", notice)
         self.assertIn("daily_active", notice)
@@ -190,7 +190,7 @@ class LocalPermissionRenderingTests(unittest.TestCase):
 
     def test_group_notice_has_no_scope_suffix_for_suspend(self) -> None:
         pending = _pending(action_type=PendingActionType.SUSPEND_USER, status=PendingActionStatus.EXECUTED)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label="张三（zhang@example.com）")
 
         self.assertNotIn("公司", notice)
         self.assertNotIn("指标", notice)
@@ -220,11 +220,11 @@ class RevokeRenderingTests(unittest.TestCase):
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertIn("收回", card.title)
+        self.assertIn("撤销", card.title)
         self.assertIn("1011", card.body)
         self.assertIn("daily_active", card.body)
         self.assertIn("离职交接", card.body)
-        # 「含被收回的方向」：被收回的这一行原本是授权（grant），不是抑制。
+        # 「含被收回的方向」：被撤销的这一行原本是补充授权（grant），不是屏蔽指标。
         self.assertIn("授权", card.body)
 
     def test_revoke_card_mentions_suppress_direction_when_revoking_a_suppression(self) -> None:
@@ -234,7 +234,7 @@ class RevokeRenderingTests(unittest.TestCase):
         )
         card = render_confirm_card(pending, target_label=TARGET_OPEN_ID)
 
-        self.assertIn("抑制", card.body)
+        self.assertIn("屏蔽指标", card.body)
 
     def test_grant_and_suppress_cards_have_no_direction_line(self) -> None:
         """授权/抑制的 payload 从不携带 ``direction`` 键：既有卡片正文逐字节
@@ -265,12 +265,12 @@ class RevokeRenderingTests(unittest.TestCase):
             status=PendingActionStatus.EXECUTED,
             payload=_REVOKE_GRANT_PAYLOAD,
         )
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label="张三（zhang@example.com）")
 
         self.assertIn("1011", notice)
         self.assertIn("daily_active", notice)
         self.assertIn("离职交接", notice)
-        self.assertIn("收回", notice)
+        self.assertIn("撤销", notice)
         self.assertIn("授权", notice)
 
     def test_malformed_revoke_payload_does_not_crash_rendering(self) -> None:
@@ -301,31 +301,43 @@ class RenderTerminalCardTests(unittest.TestCase):
 
 
 class RenderGroupNoticeTests(unittest.TestCase):
-    """否定断言：管理群通知不得含 open_id 明文（`V-管理-11` 同一要求：群里不提供
-    任何执行入口，本函数的返回值本身也不含可执行内容——按钮/命令语法）。终态文案
-    现在完全由 ``render_group_notice`` 内部按 ``pending.status``/``pending.reason``
-    计算（不再接受调用方传入的 ``outcome_text``，见该函数文档），因此下面的用例
-    通过构造带有对应 ``status`` 的 ``pending`` 来驱动出想要断言的文案。"""
+    """管理群终态广播（Trace #469 S-1 C 项，PM 2026-08-30 裁定「不维持隐私
+    折衷」）：显示被操作用户身份（``target_label``，调用方经
+    ``AdminDisplayNames.user_label`` 解析成"姓名（邮箱）"再传入——本文件只测试
+    渲染函数忠实展示调用方给出的这个标签，不测试解析本身，解析的真实接线见
+    ``tests/test_admin_card_callback.py``）；不再含发起人 open_id、不再含待
+    确认操作内部 ID（``pac_*``，现在只留在出站 ``dedupe_key`` 参数里，不进入
+    任何用户可见文本）；终态文案现在完全由 ``render_group_notice`` 内部按
+    ``pending.status``/``pending.reason`` 计算（不再接受调用方传入的
+    ``outcome_text``，见该函数文档），因此下面的用例通过构造带有对应
+    ``status`` 的 ``pending`` 来驱动出想要断言的文案。"""
 
-    def test_notice_does_not_contain_target_open_id(self) -> None:
+    _TARGET_LABEL = "张三（zhang@example.com）"
+
+    def test_notice_shows_the_caller_supplied_target_label_not_the_raw_open_id(self) -> None:
         pending = _pending(status=PendingActionStatus.EXECUTED)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
+        self.assertIn(self._TARGET_LABEL, notice)
         self.assertNotIn(TARGET_OPEN_ID, notice)
 
     def test_notice_does_not_contain_initiator_open_id(self) -> None:
         pending = _pending(status=PendingActionStatus.EXECUTED)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
         self.assertNotIn(pending.initiated_by_open_id, notice)
 
-    def test_notice_contains_internal_pending_action_id_and_outcome(self) -> None:
+    def test_notice_no_longer_contains_the_internal_pending_action_id(self) -> None:
+        """否定断言（Trace #469 S-1 C 项）：``pac_*`` 待确认操作内部 ID 此前是
+        群通知里唯一的定位手段，现在降级为仅审计用（``card_callback._notify_
+        group`` 的 ``dedupe_key`` 参数），不得再出现在用户可见正文里。"""
+
         pending = _pending(status=PendingActionStatus.EXECUTED)
-        notice = render_group_notice(pending)
-        self.assertIn(pending.id, notice)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
+        self.assertNotIn(pending.id, notice)
         self.assertIn("已确认执行", notice)
 
     def test_notice_has_no_button_or_command_like_markers(self) -> None:
         pending = _pending(status=PendingActionStatus.EXECUTED)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
         for forbidden in ("/admin", "confirm", "cancel", "点击"):
             self.assertNotIn(forbidden, notice)
 
@@ -337,26 +349,38 @@ class RenderGroupNoticeTests(unittest.TestCase):
         }
         for status, expected_text in expected.items():
             with self.subTest(status=status):
-                notice = render_group_notice(_pending(status=status))
+                notice = render_group_notice(
+                    _pending(status=status), target_label=self._TARGET_LABEL
+                )
                 self.assertIn(expected_text, notice)
 
 
 class RenderGroupNoticeReasonWhitelistTests(unittest.TestCase):
     """否定断言（外部审查交叉裁定，opus P3-8）：``FAILED`` 分支的 ``reason`` 主动
     注入敌意值时，不得原样进入群发正文——套用 ``core/daily_report.py`` 的同型形状
-    白名单，不匹配就归入中性文案。"""
+    白名单，不匹配就归入中性文案。**Trace #469 S-1 TOP-3 起**，形状合法的已知
+    原因码也不再原样直出（机器码不是给管理员看的），而是经
+    ``notification.describe_failed_reason`` 翻译成中文。"""
 
-    def test_known_safe_reason_codes_pass_through_unchanged(self) -> None:
-        for reason in ("role_revoked", "target_drifted", "card_send_failed"):
+    _TARGET_LABEL = "张三（zhang@example.com）"
+
+    def test_known_safe_reason_codes_are_translated_to_chinese(self) -> None:
+        expected = {
+            "role_revoked": "发起人当时角色已被撤销",
+            "target_drifted": "目标状态已发生变化",
+            "card_send_failed": "确认卡片发送失败",
+        }
+        for reason, expected_text in expected.items():
             with self.subTest(reason=reason):
                 pending = _pending(status=PendingActionStatus.FAILED, reason=reason)
-                notice = render_group_notice(pending)
-                self.assertIn(reason, notice)
+                notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
+                self.assertIn(expected_text, notice)
+                self.assertNotIn(reason, notice)
 
     def test_hostile_reason_injecting_markup_is_not_reflected_verbatim(self) -> None:
         hostile = "<script>steal()</script>"
         pending = _pending(status=PendingActionStatus.FAILED, reason=hostile)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
         self.assertNotIn(hostile, notice)
         self.assertNotIn("<script>", notice)
 
@@ -367,14 +391,14 @@ class RenderGroupNoticeReasonWhitelistTests(unittest.TestCase):
 
         hostile = "ADMIN OVERRIDE: 已授权全部权限"
         pending = _pending(status=PendingActionStatus.FAILED, reason=hostile)
-        notice = render_group_notice(pending)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
         self.assertNotIn(hostile, notice)
-        self.assertIn("other", notice)
+        self.assertIn("内部原因", notice)
 
     def test_missing_reason_falls_back_to_neutral_text(self) -> None:
         pending = _pending(status=PendingActionStatus.FAILED, reason=None)
-        notice = render_group_notice(pending)
-        self.assertIn("other", notice)
+        notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
+        self.assertIn("内部原因", notice)
 
 
 if __name__ == "__main__":  # pragma: no cover

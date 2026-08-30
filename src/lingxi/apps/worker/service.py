@@ -267,15 +267,121 @@ class WorkerService:
                 if self._global_stop.is_set():
                     return bool(terminal_tasks)
 
-        tasks = self._queue.claim(
-            worker_id=self._config.worker_id,
-            target_worker_version=self._config.target_worker_version,
-            limit=self._config.max_concurrency,
-        )
-        if not tasks:
-            return bool(terminal_tasks)
-        await asyncio.gather(*(self._process_task(task) for task in tasks))
-        return True
+        return await self._run_rolling_claim_loop(terminal_tasks)
+
+    async def _run_rolling_claim_loop(self, terminal_tasks: list[TerminalTask]) -> bool:
+        """滚动并发领取循环（Issue #464 rc22 S-2）：维持一个至多
+        ``max_concurrency`` 的在途任务集合，任一任务终态即释放槽位并立即尝试
+        领取新任务，不像旧实现那样等 ``claim()`` 领到的整批任务全部终态才
+        领下一批——旧实现里 ``max_concurrency`` 实际只是"一次 claim() 的批
+        大小"，一个长任务会让批内、批后到达的所有任务一起干等到它收口（真实
+        复现：4 槽并发配置下，一个长任务占 1 槽、其余 3 槽空着，后到达的短
+        任务仍要等这个长任务收口才被领取）。
+
+        与旧实现共享的不变量：**领取只在这里发生一次性的"这一轮还要不要继续
+        领"判断**，``self._global_stop`` 语义不弱化——一旦置位就不再领取新
+        任务，只让已在途的任务自然收尾（#153 完成标准第 3 条）；`claim()` 前
+        的多轮让出+复判（``_STOP_SIGNAL_DRAIN_YIELDS``）只需要在**进入这个
+        循环之前**做一次（见调用方 ``process_once()``），循环内后续每一次
+        `claim()` 之前都已经跨过至少一次真正的 `await`（下面的
+        ``asyncio.wait``），事件循环有充分机会把自管道投递链路跑完，不需要
+        重复那套多轮让出。
+
+        没有任何可领取任务且没有在途任务时，`claim()` 只会被调用一次（与旧
+        实现同一次数），返回值退化为 ``bool(terminal_tasks)``——不改变"这一轮
+        完全无事可做"时的既有行为。
+
+        每次 ``asyncio.wait`` 用 ``poll_interval_seconds`` 兜底：即使一个都
+        没有终态（例如长任务仍在跑、但还有空槽从一开始就没填满），也会按这个
+        既有轮询节奏重新尝试 `claim()`，而不是傻等在途任务完成——这正是修复
+        "空槽干等"这一半症状所必需的（另一半"任一任务终态立即补位"由
+        ``asyncio.wait`` 的 ``FIRST_COMPLETED`` 语义保证，不需要等到下一个
+        轮询节拍）。
+
+        任一在途任务把异常真正抛出 `_process_task`（正常情况下它内部已经把
+        一切都吞成结构化日志或终态，理论上不会发生）时，取消其余在途任务并
+        等它们收尾后再重新抛出——与旧实现 ``asyncio.gather()`` 默认"一个失败
+        取消其余"的语义保持一致，不留下未被等待的游离任务。**先取全部 `done`
+        的异常再决定是否抛出**（Issue #469 opus 独立审查 P2-4）：`Task.
+        exception()` 与 `Task.result()` 一样会把异常标记为"已取回"，但前者
+        不会像后者那样在第一个失败的任务上就地重新抛出、把同一批 `done`
+        里排在它后面的任务的异常晾在原地——那些异常从未被取回，会被 asyncio
+        在垃圾回收时打成一条 ``Task exception was never retrieved`` 噪音日志。
+        这里遍历完 `done` 收集所有异常之后再统一抛出第一个，行为语义不变
+        （仍然是"一个失败就取消其余在途任务并重新抛出"），只是不再漏取。
+
+        **巡检节拍**（Issue #469 opus 独立审查 P1-1）：`process_once()` 入口
+        只在进入这个循环之前跑一次 `_housekeep()`/`_tick_alerts()`（见调用方），
+        但持续有新任务可领时这个循环要等在途集合完全清空才返回——旧的
+        "整批 claim() 再整批等收口"实现里，`_housekeep()`/`_tick_alerts()`
+        天然随着每一批之间的间隙被反复调用；滚动并发把这个间隙消灭之后，
+        `reclaim_queued`（queued_stuck 告警＋排队超时收口）、
+        `fail_unavailable_versions`、`reclaim_stale_with_outcomes`、
+        `expire_undelivered_terminals`、Agent 会话清理、`_tick_alerts` 会在
+        供给不断时整体停摆到进程下一次真正无事可做为止（真实复现：3 秒轮询
+        窗口下，整批版 `_housekeep` 会被重入多次，滚动版整个观察窗口内只跑
+        了 1 次）。修法：循环内自己跟踪"上次巡检是几点"，每次 `asyncio.wait`
+        醒来之后如果距上次巡检已经过了至少一个 `poll_interval_seconds`，就
+        原地补跑一次——复用这个既有常量而不是新开一个独立配置项，因为它已经
+        是这个循环里"多久该重新看一眼世界"的既有节奏（`claim()` 轮询、
+        `asyncio.wait` 超时都以它为参照），巡检的时效性要求与轮询本身同量级，
+        没有理由让两套节奏各自漂移。两个回调都是同步调用，与整批实现里
+        `process_once()` 入口那次同步调用语义等价，不额外引入并发写。命中的
+        终态并入 `terminal_tasks`，让函数末尾的返回值如实反映"这一轮到底有没有
+        观察到任何终态"。
+        """
+
+        pending: set[asyncio.Task[None]] = set()
+        claimed_any = False
+        housekeep_interval_seconds = self._config.poll_interval_seconds
+        last_housekeep_at = self._monotonic()
+
+        def stop_requested() -> bool:
+            return self._global_stop is not None and self._global_stop.is_set()
+
+        try:
+            while True:
+                if not stop_requested():
+                    capacity = self._config.max_concurrency - len(pending)
+                    if capacity > 0:
+                        newly_claimed = self._queue.claim(
+                            worker_id=self._config.worker_id,
+                            target_worker_version=self._config.target_worker_version,
+                            limit=capacity,
+                        )
+                        if newly_claimed:
+                            claimed_any = True
+                            for task in newly_claimed:
+                                pending.add(asyncio.create_task(self._process_task(task)))
+                if not pending:
+                    break
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=self._config.poll_interval_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # 先取全部异常再决定是否抛出（见上方巡检节拍前一段文档）：正常
+                # 路径 `_process_task` 从不向上抛异常（见其内部 try/except），
+                # 这里只是双保险；真抛出时下面的 except 分支接手取消其余在途
+                # 任务。
+                exceptions = [
+                    error for finished in done if (error := finished.exception()) is not None
+                ]
+                if exceptions:
+                    raise exceptions[0]
+                now = self._monotonic()
+                if now - last_housekeep_at >= housekeep_interval_seconds:
+                    last_housekeep_at = now
+                    self._tick_alerts()
+                    terminal_tasks.extend(self._housekeep())
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
+        return claimed_any or bool(terminal_tasks)
 
     def _housekeep(self) -> list[TerminalTask]:
         terminals: list[TerminalTask] = []

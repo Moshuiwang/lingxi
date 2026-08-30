@@ -160,6 +160,143 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("日活", str(facts))
 
 
+class _FakeCompanyNames:
+    """``CompanyNameResolver`` 的内存假实现：固定映射，未命中返回 ``None``。
+
+    ``names_for``（Trace #469 修复包 B，B-7）就地委托给单个查询——``describe_
+    scope`` 自本批起只调用批量端口，不再调用 ``name_for``；内存假实现没有
+    真实实现要收敛的连接成本，批量与逐个调用语义完全等价。"""
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self._names = names
+
+    def name_for(self, *, company_id: str) -> str | None:
+        return self._names.get(company_id)
+
+    def names_for(self, *, company_ids):
+        return {company_id: self.name_for(company_id=company_id) for company_id in company_ids}
+
+
+class _RaisingCompanyNames:
+    def name_for(self, *, company_id: str) -> str | None:
+        raise RuntimeError("模拟解析口本身故障")
+
+    def names_for(self, *, company_ids):
+        raise RuntimeError("模拟解析口本身故障")
+
+
+class CompanyNameResolutionTest(unittest.TestCase):
+    """Trace #469 S-1 TOP-8：公司位经 ``company_names`` 翻译成「中文名（编号）」；
+    缺省或查不到时原样展示编号（既有行为，向后兼容）。"""
+
+    def test_company_ids_are_translated_when_a_resolver_is_supplied(self) -> None:
+        companies, _ = describe_scope(
+            {"1011": ["日活"], "1012": ["日活"]},
+            company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"}),
+        )
+
+        self.assertEqual(companies, "壹壹测试公司（1011）、壹贰测试公司（1012）")
+
+    def test_missing_resolver_keeps_the_existing_bare_id_behavior(self) -> None:
+        companies, _ = describe_scope({"1011": ["日活"]})
+
+        self.assertEqual(companies, "1011")
+
+    def test_unmatched_company_id_falls_back_to_the_bare_id(self) -> None:
+        companies, _ = describe_scope(
+            {"1011": ["日活"]}, company_names=_FakeCompanyNames({})
+        )
+
+        self.assertEqual(companies, "1011")
+
+    def test_wildcard_still_wins_and_never_calls_the_resolver(self) -> None:
+        """否定断言：通配公司位不需要、也不应该尝试翻译一个不存在的"编号"。"""
+
+        class _AssertNotCalled:
+            def name_for(self, *, company_id: str) -> str | None:
+                raise AssertionError("通配分支不应该调用 company_names")
+
+            def names_for(self, *, company_ids):
+                raise AssertionError("通配分支不应该调用 company_names")
+
+        companies, _ = describe_scope(
+            {"*": ["日活"]}, company_names=_AssertNotCalled()
+        )
+
+        self.assertEqual(companies, "全部公司")
+
+    def test_a_resolver_failure_degrades_to_the_bare_id_without_blocking_the_notice(
+        self,
+    ) -> None:
+        """否定断言：解析口本身故障（例如数据库暂时不可用）不得阻塞整条通知——
+        降级展示裸编号，与"缺省未接线"同一姿态。"""
+
+        companies, _ = describe_scope(
+            {"1011": ["日活"]}, company_names=_RaisingCompanyNames()
+        )
+
+        self.assertEqual(companies, "1011")
+
+    def test_render_scope_notice_passes_the_resolver_through(self) -> None:
+        notice = render_scope_notice(
+            GRANTED, company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"})
+        )
+
+        self.assertIn("壹壹测试公司（1011）", notice.text)
+        self.assertIn("壹贰测试公司（1012）", notice.text)
+        self.assertNotIn("1011、1012", notice.text)
+
+
+class _ConnectionCountingCompanyNames:
+    """模拟真实实现连接成本的计数假实现（Trace #469 修复包 B，B-7）：与
+    ``tests/test_management_card.ConnectionCountingDisplayNames`` 同一姿态
+    ——``names_for``（批量）与 ``name_for``（单项）各自记一次调用花费的
+    "连接数"，用于证明 ``describe_scope`` 确实改走批量端口一次性处理整批
+    公司编号，而不是对每个编号各自触发一次单项调用。"""
+
+    _COST_PER_CALL = 2
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self._names = names
+        self.connection_count = 0
+        self.name_for_calls = 0
+        self.names_for_calls = 0
+
+    def name_for(self, *, company_id: str) -> str | None:
+        self.name_for_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return self._names.get(company_id)
+
+    def names_for(self, *, company_ids):
+        self.names_for_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return {cid: self._names.get(cid) for cid in company_ids}
+
+
+class ConnectionStormRegressionTest(unittest.TestCase):
+    """Trace #469 修复包 B，B-7：``describe_scope`` 此前对权限文档里每一个
+    公司编号各自调用一次 ``CompanyNameResolver.name_for``——真实实现每次
+    调用都新建两条数据库连接，与 ``core/admin`` 侧的连接风暴同构（外部审查
+    交叉裁定）。修复后单次调用的连接数应当是与公司数量无关的常数上界。"""
+
+    def test_a_single_call_stays_within_a_small_connection_budget(self) -> None:
+        company_names = _ConnectionCountingCompanyNames(
+            {f"c{i}": f"公司{i}" for i in range(40)}
+        )
+        document = {f"c{i}": ["日活"] for i in range(40)}
+
+        describe_scope(document, company_names=company_names)
+
+        self.assertLessEqual(
+            company_names.connection_count,
+            5,
+            "一次调用的连接数应当是与公司数量无关的常数上界，不应随权限文档"
+            "里的公司数量线性增长",
+        )
+        self.assertEqual(company_names.names_for_calls, 1)
+        self.assertEqual(company_names.name_for_calls, 0)
+
+
 class DedupeKeyTest(unittest.TestCase):
     def test_the_key_binds_user_and_version(self) -> None:
         self.assertEqual(notice_dedupe_key(USER, 3), f"{USER}:3")
@@ -349,10 +486,12 @@ class DispatcherTest(unittest.TestCase):
                     )
 
     def test_the_dispatcher_cannot_touch_any_permission_state(self) -> None:
-        """形状断言：**它手上只有发送口、审计口、退避与内容目录**。
+        """形状断言：**它手上只有发送口、审计口、退避、内容目录与公司名解析口**。
 
         发布 outbox、就绪记录、用户状态一个端口都注入不进来，因此"通知失败顺手把发布
         状态改回去"这件事在装配上就写不出来——这条比在源码里搜关键字更难被绕过。
+        ``company_names``（Trace #469 S-1 TOP-8）只读公司编号→中文名的展示映射，
+        同样不持有任何权限状态。
         """
 
         import inspect
@@ -361,7 +500,16 @@ class DispatcherTest(unittest.TestCase):
 
         self.assertEqual(
             parameters,
-            {"self", "sender", "audit", "sleep", "catalog", "max_attempts", "backoff_seconds"},
+            {
+                "self",
+                "sender",
+                "audit",
+                "sleep",
+                "catalog",
+                "company_names",
+                "max_attempts",
+                "backoff_seconds",
+            },
         )
 
 

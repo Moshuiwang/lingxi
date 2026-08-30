@@ -179,6 +179,10 @@ class FakeState:
     # （tests/test_pending_action_postgres.py、tests/test_permission_publish_
     # postgres.py 的清除钩子用例、tests/test_postgres_user_memory.py）覆盖。
     user_memory: dict[str, list[UserMemoryEntry]] = field(default_factory=dict)
+    # Issue #465：``claim_queue_failure_notice`` 的内存对应物——按 event_id 只让
+    # 第一次调用拿到发送权，与真库 `queue_failure_notice` 表的 `ON CONFLICT DO
+    # NOTHING ... RETURNING` 同语义。
+    queue_failure_notices_claimed: set[str] = field(default_factory=set)
 
 
 class FakeTransaction:
@@ -194,12 +198,19 @@ class FakeTransaction:
         log: CallLog,
         *,
         fail_on: str | None = None,
+        fail_error: Exception | None = None,
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
         self._fail_on = fail_on
+        # 默认注入一个内容不带外部标识的通用 RuntimeError；``fail_error``
+        # （Issue #469 opus 独立审查 P2-5）在用例需要断言"审计不含异常正文里的
+        # 外部标识原值"时，替换成一个携带真实驱动异常常见形状（例如 psycopg 的
+        # `DETAIL: Key (...)=(...)` 串）的自定义异常——与 ``FakeReactions``/
+        # ``FakeReplies`` 的既有 ``fail_with`` 同一惯例。
+        self._fail_error = fail_error
         # Issue #175 P2-1：注入「busy 快照读到空闲，但 clear_agent_session 真正写入
         # 时已经影响 0 行」的竞态，不依赖真实并发线程调度。``None`` 时走原有的按
         # staged_claims/running_task_id 计算的语义，与真库条件更新同构。
@@ -218,7 +229,9 @@ class FakeTransaction:
 
     def _maybe_fail(self, step: str) -> None:
         if self._fail_on == step:
-            raise RuntimeError(f"注入失败：{step}")
+            raise self._fail_error if self._fail_error is not None else RuntimeError(
+                f"注入失败：{step}"
+            )
 
     def insert_inbound_event(
         self, *, event_id: str, event_type: str, user_open_id: str, trace_id: str
@@ -253,7 +266,23 @@ class FakeTransaction:
             agent_session_id=conversation.agent_session_id,
             last_task_ended_at=conversation.last_task_ended_at,
             running_task_id=running,
+            running_task_status=self._task_status(running),
         )
+
+    def _task_status(self, task_id: str | None) -> str | None:
+        """`ConversationRecord.running_task_status` 的假实现（Issue #465）：与真库
+        的 ``LEFT JOIN task`` 同语义——`task_id` 为 ``None`` 时恒 ``None``；否则
+        在已提交的任务里按 id 查一次（本次事务自己刚 ``insert_task`` 暂存的行，
+        在 ``ensure_conversation`` 这一步永远查不到自己——它发生在入队**之前**，
+        与真库同一时序）。查不到（数据不一致，理论上不该发生）保守返回 ``None``。
+        """
+
+        if task_id is None:
+            return None
+        for task in self._state.tasks:
+            if task.task_id == task_id:
+                return task.status
+        return None
 
     def claim_conversation(self, *, conversation_id: str, task_id: str) -> bool:
         self._log.add("store.claim_conversation", conversation_id=conversation_id, task_id=task_id)
@@ -356,14 +385,14 @@ class FakeTransaction:
         entries.append(new_entry)
         return new_entry.memory_id
 
-    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> UserMemoryEntry | None:
         self._log.add("store.forget_user_memory", user_id=user_id, memory_id=memory_id)
         entries = self._state.user_memory.get(user_id, [])
         for index, entry in enumerate(entries):
             if entry.memory_id == memory_id:
                 del entries[index]
-                return True
-        return False
+                return entry
+        return None
 
     def clear_user_memory(self, *, user_id: str) -> int:
         self._log.add("store.clear_user_memory", user_id=user_id)
@@ -404,14 +433,37 @@ class FakeStore:
         log: CallLog,
         *,
         fail_on: str | None = None,
+        fail_error: Exception | None = None,
         force_clear_agent_session_result: bool | None = None,
         force_claim_conversation_result: bool | None = None,
     ) -> None:
         self._state = state
         self._log = log
         self._fail_on = fail_on
+        self._fail_error = fail_error
         self._force_clear_agent_session_result = force_clear_agent_session_result
         self._force_claim_conversation_result = force_claim_conversation_result
+
+    def claim_queue_failure_notice(self, *, event_id: str) -> bool:
+        """在假状态里取得一次队列失败提示的发送权（Issue #465）。
+
+        与真库 `PostgresGatewayStore.claim_queue_failure_notice` 同语义：同一个
+        ``event_id`` 只有第一次调用返回 ``True``，之后恒 ``False``——用来断言
+        "同一条持续失败的事件被飞书重投多次时，`gateway.queue_failed` 提示只发
+        一次"。此前本假实现完全没有这个方法，`getattr(store, ..., None) is None`
+        恒真，导致所有注入 `insert_task` 失败的既有用例都走了"没有该能力的旧
+        注入 store"分支——原始异常直接穿透 `handle_message`，与生产环境（真实
+        store 一定有这个方法）的实际行为不符。补上之后这些用例改为断言生产环境
+        真正会发生的事：用户收到一条诚实的 `gateway.queue_failed` 提示。
+        """
+
+        self._log.add("store.claim_queue_failure_notice", event_id=event_id)
+        if self._fail_on == "claim_queue_failure_notice":
+            raise RuntimeError("注入失败：claim_queue_failure_notice")
+        if event_id in self._state.queue_failure_notices_claimed:
+            return False
+        self._state.queue_failure_notices_claimed.add(event_id)
+        return True
 
     def mark_onboarding_dispatched(self, *, event_id: str) -> None:
         """记账：这条事件已经交给开通编排（迁移 0062 那一列的内存对应物）。
@@ -472,6 +524,7 @@ class FakeStore:
             self._state,
             self._log,
             fail_on=self._fail_on,
+            fail_error=self._fail_error,
             force_clear_agent_session_result=self._force_clear_agent_session_result,
             force_claim_conversation_result=self._force_claim_conversation_result,
         )

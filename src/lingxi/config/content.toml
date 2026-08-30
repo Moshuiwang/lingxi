@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-2"
+version = "2026-08-30-5"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -32,8 +32,22 @@ version = "2026-08-30-2"
 "onboarding.innertest_not_open" = "BI Plus 目前处于内测阶段，暂未向你开放。感谢你的关注，欢迎稍后再来试试。"
 
 "gateway.busy_hint" = "当前任务仍在处理中"
+# Issue #465（rc22 S-3，100% 响应覆盖）：同一个"话题被占用"状态现在按任务真实
+# 所处阶段拆成两条文案——已被 worker 领取、正在执行用 `gateway.busy_hint`
+# （"处理中"是真话）；已入队但还没被任何 worker 领取用这一条（"排队中"才是
+# 真话）。两条覆盖同一个用户体验缺口：既回答"忙碌期再发消息得到什么提示"
+# （`core/conversation/pipeline.py` 的忙碌判定分支），也回答"消息入队后迟迟
+# 没人理会时要不要主动补一句"（`apps/gateway/delivery.py` 的排队阈值提示，
+# 阈值定值理由见该模块文档）。
+"gateway.busy_hint_queued" = "前面还有任务在排队，请稍等"
 "gateway.suspended" = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
+# Issue #465（rc22 S-3，100% 响应覆盖）：`EventPipeline.handle_message` 的兜底
+# 出口——正常业务分支之外任何未被专门识别的异常（数据库瞬时错误、未预料的
+# 编程缺陷等）都必须落到这一条，而不是让用户静默收不到任何回应。占位名沿用
+# `onboarding.internal_error` 一贯的 `{reference}`（不能叫 `trace_id`，见该键
+# 旁注）。
+"gateway.unexpected_error" = "处理这条消息时出现了内部问题，暂时无法完成，请稍后重试。错误码：LX-GATEWAY-001，追溯号：{reference}。"
 "gateway.delivery_expired" = "上一次问数结果因超过投递时限未能确认送达，已过期，请重新提问。"
 "gateway.new_session" = "已开启新会话，可以开始提问。"
 "gateway.session_rotated" = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"
@@ -71,6 +85,23 @@ version = "2026-08-30-2"
 "worker.action.querying_query_metric" = "正在第 {count} 次查询指标数据"
 "worker.action.composing" = "正在整理与生成回答"
 "worker.action.working" = "正在处理其它步骤"
+# 历史行完成时措辞（Trace #469 S-1 TOP-9，PM 确认纳入本批）：进度卡正文是
+# 按时间顺序追加的多行列表（core/execution/card_stream.py 的
+# `_accumulated_status_card`），此前每一行都固定用上面这组"正在..."现在时
+# 措辞——一旦追加了新的一行，前面那些本该是"已经发生过的步骤"，却仍然停在
+# "正在发生"，读起来自相矛盾（例如卡片同时显示"正在查询指标数据"和"正在
+# 整理与生成回答"两行）。这里给每一句补一个"已..."完成时变体，只用于渲染
+# 除最后一行之外的历史行，最后一行（当前正在发生的步骤）继续用上面的现在时
+# 措辞，两者从不混用在同一行。文案为实施草案，产品负责人过目前不作为最终
+# 定稿。
+"worker.action.processing_done" = "已处理"
+"worker.action.querying_metrics_done" = "已完成第 {count} 次查询指标数据"
+"worker.action.querying_list_metrics_done" = "已完成第 {count} 次查询可用指标列表"
+"worker.action.querying_describe_metric_done" = "已完成第 {count} 次查询指标说明"
+"worker.action.querying_search_dimension_done" = "已完成第 {count} 次查询维度信息"
+"worker.action.querying_query_metric_done" = "已完成第 {count} 次查询指标数据"
+"worker.action.composing_done" = "已整理与生成回答"
+"worker.action.working_done" = "已处理其它步骤"
 # G-CARD 10 分钟自动关闭提前收口（Issue #407，见 core/execution/card_stream.py
 # 的 CARD_AUTO_CLOSE_HANDOFF_SECONDS）：接近平台自动关闭阈值时的最后一帧卡片
 # 提示，之后改由文字消息发送最终结果。
@@ -168,19 +199,23 @@ version = "2026-08-30-2"
 "delivery.sheet_uncertain" = "表格生成结果暂无法确认，已转人工核对。追溯号：{reference}。"
 
 # 用户记忆命令面（Issue #357 S-H3-3，D1 显式登记范围）：用户显式登记术语映射/
-# 口径偏好/惯例模板，下一次问数生效；/memory list 可查、/memory forget <id>/
+# 口径偏好/惯例模板，下一次问数生效；/memory list 可查、/memory forget <序号>/
 # /memory clear 可清。文案为实施草案，产品负责人过目前不作为最终定稿。
-"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <id> 删除一条；/memory clear 清空全部。"
+# rc22 B-8-1（#439 TOP-10）：/memory list 不再展示裸 mem_ ULID，改用按登记时间
+# 排出的短序号（1、2、3……）；/memory forget 同步支持按短序号删除，原始 mem_
+# id 入参仍然兼容（见 core/conversation/commands.py）。
+"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆（附带序号）；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <序号> 删除一条（序号见 /memory list，也可以直接用完整 id）；/memory clear 清空全部。"
 "memory.remembered" = "已登记这条记忆，下一次提问开始生效，可以用 /memory list 查看全部。"
 "memory.remember_unsafe" = "这条记忆的内容未能登记：其中包含疑似系统指令或内部标识的文本，无法安全展示或使用，请修改关键词/说明后重试。"
-"memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <id> 删除几条后再登记。"
-"memory.forgotten" = "已删除这条记忆。"
-"memory.forget_not_found" = "没有找到这条记忆，可能已被删除或不属于你。"
+"memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <序号> 删除几条后再登记。"
+"memory.forgotten" = "已删除这条记忆：[{type_label}] {memory_key} => {memory_value}"
+"memory.forgotten_unsafe" = "已删除这条记忆（该条内容无法安全展示，类型：{type_label}）。"
+"memory.forget_not_found" = "没有找到这条记忆，可能已被删除、不属于你，或序号已过期——可以先用 /memory list 重新查看当前序号。"
 "memory.cleared" = "已清空你的全部记忆（共 {count} 条）。"
 "memory.list_empty" = "你还没有登记任何记忆。可以用 /memory remember <类型> <关键词> => <说明> 登记，类型可选 term_mapping（术语映射）/calibration_preference（口径偏好）/convention_template（惯例模板）。"
 "memory.list" = "已登记的记忆：\n{entries}"
-"memory.list_entry" = "- [{type_label}] {memory_key} => {memory_value}（id: {memory_id}）"
-"memory.list_entry_unsafe" = "- [{type_label}] （该条内容无法安全展示，可用 /memory forget <id> 删除，id: {memory_id}）"
+"memory.list_entry" = "{serial}. [{type_label}] {memory_key} => {memory_value}"
+"memory.list_entry_unsafe" = "{serial}. [{type_label}] （该条内容无法安全展示，可用 /memory forget {serial} 删除）"
 "memory.type_label.term_mapping" = "术语映射"
 "memory.type_label.calibration_preference" = "口径偏好"
 "memory.type_label.convention_template" = "惯例模板"
@@ -202,5 +237,10 @@ button_labels = []
 
 [cards."query.empty"]
 title = "查询完成"
-body = "本次未取得可用结果。"
+# Trace #469 S-1 TOP-9（PM 确认纳入本批）：此前 `core/execution/card_stream.py::
+# finish()` 会先拼一行"已完成 · N 秒"，再换行拼这条卡片固定的"本次未取得可用
+# 结果。"——两行紧挨着读像自相矛盾（"已完成"暗示成功，紧接着又说"没有结果"）。
+# 合并成一句连贯的话，"已完成"这个事实与"没有可用结果"这个结论同一句话说完，
+# 不再分两行陈述。
+body = "已完成 · {elapsed_seconds} 秒，本次未取得可用结果。"
 button_labels = []
