@@ -85,11 +85,39 @@ class _FakeAudit:
         self.calls.append((action, fields))
 
 
+class FakeDisplayNames:
+    """``AdminDisplayNames`` 的内存假实现（Trace #469 S-1）：记录每次
+    ``user_label`` 调用的 open_id，返回固定的姓名+邮箱展示值——本文件只关心
+    "确实调用了这个端口、结果确实被用于渲染"，不重复测试真实翻译逻辑（那是
+    ``adapters/admin_registry.py`` 的真库集成测试的职责）。"""
+
+    def __init__(self) -> None:
+        self.user_label_calls: list[str] = []
+        self.company_label_calls: list[str] = []
+        self.metric_label_calls: list[str] = []
+
+    def user_label(self, *, open_id: str) -> str:
+        # 刻意不把 open_id 编进返回值——与真实实现"绝不回显 open_id"的承诺
+        # 同一姿态，避免测试因为巧合包含了输入子串而遮盖真实的接线缺陷。
+        self.user_label_calls.append(open_id)
+        return "某某人（masked@example.com）"
+
+    def company_label(self, *, company_id: str) -> str:
+        self.company_label_calls.append(company_id)
+        return f"某某公司（{company_id}）"
+
+    def metric_label(self, *, metric_id: str) -> str:
+        self.metric_label_calls.append(metric_id)
+        return f"某某指标（{metric_id}）"
+
+
 class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_successful_send_marks_delivered_with_the_returned_card_id(self) -> None:
         transport = _FakeTransport(card_id="cardkit_abc")
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         result = dispatcher.send(
@@ -105,7 +133,9 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_explicit_rejection_marks_send_failed_not_delivered(self) -> None:
         transport = _FakeTransport(raises=AdminCardDeliveryRejected("拒绝", code="9999"))
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         result = dispatcher.send(
@@ -124,7 +154,9 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
 
         transport = _FakeTransport(raises=RuntimeError("网络超时"))
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         result = dispatcher.send(
@@ -137,7 +169,9 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
     def test_card_is_sent_as_a_reply_to_the_triggering_message(self) -> None:
         transport = _FakeTransport()
         tracker = _FakeTracker()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=_FakeAudit())
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         dispatcher.send(
@@ -148,6 +182,29 @@ class ConfirmCardDispatcherTests(unittest.TestCase):
         self.assertEqual(call["reply_to_message_id"], "om_specific")
         self.assertEqual(call["thread_id"], "tid_1")
         self.assertEqual(call["chat_id"], "oc_1")
+
+    def test_target_field_shows_the_resolved_display_name_not_the_raw_open_id(self) -> None:
+        """Trace #469 S-1 TOP-1 接线断言：确认卡「目标：」字段经
+        ``AdminDisplayNames.user_label`` 解析，且确实用 ``pending.
+        target_open_id`` 调用了这个端口——不是渲染层自己凑巧不显示，而是
+        调用方真的做了这次翻译。"""
+
+        transport = _FakeTransport()
+        tracker = _FakeTracker()
+        display_names = FakeDisplayNames()
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=_FakeAudit(), display_names=display_names
+        )
+        pending = _pending()
+
+        dispatcher.send(
+            pending=pending, chat_id="oc_1", thread_id=None, reply_to_message_id="om_1"
+        )
+
+        self.assertEqual(display_names.user_label_calls, [pending.target_open_id])
+        card = transport.create_calls[0]["card"]
+        self.assertIn("某某人（masked@example.com）", card.body)
+        self.assertNotIn(pending.target_open_id, card.body)
 
 
 class SendFailureAuditTests(unittest.TestCase):
@@ -162,7 +219,9 @@ class SendFailureAuditTests(unittest.TestCase):
         )
         tracker = _FakeTracker()
         audit = _FakeAudit()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=audit, display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         dispatcher.send(
@@ -184,7 +243,9 @@ class SendFailureAuditTests(unittest.TestCase):
         transport = _FakeTransport(raises=RuntimeError("网络超时"))
         tracker = _FakeTracker()
         audit = _FakeAudit()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=audit, display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         dispatcher.send(
@@ -207,7 +268,9 @@ class SendFailureAuditTests(unittest.TestCase):
         transport = _FakeTransport(raises=RuntimeError("网络超时"))
         tracker = _FakeTracker()
         audit = _FakeAudit()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=audit, display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         dispatcher.send(
@@ -224,7 +287,9 @@ class SendFailureAuditTests(unittest.TestCase):
         transport = _FakeTransport(card_id="cardkit_abc")
         tracker = _FakeTracker()
         audit = _FakeAudit()
-        dispatcher = ConfirmCardDispatcher(transport=transport, tracker=tracker, audit=audit)
+        dispatcher = ConfirmCardDispatcher(
+            transport=transport, tracker=tracker, audit=audit, display_names=FakeDisplayNames()
+        )
         pending = _pending()
 
         dispatcher.send(
@@ -279,7 +344,7 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         transport = _FakeManagementTransport()
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit
+            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
         )
 
         result = dispatcher.send(
@@ -303,7 +368,7 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         )
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit
+            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
         )
 
         result = dispatcher.send(
@@ -325,7 +390,7 @@ class ManagementCardDispatcherTests(unittest.TestCase):
         transport = _FakeManagementTransport(raises=RuntimeError("网络超时"))
         audit = _FakeAudit()
         dispatcher = ManagementCardDispatcher(
-            transport=transport, catalog=_FakeCatalog(), audit=audit
+            transport=transport, catalog=_FakeCatalog(), audit=audit, display_names=FakeDisplayNames()
         )
 
         result = dispatcher.send(

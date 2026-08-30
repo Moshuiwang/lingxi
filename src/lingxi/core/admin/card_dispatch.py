@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.management_card import (
     CompanyMetricCatalog,
     ManagementCardTransport,
@@ -40,6 +41,7 @@ from lingxi.core.admin.management_card import (
 from lingxi.core.admin.notification import (
     AdminCardDeliveryRejected,
     AdminCardTransport,
+    permission_scope_ids,
     render_confirm_card,
 )
 from lingxi.core.admin.pending_action import PendingAction
@@ -80,10 +82,16 @@ class ConfirmCardDispatcher:
         transport: AdminCardTransport,
         tracker: PendingActionDeliveryTracker,
         audit: AuditSink,
+        display_names: AdminDisplayNames,
     ) -> None:
         self._transport = transport
         self._tracker = tracker
         self._audit = audit
+        # 必填（Trace #469 S-1）：确认卡「目标：」字段自本批起一律显示姓名+
+        # 邮箱，不能有一条"未装配则退回 open_id"的安全兜底路径——那正是本批
+        # 要消灭的行为，见 core/admin/display_names.AdminDisplayNames 模块文档
+        # 「安全边界」一节。
+        self._display_names = display_names
 
     def send(
         self,
@@ -93,7 +101,20 @@ class ConfirmCardDispatcher:
         thread_id: str | None,
         reply_to_message_id: str,
     ) -> CardDispatchResult:
-        card = render_confirm_card(pending, target_label=pending.target_open_id)
+        target_label = self._display_names.user_label(open_id=pending.target_open_id)
+        scope_ids = permission_scope_ids(pending)
+        company_label = (
+            self._display_names.company_label(company_id=scope_ids[0]) if scope_ids else None
+        )
+        metric_label = (
+            self._display_names.metric_label(metric_id=scope_ids[1]) if scope_ids else None
+        )
+        card = render_confirm_card(
+            pending,
+            target_label=target_label,
+            company_label=company_label,
+            metric_label=metric_label,
+        )
         try:
             created = self._transport.create(
                 chat_id=chat_id,
@@ -158,10 +179,12 @@ class ManagementCardDispatcher:
         transport: ManagementCardTransport,
         catalog: CompanyMetricCatalog,
         audit: AuditSink,
+        display_names: AdminDisplayNames,
     ) -> None:
         self._transport = transport
         self._catalog = catalog
         self._audit = audit
+        self._display_names = display_names
 
     def send(
         self,
@@ -173,7 +196,10 @@ class ManagementCardDispatcher:
         reply_to_message_id: str,
     ) -> ManagementCardDispatchResult:
         card = render_management_card(
-            status, display_identifier=display_identifier, catalog=self._catalog
+            status,
+            display_identifier=display_identifier,
+            catalog=self._catalog,
+            display_names=self._display_names,
         )
         try:
             self._transport.create(

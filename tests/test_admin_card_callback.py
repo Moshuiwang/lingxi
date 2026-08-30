@@ -33,7 +33,9 @@ from lingxi.core.admin.pending_action import (
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _pending(*, status: PendingActionStatus = PendingActionStatus.EXECUTED) -> PendingAction:
+def _pending(
+    *, status: PendingActionStatus = PendingActionStatus.EXECUTED, reason: str | None = None
+) -> PendingAction:
     return PendingAction(
         id="pac_callback_test000000000",
         action_type=PendingActionType.SUSPEND_USER,
@@ -43,7 +45,7 @@ def _pending(*, status: PendingActionStatus = PendingActionStatus.EXECUTED) -> P
         status=status,
         card_delivered=True,
         card_id="cardkit_id_1",
-        reason=None,
+        reason=reason,
         created_at=NOW,
         confirm_deadline_at=NOW + timedelta(minutes=10),
         decided_at=NOW,
@@ -153,6 +155,29 @@ class _FakeRecomputeTrigger:
             raise self._raises
 
 
+class FakeDisplayNames:
+    """``AdminDisplayNames`` 的内存假实现（Trace #469 S-1）：记录调用参数，
+    返回不含入参 open_id 子串的固定展示值——同 ``tests/test_admin_card_
+    dispatch.py`` 的同名假实现同一姿态与理由。"""
+
+    def __init__(self) -> None:
+        self.user_label_calls: list[str] = []
+        self.company_label_calls: list[str] = []
+        self.metric_label_calls: list[str] = []
+
+    def user_label(self, *, open_id: str) -> str:
+        self.user_label_calls.append(open_id)
+        return "某某人（masked@example.com）"
+
+    def company_label(self, *, company_id: str) -> str:
+        self.company_label_calls.append(company_id)
+        return f"某某公司（{company_id}）"
+
+    def metric_label(self, *, metric_id: str) -> str:
+        self.metric_label_calls.append(metric_id)
+        return f"某某指标（{metric_id}）"
+
+
 def _build_handler(
     *,
     pending_actions: _FakePendingActions,
@@ -162,6 +187,7 @@ def _build_handler(
     audit: _RecordingAudit | None = None,
     management_actions: object | None = None,
     recompute_trigger: "_FakeRecomputeTrigger | None" = None,
+    display_names: "FakeDisplayNames | None" = None,
 ) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
     audit = audit or _RecordingAudit()
     handler = AdminCardCallbackHandler(
@@ -170,6 +196,7 @@ def _build_handler(
         group_notifier=group_notifier,
         group_chat_id=group_chat_id,
         audit=audit,
+        display_names=display_names or FakeDisplayNames(),
         management_actions=management_actions,
         recompute_trigger=recompute_trigger,
     )
@@ -263,7 +290,11 @@ class ConfirmExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success")
-        self.assertEqual(outcome["toast"]["content"], "已确认执行，权限变更将即时生效")
+        # Trace #469 S-1 TOP-3 接线修复：toast 直接用这次点击产生的
+        # ``decision.message``（这里由 ``_FakeDecision.message`` 注入），不再
+        # 由 ``_outcome_text(pending)`` 重新按持久状态派生一句不同的文案——
+        # 见 ``core/admin/card_callback.py`` ``handle()`` 的对应注释。
+        self.assertEqual(outcome["toast"]["content"], "已确认执行。")
         self.assertEqual(outcome["card"]["type"], "raw")
         # 终态卡 data 必须是对象（dict），不是字符串——飞书要的是可以直接被
         # SDK JSON 序列化的结构，不是我们提前 json.dumps 过的字符串。
@@ -278,6 +309,92 @@ class ConfirmExecutionTests(unittest.TestCase):
         self.assertEqual(cards.update_calls[0]["sequence"], 1)
         self.assertEqual(len(group.sent), 1)
         self.assertEqual(group.sent[0]["dedupe_key"], pending.id)
+
+
+class DisplayNamesWiringTests(unittest.TestCase):
+    """Trace #469 S-1 TOP-1/C 接线断言：终态卡「目标：」字段与管理群广播都经
+    ``AdminDisplayNames.user_label`` 解析 ``pending.target_open_id``，不回显
+    open_id；待确认操作内部 ID（``pac_*``）只用于出站 ``dedupe_key`` 参数
+    （审计/去重用途），不进入群通知的可见正文。"""
+
+    def _executed_outcome(self, pending: PendingAction) -> _FakeOutcome:
+        return _FakeOutcome(
+            decision=_FakeDecision(
+                kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                terminal_status=PendingActionStatus.EXECUTED,
+            ),
+            pending=pending,
+        )
+
+    def test_terminal_card_and_group_notice_show_the_resolved_label_not_the_open_id(
+        self,
+    ) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._executed_outcome(pending))
+        cards = _FakeCardTransport()
+        group = _FakeGroupNotifier()
+        display_names = FakeDisplayNames()
+        handler, _audit = _build_handler(
+            pending_actions=pending_actions,
+            confirm_cards=cards,
+            group_notifier=group,
+            display_names=display_names,
+        )
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_display_1",
+        )
+
+        self.assertIn(pending.target_open_id, display_names.user_label_calls)
+        terminal_card = cards.update_calls[0]["card"]
+        self.assertIn("某某人（masked@example.com）", terminal_card.body)
+        self.assertNotIn(pending.target_open_id, terminal_card.body)
+
+        group_text = group.sent[0]["text"]
+        self.assertIn("某某人（masked@example.com）", group_text)
+        self.assertNotIn(pending.target_open_id, group_text)
+        # 待确认操作内部 ID（pac_*）只留在 dedupe_key 里，不进入可见正文
+        # （Trace #469 S-1 C 项）。
+        self.assertEqual(group.sent[0]["dedupe_key"], pending.id)
+        self.assertNotIn(pending.id, group_text)
+
+    def test_failed_reason_is_translated_to_chinese_in_terminal_card_and_toast(self) -> None:
+        pending = _pending(status=PendingActionStatus.FAILED, reason="role_revoked")
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.ROLE_REVOKED,
+                    ok=False,
+                    message="当前角色已无权执行该操作，请重新查询后再发起。",
+                    terminal_status=PendingActionStatus.FAILED,
+                ),
+                pending=pending,
+            )
+        )
+        cards = _FakeCardTransport()
+        handler, _audit = _build_handler(pending_actions=pending_actions, confirm_cards=cards)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_display_2",
+        )
+
+        # 接线级修复（TOP-3）：toast 用这次点击的友好 decision.message。
+        self.assertEqual(
+            outcome["toast"]["content"], "当前角色已无权执行该操作，请重新查询后再发起。"
+        )
+        # 终态卡片正文用持久化的 pending.reason 翻译（describe_failed_reason），
+        # 不直出机器码 "role_revoked"。
+        terminal_card = cards.update_calls[0]["card"]
+        self.assertIn("发起人当时角色已被撤销", terminal_card.body)
+        self.assertNotIn("role_revoked", terminal_card.body)
 
 
 class NotInitiatorTests(unittest.TestCase):
@@ -628,9 +745,11 @@ class CancelPathTests(unittest.TestCase):
         )
 
         # cancelled 不是 executed：toast 类型必须是 info，不是 success（见
-        # handle() 文档分支 1 的 success/info 映射）。
+        # handle() 文档分支 1 的 success/info 映射）。toast 内容用这次点击的
+        # ``decision.message``（Trace #469 S-1 TOP-3），即 ``_FakeDecision`` 上面
+        # 注入的那句话。
         self.assertEqual(outcome["toast"]["type"], "info")
-        self.assertEqual(outcome["toast"]["content"], "已取消")
+        self.assertEqual(outcome["toast"]["content"], "已取消，未做任何变更。")
         self.assertIn("card", outcome)
         self.assertEqual(pending_actions.confirm_calls, [])
         self.assertEqual(len(pending_actions.cancel_calls), 1)
@@ -1024,7 +1143,12 @@ class RecomputeTriggerWiringTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome["toast"]["type"], "success")
-        self.assertIn("即时生效", outcome["toast"]["content"])
+        # toast 内容用这次点击的 decision.message（Trace #469 S-1 TOP-3），即
+        # 上面 `_confirm_result` 注入的那句话；"即时生效"这句持久化措辞仍然
+        # 出现在终态卡片正文里（`_outcome_text`，见 `test_terminal_card_...`
+        # 一类断言），toast 与卡片正文自本批起可以是两句不同的话，见
+        # `card_callback.py::handle()` 的对应注释。
+        self.assertEqual(outcome["toast"]["content"], "已确认执行。")
         self.assertEqual(trigger.calls, [pending])
 
     def test_cancel_does_not_trigger_recompute(self) -> None:

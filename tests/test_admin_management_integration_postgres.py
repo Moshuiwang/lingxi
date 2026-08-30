@@ -103,15 +103,23 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
 
         confirm_audit = _RecordingAudit()
         self.pending_store = PostgresPendingActionStore(self._dsn, audit=confirm_audit)
+        # 同一个 PostgresAdminQueries 实例结构性实现 AdminDisplayNames（Trace
+        # #469 S-1），与真实 apps/gateway/__init__.py 装配同一姿态——不需要
+        # 额外声明或继承，注入到下面三处需要它的构造点。
+        self.display_names = PostgresAdminQueries(self._dsn)
         self.confirm_transport = _FakeConfirmCardTransport()
         confirm_dispatcher = ConfirmCardDispatcher(
-            transport=self.confirm_transport, tracker=self.pending_store, audit=confirm_audit
+            transport=self.confirm_transport,
+            tracker=self.pending_store,
+            audit=confirm_audit,
+            display_names=self.display_names,
         )
         self.router_audit = _RecordingAudit()
         self.router = AdminCommandRouter(
             registry=PostgresAdminRegistryLookup(self._dsn),
             queries=PostgresAdminQueries(self._dsn),
             audit=self.router_audit,
+            display_names=self.display_names,
             pending_actions=self.pending_store,
             confirm_cards=confirm_dispatcher,
         )
@@ -122,6 +130,7 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
             group_notifier=_NoGroupNotifier(),
             group_chat_id=None,
             audit=self.callback_audit,
+            display_names=self.display_names,
             management_actions=self.router,
         )
 
@@ -169,6 +178,15 @@ class FormSubmitCreatesARealPendingActionTests(ManagementCardCallbackIntegration
         # 确认卡片确实通过既有 ConfirmCardDispatcher 发送了一次（真实
         # pending_action.card_delivered 应为真，能被后续 confirm() 使用）。
         self.assertEqual(len(self.confirm_transport.create_calls), 1)
+        # Trace #469 S-1 TOP-1（L1 真库证据）：确认卡「目标：」字段显示真实
+        # app_user.display_name（setUp 里写的"化名用户"），不是 TARGET_OPEN_ID
+        # 这个 open_id 字面量——真实 SQL 查询、真实 CHECK 约束下的一整条链路。
+        sent_card = self.confirm_transport.create_calls[0]["card"]
+        self.assertIn("化名用户", sent_card.body)
+        self.assertNotIn(TARGET_OPEN_ID, sent_card.body)
+        # 公司编号在没有任何银河批次时按设计原样展示（未导入过银河数据，
+        # company_label 的既有降级行为，见 core/admin/display_names 模块文档）。
+        self.assertIn("公司 1011", sent_card.body)
 
     def test_suppress_form_submit_writes_the_suppress_action_type(self) -> None:
         self.handler.handle_management_form_submit(
