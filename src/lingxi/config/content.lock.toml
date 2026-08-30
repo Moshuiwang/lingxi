@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-30-2"
-digest = "sha256:a004225a5a155fd0dfc65b4cf020d65a4d1c5369e62a3b0658d3473c760394ad"
+version = "2026-08-30-3"
+digest = "sha256:34fe15c55876216e333bf87c6b2f35fec25f90645c0f46e9de5d488fe6ef71ed"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -27,6 +27,7 @@ retired_versions = [
   "2026-08-28-4",
   "2026-08-29-1",
   "2026-08-30-1",
+  "2026-08-30-2",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -46,6 +47,7 @@ retired_versions = [
 "texts.delivery.sheet_ready" = "3e7fbf93015d32a9"
 "texts.delivery.sheet_uncertain" = "6cb0ac2f13362da1"
 "texts.gateway.busy_hint" = "7984bc41c89b9e08"
+"texts.gateway.busy_hint_queued" = "84cd962306594c84"
 "texts.gateway.delivery_expired" = "650d1541a4369696"
 "texts.gateway.group_mention_hint" = "6ff88d15b2832edb"
 "texts.gateway.new_session" = "914f6fa8697310f6"
@@ -53,6 +55,7 @@ retired_versions = [
 "texts.gateway.session_rotated" = "df77349f3165a8cb"
 "texts.gateway.slash_rejected" = "9b97c561e83c0302"
 "texts.gateway.suspended" = "dfe76626dc97ecce"
+"texts.gateway.unexpected_error" = "e73663772f0a3ee9"
 "texts.memory.cleared" = "69a517b197f284af"
 "texts.memory.forget_not_found" = "230bcb25eb539164"
 "texts.memory.forgotten" = "8dd2951f8b668251"

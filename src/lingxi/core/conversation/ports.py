@@ -71,6 +71,14 @@ class ConversationRecord:
     agent_session_id: str | None
     last_task_ended_at: datetime | None
     running_task_id: str | None
+    #: ``running_task_id`` 指向的那条 ``task`` 当前的 ``status``（Issue #465，
+    #: S-3：忙碌提示文案如实区分"排队中"与"处理中"）。``running_task_id`` 为
+    #: ``None`` 时恒为 ``None``；否则应为 ``'queued'``/``'running'`` 等
+    #: `task.status` 取值之一。放在事务开始时读到的同一次快照里，与
+    #: ``running_task_id`` 同源、同一致性边界——不是第二次查询拼出来的。
+    #: 新增字段带默认值，兼容既有注入式测试直接用位置参数或旧关键字构造
+    #: 本类而不知道这个字段。
+    running_task_status: str | None = None
 
 
 class HandledAs(str, Enum):

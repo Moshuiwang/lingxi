@@ -125,10 +125,12 @@ class _Transaction:
         )
         cursor = self._execute(
             """
-            SELECT id, agent_session_id, last_task_ended_at, running_task_id
-              FROM conversation
-             WHERE user_id = %s AND feishu_chat_id = %s
-               AND COALESCE(feishu_thread_id, '') = COALESCE(%s, '')
+            SELECT c.id, c.agent_session_id, c.last_task_ended_at, c.running_task_id,
+                   t.status
+              FROM conversation AS c
+              LEFT JOIN task AS t ON t.id = c.running_task_id
+             WHERE c.user_id = %s AND c.feishu_chat_id = %s
+               AND COALESCE(c.feishu_thread_id, '') = COALESCE(%s, '')
             """,
             (user_id, chat_id, thread_id),
         )
@@ -140,6 +142,10 @@ class _Transaction:
             agent_session_id=row[1],
             last_task_ended_at=row[2],
             running_task_id=row[3],
+            # `LEFT JOIN`：`running_task_id` 为 NULL 时 `t.status` 天然也是
+            # NULL，不需要额外判空（Issue #465，忙碌提示"排队中/处理中"如实
+            # 区分的唯一数据来源）。
+            running_task_status=row[4],
         )
 
     def claim_conversation(self, *, conversation_id: str, task_id: str) -> bool:

@@ -106,6 +106,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Callable
 
@@ -171,6 +172,16 @@ class DeliveryConsumer:
     # 取 3：默认 1 秒轮询下约 3 秒即报，同时把单点抖动挡在告警之外。数值不是产品
     # 承诺，可按需调。
     DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD = 3
+    # Issue #465（rc22 S-3，排队可感知）：入队后超过这个阈值仍未被任何 worker
+    # 领取，就补发一条"前面还有任务在排队，请稍等"（`gateway.busy_hint_queued`）。
+    # **定值理由**：产品要求落在 10~15 秒区间；取区间中值 12 秒——本轮询默认
+    # 1 秒一次（`GatewayConfig.delivery_poll_interval_seconds`），12 秒留出
+    # 10~12 轮的观察窗口，正常情况下任务从入队到被领取是秒级（worker 端 claim
+    # 轮询同样是亚秒级），12 秒的噪音发生概率可以忽略；同时比合同上限 15 秒留了
+    # 3 秒余量，不会卡在临界值上。可通过 `LINGXI_GATEWAY_QUEUE_DELAY_HINT_
+    # SECONDS` 覆盖，见 `apps/gateway/config.py`。
+    DEFAULT_QUEUE_DELAY_HINT_SECONDS = 12.0
+    DEFAULT_QUEUE_DELAY_HINT_LIMIT = 50
 
     def __init__(
         self,
@@ -189,6 +200,8 @@ class DeliveryConsumer:
         fallback_backoff_base_seconds: float = DEFAULT_FALLBACK_BACKOFF_BASE_SECONDS,
         fallback_backoff_cap_seconds: float = DEFAULT_FALLBACK_BACKOFF_CAP_SECONDS,
         loop_failure_alert_threshold: int = DEFAULT_LOOP_FAILURE_ALERT_THRESHOLD,
+        queue_delay_hint_seconds: float = DEFAULT_QUEUE_DELAY_HINT_SECONDS,
+        queue_delay_hint_limit: int = DEFAULT_QUEUE_DELAY_HINT_LIMIT,
     ) -> None:
         self._queue = queue
         self._cards = cards
@@ -206,11 +219,18 @@ class DeliveryConsumer:
         self._fallback_backoff_base_seconds = fallback_backoff_base_seconds
         self._fallback_backoff_cap_seconds = fallback_backoff_cap_seconds
         self._loop_failure_alert_threshold = loop_failure_alert_threshold
+        self._queue_delay_hint_seconds = queue_delay_hint_seconds
+        self._queue_delay_hint_limit = queue_delay_hint_limit
         # 进程内、非持久化状态：只用来给告警与外发重试限速，重启后清零属于可接受
         # 的降级（重启本身就已经是一次重新评估的机会）。
         self._last_alerted_at: dict[tuple[str, str], float] = {}
         self._fallback_attempts: dict[str, int] = {}
         self._fallback_next_attempt_at: dict[str, float] = {}
+        # 已经发过排队提示的任务 id（Issue #465）：同一姿态的进程内、非持久化
+        # 状态——只用来避免同一个任务每轮轮询都重发一次提示，不是需要跨重启
+        # 存活的业务结论。每轮与当前仍然"排队超时"的候选集合取交集自然收缩
+        # （见 `_notify_stale_queued`），不会无界增长。
+        self._queue_delay_notified: set[str] = set()
         # Issue #191：循环级异常的计数，同样是进程内状态。``consecutive_loop_failures``
         # 决定何时上报，一轮完全正常即归零；``loop_failures_total`` 只增不减，回答
         # "这个进程一共扛下过多少次循环级异常"——两者都刻意留成可读属性，让日志
@@ -288,17 +308,26 @@ class DeliveryConsumer:
 
     def run_once(self) -> int:
         """跑一轮：先报告仍然卡在"外发前预留位"里的任务，再处理正常候选。
-        返回本轮实际处理的候选任务数（不含仅被告警的 uncertain 任务）。
+        返回本轮实际处理的候选任务数（不含仅被告警的 uncertain 任务、也不含
+        本轮补发的排队提示）。
 
-        **两条循环级查询各自隔离**（Issue #191）：任何一条抛异常都只降级它自己那
-        一段，不向上抛、不带走另一段。``list_uncertain_delivery_tasks`` 失败时正常
-        候选照常消费（uncertain 告警晚一轮，用户结果不受影响）；
-        ``list_pending_delivery_tasks`` 失败时本轮没有别的事可做，直接返回 0，下一轮
-        重来。此前这两条查询裸露在循环里，一次普通的语句超时或连接重置就会抛穿
-        ``run_forever``，让整条后台线程无声死亡（见模块说明）。
+        **三条循环级查询各自隔离**（Issue #191，Issue #465 新增第三条）：任何一条
+        抛异常都只降级它自己那一段，不向上抛、不带走另一段。``list_uncertain_
+        delivery_tasks`` 失败时正常候选照常消费（uncertain 告警晚一轮，用户结果
+        不受影响）；``list_pending_delivery_tasks`` 失败时本轮没有别的事可做，
+        直接返回 0，下一轮重来；排队提示（``_notify_stale_queued``）失败只降级
+        它自己，不影响本轮正常候选的消费——它是一条尽力而为的体验提示，不该因为
+        自己不可用而拖累已经在正常投递的任务。此前这两条查询裸露在循环里，一次
+        普通的语句超时或连接重置就会抛穿 ``run_forever``，让整条后台线程无声
+        死亡（见模块说明）。
         """
 
         loop_healthy = True
+        try:
+            self._notify_stale_queued()
+        except Exception as error:  # noqa: BLE001 - 见方法文档：只降级这一段，不带走本轮
+            self._note_loop_failure(error, stage="queue_delay_hint")
+            loop_healthy = False
         try:
             uncertain_tasks = self._queue.list_uncertain_delivery_tasks(
                 limit=self._uncertain_limit
@@ -341,6 +370,76 @@ class DeliveryConsumer:
             # "整条循环坏了"。
             self._note_loop_recovered()
         return len(tasks)
+
+    def _notify_stale_queued(self) -> None:
+        """排队可感知（Issue #465，rc22 S-3）：入队超过阈值仍未被任何 worker
+        领取时，补发一条"前面还有任务在排队，请稍等"。
+
+        **刻意不做入站即回执**（产品明确排除项）：这里只在真正越过阈值时才发，
+        正常秒级领取的任务永远不会被 :meth:`~lingxi.adapters.postgres_
+        conversation.PostgresTaskQueue.list_stale_queued_tasks` 选中，不产生
+        任何噪音。
+
+        **只发一次，去重靠进程内内存集合**——与本类既有的
+        ``_last_alerted_at``/``_fallback_next_attempt_at`` 同一姿态（见
+        ``__init__`` 的字段文档），不新增数据库列或表：这是一条尽力而为的体验
+        提示，不是需要跨重启持久化、需要幂等表兜底的业务结论（对比：`worker.
+        queued_timeout` 那条更长阈值之后的诚实失败终态，仍然走 outbox 那一整套
+        幂等机制）。每轮与最新查到的候选集合取交集，任务一旦被真正领取（不再
+        出现在候选里）就会从集合里被清掉，不会无界增长；进程重启清零属于已知
+        可接受的降级——至多让同一个用户在重启窗口附近多收到一次这条提示，不
+        影响任何业务结论。
+
+        **不是 outbox 事件、不经过 ``CardStream``**：完全不触碰 `task_delivery_
+        event`/`task.card_id` 等状态，只是一次独立的 `Replies.send_text` 调用，
+        与 `core/conversation/pipeline.py` 忙碌分支复用同一份文案
+        （`gateway.busy_hint_queued`），但走的是不同的出站通道（这里是
+        `TextTransport`，忙碌分支走 `Replies`——两者签名一致，只是类型标注
+        不同，`apps/gateway/__init__.py` 装配时实际是同一个 `LarkReplies`
+        实例）。
+
+        ``getattr(self._queue, "list_stale_queued_tasks", None)``：与
+        ``apps/worker/service.py._housekeep()`` 对 ``fail_unavailable_
+        versions``/``reclaim_queued`` 等可选队列能力的既有姿态一致——旧的注入
+        式假队列（``tests/test_gateway_delivery_resilience.py`` 的
+        ``_FakeQueue`` 等，只实现循环级查询本身要覆盖的那几个方法）没有这个
+        方法时整体跳过，行为与本功能加入之前逐字节一致，不会把
+        ``AttributeError`` 误算成一次"循环级异常"进而污染那些用例已经锁死的
+        精确失败计数。
+        """
+
+        list_stale = getattr(self._queue, "list_stale_queued_tasks", None)
+        if list_stale is None:
+            return
+        stale = list_stale(
+            older_than=timedelta(seconds=self._queue_delay_hint_seconds),
+            limit=self._queue_delay_hint_limit,
+        )
+        current_ids = {row.task_id for row in stale}
+        # 收缩：不再出现在候选集合里的 id（已被领取、或已经等到更长阈值的
+        # `queued_timeout` 收口）不需要继续占内存。
+        self._queue_delay_notified &= current_ids
+        if not stale:
+            return
+        content = self._catalog.text("gateway.busy_hint_queued")
+        for row in stale:
+            if row.task_id in self._queue_delay_notified:
+                continue
+            try:
+                self._texts.send_text(
+                    chat_id=row.chat_id,
+                    thread_id=row.thread_id,
+                    reply_to_message_id=row.reply_to_message_id or "",
+                    text=content.text,
+                )
+            except Exception as error:  # noqa: BLE001 - 单条发送失败不影响其余候选，下一轮重试
+                logger.error(
+                    "排队提示发送失败，下一轮重试 task_id=%s error=%s",
+                    row.task_id,
+                    type(error).__name__,
+                )
+                continue
+            self._queue_delay_notified.add(row.task_id)
 
     def _prior_progress_history(self, task: Any) -> tuple[ProgressStepSnapshot, ...]:
         """重建这个任务在本轮批次**之前**已经持久化的进度信号历史（Issue #407
@@ -723,6 +822,7 @@ def build_delivery_consumer(
     on_send_outcome: SendOutcomeCallback | None = None,
     on_alert: AlertCallback | None = None,
     limit: int = 20,
+    queue_delay_hint_seconds: float = DeliveryConsumer.DEFAULT_QUEUE_DELAY_HINT_SECONDS,
 ) -> DeliveryConsumer:
     """按已经建好的飞书 SDK 客户端与队列适配器装配消费者。
 
@@ -735,6 +835,11 @@ def build_delivery_consumer(
     ``apps.gateway.assemble_delivery_consumer`` 只在显式命中
     ``LINGXI_GATEWAY_CARD_FAILURE_INJECT`` 时才传入一个包一层"确定性拒绝"的实现，
     用来验证卡片降级路径——不是给业务代码开的通用注入口。
+
+    ``queue_delay_hint_seconds``（Issue #465）：排队阈值提示的定值，由
+    ``apps.gateway.assemble_delivery_consumer`` 从 ``GatewayConfig.
+    queue_delay_hint_seconds`` 传入；未显式传入时使用 ``DeliveryConsumer`` 自己
+    的默认值。
     """
 
     from lingxi.adapters.feishu_delivery import LarkCardTransport, LarkDeliveryText
@@ -746,4 +851,5 @@ def build_delivery_consumer(
         on_send_outcome=on_send_outcome,
         on_alert=on_alert,
         limit=limit,
+        queue_delay_hint_seconds=queue_delay_hint_seconds,
     )

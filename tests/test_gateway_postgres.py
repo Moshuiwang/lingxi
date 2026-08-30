@@ -210,7 +210,16 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
         self.add_user()
 
     def _failing_store(self):
-        """在 ``insert_task`` 处注入写失败的存储。"""
+        """在 ``insert_task`` 处注入写失败的存储。
+
+        ``Wrapper.__getattr__``（Issue #465 补齐）把 ``.transaction()`` 之外的
+        一切属性访问都代理回真实的 ``PostgresGatewayStore``——尤其是
+        ``claim_queue_failure_notice``：此前这里只手写了 ``transaction`` 一个
+        方法，``getattr(wrapper, "claim_queue_failure_notice", None)`` 恒为
+        ``None``，暴露的是这个测试专用包装本身的缺口（真实生产 store 一直都有
+        这个方法），不是生产会发生的行为。代理之后这里的入队失败路径与生产
+        环境逐字节一致：诚实的 ``gateway.queue_failed`` 提示会被真正发出。
+        """
 
         store = PostgresGatewayStore(self._dsn)
         original = store.transaction
@@ -218,6 +227,9 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
         class Wrapper:
             def transaction(self):
                 return _FailingTransaction(original())
+
+            def __getattr__(self, name):
+                return getattr(store, name)
 
         return Wrapper()
 
@@ -231,9 +243,9 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
             audit=FakeAudit(self.log),
         )
 
-        with self.assertRaises(RuntimeError):
-            pipeline.handle_message(inbound("evt_fail"), now=NOW)
+        outcome = pipeline.handle_message(inbound("evt_fail"), now=NOW)
 
+        self.assertIsNone(outcome.handled_as)
         self.assertEqual(
             self.scalar("SELECT count(*) FROM inbound_event WHERE feishu_event_id = 'evt_fail'"),
             0,
@@ -250,8 +262,8 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
         )
-        with self.assertRaises(RuntimeError):
-            broken.handle_message(inbound("evt_retry"), now=NOW)
+        outcome = broken.handle_message(inbound("evt_retry"), now=NOW)
+        self.assertIsNone(outcome.handled_as)
 
         outcome = self.pipeline().handle_message(inbound("evt_retry"), now=NOW)
 
@@ -267,8 +279,8 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
         )
-        with self.assertRaises(RuntimeError):
-            broken.handle_message(inbound("evt_a"), now=NOW)
+        outcome = broken.handle_message(inbound("evt_a"), now=NOW)
+        self.assertIsNone(outcome.handled_as)
 
         self.assertIsNone(
             self.scalar("SELECT running_task_id FROM conversation"),
@@ -278,8 +290,16 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
         outcome = self.pipeline().handle_message(inbound("evt_b"), now=NOW)
         self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
 
-    def test_failed_enqueue_sends_no_acceptance_reply(self) -> None:
-        """`V-队列-03`：入队未成功时用户不收到任何表示已受理的回复。"""
+    def test_failed_enqueue_sends_an_honest_queue_failed_reply(self) -> None:
+        """`V-队列-03`：入队未成功时用户不收到任何表示已受理的回复。
+
+        Issue #465（100% 响应覆盖）：`V-队列-03` 原文禁止的是"已受理/已开始
+        处理"这一类回复，不是全部回复——生产环境的真实 `PostgresGatewayStore`
+        一直都实现 `claim_queue_failure_notice`，入队失败会收到一条诚实的
+        `gateway.queue_failed`（"当前暂时无法开始处理，请稍后重试"）。此前
+        这里断言零回复，锁的是测试专用 `Wrapper` 没有代理这个方法的缺口，
+        不是生产行为——见 `_failing_store` 的更新说明。
+        """
 
         broken = EventPipeline(
             store=self._failing_store(),
@@ -287,10 +307,40 @@ class TransactionBoundaryTests(GatewayPostgresTestCase):
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
         )
-        with self.assertRaises(RuntimeError):
-            broken.handle_message(inbound("evt_fail"), now=NOW)
+        outcome = broken.handle_message(inbound("evt_fail"), now=NOW)
 
-        self.assertEqual(self.log.count("reply.send_text"), 0)
+        self.assertIsNone(outcome.handled_as)
+        self.assertEqual(self.log.count("reply.send_text"), 1)
+        sent = self.log.fields("reply.send_text")[0]
+        from lingxi.config.content import default_content_catalog
+
+        self.assertEqual(sent["text"], default_content_catalog().text("gateway.queue_failed").text)
+
+    def test_failed_enqueue_notice_survives_a_fresh_pipeline_instance(self) -> None:
+        """`V-队列-07`：去重靠数据库表（`queue_failure_notice`），不是进程内存
+        ——用一个全新的 `EventPipeline`/`Wrapper` 实例模拟"进程重启"，同一个
+        持续失败的事件仍然只收到一次诚实提示。"""
+
+        first = EventPipeline(
+            store=self._failing_store(),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+        )
+        first.handle_message(inbound("evt_fail"), now=NOW)
+        self.assertEqual(self.log.count("reply.send_text"), 1)
+
+        second = EventPipeline(
+            store=self._failing_store(),
+            reactions=FakeReactions(self.log),
+            replies=FakeReplies(self.log),
+            audit=FakeAudit(self.log),
+        )
+        second.handle_message(inbound("evt_fail"), now=NOW)
+
+        self.assertEqual(
+            self.log.count("reply.send_text"), 1, "重启后同一事件不得再发一次提示"
+        )
 
 
 class _FailingTransaction:
@@ -333,6 +383,31 @@ class TopicSerialisationTests(GatewayPostgresTestCase):
             self.scalar("SELECT handled_as FROM inbound_event WHERE feishu_event_id='evt_2'"),
             "busy_hint",
         )
+
+    def test_busy_hint_text_reflects_the_running_task_s_real_status(self) -> None:
+        """Issue #465（rc22 S-3，文案如实）：真库 ``ensure_conversation`` 的
+        ``LEFT JOIN task`` 必须真正把当前状态带回来——评论区读码不能替代真库
+        断言（`task.status` 由数据库触发器/约束治理，不是应用层能自证的对象）。
+        """
+
+        from lingxi.config.content import default_content_catalog
+
+        pipeline = self.pipeline()
+        pipeline.handle_message(inbound("evt_1"), now=NOW)
+
+        # 领取之前：evt_1 的任务默认 ``status='queued'``，还没有任何 worker 认领。
+        outcome = pipeline.handle_message(inbound("evt_2"), now=NOW)
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(
+            self.log.fields("reply.send_text")[-1]["text"],
+            default_content_catalog().text("gateway.busy_hint_queued").text,
+        )
+
+        # 领取之后：同一个任务真正被 worker 抢到，状态转为 running。
+        self.queue.claim(worker_id="w1", target_worker_version="stable")
+        outcome = pipeline.handle_message(inbound("evt_3"), now=NOW)
+        self.assertEqual(outcome.handled_as, HandledAs.BUSY_HINT)
+        self.assertEqual(self.log.fields("reply.send_text")[-1]["text"], BUSY_HINT_TEXT)
 
     def test_concurrent_claims_exactly_one_wins(self) -> None:
         outcomes: list[str] = []
@@ -444,8 +519,12 @@ class ReplyAfterCommitTests(GatewayPostgresTestCase):
             "忙碌期收到的消息不得在任务结束后被重投入队——合同「不会自动提交或自动生效」",
         )
 
-    def test_no_reply_is_sent_when_the_transaction_fails(self) -> None:
-        """注入提交失败：一条回复都不许发出去。"""
+    def test_a_transaction_failure_still_gets_an_honest_fallback_reply(self) -> None:
+        """注入提交前失败：事件行随事务回滚，但 Issue #465（100% 响应覆盖）要求
+        用户不能因此完全收不到任何回应——`EventPipeline.handle_message` 现在
+        是全函数，把这类未被专门识别的异常换成一条诚实的兜底提示
+        （`gateway.unexpected_error`），不再让异常穿出去（此前这里断言"一条
+        回复都不许发出去"，锁的正是尚未补上兜底之前的旧行为）。"""
 
         pipeline = EventPipeline(
             store=_FailingCommitStore(self._dsn),
@@ -454,11 +533,17 @@ class ReplyAfterCommitTests(GatewayPostgresTestCase):
             audit=FakeAudit(self.log),
         )
 
-        with self.assertRaises(RuntimeError):
-            pipeline.handle_message(inbound("evt_1"), now=NOW)
+        outcome = pipeline.handle_message(inbound("evt_1"), now=NOW)
+
+        self.assertIsNone(outcome.handled_as)
+        self.assertEqual(self.log.count("reply.send_text"), 1)
+        from lingxi.config.content import default_content_catalog
 
         self.assertEqual(
-            self.log.count("reply.send_text"), 0, "事务失败时不得有任何回复发出"
+            self.log.fields("reply.send_text")[0]["text"],
+            default_content_catalog()
+            .text("gateway.unexpected_error", reference="trc_evt_1")
+            .text,
         )
         self.assertEqual(
             self.scalar("SELECT count(*) FROM inbound_event"), 0, "事件行应随事务回滚"
@@ -997,7 +1082,13 @@ class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
         """外部独立审查 2026-08-23 P2-3：判废与入队同事务——``insert_task`` 失败
         时，指针清空和 cleanup 排队必须一起消失。否则一次入队失败就把用户上下文
         白白清掉，还留下一条会真删 JSONL 的清理待办（判废发生在 insert_task 之前，
-        这条注入恰好构造出「判废已执行、事务随后失败」的时序）。"""
+        这条注入恰好构造出「判废已执行、事务随后失败」的时序）。
+
+        ``Wrapper.__getattr__``（Issue #465 补齐，理由同 `TransactionBoundaryTests.
+        _failing_store`）：代理 `claim_queue_failure_notice` 到真实 store，让这里
+        与生产环境一致地收到诚实的 `gateway.queue_failed`，不再依赖"这个测试专用
+        包装没有实现这个方法"这件事本身。
+        """
 
         self._finished_stale_conversation()
         store = PostgresGatewayStore(self._dsn)
@@ -1007,14 +1098,17 @@ class StaleSessionDiscardPostgresTests(GatewayPostgresTestCase):
             def transaction(self):
                 return _FailingTransaction(original())
 
+            def __getattr__(self, name):
+                return getattr(store, name)
+
         broken = EventPipeline(
             store=Wrapper(),
             reactions=FakeReactions(self.log),
             replies=FakeReplies(self.log),
             audit=FakeAudit(self.log),
         )
-        with self.assertRaises(RuntimeError):
-            broken.handle_message(inbound("evt_rotated"), now=NOW + timedelta(hours=3))
+        outcome = broken.handle_message(inbound("evt_rotated"), now=NOW + timedelta(hours=3))
+        self.assertIsNone(outcome.handled_as)
 
         self.assertEqual(
             self.scalar("SELECT agent_session_id FROM conversation"),
@@ -1159,6 +1253,12 @@ class QueueClaimTests(GatewayPostgresTestCase):
     # 并标为未认领。这里不留一条假装覆盖了它的用例。
 
     def test_notify_is_not_emitted_when_the_transaction_rolls_back(self) -> None:
+        """Issue #465：这里注入的异常发生在 ``notify_task_queued`` 之后、提交
+        之前，不经过 `QueueInsertFailure` 那条已识别路径——`EventPipeline.
+        handle_message` 现在是全函数，不再让它穿出去，而是换成一条诚实的
+        兜底提示（`gateway.unexpected_error`）；本用例仍然只锁 NOTIFY 本身
+        随事务回滚这一件事。"""
+
         listener = self._psycopg.connect(self._dsn, autocommit=True)
         try:
             listener.execute(f"LISTEN {TASK_QUEUED_CHANNEL}")
@@ -1168,8 +1268,8 @@ class QueueClaimTests(GatewayPostgresTestCase):
                 replies=FakeReplies(self.log),
                 audit=FakeAudit(self.log),
             )
-            with self.assertRaises(RuntimeError):
-                broken.handle_message(inbound("evt_fail"), now=NOW)
+            outcome = broken.handle_message(inbound("evt_fail"), now=NOW)
+            self.assertIsNone(outcome.handled_as)
             notifies = list(listener.notifies(timeout=1))
             self.assertEqual(notifies, [], "回滚的事务不得发出 NOTIFY")
         finally:
