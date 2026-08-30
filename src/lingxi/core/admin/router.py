@@ -611,8 +611,8 @@ class AdminCommandRouter:
                             reply_text=(
                                 "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
                                 "或已被撤销，或同一键同时存在补充授权与屏蔽指标两条"
-                                "需要精确指定），请用 /admin user 查询后核对，或改用"
-                                "覆盖ID 精确指定撤销。"
+                                "需要精确指定），请用 /admin user 查询后核对，或使用"
+                                "查询结果附带的管理卡逐行撤销按钮精确指定撤销。"
                             ),
                         ),
                         actor=entry.feishu_open_id,
@@ -1028,6 +1028,68 @@ _ACCOUNT_STATE_LABEL: dict[str, str] = {
     "deleted": "已删除",
 }
 
+#: ``/admin trace`` 回显里的入站事件类型 → 中文（Trace #469 修复包 B，B-6）：
+#: 与 ``adapters/feishu_events.py`` 的 ``MESSAGE_RECEIVE_EVENT``/
+#: ``CARD_ACTION_TRIGGER_EVENT`` 两个字面量一一对应——本模块历来不 import
+#: ``adapters/``（模块文档「只依赖注入的 Protocol 端口」），因此这里独立登记
+#: 一份取值，不反向依赖那个模块。未登记的取值走 :func:`_display_or_unregistered`
+#: 回退，不假装认识每一个未来可能新增的事件类型。
+_EVENT_TYPE_LABEL: dict[str, str] = {
+    "im.message.receive_v1": "用户消息",
+    "card.action.trigger": "卡片按钮/表单交互",
+}
+
+#: ``inbound_event.handled_as`` 枚举 → 中文（Trace #469 修复包 B，B-6）：与
+#: ``core/conversation/ports.HandledAs`` 的六个取值一一对应，同上一条注释
+#: 同一理由不反向 import 该枚举。
+_HANDLED_AS_LABEL: dict[str, str] = {
+    "task_queued": "已入队等待处理",
+    "busy_hint": "系统繁忙提示",
+    "not_provisioned": "未开通，未受理",
+    "auto_provisioning": "自动开通编排中",
+    "command": "管理命令",
+    "dropped": "重复投递，已丢弃",
+}
+
+#: 开通失败原因机器码 → 中文（Trace #469 修复包 B，B-6）：覆盖
+#: ``core/identity/onboarding_runner.py``/``apps/scheduler/stalled_
+#: provisioning.py`` 现有登记的全部原因码；与上面两张表同一姿态——白名单式
+#: 展示层翻译，不反向依赖产生这些字面量的具体模块。未登记的取值（未来新增
+#: 但这里忘了同步）走 :func:`_display_or_unregistered` 回退，不崩、不假装
+#: 认识。
+_FAILURE_REASON_LABEL: dict[str, str] = {
+    "account_not_enabled": "账号未启用",
+    "already_running": "该追溯号的开通已在处理中（重复触发）",
+    "app_access_token_unwired": "应用访问令牌未接线",
+    "delegated_subject": "专用主体，不走个人开通流程",
+    "executor_unavailable": "开通执行器不可用",
+    "innertest_roster_rejected": "不在内测名单中",
+    "mcp_sync_timeout": "问数权限同步超时",
+    "metric_translation_map_unavailable": "指标翻译映射不可用",
+    "missing_access_token_supply": "缺少访问令牌来源配置",
+    "missing_encrypt_key": "缺少加密密钥配置",
+    "missing_environment_variable": "缺少必需的环境变量",
+    "partial_coordinates": "银河权限坐标不完整",
+    "role_function_map_unavailable": "角色功能映射不可用",
+    "rotation_persist_failed": "凭据轮换结果落库失败",
+    "stalled_lease_expired": "认领租约已过期（长时间无进展）",
+    "stopping": "进程正在停机",
+    "user_access_token_unwired": "用户访问令牌未接线",
+    "user_environment_sweep_failed": "用户环境清理失败",
+}
+
+
+def _display_or_unregistered(value: str, table: dict[str, str]) -> str:
+    """未登记的机器码既不原样吞掉、也不假装认识——统一回退成"原值（未登记
+    显示名）"这个样式（Trace #469 修复包 B，B-6，产品负责人裁定的兜底样式）：
+    管理员至少能看到原始取值用于排查/反馈，同时明确知道这是词表遗漏而不是
+    真的没有这个状态，不会误以为系统坏了。"""
+
+    label = table.get(value)
+    if label is None:
+        return f"{value}（未登记显示名）"
+    return label
+
 
 def _render_user_status(
     identifier: str, status: AdminUserStatusView | None, *, display_names: AdminDisplayNames
@@ -1101,8 +1163,11 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     lines = [
         f"追溯号 {trace_id}：{trace.event_count} 条入站事件",
         f"首次接收: {trace.first_received_at}",
-        f"最近事件类型: {trace.last_event_type}",
-        f"最近处理方式: {trace.last_handled_as or '(未标记)'}",
+        # 事件类型/处理方式机器码 → 中文（Trace #469 修复包 B，B-6）：此前
+        # 直出 im.message.receive_v1/not_provisioned 这类内部枚举取值。
+        f"最近事件类型: {_display_or_unregistered(trace.last_event_type, _EVENT_TYPE_LABEL)}",
+        f"最近处理方式: "
+        f"{_display_or_unregistered(trace.last_handled_as, _HANDLED_AS_LABEL) if trace.last_handled_as else '(未标记)'}",
         f"是否已认领: {'是' if trace.dispatched else '否'}",
     ]
     if trace.provisioning_state is not None:
@@ -1115,8 +1180,10 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
             f"账号状态: {_ACCOUNT_STATE_LABEL.get(trace.account_state, trace.account_state)}"
         )
     if trace.failure_reason is not None:
+        # 失败原因机器码 → 中文（Trace #469 修复包 B，B-6）：此前直出
+        # role_revoked 这类内部原因码。
         lines.append(
-            f"失败原因: {trace.failure_reason}"
+            f"失败原因: {_display_or_unregistered(trace.failure_reason, _FAILURE_REASON_LABEL)}"
             f"（{trace.failure_event_type}，{trace.failure_occurred_at}）"
         )
     else:
