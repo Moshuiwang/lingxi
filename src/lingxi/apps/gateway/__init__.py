@@ -821,6 +821,7 @@ def assemble_delivery_consumer(
         cards=cards,
         limit=config.delivery_batch_limit,
         on_alert=alerting_duty.delivery_alert_callback() if alerting_duty is not None else None,
+        queue_delay_hint_seconds=config.queue_delay_hint_seconds,
     )
 
 

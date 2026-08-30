@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import timedelta
 from typing import Any
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -22,6 +23,7 @@ from postgres_schema import ensure_production_schema, psycopg_available, reset_p
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
 from lingxi.apps.gateway.delivery import DeliveryConsumer
+from lingxi.config.content import default_content_catalog
 from lingxi.core.execution.card_stream import CardCreated, DeliveryRejected
 
 SKIP_REASON = (
@@ -999,6 +1001,110 @@ class DeliveryExpiredNoticeTests(DeliveryConsumerTestCase):
 
         self.assertTrue(first, "有一条到期未提示的任务，第一次应当命中")
         self.assertFalse(second, "同一次到期只提示一次")
+
+
+class QueueDelayHintTests(DeliveryConsumerTestCase):
+    """Issue #465（rc22 S-3，排队可感知）：真库读取面 + `DeliveryConsumer` 消费面。
+
+    与本文件其余用例的区别：这里的任务从未被任何 worker 领取（``status='queued'``，
+    没有 ``worker_id``/``heartbeat_at``），因此从不出现在 ``list_pending_delivery_
+    tasks``/``start_task`` 的既有路径里——``list_stale_queued_tasks`` 是唯一能看见
+    它的查询。
+    """
+
+    def seed_queued_task(
+        self,
+        *,
+        task_id: str,
+        conversation_id: str,
+        created_seconds_ago: float,
+        reply_to_message_id: str = "reply-1",
+    ) -> None:
+        self.execute(
+            """INSERT INTO conversation
+               (id,user_id,feishu_chat_id,feishu_thread_id,running_task_id)
+               VALUES (%s,'usr-1',%s,%s,%s)""",
+            (conversation_id, f"chat-{conversation_id}", f"topic-{conversation_id}", task_id),
+        )
+        self.execute(
+            """INSERT INTO task
+               (id,conversation_id,user_id,inbound_event_id,prompt,status,
+                target_worker_version,attempts,reply_to_message_id,created_at,
+                content_expires_at)
+               VALUES (%s,%s,'usr-1',%s,'问题','queued','stable',0,%s,
+                       now() - %s * interval '1 second', now())""",
+            (task_id, conversation_id, f"event-{task_id}", reply_to_message_id, created_seconds_ago),
+        )
+
+    def test_only_tasks_past_the_threshold_are_returned(self) -> None:
+        self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
+        self.seed_queued_task(task_id="tsk-fresh", conversation_id="cnv-2", created_seconds_ago=1)
+
+        stale = self.queue.list_stale_queued_tasks(older_than=timedelta(seconds=12), limit=50)
+
+        self.assertEqual([row.task_id for row in stale], ["tsk-stale"])
+        self.assertEqual(stale[0].chat_id, "chat-cnv-1")
+        self.assertEqual(stale[0].thread_id, "topic-cnv-1")
+        self.assertEqual(stale[0].reply_to_message_id, "reply-1")
+
+    def test_delivery_consumer_sends_the_hint_exactly_once_per_stale_task(self) -> None:
+        self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+        )
+
+        consumer.run_once()
+        consumer.run_once()
+
+        self.assertEqual(len(texts.calls), 1, "同一个任务在持续排队期间只提示一次")
+        self.assertEqual(
+            texts.calls[0]["text"],
+            default_content_catalog().text("gateway.busy_hint_queued").text,
+        )
+        self.assertEqual(texts.calls[0]["chat_id"], "chat-cnv-1")
+        # 尽力而为的体验提示：不改变任务本身的状态，不产生任何 outbox 事件。
+        self.assertEqual(self.scalar("SELECT status FROM task WHERE id='tsk-stale'"), "queued")
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM task_delivery_event WHERE task_id='tsk-stale'"), 0
+        )
+
+    def test_a_task_below_the_threshold_gets_no_hint(self) -> None:
+        self.seed_queued_task(task_id="tsk-fresh", conversation_id="cnv-1", created_seconds_ago=1)
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+        )
+
+        consumer.run_once()
+
+        self.assertEqual(texts.calls, [], "刻意不做入站即回执：正常秒级领取时零噪音")
+
+    def test_leaving_and_rejoining_the_stale_set_is_treated_as_a_new_wait(self) -> None:
+        """被领取后不再是候选，进程内去重集合随之收缩；此后若又重新排队够久
+        （现实中不该发生，这里只是构造出同一个 task_id 二次跨入候选集合），
+        应当被当成一次新的排队重新提示，而不是被旧的去重记录永久挡住。"""
+
+        self.seed_queued_task(task_id="tsk-stale", conversation_id="cnv-1", created_seconds_ago=30)
+        texts = RecordingText()
+        consumer = DeliveryConsumer(
+            queue=self.queue, cards=RecordingCards(), texts=texts, queue_delay_hint_seconds=12.0
+        )
+        consumer.run_once()
+        self.assertEqual(len(texts.calls), 1)
+
+        self.execute(
+            "UPDATE task SET status='running', worker_id='worker-1', heartbeat_at=now() "
+            "WHERE id='tsk-stale'"
+        )
+        consumer.run_once()
+        self.execute(
+            "UPDATE task SET status='queued', worker_id=NULL, heartbeat_at=NULL "
+            "WHERE id='tsk-stale'"
+        )
+        consumer.run_once()
+
+        self.assertEqual(len(texts.calls), 2)
 
 
 if __name__ == "__main__":  # pragma: no cover

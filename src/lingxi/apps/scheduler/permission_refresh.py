@@ -8,8 +8,11 @@
    没有有效批次同样整轮不跑，审计可分辨；
 3. **翻译层整体可用性判据**：翻译映射为空时整轮同样不跑，**一条发布意图都不排，
    撤权也不例外**——见「翻译」一节，这是外部独立审查 2026-08-18 坐实的 P1 修复；
-4. 遍历**已开通**用户（``provisioning_state='active'`` 且 ``account_state NOT IN
-   ('deleting','deleted')``，过滤写在 SQL 里，与花名册审计同一口径），逐人：
+4. 遍历**已开通且未停用**用户（``provisioning_state='active'`` 且 ``account_state
+   NOT IN ('deleting','deleted','suspended')``，过滤写在 SQL 里——
+   :data:`~lingxi.adapters.postgres_permission_publish.PERMISSION_REFRESH_BASELINE_SQL`；
+   与花名册审计基线只在前两态上同口径，``suspended`` 是本职责专属的额外排除，
+   见 :class:`_BaselineReader` 文档「为什么两份实现故意不再共用」，Issue #468），逐人：
    花名册身份 → 银河账号匹配 → 聚合当前有效权限 → 授权侧**翻译成指标名**（这一条
    组合未覆盖就跳过这个人，见「翻译」一节；撤权侧不需要翻译，写的是不含指标名的
    ``{}``）→ 结算发布行 → 记一次权限决定；
@@ -393,10 +396,22 @@ class _AuditSink(Protocol):
 
 class _BaselineReader(Protocol):
     """已开通用户的读取口。实现是
-    :class:`lingxi.adapters.postgres_roster_audit.PostgresRosterBaselineReader`——
-    **复用**而不是照抄它的 SQL：``provisioning_state``/``account_state`` 这两条过滤
-    是产品口径（`V-花名册-10`、`V-花名册-11`），第二份实现迟早会与它分叉，而分叉的
-    方向可能是"给一个正在删除的用户重新发了权限"。
+    :class:`lingxi.adapters.postgres_permission_publish.
+    PostgresPermissionRefreshBaselineReader`（Issue #468，2026-08-30 之前是
+    :class:`lingxi.adapters.postgres_roster_audit.PostgresRosterBaselineReader`）。
+
+    **两份实现故意不再共用**：本职责需要的口径与花名册审计（日报/审计对比）用的
+    ``PostgresRosterBaselineReader.load_active_baseline()`` 曾经逐字节相同
+    （``provisioning_state='active'`` 且 ``account_state NOT IN
+    ('deleting','deleted')``，`V-花名册-10`、`V-花名册-11`），直到 Issue #468 坐实：
+    管理员停用（``account_state='suspended'``）某用户之后，这条共用的过滤没有排除
+    ``suspended``，于是次日这里仍会把这个人算进遍历集合——银河与花名册都不知道
+    "停用"这件事，照常聚合出他的有效权限并重新发布，管理员的停用承诺在数据库层面
+    被这一条批处理静默突破。修复是让**本职责专用**的
+    :class:`PostgresPermissionRefreshBaselineReader` 额外排除 ``suspended``，
+    花名册审计那份基线保持不变（它仍然需要覆盖停用期间的花名册字段漂移，这是
+    另一个产品判据，见该类文档），两个调用方从此各自独立演进各自的过滤条件，
+    不再假设"看起来一样"就可以共用同一条 SQL。
     """
 
     def load_active_baseline(self) -> Sequence[ArchivedIdentity]: ...
@@ -1245,8 +1260,10 @@ def _build_permission_refresh_duty(
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-    from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-    from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+    from lingxi.adapters.postgres_permission_publish import (
+        PostgresPermissionPublishStore,
+        PostgresPermissionRefreshBaselineReader,
+    )
     from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
     from lingxi.adapters.company_function_metric_map_file import (
         load_company_function_metric_map,
@@ -1286,7 +1303,7 @@ def _build_permission_refresh_duty(
         config.postgres_dsn, timeouts=config.postgres_timeouts
     )
     duty = PermissionRefreshDuty(
-        baseline_reader=PostgresRosterBaselineReader(
+        baseline_reader=PostgresPermissionRefreshBaselineReader(
             config.postgres_dsn, timeouts=config.postgres_timeouts
         ),
         roster_snapshot=PostgresRosterSnapshotStore(

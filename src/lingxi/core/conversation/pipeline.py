@@ -154,6 +154,12 @@ class GatewayTexts:
     busy_hint: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.busy_hint").text
     )
+    # Issue #465（rc22 S-3）：同一个"话题被占用"状态的另一种真话——任务已经入队，
+    # 但还没有任何 worker 领取（`task.status == 'queued'`）。默认值同样来自内容
+    # 目录，保留字符串字段是为了跟 ``busy_hint`` 一样兼容既有注入式测试直接赋值。
+    busy_hint_queued: str = field(
+        default_factory=lambda: default_content_catalog().text("gateway.busy_hint_queued").text
+    )
     suspended: str = field(
         default_factory=lambda: default_content_catalog().text("gateway.suspended").text
     )
@@ -161,6 +167,9 @@ class GatewayTexts:
 
     def busy_hint_content(self) -> RenderedContent:
         return _as_content(self.catalog, "gateway.busy_hint", self.busy_hint)
+
+    def busy_hint_queued_content(self) -> RenderedContent:
+        return _as_content(self.catalog, "gateway.busy_hint_queued", self.busy_hint_queued)
 
     def suspended_content(self) -> RenderedContent:
         return _as_content(self.catalog, "gateway.suspended", self.suspended)
@@ -257,7 +266,85 @@ class EventPipeline:
         改成先把 ``handled_as`` 结论持久化并提交、再发回复之后：重投时事件行已经在
         库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
         可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
+
+        **本方法是全函数（Issue #465：100% 响应覆盖产品合同）：绝不向调用方抛出
+        异常。** 已被识别的失败（`QueueInsertFailure` 等）在 :meth:`_handle_message`
+        内部各自落到对应的诚实提示；本方法这一层只兜住"没有被任何既有分支识别"的
+        剩余异常——数据库瞬时错误、还没被枚举过的编程缺陷等。没有这一层时，这类
+        异常会一路穿透 ``apps/gateway/__init__.py`` 的 ``make_event_handler``，被
+        ``adapters/feishu_longconn.py`` 的 ``LongConnectionSupervisor._dispatch``
+        接住——但那一层只记 ``event.handler_failed`` 审计，什么都不回给用户：飞书
+        会按处理失败重投这条事件，可一个稳定复现的缺陷会让重投一直撞在同一个异常
+        上，用户永远等不到任何回应（这正是 Issue #465 的触发现场）。因此这里改成
+        "任何异常都必须换成一条诚实的失败提示"，不再指望重投本身能替用户兜底。
         """
+
+        try:
+            return self._handle_message(message, now=now)
+        except Exception as error:  # noqa: BLE001 - 见上方 docstring：这是全函数的最后一道防线
+            return self._handle_unexpected_failure(message, error)
+
+    def _handle_unexpected_failure(
+        self, message: InboundMessage, error: BaseException
+    ) -> Outcome:
+        """``handle_message`` 兜底出口：记审计＋尽力而为发一条诚实失败提示。
+
+        **不重试、不重新进入事务**——异常已经使当前这一轮的事务连同它可能做过的
+        任何写入一起回滚（Python ``with`` 语句在异常路径上的标准行为），这里只用
+        ``message`` 本身携带的、与数据库状态无关的字段（``chat_id``/``thread_id``/
+        ``message_id``/``trace_id``）尽力送一条提示。停机中跳过发送，姿态与
+        ``handle_message`` 末尾"尽力而为的出站副作用"一致。
+
+        **不去重、可能重复。** 与 `QueueInsertFailure` 分支复用的
+        ``claim_queue_failure_notice``（按 event_id 只发一次）不同，这里刻意不接
+        那张去重表——它的语义是"排队失败"，套在任意异常上会名不副实。一个持续
+        触发同一缺陷的事件被飞书重投几次，用户就可能收到几条这条提示；比起完全
+        静默，这是可以接受的已知取舍（已在交付报告登记）。
+        """
+
+        content = self._texts.catalog.text("gateway.unexpected_error", reference=message.trace_id)
+        self._audit.record(
+            "event.pipeline_failed",
+            event_id=message.event_id,
+            error=f"{type(error).__name__}: {error}",
+            trace_id=message.trace_id,
+        )
+        if self._should_stop():
+            self._audit.record(
+                "reply.skipped_while_stopping",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                trace_id=message.trace_id,
+            )
+            return Outcome(handled_as=None)
+        try:
+            self._replies.send_text(
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
+                text=content.text,
+            )
+            self._audit.record(
+                "reply.sent",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                trace_id=message.trace_id,
+            )
+        except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
+            self._audit.record(
+                "reply.failed",
+                event_id=message.event_id,
+                content_key=content.key,
+                content_version=content.version,
+                error=f"{type(send_error).__name__}: {send_error}",
+                trace_id=message.trace_id,
+            )
+        return Outcome(handled_as=None)
+
+    def _handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
+        """``handle_message`` 的实际业务逻辑；异常安全网见调用方。"""
 
         moment = now or datetime.now(timezone.utc)
         deferred: list[RenderedContent] = []
@@ -573,7 +660,11 @@ class EventPipeline:
                 # 忙碌期：只回提示。合同——该消息不进入对话历史、不排队，也不会在当前
                 # 任务结束后自动提交或自动生效。`/new` 被合同明确列入受限命令，因此这条
                 # 分支在 /new 之前（`V-会话-09`）：忙碌时的 /new 不清空上下文。
-                deferred.append(self._texts.busy_hint_content())
+                #
+                # 文案如实（Issue #465）：`conversation` 是这次事务**开始时**读到的
+                # 快照，`running_task_status` 与判定 `busy` 用的 `running_task_id`
+                # 同源、同一次查询——这里能可靠区分"已经在跑"与"还在排队没人领"。
+                deferred.append(self._busy_hint_for(conversation))
                 tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
                 return Outcome(handled_as=HandledAs.BUSY_HINT)
 
@@ -585,6 +676,11 @@ class EventPipeline:
                 # 另一条连接可能在这中间抢占成功并已经在跑。条件更新影响 0 行就说明
                 # 话题已经忙了，走忙碌分支——否则会把一个正在执行的任务的上下文清掉。
                 if not tx.clear_agent_session(conversation_id=conversation.conversation_id):
+                    # 竞态分支（Issue #465 不覆盖）：`conversation` 快照读到的是"空闲"，
+                    # 真正清空时才发现另一条连接已经抢占成功——抢占它的那个任务的
+                    # 状态从未被本次事务读到，无法诚实地判定"排队中"还是"处理中"，
+                    # 因此保留原有的"处理中"默认文案，不去猜。这条竞态本身极罕见
+                    # （两条消息几乎同时到达同一话题）。
                     deferred.append(self._texts.busy_hint_content())
                     tx.mark_handled_as(
                         event_id=message.event_id, handled_as=HandledAs.BUSY_HINT
@@ -802,6 +898,21 @@ class EventPipeline:
                 ),
             )
         return tuple(rendered)
+
+    def _busy_hint_for(self, conversation) -> RenderedContent:
+        """按话题当前占用任务的真实阶段选文案（Issue #465，rc22 S-3）。
+
+        只信 `running_task_status == "queued"` 这一个精确值：`task.status` 的其余
+        取值（`running`/`awaiting_delivery`/终态）都归入"处理中"这一桶——它们共同
+        的事实是"已经有 worker 或投递流程在处理这个任务，不是单纯地在队列里等"，
+        继续沿用既有的 `gateway.busy_hint` 文案不算说谎；`None`（结构上不应该在
+        `running_task_id` 非空时出现，见 `ConversationRecord` 的 LEFT JOIN）同样
+        保守地落回这一桶，不对不认识的取值猜测成"排队中"。
+        """
+
+        if conversation.running_task_status == "queued":
+            return self._texts.busy_hint_queued_content()
+        return self._texts.busy_hint_content()
 
     def _add_reaction(self, message: InboundMessage) -> None:
         """第 3 步。失败只记审计，绝不向上抛（`V-接入-08`）。
@@ -1059,6 +1170,8 @@ class EventPipeline:
         if not tx.claim_conversation(
             conversation_id=conversation.conversation_id, task_id=task_id
         ):
+            # 竞态分支（Issue #465 不覆盖，理由同 `/new` 的同类竞态注释）：抢占它
+            # 的任务同样是本次事务从未读到的一条，保留"处理中"默认文案。
             deferred.append(self._texts.busy_hint_content())
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.BUSY_HINT)
             return Outcome(handled_as=HandledAs.BUSY_HINT)

@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-3"
+version = "2026-08-30-4"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -32,8 +32,22 @@ version = "2026-08-30-3"
 "onboarding.innertest_not_open" = "BI Plus 目前处于内测阶段，暂未向你开放。感谢你的关注，欢迎稍后再来试试。"
 
 "gateway.busy_hint" = "当前任务仍在处理中"
+# Issue #465（rc22 S-3，100% 响应覆盖）：同一个"话题被占用"状态现在按任务真实
+# 所处阶段拆成两条文案——已被 worker 领取、正在执行用 `gateway.busy_hint`
+# （"处理中"是真话）；已入队但还没被任何 worker 领取用这一条（"排队中"才是
+# 真话）。两条覆盖同一个用户体验缺口：既回答"忙碌期再发消息得到什么提示"
+# （`core/conversation/pipeline.py` 的忙碌判定分支），也回答"消息入队后迟迟
+# 没人理会时要不要主动补一句"（`apps/gateway/delivery.py` 的排队阈值提示，
+# 阈值定值理由见该模块文档）。
+"gateway.busy_hint_queued" = "前面还有任务在排队，请稍等"
 "gateway.suspended" = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
+# Issue #465（rc22 S-3，100% 响应覆盖）：`EventPipeline.handle_message` 的兜底
+# 出口——正常业务分支之外任何未被专门识别的异常（数据库瞬时错误、未预料的
+# 编程缺陷等）都必须落到这一条，而不是让用户静默收不到任何回应。占位名沿用
+# `onboarding.internal_error` 一贯的 `{reference}`（不能叫 `trace_id`，见该键
+# 旁注）。
+"gateway.unexpected_error" = "处理这条消息时出现了内部问题，暂时无法完成，请稍后重试。错误码：LX-GATEWAY-001，追溯号：{reference}。"
 "gateway.delivery_expired" = "上一次问数结果因超过投递时限未能确认送达，已过期，请重新提问。"
 "gateway.new_session" = "已开启新会话，可以开始提问。"
 "gateway.session_rotated" = "已开启新会话（距上次对话已超过两小时），本次提问不携带此前上下文。"

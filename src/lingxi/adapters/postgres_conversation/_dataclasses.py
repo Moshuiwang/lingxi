@@ -97,6 +97,19 @@ class PendingDeliveryTask:
 
 
 @dataclass(frozen=True)
+class StaleQueuedTask:
+    """一条已入队超过排队阈值、仍未被任何 worker 领取的任务（Issue #465，S-3：
+    排队可感知）。只读扫描的结果形状，供 ``apps/gateway/delivery.py`` 的
+    ``DeliveryConsumer`` 尽力而为发一条"前面还有任务在排队"的提示——不改变
+    ``task``/``conversation`` 任何一行，因此不需要携带消费进度这类字段。"""
+
+    task_id: str
+    chat_id: str
+    thread_id: str | None
+    reply_to_message_id: str | None
+
+
+@dataclass(frozen=True)
 class UncertainDeliveryTask:
     """外发前预留位没有被清空、原因不明的任务（Issue #151 审核 P3-6）。
 

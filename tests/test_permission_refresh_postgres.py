@@ -4,14 +4,17 @@
 （撤权 = 保行清空、幂等、不碰密文）。这里放的是**只有真库能证伪**的那几条：
 
 1. **遍历口径**：``provisioning_state``/``account_state`` 的过滤写在 SQL 里，因此
-   guest、matching、deleting、deleted 四个否定样本**一条发布意图都不产生**。在假
-   baseline 上跑，这条无论实现怎么写都是绿的；
+   guest、matching、deleting、deleted、suspended 五个否定样本**一条发布意图都不
+   产生**。在假 baseline 上跑，这条无论实现怎么写都是绿的；
 2. **``UNCHANGED`` 从职责层贯穿**：同一天重跑（水位重置模拟进程重启）不推进
    ``app_user.permission_version``、不排第二条意图——判定在 ``record_decision`` 的
    事务与锁里，假实现替不了；
 3. **按当前有效批次读银河**：过期批次、被取代的批次都不算当前有效，
    :class:`~lingxi.adapters.postgres_galaxy_snapshot.PostgresGalaxySnapshotReader`
-   的返回随之变化。
+   的返回随之变化；
+4. **停用/恢复的可逆性**（Issue #468）：``suspended`` 用户的次日批量重算不得把发布
+   基线回填成有效权限，恢复 ``enabled`` 之后必须重新纳入——只有真库能证伪
+   ``PostgresPermissionRefreshBaselineReader`` 的行集合随 ``account_state`` 变化。
 
 数据全部为虚构化名，不含任何真实导出内容。
 """
@@ -32,8 +35,10 @@ from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
 from lingxi.adapters.postgres_local_permission import local_override_reader
 from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore
-from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
-from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+from lingxi.adapters.postgres_permission_publish import (
+    PostgresPermissionPublishStore,
+    PostgresPermissionRefreshBaselineReader,
+)
 from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REVOKE_REASON,
@@ -84,8 +89,14 @@ GUEST_USER = "usr_refresh_guest"
 MATCHING_USER = "usr_refresh_matching"
 DELETING_USER = "usr_refresh_deleting"
 DELETED_USER = "usr_refresh_deleted"
+#: Issue #468 的否定样本：管理员停用，`account_state='suspended'`，
+#: `provisioning_state` 仍是 `active`（停用不改开通状态，见
+#: `adapters/postgres_pending_action.py` 的 `suspend_user` 分支）。银河与花名册对
+#: 这个人的资料与 `ACTIVE_USER` 逐字节相同，唯一差别是这一个状态列——这样"他没有
+#: 产生发布意图"就只可能来自基线排除，不可能来自"他本来就匹配不上"。
+SUSPENDED_USER = "usr_refresh_suspended"
 
-# 四个否定样本与那一个正样本**在花名册和银河里的资料完全一样**，唯一的差别只有
+# 五个否定样本与那一个正样本**在花名册和银河里的资料完全一样**，唯一的差别只有
 # `app_user` 的两个状态列。这样「它们没有产生发布意图」就只可能来自筛选口径，
 # 不可能来自"它们本来就匹配不上"。
 PERSONNEL = {
@@ -94,6 +105,7 @@ PERSONNEL = {
     MATCHING_USER: "ou_person_matching",
     DELETING_USER: "ou_person_deleting",
     DELETED_USER: "ou_person_deleted",
+    SUSPENDED_USER: "ou_person_suspended",
 }
 EMPLOYEE = {
     ACTIVE_USER: "10001",
@@ -101,6 +113,7 @@ EMPLOYEE = {
     MATCHING_USER: "10003",
     DELETING_USER: "10004",
     DELETED_USER: "10005",
+    SUSPENDED_USER: "10006",
 }
 EMAIL = {user: f"person{index}@example.invalid" for index, user in enumerate(PERSONNEL, start=1)}
 NAME = {user: f"化名{index}" for index, user in enumerate(PERSONNEL, start=1)}
@@ -197,6 +210,7 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             MATCHING_USER: ("matching", "enabled"),
             DELETING_USER: ("active", "deleting"),
             DELETED_USER: ("active", "deleted"),
+            SUSPENDED_USER: ("active", "suspended"),
         }
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             for user_id, (provisioning_state, account_state) in states.items():
@@ -263,7 +277,7 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
     ) -> PermissionRefreshDuty:
         publish_store = PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
-            baseline_reader=PostgresRosterBaselineReader(self._dsn),
+            baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
             roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
             galaxy=PostgresGalaxySnapshotReader(self._dsn),
             decisions=publish_store,
@@ -306,6 +320,17 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
             cursor.execute("SELECT permission_version FROM app_user WHERE id = %s", (user_id,))
             return int(cursor.fetchone()[0])
 
+    def _set_account_state(self, user_id: str, account_state: str) -> None:
+        """模拟 ``resume_user``：只翻转 ``account_state`` 这一列，与生产的
+        ``postgres_pending_action.py`` ``suspend_user``/``resume_user`` 分支同一姿态
+        （不动 ``provisioning_state``）。"""
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app_user SET account_state = %s, updated_at = now() WHERE id = %s",
+                (account_state, user_id),
+            )
+
 
 class _Clock:
     def __init__(self, moment: datetime) -> None:
@@ -339,7 +364,7 @@ class _ScriptedSelection(PostgresGalaxySnapshotReader):
 
 
 class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
-    """否定断言：非 active / deleting / deleted 用户绝不进入重算。"""
+    """否定断言：非 active / deleting / deleted / suspended 用户绝不进入重算。"""
 
     def test_only_the_active_user_gets_a_publish_intent(self) -> None:
         self._insert_users()
@@ -352,7 +377,7 @@ class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(report.examined, 1, "只有一个已开通用户进入本轮")
         self.assertEqual(report.enqueued, 1)
         self.assertEqual([entry[0] for entry in self._outbox()], [ACTIVE_USER])
-        for user in (GUEST_USER, MATCHING_USER, DELETING_USER, DELETED_USER):
+        for user in (GUEST_USER, MATCHING_USER, DELETING_USER, DELETED_USER, SUSPENDED_USER):
             with self.subTest(user=user):
                 self.assertEqual(self._version(user), 0, "否定样本的权限版本不得被推进")
 
@@ -376,6 +401,55 @@ class ActiveOnlyTest(PermissionRefreshPostgresTestCase):
         # 不是聚合层的原始职能标签「运营」。
         self.assertEqual(payload["permissions"], f'{{"BC-甲":["{METRIC_NAME}"]}}')
         self.assertNotIn(issued.reveal(), str(payload), "令牌明文一步都不进 outbox")
+
+
+class SuspendedUserExcludedTest(PermissionRefreshPostgresTestCase):
+    """Issue #468：停用抑制不得被次日批量重算突破，恢复 ``enabled`` 后必须重新纳入。
+
+    只有真库能证伪的那一半：``PostgresPermissionRefreshBaselineReader`` 的行集合
+    随 ``app_user.account_state`` 实时变化——假 baseline 上这条判据无论实现怎么写
+    都是绿的。即时撤销路径（管理员点「停用」当下 ``force_revoke`` 立刻清空发布行）
+    是另一条既有链路（``adapters/postgres_permission_recompute_trigger.py``），
+    本用例不重复它，只钉「次日批量重算」这一侧——即使完全不依赖即时撤销先跑过，
+    停用用户单凭这一条批次本身也不得拿到任何权限。
+    """
+
+    def test_a_suspended_user_is_excluded_then_reincluded_after_resume(self) -> None:
+        self._insert_users()
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        self._token_store().issue_token(SUSPENDED_USER)
+
+        # 第一轮：SUSPENDED_USER 的花名册与银河资料与 ACTIVE_USER 逐字节相同
+        # （同一份 PERSONNEL 驱动的合成导出），如果发布基线没有排除 suspended，
+        # 这一轮会像 ACTIVE_USER 一样给他一条真实权限的授权意图——这正是 Issue #468
+        # 描述的"停用抑制被次日批量重算静默突破"。
+        report = self._duty().run_once()
+
+        self.assertEqual(report.examined, 1, "停用用户不得进入本轮遍历——发布基线已排除")
+        self.assertEqual(
+            [entry[0] for entry in self._outbox()], [ACTIVE_USER], "停用用户的发布行不得回发"
+        )
+        self.assertEqual(self._version(SUSPENDED_USER), 0, "停用期间权限版本不得被推进")
+
+        # 恢复：管理员执行 resume_user，只翻转 account_state（与生产 `postgres_
+        # pending_action.py` 的 resume_user 分支同一姿态，不动 provisioning_state）。
+        self._set_account_state(SUSPENDED_USER, "enabled")
+        self.clock.advance(timedelta(days=1))
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+
+        report = self._duty().run_once()
+
+        self.assertEqual(report.examined, 2, "恢复之后重新进入遍历，与 ACTIVE_USER 一起被检查")
+        self.assertEqual(report.enqueued, 1, "只有新纳入的这个人产生新意图，ACTIVE_USER 判 UNCHANGED")
+        payload = self._latest_payload(SUSPENDED_USER)
+        self.assertEqual(
+            payload["permissions"],
+            f'{{"BC-甲":["{METRIC_NAME}"]}}',
+            "恢复后必须重新拿到与 ACTIVE_USER 一致的真实权限",
+        )
+        self.assertEqual(self._version(SUSPENDED_USER), 1, "恢复后的这一次决定才是他的第一次权限决定")
 
 
 class UnchangedAcrossRoundsTest(PermissionRefreshPostgresTestCase):

@@ -2482,6 +2482,184 @@ class WorkerServiceTests(unittest.TestCase):
         )
         self.assertEqual(queue.terminals, [], "没有任何任务应该被写成终态")
 
+    def test_a_short_task_queued_while_a_long_one_is_still_running_is_claimed_and_finishes_first(
+        self,
+    ) -> None:
+        """Issue #464 rc22 S-2：领取循环改滚动并发。
+
+        旧实现 ``claim(limit=max_concurrency)`` 领一批后 ``asyncio.gather`` 等
+        整批全部终态才领下一批——``max_concurrency`` 因此实际只是"一次 claim()
+        的批大小"。真实复现：4 槽并发配置下一个长任务占 1 槽、其余 3 槽空着，
+        长任务跑着的时候到达的短任务（例如用户发的"你好"）仍要等长任务收口
+        才被领取，用户侧表现为等待 5 分钟以上。
+
+        本用例：先领到一个长任务（占 1 槽，其余槽位从一开始就没有可领取的
+        任务），长任务运行期间才把短任务放进队列——断言短任务在长任务仍在
+        运行、尚未收口时就已经被领取、执行并写完终态。
+
+        变异验红（S-2 交付要求）：把滚动并发改回旧实现（``claim()`` 一次性
+        领整批 + ``asyncio.gather`` 等全部完成才返回），本用例的"短任务先于
+        长任务收口"断言必须变红——短任务在这个变异下要等长任务的
+        `process_once()` 整体返回、下一轮 `claim()` 才会被领到，测试会在
+        轮询超时前等不到它的终态而失败。
+        """
+
+        from lingxi.adapters.postgres_conversation import TaskContext
+
+        # 这两个 user_id 不在模块级夹具（"usr-1"/"usr-90"/"usr-91"）里，需要
+        # 各自补一份合法的 .mcp.json，否则 Epic D 闸⑥的失败关闭会在
+        # `run_turn` 之前就把任务判成 `user_mcp_config_unavailable`，测不到
+        # 滚动并发本身。
+        _seed_user_mcp_config("usr-long")
+        _seed_user_mcp_config("usr-short")
+
+        class TwoStageWorkerQueue:
+            """先只放一个长任务，测试驱动 `enqueue_short_task()` 才放入短任务，
+            模拟"重任务占槽期间才有新用户消息到达"的真实时序。
+            """
+
+            def __init__(self) -> None:
+                self._pending: list[ClaimedTask] = [
+                    ClaimedTask(
+                        task_id="tsk-long",
+                        conversation_id="cnv-long",
+                        user_id="usr-long",
+                        prompt="长任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-long",
+                    )
+                ]
+                self._contexts: dict[str, TaskContext] = {
+                    "tsk-long": TaskContext(
+                        task_id="tsk-long",
+                        conversation_id="cnv-long",
+                        user_id="usr-long",
+                        prompt="长任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-long",
+                        chat_id="chat-long",
+                        thread_id="topic-long",
+                        agent_session_id=None,
+                        stop_requested=False,
+                        side_effect_state="none",
+                    ),
+                }
+                self.events: list[dict[str, object]] = []
+                self.terminals: list[dict[str, object]] = []
+
+            def enqueue_short_task(self) -> None:
+                self._pending.append(
+                    ClaimedTask(
+                        task_id="tsk-short",
+                        conversation_id="cnv-short",
+                        user_id="usr-short",
+                        prompt="短任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-short",
+                    )
+                )
+                self._contexts["tsk-short"] = TaskContext(
+                    task_id="tsk-short",
+                    conversation_id="cnv-short",
+                    user_id="usr-short",
+                    prompt="短任务",
+                    resumed_session=False,
+                    target_worker_version="stable",
+                    attempts=1,
+                    reply_to_message_id="msg-short",
+                    chat_id="chat-short",
+                    thread_id="topic-short",
+                    agent_session_id=None,
+                    stop_requested=False,
+                    side_effect_state="none",
+                )
+
+            def claim(self, *, limit: int, **kwargs: object) -> list[ClaimedTask]:
+                taken, self._pending = self._pending[:limit], self._pending[limit:]
+                return taken
+
+            def task_context(self, *, task_id: str, **kwargs: object) -> TaskContext | None:
+                return self._contexts.get(task_id)
+
+            def mark_side_effect(self, **kwargs: object) -> bool:
+                return True
+
+            def heartbeat(self, **kwargs: object) -> bool:
+                return True
+
+            def stop_requested(self, **kwargs: object) -> bool:
+                return False
+
+            def append_delivery_event(self, **kwargs: object) -> None:
+                self.events.append(kwargs)
+
+            def write_terminal_event(self, **kwargs: object) -> None:
+                self.terminals.append(kwargs)
+
+        queue = TwoStageWorkerQueue()
+        long_task_running = asyncio.Event()
+        long_task_may_finish = asyncio.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                if prompt == "长任务":
+                    long_task_running.set()
+                    await long_task_may_finish.wait()
+                return {
+                    "turn": {"closed": True, "final_text": f"{prompt}-结果", "session_id": None},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+
+        def terminal_kind_of(task_id: str) -> str | None:
+            for terminal in queue.terminals:
+                if terminal["task_id"] == task_id:
+                    return terminal["terminal_kind"]
+            return None
+
+        async def scenario() -> None:
+            process_once_task = asyncio.create_task(service.process_once())
+            await asyncio.wait_for(long_task_running.wait(), timeout=2.0)
+
+            # 长任务此刻仍在运行——才把短任务放进队列，模拟"重任务占槽期间
+            # 有新用户消息到达"这个真实时序。
+            queue.enqueue_short_task()
+
+            deadline = time.monotonic() + 2.0
+            while terminal_kind_of("tsk-short") is None:
+                if time.monotonic() > deadline:
+                    self.fail(
+                        "短任务在长任务仍在运行时未被领取执行——"
+                        "滚动并发未生效，回退成了整批 gather 语义"
+                    )
+                await asyncio.sleep(0.01)
+
+            # 此刻长任务必须仍未收口：短任务确实先于长任务完成，不是恰好同时。
+            self.assertIsNone(
+                terminal_kind_of("tsk-long"),
+                "长任务不应该在短任务之前收口——若此刻已收口，说明短任务是"
+                "等长任务结束后才被领取的，滚动并发未生效",
+            )
+
+            long_task_may_finish.set()
+            await asyncio.wait_for(process_once_task, timeout=2.0)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(terminal_kind_of("tsk-short"), "success")
+        self.assertEqual(terminal_kind_of("tsk-long"), "success")
+
 
 class SemanticProgressTests(unittest.TestCase):
     """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 兜底刷新

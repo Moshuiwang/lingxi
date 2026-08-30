@@ -62,6 +62,13 @@ class GatewayConfig:
     # Worker 进程，不在本进程内——轮询间隔是唯一的发现机制，因此默认取一个较短的值。
     delivery_poll_interval_seconds: float = 1.0
     delivery_batch_limit: int = 20
+    # 排队可感知（Issue #465，rc22 S-3）：入队后超过这个阈值仍未被任何 worker
+    # 领取时补发一条"前面还有任务在排队"。定值理由（10~15 秒区间取中值 12 秒）
+    # 见 ``apps/gateway/delivery.DeliveryConsumer.DEFAULT_QUEUE_DELAY_HINT_
+    # SECONDS`` 上方注释；两处各自独立登记默认值、互不 import（`apps/config`
+    # 与 `apps/delivery` 之间不建立仅为一个常量的依赖边），改其一记得同步改
+    # 另一处。
+    queue_delay_hint_seconds: float = 12.0
     # 最小告警装配（Issue #153）：管理群 chat_id **可选**——没有它进程照常启动，
     # 只是告警只落到结构化日志、不真正发进管理群，与 scheduler 的
     # `admin_group_chat_id` 同一取舍（一个尚未接线的可选职责不该让整个进程起不来）。
@@ -97,18 +104,22 @@ class GatewayConfig:
     # 显式提供。
     tenant_domain: str | None = None
 
-    # markdown 官方转换开关（Issue #408 正式方案接线）——不套 `LINGXI_GATEWAY_`
-    # 前缀，环境变量名固定为 `LINGXI_DOCX_MARKDOWN_CONVERT`（任务合同明确给定
-    # 的名字，未来若有第二个进程需要判断同一份开关，两处读同一个变量名，同
-    # `bot_open_id`/`innertest_roster_open_ids` 不套前缀的理由一致）。默认
-    # `False`（关）：``apps/gateway/document_delivery.py`` 的
+    # markdown 官方转换开关（Issue #408 正式方案接线；Issue #467／rc22 S-4 起
+    # 代码默认开启）——不套 `LINGXI_GATEWAY_` 前缀，环境变量名固定为
+    # `LINGXI_DOCX_MARKDOWN_CONVERT`（任务合同明确给定的名字，未来若有第二个
+    # 进程需要判断同一份开关，两处读同一个变量名，同 `bot_open_id`/
+    # `innertest_roster_open_ids` 不套前缀的理由一致）。默认 `True`（开，
+    # Issue #467 执行 PM 裁定：docx 转换已通过 rc21 stage 探针验证，不再需要
+    # 运维每次显式开启）：``apps/gateway/document_delivery.py`` 的
     # ``_process_docx_claim`` 与 ``adapters/feishu_docx_delivery.py::
-    # LarkDocxDelivery.write_body`` 在这个值为 `False` 时逐字沿用段落路径，
-    # 零行为变化。打开前提：Bot 权限含 ``docx:document.block:convert``，且
-    # 打开后转换失败一律交付失败（失败关闭），不静默降级回段落路径——见
-    # ``deploy/.env.example`` 对应条目与 ``LarkDocxDelivery.write_body`` 模块
-    # 文档「markdown 官方转换开关」一节。
-    markdown_convert_enabled: bool = False
+    # LarkDocxDelivery.write_body`` 在这个值为 `True` 时走官方转换路径。显式
+    # 关闭用精确值 `"0"`；历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage
+    # 配置）**必须继续解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
+    # 打开前提：Bot 权限含 ``docx:document.block:convert``，转换失败一律交付
+    # 失败（失败关闭），不静默降级回段落路径——见 ``deploy/.env.example`` 对应
+    # 条目与 ``LarkDocxDelivery.write_body`` 模块文档「markdown 官方转换开关」
+    # 一节。
+    markdown_convert_enabled: bool = True
 
     # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，
     # 只用于精确判定"这条群消息是不是 @ 了机器人本身"。刻意不套 `LINGXI_GATEWAY_`
@@ -237,10 +248,15 @@ def _tenant_domain(env: Mapping[str, str]) -> str | None:
         raise GatewayConfigError(f"{ENV_PREFIX}TENANT_DOMAIN 不合法：{error}") from None
 
 def _markdown_convert_enabled(env: Mapping[str, str]) -> bool:
-    """markdown 官方转换开关（Issue #408 正式方案接线）：未配置或为空——
-    ``False``（未配置就是未启用）。配置了但不是精确的 ``"1"``——启动即失败，
-    与 ``apps/worker/config.py::_document_delivery_enabled`` 同一姿态（错配
-    不是未配，一个拼错的值不该被静默当成"关闭"长期放行）。
+    """markdown 官方转换开关（Issue #408 正式方案接线；Issue #467／rc22 S-4
+    翻转默认值）：未配置或为空——``True``（代码默认开启：docx 转换已通过
+    rc21 stage 探针验证，见 Issue #442，不再需要运维每次显式开启）。显式关闭
+    用精确值 ``"0"``——``False``。历史值 ``"1"``（翻转前唯一的开启值）——仍然
+    ``True``，与"未配置"同义，保证已经写了 ``LINGXI_DOCX_MARKDOWN_CONVERT=1``
+    的既有 stage 配置在这次翻转后行为不变。配置了但不是 ``""``/``"0"``/
+    ``"1"``——启动即失败，与 ``apps/worker/config.py::_document_delivery_
+    enabled`` 同一姿态（错配不是未配，一个拼错的值不该被静默当成任一状态
+    长期放行）。
 
     刻意直接读 ``env.get("LINGXI_DOCX_MARKDOWN_CONVERT")``，不经过本文件
     ``_text()`` 的 ``LINGXI_GATEWAY_`` 前缀包装——变量名由任务合同显式给定，
@@ -248,13 +264,14 @@ def _markdown_convert_enabled(env: Mapping[str, str]) -> bool:
     """
 
     flag = (env.get("LINGXI_DOCX_MARKDOWN_CONVERT") or "").strip()
-    if not flag:
-        return False
-    if flag != "1":
+    if not flag or flag == "1":
+        return True
+    if flag != "0":
         raise GatewayConfigError(
-            'LINGXI_DOCX_MARKDOWN_CONVERT 只接受精确值 "1"（不回显收到的值）'
+            'LINGXI_DOCX_MARKDOWN_CONVERT 只接受 "0"（关闭）或 "1"（开启，'
+            "历史值兼容，效果与未配置相同）（不回显收到的值）"
         )
-    return True
+    return False
 
 
 def _bot_open_id(env: Mapping[str, str]) -> str | None:
@@ -322,6 +339,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         shutdown_timeout_seconds=_number(env, "SHUTDOWN_TIMEOUT_SECONDS", 20.0),
         delivery_poll_interval_seconds=_number(env, "DELIVERY_POLL_INTERVAL_SECONDS", 1.0),
         delivery_batch_limit=_positive_int(env, "DELIVERY_BATCH_LIMIT", 20),
+        queue_delay_hint_seconds=_number(env, "QUEUE_DELAY_HINT_SECONDS", 12.0),
         admin_group_chat_id=admin_group_chat_id,
         alert_policy=alert_policy,
         feishu_base_url=_text(env, "FEISHU_BASE_URL") or DEFAULT_FEISHU_BASE_URL,
