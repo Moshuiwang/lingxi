@@ -267,15 +267,83 @@ class WorkerService:
                 if self._global_stop.is_set():
                     return bool(terminal_tasks)
 
-        tasks = self._queue.claim(
-            worker_id=self._config.worker_id,
-            target_worker_version=self._config.target_worker_version,
-            limit=self._config.max_concurrency,
-        )
-        if not tasks:
-            return bool(terminal_tasks)
-        await asyncio.gather(*(self._process_task(task) for task in tasks))
-        return True
+        return await self._run_rolling_claim_loop(terminal_tasks)
+
+    async def _run_rolling_claim_loop(self, terminal_tasks: list[TerminalTask]) -> bool:
+        """滚动并发领取循环（Issue #464 rc22 S-2）：维持一个至多
+        ``max_concurrency`` 的在途任务集合，任一任务终态即释放槽位并立即尝试
+        领取新任务，不像旧实现那样等 ``claim()`` 领到的整批任务全部终态才
+        领下一批——旧实现里 ``max_concurrency`` 实际只是"一次 claim() 的批
+        大小"，一个长任务会让批内、批后到达的所有任务一起干等到它收口（真实
+        复现：4 槽并发配置下，一个长任务占 1 槽、其余 3 槽空着，后到达的短
+        任务仍要等这个长任务收口才被领取）。
+
+        与旧实现共享的不变量：**领取只在这里发生一次性的"这一轮还要不要继续
+        领"判断**，``self._global_stop`` 语义不弱化——一旦置位就不再领取新
+        任务，只让已在途的任务自然收尾（#153 完成标准第 3 条）；`claim()` 前
+        的多轮让出+复判（``_STOP_SIGNAL_DRAIN_YIELDS``）只需要在**进入这个
+        循环之前**做一次（见调用方 ``process_once()``），循环内后续每一次
+        `claim()` 之前都已经跨过至少一次真正的 `await`（下面的
+        ``asyncio.wait``），事件循环有充分机会把自管道投递链路跑完，不需要
+        重复那套多轮让出。
+
+        没有任何可领取任务且没有在途任务时，`claim()` 只会被调用一次（与旧
+        实现同一次数），返回值退化为 ``bool(terminal_tasks)``——不改变"这一轮
+        完全无事可做"时的既有行为。
+
+        每次 ``asyncio.wait`` 用 ``poll_interval_seconds`` 兜底：即使一个都
+        没有终态（例如长任务仍在跑、但还有空槽从一开始就没填满），也会按这个
+        既有轮询节奏重新尝试 `claim()`，而不是傻等在途任务完成——这正是修复
+        "空槽干等"这一半症状所必需的（另一半"任一任务终态立即补位"由
+        ``asyncio.wait`` 的 ``FIRST_COMPLETED`` 语义保证，不需要等到下一个
+        轮询节拍）。
+
+        任一在途任务把异常真正抛出 `_process_task`（正常情况下它内部已经把
+        一切都吞成结构化日志或终态，理论上不会发生）时，取消其余在途任务并
+        等它们收尾后再重新抛出——与旧实现 ``asyncio.gather()`` 默认"一个失败
+        取消其余"的语义保持一致，不留下未被等待的游离任务。
+        """
+
+        pending: set[asyncio.Task[None]] = set()
+        claimed_any = False
+
+        def stop_requested() -> bool:
+            return self._global_stop is not None and self._global_stop.is_set()
+
+        try:
+            while True:
+                if not stop_requested():
+                    capacity = self._config.max_concurrency - len(pending)
+                    if capacity > 0:
+                        newly_claimed = self._queue.claim(
+                            worker_id=self._config.worker_id,
+                            target_worker_version=self._config.target_worker_version,
+                            limit=capacity,
+                        )
+                        if newly_claimed:
+                            claimed_any = True
+                            for task in newly_claimed:
+                                pending.add(asyncio.create_task(self._process_task(task)))
+                if not pending:
+                    break
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=self._config.poll_interval_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for finished in done:
+                    # 正常路径 `_process_task` 从不向上抛异常（见其内部
+                    # try/except），这里只是双保险；真抛出时立即让下面的
+                    # except 分支接手取消其余在途任务。
+                    finished.result()
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
+        return claimed_any or bool(terminal_tasks)
 
     def _housekeep(self) -> list[TerminalTask]:
         terminals: list[TerminalTask] = []

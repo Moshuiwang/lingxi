@@ -43,6 +43,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_conversation import _Transaction as _ConversationTransaction
+from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.ids import new_id
 from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
@@ -773,12 +774,18 @@ class PostgresPermissionPublishStore:
     def notice_recipient_open_id(self, user_id: str) -> str | None:
         """权限变化通知发给谁：该用户的 ``feishu_open_id``；不该发就返回 ``None``。
 
-        **两条过滤是产品约束，不是编码习惯**，口径与花名册比对基线同源
-        （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）：
+        **三条过滤是产品约束，不是编码习惯**，口径与花名册比对基线同源
+        （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）再叠加一条
+        （Issue #468，2026-08-30）：
 
         - ``provisioning_state = 'active'``：还没完成开通的人不该收到"你的可用范围已更新"；
         - ``account_state NOT IN ('deleting','deleted')``：正在删除或已删除的账号一律不发。
-          删除编排会清空姓名等字段，给这样的账号发消息是数据范围外泄。
+          删除编排会清空姓名等字段，给这样的账号发消息是数据范围外泄；
+        - ``account_state <> 'suspended'``：管理员停用期间同样不发。花名册比对基线只服务
+          日报/审计对比、不判定"该不该收通知"，两处口径此前恰好都只排除
+          ``deleting``/``deleted``——纯属巧合，不是同一份合同；本条只影响通知收件人，
+          不影响 :class:`PostgresPermissionRefreshBaselineReader` 那份决定"这个人今天
+          要不要被重新算一次权限"的独立判据（同一份缺口的另一半，见该类文档）。
 
         **为什么这条查询住在本模块**：这条链本来就在这里读 ``app_user``（权限版本），
         而把它放进 ``postgres_identity`` 会把那个模块的建档写侧闭包（``provisioning`` /
@@ -794,7 +801,7 @@ class PostgresPermissionPublishStore:
                      FROM app_user
                     WHERE id = %s
                       AND provisioning_state = 'active'
-                      AND account_state NOT IN ('deleting', 'deleted')""",
+                      AND account_state NOT IN ('deleting', 'deleted', 'suspended')""",
                 (user_id,),
             )
             row = cursor.fetchone()
@@ -829,6 +836,100 @@ class PostgresPermissionPublishStore:
             external_record_id=row[9],
             published_at=row[10],
         )
+
+
+#: 每日权限重算真正遍历的那一份基线（Issue #468）。**刻意不是**
+#: ``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``——那份服务花名册日报/审计
+#: 对比，口径必须覆盖包括 ``suspended`` 在内的一切"还没删除"的已开通用户，否则一个人
+#: 被停用期间，他的姓名/邮箱/工号漂移会从日报里悄悄消失（另一职责，不为本 Story 改）。
+#: 发权批的正确口径与它在"删除中/已删除"这两态上重合、但必须**额外**排除
+#: ``suspended``：停用是管理员对"这个人现在能不能用问数"的显式裁定，银河与花名册都
+#: 不知道这件事——``PermissionRefreshDuty`` 逐人重算时只看得到银河那一侧还有效的角色，
+#: 一旦把停用的人留在遍历集合里，第二天的批量重算会重新聚合出这个人的银河权限、
+#: 翻译、结算发布行，把停用当天已经就地清空的那条发布行重新写回一份真实权限——
+#: 停用承诺被静默突破（`V-权限-08` 撤权侧原本只管"银河没权限"，没有覆盖"银河有权限、
+#: 但管理员在应用层单独按停"这一种情形）。
+PERMISSION_REFRESH_BASELINE_SQL = """
+SELECT id, feishu_user_id, display_name, employee_no, email
+  FROM app_user
+ WHERE provisioning_state = 'active'
+   AND account_state NOT IN ('deleting', 'deleted', 'suspended')
+ ORDER BY id
+"""
+
+
+class PostgresPermissionRefreshBaselineReader:
+    """每日权限重算（:class:`~lingxi.apps.scheduler.permission_refresh.
+    PermissionRefreshDuty`）专用的基线读取，实现
+    :class:`~lingxi.apps.scheduler.permission_refresh._BaselineReader` 协议。
+
+    行形状与 :class:`~lingxi.adapters.postgres_roster_audit.
+    PostgresRosterBaselineReader` 逐字段相同（同样是 :class:`ArchivedIdentity`
+    的五个字段），**唯一差别是过滤条件多排除一个 `suspended`**（模块级常量
+    :data:`PERMISSION_REFRESH_BASELINE_SQL` 顶部注释）。
+
+    **为什么不直接复用 ``PostgresRosterBaselineReader``**（Issue #468 修复之前，
+    ``permission_refresh.py`` 的 ``_BaselineReader`` 协议文档原话是"复用而不是照抄
+    它的 SQL……第二份实现迟早会与它分叉，而分叉的方向可能是给一个正在删除的用户
+    重新发了权限"——这条顾虑本身没有错，只是没预见到分叉也可能发生在**另一个
+    方向**：两个调用方现在需要的过滤**不再相同**，继续共用同一条 SQL 才是那个真正
+    会把停用用户重新发权限的缺口）：
+
+    - 花名册审计（日报/审计对比）需要包含 ``suspended`` 用户——停用是可逆的行政
+      动作，这段时间里他的花名册字段照样可能漂移，日报不该因为他被停用就对这类
+      漂移视而不见；
+    - 发权每日批不能包含 ``suspended`` 用户——停用当天已经由 ``suspend_user``
+      即时撤销路径清空过一次发布内容（`adapters/postgres_permission_recompute_
+      trigger.py` 的 ``force_revoke``），次日批量重算如果还把这个人算进遍历集合，
+      银河那一侧完全不知道"停用"这件事、会照常聚合出他的有效权限并重新发布，
+      停用承诺就在数据库层面被这一条批处理悄悄推翻。
+
+    两条查询因此**必须**各自独立、各自可以按自己的产品口径演进，不能共用一份
+    "看起来一样"的 SQL——这正是本类存在的理由，也是本类没有做成
+    ``PostgresRosterBaselineReader`` 的一个参数化选项的理由：参数化会让两条互相
+    独立的产品判据在同一处代码里耦合，下一次任何一条口径变化都要先确认"会不会
+    影响另一边"。
+    """
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    def load_active_baseline(self) -> tuple[ArchivedIdentity, ...]:
+        """返回本轮重算集。只取五列：内部标识、人员 ID 与存档三字段——与
+        ``PostgresRosterBaselineReader.load_active_baseline`` 取的列逐字段相同，
+        只是行集合按 :data:`PERMISSION_REFRESH_BASELINE_SQL` 多排除 ``suspended``。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(PERMISSION_REFRESH_BASELINE_SQL)
+            rows = cursor.fetchall()
+
+        baseline = tuple(
+            ArchivedIdentity(
+                app_user_id=str(row[0]),
+                personnel_id=_text(row[1]),
+                display_name=_text(row[2]),
+                employee_no=_text(row[3]),
+                email=_text(row[4]),
+            )
+            for row in rows
+        )
+        # 只记条数，同 `PostgresRosterBaselineReader`（`V-花名册-33`：审计与日志
+        # 不含花名册字段值）。
+        logger.info("每日权限重算基线已读取 已开通且未停用用户=%s", len(baseline))
+        return baseline
+
+
+def _text(value: object) -> str:
+    """``NULL`` 与空白归一为空串。与 ``postgres_roster_audit._text`` 同一姿态——
+    各自一份是因为两个模块刻意不互相 import 对方的私有辅助函数。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
 
 def _same_content(payload: Any, row: PublishRow) -> bool:

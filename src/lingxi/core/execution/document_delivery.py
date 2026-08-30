@@ -94,7 +94,7 @@ MAX_SHEET_TITLE_CHARS = MAX_TITLE_CHARS
 #: 12.85%」、「3-5%」会被剥成「35%」，负号/区间数字丢失，数据产品交付的文档
 #: 可能把负增长呈现为正增长，这是数据正确性缺陷。产品负责人 2026-08-29 裁定
 #: 先行停止字符剥离（真正的排版交给 ``adapters/feishu_docx_delivery.py`` 的
-#: 官方 markdown→blocks 转换路径，默认关闭，见该模块文档「markdown 官方转换
+#: 官方 markdown→blocks 转换路径，开关状态见该模块文档「markdown 官方转换
 #: 开关」一节）：这里现在只按空行切段、段内折叠，不再做任何字符级改写。
 _BLANK_LINE_SPLIT = re.compile(r"\n\s*\n")
 

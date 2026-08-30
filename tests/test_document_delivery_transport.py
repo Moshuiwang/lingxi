@@ -1814,12 +1814,15 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
 
 
 class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
-    """``LINGXI_DOCX_MARKDOWN_CONVERT`` 的 ``apps/gateway/config.py`` 解析——默认
-    关、只接受精确值 ``"1"``、错配失败关闭（同 ``apps/worker/config.py`` 既有
-    ``LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED`` 开关同一姿态），以及
-    ``assemble_document_delivery_consumer`` 把解析结果原样传进
-    ``LarkDocxDelivery`` 构造函数（不接触数据库或网络：``tenant_domain`` 配置了
-    合法值即可装配出一个真实消费者，两个适配器的构造函数都只存参数）。"""
+    """``LINGXI_DOCX_MARKDOWN_CONVERT`` 的 ``apps/gateway/config.py`` 解析——
+    Issue #467／rc22 S-4 翻转默认值后的三态语义：未配置＝开启（代码默认，
+    docx 转换已通过 rc21 stage 探针验证）、精确值 ``"0"``＝显式关闭、历史值
+    ``"1"``（翻转前唯一的开启值）仍然＝开启，其余值一律错配失败关闭（同
+    ``apps/worker/config.py`` 既有 ``LINGXI_WORKER_DOCUMENT_DELIVERY_ENABLED``
+    开关同一姿态），以及 ``assemble_document_delivery_consumer`` 把解析结果
+    原样传进 ``LarkDocxDelivery`` 构造函数（不接触数据库或网络：
+    ``tenant_domain`` 配置了合法值即可装配出一个真实消费者，两个适配器的构造
+    函数都只存参数）。"""
 
     def _base_env(self, **overrides: str) -> dict[str, str]:
         env = {
@@ -1830,14 +1833,28 @@ class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
         env.update(overrides)
         return env
 
-    def test_unset_defaults_to_disabled(self) -> None:
+    def test_unset_defaults_to_enabled(self) -> None:
+        """Issue #467：未设置＝开启，这是本次翻转的核心行为变化。"""
+
         from lingxi.apps.gateway.config import load_config
 
         config = load_config(self._base_env())
 
+        self.assertTrue(config.markdown_convert_enabled)
+
+    def test_exact_value_zero_disables_it(self) -> None:
+        """新增的显式关闭途径：精确值 ``"0"``。"""
+
+        from lingxi.apps.gateway.config import load_config
+
+        config = load_config(self._base_env(LINGXI_DOCX_MARKDOWN_CONVERT="0"))
+
         self.assertFalse(config.markdown_convert_enabled)
 
-    def test_exact_value_one_enables_it(self) -> None:
+    def test_legacy_value_one_still_enables_it(self) -> None:
+        """兼容性回归：翻转前唯一的开启值 ``"1"`` 写进过既有 stage 配置，翻转
+        默认值后仍必须解析成开启，不能因为默认值反转就产生语义漂移。"""
+
         from lingxi.apps.gateway.config import load_config
 
         config = load_config(self._base_env(LINGXI_DOCX_MARKDOWN_CONVERT="1"))
@@ -1846,11 +1863,11 @@ class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
 
     def test_any_other_value_fails_closed_at_startup(self) -> None:
         """错配不是未配：与 ``apps/worker/config.py::_document_delivery_enabled``
-        同一纪律，一个拼错的值不该被静默当成"关闭"长期放行。"""
+        同一纪律，一个拼错的值不该被静默当成任一状态长期放行。"""
 
         from lingxi.apps.gateway.config import GatewayConfigError, load_config
 
-        for bad_value in ("true", "0", "yes", "10"):
+        for bad_value in ("true", "yes", "10", "2"):
             with self.subTest(value=bad_value):
                 with self.assertRaises(GatewayConfigError):
                     load_config(self._base_env(LINGXI_DOCX_MARKDOWN_CONVERT=bad_value))
