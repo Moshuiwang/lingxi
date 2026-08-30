@@ -122,9 +122,15 @@ class SendFailureTests(unittest.TestCase):
             channel="message_final", final=True, at=START, trace_id="01JTRACE"
         )[0]
 
-        self.assertIn("event=message_final.feishu_send_failed", notice.text)
-        self.assertIn("count=1", notice.text)
-        self.assertIn("trace_id=01JTRACE", notice.text)
+        # Trace #469 S-1 TOP-2：8 类系统告警人话化，分行中文标签范式（照抄
+        # scripts/ops/host_health_alert.py::render_message），不再是一行英文
+        # key=value；event_type 组合键仍然对外（供审计/去重），只是不再原样
+        # 拼进人类可读正文本身。
+        self.assertEqual(notice.event_type, "message_final.feishu_send_failed")
+        self.assertIn("飞书发送失败", notice.text)
+        self.assertIn("范围：message_final", notice.text)
+        self.assertIn("次数：1", notice.text)
+        self.assertIn("追溯号：01JTRACE", notice.text)
         # #443 对外名称规范：运行告警群消息不得带内部代号「Lingxi」，对外统一「BI Plus」。
         self.assertIn("BI Plus", notice.text)
         for forbidden in ("用户正文哨兵", "张三", "E1001", "@", "https://", "secret", "Lingxi"):
