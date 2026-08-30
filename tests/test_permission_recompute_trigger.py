@@ -235,6 +235,22 @@ class _FakeConfirm:
         raise NotImplementedError
 
 
+class _FakeDisplayNames:
+    """本文件唯一用例的 ``card_id=None`` 让 ``_update_card_to_terminal`` 提前
+    返回，永远不会真的调用这三个方法——只为满足构造参数的必填性，不需要
+    ``tests/test_admin_card_callback.py::FakeDisplayNames`` 那样可配置的行为
+    （代码框架"各自独立声明 Protocol"惯例，测试替身同理不共享）。"""
+
+    def user_label(self, *, open_id: str) -> str:
+        raise NotImplementedError
+
+    def company_label(self, *, company_id: str) -> str:
+        raise NotImplementedError
+
+    def metric_label(self, *, metric_id: str) -> str:
+        raise NotImplementedError
+
+
 class HandleDoesNotBlockOnSlowRecomputeTests(unittest.TestCase):
     """任务要求的核心断言：注入 ``BackgroundPermissionRecomputeTrigger`` 之后，
     ``AdminCardCallbackHandler.handle()`` 的响应时间不再受 delegate 快慢影响
@@ -262,6 +278,7 @@ class HandleDoesNotBlockOnSlowRecomputeTests(unittest.TestCase):
             group_chat_id=None,
             audit=audit,
             recompute_trigger=executor,
+            display_names=_FakeDisplayNames(),
         )
 
         try:
