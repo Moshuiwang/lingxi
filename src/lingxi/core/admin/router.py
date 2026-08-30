@@ -34,6 +34,7 @@ from lingxi.core.admin.views import (
     AdminEventView,
     AdminTraceView,
     AdminUserStatusView,
+    GalaxySourceSummary,
     LocalPermissionOverrideView,
 )
 
@@ -64,6 +65,45 @@ class AdminQueries(Protocol):
         任何入站事件返回 ``None``——``core/admin/router._render_trace`` 据此回复
         「查无此追溯号」。真实实现见
         ``adapters/admin_registry.PostgresAdminQueries.trace_lookup``。"""
+        ...
+
+    def resolve_identifier(self, *, identifier: str) -> str:
+        """把一个可能是邮箱的标识反查成 open_id（#439 A 档）。
+
+        ``identifier`` 不是邮箱形态（不含 ``@``），或反查零命中/多命中歧义时，
+        **原样返回输入**——不返回 ``None``、不发明一套"邮箱查无"的独立错误分支：
+        下游（``user_status``/``prepare()``）本来就会对一个查无此 open_id 的输入
+        给出既有的"未找到"结论，让这条路径继续复用同一个出口，比新增一条并行的
+        错误分支更不容易在两条路径之间产生用词或行为的分叉。真实实现见
+        ``adapters/admin_registry.PostgresAdminQueries.resolve_identifier``。
+        """
+        ...
+
+    def resolve_metric_name(self, *, metric_token: str) -> str:
+        """把一个可能是中文别名的指标 token 反查成真正的指标 ID（#439 A 档）。
+
+        ``metric_token`` 不在别名表里时**原样返回输入**——与 ``resolve_identifier``
+        同一姿态（fail-open 到"就当它已经是真正的指标 ID"，交给下游按既有语义处理，
+        不新增并行的错误分支）。别名表内容当前允许为空（产品负责人尚未填入内容时的
+        合法初始状态，与 ``config/company_function_metric_map.toml`` 同一先例）：
+        为空时本方法对任何输入都恒等。真实实现见 ``adapters/admin_registry.
+        PostgresAdminQueries.resolve_metric_name``。
+        """
+        ...
+
+    def resolve_override_id(
+        self, *, open_id: str, company_id: str, metric_name: str
+    ) -> str | None:
+        """按「open_id + 公司 + 指标」反查当前生效的本地覆盖行 override_id（#439 A
+        档，revoke 新参数形状的服务端反查）。
+
+        零命中或多命中（同一用户同一公司同一指标理论上可能同时有一条生效的授权行
+        与一条生效的抑制行，见迁移 ``0072`` 的唯一索引按 ``direction`` 再分——见
+        ``adapters/postgres_local_permission.py`` 模块文档）都返回 ``None``——多
+        命中时不猜测该收回哪一条方向，也不同时收回两条；调用方据此回复"存在多条
+        匹配，请改用管理卡逐行收回或改用 override_id 直接指定"，不静默选择任意一条。
+        真实实现见 ``adapters/admin_registry.PostgresAdminQueries.
+        resolve_override_id``。"""
         ...
 
 
@@ -122,6 +162,25 @@ class ConfirmCardSender(Protocol):
         thread_id: str | None,
         reply_to_message_id: str,
     ) -> _CardDispatchResult: ...
+
+
+class ManagementCardSender(Protocol):
+    """把 ``/admin user`` 查到的用户权限管理卡（#439 B 档）发送到发起管理员本人
+    私聊——作为触发这条查询命令的消息的回复。与 :class:`ConfirmCardSender` 是两个
+    独立端口（真实实现见 ``core/admin/card_dispatch.ManagementCardDispatcher``）：
+    管理卡本身不是一个"待确认操作"，发送失败也不影响 ``/admin user`` 既有的文本
+    回复这条主路径——见 :meth:`AdminCommandRouter._send_management_card` 文档。
+    """
+
+    def send(
+        self,
+        *,
+        status: AdminUserStatusView,
+        display_identifier: str,
+        chat_id: str,
+        thread_id: str | None,
+        reply_to_message_id: str,
+    ) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -192,6 +251,13 @@ _WRITE_ACTION_NAMES: dict[PendingActionType, str] = {
 #: 取舍（新的拒绝原因就该有自己的字面量，不勉强套进不描述它的既有取值）。
 _SELF_TARGET_FORBIDDEN_CODE = "self_target_forbidden"
 
+#: revoke 新参数形状（#439 A 档：identifier + 公司 + 指标）反查 override_id 零命中/
+#: 多命中歧义时的拒绝码——与 ``adapters/postgres_pending_action.
+#: TARGET_HAS_PENDING_ACTION_CODE``/``_SELF_TARGET_FORBIDDEN_CODE`` 同一取舍：这是
+#: router 层在调用 prepare() 之前就能确定性拒绝的一条独立业务规则，不是
+#: ``pending_action.py`` 既有错误码表描述的某个分支，因此不勉强套用现有取值。
+_OVERRIDE_NOT_FOUND_CODE = "override_not_found"
+
 
 class AdminCommandRouter:
     """管理命令面的唯一入口。见模块与 :meth:`route` 文档。"""
@@ -204,6 +270,7 @@ class AdminCommandRouter:
         audit: AuditSink,
         pending_actions: PendingActionPreparer | None = None,
         confirm_cards: ConfirmCardSender | None = None,
+        management_cards: ManagementCardSender | None = None,
     ) -> None:
         self._registry = registry
         self._queries = queries
@@ -214,6 +281,9 @@ class AdminCommandRouter:
         # ``_dispatch_write_action``）。
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
+        # 未装配时 `/admin user` 只回复既有文本，不发送管理卡（#439 B 档，同一条
+        # "未装配=安全兜底"惯例）——不是写路径，不需要与 pending_actions 成对存在。
+        self._management_cards = management_cards
 
     def _safe_record(self, action: str, /, **fields: object) -> bool:
         """给 ``self._audit.record`` 包一层保护（opus 批量审查 P2 修复）。
@@ -358,7 +428,19 @@ class AdminCommandRouter:
 
         if command.kind is AdminCommandKind.QUERY_USER:
             assert command.identifier is not None
-            status = self._queries.user_status(identifier=command.identifier)
+            resolved_identifier = self._queries.resolve_identifier(identifier=command.identifier)
+            status = self._queries.user_status(identifier=resolved_identifier)
+            if status is not None:
+                # 管理卡（#439 B 档）：与文本回复并存，不替代——管理卡发送失败或未
+                # 装配都不影响既有文本回复这条主路径（"未装配=安全兜底"既有惯例）。
+                self._send_management_card(
+                    status=status,
+                    display_identifier=command.identifier,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    message_id=message_id,
+                    trace_id=trace_id,
+                )
             return self._record_or_reject(
                 "admin.command.query_user",
                 AdminRouteOutcome(
@@ -376,8 +458,13 @@ class AdminCommandRouter:
 
         if command.kind is AdminCommandKind.QUERY_AUDIT:
             window_hours = command.window_hours or 24
+            resolved_audit_identifier = (
+                self._queries.resolve_identifier(identifier=command.identifier)
+                if command.identifier
+                else None
+            )
             events = self._queries.recent_events(
-                identifier=command.identifier,
+                identifier=resolved_audit_identifier,
                 window_hours=window_hours,
                 limit=DEFAULT_EVENT_LIMIT,
             )
@@ -421,7 +508,7 @@ class AdminCommandRouter:
                 entry=entry,
                 roles=roles,
                 action_type=PendingActionType.SUSPEND_USER,
-                target_identifier=command.identifier,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
@@ -434,7 +521,7 @@ class AdminCommandRouter:
                 entry=entry,
                 roles=roles,
                 action_type=PendingActionType.RESUME_USER,
-                target_identifier=command.identifier,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
@@ -450,13 +537,13 @@ class AdminCommandRouter:
                 entry=entry,
                 roles=roles,
                 action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
-                target_identifier=command.identifier,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
                 trace_id=trace_id,
                 company_id=command.company_id,
-                metric_name=command.metric_name,
+                metric_name=self._queries.resolve_metric_name(metric_token=command.metric_name),
                 reason=command.reason,
             )
 
@@ -469,24 +556,64 @@ class AdminCommandRouter:
                 entry=entry,
                 roles=roles,
                 action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS,
-                target_identifier=command.identifier,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
                 trace_id=trace_id,
                 company_id=command.company_id,
-                metric_name=command.metric_name,
+                metric_name=self._queries.resolve_metric_name(metric_token=command.metric_name),
                 reason=command.reason,
             )
 
         if command.kind is AdminCommandKind.REVOKE_PERMISSION:
             assert command.identifier is not None
             assert command.reason is not None
+            override_id = command.identifier
+            if command.company_id is not None:
+                # 形状 2（#439 A 档新增，见 commands.py 文档）：identifier 是目标
+                # 用户标识（open_id 或邮箱），company_id/metric_name 一起反查
+                # override_id；反查不到就直接回复，不产生任何待确认操作——这一步
+                # 发生在 prepare() 之前（还没有 override_id 可以喂给它），因此不
+                # 计入 `decide_prepare` 的 "not_found" 结论，是独立的一道前置判断。
+                assert command.metric_name is not None
+                resolved_open_id = self._queries.resolve_identifier(
+                    identifier=command.identifier
+                )
+                resolved_metric = self._queries.resolve_metric_name(
+                    metric_token=command.metric_name
+                )
+                found_override_id = self._queries.resolve_override_id(
+                    open_id=resolved_open_id,
+                    company_id=command.company_id,
+                    metric_name=resolved_metric,
+                )
+                if found_override_id is None:
+                    return self._record_or_reject(
+                        _WRITE_ACTION_NAMES[PendingActionType.LOCAL_PERMISSION_REVOKE],
+                        AdminRouteOutcome(
+                            handled=True,
+                            content_key="admin.write_action_rejected",
+                            content_version=_CONTENT_VERSION,
+                            reply_text=(
+                                "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
+                                "或已被收回，或同一键同时存在授权与抑制两条需要精确"
+                                "指定），请用 /admin user 查询后核对，或改用"
+                                " override_id 精确指定收回。"
+                            ),
+                        ),
+                        actor=entry.feishu_open_id,
+                        roles=roles,
+                        target=command.identifier,
+                        code=_OVERRIDE_NOT_FOUND_CODE,
+                        trace_id=trace_id,
+                    )
+                override_id = found_override_id
             # 自我目标防呆（#319 S-P-1b 设计卡新增；卡 B 沿用同一姿态）：这里
             # **不**重复卡 A 的 ``target_identifier == entry.feishu_open_id``
-            # 判断——``command.identifier`` 对收回命令而言是覆盖行的内部标识
-            # （override_id），不是 open_id，与管理员自己的 ``feishu_open_id``
-            # 结构上不会相等，判断也就恒假、形同虚设。真正等价的防呆在
+            # 判断——传给 ``_dispatch_write_action`` 的 ``override_id`` 是覆盖行的
+            # 内部标识，不是 open_id，与管理员自己的 ``feishu_open_id`` 结构上不会
+            # 相等，判断也就恒假、形同虚设。真正等价的防呆在
             # ``adapters/postgres_pending_action.py`` 的 ``prepare()``：按
             # override_id 查到覆盖行的属主 open_id 之后再核对，理由是"收回输入
             # 是 id，须查库后才知属主"（同语义、检查点位置不同，见
@@ -495,7 +622,7 @@ class AdminCommandRouter:
                 entry=entry,
                 roles=roles,
                 action_type=PendingActionType.LOCAL_PERMISSION_REVOKE,
-                target_identifier=command.identifier,
+                target_identifier=override_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
@@ -689,21 +816,66 @@ class AdminCommandRouter:
             trace_id=trace_id,
         )
 
+    def _send_management_card(
+        self,
+        *,
+        status: AdminUserStatusView,
+        display_identifier: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        trace_id: str,
+    ) -> None:
+        """`/admin user` 附带发送用户权限管理卡（#439 B 档），best-effort。
+
+        与写命令的确认卡片不同，管理卡**不是**一次待确认操作——它只是一张承载
+        「查看 + 发起」的交互卡，本身不改变任何状态（合同"待确认操作发送到发起
+        管理员本人的飞书私聊，卡片只承担最终确认，不承担搜索、比较、审批流或
+        复杂信息填写"这条只约束**确认卡**；管理卡是确认卡的前一步，专门承担
+        "复杂信息填写"，两者是两张不同的卡，见本 Story 报告"同卡二次确认"裁定）。
+        因此发送失败、或没有可回复的 ``message_id``（结构上只会发生在调用方没有
+        把触发消息 ID 传下来的时候）都只记一条 best-effort 审计，不影响
+        `/admin user` 既有的文本回复这条主路径，也不让整次 `route()` 调用失败——
+        与 `_notify_group`/`_update_card_to_terminal` 两处既有 best-effort 分支
+        （`core/admin/card_callback.py`）同一姿态。
+        """
+
+        if self._management_cards is None or not message_id:
+            return
+        try:
+            self._management_cards.send(
+                status=status,
+                display_identifier=display_identifier,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                reply_to_message_id=message_id,
+            )
+        except Exception as error:  # noqa: BLE001 - 管理卡发送失败不影响文本回复
+            self._safe_record(
+                "admin.command.management_card_send_failed",
+                target=display_identifier,
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
 
 def _render_help(roles: Sequence[str]) -> str:
     role_line = "、".join(roles) if roles else "(无)"
     return (
         "Lingxi 管理命令：\n"
         "/admin help — 显示本帮助\n"
-        "/admin user <标识> — 查询用户开通状态\n"
-        "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时）\n"
+        "/admin user <标识> — 查询用户开通状态并调出权限管理卡（标识支持邮箱或 open_id）\n"
+        "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时，标识支持邮箱或 open_id）\n"
         "/admin trace <追溯号> — 按追溯号查开通失败原因与事件时间线\n"
         "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
-        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权（需本人飞书确认卡片）\n"
-        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起本地抑制（需本人飞书确认卡片）\n"
-        "/admin revoke_permission <覆盖ID> <原因> — 发起收回本地覆盖（需本人飞书确认卡片；"
-        "覆盖ID 见 /admin user 查询结果）\n"
+        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起本地授权"
+        "（需本人飞书确认卡片；指标支持已配置的中文别名）\n"
+        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起本地抑制（同上）\n"
+        "/admin revoke_permission <标识> <公司> <指标> <原因> — 发起收回本地覆盖"
+        "（需本人飞书确认卡片；与 grant/suppress 同一参数形状，服务端反查覆盖ID）\n"
+        "/admin revoke_permission <覆盖ID> <原因> — 按覆盖ID直接发起收回（覆盖ID 见"
+        " /admin user 查询结果）\n"
         f"当前角色：{role_line}"
     )
 
@@ -752,6 +924,32 @@ def _render_local_overrides(overrides: Sequence[LocalPermissionOverrideView]) ->
 #: 提示（那正是删除前留着这句提示的唯一理由）。
 
 
+#: 银河来源摘要（#439 B 档）"算不出来"的三个原因码 → 中文提示，与
+#: ``PermissionAggregate.reason`` 取值域（"算出来了、结论是没有"）分开处理——
+#: 后者直接展示原始 reason 字面量即可（内部原因码，运维/管理员共用同一份词表，
+#: 与本模块其余展示层惯例一致，不额外维护一份中文翻译）。
+_GALAXY_SOURCE_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "roster_snapshot_unavailable",
+        "galaxy_snapshot_unavailable",
+        "role_function_map_unavailable",
+    }
+)
+
+
+def _render_galaxy_source(summary: GalaxySourceSummary | None) -> str:
+    """``/admin user`` 回显的「银河来源」段（#439 B 档，见
+    ``views.GalaxySourceSummary`` 文档）。仅供展示，不参与任何权限判定。"""
+
+    if summary is None or summary.reason in _GALAXY_SOURCE_UNAVAILABLE_REASONS:
+        return "银河来源不可用（无法计算，不代表该用户没有银河权限）"
+    if not summary.granted:
+        return f"当前没有可用的银河权限（原因：{summary.reason}）"
+    company_label = "全部公司" if summary.all_companies else "、".join(summary.companies)
+    function_label = "、".join(summary.functions)
+    return f"公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
+
+
 def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> str:
     if status is None:
         return f"未找到标识为 {identifier} 的用户记录。"
@@ -761,6 +959,7 @@ def _render_user_status(identifier: str, status: AdminUserStatusView | None) -> 
         f"账号状态：{status.account_state}\n"
         f"权限版本：{status.permission_version}\n"
         f"更新时间：{status.updated_at}\n"
+        f"银河来源：{_render_galaxy_source(status.galaxy_source)}\n"
         f"当前生效本地覆盖：\n{_render_local_overrides(status.local_overrides)}"
     )
 

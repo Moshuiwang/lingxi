@@ -19,11 +19,24 @@ from enum import Enum
 
 from lingxi.core.ids import is_ulid
 
-#: 目标标识（当前只用于 open_id）允许的形状：字母、数字、下划线、连字符、点、冒号，
-#: 1–128 字符。刻意排除空白、引号、分号等 SQL / shell 元字符——不是因为下游会拼接
-#: 字符串（真实查询走参数化语句），而是让"格式一望而知安全"成为语法层面的性质，
-#: 不依赖调用方记得转义。
-_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+#: 目标标识（open_id 或邮箱，#439 A 档新增邮箱支持）允许的形状：字母、数字、下划线、
+#: 连字符、点、冒号、``@``，1–128 字符。刻意排除空白、引号、分号等 SQL / shell 元
+#: 字符——不是因为下游会拼接字符串（真实查询走参数化语句），而是让"格式一望而知
+#: 安全"成为语法层面的性质，不依赖调用方记得转义。新增 ``@`` 只是为了让邮箱形态的
+#: 标识能通过这一层语法门（如 ``name@company.com``），是否真的按邮箱解析、反查
+#: 到哪个 open_id 是 ``router.py``/``adapters/admin_registry.py`` 的职责，本模块
+#: 继续保持"只判定形状是否安全，不关心语义"的既有分工。
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.@:-]{1,128}$")
+
+#: 指标名 token 允许的形状（#439 A 档新增中文别名支持）：在 ``_IDENTIFIER_PATTERN``
+#: 的基础上额外放行 CJK 统一表意文字区（``一-鿿``）——真实指标目录
+#: （``config/company_function_metric_map.toml``）当前全部是英文 snake_case 内部
+#: ID（如 ``sub_new_count``），管理员记不住这些内部 ID 是 #439 的真实动机；允许中文
+#: token 通过语法门后，才谈得上在 ``router.py``/``adapters/admin_registry.py`` 里
+#: 按别名表反查成真正的指标 ID——语法层继续不关心语义，只放宽到"安全字符集"，不
+#: 单独为 identifier/company_id 放开同一个口子（那两类 token 目前没有中文形态的
+#: 真实需求，维持既有更窄的字符集）。
+_METRIC_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.@:一-鿿-]{1,128}$")
 
 #: 追溯/审计查询默认时间窗（小时）与允许上限（30 天）。上限防止一次查询扫描
 #: 出远超"最近关键事件"这个 MVP 承诺的历史范围。
@@ -60,14 +73,22 @@ class AdminCommandKind(str, Enum):
 class AdminCommand:
     """解析结果。``UNKNOWN`` 之外的取值只填各自需要的字段，其余保持默认。
 
-    ``company_id``/``metric_name``/``reason`` 三个字段只有
-    ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 会填（``identifier`` 复用做
-    目标用户标识，与既有 ``suspend``/``resume`` 同一惯例）。``REVOKE_PERMISSION``
-    只填 ``identifier``（复用同一字段承载 override_id，不是 open_id——见
-    ``_parse_revoke_permission_command`` 文档）与 ``reason``，``company_id``/
-    ``metric_name`` 保持默认 ``None``（收回按行本身定位，命令里不需要重复提供
-    这两项——它们会在 ``adapters/postgres_pending_action.py`` 的 ``prepare()``
-    里从这一行本身查出来）。
+    ``company_id``/``metric_name``/``reason`` 三个字段由 ``GRANT_PERMISSION``/
+    ``SUPPRESS_PERMISSION`` 填（``identifier`` 复用做目标用户标识，与既有
+    ``suspend``/``resume`` 同一惯例）。``REVOKE_PERMISSION`` 有两种形状（#439 A
+    档新增第二种，见 ``_parse_revoke_permission_command`` 文档）：
+
+    - 形状 1（旧，按行定位）：只填 ``identifier``（复用同一字段承载 override_id，
+      不是 open_id）与 ``reason``，``company_id``/``metric_name`` 保持默认
+      ``None``——收回按行本身定位，这两项会在 ``adapters/postgres_pending_
+      action.py`` 的 ``prepare()`` 里从这一行本身查出来；
+    - 形状 2（新，与 grant/suppress 同一参数形状）：``identifier`` 是目标用户标识
+      （open_id 或邮箱，不是 override_id）、``company_id``/``metric_name``/
+      ``reason`` 均非空——``router.py`` 据此在调用 ``prepare()`` 之前先反查出
+      override_id（``AdminQueries.resolve_override_id``），再退化成与形状 1 完全
+      相同的下游调用。两种形状对下游（``pending_action.py``/``router.py`` 之外
+      的代码）保持逐字节相同的调用面，`command.company_id is not None` 是唯一
+      的判据。
     """
 
     kind: AdminCommandKind
@@ -114,9 +135,22 @@ def parse_admin_command(text: object) -> AdminCommand:
       ``lpo_*``——26 位 Crockford Base32 ULID 前缀，与 ``core/ids.is_ulid`` 同一
       形状校验；``reason`` 是尾部剩余全部 token 拼接成的自由文本，非空白、
       ≤500 字符，与 grant/suppress 同一纪律）
+    - ``/admin revoke_permission <identifier> <company_id> <metric_name> <reason...>``
+      → REVOKE_PERMISSION（#439 A 档新增：与 grant/suppress **同一参数形状**，
+      不再要求管理员先查出 ``lpo_`` 内部 ID；``identifier``/``company_id``/
+      ``metric_name`` 三段服务端反查覆盖 ID，见 ``router.py``。两种 revoke 形状
+      按第一个 token 是否形似 override_id 分辨，见 ``_parse_revoke_permission_
+      command`` 文档）
 
     任何不匹配以上形状的输入（含空文本、非字符串、未知子命令、参数数量或形状不对、
     小时数越界）一律返回 ``UNKNOWN``——调用方据此回复帮助/拒绝文案，不猜测意图。
+
+    **标识参数支持邮箱（#439 A 档）**：``user``/``audit``/``suspend``/``resume``/
+    ``grant_permission``/``suppress_permission`` 与 revoke 新形状里标记目标用户的
+    ``<identifier>``，既可以是 open_id 也可以是邮箱——本函数只按 ``_IDENTIFIER_
+    PATTERN`` 判定"形状是否安全"，不区分两者；把邮箱反查成 open_id 是
+    ``router.py``/``adapters/admin_registry.py`` 的职责（``AdminQueries.
+    resolve_identifier``），本模块继续不做任何查询。
     """
 
     if not isinstance(text, str):
@@ -187,7 +221,7 @@ def _parse_permission_command(rest: list[str], *, kind: AdminCommandKind) -> Adm
         return _unknown()
     if not _IDENTIFIER_PATTERN.fullmatch(company_id):
         return _unknown()
-    if not _IDENTIFIER_PATTERN.fullmatch(metric_name):
+    if not _METRIC_TOKEN_PATTERN.fullmatch(metric_name):
         return _unknown()
     reason = " ".join(reason_tokens).strip()
     if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
@@ -212,22 +246,60 @@ def _is_override_id(token: str) -> bool:
 
 
 def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
-    """``revoke_permission`` 的解析：``<override_id> <reason...>``——只有两段，
-    比 ``_parse_permission_command`` 少 ``company_id``/``metric_name`` 两个 token
-    （收回按行本身定位，见 ``AdminCommand`` 文档）。至少需要 2 个 token（override_id
-    + 至少一个原因词）；``reason`` 拼接规则与 :func:`_parse_permission_command`
-    相同（非空白、≤500 字符）。"""
+    """``revoke_permission`` 的解析，支持两种形状（#439 A 档新增第二种）：
+
+    1. ``<override_id> <reason...>``——原有形状，按行本身定位（见 ``AdminCommand``
+       文档），供已经知道 override_id 的调用方直接使用（例如 B 档管理卡逐行「收回」
+       按钮，回调时本来就携带这一行的 override_id，不需要再走反查）。
+    2. ``<identifier> <company_id> <metric_name> <reason...>``——与
+       ``grant_permission``/``suppress_permission`` **同一个参数形状**（#439 卡内
+       证据：形状不同致管理员两次真实误用），``identifier`` 是目标用户标识（open_id
+       或邮箱）、``company_id``/``metric_name`` 定位要收回的那一条本地覆盖；服务端
+       反查出 override_id 的职责在 ``router.py``（经 ``AdminQueries.
+       resolve_override_id``），本模块只负责识别出"这是第二种形状"并原样透传三个
+       字段，不做任何查库。
+
+    判据：第一个 token 是否符合 ``lpo_`` + ULID 的形状（:func:`_is_override_id`）。
+    两种形状的 token 数量域不重叠时也能分辨（形状 1 至少 2 个 token，形状 2 至少
+    4 个），但判据本身用"第一个 token 长什么样"而不是"数了多少个 token"——后者会让
+    一个只填了 2 个 token 的形状 2 输入（identifier 打错导致 reason 被吃掉一部分）
+    被误判成形状 1 去校验 override_id 形状，报错信息文不对题；先判形状能让两条分支
+    各自只处理自己的、路径清晰的失败信息。
+    """
 
     if len(rest) < 2:
         return _unknown()
-    override_id, *reason_tokens = rest
-    if not _is_override_id(override_id):
+
+    first = rest[0]
+    if _is_override_id(first):
+        # 形状 1：<override_id> <reason...>
+        reason = " ".join(rest[1:]).strip()
+        if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
+            return _unknown()
+        return AdminCommand(
+            kind=AdminCommandKind.REVOKE_PERMISSION, identifier=first, reason=reason
+        )
+
+    # 形状 2：<identifier> <company_id> <metric_name> <reason...>——与
+    # _parse_permission_command 同一套校验，但结果落在 REVOKE_PERMISSION 上。
+    if len(rest) < 4:
+        return _unknown()
+    identifier, company_id, metric_name, *reason_tokens = rest
+    if not _IDENTIFIER_PATTERN.fullmatch(identifier):
+        return _unknown()
+    if not _IDENTIFIER_PATTERN.fullmatch(company_id):
+        return _unknown()
+    if not _METRIC_TOKEN_PATTERN.fullmatch(metric_name):
         return _unknown()
     reason = " ".join(reason_tokens).strip()
     if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
         return _unknown()
     return AdminCommand(
-        kind=AdminCommandKind.REVOKE_PERMISSION, identifier=override_id, reason=reason
+        kind=AdminCommandKind.REVOKE_PERMISSION,
+        identifier=identifier,
+        company_id=company_id,
+        metric_name=metric_name,
+        reason=reason,
     )
 
 

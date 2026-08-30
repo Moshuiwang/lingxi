@@ -8,9 +8,14 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from lingxi.core.admin.card_dispatch import CardDispatchResult, ConfirmCardDispatcher
+from lingxi.core.admin.card_dispatch import (
+    CardDispatchResult,
+    ConfirmCardDispatcher,
+    ManagementCardDispatcher,
+)
 from lingxi.core.admin.notification import AdminCardCreated, AdminCardDeliveryRejected
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
+from lingxi.core.admin.views import AdminUserStatusView
 
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -227,6 +232,114 @@ class SendFailureAuditTests(unittest.TestCase):
         )
 
         self.assertEqual(audit.calls, [])
+
+
+class _FakeManagementTransport:
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self._raises = raises
+        self.create_calls: list[dict] = []
+
+    def create(self, *, chat_id, thread_id, reply_to_message_id, card):
+        self.create_calls.append(
+            {
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+                "card": card,
+            }
+        )
+        if self._raises is not None:
+            raise self._raises
+        return type("Created", (), {"card_id": "card_1", "message_id": "msg_1"})()
+
+
+class _FakeCatalog:
+    def companies(self):
+        return ["1011"]
+
+    def metrics(self):
+        return ["sub_new_count"]
+
+
+def _status() -> AdminUserStatusView:
+    return AdminUserStatusView(
+        identifier="ou_target",
+        provisioning_state="active",
+        account_state="enabled",
+        permission_version=1,
+        updated_at="2026-08-30T00:00:00+00:00",
+    )
+
+
+class ManagementCardDispatcherTests(unittest.TestCase):
+    """``core/admin/card_dispatch.ManagementCardDispatcher``（#439 B 档）：管理卡
+    渲染 + 发送编排，不需要落库口——管理卡不是一次待确认操作。"""
+
+    def test_successful_send_delivers_the_rendered_card(self) -> None:
+        transport = _FakeManagementTransport()
+        audit = _FakeAudit()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport, catalog=_FakeCatalog(), audit=audit
+        )
+
+        result = dispatcher.send(
+            status=_status(),
+            display_identifier="ou_target",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertTrue(result.delivered)
+        self.assertEqual(len(transport.create_calls), 1)
+        call = transport.create_calls[0]
+        self.assertEqual(call["reply_to_message_id"], "om_1")
+        self.assertEqual(call["card"]["schema"], "2.0")
+        self.assertEqual(audit.calls, [])
+
+    def test_explicit_rejection_is_reported_as_not_delivered(self) -> None:
+        transport = _FakeManagementTransport(
+            raises=AdminCardDeliveryRejected("拒绝", code=200861, log_id="log_1")
+        )
+        audit = _FakeAudit()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport, catalog=_FakeCatalog(), audit=audit
+        )
+
+        result = dispatcher.send(
+            status=_status(),
+            display_identifier="ou_target",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertEqual(len(audit.calls), 1)
+        action, fields = audit.calls[0]
+        self.assertEqual(action, "admin.management_card_dispatch.send_failed")
+        self.assertEqual(fields["code"], 200861)
+        self.assertEqual(fields["log_id"], "log_1")
+
+    def test_uncertain_result_is_also_reported_as_not_delivered(self) -> None:
+        transport = _FakeManagementTransport(raises=RuntimeError("网络超时"))
+        audit = _FakeAudit()
+        dispatcher = ManagementCardDispatcher(
+            transport=transport, catalog=_FakeCatalog(), audit=audit
+        )
+
+        result = dispatcher.send(
+            status=_status(),
+            display_identifier="ou_target",
+            chat_id="oc_1",
+            thread_id=None,
+            reply_to_message_id="om_1",
+        )
+
+        self.assertFalse(result.delivered)
+        action, fields = audit.calls[0]
+        self.assertEqual(action, "admin.management_card_dispatch.send_failed")
+        self.assertNotIn("code", fields)
 
 
 if __name__ == "__main__":  # pragma: no cover

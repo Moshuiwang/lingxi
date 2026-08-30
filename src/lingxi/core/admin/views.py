@@ -35,12 +35,48 @@ class LocalPermissionOverrideView:
 
 
 @dataclass(frozen=True)
+class GalaxySourceSummary:
+    """「查询用户状态」命令回显的银河来源权限摘要（#439 B 档：管理卡「银河来源与
+    本地覆盖分列展示」的「银河来源」这一半）。
+
+    仅供展示，**不参与任何权限判定**——真实生效权限的权威计算路径仍然是
+    ``core/permission/merge_sources.py`` 的四源合并，本类型只是把
+    ``core/permission/publish_row.aggregate_permission`` 现算一次的结果转成一份
+    不依赖 ``core.permission`` 类型的展示 DTO（``views.py`` 保持轻量、不跨模块
+    耦合的既有取舍，见模块文档）。``granted=False`` 时 ``companies``/``functions``
+    恒为空，``reason`` 给出机器可读原因码（与 ``PermissionAggregate.reason`` 同一
+    取值域，另加本类型独有的 ``roster_snapshot_unavailable``/
+    ``galaxy_snapshot_unavailable``/``role_function_map_unavailable`` 三种——
+    这三种描述"算不出来"，前面几种描述"算出来了、结论是没有"，两者对管理员来说
+    都渲染成同一种"无可展示的银河来源权限"，但原因码保留区别供审计/排障）。
+
+    ``functions`` 是**职能标签**（如"运营"/"财务"），不是问数 MCP 认的指标 ID——
+    这一层翻译（``core/permission/metric_translation.translate_company_functions``）
+    需要额外的公司维度笛卡尔积，且其失败语义（映射未覆盖时整轮 fail-closed）是
+    为"要不要真的发布"这个决策设计的，套用到"展示一下大概是什么范围"这个更宽松的
+    场景意义不大；管理员真正需要精确指标 ID 的场景（发起本地覆盖）由「本地覆盖」
+    分列与新增授权/抑制表单的指标下拉（真实指标目录）满足，不依赖这里的翻译结果。
+    """
+
+    granted: bool
+    reason: str
+    companies: tuple[str, ...] = ()
+    functions: tuple[str, ...] = ()
+    all_companies: bool = False
+
+
+@dataclass(frozen=True)
 class AdminUserStatusView:
     """「查询用户状态」命令的最小必要信息——开通与账号状态，不含花名册资料。
 
     ``local_overrides``（#319 S-P-1b 卡 B 新增，默认空元组保持既有构造点不用改）
     是该用户当前生效的本地权限覆盖行列表，供 ``/admin revoke_permission`` 的
-    UX 前置——管理员需要先看到 override_id 才能发起收回。"""
+    UX 前置——管理员需要先看到 override_id 才能发起收回。
+
+    ``galaxy_source``（#439 B 档新增，默认 ``None`` 保持既有构造点不用改）是最佳
+    努力算出的银河来源权限摘要；``None`` 与 ``GalaxySourceSummary(granted=False,
+    reason=...)`` 的区别只在"这个字段有没有被填过"，两者在管理卡上渲染成同一种
+    "银河来源不可用"文案，调用方不需要分支处理。"""
 
     identifier: str
     provisioning_state: str
@@ -48,6 +84,7 @@ class AdminUserStatusView:
     permission_version: int
     updated_at: str
     local_overrides: tuple[LocalPermissionOverrideView, ...] = field(default_factory=tuple)
+    galaxy_source: GalaxySourceSummary | None = None
 
 
 @dataclass(frozen=True)

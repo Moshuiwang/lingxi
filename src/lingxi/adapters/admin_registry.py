@@ -157,6 +157,16 @@ class PostgresAdminQueries:
             permission_version=permission_version,
             updated_at=_isoformat(updated_at),
             local_overrides=local_overrides,
+            # 「银河来源」展示（#439 B 档）本轮登记为跟进项，不在本 Story 内计算，
+            # 见本卡交付报告"登记项"一节：现算一次银河来源需要花名册快照 + 银河
+            # 快照 + core/permission 聚合层，会把这些目前只在 scheduler 进程使用
+            # 的依赖拉进 gateway 进程的运行时 import 闭包（本机 `check_installed_
+            # package.py` 已经如实拦下这一改动），是一次需要单独评估的依赖边界
+            # 决策，不是本卡"最小改动"范围内能够顺手做的事。``None`` 与
+            # ``router._render_galaxy_source``/``management_card._galaxy_source_
+            # markdown`` 的既有"不可用"分支天然衔接，管理员看到的是诚实的"银河
+            # 来源不可用"，不是编造的数据。
+            galaxy_source=None,
         )
 
     def recent_events(
@@ -257,6 +267,86 @@ class PostgresAdminQueries:
             failure_event_type=failure.event_type if failure is not None else None,
             failure_occurred_at=failure.occurred_at if failure is not None else None,
         )
+
+    def resolve_identifier(self, *, identifier: str) -> str:
+        """把邮箱形态的标识反查成 open_id（#439 A 档）；见 ``core/admin/router.
+        AdminQueries.resolve_identifier`` 的完整契约文档。
+
+        判据是"是否含 ``@``"——不是邮箱形态（不含 ``@``）时不发起任何查询，直接
+        原样返回，既是既有多数调用（open_id 本来就不含 ``@``）的零成本路径，也
+        避免把一次明显不是邮箱的输入误当邮箱去查。
+
+        ``app_user.email`` 没有唯一约束（迁移基线只对 ``feishu_open_id`` 建
+        UNIQUE），零命中或多命中都是"反查失败"，与 ``resolve_identifier`` 的
+        既有契约一致：原样返回输入，交给下游按既有"未找到"语义处理。
+        """
+
+        if "@" not in identifier:
+            return identifier
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT feishu_open_id FROM app_user"
+                " WHERE email = %s AND feishu_open_id IS NOT NULL",
+                (identifier,),
+            )
+            rows = cursor.fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        return identifier
+
+    def resolve_metric_name(self, *, metric_token: str) -> str:
+        """把中文别名反查成真正的指标 ID（#439 A 档）；见 ``core/admin/router.
+        AdminQueries.resolve_metric_name`` 的完整契约文档。
+
+        每次调用现读别名表（``adapters/admin_metric_alias_map_file.py``，见该
+        模块文档"与 company_function_metric_map_file.py 的关键差异：现读，不
+        缓存"）——管理命令面低频，现读成本可忽略，换来编辑别名表立即生效。
+        """
+
+        from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
+
+        aliases = load_admin_metric_alias_map()
+        return aliases.get(metric_token, metric_token)
+
+    def resolve_override_id(
+        self, *, open_id: str, company_id: str, metric_name: str
+    ) -> str | None:
+        """按「open_id + 公司 + 指标」反查当前生效的本地覆盖行 override_id（#439 A
+        档，revoke 新参数形状）；见 ``core/admin/router.AdminQueries.
+        resolve_override_id`` 的完整契约文档。
+
+        先按 ``feishu_open_id`` 查出内部 ``app_user.id``（``local_permission_
+        override.user_id`` 的口径，迁移 ``0072``），再复用既有的
+        :meth:`~lingxi.adapters.postgres_local_permission.
+        PostgresLocalPermissionOverrideStore.effective_entries` 取该用户全部
+        当前生效覆盖，按 ``company_id``/``metric_name`` 过滤——不新写一条按三键
+        联合查询的 SQL，理由与 ``core/admin/views.LocalPermissionOverrideView``
+        文档"数据经……effective_entries（已有）"一致：复用已经过测试、已经正确
+        处理 ``entry_status='active'`` 过滤的读路径，不重新拼一遍等价查询。
+
+        目标用户不存在（``feishu_open_id`` 查无）、零命中或多命中（同一
+        公司+指标理论上可能同时有一条生效授权与一条生效抑制，见迁移 ``0072``
+        的唯一索引按 ``direction`` 再分）均返回 ``None``——不猜测该收回哪一条。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM app_user WHERE feishu_open_id = %s",
+                (open_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        user_id = row[0]
+
+        matches = [
+            stored.id
+            for stored in self._local_overrides.effective_entries(user_id=user_id)
+            if stored.entry.company_id == company_id and stored.entry.metric_name == metric_name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
 
 def _isoformat(value: object) -> str:
