@@ -645,6 +645,134 @@ class ManagementCardDispatchTests(unittest.TestCase):
 
         self.assertEqual(calls[0]["admin_action"], "suppress")
 
+    def test_real_click_shape_missing_value_routes_via_button_name(self) -> None:
+        """W0-1 追加结论（2026-08-30，真实点击实测坐实）：真实回调里 form 内
+        提交按钮的 ``action.value`` 经常不带 ``admin_action``（本用例构造的
+        ``action.value`` 缺失，只有 ``action.form_value``）——此前这类事件会
+        在 ``adapters/feishu_events.py`` 被整体拒绝（``CardActionParseError``），
+        管理卡补充授权/屏蔽指标从此全部静默失效。修复后应改用按钮自己的
+        ``action.name``（``grant_submit``）兜底路由，仍然到达
+        ``handle_management_form_submit``。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[tuple[str, dict]] = []
+
+            def record(self, action: str, /, **fields: object) -> None:
+                self.records.append((action, fields))
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+            def handle_management_revoke(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("表单提交不该路由到收回分支")
+
+            def handle(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("表单提交不该静默落回确认/取消既有分支")
+
+        audit = Audit()
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=audit, card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        event = {
+            "header": {"event_id": "evt_real_click_1", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_admin"},
+                "action": {
+                    "tag": "form",
+                    "name": "grant_submit",
+                    # 真实实测形态：value 缺失（本用例）或是需要反序列化的
+                    # JSON 字符串（下一个用例覆盖）。
+                    "form_value": {
+                        "company_id": "1011",
+                        "metric_name": "sub_new_count",
+                        "reason": "特批",
+                    },
+                },
+                "context": {"open_chat_id": "oc_admin_dm", "open_message_id": "om_card_1"},
+            },
+        }
+
+        result = handler(event)
+
+        self.assertEqual(result, {"toast": {"type": "success", "content": "ok"}})
+        self.assertEqual(audit.records, [], "不应该落进 event.unparsable")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["admin_action"], "grant")
+        self.assertEqual(calls[0]["company_id"], "1011")
+        self.assertEqual(calls[0]["metric_name"], "sub_new_count")
+        self.assertEqual(calls[0]["reason"], "特批")
+        # value 缺失时 identifier 无法恢复（value 是它唯一的载体），
+        # card_callback.py 既有的必填校验会给出"未识别到目标用户标识"这类
+        # 明确提示，不是本层的职责——本用例只钉住"事件确实到达了
+        # handle_management_form_submit，不是被静默丢弃"。
+        self.assertEqual(calls[0]["identifier"], "")
+
+    def test_real_click_shape_json_string_value_recovers_identifier(self) -> None:
+        """真实实测的另一种形态：``action.value`` 到达时是一段 JSON 字符串——
+        解码后 ``identifier`` 等字段能完整恢复，不需要依赖按钮名兜底。"""
+
+        import json
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        event = {
+            "header": {"event_id": "evt_real_click_2", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_admin"},
+                "action": {
+                    "tag": "form",
+                    "name": "suppress_submit",
+                    "value": json.dumps(
+                        {"admin_action": "suppress", "identifier": "u@example.invalid"}
+                    ),
+                    "form_value": {
+                        "company_id": "1012",
+                        "metric_name": "channel_rate",
+                        "reason": "临时限制",
+                    },
+                },
+                "context": {"open_chat_id": "oc_admin_dm", "open_message_id": "om_card_1"},
+            },
+        }
+
+        handler(event)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["admin_action"], "suppress")
+        self.assertEqual(calls[0]["identifier"], "u@example.invalid")
+        self.assertEqual(calls[0]["company_id"], "1012")
+
     def test_revoke_button_routes_to_handle_management_revoke(self) -> None:
         from lingxi.apps.gateway import make_event_handler
 
