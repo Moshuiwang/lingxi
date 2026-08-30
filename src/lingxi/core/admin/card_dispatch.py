@@ -29,8 +29,10 @@ AuditSink``/``core/admin/card_callback.AuditSink`` 结构相同的独立 ``Audit
 
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.management_card import (
@@ -160,6 +162,90 @@ class ManagementCardDispatchResult:
     delivered: bool
 
 
+class ManagementCardContextStore:
+    """管理卡发送侧登记的 ``message_id -> identifier`` 内存 TTL 映射（Trace #469
+    修复包 B，B-1）。
+
+    ## 要解决的问题
+
+    真实点击实测坐实：管理卡「新增授权/新增抑制」表单提交回调的
+    ``action.value`` 经常不带 ``identifier``（缺失或需要反序列化的 JSON 字符串，
+    见 ``apps/gateway/__init__.py`` ``make_event_handler`` 文档）——``identifier``
+    此前唯一的载体就是这个字段，缺失时 ``card_callback.py``
+    ``handle_management_form_submit`` 只能给出「未识别到目标用户标识，请重新
+    查询 /admin user 后再操作」，管理卡头号交付在这一形态下不可用。
+
+    ## 为什么是发送侧登记，而不是从回调事件体的其它字段反查
+
+    管理卡的 ``context.open_message_id``（回调事件体里这张卡片自己的消息 ID，见
+    ``apps/gateway/__init__.py`` ``_management_card_context`` 文档）与建卡成功后
+    ``ManagementCardTransport.create()`` 返回的 ``ManagementCardCreated.
+    message_id`` 是同一个值——飞书回调把"这次点击发生在哪条消息上"如实回传，而
+    这条消息正是管理卡自己。因此发送成功那一刻就能确定性地知道"这条 message_id
+    对应哪一次 ``/admin user`` 查询、查的是谁"，不需要在回调时反查任何外部状态。
+
+    ## 为什么是内存 TTL 映射，不落库
+
+    单实例部署（D11 前提，见仓库既有决策）下，进程内存足以覆盖"管理员发起查询
+    到点击表单提交"这几分钟内的窗口；重启丢失可接受——查不到时退回既有的
+    「请重新查询 /admin user」拒绝路径，此时这句指引恰好是准确操作，不是误导。
+    落库需要迁移、需要处理跨实例一致性，为一个"重启即可自愈"的缓存引入这些
+    成本不划算。
+
+    TTL 默认 30 分钟（管理卡查询后不太可能拖到半小时之后才提交表单，超时后
+    退回既有拒绝路径不算体验回退）；条目数上限默认 512，超过时逐出**最早写入**
+    的一条（``OrderedDict`` + ``move_to_end`` 的最简单可行策略，不需要按最近
+    访问时间重新排序——本映射只在"写入"与"回调时读一次"两个时机被触碰，读取
+    不应该影响谁被优先保留）。查不到（未登记/已过期/已被逐出）与「已存在但
+    identifier 为空」在调用方（``apps/gateway/__init__.py``）眼里是同一件事：
+    维持现有「请重新查询 /admin user」文案。
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 1800.0,
+        max_entries: int = 512,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._max_entries = max_entries
+        self._clock = clock
+        self._entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
+
+    def remember(self, *, message_id: str, identifier: str) -> None:
+        """管理卡发送成功后登记一条映射。``message_id``/``identifier`` 任一为空
+        都不登记——空 ``message_id`` 无法在回调时被查到，空 ``identifier``
+        登记了也没有意义（回调侧本来就是靠它非空才判定"命中"，见调用方
+        ``apps/gateway/__init__.py`` 的查表姿态）。"""
+
+        if not message_id or not identifier:
+            return
+        expires_at = self._clock() + self._ttl_seconds
+        # 先删后插：同一个 message_id 重复登记（理论上不会发生——每次
+        # `/admin user` 都会建一张新卡、拿到新的 message_id）时把它移到队尾，
+        # 保持"最早写入的排最前面、最先被逐出"这条不变量。
+        self._entries.pop(message_id, None)
+        self._entries[message_id] = (identifier, expires_at)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def lookup(self, *, message_id: str) -> str | None:
+        """回调侧按 ``message_id`` 查回 ``identifier``；未登记、已过期都返回
+        ``None``，不抛异常——调用方把 ``None`` 与"从未登记过"同等对待。"""
+
+        if not message_id:
+            return None
+        entry = self._entries.get(message_id)
+        if entry is None:
+            return None
+        identifier, expires_at = entry
+        if self._clock() >= expires_at:
+            del self._entries[message_id]
+            return None
+        return identifier
+
+
 class ManagementCardDispatcher:
     """把 ``/admin user`` 查到的用户权限管理卡（#439 B 档）渲染并发到发起管理员
     本人私聊，作为触发这条查询命令的消息的回复。
@@ -180,11 +266,16 @@ class ManagementCardDispatcher:
         catalog: CompanyMetricCatalog,
         audit: AuditSink,
         display_names: AdminDisplayNames,
+        context_store: ManagementCardContextStore | None = None,
     ) -> None:
         self._transport = transport
         self._catalog = catalog
         self._audit = audit
         self._display_names = display_names
+        # 发送侧登记上下文（Trace #469 B-1）：``None``（既有调用点、未升级的
+        # 测试）时行为与本参数加入之前逐字节一致——不登记任何映射，回调侧
+        # ``identifier`` 缺失时维持既有「请重新查询 /admin user」拒绝路径。
+        self._context_store = context_store
 
     def send(
         self,
@@ -202,7 +293,7 @@ class ManagementCardDispatcher:
             display_names=self._display_names,
         )
         try:
-            self._transport.create(
+            created = self._transport.create(
                 chat_id=chat_id,
                 thread_id=thread_id,
                 reply_to_message_id=reply_to_message_id,
@@ -227,4 +318,11 @@ class ManagementCardDispatcher:
                     error=type(error).__name__,
                 )
             return ManagementCardDispatchResult(delivered=False)
+        if self._context_store is not None:
+            # 只在真正发出去之后登记（Trace #469 B-1）：发送失败/结果不明的
+            # 分支已经在上面 return，不会走到这里——没有实际送达的卡片就没有
+            # "这条 message_id 对应哪次查询"这件事可以登记。
+            self._context_store.remember(
+                message_id=created.message_id, identifier=display_identifier
+            )
         return ManagementCardDispatchResult(delivered=True)

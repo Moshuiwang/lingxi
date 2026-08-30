@@ -909,6 +909,181 @@ class ManagementCardDispatchTests(unittest.TestCase):
         self.assertEqual(result, {"toast": {"type": "error", "content": "操作不存在或已失效"}})
 
 
+class ManagementCardContextRecoveryTests(unittest.TestCase):
+    """Trace #469 修复包 B，B-1：``action.value`` 整体缺失（真实点击已实测的
+    第三种形态，前两种见 ``ManagementCardDispatchTests``）时，用发送侧登记的
+    ``message_id -> identifier`` 映射补回 identifier，不再一律落进
+    ``handle_management_form_submit`` 的「未识别到目标用户标识」拒绝路径。"""
+
+    @staticmethod
+    def _missing_value_event(*, message_id: str = "om_card_1") -> dict:
+        return {
+            "header": {"event_id": "evt_missing_value_1", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_admin"},
+                "action": {
+                    "tag": "form",
+                    "name": "grant_submit",
+                    "form_value": {
+                        "company_id": "1011",
+                        "metric_name": "sub_new_count",
+                        "reason": "特批",
+                    },
+                },
+                "context": {"open_chat_id": "oc_admin_dm", "open_message_id": message_id},
+            },
+        }
+
+    def test_missing_value_with_context_hit_recovers_identifier(self) -> None:
+        from lingxi.apps.gateway import make_event_handler
+        from lingxi.core.admin.card_dispatch import ManagementCardContextStore
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        store = ManagementCardContextStore()
+        store.remember(message_id="om_card_1", identifier="u@example.invalid")
+
+        handler = make_event_handler(
+            ExplodingPipeline(),
+            audit=Audit(),
+            card_callback_handler=FakeCardCallbackHandler(),
+            management_card_context_store=store,
+        )
+
+        handler(self._missing_value_event(message_id="om_card_1"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["identifier"], "u@example.invalid")
+
+    def test_missing_value_with_context_miss_keeps_existing_rejection_path(self) -> None:
+        """映射未命中（从未登记过这个 message_id）：identifier 仍是空串，与
+        本修复之前完全一致——不猜测、不伪造。"""
+
+        from lingxi.apps.gateway import make_event_handler
+        from lingxi.core.admin.card_dispatch import ManagementCardContextStore
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        store = ManagementCardContextStore()  # 未登记任何 message_id
+
+        handler = make_event_handler(
+            ExplodingPipeline(),
+            audit=Audit(),
+            card_callback_handler=FakeCardCallbackHandler(),
+            management_card_context_store=store,
+        )
+
+        handler(self._missing_value_event(message_id="om_card_never_sent"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["identifier"], "")
+
+    def test_expired_entry_keeps_existing_rejection_path(self) -> None:
+        """TTL 过期：与"从未登记过"得到同一个结论（空串），不额外区分。"""
+
+        from lingxi.apps.gateway import make_event_handler
+        from lingxi.core.admin.card_dispatch import ManagementCardContextStore
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        clock = [0.0]
+        store = ManagementCardContextStore(ttl_seconds=1800.0, clock=lambda: clock[0])
+        store.remember(message_id="om_card_1", identifier="u@example.invalid")
+        clock[0] = 1800.0  # 恰好到期
+
+        handler = make_event_handler(
+            ExplodingPipeline(),
+            audit=Audit(),
+            card_callback_handler=FakeCardCallbackHandler(),
+            management_card_context_store=store,
+        )
+
+        handler(self._missing_value_event(message_id="om_card_1"))
+
+        self.assertEqual(calls[0]["identifier"], "")
+
+    def test_capacity_eviction_keeps_existing_rejection_path(self) -> None:
+        """容量上限逐出后查不到，与其余未命中情形同一结论。**变异验红要点**：
+        若把 ``make_event_handler`` 里的查表调用去掉（例如恒使用
+        ``action_value`` 里已经确定为空的 identifier，不再尝试查
+        ``management_card_context_store``），本用例与上面两个"未命中"用例
+        全部照样通过（因为它们的期望本来就是空串）——真正能证伪"去掉查表"
+        这个变异的是 ``test_missing_value_with_context_hit_recovers_identifier``
+        那一条"命中"用例，本用例只覆盖"逐出确实生效"这条独立事实。"""
+
+        from lingxi.apps.gateway import make_event_handler
+        from lingxi.core.admin.card_dispatch import ManagementCardContextStore
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        store = ManagementCardContextStore(max_entries=1)
+        store.remember(message_id="om_card_evicted", identifier="u@example.invalid")
+        store.remember(message_id="om_card_other", identifier="someone-else@example.invalid")
+
+        handler = make_event_handler(
+            ExplodingPipeline(),
+            audit=Audit(),
+            card_callback_handler=FakeCardCallbackHandler(),
+            management_card_context_store=store,
+        )
+
+        handler(self._missing_value_event(message_id="om_card_evicted"))
+
+        self.assertEqual(calls[0]["identifier"], "")
+
+
 class AckReportingTests(unittest.TestCase):
     """派发结果必须回报给传输层，SDK 才知道该向飞书回 OK 还是 500。"""
 

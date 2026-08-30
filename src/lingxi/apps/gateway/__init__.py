@@ -278,6 +278,7 @@ def make_event_handler(
     on_parse_error: Callable[[str], None] | None = None,
     card_callback_handler: Any = None,
     group_mention_hint: Any = None,
+    management_card_context_store: Any = None,
 ) -> Callable[[dict], dict | None]:
     """把原始事件体接到管线上。
 
@@ -333,6 +334,22 @@ def make_event_handler(
       action 维持既有兜底行为——落到下面 ``decision``/``pending_action_id``
       这条既有分支，读不到有效 ``decision`` 时由 ``handle()`` 自己的
       ``unknown_decision`` 分支拒绝，与本次改动之前完全一致。
+
+    **表单提交 ``identifier`` 缺失时的发送侧登记恢复（Trace #469 修复包 B，
+    B-1）**：按钮名兜底解决了"识别出这是哪一个提交按钮"，但没有解决
+    ``action.value`` 整体缺失时 ``identifier`` 本身也一起丢失的问题——这时
+    ``action_event.action_value`` 是空字典，``.get("identifier", "")`` 恒为
+    空串。``management_card_context_store``（可选，未传入时行为与本参数加入
+    之前逐字节一致）是发送管理卡时登记的 ``message_id -> identifier`` 内存
+    TTL 映射（见 ``core/admin/card_dispatch.ManagementCardContextStore``
+    模块文档）：``identifier`` 为空且这个参数不是 ``None`` 时，用
+    ``_management_card_context`` 已经取出的 ``message_id``（回调事件体
+    ``context.open_message_id``，与建卡成功后 ``ManagementCardCreated.
+    message_id`` 是同一个值——这条消息正是管理卡自己）去查表补回；查不到
+    （未登记/已过期/已被逐出容量上限）时 ``identifier`` 仍是空串，交给
+    ``handle_management_form_submit`` 自己既有的必填校验给出「请重新查询
+    /admin user」——此时这句指引恰好是准确操作。逐行「撤销」按钮不受影响：
+    ``override_id`` 走的是另一个字段，不经过这个恢复路径。
     """
 
     def handle(payload: dict) -> dict | None:
@@ -377,10 +394,18 @@ def make_event_handler(
                 )
             if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
                 chat_id, message_id = _management_card_context(payload)
+                identifier = action_event.action_value.get("identifier", "")
+                if not identifier and management_card_context_store is not None:
+                    # 发送侧登记恢复（Trace #469 B-1，见本函数文档该节）：
+                    # value 缺失形态下 identifier 唯一的另一个来源。查不到
+                    # 时 identifier 维持空串，交给下游既有必填校验拒绝。
+                    identifier = (
+                        management_card_context_store.lookup(message_id=message_id) or ""
+                    )
                 return card_callback_handler.handle_management_form_submit(
                     operator_open_id=action_event.operator_open_id,
                     admin_action=admin_action,
-                    identifier=action_event.action_value.get("identifier", ""),
+                    identifier=identifier,
                     company_id=action_event.form_value.get("company_id", ""),
                     metric_name=action_event.form_value.get("metric_name", ""),
                     reason=action_event.form_value.get("reason", ""),
@@ -495,7 +520,11 @@ def build_supervisor(
         PermissionRecomputeAdapter,
     )
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
-    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher, ManagementCardDispatcher
+    from lingxi.core.admin.card_dispatch import (
+        ConfirmCardDispatcher,
+        ManagementCardContextStore,
+        ManagementCardDispatcher,
+    )
     from lingxi.core.admin.router import AdminCommandRouter
     from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
@@ -562,11 +591,17 @@ def build_supervisor(
     # 实例（同上 `confirm_card_dispatcher` 的取舍，两者生命周期相同、都随本次
     # 装配一起建立）；发送失败只降级（`ManagementCardDispatcher` 自己的姿态，
     # 见该类文档），不影响 `/admin user` 既有的文本回复这条主路径。
+    # 表单提交 identifier 缺失形态下的发送侧登记（Trace #469 B-1）：单实例
+    # 进程内内存 TTL 映射，与 management_card_dispatcher 生命周期相同、
+    # 装配层的同一个实例同时喂给发送侧（登记）与 make_event_handler（查询），
+    # 见 core/admin/card_dispatch.ManagementCardContextStore 模块文档。
+    management_card_context_store = ManagementCardContextStore()
     management_card_dispatcher = ManagementCardDispatcher(
         transport=LarkAdminManagementCardTransport(client),
         catalog=TomlCompanyMetricCatalog(),
         audit=audit,
         display_names=admin_display_names,
+        context_store=management_card_context_store,
     )
     admin_router = AdminCommandRouter(
         registry=admin_registry_lookup,
@@ -695,6 +730,7 @@ def build_supervisor(
             audit=audit,
             card_callback_handler=card_callback_handler,
             group_mention_hint=group_mention_hint,
+            management_card_context_store=management_card_context_store,
         ),
         backoff=BackoffPolicy(
             base_seconds=config.reconnect_base_seconds,
