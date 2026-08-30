@@ -1,6 +1,6 @@
 # Trace 执行载体（docs/traces/）
 
-长期执行计划（Execution Trace）的**合同与执行状态**以本目录下受版本控制的文件为唯一正文；对应的 GitHub `[tracking]` Issue 降级为瘦指针与产品负责人裁定界面。方法论正文仍在 GitHub [#147](https://github.com/Moshuiwang/lingxi/issues/147)；本目录只承载按该方法生成的具体 Trace。
+长期执行计划（Execution Trace）的**合同与执行状态**以本目录下受版本控制的文件为唯一正文；对应的 GitHub `[tracking]` Issue 降级为瘦指针与产品负责人裁定界面。方法论正文仍在 GitHub [#147](https://github.com/Moshuiwang/lingxi/issues/147)；Codex 与 Claude Code 共用 [Lingxi Trace 执行适配](../../.agents/skills/lingxi-trace/SKILL.md)，本目录只承载按该方法生成的具体 Trace。
 
 ## 准入
 
@@ -19,3 +19,4 @@
 - `[tracking]` Issue 正文 = 瘦指针：目标一句话 + 三件套链接 + 当前阶段一行 + 原正文折叠留档。
 - 产品负责人裁定评论、编排者交接评论、批次收口评论**仍发在该 Issue**；收口评论附任务表更新 commit 链接。
 - 缺陷、工作项、决策留痕照常走各自 Issue；产品事实照常写 `docs/` 正文。
+- Trace 只记录职责与当前运行映射：Codex 用新顶层 Task、Claude Code 用 tmux 命名会话。两种适配器共用同一三件套、Step ID、证据和 GitHub 留痕，禁止维护两套合同。

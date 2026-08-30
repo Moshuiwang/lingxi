@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lingxi Trace"
+  short_description: "Plan and orchestrate strict Lingxi Execution Traces"
+  default_prompt: "Use $lingxi-trace to plan or orchestrate this approved Lingxi Execution Trace with the recorded role and handoff contract."
