@@ -487,15 +487,22 @@ def build_supervisor(
     # 裁定，首次开通编排住在 scheduler）。两个模块名对同一个只读查询各自的取舍
     # 见 `adapters/delegated_subject_lookup.py` 模块文档。
     from lingxi.adapters.delegated_subject_lookup import registered_delegated_subject_open_id
-    from lingxi.adapters.feishu_admin_card import LarkAdminCardTransport
+    from lingxi.adapters.feishu_admin_card import (
+        LarkAdminCardTransport,
+        LarkAdminManagementCardTransport,
+        TomlCompanyMetricCatalog,
+    )
     from lingxi.adapters.feishu_group_message import FeishuGroupMessages
     from lingxi.adapters.feishu_longconn import LarkEventTransport
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
-    from lingxi.adapters.postgres_permission_recompute_trigger import PermissionRecomputeAdapter
+    from lingxi.adapters.postgres_permission_recompute_trigger import (
+        BackgroundPermissionRecomputeTrigger,
+        PermissionRecomputeAdapter,
+    )
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
-    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
+    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher, ManagementCardDispatcher
     from lingxi.core.admin.router import AdminCommandRouter
     from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
@@ -542,6 +549,20 @@ def build_supervisor(
     confirm_card_dispatcher = ConfirmCardDispatcher(
         transport=admin_card_transport, tracker=pending_action_store, audit=audit
     )
+    # 用户权限管理卡发送侧（#439 B 档，Trace #445 opus 审查坐实并修复）：此前
+    # 只有渲染层（`core/admin/management_card.render_management_card`）接进
+    # `AdminCommandRouter`，从未有任何调用点真正装配 `ManagementCardDispatcher`/
+    # 发送 transport——`management_cards` 恒为 ``None``，`/admin user` 的管理卡
+    # 因此结构上从未真正发出过（`AdminCommandRouter._send_management_card` 对
+    # ``None`` 直接短路返回，见该方法文档）。与确认卡片共用同一个 SDK 客户端
+    # 实例（同上 `confirm_card_dispatcher` 的取舍，两者生命周期相同、都随本次
+    # 装配一起建立）；发送失败只降级（`ManagementCardDispatcher` 自己的姿态，
+    # 见该类文档），不影响 `/admin user` 既有的文本回复这条主路径。
+    management_card_dispatcher = ManagementCardDispatcher(
+        transport=LarkAdminManagementCardTransport(client),
+        catalog=TomlCompanyMetricCatalog(),
+        audit=audit,
+    )
     admin_router = AdminCommandRouter(
         registry=admin_registry_lookup,
         queries=PostgresAdminQueries(
@@ -550,6 +571,7 @@ def build_supervisor(
         audit=audit,
         pending_actions=pending_action_store,
         confirm_cards=confirm_card_dispatcher,
+        management_cards=management_card_dispatcher,
     )
     # 管理群脱敏通知（Issue #96 S-M-02）：``admin_group_chat_id`` 未配置时——与既有
     # `admin_group_chat_id: str | None = None` 的既定取舍相同——这是"一个尚未接线
@@ -584,8 +606,17 @@ def build_supervisor(
         # 定向权限重算（Issue #438）：无条件装配，不受任何前置配置控制——它内部
         # 的每一个依赖都只需要 gateway 本来就有的 Postgres DSN 与随包发布的静态
         # 映射文件（见该适配器模块文档），失败降级回每日批,不影响确认结果本身。
-        recompute_trigger=PermissionRecomputeAdapter(
-            str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
+        # **不直接注入 `PermissionRecomputeAdapter`**（Trace #445 opus 审查坐实
+        # 并修复）：它的 `.trigger()` 有五到六次网络往返，同步调用会让回调应答
+        # 等它跑完——包一层 `BackgroundPermissionRecomputeTrigger`，`trigger()`
+        # 只入队立即返回，真正的重算在后台单线程里串行执行，失败仍走同一个
+        # `admin.card_callback.recompute_trigger_failed` 审计姿态（见该适配器
+        # 模块文档「BackgroundPermissionRecomputeTrigger」一节）。
+        recompute_trigger=BackgroundPermissionRecomputeTrigger(
+            PermissionRecomputeAdapter(
+                str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
+            ),
+            audit=audit,
         ),
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
