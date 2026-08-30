@@ -96,7 +96,6 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
   撤权语义不变，:meth:`_revoke` 一个字节都不改，撤权侧的两条既有边界（只对发布链上
   留过足迹的人发、聚合层判定无可用权限）继续生效。
 
-
 **存档不全时不查本地覆盖，直接撤权**：撤权行与发布行都需要 ``email``/``display_name``，
 任何合并结果都救不了一个存档不全的人，提前判掉省一次读放大，也与 :meth:`_revoke` 自己
 "完整性检查在查发布足迹之前短路"的既有观测行为逐字节一致（见 :meth:`_refresh_zero_
