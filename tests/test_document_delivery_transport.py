@@ -1660,12 +1660,21 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
 
     @staticmethod
     def _convert_response() -> dict[str, Any]:
+        # Issue #442：真实响应形状——每个块携带只读 block_id，真实顺序由
+        # first_level_block_ids 给出（本夹具只有一个块，顺序无歧义，但形状要
+        # 与探针实测对齐，否则会被 convert_markdown_to_blocks 的防御性拒绝
+        # 判定为 first_level_block_ids 缺失）。
         return {
             "code": 0,
             "data": {
                 "blocks": [
-                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "转换后正文"}}]}}
-                ]
+                    {
+                        "block_id": "blk-converted-1",
+                        "block_type": 2,
+                        "text": {"elements": [{"text_run": {"content": "转换后正文"}}]},
+                    }
+                ],
+                "first_level_block_ids": ["blk-converted-1"],
             },
         }
 
@@ -1745,7 +1754,11 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
         self.assertEqual(
             write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
         )
-        self.assertEqual(write_body["children"], self._convert_response()["data"]["blocks"])
+        # 写入端点收到的必须是剔除只读 block_id 后的块，不是转换响应原样。
+        self.assertEqual(
+            write_body["children"],
+            [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "转换后正文"}}]}}],
+        )
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertEqual(store.failed, [])
 
