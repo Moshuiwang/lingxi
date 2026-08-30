@@ -83,19 +83,20 @@ JSON 解析失败）由默认传输 :func:`urllib_transport` 分类为
 ``data.items``（同 ``read_members`` 现有形状口径）。补探针前，这条判据只有
 L1（代码 + 假传输层测试）证据，不是 L4a。
 
-## markdown 官方转换开关（Issue #408，默认关闭）
+## markdown 官方转换开关（Issue #408；Issue #467／rc22 S-4 起代码默认开启）
 
 正文交付此前把模型产出的 markdown 逐字符剥离成纯文本段落写入（``core.execution.
 document_delivery.normalize_markdown``），代价是正文里的连字符会被一并吃掉——
 「周环比 -12.85%」被剥成「周环比 12.85%」，负号丢失，属于数据正确性缺陷。产品
 负责人 2026-08-29 裁定分两步修：立即停止字符剥离（小修，`core` 侧已完成，见该
-模块），正式排版走飞书官方转换接口——本节是正式方案在本模块的落点，**默认
-关闭**。管线接线（迁移 0079 持久化原始 markdown、gateway 配置读取
-``LINGXI_DOCX_MARKDOWN_CONVERT``）已随本批完成，见
-``apps/gateway/document_delivery.py`` 模块文档「markdown 官方转换路径的接线」
-一节与 ``apps/gateway/config.py``——开关默认值仍是 ``False``，接线本身不改变
-现网行为，只是把"开关打开后会发生什么"从"能力已就绪但够不到"变成"配置一个
-环境变量即可生效"。
+模块），正式排版走飞书官方转换接口——本节是正式方案在本模块的落点。管线接线
+（迁移 0079 持久化原始 markdown、gateway 配置读取
+``LINGXI_DOCX_MARKDOWN_CONVERT``）随 Issue #408 批次完成时开关默认关闭，接线
+本身不改变现网行为；rc21 stage 探针（Issue #442）验证转换路径可用后，Issue
+#467／rc22 S-4 把 ``apps/gateway/config.py`` 的默认值翻转为**代码默认开启**，
+未配置该环境变量即等价于开启，显式关闭改用精确值 ``"0"``，翻转前唯一的开启值
+``"1"`` 继续解析成开启（既有 stage 配置零迁移成本），完整语义见
+``apps/gateway/config.py::_markdown_convert_enabled``。
 
 - :meth:`LarkDocxDelivery.convert_markdown_to_blocks`：``POST /docx/v1/documents/
   blocks/convert``（``content_type=markdown``），把一段 markdown 转换成飞书官方
@@ -162,9 +163,10 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   取舍的代价是超长 markdown 无法交付带格式的文档——本模块认为"明确拒绝"优于
   "悄悄改变幂等语义"，是否需要为超限场景另设计分批状态机留给未来 Story。
 - :meth:`LarkDocxDelivery.write_body`：写正文的唯一装配入口，把「开关」变成
-  实际可执行的分支——``markdown_convert_enabled=False``（构造函数默认值，即
-  本 Story 交付后的零行为变化状态）时逐字调用 :meth:`write_paragraphs`；为
-  ``True`` 时改走 :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
+  实际可执行的分支——``markdown_convert_enabled=False``（构造函数自身的参数
+  默认值；真正生效的值由装配层 ``apps/gateway/config.py`` 显式传入，见下一条）
+  时逐字调用 :meth:`write_paragraphs`；为 ``True`` 时改走
+  :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
   开关打开时任何一步失败（业务错误码、结果不明、超过 block 数上限）都直接向
   上抛出，**绝不捕获后静默退回纯文本段落路径**——静默降级会制造"用户以为拿到
   了带格式的文档，实际收到的是转换失败前的另一种内容"这种更难排查的假象，
@@ -173,8 +175,9 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   「三、横切约定」](../../../../docs/技术设计/代码框架.md)的硬性约束），
   ``markdown_convert_enabled`` 是构造函数参数——真正的环境变量
   ``LINGXI_DOCX_MARKDOWN_CONVERT`` 由装配层 ``apps/gateway/config.py`` 读取后
-  作为普通布尔值传进来（默认关，非空且不精确等于 ``"1"`` 时启动即失败，与
-  ``apps/worker/config.py`` 既有开关同一姿态）。**接线已完成**（迁移 0079、
+  作为普通布尔值传进来（Issue #467／rc22 S-4 起代码默认开启：未配置或精确值
+  ``"1"``＝开启，精确值 ``"0"``＝显式关闭，其余值启动即失败，与
+  ``apps/worker/config.py`` 既有开关同一「错配失败关闭」姿态）。**接线已完成**（迁移 0079、
   Issue #408 正式方案接线批次）：``task_document_delivery_request`` 新增可空
   ``markdown`` 列持久化原始 markdown 全文，``apps/gateway/document_delivery.py``
   的 :meth:`DocumentDeliveryConsumer._process_docx_claim` 按这一列是否非
@@ -477,9 +480,9 @@ class LarkDocxDelivery:
 
     def convert_markdown_to_blocks(self, markdown: str) -> list[dict[str, Any]]:
         """把一段 markdown 转换成飞书官方 block 结构、按文档真实顺序排好
-        （Issue #408 正式方案，默认关闭——见 :meth:`write_body` 与模块文档
-        「markdown 官方转换开关」一节；重排与防御性拒绝的完整理由见该节
-        Issue #442 更新的段落）。
+        （Issue #408 正式方案，Issue #467／rc22 S-4 起代码默认开启——见
+        :meth:`write_body` 与模块文档「markdown 官方转换开关」一节；重排与
+        防御性拒绝的完整理由见该节 Issue #442 更新的段落）。
 
         ``POST /docx/v1/documents/blocks/convert``，请求体 ``{"content_type":
         "markdown", "content": markdown}``。这个端点只做转换、不写入任何文档，
