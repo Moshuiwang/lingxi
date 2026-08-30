@@ -1134,7 +1134,10 @@ class AutoOnboardingRunner:
         """
 
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy={}, local=local)
+        # `full_access_wildcard` 现在是必填关键字参数（Trace #445 结构性防复发：
+        # 默认值曾是一次真实漏接的根因）——这条分支 `galaxy` 恒为空字典，取值
+        # 对结果没有作用面，仍必须显式传参。
+        merged = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
         for reason in merged.skipped_reasons:  # 通配角 v1 结构上不会出现（galaxy 恒为空）
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
         if merged.permissions:

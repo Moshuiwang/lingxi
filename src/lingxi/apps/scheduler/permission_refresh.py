@@ -931,7 +931,10 @@ class PermissionRefreshDuty:
             tally.count(SKIP_LOCAL_OVERRIDE_READ_FAILED)
             return
 
-        merged = merge_permission_sources(galaxy={}, local=local)
+        # `full_access_wildcard` 现在是必填关键字参数（Trace #445 结构性防复发：
+        # 默认值曾是一次真实漏接的根因）——这条分支 `galaxy` 恒为空字典，不含
+        # `ALL_COMPANIES_KEY`，取值对结果没有作用面，仍必须显式传参。
+        merged = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
         for reason in merged.skipped_reasons:
             # 通配角 v1 结构上不会在这条分支出现（`galaxy` 恒为空字典，不含
             # `ALL_COMPANIES_KEY`），保留同一姿态只是让两条分支的代码形状一致。
