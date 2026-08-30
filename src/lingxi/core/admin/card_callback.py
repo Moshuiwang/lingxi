@@ -135,6 +135,20 @@ class AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 
 
+class PermissionRecomputeTrigger(Protocol):
+    """确认执行成功后，对目标用户即时触发一次定向权限重算/发布的端口（Issue
+    #438）。真实实现见
+    ``adapters/postgres_permission_recompute_trigger.PermissionRecomputeAdapter``；
+    它自己决定"这个 ``PendingAction`` 该按哪种方式重算"（停用走清空、其余四类
+    走完整合并管线），``card_callback.py`` 不需要、也不应该知道这些细节——本类
+    只负责"确认执行成功了，在恰当的时刻调用它一次，失败了就记审计"，业务规则
+    全部留在权限模块（代码框架第二节：``core/admin`` 与 ``core/permission`` 是
+    两个平级领域模块，互不下沉对方的规则）。
+    """
+
+    def trigger(self, pending: PendingAction) -> None: ...
+
+
 class AdminCardCallbackHandler:
     """``card.action.trigger`` 事件的唯一处理入口。见模块文档。"""
 
@@ -146,12 +160,17 @@ class AdminCardCallbackHandler:
         group_notifier: GroupNotifier | None,
         group_chat_id: str | None,
         audit: AuditSink,
+        recompute_trigger: PermissionRecomputeTrigger | None = None,
     ) -> None:
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
         self._group_notifier = group_notifier
         self._group_chat_id = group_chat_id
         self._audit = audit
+        # 定向权限重算触发口（Issue #438）：``None`` 表示装配层还没接（与
+        # ``group_notifier=None`` 同一姿态）——不报错、不重试，即时生效这一层
+        # 纵深缺席时，每日批仍是保底,行为退回本卡之前的既有状态。
+        self._recompute_trigger = recompute_trigger
 
     def handle(
         self, *, operator_open_id: str, pending_action_id: str, decision: str, trace_id: str
@@ -271,6 +290,14 @@ class AdminCardCallbackHandler:
         if outcome.decision.terminal_status is not None:
             self._notify_group(pending)
 
+        # 定向权限重算（Issue #438）：只在这次点击**首次**让操作真正执行成功时
+        # 触发，与群通知同一去重判据（幂等重放/未改变任何状态的拒绝都不重复
+        # 触发）；额外要求 ``status is EXECUTED``——``CANCELLED``/``EXPIRED``/
+        # ``FAILED`` 都不该让任何用户的发布内容发生变化。best-effort：失败只
+        # 记审计,不影响已经落库的确认结果（模块文档「载体 #96」同一姿态）。
+        if outcome.decision.terminal_status is not None and pending.status is PendingActionStatus.EXECUTED:
+            self._trigger_recompute(pending)
+
         if pending.status is PendingActionStatus.PENDING:
             # 到这里仍是 pending 的唯一分支是点击人不是发起人——其余分支都会让
             # pending_action 落进某个终态（见 decide_confirm/decide_cancel）。
@@ -315,6 +342,18 @@ class AdminCardCallbackHandler:
             )
         return card_payload
 
+    def _trigger_recompute(self, pending: PendingAction) -> None:
+        if self._recompute_trigger is None:
+            return
+        try:
+            self._recompute_trigger.trigger(pending)
+        except Exception as error:  # noqa: BLE001 - 失败降级回每日批，不影响已经落库的确认结果
+            self._audit.record(
+                "admin.card_callback.recompute_trigger_failed",
+                pending_action_id=pending.id,
+                error=type(error).__name__,
+            )
+
     def _notify_group(self, pending: PendingAction) -> None:
         if self._group_notifier is None or not self._group_chat_id:
             return
@@ -344,7 +383,11 @@ def _toast_error(content: str) -> dict[str, Any]:
 
 def _outcome_text(pending: PendingAction) -> str:
     if pending.status is PendingActionStatus.EXECUTED:
-        return "已确认执行"
+        # Issue #438：管理员看到的回执补一句"已触发生效"，对应
+        # ``_trigger_recompute`` 这次点击是否尝试了定向重算——**不**依赖那次
+        # 触发本身是不是真的成功：即便它失败/降级，也已经在响亮审计里留痕，
+        # 每日批仍是保底,不需要让发起人从这句回执里读出内部重算的实时结果。
+        return "已确认执行，权限变更将即时生效"
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

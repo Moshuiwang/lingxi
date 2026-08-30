@@ -817,6 +817,168 @@ class SameTargetInFlightExclusionRealDbTests(PendingActionPostgresTestCase):
         self.assertEqual(rows[0][0], 1)
 
 
+class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
+    """Trace #445 卡 #437：懒清扫兜底修复 2026-08-30 真实运维事故——过期未点的
+    ``pending`` 行永久占坑，新命令被无限期拦住。覆盖：过期行被原地翻转、放行
+    新操作；未过期行不受影响、继续拦截且拒绝文案携带在途操作摘要与自助指引；
+    懒清扫不区分被卡住那一行的 ``action_type``；真实并发下恰好翻转一次、恰好
+    产生一条新的在途行。"""
+
+    def _expire_pending_row(self, pending_id: str) -> None:
+        self.execute(
+            "UPDATE pending_action SET confirm_deadline_at = now() - interval '1 second'"
+            " WHERE id = %s",
+            (pending_id,),
+        )
+
+    def test_expired_pending_row_is_flipped_and_the_new_prepare_succeeds(self) -> None:
+        self.add_target_user(account_state="enabled")
+        stale_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self._expire_pending_row(stale_id)
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertTrue(outcome.decision.ok, outcome.decision.message)
+        assert outcome.pending is not None
+        self.assertNotEqual(outcome.pending.id, stale_id, "必须是新插入的一行，不是复用旧行")
+
+        stale_row = self.query(
+            "SELECT status, reason, decided_by_open_id FROM pending_action WHERE id = %s",
+            (stale_id,),
+        )[0]
+        self.assertEqual(stale_row[0], "expired")
+        self.assertEqual(stale_row[1], "expired")
+        self.assertIsNone(stale_row[2], "系统按时钟自动翻转，不是任何管理员做出的决定")
+
+        pending_rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s AND status = 'pending'",
+            (TARGET_OPEN_ID,),
+        )
+        self.assertEqual(pending_rows[0][0], 1, "该目标此刻只应有新插入的这一条在途行")
+
+    def test_not_yet_expired_pending_row_is_left_untouched_and_still_blocks(self) -> None:
+        self.add_target_user(account_state="enabled")
+        active_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertFalse(outcome.decision.ok)
+        self.assertEqual(outcome.decision.code, TARGET_HAS_PENDING_ACTION_CODE)
+        active_row = self.query(
+            "SELECT status, decided_at FROM pending_action WHERE id = %s", (active_id,)
+        )[0]
+        self.assertEqual(active_row[0], "pending", "未过期的行绝不能被懒清扫误翻")
+        self.assertIsNone(active_row[1])
+
+    def test_rejection_message_includes_action_summary_and_self_help_guidance(self) -> None:
+        self.add_target_user(account_state="enabled")
+        self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertFalse(outcome.decision.ok)
+        message = outcome.decision.message
+        self.assertIn("停用用户", message, "摘要须点名在途的是哪一类动作")
+        self.assertIn("北京时间", message, "摘要须带发起/截止的绝对时间")
+        self.assertIn("自动释放", message, "须提示过期会自动释放")
+        self.assertIn("确认执行", message, "须提示未过期时如何自助处理旧卡")
+
+    def test_sweep_flips_regardless_of_the_blocking_rows_own_action_type(self) -> None:
+        """同一唯一索引不区分 ``action_type``（``SameTargetInFlightExclusionRealDb
+        Tests`` 已经证明"拦截"这一半是泛化的），懒清扫这一半同样泛化：一条早已
+        过期的本地权限授权在途行，同样会被一次 suspend ``prepare()`` 原地翻转
+        放行，不需要按 ``action_type`` 分别处理。"""
+
+        self.add_target_user(account_state="enabled")
+        stale_id = new_id("pac")
+        self.execute(
+            """INSERT INTO pending_action
+                   (id, action_type, target_open_id, target_state_snapshot,
+                    initiated_by_open_id, card_delivered, confirm_deadline_at, payload)
+                 VALUES (%s, 'local_permission_grant', %s, 'absent', %s, TRUE,
+                         now() - interval '1 second',
+                         '{"company_id": "1011", "metric_name": "daily_active", "reason": "特批"}')""",
+            (stale_id, TARGET_OPEN_ID, ADMIN_OPEN_ID),
+        )
+
+        outcome = self.store.prepare(
+            action_type=PendingActionType.SUSPEND_USER,
+            target_open_id=TARGET_OPEN_ID,
+            initiated_by_open_id=ADMIN_OPEN_ID,
+        )
+
+        self.assertTrue(outcome.decision.ok, outcome.decision.message)
+        stale_status = self.query(
+            "SELECT status FROM pending_action WHERE id = %s", (stale_id,)
+        )[0][0]
+        self.assertEqual(stale_status, "expired")
+
+    def test_two_concurrent_prepares_against_an_expired_row_only_one_creates_a_new_pending_row(
+        self,
+    ) -> None:
+        """真实并发用例：两个线程各自独立数据库连接，几乎同时对同一个已过期目标
+        发起 ``prepare()``——懒清扫 UPDATE 与迁移 ``0068`` 的唯一索引必须共同
+        保证：旧行恰好翻转一次，恰好一条新的在途行产生，不重复翻转、不产生两条
+        并存的 pending 行。"""
+
+        self.add_target_user(account_state="enabled")
+        stale_id = self.prepare_and_deliver(action_type=PendingActionType.SUSPEND_USER)
+        self._expire_pending_row(stale_id)
+
+        barrier = threading.Barrier(2)
+        results: list[object] = [None, None]
+        errors: list[BaseException] = []
+
+        def prepare_from_thread(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                # 每个线程用自己的 store/连接——真正要证明的序列化来自数据库行锁，
+                # 不是共享的应用层状态（与 DuplicateAndConcurrentConfirmTests 的
+                # 真实并发用例同一姿态）。
+                thread_audit = _RecordingAudit()
+                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit)
+                results[index] = thread_store.prepare(
+                    action_type=PendingActionType.SUSPEND_USER,
+                    target_open_id=TARGET_OPEN_ID,
+                    initiated_by_open_id=ADMIN_OPEN_ID,
+                )
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                errors.append(error)
+
+        threads = [threading.Thread(target=prepare_from_thread, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(errors, [], f"并发 prepare 不应抛出未预期的异常：{errors}")
+        outcomes = [result.decision.ok for result in results]
+        self.assertEqual(
+            sorted(outcomes), [False, True], "恰好一个线程成功创建新的在途操作，另一个被拒绝"
+        )
+        stale_status = self.query(
+            "SELECT status FROM pending_action WHERE id = %s", (stale_id,)
+        )[0][0]
+        self.assertEqual(stale_status, "expired", "旧行只应被翻转一次，落到 expired 终态")
+        pending_rows = self.query(
+            "SELECT count(*) FROM pending_action WHERE target_open_id = %s AND status = 'pending'",
+            (TARGET_OPEN_ID,),
+        )
+        self.assertEqual(pending_rows[0][0], 1, "恰好一条新的在途行，不多不少")
+
+
 class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
     """停用「感知即清」的接入（Issue #304 批次 4）：``suspend_user`` 确认执行时，
     在 ``confirm()`` 自己的同一个数据库事务里为该用户排队全部会话保留正文的

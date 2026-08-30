@@ -383,6 +383,7 @@ def build_supervisor(
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
+    from lingxi.adapters.postgres_permission_recompute_trigger import PermissionRecomputeAdapter
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
     from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
     from lingxi.core.admin.router import AdminCommandRouter
@@ -463,6 +464,12 @@ def build_supervisor(
         group_notifier=group_notifier,
         group_chat_id=config.admin_group_chat_id,
         audit=audit,
+        # 定向权限重算（Issue #438）：无条件装配，不受任何前置配置控制——它内部
+        # 的每一个依赖都只需要 gateway 本来就有的 Postgres DSN 与随包发布的静态
+        # 映射文件（见该适配器模块文档），失败降级回每日批,不影响确认结果本身。
+        recompute_trigger=PermissionRecomputeAdapter(
+            str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
+        ),
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
     # 普通字符串交给管线——管线自己不再持有任何查询能力，对全体消息都只是内存
