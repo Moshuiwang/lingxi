@@ -642,7 +642,7 @@ def _build_onboarding_duty(
     metric_translation_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
     permission_publish: PermissionPublishDuty | None,
     stock_tokens: Any | None = None,
-    onboarding_failed: Callable[[str, str], None] | None = None, legacy_source: Any | None = None,
+    onboarding_failed: Callable[[str, str], None] | None = None,
 ) -> Any | None:
     """装配首次开通编排（Epic D / S-D-02）；前置不齐就**不注册**并留下**恰一条**审计。
 
@@ -915,7 +915,6 @@ def _build_onboarding_duty(
         # `core/identity/onboarding_ports.FailureReasonRecorder` 协议文档。
         failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
         local_overrides=local_override_reader(dsn, timeouts=timeouts),
-        legacy_source=legacy_source, publish_history=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(
         store=store,

@@ -71,6 +71,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "worker.action.working",
     "worker.card_handoff_notice",
     "worker.status",
+    "worker.status_stalled",
     "worker.queued_timeout",
     "worker.version_unavailable",
     "worker.running_timeout",

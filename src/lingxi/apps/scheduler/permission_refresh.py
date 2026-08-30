@@ -78,8 +78,8 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
 ## 零银河权限用户的本地授权兜底（PM 2026-08-29 裁定，Issue #419，消 `V-权限-15` 已知限制）
 
 产品负责人原话：「权限管理不仅仅依靠银河，管理员也可以赋权，管理员额外赋权后，和银河
-取并集作为用户真实的权限」——**并集无条件成立，包括银河侧为零权限的用户**。此前四源
-合并（下文「本地权限覆盖合并」一节）挂在 ``aggregate.granted`` 判据之后，一个当前没有
+取并集作为用户真实的权限」——**并集无条件成立，包括银河侧为零权限的用户**。此前合并
+（下文「本地权限覆盖合并」一节）挂在 ``aggregate.granted`` 判据之后，一个当前没有
 任何银河权限的用户结构上走的是 :meth:`_revoke`、从不到达合并那一步，管理员对这类用户
 发起的本地授权因此结构上不生效——这是实现顺序留下的缺口，不是产品裁定，本次修复消除它。
 
@@ -96,15 +96,6 @@ PostgresPermissionPublishStore.record_decision` 既有的内容比对承担：�
   撤权语义不变，:meth:`_revoke` 一个字节都不改，撤权侧的两条既有边界（只对发布链上
   留过足迹的人发、聚合层判定无可用权限）继续生效。
 
-**存量沿用（S-P-2）固定不参与这条判据（P0-1，独立审查 2026-08-29 坐实并修复）**：传给
-``merge_permission_sources`` 的 ``legacy`` 固定为 ``None``。存量沿用（旧系统表遗留行）
-不构成"这个人是否该被独立授权"的判据，只有管理员的本地授权才是——修复前把
-:meth:`_resolve_legacy_source` 的结果也并了进来，导致"零银河 + 零本地授权 + 旧系统表
-遗留行"的用户被这条兜底误判成有效授权、真的排出发布意图（实测坐实）。存量沿用是否要
-在这类用户身上生效仍是产品负责人未裁的开放问题，收窄之前不得让实现抢跑一个还没做的
-决定；普通银河已授权路径（:meth:`_refresh_user` 翻译成功之后那次合并）不受影响，
-``legacy`` 在那里照常参与。
-
 **存档不全时不查本地覆盖，直接撤权**：撤权行与发布行都需要 ``email``/``display_name``，
 任何合并结果都救不了一个存档不全的人，提前判掉省一次读放大，也与 :meth:`_revoke` 自己
 "完整性检查在查发布足迹之前短路"的既有观测行为逐字节一致（见 :meth:`_refresh_zero_
@@ -117,7 +108,7 @@ galaxy_user` 文档）。**本地授权读取失败＝本轮跳过这个人（P1
 
 ## 全抑制（本地覆盖压光全部权限）同样走撤权出口（红线-2，Trace #328 opus 审查）
 
-四源合并（下文「本地权限覆盖合并」一节）之后，``merged.permissions`` 可能是空字典——
+合并（下文「本地权限覆盖合并」一节）之后，``merged.permissions`` 可能是空字典——
 这个人银河这一侧原本是有效授权（否则更早的 ``aggregate.granted`` 判据已经把他分流进
 上面的撤权分支，走不到翻译与合并这一步），但本地抑制把翻译出的全部指标都抑制掉了。
 **这不是"无可用银河权限"**（``no_galaxy_roles``/``no_supported_function``/
@@ -219,28 +210,27 @@ PostgresPermissionPublishStore.record_decision` 判 ``UNCHANGED``，不推进版
 那既救不了那个用户，又会把其余职责的时间预算吃掉。失败的用户等下一天那一轮，这正是
 "每日刷新"的语义。收到停止信号而中断的那一轮**不置位**：它没走完。
 
-## 本地权限覆盖合并（S-P-3，Issue #319）与存量权限沿用（S-P-2，Trace #328）
+## 本地权限覆盖合并（S-P-3，Issue #319）
 
 授权侧翻译成功（``company_metrics``）之后、结算发布行之前，`_refresh_user` 调用
 :func:`~lingxi.core.permission.merge_sources.merge_permission_sources` 把该用户当前
-生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）与存量沿用
-（正式权限发布表里该用户的既有行，:class:`~lingxi.core.permission.legacy_source.
-LegacyPermissionTable`，装配层未接线时同样为 ``None``）并进去：真实权限 =
-(银河翻译结果 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。语义细节（通配角 v1、空结果丢键、
-``legacy=None`` 恒等）见该模块文档，不在这里复述。存量源的读取与失败降级由
-:func:`~lingxi.core.permission.legacy_source.resolve_legacy_source` 承担——读取/解析
-失败只跳过这一个用户的存量源、响亮记 ``permission_refresh.legacy_source_skipped``
-审计，不整轮/整人失败；装配层未接线时静默按"没有存量源"处理，与本地覆盖同一姿态。
+生效的本地覆盖（:class:`_LocalOverrideReader`，装配层未接线时为 ``None``）并进去：
+真实权限 = (银河翻译结果 ∪ 本地授权) − 本地抑制。语义细节（通配角 v1、空结果丢键）
+见该模块文档，不在这里复述。
 
 **``_refresh_user`` 之外的第二个挂点（PM 2026-08-29 裁定，Issue #419）**：
 ``aggregate.granted`` 为假时，:meth:`_refresh_zero_galaxy_user` 同样调用这个纯函数，
-只是 ``galaxy`` 参数换成恒为空的 ``{}``，且 ``legacy`` 固定传 ``None``——**存量沿用
-不参与这个挂点**（P0-1，独立审查坐实并修复，见该方法文档「P0-1 收窄」一节）：只有
-本地覆盖决定"是发布还是撤权"这件事本身（合并结果空则撤权、非空则发布），存量沿用
-只在 ``_refresh_user`` 银河已授权路径参与，不构成零银河用户的独立授权来源，产品
-负责人尚未就此裁定，实现不得抢跑。一旦真的走到 ``_revoke``，它写的仍然是不含指标名
-的 ``{}``，本地覆盖对撤权行**本身的内容**依旧没有作用面——这一半（撤权行永远是空
-对象、不受本地覆盖影响）与翻译层「与撤权无关」仍是同一条边界，没有改变。
+只是 ``galaxy`` 参数换成恒为空的 ``{}``——只有本地覆盖决定"是发布还是撤权"这件事
+本身（合并结果空则撤权、非空则发布）。一旦真的走到 ``_revoke``，它写的仍然是不含
+指标名的 ``{}``，本地覆盖对撤权行**本身的内容**依旧没有作用面——这一半（撤权行
+永远是空对象、不受本地覆盖影响）与翻译层「与撤权无关」仍是同一条边界，没有改变。
+
+**存量权限沿用（曾用名「legacy source」，S-P-2，Trace #328）机制已整体退役**（PM
+2026-08-30 裁定，Issue #441）：旧系统权限多维表格的存量用户权限改走一次性差集导入
+为管理员本地授权（`scripts/ops/`，见该目录下的导入工具），不再作为运行时权限来源
+参与每日合并；本节与本职责不再有与它相关的分支、审计或接线点。历史设计与
+「发布足迹有界化」取舍见 Git 历史（本文件 2026-08-30 之前的版本）与 `Issue #328`/
+`#419`，不在当前文档复述。
 """
 
 from __future__ import annotations
@@ -261,9 +251,7 @@ from lingxi.core.permission.local_override import (
     ResolvedLocalOverrides,
     resolve_local_overrides,
 )
-from lingxi.core.permission.legacy_source import LegacyPermissionTable, resolve_legacy_source
 from lingxi.core.permission.merge_sources import (
-    ALL_COMPANIES_KEY,
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     merge_permission_sources,
 )
@@ -612,7 +600,6 @@ class PermissionRefreshDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
         local_overrides: _LocalOverrideReader | None = None,
-        legacy_source: LegacyPermissionTable | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
         self._roster_snapshot = roster_snapshot
@@ -628,10 +615,6 @@ class PermissionRefreshDuty:
         # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
         # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
         self._local_overrides = local_overrides
-        # 存量权限只读源（S-P-2，Trace #328）：``None`` 表示装配层还没接这个 store——
-        # 本轮/本用户的合并按"没有存量源"处理，产出与今天逐字节一致（同
-        # ``local_overrides=None`` 的既有姿态）。真实实现见 ``apps/scheduler/assembly.py``。
-        self._legacy_source = legacy_source
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
@@ -823,7 +806,7 @@ class PermissionRefreshDuty:
             # 赋权」，产品语义上与用户此刻有没有银河权限无关——挂在 `aggregate.
             # granted` 判据之后只是实现上的历史顺序，不是产品裁定。因此这里把「银河
             # 这一侧完全没有可翻译的内容」当成 `merge_permission_sources` 的一个
-            # 合法空输入（`galaxy={}`），查一次本地授权/存量沿用，合并结果非空才算
+            # 合法空输入（`galaxy={}`），查一次本地授权，合并结果非空才算
             # 数——既无银河也无本地授权（或本地授权已被同键抑制清空）时，合并结果
             # 仍是空字典，维持现行撤权语义不变，`_revoke` 一个字节都不改。
             self._refresh_zero_galaxy_user(tally, identity, aggregate, now)
@@ -860,14 +843,12 @@ class PermissionRefreshDuty:
             self._skip(tally, identity, STAGE_TRANSLATE, reason, revoked=False)
             return
 
-        # 四源合并（S-P-3 本地覆盖 #319 + S-P-2 存量沿用 #328）：真实权限 =
-        # (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制。挂在「翻译完成之后、结算发布行
+        # 本地权限覆盖合并（S-P-3 本地覆盖 #319）：真实权限 =
+        # (银河 ∪ 本地授权) − 本地抑制。挂在「翻译完成之后、结算发布行
         # 之前」——`company_metrics` 就是银河那一侧已经翻译好的 `{公司: (指标名, …)}`。
-        # 见 `core/permission/merge_sources.py` 模块文档；存量源的失败降级见
-        # `core/permission/legacy_source.py` 模块文档。
+        # 见 `core/permission/merge_sources.py` 模块文档。
         local = self._resolve_local_overrides(identity.app_user_id)
-        legacy = self._resolve_legacy_source(identity.app_user_id, identity.email, company_metrics)
-        merged = merge_permission_sources(galaxy=company_metrics, local=local, legacy=legacy)
+        merged = merge_permission_sources(galaxy=company_metrics, local=local)
         for reason in merged.skipped_reasons:
             # 通配角 v1：本地源在 `all_companies=True` 下整体不参与合并，见
             # `merge_permission_sources` 模块文档「通配角」一节。
@@ -899,19 +880,6 @@ class PermissionRefreshDuty:
         """银河这一侧判定"无可用权限"（`no_galaxy_roles`/`no_supported_function`/
         `no_company_scope`）时的新分支（PM 2026-08-29 裁定，Issue #419）：查一次
         **本地授权**，合并结果非空就发布，仍为空才撤权。
-
-        **P0-1 收窄（独立审查 2026-08-29 坐实并修复）**：这一步固定传
-        `legacy=None`，存量沿用不参与——理由与 `onboarding_runner.py::
-        AutoOnboardingRunner._reject_zero_galaxy_without_local_grant` 同一处
-        文档，这里不复述：存量沿用（旧系统表遗留行）不构成"这个人是否该被独立
-        授权"的判据，只有管理员的本地授权才是；`legacy` 是否要在这类用户身上
-        生效仍是 PM 未裁的开放问题。修复前把 `_resolve_legacy_source` 的结果
-        也并了进来，导致"零银河 + 零本地授权 + 旧系统表遗留行"的用户被这条
-        兜底误判成有效授权、真的排出发布意图（实测坐实）。**否定用例**：零银河
-        + 零本地 + 有旧表遗留行 → 仍走 `_revoke`（`ZeroGalaxyLocalGrantTest.
-        test_a_legacy_row_alone_does_not_authorize_a_never_granted_user`）。
-        普通银河已授权路径（`_refresh_user` 里翻译成功之后那次合并）不受影响，
-        `legacy` 在那里照常参与。
 
         **存档不全时直接走撤权、不先查本地覆盖**：撤权行与发布行都需要
         `email`/`display_name` 这两列，任何合并结果都救不了一个存档不全的人，提前
@@ -954,7 +922,7 @@ class PermissionRefreshDuty:
             tally.count(SKIP_LOCAL_OVERRIDE_READ_FAILED)
             return
 
-        merged = merge_permission_sources(galaxy={}, local=local, legacy=None)
+        merged = merge_permission_sources(galaxy={}, local=local)
         for reason in merged.skipped_reasons:
             # 通配角 v1 结构上不会在这条分支出现（`galaxy` 恒为空字典，不含
             # `ALL_COMPANIES_KEY`），保留同一姿态只是让两条分支的代码形状一致。
@@ -971,7 +939,7 @@ class PermissionRefreshDuty:
             return
 
         # 本地授权非空：管理员的兜底赋权生效，发布内容=合并结果（精确等于本地
-        # 授权集合，因为 galaxy/legacy 两侧贡献均为空）。
+        # 授权集合，因为 galaxy 一侧贡献为空）。
         self._enqueue_publish(tally, identity, merged.permissions, now)
 
     def _enqueue_publish(
@@ -1068,41 +1036,6 @@ class PermissionRefreshDuty:
                 raise _LocalOverrideReadFailed() from error
             return None
         return resolve_local_overrides(user_id=user_id, entries=entries)
-
-    def _resolve_legacy_source(
-        self, user_id: str, email: str, company_metrics: Mapping[str, Sequence[str]]
-    ) -> dict[str, tuple[str, ...]] | None:
-        """按红线-1 的有界条件（Trace #328 opus 审查）决定这个用户本轮要不要读存量源。
-
-        两条判据都会让本方法直接返回 ``None``、**不发起任何 ``find_rows`` 调用**
-        （省一次读放大）：
-
-        1. **通配用户**（``company_metrics`` 出现 :data:`~lingxi.core.permission.
-           merge_sources.ALL_COMPANIES_KEY` 键）：:func:`~lingxi.core.permission.
-           merge_sources.merge_permission_sources` 的通配分支本就完全不读 ``legacy``
-           参数（该模块文档「通配角」一节），读来的存量权限必然被丢弃——读了也是白读。
-        2. **已经在发布链上留下过足迹**（:meth:`_PublishHistory.has_publish_footprint`
-           为真：发布成功过，或当前还有 ``pending``/``publishing`` 的意图在途）：正式
-           权限发布表此刻很可能已经是 Lingxi 自己写的内容，不再是"旧系统遗留、我们
-           从未碰过"的存量——参与合并会把自己昨天的发布内容原样并回来，形成自反馈环
-           （详见 ``core/permission/legacy_source.py`` 模块文档「有界条件」一节）。
-
-        两条判据都不成立（未通配、且从未有过发布足迹）时才真正调用
-        :func:`~lingxi.core.permission.legacy_source.resolve_legacy_source`，读取/解析
-        失败的降级与审计姿态见该函数文档，本方法不重复。
-        """
-
-        if ALL_COMPANIES_KEY in company_metrics:
-            return None
-        if self._publish_history.has_publish_footprint(user_id):
-            return None
-        return resolve_legacy_source(
-            email=email,
-            table=self._legacy_source,
-            audit=self._audit,
-            action="permission_refresh.legacy_source_skipped",
-            user=user_id,
-        )
 
     def _revoke(
         self,
@@ -1240,7 +1173,6 @@ def _build_permission_refresh_duty(
     *,
     stop: threading.Event,
     audit: AuditSink,
-    legacy_source: Any | None = None,
 ) -> tuple[
     PermissionRefreshDuty | None,
     Mapping[str, Mapping[str, Sequence[str]]] | None,
@@ -1362,7 +1294,6 @@ def _build_permission_refresh_duty(
         metric_translation_map=metric_translation_map,
         audit=audit,
         stop=stop, local_overrides=local_override_reader(config.postgres_dsn, timeouts=config.postgres_timeouts),
-        legacy_source=legacy_source,
     )
     return duty, metric_translation_map
 

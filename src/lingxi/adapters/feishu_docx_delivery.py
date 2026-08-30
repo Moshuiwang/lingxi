@@ -100,10 +100,46 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
 - :meth:`LarkDocxDelivery.convert_markdown_to_blocks`：``POST /docx/v1/documents/
   blocks/convert``（``content_type=markdown``），把一段 markdown 转换成飞书官方
   block 结构。这个端点只做转换、不写入任何文档，失败或重试都不产生外部副作用。
-  **本方法的请求/响应形状未经本仓库任何真实探针验证**（issue #408「官方能力
-  事实」一节核实口径来自 open.feishu.cn 文档正文，未做真实调用），假设响应体
-  是 ``data.blocks``（block 对象数组）；如实标注，不静默宣称已验证——同
-  :meth:`read_body_children` 的既有姿态。
+  **Issue #442 受控探针实证**（2026-08-30，Bot-Test 真实调用，见该 issue 正文）
+  纠正了本节此前的假设：响应体 ``data.blocks`` **不是文档顺序**（实测「标题→
+  两列表项→正文」返回的 ``block_types`` 顺序是 ``[12, 2, 3, 12]``），真实的
+  文档顺序由响应体的 ``data.first_level_block_ids``（block_id 字符串数组）
+  给出；响应另含 ``data.block_id_to_image_urls`` 键，与 blocks 无关，不得误当
+  成块处理。因此本方法在返回前按 ``first_level_block_ids`` 重排 ``blocks``
+  （建 ``block_id`` → block 的映射后按顺序取出），并做两条防御性失败关闭
+  （**绝不静默丢块或乱序交付**，两条都是 ``FeishuDocxDeliveryError
+  (definite=True)``——转换端点无副作用、同一份 markdown 重放结果确定性相同，
+  同 :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"发起写入前的确定性
+  拒绝"）：
+
+  1. ``first_level_block_ids`` 缺失、不是列表或为空 → ``markdown_convert_
+     missing_first_level_block_ids``；
+  2. 存在任意一个块的 ``block_id`` 不在 ``first_level_block_ids`` 内（典型
+     场景：表格等嵌套结构——表格自身是一级块，但它的单元格是作为独立元素
+     出现在 ``blocks`` 数组里、却不出现在 ``first_level_block_ids`` 里的
+     子块）→ ``unsupported_nested_blocks``。本仓库当前只支持"结果是一份
+     纯一级块序列"的 markdown（标题、列表、正文段落等），**不支持任何带
+     嵌套结构的 markdown**（表格是已知的第一个例子）——这是一个已登记的
+     后续扩展点，不是本次修复的交付范围。
+     若 ``first_level_block_ids`` 引用了一个在 ``blocks`` 数组里找不到的
+     ``block_id``（响应内部不自洽，理论上不应发生），归类为「结果不明」
+     ``LookupError``，同 :meth:`read_body_children` 既有的"响应形状不对但
+     不是飞书明确拒绝"分类口径——这与上面两条"明确知道拒绝原因"的
+     ``definite`` 分支不同：这里连"为什么不一致"都无法确定。
+
+  返回前还会剔除每个块里的只读字段（``block_id``/``parent_id``/``children``，
+  见 :func:`_strip_readonly_block_fields`）——这些字段描述"这个块在文档里的
+  位置/身份"，是服务器生成的，插入端点（``blocks/{document_id}/children``）
+  不接受随插入请求带回同名字段（同官方"重新插入表格 block 前须剔除只读
+  ``merge_info``"一类约束：响应里凡是描述块的位置/关系的字段都不可回插，只有
+  描述块长什么样的字段才能原样写回）。
+
+  **仍未被本仓库任何真实探针验证的假设**（如实标注，不静默宣称已验证）：
+  每个返回的块都携带非空字符串 ``block_id``（重排映射的前提）；剔除的三个
+  字段是插入端点全部拒绝的只读字段全集（目前只确认 ``block_id`` 一定是只读
+  的，``parent_id``/``children`` 是同类推断，未见真实插入报错佐证或证伪）。
+  这两条假设在本次 Issue #442 的受控探针范围之外，留给「验证条件补强」一节
+  要求的自证闭环真实探针核实。
 - :meth:`LarkDocxDelivery.write_blocks`：把已经是飞书 block 形状的数组沿用与
   :meth:`write_paragraphs` 完全相同的 children 插入端点写入（同一坐标、同一
   ``index=0`` 单次写入语义）。**超过 :data:`MAX_CONVERTED_BLOCKS`（1000，飞书
@@ -193,6 +229,11 @@ _DOCX_DOCUMENTS_PATH = "/docx/v1/documents"
 _BLOCKS_CONVERT_PATH = "/docx/v1/documents/blocks/convert"
 _MARKDOWN_CONTENT_TYPE = "markdown"
 
+#: 官方转换响应里每个块携带的只读字段（Issue #442），插入端点不接受随请求体
+#: 带回——见 :meth:`LarkDocxDelivery.convert_markdown_to_blocks` 文档字符串
+#: 「markdown 官方转换开关」一节对应小节的完整理由与已知未验证假设。
+_CONVERT_RESPONSE_READONLY_BLOCK_KEYS = ("block_id", "parent_id", "children")
+
 #: 单次 children 插入端点的 block 数上限（模块文档「官方能力事实」核实口径，
 #: 未做真实调用探针）。超过时 :meth:`LarkDocxDelivery.write_blocks` 整体拒绝、
 #: 不分批插入——理由见模块文档「markdown 官方转换开关」一节：分批会打破
@@ -274,6 +315,13 @@ def _safe_feishu_code(value: object) -> str:
     if isinstance(value, int) and not isinstance(value, bool):
         return f"feishu_code_{value}"
     return "feishu_code_invalid"
+
+
+def _strip_readonly_block_fields(block: Mapping[str, Any]) -> dict[str, Any]:
+    """剔除 :data:`_CONVERT_RESPONSE_READONLY_BLOCK_KEYS` 里列出的只读字段，
+    返回可以原样传给插入端点的浅拷贝（不修改入参）。"""
+
+    return {key: value for key, value in block.items() if key not in _CONVERT_RESPONSE_READONLY_BLOCK_KEYS}
 
 
 class Transport(Protocol):
@@ -418,17 +466,17 @@ class LarkDocxDelivery:
         logger.info("飞书 docx 正文已写入 document_id_len=%s 段落数=%s", len(doc_id), len(texts))
 
     def convert_markdown_to_blocks(self, markdown: str) -> list[dict[str, Any]]:
-        """把一段 markdown 转换成飞书官方 block 结构（Issue #408 正式方案，
-        默认关闭——见 :meth:`write_body` 与模块文档「markdown 官方转换开关」
-        一节）。
+        """把一段 markdown 转换成飞书官方 block 结构、按文档真实顺序排好
+        （Issue #408 正式方案，默认关闭——见 :meth:`write_body` 与模块文档
+        「markdown 官方转换开关」一节；重排与防御性拒绝的完整理由见该节
+        Issue #442 更新的段落）。
 
         ``POST /docx/v1/documents/blocks/convert``，请求体 ``{"content_type":
         "markdown", "content": markdown}``。这个端点只做转换、不写入任何文档，
-        失败或重试都不产生外部副作用。**本方法的请求/响应形状未经本仓库任何
-        真实探针验证**（issue #408「官方能力事实」一节核实口径来自
-        open.feishu.cn 文档正文，未做真实调用），假设响应体是 ``data.blocks``
-        （block 对象数组）；如实标注，不静默宣称已验证——同
-        :meth:`read_body_children` 的既有姿态。
+        失败或重试都不产生外部副作用。**响应体 ``data.blocks`` 不是文档顺序**
+        （Issue #442 受控探针实证）——真实顺序由 ``data.first_level_block_ids``
+        给出，本方法据此重排后才返回；``data.block_id_to_image_urls`` 是响应里
+        的另一个键，与 blocks 无关，本方法不读取它。
         """
 
         text = (markdown or "").strip()
@@ -464,7 +512,46 @@ class LarkDocxDelivery:
             # :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"转换/写入
             # 前置校验发现的确定性失败"。
             raise FeishuDocxDeliveryError("markdown_convert_blocks_not_mapping", definite=True)
-        return mapping_blocks
+
+        # Issue #442：`blocks` 数组不是文档顺序，真实顺序在
+        # `first_level_block_ids` 里。缺失/为空一律 definite 拒绝——没有这份
+        # 顺序清单就无法保证交付顺序正确，宁可拒绝也不猜测顺序。
+        first_level_block_ids = data.get("first_level_block_ids")
+        if not isinstance(first_level_block_ids, list) or not first_level_block_ids:
+            raise FeishuDocxDeliveryError(
+                "markdown_convert_missing_first_level_block_ids", definite=True
+            )
+
+        # 每个块必须携带非空字符串 block_id 且必须出现在
+        # first_level_block_ids 里，否则一律 definite 拒绝——这既拦住表格一类
+        # 嵌套结构（表格自身是一级块，但它的单元格作为独立元素出现在
+        # `blocks` 里、却不在 `first_level_block_ids` 内），也拦住"块缺
+        # block_id 因而无法确认层级"这种更基础的形状不对，两者都无法安全
+        # 判断该块该不该、该按什么顺序交付，不做静默丢弃或猜测。
+        first_level_ids = {
+            block_id for block_id in first_level_block_ids if isinstance(block_id, str) and block_id
+        }
+        for block in mapping_blocks:
+            block_id = block.get("block_id")
+            if not isinstance(block_id, str) or block_id not in first_level_ids:
+                raise FeishuDocxDeliveryError("unsupported_nested_blocks", definite=True)
+
+        by_block_id = {block["block_id"]: block for block in mapping_blocks}
+        ordered_blocks: list[Mapping[str, Any]] = []
+        for block_id in first_level_block_ids:
+            block = by_block_id.get(block_id) if isinstance(block_id, str) else None
+            if block is None:
+                # `first_level_block_ids` 引用了一个在 `blocks` 数组里找不到
+                # 的 block_id：响应内部不自洽，理论上不应发生。这与上面两条
+                # "明确知道拒绝原因"的 definite 分支不同——这里连"为什么不
+                # 一致"都无法确定，归类为结果不明，同
+                # :meth:`read_body_children` 既有的分类口径。
+                raise LookupError(
+                    "markdown 转换响应 first_level_block_ids 引用了不存在的块：结果不明"
+                )
+            ordered_blocks.append(block)
+
+        return [_strip_readonly_block_fields(block) for block in ordered_blocks]
 
     def write_blocks(self, document_id: str, blocks: Sequence[Mapping[str, Any]]) -> None:
         """把已经是飞书 block 形状的 ``blocks`` 写进正文，沿用与

@@ -137,6 +137,22 @@ class _RecordingAudit:
         self.records.append((action, fields))
 
 
+class _FakeRecomputeTrigger:
+    """``PermissionRecomputeTrigger`` 的假实现（Issue #438）：只记调用，不做任何
+    真实重算——真实实现的编排在
+    ``adapters/postgres_permission_recompute_trigger.py``，真库全链断言在
+    ``tests/test_permission_recompute_trigger_postgres.py``。"""
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self._raises = raises
+        self.calls: list[PendingAction] = []
+
+    def trigger(self, pending: PendingAction) -> None:
+        self.calls.append(pending)
+        if self._raises is not None:
+            raise self._raises
+
+
 def _build_handler(
     *,
     pending_actions: _FakePendingActions,
@@ -145,6 +161,7 @@ def _build_handler(
     group_chat_id: str | None = "oc_admin_group",
     audit: _RecordingAudit | None = None,
     management_actions: object | None = None,
+    recompute_trigger: "_FakeRecomputeTrigger | None" = None,
 ) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
     audit = audit or _RecordingAudit()
     handler = AdminCardCallbackHandler(
@@ -154,6 +171,7 @@ def _build_handler(
         group_chat_id=group_chat_id,
         audit=audit,
         management_actions=management_actions,
+        recompute_trigger=recompute_trigger,
     )
     return handler, audit
 
@@ -245,7 +263,7 @@ class ConfirmExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success")
-        self.assertEqual(outcome["toast"]["content"], "已确认执行")
+        self.assertEqual(outcome["toast"]["content"], "已确认执行，权限变更将即时生效")
         self.assertEqual(outcome["card"]["type"], "raw")
         # 终态卡 data 必须是对象（dict），不是字符串——飞书要的是可以直接被
         # SDK JSON 序列化的结构，不是我们提前 json.dumps 过的字符串。
@@ -886,6 +904,136 @@ class ManagementRevokeClickTests(unittest.TestCase):
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertIn("未找到匹配", response["toast"]["content"])
+
+
+class RecomputeTriggerWiringTests(unittest.TestCase):
+    """确认执行成功后的定向权限重算钩子（Issue #438）：只在这次点击**首次**让
+    操作真正执行成功（``status is EXECUTED`` 且 ``terminal_status`` 非空）时触发；
+    失败降级、不影响已经落库的确认结果；未装配时静默跳过（与
+    ``group_notifier=None`` 同一姿态）。真实重算规则本身不在这里测（见
+    ``tests/test_targeted_permission_recompute.py``），本文件只测"什么时候调用
+    它一次"这条编排。
+    """
+
+    def _confirm_result(self, pending: PendingAction) -> _FakeOutcome:
+        return _FakeOutcome(
+            decision=_FakeDecision(
+                kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                terminal_status=PendingActionStatus.EXECUTED,
+            ),
+            pending=pending,
+        )
+
+    def test_executed_confirm_triggers_recompute_exactly_once(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        trigger = _FakeRecomputeTrigger()
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_1",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("即时生效", outcome["toast"]["content"])
+        self.assertEqual(trigger.calls, [pending])
+
+    def test_cancel_does_not_trigger_recompute(self) -> None:
+        pending = _pending(status=PendingActionStatus.CANCELLED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_cancel_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind="cancel", ok=True, message="已取消，未做任何变更。",
+                    terminal_status=PendingActionStatus.CANCELLED,
+                ),
+                pending=pending,
+            )
+        )
+        trigger = _FakeRecomputeTrigger()
+        handler, _audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CANCEL,
+            trace_id="trc_recompute_2",
+        )
+
+        self.assertEqual(trigger.calls, [])
+
+    def test_idempotent_replay_does_not_trigger_recompute_again(self) -> None:
+        """幂等重放（``terminal_status`` 为空，与群通知同一去重判据）不重复触发。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.ALREADY_TERMINAL, ok=False, message="已确认执行。",
+                    terminal_status=None,
+                ),
+                pending=pending,
+            )
+        )
+        trigger = _FakeRecomputeTrigger()
+        handler, _audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_3",
+        )
+
+        self.assertEqual(trigger.calls, [])
+
+    def test_recompute_failure_does_not_propagate_and_is_audited(self) -> None:
+        """降级回每日批：失败只记审计，不影响已经落库的确认结果（硬纪律）。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        trigger = _FakeRecomputeTrigger(raises=RuntimeError("重算适配器炸了"))
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_4",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success", "定向重算失败不改变确认结果本身")
+        self.assertIn(
+            "admin.card_callback.recompute_trigger_failed",
+            [action for action, _ in audit.records],
+        )
+
+    def test_missing_recompute_trigger_is_a_silent_noop(self) -> None:
+        """未装配（``None``）时静默跳过——与 ``group_notifier=None`` 同一姿态。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=None)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_5",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertNotIn(
+            "admin.card_callback.recompute_trigger_failed",
+            [action for action, _ in audit.records],
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
