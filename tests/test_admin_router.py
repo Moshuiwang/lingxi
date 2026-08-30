@@ -64,6 +64,9 @@ class FakeQueries:
         traces: dict[str, AdminTraceView] | None = None,
         raise_on_user: bool = False,
         raise_on_trace: bool = False,
+        identifier_aliases: dict[str, str] | None = None,
+        metric_aliases: dict[str, str] | None = None,
+        overrides_by_key: dict[tuple[str, str, str], str] | None = None,
     ) -> None:
         self.user_calls: list[str] = []
         self.event_calls: list[dict[str, object]] = []
@@ -73,6 +76,15 @@ class FakeQueries:
         self._traces = traces or {}
         self._raise_on_user = raise_on_user
         self._raise_on_trace = raise_on_trace
+        # #439 A 档新增三个反查端口的假实现：默认原样透传（``identifier_aliases``/
+        # ``metric_aliases`` 为空时对任何输入恒等），与真实 fail-open 语义一致——
+        # 既有全部用例因此不需要为这三个新方法各自补一份配置就能继续通过。
+        self.resolve_identifier_calls: list[str] = []
+        self.resolve_metric_calls: list[str] = []
+        self.resolve_override_calls: list[tuple[str, str, str]] = []
+        self._identifier_aliases = identifier_aliases or {}
+        self._metric_aliases = metric_aliases or {}
+        self._overrides_by_key = overrides_by_key or {}
 
     def user_status(self, *, identifier: str) -> AdminUserStatusView | None:
         self.user_calls.append(identifier)
@@ -93,6 +105,21 @@ class FakeQueries:
         if self._raise_on_trace:
             raise RuntimeError("模拟查询失败")
         return self._traces.get(trace_id)
+
+    def resolve_identifier(self, *, identifier: str) -> str:
+        self.resolve_identifier_calls.append(identifier)
+        return self._identifier_aliases.get(identifier, identifier)
+
+    def resolve_metric_name(self, *, metric_token: str) -> str:
+        self.resolve_metric_calls.append(metric_token)
+        return self._metric_aliases.get(metric_token, metric_token)
+
+    def resolve_override_id(
+        self, *, open_id: str, company_id: str, metric_name: str
+    ) -> str | None:
+        key = (open_id, company_id, metric_name)
+        self.resolve_override_calls.append(key)
+        return self._overrides_by_key.get(key)
 
 
 class _FakePrepareDecision:
@@ -212,6 +239,7 @@ def _router(
     audit: FakeAudit | None = None,
     pending_actions: FakePendingActions | None = None,
     confirm_cards: FakeConfirmCards | None = None,
+    management_cards: object | None = None,
 ) -> tuple[AdminCommandRouter, FakeRegistry, FakeQueries, FakeAudit]:
     reg = registry or FakeRegistry({ADMIN_OPEN_ID: _full_admin_entry()})
     qry = queries or FakeQueries()
@@ -223,11 +251,43 @@ def _router(
             audit=aud,
             pending_actions=pending_actions,
             confirm_cards=confirm_cards,
+            management_cards=management_cards,
         ),
         reg,
         qry,
         aud,
     )
+
+
+class FakeManagementCards:
+    """``ManagementCardSender`` 的假实现（#439 B 档）：记录每次调用的参数，
+    可配置抛出异常模拟发送失败。"""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.raise_error = raise_error
+
+    def send(
+        self,
+        *,
+        status,
+        display_identifier: str,
+        chat_id: str,
+        thread_id,
+        reply_to_message_id: str,
+    ):
+        self.calls.append(
+            {
+                "status": status,
+                "display_identifier": display_identifier,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        if self.raise_error:
+            raise RuntimeError("模拟管理卡发送失败")
+        return object()
 
 
 class DefaultDenyTests(unittest.TestCase):
@@ -503,6 +563,198 @@ class QueryUserCommandTests(unittest.TestCase):
         )
 
         self.assertNotIn("暂不生效", outcome.reply_text)
+
+
+class EmailIdentifierResolutionTests(unittest.TestCase):
+    """#439 A 档：``/admin user`` 的标识参数经 ``AdminQueries.resolve_identifier``
+    反查——命中时按反查出的 open_id 查询，回复仍展示管理员实际输入的标识（不强迫
+    管理员在回复里看到内部 open_id）。"""
+
+    def test_email_identifier_is_resolved_before_querying_user_status(self) -> None:
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=1,
+                    updated_at="2026-08-30T00:00:00+00:00",
+                )
+            },
+            identifier_aliases={"someone@example.com": "ou_target"},
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user someone@example.com", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        # 反查确实发生过一次，且 user_status 用的是反查出的 open_id，不是原始邮箱。
+        self.assertEqual(queries.resolve_identifier_calls, ["someone@example.com"])
+        self.assertEqual(queries.user_calls, ["ou_target"])
+        # 回复仍然展示管理员自己输入的标识（邮箱），不是反查出的内部 open_id。
+        self.assertIn("someone@example.com", outcome.reply_text)
+        self.assertNotIn("未找到", outcome.reply_text)
+
+    def test_unresolvable_email_falls_through_to_the_existing_not_found_reply(self) -> None:
+        """反查零命中时原样透传输入（fail-open），下游按既有"未找到"语义处理，
+        不新增一条并行的"邮箱查无"错误分支。"""
+
+        router, _, queries, _ = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user nobody@example.com", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("未找到", outcome.reply_text)
+        self.assertIn("nobody@example.com", outcome.reply_text)
+        # 原样透传后仍然去查了一次（用邮箱本身当 identifier），不是提前短路。
+        self.assertEqual(queries.user_calls, ["nobody@example.com"])
+
+    def test_open_id_shaped_identifier_skips_resolution_call(self) -> None:
+        """非邮箱形态（不含 ``@``）时不发起任何反查调用——既有全部行为的零成本
+        路径，见 ``resolve_identifier`` 文档。"""
+
+        router, _, queries, _ = _router()
+
+        router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_plain", trace_id="t1")
+
+        self.assertEqual(queries.resolve_identifier_calls, ["ou_plain"])
+        self.assertEqual(queries.user_calls, ["ou_plain"])
+
+
+class ManagementCardSendTests(unittest.TestCase):
+    """#439 B 档：``/admin user`` 附带发送用户权限管理卡，best-effort，不影响
+    既有文本回复这条主路径。"""
+
+    def _status(self) -> AdminUserStatusView:
+        return AdminUserStatusView(
+            identifier="ou_target",
+            provisioning_state="active",
+            account_state="enabled",
+            permission_version=1,
+            updated_at="2026-08-30T00:00:00+00:00",
+        )
+
+    def test_card_is_sent_as_a_reply_to_the_triggering_message_when_wired(self) -> None:
+        cards = FakeManagementCards()
+        queries = FakeQueries(users={"ou_target": self._status()})
+        router, _, _, _ = _router(queries=queries, management_cards=cards)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(len(cards.calls), 1)
+        self.assertEqual(cards.calls[0]["display_identifier"], "ou_target")
+
+    def test_admin_user_with_an_email_identifier_resolves_and_sends_the_management_card(
+        self,
+    ) -> None:
+        """自证闭环条款的完整受控注入场景：``/admin user <邮箱>`` 一次调用里
+        同时验证①标识按邮箱正确反查、②管理卡确实调出（发送）、③卡片收到的
+        ``status`` 就是反查后拿到的那份真实状态——三件事在同一次 ``route()``
+        调用里一起成立，不是三个互不相关的独立断言拼出来的假象。"""
+
+        status = self._status()
+        cards = FakeManagementCards()
+        queries = FakeQueries(
+            users={"ou_target": status},
+            identifier_aliases={"admin-user-test@example.com": "ou_target"},
+        )
+        router, _, _, _ = _router(queries=queries, management_cards=cards)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user admin-user-test@example.com",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("admin-user-test@example.com", outcome.reply_text)
+        self.assertEqual(len(cards.calls), 1)
+        self.assertEqual(cards.calls[0]["display_identifier"], "admin-user-test@example.com")
+        self.assertIs(cards.calls[0]["status"], status)
+        self.assertEqual(cards.calls[0]["reply_to_message_id"], "om_1")
+        self.assertEqual(cards.calls[0]["reply_to_message_id"], "om_1")
+        self.assertEqual(cards.calls[0]["chat_id"], "oc_1")
+
+    def test_not_wired_sends_no_card_but_text_reply_is_unaffected(self) -> None:
+        """未装配（``management_cards=None``，既有全部构造点/测试的默认值）时
+        不发送任何卡片，`/admin user` 的文本回复行为逐字节不变——既有全部 50
+        个测试用例本身就是这条回归的证据（它们从未传 management_cards）。"""
+
+        queries = FakeQueries(users={"ou_target": self._status()})
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("ou_target", outcome.reply_text)
+
+    def test_missing_message_id_skips_card_send(self) -> None:
+        """没有可回复的消息 ID（既有全部只读命令调用点的默认值）不发送卡片——
+        与写命令"无法回复触发消息就不发确认卡片"同一姿态。"""
+
+        cards = FakeManagementCards()
+        queries = FakeQueries(users={"ou_target": self._status()})
+        router, _, _, _ = _router(queries=queries, management_cards=cards)
+
+        router.route(open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1")
+
+        self.assertEqual(cards.calls, [])
+
+    def test_card_send_failure_does_not_affect_the_existing_text_reply(self) -> None:
+        cards = FakeManagementCards(raise_error=True)
+        queries = FakeQueries(users={"ou_target": self._status()})
+        router, _, _, audit = _router(queries=queries, management_cards=cards)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user ou_target",
+            trace_id="t1",
+            chat_id="oc_1",
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("ou_target", outcome.reply_text)
+        self.assertIn("admin.command.management_card_send_failed", audit.actions())
+        # 主查询审计（admin.command.query_user）仍然照常记录，不被卡片失败挤掉。
+        self.assertIn("admin.command.query_user", audit.actions())
+
+    def test_no_card_is_sent_when_the_user_is_not_found(self) -> None:
+        """查无此人时不发送管理卡——没有内容可以展示。"""
+
+        cards = FakeManagementCards()
+        router, _, _, _ = _router(management_cards=cards)
+
+        router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user ou_missing",
+            trace_id="t1",
+            chat_id="oc_1",
+            message_id="om_1",
+        )
+
+        self.assertEqual(cards.calls, [])
 
 
 class QueryTraceCommandTests(unittest.TestCase):
@@ -1228,6 +1480,68 @@ class GrantSuppressPermissionDispatchTests(unittest.TestCase):
         self.assertIn("grant_permission", outcome.reply_text)
         self.assertIn("suppress_permission", outcome.reply_text)
 
+    def test_email_identifier_and_chinese_metric_alias_are_resolved_before_prepare(
+        self,
+    ) -> None:
+        """#439 A 档：grant/suppress 的 identifier（邮箱）与 metric_name（中文
+        别名）在调用 ``prepare()`` 之前分别经 ``resolve_identifier``/
+        ``resolve_metric_name`` 反查——``prepare()`` 拿到的是反查后的真实值，
+        不是管理员原始输入的邮箱/别名。"""
+
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        queries = FakeQueries(
+            identifier_aliases={"someone@example.com": "ou_target"},
+            metric_aliases={"新增用户数": "sub_new_count"},
+        )
+        router, _, _, _ = _router(
+            queries=queries, pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin grant_permission someone@example.com 1011 新增用户数 特批",
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        call = pending_actions.prepare_calls[0]
+        self.assertEqual(call["target_open_id"], "ou_target")
+        self.assertEqual(call["metric_name"], "sub_new_count")
+        self.assertEqual(queries.resolve_identifier_calls, ["someone@example.com"])
+        self.assertEqual(queries.resolve_metric_calls, ["新增用户数"])
+
+    def test_unmapped_metric_token_passes_through_unchanged(self) -> None:
+        """别名表未命中（fail-open）：``metric_name`` 原样透传给
+        ``prepare()``——与既有"英文 ID 直接输入"路径完全等价，不新增行为分叉。"""
+
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        router, _, _, _ = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._grant_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertEqual(pending_actions.prepare_calls[0]["metric_name"], "daily_active")
+
 
 #: 与 test_admin_commands.py 同一固定字面量（`lpo_` 前缀 + 26 位 Crockford
 #: Base32 ULID），供本文件的收回派发用例复用。
@@ -1387,6 +1701,146 @@ class RevokePermissionDispatchTests(unittest.TestCase):
         outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
 
         self.assertIn("revoke_permission", outcome.reply_text)
+
+
+class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
+    """#439 A 档新增的 revoke 形状 2（``<identifier> <company_id> <metric_name>
+    <reason...>``）：router 层在调用 ``prepare()`` 之前先反查 override_id，
+    找到后退化成与形状 1 完全相同的下游调用；找不到时直接回复，不产生任何待
+    确认操作。"""
+
+    def _revoke_shape_two_text(
+        self,
+        *,
+        identifier: str = "ou_target",
+        company_id: str = "1011",
+        metric_name: str = "daily_active",
+        reason: str = "离职",
+    ) -> str:
+        return f"/admin revoke_permission {identifier} {company_id} {metric_name} {reason}"
+
+    def test_found_override_id_degrades_to_the_same_prepare_call_as_shape_one(self) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_REVOKE)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        queries = FakeQueries(
+            overrides_by_key={("ou_target", "1011", "daily_active"): _VALID_OVERRIDE_ID}
+        )
+        router, _, _, audit = _router(
+            queries=queries, pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_shape_two_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("待确认", outcome.reply_text)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        call = pending_actions.prepare_calls[0]
+        # 找到 override_id 后，下游调用与形状 1 逐字节相同——company_id/
+        # metric_name 依旧保持 None，见 commands.py「退化成与形状 1 完全相同的
+        # 下游调用」文档。
+        self.assertEqual(call["target_open_id"], _VALID_OVERRIDE_ID)
+        self.assertIsNone(call["company_id"])
+        self.assertIsNone(call["metric_name"])
+        self.assertEqual(
+            queries.resolve_override_calls,
+            [("ou_target", "1011", "daily_active")],
+        )
+
+    def test_email_identifier_and_chinese_metric_alias_are_resolved_before_the_lookup(
+        self,
+    ) -> None:
+        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_REVOKE)
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
+        )
+        confirm_cards = FakeConfirmCards(delivered=True)
+        queries = FakeQueries(
+            identifier_aliases={"someone@example.com": "ou_target"},
+            metric_aliases={"新增用户数": "sub_new_count"},
+            overrides_by_key={("ou_target", "1011", "sub_new_count"): _VALID_OVERRIDE_ID},
+        )
+        router, _, _, _ = _router(
+            queries=queries, pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_shape_two_text(
+                identifier="someone@example.com", metric_name="新增用户数"
+            ),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(len(pending_actions.prepare_calls), 1)
+        self.assertEqual(
+            pending_actions.prepare_calls[0]["target_open_id"], _VALID_OVERRIDE_ID
+        )
+
+    def test_unmatched_lookup_replies_without_touching_prepare(self) -> None:
+        """否定断言：零命中/多命中歧义（``resolve_override_id`` 返回 ``None``）
+        直接回复，不产生任何待确认操作、不发送任何卡片。"""
+
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, queries, audit = _router(
+            pending_actions=pending_actions, confirm_cards=confirm_cards
+        )
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=self._revoke_shape_two_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("未找到匹配的当前生效本地覆盖", outcome.reply_text)
+        self.assertEqual(pending_actions.prepare_calls, [])
+        self.assertEqual(confirm_cards.send_calls, [])
+        self.assertEqual(audit.records[-1][1]["code"], "override_not_found")
+
+    def test_unregistered_sender_is_default_denied_same_as_shape_one(self) -> None:
+        pending_actions = FakePendingActions(
+            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
+        )
+        confirm_cards = FakeConfirmCards()
+        router, _, queries, _ = _router(
+            registry=FakeRegistry({}),
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+        )
+
+        outcome = router.route(
+            open_id="ou_never_registered",
+            text=self._revoke_shape_two_text(),
+            trace_id="t1",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+        )
+
+        self.assertFalse(outcome.handled)
+        # 未通过身份判定，压根不会走到反查这一步。
+        self.assertEqual(queries.resolve_override_calls, [])
+        self.assertEqual(pending_actions.prepare_calls, [])
 
 
 if __name__ == "__main__":  # pragma: no cover

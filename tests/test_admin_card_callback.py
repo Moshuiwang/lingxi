@@ -137,6 +137,22 @@ class _RecordingAudit:
         self.records.append((action, fields))
 
 
+class _FakeRecomputeTrigger:
+    """``PermissionRecomputeTrigger`` 的假实现（Issue #438）：只记调用，不做任何
+    真实重算——真实实现的编排在
+    ``adapters/postgres_permission_recompute_trigger.py``，真库全链断言在
+    ``tests/test_permission_recompute_trigger_postgres.py``。"""
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self._raises = raises
+        self.calls: list[PendingAction] = []
+
+    def trigger(self, pending: PendingAction) -> None:
+        self.calls.append(pending)
+        if self._raises is not None:
+            raise self._raises
+
+
 def _build_handler(
     *,
     pending_actions: _FakePendingActions,
@@ -144,6 +160,8 @@ def _build_handler(
     group_notifier: _FakeGroupNotifier | None = None,
     group_chat_id: str | None = "oc_admin_group",
     audit: _RecordingAudit | None = None,
+    management_actions: object | None = None,
+    recompute_trigger: "_FakeRecomputeTrigger | None" = None,
 ) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
     audit = audit or _RecordingAudit()
     handler = AdminCardCallbackHandler(
@@ -152,8 +170,48 @@ def _build_handler(
         group_notifier=group_notifier,
         group_chat_id=group_chat_id,
         audit=audit,
+        management_actions=management_actions,
+        recompute_trigger=recompute_trigger,
     )
     return handler, audit
+
+
+class _FakeRouteOutcome:
+    def __init__(self, *, handled: bool, content_key: str = "", reply_text: str = "") -> None:
+        self.handled = handled
+        self.content_key = content_key
+        self.reply_text = reply_text
+
+
+class _FakeManagementRouter:
+    """``ManagementActionRouter`` 的假实现：记录每次 ``route()`` 调用的完整
+    命令文本，回放预设结论——用于验证 ``handle_management_form_submit``/
+    ``handle_management_revoke`` 是否构造出了正确的等价命令文本，不需要真实
+    数据库（真库端到端集成见 ``tests/test_admin_management_integration_
+    postgres.py``）。"""
+
+    def __init__(self, *, outcome: _FakeRouteOutcome | None = None) -> None:
+        self.route_calls: list[dict[str, object]] = []
+        self._outcome = outcome or _FakeRouteOutcome(
+            handled=True,
+            content_key="admin.write_action_pending",
+            reply_text="已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。",
+        )
+
+    def route(
+        self, *, open_id: str, text: str, trace_id: str, chat_id="", thread_id=None, message_id=""
+    ) -> _FakeRouteOutcome:
+        self.route_calls.append(
+            {
+                "open_id": open_id,
+                "text": text,
+                "trace_id": trace_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "message_id": message_id,
+            }
+        )
+        return self._outcome
 
 
 class UnknownDecisionTests(unittest.TestCase):
@@ -205,7 +263,7 @@ class ConfirmExecutionTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome["toast"]["type"], "success", "executed 状态的 toast 必须是 success")
-        self.assertEqual(outcome["toast"]["content"], "已确认执行")
+        self.assertEqual(outcome["toast"]["content"], "已确认执行，权限变更将即时生效")
         self.assertEqual(outcome["card"]["type"], "raw")
         # 终态卡 data 必须是对象（dict），不是字符串——飞书要的是可以直接被
         # SDK JSON 序列化的结构，不是我们提前 json.dumps 过的字符串。
@@ -578,6 +636,404 @@ class CancelPathTests(unittest.TestCase):
         self.assertEqual(len(pending_actions.cancel_calls), 1)
         self.assertEqual(len(cards.update_calls), 1)
         self.assertEqual(len(group.sent), 1)
+
+
+class ManagementFormSubmitTests(unittest.TestCase):
+    """``AdminCardCallbackHandler.handle_management_form_submit``（#439 B 档）：
+    单元层用假 ``ManagementActionRouter`` 验证命令文本构造是否正确；真实
+    prepare()/确认卡发送的真库集成见
+    ``tests/test_admin_management_integration_postgres.py``。"""
+
+    def test_grant_submission_constructs_the_equivalent_admin_command_text(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批授权",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(len(router.route_calls), 1)
+        call = router.route_calls[0]
+        self.assertEqual(
+            call["text"], "/admin grant_permission ou_target 1011 daily_active 特批授权"
+        )
+        self.assertEqual(call["open_id"], "ou_admin")
+        self.assertEqual(call["message_id"], "om_1")
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertNotIn("card", response)
+
+    def test_suppress_submission_uses_the_suppress_subcommand(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="suppress",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="临时抑制",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertIn("suppress_permission", router.route_calls[0]["text"])
+
+    def test_reason_containing_slash_admin_text_cannot_smuggle_a_second_command(self) -> None:
+        """否定断言（注入面）：``reason`` 里嵌一段看起来像另一条命令的文本，
+        不能让重构后的命令文本被解析成任何别的命令——``reason`` 结构上永远是
+        ``grant_permission``/``suppress_permission`` 固定形状的最后一段，
+        ``commands.py`` 的语法门只会把它整体当成 reason 拼接消费。"""
+
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="正常原因 /admin suspend ou_victim",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        text = router.route_calls[0]["text"]
+        # 整条文本仍然只是一次 grant_permission 调用，注入的 "/admin suspend"
+        # 只是 reason 字段内容的一部分，不会被当成第二条命令解析——真正的证明
+        # 是 core/admin/commands.py 的语法层面：parse_admin_command(text) 只会
+        # 产出一个 GRANT_PERMISSION 结果，reason 整体拼接含那段文本。
+        from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+
+        parsed = parse_admin_command(text)
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_PERMISSION)
+        self.assertIn("/admin suspend ou_victim", parsed.reason)
+
+    def test_not_wired_replies_unavailable_without_crashing(self) -> None:
+        handler, _ = _build_handler(pending_actions=_FakePendingActions())
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+
+    def test_unknown_admin_action_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        handler, audit = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="delete_everything",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [])
+        self.assertIn("admin.card_callback.management_unknown_action", [a for a, _ in audit.records])
+
+    def test_blank_reason_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="   ",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [])
+
+    def test_empty_company_or_metric_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(router.route_calls, [])
+
+    def test_route_not_handled_is_reported_as_an_error_toast(self) -> None:
+        """结构上只会发生在"点击这一刻当前角色恰好已被撤销"——``route()``
+        内部重新判定身份，``handled=False`` 时不能假装成功。"""
+
+        router = _FakeManagementRouter(outcome=_FakeRouteOutcome(handled=False))
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+
+
+class ManagementRevokeClickTests(unittest.TestCase):
+    """``AdminCardCallbackHandler.handle_management_revoke``（#439 B 档）：
+    单元层用假 ``ManagementActionRouter``；真库集成同上。"""
+
+    def test_revoke_click_constructs_the_equivalent_revoke_command_with_the_default_reason(
+        self,
+    ) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(len(router.route_calls), 1)
+        self.assertEqual(
+            router.route_calls[0]["text"],
+            "/admin revoke_permission lpo_01JGFJJZ008XSHEADGG8V74SPC 管理卡逐行收回",
+        )
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertNotIn("card", response)
+
+    def test_not_wired_replies_unavailable_without_crashing(self) -> None:
+        handler, _ = _build_handler(pending_actions=_FakePendingActions())
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+
+    def test_rejection_from_the_router_is_surfaced_as_an_error_toast(self) -> None:
+        router = _FakeManagementRouter(
+            outcome=_FakeRouteOutcome(
+                handled=True,
+                content_key="admin.write_action_rejected",
+                reply_text="未找到匹配的当前生效本地覆盖……",
+            )
+        )
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="lpo_01JGFJJZ008XSHEADGG8V74SPC",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertIn("未找到匹配", response["toast"]["content"])
+
+
+class RecomputeTriggerWiringTests(unittest.TestCase):
+    """确认执行成功后的定向权限重算钩子（Issue #438）：只在这次点击**首次**让
+    操作真正执行成功（``status is EXECUTED`` 且 ``terminal_status`` 非空）时触发；
+    失败降级、不影响已经落库的确认结果；未装配时静默跳过（与
+    ``group_notifier=None`` 同一姿态）。真实重算规则本身不在这里测（见
+    ``tests/test_targeted_permission_recompute.py``），本文件只测"什么时候调用
+    它一次"这条编排。
+    """
+
+    def _confirm_result(self, pending: PendingAction) -> _FakeOutcome:
+        return _FakeOutcome(
+            decision=_FakeDecision(
+                kind=ConfirmResultKind.EXECUTE, ok=True, message="已确认执行。",
+                terminal_status=PendingActionStatus.EXECUTED,
+            ),
+            pending=pending,
+        )
+
+    def test_executed_confirm_triggers_recompute_exactly_once(self) -> None:
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        trigger = _FakeRecomputeTrigger()
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_1",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("即时生效", outcome["toast"]["content"])
+        self.assertEqual(trigger.calls, [pending])
+
+    def test_cancel_does_not_trigger_recompute(self) -> None:
+        pending = _pending(status=PendingActionStatus.CANCELLED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_cancel_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind="cancel", ok=True, message="已取消，未做任何变更。",
+                    terminal_status=PendingActionStatus.CANCELLED,
+                ),
+                pending=pending,
+            )
+        )
+        trigger = _FakeRecomputeTrigger()
+        handler, _audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CANCEL,
+            trace_id="trc_recompute_2",
+        )
+
+        self.assertEqual(trigger.calls, [])
+
+    def test_idempotent_replay_does_not_trigger_recompute_again(self) -> None:
+        """幂等重放（``terminal_status`` 为空，与群通知同一去重判据）不重复触发。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.ALREADY_TERMINAL, ok=False, message="已确认执行。",
+                    terminal_status=None,
+                ),
+                pending=pending,
+            )
+        )
+        trigger = _FakeRecomputeTrigger()
+        handler, _audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_3",
+        )
+
+        self.assertEqual(trigger.calls, [])
+
+    def test_recompute_failure_does_not_propagate_and_is_audited(self) -> None:
+        """降级回每日批：失败只记审计，不影响已经落库的确认结果（硬纪律）。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        trigger = _FakeRecomputeTrigger(raises=RuntimeError("重算适配器炸了"))
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=trigger)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_4",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success", "定向重算失败不改变确认结果本身")
+        self.assertIn(
+            "admin.card_callback.recompute_trigger_failed",
+            [action for action, _ in audit.records],
+        )
+
+    def test_missing_recompute_trigger_is_a_silent_noop(self) -> None:
+        """未装配（``None``）时静默跳过——与 ``group_notifier=None`` 同一姿态。"""
+
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(self._confirm_result(pending))
+        handler, audit = _build_handler(pending_actions=pending_actions, recompute_trigger=None)
+
+        outcome = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_recompute_5",
+        )
+
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertNotIn(
+            "admin.card_callback.recompute_trigger_failed",
+            [action for action, _ in audit.records],
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

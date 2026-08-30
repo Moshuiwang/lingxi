@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-1"
+version = "2026-08-30-2"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -76,6 +76,15 @@ version = "2026-08-30-1"
 # 提示，之后改由文字消息发送最终结果。
 "worker.card_handoff_notice" = "本次处理时间较长，此卡片可能很快不再更新；处理完成后结果将以新消息发送，请留意。"
 "worker.status" = "{action} · {elapsed_seconds} 秒"
+# 停滞明示（Issue #444，产品负责人 2026-08-30 裁定「不做每秒读秒，改做不变即
+# 异常」）：同一枚步骤身份连续出现、累计跨过一个兜底周期
+# （core/execution/card_stream.py 的 STALL_THRESHOLD_SECONDS）仍未换成新的
+# 身份时，改用这句替换 worker.status——{action} 与 worker.status 复用同一份
+# 动作文案（已经带着"停滞发生在哪一步"这个位置信息，例如"正在第 2 次查询
+# 指标数据"），只是把后缀从"总用时"换成更明确的"距上次真正变化过去了多久"，
+# 让用户看得出这不是正常的进度跳动。文案为实施草案，产品负责人过目前不作为
+# 最终定稿。
+"worker.status_stalled" = "{action}（已 {stalled_seconds} 秒无新进展）"
 "worker.queued_timeout" = "任务尚未开始，当前排队已超过等待时间，请稍后重试。"
 "worker.version_unavailable" = "任务尚未开始，当前执行能力暂时不可用，请稍后重试。"
 "worker.running_timeout" = "任务执行超时，结果未能确认，请稍后重试。"

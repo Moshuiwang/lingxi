@@ -88,13 +88,22 @@ class AdminRegistryPostgresTestCase(unittest.TestCase):
         open_id: str = "ou_1",
         provisioning_state: str = "active",
         permission_version: int = 2,
+        email: str | None = None,
     ) -> None:
         self.execute(
             """INSERT INTO app_user
                  (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
-                  department, tenant_key, provisioning_state, permission_version)
-               VALUES (%s, %s, %s, %s, '化名', '测试部门', 'tk_1', %s, %s)""",
-            (user_id, open_id, f"fs_{open_id}", f"un_{open_id}", provisioning_state, permission_version),
+                  department, tenant_key, provisioning_state, permission_version, email)
+               VALUES (%s, %s, %s, %s, '化名', '测试部门', 'tk_1', %s, %s, %s)""",
+            (
+                user_id,
+                open_id,
+                f"fs_{open_id}",
+                f"un_{open_id}",
+                provisioning_state,
+                permission_version,
+                email,
+            ),
         )
 
     def add_event(
@@ -661,6 +670,170 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             trace.failure_occurred_at,
         ]
         self.assertNotIn("ou_should_not_appear", values)
+
+
+class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
+    """``PostgresAdminQueries.resolve_identifier``（#439 A 档）：邮箱 → open_id
+    真库反查。``app_user.email`` 没有唯一约束（迁移基线只对 ``feishu_open_id``
+    建 UNIQUE），零命中/多命中都必须 fail-open（原样返回输入），不猜测。"""
+
+    def test_unique_email_match_resolves_to_open_id(self) -> None:
+        self.add_user(open_id="ou_target", email="someone@example.com")
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(
+            queries.resolve_identifier(identifier="someone@example.com"), "ou_target"
+        )
+
+    def test_zero_hits_falls_back_to_the_original_input(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(
+            queries.resolve_identifier(identifier="nobody@example.com"), "nobody@example.com"
+        )
+
+    def test_multiple_hits_falls_back_to_the_original_input_not_an_arbitrary_pick(self) -> None:
+        """否定断言：同一邮箱命中多个 ``app_user`` 行时不猜测选哪一条，原样
+        透传，交给下游按既有"未找到"语义处理。"""
+
+        self.add_user(user_id="usr_a", open_id="ou_a", email="dup@example.com")
+        self.add_user(user_id="usr_b", open_id="ou_b", email="dup@example.com")
+        queries = PostgresAdminQueries(self._dsn)
+
+        resolved = queries.resolve_identifier(identifier="dup@example.com")
+
+        self.assertEqual(resolved, "dup@example.com")
+        self.assertNotIn(resolved, ("ou_a", "ou_b"))
+
+    def test_non_email_identifier_is_returned_verbatim_without_querying(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.resolve_identifier(identifier="ou_plain"), "ou_plain")
+
+
+class ResolveOverrideIdTests(AdminRegistryPostgresTestCase):
+    """``PostgresAdminQueries.resolve_override_id``（#439 A 档 revoke 新参数
+    形状）：按「open_id + 公司 + 指标」真库反查当前生效的覆盖行 override_id。"""
+
+    def add_pending_action_for_override(self, *, pending_id: str) -> str:
+        now = datetime.now(timezone.utc)
+        self.execute(
+            """INSERT INTO pending_action
+                   (id, action_type, target_open_id, target_state_snapshot,
+                    initiated_by_open_id, status, confirm_deadline_at,
+                    decided_at, decided_by_open_id)
+                 VALUES (%s, 'suspend_user', %s, 'enabled', %s, 'executed', %s, %s, %s)""",
+            (
+                pending_id,
+                f"ou_bystander_for_{pending_id}",
+                "ou_admin",
+                now + timedelta(minutes=10),
+                now,
+                "ou_admin",
+            ),
+        )
+        return pending_id
+
+    def test_unique_match_resolves_to_the_override_id(self) -> None:
+        self.add_user(user_id="usr_target", open_id="ou_target")
+        store = PostgresLocalPermissionOverrideStore(self._dsn)
+        pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        override = store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.GRANT,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=pending_id,
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        resolved = queries.resolve_override_id(
+            open_id="ou_target", company_id="1011", metric_name="daily_active"
+        )
+
+        self.assertEqual(resolved, override.id)
+
+    def test_no_match_returns_none(self) -> None:
+        self.add_user(user_id="usr_target", open_id="ou_target")
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(
+            queries.resolve_override_id(
+                open_id="ou_target", company_id="1011", metric_name="daily_active"
+            )
+        )
+
+    def test_revoked_override_no_longer_matches(self) -> None:
+        """否定断言：已收回的行不再生效，反查不应该命中它。"""
+
+        self.add_user(user_id="usr_target", open_id="ou_target")
+        store = PostgresLocalPermissionOverrideStore(self._dsn)
+        grant_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        override = store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.GRANT,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=grant_pending_id,
+        )
+        revoke_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        store.revoke(override_id=override.id, revoked_pending_action_id=revoke_pending_id)
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(
+            queries.resolve_override_id(
+                open_id="ou_target", company_id="1011", metric_name="daily_active"
+            )
+        )
+
+    def test_ambiguous_match_across_grant_and_suppress_returns_none(self) -> None:
+        """否定断言：同一 (公司, 指标) 键理论上可以同时存在一条生效授权与一条
+        生效抑制（迁移 ``0072`` 的唯一索引按 ``direction`` 再分），此时反查不应
+        猜测该收回哪一条，必须返回 ``None``——调用方据此提示改用管理卡逐行收回
+        或直接指定 override_id。"""
+
+        self.add_user(user_id="usr_target", open_id="ou_target")
+        store = PostgresLocalPermissionOverrideStore(self._dsn)
+        grant_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.GRANT,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=grant_pending_id,
+        )
+        suppress_pending_id = self.add_pending_action_for_override(pending_id=new_id("pac"))
+        store.insert(
+            user_id="usr_target",
+            direction=OverrideDirection.SUPPRESS,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="临时抑制",
+            initiated_by_open_id="ou_admin",
+            pending_action_id=suppress_pending_id,
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(
+            queries.resolve_override_id(
+                open_id="ou_target", company_id="1011", metric_name="daily_active"
+            )
+        )
+
+    def test_unknown_open_id_returns_none(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(
+            queries.resolve_override_id(
+                open_id="ou_never_existed", company_id="1011", metric_name="daily_active"
+            )
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

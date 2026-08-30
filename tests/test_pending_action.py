@@ -24,6 +24,7 @@ from lingxi.core.admin.pending_action import (
     decide_cancel,
     decide_confirm,
     decide_prepare,
+    format_in_flight_conflict_message,
 )
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, AdminRole
 
@@ -642,6 +643,59 @@ class DecideCancelTests(unittest.TestCase):
         pending = _pending()
         decision = decide_cancel(pending=pending, clicker_open_id=INITIATOR, now=NOW)
         self.assertTrue(decision.ok)
+
+
+class FormatInFlightConflictMessageTests(unittest.TestCase):
+    """``format_in_flight_conflict_message`` 纯函数断言（Trace #445 #437 拦截
+    文案改进）：拒绝文案须带在途操作摘要（动作/发起时间/截止时间）与自助指引，
+    修复真实运维事故"提示不说、旧卡可能淹没在历史消息里"（Issue #437 TO PM）。
+    """
+
+    def test_message_names_the_action_type_in_chinese_not_the_raw_enum_value(self) -> None:
+        pending = _pending(action_type=PendingActionType.SUSPEND_USER)
+        message = format_in_flight_conflict_message(blocking=pending)
+        self.assertIn("停用用户", message)
+        self.assertNotIn("suspend_user", message, "不得把内部字面量原样展示给管理员")
+
+    def test_message_maps_every_action_type_to_a_distinct_chinese_name(self) -> None:
+        """五种动作类型各自映射到不同的中文展示名，不共用一个默认兜底文案
+        ——挡"漏映射悄悄退化成同一句话"这类变异。"""
+
+        names = {
+            action_type: format_in_flight_conflict_message(blocking=_pending(action_type=action_type))
+            for action_type in PendingActionType
+        }
+        self.assertEqual(len(set(names.values())), len(PendingActionType))
+
+    def test_message_includes_beijing_time_for_both_started_and_deadline(self) -> None:
+        pending = _pending()  # created_at = NOW-5s，confirm_deadline_at = NOW+600s
+
+        message = format_in_flight_conflict_message(blocking=pending)
+
+        # NOW = 2026-08-24 12:00:00 UTC；+8 小时展示为北京时间。
+        self.assertIn("2026-08-24 19:59", message, "发起时间须换算成北京时间展示")
+        self.assertIn("2026-08-24 20:10", message, "截止时间须换算成北京时间展示")
+        self.assertEqual(message.count("北京时间"), 2, "两个时间点都要显式标注时区，不能只标一处")
+
+    def test_message_offers_self_help_guidance_for_both_expired_and_still_pending_cases(
+        self,
+    ) -> None:
+        pending = _pending()
+        message = format_in_flight_conflict_message(blocking=pending)
+        self.assertIn("自动释放", message, "须告知已过期的旧操作会在下次发起时自动释放")
+        self.assertIn("确认执行", message, "须告知未过期时可以在原卡片上如何自助处理")
+        self.assertIn("取消", message)
+
+    def test_is_a_pure_function_not_reading_the_clock(self) -> None:
+        """两次调用同一个不可变 ``PendingAction`` 必须返回逐字节相同的文案——
+        不偷偷读当前时钟（``blocking`` 的两个时间戳已经是调用方读到的既有字段，
+        不是"距离现在还有多久"这类相对表达）。"""
+
+        pending = _pending()
+        self.assertEqual(
+            format_in_flight_conflict_message(blocking=pending),
+            format_in_flight_conflict_message(blocking=pending),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

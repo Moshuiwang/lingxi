@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-30-1"
-digest = "sha256:500950c2182b750efe1a4dd3fd20b5e0a328bbf805776c420531e8373d32e8ef"
+version = "2026-08-30-2"
+digest = "sha256:a004225a5a155fd0dfc65b4cf020d65a4d1c5369e62a3b0658d3473c760394ad"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -26,6 +26,7 @@ retired_versions = [
   "2026-08-28-3",
   "2026-08-28-4",
   "2026-08-29-1",
+  "2026-08-30-1",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -131,6 +132,7 @@ retired_versions = [
 "texts.worker.running_timeout" = "b80cbbea99dbb67d"
 "texts.worker.side_effect_uncertain" = "99b6049d4bdf02bb"
 "texts.worker.status" = "239f0acefdd3bb7e"
+"texts.worker.status_stalled" = "9e5e80fd74bd191a"
 "texts.worker.stopped" = "a3ee9454ed117e00"
 "texts.worker.stopped_result" = "f87de4193e751578"
 "texts.worker.version_unavailable" = "9bd7e2f21d6550c5"
