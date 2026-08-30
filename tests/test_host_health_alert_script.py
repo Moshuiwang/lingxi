@@ -193,6 +193,26 @@ class RenderMessageTests(unittest.TestCase):
             )
 
 
+class NowIsoTimezoneAnnotationTests(unittest.TestCase):
+    """B-8 遗留第 3 项（Trace #469 修复包 B）核实结论：``_now_iso()`` 用于
+    `render_message`/`render_threshold_message` 里「时间：{now}」这一行，已经
+    是带显式 UTC 偏移量的 ISO-8601 字符串（``datetime.now(timezone.utc)
+    .astimezone().isoformat()``——先转成本机时区的 aware datetime，再序列化，
+    偏移量永远和序列化时刻的本机时钟一致），与 ``core/alerting.py`` S-1 修复
+    的告警范式（``AlertNotice.text`` 的 ``self.observed_at.isoformat()``，
+    同样是 aware datetime 直接 isoformat，同一套"数字偏移量而非人类可读时区名"
+    表达方式）完全一致——不是本批新引入的裸 ``datetime.now()`` 无时区字符串。
+    核实证据，不改代码。"""
+
+    def test_now_iso_includes_an_explicit_utc_offset(self) -> None:
+        text = host_health_alert._now_iso()
+
+        parsed = datetime.fromisoformat(text)
+
+        self.assertIsNotNone(parsed.tzinfo, "时间戳必须带显式时区，不能是裸 naive datetime")
+        self.assertIsNotNone(parsed.utcoffset())
+
+
 class CredentialLoadingTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

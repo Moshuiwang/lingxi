@@ -194,6 +194,62 @@ class FailureTopTests(unittest.TestCase):
             build_failure_top([], limit=0)
 
 
+class FailureTopHumanizationTests(unittest.TestCase):
+    """Trace #469 修复包 B，B-8 遗留第 2 项：管理员日报「失败分类 Top」此前
+    直出 ``task.error_kind`` 英文机器码，沿用 ``core/admin/router.py`` B-6
+    建立的显示名映射姿势——已登记的原因码换成中文，未登记的回退成「原值
+    （未登记显示名）」。"""
+
+    def test_known_reason_codes_are_rendered_in_chinese_not_raw_english(self) -> None:
+        top = (
+            FailureReasonCount("turn_timeout", 3),
+            FailureReasonCount("max_turns_exceeded", 1),
+        )
+        inputs = _all_determined_inputs(failure_top=top)
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("- 单轮对话超时：3 次", text)
+        self.assertIn("- 对话轮数超限：1 次", text)
+        self.assertNotIn("turn_timeout", text)
+        self.assertNotIn("max_turns_exceeded", text)
+
+    def test_known_reason_code_stays_humanized_when_throttled(self) -> None:
+        top = (FailureReasonCount("session_failed", 5),)
+        inputs = _all_determined_inputs(failure_top=top)
+        throttled = (ThrottledFailureLine("session_failed", 5, streak_days=9, throttled=True),)
+
+        text = render_daily_report(inputs, throttled_failure_lines=throttled)
+
+        self.assertIn("- 会话执行失败：5 次（连续第 9 天，已节流）", text)
+        self.assertNotIn("session_failed", text)
+
+    def test_an_unregistered_but_shape_valid_reason_code_falls_back_visibly(self) -> None:
+        """通过了 ``_safe_reason_code`` 形状白名单、但没有登记中文显示名的
+        取值（未来新增了 error_kind 却忘了同步这张表）：不假装认识，回退成
+        「原值（未登记显示名）」，管理员至少还能看到原始取值。"""
+
+        top = (FailureReasonCount("some_future_error_kind", 2),)
+        inputs = _all_determined_inputs(failure_top=top)
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("- some_future_error_kind（未登记显示名）：2 次", text)
+
+    def test_the_shape_whitelist_sentinel_other_is_not_relabeled(self) -> None:
+        """``"other"`` 是 ``_safe_reason_code`` 自己的安全哨兵值，不是真实
+        ``error_kind``——不应该被套上「未登记显示名」这句提示，它本身已经是
+        一个管理员看得懂的词。"""
+
+        top = (FailureReasonCount("哈哈哈", 1),)  # 形状之外字符，触发 "other" 兜底
+        inputs = _all_determined_inputs(failure_top=top)
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("- other：1 次", text)
+        self.assertNotIn("未登记显示名", text)
+
+
 class GuardTriggeredTests(unittest.TestCase):
     def test_sums_only_known_guard_reason_codes(self) -> None:
         rows = [

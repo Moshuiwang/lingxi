@@ -433,7 +433,11 @@ class SendFailureTests(unittest.TestCase):
         self.assertEqual(duty._reason_streaks, {})  # noqa: SLF001 - 白盒断言内部未提交
         text = duty.run_once()
         assert text is not None
-        self.assertIn("session_failed：1 次", text)
+        # Trace #469 修复包 B，B-8：「失败分类 Top」的原因码自本批起渲染成
+        # 中文显示名（见 core/daily_report.py `_humanize_error_kind`），
+        # "session_failed" → "会话执行失败"，本用例只关心节流状态是否正确
+        # 提交/归零，断言随之改用渲染后的中文文本。
+        self.assertIn("会话执行失败：1 次", text)
         self.assertNotIn("连续第", text)
 
 
@@ -508,7 +512,11 @@ class ThrottleAcrossDaysTests(unittest.TestCase):
         duty._source = present  # noqa: SLF001 - 第二天恢复出现
         text = duty.run_once()
         assert text is not None
-        self.assertIn("session_failed：1 次", text)
+        # Trace #469 修复包 B，B-8：「失败分类 Top」的原因码自本批起渲染成
+        # 中文显示名（见 core/daily_report.py `_humanize_error_kind`），
+        # "session_failed" → "会话执行失败"，本用例只关心节流状态是否正确
+        # 提交/归零，断言随之改用渲染后的中文文本。
+        self.assertIn("会话执行失败：1 次", text)
         self.assertNotIn("连续第", text)
 
 
