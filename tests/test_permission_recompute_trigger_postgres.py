@@ -135,11 +135,21 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
         )
         self.assertTrue(decision.enqueued)
 
-    def prepare_and_deliver(self, *, action_type: PendingActionType) -> str:
+    def prepare_and_deliver(
+        self,
+        *,
+        action_type: PendingActionType,
+        company_id: str | None = None,
+        metric_name: str | None = None,
+        reason: str | None = None,
+    ) -> str:
         outcome = self.pending_actions.prepare(
             action_type=action_type,
             target_open_id=TARGET_OPEN_ID,
             initiated_by_open_id=ADMIN_OPEN_ID,
+            company_id=company_id,
+            metric_name=metric_name,
+            reason=reason,
         )
         self.assertTrue(outcome.decision.ok, outcome.decision.message)
         assert outcome.pending is not None
@@ -256,6 +266,88 @@ class ResumeDegradesToDailyBatchWhenGalaxyDataIsMissingTests(
         fields = self.audit.fields_for("permission_targeted_recompute.skipped")
         self.assertEqual(fields["mode"], "recompute")
         self.assertEqual(fields["reason"], "missing_roster_snapshot")
+        self.assertNotIn(
+            "admin.card_callback.recompute_trigger_failed", self.audit.actions()
+        )
+
+
+class LocalPermissionGrantResolvesTheOwningUserIdTests(PermissionRecomputeTriggerPostgresTestCase):
+    """``LOCAL_PERMISSION_GRANT`` confirm 全链真库断言（Issue #438 补卡）。
+
+    本地权限三类动作里，只有 ``LOCAL_PERMISSION_REVOKE`` 复用 ``target_open_id``
+    形参承载 override_id（见 ``adapters/postgres_pending_action.py`` 模块文档
+    「本地权限收回如何复用同一套机制」）；``LOCAL_PERMISSION_GRANT``/``SUPPRESS``
+    的 ``target_open_id`` 全程是真实飞书 open_id，`confirm()` 的 EXECUTE 分支才
+    在 ``local_permission_override`` 表新插入一行，把这次确认卡自己的
+    ``pending_action.id`` 写进新行的 ``pending_action_id`` 列（同一文件「本地权限
+    授权/抑制如何复用同一套机制」）。
+
+    ``adapters/postgres_targeted_recompute_lookup.py::resolve_local_override_target``
+    因此按 ``pending_action_id = pending.id`` 反查出这一行的 ``user_id``（真正的
+    ``app_user.id``），不依赖、也不解析 ``target_open_id``——这条反查链路此前只有
+    假 store 的单测覆盖，本用例走真实 PostgreSQL 全链（``prepare()`` → 真实
+    ``confirm()`` 事务 → 真实 INSERT → 真实反查 → ``TargetedPermissionRecompute``），
+    坐实反查结果确实是这一行的 ``user_id``，不是 ``override_id`` 本身、也不是
+    ``pending_action_id`` 本身（三者是三个不同前缀的 ULID，历史上一次反查逻辑
+    退化成"直接把某个标识透传当 user_id 用"的编码错误，字符串层面的相等断言
+    足以拦住）。
+
+    与 ``ResumeDegradesToDailyBatchWhenGalaxyDataIsMissingTests`` 同一降级前提：
+    这个真库环境没有铺花名册快照，`recompute_and_publish` 结构上必然停在
+    ``missing_roster_snapshot`` 跳过分支（`TargetedPermissionRecompute.
+    recompute_and_publish` 判据顺序：花名册基线 → 花名册快照 → 银河批次，本用例
+    只保证前两步的判据都成立、真正到达第二步）——本用例的关键断言不是"重算产出
+    了新发布行"（这条已经由 SUSPEND 用例覆盖过"重算真的发生"的同族证据），而是
+    "跳过审计记的 user 字段是正确的内部用户 id"。
+    """
+
+    def test_confirmed_grant_resolves_the_owning_user_id_not_the_override_id(self) -> None:
+        user_id = self.add_target_user(account_state="enabled")
+
+        pending_id = self.prepare_and_deliver(
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            company_id="1011",
+            metric_name="daily_active",
+            reason="真库全链用例特批",
+        )
+
+        outcome = self.handler.handle(
+            operator_open_id=ADMIN_OPEN_ID,
+            pending_action_id=pending_id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_grant_1",
+        )
+
+        # 确认执行本身必须成功——回执带"即时生效"（Issue #438 回执文案要求）。
+        self.assertEqual(outcome["toast"]["type"], "success")
+        self.assertIn("即时生效", outcome["toast"]["content"])
+
+        # 真实反查依赖的形状：confirm() 新插入的这一行，pending_action_id 恰好
+        # 是这次确认卡自己的 id，user_id 是目标用户的内部标识，两者与 override_id
+        # 本身互不相同（三个不同前缀的 ULID：lpo_/pac_/usr_）。
+        rows = self.query(
+            "SELECT id, user_id, pending_action_id FROM local_permission_override"
+            " WHERE pending_action_id = %s",
+            (pending_id,),
+        )
+        self.assertEqual(len(rows), 1, "确认执行应当恰好新建一条本地授权覆盖行")
+        override_id, override_user_id, override_pending_action_id = rows[0]
+        self.assertEqual(override_user_id, user_id)
+        self.assertEqual(override_pending_action_id, pending_id)
+        self.assertNotEqual(override_id, user_id)
+
+        # 关键断言（Issue #438 补卡）：定向重算的跳过审计里，user 字段是反查出的
+        # 真正 app_user.id，不是 override_id、也不是触发本次回调的 pending_id。
+        fields = self.audit.fields_for("permission_targeted_recompute.skipped")
+        self.assertEqual(fields["mode"], "recompute")
+        self.assertEqual(fields["reason"], "missing_roster_snapshot")
+        self.assertEqual(fields["user"], user_id)
+        self.assertNotEqual(fields["user"], override_id)
+        self.assertNotEqual(fields["user"], pending_id)
+
+        self.assertNotIn(
+            "permission_targeted_recompute.target_unresolved", self.audit.actions()
+        )
         self.assertNotIn(
             "admin.card_callback.recompute_trigger_failed", self.audit.actions()
         )

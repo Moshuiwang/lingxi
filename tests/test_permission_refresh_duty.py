@@ -1103,6 +1103,40 @@ class LocalOverrideMergeTest(unittest.TestCase):
             reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
         )
 
+    def test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """通配角 v2（`Issue #440`）：``all_companies=True`` 但成因是
+        ``scope.all_countries``（银河「全非」通配）、职能不含
+        :data:`ADMIN_FULL_ACCESS_FUNCTION`——「有限指标 ``*``」形态。判据
+        ``ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions`` 为假，接线传
+        ``full_access_wildcard=False``：本地授权改为在 ``"*"`` 清单上参与并集，
+        不再被误判成冗余而整体跳过（修复前的缺陷）。"""
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "0"),),
+            country_rows=(
+                ("0", "ALL", "全非", "0"),
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+            ),
+        )
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),)}
+        )
+        duty, parts = build_duty(identities=(identity(),), galaxy=galaxy, local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            row.permissions,
+            f'{{"*":["{METRIC_NAME}","额外授权"]}}',
+            "有限指标通配下本地授权应参与并集，不整体跳过",
+        )
+        self.assertNotIn(
+            "permission_refresh.local_override_skipped",
+            parts["audit"].actions(),
+            "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
+        )
+
 
 # --------------------------------------------------------------------------
 # 四、撤权与输入不完整：全部失败关闭

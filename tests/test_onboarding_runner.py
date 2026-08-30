@@ -56,8 +56,13 @@ from lingxi.core.identity.stock_token_source import (
 )
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
-from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.merge_sources import (
+    REASON_GRANT_REDUNDANT_WILDCARD,
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
+)
 from lingxi.core.permission.metric_translation import translate_company_functions
+from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 UTC = timezone.utc
 OPEN_ID = "ou_employee_1"
@@ -659,6 +664,31 @@ class TwoCompanyGalaxySnapshot(FakeGalaxySnapshot):
         )
 
 
+class AllCountriesGalaxySnapshot(FakeGalaxySnapshot):
+    """银河「全非」通配授权（``scope.all_countries=True``，`galaxy_scope.py` 哨兵
+    展开）——与 ``ADMIN_FULL_ACCESS_FUNCTION`` 职能是两个互相独立的
+    ``all_companies=True`` 成因（`Issue #440` 通配角 v2）。快照仍需要至少一个非哨兵
+    国家行，否则 ``aggregate_permission`` 会因 ``company_ids`` 为空提前拒绝
+    （该判据不看 ``all_countries``）。"""
+
+    country_rows = (
+        {"country_key": "0", "name": "ALL", "name_cn": "全非", "boss_company_id": "0"},
+        {"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},
+    )
+
+    def datacountry_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return ({"user_id": galaxy_user_id, "datacountry_id": "0"},)
+
+
+class AdminRoleGalaxySnapshot(FakeGalaxySnapshot):
+    """持有 :data:`ADMIN_FULL_ACCESS_FUNCTION` 职能——`aggregate_permission` 的
+    「角色即全公司」特例，强制 ``all_companies=True``，与上面的「全非」通配是两个
+    独立成因中的另一个（真全指标通配，`merge_sources` 模块文档「通配角 v2」）。"""
+
+    def role_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return ({"user_id": galaxy_user_id, "role_id": "r_admin", "role_name": ADMIN_FULL_ACCESS_FUNCTION},)
+
+
 class LocalOverrideMergeTests(unittest.TestCase):
     """开通侧的四源合并接线（S-P-3，Issue #319）：与
     ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 同一组断言，
@@ -745,6 +775,72 @@ class LocalOverrideMergeTests(unittest.TestCase):
         self.assertIs(result.state, OnboardingState.STARTED)
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["额外授权"]}')
+
+    def test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """通配角 v2（`Issue #440`）：``all_companies=True`` 但成因是
+        ``scope.all_countries``（银河「全非」通配）、职能不含
+        :data:`ADMIN_FULL_ACCESS_FUNCTION`——「有限指标 ``*``」形态。判据
+        ``ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions`` 为假，接线传
+        ``full_access_wildcard=False``：本地授权改为在 ``"*"`` 清单上参与并集，
+        不再被误判成冗余而整体跳过（onboarding 侧与每日重算同一接线，见
+        ``tests/test_permission_refresh_duty.py`` 同名用例）。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ID: (_override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),)}
+        )
+        parts, result = run_once(
+            galaxy=FakeGalaxy(AllCountriesGalaxySnapshot()),
+            metric_translation_map={"*": {"销售分析": ("销售分析",)}},
+            local_overrides=overrides,
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"*":["销售分析","额外授权"]}',
+            "有限指标通配下本地授权应参与并集，不整体跳过",
+        )
+        self.assertNotIn(
+            "onboarding.local_override_skipped",
+            parts["audit"].actions(),
+            "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
+        )
+
+    def test_full_access_wildcard_admin_still_skips_both_grant_and_suppress(self) -> None:
+        """回归防护：真全指标通配（``ADMIN_FULL_ACCESS_FUNCTION`` 职能）下判据仍为
+        真，接线保持 ``full_access_wildcard=True``——通配角 v1 的既有行为（本地授权
+        / 抑制整体不参与合并）逐字节不变，不因 v2 判据接线而被误伤（onboarding 侧，
+        与每日重算 ``LocalOverrideMergeTest.
+        test_wildcard_admin_skips_both_grant_and_suppress_with_audit`` 同一断言）。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),
+                )
+            }
+        )
+        parts, result = run_once(
+            galaxy=FakeGalaxy(AdminRoleGalaxySnapshot()),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: ("销售分析",)}},
+            local_overrides=overrides,
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"*":["销售分析"]}',
+            "真全指标通配下本地源整体不生效",
+        )
+        skipped = [
+            fields for name, fields in parts["audit"].records if name == "onboarding.local_override_skipped"
+        ]
+        reasons = {fields["reason"] for fields in skipped}
+        self.assertEqual(
+            reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
+        )
 
 
 class ZeroGalaxyLocalGrantTests(unittest.TestCase):

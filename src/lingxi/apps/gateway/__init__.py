@@ -40,6 +40,11 @@ from lingxi.adapters.feishu_longconn import (
     TerminationReason,
 )
 from lingxi.apps.liveness import touch_liveness
+from lingxi.core.admin.management_card import (
+    ADMIN_ACTION_GRANT,
+    ADMIN_ACTION_REVOKE,
+    ADMIN_ACTION_SUPPRESS,
+)
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
@@ -241,6 +246,61 @@ class _RecordingOnboarding:
         return OnboardingResult(state=OnboardingState.STARTED)
 
 
+def _management_card_form_value(payload: dict) -> dict[str, str]:
+    """从原始 ``card.action.trigger`` 事件体里取出表单容器提交的字段值
+    （``event.action.form_value``）。
+
+    **证据等级 1**：``parse_card_action_event``（``adapters/feishu_events.py``）
+    只解析按钮自己的 ``action.value``（``core/admin/management_card.py`` 建卡时
+    写进按钮 ``behaviors[].value`` 的那几个键：``admin_action``/``identifier``/
+    ``override_id``），不解析表单容器（``form``）字段——``company_id``/
+    ``metric_name``/``reason`` 是管理员在下拉/输入框里填的，按飞书卡片 2.0
+    《配置卡片交互》文档的表单回传形状，随提交事件出现在与 ``action.value``
+    同级的 ``action.form_value``（``{字段 name: 已填值}``），不在 ``value``
+    本身里。真实回调事件体是否逐字符合仍未经真实网络往返验证（`biai-stage`
+    L4a 范围，与 ``management_card.py`` 模块文档同一等级标注）。
+
+    只保留字符串/数字这类简单标量并统一转字符串——与
+    ``parse_card_action_event`` 对 ``action.value`` 的既有过滤同一姿态（不信任
+    事件体里出现的任何嵌套结构，读不出就是缺这个字段，交给
+    ``card_callback.py`` 的必填校验拒绝，不在这里抛错）。
+    """
+
+    event = payload.get("event") if isinstance(payload, dict) else None
+    action = event.get("action") if isinstance(event, dict) else None
+    raw_form_value = action.get("form_value") if isinstance(action, dict) else None
+    if not isinstance(raw_form_value, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in raw_form_value.items()
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+    }
+
+
+def _management_card_context(payload: dict) -> tuple[str, str]:
+    """从原始事件体的 ``event.context`` 里取出触发这次点击的 ``chat_id``/
+    ``message_id``——管理卡表单提交/收回按钮转译成的等价命令文本要经
+    ``AdminCommandRouter.route()`` 发一张**新**确认卡，需要知道回复到哪个会话、
+    哪一条消息（见 ``core/admin/router.py`` ``route()`` 的 ``chat_id``/
+    ``message_id`` 文档）。飞书卡片回调事件体的 ``context.open_chat_id``/
+    ``context.open_message_id`` 就是这张管理卡自己所在的会话与消息（依据同一份
+    飞书卡片 2.0 公开文档，证据等级同上——未经真实回调验证）。管理卡是私聊卡片，
+    不涉及话题群，``thread_id`` 恒传 ``None``（与 ``route()`` 默认值一致）。
+    """
+
+    event = payload.get("event") if isinstance(payload, dict) else None
+    context = event.get("context") if isinstance(event, dict) else None
+    if not isinstance(context, dict):
+        return "", ""
+    chat_id = context.get("open_chat_id", "")
+    message_id = context.get("open_message_id", "")
+    return (
+        str(chat_id) if isinstance(chat_id, (str, int, float)) else "",
+        str(message_id) if isinstance(message_id, (str, int, float)) else "",
+    )
+
+
 def make_event_handler(
     pipeline: EventPipeline,
     *,
@@ -273,6 +333,27 @@ def make_event_handler(
     为原始带按钮状态——这正是本次要修的缺陷，根因不在这一行本身（本函数从未
     尝试构造应答），而在于它把已经算好的应答值原地丢弃。普通消息事件分支
     （``pipeline.handle_message``）不返回任何东西，隐式 ``None``，行为不变。
+
+    **管理卡表单提交/逐行收回分支（Issue #439 B 档接线）**：
+    ``card.action.trigger`` 事件体的 ``action.value`` 里出现 ``admin_action``
+    键（``core/admin/management_card.py`` 建卡时写进按钮回调值的那个字段）就是
+    管理卡交互，不是确认/取消卡片——两者的 ``action.value`` 形状结构上不相交
+    （确认/取消卡片带 ``pending_action_id``/``decision``，管理卡带
+    ``admin_action``），因此可以只按这一个键的存在与取值分流，不需要额外的
+    卡片来源标记：
+
+    - ``admin_action == "revoke"``（逐行「收回」按钮）：解析出 ``override_id``，
+      调用 :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
+      handle_management_revoke`。
+    - ``admin_action`` 是 ``"grant"``/``"suppress"``（表单提交）：额外从
+      ``action.form_value``（:func:`_management_card_form_value`）取出
+      ``company_id``/``metric_name``/``reason``，调用
+      :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
+      handle_management_form_submit`。
+    - 其余取值（含 ``admin_action`` 缺失/空）：不认识的 action 维持既有兜底
+      行为逐字节不变——落到下面 ``decision``/``pending_action_id`` 这条既有
+      分支，读不到有效 ``decision`` 时由 ``handle()`` 自己的
+      ``unknown_decision`` 分支拒绝，与本次改动之前完全一致。
     """
 
     def handle(payload: dict) -> dict | None:
@@ -289,6 +370,35 @@ def make_event_handler(
                 if on_parse_error is not None:
                     on_parse_error(str(error))
                 return None
+            admin_action = action_event.action_value.get("admin_action", "")
+            if admin_action == ADMIN_ACTION_REVOKE:
+                chat_id, message_id = _management_card_context(payload)
+                return card_callback_handler.handle_management_revoke(
+                    operator_open_id=action_event.operator_open_id,
+                    override_id=action_event.action_value.get("override_id", ""),
+                    chat_id=chat_id,
+                    thread_id=None,
+                    message_id=message_id,
+                    trace_id=action_event.trace_id,
+                )
+            if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
+                form_value = _management_card_form_value(payload)
+                chat_id, message_id = _management_card_context(payload)
+                return card_callback_handler.handle_management_form_submit(
+                    operator_open_id=action_event.operator_open_id,
+                    admin_action=admin_action,
+                    identifier=action_event.action_value.get("identifier", ""),
+                    company_id=form_value.get("company_id", ""),
+                    metric_name=form_value.get("metric_name", ""),
+                    reason=form_value.get("reason", ""),
+                    chat_id=chat_id,
+                    thread_id=None,
+                    message_id=message_id,
+                    trace_id=action_event.trace_id,
+                )
+
+            # 不认识的 action（含 admin_action 缺失/空）：既有确认/取消分支，
+            # 逐字节不变。
             decision = action_event.action_value.get("decision", "")
             pending_action_id = action_event.action_value.get("pending_action_id", "")
             return card_callback_handler.handle(
@@ -464,6 +574,13 @@ def build_supervisor(
         group_notifier=group_notifier,
         group_chat_id=config.admin_group_chat_id,
         audit=audit,
+        # 管理卡表单提交/逐行收回（Issue #439 B 档接线）：复用已经在上面装好的
+        # 同一个 AdminCommandRouter 实例——`handle_management_form_submit`/
+        # `handle_management_revoke` 把管理卡交互转译成等价的 `/admin ...`
+        # 命令文本，交给它的 `route()` 走全部既有写路径判定（角色核对、自我
+        # 目标防呆、prepare()、确认卡发送、审计），不重新实现一遍（见
+        # `core/admin/card_callback.py` `ManagementActionRouter` 文档）。
+        management_actions=admin_router,
         # 定向权限重算（Issue #438）：无条件装配，不受任何前置配置控制——它内部
         # 的每一个依赖都只需要 gateway 本来就有的 Postgres DSN 与随包发布的静态
         # 映射文件（见该适配器模块文档），失败降级回每日批,不影响确认结果本身。

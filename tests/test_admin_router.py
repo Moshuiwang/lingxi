@@ -386,6 +386,16 @@ class HelpCommandTests(unittest.TestCase):
         self.assertIn("super_admin", outcome.reply_text)
         self.assertEqual(audit.actions(), ["admin.command.help"])
 
+    def test_help_uses_the_bi_plus_external_name(self) -> None:
+        """#443 对外名称统一：管理命令帮助首行不得残留旧名「Lingxi」。"""
+
+        router, _, _, _ = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
+
+        self.assertTrue(outcome.reply_text.startswith("BI Plus 管理命令："))
+        self.assertNotIn("Lingxi", outcome.reply_text)
+
 
 class QueryUserCommandTests(unittest.TestCase):
     def test_found_user_status_reported(self) -> None:

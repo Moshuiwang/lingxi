@@ -862,7 +862,7 @@ class AdminCommandRouter:
 def _render_help(roles: Sequence[str]) -> str:
     role_line = "、".join(roles) if roles else "(无)"
     return (
-        "Lingxi 管理命令：\n"
+        "BI Plus 管理命令：\n"
         "/admin help — 显示本帮助\n"
         "/admin user <标识> — 查询用户开通状态并调出权限管理卡（标识支持邮箱或 open_id）\n"
         "/admin audit [标识] [小时数] — 查询最近事件（默认 24 小时，标识支持邮箱或 open_id）\n"
