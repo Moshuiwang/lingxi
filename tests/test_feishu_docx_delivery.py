@@ -646,6 +646,84 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         with self.assertRaises(LookupError):
             client.convert_markdown_to_blocks("正文")
 
+    def test_a_duplicate_block_id_in_mapping_blocks_is_rejected_as_a_count_mismatch(
+        self,
+    ) -> None:
+        """rc21 修复包 B（P3 docx 对账，opus 审查发现）：``blocks`` 数组里出现
+        两个块共用同一个 ``block_id``（``blk-1``）。建映射的字典推导式
+        （``by_block_id = {block["block_id"]: block for block in
+        mapping_blocks}``）会用后一个静默覆盖前一个——复现"重复 block_id
+        静默丢块"：前一个块（这里是"第一段"）的内容会从返回结果里凭空消失，
+        且不留任何痕迹。重排后的块数（2，等于 ``first_level_block_ids`` 的
+        长度）与原始 ``mapping_blocks`` 块数（3）对不上，必须 definite 拒绝。
+
+        变异存活证据：把 ``len(ordered_blocks) != len(mapping_blocks)`` 这条
+        对账删掉，本用例会从抛出 `FeishuDocxDeliveryError` 变红成静默返回
+        只含"第二段"（丢弃"第一段"）与"blk-2"两个块的结果。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-1", "block_type": 2, "text": "第一段"},
+                            {"block_id": "blk-1", "block_type": 2, "text": "第二段"},
+                            {"block_id": "blk-2", "block_type": 2, "text": "第三段"},
+                        ],
+                        "first_level_block_ids": ["blk-1", "blk-2"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("正文")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_block_count_mismatch")
+
+    def test_a_duplicate_first_level_block_id_is_rejected_even_when_counts_coincidentally_match(
+        self,
+    ) -> None:
+        """rc21 修复包 B（P3 docx 对账，opus 审查发现）：``first_level_block_
+        ids`` 自身出现重复（``["blk-1", "blk-1"]``），且 ``blocks`` 数组里
+        也恰好有两个块共用同一个 ``block_id``——两种成因在计数上互相抵消
+        （重排后块数 2 == 原始块数 2），单靠"重排后块数与原始块数对不上"这
+        一条对账**无法发现问题**，必须额外靠"``first_level_block_ids`` 自身
+        有没有重复"这条独立对账挡住。复现"first_level 重复静默重复交付"：
+        同一个块（字典推导式覆盖后剩下的那个）会在返回结果里出现两次。
+
+        变异存活证据：把 ``len(first_level_block_ids) != len(set(...))`` 这条
+        对账删掉，本用例会从抛出 `FeishuDocxDeliveryError` 变红成静默返回
+        同一个块重复两次的结果（`len(ordered_blocks) == len(mapping_blocks)`
+        这条对账不会报错，因为两个计数恰好都是 2）。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-1", "block_type": 2, "text": "第一段"},
+                            {"block_id": "blk-1", "block_type": 2, "text": "第二段"},
+                        ],
+                        "first_level_block_ids": ["blk-1", "blk-1"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("正文")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_duplicate_first_level_block_ids")
+
     def test_an_empty_markdown_is_rejected_before_any_call(self) -> None:
         transport = RecordingTransport([])
         client = _client(transport)

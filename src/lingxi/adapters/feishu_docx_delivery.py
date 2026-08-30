@@ -126,6 +126,16 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
      ``LookupError``，同 :meth:`read_body_children` 既有的"响应形状不对但
      不是飞书明确拒绝"分类口径——这与上面两条"明确知道拒绝原因"的
      ``definite`` 分支不同：这里连"为什么不一致"都无法确定。
+  3. 重排完成后再补两道对账（rc21 修复包 B，opus 审查发现，同上面两条一样
+     ``definite=True``）：``first_level_block_ids`` 自身出现重复
+     block_id → ``markdown_convert_duplicate_first_level_block_ids``（复现：
+     同一段正文在文档里被重复交付两次）；重排后的块数与 ``mapping_blocks``
+     原始块数对不上 → ``markdown_convert_block_count_mismatch``（复现：
+     ``mapping_blocks`` 里出现重复 block_id 时，建映射的字典推导式会静默
+     用后一个覆盖前一个，前一个块的内容凭空消失）。两条对账各自独立，互不
+     替代——两种成因在计数上恰好互相抵消时（`mapping_blocks` 与
+     `first_level_block_ids` 对同一个 block_id 都重复了同样的次数），只留
+     其中一条会漏判。
 
   返回前还会剔除每个块里的只读字段（``block_id``/``parent_id``/``children``，
   见 :func:`_strip_readonly_block_fields`）——这些字段描述"这个块在文档里的
@@ -550,6 +560,35 @@ class LarkDocxDelivery:
                     "markdown 转换响应 first_level_block_ids 引用了不存在的块：结果不明"
                 )
             ordered_blocks.append(block)
+
+        # 重排后两道对账（rc21 修复包 B，opus 审查发现，与上面「缺失/为空」
+        # 「引用不存在的块」两道既有防线同型同码风格——definite 拒绝，不静默
+        # 丢块或重复交付）：
+        #
+        # 1. `first_level_block_ids` 本身出现重复 block_id：`by_block_id` 是
+        #    按 `block_id` 建的字典，重复的 id 在这一步已经把同一个块对象
+        #    在 `ordered_blocks` 里放了不止一次——复现："first_level 重复静默
+        #    重复交付"（同一段正文在飞书文档里出现两次）。到这里为止所有
+        #    entries 都已经确认是有效字符串（否则上面的循环早就因为
+        #    `block is None` 抛出 `LookupError`），因此直接用 `set` 判重複，
+        #    不需要再过滤一遍。
+        if len(first_level_block_ids) != len(set(first_level_block_ids)):
+            raise FeishuDocxDeliveryError(
+                "markdown_convert_duplicate_first_level_block_ids", definite=True
+            )
+        #
+        # 2. 重排后的块数与 `mapping_blocks` 原始块数对不上：`by_block_id`
+        #    是字典推导式，`mapping_blocks` 里出现重复 block_id 时后一个会
+        #    静默覆盖前一个——复现："重复 block_id 静默丢块"（前一个块的内容
+        #    从此在返回结果里凭空消失，且不留任何痕迹）。上面第 1 条已经
+        #    挡住"`first_level_block_ids` 自身重复"这一种成因，这一条挡的
+        #    是"`mapping_blocks` 自身重复、而 `first_level_block_ids` 无重复"
+        #    这一种成因——两种成因互相独立，其中一种恰好在计数上抵消另一种
+        #    时（`mapping_blocks` 与 `first_level_block_ids` 对同一个
+        #    block_id 都重复了同样的次数），单靠这一条计数对账会漏判，所以
+        #    两条对账都必须做，不能只留一条。
+        if len(ordered_blocks) != len(mapping_blocks):
+            raise FeishuDocxDeliveryError("markdown_convert_block_count_mismatch", definite=True)
 
         return [_strip_readonly_block_fields(block) for block in ordered_blocks]
 
