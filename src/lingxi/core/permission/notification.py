@@ -21,6 +21,19 @@
 - 两条正文由产品负责人**逐字批准**，进 ``config/content.toml`` 并受版本纪律门禁约束
   （``scripts/ci/check_content_version.py``）。
 
+## 公司位人性化（Trace #469 S-1 TOP-8，2026-08-30 补充裁定）
+
+下面「两处已登记的短板」第①条已随本次裁定修复：``describe_scope``/
+``render_scope_notice`` 新增可选的 ``company_names`` 参数
+（:class:`CompanyNameResolver`），真实实现读 ``galaxy_country.name_cn``
+（``adapters/postgres_galaxy_snapshot.PostgresCompanyNames``，与
+``adapters/admin_registry.PostgresAdminQueries.company_label`` 同一份查询
+姿势、独立各自维护——两处调用面不同，不共享实现）。**只翻译公司位**：
+职能位仍是发布文本里的职能标签（第②条短板，翻译成指标名的那一层依赖
+`core/permission/metric_translation.py`，属于另一条独立的 Story，本次不动）。
+``company_names`` 缺省（``None``）时保持旧行为——直接展示 ``boss_company_id``
+编号，不强制所有调用点都已接线新的解析口。
+
 ## 占位变量从哪里来：**发布出去的那一份权限文本**
 
 ``{company_name}`` / ``{function_name}`` 取自 :func:`lingxi.core.permission.publish_row.
@@ -139,15 +152,36 @@ class PermissionNotice:
         }
 
 
+class CompanyNameResolver(Protocol):
+    """公司编号 → 中文名解析口（Trace #469 S-1 TOP-8，PM 2026-08-30 补充裁定）。
+
+    真实实现读 ``galaxy_country.name_cn``（按当前有效银河批次，
+    ``adapters/postgres_galaxy_snapshot.PostgresCompanyNames``），与
+    ``adapters/admin_registry.PostgresAdminQueries.company_label``
+    （``core/admin`` 侧同一份查询姿势）独立各自维护——两处调用面不同，不共享
+    实现，与本模块既有的"各自独立声明 Protocol"惯例一致。
+    """
+
+    def name_for(self, *, company_id: str) -> str | None:
+        """返回中文名；查无对应公司（未导入过银河数据、或该编号从未出现在当前
+        批次）时返回 ``None``——不是空字符串,调用方据此原样展示编号,不把
+        "查不到"误渲染成一个空白公司名。"""
+        ...
+
+
 def describe_scope(
-    document: Mapping[str, Sequence[str]], *, catalog: ContentCatalog | None = None
+    document: Mapping[str, Sequence[str]],
+    *,
+    catalog: ContentCatalog | None = None,
+    company_names: CompanyNameResolver | None = None,
 ) -> tuple[str, str]:
     """把一份权限文档说成「公司范围, 职能范围」两串展示文本。
 
     - 公司位：出现 :data:`~lingxi.core.permission.publish_row.ALL_COMPANIES_KEY` 时一律
       按"全部公司"渲染，**哪怕文档里还有别的键**——通配已经覆盖了它们，把两者并列会让
-      用户看到一句自相矛盾的范围。其余情况按键排序后拼接。**拼出来的是
-      ``boss_company_id`` 编号**，见下面的钩子。
+      用户看到一句自相矛盾的范围。其余情况按键排序后，经 ``company_names``
+      （非空时）翻译成「中文名（编号）」，查不到中文名或未注入解析口时原样展示
+      ``boss_company_id`` 编号（Trace #469 S-1 TOP-8，见下方钩子）。
     - 职能位：走 :func:`lingxi.core.permission.publish_row.lookup_metrics` 的
       ``company_id=None`` 分支。那一支问的是"这个人到底有没有任何可用项"，对全部键取并集
       是**正确**的（它不是范围判定，是存在性判定）；范围判定的回退制一个字都没被改动。
@@ -157,27 +191,43 @@ def describe_scope(
     """
 
     source = catalog or default_content_catalog()
-    # **「公司 + 职能 → 指标名」翻译层那一 Story 必须回到这两行，并与产品负责人复核措辞。**
-    #
-    # 公司位现在给用户看的是 ``boss_company_id`` 编号（与 #17「向用户展示使用
-    # ``name_cn``」、产品合同「不暴露内部标识」相抵），职能位现在给用户看的是职能标签
-    # （文案里也叫"职能"，翻译层之后会变成指标名）。两处都是已登记的短板，产品负责人
-    # 2026-08-18 裁定**随翻译层那一 Story 一并修复**，因此本轮不改渲染逻辑。
-    #
-    # **两位一起改，不要只改一半**：只把公司位换成中文名，用户会看到"公司是名字、职能
-    # 还是内部标签"的半截形态；只改职能位则相反。两处的正文各自要经内容目录的用户可见性
-    # 检查（:meth:`~lingxi.config.content.ContentCatalog.text` 出口），措辞变化必须由
-    # 产品负责人逐字批准并递增 ``content.toml`` 的版本。
+    # **职能位仍是已登记的短板**（第②条）：现在给用户看的仍然是发布文本里的职能
+    # 标签，不是最终指标名——那一层依赖「公司 + 职能 → 指标名」翻译层
+    # （``core/permission/metric_translation.py``），是另一条独立的 Story，本轮
+    # 不动。**公司位这条短板已随 PM 2026-08-30 补充裁定（Trace #469 S-1 TOP-8）
+    # 单独修复**：不再等翻译层一起改——"两位一起改"的顾虑是"用户看到半截形态"，
+    # 但公司位从"裸编号"变成"中文名（编号）"本身已经是自洽的改善，不会让用户
+    # 看到自相矛盾或更难懂的中间态；职能位保持原样不受影响。这条正文同样要经
+    # 内容目录的用户可见性检查（:meth:`~lingxi.config.content.ContentCatalog.text`
+    # 出口），公司中文名若恰好撞上内部过程词表会**响亮失败**，不会被悄悄发给用户。
     if ALL_COMPANIES_KEY in document:
         companies = source.text(CONTENT_KEY_ALL_COMPANIES).text
     else:
-        companies = SCOPE_SEPARATOR.join(sorted(document))
+        companies = SCOPE_SEPARATOR.join(
+            _company_display(company_id, company_names) for company_id in sorted(document)
+        )
     functions = SCOPE_SEPARATOR.join(lookup_metrics(document))
     return companies, functions
 
 
+def _company_display(company_id: str, company_names: CompanyNameResolver | None) -> str:
+    if company_names is None:
+        return company_id
+    try:
+        name_cn = company_names.name_for(company_id=company_id)
+    except Exception:  # noqa: BLE001 - 展示层降级：解析口本身故障不阻塞通知发送
+        logger.warning(
+            "permission_notice.company_name_lookup_failed company_id=%s", company_id
+        )
+        return company_id
+    return f"{name_cn}（{company_id}）" if name_cn else company_id
+
+
 def render_scope_notice(
-    permissions: str, *, catalog: ContentCatalog | None = None
+    permissions: str,
+    *,
+    catalog: ContentCatalog | None = None,
+    company_names: CompanyNameResolver | None = None,
 ) -> PermissionNotice:
     """把**已经发布出去的**那一份权限文本渲染成一条通知。
 
@@ -190,6 +240,10 @@ def render_scope_notice(
     比不发更糟。渲染出来的正文还要再过一次内容目录的用户可见性检查（内容目录在
     :meth:`~lingxi.config.content.ContentCatalog.text` 出口做），因此一个恰好长得像内部
     过程表达的公司名或职能名会**响亮失败**，而不是被发给用户。
+
+    ``company_names``（Trace #469 S-1 TOP-8）缺省时保持旧行为不变（公司位展示
+    裸编号）——调用方（``PermissionNoticeDispatcher``）未接线真实解析口的既有
+    调用点/测试不需要改动。
     """
 
     source = catalog or default_content_catalog()
@@ -199,7 +253,7 @@ def render_scope_notice(
             kind=NoticeKind.RANGE_REVOKED,
             content=source.text(CONTENT_KEY_RANGE_REVOKED),
         )
-    companies, functions = describe_scope(document, catalog=source)
+    companies, functions = describe_scope(document, catalog=source, company_names=company_names)
     return PermissionNotice(
         kind=NoticeKind.RANGE_UPDATED,
         content=source.text(
@@ -286,6 +340,7 @@ class PermissionNoticeDispatcher:
         audit: _AuditSink,
         sleep: Callable[[float], Any],
         catalog: ContentCatalog | None = None,
+        company_names: CompanyNameResolver | None = None,
         max_attempts: int = DEFAULT_NOTICE_ATTEMPTS,
         backoff_seconds: Sequence[float] = DEFAULT_NOTICE_BACKOFF_SECONDS,
     ) -> None:
@@ -297,6 +352,10 @@ class PermissionNoticeDispatcher:
         self._audit = audit
         self._sleep = sleep
         self._catalog = catalog or default_content_catalog()
+        # 公司位人性化（Trace #469 S-1 TOP-8）：缺省 ``None`` 时 render_scope_
+        # notice 保持旧行为（公司位展示裸编号）——未接线真实解析口的既有调用点/
+        # 测试不需要改动。
+        self._company_names = company_names
         self._max_attempts = max_attempts
         self._backoff = tuple(float(value) for value in backoff_seconds)
 
@@ -314,7 +373,9 @@ class PermissionNoticeDispatcher:
         产品负责人 2026-08-18 裁定 4：不阻塞权限生效。
         """
 
-        notice = render_scope_notice(permissions, catalog=self._catalog)
+        notice = render_scope_notice(
+            permissions, catalog=self._catalog, company_names=self._company_names
+        )
         dedupe_key = notice_dedupe_key(user_id, permission_version)
         last_error: str | None = None
         for attempt_no in range(1, self._max_attempts + 1):
@@ -381,6 +442,7 @@ __all__ = [
     "CONTENT_KEY_ALL_COMPANIES",
     "CONTENT_KEY_RANGE_REVOKED",
     "CONTENT_KEY_RANGE_UPDATED",
+    "CompanyNameResolver",
     "DEFAULT_NOTICE_ATTEMPTS",
     "DEFAULT_NOTICE_BACKOFF_SECONDS",
     "NoticeKind",

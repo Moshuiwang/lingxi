@@ -160,6 +160,80 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("日活", str(facts))
 
 
+class _FakeCompanyNames:
+    """``CompanyNameResolver`` 的内存假实现：固定映射，未命中返回 ``None``。"""
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self._names = names
+
+    def name_for(self, *, company_id: str) -> str | None:
+        return self._names.get(company_id)
+
+
+class _RaisingCompanyNames:
+    def name_for(self, *, company_id: str) -> str | None:
+        raise RuntimeError("模拟解析口本身故障")
+
+
+class CompanyNameResolutionTest(unittest.TestCase):
+    """Trace #469 S-1 TOP-8：公司位经 ``company_names`` 翻译成「中文名（编号）」；
+    缺省或查不到时原样展示编号（既有行为，向后兼容）。"""
+
+    def test_company_ids_are_translated_when_a_resolver_is_supplied(self) -> None:
+        companies, _ = describe_scope(
+            {"1011": ["日活"], "1012": ["日活"]},
+            company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"}),
+        )
+
+        self.assertEqual(companies, "壹壹测试公司（1011）、壹贰测试公司（1012）")
+
+    def test_missing_resolver_keeps_the_existing_bare_id_behavior(self) -> None:
+        companies, _ = describe_scope({"1011": ["日活"]})
+
+        self.assertEqual(companies, "1011")
+
+    def test_unmatched_company_id_falls_back_to_the_bare_id(self) -> None:
+        companies, _ = describe_scope(
+            {"1011": ["日活"]}, company_names=_FakeCompanyNames({})
+        )
+
+        self.assertEqual(companies, "1011")
+
+    def test_wildcard_still_wins_and_never_calls_the_resolver(self) -> None:
+        """否定断言：通配公司位不需要、也不应该尝试翻译一个不存在的"编号"。"""
+
+        class _AssertNotCalled:
+            def name_for(self, *, company_id: str) -> str | None:
+                raise AssertionError("通配分支不应该调用 company_names")
+
+        companies, _ = describe_scope(
+            {"*": ["日活"]}, company_names=_AssertNotCalled()
+        )
+
+        self.assertEqual(companies, "全部公司")
+
+    def test_a_resolver_failure_degrades_to_the_bare_id_without_blocking_the_notice(
+        self,
+    ) -> None:
+        """否定断言：解析口本身故障（例如数据库暂时不可用）不得阻塞整条通知——
+        降级展示裸编号，与"缺省未接线"同一姿态。"""
+
+        companies, _ = describe_scope(
+            {"1011": ["日活"]}, company_names=_RaisingCompanyNames()
+        )
+
+        self.assertEqual(companies, "1011")
+
+    def test_render_scope_notice_passes_the_resolver_through(self) -> None:
+        notice = render_scope_notice(
+            GRANTED, company_names=_FakeCompanyNames({"1011": "壹壹测试公司", "1012": "壹贰测试公司"})
+        )
+
+        self.assertIn("壹壹测试公司（1011）", notice.text)
+        self.assertIn("壹贰测试公司（1012）", notice.text)
+        self.assertNotIn("1011、1012", notice.text)
+
+
 class DedupeKeyTest(unittest.TestCase):
     def test_the_key_binds_user_and_version(self) -> None:
         self.assertEqual(notice_dedupe_key(USER, 3), f"{USER}:3")
@@ -349,10 +423,12 @@ class DispatcherTest(unittest.TestCase):
                     )
 
     def test_the_dispatcher_cannot_touch_any_permission_state(self) -> None:
-        """形状断言：**它手上只有发送口、审计口、退避与内容目录**。
+        """形状断言：**它手上只有发送口、审计口、退避、内容目录与公司名解析口**。
 
         发布 outbox、就绪记录、用户状态一个端口都注入不进来，因此"通知失败顺手把发布
         状态改回去"这件事在装配上就写不出来——这条比在源码里搜关键字更难被绕过。
+        ``company_names``（Trace #469 S-1 TOP-8）只读公司编号→中文名的展示映射，
+        同样不持有任何权限状态。
         """
 
         import inspect
@@ -361,7 +437,16 @@ class DispatcherTest(unittest.TestCase):
 
         self.assertEqual(
             parameters,
-            {"self", "sender", "audit", "sleep", "catalog", "max_attempts", "backoff_seconds"},
+            {
+                "self",
+                "sender",
+                "audit",
+                "sleep",
+                "catalog",
+                "company_names",
+                "max_attempts",
+                "backoff_seconds",
+            },
         )
 
 

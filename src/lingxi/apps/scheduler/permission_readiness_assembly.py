@@ -78,6 +78,7 @@ def _build_readiness_follow_up(
 
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
+    from lingxi.adapters.postgres_galaxy_snapshot import PostgresCompanyNames
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
     from lingxi.adapters.query_mcp_probe import QueryMcpProbe, content_text_metrics_reader
     from lingxi.core.permission.mcp_readiness import ReadinessTicker
@@ -130,6 +131,14 @@ def _build_readiness_follow_up(
                 app_secret=config.feishu_app_secret,
             ),
             audit=audit,
+            # 公司位人性化（Trace #469 S-1 TOP-8，PM 2026-08-30 补充裁定）：权限
+            # 变化通知的「当前可用范围」不再展示裸 boss_company_id 编号，改经
+            # galaxy_country.name_cn 展示中文名。解析口内部按当前有效批次现读，
+            # 没有批次或查无对应编号时按既有行为原样展示编号（fail-open，不阻塞
+            # 通知发送）。
+            company_names=PostgresCompanyNames(
+                config.postgres_dsn, timeouts=config.postgres_timeouts
+            ),
             # 退避用 `stop.wait` 而不是 `time.sleep`：SIGTERM 能立刻打断它
             # （同 `CredentialRotationLoop._save_with_retry`）。
             sleep=stop.wait,
