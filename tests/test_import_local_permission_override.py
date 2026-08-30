@@ -79,6 +79,13 @@ class CompanyDiffTests(unittest.TestCase):
 
         self.assertEqual(diff, {})
 
+    def test_all_companies_key_constant_matches_publish_row(self) -> None:
+        """本工具的通配拒绝/跳过分支全都判 :data:`TOOL.ALL_COMPANIES_KEY`——
+        钉住它确实是 `publish_row` 的同一个 "*" 字面量，不是本文件另起的
+        独立字符串（否则两边悄悄漂移，判断形同虚设）。"""
+
+        self.assertEqual(TOOL.ALL_COMPANIES_KEY, "*")
+
     def test_empty_legacy_produces_empty_diff(self) -> None:
         self.assertEqual(TOOL.compute_company_diff({}, {"1011": ("日活",)}), {})
 
@@ -224,6 +231,46 @@ class PlanImportTests(unittest.TestCase):
         self.assertEqual(plan.grants, ())
         self.assertEqual(plan.skipped, ())
 
+    def test_a_wildcard_galaxy_current_is_registered_as_skipped_not_silent(self) -> None:
+        """rc21 修复包 B（P1+P2+P3 之 b）：银河侧命中通配时，改动前直接调用
+        `compute_company_diff` 拿到空字典、不产出任何 grant 也不产出任何
+        skip——dry-run 清单上完全看不出这个用户发生过什么。现在必须显式登记
+        进 `plan.skipped`，原因码是 `REASON_WILDCARD_GALAXY_CURRENT`。
+
+        变异存活证据：把 `plan_import` 里 `ALL_COMPANIES_KEY in galaxy_current`
+        这条分支删掉（退回直接调用 `compute_company_diff`），本用例的
+        `plan.skipped` 断言会从"恰好一条 wildcard_galaxy_current"变红成
+        "空元组"——差集本身仍然正确（恒空），但可见性回归静默。
+
+        用「角色即全公司」B 口径特例（``ADMIN_FULL_ACCESS_FUNCTION``）触发
+        通配——不搭建「全非」datacountry 哨兵行，两条路径殊途同归地产出同一种
+        ``galaxy_current == {ALL_COMPANIES_KEY: (...)}`` 形状（见
+        ``publish_row.aggregate_permission`` 模块文档「角色即全公司」一节）。
+        """
+
+        admin_galaxy = _FakeGalaxySnapshot(
+            user_rows=({"user_id": "G-10001", "user_name": "10001", "email": GRANTED_USER.email},),
+            country_rows=(
+                {"country_key": "101", "name": "ALPHA", "name_cn": "甲国", "boss_company_id": "BC-甲"},
+            ),
+            _role_rows_by_user={"G-10001": ({"user_id": "G-10001", "role_name": "管理员角色"},)},
+            _datacountry_rows_by_user={"G-10001": ({"user_id": "G-10001", "datacountry_id": "101"},)},
+        )
+        legacy = {GRANTED_USER.email: {"BC-甲": ("旧表独有指标",)}}
+
+        plan = TOOL.plan_import(
+            legacy=legacy,
+            galaxy=admin_galaxy,
+            role_function_map={"管理员角色": "后台管理员"},
+            metric_translation_map={"*": {"后台管理员": ("全部指标",)}},
+            lookup_user=lambda email: TOOL.UserLookup(record=GRANTED_USER),
+        )
+
+        self.assertEqual(plan.grants, (), "通配下差集本身仍然恒为空，不产出任何 grant")
+        self.assertEqual(len(plan.skipped), 1)
+        self.assertEqual(plan.skipped[0].email, GRANTED_USER.email)
+        self.assertEqual(plan.skipped[0].reason, TOOL.REASON_WILDCARD_GALAXY_CURRENT)
+
     def test_an_ambiguous_app_user_is_skipped(self) -> None:
         plan = TOOL.plan_import(
             legacy={"dup@example.com": {"1011": ("日活",)}},
@@ -359,6 +406,43 @@ class LoadLegacyExportTests(unittest.TestCase):
 
     def test_malformed_permissions_json_is_rejected(self) -> None:
         path = self._write("email,permissions\na@example.com,not-json\n")
+
+        with self.assertRaises(ValueError):
+            TOOL.load_legacy_export(path)
+
+    def test_a_wildcard_permissions_key_rejects_the_whole_export(self) -> None:
+        """rc21 修复包 B（P1+P2+P3 之 a）：旧表任意一行的 ``permissions`` 出现
+        ``"*"``（``ALL_COMPANIES_KEY``）键，整份导出拒绝——不是这一行单独跳过。
+
+        复现：``{"*": [...]}`` 这样的一行若被当作普通 ``company_id="*"``
+        写进 ``local_permission_override``，会让该用户凭一条本地授权行跨公司
+        越权（读侧 ``lookup_metrics`` 的"*"回退制）。
+
+        变异存活证据：把 `load_legacy_export` 里 `ALL_COMPANIES_KEY in
+        permissions` 这条判据删掉，本用例会从抛出 `ValueError` 变红成
+        `load_legacy_export` 正常返回一份包含 "*" 键的结果。
+        """
+
+        path = self._write(
+            'email,permissions\n'
+            'a@example.com,"{""1011"": [""日活""]}"\n'
+            'wildcard@example.com,"{""*"": [""全部指标""]}"\n'
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            TOOL.load_legacy_export(path)
+
+        self.assertIn("#263", str(raised.exception))
+
+    def test_a_wildcard_permissions_key_alongside_specific_companies_is_still_rejected(
+        self,
+    ) -> None:
+        """通配键与具体公司键混在同一行也一样整体拒绝——不是"只挡纯通配行"。"""
+
+        path = self._write(
+            'email,permissions\n'
+            'a@example.com,"{""1011"": [""日活""], ""*"": [""全部指标""]}"\n'
+        )
 
         with self.assertRaises(ValueError):
             TOOL.load_legacy_export(path)

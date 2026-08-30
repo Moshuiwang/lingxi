@@ -24,9 +24,11 @@
 刷新同一行时，若这枚身份已经持续超过 :data:`STALL_THRESHOLD_SECONDS`，改用
 ``worker.status_stalled`` 文案明示"仍停在这一步、已经多久没有新进展"，而不是
 继续用看不出异常的"{action} · N 秒"措辞；换成新身份后自动恢复常规措辞，不需要
-调用方感知这个状态切换。呈现层的停滞阈值与 worker 侧的兜底强制刷新间隔
+调用方感知这个状态切换。呈现层的停滞阈值取 worker 侧兜底强制刷新间隔
 （``apps/worker/service.py::_PROGRESS_FALLBACK_SECONDS``，由 30 秒收紧到 12
-秒）取同一个值——理由见两处常量各自上方的注释。
+秒）的 **2 倍**（24 秒，rc21 修复包 B 校正——原先两者相等曾造成"恰好一个
+兜底周期的正常静默"被误判为停滞，见 :data:`STALL_THRESHOLD_SECONDS` 上方
+注释）。
 
 **「明确失败」与「结果不明」不是同一件事，判别用白名单而不是黑名单**（独立审核
 B-1 首次修复于 2026-08-14；独立审核 R-1 于同日把判别方向从黑名单反转为白名单，
@@ -352,20 +354,36 @@ class ProgressStepSnapshot:
 MAX_ACCUMULATED_STEP_LINES = 40
 
 # 停滞判定阈值（Issue #444，产品负责人 2026-08-30 裁定「不做每秒读秒，改做
-# 不变即异常」）：`_accumulate_step` 把每一次信号的语义身份（action/query_
-# count/query_step 三元组）与上一次比较——身份不变时只原地刷新这一行（见
-# 该方法文档）。这个阈值回答"身份不变可以持续多久才算异常"：同一枚身份从
-# 第一次出现到本次刷新，累计跨过这么多秒仍未换成新的身份，就判定为"停滞"，
-# 切换成明示文案（``worker.status_stalled``，见 ``_render_step_line``）而
-# 不是继续用看不出异常的"{action} · N 秒"措辞。这正是产品合同"文字十几秒内
-# 必有变化；不变超过一个兜底周期即视为异常且卡片自述"里"一个兜底周期"的
-# 呈现层落地——取值与 ``apps/worker/service.py::_PROGRESS_FALLBACK_SECONDS``
-# （worker 侧兜底强制刷新间隔，由 30 秒收紧到这个值）保持一致：worker 端
-# 的兜底 tick 复用当前信号身份写库，恰好是这里要识别的"整整一个周期没有
-# 新身份"的真实来源。两个常量各自独立登记、互不 import（同本文件
-# ``_WORST_CASE_QUERYING_CONTENT_LENGTH`` 一贯的"没有自动化门禁跨文件互相
-# 核对，这一条纪律"），调整任一侧都要回头看另一侧是否仍然对齐。
-STALL_THRESHOLD_SECONDS = 12
+# 不变即异常」；数值由 rc21 修复包 B 从 12 秒校正为 24 秒，见下方「误报双修」
+# 一段）：`_accumulate_step` 把每一次信号的语义身份（action/query_count/
+# query_step 三元组）与上一次比较——身份不变时只原地刷新这一行（见该方法
+# 文档）。这个阈值回答"身份不变可以持续多久才算异常"：同一枚身份从第一次
+# 出现到本次刷新，累计跨过这么多秒仍未换成新的身份，就判定为"停滞"，切换
+# 成明示文案（``worker.status_stalled``，见 ``_render_step_line``）而不是
+# 继续用看不出异常的"{action} · N 秒"措辞。
+#
+# **误报双修（rc21 修复包 B，opus 审查实测复现）**：本阈值原取 12 秒，与
+# ``apps/worker/service.py::_PROGRESS_FALLBACK_SECONDS``（worker 侧兜底强制
+# 刷新间隔，同样是 12 秒）完全相等——这个取法本身就是误报的根源：**恰好一个
+# 兜底周期的静默是查询/生成回答的常态**，不是异常。真实复现：t=4 发出一次
+# 问数查询、25 秒后（t=29）才返回，t=70 模型才生成完最终回答——这段时间里
+# `progress_action` 身份自 t=4 起再没有变化过（工具返回本身此前不产生任何
+# 信号，模型输出正文的 `assistant_message` 事件要等到接近 t=70 才出现），
+# 旧的 12 秒阈值让卡片从 t=16 起就持续显示"停滞"，而这实际上是一次完全正常
+# 的任务。修复分两部分（互相配合，缺一不够）：① 本阈值改为
+# ``_PROGRESS_FALLBACK_SECONDS`` 的 **2 倍**（24 秒 = 2 个兜底周期）——同一枚
+# 身份必须连续跨过两个兜底周期都没有换新身份，才判定异常，给恰好一个周期的
+# 正常静默留出余量；② 工具返回（``apps/worker/turn.py`` 流式循环早已把 SDK
+# 的 ``tool_result`` 事件转发给 ``on_stream_event``——转发路径本就存在，
+# 不需要改 ``turn.py``）时，``apps/worker/service.py`` 的 ``on_stream_event``
+# 新增一次进度信号，把身份切到 composing，让上面例子里 t=29 工具返回的那一
+# 刻就有一次新身份出现、停滞计时随之清零，不需要一直等到模型真正开始输出
+# 文字。两个常量因此**不再取相同的值**（此前的版本要求两者相等，
+# 见历史版本注释），改为本常量恒等于对方的 2 倍；两处各自独立登记、互不
+# import（同本文件 ``_WORST_CASE_QUERYING_CONTENT_LENGTH`` 一贯的"没有自动化
+# 门禁跨文件互相核对，这一条纪律"），调整任一侧都要回头看另一侧是否仍然
+# 保持这个 2 倍关系。
+STALL_THRESHOLD_SECONDS = 24
 
 
 class CardStream:
@@ -559,7 +577,9 @@ class CardStream:
         即 ``_current_step_started_at``）。跨过 :data:`STALL_THRESHOLD_
         SECONDS` 才把这个"已持续秒数"交给 ``_render_step_line`` 切换成停滞
         明示文案；没跨过时仍然只是原地刷新总用时的旧措辞——避免任务刚好在
-        两次事件驱动更新之间、还没真正到"一个兜底周期"就被误判成异常。
+        两次事件驱动更新之间、只经过一个兜底周期的正常静默就被误判成异常
+        （rc21 修复包 B：本阈值恒等于 ``_PROGRESS_FALLBACK_SECONDS`` 的 2
+        倍，见 :data:`STALL_THRESHOLD_SECONDS` 上方「误报双修」注释）。
         换成新身份时清零这个锚点，只有新身份自己持续够久才会再次触发。
         """
 

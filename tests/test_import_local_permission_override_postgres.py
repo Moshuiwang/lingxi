@@ -4,7 +4,8 @@
 同一分工：单元测试（``tests/test_import_local_permission_override.py``）钉纯逻辑
 （差集计算、用户级判定编排、CSV 解析），本文件钉**只有真库能证伪**的那半——
 ``local_permission_override``/``pending_action`` 两张表的外键与唯一索引是否真的
-被满足、幂等重跑是否真的零新增行、``--dry-run`` 是否真的不写任何一行。
+被满足、幂等重跑是否真的零新增行、默认（不传 ``--apply``）与 ``--dry-run`` 是否
+真的都不写任何一行、只有 ``--apply`` 才真正落库。
 
 数据全部为虚构化名，不含任何真实导出内容。
 """
@@ -167,7 +168,7 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
     # ---- 差集只导入旧表多出来的那一份 ------------------------------------
 
     def test_the_diff_is_imported_not_the_full_legacy_content(self) -> None:
-        code = self._run()
+        code = self._run("--apply")
 
         self.assertEqual(code, 0)
         with connect(self._dsn) as connection, connection.cursor() as cursor:
@@ -186,7 +187,7 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         self.assertEqual(entry_status, "active")
 
     def test_the_backing_pending_action_is_a_terminal_executed_grant(self) -> None:
-        self._run()
+        self._run("--apply")
 
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -208,9 +209,27 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         self.assertEqual(target_open_id, FEISHU_OPEN_ID)
         self.assertIn(LEGACY_ONLY_METRIC, payload)
 
-    # ---- --dry-run 不写任何一行 -------------------------------------------
+    # ---- 写入极性：默认与 --dry-run 都不写任何一行，只有 --apply 才写 -------
+
+    def test_default_without_apply_writes_nothing(self) -> None:
+        """rc21 修复包 B（P1+P2+P3 之 c，写入极性反转）：不传任何写入相关的
+        参数时，默认行为等价于旧版的 ``--dry-run``——只出计划，不落库。
+
+        变异存活证据：把 `main()` 里 `if not arguments.apply: ...; return 0`
+        这条早退删掉，本用例会从"零行"变红成"一行"（默认又变回真正写入）。
+        """
+
+        code = self._run()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self._count_active_overrides(), 0)
+        self.assertIn(EMAIL, self._last_output)
+        self.assertIn(LEGACY_ONLY_METRIC, self._last_output)
 
     def test_dry_run_writes_nothing(self) -> None:
+        """``--dry-run`` 是默认行为（见上一条用例）的兼容别名——旧的调用脚本
+        显式传这个参数，行为必须与不传任何参数完全一致。"""
+
         code = self._run("--dry-run")
 
         self.assertEqual(code, 0)
@@ -218,16 +237,24 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
         self.assertIn(EMAIL, self._last_output)
         self.assertIn(LEGACY_ONLY_METRIC, self._last_output)
 
+    def test_apply_and_dry_run_together_is_treated_as_dry_run(self) -> None:
+        """同时给出 `--apply` 与 `--dry-run`：按更保守的一侧处理，不写入。"""
+
+        code = self._run("--apply", "--dry-run")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self._count_active_overrides(), 0)
+
     # ---- 幂等：同一份导出反复执行，新增行数恒为零 --------------------------
 
     def test_rerunning_the_same_export_creates_no_duplicate_rows(self) -> None:
-        first_code = self._run()
+        first_code = self._run("--apply")
         first_count = self._count_active_overrides()
 
-        second_code = self._run()
+        second_code = self._run("--apply")
         second_count = self._count_active_overrides()
 
-        third_code = self._run()
+        third_code = self._run("--apply")
         third_count = self._count_active_overrides()
 
         self.assertEqual((first_code, second_code, third_code), (0, 0, 0))
@@ -247,7 +274,7 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
     def test_a_user_fully_covered_by_galaxy_gets_nothing_imported(self) -> None:
         self._legacy_csv = self._write_legacy_csv(f'{{"BC-甲": ["{GALAXY_METRIC}"]}}')
 
-        code = self._run()
+        code = self._run("--apply")
 
         self.assertEqual(code, 0)
         self.assertEqual(self._count_active_overrides(), 0)
