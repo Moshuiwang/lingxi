@@ -73,7 +73,7 @@ curl --silent --show-error --request POST \
   'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id' \
   --header "Authorization: Bearer ${tenant_access_token}" \
   --header 'Content-Type: application/json; charset=utf-8' \
-  --data "{\"receive_id\":\"${user_ids[0]}\",\"msg_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"灵犀验证：已通过工作邮箱定位到你。这是一条由 StarTimes 中心机器人发送的测试消息。\\\"}\"}" \
+  --data "{\"receive_id\":\"${user_ids[0]}\",\"msg_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"BI Plus 验证：已通过工作邮箱定位到你。这是一条由 StarTimes 中心机器人发送的测试消息。\\\"}\"}" \
   --output "${message_file}"
 
 if [[ "$(jq -r '.code // empty' "${message_file}")" != '0' ]]; then
