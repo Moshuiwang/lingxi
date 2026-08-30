@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-4"
+version = "2026-08-30-5"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -199,19 +199,23 @@ version = "2026-08-30-4"
 "delivery.sheet_uncertain" = "表格生成结果暂无法确认，已转人工核对。追溯号：{reference}。"
 
 # 用户记忆命令面（Issue #357 S-H3-3，D1 显式登记范围）：用户显式登记术语映射/
-# 口径偏好/惯例模板，下一次问数生效；/memory list 可查、/memory forget <id>/
+# 口径偏好/惯例模板，下一次问数生效；/memory list 可查、/memory forget <序号>/
 # /memory clear 可清。文案为实施草案，产品负责人过目前不作为最终定稿。
-"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <id> 删除一条；/memory clear 清空全部。"
+# rc22 B-8-1（#439 TOP-10）：/memory list 不再展示裸 mem_ ULID，改用按登记时间
+# 排出的短序号（1、2、3……）；/memory forget 同步支持按短序号删除，原始 mem_
+# id 入参仍然兼容（见 core/conversation/commands.py）。
+"memory.usage_help" = "支持的记忆命令：/memory list 查看已登记记忆（附带序号）；/memory remember <类型> <关键词> => <说明> 登记（类型可选 term_mapping/calibration_preference/convention_template）；/memory forget <序号> 删除一条（序号见 /memory list，也可以直接用完整 id）；/memory clear 清空全部。"
 "memory.remembered" = "已登记这条记忆，下一次提问开始生效，可以用 /memory list 查看全部。"
 "memory.remember_unsafe" = "这条记忆的内容未能登记：其中包含疑似系统指令或内部标识的文本，无法安全展示或使用，请修改关键词/说明后重试。"
-"memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <id> 删除几条后再登记。"
-"memory.forgotten" = "已删除这条记忆。"
-"memory.forget_not_found" = "没有找到这条记忆，可能已被删除或不属于你。"
+"memory.limit_exceeded" = "已达到记忆条数上限（50 条），请先用 /memory clear 或 /memory forget <序号> 删除几条后再登记。"
+"memory.forgotten" = "已删除这条记忆：[{type_label}] {memory_key} => {memory_value}"
+"memory.forgotten_unsafe" = "已删除这条记忆（该条内容无法安全展示，类型：{type_label}）。"
+"memory.forget_not_found" = "没有找到这条记忆，可能已被删除、不属于你，或序号已过期——可以先用 /memory list 重新查看当前序号。"
 "memory.cleared" = "已清空你的全部记忆（共 {count} 条）。"
 "memory.list_empty" = "你还没有登记任何记忆。可以用 /memory remember <类型> <关键词> => <说明> 登记，类型可选 term_mapping（术语映射）/calibration_preference（口径偏好）/convention_template（惯例模板）。"
 "memory.list" = "已登记的记忆：\n{entries}"
-"memory.list_entry" = "- [{type_label}] {memory_key} => {memory_value}（id: {memory_id}）"
-"memory.list_entry_unsafe" = "- [{type_label}] （该条内容无法安全展示，可用 /memory forget <id> 删除，id: {memory_id}）"
+"memory.list_entry" = "{serial}. [{type_label}] {memory_key} => {memory_value}"
+"memory.list_entry_unsafe" = "{serial}. [{type_label}] （该条内容无法安全展示，可用 /memory forget {serial} 删除）"
 "memory.type_label.term_mapping" = "术语映射"
 "memory.type_label.calibration_preference" = "口径偏好"
 "memory.type_label.convention_template" = "惯例模板"

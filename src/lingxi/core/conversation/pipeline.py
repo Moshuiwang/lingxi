@@ -1040,21 +1040,28 @@ class EventPipeline:
             return Outcome(handled_as=HandledAs.COMMAND)
 
         if memory_command.kind is MemoryCommandKind.FORGET:
-            forgotten = tx.forget_user_memory(
-                user_id=user.user_id, memory_id=memory_command.memory_id
+            # 短序号解析需要先查一次当前用户的记忆列表（rc22 B-8-1，#439
+            # TOP-10）：与随后的 tx.forget_user_memory 同一个数据库事务、同一个
+            # 连接，中途不会有别的写者插队——见 _resolve_forget_target_id 文档
+            # 「forget 时刻的同一确定性排序」这条口径的成立依据。
+            entries = tx.list_user_memory(user_id=user.user_id)
+            target_id = self._resolve_forget_target_id(memory_command, entries)
+            forgotten_entry = (
+                tx.forget_user_memory(user_id=user.user_id, memory_id=target_id)
+                if target_id is not None
+                else None
             )
-            content_key = "memory.forgotten" if forgotten else "memory.forget_not_found"
-            deferred.append(self._texts.catalog.text(content_key))
-            if forgotten:
-                # 未命中（不存在/不属于本人）不审计为一次「删除」事件——结构上没有
-                # 发生任何写操作，与 forget_user_memory 的跨用户零生效同一条纪律
-                # （不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
+            deferred.append(self._render_forget_receipt(forgotten_entry))
+            if forgotten_entry is not None:
+                # 未命中（不存在/不属于本人/序号越界）不审计为一次「删除」事件——
+                # 结构上没有发生任何写操作，与 forget_user_memory 的跨用户零生效
+                # 同一条纪律（不产生「有人尝试删了别人一条记忆」这样的误导性事实）。
                 self._audit.record(
                     "command.memory_forget",
                     event_id=message.event_id,
                     user_id=user.user_id,
                     conversation_id=conversation.conversation_id,
-                    memory_id=memory_command.memory_id,
+                    memory_id=forgotten_entry.memory_id,
                     trace_id=message.trace_id,
                 )
             tx.mark_handled_as(event_id=message.event_id, handled_as=HandledAs.COMMAND)
@@ -1112,6 +1119,17 @@ class EventPipeline:
     def _render_memory_list(self, entries: list[UserMemoryEntry]) -> RenderedContent:
         """把 ``/memory list`` 查到的记忆渲染成用户可见文本。
 
+        **短序号取代裸 id 展示**（rc22 B-8-1，#439 TOP-10）：此前每一行末尾都
+        带一个 ``mem_`` 前缀的裸 ULID（``id: mem_01ARZ...``）供 ``/memory
+        forget`` 引用——这是全仓库唯一波及普通用户的裸 ULID 展示面，对不熟悉
+        内部标识格式的用户不友好。这里改成按 ``entries`` 顺序从 1 开始编号的
+        短序号，``/memory forget <序号>`` 同样可以引用（原始 ``mem_`` id 仍然
+        兼容，见 ``commands.parse_memory_command`` 文档）。序号顺序与
+        ``forget`` 时刻 ``tx.list_user_memory`` 返回的顺序能对上，**不是靠两处
+        约定一致**，而是两处调用的是同一个 ``ORDER BY created_at ASC`` 查询
+        （``adapters/postgres_conversation/_transaction.py`` 的
+        ``list_user_memory``），结构上没有第二个排序键可以漂移。
+
         每一行单独过一次内容安全校验（``content.toml`` 的 ``_validate_user_visible_
         text``）：``memory_key``/``memory_value`` 是用户自己写入的自由文本，结构上
         无法保证它不会撞上协议泄漏词表（``mcp__``/``trace_id`` 等，见该文件文档）。
@@ -1124,24 +1142,83 @@ class EventPipeline:
         if not entries:
             return catalog.text("memory.list_empty")
         lines: list[str] = []
-        for entry in entries:
+        for serial, entry in enumerate(entries, start=1):
             type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
             try:
                 rendered_entry = catalog.text(
                     "memory.list_entry",
+                    serial=serial,
                     type_label=type_label,
                     memory_key=entry.memory_key,
                     memory_value=entry.memory_value,
-                    memory_id=entry.memory_id,
                 )
             except ContentSafetyError:
                 rendered_entry = catalog.text(
                     "memory.list_entry_unsafe",
+                    serial=serial,
                     type_label=type_label,
-                    memory_id=entry.memory_id,
                 )
             lines.append(rendered_entry.text)
         return catalog.text("memory.list", entries="\n".join(lines))
+
+    def _resolve_forget_target_id(
+        self, memory_command: MemoryCommand, entries: list[UserMemoryEntry]
+    ) -> str | None:
+        """把 ``/memory forget`` 的入参（短序号或原始 ``mem_`` id）解析成要传给
+        ``tx.forget_user_memory`` 的具体 id（rc22 B-8-1，#439 TOP-10）。
+
+        序号解析用的是**本次调用内、真正执行删除之前**这一次 ``list_user_
+        memory`` 的查询结果——它与随后的 ``tx.forget_user_memory`` 共享同一个
+        数据库事务、同一个连接，中途不会有别的写者插队。``/memory list`` 展示
+        的序号和这里解析用的序号，只要两次查询之间用户自己的记忆集合没有变化，
+        指向的就是同一条记录；如果确实变化了（这次 forget 之前，用户又
+        remember/forget 了别的条目），这里按**当刻重新排序**解析，不去猜测
+        用户上一次看到的是哪一份快照——调用方（``_handle_memory_command``）在
+        回执里回显被删条目的实际内容（``_render_forget_receipt``），让用户能
+        自行核对删的是不是自己想删的那一条，这是覆盖这个「列表与删除之间
+        记忆集合变化」边缘情形取的口径，不是缺陷。
+
+        传入完整 ``mem_`` id 时原样透传，不在这里做存在性/归属预检查——那仍然
+        只由 ``forget_user_memory`` 自己的 ``WHERE ... AND user_id`` 结构性把关
+        （跨用户传入他人 id 时哪怕在 ``entries`` 里也找不到，因为 ``entries``
+        本身就已经是「按 user_id 过滤」的结果），保持这条路径与新增短序号解析
+        之前完全一致的行为，不因为新增能力改变旧路径的判定顺序。
+        """
+
+        if memory_command.memory_serial is not None:
+            index = memory_command.memory_serial - 1
+            if 0 <= index < len(entries):
+                return entries[index].memory_id
+            return None
+        return memory_command.memory_id
+
+    def _render_forget_receipt(self, entry: UserMemoryEntry | None) -> RenderedContent:
+        """``/memory forget`` 的回执（rc22 B-8-1，#439 TOP-10）：命中时回显被删
+        条目的实际内容，供用户自行核对删的是不是那一条——短序号解析存在「列表
+        与删除之间记忆集合变化」的边缘情形（见 ``_resolve_forget_target_id``
+        文档），回显内容是这个口径下用户唯一能自校验的手段。未命中（不存在/
+        不属于本人/序号越界，三者不区分，理由同既有 ``memory.forget_not_
+        found`` 文案）沿用既有拒绝文案。
+
+        被删内容本身撞上安全校验时（同 ``_render_memory_list`` 的道理：
+        ``memory_key``/``memory_value`` 是用户自由文本，无法结构性保证不撞协议
+        泄漏词表）退化成不回显内容的安全占位回执——「删除成功」这个正向结果
+        不能反过来让内容安全校验失效。
+        """
+
+        catalog = self._texts.catalog
+        if entry is None:
+            return catalog.text("memory.forget_not_found")
+        type_label = catalog.text(f"memory.type_label.{entry.memory_type}").text
+        try:
+            return catalog.text(
+                "memory.forgotten",
+                type_label=type_label,
+                memory_key=entry.memory_key,
+                memory_value=entry.memory_value,
+            )
+        except ContentSafetyError:
+            return catalog.text("memory.forgotten_unsafe", type_label=type_label)
 
     def _try_admin_route(
         self, tx, message: InboundMessage, deferred: list[RenderedContent]

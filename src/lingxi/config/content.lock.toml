@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-30-4"
-digest = "sha256:1626a8ec2a2359870e8b655a5159820d337f5cc17fa8fd62417417d7ee732612"
+version = "2026-08-30-5"
+digest = "sha256:b9dd535c5e9edc7ac1fad5411ec9e189109a34d3893c069e007aaef83b19cffb"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -29,6 +29,7 @@ retired_versions = [
   "2026-08-30-1",
   "2026-08-30-2",
   "2026-08-30-3",
+  "2026-08-30-4",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -58,19 +59,20 @@ retired_versions = [
 "texts.gateway.suspended" = "dfe76626dc97ecce"
 "texts.gateway.unexpected_error" = "e73663772f0a3ee9"
 "texts.memory.cleared" = "69a517b197f284af"
-"texts.memory.forget_not_found" = "230bcb25eb539164"
-"texts.memory.forgotten" = "8dd2951f8b668251"
-"texts.memory.limit_exceeded" = "04fe51feb442a36c"
+"texts.memory.forget_not_found" = "09690dd72d85e7e1"
+"texts.memory.forgotten" = "45700689fc536d3a"
+"texts.memory.forgotten_unsafe" = "af2c737775f8522e"
+"texts.memory.limit_exceeded" = "aaa769f990b7c661"
 "texts.memory.list" = "7417464c7145de9c"
 "texts.memory.list_empty" = "f25239a6855eb251"
-"texts.memory.list_entry" = "fe4361b6a8f4c1e5"
-"texts.memory.list_entry_unsafe" = "6908c89a084dc5ff"
+"texts.memory.list_entry" = "1a4e33f7721ae949"
+"texts.memory.list_entry_unsafe" = "1bd42955e07f3219"
 "texts.memory.remember_unsafe" = "186bff87bab87ad4"
 "texts.memory.remembered" = "284fff1c7a19ba43"
 "texts.memory.type_label.calibration_preference" = "fd959acebfa8d8f3"
 "texts.memory.type_label.convention_template" = "95271099604f4d6e"
 "texts.memory.type_label.term_mapping" = "6030911f16b8b73d"
-"texts.memory.usage_help" = "6abdb399dc856115"
+"texts.memory.usage_help" = "d0c16b5987907005"
 "texts.onboarding.checking" = "738d208e40a19f0b"
 "texts.onboarding.completed" = "e6e721e2af6a2d7d"
 "texts.onboarding.delegated_subject" = "2d5caff476da0546"
