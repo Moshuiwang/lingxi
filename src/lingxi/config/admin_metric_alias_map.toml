@@ -1,0 +1,37 @@
+# 「指标中文别名」→ 真实指标 ID 映射（Issue #439 A 档：文本命令兜底人性化）
+#
+# 背景：真实指标目录（config/company_function_metric_map.toml）里的指标 ID 全部是
+# 英文 snake_case 内部标识（如 "sub_new_count"），管理员在 /admin grant_permission /
+# suppress_permission / revoke_permission 里目前必须精确输入这个 ID 才能命中——记不住
+# 拼写、把 grant 与 revoke 参数形状搞混，是 #439 卡内登记的两次真实误用之一。
+#
+# 本文件只提供「别名 → 真实指标 ID」的查找表，供 adapters/admin_metric_alias_map_file.py
+# 加载、core/admin/router.py 在 grant/suppress/revoke 三条写命令里查一次（查不到就原样
+# 透传输入，交给下游按既有"未找到"语义处理，不新增并行的错误分支——见 router.py 的
+# ``AdminQueries.resolve_metric_name`` 文档）。本文件不校验别名是否已在别处使用，也不
+# 校验右值是否真的出现在 company_function_metric_map.toml 里——两个文件由不同人分别
+# 维护，互相校验会让改一个文件牵连另一个文件的解析（与 metric_translation.py 对
+# galaxy_role_function_map.toml 的既有取舍一致）。
+#
+# ── 当前状态：本文件是空的（载体先行，内容后填，与 company_function_metric_map.toml
+#    当年交付时的先例同一姿态）─────────────────────────────────────────────
+# 每个指标 ID 对应的中文别名需要产品负责人依据实际业务口径确定（例如
+# "sub_new_count" 对应"新增用户数"还是"新增订阅数"，需要业务侧确认，不能由实现
+# 代理猜测或从 ID 拼写反推——那是把模型推测当作产品决定）。本卡只交付查找机制；
+# 别名内容留待产品负责人后续补充。
+#
+# ── 生效时机 ─────────────────────────────────────────────────────────
+# 与 galaxy_role_function_map.toml/company_function_metric_map.toml（scheduler 进程
+# 启动时读一次）不同，本文件由 gateway 在**每次**收到 grant/suppress/revoke 写命令时
+# 现读（见 adapters/admin_metric_alias_map_file.py 模块文档）——管理命令面是低频的
+# 单管理员交互，现读的文件 I/O 成本可忽略，换来的是编辑本文件后**立即**生效、不需要
+# 重启 gateway 容器。
+#
+# ── 形状 ─────────────────────────────────────────────────────────────
+# [aliases]
+# "别名文本" = "真实指标ID"
+#
+# 示例（未生效，仅示范形状，产品负责人确认口径前不要取消注释）：
+# # "新增用户数" = "sub_new_count"
+
+[aliases]

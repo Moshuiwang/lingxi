@@ -1,0 +1,72 @@
+"""读取「指标中文别名 → 真实指标 ID」映射配置文件（标准库 tomllib，无新增依赖）。
+
+文件 I/O 放在 adapters：``core/admin/router.py`` 只接收已解析好的字符串到字符串
+映射，形状照 :mod:`lingxi.adapters.company_function_metric_map_file`/
+:mod:`lingxi.adapters.role_function_map_file`（同一份三层分工：配置文件随包发布 →
+本模块解析 → 调用方使用）。
+
+## 与 ``company_function_metric_map_file.py`` 的关键差异：现读，不缓存
+
+那个模块只在 scheduler 进程启动时被调用一次（``apps/scheduler/assembly.py``），
+本模块的唯一调用方 ``adapters/admin_registry.PostgresAdminQueries.resolve_metric_name``
+在**每次**收到 grant/suppress/revoke 写命令时现读——管理命令面是低频的单管理员交互
+（MVP 全仓库只有一个真实管理员），一次 TOML 文件解析的成本可以忽略，换来的是产品
+负责人编辑这份别名表后**立即**生效，不需要重启 gateway 容器（对比
+``company_function_metric_map.toml`` 编辑后需要重启 scheduler 的既有限制，见该文件
+模块文档「外置路径」一节）。因此本模块**不提供**任何缓存或 digest 日志——那些是
+"只加载一次、需要知道读到了哪一版"这个场景才需要的机制，本模块的场景是"每次都读
+最新内容"，天然不存在版本漂移问题。
+
+## fail-open：读取失败视为空表，不阻塞管理命令面
+
+配置文件缺失、格式非法，或 ``[aliases]`` 表本身不存在，本模块**不抛异常**，一律
+返回空映射——与 ``company_function_metric_map_file.load_company_function_metric_map``
+"文件读不出来就响亮失败"的既有纪律相反，是刻意的：这里的映射结果直接决定
+``resolve_metric_name`` 会不会命中一次别名替换，命中与否两条路径下游都要走同一套
+既有校验（``core/admin/commands.py`` 的 ``_METRIC_TOKEN_PATTERN``、
+``decide_prepare``/``prepare()`` 的既有"未找到"语义）——一次文件损坏最多让"记不住
+英文 ID 的管理员这次多打一次字"，不会让任何写命令因为一个纯展示层的便利机制而
+整体不可用。真正的产品数据完整性仍然由 ``company_function_metric_map.toml``（真实
+指标目录）与迁移 ``0072`` 的数据库约束把守，本文件从不参与那两道防线。
+"""
+
+from __future__ import annotations
+
+import tomllib
+from pathlib import Path
+from typing import Mapping
+
+
+def default_admin_metric_alias_map_path() -> Path:
+    """随包发布的配置文件路径。"""
+
+    return Path(__file__).resolve().parents[1] / "config" / "admin_metric_alias_map.toml"
+
+
+def load_admin_metric_alias_map(path: Path | None = None) -> Mapping[str, str]:
+    """解析「别名 → 真实指标 ID」映射；读取或格式失败一律返回空映射（见模块文档
+    「fail-open」一节，与 ``company_function_metric_map_file`` 的响亮失败纪律刻意
+    相反）。
+
+    ``path`` 为 ``None`` 时落回包内默认路径。返回值只保留 ``[aliases]`` 表下
+    键、值都是非空字符串的条目——形状不对的单条目跳过而不是让整份解析失败，
+    理由与"读取失败就当空表"相同：这是一个便利机制，不值得因为一条脏配置让
+    其余已经写对的别名也失效。
+    """
+
+    config_path = path or default_admin_metric_alias_map_path()
+    try:
+        with config_path.open("rb") as config_file:
+            document = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+    aliases = document.get("aliases")
+    if not isinstance(aliases, Mapping):
+        return {}
+
+    return {
+        key: value
+        for key, value in aliases.items()
+        if isinstance(key, str) and key and isinstance(value, str) and value
+    }

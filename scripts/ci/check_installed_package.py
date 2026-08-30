@@ -293,6 +293,11 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.card_callback",
     "lingxi.adapters.postgres_pending_action",
     "lingxi.adapters.feishu_admin_card",
+    # 用户权限管理卡（#439 B 档）展示层 + 指标中文别名反查（#439 A 档）的配置
+    # 读取——两者均只被 gateway 的管理命令面消费，与上面确认卡片的既有归类
+    # 同一姿态。
+    "lingxi.core.admin.management_card",
+    "lingxi.adapters.admin_metric_alias_map_file",
     "lingxi.apps.worker.cli",
     "lingxi.apps.worker.config",
     "lingxi.apps.worker.report",
@@ -637,6 +642,13 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # 两个模块已经在上面「四源聚合集中合并」一节登记过（S-P-3 落地更早），
             # 这里不重复登记同一个字面量——门禁对首列的重复做静态核对，一处登记
             # 已经证明"装得上"，重复只会让核对本身变得可疑。
+            # #439 A 档：`PostgresAdminQueries.resolve_metric_name`（指标中文别名
+            # 反查）在函数内延迟 import `admin_metric_alias_map_file`——它随
+            # `admin_registry.py` 一起进了本闭包（同上"admin_bootstrap 种子写入
+            # 使用"一条边），即使 admin_bootstrap 本身从不调用这个方法：静态闭包
+            # 检查按模块整体核对可达性，不按函数调用路径区分。纯标准库
+            # （`tomllib`），不新增第三方依赖。
+            "lingxi.adapters.admin_metric_alias_map_file",
             "lingxi.core.admin",
             "lingxi.core.admin.registry",
             "lingxi.core.admin.views",
@@ -961,6 +973,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.card_callback",
             "lingxi.adapters.postgres_pending_action",
             "lingxi.adapters.feishu_admin_card",
+            # 用户权限管理卡（#439 B 档）：`/admin user` 除既有文本回复外附带发送
+            # 一张管理卡（`ManagementCardDispatcher`/`TomlCompanyMetricCatalog`，
+            # 均在函数内由装配层按需 import，与本组其余"函数内 import 也要显式
+            # 登记"条目同一姿态）。`admin_registry.PostgresAdminQueries.
+            # resolve_metric_name` 同样在函数内 import `admin_metric_alias_map_
+            # file`（#439 A 档指标中文别名反查）。四个新模块均为纯标准库
+            # （`tomllib`），不新增第三方依赖，只补齐制品完整性登记。
+            "lingxi.core.admin.management_card",
+            "lingxi.adapters.admin_metric_alias_map_file",
+            "lingxi.adapters.company_function_metric_map_file",
+            "lingxi.core.permission.metric_translation",
             # 本地权限授权/抑制全链路（#319 S-P-1b）：
             # adapters.postgres_pending_action 模块级 import 了
             # adapters.postgres_local_permission 的 _insert_locked/

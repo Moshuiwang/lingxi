@@ -32,12 +32,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from lingxi.core.admin.management_card import (
+    CompanyMetricCatalog,
+    ManagementCardTransport,
+    render_management_card,
+)
 from lingxi.core.admin.notification import (
     AdminCardDeliveryRejected,
     AdminCardTransport,
     render_confirm_card,
 )
 from lingxi.core.admin.pending_action import PendingAction
+from lingxi.core.admin.views import AdminUserStatusView
 
 
 class PendingActionDeliveryTracker(Protocol):
@@ -126,3 +132,73 @@ class ConfirmCardDispatcher:
 
         self._tracker.mark_card_delivered(pending_action_id=pending.id, card_id=created.card_id)
         return CardDispatchResult(delivered=True)
+
+
+@dataclass(frozen=True)
+class ManagementCardDispatchResult:
+    delivered: bool
+
+
+class ManagementCardDispatcher:
+    """把 ``/admin user`` 查到的用户权限管理卡（#439 B 档）渲染并发到发起管理员
+    本人私聊，作为触发这条查询命令的消息的回复。
+
+    与 :class:`ConfirmCardDispatcher` 是两个独立类：管理卡不是一次待确认操作，
+    没有"发送结果需要落回某一行状态"这一步（见 ``core/admin/management_card.py``
+    模块文档"两张不同的卡"）——发送成功与否只影响这次查询是否额外附带了一张卡，
+    不影响任何数据库行的状态机，因此不需要注入 ``PendingActionDeliveryTracker``
+    这一类落库口。发送失败只记一条审计，调用方（``core/admin/router.
+    AdminCommandRouter._send_management_card``）据此把失败当 best-effort 处理，
+    不影响 ``/admin user`` 既有的文本回复。
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: ManagementCardTransport,
+        catalog: CompanyMetricCatalog,
+        audit: AuditSink,
+    ) -> None:
+        self._transport = transport
+        self._catalog = catalog
+        self._audit = audit
+
+    def send(
+        self,
+        *,
+        status: AdminUserStatusView,
+        display_identifier: str,
+        chat_id: str,
+        thread_id: str | None,
+        reply_to_message_id: str,
+    ) -> ManagementCardDispatchResult:
+        card = render_management_card(
+            status, display_identifier=display_identifier, catalog=self._catalog
+        )
+        try:
+            self._transport.create(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+                card=card,
+            )
+        except Exception as error:
+            # 与 ConfirmCardDispatcher.send 同一白名单纪律：明确拒绝与结果不明
+            # 在这里得到同一处理——管理卡发送失败不影响任何业务状态（它本来就
+            # 不是一次待确认操作），因此不需要"作废"任何东西，只记一条审计。
+            if isinstance(error, AdminCardDeliveryRejected):
+                self._audit.record(
+                    "admin.management_card_dispatch.send_failed",
+                    target=display_identifier,
+                    error=type(error).__name__,
+                    code=error.code,
+                    log_id=error.log_id,
+                )
+            else:
+                self._audit.record(
+                    "admin.management_card_dispatch.send_failed",
+                    target=display_identifier,
+                    error=type(error).__name__,
+                )
+            return ManagementCardDispatchResult(delivered=False)
+        return ManagementCardDispatchResult(delivered=True)

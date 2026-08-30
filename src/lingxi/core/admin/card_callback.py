@@ -81,6 +81,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from lingxi.core.admin.management_card import ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -135,6 +136,68 @@ class AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 
 
+class _ManagementRouteOutcome(Protocol):
+    """``AdminRouteOutcome`` 的公共结构面（#439 B 档新增两个方法用得到的四个
+    字段）：用结构类型而不是 import 具体 dataclass，避免card_callback.py 与
+    router.py 之间多一层强耦合——两者本来就已经通过 ``PendingActionPreparer``/
+    ``ConfirmCardSender`` 两个独立端口分别与 ``AdminCommandRouter`` 打交道（见
+    ``router.py`` 模块文档），这里延续同一分工。"""
+
+    handled: bool
+    content_key: str
+    reply_text: str
+
+
+class ManagementActionRouter(Protocol):
+    """管理卡（#439 B 档）表单/按钮回调 → 等价 ``/admin ...`` 命令文本 → 既有
+    ``AdminCommandRouter.route()`` 的调用面。与 ``PendingActionDecider``/
+    ``AdminCardTransport`` 两个既有端口是同一个类（真实装配时都指向同一个
+    ``AdminCommandRouter`` 实例），但作为独立声明的 Protocol——本类只用得到
+    ``route()`` 这一个方法，不需要 import 具体的 ``AdminCommandRouter`` 类型。
+
+    真正的写路径判定（角色核对、自我目标防呆、prepare()、确认卡发送、审计）
+    全部发生在 ``route()`` 内部——本类新增的两个方法只负责"把管理卡的交互翻译成
+    一条等价命令文本"，不重新实现任何一步既有判定（#437/#438 领地不变）。
+    """
+
+    def route(
+        self,
+        *,
+        open_id: str,
+        text: str,
+        trace_id: str,
+        chat_id: str = "",
+        thread_id: str | None = None,
+        message_id: str = "",
+    ) -> _ManagementRouteOutcome: ...
+
+
+#: 管理卡逐行「收回」按钮没有独立的原因输入框（issue #439 B 档设计：一键收回，
+#: 不为收回单独加一个表单）——服务端补一个固定原因，供审计与确认卡回显；管理员
+#: 需要自定义收回原因时仍可用文本命令 ``/admin revoke_permission`` 自行填写。
+_MANAGEMENT_CARD_REVOKE_REASON = "管理卡逐行收回"
+
+#: 表单提交成功创建待确认操作时 ``AdminRouteOutcome.content_key`` 的取值——与
+#: ``router.py`` 里 ``_dispatch_write_action`` 最终成功分支写死的字面量一致，
+#: 是本模块判断"这次提交要不要提示成功 toast"的唯一依据（见 ``router.py`` 该
+#: 分支的 ``content_key="admin.write_action_pending"``）。
+_WRITE_ACTION_PENDING_CONTENT_KEY = "admin.write_action_pending"
+
+
+def _toast_from_route_outcome(outcome: _ManagementRouteOutcome) -> dict[str, Any]:
+    """把 ``AdminCommandRouter.route()`` 的结论翻译成管理卡交互的 toast 应答
+    （不带 ``card`` 键——管理卡面板本身不因为一次表单提交而改变展示，管理员可以
+    继续在同一张卡上发起下一次操作，见 ``core/admin/management_card.py`` 模块
+    文档"管理卡不支持 update()"一节）。"""
+
+    if not outcome.handled:
+        # 结构上只会发生在"点击这一刻当前角色恰好已被撤销"——route() 内部会重新
+        # 判定一次身份，不假设管理卡的历史交互权限仍然有效。
+        return _toast_error("当前身份已无权限执行该操作，请重新查询 /admin user")
+    toast_type = "success" if outcome.content_key == _WRITE_ACTION_PENDING_CONTENT_KEY else "error"
+    return {"toast": {"type": toast_type, "content": outcome.reply_text}}
+
+
 class AdminCardCallbackHandler:
     """``card.action.trigger`` 事件的唯一处理入口。见模块文档。"""
 
@@ -146,12 +209,106 @@ class AdminCardCallbackHandler:
         group_notifier: GroupNotifier | None,
         group_chat_id: str | None,
         audit: AuditSink,
+        management_actions: ManagementActionRouter | None = None,
     ) -> None:
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
         self._group_notifier = group_notifier
         self._group_chat_id = group_chat_id
         self._audit = audit
+        # 未装配时管理卡的表单/按钮交互回复"该功能当前不可用"，不假装已经路由
+        # 过任何命令——与本类既有确认/取消两个端口"未装配=构造时必须传入"不同
+        # （#439 新增，向后兼容既有全部调用点：不传这个参数时行为逐字节不变）。
+        self._management_actions = management_actions
+
+    def handle_management_form_submit(
+        self,
+        *,
+        operator_open_id: str,
+        admin_action: str,
+        identifier: str,
+        company_id: str,
+        metric_name: str,
+        reason: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """管理卡「新增授权 / 新增抑制」表单提交（#439 B 档新增交互分支）。
+
+        参数是**已经从飞书表单回传值解析出来的干净字段**——原始 ``card.action.
+        trigger`` 事件体的解析（含如何从表单字段里取出 ``company_id``/
+        ``metric_name``/``reason``）是 gateway 接线层的职责，与既有
+        ``operator_open_id``/``pending_action_id``/``decision`` 三个干净参数同一
+        分工（见模块文档"``handle()`` 的返回值就是飞书卡片回调的应答帧"一节，
+        原始事件解析同样不在本类里）。
+
+        任何一个必填字段为空（下拉未选择、目录不可用时的占位选项、输入框留空）
+        都在这里直接拒绝，不构造一条注定是 ``UNKNOWN`` 的命令文本去打扰
+        ``route()``——三个字段的校验判据本身就是"非空"，与 ``core/admin/
+        commands.py`` 的既有语法门重复，但在这里提前判断能给出"请选择/填写
+        哪一项"这种更具体的 toast，而不是笼统的"未识别的管理命令"。
+        """
+
+        if self._management_actions is None:
+            return _toast_error("该功能当前不可用，请改用文本命令")
+        if admin_action not in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
+            self._audit.record(
+                "admin.card_callback.management_unknown_action",
+                admin_action=admin_action,
+                trace_id=trace_id,
+            )
+            return _toast_error("操作不存在或已失效")
+        if not company_id:
+            return _toast_error("请选择公司")
+        if not metric_name:
+            return _toast_error("请选择指标")
+        if not reason.strip():
+            return _toast_error("请填写原因")
+
+        sub_command = "grant_permission" if admin_action == ADMIN_ACTION_GRANT else "suppress_permission"
+        text = f"/admin {sub_command} {identifier} {company_id} {metric_name} {reason.strip()}"
+        outcome = self._management_actions.route(
+            open_id=operator_open_id,
+            text=text,
+            trace_id=trace_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+        )
+        return _toast_from_route_outcome(outcome)
+
+    def handle_management_revoke(
+        self,
+        *,
+        operator_open_id: str,
+        override_id: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """管理卡逐行「收回」按钮点击（#439 B 档新增交互分支）。
+
+        ``override_id`` 是建卡时写进按钮 ``behaviors.value`` 的这一行内部标识，
+        直接复用旧形状 ``/admin revoke_permission <override_id> <原因>``（见
+        ``core/admin/commands.py`` 文档"形状 1"）——按钮点击这一刻已经精确知道
+        是哪一行，不需要走 A 档新增的「标识+公司+指标」反查形状。
+        """
+
+        if self._management_actions is None:
+            return _toast_error("该功能当前不可用，请改用文本命令")
+        text = f"/admin revoke_permission {override_id} {_MANAGEMENT_CARD_REVOKE_REASON}"
+        outcome = self._management_actions.route(
+            open_id=operator_open_id,
+            text=text,
+            trace_id=trace_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+        )
+        return _toast_from_route_outcome(outcome)
 
     def handle(
         self, *, operator_open_id: str, pending_action_id: str, decision: str, trace_id: str
