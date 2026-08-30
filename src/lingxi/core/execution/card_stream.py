@@ -19,6 +19,15 @@
 这份参数因此不是可选的锦上添花，而是"正文不会跨轮询边界变短"的唯一依据，见
 ``apps/gateway/delivery.py`` 模块说明「过程流式的正文累积」。
 
+**Issue #444 起，同一枚步骤身份持续过久会被明示为"停滞"**（产品负责人
+2026-08-30 裁定「不做每秒读秒，改做不变即异常」）：``_accumulate_step`` 原地
+刷新同一行时，若这枚身份已经持续超过 :data:`STALL_THRESHOLD_SECONDS`，改用
+``worker.status_stalled`` 文案明示"仍停在这一步、已经多久没有新进展"，而不是
+继续用看不出异常的"{action} · N 秒"措辞；换成新身份后自动恢复常规措辞，不需要
+调用方感知这个状态切换。呈现层的停滞阈值与 worker 侧的兜底强制刷新间隔
+（``apps/worker/service.py::_PROGRESS_FALLBACK_SECONDS``，由 30 秒收紧到 12
+秒）取同一个值——理由见两处常量各自上方的注释。
+
 **「明确失败」与「结果不明」不是同一件事，判别用白名单而不是黑名单**（独立审核
 B-1 首次修复于 2026-08-14；独立审核 R-1 于同日把判别方向从黑名单反转为白名单，
 红线：重复投递）。``start()``/``finish()`` 的终态更新/``send_fallback()`` 这三处
@@ -270,9 +279,10 @@ SendOutcomeCallback = Callable[[str, bool], None]
 #   改动只是复用现成的降级路径提前触发一次，不需要新增任何状态机分支，代价
 #   明显更低——选定为本次实现。
 # 阈值取 9 分钟（留 1 分钟安全余量）：事件驱动进度更新最短 5 秒、兜底计时最长
-# 30 秒（``apps/worker/service.py``），跨过阈值后最多 30 秒内就会有下一次
-# ``update`` 调用触发这条提示，届时距真实的 10 分钟平台自动关闭仍有≥30 秒
-# 余量，可靠地在平台真的关闭之前完成主动切换。
+# 12 秒（``apps/worker/service.py`` 的 ``_PROGRESS_FALLBACK_SECONDS``，Issue
+# #444 由 30 秒收紧），跨过阈值后最多 12 秒内就会有下一次 ``update`` 调用
+# 触发这条提示，届时距真实的 10 分钟平台自动关闭仍有≥48 秒余量（收紧前是
+# ≥30 秒），可靠地在平台真的关闭之前完成主动切换。
 CARD_AUTO_CLOSE_HANDOFF_SECONDS = 540.0
 
 
@@ -341,6 +351,22 @@ class ProgressStepSnapshot:
 # 第一步。
 MAX_ACCUMULATED_STEP_LINES = 40
 
+# 停滞判定阈值（Issue #444，产品负责人 2026-08-30 裁定「不做每秒读秒，改做
+# 不变即异常」）：`_accumulate_step` 把每一次信号的语义身份（action/query_
+# count/query_step 三元组）与上一次比较——身份不变时只原地刷新这一行（见
+# 该方法文档）。这个阈值回答"身份不变可以持续多久才算异常"：同一枚身份从
+# 第一次出现到本次刷新，累计跨过这么多秒仍未换成新的身份，就判定为"停滞"，
+# 切换成明示文案（``worker.status_stalled``，见 ``_render_step_line``）而
+# 不是继续用看不出异常的"{action} · N 秒"措辞。这正是产品合同"文字十几秒内
+# 必有变化；不变超过一个兜底周期即视为异常且卡片自述"里"一个兜底周期"的
+# 呈现层落地——取值与 ``apps/worker/service.py::_PROGRESS_FALLBACK_SECONDS``
+# （worker 侧兜底强制刷新间隔，由 30 秒收紧到这个值）保持一致：worker 端
+# 的兜底 tick 复用当前信号身份写库，恰好是这里要识别的"整整一个周期没有
+# 新身份"的真实来源。两个常量各自独立登记、互不 import（同本文件
+# ``_WORST_CASE_QUERYING_CONTENT_LENGTH`` 一贯的"没有自动化门禁跨文件互相
+# 核对，这一条纪律"），调整任一侧都要回头看另一侧是否仍然对齐。
+STALL_THRESHOLD_SECONDS = 12
+
 
 class CardStream:
     """一个任务一个实例；绝不跨话题共享卡片序号或限流状态。"""
@@ -386,10 +412,16 @@ class CardStream:
         # 的历史信号重建）重放一遍，找回上一轮结束时的累积状态，再由后续
         # ``update()`` 调用在这个基础上继续追加，不会出现"新一轮卡片正文突然
         # 变短"这种回退观感。``_last_step_identity`` 记录"最近一次累积的是
-        # 哪一种信号"——同一种信号连续出现时（例如 30 秒兜底刷新复用同一个
-        # 状态）只原地刷新用时，不重复追加同一句话；换成不同信号才追加新行。
+        # 哪一种信号"——同一种信号连续出现时（例如兜底刷新复用同一个状态）
+        # 只原地刷新用时，不重复追加同一句话；换成不同信号才追加新行。
+        # ``_current_step_started_at`` 记录当前这枚身份第一次出现时的
+        # ``elapsed_seconds``——停滞判定（Issue #444）需要知道"这枚身份已经
+        # 持续了多久"，而不是"任务总共跑了多久"，两者在有多个步骤的长任务里
+        # 并不相等。resume 重放同样会正确重建这个锚点，因为回放本身就是逐条
+        # 调用 ``_accumulate_step``，与实时调用走同一份逻辑。
         self._step_lines: list[str] = []
         self._last_step_identity: tuple[str, int | None, str | None] | None = None
+        self._current_step_started_at: int = 0
         for snapshot in initial_progress_history:
             self._accumulate_step(
                 action=snapshot.action,
@@ -513,24 +545,44 @@ class CardStream:
         识别一次信号是不是"新步骤"，只看语义身份 ``(action, query_count,
         query_step)`` 是否与上一次不同——问数查询的 ``query_count`` 递增
         （即使 ``query_step`` 相同）也算新步骤，因为"第几次查询"本身就是
-        Issue #321/#407 要求的"有业务含义的文字变化"。身份不变时（例如 30 秒
-        兜底刷新复用同一个状态、还没有任何新信号）只原地刷新这一行的用时，
-        不重复追加同一句话——否则长任务会在同一个阶段反复刷屏一模一样的行，
-        与"只到步骤名深度"的产品意图背道而驰。
+        Issue #321/#407 要求的"有业务含义的文字变化"。身份不变时（例如兜底
+        刷新复用同一个状态、还没有任何新信号）只原地刷新这一行，不重复追加
+        同一句话——否则长任务会在同一个阶段反复刷屏一模一样的行，与"只到
+        步骤名深度"的产品意图背道而驰。
 
         只有 ``PROGRESS_ACTION_QUERYING`` 才把 ``query_count``/``query_step``
         计入身份——其它动作即使调用方误传了这两个参数也不区分，防止调用方
         传参不一致时把同一个 composing/working 状态错误地拆成多行。
+
+        **停滞判定（Issue #444）**：身份不变时，同时算出这枚身份已经持续了
+        多久（``elapsed_seconds`` 减去它第一次出现时的 ``elapsed_seconds``，
+        即 ``_current_step_started_at``）。跨过 :data:`STALL_THRESHOLD_
+        SECONDS` 才把这个"已持续秒数"交给 ``_render_step_line`` 切换成停滞
+        明示文案；没跨过时仍然只是原地刷新总用时的旧措辞——避免任务刚好在
+        两次事件驱动更新之间、还没真正到"一个兜底周期"就被误判成异常。
+        换成新身份时清零这个锚点，只有新身份自己持续够久才会再次触发。
         """
 
         if action == PROGRESS_ACTION_QUERYING:
             identity = (action, query_count, query_step)
         else:
             identity = (action, None, None)
+        is_repeat = bool(self._step_lines) and self._last_step_identity == identity
+        stalled_seconds: int | None = None
+        if is_repeat:
+            duration = max(0, elapsed_seconds - self._current_step_started_at)
+            if duration >= STALL_THRESHOLD_SECONDS:
+                stalled_seconds = duration
+        else:
+            self._current_step_started_at = elapsed_seconds
         line = self._render_step_line(
-            action=action, elapsed_seconds=elapsed_seconds, query_count=query_count, query_step=query_step
+            action=action,
+            elapsed_seconds=elapsed_seconds,
+            query_count=query_count,
+            query_step=query_step,
+            stalled_seconds=stalled_seconds,
         )
-        if self._step_lines and self._last_step_identity == identity:
+        if is_repeat:
             self._step_lines[-1] = line
         else:
             self._step_lines.append(line)
@@ -688,9 +740,10 @@ class CardStream:
         elapsed_seconds: int,
         query_count: int | None = None,
         query_step: str | None = None,
+        stalled_seconds: int | None = None,
     ) -> str:
         """按语义化进度动作码选文案，渲染成累积列表里的一行（Issue #321 方向
-        C；Issue #407 增粒度／方向 B）。
+        C；Issue #407 增粒度／方向 B；Issue #444 停滞明示）。
 
         ``query_count`` 缺失（``None``）时 ``querying`` 退化为默认 ``processing``
         文案而不是抛错或渲染出一句缺占位符的残句——这只可能发生在
@@ -704,6 +757,13 @@ class CardStream:
         过滤过，这里是第三层防御——直接用 ``dict.get`` 查不到就落回默认值，
         不做任何字符串拼接或动态键名，因此不存在"传入未知值就把它拼进渲染键"
         这条注入面）一律落回通用文案 ``worker.action.querying_metrics``。
+
+        ``stalled_seconds``——非 ``None`` 时（``_accumulate_step`` 判定同一枚
+        身份已经跨过 :data:`STALL_THRESHOLD_SECONDS` 仍未变化）改用
+        ``worker.status_stalled`` 明示停滞的措辞，而不是常规的
+        ``worker.status``；``action_text`` 本身不变——它已经带着"停滞发生在
+        哪一步"这个位置信息（例如"正在第 2 次查询指标数据"），停滞措辞只是
+        换了个更明确的后缀，不是丢掉位置信息重新说一遍。
         """
 
         if action == PROGRESS_ACTION_COMPLETED:
@@ -717,6 +777,10 @@ class CardStream:
             action_text = self._catalog.text("worker.action.working").text
         else:
             action_text = self._catalog.text("worker.action.processing").text
+        if stalled_seconds is not None:
+            return self._catalog.text(
+                "worker.status_stalled", action=action_text, stalled_seconds=stalled_seconds
+            ).text
         return self._catalog.text(
             "worker.status", action=action_text, elapsed_seconds=elapsed_seconds
         ).text

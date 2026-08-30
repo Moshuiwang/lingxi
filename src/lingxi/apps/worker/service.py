@@ -66,8 +66,31 @@ _STOP_SIGNAL_DRAIN_YIELDS = 5
 # - 兜底计时驱动（`_monitor` 每轮调用一次）最长间隔 `_PROGRESS_FALLBACK_SECONDS`
 #   ——距上次更新超过这个阈值时强制推一次纯用时更新，即使没有任何新信号。
 # 两者是同一个节流函数在同一份状态上的两种阈值，不是两套独立机制。
+#
+# `_PROGRESS_FALLBACK_SECONDS` 由 30 秒收紧到 12 秒（Issue #444，产品负责人
+# 2026-08-30 裁定「不做每秒读秒，改做不变即异常」）：产品负责人要求卡片文字
+# 「十几秒内必有变化」，30 秒的旧兜底周期本身就超过这个体验预算，用户能感知
+# 到的最长静止时间必须压缩进"十几秒"量级。12 秒落在卡片给出的 10~15 秒收紧
+# 区间中段，取值依据——
+# - 配额余量：CardKit 限流是单话题 500ms/全进程 50 次/秒
+#   （见 `core.execution.card_stream.CardRateLimiter`）；12 秒兜底周期下单个
+#   任务最多贡献 1/12 ≈0.083 次/秒，`WorkerConfig.max_concurrency` 默认 16
+#   （见 `apps/worker/config.py`），即使全部 16 个并发任务的兜底 tick 完全
+#   同步撞在同一秒（最坏情形，事件驱动的 5 秒最短间隔与兜底 tick 走同一份
+#   节流状态、不会与兜底 tick 同时重复计数），单进程每秒也只贡献 16 次，
+#   仍有 34 次/秒（68%）的余量留给同一进程内其它话题的事件驱动更新与终态帧；
+# - 与事件驱动最短间隔 `_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS`（5 秒）的比例
+#   保持在 2 倍以上，不会出现"兜底周期比事件驱动间隔还短、兜底成为主要更新
+#   来源"的倒挂；
+# - 与 `core.execution.card_stream.CARD_AUTO_CLOSE_HANDOFF_SECONDS`（540 秒
+#   提前收口阈值）的安全余量因此从旧值的 ≥30 秒提升到 ≥48 秒，见该常量上方
+#   注释同步更新的数字。
+# 呈现层的停滞判定阈值（`core.execution.card_stream.STALL_THRESHOLD_SECONDS`）
+# 取相同的值，用来判定"同一枚步骤身份连续出现是否已经跨过一个兜底周期"；两个
+# 常量各自独立登记、互不 import（本文件与该模块一贯的纪律：没有自动化门禁
+# 跨文件互相核对），调整任一侧都要回头看另一侧是否仍然对齐。
 _PROGRESS_MIN_UPDATE_INTERVAL_SECONDS = 5.0
-_PROGRESS_FALLBACK_SECONDS = 30.0
+_PROGRESS_FALLBACK_SECONDS = 12.0
 
 
 class QueueListener(Protocol):
@@ -441,9 +464,10 @@ class WorkerService:
         # 2026-08-29 方向 A+B 裁定）：三个信号源——模型文本输出（`on_stream_
         # event` 的 `assistant_message`）、工具调用开始（`on_tool_call`，数据
         # 来自 `ToolGateway.set_tool_call_listener`，见 `apps/worker/turn.py::
-        # run_turn`）、30 秒兜底计时（`_monitor` 的 `on_stall_tick`）——共享这
-        # 一份状态，区分三类文案：问数查询工具（`QUERY_MCP_TOOL_PREFIX` 前缀，
-        # 再按去掉前缀后的子步骤名白名单式细分四种更具体的文案，见
+        # run_turn`）、`_PROGRESS_FALLBACK_SECONDS` 兜底计时（`_monitor` 的
+        # `on_stall_tick`）——共享这一份状态，区分三类文案：问数查询工具
+        # （`QUERY_MCP_TOOL_PREFIX` 前缀，再按去掉前缀后的子步骤名白名单式
+        # 细分四种更具体的文案，见
         # `core.execution.card_stream._QUERY_STEP_ACTION_TEXT_KEYS`）、模型
         # 文本输出（composing）、其它工具调用（working，含被拒绝的越界包装
         # 调用）。`last_progress_write_at` 以任务开始时刻为锚点：`_process_task`
@@ -480,7 +504,7 @@ class WorkerService:
             写库本身丢进线程池执行、不在这里等待结果（与 `service.py` 别处的
             `asyncio.to_thread` 同一手法）：这个函数被 SDK 流式回调
             （`on_stream_event`/`on_tool_call`，同步、由 `turn.py` 的迭代循环
-            直接调用）与 30 秒兜底 tick（`on_stall_tick`，同步、由 `_monitor`
+            直接调用）与 `_PROGRESS_FALLBACK_SECONDS` 兜底 tick（`on_stall_tick`，同步、由 `_monitor`
             的轮询循环直接调用）共用，三处调用方都不是 `async def`、改不成
             `await`。真实 psycopg 同步写最坏可能卡住数秒（锁等待/网络抖动），
             不丢进线程池会直接拖住事件循环、连带心跳与停止处理跟着变慢。
@@ -573,8 +597,8 @@ class WorkerService:
 
         def on_stall_tick() -> None:
             # `_monitor` 每个 `stop_poll_interval_seconds` 调用一次：距上次真正
-            # 写库的更新 ≥30 秒时强制推一次纯用时更新（沿用当前的 progress_
-            # action/query_count，即使没有任何新信号）。
+            # 写库的更新 ≥`_PROGRESS_FALLBACK_SECONDS` 时强制推一次纯用时更新
+            # （沿用当前的 progress_action/query_count，即使没有任何新信号）。
             _write_progress_if_due(_PROGRESS_FALLBACK_SECONDS)
 
         monitor = asyncio.create_task(
