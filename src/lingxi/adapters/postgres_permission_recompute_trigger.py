@@ -29,14 +29,53 @@ cipher`` 只在**新建**发布行时才需要，见 ``core/permission/publish_r
 它也接进 gateway（一个直接暴露在飞书长连接、处理外部回调的进程），是明显不成
 比例的攻击面扩大，因此 ``TargetedPermissionRecompute`` 固定传 ``token_cipher=
 None``（见该模块文档「三处刻意不同」第 3 条）——真的撞上"要新建行却没有密文"，
-``record_decision`` 会失败，本类让异常原样冒泡，由 ``card_callback.py`` 的
-best-effort 包裹按「降级回每日批」处理。**这条选择改变的是系统边界（哪个进程
-持有哪把密钥），本卡不擅自扩大，本模块也因此明确排除了这一角，留给产品/架构
-在需要时另行评估。**
+``PermissionRecomputeAdapter.trigger`` 会让 ``ValueError`` 原样冒泡，调用方
+（``BackgroundPermissionRecomputeTrigger`` 或 ``card_callback.py`` 的
+best-effort 包裹，取决于是否接了下面这层异步执行器）按「降级回每日批」处理。
+**这条选择改变的是系统边界（哪个进程持有哪把密钥），本卡不擅自扩大，本模块也
+因此明确排除了这一角，留给产品/架构在需要时另行评估。**
+
+## ``BackgroundPermissionRecomputeTrigger``：把同步触发包成"提交即返回"（Trace #445 opus 审查坐实并修复）
+
+``card_callback.py::AdminCardCallbackHandler._trigger_recompute`` 在
+``handle()`` 的主路径里**同步**调用注入的 ``recompute_trigger.trigger(pending)``
+——而 ``PermissionRecomputeAdapter.trigger`` 内部有五到六次网络往返的 Postgres
+查询/写入（花名册基线、花名册快照、银河快照、权限发布表读写、本地覆盖读取），
+一旦数据库这一刻抖动变慢，管理员点确认按钮之后就要一直等到这整条重算链路跑完
+才能收到卡片应答——``handle()`` 的返回值就是飞书要的应答帧（``card_callback.py``
+模块文档「载体 #96」），这条延迟直接体现为飞书卡片按钮转圈。定向重算是「即时
+生效」这一层纵深，每日批本来就是保底，没有理由让它的延迟拖累回调应答本身。
+
+**为什么在这里包一层，不让 ``card_callback.py`` 自己起线程**：``card_callback.py``
+只依赖注入的 ``PermissionRecomputeTrigger`` Protocol 端口，不该知道"这个端口的
+真实实现要不要异步执行"这种装配层细节——``_trigger_recompute`` 的 EXECUTED-only、
+幂等去重判据一个字都不改（仍然只在这次点击首次让操作执行成功时调用一次
+``trigger()``），本类只是装配层塞进另一层的 ``PermissionRecomputeTrigger``
+实现：``card_callback.py`` 看到的仍然是"调用 ``trigger()``，失败会抛异常"这同一个
+契约，只是这次 ``trigger()`` 本身从不冒泡异常（只做入队）——真正可能失败的执行
+在后台线程里跑，用与 ``card_callback.py`` 同一个动作名/字段形状记一条审计（见
+:meth:`_run`），运维检索方式不需要跟着改。
+
+**有界队列 + 丢弃，不是无界排队**：单工作线程按入队顺序串行执行——真实数据库
+连接不该被并发重算请求以不可控并发数打满。队列容量固定在 1~4 之间（默认 4）：
+管理员确认卡片是低频人工操作，正常情况下队列几乎总是空的，容量存在的意义是
+"扛住短时间内连续几次点击"，不是"扛住持续高吞吐"。真的堆满时选择**丢弃并响亮
+审计**，不是无界增长——无界队列会把"数据库变慢"变成"进程内存持续增长直到
+OOM"，且被丢弃的这一条重算本来就有每日批兜底，不丢反而更不安全。
+
+**daemon 线程**：与 gateway 进程既有的两条投递消费线程同一姿态
+（``apps/gateway/__init__.py`` 的 ``delivery_thread``/``document_delivery_
+thread`` 均 ``daemon=True``）——进程收到停机信号时不应该被一条卡在数据库调用里
+的后台重算线程拖住退出，`V-部署-03` 的停机预算只覆盖长连接与两条投递消费循环，
+本类新增的这条后台线程不参与那份预算记账——它本来就是"尽力而为"的纵深，不是
+必须完成才能安全退出的在途工作（真正的业务写入已经在 ``confirm()``/``cancel()``
+那次数据库事务里落定，重算只是让结果更快对外可见）。
 """
 
 from __future__ import annotations
 
+import queue
+import threading
 from typing import Any, Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
@@ -147,4 +186,83 @@ class PermissionRecomputeAdapter:
             recompute.recompute_and_publish(user_id=user_id)
 
 
-__all__ = ["PermissionRecomputeAdapter"]
+#: 单工作线程队列容量上下界（模块文档「有界队列 + 丢弃」一节）。
+_MIN_QUEUE_MAXSIZE = 1
+_MAX_QUEUE_MAXSIZE = 4
+_DEFAULT_QUEUE_MAXSIZE = 4
+
+#: 与 ``card_callback.py::AdminCardCallbackHandler._trigger_recompute`` 同步
+#: 分支使用的字面量逐字相同——运维按这一个动作名检索"这次定向重算触发失败了"，
+#: 不需要区分背后到底是同步调用失败还是本类的后台线程执行失败。
+_RECOMPUTE_TRIGGER_FAILED_ACTION = "admin.card_callback.recompute_trigger_failed"
+
+#: 有界队列满时的丢弃审计——与上面那条失败审计是两件不同的事（这条从未真正
+#: 执行过，谈不上"失败"），动作名因此独立登记，运维可以分辨"这次触发到底是
+#: 执行失败了，还是压根没排上队"。
+_RECOMPUTE_TRIGGER_DROPPED_ACTION = "admin.card_callback.recompute_trigger_dropped"
+
+
+class BackgroundPermissionRecomputeTrigger:
+    """把任意 ``PermissionRecomputeTrigger`` 实现（生产环境即
+    :class:`PermissionRecomputeAdapter`）包成"提交即返回、后台单线程串行执行"
+    的异步执行器（Trace #445 opus 审查坐实并修复）。完整取舍见模块文档
+    「``BackgroundPermissionRecomputeTrigger``」一节；本类只编排排队与执行，
+    不编排也不修改任何定向重算的业务判定——那些规则完全在被包装的
+    ``delegate`` 里。
+    """
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        audit: AuditSink,
+        queue_maxsize: int = _DEFAULT_QUEUE_MAXSIZE,
+    ) -> None:
+        if not _MIN_QUEUE_MAXSIZE <= queue_maxsize <= _MAX_QUEUE_MAXSIZE:
+            raise ValueError(
+                f"queue_maxsize 必须在 {_MIN_QUEUE_MAXSIZE}~{_MAX_QUEUE_MAXSIZE} 之间"
+                "（模块文档「有界队列 + 丢弃」一节：容量存在的意义是扛住短时间内"
+                "连续几次点击，不是扛住持续高吞吐）"
+            )
+        self._delegate = delegate
+        self._audit = audit
+        self._queue: queue.Queue[PendingAction] = queue.Queue(maxsize=queue_maxsize)
+        self._worker = threading.Thread(
+            target=self._run,
+            name="lingxi-gateway-permission-recompute",
+            daemon=True,  # 模块文档「daemon 线程」一节。
+        )
+        self._worker.start()
+
+    def trigger(self, pending: PendingAction) -> None:
+        """立即返回：只把这条待确认操作放进队列，真正的重算在后台线程里跑
+        （:meth:`_run`）。队列已满时丢弃并响亮审计，从不阻塞调用方，也从不
+        向调用方冒泡任何异常——``card_callback.py`` 因此不需要跟着改一个字。
+        """
+
+        try:
+            self._queue.put_nowait(pending)
+        except queue.Full:
+            self._audit.record(
+                _RECOMPUTE_TRIGGER_DROPPED_ACTION,
+                pending_action_id=pending.id,
+            )
+
+    def _run(self) -> None:
+        """工作线程主体：按入队顺序串行执行，单条失败只记审计、不影响下一条。"""
+
+        while True:
+            pending = self._queue.get()
+            try:
+                self._delegate.trigger(pending)
+            except Exception as error:  # noqa: BLE001 - 与 card_callback.py 同一条 best-effort 姿态
+                self._audit.record(
+                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                    pending_action_id=pending.id,
+                    error=type(error).__name__,
+                )
+            finally:
+                self._queue.task_done()
+
+
+__all__ = ["BackgroundPermissionRecomputeTrigger", "PermissionRecomputeAdapter"]

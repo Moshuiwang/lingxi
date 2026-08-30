@@ -279,6 +279,23 @@ class AdminCardCallbackHandler:
                 trace_id=trace_id,
             )
             return _toast_error("操作不存在或已失效")
+        if not identifier:
+            # opus 审查坐实并修复：不校验就直接拼命令文本时，`identifier` 为空
+            # 会让下面的 f-string 拼出两个连续空白（`.../{sub_command} {""} {company_id} ...`）
+            # ——`core/admin/commands.py::parse_admin_command` 按 `str.split()`
+            # 解析，连续空白被当成一个分隔符吃掉，company_id/metric_name/reason
+            # 的第一个词依次整体左移一位，落进 `_parse_permission_command` 后仍
+            # 可能是一条形状合法的 grant/suppress 命令——只是语义已经完全错位
+            # （真正的目标公司被当成 identifier 吞掉，真正的指标被当成公司，
+            # 原因的第一个词被当成指标名），管理员看到的却是"已生成待确认操作"
+            # 这类正常回执，察觉不到目标已经变成别人。必须在拼接命令文本之前
+            # 拦住，不能指望下游语法校验替它兜底。
+            self._audit.record(
+                "admin.card_callback.management_missing_identifier",
+                admin_action=admin_action,
+                trace_id=trace_id,
+            )
+            return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
         if not company_id:
             return _toast_error("请选择公司")
         if not metric_name:
@@ -318,6 +335,17 @@ class AdminCardCallbackHandler:
 
         if self._management_actions is None:
             return _toast_error("该功能当前不可用，请改用文本命令")
+        if not override_id:
+            # 与 `handle_management_form_submit` 同一条纪律：不校验就拼命令
+            # 文本，`override_id` 为空时下面这行会拼出连续空白，交给
+            # `parse_admin_command` 解析——当前固定原因文案不含空格，恰好只会
+            # 落进 token 数不足的 UNKNOWN 分支，但拼接前拦住不依赖这个偶然
+            # 事实（固定原因文案将来改动时不应该重新引入这一类角落）。
+            self._audit.record(
+                "admin.card_callback.management_missing_override_id",
+                trace_id=trace_id,
+            )
+            return _toast_error("未识别到待收回的授权行，请重新查询 /admin user 后再操作")
         text = f"/admin revoke_permission {override_id} {_MANAGEMENT_CARD_REVOKE_REASON}"
         outcome = self._management_actions.route(
             open_id=operator_open_id,

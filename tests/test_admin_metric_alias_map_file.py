@@ -87,5 +87,50 @@ class ContentShapeTests(unittest.TestCase):
         self.assertEqual(aliases, {})
 
 
+class MetricValueShapeTests(unittest.TestCase):
+    """opus 审查坐实并修复：模块文档此前声称"命中路径的右值下游还会走
+    ``_METRIC_TOKEN_PATTERN`` 校验"，但那条校验实际只发生在解析**原始**
+    token 那一刻——命中别名表之后的右值从未再被任何下游校验过，加载器自己
+    是唯一的把关点。变异锚点：把 ``load_admin_metric_alias_map`` 里的
+    ``_METRIC_VALUE_PATTERN.fullmatch(value)`` 改回恒 ``True``（即改回修复前
+    只判断"是不是非空字符串"）后，本类全部用例按预期变红。"""
+
+    def _load(self, aliases_toml_body: str) -> dict:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "shape.toml"
+            config_file.write_text(f"[aliases]\n{aliases_toml_body}\n", encoding="utf-8")
+            return dict(load_admin_metric_alias_map(config_file))
+
+    def test_a_value_containing_whitespace_is_skipped(self) -> None:
+        """空白不在 ``_METRIC_TOKEN_PATTERN`` 的合法字符集里——一条形状脏的
+        配置（例如误粘贴了一段说明文字）不该原样流向下游。"""
+
+        aliases = self._load('"新增用户数" = "sub new count"\n"充值金额" = "sub_recharge_money"\n')
+        self.assertEqual(aliases, {"充值金额": "sub_recharge_money"})
+
+    def test_a_value_containing_a_semicolon_is_skipped(self) -> None:
+        aliases = self._load('"坏别名" = "sub;drop"\n"好别名" = "sub_ok"\n')
+        self.assertEqual(aliases, {"好别名": "sub_ok"})
+
+    def test_a_value_longer_than_128_characters_is_skipped(self) -> None:
+        too_long = "a" * 129
+        aliases = self._load(f'"过长" = "{too_long}"\n"正常" = "sub_ok"\n')
+        self.assertEqual(aliases, {"正常": "sub_ok"})
+
+    def test_a_value_that_is_exactly_128_characters_is_kept(self) -> None:
+        exactly_128 = "a" * 128
+        aliases = self._load(f'"刚好" = "{exactly_128}"\n')
+        self.assertEqual(aliases, {"刚好": exactly_128})
+
+    def test_chinese_characters_in_the_value_are_still_legal(self) -> None:
+        """形状与 ``_METRIC_TOKEN_PATTERN`` 逐字一致：中文字符本身合法（真实
+        指标 ID 当前全是英文，但形状校验不该比下游更严）。"""
+
+        aliases = self._load('"别名" = "中文指标ID"\n')
+        self.assertEqual(aliases, {"别名": "中文指标ID"})
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

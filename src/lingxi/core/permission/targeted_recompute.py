@@ -34,11 +34,20 @@
    ——``RESUME_USER``/``LOCAL_PERMISSION_*`` 只会发生在这个人已经存在开通历史
    之后，绝大多数情况下发布表已有这一行，走的是"更新既有行"路径（``token_cipher``
    一律不碰，见 ``core/permission/publish_row.py`` 模块文档），不需要读取密文；
-   真的撞上"要新建行但没有密文"这一角时，``record_decision`` 会失败，本模块让
-   异常原样冒泡（不在这里吞掉），调用方按「失败降级回每日批」处理——绝不为了
-   凑齐这一角去 gateway 里接入 MCP 令牌加密主密钥（那是一把只应该活在 scheduler
-   进程里的密钥，见 ``apps/scheduler/permission_refresh.py::_build_permission_
-   refresh_duty`` 的同一条纪律）。
+   真的撞上"要新建行但没有密文"这一角时——**失败不是发生在 ``record_decision``**
+   （文档曾经这样写，与实现不符，Trace #445 opus 审查坐实）：``record_decision``
+   只把这份不带密文的快照原样记成 ``ENQUEUED`` 写进 outbox（见
+   ``PublishRow.snapshot_fields`` 在 ``token_cipher`` 为空时退回六字段更新集，
+   不做任何校验），真正抛出"新建发布行必须携带 token_cipher"这条 ``ValueError``
+   并归类为 ``missing_token_cipher`` 失败关闭的是**发布执行器**
+   （``core/permission/publish.py``，随每日刷新/开通链之后独立消费 outbox 的
+   那一层，见其模块文档「``token_cipher``」一节）——本模块与那个执行器之间隔着
+   一次 outbox 落库与之后独立的一轮消费，异常不是"原样冒泡"给本模块的调用方，
+   而是延迟到发布执行器那一轮才会被观察到。``_settle_publish`` 因此在撞上这一角
+   时额外记一条本模块自己的审计（见该方法文档），不再依赖"异常会冒泡"这个不成立
+   的假设去暴露这个角落。绝不为了凑齐这一角去 gateway 里接入 MCP 令牌加密主密钥
+   （那是一把只应该活在 scheduler 进程里的密钥，见 ``apps/scheduler/
+   permission_refresh.py::_build_permission_refresh_duty`` 的同一条纪律）。
 
 ## 为什么 ``force_revoke`` 与 ``recompute_and_publish`` 是两个方法，不是一个
 
@@ -76,6 +85,7 @@ from lingxi.core.permission.metric_translation import (
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import (
+    ADMIN_FULL_ACCESS_FUNCTION,
     aggregate_permission,
     build_revocation_row,
     build_translated_publish_row,
@@ -279,7 +289,19 @@ class TargetedPermissionRecompute:
             cause = aggregate.reason
 
         local = self._resolve_local_overrides(user_id)
-        merged = merge_permission_sources(galaxy=company_metrics, local=local)
+        # 通配角 v2（Issue #440，本模块 #445 修复前漏接）：`all_companies=True`
+        # 有两个互相独立的成因（`scope.all_countries` 或持有
+        # `ADMIN_FULL_ACCESS_FUNCTION`），只有后者是「真全指标通配」——
+        # `merge_permission_sources` 自己不猜测，调用方必须显式声明（同
+        # `permission_refresh.py::_refresh_user`/`onboarding_runner.py::
+        # AutoOnboardingRunner._publish` 的同型判据，见该函数「通配角 v2」文档）。
+        # 零银河分支（`aggregate.granted` 为假）`aggregate.functions` 恒为空
+        # 元组，`in` 判据天然为 False，参数在 `galaxy={}` 时本就无作用面。
+        merged = merge_permission_sources(
+            galaxy=company_metrics,
+            local=local,
+            full_access_wildcard=ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions,
+        )
         for reason in merged.skipped_reasons:
             # 通配用户（银河「后台管理员」，all_companies=True）场景：本地覆盖整体
             # 不参与合并——审计明确说明这次调用为什么没有产生预期变化（Issue #438
@@ -307,6 +329,20 @@ class TargetedPermissionRecompute:
         self, user_id: str, identity: ArchivedIdentity, company_metrics: Mapping[str, Sequence[str]]
     ) -> TargetedRecomputeOutcome:
         now = self._clock()
+        if not self._publish_history.has_publish_footprint(user_id):
+            # 模块文档「三处刻意不同」第 3 条角落：这个人此刻在发布链上没有留下
+            # 任何足迹（从未发布成功，也没有任何在途意图）——即将调用的
+            # ``record_decision`` 不会因此失败（它只把这份没有 ``token_cipher``
+            # 的快照原样记成 ``ENQUEUED``），真正的失败关闭发生在之后独立一轮的
+            # 发布执行器（``core/permission/publish.py``，见模块文档同一角落的
+            # 更正）——那一层的 ``missing_token_cipher`` 审计与本模块的审计流
+            # 不是同一处，运维不会自然地把两者联系起来。这条审计让这个角落在
+            # **这里**就可分辨：确认卡回执说"已确认执行"的同时，运维已经能看到
+            # "这次即将成为一次新建行尝试、而本模块从不持有可以新建行的密文"。
+            self._audit.record(
+                "permission_targeted_recompute.publish_needs_cipher",
+                user=user_id,
+            )
         row = build_translated_publish_row(
             company_metrics=company_metrics,
             email=identity.email,

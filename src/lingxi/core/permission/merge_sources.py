@@ -150,9 +150,20 @@ publish_row.aggregate_permission` 让 ``all_companies`` 为真的条件是
 新增关键字参数 :paramref:`~merge_permission_sources.full_access_wildcard`，把
 这个判断显式收进签名，**不猜测**。
 
-**默认值 ``True``**：保持「通配角 v1」原有行为逐字不变，两个既有调用点（尚未
-在本卡改动，接线是否需要跟进不在本卡范围，见 `Issue #440` 报告与本卡收口说明）
-不传这个参数时，行为与本卡之前完全一致，不产生任何回归。
+**必填，无默认值（Trace #445 opus 审查坐实并修复，结构性防复发）**：本参数
+落地之初带 ``True`` 默认值（保持「通配角 v1」原有行为逐字不变，供两个既有
+调用点当时不必立即改动），这个默认值本身后来正是根因——`core/permission/
+targeted_recompute.py`（Issue #438 载体，晚于本卡新增的第三个写发布行调用点）
+接入本函数时因为默认值"看似安全"而没有显式判断该传哪个值，实际把它的通配
+用户（无论真全指标还是有限指标）一律当成真全指标处理，静默复现了本卡本该
+修复的同一个误判（`Issue #445` 坐实）。修复方式是把默认值整体删除、改成
+必填关键字参数：调用方漏接不再表现为"行为退回 v1、悄悄吃掉一个已知缺陷"，
+而是当场 ``TypeError`` 拒绝调用——把"忘记声明"从一个运行时才会被发现（甚至
+不一定会被发现）的语义错误，收紧成开发期就会报错的结构错误。全仓库当前
+三个生产调用点（`permission_refresh.py::_refresh_user`、`onboarding_runner.py::
+AutoOnboardingRunner._publish`、`targeted_recompute.py::TargetedPermissionRecompute.
+recompute_and_publish`）与两个零银河分支（`galaxy={}`，通配键结构上不存在，
+参数取值不影响结果，但同样必须显式传参）均已同步改为显式传参，全部测试同步。
 
 **``full_access_wildcard=False``（有限指标 ``*``）时的语义**——「在 ``"*"``
 清单上并集/减集」，逐字执行：
@@ -252,7 +263,7 @@ def merge_permission_sources(
     *,
     galaxy: Mapping[str, Sequence[str]],
     local: ResolvedLocalOverrides | None,
-    full_access_wildcard: bool = True,
+    full_access_wildcard: bool,
 ) -> MergedPermissionSources:
     """真实权限 ``= (银河 ∪ 本地授权) − 本地抑制``。
 
@@ -268,15 +279,16 @@ def merge_permission_sources(
     降级传入）——对结果**恒等**：产出与 ``galaxy`` 逐字节相同（键集合与值集合都
     只由 ``galaxy`` 决定）。
 
-    ``full_access_wildcard``：``galaxy`` 出现 :data:`ALL_COMPANIES_KEY` 键时，这个
-    通配到底是「真全指标通配」（默认 ``True``，`V-权限-14` 银河后台管理员）还是
-    「有限指标通配」（``False``，同样 ``all_companies=True`` 但成因是
-    ``scope.all_countries``、职能有限，`Issue #440`）——两者在 ``galaxy`` 这个纯
-    字符串映射里逐字节不可分，调用方必须显式声明，本函数不猜测（见模块文档
-    「通配角 v2」）。非通配（``galaxy`` 没有 :data:`ALL_COMPANIES_KEY` 键）时这个
-    参数无效果。
+    ``full_access_wildcard``：**必填，无默认值**（模块文档「通配角 v2」的结构性
+    防复发一节——默认值本身曾是一次真实漏接的根因）。``galaxy`` 出现
+    :data:`ALL_COMPANIES_KEY` 键时，这个通配到底是「真全指标通配」（``True``，
+    `V-权限-14` 银河后台管理员）还是「有限指标通配」（``False``，同样
+    ``all_companies=True`` 但成因是 ``scope.all_countries``、职能有限，
+    `Issue #440`）——两者在 ``galaxy`` 这个纯字符串映射里逐字节不可分，调用方
+    必须显式声明，本函数不猜测。非通配（``galaxy`` 没有 :data:`ALL_COMPANIES_KEY`
+    键）时这个参数取值不影响结果，但仍必须显式传入。
 
-    **通配角 v1**（``full_access_wildcard=True``，默认值，向后兼容）：``local``
+    **通配角 v1**（``full_access_wildcard=True``）：``local``
     整体不参与合并，产出与 ``galaxy`` 逐字节相同；
     :attr:`MergedPermissionSources.skipped_reasons` 按"``local`` 是否带着非空
     授权/抑制"分别登记

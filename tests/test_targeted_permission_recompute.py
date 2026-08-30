@@ -39,7 +39,10 @@ from lingxi.core.permission.targeted_recompute import (
 
 from test_permission_refresh_duty import (
     COMPANY_ID,
+    FUNCTION_LABEL,
+    GALAXY_ACCOUNT_ONE,
     METRIC_NAME,
+    METRIC_NAME_TWO,
     METRIC_TRANSLATION_MAP,
     ROLE_FUNCTION_MAP,
     USER_ONE,
@@ -292,6 +295,137 @@ class RecomputeAndPublishGrantTests(unittest.TestCase):
         self.assertNotIn("不会生效的指标", call["row"].permissions)
         skip_fields = parts["audit"].fields_for("permission_targeted_recompute.local_override_skipped")
         self.assertTrue(skip_fields)
+
+    def test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """通配角 v2（`Issue #440`）：``all_companies=True`` 但成因是
+        ``scope.all_countries``（银河「全非」通配）、职能不含
+        ``ADMIN_FULL_ACCESS_FUNCTION``——「有限指标 ``*``」形态。对称
+        ``test_permission_refresh_duty.py::LocalOverrideMergeTest.
+        test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics``
+        的同名用例：本地授权应在 ``"*"`` 清单上参与并集，不整体跳过——这正是
+        `Issue #445` 坐实的漏接（本模块此前恒把 ``full_access_wildcard`` 传成
+        ``True``，把这种有限指标形态误判成真全指标通配）。变异锚点：把
+        ``targeted_recompute.py`` 里的 ``full_access_wildcard=`` 参数改回不传
+        （退回默认值）或恒传 ``True``，本用例会由绿转红（补授的指标消失、审计
+        多出一条 ``local_override_skipped``）。
+        """
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "0"),),
+            country_rows=(
+                ("0", "ALL", "全非", "0"),
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+            ),
+        )
+        override = LocalPermissionOverrideEntry(
+            user_id=USER_ONE,
+            direction=OverrideDirection.GRANT,
+            company_id=COMPANY_ID,
+            metric_name="额外授权",
+            reason="特批",
+            initiated_by_open_id="ou_admin",
+            pending_action_id="pac_test0000000000000000003",
+            created_at=NOW,
+        )
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            galaxy=galaxy,
+            local_overrides=FakeLocalOverrides({USER_ONE: (override,)}),
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        [call] = parts["decisions"].calls
+        self.assertEqual(
+            json.loads(call["row"].permissions),
+            {"*": [METRIC_NAME, "额外授权"]},
+            "有限指标通配下本地授权应参与并集，不整体跳过",
+        )
+        self.assertNotIn(
+            "permission_targeted_recompute.local_override_skipped",
+            parts["audit"].actions(),
+            "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
+        )
+
+    def test_limited_metric_wildcard_suppress_narrows_the_published_metrics(self) -> None:
+        """通配角 v2 对称用例（suppress 减集半边）：有限指标 ``*`` 用户的本地
+        抑制应该在 ``"*"`` 清单上生效地减去一个指标，不是像真通配（v1）那样被
+        整体拦不住（``WildcardRoleTests`` 覆盖的是相反的真通配语义）。
+        `test_permission_refresh_duty.py` 目前只登记了 grant 半边的同名先例，
+        本用例是这一半的独立补齐，命名与之对称。
+        """
+
+        galaxy = galaxy_snapshot(
+            countries=((GALAXY_ACCOUNT_ONE, "0"),),
+            country_rows=(
+                ("0", "ALL", "全非", "0"),
+                ("KE", "KENYA", "肯尼亚", COMPANY_ID),
+            ),
+        )
+        override = LocalPermissionOverrideEntry(
+            user_id=USER_ONE,
+            direction=OverrideDirection.SUPPRESS,
+            company_id=COMPANY_ID,
+            metric_name=METRIC_NAME_TWO,
+            reason="特批",
+            initiated_by_open_id="ou_admin",
+            pending_action_id="pac_test0000000000000000004",
+            created_at=NOW,
+        )
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            galaxy=galaxy,
+            metric_translation_map={"*": {FUNCTION_LABEL: (METRIC_NAME, METRIC_NAME_TWO)}},
+            local_overrides=FakeLocalOverrides({USER_ONE: (override,)}),
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        [call] = parts["decisions"].calls
+        self.assertEqual(
+            json.loads(call["row"].permissions),
+            {"*": [METRIC_NAME]},
+            "有限指标通配下本地抑制应生效地减去一个指标",
+        )
+        self.assertNotIn(
+            "permission_targeted_recompute.local_override_skipped",
+            parts["audit"].actions(),
+            "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
+        )
+
+
+class PublishNeedsCipherAuditTests(unittest.TestCase):
+    """模块文档「三处刻意不同」第 3 条角落（Trace #445 opus 审查坐实并修复的
+    文档不实表述）：这个人在发布链上此刻没有任何足迹时，``_settle_publish``
+    即将结算的这条发布行没有 ``token_cipher``，而真正的失败关闭发生在之后
+    独立一轮的发布执行器——本模块补一条自己的审计让这个角落在这里就可分辨。
+    """
+
+    def test_a_first_time_publish_flags_the_missing_cipher_corner(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),), published_users=set()  # 显式：从未有过足迹
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        fields = parts["audit"].fields_for("permission_targeted_recompute.publish_needs_cipher")
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0]["user"], USER_ONE)
+
+    def test_a_publish_with_an_existing_footprint_does_not_flag_the_corner(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),), published_users={USER_ONE}
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        self.assertEqual(
+            parts["audit"].fields_for("permission_targeted_recompute.publish_needs_cipher"), []
+        )
 
 
 class ForceRevokeVsRecomputeDoNotConflateTest(unittest.TestCase):
