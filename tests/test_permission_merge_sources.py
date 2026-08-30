@@ -6,7 +6,7 @@
 ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 与
 ``tests/test_onboarding_runner.py::LocalOverrideMergeTests``。
 
-三处变异锚点已实测验红、验证后原样还原（S-P-3 实施卡要求，结果登记在此，不重复
+两处变异锚点已实测验红、验证后原样还原（S-P-3 实施卡要求，结果登记在此，不重复
 登记在别处）：
 
 1. **把 ``−`` 改成 ``∪``**：临时把 ``values -= set(local_suppressions.get(key, ()))``
@@ -19,11 +19,10 @@
    （``test_wildcard_skips_grant_with_a_reason``/
    ``test_wildcard_skips_suppress_with_a_reason``）由绿转红（``skipped_reasons``
    变回空元组）；改回后复绿。
-3. **legacy 参数改成参与通配下的合并**（临时删掉通配分支里"不参与 legacy"的隐含
-   行为，让通配分支也去合并 ``legacy``）：
-   ``LegacyIdentityTests.test_legacy_is_ignored_under_the_wildcard_too`` 由绿转红
-   （通配下传入 ``legacy`` 会在结果里多出一个具体公司键，逐字节比对失败）；
-   改回后复绿。
+
+**存量沿用（legacy source）机制退役**（Issue #441）：本文件原有的
+``LegacyIdentityTests``（钉住已删除的 ``legacy`` 参数语义）随
+``merge_permission_sources`` 签名收窄一并删除，不在此保留占位。
 """
 
 from __future__ import annotations
@@ -72,7 +71,7 @@ def _resolved(*entries: LocalPermissionOverrideEntry) -> ResolvedLocalOverrides:
 
 
 class UnionThenSubtractTests(unittest.TestCase):
-    """真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制（非通配分支）。"""
+    """真实权限 = (银河 ∪ 本地授权) − 本地抑制（非通配分支）。"""
 
     def test_local_grant_is_unioned_in(self) -> None:
         local = _resolved(_entry(metric_name="收入"))
@@ -154,45 +153,6 @@ class NoLocalSourceIsIdentityTests(unittest.TestCase):
         )
 
         self.assertEqual(result.permissions, {"1011": ("日活",)})
-
-
-class LegacyIdentityTests(unittest.TestCase):
-    """``legacy=None`` 恒等（S-P-3 只定签名，数据源留给 S-P-2 批二）。"""
-
-    def test_legacy_none_is_identity(self) -> None:
-        result = merge_permission_sources(
-            galaxy={"1011": ("日活",)}, local=_resolved(_entry(metric_name="收入")), legacy=None
-        )
-
-        self.assertEqual(result.permissions, {"1011": ("收入", "日活")})
-
-    def test_legacy_participates_in_the_union_when_provided(self) -> None:
-        """非 ``None`` 时的正面断言：``legacy`` 与本地授权对称——参与并集，不参与
-        抑制豁免（被本地抑制命中同样会被减掉）。"""
-
-        result = merge_permission_sources(
-            galaxy={"1011": ("日活",)},
-            local=None,
-            legacy={"1011": ("存量指标",), "1012": ("另一存量指标",)},
-        )
-
-        self.assertEqual(
-            result.permissions, {"1011": ("存量指标", "日活"), "1012": ("另一存量指标",)}
-        )
-
-    def test_legacy_is_ignored_under_the_wildcard_too(self) -> None:
-        """通配下 ``legacy`` 同样不参与合并——理由与本地授权相同：往通配映射里
-        追加一个具体公司键会让读侧 ``lookup_metrics`` 对那个公司不再回退通配，
-        造成一处极难发现的窄范围回归（模块文档「通配角」一节）。变异锚点③。"""
-
-        result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)},
-            local=None,
-            legacy={"1011": ("存量指标",)},
-        )
-
-        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)})
-        self.assertNotIn("1011", result.permissions, "通配下不得凭空长出具体公司键")
 
 
 class WildcardRoleTests(unittest.TestCase):
