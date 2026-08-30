@@ -12,12 +12,25 @@ from lingxi.adapters.admin_metric_alias_map_file import (
 
 
 class RealFileTests(unittest.TestCase):
-    def test_packaged_default_is_a_currently_empty_but_valid_alias_table(self) -> None:
-        """随包发布的别名表当前是空的（载体先行，内容后填，见该文件模块文档）
-        ——空表本身是合法内容，不是错误。"""
+    def test_packaged_default_has_the_nine_pm_approved_aliases(self) -> None:
+        """随包发布的别名表已由产品负责人 2026-08-30 填入九条别名（Trace #469
+        S-1），见该文件模块文档。"""
 
         aliases = load_admin_metric_alias_map()
-        self.assertEqual(aliases, {})
+        self.assertEqual(
+            aliases,
+            {
+                "新增订户数": "sub_new_count",
+                "充值订户数": "sub_recharge_count",
+                "充值金额": "sub_recharge_money",
+                "扣费订户数": "sub_deduction_count",
+                "扣费金额": "sub_deduction_money",
+                "渠道市场份额": "channel_market_sharing",
+                "渠道费率": "channel_rate",
+                "汇率": "exchange_rate",
+                "增值税率": "vat_rate",
+            },
+        )
 
     def test_default_path_points_at_an_existing_file(self) -> None:
         self.assertTrue(default_admin_metric_alias_map_path().is_file())

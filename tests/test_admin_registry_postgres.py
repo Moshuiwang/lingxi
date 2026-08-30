@@ -89,21 +89,45 @@ class AdminRegistryPostgresTestCase(unittest.TestCase):
         provisioning_state: str = "active",
         permission_version: int = 2,
         email: str | None = None,
+        display_name: str | None = "化名",
     ) -> None:
         self.execute(
             """INSERT INTO app_user
                  (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
                   department, tenant_key, provisioning_state, permission_version, email)
-               VALUES (%s, %s, %s, %s, '化名', '测试部门', 'tk_1', %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, '测试部门', 'tk_1', %s, %s, %s)""",
             (
                 user_id,
                 open_id,
                 f"fs_{open_id}",
                 f"un_{open_id}",
+                display_name,
                 provisioning_state,
                 permission_version,
                 email,
             ),
+        )
+
+    def insert_current_galaxy_batch(self, *, batch_id: str = "gib_display_names_fixture") -> str:
+        """插入一个「当前有效」的银河批次（``status='complete'``、``started_at``
+        为当下——``expires_at`` 由迁移触发器从它推导，足够新就不会过期），供
+        ``company_label`` 真库断言使用。"""
+
+        self.execute(
+            """INSERT INTO galaxy_import_batch
+                 (id, source_label, source_digest, status, started_at, completed_at)
+               VALUES (%s, %s, %s, 'complete', now(), now())""",
+            (batch_id, f"合成导出 {batch_id}", f"digest-{batch_id}"),
+        )
+        return batch_id
+
+    def add_galaxy_country(
+        self, *, batch_id: str, source_id: str, boss_company_id: str, name_cn: str
+    ) -> None:
+        self.execute(
+            """INSERT INTO galaxy_country (batch_id, source_id, boss_company_id, name_cn)
+               VALUES (%s, %s, %s, %s)""",
+            (batch_id, source_id, boss_company_id, name_cn),
         )
 
     def add_event(
@@ -834,6 +858,90 @@ class ResolveOverrideIdTests(AdminRegistryPostgresTestCase):
                 open_id="ou_never_existed", company_id="1011", metric_name="daily_active"
             )
         )
+
+
+class DisplayNamesTests(AdminRegistryPostgresTestCase):
+    """``PostgresAdminQueries`` 的 ``AdminDisplayNames`` 结构性实现（Trace #469
+    S-1）：``user_label``/``company_label``/``metric_label`` 三个真库/真配置
+    查询，管理员可见文案「姓名（邮箱）」「中文名（编号）」的数据源。"""
+
+    # ---- user_label ---------------------------------------------------
+
+    def test_user_label_shows_name_and_email_when_both_present(self) -> None:
+        self.add_user(open_id="ou_target", display_name="张三", email="zhangsan@example.com")
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(
+            queries.user_label(open_id="ou_target"), "张三（zhangsan@example.com）"
+        )
+
+    def test_user_label_falls_back_to_display_name_only(self) -> None:
+        self.add_user(open_id="ou_target", display_name="张三", email=None)
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.user_label(open_id="ou_target"), "张三")
+
+    # 不覆盖"email 有值但 display_name 缺失"与"两者都缺失但行存在"这两种
+    # 组合——``app_user`` 的 CHECK 约束（迁移基线，identity 字段全有全无）
+    # 要求 ``feishu_open_id`` 非空时 ``display_name`` 必须同为非空，真实数据
+    # 库结构上不可能出现这样的行；``user_label`` 方法本身的"两者皆空退化为
+    # 该用户"分支由下面"查无此用户"（行完全不存在，等价于两者皆空）覆盖。
+
+    def test_user_label_never_echoes_the_open_id_for_an_unknown_user(self) -> None:
+        """否定断言（防倒退关卡）：查无此用户时绝不把 open_id 原样拼进返回值。"""
+
+        queries = PostgresAdminQueries(self._dsn)
+
+        label = queries.user_label(open_id="ou_never_registered")
+
+        self.assertEqual(label, "该用户")
+        self.assertNotIn("ou_never_registered", label)
+
+    # ---- company_label --------------------------------------------------
+
+    def test_company_label_shows_chinese_name_and_id_from_the_current_batch(self) -> None:
+        batch_id = self.insert_current_galaxy_batch()
+        self.add_galaxy_country(
+            batch_id=batch_id, source_id="7", boss_company_id="1011", name_cn="壹壹测试公司"
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.company_label(company_id="1011"), "壹壹测试公司（1011）")
+
+    def test_company_label_falls_back_to_the_raw_id_without_a_current_batch(self) -> None:
+        """没有任何有效银河批次（从未导入，或全部过期）时原样展示编号——公司
+        编号是业务代码，允许这条兜底（不是 ou_/lpo_/pac_ 一类内部标识）。"""
+
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.company_label(company_id="1011"), "1011")
+
+    def test_company_label_falls_back_to_the_raw_id_when_not_found_in_the_current_batch(
+        self,
+    ) -> None:
+        batch_id = self.insert_current_galaxy_batch()
+        self.add_galaxy_country(
+            batch_id=batch_id, source_id="7", boss_company_id="1011", name_cn="壹壹测试公司"
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.company_label(company_id="9999"), "9999")
+
+    # ---- metric_label -----------------------------------------------------
+
+    def test_metric_label_reverse_resolves_the_packaged_alias_table(self) -> None:
+        """真读随包发布的 ``config/admin_metric_alias_map.toml``（产品负责人
+        2026-08-30 填入的九条别名，Trace #469 S-1），不是测试自己造的临时表。"""
+
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.metric_label(metric_id="sub_new_count"), "新增订户数")
+        self.assertEqual(queries.metric_label(metric_id="exchange_rate"), "汇率")
+
+    def test_metric_label_falls_back_to_the_raw_id_when_no_alias_matches(self) -> None:
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertEqual(queries.metric_label(metric_id="not_a_real_metric"), "not_a_real_metric")
 
 
 if __name__ == "__main__":  # pragma: no cover
