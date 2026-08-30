@@ -291,7 +291,7 @@ def render_message(action: str, classification: Classification, *, host: str, no
     if action == ACTION_ALERT:
         label = _REASON_LABEL.get(classification.reason, classification.reason)
         return (
-            f"[Lingxi 宿主监控] 告警\n"
+            f"[BI Plus 宿主监控] 告警\n"
             f"容器：{classification.name}\n"
             f"状态：{label}\n"
             f"主机：{host}\n"
@@ -299,7 +299,7 @@ def render_message(action: str, classification: Classification, *, host: str, no
         )
     if action == ACTION_RECOVERY:
         return (
-            f"[Lingxi 宿主监控] 恢复\n"
+            f"[BI Plus 宿主监控] 恢复\n"
             f"容器：{classification.name}\n"
             f"状态：已恢复正常\n"
             f"主机：{host}\n"
@@ -362,9 +362,9 @@ def render_threshold_message(action: str, *, label: str, detail: str, host: str,
     """
 
     if action == ACTION_ALERT:
-        return f"[Lingxi 资源监控] 告警\n{label}：{detail}\n主机：{host}\n时间：{now}"
+        return f"[BI Plus 资源监控] 告警\n{label}：{detail}\n主机：{host}\n时间：{now}"
     if action == ACTION_RECOVERY:
-        return f"[Lingxi 资源监控] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
+        return f"[BI Plus 资源监控] 恢复\n{label}：已恢复正常\n主机：{host}\n时间：{now}"
     raise ValueError("仅 alert / recovery 两种动作需要渲染文本")
 
 
