@@ -813,6 +813,66 @@ class ManagementFormSubmitTests(unittest.TestCase):
 
         self.assertEqual(router.route_calls, [])
 
+    def test_empty_identifier_is_rejected_without_calling_the_router(self) -> None:
+        """opus 审查坐实并修复：空 ``identifier`` 此前不做任何校验就直接拼命令
+        文本——``f"/admin grant_permission  {company_id} {metric_name} {reason}"``
+        （两个连续空格）经 ``commands.py`` 的 ``str.split()`` 解析会把
+        ``company_id`` 当成 ``identifier``、``metric_name`` 当成
+        ``company_id``、``reason`` 的第一个词当成 ``metric_name``——只要
+        ``reason`` 有至少两个词，这仍然是一条形状合法的 ``grant_permission``
+        命令，只是目标已经完全变成别人。变异锚点：删掉本用例前的
+        ``if not identifier`` 分支后，本用例（连同下面的复现用例）会由绿转红。
+        """
+
+        router = _FakeManagementRouter()
+        handler, audit = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [], "校验必须在拼命令文本、调用 route() 之前拦住")
+        self.assertIn(
+            "admin.card_callback.management_missing_identifier", [a for a, _ in audit.records]
+        )
+
+    def test_before_the_fix_an_empty_identifier_would_shift_into_a_wellformed_but_wrong_command(
+        self,
+    ) -> None:
+        """复现修复前的缺陷本身（不经过 handler 的校验，直接验证
+        ``commands.py`` 会怎么解析那条被拼错的文本）：``identifier=""`` 时的
+        命令文本左移之后，只要 ``reason`` 里有至少两个词，解析结果仍然是一条
+        看起来完全合法的 ``GRANT_PERMISSION``，目标却已经变成了原本的
+        ``company_id`` 取值——这正是"察觉不到目标已经变成别人"这句话的具体
+        证据，钉在测试里防止有人以为"反正下游会拒绝"就足够安全。"""
+
+        from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+
+        identifier = ""
+        company_id = "1011"
+        metric_name = "daily_active"
+        reason = "特批 授权"
+        shifted_text = f"/admin grant_permission {identifier} {company_id} {metric_name} {reason}"
+
+        parsed = parse_admin_command(shifted_text)
+
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_PERMISSION, "被左移后仍然形状合法")
+        self.assertEqual(parsed.identifier, company_id, "目标标识被错误地换成了原本的公司 ID")
+        self.assertEqual(parsed.company_id, metric_name, "公司被错误地换成了原本的指标名")
+        self.assertEqual(parsed.metric_name, "特批", "指标名被错误地换成了原因的第一个词")
+
     def test_route_not_handled_is_reported_as_an_error_toast(self) -> None:
         """结构上只会发生在"点击这一刻当前角色恰好已被撤销"——``route()``
         内部重新判定身份，``handled=False`` 时不能假装成功。"""
@@ -904,6 +964,31 @@ class ManagementRevokeClickTests(unittest.TestCase):
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertIn("未找到匹配", response["toast"]["content"])
+
+    def test_empty_override_id_is_rejected_without_calling_the_router(self) -> None:
+        """与表单提交同一条纪律：``override_id`` 为空时不校验就拼命令文本，
+        变异锚点：删掉本用例前的 ``if not override_id`` 分支后，本用例会由绿
+        转红。"""
+
+        router = _FakeManagementRouter()
+        handler, audit = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [], "校验必须在拼命令文本、调用 route() 之前拦住")
+        self.assertIn(
+            "admin.card_callback.management_missing_override_id", [a for a, _ in audit.records]
+        )
 
 
 class RecomputeTriggerWiringTests(unittest.TestCase):
