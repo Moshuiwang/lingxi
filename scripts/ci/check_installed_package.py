@@ -403,6 +403,13 @@ REQUIRED_MODULES = (
     # stalled_provisioning 那一条理由，漏登记会直接让 scheduler 起不来）。持久化面
     # 复用上面已经登记过的 `adapters.postgres_document_delivery`，不重复登记。
     "lingxi.apps.scheduler.document_delivery_dead_letter",
+    # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
+    # `core/admin/card_callback.py` 的 `PermissionRecomputeTrigger` 端口，由
+    # `apps/gateway/__init__.py` 在函数内 import 真实实现装配进去（同该文件其余
+    # "函数内 import 证明不了装得上"条目，必须随制品发布）。
+    "lingxi.core.permission.targeted_recompute",
+    "lingxi.adapters.postgres_targeted_recompute_lookup",
+    "lingxi.adapters.postgres_permission_recompute_trigger",
 )
 
 # 源码树里仍保留的 Bot-Test / 历史受控验证资产。它们不是正式用户路径的漏项，但正式
@@ -960,6 +967,37 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # confirm() 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
             "lingxi.core.permission.local_override",
+            # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
+            # `card_callback_handler` 装配处在函数内 import
+            # `PermissionRecomputeAdapter`（`adapters/postgres_permission_
+            # recompute_trigger.py`），无条件装配（与待确认操作全链路本身同一
+            # 姿态）。它在**自己被调用时**（`.trigger()` 内）才函数内 import 一整条
+            # "花名册基线 → 花名册快照 → 银河快照 → 权限聚合/合并/翻译 → 发布
+            # outbox"的只读链路——这条链路此前只有 scheduler 进程真正调用过（见
+            # 上面 scheduler 组同名注释），这是它**第一次**也随 gateway 进程的运行
+            # 依赖闭包一起发布。
+            "lingxi.core.permission.targeted_recompute",
+            "lingxi.adapters.postgres_targeted_recompute_lookup",
+            "lingxi.adapters.postgres_permission_recompute_trigger",
+            "lingxi.core.identity.roster_audit",
+            "lingxi.adapters.postgres_roster_audit",
+            "lingxi.core.identity.roster_snapshot",
+            "lingxi.adapters.postgres_roster_snapshot",
+            "lingxi.adapters.feishu_roster_bitable",
+            "lingxi.adapters.postgres_galaxy_snapshot",
+            "lingxi.core.permission.galaxy_export",
+            "lingxi.core.permission.galaxy_scope",
+            "lingxi.adapters.galaxy_import",
+            "lingxi.core.permission.account_match",
+            "lingxi.core.permission.merge_sources",
+            "lingxi.core.permission.metric_translation",
+            "lingxi.core.permission.publish_row",
+            "lingxi.core.permission.publish",
+            "lingxi.core.permission.mcp_readiness",
+            "lingxi.core.permission.role_function",
+            "lingxi.adapters.postgres_permission_publish",
+            "lingxi.adapters.role_function_map_file",
+            "lingxi.adapters.company_function_metric_map_file",
             "lingxi.core.alerting",
             "lingxi.core.identity",
             "lingxi.core.identity.credentials",
