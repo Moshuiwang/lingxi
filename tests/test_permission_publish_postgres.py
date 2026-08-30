@@ -1487,8 +1487,10 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
 
         self.assertIsNone(self.store.notice_recipient_open_id(USER_A))
 
-    def test_a_deleting_or_deleted_account_gets_no_notice(self) -> None:
-        for state in ("deleting", "deleted"):
+    def test_a_deleting_deleted_or_suspended_account_gets_no_notice(self) -> None:
+        """Issue #468（2026-08-30）：停用期间同样不该收到"你的可用范围已更新"。"""
+
+        for state in ("deleting", "deleted", "suspended"):
             with self.subTest(state):
                 self._activate(account_state=state)
                 self.assertIsNone(self.store.notice_recipient_open_id(USER_A))
