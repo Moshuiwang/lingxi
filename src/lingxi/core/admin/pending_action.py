@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from lingxi.core.admin.registry import AdminRegistryEntry, AdminRole, is_authorized_admin
@@ -232,6 +232,65 @@ def decide_prepare(
             message=_TARGET_STATE_CHANGED_MESSAGE[action_type],
         )
     return PrepareDecision(ok=True)
+
+
+#: 拦截文案里"这是哪一类动作"的中文展示名（Trace #445 #437 拦截文案改进）——
+#: 不直接展示 ``PendingActionType.value``（英文字面量），管理员看不懂
+#: ``local_permission_grant`` 这类内部取值。
+_ACTION_TYPE_DISPLAY_NAME: dict[PendingActionType, str] = {
+    PendingActionType.SUSPEND_USER: "停用用户",
+    PendingActionType.RESUME_USER: "恢复用户",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "本地权限授权",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "本地权限抑制",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "本地权限收回",
+}
+
+#: 拦截文案里绝对时间的展示偏移——与 ``core/daily_report.py`` 既有的
+#: ``_BEIJING_OFFSET`` 同一惯例（UTC 存储 + 8 小时固定偏移展示为北京时间、
+#: 显式标注「北京时间」，不为此引入 zoneinfo 依赖）；本模块此前没有任何一处
+#: 展示绝对时间，这是本仓管理员面向文案里的第一处，因此照抄这一既有先例而不是
+#: 另立一套格式。
+_DISPLAY_TIMEZONE_OFFSET = timedelta(hours=8)
+
+
+def format_in_flight_conflict_message(*, blocking: PendingAction) -> str:
+    """``prepare()`` 撞上"同一目标已有一条在途 pending 行"时的拦截文案
+    （Trace #445 #437）。
+
+    修复 2026-08-30 真实运维事故（Issue #437 TO PM）：拦截提示原本只说"该用户
+    当前已有一条待确认操作在途"，不带任何自助解法——管理员既不知道是哪一条、
+    多久前发起、是否已经过期，旧确认卡又可能已经淹没在飞书历史消息里，
+    上一次只能靠编排者查库手工处理才解锁。本函数把 ``blocking``（调用方已经
+    查到、结构上确认仍是 ``status='pending'`` 的那一行——是否已经过期由调用方
+    在拿到这一行时就地判定并优先原地翻转放行，见 ``adapters/
+    postgres_pending_action.py`` 的 ``prepare()`` 懒清扫兜底；走到这个函数说明
+    那一行确认仍然是真在途、未过期）的动作类型/发起时间/截止时间摘要，连同
+    "已过期会自动释放、未过期请先处理旧卡"这条自助指引一起渲染成一段文案。
+
+    纯函数、不做任何 I/O 或时钟读取——``blocking`` 的两个时间戳都是调用方已经
+    从数据库读到的既有字段，不重新取 ``now()``。
+
+    **先归一到 UTC，再加 8 小时展示**（opus 审查坐实并修复：与
+    ``core/daily_report.py`` 既有先例 ``utc_start = window_start.astimezone(
+    timezone.utc)`` 同一姿态）——本方法此前直接在 ``blocking`` 的两个字段上加
+    ``_DISPLAY_TIMEZONE_OFFSET``，如果这两个字段本身已经是非 UTC 的 aware
+    ``datetime``（例如已经是 ``+08:00`` 的墙钟值），会把它在墙钟层面再加一次
+    8 小时，读者看到的是一个被二次偏移过的错误时刻。数据库列当前恒为 UTC，
+    这条修复此刻不改变任何真实用户可见的输出，但不应该让"当前恒为 UTC"这个
+    调用方事实由本函数自己悄悄假设——``astimezone()`` 对已经是 UTC 的输入是
+    恒等操作，加这一步没有代价。
+    """
+
+    started = blocking.created_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
+    deadline = blocking.confirm_deadline_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
+    action_name = _ACTION_TYPE_DISPLAY_NAME[blocking.action_type]
+    return (
+        "该用户当前已有一条待确认操作在途："
+        f"{action_name}，发起于 {started:%Y-%m-%d %H:%M}（北京时间），"
+        f"将于 {deadline:%Y-%m-%d %H:%M}（北京时间）过期。"
+        "已过期的旧操作会在下次发起同类命令时自动释放，无需手动处理；"
+        "尚未过期时请先在原确认卡片上点击确认执行或取消，再重新发起。"
+    )
 
 
 class ConfirmResultKind(str, Enum):

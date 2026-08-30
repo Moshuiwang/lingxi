@@ -125,7 +125,9 @@ class SendFailureTests(unittest.TestCase):
         self.assertIn("event=message_final.feishu_send_failed", notice.text)
         self.assertIn("count=1", notice.text)
         self.assertIn("trace_id=01JTRACE", notice.text)
-        for forbidden in ("用户正文哨兵", "张三", "E1001", "@", "https://", "secret"):
+        # #443 对外名称规范：运行告警群消息不得带内部代号「Lingxi」，对外统一「BI Plus」。
+        self.assertIn("BI Plus", notice.text)
+        for forbidden in ("用户正文哨兵", "张三", "E1001", "@", "https://", "secret", "Lingxi"):
             self.assertNotIn(forbidden, notice.text)
 
     def test_non_final_failures_need_three_failures_in_five_minutes(self) -> None:

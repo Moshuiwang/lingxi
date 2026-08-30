@@ -66,8 +66,49 @@ _STOP_SIGNAL_DRAIN_YIELDS = 5
 # - 兜底计时驱动（`_monitor` 每轮调用一次）最长间隔 `_PROGRESS_FALLBACK_SECONDS`
 #   ——距上次更新超过这个阈值时强制推一次纯用时更新，即使没有任何新信号。
 # 两者是同一个节流函数在同一份状态上的两种阈值，不是两套独立机制。
+#
+# `_PROGRESS_FALLBACK_SECONDS` 由 30 秒收紧到 12 秒（Issue #444，产品负责人
+# 2026-08-30 裁定「不做每秒读秒，改做不变即异常」）：产品负责人要求卡片文字
+# 「十几秒内必有变化」，30 秒的旧兜底周期本身就超过这个体验预算，用户能感知
+# 到的最长静止时间必须压缩进"十几秒"量级。12 秒落在卡片给出的 10~15 秒收紧
+# 区间中段，取值依据——
+# - **配额余量（rc21 修复包 B 校正——此前这里把限流器和单任务上界都算错了）**：
+#   CardKit 限流（单话题 500ms、全进程 50 次/秒）由 `apps.gateway.delivery.
+#   DeliveryConsumer` 持有的 `CardRateLimiter` 单例强制执行——那是 **Gateway
+#   消费进程**，与本文件所在的 **Worker 进程**是两个独立进程；本文件的
+#   `_write_progress_if_due` 只把进度事件写进 outbox（数据库表），从不直接
+#   调用限流器。这里估的是"Worker 侧往 outbox 灌新进度行的速度，会不会让
+#   Gateway 那一侧的 50 次/秒预算撑不住"，不是本文件自己持有配额。
+#   单个任务对这份预算的真实贡献上界，由**更频繁**的那条驱动路径决定，不是
+#   兜底周期本身——`_write_progress_if_due` 的节流状态由事件驱动与兜底 tick
+#   共用（见该函数文档），事件驱动路径的最短间隔
+#   `_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS` = 5 秒比 12 秒的兜底周期更紧，
+#   只要模型在工具调用/文本输出上足够活跃，单个任务的写入频率会被这 5 秒
+#   卡住，而不是 12 秒的兜底周期——单任务上界因此是 **1/5 = 0.2 次/秒，不是
+#   1/12**（此前把兜底周期当成唯一驱动源算成 1/12，是这条注释此前的错误）。
+#   `WorkerConfig.max_concurrency` 默认 16（见 `apps/worker/config.py`）：
+#   - 理论最坏（不依赖"两条路径共享同一份节流状态、不会重复计数"这条实现
+#     细节，只假设每个任务在同一秒内两条路径都各自算了一次）：16 个任务 ×
+#     2 次/秒 = 32 次，占 50 次/秒预算的 64%；
+#   - 真实链路（两条路径实际共享同一份 `last_progress_write_at`，一次写入
+#     后另一路径的下一次尝试必然被同一份状态挡住，不会重复计数；16 个任务
+#     各自的事件到达时刻天然错开，不会全部同秒撞在一起）：约 16×0.2=3.2
+#     次/秒，占 50 次/秒预算的 6.4%，余量非常充分；
+# - 与事件驱动最短间隔 `_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS`（5 秒）的比例
+#   保持在 2 倍以上（当前 2.4 倍），不会出现"兜底周期比事件驱动间隔还短、
+#   兜底成为主要更新来源"的倒挂；
+# - 与 `core.execution.card_stream.CARD_AUTO_CLOSE_HANDOFF_SECONDS`（540 秒
+#   提前收口阈值）的安全余量因此从旧值的 ≥30 秒提升到 ≥48 秒，见该常量上方
+#   注释同步更新的数字——这条边界只看本常量（`_PROGRESS_FALLBACK_SECONDS`），
+#   与下面呈现层的停滞判定阈值无关。
+# 呈现层的停滞判定阈值（`core.execution.card_stream.STALL_THRESHOLD_SECONDS`，
+# rc21 修复包 B 校正为 24 秒）恒等于本常量的 **2 倍**（此前两者相等曾造成
+# "恰好一个兜底周期的正常静默"被误判为停滞，见该常量上方「误报双修」注释）：
+# 用来判定"同一枚步骤身份连续出现是否已经跨过两个兜底周期"；两个常量各自
+# 独立登记、互不 import（本文件与该模块一贯的纪律：没有自动化门禁跨文件互相
+# 核对），调整任一侧都要回头看另一侧是否仍然保持这个 2 倍关系。
 _PROGRESS_MIN_UPDATE_INTERVAL_SECONDS = 5.0
-_PROGRESS_FALLBACK_SECONDS = 30.0
+_PROGRESS_FALLBACK_SECONDS = 12.0
 
 
 class QueueListener(Protocol):
@@ -438,17 +479,21 @@ class WorkerService:
         executor: WorkerTurnExecutor | None = None
 
         # 语义化等待进度（Issue #321 方向 C；Issue #407 增粒度，产品负责人
-        # 2026-08-29 方向 A+B 裁定）：三个信号源——模型文本输出（`on_stream_
-        # event` 的 `assistant_message`）、工具调用开始（`on_tool_call`，数据
-        # 来自 `ToolGateway.set_tool_call_listener`，见 `apps/worker/turn.py::
-        # run_turn`）、30 秒兜底计时（`_monitor` 的 `on_stall_tick`）——共享这
-        # 一份状态，区分三类文案：问数查询工具（`QUERY_MCP_TOOL_PREFIX` 前缀，
-        # 再按去掉前缀后的子步骤名白名单式细分四种更具体的文案，见
+        # 2026-08-29 方向 A+B 裁定；rc21 修复包 B 补工具返回信号）：四个信号
+        # 源——模型文本输出（`on_stream_event` 的 `assistant_message`）、工具
+        # 返回（同一个 `on_stream_event` 的 `tool_result`，rc21 修复包 B 新增，
+        # 见该分支上方注释）、工具调用开始（`on_tool_call`，数据来自
+        # `ToolGateway.set_tool_call_listener`，见 `apps/worker/turn.py::
+        # run_turn`）、`_PROGRESS_FALLBACK_SECONDS` 兜底计时（`_monitor` 的
+        # `on_stall_tick`）——共享这一份状态，区分三类文案：问数查询工具
+        # （`QUERY_MCP_TOOL_PREFIX` 前缀，再按去掉前缀后的子步骤名白名单式
+        # 细分四种更具体的文案，见
         # `core.execution.card_stream._QUERY_STEP_ACTION_TEXT_KEYS`）、模型
-        # 文本输出（composing）、其它工具调用（working，含被拒绝的越界包装
-        # 调用）。`last_progress_write_at` 以任务开始时刻为锚点：`_process_task`
-        # 开头的 "started" 事件已经让 Gateway 建卡并展示过一次默认文案
-        # （`start()`），下面的节流窗口紧接着它算起，不是从零开始。
+        # 文本输出/工具返回（composing）、其它工具调用（working，含被拒绝的
+        # 越界包装调用）。`last_progress_write_at` 以任务开始时刻为锚点：
+        # `_process_task` 开头的 "started" 事件已经让 Gateway 建卡并展示过
+        # 一次默认文案（`start()`），下面的节流窗口紧接着它算起，不是从零
+        # 开始。
         last_progress_write_at = started_at
         progress_action = PROGRESS_ACTION_PROCESSING
         query_count = 0
@@ -480,7 +525,7 @@ class WorkerService:
             写库本身丢进线程池执行、不在这里等待结果（与 `service.py` 别处的
             `asyncio.to_thread` 同一手法）：这个函数被 SDK 流式回调
             （`on_stream_event`/`on_tool_call`，同步、由 `turn.py` 的迭代循环
-            直接调用）与 30 秒兜底 tick（`on_stall_tick`，同步、由 `_monitor`
+            直接调用）与 `_PROGRESS_FALLBACK_SECONDS` 兜底 tick（`on_stall_tick`，同步、由 `_monitor`
             的轮询循环直接调用）共用，三处调用方都不是 `async def`、改不成
             `await`。真实 psycopg 同步写最坏可能卡住数秒（锁等待/网络抖动），
             不丢进线程池会直接拖住事件循环、连带心跳与停止处理跟着变慢。
@@ -547,9 +592,29 @@ class WorkerService:
 
         def on_stream_event(event: Mapping[str, Any]) -> None:
             nonlocal progress_action, query_step
-            if event.get("kind") == "assistant_message":
+            kind = event.get("kind")
+            if kind == "assistant_message":
                 # 模型在两次工具调用之间/收尾前输出的正文——归入"生成阶段"文案，
                 # 与"其它工具调用"（working）区分开（Issue #407）。
+                progress_action = PROGRESS_ACTION_COMPOSING
+                query_step = None
+                _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
+            elif kind == "tool_result":
+                # rc21 修复包 B（P1 #444 停滞误报双修之 b，opus 审查发现）：工具
+                # 调用发出后（`on_tool_call` 已把身份切到 querying/working）到
+                # 模型真正开始输出下一段文字（`assistant_message`）之间，可能
+                # 隔着一段模型"看完工具结果、组织下一步"的静默——这段时间旧代码
+                # 完全没有信号，身份停在 querying/working 原地不动，一旦这段
+                # 静默单独或叠加工具本身的执行耗时超过停滞阈值，就会被误判成
+                # "停滞"（真实复现：一次问数查询 25 秒后返回，模型接着生成了
+                # 40 余秒的最终回答，中途一次新身份都没出现，见
+                # `core.execution.card_stream.STALL_THRESHOLD_SECONDS` 上方
+                # 「误报双修」注释的完整时间线）。工具结果一到（不区分成功/
+                # 失败——不论哪种，模型都要基于这个结果继续处理，用户能感知的
+                # 状态都是"不再等工具了，模型在处理"）就立即切到 composing 并
+                # 写一次进度，让停滞计时的锚点（`_current_step_started_at`，
+                # 见 `card_stream._accumulate_step`）跟着这次身份切换清零——
+                # 不需要等到模型真正吐出文字才恢复"看起来在正常推进"的观感。
                 progress_action = PROGRESS_ACTION_COMPOSING
                 query_step = None
                 _write_progress_if_due(_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS)
@@ -573,8 +638,8 @@ class WorkerService:
 
         def on_stall_tick() -> None:
             # `_monitor` 每个 `stop_poll_interval_seconds` 调用一次：距上次真正
-            # 写库的更新 ≥30 秒时强制推一次纯用时更新（沿用当前的 progress_
-            # action/query_count，即使没有任何新信号）。
+            # 写库的更新 ≥`_PROGRESS_FALLBACK_SECONDS` 时强制推一次纯用时更新
+            # （沿用当前的 progress_action/query_count，即使没有任何新信号）。
             _write_progress_if_due(_PROGRESS_FALLBACK_SECONDS)
 
         monitor = asyncio.create_task(

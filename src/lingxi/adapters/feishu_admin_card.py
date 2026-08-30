@@ -58,14 +58,18 @@ action 容器移到顶层元素，回调形态选用飞书《配置卡片交互�
 from __future__ import annotations
 
 import json
-from typing import Any
+import logging
+from typing import Any, Sequence
 
+from lingxi.core.admin.management_card import ManagementCardCreated
 from lingxi.core.admin.notification import (
     AdminCardCreated,
     AdminCardDeliveryRejected,
     RenderedConfirmCard,
     render_card_payload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LarkAdminCardTransport:
@@ -191,3 +195,136 @@ class LarkAdminCardTransport:
                 code=response.code,
                 log_id=response.get_log_id(),
             )
+
+
+class TomlCompanyMetricCatalog:
+    """实现 ``core.admin.management_card.CompanyMetricCatalog``：真实公司/指标
+    下拉选项目录（#439 B 档），读取 ``config/company_function_metric_map.toml``
+    （``adapters/company_function_metric_map_file.py``，已有、本 Story 未改动）。
+
+    放在本文件而不是 ``adapters/admin_registry.py``：本类不需要数据库连接
+    （``config/company_function_metric_map.toml`` 是随包发布的静态文件），语义上
+    更接近"管理卡渲染所需的一个只读目录源"，与本文件其余"管理卡出站"职责同一
+    分组；`admin_registry.py` 的 ``PostgresAdminQueries`` 保持只装配需要 DSN 的
+    真实查询，不额外装配一个不需要 DSN 的静态文件读取器。
+
+    **每次调用现读文件，不缓存**——与 ``adapters/admin_metric_alias_map_file.py``
+    同一取舍（管理命令面低频，现读成本可忽略，换来编辑映射表立即生效，不需要
+    重启 gateway）。读取或格式失败时返回空元组（fail-open，见
+    ``core.admin.management_card.render_management_card`` 对空目录的降级渲染），
+    不让整张管理卡因为一份可选的展示数据渲染失败。
+    """
+
+    def companies(self) -> Sequence[str]:
+        mapping = self._load()
+        return tuple(sorted(key for key in mapping if key != "*"))
+
+    def metrics(self) -> Sequence[str]:
+        mapping = self._load()
+        metrics: set[str] = set()
+        for functions in mapping.values():
+            for values in functions.values():
+                metrics.update(values)
+        return tuple(sorted(metrics))
+
+    def _load(self) -> dict[str, dict[str, tuple[str, ...]]]:
+        from lingxi.adapters.company_function_metric_map_file import (
+            load_company_function_metric_map,
+        )
+
+        try:
+            return dict(load_company_function_metric_map())
+        except Exception as error:  # noqa: BLE001 - 展示层降级，不让管理卡渲染失败
+            logger.warning(
+                "admin.management_card.catalog_load_failed error=%s", type(error).__name__
+            )
+            return {}
+
+
+class LarkAdminManagementCardTransport:
+    """实现 ``core.admin.management_card.ManagementCardTransport``：真实建卡并
+    作为消息发出（#439 B 档）。与 :class:`LarkAdminCardTransport.create` 同构
+    （同一套 CardKit 建卡 + 回复发送、``DeliveryRejected`` 白名单判别姿态），
+    区别是管理卡不支持 ``update()``——它不是一次待确认操作，见
+    ``core.admin.management_card.ManagementCardTransport`` 文档。
+
+    **本模块的真实行为未验证（证据等级 1）**：全部断言跑在注入的假实现上；真实
+    CardKit 是否接受 ``select_static``/``input``/``form`` 三种组件、真实点击是否
+    正确触发回调，均属 `biai-stage` L4a 受控验收（本 Story 未验证，见报告"未验证
+    事项"）——与 ``LarkAdminCardTransport`` 当年在 2026-08-25 之前的状态相同（那次
+    真实探针只验证过按钮/markdown 两种组件，见类文档），本类新增的三种组件字段
+    形状完全依据飞书公开文档撰写，尚未被同等强度的真实探针核实过。
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def create(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str | None,
+        reply_to_message_id: str,
+        card: dict[str, Any],
+    ) -> ManagementCardCreated:
+        """建卡并作为消息发出，回复触发 ``/admin user`` 命令的那条消息——与
+        :meth:`LarkAdminCardTransport.create` 同一机制，卡片因此结构上只会出现在
+        发起管理员本人与机器人的私聊里。"""
+
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+
+        create_request = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        create_response = self._client.cardkit.v1.card.create(create_request)
+        if not create_response.success():
+            raise AdminCardDeliveryRejected(
+                f"建卡失败：code={create_response.code} msg={create_response.msg} "
+                f"log_id={create_response.get_log_id()}",
+                code=create_response.code,
+                log_id=create_response.get_log_id(),
+            )
+        if create_response.data is None or not create_response.data.card_id:
+            raise LookupError(
+                "建卡响应缺少可回读标识 card_id："
+                f"code={create_response.code} msg={create_response.msg} "
+                f"log_id={create_response.get_log_id()}"
+            )
+        card_id = create_response.data.card_id
+
+        send_body = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+        send_request = (
+            ReplyMessageRequest.builder()
+            .message_id(reply_to_message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .content(send_body)
+                .msg_type("interactive")
+                .reply_in_thread(thread_id is not None)
+                .build()
+            )
+            .build()
+        )
+        send_response = self._client.im.v1.message.reply(send_request)
+        if not send_response.success():
+            raise AdminCardDeliveryRejected(
+                f"卡片发送失败：code={send_response.code} msg={send_response.msg} "
+                f"log_id={send_response.get_log_id()}",
+                code=send_response.code,
+                log_id=send_response.get_log_id(),
+            )
+        if send_response.data is None or not send_response.data.message_id:
+            raise LookupError(
+                "卡片发送响应缺少可回读标识 message_id："
+                f"code={send_response.code} msg={send_response.msg} "
+                f"log_id={send_response.get_log_id()}"
+            )
+        return ManagementCardCreated(card_id=card_id, message_id=send_response.data.message_id)

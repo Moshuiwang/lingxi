@@ -214,7 +214,7 @@ class AlertNotice:
 
         trace = self.trace_id or "-"
         return (
-            f"Lingxi 运行告警 action={self.action.value} event={self.event_type} "
+            f"BI Plus 运行告警 action={self.action.value} event={self.event_type} "
             f"time={self.observed_at.isoformat()} count={self.count} trace_id={trace}"
         )
 

@@ -171,6 +171,9 @@ class RenderMessageTests(unittest.TestCase):
         self.assertIn("unhealthy", text)
         self.assertIn("stage-host", text)
         self.assertIn("告警", text)
+        # #443 对外名称规范：监控告警群消息不得带内部代号「Lingxi」，对外统一「BI Plus」。
+        self.assertIn("BI Plus", text)
+        self.assertNotIn("[Lingxi", text)
 
     def test_recovery_message(self) -> None:
         classification = host_health_alert.Classification("lingxi-gateway-1", host_health_alert.REASON_OK, False)
@@ -179,6 +182,8 @@ class RenderMessageTests(unittest.TestCase):
         )
         self.assertIn("恢复", text)
         self.assertIn("lingxi-gateway-1", text)
+        self.assertIn("BI Plus", text)
+        self.assertNotIn("[Lingxi", text)
 
     def test_none_action_rejected(self) -> None:
         classification = host_health_alert.Classification("c", host_health_alert.REASON_OK, False)
@@ -598,11 +603,16 @@ class ThresholdIOTests(unittest.TestCase):
         self.assertIn("告警", alert_text)
         self.assertIn("磁盘用量", alert_text)
         self.assertIn("已用 90%", alert_text)
+        # #443 对外名称规范：监控告警群消息不得带内部代号「Lingxi」，对外统一「BI Plus」。
+        self.assertIn("BI Plus", alert_text)
+        self.assertNotIn("[Lingxi", alert_text)
 
         recovery_text = host_health_alert.render_threshold_message(
             host_health_alert.ACTION_RECOVERY, label="磁盘用量", detail="已用 90%", host="h", now="t"
         )
         self.assertIn("恢复", recovery_text)
+        self.assertIn("BI Plus", recovery_text)
+        self.assertNotIn("[Lingxi", recovery_text)
 
         with self.assertRaises(ValueError):
             host_health_alert.render_threshold_message(

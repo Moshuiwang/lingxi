@@ -59,6 +59,7 @@ from lingxi.core.execution.card_stream import (
     PROGRESS_ACTION_PROCESSING,
     PROGRESS_ACTION_QUERYING,
     PROGRESS_ACTION_WORKING,
+    ProgressStepSnapshot,
     decode_progress_action,
     encode_progress_action,
 )
@@ -340,6 +341,263 @@ class CardStreamTests(unittest.TestCase):
 
         self.assertLessEqual(len(encoded), PROGRESS_CONTENT_MAX_LENGTH)
         self.assertEqual(encoded, f"querying:99:{longest_step}")
+
+    def test_a_repeated_identity_under_the_stall_threshold_keeps_the_plain_wording(
+        self,
+    ) -> None:
+        """Issue #444（rc21 修复包 B 校正阈值至 24 秒）：同一枚步骤身份第二次
+        出现，但距第一次出现还没跨过 ``STALL_THRESHOLD_SECONDS``（24 秒）——
+        此时仍然只是原地刷新总用时的常规措辞，不应该提前判定为"停滞"，否则
+        短暂的正常间隔也会被误报异常。
+
+        这条用例的累计间隔（20 秒）刻意选在"旧阈值（12 秒）会误判为停滞、新
+        阈值（24 秒）不会"这个区间——直接对应 opus 审查发现的误报场景：单个
+        兜底周期的静默是查询/生成回答的常态，不该被当成异常。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(
+            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+        now[0] = 2.0
+        # 同一身份第二次出现，累计过了 20 秒（22-2）——超过旧阈值（12 秒）但
+        # 仍在新阈值（24 秒）之内。
+        stream.update(
+            elapsed_seconds=22, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+
+        self.assertEqual(cards.bodies[-1], "正在第 1 次查询可用指标列表 · 22 秒")
+        self.assertNotIn("无新进展", cards.bodies[-1])
+
+    def test_a_repeated_identity_past_the_stall_threshold_names_the_stalled_step(
+        self,
+    ) -> None:
+        """Issue #444 关卡条件（rc21 修复包 B 校正阈值至 24 秒）：受控构造
+        "卡住"场景——同一枚步骤身份连续出现、累计跨过两个兜底周期
+        （``STALL_THRESHOLD_SECONDS`` = 24 秒）仍未变化，必须切换成明示的
+        停滞文案，且这句话本身仍然点名"停在哪一步"（不是丢掉位置信息、只说
+        一句空泛的"卡住了"）。
+
+        变异存活证据：把 ``_accumulate_step`` 里 ``duration >=
+        STALL_THRESHOLD_SECONDS`` 的判据改成恒 ``False``，本用例的"停滞文案
+        出现"断言必须变红（会一直停留在常规的"· N 秒"措辞）。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(
+            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+        now[0] = 3.0
+        # 同一身份再次出现，累计已经过了 25 秒（27-2），跨过 24 秒阈值。
+        stream.update(
+            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+
+        self.assertEqual(
+            cards.bodies[-1],
+            "正在第 1 次查询可用指标列表（已 25 秒无新进展）",
+            "停滞文案必须同时点名具体停在哪一步，不能只说一句空泛的异常提示",
+        )
+
+    def test_stall_wording_keeps_changing_while_still_stalled(self) -> None:
+        """Issue #444：即使真的停滞了，文字也不能"卡死不动"——停滞文案里的
+        "已 N 秒无新进展"必须随每一次兜底刷新继续增长，这正是体验合同"文字
+        十几秒内必有变化"在停滞状态下的落地：用户始终能看到卡片仍在更新，
+        只是明确被告知这个更新没有带来新进展。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(elapsed_seconds=1, action=PROGRESS_ACTION_WORKING)
+        now[0] = 2.0
+        stream.update(elapsed_seconds=26, action=PROGRESS_ACTION_WORKING)
+        first_stalled_body = cards.bodies[-1]
+        now[0] = 3.0
+        stream.update(elapsed_seconds=50, action=PROGRESS_ACTION_WORKING)
+        second_stalled_body = cards.bodies[-1]
+
+        self.assertEqual(first_stalled_body, "正在处理其它步骤（已 25 秒无新进展）")
+        self.assertEqual(second_stalled_body, "正在处理其它步骤（已 49 秒无新进展）")
+        self.assertNotEqual(
+            first_stalled_body, second_stalled_body, "停滞期间文字必须继续变化，不能停在同一句话不动"
+        )
+
+    def test_a_fresh_signal_after_a_stall_resumes_normal_wording_and_keeps_history(
+        self,
+    ) -> None:
+        """Issue #444 关卡条件：停滞明示之后，一旦出现真正的新信号（换了一枚
+        不同的步骤身份），必须"恢复后正常续进"——新的一行用常规措辞、不再带
+        停滞后缀，且此前的停滞行仍然保留在累积历史里，不因为恢复而被抹掉。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+        now[0] = 1.0
+        stream.update(
+            elapsed_seconds=2, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+        now[0] = 2.0
+        stream.update(
+            elapsed_seconds=27, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="list_metrics"
+        )
+        self.assertIn("无新进展", cards.bodies[-1])
+        now[0] = 3.0
+        stream.update(elapsed_seconds=28, action=PROGRESS_ACTION_COMPOSING)
+
+        self.assertEqual(
+            cards.bodies[-1],
+            "正在第 1 次查询可用指标列表（已 25 秒无新进展）\n正在整理与生成回答 · 28 秒",
+            "恢复后的新一行必须是常规措辞，且此前的停滞行不能被抹掉",
+        )
+
+    def test_resume_replays_a_stalled_history_and_preserves_the_stalled_wording(
+        self,
+    ) -> None:
+        """Issue #444：Gateway 消费循环每一轮轮询都会重新构造一个全新的
+        ``CardStream``（见模块文档），停滞状态因此也必须能从 ``initial_
+        progress_history`` 正确重放，不能只在同一个存活的 Python 对象内才生效。
+        """
+
+        history = [
+            ProgressStepSnapshot(
+                elapsed_seconds=2,
+                action=PROGRESS_ACTION_QUERYING,
+                query_count=1,
+                query_step="list_metrics",
+            ),
+            ProgressStepSnapshot(
+                elapsed_seconds=27,
+                action=PROGRESS_ACTION_QUERYING,
+                query_count=1,
+                query_step="list_metrics",
+            ),
+        ]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            initial_card_id="card-resumed",
+            initial_sequence=2,
+            initial_message_id="msg-resumed",
+            initial_progress_history=history,
+        )
+
+        self.assertEqual(
+            stream._accumulated_status_card().body,
+            "正在第 1 次查询可用指标列表（已 25 秒无新进展）",
+            "resume 重放必须重建出与实时调用完全一致的停滞判定与措辞",
+        )
+
+    def test_a_normal_query_then_answer_flow_never_shows_stalled_wording(self) -> None:
+        """否定用例（rc21 修复包 B，P1 #444 停滞误报双修）：一次完全正常的
+        问数任务——工具调用、期间一次兜底刷新、工具返回（切到 composing）、
+        再一次兜底刷新、最终模型输出正文——每一段"同一身份持续的时长"都
+        没有跨过新阈值（``STALL_THRESHOLD_SECONDS`` = 24 秒），全程不应该
+        出现"无新进展"这句停滞措辞。
+
+        这条用例同时钉住两处配合关系：阈值本身（12→24 秒）与工具返回信号
+        （`tool_result` → composing，见 ``apps/worker/service.py`` 的
+        ``on_stream_event``）——单独改回旧阈值 12 秒，或者去掉工具返回信号
+        （让身份从 t=3 的 querying 一路持续到 t=40 才换成 composing，
+        持续 37 秒），本用例都会由绿变红。
+        """
+
+        now = [0.0]
+        cards = RecordingCards()
+        text = RecordingText()
+        stream = CardStream(
+            chat_id="chat-a",
+            thread_id="topic-a",
+            reply_to_message_id="msg-a",
+            transport=cards,
+            fallback=text,
+            monotonic=lambda: now[0],
+            rate_limiter=CardRateLimiter(),
+        )
+        stream.start()
+
+        # t=3：发出查询工具调用。
+        now[0] = 1.0
+        stream.update(
+            elapsed_seconds=3, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+        )
+        # t=15：期间一次兜底刷新（距上次 12 秒），身份未变——累计 12 秒，
+        # 远没跨过 24 秒新阈值。
+        now[0] = 2.0
+        stream.update(
+            elapsed_seconds=15, action=PROGRESS_ACTION_QUERYING, query_count=1, query_step="query_metric"
+        )
+        # t=18：工具结果返回，rc21 新增信号把身份切到 composing——停滞计时
+        # 的锚点随之清零。
+        now[0] = 3.0
+        stream.update(elapsed_seconds=18, action=PROGRESS_ACTION_COMPOSING)
+        # t=30：composing 期间一次兜底刷新（距上次 12 秒），身份未变——累计
+        # 12 秒，同样没跨过阈值。
+        now[0] = 4.0
+        stream.update(elapsed_seconds=30, action=PROGRESS_ACTION_COMPOSING)
+        # t=40：模型正文输出（`assistant_message`）——同样归入 composing，
+        # 与 t=18 的锚点相比累计 22 秒，仍在阈值之内。
+        now[0] = 5.0
+        stream.update(elapsed_seconds=40, action=PROGRESS_ACTION_COMPOSING)
+
+        # 6 = start() 建卡的初始占位帧 + 5 次 update()；逐一确认没有一帧被
+        # 节流吞掉，也确认全部 6 帧里没有任何一帧出现停滞措辞。
+        self.assertEqual(len(cards.bodies), 6, "建卡 + 五次 update 都必须真正写库，没有一次被节流吞掉")
+        for body in cards.bodies:
+            self.assertNotIn("无新进展", body, f"正常任务全程不应出现停滞措辞，实际：{body!r}")
 
     def test_an_unmapped_query_step_falls_back_to_the_generic_text_without_leaking_it(
         self,
@@ -2203,8 +2461,9 @@ class WorkerServiceTests(unittest.TestCase):
 
 
 class SemanticProgressTests(unittest.TestCase):
-    """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 30 秒兜底刷新
-    （产品负责人 2026-08-27 裁定，留痕 #321 评论 5434086490）。
+    """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 兜底刷新
+    （产品负责人 2026-08-27 裁定，留痕 #321 评论 5434086490；兜底周期由 Issue
+    #444 收紧至 12 秒，2026-08-30）。
 
     只测数据管路与节流判据本身（谁写了几条 progress 事件、``content`` 字段解码
     后是什么语义），不测 CardKit 真实渲染（L4a）；文案本身不回显工具名/参数的
@@ -2333,6 +2592,100 @@ class SemanticProgressTests(unittest.TestCase):
             (PROGRESS_ACTION_WORKING, None, None),
         )
 
+    def test_a_tool_result_switches_progress_to_composing_not_left_on_querying(
+        self,
+    ) -> None:
+        """rc21 修复包 B（P1 #444 停滞误报双修之 b，opus 审查发现）：工具调用
+        发出（querying）之后，如果工具本身执行较久、期间没有任何其它信号，
+        身份会一直停在 querying，接近停滞阈值时容易被误判。工具结果一旦
+        返回（``tool_result`` 事件），必须立即产生一条新的 composing 身份，
+        不能让卡片继续显示"还在查询"的旧措辞——见
+        ``core.execution.card_stream.STALL_THRESHOLD_SECONDS`` 上方「误报
+        双修」注释的完整时间线（t=4 发查询、t=29 才返回、t=70 生成完）。
+
+        变异存活证据：把 ``on_stream_event`` 里 ``elif kind == "tool_result":
+        ...`` 这一支删掉，本用例的第二条 progress 事件断言会变红——因为
+        `tool_result` 事件不再触发任何写入，只会有一条 progress 事件
+        （停留在 querying），不是两条。
+
+        两次调用时刻都刻意选在距任务起点（``clock["now"]`` 起始 0.0）超过
+        ``_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS``（5 秒）之外，避免撞上
+        与本次修复无关的另一条节流边界（`_write_progress_if_due` 的节流
+        锚点在任务开始时就已经存在，不是从第一次真正写入才开始计）。
+        """
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                clock["now"] = 10.0
+                kwargs["on_tool_call"]("mcp__query__query_metric")  # type: ignore[index]
+                clock["now"] = 35.0
+                kwargs["on_stream_event"](  # type: ignore[index]
+                    {"kind": "tool_result", "tool_use_id": "t1", "content": [], "is_error": False}
+                )
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 2, "工具调用与工具返回各自触发一条 progress 事件")
+        self.assertEqual(
+            decode_progress_action(progress_events[0]["content"]),
+            (PROGRESS_ACTION_QUERYING, 1, "query_metric"),
+        )
+        self.assertEqual(
+            decode_progress_action(progress_events[1]["content"]),
+            (PROGRESS_ACTION_COMPOSING, None, None),
+            "工具结果返回后必须切到 composing，不能停留在 querying 上",
+        )
+
+    def test_a_failed_tool_result_also_switches_to_composing(self) -> None:
+        """工具执行失败（``is_error=True``）同样要切到 composing——不论成功
+        还是失败，模型都要基于这个结果继续处理，用户能感知的状态都是"不再
+        等工具了，模型在处理"，不区分成功/失败两种措辞。"""
+
+        queue = FakeWorkerQueue()
+        clock = {"now": 0.0}
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                clock["now"] = 10.0
+                kwargs["on_tool_call"]("Bash")  # type: ignore[index]
+                clock["now"] = 20.0
+                kwargs["on_stream_event"](  # type: ignore[index]
+                    {"kind": "tool_result", "tool_use_id": "t1", "content": [], "is_error": True}
+                )
+                return {
+                    "turn": {"closed": True, "final_text": "结果", "session_id": "s"},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            monotonic=lambda: clock["now"],
+        )
+        asyncio.run(service.process_once())
+
+        progress_events = [e for e in queue.events if e["event_type"] == "progress"]
+        self.assertEqual(len(progress_events), 2)
+        self.assertEqual(
+            decode_progress_action(progress_events[1]["content"]),
+            (PROGRESS_ACTION_COMPOSING, None, None),
+        )
+
     def test_model_text_output_is_reported_as_composing_distinct_from_working(self) -> None:
         """Issue #407：模型文本输出（``assistant_message``）与其它工具调用现在
         各自独立文案——同一回合先后触发两种信号，必须解码出两种不同的动作码，
@@ -2415,13 +2768,14 @@ class SemanticProgressTests(unittest.TestCase):
             "未映射的子步骤退回不带步骤名的通用查询状态，不是拒绝或报错",
         )
 
-    def test_a_stalled_long_task_gets_exactly_one_thirty_second_fallback_update(
+    def test_a_stalled_long_task_gets_exactly_one_fallback_update_at_the_tightened_interval(
         self,
     ) -> None:
-        """②：30 秒无任何事件——``_monitor`` 的兜底计时必须恰好推一次纯用时更新，
-        不多不少。走真实的 ``_monitor`` 循环（不是直接调用 ``on_stall_tick``），
-        用一个只由 ``sleep()`` 推进的虚拟时钟把 30 秒虚拟等待压缩进近乎零的真实
-        墙钟时间——``monotonic()`` 只读、``sleep()`` 才是唯一的推进点，因此耗时
+        """②：Issue #444 关卡条件——收紧后的兜底周期（12 秒）内无任何事件，
+        ``_monitor`` 的兜底计时必须恰好推一次纯用时更新，不多不少。走真实的
+        ``_monitor`` 循环（不是直接调用 ``on_stall_tick``），用一个只由
+        ``sleep()`` 推进的虚拟时钟把 12 秒虚拟等待压缩进近乎零的真实墙钟
+        时间——``monotonic()`` 只读、``sleep()`` 才是唯一的推进点，因此耗时
         完全由 ``_monitor`` 自己的循环次数（乘以 ``stop_poll_interval_seconds``）
         决定，不依赖真实时钟或调度器的时序抖动。
 
@@ -2456,7 +2810,10 @@ class SemanticProgressTests(unittest.TestCase):
                 }
 
         service = WorkerService(
-            config=worker_config(stop_poll_interval_seconds=5.0),
+            # 4 秒是 12 秒兜底周期（``_PROGRESS_FALLBACK_SECONDS``）的整除数，
+            # 让虚拟时钟的 tick 边界恰好落在阈值上（0/4/8/12），与收紧前用
+            # 5 秒整除 30 秒同一手法。
+            config=worker_config(stop_poll_interval_seconds=4.0),
             queue=queue,
             executor_factory=lambda config, marker: Executor(),
             monotonic=clock.monotonic,
@@ -2465,13 +2822,13 @@ class SemanticProgressTests(unittest.TestCase):
         asyncio.run(service.process_once())
 
         progress_events = [e for e in queue.events if e["event_type"] == "progress"]
-        self.assertEqual(len(progress_events), 1, "30 秒无事件应恰好触发一次兜底用时更新")
+        self.assertEqual(len(progress_events), 1, "12 秒无事件应恰好触发一次兜底用时更新")
         self.assertEqual(
             decode_progress_action(progress_events[0]["content"]),
             (PROGRESS_ACTION_PROCESSING, None, None),
             "本用例从未发生任何可分类信号，兜底更新沿用默认 processing 语义",
         )
-        self.assertGreaterEqual(progress_events[0]["elapsed_seconds"], 30)
+        self.assertGreaterEqual(progress_events[0]["elapsed_seconds"], 12)
 
     def test_a_short_task_with_no_tool_calls_keeps_its_terminal_content_byte_for_byte(
         self,

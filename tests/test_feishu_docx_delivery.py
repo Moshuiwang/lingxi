@@ -438,24 +438,291 @@ class ReadBodyChildrenTest(unittest.TestCase):
 class ConvertMarkdownToBlocksTest(unittest.TestCase):
     """Issue #408 正式方案：官方 markdown→blocks 转换（默认关闭，见
     ``LarkDocxDelivery.write_body`` 与模块文档「markdown 官方转换开关」）。
-    请求/响应形状未经真实探针验证，本文件只钉住"调用形态与本模块自己声明的
-    契约一致"，同既有惯例。"""
 
-    def test_a_successful_convert_returns_the_blocks_and_matches_the_request_shape(self) -> None:
+    Issue #442（2026-08-30 受控探针实证）：真实响应 ``data.blocks`` 不是文档
+    顺序，真实顺序由 ``data.first_level_block_ids`` 给出，另有一个与 blocks
+    无关的 ``data.block_id_to_image_urls`` 键。本类的夹具直接采用探针实测形状
+    （标题→两列表项→正文，``block_types`` 乱序 ``[12, 2, 3, 12]``，
+    ``first_level_block_ids`` 正序）。
+    """
+
+    def test_blocks_are_reordered_by_first_level_block_ids_and_readonly_fields_are_stripped(
+        self,
+    ) -> None:
+        """探针实测形状（Issue #442 正文登记的原始实测）：``blocks`` 数组
+        物理顺序是乱的（``block_types`` 顺序 ``[12, 2, 3, 12]``），真实文档
+        顺序（标题→列表项一→列表项二→正文）由 ``first_level_block_ids`` 给出。
+        本夹具的物理顺序刻意与真实顺序不同（列表项一排在物理首位、标题排在
+        物理第三位），确保"按 blocks 数组物理顺序返回"与"按
+        first_level_block_ids 重排"在这个夹具上给出不同结果。同时验证：
+        - 负号/连字符逐字保真（「-12.85%」「3-5%」不被改动）；
+        - 只读字段（``block_id``/``parent_id``/``children``）在返回前被剔除；
+        - 响应里与 blocks 无关的 ``block_id_to_image_urls`` 键被忽略、不误当块。
+
+        变异锚点：把按 ``first_level_block_ids`` 重排这一步删掉、直接返回
+        ``mapping_blocks`` 物理顺序，本用例会从"返回顺序=标题/列表1/列表2/
+        正文"变红成"返回顺序=列表1/正文/标题/列表2"（与 ``blocks`` 数组物理
+        顺序一致，而不是真实文档顺序）。
+        """
+
+        # 物理响应顺序（block_types = [12, 2, 3, 12]，探针实测形状）。
+        item1_block = {
+            "block_id": "blk-item1",
+            "block_type": 12,
+            "text": {"elements": [{"text_run": {"content": "列表项一 3-5%"}}]},
+        }
+        body_block = {
+            "block_id": "blk-body",
+            "parent_id": DOCUMENT_ID,
+            "children": [],
+            "block_type": 2,
+            "text": {"elements": [{"text_run": {"content": "周环比 -12.85%"}}]},
+        }
+        heading_block = {
+            "block_id": "blk-heading",
+            "parent_id": DOCUMENT_ID,
+            "block_type": 3,
+            "text": {"elements": [{"text_run": {"content": "标题"}}]},
+        }
+        item2_block = {
+            "block_id": "blk-item2",
+            "block_type": 12,
+            "text": {"elements": [{"text_run": {"content": "列表项二"}}]},
+        }
+        response_blocks = [item1_block, body_block, heading_block, item2_block]
         transport = RecordingTransport(
-            [{"code": 0, "data": {"blocks": [{"block_type": 1, "page": {}}, {"block_type": 2}]}}]
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": response_blocks,
+                        # 真实文档顺序：标题→列表项一→列表项二→正文。
+                        "first_level_block_ids": [
+                            "blk-heading",
+                            "blk-item1",
+                            "blk-item2",
+                            "blk-body",
+                        ],
+                        "block_id_to_image_urls": {"blk-body": "https://example.invalid/img.png"},
+                    },
+                }
+            ]
         )
         client = _client(transport)
 
-        blocks = client.convert_markdown_to_blocks("# 标题\n\n正文")
+        blocks = client.convert_markdown_to_blocks("# 标题\n\n- 列表项一 3-5%\n- 列表项二\n\n周环比 -12.85%")
 
         self.assertEqual(len(transport.calls), 1)
         method, url, body, token = transport.calls[0]
         self.assertEqual(method, "POST")
         self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/blocks/convert")
-        self.assertEqual(body, {"content_type": "markdown", "content": "# 标题\n\n正文"})
         self.assertEqual(token, FAKE_TOKEN)
-        self.assertEqual(blocks, [{"block_type": 1, "page": {}}, {"block_type": 2}])
+        # 返回顺序必须等于 first_level_block_ids 声明的真实文档顺序。
+        self.assertEqual(
+            [block["text"]["elements"][0]["text_run"]["content"] for block in blocks],
+            ["标题", "列表项一 3-5%", "列表项二", "周环比 -12.85%"],
+        )
+        # 只读字段（block_id/parent_id/children）必须被剔除。
+        for block in blocks:
+            self.assertNotIn("block_id", block)
+            self.assertNotIn("parent_id", block)
+            self.assertNotIn("children", block)
+        self.assertEqual(blocks[0]["block_type"], 3)  # 标题
+        self.assertEqual(blocks[1]["block_type"], 12)  # 列表项一
+        self.assertEqual(blocks[2]["block_type"], 12)  # 列表项二
+        self.assertEqual(blocks[3]["block_type"], 2)  # 正文
+
+    def test_missing_first_level_block_ids_is_rejected_and_definite(self) -> None:
+        """变异锚点：把"first_level_block_ids 缺失/为空 → definite 拒绝"这条
+        判据删掉，本用例会从抛出 ``FeishuDocxDeliveryError`` 变红成静默按
+        ``blocks`` 数组物理顺序返回（乱序交付）。
+        """
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"blocks": [{"block_id": "blk-1", "block_type": 2}]}}]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("# 标题")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_missing_first_level_block_ids")
+
+    def test_empty_first_level_block_ids_is_rejected_and_definite(self) -> None:
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [{"block_id": "blk-1", "block_type": 2}],
+                        "first_level_block_ids": [],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("# 标题")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_missing_first_level_block_ids")
+
+    def test_a_block_outside_first_level_block_ids_is_rejected_as_unsupported_nested_blocks(
+        self,
+    ) -> None:
+        """典型场景：含表格的 markdown——表格自身是一级块，出现在
+        ``first_level_block_ids`` 里，但它的单元格作为独立元素出现在
+        ``blocks`` 数组里、却不在 ``first_level_block_ids`` 内。本仓库当前
+        不支持任何带嵌套结构的 markdown，必须 definite 拒绝、不做静默丢块。
+
+        变异锚点：把"块必须在 first_level_block_ids 内"这条判据删掉，本用例
+        会从抛出 ``FeishuDocxDeliveryError`` 变红成静默丢弃单元格块、只返回
+        表格这一个块。
+        """
+
+        table_block = {"block_id": "blk-table", "block_type": 31}
+        table_cell_block = {"block_id": "blk-cell", "block_type": 32}
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [table_block, table_cell_block],
+                        "first_level_block_ids": ["blk-table"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("| a | b |\n| - | - |\n| 1 | 2 |")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "unsupported_nested_blocks")
+
+    def test_a_block_missing_block_id_is_rejected_as_unsupported_nested_blocks(self) -> None:
+        """块缺 ``block_id`` 时无法确认它是否属于一级块，同样不能静默丢弃或
+        猜测归类，一律走与"嵌套结构"相同的 definite 拒绝分支。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [{"block_type": 2}],
+                        "first_level_block_ids": ["blk-1"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("正文")
+
+        self.assertEqual(raised.exception.code, "unsupported_nested_blocks")
+
+    def test_first_level_block_ids_referencing_an_unknown_block_is_a_lookup_error(self) -> None:
+        """``first_level_block_ids`` 引用了一个在 ``blocks`` 数组里找不到的
+        ``block_id``：响应内部不自洽，归类为结果不明，不是 definite 拒绝
+        （同 :meth:`LarkDocxDelivery.read_body_children` 既有分类口径）。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [{"block_id": "blk-1", "block_type": 2}],
+                        "first_level_block_ids": ["blk-1", "blk-missing"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(LookupError):
+            client.convert_markdown_to_blocks("正文")
+
+    def test_a_duplicate_block_id_in_mapping_blocks_is_rejected_as_a_count_mismatch(
+        self,
+    ) -> None:
+        """rc21 修复包 B（P3 docx 对账，opus 审查发现）：``blocks`` 数组里出现
+        两个块共用同一个 ``block_id``（``blk-1``）。建映射的字典推导式
+        （``by_block_id = {block["block_id"]: block for block in
+        mapping_blocks}``）会用后一个静默覆盖前一个——复现"重复 block_id
+        静默丢块"：前一个块（这里是"第一段"）的内容会从返回结果里凭空消失，
+        且不留任何痕迹。重排后的块数（2，等于 ``first_level_block_ids`` 的
+        长度）与原始 ``mapping_blocks`` 块数（3）对不上，必须 definite 拒绝。
+
+        变异存活证据：把 ``len(ordered_blocks) != len(mapping_blocks)`` 这条
+        对账删掉，本用例会从抛出 `FeishuDocxDeliveryError` 变红成静默返回
+        只含"第二段"（丢弃"第一段"）与"blk-2"两个块的结果。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-1", "block_type": 2, "text": "第一段"},
+                            {"block_id": "blk-1", "block_type": 2, "text": "第二段"},
+                            {"block_id": "blk-2", "block_type": 2, "text": "第三段"},
+                        ],
+                        "first_level_block_ids": ["blk-1", "blk-2"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("正文")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_block_count_mismatch")
+
+    def test_a_duplicate_first_level_block_id_is_rejected_even_when_counts_coincidentally_match(
+        self,
+    ) -> None:
+        """rc21 修复包 B（P3 docx 对账，opus 审查发现）：``first_level_block_
+        ids`` 自身出现重复（``["blk-1", "blk-1"]``），且 ``blocks`` 数组里
+        也恰好有两个块共用同一个 ``block_id``——两种成因在计数上互相抵消
+        （重排后块数 2 == 原始块数 2），单靠"重排后块数与原始块数对不上"这
+        一条对账**无法发现问题**，必须额外靠"``first_level_block_ids`` 自身
+        有没有重复"这条独立对账挡住。复现"first_level 重复静默重复交付"：
+        同一个块（字典推导式覆盖后剩下的那个）会在返回结果里出现两次。
+
+        变异存活证据：把 ``len(first_level_block_ids) != len(set(...))`` 这条
+        对账删掉，本用例会从抛出 `FeishuDocxDeliveryError` 变红成静默返回
+        同一个块重复两次的结果（`len(ordered_blocks) == len(mapping_blocks)`
+        这条对账不会报错，因为两个计数恰好都是 2）。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-1", "block_type": 2, "text": "第一段"},
+                            {"block_id": "blk-1", "block_type": 2, "text": "第二段"},
+                        ],
+                        "first_level_block_ids": ["blk-1", "blk-1"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_blocks("正文")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_duplicate_first_level_block_ids")
 
     def test_an_empty_markdown_is_rejected_before_any_call(self) -> None:
         transport = RecordingTransport([])
@@ -611,11 +878,32 @@ class WriteBodySwitchTest(unittest.TestCase):
             },
         )
 
-    def test_enabled_calls_convert_then_writes_the_returned_blocks(self) -> None:
-        converted_blocks = [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "标题"}}]}}]
+    def test_enabled_calls_convert_then_writes_the_reordered_stripped_blocks(self) -> None:
+        """探针实测形状：``blocks`` 数组物理顺序与 ``first_level_block_ids``
+        声明的真实顺序不同，且每个块携带只读 ``block_id``——写入端点收到的
+        必须是按真实顺序重排、剔除只读字段后的结果，不是响应原始顺序/原始
+        字段。"""
+
+        heading_raw = {
+            "block_id": "blk-heading",
+            "block_type": 3,
+            "text": {"elements": [{"text_run": {"content": "标题"}}]},
+        }
+        body_raw = {
+            "block_id": "blk-body",
+            "block_type": 2,
+            "text": {"elements": [{"text_run": {"content": "第一段正文"}}]},
+        }
+        # 响应物理顺序刻意与真实文档顺序（标题在前）相反。
         transport = RecordingTransport(
             [
-                {"code": 0, "data": {"blocks": converted_blocks}},
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [body_raw, heading_raw],
+                        "first_level_block_ids": ["blk-heading", "blk-body"],
+                    },
+                },
                 {"code": 0, "data": {}},
             ]
         )
@@ -630,7 +918,16 @@ class WriteBodySwitchTest(unittest.TestCase):
         self.assertEqual(convert_body, {"content_type": "markdown", "content": "# 标题"})
         write_method, write_url, write_body, _ = transport.calls[1]
         self.assertEqual(write_url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
-        self.assertEqual(write_body, {"children": converted_blocks, "index": 0})
+        self.assertEqual(
+            write_body,
+            {
+                "children": [
+                    {"block_type": 3, "text": {"elements": [{"text_run": {"content": "标题"}}]}},
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "第一段正文"}}]}},
+                ],
+                "index": 0,
+            },
+        )
 
     def test_enabled_convert_failure_fails_closed_without_falling_back_to_paragraphs(self) -> None:
         """开关打开时 convert 调用失败必须失败关闭，绝不静默退回纯文本段落
@@ -646,8 +943,18 @@ class WriteBodySwitchTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
 
     def test_enabled_over_cap_blocks_fail_closed_without_any_insert_call(self) -> None:
-        oversized_blocks = [{"block_type": 2}] * (MAX_CONVERTED_BLOCKS + 1)
-        transport = RecordingTransport([{"code": 0, "data": {"blocks": oversized_blocks}}])
+        oversized_blocks = [
+            {"block_id": f"blk-{index}", "block_type": 2} for index in range(MAX_CONVERTED_BLOCKS + 1)
+        ]
+        oversized_first_level_ids = [block["block_id"] for block in oversized_blocks]
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {"blocks": oversized_blocks, "first_level_block_ids": oversized_first_level_ids},
+                }
+            ]
+        )
         client = _client(transport, markdown_convert_enabled=True)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:

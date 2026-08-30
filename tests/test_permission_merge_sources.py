@@ -1,10 +1,14 @@
-"""``core/permission/merge_sources.py`` 的纯逻辑测试（Issue #319 S-P-3）。
+"""``core/permission/merge_sources.py`` 的纯逻辑测试（Issue #319 S-P-3；
+``LimitedWildcardTests``/``PublishRowReadbackSelfProofTests`` 两组新增于
+Issue #440 2026-08-30 修复；``RequiredParameterTests`` 新增于 Trace #445 结构性
+防复发修复）。
 
 不需要数据库、不需要任何调用点——只测 :func:`merge_permission_sources` 这一个纯
-函数。两个调用点各自的接线测试（真实的 ``PermissionRefreshDuty``/
-``AutoOnboardingRunner`` 装配 + 审计事件）分别在
-``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 与
-``tests/test_onboarding_runner.py::LocalOverrideMergeTests``。
+函数。三个调用点各自的接线测试（真实的 ``PermissionRefreshDuty``/
+``AutoOnboardingRunner``/``TargetedPermissionRecompute`` 装配 + 审计事件）分别在
+``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest``、
+``tests/test_onboarding_runner.py::LocalOverrideMergeTests``、
+``tests/test_targeted_permission_recompute.py``。
 
 三处变异锚点已实测验红、验证后原样还原（S-P-3 实施卡要求，结果登记在此，不重复
 登记在别处）：
@@ -19,15 +23,26 @@
    （``test_wildcard_skips_grant_with_a_reason``/
    ``test_wildcard_skips_suppress_with_a_reason``）由绿转红（``skipped_reasons``
    变回空元组）；改回后复绿。
-3. **legacy 参数改成参与通配下的合并**（临时删掉通配分支里"不参与 legacy"的隐含
-   行为，让通配分支也去合并 ``legacy``）：
-   ``LegacyIdentityTests.test_legacy_is_ignored_under_the_wildcard_too`` 由绿转红
-   （通配下传入 ``legacy`` 会在结果里多出一个具体公司键，逐字节比对失败）；
-   改回后复绿。
+3. **Issue #440 形态判别改坏**：临时把 ``if full_access_wildcard:`` 改成
+   ``if True:``（形态判别失效，任何通配都当"真全指标通配"整体跳过，等价于修复
+   前的行为），``LimitedWildcardTests`` 全部用例与
+   ``PublishRowReadbackSelfProofTests`` 由绿转红——正是 `Issue #440` 报告的
+   误判本身（有限指标 ``*`` 用户的补授被跳过、理由码错误标成
+   ``grant_redundant_wildcard``）；改回后复绿，证据见本卡收口报告。
+
+**存量沿用（legacy source）机制退役**（Issue #441）：本文件原有的
+``LegacyIdentityTests``（钉住已删除的 ``legacy`` 参数语义）及其变异锚点随
+``merge_permission_sources`` 签名收窄一并删除，不在此保留占位。
+
+**结构性防复发**（Trace #445）：``full_access_wildcard`` 曾经的默认值 ``True``
+正是 ``targeted_recompute.py`` 漏接判据这次真实事故的根因——本文件全部调用点
+现在都显式传参（非通配场景取值不影响结果，仍必须传，见签名文档），
+``RequiredParameterTests`` 钉住"漏传直接 ``TypeError``"这条结构性保证本身。
 """
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 
@@ -44,6 +59,7 @@ from lingxi.core.permission.merge_sources import (
     MergedPermissionSources,
     merge_permission_sources,
 )
+from lingxi.core.permission.publish_row import lookup_metrics, serialize_translated_permissions
 
 _NOW = datetime(2026, 8, 27, 3, 0, 0, tzinfo=timezone.utc)
 
@@ -72,12 +88,14 @@ def _resolved(*entries: LocalPermissionOverrideEntry) -> ResolvedLocalOverrides:
 
 
 class UnionThenSubtractTests(unittest.TestCase):
-    """真实权限 = (银河 ∪ 本地授权 ∪ 存量沿用) − 本地抑制（非通配分支）。"""
+    """真实权限 = (银河 ∪ 本地授权) − 本地抑制（非通配分支）。"""
 
     def test_local_grant_is_unioned_in(self) -> None:
         local = _resolved(_entry(metric_name="收入"))
 
-        result = merge_permission_sources(galaxy={"1011": ("日活",)}, local=local)
+        result = merge_permission_sources(
+            galaxy={"1011": ("日活",)}, local=local, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions, {"1011": ("收入", "日活")})
         self.assertEqual(result.skipped_reasons, ())
@@ -88,7 +106,9 @@ class UnionThenSubtractTests(unittest.TestCase):
 
         local = _resolved(_entry(company_id="1099", metric_name="收入"))
 
-        result = merge_permission_sources(galaxy={"1011": ("日活",)}, local=local)
+        result = merge_permission_sources(
+            galaxy={"1011": ("日活",)}, local=local, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions, {"1011": ("日活",), "1099": ("收入",)})
 
@@ -99,7 +119,7 @@ class UnionThenSubtractTests(unittest.TestCase):
         local = _resolved(_entry(direction=OverrideDirection.SUPPRESS, metric_name="日活"))
 
         result = merge_permission_sources(
-            galaxy={"1011": ("日活", "收入")}, local=local
+            galaxy={"1011": ("日活", "收入")}, local=local, full_access_wildcard=True
         )
 
         self.assertEqual(result.permissions, {"1011": ("收入",)})
@@ -108,6 +128,7 @@ class UnionThenSubtractTests(unittest.TestCase):
         result = merge_permission_sources(
             galaxy={"1011": ("日活",), "1012": ("收入",)},
             local=_resolved(_entry(direction=OverrideDirection.SUPPRESS, metric_name="日活")),
+            full_access_wildcard=True,
         )
 
         self.assertEqual(result.permissions, {"1012": ("收入",)})
@@ -123,14 +144,18 @@ class UnionThenSubtractTests(unittest.TestCase):
             _entry(direction=OverrideDirection.SUPPRESS, metric_name="日活"),
         )
 
-        result = merge_permission_sources(galaxy={"1011": ()}, local=local)
+        result = merge_permission_sources(
+            galaxy={"1011": ()}, local=local, full_access_wildcard=True
+        )
 
         self.assertNotIn("1011", result.permissions)
 
     def test_output_values_are_sorted_and_deduplicated(self) -> None:
         local = _resolved(_entry(metric_name="日活"))
 
-        result = merge_permission_sources(galaxy={"1011": ("收入", "日活")}, local=local)
+        result = merge_permission_sources(
+            galaxy={"1011": ("收入", "日活")}, local=local, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions["1011"], ("收入", "日活"))
 
@@ -140,7 +165,9 @@ class NoLocalSourceIsIdentityTests(unittest.TestCase):
     调用方降级的哨兵值）。"""
 
     def test_none_is_identity(self) -> None:
-        result = merge_permission_sources(galaxy={"1011": ("收入", "日活")}, local=None)
+        result = merge_permission_sources(
+            galaxy={"1011": ("收入", "日活")}, local=None, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions, {"1011": ("收入", "日活")})
         self.assertEqual(result.skipped_reasons, ())
@@ -150,49 +177,10 @@ class NoLocalSourceIsIdentityTests(unittest.TestCase):
         恒等——只是走的是"参与合并、恰好没有任何贡献"这条路径，不是"跳过"。"""
 
         result = merge_permission_sources(
-            galaxy={"1011": ("日活",)}, local=_resolved()
+            galaxy={"1011": ("日活",)}, local=_resolved(), full_access_wildcard=True
         )
 
         self.assertEqual(result.permissions, {"1011": ("日活",)})
-
-
-class LegacyIdentityTests(unittest.TestCase):
-    """``legacy=None`` 恒等（S-P-3 只定签名，数据源留给 S-P-2 批二）。"""
-
-    def test_legacy_none_is_identity(self) -> None:
-        result = merge_permission_sources(
-            galaxy={"1011": ("日活",)}, local=_resolved(_entry(metric_name="收入")), legacy=None
-        )
-
-        self.assertEqual(result.permissions, {"1011": ("收入", "日活")})
-
-    def test_legacy_participates_in_the_union_when_provided(self) -> None:
-        """非 ``None`` 时的正面断言：``legacy`` 与本地授权对称——参与并集，不参与
-        抑制豁免（被本地抑制命中同样会被减掉）。"""
-
-        result = merge_permission_sources(
-            galaxy={"1011": ("日活",)},
-            local=None,
-            legacy={"1011": ("存量指标",), "1012": ("另一存量指标",)},
-        )
-
-        self.assertEqual(
-            result.permissions, {"1011": ("存量指标", "日活"), "1012": ("另一存量指标",)}
-        )
-
-    def test_legacy_is_ignored_under_the_wildcard_too(self) -> None:
-        """通配下 ``legacy`` 同样不参与合并——理由与本地授权相同：往通配映射里
-        追加一个具体公司键会让读侧 ``lookup_metrics`` 对那个公司不再回退通配，
-        造成一处极难发现的窄范围回归（模块文档「通配角」一节）。变异锚点③。"""
-
-        result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)},
-            local=None,
-            legacy={"1011": ("存量指标",)},
-        )
-
-        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)})
-        self.assertNotIn("1011", result.permissions, "通配下不得凭空长出具体公司键")
 
 
 class WildcardRoleTests(unittest.TestCase):
@@ -202,7 +190,7 @@ class WildcardRoleTests(unittest.TestCase):
 
     def test_wildcard_with_no_local_source_is_untouched_and_silent(self) -> None:
         result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=None
+            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=None, full_access_wildcard=True
         )
 
         self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)})
@@ -214,7 +202,7 @@ class WildcardRoleTests(unittest.TestCase):
         local = _resolved(_entry(metric_name="额外授权"))
 
         result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local
+            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local, full_access_wildcard=True
         )
 
         self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)}, "通配下 grant 是冗余")
@@ -227,7 +215,7 @@ class WildcardRoleTests(unittest.TestCase):
         local = _resolved(_entry(direction=OverrideDirection.SUPPRESS, metric_name="全部指标"))
 
         result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local
+            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local, full_access_wildcard=True
         )
 
         self.assertEqual(
@@ -242,7 +230,7 @@ class WildcardRoleTests(unittest.TestCase):
         )
 
         result = merge_permission_sources(
-            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local
+            galaxy={ALL_COMPANIES_KEY: ("全部指标",)}, local=local, full_access_wildcard=True
         )
 
         self.assertEqual(
@@ -256,15 +244,239 @@ class WildcardRoleTests(unittest.TestCase):
 
         local = _resolved(_entry(metric_name="收入"))
 
-        result = merge_permission_sources(galaxy={"1011": ("日活",)}, local=local)
+        result = merge_permission_sources(
+            galaxy={"1011": ("日活",)}, local=local, full_access_wildcard=True
+        )
 
         self.assertEqual(result.permissions, {"1011": ("收入", "日活")})
         self.assertEqual(result.skipped_reasons, ())
 
 
+class LimitedWildcardTests(unittest.TestCase):
+    """通配角 v2（``full_access_wildcard=False``，`Issue #440` 2026-08-30 修复）：
+    ``all_companies=True`` 但成因是 ``scope.all_countries``（职能有限，翻译出的
+    ``"*"`` 清单是有限指标，不是「全部指标」）时，本地授权/抑制参与合并——语义是
+    在 ``"*"`` 这一份清单上做并集/减集，而不是 ``WildcardRoleTests`` 那种整体
+    跳过。变异锚点④（把 ``if full_access_wildcard:`` 改成 ``if True:``）覆盖
+    本类全部用例，见模块文档字符串。
+    """
+
+    def test_true_full_wildcard_still_skips_with_original_reason_codes(self) -> None:
+        """513 维持跳过：显式传 ``full_access_wildcard=True``时，行为与
+        ``WildcardRoleTests`` 逐字节相同——两形态判别不改变真通配这一支。"""
+
+        local = _resolved(_entry(metric_name="额外授权"))
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("全部指标",)},
+            local=local,
+            full_access_wildcard=True,
+        )
+
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("全部指标",)})
+        self.assertIn(REASON_GRANT_REDUNDANT_WILDCARD, result.skipped_reasons)
+
+    def test_limited_wildcard_grant_widens_the_wildcard_list(self) -> None:
+        """核心正向断言：清单外的补授生效——`Issue #440` 报告的缺陷本身。"""
+
+        local = _resolved(_entry(company_id="1011", metric_name="客户数"))
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("成本", "收入")},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("客户数", "成本", "收入")})
+        self.assertEqual(result.skipped_reasons, ())
+
+    def test_limited_wildcard_suppress_narrows_the_wildcard_list(self) -> None:
+        local = _resolved(_entry(direction=OverrideDirection.SUPPRESS, metric_name="成本"))
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("成本", "收入")},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("收入",)})
+        self.assertEqual(result.skipped_reasons, ())
+
+    def test_merge_semantics_is_independent_of_which_company_id_the_row_carries(
+        self,
+    ) -> None:
+        """验收断言原话「合并语义与行来源无关」：两条本地条目分别记着完全不同的
+        ``company_id``（一个具体公司、一个字面量 ``"*"`` 本身），对参与合并这件事
+        没有任何区别——都只看 ``metric_name``，都并入同一个 ``"*"`` 键。"""
+
+        local = _resolved(
+            _entry(company_id="1011", metric_name="客户数"),
+            _entry(company_id=ALL_COMPANIES_KEY, metric_name="留存率"),
+        )
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("收入",)},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(
+            result.permissions, {ALL_COMPANIES_KEY: ("客户数", "收入", "留存率")}
+        )
+
+    def test_no_narrowing_regression_no_specific_company_key_is_ever_produced(
+        self,
+    ) -> None:
+        """窄化回归否定用例：无论本地条目的 ``company_id`` 是什么具体公司，合并
+        结果里都**不能**出现那个具体公司键——出现就意味着读侧 ``lookup_metrics``
+        对那个公司不再回退 ``"*"``，是当年通配角设计要防的窄范围回归。"""
+
+        local = _resolved(
+            _entry(company_id="1011", metric_name="客户数"),
+            _entry(company_id="1099", direction=OverrideDirection.SUPPRESS, metric_name="收入"),
+        )
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("收入", "成本")},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(set(result.permissions), {ALL_COMPANIES_KEY})
+        self.assertNotIn("1011", result.permissions)
+        self.assertNotIn("1099", result.permissions)
+
+    def test_a_grant_that_is_already_covered_does_not_change_the_result_and_is_not_mislabeled(
+        self,
+    ) -> None:
+        """理由码修正的核心断言：即便这次补授的指标碰巧已经在清单里（合并后结果
+        不变），也绝不登记 ``grant_redundant_wildcard``——这个理由码在有限指标
+        形态下不成立（模块文档「通配角 v2」），登记它会重新暗示"清单外指标不能
+        被补授"这个已经被坐实为误判的假设。"""
+
+        local = _resolved(_entry(metric_name="收入"))
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("成本", "收入")},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("成本", "收入")})
+        self.assertEqual(result.skipped_reasons, ())
+        self.assertNotIn(REASON_GRANT_REDUNDANT_WILDCARD, result.skipped_reasons)
+
+    def test_fully_suppressed_wildcard_drops_the_key_not_an_empty_list(self) -> None:
+        local = _resolved(_entry(direction=OverrideDirection.SUPPRESS, metric_name="收入"))
+
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("收入",)},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(result.permissions, {})
+        self.assertNotIn(
+            ALL_COMPANIES_KEY, result.permissions, "抑制到空必须丢弃键，不写空列表"
+        )
+
+    def test_no_local_source_is_identity_under_the_limited_form_too(self) -> None:
+        result = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: ("收入",)}, local=None, full_access_wildcard=False
+        )
+
+        self.assertEqual(result.permissions, {ALL_COMPANIES_KEY: ("收入",)})
+        self.assertEqual(result.skipped_reasons, ())
+
+
+class PublishRowReadbackSelfProofTests(unittest.TestCase):
+    """自证闭环（Issue #440 评论「自证闭环条款」，PM 2026-08-30）：受控直造一个
+    「有限指标 ``*``」用户的本地授权行（``company_id`` 与真实业务公司无关，证
+    「合并语义与行来源无关」）→ 触发合并（即「重算」——`merge_permission_sources`
+    正是两个调用点在重算/开通时实际调用的那一步）→ 断言合并结果为「"*" 清单 ∪
+    补授」且无窄化回归 → 序列化成发布行 ``permissions`` 文本、反序列化模拟「发布
+    表回读」，用 :func:`lookup_metrics` 核对任意具体公司都能看到并集后的指标。
+    全程只调用本仓库既有纯函数，不连数据库/stage，`全程不依赖 PM`。
+    """
+
+    def test_a_supplementary_grant_survives_serialization_and_readback_with_no_narrowing(
+        self,
+    ) -> None:
+        baseline = ("净利润", "收入")
+        # company_id="9999" 是一个与该用户实际业务范围无关的占位公司——刻意证明
+        # 合并是否生效不取决于这个字段的取值。
+        local = _resolved(_entry(company_id="9999", metric_name="客户数"))
+
+        merged = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: baseline},
+            local=local,
+            full_access_wildcard=False,
+        )
+
+        self.assertEqual(merged.permissions, {ALL_COMPANIES_KEY: ("净利润", "客户数", "收入")})
+        self.assertEqual(merged.skipped_reasons, ())
+
+        published_text = serialize_translated_permissions(merged.permissions)
+        read_back = json.loads(published_text)
+
+        self.assertEqual(read_back, {ALL_COMPANIES_KEY: ["净利润", "客户数", "收入"]})
+        for company_id in ("1011", "1099", "任意未曾出现过的公司"):
+            with self.subTest(company_id=company_id):
+                self.assertEqual(
+                    lookup_metrics(read_back, company_id), ("净利润", "客户数", "收入")
+                )
+                self.assertNotIn(
+                    company_id, read_back, "不得因为合并而凭空长出具体公司键"
+                )
+
+    def test_a_caller_that_hardcodes_true_reproduces_the_pre_440_misjudgment(self) -> None:
+        """红/绿对照的「红」半边：模拟一个调用点没有做「真全指标通配 vs 有限指标
+        通配」这一步判断、直接传 ``full_access_wildcard=True``——`Issue #440`
+        修复前两个既有调用点的唯一调用形状，`Issue #445` 又在第三个新调用点
+        ``targeted_recompute.py`` 里原样复现过一次，都是"漏接判据"这同一类
+        缺陷（不是签名收紧就能挡住的那一类——调用方即使显式传参，也可能选错值，
+        见 ``RequiredParameterTests`` 钉的是另一半："完全不传"才会被结构性拦住）。
+        同一个补授在有限指标形态下被误判为冗余而不生效、理由码错误——这正是
+        `Issue #440` 的缺陷本身。"""
+
+        baseline = ("净利润", "收入")
+        local = _resolved(_entry(company_id="9999", metric_name="客户数"))
+
+        misjudged = merge_permission_sources(
+            galaxy={ALL_COMPANIES_KEY: baseline}, local=local, full_access_wildcard=True
+        )
+
+        self.assertEqual(
+            misjudged.permissions,
+            {ALL_COMPANIES_KEY: baseline},
+            "错误地传 full_access_wildcard=True 时，补授的指标不出现在结果里——这就是误判本身",
+        )
+        self.assertIn(
+            REASON_GRANT_REDUNDANT_WILDCARD, misjudged.skipped_reasons
+        )
+
+
+class RequiredParameterTests(unittest.TestCase):
+    """结构性防复发（Trace #445）：``full_access_wildcard`` 曾经的默认值 ``True``
+    正是 ``targeted_recompute.py`` 漏接判据这次真实事故的根因——签名收紧为必填
+    关键字参数之后，任何调用点漏传都应该在开发期就被 ``TypeError`` 拦住，不再
+    悄悄退回成"当作真全指标通配"这条可能错误的行为。变异锚点：临时把签名的
+    ``full_access_wildcard: bool`` 改回 ``full_access_wildcard: bool = True``
+    后，本用例会由绿转红（不再抛出 ``TypeError``）。
+    """
+
+    def test_omitting_the_parameter_raises_type_error_instead_of_silently_defaulting(
+        self,
+    ) -> None:
+        with self.assertRaises(TypeError):
+            merge_permission_sources(galaxy={"1011": ("日活",)}, local=None)  # type: ignore[call-arg]
+
+
 class ResultTypeTests(unittest.TestCase):
     def test_result_is_a_merged_permission_sources_instance(self) -> None:
-        result = merge_permission_sources(galaxy={"1011": ("日活",)}, local=None)
+        result = merge_permission_sources(
+            galaxy={"1011": ("日活",)}, local=None, full_access_wildcard=True
+        )
 
         self.assertIsInstance(result, MergedPermissionSources)
 

@@ -356,7 +356,10 @@ def _group_outcome_text(pending: PendingAction) -> str:
     """
 
     if pending.status is PendingActionStatus.EXECUTED:
-        return "已确认执行"
+        # Issue #438：与 ``card_callback._outcome_text`` 同步补"即时生效"信息
+        # （该函数文档「同一组状态分支」）——群通知与发起人私聊终态卡这次一起
+        # 变化，不允许分叉出两句不一致的措辞。
+        return "已确认执行，权限变更将即时生效"
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

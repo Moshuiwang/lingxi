@@ -53,6 +53,14 @@ class QueryUserParsingTests(unittest.TestCase):
         command = parse_admin_command("/admin user ou abc")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
 
+    def test_email_shaped_identifier_is_recognized(self) -> None:
+        """#439 A 档：标识参数支持邮箱。是否真的按邮箱反查是 router.py/
+        adapters 的职责，这里只验证语法层放行含 ``@`` 的标识。"""
+
+        command = parse_admin_command("/admin user someone@example.com")
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(command.identifier, "someone@example.com")
+
 
 class QueryAuditParsingTests(unittest.TestCase):
     def test_bare_audit_uses_defaults(self) -> None:
@@ -241,6 +249,36 @@ class GrantSuppressPermissionParsingTests(unittest.TestCase):
         self.assertEqual(grant.kind, AdminCommandKind.GRANT_PERMISSION)
         self.assertEqual(suppress.kind, AdminCommandKind.SUPPRESS_PERMISSION)
 
+    def test_identifier_accepts_email_shape(self) -> None:
+        """#439 A 档：标识参数支持邮箱——``_IDENTIFIER_PATTERN`` 新增 ``@``。"""
+
+        command = parse_admin_command(
+            "/admin grant_permission someone@example.com 1011 daily_active 特批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
+        self.assertEqual(command.identifier, "someone@example.com")
+
+    def test_metric_name_accepts_chinese_alias(self) -> None:
+        """#439 A 档：指标支持中文别名——``_METRIC_TOKEN_PATTERN`` 放行 CJK，
+        与 ``identifier``/``company_id`` 仍然只认 ``_IDENTIFIER_PATTERN``（更窄）
+        分开验证。是否真的命中别名表是 router.py/adapters 的职责，这里只验证
+        语法层放行。"""
+
+        command = parse_admin_command(
+            "/admin grant_permission ou_abc123 1011 新增用户数 特批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
+        self.assertEqual(command.metric_name, "新增用户数")
+
+    def test_company_id_does_not_accept_chinese_even_though_metric_name_does(self) -> None:
+        """否定断言：company_id 复用更窄的 ``_IDENTIFIER_PATTERN``（不含 CJK），
+        中文放宽只发生在 metric_name 这一个字段上，不是全局放开。"""
+
+        command = parse_admin_command(
+            "/admin grant_permission ou_abc123 一零一一 daily_active 特批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
 
 #: 一个形状合法的本地权限覆盖行标识（``lpo_`` 前缀 + 26 位 Crockford Base32
 #: ULID，与 ``core/ids.new_id("lpo")`` 的生成形状逐字对应），供本文件的收回解析
@@ -322,6 +360,58 @@ class RevokePermissionParsingTests(unittest.TestCase):
     def test_missing_override_id_is_unknown(self) -> None:
         command = parse_admin_command("/admin revoke_permission")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+
+class RevokePermissionShapeTwoParsingTests(unittest.TestCase):
+    """``/admin revoke_permission`` 形状 2（#439 A 档新增）：
+    ``<identifier> <company_id> <metric_name> <reason...>``——与 grant/suppress
+    同一参数形状，服务端反查覆盖 ID（router.py 职责，这里只验证语法层解析）。"""
+
+    def test_identifier_company_metric_reason_shape_is_recognized(self) -> None:
+        command = parse_admin_command(
+            "/admin revoke_permission ou_abc123 1011 daily_active 离职"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(command.identifier, "ou_abc123")
+        self.assertEqual(command.company_id, "1011")
+        self.assertEqual(command.metric_name, "daily_active")
+        self.assertEqual(command.reason, "离职")
+
+    def test_email_identifier_and_chinese_metric_alias_shape_is_recognized(self) -> None:
+        command = parse_admin_command(
+            "/admin revoke_permission someone@example.com 1011 新增用户数 离职"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(command.identifier, "someone@example.com")
+        self.assertEqual(command.metric_name, "新增用户数")
+
+    def test_multi_word_reason_is_joined_back_together(self) -> None:
+        command = parse_admin_command(
+            "/admin revoke_permission ou_abc123 1011 daily_active 离职 交接 期间 收回"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(command.reason, "离职 交接 期间 收回")
+
+    def test_missing_reason_is_unknown(self) -> None:
+        command = parse_admin_command("/admin revoke_permission ou_abc123 1011 daily_active")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+    def test_an_override_id_shaped_first_token_never_falls_through_to_shape_two(self) -> None:
+        """否定断言：第一个 token 形似 override_id 时，即使凑够 4 个 token，也必须
+        走形状 1（按 override_id 定位），不会被形状 2 的解析规则接管——两种形状
+        的判据是"第一个 token 长什么样"，不是"数了多少个 token"（见
+        ``_parse_revoke_permission_command`` 文档）。"""
+
+        command = parse_admin_command(
+            f"/admin revoke_permission {_VALID_OVERRIDE_ID} 1011 daily_active 离职"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        # 形状 1 的解析把 rest[1:] 全部拼成 reason，不会把 "1011"/"daily_active"
+        # 单独解释成 company_id/metric_name。
+        self.assertEqual(command.identifier, _VALID_OVERRIDE_ID)
+        self.assertEqual(command.reason, "1011 daily_active 离职")
+        self.assertIsNone(command.company_id)
+        self.assertIsNone(command.metric_name)
 
 
 class QueryTraceParsingTests(unittest.TestCase):

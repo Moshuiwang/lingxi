@@ -6,6 +6,15 @@
    ``decide_prepare``，通过则插入一行 ``pending`` 记录（``card_delivered=FALSE``）。
    同一 ``target_open_id`` 已有在途 ``pending`` 行时，插入会撞上迁移 ``0068`` 的
    部分唯一索引，本方法捕获后转译为友好拒绝（外部审查交叉裁定，codex P1-5，ABA）。
+   **懒清扫兜底（Trace #445 #437，2026-08-30）**：撞上这条唯一索引之前，本方法
+   先原地尝试把这个目标"早已过 ``confirm_deadline_at`` 但从未被点击"的旧
+   ``pending`` 行翻转为 ``expired``——修复真实运维事故"过期未点的确认卡永久
+   占坑，新命令被无限期拦住，只能靠人工查库解锁"。这不是新增一个后台清扫进程，
+   仍然是迁移 ``0068``"惰性过期判定"这条既有姿态的延伸：判定的触发点从
+   "回到旧卡片上点按钮"扩展为"同一目标的下一次 ``prepare()``"，见该方法自己的
+   文档与迁移 ``0068`` 文件头部「为什么不做本地行的过期后台清理」。仍然真在途
+   （未过期）的行不受影响，拦截文案改为携带这条在途操作的摘要与自助指引
+   （:func:`~lingxi.core.admin.pending_action.format_in_flight_conflict_message`）。
 2. :meth:`PostgresPendingActionStore.confirm`/:meth:`~.cancel` —— ``SELECT ... FOR
    UPDATE`` 锁定待确认操作与目标 ``app_user`` 行，调用对应纯函数取得决策，按决策
    执行 ``UPDATE``，同一事务内写审计；审计失败则整个事务回滚（写路径
@@ -124,17 +133,25 @@ from lingxi.core.admin.pending_action import (
     decide_cancel,
     decide_confirm,
     decide_prepare,
+    format_in_flight_conflict_message,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 
-#: ``prepare()`` 撞上同目标在途唯一索引时对外的错误码与文案（外部审查交叉裁定，
+#: ``prepare()`` 撞上同目标在途唯一索引时对外的错误码（外部审查交叉裁定，
 #: codex P1-5）——与 ``core/admin/pending_action.ERROR_CODE``/``CANCEL_ERROR_CODE``
 #: 同一风格的字面量表，但这条拒绝发生在插入阶段（数据库约束触发），不经过
 #: ``decide_prepare`` 这个纯函数，因此不适合定义在那个模块的 ``ConfirmResultKind``/
 #: ``CancelResultKind`` 枚举里——那两个枚举描述的是"读到一行之后怎么判"，这里是
 #: "连一行都插不进去"。
 TARGET_HAS_PENDING_ACTION_CODE = "target_has_pending_action"
+
+#: 兜底文案，只在结构上不应该发生的分支使用（撞了唯一索引、但紧接着的 SELECT
+#: 却查不到那一条 'pending' 行——理论上不可能，见 ``prepare()`` 内该分支注释）；
+#: 正常路径下的拦截文案由 ``core/admin/pending_action.
+#: format_in_flight_conflict_message`` 按查到的在途行动态生成，带摘要与自助指引
+#: （Trace #445 #437 拦截文案改进：修复"提示不说、旧卡可能淹没在历史消息
+#: 里"这条真实运维事故，见该函数文档）。
 TARGET_HAS_PENDING_ACTION_MESSAGE = "该用户当前已有一条待确认操作在途，请先处理（确认或取消）后再重新发起。"
 
 #: 收回的自我目标防呆拒绝码/文案（#319 S-P-1b 卡 B）：取值与 ``core/admin/
@@ -272,10 +289,29 @@ class PostgresPendingActionStore:
         metric_name: str | None = None,
         reason: str | None = None,
         now: datetime | None = None,
+        trace_id: str | None = None,
     ) -> PrepareOutcome:
         """读目标当前状态、判定是否可以发起，通过则插入一行 ``pending`` 记录
         （``card_delivered=FALSE``，调用方随后发卡片，成功再调用
         :meth:`mark_card_delivered`，失败调用 :meth:`mark_send_failed`）。
+
+        **懒清扫兜底（Trace #445 #437）**：插入前先把这个目标"早已过期却从未被
+        点击"的旧 ``pending`` 行原地翻转为 ``expired``（不影响仍然真在途的行），
+        见模块文档「懒清扫兜底」一节。仍然撞上同目标在途唯一索引时，拒绝文案携带
+        这条在途操作的摘要（动作/发起时间/截止时间）与自助指引（已过期会自动
+        释放/未过期请先处理旧卡），见 :func:`~lingxi.core.admin.pending_action.
+        format_in_flight_conflict_message`。**真的翻转了一行时补一条
+        ``admin.pending_action.lazily_expired`` 审计**（opus 审查坐实并修复：
+        此前这条 UPDATE 真的改了一行状态却完全没有留痕，与 :meth:`confirm`/
+        :meth:`cancel` 每次状态改变都记一条 ``admin.pending_action.*`` 审计的
+        既有纪律不对称）——``target``/``triggered_by`` 分别是被清掉那一行的
+        目标与触发这次懒清扫的**这次新** ``prepare()`` 调用的发起人（不是被
+        清掉那一行自己的原发起人，那个信息已经在 ``pending_action`` 表里，不
+        重复搬进审计字段）。``trace_id`` 形参当前没有真实生产调用方传入
+        （``core/admin/router.py::_dispatch_write_action`` 调用 ``prepare()``
+        时还没有把它的 trace_id 传进来，这条接线不在本次修复的分域范围内），
+        因此审计里这个字段目前恒为 ``None``——本参数已经就位，接线打通后不需要
+        再改这个方法一次。
 
         ``company_id``/``metric_name``/``reason`` 三个参数只有
         ``action_type in LOCAL_PERMISSION_ACTION_TYPES``（授权/抑制/收回）时才会
@@ -390,10 +426,63 @@ class PostgresPendingActionStore:
                         return PrepareOutcome(decision=decision)
 
                     confirm_deadline_at = moment + timedelta(seconds=PENDING_ACTION_TTL_SECONDS)
+
+                    # 懒清扫兜底（Trace #445 #437，2026-08-30 真实运维事故修复）：
+                    # 这个目标如果已有一条早过 confirm_deadline_at、却从未被点击过
+                    # 的 pending 行，原地翻转为 expired，让它让出下面那条唯一索引
+                    # 的名额——不是新增一个后台清扫职责，只是把"惰性过期判定"的
+                    # 触发点从"回到旧卡片上点按钮"扩展到"同一目标的下一次
+                    # prepare()"（迁移 0068 文件头部「为什么不做本地行的过期后台
+                    # 清理」）。
+                    #
+                    # WHERE 子句本身就是并发安全网，不需要先 SELECT ... FOR UPDATE
+                    # 再判断：同一目标同一时刻至多一条 'pending' 行（本模块文档
+                    # 「为什么同一目标同一时刻只允许一条在途待确认操作」），且这条
+                    # UPDATE 只匹配"仍是 pending 且已经过了 confirm_deadline_at"的
+                    # 那一行——PostgreSQL 在拿到行锁后按已提交的最新数据重新核对
+                    # WHERE 子句：真实并发下，另一个几乎同时执行的翻转会先等这把
+                    # 行锁，等到后发现该行的 status 已经不是 'pending'（已被对方
+                    # 翻转并提交），于是这条语句在这一行上影响 0 行——不会重复翻转
+                    # 一条已经翻过的行，也不可能把一条 confirm_deadline_at 还没到的
+                    # 行错误地判成过期（时间比较本身与并发无关）。``decided_by_
+                    # open_id`` 留空（不在 SET 子句里）：这不是任何管理员做出的
+                    # 决定，是系统按时钟发现过期——与 decide_confirm 的 EXPIRE 分支
+                    # （点击人发现过期，decided_by_open_id 写点击人）在数据里天然
+                    # 可区分，供未来人工核对时分辨"谁/什么触发了这次过期"。
+                    cursor.execute(
+                        """
+                        UPDATE pending_action
+                           SET status = 'expired', reason = 'expired', decided_at = %s
+                         WHERE target_open_id = %s AND status = 'pending'
+                           AND confirm_deadline_at <= %s
+                        RETURNING id
+                        """,
+                        (moment, resolved_target_open_id, moment),
+                    )
+                    if cursor.rowcount == 1:
+                        # 真的翻转了一行——按方法文档「懒清扫兜底」一节补一条
+                        # 可分辨审计，与 confirm()/cancel() 的既有姿态对齐
+                        # （opus 审查坐实并修复：此前这一步完全没有留痕）。
+                        # `rowcount == 1` 是上面注释里"同一目标同一时刻至多一条
+                        # pending 行"这条既有不变量的直接推论，不是新增假设。
+                        (expired_pending_action_id,) = cursor.fetchone()
+                        self._audit.record(
+                            "admin.pending_action.lazily_expired",
+                            pending_action_id=expired_pending_action_id,
+                            target=resolved_target_open_id,
+                            triggered_by=initiated_by_open_id,
+                            trace_id=trace_id,
+                        )
+
                     # 嵌套事务块 = psycopg 的 SAVEPOINT：撞上迁移 0068 的同目标在途
-                    # 唯一索引时，只回滚这条 INSERT 本身，外层事务（目前只做了一次
-                    # 只读 SELECT）保持可继续提交的干净状态（外部审查交叉裁定，
-                    # codex P1-5，ABA）。
+                    # 唯一索引时，只回滚这条 INSERT 本身，外层事务（上面的懒清扫
+                    # UPDATE、以及目前为止做过的只读 SELECT）保持可继续提交的干净
+                    # 状态（外部审查交叉裁定，codex P1-5，ABA）。走到这里仍然撞上，
+                    # 说明上面的懒清扫没有翻转任何行——这个目标真的还有一条未过期
+                    # 的在途操作；即使是一次真实并发（另一个 prepare() 调用抢先
+                    # 插入了它自己的新 pending 行），那一行结构上也不可能是过期的
+                    # ——下面重新查到的行、以及据此生成的拒绝文案在两种情形下都
+                    # 准确。
                     try:
                         with connection.transaction():
                             cursor.execute(
@@ -416,11 +505,27 @@ class PostgresPendingActionStore:
                                 ),
                             )
                     except UniqueViolation:
+                        cursor.execute(
+                            f"SELECT {_SELECT_COLUMNS} FROM pending_action"
+                            " WHERE target_open_id = %s AND status = 'pending'",
+                            (resolved_target_open_id,),
+                        )
+                        blocking_row = cursor.fetchone()
+                        message = (
+                            format_in_flight_conflict_message(
+                                blocking=_row_to_pending_action(blocking_row)
+                            )
+                            if blocking_row is not None
+                            # 结构上不应该发生——刚撞过这条唯一索引，说明这一刻
+                            # 必然存在一条 'pending' 行；留一个不依赖它的兜底文案，
+                            # 响亮地退化，不静默吞掉查不到行这件怪事。
+                            else TARGET_HAS_PENDING_ACTION_MESSAGE
+                        )
                         return PrepareOutcome(
                             decision=PrepareDecision(
                                 ok=False,
                                 code=TARGET_HAS_PENDING_ACTION_CODE,
-                                message=TARGET_HAS_PENDING_ACTION_MESSAGE,
+                                message=message,
                             )
                         )
         pending = self.get(pending_action_id=pending_id)

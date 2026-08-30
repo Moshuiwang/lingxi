@@ -54,12 +54,15 @@ from lingxi.core.identity.stock_token_source import (
     NO_ROW,
     StockTokenLookup,
 )
-from lingxi.core.permission.legacy_source import REASON_LEGACY_READ_FAILED
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.mcp_readiness import ReadinessOutcome
-from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED
+from lingxi.core.permission.merge_sources import (
+    REASON_GRANT_REDUNDANT_WILDCARD,
+    REASON_LOCAL_OVERRIDE_READ_FAILED,
+    REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
+)
 from lingxi.core.permission.metric_translation import translate_company_functions
-from lingxi.core.permission.publish import ExistingPermissionRow
+from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 UTC = timezone.utc
 OPEN_ID = "ou_employee_1"
@@ -401,55 +404,6 @@ class FakeLocalOverrides:
         return self._entries.get(user_id, ())
 
 
-class FakeLegacyTable:
-    """存量权限只读源的假实现（S-P-2，Issue #319 / Trace #328）。同构于
-    ``tests/test_permission_refresh_duty.py`` 的同名类——``LegacyPermissionTable``
-    协议本身定义在 ``core/permission/legacy_source.py``，两个调用点的测试各自留一份
-    假实现是测试夹具的既有惯例（同 ``FakeLocalOverrides``），不是层级约束要求的。"""
-
-    def __init__(
-        self,
-        rows_by_email: dict[str, str] | None = None,
-        *,
-        find_error: Exception | None = None,
-        duplicate_for: set[str] | None = None,
-    ) -> None:
-        self._rows = rows_by_email or {}
-        self._find_error = find_error
-        self._duplicate_for = duplicate_for or set()
-        self.find_calls: list[tuple[str, str]] = []
-
-    def find_rows(self, *, record_key: str, email: str) -> tuple[ExistingPermissionRow, ...]:
-        self.find_calls.append((record_key, email))
-        if self._find_error is not None:
-            raise self._find_error
-        if email not in self._rows:
-            return ()
-        row = ExistingPermissionRow(
-            record_id=f"rec_{email}",
-            fields={"record_key": email, "email": email, "permissions": self._rows[email]},
-        )
-        return (row, row) if email in self._duplicate_for else (row,)
-
-
-class FakePublishHistory:
-    """「这个人在发布链上有没有留下过足迹」的假实现（红线-1，Trace #328 opus 审查）。
-    同构于 ``tests/test_permission_refresh_duty.py`` 的同名类（各自独立一份，理由与
-    ``PublishHistorySource`` 协议文档一致：``core/`` 不 import ``apps/``）。
-
-    默认**谁都没有**：首次开通的用户结构上通常也确实还没有任何发布足迹，因此这是
-    ``LegacySourceMergeTests`` 既有正向用例的自然默认值。
-    """
-
-    def __init__(self, published_users: set[str] | None = None) -> None:
-        self._published = published_users or set()
-        self.calls: list[str] = []
-
-    def has_publish_footprint(self, user_id: str) -> bool:
-        self.calls.append(user_id)
-        return user_id in self._published
-
-
 class RecordingAudit:
     def __init__(self) -> None:
         self.records: list[tuple[str, dict[str, object]]] = []
@@ -540,15 +494,6 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
         # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
         "local_overrides": None,
-        # 默认 None：哨兵——不注入存量权限只读源时，行为必须与接线之前逐字节一致
-        # （S-P-2 #328，见 LegacySourceMergeTests.test_table_absent_matches_todays_behavior）。
-        "legacy_source": None,
-        # 默认「谁都没有」：红线-1 有界化（Trace #328 opus 审查）的默认值——首次
-        # 开通的用户结构上通常也确实还没有任何发布足迹，因此本文件绝大多数用例
-        # （legacy 参与合并的既有正向路径）继续成立；``publish_history=None``
-        # （装配层未接线）走保守分支同样按"不参与"处理，见
-        # ``LegacySourceMergeTests.test_publish_history_absent_also_blocks_legacy``。
-        "publish_history": FakePublishHistory(),
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     executor = overrides.get("executor") or InlineExecutor()
@@ -586,8 +531,6 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         onboarding_failed=parts["onboarding_failed"],
         failure_reasons=parts["failure_reasons"],
         local_overrides=parts["local_overrides"],
-        legacy_source=parts["legacy_source"],
-        publish_history=parts["publish_history"],
     )
     return runner, parts
 
@@ -721,6 +664,31 @@ class TwoCompanyGalaxySnapshot(FakeGalaxySnapshot):
         )
 
 
+class AllCountriesGalaxySnapshot(FakeGalaxySnapshot):
+    """银河「全非」通配授权（``scope.all_countries=True``，`galaxy_scope.py` 哨兵
+    展开）——与 ``ADMIN_FULL_ACCESS_FUNCTION`` 职能是两个互相独立的
+    ``all_companies=True`` 成因（`Issue #440` 通配角 v2）。快照仍需要至少一个非哨兵
+    国家行，否则 ``aggregate_permission`` 会因 ``company_ids`` 为空提前拒绝
+    （该判据不看 ``all_countries``）。"""
+
+    country_rows = (
+        {"country_key": "0", "name": "ALL", "name_cn": "全非", "boss_company_id": "0"},
+        {"country_key": "c_1", "name": "Kenya", "name_cn": "肯尼亚", "boss_company_id": "88"},
+    )
+
+    def datacountry_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return ({"user_id": galaxy_user_id, "datacountry_id": "0"},)
+
+
+class AdminRoleGalaxySnapshot(FakeGalaxySnapshot):
+    """持有 :data:`ADMIN_FULL_ACCESS_FUNCTION` 职能——`aggregate_permission` 的
+    「角色即全公司」特例，强制 ``all_companies=True``，与上面的「全非」通配是两个
+    独立成因中的另一个（真全指标通配，`merge_sources` 模块文档「通配角 v2」）。"""
+
+    def role_rows(self, galaxy_user_id: str) -> tuple[Mapping[str, Any], ...]:
+        return ({"user_id": galaxy_user_id, "role_id": "r_admin", "role_name": ADMIN_FULL_ACCESS_FUNCTION},)
+
+
 class LocalOverrideMergeTests(unittest.TestCase):
     """开通侧的四源合并接线（S-P-3，Issue #319）：与
     ``tests/test_permission_refresh_duty.py::LocalOverrideMergeTest`` 同一组断言，
@@ -808,12 +776,78 @@ class LocalOverrideMergeTests(unittest.TestCase):
         self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
         self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["额外授权"]}')
 
+    def test_limited_metric_wildcard_grant_is_unioned_into_the_published_metrics(self) -> None:
+        """通配角 v2（`Issue #440`）：``all_companies=True`` 但成因是
+        ``scope.all_countries``（银河「全非」通配）、职能不含
+        :data:`ADMIN_FULL_ACCESS_FUNCTION`——「有限指标 ``*``」形态。判据
+        ``ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions`` 为假，接线传
+        ``full_access_wildcard=False``：本地授权改为在 ``"*"`` 清单上参与并集，
+        不再被误判成冗余而整体跳过（onboarding 侧与每日重算同一接线，见
+        ``tests/test_permission_refresh_duty.py`` 同名用例）。"""
+
+        overrides = FakeLocalOverrides(
+            {USER_ID: (_override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),)}
+        )
+        parts, result = run_once(
+            galaxy=FakeGalaxy(AllCountriesGalaxySnapshot()),
+            metric_translation_map={"*": {"销售分析": ("销售分析",)}},
+            local_overrides=overrides,
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"*":["销售分析","额外授权"]}',
+            "有限指标通配下本地授权应参与并集，不整体跳过",
+        )
+        self.assertNotIn(
+            "onboarding.local_override_skipped",
+            parts["audit"].actions(),
+            "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
+        )
+
+    def test_full_access_wildcard_admin_still_skips_both_grant_and_suppress(self) -> None:
+        """回归防护：真全指标通配（``ADMIN_FULL_ACCESS_FUNCTION`` 职能）下判据仍为
+        真，接线保持 ``full_access_wildcard=True``——通配角 v1 的既有行为（本地授权
+        / 抑制整体不参与合并）逐字节不变，不因 v2 判据接线而被误伤（onboarding 侧，
+        与每日重算 ``LocalOverrideMergeTest.
+        test_wildcard_admin_skips_both_grant_and_suppress_with_audit`` 同一断言）。"""
+
+        overrides = FakeLocalOverrides(
+            {
+                USER_ID: (
+                    _override_entry(direction=OverrideDirection.GRANT, metric_name="额外授权"),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, metric_name="销售分析"),
+                )
+            }
+        )
+        parts, result = run_once(
+            galaxy=FakeGalaxy(AdminRoleGalaxySnapshot()),
+            role_function_map={ADMIN_FULL_ACCESS_FUNCTION: ADMIN_FULL_ACCESS_FUNCTION},
+            metric_translation_map={"*": {ADMIN_FULL_ACCESS_FUNCTION: ("销售分析",)}},
+            local_overrides=overrides,
+        )
+
+        self.assertIs(result.state, OnboardingState.STARTED)
+        self.assertEqual(
+            parts["decisions"].rows[0].permissions,
+            '{"*":["销售分析"]}',
+            "真全指标通配下本地源整体不生效",
+        )
+        skipped = [
+            fields for name, fields in parts["audit"].records if name == "onboarding.local_override_skipped"
+        ]
+        reasons = {fields["reason"] for fields in skipped}
+        self.assertEqual(
+            reasons, {REASON_GRANT_REDUNDANT_WILDCARD, REASON_SUPPRESS_INAPPLICABLE_WILDCARD}
+        )
+
 
 class ZeroGalaxyLocalGrantTests(unittest.TestCase):
     """`V-权限-15` 已消除的已知限制在开通侧的对应断言（PM 2026-08-29 裁定，
     Issue #419）：``aggregate.granted`` 为假不再让 `_match` 直接拒绝，先看
-    **本地授权**（不含存量沿用，P0-1 独立审查坐实并修复）能否兜底出可发布内容
-    ——与 ``tests/test_permission_refresh_duty.py::ZeroGalaxyLocalGrantTest``
+    **本地授权**能否兜底出可发布内容——与
+    ``tests/test_permission_refresh_duty.py::ZeroGalaxyLocalGrantTest``
     同一组断言，证明两个调用点消费的是同一条产品语义。"""
 
     def test_zero_galaxy_user_with_a_local_grant_completes_with_exactly_the_local_set(
@@ -878,58 +912,6 @@ class ZeroGalaxyLocalGrantTests(unittest.TestCase):
         self.assertEqual(parts["environment"].calls, [])
         self.assertEqual(parts["decisions"].rows, [])
         self.assertEqual(parts["users"].advanced, [])
-
-    def test_a_legacy_row_alone_does_not_authorize_a_never_granted_user(self) -> None:
-        """否定（P0-1，独立审查坐实并修复）：零银河 + 零本地授权 + 旧系统表遗留行
-        → 存量沿用不构成独立授权来源，维持 ``not_authorized`` 语义。修复前
-        ``_reject_zero_galaxy_without_local_grant`` 会把 ``_resolve_legacy_
-        source`` 的结果也并进判据，让这个人被误判成有效授权、真的开通并发布；
-        修复后这一步固定传 ``legacy=None``，连 ``find_rows`` 都不发起。"""
-
-        legacy = FakeLegacyTable({"xiaoming@example.com": '{"88":["旧系统遗留指标"]}'})
-        parts, result = run_once(role_function_map={}, legacy_source=legacy)
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(
-            parts["audit"].facts("onboarding.result")["failure_reason"], "no_supported_function"
-        )
-        self.assertEqual(parts["environment"].calls, [], "无权限终态不得创建用户环境")
-        self.assertEqual(parts["decisions"].rows, [], "无权限终态不得排发布意图")
-        self.assertEqual(parts["users"].advanced, [], "无权限终态不得推进开通状态")
-        self.assertEqual(legacy.find_calls, [], "零银河兜底判据不得读取存量沿用")
-
-    def test_a_legacy_row_does_not_leak_into_the_publish_row_when_a_local_grant_authorizes(
-        self,
-    ) -> None:
-        """否定（NEW-1，独立审查复核 2026-08-29 坐实并修复）：零银河 + 一条本地
-        授权（通过前置门 `_reject_zero_galaxy_without_local_grant`）+ 旧系统表
-        也有一行 → `_publish` 里真正结算发布行的那次合并同样必须传
-        ``legacy=None``，发布内容精确等于本地授权集合，**不含旧表指标**。
-
-        与上一条用例（``test_a_legacy_row_alone_does_not_authorize_a_never_
-        granted_user``）不同：那一条覆盖的是前置门自己那次合并（零本地授权，
-        走不到 ``_publish``）；本用例专门覆盖 ``_publish`` 结算发布行的那次合并
-        （前置门已放行，`_publish` 内部曾无条件调用 `_resolve_legacy_source`，
-        与前置门的收窄判据自相矛盾——独立审查坐实：修复前旧表行会悄悄并进
-        发布内容）。修复后两处判据同型：`aggregate.granted` 为假时 `legacy`
-        恒为 ``None``，`_resolve_legacy_source`/`find_rows` 都不被调用。"""
-
-        overrides = FakeLocalOverrides({USER_ID: (_override_entry(),)})
-        legacy = FakeLegacyTable({"xiaoming@example.com": '{"88":["旧系统遗留指标"]}'})
-        parts, result = run_once(
-            role_function_map={}, local_overrides=overrides, legacy_source=legacy
-        )
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
-        self.assertEqual(
-            parts["decisions"].rows[0].permissions,
-            '{"88":["本地指标"]}',
-            "发布内容必须精确等于本地授权集合，不得混入旧表遗留指标",
-        )
-        self.assertEqual(
-            legacy.find_calls, [], "_publish 结算发布行时零银河分支不得读取存量沿用"
-        )
 
     def test_galaxy_recovering_restores_the_union_for_the_same_local_grant(self) -> None:
         """正向：同一份本地授权配置，银河一侧从零恢复为有效授权后，发布内容从
@@ -1048,97 +1030,6 @@ class PublishTranslationTests(unittest.TestCase):
         self.assertEqual(facts["state"], "internal_error")
         self.assertEqual(facts["failure_reason"], "permission_translation_unavailable")
         self.assertEqual(parts["decisions"].rows, [], "映射整体为空时同样零写入")
-
-
-class LegacySourceMergeTests(unittest.TestCase):
-    """开通侧的存量权限沿用接线（S-P-2，Issue #319 / Trace #328）：与
-    ``tests/test_permission_refresh_duty.py::LegacySourceMergeTest`` 同一组断言，
-    证明两个调用点消费的是同一个 ``resolve_legacy_source``/``merge_permission_sources``。
-    查找键取**规范化邮箱**（小写），与 ``ROSTER_ROWS[0]["email"]``（混合大小写）同源。"""
-
-    NORMALIZED_EMAIL = "xiaoming@example.com"
-
-    def test_table_absent_matches_todays_behavior(self) -> None:
-        parts, result = run_once()
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
-
-    def test_no_matching_legacy_row_is_also_identity(self) -> None:
-        legacy = FakeLegacyTable({})
-        parts, _ = run_once(legacy_source=legacy)
-
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
-        self.assertEqual(legacy.find_calls, [(self.NORMALIZED_EMAIL, self.NORMALIZED_EMAIL)])
-
-    def test_legacy_permissions_are_unioned_into_the_published_metrics(self) -> None:
-        """存量沿用后聚合含并集（本卡验收断言①）。"""
-
-        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'})
-        parts, _ = run_once(legacy_source=legacy)
-
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["存量指标","销售分析"]}')
-
-    def test_read_failure_skips_legacy_source_and_audits(self) -> None:
-        """本卡验收断言②：读取失败只跳过存量源，不整链失败。"""
-
-        legacy = FakeLegacyTable(find_error=RuntimeError("注入的存量表读取失败"))
-        parts, result = run_once(legacy_source=legacy)
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
-        self.assertIn("onboarding.legacy_source_skipped", parts["audit"].actions())
-        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
-        self.assertEqual(facts["user"], USER_ID)
-        self.assertEqual(facts["reason"], REASON_LEGACY_READ_FAILED)
-        self.assertEqual(facts["error"], "RuntimeError")
-
-    def test_conflicting_legacy_rows_are_skipped_with_a_distinct_reason(self) -> None:
-        """本卡验收断言⑤：命中多行失败关闭，原因码与读取失败可分辨。"""
-
-        legacy = FakeLegacyTable(
-            {self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'}, duplicate_for={self.NORMALIZED_EMAIL}
-        )
-        parts, _ = run_once(legacy_source=legacy)
-
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
-        facts = parts["audit"].facts("onboarding.legacy_source_skipped")
-        self.assertEqual(facts["reason"], "multiple_rows")
-        self.assertNotIn("error", facts)
-
-    def test_a_user_with_a_publish_footprint_never_reads_legacy(self) -> None:
-        """红线-1 否定用例（Trace #328 opus 审查）：这个用户已经在发布链上留下过
-        足迹——发生在一条因下游步骤失败而重跑的链上，``_publish`` 被第二次调用时，
-        第一次调用可能已经排出过一条发布意图。有界化判据必须挡住存量沿用，**连
-        find_rows 都不发起**（省读放大）。存量行故意携带一个当前银河聚合结果里
-        没有的指标，模拟"上一次调用发布的内容被当作存量沿用原样读了回来"的自
-        反馈环风险。"""
-
-        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["上一次已发布的指标"]}'})
-        parts, result = run_once(
-            legacy_source=legacy, publish_history=FakePublishHistory({USER_ID})
-        )
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(
-            parts["decisions"].rows[0].permissions,
-            '{"88":["销售分析"]}',
-            "有发布足迹时存量沿用不生效",
-        )
-        self.assertEqual(legacy.find_calls, [], "有发布足迹时连 find_rows 都不该发起")
-
-    def test_publish_history_absent_also_blocks_legacy(self) -> None:
-        """装配层未接线发布足迹口（``publish_history=None``）时按保守分支处理：
-        判据答不出来，legacy 一律不参与——与"未接线 store 静默不参与"的既有姿态
-        一致，但方向反过来（未接线时**不放行**，不是**放行**），因为放行的风险
-        是自反馈环，不放行的代价只是这一轮少沿用一份本该沿用的存量权限。"""
-
-        legacy = FakeLegacyTable({self.NORMALIZED_EMAIL: '{"88":["存量指标"]}'})
-        parts, result = run_once(legacy_source=legacy, publish_history=None)
-
-        self.assertIs(result.state, OnboardingState.STARTED)
-        self.assertEqual(parts["decisions"].rows[0].permissions, '{"88":["销售分析"]}')
-        self.assertEqual(legacy.find_calls, [], "判据答不出来时不该发起 find_rows")
 
 
 class ThreadingTests(unittest.TestCase):
