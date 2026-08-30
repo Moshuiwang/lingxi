@@ -551,19 +551,40 @@ class _Transaction:
         )
         return memory_id
 
-    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
-        """删除**属于该用户**的一条记忆；返回是否真的删了。
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> UserMemoryEntry | None:
+        """删除**属于该用户**的一条记忆；返回被删除那一行的内容，未删除任何行时
+        返回 ``None``。
 
         ``AND user_id = %s`` 结构性地堵死跨用户删除——即使调用方传入的
         ``memory_id`` 属于另一个用户，这条语句也影响 0 行，不需要先查一次"这条
         记忆是不是我的"再判断，避免 TOCTOU 窗口。
+
+        ``RETURNING``（rc22 B-8-1，#439 TOP-10）：调用方（``/memory forget``
+        的 pipeline 分发）需要在回执里回显被删条目的实际内容，供用户自行核对
+        删的是不是那一条——短序号解析到具体 id 之间存在"列表与删除之间记忆
+        集合变化"的边缘情形，回显内容是用户唯一能自校验的手段。用
+        ``RETURNING`` 让"删没删成功"与"删的是哪一条"在同一条 SQL 里原子获得，
+        不需要调用方另起一次 ``SELECT``。
         """
 
         cursor = self._execute(
-            "DELETE FROM user_memory WHERE id = %s AND user_id = %s",
+            """
+            DELETE FROM user_memory
+             WHERE id = %s AND user_id = %s
+            RETURNING memory_type, memory_key, memory_value, created_at
+            """,
             (memory_id, user_id),
         )
-        return cursor.rowcount == 1
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return UserMemoryEntry(
+            memory_id=memory_id,
+            memory_type=row[0],
+            memory_key=row[1],
+            memory_value=row[2],
+            created_at=row[3],
+        )
 
     def clear_user_memory(self, *, user_id: str) -> int:
         """清空该用户的全部记忆，返回清掉的行数。

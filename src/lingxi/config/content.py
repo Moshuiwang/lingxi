@@ -151,6 +151,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "memory.remember_unsafe",
     "memory.limit_exceeded",
     "memory.forgotten",
+    "memory.forgotten_unsafe",
     "memory.forget_not_found",
     "memory.cleared",
     "memory.list_empty",

@@ -385,14 +385,14 @@ class FakeTransaction:
         entries.append(new_entry)
         return new_entry.memory_id
 
-    def forget_user_memory(self, *, user_id: str, memory_id: str) -> bool:
+    def forget_user_memory(self, *, user_id: str, memory_id: str) -> UserMemoryEntry | None:
         self._log.add("store.forget_user_memory", user_id=user_id, memory_id=memory_id)
         entries = self._state.user_memory.get(user_id, [])
         for index, entry in enumerate(entries):
             if entry.memory_id == memory_id:
                 del entries[index]
-                return True
-        return False
+                return entry
+        return None
 
     def clear_user_memory(self, *, user_id: str) -> int:
         self._log.add("store.clear_user_memory", user_id=user_id)

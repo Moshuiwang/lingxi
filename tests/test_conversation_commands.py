@@ -172,6 +172,73 @@ class ForgetParsingTests(unittest.TestCase):
         )
 
 
+class ForgetSerialParsingTests(unittest.TestCase):
+    """rc22 B-8-1（#439 TOP-10）：``/memory forget`` 新增的短序号参数形状——序号
+    到具体 ``memory_id`` 的解析是 I/O（需要查一次记忆列表），不在本模块完成，
+    这里只钉「哪些字面量能/不能被识别成序号」，解析后置行为见
+    ``tests/test_gateway_pipeline.py`` 的 ``MemoryCommandDispatchTests``。
+
+    变异锚点：把 ``commands._parse_memory_serial`` 的「``token != str(int(token))``
+    前导零/符号拒绝」这段判据删掉，``test_leading_zero_is_rejected``/
+    ``test_plus_sign_is_rejected`` 两条会从 ``NONE`` 变红成非 ``NONE``。
+    """
+
+    def test_single_digit_serial_is_recognized(self) -> None:
+        self.assertEqual(
+            parse_memory_command("/memory forget 1"),
+            MemoryCommand(kind=MemoryCommandKind.FORGET, memory_serial=1),
+        )
+
+    def test_multi_digit_serial_is_recognized(self) -> None:
+        self.assertEqual(
+            parse_memory_command("/memory forget 42"),
+            MemoryCommand(kind=MemoryCommandKind.FORGET, memory_serial=42),
+        )
+
+    def test_zero_is_rejected(self) -> None:
+        """序号从 1 开始，``0`` 不对应任何展示行。"""
+
+        self.assertEqual(parse_memory_command("/memory forget 0").kind, MemoryCommandKind.NONE)
+
+    def test_leading_zero_is_rejected(self) -> None:
+        """``01`` 不消歧——不猜测它是序号 1 还是格式错误，直接判 NONE。"""
+
+        self.assertEqual(parse_memory_command("/memory forget 01").kind, MemoryCommandKind.NONE)
+
+    def test_plus_sign_is_rejected(self) -> None:
+        self.assertEqual(parse_memory_command("/memory forget +1").kind, MemoryCommandKind.NONE)
+
+    def test_negative_sign_is_rejected(self) -> None:
+        self.assertEqual(parse_memory_command("/memory forget -1").kind, MemoryCommandKind.NONE)
+
+    def test_decimal_is_rejected(self) -> None:
+        self.assertEqual(parse_memory_command("/memory forget 1.0").kind, MemoryCommandKind.NONE)
+
+    def test_trailing_extra_token_after_serial_is_none(self) -> None:
+        self.assertEqual(
+            parse_memory_command("/memory forget 1 extra").kind, MemoryCommandKind.NONE
+        )
+
+    def test_serial_result_carries_no_memory_id(self) -> None:
+        """``memory_id``/``memory_serial`` 二选一——序号形态解析结果不带 id。"""
+
+        result = parse_memory_command("/memory forget 7")
+        self.assertIsNone(result.memory_id)
+        self.assertEqual(result.memory_serial, 7)
+
+    def test_a_full_mem_id_that_happens_to_be_all_digits_after_prefix_still_parses_as_id(
+        self,
+    ) -> None:
+        """互斥优先级：先按 ``mem_`` 前缀 + ULID 判定，只有不匹配时才退而解析
+        成序号——两种形状在语法层面互不相容（ULID 不是纯十进制数字），这里只
+        证明分支顺序不会把一个本该被识别为 id 的合法 id 误判成序号。"""
+
+        valid_id = "mem_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        result = parse_memory_command(f"/memory forget {valid_id}")
+        self.assertEqual(result.memory_id, valid_id)
+        self.assertIsNone(result.memory_serial)
+
+
 class RememberParsingTests(unittest.TestCase):
     def test_term_mapping_recognized(self) -> None:
         result = parse_memory_command("/memory remember term_mapping 大尼日 => 尼日利亚")

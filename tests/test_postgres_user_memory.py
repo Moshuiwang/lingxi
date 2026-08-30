@@ -189,6 +189,30 @@ class ListRememberForgetClearTests(UserMemoryPostgresTestCase):
         self.assertTrue(forgotten)
         self.assertEqual(self.query("SELECT count(*) FROM user_memory")[0][0], 0)
 
+    def test_forget_returns_the_deleted_rows_content(self) -> None:
+        """rc22 B-8-1（#439 TOP-10）：``forget_user_memory`` 从只返回布尔值改为
+        返回被删除那一行的内容（``RETURNING``），供 ``/memory forget`` 回执
+        回显——调用方据此让用户自行核对删的是不是那一条。"""
+
+        memory_id = self.remember(
+            user_id=self.user_a,
+            memory_type="calibration_preference",
+            memory_key="环比口径",
+            memory_value="按自然月环比",
+        )
+
+        with connect(self._dsn) as connection:
+            with connection.transaction():
+                forgotten = _Transaction(connection).forget_user_memory(
+                    user_id=self.user_a, memory_id=memory_id
+                )
+
+        self.assertIsNotNone(forgotten)
+        self.assertEqual(forgotten.memory_id, memory_id)
+        self.assertEqual(forgotten.memory_type, "calibration_preference")
+        self.assertEqual(forgotten.memory_key, "环比口径")
+        self.assertEqual(forgotten.memory_value, "按自然月环比")
+
     def test_forget_an_unknown_id_returns_false_and_touches_nothing(self) -> None:
         self.remember(user_id=self.user_a, memory_key="k", memory_value="v")
 
@@ -198,7 +222,7 @@ class ListRememberForgetClearTests(UserMemoryPostgresTestCase):
                     user_id=self.user_a, memory_id="mem_does_not_exist_000000000"
                 )
 
-        self.assertFalse(forgotten)
+        self.assertIsNone(forgotten)
         self.assertEqual(self.query("SELECT count(*) FROM user_memory")[0][0], 1)
 
     def test_forget_cannot_delete_another_users_memory(self) -> None:
@@ -213,7 +237,7 @@ class ListRememberForgetClearTests(UserMemoryPostgresTestCase):
                     user_id=self.user_b, memory_id=memory_id
                 )
 
-        self.assertFalse(forgotten)
+        self.assertIsNone(forgotten)
         self.assertEqual(
             self.query("SELECT count(*) FROM user_memory WHERE id = %s", (memory_id,))[0][0],
             1,

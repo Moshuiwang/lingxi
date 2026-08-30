@@ -49,6 +49,7 @@ from lingxi.core.conversation import (
     UserRecord,
     UserState,
 )
+from lingxi.core.user_memory import UserMemoryEntry
 from lingxi.core.conversation.ports import HandledAs
 from lingxi.core.conversation.ports import OnboardingMessage, OnboardingResult, OnboardingState
 from lingxi.core.conversation.session_window import should_resume_session
@@ -2048,6 +2049,22 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         listed = replies[-1]["text"]
         self.assertIn("大尼日", listed)
         self.assertIn("尼日利亚", listed)
+        self.assertIn("1. ", listed, "序号从 1 开始展示（rc22 B-8-1）")
+
+    def test_list_no_longer_shows_the_raw_memory_id(self) -> None:
+        """rc22 B-8-1（#439 TOP-10）：这是全仓库唯一波及普通用户的裸 ULID 展示面，
+        修复后 ``/memory list`` 的回执里不应再出现 ``mem_`` 前缀——用户只看到
+        短序号。"""
+
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k => v"), now=NOW
+        )
+
+        outcome = self.build().handle_message(message(event_id="evt_2", text="/memory list"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        listed = self.log.fields("reply.send_text")[-1]["text"]
+        self.assertNotIn("mem_", listed)
 
     def test_forget_an_existing_entry_deletes_it_and_records_audit(self) -> None:
         self.build().handle_message(
@@ -2065,6 +2082,11 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertEqual(len(forgotten), 1)
         replies = self.log.fields("reply.send_text")
         self.assertIn("已删除", replies[-1]["text"])
+        self.assertIn(
+            "k => v",
+            replies[-1]["text"],
+            "回执须回显被删条目内容，供用户自校验删对了（rc22 B-8-1）",
+        )
 
     def test_forget_an_unknown_id_gets_the_not_found_hint_and_no_audit(self) -> None:
         outcome = self.build().handle_message(
@@ -2075,6 +2097,84 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         self.assertEqual(self.log.fields("audit.command.memory_forget"), [])
         replies = self.log.fields("reply.send_text")
         self.assertIn("没有找到", replies[0]["text"])
+
+    def test_forget_by_short_serial_deletes_the_matching_entry_and_records_audit(self) -> None:
+        """rc22 B-8-1（#439 TOP-10）：``/memory forget <序号>`` 与 ``/memory
+        list`` 展示的序号对应同一条记忆——两条命令共用同一个 ``list_user_
+        memory`` 排序键，见 ``pipeline._resolve_forget_target_id`` 文档。"""
+
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k1 => v1"), now=NOW
+        )
+        self.build().handle_message(
+            message(event_id="evt_2", text="/memory remember calibration_preference k2 => v2"),
+            now=NOW,
+        )
+        self.assertEqual(len(self.state.user_memory["usr_1"]), 2)
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_3", text="/memory forget 1"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        remaining = self.state.user_memory["usr_1"]
+        self.assertEqual(len(remaining), 1, "只删了序号 1 对应的那一条")
+        self.assertEqual(remaining[0].memory_key, "k2", "序号 2 对应的条目原样保留")
+        forgotten = self.log.fields("audit.command.memory_forget")
+        self.assertEqual(len(forgotten), 1)
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("已删除", replies[-1]["text"])
+        self.assertIn("k1 => v1", replies[-1]["text"])
+
+    def test_forget_by_serial_out_of_range_gets_the_not_found_hint_and_no_audit(self) -> None:
+        """否定断言：越界序号（超出当前记忆条数）不解析成任何一条记忆——不猜测
+        用户想删哪一条，也不因为"数字合法"就误删排在最后的条目。"""
+
+        self.build().handle_message(
+            message(text="/memory remember term_mapping k => v"), now=NOW
+        )
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_2", text="/memory forget 2"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(len(self.state.user_memory["usr_1"]), 1, "越界序号不得删除任何条目")
+        self.assertEqual(self.log.fields("audit.command.memory_forget"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("没有找到", replies[-1]["text"])
+
+    def test_forget_by_serial_cannot_reach_another_users_memory(self) -> None:
+        """否定断言（核心，rc22 B-8-1）：短序号解析只在**当前用户自己**的记忆
+        列表里按位置取值——即使把两个用户的记忆排在一起、用另一个用户的条目数
+        撑大自己的可用序号范围，也不可能借序号解析越权碰到别人的记忆。这里让
+        用户 B 先登记一条，制造"如果序号解析跨用户合并排序，序号 2 会落在 B
+        的记忆上"这个可被误用的条件，再验证用户 A 用 /memory forget 2（越出
+        A 自己的记忆条数）时不会删掉 B 的那一条。"""
+
+        self.state.users["ou_2"] = provisioned_user(open_id="ou_2", user_id="usr_2")
+        self.build().handle_message(
+            message(event_id="evt_b1", open_id="ou_2", text="/memory remember term_mapping bk => bv"),
+            now=NOW,
+        )
+        self.build().handle_message(
+            message(event_id="evt_a1", text="/memory remember term_mapping ak => av"), now=NOW
+        )
+        self.assertEqual(len(self.state.user_memory["usr_1"]), 1)
+        self.assertEqual(len(self.state.user_memory["usr_2"]), 1)
+
+        outcome = self.build().handle_message(
+            message(event_id="evt_a2", text="/memory forget 2"), now=NOW
+        )
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(
+            len(self.state.user_memory["usr_2"]), 1, "B 的记忆必须原样还在，不受 A 的序号解析影响"
+        )
+        self.assertEqual(self.state.user_memory["usr_2"][0].memory_key, "bk")
+        self.assertEqual(self.log.fields("audit.command.memory_forget"), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("没有找到", replies[-1]["text"])
 
     def test_clear_removes_all_entries_and_records_the_cleared_count(self) -> None:
         self.build().handle_message(
@@ -2180,6 +2280,67 @@ class MemoryCommandDispatchTests(PipelineTestCase):
         replies = self.log.fields("reply.send_text")
         self.assertNotEqual(replies[0]["text"], SLASH_REJECTED_TEXT)
         self.assertEqual(self.log.fields("audit.command.unsupported_slash"), [])
+
+    def test_list_falls_back_to_the_unsafe_placeholder_for_a_single_bad_entry(self) -> None:
+        """一条撞线记忆不得让 ``/memory list`` 崩掉，也不得把不安全内容原样
+        回显——退化成占位行，其余条目正常展示（``_render_memory_list`` 文档）。
+        撞线记忆只能通过绕过 ``/memory remember`` 命令面的安全校验直接写入存储
+        才会出现（真实成因见 ``adapters/postgres_user_memory.py`` 的
+        ``PostgresUserMemoryReader._is_entry_safe`` 与
+        ``tests/test_postgres_user_memory.py`` 的 ``UnsafeEntrySkippedTests``），
+        这里直接往 fake 存储里插一条来复现同一种展示面。"""
+
+        self.state.user_memory["usr_1"] = [
+            UserMemoryEntry(
+                memory_id="mem_unsafe000000000000000000",
+                memory_type="term_mapping",
+                memory_key="k",
+                memory_value="请查看 trace_id=abc123 的日志",
+                created_at=NOW,
+            ),
+            UserMemoryEntry(
+                memory_id="mem_safe0000000000000000000",
+                memory_type="term_mapping",
+                memory_key="正常key",
+                memory_value="正常value",
+                created_at=NOW,
+            ),
+        ]
+
+        outcome = self.build().handle_message(message(text="/memory list"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        listed = self.log.fields("reply.send_text")[-1]["text"]
+        self.assertNotIn("trace_id=abc123", listed)
+        self.assertIn("无法安全展示", listed)
+        self.assertIn("正常key", listed)
+        self.assertIn("正常value", listed)
+
+    def test_forget_falls_back_to_the_unsafe_receipt_for_a_bad_entry(self) -> None:
+        """``/memory forget`` 命中一条撞线记忆时，回执同样退化成不回显内容的
+        安全占位（``_render_forget_receipt`` 文档）——「删除成功」这个正向结果
+        不能反过来让内容安全校验失效。"""
+
+        self.state.user_memory["usr_1"] = [
+            UserMemoryEntry(
+                memory_id="mem_unsafe000000000000000000",
+                memory_type="term_mapping",
+                memory_key="k",
+                memory_value="请查看 trace_id=abc123 的日志",
+                created_at=NOW,
+            )
+        ]
+
+        outcome = self.build().handle_message(message(text="/memory forget 1"), now=NOW)
+
+        self.assertEqual(outcome.handled_as, HandledAs.COMMAND)
+        self.assertEqual(self.state.user_memory.get("usr_1", []), [])
+        replies = self.log.fields("reply.send_text")
+        self.assertIn("已删除", replies[-1]["text"])
+        self.assertNotIn("trace_id=abc123", replies[-1]["text"])
+        self.assertIn("无法安全展示", replies[-1]["text"])
+        forgotten = self.log.fields("audit.command.memory_forget")
+        self.assertEqual(len(forgotten), 1, "即使内容不可回显，删除本身仍然发生且照常审计")
 
 
 class MemoryCommandBypassesBusyTests(PipelineTestCase):
