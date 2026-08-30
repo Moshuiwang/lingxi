@@ -71,6 +71,16 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "worker.action.querying_query_metric",
     "worker.action.composing",
     "worker.action.working",
+    # 历史行完成时措辞（Trace #469 S-1 TOP-9）：进度卡累积列表里，除最后一行
+    # （当前正在发生的步骤）外全部改用这组"已..."完成时措辞。
+    "worker.action.processing_done",
+    "worker.action.querying_metrics_done",
+    "worker.action.querying_list_metrics_done",
+    "worker.action.querying_describe_metric_done",
+    "worker.action.querying_search_dimension_done",
+    "worker.action.querying_query_metric_done",
+    "worker.action.composing_done",
+    "worker.action.working_done",
     "worker.card_handoff_notice",
     "worker.status",
     "worker.status_stalled",

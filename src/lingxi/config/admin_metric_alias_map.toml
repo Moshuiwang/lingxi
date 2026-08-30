@@ -13,12 +13,14 @@
 # 维护，互相校验会让改一个文件牵连另一个文件的解析（与 metric_translation.py 对
 # galaxy_role_function_map.toml 的既有取舍一致）。
 #
-# ── 当前状态：本文件是空的（载体先行，内容后填，与 company_function_metric_map.toml
-#    当年交付时的先例同一姿态）─────────────────────────────────────────────
-# 每个指标 ID 对应的中文别名需要产品负责人依据实际业务口径确定（例如
-# "sub_new_count" 对应"新增用户数"还是"新增订阅数"，需要业务侧确认，不能由实现
-# 代理猜测或从 ID 拼写反推——那是把模型推测当作产品决定）。本卡只交付查找机制；
-# 别名内容留待产品负责人后续补充。
+# ── 当前状态：内容已由产品负责人填入（2026-08-30，Trace #469 S-1 PM 补充裁定）──
+# 下面九条别名与真实指标 ID 的对应关系由产品负责人逐条裁定给出，编排者机械落盘，
+# 不做任何猜测或反推。同一份映射同时供 core/admin/router.py 的
+# ``AdminQueries.resolve_metric_name``（输入侧：文本命令允许直接打中文别名）与
+# ``core/admin/display_names.AdminDisplayNames.metric_label`` 的真实实现（展示
+# 侧：管理卡下拉选项、确认卡/终态卡/群通知的「指标」字段一律显示这份别名，不
+# 再显示 "sub_new_count" 这类内部 snake_case ID）反查使用——见两个模块各自的
+# 文档。
 #
 # ── 生效时机 ─────────────────────────────────────────────────────────
 # 与 galaxy_role_function_map.toml/company_function_metric_map.toml（scheduler 进程
@@ -30,8 +32,14 @@
 # ── 形状 ─────────────────────────────────────────────────────────────
 # [aliases]
 # "别名文本" = "真实指标ID"
-#
-# 示例（未生效，仅示范形状，产品负责人确认口径前不要取消注释）：
-# # "新增用户数" = "sub_new_count"
 
 [aliases]
+"新增订户数" = "sub_new_count"
+"充值订户数" = "sub_recharge_count"
+"充值金额" = "sub_recharge_money"
+"扣费订户数" = "sub_deduction_count"
+"扣费金额" = "sub_deduction_money"
+"渠道市场份额" = "channel_market_sharing"
+"渠道费率" = "channel_rate"
+"汇率" = "exchange_rate"
+"增值税率" = "vat_rate"

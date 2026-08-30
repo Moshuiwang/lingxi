@@ -308,6 +308,65 @@ class PostgresAdminQueries:
         aliases = load_admin_metric_alias_map()
         return aliases.get(metric_token, metric_token)
 
+    def user_label(self, *, open_id: str) -> str:
+        """``core.admin.display_names.AdminDisplayNames.user_label`` 真实实现
+        （Trace #469 S-1）：把 open_id 翻译成「姓名（邮箱）」。``app_user.
+        display_name`` 是建档时从飞书通讯录读到的官方姓名，不是花名册/银河
+        导入的姓名列（数据库设计「姓名列只能用于内部诊断」约束的是后者，本方法
+        不涉及）。查无此用户，或姓名邮箱均为空，返回通用占位——绝不把入参
+        ``open_id`` 原样拼进返回值（合同"管理员可见文案零 ou_"）。"""
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT display_name, email FROM app_user WHERE feishu_open_id = %s",
+                (open_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return "该用户"
+        display_name = (row[0] or "").strip()
+        email = (row[1] or "").strip()
+        if display_name and email:
+            return f"{display_name}（{email}）"
+        return display_name or email or "该用户"
+
+    def company_label(self, *, company_id: str) -> str:
+        """``AdminDisplayNames.company_label`` 真实实现：按**当前有效银河批次**
+        查 ``galaxy_country.name_cn``（``boss_company_id`` 连接，与
+        ``core/permission/galaxy_scope.py`` 同一连接键取舍）。没有有效批次，或
+        查无中文名，原样返回 ``company_id``——公司编号是业务代码，不是需要隐藏
+        的内部系统标识，允许兜底展示。"""
+
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return company_id
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT name_cn FROM galaxy_country WHERE batch_id = %s AND boss_company_id = %s LIMIT 1",
+                (batch_id, company_id),
+            )
+            row = cursor.fetchone()
+        name_cn = (row[0] or "").strip() if row is not None else ""
+        return f"{name_cn}（{company_id}）" if name_cn else company_id
+
+    def metric_label(self, *, metric_id: str) -> str:
+        """``AdminDisplayNames.metric_label`` 真实实现：反查
+        ``config/admin_metric_alias_map.toml``（别名 → 真实指标 ID）得到中文
+        别名。与 :meth:`resolve_metric_name`（输入侧，中文别名 → 真实 ID）同一
+        份文件、方向相反——每次调用现读，不缓存，同一姿态（该文件模块文档）。
+        多个别名映射到同一个真实 ID 时任取一个（配置写入方职责，非本方法关注
+        的正确性问题）；查无别名原样返回 ``metric_id``。"""
+
+        from lingxi.adapters.admin_metric_alias_map_file import load_admin_metric_alias_map
+
+        aliases = load_admin_metric_alias_map()
+        for alias, real_id in aliases.items():
+            if real_id == metric_id:
+                return alias
+        return metric_id
+
     def resolve_override_id(
         self, *, open_id: str, company_id: str, metric_name: str
     ) -> str | None:

@@ -330,6 +330,10 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
         变异存活证据：把 ``DeliveryConsumer._prior_progress_history`` 改成恒
         返回 ``()``（不重建历史），本用例的第二次断言会变红——第二轮的正文
         会只剩第二行，缺掉第一轮已经展示过的第一行。
+
+        Trace #469 S-1 TOP-9：第三轮追加第二行之后，第一行不再是"当前正在
+        发生的步骤"，改用完成时措辞展示（"已完成第 1 次查询..."），只有
+        当前追加的最后一行继续用"正在..."现在时措辞。
         """
 
         from lingxi.core.execution.card_stream import (
@@ -372,8 +376,9 @@ class HappyPathCardDeliveryTests(DeliveryConsumerTestCase):
 
         self.assertEqual(
             second_round_body,
-            "正在第 1 次查询可用指标列表 · 5 秒\n正在整理与生成回答 · 9 秒",
-            "第三轮（全新的 CardStream 实例）必须找回第二轮已经追加过的第一行",
+            "已完成第 1 次查询可用指标列表 · 5 秒\n正在整理与生成回答 · 9 秒",
+            "第三轮（全新的 CardStream 实例）必须找回第二轮已经追加过的第一行"
+            "（翻篇后改用完成时措辞）",
         )
 
     def test_a_second_round_with_no_new_events_does_not_repeat_delivery(self) -> None:

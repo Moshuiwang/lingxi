@@ -236,7 +236,46 @@ class PostgresGalaxySnapshotReader:
         return snapshot
 
 
+class PostgresCompanyNames:
+    """``core.permission.notification.CompanyNameResolver`` 的真实实现（结构性
+    实现，不继承）：按当前有效银河批次查 ``galaxy_country.name_cn``（Trace
+    #469 S-1 TOP-8）。
+
+    与 ``adapters/admin_registry.PostgresAdminQueries.company_label`` 是同一份
+    查询姿势（当前批次 + ``boss_company_id`` 精确匹配），**独立各自维护，不
+    共享实现**——两处调用面不同（一处是管理员命令面展示，一处是普通用户权限
+    变化通知），与本仓库既有的"各自独立声明接口"惯例一致。只查
+    ``galaxy_country`` 一张表，不用 :meth:`PostgresGalaxySnapshotReader.
+    load_current`——那个方法额外读 ``galaxy_user``/``galaxy_user_role``/
+    ``galaxy_user_datacountry`` 三张表，本类每次调用只需要一次"给定编号查
+    中文名"的轻量读取，没有理由为此多付三张表的读取成本（``PermissionPublishDuty``
+    是高频 tick，代价差异会被放大）。
+    """
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    def name_for(self, *, company_id: str) -> str | None:
+        from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
+
+        batch_id = PostgresGalaxyImportStore(self._dsn, timeouts=self._timeouts).current_batch_id()
+        if batch_id is None:
+            return None
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT name_cn FROM galaxy_country WHERE batch_id = %s AND boss_company_id = %s LIMIT 1",
+                (batch_id, company_id),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        name_cn = (row[0] or "").strip()
+        return name_cn or None
+
+
 __all__ = [
     "GalaxyPermissionSnapshot",
+    "PostgresCompanyNames",
     "PostgresGalaxySnapshotReader",
 ]

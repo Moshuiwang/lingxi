@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-3"
+version = "2026-08-30-4"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -85,6 +85,23 @@ version = "2026-08-30-3"
 "worker.action.querying_query_metric" = "正在第 {count} 次查询指标数据"
 "worker.action.composing" = "正在整理与生成回答"
 "worker.action.working" = "正在处理其它步骤"
+# 历史行完成时措辞（Trace #469 S-1 TOP-9，PM 确认纳入本批）：进度卡正文是
+# 按时间顺序追加的多行列表（core/execution/card_stream.py 的
+# `_accumulated_status_card`），此前每一行都固定用上面这组"正在..."现在时
+# 措辞——一旦追加了新的一行，前面那些本该是"已经发生过的步骤"，却仍然停在
+# "正在发生"，读起来自相矛盾（例如卡片同时显示"正在查询指标数据"和"正在
+# 整理与生成回答"两行）。这里给每一句补一个"已..."完成时变体，只用于渲染
+# 除最后一行之外的历史行，最后一行（当前正在发生的步骤）继续用上面的现在时
+# 措辞，两者从不混用在同一行。文案为实施草案，产品负责人过目前不作为最终
+# 定稿。
+"worker.action.processing_done" = "已处理"
+"worker.action.querying_metrics_done" = "已完成第 {count} 次查询指标数据"
+"worker.action.querying_list_metrics_done" = "已完成第 {count} 次查询可用指标列表"
+"worker.action.querying_describe_metric_done" = "已完成第 {count} 次查询指标说明"
+"worker.action.querying_search_dimension_done" = "已完成第 {count} 次查询维度信息"
+"worker.action.querying_query_metric_done" = "已完成第 {count} 次查询指标数据"
+"worker.action.composing_done" = "已整理与生成回答"
+"worker.action.working_done" = "已处理其它步骤"
 # G-CARD 10 分钟自动关闭提前收口（Issue #407，见 core/execution/card_stream.py
 # 的 CARD_AUTO_CLOSE_HANDOFF_SECONDS）：接近平台自动关闭阈值时的最后一帧卡片
 # 提示，之后改由文字消息发送最终结果。
@@ -216,5 +233,10 @@ button_labels = []
 
 [cards."query.empty"]
 title = "查询完成"
-body = "本次未取得可用结果。"
+# Trace #469 S-1 TOP-9（PM 确认纳入本批）：此前 `core/execution/card_stream.py::
+# finish()` 会先拼一行"已完成 · N 秒"，再换行拼这条卡片固定的"本次未取得可用
+# 结果。"——两行紧挨着读像自相矛盾（"已完成"暗示成功，紧接着又说"没有结果"）。
+# 合并成一句连贯的话，"已完成"这个事实与"没有可用结果"这个结论同一句话说完，
+# 不再分两行陈述。
+body = "已完成 · {elapsed_seconds} 秒，本次未取得可用结果。"
 button_labels = []

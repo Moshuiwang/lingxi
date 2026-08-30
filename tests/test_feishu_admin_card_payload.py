@@ -17,6 +17,10 @@
 ``card.action.trigger`` 回调应答需要复用同一份终态卡 JSON 构造（见
 ``core/admin/card_callback.py`` 模块文档「载体 #96」），而应答的构造方按代码框架
 第二节不得 import ``adapters/``。本文件的断言随函数一起搬家，内容未变。
+
+**Trace #469 S-1（W0-1 探针裁定）起，两个按钮横排进 ``column_set``**：不再是
+``body.elements`` 的两个裸顶层元素，见 ``core/admin/card_layout.button_row``。
+本文件下方按钮相关断言改用 :func:`_find_buttons` 递归查找。
 """
 
 from __future__ import annotations
@@ -28,6 +32,18 @@ from lingxi.core.admin.notification import (
     RenderedConfirmCard,
     render_card_payload,
 )
+
+
+def _find_buttons(elements: list[dict]) -> list[dict]:
+    found: list[dict] = []
+    for element in elements:
+        tag = element.get("tag")
+        if tag == "button":
+            found.append(element)
+        elif tag == "column_set":
+            for column in element.get("columns", ()):
+                found.extend(_find_buttons(column.get("elements", ())))
+    return found
 
 
 def _card_with_buttons() -> RenderedConfirmCard:
@@ -73,14 +89,30 @@ class CardPayloadShapeTests(unittest.TestCase):
         tags = [element["tag"] for element in payload["body"]["elements"]]
         self.assertNotIn("action", tags)
 
-    def test_buttons_are_top_level_elements_with_bound_callback_values(self) -> None:
+    def test_buttons_are_horizontally_laid_out_in_a_column_set_with_bound_callback_values(
+        self,
+    ) -> None:
+        """按钮横排（Trace #469 S-1，W0-1 探针裁定：确认卡按钮点击频率高于
+        管理卡，同批一起改）：两个按钮横排进一个显式声明 ``flex_mode`` 的
+        ``column_set``，不再是两个裸顶层元素。"""
+
         payload = render_card_payload(_card_with_buttons())
         elements = payload["body"]["elements"]
-        button_elements = [element for element in elements if element["tag"] == "button"]
-        # button_elements 直接来自 elements 的顶层过滤（不是从某个容器元素的
-        # 子字段里取出来的）——这本身就断言了按钮是顶层元素，不嵌在任何容器里。
+        column_sets = [element for element in elements if element["tag"] == "column_set"]
+        self.assertEqual(len(column_sets), 1)
+        column_set = column_sets[0]
+        self.assertEqual(column_set["flex_mode"], "bisect")
+        self.assertEqual(len(column_set["columns"]), 2)
+        for column in column_set["columns"]:
+            self.assertEqual(column["tag"], "column")
+            self.assertEqual(column["width"], "auto")
+
+        button_elements = _find_buttons(elements)
         self.assertEqual(len(button_elements), 2)
+        # 这两个按钮不在 form 容器内，飞书官方错误码 200530 不约束它们，因此
+        # 不需要（也没有）name 字段。
         for button in button_elements:
+            self.assertNotIn("name", button)
             self.assertIn("text", button)
             behaviors = button["behaviors"]
             self.assertEqual(len(behaviors), 1)
@@ -91,9 +123,7 @@ class CardPayloadShapeTests(unittest.TestCase):
 
     def test_confirm_button_is_primary_type_and_cancel_is_default(self) -> None:
         payload = render_card_payload(_card_with_buttons())
-        button_elements = [
-            element for element in payload["body"]["elements"] if element["tag"] == "button"
-        ]
+        button_elements = _find_buttons(payload["body"]["elements"])
         by_decision = {
             button["behaviors"][0]["value"]["decision"]: button for button in button_elements
         }
@@ -101,12 +131,14 @@ class CardPayloadShapeTests(unittest.TestCase):
         self.assertEqual(by_decision["cancel"]["type"], "default")
 
     def test_terminal_card_has_no_button_elements(self) -> None:
-        """终态卡片结构上不存在任何可点击按钮，不是靠禁用态表达"不能再点了"。"""
+        """终态卡片结构上不存在任何可点击按钮，也没有 column_set 容器，不是
+        靠禁用态表达"不能再点了"。"""
 
         payload = render_card_payload(_terminal_card())
         tags = [element["tag"] for element in payload["body"]["elements"]]
         self.assertNotIn("action", tags)
         self.assertNotIn("button", tags)
+        self.assertNotIn("column_set", tags)
         self.assertEqual(tags, ["markdown"])
 
 

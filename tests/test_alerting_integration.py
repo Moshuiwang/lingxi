@@ -479,7 +479,10 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
         duty.dispatcher.run_once(at=clock.value)
 
         self.assertEqual(len(sender.calls), 1)
-        self.assertIn("dispatch_uncertain_card_finish.feishu_send_failed", sender.calls[0]["text"])
+        # Trace #469 S-1 TOP-2：分行中文标签范式，event_type 的"scope.kind"
+        # 组合键拆成"范围"（scope 原样）与"类型"（kind 的中文标签）两行。
+        self.assertIn("范围：dispatch_uncertain_card_finish", sender.calls[0]["text"])
+        self.assertIn("类型：飞书发送失败", sender.calls[0]["text"])
 
     def test_kind_strings_are_sanitized_into_a_safe_scope(self) -> None:
         """真实 kind 字符串带冒号与大写字母（如 ``fallback_send_failed:
@@ -518,7 +521,7 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
         duty.dispatcher.run_once(at=clock.value)
 
         self.assertEqual(len(sender.calls), 1, "trace_id 格式异常不得让整条告警消失")
-        self.assertIn("trace_id=-", sender.calls[0]["text"])
+        self.assertIn("追溯号：-", sender.calls[0]["text"])
 
     def test_different_delivery_kinds_do_not_share_a_dedupe_window(self) -> None:
         sender = FakeAlertSender()
@@ -659,7 +662,7 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
                     1,
                     "投递循环停摆必须在第一次上报时就发出告警，不能等攒够阈值",
                 )
-                self.assertIn("trace_id=gateway-delivery-loop", sender.calls[0]["text"])
+                self.assertIn("追溯号：gateway-delivery-loop", sender.calls[0]["text"])
 
     def test_document_delivery_terminal_kinds_alert_immediately_under_production_defaults(
         self,
@@ -697,7 +700,7 @@ class DeliveryAlertCallbackTests(unittest.TestCase):
                     1,
                     "文档交付终态告警必须在第一次上报时就发出，不能等攒够阈值",
                 )
-                self.assertIn("trace_id=01J00000000000000000000TASK", sender.calls[0]["text"])
+                self.assertIn("追溯号：01J00000000000000000000TASK", sender.calls[0]["text"])
 
 
 class OnboardingFailedAlertCallbackTests(unittest.TestCase):
@@ -718,8 +721,9 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
         duty.dispatcher.run_once(at=clock.value)
 
         self.assertEqual(len(sender.calls), 1)
-        self.assertIn("publish_not_completed.onboarding_failed", sender.calls[0]["text"])
-        self.assertIn("trace_id=01J00000000000000000000TRC1", sender.calls[0]["text"])
+        self.assertIn("范围：publish_not_completed", sender.calls[0]["text"])
+        self.assertIn("类型：用户开通失败", sender.calls[0]["text"])
+        self.assertIn("追溯号：01J00000000000000000000TRC1", sender.calls[0]["text"])
 
     def test_the_alert_text_never_contains_open_id_or_profile_values(self) -> None:
         """否定断言：群消息只含故障类别 + 计数 + 追溯号——回调签名里根本没有传
@@ -776,7 +780,7 @@ class OnboardingFailedAlertCallbackTests(unittest.TestCase):
         duty.dispatcher.run_once(at=clock.value)
 
         self.assertEqual(len(sender.calls), 1, "trace_id 格式异常不得让整条告警消失")
-        self.assertIn("trace_id=-", sender.calls[0]["text"])
+        self.assertIn("追溯号：-", sender.calls[0]["text"])
 
 
 class OnboardingStalledAlertCallbackTests(unittest.TestCase):
@@ -797,8 +801,9 @@ class OnboardingStalledAlertCallbackTests(unittest.TestCase):
         duty.dispatcher.run_once(at=clock.value)
 
         self.assertEqual(len(sender.calls), 1)
-        self.assertIn("stalled_provisioning.onboarding_failed", sender.calls[0]["text"])
-        self.assertIn("count=3", sender.calls[0]["text"])
+        self.assertIn("范围：stalled_provisioning", sender.calls[0]["text"])
+        self.assertIn("类型：用户开通失败", sender.calls[0]["text"])
+        self.assertIn("次数：3", sender.calls[0]["text"])
 
     def test_a_zero_count_never_produces_an_alert(self) -> None:
         """否定断言：零计数不该报警——「有人卡住了」这句话必须是真的。"""

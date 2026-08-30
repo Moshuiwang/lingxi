@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.admin_registry import seed_admin_registry_entry
+from lingxi.adapters.admin_registry import PostgresAdminQueries, seed_admin_registry_entry
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
@@ -93,6 +93,9 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             group_notifier=None,
             group_chat_id=None,
             audit=self.audit,
+            # PostgresAdminQueries 结构性实现 AdminDisplayNames（Trace #469
+            # S-1），与真实 apps/gateway/__init__.py 装配同一姿态。
+            display_names=PostgresAdminQueries(self._dsn),
             recompute_trigger=PermissionRecomputeAdapter(self._dsn, audit=self.audit),
         )
 
@@ -194,9 +197,13 @@ class SuspendTriggersInstantRevokeTests(PermissionRecomputeTriggerPostgresTestCa
             trace_id="trc_suspend_1",
         )
 
-        # 回调应答本身：确认成功，回执带"即时生效"信息（Issue #438 回执文案要求）。
+        # 回调应答本身：确认成功。Trace #469 S-1 TOP-3 接线修复后，toast 用这次
+        # 点击的 decide_confirm 友好消息（"已确认执行。"），"即时生效"这句持久化
+        # 措辞改为在终态卡片正文里核对（见 core/admin/card_callback.py
+        # handle() 的对应注释）。
         self.assertEqual(outcome["toast"]["type"], "success")
-        self.assertIn("即时生效", outcome["toast"]["content"])
+        self.assertEqual(outcome["toast"]["content"], "已确认执行。")
+        self.assertIn("即时生效", outcome["card"]["data"]["body"]["elements"][0]["content"])
 
         # 账号状态：既有行为不变（本卡不改动这一层）。
         account_state = self.query(
@@ -318,9 +325,12 @@ class LocalPermissionGrantResolvesTheOwningUserIdTests(PermissionRecomputeTrigge
             trace_id="trc_grant_1",
         )
 
-        # 确认执行本身必须成功——回执带"即时生效"（Issue #438 回执文案要求）。
+        # 确认执行本身必须成功。Trace #469 S-1 TOP-3 接线修复后，toast 用这次
+        # 点击的 decide_confirm 友好消息，"即时生效"这句持久化措辞改为在终态
+        # 卡片正文里核对（同上一处注释）。
         self.assertEqual(outcome["toast"]["type"], "success")
-        self.assertIn("即时生效", outcome["toast"]["content"])
+        self.assertEqual(outcome["toast"]["content"], "已确认执行。")
+        self.assertIn("即时生效", outcome["card"]["data"]["body"]["elements"][0]["content"])
 
         # 真实反查依赖的形状：confirm() 新插入的这一行，pending_action_id 恰好
         # 是这次确认卡自己的 id，user_id 是目标用户的内部标识，两者与 override_id

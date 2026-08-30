@@ -192,6 +192,31 @@ class AlertSignal:
             raise ValueError("只有飞书发送失败事件可以标记为 final")
 
 
+#: 八类系统告警 → 中文标签（Trace #469 S-1 TOP-2）：此前群消息是一行英文
+#: key=value（``action=alert event=worker.queued_stuck time=... count=...
+#: trace_id=...``），运维之外的管理员读不懂哪个英文键对应什么故障；照抄
+#: ``scripts/ops/host_health_alert.py::render_message`` 的分行中文标签范式
+#: （见该脚本模块文档"防骚扰与恢复通知"一节的姊妹渲染函数），标题带
+#: ``[BI Plus 运行告警]`` 前缀 + 告警/恢复动作，正文按"类型/范围/次数/时间/
+#: 追溯号"五个中文标签分行——与宿主监控脚本的"容器/状态/主机/时间"四行同一
+#: 视觉范式，不是碰巧长得像。
+_ALERT_KIND_LABEL: dict[AlertKind, str] = {
+    AlertKind.PROCESS_INACTIVE: "进程无心跳",
+    AlertKind.QUEUED_STUCK: "任务排队超时未领取",
+    AlertKind.RUNNING_HEARTBEAT_TIMEOUT: "任务执行中心跳超时",
+    AlertKind.RETRY_EXHAUSTED: "任务重试次数耗尽",
+    AlertKind.AWAITING_DELIVERY_STUCK: "投递确认超时未收到",
+    AlertKind.WORKER_VERSION_UNAVAILABLE: "目标执行版本不可用",
+    AlertKind.FEISHU_SEND_FAILED: "飞书发送失败",
+    AlertKind.ONBOARDING_FAILED: "用户开通失败",
+}
+
+_NOTICE_ACTION_LABEL: dict[NoticeAction, str] = {
+    NoticeAction.ALERT: "告警",
+    NoticeAction.RECOVERY: "恢复",
+}
+
+
 @dataclass(frozen=True)
 class AlertNotice:
     """可交给出站适配器的安全、纯文本告警。"""
@@ -210,12 +235,25 @@ class AlertNotice:
 
     @property
     def text(self) -> str:
-        """只渲染类型、时间、数量和 trace_id，不接收业务正文。"""
+        """只渲染类型、范围、时间、数量和 trace_id，不接收业务正文——分行中文
+        标签范式（Trace #469 S-1 TOP-2），照抄
+        ``scripts/ops/host_health_alert.py::render_message`` 的姊妹渲染函数。
+        ``event_type`` 这个"scope.kind"组合键仍然通过 :attr:`event_type` 属性
+        对外（供审计记录/告警去重使用），只是不再原样拼进人类可读正文——正文
+        改成"类型"（中文标签）与"范围"两个独立标签，可读性更好，且信息量
+        不减（组合键仍能从这两行反推）。
+        """
 
+        action_label = _NOTICE_ACTION_LABEL[self.action]
+        kind_label = _ALERT_KIND_LABEL.get(self.kind, self.kind.value)
         trace = self.trace_id or "-"
         return (
-            f"BI Plus 运行告警 action={self.action.value} event={self.event_type} "
-            f"time={self.observed_at.isoformat()} count={self.count} trace_id={trace}"
+            f"[BI Plus 运行告警] {action_label}\n"
+            f"类型：{kind_label}\n"
+            f"范围：{self.scope}\n"
+            f"次数：{self.count}\n"
+            f"时间：{self.observed_at.isoformat()}\n"
+            f"追溯号：{trace}"
         )
 
 

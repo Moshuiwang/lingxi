@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-30-3"
-digest = "sha256:34fe15c55876216e333bf87c6b2f35fec25f90645c0f46e9de5d488fe6ef71ed"
+version = "2026-08-30-4"
+digest = "sha256:1626a8ec2a2359870e8b655a5159820d337f5cc17fa8fd62417417d7ee732612"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -28,11 +28,12 @@ retired_versions = [
   "2026-08-29-1",
   "2026-08-30-1",
   "2026-08-30-2",
+  "2026-08-30-3",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
 [keys]
-"cards.query.empty.body" = "e799c23e7c6c94a0"
+"cards.query.empty.body" = "b3cf697a38b609f5"
 "cards.query.empty.title" = "463b2262ebe14a9f"
 "cards.query.failure.body" = "9273d00cc73897fe"
 "cards.query.failure.title" = "61f9bd1ac5624140"
@@ -118,13 +119,21 @@ retired_versions = [
 "texts.roster.value_absent" = "74e9907bf9a62de2"
 "texts.worker.action.completed" = "f28461bb49c85647"
 "texts.worker.action.composing" = "d721250554c3e20b"
+"texts.worker.action.composing_done" = "8b346b85cebf7dd7"
 "texts.worker.action.processing" = "3b7e27cb4379da3c"
+"texts.worker.action.processing_done" = "59f6c836929344e5"
 "texts.worker.action.querying_describe_metric" = "066818d6f9cc2839"
+"texts.worker.action.querying_describe_metric_done" = "15a3edc3ea3590fc"
 "texts.worker.action.querying_list_metrics" = "0482a62d7a042185"
+"texts.worker.action.querying_list_metrics_done" = "2046fb8eacdc8c1d"
 "texts.worker.action.querying_metrics" = "71f01435c81ae105"
+"texts.worker.action.querying_metrics_done" = "da8b26cf4d2c65a7"
 "texts.worker.action.querying_query_metric" = "71f01435c81ae105"
+"texts.worker.action.querying_query_metric_done" = "da8b26cf4d2c65a7"
 "texts.worker.action.querying_search_dimension" = "87b8b522d0a66b0d"
+"texts.worker.action.querying_search_dimension_done" = "b3f87e8fa8b6867d"
 "texts.worker.action.working" = "7306c419b0fb0d14"
+"texts.worker.action.working_done" = "ce61f50590320c2a"
 "texts.worker.card_handoff_notice" = "f926d145f0f18496"
 "texts.worker.context_too_long" = "33805373cca13b15"
 "texts.worker.failed" = "51f1df400deab9d0"
