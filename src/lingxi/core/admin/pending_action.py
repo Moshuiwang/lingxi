@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from lingxi.core.admin.registry import AdminRegistryEntry, AdminRole, is_authorized_admin
@@ -269,10 +269,20 @@ def format_in_flight_conflict_message(*, blocking: PendingAction) -> str:
 
     纯函数、不做任何 I/O 或时钟读取——``blocking`` 的两个时间戳都是调用方已经
     从数据库读到的既有字段，不重新取 ``now()``。
+
+    **先归一到 UTC，再加 8 小时展示**（opus 审查坐实并修复：与
+    ``core/daily_report.py`` 既有先例 ``utc_start = window_start.astimezone(
+    timezone.utc)`` 同一姿态）——本方法此前直接在 ``blocking`` 的两个字段上加
+    ``_DISPLAY_TIMEZONE_OFFSET``，如果这两个字段本身已经是非 UTC 的 aware
+    ``datetime``（例如已经是 ``+08:00`` 的墙钟值），会把它在墙钟层面再加一次
+    8 小时，读者看到的是一个被二次偏移过的错误时刻。数据库列当前恒为 UTC，
+    这条修复此刻不改变任何真实用户可见的输出，但不应该让"当前恒为 UTC"这个
+    调用方事实由本函数自己悄悄假设——``astimezone()`` 对已经是 UTC 的输入是
+    恒等操作，加这一步没有代价。
     """
 
-    started = blocking.created_at + _DISPLAY_TIMEZONE_OFFSET
-    deadline = blocking.confirm_deadline_at + _DISPLAY_TIMEZONE_OFFSET
+    started = blocking.created_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
+    deadline = blocking.confirm_deadline_at.astimezone(timezone.utc) + _DISPLAY_TIMEZONE_OFFSET
     action_name = _ACTION_TYPE_DISPLAY_NAME[blocking.action_type]
     return (
         "该用户当前已有一条待确认操作在途："

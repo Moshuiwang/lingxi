@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -685,6 +686,34 @@ class FormatInFlightConflictMessageTests(unittest.TestCase):
         self.assertIn("自动释放", message, "须告知已过期的旧操作会在下次发起时自动释放")
         self.assertIn("确认执行", message, "须告知未过期时可以在原卡片上如何自助处理")
         self.assertIn("取消", message)
+
+    def test_a_non_utc_aware_timestamp_is_not_double_offset(self) -> None:
+        """opus 审查坐实并修复：修复前直接在 ``blocking`` 的时间戳上加 8 小时
+        ——如果这两个字段已经是非 UTC 的 aware ``datetime``（例如已经是
+        ``+08:00`` 的墙钟值），会被二次偏移。这里构造一个已经是北京时间 20:00
+        的 ``+08:00`` 输入：正确展示应该原样是 20:00（``astimezone(UTC)`` 先
+        换算成 UTC 12:00，再加 8 小时展示，绕回同一个墙钟值）；修复前的错误
+        实现会直接在墙钟值 20:00 上再加 8 小时，显示成次日 04:00。"""
+
+        beijing_tzinfo = timezone(timedelta(hours=8))
+        already_beijing_time = datetime(2026, 8, 24, 20, 0, 0, tzinfo=beijing_tzinfo)
+        pending = dataclasses.replace(
+            _pending(),
+            created_at=already_beijing_time,
+            confirm_deadline_at=already_beijing_time + timedelta(minutes=10),
+        )
+
+        message = format_in_flight_conflict_message(blocking=pending)
+
+        self.assertIn(
+            "2026-08-24 20:00", message, "已经是北京时间的输入展示时不该再偏移"
+        )
+        self.assertIn("2026-08-24 20:10", message)
+        self.assertNotIn(
+            "2026-08-25 04:00",
+            message,
+            "复现修复前的缺陷：+08:00 输入被二次偏移显示成次日 04:00",
+        )
 
     def test_is_a_pure_function_not_reading_the_clock(self) -> None:
         """两次调用同一个不可变 ``PendingAction`` 必须返回逐字节相同的文案——
