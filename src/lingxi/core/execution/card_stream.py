@@ -879,13 +879,30 @@ class CardStream:
                 text_key = _QUERY_STEP_ACTION_TEXT_KEYS.get(query_step, "worker.action.querying_metrics")
             action_text = self._catalog.text(text_key, count=query_count).text
         elif action == PROGRESS_ACTION_COMPOSING:
-            key = "worker.action.composing_done" if completed else "worker.action.composing"
+            # 完成时措辞改走 _ACTION_DONE_TEXT_KEYS（B-4，Trace #469 修复包
+            # B）——此前这里内联拼接 "..._done"，与上面查询类分支已经在用的
+            # _QUERY_STEP_ACTION_TEXT_KEYS_DONE 查表姿态不一致，也让
+            # _ACTION_DONE_TEXT_KEYS 这张表定义了却从未被引用。取值与内联字面量
+            # 逐字节相同（"worker.action.composing_done"），渲染输出不变。
+            key = (
+                _ACTION_DONE_TEXT_KEYS[PROGRESS_ACTION_COMPOSING]
+                if completed
+                else "worker.action.composing"
+            )
             action_text = self._catalog.text(key).text
         elif action == PROGRESS_ACTION_WORKING:
-            key = "worker.action.working_done" if completed else "worker.action.working"
+            key = (
+                _ACTION_DONE_TEXT_KEYS[PROGRESS_ACTION_WORKING]
+                if completed
+                else "worker.action.working"
+            )
             action_text = self._catalog.text(key).text
         else:
-            key = "worker.action.processing_done" if completed else "worker.action.processing"
+            key = (
+                _ACTION_DONE_TEXT_KEYS[PROGRESS_ACTION_PROCESSING]
+                if completed
+                else "worker.action.processing"
+            )
             action_text = self._catalog.text(key).text
         if stalled_seconds is not None:
             return self._catalog.text(
