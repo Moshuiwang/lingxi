@@ -137,6 +137,20 @@ class QueueInsertFailure(RuntimeError):
     """task 写入失败，入队事务必须整体回滚。"""
 
 
+class _InboundEventInsertFailure(RuntimeError):
+    """``insert_inbound_event`` 落库之前失败的内部标记（Issue #469 opus 独立
+    审查 P2-1）。
+
+    只在 :meth:`EventPipeline._within_transaction` 第 2 步、``tx.
+    insert_inbound_event(...)`` 这一次调用本身抛异常时使用，包一层
+    ``__cause__`` 原样带上原始异常，只为了让 ``handle_message`` 能在自己的
+    顶层 ``except`` 分流表里区分出"这条事件在 `inbound_event` 表里还没有留下
+    任何幂等记录"这一种特殊情况——真正的处理与提示逻辑仍然统一走
+    ``_handle_unexpected_failure``（见其 ``retryable`` 参数文档）。不对外
+    暴露、不在本模块之外被捕获或构造。
+    """
+
+
 def fixed_stable_version(*, user_id: str, now: datetime) -> str:
     """默认版本求值：恒为 ``stable``。签名保留 #45 要求的两个输入。"""
 
@@ -267,46 +281,83 @@ class EventPipeline:
         库里，幂等去重挡住重处理；回复失败只记审计。这是知情取舍——用户少收一条提示
         可以接受，合同的硬承诺是"不自动生效"，那一条现在由已提交的事件行保证。
 
-        **本方法是全函数（Issue #465：100% 响应覆盖产品合同）：绝不向调用方抛出
-        异常。** 已被识别的失败（`QueueInsertFailure` 等）在 :meth:`_handle_message`
-        内部各自落到对应的诚实提示；本方法这一层只兜住"没有被任何既有分支识别"的
-        剩余异常——数据库瞬时错误、还没被枚举过的编程缺陷等。没有这一层时，这类
-        异常会一路穿透 ``apps/gateway/__init__.py`` 的 ``make_event_handler``，被
-        ``adapters/feishu_longconn.py`` 的 ``LongConnectionSupervisor._dispatch``
-        接住——但那一层只记 ``event.handler_failed`` 审计，什么都不回给用户：飞书
-        会按处理失败重投这条事件，可一个稳定复现的缺陷会让重投一直撞在同一个异常
-        上，用户永远等不到任何回应（这正是 Issue #465 的触发现场）。因此这里改成
-        "任何异常都必须换成一条诚实的失败提示"，不再指望重投本身能替用户兜底。
+        **本方法对绝大多数失败是全函数（Issue #465：100% 响应覆盖产品合同）：
+        不向调用方抛出异常。** 已被识别的失败（`QueueInsertFailure` 等）在
+        :meth:`_handle_message` 内部各自落到对应的诚实提示；本方法这一层只兜住
+        "没有被任何既有分支识别"的剩余异常——数据库瞬时错误、还没被枚举过的编程
+        缺陷等。没有这一层时，这类异常会一路穿透 ``apps/gateway/__init__.py`` 的
+        ``make_event_handler``，被 ``adapters/feishu_longconn.py`` 的
+        ``LongConnectionSupervisor._dispatch`` 接住——但那一层只记
+        ``event.handler_failed`` 审计，什么都不回给用户：飞书会按处理失败重投这条
+        事件，可一个稳定复现的缺陷会让重投一直撞在同一个异常上，用户永远等不到
+        任何回应（这正是 Issue #465 的触发现场）。因此这里改成"任何异常都必须换成
+        一条诚实的失败提示"，不再指望重投本身能替用户兜底。
+
+        **唯一的例外（Issue #469 opus 独立审查 P2-1）：`_InboundEventInsertFailure`
+        ——``insert_inbound_event`` 落库之前的失败。** 发完提示之后仍会破例向上
+        穿出原始异常，理由与分界见 :meth:`_handle_unexpected_failure` 的
+        ``retryable`` 参数文档。
         """
 
         try:
             return self._handle_message(message, now=now)
+        except _InboundEventInsertFailure as error:
+            return self._handle_unexpected_failure(
+                message, error.__cause__ or error, retryable=True
+            )
         except Exception as error:  # noqa: BLE001 - 见上方 docstring：这是全函数的最后一道防线
             return self._handle_unexpected_failure(message, error)
 
     def _handle_unexpected_failure(
-        self, message: InboundMessage, error: BaseException
+        self, message: InboundMessage, error: BaseException, *, retryable: bool = False
     ) -> Outcome:
         """``handle_message`` 兜底出口：记审计＋尽力而为发一条诚实失败提示。
 
-        **不重试、不重新进入事务**——异常已经使当前这一轮的事务连同它可能做过的
-        任何写入一起回滚（Python ``with`` 语句在异常路径上的标准行为），这里只用
+        **不重新进入事务**——异常已经使当前这一轮的事务连同它可能做过的任何写入
+        一起回滚（Python ``with`` 语句在异常路径上的标准行为），这里只用
         ``message`` 本身携带的、与数据库状态无关的字段（``chat_id``/``thread_id``/
         ``message_id``/``trace_id``）尽力送一条提示。停机中跳过发送，姿态与
         ``handle_message`` 末尾"尽力而为的出站副作用"一致。
 
-        **不去重、可能重复。** 与 `QueueInsertFailure` 分支复用的
-        ``claim_queue_failure_notice``（按 event_id 只发一次）不同，这里刻意不接
-        那张去重表——它的语义是"排队失败"，套在任意异常上会名不副实。一个持续
-        触发同一缺陷的事件被飞书重投几次，用户就可能收到几条这条提示；比起完全
-        静默，这是可以接受的已知取舍（已在交付报告登记）。
+        **默认（``retryable=False``）吞掉异常、不重新抛出**——这是这里此前唯一
+        的行为，但下面这段说明此前写错了取舍前提（Issue #469 opus 独立审查
+        P2-1 纠偏）：吞掉之后 ``handle_message`` 正常返回，
+        ``LongConnectionSupervisor._dispatch`` 看到的是一次成功处理
+        （``error=None``），照此向飞书回 ack——**飞书不会因此重投这条事件**，
+        不存在"重投几次、用户就收到几条这条提示"这回事。真实后果反而是：一次
+        瞬时故障（DB 死锁、连接被重置等）在这层兜底加入之前，会被飞书按处理
+        失败重投、下一次尝试大概率自愈；加入之后，同一次瞬时故障变成"这条用户
+        消息被永久丢弃＋一条内部错误提示"，不再有任何自愈机会。
+
+        **``retryable=True``：唯一的例外，仅对应 `insert_inbound_event` 落库
+        之前的失败**（调用方 ``handle_message`` 只在这一种出口传 ``True``）。
+        这次失败发生在这条事件的幂等记录写进 ``inbound_event`` 表之前，飞书
+        重投这条事件会被当成一条全新事件正常处理、不会被去重挡下——是这条
+        分支里唯一"重投真的能带来恢复"的出口。因此这里在发完提示之后**重新
+        抛出**原始异常，让它破例穿出 ``handle_message``，`_dispatch` 收到真正
+        的失败（非 ``error=None``），照此向飞书返回失败以触发重投。其余出口
+        （幂等记录已经落库之后的任何失败）继续吞掉：重投只会撞上已经写好的
+        去重行，在 :meth:`_within_transaction` 第 2 步被判重直接短路返回，对
+        恢复没有任何帮助，穿出异常只是把同一条日志再刷一遍噪音。
+
+        已知取舍：``retryable=True`` 期间飞书按自己的重投策略再次投递同一条
+        事件，每次命中同一个瞬时故障都会再触发一次这条提示——用户可能在重投
+        窗口内收到最多 3 条重复的这条提示（飞书长连接对单条事件的重投次数
+        上限）；比起消息被永久丢弃且无法自愈，这是可以接受的已知取舍（已在
+        交付报告登记）。
         """
 
         content = self._texts.catalog.text("gateway.unexpected_error", reference=message.trace_id)
         self._audit.record(
             "event.pipeline_failed",
             event_id=message.event_id,
-            error=f"{type(error).__name__}: {error}",
+            # 只记异常类名，不记异常正文（Issue #469 opus 独立审查 P2-5，与
+            # `task.enqueue_failed`、`onboarding.failed` 等既有审计纪律一致）：
+            # 这里接住的是"没有被任何既有分支识别"的剩余异常，psycopg 等驱动的
+            # 异常串可能原样带着 `DETAIL: Key (feishu_open_id)=(ou_...)` 这类
+            # 外部标识原值，写进审计正文就抵触 V-花名册-33「审计与日志不含外部
+            # 标识原值」。
+            error=type(error).__name__,
             trace_id=message.trace_id,
         )
         if self._should_stop():
@@ -317,30 +368,32 @@ class EventPipeline:
                 content_version=content.version,
                 trace_id=message.trace_id,
             )
-            return Outcome(handled_as=None)
-        try:
-            self._replies.send_text(
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                reply_to_message_id=message.message_id,
-                text=content.text,
-            )
-            self._audit.record(
-                "reply.sent",
-                event_id=message.event_id,
-                content_key=content.key,
-                content_version=content.version,
-                trace_id=message.trace_id,
-            )
-        except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
-            self._audit.record(
-                "reply.failed",
-                event_id=message.event_id,
-                content_key=content.key,
-                content_version=content.version,
-                error=f"{type(send_error).__name__}: {send_error}",
-                trace_id=message.trace_id,
-            )
+        else:
+            try:
+                self._replies.send_text(
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
+                    text=content.text,
+                )
+                self._audit.record(
+                    "reply.sent",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    trace_id=message.trace_id,
+                )
+            except Exception as send_error:  # noqa: BLE001 - 已经在兜底路径，发送失败只记审计
+                self._audit.record(
+                    "reply.failed",
+                    event_id=message.event_id,
+                    content_key=content.key,
+                    content_version=content.version,
+                    error=f"{type(send_error).__name__}: {send_error}",
+                    trace_id=message.trace_id,
+                )
+        if retryable:
+            raise error
         return Outcome(handled_as=None)
 
     def _handle_message(self, message: InboundMessage, *, now: datetime | None = None) -> Outcome:
@@ -460,12 +513,18 @@ class EventPipeline:
             # —— 第 2 步：幂等。冲突即重复投递，**在此立刻返回**。
             # 早退发生在加表情之前，因此重复投递在用户可见面同样不重复：不再加表情、
             # 不再发任何回复（`V-接入-09` 断的是出站调用次数，不只是数据库行数）。
-            first_time = tx.insert_inbound_event(
-                event_id=message.event_id,
-                event_type=message.event_type,
-                user_open_id=message.sender_open_id,
-                trace_id=message.trace_id,
-            )
+            try:
+                first_time = tx.insert_inbound_event(
+                    event_id=message.event_id,
+                    event_type=message.event_type,
+                    user_open_id=message.sender_open_id,
+                    trace_id=message.trace_id,
+                )
+            except Exception as error:  # noqa: BLE001 - 见 _InboundEventInsertFailure 文档
+                # 这一次调用本身失败：幂等记录还没有落库，是 handle_message 顶层
+                # 兜底里唯一"重投能真正带来恢复"的出口（Issue #469 opus 独立审查
+                # P2-1，见 _handle_unexpected_failure 的 retryable 参数文档）。
+                raise _InboundEventInsertFailure(error) from error
             if not first_time:
                 self._audit.record(
                     "inbound_event.duplicate",
