@@ -487,6 +487,300 @@ class CardActionDispatchTests(unittest.TestCase):
         self.assertEqual(received, ["evt_normal_direct"])
 
 
+def management_form_submit_event(
+    *,
+    event_id: str = "evt_card_form_1",
+    operator_open_id: str = "ou_admin",
+    admin_action: str = "grant",
+    identifier: str = "u@example.invalid",
+    company_id: str = "1011",
+    metric_name: str = "示例指标",
+    reason: str = "特批",
+    chat_id: str = "oc_admin_dm",
+    message_id: str = "om_card_1",
+) -> dict:
+    """管理卡「新增授权/新增抑制」表单提交的原始事件体（`core/admin/
+    management_card.py` 的 ``form``/``select_static``/``input`` 组件形状 +
+    飞书卡片 2.0 表单回传的 ``action.form_value``，证据等级 1，见
+    ``apps/gateway/__init__.py`` ``_management_card_form_value`` 文档）。"""
+
+    return {
+        "header": {"event_id": event_id, "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": operator_open_id},
+            "action": {
+                "tag": "form",
+                "value": {"admin_action": admin_action, "identifier": identifier},
+                "form_value": {
+                    "company_id": company_id,
+                    "metric_name": metric_name,
+                    "reason": reason,
+                },
+            },
+            "context": {"open_chat_id": chat_id, "open_message_id": message_id},
+        },
+    }
+
+
+def management_revoke_event(
+    *,
+    event_id: str = "evt_card_revoke_1",
+    operator_open_id: str = "ou_admin",
+    override_id: str = "lpo_1",
+    identifier: str = "u@example.invalid",
+    chat_id: str = "oc_admin_dm",
+    message_id: str = "om_card_2",
+) -> dict:
+    """管理卡逐行「收回」按钮点击的原始事件体（`core/admin/management_card.py`
+    ``_override_row_elements`` 建的按钮 ``behaviors[].value`` 形状）。"""
+
+    return {
+        "header": {"event_id": event_id, "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": operator_open_id},
+            "action": {
+                "tag": "button",
+                "value": {
+                    "admin_action": "revoke",
+                    "override_id": override_id,
+                    "identifier": identifier,
+                },
+            },
+            "context": {"open_chat_id": chat_id, "open_message_id": message_id},
+        },
+    }
+
+
+class ManagementCardDispatchTests(unittest.TestCase):
+    """Issue #439 B 档：管理卡表单提交与逐行收回按钮的原始事件体解析与路由。
+
+    只验证 ``make_event_handler`` 把回传值分流到正确的方法、传对干净参数——
+    ``AdminCardCallbackHandler.handle_management_form_submit``/
+    ``handle_management_revoke`` 自身的必填校验、``route()`` 转译已经在
+    ``tests/test_admin_card_callback.py`` 钉过，这里不重复。
+    """
+
+    def test_grant_form_submission_routes_to_handle_management_form_submit(self) -> None:
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+            def handle_management_revoke(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("表单提交不该路由到收回分支")
+
+            def handle(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("表单提交不该路由到确认/取消既有分支")
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        result = handler(
+            management_form_submit_event(
+                admin_action="grant",
+                identifier="u@example.invalid",
+                company_id="1011",
+                metric_name="示例指标",
+                reason="特批",
+                chat_id="oc_admin_dm",
+                message_id="om_card_1",
+            )
+        )
+
+        self.assertEqual(result, {"toast": {"type": "success", "content": "ok"}})
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "operator_open_id": "ou_admin",
+                    "admin_action": "grant",
+                    "identifier": "u@example.invalid",
+                    "company_id": "1011",
+                    "metric_name": "示例指标",
+                    "reason": "特批",
+                    "chat_id": "oc_admin_dm",
+                    "thread_id": None,
+                    "message_id": "om_card_1",
+                    "trace_id": calls[0]["trace_id"],
+                }
+            ],
+        )
+
+    def test_suppress_form_submission_also_routes_to_form_submit(self) -> None:
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_form_submit(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "ok"}}
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        handler(management_form_submit_event(admin_action="suppress"))
+
+        self.assertEqual(calls[0]["admin_action"], "suppress")
+
+    def test_revoke_button_routes_to_handle_management_revoke(self) -> None:
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle_management_revoke(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "已收回"}}
+
+            def handle_management_form_submit(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("收回按钮不该路由到表单提交分支")
+
+            def handle(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("收回按钮不该路由到确认/取消既有分支")
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        result = handler(
+            management_revoke_event(
+                override_id="lpo_9", chat_id="oc_admin_dm", message_id="om_card_2"
+            )
+        )
+
+        self.assertEqual(result, {"toast": {"type": "success", "content": "已收回"}})
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "operator_open_id": "ou_admin",
+                    "override_id": "lpo_9",
+                    "chat_id": "oc_admin_dm",
+                    "thread_id": None,
+                    "message_id": "om_card_2",
+                    "trace_id": calls[0]["trace_id"],
+                }
+            ],
+        )
+
+    def test_unrecognized_admin_action_falls_back_to_the_existing_confirm_cancel_branch(
+        self,
+    ) -> None:
+        """否定断言：``admin_action`` 缺失（确认/取消卡片的既有形状）时维持既有
+        兜底行为逐字节不变——路由到 ``handle()``，不是两个新分支。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[dict[str, object]] = []
+
+        class FakeCardCallbackHandler:
+            def handle(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"toast": {"type": "success", "content": "已确认执行"}}
+
+            def handle_management_form_submit(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("确认/取消卡片不该路由到表单提交分支")
+
+            def handle_management_revoke(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("确认/取消卡片不该路由到收回分支")
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        result = handler(card_action_event(operator_open_id="ou_admin", decision="confirm"))
+
+        self.assertEqual(result, {"toast": {"type": "success", "content": "已确认执行"}})
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "operator_open_id": "ou_admin",
+                    "pending_action_id": "pac_1",
+                    "decision": "confirm",
+                    "trace_id": calls[0]["trace_id"],
+                }
+            ],
+        )
+
+    def test_unknown_admin_action_value_also_falls_back_not_a_new_toast(self) -> None:
+        """``admin_action`` 存在但取值既不是 grant/suppress 也不是
+        revoke（伪造或未来新增未接线的取值）：结构上按「无法识别」处理，落到
+        既有确认/取消分支（会因缺 ``decision`` 被 ``handle()`` 自己的
+        ``unknown_decision`` 拒绝），不新造一条分流逻辑之外的行为。"""
+
+        from lingxi.apps.gateway import make_event_handler
+
+        class Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                pass
+
+        class ExplodingPipeline:
+            def handle_message(self, message: object) -> None:  # pragma: no cover
+                raise AssertionError("卡片回调事件不该进消息管线")
+
+        calls: list[str] = []
+
+        class FakeCardCallbackHandler:
+            def handle(self, **kwargs: object) -> dict:
+                calls.append("handle")
+                return {"toast": {"type": "error", "content": "操作不存在或已失效"}}
+
+            def handle_management_form_submit(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("未知 admin_action 不该路由到表单提交分支")
+
+            def handle_management_revoke(self, **kwargs: object) -> dict:  # pragma: no cover
+                raise AssertionError("未知 admin_action 不该路由到收回分支")
+
+        handler = make_event_handler(
+            ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
+        )
+
+        result = handler(management_form_submit_event(admin_action="__unknown__"))
+
+        self.assertEqual(calls, ["handle"])
+        self.assertEqual(result, {"toast": {"type": "error", "content": "操作不存在或已失效"}})
+
+
 class AckReportingTests(unittest.TestCase):
     """派发结果必须回报给传输层，SDK 才知道该向飞书回 OK 还是 500。"""
 
