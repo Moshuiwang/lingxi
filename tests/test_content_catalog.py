@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -36,6 +38,25 @@ _FORMAL_RENDERING_MODULES = (
 def _document() -> dict:
     with CONTENT_PATH.open("rb") as stream:
         return tomllib.load(stream)
+
+
+#: #443 对外名称规范：复用 `scripts/ci/check_content_version.py` 已有的
+#: `flatten_visible`（摊平 [texts]/[cards] 的全部用户可见文案），不在这里重写
+#: 一份第二份摊平逻辑——两处实现分叉是这类检查最容易悄悄失效的方式。
+_CONTENT_VERSION_CHECK_PATH = (
+    Path(__file__).parents[1] / "scripts" / "ci" / "check_content_version.py"
+)
+_INTERNAL_CODENAME_PATTERN = re.compile(r"灵犀|lingxi", re.IGNORECASE)
+
+
+def _load_content_version_check():
+    spec = importlib.util.spec_from_file_location(
+        "check_content_version_under_test_443", _CONTENT_VERSION_CHECK_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _imported_bot_test_modules(source_root: Path) -> tuple[str, ...]:
@@ -378,6 +399,44 @@ class ContentDirectoryTests(unittest.TestCase):
             "正式渲染入口的传递导入闭包不得包含 Bot-Test 资产模块："
             + ", ".join(imported),
         )
+
+    def test_the_six_naming_keys_render_bi_plus_and_never_the_internal_codename(self) -> None:
+        """#443 对外名称规范（产品负责人 2026-08-30 裁定）：「灵犀/lingxi/Lingxi」是
+        内部代号，不得出现在任何用户可见面；对外统一「BI Plus」。这六个键是当次
+        扫明的全部 content.toml 暴露面（开通链四条 + 内测未开放一条 + 停用一条），
+        逐一渲染断言必须包含「BI Plus」，且不含内部代号（大小写不敏感的 lingxi
+        与中文「灵犀」都要挡住）。"""
+
+        catalog = default_content_catalog()
+        cases: dict[str, dict[str, str]] = {
+            "onboarding.matched": {},
+            "onboarding.syncing": {},
+            "onboarding.completed": {"company_name": "测试公司", "function_name": "测试职能"},
+            "onboarding.not_authorized": {},
+            "onboarding.innertest_not_open": {},
+            "gateway.suspended": {},
+        }
+        for key, kwargs in cases.items():
+            with self.subTest(key=key):
+                rendered = catalog.text(key, **kwargs).text
+                self.assertIn("BI Plus", rendered)
+                self.assertIsNone(
+                    _INTERNAL_CODENAME_PATTERN.search(rendered),
+                    f"{key} 渲染文本仍包含内部代号：{rendered!r}",
+                )
+
+    def test_content_toml_user_visible_text_has_zero_internal_codename_hits(self) -> None:
+        """低成本的全局兜底（#443）：即便未来在 content.toml 新增第七个键时不小心
+        带回内部代号，这条检查也会先于人工审计发现，不必逐键手写。只查
+        content.toml 的用户可见文案（[texts]/[cards]，复用门禁自己的摊平逻辑），
+        不外溢到内部日志/代码标识/文档技术名——那些按 #443 白名单继续允许使用
+        「Lingxi」。"""
+
+        check = _load_content_version_check()
+        pairs, errors = check.flatten_visible(_document())
+        self.assertEqual(errors, [])
+        hits = sorted(key for key, text in pairs if _INTERNAL_CODENAME_PATTERN.search(text))
+        self.assertEqual(hits, [], f"content.toml 用户可见文案仍命中内部代号的键：{hits}")
 
 
 class UserVisibleOutputTests(unittest.TestCase):
