@@ -83,6 +83,12 @@ _IMPACT_TEXT: dict[PendingActionType, str] = {
 #: 操作两套说法）。
 _DIRECTION_LABEL: dict[str, str] = {"grant": "补充授权", "suppress": "屏蔽指标"}
 
+#: 群通知 reason 预览长度（Trace #469 S-1 收尾项：截断长度与管理卡/
+#: router.py 的覆盖行回显统一），与 ``core/admin/management_card.
+#: _OVERRIDE_REASON_PREVIEW_LENGTH``/``core/admin/router.
+#: _OVERRIDE_REASON_PREVIEW_LENGTH`` 同一取值，独立各自维护。
+_GROUP_REASON_PREVIEW_LENGTH = 20
+
 
 def _permission_payload(pending: PendingAction) -> dict[str, Any] | None:
     """解析 ``pending.payload``（JSON 字符串，仅本地权限三类动作非空，见迁移
@@ -203,6 +209,11 @@ def _permission_scope_suffix(
     company_display = company_label if company_label is not None else payload.get("company_id", "")
     metric_display = metric_label if metric_label is not None else payload.get("metric_name", "")
     reason = payload.get("reason", "")
+    # 截断长度与管理卡/router.py 的覆盖行回显统一（Trace #469 S-1 收尾项）：
+    # 群通知是多人可见的广播面，同样不是审计全文检索入口，不应该比"只发起人
+    # 一人可见"的确认卡私聊正文（_permission_scope_block，不截断）更宽松。
+    if len(reason) > _GROUP_REASON_PREVIEW_LENGTH:
+        reason = reason[:_GROUP_REASON_PREVIEW_LENGTH] + "…"
     direction = payload.get("direction")
     direction_infix = f"{_DIRECTION_LABEL.get(direction, direction)} · " if direction else ""
     return f"（{direction_infix}公司 {company_display} · 指标 {metric_display} · 原因 {reason}）"

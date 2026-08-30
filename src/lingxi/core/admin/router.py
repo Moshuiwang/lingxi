@@ -610,9 +610,9 @@ class AdminCommandRouter:
                             content_version=_CONTENT_VERSION,
                             reply_text=(
                                 "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
-                                "或已被收回，或同一键同时存在授权与抑制两条需要精确"
-                                "指定），请用 /admin user 查询后核对，或改用"
-                                " override_id 精确指定收回。"
+                                "或已被撤销，或同一键同时存在补充授权与屏蔽指标两条"
+                                "需要精确指定），请用 /admin user 查询后核对，或改用"
+                                "覆盖ID 精确指定撤销。"
                             ),
                         ),
                         actor=entry.feishu_open_id,
@@ -733,7 +733,7 @@ class AdminCommandRouter:
                     handled=True,
                     content_key="admin.write_action_unavailable",
                     content_version=_CONTENT_VERSION,
-                    reply_text="该功能当前不可用，请联系 Ops。",
+                    reply_text="该功能当前不可用，请联系技术支持。",
                 ),
                 actor=entry.feishu_open_id,
                 roles=roles,
