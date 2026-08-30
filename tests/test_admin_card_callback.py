@@ -1017,6 +1017,138 @@ class ManagementFormSubmitTests(unittest.TestCase):
         self.assertEqual(response["toast"]["type"], "error")
 
 
+class ManagementFormSubmitWhitespaceValidationTests(unittest.TestCase):
+    """Trace #469 修复包 B，B-2：``identifier``/``company_id``/``metric_name``
+    非空但含空白字符（含全角空格 U+3000）时，纵深校验必须在拼接命令文本之前
+    拦住——审查实测 ``company_id="1011 sub_new_count"`` 能把 ``metric_name``
+    静默左移替换成 ``sub_new_count``、把真正的 ``metric_name`` 挤进 ``reason``
+    首词，当前调用点全部受控故不可达，本组用例是纵深加固。"""
+
+    def test_identifier_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        handler, audit = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target extra_token",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [], "含空白字符的 identifier 不得拼进命令文本")
+        self.assertIn(
+            "admin.card_callback.management_missing_identifier", [a for a, _ in audit.records]
+        )
+
+    def test_company_id_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+        """审查实测的具体复现场景：``company_id`` 里嵌一个空格 + 别的指标名，
+        企图让 ``str.split()`` 把它左移进 ``metric_name``。"""
+
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011 sub_new_count",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [], "含空白字符的 company_id 不得拼进命令文本")
+
+    def test_metric_name_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="suppress",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [], "含空白字符的 metric_name 不得拼进命令文本")
+
+    def test_fullwidth_space_in_identifier_is_also_rejected(self) -> None:
+        """全角空格（U+3000）与半角空格同样落进 ``str.isspace()``，不能被
+        当成一个"看起来正常"的字符漏过校验。"""
+
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target　extra",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(router.route_calls, [])
+
+    def test_well_formed_fields_without_whitespace_still_pass(self) -> None:
+        """否定断言的另一半：正常取值（不含任何空白）不应该被这条新增校验
+        误伤——与既有 ``test_grant_submission_constructs_the_equivalent_
+        admin_command_text`` 覆盖同一条主路径，这里只确认新校验不引入
+        误报。"""
+
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_form_submit(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="1011",
+            metric_name="daily_active",
+            reason="特批 授权说明",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(len(router.route_calls), 1)
+
+
 class ManagementRevokeClickTests(unittest.TestCase):
     """``AdminCardCallbackHandler.handle_management_revoke``（#439 B 档）：
     单元层用假 ``ManagementActionRouter``；真库集成同上。"""
