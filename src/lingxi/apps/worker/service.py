@@ -301,11 +301,40 @@ class WorkerService:
         任一在途任务把异常真正抛出 `_process_task`（正常情况下它内部已经把
         一切都吞成结构化日志或终态，理论上不会发生）时，取消其余在途任务并
         等它们收尾后再重新抛出——与旧实现 ``asyncio.gather()`` 默认"一个失败
-        取消其余"的语义保持一致，不留下未被等待的游离任务。
+        取消其余"的语义保持一致，不留下未被等待的游离任务。**先取全部 `done`
+        的异常再决定是否抛出**（Issue #469 opus 独立审查 P2-4）：`Task.
+        exception()` 与 `Task.result()` 一样会把异常标记为"已取回"，但前者
+        不会像后者那样在第一个失败的任务上就地重新抛出、把同一批 `done`
+        里排在它后面的任务的异常晾在原地——那些异常从未被取回，会被 asyncio
+        在垃圾回收时打成一条 ``Task exception was never retrieved`` 噪音日志。
+        这里遍历完 `done` 收集所有异常之后再统一抛出第一个，行为语义不变
+        （仍然是"一个失败就取消其余在途任务并重新抛出"），只是不再漏取。
+
+        **巡检节拍**（Issue #469 opus 独立审查 P1-1）：`process_once()` 入口
+        只在进入这个循环之前跑一次 `_housekeep()`/`_tick_alerts()`（见调用方），
+        但持续有新任务可领时这个循环要等在途集合完全清空才返回——旧的
+        "整批 claim() 再整批等收口"实现里，`_housekeep()`/`_tick_alerts()`
+        天然随着每一批之间的间隙被反复调用；滚动并发把这个间隙消灭之后，
+        `reclaim_queued`（queued_stuck 告警＋排队超时收口）、
+        `fail_unavailable_versions`、`reclaim_stale_with_outcomes`、
+        `expire_undelivered_terminals`、Agent 会话清理、`_tick_alerts` 会在
+        供给不断时整体停摆到进程下一次真正无事可做为止（真实复现：3 秒轮询
+        窗口下，整批版 `_housekeep` 会被重入多次，滚动版整个观察窗口内只跑
+        了 1 次）。修法：循环内自己跟踪"上次巡检是几点"，每次 `asyncio.wait`
+        醒来之后如果距上次巡检已经过了至少一个 `poll_interval_seconds`，就
+        原地补跑一次——复用这个既有常量而不是新开一个独立配置项，因为它已经
+        是这个循环里"多久该重新看一眼世界"的既有节奏（`claim()` 轮询、
+        `asyncio.wait` 超时都以它为参照），巡检的时效性要求与轮询本身同量级，
+        没有理由让两套节奏各自漂移。两个回调都是同步调用，与整批实现里
+        `process_once()` 入口那次同步调用语义等价，不额外引入并发写。命中的
+        终态并入 `terminal_tasks`，让函数末尾的返回值如实反映"这一轮到底有没有
+        观察到任何终态"。
         """
 
         pending: set[asyncio.Task[None]] = set()
         claimed_any = False
+        housekeep_interval_seconds = self._config.poll_interval_seconds
+        last_housekeep_at = self._monotonic()
 
         def stop_requested() -> bool:
             return self._global_stop is not None and self._global_stop.is_set()
@@ -331,11 +360,20 @@ class WorkerService:
                     timeout=self._config.poll_interval_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                for finished in done:
-                    # 正常路径 `_process_task` 从不向上抛异常（见其内部
-                    # try/except），这里只是双保险；真抛出时立即让下面的
-                    # except 分支接手取消其余在途任务。
-                    finished.result()
+                # 先取全部异常再决定是否抛出（见上方巡检节拍前一段文档）：正常
+                # 路径 `_process_task` 从不向上抛异常（见其内部 try/except），
+                # 这里只是双保险；真抛出时下面的 except 分支接手取消其余在途
+                # 任务。
+                exceptions = [
+                    error for finished in done if (error := finished.exception()) is not None
+                ]
+                if exceptions:
+                    raise exceptions[0]
+                now = self._monotonic()
+                if now - last_housekeep_at >= housekeep_interval_seconds:
+                    last_housekeep_at = now
+                    self._tick_alerts()
+                    terminal_tasks.extend(self._housekeep())
         except BaseException:
             for task in pending:
                 task.cancel()

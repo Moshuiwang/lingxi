@@ -98,6 +98,7 @@ class PipelineTestCase(unittest.TestCase):
         self,
         *,
         fail_on: str | None = None,
+        fail_error: Exception | None = None,
         reaction_error: Exception | None = None,
         onboarding=None,
         force_clear_agent_session_result: bool | None = None,
@@ -112,6 +113,7 @@ class PipelineTestCase(unittest.TestCase):
                 self.state,
                 self.log,
                 fail_on=fail_on,
+                fail_error=fail_error,
                 force_clear_agent_session_result=force_clear_agent_session_result,
                 force_claim_conversation_result=force_claim_conversation_result,
             ),
@@ -2294,25 +2296,15 @@ class ResponseCoverageTests(PipelineTestCase):
     的 ``except Exception`` 缩窄成 ``except QueueInsertFailure``（去掉本条
     兜底分支）后，本组用例全部由绿转红（异常原样穿出 ``handle_message``）；
     恢复后复绿。红/绿证据见交付报告，不在本文件重复记录。
+
+    ``insert_inbound_event`` 这一个出口是例外中的例外（Issue #469 opus 独立
+    审查 P2-1）：这里的失败发生在这条事件的幂等记录落库**之前**，飞书重投
+    这条事件不会被去重表挡下，是唯一"重投真的能带来恢复"的出口——见
+    ``EventPipeline._handle_unexpected_failure`` 的 ``retryable`` 参数文档。
+    因此这一个出口在发完提示之后**仍会重新抛出**原始异常，与本组其余出口
+    "提示已发＋异常不穿出"的既有断言刻意不同，不是遗漏；专门的正例/停机组合
+    断言与变异验红见 ``RetryableInsertFailureTests``，不在本组重复。
     """
-
-    def test_insert_inbound_event_failure_gets_an_honest_fallback_reply(self) -> None:
-        outcome = self.build(fail_on="insert_inbound_event").handle_message(
-            message("evt_boom"), now=NOW
-        )
-
-        self.assertIsNone(outcome.handled_as)
-        replies = self.log.fields("reply.send_text")
-        self.assertEqual(len(replies), 1, "任何未被识别的异常都必须换成一条用户可见回复")
-        self.assertEqual(
-            replies[0]["text"],
-            default_content_catalog().text(
-                "gateway.unexpected_error", reference="trc_evt_boom"
-            ).text,
-        )
-        failed = self.log.fields("audit.event.pipeline_failed")
-        self.assertEqual(len(failed), 1)
-        self.assertIn("RuntimeError", failed[0]["error"])
 
     def test_claim_conversation_failure_gets_an_honest_fallback_reply(self) -> None:
         outcome = self.build(fail_on="claim_conversation").handle_message(
@@ -2347,15 +2339,98 @@ class ResponseCoverageTests(PipelineTestCase):
     def test_fallback_reply_is_skipped_while_stopping_not_forced(self) -> None:
         """停机中：结论（此处是"处理失败"这件事本身）已经无法再落库改变，回复是
         尽力而为的那一部分——与既有 `deferred` 停机跳过姿态一致，不因为是兜底
-        路径就破例在停机预算之外硬发一次出站调用。"""
+        路径就破例在停机预算之外硬发一次出站调用。
+
+        用 ``claim_conversation``（幂等记录已落库之后的出口）而不是
+        ``insert_inbound_event``：后者现在是唯一会重新抛出异常的出口（见
+        ``RetryableInsertFailureTests``），混在这里会让这条用例同时断言两件
+        不相关的事——本用例只关心"停机中是否跳过发送"这一件事。"""
 
         outcome = self.build(
-            fail_on="insert_inbound_event", should_stop=lambda: True
+            fail_on="claim_conversation", should_stop=lambda: True
         ).handle_message(message("evt_boom"), now=NOW)
 
         self.assertIsNone(outcome.handled_as)
         self.assertEqual(self.log.count("reply.send_text"), 0)
         self.assertEqual(self.log.count("audit.reply.skipped_while_stopping"), 1)
+
+
+class RetryableInsertFailureTests(PipelineTestCase):
+    """Issue #469（opus 独立审查 P2-1）：``insert_inbound_event`` 落库之前的
+    失败是 ``ResponseCoverageTests`` 全组里唯一"提示已发之后仍会重新抛出异常"
+    的出口——理由见 ``EventPipeline._handle_unexpected_failure`` 的
+    ``retryable`` 参数文档：这条事件在 ``inbound_event`` 表里还没有留下任何
+    幂等记录，飞书重投这条事件会被当成一条全新事件正常处理，是唯一"重投真的
+    能带来恢复"的失败位置；其余出口（幂等记录已经落库之后的任何失败）继续
+    吞掉，见 ``ResponseCoverageTests`` 里 ``claim_conversation``/
+    ``remember_user_memory`` 两条既有用例。
+
+    **变异验红**：把 ``_within_transaction`` 里包住 ``insert_inbound_event``
+    的 ``try/except`` 去掉（等价于让这一个出口也退回"只记审计、吞掉异常"），
+    ``test_reraises_after_sending_the_honest_reply`` 与
+    ``test_reraises_even_while_stopping`` 两条都会由绿转红（``assertRaises``
+    捕不到异常）；恢复后复绿。
+    """
+
+    def test_reraises_after_sending_the_honest_reply(self) -> None:
+        pipeline = self.build(fail_on="insert_inbound_event")
+
+        with self.assertRaises(RuntimeError):
+            pipeline.handle_message(message("evt_boom"), now=NOW)
+
+        self.assertEqual(
+            self.log.count("reply.send_text"), 1, "重投能恢复不代表这次不用尽力而为发一条提示"
+        )
+        failed = self.log.fields("audit.event.pipeline_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(
+            failed[0]["error"],
+            "RuntimeError",
+            "只记异常类名，不记异常正文（Issue #469 opus 独立审查 P2-5）",
+        )
+
+    def test_reraises_even_while_stopping(self) -> None:
+        """停机中同样不吞：没有发提示（停机跳过发送是既有姿态，见
+        ``ResponseCoverageTests.test_fallback_reply_is_skipped_while_stopping_
+        not_forced``），但这个失败位置本身能靠飞书重投恢复的事实不因为进程正在
+        停机就消失——异常照样要穿出去。"""
+
+        pipeline = self.build(fail_on="insert_inbound_event", should_stop=lambda: True)
+
+        with self.assertRaises(RuntimeError):
+            pipeline.handle_message(message("evt_boom"), now=NOW)
+
+        self.assertEqual(self.log.count("reply.send_text"), 0)
+        self.assertEqual(self.log.count("audit.reply.skipped_while_stopping"), 1)
+
+
+class PipelineFailedAuditLeakageTests(PipelineTestCase):
+    """Issue #469（opus 独立审查 P2-5）：``event.pipeline_failed`` 只记异常
+    类名，不得把异常正文写进审计——psycopg 等驱动的异常串常见形状是
+    ``DETAIL: Key (feishu_open_id)=(ou_...)``，整段记进审计会把外部标识原值
+    留在系统里，抵触 `V-花名册-33`「审计与日志不含外部标识原值」；与
+    ``task.enqueue_failed``/``onboarding.failed`` 等既有审计纪律看齐。
+
+    **变异验红**：把 ``_handle_unexpected_failure`` 里 ``event.pipeline_failed``
+    的 ``error=type(error).__name__`` 改回旧写法
+    ``error=f"{type(error).__name__}: {error}"``，本用例由绿转红（``ou_fake123``
+    出现在审计字段里）；恢复后复绿。
+    """
+
+    def test_audit_does_not_leak_exception_detail_text(self) -> None:
+        leaking_error = RuntimeError(
+            'duplicate key value violates unique constraint "inbound_event_pkey"\n'
+            "DETAIL:  Key (feishu_open_id)=(ou_fake123) already exists."
+        )
+        pipeline = self.build(fail_on="claim_conversation", fail_error=leaking_error)
+
+        outcome = pipeline.handle_message(message("evt_boom"), now=NOW)
+
+        self.assertIsNone(outcome.handled_as)
+        failed = self.log.fields("audit.event.pipeline_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertNotIn("ou_fake123", failed[0]["error"])
+        self.assertEqual(failed[0]["error"], "RuntimeError")
 
 
 if __name__ == "__main__":

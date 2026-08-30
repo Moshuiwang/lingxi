@@ -2660,6 +2660,247 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertEqual(terminal_kind_of("tsk-short"), "success")
         self.assertEqual(terminal_kind_of("tsk-long"), "success")
 
+    def test_housekeeping_keeps_running_on_a_cadence_while_the_claim_loop_never_empties(
+        self,
+    ) -> None:
+        """Issue #469 opus 独立审查 P1-1：滚动并发循环持续有在途任务、``pending``
+        全程不清空时（这里用一个长任务占住一个槽、观察窗口内不收口来复现），
+        ``_housekeep()``/``_tick_alerts()`` 必须仍按 ``poll_interval_seconds``
+        节拍被调用——修复前它们要等整个 ``pending`` 集合清空、``process_once()``
+        整体返回才会再跑一次，真实复现：3 秒轮询窗口下整批实现会被重入多次，
+        滚动实现修复前整个观察窗口内只跑了 1 次。
+
+        变异验红：去掉 ``_run_rolling_claim_loop`` 里的巡检节拍逻辑（循环内不再
+        补跑 ``_housekeep()``/``_tick_alerts()``）后，本用例的
+        ``housekeep_calls >= 2``/``alert_ticks >= 2`` 两条断言必须变红——观察
+        窗口内两者都会恒为 0，因为长任务占着槽、``pending`` 从未清空过、
+        ``process_once()`` 从未返回过；恢复后复绿。红/绿证据见交付报告。
+        """
+
+        from lingxi.adapters.postgres_conversation import TaskContext
+
+        _seed_user_mcp_config("usr-housekeep-long")
+
+        class NeverEmptyingWorkerQueue:
+            """领到一个长任务之后再没有任何新任务可领——``pending`` 因此在整个
+            观察窗口内都不会清空，模拟"持续供给任务、长任务占槽不清空"这个让
+            巡检停摆的真实时序。"""
+
+            def __init__(self) -> None:
+                self._claimed_long = False
+                self._contexts: dict[str, TaskContext] = {
+                    "tsk-long": TaskContext(
+                        task_id="tsk-long",
+                        conversation_id="cnv-long",
+                        user_id="usr-housekeep-long",
+                        prompt="长任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-long",
+                        chat_id="chat-long",
+                        thread_id="topic-long",
+                        agent_session_id=None,
+                        stop_requested=False,
+                        side_effect_state="none",
+                    ),
+                }
+                self.events: list[dict[str, object]] = []
+                self.terminals: list[dict[str, object]] = []
+                # 巡检节拍探针：真实队列适配器上这个方法负责 queued_stuck 告警
+                # ＋排队超时收口，``_housekeep()`` 用 ``getattr`` 探测它是否
+                # 存在、存在就调用——这里只用计数器证明它确实被调用了，不需要
+                # 真的返回可回收的终态。
+                self.housekeep_calls = 0
+
+            def claim(self, *, limit: int, **kwargs: object) -> list[ClaimedTask]:
+                if self._claimed_long:
+                    return []
+                self._claimed_long = True
+                return [
+                    ClaimedTask(
+                        task_id="tsk-long",
+                        conversation_id="cnv-long",
+                        user_id="usr-housekeep-long",
+                        prompt="长任务",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id="msg-long",
+                    )
+                ]
+
+            def task_context(self, *, task_id: str, **kwargs: object) -> TaskContext | None:
+                return self._contexts.get(task_id)
+
+            def mark_side_effect(self, **kwargs: object) -> bool:
+                return True
+
+            def heartbeat(self, **kwargs: object) -> bool:
+                return True
+
+            def stop_requested(self, **kwargs: object) -> bool:
+                return False
+
+            def append_delivery_event(self, **kwargs: object) -> None:
+                self.events.append(kwargs)
+
+            def write_terminal_event(self, **kwargs: object) -> None:
+                self.terminals.append(kwargs)
+
+            def reclaim_queued(self, *, max_wait: object) -> list:
+                self.housekeep_calls += 1
+                return []
+
+        queue = NeverEmptyingWorkerQueue()
+        alert_ticks = [0]
+
+        def on_alert_tick() -> None:
+            alert_ticks[0] += 1
+
+        long_task_running = asyncio.Event()
+        long_task_may_finish = asyncio.Event()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                long_task_running.set()
+                await long_task_may_finish.wait()
+                return {
+                    "turn": {"closed": True, "final_text": f"{prompt}-结果", "session_id": None},
+                    "failure": None,
+                }
+
+        service = WorkerService(
+            config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_alert_tick=on_alert_tick,
+        )
+
+        async def scenario() -> None:
+            process_once_task = asyncio.create_task(service.process_once())
+            await asyncio.wait_for(long_task_running.wait(), timeout=2.0)
+
+            # 观察窗口：长任务占住槽位、pending 全程不清空。窗口取巡检节拍
+            # （复用 poll_interval_seconds=0.02 秒）的 10 倍，理论上限至少能跑
+            # 约 10 次；断言只要求 >=2 次，留足调度抖动的余量。
+            await asyncio.sleep(0.2)
+
+            long_task_may_finish.set()
+            await asyncio.wait_for(process_once_task, timeout=2.0)
+
+        asyncio.run(scenario())
+
+        self.assertGreaterEqual(
+            queue.housekeep_calls,
+            2,
+            "长任务占槽、pending 全程不清空期间，_housekeep() 必须仍按节拍被"
+            "调用（Issue #469 opus 独立审查 P1-1），不能等到整个 "
+            "process_once() 返回才补跑",
+        )
+        self.assertGreaterEqual(
+            alert_ticks[0],
+            2,
+            "同一节拍下 _tick_alerts() 也必须继续被调用，不能随 _housekeep() "
+            "一起停摆",
+        )
+        self.assertEqual(len(queue.terminals), 1)
+        self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_every_exception_in_the_same_done_batch_is_retrieved_before_raising(
+        self,
+    ) -> None:
+        """Issue #469 opus 独立审查 P2-4：``asyncio.wait()`` 返回的同一批
+        ``done`` 里如果不止一个任务失败，此前的实现是
+        ``for finished in done: finished.result()``——一遇到第一个失败就地
+        抛出、跳出循环，排在它后面的任务的异常从未被 ``.result()``/
+        ``.exception()`` 取回；``asyncio`` 会在这些任务被垃圾回收时打一条
+        ``Task exception was never retrieved`` 噪音日志（`_process_task` 正常
+        路径不会真的向上抛异常，见其内部 try/except，但队列适配器自身的方法
+        —— 例如这里注入的 ``task_context`` —— 完全可能抛出，这条双保险因此
+        是真实可达路径，不是纯理论分支）。
+
+        构造两个"领到之后不经过任何 ``await`` 就同步抛异常"的任务：两者都
+        会在 ``asyncio.wait()`` 真正挂起之前的同一轮事件循环里跑完，必然落进
+        同一批 ``done``（已用独立脚本对拍验证：旧逻辑下 ``done`` 恰好包含
+        两个任务，且其中一个的 ``_log_traceback`` 停留在 ``True``）。断言
+        修复后两者的异常都已经被取回。
+
+        变异验红：把 `_run_rolling_claim_loop` 的收集逻辑改回
+        ``for finished in done: finished.result()``，两个任务中总有恰好一个
+        的 ``_log_traceback`` 保持 ``True``（``done`` 是无序集合，具体是哪一
+        个不确定，但断言对全体任务遍历，必有一个由绿转红）；恢复后复绿。
+        """
+
+        from unittest.mock import patch
+
+        class TwoImmediateFailuresQueue:
+            """两个任务都在没有任何 ``await`` 的情况下同步抛异常——见
+            ``_process_task`` 的第一行就是 ``self._queue.task_context(...)``，
+            没有任何前置 ``await``，因此两个 ``Task`` 都会在事件循环下一次
+            真正运行到它们之前就已经被 ``call_soon`` 排队，`asyncio.wait()`
+            真正挂起前的同一轮就会把两者都跑完。"""
+
+            def __init__(self) -> None:
+                self._claimed = False
+
+            def claim(self, *, limit: int, **kwargs: object) -> list[ClaimedTask]:
+                if self._claimed:
+                    return []
+                self._claimed = True
+                return [
+                    ClaimedTask(
+                        task_id=f"tsk-boom-{i}",
+                        conversation_id=f"cnv-boom-{i}",
+                        user_id="usr-boom",
+                        prompt="p",
+                        resumed_session=False,
+                        target_worker_version="stable",
+                        attempts=1,
+                        reply_to_message_id=f"msg-boom-{i}",
+                    )
+                    for i in range(2)
+                ]
+
+            def task_context(self, *, task_id: str, **kwargs: object):
+                raise RuntimeError(f"注入失败：{task_id}")
+
+        queue = TwoImmediateFailuresQueue()
+        service = WorkerService(
+            config=worker_config(max_concurrency=4, poll_interval_seconds=0.02),
+            queue=queue,
+            executor_factory=lambda config, marker: None,
+        )
+
+        created_tasks: list[asyncio.Task] = []
+        real_create_task = asyncio.create_task
+
+        def recording_create_task(coro, *args, **kwargs):
+            task = real_create_task(coro, *args, **kwargs)
+            created_tasks.append(task)
+            return task
+
+        async def scenario() -> None:
+            with self.assertRaises(RuntimeError):
+                await service.process_once()
+
+        with patch(
+            "lingxi.apps.worker.service.asyncio.create_task",
+            side_effect=recording_create_task,
+        ):
+            asyncio.run(scenario())
+
+        self.assertEqual(len(created_tasks), 2, "两个任务都应该被领取并各自创建成 Task")
+        for task in created_tasks:
+            self.assertTrue(task.done())
+            self.assertIsInstance(task._exception, RuntimeError)
+            self.assertFalse(
+                task._log_traceback,
+                "两个任务的异常都必须已经被取回（各自调用过一次 "
+                ".exception()/.result()），否则 asyncio 会在垃圾回收时打一条 "
+                "'Task exception was never retrieved' 噪音日志",
+            )
+
 
 class SemanticProgressTests(unittest.TestCase):
     """Issue #321 方向 C：语义化等待进度——工具调用阶段文案 + 兜底刷新
