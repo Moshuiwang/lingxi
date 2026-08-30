@@ -24,11 +24,11 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Mapping, Protocol, Sequence
 
 
 class AdminDisplayNames(Protocol):
-    """管理员可见展示名解析口。三个方法都只读，不做任何权限判断——是否应当
+    """管理员可见展示名解析口。方法都只读，不做任何权限判断——是否应当
     展示这条信息由调用方决定，本接口只负责"把已经决定要展示的标识翻译成什么
     文本"。
     """
@@ -48,4 +48,22 @@ class AdminDisplayNames(Protocol):
     def metric_label(self, *, metric_id: str) -> str:
         """把指标 ID 反查成中文别名（``config/admin_metric_alias_map.toml``）；
         查无别名时原样返回 ``metric_id``，理由同 :meth:`company_label`。"""
+        ...
+
+    def company_labels(self, *, company_ids: Sequence[str]) -> Mapping[str, str]:
+        """:meth:`company_label` 的批量变体（Trace #469 修复包 B，B-7：连接
+        风暴收敛）——一次调用翻译一组公司编号，语义与逐个调用
+        :meth:`company_label` 完全等价（查无中文名时该编号原样出现在返回映射
+        里），唯一区别是真实实现只需为整批 ID 建立**一次**数据库连接批次
+        查询，而不是每个编号各自建连接。管理卡渲染这类"一次渲染要翻译几十个
+        编号"的场景应当调用这个方法而不是循环调用 :meth:`company_label`——
+        见 ``core/admin/management_card.render_management_card`` 与
+        ``adapters/admin_registry.PostgresAdminQueries.company_labels`` 的
+        连接数对比。空输入返回空映射。"""
+        ...
+
+    def metric_labels(self, *, metric_ids: Sequence[str]) -> Mapping[str, str]:
+        """:meth:`metric_label` 的批量变体，同上一条注释同一理由——真实实现
+        是文件读取而非数据库连接，批量的收益是"只读一次映射文件"而不是每个
+        指标各读一次，同一份收敛姿势。空输入返回空映射。"""
         ...

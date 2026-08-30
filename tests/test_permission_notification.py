@@ -161,7 +161,11 @@ class RenderTest(unittest.TestCase):
 
 
 class _FakeCompanyNames:
-    """``CompanyNameResolver`` 的内存假实现：固定映射，未命中返回 ``None``。"""
+    """``CompanyNameResolver`` 的内存假实现：固定映射，未命中返回 ``None``。
+
+    ``names_for``（Trace #469 修复包 B，B-7）就地委托给单个查询——``describe_
+    scope`` 自本批起只调用批量端口，不再调用 ``name_for``；内存假实现没有
+    真实实现要收敛的连接成本，批量与逐个调用语义完全等价。"""
 
     def __init__(self, names: dict[str, str]) -> None:
         self._names = names
@@ -169,9 +173,15 @@ class _FakeCompanyNames:
     def name_for(self, *, company_id: str) -> str | None:
         return self._names.get(company_id)
 
+    def names_for(self, *, company_ids):
+        return {company_id: self.name_for(company_id=company_id) for company_id in company_ids}
+
 
 class _RaisingCompanyNames:
     def name_for(self, *, company_id: str) -> str | None:
+        raise RuntimeError("模拟解析口本身故障")
+
+    def names_for(self, *, company_ids):
         raise RuntimeError("模拟解析口本身故障")
 
 
@@ -206,6 +216,9 @@ class CompanyNameResolutionTest(unittest.TestCase):
             def name_for(self, *, company_id: str) -> str | None:
                 raise AssertionError("通配分支不应该调用 company_names")
 
+            def names_for(self, *, company_ids):
+                raise AssertionError("通配分支不应该调用 company_names")
+
         companies, _ = describe_scope(
             {"*": ["日活"]}, company_names=_AssertNotCalled()
         )
@@ -232,6 +245,56 @@ class CompanyNameResolutionTest(unittest.TestCase):
         self.assertIn("壹壹测试公司（1011）", notice.text)
         self.assertIn("壹贰测试公司（1012）", notice.text)
         self.assertNotIn("1011、1012", notice.text)
+
+
+class _ConnectionCountingCompanyNames:
+    """模拟真实实现连接成本的计数假实现（Trace #469 修复包 B，B-7）：与
+    ``tests/test_management_card.ConnectionCountingDisplayNames`` 同一姿态
+    ——``names_for``（批量）与 ``name_for``（单项）各自记一次调用花费的
+    "连接数"，用于证明 ``describe_scope`` 确实改走批量端口一次性处理整批
+    公司编号，而不是对每个编号各自触发一次单项调用。"""
+
+    _COST_PER_CALL = 2
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self._names = names
+        self.connection_count = 0
+        self.name_for_calls = 0
+        self.names_for_calls = 0
+
+    def name_for(self, *, company_id: str) -> str | None:
+        self.name_for_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return self._names.get(company_id)
+
+    def names_for(self, *, company_ids):
+        self.names_for_calls += 1
+        self.connection_count += self._COST_PER_CALL
+        return {cid: self._names.get(cid) for cid in company_ids}
+
+
+class ConnectionStormRegressionTest(unittest.TestCase):
+    """Trace #469 修复包 B，B-7：``describe_scope`` 此前对权限文档里每一个
+    公司编号各自调用一次 ``CompanyNameResolver.name_for``——真实实现每次
+    调用都新建两条数据库连接，与 ``core/admin`` 侧的连接风暴同构（外部审查
+    交叉裁定）。修复后单次调用的连接数应当是与公司数量无关的常数上界。"""
+
+    def test_a_single_call_stays_within_a_small_connection_budget(self) -> None:
+        company_names = _ConnectionCountingCompanyNames(
+            {f"c{i}": f"公司{i}" for i in range(40)}
+        )
+        document = {f"c{i}": ["日活"] for i in range(40)}
+
+        describe_scope(document, company_names=company_names)
+
+        self.assertLessEqual(
+            company_names.connection_count,
+            5,
+            "一次调用的连接数应当是与公司数量无关的常数上界，不应随权限文档"
+            "里的公司数量线性增长",
+        )
+        self.assertEqual(company_names.names_for_calls, 1)
+        self.assertEqual(company_names.name_for_calls, 0)
 
 
 class DedupeKeyTest(unittest.TestCase):
