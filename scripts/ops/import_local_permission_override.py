@@ -40,6 +40,15 @@ zhang.san@example.com,"{""1011"": [""日活""]}"
 Feishu 多维表格产生这份 CSV、导入前如何抽样核对，写在 #263 的切换清单里，不在
 本工具范围。
 
+**任意一行 ``permissions`` 使用了 :data:`~lingxi.core.permission.publish_row.
+ALL_COMPANIES_KEY`（``"*"``）键，同样整份导出拒绝导入**（rc21 修复包 B）：旧表
+自己写的"*"通配与本工具在银河一侧判定的"通配管理员"是两个不相关的概念，把它
+当作普通 ``company_id="*"`` 写进 ``local_permission_override`` 会让该用户凭一条
+本地授权行跨公司越权（读侧 ``lookup_metrics`` 的"*"回退制对任何没有具体公司键
+命中的查询都会命中这一行）。旧表通配用户的平移方式留 #263 由 PM 单裁，本工具
+不猜、不代为决定，命中即整份拒绝——dry-run（含未来的 ``--apply``）都会看到同一
+条拒绝原因。
+
 ## 输入二：当前银河快照（从库读，不需要额外文件）
 
 对旧表里出现的每一个邮箱，本工具按**与每日权限重算完全相同**的匹配 + 聚合 +
@@ -64,8 +73,14 @@ Feishu 多维表格产生这份 CSV、导入前如何抽样核对，写在 #263 
 - 银河判定有权限但翻译层（公司+职能→指标名）覆盖不全（fail-closed，与每日
   重算同一姿态，不产出部分结果）。
 
-银河侧命中 513 通配管理员（``all_companies=True``）时，视为银河已经覆盖旧表
-可能给出的任何具体公司权限，该用户差集恒为空，不导入。
+银河侧命中通配（``all_companies=True``——不论是 513 通配管理员走「全非」范围，
+还是「角色即全公司」B 口径特例，两种形态下 :func:`resolve_galaxy_current` 的
+产出都只有 :data:`~lingxi.core.permission.publish_row.ALL_COMPANIES_KEY` 一个
+键）时，视为银河已经覆盖旧表可能给出的任何具体公司权限，该用户差集恒为空、
+不导入——**登记进 dry-run 清单的"跳过"一栏**（原因码
+:data:`REASON_WILDCARD_GALAXY_CURRENT`，rc21 修复包 B 前是静默零输出，人工
+核对时分不清"银河已覆盖"与"这个人在旧表里本来就没数据"）；有限通配下差集
+语义能否再精细化留 #263 裁定，本工具现在一律按恒空处理。
 
 ## 幂等
 
@@ -94,14 +109,17 @@ Feishu 多维表格产生这份 CSV、导入前如何抽样核对，写在 #263 
 
 ## 用法
 
+**写入极性（rc21 修复包 B）：默认只出计划，不写入任何一行；要真正写入必须显式
+加 `--apply`**——``--dry-run`` 保留为该默认行为的兼容别名。
+
 ```
 export LINGXI_POSTGRES_DSN='postgresql://...'
 PYTHONPATH=src python3 scripts/ops/import_local_permission_override.py \\
-    /path/to/legacy_export.csv --initiated-by ou_xxx --dry-run
-
-# 核对无误后去掉 --dry-run 真正写入
-PYTHONPATH=src python3 scripts/ops/import_local_permission_override.py \\
     /path/to/legacy_export.csv --initiated-by ou_xxx
+
+# 核对无误后加 --apply 真正写入
+PYTHONPATH=src python3 scripts/ops/import_local_permission_override.py \\
+    /path/to/legacy_export.csv --initiated-by ou_xxx --apply
 ```
 
 ``--dsn`` 可覆盖 ``LINGXI_POSTGRES_DSN``；两者都缺失时拒绝运行。凭据只从环境
@@ -248,6 +266,11 @@ REASON_GALAXY_ACCOUNT_PREFIX = "galaxy_account_"
 REASON_TRANSLATION_UNAVAILABLE = "metric_translation_unavailable"
 REASON_TRANSLATION_UNCOVERED = "metric_translation_uncovered"
 
+#: :func:`plan_import` 在 ``galaxy_current`` 命中 :data:`~lingxi.core.
+#: permission.publish_row.ALL_COMPANIES_KEY` 时登记的跳过原因码（rc21 修复包 B，
+#: P1+P2+P3 之 b）——见 :func:`plan_import` 内该分支上方注释。
+REASON_WILDCARD_GALAXY_CURRENT = "wildcard_galaxy_current"
+
 
 def resolve_galaxy_current(
     *,
@@ -343,6 +366,30 @@ def plan_import(
             continue
         assert galaxy_current is not None  # skip_reason is None ⇒ 有值（上面已返回）
 
+        if ALL_COMPANIES_KEY in galaxy_current:
+            # rc21 修复包 B（opus 审查发现，P1+P2+P3 之 b）：银河此刻能给这个人
+            # 的结果命中通配——不论走到这里的是「全非」``scope.all_countries``
+            # 那一条路径，还是「角色即全公司」B 口径特例（持有
+            # ``ADMIN_FULL_ACCESS_FUNCTION`` 时强制 ``all_companies=True``，
+            # 详见 ``publish_row.aggregate_permission`` 模块文档），
+            # :func:`translate_company_functions` 对两者的产出都只有
+            # :data:`ALL_COMPANIES_KEY` 这一个键——`compute_company_diff` 判定
+            # 两种通配形态下差集**恒为空**这件事本身不变（旧表可能给出的任何
+            # 具体公司权限视为已被银河覆盖）。这里改变的只是**可见性**：以前
+            # 直接调 `compute_company_diff` 拿到空字典、不产出任何 grant 也不
+            # 产出任何 skip，人工核对 dry-run 清单时完全看不出"这个用户为什么
+            # 一条差集都没有"——是银河真的已经覆盖，还是这个用户在
+            # `legacy` 里本来就没有数据？现在显式登记进 skipped 清单，原因码
+            # 可分辨（:data:`REASON_WILDCARD_GALAXY_CURRENT`）。
+            #
+            # **有限通配的差集语义留 #263 裁定**：这里按"银河给了通配就当作
+            # 已经覆盖旧表任何具体公司权限"处理，不检查通配那份指标列表是否
+            # 真的完整覆盖了旧表这个用户在各公司下的每一项——如果将来产品
+            # 需要更精细的"通配下也可能有旧表独有指标"语义，判定逻辑要在
+            # #263 里另行设计，本工具现在不做这个推测，一律按恒空差集处理。
+            skipped.append(SkippedUser(email=email, reason=REASON_WILDCARD_GALAXY_CURRENT))
+            continue
+
         diff = compute_company_diff(legacy[email], galaxy_current)
         for company_id in sorted(diff):
             for metric_name in diff[company_id]:
@@ -378,9 +425,29 @@ def load_legacy_export(path: Path) -> dict[str, dict[str, tuple[str, ...]]]:
             if email in result:
                 raise ValueError(f"邮箱 {email} 在导出文件中出现多行，无法判定以哪一行为准")
             try:
-                result[email] = dict(parse_permissions(row.get("permissions")))
+                permissions = dict(parse_permissions(row.get("permissions")))
             except ValueError as error:
                 raise ValueError(f"第 {row_number} 行（{email}）permissions 列解析失败：{error}") from error
+            if ALL_COMPANIES_KEY in permissions:
+                # rc21 修复包 B（opus 审查发现，P1+P2+P3 之 a）：旧表本身出现
+                # ALL_COMPANIES_KEY（"*"）键，整份导出拒绝导入——不是这一行
+                # 单独跳过。旧表的"*"是 biai-agent 自己的通配写法，与本工具
+                # `resolve_galaxy_current` 判定的"银河侧通配"是完全不同的两件
+                # 事：把它当成一个普通 ``company_id="*"`` 写进
+                # ``local_permission_override``，会让这个人凭一条本地授权行
+                # 跨公司越权（``lookup_metrics`` 的"*"回退制对**任何**没有具体
+                # 公司键命中的查询都会命中这一行）。旧表通配用户到底该怎么
+                # 平移，不是本工具能替 PM 决定的产品口径，留 #263 由 PM 单裁；
+                # 本工具在能确定"这份导出里有一个这种用户"的这一刻就整体拒绝，
+                # 不猜、不跳过这一行继续导入其余用户——一份导出里混着一个
+                # 通配用户，人工核对时也无法只看 dry-run 清单确认其余行没有
+                # 被这条本该拒绝的规则污染。
+                raise ValueError(
+                    f"第 {row_number} 行（{email}）permissions 使用了旧表通配键"
+                    f' "{ALL_COMPANIES_KEY}"：旧表通配用户的平移方式留 #263 由'
+                    " PM 单裁，本工具拒绝导入整份导出。"
+                )
+            result[email] = permissions
     return result
 
 
@@ -545,7 +612,15 @@ def main(argv: list[str] | None = None) -> int:
         help="本次导入的责任人飞书 open_id，写入每一行的 initiated_by_open_id/decided_by_open_id",
     )
     parser.add_argument("--dsn", default=None, help="PostgreSQL DSN；缺省读 LINGXI_POSTGRES_DSN")
-    parser.add_argument("--dry-run", action="store_true", help="只计算并打印差集清单，不写入任何一行")
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="真正写入这份差集计划；不传时（默认）只计算并打印计划，不写入任何一行",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="兼容别名：与不传 --apply 时的默认行为等价，只计算并打印计划，不写入任何一行"
+        "（与 --apply 同时给出时，按更保守的 --dry-run 处理）",
+    )
     parser.add_argument("--role-function-map", type=Path, default=None, help="覆盖随包发布的角色→职能映射文件")
     parser.add_argument("--metric-translation-map", type=Path, default=None, help="覆盖随包发布的公司+职能→指标名映射文件")
     arguments = parser.parse_args(argv)
@@ -601,9 +676,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     _print_plan(plan)
 
-    if arguments.dry_run:
-        print("--dry-run：以上仅为计划，未写入任何一行。")
+    # 写入极性（rc21 修复包 B，P1+P2+P3 之 c）：默认只出计划，不写入任何一行；
+    # 必须显式传 --apply 才真正落库——与改动前"默认写入、要传 --dry-run 才不写"
+    # 相反。反转理由：一次导入的默认后果理应是"什么都不发生"，误操作（漏传
+    # --dry-run）造成的是"该核对的计划没核对就已经写库"，比"想写却忘了加
+    # --apply、只看了一遍计划"危险得多。--dry-run 保留为该默认行为的兼容别名
+    # （旧的调用脚本/文档继续可用，不会因为这次改动突然报"未知参数"）；两者
+    # 同时给出时按更保守的 --dry-run 处理，不写入。
+    if arguments.apply and arguments.dry_run:
+        print("同时给出 --apply 与 --dry-run：按更保守的 --dry-run 处理，未写入任何一行。")
         return 0
+    if not arguments.apply:
+        print("默认只出计划，不写入任何一行；确认无误后加 --apply 真正写入（--dry-run 是该默认行为的兼容别名）。")
+        return 0
+
+    print(f"即将写入 {len(plan.grants)} 行。")
 
     # 写入阶段：每条 PlannedGrant 各自开一条连接/事务（见 apply_grant 文档），
     # 不复用上面的只读连接——避免让整批导入共享同一个长事务、同一把连接级锁。

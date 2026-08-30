@@ -121,7 +121,7 @@ curl --silent --show-error --request POST \
   'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id' \
   --header "Authorization: Bearer ${tenant_access_token}" \
   --header 'Content-Type: application/json; charset=utf-8' \
-  --data "{\"receive_id\":\"${user_id}\",\"msg_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"灵犀验证：已按关联组织架构和工作邮箱确认你的身份。这是一条由 StarTimes 中心机器人发送的测试消息。\\\"}\"}" \
+  --data "{\"receive_id\":\"${user_id}\",\"msg_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"BI Plus 验证：已按关联组织架构和工作邮箱确认你的身份。这是一条由 StarTimes 中心机器人发送的测试消息。\\\"}\"}" \
   --output "${message_file}"
 if [[ "$(jq -r '.code // empty' "${message_file}")" != '0' ]]; then
   printf '已按组织架构及邮箱确认身份，但消息发送失败：\n'
