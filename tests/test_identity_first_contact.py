@@ -214,8 +214,8 @@ class DecideFirstContactTest(unittest.TestCase):
         self.assertEqual(
             decision.message,
             "当前没有可用的银河权限，请先在银河申请或补充权限。"
-            "银河权限生效并完成同步后，请再回到 Lingxi 使用。"
-            "Lingxi 不能代替你申请或扩大银河权限。"
+            "银河权限生效并完成同步后，请再回到 BI Plus 使用。"
+            "BI Plus 不能代替你申请或扩大银河权限。"
             "如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
         )
         self.assertNotIn("人工核对", decision.message)
@@ -457,8 +457,8 @@ class UserFacingMessageTest(unittest.TestCase):
         self.assertEqual(
             not_authorized.message,
             "当前没有可用的银河权限，请先在银河申请或补充权限。"
-            "银河权限生效并完成同步后，请再回到 Lingxi 使用。"
-            "Lingxi 不能代替你申请或扩大银河权限。"
+            "银河权限生效并完成同步后，请再回到 BI Plus 使用。"
+            "BI Plus 不能代替你申请或扩大银河权限。"
             "如果你在银河已经有权限但仍看到此提示，请联系银河管理员。",
         )
         self.assertEqual(not_authorized.content_key, "onboarding.not_authorized")

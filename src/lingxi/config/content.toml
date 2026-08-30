@@ -1,16 +1,16 @@
 [meta]
-version = "2026-08-29-1"
+version = "2026-08-30-1"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
-"onboarding.matched" = "已核对到你的银河权限，正在完成 Lingxi 开通和权限同步，请稍候。同步完成后会通知你。"
+"onboarding.matched" = "已核对到你的银河权限，正在完成 BI Plus 开通和权限同步，请稍候。同步完成后会通知你。"
 # 权限发布已排出、进入同步等待时发送。正文的两段都来自产品合同：前半句是合同已批准的
 # 「已核对到银河权限、正在完成开通和权限同步」，后半句是合同「权限同步期间，卡片明确显示
 # 『权限正在同步，预计最多需要十五分钟』，用户无需重复开通」的逐字要求。合并成一次发送，
 # 避免连着推两条只差一句话的消息。
-"onboarding.syncing" = "已核对到你的银河权限，正在完成 Lingxi 开通和权限同步。权限正在同步，预计最多需要十五分钟，无需重复开通。同步完成后会通知你。"
-"onboarding.completed" = "开通完成，你现在可以开始使用 Lingxi。当前可用范围：公司：{company_name}；职能：{function_name}。"
-"onboarding.not_authorized" = "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 Lingxi 使用。Lingxi 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
+"onboarding.syncing" = "已核对到你的银河权限，正在完成 BI Plus 开通和权限同步。权限正在同步，预计最多需要十五分钟，无需重复开通。同步完成后会通知你。"
+"onboarding.completed" = "开通完成，你现在可以开始使用 BI Plus。当前可用范围：公司：{company_name}；职能：{function_name}。"
+"onboarding.not_authorized" = "当前没有可用的银河权限，请先在银河申请或补充权限。银河权限生效并完成同步后，请再回到 BI Plus 使用。BI Plus 不能代替你申请或扩大银河权限。如果你在银河已经有权限但仍看到此提示，请联系银河管理员。"
 # Issue #280 裁定 B2-4：加追溯号，占位名不能叫 trace_id（内容安全规则见 content.py
 # 的 _PROCESS_MARKER_PATTERN，用 {reference} 代替，见联合设计 §0.1）。
 "onboarding.sync_timeout" = "权限同步未完成，已转交处理，无需重复开通。追溯号：{reference}。"
@@ -29,10 +29,10 @@ version = "2026-08-29-1"
 # 且不泄露名单机制本身的存在与内部细节——因此不说「你不在名单中」「无可用银河权限」
 # （后者会误导用户去银河申请一个与本闸无关的权限），也不带错误码/追溯号（这是确定性
 # 业务结论，不是需要管理员介入的内部故障）。
-"onboarding.innertest_not_open" = "Lingxi 目前处于内测阶段，暂未向你开放。感谢你的关注，欢迎稍后再来试试。"
+"onboarding.innertest_not_open" = "BI Plus 目前处于内测阶段，暂未向你开放。感谢你的关注，欢迎稍后再来试试。"
 
 "gateway.busy_hint" = "当前任务仍在处理中"
-"gateway.suspended" = "你的 Lingxi 账号当前已停用，暂时无法发起新的问数。"
+"gateway.suspended" = "你的 BI Plus 账号当前已停用，暂时无法发起新的问数。"
 "gateway.queue_failed" = "消息已收到，但当前暂时无法开始处理，请稍后重试。错误码：LX-QUEUE-001"
 "gateway.delivery_expired" = "上一次问数结果因超过投递时限未能确认送达，已过期，请重新提问。"
 "gateway.new_session" = "已开启新会话，可以开始提问。"

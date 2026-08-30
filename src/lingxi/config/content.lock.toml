@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-08-29-1"
-digest = "sha256:d74b57f86686ca59353373d9b0365baa7d1fb19ae22adf89f51e17a2cfdc1c65"
+version = "2026-08-30-1"
+digest = "sha256:500950c2182b750efe1a4dd3fd20b5e0a328bbf805776c420531e8373d32e8ef"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -25,6 +25,7 @@ retired_versions = [
   "2026-08-28-2",
   "2026-08-28-3",
   "2026-08-28-4",
+  "2026-08-29-1",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -50,7 +51,7 @@ retired_versions = [
 "texts.gateway.queue_failed" = "c5c6ac5c10a031fa"
 "texts.gateway.session_rotated" = "df77349f3165a8cb"
 "texts.gateway.slash_rejected" = "9b97c561e83c0302"
-"texts.gateway.suspended" = "367f5c5462e3358e"
+"texts.gateway.suspended" = "dfe76626dc97ecce"
 "texts.memory.cleared" = "69a517b197f284af"
 "texts.memory.forget_not_found" = "230bcb25eb539164"
 "texts.memory.forgotten" = "8dd2951f8b668251"
@@ -66,15 +67,15 @@ retired_versions = [
 "texts.memory.type_label.term_mapping" = "6030911f16b8b73d"
 "texts.memory.usage_help" = "6abdb399dc856115"
 "texts.onboarding.checking" = "738d208e40a19f0b"
-"texts.onboarding.completed" = "4733d8c930485684"
+"texts.onboarding.completed" = "e6e721e2af6a2d7d"
 "texts.onboarding.delegated_subject" = "2d5caff476da0546"
-"texts.onboarding.innertest_not_open" = "920b258002a0bec2"
+"texts.onboarding.innertest_not_open" = "b5ede80f7add1eda"
 "texts.onboarding.internal_error" = "c7bef626a5602d4a"
-"texts.onboarding.matched" = "601320747836f485"
-"texts.onboarding.not_authorized" = "70b661df834988e6"
+"texts.onboarding.matched" = "21cf0e7d79a0a085"
+"texts.onboarding.not_authorized" = "c4dfa61c10679764"
 "texts.onboarding.stalled" = "1e38f737f519eda2"
 "texts.onboarding.sync_timeout" = "332dedd2c0cff9e1"
-"texts.onboarding.syncing" = "475f3fd7a4b4a4e4"
+"texts.onboarding.syncing" = "224868e8a7c923cf"
 "texts.permission.all_companies" = "a6c7411df8878f06"
 "texts.permission.range_revoked" = "5b06514b6afaebb3"
 "texts.permission.range_updated" = "5fe3ad7738e8f859"
