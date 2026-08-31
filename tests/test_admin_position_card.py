@@ -210,6 +210,48 @@ class PositionManagementCardTests(unittest.TestCase):
             element.get("content", "") for element in elements if element.get("tag") == "markdown"
         ))
 
+    def test_cardkit_failure_does_not_advance_visual_watermark_before_success(self) -> None:
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def update(self, **kwargs) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("CardKit transient")
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_cardkit_failure",
+            identifier="u@example.com",
+            card_id="card_cardkit_failure",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        store.update_state(
+            message_id="om_cardkit_failure", state="effective", dispatch_status="effective"
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_PositionCatalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+        context = store.lookup_context(message_id="om_cardkit_failure")
+        assert context is not None
+        with self.assertRaises(RuntimeError):
+            refresher.update(context=context, status=_status(), state="effective")
+        self.assertEqual(len(store.list_needing_refresh()), 1)
+
+        context = store.lookup_context(message_id="om_cardkit_failure")
+        assert context is not None
+        refresher.update(context=context, status=_status(), state="effective")
+        self.assertEqual(store.list_needing_refresh(), ())
+
     def test_visual_update_failure_keeps_persistent_refresh_watermark_for_retry(self) -> None:
         from lingxi.apps.gateway import _ManagementCardRecoveryScanner
 
