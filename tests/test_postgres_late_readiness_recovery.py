@@ -126,6 +126,7 @@ class LateReadinessRecoveryPostgresTestCase(unittest.TestCase):
         """发布一版权限并读回一致，返回 ``permission_version``。"""
 
         decision = self.publish_store.record_decision(
+            require_enabled_account=True,
             user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
         )
         claimed = self.publish_store.claim_next()
@@ -239,6 +240,7 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
     def test_an_intent_owned_by_another_orchestrator_is_not_a_candidate(self) -> None:
         version = self.publish_store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         ).permission_version
         self.publish_store.claim_next()

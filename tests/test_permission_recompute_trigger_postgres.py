@@ -131,6 +131,7 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             token_cipher=TOKEN_CIPHER,
         )
         decision = self.publish_store.record_decision(
+            require_enabled_account=True,
             user_id=user_id,
             row=row,
             reason="test_seed",

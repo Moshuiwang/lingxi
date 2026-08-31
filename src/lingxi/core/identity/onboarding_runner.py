@@ -256,6 +256,7 @@ from lingxi.core.permission.metric_translation import (
     translate_company_functions,
 )
 from lingxi.core.permission.notification import describe_scope
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     STATUS_APPROVED,
@@ -898,7 +899,7 @@ class AutoOnboardingRunner:
         stalled["user_id"] = user_id
 
         self._stop_guard()
-        published = self._publish(user_id, request, aggregate, issued)
+        published = self._publish(user_id, request, aggregate, issued, trace_id=trace_id)
         if isinstance(published, _Terminal):
             return published
         permission_version, permissions = published
@@ -1220,6 +1221,8 @@ class AutoOnboardingRunner:
         request: ProvisioningRequest,
         aggregate: Any,
         issued: Any,
+        *,
+        trace_id: str,
     ) -> _Terminal | tuple[int, str]:
         if not request.email:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
@@ -1309,12 +1312,34 @@ class AutoOnboardingRunner:
             decided_at=self._clock(),
             token_cipher=issued.token_cipher,
         )
-        decision = self._decisions.record_decision(
-            user_id=user_id,
-            row=row,
-            reason=FIRST_ONBOARDING_REASON,
-            decided_at=self._clock(),
-        )
+        try:
+            decision = self._decisions.record_decision(
+                user_id=user_id,
+                row=row,
+                reason=FIRST_ONBOARDING_REASON,
+                # Issue #483：首次开通同样是一份**需要账号有效**的授权。`_recheck_
+                # still_provisionable` 已经复核过一次账号状态，但那次复核到这里之间
+                # 隔着令牌签发与用户环境创建——管理员恰好在这个窗口停用账号是真实
+                # 形状，只有落决定那把行锁里的复检能真正把它串起来。
+                require_enabled_account=True,
+                decided_at=self._clock(),
+            )
+        except PermissionGrantBlockedByAccountState as blocked:
+            # **必须收敛到既有的停用终态，不能变成通用内部故障**：模块文档
+            # 「``account_state != 'enabled'`` → 停止开通，不建环境、不发权限，用户按
+            # 「账号已停用」告知」说的正是这一种，用户看到的仍是「你的 BI Plus 账号
+            # 当前已停用」。审计动作与 `_recheck_still_provisionable`/`_confirm` 两处
+            # 复核逐字相同——运维按同一个动作名检索"这条开通链因为账号状态停下了"，
+            # 不需要区分是哪一次复核抓到的。事务整体回滚：版本没推进、意图没入队。
+            self._audit.record(
+                "onboarding.halted_account_state",
+                user=user_id,
+                account_state=blocked.account_state,
+                trace_id=trace_id,
+            )
+            return _Terminal(
+                OnboardingState.NOT_AUTHORIZED, KEY_SUSPENDED, reason="account_not_enabled"
+            )
         version = int(decision.permission_version)
         # ``UNCHANGED`` 也要等：那一条意图可能还停在 ``pending``（重入、或每日重算刚排出
         # 来还没被消费）。跳过等待会让"发布面根本没跑"表现成十五分钟的 MCP 同步超时——

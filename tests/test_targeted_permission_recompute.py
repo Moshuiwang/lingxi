@@ -26,6 +26,7 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
 from lingxi.core.permission.targeted_recompute import (
     RecomputeKind,
+    SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
     SKIP_MATCH_FAILED,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
@@ -445,6 +446,67 @@ class ForceRevokeVsRecomputeDoNotConflateTest(unittest.TestCase):
         self.assertEqual(outcome.kind, RecomputeKind.REVOKED)
         [call] = parts["decisions"].calls
         self.assertEqual(call["row"].permissions, "{}")
+
+
+class AccountStateDeclarationTest(unittest.TestCase):
+    """Issue #483 缺口②：本模块两条落决定路径的账号状态声明，以及被挡时的收口。
+
+    复检本身在 ``record_decision`` 的行锁里（只有真库能证伪，见
+    ``tests/test_permission_refresh_postgres.py::SuspendedUserLocalPermissionActionTest``）；
+    这里钉的是**纯编排层**：授权侧声明"需要账号有效"、撤权侧声明"不要求"，被挡时走
+    可分辨的跳过码而不是异常上抛。
+    """
+
+    def test_the_publish_path_declares_that_it_needs_an_enabled_account(self) -> None:
+        recompute, parts = build_recompute(identities=(identity(),), published_users={USER_ONE})
+
+        recompute.recompute_and_publish(user_id=USER_ONE)
+
+        [call] = parts["decisions"].calls
+        self.assertIs(call["require_enabled_account"], True)
+
+    def test_the_revocation_path_declares_that_it_does_not(self) -> None:
+        """挡住撤权 = 停用彻底失效：这条声明写反是本次修复后果最严重的一处错误。"""
+
+        recompute, parts = build_recompute(identities=(identity(),), published_users={USER_ONE})
+
+        recompute.force_revoke(user_id=USER_ONE)
+
+        [call] = parts["decisions"].calls
+        self.assertIs(call["require_enabled_account"], False)
+
+    def test_a_blocked_publish_becomes_a_distinguishable_skip(self) -> None:
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            decisions=FakeDecisions(blocked_users={USER_ONE}),
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, SKIP_ACCOUNT_NOT_ENABLED)
+        skipped = parts["audit"].fields_for("permission_targeted_recompute.skipped")
+        self.assertEqual(skipped[-1]["reason"], SKIP_ACCOUNT_NOT_ENABLED)
+        self.assertEqual(skipped[-1]["account_state"], "suspended")
+        self.assertEqual(parts["decisions"].calls, [], "被挡的决定一个字节都没落库")
+
+    def test_a_blocked_publish_does_not_fall_back_to_a_revocation(self) -> None:
+        """否定断言：被挡**不等于**"那就撤权吧"。
+
+        自动改排撤权会把一次账号状态守卫变成一次静默的权限变更——这个人的发布内容
+        应当维持现状（停用那一刻的即时撤权已经处理过它），本模块不再多写一次。
+        """
+
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            published_users={USER_ONE},
+            decisions=FakeDecisions(blocked_users={USER_ONE}),
+        )
+
+        recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(parts["decisions"].calls, [])
 
 
 if __name__ == "__main__":

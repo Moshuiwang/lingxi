@@ -43,15 +43,25 @@ from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
 from lingxi.apps.scheduler.permission_refresh import (
     PERMISSION_REVOKE_REASON,
     REASON_FULLY_SUPPRESSED,
+    SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_NO_PUBLISHED_ROW,
     PermissionRefreshDuty,
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     STATUS_PUBLISHED,
+    ExistingPermissionRow,
     PublishAttempt,
     PublishOutcome,
     publish_claim,
+)
+from lingxi.core.permission.targeted_recompute import (
+    ADMIN_TARGETED_REVOKE_REASON,
+    RecomputeKind,
+    TargetedPermissionRecompute,
+)
+from lingxi.core.permission.targeted_recompute import (
+    SKIP_ACCOUNT_NOT_ENABLED as TARGETED_SKIP_ACCOUNT_NOT_ENABLED,
 )
 
 
@@ -273,9 +283,11 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
         return PostgresMcpTokenStore(self._dsn, cipher=McpTokenCipher(SPEC_MASTER_KEY))
 
     def _duty(
-        self, *, metric_translation_map=None, local_overrides=None
+        self, *, metric_translation_map=None, local_overrides=None, publish_store=None
     ) -> PermissionRefreshDuty:
-        publish_store = PostgresPermissionPublishStore(self._dsn)
+        # ``publish_store`` 可注入：Issue #483 的交错用例要在真实 store 外面包一层
+        # **只控制先后顺序、不改变任何被测判据**的装饰器（见 WindowSuspendTest）。
+        publish_store = publish_store or PostgresPermissionPublishStore(self._dsn)
         return PermissionRefreshDuty(
             baseline_reader=PostgresPermissionRefreshBaselineReader(self._dsn),
             roster_snapshot=PostgresRosterSnapshotStore(self._dsn),
@@ -330,6 +342,44 @@ class PermissionRefreshPostgresTestCase(unittest.TestCase):
                 "UPDATE app_user SET account_state = %s, updated_at = now() WHERE id = %s",
                 (account_state, user_id),
             )
+
+
+class _RecordingTransport:
+    """记录每一次外部写入，把"发布行有没有被回发"这条断言钉在**外部调用层**。
+
+    为什么不用 :class:`_ExplodingTransport`（一次外部调用即断言失败）：修复之后窗口
+    用户仍然有一条**合法的撤权意图**要发出去（``force_revoke`` 排的那条），"零外部
+    调用"因此是错的判据。真正要证伪的是「**有没有任何一次外部写入把非空权限写回
+    这一行**」——那才是停用承诺被突破时用户侧真正会发生的事。
+    """
+
+    def __init__(self, existing: dict[str, dict] | None = None) -> None:
+        self._rows: dict[str, dict] = {rid: dict(fields) for rid, fields in (existing or {}).items()}
+        #: 每一次外部写入的 (record_id, 字段快照)。``record_id`` 为 ``None`` 表示新建。
+        self.writes: list[tuple[str | None, dict]] = []
+
+    def find_rows(self, *, record_key: str, email: str):
+        return tuple(
+            ExistingPermissionRow(record_id=record_id, fields=dict(fields))
+            for record_id, fields in self._rows.items()
+            if fields.get("record_key") == record_key or fields.get("email") == email
+        )
+
+    def create_row(self, fields):
+        record_id = f"rec_created_{len(self._rows) + 1}"
+        self._rows[record_id] = dict(fields)
+        self.writes.append((None, dict(fields)))
+        return record_id
+
+    def update_row(self, record_id, fields):
+        self._rows.setdefault(record_id, {}).update(fields)
+        self.writes.append((record_id, dict(fields)))
+
+    def read_row(self, record_id):
+        return dict(self._rows[record_id])
+
+    def permissions_written(self) -> list[str]:
+        return [fields["permissions"] for _record_id, fields in self.writes if "permissions" in fields]
 
 
 class _Clock:
@@ -952,6 +1002,351 @@ class GalaxySnapshotReaderTest(PermissionRefreshPostgresTestCase):
         self.assertEqual(snapshot.batch_id, second)
         # 两批的行数相同，因此只有批次标识能区分——读到的必须是新批次那一份。
         self.assertEqual(len(snapshot.user_rows), len(PERSONNEL))
+
+# --------------------------------------------------------------------------
+# Issue #483：落决定的行锁里复检账号状态
+# --------------------------------------------------------------------------
+
+
+class _SuspendDuringBatchStore:
+    """**只控制先后顺序、不改变任何被测判据**的装饰器（Issue #483 交错构造）。
+
+    在真实 :class:`PostgresPermissionPublishStore` 外面包一层：第一次为窗口用户调用
+    ``record_decision`` **之前**，先用生产同一姿态把这个人停用、再跑一次**生产装配**
+    的 ``TargetedPermissionRecompute.force_revoke``，然后才委托给真实实现。
+
+    **为什么这与真实竞态逐字等价**：``record_decision`` 自己建连接、自己开事务，它
+    只可能看到**已提交**的库状态。真实竞态里"停用 + 撤权"这两次写入同样是在批处理
+    读完基线之后、轮到这个人之前提交的。装饰器控制的只有"谁先提交"，停用写入与撤权
+    都是生产代码跑出来的，批处理读到的也是真实提交后的库状态——没有任何一处判据被
+    替换成假实现。不用线程、不用 sleep，因此确定性可复现。
+    """
+
+    def __init__(self, dsn: str, *, window_user: str, on_suspend) -> None:
+        self._inner = PostgresPermissionPublishStore(dsn)
+        self._dsn = dsn
+        self._window_user = window_user
+        self._on_suspend = on_suspend
+        self.suspended = False
+
+    def __getattr__(self, name):  # 其余方法原样委托给真实 store
+        return getattr(self._inner, name)
+
+    def record_decision(self, *, user_id: str, **kwargs):
+        if user_id == self._window_user and not self.suspended:
+            self.suspended = True
+            self._on_suspend()
+        return self._inner.record_decision(user_id=user_id, **kwargs)
+
+
+class AccountStateWindowTestCase(PermissionRefreshPostgresTestCase):
+    """#483 的共同底座：两个**都在基线里**的用户，资料逐字节相同。
+
+    ``SUSPENDED_USER`` 在本组用例里一开始被翻成 ``enabled``（他与 ``ACTIVE_USER``
+    的花名册/银河资料本就同源），这样"他最后没拿到权限"就只可能来自本次修复，不可能
+    来自"他本来就在基线之外"。基线按 ``id`` 排序，``usr_refresh_active`` 排在
+    ``usr_refresh_suspended`` 前面——对照用户先被处理，窗口正好落在他之后。
+    """
+
+    def _setup_two_active_users(self) -> None:
+        self._insert_users()
+        self._set_account_state(SUSPENDED_USER, "enabled")
+        self._write_roster_snapshot()
+        self._import_galaxy()
+        self._token_store().issue_token(ACTIVE_USER)
+        self._token_store().issue_token(SUSPENDED_USER)
+
+    def _publish_all_pending(self) -> dict[str, dict]:
+        """把当前全部 pending 意图推到 ``published``（模拟"我们真的发布成功过"），
+        返回 ``外部记录标识 → 字段快照``，供 :class:`_RecordingTransport` 预置。"""
+
+        store = PostgresPermissionPublishStore(self._dsn)
+        rows: dict[str, dict] = {}
+        seen: list[str] = []
+        while True:
+            claimed = store.claim_next(exclude=tuple(seen))
+            if claimed is None:
+                break
+            seen.append(claimed.outbox_id)
+            record_id = f"rec_{claimed.user_id}"
+            rows[record_id] = dict(claimed.payload)
+            store.complete(
+                PublishAttempt(
+                    outcome=PublishOutcome.PUBLISHED,
+                    outbox_id=claimed.outbox_id,
+                    user_id=claimed.user_id,
+                    permission_version=claimed.permission_version,
+                    attempts=claimed.attempts,
+                    action="create",
+                    external_record_id=record_id,
+                ),
+                status=STATUS_PUBLISHED,
+            )
+        return rows
+
+    def _force_revoke_like_production(self, user_id: str) -> None:
+        """跑一次**生产装配**的 ``force_revoke``——依赖照
+        ``adapters/postgres_permission_recompute_trigger.PermissionRecomputeAdapter``
+        构造（同一个 ``PostgresRosterBaselineReader``、同一个 publish store）。"""
+
+        recompute = self._production_recompute()
+        outcome = recompute.force_revoke(user_id=user_id)
+        assert outcome.kind is RecomputeKind.REVOKED, outcome
+
+    def _production_recompute(self) -> TargetedPermissionRecompute:
+        """按 ``PermissionRecomputeAdapter.trigger`` 的装配复刻一份定向重算。
+
+        **唯一的偏离**是两份内容配置（角色→职能、公司+职能→指标名）取本文件的夹具
+        而不是随包发布的文件：那两份文件在当前部署里是空的，用它们会让整条链停在
+        ``metric_translation_unavailable``，用例就变成"什么都没测"的假绿。判定链上的
+        每一个适配器（花名册基线、花名册快照、银河快照、发布 store、本地覆盖）都是
+        真实实现。
+        """
+
+        from lingxi.adapters.postgres_permission_recompute_trigger import (
+            _BaselineIdentityLookup,
+            _RosterRowsAdapter,
+        )
+        from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
+
+        publish_store = PostgresPermissionPublishStore(self._dsn)
+        return TargetedPermissionRecompute(
+            identities=_BaselineIdentityLookup(
+                PostgresRosterBaselineReader(self._dsn).load_active_baseline()
+            ),
+            roster_snapshot=_RosterRowsAdapter(PostgresRosterSnapshotStore(self._dsn)),
+            galaxy=PostgresGalaxySnapshotReader(self._dsn),
+            decisions=publish_store,
+            publish_history=publish_store,
+            role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP,
+            audit=self.audit,
+            local_overrides=local_override_reader(self._dsn),
+            clock=self.clock,
+        )
+
+    def _blocked_audits(self) -> list[dict]:
+        return [
+            fields
+            for action, fields in self.audit.records
+            if action == "permission_refresh.grant_blocked_account_state"
+        ]
+
+
+class WindowSuspendTest(AccountStateWindowTestCase):
+    """Issue #483：**基线读取之后、轮到这个人之前**被停用 + 排空权限。
+
+    这条用例只有真库能证伪：判据落在 ``record_decision`` 那把 ``SELECT ... FOR UPDATE``
+    里，与停用写入争的是**同一行的同一把锁**。假 store 上无论实现怎么写都是绿的。
+    """
+
+    def test_a_user_suspended_inside_the_window_never_gets_a_grant_back(self) -> None:
+        self._setup_two_active_users()
+
+        # 第一轮：两个人都拿到真实权限，并且真的"发布成功过"——撤权侧的
+        # `has_publish_footprint` 因此为真，`force_revoke` 才会真的排撤权行。
+        first = self._duty().run_once()
+        self.assertEqual(first.enqueued, 2)
+        external_rows = self._publish_all_pending()
+        self.assertEqual(len(external_rows), 2)
+
+        # 第二轮：批基线读到两个人都还有效；轮到窗口用户时，管理员刚好完成"停用 +
+        # 即时撤权"。
+        self.clock.advance(timedelta(days=1))
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        revoked_version: dict[str, int] = {}
+
+        def suspend_and_revoke() -> None:
+            self._set_account_state(SUSPENDED_USER, "suspended")
+            self._force_revoke_like_production(SUSPENDED_USER)
+            revoked_version["value"] = self._version(SUSPENDED_USER)
+            self.assertEqual(
+                self._latest_payload(SUSPENDED_USER)["permissions"],
+                "{}",
+                "即时撤权必须先把发布内容清空——这是本用例要防止被批处理盖回去的那一版",
+            )
+
+        decorated = _SuspendDuringBatchStore(
+            self._dsn, window_user=SUSPENDED_USER, on_suspend=suspend_and_revoke
+        )
+        report = self._duty(publish_store=decorated).run_once()
+
+        self.assertTrue(decorated.suspended, "交错必须真的发生过，否则这条用例什么都没测")
+
+        # 1. 最终态：最新一条意图仍然是那条空权限撤权，批处理没有盖回非空授权。
+        self.assertEqual(self._latest_payload(SUSPENDED_USER)["permissions"], "{}")
+        reasons_after_revoke = [
+            reason
+            for user, version, reason in self._outbox()
+            if user == SUSPENDED_USER and version >= revoked_version["value"]
+        ]
+        self.assertEqual(
+            reasons_after_revoke,
+            [ADMIN_TARGETED_REVOKE_REASON],
+            "撤权之后不得再出现任何一条每日批授权意图",
+        )
+
+        # 2. 版本停在 force_revoke 推进后的那一版：批处理**一次都没有再推进**。
+        self.assertEqual(self._version(SUSPENDED_USER), revoked_version["value"])
+
+        # 3. 报告与审计：被挡计入专属原因码，`failed` 不加一（被挡是正确结果）。
+        self.assertEqual(report.failed, 0, "被账号状态挡住不是故障")
+        self.assertEqual(report.reasons.get(SKIP_ACCOUNT_NOT_ENABLED), 1)
+        blocked = self._blocked_audits()
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["user"], SUSPENDED_USER)
+        self.assertEqual(blocked[0]["account_state"], "suspended")
+
+        # 4. 对照用户不受影响：一个人被挡不带走整轮。
+        self.assertEqual(report.examined, 2)
+        self.assertEqual(report.unchanged, 1, "对照用户内容没变，判 UNCHANGED")
+
+        # 5. **外部调用层**：把剩下的意图真的发一遍，没有任何一次写入把非空权限
+        #    写回这一行——发布行无回发钉在外部调用层，不是只看数据库。
+        transport = _RecordingTransport(external_rows)
+        store = PostgresPermissionPublishStore(self._dsn)
+        seen: list[str] = []
+        while True:
+            claimed = store.claim_next(exclude=tuple(seen))
+            if claimed is None:
+                break
+            seen.append(claimed.outbox_id)
+            attempt = publish_claim(claimed, transport=transport)
+            store.complete(attempt, status=attempt.next_status(max_attempts=3))
+        self.assertEqual(
+            transport.permissions_written(),
+            ["{}"],
+            "外部表只应收到那一次清空写入；任何一条非空权限写回都说明停用被突破了",
+        )
+        self.assertEqual(
+            transport.read_row(f"rec_{SUSPENDED_USER}")["permissions"],
+            "{}",
+            "外部表里这一行最终必须是空权限",
+        )
+
+    def test_a_later_round_no_longer_touches_the_suspended_user_and_the_state_is_correct(
+        self,
+    ) -> None:
+        """持续性坐实：命中窗口之后，后续批**不再评估也不再纠正**这个人——因为修复
+        之后已经不需要纠正了，他的终态本来就是空权限。
+
+        这条钉的是 issue 草案里标为"待进一步坐实"的那一环：下一轮批处理基线已经排除
+        ``suspended``，这个人根本不进遍历集合。修复前这意味着错误授权会一直挂着；修复
+        后同一条事实变成"没有什么需要纠正"。两件事的代码行为一样，产品含义相反，所以
+        必须连同**修复后的正确终态**一起钉死。
+        """
+
+        self._setup_two_active_users()
+        self._duty().run_once()
+        self._publish_all_pending()
+
+        self.clock.advance(timedelta(days=1))
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+
+        def suspend_and_revoke() -> None:
+            self._set_account_state(SUSPENDED_USER, "suspended")
+            self._force_revoke_like_production(SUSPENDED_USER)
+
+        decorated = _SuspendDuringBatchStore(
+            self._dsn, window_user=SUSPENDED_USER, on_suspend=suspend_and_revoke
+        )
+        self._duty(publish_store=decorated).run_once()
+        version_after_window = self._version(SUSPENDED_USER)
+        payload_after_window = self._latest_payload(SUSPENDED_USER)
+
+        # 再跑一轮：这个人已经是 suspended，基线把他排除在外。
+        self.clock.advance(timedelta(days=1))
+        self._write_roster_snapshot(captured_at=self.clock.moment)
+        report = self._duty().run_once()
+
+        self.assertEqual(report.examined, 1, "停用用户不再进入遍历集合")
+        self.assertNotIn(SKIP_ACCOUNT_NOT_ENABLED, report.reasons, "他连被挡的机会都没有")
+        self.assertEqual(self._version(SUSPENDED_USER), version_after_window, "后续批不再推进版本")
+        self.assertEqual(
+            self._latest_payload(SUSPENDED_USER),
+            payload_after_window,
+            "终态就是即时撤权那一版空权限，后续批既不纠正也不需要纠正",
+        )
+        self.assertEqual(payload_after_window["permissions"], "{}")
+
+
+class SuspendedUserLocalPermissionActionTest(AccountStateWindowTestCase):
+    """Issue #483 缺口②：对**已停用**用户做本地权限动作触发的定向重算，不得把他的
+    真实权限重新排出去。**不需要任何竞态，确定性可复现。**
+
+    机制（编排者与设计稿各自独立回源坐实）：定向重算的身份基线是**花名册审计基线**
+    （``ACTIVE_BASELINE_SQL``，**有意包含** ``suspended``，见 Issue #468 留痕），
+    ``find_active`` 只是 ``dict.get`` 无二次过滤，``recompute_and_publish`` 主体全程
+    不读 ``account_state``——三环叠加，停用用户能一路走到发布。
+
+    真库不可替代的那一半：花名册审计基线的行集合随 ``account_state`` 实时变化，假
+    identities 上这条判据无论实现怎么写都是绿的。
+    """
+
+    def test_a_recompute_for_a_suspended_user_never_publishes_permissions_again(self) -> None:
+        self._setup_two_active_users()
+        # 先让这个人有真实的发布足迹与非空权限，再停用 + 即时撤权——这正是管理员点
+        # 「停用」之后的真实库状态。
+        self._duty().run_once()
+        self._publish_all_pending()
+        self._set_account_state(SUSPENDED_USER, "suspended")
+        self._force_revoke_like_production(SUSPENDED_USER)
+        version_after_revoke = self._version(SUSPENDED_USER)
+        self.assertEqual(self._latest_payload(SUSPENDED_USER)["permissions"], "{}")
+
+        # 管理员随后对这个已停用的人做一次本地权限动作：确认成功后触发的正是
+        # `recompute_and_publish`（`PermissionRecomputeAdapter.trigger` 对一切非
+        # SUSPEND_USER 的动作都走这一条），身份仍然能从花名册审计基线里查到。
+        outcome = self._production_recompute().recompute_and_publish(user_id=SUSPENDED_USER)
+
+        self.assertIs(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, TARGETED_SKIP_ACCOUNT_NOT_ENABLED)
+        skipped = [
+            fields
+            for action, fields in self.audit.records
+            if action == "permission_targeted_recompute.skipped"
+            and fields.get("reason") == TARGETED_SKIP_ACCOUNT_NOT_ENABLED
+        ]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["user"], SUSPENDED_USER)
+        self.assertEqual(skipped[0]["account_state"], "suspended")
+
+        # 零写入：版本不推进、不多一条意图、发布内容仍然是空的。
+        self.assertEqual(self._version(SUSPENDED_USER), version_after_revoke)
+        self.assertEqual(self._latest_payload(SUSPENDED_USER)["permissions"], "{}")
+
+    def test_the_same_recompute_still_publishes_for_an_enabled_user(self) -> None:
+        """正向对照：同一条定向重算路径对 ``enabled`` 用户照常发权。
+
+        没有这一条，上一条用例在"守卫把所有人都挡住"这种停服级误伤下**仍然是绿的**。
+        """
+
+        self._setup_two_active_users()
+        outcome = self._production_recompute().recompute_and_publish(user_id=ACTIVE_USER)
+
+        self.assertIs(outcome.kind, RecomputeKind.ENQUEUED)
+        self.assertEqual(
+            self._latest_payload(ACTIVE_USER)["permissions"], f'{{"BC-甲":["{METRIC_NAME}"]}}'
+        )
+
+    def test_force_revoke_for_a_suspended_user_is_never_blocked(self) -> None:
+        """方向相反的那一处：停用即时撤销必须照常生效（挡住它 = 停用彻底失效）。
+
+        这也是「停用即时撤销」既有回归的真库复核：它走的是同一个
+        ``record_decision``，只是声明"不要求账号有效"。
+        """
+
+        self._setup_two_active_users()
+        self._duty().run_once()
+        self._publish_all_pending()
+        before = self._version(SUSPENDED_USER)
+
+        self._set_account_state(SUSPENDED_USER, "suspended")
+        outcome = self._production_recompute().force_revoke(user_id=SUSPENDED_USER)
+
+        self.assertIs(outcome.kind, RecomputeKind.REVOKED)
+        self.assertEqual(self._version(SUSPENDED_USER), before + 1)
+        self.assertEqual(self._latest_payload(SUSPENDED_USER)["permissions"], "{}")
 
 
 if __name__ == "__main__":
