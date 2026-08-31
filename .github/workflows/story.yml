@@ -20,6 +20,7 @@ jobs:
     outputs:
       mode: ${{ steps.changes.outputs.mode }}
       risk_level: ${{ steps.changes.outputs.risk_level }}
+      docs_changed: ${{ steps.changes.outputs.docs_changed }}
       l1_changed: ${{ steps.changes.outputs.l1_changed }}
       l3_changed: ${{ steps.changes.outputs.l3_changed }}
       worker_changed: ${{ steps.changes.outputs.worker_changed }}
@@ -41,7 +42,7 @@ jobs:
   docs:
     name: Story / docs
     needs: classify
-    if: needs.classify.outputs.mode == 'docs'
+    if: needs.classify.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
@@ -143,6 +144,7 @@ jobs:
         env:
           MODE: ${{ needs.classify.outputs.mode }}
           RISK_LEVEL: ${{ needs.classify.outputs.risk_level }}
+          DOCS_CHANGED: ${{ needs.classify.outputs.docs_changed }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           L1_RESULT: ${{ needs.l1.result }}
@@ -151,6 +153,10 @@ jobs:
         run: |
           if [ "${CLASSIFY_RESULT}" != success ]; then
             echo 'Story 路由失败' >&2
+            exit 1
+          fi
+          if [ "${DOCS_CHANGED}" = true ] && [ "${DOCS_RESULT}" != success ]; then
+            echo "Story 文档门禁未通过：${DOCS_RESULT}" >&2
             exit 1
           fi
           case "${RISK_LEVEL}" in

@@ -925,9 +925,11 @@ class PublishJobGuardTest(unittest.TestCase):
           workflow_call:
         jobs:
           classify:
+            outputs:
+              docs_changed: ${{ steps.changes.outputs.docs_changed }}
           docs:
             name: Epic Full / docs
-            if: needs.classify.outputs.mode == 'docs'
+            if: needs.classify.outputs.docs_changed == 'true'
             steps:
               - run: scripts/ci/verify_docs.sh
           l1:
@@ -938,8 +940,14 @@ class PublishJobGuardTest(unittest.TestCase):
           gate:
             if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
             steps:
-              - if: needs.classify.outputs.risk_level == 'l3'
-                run: python3 scripts/ci/check_permission_impact.py
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                run: python3 scripts/ci/prepare_permission_impact_counts.py
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                run: python3 scripts/ci/check_permission_impact.py --user-counts
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                uses: actions/upload-artifact@sha
+                with:
+                  name: permission-impact-pr-1-abc
           extras:
             strategy:
               matrix:
@@ -952,6 +960,7 @@ class PublishJobGuardTest(unittest.TestCase):
                 with:
                   name: epic-candidate-images-pr-1-abc
           candidate:
+            if: needs.classify.outputs.mode == 'docs'
             needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
@@ -964,9 +973,12 @@ class PublishJobGuardTest(unittest.TestCase):
             branches: ['epic/**']
         jobs:
           classify:
+            outputs:
+              docs_changed: ${{ steps.changes.outputs.docs_changed }}
             steps:
               - run: python3 scripts/ci/classify_story_changes.py
           docs:
+            if: needs.classify.outputs.docs_changed == 'true'
             steps:
               - run: scripts/ci/verify_docs.sh
           l1:
@@ -1032,6 +1044,25 @@ class PublishJobGuardTest(unittest.TestCase):
     def test_wellformed_publish_job_passes(self) -> None:
         failures = self._with_workflows()
         self.assertEqual(failures, [])
+
+    def test_docs_gate_mutation_cannot_hide_docs_plus_l1(self) -> None:
+        """变异验红：恢复只看 mode=docs 会让 docs+L1 混合改动绕过文档门禁。"""
+
+        full = self.FULL.replace(
+            "if: needs.classify.outputs.docs_changed == 'true'",
+            "if: needs.classify.outputs.mode == 'docs'",
+            1,
+        )
+        story = self.STORY.replace(
+            "if: needs.classify.outputs.docs_changed == 'true'",
+            "if: needs.classify.outputs.mode == 'docs'",
+            1,
+        )
+        failures = self._with_workflows(full=full, story=story)
+        self.assertTrue(
+            any("docs job 必须以 docs_changed=true" in failure for failure in failures),
+            failures,
+        )
 
     def test_repeating_full_gate_on_main_is_caught(self) -> None:
         publish = self.PUBLISH.replace(

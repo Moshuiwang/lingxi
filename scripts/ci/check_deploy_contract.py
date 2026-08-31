@@ -1649,6 +1649,14 @@ def check_ci_workflow() -> list[str]:
     story = read(STORY_WORKFLOW)
     publish = read(PUBLISH_WORKFLOW)
 
+    def job_body(workflow: str, job_name: str) -> str | None:
+        match = re.search(
+            rf"^  {re.escape(job_name)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        return match.group(1) if match else None
+
     # M2-62-41 / D16：`extra: [...]` 只能有一行。
     #
     # check_installed_package.py 的 `_MATRIX_LINE` 用的是 `re.search`，只取**第一个**
@@ -1715,9 +1723,11 @@ def check_ci_workflow() -> list[str]:
                 )
 
     # 纯文档 main PR 的稳定 required check 仍叫 Epic Full，但不得启动真库、extras
-    # 或镜像构建。遗漏这些标记会让文档改动又悄悄退化为完整回归。
+    # 或镜像构建；docs + L1 混合改动也必须运行同一份文档门禁。遗漏这些标记会让
+    # 文档改动悄悄退化为完整回归，或被 L1 快路径吞掉。
     for marker in (
         "name: Epic Full / docs",
+        "docs_changed: ${{ steps.changes.outputs.docs_changed }}",
         "scripts/ci/verify_docs.sh",
         "needs.classify.outputs.mode == 'docs'",
         "needs.classify.outputs.mode != 'docs'",
@@ -1726,13 +1736,33 @@ def check_ci_workflow() -> list[str]:
         "needs.classify.outputs.risk_level == 'l1'",
         "needs.classify.outputs.risk_level != 'l1'",
         "scripts/ci/check_permission_impact.py",
+        "scripts/ci/prepare_permission_impact_counts.py",
+        "--user-counts",
+        "permission-impact-pr-",
         "needs.classify.outputs.risk_level == 'l3'",
+        "needs.classify.outputs.l3_changed == 'true'",
     ):
         if marker not in full:
             failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")
 
+    # 计数来源只在 biai-stage 受控导出，PR runner 不得直接调用 stage 导出器；否则
+    # 一个 workflow 改动就会把用户数据带进普通 CI。gate 自己的本地 postgres 测试
+    # DSN 是允许的，不能把它误判成业务凭据。
+    for forbidden in ("scripts/ops/export_permission_impact_counts.py",):
+        if forbidden in strip_comments(full):
+            failures.append(f"ci.yml 不得在普通 CI 接入受控计数来源 `{forbidden}`。")
+
+    # docs_changed 是独立于风险等级的事实：docs + L1 必须同时通过已有文档门禁，
+    # 不能只看 mode/risk（混合改动的 mode=fast、risk=l1 会绕过旧的 docs job）。
+    full_docs = job_body(full, "docs")
+    if full_docs is None or "needs.classify.outputs.docs_changed == 'true'" not in full_docs:
+        failures.append(
+            "ci.yml 的 docs job 必须以 docs_changed=true 触发，确保 docs+L1 混合改动仍运行 verify_docs。"
+        )
+
     for marker in (
         "'epic/**'",
+        "docs_changed: ${{ steps.changes.outputs.docs_changed }}",
         "classify_story_changes.py",
         "verify_docs.sh",
         "uses: ./.github/workflows/ci.yml",
@@ -1743,6 +1773,12 @@ def check_ci_workflow() -> list[str]:
     ):
         if marker not in story:
             failures.append(f"story.yml 缺少 `{marker}`，Story Fast 路由不完整。")
+
+    story_docs = job_body(story, "docs")
+    if story_docs is None or "needs.classify.outputs.docs_changed == 'true'" not in story_docs:
+        failures.append(
+            "story.yml 的 docs job 必须以 docs_changed=true 触发，确保 docs+L1 混合改动仍运行 verify_docs。"
+        )
 
     # `packages: write` 只能存在于 main push 工作流，且必须等待候选身份核对。
     if "packages: write" in full or "packages: write" in story:
