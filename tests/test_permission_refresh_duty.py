@@ -43,6 +43,7 @@ from lingxi.apps.scheduler import (
 )
 from lingxi.apps.scheduler.permission_refresh import (
     REASON_FULLY_SUPPRESSED,
+    SKIP_ACCOUNT_NOT_ENABLED,
     SKIP_ARCHIVED_IDENTITY_INCOMPLETE,
     SKIP_METRIC_TRANSLATION_UNAVAILABLE,
     SKIP_METRIC_TRANSLATION_UNCOVERED,
@@ -62,7 +63,11 @@ from lingxi.core.permission.merge_sources import (
     REASON_LOCAL_OVERRIDE_READ_FAILED,
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
-from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
+from lingxi.core.permission.publish_row import (
+    ADMIN_FULL_ACCESS_FUNCTION,
+    REVOKED_PERMISSIONS_TEXT,
+)
 
 REPOSITORY_ROOT = pathlib.Path(__file__).parents[1]
 DUTY_SOURCE = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "scheduler" / "permission_refresh.py"
@@ -297,15 +302,36 @@ class FakeDecisions:
         unchanged_users: set[str] | None = None,
         failing_users: set[str] | None = None,
         cleared_events_by_user: dict[str, int] | None = None,
+        blocked_users: set[str] | None = None,
     ) -> None:
         self.calls: list[dict] = []
         self._unchanged = unchanged_users or set()
         self._failing = failing_users or set()
         self._cleared_events_by_user = cleared_events_by_user or {}
+        # Issue #483：``require_enabled_account=True`` 的调用命中这些用户时，照真实
+        # 实现抛 ``PermissionGrantBlockedByAccountState``——真库里那把行锁的复检在
+        # 假 store 上替不了，但"调用方被挡之后怎么收口"是纯职责层行为，可以在这里钉。
+        self._blocked = blocked_users or set()
 
     def record_decision(
-        self, *, user_id, row, reason, decided_at, clear_delivered_content: bool = False
+        self,
+        *,
+        user_id,
+        row,
+        reason,
+        require_enabled_account: bool,
+        decided_at,
+        clear_delivered_content: bool = False,
     ):
+        # 与真实实现同一条自洽断言（Issue #483）：声明"不要求账号有效"的调用只能
+        # 排撤权行。假 store 也照做，否则调用点把两者传反时假 store 会静默放过。
+        assert isinstance(require_enabled_account, bool)
+        if not require_enabled_account:
+            assert row.permissions == REVOKED_PERMISSIONS_TEXT, (
+                "声明不要求账号有效的权限决定只能排撤权行"
+            )
+        if require_enabled_account and user_id in self._blocked:
+            raise PermissionGrantBlockedByAccountState("suspended")
         if user_id in self._failing:
             raise RuntimeError("注入的落库失败")
         self.calls.append(
@@ -313,6 +339,7 @@ class FakeDecisions:
                 "user_id": user_id,
                 "row": row,
                 "reason": reason,
+                "require_enabled_account": require_enabled_account,
                 "decided_at": decided_at,
                 "clear_delivered_content": clear_delivered_content,
             }
@@ -1728,6 +1755,105 @@ class IncompleteInputTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 四之二、被账号状态挡住的授权（Issue #483）
+# --------------------------------------------------------------------------
+
+
+class GrantBlockedByAccountStateTest(unittest.TestCase):
+    """落决定的行锁里发现这个人已经不是 ``enabled`` 时，本职责怎么收口。
+
+    复检本身在 ``record_decision`` 的事务里（只有真库能证伪，见
+    ``tests/test_permission_refresh_postgres.py::WindowSuspendTest``）；这里钉的是
+    **纯职责层**的三件事：计成专属原因码、不计成故障、一个人被挡不带走整轮。
+    """
+
+    def test_a_blocked_grant_is_counted_as_a_reason_not_as_a_failure(self) -> None:
+        duty, parts = build_duty(
+            identities=(identity(),), decisions=FakeDecisions(blocked_users={USER_ONE})
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.reasons.get(SKIP_ACCOUNT_NOT_ENABLED), 1)
+        self.assertEqual(report.failed, 0, "被挡是正确结果，不是技术故障")
+        self.assertEqual(report.enqueued, 0)
+        self.assertEqual(report.unchanged, 0)
+        self.assertEqual(parts["decisions"].calls, [], "被挡的这次决定一个字节都没落库")
+
+    def test_the_block_is_audited_with_the_account_state(self) -> None:
+        duty, parts = build_duty(
+            identities=(identity(),), decisions=FakeDecisions(blocked_users={USER_ONE})
+        )
+
+        duty.run_once()
+
+        recorded = parts["audit"].fields_for("permission_refresh.grant_blocked_account_state")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["user"], USER_ONE)
+        self.assertEqual(recorded[0]["reason"], SKIP_ACCOUNT_NOT_ENABLED)
+        self.assertEqual(recorded[0]["account_state"], "suspended")
+
+    def test_one_blocked_user_does_not_take_the_round_down(self) -> None:
+        duty, _ = build_duty(
+            identities=(
+                identity(),
+                identity(
+                    USER_TWO,
+                    personnel_id="ou_person_0002",
+                    display_name=NAME_TWO,
+                    employee_no=EMPLOYEE_TWO,
+                    email=EMAIL_TWO,
+                ),
+            ),
+            roster_rows=(
+                roster_row(),
+                roster_row(
+                    "ou_person_0002", employee_no=EMPLOYEE_TWO, email=EMAIL_TWO, name=NAME_TWO
+                ),
+            ),
+            galaxy=galaxy_snapshot(
+                accounts=(
+                    (GALAXY_ACCOUNT_ONE, EMPLOYEE_ONE, EMAIL_ONE),
+                    (GALAXY_ACCOUNT_TWO, EMPLOYEE_TWO, EMAIL_TWO),
+                ),
+                roles=((GALAXY_ACCOUNT_ONE, ROLE_NAME), (GALAXY_ACCOUNT_TWO, ROLE_NAME)),
+                countries=((GALAXY_ACCOUNT_ONE, "KE"), (GALAXY_ACCOUNT_TWO, "KE")),
+            ),
+            decisions=FakeDecisions(blocked_users={USER_ONE}),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.examined, 2)
+        self.assertEqual(report.enqueued, 1, "另一个人照常拿到发布意图")
+        self.assertEqual(report.reasons.get(SKIP_ACCOUNT_NOT_ENABLED), 1)
+        self.assertEqual(report.failed, 0)
+
+    def test_the_two_call_sites_declare_opposite_account_requirements(self) -> None:
+        """授权侧声明"需要账号有效"、撤权侧声明"不要求"——两条声明都被测到。
+
+        撤权侧尤其重要：挡住撤权 = 停用彻底失效。假 store 里那条自洽断言（声明
+        ``False`` 的调用只能排撤权行）在这里被真的执行一次。
+        """
+
+        duty, parts = build_duty(identities=(identity(),))
+        duty.run_once()
+        self.assertEqual(
+            [call["require_enabled_account"] for call in parts["decisions"].calls], [True]
+        )
+
+        duty, parts = build_duty(
+            identities=(identity(),),
+            galaxy=galaxy_snapshot(roles=()),
+            published_users={USER_ONE},
+        )
+        duty.run_once()
+        self.assertEqual(
+            [call["require_enabled_account"] for call in parts["decisions"].calls], [False]
+        )
+
+
+# --------------------------------------------------------------------------
 # 五、单用户隔离
 # --------------------------------------------------------------------------
 
@@ -1916,13 +2042,33 @@ class ActiveFilterTest(unittest.TestCase):
         """
 
         self.assertIn("provisioning_state = 'active'", PERMISSION_REFRESH_BASELINE_SQL)
-        self.assertIn(
-            "account_state NOT IN ('deleting', 'deleted', 'suspended')",
-            PERMISSION_REFRESH_BASELINE_SQL,
-        )
+        # Issue #483（codex 第 2 轮 P2）：判据从拒绝列表改成**正向白名单**。行集合
+        # 与改之前逐行等价（CHECK 约束只有四个取值），改的是演进方向——下面这条
+        # 否定断言把"不许退回拒绝列表"钉死：将来 CHECK 加了第五个状态时，拒绝列表
+        # 会静默把它当成可以发权。
+        self.assertIn("account_state = 'enabled'", PERMISSION_REFRESH_BASELINE_SQL)
+        self.assertNotIn("NOT IN", PERMISSION_REFRESH_BASELINE_SQL)
         source = duty_code()
-        for forbidden in ("provisioning_state", "account_state", "SELECT"):
+        for forbidden in ("provisioning_state", "SELECT"):
             self.assertNotIn(forbidden, source, f"筛选不得在职责里再写一份：{forbidden}")
+        # ``account_state`` 这个**词**在职责里现在可以出现一次——Issue #483 之后，被
+        # 账号状态挡住的那条收口要把 ``blocked.account_state`` 如实写进审计（它是那四个
+        # 固定字面量之一，不是人员资料）。真正不许出现的是**判据本身**：任何形式的
+        # 比较，以及任何一个状态字面量。这比原来的整词禁令更紧——原来的禁令允许
+        # `if x == 'suspended'` 只要不提列名，现在提了字面量就红。
+        for forbidden in (
+            "account_state =",
+            "account_state==",
+            "account_state ==",
+            "account_state !=",
+            "account_state IN",
+            "account_state NOT IN",
+            "'enabled'",
+            "'suspended'",
+            "'deleting'",
+            "'deleted'",
+        ):
+            self.assertNotIn(forbidden, source, f"账号状态判据不得在职责里再写一份：{forbidden}")
 
     def test_every_row_the_reader_returns_is_examined(self) -> None:
         baseline = FakeBaseline(identity(), identity(USER_TWO, personnel_id="ou_person_0002"))

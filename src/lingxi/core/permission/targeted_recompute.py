@@ -49,6 +49,23 @@
    （那是一把只应该活在 scheduler 进程里的密钥，见 ``apps/scheduler/
    permission_refresh.py::_build_permission_refresh_duty`` 的同一条纪律）。
 
+## 已停用用户不会被本模块重新发权（Issue #483 缺口②）
+
+本模块的身份查找口（``_IdentityLookup``）真实实现取的是**花名册审计基线**
+（``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``），那份基线**有意包含
+``suspended``**（停用期间姓名/邮箱/工号漂移仍要进日报，见 Issue #468 留痕），因此
+``recompute_and_publish`` 首行的 ``SKIP_USER_NOT_ACTIVE`` 兜底对停用用户**不会触发**，
+而它自己全程也不读 ``account_state``。结果是：管理员对一个已停用用户执行「授予 /
+抑制 / 收回本地权限」，确认成功后触发的这条重算，会把这个人的真实合并权限重新排出去
+——**不需要任何竞态，确定性可复现**。
+
+修法不是在本模块再抄一份账号状态判据（那会变成第二个真相来源，且仍然与停用写入不在
+同一把锁里），而是复用落权限决定那把**已经持有的 ``app_user`` 行锁**：
+:meth:`_settle_publish` 声明 ``require_enabled_account=True``，非 ``enabled`` 一律
+不排非空授权，本模块只负责把被挡翻译成可分辨的 :data:`SKIP_ACCOUNT_NOT_ENABLED`
+跳过码。:meth:`_settle_revocation` 相反，声明 ``False``——撤权的服务对象本来就是已停用
+用户，挡住它等于让停用彻底失效。
+
 ## 为什么 ``force_revoke`` 与 ``recompute_and_publish`` 是两个方法，不是一个
 
 停用（``SUSPEND_USER``）需要的是「不管银河怎么说，立刻清空这个人的发布内容」——
@@ -84,6 +101,7 @@ from lingxi.core.permission.metric_translation import (
     metric_translation_available,
     translate_company_functions,
 )
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     aggregate_permission,
@@ -108,6 +126,12 @@ SKIP_MATCH_FAILED = "match_failed"
 SKIP_ARCHIVED_IDENTITY_INCOMPLETE = "archived_identity_incomplete"
 SKIP_NO_PUBLISHED_ROW = "no_published_row"
 SKIP_LOCAL_OVERRIDE_READ_FAILED = "local_override_read_failed"
+#: 落授权决定的那把行锁里发现这个人不是 ``enabled``（Issue #483 缺口②）：本模块的
+#: 身份基线**有意包含** ``suspended``，因此这条跳过是常态出口而不是异常——管理员对
+#: 一个已停用用户做本地权限动作时就会走到这里。与 :data:`SKIP_USER_NOT_ACTIVE`
+#: 刻意分开登记：那一条说的是"这个人不在花名册基线里"（删除中/已删除/未开通完成），
+#: 这一条说的是"人在基线里，但账号状态不允许给他排非空授权"。
+SKIP_ACCOUNT_NOT_ENABLED = "account_not_enabled"
 
 
 class RecomputeKind(str, Enum):
@@ -163,12 +187,17 @@ class _Decision(Protocol):
 
 
 class _DecisionStore(Protocol):
+    """``require_enabled_account`` 是**必填**关键字参数（Issue #483）：授权侧传
+    ``True``、撤权侧传 ``False``，账号状态复检落在实现那把已经持有的 ``app_user``
+    行锁里（模块文档「已停用用户不会被本模块重新发权」一节）。"""
+
     def record_decision(
         self,
         *,
         user_id: str,
         row: Any,
         reason: str,
+        require_enabled_account: bool,
         decided_at: datetime,
         clear_delivered_content: bool = False,
     ) -> _Decision: ...
@@ -351,13 +380,25 @@ class TargetedPermissionRecompute:
             # 只读既有密文的读取口不在本模块（模块文档「三处刻意不同」第 3 条）。
             token_cipher=None,
         )
-        decision = self._decisions.record_decision(
-            user_id=user_id,
-            row=row,
-            reason=ADMIN_TARGETED_RECOMPUTE_REASON,
-            decided_at=now,
-            clear_delivered_content=True,
-        )
+        try:
+            decision = self._decisions.record_decision(
+                user_id=user_id,
+                row=row,
+                reason=ADMIN_TARGETED_RECOMPUTE_REASON,
+                # Issue #483 缺口②：本模块的身份基线有意包含 ``suspended``，这里是
+                # 唯一挡住"给已停用用户重新发权"的地方，判据在实现的行锁里。
+                require_enabled_account=True,
+                decided_at=now,
+                clear_delivered_content=True,
+            )
+        except PermissionGrantBlockedByAccountState as blocked:
+            # 常态出口，不是故障：事务整体回滚，这个人的发布内容一个字节都没变。
+            return self._skip(
+                user_id,
+                mode="recompute",
+                reason=SKIP_ACCOUNT_NOT_ENABLED,
+                account_state=blocked.account_state,
+            )
         kind = RecomputeKind.ENQUEUED if decision.enqueued else RecomputeKind.UNCHANGED
         self._audit.record(
             "permission_targeted_recompute.completed",
@@ -377,6 +418,9 @@ class TargetedPermissionRecompute:
             user_id=user_id,
             row=row,
             reason=ADMIN_TARGETED_REVOKE_REASON,
+            # Issue #483：撤权任何账号状态都必须放行——``force_revoke`` 的服务对象
+            # 本来就是刚被停用的人，挡住它等于让停用彻底失效。
+            require_enabled_account=False,
             decided_at=now,
             clear_delivered_content=True,
         )
@@ -429,6 +473,7 @@ __all__ = [
     "ADMIN_TARGETED_REVOKE_REASON",
     "AuditSink",
     "RecomputeKind",
+    "SKIP_ACCOUNT_NOT_ENABLED",
     "SKIP_ARCHIVED_IDENTITY_INCOMPLETE",
     "SKIP_LOCAL_OVERRIDE_READ_FAILED",
     "SKIP_MATCH_FAILED",

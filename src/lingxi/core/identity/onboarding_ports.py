@@ -97,10 +97,22 @@ class TokenIssuer(Protocol):
 
 
 class PermissionDecisionStore(Protocol):
-    """权限决定 + 发布意图（同事务），以及意图状态的回读。"""
+    """权限决定 + 发布意图（同事务），以及意图状态的回读。
+
+    ``require_enabled_account`` 是**必填**关键字参数（Issue #483）：开通链落的是一份
+    需要账号有效的授权，恒传 ``True``；账号状态复检落在实现那把已经持有的 ``app_user``
+    行锁里，被挡时抛
+    :class:`~lingxi.core.permission.publish.PermissionGrantBlockedByAccountState`。
+    """
 
     def record_decision(
-        self, *, user_id: str, row: Any, reason: str, decided_at: datetime
+        self,
+        *,
+        user_id: str,
+        row: Any,
+        reason: str,
+        require_enabled_account: bool,
+        decided_at: datetime,
     ) -> Any: ...
 
     def load(self, outbox_id: str) -> Any: ...
