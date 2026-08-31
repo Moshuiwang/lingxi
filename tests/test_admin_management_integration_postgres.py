@@ -318,7 +318,7 @@ class RevokeButtonClickCreatesARealPendingActionTests(ManagementCardCallbackInte
         # 终态原因码（"expired"/"role_revoked" 等），prepare() 阶段恒为
         # None——不是本次改动引入的行为，是既有存储约定。
         self.assertIsNone(reason)
-        self.assertIn("管理卡逐行收回", payload)
+        self.assertIn("管理卡逐行撤销", payload)
 
     def test_unauthorized_operator_writes_nothing(self) -> None:
         override_id = self._insert_active_override()

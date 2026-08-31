@@ -175,10 +175,24 @@ class ManagementActionRouter(Protocol):
     ) -> _ManagementRouteOutcome: ...
 
 
-#: 管理卡逐行「收回」按钮没有独立的原因输入框（issue #439 B 档设计：一键收回，
-#: 不为收回单独加一个表单）——服务端补一个固定原因，供审计与确认卡回显；管理员
-#: 需要自定义收回原因时仍可用文本命令 ``/admin revoke_permission`` 自行填写。
-_MANAGEMENT_CARD_REVOKE_REASON = "管理卡逐行收回"
+#: 管理卡逐行「撤销」按钮没有独立的原因输入框（issue #439 B 档设计：一键撤销，
+#: 不为撤销单独加一个表单）——服务端补一个固定原因，供审计与确认卡回显；管理员
+#: 需要自定义撤销原因时仍可用文本命令 ``/admin revoke_permission`` 自行填写。
+#:
+#: 术语统一（Trace #469 S-1 遗漏，收尾批 L4a 实测发现）：取值随按钮标签一起从
+#: 「收回」改成「撤销」，与 ``core/admin/notification._ACTION_LABEL`` 的
+#: ``LOCAL_PERMISSION_REVOKE`` 项、``core/admin/management_card`` 覆盖行按钮的
+#: ``label="撤销"`` 逐字一致——此前按钮写「撤销」、这段原因文字写「收回」，同一次
+#: 操作在确认卡「原因」行/终态卡/群通知里出现两套说法（TOP-7 防倒退）。
+#:
+#: **已落库的旧值一律不回改**：这段文本进的是 ``pending_action.payload`` 的
+#: ``reason`` 键（自由文本，见 ``adapters/postgres_pending_action.py``
+#: ``prepare()`` 的 revoke 分支），渲染侧只做原样展示与定长截断；全仓没有任何
+#: 一处按它的字面量做比较、匹配或解析（``notification._safe_reason`` 那条形状
+#: 白名单作用于 ``pending_action.reason`` 机器码，不是这段自由文本），因此历史
+#: 行继续原样渲染，换新值不会让任何一条旧记录解析失败或渲染异常。审计文本是
+#: 历史事实，改成今天的说法反而会篡改"当时管理员看到的是什么"。
+_MANAGEMENT_CARD_REVOKE_REASON = "管理卡逐行撤销"
 
 #: 表单提交成功创建待确认操作时 ``AdminRouteOutcome.content_key`` 的取值——与
 #: ``router.py`` 里 ``_dispatch_write_action`` 最终成功分支写死的字面量一致，
@@ -352,7 +366,7 @@ class AdminCardCallbackHandler:
         message_id: str,
         trace_id: str,
     ) -> dict[str, Any]:
-        """管理卡逐行「收回」按钮点击（#439 B 档新增交互分支）。
+        """管理卡逐行「撤销」按钮点击（#439 B 档新增交互分支）。
 
         ``override_id`` 是建卡时写进按钮 ``behaviors.value`` 的这一行内部标识，
         直接复用旧形状 ``/admin revoke_permission <override_id> <原因>``（见
@@ -372,7 +386,7 @@ class AdminCardCallbackHandler:
                 "admin.card_callback.management_missing_override_id",
                 trace_id=trace_id,
             )
-            return _toast_error("未识别到待收回的授权行，请重新查询 /admin user 后再操作")
+            return _toast_error("未识别到待撤销的授权行，请重新查询 /admin user 后再操作")
         text = f"/admin revoke_permission {override_id} {_MANAGEMENT_CARD_REVOKE_REASON}"
         outcome = self._management_actions.route(
             open_id=operator_open_id,

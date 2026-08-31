@@ -17,6 +17,8 @@ from lingxi.core.admin.pending_action import (
     REQUIRED_ROLE,
     TARGET_ACCOUNT_STATE,
     VALID_SOURCE_STATES,
+    _ACTION_TYPE_DISPLAY_NAME,
+    _TARGET_STATE_CHANGED_MESSAGE,
     CancelResultKind,
     ConfirmResultKind,
     PendingAction,
@@ -644,6 +646,89 @@ class DecideCancelTests(unittest.TestCase):
         pending = _pending()
         decision = decide_cancel(pending=pending, clicker_open_id=INITIATOR, now=NOW)
         self.assertTrue(decision.ok)
+
+
+class LocalPermissionTerminologyTests(unittest.TestCase):
+    """本模块两张管理员可见词表的术语统一（Trace #469 S-1 遗漏，收尾批 L4a
+    实测发现）。
+
+    #439 的 PM 裁定是**全链路**统一为「补充授权 / 屏蔽指标 / 撤销」，S-1 扫的是
+    三张展示词表（``notification._ACTION_LABEL``、``management_card.
+    _DIRECTION_LABEL``、``router._OVERRIDE_DIRECTION_LABEL``），漏掉了本模块的
+    ``_ACTION_TYPE_DISPLAY_NAME``（第四张词表，#437 真实运维事故的拦截文案就用
+    它）与 ``_TARGET_STATE_CHANGED_MESSAGE``。两处都是管理员直接读到的句子，
+    留着退役动词会把他导向一个已经不存在的「收回」入口（TOP-7 防倒退）。
+    """
+
+    _LOCAL_PERMISSION_TYPES = (
+        PendingActionType.LOCAL_PERMISSION_GRANT,
+        PendingActionType.LOCAL_PERMISSION_SUPPRESS,
+        PendingActionType.LOCAL_PERMISSION_REVOKE,
+    )
+
+    def test_action_type_display_name_matches_the_canonical_action_label(self) -> None:
+        """变异锚点：把 ``_ACTION_TYPE_DISPLAY_NAME`` 的三项改回「本地权限授权 /
+        本地权限抑制 / 本地权限收回」，本用例由绿转红。
+
+        断言的是**跨模块逐字一致**而不是字面量快照：这条拦截提示的全部价值是让
+        管理员认出那张还在途的旧确认卡，而卡的标题正是 ``待确认：
+        {_ACTION_LABEL[...]}用户``——两处用词对不上，提示越详细越误导。
+        """
+
+        from lingxi.core.admin.notification import _ACTION_LABEL
+
+        for action_type in self._LOCAL_PERMISSION_TYPES:
+            with self.subTest(action_type=action_type):
+                self.assertEqual(
+                    _ACTION_TYPE_DISPLAY_NAME[action_type], _ACTION_LABEL[action_type]
+                )
+
+    def test_no_display_name_uses_a_retired_permission_verb(self) -> None:
+        for action_type, name in _ACTION_TYPE_DISPLAY_NAME.items():
+            with self.subTest(action_type=action_type):
+                self.assertNotIn("收回", name)
+                self.assertNotIn("抑制", name)
+
+    def test_in_flight_conflict_message_never_shows_a_retired_verb(self) -> None:
+        """出口断言（不只断言词表本身）：#437 的拦截文案是真正送到管理员眼前的
+        那一句，把词表接错同样必须红。"""
+
+        for action_type in PendingActionType:
+            with self.subTest(action_type=action_type):
+                message = format_in_flight_conflict_message(
+                    blocking=_pending(action_type=action_type)
+                )
+                self.assertNotIn("收回", message)
+                self.assertNotIn("抑制", message)
+
+    def test_target_state_changed_messages_use_the_unified_revoke_verb(self) -> None:
+        """变异锚点：把「如需更改请先撤销」改回「如需更改请先收回」、或把
+        「无需撤销（或已被撤销/替代）」改回「收回」版本，本用例由绿转红。"""
+
+        for action_type in self._LOCAL_PERMISSION_TYPES:
+            with self.subTest(action_type=action_type):
+                message = _TARGET_STATE_CHANGED_MESSAGE[action_type]
+                self.assertNotIn("收回", message)
+                self.assertIn("撤销", message)
+
+    def test_target_state_changed_messages_are_reachable_through_decide_prepare(self) -> None:
+        """出口断言：这三句文案不是摆设——``decide_prepare`` 在目标状态不允许时
+        原样把它交给管理员。"""
+
+        cases = {
+            PendingActionType.LOCAL_PERMISSION_GRANT: "present",
+            PendingActionType.LOCAL_PERMISSION_SUPPRESS: "present",
+            PendingActionType.LOCAL_PERMISSION_REVOKE: "revoked",
+        }
+        for action_type, current_state in cases.items():
+            with self.subTest(action_type=action_type):
+                decision = decide_prepare(
+                    action_type=action_type, current_account_state=current_state
+                )
+                self.assertFalse(decision.ok)
+                self.assertEqual(decision.code, "target_state_changed")
+                self.assertNotIn("收回", decision.message)
+                self.assertIn("撤销", decision.message)
 
 
 class FormatInFlightConflictMessageTests(unittest.TestCase):
