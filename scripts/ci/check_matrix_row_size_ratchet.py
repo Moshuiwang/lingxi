@@ -62,6 +62,11 @@ MATRIX_VOLUME_GLOB = "验收矩阵-*.md"
 BASELINE_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "matrix_row_size_baseline.txt"
 
 THRESHOLD_BYTES = 800
+# 读取范围自检下限（Issue #479 分册后）：矩阵至少是「总册 + 1 个分册」。分册被
+# 改名/移出 glob 时，本脚本会量到 0 条断言行然后一路 exit 0——那是最危险的一种
+# 绿：棘轮还在跑，但它什么都没在看。分册前同一场景由「读不到文件」自然判红，
+# 分册后必须显式补回来（PR #490 独立审查 P2-1）。
+MINIMUM_MATRIX_DOCUMENTS = 2
 TOTAL_BYTES_TRIGGER = 400 * 1024
 TOTAL_LINES_TRIGGER = 1500
 
@@ -147,6 +152,30 @@ def measure_rows(text: str) -> dict[str, int]:
         size = len(line.encode("utf-8"))
         counts[identifier] = max(counts.get(identifier, 0), size)
     return counts
+
+
+def verify_read_range(documents: dict[str, str], current: dict[str, int]) -> None:
+    """读取范围自检：范围塌掉时**失败关闭**，不许安静地量出 0 条然后 exit 0。
+
+    两条判据各挡一种塌法：
+    1. 文件数少于 ``MINIMUM_MATRIX_DOCUMENTS``——分册被改名、移走或 glob 写坏，
+       整批断言脱离棘轮，而每一个还留在基线里的编号都会被 ``evaluate`` 当成
+       「已下线」放行（那条 continue 是给真删除留的口子，不该给读丢了的分册用）；
+    2. 一条断言行都没量到——就算文件数凑够了，也说明表头/表格结构被改动，
+       同 ``check_acceptance_matrix.py`` 的「一条断言都没解析到」同一条纪律。
+    """
+    if len(documents) < MINIMUM_MATRIX_DOCUMENTS:
+        raise BaselineError(
+            f"矩阵读取范围只发现 {len(documents)} 个文件（总册 {MATRIX_DOCUMENT.name} + "
+            f"{MATRIX_DOCUMENT.parent.name}/{MATRIX_VOLUME_GLOB} 分册），"
+            f"少于下限 {MINIMUM_MATRIX_DOCUMENTS}。分册被改名或移出 glob 会让整批断言"
+            "脱离棘轮却仍然全绿——这里失败关闭，不按空集合放行。"
+        )
+    if not current:
+        raise BaselineError(
+            f"在 {len(documents)} 个矩阵文件里一条 V-* 断言行都没量到："
+            "表头或表格结构被改动了。棘轮拒绝按空集合给出绿灯。"
+        )
 
 
 def read_matrix_text() -> str:
@@ -315,6 +344,11 @@ def run_check() -> int:
         return 1
 
     current = measure_documents(documents)
+    try:
+        verify_read_range(documents, current)
+    except BaselineError as error:
+        print(f"验收矩阵单行体量棘轮检查失败：{error}", file=sys.stderr)
+        return 1
     print(render_total_size_report(documents))
 
     failures = evaluate(baseline, current)
@@ -341,6 +375,12 @@ def run_refresh() -> int:
         return 1
 
     current = measure_documents(documents)
+    try:
+        verify_read_range(documents, current)
+    except BaselineError as error:
+        # --refresh 会写基线：在一个坏掉的读取范围上刷新，等于把全部登记一次抹掉。
+        print(f"验收矩阵单行体量棘轮刷新失败：{error}", file=sys.stderr)
+        return 1
 
     # 与 check_size_ratchet.py 的 run_refresh 同一纪律：只处理「基线记录 > 实测」
     # 这一类（该编号已经缩小、或有人手工调大了基线，--refresh 一律以实测为准

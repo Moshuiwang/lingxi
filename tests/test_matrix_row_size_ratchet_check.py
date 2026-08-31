@@ -263,6 +263,13 @@ class RunCheckDoesNotBlockOnTotalTriggerTest(unittest.TestCase):
         root = Path(self._tmp.name)
         self.matrix_path = root / "matrix.md"
         self.baseline_path = root / "baseline.txt"
+        # 读取范围自检要求「总册 + 至少一个分册」（Issue #479 / PR #490 P2-1），
+        # 所以夹具也按真实形状摆：一个总册 + 一个短行分册（短行不会进棘轮基线，
+        # 不影响这些用例各自要测的东西）。
+        self.volume_path = root / "验收矩阵-占位册.md"
+        self.volume_path.write_text(
+            matrix_document("| V-占位-01 | 占位分册的一行 | L2 | 已认领 |\n"), encoding="utf-8"
+        )
 
         self._orig_matrix = CHECK.MATRIX_DOCUMENT
         self._orig_baseline = CHECK.BASELINE_PATH
@@ -300,6 +307,11 @@ class RunRefreshClassificationTest(unittest.TestCase):
         root = Path(self._tmp.name)
         self.matrix_path = root / "matrix.md"
         self.baseline_path = root / "baseline.txt"
+        # 同上：读取范围自检要求「总册 + 至少一个分册」。
+        self.volume_path = root / "验收矩阵-占位册.md"
+        self.volume_path.write_text(
+            matrix_document("| V-占位-01 | 占位分册的一行 | L2 | 已认领 |\n"), encoding="utf-8"
+        )
 
         self._orig_repository_root = CHECK.REPOSITORY_ROOT
         self._orig_matrix = CHECK.MATRIX_DOCUMENT
@@ -364,6 +376,74 @@ class RunRefreshClassificationTest(unittest.TestCase):
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-开通-01": 50})
 
 
+class ReadRangeFailsClosedTest(unittest.TestCase):
+    """读取范围塌掉时必须判红（Issue #479 分册的直接后果，PR #490 独立审查 P2-1）。
+
+    分册前，把矩阵文件挪走会让 ``read_matrix_text()`` 抛 ``BaselineError`` 自然判红。
+    分册后同一场景变成「总册还在、8 个分册都不见了」：量到 0 条断言行，而
+    ``evaluate`` 对「基线里有、当前没有」一律放行（那条 continue 是给真删除留的），
+    于是脚本会安安静静 exit 0。这一组用例把那条路钉死。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.matrix_path = self.root / "matrix.md"
+        self.baseline_path = self.root / "baseline.txt"
+
+        self._orig_repository_root = CHECK.REPOSITORY_ROOT
+        self._orig_matrix = CHECK.MATRIX_DOCUMENT
+        self._orig_baseline = CHECK.BASELINE_PATH
+        CHECK.REPOSITORY_ROOT = self.root
+        CHECK.MATRIX_DOCUMENT = self.matrix_path
+        CHECK.BASELINE_PATH = self.baseline_path
+        self.addCleanup(self._restore)
+
+        self.matrix_path.write_text(
+            matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n"), encoding="utf-8"
+        )
+        self.baseline_path.write_text(CHECK.render_baseline({}), encoding="utf-8")
+
+    def _restore(self) -> None:
+        CHECK.REPOSITORY_ROOT = self._orig_repository_root
+        CHECK.MATRIX_DOCUMENT = self._orig_matrix
+        CHECK.BASELINE_PATH = self._orig_baseline
+
+    def _add_volume(self, rows: str) -> Path:
+        volume = self.root / "验收矩阵-一册.md"
+        volume.write_text(matrix_document(rows), encoding="utf-8")
+        return volume
+
+    def test_every_volume_missing_fails_closed(self) -> None:
+        """总册还在、分册一个都不在：必须判红，不许按「断言都下线了」放行。"""
+        exit_code = CHECK.run_check()
+        self.assertEqual(exit_code, 1)
+
+    def test_the_failure_names_the_read_range(self) -> None:
+        with self.assertRaises(CHECK.BaselineError) as caught:
+            CHECK.verify_read_range({"matrix.md": ""}, {"V-开通-01": 100})
+        self.assertIn("读取范围", str(caught.exception))
+        self.assertIn(CHECK.MATRIX_VOLUME_GLOB, str(caught.exception))
+
+    def test_enough_files_but_zero_assertion_rows_still_fails_closed(self) -> None:
+        """文件数凑够也不够：一条断言行都没量到说明表格结构被改动了。"""
+        (self.root / "验收矩阵-一册.md").write_text("# 分册\n\n没有任何表格。\n", encoding="utf-8")
+        self.matrix_path.write_text("# 产品验收矩阵\n\n没有任何表格。\n", encoding="utf-8")
+        self.assertEqual(CHECK.run_check(), 1)
+
+    def test_a_hub_plus_one_volume_passes(self) -> None:
+        """正面对照：补回一个分册就复绿——上面两条红不是被别的原因带出来的。"""
+        self._add_volume("| V-权限-01 | 另一句判定 | L2 | 已验证 |\n")
+        self.assertEqual(CHECK.run_check(), 0)
+
+    def test_refresh_refuses_on_a_broken_read_range_and_keeps_the_baseline(self) -> None:
+        """--refresh 会写基线：在坏掉的读取范围上刷新等于把全部登记一次抹掉。"""
+        self.baseline_path.write_text(CHECK.render_baseline({"V-权限-15": 11485}), encoding="utf-8")
+        self.assertEqual(CHECK.run_refresh(), 1)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-权限-15": 11485})
+
+
 class RealBaselineIsHonestTest(unittest.TestCase):
     """反向验证：仓库里已经提交的基线文件与真实矩阵文档必须诚实（记录值与实测
     精确相等），且脚本对当前真实矩阵实跑必须是绿——与 test_size_ratchet_check.py
@@ -398,6 +478,11 @@ class RealBaselineIsHonestTest(unittest.TestCase):
 
     def test_run_check_passes_against_the_real_repository_matrix(self) -> None:
         self.assertEqual(CHECK.run_check(), 0)
+
+    def test_the_real_repository_read_range_self_check_passes(self) -> None:
+        documents = CHECK.read_matrix_documents()
+        CHECK.verify_read_range(documents, CHECK.measure_documents(documents))
+        self.assertGreaterEqual(len(documents), CHECK.MINIMUM_MATRIX_DOCUMENTS)
 
 
 if __name__ == "__main__":
