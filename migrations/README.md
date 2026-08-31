@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0079_document_delivery_markdown` |
+| head revision | `0080_task_failure_signature` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -490,6 +490,28 @@ Issue #408 正式方案第二步。不新建表：`task_document_delivery_reques
 
 `downgrade()` 直接删该列及其 CHECK，有损（非空 `markdown` 随列丢失，不删行
 本身），与 `0078` 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0080_task_failure_signature`（任务失败签名：`task` 新增两列）
+
+Issue #495。`task` 新增两列可空 `TEXT`：`failure_code`（worker 给出的**细分**
+失败码）与 `failure_signature`（底层异常的**类型限定名**）。补的是 2026-08-31
+浸泡窗口取证到的诊断黑洞——8 条任务失败里 6 条无法归因，结构化日志只留下
+`error_kind=session_failed failure_code=null`。
+
+既有的 `task.error_kind` 不能替代 `failure_code`：那一列是失败码被压平成**用户
+文案分类**之后的粗粒度值，`drain_timeout`/`sdk_unavailable`/`cancelled`/
+`gate_bypassed` 全部塌进同一个 `session_failed`。落库而不是只补日志，是因为
+worker 与 gateway 是两个独立进程、不共享文件系统，只进 worker stderr 的线索
+管理员用 `/admin trace` 看不到——与 `0070` 同一个结构性缺口、同一条解法。
+
+**两列都不装异常正文**（`V-花名册-33`：审计与日志不含外部标识原值；psycopg 异常
+串常见形状 `DETAIL: Key (feishu_open_id)=(ou_...)`），写入前过字符白名单与 64
+字符上界，口径与 rc22 opus 审查 P2-5 对 `event.pipeline_failed` 的收敛一致。
+两列可空且 `NULL` 是精确语义（成功回合无失败码；`turn_timeout` 这类失败没有
+异常对象可签），不回填历史行。列语义与判据见迁移文件头部完整说明。
+
+`downgrade()` 直接删两列，有损（失败码与签名随列丢失，不删行本身），与 `0070`
+既有先例同一姿态（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

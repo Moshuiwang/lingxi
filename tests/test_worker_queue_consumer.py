@@ -4725,3 +4725,318 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         terminal = queue.terminals[0]
         self.assertEqual(terminal["terminal_kind"], "success")
         self.assertEqual(terminal["content"], "结果")
+
+
+#: 三种形状不同的"未分类"底层异常，覆盖 Issue #495 完成标准 1 点名的三类来源。
+#: 刻意都在测试文件里现造类：真实的 psycopg/httpx/SDK 异常类不是本仓依赖（也
+#: 不该为了一条断言把它们拖进 fast 门禁），而被断言的行为只与
+#: ``type(error).__module__``/``__qualname__`` 有关，与这些库本身无关。
+#: 定义在模块顶层而不是嵌在测试类里：嵌套类的 ``__qualname__`` 会带上外层类名，
+#: 让签名无谓地长，掩盖"限定名在正常情况下很短"这个事实。
+class FakeDatabaseError(Exception):
+    """psycopg 形状：驱动异常，正文里常带 ``DETAIL: Key (...)=(ou_...)``。"""
+
+
+class FakeHttpError(Exception):
+    """外部 HTTP 形状。"""
+
+
+class FakeSdkInternalError(Exception):
+    """Agent SDK 内部形状。"""
+
+
+class TerminalFailureSignatureTests(unittest.TestCase):
+    """Issue #495：失败终态必须留得下线索——底层异常的**类型限定名**与一个
+    非 ``null`` 的失败码。
+
+    真实代价（2026-08-31 浸泡窗口取证，Trace #469 S-12）：8 条任务失败里 6 条
+    **无法归因**，结构化日志只留下 ``worker.task.terminal
+    error_kind=session_failed failure_code=null``；能归因的另外 2 条恰恰是因为
+    走了另一条**会落日志**的分支（``worker.mcp_server_unavailable`` 记下了
+    502）。正反对照就在同一批样本里。
+
+    这一组同时守两条互相拉扯的线：**可诊断**（``..._leaves_a_distinguishable_
+    signature`` 等）与**不泄露**（``test_the_signature_never_carries_exception_
+    text``）。任何一条被牺牲都算失败。
+    """
+
+    _DatabaseError = FakeDatabaseError
+    _HttpError = FakeHttpError
+    _SdkInternalError = FakeSdkInternalError
+
+    @staticmethod
+    def _raising_executor(error: BaseException):
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise error
+
+        return Executor
+
+    def _run(self, executor_class) -> tuple[FakeWorkerQueue, RecordingTerminalOutcomeSink]:
+        queue = FakeWorkerQueue()
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: executor_class(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+        return queue, sink
+
+    def _run_report(self, report: dict) -> tuple[FakeWorkerQueue, RecordingTerminalOutcomeSink]:
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return report
+
+        return self._run(Executor)
+
+    def test_each_unclassified_exception_type_leaves_a_distinguishable_signature(self) -> None:
+        """完成标准 1：数据库 / 外部 HTTP / SDK 内部三种底层异常，在日志里必须
+        留下**互不相同**的类型签名，而不是一律 ``session_failed`` 一个词。
+
+        **变异验红**（已实测）：把 ``report_extraction.failure_with_signature``
+        的返回值去掉 ``"signature"`` 这一项（等价于"兜底分支不再留签名"这个
+        退化），本用例由绿转红；把 ``exception_failure_signature`` 改成恒返回
+        同一个字符串同样红（三个签名塌成一个，``len(set(...)) == 3`` 捕获）。
+        恢复后复绿。
+        """
+
+        signatures: list[str] = []
+        for error in (
+            self._DatabaseError("connection to server failed"),
+            self._HttpError("502 Bad Gateway"),
+            self._SdkInternalError("transport closed unexpectedly"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                _, sink = self._run(self._raising_executor(error))
+                fields = sink.calls[0]
+                # 用户可见的分类**不变**（完成标准：不改用户可见文案）。
+                self.assertEqual(fields["error_kind"], "session_failed")
+                self.assertEqual(fields["failure_code"], "session_failed")
+                signature = fields["failure_signature"]
+                self.assertIsInstance(signature, str)
+                self.assertIn(type(error).__qualname__, signature)
+                signatures.append(signature)
+
+        self.assertEqual(
+            len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}"
+        )
+
+    def test_the_signature_is_a_qualified_type_name_not_a_bare_class_name(self) -> None:
+        """同名类型必须仍然可区分：``TimeoutError`` 这种名字被多个库各自定义，
+        只有带上模块名才回答得了"是数据库超时还是外部 HTTP 超时"。
+
+        **变异验红**（已实测）：把 ``exception_failure_signature`` 里的
+        ``qualified`` 改回裸类名，本用例由绿转红（断言不到模块前缀）。
+        """
+
+        _, sink = self._run(self._raising_executor(self._DatabaseError("boom")))
+
+        signature = sink.calls[0]["failure_signature"]
+        self.assertTrue(signature.endswith(".FakeDatabaseError"), f"实际={signature}")
+        self.assertIn("test_worker_queue_consumer", signature, f"实际={signature}")
+
+    def test_a_builtin_exception_keeps_a_short_signature_without_the_builtins_prefix(self) -> None:
+        """``builtins.`` 前缀对诊断毫无信息量，只会挤占 64 字符预算——内建异常
+        的签名就是它自己的名字。"""
+
+        _, sink = self._run(self._raising_executor(ValueError("boom")))
+
+        self.assertEqual(sink.calls[0]["failure_signature"], "ValueError")
+
+    def test_the_signature_never_carries_exception_text(self) -> None:
+        """完成标准 2（不泄露）：异常**正文**含外部标识原值时，日志与落库两个
+        出口都必须零出现。
+
+        样式取真实形状，不是编的：psycopg 唯一约束冲突的异常串就长这样
+        （``DETAIL:  Key (feishu_open_id)=(ou_...) already exists.``），rc22
+        opus 审查 P2-5 正是因为 ``event.pipeline_failed`` 记了这段全文才做的
+        收敛；这里照抄那条做法并把样本扩到 `V-花名册-33` 关心的其余三种外部
+        标识（``lpo_``/``pac_``）与邮箱。
+
+        **变异验红**（已实测）：让 ``report_extraction.exception_failure_
+        signature`` 返回 ``f"{type(error).__name__}: {error}"``（即"顺手把正文
+        也带上"这种最容易发生的改动），本用例由绿转红。恢复后复绿。
+        """
+
+        leaking = self._DatabaseError(
+            'duplicate key value violates unique constraint "app_user_feishu_open_id_key"\n'
+            "DETAIL:  Key (feishu_open_id)=(ou_fake0123456789) already exists.\n"
+            "chat=oc_fake9876 permission=lpo_fake4321 package=pac_fake8765 "
+            "contact=someone@example.com"
+        )
+        queue, sink = self._run(self._raising_executor(leaking))
+
+        for label, payload in (
+            ("低敏审计日志", repr(sink.calls[0])),
+            ("终态落库参数", repr(queue.terminals[0])),
+        ):
+            for secret in (
+                "ou_fake0123456789",
+                "lpo_fake4321",
+                "pac_fake8765",
+                "someone@example.com",
+                "duplicate key value",
+            ):
+                with self.subTest(sink=label, secret=secret):
+                    self.assertNotIn(secret, payload)
+        # 正面：泄露被挡住了，但线索**仍在**——否则这条断言用一个恒空的实现
+        # 也能通过。
+        self.assertTrue(sink.calls[0]["failure_signature"].endswith(".FakeDatabaseError"))
+
+    def test_failure_code_is_never_null_on_a_failed_terminal(self) -> None:
+        """完成标准 3：失败终态的 ``failure_code`` 不再为 ``null``。
+
+        三种"没人起名字"的真实形状各给一个显式码，且 ``error_kind`` 与用户
+        文案**逐字不变**（仍是通用失败，见 ``_failure_content`` 默认分支）。
+
+        **变异验红**（已实测）：把 ``service.py`` 里
+        ``logged_failure_code = failure_code or _unnamed_failure_code(report)``
+        改回 ``failure_code``，本用例三条 subTest 全红。恢复后复绿。
+        """
+
+        for label, report, expected_code in (
+            (
+                "回合没收口且没人给失败起名字",
+                {"turn": {"closed": False, "final_text": ""}, "failure": None},
+                "turn_not_closed",
+            ),
+            (
+                "屏障失效（有调用绕过了判定）",
+                {
+                    "turn": {"closed": False, "final_text": "", "gate_bypassed": True},
+                    "failure": None,
+                },
+                "gate_bypassed",
+            ),
+            (
+                "failure 映射存在但缺 code",
+                {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {"message": "something went wrong"},
+                },
+                "unnamed_failure",
+            ),
+        ):
+            with self.subTest(label):
+                queue, sink = self._run_report(report)
+                fields = sink.calls[0]
+                self.assertEqual(fields["failure_code"], expected_code)
+                self.assertIsNotNone(fields["failure_code"])
+                # 用户侧不变：通用失败文案 + 通用 error_kind。
+                self.assertEqual(fields["error_kind"], "session_failed")
+                self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
+                self.assertEqual(
+                    queue.terminals[0]["content"],
+                    default_content_catalog().text("worker.failed").text,
+                )
+
+    def test_stopped_and_withheld_terminals_also_carry_a_failure_code(self) -> None:
+        """完成标准 3 的另外两支：开工前就被停止、以及安全拒发，此前同样恒
+        ``failure_code=null``——运维按失败码过滤时这两类终态会整块消失。"""
+
+        queue = FakeWorkerQueue(stopped=True)
+        sink = RecordingTerminalOutcomeSink()
+
+        class NeverRuns:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise AssertionError("开工前已 stop，不该跑回合")
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: NeverRuns(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+        self.assertEqual(sink.calls[0]["terminal_kind"], "stopped")
+        self.assertEqual(sink.calls[0]["failure_code"], "stopped")
+
+        _, withheld_sink = self._run_report(
+            {
+                "turn": {
+                    "closed": True,
+                    "final_text": "被拦下的正文",
+                    "session_id": "s",
+                    "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                    "user_result": "redacted_withheld",
+                },
+                "failure": None,
+            }
+        )
+        self.assertEqual(withheld_sink.calls[0]["terminal_kind"], "redacted_withheld")
+        self.assertEqual(withheld_sink.calls[0]["failure_code"], "redacted_withheld")
+
+    def test_a_successful_turn_reports_no_failure_code_and_no_signature(self) -> None:
+        """否定测试：成功回合**没有**失败，两个字段必须保持 ``None``——把它们
+        填上一个占位符就是编造一次不存在的失败，也会让上面几条"非 null"断言
+        被一个恒真实现蒙混过关。"""
+
+        queue, sink = self._run_report(
+            {
+                "turn": {"closed": True, "final_text": "日活是 1024。", "session_id": "s"},
+                "failure": None,
+            }
+        )
+
+        self.assertEqual(sink.calls[0]["terminal_kind"], "success")
+        self.assertIsNone(sink.calls[0]["failure_code"])
+        self.assertIsNone(sink.calls[0]["failure_signature"])
+        self.assertIsNone(queue.terminals[0]["failure_code"])
+        self.assertIsNone(queue.terminals[0]["failure_signature"])
+
+    def test_already_classified_failures_keep_their_code_and_carry_no_fake_signature(self) -> None:
+        """完成标准 5（回归）：本来就能归因的失败码原样保留，终态种类与用户
+        文案不变；这些失败不来自异常对象，``failure_signature`` 必须保持
+        ``None``——编一个占位符会让"有签名"这件事失去信息量。"""
+
+        for failure_code, terminal_kind, error_kind in (
+            ("turn_timeout", "timeout", "running_timeout"),
+            ("max_turns_exceeded", "failed", "max_turns_exceeded"),
+            ("result_too_large", "failed", "result_too_large"),
+            ("context_too_long", "failed", "context_too_long"),
+        ):
+            with self.subTest(failure_code=failure_code):
+                queue, sink = self._run_report(
+                    {"turn": {"closed": False, "final_text": ""}, "failure": {"code": failure_code}}
+                )
+                self.assertEqual(sink.calls[0]["failure_code"], failure_code)
+                self.assertIsNone(sink.calls[0]["failure_signature"])
+                self.assertEqual(sink.calls[0]["terminal_kind"], terminal_kind)
+                self.assertEqual(sink.calls[0]["error_kind"], error_kind)
+                self.assertEqual(queue.terminals[0]["failure_code"], failure_code)
+
+    def test_the_failure_code_and_signature_are_persisted_with_the_terminal(self) -> None:
+        """两个出口，不是一个：低敏日志给有容器访问权限的运维，落库列给只有
+        飞书私聊的管理员（``/admin trace``）。worker 与 gateway 是两个独立进程、
+        不共享文件系统，只进 stderr 的线索管理员永远看不到。
+
+        **变异验红**（已实测）：把 ``_finish_terminal`` 传给
+        ``write_terminal_event`` 的 ``failure_code``/``failure_signature`` 两个
+        参数删掉，本用例由绿转红。
+        """
+
+        queue, sink = self._run(self._raising_executor(self._HttpError("502 Bad Gateway")))
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["failure_code"], "session_failed")
+        self.assertEqual(terminal["failure_signature"], sink.calls[0]["failure_signature"])
+        self.assertTrue(terminal["failure_signature"].endswith(".FakeHttpError"))
+
+    def test_a_hostile_type_name_is_reduced_to_an_identifier_shape(self) -> None:
+        """纵深防线：签名的字符集是**白名单**（ASCII 字母数字、下划线、点）。
+        某个 SDK 拿运行时数据动态造异常类时，类名里的空格、冒号、括号一律被
+        剔除，长度截到 64 字符——宁可签名难看也不让未知内容搭车进日志。"""
+
+        from lingxi.apps.worker.report_extraction import (
+            UNKNOWN_FAILURE_SIGNATURE,
+            sanitize_failure_signature,
+        )
+
+        self.assertEqual(
+            sanitize_failure_signature("Key (feishu_open_id)=(ou_x) 已存在"), "Keyfeishu_open_idou_x"
+        )
+        self.assertEqual(len(sanitize_failure_signature("A" * 300)), 64)
+        self.assertEqual(sanitize_failure_signature("中文异常"), UNKNOWN_FAILURE_SIGNATURE)
+        self.assertEqual(sanitize_failure_signature(""), UNKNOWN_FAILURE_SIGNATURE)
