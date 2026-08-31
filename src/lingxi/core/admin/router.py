@@ -107,7 +107,7 @@ class AdminQueries(Protocol):
         与一条生效的抑制行，见迁移 ``0072`` 的唯一索引按 ``direction`` 再分——见
         ``adapters/postgres_local_permission.py`` 模块文档）都返回 ``None``——多
         命中时不猜测该收回哪一条方向，也不同时收回两条；调用方据此回复"存在多条
-        匹配，请改用管理卡逐行收回或改用 override_id 直接指定"，不静默选择任意一条。
+        匹配，请改用管理卡撤销按钮或改用 override_id 直接指定"，不静默选择任意一条。
         真实实现见 ``adapters/admin_registry.PostgresAdminQueries.
         resolve_override_id``。"""
         ...
@@ -645,7 +645,7 @@ class AdminCommandRouter:
                                 "未找到匹配的当前生效本地覆盖（标识/公司/指标不匹配，"
                                 "或已被撤销，或同一键同时存在补充授权与屏蔽指标两条"
                                 "需要精确指定），请用 /admin user 查询后核对，或使用"
-                                "查询结果附带的管理卡逐行撤销按钮精确指定撤销。"
+                                "查询结果附带的管理卡撤销按钮精确指定撤销。"
                             ),
                         ),
                         actor=entry.feishu_open_id,
@@ -955,9 +955,9 @@ def _render_help(roles: Sequence[str]) -> str:
     """术语统一（Trace #469 S-1，PM 补充裁定第 4 条）：命令说明改用「补充授权」
     「屏蔽指标」「撤销」，与管理卡按钮、确认卡/终态卡/群通知同一份说法。最后一行
     不再声称"覆盖ID 见 /admin user 查询结果"——`/admin user` 回显自本批起不再
-    展示裸 override_id（内部 ID 只留审计，见 ``_render_local_overrides``），已知
-    覆盖ID 时仍可直接使用，但多数场景请改用上一行的「标识+公司+指标」形式或管理卡
-    逐行「撤销」按钮。
+    展示裸 override_id/permission_group_id（内部 ID 只留审计，见
+    ``_render_local_overrides``），已知覆盖ID 时仍可直接使用，但多数场景请改用上一行
+    的「标识+公司+指标」形式或管理卡「撤销」按钮。
     """
 
     role_line = "、".join(roles) if roles else "(无)"
@@ -974,8 +974,8 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起屏蔽指标（同上）\n"
         "/admin revoke_permission <标识> <公司> <指标> <原因> — 发起撤销本地覆盖"
         "（需本人飞书确认卡片；与 grant/suppress 同一参数形状，服务端反查覆盖ID）\n"
-        "/admin revoke_permission <覆盖ID> <原因> — 已知覆盖ID时按覆盖ID直接发起撤销"
-        "（多数场景请改用上一行的标识+公司+指标形式，或使用管理卡逐行撤销按钮）\n"
+        "/admin revoke_permission <覆盖ID/权限组ID> <原因> — 已知 ID 时直接发起撤销"
+        "（多数场景请改用上一行的标识+公司+指标形式，或使用管理卡撤销按钮）\n"
         f"当前角色：{role_line}"
     )
 
@@ -999,20 +999,44 @@ _OVERRIDE_DIRECTION_LABEL: dict[str, str] = {"grant": "补充授权", "suppress"
 def _render_local_overrides(
     overrides: Sequence[LocalPermissionOverrideView], *, display_names: AdminDisplayNames
 ) -> str:
-    """``/admin user`` 回显的「当前生效本地覆盖」段——每行一条，无覆盖时一行
-    「无本地覆盖」（#319 S-P-1b 卡 B）。
+    """``/admin user`` 回显的「当前生效本地覆盖」段。
+
+    新职位+范围授权的展开行共享 ``permission_group_id``，因此在用户可见文本中也
+    聚合成一个职位+范围项；只有历史 ``permission_group_id IS NULL`` 行维持逐行
+    展示。无覆盖时返回一行「无本地覆盖」（#319 S-P-1b 卡 B）。
 
     自 Trace #469 S-1 起**不再展示 override_id**（内部 ID 只留审计，管理员需要
-    发起撤销时用「标识+公司+指标」形式或管理卡逐行撤销按钮，均不需要先看到这个
-    内部 ID）；公司/指标经 ``display_names`` 翻译成人类可读文本，与管理卡
-    ``_override_row_elements`` 的「公司中文名 · 指标中文名 · 原因 · 时间」同一
-    格式。
+    发起撤销时用「标识+公司+指标」形式或管理卡撤销按钮，均不需要先看到这个内部
+    ID）；公司/指标经 ``display_names`` 翻译成人类可读文本。
     """
 
     if not overrides:
         return "无本地覆盖"
-    lines = []
+    groups: dict[str, list[LocalPermissionOverrideView]] = {}
     for override in overrides:
+        if override.permission_group_id:
+            groups.setdefault(override.permission_group_id, []).append(override)
+
+    lines: list[str] = []
+    rendered_groups: set[str] = set()
+    for override in overrides:
+        group_id = override.permission_group_id
+        if group_id:
+            if group_id in rendered_groups:
+                continue
+            rendered_groups.add(group_id)
+            first = groups[group_id][0]
+            reason = first.reason
+            if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
+                reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
+            scope = first.company_scope or first.company_id
+            scope_label = "全部" if scope == "*" else display_names.company_label(company_id=scope)
+            lines.append(
+                f"- （补充授权）职位 {first.position_name or '（未知职位）'} ·"
+                f" 公司范围 {scope_label} · 覆盖 {len(groups[group_id])} 项权限 ·"
+                f" 原因 {reason} · {first.created_at}"
+            )
+            continue
         direction_label = _OVERRIDE_DIRECTION_LABEL.get(override.direction, override.direction)
         reason = override.reason
         if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
@@ -1071,12 +1095,12 @@ def _render_galaxy_source(
     return f"公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
 
 
-#: 内部标识前缀白名单（Trace #469 S-1）：管理员可见文案零 ou_/lpo_/pac_ 是
+#: 内部标识前缀白名单（Trace #469 S-1）：管理员可见文案零 ou_/lpo_/lpg_/pac_ 是
 #: 结构性硬要求，即使这个值是管理员自己刚刚敲进来的输入也不例外——真正需要
 #: 隐藏的是"这串文本长得像系统内部标识"这件事本身，与它的来源（系统生成 /
 #: 管理员键入）无关。非内部 ID 形状的输入（多数情况下是邮箱，或管理员的一次
 #: 手误）原样回显，不额外做资料查找。
-_INTERNAL_ID_PREFIXES: tuple[str, ...] = ("ou_", "lpo_", "pac_")
+_INTERNAL_ID_PREFIXES: tuple[str, ...] = ("ou_", "lpo_", "lpg_", "pac_")
 
 
 def _safe_identifier_echo(identifier: str) -> str:

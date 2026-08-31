@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0082_document_delivery_degraded` |
+| head revision | `0083_management_card_recovery` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -550,6 +550,15 @@ NOT DISTINCT FROM 'docx')` 与 `0079` 的 `markdown` CHECK 同一姿态。本列
 
 `downgrade()` 直接删该列及其 CHECK，有损（非空取值随列丢失，不删行本身），与
 `0078`/`0079` 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0083_management_card_recovery`（管理卡视觉恢复与 24 小时边界）
+
+Issue #493。`management_card_context` 新增持久 `needs_refresh` 与
+`visual_sequence`，把数据库状态与 CardKit 视觉回写分开：gateway 启动和心跳扫描
+失败水位，只有 CardKit update 成功才推进视觉水位；同时新增真实 daily batch 补齐的
+待汇总标记，迟到的 instant outbox 不会被算作每日纠偏。数据库 CHECK 与代码层共同
+把上下文截止时间限制在创建后 24 小时内，默认保留窗口为 40 分钟。新增列与约束的
+downgrade 是有损但不删除业务行，符合 add-before-delete 与存量不迁移约定。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

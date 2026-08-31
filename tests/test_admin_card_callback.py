@@ -1178,6 +1178,28 @@ class ManagementRevokeClickTests(unittest.TestCase):
         self.assertEqual(response["toast"]["type"], "success")
         self.assertNotIn("card", response)
 
+    def test_position_group_revoke_uses_group_id_and_group_reason(self) -> None:
+        router = _FakeManagementRouter()
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="",
+            permission_group_id="lpg_01M1C90YDGMTY567GDTZZJ4C5E",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_group_revoke",
+        )
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(
+            router.route_calls[0]["text"],
+            "/admin revoke_permission lpg_01M1C90YDGMTY567GDTZZJ4C5E 管理卡撤销职位范围授权",
+        )
+
     def test_not_wired_replies_unavailable_without_crashing(self) -> None:
         handler, _ = _build_handler(pending_actions=_FakePendingActions())
 

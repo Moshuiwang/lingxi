@@ -32,6 +32,7 @@ from __future__ import annotations
 import time
 import hashlib
 import json
+import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -52,6 +53,50 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction
 from lingxi.core.admin.views import AdminUserStatusView
+
+
+# 管理卡上下文只允许在这段时间内接受旧卡回调。它是一个内部保护窗口，不是
+# 待确认操作或本地授权的有效期；但无论调用方如何配置，都不能超过 24 小时。
+# 这两个常量放在 core 的唯一纯逻辑入口，内存兼容实现与 PostgreSQL 适配器共用同一
+# 组边界，避免一边允许更长窗口而另一边已经拒绝的语义分叉。
+MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS = 40.0 * 60.0
+MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS = 24.0 * 60.0 * 60.0
+
+
+def bounded_management_card_ttl_seconds(value: float) -> float:
+    """把管理卡上下文 TTL 收窄到 ``(0, 24h]``。
+
+    ``ttl_seconds`` 是部署/测试配置入口，不能成为绕过 24 小时硬上限的后门。非有限
+    或非正数配置直接失败关闭；超过上限的合法数值收窄到上限。调用方若需要构造一条
+    已经过期的历史上下文，应传一个显式的过去 ``context_deadline_at``，而不是配置
+    一个非法 TTL。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("管理卡上下文 TTL 必须是有限正数")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError("管理卡上下文 TTL 必须是有限正数")
+    return min(number, MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS)
+
+
+def bounded_management_card_deadline(
+    *, now: datetime, requested: datetime | None, ttl_seconds: float
+) -> datetime:
+    """返回不晚于 ``now + 24h`` 的管理卡上下文截止时间。"""
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    elif now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if requested is None:
+        deadline = now + timedelta(seconds=bounded_management_card_ttl_seconds(ttl_seconds))
+    else:
+        deadline = requested
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+    hard_deadline = now + timedelta(seconds=MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS)
+    return min(deadline, hard_deadline)
 
 
 def management_card_fingerprint(status: AdminUserStatusView) -> str:
@@ -211,8 +256,9 @@ class ManagementCardDispatchResult:
 class ManagementCardContext:
     """一张管理卡的可恢复上下文。
 
-    ``context_deadline_at`` 只用于回调时的懒检查；没有后台定时器，也不改变已经确认
-    生效的本地授权有效期。``card_sequence`` 是整卡更新序号，必须由持久层原子递增。
+    ``context_deadline_at`` 只用于回调时的懒检查；后台恢复 scanner 只处理已落库但尚未
+    成功回写的视觉水位，不主动清扫到期上下文，也不改变已经确认生效的本地授权有效期。
+    ``card_sequence`` 是整卡更新序号，必须由持久层原子递增。
     """
 
     message_id: str
@@ -226,9 +272,17 @@ class ManagementCardContext:
     state: str = "ready"
     dispatch_status: str = "idle"
     last_trace_id: str | None = None
-    # 仅用于每日批补齐汇总的幂等水位；普通即时成功从 dispatching 进入
-    # effective 时会置上，incomplete 被每日批补齐时保留为空，直到汇总成功送达。
+    # 仅用于每日批补齐汇总的幂等水位；只有持久层确认 daily refresh/batch 已经补齐
+    # 一条此前即时失败的操作时才置上，普通即时成功不会获得这项资格。
     daily_correction_reported_at: datetime | None = None
+    # 只有真实 daily refresh/batch 发布补齐过一条此前即时失败的操作时才为真；迟到
+    # 的 instant outbox 成功会清掉它，不能触发“每日纠偏补齐”群摘要。
+    daily_correction_pending: bool = False
+    # ``needs_refresh`` 是持久的视觉回写水位：数据库状态已经改变但 CardKit 尚未
+    # 成功接受最新卡片时为真。``visual_sequence`` 只在 CardKit 成功后推进，不能在
+    # 取号或网络调用失败时提前推进。
+    needs_refresh: bool = False
+    visual_sequence: int = 2
 
 
 class ManagementCardContextStore:
@@ -262,7 +316,7 @@ class ManagementCardContextStore:
     ``card_id``、发起人、快照指纹和 sequence）落在 PostgreSQL，以支持重启恢复。
     因此这里的 TTL/容量仅是测试适配器的内部默认值，不构成产品承诺。
 
-    TTL 默认 30 分钟（管理卡查询后不太可能拖到半小时之后才提交表单，超时后
+    TTL 默认 40 分钟（管理卡查询后不太可能拖到四十分钟之后才提交表单，超时后
     退回既有拒绝路径不算体验回退）；条目数上限默认 512，超过时逐出**最早写入**
     的一条（``OrderedDict`` + ``move_to_end`` 的最简单可行策略，不需要按最近
     访问时间重新排序——本映射只在"写入"与"回调时读一次"两个时机被触碰，读取
@@ -274,11 +328,11 @@ class ManagementCardContextStore:
     def __init__(
         self,
         *,
-        ttl_seconds: float = 1800.0,
+        ttl_seconds: float = MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
         max_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._ttl_seconds = ttl_seconds
+        self._ttl_seconds = bounded_management_card_ttl_seconds(ttl_seconds)
         self._max_entries = max_entries
         self._clock = clock
         self._entries: OrderedDict[str, tuple[ManagementCardContext, float]] = OrderedDict()
@@ -310,8 +364,10 @@ class ManagementCardContextStore:
         if not message_id or not identifier:
             return
         expires_at = self._clock() + self._ttl_seconds
-        deadline = context_deadline_at or (
-            datetime.now(timezone.utc) + timedelta(seconds=self._ttl_seconds)
+        deadline = bounded_management_card_deadline(
+            now=datetime.now(timezone.utc),
+            requested=context_deadline_at,
+            ttl_seconds=self._ttl_seconds,
         )
         context = ManagementCardContext(
             message_id=message_id,
@@ -325,6 +381,8 @@ class ManagementCardContextStore:
             state=state,
             dispatch_status=dispatch_status,
             last_trace_id=last_trace_id,
+            needs_refresh=False,
+            visual_sequence=max(1, int(card_sequence)),
         )
         # 同一个 message_id 重复登记（理论上不会发生——每次 `/admin user`
         # 都会建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续
@@ -403,13 +461,20 @@ class ManagementCardContextStore:
             if entry is None:
                 return None
             context, expires_at = entry
+            changed = any(
+                value is not None
+                for value in (state, dispatch_status, snapshot_fingerprint, last_trace_id)
+            )
             updated = ManagementCardContext(
                 message_id=context.message_id,
                 card_id=context.card_id,
                 identifier=context.identifier,
                 chat_id=context.chat_id,
                 initiated_by_open_id=context.initiated_by_open_id,
-                card_sequence=context.card_sequence,
+                # 每次持久状态改变都占用一个新的整卡版本。除了让 CardKit 的更新
+                # 顺序严格单调，这还使旧 scanner 在新状态写入后不能误把 needs_refresh
+                # 清掉；mark_visual_refreshed() 会按这个版本判定是否仍有新状态。
+                card_sequence=context.card_sequence + (1 if changed else 0),
                 snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
                 context_deadline_at=context.context_deadline_at,
                 state=state if state is not None else context.state,
@@ -417,12 +482,52 @@ class ManagementCardContextStore:
                 last_trace_id=last_trace_id if last_trace_id is not None else context.last_trace_id,
                 daily_correction_reported_at=(
                     context.daily_correction_reported_at
-                    if state != "effective" or context.state == "incomplete"
+                    if state != "effective" or context.daily_correction_pending
                     else context.daily_correction_reported_at or datetime.now(timezone.utc)
                 ),
+                # ``incomplete`` 只是失败状态，不足以证明每日批已补齐；保留既有
+                # qualification，只有 settle_published_contexts 才能置位它。
+                daily_correction_pending=context.daily_correction_pending,
+                needs_refresh=context.needs_refresh or changed,
+                visual_sequence=context.visual_sequence,
             )
             self._entries[message_id] = (updated, expires_at)
             return updated
+
+    def list_needing_refresh(self, *, limit: int = 20) -> tuple[ManagementCardContext, ...]:
+        """返回尚未被 CardKit 成功回写的上下文。"""
+
+        if limit < 1:
+            return ()
+        with self._lock:
+            return tuple(
+                context
+                for context, _expires_at in self._entries.values()
+                if context.needs_refresh
+            )[:limit]
+
+    def mark_visual_refreshed(self, *, message_id: str, sequence: int) -> bool:
+        """仅在外部 CardKit update 成功后清除视觉回写水位。"""
+
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return False
+            context, expires_at = entry
+            if sequence < context.visual_sequence:
+                return False
+            updated = ManagementCardContext(
+                **{
+                    **context.__dict__,
+                    # 与 PostgreSQL ``CASE WHEN card_sequence <= sequence`` 同一
+                    # 语义：若另一个回调已经拿到更高的序号，较早那次成功回写不能
+                    # 清掉较新的待刷新水位。
+                    "needs_refresh": context.card_sequence > sequence,
+                    "visual_sequence": max(context.visual_sequence, sequence),
+                }
+            )
+            self._entries[message_id] = (updated, expires_at)
+            return True
 
     # The in-memory compatibility store has no publish outbox to observe.  Keep the
     # production adapter's optional observation surface available so gateway tests and

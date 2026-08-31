@@ -325,6 +325,90 @@ class _GatewayManagementCardRefresher:
         )
         sequence = self._context_store.next_card_sequence(message_id=context.message_id)
         self._transport.update(card_id=context.card_id, sequence=sequence, card=card)
+        # 只有 CardKit update 返回成功才推进持久视觉水位。取号或外部调用失败时
+        # ``needs_refresh`` 必须保留，供重启后的 scanner 再次尝试；不能靠进程内
+        # observer 的一次机会把数据库状态与原卡永久分叉。
+        mark_visual_refreshed = getattr(self._context_store, "mark_visual_refreshed", None)
+        if callable(mark_visual_refreshed):
+            mark_visual_refreshed(message_id=context.message_id, sequence=sequence)
+
+
+class _ManagementCardRecoveryScanner:
+    """用持久 ``needs_refresh`` 水位恢复管理卡最终视觉状态。
+
+    管理卡状态写库与 CardKit 更新是两个外部系统，不能由进程内 observer 维持
+    一致。scanner 在 gateway 启动时先跑一次，之后由长连接心跳按短间隔惰性触发；
+    失败只留下水位并等待下一轮，成功则由 refresher 在 CardKit 返回后清水位。
+    因而重启、短暂 CardKit 故障和重复扫描都收敛到同一条幂等路径，不会产生第二张
+    卡或第二条业务投递。
+    """
+
+    def __init__(
+        self,
+        *,
+        context_store: Any,
+        refresher: Any,
+        status_lookup: Callable[[str], Any],
+        audit: Any,
+        interval_seconds: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._context_store = context_store
+        self._refresher = refresher
+        self._status_lookup = status_lookup
+        self._audit = audit
+        self._interval_seconds = max(0.1, float(interval_seconds))
+        self._clock = clock
+        self._next_scan_at = 0.0
+
+    @staticmethod
+    def _dispatch_status_for(context: ManagementCardContext) -> str | None:
+        if context.dispatch_status in {"publishing", "effective", "incomplete"}:
+            return context.dispatch_status
+        if context.state in {"dispatching", "submitted"}:
+            return "publishing"
+        if context.state == "effective":
+            return "effective"
+        if context.state == "incomplete":
+            return "incomplete"
+        return None
+
+    def scan(self) -> int:
+        try:
+            contexts = self._context_store.list_needing_refresh(limit=20)
+        except Exception as error:  # noqa: BLE001 - preserve watermark for retry
+            self._audit.record(
+                "admin.management_card.recovery_scan_failed", error=type(error).__name__
+            )
+            return 0
+        recovered = 0
+        for context in contexts:
+            try:
+                status = self._status_lookup(context.identifier)
+                if status is None:
+                    continue
+                dispatch_status = self._dispatch_status_for(context)
+                self._refresher.update(
+                    context=context,
+                    status=status,
+                    state=context.state,
+                    dispatch_status=dispatch_status,
+                )
+                recovered += 1
+            except Exception as error:  # noqa: BLE001 - retry this row next scan
+                self._audit.record(
+                    "admin.management_card.recovery_refresh_failed",
+                    error=type(error).__name__,
+                    message_id=getattr(context, "message_id", ""),
+                )
+        self._next_scan_at = self._clock() + self._interval_seconds
+        return recovered
+
+    def scan_if_due(self) -> int:
+        now = self._clock()
+        if now < self._next_scan_at:
+            return 0
+        return self.scan()
 
 
 # This is an internal observer window, not a product promise.  The administrator sees
@@ -376,8 +460,9 @@ def make_event_handler(
     ``admin_action``），因此可以只按这一个键的存在与取值分流，不需要额外的
     卡片来源标记：
 
-    - ``admin_action == "revoke"``（逐行「收回」按钮）：解析出 ``override_id``，
-      调用 :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
+    - ``admin_action == "revoke"``（撤销按钮）：新职位+范围项解析出
+      ``permission_group_id``，历史行解析出 ``override_id``，调用
+      :meth:`~lingxi.core.admin.card_callback.AdminCardCallbackHandler.
       handle_management_revoke`。
     - ``admin_action`` 是 ``"grant"``/``"suppress"``（表单提交）：额外从
       ``action_event.form_value``（``adapters/feishu_events.py`` 集中解析，见
@@ -447,7 +532,7 @@ def make_event_handler(
                     admin_action = ADMIN_ACTION_SUPPRESS
             if admin_action == ADMIN_ACTION_REVOKE:
                 chat_id, message_id = _management_card_context(payload)
-                return card_callback_handler.handle_management_revoke(
+                revoke_kwargs = dict(
                     operator_open_id=action_event.operator_open_id,
                     override_id=action_event.action_value.get("override_id", ""),
                     chat_id=chat_id,
@@ -455,6 +540,10 @@ def make_event_handler(
                     message_id=message_id,
                     trace_id=action_event.trace_id,
                 )
+                permission_group_id = action_event.action_value.get("permission_group_id", "")
+                if permission_group_id:
+                    revoke_kwargs["permission_group_id"] = permission_group_id
+                return card_callback_handler.handle_management_revoke(**revoke_kwargs)
             if admin_action == ADMIN_ACTION_CANCEL:
                 chat_id, message_id = _management_card_context(payload)
                 identifier = action_event.action_value.get("identifier", "")
@@ -710,6 +799,16 @@ def build_supervisor(
         resolved = resolver(identifier=identifier) if callable(resolver) else identifier
         return admin_display_names.user_status(identifier=resolved)
 
+    management_card_recovery = _ManagementCardRecoveryScanner(
+        context_store=management_card_context_store,
+        refresher=management_card_refresher,
+        status_lookup=_lookup_management_status,
+        audit=audit,
+    )
+    # 启动时先恢复一次；失败只留 needs_refresh 水位，不能阻止 gateway 建立长连接。
+    # 后续每次长连接心跳由 scan_if_due() 重试，CardKit 成功后才清水位。
+    management_card_recovery.scan()
+
     def _refresh_management_after_recompute(
         pending: Any,
         *,
@@ -950,6 +1049,11 @@ def build_supervisor(
         # 停机时跳过尽力而为的出站回复，不让它把停机拖过预算。
         should_stop=should_stop,
     )
+    def _management_card_heartbeat() -> None:
+        management_card_recovery.scan_if_due()
+        if heartbeat is not None:
+            heartbeat()
+
     return LongConnectionSupervisor(
         transport=transport
         or LarkEventTransport(
@@ -980,7 +1084,7 @@ def build_supervisor(
             ceiling_seconds=config.reconnect_ceiling_seconds,
         ),
         audit=audit.record,
-        heartbeat=heartbeat,
+        heartbeat=_management_card_heartbeat,
     )
 
 

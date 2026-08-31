@@ -95,10 +95,11 @@ MAX_AUDIT_WINDOW_HOURS = 720
 #: 或收回的来龙去脉，同时防止一次输入把审计字段撑成不可读的长文。
 _PERMISSION_REASON_MAX_LENGTH = 500
 
-#: ``revoke_permission`` 的目标标识形状：本地权限覆盖行的内部主键前缀
-#: （``adapters/postgres_local_permission.py`` 用 ``new_id("lpo")`` 生成），不是
-#: open_id——收回命令按行本身定位，不是按用户+公司+指标定位（卡 B 设计卡）。
+#: ``revoke_permission`` 的目标标识形状：历史本地权限覆盖行的内部主键前缀，或
+#: 新职位+范围授权组的内部主键前缀（``permission_group_id``）。两者都不是
+#: open_id——前者按历史行定位，后者按一笔职位+公司范围授权整体定位。
 _OVERRIDE_ID_PREFIX = "lpo_"
+_PERMISSION_GROUP_ID_PREFIX = "lpg_"
 
 _COMMAND_PREFIX = "/admin"
 
@@ -442,21 +443,26 @@ def _parse_position_permission_command(rest: list[str]) -> AdminCommand:
 
 
 def _is_override_id(token: str) -> bool:
-    """``lpo_`` 前缀 + 26 位 Crockford Base32 ULID——与 ``core/ids.new_id("lpo")``
-    的生成形状逐字对应，复用 ``core/ids.is_ulid`` 而不是自己重写一份大小写/
-    字母表校验（全仓库唯一一份 ULID 实现，见该模块文档）。"""
+    """历史 ``lpo_`` 行 ID 或新授权组 ``lpg_`` ID。"""
 
-    if not token.startswith(_OVERRIDE_ID_PREFIX):
+    prefix = next(
+        (
+            candidate
+            for candidate in (_OVERRIDE_ID_PREFIX, _PERMISSION_GROUP_ID_PREFIX)
+            if token.startswith(candidate)
+        ),
+        None,
+    )
+    if prefix is None:
         return False
-    return is_ulid(token[len(_OVERRIDE_ID_PREFIX) :])
+    return is_ulid(token[len(prefix) :])
 
 
 def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
     """``revoke_permission`` 的解析，支持两种形状（#439 A 档新增第二种）：
 
-    1. ``<override_id> <reason...>``——原有形状，按行本身定位（见 ``AdminCommand``
-       文档），供已经知道 override_id 的调用方直接使用（例如 B 档管理卡逐行「收回」
-       按钮，回调时本来就携带这一行的 override_id，不需要再走反查）。
+    1. ``<override_id|permission_group_id> <reason...>``——管理卡按钮形状：历史
+       ``lpo_`` 按行定位，新授权组 ``lpg_`` 按职位+范围整体定位。
     2. ``<identifier> <company_id> <metric_name> <reason...>``——与
        ``grant_permission``/``suppress_permission`` **同一个参数形状**（#439 卡内
        证据：形状不同致管理员两次真实误用），``identifier`` 是目标用户标识（open_id
@@ -465,7 +471,8 @@ def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
        resolve_override_id``），本模块只负责识别出"这是第二种形状"并原样透传三个
        字段，不做任何查库。
 
-    判据：第一个 token 是否符合 ``lpo_`` + ULID 的形状（:func:`_is_override_id`）。
+    判据：第一个 token 是否符合 ``lpo_``/``lpg_`` + ULID 的形状
+    （:func:`_is_override_id`）。
     两种形状的 token 数量域不重叠时也能分辨（形状 1 至少 2 个 token，形状 2 至少
     4 个），但判据本身用"第一个 token 长什么样"而不是"数了多少个 token"——后者会让
     一个只填了 2 个 token 的形状 2 输入（identifier 打错导致 reason 被吃掉一部分）

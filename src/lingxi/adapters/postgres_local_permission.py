@@ -337,6 +337,34 @@ class PostgresLocalPermissionOverrideStore:
                 cursor, override_id=override_id, revoked_pending_action_id=revoked_pending_action_id, moment=moment
             )
 
+    def revoke_group(
+        self,
+        *,
+        permission_group_id: str,
+        revoked_pending_action_id: str,
+        expected_override_ids: tuple[str, ...],
+        now: datetime | None = None,
+    ) -> bool:
+        """事务性收回一笔职位+范围授权的全部展开行。
+
+        ``expected_override_ids`` 是管理卡展示时看到的完整行集合。函数在同一
+        事务中先对该组当前生效行加行锁，再核对集合完全一致，最后一次性翻转所有
+        行；因此并发新授权不会被误伤，且组已发生漂移时整个操作原子失败。历史
+        ``permission_group_id IS NULL`` 行仍由 :meth:`revoke` 按行收回。
+        """
+
+        if not permission_group_id or not expected_override_ids:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            return _revoke_group_locked(
+                cursor,
+                permission_group_id=permission_group_id,
+                revoked_pending_action_id=revoked_pending_action_id,
+                moment=moment,
+                expected_override_ids=expected_override_ids,
+            )
+
 
 def _insert_locked(cursor, *, override_id: str, entry: LocalPermissionOverrideEntry) -> None:
     """在调用方已经持有的 ``cursor``（及其所在事务）上执行实际 ``INSERT``。
@@ -398,3 +426,45 @@ def _revoke_locked(
         (moment, revoked_pending_action_id, override_id),
     )
     return cursor.rowcount == 1
+
+
+def _revoke_group_locked(
+    cursor,
+    *,
+    permission_group_id: str,
+    revoked_pending_action_id: str,
+    moment: datetime,
+    expected_override_ids: tuple[str, ...],
+) -> bool:
+    """在调用方事务内锁定并收回一整个新职位授权组。
+
+    锁定后比较期望集合是并发安全的关键：如果另一笔确认已经为同组追加了行，
+    或组内某行已被先收回，返回 ``False``，调用方回滚整笔待确认操作，不会只收
+    回半组或把并发新授权带走。调用方应在同一事务中持有目标用户锁，以序列化
+    常规 grant/revoke；这里的集合比较则是数据库级纵深防线。
+    """
+
+    if not permission_group_id or not expected_override_ids:
+        return False
+    expected = tuple(dict.fromkeys(expected_override_ids))
+    if len(expected) != len(expected_override_ids):
+        return False
+    cursor.execute(
+        "SELECT id FROM local_permission_override"
+        " WHERE permission_group_id = %s AND entry_status = 'active'"
+        " ORDER BY id FOR UPDATE",
+        (permission_group_id,),
+    )
+    current_ids = tuple(row[0] for row in cursor.fetchall())
+    if set(current_ids) != set(expected) or len(current_ids) != len(expected):
+        return False
+    placeholders = ", ".join("%s" for _ in expected)
+    cursor.execute(
+        "UPDATE local_permission_override"
+        " SET entry_status = 'revoked', revoked_at = %s,"
+        "     revoked_pending_action_id = %s"
+        f" WHERE permission_group_id = %s AND entry_status = 'active'"
+        f"   AND id IN ({placeholders})",
+        (moment, revoked_pending_action_id, permission_group_id, *expected),
+    )
+    return cursor.rowcount == len(expected)
