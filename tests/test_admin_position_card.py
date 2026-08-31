@@ -507,6 +507,30 @@ class ContextSequenceTests(unittest.TestCase):
             MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS + 1,
         )
 
+        from lingxi.core.admin.card_dispatch import bounded_management_card_deadline
+
+        fixed_now = NOW
+        before_24h = fixed_now + timedelta(hours=24) - timedelta(seconds=1)
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=before_24h, ttl_seconds=1800
+            ),
+            before_24h,
+        )
+        exact_24h = fixed_now + timedelta(hours=24)
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=exact_24h, ttl_seconds=1800
+            ),
+            exact_24h,
+        )
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=exact_24h + timedelta(seconds=1), ttl_seconds=1800
+            ),
+            exact_24h,
+        )
+
     def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(self) -> None:
         clock = [0.0]
         store = ManagementCardContextStore(ttl_seconds=1.0, clock=lambda: clock[0])
