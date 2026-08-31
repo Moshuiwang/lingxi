@@ -257,6 +257,40 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertIn("公司范围 全部（3 家公司）", visible)
 
 
+class TerminalOutcomeTextTests(unittest.TestCase):
+    @staticmethod
+    def _executed(*, payload: str | None) -> PendingAction:
+        return PendingAction(
+            id="pac_outcome_text",
+            action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+            target_open_id="ou_target",
+            target_state_snapshot="absent",
+            initiated_by_open_id="ou_admin",
+            status=PendingActionStatus.EXECUTED,
+            card_delivered=True,
+            card_id="card_confirm",
+            reason="特批",
+            created_at=NOW,
+            confirm_deadline_at=NOW + timedelta(minutes=10),
+            decided_at=NOW,
+            decided_by_open_id="ou_admin",
+            payload=payload,
+        )
+
+    def test_position_scope_confirmation_is_truthfully_waiting(self) -> None:
+        from lingxi.core.admin.card_callback import _outcome_text
+
+        self.assertEqual(
+            _outcome_text(self._executed(payload='{"position_name":"A运营","company_scope":"c1"}')),
+            "操作已记录，权限正在下发",
+        )
+
+    def test_legacy_confirmation_also_reports_the_two_phase_result(self) -> None:
+        from lingxi.core.admin.card_callback import _outcome_text
+
+        self.assertEqual(_outcome_text(self._executed(payload=None)), "操作已记录，权限正在下发")
+
+
 class ContextSequenceTests(unittest.TestCase):
     def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(self) -> None:
         clock = [0.0]
