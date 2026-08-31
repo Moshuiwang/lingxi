@@ -365,7 +365,7 @@ class DocumentDeliveryConsumer:
         # 的 document_id 必然是全新文档，从未写过正文，不需要这次额外读回，行为
         # 与修复前逐字相同（见模块说明「写正文步的幂等判据」）。
         recovering_from_checkpoint = document_id is not None
-        # Issue #499：这一行此前是否已经被判定为降级交付（迁移 0080 的
+        # Issue #499：这一行此前是否已经被判定为降级交付（迁移 0082 的
         # `body_degraded_reason`，由 `claim_pending` 一并读出）。检查点恢复路径
         # 会跳过写正文步、因此不会再产生一次 `WriteBodyOutcome`——不从 claim 里
         # 继承这个值，恢复路径发出的就是不带降级说明的"文档已生成"。
@@ -401,7 +401,7 @@ class DocumentDeliveryConsumer:
                     # 然向上抛，走下面既有的 definite/结果不明分类）。降级时正文
                     # **已经**写进飞书了，所以这里先把原因码单独提交成检查点、再
                     # 继续授权/读回——晚提交会被一次崩溃带走，恢复路径就再也无从
-                    # 知道这一行降级过（见迁移 0080 文件头部「残留窗口如实登记」）。
+                    # 知道这一行降级过（见迁移 0082 文件头部「残留窗口如实登记」）。
                     if outcome.degraded_reason is not None:
                         body_degraded_reason = outcome.degraded_reason
                         self._store.mark_body_degraded(
@@ -533,7 +533,7 @@ class DocumentDeliveryConsumer:
 
         ``body_degraded_reason``（Issue #499）：只由 docx 分支传，非 ``None`` 时
         成功通知改用明示降级的文案。sheet 分支结构上恒为 ``None``（没有"markdown
-        转换"这个概念，迁移 0080 的 CHECK 也在数据库层拒绝这种行），因此不传。
+        转换"这个概念，迁移 0082 的 CHECK 也在数据库层拒绝这种行），因此不传。
         """
 
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
@@ -680,7 +680,7 @@ class DocumentDeliveryConsumer:
         补发未确认送达通知的路径（``run_once`` 里的 :class:`UnnotifiedSuccess`，
         没有完整 claim——``title``/``paragraphs``/``attempts`` 对补发通知无关）。
 
-        ``body_degraded_reason``（迁移 0080，Issue #499）：非 ``None`` 时选用
+        ``body_degraded_reason``（迁移 0082，Issue #499）：非 ``None`` 时选用
         ``delivery.document_ready_degraded``。两个调用点各自的来源不同——原发送
         路径来自本次 ``write_body`` 的返回值（或 claim 里继承的历史值），补发
         路径来自 :class:`~lingxi.adapters.postgres_document_delivery.

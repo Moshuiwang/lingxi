@@ -227,6 +227,20 @@ class TomlCompanyMetricCatalog:
                 metrics.update(values)
         return tuple(sorted(metrics))
 
+    def positions(self) -> Sequence[str]:
+        """返回可选择的银河职位名；必须是映射文件中的精确 key。"""
+
+        from lingxi.adapters.role_function_map_file import load_role_function_map
+
+        try:
+            return tuple(sorted(load_role_function_map().keys()))
+        except Exception as error:  # noqa: BLE001 - 管理卡降级为空目录
+            logger.warning(
+                "admin.management_card.position_catalog_load_failed error=%s",
+                type(error).__name__,
+            )
+            return ()
+
     def _load(self) -> dict[str, dict[str, tuple[str, ...]]]:
         from lingxi.adapters.company_function_metric_map_file import (
             load_company_function_metric_map,
@@ -244,9 +258,8 @@ class TomlCompanyMetricCatalog:
 class LarkAdminManagementCardTransport:
     """实现 ``core.admin.management_card.ManagementCardTransport``：真实建卡并
     作为消息发出（#439 B 档）。与 :class:`LarkAdminCardTransport.create` 同构
-    （同一套 CardKit 建卡 + 回复发送、``DeliveryRejected`` 白名单判别姿态），
-    区别是管理卡不支持 ``update()``——它不是一次待确认操作，见
-    ``core.admin.management_card.ManagementCardTransport`` 文档。
+    （同一套 CardKit 建卡 + 回复发送、``DeliveryRejected`` 白名单判别姿态）；
+    ``update()`` 用于在原卡片实体上刷新 #493 的懒过期与异步下发状态。
 
     **本模块的真实行为未验证（证据等级 1）**：全部断言跑在注入的假实现上；真实
     CardKit 是否接受 ``select_static``/``input``/``form`` 三种组件、真实点击是否
@@ -328,3 +341,28 @@ class LarkAdminManagementCardTransport:
                 f"log_id={send_response.get_log_id()}"
             )
         return ManagementCardCreated(card_id=card_id, message_id=send_response.data.message_id)
+
+    def update(self, *, card_id: str, sequence: int, card: dict[str, Any]) -> None:
+        """原地替换管理卡；``sequence`` 由持久上下文存储原子递增。"""
+
+        from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
+
+        request = (
+            UpdateCardRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                UpdateCardRequestBody.builder()
+                .card(Card.builder().type("card_json").data(json.dumps(card, ensure_ascii=False)).build())
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = self._client.cardkit.v1.card.update(request)
+        if not response.success():
+            raise AdminCardDeliveryRejected(
+                f"管理卡更新失败：code={response.code} msg={response.msg} "
+                f"log_id={response.get_log_id()}",
+                code=response.code,
+                log_id=response.get_log_id(),
+            )

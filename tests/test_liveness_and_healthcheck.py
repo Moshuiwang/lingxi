@@ -3,6 +3,17 @@
 healthcheck 必须能对"依赖不可达"和"主循环停摆"两类真实故障如实变红——本文件
 用真实文件系统（``tempfile``）与真实（但故意配错/故意不启动）网络目标验证这一点，
 不用 mock 掩盖判定逻辑本身。
+
+``HealthcheckFreeSpaceTests``（Issue #494，2026-08-31）覆盖第三类真实故障：
+**活性文件所在的那块盘写满**。这一类此前完全测不出来，因为它压根没有对应的判定
+——worker 容器的 ``/tmp`` 是 256MB 内存盘、被 Agent 会话转录写满后任务开始失败，
+而健康检查一路报绿（活性文件是十几字节的覆盖写，不需要新页）。本节第一个用例
+就把那个"盘满仍然绿"的现场原样复现出来，再断言新判定确实变红。
+
+**这一节唯一注入的替身是 ``statvfs`` 读数**：在 CI 里造一块真的写满的文件系统需要
+root（mount tmpfs / 挂 loop 设备），不是单元测试能做到的事。为了不让替身把判定
+逻辑一起掩盖掉，``test_real_filesystem_numbers_are_actually_read`` 用真实目录、
+真实 ``os.statvfs`` 跑两次相反的阈值，证明读的确实是这块盘的真实数字。
 """
 
 from __future__ import annotations
@@ -523,3 +534,189 @@ class HealthcheckTtlLatencyContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _fake_statvfs(*, total_bytes: int, free_bytes: int):
+    """构造一份 ``os.statvfs`` 读数替身（块大小固定 1 字节，数字即字节）。"""
+
+    class _Result:
+        f_frsize = 1
+        f_blocks = total_bytes
+        f_bavail = free_bytes
+
+    return lambda _path: _Result()
+
+
+class HealthcheckFreeSpaceTests(unittest.TestCase):
+    """Issue #494 ③：健康检查必须反映 ``/tmp`` 的真实可用空间。
+
+    这是本卡的核心验收项：前两个子问题（无界增长、容量上限没分环境）之所以能
+    在生产里静默地把用户任务拖垮，正是因为**没有任何一段判定看得见这块盘**。
+    """
+
+    def test_the_liveness_probe_still_passes_on_a_full_disk_which_is_why_this_check_exists(
+        self,
+    ) -> None:
+        """先把"假阳性"的现场原样复现出来：盘满了，活性文件照样写得成功、年龄
+        照样新鲜、原有两段判定照样绿——然后再断言新判定把它判红。
+
+        活性文件是十几字节的**覆盖写**：先 truncate 释放的就是同一页，重写不需要
+        向 tmpfs 要新页，所以 100% 满的盘上它一路成功。这不是推测，是 rc22 收尾批
+        S-12 浸泡的实测现象（三容器写满期间一直显示 healthy）。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            liveness.touch_liveness("worker", directory=directory)
+            liveness.touch_liveness("worker", directory=directory)  # 覆盖写，成功
+
+            # 原有的"主循环仍在跳动"判定：绿。
+            healthcheck._check_liveness("worker", 60.0, {}, directory=directory)
+
+            # 新增的可用空间判定：同一个目录、同一轮探测，红。
+            with self.assertRaises(healthcheck.HealthcheckError) as caught:
+                healthcheck._check_free_space(
+                    "worker",
+                    directory=directory,
+                    statvfs=_fake_statvfs(total_bytes=256 * 1024 * 1024, free_bytes=0),
+                )
+            self.assertIn("可用空间", str(caught.exception))
+
+    def test_a_disk_with_room_left_is_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            healthcheck._check_free_space(
+                "worker",
+                directory=Path(tmp),
+                statvfs=_fake_statvfs(
+                    total_bytes=256 * 1024 * 1024, free_bytes=160 * 1024 * 1024
+                ),
+            )
+
+    def test_the_ratio_scales_with_each_service_own_tmpfs_size(self) -> None:
+        """阈值必须按比例、不能是固定字节数：worker/worker-queue 的 /tmp 是
+        256m，scheduler/gateway/migrate/reauthorize 是 16m。任何固定字节阈值
+        要么让 16m 的盘恒红、要么对 256m 的盘形同虚设。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            # 16MiB 的盘剩 8MiB：占用一半，健康。
+            healthcheck._check_free_space(
+                "scheduler",
+                directory=directory,
+                statvfs=_fake_statvfs(total_bytes=16 * 1024 * 1024, free_bytes=8 * 1024 * 1024),
+            )
+            # 同样剩 8MiB，但盘是 256MiB：只剩 3%，不健康。
+            with self.assertRaises(healthcheck.HealthcheckError):
+                healthcheck._check_free_space(
+                    "worker",
+                    directory=directory,
+                    statvfs=_fake_statvfs(
+                        total_bytes=256 * 1024 * 1024, free_bytes=8 * 1024 * 1024
+                    ),
+                )
+
+    def test_a_large_filesystem_with_plenty_free_is_healthy_regardless_of_ratio(self) -> None:
+        """绝对上界：开发机 / CI 的 `/tmp` 常常落在几百 GB 的根文件系统上，
+        "可用不足 10%" 在那里是常态而不是故障。容器里的 tmpfs 上限只有 16m/256m，
+        永远够不到这条上界，因此它不会让真实的写满逃过判定。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            healthcheck._check_free_space(
+                "worker",
+                directory=Path(tmp),
+                statvfs=_fake_statvfs(
+                    total_bytes=500 * 1024**3, free_bytes=1 * 1024**3
+                ),
+            )
+
+    def test_a_large_filesystem_that_is_actually_full_is_still_unhealthy(self) -> None:
+        """上界只放行"可用空间绝对够多"，不放行"盘大"——真的写满的大盘照样红。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(healthcheck.HealthcheckError):
+                healthcheck._check_free_space(
+                    "worker",
+                    directory=Path(tmp),
+                    statvfs=_fake_statvfs(total_bytes=500 * 1024**3, free_bytes=4 * 1024**2),
+                )
+
+    def test_an_unreadable_directory_is_unhealthy_not_silently_ok(self) -> None:
+        """连自己的临时目录都 stat 不了的容器不该被称作健康——"看不出问题就算
+        好"正是本段要消灭的那种假绿。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist"
+            with self.assertRaises(healthcheck.HealthcheckError):
+                healthcheck._check_free_space("worker", directory=missing)
+
+    def test_a_zero_capacity_reading_is_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(healthcheck.HealthcheckError):
+                healthcheck._check_free_space(
+                    "worker",
+                    directory=Path(tmp),
+                    statvfs=_fake_statvfs(total_bytes=0, free_bytes=0),
+                )
+
+    def test_real_filesystem_numbers_are_actually_read(self) -> None:
+        """反桩用例：不注入任何替身，直接读真实目录所在盘的 ``os.statvfs``。
+
+        用两组相反的阈值各跑一次（``--sufficient-free-bytes 0`` 关掉绝对上界，
+        让比例说了算）——要求"可用必须等于全盘"必然红、要求"可用比例下限为 0"
+        必然绿。两者都成立，说明读到的是这块盘真实的 total/free，而不是某个常量
+        或被替身掩盖掉的判定。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            with self.assertRaises(healthcheck.HealthcheckError):
+                healthcheck._check_free_space(
+                    "worker",
+                    directory=directory,
+                    min_free_ratio=1.0,
+                    sufficient_free_bytes=0,
+                )
+            healthcheck._check_free_space(
+                "worker",
+                directory=directory,
+                min_free_ratio=0.0,
+                sufficient_free_bytes=0,
+            )
+
+    def test_run_reports_the_full_disk_before_it_ever_looks_at_the_database(self) -> None:
+        """接线断言：``run()`` 真的调用了新判定，而且排在依赖可达之前。
+
+        环境里连 DSN 都没有——如果可用空间判定没被接上、或者排在数据库之后，
+        这次的失败理由会是"缺少数据库连接串"。理由是磁盘，才说明第一段确实先跑了。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with patch.object(
+                healthcheck.os,
+                "statvfs",
+                _fake_statvfs(total_bytes=256 * 1024 * 1024, free_bytes=0),
+            ):
+                exit_code = healthcheck.run(
+                    ["--role", "worker"],
+                    env={"LINGXI_LIVENESS_DIR": tmp},
+                    stderr=err,
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("可用空间", err.getvalue())
+            self.assertNotIn("数据库", err.getvalue())
+
+    def test_run_accepts_explicit_thresholds_on_the_command_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            exit_code = healthcheck.run(
+                ["--role", "worker", "--min-free-ratio", "1.0", "--sufficient-free-bytes", "0"],
+                env={"LINGXI_LIVENESS_DIR": tmp},
+                stderr=err,
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("可用空间", err.getvalue())

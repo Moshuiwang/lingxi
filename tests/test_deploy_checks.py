@@ -527,16 +527,243 @@ class ResourceLimitsTest(unittest.TestCase):
         failures = self._with_stage_override(body)
         self.assertTrue(any("scheduler" in f and "`pids`" in f for f in failures), failures)
 
-    def test_stage_override_declaring_none_of_the_block_is_not_required(self) -> None:
-        """覆盖文件本身可以完全不声明 deploy.resources.limits（沿用基线），
-        这条不该被当成缺失——只有"声明了但不合规"才判红。"""
+    def test_stage_override_declaring_none_of_the_block_is_now_caught(self) -> None:
+        """变异验红（Issue #494 收紧）：覆盖文件不得靠"沿用基线"省掉声明。
+
+        基线给 worker-queue 的默认是 4.0 核 / 16G，而 stage 主机只有 2 核 /
+        3.74GiB——沿用它等于这道防线完全没有生效，且不会有任何报错。每个环境
+        显式写出自己那一档，"这个数字是给哪台机器的"才是文件里可读、可复核的。
+        """
 
         failures = self._with_stage_override('scheduler:\n  user: "10001:10001"\n')
-        self.assertEqual([f for f in failures if "scheduler" in f], [])
+        self.assertTrue(
+            any("scheduler" in f and "deploy.resources.limits" in f for f in failures),
+            failures,
+        )
 
     def test_stage_override_with_valid_values_passes(self) -> None:
         failures = self._with_stage_override(self.FULL_SERVICE)
         self.assertEqual([f for f in failures if "scheduler" in f], [])
+
+
+class ProdPendingHostSpecLimitsTest(unittest.TestCase):
+    """Issue #494：生产主机规格待产品负责人裁定期间，`worker-queue` 的三项限制
+    在 `compose.prod.yaml` 里必须是 `${VAR:?...}` 无默认值形态。
+
+    此前那组 4.0 核 / 16G 是按"建议服务器 8 核 / 32GB"推算的，那台服务器的实际
+    规格从未被确认过。上限高于物理规格不会报错，等于这道防线完全没有生效。
+    """
+
+    def _with_prod_override(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        prod = directory / "compose.prod.yaml"
+        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = prod
+        try:
+            return CONTRACT.check_resource_limits()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+
+    PENDING_BODY = (
+        "worker-queue:\n"
+        "  deploy:\n"
+        "    resources:\n"
+        "      limits:\n"
+        '        cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"\n'
+        "        memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:?待定}\n"
+        "        pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:?待定}\n"
+    )
+
+    def test_a_silent_default_on_a_pending_key_is_caught(self) -> None:
+        """变异验红：把 `:?` 改回 `:-4.0`——漏配时静默用上一个没人为生产判断过的
+        上限，正是本条要挡住的形状。"""
+
+        body = self.PENDING_BODY.replace(
+            '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"', '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"'
+        )
+        failures = self._with_prod_override(body)
+        self.assertTrue(
+            any("worker-queue" in f and "`cpus`" in f and "无默认值" in f for f in failures),
+            failures,
+        )
+
+    def test_a_hardcoded_number_on_a_pending_key_is_caught(self) -> None:
+        body = self.PENDING_BODY.replace(
+            '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"', '"4.0"'
+        )
+        failures = self._with_prod_override(body)
+        self.assertTrue(
+            any("worker-queue" in f and "`cpus`" in f for f in failures), failures
+        )
+
+    def test_the_pending_form_passes(self) -> None:
+        failures = self._with_prod_override(self.PENDING_BODY)
+        self.assertEqual([f for f in failures if "worker-queue" in f], [])
+
+    def test_real_prod_compose_uses_the_pending_form(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_resource_limits(), [])
+
+
+class ComposeInterpolationYamlSafetyTest(unittest.TestCase):
+    """PR #506 CI 实测教训：compose 的值先过 YAML 解析、再做 `${VAR}` 插值。
+
+    提示语里带一个 `（Issue #494）`——未加引号的 YAML 标量遇到「空格+#」就从那里
+    截断，`}` 被甩在解析结果之外，compose 报 `invalid interpolation format` 而不是
+    我们要的"变量缺失"，fail-fast 语义整条失效。这一类此前只有最晚的
+    `Epic Full / image` 作业才抓得到。
+    """
+
+    def _with_prod(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        prod = directory / "compose.prod.yaml"
+        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = prod
+        try:
+            return CONTRACT.check_compose_interpolation_is_yaml_safe()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+
+    def test_a_hash_inside_the_placeholder_is_caught(self) -> None:
+        """变异验红：这就是 PR #506 上炸掉 CI 的那一行的形状。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定 #494}\n"
+        )
+        self.assertTrue(any("行内注释" in f for f in failures), failures)
+
+    def test_a_colon_space_inside_the_placeholder_is_caught(self) -> None:
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定: 见 README}\n"
+        )
+        self.assertTrue(any("映射指示符" in f for f in failures), failures)
+
+    def test_an_unclosed_placeholder_is_caught(self) -> None:
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定\n"
+        )
+        self.assertTrue(any("没有闭合" in f for f in failures), failures)
+
+    def test_a_required_variable_missing_from_the_render_script_is_caught(self) -> None:
+        """变异验红（本次漏网的第二半）：新增一个 `${VAR:?}` 却忘了给
+        `verify_compose_structure.sh` 补占位值——那条渲染门禁会以"变量缺失"红，
+        而它只在最晚的 image 作业里跑。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n  environment:\n"
+            "    SOMETHING: ${LINGXI_BRAND_NEW_REQUIRED_VAR:?pending}\n"
+        )
+        self.assertTrue(
+            any("LINGXI_BRAND_NEW_REQUIRED_VAR" in f and "export" in f for f in failures),
+            failures,
+        )
+
+    def test_full_line_comments_mentioning_placeholders_do_not_produce_false_reds(self) -> None:
+        """散文注释里演示 `${VAR:?...}` 写法是常态，不该被判红。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n"
+            "  # 四项一律写成 `${VAR:?说明}`：生产不许退回默认值\n"
+            '  user: "10001:10001"\n'
+        )
+        self.assertEqual(failures, [])
+
+    def test_real_compose_files_and_render_script_agree(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_compose_interpolation_is_yaml_safe(), [])
+
+
+class WorkerTmpfsCapacityTest(unittest.TestCase):
+    """Issue #494 ②：`worker-queue` 的 `/tmp` 内存盘上限必须分环境显式配置。
+
+    实测背景：这块盘 45 分钟被 Agent 会话转录写满，而 `compose.prod.yaml` 与
+    `compose.stage.yaml` 都没有覆盖过基线那个 256m（grep 零命中）——生产是同一个
+    上限，且没有人为它做过判断。
+    """
+
+    BASE = (
+        "worker-queue:\n"
+        "  tmpfs:\n"
+        "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}\n"
+    )
+    STAGE = BASE
+    PROD = (
+        "worker-queue:\n"
+        "  tmpfs:\n"
+        "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定}\n"
+    )
+
+    def _run(self, *, base: str | None = None, stage: str | None = None, prod: str | None = None):
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        originals = (CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD)
+        try:
+            for name, body, attribute in (
+                ("compose.yaml", base if base is not None else self.BASE, "COMPOSE_BASE"),
+                ("compose.stage.yaml", stage if stage is not None else self.STAGE, "COMPOSE_STAGE"),
+                ("compose.prod.yaml", prod if prod is not None else self.PROD, "COMPOSE_PROD"),
+            ):
+                path = directory / name
+                path.write_text(
+                    "services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8"
+                )
+                setattr(CONTRACT, attribute, path)
+            return CONTRACT.check_worker_tmpfs_capacity()
+        finally:
+            CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = originals
+
+    def test_the_well_formed_shape_passes(self) -> None:
+        self.assertEqual(self._run(), [])
+
+    def test_a_hardcoded_size_in_the_baseline_is_caught(self) -> None:
+        """变异验红：写死的上限没有办法分环境覆盖，stage 与生产就只能共用同一个
+        数字——这正是改动前的真实状态。"""
+
+        failures = self._run(base="worker-queue:\n  tmpfs:\n    - /tmp:mode=1777,size=256m\n")
+        self.assertTrue(any("写死" in f for f in failures), failures)
+
+    def test_a_stage_override_that_never_declares_tmpfs_is_caught(self) -> None:
+        failures = self._run(stage='worker-queue:\n  user: "10001:10001"\n')
+        self.assertTrue(any("没有声明" in f for f in failures), failures)
+
+    def test_a_prod_override_that_never_declares_tmpfs_is_caught(self) -> None:
+        failures = self._run(prod='worker-queue:\n  user: "10001:10001"\n')
+        self.assertTrue(any("没有声明" in f for f in failures), failures)
+
+    def test_a_prod_default_value_is_caught(self) -> None:
+        """变异验红（本条是"不得沿用默认"的具体形状）：带默认值意味着漏配时
+        静默用上一个没人为生产判断过的内存盘上限，而这块盘写满就等量吃掉宿主
+        内存。"""
+
+        failures = self._run(
+            prod="worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}\n"
+        )
+        self.assertTrue(any("无默认值形态" in f for f in failures), failures)
+
+    def test_a_missing_size_option_is_caught(self) -> None:
+        """不写 size 时 Docker 默认给宿主内存的一半，等于这块内存盘完全没有上限。"""
+
+        failures = self._run(stage="worker-queue:\n  tmpfs:\n    - /tmp:mode=1777\n")
+        self.assertTrue(any("size=" in f for f in failures), failures)
+
+    def test_a_stage_size_that_cannot_be_read_as_a_positive_number_is_caught(self) -> None:
+        failures = self._run(
+            stage="worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定}\n"
+        )
+        self.assertTrue(any("判定不出安全的正数上限" in f for f in failures), failures)
+
+    def test_real_compose_files_pass(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_worker_tmpfs_capacity(), [])
 
 
 class LogRetentionFloorTest(unittest.TestCase):
@@ -659,8 +886,16 @@ class PublishJobGuardTest(unittest.TestCase):
             if: needs.classify.outputs.mode == 'docs'
             steps:
               - run: scripts/ci/verify_docs.sh
+          l1:
+            name: Epic Full / l1
+            if: needs.classify.outputs.risk_level == 'l1'
+            steps:
+              - run: python3 scripts/ci/check_l1_assets.py
           gate:
-            if: needs.classify.outputs.mode != 'docs'
+            if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
+            steps:
+              - if: needs.classify.outputs.risk_level == 'l3'
+                run: python3 scripts/ci/check_permission_impact.py
           extras:
             strategy:
               matrix:
@@ -673,7 +908,7 @@ class PublishJobGuardTest(unittest.TestCase):
                 with:
                   name: epic-candidate-images-pr-1-abc
           candidate:
-            needs: [classify, docs, gate, extras, image]
+            needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
               - uses: actions/upload-artifact@sha
@@ -690,6 +925,11 @@ class PublishJobGuardTest(unittest.TestCase):
           docs:
             steps:
               - run: scripts/ci/verify_docs.sh
+          l1:
+            name: Story / content l1
+            if: needs.classify.outputs.risk_level == 'l1'
+            steps:
+              - run: python3 scripts/ci/check_l1_assets.py
           full:
             uses: ./.github/workflows/ci.yml
     """
@@ -759,7 +999,7 @@ class PublishJobGuardTest(unittest.TestCase):
 
     def test_candidate_must_need_all_full_legs(self) -> None:
         full = self.FULL.replace(
-            "needs: [classify, docs, gate, extras, image]", "needs: [classify, docs, gate, extras]"
+            "needs: [classify, docs, l1, gate, extras, image]", "needs: [classify, docs, l1, gate, extras]"
         )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("candidate needs" in failure for failure in failures), failures)

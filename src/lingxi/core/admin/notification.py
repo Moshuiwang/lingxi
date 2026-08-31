@@ -149,7 +149,33 @@ def permission_scope_ids(pending: PendingAction) -> tuple[str, str] | None:
     payload = _permission_payload(pending)
     if payload is None:
         return None
+    if payload.get("position_name") and payload.get("pairs"):
+        first = payload["pairs"][0]
+        if isinstance(first, (list, tuple)) and len(first) == 2:
+            return str(first[0]), str(first[1])
     return payload.get("company_id", ""), payload.get("metric_name", "")
+
+
+def _position_company_count(payload: Mapping[str, Any]) -> int:
+    """计算职位范围确认卡要展示的实际公司数。
+
+    新 payload 会保存展开后的 ``companies``，但旧/手工构造的 payload 可能只保留
+    ``pairs``；两者都按去重后的真实公司键计数，绝不把 ``*`` 当成一家公司的标签。
+    """
+
+    raw_companies = payload.get("companies")
+    values: list[str] = []
+    if isinstance(raw_companies, (list, tuple, set)):
+        values.extend(value.strip() for value in raw_companies if isinstance(value, str) and value.strip())
+    if not values:
+        pairs = payload.get("pairs")
+        if isinstance(pairs, (list, tuple)):
+            for pair in pairs:
+                if isinstance(pair, (list, tuple)) and pair and isinstance(pair[0], str):
+                    company = pair[0].strip()
+                    if company:
+                        values.append(company)
+    return len(dict.fromkeys(value for value in values if value != "*"))
 
 
 def _permission_scope_block(
@@ -184,6 +210,20 @@ def _permission_scope_block(
     payload = _permission_payload(pending)
     if payload is None:
         return _SCOPE_UNAVAILABLE_TEXT
+    if payload.get("position_name"):
+        role = payload.get("position_name", "")
+        scope = payload.get("company_scope", "")
+        company_count = _position_company_count(payload)
+        scope_display = (
+            f"全部（{company_count} 家公司）"
+            if scope == "*"
+            else (company_label if company_label is not None else scope)
+        )
+        reason = payload.get("reason", "")
+        return (
+            f"职位：{role}\n公司范围：{scope_display}\n"
+            f"原因：{reason}\n"
+        )
     company_display = company_label if company_label is not None else payload.get("company_id", "")
     metric_display = metric_label if metric_label is not None else payload.get("metric_name", "")
     reason = payload.get("reason", "")
@@ -206,6 +246,19 @@ def _permission_scope_suffix(
     payload = _permission_payload(pending)
     if payload is None:
         return ""
+    if payload.get("position_name"):
+        role = payload.get("position_name", "")
+        scope = payload.get("company_scope", "")
+        company_count = _position_company_count(payload)
+        scope_display = (
+            f"全部（{company_count} 家公司）"
+            if scope == "*"
+            else (company_label if company_label is not None else scope)
+        )
+        reason = payload.get("reason", "")
+        if len(reason) > _GROUP_REASON_PREVIEW_LENGTH:
+            reason = reason[:_GROUP_REASON_PREVIEW_LENGTH] + "…"
+        return f"（职位 {role} · 公司范围 {scope_display} · 原因 {reason}）"
     company_display = company_label if company_label is not None else payload.get("company_id", "")
     metric_display = metric_label if metric_label is not None else payload.get("metric_name", "")
     reason = payload.get("reason", "")
@@ -476,10 +529,10 @@ def _group_outcome_text(pending: PendingAction) -> str:
     """
 
     if pending.status is PendingActionStatus.EXECUTED:
-        # Issue #438：与 ``card_callback._outcome_text`` 同步补"即时生效"信息
-        # （该函数文档「同一组状态分支」）——群通知与发起人私聊终态卡这次一起
-        # 变化，不允许分叉出两句不一致的措辞。
-        return "已确认执行，权限变更将即时生效"
+        payload = _permission_payload(pending)
+        if payload is not None and payload.get("position_name"):
+            return "操作已记录，权限正在下发"
+        return "已确认执行；操作已记录，权限正在下发"
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

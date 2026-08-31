@@ -203,6 +203,7 @@ REQUIRED_MODULES = (
     # REQUIRED_MODULES 与 PROCESS_RUNTIME_IMPORTS 各自回答不同的问题（制品完整 vs
     # 某个进程的运行时依赖装得上），两处都要有。
     "lingxi.core.permission.local_override",
+    "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
     "lingxi.core.permission.merge_sources",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
@@ -288,6 +289,7 @@ REQUIRED_MODULES = (
     "lingxi.core.admin.card_dispatch",
     "lingxi.core.admin.card_callback",
     "lingxi.adapters.postgres_pending_action",
+    "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
     # 用户权限管理卡（#439 B 档）展示层 + 指标中文别名反查（#439 A 档）的配置
     # 读取——两者均只被 gateway 的管理命令面消费，与上面确认卡片的既有归类
@@ -678,6 +680,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # import 了独立的 watermark 适配器，理由相同。
             "lingxi.adapters.postgres_daily_report",
             "lingxi.adapters.postgres_daily_report_watermark",
+            # 管理卡权限补偿收口（Issue #493）：scheduler 在权限发布每轮末尾读取并更新
+            # 管理卡上下文，跨 gateway 重启后仍能按 outbox 的真实 published 状态收口，
+            # 因此该持久化 adapter 也属于 scheduler 的运行时闭包。
+            "lingxi.adapters.postgres_management_card_context",
+            # 上述适配器返回 ``ManagementCardContext``，其类型/构造位于 core.admin
+            # 卡片模块；scheduler 虽不接收管理卡回调，但静态 import 闭包仍需如实登记
+            # 这些轻量领域模块，避免制品检查把间接依赖误判为缺包。
+            "lingxi.core.admin.card_layout",
+            "lingxi.core.admin.display_names",
+            "lingxi.core.admin.management_card",
+            "lingxi.core.admin.notification",
+            "lingxi.core.admin.pending_action",
+            "lingxi.core.admin.card_dispatch",
             # 「本地权限覆盖活动」段（Issue #319 S-P-1c）：
             # `_build_local_override_activity_check` 在函数内 import 本地权限
             # 覆盖表的读路径，与上面两个通报 adapter 同一条"函数内 import 证明
@@ -975,6 +990,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.admin.card_dispatch",
             "lingxi.core.admin.card_callback",
             "lingxi.adapters.postgres_pending_action",
+            "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
             # 用户权限管理卡（#439 B 档）：`/admin user` 除既有文本回复外附带发送
             # 一张管理卡（`ManagementCardDispatcher`/`TomlCompanyMetricCatalog`，
@@ -1002,6 +1018,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # confirm() 解析 payload 后构造要写入的条目）。
             "lingxi.adapters.postgres_local_permission",
             "lingxi.core.permission.local_override",
+            "lingxi.core.permission.position_override",
             # 管理员写动作确认执行成功后的定向单用户权限重算+发布（Issue #438）：
             # `card_callback_handler` 装配处在函数内 import
             # `PermissionRecomputeAdapter`（`adapters/postgres_permission_

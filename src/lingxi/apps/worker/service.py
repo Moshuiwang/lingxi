@@ -19,12 +19,15 @@ from lingxi.apps.worker.report_extraction import (
     _load_task_system_prompt,
     _protocol_breakdown_reasons,
     _report_document_request,
+    _report_failure_signature,
     _report_guard_denied_count,
     _report_sheet_request,
     _report_token_usage,
     _tool_result_count,
+    _unnamed_failure_code,
+    failure_with_signature,
 )
-from lingxi.apps.worker.session_cleanup import delete_agent_session_files
+from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
@@ -215,6 +218,8 @@ class WorkerService:
         # 不触碰清理队列——留着排队等下一个配置正确的进程来处理，而不是假装已清理。
         self._session_root = session_root
         self._session_cleanup_batch_limit = session_cleanup_batch_limit
+        # Issue #494：独立的容量回收路径按配置节流，None 表示首轮立即回收。
+        self._last_session_reclaim_at: float | None = None
         # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
         # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
         self._on_alert_tick = on_alert_tick
@@ -433,7 +438,24 @@ class WorkerService:
             # 最小可观测性第二类：queued/running/awaiting-delivery 滞留三选一）。
             self._report_task_stuck("awaiting_delivery_stuck", len(expired))
         self._cleanup_agent_sessions()
+        self._reclaim_session_transcripts()
         return terminals
+
+    def _reclaim_session_transcripts(self) -> None:
+        """Run the independent, throttled Issue #494 capacity-reclaim path."""
+        if self._session_root is None or self._config.session_disk_budget_bytes <= 0:
+            return
+        now = self._monotonic()
+        last = self._last_session_reclaim_at
+        if last is not None and now - last < self._config.session_reclaim_interval_seconds:
+            return
+        self._last_session_reclaim_at = now
+        run_session_transcript_reclaim(
+            self._session_root,
+            budget_bytes=self._config.session_disk_budget_bytes,
+            low_water_ratio=self._config.session_disk_low_water_ratio,
+            min_age_seconds=self._config.session_reclaim_min_age_seconds,
+        )
 
     def _cleanup_agent_sessions(self) -> None:
         """认领并（先归档、再）物理清理一批到期的 Agent 会话 JSONL（Issue #153；
@@ -569,6 +591,9 @@ class WorkerService:
                 terminal_kind=TerminalKind.STOPPED.value,
                 error_kind="stopped",
                 content=self._catalog.text("worker.stopped"),
+                # Issue #495：这一支没有 `report`、失败码此前恒 null；原因是
+                # 确定的（开工前就被停止），如实记下，不留空白让运维去猜。
+                failure_code="stopped",
             )
             return
         started_at = self._monotonic()
@@ -845,15 +870,18 @@ class WorkerService:
             # 诊断具体失败原因（例如用户还没走完首次开通、配置文件形状不对）。
             report = {
                 "turn": {"closed": False, "final_text": "", "session_id": None},
-                "failure": {
-                    "code": "user_mcp_config_unavailable",
-                    "message": f"user_mcp_config:{error.code}",
-                },
+                "failure": failure_with_signature(
+                    "user_mcp_config_unavailable", f"user_mcp_config:{error.code}", error
+                ),
             }
         except Exception as error:  # noqa: BLE001 - worker 绝不留下 running
+            # `turn.py` 兜底 `except` 之外的**第二条**兜底（Issue #495）：失败码
+            # 保持 `session_failed`（用户文案不变），类型限定名进 `signature`。
             report = {
                 "turn": {"closed": False, "final_text": "", "session_id": None},
-                "failure": {"code": "session_failed", "message": type(error).__name__},
+                "failure": failure_with_signature(
+                    "session_failed", type(error).__name__, error
+                ),
             }
         finally:
             monitor.cancel()
@@ -880,6 +908,8 @@ class WorkerService:
         turn = report.get("turn") or {}
         failure = report.get("failure") or {}
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
+        # 失败签名（Issue #495）：底层异常的类型限定名；失败不来自异常时为 None。
+        failure_signature = _report_failure_signature(report)
         final_text = turn.get("final_text") if isinstance(turn, Mapping) else ""
         final_text = final_text if isinstance(final_text, str) else ""
         elapsed_seconds = int(max(0.0, self._monotonic() - started_at))
@@ -957,6 +987,7 @@ class WorkerService:
                 content=content,
                 elapsed_seconds=elapsed_seconds,
                 failure_code=failure_code,
+                failure_signature=failure_signature,
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
@@ -970,13 +1001,19 @@ class WorkerService:
             terminal_kind = (
                 TerminalKind.TIMEOUT.value if failure_code == "turn_timeout" else TerminalKind.FAILED.value
             )
+            # Issue #495：失败终态的 `failure_code` 不再允许为 `null`（「没有失败
+            # 码」不是失败原因，只是没人起名字；三种形状见 `_unnamed_failure_code`）。
+            # 补在 `error_kind`/`content` 按**原始**失败码求值之后，三个补码都落进
+            # `_failure_content` 默认分支，用户文案与终态种类因此不变。
+            logged_failure_code = failure_code or _unnamed_failure_code(report)
             self._finish_terminal(
                 claimed,
                 terminal_kind=terminal_kind,
                 error_kind=error_kind,
                 content=content,
                 elapsed_seconds=elapsed_seconds,
-                failure_code=failure_code,
+                failure_code=logged_failure_code,
+                failure_signature=failure_signature,
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
@@ -1003,6 +1040,7 @@ class WorkerService:
                 content=content,
                 elapsed_seconds=elapsed_seconds,
                 failure_code=_MODEL_PROTOCOL_BREAKDOWN_FAILURE_CODE,
+                failure_signature=failure_signature,
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
@@ -1021,7 +1059,10 @@ class WorkerService:
                 error_kind="redacted_withheld",
                 content=self._catalog.text("worker.redacted_withheld"),
                 elapsed_seconds=elapsed_seconds,
-                failure_code=failure_code,
+                # Issue #495：这一支必然无 failure、失败码此前恒 null；运维按
+                # 失败码过滤时不该唯独漏掉这一类终态。
+                failure_code=failure_code or "redacted_withheld",
+                failure_signature=failure_signature,
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
@@ -1043,6 +1084,7 @@ class WorkerService:
                 elapsed_seconds=elapsed_seconds,
                 session_id=turn.get("session_id") if isinstance(turn, Mapping) else None,
                 failure_code=failure_code,
+                failure_signature=failure_signature,
                 output_safety=output_safety,
                 denied_count=denied_count,
                 denied_tool_names=denied_tool_names,
@@ -1190,6 +1232,7 @@ class WorkerService:
         elapsed_seconds: int = 0,
         session_id: str | None = None,
         failure_code: object = None,
+        failure_signature: str | None = None,
         output_safety: Mapping[str, Any] | None = None,
         denied_count: int = 0,
         denied_tool_names: tuple[str, ...] = (),
@@ -1226,11 +1269,16 @@ class WorkerService:
         ``document_request`` 同一判断分支、同一转发时机的并列字段，原样透传，
         不在这一层做互斥校验（真正的互斥校验在
         ``write_terminal_event``——见该方法文档）。
+
+        ``failure_signature``（Issue #495，迁移 ``0080``）：底层异常的**类型限定
+        名**，与 ``failure_code`` 一起同时进低敏审计日志与 ``task`` 两列——完整
+        口径见 :meth:`_log_terminal_outcome` 与 ``report_extraction`` 的签名一节。
         """
 
         self._log_terminal_outcome(
             task_id=claimed.task_id,
             failure_code=failure_code,
+            failure_signature=failure_signature,
             error_kind=error_kind,
             terminal_kind=terminal_kind,
             output_safety=output_safety,
@@ -1249,6 +1297,10 @@ class WorkerService:
             agent_session_id=session_id,
             token_usage=token_usage,
             guard_denied_count=guard_denied_count,
+            # 同事务落库（迁移 0080，Issue #495）：worker 与 gateway 不共享文件
+            # 系统，只进 stderr 的线索管理员看不到（同迁移 0070 的结构性缺口）。
+            failure_code=_cap_log_token(str(failure_code))[0] if failure_code is not None else None,
+            failure_signature=failure_signature,
             document_request=document_request,
             sheet_request=sheet_request,
         )
@@ -1258,6 +1310,7 @@ class WorkerService:
         *,
         task_id: str,
         failure_code: object,
+        failure_signature: str | None,
         error_kind: str | None,
         terminal_kind: str,
         output_safety: Mapping[str, Any] | None,
@@ -1278,23 +1331,10 @@ class WorkerService:
         已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
         （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
         导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
-
-        ``tool_result_count`` 是 Issue #291 L6 取证结论补的一项（见
-        ``_tool_result_count`` 的完整说明）：2026-08-22 那次取证——模型把工具
-        调用协议写成正文散文、被净化层遮蔽后仍当成成功交付——运维定位"这一轮
-        到底有没有真的调用过工具"花了 40 分钟，因为这个字段此前同样从未离开
-        进程。
-
-        独立复核 P1：这条事件不能直接调用 stdlib ``logging``——``WorkerService``
-        不知道自己会被哪个进程入口装配，而真实队列 worker 的 ``apps/worker/
-        cli.py`` 刻意从不调用 ``logging.basicConfig()``（未配置 handler 时默认
-        阈值 ``WARNING`` 会把 ``logging.info(...)`` 悄悄吞掉，运维在真实容器
-        stderr 里永远看不到）。因此改为调用装配层注入的 ``on_terminal_outcome``
-        回调，由 ``cli.py`` 接到本文件既有的结构化 stderr 出口（``worker.task.
-        terminal``，带 ``trace_id``；``denied_count > 0`` 时该出口把这条事件
-        提到 ``warning`` 级别，见 ``cli.py`` 的 ``_terminal_outcome_sink``）。
-        没有装配方（``None``，例如白盒测试与旧调用方）时整体跳过，不假装写了
-        一条实际不存在的日志。
+        ``failure_signature``/``failure_code``（#495）与 ``tool_result_count``（#291）
+        仅提供类型化、低敏的终态取证线索，不记录异常正文或工具入参。
+        独立复核 P1：事件经装配层 ``on_terminal_outcome`` 接入结构化 stderr；没有
+        装配方（``None``）时跳过，不假装写出实际不存在的日志。
         """
 
         if self._on_terminal_outcome is None:
@@ -1317,6 +1357,11 @@ class WorkerService:
         if failure_code is not None:
             capped_failure_code, code_truncated = _cap_log_token(str(failure_code))
             truncated = truncated or code_truncated
+        # 失败签名同一惯例（Issue #495）：写入方已洗过截过，这里是纵深防线。
+        capped_failure_signature: str | None = None
+        if failure_signature is not None:
+            capped_failure_signature, signature_truncated = _cap_log_token(failure_signature)
+            truncated = truncated or signature_truncated
         capped_reasons: list[str] = []
         for reason in reasons:
             capped_reason, reason_truncated = _cap_log_token(reason)
@@ -1331,6 +1376,8 @@ class WorkerService:
         fields = {
             "task_id": task_id,
             "failure_code": capped_failure_code,
+            # 未分类失败的唯一线索（Issue #495）：**只有类型限定名**，不含正文。
+            "failure_signature": capped_failure_signature,
             "error_kind": error_kind,
             "terminal_kind": terminal_kind,
             "output_safety_blocked": blocked,

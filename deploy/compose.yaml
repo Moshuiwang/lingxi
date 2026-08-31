@@ -321,8 +321,22 @@ services:
 
     user: "10001:10001"
     read_only: true
+    # ---- /tmp 容量（Issue #494）------------------------------------------------
+    # **这是一块内存盘，写满即占用等量宿主内存**，不是磁盘。镜像把 HOME 指到 /tmp，
+    # Agent 会话转录写在 $HOME/.claude/projects 下：rc22 收尾批 S-12 浸泡实测，
+    # 容器接负载约 45 分钟就把 256MB 写满（32 份转录、单份最大 15MB），而当时
+    # 健康检查一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页。
+    # 三条一起才算修好，缺一条都会让这个故障重新变得静默：
+    #   ① 常规回收：apps/worker/session_cleanup.py 的 reclaim_session_transcripts
+    #      按字节预算删最旧的（此前只有 /new、权限刷新等触发点排队才会删）；
+    #   ② 分环境显式上限：就是这一行，值由 LINGXI_WORKER_QUEUE_TMPFS_SIZE 决定，
+    #      stage/prod 各自在自己的覆盖文件里显式声明，不许沿用基线默认——由
+    #      scripts/ci/check_deploy_contract.py 的 check_worker_tmpfs_capacity 守住；
+    #   ③ 健康检查看得见这块盘：lingxi.apps.healthcheck 增加可用空间判定。
+    # 基线这个 256m 默认值只是"漏挂 --env-file 时不至于更糟"的兜底，不是任何一个
+    # 环境的部署档；真正生效的值来自覆盖文件。
     tmpfs:
-      - /tmp:mode=1777,size=256m
+      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}
     security_opt:
       - no-new-privileges:true
 

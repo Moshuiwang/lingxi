@@ -47,14 +47,17 @@ from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.ids import new_id
 from lingxi.core.permission.mcp_readiness import TERMINAL_OUTCOMES
 from lingxi.core.permission.publish import (
+    ACCOUNT_STATE_ENABLED,
     ClaimedPublish,
     PermissionDecisionTransientFailure,
+    PermissionGrantBlockedByAccountState,
     PublishAttempt,
     PublishOutcome,
 )
 from lingxi.core.permission.publish_row import (
     CREATED_FIELD_NAMES,
     PUBLISHED_FIELD_NAMES,
+    REVOKED_PERMISSIONS_TEXT,
     TOKEN_CIPHER_FIELD,
     PublishRow,
     is_cipher_shaped,
@@ -167,6 +170,7 @@ class PostgresPermissionPublishStore:
         user_id: str,
         row: PublishRow,
         reason: str,
+        require_enabled_account: bool,
         decided_at: datetime | None = None,
         clear_delivered_content: bool = False,
     ) -> PermissionDecision:
@@ -206,6 +210,42 @@ class PostgresPermissionPublishStore:
            的 ``permissions`` 列文本，与整行 ENQUEUED/UNCHANGED 判定完全分开：
            清理只在这个更窄的比较判真时才发生，见 :func:`_permissions_changed`。
 
+        ``require_enabled_account`` 是**必填**关键字参数：调用方必须声明"我这次落的
+        是一份需要账号有效才能生效的授权（``True``），还是一次任何状态都必须放行的
+        撤权（``False``）"。声明 ``True`` 时，上面第 1 步那把**已经持有的行锁**里顺带
+        读出的 ``account_state`` 一旦不是 :data:`~lingxi.core.permission.publish.
+        ACCOUNT_STATE_ENABLED`，本方法**一个字节都不写**、抛
+        :class:`~lingxi.core.permission.publish.PermissionGrantBlockedByAccountState`，
+        事务整体回滚（Issue #483）。
+
+        **这是消除竞态，不是缩小窗口**：管理员的「停用」写入走的是**同一行的同一把
+        ``FOR UPDATE`` 锁**（``adapters/postgres_pending_action.py`` 的 ``_confirm_
+        locked`` 先锁 ``app_user`` 再翻转 ``account_state``），两个写入者必然串行；
+        先到者提交之后，后到者读到的一定是提交后的状态。原缺陷是"读基线的那一刻他
+        还是 enabled、落决定的这一刻他已经被停用"——判据挪进锁里之后，这两个"刻"
+        就是同一个。它同时关掉另一条**不需要竞态**的同族路径：管理员对一个已停用
+        用户做本地权限动作触发的定向重算（``core/permission/targeted_recompute.py``
+        取的身份基线是**花名册审计基线**，有意包含 ``suspended``）。
+
+        **为什么必填而不是给默认值**：一个"默认不检查"的安全开关迟早会被新调用点
+        忘掉。本仓为这条纪律付过一次学费——``merge_permission_sources(full_access_
+        wildcard=...)`` 的默认值曾是一次真实漏接的根因，Trace #445 之后改成必填
+        关键字（``apps/scheduler/permission_refresh.py`` 该调用处的注释原话）。
+
+        **声明与内容必须自洽**：声明 ``False``（不要求账号有效）时，``row.permissions``
+        必须是撤权行的空对象（:data:`~lingxi.core.permission.publish_row.
+        REVOKED_PERMISSIONS_TEXT`），否则直接 ``ValueError``、不进事务。这让"未来某个
+        调用点传错 ``False`` 却排非空授权"在运行期就写不出来——守卫因此不依赖调用方
+        声明得对，只依赖它声明得**自洽**。反方向不设限：声明 ``True`` 的撤权只是多要
+        一次账号有效，方向是少写、不是多写。
+
+        **失败方向是"少写"**：守卫写错时谁都发不出权限（包括首次开通），那是停服级别
+        的误伤，比原缺陷更响——所以判据**只看 ``account_state``**，绝不带
+        ``provisioning_state``：首次开通调用本方法时 ``provisioning_state`` 还是
+        ``provisioning``（推进到 ``mcp_syncing`` 发生在发布**之后**），多带一列会让
+        首次开通 100% 全部失败。``tests/test_permission_publish_postgres.py`` 有一条
+        正向真库用例把这一点钉死。
+
         **为什么是调用方显式传入的开关，不是本方法内部自己判断"这是权限变化所以该
         清"**：本方法同时服务首次开通（``core/identity/onboarding_runner.py``，
         ``reason=first_onboarding``）与每日刷新的授权、撤权两条路径
@@ -239,6 +279,12 @@ class PostgresPermissionPublishStore:
 
         if not isinstance(row, PublishRow):
             raise TypeError("发布行必须是 PublishRow：字段集与文本形态由它保证")
+        if not isinstance(require_enabled_account, bool):
+            raise TypeError("require_enabled_account 必须显式传 True/False")
+        if not require_enabled_account and row.permissions != REVOKED_PERMISSIONS_TEXT:
+            # 声明与内容自洽（方法文档「声明与内容必须自洽」一节）：不要求账号有效的
+            # 调用只能是撤权。不回显收到的内容——它是这个人的权限范围。
+            raise ValueError("声明不要求账号有效的权限决定只能排撤权行（permissions 必须为空对象）")
         moment = decided_at or datetime.now(_UTC)
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("权限决定时间必须带时区")
@@ -251,6 +297,7 @@ class PostgresPermissionPublishStore:
                 row=row,
                 reason=reason,
                 moment=moment,
+                require_enabled_account=require_enabled_account,
                 clear_delivered_content=clear_delivered_content,
             )
         except OperationalError as error:
@@ -263,6 +310,7 @@ class PostgresPermissionPublishStore:
         row: PublishRow,
         reason: str,
         moment: datetime,
+        require_enabled_account: bool,
         clear_delivered_content: bool,
     ) -> PermissionDecision:
         """:meth:`record_decision` 的事务体本身，逐字保留自拆分前的
@@ -273,13 +321,28 @@ class PostgresPermissionPublishStore:
             with connection.transaction():
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        "SELECT permission_version FROM app_user WHERE id = %s FOR UPDATE",
+                        "SELECT permission_version, account_state FROM app_user "
+                        "WHERE id = %s FOR UPDATE",
                         (user_id,),
                     )
                     current = cursor.fetchone()
                     if current is None:
                         raise LookupError("权限决定的目标用户不存在")
                     version = int(current[0])
+                    account_state = str(current[1])
+                    if require_enabled_account and account_state != ACCOUNT_STATE_ENABLED:
+                        # Issue #483：判据在**这把已经持有的行锁**里，不是锁外先查一次
+                        # ——锁外查会把窗口从"整轮"缩到"两条 SQL 之间"，竞态依然存在。
+                        # 抛出让事务整体回滚：版本不推进、意图不入队、送达正文不清，
+                        # 不留任何半套状态（方法文档 ``require_enabled_account`` 一节）。
+                        logger.warning(
+                            "账号状态不允许排出非空授权，本次权限决定整体回滚 "
+                            "user=%s account_state=%s reason=%s",
+                            user_id,
+                            account_state,
+                            reason,
+                        )
+                        raise PermissionGrantBlockedByAccountState(account_state)
 
                     cursor.execute(
                         """SELECT id, payload, status
@@ -779,13 +842,20 @@ class PostgresPermissionPublishStore:
         （Issue #468，2026-08-30）：
 
         - ``provisioning_state = 'active'``：还没完成开通的人不该收到"你的可用范围已更新"；
-        - ``account_state NOT IN ('deleting','deleted')``：正在删除或已删除的账号一律不发。
-          删除编排会清空姓名等字段，给这样的账号发消息是数据范围外泄；
-        - ``account_state <> 'suspended'``：管理员停用期间同样不发。花名册比对基线只服务
-          日报/审计对比、不判定"该不该收通知"，两处口径此前恰好都只排除
-          ``deleting``/``deleted``——纯属巧合，不是同一份合同；本条只影响通知收件人，
-          不影响 :class:`PostgresPermissionRefreshBaselineReader` 那份决定"这个人今天
-          要不要被重新算一次权限"的独立判据（同一份缺口的另一半，见该类文档）。
+        - ``account_state = 'enabled'``：删除中/已删除的账号一律不发（删除编排会清空
+          姓名等字段，给这样的账号发消息是数据范围外泄），管理员停用期间同样不发。
+          花名册比对基线只服务日报/审计对比、不判定"该不该收通知"，两处口径此前恰好
+          都只排除 ``deleting``/``deleted``——纯属巧合，不是同一份合同；本条只影响通知
+          收件人，不影响 :class:`PostgresPermissionRefreshBaselineReader` 那份决定
+          "这个人今天要不要被重新算一次权限"的独立判据（同一份缺口的另一半，见该类
+          文档）。
+
+          **Issue #483 把它从拒绝列表改成正向白名单**：``account_state`` 的 CHECK 约束
+          今天只有 ``enabled``/``suspended``/``deleting``/``deleted`` 四个取值，两种
+          写法**逐行等价**、行集合一个字不变；改的是演进方向——将来往 CHECK 里加第五个
+          状态时，拒绝列表会静默把它当成"可以发通知"，白名单默认拒绝
+          （codex 第 2 轮 P2 的"演进防御"处置，判据常量见
+          :data:`~lingxi.core.permission.publish.ACCOUNT_STATE_ENABLED`）。
 
         **为什么这条查询住在本模块**：这条链本来就在这里读 ``app_user``（权限版本），
         而把它放进 ``postgres_identity`` 会把那个模块的建档写侧闭包（``provisioning`` /
@@ -801,7 +871,7 @@ class PostgresPermissionPublishStore:
                      FROM app_user
                     WHERE id = %s
                       AND provisioning_state = 'active'
-                      AND account_state NOT IN ('deleting', 'deleted', 'suspended')""",
+                      AND account_state = 'enabled'""",
                 (user_id,),
             )
             row = cursor.fetchone()
@@ -849,11 +919,19 @@ class PostgresPermissionPublishStore:
 #: 翻译、结算发布行，把停用当天已经就地清空的那条发布行重新写回一份真实权限——
 #: 停用承诺被静默突破（`V-权限-08` 撤权侧原本只管"银河没权限"，没有覆盖"银河有权限、
 #: 但管理员在应用层单独按停"这一种情形）。
+#:
+#: **正向白名单，不是拒绝列表**（Issue #483，codex 第 2 轮 P2）：``account_state`` 的
+#: CHECK 约束今天只有四个取值，``= 'enabled'`` 与原来的
+#: ``NOT IN ('deleting','deleted','suspended')`` **逐行等价**、行集合一个字不变；改的
+#: 是演进方向——将来往 CHECK 里加第五个状态时，拒绝列表会静默把它当成"可以发权"。
+#: 判据常量见 :data:`~lingxi.core.permission.publish.ACCOUNT_STATE_ENABLED`。
+#: ``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL`` **刻意不跟着改**：它
+#: **有意包含** ``suspended``（上一段），改成白名单会改变它的行为。
 PERMISSION_REFRESH_BASELINE_SQL = """
 SELECT id, feishu_user_id, display_name, employee_no, email
   FROM app_user
  WHERE provisioning_state = 'active'
-   AND account_state NOT IN ('deleting', 'deleted', 'suspended')
+   AND account_state = 'enabled'
  ORDER BY id
 """
 

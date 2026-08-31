@@ -41,15 +41,19 @@ from lingxi.adapters.feishu_longconn import (
 )
 from lingxi.apps.liveness import touch_liveness
 from lingxi.core.admin.management_card import (
+    ADMIN_ACTION_CANCEL,
     ADMIN_ACTION_GRANT,
     ADMIN_ACTION_REVOKE,
     ADMIN_ACTION_SUPPRESS,
     GRANT_SUBMIT_BUTTON_NAME,
     SUPPRESS_SUBMIT_BUTTON_NAME,
+    render_management_card,
 )
+from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
 from lingxi.core.conversation.pipeline import EventPipeline
 from lingxi.core.conversation.ports import OnboardingResult, OnboardingRunner, OnboardingState
 from lingxi.core.execution.card_stream import CardCreated, CardTransport, DeliveryRejected
+from lingxi.core.permission.targeted_recompute import RecomputeKind
 
 from .config import GatewayConfig, GatewayConfigError, load_config
 from .delivery import LOOP_ALERT_TRACE_ID
@@ -271,6 +275,65 @@ def _management_card_context(payload: dict) -> tuple[str, str]:
     )
 
 
+class _GatewayManagementCardRefresher:
+    """把管理卡状态更新集中到同一个 transport + 持久 sequence 端口。"""
+
+    def __init__(self, *, transport: Any, catalog: Any, display_names: Any, context_store: Any) -> None:
+        self._transport = transport
+        self._catalog = catalog
+        self._display_names = display_names
+        self._context_store = context_store
+
+    def update(
+        self,
+        *,
+        context: ManagementCardContext,
+        status: Any,
+        state: str,
+        dispatch_status: str | None = None,
+        status_message: str | None = None,
+    ) -> None:
+        # 执行已结束（已生效/不完整）后，原管理卡恢复为可重新查询/提交的表单；
+        # 只有等待中的提交态继续隐藏表单，避免重复点击。取消则关闭这张卡。
+        submitted = state in {"submitted", "dispatching"}
+        # 数据库里的 dispatch_status 是机器状态（publishing/effective/incomplete），
+        # 不能原样回显给管理员；所有管理卡可见结果都在这里映射成产品术语。
+        if status_message:
+            rendered_status = status_message
+        elif state in {"submitted", "dispatching"} or dispatch_status == "publishing":
+            rendered_status = "操作已记录，权限正在下发"
+        elif state == "effective" or dispatch_status == "effective":
+            rendered_status = "已生效"
+        elif state == "incomplete" or dispatch_status == "incomplete":
+            rendered_status = dispatch_status if dispatch_status and dispatch_status not in {
+                "incomplete",
+                "publishing",
+            } else "权限下发未完成，将在次日批处理修正"
+        elif state == "closed":
+            rendered_status = "已取消"
+        else:
+            rendered_status = dispatch_status
+        card = render_management_card(
+            status,
+            display_identifier=context.identifier,
+            catalog=self._catalog,
+            display_names=self._display_names,
+            submitted=submitted,
+            dispatch_status=rendered_status,
+            status_message=status_message,
+            closed=state == "closed",
+        )
+        sequence = self._context_store.next_card_sequence(message_id=context.message_id)
+        self._transport.update(card_id=context.card_id, sequence=sequence, card=card)
+
+
+# This is an internal observer window, not a product promise.  The administrator sees
+# the truthful "正在下发" state while the scheduler consumes the outbox; after the
+# observer gives up, the persisted incomplete state is corrected by the daily batch.
+_MANAGEMENT_PUBLISH_OBSERVE_SECONDS = 60.0
+_MANAGEMENT_PUBLISH_POLL_SECONDS = 1.0
+
+
 def make_event_handler(
     pipeline: EventPipeline,
     *,
@@ -392,6 +455,19 @@ def make_event_handler(
                     message_id=message_id,
                     trace_id=action_event.trace_id,
                 )
+            if admin_action == ADMIN_ACTION_CANCEL:
+                chat_id, message_id = _management_card_context(payload)
+                identifier = action_event.action_value.get("identifier", "")
+                if not identifier and management_card_context_store is not None:
+                    identifier = management_card_context_store.lookup(message_id=message_id) or ""
+                return card_callback_handler.handle_management_cancel(
+                    operator_open_id=action_event.operator_open_id,
+                    identifier=identifier,
+                    chat_id=chat_id,
+                    thread_id=None,
+                    message_id=message_id,
+                    trace_id=action_event.trace_id,
+                )
             if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
                 chat_id, message_id = _management_card_context(payload)
                 identifier = action_event.action_value.get("identifier", "")
@@ -402,17 +478,26 @@ def make_event_handler(
                     identifier = (
                         management_card_context_store.lookup(message_id=message_id) or ""
                     )
+                form_kwargs = {
+                    "operator_open_id": action_event.operator_open_id,
+                    "admin_action": admin_action,
+                    "identifier": identifier,
+                    "company_id": action_event.form_value.get("company_id", ""),
+                    "metric_name": action_event.form_value.get("metric_name", ""),
+                    "reason": action_event.form_value.get("reason", ""),
+                    "chat_id": chat_id,
+                    "thread_id": None,
+                    "message_id": message_id,
+                    "trace_id": action_event.trace_id,
+                }
+                position_name = action_event.form_value.get("position_name", "")
+                company_scope = action_event.form_value.get("company_scope", "")
+                if position_name:
+                    form_kwargs["position_name"] = position_name
+                if company_scope:
+                    form_kwargs["company_scope"] = company_scope
                 return card_callback_handler.handle_management_form_submit(
-                    operator_open_id=action_event.operator_open_id,
-                    admin_action=admin_action,
-                    identifier=identifier,
-                    company_id=action_event.form_value.get("company_id", ""),
-                    metric_name=action_event.form_value.get("metric_name", ""),
-                    reason=action_event.form_value.get("reason", ""),
-                    chat_id=chat_id,
-                    thread_id=None,
-                    message_id=message_id,
-                    trace_id=action_event.trace_id,
+                    **form_kwargs,
                 )
 
             # 不认识的 action（含 admin_action 缺失/空）：既有确认/取消分支，
@@ -514,17 +599,16 @@ def build_supervisor(
     from lingxi.adapters.feishu_longconn import LarkEventTransport
     from lingxi.adapters.feishu_outbound import LarkReactions, LarkReplies, build_client
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_management_card_context import (
+        PostgresManagementCardContextStore,
+    )
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
     from lingxi.adapters.postgres_permission_recompute_trigger import (
         BackgroundPermissionRecomputeTrigger,
         PermissionRecomputeAdapter,
     )
     from lingxi.core.admin.card_callback import AdminCardCallbackHandler
-    from lingxi.core.admin.card_dispatch import (
-        ConfirmCardDispatcher,
-        ManagementCardContextStore,
-        ManagementCardDispatcher,
-    )
+    from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher, ManagementCardDispatcher
     from lingxi.core.admin.router import AdminCommandRouter
     from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
 
@@ -591,18 +675,169 @@ def build_supervisor(
     # 实例（同上 `confirm_card_dispatcher` 的取舍，两者生命周期相同、都随本次
     # 装配一起建立）；发送失败只降级（`ManagementCardDispatcher` 自己的姿态，
     # 见该类文档），不影响 `/admin user` 既有的文本回复这条主路径。
-    # 表单提交 identifier 缺失形态下的发送侧登记（Trace #469 B-1）：单实例
-    # 进程内内存 TTL 映射，与 management_card_dispatcher 生命周期相同、
-    # 装配层的同一个实例同时喂给发送侧（登记）与 make_event_handler（查询），
-    # 见 core/admin/card_dispatch.ManagementCardContextStore 模块文档。
-    management_card_context_store = ManagementCardContextStore()
+    # 管理卡上下文（#493）由 PostgreSQL 持久保存；发送侧登记与回调侧读取共用同一
+    # 个 store，gateway 重启后仍能恢复目标、卡片实体与 sequence。
+    management_card_transport = LarkAdminManagementCardTransport(client)
+    management_card_catalog = TomlCompanyMetricCatalog()
+    # #493：message_id→目标、card_id、快照和 sequence 必须跨 gateway 重启保留，
+    # 生产装配使用 PostgreSQL，而不是旧的进程内 TTL 映射。
+    management_card_context_store = PostgresManagementCardContextStore(
+        str(config.postgres_dsn), timeouts=config.postgres_timeouts
+    )
     management_card_dispatcher = ManagementCardDispatcher(
-        transport=LarkAdminManagementCardTransport(client),
-        catalog=TomlCompanyMetricCatalog(),
+        transport=management_card_transport,
+        catalog=management_card_catalog,
         audit=audit,
         display_names=admin_display_names,
         context_store=management_card_context_store,
     )
+    management_card_refresher = _GatewayManagementCardRefresher(
+        transport=management_card_transport,
+        catalog=management_card_catalog,
+        display_names=admin_display_names,
+        context_store=management_card_context_store,
+    )
+
+    def _lookup_management_status(identifier: str) -> Any:
+        """按管理卡上下文中的展示标识读取当前状态。
+
+        ``/admin user`` may have been addressed by邮箱。上下文要保留这个原始标识，
+        让卡片刷新时继续显示同一输入；读数据库前则复用已有邮箱→open_id 解析，
+        否则重启后/异步刷新时会把邮箱误当成 ``feishu_open_id`` 而读不到目标。
+        """
+
+        resolver = getattr(admin_display_names, "resolve_identifier", None)
+        resolved = resolver(identifier=identifier) if callable(resolver) else identifier
+        return admin_display_names.user_status(identifier=resolved)
+
+    def _refresh_management_after_recompute(
+        pending: Any,
+        *,
+        complete: bool,
+        status_message: str | None = None,
+        state_override: str | None = None,
+    ) -> None:
+        """后台重算/发布观察后把原管理卡推进到真实状态。"""
+
+        origin_message_id = getattr(pending, "origin_card_message_id", None)
+        if not origin_message_id:
+            return
+        try:
+            context = management_card_context_store.lookup_context(message_id=origin_message_id)
+            if context is None:
+                return
+            # 取消后即使重算线程晚到，也不能把已经关闭的管理卡重新打开；
+            # 关闭是持久状态，后台结果只允许推进仍可见的卡片。
+            if context.state == "closed":
+                return
+            status = _lookup_management_status(context.identifier)
+            if status is None:
+                return
+            state = "effective" if complete else (state_override or "incomplete")
+            if complete:
+                dispatch_status = "已生效"
+            elif state == "dispatching":
+                dispatch_status = status_message or "操作已记录，权限正在下发"
+            else:
+                trace = context.last_trace_id or "当前操作"
+                dispatch_status = (
+                    status_message
+                    or f"下发未完成，最迟次日自动纠正 · 追溯号 {trace}"
+                )
+            machine_dispatch_status = (
+                "effective"
+                if complete
+                else "publishing"
+                if state == "dispatching"
+                else "incomplete"
+            )
+            updated = management_card_context_store.update_state(
+                message_id=origin_message_id,
+                state=state,
+                dispatch_status=machine_dispatch_status,
+                snapshot_fingerprint=management_card_fingerprint(status),
+            )
+            if updated is not None:
+                management_card_refresher.update(
+                    context=updated,
+                    status=status,
+                    state=state,
+                    dispatch_status=dispatch_status,
+                )
+        except Exception as error:  # noqa: BLE001 - result refresh is best effort
+            audit.record(
+                "admin.card_callback.management_card_refresh_failed",
+                error=type(error).__name__,
+                pending_action_id=getattr(pending, "id", ""),
+            )
+
+    def _recompute_completed(pending: Any) -> None:
+        _refresh_management_after_recompute(pending, complete=True)
+
+    def _start_management_publish_observer(pending: Any) -> None:
+        """在 gateway 内部短暂观察 outbox，直到真实发布读回一致。
+
+        定向重算只负责排出意图，不能把 ``ENQUEUED``/``REVOKED`` 直接翻译为「已生效」。
+        发布消费在 scheduler 进程中完成，所以这里通过共享 PostgreSQL 状态观察结果；
+        观察线程有界且 daemon 化，超时后留下的 ``incomplete`` 由每日批修正。
+        """
+
+        origin_message_id = getattr(pending, "origin_card_message_id", None)
+        if not origin_message_id:
+            return
+
+        def observe() -> None:
+            deadline = time.monotonic() + _MANAGEMENT_PUBLISH_OBSERVE_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    publish_state = management_card_context_store.latest_publish_state_for_message(
+                        message_id=origin_message_id
+                    )
+                except Exception as error:  # noqa: BLE001 - transient reads are retried
+                    audit.record(
+                        "admin.card_callback.management_publish_state_lookup_failed",
+                        error=type(error).__name__,
+                    )
+                    publish_state = None
+                if publish_state == "published":
+                    _refresh_management_after_recompute(pending, complete=True)
+                    return
+                if publish_state in {"failed", "superseded"}:
+                    _refresh_management_after_recompute(pending, complete=False)
+                    return
+                threading.Event().wait(_MANAGEMENT_PUBLISH_POLL_SECONDS)
+            _refresh_management_after_recompute(pending, complete=False)
+
+        threading.Thread(
+            target=observe,
+            name="lingxi-gateway-management-publish-observer",
+            daemon=True,
+        ).start()
+
+    def _recompute_queued(pending: Any, outcome: Any) -> None:
+        # ``UNCHANGED`` means the permission row already represented the desired
+        # result and no new outbox intent was created. It is therefore effective
+        # immediately; observing an unrelated older published outbox row would
+        # otherwise be both racy and misleading, while waiting for the observer
+        # would eventually turn a successful no-op into "未完成".
+        if getattr(outcome, "kind", None) is RecomputeKind.UNCHANGED:
+            _refresh_management_after_recompute(pending, complete=True)
+            return
+        _refresh_management_after_recompute(
+            pending,
+            complete=False,
+            state_override="dispatching",
+            status_message="操作已记录，权限正在下发",
+        )
+        _start_management_publish_observer(pending)
+
+    def _recompute_failed(pending: Any, error: Exception | None) -> None:
+        del error
+        _refresh_management_after_recompute(pending, complete=False)
+
+    def _recompute_timeout(pending: Any) -> None:
+        _refresh_management_after_recompute(pending, complete=False)
+        _start_management_publish_observer(pending)
     admin_router = AdminCommandRouter(
         registry=admin_registry_lookup,
         queries=admin_display_names,
@@ -643,6 +878,9 @@ def build_supervisor(
         # 目标防呆、prepare()、确认卡发送、审计），不重新实现一遍（见
         # `core/admin/card_callback.py` `ManagementActionRouter` 文档）。
         management_actions=admin_router,
+        management_context_store=management_card_context_store,
+        management_state_lookup=_lookup_management_status,
+        management_card_refresher=management_card_refresher,
         # 定向权限重算（Issue #438）：无条件装配，不受任何前置配置控制——它内部
         # 的每一个依赖都只需要 gateway 本来就有的 Postgres DSN 与随包发布的静态
         # 映射文件（见该适配器模块文档），失败降级回每日批,不影响确认结果本身。
@@ -657,6 +895,10 @@ def build_supervisor(
                 str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
             ),
             audit=audit,
+            on_completed=_recompute_completed,
+            on_queued=_recompute_queued,
+            on_failed=_recompute_failed,
+            on_timeout=_recompute_timeout,
         ),
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个

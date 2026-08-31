@@ -16,6 +16,7 @@ from lingxi.core.admin.commands import (
     DEFAULT_AUDIT_WINDOW_HOURS,
     MAX_AUDIT_WINDOW_HOURS,
     AdminCommandKind,
+    AdminRejectReason,
     parse_admin_command,
 )
 from lingxi.core.ids import new_ulid
@@ -506,6 +507,268 @@ class UnknownAndInjectionShapedInputTests(unittest.TestCase):
 
         command = parse_admin_command("帮我查一下 /admin help 怎么用")
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+
+
+#: 一个只出现在测试里的公开形态邮箱（协作约定：夹具不得出现真实内部标识）。
+_PLAIN_EMAIL = "someone@example.com"
+
+#: 邮箱被飞书客户端自动链接化之后，可能出现在 ``content.text`` 里的形态清单
+#: （Issue #492）。键是形态名，值是该形态下**这一个 token 的逐字内容**。
+#:
+#: **来源标注（必须如实读）**：这份清单是「L6 负面证据 ＋ 飞书官方文档」的**推定**，
+#: **不是**对真实信封的逐字节回读。三条真实失败消息的正文在 stage 上结构性取不到
+#: （``inbound_event`` 没有正文列、也没存 ``chat_id``/``message_id``；飞书没有任何
+#: 接口能枚举机器人↔用户私聊），取证过程与结论见 Issue #492 的 W0-2 两条评论。
+#: 支撑"链接化之后仍以 ``message_type: text`` 到达、语法编码在 ``content.text``
+#: 里"这一条的是 **L6 负面证据**：这位管理员 8 天 42 条入站事件全部是 ``text``、
+#: 零丢弃，全量日志 ``message.unsupported_type`` 零条，而同期他的客户端确实发生了
+#: 链接化。
+#:
+#: 逐条依据：
+#:
+#: - ``markdown_link`` / ``markdown_link_empty_text`` / ``markdown_link_wrapping_
+#:   angle_autolink``——**有飞书官方文档依据**：《发送消息内容结构》写明文本消息
+#:   （``msg_type=text``）的超链接使用格式就是 ``[文本](链接)``，并要求链接文本内
+#:   不要嵌套 ``[]``（本解析器的正则因此也不允许嵌套方括号，与官方约束同形）。
+#: - ``bare_mailto`` / ``bare_mailto_uppercase_scheme`` / ``angle_autolink_with_
+#:   scheme``——``mailto:`` 是邮箱链接的标准 URI scheme（RFC 6068）。注意 ``:``
+#:   本来就在 ``_IDENTIFIER_PATTERN`` 的字符集里，所以 ``mailto:a@b.com`` 此前
+#:   不落 UNKNOWN，而是被当成标识原样送去反查、查无此人——同一缺陷的另一副面孔，
+#:   同样要靠归一化才好。
+#: - ``angle_autolink`` / ``inline_code``——通用 markdown 的自动链接与行内代码包装，
+#:   **飞书官方文档未声明**文本消息支持这两种。纳入是**防御性覆盖**（剥掉之后仍走
+#:   同一道字符集门，代价为零），**不得对外声称是实测到的飞书形态**。
+#:
+#: 真实形态的最终确认由 stage 真人复现兜底（L4a，Issue #492 完成标准 5）。
+_LINKIFIED_EMAIL_FORMS: dict[str, str] = {
+    "markdown_link": f"[{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL})",
+    "markdown_link_empty_text": f"[](mailto:{_PLAIN_EMAIL})",
+    "markdown_link_wrapping_angle_autolink": f"[<{_PLAIN_EMAIL}>](mailto:{_PLAIN_EMAIL})",
+    "bare_mailto": f"mailto:{_PLAIN_EMAIL}",
+    "bare_mailto_uppercase_scheme": f"MAILTO:{_PLAIN_EMAIL}",
+    "angle_autolink": f"<{_PLAIN_EMAIL}>",
+    "angle_autolink_with_scheme": f"<mailto:{_PLAIN_EMAIL}>",
+    "inline_code": f"`{_PLAIN_EMAIL}`",
+}
+
+#: 全部**吃邮箱**的命令入口（Issue #492 的 W0-2 全清单，已含三处校正：``/admin
+#: trace`` 吃裸 ULID、``revoke_permission`` 形状 1 吃 ``lpo_``+ULID，两者都**不**
+#: 吃邮箱，因此不在本表内）。值是命令模板，``{identifier}`` 是那一位邮箱参数。
+_EMAIL_TAKING_COMMANDS: dict[str, tuple[str, AdminCommandKind]] = {
+    "user": ("/admin user {identifier}", AdminCommandKind.QUERY_USER),
+    "audit_identifier_only": ("/admin audit {identifier}", AdminCommandKind.QUERY_AUDIT),
+    "audit_identifier_and_hours": (
+        "/admin audit {identifier} 48",
+        AdminCommandKind.QUERY_AUDIT,
+    ),
+    "suspend": ("/admin suspend {identifier}", AdminCommandKind.SUSPEND_USER),
+    "resume": ("/admin resume {identifier}", AdminCommandKind.RESUME_USER),
+    "grant_permission": (
+        "/admin grant_permission {identifier} 1011 daily_active 特批 授权",
+        AdminCommandKind.GRANT_PERMISSION,
+    ),
+    "suppress_permission": (
+        "/admin suppress_permission {identifier} 1011 daily_active 屏蔽 指标",
+        AdminCommandKind.SUPPRESS_PERMISSION,
+    ),
+    "revoke_permission_shape_two": (
+        "/admin revoke_permission {identifier} 1011 daily_active 撤销 覆盖",
+        AdminCommandKind.REVOKE_PERMISSION,
+    ),
+}
+
+
+class LinkifiedIdentifierParsingTests(unittest.TestCase):
+    """Issue #492：被飞书客户端自动链接化的邮箱必须照常解析。
+
+    真实缺陷：产品负责人 2026-08-31 在飞书里连发三条管理命令、连续三次收到"未识别
+    的管理命令"。裁定原话：**不能因为带了 mailto 就未识别**。失败落点是
+    ``_IDENTIFIER_PATTERN`` 的字符集不含 ``[]()<>``——链接化后的邮箱不含空白、仍是
+    一个整 token，token 数对得上，一路走到字符集校验才被拒。修法是**在校验前归一化**，
+    不是放宽字符集（字符集是本模块声明的第二道安全防线）。
+
+    形态清单与其证据等级见 :data:`_LINKIFIED_EMAIL_FORMS` 的说明——它是**推定**，
+    不是真实信封的逐字节回读。
+    """
+
+    def test_every_email_taking_command_accepts_every_linkified_form(self) -> None:
+        """完成标准 1＋2：多形态 × 全部吃邮箱的命令入口，逐格解析出裸邮箱。"""
+
+        for command_name, (template, expected_kind) in _EMAIL_TAKING_COMMANDS.items():
+            for form_name, token in _LINKIFIED_EMAIL_FORMS.items():
+                with self.subTest(command=command_name, form=form_name):
+                    command = parse_admin_command(template.format(identifier=token))
+                    self.assertEqual(command.kind, expected_kind)
+                    self.assertEqual(command.identifier, _PLAIN_EMAIL)
+                    self.assertIsNone(command.reject_reason)
+
+    def test_linkified_identifier_does_not_disturb_the_other_arguments(self) -> None:
+        """归一化只作用在标识那一位：公司/指标/原因原样解析，不左移、不吞词。"""
+
+        command = parse_admin_command(
+            f"/admin grant_permission [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL}) "
+            "1011 新增用户数 三月特批 走完审批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
+        self.assertEqual(command.identifier, _PLAIN_EMAIL)
+        self.assertEqual(command.company_id, "1011")
+        self.assertEqual(command.metric_name, "新增用户数")
+        self.assertEqual(command.reason, "三月特批 走完审批")
+
+    def test_linkified_open_id_is_also_accepted(self) -> None:
+        """链接化不是邮箱专属：客户端把任何一段文本包成链接，标识都应照常解析。"""
+
+        command = parse_admin_command("/admin user [ou_abc123](mailto:ou_abc123)")
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(command.identifier, "ou_abc123")
+
+    def test_display_text_wins_over_the_link_target(self) -> None:
+        """管理员看到的是显示文本，命令就作用在显示文本上——避免"看到 A、操作 B"
+        这种错位。自动链接化的真实场景里两者本来相同，这条钉住的是二者不同时的取舍。"""
+
+        command = parse_admin_command(
+            "/admin user [seen@example.com](mailto:hidden@example.com)"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(command.identifier, "seen@example.com")
+
+    def test_empty_display_text_falls_back_to_the_link_target(self) -> None:
+        command = parse_admin_command("/admin user [](mailto:hidden@example.com)")
+        self.assertEqual(command.identifier, "hidden@example.com")
+
+
+class LinkNormalizationDoesNotWidenTheCharsetTests(unittest.TestCase):
+    """否定断言（验证与门禁 §八）：归一化**只剥外壳，不放行内容**。
+
+    ``_IDENTIFIER_PATTERN`` 是本模块声明的第二道独立防线（模块文档：即使未来出现
+    绕过身份判定的缺陷，这个解析器也拼不出一条 SQL 或系统命令）。Issue #492 的修法
+    刻意选择"在校验前归一化"而不是"放宽字符集"，这一组用例就是那条选择的保险：任何
+    被字符集拒绝的**内容**，套上链接外壳之后照样被拒。
+    """
+
+    def test_sql_injection_shaped_payload_inside_a_markdown_link_is_still_unknown(self) -> None:
+        command = parse_admin_command("/admin user [1;DROP--](mailto:x@example.com)")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+    def test_shell_metacharacter_payload_inside_inline_code_is_still_unknown(self) -> None:
+        command = parse_admin_command("/admin user `$(rm)`")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+    def test_quote_payload_inside_an_angle_autolink_is_still_unknown(self) -> None:
+        command = parse_admin_command("/admin suspend <ou_a'or'1'='1>")
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+    def test_only_a_whole_token_is_unwrapped_not_a_link_shaped_substring(self) -> None:
+        """剥壳锚定整个 token：``[a](b)`` 后面还挂着别的字符时不剥，照旧 UNKNOWN。"""
+
+        command = parse_admin_command(
+            f"/admin user [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL})尾巴"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+    def test_company_id_is_not_normalized(self) -> None:
+        """归一化只装在标识那一位：公司标识不是邮箱形态、没有真实链接化路径，
+        不给它开这个口子（多归一化一个位置就是多一份不必要的解析面）。"""
+
+        command = parse_admin_command(
+            "/admin grant_permission ou_abc123 [1011](mailto:1011) daily_active 特批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_COMPANY_ID)
+
+    def test_plain_forms_are_untouched(self) -> None:
+        """不误伤（完成标准 3）：没有链接外壳的输入逐条保持原有结果。"""
+
+        plain = parse_admin_command(f"/admin user {_PLAIN_EMAIL}")
+        self.assertEqual(plain.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(plain.identifier, _PLAIN_EMAIL)
+
+        open_id = parse_admin_command("/admin user ou_abc123")
+        self.assertEqual(open_id.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(open_id.identifier, "ou_abc123")
+
+        # 含 `@` 但不是邮箱：`_IDENTIFIER_PATTERN` 本来就只判形状不判语义，
+        # 归一化前后都原样放行到反查层（那里查无此人，是既有行为）。
+        at_shaped = parse_admin_command("/admin user @@@")
+        self.assertEqual(at_shaped.kind, AdminCommandKind.QUERY_USER)
+        self.assertEqual(at_shaped.identifier, "@@@")
+
+
+class RejectReasonSegmentationTests(unittest.TestCase):
+    """Issue #492 完成标准 4：``UNKNOWN`` 要说清是**哪一段**没看懂。
+
+    此前 ``parse_admin_command`` 只回一个不带原因的 ``UNKNOWN``，两类完全不同的
+    错误（邮箱被链接化 / 公司那一段填了中文名）产生逐字相同的回复，管理员无从
+    自救——这正是产品负责人连踩三次的体验。回复文案本身在
+    ``core/admin/router._render_unknown``，这里只钉解析器回传的落点。
+    """
+
+    def test_chinese_company_name_is_attributed_to_the_company_segment(self) -> None:
+        """Issue #492 假设 2：公司参数期望公司编号，输中文名**被拒是正确行为**
+        （不放宽 ``_IDENTIFIER_PATTERN`` 去接受 CJK，那是语义变更）；缺陷只在于
+        此前没说清楚。这条断言钉住"说清楚"这一半。"""
+
+        command = parse_admin_command(
+            "/admin grant_permission ou_abc123 一零一一 daily_active 特批"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_COMPANY_ID)
+
+    def test_each_segment_reports_its_own_reason(self) -> None:
+        expectations: list[tuple[str, AdminRejectReason]] = [
+            # 不是 /admin 开头：不是一次命令尝试，保持既有笼统文案（不误伤）。
+            ("本月销售额是多少", AdminRejectReason.NOT_A_COMMAND),
+            ("", AdminRejectReason.NOT_A_COMMAND),
+            ("帮我查一下 /admin help 怎么用", AdminRejectReason.NOT_A_COMMAND),
+            # 命令名那一段
+            ("/admin", AdminRejectReason.UNKNOWN_SUBCOMMAND),
+            ("/admin delete_user ou_1", AdminRejectReason.UNKNOWN_SUBCOMMAND),
+            # 参数个数
+            ("/admin user", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            ("/admin user ou_a extra", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            ("/admin help now", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            ("/admin grant_permission ou_a 1011 daily_active", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            # 用户标识那一段
+            ("/admin user ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
+            ("/admin suspend <a b>", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            ("/admin audit ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
+            ("/admin audit ou_a;b 48", AdminRejectReason.BAD_IDENTIFIER),
+            # 指标那一段
+            ("/admin grant_permission ou_a 1011 daily;active 特批", AdminRejectReason.BAD_METRIC_NAME),
+            # 原因那一段
+            ("/admin grant_permission ou_a 1011 daily_active " + "长" * 501, AdminRejectReason.BAD_REASON),
+            (f"/admin revoke_permission {_VALID_OVERRIDE_ID} " + "长" * 501, AdminRejectReason.BAD_REASON),
+            # 小时数那一段
+            ("/admin audit 0", AdminRejectReason.BAD_WINDOW_HOURS),
+            ("/admin audit 721", AdminRejectReason.BAD_WINDOW_HOURS),
+            ("/admin audit ou_a notanumber", AdminRejectReason.BAD_WINDOW_HOURS),
+            ("/admin audit ou_a 0", AdminRejectReason.BAD_WINDOW_HOURS),
+            # 追溯号那一段
+            ("/admin trace not-a-ulid", AdminRejectReason.BAD_TRACE_ID),
+        ]
+        for text, expected in expectations:
+            with self.subTest(text=text[:60]):
+                command = parse_admin_command(text)
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertEqual(command.reject_reason, expected)
+
+    def test_non_string_input_is_not_a_command(self) -> None:
+        command = parse_admin_command(None)  # type: ignore[arg-type]
+        self.assertEqual(command.reject_reason, AdminRejectReason.NOT_A_COMMAND)
+
+    def test_successful_commands_carry_no_reject_reason(self) -> None:
+        for text in (
+            "/admin help",
+            f"/admin user {_PLAIN_EMAIL}",
+            "/admin audit",
+            "/admin grant_permission ou_a 1011 daily_active 特批",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_admin_command(text).reject_reason)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -39,6 +39,7 @@ COMPOSE_STAGE = REPOSITORY_ROOT / "deploy" / "compose.stage.yaml"
 COMPOSE_PROD = REPOSITORY_ROOT / "deploy" / "compose.prod.yaml"
 ENV_EXAMPLE = REPOSITORY_ROOT / "deploy" / ".env.example"
 DEPLOY_CHECKLIST = REPOSITORY_ROOT / "deploy" / "验收前部署配置清单.md"
+COMPOSE_STRUCTURE_SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "verify_compose_structure.sh"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
@@ -687,19 +688,48 @@ def _extract_positive_default(raw: str) -> float | None:
         return None
 
 
-def _check_resource_limits_in(compose_path: pathlib.Path, *, require_all_services: bool) -> list[str]:
-    """核对一份 compose 文本里，出现了 `deploy.resources.limits` 的服务是否
-    合规：三键齐全、且各自能从静态文本判定出一个 >0 的默认值。
+#: `${VAR:?说明}` 形态：**没有默认值**，漏配就 `docker compose up` 报错退出。
+#: 这是本仓库既有的"不许静默退回默认"写法（`LINGXI_IMAGE_TAG` 用的就是它）。
+REQUIRED_VARIABLE = re.compile(r'^"?\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}"?$')
 
-    `require_all_services=True`（基线 `compose.yaml`）：全部六个服务必须都
-    声明这个块。`require_all_services=False`（stage/prod 覆盖文件）：声明这
-    个块本身是可选的——覆盖文件可以什么都不改、直接沿用基线；但**一旦声明
-    了**，标准不会降低，同样要三键齐全、数值 >0——覆盖文件的值才是真正部署
-    时生效的值，只核对基线管不住"覆盖文件把某一项悄悄改成 0"（独立审查
-    P1-2）。
+# ---- 生产主机规格待裁定（Issue #494，2026-08-31）-----------------------------
+# `worker-queue` 的生产档四项（/tmp 上限 + cpus/memory/pids）此前是一组按"建议
+# 服务器 8 核 / 32GB"推算的数字，那台服务器的实际规格**从未被确认过**；而 `/tmp`
+# 是内存盘，写满即等量占用宿主内存，规格不符时这部分占用没有任何护栏。在产品负责人
+# 裁定生产主机规格之前，这四项在 `compose.prod.yaml` 里必须写成 `${VAR:?...}`：
+# 生产部署会因为缺变量而**报错退出**，而不是静默用上一个可能错的默认值。
+#
+# 裁定之后的落法是把值写进 `deploy/.env.prod`，本表与 compose 文件都不用改；真要
+# 把数字写回 compose，就把服务名从这张表里删掉，让它退回普通的"正数默认值"规则。
+PROD_PENDING_HOST_SPEC_LIMITS: dict[str, tuple[str, ...]] = {
+    "worker-queue": ("cpus", "memory", "pids"),
+}
+
+
+def _check_resource_limits_in(
+    compose_path: pathlib.Path,
+    *,
+    require_all_services: bool,
+    pending_keys: dict[str, tuple[str, ...]] | None = None,
+) -> list[str]:
+    """核对一份 compose 文本里六个服务的 `deploy.resources.limits`：三键齐全、
+    且各自能从静态文本判定出一个 >0 的默认值。
+
+    `require_all_services=True` 现在对**三份文件都成立**（Issue #494）：基线、
+    stage 覆盖、prod 覆盖都必须逐服务显式声明这个块。此前覆盖文件是可选的
+    ——"沿用基线"听起来无害，实际是把一个只为"漏挂 --env-file 时不至于更糟"
+    而存在的兜底值当成了部署档：基线给 worker-queue 的默认是 4.0 核 / 16G，
+    而 stage 主机只有 2 核 / 3.74GiB，沿用它等于这道防线完全没有生效，且不会
+    有任何报错。每个环境显式写出自己的一档，是让"这个数字是给哪台机器的"这件事
+    在文件里可读、可复核。
+
+    `pending_keys` 里登记的服务/键（见 `PROD_PENDING_HOST_SPEC_LIMITS`）反过来
+    **必须**是 `${VAR:?...}` 无默认值形态：那些数字依赖尚未确认的主机规格，
+    留一个能静默生效的默认值比报错更危险。
     """
 
     failures: list[str] = []
+    pending = pending_keys or {}
     text = strip_comments(read(compose_path))
     for service in RESOURCE_LIMITED_SERVICES:
         block = service_block(text, service)
@@ -715,9 +745,12 @@ def _check_resource_limits_in(compose_path: pathlib.Path, *, require_all_service
                 failures.append(
                     f"{service} 在 {display(compose_path)} 里没有 deploy.resources.limits "
                     "声明。stage 主机只有 2 核 / 3.7GiB，不限制的容器会互相饿死；"
-                    "缺一个服务的限制就是缺一个失控风险。"
+                    "缺一个服务的限制就是缺一个失控风险。覆盖文件不得靠"
+                    "「沿用基线」省掉这一段——基线的值只是漏挂 --env-file 时的兜底，"
+                    "不是任何一个环境的部署档（Issue #494）。"
                 )
             continue
+        pending_for_service = pending.get(service, ())
         for key in ("cpus", "memory", "pids"):
             value_match = re.search(rf"^\s*{key}:\s*(\S.*?)\s*$", limits_block, re.MULTILINE)
             if value_match is None:
@@ -725,22 +758,37 @@ def _check_resource_limits_in(compose_path: pathlib.Path, *, require_all_service
                     f"{service} 的 deploy.resources.limits 在 {display(compose_path)} 缺 `{key}`"
                 )
                 continue
-            numeric = _extract_positive_default(value_match.group(1))
+            raw = value_match.group(1).strip()
+            if key in pending_for_service:
+                if not REQUIRED_VARIABLE.match(raw):
+                    failures.append(
+                        f"{service} 的 `{key}` 在 {display(compose_path)} 不是 "
+                        f"`${{变量:?说明}}` 无默认值形态（原文 `{raw}`）。这一项依赖"
+                        "尚未确认的生产主机规格（Issue #494）：带默认值意味着漏配时"
+                        "静默用上一个可能高于物理规格的上限，那道防线等于没有生效。"
+                        "裁定后把值写进 deploy/.env.prod，或从 "
+                        "PROD_PENDING_HOST_SPEC_LIMITS 里摘掉这一项。"
+                    )
+                continue
+            numeric = _extract_positive_default(raw)
             if numeric is None or numeric <= 0:
                 failures.append(
                     f"{service} 的 `{key}` 在 {display(compose_path)} 判定不出安全的正数默认值"
-                    f"（原文 `{value_match.group(1).strip()}`）。Compose 对 `pids: 0`/`memory: 0`"
+                    f"（原文 `{raw}`）。Compose 对 `pids: 0`/`memory: 0`"
                     "这类 0/null/空值的语义是整个不下发这项限制，等于没设——必须是可判定的正数。"
                 )
     return failures
 
 
 def check_resource_limits() -> list[str]:
-    """六个服务在基线 `deploy/compose.yaml` 都必须声明 `deploy.resources.limits`
-    的 `cpus`/`memory`/`pids` 三项且各自的静态默认值 >0；`compose.stage.yaml`/
-    `compose.prod.yaml` 一旦也声明了同一个块，同样要三键齐全、数值 >0（独立
-    审查 P1-2：此前只读基线，覆盖文件把某一项悄悄改成 `0`/空——而覆盖文件的
-    值才是真正部署时生效的值——不会被这条门禁发现）。
+    """**三份 compose 各自**都要为六个服务显式声明 `deploy.resources.limits`
+    的 `cpus`/`memory`/`pids` 三项，且各自的静态默认值 >0（独立审查 P1-2：
+    此前只读基线，覆盖文件把某一项悄悄改成 `0`/空——而覆盖文件的值才是真正
+    部署时生效的值——不会被这条门禁发现；Issue #494 进一步要求覆盖文件不得
+    靠"沿用基线"省掉声明）。
+
+    例外只有一处：`PROD_PENDING_HOST_SPEC_LIMITS` 登记的生产待定项必须写成
+    `${VAR:?...}`，反过来**不许**带默认值。
 
     只做结构 + 静态数值核对，不核对具体数值"合不合理"——合理性是容量判断，
     见 `deploy/README.md`「资源限制」一节；这里只保证"没有任何服务被漏掉、
@@ -749,8 +797,169 @@ def check_resource_limits() -> list[str]:
 
     failures: list[str] = []
     failures += _check_resource_limits_in(COMPOSE_BASE, require_all_services=True)
-    failures += _check_resource_limits_in(COMPOSE_STAGE, require_all_services=False)
-    failures += _check_resource_limits_in(COMPOSE_PROD, require_all_services=False)
+    failures += _check_resource_limits_in(COMPOSE_STAGE, require_all_services=True)
+    failures += _check_resource_limits_in(
+        COMPOSE_PROD,
+        require_all_services=True,
+        pending_keys=PROD_PENDING_HOST_SPEC_LIMITS,
+    )
+    return failures
+
+
+# ---- compose 插值占位符必须能被 YAML 解析（PR #506 CI 实测教训）--------------
+# compose 的值要先过 **YAML 解析**，再做 `${VAR}` 插值。未加引号的 YAML 标量遇到
+# 「空格 + #」就被当成行内注释**从那里截断**——`#494` 里的那个 `#` 把 `}` 连同后半
+# 句一起吃掉，剩下一个没有闭合的 `${...`，compose 报的是
+# `invalid interpolation format`（而不是我们要的"变量缺失"），整条 fail-fast 语义
+# 直接失效。同理「冒号 + 空格」会被 YAML 当成映射指示符。
+#
+# 这一类此前只有最晚的 `Epic Full / image` 作业里的 `verify_compose_structure.sh`
+# （真的起 docker 渲染）才抓得到；本检查把它前移到不需要 docker 的文本层，让
+# `scripts/dev/check.sh fast` 与 Story 门禁就能变红。两者不互相替代：那边验的是
+# 渲染后的最终结构，这边验的是"能不能渲染得出来"。
+_PLACEHOLDER = re.compile(r"\$\{([^{}]*)\}")
+#: YAML 纯量里会改变解析结果的两个序列，出现在 `${...}` 内部即判红。
+_YAML_HOSTILE_SEQUENCES = (" #", ": ")
+
+
+def check_compose_interpolation_is_yaml_safe() -> list[str]:
+    """三份 compose 里每个 `${...}` 占位符都必须能原样活过 YAML 解析；且每个
+    **无默认值**的 `${VAR:?}` 都必须被 `verify_compose_structure.sh` 显式赋一个
+    占位值，否则那条渲染门禁会以"变量缺失"红（PR #506 实测：漏了这一步只会在
+    最晚的 image 作业里才炸）。
+    """
+
+    failures: list[str] = []
+    required_variables: set[str] = set()
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+        for number, line in enumerate(read(path).splitlines(), start=1):
+            if line.lstrip().startswith("#") or "${" not in line:
+                continue
+            for body in _PLACEHOLDER.findall(line):
+                for sequence in _YAML_HOSTILE_SEQUENCES:
+                    if sequence in body:
+                        failures.append(
+                            f"{display(path)}:{number} 的 `${{{body[:40]}…}}` 含 "
+                            f"`{sequence.replace(' ', '␠')}`。compose 的值先过 YAML 解析再插值："
+                            "未加引号的标量遇到「空格+#」会被当成行内注释从那里截断、"
+                            "「冒号+空格」会被当成映射指示符，两者都会把 `}` 甩在解析结果之外，"
+                            "compose 只会报 `invalid interpolation format`。提示语请压成短的"
+                            "纯 ASCII 单行，详细说明写在 deploy/README.md。"
+                        )
+                match = re.match(r"([A-Za-z_][A-Za-z0-9_]*):\?", body)
+                if match:
+                    required_variables.add(match.group(1))
+            # 占位符必须在本行闭合：去掉全部完整占位符后不该还剩 `${`。
+            if "${" in _PLACEHOLDER.sub("", line):
+                failures.append(
+                    f"{display(path)}:{number} 有没有闭合的 `${{`，compose 会报 "
+                    "`invalid interpolation format`"
+                )
+
+    script = read(COMPOSE_STRUCTURE_SCRIPT)
+    exported = set(re.findall(r"^export\s+([A-Za-z_][A-Za-z0-9_]*)=", script, re.MULTILINE))
+    for variable in sorted(required_variables - exported):
+        failures.append(
+            f"`${{{variable}:?}}` 是无默认值的必填变量，但 "
+            f"{display(COMPOSE_STRUCTURE_SCRIPT)} 没有为它 export 占位值。"
+            "那条渲染门禁不读 deploy/.env.prod，缺一个就整段渲染不出来——"
+            "而它只在最晚的 `Epic Full / image` 作业里跑（PR #506 实测）。"
+        )
+    return failures
+
+
+# ---- worker-queue 的 /tmp 内存盘上限（Issue #494）----------------------------
+# 这块盘不是磁盘：镜像把 HOME 指到 /tmp，Agent 会话转录写在 $HOME/.claude/projects
+# 下，**写满即等量占用宿主内存**。rc22 收尾批 S-12 浸泡实测：容器接负载约 45 分钟
+# 就把 256MB 写满（32 份转录、单份最大 15MB），而健康检查一路报绿——探针写的是
+# 十几字节的活性文件，覆盖写不需要新页，于是"用户在失败、监控显示 healthy、运维
+# 查不出原因"可以无限期持续。
+#
+# 上限此前只写在基线 compose.yaml 里，`compose.prod.yaml` 与 `compose.stage.yaml`
+# 都没有覆盖（grep 零命中）——生产是同一个 256MB，且没人显式为它做过判断。这条
+# 门禁把三件事钉死：基线不许把值写死回去（必须走变量）、stage 必须显式声明自己
+# 那一档、prod 必须显式声明且**不得沿用默认**（主机规格待裁定，见
+# PROD_PENDING_HOST_SPEC_LIMITS 的同一条理由）。
+TMPFS_CAPACITY_SERVICE = "worker-queue"
+TMPFS_CAPACITY_VARIABLE = "LINGXI_WORKER_QUEUE_TMPFS_SIZE"
+
+
+def _tmp_tmpfs_size(compose_path: pathlib.Path, service: str) -> tuple[str | None, str | None]:
+    """返回 (size 原文, 失败说明)。两者恒有且只有一个是 ``None``。"""
+
+    text = strip_comments(read(compose_path))
+    block = service_block(text, service)
+    if block is None:
+        return None, f"{display(compose_path)} 找不到 service `{service}`"
+    tmpfs_block = service_block(block, "tmpfs")
+    if not tmpfs_block or not tmpfs_block.strip():
+        return None, (
+            f"{service} 在 {display(compose_path)} 没有声明 `tmpfs:`。"
+            "`/tmp` 是内存盘、写满即等量占用宿主内存，容量必须分环境显式声明，"
+            "不许靠沿用基线默认（Issue #494）。"
+        )
+    # 挂载项的选项串里可能含空格（`${VAR:?中文说明}` 的说明文本），因此不能按
+    # `\S+` 切——那会在 prod 的待定占位上找不到这一项而给出一条误导性的报错。
+    entry = re.search(r"^\s*-\s*/tmp:(.+?)\s*$", tmpfs_block, re.MULTILINE)
+    if entry is None:
+        return None, (
+            f"{service} 在 {display(compose_path)} 的 `tmpfs:` 里找不到 `/tmp` 挂载项"
+        )
+    # `${...}` 整体作为一个值取走：占位说明里可以出现逗号，按逗号硬切会把它腰斩。
+    size = re.search(r"(?:^|,)size=(\$\{[^}]*\}|[^,]+)", entry.group(1))
+    if size is None:
+        return None, (
+            f"{service} 在 {display(compose_path)} 的 `/tmp` tmpfs 没有 `size=` 上限"
+            f"（原文 `{entry.group(1)}`）。不写 size 时 Docker 默认给宿主内存的一半，"
+            "等于这块内存盘完全没有上限。"
+        )
+    return size.group(1).strip(), None
+
+
+def check_worker_tmpfs_capacity() -> list[str]:
+    """`worker-queue` 的 `/tmp` 内存盘上限必须是分环境显式配置（Issue #494）。
+
+    基线走变量、stage 显式给出自己那一档、prod 显式声明且必须是 `${VAR:?...}`
+    无默认值形态——理由见本节头部注释与 `PROD_PENDING_HOST_SPEC_LIMITS`。
+    """
+
+    failures: list[str] = []
+    service = TMPFS_CAPACITY_SERVICE
+
+    base_size, error = _tmp_tmpfs_size(COMPOSE_BASE, service)
+    if error is not None:
+        failures.append(error)
+    elif f"${{{TMPFS_CAPACITY_VARIABLE}" not in base_size:
+        failures.append(
+            f"{service} 在 {display(COMPOSE_BASE)} 的 `/tmp` size 写死成了 `{base_size}`，"
+            f"没有走 `${{{TMPFS_CAPACITY_VARIABLE}}}`。写死的上限没有办法分环境覆盖，"
+            "stage 与生产就只能共用同一个数字（Issue #494）。"
+        )
+
+    stage_size, error = _tmp_tmpfs_size(COMPOSE_STAGE, service)
+    if error is not None:
+        failures.append(error)
+    else:
+        numeric = _extract_positive_default(stage_size)
+        if numeric is None or numeric <= 0:
+            failures.append(
+                f"{service} 在 {display(COMPOSE_STAGE)} 的 `/tmp` size "
+                f"`{stage_size}` 判定不出安全的正数上限。stage 主机是 2 核 / 3.74GiB，"
+                "这块内存盘的上限必须是一个看得见、可复核的正数。"
+            )
+
+    prod_size, error = _tmp_tmpfs_size(COMPOSE_PROD, service)
+    if error is not None:
+        failures.append(error)
+    elif not REQUIRED_VARIABLE.match(prod_size):
+        failures.append(
+            f"{service} 在 {display(COMPOSE_PROD)} 的 `/tmp` size `{prod_size}` "
+            "不是 `${变量:?说明}` 无默认值形态。生产主机内存规格尚待产品负责人裁定"
+            "（Issue #494）：带默认值意味着漏配时静默用上一个没人为生产判断过的"
+            "内存盘上限，而这块盘写满就等量吃掉宿主内存。裁定后把值写进 "
+            "deploy/.env.prod，本文件不用改。"
+        )
+
     return failures
 
 
@@ -1338,7 +1547,7 @@ def check_ci_workflow() -> list[str]:
     else:
         candidate = candidate_match.group(1)
         needs = re.search(r"^\s*needs:\s*\[([^\]]*)\]", candidate, re.MULTILINE)
-        required = {"classify", "docs", "gate", "extras", "image"}
+        required = {"classify", "docs", "l1", "gate", "extras", "image"}
         actual = {item.strip() for item in needs.group(1).split(",")} if needs else set()
         if actual != required:
             failures.append(
@@ -1376,11 +1585,26 @@ def check_ci_workflow() -> list[str]:
         "scripts/ci/verify_docs.sh",
         "needs.classify.outputs.mode == 'docs'",
         "needs.classify.outputs.mode != 'docs'",
+        "name: Epic Full / l1",
+        "scripts/ci/check_l1_assets.py",
+        "needs.classify.outputs.risk_level == 'l1'",
+        "needs.classify.outputs.risk_level != 'l1'",
+        "scripts/ci/check_permission_impact.py",
+        "needs.classify.outputs.risk_level == 'l3'",
     ):
         if marker not in full:
-            failures.append(f"ci.yml 缺少纯文档轻量 Epic 路由标记 `{marker}`。")
+            failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")
 
-    for marker in ("'epic/**'", "classify_story_changes.py", "verify_docs.sh", "uses: ./.github/workflows/ci.yml", "name: Story Fast"):
+    for marker in (
+        "'epic/**'",
+        "classify_story_changes.py",
+        "verify_docs.sh",
+        "uses: ./.github/workflows/ci.yml",
+        "name: Story Fast",
+        "name: Story / content l1",
+        "scripts/ci/check_l1_assets.py",
+        "needs.classify.outputs.risk_level == 'l1'",
+    ):
         if marker not in story:
             failures.append(f"story.yml 缺少 `{marker}`，Story Fast 路由不完整。")
 
@@ -1448,6 +1672,8 @@ def main() -> int:
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("六服务资源限制结构", check_resource_limits),
+        ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
+        ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),
         ("日志留存下限", check_log_retention_floor),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),

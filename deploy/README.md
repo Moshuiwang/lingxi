@@ -582,7 +582,32 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 | `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
 | `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
 | `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
-| `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **4.0 / 16G / 4096** | 架构设计「九、容量与资源」：峰值并发任务 10–16 × 单任务内存 300–500MB = 8–16GB；这是六个服务里唯一直接对应该估算的服务，取估算上限 |
+| `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **待裁定（`${VAR:?}`，无默认值）** | 见下方「生产主机规格待裁定」 |
+
+### 生产主机规格待裁定（Issue #494，2026-08-31）
+
+`worker-queue` 生产档原来的 **4.0 / 16G / 4096** 以及 `/tmp` 的 **256m**，是按"建议服务器 8 核 / 32GB"推算出来的——**那台服务器的实际规格从未被确认过**。上限高于物理规格不会报错，但等于这道防线完全没有生效；`/tmp` 更是内存盘，写满即等量占用宿主内存，规格不符时这部分占用没有任何护栏。
+
+因此这四项在 `deploy/compose.prod.yaml` 里现在写成 `${VAR:?说明}`（**无默认值**）：生产 `docker compose up` 会因为缺变量直接报错退出，而不是静默用上一个没人为生产判断过的数字。**那四条提示语是刻意压短的纯 ASCII 单行，详细说明只写在本节**——compose 的值先过 YAML 解析再插值，未加引号的标量遇到「空格 + `#`」会被当成行内注释从那里截断（`（Issue #494）` 里的那个 `#` 就把 `}` 一起吃掉了），compose 于是报 `invalid interpolation format` 而不是我们要的「变量缺失」，fail-fast 语义整条失效（PR #506 CI 实测）。同理提示语里不能出现「冒号 + 空格」。这条已由 `check_compose_interpolation_is_yaml_safe` 钉成门禁；同一条门禁还要求每个 `${VAR:?}` 都在 `scripts/ci/verify_compose_structure.sh` 里有一个占位 `export`，否则那条渲染核对拿不到真值、整段渲染不出来。`scripts/ci/check_deploy_contract.py` 的 `check_resource_limits`（`PROD_PENDING_HOST_SPEC_LIMITS`）与 `check_worker_tmpfs_capacity` 把这条形状钉成会变红的断言。
+
+**要产品负责人确认的清单**（确认后把值写进 `deploy/.env.prod`，compose 文件不用改）：
+
+| 变量 | 依赖的事实 |
+| --- | --- |
+| `LINGXI_WORKER_QUEUE_CPU_LIMIT` | 生产主机 vCPU 数 |
+| `LINGXI_WORKER_QUEUE_MEM_LIMIT` | 生产主机内存规格；与 `LINGXI_WORKER_MAX_CONCURRENCY` 同批定（下方并发上界表） |
+| `LINGXI_WORKER_QUEUE_PIDS_LIMIT` | 同上，按并发上界 × 单回合子进程数反推 |
+| `LINGXI_WORKER_QUEUE_TMPFS_SIZE` | 生产主机内存规格——这块盘吃的是宿主内存，不是磁盘 |
+
+其余五个服务的生产档仍沿用上表数值：它们都是无子进程扇出的轻量进程，量级判断不依赖主机规格的精确值；`worker`（一次性 job）的 `/tmp` 也仍是基线的 256m——它跑完一个回合就退出、tmpfs 随容器销毁，没有 `worker-queue` 那种跨任务累积的增长（Issue #494 已核实，不单独立项）。
+
+### `/tmp` 内存盘容量（Issue #494）
+
+`worker`/`worker-queue` 的 `/tmp` 是 **256MB 内存盘**（其余四个服务 16m）。镜像把 `HOME` 指到 `/tmp`，Agent 会话转录写在 `$HOME/.claude/projects` 下——rc22 收尾批 S-12 浸泡实测：worker-queue 接负载约 **45 分钟就写满**（32 份转录、单份最大 15MB），清空后 33 分钟又长回 190MB。三条修复缺一不可：
+
+1. **常规回收**：`apps/worker/session_cleanup.py` 的 `reclaim_session_transcripts` 按字节预算删最旧的（默认预算 128MiB、低水位 75%、保护最近 5 分钟写过的）。此前只有 `/new`、权限刷新等触发点排队才会删，**正常问数流程一次都不排**。运维旋钮见 `deploy/.env.example`「文件五」的 `LINGXI_WORKER_SESSION_DISK_*` / `LINGXI_WORKER_SESSION_RECLAIM_*`；预算设 `0` 显式关闭回收（保全取证现场用）。
+2. **上限分环境显式**：值由 `LINGXI_WORKER_QUEUE_TMPFS_SIZE` 决定，stage 钉在 256m（t3.medium，这块盘吃宿主内存），生产待裁定（见上）。
+3. **健康检查看得见这块盘**：`lingxi.apps.healthcheck` 增加可用空间判定，低于总量 10% 判红。修复前它一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页，所以"用户在失败、监控显示 healthy"可以无限期持续。时延口径见 `deploy/监控告警.md`「五、时延估算」的 C 类。
 
 **stage 主机只有 2 核 / 3.7GiB**：`scheduler`（512M）+ `gateway`（512M）+
 `worker-queue`（2G）三个常驻服务加总约 3G，给宿主机与 Docker 守护进程留下约
@@ -604,7 +629,7 @@ CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直接 kil
 | 档位 | `memory` 限额 | 并发上界建议 | 推导 |
 | --- | --- | --- | --- |
 | stage | 2G | **≤4** | 2048MB ÷ 单任务上限 500MB ≈ 4.1，向下取整；默认值 16 在这一档会在真实并发负载下把 `worker-queue` 顶爆内存，pids/memory 限额会把超额回合直接 kill，不是温和排队降级 |
-| 生产 | 16G | 16（默认值即可） | 16384MB ÷ 单任务上限 500MB ≈ 32.8，默认 16 落在这个上界之内，与架构设计「九、容量与资源」的估算区间（8–16GB）一致，不需要显式覆盖 |
+| 生产 | 待裁定 | **随内存限额同批裁定** | 原来那行按 16G 反推出「默认 16 即可」，而 16G 本身是按一台从未确认过规格的服务器推算的（见上方「生产主机规格待裁定」）。内存限额定下来之前，并发上界同样没有依据，不能沿用默认 |
 
 **因此：任何设了 `LINGXI_WORKER_QUEUE_MEM_LIMIT` 低于生产档（尤其是 stage 这类
 资源受限环境）的部署，必须同步显式设置 `LINGXI_WORKER_MAX_CONCURRENCY`**——默认值

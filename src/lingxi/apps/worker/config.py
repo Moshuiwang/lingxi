@@ -15,6 +15,11 @@ import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from lingxi.apps.worker.session_cleanup import (
+    DEFAULT_SESSION_DISK_BUDGET_BYTES,
+    DEFAULT_SESSION_DISK_LOW_WATER_RATIO,
+    DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS,
+)
 from lingxi.core.execution.input_safety import SAFE_OUTPUT_FALLBACK, WITHHELD_MESSAGE
 from lingxi.core.execution.tool_policy import is_well_formed_tool_name
 from lingxi.core.ids import new_ulid
@@ -173,6 +178,18 @@ class WorkerConfig:
     # ``$HOME/.claude/projects`` 推导默认根目录，见 apps/worker/session_cleanup.py。
     session_root: str | None = None
     session_cleanup_batch_limit: int = 20
+    # 会话转录容量回收（Issue #494）：定点清理只在 ``/new``、权限刷新等触发点排队
+    # 时才发生，正常问数流程一次都不排——没有这一条，转录就在容器的 256MB 内存盘
+    # 上单调增长直到写满（rc22 收尾批 S-12 实测约 45 分钟）。完整取舍见
+    # ``apps/worker/session_cleanup.py`` 模块文档「容量回收」。预算 ``0`` 表示
+    # 显式关闭回收，是留给运维保全取证现场的逃生口，不是默认值。
+    session_disk_budget_bytes: int = DEFAULT_SESSION_DISK_BUDGET_BYTES
+    session_disk_low_water_ratio: float = DEFAULT_SESSION_DISK_LOW_WATER_RATIO
+    session_reclaim_min_age_seconds: float = DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS
+    # 两次容量回收之间的最小间隔：``process_once`` 每 2 秒跑一轮，没必要每轮都去
+    # 扫一遍目录（扫描本身是 stat 每个文件，在小机器上不是零成本，见 #497 对
+    # healthcheck 冷启动开销的实测）。
+    session_reclaim_interval_seconds: float = 60.0
     # 用户环境根目录（Epic D 闸⑥）：queue 模式处理每个任务时，按任务的
     # ``user_id`` 读 ``<user_env_root>/<user_id>/.mcp.json``，把解析结果作为这一
     # 次会话专属的 ``mcp_servers``——见 ``apps/worker/service.py``。**不带
@@ -305,6 +322,19 @@ def load_config(
         shutdown_timeout_seconds=_shutdown_timeout(_text(env, "SHUTDOWN_TIMEOUT_SECONDS")),
         session_root=_text(env, "SESSION_ROOT"),
         session_cleanup_batch_limit=_positive_int(env, "SESSION_CLEANUP_BATCH_LIMIT", 20),
+        session_disk_budget_bytes=_positive_int(
+            env,
+            "SESSION_DISK_BUDGET_BYTES",
+            DEFAULT_SESSION_DISK_BUDGET_BYTES,
+            allow_zero=True,
+        ),
+        session_disk_low_water_ratio=_low_water_ratio(env),
+        session_reclaim_min_age_seconds=_duration(
+            env, "SESSION_RECLAIM_MIN_AGE_SECONDS", DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS
+        ),
+        session_reclaim_interval_seconds=_duration(
+            env, "SESSION_RECLAIM_INTERVAL_SECONDS", 60.0
+        ),
         user_env_root=_user_env_root(env),
         system_prompt_file=system_prompt_file,
         innertest_content_capture_enabled=content_capture_enabled,
@@ -735,3 +765,27 @@ def _positive_int(
     if invalid:
         raise WorkerConfigError(f"{ENV_PREFIX}{name} 必须是合法的正整数")
     return parsed
+
+
+def _low_water_ratio(env: Mapping[str, str]) -> float:
+    """会话转录容量回收的低水位比例（Issue #494）：``(0, 1]`` 之间的小数。
+
+    ``1.0`` 合法（等价于"删到刚好等于预算"）；``0`` 与负数不合法——那会让一次
+    回收把目录清空，把"容量回收"变成"全删"。上界同样封死：大于 1 的比例意味着
+    低水位高于预算本身，回收永远达不到目标、每一轮都白扫一遍目录。
+    """
+
+    value = _text(env, "SESSION_DISK_LOW_WATER_RATIO")
+    if not value:
+        return DEFAULT_SESSION_DISK_LOW_WATER_RATIO
+    try:
+        ratio = float(value)
+    except ValueError as error:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SESSION_DISK_LOW_WATER_RATIO 必须是 (0, 1] 之间的小数"
+        ) from error
+    if not 0 < ratio <= 1:
+        raise WorkerConfigError(
+            f"{ENV_PREFIX}SESSION_DISK_LOW_WATER_RATIO 必须是 (0, 1] 之间的小数"
+        )
+    return ratio

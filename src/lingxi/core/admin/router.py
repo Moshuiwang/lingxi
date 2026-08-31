@@ -19,11 +19,16 @@ PostgreSQL 实现见 ``adapters/admin_registry.py``；调用方（``core/convers
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
-from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+from lingxi.core.admin.commands import (
+    AdminCommandKind,
+    AdminRejectReason,
+    parse_admin_command,
+)
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.pending_action import (
     LOCAL_PERMISSION_ACTION_TYPES,
@@ -143,6 +148,9 @@ class PendingActionPreparer(Protocol):
         company_id: str | None = None,
         metric_name: str | None = None,
         reason: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> _PrepareOutcome: ...
 
 
@@ -221,6 +229,7 @@ class AdminRouter(Protocol):
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome: ...
 
 
@@ -344,6 +353,7 @@ class AdminCommandRouter:
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         """判定 ``open_id`` 是否为当前有效管理员，是则解析并执行命令。
 
@@ -392,6 +402,7 @@ class AdminCommandRouter:
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
+                origin_card_message_id=origin_card_message_id,
             )
         except Exception as error:  # noqa: BLE001 - 已确认是管理员，失败也必须有回复
             return self._record_or_reject(
@@ -416,6 +427,7 @@ class AdminCommandRouter:
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         command = parse_admin_command(text)
         roles = sorted(role.value for role in entry.roles)
@@ -444,6 +456,7 @@ class AdminCommandRouter:
                 self._send_management_card(
                     status=status,
                     display_identifier=command.identifier,
+                    initiated_by_open_id=entry.feishu_open_id,
                     chat_id=chat_id,
                     thread_id=thread_id,
                     message_id=message_id,
@@ -560,6 +573,26 @@ class AdminCommandRouter:
                 reason=command.reason,
             )
 
+        if command.kind is AdminCommandKind.GRANT_POSITION_PERMISSION:
+            assert command.identifier is not None
+            assert command.position_name is not None
+            assert command.company_scope is not None
+            assert command.reason is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+                position_name=command.position_name,
+                company_scope=command.company_scope,
+                reason=command.reason,
+                origin_card_message_id=origin_card_message_id,
+            )
+
         if command.kind is AdminCommandKind.SUPPRESS_PERMISSION:
             assert command.identifier is not None
             assert command.company_id is not None
@@ -645,16 +678,23 @@ class AdminCommandRouter:
 
         # UNKNOWN：语法封闭的落点——不认识的命令得到帮助/拒绝文案，绝不会被当成
         # 任何查询条件执行（`commands.py` 已把语法钉死为六选一，这里只负责回复）。
+        # `reject_reason`（Issue #492）只是一个枚举名，不含任何管理员输入的原文，
+        # 记进审计是为了让下一次"真人踩到但现场取不到正文"的调查至少知道是哪一段
+        # 没通过——Trace #502 W0-2 那次调查正是卡在这里（三条失败只留下一个不带
+        # 原因的 UNKNOWN，两个竞争假设至今无法区分）。
         return self._record_or_reject(
             "admin.command.unknown",
             AdminRouteOutcome(
                 handled=True,
                 content_key="admin.unknown_command",
                 content_version=_CONTENT_VERSION,
-                reply_text=_render_unknown(),
+                reply_text=_render_unknown(command.reject_reason),
             ),
             actor=entry.feishu_open_id,
             roles=roles,
+            reject_reason=(
+                command.reject_reason.value if command.reject_reason is not None else None
+            ),
             trace_id=trace_id,
         )
 
@@ -672,6 +712,9 @@ class AdminCommandRouter:
         company_id: str | None = None,
         metric_name: str | None = None,
         reason: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         """``suspend``/``resume``/``grant_permission``/``suppress_permission``/
         ``revoke_permission`` 共用的写命令编排：角色核对 → 自我目标防呆 →
@@ -768,14 +811,34 @@ class AdminCommandRouter:
         # 分支，见 ``tests/test_pending_action.py``）——那一刻是唯一有意义的
         # "角色是否仍然有效"的重新核验点，因为 prepare 到 confirm 之间存在真实的
         # 时间窗口，而 prepare 内部这两步之间没有。
-        outcome = self._pending_actions.prepare(
-            action_type=action_type,
-            target_open_id=target_identifier,
-            initiated_by_open_id=entry.feishu_open_id,
-            company_id=company_id,
-            metric_name=metric_name,
-            reason=reason,
-        )
+        prepare_kwargs: dict[str, object] = {
+            "action_type": action_type,
+            "target_open_id": target_identifier,
+            "initiated_by_open_id": entry.feishu_open_id,
+            "company_id": company_id,
+            "metric_name": metric_name,
+            "reason": reason,
+        }
+        # 旧的注入式 preparer 仍只接受公司×指标字段；新职位表单才附加扩展
+        # 参数，避免无关的旧只读/命令测试因可选字段破坏接口兼容。
+        if position_name is not None:
+            prepare_kwargs["position_name"] = position_name
+        if company_scope is not None:
+            prepare_kwargs["company_scope"] = company_scope
+        if origin_card_message_id is not None:
+            prepare_kwargs["origin_card_message_id"] = origin_card_message_id
+        if position_name is not None:
+            try:
+                prepare_parameters = inspect.signature(self._pending_actions.prepare).parameters
+                accepts_trace = "trace_id" in prepare_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in prepare_parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_trace = False
+            if accepts_trace:
+                prepare_kwargs["trace_id"] = trace_id
+        outcome = self._pending_actions.prepare(**prepare_kwargs)  # type: ignore[arg-type]
         if not outcome.decision.ok or outcome.pending is None:
             return self._record_or_reject(
                 action_name,
@@ -820,7 +883,11 @@ class AdminCommandRouter:
                 handled=True,
                 content_key="admin.write_action_pending",
                 content_version=_CONTENT_VERSION,
-                reply_text="已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。",
+                reply_text=(
+                    "已提交，请在下方确认卡片上确认（10 分钟内有效）。"
+                    if position_name is not None
+                    else "已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。"
+                ),
             ),
             actor=entry.feishu_open_id,
             roles=roles,
@@ -834,6 +901,7 @@ class AdminCommandRouter:
         *,
         status: AdminUserStatusView,
         display_identifier: str,
+        initiated_by_open_id: str = "",
         chat_id: str,
         thread_id: str | None,
         message_id: str,
@@ -856,12 +924,23 @@ class AdminCommandRouter:
         if self._management_cards is None or not message_id:
             return
         try:
+            send_kwargs: dict[str, object] = {
+                "status": status,
+                "display_identifier": display_identifier,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "reply_to_message_id": message_id,
+            }
+            # 旧的测试/插件 sender 没有发起人字段时保持兼容；生产 dispatcher
+            # 会持久化真实 initiator，供回调的身份校验与审计恢复。
+            try:
+                supports_initiator = "initiated_by_open_id" in inspect.signature(self._management_cards.send).parameters
+            except (TypeError, ValueError):
+                supports_initiator = False
+            if supports_initiator:
+                send_kwargs["initiated_by_open_id"] = initiated_by_open_id
             self._management_cards.send(
-                status=status,
-                display_identifier=display_identifier,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                reply_to_message_id=message_id,
+                **send_kwargs,
             )
         except Exception as error:  # noqa: BLE001 - 管理卡发送失败不影响文本回复
             self._safe_record(
@@ -1079,6 +1158,64 @@ _FAILURE_REASON_LABEL: dict[str, str] = {
 }
 
 
+#: ``task.status`` 枚举 → 中文（Issue #495）：与迁移 ``0059`` 把 ``task`` 的
+#: status CHECK 扩成六个取值一一对应。与本文件其余词表同一姿态——白名单式展示层
+#: 翻译，未登记走 :func:`_display_or_unregistered` 回退。
+_TASK_STATUS_LABEL: dict[str, str] = {
+    "queued": "排队中",
+    "running": "执行中",
+    "awaiting_delivery": "已收口，等待答复送达",
+    "succeeded": "成功",
+    "failed": "失败",
+    "stopped": "已停止",
+}
+
+#: 任务失败机器码 → 中文（Issue #495）。**同时覆盖两列**：``task.failure_code``
+#: （迁移 ``0080`` 新增，worker 给出的**细分**失败码）与 ``task.error_kind``
+#: （被 ``apps/worker/service.py::_failure_content`` 压平成用户文案分类之后的粗
+#: 粒度值）。两列是不同的取值域：``drain_timeout``/``sdk_unavailable``/
+#: ``cancelled``/``gate_bypassed`` 在 ``error_kind`` 那一列全部塌进同一个
+#: ``session_failed``，正是本 Issue 要消灭的那种"什么都看不出来"；反过来
+#: ``error_kind`` 也有 ``failure_code`` 覆盖不到的取值——**没有经过
+#: ``write_terminal_event`` 的失败终态**（心跳超时回收 ``retry_exhausted``/
+#: ``side_effect_uncertain``、投递到期 ``delivery_expired``、排队超时
+#: ``queued_timeout`` 等，写入方是 ``adapters/postgres_conversation/
+#: _queue_lifecycle.py``）在新列上恒为 ``NULL``，只有 ``error_kind`` 说得出原因。
+#: 因此回显按「有 ``failure_code`` 用它，否则退回 ``error_kind``」取值，一张表
+#: 服务两列，不维护两份会各自漂移的词表。
+#:
+#: ``core/daily_report.py`` 另有一份只翻译 ``task.error_kind`` 的词表，服务的是
+#: 「失败分类 Top」榜单——两处对**共有**的词刻意逐字保持同一措辞，改动其一时请
+#: 同步另一处。**唯一一处有意分岔**：``session_failed`` 在那边是「会话执行失败」，
+#: 这边加了「（未分类，见底层异常）」——榜单是聚合计数、下面没有别的行可看，而
+#: 这里紧接着就是「底层异常类型」那一行，把读者指过去正是本 Issue 的要点。
+_TASK_FAILURE_LABEL: dict[str, str] = {
+    "cancelled": "执行被取消",
+    "config_error": "worker 配置错误",
+    "context_too_long": "上下文过长",
+    "delivery_expired": "投递已过期",
+    "drain_timeout": "收尾超时",
+    "gate_bypassed": "工具调用绕过了判定屏障（屏障失效）",
+    "interrupted": "用户主动停止",
+    "max_turns_exceeded": "对话轮数超限",
+    "model_protocol_breakdown": "模型输出协议异常",
+    "queued_timeout": "排队超时未领取",
+    "redacted_withheld": "内容因安全策略被拦截",
+    "result_too_large": "查询结果过大",
+    "retry_exhausted": "重试次数耗尽",
+    "running_timeout": "执行超时",
+    "sdk_unavailable": "Agent SDK 不可用",
+    "session_failed": "会话执行失败（未分类，见底层异常）",
+    "side_effect_uncertain": "执行结果不确定（需人工核实是否已生效）",
+    "stopped": "用户主动停止",
+    "turn_not_closed": "回合未收口，且没有留下失败码",
+    "turn_timeout": "单轮对话超时",
+    "unnamed_failure": "失败记录缺失分类码",
+    "user_mcp_config_unavailable": "用户问数配置不可用",
+    "worker_version_unavailable": "目标执行版本不可用",
+}
+
+
 def _display_or_unregistered(value: str, table: dict[str, str]) -> str:
     """未登记的机器码既不原样吞掉、也不假装认识——统一回退成"原值（未登记
     显示名）"这个样式（Trace #469 修复包 B，B-6，产品负责人裁定的兜底样式）：
@@ -1187,9 +1324,74 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
             f"（{trace.failure_event_type}，{trace.failure_occurred_at}）"
         )
     else:
-        lines.append("无失败记录")
+        lines.append("无开通失败记录")
+    if trace.task_status is not None:
+        # 任务收口结果（Issue #495）：这条追溯号派生的任务失败时，管理员此前
+        # 唯一能拿到的是「无失败记录」——开通没失败，问数任务失败了，而任务
+        # 那一侧的分类码与底层异常类型名只进 worker 容器 stderr，管理员看不到。
+        # 迁移 0080 落库之后这里才有东西可显示；没有派生任务时整段省略，不摆
+        # 一排空值。
+        suffix = f"（{trace.task_ended_at}）" if trace.task_ended_at is not None else ""
+        lines.append(
+            f"任务结果: {_display_or_unregistered(trace.task_status, _TASK_STATUS_LABEL)}{suffix}"
+        )
+        # 有细分失败码用它，否则退回 `error_kind`：没有经过 `write_terminal_
+        # event` 的失败终态（心跳超时回收、投递到期、排队超时）在新列上恒为
+        # NULL，只有 `error_kind` 说得出原因，不能因此整行消失。
+        task_failure = trace.task_failure_code or trace.task_error_kind
+        if task_failure is not None:
+            lines.append(
+                f"任务失败原因: {_display_or_unregistered(task_failure, _TASK_FAILURE_LABEL)}"
+            )
+        if trace.task_failure_signature is not None:
+            # 底层异常**类型名**，不是异常正文（`V-花名册-33`：审计与日志不含
+            # 外部标识原值；psycopg 的异常串常见形状 `DETAIL: Key
+            # (feishu_open_id)=(ou_...)`）。这里不翻译——它是第三方库的类名，
+            # 没有可枚举的取值域，翻译只能靠猜；管理员把它原样贴给研发就是最
+            # 有用的一手信息。
+            lines.append(f"底层异常类型: {trace.task_failure_signature}")
     return "\n".join(lines)
 
 
-def _render_unknown() -> str:
-    return "未识别的管理命令，请发送 /admin help 查看可用命令。"
+#: 「以 ``/admin`` 开头但没解析成功」时，按失败落点告诉管理员**哪一段**没看懂
+#: （Issue #492 完成标准 4）。
+#:
+#: 缺陷现场：产品负责人 2026-08-31 连发三条管理命令，三条都只收到一句"未识别的
+#: 管理命令，请发送 /admin help 查看可用命令"——这句话不含任何可据以修正的信息，
+#: 他无从自救，也无法判断是邮箱被客户端自动链接化了（Issue #492 假设 1）还是公司
+#: 那一段填了中文名（假设 2）。两种情形此前产生**逐字相同**的回复。
+#:
+#: **刻意不回显管理员输入的原文**：回显最直观，但出站是一条飞书文本消息，而飞书
+#: 文本消息里的 ``<at user_id="all"></at>`` 一类标记是有语义的——把输入原样拼进
+#: 回复等于把一段可控文本反射进出站消息。段名 + 期望形状已经足够自救，不值得为
+#: 这点便利开一个反射面。
+_REJECT_HINTS: dict[AdminRejectReason, str] = {
+    AdminRejectReason.UNKNOWN_SUBCOMMAND: "没有认出命令名",
+    AdminRejectReason.WRONG_ARGUMENT_COUNT: "参数个数与这条命令的格式对不上",
+    AdminRejectReason.BAD_IDENTIFIER: (
+        "没有认出用户标识（命令里的第 1 个参数）——这一段请填用户邮箱或 open_id，中间不要有空格"
+    ),
+    AdminRejectReason.BAD_COMPANY_ID: (
+        "没有认出公司标识（命令里的第 2 个参数）——这一段要填公司编号，不是公司中文名称"
+    ),
+    AdminRejectReason.BAD_METRIC_NAME: (
+        "没有认出指标（命令里的第 3 个参数）——这一段请填指标名或已配置的中文别名，中间不要有空格"
+    ),
+    AdminRejectReason.BAD_REASON: "没有看懂原因（命令里的最后一段）——原因不能为空，且不超过 500 字",
+    AdminRejectReason.BAD_WINDOW_HOURS: "没有看懂小时数——这一段请填 1 到 720 之间的整数",
+    AdminRejectReason.BAD_TRACE_ID: "没有认出追溯号——这一段请填完整的 26 位追溯号，不要带前缀",
+}
+
+#: 不以 ``/admin`` 开头的文本得到的既有文案，逐字不变（Issue #492 完成标准 3）。
+#: 管理命令面**没有 ``/admin`` 前缀预检**，已登记管理员发的任何一句闲聊都会走到
+#: UNKNOWN 分支；对这些输入做分段报错等于对每句闲聊解释命令语法，是误伤。
+_UNKNOWN_COMMAND_TEXT = "未识别的管理命令，请发送 /admin help 查看可用命令。"
+
+
+def _render_unknown(reject_reason: AdminRejectReason | None) -> str:
+    """``UNKNOWN`` 的回复：以 ``/admin`` 开头的失败说清是哪一段没看懂，其余原样。"""
+
+    hint = _REJECT_HINTS.get(reject_reason) if reject_reason is not None else None
+    if hint is None:
+        return _UNKNOWN_COMMAND_TEXT
+    return f"这条管理命令没有完全看懂：{hint}。请发送 /admin help 查看正确格式后重发。"

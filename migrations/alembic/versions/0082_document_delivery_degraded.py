@@ -1,8 +1,8 @@
 """文档交付明示降级：``task_document_delivery_request`` 新增可空
 ``body_degraded_reason`` 列，持久化"这一行的正文是降级写进去的"这件事。
 
-Revision ID: 0080_document_delivery_degraded
-Revises: 0079_document_delivery_markdown
+Revision ID: 0082_document_delivery_degraded
+Revises: 0081_management_card_context
 Create Date: 2026-08-31
 
 Issue #499（rc23 S-6）。产品负责人 2026-08-31 裁定：docx 正文命中本仓库不支持的
@@ -79,8 +79,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0080_document_delivery_degraded"
-down_revision: str | None = "0079_document_delivery_markdown"
+revision: str = "0082_document_delivery_degraded"
+down_revision: str | None = "0081_management_card_context"
 branch_labels: str | None = None
 depends_on: str | None = None
 

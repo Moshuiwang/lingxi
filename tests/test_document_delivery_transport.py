@@ -182,7 +182,7 @@ class _RecordingDeliveryStore:
         self.uncertain: list[tuple[str, str]] = []
         self.failed: list[tuple[str, str]] = []
         self.notified: list[str] = []
-        # Issue #499：降级检查点（迁移 0080）的调用记录。
+        # Issue #499：降级检查点（迁移 0082）的调用记录。
         self.body_degraded: list[tuple[str, str]] = []
         self._unnotified = list(unnotified)
 
@@ -1098,7 +1098,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
     def test_resent_notice_for_a_degraded_row_still_says_the_format_was_simplified(self) -> None:
         """Issue #499：补发通知是**另一次进程调用**，看不到原发送那次
         ``write_body`` 的内存信号——它必须从库里读 ``body_degraded_reason``
-        （迁移 0080）才知道要用明示降级的文案。
+        （迁移 0082）才知道要用明示降级的文案。
 
         变异锚点：把 ``claim_unnotified_succeeded`` 的 SELECT 里
         ``body_degraded_reason`` 去掉（或把 ``_send_ready_notice`` 的文案分派
@@ -1129,7 +1129,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(dedupe_key, "document-ready:tdd-degraded-unnotified")
 
     def test_mark_body_degraded_persists_the_reason_and_claim_pending_reads_it_back(self) -> None:
-        """迁移 0080 的检查点列真库往返：``mark_body_degraded`` 单独提交之后，
+        """迁移 0082 的检查点列真库往返：``mark_body_degraded`` 单独提交之后，
         下一次认领必须把原因码带回 :class:`DocumentDeliveryClaim`——检查点恢复
         路径会跳过写正文步、拿不到那次 ``write_body`` 的返回值，只能靠这一列。
         """
@@ -1158,7 +1158,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(reclaimed.body_degraded_reason, "unsupported_nested_blocks")
 
     def test_body_degraded_reason_check_rejects_a_sheet_row_carrying_a_value(self) -> None:
-        """迁移 0080 的 CHECK：sheet 分支没有"markdown 转换"这个概念，也就没有
+        """迁移 0082 的 CHECK：sheet 分支没有"markdown 转换"这个概念，也就没有
         "转换被拒绝所以降级"这件事——数据库层直接拒绝这种自相矛盾的行。"""
 
         with self.assertRaises(Exception):
@@ -1955,7 +1955,7 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
         )
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertEqual(store.failed, [])
-        # 降级检查点单独落库（迁移 0080）——补发通知与检查点恢复路径靠它。
+        # 降级检查点单独落库（迁移 0082）——补发通知与检查点恢复路径靠它。
         self.assertEqual(store.body_degraded, [("tdd-wire-1", "unsupported_nested_blocks")])
         # 明示降级：用户拿到的通知必须说清格式被简化了。
         self.assertEqual(len(notifier.sent), 1)
@@ -1969,7 +1969,7 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
     ) -> None:
         """检查点恢复路径跳过写正文步，因此**永远不会**再产生一次
         ``WriteBodyOutcome``——降级说明只能从 claim 带进来的
-        ``body_degraded_reason``（迁移 0080）继承。
+        ``body_degraded_reason``（迁移 0082）继承。
 
         变异锚点：把 ``_process_docx_claim`` 里
         ``body_degraded_reason = claim.body_degraded_reason`` 改成 ``= None``，

@@ -140,7 +140,7 @@ class DocumentDeliveryClaim:
     # `DocumentDeliveryClaim(...)` 的调用点不传这个字段即等价于"没有 markdown
     # 原文"，与新增列之前逐字相同的行为。
     markdown: str | None = None
-    # 迁移 0080（Issue #499）：非 None 即"这一行的正文已经被降级成纯文本段落
+    # 迁移 0082（Issue #499）：非 None 即"这一行的正文已经被降级成纯文本段落
     # 路径写入"，取值是原因码。**认领时就要读出来**，因为检查点恢复路径
     # （`read_body_children` 判定正文已写、直接跳过写正文步）永远不会再调用一次
     # `write_body`，拿不到那次调用的内存信号——不从库里带进来，这条路径就会发出
@@ -161,7 +161,7 @@ class UnnotifiedSuccess:
     sheet 直接读这一列（建表时已经落检查点，见
     :meth:`PostgresDocumentDeliveryStore.mark_document_created`）。
 
-    ``body_degraded_reason``（迁移 0080，Issue #499）：补发时要选哪条文案同样
+    ``body_degraded_reason``（迁移 0082，Issue #499）：补发时要选哪条文案同样
     要看它——非 ``None`` 说明这一行的正文是降级写进去的，必须补发**明示降级**
     的那条就绪文案，而不是普通就绪文案。
     """
@@ -172,7 +172,7 @@ class UnnotifiedSuccess:
     document_id: str
     delivery_type: str
     resource_url: str | None
-    # 迁移 0080（Issue #499）：补发通知是另一次进程调用，看不到原发送路径那次
+    # 迁移 0082（Issue #499）：补发通知是另一次进程调用，看不到原发送路径那次
     # `write_body` 的内存信号——不带上这一列，补发出去的就是不含"格式已简化"
     # 说明的就绪通知（静默降级）。
     body_degraded_reason: str | None = None
@@ -262,7 +262,7 @@ class PostgresDocumentDeliveryStore:
                 raise DocumentDeliveryOwnershipLost(request_id)
 
     def mark_body_degraded(self, *, request_id: str, reason: str) -> None:
-        """检查点：正文已经**降级**写入（迁移 0080，Issue #499）——落
+        """检查点：正文已经**降级**写入（迁移 0082，Issue #499）——落
         ``body_degraded_reason``，单独提交，不与后续"授权/读回/落终态"共享事务。
 
         姿态与 :meth:`mark_document_created` 一致，理由也一致：这是一件"外部
@@ -523,7 +523,7 @@ class PostgresDocumentDeliveryStore:
         形态，信息量不小于 ``paragraphs``，同一次擦除必须一起清，不能只擦段落列却
         把原文留在库里过期不清）；``status``/``document_id``/``attempts``/
         ``last_error``/时间戳留下——它们是"谁在什么时候请求过一份文档、结果如何"
-        这类运行事实，本身不含用户资料（迁移 0080 的
+        这类运行事实，本身不含用户资料（迁移 0082 的
         ``body_degraded_reason`` 同属这一类：一个固定枚举形状的原因码，不含任何
         用户内容，因此同样不在擦除范围内），形状照 ``adapters/postgres_permission_
         publish.py`` 的 ``redact_expired_payloads``（那张表擦 ``payload`` 成

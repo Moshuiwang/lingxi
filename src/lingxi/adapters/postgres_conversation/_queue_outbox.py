@@ -142,6 +142,8 @@ class _OutboxMixin:
         agent_session_id: str | None = None,
         token_usage: Mapping[str, int] | None = None,
         guard_denied_count: int | None = None,
+        failure_code: str | None = None,
+        failure_signature: str | None = None,
         document_request: Mapping[str, Any] | None = None,
         sheet_request: Mapping[str, Any] | None = None,
     ) -> AppendedEvent | None:
@@ -189,6 +191,18 @@ class _OutboxMixin:
         保证同一次调用 ``document_request``/``sheet_request`` 至多一个非
         ``None``——这里仍然响亮校验这条不变式（纵深防线，不假设上游一定守约）：
         两者都非 ``None`` 视为调用方契约错误，直接拒绝，不猜测该用哪一个。
+
+        ``failure_code``/``failure_signature``（迁移 ``0080``，Issue #495）：落
+        ``task.failure_code``/``task.failure_signature`` 两列。前者是这次终态的
+        细分失败码（``task.error_kind`` 是被 ``_failure_content`` 压平成用户文案
+        分类之后的粗粒度值，``drain_timeout``/``sdk_unavailable``/``cancelled``/
+        ``gate_bypassed`` 全都塌进同一个 ``session_failed``，落库之后再也分不
+        开）；后者是底层异常的**类型限定名**，是"未分类失败"唯一留得下的线索。
+        两者都可空，``NULL`` 是精确语义（这次失败不来自异常、或这一轮压根不是
+        失败），不编造占位符。**异常正文永远不落这两列**——``V-花名册-33`` 禁止
+        外部标识原值进审计与日志，psycopg 的异常串常见形状正是
+        ``DETAIL: Key (feishu_open_id)=(ou_...)``；收敛口径见
+        ``apps/worker/report_extraction.py`` 的失败签名一节。
 
         **这一插入套在一个独立的 SAVEPOINT 里（P2-3，opus 审查），不与终态事件/
         task 状态转移共享失败命运**：文档请求插入失败（结构性、会重复发生的
@@ -245,13 +259,17 @@ class _OutboxMixin:
                            error_kind = COALESCE(%s, error_kind),
                            ended_at = now(),
                            token_usage = %s,
-                           guard_denied_count = %s
+                           guard_denied_count = %s,
+                           failure_code = %s,
+                           failure_signature = %s
                      WHERE id = %s AND worker_id = %s AND status = 'running'
                     """,
                     (
                         error_kind,
                         _jsonb_or_none(token_usage),
                         guard_denied_count,
+                        failure_code,
+                        failure_signature,
                         task_id,
                         worker_id,
                     ),

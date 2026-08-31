@@ -8,8 +8,8 @@
    没有有效批次同样整轮不跑，审计可分辨；
 3. **翻译层整体可用性判据**：翻译映射为空时整轮同样不跑，**一条发布意图都不排，
    撤权也不例外**——见「翻译」一节，这是外部独立审查 2026-08-18 坐实的 P1 修复；
-4. 遍历**已开通且未停用**用户（``provisioning_state='active'`` 且 ``account_state
-   NOT IN ('deleting','deleted','suspended')``，过滤写在 SQL 里——
+4. 遍历**已开通且未停用**用户（``provisioning_state='active'`` 且
+   ``account_state='enabled'``——正向白名单，Issue #483；过滤写在 SQL 里——
    :data:`~lingxi.adapters.postgres_permission_publish.PERMISSION_REFRESH_BASELINE_SQL`；
    与花名册审计基线只在前两态上同口径，``suspended`` 是本职责专属的额外排除，
    见 :class:`_BaselineReader` 文档「为什么两份实现故意不再共用」，Issue #468），逐人：
@@ -263,6 +263,7 @@ from lingxi.core.permission.metric_translation import (
     metric_translation_available,
     translate_company_functions,
 )
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import (
     ADMIN_FULL_ACCESS_FUNCTION,
     aggregate_permission,
@@ -343,6 +344,13 @@ SKIP_METRIC_TRANSLATION_UNAVAILABLE = "metric_translation_unavailable"
 #: 「公司 + 职能 → 指标名」翻译层**有内容，但这一次要用的组合没被覆盖**（Issue #227）：
 #: 不发布、不撤权，只跳过。
 SKIP_METRIC_TRANSLATION_UNCOVERED = "metric_translation_uncovered"
+#: 落授权决定的那把行锁里发现这个人已经不是 ``enabled``（Issue #483）：本轮基线读到
+#: 他的那一刻他还有效，轮到处理他的这一刻管理员已经把他停用了。**这不是故障**——
+#: ``report.failed`` 不加一，撤权那一侧也不受影响（撤权声明"不要求账号有效"）；它是
+#: 「停用」承诺被正确兑现的证据，因此单独登记一个原因码 + 一条专属审计动作，让运维能
+#: 从审计上看出"今天真的发生过一次这样的交错"。上线后第一轮批处理应当回看这条计数，
+#: 正常为 0。
+SKIP_ACCOUNT_NOT_ENABLED = "account_not_enabled"
 
 #: 逐用户结果的四个分类。``granted`` 之外的三类都**不产生任何发布意图**。
 STAGE_MATCH = "match"
@@ -472,6 +480,12 @@ class _DecisionStore(Protocol):
 
     **版本推进与幂等完全由它承担**：本职责不读、不写、不比较 ``permission_version``，
     也不自己判断"这次权限有没有变化"。那条判定连同它的锁与事务边界只有一处实现。
+
+    ``require_enabled_account`` 是**必填**关键字参数（Issue #483，与
+    ``merge_permission_sources(full_access_wildcard=...)`` 同一条结构性防复发纪律）：
+    授权侧传 ``True``、撤权侧传 ``False``。账号状态复检落在实现那把**已经持有的**
+    ``app_user`` 行锁里，本职责一个字都不复制——它只负责在被挡时把结果翻译成自己的
+    计数与审计（:data:`SKIP_ACCOUNT_NOT_ENABLED`）。
     """
 
     def record_decision(
@@ -480,6 +494,7 @@ class _DecisionStore(Protocol):
         user_id: str,
         row: Any,
         reason: str,
+        require_enabled_account: bool,
         decided_at: datetime,
         clear_delivered_content: bool = False,
     ) -> _Decision: ...
@@ -993,15 +1008,39 @@ class PermissionRefreshDuty:
             decided_at=now,
             token_cipher=token_cipher,
         )
-        decision = self._decisions.record_decision(
-            user_id=identity.app_user_id,
-            row=row,
-            reason=PERMISSION_REFRESH_REASON,
-            decided_at=now,
-            # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
-            # 已送达、随会话保留的投递正文（S-P-5，Trace #328）。
-            clear_delivered_content=True,
-        )
+        try:
+            decision = self._decisions.record_decision(
+                user_id=identity.app_user_id,
+                row=row,
+                reason=PERMISSION_REFRESH_REASON,
+                # Issue #483：这是一份**需要账号有效**的授权。基线读取到轮到这个人
+                # 被处理之间，管理员可能刚把他停用并排空了权限——判据必须落在
+                # ``record_decision`` 那把已经持有的行锁里（同一行、同一把锁 = 与
+                # 停用写入串行），不是这里先查一次账号状态（那只会把窗口缩小）。
+                require_enabled_account=True,
+                decided_at=now,
+                # 权限确实变化时，在 record_decision 自己的同一个事务里顺带清空该用户
+                # 已送达、随会话保留的投递正文（S-P-5，Trace #328）。
+                clear_delivered_content=True,
+            )
+        except PermissionGrantBlockedByAccountState as blocked:
+            # **被挡是正确结果，不是故障**：``tally.failed`` 不加一（那一列是"处理这个
+            # 人时抛了异常"，运维按它判断本轮健康度）。这个人本轮什么都没写——事务整体
+            # 回滚，版本没推进、意图没入队；他的撤权由停用那一刻的即时撤销路径负责。
+            tally.count(SKIP_ACCOUNT_NOT_ENABLED)
+            self._audit.record(
+                "permission_refresh.grant_blocked_account_state",
+                user=identity.app_user_id,
+                stage=STAGE_IDENTITY,
+                reason=SKIP_ACCOUNT_NOT_ENABLED,
+                account_state=blocked.account_state,
+            )
+            logger.warning(
+                "本轮基线读取之后该用户已被停用，授权决定整体回滚 user=%s account_state=%s",
+                identity.app_user_id,
+                blocked.account_state,
+            )
+            return
         if decision.enqueued:
             tally.enqueued += 1
             self._audit.record(
@@ -1117,6 +1156,11 @@ class PermissionRefreshDuty:
             user_id=identity.app_user_id,
             row=row,
             reason=PERMISSION_REVOKE_REASON,
+            # Issue #483：撤权**任何账号状态都必须放行**。挡住撤权 = 停用彻底失效，
+            # 是本次修复方向相反的那个、后果最严重的错误——``force_revoke`` 的服务
+            # 对象本来就是已停用用户。声明 ``False`` 时实现侧还会断言这一行确实是
+            # 空权限撤权行，传错在运行期就写不出来。
+            require_enabled_account=False,
             decided_at=now,
             # 权限确实变化（真的排出撤权意图）时，在 record_decision 自己的同一个
             # 事务里顺带清空该用户已送达、随会话保留的投递正文（S-P-5，Trace #328），
@@ -1333,6 +1377,7 @@ __all__ = [
     "PermissionRefreshDuty",
     "PermissionRefreshReport",
     "REASON_FULLY_SUPPRESSED",
+    "SKIP_ACCOUNT_NOT_ENABLED",
     "SKIP_METRIC_TRANSLATION_UNAVAILABLE",
     "SKIP_METRIC_TRANSLATION_UNCOVERED",
     "SKIP_NO_PUBLISHED_ROW",

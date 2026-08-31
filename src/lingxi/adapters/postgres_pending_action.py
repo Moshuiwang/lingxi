@@ -137,6 +137,7 @@ from lingxi.core.admin.pending_action import (
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.position_override import expand_position_scope
 
 #: ``prepare()`` 撞上同目标在途唯一索引时对外的错误码（外部审查交叉裁定，
 #: codex P1-5）——与 ``core/admin/pending_action.ERROR_CODE``/``CANCEL_ERROR_CODE``
@@ -209,7 +210,7 @@ class CancelOutcome:
 _SELECT_COLUMNS = (
     "id, action_type, target_open_id, target_state_snapshot, initiated_by_open_id,"
     " status, card_delivered, card_id, reason, created_at, confirm_deadline_at,"
-    " decided_at, decided_by_open_id, card_sequence, payload"
+    " decided_at, decided_by_open_id, card_sequence, payload, origin_card_message_id"
 )
 
 
@@ -230,6 +231,7 @@ def _row_to_pending_action(row: tuple) -> PendingAction:
         decided_by_open_id,
         card_sequence,
         payload,
+        origin_card_message_id,
     ) = row
     return PendingAction(
         id=id_,
@@ -247,6 +249,7 @@ def _row_to_pending_action(row: tuple) -> PendingAction:
         decided_by_open_id=decided_by_open_id,
         card_sequence=card_sequence,
         payload=payload,
+        origin_card_message_id=origin_card_message_id,
     )
 
 
@@ -290,6 +293,9 @@ class PostgresPendingActionStore:
         reason: str | None = None,
         now: datetime | None = None,
         trace_id: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> PrepareOutcome:
         """读目标当前状态、判定是否可以发起，通过则插入一行 ``pending`` 记录
         （``card_delivered=FALSE``，调用方随后发卡片，成功再调用
@@ -331,9 +337,50 @@ class PostgresPendingActionStore:
         pending_id = new_id("pac")
         is_local_permission_action = action_type in _DIRECTION_BY_ACTION_TYPE
         is_revoke_action = action_type is PendingActionType.LOCAL_PERMISSION_REVOKE
+        position_expansion = None
+        if position_name is not None or company_scope is not None:
+            if action_type is not PendingActionType.LOCAL_PERMISSION_GRANT:
+                return PrepareOutcome(
+                    decision=PrepareDecision(
+                        ok=False,
+                        code="position_grant_only",
+                        message="职位+公司范围只支持补充授权。",
+                    )
+                )
+            try:
+                from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
+                from lingxi.adapters.role_function_map_file import load_role_function_map
+
+                company_map = load_company_function_metric_map()
+                position_expansion = expand_position_scope(
+                    position_name=position_name or "",
+                    company_scope=company_scope or "",
+                    role_function_map=load_role_function_map(),
+                    company_function_metric_map=company_map,
+                    available_companies=tuple(key for key in company_map if key != "*"),
+                )
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                return PrepareOutcome(
+                    decision=PrepareDecision(
+                        ok=False,
+                        code="position_mapping_unavailable",
+                        message="职位或公司范围当前不可用，请重新查询后再试。",
+                    )
+                )
         payload = (
             json.dumps(
-                {"company_id": company_id, "metric_name": metric_name, "reason": reason},
+                (
+                    {
+                        "position_name": position_expansion.position_name,
+                        "function": position_expansion.function,
+                        "company_scope": position_expansion.company_scope,
+                        "companies": position_expansion.companies,
+                        "pairs": position_expansion.pairs,
+                        "reason": reason,
+                    }
+                    if position_expansion is not None
+                    else {"company_id": company_id, "metric_name": metric_name, "reason": reason}
+                ),
                 ensure_ascii=False,
             )
             if is_local_permission_action
@@ -404,13 +451,22 @@ class PostgresPendingActionStore:
                             current_state = None
                         else:
                             direction = _DIRECTION_BY_ACTION_TYPE[action_type]
-                            cursor.execute(
-                                "SELECT 1 FROM local_permission_override"
-                                " WHERE user_id = %s AND direction = %s AND company_id = %s"
-                                "   AND metric_name = %s AND entry_status = 'active'",
-                                (user_id, direction.value, company_id, metric_name),
+                            pairs = (
+                                position_expansion.pairs
+                                if position_expansion is not None
+                                else ((company_id, metric_name),)
                             )
-                            current_state = "present" if cursor.fetchone() is not None else "absent"
+                            current_state = "absent"
+                            for pair_company_id, pair_metric_name in pairs:
+                                cursor.execute(
+                                    "SELECT 1 FROM local_permission_override"
+                                    " WHERE user_id = %s AND direction = %s AND company_id = %s"
+                                    "   AND metric_name = %s AND entry_status = 'active'",
+                                    (user_id, direction.value, pair_company_id, pair_metric_name),
+                                )
+                                if cursor.fetchone() is not None:
+                                    current_state = "present"
+                                    break
                     else:
                         cursor.execute(
                             "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
@@ -489,9 +545,9 @@ class PostgresPendingActionStore:
                                 """
                                 INSERT INTO pending_action
                                     (id, action_type, target_open_id, target_state_snapshot,
-                                     initiated_by_open_id, status, card_delivered, created_at,
-                                     confirm_deadline_at, payload)
-                                VALUES (%s, %s, %s, %s, %s, 'pending', FALSE, %s, %s, %s)
+                                    initiated_by_open_id, status, card_delivered, created_at,
+                                     confirm_deadline_at, payload, origin_card_message_id)
+                                VALUES (%s, %s, %s, %s, %s, 'pending', FALSE, %s, %s, %s, %s)
                                 """,
                                 (
                                     pending_id,
@@ -502,6 +558,7 @@ class PostgresPendingActionStore:
                                     moment,
                                     confirm_deadline_at,
                                     payload,
+                                    origin_card_message_id,
                                 ),
                             )
                     except UniqueViolation:
@@ -824,17 +881,6 @@ class PostgresPendingActionStore:
                                 assert target_user_id is not None
                                 assert pending.payload is not None
                                 payload_data = json.loads(pending.payload)
-                                entry = LocalPermissionOverrideEntry(
-                                    user_id=target_user_id,
-                                    direction=_DIRECTION_BY_ACTION_TYPE[pending.action_type],
-                                    company_id=payload_data["company_id"],
-                                    metric_name=payload_data["metric_name"],
-                                    reason=payload_data["reason"],
-                                    initiated_by_open_id=pending.initiated_by_open_id,
-                                    pending_action_id=pending.id,
-                                    created_at=moment,
-                                )
-                                override_id = new_id("lpo")
                                 try:
                                     # 嵌套事务块 = psycopg 的 SAVEPOINT，与 prepare()
                                     # 对 pending_action_single_pending_target_idx 的
@@ -845,7 +891,26 @@ class PostgresPendingActionStore:
                                     # 抢先落地——降级为既有 TARGET_DRIFTED/FAILED，
                                     # 不新增错误码（模块文档）。
                                     with connection.transaction():
-                                        _insert_locked(cursor, override_id=override_id, entry=entry)
+                                        pairs = payload_data.get("pairs")
+                                        if not pairs:
+                                            pairs = ((payload_data["company_id"], payload_data["metric_name"]),)
+                                        for pair_company_id, pair_metric_name in pairs:
+                                            entry = LocalPermissionOverrideEntry(
+                                                user_id=target_user_id,
+                                                direction=_DIRECTION_BY_ACTION_TYPE[pending.action_type],
+                                                company_id=pair_company_id,
+                                                metric_name=pair_metric_name,
+                                                reason=payload_data["reason"],
+                                                initiated_by_open_id=pending.initiated_by_open_id,
+                                                pending_action_id=pending.id,
+                                                created_at=moment,
+                                                position_name=payload_data.get("position_name"),
+                                                company_scope=payload_data.get("company_scope"),
+                                                permission_group_id=(
+                                                    pending.id if payload_data.get("position_name") else None
+                                                ),
+                                            )
+                                            _insert_locked(cursor, override_id=new_id("lpo"), entry=entry)
                                 except DuplicateActiveOverride:
                                     decision = ConfirmDecision(
                                         kind=ConfirmResultKind.TARGET_DRIFTED,

@@ -28,6 +28,9 @@ def _load_classifier():
     spec = importlib.util.spec_from_file_location("classify_story_changes_shared", CLASSIFIER_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # classify_story_changes.py 的 Classification 是 dataclass；dataclasses 在处理
+    # 类型注解时会回查 sys.modules，动态加载前必须先登记模块，和测试加载器同一纪律。
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -53,8 +56,12 @@ def changed_paths_against(
     args = ["git", "diff", "--name-only", "-z", "--no-renames", base]
     if not include_worktree:
         args.append("HEAD")
-    result = subprocess.run(args, check=True, capture_output=True, text=True, cwd=repository)
-    paths = [path for path in result.stdout.split("\0") if path]
+    result = subprocess.run(args, check=True, capture_output=True, cwd=repository)
+    paths = [
+        raw.decode("utf-8", errors="surrogateescape")
+        for raw in result.stdout.split(b"\0")
+        if raw
+    ]
 
     if include_worktree:
         # `git diff` 默认不认「尚未 add 过的新文件」——它们连 index 都没进，diff 找不到
@@ -64,10 +71,14 @@ def changed_paths_against(
             ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             check=True,
             capture_output=True,
-            text=True,
             cwd=repository,
         )
-        paths.extend(path for path in untracked.stdout.split("\0") if path and path not in paths)
+        untracked_paths = [
+            raw.decode("utf-8", errors="surrogateescape")
+            for raw in untracked.stdout.split(b"\0")
+            if raw
+        ]
+        paths.extend(path for path in untracked_paths if path not in paths)
 
     return paths
 
@@ -84,6 +95,18 @@ def classify_local(
     return _CLASSIFIER.classify(paths)
 
 
+def classify_local_detail(
+    base: str,
+    *,
+    include_worktree: bool = True,
+    repository: Path | None = None,
+):
+    """本机返回与 CI 相同的风险路由事实（含 l1/l3 专用标记）。"""
+
+    paths = changed_paths_against(base, include_worktree=include_worktree, repository=repository)
+    return _CLASSIFIER.classify_detail(paths)
+
+
 def _main() -> int:
     import argparse
 
@@ -94,15 +117,25 @@ def _main() -> int:
         action="store_true",
         help="只看 base..HEAD 已提交的差异，不含工作树未提交内容（与 CI 口径一致）",
     )
+    parser.add_argument(
+        "--risk",
+        action="store_true",
+        help="同时打印 Issue #498 风险级别（l0/l1/l2/l3/fast/full）",
+    )
     args = parser.parse_args()
 
     try:
-        mode = classify_local(args.base, include_worktree=not args.committed_only)
+        classification = classify_local_detail(
+            args.base, include_worktree=not args.committed_only
+        )
     except subprocess.CalledProcessError as error:
         print(f"local_layer：git diff 失败（{error}）", file=sys.stderr)
         return 1
 
-    print(mode)
+    if args.risk:
+        print(f"{classification.mode} {classification.risk_level}")
+    else:
+        print(classification.mode)
     return 0
 
 
