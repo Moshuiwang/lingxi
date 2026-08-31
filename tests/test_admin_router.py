@@ -1111,6 +1111,45 @@ class QueryTraceCommandTests(unittest.TestCase):
 
         self.assertIn("some_future_failure_code（未登记显示名）", reply)
 
+    def test_document_delivery_degradation_is_reported_separately_from_task_success(
+        self,
+    ) -> None:
+        """Issue #499：任务成功不等于文档正文按官方排版成功。
+
+        ``body_degraded_reason`` 从文档投递检查点读出后，管理员凭同一个追溯号应
+        能看到「文档成功但正文已降级」及可读原因；不能只展示 task 的成功状态，
+        也不能把降级静默成普通文档成功。
+
+        **变异验红**：删掉 ``_render_trace`` 的文档投递段落，或把降级字段改成
+        恒为空，本用例的两条断言都应变红；恢复后复绿。
+        """
+
+        reply = self._trace_reply(
+            task_status="succeeded",
+            document_delivery_status="succeeded",
+            document_body_degraded_reason="unsupported_nested_blocks",
+        )
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertIn("文档交付结果: 成功", reply)
+        self.assertIn("文档正文处理: 已降级", reply)
+        self.assertIn("正文含暂不支持的嵌套结构", reply)
+
+    def test_document_delivery_failure_is_reported_when_task_itself_succeeded(self) -> None:
+        """文档消费是独立状态机：问数任务成功但文档明确失败时，``/admin trace``
+        仍应如实显示文档失败及其原因，不能拿 task 的成功状态遮住用户未拿到文档
+        这一事实。"""
+
+        reply = self._trace_reply(
+            task_status="succeeded",
+            document_delivery_status="failed",
+            document_delivery_last_error="permission_not_confirmed",
+        )
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertIn("文档交付结果: 失败", reply)
+        self.assertIn("文档交付原因: 授权结果未能读回确认", reply)
+
     def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
         """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询
         （与既有 `DefaultDenyTests` 同一姿态，本命令专用取证）。"""

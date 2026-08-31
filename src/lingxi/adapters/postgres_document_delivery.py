@@ -140,6 +140,13 @@ class DocumentDeliveryClaim:
     # `DocumentDeliveryClaim(...)` 的调用点不传这个字段即等价于"没有 markdown
     # 原文"，与新增列之前逐字相同的行为。
     markdown: str | None = None
+    # 迁移 0082（Issue #499）：非 None 即"这一行的正文已经被降级成纯文本段落
+    # 路径写入"，取值是原因码。**认领时就要读出来**，因为检查点恢复路径
+    # （`read_body_children` 判定正文已写、直接跳过写正文步）永远不会再调用一次
+    # `write_body`，拿不到那次调用的内存信号——不从库里带进来，这条路径就会发出
+    # 不带降级说明的"文档已生成"，退回成裁定明令消灭的静默降级。默认 None 让
+    # 既有直接构造 `DocumentDeliveryClaim(...)` 的调用点（测试）零改动。
+    body_degraded_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,10 @@ class UnnotifiedSuccess:
     时要拼哪种链接同样要看类型——docx 本地拼接（不需要 ``resource_url``），
     sheet 直接读这一列（建表时已经落检查点，见
     :meth:`PostgresDocumentDeliveryStore.mark_document_created`）。
+
+    ``body_degraded_reason``（迁移 0082，Issue #499）：补发时要选哪条文案同样
+    要看它——非 ``None`` 说明这一行的正文是降级写进去的，必须补发**明示降级**
+    的那条就绪文案，而不是普通就绪文案。
     """
 
     id: str
@@ -161,6 +172,10 @@ class UnnotifiedSuccess:
     document_id: str
     delivery_type: str
     resource_url: str | None
+    # 迁移 0082（Issue #499）：补发通知是另一次进程调用，看不到原发送路径那次
+    # `write_body` 的内存信号——不带上这一列，补发出去的就是不含"格式已简化"
+    # 说明的就绪通知（静默降级）。
+    body_degraded_reason: str | None = None
 
 
 def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
@@ -176,6 +191,7 @@ def _row_to_claim(row: tuple[Any, ...]) -> DocumentDeliveryClaim:
         delivery_type=row[7],
         resource_url=row[8],
         markdown=row[9],
+        body_degraded_reason=row[10],
     )
 
 
@@ -208,7 +224,7 @@ class PostgresDocumentDeliveryStore:
                       LIMIT %s
                  )
                 RETURNING id, task_id, requester_open_id, title, paragraphs, document_id, attempts,
-                          delivery_type, resource_url, markdown
+                          delivery_type, resource_url, markdown, body_degraded_reason
                 """,
                 (max_attempts, limit),
             )
@@ -241,6 +257,38 @@ class PostgresDocumentDeliveryStore:
                  WHERE id = %s AND status = 'processing' AND document_id IS NULL
                 """,
                 (document_id, resource_url, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise DocumentDeliveryOwnershipLost(request_id)
+
+    def mark_body_degraded(self, *, request_id: str, reason: str) -> None:
+        """检查点：正文已经**降级**写入（迁移 0082，Issue #499）——落
+        ``body_degraded_reason``，单独提交，不与后续"授权/读回/落终态"共享事务。
+
+        姿态与 :meth:`mark_document_created` 一致，理由也一致：这是一件"外部
+        已经发生、本地必须记住"的事实，晚一步提交就可能被一次崩溃带走。差别
+        只在守卫——建档那一步用 ``document_id IS NULL`` 防止覆盖已经建出来的
+        文档标识；这里不需要那道守卫，因为同一行的降级原因码在同一次交付里只
+        会由唯一一次 ``write_body`` 调用产生，重复写入同一个值是幂等的。
+
+        ``status = 'processing'`` 守卫保留：命中 0 行说明这一行的持有权已经不在
+        本次调用手里（典型是被 ``reclaim_stale_processing`` 回收过的慢消费者），
+        抛出 :class:`DocumentDeliveryOwnershipLost` 让调用方当场中止，不继续
+        授权/读回/通知——同 :meth:`mark_document_created` 的 P1-2 处置。
+
+        **不在这里顺手把 ``NULL`` 写回去**：本方法只在真的降级时被调用，没有
+        "取消降级"这个动作。一行的正文写过就不会再写第二遍（检查点幂等判据），
+        因此不存在"上次降级、这次没降级"需要清位的场景。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE task_document_delivery_request
+                   SET body_degraded_reason = %s, updated_at = now()
+                 WHERE id = %s AND status = 'processing'
+                """,
+                (reason, request_id),
             )
             if cursor.rowcount != 1:
                 raise DocumentDeliveryOwnershipLost(request_id)
@@ -281,7 +329,8 @@ class PostgresDocumentDeliveryStore:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, task_id, requester_open_id, document_id, delivery_type, resource_url
+                SELECT id, task_id, requester_open_id, document_id, delivery_type, resource_url,
+                       body_degraded_reason
                   FROM task_document_delivery_request
                  WHERE status = 'succeeded' AND notified_at IS NULL
                    AND document_id IS NOT NULL
@@ -474,7 +523,9 @@ class PostgresDocumentDeliveryStore:
         形态，信息量不小于 ``paragraphs``，同一次擦除必须一起清，不能只擦段落列却
         把原文留在库里过期不清）；``status``/``document_id``/``attempts``/
         ``last_error``/时间戳留下——它们是"谁在什么时候请求过一份文档、结果如何"
-        这类运行事实，本身不含用户资料，形状照 ``adapters/postgres_permission_
+        这类运行事实，本身不含用户资料（迁移 0082 的
+        ``body_degraded_reason`` 同属这一类：一个固定枚举形状的原因码，不含任何
+        用户内容，因此同样不在擦除范围内），形状照 ``adapters/postgres_permission_
         publish.py`` 的 ``redact_expired_payloads``（那张表擦 ``payload`` 成
         ``'{}'::jsonb``，这里擦成空字符串/空数组/``NULL``——三者都是迁移
         0074/0079 那条形状 CHECK 认可的"擦除态"；``markdown`` 擦成 ``NULL`` 而不是

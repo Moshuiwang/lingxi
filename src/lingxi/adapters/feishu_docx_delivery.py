@@ -118,10 +118,14 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   2. 存在任意一个块的 ``block_id`` 不在 ``first_level_block_ids`` 内（典型
      场景：表格等嵌套结构——表格自身是一级块，但它的单元格是作为独立元素
      出现在 ``blocks`` 数组里、却不出现在 ``first_level_block_ids`` 里的
-     子块）→ ``unsupported_nested_blocks``。本仓库当前只支持"结果是一份
-     纯一级块序列"的 markdown（标题、列表、正文段落等），**不支持任何带
-     嵌套结构的 markdown**（表格是已知的第一个例子）——这是一个已登记的
-     后续扩展点，不是本次修复的交付范围。
+     子块）→ :data:`UNSUPPORTED_NESTED_BLOCKS`。本仓库当前只支持"结果是
+     一份纯一级块序列"的 markdown（标题、列表、正文段落等），**不支持任何
+     带嵌套结构的 markdown**（表格是已知的第一个例子）——这是一个已登记的
+     后续扩展点，不是本次修复的交付范围。**这个码是全模块唯一会被
+     :meth:`LarkDocxDelivery.write_body` 捕获并转成明示降级的原因码**
+     （Issue #499），其余原因码一律照旧向上抛出。已知触发面只穷举到
+     markdown 表格；引用块、嵌套列表等其它嵌套形态是否同样命中，本仓库**未做
+     逐形态探针**，不得声称"只有表格会命中"。
      若 ``first_level_block_ids`` 引用了一个在 ``blocks`` 数组里找不到的
      ``block_id``（响应内部不自洽，理论上不应发生），归类为「结果不明」
      ``LookupError``，同 :meth:`read_body_children` 既有的"响应形状不对但
@@ -166,11 +170,16 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   实际可执行的分支——``markdown_convert_enabled=False``（构造函数自身的参数
   默认值；真正生效的值由装配层 ``apps/gateway/config.py`` 显式传入，见下一条）
   时逐字调用 :meth:`write_paragraphs`；为 ``True`` 时改走
-  :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
-  开关打开时任何一步失败（业务错误码、结果不明、超过 block 数上限）都直接向
-  上抛出，**绝不捕获后静默退回纯文本段落路径**——静默降级会制造"用户以为拿到
-  了带格式的文档，实际收到的是转换失败前的另一种内容"这种更难排查的假象，
-  与本模块 :meth:`_data` 一贯的"绝不静默降级"姿态一致。
+  :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。返回
+  :class:`WriteBodyOutcome`（Issue #499）——调用方据此知道这次是不是降级写的。
+  开关打开时的失败**只有一个例外会被捕获**：
+  :data:`UNSUPPORTED_NESTED_BLOCKS`（含表格等嵌套结构）时改走纯文本段落路径
+  并在返回值里明示降级；其余一切（业务错误码、结果不明、超过 block 数上限、
+  其它 ``markdown_convert_*`` 对账码）仍然直接向上抛出。**降级必须明示，不得
+  静默**——静默降级会制造"用户以为拿到了带格式的文档，实际收到的是转换失败前
+  的另一种内容"这种更难排查的假象；产品负责人 2026-08-31 裁定用"降级 + 如实
+  告知"取代"整次失败"，取代的是失败结论，不是"必须让用户知道"这条纪律，完整
+  理由与安全前提见 :meth:`LarkDocxDelivery.write_body` 文档字符串。
 - **开关本身不是环境变量**：`adapters/` 不直接读 ``os.environ``（[代码框架
   「三、横切约定」](../../../../docs/技术设计/代码框架.md)的硬性约束），
   ``markdown_convert_enabled`` 是构造函数参数——真正的环境变量
@@ -208,6 +217,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -252,6 +262,42 @@ _CONVERT_RESPONSE_READONLY_BLOCK_KEYS = ("block_id", "parent_id", "children")
 #: 不分批插入——理由见模块文档「markdown 官方转换开关」一节：分批会打破
 #: :meth:`LarkDocxDelivery.read_body_children` 判据依赖的"正文一次写入"假设。
 MAX_CONVERTED_BLOCKS = 1000
+
+#: 官方转换端点判定"这份 markdown 含本仓库不支持的嵌套结构"（典型是表格：表格
+#: 自身是一级块，单元格却作为独立元素出现在 ``blocks`` 数组里、不在
+#: ``first_level_block_ids`` 内）时的原因码。**独立成常量而不是散落的字面量**：
+#: 它现在同时是抛出点（:meth:`LarkDocxDelivery.convert_markdown_to_blocks`）与
+#: 唯一捕获点（:meth:`LarkDocxDelivery.write_body` 的明示降级分支，Issue #499）
+#: 的判据，两处必须逐字一致——写成两个字面量时，任何一侧改名都会让降级分支
+#: 悄悄失效、退回"整次交付失败"，而没有任何东西会红。
+UNSUPPORTED_NESTED_BLOCKS = "unsupported_nested_blocks"
+
+
+@dataclass(frozen=True)
+class WriteBodyOutcome:
+    """:meth:`LarkDocxDelivery.write_body` 的返回值：这次正文到底是按哪条路径
+    写进去的（Issue #499 明示降级）。
+
+    ``degraded_reason``：``None`` = 按调用方要求的路径原样写入（转换开关关时
+    的段落路径，或开关开时的官方转换路径），没有任何降级；非 ``None`` = 官方
+    转换被飞书**确定性拒绝**（当前唯一取值 :data:`UNSUPPORTED_NESTED_BLOCKS`），
+    正文已经改用纯文本段落路径写入，**用户拿到的排版与他本该拿到的不同**。
+
+    **为什么必须有返回值、而不是让适配器自己把降级咽下去**：本模块此前的姿态
+    是"转换失败一律向上抛，绝不静默退回段落路径"，理由是静默降级会制造"用户
+    以为拿到了带格式的文档、实际收到另一种内容"的假象。产品负责人 2026-08-31
+    就 Issue #499 裁定改为**降级交付**（含表格的回答此前 18.2% 整次交付失败，
+    实测见该 issue W0-1 评论），但这条裁定的成立条件是**把"静默降级"换成
+    "明示降级"**——调用方必须知道这次降级了，才能如实告知用户格式已简化。
+    这个返回值就是那条跨模块信号；调用方（``apps/gateway/document_delivery.py``）
+    丢掉它，等于把裁定退化成当初被明令禁止的静默降级。
+    """
+
+    degraded_reason: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.degraded_reason is not None
 
 
 class FeishuDocxDeliveryError(RuntimeError):
@@ -547,7 +593,7 @@ class LarkDocxDelivery:
         for block in mapping_blocks:
             block_id = block.get("block_id")
             if not isinstance(block_id, str) or block_id not in first_level_ids:
-                raise FeishuDocxDeliveryError("unsupported_nested_blocks", definite=True)
+                raise FeishuDocxDeliveryError(UNSUPPORTED_NESTED_BLOCKS, definite=True)
 
         by_block_id = {block["block_id"]: block for block in mapping_blocks}
         ordered_blocks: list[Mapping[str, Any]] = []
@@ -625,25 +671,78 @@ class LarkDocxDelivery:
             "飞书 docx 正文已按官方转换写入 document_id_len=%s block数=%s", len(doc_id), len(children)
         )
 
-    def write_body(self, document_id: str, *, paragraphs: Sequence[str], markdown: str) -> None:
+    def write_body(
+        self, document_id: str, *, paragraphs: Sequence[str], markdown: str
+    ) -> WriteBodyOutcome:
         """写正文的唯一装配入口：把「markdown 官方转换开关」变成实际可执行的
-        分支（模块文档同名一节）。
+        分支（模块文档同名一节），并把"这次是不是降级写的"作为
+        :class:`WriteBodyOutcome` 返回给调用方。
 
         ``markdown_convert_enabled=False``（构造函数默认值）时逐字调用
-        :meth:`write_paragraphs`——本 Story 交付后各现网调用路径的默认行为
-        零变化。为 ``True`` 时改走 :meth:`convert_markdown_to_blocks` +
-        :meth:`write_blocks`：这条路径上任何一步失败（业务错误码、结果不明、
-        超过 block 数上限）都直接向上抛出，**绝不捕获后静默退回纯文本段落
-        路径**——静默降级会制造"用户以为拿到了带格式的文档，实际收到的是
-        转换失败前的另一种内容"这种更难排查的假象，与 :meth:`_data` 一贯的
-        "绝不静默降级"姿态一致。
+        :meth:`write_paragraphs`，返回 ``degraded_reason=None``——不是降级，
+        是这套部署本来就要求的路径。为 ``True`` 时改走
+        :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
+
+        **唯一的降级分支（Issue #499，产品负责人 2026-08-31 裁定）**：
+        :meth:`convert_markdown_to_blocks` 抛出
+        :data:`UNSUPPORTED_NESTED_BLOCKS` 这**一个**原因码时，改用
+        :meth:`write_paragraphs` 交付纯文本段落，并返回
+        ``degraded_reason=UNSUPPORTED_NESTED_BLOCKS``。裁定依据：翻转
+        Issue #467 的默认值之后，含表格的回答从"降级但拿得到"变成"整次交付
+        失败"，实测 22 次投递里 4 次（18.2%）命中，其中 1 次来自最简单的
+        单公司/单指标/单月问题——用户要的是内容，格式损失可以如实告知，空手
+        而归的代价明显更大。
+
+        **这条捕获必须窄到这一个码，且必须只包住转换调用本身**，两条都是安全
+        前提，不是风格偏好：
+
+        1. 只捕这一个码——``too_many_blocks``/``markdown_convert_*``/飞书业务
+           错误码/``LookupError`` 全部维持原样向上抛。泛化成"捕获所有异常都
+           降级"会把真实故障（限流、权限缺失、响应形状不对）一并吞成"交付
+           成功"，那比原来的整次失败更糟。
+        2. ``try`` 只包 :meth:`convert_markdown_to_blocks`——转换端点**不写入
+           任何文档、没有外部副作用**，因此在它失败之后改走段落路径是安全的
+           （这篇文档此刻还是空的）。:meth:`write_blocks` 一旦发起就有副作用，
+           它的失败**绝不能**触发第二次写入：那会把同一份正文写两遍。把
+           ``try`` 缩到转换这一步，即使将来 :meth:`write_blocks` 也开始抛同一
+           个码，这条约束也仍然成立。
+
+        **降级不等于可以不告诉用户。** 本方法此前的文档字符串写的是"绝不捕获
+        后静默退回纯文本段落路径"，理由是静默降级会制造"用户以为拿到了带格式
+        的文档、实际收到的是另一种内容"的假象。那条理由**至今成立**——被推翻
+        的只是"因此宁可整次失败"这个结论，不是"降级必须让用户知道"这条纪律。
+        返回值就是为此存在：调用方（``apps/gateway/document_delivery.py``）
+        必须接住它并改用明示降级的用户文案。**丢掉这个返回值 = 恢复成当初被
+        明令禁止的静默降级。**
+
+        **降级后的观感如实登记**：``paragraphs`` 由
+        ``core/execution/document_delivery.py::normalize_markdown`` 产出，它按
+        空行切段、段内换行折叠成空格且不剥离 markdown 语法字符——因此表格会被
+        拍平成一段长文本，``|---|`` 这类分隔行会原样留在正文里。**本降级解决
+        的是"拿不到"，不保证"好看"**，用户文案不得暗示格式完好。
         """
 
-        if self._markdown_convert_enabled:
-            blocks = self.convert_markdown_to_blocks(markdown)
-            self.write_blocks(document_id, blocks)
-        else:
+        if not self._markdown_convert_enabled:
             self.write_paragraphs(document_id, paragraphs)
+            return WriteBodyOutcome()
+
+        try:
+            blocks = self.convert_markdown_to_blocks(markdown)
+        except FeishuDocxDeliveryError as error:
+            if error.code != UNSUPPORTED_NESTED_BLOCKS:
+                raise
+            # 到这里为止没有发起过任何写入（转换端点无副作用），这篇文档仍然
+            # 是空的——改走段落路径不会重复交付内容。
+            logger.warning(
+                "飞书 docx 正文降级为纯文本段落路径 document_id_len=%s reason=%s",
+                len(document_id),
+                error.code,
+            )
+            self.write_paragraphs(document_id, paragraphs)
+            return WriteBodyOutcome(degraded_reason=error.code)
+
+        self.write_blocks(document_id, blocks)
+        return WriteBodyOutcome()
 
     def grant_full_access(self, document_id: str, open_id: str) -> None:
         """对 ``open_id`` 这个人授予文档级「可管理」（决策记录 2026-08-23 裁定的
@@ -741,9 +840,11 @@ __all__ = [
     "FULL_ACCESS_PERM",
     "MAX_CONVERTED_BLOCKS",
     "OPENID_MEMBER_TYPE",
+    "UNSUPPORTED_NESTED_BLOCKS",
     "USER_OPEN_ID_PREFIX",
     "FeishuDocxDeliveryError",
     "LarkDocxDelivery",
+    "WriteBodyOutcome",
     "REQUEST_TIMEOUT_SECONDS",
     "Transport",
     "urllib_transport",

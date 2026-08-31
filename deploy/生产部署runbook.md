@@ -37,6 +37,23 @@ scripts/ops/sync_db_env_from_credentials.sh \
 
 逐条通过 [`deploy/README.md`「部署前置检查」](README.md)的两项：七个文件均 `0600` 且属主为部署用户；部署机已用只读拉取身份登录 GHCR。任一项不符不得执行下一步。
 
+**外加一项就绪检查（[Issue #499](https://github.com/Moshuiwang/lingxi/issues/499)，rc23）**：确认 `.env.prod.gateway` 里 `LINGXI_DOCX_MARKDOWN_CONVERT` 的**实际取值**与本仓库当前结论一致——
+
+```bash
+# 只列这一行配置本身，不打印文件其余内容；该变量不是凭据
+grep -n '^LINGXI_DOCX_MARKDOWN_CONVERT' deploy/.env.prod.gateway || echo '未设置（= 开启，代码默认值）'
+```
+
+判据（三选一，都是合法结论，但必须**是有意选的**，不是漏配的结果）：
+
+| 实际取值 | 生效状态 | 用户可见后果 |
+|---|---|---|
+| 未设置 或 `1` | 官方 markdown→blocks 转换**开启**（[#467](https://github.com/Moshuiwang/lingxi/issues/467) 起的代码默认值） | 正文带官方排版；回答里含表格等不支持的嵌套结构时**降级交付纯文本段落并如实告知格式已简化**（[#499](https://github.com/Moshuiwang/lingxi/issues/499)），不再整次失败 |
+| `0` | 转换**关闭** | 正文一律走纯文本段落路径，没有官方排版，也不会出现降级提示 |
+| 其余任何非空值 | **启动即失败** | gateway 起不来——错配不是未配 |
+
+不符合上表任一行，或取值与本次发布意图不一致时，先改配置再继续，不得带着未确认的取值起服务。
+
 ### 2.3 迁移
 
 ```bash

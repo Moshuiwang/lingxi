@@ -775,6 +775,82 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
         self.assertEqual(trace.task_failure_signature, "psycopg.errors.OperationalError")
         self.assertTrue(trace.task_ended_at)
 
+    def test_trace_carries_document_delivery_degradation_from_the_checkpoint(self) -> None:
+        """Issue #499 真库往返：任务成功后由 gateway 独立写入的文档降级检查点，
+        必须能沿 ``trace_id`` 查回；否则管理员只看到 task 成功，会把格式已简化
+        静默成普通文档成功。"""
+
+        self.add_user(user_id="usr_doc", open_id="ou_doc", provisioning_state="active")
+        self.add_event(
+            event_id="evt_doc",
+            open_id="ou_doc",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_doc",
+        )
+        self.add_task(
+            task_id="tsk_doc",
+            user_id="usr_doc",
+            inbound_event_id="evt_doc",
+            status="succeeded",
+            error_kind=None,
+            failure_code=None,
+            failure_signature=None,
+        )
+        self.execute(
+            """INSERT INTO task_document_delivery_request
+                 (id, task_id, requester_open_id, title, paragraphs, status,
+                  document_id, permission_confirmed_at, content_expires_at,
+                  body_degraded_reason)
+               VALUES ('tdd_doc', 'tsk_doc', 'ou_doc', '标题', '[\"正文\"]'::jsonb,
+                       'succeeded', 'docx_doc', now(), now() + interval '1 day',
+                       'unsupported_nested_blocks')"""
+        )
+
+        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="trc_doc")
+
+        assert trace is not None
+        self.assertEqual(trace.task_status, "succeeded")
+        self.assertEqual(trace.document_delivery_status, "succeeded")
+        self.assertIsNone(trace.document_delivery_last_error)
+        self.assertEqual(trace.document_body_degraded_reason, "unsupported_nested_blocks")
+
+    def test_trace_carries_document_delivery_failure_when_task_succeeded(self) -> None:
+        """文档投递失败与问数任务收口是两条独立状态机；trace 查询不能用 task 的
+        成功状态遮住用户未拿到文档的事实。"""
+
+        self.add_user(user_id="usr_doc_failed", open_id="ou_doc_failed", provisioning_state="active")
+        self.add_event(
+            event_id="evt_doc_failed",
+            open_id="ou_doc_failed",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_doc_failed",
+        )
+        self.add_task(
+            task_id="tsk_doc_failed",
+            user_id="usr_doc_failed",
+            inbound_event_id="evt_doc_failed",
+            status="succeeded",
+            error_kind=None,
+            failure_code=None,
+            failure_signature=None,
+        )
+        self.execute(
+            """INSERT INTO task_document_delivery_request
+                 (id, task_id, requester_open_id, title, paragraphs, status,
+                  document_id, content_expires_at, last_error)
+               VALUES ('tdd_doc_failed', 'tsk_doc_failed', 'ou_doc_failed', '标题',
+                       '[\"正文\"]'::jsonb, 'failed', 'docx_doc_failed',
+                       now() + interval '1 day', 'permission_not_confirmed')"""
+        )
+
+        trace = PostgresAdminQueries(self._dsn).trace_lookup(trace_id="trc_doc_failed")
+
+        assert trace is not None
+        self.assertEqual(trace.task_status, "succeeded")
+        self.assertEqual(trace.document_delivery_status, "failed")
+        self.assertEqual(trace.document_delivery_last_error, "permission_not_confirmed")
+        self.assertIsNone(trace.document_body_degraded_reason)
+
     def test_trace_without_any_task_reports_none_not_a_fabricated_row(self) -> None:
         """否定测试：这条追溯号没有派生任务（管理命令、未开通用户、重复投递
         都不入队）时五个字段全为 ``None``，不编造一行——否则上一条用例用一个
