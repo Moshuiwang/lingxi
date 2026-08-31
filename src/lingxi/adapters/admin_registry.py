@@ -230,6 +230,24 @@ class PostgresAdminQueries:
         （首次开通首聊），取最近一条只是为了在理论上出现多条时不崩溃，不是
         本命令承诺聚合展示全部历史事件——完整时间线仍然是 ``/admin audit``
         与 ``python -m lingxi.apps.trace`` 的职责。
+
+        「任务收口结果」（Issue #495）是第三次查询：``task`` JOIN
+        ``inbound_event``（``task.inbound_event_id`` = ``inbound_event.
+        feishu_event_id``，两者之间**没有外键**，理由见迁移 ``0057`` 文件头部）。
+        补的是一个此前结构性不可达的洞——worker 与 gateway 是两个独立部署的
+        进程，任务失败的分类码与底层异常类型名只进 worker 容器自己的 stderr
+        （``worker.task.terminal``），管理员在飞书私聊里永远看不到；迁移
+        ``0080`` 把它们落进 ``task`` 两列之后，这条 JOIN 就是管理员自助拿到
+        「这次问数为什么失败」的路径。同样取**最近一个**任务：一条入站事件
+        正常只派生一个任务，重试与心跳回收都复用同一行，取最近一个只是不崩溃
+        的兜底。
+
+        **已知取舍（如实登记）**：``inbound_event.trace_id`` 与
+        ``task.inbound_event_id`` 都没有索引，这条 JOIN 在大表上是顺序扫描。
+        可以接受——``/admin trace`` 是管理员手工发起的低频命令（不是任何循环
+        或定时职责的一部分），而 ``task`` 受 90 天保留清理约束、体量有界；为
+        一条手工命令新建两个索引会给每一次入队与每一次终态写入都加上维护
+        成本，不划算。此处不新建索引是有意选择，不是遗漏。
         """
 
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
@@ -253,6 +271,7 @@ class PostgresAdminQueries:
 
         status = self.user_status(identifier=last_open_id) if last_open_id else None
         failure = fetch_failure_reason(self._dsn, trace_id=trace_id, timeouts=self._timeouts)
+        task = self._trace_task(trace_id=trace_id)
 
         return AdminTraceView(
             trace_id=trace_id,
@@ -266,7 +285,41 @@ class PostgresAdminQueries:
             failure_reason=failure.failure_reason if failure is not None else None,
             failure_event_type=failure.event_type if failure is not None else None,
             failure_occurred_at=failure.occurred_at if failure is not None else None,
+            task_status=task[0] if task is not None else None,
+            task_error_kind=task[1] if task is not None else None,
+            task_failure_code=task[2] if task is not None else None,
+            task_failure_signature=task[3] if task is not None else None,
+            task_ended_at=_isoformat(task[4]) if task is not None and task[4] is not None else None,
         )
+
+    def _trace_task(
+        self, *, trace_id: str
+    ) -> tuple[str, str | None, str | None, str | None, object] | None:
+        """按追溯号取这条入站事件派生的**最近一个**任务的收口结果（Issue #495）。
+
+        查不到返回 ``None``——这条追溯号没有派生任何任务是完全正常的情形
+        （管理命令、未开通用户、重复投递事件都不入队），不是错误，调用方据此
+        在回显里省掉整段而不是显示一堆空值。
+        """
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT task.status, task.error_kind, task.failure_code,
+                       task.failure_signature, task.ended_at
+                  FROM task
+                  JOIN inbound_event
+                    ON inbound_event.feishu_event_id = task.inbound_event_id
+                 WHERE inbound_event.trace_id = %s
+                 ORDER BY task.created_at DESC
+                 LIMIT 1
+                """,
+                (trace_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1], row[2], row[3], row[4])
 
     def resolve_identifier(self, *, identifier: str) -> str:
         """把邮箱形态的标识反查成 open_id（#439 A 档）；见 ``core/admin/router.

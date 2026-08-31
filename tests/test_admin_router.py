@@ -872,7 +872,11 @@ class QueryTraceCommandTests(unittest.TestCase):
 
     def test_trace_without_failure_reason_reported_honestly(self) -> None:
         """追溯号存在（例如成功开通、或仍在进行中）但没有失败记录：如实回
-        「无失败记录」并带上能查到的开通状态，不是假装这条追溯号也查无此人。"""
+        「无开通失败记录」并带上能查到的开通状态，不是假装这条追溯号也查无此人。
+
+        Issue #495 起这句话由「无失败记录」改成「无开通失败记录」：同一条回复
+        里现在可能同时出现"开通没失败"与"问数任务失败了"，旧措辞会与紧随其后
+        的「任务结果: 失败」直接打架。"""
 
         trace_id = new_ulid()
         queries = FakeQueries(
@@ -899,7 +903,7 @@ class QueryTraceCommandTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("无失败记录", outcome.reply_text)
+        self.assertIn("无开通失败记录", outcome.reply_text)
         # Trace #469 S-1：英文状态码翻译成中文。
         self.assertIn("已开通", outcome.reply_text)
         self.assertNotIn("查无此追溯号", outcome.reply_text)
@@ -1006,6 +1010,106 @@ class QueryTraceCommandTests(unittest.TestCase):
         self.assertIn(
             "some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text
         )
+
+    def _trace_view(self, trace_id: str, **overrides: object) -> AdminTraceView:
+        values: dict[str, object] = {
+            "trace_id": trace_id,
+            "event_count": 1,
+            "first_received_at": "2026-08-31T01:00:00+00:00",
+            "last_event_type": "im.message.receive_v1",
+            "last_handled_as": "task_queued",
+            "dispatched": True,
+            "provisioning_state": "active",
+            "account_state": "enabled",
+            "failure_reason": None,
+            "failure_event_type": None,
+            "failure_occurred_at": None,
+        }
+        values.update(overrides)
+        return AdminTraceView(**values)  # type: ignore[arg-type]
+
+    def _trace_reply(self, **overrides: object) -> str:
+        trace_id = new_ulid()
+        queries = FakeQueries(traces={trace_id: self._trace_view(trace_id, **overrides)})
+        router, _, _, _ = _router(queries=queries)
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+        self.assertTrue(outcome.handled)
+        return outcome.reply_text
+
+    def test_task_failure_is_reported_with_a_readable_reason_and_the_exception_type(
+        self,
+    ) -> None:
+        """Issue #495 完成标准 4：管理员凭追溯号就能拿到「这次问数为什么失败」的
+        可读原因，不必再去检索 worker 容器日志（他根本没有那个权限）。
+
+        翻译口径与 Trace #469 修复包 B 一致：状态与失败码换中文，底层异常
+        **类型名**原样展示（第三方库类名没有可枚举取值域，翻译只能靠猜；原样
+        贴给研发就是最有用的一手信息）。
+
+        **变异验红**（已实测）：删掉 ``_render_trace`` 里
+        ``trace.task_status is not None`` 那一段，本用例由绿转红。恢复后复绿。"""
+
+        reply = self._trace_reply(
+            task_status="failed",
+            task_error_kind="session_failed",
+            task_failure_code="session_failed",
+            task_failure_signature="psycopg.errors.OperationalError",
+            task_ended_at="2026-08-31T01:02:03+00:00",
+        )
+
+        self.assertIn("任务结果: 失败", reply)
+        self.assertIn("2026-08-31T01:02:03+00:00", reply)
+        self.assertIn("会话执行失败（未分类，见底层异常）", reply)
+        self.assertIn("psycopg.errors.OperationalError", reply)
+
+    def test_a_trace_without_any_task_omits_the_task_section_entirely(self) -> None:
+        """否定测试：这条追溯号没有派生任务（管理命令、未开通用户、重复投递都
+        不入队）时整段省略，不摆一排空值——否则上一条用例用一个恒真实现也能过。"""
+
+        reply = self._trace_reply()
+
+        self.assertNotIn("任务结果", reply)
+        self.assertNotIn("任务失败原因", reply)
+        self.assertNotIn("底层异常类型", reply)
+
+    def test_a_successful_task_shows_its_status_without_inventing_a_failure(self) -> None:
+        """成功的任务只展示状态：``failure_code``/``failure_signature`` 在这种
+        终态下本来就是 ``NULL``（迁移 ``0080`` 的精确语义），不得凭空补一行
+        「失败原因」。"""
+
+        reply = self._trace_reply(task_status="succeeded", task_ended_at="2026-08-31T01:02:03+00:00")
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertNotIn("任务失败原因", reply)
+        self.assertNotIn("底层异常类型", reply)
+
+    def test_a_failure_without_a_failure_code_falls_back_to_the_error_kind(self) -> None:
+        """没有经过 ``write_terminal_event`` 的失败终态（心跳超时回收、投递到期、
+        排队超时，写入方是 ``_queue_lifecycle.py``）在 ``failure_code`` 列上恒为
+        ``NULL``——回显必须退回 ``error_kind``，不能因此整行消失、让管理员看到
+        一个没有任何原因的「任务结果: 失败」。
+
+        **变异验红**（已实测）：把 ``_render_trace`` 里的
+        ``trace.task_failure_code or trace.task_error_kind`` 改回只看
+        ``task_failure_code``，本用例由绿转红。恢复后复绿。"""
+
+        reply = self._trace_reply(
+            task_status="failed", task_error_kind="retry_exhausted", task_failure_code=None
+        )
+
+        self.assertIn("任务失败原因: 重试次数耗尽", reply)
+
+    def test_an_unregistered_task_failure_code_falls_back_to_the_visible_marker(self) -> None:
+        """未登记的失败码（未来新增但词表忘了同步）走与本文件其余词表同一条
+        回退：原值 + 「未登记显示名」，不崩、不假装认识。"""
+
+        reply = self._trace_reply(
+            task_status="failed", task_failure_code="some_future_failure_code"
+        )
+
+        self.assertIn("some_future_failure_code（未登记显示名）", reply)
 
     def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
         """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询

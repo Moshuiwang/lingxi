@@ -574,6 +574,71 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "session_failed")
 
+    def test_the_unclassified_fallback_records_the_exception_type_as_a_signature(self) -> None:
+        """Issue #495：``turn.py`` 那条兜底 ``except`` 分支（把任何未分类的 SDK
+        异常收敛成 ``session_failed`` 一个词）必须在报告里额外留下底层异常的
+        **类型限定名**——它是 queue 链路唯一会进低敏审计日志与 ``task`` 落库列的
+        那一段，也是 2026-08-31 浸泡窗口里 6 条无法归因失败缺的那条线索。
+
+        分类结论本身**不变**（仍是 ``session_failed``，用户可见文案因此逐字
+        不变），变的只是"还留不留得下线索"。
+
+        **变异验红**（已实测）：把 ``report_extraction.failure_with_signature``
+        的返回值去掉 ``"signature"`` 这一项（``turn.py::_failure`` 就是它的调用
+        方之一），本用例由绿转红。恢复后复绿。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        signatures = []
+        for error in (
+            RuntimeError("connection reset by peer"),
+            OSError("[Errno 28] No space left on device"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+                sdk.raise_after_steps = error
+                sdk.install(self)
+
+                executor = WorkerTurnExecutor(load_config(worker_env()))
+                report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+                self.assertEqual(report["failure"]["code"], "session_failed")
+                self.assertEqual(report["failure"]["signature"], type(error).__name__)
+                signatures.append(report["failure"]["signature"])
+
+        self.assertEqual(len(set(signatures)), 2, f"两种底层异常必须可区分，实际={signatures}")
+
+    def test_the_signature_carries_the_type_only_never_the_exception_text(self) -> None:
+        """Issue #495 完成标准 2：异常正文里的外部标识原值不得随签名外流。
+
+        样式取真实形状（psycopg 唯一约束冲突的异常串），与 rc22 opus 审查 P2-5
+        对 ``event.pipeline_failed`` 的处置同一口径——``failure.message`` 那一份
+        是既有行为（只在 turn 模式的 stdout 报告里，经 ``redact_free_text``），
+        本条断言守的是**新增**的 ``signature`` 字段：它是唯一会离开 worker 进程
+        进入日志与数据库的那一段，必须只含类型名。
+
+        **变异验红**（已实测）：让 ``exception_failure_signature`` 返回
+        ``f"{type(error).__name__}: {error}"``，本用例由绿转红。恢复后复绿。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = RuntimeError(
+            'duplicate key value violates unique constraint "app_user_feishu_open_id_key"\n'
+            "DETAIL:  Key (feishu_open_id)=(ou_fake0123456789) already exists."
+        )
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertEqual(report["failure"]["signature"], "RuntimeError")
+        self.assertNotIn("ou_fake0123456789", report["failure"]["signature"])
+
 
 class SessionResumeFallbackTest(unittest.TestCase):
     """会话 resume 失配自动降级（2026-08-27 生产事故 #2）。

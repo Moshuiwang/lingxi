@@ -50,6 +50,7 @@ from lingxi.core.innertest_content_capture import ContentCaptureRecord, RawTurnC
 
 from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
+from .report_extraction import failure_with_signature
 
 _MAX_FAILURE_TEXT = 500
 
@@ -830,7 +831,12 @@ class WorkerTurnExecutor:
 def _failure(code: str, error: BaseException) -> dict[str, str]:
     # 异常正文可能带上连接串、路径或令牌，按自由文本脱敏后再截断。
     text = redact_free_text(f"{type(error).__name__}: {error}")[:_MAX_FAILURE_TEXT]
-    return {"code": code, "message": text}
+    # 失败签名（Issue #495）：只取异常**类型的限定名**，与 ``message`` 是两件不同
+    # 的东西——``message`` 停在这份报告里（turn 模式下随 stdout JSON 走），
+    # ``signature`` 是唯一会进入 queue 链路低敏审计日志与 ``task`` 落库列的那一段，
+    # 因此它必须只含源码标识符、不含任何异常正文。收敛口径照抄 rc22 opus 审查
+    # P2-5 对 ``event.pipeline_failed`` 的处置，见 ``report_extraction`` 该节说明。
+    return failure_with_signature(code, text, error)
 
 
 def _failure_message(code: str, message: str) -> dict[str, str]:
