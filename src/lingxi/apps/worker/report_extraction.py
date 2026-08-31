@@ -464,6 +464,10 @@ def sanitize_failure_signature(value: str) -> str:
 def _report_failure_signature(report: Mapping[str, Any]) -> str | None:
     """从一次回合报告里取出失败签名；没有（例如失败根本不来自异常）返回 ``None``。
 
+    通常签名是底层异常的限定类型名（Issue #495）；少数结构化外因也可以携带
+    稳定的分类签名，例如指标 MCP 的 ``mcp.query.http_502``。两种形状都必须经过
+    同一条白名单清洗，不能让跨进程报告把自由文本带进审计出口。
+
     ``None`` 是精确语义、不是"以后补"：``turn_timeout``/``drain_timeout``/
     ``cancelled`` 这些失败码本身已经把原因说全了，没有底层异常可签名，编一个
     占位符只会让"有签名"这件事失去信息量。

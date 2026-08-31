@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-31-4"
+version = "2026-08-31-5"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -123,6 +123,7 @@ version = "2026-08-31-4"
 "worker.stopped" = "任务已停止。"
 "worker.stopped_result" = "任务已停止。已产生的结果：{result}"
 "worker.failed" = "本次任务未取得可用结果，请稍后重试。"
+"worker.mcp_bad_gateway" = "指标服务暂时不可用，本次未取得可用结果。请稍后重试；如持续出现，请联系管理员。"
 "worker.side_effect_uncertain" = "任务结果未能确认，未自动重试，请稍后重试。"
 "worker.context_too_long" = "当前对话过长，请使用 `/new` 开始新会话"
 # 2026-08-23 真实故障：未加窄过滤的指标查询返回体过大（约 9.3MB），此前被压平成

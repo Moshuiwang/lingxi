@@ -1294,6 +1294,7 @@ class WorkerServiceTests(unittest.TestCase):
             # 2026-08-23 真实故障：回执超过 SDK 读流缓冲上限（result_too_large，
             # 分类在 apps/worker/turn.py）同样不得压平成「请稍后重试」。
             (False, "result_too_large", "failed", "result_too_large", "worker.result_too_large"),
+            (False, "mcp_bad_gateway", "failed", "mcp_bad_gateway", "worker.mcp_bad_gateway"),
         ):
             with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
                 queue = FakeWorkerQueue(stopped=stopped)
@@ -1317,6 +1318,43 @@ class WorkerServiceTests(unittest.TestCase):
                 self.assertEqual(
                     terminal["content"], default_content_catalog().text(expected_content_key).text
                 )
+
+    def test_mcp_bad_gateway_terminal_is_actionable_and_not_duplicated(self) -> None:
+        queue = FakeWorkerQueue()
+        sink = RecordingTerminalOutcomeSink()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {
+                        "code": "mcp_bad_gateway",
+                        "signature": "mcp.query.http_502",
+                    },
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+
+        asyncio.run(service.process_once())
+        # claim() 已经把任务移出可领取集合；重复巡检不得再写终态或回调一次。
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(queue.terminals), 1)
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "mcp_bad_gateway")
+        self.assertEqual(terminal["failure_code"], "mcp_bad_gateway")
+        self.assertEqual(terminal["failure_signature"], "mcp.query.http_502")
+        self.assertEqual(
+            terminal["content"], default_content_catalog().text("worker.mcp_bad_gateway").text
+        )
+        self.assertEqual(len(sink.calls), 1)
+        self.assertEqual(len([event for event in queue.events if event["event_type"] == "terminal"]), 0)
 
     def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
         """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成

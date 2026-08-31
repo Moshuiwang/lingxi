@@ -214,6 +214,15 @@ class FailureTopHumanizationTests(unittest.TestCase):
         self.assertNotIn("turn_timeout", text)
         self.assertNotIn("max_turns_exceeded", text)
 
+    def test_mcp_bad_gateway_reason_is_rendered_as_a_distinct_actionable_label(self) -> None:
+        top = (FailureReasonCount("mcp_bad_gateway", 2),)
+        inputs = _all_determined_inputs(failure_top=top)
+
+        text = render_daily_report(inputs)
+
+        self.assertIn("- 指标 MCP 网关返回 502：2 次", text)
+        self.assertNotIn("mcp_bad_gateway", text)
+
     def test_known_reason_code_stays_humanized_when_throttled(self) -> None:
         top = (FailureReasonCount("session_failed", 5),)
         inputs = _all_determined_inputs(failure_top=top)

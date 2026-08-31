@@ -1064,6 +1064,18 @@ class QueryTraceCommandTests(unittest.TestCase):
         self.assertIn("会话执行失败（未分类，见底层异常）", reply)
         self.assertIn("psycopg.errors.OperationalError", reply)
 
+    def test_query_mcp_502_has_a_distinct_trace_reason_and_signature(self) -> None:
+        reply = self._trace_reply(
+            task_status="failed",
+            task_error_kind="mcp_bad_gateway",
+            task_failure_code="mcp_bad_gateway",
+            task_failure_signature="mcp.query.http_502",
+        )
+
+        self.assertIn("指标 MCP 网关返回 502（建连失败）", reply)
+        self.assertIn("失败签名: mcp.query.http_502", reply)
+        self.assertIn("mcp.query.http_502", reply)
+
     def test_a_trace_without_any_task_omits_the_task_section_entirely(self) -> None:
         """否定测试：这条追溯号没有派生任务（管理命令、未开通用户、重复投递都
         不入队）时整段省略，不摆一排空值——否则上一条用例用一个恒真实现也能过。"""

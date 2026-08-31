@@ -161,6 +161,7 @@ _ERROR_KIND_LABEL: dict[str, str] = {
     "side_effect_uncertain": "执行结果不确定（需人工核实是否已生效）",
     "model_protocol_breakdown": "模型输出协议异常",
     "result_too_large": "查询结果过大",
+    "mcp_bad_gateway": "指标 MCP 网关返回 502",
     "session_failed": "会话执行失败",
     "stopped": "用户主动停止",
     "redacted_withheld": "内容因安全策略被拦截",
