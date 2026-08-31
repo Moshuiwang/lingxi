@@ -886,8 +886,16 @@ class PublishJobGuardTest(unittest.TestCase):
             if: needs.classify.outputs.mode == 'docs'
             steps:
               - run: scripts/ci/verify_docs.sh
+          l1:
+            name: Epic Full / l1
+            if: needs.classify.outputs.risk_level == 'l1'
+            steps:
+              - run: python3 scripts/ci/check_l1_assets.py
           gate:
-            if: needs.classify.outputs.mode != 'docs'
+            if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
+            steps:
+              - if: needs.classify.outputs.risk_level == 'l3'
+                run: python3 scripts/ci/check_permission_impact.py
           extras:
             strategy:
               matrix:
@@ -900,7 +908,7 @@ class PublishJobGuardTest(unittest.TestCase):
                 with:
                   name: epic-candidate-images-pr-1-abc
           candidate:
-            needs: [classify, docs, gate, extras, image]
+            needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
               - uses: actions/upload-artifact@sha
@@ -917,6 +925,11 @@ class PublishJobGuardTest(unittest.TestCase):
           docs:
             steps:
               - run: scripts/ci/verify_docs.sh
+          l1:
+            name: Story / content l1
+            if: needs.classify.outputs.risk_level == 'l1'
+            steps:
+              - run: python3 scripts/ci/check_l1_assets.py
           full:
             uses: ./.github/workflows/ci.yml
     """
@@ -986,7 +999,7 @@ class PublishJobGuardTest(unittest.TestCase):
 
     def test_candidate_must_need_all_full_legs(self) -> None:
         full = self.FULL.replace(
-            "needs: [classify, docs, gate, extras, image]", "needs: [classify, docs, gate, extras]"
+            "needs: [classify, docs, l1, gate, extras, image]", "needs: [classify, docs, l1, gate, extras]"
         )
         failures = self._with_workflows(full=full)
         self.assertTrue(any("candidate needs" in failure for failure in failures), failures)
