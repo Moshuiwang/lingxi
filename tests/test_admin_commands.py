@@ -285,6 +285,7 @@ class GrantSuppressPermissionParsingTests(unittest.TestCase):
 #: ULID，与 ``core/ids.new_id("lpo")`` 的生成形状逐字对应），供本文件的收回解析
 #: 用例复用——固定字面量而不是每个用例现生成一个，保持用例之间的期望值可读。
 _VALID_OVERRIDE_ID = "lpo_01JGFJJZ008XSHEADGG8V74SPC"
+_VALID_LEGACY_PERMISSION_GROUP_ID = "pac_01JGFJJZ008XSHEADGG8V74SPC"
 
 
 class RevokePermissionParsingTests(unittest.TestCase):
@@ -308,6 +309,15 @@ class RevokePermissionParsingTests(unittest.TestCase):
         )
         self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.reason, "离职 交接 期间 收回")
+
+    def test_legacy_pending_action_group_id_remains_a_group_target(self) -> None:
+        """0081 基线曾把职位组 ID 写成 ``pac_``；存量不迁移时仍须能撤销整组。"""
+
+        command = parse_admin_command(
+            f"/admin revoke_permission {_VALID_LEGACY_PERMISSION_GROUP_ID} 管理卡撤销"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(command.identifier, _VALID_LEGACY_PERMISSION_GROUP_ID)
 
     def test_case_insensitive_and_whitespace_tolerant(self) -> None:
         command = parse_admin_command(

@@ -100,6 +100,11 @@ _PERMISSION_REASON_MAX_LENGTH = 500
 #: open_id——前者按历史行定位，后者按一笔职位+公司范围授权整体定位。
 _OVERRIDE_ID_PREFIX = "lpo_"
 _PERMISSION_GROUP_ID_PREFIX = "lpg_"
+# The fixed-base implementation used the pending-action id (``pac_``) as the
+# group id for already-created position grants.  Keep accepting that legacy
+# shape so the no-data-migration decision does not strand existing group cards;
+# newly-created grants always use the dedicated ``lpg_`` prefix.
+_LEGACY_PERMISSION_GROUP_ID_PREFIX = "pac_"
 
 _COMMAND_PREFIX = "/admin"
 
@@ -448,7 +453,11 @@ def _is_override_id(token: str) -> bool:
     prefix = next(
         (
             candidate
-            for candidate in (_OVERRIDE_ID_PREFIX, _PERMISSION_GROUP_ID_PREFIX)
+            for candidate in (
+                _OVERRIDE_ID_PREFIX,
+                _PERMISSION_GROUP_ID_PREFIX,
+                _LEGACY_PERMISSION_GROUP_ID_PREFIX,
+            )
             if token.startswith(candidate)
         ),
         None,
@@ -471,7 +480,8 @@ def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
        resolve_override_id``），本模块只负责识别出"这是第二种形状"并原样透传三个
        字段，不做任何查库。
 
-    判据：第一个 token 是否符合 ``lpo_``/``lpg_`` + ULID 的形状
+    判据：第一个 token 是否符合 ``lpo_``/``lpg_`` + ULID 的形状（或基线已创建组的
+    ``pac_`` 兼容形状）
     （:func:`_is_override_id`）。
     两种形状的 token 数量域不重叠时也能分辨（形状 1 至少 2 个 token，形状 2 至少
     4 个），但判据本身用"第一个 token 长什么样"而不是"数了多少个 token"——后者会让

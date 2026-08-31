@@ -334,7 +334,12 @@ class PostgresPendingActionStore:
         pending_id = new_id("pac")
         is_local_permission_action = action_type in _DIRECTION_BY_ACTION_TYPE
         is_revoke_action = action_type is PendingActionType.LOCAL_PERMISSION_REVOKE
-        is_group_revoke_action = is_revoke_action and target_open_id.startswith("lpg_")
+        # 0081 基线曾把职位展开授权的 permission_group_id 写成 pending_action
+        # 的 pac_ id。新授权使用专用 lpg_ 前缀，但存量不迁移，所以旧组卡仍须按组
+        # 撤销，而不能被误当成历史 NULL 组的单行撤销。
+        is_group_revoke_action = is_revoke_action and target_open_id.startswith(
+            ("lpg_", "pac_")
+        )
         position_expansion = None
         if position_name is not None or company_scope is not None:
             if action_type is not PendingActionType.LOCAL_PERMISSION_GRANT:
