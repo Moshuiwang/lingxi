@@ -607,6 +607,79 @@ class ProdPendingHostSpecLimitsTest(unittest.TestCase):
         self.assertEqual(CONTRACT.check_resource_limits(), [])
 
 
+class ComposeInterpolationYamlSafetyTest(unittest.TestCase):
+    """PR #506 CI 实测教训：compose 的值先过 YAML 解析、再做 `${VAR}` 插值。
+
+    提示语里带一个 `（Issue #494）`——未加引号的 YAML 标量遇到「空格+#」就从那里
+    截断，`}` 被甩在解析结果之外，compose 报 `invalid interpolation format` 而不是
+    我们要的"变量缺失"，fail-fast 语义整条失效。这一类此前只有最晚的
+    `Epic Full / image` 作业才抓得到。
+    """
+
+    def _with_prod(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        prod = directory / "compose.prod.yaml"
+        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = prod
+        try:
+            return CONTRACT.check_compose_interpolation_is_yaml_safe()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+
+    def test_a_hash_inside_the_placeholder_is_caught(self) -> None:
+        """变异验红：这就是 PR #506 上炸掉 CI 的那一行的形状。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定 #494}\n"
+        )
+        self.assertTrue(any("行内注释" in f for f in failures), failures)
+
+    def test_a_colon_space_inside_the_placeholder_is_caught(self) -> None:
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定: 见 README}\n"
+        )
+        self.assertTrue(any("映射指示符" in f for f in failures), failures)
+
+    def test_an_unclosed_placeholder_is_caught(self) -> None:
+        failures = self._with_prod(
+            "worker-queue:\n  tmpfs:\n"
+            "    - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?待定\n"
+        )
+        self.assertTrue(any("没有闭合" in f for f in failures), failures)
+
+    def test_a_required_variable_missing_from_the_render_script_is_caught(self) -> None:
+        """变异验红（本次漏网的第二半）：新增一个 `${VAR:?}` 却忘了给
+        `verify_compose_structure.sh` 补占位值——那条渲染门禁会以"变量缺失"红，
+        而它只在最晚的 image 作业里跑。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n  environment:\n"
+            "    SOMETHING: ${LINGXI_BRAND_NEW_REQUIRED_VAR:?pending}\n"
+        )
+        self.assertTrue(
+            any("LINGXI_BRAND_NEW_REQUIRED_VAR" in f and "export" in f for f in failures),
+            failures,
+        )
+
+    def test_full_line_comments_mentioning_placeholders_do_not_produce_false_reds(self) -> None:
+        """散文注释里演示 `${VAR:?...}` 写法是常态，不该被判红。"""
+
+        failures = self._with_prod(
+            "worker-queue:\n"
+            "  # 四项一律写成 `${VAR:?说明}`：生产不许退回默认值\n"
+            '  user: "10001:10001"\n'
+        )
+        self.assertEqual(failures, [])
+
+    def test_real_compose_files_and_render_script_agree(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_compose_interpolation_is_yaml_safe(), [])
+
+
 class WorkerTmpfsCapacityTest(unittest.TestCase):
     """Issue #494 ②：`worker-queue` 的 `/tmp` 内存盘上限必须分环境显式配置。
 

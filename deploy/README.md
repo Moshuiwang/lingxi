@@ -588,7 +588,7 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 
 `worker-queue` 生产档原来的 **4.0 / 16G / 4096** 以及 `/tmp` 的 **256m**，是按"建议服务器 8 核 / 32GB"推算出来的——**那台服务器的实际规格从未被确认过**。上限高于物理规格不会报错，但等于这道防线完全没有生效；`/tmp` 更是内存盘，写满即等量占用宿主内存，规格不符时这部分占用没有任何护栏。
 
-因此这四项在 `deploy/compose.prod.yaml` 里现在写成 `${VAR:?说明}`（**无默认值**）：生产 `docker compose up` 会因为缺变量直接报错退出，而不是静默用上一个没人为生产判断过的数字。`scripts/ci/check_deploy_contract.py` 的 `check_resource_limits`（`PROD_PENDING_HOST_SPEC_LIMITS`）与 `check_worker_tmpfs_capacity` 把这条形状钉成会变红的断言。
+因此这四项在 `deploy/compose.prod.yaml` 里现在写成 `${VAR:?说明}`（**无默认值**）：生产 `docker compose up` 会因为缺变量直接报错退出，而不是静默用上一个没人为生产判断过的数字。**那四条提示语是刻意压短的纯 ASCII 单行，详细说明只写在本节**——compose 的值先过 YAML 解析再插值，未加引号的标量遇到「空格 + `#`」会被当成行内注释从那里截断（`（Issue #494）` 里的那个 `#` 就把 `}` 一起吃掉了），compose 于是报 `invalid interpolation format` 而不是我们要的「变量缺失」，fail-fast 语义整条失效（PR #506 CI 实测）。同理提示语里不能出现「冒号 + 空格」。这条已由 `check_compose_interpolation_is_yaml_safe` 钉成门禁；同一条门禁还要求每个 `${VAR:?}` 都在 `scripts/ci/verify_compose_structure.sh` 里有一个占位 `export`，否则那条渲染核对拿不到真值、整段渲染不出来。`scripts/ci/check_deploy_contract.py` 的 `check_resource_limits`（`PROD_PENDING_HOST_SPEC_LIMITS`）与 `check_worker_tmpfs_capacity` 把这条形状钉成会变红的断言。
 
 **要产品负责人确认的清单**（确认后把值写进 `deploy/.env.prod`，compose 文件不用改）：
 

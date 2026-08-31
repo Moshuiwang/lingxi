@@ -39,6 +39,7 @@ COMPOSE_STAGE = REPOSITORY_ROOT / "deploy" / "compose.stage.yaml"
 COMPOSE_PROD = REPOSITORY_ROOT / "deploy" / "compose.prod.yaml"
 ENV_EXAMPLE = REPOSITORY_ROOT / "deploy" / ".env.example"
 DEPLOY_CHECKLIST = REPOSITORY_ROOT / "deploy" / "验收前部署配置清单.md"
+COMPOSE_STRUCTURE_SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "verify_compose_structure.sh"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
@@ -802,6 +803,68 @@ def check_resource_limits() -> list[str]:
         require_all_services=True,
         pending_keys=PROD_PENDING_HOST_SPEC_LIMITS,
     )
+    return failures
+
+
+# ---- compose 插值占位符必须能被 YAML 解析（PR #506 CI 实测教训）--------------
+# compose 的值要先过 **YAML 解析**，再做 `${VAR}` 插值。未加引号的 YAML 标量遇到
+# 「空格 + #」就被当成行内注释**从那里截断**——`#494` 里的那个 `#` 把 `}` 连同后半
+# 句一起吃掉，剩下一个没有闭合的 `${...`，compose 报的是
+# `invalid interpolation format`（而不是我们要的"变量缺失"），整条 fail-fast 语义
+# 直接失效。同理「冒号 + 空格」会被 YAML 当成映射指示符。
+#
+# 这一类此前只有最晚的 `Epic Full / image` 作业里的 `verify_compose_structure.sh`
+# （真的起 docker 渲染）才抓得到；本检查把它前移到不需要 docker 的文本层，让
+# `scripts/dev/check.sh fast` 与 Story 门禁就能变红。两者不互相替代：那边验的是
+# 渲染后的最终结构，这边验的是"能不能渲染得出来"。
+_PLACEHOLDER = re.compile(r"\$\{([^{}]*)\}")
+#: YAML 纯量里会改变解析结果的两个序列，出现在 `${...}` 内部即判红。
+_YAML_HOSTILE_SEQUENCES = (" #", ": ")
+
+
+def check_compose_interpolation_is_yaml_safe() -> list[str]:
+    """三份 compose 里每个 `${...}` 占位符都必须能原样活过 YAML 解析；且每个
+    **无默认值**的 `${VAR:?}` 都必须被 `verify_compose_structure.sh` 显式赋一个
+    占位值，否则那条渲染门禁会以"变量缺失"红（PR #506 实测：漏了这一步只会在
+    最晚的 image 作业里才炸）。
+    """
+
+    failures: list[str] = []
+    required_variables: set[str] = set()
+    for path in (COMPOSE_BASE, COMPOSE_STAGE, COMPOSE_PROD):
+        for number, line in enumerate(read(path).splitlines(), start=1):
+            if line.lstrip().startswith("#") or "${" not in line:
+                continue
+            for body in _PLACEHOLDER.findall(line):
+                for sequence in _YAML_HOSTILE_SEQUENCES:
+                    if sequence in body:
+                        failures.append(
+                            f"{display(path)}:{number} 的 `${{{body[:40]}…}}` 含 "
+                            f"`{sequence.replace(' ', '␠')}`。compose 的值先过 YAML 解析再插值："
+                            "未加引号的标量遇到「空格+#」会被当成行内注释从那里截断、"
+                            "「冒号+空格」会被当成映射指示符，两者都会把 `}` 甩在解析结果之外，"
+                            "compose 只会报 `invalid interpolation format`。提示语请压成短的"
+                            "纯 ASCII 单行，详细说明写在 deploy/README.md。"
+                        )
+                match = re.match(r"([A-Za-z_][A-Za-z0-9_]*):\?", body)
+                if match:
+                    required_variables.add(match.group(1))
+            # 占位符必须在本行闭合：去掉全部完整占位符后不该还剩 `${`。
+            if "${" in _PLACEHOLDER.sub("", line):
+                failures.append(
+                    f"{display(path)}:{number} 有没有闭合的 `${{`，compose 会报 "
+                    "`invalid interpolation format`"
+                )
+
+    script = read(COMPOSE_STRUCTURE_SCRIPT)
+    exported = set(re.findall(r"^export\s+([A-Za-z_][A-Za-z0-9_]*)=", script, re.MULTILINE))
+    for variable in sorted(required_variables - exported):
+        failures.append(
+            f"`${{{variable}:?}}` 是无默认值的必填变量，但 "
+            f"{display(COMPOSE_STRUCTURE_SCRIPT)} 没有为它 export 占位值。"
+            "那条渲染门禁不读 deploy/.env.prod，缺一个就整段渲染不出来——"
+            "而它只在最晚的 `Epic Full / image` 作业里跑（PR #506 实测）。"
+        )
     return failures
 
 
@@ -1595,6 +1658,7 @@ def main() -> int:
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("六服务资源限制结构", check_resource_limits),
         ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
+        ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),
         ("日志留存下限", check_log_retention_floor),
         ("Compose 部署契约", check_compose_contract),
         ("Dockerfile 契约", check_dockerfile),

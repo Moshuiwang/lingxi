@@ -86,14 +86,22 @@ services:
     # 规格确认下来、写进 deploy/.env.prod。裁定后只需要在 .env.prod 里给值，本文件
     # 不用再改。scripts/ci/check_deploy_contract.py 的 check_worker_tmpfs_capacity /
     # check_resource_limits 把"prod 必须显式声明、不得沿用默认"钉成会变红的断言。
+    #
+    # **四条提示语必须是短的纯 ASCII 单行，详细说明只写在 deploy/README.md**
+    # （PR #506 CI 实测教训）：compose 的值在被插值之前先过 YAML 解析，未加引号的
+    # 标量遇到空格加 `#` 就被当成行内注释**从那里截断**——原来的提示语里带一个
+    # `（Issue #494）`，YAML 把 `}` 连同后半句一起吃掉，剩下一个没有闭合的
+    # `${...`，compose 报 `invalid interpolation format` 而不是我们要的"变量缺失"。
+    # 同理不能出现冒号加空格（YAML 会当成映射键）。这条已由
+    # `check_compose_interpolation_is_yaml_safe` 钉成门禁。
     tmpfs:
-      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?生产 /tmp 内存盘上限待定：确认生产主机内存规格后写进 deploy/.env.prod（Issue #494）}
+      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?prod host memory spec pending - set it in deploy/.env.prod, see deploy/README.md}
     deploy:
       resources:
         limits:
-          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:?生产 CPU 上限待定：确认生产主机 vCPU 数后写进 deploy/.env.prod（Issue #494）}"
-          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:?生产内存上限待定：确认生产主机内存规格后写进 deploy/.env.prod（Issue #494）}
-          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:?生产 pids 上限待定：与并发上界 LINGXI_WORKER_MAX_CONCURRENCY 同批裁定后写进 deploy/.env.prod（Issue #494）}
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:?prod host vCPU spec pending - set it in deploy/.env.prod, see deploy/README.md}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:?prod host memory spec pending - set it in deploy/.env.prod, see deploy/README.md}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:?prod host spec pending - set it with LINGXI_WORKER_MAX_CONCURRENCY in deploy/.env.prod, see deploy/README.md}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
       # 与 stage 覆盖结构一致（部署门禁要求两侧只许值不同）：默认提示词等运行时
