@@ -76,7 +76,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
 from lingxi.adapters.postgres_targeted_recompute_lookup import (
@@ -89,7 +89,12 @@ from lingxi.core.admin.pending_action import (
     PendingActionType,
 )
 from lingxi.core.identity.roster_audit import ArchivedIdentity
-from lingxi.core.permission.targeted_recompute import AuditSink, TargetedPermissionRecompute
+from lingxi.core.permission.targeted_recompute import (
+    AuditSink,
+    RecomputeKind,
+    TargetedPermissionRecompute,
+    TargetedRecomputeOutcome,
+)
 
 
 class _BaselineIdentityLookup:
@@ -138,7 +143,7 @@ class PermissionRecomputeAdapter:
         self._timeouts = timeouts
         self._audit = audit
 
-    def trigger(self, pending: PendingAction) -> None:
+    def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
         """``card_callback.py`` 在确认执行成功后调用，best-effort（异常由调用方
         捕获并降级，见该模块「载体 #96」旁的执行成功钩子）。本方法自己**不**吞
         任何异常——吞了调用方就没有机会记"这次触发失败了"这条响亮审计。
@@ -162,7 +167,7 @@ class PermissionRecomputeAdapter:
                 pending_action_id=pending.id,
                 action_type=pending.action_type.value,
             )
-            return
+            return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="target_unresolved")
 
         baseline = PostgresRosterBaselineReader(self._dsn, timeouts=self._timeouts).load_active_baseline()
         publish_store = PostgresPermissionPublishStore(self._dsn, timeouts=self._timeouts)
@@ -181,15 +186,19 @@ class PermissionRecomputeAdapter:
         )
 
         if pending.action_type is PendingActionType.SUSPEND_USER:
-            recompute.force_revoke(user_id=user_id)
-        else:
-            recompute.recompute_and_publish(user_id=user_id)
+            return recompute.force_revoke(user_id=user_id)
+        return recompute.recompute_and_publish(user_id=user_id)
 
 
 #: 单工作线程队列容量上下界（模块文档「有界队列 + 丢弃」一节）。
 _MIN_QUEUE_MAXSIZE = 1
 _MAX_QUEUE_MAXSIZE = 4
 _DEFAULT_QUEUE_MAXSIZE = 4
+
+# 确认后给定向重算留出的内部处理窗口。它只控制管理卡上的等待/未完成状态，
+# 不改变 pending_action 的确认窗口或本地授权的有效期，也不是产品向管理员承诺的
+# 硬上限；超时后日批仍可恢复并留下修正摘要。
+_DEFAULT_RECOMPUTE_TIMEOUT_SECONDS = 60.0
 
 #: 与 ``card_callback.py::AdminCardCallbackHandler._trigger_recompute`` 同步
 #: 分支使用的字面量逐字相同——运维按这一个动作名检索"这次定向重算触发失败了"，
@@ -200,6 +209,30 @@ _RECOMPUTE_TRIGGER_FAILED_ACTION = "admin.card_callback.recompute_trigger_failed
 #: 执行过，谈不上"失败"），动作名因此独立登记，运维可以分辨"这次触发到底是
 #: 执行失败了，还是压根没排上队"。
 _RECOMPUTE_TRIGGER_DROPPED_ACTION = "admin.card_callback.recompute_trigger_dropped"
+_RECOMPUTE_TRIGGER_TIMEOUT_ACTION = "admin.card_callback.recompute_trigger_timeout"
+
+
+class _ExecutionWatch:
+    """让超时回调与后台结果回调互斥，避免超时后迟到结果把卡片改回已生效。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._finished = False
+        self._timed_out = False
+
+    def timeout(self) -> bool:
+        with self._lock:
+            if self._finished:
+                return False
+            self._timed_out = True
+            return True
+
+    def finish(self) -> bool:
+        with self._lock:
+            if self._finished or self._timed_out:
+                return False
+            self._finished = True
+            return True
 
 
 class BackgroundPermissionRecomputeTrigger:
@@ -217,6 +250,11 @@ class BackgroundPermissionRecomputeTrigger:
         *,
         audit: AuditSink,
         queue_maxsize: int = _DEFAULT_QUEUE_MAXSIZE,
+        on_completed: Callable[[PendingAction], None] | None = None,
+        on_queued: Callable[[PendingAction, TargetedRecomputeOutcome], None] | None = None,
+        on_failed: Callable[[PendingAction, Exception | None], None] | None = None,
+        on_timeout: Callable[[PendingAction], None] | None = None,
+        timeout_seconds: float = _DEFAULT_RECOMPUTE_TIMEOUT_SECONDS,
     ) -> None:
         if not _MIN_QUEUE_MAXSIZE <= queue_maxsize <= _MAX_QUEUE_MAXSIZE:
             raise ValueError(
@@ -224,9 +262,20 @@ class BackgroundPermissionRecomputeTrigger:
                 "（模块文档「有界队列 + 丢弃」一节：容量存在的意义是扛住短时间内"
                 "连续几次点击，不是扛住持续高吞吐）"
             )
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ValueError("timeout_seconds 必须是正数")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds 必须是正数")
         self._delegate = delegate
         self._audit = audit
-        self._queue: queue.Queue[PendingAction] = queue.Queue(maxsize=queue_maxsize)
+        self._on_completed = on_completed
+        self._on_queued = on_queued
+        self._on_failed = on_failed
+        self._on_timeout = on_timeout
+        self._timeout_seconds = float(timeout_seconds)
+        self._queue: queue.Queue[tuple[PendingAction, _ExecutionWatch, threading.Timer]] = queue.Queue(
+            maxsize=queue_maxsize
+        )
         self._worker = threading.Thread(
             target=self._run,
             name="lingxi-gateway-permission-recompute",
@@ -240,28 +289,110 @@ class BackgroundPermissionRecomputeTrigger:
         向调用方冒泡任何异常——``card_callback.py`` 因此不需要跟着改一个字。
         """
 
+        watch = _ExecutionWatch()
+        timer = threading.Timer(self._timeout_seconds, self._on_timeout_fired, args=(pending, watch))
+        timer.daemon = True
         try:
-            self._queue.put_nowait(pending)
+            self._queue.put_nowait((pending, watch, timer))
         except queue.Full:
             self._audit.record(
                 _RECOMPUTE_TRIGGER_DROPPED_ACTION,
                 pending_action_id=pending.id,
             )
+            if self._on_failed is not None:
+                try:
+                    self._on_failed(pending, None)
+                except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                    self._audit.record(
+                        _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                        pending_action_id=pending.id,
+                        error=type(error).__name__,
+                    )
+            return
+        # Start only after the item owns a queue slot, so a dropped item can never
+        # race its timeout callback.  The worker may finish before ``start``; a
+        # pre-cancelled Timer is safe and keeps the callback mutually exclusive.
+        timer.start()
+
+    def _on_timeout_fired(self, pending: PendingAction, watch: _ExecutionWatch) -> None:
+        if not watch.timeout():
+            return
+        self._audit.record(
+            _RECOMPUTE_TRIGGER_TIMEOUT_ACTION,
+            pending_action_id=pending.id,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if self._on_timeout is not None:
+            try:
+                self._on_timeout(pending)
+            except Exception as error:  # noqa: BLE001 - timeout callback must not kill timer
+                self._audit.record(
+                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                    pending_action_id=pending.id,
+                    error=type(error).__name__,
+                )
 
     def _run(self) -> None:
         """工作线程主体：按入队顺序串行执行，单条失败只记审计、不影响下一条。"""
 
         while True:
-            pending = self._queue.get()
+            pending, watch, timer = self._queue.get()
             try:
-                self._delegate.trigger(pending)
+                outcome = self._delegate.trigger(pending)
             except Exception as error:  # noqa: BLE001 - 与 card_callback.py 同一条 best-effort 姿态
                 self._audit.record(
                     _RECOMPUTE_TRIGGER_FAILED_ACTION,
                     pending_action_id=pending.id,
                     error=type(error).__name__,
                 )
+                if watch.finish() and self._on_failed is not None:
+                    try:
+                        self._on_failed(pending, error)
+                    except Exception as callback_error:  # noqa: BLE001
+                        self._audit.record(
+                            _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                            pending_action_id=pending.id,
+                            error=type(callback_error).__name__,
+                        )
+            else:
+                # ``TargetedPermissionRecompute`` only records a publish *intent* here;
+                # ``ENQUEUED``/``REVOKED`` do not mean the external permission table has
+                # accepted and read back the row.  Treat those outcomes as waiting, not
+                # effective.  ``UNCHANGED`` is also left to the status observer: an old
+                # in-flight intent may still be pending.  Only legacy delegates that do
+                # not return a typed outcome retain the historical completed callback.
+                typed_outcome = (
+                    outcome if isinstance(outcome, TargetedRecomputeOutcome) else None
+                )
+                completed = typed_outcome is None
+                queued = typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+                if watch.finish():
+                    if queued:
+                        try:
+                            if self._on_queued is not None:
+                                self._on_queued(pending, typed_outcome)  # type: ignore[arg-type]
+                        except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                            self._audit.record(
+                                _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                                pending_action_id=pending.id,
+                                error=type(error).__name__,
+                            )
+                    else:
+                        callback = self._on_completed if completed else self._on_failed
+                        if callback is not None:
+                            try:
+                                if completed:
+                                    callback(pending)  # type: ignore[misc]
+                                else:
+                                    callback(pending, None)  # type: ignore[misc]
+                            except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                                self._audit.record(
+                                    _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                                    pending_action_id=pending.id,
+                                    error=type(error).__name__,
+                                )
             finally:
+                timer.cancel()
                 self._queue.task_done()
 
 

@@ -168,6 +168,10 @@ class PendingAction:
     #: 这条对应关系，见该迁移文件头部）。默认值 ``None`` 保持既有构造点（本卡之前
     #: 写下的全部 ``PendingAction(...)`` 调用点）不需要改一行。
     payload: str | None = None
+    #: 管理卡上下文反向链接（#493）。确认卡由管理卡提交产生时保存原管理卡
+    #: ``message_id``，这样确认/取消/后台重算都能在原卡上恢复状态；旧文本命令
+    #: 与历史行保持 ``None``。
+    origin_card_message_id: str | None = None
 
     @property
     def is_terminal(self) -> bool:

@@ -75,6 +75,11 @@ class LocalPermissionOverrideEntry:
     initiated_by_open_id: str
     pending_action_id: str
     created_at: datetime
+    # #493 职位+公司范围授权的来源信息。展开后的每条公司×指标行共享同一
+    # ``permission_group_id``；旧的逐指标行保持 None，不做历史迁移。
+    position_name: str | None = None
+    company_scope: str | None = None
+    permission_group_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.direction, OverrideDirection):
@@ -93,6 +98,10 @@ class LocalPermissionOverrideEntry:
             # 与 publish_row.format_updated_at 同一条纪律：时间一律 UTC，naive 时间
             # 会让跨时区部署对"这条覆盖是什么时候生效的"产生歧义。
             raise ValueError("本地权限覆盖条目的 created_at 必须带时区")
+        for field_name in ("position_name", "company_scope", "permission_group_id"):
+            value = getattr(self, field_name)
+            if value is not None and _blank(value):
+                raise ValueError(f"本地权限覆盖条目的字段 {field_name} 不得为空白")
 
     @property
     def key(self) -> tuple[str, str]:
@@ -207,7 +216,7 @@ def audit_fields(entry: LocalPermissionOverrideEntry) -> dict[str, Any]:
     直接写入审计是同一惯例。
     """
 
-    return {
+    fields = {
         "user_id": entry.user_id,
         "direction": entry.direction.value,
         "company_id": entry.company_id,
@@ -217,3 +226,8 @@ def audit_fields(entry: LocalPermissionOverrideEntry) -> dict[str, Any]:
         "pending_action_id": entry.pending_action_id,
         "created_at": entry.created_at.isoformat(),
     }
+    for name in ("position_name", "company_scope", "permission_group_id"):
+        value = getattr(entry, name)
+        if value is not None:
+            fields[name] = value
+    return fields

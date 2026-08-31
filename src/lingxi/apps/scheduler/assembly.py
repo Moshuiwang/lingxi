@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from lingxi.core.alerting import AlertingDuty
@@ -48,6 +50,94 @@ from lingxi.apps.scheduler.roster_audit import (
 from lingxi.apps.scheduler.stalled_provisioning import _build_stalled_provisioning_duty
 
 logger = logging.getLogger(__name__)
+
+
+def _build_management_correction_callback(
+    config: SchedulerConfig,
+    *,
+    audit: AuditSink,
+    on_send_outcome: Callable[[str, bool], None] | None = None,
+) -> Callable[[], None]:
+    """装配管理卡权限补偿的真实发布观察与每日汇总出口。
+
+    定向重算与发布消费是两个进程里的异步职责：gateway 只能先显示等待，scheduler
+    读回 ``publish_outbox='published'`` 后才把持久上下文收口为生效。此前这条收口没有
+    常驻调用方，重启后的管理卡只能等下一次人工点击才重新观察。这里把观察挂到已有的
+    权限发布职责每轮末尾，不新建轮询线程，也不把 outbox 入队误称为外部生效。
+
+    ``daily_correction_reported_at`` 是按消息 ID 的水位。汇总按当前未通报的 ID 集合
+    计算稳定去重键：发送成功与水位写入之间若进程崩溃，重试携带同一个键；若后来又有
+    新的补偿行，集合变化会得到新的键，避免把新增行静默吞掉。未配置管理群时只留一条
+    缺出口审计而保留未通报水位，后续部署补上群配置后仍可补发。
+    """
+
+    from lingxi.adapters.feishu_group_message import (
+        MANAGEMENT_CORRECTION_UUID_PREFIX,
+        FeishuGroupMessages,
+    )
+    from lingxi.adapters.postgres_management_card_context import (
+        PostgresManagementCardContextStore,
+    )
+    from lingxi.config.content import default_content_catalog
+
+    store = PostgresManagementCardContextStore(
+        config.postgres_dsn, timeouts=config.postgres_timeouts
+    )
+    sender: Any = None
+    if config.admin_group_chat_id:
+        sender = FeishuGroupMessages(
+            base_url=config.feishu_base_url,
+            app_id=config.feishu_app_id,
+            app_secret=config.feishu_app_secret,
+            on_send_outcome=on_send_outcome,
+            uuid_prefix=MANAGEMENT_CORRECTION_UUID_PREFIX,
+        )
+    channel_missing_reported = False
+
+    def settle() -> None:
+        nonlocal channel_missing_reported
+        # 先把已读回一致的上下文推进到 effective，再取待通报水位；两步各自幂等，
+        # 中间崩溃时下一轮会重复读而不会重复修改权限。
+        store.settle_published_contexts()
+        message_ids = tuple(sorted(store.unreported_daily_correction_ids()))
+        if not message_ids:
+            return
+        if sender is None:
+            if not channel_missing_reported:
+                audit.record(
+                    "admin.management_correction_channel_missing",
+                    count=len(message_ids),
+                    variable="LINGXI_ADMIN_GROUP_CHAT_ID",
+                )
+                channel_missing_reported = True
+            return
+
+        digest = hashlib.sha256("\n".join(message_ids).encode("utf-8")).hexdigest()[:16]
+        dedupe_key = (
+            f"management-correction:{datetime.now(timezone.utc).date().isoformat()}:{digest}"
+        )
+        text = default_content_catalog().text(
+            "permission.management_correction_summary", count=len(message_ids)
+        ).text
+        try:
+            sender.send_text(
+                chat_id=config.admin_group_chat_id,
+                text=text,
+                dedupe_key=dedupe_key,
+            )
+        except Exception as error:  # noqa: BLE001 - 下一轮继续用同一批次重试
+            audit.record(
+                "admin.management_correction_summary_failed",
+                count=len(message_ids),
+                error=type(error).__name__,
+            )
+            return
+        # 只有发送返回成功才推进水位；若这里失败，外层职责记录观察失败，下一轮
+        # 会用相同 ID 集合/去重键再次尝试，不把不确定态标作已送达。
+        store.mark_daily_corrections_reported(message_ids=message_ids)
+        audit.record("admin.management_correction_summary_sent", count=len(message_ids))
+
+    return settle
 
 
 def build_loop(
@@ -223,11 +313,18 @@ def build_loop(
     # 发布消费排在每日重算**之后**：同一轮里重算先把当天的意图排进来，发布紧接着就能把
     # 它推出去，而不是白等一个调度周期。位置只保证同一轮内的先后；一条意图晚一轮被消费
     # 没有任何产品后果（outbox 本来就是异步的）。
+    # S7 管理卡上下文补偿观察；仅新增 scheduler 侧接线，不改变 S8 的 CI/门禁规则。
+    management_corrections = _build_management_correction_callback(
+        config,
+        audit=sink,
+        on_send_outcome=(alerting_duty.send_outcome_callback() if alerting_duty else None),
+    )
     permission_publish = _build_permission_publish_duty(
         config,
         stop=stop,
         audit=sink,
         permission_table_access_token=permission_table_supply,
+        on_management_corrections=management_corrections,
     )
     if permission_publish is not None:
         duties.append(permission_publish)

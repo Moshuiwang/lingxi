@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0080_task_failure_signature` |
+| head revision | `0081_management_card_context` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -512,6 +512,19 @@ worker 与 gateway 是两个独立进程、不共享文件系统，只进 worker
 
 `downgrade()` 直接删两列，有损（失败码与签名随列丢失，不删行本身），与 `0070`
 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0081_management_card_context`（管理卡持久上下文与职位范围授权元数据）
+
+Issue #493。新增 `management_card_context` 持久保存管理卡的消息/卡片实体、发起人、
+目标标识、快照指纹、过期时间、状态与整卡 `sequence`，使 gateway 重启或多实例切换
+后仍能恢复回调上下文。`pending_action.origin_card_message_id` 保存从管理卡到确认操作的
+反向链接；`card_sequence` 由单条 `UPDATE ... RETURNING` 原子递增，避免并发更新拿到
+重复序号。
+
+`local_permission_override` 新增可空的职位、公司范围与权限组元数据。旧的逐公司×指标
+历史行不回填、不改写；新的职位+范围提交在确认事务中展开为实际公司×指标行，全部范围
+显示实际公司数量，映射缺失时失败关闭。`downgrade()` 删除本 revision 新增对象与列，
+有损但不删除既有业务行（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

@@ -30,8 +30,12 @@ AuditSink``/``core/admin/card_callback.AuditSink`` 结构相同的独立 ``Audit
 from __future__ import annotations
 
 import time
+import hashlib
+import json
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 
 from lingxi.core.admin.display_names import AdminDisplayNames
@@ -48,6 +52,47 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction
 from lingxi.core.admin.views import AdminUserStatusView
+
+
+def management_card_fingerprint(status: AdminUserStatusView) -> str:
+    """返回管理卡所依据状态的稳定指纹。
+
+    指纹只包含权限状态、银河摘要和当前本地覆盖内容，不包含卡片/消息 ID 或操作者
+    身份。回调在执行写操作前重新取当前状态并比较它，防止旧卡在数据已经变化后继续
+    写入；排序只用于稳定序列化，不改变权限语义。
+    """
+
+    payload = {
+        "identifier": status.identifier,
+        "provisioning_state": status.provisioning_state,
+        "account_state": status.account_state,
+        "updated_at": status.updated_at,
+        "local_overrides": [
+            {
+                "override_id": item.override_id,
+                "direction": item.direction,
+                "company_id": item.company_id,
+                "metric_name": item.metric_name,
+                "reason": item.reason,
+                "created_at": item.created_at,
+                "position_name": item.position_name,
+                "company_scope": item.company_scope,
+                "group_id": item.group_id,
+            }
+            for item in status.local_overrides
+        ],
+        "galaxy_source": None
+        if status.galaxy_source is None
+        else {
+            "granted": status.galaxy_source.granted,
+            "reason": status.galaxy_source.reason,
+            "companies": sorted(status.galaxy_source.companies),
+            "functions": sorted(status.galaxy_source.functions),
+            "all_companies": status.galaxy_source.all_companies,
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class PendingActionDeliveryTracker(Protocol):
@@ -162,9 +207,36 @@ class ManagementCardDispatchResult:
     delivered: bool
 
 
+@dataclass(frozen=True)
+class ManagementCardContext:
+    """一张管理卡的可恢复上下文。
+
+    ``context_deadline_at`` 只用于回调时的懒检查；没有后台定时器，也不改变已经确认
+    生效的本地授权有效期。``card_sequence`` 是整卡更新序号，必须由持久层原子递增。
+    """
+
+    message_id: str
+    card_id: str
+    identifier: str
+    chat_id: str
+    initiated_by_open_id: str
+    card_sequence: int
+    snapshot_fingerprint: str
+    context_deadline_at: datetime
+    state: str = "ready"
+    dispatch_status: str = "idle"
+    last_trace_id: str | None = None
+    # 仅用于每日批补齐汇总的幂等水位；普通即时成功从 dispatching 进入
+    # effective 时会置上，incomplete 被每日批补齐时保留为空，直到汇总成功送达。
+    daily_correction_reported_at: datetime | None = None
+
+
 class ManagementCardContextStore:
-    """管理卡发送侧登记的 ``message_id -> identifier`` 内存 TTL 映射（Trace #469
-    修复包 B，B-1）。
+    """兼容旧调用方/测试的 ``message_id -> identifier`` 内存 TTL 映射。
+
+    生产 gateway 使用 ``adapters.postgres_management_card_context`` 的持久实现；
+    本类保留为纯逻辑适配器，便于旧调用方和无数据库单测验证同一套回调语义。
+    （Trace #469 修复包 B，B-1。）
 
     ## 要解决的问题
 
@@ -184,13 +256,11 @@ class ManagementCardContextStore:
     这条消息正是管理卡自己。因此发送成功那一刻就能确定性地知道"这条 message_id
     对应哪一次 ``/admin user`` 查询、查的是谁"，不需要在回调时反查任何外部状态。
 
-    ## 为什么是内存 TTL 映射，不落库
+    ## 内存实现的边界
 
-    单实例部署（D11 前提，见仓库既有决策）下，进程内存足以覆盖"管理员发起查询
-    到点击表单提交"这几分钟内的窗口；重启丢失可接受——查不到时退回既有的
-    「请重新查询 /admin user」拒绝路径，此时这句指引恰好是准确操作，不是误导。
-    落库需要迁移、需要处理跨实例一致性，为一个"重启即可自愈"的缓存引入这些
-    成本不划算。
+    本实现仅用于兼容旧调用方和不接数据库的单测；生产实现把完整上下文（含
+    ``card_id``、发起人、快照指纹和 sequence）落在 PostgreSQL，以支持重启恢复。
+    因此这里的 TTL/容量仅是测试适配器的内部默认值，不构成产品承诺。
 
     TTL 默认 30 分钟（管理卡查询后不太可能拖到半小时之后才提交表单，超时后
     退回既有拒绝路径不算体验回退）；条目数上限默认 512，超过时逐出**最早写入**
@@ -211,9 +281,27 @@ class ManagementCardContextStore:
         self._ttl_seconds = ttl_seconds
         self._max_entries = max_entries
         self._clock = clock
-        self._entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._entries: OrderedDict[str, tuple[ManagementCardContext, float]] = OrderedDict()
+        # The production adapter gets atomic increments from PostgreSQL.  This
+        # compatibility implementation is also used by gateway-style tests and
+        # must not hand out the same sequence twice when two callbacks race.
+        self._lock = threading.RLock()
 
-    def remember(self, *, message_id: str, identifier: str) -> None:
+    def remember(
+        self,
+        *,
+        message_id: str,
+        identifier: str,
+        card_id: str = "",
+        chat_id: str = "",
+        initiated_by_open_id: str = "",
+        snapshot_fingerprint: str = "",
+        card_sequence: int = 2,
+        context_deadline_at: datetime | None = None,
+        state: str = "ready",
+        dispatch_status: str = "idle",
+        last_trace_id: str | None = None,
+    ) -> None:
         """管理卡发送成功后登记一条映射。``message_id``/``identifier`` 任一为空
         都不登记——空 ``message_id`` 无法在回调时被查到，空 ``identifier``
         登记了也没有意义（回调侧本来就是靠它非空才判定"命中"，见调用方
@@ -222,13 +310,38 @@ class ManagementCardContextStore:
         if not message_id or not identifier:
             return
         expires_at = self._clock() + self._ttl_seconds
-        # 先删后插：同一个 message_id 重复登记（理论上不会发生——每次
-        # `/admin user` 都会建一张新卡、拿到新的 message_id）时把它移到队尾，
-        # 保持"最早写入的排最前面、最先被逐出"这条不变量。
-        self._entries.pop(message_id, None)
-        self._entries[message_id] = (identifier, expires_at)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        deadline = context_deadline_at or (
+            datetime.now(timezone.utc) + timedelta(seconds=self._ttl_seconds)
+        )
+        context = ManagementCardContext(
+            message_id=message_id,
+            card_id=card_id,
+            identifier=identifier,
+            chat_id=chat_id,
+            initiated_by_open_id=initiated_by_open_id,
+            card_sequence=max(1, int(card_sequence)),
+            snapshot_fingerprint=snapshot_fingerprint,
+            context_deadline_at=deadline,
+            state=state,
+            dispatch_status=dispatch_status,
+            last_trace_id=last_trace_id,
+        )
+        # 同一个 message_id 重复登记（理论上不会发生——每次 `/admin user`
+        # 都会建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续
+        # 已有状态；不能让一次重放把已关闭/已提交的卡重新变成 ready。
+        with self._lock:
+            existing = self._entries.get(message_id)
+            if existing is not None:
+                previous, _previous_expires_at = existing
+                if context.card_sequence > previous.card_sequence:
+                    previous = ManagementCardContext(
+                        **{**previous.__dict__, "card_sequence": context.card_sequence}
+                    )
+                self._entries[message_id] = (previous, _previous_expires_at)
+            else:
+                self._entries[message_id] = (context, expires_at)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
 
     def lookup(self, *, message_id: str) -> str | None:
         """回调侧按 ``message_id`` 查回 ``identifier``；未登记、已过期都返回
@@ -236,14 +349,96 @@ class ManagementCardContextStore:
 
         if not message_id:
             return None
-        entry = self._entries.get(message_id)
-        if entry is None:
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, expires_at = entry
+            if self._clock() >= expires_at:
+                return None
+            return context.identifier
+
+    def lookup_context(self, *, message_id: str) -> ManagementCardContext | None:
+        """按消息 ID 找回完整上下文。
+
+        这里保留已过内部缓存窗口的上下文，供回调层做一次惰性关闭/刷新；严格的
+        ``lookup()`` 仍会把过期项视为未命中。容量上限负责避免这类保留无限增长。
+        """
+
+        if not message_id:
             return None
-        identifier, expires_at = entry
-        if self._clock() >= expires_at:
-            del self._entries[message_id]
-            return None
-        return identifier
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, _expires_at = entry
+            return context
+
+    def next_card_sequence(self, *, message_id: str) -> int:
+        """在进程内原子递增 sequence；持久适配器提供跨进程版本。"""
+
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                raise KeyError(message_id)
+            context, expires_at = entry
+            next_value = context.card_sequence + 1
+            self._entries[message_id] = (
+                ManagementCardContext(**{**context.__dict__, "card_sequence": next_value}),
+                expires_at,
+            )
+            return next_value
+
+    def update_state(
+        self,
+        *,
+        message_id: str,
+        state: str | None = None,
+        dispatch_status: str | None = None,
+        snapshot_fingerprint: str | None = None,
+        last_trace_id: str | None = None,
+    ) -> ManagementCardContext | None:
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, expires_at = entry
+            updated = ManagementCardContext(
+                message_id=context.message_id,
+                card_id=context.card_id,
+                identifier=context.identifier,
+                chat_id=context.chat_id,
+                initiated_by_open_id=context.initiated_by_open_id,
+                card_sequence=context.card_sequence,
+                snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
+                context_deadline_at=context.context_deadline_at,
+                state=state if state is not None else context.state,
+                dispatch_status=dispatch_status if dispatch_status is not None else context.dispatch_status,
+                last_trace_id=last_trace_id if last_trace_id is not None else context.last_trace_id,
+                daily_correction_reported_at=(
+                    context.daily_correction_reported_at
+                    if state != "effective" or context.state == "incomplete"
+                    else context.daily_correction_reported_at or datetime.now(timezone.utc)
+                ),
+            )
+            self._entries[message_id] = (updated, expires_at)
+            return updated
+
+    # The in-memory compatibility store has no publish outbox to observe.  Keep the
+    # production adapter's optional observation surface available so gateway tests and
+    # old callers can inject this store without a special branch.
+    def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
+        del message_id
+        return None
+
+    def settle_published_contexts(self) -> tuple[str, ...]:
+        return ()
+
+    def unreported_daily_correction_ids(self) -> tuple[str, ...]:
+        return ()
+
+    def mark_daily_corrections_reported(self, *, message_ids: tuple[str, ...]) -> None:
+        del message_ids
 
 
 class ManagementCardDispatcher:
@@ -285,6 +480,7 @@ class ManagementCardDispatcher:
         chat_id: str,
         thread_id: str | None,
         reply_to_message_id: str,
+        initiated_by_open_id: str = "",
     ) -> ManagementCardDispatchResult:
         card = render_management_card(
             status,
@@ -323,6 +519,15 @@ class ManagementCardDispatcher:
             # 分支已经在上面 return，不会走到这里——没有实际送达的卡片就没有
             # "这条 message_id 对应哪次查询"这件事可以登记。
             self._context_store.remember(
-                message_id=created.message_id, identifier=display_identifier
+                message_id=created.message_id,
+                identifier=display_identifier,
+                card_id=created.card_id,
+                chat_id=chat_id,
+                initiated_by_open_id=initiated_by_open_id,
+                snapshot_fingerprint=management_card_fingerprint(status),
+                # CardKit's create + reply consume the first two entities in the
+                # card's sequence stream; the first in-place management update
+                # must therefore start at 3.
+                card_sequence=2,
             )
         return ManagementCardDispatchResult(delivered=True)

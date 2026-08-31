@@ -32,6 +32,11 @@ class LocalPermissionOverrideView:
     metric_name: str
     reason: str
     created_at: str
+    # #493 新的职位+范围授权会把展开后的行归到同一组；旧行没有这些值，保持
+    # ``None``，这样历史数据无需迁移、仍可照常展示/撤销。
+    position_name: str | None = None
+    company_scope: str | None = None
+    group_id: str | None = None
 
 
 @dataclass(frozen=True)

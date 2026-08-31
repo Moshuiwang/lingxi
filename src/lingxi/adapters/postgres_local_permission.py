@@ -119,7 +119,7 @@ class StoredLocalPermissionOverride:
 
 _SELECT_COLUMNS = (
     "id, user_id, direction, company_id, metric_name, reason, initiated_by_open_id,"
-    " pending_action_id, created_at"
+    " pending_action_id, created_at, position_name, company_scope, permission_group_id"
 )
 
 #: 内测每日通报「本地权限覆盖活动」段的哑聚合（Issue #319 S-P-1c，唯一调用方
@@ -170,6 +170,9 @@ def _row_to_stored(row: tuple) -> StoredLocalPermissionOverride:
         initiated_by_open_id,
         pending_action_id,
         created_at,
+        position_name,
+        company_scope,
+        permission_group_id,
     ) = row
     entry = LocalPermissionOverrideEntry(
         user_id=user_id,
@@ -180,6 +183,9 @@ def _row_to_stored(row: tuple) -> StoredLocalPermissionOverride:
         initiated_by_open_id=initiated_by_open_id,
         pending_action_id=pending_action_id,
         created_at=created_at,
+        position_name=position_name,
+        company_scope=company_scope,
+        permission_group_id=permission_group_id,
     )
     return StoredLocalPermissionOverride(id=id_, entry=entry)
 
@@ -259,6 +265,9 @@ class PostgresLocalPermissionOverrideStore:
         initiated_by_open_id: str,
         pending_action_id: str,
         now: datetime | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        permission_group_id: str | None = None,
     ) -> StoredLocalPermissionOverride:
         """插入一条新的生效本地覆盖条目，独立开一条连接/事务。
 
@@ -290,6 +299,9 @@ class PostgresLocalPermissionOverrideStore:
             initiated_by_open_id=initiated_by_open_id,
             pending_action_id=pending_action_id,
             created_at=moment,
+            position_name=position_name,
+            company_scope=company_scope,
+            permission_group_id=permission_group_id,
         )
 
         override_id = new_id("lpo")
@@ -345,8 +357,9 @@ def _insert_locked(cursor, *, override_id: str, entry: LocalPermissionOverrideEn
             """
             INSERT INTO local_permission_override
                 (id, user_id, direction, company_id, metric_name, reason,
-                 initiated_by_open_id, pending_action_id, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 initiated_by_open_id, pending_action_id, created_at,
+                 position_name, company_scope, permission_group_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 override_id,
@@ -358,6 +371,9 @@ def _insert_locked(cursor, *, override_id: str, entry: LocalPermissionOverrideEn
                 entry.initiated_by_open_id,
                 entry.pending_action_id,
                 entry.created_at,
+                entry.position_name,
+                entry.company_scope,
+                entry.permission_group_id,
             ),
         )
     except UniqueViolation as error:

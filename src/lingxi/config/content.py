@@ -134,6 +134,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.range_updated",
     "permission.range_revoked",
     "permission.all_companies",
+    "permission.management_correction_summary",
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
     # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
