@@ -1112,7 +1112,7 @@ class ReadinessTicker(_ReadinessProbeRunner):
 
 
 class ReadinessRecoveryTicker(_ReadinessProbeRunner):
-    """给「已经判过 ``timed_out``」的绑定做**周期性复检**（[V-开通-18](../../../../docs/技术设计/验收矩阵.md)）。
+    """给「已经判过 ``timed_out``」的绑定做**周期性复检**（[V-开通-18](../../../../docs/技术设计/验收矩阵-开通与身份.md)）。
 
     首次开通那条链（:class:`~lingxi.core.identity.onboarding_runner.AutoOnboardingRunner`）
     用 :class:`McpReadinessConfirmation` 阻塞式跑完合同预算，预算耗尽即返回 ``timed_out``

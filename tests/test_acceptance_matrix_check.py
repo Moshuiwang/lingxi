@@ -141,6 +141,58 @@ class MatrixStatusColumnTest(unittest.TestCase):
         self.assertTrue(any("一条断言都没解析到" in error for error in errors), errors)
 
 
+class MultipleVolumeTest(unittest.TestCase):
+    """分册后（Issue #479）矩阵是「总册 + 分册」一个集合，判定标准不变。"""
+
+    def _volumes(self, first_rows: str, second_rows: str) -> dict[str, str]:
+        return {
+            "验收矩阵.md": gate_document("", GOOD_COVERAGE),
+            "验收矩阵-一册.md": gate_document(first_rows, ""),
+            "验收矩阵-二册.md": gate_document(second_rows, ""),
+        }
+
+    def test_assertions_from_every_volume_are_parsed(self) -> None:
+        statuses, errors = CHECK.parse_matrix(
+            self._volumes(
+                "| V-开通-01 | 不先占位再回填 | L2（真库） | 已认领 |\n",
+                "| V-权限-01 | 发布前先落库 | L2（真库） | 已验证 |\n",
+            )
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, {"V-开通-01": "已认领", "V-权限-01": "已验证"})
+
+    def test_the_same_identifier_in_two_volumes_is_rejected(self) -> None:
+        """跨分册重号是分册**新**引入的失败形态：同一编号两份状态，读者不知道信哪个。"""
+        _, errors = CHECK.parse_matrix(
+            self._volumes(
+                "| V-开通-01 | 一册的说法 | L2 | 已认领 |\n",
+                "| V-开通-01 | 二册的说法 | L2 | 已验证 |\n",
+            )
+        )
+        self.assertTrue(any("断言编号重复" in error for error in errors), errors)
+        self.assertTrue(any("验收矩阵-一册.md" in error for error in errors), errors)
+
+    def test_errors_name_the_document_they_came_from(self) -> None:
+        _, errors = CHECK.parse_matrix(
+            self._volumes(
+                "| V-开通-01 | 正常 | L2 | 已认领 |\n",
+                "| V-权限-01 | 状态写错 | L2 | 待实现 |\n",
+            )
+        )
+        self.assertTrue(any("验收矩阵-二册.md" in error and "待实现" in error for error in errors), errors)
+
+    def test_a_coverage_list_moved_into_a_volume_is_still_seen(self) -> None:
+        """覆盖清单被搬进分册也必须被解析到，而不是因为「只读总册」静默漏掉。"""
+        coverage, errors = CHECK.parse_coverage(
+            {
+                "验收矩阵.md": "# 产品验收矩阵\n\n没有清单。\n",
+                "验收矩阵-一册.md": gate_document(GOOD_MATRIX, GOOD_COVERAGE),
+            }
+        )
+        self.assertEqual(errors, [])
+        self.assertIn("首次对话与自动准入", coverage)
+
+
 class CoverageListTest(unittest.TestCase):
     """②「合同条款无断言覆盖」——漏登记、留空、编号写错必须变红。"""
 
@@ -232,10 +284,32 @@ class RealDocumentTest(unittest.TestCase):
         self.assertIn("合同条款覆盖清单：通过", stdout.getvalue())
 
     def test_every_assertion_in_the_matrix_document_has_a_state(self) -> None:
-        statuses, errors = CHECK.parse_matrix(CHECK.MATRIX_DOCUMENT.read_text(encoding="utf-8"))
+        statuses, errors = CHECK.parse_matrix(CHECK.matrix_documents())
         self.assertEqual(errors, [])
         self.assertGreater(len(statuses), 100)
         self.assertEqual(set(statuses.values()) - set(CHECK.ASSERTION_STATES), set())
+
+    def test_the_real_matrix_is_split_into_volumes_and_the_hub_holds_no_assertions(self) -> None:
+        """分册后（Issue #479）真实矩阵必须真的是「总册 + 多个分册」。
+
+        没有这条，把断言全部搬回总册、或把分册删空，都不会有任何检查变红——
+        本检查读的是整个集合，正是分册结构本身没人守。
+        """
+        documents = CHECK.matrix_documents()
+        self.assertGreater(len(documents), 1, "只发现总册，分册全丢了？")
+        hub_statuses, _ = CHECK.parse_matrix(documents[CHECK.MATRIX_DOCUMENT.name])
+        self.assertEqual(hub_statuses, {}, "总册只该留索引与覆盖清单，断言正文在分册里")
+
+    def test_a_volume_missing_from_the_hub_index_fails(self) -> None:
+        """磁盘上有、总册导航里没有的分册必须判红——否则读者找不到它。"""
+        documents = {
+            "验收矩阵.md": "# 产品验收矩阵\n\n[开通](验收矩阵-开通.md)\n",
+            "验收矩阵-开通.md": "# 开通\n",
+            "验收矩阵-权限.md": "# 权限\n",
+        }
+        errors = CHECK.check_volume_registry(documents)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("验收矩阵-权限.md", errors[0])
 
 
 if __name__ == "__main__":

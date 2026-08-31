@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""校验验收矩阵的状态列与合同条款覆盖清单（见 docs/技术设计/验收矩阵.md）。
+"""校验验收矩阵的状态列与合同条款覆盖清单（见 docs/技术设计/验收矩阵.md 及其分册）。
+
+**读取范围（Issue #479 分册后）**：矩阵从「一个文件」变成「总册 `验收矩阵.md`
++ 同目录全部 `验收矩阵-*.md` 分册」。本检查按这个集合**整体**解析，判定标准一个
+字没改：状态三态不变、断言编号唯一性不变（跨分册重号照样判红）、合同章节覆盖
+跨查不变。分册用**目录扫描**发现而不是写死清单——写死清单意味着新增一册忘了登
+记就会静默脱离检查，而这正是本检查存在的理由。扫描到的每一册还必须能在总册的
+分册索引里被链接到，否则判红：磁盘上有、总册导航里没有的分册，读者找不到它。
 
 只读两份 Markdown，不访问网络、不依赖标准库以外的东西。它挡的是两类**沉默**的漏洞：
 
@@ -19,7 +26,30 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MATRIX_DOCUMENT = REPOSITORY_ROOT / "docs" / "技术设计" / "验收矩阵.md"
+# 分册命名空间：与总册同目录、同前缀。改这个 glob 等于改读取范围，须与总册
+# 「体量预算」小节同步。
+MATRIX_VOLUME_GLOB = "验收矩阵-*.md"
 CONTRACT_DOCUMENT = REPOSITORY_ROOT / "docs" / "产品合同与外部边界.md"
+
+
+def matrix_volumes() -> list[Path]:
+    """总册同目录下的全部分册，按文件名排序（稳定的报错顺序）。"""
+    return sorted(MATRIX_DOCUMENT.parent.glob(MATRIX_VOLUME_GLOB))
+
+
+def matrix_documents() -> dict[str, str]:
+    """「显示名 → 正文」：总册在前，分册按文件名排序跟在后面。"""
+    documents = {MATRIX_DOCUMENT.name: MATRIX_DOCUMENT.read_text(encoding="utf-8")}
+    for volume in matrix_volumes():
+        documents[volume.name] = volume.read_text(encoding="utf-8")
+    return documents
+
+
+def as_documents(text_or_documents: "str | dict[str, str]") -> dict[str, str]:
+    """允许单份正文直接传入（单元测试与单文件调用），统一成「显示名 → 正文」。"""
+    if isinstance(text_or_documents, str):
+        return {MATRIX_DOCUMENT.name: text_or_documents}
+    return text_or_documents
 
 # 验收矩阵定义的三态。状态列只允许这三个词，多一个同义词就等于多一套不受检查的语义。
 ASSERTION_STATES = ("未认领", "已认领", "已验证")
@@ -83,44 +113,51 @@ def iter_tables(text: str):
         yield header, index + 1, split_row(line)
 
 
-def parse_matrix(text: str) -> tuple[dict[str, str], list[str]]:
-    """读出「断言编号 → 状态」，并报出所有不合格的断言行。"""
+def parse_matrix(text_or_documents: "str | dict[str, str]") -> tuple[dict[str, str], list[str]]:
+    """读出「断言编号 → 状态」，并报出所有不合格的断言行。
+
+    入参是「显示名 → 正文」的多份文档（总册 + 分册）；只传一份正文时按单文档处理。
+    断言编号的唯一性在**整个集合**里判定，跨分册重号与同一份文档内重号同样判红。
+    """
+    documents = as_documents(text_or_documents)
     statuses: dict[str, str] = {}
-    seen_at: dict[str, int] = {}
+    seen_at: dict[str, str] = {}
     errors: list[str] = []
 
-    for header, line_number, cells in iter_tables(text):
-        in_matrix = header == MATRIX_HEADER
-        if not in_matrix and not (cells and LOOSE_ASSERTION_ROW.match(cells[0])):
-            continue
-        if not in_matrix:
-            errors.append(
-                f"第 {line_number} 行：断言 {cells[0]!r} 所在的表没有「状态」列表头"
-                f"（应为 {' | '.join(MATRIX_HEADER)}）"
-            )
-            continue
-        if len(cells) != len(MATRIX_HEADER):
-            errors.append(
-                f"第 {line_number} 行：断言行有 {len(cells)} 格，应为 {len(MATRIX_HEADER)} 格；"
-                f"若正文需要字面竖线请写成 \\| 转义：{cells[0]!r}"
-            )
-            continue
+    for source, text in documents.items():
+        for header, line_number, cells in iter_tables(text):
+            where = f"{source} 第 {line_number} 行"
+            in_matrix = header == MATRIX_HEADER
+            if not in_matrix and not (cells and LOOSE_ASSERTION_ROW.match(cells[0])):
+                continue
+            if not in_matrix:
+                errors.append(
+                    f"{where}：断言 {cells[0]!r} 所在的表没有「状态」列表头"
+                    f"（应为 {' | '.join(MATRIX_HEADER)}）"
+                )
+                continue
+            if len(cells) != len(MATRIX_HEADER):
+                errors.append(
+                    f"{where}：断言行有 {len(cells)} 格，应为 {len(MATRIX_HEADER)} 格；"
+                    f"若正文需要字面竖线请写成 \\| 转义：{cells[0]!r}"
+                )
+                continue
 
-        identifier, _, _, state = cells
-        if not ASSERTION_ID.match(identifier):
-            errors.append(f"第 {line_number} 行：编号格不是合法断言编号：{identifier!r}")
-            continue
-        if identifier in seen_at:
-            errors.append(f"第 {line_number} 行：断言编号重复，已见于第 {seen_at[identifier]} 行：{identifier}")
-            continue
-        if state not in ASSERTION_STATES:
-            errors.append(
-                f"第 {line_number} 行：{identifier} 的状态是 {state!r}，"
-                f"只允许 {' / '.join(ASSERTION_STATES)}"
-            )
-            continue
-        statuses[identifier] = state
-        seen_at[identifier] = line_number
+            identifier, _, _, state = cells
+            if not ASSERTION_ID.match(identifier):
+                errors.append(f"{where}：编号格不是合法断言编号：{identifier!r}")
+                continue
+            if identifier in seen_at:
+                errors.append(f"{where}：断言编号重复，已见于{seen_at[identifier]}：{identifier}")
+                continue
+            if state not in ASSERTION_STATES:
+                errors.append(
+                    f"{where}：{identifier} 的状态是 {state!r}，"
+                    f"只允许 {' / '.join(ASSERTION_STATES)}"
+                )
+                continue
+            statuses[identifier] = state
+            seen_at[identifier] = where
 
     if not statuses and not errors:
         errors.append("验收矩阵里一条断言都没解析到：表头或表格结构被改动了")
@@ -140,57 +177,66 @@ def expand_reference(reference: str) -> tuple[list[str], str | None]:
     return [f"{group}-{number:02d}" for number in range(int(start), int(end) + 1)], None
 
 
-def parse_coverage(text: str) -> tuple[dict[str, tuple[list[str], str]], list[str]]:
-    """读出「合同章节 → (断言编号, 说明)」。"""
+def parse_coverage(
+    text_or_documents: "str | dict[str, str]",
+) -> tuple[dict[str, tuple[list[str], str]], list[str]]:
+    """读出「合同章节 → (断言编号, 说明)」。
+
+    分册后覆盖清单仍然只有一份（住在总册），但仍按整个文档集合扫描：清单被搬到某个
+    分册、或有人在分册里写出第二份，都必须被看见，而不是因为「只读总册」静默漏掉。
+    """
+    documents = as_documents(text_or_documents)
     coverage: dict[str, tuple[list[str], str]] = {}
     errors: list[str] = []
     found_table = False
 
-    for header, line_number, cells in iter_tables(text):
-        if header != COVERAGE_HEADER:
-            continue
-        found_table = True
-        if len(cells) != len(COVERAGE_HEADER):
-            errors.append(f"第 {line_number} 行：覆盖清单行有 {len(cells)} 格，应为 {len(COVERAGE_HEADER)} 格")
-            continue
-
-        section, raw_references, note = cells
-        if not section:
-            errors.append(f"第 {line_number} 行：合同章节为空")
-            continue
-        if section in coverage:
-            errors.append(f"第 {line_number} 行：合同章节在覆盖清单里重复：{section}")
-            continue
-
-        if raw_references == NO_ASSERTION:
-            if not note or note == EMPTY_NOTE:
-                errors.append(
-                    f"第 {line_number} 行：「{section}」写了 {NO_ASSERTION} 却没有说明理由；"
-                    "不允许静默宣布某节不需要断言"
-                )
-            coverage[section] = ([], note)
-            continue
-
-        if not raw_references:
-            errors.append(f"第 {line_number} 行：「{section}」没有任何对应断言，也没有写 {NO_ASSERTION}")
-            coverage[section] = ([], note)
-            continue
-
-        identifiers: list[str] = []
-        for reference in (part.strip() for part in raw_references.split("、")):
-            if not reference:
-                errors.append(f"第 {line_number} 行：「{section}」的断言列表里有空项")
+    for source, text in documents.items():
+        for header, line_number, cells in iter_tables(text):
+            if header != COVERAGE_HEADER:
                 continue
-            expanded, error = expand_reference(reference)
-            if error:
-                errors.append(f"第 {line_number} 行：「{section}」{error}")
+            where = f"{source} 第 {line_number} 行"
+            found_table = True
+            if len(cells) != len(COVERAGE_HEADER):
+                errors.append(f"{where}：覆盖清单行有 {len(cells)} 格，应为 {len(COVERAGE_HEADER)} 格")
                 continue
-            for identifier in expanded:
-                if identifier in identifiers:
-                    errors.append(f"第 {line_number} 行：「{section}」重复引用 {identifier}")
+
+            section, raw_references, note = cells
+            if not section:
+                errors.append(f"{where}：合同章节为空")
+                continue
+            if section in coverage:
+                errors.append(f"{where}：合同章节在覆盖清单里重复：{section}")
+                continue
+
+            if raw_references == NO_ASSERTION:
+                if not note or note == EMPTY_NOTE:
+                    errors.append(
+                        f"{where}：「{section}」写了 {NO_ASSERTION} 却没有说明理由；"
+                        "不允许静默宣布某节不需要断言"
+                    )
+                coverage[section] = ([], note)
+                continue
+
+            if not raw_references:
+                errors.append(f"{where}：「{section}」没有任何对应断言，也没有写 {NO_ASSERTION}")
+                coverage[section] = ([], note)
+                continue
+
+            identifiers: list[str] = []
+            for reference in (part.strip() for part in raw_references.split("、")):
+                if not reference:
+                    errors.append(f"{where}：「{section}」的断言列表里有空项")
                     continue
-                identifiers.append(identifier)
-        coverage[section] = (identifiers, note)
+                expanded, error = expand_reference(reference)
+                if error:
+                    errors.append(f"{where}：「{section}」{error}")
+                    continue
+                for identifier in expanded:
+                    if identifier in identifiers:
+                        errors.append(f"{where}：「{section}」重复引用 {identifier}")
+                        continue
+                    identifiers.append(identifier)
+            coverage[section] = (identifiers, note)
 
     if not found_table:
         errors.append(f"没找到合同条款覆盖清单（表头应为 {' | '.join(COVERAGE_HEADER)}）")
@@ -242,13 +288,28 @@ def cross_check(
     return errors
 
 
+def check_volume_registry(documents: dict[str, str]) -> list[str]:
+    """每个磁盘上的分册都必须在总册的分册索引里被链接到。
+
+    分册靠目录扫描发现，所以「加了文件忘了登记」不会让断言脱离检查；但读者仍然会
+    找不到它。这条检查补上导航面：总册正文里必须出现指向该分册的 Markdown 链接。
+    """
+    hub_text = documents.get(MATRIX_DOCUMENT.name, "")
+    return [
+        f"分册 {name} 没有登记在总册 {MATRIX_DOCUMENT.name} 的分册索引里"
+        f"（总册正文需要出现指向它的 Markdown 链接 `]({name})`）"
+        for name in documents
+        if name != MATRIX_DOCUMENT.name and f"]({name})" not in hub_text
+    ]
+
+
 def main() -> int:
-    matrix_text = MATRIX_DOCUMENT.read_text(encoding="utf-8")
+    documents = matrix_documents()
     contract_text = CONTRACT_DOCUMENT.read_text(encoding="utf-8")
 
-    statuses, failures = parse_matrix(matrix_text)
-    coverage, coverage_errors = parse_coverage(matrix_text)
-    failures = failures + coverage_errors
+    statuses, failures = parse_matrix(documents)
+    coverage, coverage_errors = parse_coverage(documents)
+    failures = failures + coverage_errors + check_volume_registry(documents)
     sections = contract_sections(contract_text)
     failures = failures + cross_check(statuses, coverage, sections)
 
@@ -262,7 +323,8 @@ def main() -> int:
         f"{state} {sum(1 for value in statuses.values() if value == state)}" for state in ASSERTION_STATES
     )
     covered = sum(1 for identifiers, _ in coverage.values() if identifiers)
-    print(f"验收矩阵状态列：通过（{len(statuses)} 条断言；{counted}）")
+    volumes = len(documents) - 1
+    print(f"验收矩阵状态列：通过（{len(statuses)} 条断言；{counted}；总册 + {volumes} 个分册）")
     print(f"合同条款覆盖清单：通过（{len(coverage)} 个章节，其中 {covered} 个已映射到断言）")
     return 0
 

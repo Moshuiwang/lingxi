@@ -129,7 +129,7 @@ activate_after_late_readiness`，条件更新只在 `provisioning_state = 'mcp_s
 发生——**独立审查 codex P1-3 新增的只是告警侧的一次调用**（:meth:`_notify_admin_
 of_failure`），让「转交管理员处理」这句话对 `sync_timeout` 也有真实送达，不改变
 上面这条恢复语义半分毫。**这条缺口同时登记在**
-``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵.md`` 的 ``V-开通-18``
+``docs/当前能力.md``（用户可见后果）与``docs/技术设计/验收矩阵-开通与身份.md`` 的 ``V-开通-18``
 ——只写在这里不算被守住，冻结验收读的是 ``docs/`` 正文；``docs/当前能力.md`` 的更新属
 另一个 Story 的范围，本次改动只更新了验收矩阵。
 

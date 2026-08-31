@@ -207,6 +207,52 @@ class TotalSizeNoticeTest(unittest.TestCase):
         self.assertIn("提示", notice)
 
 
+class MeasureDocumentsTest(unittest.TestCase):
+    """分册合并规则（Issue #479）：以断言编号为 key 取整个集合里的最大字节数。"""
+
+    def test_rows_from_every_volume_are_measured(self) -> None:
+        documents = {
+            "验收矩阵-一册.md": matrix_document("| V-开通-01 | 一句判定 | L2 | 已认领 |\n"),
+            "验收矩阵-二册.md": matrix_document("| V-权限-01 | 另一句判定 | L2 | 已验证 |\n"),
+        }
+        self.assertEqual(set(CHECK.measure_documents(documents)), {"V-开通-01", "V-权限-01"})
+
+    def test_the_same_identifier_in_two_volumes_takes_the_larger_count(self) -> None:
+        """搬去哪一册都不改变判定：任意一册里的超标行都不会被另一册的短行掩盖。"""
+        short_row = "| V-开通-01 | 短 | L2 | 已认领 |\n"
+        long_row = "| V-开通-01 | " + ("很长的裁定沿革" * 40) + " | L2 | 已认领 |\n"
+        documents = {
+            "验收矩阵-一册.md": matrix_document(short_row),
+            "验收矩阵-二册.md": matrix_document(long_row),
+        }
+        self.assertEqual(
+            CHECK.measure_documents(documents)["V-开通-01"],
+            len(long_row.rstrip("\n").encode("utf-8")),
+        )
+
+
+class TotalSizeReportTest(unittest.TestCase):
+    """触发线按**单个文件**判定（Issue #479 口径更新），合计只打印、不设阈值。"""
+
+    def test_each_document_is_reported_on_its_own(self) -> None:
+        documents = {
+            "验收矩阵.md": "短文档\n",
+            "验收矩阵-一册.md": "\n".join(f"行{i}" for i in range(CHECK.TOTAL_LINES_TRIGGER + 1)),
+        }
+        report = CHECK.render_total_size_report(documents)
+        self.assertIn("验收矩阵.md：", report)
+        self.assertIn("未触及分册触发线", report)
+        self.assertIn("【提示】", report)  # 触线的那一册照样出横幅
+        self.assertIn("验收矩阵全集合合计：2 个文件", report)
+
+    def test_two_documents_each_under_the_trigger_do_not_trigger_on_their_sum(self) -> None:
+        """口径更新的正面确认：单册各自不触线时，合计再大也只是打印，不出横幅。"""
+        half = "字" * (CHECK.TOTAL_BYTES_TRIGGER // 3 - 10)
+        report = CHECK.render_total_size_report({"a.md": half, "b.md": half})
+        self.assertNotIn("【提示】", report)
+        self.assertIn("验收矩阵全集合合计：2 个文件", report)
+
+
 class RunCheckDoesNotBlockOnTotalTriggerTest(unittest.TestCase):
     """行为级验证：即便总量触线，只要单行棘轮本身没有违规，run_check() 仍必须
     退出 0——这是「非阻断」这条规则唯一真正生效的地方，字符串提示本身不够。"""
@@ -325,8 +371,25 @@ class RealBaselineIsHonestTest(unittest.TestCase):
 
     def test_committed_baseline_matches_actual_row_byte_counts(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
-        current = CHECK.measure_rows(CHECK.read_matrix_text())
+        current = CHECK.measure_documents(CHECK.read_matrix_documents())
         self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_every_baseline_entry_is_still_measured_after_the_split(self) -> None:
+        """分册（Issue #479）后每条基线登记都必须仍被丈量到。
+
+        ``evaluate`` 对「基线里有、矩阵里没有」这种情况刻意不判红（断言下线是合法
+        的）。所以如果丈量范围漏掉某个分册，上面那条用例会**静默变成空话**——它只
+        会看到一个空的 current 然后通过。这条用例正面钉住：登记的 20 条全都要被
+        当前的读取范围覆盖到。
+        """
+        baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
+        current = CHECK.measure_documents(CHECK.read_matrix_documents())
+        self.assertEqual(sorted(set(baseline) - set(current)), [])
+
+    def test_the_real_matrix_is_read_as_a_hub_plus_volumes(self) -> None:
+        documents = CHECK.read_matrix_documents()
+        self.assertGreater(len(documents), 1, "只读到总册，分册没进丈量范围")
+        self.assertIn(CHECK.MATRIX_DOCUMENT.name, documents)
 
     def test_committed_baseline_entries_are_all_valid_assertion_identifiers(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
