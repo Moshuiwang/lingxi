@@ -207,6 +207,52 @@ class TotalSizeNoticeTest(unittest.TestCase):
         self.assertIn("提示", notice)
 
 
+class MeasureDocumentsTest(unittest.TestCase):
+    """分册合并规则（Issue #479）：以断言编号为 key 取整个集合里的最大字节数。"""
+
+    def test_rows_from_every_volume_are_measured(self) -> None:
+        documents = {
+            "验收矩阵-一册.md": matrix_document("| V-开通-01 | 一句判定 | L2 | 已认领 |\n"),
+            "验收矩阵-二册.md": matrix_document("| V-权限-01 | 另一句判定 | L2 | 已验证 |\n"),
+        }
+        self.assertEqual(set(CHECK.measure_documents(documents)), {"V-开通-01", "V-权限-01"})
+
+    def test_the_same_identifier_in_two_volumes_takes_the_larger_count(self) -> None:
+        """搬去哪一册都不改变判定：任意一册里的超标行都不会被另一册的短行掩盖。"""
+        short_row = "| V-开通-01 | 短 | L2 | 已认领 |\n"
+        long_row = "| V-开通-01 | " + ("很长的裁定沿革" * 40) + " | L2 | 已认领 |\n"
+        documents = {
+            "验收矩阵-一册.md": matrix_document(short_row),
+            "验收矩阵-二册.md": matrix_document(long_row),
+        }
+        self.assertEqual(
+            CHECK.measure_documents(documents)["V-开通-01"],
+            len(long_row.rstrip("\n").encode("utf-8")),
+        )
+
+
+class TotalSizeReportTest(unittest.TestCase):
+    """触发线按**单个文件**判定（Issue #479 口径更新），合计只打印、不设阈值。"""
+
+    def test_each_document_is_reported_on_its_own(self) -> None:
+        documents = {
+            "验收矩阵.md": "短文档\n",
+            "验收矩阵-一册.md": "\n".join(f"行{i}" for i in range(CHECK.TOTAL_LINES_TRIGGER + 1)),
+        }
+        report = CHECK.render_total_size_report(documents)
+        self.assertIn("验收矩阵.md：", report)
+        self.assertIn("未触及分册触发线", report)
+        self.assertIn("【提示】", report)  # 触线的那一册照样出横幅
+        self.assertIn("验收矩阵全集合合计：2 个文件", report)
+
+    def test_two_documents_each_under_the_trigger_do_not_trigger_on_their_sum(self) -> None:
+        """口径更新的正面确认：单册各自不触线时，合计再大也只是打印，不出横幅。"""
+        half = "字" * (CHECK.TOTAL_BYTES_TRIGGER // 3 - 10)
+        report = CHECK.render_total_size_report({"a.md": half, "b.md": half})
+        self.assertNotIn("【提示】", report)
+        self.assertIn("验收矩阵全集合合计：2 个文件", report)
+
+
 class RunCheckDoesNotBlockOnTotalTriggerTest(unittest.TestCase):
     """行为级验证：即便总量触线，只要单行棘轮本身没有违规，run_check() 仍必须
     退出 0——这是「非阻断」这条规则唯一真正生效的地方，字符串提示本身不够。"""
@@ -217,6 +263,13 @@ class RunCheckDoesNotBlockOnTotalTriggerTest(unittest.TestCase):
         root = Path(self._tmp.name)
         self.matrix_path = root / "matrix.md"
         self.baseline_path = root / "baseline.txt"
+        # 读取范围自检要求「总册 + 至少一个分册」（Issue #479 / PR #490 P2-1），
+        # 所以夹具也按真实形状摆：一个总册 + 一个短行分册（短行不会进棘轮基线，
+        # 不影响这些用例各自要测的东西）。
+        self.volume_path = root / "验收矩阵-占位册.md"
+        self.volume_path.write_text(
+            matrix_document("| V-占位-01 | 占位分册的一行 | L2 | 已认领 |\n"), encoding="utf-8"
+        )
 
         self._orig_matrix = CHECK.MATRIX_DOCUMENT
         self._orig_baseline = CHECK.BASELINE_PATH
@@ -254,6 +307,11 @@ class RunRefreshClassificationTest(unittest.TestCase):
         root = Path(self._tmp.name)
         self.matrix_path = root / "matrix.md"
         self.baseline_path = root / "baseline.txt"
+        # 同上：读取范围自检要求「总册 + 至少一个分册」。
+        self.volume_path = root / "验收矩阵-占位册.md"
+        self.volume_path.write_text(
+            matrix_document("| V-占位-01 | 占位分册的一行 | L2 | 已认领 |\n"), encoding="utf-8"
+        )
 
         self._orig_repository_root = CHECK.REPOSITORY_ROOT
         self._orig_matrix = CHECK.MATRIX_DOCUMENT
@@ -318,6 +376,74 @@ class RunRefreshClassificationTest(unittest.TestCase):
         self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-开通-01": 50})
 
 
+class ReadRangeFailsClosedTest(unittest.TestCase):
+    """读取范围塌掉时必须判红（Issue #479 分册的直接后果，PR #490 独立审查 P2-1）。
+
+    分册前，把矩阵文件挪走会让 ``read_matrix_text()`` 抛 ``BaselineError`` 自然判红。
+    分册后同一场景变成「总册还在、8 个分册都不见了」：量到 0 条断言行，而
+    ``evaluate`` 对「基线里有、当前没有」一律放行（那条 continue 是给真删除留的），
+    于是脚本会安安静静 exit 0。这一组用例把那条路钉死。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.matrix_path = self.root / "matrix.md"
+        self.baseline_path = self.root / "baseline.txt"
+
+        self._orig_repository_root = CHECK.REPOSITORY_ROOT
+        self._orig_matrix = CHECK.MATRIX_DOCUMENT
+        self._orig_baseline = CHECK.BASELINE_PATH
+        CHECK.REPOSITORY_ROOT = self.root
+        CHECK.MATRIX_DOCUMENT = self.matrix_path
+        CHECK.BASELINE_PATH = self.baseline_path
+        self.addCleanup(self._restore)
+
+        self.matrix_path.write_text(
+            matrix_document("| V-开通-01 | 一句判定 | L2（真库） | 已认领 |\n"), encoding="utf-8"
+        )
+        self.baseline_path.write_text(CHECK.render_baseline({}), encoding="utf-8")
+
+    def _restore(self) -> None:
+        CHECK.REPOSITORY_ROOT = self._orig_repository_root
+        CHECK.MATRIX_DOCUMENT = self._orig_matrix
+        CHECK.BASELINE_PATH = self._orig_baseline
+
+    def _add_volume(self, rows: str) -> Path:
+        volume = self.root / "验收矩阵-一册.md"
+        volume.write_text(matrix_document(rows), encoding="utf-8")
+        return volume
+
+    def test_every_volume_missing_fails_closed(self) -> None:
+        """总册还在、分册一个都不在：必须判红，不许按「断言都下线了」放行。"""
+        exit_code = CHECK.run_check()
+        self.assertEqual(exit_code, 1)
+
+    def test_the_failure_names_the_read_range(self) -> None:
+        with self.assertRaises(CHECK.BaselineError) as caught:
+            CHECK.verify_read_range({"matrix.md": ""}, {"V-开通-01": 100})
+        self.assertIn("读取范围", str(caught.exception))
+        self.assertIn(CHECK.MATRIX_VOLUME_GLOB, str(caught.exception))
+
+    def test_enough_files_but_zero_assertion_rows_still_fails_closed(self) -> None:
+        """文件数凑够也不够：一条断言行都没量到说明表格结构被改动了。"""
+        (self.root / "验收矩阵-一册.md").write_text("# 分册\n\n没有任何表格。\n", encoding="utf-8")
+        self.matrix_path.write_text("# 产品验收矩阵\n\n没有任何表格。\n", encoding="utf-8")
+        self.assertEqual(CHECK.run_check(), 1)
+
+    def test_a_hub_plus_one_volume_passes(self) -> None:
+        """正面对照：补回一个分册就复绿——上面两条红不是被别的原因带出来的。"""
+        self._add_volume("| V-权限-01 | 另一句判定 | L2 | 已验证 |\n")
+        self.assertEqual(CHECK.run_check(), 0)
+
+    def test_refresh_refuses_on_a_broken_read_range_and_keeps_the_baseline(self) -> None:
+        """--refresh 会写基线：在坏掉的读取范围上刷新等于把全部登记一次抹掉。"""
+        self.baseline_path.write_text(CHECK.render_baseline({"V-权限-15": 11485}), encoding="utf-8")
+        self.assertEqual(CHECK.run_refresh(), 1)
+        self.assertEqual(CHECK.load_baseline(self.baseline_path), {"V-权限-15": 11485})
+
+
 class RealBaselineIsHonestTest(unittest.TestCase):
     """反向验证：仓库里已经提交的基线文件与真实矩阵文档必须诚实（记录值与实测
     精确相等），且脚本对当前真实矩阵实跑必须是绿——与 test_size_ratchet_check.py
@@ -325,8 +451,25 @@ class RealBaselineIsHonestTest(unittest.TestCase):
 
     def test_committed_baseline_matches_actual_row_byte_counts(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
-        current = CHECK.measure_rows(CHECK.read_matrix_text())
+        current = CHECK.measure_documents(CHECK.read_matrix_documents())
         self.assertEqual(CHECK.evaluate(baseline, current), [])
+
+    def test_every_baseline_entry_is_still_measured_after_the_split(self) -> None:
+        """分册（Issue #479）后每条基线登记都必须仍被丈量到。
+
+        ``evaluate`` 对「基线里有、矩阵里没有」这种情况刻意不判红（断言下线是合法
+        的）。所以如果丈量范围漏掉某个分册，上面那条用例会**静默变成空话**——它只
+        会看到一个空的 current 然后通过。这条用例正面钉住：登记的 20 条全都要被
+        当前的读取范围覆盖到。
+        """
+        baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
+        current = CHECK.measure_documents(CHECK.read_matrix_documents())
+        self.assertEqual(sorted(set(baseline) - set(current)), [])
+
+    def test_the_real_matrix_is_read_as_a_hub_plus_volumes(self) -> None:
+        documents = CHECK.read_matrix_documents()
+        self.assertGreater(len(documents), 1, "只读到总册，分册没进丈量范围")
+        self.assertIn(CHECK.MATRIX_DOCUMENT.name, documents)
 
     def test_committed_baseline_entries_are_all_valid_assertion_identifiers(self) -> None:
         baseline = CHECK.load_baseline(CHECK.BASELINE_PATH)
@@ -335,6 +478,11 @@ class RealBaselineIsHonestTest(unittest.TestCase):
 
     def test_run_check_passes_against_the_real_repository_matrix(self) -> None:
         self.assertEqual(CHECK.run_check(), 0)
+
+    def test_the_real_repository_read_range_self_check_passes(self) -> None:
+        documents = CHECK.read_matrix_documents()
+        CHECK.verify_read_range(documents, CHECK.measure_documents(documents))
+        self.assertGreaterEqual(len(documents), CHECK.MINIMUM_MATRIX_DOCUMENTS)
 
 
 if __name__ == "__main__":

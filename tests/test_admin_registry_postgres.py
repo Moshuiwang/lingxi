@@ -3,7 +3,7 @@
 唯一索引、CHECK 约束、真实读表这类断言必须在真库上验证，不用 mock（验证与门禁
 第五节）。建库走 `tests/postgres_schema.py` 的整条 alembic 链，与生产同源。
 
-认领断言（opus 批量审查 P3 修复：与 `docs/技术设计/验收矩阵.md` 实际行号核对，
+认领断言（opus 批量审查 P3 修复：与 `docs/技术设计/验收矩阵-接入与管理.md` 实际行号核对，
 此前四条 V-编号与矩阵实际定义逐条错位）：
 - V-管理-21：``RealTimeLookupTests`` 里"未登记 → ``None``"（``test_unknown_open_
   id_returns_none``）与"已登记 → 读回完整条目、三类角色全授予"

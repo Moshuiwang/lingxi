@@ -114,7 +114,7 @@
    上；``run_once`` 只做"认领若干条并提交"，认领量由执行器剩余容量压住。
 
 10. **迟到就绪恢复**（:class:`~lingxi.apps.scheduler.late_readiness_recovery.
-    LateReadinessRecoveryDuty`，[V-开通-18](../../../../docs/技术设计/验收矩阵.md)）——
+    LateReadinessRecoveryDuty`，[V-开通-18](../../../../docs/技术设计/验收矩阵-开通与身份.md)）——
     首次开通编排（职责 9）的阻塞式就绪确认判超时之后，``provisioning_state`` 停在
     ``mcp_syncing``，此前没有任何东西会再回来看这个人。第十个职责每轮按十五分钟一次
     的节奏（在候选查询里判到期，不是每轮都真的发探针）把这些用户重新捞回来再探一次，

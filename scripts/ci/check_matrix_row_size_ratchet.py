@@ -31,11 +31,20 @@ UTF-8 字节数」，以断言编号为 key：
 内部实现的先例，脚本各自独立可运行、失败原因不牵连），靠这份注释和两边测试
 分别对真实文档跑通来保证口径同步。
 
-**总量触发线（非阻断）**：同一次运行里，对全文件做 400KB / 1500 行双指标检测
-（先触线者生效），触线打印醒目提示、**exit 0 不卡红**——按 Gate G-4 产物的分册
-预案，触线只是「下一次改动该文件前必须先完成分册」的信号，不是立即失败；不能
-让一次总量提示误伤当次无关 PR。分册规则本身写在
-``docs/技术设计/验收矩阵.md`` 文件头「体量预算」小节，这里只负责量出数字。
+**读取范围（Issue #479 分册后）**：矩阵从「一个文件」变成「总册
+``验收矩阵.md`` + 同目录全部 ``验收矩阵-*.md`` 分册」。单行 800B 棘轮的判定标准
+一个字没改，只是丈量范围扩成整个集合：以断言编号为 key，取该编号在**所有**分册
+里出现过的最大字节数与基线比较，所以断言搬去哪一册都不改变判定结果。分册靠目录
+扫描发现而不是写死清单——写死清单意味着新增一册忘了登记就静默脱离棘轮。
+
+**总量触发线（非阻断）**：400KB / 1500 行双指标（先触线者生效），触线打印醒目
+提示、**exit 0 不卡红**——按 Gate G-4 产物的分册预案，触线只是「下一次改动该文件
+前必须先完成分册」的信号，不是立即失败；不能让一次总量提示误伤当次无关 PR。
+**分册后计量单位从「整份矩阵一个文件」改成「每个文件各自独立」，两个数值不变**
+（口径更新经 Issue #479 批准，留痕在总册「体量预算」小节）：一册触线就提示把那
+一册再拆一层。同时打印全部分册的合计字节/行数，让「每册都不触线、加起来仍在膨胀」
+这种情况有人能看见。分册规则本身写在 ``docs/技术设计/验收矩阵.md`` 文件头
+「体量预算」小节，这里只负责量出数字。
 """
 
 from __future__ import annotations
@@ -47,9 +56,17 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MATRIX_DOCUMENT = REPOSITORY_ROOT / "docs" / "技术设计" / "验收矩阵.md"
+# 分册命名空间：与总册同目录、同前缀（与 check_acceptance_matrix.py 的
+# MATRIX_VOLUME_GLOB 逐字保持一致，同一份集合必须被两个检查同时看见）。
+MATRIX_VOLUME_GLOB = "验收矩阵-*.md"
 BASELINE_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "matrix_row_size_baseline.txt"
 
 THRESHOLD_BYTES = 800
+# 读取范围自检下限（Issue #479 分册后）：矩阵至少是「总册 + 1 个分册」。分册被
+# 改名/移出 glob 时，本脚本会量到 0 条断言行然后一路 exit 0——那是最危险的一种
+# 绿：棘轮还在跑，但它什么都没在看。分册前同一场景由「读不到文件」自然判红，
+# 分册后必须显式补回来（PR #490 独立审查 P2-1）。
+MINIMUM_MATRIX_DOCUMENTS = 2
 TOTAL_BYTES_TRIGGER = 400 * 1024
 TOTAL_LINES_TRIGGER = 1500
 
@@ -137,11 +154,64 @@ def measure_rows(text: str) -> dict[str, int]:
     return counts
 
 
+def verify_read_range(documents: dict[str, str], current: dict[str, int]) -> None:
+    """读取范围自检：范围塌掉时**失败关闭**，不许安静地量出 0 条然后 exit 0。
+
+    两条判据各挡一种塌法：
+    1. 文件数少于 ``MINIMUM_MATRIX_DOCUMENTS``——分册被改名、移走或 glob 写坏，
+       整批断言脱离棘轮，而每一个还留在基线里的编号都会被 ``evaluate`` 当成
+       「已下线」放行（那条 continue 是给真删除留的口子，不该给读丢了的分册用）；
+    2. 一条断言行都没量到——就算文件数凑够了，也说明表头/表格结构被改动，
+       同 ``check_acceptance_matrix.py`` 的「一条断言都没解析到」同一条纪律。
+    """
+    if len(documents) < MINIMUM_MATRIX_DOCUMENTS:
+        raise BaselineError(
+            f"矩阵读取范围只发现 {len(documents)} 个文件（总册 {MATRIX_DOCUMENT.name} + "
+            f"{MATRIX_DOCUMENT.parent.name}/{MATRIX_VOLUME_GLOB} 分册），"
+            f"少于下限 {MINIMUM_MATRIX_DOCUMENTS}。分册被改名或移出 glob 会让整批断言"
+            "脱离棘轮却仍然全绿——这里失败关闭，不按空集合放行。"
+        )
+    if not current:
+        raise BaselineError(
+            f"在 {len(documents)} 个矩阵文件里一条 V-* 断言行都没量到："
+            "表头或表格结构被改动了。棘轮拒绝按空集合给出绿灯。"
+        )
+
+
 def read_matrix_text() -> str:
     try:
         return MATRIX_DOCUMENT.read_text(encoding="utf-8")
     except OSError as error:
         raise BaselineError(f"无法读取验收矩阵文档 {MATRIX_DOCUMENT}：{error}") from error
+
+
+def matrix_volumes() -> list[Path]:
+    """总册同目录下的全部分册，按文件名排序。"""
+    return sorted(MATRIX_DOCUMENT.parent.glob(MATRIX_VOLUME_GLOB))
+
+
+def read_matrix_documents() -> dict[str, str]:
+    """「显示名 → 正文」：总册在前，分册按文件名排序跟在后面。"""
+    documents = {MATRIX_DOCUMENT.name: read_matrix_text()}
+    for volume in matrix_volumes():
+        try:
+            documents[volume.name] = volume.read_text(encoding="utf-8")
+        except OSError as error:
+            raise BaselineError(f"无法读取验收矩阵分册 {volume}：{error}") from error
+    return documents
+
+
+def measure_documents(documents: dict[str, str]) -> dict[str, int]:
+    """断言编号 → 该编号在整个集合里出现过的最大 UTF-8 字节数。
+
+    合并规则与单文档内的重复行策略同一条（取最大值）：搬到哪一册都不改变判定，
+    任意一册里的任意一行超标都会被抓到。
+    """
+    counts: dict[str, int] = {}
+    for text in documents.values():
+        for identifier, size in measure_rows(text).items():
+            counts[identifier] = max(counts.get(identifier, 0), size)
+    return counts
 
 
 def parse_baseline(text: str) -> dict[str, int]:
@@ -238,27 +308,48 @@ def render_total_size_notice(text: str) -> str:
     return "\n".join(
         [
             banner,
-            "【提示】验收矩阵总量已触及分册触发线（400KB 或 1500 行，先触发者生效）：",
+            "【提示】验收矩阵某一册总量已触及分册触发线（400KB 或 1500 行，先触发者生效）：",
             f"当前 {total_bytes}B / {total_lines} 行。本提示不卡红、不影响退出码。",
-            "下一次改动 docs/技术设计/验收矩阵.md 前，必须先完成分册："
-            "优先按存活状态归档到 docs/参考证据/验收矩阵-归档.md"
-            "（不改变现有产品域章节标题与锚点）；不够再按产品域二次拆分。"
-            "详见该文件头部「体量预算」小节。",
+            "下一次改动该分册前，必须先把它再拆一层："
+            "优先在册内按既有章节继续切分（新分册照 docs/技术设计/验收矩阵-*.md 命名，"
+            "并在总册分册索引里登记），或按存活状态归档到 docs/参考证据/验收矩阵-归档.md。"
+            "详见总册 docs/技术设计/验收矩阵.md 头部「体量预算」小节。",
             banner,
         ]
     )
 
 
+def render_total_size_report(documents: dict[str, str]) -> str:
+    """逐册打印总量状态，末尾补一行全集合合计。
+
+    合计只是给人看的信号，没有独立阈值——触发线的判定单位就是单个文件（Issue #479
+    口径更新），这里不引入第二套没被批准的判定标准。
+    """
+    lines = [f"{name}：{render_total_size_notice(text)}" for name, text in documents.items()]
+    total_bytes = sum(len(text.encode("utf-8")) for text in documents.values())
+    total_lines = sum(len(text.splitlines()) for text in documents.values())
+    lines.append(
+        f"验收矩阵全集合合计：{len(documents)} 个文件、{total_bytes}B、{total_lines} 行"
+        "（合计无独立阈值，触发线按单个文件判定；此行供人判断整体膨胀）"
+    )
+    return "\n".join(lines)
+
+
 def run_check() -> int:
     try:
         baseline = load_baseline(BASELINE_PATH)
-        text = read_matrix_text()
+        documents = read_matrix_documents()
     except BaselineError as error:
         print(f"验收矩阵单行体量棘轮检查失败：{error}", file=sys.stderr)
         return 1
 
-    current = measure_rows(text)
-    print(render_total_size_notice(text))
+    current = measure_documents(documents)
+    try:
+        verify_read_range(documents, current)
+    except BaselineError as error:
+        print(f"验收矩阵单行体量棘轮检查失败：{error}", file=sys.stderr)
+        return 1
+    print(render_total_size_report(documents))
 
     failures = evaluate(baseline, current)
     if failures:
@@ -269,8 +360,8 @@ def run_check() -> int:
 
     over_threshold = sum(1 for size in current.values() if size > THRESHOLD_BYTES)
     print(
-        f"验收矩阵单行体量棘轮：通过（扫描 {len(current)} 条断言行，阈值 {THRESHOLD_BYTES}B，"
-        f"{over_threshold} 条在棘轮基线内，{len(baseline)} 条基线登记）"
+        f"验收矩阵单行体量棘轮：通过（扫描 {len(documents)} 个文件、{len(current)} 条断言行，"
+        f"阈值 {THRESHOLD_BYTES}B，{over_threshold} 条在棘轮基线内，{len(baseline)} 条基线登记）"
     )
     return 0
 
@@ -278,12 +369,18 @@ def run_check() -> int:
 def run_refresh() -> int:
     try:
         baseline = load_baseline(BASELINE_PATH)
-        text = read_matrix_text()
+        documents = read_matrix_documents()
     except BaselineError as error:
         print(f"验收矩阵单行体量棘轮刷新失败：{error}", file=sys.stderr)
         return 1
 
-    current = measure_rows(text)
+    current = measure_documents(documents)
+    try:
+        verify_read_range(documents, current)
+    except BaselineError as error:
+        # --refresh 会写基线：在一个坏掉的读取范围上刷新，等于把全部登记一次抹掉。
+        print(f"验收矩阵单行体量棘轮刷新失败：{error}", file=sys.stderr)
+        return 1
 
     # 与 check_size_ratchet.py 的 run_refresh 同一纪律：只处理「基线记录 > 实测」
     # 这一类（该编号已经缩小、或有人手工调大了基线，--refresh 一律以实测为准
