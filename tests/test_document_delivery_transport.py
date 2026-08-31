@@ -176,12 +176,33 @@ class _RecordingDeliveryStore:
     """``PostgresDocumentDeliveryStore`` 的假实现，只记录调用、不接触数据库
     ——供不需要真库的 gateway 分支单测使用（Issue #408 正式方案接线）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, unnotified: Any = ()) -> None:
         self.document_created: list[tuple[str, str, str | None]] = []
         self.succeeded: list[str] = []
         self.uncertain: list[tuple[str, str]] = []
         self.failed: list[tuple[str, str]] = []
         self.notified: list[str] = []
+        # Issue #499：降级检查点（迁移 0080）的调用记录。
+        self.body_degraded: list[tuple[str, str]] = []
+        self._unnotified = list(unnotified)
+
+    # -- run_once 需要的循环级方法（只服务补发通知这条腿，其余返回空） --------
+
+    def fail_exhausted_pending(self) -> int:
+        return 0
+
+    def reclaim_stale_processing(self) -> tuple[int, int]:
+        return (0, 0)
+
+    def claim_unnotified_succeeded(self, *, limit: int) -> list[Any]:
+        pending, self._unnotified = self._unnotified, []
+        return pending
+
+    def claim_pending(self, *, limit: int) -> list[Any]:
+        return []
+
+    def mark_body_degraded(self, *, request_id: str, reason: str) -> None:
+        self.body_degraded.append((request_id, reason))
 
     def mark_document_created(
         self, *, request_id: str, document_id: str, resource_url: str | None = None
@@ -279,11 +300,13 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         document_id: str | None = None,
         task_id: str | None = None,
         markdown: str | None = None,
+        body_degraded_reason: str | None = None,
     ) -> None:
         self.execute(
             """INSERT INTO task_document_delivery_request
-               (id, task_id, requester_open_id, title, paragraphs, document_id, markdown)
-               VALUES (%s, %s, %s, '标题', %s, %s, %s)""",
+               (id, task_id, requester_open_id, title, paragraphs, document_id, markdown,
+                body_degraded_reason)
+               VALUES (%s, %s, %s, '标题', %s, %s, %s, %s)""",
             (
                 request_id,
                 task_id or self.TASK_ID,
@@ -291,6 +314,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
                 json.dumps(["段落一", "段落二"], ensure_ascii=False),
                 document_id,
                 markdown,
+                body_degraded_reason,
             ),
         )
 
@@ -1058,6 +1082,8 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         self.assertEqual(open_id, self.REQUESTER_OPEN_ID)
         self.assertIn("doc-unnotified", text)
         self.assertEqual(dedupe_key, "document-ready:tdd-unnotified")
+        # 反向哨兵：没有降级的行补发的是普通就绪文案，不含"格式做了简化"。
+        self.assertNotIn("格式做了简化", text)
         self.assertIsNotNone(
             self.scalar(
                 "SELECT notified_at FROM task_document_delivery_request WHERE id = 'tdd-unnotified'"
@@ -1068,6 +1094,86 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
         notifier.sent.clear()
         consumer.run_once()
         self.assertEqual(notifier.sent, [])
+
+    def test_resent_notice_for_a_degraded_row_still_says_the_format_was_simplified(self) -> None:
+        """Issue #499：补发通知是**另一次进程调用**，看不到原发送那次
+        ``write_body`` 的内存信号——它必须从库里读 ``body_degraded_reason``
+        （迁移 0080）才知道要用明示降级的文案。
+
+        变异锚点：把 ``claim_unnotified_succeeded`` 的 SELECT 里
+        ``body_degraded_reason`` 去掉（或把 ``_send_ready_notice`` 的文案分派
+        改成恒选 ``delivery.document_ready``），本用例会从"文案含格式已简化"
+        变红——那正是"用户被静默地降级交付"这条被明令禁止的行为。
+        """
+
+        self._seed_pending_request(
+            request_id="tdd-degraded-unnotified",
+            document_id="doc-degraded",
+            body_degraded_reason="unsupported_nested_blocks",
+        )
+        self.execute(
+            "UPDATE task_document_delivery_request "
+            "SET status = 'succeeded', permission_confirmed_at = now(), "
+            "updated_at = now() - interval '11 minutes' WHERE id = 'tdd-degraded-unnotified'"
+        )
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(store=self.store, docx=_SpyDocx(), notifier=notifier)
+
+        consumer.run_once()
+
+        self.assertEqual(len(notifier.sent), 1)
+        _, text, dedupe_key = notifier.sent[0]
+        self.assertIn("doc-degraded", text)
+        self.assertIn("格式做了简化", text)
+        # 去重前缀与普通就绪文案共用：同一次交付的两次通知尝试，不是两条通知。
+        self.assertEqual(dedupe_key, "document-ready:tdd-degraded-unnotified")
+
+    def test_mark_body_degraded_persists_the_reason_and_claim_pending_reads_it_back(self) -> None:
+        """迁移 0080 的检查点列真库往返：``mark_body_degraded`` 单独提交之后，
+        下一次认领必须把原因码带回 :class:`DocumentDeliveryClaim`——检查点恢复
+        路径会跳过写正文步、拿不到那次 ``write_body`` 的返回值，只能靠这一列。
+        """
+
+        self._seed_pending_request(request_id="tdd-degrade-checkpoint")
+        [claim] = self.store.claim_pending(limit=1)
+        self.assertIsNone(claim.body_degraded_reason)
+
+        self.store.mark_body_degraded(
+            request_id="tdd-degrade-checkpoint", reason="unsupported_nested_blocks"
+        )
+
+        self.assertEqual(
+            self.scalar(
+                "SELECT body_degraded_reason FROM task_document_delivery_request "
+                "WHERE id = 'tdd-degrade-checkpoint'"
+            ),
+            "unsupported_nested_blocks",
+        )
+        # 回收成 pending 后重新认领：这一次必须带着原因码进来。
+        self.execute(
+            "UPDATE task_document_delivery_request SET status = 'pending' "
+            "WHERE id = 'tdd-degrade-checkpoint'"
+        )
+        [reclaimed] = self.store.claim_pending(limit=1)
+        self.assertEqual(reclaimed.body_degraded_reason, "unsupported_nested_blocks")
+
+    def test_body_degraded_reason_check_rejects_a_sheet_row_carrying_a_value(self) -> None:
+        """迁移 0080 的 CHECK：sheet 分支没有"markdown 转换"这个概念，也就没有
+        "转换被拒绝所以降级"这件事——数据库层直接拒绝这种自相矛盾的行。"""
+
+        with self.assertRaises(Exception):
+            self.execute(
+                """INSERT INTO task_document_delivery_request
+                   (id, task_id, requester_open_id, title, paragraphs, delivery_type,
+                    body_degraded_reason)
+                   VALUES ('tdd-sheet-degraded', %s, %s, '标题', %s, 'sheet',
+                           'unsupported_nested_blocks')""",
+                (
+                    self.TASK_ID,
+                    self.REQUESTER_OPEN_ID,
+                    json.dumps([["A1"]], ensure_ascii=False),
+                ),
+            )
 
     def test_a_fresh_unnotified_success_within_the_backoff_window_is_not_resent_yet(
         self,
@@ -1784,6 +1890,125 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
         self.assertEqual(store.succeeded, [])
         self.assertEqual(store.failed, [("tdd-wire-1", "feishu_code_99991400")])
         self.assertEqual(store.document_created, [("tdd-wire-1", self.DOCUMENT_ID, None)])
+
+    @staticmethod
+    def _unsupported_nested_convert_response() -> dict[str, Any]:
+        """真实表格的响应形状：单元格作为独立元素出现在 ``blocks`` 里、却不在
+        ``first_level_block_ids`` 内 → ``unsupported_nested_blocks``。"""
+
+        return {
+            "code": 0,
+            "data": {
+                "blocks": [
+                    {"block_id": "blk-table", "block_type": 31, "table": {"column_size": 2}},
+                    {"block_id": "blk-table-cell", "block_type": 32},
+                ],
+                "first_level_block_ids": ["blk-table"],
+            },
+        }
+
+    def test_switch_on_unsupported_nested_blocks_degrades_delivers_and_tells_the_user(self) -> None:
+        """Issue #499 的 gateway 端核心用例（产品负责人 2026-08-31 裁定）：回答
+        里含表格时**不再整次失败**——转换被拒后改写段落、继续授权与读回、判成功，
+        并且给用户的就绪通知换成明示"格式已简化"的那条文案。
+
+        **同时是"孤儿文档不再产生"的证据**：命中失败的旧行为里，转换在写正文步
+        就抛了，``grant_full_access`` 从never执行——飞书云盘里每失败一次就多留
+        一篇空的、未授权、谁也打不开的文档（#499 W0-1 新发现）。这里断言第 4 次
+        调用确实是授权端点，即那篇文档已经被正常写入并授予给提问用户。
+        """
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._unsupported_nested_convert_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _RecordingDeliveryStore()
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
+        )
+        claim = self._claim(markdown="| 公司 | 指标 |\n| --- | --- |")
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 5, "建档→转换（被拒）→段落写入→授权→读回")
+        _, write_url, write_body, _ = transport.calls[2]
+        self.assertEqual(
+            write_url,
+            f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
+        )
+        # 降级后写进去的是段落路径的产物，不是转换响应里的表格块。
+        self.assertEqual(
+            write_body["children"],
+            [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}],
+        )
+        # 孤儿文档消除的直接证据：授权这一步真的发生了。
+        _, grant_url, _, _ = transport.calls[3]
+        self.assertEqual(
+            grant_url,
+            f"{self.BASE_URL}/drive/v1/permissions/{self.DOCUMENT_ID}/members?type=docx",
+        )
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(store.failed, [])
+        # 降级检查点单独落库（迁移 0080）——补发通知与检查点恢复路径靠它。
+        self.assertEqual(store.body_degraded, [("tdd-wire-1", "unsupported_nested_blocks")])
+        # 明示降级：用户拿到的通知必须说清格式被简化了。
+        self.assertEqual(len(notifier.sent), 1)
+        _, text, dedupe_key = notifier.sent[0]
+        self.assertIn("格式做了简化", text)
+        self.assertIn(self.DOCUMENT_ID, text)
+        self.assertEqual(dedupe_key, "document-ready:tdd-wire-1")
+
+    def test_checkpoint_recovery_of_a_degraded_row_still_tells_the_user_it_was_simplified(
+        self,
+    ) -> None:
+        """检查点恢复路径跳过写正文步，因此**永远不会**再产生一次
+        ``WriteBodyOutcome``——降级说明只能从 claim 带进来的
+        ``body_degraded_reason``（迁移 0080）继承。
+
+        变异锚点：把 ``_process_docx_claim`` 里
+        ``body_degraded_reason = claim.body_degraded_reason`` 改成 ``= None``，
+        本用例会从"文案含格式已简化"变红成普通就绪文案。
+        """
+
+        transport = _RecordingUserMessageTransport(
+            [
+                # 恢复路径先读回正文根 block：非空即"已经写过"，跳过写正文。
+                {"code": 0, "data": {"items": [{"block_id": "b1", "block_type": 2}]}},
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _RecordingDeliveryStore()
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
+        )
+        claim = DocumentDeliveryClaim(
+            id="tdd-wire-1",
+            task_id="tsk-wire-1",
+            requester_open_id=self.OPEN_ID,
+            title="标题",
+            paragraphs=("正文段落",),
+            document_id=self.DOCUMENT_ID,
+            attempts=2,
+            markdown="| 公司 | 指标 |",
+            body_degraded_reason="unsupported_nested_blocks",
+        )
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 3, "读回正文→授权→读回协作者，不再写正文")
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        # 没有再次降级，因此不重复落检查点。
+        self.assertEqual(store.body_degraded, [])
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertIn("格式做了简化", notifier.sent[0][1])
 
     def test_null_markdown_falls_back_to_paragraphs_regardless_of_the_switch_state(self) -> None:
         """NULL markdown 回退段落：即使转换开关打开，这一行的 ``markdown`` 列是

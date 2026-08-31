@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0079_document_delivery_markdown` |
+| head revision | `0080_document_delivery_degraded` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -490,6 +490,30 @@ Issue #408 正式方案第二步。不新建表：`task_document_delivery_reques
 
 `downgrade()` 直接删该列及其 CHECK，有损（非空 `markdown` 随列丢失，不删行
 本身），与 `0078` 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0080_document_delivery_degraded`（明示降级：检查点表新增 body_degraded_reason 列）
+
+Issue #499（rc23 S-6，产品负责人 2026-08-31 裁定「降级交付」）。不新建表：
+`task_document_delivery_request` 新增可空 `body_degraded_reason` 列。docx 正文
+命中本仓库不支持的嵌套结构（`unsupported_nested_blocks`，典型是 markdown 表格）
+时，改走纯文本段落路径交付而不是整次失败——这一列就是「这次是降级写进去的」
+这件事的跨进程载体。
+
+**为什么必须落库**：「文档已就绪」通知有三条发送路径，只有一条看得见同一次调用
+的内存信号——原发送路径、补发未确认送达路径（另一次进程调用）、检查点恢复路径
+（跳过写正文步，永远不会再产生降级信号）。后两条读不到这一列时会发出**不带降级
+说明**的就绪通知，等于把裁定退化成被明令禁止的静默降级。写入时机是降级正文写入
+成功之后**单独提交**（同 `document_id` 检查点的纪律，见
+`adapters/postgres_document_delivery.py::mark_body_degraded`）。
+
+不复用 `last_error`：那一列会被回收/死信路径写入，`status='succeeded' AND
+last_error IS NOT NULL` 表达的是「曾经卡住过」而不是「这次降级了」，压进同一列
+会让通知路径误报降级。`CHECK (body_degraded_reason IS NULL OR delivery_type IS
+NOT DISTINCT FROM 'docx')` 与 `0079` 的 `markdown` CHECK 同一姿态。本列是运行
+事实（固定枚举原因码，不含用户内容），**不进** `V-投递-06` 的 24 小时正文擦除。
+
+`downgrade()` 直接删该列及其 CHECK，有损（非空取值随列丢失，不删行本身），与
+`0078`/`0079` 既有先例同一姿态（本 revision 未在任何环境应用过）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

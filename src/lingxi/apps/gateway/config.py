@@ -115,10 +115,13 @@ class GatewayConfig:
     # LarkDocxDelivery.write_body`` 在这个值为 `True` 时走官方转换路径。显式
     # 关闭用精确值 `"0"`；历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage
     # 配置）**必须继续解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
-    # 打开前提：Bot 权限含 ``docx:document.block:convert``，转换失败一律交付
-    # 失败（失败关闭），不静默降级回段落路径——见 ``deploy/.env.example`` 对应
-    # 条目与 ``LarkDocxDelivery.write_body`` 模块文档「markdown 官方转换开关」
-    # 一节。
+    # 打开前提：Bot 权限含 ``docx:document.block:convert``。失败语义（Issue
+    # #499，产品负责人 2026-08-31 裁定）：正文含本仓库不支持的嵌套结构
+    # （``unsupported_nested_blocks``，典型是 markdown 表格）时**降级交付**
+    # ——改走纯文本段落路径写入并如实告知用户格式已简化，不是整次失败；其余
+    # 一切失败仍然一律交付失败/结果不明（失败关闭），**不降级、不静默退回段落
+    # 路径**。见 ``deploy/.env.example`` 对应条目与 ``LarkDocxDelivery.
+    # write_body`` 模块文档「markdown 官方转换开关」一节。
     markdown_convert_enabled: bool = True
 
     # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，

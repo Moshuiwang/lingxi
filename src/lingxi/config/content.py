@@ -136,6 +136,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.all_companies",
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
+    "delivery.document_ready_degraded",
     # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",
