@@ -1,5 +1,5 @@
 """迟到就绪恢复的持久化：候选查询、「推进 active + 排通知」同事务、通知 outbox 的
-claim / complete / purge（[V-开通-18](../../../docs/技术设计/验收矩阵.md)）。
+claim / complete / purge（[V-开通-18](../../../docs/技术设计/验收矩阵-开通与身份.md)）。
 
 外部独立审查（codex）三条必修在这里落地：
 
