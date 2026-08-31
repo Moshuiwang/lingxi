@@ -204,7 +204,10 @@ class SuspendTriggersInstantRevokeTests(PermissionRecomputeTriggerPostgresTestCa
         # handle() 的对应注释）。
         self.assertEqual(outcome["toast"]["type"], "success")
         self.assertEqual(outcome["toast"]["content"], "已确认执行。")
-        self.assertIn("即时生效", outcome["card"]["data"]["body"]["elements"][0]["content"])
+        self.assertIn(
+            "操作已记录，权限正在下发",
+            outcome["card"]["data"]["body"]["elements"][0]["content"],
+        )
 
         # 账号状态：既有行为不变（本卡不改动这一层）。
         account_state = self.query(
@@ -331,7 +334,10 @@ class LocalPermissionGrantResolvesTheOwningUserIdTests(PermissionRecomputeTrigge
         # 卡片正文里核对（同上一处注释）。
         self.assertEqual(outcome["toast"]["type"], "success")
         self.assertEqual(outcome["toast"]["content"], "已确认执行。")
-        self.assertIn("即时生效", outcome["card"]["data"]["body"]["elements"][0]["content"])
+        self.assertIn(
+            "操作已记录，权限正在下发",
+            outcome["card"]["data"]["body"]["elements"][0]["content"],
+        )
 
         # 真实反查依赖的形状：confirm() 新插入的这一行，pending_action_id 恰好
         # 是这次确认卡自己的 id，user_id 是目标用户的内部标识，两者与 override_id

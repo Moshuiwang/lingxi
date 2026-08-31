@@ -79,10 +79,22 @@ _do_without_validation`` 此前对一切事件都返回 ``None``（=空 OK），
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+import inspect
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Protocol
 
 from lingxi.core.admin.display_names import AdminDisplayNames
-from lingxi.core.admin.management_card import ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS
+from lingxi.core.admin.management_card import (
+    ADMIN_ACTION_CANCEL,
+    ADMIN_ACTION_GRANT,
+    ADMIN_ACTION_SUPPRESS,
+)
+from lingxi.core.admin.card_dispatch import (
+    ManagementCardContext,
+    management_card_fingerprint,
+)
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -99,7 +111,9 @@ from lingxi.core.admin.pending_action import (
     PendingActionAuditWriteFailed,
     PendingActionStatus,
     PendingActionTransientFailure,
+    PendingActionType,
 )
+from lingxi.core.admin.views import AdminUserStatusView
 
 
 class _Decision(Protocol):
@@ -172,7 +186,44 @@ class ManagementActionRouter(Protocol):
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> _ManagementRouteOutcome: ...
+
+
+class ManagementCardContextReader(Protocol):
+    def lookup_context(self, *, message_id: str) -> ManagementCardContext | None: ...
+
+    def update_state(
+        self,
+        *,
+        message_id: str,
+        state: str | None = None,
+        dispatch_status: str | None = None,
+        snapshot_fingerprint: str | None = None,
+        last_trace_id: str | None = None,
+    ) -> ManagementCardContext | None: ...
+
+
+class ManagementCardRefresher(Protocol):
+    """在原管理卡实体上按持久 sequence 更新最新状态。"""
+
+    def update(
+        self,
+        *,
+        context: ManagementCardContext,
+        status: AdminUserStatusView,
+        state: str,
+        dispatch_status: str | None = None,
+        status_message: str | None = None,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class _ManagementContextCheck:
+    context: ManagementCardContext | None
+    status: AdminUserStatusView | None
+    stale: bool = False
+    forbidden: bool = False
 
 
 #: 管理卡逐行「撤销」按钮没有独立的原因输入框（issue #439 B 档设计：一键撤销，
@@ -203,9 +254,8 @@ _WRITE_ACTION_PENDING_CONTENT_KEY = "admin.write_action_pending"
 
 def _toast_from_route_outcome(outcome: _ManagementRouteOutcome) -> dict[str, Any]:
     """把 ``AdminCommandRouter.route()`` 的结论翻译成管理卡交互的 toast 应答
-    （不带 ``card`` 键——管理卡面板本身不因为一次表单提交而改变展示，管理员可以
-    继续在同一张卡上发起下一次操作，见 ``core/admin/management_card.py`` 模块
-    文档"管理卡不支持 update()"一节）。"""
+    （表单/逐行按钮的提交结果先以 toast 返回；原管理卡的不可操作状态由出带外
+    持久化更新负责，见 ``core/admin/management_card.py`` 与 gateway 装配）。"""
 
     if not outcome.handled:
         # 结构上只会发生在"点击这一刻当前角色恰好已被撤销"——route() 内部会重新
@@ -243,6 +293,9 @@ class AdminCardCallbackHandler:
         display_names: AdminDisplayNames,
         management_actions: ManagementActionRouter | None = None,
         recompute_trigger: PermissionRecomputeTrigger | None = None,
+        management_context_store: ManagementCardContextReader | None = None,
+        management_state_lookup: Callable[[str], AdminUserStatusView | None] | None = None,
+        management_card_refresher: ManagementCardRefresher | None = None,
     ) -> None:
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
@@ -258,9 +311,12 @@ class AdminCardCallbackHandler:
         # （#439 新增，向后兼容既有全部调用点：不传这个参数时行为逐字节不变）。
         self._management_actions = management_actions
         # 定向权限重算触发口（Issue #438）：``None`` 表示装配层还没接（与
-        # ``group_notifier=None`` 同一姿态）——不报错、不重试，即时生效这一层
-        # 纵深缺席时，每日批仍是保底,行为退回本卡之前的既有状态。
+        # ``group_notifier=None`` 同一姿态）——不报错、不重试，异步下发这一层
+        # 纵深缺席时，每日批仍是保底，确认事务本身的结果不被改变。
         self._recompute_trigger = recompute_trigger
+        self._management_context_store = management_context_store
+        self._management_state_lookup = management_state_lookup
+        self._management_card_refresher = management_card_refresher
 
     def handle_management_form_submit(
         self,
@@ -275,8 +331,10 @@ class AdminCardCallbackHandler:
         thread_id: str | None,
         message_id: str,
         trace_id: str,
+        position_name: str = "",
+        company_scope: str = "",
     ) -> dict[str, Any]:
-        """管理卡「新增授权 / 新增抑制」表单提交（#439 B 档新增交互分支）。
+        """管理卡「职位+公司范围补充授权」表单提交（#493）。
 
         参数是**已经从飞书表单回传值解析出来的干净字段**——原始 ``card.action.
         trigger`` 事件体的解析（含如何从表单字段里取出 ``company_id``/
@@ -294,6 +352,7 @@ class AdminCardCallbackHandler:
 
         if self._management_actions is None:
             return _toast_error("该功能当前不可用，请改用文本命令")
+        position_form = bool(position_name or company_scope)
         if admin_action not in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
             self._audit.record(
                 "admin.card_callback.management_unknown_action",
@@ -301,6 +360,24 @@ class AdminCardCallbackHandler:
                 trace_id=trace_id,
             )
             return _toast_error("操作不存在或已失效")
+        context_check = self._management_context(
+            message_id=message_id,
+            identifier=identifier,
+            operator_open_id=operator_open_id,
+            trace_id=trace_id,
+        )
+        if context_check.forbidden:
+            return _toast_error("只有发起该管理卡的管理员本人可以操作")
+        if context_check.stale:
+            return _toast_error("数据已变化，请重新查询")
+        context = context_check.context
+        current_status = context_check.status
+        if context is not None and not identifier:
+            identifier = context.identifier
+        elif context is not None:
+            # The card context is authoritative.  Never allow a tampered hidden
+            # identifier to redirect a management-card action to another user.
+            identifier = context.identifier
         if not identifier:
             # opus 审查坐实并修复：不校验就直接拼命令文本时，`identifier` 为空
             # 会让下面的 f-string 拼出两个连续空白（`.../{sub_command} {""} {company_id} ...`）
@@ -318,6 +395,37 @@ class AdminCardCallbackHandler:
                 trace_id=trace_id,
             )
             return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
+        if position_form:
+            if admin_action != ADMIN_ACTION_GRANT:
+                return _toast_error("职位+公司范围只支持补充授权")
+            if not reason.strip():
+                return _toast_error("请填写原因")
+            if not position_name.strip():
+                return _toast_error("请选择银河职位")
+            if not company_scope.strip():
+                return _toast_error("请选择公司范围")
+            if any(ch.isspace() for ch in position_name) or any(
+                ch.isspace() for ch in company_scope
+            ):
+                return _toast_error("职位或公司范围无效，请重新选择")
+            text = f"/admin grant_position {identifier} {position_name} {company_scope} {reason.strip()}"
+            outcome = self._route_management_action(
+                operator_open_id=operator_open_id,
+                text=text,
+                trace_id=trace_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+            )
+            if outcome.handled and outcome.content_key == _WRITE_ACTION_PENDING_CONTENT_KEY:
+                self._mark_management_submitted(
+                    context=context,
+                    status=current_status,
+                    message_id=message_id,
+                    trace_id=trace_id,
+                )
+            return _toast_from_route_outcome(outcome)
+
         if not company_id:
             return _toast_error("请选择公司")
         if not metric_name:
@@ -346,15 +454,291 @@ class AdminCardCallbackHandler:
 
         sub_command = "grant_permission" if admin_action == ADMIN_ACTION_GRANT else "suppress_permission"
         text = f"/admin {sub_command} {identifier} {company_id} {metric_name} {reason.strip()}"
-        outcome = self._management_actions.route(
-            open_id=operator_open_id,
+        outcome = self._route_management_action(
+            operator_open_id=operator_open_id,
             text=text,
             trace_id=trace_id,
             chat_id=chat_id,
             thread_id=thread_id,
             message_id=message_id,
         )
+        if outcome.handled and outcome.content_key == _WRITE_ACTION_PENDING_CONTENT_KEY:
+            self._mark_management_submitted(
+                context=context,
+                status=current_status,
+                message_id=message_id,
+                trace_id=trace_id,
+            )
         return _toast_from_route_outcome(outcome)
+
+    def _route_management_action(
+        self,
+        *,
+        operator_open_id: str,
+        text: str,
+        trace_id: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+    ) -> _ManagementRouteOutcome:
+        """Route a management-card action and preserve old injected fakes.
+
+        The production router accepts ``origin_card_message_id`` so the pending
+        confirmation can link back to the management card.  Historical test/plugin
+        routers may expose the pre-#493 signature; introspection keeps those callers
+        source-compatible while the real router still receives the reverse link.
+        """
+
+        if self._management_actions is None:  # guarded by each public caller
+            raise RuntimeError("管理卡动作路由未装配")
+        kwargs: dict[str, object] = {
+            "open_id": operator_open_id,
+            "text": text,
+            "trace_id": trace_id,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": message_id,
+        }
+        try:
+            parameters = inspect.signature(self._management_actions.route).parameters
+            supports_origin = "origin_card_message_id" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_origin = False
+        if supports_origin:
+            kwargs["origin_card_message_id"] = message_id or None
+        return self._management_actions.route(**kwargs)  # type: ignore[arg-type]
+
+    def _management_context(
+        self,
+        *,
+        message_id: str,
+        identifier: str,
+        operator_open_id: str,
+        trace_id: str,
+    ) -> _ManagementContextCheck:
+        """读取管理卡上下文并做回调时的懒快照校验。
+
+        返回 ``stale=True`` 时调用方不得继续构造写命令；刷新动作已尽力完成，管理员
+        需要重新查询以获得新的卡片。没有上下文（旧卡/已过保留窗口）同样失败关闭，
+        但不把它当成数据发生变化来误导用户。
+        """
+
+        store = self._management_context_store
+        if store is None or not message_id:
+            return _ManagementContextCheck(context=None, status=None)
+        try:
+            context = store.lookup_context(message_id=message_id)
+        except Exception as error:  # noqa: BLE001 - 读上下文失败不得放行
+            self._audit.record(
+                "admin.card_callback.management_context_lookup_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+            return _ManagementContextCheck(context=None, status=None, stale=True)
+        if context is None:
+            # A production management-card action must have a persistent
+            # binding.  A miss can be a forged message id, a pre-migration
+            # card, or a retained row that was removed; never trust the hidden
+            # identifier and route a write without that binding.
+            self._audit.record(
+                "admin.card_callback.management_context_missing",
+                trace_id=trace_id,
+            )
+            return _ManagementContextCheck(context=None, status=None, stale=True)
+        if context.initiated_by_open_id and context.initiated_by_open_id != operator_open_id:
+            self._audit.record(
+                "admin.card_callback.management_not_initiator",
+                trace_id=trace_id,
+            )
+            return _ManagementContextCheck(
+                context=context, status=None, forbidden=True
+            )
+        if identifier and identifier != context.identifier:
+            self._audit.record(
+                "admin.card_callback.management_identifier_mismatch",
+                trace_id=trace_id,
+            )
+            return _ManagementContextCheck(
+                context=context, status=None, forbidden=True
+            )
+        if context.state in {"closed", "submitted", "dispatching"}:
+            # A closed card must not become a write entry point again if a stale
+            # callback is replayed. Likewise, once a form submission has already
+            # produced its confirmation card, a duplicate delivery must not create
+            # a second logical operation. Terminal effective/incomplete states
+            # intentionally remain actionable: the renderer restores the form for
+            # a fresh operation against the latest snapshot.
+            self._audit.record(
+                "admin.card_callback.management_context_not_actionable",
+                trace_id=trace_id,
+                state=context.state,
+            )
+            return _ManagementContextCheck(context=context, status=None, stale=True)
+        expired = context.context_deadline_at <= datetime.now(timezone.utc)
+        if expired:
+            self._audit.record(
+                "admin.card_callback.management_context_expired", trace_id=trace_id
+            )
+        status = None
+        if self._management_state_lookup is not None:
+            try:
+                status = self._management_state_lookup(context.identifier)
+            except Exception as error:  # noqa: BLE001 - fail closed on state read errors
+                self._audit.record(
+                    "admin.card_callback.management_state_lookup_failed",
+                    error=type(error).__name__,
+                    trace_id=trace_id,
+                )
+                return _ManagementContextCheck(context=context, status=None, stale=True)
+            if status is None:
+                return _ManagementContextCheck(context=context, status=None, stale=True)
+            fingerprint = management_card_fingerprint(status)
+            if expired or (
+                context.snapshot_fingerprint and fingerprint != context.snapshot_fingerprint
+            ):
+                # 变化后尽力把原卡更新到最新状态；无论更新成败都不继续写入旧快照。
+                try:
+                    refreshed_context = store.update_state(
+                        message_id=message_id,
+                        state="closed",
+                        dispatch_status="idle",
+                        snapshot_fingerprint=fingerprint,
+                        last_trace_id=trace_id,
+                    ) or context
+                except Exception as error:  # noqa: BLE001 - card refresh is best effort
+                    self._audit.record(
+                        "admin.card_callback.management_context_close_failed",
+                        error=type(error).__name__,
+                        trace_id=trace_id,
+                    )
+                    refreshed_context = context
+                self._refresh_management_card(
+                    context=refreshed_context,
+                    status=status,
+                    state="closed",
+                    status_message="数据已变化，请重新查询",
+                    trace_id=trace_id,
+                )
+                return _ManagementContextCheck(context=context, status=status, stale=True)
+        if expired:
+            return _ManagementContextCheck(context=context, status=status, stale=True)
+        return _ManagementContextCheck(context=context, status=status)
+
+    def _mark_management_submitted(
+        self,
+        *,
+        context: ManagementCardContext | None,
+        status: AdminUserStatusView | None,
+        message_id: str,
+        trace_id: str,
+    ) -> None:
+        if context is None or self._management_context_store is None:
+            return
+        try:
+            updated = self._management_context_store.update_state(
+                message_id=message_id,
+                state="submitted",
+                dispatch_status="publishing",
+                last_trace_id=trace_id,
+            )
+            if updated is not None and status is not None:
+                self._refresh_management_card(
+                    context=updated,
+                    status=status,
+                    state="submitted",
+                    dispatch_status="publishing",
+                    trace_id=trace_id,
+                )
+        except Exception as error:  # noqa: BLE001 - database/card update is best effort
+            self._audit.record(
+                "admin.card_callback.management_card_refresh_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
+    def _refresh_management_card(
+        self,
+        *,
+        context: ManagementCardContext,
+        status: AdminUserStatusView,
+        state: str,
+        dispatch_status: str | None = None,
+        status_message: str | None = None,
+        trace_id: str,
+    ) -> None:
+        if self._management_card_refresher is None:
+            return
+        try:
+            self._management_card_refresher.update(
+                context=context,
+                status=status,
+                state=state,
+                dispatch_status=dispatch_status,
+                status_message=status_message,
+            )
+        except Exception as error:  # noqa: BLE001 - management card is best effort
+            self._audit.record(
+                "admin.card_callback.management_card_refresh_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
+    def handle_management_cancel(
+        self,
+        *,
+        operator_open_id: str,
+        identifier: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        """管理卡第三个按钮：只关闭/标记当前卡，不创建任何权限操作。"""
+
+        context_check = self._management_context(
+            message_id=message_id,
+            identifier=identifier,
+            operator_open_id=operator_open_id,
+            trace_id=trace_id,
+        )
+        if context_check.forbidden:
+            return _toast_error("只有发起该管理卡的管理员本人可以操作")
+        if context_check.stale:
+            return _toast_error("数据已变化，请重新查询")
+        context = context_check.context
+        status = context_check.status
+        if context is None or self._management_context_store is None:
+            return _toast_error("管理卡已失效，请重新查询 /admin user")
+        try:
+            updated = self._management_context_store.update_state(
+                message_id=message_id,
+                state="closed",
+                dispatch_status="idle",
+                last_trace_id=trace_id,
+            )
+            if updated is not None and status is not None:
+                self._refresh_management_card(
+                    context=updated,
+                    status=status,
+                    state="closed",
+                    trace_id=trace_id,
+                )
+        except Exception as error:  # noqa: BLE001
+            self._audit.record(
+                "admin.card_callback.management_cancel_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+            return _toast_error("系统繁忙，请稍后重试")
+        self._audit.record(
+            "admin.card_callback.management_cancelled",
+            operator=operator_open_id,
+            trace_id=trace_id,
+        )
+        return {"toast": {"type": "info", "content": "已取消"}}
 
     def handle_management_revoke(
         self,
@@ -376,6 +760,18 @@ class AdminCardCallbackHandler:
 
         if self._management_actions is None:
             return _toast_error("该功能当前不可用，请改用文本命令")
+        context_check = self._management_context(
+            message_id=message_id,
+            identifier="",
+            operator_open_id=operator_open_id,
+            trace_id=trace_id,
+        )
+        if context_check.forbidden:
+            return _toast_error("只有发起该管理卡的管理员本人可以操作")
+        if context_check.stale:
+            return _toast_error("数据已变化，请重新查询")
+        context = context_check.context
+        current_status = context_check.status
         if not override_id:
             # 与 `handle_management_form_submit` 同一条纪律：不校验就拼命令
             # 文本，`override_id` 为空时下面这行会拼出连续空白，交给
@@ -386,16 +782,30 @@ class AdminCardCallbackHandler:
                 "admin.card_callback.management_missing_override_id",
                 trace_id=trace_id,
             )
-            return _toast_error("未识别到待撤销的授权行，请重新查询 /admin user 后再操作")
+            return _toast_error("未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作")
+        if context is not None and current_status is not None:
+            if not any(item.override_id == override_id for item in current_status.local_overrides):
+                self._audit.record(
+                    "admin.card_callback.management_override_mismatch",
+                    trace_id=trace_id,
+                )
+                return _toast_error("未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作")
         text = f"/admin revoke_permission {override_id} {_MANAGEMENT_CARD_REVOKE_REASON}"
-        outcome = self._management_actions.route(
-            open_id=operator_open_id,
+        outcome = self._route_management_action(
+            operator_open_id=operator_open_id,
             text=text,
             trace_id=trace_id,
             chat_id=chat_id,
             thread_id=thread_id,
             message_id=message_id,
         )
+        if outcome.handled and outcome.content_key == _WRITE_ACTION_PENDING_CONTENT_KEY:
+            self._mark_management_submitted(
+                context=context,
+                status=current_status,
+                message_id=message_id,
+                trace_id=trace_id,
+            )
         return _toast_from_route_outcome(outcome)
 
     def handle(
@@ -516,6 +926,13 @@ class AdminCardCallbackHandler:
         if outcome.decision.terminal_status is not None:
             self._notify_group(pending)
 
+        # 职位表单产生的确认卡带有原管理卡反向链接。确认后立刻把原卡置为
+        # 「下发中」，取消/失败则恢复成最新只读状态；重算完成回调可再次刷新为
+        # 「已生效」或「未完成」。先推进原卡再入队重算，避免极快的后台结果（尤其
+        # ``UNCHANGED`` 无需启动观察线程）被后面的“已提交”刷新覆盖回去。
+        if outcome.decision.terminal_status is not None:
+            self._refresh_origin_management_card(pending=pending, trace_id=trace_id)
+
         # 定向权限重算（Issue #438）：只在这次点击**首次**让操作真正执行成功时
         # 触发，与群通知同一去重判据（幂等重放/未改变任何状态的拒绝都不重复
         # 触发）；额外要求 ``status is EXECUTED``——``CANCELLED``/``EXPIRED``/
@@ -529,6 +946,11 @@ class AdminCardCallbackHandler:
             # pending_action 落进某个终态（见 decide_confirm/decide_cancel）。
             return _toast_error("只有发起人本人可以操作此卡片")
 
+        toast_content = outcome.decision.message
+        if pending.status is PendingActionStatus.EXECUTED and _is_position_scope_pending(pending):
+            # #493 的确认结果先是事务已记录，随后才由后台重算发布；不要把成功
+            # toast 误写成已经生效。旧的逐公司×指标命令保持历史文案兼容。
+            toast_content = _outcome_text(pending)
         response: dict[str, Any] = {
             "toast": {
                 "type": "success" if pending.status is PendingActionStatus.EXECUTED else "info",
@@ -545,7 +967,7 @@ class AdminCardCallbackHandler:
                 # ``decision.message`` 比用只看持久状态的 ``_outcome_text``
                 # 更准确（例如幂等重放会说"该操作已经执行过，不会重复执行。"
                 # 而不是重新展示第一次的"已确认执行"）。
-                "content": outcome.decision.message,
+                "content": toast_content,
             }
         }
         if card_payload is not None:
@@ -621,6 +1043,54 @@ class AdminCardCallbackHandler:
                 error=type(error).__name__,
             )
 
+    def _refresh_origin_management_card(self, *, pending: PendingAction, trace_id: str) -> None:
+        origin_message_id = getattr(pending, "origin_card_message_id", None)
+        store = self._management_context_store
+        lookup = self._management_state_lookup
+        if not origin_message_id or store is None or lookup is None:
+            return
+        try:
+            context = store.lookup_context(message_id=origin_message_id)
+            if context is None:
+                return
+            status = lookup(context.identifier)
+            if status is None:
+                return
+            if pending.status is PendingActionStatus.EXECUTED:
+                state, dispatch_status = "dispatching", "publishing"
+            elif pending.status is PendingActionStatus.CANCELLED:
+                # 这里是**确认卡**上的取消：按 #493 生命周期约定，确认卡处理完
+                # 后原管理卡回到最新只读快照并恢复表单。管理卡自身的“取消”按钮
+                # 走 ``handle_management_cancel``，才会把上下文置为 ``closed``。
+                state, dispatch_status = "ready", "idle"
+            elif pending.status is PendingActionStatus.FAILED:
+                state, dispatch_status = "incomplete", "incomplete"
+            else:
+                state, dispatch_status = "closed", "idle"
+            updated = store.update_state(
+                message_id=origin_message_id,
+                state=state,
+                dispatch_status=dispatch_status,
+                snapshot_fingerprint=management_card_fingerprint(status),
+                last_trace_id=trace_id,
+            )
+            if updated is not None:
+                self._refresh_management_card(
+                    context=updated,
+                    status=status,
+                    state=state,
+                    # ``idle`` 是持久层机器状态，不应原样出现在卡片的人类可见
+                    # 文案；ready 分支传 None 让 renderer 只展示恢复后的表单。
+                    dispatch_status=None if state == "ready" else dispatch_status,
+                    trace_id=trace_id,
+                )
+        except Exception as error:  # noqa: BLE001 - refresh is best effort after commit
+            self._audit.record(
+                "admin.card_callback.management_card_refresh_failed",
+                error=type(error).__name__,
+                trace_id=trace_id,
+            )
+
     def _notify_group(self, pending: PendingAction) -> None:
         if self._group_notifier is None or not self._group_chat_id:
             return
@@ -657,13 +1127,25 @@ def _toast_error(content: str) -> dict[str, Any]:
     return {"toast": {"type": "error", "content": content}}
 
 
+def _is_position_scope_pending(pending: PendingAction) -> bool:
+    """识别 #493 的职位范围授权，供即时回执采用异步下发文案。"""
+
+    if pending.action_type is not PendingActionType.LOCAL_PERMISSION_GRANT:
+        return False
+    if not pending.payload:
+        return False
+    try:
+        payload = json.loads(pending.payload)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and bool(payload.get("position_name"))
+
+
 def _outcome_text(pending: PendingAction) -> str:
     if pending.status is PendingActionStatus.EXECUTED:
-        # Issue #438：管理员看到的回执补一句"已触发生效"，对应
-        # ``_trigger_recompute`` 这次点击是否尝试了定向重算——**不**依赖那次
-        # 触发本身是不是真的成功：即便它失败/降级，也已经在响亮审计里留痕，
-        # 每日批仍是保底,不需要让发起人从这句回执里读出内部重算的实时结果。
-        return "已确认执行，权限变更将即时生效"
+        # 数据库事务已记录，但重算/发布由后台队列异步完成；不能把「已记录」
+        # 误报为「即时生效」。完成后由后台回调把原管理卡刷新为最终状态。
+        return "操作已记录，权限正在下发"
     if pending.status is PendingActionStatus.CANCELLED:
         return "已取消"
     if pending.status is PendingActionStatus.EXPIRED:

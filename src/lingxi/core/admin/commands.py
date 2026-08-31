@@ -81,6 +81,9 @@ _MAX_LINK_UNWRAP_ROUNDS = 3
 #: 单独为 identifier/company_id 放开同一个口子（那两类 token 目前没有中文形态的
 #: 真实需求，维持既有更窄的字符集）。
 _METRIC_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.@:一-鿿-]{1,128}$")
+# 银河职位名是配置中的精确自由文本，当前已知角色包含全角括号；仍只允许安全的
+# 单 token 字符集，避免把文本命令拼接成开放式语法。
+_POSITION_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.@:一-鿿（）()\-]{1,128}$")
 
 #: 追溯/审计查询默认时间窗（小时）与允许上限（30 天）。上限防止一次查询扫描
 #: 出远超"最近关键事件"这个 MVP 承诺的历史范围。
@@ -108,6 +111,7 @@ class AdminCommandKind(str, Enum):
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
     GRANT_PERMISSION = "grant_permission"
+    GRANT_POSITION_PERMISSION = "grant_position_permission"
     SUPPRESS_PERMISSION = "suppress_permission"
     REVOKE_PERMISSION = "revoke_permission"
     UNKNOWN = "unknown"
@@ -181,6 +185,8 @@ class AdminCommand:
     company_id: str | None = None
     metric_name: str | None = None
     reason: str | None = None
+    position_name: str | None = None
+    company_scope: str | None = None
     #: 仅 ``UNKNOWN`` 填（Issue #492）：这条输入是**哪一段**没看懂，供
     #: ``router.py`` 回一句能让管理员自救的分段报错，并写进审计。其余 ``kind``
     #: 恒为 ``None``——解析成功的命令没有"失败原因"可言。
@@ -338,6 +344,9 @@ def parse_admin_command(text: object) -> AdminCommand:
     if sub == "grant_permission":
         return _parse_permission_command(rest, kind=AdminCommandKind.GRANT_PERMISSION)
 
+    if sub in {"grant_position", "grant_position_permission"}:
+        return _parse_position_permission_command(rest)
+
     if sub == "suppress_permission":
         return _parse_permission_command(rest, kind=AdminCommandKind.SUPPRESS_PERMISSION)
 
@@ -398,6 +407,36 @@ def _parse_permission_command(rest: list[str], *, kind: AdminCommandKind) -> Adm
         identifier=identifier,
         company_id=company_id,
         metric_name=metric_name,
+        reason=reason,
+    )
+
+
+def _parse_position_permission_command(rest: list[str]) -> AdminCommand:
+    """解析管理卡使用的「银河职位 + 公司范围 + 原因」授权命令。
+
+    该命令不是新的权限类型，只是把产品表单的两个维度封装进受控文本路由；真正
+    的职位映射和公司范围展开由待确认操作适配器在服务端完成。公司范围 ``*``
+    表示「全部」，实际公司数量始终由当前映射目录计算。
+    """
+
+    if len(rest) < 4:
+        return _unknown(AdminRejectReason.WRONG_ARGUMENT_COUNT)
+    identifier, position_name, company_scope, *reason_tokens = rest
+    identifier = _normalize_identifier(identifier)
+    if not _IDENTIFIER_PATTERN.fullmatch(identifier):
+        return _unknown(AdminRejectReason.BAD_IDENTIFIER)
+    if not _POSITION_TOKEN_PATTERN.fullmatch(position_name):
+        return _unknown(AdminRejectReason.BAD_METRIC_NAME)
+    if not _IDENTIFIER_PATTERN.fullmatch(company_scope) and company_scope not in {"*", "全部", "all"}:
+        return _unknown(AdminRejectReason.BAD_COMPANY_ID)
+    reason = " ".join(reason_tokens).strip()
+    if not reason or len(reason) > _PERMISSION_REASON_MAX_LENGTH:
+        return _unknown(AdminRejectReason.BAD_REASON)
+    return AdminCommand(
+        kind=AdminCommandKind.GRANT_POSITION_PERMISSION,
+        identifier=identifier,
+        position_name=position_name,
+        company_scope="*" if company_scope.casefold() in {"all", "全部"} else company_scope,
         reason=reason,
     )
 

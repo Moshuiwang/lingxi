@@ -45,6 +45,10 @@ DELIVERY_UUID_PREFIX = "lingxi-roster-"
 #: `"lingxi-daily-report-"` 为 20 + 32 = 52，超限导致每日通报发送前必抛
 #: `ValueError`、通报永远发不出，opus 批量审查 P1 修复）。
 DAILY_REPORT_UUID_PREFIX = "lingxi-daily-"
+#: 管理卡每日补偿通报专用去重前缀。它和花名册/内测日报/管理终态通知虽然都发到
+#: 管理群，但代表独立的投递语义，不能让飞书把不同消息误判为同一逻辑投递。长度为
+#: 16 + 32 = 48，落在飞书的 50 字符 ``uuid`` 上限内。
+MANAGEMENT_CORRECTION_UUID_PREFIX = "lingxi-perm-fix-"
 DELIVERY_UUID_MAX_LENGTH = 50
 SendOutcomeCallback = Callable[[str, bool], None]
 

@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-30-5"
+version = "2026-08-31-1"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -167,6 +167,9 @@ version = "2026-08-30-5"
 "permission.range_updated" = "你的数据查询可用范围已更新。当前可用范围——公司：{company_name}；职能：{function_name}。你可以直接发起一次查询验证，如有疑问请联系管理员。"
 "permission.range_revoked" = "你的数据查询可用范围已更新，当前暂无可用的数据范围。如有疑问请联系管理员。"
 "permission.all_companies" = "全部公司"
+# 管理卡即时下发超过内部观察窗口后，日批真正读回一致时只向管理群发送一条汇总；
+# 仅报告条数，不带人员、公司或指标标识。
+"permission.management_correction_summary" = "每日权限批处理已补齐 {count} 条此前未完成的权限下发。"
 
 # Issue #341 S-ES-3：文档投递独立消费循环成功建档、写正文、授予可管理并读回
 # 确认后，作为一条追加消息发给提问用户（不进入任何已有话题的卡片/文本终态，

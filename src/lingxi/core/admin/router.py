@@ -19,6 +19,7 @@ PostgreSQL 实现见 ``adapters/admin_registry.py``；调用方（``core/convers
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Protocol, Sequence
@@ -147,6 +148,9 @@ class PendingActionPreparer(Protocol):
         company_id: str | None = None,
         metric_name: str | None = None,
         reason: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> _PrepareOutcome: ...
 
 
@@ -225,6 +229,7 @@ class AdminRouter(Protocol):
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome: ...
 
 
@@ -348,6 +353,7 @@ class AdminCommandRouter:
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         """判定 ``open_id`` 是否为当前有效管理员，是则解析并执行命令。
 
@@ -396,6 +402,7 @@ class AdminCommandRouter:
                 chat_id=chat_id,
                 thread_id=thread_id,
                 message_id=message_id,
+                origin_card_message_id=origin_card_message_id,
             )
         except Exception as error:  # noqa: BLE001 - 已确认是管理员，失败也必须有回复
             return self._record_or_reject(
@@ -420,6 +427,7 @@ class AdminCommandRouter:
         chat_id: str = "",
         thread_id: str | None = None,
         message_id: str = "",
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         command = parse_admin_command(text)
         roles = sorted(role.value for role in entry.roles)
@@ -448,6 +456,7 @@ class AdminCommandRouter:
                 self._send_management_card(
                     status=status,
                     display_identifier=command.identifier,
+                    initiated_by_open_id=entry.feishu_open_id,
                     chat_id=chat_id,
                     thread_id=thread_id,
                     message_id=message_id,
@@ -562,6 +571,26 @@ class AdminCommandRouter:
                 company_id=command.company_id,
                 metric_name=self._queries.resolve_metric_name(metric_token=command.metric_name),
                 reason=command.reason,
+            )
+
+        if command.kind is AdminCommandKind.GRANT_POSITION_PERMISSION:
+            assert command.identifier is not None
+            assert command.position_name is not None
+            assert command.company_scope is not None
+            assert command.reason is not None
+            return self._dispatch_write_action(
+                entry=entry,
+                roles=roles,
+                action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
+                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                trace_id=trace_id,
+                position_name=command.position_name,
+                company_scope=command.company_scope,
+                reason=command.reason,
+                origin_card_message_id=origin_card_message_id,
             )
 
         if command.kind is AdminCommandKind.SUPPRESS_PERMISSION:
@@ -683,6 +712,9 @@ class AdminCommandRouter:
         company_id: str | None = None,
         metric_name: str | None = None,
         reason: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
         """``suspend``/``resume``/``grant_permission``/``suppress_permission``/
         ``revoke_permission`` 共用的写命令编排：角色核对 → 自我目标防呆 →
@@ -779,14 +811,34 @@ class AdminCommandRouter:
         # 分支，见 ``tests/test_pending_action.py``）——那一刻是唯一有意义的
         # "角色是否仍然有效"的重新核验点，因为 prepare 到 confirm 之间存在真实的
         # 时间窗口，而 prepare 内部这两步之间没有。
-        outcome = self._pending_actions.prepare(
-            action_type=action_type,
-            target_open_id=target_identifier,
-            initiated_by_open_id=entry.feishu_open_id,
-            company_id=company_id,
-            metric_name=metric_name,
-            reason=reason,
-        )
+        prepare_kwargs: dict[str, object] = {
+            "action_type": action_type,
+            "target_open_id": target_identifier,
+            "initiated_by_open_id": entry.feishu_open_id,
+            "company_id": company_id,
+            "metric_name": metric_name,
+            "reason": reason,
+        }
+        # 旧的注入式 preparer 仍只接受公司×指标字段；新职位表单才附加扩展
+        # 参数，避免无关的旧只读/命令测试因可选字段破坏接口兼容。
+        if position_name is not None:
+            prepare_kwargs["position_name"] = position_name
+        if company_scope is not None:
+            prepare_kwargs["company_scope"] = company_scope
+        if origin_card_message_id is not None:
+            prepare_kwargs["origin_card_message_id"] = origin_card_message_id
+        if position_name is not None:
+            try:
+                prepare_parameters = inspect.signature(self._pending_actions.prepare).parameters
+                accepts_trace = "trace_id" in prepare_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in prepare_parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_trace = False
+            if accepts_trace:
+                prepare_kwargs["trace_id"] = trace_id
+        outcome = self._pending_actions.prepare(**prepare_kwargs)  # type: ignore[arg-type]
         if not outcome.decision.ok or outcome.pending is None:
             return self._record_or_reject(
                 action_name,
@@ -831,7 +883,11 @@ class AdminCommandRouter:
                 handled=True,
                 content_key="admin.write_action_pending",
                 content_version=_CONTENT_VERSION,
-                reply_text="已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。",
+                reply_text=(
+                    "已提交，请在下方确认卡片上确认（10 分钟内有效）。"
+                    if position_name is not None
+                    else "已生成待确认操作，请查收你的飞书私聊确认卡片（十分钟内有效）。"
+                ),
             ),
             actor=entry.feishu_open_id,
             roles=roles,
@@ -845,6 +901,7 @@ class AdminCommandRouter:
         *,
         status: AdminUserStatusView,
         display_identifier: str,
+        initiated_by_open_id: str = "",
         chat_id: str,
         thread_id: str | None,
         message_id: str,
@@ -867,12 +924,23 @@ class AdminCommandRouter:
         if self._management_cards is None or not message_id:
             return
         try:
+            send_kwargs: dict[str, object] = {
+                "status": status,
+                "display_identifier": display_identifier,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "reply_to_message_id": message_id,
+            }
+            # 旧的测试/插件 sender 没有发起人字段时保持兼容；生产 dispatcher
+            # 会持久化真实 initiator，供回调的身份校验与审计恢复。
+            try:
+                supports_initiator = "initiated_by_open_id" in inspect.signature(self._management_cards.send).parameters
+            except (TypeError, ValueError):
+                supports_initiator = False
+            if supports_initiator:
+                send_kwargs["initiated_by_open_id"] = initiated_by_open_id
             self._management_cards.send(
-                status=status,
-                display_identifier=display_identifier,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                reply_to_message_id=message_id,
+                **send_kwargs,
             )
         except Exception as error:  # noqa: BLE001 - 管理卡发送失败不影响文本回复
             self._safe_record(

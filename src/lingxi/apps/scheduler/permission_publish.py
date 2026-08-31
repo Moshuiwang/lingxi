@@ -325,6 +325,7 @@ class PermissionPublishDuty:
         readiness_limit: int = DEFAULT_READINESS_LIMIT,
         round_budget_seconds: float = DEFAULT_ROUND_BUDGET_SECONDS,
         on_alert: Callable[[str, str], None] | None = None,
+        on_management_corrections: Callable[[], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
     ) -> None:
@@ -348,6 +349,7 @@ class PermissionPublishDuty:
         self._readiness_limit = readiness_limit
         self._round_budget = timedelta(seconds=float(round_budget_seconds))
         self._on_alert = on_alert
+        self._on_management_corrections = on_management_corrections
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
         self._stop = threading.Event() if stop is None else stop
@@ -455,6 +457,17 @@ class PermissionPublishDuty:
             probe_wired=readiness is not None and readiness.ticker.probe_wired,
         )
         self._audit.record("permission_publish.completed", **report.audit_facts())
+        if self._on_management_corrections is not None:
+            # 这条观察只收口已经被发布面读回一致的管理卡上下文；它不参与权限
+            # 决定，也不把 outbox 入队误报为外部生效。回调自身负责把每日补齐
+            # 汇总做成幂等投递，异常不能带走本轮发布/就绪结果。
+            try:
+                self._on_management_corrections()
+            except Exception as error:  # noqa: BLE001 - observer is best effort
+                self._audit.record(
+                    "admin.management_correction_settlement_failed",
+                    error=type(error).__name__,
+                )
         if report.advanced or report.attempts or report.reclaimed:
             # 摘要只有计数。一轮什么都没做时不打日志：这条职责每分钟跑一次。
             logger.info(
@@ -643,6 +656,7 @@ def _build_permission_publish_duty(
     stop: threading.Event,
     audit: AuditSink,
     permission_table_access_token: Callable[[], str] | None,
+    on_management_corrections: Callable[[], None] | None = None,
 ) -> PermissionPublishDuty | None:
     """装配权限发布消费职责；**三个面各按自身依赖装配，缺谁只停谁**（二级审查 N6）。
 
@@ -732,6 +746,7 @@ def _build_permission_publish_duty(
         audit=audit,
         readiness=readiness,
         on_alert=_permission_readiness_alert(audit),
+        on_management_corrections=on_management_corrections,
         stop=stop,
     )
 
