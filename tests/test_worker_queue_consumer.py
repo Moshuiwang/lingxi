@@ -24,6 +24,8 @@ import itertools
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -4927,7 +4929,7 @@ class FakeSdkInternalError(Exception):
 
 
 class TerminalFailureSignatureTests(unittest.TestCase):
-    """Issue #495：失败终态必须留得下线索——底层异常的**类型限定名**与一个
+    """Issue #495：失败终态必须留得下线索——底层异常的**固定类别摘要**与一个
     非 ``null`` 的失败码。
 
     真实代价（2026-08-31 浸泡窗口取证，Trace #469 S-12）：8 条任务失败里 6 条
@@ -4974,7 +4976,8 @@ class TerminalFailureSignatureTests(unittest.TestCase):
 
     def test_each_unclassified_exception_type_leaves_a_distinguishable_signature(self) -> None:
         """完成标准 1：数据库 / 外部 HTTP / SDK 内部三种底层异常，在日志里必须
-        留下**互不相同**的类型签名，而不是一律 ``session_failed`` 一个词。
+        留下**互不相同**的稳定签名，而不是一律 ``session_failed`` 一个词。签名
+        只由固定类别和不可逆摘要组成，不把运行时类名写入日志。
 
         **变异验红**（已实测）：把 ``report_extraction.failure_with_signature``
         的返回值去掉 ``"signature"`` 这一项（等价于"兜底分支不再留签名"这个
@@ -4997,34 +5000,41 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                 self.assertEqual(fields["failure_code"], "session_failed")
                 signature = fields["failure_signature"]
                 self.assertIsInstance(signature, str)
-                self.assertIn(type(error).__qualname__, signature)
+                self.assertRegex(
+                    signature,
+                    r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+                )
                 signatures.append(signature)
 
         self.assertEqual(
             len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}"
         )
 
-    def test_the_signature_is_a_qualified_type_name_not_a_bare_class_name(self) -> None:
-        """同名类型必须仍然可区分：``TimeoutError`` 这种名字被多个库各自定义，
-        只有带上模块名才回答得了"是数据库超时还是外部 HTTP 超时"。
+    def test_the_signature_is_a_stable_digest_not_a_bare_class_name(self) -> None:
+        """签名必须是固定类别加不可逆摘要，而不是裸类名或模块限定名；后者
+        可能由 SDK 用运行时数据动态生成，不能进入低敏出口。
 
-        **变异验红**（已实测）：把 ``exception_failure_signature`` 里的
-        ``qualified`` 改回裸类名，本用例由绿转红（断言不到模块前缀）。
+        **变异验红**：把摘要改回裸类名或模块限定名，本用例应由绿转红（输出
+        不符合固定签名形状）。
         """
 
         _, sink = self._run(self._raising_executor(self._DatabaseError("boom")))
 
         signature = sink.calls[0]["failure_signature"]
-        self.assertTrue(signature.endswith(".FakeDatabaseError"), f"实际={signature}")
-        self.assertIn("test_worker_queue_consumer", signature, f"实际={signature}")
+        self.assertRegex(
+            signature,
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
 
-    def test_a_builtin_exception_keeps_a_short_signature_without_the_builtins_prefix(self) -> None:
-        """``builtins.`` 前缀对诊断毫无信息量，只会挤占 64 字符预算——内建异常
-        的签名就是它自己的名字。"""
+    def test_a_builtin_exception_keeps_a_stable_category_signature(self) -> None:
+        """内建异常也只返回固定类别摘要，不把类名或模块名写进日志。"""
 
         _, sink = self._run(self._raising_executor(ValueError("boom")))
 
-        self.assertEqual(sink.calls[0]["failure_signature"], "ValueError")
+        self.assertRegex(
+            sink.calls[0]["failure_signature"],
+            r"^exception\.builtin\.[0-9a-f]{40}$",
+        )
 
     def test_the_signature_never_carries_exception_text(self) -> None:
         """完成标准 2（不泄露）：异常**正文**含外部标识原值时，日志与落库两个
@@ -5064,7 +5074,10 @@ class TerminalFailureSignatureTests(unittest.TestCase):
                     self.assertNotIn(secret, payload)
         # 正面：泄露被挡住了，但线索**仍在**——否则这条断言用一个恒空的实现
         # 也能通过。
-        self.assertTrue(sink.calls[0]["failure_signature"].endswith(".FakeDatabaseError"))
+        self.assertRegex(
+            sink.calls[0]["failure_signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
 
     def test_failure_code_is_never_null_on_a_failed_terminal(self) -> None:
         """完成标准 3：失败终态的 ``failure_code`` 不再为 ``null``。
@@ -5203,12 +5216,15 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         terminal = queue.terminals[0]
         self.assertEqual(terminal["failure_code"], "session_failed")
         self.assertEqual(terminal["failure_signature"], sink.calls[0]["failure_signature"])
-        self.assertTrue(terminal["failure_signature"].endswith(".FakeHttpError"))
+        self.assertRegex(
+            terminal["failure_signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
 
-    def test_a_hostile_type_name_is_reduced_to_an_identifier_shape(self) -> None:
-        """纵深防线：签名的字符集是**白名单**（ASCII 字母数字、下划线、点）。
-        某个 SDK 拿运行时数据动态造异常类时，类名里的空格、冒号、括号一律被
-        剔除，长度截到 64 字符——宁可签名难看也不让未知内容搭车进日志。"""
+    def test_a_hostile_type_name_and_free_text_are_rejected_or_hashed(self) -> None:
+        """纵深防线：动态类名和数据库异常正文不能靠字符替换进入签名。
+        动态类型只产生固定类别摘要；跨进程报告收到异常正文时直接退回
+        ``unknown``，而不是把 ``ou_x`` 等白名单字符保留下来。"""
 
         from lingxi.apps.worker.report_extraction import (
             UNKNOWN_FAILURE_SIGNATURE,
@@ -5216,8 +5232,79 @@ class TerminalFailureSignatureTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            sanitize_failure_signature("Key (feishu_open_id)=(ou_x) 已存在"), "Keyfeishu_open_idou_x"
+            sanitize_failure_signature("Key (feishu_open_id)=(ou_x) 已存在"),
+            UNKNOWN_FAILURE_SIGNATURE,
         )
-        self.assertEqual(len(sanitize_failure_signature("A" * 300)), 64)
+        self.assertEqual(sanitize_failure_signature("A" * 300), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature("中文异常"), UNKNOWN_FAILURE_SIGNATURE)
         self.assertEqual(sanitize_failure_signature(""), UNKNOWN_FAILURE_SIGNATURE)
+        self.assertEqual(
+            sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502"
+        )
+
+    def test_a_dynamic_type_name_never_reaches_the_terminal_signature(self) -> None:
+        """审核复现：SDK 动态造出的 ``ou_secret_user`` 类名不能原样进入
+        终态签名、低敏日志或持久终态；同一类型仍应保留一个可区分的固定形状
+        线索。"""
+
+        from lingxi.apps.worker.report_extraction import exception_failure_signature
+
+        dynamic_type = type(
+            "ou_secret_user",
+            (Exception,),
+            {"__module__": "sdk.dynamic.ou_secret_user"},
+        )
+        error = dynamic_type(
+            "ou_secret_user=ou_x lpo_secret=lpo_x pac_secret=pac_x contact=secret@example.com"
+        )
+        signature = exception_failure_signature(error)
+
+        self.assertNotIn("ou_", signature)
+        self.assertNotIn("lpo_", signature)
+        self.assertNotIn("pac_", signature)
+        self.assertNotIn("@", signature)
+        self.assertRegex(signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$")
+        self.assertEqual(signature, exception_failure_signature(dynamic_type("different text")))
+
+        queue, sink = self._run(self._raising_executor(error))
+        for payload in (repr(sink.calls[0]), repr(queue.terminals[0])):
+            for secret in (
+                "ou_secret_user",
+                "ou_x",
+                "lpo_x",
+                "pac_x",
+                "secret@example.com",
+            ):
+                self.assertNotIn(secret, payload)
+        self.assertEqual(queue.terminals[0]["failure_signature"], signature)
+
+    def test_exception_signature_is_stable_across_processes(self) -> None:
+        """失败签名会落库并由另一个进程的 ``/admin trace`` 读取，因此不能
+        使用 Python 的随机 hash；相同类型身份在独立解释器中必须得到同一摘要。"""
+
+        from lingxi.apps.worker.report_extraction import exception_failure_signature
+
+        dynamic_type = type(
+            "RuntimeDatabaseError",
+            (Exception,),
+            {"__module__": "psycopg.errors"},
+        )
+        expected = exception_failure_signature(dynamic_type("not persisted"))
+        child_code = (
+            "from lingxi.apps.worker.report_extraction import exception_failure_signature; "
+            "E = type('RuntimeDatabaseError', (Exception,), "
+            "{'__module__': 'psycopg.errors'}); "
+            "print(exception_failure_signature(E('ou_secret_user=ou_x')))")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", child_code],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.strip(), expected)
+        self.assertNotIn("ou_", result.stdout)

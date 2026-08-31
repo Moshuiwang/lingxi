@@ -574,11 +574,12 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "session_failed")
 
-    def test_the_unclassified_fallback_records_the_exception_type_as_a_signature(self) -> None:
+    def test_the_unclassified_fallback_records_a_stable_signature(self) -> None:
         """Issue #495：``turn.py`` 那条兜底 ``except`` 分支（把任何未分类的 SDK
         异常收敛成 ``session_failed`` 一个词）必须在报告里额外留下底层异常的
-        **类型限定名**——它是 queue 链路唯一会进低敏审计日志与 ``task`` 落库列的
-        那一段，也是 2026-08-31 浸泡窗口里 6 条无法归因失败缺的那条线索。
+        **稳定签名**——它是 queue 链路唯一会进低敏审计日志与 ``task`` 落库列的
+        那一段，也是 2026-08-31 浸泡窗口里 6 条无法归因失败缺的那条线索。签名
+        只保留固定类别和不可逆摘要，不把动态类型原文写入报告。
 
         分类结论本身**不变**（仍是 ``session_failed``，用户可见文案因此逐字
         不变），变的只是"还留不留得下线索"。
@@ -605,8 +606,12 @@ class WorkerWiringTest(unittest.TestCase):
                 report = asyncio.run(executor.run_turn("查一下频道收视率"))
 
                 self.assertEqual(report["failure"]["code"], "session_failed")
-                self.assertEqual(report["failure"]["signature"], type(error).__name__)
-                signatures.append(report["failure"]["signature"])
+                signature = report["failure"]["signature"]
+                self.assertRegex(
+                    signature,
+                    r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+                )
+                signatures.append(signature)
 
         self.assertEqual(len(set(signatures)), 2, f"两种底层异常必须可区分，实际={signatures}")
 
@@ -617,7 +622,7 @@ class WorkerWiringTest(unittest.TestCase):
         对 ``event.pipeline_failed`` 的处置同一口径——``failure.message`` 那一份
         是既有行为（只在 turn 模式的 stdout 报告里，经 ``redact_free_text``），
         本条断言守的是**新增**的 ``signature`` 字段：它是唯一会离开 worker 进程
-        进入日志与数据库的那一段，必须只含类型名。
+        进入日志与数据库的那一段，必须只含固定类别与不可逆摘要。
 
         **变异验红**（已实测）：让 ``exception_failure_signature`` 返回
         ``f"{type(error).__name__}: {error}"``，本用例由绿转红。恢复后复绿。
@@ -636,7 +641,10 @@ class WorkerWiringTest(unittest.TestCase):
         executor = WorkerTurnExecutor(load_config(worker_env()))
         report = asyncio.run(executor.run_turn("查一下频道收视率"))
 
-        self.assertEqual(report["failure"]["signature"], "RuntimeError")
+        self.assertRegex(
+            report["failure"]["signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
         self.assertNotIn("ou_fake0123456789", report["failure"]["signature"])
 
 

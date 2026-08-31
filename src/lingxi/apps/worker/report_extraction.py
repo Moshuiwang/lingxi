@@ -57,7 +57,7 @@ def _denied_tool_summary(report: Mapping[str, Any]) -> tuple[int, tuple[str, ...
     里补回来。可以接受：这轮回合本身已经落到一个响亮的失败终态（未预期异常
     带着 ``type(error).__name__`` 收口，见 ``_process_task`` 的失败分支），运维
     看得到"这一轮坏了"；唯一的代价是看不到"坏之前它还拒绝过几次工具调用"这个
-    补充事实，不是静默丢失整轮结果。
+    补充事实，不是静默丢失整轮结果；终态线索使用固定类别摘要，不回显动态类型。
     """
 
     audit = report.get("audit") if isinstance(report, Mapping) else None
@@ -375,21 +375,52 @@ def _protocol_breakdown_reasons(output_safety: Mapping[str, Any] | None) -> tupl
 # 等外部标识原值写进日志，而 psycopg 等驱动的异常串常见形状正是
 # ``DETAIL: Key (feishu_open_id)=(ou_...)``。rc22 opus 审查 P2-5 已经为
 # ``event.pipeline_failed`` 做过同一次收敛（``core/conversation/pipeline.py``：
-# 只记 ``type(error).__name__``），本模块照抄那条既有做法，不另造一套。
+# 只记异常的稳定分类），本模块采用固定形状的加密摘要，不把动态类名或异常正文
+# 原样带进低敏出口。
 
-#: 失败签名允许出现的字符白名单之外的一切（ASCII 字母数字、下划线、点）。
-#: 用**白名单**而不是黑名单：异常类型名与模块名是源码里写死的标识符，形状已知；
-#: 任何超出这个集合的字符都说明这不是一个正常的类型标识（例如某个 SDK 用异常
-#: 正文动态造类），一律剔除，宁可签名难看也不让未知内容搭车进日志。
-_FAILURE_SIGNATURE_DISALLOWED = re.compile(r"[^A-Za-z0-9_.]")
-
-#: 签名长度上界。与 ``_cap_log_token`` 的 64 同量级——真实类型限定名
-#: （``psycopg.errors.UniqueViolation`` 30 字符）远在其内，超长只可能来自异常。
+#: 签名长度上界。摘要是固定 ASCII 形状；64 字符仍与 ``_cap_log_token`` 同量级，
+#: 兼容迁移 0080 已有的 TEXT 列和旧日志预算。
 _MAX_FAILURE_SIGNATURE_CHARS = 64
 
 #: 连类型名都取不到时的显式占位（例如某个对象的 ``__name__`` 被清成空串）。
 #: **不是 ``None``**：这一列的存在意义就是"任何终态都留得下一个可查的记号"。
 UNKNOWN_FAILURE_SIGNATURE = "unknown"
+
+# 异常类型来自 Python 运行时，模块名和限定类名都可能被 SDK 动态改成用户输入。
+# 不能用字符洗掉括号/空格来"净化"它：``ou_x`` 这类值只要本身由允许字符组成，
+# 洗完仍会原样留在日志和 /admin trace。这里把完整类型身份只作为 SHA-256 输入，
+# 出口只保留固定的类别词与 160-bit 摘要；摘要不是可逆编码，也不接收异常正文。
+_FAILURE_SIGNATURE_DIGEST_HEX_CHARS = 40
+_FAILURE_SIGNATURE_PREFIX = "exception"
+_FAILURE_SIGNATURE_FAMILIES = frozenset(
+    {"builtin", "database", "http", "sdk", "runtime", "external"}
+)
+_FAILURE_SIGNATURE_PATTERN = re.compile(
+    rf"^{re.escape(_FAILURE_SIGNATURE_PREFIX)}\."
+    rf"(?:{'|'.join(sorted(_FAILURE_SIGNATURE_FAMILIES))})\."
+    rf"[0-9a-f]{{{_FAILURE_SIGNATURE_DIGEST_HEX_CHARS}}}$"
+)
+
+# 这类签名不是异常类型，而是结构化外因的固定分类；只允许已经批准的字面量
+# 穿过跨进程报告。未来新增结构化外因必须在这里登记，不能让任意字符串借白名单
+# 之名进入 task 或低敏日志。
+_STABLE_FAILURE_SIGNATURES = frozenset({"mcp.query.http_502", UNKNOWN_FAILURE_SIGNATURE})
+
+# 只输出这些固定类别名。匹配的是完整模块或其子模块，模块字符串本身永不回显，
+# 因此即使动态模块名里带 open_id/邮箱，也只能影响类别（固定词）和摘要。
+_EXCEPTION_MODULE_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("psycopg", "database"),
+    ("httpx", "http"),
+    ("httpcore", "http"),
+    ("aiohttp", "http"),
+    ("requests", "http"),
+    ("claude_agent_sdk", "sdk"),
+    ("asyncio", "runtime"),
+    ("anyio", "runtime"),
+    ("trio", "runtime"),
+    ("lingxi", "runtime"),
+    ("builtins", "builtin"),
+)
 
 #: 「这次失败没有人给它起名字」时按报告里已有事实推出的三个显式码（Issue #495
 #: 完成标准 3：``failure_code`` 在失败终态下不再为 ``null``）。三个都落进
@@ -407,32 +438,62 @@ TURN_NOT_CLOSED_FAILURE_CODE = "turn_not_closed"
 
 
 def exception_failure_signature(error: BaseException) -> str:
-    """把一个异常收敛成**可以进日志**的失败签名：只取类型的限定名。
+    """把一个异常收敛成**可以进日志**的固定形状失败签名。
 
-    取 ``模块.限定名``（``builtins`` 前缀去掉）而不是裸 ``__name__``：真实故障里
-    最需要区分的恰恰是同名类型——``psycopg.errors.OperationalError`` 与
-    ``httpx.ConnectError`` 与 SDK 自己的 ``ProcessError`` 在裸类名下也许还能分开，
-    但 ``TimeoutError``/``ConnectionError`` 这类名字被多个库各自定义，只有带上
-    模块才回答得了"是数据库超时还是外部 HTTP 超时"。模块名与类名都是源码标识符，
-    不是运行时数据，因此这一步不引入新的泄漏面。
+    过去直接落 ``模块.限定类名``，所以 SDK 动态造出的
+    ``sdk.dynamic.ou_secret_user`` 会把用户标识带进 task、低敏日志和
+    ``/admin trace``；对异常正文做字符白名单也挡不住
+    ``Key (feishu_open_id)=(ou_x)``，因为 ``ou_x`` 本身全是白名单字符。
 
-    **异常正文（``str(error)``）在任何情况下都不参与**——那是 P2-5 收敛掉的那半，
-    见本节顶部说明。
+    现在只把模块/限定类名用于 SHA-256 输入，返回
+    ``exception.<固定类别>.<160-bit摘要>``。类别只来自本文件的固定表，摘要输出
+    使用十六进制固定字符集，既能在跨进程/跨重启时稳定区分已有底层异常，又不会把
+    动态类型或其正文可逆地编码进持久状态。``str(error)`` 在任何情况下都不参与。
     """
 
     error_type = type(error)
-    module = _FAILURE_SIGNATURE_DISALLOWED.sub("", getattr(error_type, "__module__", "") or "")
-    raw_name = getattr(error_type, "__qualname__", "") or getattr(error_type, "__name__", "") or ""
-    name = _FAILURE_SIGNATURE_DISALLOWED.sub("", raw_name)
-    qualified = name if module in ("", "builtins") else f"{module}.{name}"
-    if len(qualified) <= _MAX_FAILURE_SIGNATURE_CHARS:
-        return qualified or UNKNOWN_FAILURE_SIGNATURE
-    # 超过上界时**先丢模块路径、后动类名**：判别力全在类名那一半，从右边截断
-    # 会先啃掉类名（``a.very.long.module.path.Timeout`` 截成 ``a.very.long.mod``
-    # 这种毫无用处的形状）。类名自己就超限时保留右端——嵌套类的最内层名字最具体。
-    if len(name) <= _MAX_FAILURE_SIGNATURE_CHARS:
-        return name or UNKNOWN_FAILURE_SIGNATURE
-    return name[-_MAX_FAILURE_SIGNATURE_CHARS:]
+    try:
+        module = getattr(error_type, "__module__", None)
+        name = getattr(error_type, "__qualname__", None)
+    except Exception:  # noqa: BLE001 - 恶意元类不得阻断失败收口
+        return UNKNOWN_FAILURE_SIGNATURE
+    if not isinstance(module, str) or not isinstance(name, str) or not module or not name:
+        return UNKNOWN_FAILURE_SIGNATURE
+    # 元数据也可能是带重载方法的 str 子类；归一为内建 str 后再做分类/编码，避免
+    # 恶意 ``startswith`` 等实现把终态收口重新变成一个会抛异常的路径。
+    module = str.__str__(module)
+    name = str.__str__(name)
+
+    family = _exception_signature_family(module)
+    try:
+        # str.encode 的显式调用避免可疑 str 子类重载 encode；surrogatepass 让异常
+        # 元数据里的孤立代理字符也得到稳定摘要，而不是在兜底收口时再次抛错。
+        identity = (
+            str.encode(module, "utf-8", "surrogatepass")
+            + b"\x00"
+            + str.encode(name, "utf-8", "surrogatepass")
+        )
+        digest = hashlib.sha256(b"lingxi.failure-signature.v1\x00" + identity).hexdigest()
+    except (TypeError, UnicodeError):
+        return UNKNOWN_FAILURE_SIGNATURE
+    signature = (
+        f"{_FAILURE_SIGNATURE_PREFIX}.{family}."
+        f"{digest[:_FAILURE_SIGNATURE_DIGEST_HEX_CHARS]}"
+    )
+    return (
+        signature
+        if len(signature) <= _MAX_FAILURE_SIGNATURE_CHARS
+        else UNKNOWN_FAILURE_SIGNATURE
+    )
+
+
+def _exception_signature_family(module: str) -> str:
+    """把异常模块归入固定低基数类别；不返回模块原文。"""
+
+    for prefix, family in _EXCEPTION_MODULE_FAMILIES:
+        if module == prefix or module.startswith(f"{prefix}."):
+            return family
+    return "external"
 
 
 def failure_with_signature(code: str, message: str, error: BaseException) -> dict[str, str]:
@@ -449,24 +510,29 @@ def failure_with_signature(code: str, message: str, error: BaseException) -> dic
 
 
 def sanitize_failure_signature(value: str) -> str:
-    """按白名单洗掉签名里的一切非标识符字符并截到上界；洗空则回退占位符。
+    """只接受固定分类或本模块生成的摘要，拒绝任意报告字符串。
 
-    :func:`exception_failure_signature` 自己做更聪明的截断（见其说明），这里是
-    **给来路不明的值兜底**的那一版：报告是跨进程 JSON，``failure.signature``
-    完全可能来自一个未来版本、一个测试替身、或一次形状不对的构造，读回时不能
-    假设它已经符合约束。
+    报告跨 worker/gateway 进程传递，``failure.signature`` 不能被当作可信的类型名。
+    旧实现把 ``Key (feishu_open_id)=(ou_x)`` 洗成
+    ``Keyfeishu_open_idou_x``，等于把敏感值换一种可逆形式继续持久化；现在任何不
+    符合固定形状的值都降为 ``unknown``，不做字符替换，也不截取原文。
     """
 
-    cleaned = _FAILURE_SIGNATURE_DISALLOWED.sub("", value)[:_MAX_FAILURE_SIGNATURE_CHARS]
-    return cleaned or UNKNOWN_FAILURE_SIGNATURE
+    if not isinstance(value, str):
+        return UNKNOWN_FAILURE_SIGNATURE
+    if value in _STABLE_FAILURE_SIGNATURES:
+        return value
+    if _FAILURE_SIGNATURE_PATTERN.fullmatch(value):
+        return value
+    return UNKNOWN_FAILURE_SIGNATURE
 
 
 def _report_failure_signature(report: Mapping[str, Any]) -> str | None:
     """从一次回合报告里取出失败签名；没有（例如失败根本不来自异常）返回 ``None``。
 
-    通常签名是底层异常的限定类型名（Issue #495）；少数结构化外因也可以携带
+    通常签名是底层异常的固定类别摘要（Issue #495）；少数结构化外因也可以携带
     稳定的分类签名，例如指标 MCP 的 ``mcp.query.http_502``。两种形状都必须经过
-    同一条白名单清洗，不能让跨进程报告把自由文本带进审计出口。
+    同一条严格形状校验，不能让跨进程报告把自由文本带进审计出口。
 
     ``None`` 是精确语义、不是"以后补"：``turn_timeout``/``drain_timeout``/
     ``cancelled`` 这些失败码本身已经把原因说全了，没有底层异常可签名，编一个

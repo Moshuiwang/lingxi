@@ -494,7 +494,7 @@ Issue #408 正式方案第二步。不新建表：`task_document_delivery_reques
 ## `0080_task_failure_signature`（任务失败签名：`task` 新增两列）
 
 Issue #495。`task` 新增两列可空 `TEXT`：`failure_code`（worker 给出的**细分**
-失败码）与 `failure_signature`（底层异常的**类型限定名**）。补的是 2026-08-31
+失败码）与 `failure_signature`（底层异常的**固定类别摘要**）。补的是 2026-08-31
 浸泡窗口取证到的诊断黑洞——8 条任务失败里 6 条无法归因，结构化日志只留下
 `error_kind=session_failed failure_code=null`。
 
@@ -505,8 +505,9 @@ worker 与 gateway 是两个独立进程、不共享文件系统，只进 worker
 管理员用 `/admin trace` 看不到——与 `0070` 同一个结构性缺口、同一条解法。
 
 **两列都不装异常正文**（`V-花名册-33`：审计与日志不含外部标识原值；psycopg 异常
-串常见形状 `DETAIL: Key (feishu_open_id)=(ou_...)`），写入前过字符白名单与 64
-字符上界，口径与 rc22 opus 审查 P2-5 对 `event.pipeline_failed` 的收敛一致。
+串常见形状 `DETAIL: Key (feishu_open_id)=(ou_...)`），写入前只接受固定分类或
+`exception.<类别>.<160-bit摘要>` 的固定形状与 64 字符上界，口径与 rc22 opus
+审查 P2-5 对 `event.pipeline_failed` 的收敛一致。
 两列可空且 `NULL` 是精确语义（成功回合无失败码；`turn_timeout` 这类失败没有
 异常对象可签），不回填历史行。列语义与判据见迁移文件头部完整说明。
 

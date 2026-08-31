@@ -24,6 +24,7 @@ from lingxi.apps.worker.report_extraction import (
     _report_sheet_request,
     _report_token_usage,
     _tool_result_count,
+    sanitize_failure_signature,
     _unnamed_failure_code,
     failure_with_signature,
 )
@@ -876,7 +877,7 @@ class WorkerService:
             }
         except Exception as error:  # noqa: BLE001 - worker 绝不留下 running
             # `turn.py` 兜底 `except` 之外的**第二条**兜底（Issue #495）：失败码
-            # 保持 `session_failed`（用户文案不变），类型限定名进 `signature`。
+            # 保持 `session_failed`（用户文案不变），固定类别摘要进 `signature`。
             report = {
                 "turn": {"closed": False, "final_text": "", "session_id": None},
                 "failure": failure_with_signature(
@@ -908,7 +909,7 @@ class WorkerService:
         turn = report.get("turn") or {}
         failure = report.get("failure") or {}
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
-        # 失败签名（#495/#496）：异常类型名或结构化外因标识；没有时为 None。
+        # 失败签名（#495/#496）：异常固定类别摘要或结构化外因标识；没有时为 None。
         failure_signature = _report_failure_signature(report)
         final_text = turn.get("final_text") if isinstance(turn, Mapping) else ""
         final_text = final_text if isinstance(final_text, str) else ""
@@ -1270,13 +1271,14 @@ class WorkerService:
         不在这一层做互斥校验（真正的互斥校验在
         ``write_terminal_event``——见该方法文档）。
 
-        ``failure_signature``（#495/#496，迁移 ``0080``）：异常类型名或固定分类签名
-        （如 ``mcp.query.http_502``），与 ``failure_code`` 一起进低敏日志与 ``task`` 两列。
+        ``failure_signature``（#495/#496，迁移 ``0080``）：异常固定类别摘要或结构化外因
+        分类签名（如 ``mcp.query.http_502``）进两个出口；原始异常类型名和正文不进入。
         """
+        safe_failure_signature = sanitize_failure_signature(failure_signature) if failure_signature is not None else None
         self._log_terminal_outcome(
             task_id=claimed.task_id,
             failure_code=failure_code,
-            failure_signature=failure_signature,
+            failure_signature=safe_failure_signature,
             error_kind=error_kind,
             terminal_kind=terminal_kind,
             output_safety=output_safety,
@@ -1298,7 +1300,7 @@ class WorkerService:
             # 同事务落库（迁移 0080，Issue #495）：worker 与 gateway 不共享文件
             # 系统，只进 stderr 的线索管理员看不到（同迁移 0070 的结构性缺口）。
             failure_code=_cap_log_token(str(failure_code))[0] if failure_code is not None else None,
-            failure_signature=failure_signature,
+            failure_signature=safe_failure_signature,
             document_request=document_request,
             sheet_request=sheet_request,
         )
@@ -1329,12 +1331,11 @@ class WorkerService:
         已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
         （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
         导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
-        ``failure_signature``/``failure_code``（#495/#496）与 ``tool_result_count``（#291）
-        仅提供低敏类型/分类线索，不记录异常正文或工具入参。
+        ``failure_signature``/``failure_code``（#495/#496）与 ``tool_result_count``（#291）仅
+        提供低敏固定类别/分类线索，不记录动态类型、异常正文或工具入参。
         独立复核 P1：事件经装配层 ``on_terminal_outcome`` 接入结构化 stderr；没有
         装配方（``None``）时跳过，不假装写出实际不存在的日志。
         """
-
         if self._on_terminal_outcome is None:
             return
 
@@ -1355,10 +1356,9 @@ class WorkerService:
         if failure_code is not None:
             capped_failure_code, code_truncated = _cap_log_token(str(failure_code))
             truncated = truncated or code_truncated
-        # 失败签名同一惯例（Issue #495）：写入方已洗过截过，这里是纵深防线。
         capped_failure_signature: str | None = None
         if failure_signature is not None:
-            capped_failure_signature, signature_truncated = _cap_log_token(failure_signature)
+            capped_failure_signature, signature_truncated = _cap_log_token(sanitize_failure_signature(failure_signature))
             truncated = truncated or signature_truncated
         capped_reasons: list[str] = []
         for reason in reasons:
