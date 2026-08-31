@@ -953,6 +953,15 @@ def _render_local_override_activity(
     与是否已发布无关，故用「登记」）；额外单独注明生效口径——开通链已生效、
     重算侧待每日重算恢复运行——不再笼统断言「生效」，也不再走回 2026-08-18 那种
     对所有场景一刀切成「登记」的过度保守。
+
+    **术语与管理卡/确认卡同步（Trace #469 收尾批修复包 E，#439 PM 裁定）**：三个
+    计数的名字用「补充授权 / 屏蔽指标 / 撤销」，逐字取自 ``core/admin/
+    notification._ACTION_LABEL``（与 ``core/admin/management_card.
+    _DIRECTION_LABEL``、``core/admin/router._OVERRIDE_DIRECTION_LABEL`` 同一份
+    口径）。本段是全链路术语统一的第五个出口——管理群同一批读者，白天在管理卡
+    上点的是「撤销」，晚上在日报里读到的却是「收回」，同一件事两套说法
+    （TOP-7）。这次改的只是这三个名字，「本窗口」/「登记」/「生效口径」三处
+    PM 已裁定的措辞逐字不动。
     """
 
     if section is None:
@@ -964,10 +973,10 @@ def _render_local_override_activity(
     if activity is None:
         return ""
     return (
-        f"本地权限覆盖活动：本窗口新增 授权 {activity.granted_today} 笔、"
-        f"抑制 {activity.suppressed_today} 笔、收回 {activity.revoked_today} 笔；"
-        f"当前登记 授权 {activity.active_grant_total} 条、"
-        f"抑制 {activity.active_suppress_total} 条，"
+        f"本地权限覆盖活动：本窗口新增 补充授权 {activity.granted_today} 笔、"
+        f"屏蔽指标 {activity.suppressed_today} 笔、撤销 {activity.revoked_today} 笔；"
+        f"当前登记 补充授权 {activity.active_grant_total} 条、"
+        f"屏蔽指标 {activity.active_suppress_total} 条，"
         f"涉及 {activity.affected_user_count} 位用户"
         "（生效口径：开通链已生效，重算侧待每日重算恢复运行）"
     )

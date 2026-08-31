@@ -920,11 +920,17 @@ class LocalOverrideActivityRenderTests(unittest.TestCase):
         text = render_daily_report(inputs)
 
         self.assertIn("本地权限覆盖活动", text)
-        self.assertIn("授权 2 笔", text)
-        self.assertIn("抑制 1 笔", text)
-        self.assertIn("收回 1 笔", text)
-        self.assertIn("当前登记 授权 5 条", text)
-        self.assertIn("抑制 3 条", text)
+        # 术语统一（Trace #469 收尾批修复包 E，#439 PM 裁定）：三个计数的名字
+        # 逐字取自 core/admin/notification._ACTION_LABEL。断言写成完整词
+        # （不是「授权 2 笔」这种会被「补充授权 2 笔」顺带满足的子串），
+        # 变异锚点：改回「授权/抑制/收回」本用例即由绿转红。
+        self.assertIn("新增 补充授权 2 笔", text)
+        self.assertIn("屏蔽指标 1 笔", text)
+        self.assertIn("撤销 1 笔", text)
+        self.assertIn("当前登记 补充授权 5 条", text)
+        self.assertIn("屏蔽指标 3 条", text)
+        self.assertNotIn("收回", text)
+        self.assertNotIn("抑制", text)
         self.assertIn("涉及 6 位用户", text)
         # P1-2（独立审查坐实并修复）：现网每日重算未跑，不得笼统断言「生效」——
         # 正文改用「登记」计数本身，另加一句口径说明区分开通链（已生效）与

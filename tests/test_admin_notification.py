@@ -411,7 +411,12 @@ _RETIRED_PERMISSION_VERBS = ("收回", "抑制", "新增授权", "新增抑制")
 
 
 class AdminSurfaceTerminologySweepTests(unittest.TestCase):
-    """``src/lingxi/core/admin`` 全模块可见文案的退役术语静态扫描（TOP-7 防倒退）。
+    """权限术语出口面的退役术语静态扫描（TOP-7 防倒退）。
+
+    扫描范围 = ``src/lingxi/core/admin`` 全模块 + ``src/lingxi/core/
+    daily_report.py``。日报被显式纳入是因为收尾批实测发现的**第五个出口**就在
+    那里：管理群是同一批读者，白天在管理卡上点的是「撤销」、晚上在日报里读到
+    「收回」，同一件事两套说法。
 
     只看**非文档字符串**的字符串字面量：模块/类/函数的 docstring 与 ``#`` 注释是
     写给维护者的沿革记录，必须保留"这个词当年叫什么"的historical事实，不在扫描
@@ -429,8 +434,11 @@ class AdminSurfaceTerminologySweepTests(unittest.TestCase):
         import ast
 
         admin_package = pathlib.Path(notification_module.__file__).parent
+        scanned = sorted(admin_package.glob("*.py")) + [
+            admin_package.parent / "daily_report.py"
+        ]
         offenders: list[str] = []
-        for path in sorted(admin_package.glob("*.py")):
+        for path in scanned:
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source)
             docstring_ids = set()
@@ -459,7 +467,7 @@ class AdminSurfaceTerminologySweepTests(unittest.TestCase):
         self.assertEqual(
             offenders,
             [],
-            "core/admin 里出现了使用退役术语的管理员可见文案；术语以 "
+            "权限术语出口面出现了使用退役术语的管理员可见文案；术语以 "
             "notification._ACTION_LABEL 为准（补充授权 / 屏蔽指标 / 撤销）：\n"
             + "\n".join(offenders),
         )
