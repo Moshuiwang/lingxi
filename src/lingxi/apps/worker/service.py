@@ -28,7 +28,7 @@ from lingxi.apps.worker.report_extraction import (
     failure_with_signature,
 )
 from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
-from lingxi.apps.worker.turn import WorkerTurnExecutor
+from lingxi.apps.worker.turn import MCP_BAD_GATEWAY_FAILURE_CODE, WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
 from lingxi.core.execution.card_stream import (
@@ -89,14 +89,14 @@ _STOP_SIGNAL_DRAIN_YIELDS = 5
 #   只要模型在工具调用/文本输出上足够活跃，单个任务的写入频率会被这 5 秒
 #   卡住，而不是 12 秒的兜底周期——单任务上界因此是 **1/5 = 0.2 次/秒，不是
 #   1/12**（此前把兜底周期当成唯一驱动源算成 1/12，是这条注释此前的错误）。
-#   `WorkerConfig.max_concurrency` 默认 16（见 `apps/worker/config.py`）：
+#   `WorkerConfig.max_concurrency` 当前默认/硬上限为 4（见 `apps/worker/config.py`）：
 #   - 理论最坏（不依赖"两条路径共享同一份节流状态、不会重复计数"这条实现
-#     细节，只假设每个任务在同一秒内两条路径都各自算了一次）：16 个任务 ×
-#     2 次/秒 = 32 次，占 50 次/秒预算的 64%；
+#     细节，只假设每个任务在同一秒内两条路径都各自算了一次）：4 个任务 ×
+#     2 次/秒 = 8 次，占 50 次/秒预算的 16%；
 #   - 真实链路（两条路径实际共享同一份 `last_progress_write_at`，一次写入
-#     后另一路径的下一次尝试必然被同一份状态挡住，不会重复计数；16 个任务
-#     各自的事件到达时刻天然错开，不会全部同秒撞在一起）：约 16×0.2=3.2
-#     次/秒，占 50 次/秒预算的 6.4%，余量非常充分；
+#     后另一路径的下一次尝试必然被同一份状态挡住，不会重复计数；4 个任务
+#     各自的事件到达时刻天然错开，不会全部同秒撞在一起）：约 4×0.2=0.8
+#     次/秒，占 50 次/秒预算的 1.6%，余量非常充分；
 # - 与事件驱动最短间隔 `_PROGRESS_MIN_UPDATE_INTERVAL_SECONDS`（5 秒）的比例
 #   保持在 2 倍以上（当前 2.4 倍），不会出现"兜底周期比事件驱动间隔还短、
 #   兜底成为主要更新来源"的倒挂；
@@ -908,7 +908,7 @@ class WorkerService:
         turn = report.get("turn") or {}
         failure = report.get("failure") or {}
         failure_code = failure.get("code") if isinstance(failure, Mapping) else None
-        # 失败签名（Issue #495）：底层异常的类型限定名；失败不来自异常时为 None。
+        # 失败签名（#495/#496）：异常类型名或结构化外因标识；没有时为 None。
         failure_signature = _report_failure_signature(report)
         final_text = turn.get("final_text") if isinstance(turn, Mapping) else ""
         final_text = final_text if isinstance(final_text, str) else ""
@@ -1270,11 +1270,9 @@ class WorkerService:
         不在这一层做互斥校验（真正的互斥校验在
         ``write_terminal_event``——见该方法文档）。
 
-        ``failure_signature``（Issue #495，迁移 ``0080``）：底层异常的**类型限定
-        名**，与 ``failure_code`` 一起同时进低敏审计日志与 ``task`` 两列——完整
-        口径见 :meth:`_log_terminal_outcome` 与 ``report_extraction`` 的签名一节。
+        ``failure_signature``（#495/#496，迁移 ``0080``）：异常类型名或固定分类签名
+        （如 ``mcp.query.http_502``），与 ``failure_code`` 一起进低敏日志与 ``task`` 两列。
         """
-
         self._log_terminal_outcome(
             task_id=claimed.task_id,
             failure_code=failure_code,
@@ -1331,8 +1329,8 @@ class WorkerService:
         已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
         （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
         导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
-        ``failure_signature``/``failure_code``（#495）与 ``tool_result_count``（#291）
-        仅提供类型化、低敏的终态取证线索，不记录异常正文或工具入参。
+        ``failure_signature``/``failure_code``（#495/#496）与 ``tool_result_count``（#291）
+        仅提供低敏类型/分类线索，不记录异常正文或工具入参。
         独立复核 P1：事件经装配层 ``on_terminal_outcome`` 接入结构化 stderr；没有
         装配方（``None``）时跳过，不假装写出实际不存在的日志。
         """
@@ -1376,7 +1374,6 @@ class WorkerService:
         fields = {
             "task_id": task_id,
             "failure_code": capped_failure_code,
-            # 未分类失败的唯一线索（Issue #495）：**只有类型限定名**，不含正文。
             "failure_signature": capped_failure_signature,
             "error_kind": error_kind,
             "terminal_kind": terminal_kind,
@@ -1472,6 +1469,8 @@ class WorkerService:
             # （分类在 apps/worker/turn.py）。与 max_turns_exceeded 同一姿态——
             # 「请稍后重试」对确定性失败是误导，专属文案给出可行动的建议。
             return "result_too_large", self._catalog.text("worker.result_too_large")
+        if code == MCP_BAD_GATEWAY_FAILURE_CODE:
+            return MCP_BAD_GATEWAY_FAILURE_CODE, self._catalog.text("worker.mcp_bad_gateway")
         return "session_failed", self._catalog.text("worker.failed")
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:

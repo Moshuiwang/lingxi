@@ -1188,7 +1188,7 @@ _TASK_STATUS_LABEL: dict[str, str] = {
 #: 「失败分类 Top」榜单——两处对**共有**的词刻意逐字保持同一措辞，改动其一时请
 #: 同步另一处。**唯一一处有意分岔**：``session_failed`` 在那边是「会话执行失败」，
 #: 这边加了「（未分类，见底层异常）」——榜单是聚合计数、下面没有别的行可看，而
-#: 这里紧接着就是「底层异常类型」那一行，把读者指过去正是本 Issue 的要点。
+#: 这里紧接着就是「失败签名/底层异常类型」那一行，把读者指过去正是本 Issue 的要点。
 _TASK_FAILURE_LABEL: dict[str, str] = {
     "cancelled": "执行被取消",
     "config_error": "worker 配置错误",
@@ -1202,6 +1202,7 @@ _TASK_FAILURE_LABEL: dict[str, str] = {
     "queued_timeout": "排队超时未领取",
     "redacted_withheld": "内容因安全策略被拦截",
     "result_too_large": "查询结果过大",
+    "mcp_bad_gateway": "指标 MCP 网关返回 502（建连失败）",
     "retry_exhausted": "重试次数耗尽",
     "running_timeout": "执行超时",
     "sdk_unavailable": "Agent SDK 不可用",
@@ -1348,7 +1349,7 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     if trace.task_status is not None:
         # 任务收口结果（Issue #495）：这条追溯号派生的任务失败时，管理员此前
         # 唯一能拿到的是「无失败记录」——开通没失败，问数任务失败了，而任务
-        # 那一侧的分类码与底层异常类型名只进 worker 容器 stderr，管理员看不到。
+        # 那一侧的分类码与失败签名只进 worker 容器 stderr，管理员看不到。
         # 迁移 0080 落库之后这里才有东西可显示；没有派生任务时整段省略，不摆
         # 一排空值。
         suffix = f"（{trace.task_ended_at}）" if trace.task_ended_at is not None else ""
@@ -1364,12 +1365,16 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
                 f"任务失败原因: {_display_or_unregistered(task_failure, _TASK_FAILURE_LABEL)}"
             )
         if trace.task_failure_signature is not None:
-            # 底层异常**类型名**，不是异常正文（`V-花名册-33`：审计与日志不含
-            # 外部标识原值；psycopg 的异常串常见形状 `DETAIL: Key
-            # (feishu_open_id)=(ou_...)`）。这里不翻译——它是第三方库的类名，
-            # 没有可枚举的取值域，翻译只能靠猜；管理员把它原样贴给研发就是最
-            # 有用的一手信息。
-            lines.append(f"底层异常类型: {trace.task_failure_signature}")
+            # 通常是底层异常**类型名**，不是异常正文；结构化外因也可使用固定分类
+            # 签名（例如 `mcp.query.http_502`），同样不是自由文本（`V-花名册-33`：
+            # 审计与日志不含外部标识原值；psycopg 的异常串常见形状 `DETAIL: Key
+            # (feishu_open_id)=(ou_...)`）。这里不翻译——它是稳定的低敏标识，没有
+            # 可枚举的取值域，翻译只能靠猜；管理员把它原样贴给研发就是最有用的一手
+            # 信息。
+            signature_label = (
+                "失败签名" if trace.task_failure_code == "mcp_bad_gateway" else "底层异常类型"
+            )
+            lines.append(f"{signature_label}: {trace.task_failure_signature}")
     if trace.document_delivery_status is not None:
         # 文档投递是 task 收口之后由 gateway 独立消费循环完成的另一条状态机。
         # 因此不能把 task.status == succeeded 当作文档已成功；尤其 #499 的降级

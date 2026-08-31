@@ -1271,6 +1271,28 @@ class WorkerConfigTest(unittest.TestCase):
 
         return load_config(worker_env(**overrides))
 
+    def test_worker_queue_concurrency_defaults_to_the_approved_hard_limit(self) -> None:
+        config = self._load()
+        self.assertEqual(config.max_concurrency, 4)
+
+    def test_worker_queue_concurrency_rejects_values_above_the_hard_limit(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            self._load(LINGXI_WORKER_MAX_CONCURRENCY="5")
+
+    def test_direct_worker_config_also_rejects_values_above_the_hard_limit(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfig, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            WorkerConfig(
+                question="q",
+                read_only_tools=(READ_ONLY_TOOL,),
+                trace_id="01J0000000000000000TEST000",
+                turn_timeout_seconds=60.0,
+                max_concurrency=5,
+            )
+
     def test_missing_question_fails_with_a_named_variable(self) -> None:
         from lingxi.apps.worker.config import WorkerConfigError, load_config
 
@@ -2870,6 +2892,64 @@ class McpStatusAuditTest(unittest.TestCase):
 
         self.assertIsNone(report["failure"])
         self.assertEqual(events, [])
+
+    def test_query_http_502_is_a_dedicated_failure_without_retry(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "HTTP 502 Bad Gateway"},
+                ]
+            }
+        )
+
+        self.assertEqual(report["failure"]["code"], "mcp_bad_gateway")
+        self.assertEqual(report["failure"]["signature"], "mcp.query.http_502")
+        self.assertFalse(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1)
+        self.assertEqual(len(fake.options), 1, "502 建连失败不得进入 resume/自动重试")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["server"], "query")
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn("502", events[0]["error"])
+
+    def test_non_query_502_and_query_non_502_keep_existing_success_semantics(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "HTTP 503 Service Unavailable"},
+                    {"name": "billing", "status": "failed", "error": "HTTP 502 Bad Gateway"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1)
+        self.assertEqual({event["server"] for event in events}, {"query", "billing"})
+
+    def test_bad_gateway_signal_is_reset_between_turns(self) -> None:
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        fake = FakeAgentSDK(
+            [{"kind": "text", "text": "日活 1024。"}],
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "status=502"},
+                ]
+            },
+        ).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        first = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-reset"))
+        fake.mcp_status = {"mcpServers": [{"name": "query", "status": "connected"}]}
+        second = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-reset-2"))
+
+        self.assertEqual(first["failure"]["code"], "mcp_bad_gateway")
+        self.assertIsNone(second["failure"])
+        self.assertTrue(second["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 2)
 
     def test_pending_and_disabled_are_not_treated_as_failures(self) -> None:
         """G-2 已知边界：`pending`（慢连接、`__aenter__()` 返回时还没到终态）与

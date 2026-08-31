@@ -94,6 +94,7 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "worker.side_effect_uncertain",
     "worker.context_too_long",
     "worker.result_too_large",
+    "worker.mcp_bad_gateway",
     "worker.redacted_withheld",
     "roster.report_title",
     "roster.header",

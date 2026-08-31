@@ -54,23 +54,23 @@ done
 export LINGXI_IMAGE_REGISTRY=ghcr.io/moshuiwang
 export LINGXI_IMAGE_TAG=20260806-000000000000
 
-# 生产主机规格待裁定的四项（Issue #494）在 deploy/compose.prod.yaml 里是
-# `${VAR:?...}` **无默认值**形态：真值由 deploy/.env.prod 提供，结构核对拿不到
+# 生产 worker-queue 合同的四项资源（Issue #494/#502）以及并发值在
+# deploy/compose.prod.yaml 里是 `${VAR:?...}` **无默认值**形态：真值由 deploy/.env.prod 提供，结构核对拿不到
 # 它，因此这里跟镜像仓库/tag 同一姿势给一组占位值，让渲染能跑完。
 #
 # **必须与 stage 侧渲染出同一个 tmpfs 值**：下面的结构摘要含 `tmpfs=` 一项，
-# stage 侧写的是 `${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}`，两边读的是同一个变量名，
-# 所以在这里 export 一次即可让两侧一致；给不同的值会让结构对照红，那是本脚本
-# 设计上要报的差异，不是本行的自由度。
+# stage 侧写的是 `${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}`，prod 侧由外部占位值供给；
+# 循环内分别设置/清除变量，既能检查 stage 基线默认值，也能检查 prod 外部合同。
 #
 # 新增任何 `${VAR:?}` 必须同步加进这里，否则本脚本会以"变量缺失"红——
 # `scripts/ci/check_deploy_contract.py::check_compose_interpolation_is_yaml_safe`
 # 把这条同步关系钉成会变红的断言（PR #506 CI 实测教训：漏了就只在最晚的
 # `Epic Full / image` 作业才炸）。
+export LINGXI_WORKER_MAX_CONCURRENCY=4
 export LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
-export LINGXI_WORKER_QUEUE_CPU_LIMIT=4.0
-export LINGXI_WORKER_QUEUE_MEM_LIMIT=16G
-export LINGXI_WORKER_QUEUE_PIDS_LIMIT=4096
+export LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
+export LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
+export LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
 
 # 摘要脚本单独用带引号的 heredoc 装进变量：直接写 `python3 -c '...'` 时，
 # 内层的引号会与外层冲突（第一版就栽在这上面）。
@@ -104,6 +104,59 @@ print("\n".join(lines))
 PYTHON
 )
 
+# 结构摘要不包含 environment/resources（它们允许按环境覆盖），所以单独核对
+# worker-queue 的已批准容量合同。这里用同一组外部占位值渲染两侧，仍然证明的是
+# 仓库中的 compose 形状与合同，而不是读取或创建真实生产 `.env.prod`。
+worker_contract_program=$(
+  cat <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+
+service = document.get("services", {}).get("worker-queue")
+if not isinstance(service, dict):
+    print(sys.argv[2] + " 缺少 worker-queue service", file=sys.stderr)
+    raise SystemExit(1)
+
+expected_environment = {"LINGXI_WORKER_MAX_CONCURRENCY": "4"}
+environment = service.get("environment", {})
+if not isinstance(environment, dict):
+    print(sys.argv[2] + " worker-queue environment 不是映射", file=sys.stderr)
+    raise SystemExit(1)
+for key, expected in expected_environment.items():
+    actual = environment.get(key)
+    if actual != expected:
+        print(
+            sys.argv[2] + " worker-queue " + key + "=" + repr(actual)
+            + ", approved value " + expected,
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+limits = (
+    service.get("deploy", {})
+    .get("resources", {})
+    .get("limits", {})
+)
+expected_limits = {"cpus": 1.5, "memory": "2147483648", "pids": 512}
+for key, expected in expected_limits.items():
+    actual = limits.get(key) if isinstance(limits, dict) else None
+    if actual != expected:
+        print(
+            sys.argv[2] + " worker-queue limit " + key + "=" + repr(actual)
+            + ", approved value " + repr(expected),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+if "/tmp:mode=1777,size=256m" not in service.get("tmpfs", []):
+    print(sys.argv[2] + " worker-queue tmpfs 不符合 256m 合同", file=sys.stderr)
+    raise SystemExit(1)
+PYTHON
+)
+
 build_key_program=$(
   cat <<'PYTHON'
 import json
@@ -123,10 +176,20 @@ PYTHON
 )
 
 for environment in stage prod; do
+  if [[ "${environment}" == prod ]]; then
+    export LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
+    export LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
+    export LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
+    export LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
+  else
+    unset LINGXI_WORKER_QUEUE_TMPFS_SIZE LINGXI_WORKER_QUEUE_CPU_LIMIT
+    unset LINGXI_WORKER_QUEUE_MEM_LIMIT LINGXI_WORKER_QUEUE_PIDS_LIMIT
+  fi
   # --profile mvp（Issue #153）：把 worker-queue 也纳入结构对照，否则它只在
   # mvp profile 下才可见，stage/prod 之间的等价性就漏了这个常驻服务一半的检查。
   docker compose -f deploy/compose.yaml -f "deploy/compose.${environment}.yaml" \
     --profile job --profile gateway --profile mvp config --format json > "${workspace}/${environment}.json"
+  python3 -c "${worker_contract_program}" "${workspace}/${environment}.json" "${environment}"
   python3 -c "${summary_program}" "${workspace}/${environment}.json" \
     > "${workspace}/${environment}.summary"
 done

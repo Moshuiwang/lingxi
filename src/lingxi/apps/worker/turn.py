@@ -47,6 +47,7 @@ from lingxi.core.execution.input_safety import compose_agent_prompt, normalize_e
 from lingxi.core.execution.message_stream import TurnStreamRecorder
 from lingxi.core.execution.tool_policy import ToolPolicy
 from lingxi.core.innertest_content_capture import ContentCaptureRecord, RawTurnCapture
+from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
 
 from .config import OUTPUT_SAFETY_CANARY_SURVIVOR_BODY, WorkerConfig
 from .report import build_report
@@ -60,6 +61,17 @@ _MAX_FAILURE_TEXT = 500
 # 故障）、`connected`（正常）都不触发。判定只在这一层，`adapters/claude_agent_
 # session.py` 只转发 SDK 原始 dict，不含任何判定逻辑（该模块既有约定）。
 _MCP_UNAVAILABLE_STATUSES = frozenset({"failed", "needs-auth"})
+# 下游指标 MCP 建连失败的稳定取值（Issue #496）：只在 query 服务报告 failed /
+# needs-auth 且错误文本明确带 HTTP 502 时使用。签名不是异常类型——这个信号来自
+# ``get_mcp_status`` 的结构化状态，而不是 Python exception——但仍保持和 #495
+# 一样的低敏、可落库、可在 ``/admin trace`` 回显的标识符形状。
+MCP_BAD_GATEWAY_FAILURE_CODE = "mcp_bad_gateway"
+MCP_BAD_GATEWAY_FAILURE_SIGNATURE = "mcp.query.http_502"
+_MCP_BAD_GATEWAY_ERROR = re.compile(
+    r"(?:\b502\s+bad\s+gateway\b|\bhttp(?:/\d+(?:\.\d+)?)?\s*[:=]?\s*502\b|"
+    r"\b(?:status|status[_ -]?code|code)\s*[:=]\s*['\"]?502\b)",
+    re.IGNORECASE,
+)
 
 # 会话 resume 失配的特征串（2026-08-27 生产事故 #2）：worker 容器 HOME=/tmp，
 # CLI 会话文件随容器重建消失，但 conversation.agent_session_id 仍留在库里——
@@ -211,6 +223,9 @@ class WorkerTurnExecutor:
         # `run_turn` 据此决定要不要对这次尝试的 `session_failed` 做一次降级重试。
         # 这里的初始化只是防御性的——真正生效的重置在 `run_turn` 每轮尝试开头。
         self._resume_miss_detected = False
+        # 502 只反映当前 run_turn 的 MCP 状态探针；每次尝试开头清零，不能把上一
+        # 次回合或 resume 降级尝试的外因带进下一次报告。
+        self._mcp_bad_gateway_detected = False
 
     @property
     def policy(self) -> ToolPolicy:
@@ -489,6 +504,12 @@ class WorkerTurnExecutor:
                 continue
             name = server.get("name")
             error_text = server.get("error")
+            if (
+                name == QUERY_MCP_SERVER_NAME
+                and isinstance(error_text, str)
+                and _MCP_BAD_GATEWAY_ERROR.search(error_text)
+            ):
+                self._mcp_bad_gateway_detected = True
             self._emit_stderr_record(
                 level="warning",
                 event="worker.mcp_server_unavailable",
@@ -590,6 +611,7 @@ class WorkerTurnExecutor:
             # 特征串时置位，只反映**这一次**尝试观测到的信号，不带着上一次失败
             # 尝试的痕迹进入这一轮的降级判定。
             self._resume_miss_detected = False
+            self._mcp_bad_gateway_detected = False
 
             def handle_event(event: Mapping[str, Any]) -> None:
                 recorder.handle(event)
@@ -712,6 +734,14 @@ class WorkerTurnExecutor:
                         event="worker.stop.interrupt_race",
                         terminal_reason=recorder.terminal_reason,
                     )
+
+            if self._mcp_bad_gateway_detected and (
+                failure is None or failure.get("code") == "session_failed"
+            ):
+                # 502 是下游建连的确定性失败，不进入 resume 失配的自动降级重试：
+                # 这个稳定码会让下方只对 ``session_failed`` 生效的重试条件失配，
+                # 从结构上保证本次任务至多执行一次，不重复结果或交付。
+                failure = _mcp_bad_gateway_failure()
 
             if fuse_event.is_set():
                 # 包装拒绝熔断（Issue #352）：不管这次尝试最终被 SDK 收口成
@@ -841,6 +871,16 @@ def _failure(code: str, error: BaseException) -> dict[str, str]:
 
 def _failure_message(code: str, message: str) -> dict[str, str]:
     return {"code": code, "message": redact_free_text(message)[:_MAX_FAILURE_TEXT]}
+
+
+def _mcp_bad_gateway_failure() -> dict[str, str]:
+    """构造一次来自 MCP 状态探针的 502 失败，不携带外部错误正文。"""
+
+    return {
+        "code": MCP_BAD_GATEWAY_FAILURE_CODE,
+        "message": "指标服务网关返回 HTTP 502，未取得可用结果",
+        "signature": MCP_BAD_GATEWAY_FAILURE_SIGNATURE,
+    }
 
 
 def _sdk_termination_failure(

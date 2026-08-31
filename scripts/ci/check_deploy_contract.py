@@ -53,6 +53,14 @@ SCHEDULER_CREDENTIAL_ROTATION = (
 )
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
+WORKER_MAX_CONCURRENCY_VARIABLE = "LINGXI_WORKER_MAX_CONCURRENCY"
+WORKER_QUEUE_PRODUCTION_CONTRACT = {
+    WORKER_MAX_CONCURRENCY_VARIABLE: "4",
+    "LINGXI_WORKER_QUEUE_CPU_LIMIT": "1.5",
+    "LINGXI_WORKER_QUEUE_MEM_LIMIT": "2G",
+    "LINGXI_WORKER_QUEUE_PIDS_LIMIT": "512",
+    "LINGXI_WORKER_QUEUE_TMPFS_SIZE": "256m",
+}
 
 # 停止宽限期的数据库往返预算（秒）由下方的 ``module_constant`` 从统一连接工厂读取。
 # 这里不能复制 DSN 或连接工厂的数字：工厂通过 kwargs 覆盖 DSN 同名参数，且合法环境
@@ -468,6 +476,142 @@ def check_onboarding_gate_env_example() -> list[str]:
     return failures
 
 
+def _environment_value(service_text: str, variable: str) -> str | None:
+    """从 service 的 ``environment:`` 子块取一个变量原文。"""
+
+    environment = service_block(service_text, "environment") or ""
+    match = re.search(rf"^\s*{re.escape(variable)}:\s*(.*?)\s*$", environment, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _resource_value(service_text: str, key: str) -> str | None:
+    """从 service 的 ``deploy.resources.limits`` 子块取一个限制原文。"""
+
+    deploy = service_block(service_text, "deploy") or ""
+    resources = service_block(deploy, "resources") or ""
+    limits = service_block(resources, "limits") or ""
+    match = re.search(rf"^\s*{re.escape(key)}:\s*(.*?)\s*$", limits, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _has_env_assignment(text: str, variable: str, value: str, *, allow_comment: bool = False) -> bool:
+    """判断文档/env 模板是否出现精确的 ``NAME=value`` 行。"""
+
+    prefix = r"#?\s*" if allow_comment else r"\s*"
+    return bool(
+        re.search(
+            rf"^{prefix}{re.escape(variable)}={re.escape(value)}\s*$",
+            text,
+            re.MULTILINE,
+        )
+    )
+
+
+def check_worker_concurrency_contract() -> list[str]:
+    """把 worker-queue 并发上限与生产资源合同钉在代码/compose/文档四层。
+
+    Issue #496 的风险不是一个只写在评论里的容量意见：直接构造、环境 loader、
+    stage/prod compose 以及生产 runbook 必须共同表达同一个 `4`。生产资源值仍从
+    未入库的外部 `.env.prod` 注入，但它们的合同值和 `${VAR:?}` fail-fast 形状在
+    仓库里必须可机械检查；这样既不把真实生产凭据写进仓库，也不让数字漂移。
+    """
+
+    failures: list[str] = []
+    config_source = read(WORKER_CONFIG)
+    default = module_constant(WORKER_CONFIG, "DEFAULT_MAX_CONCURRENCY")
+    hard_limit = module_constant(WORKER_CONFIG, "MAX_CONCURRENCY_HARD_LIMIT")
+    if default != 4 or hard_limit != 4:
+        failures.append(
+            "apps/worker/config.py 的 DEFAULT_MAX_CONCURRENCY / "
+            f"MAX_CONCURRENCY_HARD_LIMIT 必须都为 4（当前 {default!r}/{hard_limit!r}）。"
+        )
+    if not re.search(
+        r"max_concurrency\s*:\s*int\s*=\s*DEFAULT_MAX_CONCURRENCY",
+        config_source,
+    ):
+        failures.append(
+            "apps/worker/config.py 的 WorkerConfig.max_concurrency 必须引用 "
+            "DEFAULT_MAX_CONCURRENCY，不能留下漂移的旧默认值。"
+        )
+    if not re.search(r"max_concurrency\s*=\s*_max_concurrency\(env\)", config_source):
+        failures.append(
+            "apps/worker/config.py 的 load_config 必须经 _max_concurrency(env) 读取，"
+            "不能只在 compose 或评论里声明上限。"
+        )
+    if "MAX_CONCURRENCY_HARD_LIMIT" not in config_source:
+        failures.append("apps/worker/config.py 缺少并发硬上限断言。")
+
+    base = strip_comments(read(COMPOSE_BASE))
+    stage = strip_comments(read(COMPOSE_STAGE))
+    prod = strip_comments(read(COMPOSE_PROD))
+    base_worker_queue = service_block(base, "worker-queue") or ""
+    stage_worker_queue = service_block(stage, "worker-queue") or ""
+    prod_worker_queue = service_block(prod, "worker-queue") or ""
+    base_value = _environment_value(base_worker_queue, WORKER_MAX_CONCURRENCY_VARIABLE)
+    if base_value != '"${LINGXI_WORKER_MAX_CONCURRENCY:-4}"':
+        failures.append(
+            "deploy/compose.yaml 的 worker-queue 必须显式给出 "
+            'LINGXI_WORKER_MAX_CONCURRENCY: "${LINGXI_WORKER_MAX_CONCURRENCY:-4}"。'
+        )
+    stage_value = _environment_value(stage_worker_queue, WORKER_MAX_CONCURRENCY_VARIABLE)
+    if stage_value not in {'"4"', "4"}:
+        failures.append(
+            "deploy/compose.stage.yaml 的 worker-queue 必须显式固定 "
+            "LINGXI_WORKER_MAX_CONCURRENCY=4。"
+        )
+    prod_value = _environment_value(prod_worker_queue, WORKER_MAX_CONCURRENCY_VARIABLE)
+    if prod_value is None or not REQUIRED_VARIABLE.match(prod_value):
+        failures.append(
+            "deploy/compose.prod.yaml 的 worker-queue 并发必须使用 "
+            "LINGXI_WORKER_MAX_CONCURRENCY 的 `${VAR:?}` 外部 env 门，不能带默认值。"
+        )
+
+    expected_limits = {
+        "cpus": '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:-1.5}"',
+        "memory": "${LINGXI_WORKER_QUEUE_MEM_LIMIT:-2G}",
+        "pids": "${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-512}",
+    }
+    for path_label, worker_queue in (
+        ("deploy/compose.yaml", base_worker_queue),
+        ("deploy/compose.stage.yaml", stage_worker_queue),
+    ):
+        for key, expected in expected_limits.items():
+            actual = _resource_value(worker_queue, key)
+            if actual != expected:
+                failures.append(
+                    f"{path_label} 的 worker-queue `{key}` 必须保留批准合同默认值 "
+                    f"{expected}（当前 {actual!r}）。"
+                )
+
+    env_example = read(ENV_EXAMPLE)
+    if not _has_env_assignment(
+        env_example, WORKER_MAX_CONCURRENCY_VARIABLE, "4", allow_comment=True
+    ):
+        failures.append(
+            "deploy/.env.example 没有示范 LINGXI_WORKER_MAX_CONCURRENCY=4；"
+            "并发合同不能只活在 compose 注释里。"
+        )
+
+    readme = read(REPOSITORY_ROOT / "deploy" / "README.md")
+    runbook = read(REPOSITORY_ROOT / "deploy" / "生产部署runbook.md")
+    checklist = read(DEPLOY_CHECKLIST)
+    for path_label, text in (
+        ("deploy/README.md", readme),
+        ("deploy/生产部署runbook.md", runbook),
+    ):
+        for variable, value in WORKER_QUEUE_PRODUCTION_CONTRACT.items():
+            if not _has_env_assignment(text, variable, value):
+                failures.append(
+                    f"{path_label} 缺少生产 worker-queue 合同行 `{variable}={value}`；"
+                    "真实值仍须写到未入库的外部 deploy/.env.prod。"
+                )
+    if WORKER_MAX_CONCURRENCY_VARIABLE not in checklist or "硬上限" not in checklist:
+        failures.append(
+            "deploy/验收前部署配置清单.md 没有登记 worker-queue 并发硬上限合同。"
+        )
+    return failures
+
+
 def check_content_capture_prod_guard() -> list[str]:
     """内测轮内容级采集开关（Issue #251/#304 批次 3）的"正式环境不得生效"结构性
     保证：机械核对而不是只活在文档里的约定。
@@ -692,16 +836,10 @@ def _extract_positive_default(raw: str) -> float | None:
 #: 这是本仓库既有的"不许静默退回默认"写法（`LINGXI_IMAGE_TAG` 用的就是它）。
 REQUIRED_VARIABLE = re.compile(r'^"?\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}"?$')
 
-# ---- 生产主机规格待裁定（Issue #494，2026-08-31）-----------------------------
-# `worker-queue` 的生产档四项（/tmp 上限 + cpus/memory/pids）此前是一组按"建议
-# 服务器 8 核 / 32GB"推算的数字，那台服务器的实际规格**从未被确认过**；而 `/tmp`
-# 是内存盘，写满即等量占用宿主内存，规格不符时这部分占用没有任何护栏。在产品负责人
-# 裁定生产主机规格之前，这四项在 `compose.prod.yaml` 里必须写成 `${VAR:?...}`：
-# 生产部署会因为缺变量而**报错退出**，而不是静默用上一个可能错的默认值。
-#
-# 裁定之后的落法是把值写进 `deploy/.env.prod`，本表与 compose 文件都不用改；真要
-# 把数字写回 compose，就把服务名从这张表里删掉，让它退回普通的"正数默认值"规则。
-PROD_PENDING_HOST_SPEC_LIMITS: dict[str, tuple[str, ...]] = {
+# ---- 生产 worker-queue 外部资源合同（Issue #494/#502，2026-08-31）---------
+# 生产值由目标机器外部根 `deploy/.env.prod` 提供，仓库不创建真实文件；prod compose
+# 以 `${VAR:?...}` 形态 fail-fast，静态检查同时确认这个形状与合同文档中的值。
+PROD_EXTERNAL_HOST_SPEC_LIMITS: dict[str, tuple[str, ...]] = {
     "worker-queue": ("cpus", "memory", "pids"),
 }
 
@@ -710,7 +848,7 @@ def _check_resource_limits_in(
     compose_path: pathlib.Path,
     *,
     require_all_services: bool,
-    pending_keys: dict[str, tuple[str, ...]] | None = None,
+    external_keys: dict[str, tuple[str, ...]] | None = None,
 ) -> list[str]:
     """核对一份 compose 文本里六个服务的 `deploy.resources.limits`：三键齐全、
     且各自能从静态文本判定出一个 >0 的默认值。
@@ -718,18 +856,17 @@ def _check_resource_limits_in(
     `require_all_services=True` 现在对**三份文件都成立**（Issue #494）：基线、
     stage 覆盖、prod 覆盖都必须逐服务显式声明这个块。此前覆盖文件是可选的
     ——"沿用基线"听起来无害，实际是把一个只为"漏挂 --env-file 时不至于更糟"
-    而存在的兜底值当成了部署档：基线给 worker-queue 的默认是 4.0 核 / 16G，
-    而 stage 主机只有 2 核 / 3.74GiB，沿用它等于这道防线完全没有生效，且不会
-    有任何报错。每个环境显式写出自己的一档，是让"这个数字是给哪台机器的"这件事
+    而存在的兜底值当成了部署档；当前基线默认与批准的 worker-queue 合同一致，
+    stage 与生产机器采用同型资源。每个环境显式写出自己的一档，是让"这个数字是给哪台机器的"这件事
     在文件里可读、可复核。
 
-    `pending_keys` 里登记的服务/键（见 `PROD_PENDING_HOST_SPEC_LIMITS`）反过来
-    **必须**是 `${VAR:?...}` 无默认值形态：那些数字依赖尚未确认的主机规格，
-    留一个能静默生效的默认值比报错更危险。
+    `external_keys` 里登记的服务/键（见 `PROD_EXTERNAL_HOST_SPEC_LIMITS`）反过来
+    **必须**是 `${VAR:?...}` 无默认值形态：生产值仍由外部 `.env.prod` 注入，
+    留一个能静默生效的默认值会绕过合同。
     """
 
     failures: list[str] = []
-    pending = pending_keys or {}
+    external = external_keys or {}
     text = strip_comments(read(compose_path))
     for service in RESOURCE_LIMITED_SERVICES:
         block = service_block(text, service)
@@ -750,7 +887,7 @@ def _check_resource_limits_in(
                     "不是任何一个环境的部署档（Issue #494）。"
                 )
             continue
-        pending_for_service = pending.get(service, ())
+        external_for_service = external.get(service, ())
         for key in ("cpus", "memory", "pids"):
             value_match = re.search(rf"^\s*{key}:\s*(\S.*?)\s*$", limits_block, re.MULTILINE)
             if value_match is None:
@@ -759,15 +896,15 @@ def _check_resource_limits_in(
                 )
                 continue
             raw = value_match.group(1).strip()
-            if key in pending_for_service:
+            if key in external_for_service:
                 if not REQUIRED_VARIABLE.match(raw):
                     failures.append(
                         f"{service} 的 `{key}` 在 {display(compose_path)} 不是 "
                         f"`${{变量:?说明}}` 无默认值形态（原文 `{raw}`）。这一项依赖"
-                        "尚未确认的生产主机规格（Issue #494）：带默认值意味着漏配时"
-                        "静默用上一个可能高于物理规格的上限，那道防线等于没有生效。"
-                        "裁定后把值写进 deploy/.env.prod，或从 "
-                        "PROD_PENDING_HOST_SPEC_LIMITS 里摘掉这一项。"
+                        "生产外部资源合同（Issue #494/#502）：带默认值意味着漏配时"
+                        "静默绕过主机资源确认，那道防线等于没有生效。值只能由外部 "
+                        "deploy/.env.prod 提供，或从 "
+                        "PROD_EXTERNAL_HOST_SPEC_LIMITS 里摘掉这一项。"
                     )
                 continue
             numeric = _extract_positive_default(raw)
@@ -787,7 +924,7 @@ def check_resource_limits() -> list[str]:
     部署时生效的值——不会被这条门禁发现；Issue #494 进一步要求覆盖文件不得
     靠"沿用基线"省掉声明）。
 
-    例外只有一处：`PROD_PENDING_HOST_SPEC_LIMITS` 登记的生产待定项必须写成
+    例外只有一处：`PROD_EXTERNAL_HOST_SPEC_LIMITS` 登记的生产外部合同项必须写成
     `${VAR:?...}`，反过来**不许**带默认值。
 
     只做结构 + 静态数值核对，不核对具体数值"合不合理"——合理性是容量判断，
@@ -801,7 +938,7 @@ def check_resource_limits() -> list[str]:
     failures += _check_resource_limits_in(
         COMPOSE_PROD,
         require_all_services=True,
-        pending_keys=PROD_PENDING_HOST_SPEC_LIMITS,
+        external_keys=PROD_EXTERNAL_HOST_SPEC_LIMITS,
     )
     return failures
 
@@ -876,10 +1013,10 @@ def check_compose_interpolation_is_yaml_safe() -> list[str]:
 # 查不出原因"可以无限期持续。
 #
 # 上限此前只写在基线 compose.yaml 里，`compose.prod.yaml` 与 `compose.stage.yaml`
-# 都没有覆盖（grep 零命中）——生产是同一个 256MB，且没人显式为它做过判断。这条
+# 都没有覆盖（grep 零命中）——生产未形成显式合同。这条
 # 门禁把三件事钉死：基线不许把值写死回去（必须走变量）、stage 必须显式声明自己
-# 那一档、prod 必须显式声明且**不得沿用默认**（主机规格待裁定，见
-# PROD_PENDING_HOST_SPEC_LIMITS 的同一条理由）。
+# 那一档、prod 必须显式声明且**不得沿用默认**（生产值由外部合同提供，见
+# PROD_EXTERNAL_HOST_SPEC_LIMITS 的同一条理由）。
 TMPFS_CAPACITY_SERVICE = "worker-queue"
 TMPFS_CAPACITY_VARIABLE = "LINGXI_WORKER_QUEUE_TMPFS_SIZE"
 
@@ -899,7 +1036,7 @@ def _tmp_tmpfs_size(compose_path: pathlib.Path, service: str) -> tuple[str | Non
             "不许靠沿用基线默认（Issue #494）。"
         )
     # 挂载项的选项串里可能含空格（`${VAR:?中文说明}` 的说明文本），因此不能按
-    # `\S+` 切——那会在 prod 的待定占位上找不到这一项而给出一条误导性的报错。
+    # `\S+` 切——那会在 prod 的外部合同占位上找不到这一项而给出误导性的报错。
     entry = re.search(r"^\s*-\s*/tmp:(.+?)\s*$", tmpfs_block, re.MULTILINE)
     if entry is None:
         return None, (
@@ -920,7 +1057,7 @@ def check_worker_tmpfs_capacity() -> list[str]:
     """`worker-queue` 的 `/tmp` 内存盘上限必须是分环境显式配置（Issue #494）。
 
     基线走变量、stage 显式给出自己那一档、prod 显式声明且必须是 `${VAR:?...}`
-    无默认值形态——理由见本节头部注释与 `PROD_PENDING_HOST_SPEC_LIMITS`。
+    无默认值形态——理由见本节头部注释与 `PROD_EXTERNAL_HOST_SPEC_LIMITS`。
     """
 
     failures: list[str] = []
@@ -954,10 +1091,9 @@ def check_worker_tmpfs_capacity() -> list[str]:
     elif not REQUIRED_VARIABLE.match(prod_size):
         failures.append(
             f"{service} 在 {display(COMPOSE_PROD)} 的 `/tmp` size `{prod_size}` "
-            "不是 `${变量:?说明}` 无默认值形态。生产主机内存规格尚待产品负责人裁定"
-            "（Issue #494）：带默认值意味着漏配时静默用上一个没人为生产判断过的"
-            "内存盘上限，而这块盘写满就等量吃掉宿主内存。裁定后把值写进 "
-            "deploy/.env.prod，本文件不用改。"
+            "不是 `${变量:?说明}` 无默认值形态。生产 worker-queue 资源合同"
+            "（Issue #494/#502）要求值由外部 deploy/.env.prod 提供；带默认值意味着"
+            "漏配时静默绕过合同，而这块盘写满就等量吃掉宿主内存。"
         )
 
     return failures
@@ -1668,6 +1804,7 @@ def main() -> int:
         ("停止宽限期与源码常量联动", check_stop_grace_period),
         ("数据库超时与停机上界依据", check_database_timeouts),
         ("worker-queue env.example 示范值", check_worker_queue_env_example),
+        ("worker-queue 并发上限与生产资源合同", check_worker_concurrency_contract),
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),

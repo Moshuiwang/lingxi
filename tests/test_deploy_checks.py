@@ -530,9 +530,9 @@ class ResourceLimitsTest(unittest.TestCase):
     def test_stage_override_declaring_none_of_the_block_is_now_caught(self) -> None:
         """变异验红（Issue #494 收紧）：覆盖文件不得靠"沿用基线"省掉声明。
 
-        基线给 worker-queue 的默认是 4.0 核 / 16G，而 stage 主机只有 2 核 /
-        3.74GiB——沿用它等于这道防线完全没有生效，且不会有任何报错。每个环境
-        显式写出自己那一档，"这个数字是给哪台机器的"才是文件里可读、可复核的。
+        基线的 worker-queue 默认必须与批准合同一致，而 stage 主机只有 2 核 /
+        3.74GiB——覆盖文件省掉资源声明会让部署档不再可复核。每个环境显式写出
+        自己那一档，"这个数字是给哪台机器的"才是文件里可读、可复核的。
         """
 
         failures = self._with_stage_override('scheduler:\n  user: "10001:10001"\n')
@@ -546,12 +546,56 @@ class ResourceLimitsTest(unittest.TestCase):
         self.assertEqual([f for f in failures if "scheduler" in f], [])
 
 
-class ProdPendingHostSpecLimitsTest(unittest.TestCase):
-    """Issue #494：生产主机规格待产品负责人裁定期间，`worker-queue` 的三项限制
+class WorkerConcurrencyContractTest(unittest.TestCase):
+    """Issue #496：并发 4 必须是可检查的代码/compose/部署合同。"""
+
+    def test_real_repository_has_the_approved_contract(self) -> None:
+        self.assertEqual(CONTRACT.check_worker_concurrency_contract(), [])
+
+    def test_stage_concurrency_mutation_is_rejected(self) -> None:
+        original_read = CONTRACT.read
+
+        def mutated_read(path: Path) -> str:
+            text = original_read(path)
+            if path == CONTRACT.COMPOSE_STAGE:
+                text = text.replace(
+                    'LINGXI_WORKER_MAX_CONCURRENCY: "4"',
+                    'LINGXI_WORKER_MAX_CONCURRENCY: "5"',
+                    1,
+                )
+            return text
+
+        CONTRACT.read = mutated_read
+        try:
+            failures = CONTRACT.check_worker_concurrency_contract()
+        finally:
+            CONTRACT.read = original_read
+
+        self.assertTrue(any("compose.stage.yaml" in failure for failure in failures), failures)
+
+    def test_worker_config_hard_limit_mutation_is_rejected(self) -> None:
+        original_read = CONTRACT.read
+
+        def mutated_read(path: Path) -> str:
+            text = original_read(path)
+            if path == CONTRACT.WORKER_CONFIG:
+                text = text.replace("MAX_CONCURRENCY_HARD_LIMIT = 4", "MAX_CONCURRENCY_HARD_LIMIT = 8", 1)
+            return text
+
+        CONTRACT.read = mutated_read
+        try:
+            failures = CONTRACT.check_worker_concurrency_contract()
+        finally:
+            CONTRACT.read = original_read
+
+        self.assertTrue(any("MAX_CONCURRENCY_HARD_LIMIT" in failure for failure in failures), failures)
+
+
+class ProdExternalHostSpecLimitsTest(unittest.TestCase):
+    """Issue #494/#502：生产 worker-queue 三项资源值由外部合同注入，
     在 `compose.prod.yaml` 里必须是 `${VAR:?...}` 无默认值形态。
 
-    此前那组 4.0 核 / 16G 是按"建议服务器 8 核 / 32GB"推算的，那台服务器的实际
-    规格从未被确认过。上限高于物理规格不会报错，等于这道防线完全没有生效。
+    生产实际值不入库，漏配时必须 fail-fast，不能静默绕过资源合同。
     """
 
     def _with_prod_override(self, body: str) -> list[str]:
@@ -565,7 +609,7 @@ class ProdPendingHostSpecLimitsTest(unittest.TestCase):
         finally:
             CONTRACT.COMPOSE_PROD = original
 
-    PENDING_BODY = (
+    EXTERNAL_CONTRACT_BODY = (
         "worker-queue:\n"
         "  deploy:\n"
         "    resources:\n"
@@ -575,11 +619,11 @@ class ProdPendingHostSpecLimitsTest(unittest.TestCase):
         "        pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:?待定}\n"
     )
 
-    def test_a_silent_default_on_a_pending_key_is_caught(self) -> None:
+    def test_a_silent_default_on_an_external_key_is_caught(self) -> None:
         """变异验红：把 `:?` 改回 `:-4.0`——漏配时静默用上一个没人为生产判断过的
         上限，正是本条要挡住的形状。"""
 
-        body = self.PENDING_BODY.replace(
+        body = self.EXTERNAL_CONTRACT_BODY.replace(
             '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"', '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"'
         )
         failures = self._with_prod_override(body)
@@ -588,8 +632,8 @@ class ProdPendingHostSpecLimitsTest(unittest.TestCase):
             failures,
         )
 
-    def test_a_hardcoded_number_on_a_pending_key_is_caught(self) -> None:
-        body = self.PENDING_BODY.replace(
+    def test_a_hardcoded_number_on_an_external_key_is_caught(self) -> None:
+        body = self.EXTERNAL_CONTRACT_BODY.replace(
             '"${LINGXI_WORKER_QUEUE_CPU_LIMIT:?待定}"', '"4.0"'
         )
         failures = self._with_prod_override(body)
@@ -597,11 +641,11 @@ class ProdPendingHostSpecLimitsTest(unittest.TestCase):
             any("worker-queue" in f and "`cpus`" in f for f in failures), failures
         )
 
-    def test_the_pending_form_passes(self) -> None:
-        failures = self._with_prod_override(self.PENDING_BODY)
+    def test_the_external_contract_form_passes(self) -> None:
+        failures = self._with_prod_override(self.EXTERNAL_CONTRACT_BODY)
         self.assertEqual([f for f in failures if "worker-queue" in f], [])
 
-    def test_real_prod_compose_uses_the_pending_form(self) -> None:
+    def test_real_prod_compose_uses_the_external_contract_form(self) -> None:
         """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
 
         self.assertEqual(CONTRACT.check_resource_limits(), [])
