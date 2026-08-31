@@ -592,6 +592,7 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
         assert context is not None
         self.assertTrue(context.daily_correction_pending)
         self.assertIsNone(context.daily_correction_reported_at)
+        self.assertTrue(context.needs_refresh)
         self.assertEqual(context_store.unreported_daily_correction_ids(), (message_id,))
 
         # 重启/迟到的 instant observer 不能把已经由 daily batch 证明的事实清掉。

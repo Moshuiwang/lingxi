@@ -247,7 +247,41 @@ class PositionManagementCardTests(unittest.TestCase):
         )
         self.assertEqual(scanner.scan(), 0)
         self.assertEqual(len(store.list_needing_refresh()), 1)
-        self.assertEqual(scanner.scan(), 1)
+        # 用新的 scanner 实例模拟 gateway 在瞬时 CardKit 失败后重启；重试依据是
+        # store 中的持久水位，而不是上一进程的 observer/内存状态。
+        restarted_scanner = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=_Refresher(),
+            status_lookup=lambda _identifier: _status(),
+            audit=_Audit(),
+        )
+        self.assertEqual(restarted_scanner.scan(), 1)
+        self.assertEqual(store.list_needing_refresh(), ())
+
+    def test_stale_visual_sequence_cannot_clear_new_state_watermark(self) -> None:
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_visual_generation",
+            identifier="u@example.com",
+            card_id="card_visual_generation",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        updated = store.update_state(
+            message_id="om_visual_generation", state="effective", dispatch_status="effective"
+        )
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.card_sequence, 3)
+        self.assertTrue(updated.needs_refresh)
+        self.assertFalse(
+            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1)
+        )
+        self.assertEqual(len(store.list_needing_refresh()), 1)
+        self.assertTrue(
+            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3)
+        )
         self.assertEqual(store.list_needing_refresh(), ())
 
     def test_closed_card_has_no_form_or_cancel_action(self) -> None:
