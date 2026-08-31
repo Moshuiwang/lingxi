@@ -838,9 +838,13 @@ class LocalOverrideActivityWiringTests(unittest.TestCase):
 
         assert text is not None
         self.assertIn("本地权限覆盖活动", text)
-        self.assertIn("授权 2 笔", text)
-        self.assertIn("抑制 1 笔", text)
-        self.assertIn("收回 1 笔", text)
+        # 术语统一（Trace #469 收尾批修复包 E）：同 tests/test_daily_report_
+        # render.py 的完整词断言，职责层这条出口同样不许退回旧说法。
+        self.assertIn("新增 补充授权 2 笔", text)
+        self.assertIn("屏蔽指标 1 笔", text)
+        self.assertIn("撤销 1 笔", text)
+        self.assertNotIn("收回", text)
+        self.assertNotIn("抑制", text)
         self.assertIn("涉及 6 位用户", text)
         sent_fields = parts["audit"].fields_for("daily_report.sent")[0]
         self.assertNotIn("local_override_activity", sent_fields["undetermined_sections"])

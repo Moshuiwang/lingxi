@@ -200,14 +200,19 @@ _NOT_FOUND_MESSAGE: dict[PendingActionType, str] = {
 
 #: ``target_state_changed`` 分支的文案，按动作类型分化（Trace #328 opus 审查升级
 #: 的 P2：此前本地权限三类动作全部落进"suspend 之外都当 resume 处理"的 ``else``
-#: 分支，字面导向"请去 /admin resume"——对一个授权/抑制/收回命令毫无意义，是一条
-#: 真实的误导面）。
+#: 分支，字面导向"请去 /admin resume"——对一个补充授权/屏蔽指标/撤销命令毫无意义，
+#: 是一条真实的误导面）。
+#:
+#: 文案里的动词用「撤销」而不是退役的「收回」（Trace #469 S-1 遗漏，收尾批 L4a
+#: 实测发现）：与 ``core/admin/notification._ACTION_LABEL`` 的
+#: ``LOCAL_PERMISSION_REVOKE`` 项逐字一致——管理员在管理卡上点的按钮、确认卡上
+#: 看到的标题都是「撤销」，这句拒绝提示不能再让他去找一个不存在的「收回」入口。
 _TARGET_STATE_CHANGED_MESSAGE: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "该用户当前不是启用状态，无需停用（或当前状态不支持停用）。",
     PendingActionType.RESUME_USER: "该用户当前不是停用状态，无需恢复（或当前状态不支持恢复）。",
-    PendingActionType.LOCAL_PERMISSION_GRANT: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先收回）。",
-    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先收回）。",
-    PendingActionType.LOCAL_PERMISSION_REVOKE: "该条本地权限当前不是生效状态，无需收回（或已被收回/替代）。",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先撤销）。",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "该项本地权限当前已有生效登记，无需重复发起（如需更改请先撤销）。",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "该条本地权限当前不是生效状态，无需撤销（或已被撤销/替代）。",
 }
 
 
@@ -237,12 +242,27 @@ def decide_prepare(
 #: 拦截文案里"这是哪一类动作"的中文展示名（Trace #445 #437 拦截文案改进）——
 #: 不直接展示 ``PendingActionType.value``（英文字面量），管理员看不懂
 #: ``local_permission_grant`` 这类内部取值。
+#:
+#: 术语统一（Trace #469 S-1 遗漏，收尾批 L4a 实测复现的第四张词表）：本地权限
+#: 三类动作的展示名**逐字取自** ``core/admin/notification._ACTION_LABEL``
+#: （「补充授权」/「屏蔽指标」/「撤销」），不再用退役的「本地权限授权 / 本地权限
+#: 抑制 / 本地权限收回」。这条拦截提示的全部价值就是让管理员**认出并找到**那张
+#: 还在途的旧确认卡（#437 真实运维事故），而那张卡的标题正是
+#: ``待确认：{_ACTION_LABEL[...]}用户``——两处用词必须能对得上，否则提示越详细
+#: 越误导。``SUSPEND_USER``/``RESUME_USER`` 两项与 #439 的权限术语裁定无关，
+#: 保持原样不动。
+#:
+#: 不 ``import`` ``notification._ACTION_LABEL`` 复用同一份对象：依赖方向是
+#: ``notification`` → ``pending_action``（前者已经 ``from ... pending_action
+#: import PendingActionType``），反向引用会造成循环导入。与 ``core/admin/
+#: router._OVERRIDE_DIRECTION_LABEL``、``core/admin/management_card.
+#: _DIRECTION_LABEL`` 同一取舍：展示文案就地各维护一份、靠用例锁死取值一致。
 _ACTION_TYPE_DISPLAY_NAME: dict[PendingActionType, str] = {
     PendingActionType.SUSPEND_USER: "停用用户",
     PendingActionType.RESUME_USER: "恢复用户",
-    PendingActionType.LOCAL_PERMISSION_GRANT: "本地权限授权",
-    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "本地权限抑制",
-    PendingActionType.LOCAL_PERMISSION_REVOKE: "本地权限收回",
+    PendingActionType.LOCAL_PERMISSION_GRANT: "补充授权",
+    PendingActionType.LOCAL_PERMISSION_SUPPRESS: "屏蔽指标",
+    PendingActionType.LOCAL_PERMISSION_REVOKE: "撤销",
 }
 
 #: 拦截文案里绝对时间的展示偏移——与 ``core/daily_report.py`` 既有的

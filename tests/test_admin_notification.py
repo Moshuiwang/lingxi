@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import pathlib
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import lingxi.core.admin.notification as notification_module
 from lingxi.core.admin.notification import (
     DECISION_CANCEL,
     DECISION_CONFIRM,
@@ -399,6 +401,76 @@ class RenderGroupNoticeReasonWhitelistTests(unittest.TestCase):
         pending = _pending(status=PendingActionStatus.FAILED, reason=None)
         notice = render_group_notice(pending, target_label=self._TARGET_LABEL)
         self.assertIn("内部原因", notice)
+
+
+#: 已退役的权限动词（Trace #469 #439 PM 裁定：全链路统一为「补充授权 /
+#: 屏蔽指标 / 撤销」）。收尾批 L4a 实测发现 S-1 只扫了三张展示词表，仍有四个
+#: 管理员可见出口在用「收回」——下面这条静态扫描把整个 ``core/admin`` 的可见
+#: 文案面钉死，让"第五个出口"在合并前就红，而不是等产品负责人点到。
+_RETIRED_PERMISSION_VERBS = ("收回", "抑制", "新增授权", "新增抑制")
+
+
+class AdminSurfaceTerminologySweepTests(unittest.TestCase):
+    """权限术语出口面的退役术语静态扫描（TOP-7 防倒退）。
+
+    扫描范围 = ``src/lingxi/core/admin`` 全模块 + ``src/lingxi/core/
+    daily_report.py``。日报被显式纳入是因为收尾批实测发现的**第五个出口**就在
+    那里：管理群是同一批读者，白天在管理卡上点的是「撤销」、晚上在日报里读到
+    「收回」，同一件事两套说法。
+
+    只看**非文档字符串**的字符串字面量：模块/类/函数的 docstring 与 ``#`` 注释是
+    写给维护者的沿革记录，必须保留"这个词当年叫什么"的historical事实，不在扫描
+    范围内；真正会走到飞书卡片/toast/群通知上的，是这些字面量。
+
+    这条扫描不覆盖内部标识符与数据库取值：``PendingActionType.
+    LOCAL_PERMISSION_REVOKE = "local_permission_revoke"``、迁移 ``0072`` 的
+    ``direction`` 取值 ``grant``/``suppress``、``entry_status`` 的
+    ``active``/``revoked``、回调 ``admin_action == "revoke"``、命令 token
+    ``revoke_permission`` 全部是 ASCII，本来就不含中文退役动词——改它们会破坏
+    已落库数据与回调解析，**绝不因为术语统一而改动**。
+    """
+
+    def test_no_admin_facing_literal_uses_a_retired_permission_verb(self) -> None:
+        import ast
+
+        admin_package = pathlib.Path(notification_module.__file__).parent
+        scanned = sorted(admin_package.glob("*.py")) + [
+            admin_package.parent / "daily_report.py"
+        ]
+        offenders: list[str] = []
+        for path in scanned:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            docstring_ids = set()
+            for node in ast.walk(tree):
+                if isinstance(
+                    node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    body = node.body
+                    if (
+                        body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)
+                    ):
+                        docstring_ids.add(id(body[0].value))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and id(node) not in docstring_ids
+                ):
+                    hit = [v for v in _RETIRED_PERMISSION_VERBS if v in node.value]
+                    if hit:
+                        offenders.append(f"{path.name}:{node.lineno}: {hit} -> {node.value!r}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "权限术语出口面出现了使用退役术语的管理员可见文案；术语以 "
+            "notification._ACTION_LABEL 为准（补充授权 / 屏蔽指标 / 撤销）：\n"
+            + "\n".join(offenders),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

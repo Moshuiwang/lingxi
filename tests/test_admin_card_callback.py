@@ -1173,7 +1173,7 @@ class ManagementRevokeClickTests(unittest.TestCase):
         self.assertEqual(len(router.route_calls), 1)
         self.assertEqual(
             router.route_calls[0]["text"],
-            "/admin revoke_permission lpo_01JGFJJZ008XSHEADGG8V74SPC 管理卡逐行收回",
+            "/admin revoke_permission lpo_01JGFJJZ008XSHEADGG8V74SPC 管理卡逐行撤销",
         )
         self.assertEqual(response["toast"]["type"], "success")
         self.assertNotIn("card", response)
@@ -1240,6 +1240,63 @@ class ManagementRevokeClickTests(unittest.TestCase):
         self.assertIn(
             "admin.card_callback.management_missing_override_id", [a for a, _ in audit.records]
         )
+
+
+class ManagementCardTerminologyTests(unittest.TestCase):
+    """管理卡撤销路径的术语统一（Trace #469 S-1 遗漏，收尾批 L4a 实测发现）。
+
+    #439 的 PM 裁定是**全链路**统一为「补充授权 / 屏蔽指标 / 撤销」，S-1 只扫到
+    三张展示词表；管理卡逐行按钮写「撤销」、服务端补的固定原因却仍写「收回」，
+    同一次操作在确认卡「原因」行 / 终态卡 / 群通知里出现两套说法——产品负责人
+    点一次撤销按钮就会当场看到（TOP-7 防倒退）。本类把两处出口逐字钉死。
+    """
+
+    def test_default_revoke_reason_uses_the_unified_verb_not_the_retired_one(self) -> None:
+        """变异锚点：把 ``_MANAGEMENT_CARD_REVOKE_REASON`` 改回「管理卡逐行收回」
+        （或任何含「收回」的取值），本用例立即由绿转红。"""
+
+        from lingxi.core.admin.card_callback import _MANAGEMENT_CARD_REVOKE_REASON
+        from lingxi.core.admin.notification import _ACTION_LABEL
+
+        revoke_label = _ACTION_LABEL[PendingActionType.LOCAL_PERMISSION_REVOKE]
+        self.assertIn(
+            revoke_label,
+            _MANAGEMENT_CARD_REVOKE_REASON,
+            "固定原因必须逐字包含 notification._ACTION_LABEL 里的撤销术语",
+        )
+        self.assertNotIn("收回", _MANAGEMENT_CARD_REVOKE_REASON)
+
+    def test_default_revoke_reason_stays_free_of_whitespace(self) -> None:
+        """形状不变量（``handle_management_revoke`` 的注释依赖它）：固定原因不含
+        空白，才不会在拼进 ``/admin revoke_permission <id> <reason...>`` 时改变
+        token 切分行为。改文案是文案改动，不得顺带改变解析形状。"""
+
+        from lingxi.core.admin.card_callback import _MANAGEMENT_CARD_REVOKE_REASON
+
+        self.assertTrue(_MANAGEMENT_CARD_REVOKE_REASON.strip())
+        self.assertEqual(_MANAGEMENT_CARD_REVOKE_REASON.split(), [_MANAGEMENT_CARD_REVOKE_REASON])
+
+    def test_missing_override_id_toast_uses_the_unified_verb(self) -> None:
+        """变异锚点：把这句 toast 改回「未识别到待收回的授权行……」，本用例由绿
+        转红。管理员看到的每一句提示都不得把他导向一个已经不存在的「收回」入口。
+        """
+
+        handler, _ = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=_FakeManagementRouter()
+        )
+
+        response = handler.handle_management_revoke(
+            operator_open_id="ou_admin",
+            override_id="",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+
+        content = response["toast"]["content"]
+        self.assertIn("撤销", content)
+        self.assertNotIn("收回", content)
 
 
 class RecomputeTriggerWiringTests(unittest.TestCase):
