@@ -23,7 +23,11 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
-from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
+from lingxi.core.admin.commands import (
+    AdminCommandKind,
+    AdminRejectReason,
+    parse_admin_command,
+)
 from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.pending_action import (
     LOCAL_PERMISSION_ACTION_TYPES,
@@ -645,16 +649,23 @@ class AdminCommandRouter:
 
         # UNKNOWN：语法封闭的落点——不认识的命令得到帮助/拒绝文案，绝不会被当成
         # 任何查询条件执行（`commands.py` 已把语法钉死为六选一，这里只负责回复）。
+        # `reject_reason`（Issue #492）只是一个枚举名，不含任何管理员输入的原文，
+        # 记进审计是为了让下一次"真人踩到但现场取不到正文"的调查至少知道是哪一段
+        # 没通过——Trace #502 W0-2 那次调查正是卡在这里（三条失败只留下一个不带
+        # 原因的 UNKNOWN，两个竞争假设至今无法区分）。
         return self._record_or_reject(
             "admin.command.unknown",
             AdminRouteOutcome(
                 handled=True,
                 content_key="admin.unknown_command",
                 content_version=_CONTENT_VERSION,
-                reply_text=_render_unknown(),
+                reply_text=_render_unknown(command.reject_reason),
             ),
             actor=entry.feishu_open_id,
             roles=roles,
+            reject_reason=(
+                command.reject_reason.value if command.reject_reason is not None else None
+            ),
             trace_id=trace_id,
         )
 
@@ -1191,5 +1202,45 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
     return "\n".join(lines)
 
 
-def _render_unknown() -> str:
-    return "未识别的管理命令，请发送 /admin help 查看可用命令。"
+#: 「以 ``/admin`` 开头但没解析成功」时，按失败落点告诉管理员**哪一段**没看懂
+#: （Issue #492 完成标准 4）。
+#:
+#: 缺陷现场：产品负责人 2026-08-31 连发三条管理命令，三条都只收到一句"未识别的
+#: 管理命令，请发送 /admin help 查看可用命令"——这句话不含任何可据以修正的信息，
+#: 他无从自救，也无法判断是邮箱被客户端自动链接化了（Issue #492 假设 1）还是公司
+#: 那一段填了中文名（假设 2）。两种情形此前产生**逐字相同**的回复。
+#:
+#: **刻意不回显管理员输入的原文**：回显最直观，但出站是一条飞书文本消息，而飞书
+#: 文本消息里的 ``<at user_id="all"></at>`` 一类标记是有语义的——把输入原样拼进
+#: 回复等于把一段可控文本反射进出站消息。段名 + 期望形状已经足够自救，不值得为
+#: 这点便利开一个反射面。
+_REJECT_HINTS: dict[AdminRejectReason, str] = {
+    AdminRejectReason.UNKNOWN_SUBCOMMAND: "没有认出命令名",
+    AdminRejectReason.WRONG_ARGUMENT_COUNT: "参数个数与这条命令的格式对不上",
+    AdminRejectReason.BAD_IDENTIFIER: (
+        "没有认出用户标识（命令里的第 1 个参数）——这一段请填用户邮箱或 open_id，中间不要有空格"
+    ),
+    AdminRejectReason.BAD_COMPANY_ID: (
+        "没有认出公司标识（命令里的第 2 个参数）——这一段要填公司编号，不是公司中文名称"
+    ),
+    AdminRejectReason.BAD_METRIC_NAME: (
+        "没有认出指标（命令里的第 3 个参数）——这一段请填指标名或已配置的中文别名，中间不要有空格"
+    ),
+    AdminRejectReason.BAD_REASON: "没有看懂原因（命令里的最后一段）——原因不能为空，且不超过 500 字",
+    AdminRejectReason.BAD_WINDOW_HOURS: "没有看懂小时数——这一段请填 1 到 720 之间的整数",
+    AdminRejectReason.BAD_TRACE_ID: "没有认出追溯号——这一段请填完整的 26 位追溯号，不要带前缀",
+}
+
+#: 不以 ``/admin`` 开头的文本得到的既有文案，逐字不变（Issue #492 完成标准 3）。
+#: 管理命令面**没有 ``/admin`` 前缀预检**，已登记管理员发的任何一句闲聊都会走到
+#: UNKNOWN 分支；对这些输入做分段报错等于对每句闲聊解释命令语法，是误伤。
+_UNKNOWN_COMMAND_TEXT = "未识别的管理命令，请发送 /admin help 查看可用命令。"
+
+
+def _render_unknown(reject_reason: AdminRejectReason | None) -> str:
+    """``UNKNOWN`` 的回复：以 ``/admin`` 开头的失败说清是哪一段没看懂，其余原样。"""
+
+    hint = _REJECT_HINTS.get(reject_reason) if reject_reason is not None else None
+    if hint is None:
+        return _UNKNOWN_COMMAND_TEXT
+    return f"这条管理命令没有完全看懂：{hint}。请发送 /admin help 查看正确格式后重发。"

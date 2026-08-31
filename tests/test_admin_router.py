@@ -2030,5 +2030,137 @@ class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
         self.assertEqual(pending_actions.prepare_calls, [])
 
 
+#: 一个只出现在测试里的公开形态邮箱（协作约定：夹具不得出现真实内部标识）。
+_LINK_TEST_EMAIL = "someone@example.com"
+
+
+class LinkifiedEmailRoutingTests(unittest.TestCase):
+    """Issue #492：链接化的邮箱在**整条路由**上走通，不只在解析器里。
+
+    现场：产品负责人 2026-08-31 真人操作，输入的邮箱被飞书编辑器自动转成了
+    ``mailto:`` 链接，连续三条命令都只收到"未识别的管理命令"。裁定原话：
+    **不能因为带了 mailto 就未识别**。
+    """
+
+    def test_markdown_linkified_email_reaches_the_query_with_the_bare_address(self) -> None:
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=1,
+                    updated_at="2026-08-31T00:00:00+00:00",
+                )
+            },
+            identifier_aliases={_LINK_TEST_EMAIL: "ou_target"},
+        )
+        router, _, _, audit = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f"/admin user [{_LINK_TEST_EMAIL}](mailto:{_LINK_TEST_EMAIL})",
+            trace_id="t1",
+        )
+
+        self.assertTrue(outcome.handled)
+        # 反查拿到的是裸邮箱（链接外壳已在解析层剥掉），查询拿到的是反查后的 open_id。
+        self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
+        self.assertEqual(queries.user_calls, ["ou_target"])
+        self.assertEqual(audit.actions(), ["admin.command.query_user"])
+
+    def test_bare_mailto_scheme_also_reaches_the_query(self) -> None:
+        """``mailto:a@b.com`` 此前不落 UNKNOWN（``:`` 本来就在字符集里），而是被
+        当成标识原样送去反查、查无此人——同一缺陷更隐蔽的一副面孔。"""
+
+        queries = FakeQueries(identifier_aliases={_LINK_TEST_EMAIL: "ou_target"})
+        router, _, _, _ = _router(queries=queries)
+
+        router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin user mailto:{_LINK_TEST_EMAIL}", trace_id="t1"
+        )
+
+        self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
+
+
+class SegmentedUnknownReplyTests(unittest.TestCase):
+    """Issue #492 完成标准 4：解析失败时说清**哪一段**没看懂。
+
+    "未识别的管理命令，请发送 /admin help 查看可用命令"这句话不含任何可据以修正的
+    信息——产品负责人连踩三次时，无法判断是邮箱被客户端链接化了（假设 1）还是公司
+    那一段填了中文名（假设 2），两种情形此前产生**逐字相同**的回复。
+    """
+
+    def test_chinese_company_name_reply_names_the_company_segment(self) -> None:
+        """假设 2 的自救出口：公司参数期望公司编号，输中文名被拒是**正确行为**
+        （不放宽字符集去接受 CJK，那是语义变更）——缺陷只在于没说清楚。"""
+
+        router, _, queries, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin grant_permission ou_target 一零一一 daily_active 特批",
+            trace_id="t1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("公司标识", outcome.reply_text)
+        self.assertIn("公司编号", outcome.reply_text)
+        self.assertEqual(queries.user_calls, [])
+        self.assertEqual(audit.actions(), ["admin.command.unknown"])
+        self.assertEqual(audit.records[0][1]["reject_reason"], "bad_company_id")
+
+    def test_unparseable_identifier_reply_names_the_identifier_segment(self) -> None:
+        router, _, _, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_a;b", trace_id="t1"
+        )
+
+        self.assertIn("用户标识", outcome.reply_text)
+        self.assertEqual(audit.records[0][1]["reject_reason"], "bad_identifier")
+
+    def test_unknown_subcommand_reply_names_the_command_name_segment(self) -> None:
+        router, _, _, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin delete_user ou_1", trace_id="t1"
+        )
+
+        self.assertIn("命令名", outcome.reply_text)
+        self.assertEqual(audit.records[0][1]["reject_reason"], "unknown_subcommand")
+
+    def test_plain_chat_text_keeps_the_generic_reply_word_for_word(self) -> None:
+        """不误伤（完成标准 3）：管理命令面**没有 ``/admin`` 前缀预检**，已登记
+        管理员发的任何一句闲聊都会走到 UNKNOWN 分支。对这些输入做分段报错等于对
+        每句闲聊解释命令语法——既有那句笼统文案逐字保留。"""
+
+        router, _, _, audit = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="不知道说什么", trace_id="t1")
+
+        self.assertEqual(outcome.reply_text, "未识别的管理命令，请发送 /admin help 查看可用命令。")
+        self.assertEqual(audit.records[0][1]["reject_reason"], "not_a_command")
+
+    def test_the_reply_never_echoes_the_admin_input(self) -> None:
+        """否定断言：分段报错只说段名与期望形状，**不回显输入原文**。
+
+        出站是一条飞书文本消息，飞书文本消息里的 ``<at user_id="all"></at>`` 一类
+        标记是有语义的；把输入拼进回复等于把一段可控文本反射进出站消息。段名 +
+        期望形状已经够自救，不值得为这点便利开一个反射面。
+        """
+
+        router, _, _, _ = _router()
+        payload = "ou_a;;;;<at></at>"
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin user {payload}", trace_id="t1"
+        )
+
+        self.assertNotIn(payload, outcome.reply_text)
+        self.assertNotIn(";;;;", outcome.reply_text)
+        self.assertNotIn("<at", outcome.reply_text)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
