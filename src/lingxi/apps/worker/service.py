@@ -24,7 +24,10 @@ from lingxi.apps.worker.report_extraction import (
     _report_token_usage,
     _tool_result_count,
 )
-from lingxi.apps.worker.session_cleanup import delete_agent_session_files
+from lingxi.apps.worker.session_cleanup import (
+    delete_agent_session_files,
+    run_session_transcript_reclaim,
+)
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
@@ -215,6 +218,13 @@ class WorkerService:
         # 不触碰清理队列——留着排队等下一个配置正确的进程来处理，而不是假装已清理。
         self._session_root = session_root
         self._session_cleanup_batch_limit = session_cleanup_batch_limit
+        # 会话转录容量回收（Issue #494）：上面那条按 id 定点清理的路径只在 `/new`、
+        # 权限刷新等触发点排队时才动手，**正常问数流程一次都不排**——转录因此在
+        # 容器的 256MB 内存盘上单调增长直到写满（rc22 收尾批 S-12 实测约 45 分钟，
+        # 且健康检查当时照样报绿，见 `lingxi/apps/healthcheck` 的可用空间判定）。
+        # 这里记住上一次回收的时刻，`_housekeep` 按 `session_reclaim_interval_
+        # seconds` 节流；`None` 表示"本进程还没回收过"，第一轮就会跑一次。
+        self._last_session_reclaim_at: float | None = None
         # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
         # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
         self._on_alert_tick = on_alert_tick
@@ -433,7 +443,38 @@ class WorkerService:
             # 最小可观测性第二类：queued/running/awaiting-delivery 滞留三选一）。
             self._report_task_stuck("awaiting_delivery_stuck", len(expired))
         self._cleanup_agent_sessions()
+        self._reclaim_session_transcripts()
         return terminals
+
+    def _reclaim_session_transcripts(self) -> None:
+        """按字节预算回收会话转录（Issue #494）：只决定"要不要现在跑"，回收与
+        日志在 ``session_cleanup.run_session_transcript_reclaim``。
+
+        与 ``_cleanup_agent_sessions`` 是**两条互相独立的路径**，缺一不可：那一条
+        按 ``agent_session_cleanup`` 队列定点清理（先归档、保全取证），只在
+        ``/new``、权限刷新、闲置话题清扫等触发点才有内容；本条与数据库无关，只看
+        目录总占用——没有它，正常问数流程产生的转录永远没有人删，最后写满容器的
+        256MB 内存盘（实测约 45 分钟）。
+
+        节流到 ``session_reclaim_interval_seconds`` 一次：``process_once`` 每 2 秒
+        一轮，每轮都扫一遍目录（逐文件 stat）在 2 核小机上不是零成本。用
+        ``self._monotonic``（与心跳/超时同一个可注入时钟）而不是墙钟，避免 NTP
+        校时把节流窗口拉成任意长度。
+        """
+
+        if self._session_root is None or self._config.session_disk_budget_bytes <= 0:
+            return
+        now = self._monotonic()
+        last = self._last_session_reclaim_at
+        if last is not None and now - last < self._config.session_reclaim_interval_seconds:
+            return
+        self._last_session_reclaim_at = now
+        run_session_transcript_reclaim(
+            self._session_root,
+            budget_bytes=self._config.session_disk_budget_bytes,
+            low_water_ratio=self._config.session_disk_low_water_ratio,
+            min_age_seconds=self._config.session_reclaim_min_age_seconds,
+        )
 
     def _cleanup_agent_sessions(self) -> None:
         """认领并（先归档、再）物理清理一批到期的 Agent 会话 JSONL（Issue #153；

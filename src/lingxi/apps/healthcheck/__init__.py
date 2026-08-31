@@ -5,20 +5,48 @@
 以 ``docker exec`` 语义在同一个容器内执行，与被检查进程共享同一份文件系统与网络
 命名空间，不需要监听端口，也不产生任何新的入站面。
 
-两段独立判定，**都要过**才算健康：
+三段独立判定，**都要过**才算健康：
 
-1. **依赖可达**：用与业务代码同一个连接工厂（``lingxi.adapters.postgres.connect``，
+1. **临时目录还写得进去**：读 ``/tmp``（活性文件所在的那块盘）的真实可用空间，
+   低于阈值即判不健康。这一段单独存在的理由见下面「为什么要单独判可用空间」。
+2. **依赖可达**：用与业务代码同一个连接工厂（``lingxi.adapters.postgres.connect``，
    带同一套受限超时）尝试连接数据库并跑一条 ``SELECT 1``。数据库不可用时——
    无论是网络问题、凭据错误还是数据库本身宕机——这一步必然如实失败，不存在
    "假健康"的空间（合同第 5 条："依赖（数据库等）不可用时健康检查必须如实
    变红"）。
-2. **主循环仍在跳动**：读取 ``lingxi.apps.liveness`` 写下的活性文件，年龄超过
+3. **主循环仍在跳动**：读取 ``lingxi.apps.liveness`` 写下的活性文件，年龄超过
    阈值即判不健康。这一段单独存在的理由：只测依赖可达测不出"进程 PID 还在、
    数据库也连得上，但主循环因为一次未捕获异常或死锁已经停止消费"——这正是
    `healthcheck 只能证明 PID 存活时不接受为完成` 这条要求要挡住的假健康形状。
 
 任何一段失败都以非零退出码结束，原因写到 stderr（不写业务正文，只写类别与
 耗时/年龄这类低敏诊断信息）。
+
+## 为什么要单独判可用空间（Issue #494）
+
+worker 容器的 ``HOME`` 指向 ``/tmp``，而 ``/tmp`` 是一块 **256MB 内存盘**；Agent
+会话转录写在 ``$HOME/.claude/projects`` 下，正常问数流程没有任何常规回收路径
+（Issue #494 ①，已在 ``apps/worker/session_cleanup.py`` 补上），rc22 收尾批 S-12
+浸泡实测：容器接负载约 45 分钟后 ``df -h /tmp`` 就是 ``256M 256M 0 100%``。
+
+**盘写满之后，本命令原来那两段判定全部照常报绿**——这是本文件要修掉的假阳性：
+
+* 活性文件是 ``lingxi-{role}-liveness`` 这类十几字节的小文件，主循环每轮**覆盖写**
+  同一个 inode。覆盖写十几个字节不需要向 tmpfs 要新页（先 truncate 释放的就是同
+  一页），所以盘 100% 满的时候心跳照写不误、年龄永远新鲜；
+* 数据库探测走网络，与本地盘无关，同样一路绿。
+
+于是"用户任务在失败、监控显示 healthy、运维查不出原因"这个组合可以无限期持续。
+判定逻辑本身没错，错的是它**没有一段判定能看见这块盘**。因此这里补上第三段，
+且**放在最前面**：它是三段里最便宜的一次 ``statvfs``（微秒量级，不像依赖可达那样
+要 ``import psycopg``），而且盘满会污染另外两段的信号（活性/缓存戳都写在这块盘
+上），先判它给出的诊断也最接近根因。
+
+阈值是**按比例**判、不是一个固定字节数：六个服务的 ``/tmp`` 上限不是同一个数
+（``deploy/compose.yaml``：worker/worker-queue 是 256m，其余四个是 16m），任何固定
+字节阈值要么对 16m 的盘恒红、要么对 256m 的盘形同虚设。同时封一个绝对上界
+``_SUFFICIENT_FREE_BYTES``：可用空间已经有这么多时一律判够用，免得本命令在开发机
+那种几百 GB 的文件系统上因为"可用不足 10%"而误红。
 
 ## 依赖可达判定的成本与缓存（Issue #409）
 
@@ -55,12 +83,13 @@ psycopg`` 与新建连接这整段开销。**缓存只在成功时写入**：一
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
-from lingxi.apps.liveness import read_liveness_age_seconds, touch_liveness
+from lingxi.apps.liveness import liveness_path, read_liveness_age_seconds, touch_liveness
 
 # 三个进程读数据库连接串用的环境变量名不统一（scheduler/worker 用不带前缀的
 # LINGXI_POSTGRES_DSN；gateway 的配置整体加了 LINGXI_GATEWAY_ 前缀，见
@@ -152,6 +181,22 @@ _LIVENESS_KEYS_BY_ROLE: Mapping[str, tuple[str, ...]] = {
     "gateway": ("gateway-longconn", "gateway-delivery"),
 }
 
+# ---- 临时目录可用空间阈值（Issue #494）--------------------------------------
+#: 可用空间低于总量的这个比例即判不健康。10% 对 worker/worker-queue 的 256MB
+#: 内存盘 = 25.6MiB，正好是"再放得下一份最大的会话转录（实测单份最大 15MB）还有
+#: 富余"这个量级；对 scheduler/gateway 那块 16MB 的盘 = 1.6MiB，同样够它们写活性
+#: 文件与临时文件。**回收预算与这条阈值不能打架**：`apps/worker/session_cleanup.py`
+#: 的默认预算 128MiB、低水位 96MiB，回收后留 160MiB 空闲，与 25.6MiB 的判红线之间
+#: 隔着一个数量级，正常运行绝不会贴线。
+_DEFAULT_MIN_FREE_RATIO = 0.10
+#: 可用空间达到这个绝对值时一律判够用，不再看比例。开发机 / CI 的 `/tmp` 常常落在
+#: 几百 GB 的根文件系统上，"可用不足 10%" 在那里是常态而不是故障；容器里的 tmpfs
+#: 上限只有 16m/256m，永远够不到这个数，因此这条上界只影响非容器场景，不会让容器
+#: 里真实的写满逃过判定。传 ``0`` 显式关掉这条上界（一切以比例为准）。
+_SUFFICIENT_FREE_BYTES = 512 * 1024 * 1024
+#: 只用于把字节数渲染成人读得懂的 MiB，不参与任何判定。
+_MIB = 1024 * 1024
+
 
 class HealthcheckError(RuntimeError):
     """健康检查判定失败；``reason`` 是安全的分类文本，不含业务正文或凭据。"""
@@ -159,6 +204,57 @@ class HealthcheckError(RuntimeError):
 
 def _db_cache_liveness_key(role: str) -> str:
     return f"{role}-db"
+
+
+def _check_free_space(
+    role: str,
+    *,
+    directory: Path | None = None,
+    min_free_ratio: float = _DEFAULT_MIN_FREE_RATIO,
+    sufficient_free_bytes: int = _SUFFICIENT_FREE_BYTES,
+    statvfs: Callable[[str], os.statvfs_result] | None = None,
+) -> None:
+    """判定活性文件所在的那块盘（容器里就是 ``/tmp`` 那块 tmpfs）还写得进去。
+
+    看的是**这块盘本身**而不是某个文件写得成不成：活性文件是十几字节的覆盖写，
+    盘 100% 满时它照样成功——那正是 Issue #494 里"容器一直报 healthy、用户在失败"
+    的成因（模块文档「为什么要单独判可用空间」有实测数据）。
+
+    判红条件是"可用比例低于阈值"**且**"可用绝对值也不够多"：前者让阈值随各服务
+    各自配置的 tmpfs 上限缩放（16m 与 256m 不能共用一个固定字节数），后者避免在
+    开发机那种几百 GB 的文件系统上误红。
+
+    ``statvfs`` 本身失败（目录不存在、盘不可读）同样判不健康：一个连自己的临时
+    目录都 stat 不了的容器不该被称作健康，退回"看不出问题就算好"正是本段要消灭的
+    那种假绿。
+    """
+
+    # `os.statvfs` 现取而不是绑成默认参数：默认参数在函数定义那一刻就求值，
+    # 之后任何替换（测试注入、平台适配）都不会生效，那正是"注入了却没生效"这类
+    # 假绿的来源（与 `run()` 里 P1-6 那条 `directory` 显式下传同一条教训）。
+    probe = statvfs if statvfs is not None else os.statvfs
+    path = liveness_path(role, directory=directory).parent
+    try:
+        stats = probe(str(path))
+    except OSError as error:
+        raise HealthcheckError(
+            f"临时目录不可用：{type(error).__name__}"
+        ) from error
+    total = stats.f_blocks * stats.f_frsize
+    free = stats.f_bavail * stats.f_frsize
+    if total <= 0:
+        # 读得到但总量为 0：无法据此判定，不假装健康也不编一个阈值。
+        raise HealthcheckError("临时目录容量读数为 0，无法判定可用空间")
+    if sufficient_free_bytes > 0 and free >= sufficient_free_bytes:
+        # `<= 0` 显式表示"关掉这条绝对上界，一切以比例为准"——不是"0 字节也算够"。
+        return
+    threshold = min_free_ratio * total
+    if free < threshold:
+        raise HealthcheckError(
+            f"临时目录可用空间 {free / _MIB:.1f}MiB 低于阈值 "
+            f"{threshold / _MIB:.1f}MiB（总量 {total / _MIB:.1f}MiB，"
+            f"下限比例 {min_free_ratio:.0%}）"
+        )
 
 
 def _check_database(
@@ -237,8 +333,6 @@ def run(
     env: Mapping[str, str] | None = None,
     stderr: object = None,
 ) -> int:
-    import os
-
     parser = argparse.ArgumentParser(prog="python -m lingxi.apps.healthcheck")
     parser.add_argument("--role", required=True, choices=sorted(_DSN_ENV_VAR_BY_ROLE))
     parser.add_argument(
@@ -254,6 +348,25 @@ def run(
         help=(
             "依赖可达判定的成功结果缓存有效期（秒，Issue #409）；缺省按角色取"
             "合理默认值。0 等价于关闭缓存，每轮都做真实探测"
+        ),
+    )
+    parser.add_argument(
+        "--min-free-ratio",
+        type=float,
+        default=None,
+        help=(
+            "临时目录（活性文件所在盘）可用空间的下限比例（Issue #494）；缺省 "
+            f"{_DEFAULT_MIN_FREE_RATIO:.0%}。按比例而不是固定字节，因为六个服务的 "
+            "tmpfs 上限本就不同"
+        ),
+    )
+    parser.add_argument(
+        "--sufficient-free-bytes",
+        type=int,
+        default=None,
+        help=(
+            "可用空间达到这个绝对值即判够用、不再看比例；缺省 "
+            f"{_SUFFICIENT_FREE_BYTES // (1024 * 1024)}MiB，0 表示关掉这条上界"
         ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -279,8 +392,23 @@ def run(
     liveness_dir_override = (source.get("LINGXI_LIVENESS_DIR") or "").strip()
     directory = Path(liveness_dir_override) if liveness_dir_override else None
 
+    min_free_ratio = args.min_free_ratio
+    if min_free_ratio is None:
+        min_free_ratio = _DEFAULT_MIN_FREE_RATIO
+    sufficient_free_bytes = args.sufficient_free_bytes
+    if sufficient_free_bytes is None:
+        sufficient_free_bytes = _SUFFICIENT_FREE_BYTES
+
     started = time.monotonic()
     try:
+        # 可用空间判定排第一：三段里最便宜的一次 statvfs，而且盘满会污染另外两段
+        # 的信号（活性戳与 DB 缓存戳都写在这块盘上），先判它给出的诊断最接近根因。
+        _check_free_space(
+            args.role,
+            directory=directory,
+            min_free_ratio=min_free_ratio,
+            sufficient_free_bytes=sufficient_free_bytes,
+        )
         _check_database(args.role, db_cache_ttl, source, directory=directory)
         _check_liveness(args.role, max_age, source, directory=directory)
     except HealthcheckError as error:

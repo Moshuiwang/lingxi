@@ -75,15 +75,25 @@ services:
   worker-queue:
     env_file:
       - ./.env.prod.worker-queue
-    # 架构设计「九、容量与资源」：峰值并发任务 10–16 × 单任务内存 300–500MB =
-    # worker 内存需求 8–16GB；这里取上限并按建议服务器 8 核 / 32GB 留出与
-    # scheduler/gateway 及宿主机自身共用的余量（完整推导见 deploy/README.md）。
+    # ---- 生产主机规格待产品负责人裁定（Issue #494，2026-08-31）-----------------
+    # 下面四项（/tmp 上限 + cpus/memory/pids）此前是**一组按"建议服务器 8 核 /
+    # 32GB"推算出来的数字，那台服务器的实际规格从未被确认过**。上限高于物理规格
+    # 不会报错，但等于这道防线完全没有生效；而 /tmp 是内存盘，写满即等量占用宿主
+    # 内存，规格不符时这部分占用没有任何护栏。
+    #
+    # 因此四项一律写成 `${VAR:?...}`（**无默认值**）：生产不是"少配一个变量就退回
+    # 一个可能错的默认"，而是 `docker compose up` 直接报错退出，逼这次部署先把主机
+    # 规格确认下来、写进 deploy/.env.prod。裁定后只需要在 .env.prod 里给值，本文件
+    # 不用再改。scripts/ci/check_deploy_contract.py 的 check_worker_tmpfs_capacity /
+    # check_resource_limits 把"prod 必须显式声明、不得沿用默认"钉成会变红的断言。
+    tmpfs:
+      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:?生产 /tmp 内存盘上限待定：确认生产主机内存规格后写进 deploy/.env.prod（Issue #494）}
     deploy:
       resources:
         limits:
-          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"
-          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-16G}
-          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-4096}
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:?生产 CPU 上限待定：确认生产主机 vCPU 数后写进 deploy/.env.prod（Issue #494）}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:?生产内存上限待定：确认生产主机内存规格后写进 deploy/.env.prod（Issue #494）}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:?生产 pids 上限待定：与并发上界 LINGXI_WORKER_MAX_CONCURRENCY 同批裁定后写进 deploy/.env.prod（Issue #494）}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
       # 与 stage 覆盖结构一致（部署门禁要求两侧只许值不同）：默认提示词等运行时

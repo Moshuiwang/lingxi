@@ -3965,6 +3965,149 @@ class RealQueueTerminalTests(unittest.TestCase):
         )
 
 
+class SessionTranscriptReclamationTests(unittest.TestCase):
+    """Issue #494 ①：**正常问数流程**下会话转录占用必须收敛在预算内。
+
+    这里刻意用一个连 ``claim_session_cleanups`` 都没有的假队列——**改动前那条唯一
+    的清理路径在本用例里根本不存在**，正如生产里正常问数流程从不往
+    ``agent_session_cleanup`` 排队一样。因此"占用有界"只能由新增的常规回收路径
+    提供：把 `_reclaim_session_transcripts` 从 `_housekeep` 里摘掉，本节第一个用例
+    立刻变红（转录单调增长到远超预算），这正是 rc22 收尾批 S-12 实测到的形状。
+    """
+
+    class _IdleQueue:
+        """只会说"没有任务"的队列：不提供任何回收/清理方法，`_housekeep` 里
+        那几个 `getattr(..., None)` 分支全部走空。"""
+
+        def claim(self, **kwargs: object) -> list[object]:
+            return []
+
+    def _service(self, root: Path, **overrides: object) -> WorkerService:
+        values: dict[str, object] = {
+            "session_disk_budget_bytes": 4096,
+            "session_disk_low_water_ratio": 0.75,
+            "session_reclaim_min_age_seconds": 60.0,
+            "session_reclaim_interval_seconds": 0.0,
+        }
+        values.update(overrides)
+        return WorkerService(
+            config=worker_config(**values),
+            queue=self._IdleQueue(),
+            session_root=root,
+        )
+
+    @staticmethod
+    def _write_transcript(root: Path, index: int, size: int) -> Path:
+        path = root / f"session-{index:04d}.jsonl"
+        path.write_bytes(b"x" * size)
+        # 每一份都往前挪，既让"最旧"有确定顺序，也让它们全部落在保护窗口之外
+        # （真实运行里保护窗口只罩住在途回合，不是全部转录）。
+        stamp = time.time() - 10_000 + index
+        os.utime(path, (stamp, stamp))
+        return path
+
+    @staticmethod
+    def _total(root: Path) -> int:
+        return sum(entry.stat().st_size for entry in root.rglob("*.jsonl"))
+
+    def test_continuous_traffic_without_any_cleanup_queue_stays_within_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root)
+            written = 0
+            peak = 0
+
+            # 40 轮"问数"，每轮产出一份 512B 转录：不回收的话总量会到 20480B，
+            # 是 4096B 预算的 5 倍——正是"单调增长直到写满"的缩尺复现。
+            for index in range(40):
+                self._write_transcript(root, index, 512)
+                written += 512
+                asyncio.run(service.process_once())
+                peak = max(peak, self._total(root))
+
+            self.assertEqual(written, 40 * 512)
+            self.assertLessEqual(
+                peak,
+                4096,
+                "持续问数流量下会话转录占用必须始终收敛在预算内，而不是单调增长",
+            )
+            self.assertGreater(
+                self._total(root), 0, "回收不该把目录清空——只压到低水位，最新的要留着"
+            )
+
+    def test_the_newest_transcripts_survive_a_reclaim_round(self) -> None:
+        """收敛不能靠"全删"：用户刚聊过的会话续得上，是回收方式的一部分。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root)
+            paths = [self._write_transcript(root, index, 1024) for index in range(10)]
+
+            asyncio.run(service.process_once())
+
+            self.assertFalse(paths[0].exists(), "最旧的一份必须先被回收")
+            self.assertTrue(paths[-1].exists(), "最新的一份必须留下")
+
+    def test_a_zero_budget_leaves_every_transcript_in_place(self) -> None:
+        """运维显式关闭回收（保全取证现场）时，一份都不许删。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root, session_disk_budget_bytes=0)
+            paths = [self._write_transcript(root, index, 1024) for index in range(10)]
+
+            asyncio.run(service.process_once())
+
+            self.assertTrue(all(path.exists() for path in paths))
+
+    def test_reclamation_is_throttled_between_rounds(self) -> None:
+        """`process_once` 每 2 秒一轮，不该每轮都去扫一遍目录。"""
+
+        now = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = WorkerService(
+                config=worker_config(
+                    session_disk_budget_bytes=1024,
+                    session_reclaim_interval_seconds=60.0,
+                    session_reclaim_min_age_seconds=60.0,
+                ),
+                queue=self._IdleQueue(),
+                session_root=root,
+                monotonic=lambda: now,
+            )
+            for index in range(4):
+                self._write_transcript(root, index, 1024)
+
+            asyncio.run(service.process_once())  # t=0：跑一次，压到低水位
+            after_first = self._total(root)
+            self.assertLess(after_first, 4 * 1024)
+
+            self._write_transcript(root, 99, 4096)
+            now = 1.0
+            asyncio.run(service.process_once())  # 节流窗口内，不该再跑
+            self.assertEqual(
+                self._total(root),
+                after_first + 4096,
+                "节流窗口内不该再扫一遍目录",
+            )
+
+            now = 100.0
+            asyncio.run(service.process_once())  # 窗口过了，必须再跑一次
+            self.assertLess(self._total(root), after_first + 4096)
+
+    def test_no_session_root_means_no_reclamation_attempt(self) -> None:
+        """取不到会话根目录（例如缺 HOME）时整体跳过，不猜一个路径去删东西。"""
+
+        service = WorkerService(
+            config=worker_config(session_disk_budget_bytes=1),
+            queue=self._IdleQueue(),
+            session_root=None,
+        )
+
+        asyncio.run(service.process_once())  # 不抛异常即通过
+
+
 @unittest.skipUnless(POSTGRES_READY, SKIP_DB)
 class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
     """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
