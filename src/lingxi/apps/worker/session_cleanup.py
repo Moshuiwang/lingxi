@@ -57,6 +57,37 @@ config.py`` 的 ``<user_env_root>/<user_id>/.mcp.json``）——复用它的每�
 ``user_env_root``/``user_id``（例如未来新增的调用点、或历史测试直接调用本函数
 不传这两个新增关键字参数）时同样退回直接删除——没有目标目录就没有"归档"这件
 事可言，不能假装做到了。
+
+## 容量回收：会话转录不能无界增长（Issue #494，2026-08-31）
+
+上面那条路径是**按 id 定点清理**：只有 ``/new``、权限刷新、闲置话题清扫等触发点
+往 ``agent_session_cleanup`` 排了队，对应的 JSONL 才会被处理。**正常问数流程一次
+都不排队**——于是会话转录在容器里只增不减。rc22 收尾批 S-12 浸泡实测坐实了这个
+形状：worker 容器的 ``HOME=/tmp`` 是一块 **256MB 内存盘**，接负载约 45 分钟后
+``df -h /tmp`` 就是 ``256M 256M 0 100%``，``/tmp/.claude/projects`` 一家吃满全部
+256MB（32 份转录、单份最大 15MB——重指标查询的工具回执很大）；清空后 33 分钟又
+长回 190MB。这不是"稳态占用偏高"，是单调增长直到写满。
+
+:func:`reclaim_session_transcripts` 补上常规回收路径：**按总字节预算、删最旧的**，
+与定点清理各自独立（定点清理仍然先归档，语义不变）。三条设计取舍：
+
+* **删除而不归档**。归档的目的地在持久卷上，一次容量回收要搬走的是"最旧的一批"
+  而不是"刚出事的那一份"，把它们逐份复制到磁盘再按保留上限立刻裁掉，只是把内存
+  盘的增长换成一次无谓的 I/O。真正需要保全的取证对象是**最近**发生的那次回合，
+  而本函数恰恰**先删最旧、保留最新**——比 Issue #291 那次"``/new`` 顺手把刚出事的
+  转录删了"的形状更安全，不是更危险。
+* **保护"太新"的文件**。``min_age_seconds`` 之内被写过的转录一律跳过：正在跑的
+  回合、以及用户刚刚聊过随时可能续用的会话不进删除集合。POSIX 上删掉一个仍被
+  打开的文件不会让写入方报错（fd 还在），但会让下一次 ``resume`` 落空、用户丢掉
+  会话内的上下文——那是用户可见的降级，不能为了腾空间随手换。
+* **删不动就如实告警，不硬删**。跳过保护窗口后仍超预算，说明预算相对真实负载配
+  小了（或者单份转录异常巨大），这时打一条 error 让人看见，而不是把保护窗口一
+  路降到 0 去凑数——真正的兜底是健康检查（``lingxi.apps.healthcheck`` 的可用空间
+  判定，同一个 Issue）会如实变红，不是这里偷偷删掉在用的会话。
+
+删掉的转录**不是产品状态**：会话与消息的事实源是数据库，JSONL 只是 Agent SDK 用来
+``resume`` 的本地缓存。丢一份的后果是这个会话续不上（``worker.session_resume_miss``
+→ 退回全新会话），rc22 浸泡里这条降级分支已被实测走过 14 次、零任务失败。
 """
 
 from __future__ import annotations
@@ -65,8 +96,9 @@ import logging
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +121,20 @@ _ARCHIVE_DIR_MODE = 0o700
 #: 不是产品承诺的保留期限——这里只做"不无限增长"的下界防护。
 _DEFAULT_ARCHIVE_RETENTION_COUNT = 10
 _DEFAULT_ARCHIVE_RETENTION_DAYS = 7.0
+
+#: 会话转录容量回收的默认字节预算（见 :func:`reclaim_session_transcripts`）。
+#: 128MiB 是按实测标定的：worker 容器 ``/tmp`` 是 256MB 内存盘，预算取一半，
+#: 回收后（低水位 75% → 96MiB）仍留出 160MiB 空闲，远高于健康检查的可用空间
+#: 阈值（``lingxi.apps.healthcheck`` 默认按总量 10% 判红 = 25.6MiB），因此"回收
+#: 刚好跑完"与"健康检查判红"之间有整整一个数量级的间隔，不会互相打架。
+DEFAULT_SESSION_DISK_BUDGET_BYTES = 128 * 1024 * 1024
+#: 触发回收后要压到预算的百分之多少。留出低水位而不是"删到刚好等于预算"，是为了
+#: 让回收按批次发生（实测负载下约每 5 分钟一次），而不是每一轮都在预算线上反复
+#: 删一两个文件。
+DEFAULT_SESSION_DISK_LOW_WATER_RATIO = 0.75
+#: 保护窗口：最近这么多秒内被写过的转录不参与删除，见模块文档「容量回收」。
+#: 300 秒覆盖实测重查询单条 113.8 秒的数倍，足以罩住任何一次在途回合。
+DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS = 300.0
 
 
 def default_session_root(env: Mapping[str, str] | None = None) -> Path | None:
@@ -243,3 +289,178 @@ def delete_agent_session_files(
         _prune_archive(archive_dir, retention_count=retention_count, retention_days=retention_days)
 
     return handled
+
+
+@dataclass(frozen=True)
+class ReclaimOutcome:
+    """一次容量回收的实际结果，供调用方记日志与测试断言。
+
+    ``bytes_after`` 仍然大于 ``budget_bytes`` 时 ``over_budget`` 为真：这一轮已经
+    把所有**可删**的都删了，剩下的全在保护窗口内。这是一个诚实的"删不动了"信号，
+    调用方据此告警，而不是缩短保护窗口去凑数（见模块文档「容量回收」）。
+    """
+
+    files_seen: int
+    bytes_before: int
+    files_deleted: int
+    bytes_freed: int
+    bytes_after: int
+    files_protected: int
+    budget_bytes: int
+
+    @property
+    def over_budget(self) -> bool:
+        return self.budget_bytes > 0 and self.bytes_after > self.budget_bytes
+
+
+_EMPTY_RECLAIM = ReclaimOutcome(
+    files_seen=0,
+    bytes_before=0,
+    files_deleted=0,
+    bytes_freed=0,
+    bytes_after=0,
+    files_protected=0,
+    budget_bytes=0,
+)
+
+
+def reclaim_session_transcripts(
+    session_root: Path,
+    *,
+    budget_bytes: int = DEFAULT_SESSION_DISK_BUDGET_BYTES,
+    low_water_ratio: float = DEFAULT_SESSION_DISK_LOW_WATER_RATIO,
+    min_age_seconds: float = DEFAULT_SESSION_RECLAIM_MIN_AGE_SECONDS,
+    now: Callable[[], float] = time.time,
+) -> ReclaimOutcome:
+    """把 ``session_root`` 下的会话转录总占用压回 ``budget_bytes`` 以内（Issue
+    #494），**删最旧的、跳过最近 ``min_age_seconds`` 内被写过的**。
+
+    这是与"按 id 定点清理"（:func:`delete_agent_session_files`）互相独立的常规
+    回收路径：定点清理只在 ``/new``、权限刷新等触发点排队时才发生，正常问数流程
+    一次都不排——没有这一条，转录就是单调增长直到把内存盘写满（模块文档「容量
+    回收」有实测数据）。
+
+    ``budget_bytes <= 0`` 表示**关闭回收**，直接返回一份空结果、不扫描目录：这是
+    留给运维的显式逃生口（例如为了保全一整段取证现场），不是默认值。根目录不存在
+    同样返回空结果——与定点清理一致，"没有目录"不是错误。
+
+    单个文件删除失败只记类型、不中断本轮（同批其余文件仍要被回收）；``stat`` 失败
+    的条目直接跳过，不猜它的大小，也不把它算进总量。
+    """
+
+    if budget_bytes <= 0:
+        return _EMPTY_RECLAIM
+    if not session_root.is_dir():
+        return _EMPTY_RECLAIM
+
+    entries: list[tuple[float, int, Path]] = []
+    total = 0
+    for match in session_root.rglob("*.jsonl"):
+        try:
+            info = match.stat()
+        except OSError:
+            # 竞态删除或不可读：不猜大小、不计入总量，也不当作失败——下一轮重扫。
+            continue
+        if not os.path.isfile(match):
+            continue
+        entries.append((info.st_mtime, info.st_size, match))
+        total += info.st_size
+
+    if total <= budget_bytes:
+        return ReclaimOutcome(
+            files_seen=len(entries),
+            bytes_before=total,
+            files_deleted=0,
+            bytes_freed=0,
+            bytes_after=total,
+            files_protected=0,
+            budget_bytes=budget_bytes,
+        )
+
+    # 低水位：一次回收到预算的 low_water_ratio，避免每一轮都贴着预算线反复删。
+    target = int(budget_bytes * low_water_ratio)
+    cutoff = now() - min_age_seconds
+    entries.sort(key=lambda item: item[0])  # 最旧的排在前面
+
+    remaining = total
+    freed = 0
+    deleted = 0
+    protected = 0
+    for mtime, size, path in entries:
+        if remaining <= target:
+            break
+        if mtime >= cutoff:
+            # 在途回合或用户刚聊过的会话：删了会让 resume 落空、用户丢上下文。
+            protected += 1
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            remaining -= size
+            freed += size
+            continue
+        except OSError as error:
+            # 不记完整路径：目录名里带 cwd 片段，只留错误类型足够排障。
+            logger.error("会话转录容量回收删除失败 error=%s", type(error).__name__)
+            continue
+        remaining -= size
+        freed += size
+        deleted += 1
+
+    return ReclaimOutcome(
+        files_seen=len(entries),
+        bytes_before=total,
+        files_deleted=deleted,
+        bytes_freed=freed,
+        bytes_after=remaining,
+        files_protected=protected,
+        budget_bytes=budget_bytes,
+    )
+
+
+def run_session_transcript_reclaim(
+    session_root: Path,
+    *,
+    budget_bytes: int,
+    low_water_ratio: float,
+    min_age_seconds: float,
+) -> ReclaimOutcome | None:
+    """跑一次容量回收并把结果记成结构化日志；失败返回 ``None`` 且不抛。
+
+    与 :func:`reclaim_session_transcripts` 分开，是为了让调用方（``WorkerService``
+    的每轮收口）只保留"要不要现在跑"这一件事：回收是收口顺带做的维护动作，
+    **任何失败都不能带走任务职责**——与心跳、告警 tick 同一姿态。
+    """
+
+    try:
+        outcome = reclaim_session_transcripts(
+            session_root,
+            budget_bytes=budget_bytes,
+            low_water_ratio=low_water_ratio,
+            min_age_seconds=min_age_seconds,
+        )
+    except Exception as error:  # noqa: BLE001 - 维护动作失败不能带走任务职责
+        logger.error("会话转录容量回收失败 error=%s", type(error).__name__)
+        return None
+    if outcome.files_deleted:
+        logger.warning(
+            "worker.session_transcripts_reclaimed files_deleted=%d bytes_freed=%d "
+            "bytes_before=%d bytes_after=%d budget_bytes=%d files_protected=%d",
+            outcome.files_deleted,
+            outcome.bytes_freed,
+            outcome.bytes_before,
+            outcome.bytes_after,
+            outcome.budget_bytes,
+            outcome.files_protected,
+        )
+    if outcome.over_budget:
+        # 删不动了：能删的都删了，剩下的全在保护窗口内。如实告警而不是缩短保护
+        # 窗口去凑数——真正的兜底是健康检查按可用空间判红（同一个 Issue）。
+        logger.error(
+            "worker.session_transcripts_over_budget bytes_after=%d budget_bytes=%d "
+            "files_protected=%d",
+            outcome.bytes_after,
+            outcome.budget_bytes,
+            outcome.files_protected,
+        )
+    return outcome

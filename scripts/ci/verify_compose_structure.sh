@@ -54,6 +54,24 @@ done
 export LINGXI_IMAGE_REGISTRY=ghcr.io/moshuiwang
 export LINGXI_IMAGE_TAG=20260806-000000000000
 
+# 生产主机规格待裁定的四项（Issue #494）在 deploy/compose.prod.yaml 里是
+# `${VAR:?...}` **无默认值**形态：真值由 deploy/.env.prod 提供，结构核对拿不到
+# 它，因此这里跟镜像仓库/tag 同一姿势给一组占位值，让渲染能跑完。
+#
+# **必须与 stage 侧渲染出同一个 tmpfs 值**：下面的结构摘要含 `tmpfs=` 一项，
+# stage 侧写的是 `${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}`，两边读的是同一个变量名，
+# 所以在这里 export 一次即可让两侧一致；给不同的值会让结构对照红，那是本脚本
+# 设计上要报的差异，不是本行的自由度。
+#
+# 新增任何 `${VAR:?}` 必须同步加进这里，否则本脚本会以"变量缺失"红——
+# `scripts/ci/check_deploy_contract.py::check_compose_interpolation_is_yaml_safe`
+# 把这条同步关系钉成会变红的断言（PR #506 CI 实测教训：漏了就只在最晚的
+# `Epic Full / image` 作业才炸）。
+export LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
+export LINGXI_WORKER_QUEUE_CPU_LIMIT=4.0
+export LINGXI_WORKER_QUEUE_MEM_LIMIT=16G
+export LINGXI_WORKER_QUEUE_PIDS_LIMIT=4096
+
 # 摘要脚本单独用带引号的 heredoc 装进变量：直接写 `python3 -c '...'` 时，
 # 内层的引号会与外层冲突（第一版就栽在这上面）。
 summary_program=$(

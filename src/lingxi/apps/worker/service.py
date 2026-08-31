@@ -27,7 +27,7 @@ from lingxi.apps.worker.report_extraction import (
     _unnamed_failure_code,
     failure_with_signature,
 )
-from lingxi.apps.worker.session_cleanup import delete_agent_session_files
+from lingxi.apps.worker.session_cleanup import delete_agent_session_files, run_session_transcript_reclaim
 from lingxi.apps.worker.turn import WorkerTurnExecutor
 from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.delivery.ports import DeliveryEventType, TerminalKind, assert_content_allowed
@@ -218,6 +218,8 @@ class WorkerService:
         # 不触碰清理队列——留着排队等下一个配置正确的进程来处理，而不是假装已清理。
         self._session_root = session_root
         self._session_cleanup_batch_limit = session_cleanup_batch_limit
+        # Issue #494：独立的容量回收路径按配置节流，None 表示首轮立即回收。
+        self._last_session_reclaim_at: float | None = None
         # 告警状态机的恢复计时与重试投递都需要被定期"戳一下"（Issue #153）；worker
         # 没有 scheduler 那种专门的定时职责循环，借用每轮收口顺便调用。
         self._on_alert_tick = on_alert_tick
@@ -436,7 +438,24 @@ class WorkerService:
             # 最小可观测性第二类：queued/running/awaiting-delivery 滞留三选一）。
             self._report_task_stuck("awaiting_delivery_stuck", len(expired))
         self._cleanup_agent_sessions()
+        self._reclaim_session_transcripts()
         return terminals
+
+    def _reclaim_session_transcripts(self) -> None:
+        """Run the independent, throttled Issue #494 capacity-reclaim path."""
+        if self._session_root is None or self._config.session_disk_budget_bytes <= 0:
+            return
+        now = self._monotonic()
+        last = self._last_session_reclaim_at
+        if last is not None and now - last < self._config.session_reclaim_interval_seconds:
+            return
+        self._last_session_reclaim_at = now
+        run_session_transcript_reclaim(
+            self._session_root,
+            budget_bytes=self._config.session_disk_budget_bytes,
+            low_water_ratio=self._config.session_disk_low_water_ratio,
+            min_age_seconds=self._config.session_reclaim_min_age_seconds,
+        )
 
     def _cleanup_agent_sessions(self) -> None:
         """认领并（先归档、再）物理清理一批到期的 Agent 会话 JSONL（Issue #153；
@@ -1312,28 +1331,10 @@ class WorkerService:
         已经被记录"，但此前 queue 链路从未把 ``report["audit"]["denied_count"]``
         （早就算出来了，见 ``report.py``）写进任何运维可见的地方——白名单配错
         导致的拒绝只能像 #291 真实事故那样，靠用户反馈才会被发现。
-
-        ``failure_signature``/非空 ``failure_code`` 是 Issue #495 补的一项：兜底
-        ``except`` 此前把任何未分类异常压成 ``session_failed`` 一个词、没有失败码
-        的失败终态干脆记 ``failure_code=null``（浸泡窗口 8 条失败 6 条无法归因全
-        卡在这里）。补的是**类型名与显式失败码**，不是异常正文。
-
-        ``tool_result_count`` 是 Issue #291 L6 取证结论补的一项（见
-        ``_tool_result_count`` 的完整说明）：2026-08-22 那次取证——模型把工具
-        调用协议写成正文散文、被净化层遮蔽后仍当成成功交付——运维定位"这一轮
-        到底有没有真的调用过工具"花了 40 分钟，因为这个字段此前同样从未离开
-        进程。
-
-        独立复核 P1：这条事件不能直接调用 stdlib ``logging``——``WorkerService``
-        不知道自己会被哪个进程入口装配，而真实队列 worker 的 ``apps/worker/
-        cli.py`` 刻意从不调用 ``logging.basicConfig()``（未配置 handler 时默认
-        阈值 ``WARNING`` 会把 ``logging.info(...)`` 悄悄吞掉，运维在真实容器
-        stderr 里永远看不到）。因此改为调用装配层注入的 ``on_terminal_outcome``
-        回调，由 ``cli.py`` 接到本文件既有的结构化 stderr 出口（``worker.task.
-        terminal``，带 ``trace_id``；``denied_count > 0`` 时该出口把这条事件
-        提到 ``warning`` 级别，见 ``cli.py`` 的 ``_terminal_outcome_sink``）。
-        没有装配方（``None``，例如白盒测试与旧调用方）时整体跳过，不假装写了
-        一条实际不存在的日志。
+        ``failure_signature``/``failure_code``（#495）与 ``tool_result_count``（#291）
+        仅提供类型化、低敏的终态取证线索，不记录异常正文或工具入参。
+        独立复核 P1：事件经装配层 ``on_terminal_outcome`` 接入结构化 stderr；没有
+        装配方（``None``）时跳过，不假装写出实际不存在的日志。
         """
 
         if self._on_terminal_outcome is None:

@@ -114,6 +114,13 @@ services:
   worker-queue:
     env_file:
       - ./.env.stage.worker-queue
+    # /tmp 内存盘上限（Issue #494）：stage 主机是 t3.medium（2 vCPU / 3.74GiB，
+    # 浸泡实测宿主可用内存 1.6~1.7GiB、swap 已用 261MiB），**这块盘写满就等量吃掉
+    # 宿主内存**，因此 stage 这一档钉死在 256m 不再往上加；真正解决无界增长的是
+    # 会话转录的常规回收路径（apps/worker/session_cleanup.py），不是把盘做大。
+    # 生产档是待定项：见 compose.prod.yaml 同位置。
+    tmpfs:
+      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}
     # 与一次性 worker job 同一量级（stage 主机预算所限，见 deploy/README.md）；
     # 生产档远高于此，两者不能互相照抄。
     deploy:
