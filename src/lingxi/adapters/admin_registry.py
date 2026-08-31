@@ -282,16 +282,17 @@ class PostgresAdminQueries:
         本命令承诺聚合展示全部历史事件——完整时间线仍然是 ``/admin audit``
         与 ``python -m lingxi.apps.trace`` 的职责。
 
-        「任务收口结果」（Issue #495）是第三次查询：``task`` JOIN
-        ``inbound_event``（``task.inbound_event_id`` = ``inbound_event.
-        feishu_event_id``，两者之间**没有外键**，理由见迁移 ``0057`` 文件头部）。
-        补的是一个此前结构性不可达的洞——worker 与 gateway 是两个独立部署的
-        进程，任务失败的分类码与底层异常类型名只进 worker 容器自己的 stderr
-        （``worker.task.terminal``），管理员在飞书私聊里永远看不到；迁移
-        ``0080`` 把它们落进 ``task`` 两列之后，这条 JOIN 就是管理员自助拿到
-        「这次问数为什么失败」的路径。同样取**最近一个**任务：一条入站事件
-        正常只派生一个任务，重试与心跳回收都复用同一行，取最近一个只是不崩溃
-        的兜底。
+        「任务收口结果」（Issue #495）与「文档投递结果」（Issue #499）共用第三次
+        查询：``task`` JOIN ``inbound_event``（``task.inbound_event_id`` =
+        ``inbound_event.feishu_event_id``，两者之间**没有外键**，理由见迁移
+        ``0057`` 文件头部），再 LEFT JOIN ``task_document_delivery_request``。
+        前者补的是任务失败分类码此前只进 worker stderr 的诊断洞；后者补的是
+        gateway 独立消费循环的结果此前无法从 ``/admin trace`` 看到的洞——问数
+        任务可能已经成功，但文档仍在排队、明确失败、结果不明，或正文已按
+        ``unsupported_nested_blocks`` 降级交付。迁移 ``0082`` 把降级原因作为
+        检查点落库之后，这条 JOIN 才能让管理员凭同一个 trace_id 查到「这次是
+        降级而不是静默成功」的事实。仍取**最近一个**任务/文档请求：一条入站事件
+        正常只派生一个任务，重试与心跳回收都复用同一行，取最近一个只是稳妥兜底。
 
         **已知取舍（如实登记）**：``inbound_event.trace_id`` 与
         ``task.inbound_event_id`` 都没有索引，这条 JOIN 在大表上是顺序扫描。
@@ -341,12 +342,25 @@ class PostgresAdminQueries:
             task_failure_code=task[2] if task is not None else None,
             task_failure_signature=task[3] if task is not None else None,
             task_ended_at=_isoformat(task[4]) if task is not None and task[4] is not None else None,
+            document_delivery_status=task[5] if task is not None else None,
+            document_delivery_last_error=task[6] if task is not None else None,
+            document_body_degraded_reason=task[7] if task is not None else None,
         )
 
     def _trace_task(
         self, *, trace_id: str
-    ) -> tuple[str, str | None, str | None, str | None, object] | None:
-        """按追溯号取这条入站事件派生的**最近一个**任务的收口结果（Issue #495）。
+    ) -> tuple[
+        str,
+        str | None,
+        str | None,
+        str | None,
+        object,
+        str | None,
+        str | None,
+        str | None,
+    ] | None:
+        """按追溯号取这条入站事件派生的**最近一个**任务与文档投递收口结果（Issue
+        #495/#499）。
 
         查不到返回 ``None``——这条追溯号没有派生任何任务是完全正常的情形
         （管理命令、未开通用户、重复投递事件都不入队），不是错误，调用方据此
@@ -357,12 +371,16 @@ class PostgresAdminQueries:
             cursor.execute(
                 """
                 SELECT task.status, task.error_kind, task.failure_code,
-                       task.failure_signature, task.ended_at
+                       task.failure_signature, task.ended_at,
+                       delivery.status, delivery.last_error,
+                       delivery.body_degraded_reason
                   FROM task
                   JOIN inbound_event
                     ON inbound_event.feishu_event_id = task.inbound_event_id
+                  LEFT JOIN task_document_delivery_request AS delivery
+                    ON delivery.task_id = task.id
                  WHERE inbound_event.trace_id = %s
-                 ORDER BY task.created_at DESC
+                 ORDER BY task.created_at DESC, delivery.created_at DESC NULLS LAST
                  LIMIT 1
                 """,
                 (trace_id,),
@@ -370,7 +388,16 @@ class PostgresAdminQueries:
             row = cursor.fetchone()
         if row is None:
             return None
-        return (row[0], row[1], row[2], row[3], row[4])
+        return (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+        )
 
     def resolve_identifier(self, *, identifier: str) -> str:
         """把邮箱形态的标识反查成 open_id（#439 A 档）；见 ``core/admin/router.

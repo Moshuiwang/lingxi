@@ -1215,6 +1215,26 @@ _TASK_FAILURE_LABEL: dict[str, str] = {
     "worker_version_unavailable": "目标执行版本不可用",
 }
 
+# ``task_document_delivery_request.status`` 枚举 → 中文（Issue #499）：文档消费在
+# gateway 独立进程完成，任务本身成功不等于文档已经成功交付；``/admin trace`` 必须
+# 把这条独立状态显示出来，而不是让管理员只看到一个成功的 task。
+_DOCUMENT_DELIVERY_STATUS_LABEL: dict[str, str] = {
+    "pending": "排队中",
+    "processing": "处理中",
+    "succeeded": "成功",
+    "uncertain": "结果不明（需人工核实）",
+    "failed": "失败",
+}
+
+# 文档投递原因码 → 中文。未知取值仍由 ``_display_or_unregistered`` 保留原码并标记，
+# 与任务失败码采用同一条白名单展示纪律；原因码本身不含用户正文或外部标识。
+_DOCUMENT_DELIVERY_REASON_LABEL: dict[str, str] = {
+    "attempts_exhausted": "重试次数耗尽",
+    "pending_expired_unconsumed": "排队超时未被消费",
+    "permission_not_confirmed": "授权结果未能读回确认",
+    "unsupported_nested_blocks": "正文含暂不支持的嵌套结构",
+}
+
 
 def _display_or_unregistered(value: str, table: dict[str, str]) -> str:
     """未登记的机器码既不原样吞掉、也不假装认识——统一回退成"原值（未登记
@@ -1350,6 +1370,31 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
             # 没有可枚举的取值域，翻译只能靠猜；管理员把它原样贴给研发就是最
             # 有用的一手信息。
             lines.append(f"底层异常类型: {trace.task_failure_signature}")
+    if trace.document_delivery_status is not None:
+        # 文档投递是 task 收口之后由 gateway 独立消费循环完成的另一条状态机。
+        # 因此不能把 task.status == succeeded 当作文档已成功；尤其 #499 的降级
+        # 事实只存在检查点列里，必须在同一条 trace 回显中明确区分。
+        lines.append(
+            "文档交付结果: "
+            + _display_or_unregistered(
+                trace.document_delivery_status, _DOCUMENT_DELIVERY_STATUS_LABEL
+            )
+        )
+        if trace.document_delivery_last_error is not None:
+            lines.append(
+                "文档交付原因: "
+                + _display_or_unregistered(
+                    trace.document_delivery_last_error, _DOCUMENT_DELIVERY_REASON_LABEL
+                )
+            )
+        if trace.document_body_degraded_reason is not None:
+            lines.append(
+                "文档正文处理: 已降级（"
+                + _display_or_unregistered(
+                    trace.document_body_degraded_reason, _DOCUMENT_DELIVERY_REASON_LABEL
+                )
+                + "，已回退纯文本段落路径）"
+            )
     return "\n".join(lines)
 
 

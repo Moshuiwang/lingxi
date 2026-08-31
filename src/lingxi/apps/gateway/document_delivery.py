@@ -91,7 +91,7 @@ definite/结果不明分类，不单独处理。
 **必须**做三件事，缺一件这条裁定就退化成当初被明令禁止的静默降级：
 
 1. 把原因码落进 ``task_document_delivery_request.body_degraded_reason``（迁移
-   0080，:meth:`PostgresDocumentDeliveryStore.mark_body_degraded` 单独提交）
+   0082，:meth:`PostgresDocumentDeliveryStore.mark_body_degraded` 单独提交）
    ——补发通知路径与检查点恢复路径都是另一次进程调用，读不到这次调用的内存
    信号；
 2. 成功通知改用 ``delivery.document_ready_degraded``（如实说明格式已简化及

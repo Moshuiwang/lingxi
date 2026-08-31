@@ -106,7 +106,8 @@ class AdminEventView:
 class AdminTraceView:
     """``/admin trace <追溯号>`` 查询结果（Issue #337）：入站事件时间线摘要 +
     该追溯号定位到的用户当前开通状态 + 失败原因（``onboarding_failure`` 表，
-    迁移 ``0077``）+ 这条追溯号对应任务的收口结果（``task`` 表，Issue #495）。
+    迁移 ``0077``）+ 这条追溯号对应任务的收口结果（``task`` 表，Issue #495）+
+    文档投递结果（``task_document_delivery_request`` 表，Issue #499）。
 
     非 ``None``（即 ``inbound_event`` 里至少有一条这个 ``trace_id``）时才由
     ``adapters/admin_registry.PostgresAdminQueries.trace_lookup`` 构造；查无
@@ -144,3 +145,10 @@ class AdminTraceView:
     task_failure_code: str | None = None
     task_failure_signature: str | None = None
     task_ended_at: str | None = None
+    # 文档投递结果（Issue #499）：任务成功收口不代表文档也成功——文档消费在
+    # gateway 独立进程执行，可能仍在排队、已降级成功、明确失败或结果不明。
+    # 这三列只带状态/分类码，不带标题、正文、文档 ID 或链接；管理员凭同一个
+    # trace_id 必须能分辨「问数任务成功但文档交付失败」与「正文已降级交付」。
+    document_delivery_status: str | None = None
+    document_delivery_last_error: str | None = None
+    document_body_degraded_reason: str | None = None
