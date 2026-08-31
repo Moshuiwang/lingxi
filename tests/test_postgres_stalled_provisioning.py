@@ -113,6 +113,7 @@ class StalledProvisioningPostgresTestCase(unittest.TestCase):
         """
 
         decision = self.publish_store.record_decision(
+            require_enabled_account=True,
             user_id=user_id, row=row or _row(), reason=reason, decided_at=datetime.now(timezone.utc)
         )
         claimed = self.publish_store.claim_next()

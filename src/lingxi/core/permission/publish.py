@@ -175,6 +175,49 @@ class PermissionDecisionTransientFailure(RuntimeError):
         self.classification = classification
 
 
+#: ``app_user.account_state`` 里**唯一**允许被排出非空授权的取值（Issue #483）。
+#:
+#: 判据刻意写成**正向白名单常量**、单一来源，不是拒绝列表：数据库 CHECK 今天只有
+#: ``enabled``/``suspended``/``deleting``/``deleted`` 四个取值，两种写法逐行等价；
+#: 但将来有人往 CHECK 里加第五个状态时，拒绝列表会**静默放行**它，白名单会默认
+#: 拒绝——那正是本 Issue 根因的同一类错误（codex 第 2 轮 P2 的"演进防御"处置）。
+ACCOUNT_STATE_ENABLED = "enabled"
+
+
+class PermissionGrantBlockedByAccountState(RuntimeError):
+    """一次**需要账号有效**的权限决定，在落决定的那把行锁里发现账号已不是
+    ``enabled``：事务整体回滚，``app_user.permission_version`` 与 ``publish_outbox``
+    一个字节都没变（Issue #483）。
+
+    **它不是故障，是正确结果。** 管理员的「停用」承诺在这里被兑现：任何一条会把
+    非空授权排给一个已停用（或删除中/已删除）账号的路径，都必须在这里停下。三个
+    调用方各自把它翻译成自己的用户可见收口，**不得静默吞掉**：
+
+    - 每日批授权（``apps/scheduler/permission_refresh.py``）：计一条专属原因码
+      ``account_not_enabled`` 并响亮审计，``report.failed`` **不加一**——被挡是正确
+      结果，不是故障；
+    - 定向重算发布（``core/permission/targeted_recompute.py``）：走可分辨的跳过码
+      ``account_not_enabled``；
+    - 首次开通（``core/identity/onboarding_runner.py``）：复用既有的停用终态
+      （``KEY_SUSPENDED`` + ``onboarding.halted_account_state`` 审计），用户看到的
+      仍是「你的 BI Plus 账号当前已停用」，不是内部故障。
+
+    **为什么是"抛出"而不是"返回一个结果"**：抛出让事务整体回滚，天然保证"零写入"
+    （不留半套状态），也让任何一个忘记处理它的新调用方**响亮失败**，而不是拿到一个
+    看起来正常的返回值继续往下走。
+
+    定义在这个纯类型模块而不是 ``adapters/postgres_permission_publish.py``，理由与
+    :class:`PermissionDecisionTransientFailure` 完全相同：调用方要在不引入 psycopg
+    依赖链的情况下拿到这个类型去写 ``except``。
+
+    ``account_state`` 只是那四个固定字面量之一，**不是人员资料**，可以进审计与日志。
+    """
+
+    def __init__(self, account_state: str) -> None:
+        super().__init__(f"账号状态不允许排出非空授权，事务已整体回滚：{account_state}")
+        self.account_state = account_state
+
+
 class ExistingPermissionRow(NamedTuple):
     """发布表里已经存在的一行：外部记录标识 + 原始字段。
 
@@ -718,9 +761,11 @@ class PermissionPublishExecutor:
 
 
 __all__ = [
+    "ACCOUNT_STATE_ENABLED",
     "DEFAULT_MAX_ATTEMPTS",
     "ClaimedPublish",
     "ExistingPermissionRow",
+    "PermissionGrantBlockedByAccountState",
     "PermissionPublishExecutor",
     "PermissionPublishStore",
     "PermissionTableError",

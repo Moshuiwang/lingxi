@@ -1090,6 +1090,64 @@ _FAILURE_REASON_LABEL: dict[str, str] = {
 }
 
 
+#: ``task.status`` 枚举 → 中文（Issue #495）：与迁移 ``0059`` 把 ``task`` 的
+#: status CHECK 扩成六个取值一一对应。与本文件其余词表同一姿态——白名单式展示层
+#: 翻译，未登记走 :func:`_display_or_unregistered` 回退。
+_TASK_STATUS_LABEL: dict[str, str] = {
+    "queued": "排队中",
+    "running": "执行中",
+    "awaiting_delivery": "已收口，等待答复送达",
+    "succeeded": "成功",
+    "failed": "失败",
+    "stopped": "已停止",
+}
+
+#: 任务失败机器码 → 中文（Issue #495）。**同时覆盖两列**：``task.failure_code``
+#: （迁移 ``0080`` 新增，worker 给出的**细分**失败码）与 ``task.error_kind``
+#: （被 ``apps/worker/service.py::_failure_content`` 压平成用户文案分类之后的粗
+#: 粒度值）。两列是不同的取值域：``drain_timeout``/``sdk_unavailable``/
+#: ``cancelled``/``gate_bypassed`` 在 ``error_kind`` 那一列全部塌进同一个
+#: ``session_failed``，正是本 Issue 要消灭的那种"什么都看不出来"；反过来
+#: ``error_kind`` 也有 ``failure_code`` 覆盖不到的取值——**没有经过
+#: ``write_terminal_event`` 的失败终态**（心跳超时回收 ``retry_exhausted``/
+#: ``side_effect_uncertain``、投递到期 ``delivery_expired``、排队超时
+#: ``queued_timeout`` 等，写入方是 ``adapters/postgres_conversation/
+#: _queue_lifecycle.py``）在新列上恒为 ``NULL``，只有 ``error_kind`` 说得出原因。
+#: 因此回显按「有 ``failure_code`` 用它，否则退回 ``error_kind``」取值，一张表
+#: 服务两列，不维护两份会各自漂移的词表。
+#:
+#: ``core/daily_report.py`` 另有一份只翻译 ``task.error_kind`` 的词表，服务的是
+#: 「失败分类 Top」榜单——两处对**共有**的词刻意逐字保持同一措辞，改动其一时请
+#: 同步另一处。**唯一一处有意分岔**：``session_failed`` 在那边是「会话执行失败」，
+#: 这边加了「（未分类，见底层异常）」——榜单是聚合计数、下面没有别的行可看，而
+#: 这里紧接着就是「底层异常类型」那一行，把读者指过去正是本 Issue 的要点。
+_TASK_FAILURE_LABEL: dict[str, str] = {
+    "cancelled": "执行被取消",
+    "config_error": "worker 配置错误",
+    "context_too_long": "上下文过长",
+    "delivery_expired": "投递已过期",
+    "drain_timeout": "收尾超时",
+    "gate_bypassed": "工具调用绕过了判定屏障（屏障失效）",
+    "interrupted": "用户主动停止",
+    "max_turns_exceeded": "对话轮数超限",
+    "model_protocol_breakdown": "模型输出协议异常",
+    "queued_timeout": "排队超时未领取",
+    "redacted_withheld": "内容因安全策略被拦截",
+    "result_too_large": "查询结果过大",
+    "retry_exhausted": "重试次数耗尽",
+    "running_timeout": "执行超时",
+    "sdk_unavailable": "Agent SDK 不可用",
+    "session_failed": "会话执行失败（未分类，见底层异常）",
+    "side_effect_uncertain": "执行结果不确定（需人工核实是否已生效）",
+    "stopped": "用户主动停止",
+    "turn_not_closed": "回合未收口，且没有留下失败码",
+    "turn_timeout": "单轮对话超时",
+    "unnamed_failure": "失败记录缺失分类码",
+    "user_mcp_config_unavailable": "用户问数配置不可用",
+    "worker_version_unavailable": "目标执行版本不可用",
+}
+
+
 def _display_or_unregistered(value: str, table: dict[str, str]) -> str:
     """未登记的机器码既不原样吞掉、也不假装认识——统一回退成"原值（未登记
     显示名）"这个样式（Trace #469 修复包 B，B-6，产品负责人裁定的兜底样式）：
@@ -1198,7 +1256,32 @@ def _render_trace(trace_id: str, trace: AdminTraceView | None) -> str:
             f"（{trace.failure_event_type}，{trace.failure_occurred_at}）"
         )
     else:
-        lines.append("无失败记录")
+        lines.append("无开通失败记录")
+    if trace.task_status is not None:
+        # 任务收口结果（Issue #495）：这条追溯号派生的任务失败时，管理员此前
+        # 唯一能拿到的是「无失败记录」——开通没失败，问数任务失败了，而任务
+        # 那一侧的分类码与底层异常类型名只进 worker 容器 stderr，管理员看不到。
+        # 迁移 0080 落库之后这里才有东西可显示；没有派生任务时整段省略，不摆
+        # 一排空值。
+        suffix = f"（{trace.task_ended_at}）" if trace.task_ended_at is not None else ""
+        lines.append(
+            f"任务结果: {_display_or_unregistered(trace.task_status, _TASK_STATUS_LABEL)}{suffix}"
+        )
+        # 有细分失败码用它，否则退回 `error_kind`：没有经过 `write_terminal_
+        # event` 的失败终态（心跳超时回收、投递到期、排队超时）在新列上恒为
+        # NULL，只有 `error_kind` 说得出原因，不能因此整行消失。
+        task_failure = trace.task_failure_code or trace.task_error_kind
+        if task_failure is not None:
+            lines.append(
+                f"任务失败原因: {_display_or_unregistered(task_failure, _TASK_FAILURE_LABEL)}"
+            )
+        if trace.task_failure_signature is not None:
+            # 底层异常**类型名**，不是异常正文（`V-花名册-33`：审计与日志不含
+            # 外部标识原值；psycopg 的异常串常见形状 `DETAIL: Key
+            # (feishu_open_id)=(ou_...)`）。这里不翻译——它是第三方库的类名，
+            # 没有可枚举的取值域，翻译只能靠猜；管理员把它原样贴给研发就是最
+            # 有用的一手信息。
+            lines.append(f"底层异常类型: {trace.task_failure_signature}")
     return "\n".join(lines)
 
 

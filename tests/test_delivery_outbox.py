@@ -307,6 +307,57 @@ class TerminalEventTests(DeliveryOutboxTestCase):
         self.assertIsNone(row[1])
         self.assertTrue(row[2])
 
+    def test_write_terminal_event_persists_the_failure_code_and_signature(self) -> None:
+        """失败签名落库（迁移 ``0080``，Issue #495）：终态写入同事务落
+        ``task.failure_code``/``task.failure_signature``——真实往返，不是应用层
+        假装写入。
+
+        为什么必须落库而不是只补日志：worker 与 gateway 是两个独立部署的进程、
+        不共享文件系统，只进 worker stderr 的线索管理员用 ``/admin trace``
+        永远看不到（与迁移 ``0070`` 同一个结构性缺口）。
+
+        ``error_kind`` 与 ``failure_code`` **是两列**，也必须能分开：前者是被
+        压平成用户文案分类之后的粗粒度值（``drain_timeout`` 在那一列上就是
+        ``session_failed``），后者才是这次失败的细分码。
+
+        **变异验红**（已实测，真库）：把 ``UPDATE task`` 里的
+        ``failure_code = %s``/``failure_signature = %s`` 改成写死 ``NULL``，
+        本用例由绿转红；还原后复绿。
+        """
+
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="failed",
+            error_kind="session_failed", content="失败提示",
+            failure_code="drain_timeout",
+            failure_signature="psycopg.errors.OperationalError",
+        )
+
+        row = self.query(
+            "SELECT error_kind, failure_code, failure_signature FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertEqual(row[0], "session_failed")
+        self.assertEqual(row[1], "drain_timeout")
+        self.assertEqual(row[2], "psycopg.errors.OperationalError")
+
+    def test_write_terminal_event_leaves_both_failure_columns_null_when_absent(self) -> None:
+        """取不到时必须是真正的 SQL NULL，不是空串——``NULL`` 在这两列上是精确
+        语义（成功回合没有失败码；``turn_timeout`` 这类失败没有异常对象可签），
+        空串会让"没有"和"有一个空的"分不开（迁移 ``0080`` 文件头部）。"""
+
+        self.queue.write_terminal_event(
+            task_id="tsk-1", worker_id="worker-1", terminal_kind="success",
+            error_kind=None, content="答案",
+        )
+
+        row = self.query(
+            "SELECT failure_code, failure_signature,"
+            " (failure_code IS NULL) AND (failure_signature IS NULL) AS both_sql_null"
+            " FROM task WHERE id='tsk-1'"
+        )[0]
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+        self.assertTrue(row[2])
+
     def test_second_terminal_write_is_rejected_not_a_second_valid_terminal(self) -> None:
         first = self.queue.write_terminal_event(
             task_id="tsk-1", worker_id="worker-1", terminal_kind="success",

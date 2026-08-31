@@ -101,7 +101,7 @@ class AdminEventView:
 class AdminTraceView:
     """``/admin trace <追溯号>`` 查询结果（Issue #337）：入站事件时间线摘要 +
     该追溯号定位到的用户当前开通状态 + 失败原因（``onboarding_failure`` 表，
-    迁移 ``0077``）。
+    迁移 ``0077``）+ 这条追溯号对应任务的收口结果（``task`` 表，Issue #495）。
 
     非 ``None``（即 ``inbound_event`` 里至少有一条这个 ``trace_id``）时才由
     ``adapters/admin_registry.PostgresAdminQueries.trace_lookup`` 构造；查无
@@ -125,3 +125,17 @@ class AdminTraceView:
     failure_reason: str | None
     failure_event_type: str | None
     failure_occurred_at: str | None
+    # 任务收口结果（Issue #495）：这条追溯号的入站事件所派生的**最近一个**任务
+    # （``task.inbound_event_id`` = ``inbound_event.feishu_event_id``）。全部可空
+    # 且 ``None`` 是精确语义——这条追溯号可能压根没有派生任务（管理命令、未开通
+    # 用户、重复投递），也可能任务还在排队。``task_failure_code``/
+    # ``task_failure_signature`` 由迁移 ``0080`` 落库，成功回合与不来自异常的
+    # 失败在这两列上本来就是 ``NULL``。
+    #
+    # 脱敏姿态与本视图其余字段一致：只带状态、分类码与异常**类型名**，不带
+    # 提问正文、不带模型输出、不带异常正文（`V-花名册-33`）。
+    task_status: str | None = None
+    task_error_kind: str | None = None
+    task_failure_code: str | None = None
+    task_failure_signature: str | None = None
+    task_ended_at: str | None = None

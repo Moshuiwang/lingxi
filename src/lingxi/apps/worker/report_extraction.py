@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Mapping
 
 _MAX_LOG_TOKEN_CHARS = 64
@@ -358,3 +359,136 @@ def _protocol_breakdown_reasons(output_safety: Mapping[str, Any] | None) -> tupl
     return tuple(
         str(reason) for reason in raw_reasons if str(reason) in _PROTOCOL_BREAKDOWN_REASON_CODES
     )
+
+
+# ---------------------------------------------------------------------------
+# 失败签名与「没人起名字」的失败码（Issue #495）
+# ---------------------------------------------------------------------------
+#
+# 2026-08-31 浸泡窗口取证：8 条任务失败里 6 条**无法归因**——结构化日志只留下
+# ``worker.task.terminal error_kind=session_failed failure_code=null``，底层异常
+# 的类型、文本、堆栈一条都没有离开进程。用户侧是对的（#465 响应覆盖成立），
+# 运维侧是全黑的。能归因的另外 2 条恰恰是因为走了另一条**会落日志**的分支
+# （``worker.mcp_server_unavailable`` 记下了 502），正反对照就在同一批样本里。
+#
+# 这里补的是那条线索，**不是**把异常正文放出来：``V-花名册-33`` 禁止把 ``ou_``
+# 等外部标识原值写进日志，而 psycopg 等驱动的异常串常见形状正是
+# ``DETAIL: Key (feishu_open_id)=(ou_...)``。rc22 opus 审查 P2-5 已经为
+# ``event.pipeline_failed`` 做过同一次收敛（``core/conversation/pipeline.py``：
+# 只记 ``type(error).__name__``），本模块照抄那条既有做法，不另造一套。
+
+#: 失败签名允许出现的字符白名单之外的一切（ASCII 字母数字、下划线、点）。
+#: 用**白名单**而不是黑名单：异常类型名与模块名是源码里写死的标识符，形状已知；
+#: 任何超出这个集合的字符都说明这不是一个正常的类型标识（例如某个 SDK 用异常
+#: 正文动态造类），一律剔除，宁可签名难看也不让未知内容搭车进日志。
+_FAILURE_SIGNATURE_DISALLOWED = re.compile(r"[^A-Za-z0-9_.]")
+
+#: 签名长度上界。与 ``_cap_log_token`` 的 64 同量级——真实类型限定名
+#: （``psycopg.errors.UniqueViolation`` 30 字符）远在其内，超长只可能来自异常。
+_MAX_FAILURE_SIGNATURE_CHARS = 64
+
+#: 连类型名都取不到时的显式占位（例如某个对象的 ``__name__`` 被清成空串）。
+#: **不是 ``None``**：这一列的存在意义就是"任何终态都留得下一个可查的记号"。
+UNKNOWN_FAILURE_SIGNATURE = "unknown"
+
+#: 「这次失败没有人给它起名字」时按报告里已有事实推出的三个显式码（Issue #495
+#: 完成标准 3：``failure_code`` 在失败终态下不再为 ``null``）。三个都落进
+#: ``apps/worker/service.py::_failure_content`` 的默认分支——用户可见文案因此
+#: **逐字不变**（``worker.failed``），新增的区分度只留在审计/日志侧。
+#:
+#: - ``gate_bypassed``：有工具调用绕过了 ``PreToolUse`` 判定（屏障失效）；
+#: - ``unnamed_failure``：报告带了 ``failure`` 但里面没有 ``code``；
+#: - ``turn_not_closed``：回合就是没收口，没有更具体的事实可说。
+#:   取值与 ``apps/worker/report.py`` 里 ``termination_reason`` 对同一情形使用
+#:   的字符串一致，不另造第二套词。
+GATE_BYPASSED_FAILURE_CODE = "gate_bypassed"
+UNNAMED_FAILURE_CODE = "unnamed_failure"
+TURN_NOT_CLOSED_FAILURE_CODE = "turn_not_closed"
+
+
+def exception_failure_signature(error: BaseException) -> str:
+    """把一个异常收敛成**可以进日志**的失败签名：只取类型的限定名。
+
+    取 ``模块.限定名``（``builtins`` 前缀去掉）而不是裸 ``__name__``：真实故障里
+    最需要区分的恰恰是同名类型——``psycopg.errors.OperationalError`` 与
+    ``httpx.ConnectError`` 与 SDK 自己的 ``ProcessError`` 在裸类名下也许还能分开，
+    但 ``TimeoutError``/``ConnectionError`` 这类名字被多个库各自定义，只有带上
+    模块才回答得了"是数据库超时还是外部 HTTP 超时"。模块名与类名都是源码标识符，
+    不是运行时数据，因此这一步不引入新的泄漏面。
+
+    **异常正文（``str(error)``）在任何情况下都不参与**——那是 P2-5 收敛掉的那半，
+    见本节顶部说明。
+    """
+
+    error_type = type(error)
+    module = _FAILURE_SIGNATURE_DISALLOWED.sub("", getattr(error_type, "__module__", "") or "")
+    raw_name = getattr(error_type, "__qualname__", "") or getattr(error_type, "__name__", "") or ""
+    name = _FAILURE_SIGNATURE_DISALLOWED.sub("", raw_name)
+    qualified = name if module in ("", "builtins") else f"{module}.{name}"
+    if len(qualified) <= _MAX_FAILURE_SIGNATURE_CHARS:
+        return qualified or UNKNOWN_FAILURE_SIGNATURE
+    # 超过上界时**先丢模块路径、后动类名**：判别力全在类名那一半，从右边截断
+    # 会先啃掉类名（``a.very.long.module.path.Timeout`` 截成 ``a.very.long.mod``
+    # 这种毫无用处的形状）。类名自己就超限时保留右端——嵌套类的最内层名字最具体。
+    if len(name) <= _MAX_FAILURE_SIGNATURE_CHARS:
+        return name or UNKNOWN_FAILURE_SIGNATURE
+    return name[-_MAX_FAILURE_SIGNATURE_CHARS:]
+
+
+def failure_with_signature(code: str, message: str, error: BaseException) -> dict[str, str]:
+    """构造一份带失败签名的 ``failure`` 映射（Issue #495）。
+
+    三个调用点（``turn.py`` 的兜底 ``except``、``service.py`` 的
+    ``UserMcpConfigError`` 与执行器兜底 ``except``）共用同一个构造口，是为了让
+    "任何从异常来的失败都必须带签名"成为一件**改不漏**的事：新增一条异常收口
+    分支时照抄这一行即可，不必记得再补一个字段。``message`` 由调用方按各自的
+    脱敏纪律准备好后传入，本函数不再加工它。
+    """
+
+    return {"code": code, "message": message, "signature": exception_failure_signature(error)}
+
+
+def sanitize_failure_signature(value: str) -> str:
+    """按白名单洗掉签名里的一切非标识符字符并截到上界；洗空则回退占位符。
+
+    :func:`exception_failure_signature` 自己做更聪明的截断（见其说明），这里是
+    **给来路不明的值兜底**的那一版：报告是跨进程 JSON，``failure.signature``
+    完全可能来自一个未来版本、一个测试替身、或一次形状不对的构造，读回时不能
+    假设它已经符合约束。
+    """
+
+    cleaned = _FAILURE_SIGNATURE_DISALLOWED.sub("", value)[:_MAX_FAILURE_SIGNATURE_CHARS]
+    return cleaned or UNKNOWN_FAILURE_SIGNATURE
+
+
+def _report_failure_signature(report: Mapping[str, Any]) -> str | None:
+    """从一次回合报告里取出失败签名；没有（例如失败根本不来自异常）返回 ``None``。
+
+    ``None`` 是精确语义、不是"以后补"：``turn_timeout``/``drain_timeout``/
+    ``cancelled`` 这些失败码本身已经把原因说全了，没有底层异常可签名，编一个
+    占位符只会让"有签名"这件事失去信息量。
+    """
+
+    failure = report.get("failure") if isinstance(report, Mapping) else None
+    if not isinstance(failure, Mapping):
+        return None
+    signature = failure.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return None
+    return sanitize_failure_signature(signature)
+
+
+def _unnamed_failure_code(report: Mapping[str, Any]) -> str:
+    """失败终态但 ``failure`` 没给出 ``code`` 时，按报告里已有的事实推一个显式码。
+
+    **不推断成 ``stopped``、也不推断成任何用户可见语义**：这里只回答"这次失败
+    在报告里长什么样"，三个取值各自对应一个可核对的事实（见上方常量说明）。
+    """
+
+    failure = report.get("failure") if isinstance(report, Mapping) else None
+    if isinstance(failure, Mapping) and failure:
+        return UNNAMED_FAILURE_CODE
+    turn = report.get("turn") if isinstance(report, Mapping) else None
+    if isinstance(turn, Mapping) and turn.get("gate_bypassed"):
+        return GATE_BYPASSED_FAILURE_CODE
+    return TURN_NOT_CLOSED_FAILURE_CODE

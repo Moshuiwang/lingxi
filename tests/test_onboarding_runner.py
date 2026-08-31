@@ -62,6 +62,7 @@ from lingxi.core.permission.merge_sources import (
     REASON_SUPPRESS_INAPPLICABLE_WILDCARD,
 )
 from lingxi.core.permission.metric_translation import translate_company_functions
+from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import ADMIN_FULL_ACCESS_FUNCTION
 
 UTC = timezone.utc
@@ -309,14 +310,38 @@ class FakeIntent:
 
 
 class FakeDecisions:
-    def __init__(self, *, enqueued: bool = True, statuses: Sequence[str] = ("published",)) -> None:
+    def __init__(
+        self,
+        *,
+        enqueued: bool = True,
+        statuses: Sequence[str] = ("published",),
+        blocked_account_state: str | None = None,
+    ) -> None:
         self._enqueued = enqueued
         self._statuses = list(statuses)
         self.rows: list[Any] = []
         self.reasons: list[str] = []
+        self.require_enabled_account: list[bool] = []
         self.loads = 0
+        # Issue #483：非空时照真实实现抛 ``PermissionGrantBlockedByAccountState``，
+        # 用来钉死"开通链被账号状态挡住时收敛到既有停用终态"这条收口。
+        self._blocked_account_state = blocked_account_state
 
-    def record_decision(self, *, user_id: str, row: Any, reason: str, decided_at: datetime) -> Any:
+    def record_decision(
+        self,
+        *,
+        user_id: str,
+        row: Any,
+        reason: str,
+        require_enabled_account: bool,
+        decided_at: datetime,
+    ) -> Any:
+        # 开通链落的恒是需要账号有效的授权（Issue #483）：这条断言让调用点一旦
+        # 传成 False（或忘了传）就当场红，而不是在真库用例里才暴露。
+        assert require_enabled_account is True, "首次开通必须声明需要账号有效"
+        self.require_enabled_account.append(require_enabled_account)
+        if self._blocked_account_state is not None:
+            raise PermissionGrantBlockedByAccountState(self._blocked_account_state)
         self.rows.append(row)
         self.reasons.append(reason)
         return FakeDecision(enqueued=self._enqueued, permission_version=7, outbox_id="pub_1")
@@ -1626,6 +1651,37 @@ class RecheckBeforeContinuingTests(unittest.TestCase):
         self.assertEqual(parts["decisions"].rows, [])
         self.assertEqual(users.advanced, [])
         self.assertIn("onboarding.halted_account_state", parts["audit"].actions())
+
+    def test_a_suspension_landing_inside_the_publish_transaction_reuses_the_same_terminal(
+        self,
+    ) -> None:
+        """Issue #483：从建档后那次复核到落权限决定之间，管理员恰好完成停用。
+
+        这个窗口是真实形状——中间隔着令牌签发与用户环境创建。落决定那把行锁里的复检
+        会挡住这次发布，本用例钉的是**开通链的收口不得退化成通用内部故障**：用户看到
+        的仍然是既有的「账号已停用」终态，审计动作与另外两处复核逐字相同。
+        """
+
+        parts, _ = run_once(decisions=FakeDecisions(blocked_account_state="suspended"))
+
+        self.assertEqual(parts["notifier"].terminal()[1], KEY_SUSPENDED)
+        self.assertIn("onboarding.halted_account_state", parts["audit"].actions())
+        self.assertEqual(
+            parts["audit"].facts("onboarding.halted_account_state")["account_state"], "suspended"
+        )
+        # 被挡之后不得继续推进状态机：不写 mcp_syncing、更不写 active。
+        self.assertNotIn(STATE_MCP_SYNCING, parts["users"].advanced)
+        self.assertNotIn(STATE_ACTIVE, parts["users"].advanced)
+
+    def test_a_normal_onboarding_still_declares_that_it_needs_an_enabled_account(self) -> None:
+        """正向断言：开通链恒声明 ``require_enabled_account=True``。
+
+        假 store 里那条 ``assert require_enabled_account is True`` 只在被调用时才生效，
+        这条用例保证它真的被调用过一次——否则"声明对不对"根本没有被测。
+        """
+
+        parts, _ = run_once()
+        self.assertEqual(parts["decisions"].require_enabled_account, [True])
 
     def test_an_already_active_user_is_not_provisioned_a_second_time(self) -> None:
         """已 active：不重复建环境、不重复发布，但**照常通知**。

@@ -146,6 +146,47 @@ class AdminRegistryPostgresTestCase(unittest.TestCase):
             (event_id, received_at, open_id, handled_as, trace_id),
         )
 
+    def add_task(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        inbound_event_id: str,
+        conversation_id: str | None = None,
+        status: str = "failed",
+        error_kind: str | None = "session_failed",
+        failure_code: str | None = None,
+        failure_signature: str | None = None,
+    ) -> None:
+        """插一条问数任务（Issue #495）：``task.inbound_event_id`` 是它与
+        ``inbound_event`` 之间唯一的溯源边（两者之间**没有外键**，理由见迁移
+        ``0057`` 文件头部），``trace_lookup`` 的新 JOIN 走的就是这条边。"""
+
+        conversation_id = conversation_id or f"cnv_{task_id}"
+        self.execute(
+            """INSERT INTO conversation (id, user_id, feishu_chat_id)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (id) DO NOTHING""",
+            (conversation_id, user_id, f"oc_{conversation_id}"),
+        )
+        self.execute(
+            """INSERT INTO task
+                 (id, conversation_id, user_id, inbound_event_id, prompt,
+                  status, target_worker_version, error_kind,
+                  failure_code, failure_signature, ended_at)
+               VALUES (%s, %s, %s, %s, '问题', %s, 'stable', %s, %s, %s, now())""",
+            (
+                task_id,
+                conversation_id,
+                user_id,
+                inbound_event_id,
+                status,
+                error_kind,
+                failure_code,
+                failure_signature,
+            ),
+        )
+
 
 class SeedIdempotencyTests(AdminRegistryPostgresTestCase):
     def test_first_seed_inserts_and_grants_all_three_roles(self) -> None:
@@ -694,6 +735,94 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
             trace.failure_occurred_at,
         ]
         self.assertNotIn("ou_should_not_appear", values)
+
+    def test_trace_carries_the_task_failure_code_and_exception_type(self) -> None:
+        """Issue #495 完成标准 4 的真库那一半：管理员凭追溯号拿到任务失败的
+        细分失败码与底层异常类型名。
+
+        这是一条此前**结构性不可达**的路径——两个值只进过 worker 容器自己的
+        stderr（``worker.task.terminal``），worker 与 gateway 不共享文件系统，
+        管理员没有容器访问权限。迁移 ``0080`` 落库 + 本次新增的
+        ``task``↔``inbound_event`` JOIN 才让它可达。
+
+        **变异验红**（已实测，真库）：把 ``trace_lookup`` 里
+        ``task = self._trace_task(trace_id=trace_id)`` 改成 ``task = None``，
+        本用例与 ``..._belonging_to_another_trace...`` 一起由绿转红；还原后复绿。
+        """
+
+        self.add_user(user_id="usr_task", open_id="ou_task", provisioning_state="active")
+        self.add_event(
+            event_id="evt_task",
+            open_id="ou_task",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_task",
+        )
+        self.add_task(
+            task_id="tsk_task",
+            user_id="usr_task",
+            inbound_event_id="evt_task",
+            failure_code="session_failed",
+            failure_signature="psycopg.errors.OperationalError",
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        trace = queries.trace_lookup(trace_id="trc_task")
+
+        assert trace is not None
+        self.assertEqual(trace.task_status, "failed")
+        self.assertEqual(trace.task_error_kind, "session_failed")
+        self.assertEqual(trace.task_failure_code, "session_failed")
+        self.assertEqual(trace.task_failure_signature, "psycopg.errors.OperationalError")
+        self.assertTrue(trace.task_ended_at)
+
+    def test_trace_without_any_task_reports_none_not_a_fabricated_row(self) -> None:
+        """否定测试：这条追溯号没有派生任务（管理命令、未开通用户、重复投递
+        都不入队）时五个字段全为 ``None``，不编造一行——否则上一条用例用一个
+        恒真实现也能过。"""
+
+        self.add_user(user_id="usr_notask", open_id="ou_notask", provisioning_state="active")
+        self.add_event(
+            event_id="evt_notask",
+            open_id="ou_notask",
+            received_at=datetime.now(timezone.utc),
+            trace_id="trc_notask",
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        trace = queries.trace_lookup(trace_id="trc_notask")
+
+        assert trace is not None
+        self.assertIsNone(trace.task_status)
+        self.assertIsNone(trace.task_error_kind)
+        self.assertIsNone(trace.task_failure_code)
+        self.assertIsNone(trace.task_failure_signature)
+        self.assertIsNone(trace.task_ended_at)
+
+    def test_a_task_belonging_to_another_trace_is_never_returned(self) -> None:
+        """JOIN 的正确性否定测试：另一条追溯号的任务不得串进来——把 JOIN 条件
+        写错（例如漏掉 ``inbound_event.trace_id`` 过滤）必须让本用例变红。"""
+
+        for suffix in ("a", "b"):
+            self.add_user(
+                user_id=f"usr_{suffix}", open_id=f"ou_{suffix}", provisioning_state="active"
+            )
+            self.add_event(
+                event_id=f"evt_{suffix}",
+                open_id=f"ou_{suffix}",
+                received_at=datetime.now(timezone.utc),
+                trace_id=f"trc_{suffix}",
+            )
+        self.add_task(
+            task_id="tsk_b",
+            user_id="usr_b",
+            inbound_event_id="evt_b",
+            failure_code="turn_timeout",
+            failure_signature=None,
+        )
+        queries = PostgresAdminQueries(self._dsn)
+
+        self.assertIsNone(queries.trace_lookup(trace_id="trc_a").task_status)
+        self.assertEqual(queries.trace_lookup(trace_id="trc_b").task_failure_code, "turn_timeout")
 
 
 class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
