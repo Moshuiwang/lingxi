@@ -1547,7 +1547,7 @@ def check_ci_workflow() -> list[str]:
     else:
         candidate = candidate_match.group(1)
         needs = re.search(r"^\s*needs:\s*\[([^\]]*)\]", candidate, re.MULTILINE)
-        required = {"classify", "docs", "gate", "extras", "image"}
+        required = {"classify", "docs", "l1", "gate", "extras", "image"}
         actual = {item.strip() for item in needs.group(1).split(",")} if needs else set()
         if actual != required:
             failures.append(
@@ -1585,11 +1585,26 @@ def check_ci_workflow() -> list[str]:
         "scripts/ci/verify_docs.sh",
         "needs.classify.outputs.mode == 'docs'",
         "needs.classify.outputs.mode != 'docs'",
+        "name: Epic Full / l1",
+        "scripts/ci/check_l1_assets.py",
+        "needs.classify.outputs.risk_level == 'l1'",
+        "needs.classify.outputs.risk_level != 'l1'",
+        "scripts/ci/check_permission_impact.py",
+        "needs.classify.outputs.risk_level == 'l3'",
     ):
         if marker not in full:
-            failures.append(f"ci.yml 缺少纯文档轻量 Epic 路由标记 `{marker}`。")
+            failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")
 
-    for marker in ("'epic/**'", "classify_story_changes.py", "verify_docs.sh", "uses: ./.github/workflows/ci.yml", "name: Story Fast"):
+    for marker in (
+        "'epic/**'",
+        "classify_story_changes.py",
+        "verify_docs.sh",
+        "uses: ./.github/workflows/ci.yml",
+        "name: Story Fast",
+        "name: Story / content l1",
+        "scripts/ci/check_l1_assets.py",
+        "needs.classify.outputs.risk_level == 'l1'",
+    ):
         if marker not in story:
             failures.append(f"story.yml 缺少 `{marker}`，Story Fast 路由不完整。")
 
