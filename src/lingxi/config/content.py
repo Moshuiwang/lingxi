@@ -164,6 +164,10 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "memory.type_label.term_mapping",
     "memory.type_label.calibration_preference",
     "memory.type_label.convention_template",
+    # 管理命令面「没看懂」回复（Trace #521 F4-3）：第一条给闲聊（正文与既有文案
+    # 逐字相同），第二条给已判定出失败段的 /admin 命令，带段名与实际分段数。
+    "admin.unknown_command",
+    "admin.unknown_command_detail",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (
