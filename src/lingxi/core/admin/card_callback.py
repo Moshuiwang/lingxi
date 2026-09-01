@@ -215,7 +215,9 @@ class ManagementCardRefresher(Protocol):
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-    ) -> None: ...
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool | None: ...
 
 
 @dataclass(frozen=True)

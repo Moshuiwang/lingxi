@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0083_management_card_recovery` |
+| head revision | `0084_management_card_state_cas` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -559,6 +559,15 @@ Issue #493。`management_card_context` 新增持久 `needs_refresh` 与
 待汇总标记，迟到的 instant outbox 不会被算作每日纠偏。数据库 CHECK 与代码层共同
 把上下文截止时间限制在创建后 24 小时内，默认保留窗口为 40 分钟。新增列与约束的
 downgrade 是有损但不删除业务行，符合 add-before-delete 与存量不迁移约定。
+
+## `0084_management_card_state_cas`（管理卡状态代数 CAS）
+
+Issue #493 P1 复修。`management_card_context` 新增正数 `state_version`，与发给
+CardKit 的 `card_sequence` 分开：状态写入同时推进两条版本链，恢复 scanner 读取的
+状态代数与整卡序号必须仍匹配，才能领取下一序号；CardKit 更新成功后的
+`needs_refresh` 清除也按同一快照做 CAS。旧 scanner 若在渲染期间遇到状态推进，会
+放弃发送并保留水位，下一轮从当前状态重新渲染。升级只加列并以 1 初始化既有上下文，
+downgrade 删除该列（有损但不删除业务行）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

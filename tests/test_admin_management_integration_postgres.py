@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
@@ -39,6 +41,7 @@ from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
 from lingxi.core.admin.router import AdminCommandRouter
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
+from lingxi.core.admin.views import AdminUserStatusView
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -604,6 +607,179 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
         context_store.mark_daily_corrections_reported(message_ids=(message_id,))
         self.assertEqual(context_store.unreported_daily_correction_ids(), ())
 
+
+class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCase):
+    """#493 P1：两个独立连接上的 scanner/writer 必须按状态代数 CAS。"""
+
+    def _seed_refreshable_context(self, message_id: str) -> PostgresManagementCardContextStore:
+        store = PostgresManagementCardContextStore(self._dsn)
+        store.remember(
+            message_id=message_id,
+            identifier=TARGET_OPEN_ID,
+            card_id=f"card_{message_id}",
+            chat_id="oc_1",
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            snapshot_fingerprint="fp",
+            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        store.update_state(
+            message_id=message_id, state="effective", dispatch_status="effective"
+        )
+        return store
+
+    def test_concurrent_state_write_rejects_stale_sequence_claim_without_consuming_it(self) -> None:
+        scanner_store = self._seed_refreshable_context("om_state_cas_claim")
+        writer_store = PostgresManagementCardContextStore(self._dsn)
+        snapshot = scanner_store.lookup_context(message_id="om_state_cas_claim")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+
+        both_ready = threading.Barrier(2)
+        writer_done = threading.Event()
+
+        def write_new_state():
+            both_ready.wait(timeout=5)
+            updated = writer_store.update_state(
+                message_id="om_state_cas_claim",
+                state="incomplete",
+                dispatch_status="incomplete",
+            )
+            writer_done.set()
+            return updated
+
+        def claim_old_snapshot():
+            both_ready.wait(timeout=5)
+            self.assertTrue(writer_done.wait(timeout=5))
+            return scanner_store.next_card_sequence(
+                message_id="om_state_cas_claim",
+                expected_state_version=snapshot.state_version,
+                expected_card_sequence=snapshot.card_sequence,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer_future = pool.submit(write_new_state)
+            scanner_future = pool.submit(claim_old_snapshot)
+            self.assertIsNotNone(writer_future.result(timeout=10))
+            self.assertIsNone(scanner_future.result(timeout=10))
+
+        current = scanner_store.lookup_context(message_id="om_state_cas_claim")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertEqual(current.state_version, snapshot.state_version + 1)
+        self.assertEqual(current.card_sequence, snapshot.card_sequence + 1)
+        self.assertTrue(current.needs_refresh)
+
+    def test_concurrent_state_write_rejects_late_watermark_clear(self) -> None:
+        scanner_store = self._seed_refreshable_context("om_state_cas_mark")
+        writer_store = PostgresManagementCardContextStore(self._dsn)
+        snapshot = scanner_store.lookup_context(message_id="om_state_cas_mark")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        claimed = scanner_store.next_card_sequence(
+            message_id="om_state_cas_mark",
+            expected_state_version=snapshot.state_version,
+            expected_card_sequence=snapshot.card_sequence,
+        )
+        self.assertEqual(claimed, snapshot.card_sequence + 1)
+        assert claimed is not None
+
+        writer_done = threading.Event()
+
+        def write_new_state():
+            updated = writer_store.update_state(
+                message_id="om_state_cas_mark",
+                state="incomplete",
+                dispatch_status="incomplete",
+            )
+            writer_done.set()
+            return updated
+
+        def mark_old_visual():
+            self.assertTrue(writer_done.wait(timeout=5))
+            return scanner_store.mark_visual_refreshed(
+                message_id="om_state_cas_mark",
+                sequence=claimed,
+                expected_state_version=snapshot.state_version,
+                expected_card_sequence=claimed,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer_future = pool.submit(write_new_state)
+            mark_future = pool.submit(mark_old_visual)
+            self.assertIsNotNone(writer_future.result(timeout=10))
+            self.assertFalse(mark_future.result(timeout=10))
+
+        current = scanner_store.lookup_context(message_id="om_state_cas_mark")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertEqual(current.card_sequence, claimed + 1)
+        self.assertEqual(current.visual_sequence, snapshot.visual_sequence)
+        self.assertTrue(current.needs_refresh)
+
+    def test_gateway_refresher_uses_real_context_port_and_clears_only_after_update(self) -> None:
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+
+        class _Catalog:
+            def companies(self):
+                return ["1011"]
+
+            def metrics(self):
+                return ["daily_active"]
+
+            def positions(self):
+                return ["A运营"]
+
+        class _DisplayNames:
+            def company_labels(self, *, company_ids):
+                return {company_id: company_id for company_id in company_ids}
+
+            def metric_labels(self, *, metric_ids):
+                return {metric_id: metric_id for metric_id in metric_ids}
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.updates: list[dict] = []
+
+            def update(self, **kwargs) -> None:
+                self.updates.append(kwargs)
+
+        store = self._seed_refreshable_context("om_state_cas_port")
+        context = store.lookup_context(message_id="om_state_cas_port")
+        self.assertIsNotNone(context)
+        assert context is not None
+        status = AdminUserStatusView(
+            identifier=TARGET_OPEN_ID,
+            provisioning_state="active",
+            account_state="enabled",
+            permission_version=1,
+            updated_at="2026-09-01T00:00:00+00:00",
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_Catalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+
+        self.assertTrue(
+            refresher.update(
+                context=context,
+                status=status,
+                state=context.state,
+                dispatch_status=context.dispatch_status,
+            )
+        )
+        self.assertEqual(len(transport.updates), 1)
+        self.assertEqual(transport.updates[0]["card_id"], context.card_id)
+        self.assertEqual(transport.updates[0]["sequence"], context.card_sequence + 1)
+        current = store.lookup_context(message_id="om_state_cas_port")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertFalse(current.needs_refresh)
+        self.assertEqual(current.visual_sequence, transport.updates[0]["sequence"])
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

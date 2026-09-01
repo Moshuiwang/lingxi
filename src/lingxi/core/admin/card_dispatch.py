@@ -283,6 +283,10 @@ class ManagementCardContext:
     # 取号或网络调用失败时提前推进。
     needs_refresh: bool = False
     visual_sequence: int = 2
+    # 业务状态代数与 CardKit 的外部 sequence 分开记账。scanner 只能用它读到的
+    # 代数回写；状态在渲染期间改变时，CAS 会拒绝旧视觉。card_sequence 仍是
+    # CardKit 的整卡序号，不能拿它单独充当状态版本。
+    state_version: int = 1
 
 
 class ManagementCardContextStore:
@@ -351,6 +355,7 @@ class ManagementCardContextStore:
         initiated_by_open_id: str = "",
         snapshot_fingerprint: str = "",
         card_sequence: int = 2,
+        state_version: int = 1,
         context_deadline_at: datetime | None = None,
         state: str = "ready",
         dispatch_status: str = "idle",
@@ -383,6 +388,7 @@ class ManagementCardContextStore:
             last_trace_id=last_trace_id,
             needs_refresh=False,
             visual_sequence=max(1, int(card_sequence)),
+            state_version=max(1, int(state_version)),
         )
         # 同一个 message_id 重复登记（理论上不会发生——每次 `/admin user`
         # 都会建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续
@@ -394,6 +400,10 @@ class ManagementCardContextStore:
                 if context.card_sequence > previous.card_sequence:
                     previous = ManagementCardContext(
                         **{**previous.__dict__, "card_sequence": context.card_sequence}
+                    )
+                if context.state_version > previous.state_version:
+                    previous = ManagementCardContext(
+                        **{**previous.__dict__, "state_version": context.state_version}
                     )
                 self._entries[message_id] = (previous, _previous_expires_at)
             else:
@@ -432,14 +442,44 @@ class ManagementCardContextStore:
             context, _expires_at = entry
             return context
 
-    def next_card_sequence(self, *, message_id: str) -> int:
-        """在进程内原子递增 sequence；持久适配器提供跨进程版本。"""
+    def next_card_sequence(
+        self,
+        *,
+        message_id: str,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> int | None:
+        """在进程内原子递增 sequence，并可按 scanner 快照做 CAS。
+
+        旧调用方不传期望值时保留 ``KeyError``/整数返回的兼容姿态。恢复路径必须
+        同时带上它读到的状态代数与 CardKit 序号；任一在渲染期间改变就返回
+        ``None``，调用方不得把旧卡片发给 CardKit。
+        """
+
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
 
         with self._lock:
             entry = self._entries.get(message_id)
             if entry is None:
+                if expected_state_version is not None or expected_card_sequence is not None:
+                    return None
                 raise KeyError(message_id)
             context, expires_at = entry
+            if (
+                expected_state_version is not None
+                and context.state_version != expected_state_version
+            ) or (
+                expected_card_sequence is not None
+                and context.card_sequence != expected_card_sequence
+            ):
+                return None
             next_value = context.card_sequence + 1
             self._entries[message_id] = (
                 ManagementCardContext(**{**context.__dict__, "card_sequence": next_value}),
@@ -473,8 +513,10 @@ class ManagementCardContextStore:
                 initiated_by_open_id=context.initiated_by_open_id,
                 # 每次持久状态改变都占用一个新的整卡版本。除了让 CardKit 的更新
                 # 顺序严格单调，这还使旧 scanner 在新状态写入后不能误把 needs_refresh
-                # 清掉；mark_visual_refreshed() 会按这个版本判定是否仍有新状态。
+                # 清掉；state_version 与 mark_visual_refreshed() 共同判定是否仍有
+                # 新状态。
                 card_sequence=context.card_sequence + (1 if changed else 0),
+                state_version=context.state_version + (1 if changed else 0),
                 snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
                 context_deadline_at=context.context_deadline_at,
                 state=state if state is not None else context.state,
@@ -506,14 +548,45 @@ class ManagementCardContextStore:
                 if context.needs_refresh
             )[:limit]
 
-    def mark_visual_refreshed(self, *, message_id: str, sequence: int) -> bool:
-        """仅在外部 CardKit update 成功后清除视觉回写水位。"""
+    def mark_visual_refreshed(
+        self,
+        *,
+        message_id: str,
+        sequence: int,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool:
+        """仅在外部 CardKit update 成功后清除视觉回写水位。
+
+        恢复路径传入渲染快照的状态代数和本次实际领到的 CardKit 序号。状态或
+        序号再被别的写入方推进时，CAS 失败并保留 ``needs_refresh``，让下一轮从
+        当前行重新渲染。
+        """
+
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("sequence 必须是正整数")
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
 
         with self._lock:
             entry = self._entries.get(message_id)
             if entry is None:
                 return False
             context, expires_at = entry
+            if (
+                expected_state_version is not None
+                and context.state_version != expected_state_version
+            ) or (
+                expected_card_sequence is not None
+                and context.card_sequence != expected_card_sequence
+            ):
+                return False
             if sequence < context.visual_sequence:
                 return False
             updated = ManagementCardContext(

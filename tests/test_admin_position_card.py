@@ -300,6 +300,84 @@ class PositionManagementCardTests(unittest.TestCase):
         self.assertEqual(restarted_scanner.scan(), 1)
         self.assertEqual(store.list_needing_refresh(), ())
 
+    def test_recovery_scanner_drops_old_visual_when_state_changes_after_snapshot(self) -> None:
+        """scanner 读旧行后，状态推进必须让旧视觉在取号 CAS 处放弃。"""
+
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher, _ManagementCardRecoveryScanner
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.updated: list[dict] = []
+
+            def update(self, **kwargs) -> None:
+                self.updated.append(kwargs)
+
+        class _Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                del action, fields
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_recovery_cas",
+            identifier="u@example.com",
+            card_id="card_recovery_cas",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        store.update_state(
+            message_id="om_recovery_cas", state="effective", dispatch_status="effective"
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_PositionCatalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+        calls = 0
+
+        def status_lookup(_identifier):
+            nonlocal calls
+            calls += 1
+            # This is the concurrent writer between list_needing_refresh() and
+            # the stale scanner's sequence claim.
+            store.update_state(
+                message_id="om_recovery_cas", state="incomplete", dispatch_status="incomplete"
+            )
+            return _status()
+
+        scanner = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=refresher,
+            status_lookup=status_lookup,
+            audit=_Audit(),
+        )
+
+        self.assertEqual(scanner.scan(), 0)
+        self.assertEqual(calls, 1)
+        self.assertEqual(transport.updated, [])
+        current = store.lookup_context(message_id="om_recovery_cas")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertTrue(current.needs_refresh)
+        # CAS failure must not consume another CardKit sequence.
+        self.assertEqual(current.card_sequence, 4)
+
+        # A fresh scanner can now render and deliver the current state after the
+        # old snapshot has been rejected, which also exercises restart recovery.
+        restarted = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=refresher,
+            status_lookup=lambda _identifier: _status(),
+            audit=_Audit(),
+        )
+        self.assertEqual(restarted.scan(), 1)
+        self.assertEqual(len(transport.updated), 1)
+        self.assertEqual(transport.updated[0]["sequence"], 5)
+        self.assertEqual(store.list_needing_refresh(), ())
+
     def test_stale_visual_sequence_cannot_clear_new_state_watermark(self) -> None:
         store = ManagementCardContextStore()
         store.remember(

@@ -292,7 +292,12 @@ class _GatewayManagementCardRefresher:
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-    ) -> None:
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool:
+        # Use snapshot versions when available; legacy test doubles may omit them.
+        expected_state_version = getattr(context, "state_version", None) if expected_state_version is None else expected_state_version
+        expected_card_sequence = getattr(context, "card_sequence", None) if expected_card_sequence is None else expected_card_sequence
         # 执行已结束（已生效/不完整）后，原管理卡恢复为可重新查询/提交的表单；
         # 只有等待中的提交态继续隐藏表单，避免重复点击。取消则关闭这张卡。
         submitted = state in {"submitted", "dispatching"}
@@ -323,14 +328,26 @@ class _GatewayManagementCardRefresher:
             status_message=status_message,
             closed=state == "closed",
         )
-        sequence = self._context_store.next_card_sequence(message_id=context.message_id)
+        sequence_kwargs: dict[str, Any] = {"message_id": context.message_id}
+        if expected_state_version is not None:
+            sequence_kwargs["expected_state_version"] = expected_state_version
+        if expected_card_sequence is not None:
+            sequence_kwargs["expected_card_sequence"] = expected_card_sequence
+        sequence = self._context_store.next_card_sequence(**sequence_kwargs)
+        if sequence is None:
+            return False
         self._transport.update(card_id=context.card_id, sequence=sequence, card=card)
-        # 只有 CardKit update 返回成功才推进持久视觉水位。取号或外部调用失败时
-        # ``needs_refresh`` 必须保留，供重启后的 scanner 再次尝试；不能靠进程内
-        # observer 的一次机会把数据库状态与原卡永久分叉。
         mark_visual_refreshed = getattr(self._context_store, "mark_visual_refreshed", None)
         if callable(mark_visual_refreshed):
-            mark_visual_refreshed(message_id=context.message_id, sequence=sequence)
+            mark_kwargs: dict[str, Any] = {"message_id": context.message_id, "sequence": sequence}
+            if expected_state_version is not None:
+                mark_kwargs["expected_state_version"] = expected_state_version
+            if expected_state_version is not None or expected_card_sequence is not None:
+                mark_kwargs["expected_card_sequence"] = sequence
+            marked = mark_visual_refreshed(**mark_kwargs)
+            if marked is False:
+                return False
+        return True
 
 
 class _ManagementCardRecoveryScanner:
@@ -388,12 +405,14 @@ class _ManagementCardRecoveryScanner:
                 if status is None:
                     continue
                 dispatch_status = self._dispatch_status_for(context)
-                self._refresher.update(
+                refreshed = self._refresher.update(
                     context=context,
                     status=status,
                     state=context.state,
                     dispatch_status=dispatch_status,
                 )
+                if refreshed is False:
+                    continue
                 recovered += 1
             except Exception as error:  # noqa: BLE001 - retry this row next scan
                 self._audit.record(
