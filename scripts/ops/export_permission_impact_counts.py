@@ -4,7 +4,7 @@
 这是受控验收环境的只读导出工具，不属于 CI：它只执行 ``COUNT(DISTINCT user_id)``
 聚合，不把用户标识、邮箱、角色分组明细或数据库凭据写入输出。生成的 JSON 只是
 可随权限配置 PR 提交的 stage 声明（claim）；CI 只有在 trusted-base GitHub OWNER
-reader 验证 PM 的一次性评论后才采信，CI 本身不会连接数据库或公司系统。
+reader 验证限时 OWNER attestation 评论后才采信，CI 本身不会连接数据库或公司系统。
 
 调用示例（在 biai-stage 的受控工作目录执行，DSN 仅从环境变量读取）：
 
@@ -131,7 +131,7 @@ def export(
     if provenance_output is not None:
         raise IMPACT.CountEvidenceError(
             "stage exporter 不生成 GitHub OWNER provenance；请把本清单交给 PM，"
-            "由 trusted-base GitHub OWNER reader 验证一次性评论"
+            "由 trusted-base GitHub OWNER reader 验证限时 OWNER attestation 评论"
         )
     base_roles, base_metrics, base_role_raw, base_metric_raw = _facts(repository, base_ref)
     head_roles, head_metrics, head_role_raw, head_metric_raw = _facts(repository, head_ref)

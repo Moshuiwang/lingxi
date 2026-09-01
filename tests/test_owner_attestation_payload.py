@@ -66,9 +66,22 @@ class OwnerAttestationPayloadTest(unittest.TestCase):
             nonce="nonce-0123456789ab",
             now=self.NOW,
         )
-        raw = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        output = self.repository / "comment-body.json"
+        RENDERER._write(output, body)
+        raw_bytes = output.read_bytes()
+        expected_bytes = (
+            json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        self.assertEqual(raw_bytes, expected_bytes)
+        self.assertEqual(raw_bytes.count(b"\n"), 1)
+        raw = raw_bytes.decode("utf-8")
         self.assertEqual(RENDERER.READER._json_document(raw, "body"), body)
         self.assertNotIn("```", raw)
+        with self.assertRaises(RENDERER.READER.AttestationError):
+            RENDERER.READER._json_document(
+                (b"```json\n" + raw_bytes + b"```").decode("utf-8"),
+                "wrapped body",
+            )
         self.assertEqual(body["repository"]["id"], RENDERER.READER.REPOSITORY_ID)
         self.assertEqual(body["pull_request"]["number"], 518)
 

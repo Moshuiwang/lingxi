@@ -469,6 +469,32 @@ class OwnerAttestationTest(unittest.TestCase):
             {"src/lingxi/config/new.toml", "src/lingxi/config/old.toml"},
         )
 
+    def test_pull_files_status_allowlist_matches_real_rest_values(self) -> None:
+        for offset, status in enumerate(sorted(READER.FILE_STATUSES)):
+            with self.subTest(status=status):
+                paths, _, count = READER._changed_files(
+                    FakeApi(
+                        self._pr(),
+                        [[self._comment()]],
+                        files=[[_file_entry(f"{status}.txt", status=status, sha=f"{offset + 1:040x}")]],
+                    ),
+                    pr_number=7,
+                    repository_full_name=READER.REPOSITORY_FULL_NAME,
+                )
+                self.assertEqual(paths, {f"{status}.txt"})
+                self.assertEqual(count, 1)
+
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(
+                    self._pr(),
+                    [[self._comment()]],
+                    files=[[_file_entry("deleted.txt", status="deleted")]],
+                ),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+
     def test_pull_files_bad_shape_duplicate_pagination_and_api_failure_fail_closed(self) -> None:
         bad_shape = _file_entry("README.md")
         del bad_shape["sha"]

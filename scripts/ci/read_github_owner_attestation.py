@@ -49,6 +49,9 @@ MAX_BODY_BYTES = 64 * 1024
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+FILE_STATUSES = frozenset(
+    {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
+)
 
 ATTESTATION_KEYS = frozenset(
     {
@@ -699,7 +702,7 @@ def _file_item_identity(entry: Mapping[str, Any]) -> Hashable:
     sha = entry.get("sha")
     _sha1(sha, "GitHub PR files 条目的 sha")
     status = entry.get("status")
-    if status not in {"added", "modified", "deleted", "renamed", "copied", "changed", "unchanged"}:
+    if status not in FILE_STATUSES:
         raise AttestationError("GitHub PR files 条目的 status 异常")
     return (filename, previous, sha, status)
 
