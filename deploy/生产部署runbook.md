@@ -33,10 +33,8 @@ scripts/ops/sync_db_env_from_credentials.sh \
 
 机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)（含 session 模式连接约束）。**截至 2026-08-29 生产尚未切换/部署**：本节只登记同构加载方式，实际执行在生产发布的独立 ops 卡内。
 
-**worker-queue 并发与资源合同（Issue #494/#496/#502）**：生产机器型号与 stage
-一致，执行并发固定为 `4`，资源固定为 CPU `1.5`、memory `2G`、pids `512`、
-`tmpfs 256m`。在目标机外部根 `deploy/.env.prod`（不入库、不写入本仓库）核对并
-写入以下五行：
+**资源与并发（Issue #494/#496/#502）**：生产机器型号与 stage 一致。在目标机外部根
+`deploy/.env.prod`（不入库、不写入本仓库）核对并写入以下**七行**：
 
 ```dotenv
 LINGXI_WORKER_MAX_CONCURRENCY=4
@@ -44,17 +42,35 @@ LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
 LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
 LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
 LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
+LINGXI_SCHEDULER_MEM_LIMIT=512M
+LINGXI_GATEWAY_MEM_LIMIT=512M
 ```
 
-`deploy/compose.prod.yaml` 对这五项使用 `${VAR:?}` 无默认值；缺任何一项时，
-`docker compose config` 直接失败，不能带着未核对的默认值启动。部署前用以下命令
-确认渲染后的 worker-queue 环境和资源值与合同一致（命令只读，不创建或修改真实
-生产文件）：
+**七行分两族，漏配的后果完全不同，都必须写：**
+
+| 行 | `compose.prod.yaml` 形态 | 漏配会怎样 |
+| --- | --- | --- |
+| 前五行（worker-queue 并发与资源） | `${VAR:?}` **无默认值** | `docker compose config`/`up` **直接失败**，起不来 |
+| 后两行（`scheduler`/`gateway` 内存，**必写**） | `${VAR:-1G}` **有默认值**（`compose.prod.yaml:35`/`:58`） | **不报错、静默退回 `1G`**——三个常驻服务加总从 3G 变成 4G，超过主机 3.74GiB |
+
+后两行把 `scheduler`/`gateway` 钉成与 stage 同值 `512M`，三个常驻服务加总
+512M + 512M + 2G = **3G ≤ 3.74GiB**；这与「生产与 stage 同型」是同一件事，不改
+`compose.prod.yaml` 的默认值。加总核对与推导见
+[`deploy/README.md`「三个常驻服务的加总核对」](README.md#三个常驻服务的加总核对)，此处不复述。
+
+部署前用以下两条只读命令确认渲染后的值与上表一致（只读，不创建或修改真实生产
+文件）。**后两行是有默认值形态，看 env 文件看不出漏没漏，必须靠渲染回读**：
 
 ```bash
+# ① worker-queue：并发与四项资源
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
   config worker-queue
+
+# ② scheduler / gateway：确认 memory 渲染成 512M 而不是默认的 1G
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  config scheduler gateway
 ```
 
 ### 2.2 部署前置检查（preflight）
