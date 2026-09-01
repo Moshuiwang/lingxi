@@ -2,9 +2,10 @@
 """L1 用户可见资产轻门禁（Issue #498）。
 
 L1 只覆盖三份已批准的用户可见事实源：``content.toml``、它的版本锁，以及
-``admin_metric_alias_map.toml``。这里复用 #190 的内容摘要/锁校验，并对别名表与
-管理员可见出口做 fail-closed 术语扫描。门禁不导入业务包、不连接数据库、不读取生产
-数据或凭据，因此它明显轻于 Story Fast / Epic Full，但不会把「轻」误当成「不校验」。
+``admin_metric_alias_map.toml``。这里复用 #190 的内容摘要/锁校验，断言内容目录的键
+集合与运行时登记表精确相等（Issue #520 F1），并对别名表与管理员可见出口做
+fail-closed 术语扫描。门禁不导入业务包、不连接数据库、不读取生产数据或凭据，因此它
+明显轻于 Story Fast / Epic Full，但不会把「轻」误当成「不校验」。
 
 提示词（L2）不在本脚本中实现；将来若产品批准事实源，应先登记到分类器并另行补合同。
 """
@@ -28,6 +29,18 @@ LOCK_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.lock.toml"
 ALIAS_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "admin_metric_alias_map.toml"
 ADMIN_SOURCE_ROOT = REPOSITORY_ROOT / "src" / "lingxi" / "core" / "admin"
 DAILY_REPORT_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "core" / "daily_report.py"
+CONTENT_MODULE_PATH = REPOSITORY_ROOT / "src" / "lingxi" / "config" / "content.py"
+
+# Issue #520 F1：运行时 ``ContentCatalog.from_mapping`` 对 ``[texts]`` / ``[cards]``
+# 的键集合做**精确相等**比对（``_require_exact_keys``），少一个键或多一个键都会抛
+# ``ContentValidationError``，进程在加载内容目录时就起不来。此前这道门禁只校验版本
+# 锁与术语，不看键集合：删一条文案键、或新增一条没人消费的键，只要递增版本并刷新锁
+# 就全绿，而线上必然加载失败。下面这张表把「运行时要求什么键」与「配置里有什么键」
+# 绑到一起，**用 ast 静态读取，不 import lingxi**，门禁保持零业务依赖。
+CONTENT_KEY_DECLARATIONS = (
+    ("texts", "REQUIRED_TEXT_KEYS", "文案"),
+    ("cards", "REQUIRED_CARD_KEYS", "卡片"),
+)
 
 # 这些是用户出口已退役的中文动词；内部数据库/回调 token 是 ASCII，不在此扫描。
 RETIRED_TERMS = ("收回", "抑制", "新增授权", "新增抑制")
@@ -90,6 +103,100 @@ def load_aliases(path: Path) -> tuple[dict[str, str] | None, list[str]]:
             continue
         valid[key] = value
     return (valid if not errors else None), errors
+
+
+def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] | None, list[str]]:
+    """静态读出 ``content.py`` 里登记的必需键集合。
+
+    刻意用 ``ast`` 而不是 import：这道门禁的合同是「不导入业务包」，import 会把
+    ``lingxi`` 的依赖闭包和副作用带进 CI 的轻量路径。只认**模块顶层**的直接赋值，
+    并要求右值是字面量元组/列表——任何需要求值才能确定的写法（拼接、条件、函数
+    调用）都当作读不出来而失败关闭，绝不猜一个可能不完整的集合。
+    """
+
+    try:
+        tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    except (OSError, SyntaxError) as error:
+        return None, [
+            f"L1 键集合检查无法解析 {_display(module_path, REPOSITORY_ROOT)}：{error}"
+        ]
+
+    wanted = {name for _, name, _ in CONTENT_KEY_DECLARATIONS}
+    found: dict[str, frozenset[str]] = {}
+    errors: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign):
+            targets: list[ast.expr] = [node.target]
+            value = node.value
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        else:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name) or target.id not in wanted:
+                continue
+            try:
+                literal = ast.literal_eval(value) if value is not None else None
+            except (ValueError, TypeError, SyntaxError):
+                literal = None
+            if not isinstance(literal, (tuple, list)) or not all(
+                isinstance(item, str) for item in literal
+            ):
+                errors.append(
+                    f"{_display(module_path, REPOSITORY_ROOT)} 的 {target.id} "
+                    "必须是模块顶层的字面量字符串元组，否则门禁无法静态确定必需键"
+                )
+                continue
+            found[target.id] = frozenset(literal)
+
+    for name in sorted(wanted - set(found)):
+        if not any(name in error for error in errors):
+            errors.append(
+                f"{_display(module_path, REPOSITORY_ROOT)} 里找不到模块顶层的 {name}："
+                "运行时必需键的登记表被改名或移动了，L1 门禁不能再证明配置与运行时一致"
+            )
+    if errors:
+        return None, errors
+    return found, []
+
+
+def _content_key_failures(
+    content: Mapping[str, Any], content_path: Path, module_path: Path
+) -> list[str]:
+    """content.toml 的键集合必须与运行时登记表**精确相等**（Issue #520 F1）。"""
+
+    declared, errors = required_content_keys(module_path)
+    if declared is None:
+        return errors
+
+    failures: list[str] = []
+    display = _display(content_path, REPOSITORY_ROOT)
+    for table, name, kind in CONTENT_KEY_DECLARATIONS:
+        actual = content.get(table)
+        if not isinstance(actual, Mapping):
+            failures.append(
+                f"{display} 缺少 [{table}] 表或它不是表；运行时会直接拒绝加载内容目录"
+            )
+            continue
+        required = declared[name]
+        missing = sorted(required - set(actual))
+        extra = sorted(set(actual) - required)
+        if not missing and not extra:
+            continue
+        details: list[str] = []
+        if missing:
+            details.append("缺少 " + "、".join(missing))
+        if extra:
+            details.append("多余 " + "、".join(extra))
+        failures.append(
+            f"{display}:[{table}] 的{kind}键与 "
+            f"{_display(module_path, REPOSITORY_ROOT)} 的 {name} 不是精确相等："
+            + "；".join(details)
+            + "。运行时 ContentCatalog.from_mapping 就是精确比对，键集合不等会抛 "
+            "ContentValidationError，进程加载内容目录时直接失败"
+        )
+    return failures
 
 
 def _string_literals_without_docstrings(path: Path) -> list[tuple[int, str]]:
@@ -171,6 +278,7 @@ def check_l1_assets(
     *,
     admin_source_root: Path = ADMIN_SOURCE_ROOT,
     daily_report_path: Path = DAILY_REPORT_PATH,
+    content_module_path: Path = CONTENT_MODULE_PATH,
 ) -> list[str]:
     """返回 L1 失败列表；空列表表示通过。"""
 
@@ -179,6 +287,11 @@ def check_l1_assets(
     lock, lock_errors = CONTENT_CHECKER.load_lock(lock_path)
     failures.extend(content_errors)
     failures.extend(lock_errors)
+    if content is not None and not content_errors:
+        # 与版本锁无关的一道独立断言：版本锁只证明「文案变了版本也跟着变了」，
+        # 证明不了「键集合仍然是运行时要求的那一套」。递增版本 + 刷新锁能让锁校验
+        # 全绿，但删键/加键仍会在运行时加载失败，所以这里必须单独判一次。
+        failures.extend(_content_key_failures(content, content_path, content_module_path))
     if content is not None and lock is not None and not content_errors and not lock_errors:
         failures.extend(CONTENT_CHECKER.evaluate(content, lock))
         failures.extend(_content_term_failures(content, content_path))
@@ -199,7 +312,7 @@ def run_check(**kwargs: Any) -> int:
         for failure in failures:
             print(f"- {failure}", file=sys.stderr)
         return 1
-    print("L1 用户可见资产门禁：通过（content 版本/锁、别名形状、术语扫描）")
+    print("L1 用户可见资产门禁：通过（content 键集合/版本/锁、别名形状、术语扫描）")
     return 0
 
 
@@ -210,6 +323,7 @@ def main() -> int:
     parser.add_argument("--aliases", type=Path, default=ALIAS_PATH)
     parser.add_argument("--admin-source-root", type=Path, default=ADMIN_SOURCE_ROOT)
     parser.add_argument("--daily-report", type=Path, default=DAILY_REPORT_PATH)
+    parser.add_argument("--content-module", type=Path, default=CONTENT_MODULE_PATH)
     args = parser.parse_args()
     return run_check(
         content_path=args.content,
@@ -217,6 +331,7 @@ def main() -> int:
         alias_path=args.aliases,
         admin_source_root=args.admin_source_root,
         daily_report_path=args.daily_report,
+        content_module_path=args.content_module,
     )
 
 

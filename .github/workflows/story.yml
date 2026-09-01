@@ -109,6 +109,11 @@ jobs:
       - name: 校验门禁没有改写工作树
         run: test -z "$(git status --porcelain)"
 
+  # Issue #520 F2：**这条轻量档当前不会被触发。** 分类器里的
+  # `L1_LIGHT_ROUTE_ENABLED = False` 把只改 L1 内容资产的改动路由回了完整门禁
+  # （Story 侧即下面的 `full` job，复用同一份 Epic Full）。原因见分类器注释：
+  # 这三份资产随镜像发布，轻量档不会产出候选证明，合入 main 后发布必然失败。
+  # 本 job 与判定代码一起原样保留，留待上线后重启用。
   l1:
     name: Story / content l1
     needs: classify
