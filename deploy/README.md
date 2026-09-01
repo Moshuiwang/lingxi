@@ -599,7 +599,9 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 `scripts/ci/verify_compose_structure.sh` 会分别检查这种 fail-fast 形状及可渲染占位
 值；提示语保持纯 ASCII 单行，避免 YAML 先于插值截断 `${...}`。
 
-生产根 `.env.prod` 应包含以下五行（示例合同，不是要求把文件提交到仓库）：
+生产根 `.env.prod` 的 worker-queue 部分应包含以下五行（示例合同，不是要求把文件提交到
+仓库）。**这五行不是根 `.env.prod` 的全部**——另有两行 `scheduler`/`gateway` 内存必须
+同时写入，见下「三个常驻服务的加总核对」：
 
 ```dotenv
 LINGXI_WORKER_MAX_CONCURRENCY=4
