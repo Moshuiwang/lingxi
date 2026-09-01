@@ -596,8 +596,18 @@ jobs:
           fi
           if [ "${EVENT_NAME}" = pull_request ] && [ "${DOCS_CHANGED}" = true ] \
              && [ "${DOCS_RESULT}" != success ]; then
-            printf '混合候选文档门禁未通过：%s\n' "${DOCS_RESULT}" >&2
-            exit 1
+            # main PR 的 Epic Full / docs 应运行；epic/** -> main 的跟踪 PR 通过
+            # Story Fast / docs 覆盖文档，复用进来的 Epic Full / docs 按设计 skipped。
+            # Story Fast 的 story-result 另行要求 caller 的 docs=success。
+            # 后者只允许恰好是 skipped；若 Epic 侧意外失败/取消，仍不能被汇总吞掉。
+            case "${BASE_REF}:${DOCS_RESULT}" in
+              epic/*:skipped) : ;;
+              *)
+                printf '候选文档门禁未通过：base=%s result=%s\n' \
+                  "${BASE_REF}" "${DOCS_RESULT}" >&2
+                exit 1
+                ;;
+            esac
           fi
           if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
              && [ "${MODE}" = docs ] && [ "${RISK_LEVEL}" = l0 ]; then
