@@ -631,11 +631,30 @@ LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
 2. **上限分环境显式**：值由 `LINGXI_WORKER_QUEUE_TMPFS_SIZE` 决定，stage 与生产均钉在 256m（这块盘吃宿主内存）。
 3. **健康检查看得见这块盘**：`lingxi.apps.healthcheck` 增加可用空间判定，低于总量 10% 判红。修复前它一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页，所以"用户在失败、监控显示 healthy"可以无限期持续。时延口径见 `deploy/监控告警.md`「五、时延估算」的 C 类。
 
-**stage 与生产机器采用同一型号合同**：`scheduler`（stage 512M / 生产 1G）+
-`gateway`（stage 512M / 生产 1G）+ `worker-queue`（2G）三个常驻服务的
-worker-queue 预算固定为 1.5 CPU、2G、512 pids、256m tmpfs；一次性作业的其余
-资源值仍见上表。Agent SDK 一个回合会拉起 Claude CLI 与多个 MCP 子进程，pids
-撞顶的失败形态是进程被直接 kill，因此执行并发上限与资源合同必须保持一致。
+**stage 与生产机器采用同一型号（t3.medium，2 vCPU / 3.74GiB）**，因此两边的加总
+核对用同一台主机的容量来算。**只有三个常驻服务会同时在跑**（`worker`/`migrate`/
+`reauthorize` 是一次性作业，通常不与常驻服务的峰值重叠）：
+
+| | `scheduler` | `gateway` | `worker-queue` | 三者加总 | 主机 |
+| --- | --- | --- | --- | --- | --- |
+| stage `memory` | 512M | 512M | 2G | **3G** | 3.74GiB（余约 700MB） |
+| 生产 `memory` | 1G | 1G | 2G | **4G** | 3.74GiB（**加总已超出主机**） |
+| 生产 `cpus` | 1.0 | 1.0 | 1.5 | **3.5** | 2 vCPU（超订） |
+
+**怎么读这张表**：`deploy.resources.limits` 是**上界，不是预留**，三者同时顶格才会
+真的冲突。CPU 超订只会限流变慢；内存超订撞上去是被 OOM kill，所以只有 `memory`
+这一行需要核对。生产之所以可以带着 4G 的加总上线：`scheduler` 与 `gateway` 都没有
+子进程扇出（依据见上表「依据」列），它们的 1G 是留给突发的天花板而不是常态占用，
+真正会长期贴近自己上限的只有 `worker-queue`——它单独一个就吃掉 2G，占主机一半以上。
+**登记为上线首周观察项**：若三个常驻服务的实测常驻占用之和逼近 3.74GiB，处置途径是
+把生产 `scheduler`/`gateway` 降回 stage 的 512M（加总回到 3G、恢复约 700MB 余量），
+而不是放松 `worker-queue`。stage 浸泡实测的宿主可用内存是 1.6~1.7GiB、swap 已用
+261MiB，说明这台机器的实际余量比"3.74GiB 减去加总"更紧。
+
+`worker-queue` 自己的 2G 够不够用，推导见[架构设计「九、容量与资源」](../docs/技术设计/架构设计.md)
+（(2048 MiB − 256 MiB tmpfs) ÷ 并发 4 = 每回合 448 MiB）。Agent SDK 一个回合会拉起
+Claude CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直接 kill，因此执行并发
+上限与这组资源值必须一起改、不能单改一边。
 
 **`worker-queue` 的内存限额与并发上限必须同步设，两者是同一个约束的两半**：
 `LINGXI_WORKER_MAX_CONCURRENCY`（`apps/worker/config.py`）决定一个容器同一时刻
