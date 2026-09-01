@@ -2277,6 +2277,28 @@ class LinkifiedEmailRoutingTests(unittest.TestCase):
 
         self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
 
+    def test_unsupported_link_forms_stop_before_identifier_resolution(self) -> None:
+        """#492 的收窄边界在路由层也要保持 fail closed：不把链接化 open_id、
+        不一致目标或任意 URL 送到 ``resolve_identifier``/下游查询。"""
+
+        unsupported = (
+            f"/admin user <{_LINK_TEST_EMAIL}>",
+            f"/admin user `{_LINK_TEST_EMAIL}`",
+            f"/admin user [ou_abc123](mailto:ou_abc123)",
+            f"/admin user [seen@example.com](mailto:{_LINK_TEST_EMAIL})",
+            f"/admin user [{_LINK_TEST_EMAIL}](https://example.com/user)",
+        )
+        for text in unsupported:
+            with self.subTest(text=text):
+                router, _, queries, audit = _router()
+                outcome = router.route(open_id=ADMIN_OPEN_ID, text=text, trace_id="t1")
+
+                self.assertTrue(outcome.handled)
+                self.assertIn("用户标识", outcome.reply_text)
+                self.assertEqual(queries.resolve_identifier_calls, [])
+                self.assertEqual(queries.user_calls, [])
+                self.assertEqual(audit.actions(), ["admin.command.unknown"])
+
 
 class SegmentedUnknownReplyTests(unittest.TestCase):
     """Issue #492 完成标准 4：解析失败时说清**哪一段**没看懂。
