@@ -1,5 +1,5 @@
 [meta]
-version = "2026-08-31-5"
+version = "2026-09-01"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -237,6 +237,19 @@ version = "2026-08-31-5"
 "memory.type_label.term_mapping" = "术语映射"
 "memory.type_label.calibration_preference" = "口径偏好"
 "memory.type_label.convention_template" = "惯例模板"
+
+# 管理命令面的「没看懂」回复（Trace #521 F4-3）。此前这两句写死在
+# core/admin/router.py 里、审计版本恒为字面量 "internal"；F4 要求回复正文补一句
+# 「实际收到 N 段参数」——这是管理员唯一的自救线索（#492 那次，管理员发的是
+# 「一个邮箱 + 24」两段，解析器数出三段，正是客户端把邮箱拆开了），既然要改用户
+# 可见正文，就一并纳入版本化目录，改文案必须递增 [meta] version。
+#
+# 第一条对应「不是一次 /admin 命令尝试」（闲聊）——正文与既有文案逐字相同，
+# 不对每句闲聊解释命令语法。第二条只在已经判定出「哪一段没看懂」时使用。
+# {hint} 是段名 + 期望形状的固定短语（router._REJECT_HINTS），**不含输入原文**；
+# {segment_count} 是分段计数，同样不回显原文。
+"admin.unknown_command" = "未识别的管理命令，请发送 /admin help 查看可用命令。"
+"admin.unknown_command_detail" = "这条管理命令没有完全看懂：{hint}（实际收到 {segment_count} 段参数）。请发送 /admin help 查看正确格式后重发。"
 
 [cards."query.status"]
 title = "正在查询"
