@@ -727,16 +727,25 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         )
         return store
 
-    def _submit(self, handler, *, operator="ou_admin", identifier="u@example.com"):
+    def _submit(
+        self,
+        handler,
+        *,
+        operator="ou_admin",
+        identifier="u@example.com",
+        position_name="A运营",
+        company_scope="c1",
+        reason="特批",
+    ):
         return handler.handle_management_form_submit(
             operator_open_id=operator,
             admin_action=ADMIN_ACTION_GRANT,
             identifier=identifier,
             company_id="",
             metric_name="",
-            reason="特批",
-            position_name="A运营",
-            company_scope="c1",
+            reason=reason,
+            position_name=position_name,
+            company_scope=company_scope,
             chat_id="oc_1",
             thread_id=None,
             message_id="om_1",
@@ -897,6 +906,145 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         self.assertEqual(store.lookup_context(message_id="om_1").state, "ready")
         self.assertEqual(refresh.calls[-1]["state"], "ready")
         self.assertIsNone(refresh.calls[-1]["dispatch_status"])
+
+    # ------------------------------------------------------------------
+    # #493 P1-2（rc24 缺陷账本 #520 F6）：职位表单两个必填项的服务端否定用例。
+    # 此前 `handle_management_form_submit` 的「缺职位 / 缺范围」两条拒绝分支
+    # 零测试覆盖——删掉它们全套用例仍全绿。它与 Trace #469 已经付过学费的
+    # 「参数静默左移」是同一族路径（见下面的 `PositionCommandShiftReproductionTests`
+    # 逐字复现），下游 `_parse_position_permission_command` 的语法门只在取值
+    # 恰好不合语法时才兜得住，不能当成这两条校验的替代品。
+    # ------------------------------------------------------------------
+
+    def test_missing_position_name_is_rejected_before_routing(self) -> None:
+        """缺职位：服务端必须在拼命令文本之前拒绝，并给出「请选择银河职位」。
+
+        变异锚点：删掉 ``card_callback.py`` 里 ``if not position_name.strip():
+        return _toast_error("请选择银河职位")`` 两行后，本用例由绿转红。
+        """
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="", company_scope="c1")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(response["toast"]["content"], "请选择银河职位")
+        self.assertEqual(route.calls, [], "缺职位必须在拼命令文本、调用 route() 之前拦住")
+
+    def test_missing_company_scope_is_rejected_before_routing(self) -> None:
+        """缺范围：服务端必须在拼命令文本之前拒绝，并给出「请选择公司范围」。
+
+        变异锚点：删掉 ``card_callback.py`` 里 ``if not company_scope.strip():
+        return _toast_error("请选择公司范围")`` 两行后，本用例由绿转红。
+        """
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="A运营", company_scope="")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(response["toast"]["content"], "请选择公司范围")
+        self.assertEqual(route.calls, [], "缺范围必须在拼命令文本、调用 route() 之前拦住")
+
+    def test_whitespace_only_position_or_scope_is_treated_as_missing(self) -> None:
+        """只填空白等于没填：``.strip()`` 之后为空的取值必须落回同一条「请选择」
+        文案，而不是滑到下游那条更笼统的「职位或公司范围无效」——两者都拒绝，
+        但只有前者告诉管理员到底缺哪一项。全角空格（U+3000）同样算空白。"""
+
+        status = _status()
+        for position_name, company_scope, expected in (
+            ("   ", "c1", "请选择银河职位"),
+            ("\u3000", "c1", "请选择银河职位"),
+            ("A运营", "   ", "请选择公司范围"),
+            ("A运营", "\u3000", "请选择公司范围"),
+        ):
+            with self.subTest(position_name=position_name, company_scope=company_scope):
+                route = _Route()
+                store = self._store(status)
+                handler = self._handler(
+                    status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+                )
+
+                response = self._submit(
+                    handler, position_name=position_name, company_scope=company_scope
+                )
+
+                self.assertEqual(response["toast"]["type"], "error")
+                self.assertEqual(response["toast"]["content"], expected)
+                self.assertEqual(route.calls, [])
+
+    def test_both_fields_present_still_routes(self) -> None:
+        """否定用例的另一半：两项都选齐时新增断言不得误伤主路径。"""
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="A运营", company_scope="c1")
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(len(route.calls), 1)
+        self.assertEqual(
+            route.calls[0]["text"], "/admin grant_position u@example.com A运营 c1 特批"
+        )
+
+
+class PositionCommandShiftReproductionTests(unittest.TestCase):
+    """复现「缺职位 / 缺范围」被放过去之后会发生什么（#493 P1-2 / #520 F6）。
+
+    这里不经过 handler 的校验，直接把「少了一段」的命令文本喂给
+    ``parse_admin_command``：连续空白被 ``str.split()`` 吃成一个分隔符，后面
+    每个字段整体左移一位，解析结果仍然是一条形状完全合法的
+    ``GRANT_POSITION_PERMISSION``——只是职位或公司范围已经换成了管理员从没
+    选过的取值，而管理员看到的却是「已提交，请确认」这类正常回执。
+
+    下游语法门只在左移后的取值恰好不合语法时才拒绝，因此它是运气、不是护栏；
+    这组用例把这一点钉住，防止有人以为「反正下游会拒绝」就够安全（Trace #469
+    已经为同一族根因付过一次学费）。
+    """
+
+    def test_a_missing_position_name_shifts_the_company_scope_into_the_position(self) -> None:
+        identifier = "u@example.com"
+        position_name = ""
+        company_scope = "c1"
+        reason = "c2 补充授权"
+        shifted = f"/admin grant_position {identifier} {position_name} {company_scope} {reason}"
+
+        parsed = parse_admin_command(shifted)
+
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(parsed.position_name, "c1", "管理员选的公司范围被当成了职位")
+        self.assertEqual(parsed.company_scope, "c2", "公司范围换成了原因里的第一个词")
+        self.assertEqual(parsed.reason, "补充授权")
+
+    def test_a_missing_company_scope_shifts_the_reason_into_the_scope(self) -> None:
+        identifier = "u@example.com"
+        position_name = "A运营"
+        company_scope = ""
+        reason = "c2 补充授权"
+        shifted = f"/admin grant_position {identifier} {position_name} {company_scope} {reason}"
+
+        parsed = parse_admin_command(shifted)
+
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(parsed.position_name, "A运营")
+        self.assertEqual(
+            parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司"
+        )
+        self.assertEqual(parsed.reason, "补充授权")
 
 
 class _RefresherTransport:
