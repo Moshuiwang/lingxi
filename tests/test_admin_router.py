@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import unittest
 
+from lingxi.config.content import default_content_catalog
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, AdminRole
 from lingxi.core.admin.router import (
@@ -2377,6 +2378,152 @@ class SegmentedUnknownReplyTests(unittest.TestCase):
         self.assertNotIn(payload, outcome.reply_text)
         self.assertNotIn(";;;;", outcome.reply_text)
         self.assertNotIn("<at", outcome.reply_text)
+
+
+class UnknownCommandForensicsTests(unittest.TestCase):
+    """Trace #521 F4-1/F4-3：``admin.command.unknown`` 的取证字段与自救文案。
+
+    #492 的 W0-2 调查卡在同一个位置两次：一条失败只留下 ``reject_reason`` 一个枚举
+    名，"客户端把邮箱拆成了两段"和"管理员真的多打了一个参数"产生**逐字相同**的
+    审计，两个竞争假设无法区分。本组用例把"下一次复现能被指认"钉死。
+    """
+
+    _EMAIL = "someone@example.com"
+
+    def test_admin_prefixed_failure_records_shapes_and_raw_text(self) -> None:
+        router, _, _, audit = _router()
+
+        router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f"/admin audit {self._EMAIL} (mailto:not-an-email) 24",
+            trace_id="t1",
+        )
+
+        action, fields = audit.records[0]
+        self.assertEqual(action, "admin.command.unknown")
+        self.assertEqual(fields["reject_reason"], "wrong_argument_count")
+        self.assertEqual(fields["token_count"], 3)
+        self.assertEqual(
+            fields["token_shapes"],
+            "admin_prefix,bare_word,email,paren_wrapped,digits",
+        )
+        self.assertEqual(
+            fields["raw_admin_text"],
+            f"/admin audit {self._EMAIL} (mailto:not-an-email) 24",
+        )
+
+    def test_token_shapes_carry_no_input_text(self) -> None:
+        """否定断言：形状串是固定分类名，不含任何输入片段。"""
+
+        router, _, _, audit = _router()
+
+        router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin user ou_a;;;;<at></at> 多余",
+            trace_id="t1",
+        )
+
+        shapes = audit.records[0][1]["token_shapes"]
+        self.assertNotIn(";;;;", shapes)
+        self.assertNotIn("<at", shapes)
+        self.assertNotIn("多余", shapes)
+
+    def test_plain_chat_records_no_raw_text_and_no_shapes(self) -> None:
+        """不误伤：不是以 ``/admin`` 开头的闲聊一个字都不记（既有"不保存正文"纪律）。"""
+
+        router, _, _, audit = _router()
+
+        router.route(open_id=ADMIN_OPEN_ID, text="今天数据怎么样", trace_id="t1")
+
+        fields = audit.records[0][1]
+        self.assertEqual(fields["reject_reason"], "not_a_command")
+        self.assertNotIn("raw_admin_text", fields)
+        self.assertNotIn("token_shapes", fields)
+        self.assertNotIn("token_count", fields)
+
+    def test_raw_admin_text_is_truncated_instead_of_unbounded(self) -> None:
+        router, _, _, audit = _router()
+        overlong = "/admin audit " + "x" * 4000
+
+        router.route(open_id=ADMIN_OPEN_ID, text=overlong, trace_id="t1")
+
+        raw = audit.records[0][1]["raw_admin_text"]
+        self.assertLess(len(raw), len(overlong))
+        self.assertTrue(raw.endswith("…[truncated]"))
+
+    def test_reply_tells_the_admin_how_many_segments_arrived(self) -> None:
+        """F4-3：管理员发的是"一个邮箱 + 24"两段，看到"实际收到 3 段"才可能自救。"""
+
+        router, _, _, _ = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f"/admin audit {self._EMAIL} (mailto:not-an-email) 24",
+            trace_id="t1",
+        )
+
+        self.assertIn("实际收到 3 段", outcome.reply_text)
+
+    def test_plain_chat_reply_stays_word_for_word_without_any_count(self) -> None:
+        router, _, _, _ = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="今天数据怎么样", trace_id="t1")
+
+        self.assertEqual(
+            outcome.reply_text, "未识别的管理命令，请发送 /admin help 查看可用命令。"
+        )
+        self.assertNotIn("实际收到", outcome.reply_text)
+
+    def test_unknown_reply_is_governed_by_the_versioned_content_catalog(self) -> None:
+        """F4-3：这两句话进了 ``config/content.toml``，审计版本随目录走。"""
+
+        router, _, _, _ = _router()
+        catalog_version = default_content_catalog().version
+
+        detailed = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin delete_user x", trace_id="t1"
+        )
+        generic = router.route(open_id=ADMIN_OPEN_ID, text="闲聊", trace_id="t2")
+
+        self.assertEqual(detailed.content_key, "admin.unknown_command_detail")
+        self.assertEqual(detailed.content_version, catalog_version)
+        self.assertEqual(generic.content_key, "admin.unknown_command")
+        self.assertEqual(generic.content_version, catalog_version)
+
+
+class MultiTokenLinkifiedCommandRoutingTests(unittest.TestCase):
+    """Trace #521 W0-1：被客户端拆成多段的邮箱，路由层要真的执行那条查询。"""
+
+    _EMAIL = "someone@example.com"
+
+    def test_anchor_shaped_email_reaches_the_same_audit_query(self) -> None:
+        anchor = f'<a href="mailto:{self._EMAIL}">{self._EMAIL}</a>'
+        router, _, queries, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin audit {anchor} 24", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(audit.actions(), ["admin.command.query_audit"])
+        self.assertEqual(
+            queries.event_calls, [{"identifier": self._EMAIL, "window_hours": 24, "limit": 20}]
+        )
+
+    def test_a_mismatched_pair_is_still_refused_at_the_router(self) -> None:
+        """fail closed 一路贯穿到路由：显示≠目标不会变成一次查询。"""
+
+        router, _, queries, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f'/admin audit <a href="mailto:{self._EMAIL}">某人</a> 24',
+            trace_id="t1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(queries.event_calls, [])
+        self.assertEqual(audit.actions(), ["admin.command.unknown"])
 
 
 if __name__ == "__main__":  # pragma: no cover

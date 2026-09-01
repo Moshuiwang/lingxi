@@ -4,12 +4,22 @@
 只读取两个 Git ref 中的两份 TOML 配置，不连接数据库、不读取生产快照、不需要凭据。
 脚本把角色→职能与公司→职能→指标的有效笛卡尔面做集合差，报告新增授予面与收缩面
 两栏；受影响用户数量必须来自绑定两份权限事实内容、影响面摘要和来源时间的纯计数证明。
-权限面为空时才由 Git diff 严格推出 0；权限面非空而没有经编排者在仓库外登记的
-biai-stage 只读聚合证明会失败关闭，绝不拿角色数、配置行数或任何内部 ID 冒充用户数。
+权限面为空时才由 Git diff 严格推出 0；权限面非空而没有 biai-stage 只读聚合声明仍然
+失败关闭，绝不拿角色数、配置行数或任何内部 ID 冒充用户数。
 
-PR 内的计数清单只能是 stage 导出声明（claim），不是可信的 stage 证据。可信链路需要一
-份不在 PR 工作树中的 hash registration；当前仓库没有受保护 stage job/artifact/attestation
-来自动提供它，所以缺 registration 时必须明确报告 PM 门，而不是把自报来源升格。
+PR 内的计数清单只能是 stage 导出声明（claim），不是可信的 stage 证据。把它升格为可信
+证据需要一份不在 PR 工作树中的 hash registration。
+
+**Issue #520 F3（rc24 正式上线批，产品负责人前置输入 D10 方案甲）**：这份仓库外
+registration 是一个**从未被实现的输入**——全仓没有任何 job 会写出
+``${RUNNER_TEMP}/permission-impact-provenance.json``，于是这道检查此前对**任何**真实
+非空权限改动都退出 1（无清单、形状错、以及完全合法的清单三种情况全部失败），真正需要
+审查的改动反而一份影响面 diff 都拿不到。现在把「必须存在 registration」降级为**可选**：
+缺失时把它记录成 ``unregistered`` 并继续产出扩权/缩权影响面 diff，数量按未验证声明
+（``unverified-claim``）如实标注。**registration 一旦真的存在，既有的全部 fail-closed
+判定原样保留**——仓库内注入、符号链接、字段/绑定不符仍然失败关闭；降级的是一个从来
+没人提供过的输入，不是对伪造证据的防护。数量可信性的补偿措施见
+``docs/技术设计/验证与门禁.md`` 的已知边界。
 """
 
 from __future__ import annotations
@@ -67,6 +77,19 @@ PROVENANCE_KEYS = frozenset(
 )
 COUNT_KEYS = frozenset({"grant", "shrink"})
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Issue #520 F3：registration 缺失时的三种登记状态。它们只描述「数量的可信度」，
+# 不影响影响面 diff 本身——diff 完全由仓库内两份静态事实推导，不需要任何外部输入。
+REGISTRATION_NOT_APPLICABLE = "not-applicable-empty-surface"
+REGISTRATION_UNREGISTERED = "unregistered"
+REGISTRATION_REGISTERED = "out-of-band-hash-registered"
+UNREGISTERED_NOTE = (
+    "仓库外 stage hash registration 缺失。该输入自登记以来从未被实现："
+    "本仓库没有任何 job 会写出 permission-impact-provenance.json。"
+    "按 Issue #520 F3（产品负责人前置输入 D10 方案甲）降级为可选："
+    "影响面 diff 照常产出并上传，受影响用户数量按未验证的 biai-stage 声明记录。"
+    "数量的可信性由 fable 独立审查与产品负责人合并前人工复核承担。"
+)
 
 SurfaceEntry = tuple[str, str, str, str]
 
@@ -649,6 +672,23 @@ def _load_external_provenance(path: Path, *, repository: Path) -> dict[str, Any]
     return _load_json_document(path)
 
 
+def load_optional_provenance(path: Path | None, *, repository: Path) -> dict[str, Any] | None:
+    """registration **缺失**时返回 None；**存在**时仍走原样的严格校验（Issue #520 F3）。
+
+    降级只针对「这个文件根本不存在」这一种情况——它是一个从未被实现的输入。只要路径
+    上真的有东西（普通文件、目录、甚至断掉的符号链接），一律交给
+    :func:`_load_external_provenance` 按原规则判定：仓库内注入、符号链接、无法解析
+    都仍然失败关闭。断链符号链接刻意用 ``is_symlink()`` 单独识别，避免
+    ``exists()`` 的 False 把一次注入尝试误读成「没提供」。
+    """
+
+    if path is None:
+        return None
+    if not path.exists() and not path.is_symlink():
+        return None
+    return _load_external_provenance(path, repository=repository)
+
+
 def _load_user_counts(path: Path) -> Mapping[str, Any]:
     return _load_json_document(path)
 
@@ -657,7 +697,8 @@ def render_report(report: Mapping[str, Any]) -> str:
     """渲染公开门禁摘要；只展示权限事实与数量，不展示用户明细。"""
 
     lines = [
-        "L3 权限影响面 diff：通过（权限事实静态；stage 数量需另有仓库外 hash registration）"
+        "L3 权限影响面 diff：通过（权限事实静态；stage 数量的仓库外 hash registration "
+        "为可选，见下方登记状态）"
     ]
     for label, key, count_key in (
         ("新增授予面（grant）", "grant", "grant_entry_count"),
@@ -687,6 +728,12 @@ def render_report(report: Mapping[str, Any]) -> str:
         lines.append(f"  provenance={source['provenance']}")
     if "registered_at" in source:
         lines.append(f"  registered_at={source['registered_at']}")
+    registration = report.get("count_registration")
+    if isinstance(registration, Mapping):
+        lines.append(f"  仓库外 registration：{registration.get('status')}")
+        note = registration.get("note")
+        if note:
+            lines.append(f"  {note}")
     return "\n".join(lines)
 
 
@@ -722,6 +769,8 @@ def run_check(
     # 先验证数量清单的事实绑定，再验证仓库外的 stage registration。这样即便 PR
     # 提交了一个看似完整的 stage JSON，缺少受控 stage 的 hash 登记也不会被 CI 采信。
     provenance: dict[str, Any] | None = None
+    registration_status = REGISTRATION_NOT_APPLICABLE
+    registration_note = ""
     if grant_surface or shrink_surface:
         if counts is None:
             # build_report 会给出同一失败语义；这里不读取任何 provenance 路径。
@@ -739,22 +788,24 @@ def run_check(
                     "非空权限影响面不能使用静态 0 或其他自报来源；"
                     "请从 biai-stage 取得聚合声明并由仓库外 registration 绑定"
                 )
-            if trusted_provenance_path is None:
-                raise CountEvidenceError(
-                    "PR 内 biai-stage 聚合只是未验证声明；缺少仓库外 hash registration。"
-                    "当前没有受保护 stage artifact/attestation，需经 PM 门补齐注入"
-                )
-            provenance_document = _load_external_provenance(
+            provenance_document = load_optional_provenance(
                 trusted_provenance_path, repository=repository
             )
-            provenance = _validate_stage_provenance(
-                provenance_document,
-                manifest=counts,
-                expected_base_facts_sha256=base_facts_sha256,
-                expected_head_facts_sha256=head_facts_sha256,
-                expected_grant_surface_sha256=_surface_digest(grant_surface),
-                expected_shrink_surface_sha256=_surface_digest(shrink_surface),
-            )
+            if provenance_document is None:
+                # Issue #520 F3：缺 registration 不再终止。影响面 diff 与计数照常产出，
+                # 数量的可信度如实降级为未验证声明，并把原因写进报告与门禁摘要。
+                registration_status = REGISTRATION_UNREGISTERED
+                registration_note = UNREGISTERED_NOTE
+            else:
+                provenance = _validate_stage_provenance(
+                    provenance_document,
+                    manifest=counts,
+                    expected_base_facts_sha256=base_facts_sha256,
+                    expected_head_facts_sha256=head_facts_sha256,
+                    expected_grant_surface_sha256=_surface_digest(grant_surface),
+                    expected_shrink_surface_sha256=_surface_digest(shrink_surface),
+                )
+                registration_status = REGISTRATION_REGISTERED
     report = build_report(
         base_roles,
         head_roles,
@@ -773,6 +824,11 @@ def run_check(
         report["affected_user_counts"]["source"]["registered_at"] = provenance[
             "registered_at"
         ]
+    # 登记状态与影响面报告一起进制品：审查者与产品负责人据此知道这次的数量是否经过
+    # 仓库外绑定，而不必去猜一个不存在的文件为什么没出现。
+    report["count_registration"] = {"status": registration_status}
+    if registration_note:
+        report["count_registration"]["note"] = registration_note
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -794,8 +850,9 @@ def main() -> int:
         "--trusted-provenance",
         type=Path,
         help=(
-            "仓库外的 biai-stage hash registration；PR 内清单只是 claim，"
-            "没有该文件时非空权限面失败关闭"
+            "仓库外的 biai-stage hash registration（可选，Issue #520 F3）；PR 内清单只是 "
+            "claim，缺该文件时降级为未验证声明并继续产出影响面 diff，"
+            "文件存在则仍按原规则严格校验"
         ),
     )
     parser.add_argument("--output", type=Path, help="可选 JSON 报告路径")

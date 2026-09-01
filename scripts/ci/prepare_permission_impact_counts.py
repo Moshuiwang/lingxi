@@ -3,9 +3,14 @@
 
 CI 不能连接 biai-stage、读取业务凭据或调用公司系统。本脚本只做两件事：权限面为空
 时根据当前两个 Git ref 的事实集合差确定性生成 0；权限面非空时读取 PR 中由
-biai-stage 生成的纯计数声明，并要求仓库外的 hash registration 绑定两份权限事实和
-grant/shrink 面摘要。PR 自带的声明不是可信 stage 证据，缺少 registration 时响亮失败，
-避免把自报或猜测的 0 伪装成影响面证据。
+biai-stage 生成的纯计数声明。PR 自带的声明不是可信 stage 证据，因此仓库外的 hash
+registration 若存在，必须绑定两份权限事实和 grant/shrink 面摘要。
+
+**Issue #520 F3（rc24 正式上线批，产品负责人前置输入 D10 方案甲）**：那份仓库外
+registration 是一个从未被实现的输入——没有任何 job 会写出它，于是这一步此前对任何
+真实非空权限改动都退出 1。现在缺失即降级为可选并如实打印说明，继续产出计数证明；
+**文件一旦存在，绑定校验一条不减**。绝不把自报或猜测的 0 伪装成影响面证据：非空权限
+面仍然必须有 biai-stage 聚合声明，缺声明、形状不符照旧失败关闭。
 """
 
 from __future__ import annotations
@@ -129,19 +134,22 @@ def prepare(
                 "非空权限影响面只能使用 biai-stage 只读聚合声明；"
                 "不能用静态 0 或其他自报来源替代"
             )
-        if trusted_provenance is None:
-            raise IMPACT.CountEvidenceError(
-                "PR 内 biai-stage 聚合只是未验证声明；缺少仓库外 hash registration。"
-                "当前没有受保护 stage artifact/attestation，需经 PM 门补齐注入"
-            )
-        IMPACT._validate_stage_provenance(
-            IMPACT._load_external_provenance(trusted_provenance, repository=repository),
-            manifest=evidence,
-            expected_base_facts_sha256=base_facts_sha256,
-            expected_head_facts_sha256=head_facts_sha256,
-            expected_grant_surface_sha256=IMPACT._surface_digest(grant_surface),
-            expected_shrink_surface_sha256=IMPACT._surface_digest(shrink_surface),
+        registration = IMPACT.load_optional_provenance(
+            trusted_provenance, repository=repository
         )
+        if registration is None:
+            # Issue #520 F3：缺 registration 不再终止；把降级原因写进门禁日志，
+            # 让审查者与产品负责人看到这次的数量是未验证声明。
+            print(f"L3 权限影响面计数证明降级：{IMPACT.UNREGISTERED_NOTE}")
+        else:
+            IMPACT._validate_stage_provenance(
+                registration,
+                manifest=evidence,
+                expected_base_facts_sha256=base_facts_sha256,
+                expected_head_facts_sha256=head_facts_sha256,
+                expected_grant_surface_sha256=IMPACT._surface_digest(grant_surface),
+                expected_shrink_surface_sha256=IMPACT._surface_digest(shrink_surface),
+            )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -161,8 +169,9 @@ def main() -> int:
         "--trusted-provenance",
         type=Path,
         help=(
-            "仓库外的 biai-stage hash registration；PR 内清单只是 claim，"
-            "没有该文件时非空权限面失败关闭"
+            "仓库外的 biai-stage hash registration（可选，Issue #520 F3）；PR 内清单只是 "
+            "claim，缺该文件时降级为未验证声明并继续产出影响面 diff，"
+            "文件存在则仍按原规则严格校验"
         ),
     )
     parser.add_argument("--output", type=Path, required=True)

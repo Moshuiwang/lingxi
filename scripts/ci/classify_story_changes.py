@@ -37,6 +37,19 @@ L3_FILES = frozenset(
 )
 CONFIG_PREFIX = "src/lingxi/config/"
 
+# Issue #520 F2（rc24 正式上线批）：**L1 轻量档当前停用，路由回完整门禁。**
+#
+# 停用理由是产品事实而不是实现细节：这三份内容资产**随镜像发布**。它们位于
+# `src/**`，会命中 `publish.yml` 的路径过滤；而走轻量档时 Epic Full 不跑 image、
+# 也不写候选证明，合入 main 之后 `verify_epic_candidate.py` 必然找不到候选而失败。
+# 换句话说「只改文案、不构建镜像」这个前提本身站不住——文案要生效必须有新镜像。
+#
+# 判定这一档的代码（``L1_FILES`` / ``is_l1`` / ``l1_changed`` 输出，以及两个工作流
+# 里的 l1 job）**原样保留**，留待上线后产品确认内容资产的发布路径，再把这个开关改回
+# True 即可重启用。在那之前 ``l1_changed`` 仍照常输出，完整门禁里的「L1 资产版本锁
+# 与术语扫描」步骤照常执行——轻量档停用不等于 L1 校验被跳过。
+L1_LIGHT_ROUTE_ENABLED = False
+
 # L2（提示词）只保留扩展位，不接线、不把任何现有路径归入这里。以后若产品批准
 # 具体事实源，应显式登记路径；在此之前 unknown/full 是安全默认。
 L2_FILES = frozenset()
@@ -121,7 +134,11 @@ def classify_detail(paths: list[str]) -> Classification:
 
     if all(is_document(path) or is_l1(path) for path in normalized):
         if l1_changed:
-            return Classification("fast", "l1", docs_changed, True, False)
+            if L1_LIGHT_ROUTE_ENABLED:
+                return Classification("fast", "l1", docs_changed, True, False)
+            # 停用期间路由到完整门禁（Issue #520 F2）。这样 image job 会跑、候选证明
+            # 会写出来，L1 资产改动合入 main 之后 Main Publish 才有候选可回读。
+            return Classification("full", "full", docs_changed, True, False)
         return Classification("docs", "l0", docs_changed, False, False)
 
     # L1 与普通源码/测试混合时仍必须执行 L1 专用校验，但沿用既有 fast 语义；

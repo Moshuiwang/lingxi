@@ -17,6 +17,8 @@ from lingxi.core.admin.commands import (
     MAX_AUDIT_WINDOW_HOURS,
     AdminCommandKind,
     AdminRejectReason,
+    _collapse_identifier_link_forms,
+    describe_admin_tokens,
     parse_admin_command,
 )
 from lingxi.core.ids import new_ulid
@@ -821,6 +823,240 @@ class RejectReasonSegmentationTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_admin_command(text).reject_reason)
+
+
+#: Trace #521 W0-1 的**多 token** 形态矩阵：显示文本与链接目标之间出现了空白，
+#: ``str.split()`` 因此把一个邮箱拆成两段以上。这一类是 2026-09-01 那次真实失败
+#: （``/admin audit <邮箱> 24`` → ``wrong_argument_count``）唯一可能的结构：
+#: ``_parse_audit`` 只在 ``len(rest) >= 3`` 时返回该原因，而三种已适配的单 token
+#: 形态实测全部解析成功、五种被拒的单 token 形态实测全部落 ``bad_identifier``。
+#:
+#: 与 :data:`_LINKIFIED_EMAIL_FORMS` 同一纪律：**公开邮箱的合成夹具，不是真实
+#: 信封的逐字节回读**。哪一种真的发生过要靠 ``admin.command.unknown`` 新增的
+#: ``token_shapes`` 取证字段在下一次复现时指认，不靠推断。
+_MULTI_TOKEN_EMAIL_FORMS: dict[str, str] = {
+    "html_anchor": f'<a href="mailto:{_PLAIN_EMAIL}">{_PLAIN_EMAIL}</a>',
+    "html_anchor_single_quote": f"<a href='mailto:{_PLAIN_EMAIL}'>{_PLAIN_EMAIL}</a>",
+    "html_anchor_extra_attribute": (
+        f'<a href="mailto:{_PLAIN_EMAIL}" target="_blank">{_PLAIN_EMAIL}</a>'
+    ),
+    "display_then_paren_mailto": f"{_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL})",
+    "display_then_paren_bare": f"{_PLAIN_EMAIL} ({_PLAIN_EMAIL})",
+    "display_then_bracket_mailto": f"{_PLAIN_EMAIL} [mailto:{_PLAIN_EMAIL}]",
+    "display_then_angle_mailto": f"{_PLAIN_EMAIL} <mailto:{_PLAIN_EMAIL}>",
+    "display_then_bare_mailto": f"{_PLAIN_EMAIL} mailto:{_PLAIN_EMAIL}",
+    "markdown_link_with_space": f"[{_PLAIN_EMAIL}] (mailto:{_PLAIN_EMAIL})",
+    "mailto_display_and_target": f"mailto:{_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL})",
+}
+
+#: 同样是多 token，但**显示文本与链接目标不是同一个邮箱**——一律不合并（fail
+#: closed）。这条边界是整个归一化能否成立的前提：合并显示≠目标的一对，等于把
+#: "管理员看到 A、系统操作 B" 变成一次成功解析。
+_REJECTED_MULTI_TOKEN_EMAIL_FORMS: dict[str, str] = {
+    "anchor_display_is_a_name": f'<a href="mailto:{_PLAIN_EMAIL}">某人</a>',
+    "anchor_target_is_http": f'<a href="https://example.com/u">{_PLAIN_EMAIL}</a>',
+    "display_and_target_differ": f"seen@example.com (mailto:{_PLAIN_EMAIL})",
+    "target_is_http_link": f"{_PLAIN_EMAIL} (https://example.com/{_PLAIN_EMAIL})",
+    "target_is_open_id": f"{_PLAIN_EMAIL} (mailto:ou_abc123)",
+    "display_is_open_id": f"ou_abc123 (mailto:ou_abc123)",
+    "target_is_not_an_email": f"{_PLAIN_EMAIL} (mailto:not-an-email)",
+}
+
+
+class MultiTokenLinkifiedIdentifierTests(unittest.TestCase):
+    """Trace #521 W0-1/F4-2：显示文本与链接目标被拆成多段时也要认得出来。
+
+    #492 的 S-4 只处理了**单 token** 的 ``mailto`` 形态，结构上覆盖不到"一个邮箱
+    占了两段"的输入；2026-09-01 那次真实失败落的正是 ``wrong_argument_count``，
+    与 S-4 适配的三种形态无关（那三种实测全部解析成功）。
+    """
+
+    def test_every_multi_token_form_parses_on_every_email_taking_command(self) -> None:
+        for form_name, identifier in _MULTI_TOKEN_EMAIL_FORMS.items():
+            for command_name, (template, kind) in _EMAIL_TAKING_COMMANDS.items():
+                with self.subTest(form=form_name, command=command_name):
+                    command = parse_admin_command(template.format(identifier=identifier))
+                    self.assertEqual(command.kind, kind)
+                    self.assertEqual(command.identifier, _PLAIN_EMAIL)
+                    self.assertIsNone(command.reject_reason)
+
+    def test_the_observed_failure_shape_now_resolves_to_the_same_query(self) -> None:
+        """真实失败的等价复现：``/admin audit <锚点形态邮箱> 24``。
+
+        修复前这条输入被切成三段参数 → ``wrong_argument_count``；修复后与管理员
+        原样键入裸邮箱**逐字段相同**。
+        """
+
+        anchor = f'<a href="mailto:{_PLAIN_EMAIL}">{_PLAIN_EMAIL}</a>'
+
+        command = parse_admin_command(f"/admin audit {anchor} 24")
+
+        self.assertEqual(command, parse_admin_command(f"/admin audit {_PLAIN_EMAIL} 24"))
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_AUDIT)
+        self.assertEqual(command.identifier, _PLAIN_EMAIL)
+        self.assertEqual(command.window_hours, 24)
+
+    def test_display_and_target_must_be_the_same_email(self) -> None:
+        """fail closed：显示≠目标一律不合并，也就不可能被当成目标标识执行。"""
+
+        for form_name, identifier in _REJECTED_MULTI_TOKEN_EMAIL_FORMS.items():
+            with self.subTest(form=form_name):
+                command = parse_admin_command(f"/admin user {identifier}")
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertIsNone(command.identifier)
+
+    def test_a_mismatched_pair_never_leaks_either_side_as_the_identifier(self) -> None:
+        """否定断言：既不能拿显示文本当标识，也不能拿链接目标当标识。"""
+
+        command = parse_admin_command(
+            f"/admin user seen@example.com (mailto:{_PLAIN_EMAIL})"
+        )
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertIsNone(command.identifier)
+
+
+class CollapseDoesNotChangeAnythingThatAlreadyParsedTests(unittest.TestCase):
+    """不误伤（F4-4）：归一化只在**原样解析失败**时才启用。
+
+    因此"原本能解析成功的输入"这一整类的行为逐字节不变——这不是靠逐条枚举证明的
+    偶然性质，而是 :func:`parse_admin_command` 的结构性质，本组用例把它钉死。
+    """
+
+    #: 一组原本就能解析成功的输入，覆盖每一种命令形状。
+    _ALREADY_PARSING = (
+        "/admin help",
+        f"/admin user {_PLAIN_EMAIL}",
+        "/admin user ou_abc123",
+        f"/admin audit {_PLAIN_EMAIL} 24",
+        "/admin audit 24",
+        "/admin audit",
+        f"/admin suspend {_PLAIN_EMAIL}",
+        f"/admin resume {_PLAIN_EMAIL}",
+        f"/admin grant_permission {_PLAIN_EMAIL} 1011 daily_active 特批 授权",
+        f"/admin suppress_permission {_PLAIN_EMAIL} 1011 daily_active 屏蔽 指标",
+        f"/admin grant_position {_PLAIN_EMAIL} 数据分析师 * 职位授权",
+        f"/admin revoke_permission {_PLAIN_EMAIL} 1011 daily_active 撤销 覆盖",
+    )
+
+    def test_successful_parses_are_unchanged_by_the_new_normalization(self) -> None:
+        for text in self._ALREADY_PARSING:
+            with self.subTest(text=text):
+                command = parse_admin_command(text)
+                self.assertNotEqual(command.kind, AdminCommandKind.UNKNOWN)
+                # 归一化对这些输入必须是恒等变换（它们压根不会进入归一化）。
+                self.assertEqual(_collapse_identifier_link_forms(text), text)
+
+    def test_plain_chat_is_never_normalized_and_keeps_the_generic_failure(self) -> None:
+        """闲聊连 ``/admin`` 前缀都没有：第一步就返回 ``NOT_A_COMMAND``。"""
+
+        for text in (
+            "不知道说什么",
+            f"帮我看看 {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL}) 的权限",
+            "今天的数据 <a href=\"mailto:a@b.com\">a@b.com</a> 有问题吗",
+        ):
+            with self.subTest(text=text):
+                command = parse_admin_command(text)
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertEqual(command.reject_reason, AdminRejectReason.NOT_A_COMMAND)
+
+    def test_non_email_at_shaped_input_is_never_rewritten(self) -> None:
+        """含非邮箱 ``@`` 的输入（飞书 at 标记、``@全体``、``@1``）行为不变。
+
+        归一化只认"两侧都是同一个邮箱"的一对，因此这些输入连改写都不会发生——
+        断言写成"归一化是恒等变换 + 结论与既有逐字相同"，比只断言某个失败枚举更
+        贴近"不误伤"这条承诺本身。``@1`` 一直是合法标识形状（``_IDENTIFIER_
+        PATTERN`` 允许 ``@``），它本来就解析成功，这里同样必须保持成功。
+        """
+
+        for text, expected_kind, expected_reason in (
+            (
+                '/admin user <at user_id="all"></at>',
+                AdminCommandKind.UNKNOWN,
+                AdminRejectReason.WRONG_ARGUMENT_COUNT,
+            ),
+            ("/admin user @所有人", AdminCommandKind.UNKNOWN, AdminRejectReason.BAD_IDENTIFIER),
+            ("/admin audit @1 24", AdminCommandKind.QUERY_AUDIT, None),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_collapse_identifier_link_forms(text), text)
+                command = parse_admin_command(text)
+                self.assertEqual(command.kind, expected_kind)
+                self.assertEqual(command.reject_reason, expected_reason)
+
+    def test_a_genuinely_unknown_command_keeps_its_original_failure_reason(self) -> None:
+        """归一化救不回来时返回**原样解析**的失败原因，不换一个更迷惑的落点。"""
+
+        command = parse_admin_command(
+            f"/admin delete_user {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL})"
+        )
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.UNKNOWN_SUBCOMMAND)
+
+    def test_too_many_real_arguments_still_reports_wrong_argument_count(self) -> None:
+        """管理员真的多打了一个参数时，仍然是"参数个数不对"，不被归一化掩盖。"""
+
+        command = parse_admin_command(f"/admin audit {_PLAIN_EMAIL} 24 48")
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.WRONG_ARGUMENT_COUNT)
+
+
+class AdminTokenShapeForensicsTests(unittest.TestCase):
+    """Trace #521 F4-1：``admin.command.unknown`` 的形状取证字段。
+
+    #492 的调查卡在"一条 ``wrong_argument_count`` 只留下一个枚举名"——"客户端把
+    邮箱拆成两段"和"管理员真的多打一个参数"产生逐字相同的审计。形状画像让下一次
+    复现可以被**指认**，不必再靠推理排除。
+    """
+
+    def test_shapes_describe_the_anchor_form_without_any_input_text(self) -> None:
+        anchor = f'<a href="mailto:{_PLAIN_EMAIL}">{_PLAIN_EMAIL}</a>'
+
+        described = describe_admin_tokens(f"/admin audit {anchor} 24")
+
+        self.assertTrue(described.is_admin_prefixed)
+        self.assertEqual(described.argument_count, 3)
+        self.assertEqual(
+            described.shapes,
+            ("admin_prefix", "bare_word", "html_anchor_open", "html_href_attribute", "digits"),
+        )
+        # 否定断言：形状串里没有任何一段输入原文。
+        self.assertNotIn(_PLAIN_EMAIL, described.shape_summary)
+        self.assertNotIn("example.com", described.shape_summary)
+        self.assertNotIn("mailto", described.shape_summary)
+
+    def test_shapes_separate_the_two_competing_hypotheses(self) -> None:
+        """同一条 ``wrong_argument_count``，两种成因的形状串必须不同。"""
+
+        split_by_client = describe_admin_tokens(
+            f"/admin audit {_PLAIN_EMAIL} (mailto:{_PLAIN_EMAIL}) 24"
+        )
+        typed_by_admin = describe_admin_tokens(f"/admin audit {_PLAIN_EMAIL} 24 48")
+
+        self.assertEqual(split_by_client.argument_count, typed_by_admin.argument_count)
+        self.assertNotEqual(split_by_client.shapes, typed_by_admin.shapes)
+        self.assertEqual(
+            split_by_client.shapes,
+            ("admin_prefix", "bare_word", "email", "paren_wrapped", "digits"),
+        )
+        self.assertEqual(
+            typed_by_admin.shapes,
+            ("admin_prefix", "bare_word", "email", "digits", "digits"),
+        )
+
+    def test_non_admin_text_is_flagged_so_no_forensics_are_recorded(self) -> None:
+        described = describe_admin_tokens("今天的日报呢")
+
+        self.assertFalse(described.is_admin_prefixed)
+
+    def test_non_string_input_is_handled_without_raising(self) -> None:
+        described = describe_admin_tokens(None)
+
+        self.assertFalse(described.is_admin_prefixed)
+        self.assertEqual(described.shapes, ())
+        self.assertEqual(described.argument_count, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
