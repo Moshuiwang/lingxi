@@ -44,13 +44,21 @@ L2_PREFIXES = ()
 
 
 class Classification:
-    """兼容旧 docs/fast/full 的同时，暴露 Issue #498 的风险路由事实。"""
+    """兼容旧 docs/fast/full，同时暴露风险与独立文档改动事实。"""
 
-    __slots__ = ("mode", "risk_level", "l1_changed", "l3_changed")
+    __slots__ = ("mode", "risk_level", "docs_changed", "l1_changed", "l3_changed")
 
-    def __init__(self, mode: str, risk_level: str, l1_changed: bool, l3_changed: bool) -> None:
+    def __init__(
+        self,
+        mode: str,
+        risk_level: str,
+        docs_changed: bool,
+        l1_changed: bool,
+        l3_changed: bool,
+    ) -> None:
         self.mode = mode
         self.risk_level = risk_level
+        self.docs_changed = docs_changed
         self.l1_changed = l1_changed
         self.l3_changed = l3_changed
 
@@ -82,19 +90,20 @@ def classify_detail(paths: list[str]) -> Classification:
 
     normalized = normalized_paths(paths)
     if not normalized:
-        return Classification("full", "full", False, False)
+        return Classification("full", "full", False, False, False)
 
+    docs_changed = any(is_document(path) for path in normalized)
     l1_changed = any(is_l1(path) for path in normalized)
     l3_changed = any(is_l3(path) for path in normalized)
 
     # 权限配置是最重等级，和任何其他改动混合时也不能降级。
     if l3_changed:
-        return Classification("full", "l3", l1_changed, True)
+        return Classification("full", "l3", docs_changed, l1_changed, True)
 
     # L2 目前没有接线；若未来登记路径，先安全地复用完整门禁，避免形成未批准的
     # 「提示词快检」假门。产品批准后再单独实现其合同。
     if any(is_l2(path) for path in normalized):
-        return Classification("full", "l2", l1_changed, False)
+        return Classification("full", "l2", docs_changed, l1_changed, False)
 
     # 配置目录里除上述白名单外的任何文件都可能改变用户体验、权限或事实源；不能
     # 因为它也位于 src/ 而沿用普通代码 fast。这个分支刻意早于 is_fast()。
@@ -105,22 +114,22 @@ def classify_detail(paths: list[str]) -> Classification:
         and not is_l2(path)
         for path in normalized
     ):
-        return Classification("full", "full", l1_changed, False)
+        return Classification("full", "full", docs_changed, l1_changed, False)
 
     if any(is_full(path) for path in normalized):
-        return Classification("full", "full", l1_changed, False)
+        return Classification("full", "full", docs_changed, l1_changed, False)
 
     if all(is_document(path) or is_l1(path) for path in normalized):
         if l1_changed:
-            return Classification("fast", "l1", True, False)
-        return Classification("docs", "l0", False, False)
+            return Classification("fast", "l1", docs_changed, True, False)
+        return Classification("docs", "l0", docs_changed, False, False)
 
     # L1 与普通源码/测试混合时仍必须执行 L1 专用校验，但沿用既有 fast 语义；
     # 这样文案旁边的安全代码变更不会偷偷省掉版本锁或术语扫描。
     if all(is_document(path) or is_fast(path) or is_l1(path) for path in normalized):
-        return Classification("fast", "fast", l1_changed, False)
+        return Classification("fast", "fast", docs_changed, l1_changed, False)
 
-    return Classification("full", "full", l1_changed, False)
+    return Classification("full", "full", docs_changed, l1_changed, False)
 
 # scripts/ci/ 整目录默认提级到完整门禁，但其中已知的纯数据文件不含可执行逻辑、
 # 不改变门禁脚本本身的判定行为，因此显式登记后单独按 fast 处理（Issue #298）。
@@ -183,6 +192,7 @@ def write_output(destination: Path, classification: Classification, paths: list[
     with destination.open("a", encoding="utf-8") as output:
         output.write(f"mode={classification.mode}\n")
         output.write(f"risk_level={classification.risk_level}\n")
+        output.write(f"docs_changed={'true' if classification.docs_changed else 'false'}\n")
         output.write(f"l1_changed={'true' if classification.l1_changed else 'false'}\n")
         output.write(f"l3_changed={'true' if classification.l3_changed else 'false'}\n")
         output.write(f"worker_changed={'true' if worker_changed else 'false'}\n")

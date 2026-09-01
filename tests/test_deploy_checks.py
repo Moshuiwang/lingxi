@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -925,9 +927,11 @@ class PublishJobGuardTest(unittest.TestCase):
           workflow_call:
         jobs:
           classify:
+            outputs:
+              docs_changed: ${{ steps.changes.outputs.docs_changed }}
           docs:
             name: Epic Full / docs
-            if: needs.classify.outputs.mode == 'docs'
+            if: needs.classify.outputs.docs_changed == 'true'
             steps:
               - run: scripts/ci/verify_docs.sh
           l1:
@@ -938,8 +942,14 @@ class PublishJobGuardTest(unittest.TestCase):
           gate:
             if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
             steps:
-              - if: needs.classify.outputs.risk_level == 'l3'
-                run: python3 scripts/ci/check_permission_impact.py
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                run: python3 scripts/ci/prepare_permission_impact_counts.py --trusted-provenance permission-impact-provenance
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                run: python3 scripts/ci/check_permission_impact.py --user-counts --trusted-provenance permission-impact-provenance
+              - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
+                uses: actions/upload-artifact@sha
+                with:
+                  name: permission-impact-pr-1-abc
           extras:
             strategy:
               matrix:
@@ -952,6 +962,7 @@ class PublishJobGuardTest(unittest.TestCase):
                 with:
                   name: epic-candidate-images-pr-1-abc
           candidate:
+            if: needs.classify.outputs.mode == 'docs'
             needs: [classify, docs, l1, gate, extras, image]
             steps:
               - run: python3 scripts/ci/write_epic_candidate.py
@@ -964,9 +975,12 @@ class PublishJobGuardTest(unittest.TestCase):
             branches: ['epic/**']
         jobs:
           classify:
+            outputs:
+              docs_changed: ${{ steps.changes.outputs.docs_changed }}
             steps:
               - run: python3 scripts/ci/classify_story_changes.py
           docs:
+            if: needs.classify.outputs.docs_changed == 'true'
             steps:
               - run: scripts/ci/verify_docs.sh
           l1:
@@ -1033,6 +1047,25 @@ class PublishJobGuardTest(unittest.TestCase):
         failures = self._with_workflows()
         self.assertEqual(failures, [])
 
+    def test_docs_gate_mutation_cannot_hide_docs_plus_l1(self) -> None:
+        """变异验红：恢复只看 mode=docs 会让 docs+L1 混合改动绕过文档门禁。"""
+
+        full = self.FULL.replace(
+            "if: needs.classify.outputs.docs_changed == 'true'",
+            "if: needs.classify.outputs.mode == 'docs'",
+            1,
+        )
+        story = self.STORY.replace(
+            "if: needs.classify.outputs.docs_changed == 'true'",
+            "if: needs.classify.outputs.mode == 'docs'",
+            1,
+        )
+        failures = self._with_workflows(full=full, story=story)
+        self.assertTrue(
+            any("docs job 必须以 docs_changed=true" in failure for failure in failures),
+            failures,
+        )
+
     def test_repeating_full_gate_on_main_is_caught(self) -> None:
         publish = self.PUBLISH.replace(
             "- run: python3 scripts/ci/verify_epic_candidate.py",
@@ -1076,6 +1109,212 @@ class PublishJobGuardTest(unittest.TestCase):
             any("write_epic_candidate_images.py" in failure for failure in failures), failures
         )
 
+
+class CandidateSummaryRoutingTest(unittest.TestCase):
+    """候选汇总只接受实际运行或由上游 Story 明确覆盖的门禁。"""
+
+    @staticmethod
+    def _summary_script(workflow: str) -> str:
+        step = "      - name: 确认完整门禁全部通过\n"
+        start = workflow.index(step)
+        run = "        run: |\n"
+        body_start = workflow.index(run, start) + len(run)
+        body_end = workflow.index(
+            "\n      # 三步都额外要求 image 真正 success", body_start
+        )
+        return textwrap.dedent(workflow[body_start:body_end]).strip() + "\n"
+
+    @staticmethod
+    def _run_summary(workflow: str, **overrides: str) -> subprocess.CompletedProcess[str]:
+        values = {
+            "EVENT_NAME": "pull_request",
+            "BASE_REF": "main",
+            "HEAD_REF": "feature/test",
+            "RUN_ATTEMPT": "1",
+            "MODE": "full",
+            "RISK_LEVEL": "full",
+            "DOCS_CHANGED": "false",
+            "CLASSIFY_RESULT": "success",
+            "DOCS_RESULT": "skipped",
+            "L1_RESULT": "skipped",
+            "GATE_RESULT": "success",
+            "EXTRAS_RESULT": "success",
+            "IMAGE_RESULT": "success",
+        }
+        values.update(overrides)
+        environment = dict(os.environ)
+        environment.update(values)
+        return subprocess.run(
+            [
+                "bash",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                CandidateSummaryRoutingTest._summary_script(workflow),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_docs_and_l1_summary_matrix(self) -> None:
+        workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        cases = [
+            (
+                "epic caller owns docs",
+                {
+                    "BASE_REF": "epic/rc23",
+                    "HEAD_REF": "codex/rc23-review-fixpack",
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "main docs success",
+                {"DOCS_CHANGED": "true", "DOCS_RESULT": "success"},
+                True,
+            ),
+            (
+                "main docs skipped",
+                {"DOCS_CHANGED": "true", "DOCS_RESULT": "skipped"},
+                False,
+            ),
+            (
+                "main docs failed",
+                {"DOCS_CHANGED": "true", "DOCS_RESULT": "failure"},
+                False,
+            ),
+            (
+                "epic docs unexpectedly failed",
+                {
+                    "BASE_REF": "epic/rc23",
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "failure",
+                },
+                False,
+            ),
+            (
+                "unrecognised non-main skipped",
+                {"BASE_REF": "release/rc23", "DOCS_CHANGED": "true"},
+                False,
+            ),
+            (
+                "main l1 success",
+                {
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "success",
+                    "RISK_LEVEL": "l1",
+                    "MODE": "fast",
+                    "L1_RESULT": "success",
+                    "GATE_RESULT": "skipped",
+                    "EXTRAS_RESULT": "skipped",
+                    "IMAGE_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "main l1 skipped",
+                {
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "success",
+                    "RISK_LEVEL": "l1",
+                    "MODE": "fast",
+                    "L1_RESULT": "skipped",
+                    "GATE_RESULT": "skipped",
+                    "EXTRAS_RESULT": "skipped",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+        ]
+        for label, environment, expected in cases:
+            with self.subTest(label=label):
+                result = self._run_summary(workflow, **environment)
+                self.assertEqual(
+                    result.returncode == 0,
+                    expected,
+                    result.stdout + result.stderr,
+                )
+
+    def test_full_and_image_candidate_summary_matrix(self) -> None:
+        workflow = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        cases = [
+            (
+                "main full image candidate",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "epic/rc23",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "success",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "success",
+                },
+                True,
+            ),
+            (
+                "main full image missing",
+                {
+                    "BASE_REF": "main",
+                    "DOCS_CHANGED": "true",
+                    "DOCS_RESULT": "success",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+            (
+                "workflow dispatch keeps non-PR full path",
+                {
+                    "EVENT_NAME": "workflow_dispatch",
+                    "CLASSIFY_RESULT": "skipped",
+                    "DOCS_RESULT": "skipped",
+                    "L1_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "success",
+                },
+                True,
+            ),
+            (
+                "epic synchronize may skip image",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "epic/rc23",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "success",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                True,
+            ),
+            (
+                "epic synchronize gate failure",
+                {
+                    "BASE_REF": "main",
+                    "HEAD_REF": "epic/rc23",
+                    "RUN_ATTEMPT": "1",
+                    "DOCS_CHANGED": "false",
+                    "DOCS_RESULT": "skipped",
+                    "GATE_RESULT": "failure",
+                    "EXTRAS_RESULT": "success",
+                    "IMAGE_RESULT": "skipped",
+                },
+                False,
+            ),
+        ]
+        for label, environment, expected in cases:
+            with self.subTest(label=label):
+                result = self._run_summary(workflow, **environment)
+                self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 
 class RealWorkflowTest(unittest.TestCase):
     """真实 ci.yml 的两腿构建必须走同一条路径（验收微验 P1）。
@@ -1126,6 +1365,16 @@ class RealWorkflowTest(unittest.TestCase):
             "否则构建参数会在两腿之间漂移（来源标签就是这么漂的）",
         )
         self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
+
+    def test_permission_impact_ci_requires_external_registration_without_new_privilege(self) -> None:
+        """P2：PR claim 不能独自成为 stage 证据，且当前不偷偷申请新权限。"""
+
+        text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        self.assertIn("--trusted-provenance", text)
+        self.assertIn("permission-impact-provenance.json", text)
+        self.assertIn("PR 内的 `.github/permission-impact-counts.json` 只是", text)
+        self.assertNotIn("id-token: write", text)
+        self.assertNotIn("actions/attest-build-provenance", text)
 
 
 class DatabaseTimeoutTest(unittest.TestCase):

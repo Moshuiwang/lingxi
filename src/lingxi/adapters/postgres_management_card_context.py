@@ -1,30 +1,39 @@
 """管理卡上下文的 PostgreSQL 持久适配器（#493）。
 
-管理卡的 message/card 关联和整卡 sequence 必须跨 gateway 重启保留。该模块只负责
-参数化 SQL 与事务边界；读取保留到期上下文交给调用层做惰性关闭，不能启动后台扫描。
+管理卡的 message/card 关联、整卡 sequence 和视觉恢复水位必须跨 gateway 重启保留。
+该模块只负责参数化 SQL 与事务边界；读取保留到期上下文交给调用层做惰性关闭，
+gateway 的 needs_refresh scanner 只重试已落库状态的 CardKit 更新，不主动清扫到期行。
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
-from lingxi.core.admin.card_dispatch import ManagementCardContext
+from lingxi.core.admin.card_dispatch import (
+    MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
+    ManagementCardContext,
+    bounded_management_card_deadline,
+    bounded_management_card_ttl_seconds,
+)
 
 
 # 内部缓存保留窗口，不对管理员承诺；用户可见的确认窗口仍由 pending_action 的
 # 产品合同控制。它只避免永久保留消息映射，具体值可随部署配置调整。
-_INTERNAL_CONTEXT_TTL_SECONDS = 1800.0
+_INTERNAL_CONTEXT_TTL_SECONDS = MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS
 
 _SELECT_COLUMNS = (
     "message_id, card_id, identifier, chat_id, initiated_by_open_id, card_sequence,"
+    " state_version,"
     " snapshot_fingerprint, context_deadline_at, state, dispatch_status, last_trace_id,"
-    " daily_correction_reported_at"
+    " daily_correction_reported_at, daily_correction_pending, needs_refresh, visual_sequence"
 )
 
 _INSERT_COLUMNS = (
     "message_id, card_id, identifier, chat_id, initiated_by_open_id, card_sequence,"
-    " snapshot_fingerprint, context_deadline_at, state, dispatch_status, last_trace_id"
+    " state_version,"
+    " snapshot_fingerprint, context_deadline_at, state, dispatch_status, last_trace_id,"
+    " needs_refresh, visual_sequence"
 )
 
 
@@ -36,12 +45,16 @@ def _row_to_context(row: tuple) -> ManagementCardContext:
         chat_id=row[3],
         initiated_by_open_id=row[4],
         card_sequence=int(row[5]),
-        snapshot_fingerprint=row[6],
-        context_deadline_at=row[7],
-        state=row[8],
-        dispatch_status=row[9],
-        last_trace_id=row[10],
-        daily_correction_reported_at=row[11],
+        state_version=int(row[6]),
+        snapshot_fingerprint=row[7],
+        context_deadline_at=row[8],
+        state=row[9],
+        dispatch_status=row[10],
+        last_trace_id=row[11],
+        daily_correction_reported_at=row[12],
+        daily_correction_pending=bool(row[13]),
+        needs_refresh=bool(row[14]),
+        visual_sequence=int(row[15]),
     )
 
 
@@ -57,7 +70,7 @@ class PostgresManagementCardContextStore:
     ) -> None:
         self._dsn = dsn
         self._timeouts = timeouts
-        self._ttl_seconds = ttl_seconds
+        self._ttl_seconds = bounded_management_card_ttl_seconds(ttl_seconds)
 
     def remember(
         self,
@@ -69,6 +82,7 @@ class PostgresManagementCardContextStore:
         initiated_by_open_id: str,
         snapshot_fingerprint: str,
         card_sequence: int = 2,
+        state_version: int = 1,
         context_deadline_at: datetime | None = None,
         state: str = "ready",
         dispatch_status: str = "idle",
@@ -76,15 +90,17 @@ class PostgresManagementCardContextStore:
     ) -> None:
         if not all((message_id, identifier, card_id, chat_id, initiated_by_open_id, snapshot_fingerprint)):
             raise ValueError("管理卡持久上下文缺少必填字段")
-        deadline = context_deadline_at or (
-            datetime.now(timezone.utc) + timedelta(seconds=self._ttl_seconds)
+        deadline = bounded_management_card_deadline(
+            now=datetime.now(timezone.utc),
+            requested=context_deadline_at,
+            ttl_seconds=self._ttl_seconds,
         )
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"""
                 INSERT INTO management_card_context
                     ({_INSERT_COLUMNS})
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s)
                 ON CONFLICT (message_id) DO UPDATE SET
                     -- A retry/replay must never move a persisted card backwards.
                     -- ``next_card_sequence`` is the normal update path; keeping
@@ -95,6 +111,14 @@ class PostgresManagementCardContextStore:
                         management_card_context.card_sequence,
                         EXCLUDED.card_sequence
                     ),
+                    state_version = GREATEST(
+                        management_card_context.state_version,
+                        EXCLUDED.state_version
+                    ),
+                    visual_sequence = GREATEST(
+                        management_card_context.visual_sequence,
+                        EXCLUDED.visual_sequence
+                    ),
                     updated_at = now()
                 """,
                 (
@@ -104,11 +128,13 @@ class PostgresManagementCardContextStore:
                     chat_id,
                     initiated_by_open_id,
                     max(1, int(card_sequence)),
+                    max(1, int(state_version)),
                     snapshot_fingerprint,
                     deadline,
                     state,
                     dispatch_status,
                     last_trace_id,
+                    max(1, int(card_sequence)),
                 ),
             )
 
@@ -123,7 +149,7 @@ class PostgresManagementCardContextStore:
 
         管理卡回调需要在惰性路径上把旧实体刷新为不可操作状态，因此这里不在 SQL
         层过滤 deadline；严格的 ``lookup()`` 仍会把到期项当作未命中。数据库保留由
-        后续显式清理策略负责，当前不启动后台扫描。
+            后续显式清理策略负责；needs_refresh scanner 不会清理这些上下文。
         """
 
         if not message_id:
@@ -137,17 +163,47 @@ class PostgresManagementCardContextStore:
             row = cursor.fetchone()
         return _row_to_context(row) if row is not None else None
 
-    def next_card_sequence(self, *, message_id: str) -> int:
+    def next_card_sequence(
+        self,
+        *,
+        message_id: str,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> int | None:
+        """原子领取下一条 CardKit 序号，并可按 scanner 快照做 CAS。
+
+        恢复路径必须传入它读取的状态代数和 CardKit 序号。任一期望值不匹配
+        都返回 ``None``，不消耗序号；未传期望值时保留旧调用方的无条件递增
+        兼容姿态，未知消息仍抛 ``KeyError``。
+        """
+
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
+        conditions = ["message_id = %(message_id)s"]
+        parameters: dict[str, object] = {"message_id": message_id}
+        if expected_state_version is not None:
+            conditions.append("state_version = %(expected_state_version)s")
+            parameters["expected_state_version"] = expected_state_version
+        if expected_card_sequence is not None:
+            conditions.append("card_sequence = %(expected_card_sequence)s")
+            parameters["expected_card_sequence"] = expected_card_sequence
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE management_card_context"
                 " SET card_sequence = card_sequence + 1, updated_at = now()"
-                " WHERE message_id = %s"
-                " RETURNING card_sequence",
-                (message_id,),
+                " WHERE " + " AND ".join(conditions) + " RETURNING card_sequence",
+                parameters,
             )
             row = cursor.fetchone()
         if row is None:
+            if expected_state_version is not None or expected_card_sequence is not None:
+                return None
             raise KeyError(message_id)
         return int(row[0])
 
@@ -173,12 +229,27 @@ class PostgresManagementCardContextStore:
                 values.append(value)
         if state == "effective":
             # 即时成功（旧状态为 dispatching/submitted）不应被当成每日批补齐；
-            # 但若旧状态已经是 incomplete，则保留 NULL，交给汇总发送逻辑置水位。
+            # 即使旧状态已经是 incomplete，迟到的 instant outbox 成功也不具备每日批
+            # 资格；只有 settle_published_contexts 识别到 daily reason 时才重新置为待
+            # 汇总水位。若该水位已经由 daily settle 置上，后来的迟到 instant 成功
+            # 不能把真实的每日批补齐事实抹掉。
             assignments.append(
-                "daily_correction_reported_at = CASE "
-                "WHEN state = 'incomplete' THEN daily_correction_reported_at "
-                "ELSE COALESCE(daily_correction_reported_at, now()) END"
+                "daily_correction_reported_at = CASE"
+                " WHEN daily_correction_pending THEN daily_correction_reported_at"
+                " ELSE COALESCE(daily_correction_reported_at, now()) END"
             )
+        # ``incomplete`` 只表示即时路径未在观察窗口内完成，不是 daily batch 已经
+        # 修复的证据；daily_correction_pending 只能由 settle_published_contexts 置位。
+        if any(
+            value is not None
+            for value in (state, dispatch_status, snapshot_fingerprint, last_trace_id)
+        ):
+            # 状态写入和视觉恢复必须属于同一条单调版本链。若 scanner 已经取出旧
+            # 快照，随后有新的状态落库，版本抬高后旧回写只能留下 needs_refresh，
+            # 不能把新状态误标为已交付。
+            assignments.append("card_sequence = card_sequence + 1")
+            assignments.append("state_version = state_version + 1")
+            assignments.append("needs_refresh = TRUE")
         if not assignments:
             return self.lookup_context(message_id=message_id)
         values.append(message_id)
@@ -193,6 +264,71 @@ class PostgresManagementCardContextStore:
             )
             row = cursor.fetchone()
         return _row_to_context(row) if row is not None else None
+
+    def list_needing_refresh(self, *, limit: int = 20) -> tuple[ManagementCardContext, ...]:
+        """列出数据库状态已改变但尚未被 CardKit 成功回写的管理卡。"""
+
+        if limit < 1:
+            return ()
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {_SELECT_COLUMNS} FROM management_card_context"
+                " WHERE needs_refresh = TRUE ORDER BY updated_at, message_id LIMIT %s",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+        return tuple(_row_to_context(row) for row in rows)
+
+    def mark_visual_refreshed(
+        self,
+        *,
+        message_id: str,
+        sequence: int,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool:
+        """仅在 CardKit update 成功后推进视觉水位，并按快照版本做 CAS。
+
+        ``expected_state_version`` 防止旧状态清掉新状态；``expected_card_sequence``
+        防止两个恢复者为同一状态分别领号后，较旧视觉覆盖/清掉较新的序号。未传
+        期望值时保留旧适配器调用的单调序号姿态。
+        """
+
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("sequence 必须是正整数")
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
+        conditions = [
+            "message_id = %(message_id)s",
+            "%(sequence)s >= visual_sequence",
+        ]
+        parameters: dict[str, object] = {
+            "message_id": message_id,
+            "sequence": sequence,
+        }
+        if expected_state_version is not None:
+            conditions.append("state_version = %(expected_state_version)s")
+            parameters["expected_state_version"] = expected_state_version
+        if expected_card_sequence is not None:
+            conditions.append("card_sequence = %(expected_card_sequence)s")
+            parameters["expected_card_sequence"] = expected_card_sequence
+
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE management_card_context"
+                " SET visual_sequence = GREATEST(visual_sequence, %(sequence)s),"
+                "     needs_refresh = CASE WHEN card_sequence <= %(sequence)s THEN FALSE ELSE TRUE END,"
+                "     updated_at = now()"
+                " WHERE " + " AND ".join(conditions),
+                parameters,
+            )
+            return cursor.rowcount == 1
 
     def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
         """读取管理卡关联操作对应的最新权限发布状态。
@@ -242,10 +378,11 @@ class PostgresManagementCardContextStore:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                WITH candidates AS (
+                WITH latest_published AS (
                     SELECT DISTINCT ON (c.message_id)
                            c.message_id,
-                           c.state AS previous_state
+                           c.state AS previous_state,
+                           o.reason
                       FROM management_card_context c
                       JOIN pending_action pa
                         ON pa.origin_card_message_id = c.message_id
@@ -258,6 +395,7 @@ class PostgresManagementCardContextStore:
                        AND pa.decided_at IS NOT NULL
                        AND o.status = 'published'
                        AND o.published_at IS NOT NULL
+                       AND o.created_at >= pa.decided_at
                        AND o.published_at >= pa.decided_at
                        AND o.reason IN (
                            'admin_action_instant_recompute',
@@ -266,31 +404,56 @@ class PostgresManagementCardContextStore:
                            'daily_permission_revoke'
                        )
                      ORDER BY c.message_id, o.permission_version DESC,
-                              o.published_at DESC, o.id DESC
+                              o.published_at DESC, o.created_at DESC, o.id DESC
+                ), candidates AS (
+                    SELECT message_id,
+                           previous_state,
+                           (reason IN (
+                               'daily_permission_refresh',
+                               'daily_permission_revoke'
+                           )) AS daily_batch_published
+                      FROM latest_published
                 ), updated AS (
                     UPDATE management_card_context c
                        SET state = 'effective',
                            dispatch_status = 'effective',
+                           card_sequence = c.card_sequence + 1,
+                           state_version = c.state_version + 1,
+                           needs_refresh = TRUE,
                            daily_correction_reported_at = CASE
-                               WHEN candidates.previous_state = 'incomplete' THEN NULL
+                               WHEN candidates.previous_state = 'incomplete'
+                                    AND candidates.daily_batch_published THEN NULL
                                ELSE COALESCE(c.daily_correction_reported_at, now())
                            END,
+                           daily_correction_pending = (
+                               candidates.previous_state = 'incomplete'
+                               AND candidates.daily_batch_published
+                           ),
                            updated_at = now()
                       FROM candidates
                      WHERE c.message_id = candidates.message_id
-                    RETURNING c.message_id, candidates.previous_state
+                    RETURNING c.message_id
                 )
-                SELECT message_id, previous_state FROM updated
+                SELECT updated.message_id, candidates.previous_state,
+                       candidates.daily_batch_published
+                  FROM updated
+                  JOIN candidates ON candidates.message_id = updated.message_id
                 """
             )
             rows = cursor.fetchall()
-        return tuple(str(row[0]) for row in rows if row[1] == "incomplete")
+        return tuple(
+            str(row[0])
+            for row in rows
+            if row[1] == "incomplete" and bool(row[2])
+        )
 
     def unreported_daily_correction_ids(self) -> tuple[str, ...]:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """SELECT message_id FROM management_card_context
-                    WHERE state = 'effective' AND daily_correction_reported_at IS NULL
+                    WHERE state = 'effective'
+                      AND daily_correction_pending = TRUE
+                      AND daily_correction_reported_at IS NULL
                     ORDER BY updated_at, message_id"""
             )
             rows = cursor.fetchall()
@@ -302,9 +465,11 @@ class PostgresManagementCardContextStore:
         placeholders = ", ".join("%s" for _ in message_ids)
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE management_card_context SET daily_correction_reported_at = now() "
+                "UPDATE management_card_context SET daily_correction_reported_at = now(), "
+                "daily_correction_pending = FALSE "
                 f"WHERE message_id IN ({placeholders}) "
-                "AND state = 'effective' AND daily_correction_reported_at IS NULL",
+                "AND state = 'effective' AND daily_correction_pending = TRUE "
+                "AND daily_correction_reported_at IS NULL",
                 message_ids,
             )
 

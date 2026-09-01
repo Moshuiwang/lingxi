@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from lingxi.core.admin.card_dispatch import ManagementCardContextStore, management_card_fingerprint
+from lingxi.core.admin.card_dispatch import (
+    MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
+    MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS,
+    ManagementCardContextStore,
+    management_card_fingerprint,
+)
 from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
 from lingxi.core.admin.management_card import (
     ADMIN_ACTION_CANCEL,
@@ -115,6 +120,13 @@ class PositionExpansionTests(unittest.TestCase):
         missing_reason = parse_admin_command("/admin grant_position u@example.com A运营 c1")
         self.assertEqual(missing_reason.kind, AdminCommandKind.UNKNOWN)
 
+    def test_permission_group_id_is_a_closed_revoke_target_shape(self) -> None:
+        command = parse_admin_command(
+            "/admin revoke_permission lpg_01M1C90YDGMTY567GDTZZJ4C5E 管理卡撤销"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
+        self.assertEqual(command.identifier, "lpg_01M1C90YDGMTY567GDTZZJ4C5E")
+
 
 class PositionManagementCardTests(unittest.TestCase):
     def test_new_card_has_required_position_scope_reason_and_actual_all_count(self) -> None:
@@ -198,6 +210,200 @@ class PositionManagementCardTests(unittest.TestCase):
             element.get("content", "") for element in elements if element.get("tag") == "markdown"
         ))
 
+    def test_cardkit_failure_does_not_advance_visual_watermark_before_success(self) -> None:
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def update(self, **kwargs) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("CardKit transient")
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_cardkit_failure",
+            identifier="u@example.com",
+            card_id="card_cardkit_failure",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        store.update_state(
+            message_id="om_cardkit_failure", state="effective", dispatch_status="effective"
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_PositionCatalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+        context = store.lookup_context(message_id="om_cardkit_failure")
+        assert context is not None
+        with self.assertRaises(RuntimeError):
+            refresher.update(context=context, status=_status(), state="effective")
+        self.assertEqual(len(store.list_needing_refresh()), 1)
+
+        context = store.lookup_context(message_id="om_cardkit_failure")
+        assert context is not None
+        refresher.update(context=context, status=_status(), state="effective")
+        self.assertEqual(store.list_needing_refresh(), ())
+
+    def test_visual_update_failure_keeps_persistent_refresh_watermark_for_retry(self) -> None:
+        from lingxi.apps.gateway import _ManagementCardRecoveryScanner
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_recovery",
+            identifier="u@example.com",
+            card_id="card_recovery",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        store.update_state(message_id="om_recovery", state="effective", dispatch_status="effective")
+        calls: list[object] = []
+        attempts = [RuntimeError("CardKit transient"), None]
+
+        class _Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                calls.append((action, fields))
+
+        class _Refresher:
+            def update(self, *, context, **kwargs) -> None:
+                calls.append(context.message_id)
+                failure = attempts.pop(0)
+                if failure is not None:
+                    raise failure
+                sequence = store.next_card_sequence(message_id=context.message_id)
+                store.mark_visual_refreshed(message_id=context.message_id, sequence=sequence)
+
+        scanner = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=_Refresher(),
+            status_lookup=lambda _identifier: _status(),
+            audit=_Audit(),
+        )
+        self.assertEqual(scanner.scan(), 0)
+        self.assertEqual(len(store.list_needing_refresh()), 1)
+        # 用新的 scanner 实例模拟 gateway 在瞬时 CardKit 失败后重启；重试依据是
+        # store 中的持久水位，而不是上一进程的 observer/内存状态。
+        restarted_scanner = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=_Refresher(),
+            status_lookup=lambda _identifier: _status(),
+            audit=_Audit(),
+        )
+        self.assertEqual(restarted_scanner.scan(), 1)
+        self.assertEqual(store.list_needing_refresh(), ())
+
+    def test_recovery_scanner_drops_old_visual_when_state_changes_after_snapshot(self) -> None:
+        """scanner 读旧行后，状态推进必须让旧视觉在取号 CAS 处放弃。"""
+
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher, _ManagementCardRecoveryScanner
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.updated: list[dict] = []
+
+            def update(self, **kwargs) -> None:
+                self.updated.append(kwargs)
+
+        class _Audit:
+            def record(self, action: str, /, **fields: object) -> None:
+                del action, fields
+
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_recovery_cas",
+            identifier="u@example.com",
+            card_id="card_recovery_cas",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        store.update_state(
+            message_id="om_recovery_cas", state="effective", dispatch_status="effective"
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_PositionCatalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+        calls = 0
+
+        def status_lookup(_identifier):
+            nonlocal calls
+            calls += 1
+            # This is the concurrent writer between list_needing_refresh() and
+            # the stale scanner's sequence claim.
+            store.update_state(
+                message_id="om_recovery_cas", state="incomplete", dispatch_status="incomplete"
+            )
+            return _status()
+
+        scanner = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=refresher,
+            status_lookup=status_lookup,
+            audit=_Audit(),
+        )
+
+        self.assertEqual(scanner.scan(), 0)
+        self.assertEqual(calls, 1)
+        self.assertEqual(transport.updated, [])
+        current = store.lookup_context(message_id="om_recovery_cas")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertTrue(current.needs_refresh)
+        # CAS failure must not consume another CardKit sequence.
+        self.assertEqual(current.card_sequence, 4)
+
+        # A fresh scanner can now render and deliver the current state after the
+        # old snapshot has been rejected, which also exercises restart recovery.
+        restarted = _ManagementCardRecoveryScanner(
+            context_store=store,
+            refresher=refresher,
+            status_lookup=lambda _identifier: _status(),
+            audit=_Audit(),
+        )
+        self.assertEqual(restarted.scan(), 1)
+        self.assertEqual(len(transport.updated), 1)
+        self.assertEqual(transport.updated[0]["sequence"], 5)
+        self.assertEqual(store.list_needing_refresh(), ())
+
+    def test_stale_visual_sequence_cannot_clear_new_state_watermark(self) -> None:
+        store = ManagementCardContextStore()
+        store.remember(
+            message_id="om_visual_generation",
+            identifier="u@example.com",
+            card_id="card_visual_generation",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        updated = store.update_state(
+            message_id="om_visual_generation", state="effective", dispatch_status="effective"
+        )
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.card_sequence, 3)
+        self.assertTrue(updated.needs_refresh)
+        self.assertFalse(
+            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=1)
+        )
+        self.assertEqual(len(store.list_needing_refresh()), 1)
+        self.assertTrue(
+            store.mark_visual_refreshed(message_id="om_visual_generation", sequence=3)
+        )
+        self.assertEqual(store.list_needing_refresh(), ())
+
     def test_closed_card_has_no_form_or_cancel_action(self) -> None:
         """取消/过期后的卡片关闭交互入口，避免按钮状态与服务端状态分叉。"""
 
@@ -256,6 +462,53 @@ class PositionManagementCardTests(unittest.TestCase):
         )
         self.assertIn("公司范围 全部（3 家公司）", visible)
 
+    def test_position_group_is_one_visible_item_and_one_group_revoke_action(self) -> None:
+        rows = tuple(
+            LocalPermissionOverrideView(
+                override_id=f"lpo_{index}",
+                direction="grant",
+                company_id=f"c{index % 3 + 1}",
+                metric_name=f"m{index}",
+                reason="特批职位范围",
+                created_at="2026-08-31T12:00:00+00:00",
+                position_name="A运营",
+                company_scope="*",
+                group_id="lpg_01M1C90YDGMTY567GDTZZJ4C5E",
+            )
+            for index in range(387)
+        )
+        status = AdminUserStatusView(
+            identifier="ou_target",
+            provisioning_state="active",
+            account_state="enabled",
+            permission_version=1,
+            updated_at="2026-08-31T12:00:00+00:00",
+            local_overrides=rows,
+        )
+        card = render_management_card(
+            status,
+            display_identifier="u@example.com",
+            catalog=_PositionCatalog(),
+            display_names=_DisplayNames(),
+        )
+        elements = list(_walk(card["body"]["elements"]))
+        revoke_buttons = [
+            element
+            for element in elements
+            if element.get("tag") == "button"
+            and element["behaviors"][0]["value"].get("admin_action") == "revoke"
+        ]
+        self.assertEqual(len(revoke_buttons), 1)
+        value = revoke_buttons[0]["behaviors"][0]["value"]
+        self.assertEqual(value.get("permission_group_id"), "lpg_01M1C90YDGMTY567GDTZZJ4C5E")
+        self.assertNotIn("override_id", value)
+        visible = "\n".join(
+            element.get("content", "")
+            for element in elements
+            if element.get("tag") == "markdown"
+        )
+        self.assertIn("覆盖 387 项权限", visible)
+
 
 class TerminalOutcomeTextTests(unittest.TestCase):
     @staticmethod
@@ -292,6 +545,70 @@ class TerminalOutcomeTextTests(unittest.TestCase):
 
 
 class ContextSequenceTests(unittest.TestCase):
+    def test_default_context_ttl_is_forty_minutes_and_explicit_deadline_is_hard_capped_at_24h(self) -> None:
+        store = ManagementCardContextStore()
+        before = datetime.now(timezone.utc)
+        store.remember(
+            message_id="om_ttl",
+            identifier="u@example.com",
+            card_id="card_ttl",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+        )
+        context = store.lookup_context(message_id="om_ttl")
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertGreaterEqual(
+            (context.context_deadline_at - before).total_seconds(),
+            MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS - 1,
+        )
+        self.assertLessEqual(
+            (context.context_deadline_at - before).total_seconds(),
+            MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS + 1,
+        )
+
+        store.remember(
+            message_id="om_ttl_capped",
+            identifier="u@example.com",
+            card_id="card_ttl_capped",
+            chat_id="oc_1",
+            initiated_by_open_id="ou_admin",
+            snapshot_fingerprint="fp",
+            context_deadline_at=before + timedelta(days=7),
+        )
+        capped = store.lookup_context(message_id="om_ttl_capped")
+        self.assertIsNotNone(capped)
+        assert capped is not None
+        self.assertLessEqual(
+            (capped.context_deadline_at - before).total_seconds(),
+            MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS + 1,
+        )
+
+        from lingxi.core.admin.card_dispatch import bounded_management_card_deadline
+
+        fixed_now = NOW
+        before_24h = fixed_now + timedelta(hours=24) - timedelta(seconds=1)
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=before_24h, ttl_seconds=1800
+            ),
+            before_24h,
+        )
+        exact_24h = fixed_now + timedelta(hours=24)
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=exact_24h, ttl_seconds=1800
+            ),
+            exact_24h,
+        )
+        self.assertEqual(
+            bounded_management_card_deadline(
+                now=fixed_now, requested=exact_24h + timedelta(seconds=1), ttl_seconds=1800
+            ),
+            exact_24h,
+        )
+
     def test_context_sequence_is_monotonic_and_expired_context_is_still_recoverable_for_lazy_close(self) -> None:
         clock = [0.0]
         store = ManagementCardContextStore(ttl_seconds=1.0, clock=lambda: clock[0])
@@ -339,7 +656,9 @@ class ContextSequenceTests(unittest.TestCase):
         context = store.lookup_context(message_id="om_1")
         self.assertEqual(context.state, "closed")
         self.assertEqual(context.identifier, "u@example.com")
-        self.assertEqual(context.card_sequence, 4)
+        # 状态关闭本身也占用一个新的整卡版本，避免并发旧 scanner 清掉新的
+        # needs_refresh；重复登记仍不能把实体/状态重新打开。
+        self.assertEqual(context.card_sequence, 5)
 
 
 class _Audit:

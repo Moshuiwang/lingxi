@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0082_document_delivery_degraded` |
+| head revision | `0084_management_card_state_cas` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -494,7 +494,7 @@ Issue #408 正式方案第二步。不新建表：`task_document_delivery_reques
 ## `0080_task_failure_signature`（任务失败签名：`task` 新增两列）
 
 Issue #495。`task` 新增两列可空 `TEXT`：`failure_code`（worker 给出的**细分**
-失败码）与 `failure_signature`（底层异常的**类型限定名**）。补的是 2026-08-31
+失败码）与 `failure_signature`（底层异常的**固定类别摘要**）。补的是 2026-08-31
 浸泡窗口取证到的诊断黑洞——8 条任务失败里 6 条无法归因，结构化日志只留下
 `error_kind=session_failed failure_code=null`。
 
@@ -505,8 +505,9 @@ worker 与 gateway 是两个独立进程、不共享文件系统，只进 worker
 管理员用 `/admin trace` 看不到——与 `0070` 同一个结构性缺口、同一条解法。
 
 **两列都不装异常正文**（`V-花名册-33`：审计与日志不含外部标识原值；psycopg 异常
-串常见形状 `DETAIL: Key (feishu_open_id)=(ou_...)`），写入前过字符白名单与 64
-字符上界，口径与 rc22 opus 审查 P2-5 对 `event.pipeline_failed` 的收敛一致。
+串常见形状 `DETAIL: Key (feishu_open_id)=(ou_...)`），写入前只接受固定分类或
+`exception.<类别>.<160-bit摘要>` 的固定形状与 64 字符上界，口径与 rc22 opus
+审查 P2-5 对 `event.pipeline_failed` 的收敛一致。
 两列可空且 `NULL` 是精确语义（成功回合无失败码；`turn_timeout` 这类失败没有
 异常对象可签），不回填历史行。列语义与判据见迁移文件头部完整说明。
 
@@ -549,6 +550,24 @@ NOT DISTINCT FROM 'docx')` 与 `0079` 的 `markdown` CHECK 同一姿态。本列
 
 `downgrade()` 直接删该列及其 CHECK，有损（非空取值随列丢失，不删行本身），与
 `0078`/`0079` 既有先例同一姿态（本 revision 未在任何环境应用过）。
+
+## `0083_management_card_recovery`（管理卡视觉恢复与 24 小时边界）
+
+Issue #493。`management_card_context` 新增持久 `needs_refresh` 与
+`visual_sequence`，把数据库状态与 CardKit 视觉回写分开：gateway 启动和心跳扫描
+失败水位，只有 CardKit update 成功才推进视觉水位；同时新增真实 daily batch 补齐的
+待汇总标记，迟到的 instant outbox 不会被算作每日纠偏。数据库 CHECK 与代码层共同
+把上下文截止时间限制在创建后 24 小时内，默认保留窗口为 40 分钟。新增列与约束的
+downgrade 是有损但不删除业务行，符合 add-before-delete 与存量不迁移约定。
+
+## `0084_management_card_state_cas`（管理卡状态代数 CAS）
+
+Issue #493 P1 复修。`management_card_context` 新增正数 `state_version`，与发给
+CardKit 的 `card_sequence` 分开：状态写入同时推进两条版本链，恢复 scanner 读取的
+状态代数与整卡序号必须仍匹配，才能领取下一序号；CardKit 更新成功后的
+`needs_refresh` 清除也按同一快照做 CAS。旧 scanner 若在渲染期间遇到状态推进，会
+放弃发送并保留水位，下一轮从当前状态重新渲染。升级只加列并以 1 初始化既有上下文，
+downgrade 删除该列（有损但不删除业务行）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

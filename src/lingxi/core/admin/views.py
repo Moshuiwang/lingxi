@@ -21,7 +21,8 @@ class LocalPermissionOverrideView:
     数据经 ``adapters.postgres_local_permission.
     PostgresLocalPermissionOverrideStore.effective_entries``。
 
-    ``reason`` 是完整原文——是否截断显示是 ``core/admin/router._render_user_status``
+    新职位+范围授权的多行会共享 ``group_id``，管理卡按组展示/撤销；历史
+    ``group_id is None`` 的行仍按行展示/撤销。``reason`` 是完整原文——是否截断显示是 ``core/admin/router._render_user_status``
     的展示层决定（不回显 reason 全文，截断 20 字），本视图本身只是忠实的 DTO，
     不提前做任何截断，避免把展示细节耦合进数据形状。
     """
@@ -37,6 +38,12 @@ class LocalPermissionOverrideView:
     position_name: str | None = None
     company_scope: str | None = None
     group_id: str | None = None
+
+    @property
+    def permission_group_id(self) -> str | None:
+        """``permission_group_id`` 的领域名；``group_id`` 保留为旧 DTO 兼容别名。"""
+
+        return self.group_id
 
 
 @dataclass(frozen=True)
@@ -76,7 +83,7 @@ class AdminUserStatusView:
 
     ``local_overrides``（#319 S-P-1b 卡 B 新增，默认空元组保持既有构造点不用改）
     是该用户当前生效的本地权限覆盖行列表，供 ``/admin revoke_permission`` 的
-    UX 前置——管理员需要先看到 override_id 才能发起收回。
+    UX 前置——新授权按 ``group_id``，历史行按 ``override_id`` 发起撤销。
 
     ``galaxy_source``（#439 B 档新增，默认 ``None`` 保持既有构造点不用改）是最佳
     努力算出的银河来源权限摘要；``None`` 与 ``GalaxySourceSummary(granted=False,

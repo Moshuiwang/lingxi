@@ -1,4 +1,4 @@
-"""任务失败签名：task 表新增细分失败码与底层异常类型名两列。
+"""任务失败签名：task 表新增细分失败码与底层异常固定摘要两列。
 
 Revision ID: 0080_task_failure_signature
 Revises: 0079_document_delivery_markdown
@@ -24,16 +24,17 @@ Issue #495。2026-08-31 浸泡窗口取证：8 条任务失败里 **6 条无法�
   ``apps/worker/service.py::_failure_content`` 把失败码压平成**用户文案分类**
   之后的粗粒度值，上面列的六种全部塌进同一个 ``session_failed``，落库之后再也
   分不开。
-- ``failure_signature``（``TEXT``，可空）——底层异常的**类型限定名**
-  （``psycopg.errors.UniqueViolation`` 这种形状，模块名 + 类名）。这是"未分类
-  失败"唯一留得下的线索。
+- ``failure_signature``（``TEXT``，可空）——底层异常的**固定类别摘要**（例如
+  ``exception.database.<160-bit摘要>``）。完整类型身份只作为不可逆摘要的输入，
+  不把动态模块/类名写进持久状态；这是"未分类失败"唯一留得下的低敏线索。
 
 **这两列不装异常正文，这是安全约束不是省事**：``V-花名册-33`` 禁止把 ``ou_``
 等外部标识原值写进审计与日志，而 psycopg 等驱动的异常串常见形状正是
 ``DETAIL: Key (feishu_open_id)=(ou_...)``。rc22 opus 审查 P2-5 已经为
 ``event.pipeline_failed`` 做过同一次收敛（只记 ``type(error).__name__``），
-本列照抄那条既有做法。写入前还要过一道字符白名单（只留 ASCII 字母数字、下划线、
-点）与 64 字符上界，见 ``apps/worker/report_extraction.py`` 的失败签名一节。
+本列照抄那条既有做法。写入前还要过一道固定形状校验（只接受固定分类或
+``exception.<类别>.<160-bit摘要>``）与 64 字符上界，见
+``apps/worker/report_extraction.py`` 的失败签名一节。
 
 **两列都允许 ``NULL``，且 ``NULL`` 是精确语义、不是"暂时留空以后补"**：业务
 成功的回合没有失败码可写；``turn_timeout``/``drain_timeout``/``cancelled`` 这

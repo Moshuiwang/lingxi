@@ -215,7 +215,9 @@ class ManagementCardRefresher(Protocol):
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-    ) -> None: ...
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool | None: ...
 
 
 @dataclass(frozen=True)
@@ -226,9 +228,9 @@ class _ManagementContextCheck:
     forbidden: bool = False
 
 
-#: 管理卡逐行「撤销」按钮没有独立的原因输入框（issue #439 B 档设计：一键撤销，
-#: 不为撤销单独加一个表单）——服务端补一个固定原因，供审计与确认卡回显；管理员
-#: 需要自定义撤销原因时仍可用文本命令 ``/admin revoke_permission`` 自行填写。
+#: 管理卡撤销按钮（组或历史行）没有独立的原因输入框（issue #439 B 档设计：一键
+#: 撤销，不为撤销单独加一个表单）——服务端补一个固定原因，供审计与确认卡回显；
+#: 管理员需要自定义撤销原因时仍可用文本命令 ``/admin revoke_permission`` 自行填写。
 #:
 #: 术语统一（Trace #469 S-1 遗漏，收尾批 L4a 实测发现）：取值随按钮标签一起从
 #: 「收回」改成「撤销」，与 ``core/admin/notification._ACTION_LABEL`` 的
@@ -244,6 +246,7 @@ class _ManagementContextCheck:
 #: 行继续原样渲染，换新值不会让任何一条旧记录解析失败或渲染异常。审计文本是
 #: 历史事实，改成今天的说法反而会篡改"当时管理员看到的是什么"。
 _MANAGEMENT_CARD_REVOKE_REASON = "管理卡逐行撤销"
+_MANAGEMENT_CARD_GROUP_REVOKE_REASON = "管理卡撤销职位范围授权"
 
 #: 表单提交成功创建待确认操作时 ``AdminRouteOutcome.content_key`` 的取值——与
 #: ``router.py`` 里 ``_dispatch_write_action`` 最终成功分支写死的字面量一致，
@@ -254,7 +257,7 @@ _WRITE_ACTION_PENDING_CONTENT_KEY = "admin.write_action_pending"
 
 def _toast_from_route_outcome(outcome: _ManagementRouteOutcome) -> dict[str, Any]:
     """把 ``AdminCommandRouter.route()`` 的结论翻译成管理卡交互的 toast 应答
-    （表单/逐行按钮的提交结果先以 toast 返回；原管理卡的不可操作状态由出带外
+    （表单/撤销按钮的提交结果先以 toast 返回；原管理卡的不可操作状态由出带外
     持久化更新负责，见 ``core/admin/management_card.py`` 与 gateway 装配）。"""
 
     if not outcome.handled:
@@ -749,13 +752,13 @@ class AdminCardCallbackHandler:
         thread_id: str | None,
         message_id: str,
         trace_id: str,
+        permission_group_id: str = "",
     ) -> dict[str, Any]:
-        """管理卡逐行「撤销」按钮点击（#439 B 档新增交互分支）。
+        """管理卡「撤销」按钮点击（#439 B 档新增交互分支）。
 
-        ``override_id`` 是建卡时写进按钮 ``behaviors.value`` 的这一行内部标识，
-        直接复用旧形状 ``/admin revoke_permission <override_id> <原因>``（见
-        ``core/admin/commands.py`` 文档"形状 1"）——按钮点击这一刻已经精确知道
-        是哪一行，不需要走 A 档新增的「标识+公司+指标」反查形状。
+        新职位+范围授权按钮携带 ``permission_group_id``，按一笔授权组整体撤销；
+        历史无组行继续携带 ``override_id``，逐行撤销。两者都直接复用
+        ``/admin revoke_permission <目标> <原因>`` 的封闭解析形状。
         """
 
         if self._management_actions is None:
@@ -772,7 +775,8 @@ class AdminCardCallbackHandler:
             return _toast_error("数据已变化，请重新查询")
         context = context_check.context
         current_status = context_check.status
-        if not override_id:
+        target_id = permission_group_id or override_id
+        if not target_id:
             # 与 `handle_management_form_submit` 同一条纪律：不校验就拼命令
             # 文本，`override_id` 为空时下面这行会拼出连续空白，交给
             # `parse_admin_command` 解析——当前固定原因文案不含空格，恰好只会
@@ -782,15 +786,33 @@ class AdminCardCallbackHandler:
                 "admin.card_callback.management_missing_override_id",
                 trace_id=trace_id,
             )
-            return _toast_error("未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作")
+            return _toast_error(
+                "未识别到待撤销的权限组，请重新查询 /admin user 后再操作"
+                if permission_group_id
+                else "未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作"
+            )
         if context is not None and current_status is not None:
-            if not any(item.override_id == override_id for item in current_status.local_overrides):
+            found = (
+                any(item.group_id == permission_group_id for item in current_status.local_overrides)
+                if permission_group_id
+                else any(item.override_id == override_id for item in current_status.local_overrides)
+            )
+            if not found:
                 self._audit.record(
                     "admin.card_callback.management_override_mismatch",
                     trace_id=trace_id,
                 )
-                return _toast_error("未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作")
-        text = f"/admin revoke_permission {override_id} {_MANAGEMENT_CARD_REVOKE_REASON}"
+                return _toast_error(
+                    "未识别到待撤销的权限组，请重新查询 /admin user 后再操作"
+                    if permission_group_id
+                    else "未识别到待撤销的覆盖行，请重新查询 /admin user 后再操作"
+                )
+        reason = (
+            _MANAGEMENT_CARD_GROUP_REVOKE_REASON
+            if permission_group_id
+            else _MANAGEMENT_CARD_REVOKE_REASON
+        )
+        text = f"/admin revoke_permission {target_id} {reason}"
         outcome = self._route_management_action(
             operator_open_id=operator_open_id,
             text=text,

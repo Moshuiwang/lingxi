@@ -17,9 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 面向 main 的纯文档 PR 不需要真库、extras 或镜像回归；但仍产出稳定的
-  # `Epic Full` required check。复用 Story 的路径分类器，避免在两处维护“什么是文档”。
-  # workflow_call / 手动运行一律走完整门禁，只有 main PR 才允许此轻量分支。
+  # 面向 main 的 PR，文档改动（包括 docs + L1 混合）都运行文档门禁；纯文档仍不需要
+  # 真库、extras 或镜像回归，并产出稳定的 `Epic Full` required check。复用 Story 的
+  # 路径分类器，避免在两处维护“什么是文档”。workflow_call / 手动运行一律走完整门禁，
+  # 只有 main PR 才允许此轻量分支。
   classify:
     name: Epic / classify
     if: github.event_name == 'pull_request'
@@ -28,6 +29,7 @@ jobs:
     outputs:
       mode: ${{ steps.changes.outputs.mode }}
       risk_level: ${{ steps.changes.outputs.risk_level }}
+      docs_changed: ${{ steps.changes.outputs.docs_changed }}
       l1_changed: ${{ steps.changes.outputs.l1_changed }}
       l3_changed: ${{ steps.changes.outputs.l3_changed }}
       image_candidate: ${{ steps.image_candidate.outputs.value }}
@@ -78,7 +80,7 @@ jobs:
     needs: [classify]
     if: >-
       github.event_name == 'pull_request' && github.base_ref == 'main' &&
-      needs.classify.outputs.mode == 'docs' && needs.classify.outputs.risk_level == 'l0'
+      needs.classify.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
@@ -144,13 +146,54 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # PR 内的 `.github/permission-impact-counts.json` 只是 biai-stage 声明；它不能
+      # 自称可信来源。可信绑定必须由受控 stage 在仓库外提供 hash registration。
+      # 当前仓库没有受保护 stage job/artifact/attestation 注入链，故该路径缺失时
+      # 明确失败并报告 PM 门；不新增 token、secret、OIDC 或 protected environment 权限。
+      - name: 准备权限影响面计数证明（L3，需仓库外 stage registration）
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        run: |
+          python3 scripts/ci/prepare_permission_impact_counts.py \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --repository "${GITHUB_WORKSPACE}" \
+            --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --output "${RUNNER_TEMP}/permission-impact-counts.json"
+
       - name: 生成权限影响面 diff（L3）
-        if: github.event_name == 'pull_request' && needs.classify.outputs.risk_level == 'l3'
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
         run: |
           python3 scripts/ci/check_permission_impact.py \
             --base-ref "${{ github.event.pull_request.base.sha }}" \
             --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --user-counts "${RUNNER_TEMP}/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
             --output "${RUNNER_TEMP}/permission-impact.json"
+
+      - name: 留存权限影响面与计数证明（L3）
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: permission-impact-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/permission-impact-counts.json
+            ${{ runner.temp }}/permission-impact-provenance.json
+            ${{ runner.temp }}/permission-impact.json
+          # 空的有效 surface 只由仓库静态事实推导 0，不会生成 provenance；非空
+          # surface 已在 prepare/check 中对缺 registration fail-closed。counts/report
+          # 若缺失则前置步骤已失败，因此这里允许仅缺少可选的空 diff registration。
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: L1 资产版本锁与术语扫描（混合高风险改动）
         if: needs.classify.outputs.l1_changed == 'true'
@@ -539,6 +582,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           MODE: ${{ needs.classify.outputs.mode }}
           RISK_LEVEL: ${{ needs.classify.outputs.risk_level }}
+          DOCS_CHANGED: ${{ needs.classify.outputs.docs_changed }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           L1_RESULT: ${{ needs.l1.result }}
@@ -549,6 +593,21 @@ jobs:
           if [ "${EVENT_NAME}" = pull_request ] && [ "${CLASSIFY_RESULT}" != success ]; then
             printf 'Epic 分类器未通过：%s\n' "${CLASSIFY_RESULT}" >&2
             exit 1
+          fi
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${DOCS_CHANGED}" = true ] \
+             && [ "${DOCS_RESULT}" != success ]; then
+            # main PR 的 Epic Full / docs 应运行；epic/** -> main 的跟踪 PR 通过
+            # Story Fast / docs 覆盖文档，复用进来的 Epic Full / docs 按设计 skipped。
+            # Story Fast 的 story-result 另行要求 caller 的 docs=success。
+            # 后者只允许恰好是 skipped；若 Epic 侧意外失败/取消，仍不能被汇总吞掉。
+            case "${BASE_REF}:${DOCS_RESULT}" in
+              epic/*:skipped) : ;;
+              *)
+                printf '候选文档门禁未通过：base=%s result=%s\n' \
+                  "${BASE_REF}" "${DOCS_RESULT}" >&2
+                exit 1
+                ;;
+            esac
           fi
           if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
              && [ "${MODE}" = docs ] && [ "${RISK_LEVEL}" = l0 ]; then

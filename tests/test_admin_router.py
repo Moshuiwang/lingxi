@@ -556,6 +556,46 @@ class QueryUserCommandTests(unittest.TestCase):
         self.assertNotIn(long_reason, outcome.reply_text, "reason 不得回显全文")
         self.assertNotIn("无本地覆盖", outcome.reply_text)
 
+    def test_user_with_position_group_overrides_shows_one_group_item(self) -> None:
+        group_id = "lpg_01M1C90YDGMTY567GDTZZJ4C5E"
+        overrides = tuple(
+            LocalPermissionOverrideView(
+                override_id=f"lpo_{index}",
+                direction="grant",
+                company_id=f"c{index}",
+                metric_name=f"metric_{index}",
+                reason="职位范围特批",
+                created_at="2026-08-24T00:00:00+00:00",
+                position_name="A运营",
+                company_scope="*",
+                group_id=group_id,
+            )
+            for index in range(3)
+        )
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                    local_overrides=overrides,
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.reply_text.count("覆盖 3 项权限"), 1)
+        self.assertIn("职位 A运营", outcome.reply_text)
+        self.assertIn("公司范围 全部", outcome.reply_text)
+        self.assertNotIn("metric_0", outcome.reply_text)
+
     def test_a_user_with_local_overrides_no_longer_carries_the_zero_galaxy_permission_caveat(
         self,
     ) -> None:
@@ -2236,6 +2276,28 @@ class LinkifiedEmailRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
+
+    def test_unsupported_link_forms_stop_before_identifier_resolution(self) -> None:
+        """#492 的收窄边界在路由层也要保持 fail closed：不把链接化 open_id、
+        不一致目标或任意 URL 送到 ``resolve_identifier``/下游查询。"""
+
+        unsupported = (
+            f"/admin user <{_LINK_TEST_EMAIL}>",
+            f"/admin user `{_LINK_TEST_EMAIL}`",
+            f"/admin user [ou_abc123](mailto:ou_abc123)",
+            f"/admin user [seen@example.com](mailto:{_LINK_TEST_EMAIL})",
+            f"/admin user [{_LINK_TEST_EMAIL}](https://example.com/user)",
+        )
+        for text in unsupported:
+            with self.subTest(text=text):
+                router, _, queries, audit = _router()
+                outcome = router.route(open_id=ADMIN_OPEN_ID, text=text, trace_id="t1")
+
+                self.assertTrue(outcome.handled)
+                self.assertIn("用户标识", outcome.reply_text)
+                self.assertEqual(queries.resolve_identifier_calls, [])
+                self.assertEqual(queries.user_calls, [])
+                self.assertEqual(audit.actions(), ["admin.command.unknown"])
 
 
 class SegmentedUnknownReplyTests(unittest.TestCase):
