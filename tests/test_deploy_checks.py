@@ -941,9 +941,9 @@ class PublishJobGuardTest(unittest.TestCase):
             if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
             steps:
               - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
-                run: python3 scripts/ci/prepare_permission_impact_counts.py
+                run: python3 scripts/ci/prepare_permission_impact_counts.py --trusted-provenance permission-impact-provenance
               - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
-                run: python3 scripts/ci/check_permission_impact.py --user-counts
+                run: python3 scripts/ci/check_permission_impact.py --user-counts --trusted-provenance permission-impact-provenance
               - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
                 uses: actions/upload-artifact@sha
                 with:
@@ -1157,6 +1157,16 @@ class RealWorkflowTest(unittest.TestCase):
             "否则构建参数会在两腿之间漂移（来源标签就是这么漂的）",
         )
         self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
+
+    def test_permission_impact_ci_requires_external_registration_without_new_privilege(self) -> None:
+        """P2：PR claim 不能独自成为 stage 证据，且当前不偷偷申请新权限。"""
+
+        text = CONTRACT.read(CONTRACT.CI_WORKFLOW)
+        self.assertIn("--trusted-provenance", text)
+        self.assertIn("permission-impact-provenance.json", text)
+        self.assertIn("PR 内的 `.github/permission-impact-counts.json` 只是", text)
+        self.assertNotIn("id-token: write", text)
+        self.assertNotIn("actions/attest-build-provenance", text)
 
 
 class DatabaseTimeoutTest(unittest.TestCase):

@@ -1738,6 +1738,8 @@ def check_ci_workflow() -> list[str]:
         "scripts/ci/check_permission_impact.py",
         "scripts/ci/prepare_permission_impact_counts.py",
         "--user-counts",
+        "--trusted-provenance",
+        "permission-impact-provenance",
         "permission-impact-pr-",
         "needs.classify.outputs.risk_level == 'l3'",
         "needs.classify.outputs.l3_changed == 'true'",
@@ -1745,9 +1747,10 @@ def check_ci_workflow() -> list[str]:
         if marker not in full:
             failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")
 
-    # 计数来源只在 biai-stage 受控导出，PR runner 不得直接调用 stage 导出器；否则
-    # 一个 workflow 改动就会把用户数据带进普通 CI。gate 自己的本地 postgres 测试
-    # DSN 是允许的，不能把它误判成业务凭据。
+    # 计数声明只由 biai-stage 受控导出，PR runner 不得直接调用 stage 导出器；可信
+    # 采信还必须拿到仓库外 hash registration。否则一个 workflow 改动就会把用户数据
+    # 带进普通 CI，或把 PR 自报冒充 stage 证据。gate 自己的本地 postgres 测试 DSN
+    # 是允许的，不能把它误判成业务凭据。
     for forbidden in ("scripts/ops/export_permission_impact_counts.py",):
         if forbidden in strip_comments(full):
             failures.append(f"ci.yml 不得在普通 CI 接入受控计数来源 `{forbidden}`。")

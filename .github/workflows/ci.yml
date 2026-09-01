@@ -146,7 +146,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: 准备权限影响面计数证明（L3）
+      # PR 内的 `.github/permission-impact-counts.json` 只是 biai-stage 声明；它不能
+      # 自称可信来源。可信绑定必须由受控 stage 在仓库外提供 hash registration。
+      # 当前仓库没有受保护 stage job/artifact/attestation 注入链，故该路径缺失时
+      # 明确失败并报告 PM 门；不新增 token、secret、OIDC 或 protected environment 权限。
+      - name: 准备权限影响面计数证明（L3，需仓库外 stage registration）
         if: >-
           github.event_name == 'pull_request' &&
           needs.classify.outputs.risk_level == 'l3' &&
@@ -157,6 +161,7 @@ jobs:
             --head-ref "${{ github.event.pull_request.head.sha }}" \
             --repository "${GITHUB_WORKSPACE}" \
             --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
             --output "${RUNNER_TEMP}/permission-impact-counts.json"
 
       - name: 生成权限影响面 diff（L3）
@@ -169,6 +174,7 @@ jobs:
             --base-ref "${{ github.event.pull_request.base.sha }}" \
             --head-ref "${{ github.event.pull_request.head.sha }}" \
             --user-counts "${RUNNER_TEMP}/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
             --output "${RUNNER_TEMP}/permission-impact.json"
 
       - name: 留存权限影响面与计数证明（L3）
@@ -181,8 +187,12 @@ jobs:
           name: permission-impact-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: |
             ${{ runner.temp }}/permission-impact-counts.json
+            ${{ runner.temp }}/permission-impact-provenance.json
             ${{ runner.temp }}/permission-impact.json
-          if-no-files-found: error
+          # 空的有效 surface 只由仓库静态事实推导 0，不会生成 provenance；非空
+          # surface 已在 prepare/check 中对缺 registration fail-closed。counts/report
+          # 若缺失则前置步骤已失败，因此这里允许仅缺少可选的空 diff registration。
+          if-no-files-found: warn
           retention-days: 30
 
       - name: L1 资产版本锁与术语扫描（混合高风险改动）

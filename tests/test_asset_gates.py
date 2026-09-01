@@ -181,6 +181,52 @@ class PermissionImpactTest(unittest.TestCase):
     OLD_METRIC = {"companies": {"1": {"运营": ["m1", "m2"], "销售": ["m0"]}}}
     NEW_METRIC = {"companies": {"1": {"运营": ["m2", "m3"], "销售": ["m0"]}}}
 
+    @staticmethod
+    def _commit(repository: Path, message: str) -> str:
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ],
+            cwd=repository,
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    @staticmethod
+    def _stage_registration(manifest: dict[str, object]) -> dict[str, object]:
+        source = manifest["source"]
+        assert isinstance(source, dict)
+        return {
+            "schema": IMPACT.PROVENANCE_SCHEMA,
+            "manifest_sha256": IMPACT._document_digest(manifest),
+            "base_facts_sha256": manifest["base_facts_sha256"],
+            "head_facts_sha256": manifest["head_facts_sha256"],
+            "grant_surface_sha256": manifest["grant_surface_sha256"],
+            "shrink_surface_sha256": manifest["shrink_surface_sha256"],
+            "source": {
+                "kind": IMPACT.STAGE_PROVENANCE_SOURCE,
+                "environment": source["environment"],
+                "dataset": source["dataset"],
+                "query_version": source["query_version"],
+                "captured_at": source["captured_at"],
+            },
+            "registered_at": "2026-09-01T00:00:00+00:00",
+        }
+
     def test_grant_and_shrink_are_separate_and_counts_are_explicit(self) -> None:
         with self.assertRaises(IMPACT.CountEvidenceError):
             IMPACT.build_report(
@@ -231,8 +277,6 @@ class PermissionImpactTest(unittest.TestCase):
             )
 
     def test_strict_manifest_is_bound_to_candidate_and_contains_only_aggregate_metadata(self) -> None:
-        base_ref = "base-sha"
-        head_ref = "head-sha"
         base_digest = "a" * 64
         head_digest = "b" * 64
         base_surface = IMPACT.build_surface(
@@ -247,15 +291,13 @@ class PermissionImpactTest(unittest.TestCase):
         shrink = base_surface - head_surface
         manifest = {
             "schema": IMPACT.COUNT_SCHEMA,
-            "base_ref": base_ref,
-            "head_ref": head_ref,
             "base_facts_sha256": base_digest,
             "head_facts_sha256": head_digest,
             "grant_surface_sha256": IMPACT._surface_digest(grant),
             "shrink_surface_sha256": IMPACT._surface_digest(shrink),
             "counts": {"grant": 7, "shrink": 4},
             "source": {
-                "kind": IMPACT.STAGE_COUNT_SOURCE,
+                "kind": IMPACT.STAGE_COUNT_CLAIM_SOURCE,
                 "environment": "biai-stage",
                 "dataset": "galaxy_user_role",
                 "query_version": "permission-impact-users/v1",
@@ -270,12 +312,14 @@ class PermissionImpactTest(unittest.TestCase):
             user_counts=manifest,
             base_facts_sha256=base_digest,
             head_facts_sha256=head_digest,
-            base_ref=base_ref,
-            head_ref=head_ref,
             strict_count_manifest=True,
         )
         self.assertEqual(report["affected_user_counts"]["grant"], 7)
-        self.assertEqual(report["affected_user_counts"]["source"]["kind"], IMPACT.STAGE_COUNT_SOURCE)
+        self.assertEqual(report["affected_user_counts"]["status"], "unverified-claim")
+        self.assertEqual(
+            report["affected_user_counts"]["source"]["kind"],
+            IMPACT.STAGE_COUNT_CLAIM_SOURCE,
+        )
         self.assertNotIn("user_id", json.dumps(report, ensure_ascii=False))
 
         forged = dict(manifest)
@@ -290,10 +334,174 @@ class PermissionImpactTest(unittest.TestCase):
                 user_counts=forged,
                 base_facts_sha256=base_digest,
                 head_facts_sha256=head_digest,
-                base_ref=base_ref,
-                head_ref=head_ref,
                 strict_count_manifest=True,
             )
+
+    def test_manifest_survives_its_own_pr_commit_and_tampering_turns_red(self) -> None:
+        """P1/P2：清单绑定事实摘要，PR 提交清单本身不会改变绑定；篡改必失败。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repo"
+            repository.mkdir()
+            role_path = repository / IMPACT.ROLE_MAP_PATH
+            metric_path = repository / IMPACT.METRIC_MAP_PATH
+            role_path.parent.mkdir(parents=True, exist_ok=True)
+            metric_path.parent.mkdir(parents=True, exist_ok=True)
+            role_path.write_text('[roles]\n"角色" = "职能"\n', encoding="utf-8")
+            metric_path.write_text('[companies."1"]\n"职能" = ["m1"]\n', encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            base = self._commit(repository, "base")
+            metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2"]\n', encoding="utf-8")
+            facts_head = self._commit(repository, "permission fact change")
+
+            base_roles, base_metrics, base_role_raw, base_metric_raw = IMPACT._load_ref_documents_with_raw(
+                repository, base
+            )
+            head_roles, head_metrics, head_role_raw, head_metric_raw = IMPACT._load_ref_documents_with_raw(
+                repository, facts_head
+            )
+            base_surface = IMPACT.build_surface(
+                IMPACT._role_map(base_roles, "base"), IMPACT._metric_map(base_metrics, "base")
+            )
+            head_surface = IMPACT.build_surface(
+                IMPACT._role_map(head_roles, "head"), IMPACT._metric_map(head_metrics, "head")
+            )
+            grant_surface = head_surface - base_surface
+            shrink_surface = base_surface - head_surface
+            manifest: dict[str, object] = {
+                "schema": IMPACT.COUNT_SCHEMA,
+                "base_facts_sha256": IMPACT._facts_digest(base_role_raw, base_metric_raw),
+                "head_facts_sha256": IMPACT._facts_digest(head_role_raw, head_metric_raw),
+                "grant_surface_sha256": IMPACT._surface_digest(grant_surface),
+                "shrink_surface_sha256": IMPACT._surface_digest(shrink_surface),
+                "counts": {"grant": 12, "shrink": 5},
+                "source": {
+                    "kind": IMPACT.STAGE_COUNT_CLAIM_SOURCE,
+                    "environment": "biai-stage",
+                    "dataset": "galaxy_user_role",
+                    "query_version": "permission-impact-users/v1",
+                    "captured_at": "2026-09-01T00:00:00+00:00",
+                },
+            }
+            manifest_path = repository / ".github" / "permission-impact-counts.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            registration_path = root / "permission-impact-provenance.json"
+            registration = self._stage_registration(manifest)
+            registration_path.write_text(
+                json.dumps(registration, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            # 把 manifest 本身加入 head：它改变了提交 SHA，但两份权限事实没有改变。
+            committed_head = self._commit(repository, "submit stage claim manifest")
+            prepared = root / "prepared-counts.json"
+            with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
+                PREPARE.prepare(
+                    base,
+                    committed_head,
+                    repository=repository,
+                    manifest=manifest_path,
+                    output=prepared,
+                )
+            evidence = PREPARE.prepare(
+                base,
+                committed_head,
+                repository=repository,
+                manifest=manifest_path,
+                trusted_provenance=registration_path,
+                output=prepared,
+            )
+            self.assertEqual(evidence["counts"], {"grant": 12, "shrink": 5})
+            self.assertNotIn("head_ref", manifest)
+            self.assertNotIn("head_ref", prepared.read_text(encoding="utf-8"))
+            checked = root / "permission-impact-report.json"
+            with self.assertRaises(IMPACT.CountEvidenceError):
+                IMPACT.run_check(
+                    base,
+                    committed_head,
+                    repository=repository,
+                    user_counts_path=prepared,
+                )
+            self.assertEqual(
+                IMPACT.run_check(
+                    base,
+                    committed_head,
+                    repository=repository,
+                    user_counts_path=prepared,
+                    trusted_provenance_path=registration_path,
+                    output=checked,
+                ),
+                0,
+            )
+            self.assertIn(
+                "out-of-band-hash-registered",
+                checked.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                json.loads(checked.read_text(encoding="utf-8"))["affected_user_counts"]["status"],
+                "provided-registered",
+            )
+
+            # 修改 facts 后仍指向同一份 stage registration，必须被事实摘要绑定挡住。
+            metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2", "m3"]\n', encoding="utf-8")
+            changed_facts_head = self._commit(repository, "tamper permission facts")
+            with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
+                PREPARE.prepare(
+                    base,
+                    changed_facts_head,
+                    repository=repository,
+                    manifest=manifest_path,
+                    trusted_provenance=registration_path,
+                    output=prepared,
+                )
+
+            # 修改 count 或 surface digest，registration 与当前 claim 的 hash/绑定均应失败。
+            original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for field, value in (
+                ("counts", {"grant": 99, "shrink": 5}),
+                ("grant_surface_sha256", "0" * 64),
+                ("head_facts_sha256", "1" * 64),
+            ):
+                tampered = json.loads(json.dumps(original_manifest))
+                tampered[field] = value
+                manifest_path.write_text(
+                    json.dumps(tampered, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
+                    PREPARE.prepare(
+                        base,
+                        committed_head,
+                        repository=repository,
+                        manifest=manifest_path,
+                        trusted_provenance=registration_path,
+                        output=prepared,
+                    )
+            manifest_path.write_text(
+                json.dumps(original_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            tampered_registration = dict(registration)
+            tampered_registration["manifest_sha256"] = "2" * 64
+            registration_path.write_text(
+                json.dumps(tampered_registration, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(IMPACT.CountEvidenceError):
+                IMPACT._validate_stage_provenance(
+                    tampered_registration,
+                    manifest=original_manifest,
+                    expected_base_facts_sha256=original_manifest["base_facts_sha256"],
+                    expected_head_facts_sha256=original_manifest["head_facts_sha256"],
+                    expected_grant_surface_sha256=original_manifest["grant_surface_sha256"],
+                    expected_shrink_surface_sha256=original_manifest["shrink_surface_sha256"],
+                )
 
     def test_empty_surface_derives_zero_from_static_diff(self) -> None:
         role = {"roles": {"角色": "没有对应指标的职能"}}
@@ -303,6 +511,41 @@ class PermissionImpactTest(unittest.TestCase):
         self.assertEqual((counts["grant"], counts["shrink"]), (0, 0))
         self.assertEqual(counts["status"], "derived")
         self.assertEqual(counts["source"]["kind"], IMPACT.EMPTY_COUNT_SOURCE)
+
+    def test_pr_stage_claim_and_in_tree_registration_are_not_trusted(self) -> None:
+        manifest = {
+            "schema": IMPACT.COUNT_SCHEMA,
+            "base_facts_sha256": "a" * 64,
+            "head_facts_sha256": "b" * 64,
+            "grant_surface_sha256": "c" * 64,
+            "shrink_surface_sha256": "d" * 64,
+            "counts": {"grant": 1, "shrink": 0},
+            "source": {
+                "kind": IMPACT.STAGE_COUNT_CLAIM_SOURCE,
+                "environment": "biai-stage",
+                "dataset": "galaxy_user_role",
+                "query_version": "permission-impact-users/v1",
+                "captured_at": "2026-09-01T00:00:00+00:00",
+            },
+        }
+        old_source = dict(manifest)
+        old_source["source"] = dict(manifest["source"])
+        old_source["source"]["kind"] = "biai-stage-read-only-aggregate"
+        with self.assertRaises(IMPACT.CountEvidenceError):
+            IMPACT._validate_count_manifest(
+                old_source,
+                expected_base_facts_sha256=manifest["base_facts_sha256"],
+                expected_head_facts_sha256=manifest["head_facts_sha256"],
+                expected_grant_surface_sha256=manifest["grant_surface_sha256"],
+                expected_shrink_surface_sha256=manifest["shrink_surface_sha256"],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp)
+            in_tree = repository / "provenance.json"
+            in_tree.write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(IMPACT.CountEvidenceError):
+                IMPACT._load_external_provenance(in_tree, repository=repository)
 
     def test_count_input_symlink_is_rejected_before_reading_runner_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -528,15 +771,32 @@ class PermissionImpactTest(unittest.TestCase):
             )
             try:
                 output = repository / "counts.json"
+                provenance_output = repository / "provenance.json"
                 with mock.patch.dict(EXPORT.os.environ, {EXPORT.DSN_ENV: "redacted"}):
-                    evidence = EXPORT.export(base, head, repository=repository, output=output)
+                    evidence = EXPORT.export(
+                        base,
+                        head,
+                        repository=repository,
+                        output=output,
+                        provenance_output=provenance_output,
+                    )
             finally:
                 EXPORT._read_stage_counts = original
             self.assertEqual(evidence["counts"], {"grant": 12, "shrink": 5})
+            registration = json.loads(provenance_output.read_text(encoding="utf-8"))
+            IMPACT._validate_stage_provenance(
+                registration,
+                manifest=evidence,
+                expected_base_facts_sha256=evidence["base_facts_sha256"],
+                expected_head_facts_sha256=evidence["head_facts_sha256"],
+                expected_grant_surface_sha256=evidence["grant_surface_sha256"],
+                expected_shrink_surface_sha256=evidence["shrink_surface_sha256"],
+            )
             serialized = output.read_text(encoding="utf-8")
             self.assertNotIn("redacted", serialized)
             self.assertNotIn("user_id", serialized)
             self.assertNotIn("user-", serialized)
+            self.assertNotIn("head_ref", serialized)
 
     def test_stage_export_query_is_aggregate_only(self) -> None:
         source = (ROOT / "scripts/ops/export_permission_impact_counts.py").read_text(

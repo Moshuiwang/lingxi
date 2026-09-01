@@ -2,9 +2,10 @@
 """准备 L3 权限影响用户计数证明。
 
 CI 不能连接 biai-stage、读取业务凭据或调用公司系统。本脚本只做两件事：权限面为空
-时根据当前两个 Git ref 确定性生成 0；权限面非空时读取 PR 中由 biai-stage 只读聚合
-生成的纯计数清单，并将其绑定到本次 ref、权限事实摘要和 grant/shrink 面摘要。缺少
-后者时响亮失败，避免把猜测的 0 伪装成影响面证据。
+时根据当前两个 Git ref 的事实集合差确定性生成 0；权限面非空时读取 PR 中由
+biai-stage 生成的纯计数声明，并要求仓库外的 hash registration 绑定两份权限事实和
+grant/shrink 面摘要。PR 自带的声明不是可信 stage 证据，缺少 registration 时响亮失败，
+避免把自报或猜测的 0 伪装成影响面证据。
 """
 
 from __future__ import annotations
@@ -54,15 +55,7 @@ def _head_timestamp(repository: Path, head_ref: str) -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("计数证明必须是普通 JSON 文件，不接受符号链接")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"计数证明无法读取或解析：{path}（{error}）") from error
-    if not isinstance(value, dict):
-        raise ValueError("计数证明必须是 JSON 对象")
-    return value
+    return IMPACT._load_json_document(path)
 
 
 def prepare(
@@ -71,6 +64,7 @@ def prepare(
     *,
     repository: Path = REPOSITORY_ROOT,
     manifest: Path = MANIFEST_PATH,
+    trusted_provenance: Path | None = None,
     output: Path,
 ) -> dict[str, Any]:
     (
@@ -103,8 +97,6 @@ def prepare(
         # PR 自带的数字覆盖。这样不会把一个伪造的「0」当成真实影响面证据。
         evidence = {
             "schema": IMPACT.COUNT_SCHEMA,
-            "base_ref": base_ref,
-            "head_ref": head_ref,
             "base_facts_sha256": base_facts_sha256,
             "head_facts_sha256": head_facts_sha256,
             "grant_surface_sha256": IMPACT._surface_digest(grant_surface),
@@ -127,18 +119,29 @@ def prepare(
         evidence = _read_json(manifest)
         validated = IMPACT._validate_count_manifest(
             evidence,
-            expected_base_ref=base_ref,
-            expected_head_ref=head_ref,
             expected_base_facts_sha256=base_facts_sha256,
             expected_head_facts_sha256=head_facts_sha256,
             expected_grant_surface_sha256=IMPACT._surface_digest(grant_surface),
             expected_shrink_surface_sha256=IMPACT._surface_digest(shrink_surface),
         )
-        if validated["source"]["kind"] != IMPACT.STAGE_COUNT_SOURCE:
+        if validated["source"]["kind"] != IMPACT.STAGE_COUNT_CLAIM_SOURCE:
             raise IMPACT.CountEvidenceError(
-                "非空权限影响面只能使用 biai-stage 只读聚合来源；"
-                "不能用静态 0 或其他来源替代"
+                "非空权限影响面只能使用 biai-stage 只读聚合声明；"
+                "不能用静态 0 或其他自报来源替代"
             )
+        if trusted_provenance is None:
+            raise IMPACT.CountEvidenceError(
+                "PR 内 biai-stage 聚合只是未验证声明；缺少仓库外 hash registration。"
+                "当前没有受保护 stage artifact/attestation，需经 PM 门补齐注入"
+            )
+        IMPACT._validate_stage_provenance(
+            IMPACT._load_external_provenance(trusted_provenance, repository=repository),
+            manifest=evidence,
+            expected_base_facts_sha256=base_facts_sha256,
+            expected_head_facts_sha256=head_facts_sha256,
+            expected_grant_surface_sha256=IMPACT._surface_digest(grant_surface),
+            expected_shrink_surface_sha256=IMPACT._surface_digest(shrink_surface),
+        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -154,6 +157,14 @@ def main() -> int:
     parser.add_argument("--head-ref", required=True)
     parser.add_argument("--repository", type=Path, default=REPOSITORY_ROOT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument(
+        "--trusted-provenance",
+        type=Path,
+        help=(
+            "仓库外的 biai-stage hash registration；PR 内清单只是 claim，"
+            "没有该文件时非空权限面失败关闭"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -162,6 +173,7 @@ def main() -> int:
             args.head_ref,
             repository=args.repository,
             manifest=args.manifest,
+            trusted_provenance=args.trusted_provenance,
             output=args.output,
         )
     except (IMPACT.ConfigShapeError, IMPACT.CountEvidenceError, RuntimeError, ValueError) as error:
