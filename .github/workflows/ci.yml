@@ -92,6 +92,11 @@ jobs:
       - name: 运行文档门禁
         run: scripts/ci/verify_docs.sh
 
+  # Issue #520 F2：**这条轻量档当前不会被触发。** 分类器里的
+  # `L1_LIGHT_ROUTE_ENABLED = False` 把只改 L1 内容资产的改动路由回了完整门禁——
+  # 那三份资产随镜像发布，走轻量档不会产出候选证明，合入 main 后 Main Publish 必然
+  # 找不到候选而失败。本 job 与分类器里的判定代码一起原样保留，留待上线后重启用；
+  # 停用期间 l1_changed 仍为 true，下面 gate 里的 L1 资产检查照常执行。
   l1:
     name: Epic Full / l1
     needs: [classify]
@@ -147,10 +152,18 @@ jobs:
           fetch-depth: 0
 
       # PR 内的 `.github/permission-impact-counts.json` 只是 biai-stage 声明；它不能
-      # 自称可信来源。可信绑定必须由受控 stage 在仓库外提供 hash registration。
-      # 当前仓库没有受保护 stage job/artifact/attestation 注入链，故该路径缺失时
-      # 明确失败并报告 PM 门；不新增 token、secret、OIDC 或 protected environment 权限。
-      - name: 准备权限影响面计数证明（L3，需仓库外 stage registration）
+      # 自称可信来源。可信绑定要由受控 stage 在仓库外提供 hash registration。
+      #
+      # Issue #520 F3（产品负责人前置输入 D10 方案甲）：本仓库**没有任何 job**
+      # 会写出下面这个 `${RUNNER_TEMP}/permission-impact-provenance.json`——它自登记
+      # 起就是一个从未被实现的输入，于是这两步此前对**任何**真实非空权限改动都退出 1，
+      # 真正需要审查的改动反而一份影响面 diff 都拿不到。现在把「必须存在 registration」
+      # 降级为可选：缺失时记录成 unregistered 并继续产出 grant/shrink 影响面 diff；
+      # 文件真的存在时，仓库内注入 / 符号链接 / 绑定不符等既有判定一条不减。
+      # 数量可信性的补偿措施（fable 独立审查 + 产品负责人合并前人工复核）写在
+      # docs/技术设计/验证与门禁.md 的已知边界。
+      # 仍然不新增 token、secret、OIDC 或 protected environment 权限。
+      - name: 准备权限影响面计数证明（L3，仓库外 stage registration 可选）
         if: >-
           github.event_name == 'pull_request' &&
           needs.classify.outputs.risk_level == 'l3' &&
@@ -190,8 +203,9 @@ jobs:
             ${{ runner.temp }}/permission-impact-provenance.json
             ${{ runner.temp }}/permission-impact.json
           # 空的有效 surface 只由仓库静态事实推导 0，不会生成 provenance；非空
-          # surface 已在 prepare/check 中对缺 registration fail-closed。counts/report
-          # 若缺失则前置步骤已失败，因此这里允许仅缺少可选的空 diff registration。
+          # surface 的 registration 按 Issue #520 F3 是可选输入，当前没有任何 job 写它，
+          # 所以常态就是缺席（报告里会写明 status=unregistered 与原因）。counts/report
+          # 若缺失则前置步骤已经失败，因此这里只允许缺少那份可选的 registration。
           if-no-files-found: warn
           retention-days: 30
 
