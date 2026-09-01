@@ -228,12 +228,29 @@ class PermissionImpactTest(unittest.TestCase):
             "attestation": {
                 "comment_id": 9001,
                 "comment_url": "https://github.com/Moshuiwang/lingxi/pull/7#issuecomment-9001",
+                "repository": "Moshuiwang/lingxi",
+                "pr_number": 7,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
                 "user_id": 200755707,
                 "nonce": "nonce-0123456789ab",
                 "body_sha256": "1" * 64,
                 "response_sha256": "2" * 64,
                 "run_id": 12345,
                 "run_sha": "3" * 40,
+                "pr_mode": "regular-l3",
+                "challenge_sha256": IMPACT._run_challenge_digest(
+                    repository="Moshuiwang/lingxi",
+                    pr_number=7,
+                    base_sha="a" * 40,
+                    head_sha="b" * 40,
+                    run_id=12345,
+                    run_sha="3" * 40,
+                    pr_mode="regular-l3",
+                    comment_id=9001,
+                    body_sha256="1" * 64,
+                    api_response_sha256="2" * 64,
+                ),
             },
         }
 
@@ -455,6 +472,26 @@ class PermissionImpactTest(unittest.TestCase):
             self.assertEqual(
                 json.loads(checked.read_text(encoding="utf-8"))["affected_user_counts"]["status"],
                 "provided-registered",
+            )
+
+            tampered_provenance = json.loads(registration_path.read_text(encoding="utf-8"))
+            tampered_provenance["attestation"]["challenge_sha256"] = "0" * 64
+            registration_path.write_text(
+                json.dumps(tampered_provenance, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
+                PREPARE.prepare(
+                    base,
+                    committed_head,
+                    repository=repository,
+                    manifest=manifest_path,
+                    trusted_provenance=registration_path,
+                    output=prepared,
+                )
+            registration_path.write_text(
+                json.dumps(registration, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
             )
 
             # 修改 facts 后仍指向同一份 OWNER provenance，必须被事实摘要绑定挡住。

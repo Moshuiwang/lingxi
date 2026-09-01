@@ -20,8 +20,26 @@ from pathlib import Path
 from typing import Any
 
 
+NONMERGE_SENTINEL = ".github/permission-impact-evidence-only"
+
+
 class CandidateError(RuntimeError):
     pass
+
+
+def assert_publishable_tree(repository_root: Path = Path.cwd()) -> None:
+    """Keep evidence-only trees out of the accepted/deployable candidate path.
+
+    This is a repository-local sentinel, not a substitute for GitHub branch
+    protection or a ruleset.  It gives Main Publish a deterministic fail-closed
+    check even if an operator bypasses the intended non-merge review flow.
+    """
+
+    sentinel = repository_root / NONMERGE_SENTINEL
+    if sentinel.exists() or sentinel.is_symlink():
+        raise CandidateError(
+            "当前 main 树带有 evidence-only nonmerge sentinel，禁止生成可部署候选"
+        )
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -174,6 +192,7 @@ def main() -> int:
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise CandidateError("缺少 GITHUB_TOKEN，不能回读候选证明")
+    assert_publishable_tree()
     pr, document = verified_candidate(
         GitHubReader(token),
         repository=args.repository,

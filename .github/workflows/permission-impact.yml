@@ -68,6 +68,14 @@ jobs:
             echo '本 PR 不含 L3 权限事实变更；跳过 OWNER attestation'
           fi
 
+      - name: evidence-only sentinel 未走 L3 路由时硬失败
+        if: steps.route.outputs.required != 'true'
+        run: |
+          if git cat-file -e "${{ github.event.pull_request.head.sha }}:.github/permission-impact-evidence-only" 2>/dev/null; then
+            echo 'evidence-only sentinel 必须进入 Permission Impact / trusted base 的证据专用流程，禁止合并或部署。' >&2
+            exit 1
+          fi
+
       - name: 从 trusted base 读取 GitHub OWNER attestation
         if: steps.route.outputs.required == 'true'
         run: |
@@ -116,3 +124,12 @@ jobs:
             ${{ runner.temp }}/permission-impact.json
           if-no-files-found: error
           retention-days: 30
+
+      - name: evidence-only PR 硬 nonmerge/nondeploy sentinel
+        if: steps.route.outputs.required == 'true' && success()
+        run: |
+          mode=$(python3 -c 'import json, os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "permission-impact-attestation.json"), encoding="utf-8"))["pr_mode"])')
+          if [ "${mode}" = "evidence-only" ]; then
+            echo 'evidence-only PR 只允许留存证据，禁止合并或部署；请由 PM/管理员按规则集流程处理。' >&2
+            exit 1
+          fi

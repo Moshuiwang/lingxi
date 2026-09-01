@@ -46,6 +46,7 @@ PERMISSION_IMPACT_WORKFLOW = (
     REPOSITORY_ROOT / ".github" / "workflows" / "permission-impact.yml"
 )
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
+EPIC_CANDIDATE_VERIFIER = REPOSITORY_ROOT / "scripts" / "ci" / "verify_epic_candidate.py"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
 POSTGRES_ADAPTER = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "postgres.py"
@@ -1652,6 +1653,12 @@ def check_ci_workflow() -> list[str]:
     story = read(STORY_WORKFLOW)
     trusted_permission = read(PERMISSION_IMPACT_WORKFLOW)
     publish = read(PUBLISH_WORKFLOW)
+    candidate_verifier = read(EPIC_CANDIDATE_VERIFIER)
+
+    if "NONMERGE_SENTINEL" not in candidate_verifier or "assert_publishable_tree()" not in candidate_verifier:
+        failures.append(
+            "verify_epic_candidate.py 必须在 Main Publish 前拒绝 evidence-only nonmerge sentinel。"
+        )
 
     # OWNER attestation 只需要 GitHub 的内建只读 PR token；不得借门禁之名扩大
     # contents、OIDC、runner 或 protected environment 权限。这里读顶层块，避免把
@@ -1720,6 +1727,9 @@ def check_ci_workflow() -> list[str]:
         "--trusted-provenance \"${RUNNER_TEMP}/permission-impact-provenance.json\"",
         "name: permission-impact-trusted-pr-",
         "if-no-files-found: error",
+        "evidence-only PR 硬 nonmerge/nondeploy sentinel",
+        '"pr_mode"',
+        "exit 1",
     ):
         expected = marker
         if expected not in trusted_permission:
@@ -1827,6 +1837,8 @@ def check_ci_workflow() -> list[str]:
         "--evidence-output",
         "lingxi-trusted-base",
         "github.base_ref == 'main'",
+        "evidence-only PR 硬 nonmerge/nondeploy sentinel",
+        '"pr_mode"',
     ):
         if marker not in full:
             failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")

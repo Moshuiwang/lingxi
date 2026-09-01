@@ -329,6 +329,19 @@ class CandidateIdentityTest(unittest.TestCase):
     def test_exact_merged_pr_is_selected(self) -> None:
         self.assertEqual(VERIFIER.select_merged_pr([self.pr()], MERGE)["number"], 82)
 
+    def test_evidence_only_sentinel_is_not_publishable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sentinel = root / VERIFIER.NONMERGE_SENTINEL
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text("lingxi.permission-impact-evidence-only/v1\n", encoding="utf-8")
+            with self.assertRaises(VERIFIER.CandidateError):
+                VERIFIER.assert_publishable_tree(root)
+
+    def test_normal_tree_remains_publishable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            VERIFIER.assert_publishable_tree(Path(directory))
+
 
 if __name__ == "__main__":
     unittest.main()

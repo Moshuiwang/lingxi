@@ -23,6 +23,29 @@ sys.modules[SPEC.name] = READER
 SPEC.loader.exec_module(READER)
 
 
+def _file_entry(
+    filename: str,
+    *,
+    sha: str = "a" * 40,
+    status: str = "modified",
+    previous_filename: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "filename": filename,
+        "sha": sha,
+        "status": status,
+        "additions": 1,
+        "deletions": 0,
+        "changes": 1,
+        "blob_url": f"https://github.com/Moshuiwang/lingxi/blob/{sha}/{filename}",
+        "raw_url": f"https://github.com/Moshuiwang/lingxi/raw/{sha}/{filename}",
+        "contents_url": f"https://api.github.com/repos/Moshuiwang/lingxi/contents/{filename}?ref={sha}",
+    }
+    if previous_filename is not None:
+        entry["previous_filename"] = previous_filename
+    return entry
+
+
 class FakeApi:
     """只模拟官方 REST 返回值；生产 reader 不依赖这份夹具。"""
 
@@ -38,7 +61,7 @@ class FakeApi:
     ) -> None:
         self.pr = pr
         self.comments = comments
-        self.files = files or [[{"id": 1, "filename": "src/lingxi/config/company_function_metric_map.toml"}]]
+        self.files = files or [[_file_entry("src/lingxi/config/company_function_metric_map.toml")]]
         self.error_at = error_at
         self.malformed_link = malformed_link
         self.repository_links = repository_links
@@ -132,6 +155,7 @@ class OwnerAttestationTest(unittest.TestCase):
     def _pr(self, *, author: dict[str, Any] | None = None, base: str | None = None, head: str | None = None) -> dict[str, Any]:
         return {
             "number": 7,
+            "changed_files": 1,
             "base": {
                 "sha": base or self.BASE,
                 "repo": {"id": READER.REPOSITORY_ID, "full_name": READER.REPOSITORY_FULL_NAME},
@@ -193,6 +217,8 @@ class OwnerAttestationTest(unittest.TestCase):
         comment: dict[str, Any] | None = None,
         pr: dict[str, Any] | None = None,
         files: list[list[dict[str, Any]]] | None = None,
+        run_id: int = 12345,
+        run_sha: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         fake = api or FakeApi(pr or self._pr(), [[comment or self._comment()]], files)
         return READER.read_attestation(
@@ -202,24 +228,91 @@ class OwnerAttestationTest(unittest.TestCase):
             base_sha=self.BASE,
             head_sha=self.HEAD,
             manifest_path=self.manifest_path,
-            run_id=12345,
-            run_sha=self.RUN_SHA,
+            run_id=run_id,
+            run_sha=run_sha or self.RUN_SHA,
             now=self.NOW,
         )
 
     def test_owner_comment_is_converted_to_existing_provenance_and_public_evidence(self) -> None:
-        attestation, provenance, evidence = self._read()
+        comment = self._comment()
+        attestation, provenance, evidence = self._read(comment=comment)
         self.assertEqual(attestation["schema"], READER.ATTESTATION_SCHEMA)
         self.assertEqual(provenance["schema"], READER.PROVENANCE_SCHEMA)
         self.assertEqual(provenance["source"]["kind"], READER.PROVENANCE_SOURCE)
+        self.assertEqual(set(provenance), READER.PROVENANCE_KEYS)
+        self.assertEqual(set(provenance["attestation"]), READER.PROVENANCE_ATTESTATION_KEYS)
+        self.assertEqual(set(evidence), READER.EVIDENCE_KEYS)
+        self.assertEqual(set(evidence["comment"]), READER.EVIDENCE_COMMENT_KEYS)
         self.assertEqual(provenance["attestation"]["comment_id"], 9001)
         self.assertEqual(provenance["attestation"]["user_id"], READER.OWNER_ID)
+        self.assertEqual(evidence["pr_mode"], "regular-l3")
         self.assertEqual(evidence["run_id"], 12345)
         self.assertEqual(evidence["run_sha"], self.RUN_SHA)
         self.assertEqual(evidence["comment"]["user_id"], READER.OWNER_ID)
+        self.assertEqual(evidence["comment"]["body"], comment["body"])
+        self.assertEqual(
+            set(json.loads(evidence["comment"]["body"])),
+            READER.ATTESTATION_KEYS,
+        )
+        self.assertNotIn("user_id", evidence["comment"]["body"])
+        self.assertNotIn("token", evidence["comment"]["body"].lower())
         self.assertEqual(len(evidence["comment"]["body_sha256"]), 64)
         self.assertEqual(len(evidence["api_response_sha256"]), 64)
+        self.assertEqual(len(evidence["challenge_sha256"]), 64)
+        self.assertEqual(
+            evidence["challenge_sha256"],
+            READER._run_challenge_digest(
+                repository=READER.REPOSITORY_FULL_NAME,
+                pr_number=7,
+                base_sha=self.BASE,
+                head_sha=self.HEAD,
+                run_id=12345,
+                run_sha=self.RUN_SHA,
+                pr_mode="regular-l3",
+                comment_id=9001,
+                body_sha256=evidence["comment"]["body_sha256"],
+                api_response_sha256=evidence["api_response_sha256"],
+            ),
+        )
         self.assertNotIn("GITHUB_TOKEN", json.dumps(evidence))
+
+    def test_run_challenge_changes_with_trusted_run_identity(self) -> None:
+        _, provenance_a, evidence_a = self._read(run_id=12345)
+        _, provenance_b, evidence_b = self._read(run_id=12346)
+        self.assertNotEqual(evidence_a["challenge_sha256"], evidence_b["challenge_sha256"])
+        self.assertNotEqual(
+            provenance_a["attestation"]["challenge_sha256"],
+            provenance_b["attestation"]["challenge_sha256"],
+        )
+
+    def test_pre_generated_payload_may_be_commented_one_or_several_seconds_later(self) -> None:
+        for delay in (1, 3):
+            with self.subTest(delay=delay):
+                created_at = f"2026-09-01T11:55:{delay:02d}+00:00"
+                self._read(comment=self._comment(created_at=created_at, updated_at=created_at))
+
+    def test_comment_must_follow_issued_at_and_be_at_or_before_now(self) -> None:
+        too_early = self._comment(
+            body=self._body(issued_at="2026-09-01T11:55:01+00:00")
+        )
+        with self.assertRaises(READER.AttestationError):
+            self._read(comment=too_early)
+        future = self._comment(
+            created_at="2026-09-01T12:00:01+00:00",
+            updated_at="2026-09-01T12:00:01+00:00",
+        )
+        with self.assertRaises(READER.AttestationError):
+            self._read(comment=future)
+        too_late = self._comment(
+            body=self._body(
+                issued_at="2026-09-01T11:30:00+00:00",
+                expires_at="2026-09-01T11:40:00+00:00",
+            ),
+            created_at="2026-09-01T11:35:00+00:00",
+            updated_at="2026-09-01T11:35:00+00:00",
+        )
+        with self.assertRaises(READER.AttestationError):
+            self._read(comment=too_late)
 
     def test_wrong_author_id_node_type_and_association_fail_closed(self) -> None:
         cases = [
@@ -347,16 +440,143 @@ class OwnerAttestationTest(unittest.TestCase):
             html_url="https://github.com/Moshuiwang/lingxi/pull/7#issuecomment-9002",
         )
         api = FakeApi(
-            self._pr(),
+            {**self._pr(), "changed_files": 2},
             [[self._comment()], [second]],
             files=[
-                [{"id": 1, "filename": "src/lingxi/config/company_function_metric_map.toml"}],
-                [{"id": 2, "filename": "README.md"}],
+                [_file_entry("src/lingxi/config/company_function_metric_map.toml")],
+                [_file_entry("README.md")],
             ],
             repository_links=True,
         )
         self._read(api=api)
         self.assertIn("page=2", api.calls[-1])
+
+    def test_pull_files_use_official_shape_and_endpoint_key_without_id(self) -> None:
+        renamed = _file_entry(
+            "src/lingxi/config/new.toml",
+            sha="b" * 40,
+            status="renamed",
+            previous_filename="src/lingxi/config/old.toml",
+        )
+        paths, _, count = READER._changed_files(
+            FakeApi(self._pr(), [[self._comment()]], files=[[renamed]]),
+            pr_number=7,
+            repository_full_name=READER.REPOSITORY_FULL_NAME,
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            paths,
+            {"src/lingxi/config/new.toml", "src/lingxi/config/old.toml"},
+        )
+
+    def test_pull_files_bad_shape_duplicate_pagination_and_api_failure_fail_closed(self) -> None:
+        bad_shape = _file_entry("README.md")
+        del bad_shape["sha"]
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(self._pr(), [[self._comment()]], files=[[bad_shape]]),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+        duplicate = [
+            _file_entry("README.md", sha="a" * 40),
+            _file_entry("README.md", sha="b" * 40),
+        ]
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(self._pr(), [[self._comment()]], files=[duplicate]),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(
+                    self._pr(),
+                    [[self._comment()]],
+                    files=[[_file_entry("README.md")], [_file_entry("README.md")]],
+                ),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(
+                    self._pr(),
+                    [[self._comment()]],
+                    files=[
+                        [_file_entry("README.md", sha="a" * 40)],
+                        [_file_entry("README.md", sha="b" * 40)],
+                    ],
+                ),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(
+                    self._pr(),
+                    [[self._comment()]],
+                    files=[[_file_entry("README.md")], [_file_entry("README.md")]],
+                    error_at="files",
+                ),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+
+    def test_changed_files_count_uses_pr_response_and_rejects_truncation(self) -> None:
+        valid = READER._validate_pr_response(
+            self._pr(),
+            repository_id=READER.REPOSITORY_ID,
+            repository_full_name=READER.REPOSITORY_FULL_NAME,
+            pr_number=7,
+            base_sha=self.BASE,
+            head_sha=self.HEAD,
+        )
+        self.assertEqual(valid["changed_files"], 1)
+        with self.assertRaises(READER.AttestationError):
+            READER._validate_pr_response(
+                {**self._pr(), "changed_files": 3001},
+                repository_id=READER.REPOSITORY_ID,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+                pr_number=7,
+                base_sha=self.BASE,
+                head_sha=self.HEAD,
+            )
+        for value in (True, 1.5, "1", None):
+            with self.subTest(value=value), self.assertRaises(READER.AttestationError):
+                READER._validate_pr_response(
+                    {**self._pr(), "changed_files": value},
+                    repository_id=READER.REPOSITORY_ID,
+                    repository_full_name=READER.REPOSITORY_FULL_NAME,
+                    pr_number=7,
+                    base_sha=self.BASE,
+                    head_sha=self.HEAD,
+                )
+
+        three_thousand = [
+            [_file_entry(f"file-{offset + index}.txt", sha=f"{offset + index + 1:040x}") for index in range(100)]
+            for offset in range(0, 3000, 100)
+        ]
+        _, _, count = READER._changed_files(
+            FakeApi(self._pr(), [[self._comment()]], files=three_thousand),
+            pr_number=7,
+            repository_full_name=READER.REPOSITORY_FULL_NAME,
+        )
+        self.assertEqual(count, 3000)
+        three_thousand_one = three_thousand + [[_file_entry("file-3000.txt", sha="b" * 40)]]
+        with self.assertRaises(READER.ApiError):
+            READER._changed_files(
+                FakeApi(self._pr(), [[self._comment()]], files=three_thousand_one),
+                pr_number=7,
+                repository_full_name=READER.REPOSITORY_FULL_NAME,
+            )
+        with self.assertRaises(READER.AttestationError):
+            self._read(
+                api=FakeApi(
+                    {**self._pr(), "changed_files": 2},
+                    [[self._comment()]],
+                )
+            )
 
     def test_api_failure_or_malformed_pagination_fails_closed(self) -> None:
         with self.assertRaises(READER.ApiError):
@@ -386,7 +606,45 @@ class OwnerAttestationTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 with self.assertRaises(READER.AttestationError):
-                    self._read(files=[[{"id": 1, "filename": path}]])
+                    self._read(files=[[_file_entry(path)]])
+
+    def test_permission_pr_allowlist_rejects_runtime_deploy_and_other_configuration(self) -> None:
+        for path in (
+            "src/lingxi/core/permission/publish.py",
+            "deploy/compose.prod.yaml",
+            ".github/other-workflow.yml",
+            "src/lingxi/config/content.toml",
+        ):
+            with self.subTest(path=path), self.assertRaises(READER.AttestationError):
+                self._read(files=[[_file_entry(path)]])
+        self._read(files=[[_file_entry("tests/test_owner_attestation.py")]])
+        self._read(files=[[_file_entry("docs/traces/502-rc23清仓批/验收.md")]])
+
+    def test_evidence_only_sentinel_is_exact_and_hard_nonmerge_mode(self) -> None:
+        sentinel = self.repository / READER.EVIDENCE_ONLY_SENTINEL
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(READER.EVIDENCE_ONLY_SENTINEL_CONTENT, encoding="utf-8")
+        result = self._read(
+            files=[[_file_entry(READER.EVIDENCE_ONLY_SENTINEL)]],
+        )
+        self.assertEqual(result[2]["pr_mode"], "evidence-only")
+        sentinel.write_text("not-the-contract\n", encoding="utf-8")
+        with self.assertRaises(READER.AttestationError):
+            self._read(files=[[_file_entry(READER.EVIDENCE_ONLY_SENTINEL)]])
+
+    def test_evidence_only_sentinel_cannot_hide_runtime_or_deploy_files(self) -> None:
+        sentinel = self.repository / READER.EVIDENCE_ONLY_SENTINEL
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(READER.EVIDENCE_ONLY_SENTINEL_CONTENT, encoding="utf-8")
+        with self.assertRaises(READER.AttestationError):
+            self._read(
+                files=[
+                    [
+                        _file_entry(READER.EVIDENCE_ONLY_SENTINEL),
+                        _file_entry("deploy/compose.prod.yaml", sha="b" * 40),
+                    ]
+                ]
+            )
 
     def test_empty_missing_or_non_attestation_comments_fail(self) -> None:
         with self.assertRaises(READER.AttestationError):

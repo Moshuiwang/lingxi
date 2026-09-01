@@ -3,8 +3,8 @@
 
 The permission-impact count manifest is intentionally a PR artifact: a PR author
 can edit it.  This reader obtains the PR and its ordinary issue comments from the
-official GitHub REST API and accepts exactly one comment issued by the repository
-owner.  The caller must execute this file from the trusted base commit; the reader
+official GitHub REST API and accepts exactly one immutable comment issued by the
+repository owner.  The caller must execute this file from the trusted base commit; the reader
 also rejects a PR that changes any workflow or CI trust-root file.
 
 The reader does not call a business system, does not write GitHub state, and never
@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Hashable, Mapping, Sequence
 
 
 REPOSITORY_ID = 1_309_889_651
@@ -43,6 +43,7 @@ PROVENANCE_SCHEMA = "lingxi.permission-impact-provenance/v2"
 PROVENANCE_SOURCE = "github-owner-attestation"
 COMMENT_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 100
+MAX_CHANGED_FILES = 3_000
 MAX_ATTESTATION_TTL_SECONDS = 15 * 60
 MAX_BODY_BYTES = 64 * 1024
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -92,6 +93,7 @@ EVIDENCE_KEYS = frozenset(
         "schema",
         "repository",
         "pr_number",
+        "pr_mode",
         "base_sha",
         "head_sha",
         "run_id",
@@ -101,10 +103,11 @@ EVIDENCE_KEYS = frozenset(
         "manifest_sha256",
         "api_response_sha256",
         "api_response_count",
+        "challenge_sha256",
     }
 )
 EVIDENCE_COMMENT_KEYS = frozenset(
-    {"id", "url", "user_id", "user_login", "body_sha256", "created_at"}
+    {"id", "url", "user_id", "user_login", "body", "body_sha256", "created_at"}
 )
 PROVENANCE_KEYS = frozenset(
     {
@@ -126,12 +129,18 @@ PROVENANCE_ATTESTATION_KEYS = frozenset(
     {
         "comment_id",
         "comment_url",
+        "repository",
+        "pr_number",
+        "base_sha",
+        "head_sha",
         "user_id",
         "nonce",
         "body_sha256",
         "response_sha256",
         "run_id",
         "run_sha",
+        "pr_mode",
+        "challenge_sha256",
     }
 )
 
@@ -145,7 +154,36 @@ TRUST_ROOT_FILES = frozenset(
         # to form the owner-signed manifest; changing it in the same PR would
         # invalidate the attestation's exporter binding.
         "scripts/ops/export_permission_impact_counts.py",
+        "scripts/ops/render_permission_impact_owner_attestation.py",
     }
+)
+
+EVIDENCE_ONLY_SENTINEL = ".github/permission-impact-evidence-only"
+EVIDENCE_ONLY_SENTINEL_CONTENT = "lingxi.permission-impact-evidence-only/v1\n"
+PERMISSION_FACT_FILES = frozenset(
+    {
+        "src/lingxi/config/galaxy_role_function_map.toml",
+        "src/lingxi/config/company_function_metric_map.toml",
+    }
+)
+PERMISSION_CLAIM_FILES = frozenset({".github/permission-impact-counts.json"})
+PERMISSION_SUPPORT_FILES = frozenset(
+    {
+        "docs/traces/502-rc23清仓批/合同.md",
+        "docs/traces/502-rc23清仓批/任务表.md",
+        "docs/traces/502-rc23清仓批/验收.md",
+        "README.md",
+        "tests/test_asset_gates.py",
+        "tests/test_deploy_checks.py",
+        "tests/test_owner_attestation.py",
+        "tests/test_owner_attestation_payload.py",
+    }
+)
+PERMISSION_PR_ALLOWLIST = (
+    PERMISSION_FACT_FILES
+    | PERMISSION_CLAIM_FILES
+    | PERMISSION_SUPPORT_FILES
+    | {EVIDENCE_ONLY_SENTINEL}
 )
 
 
@@ -444,10 +482,13 @@ def validate_attestation(
         raise AttestationError("OWNER attestation captured_at 未绑定 manifest source")
     if captured > issued:
         raise AttestationError("OWNER attestation captured_at 不得晚于 issued_at")
-    if comment_time > issued:
-        raise AttestationError("OWNER attestation issued_at 早于评论创建时间")
+    # The trusted stage prepares the payload before the owner posts it.  The
+    # immutable GitHub creation timestamp therefore follows issued_at; requiring
+    # the reverse relation would reject the normal pre-generated-payload flow.
+    if issued > comment_time:
+        raise AttestationError("OWNER attestation issued_at 晚于评论创建时间")
     current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-    if captured > current or issued > current:
+    if captured > current or issued > current or comment_time > current:
         raise AttestationError("OWNER attestation 时间不得在未来")
     if expires <= issued or expires <= current:
         raise AttestationError("OWNER attestation 已过期或 expires_at 顺序错误")
@@ -455,7 +496,7 @@ def validate_attestation(
         raise AttestationError("OWNER attestation TTL 过长")
     nonce = document.get("nonce")
     if not isinstance(nonce, str) or NONCE_RE.fullmatch(nonce) is None:
-        raise AttestationError("OWNER attestation nonce 必须是一次性随机标识")
+        raise AttestationError("OWNER attestation nonce 必须是随机标识")
     return {
         "schema": ATTESTATION_SCHEMA,
         "repository": dict(repository),
@@ -506,6 +547,16 @@ def _validate_pr_response(
         or base_repo.get("full_name") != repository_full_name
     ):
         raise AttestationError("GitHub API PR repository 不匹配")
+    changed_files = pr.get("changed_files")
+    if (
+        isinstance(changed_files, bool)
+        or not isinstance(changed_files, int)
+        or changed_files < 0
+        or changed_files > MAX_CHANGED_FILES
+    ):
+        raise AttestationError(
+            f"GitHub API PR changed_files 必须是 0..{MAX_CHANGED_FILES} 的整数"
+        )
     author = _mapping(pr.get("user"), "GitHub PR author")
     for key in ("login", "id", "node_id", "type"):
         if key not in author:
@@ -526,7 +577,9 @@ def _validate_pr_response(
         or author.get("node_id") == OWNER_NODE_ID
     ):
         raise AttestationError("PR 作者不得与 OWNER attestation 信任根相同")
-    return dict(pr)
+    normalized = dict(pr)
+    normalized["changed_files"] = changed_files
+    return normalized
 
 
 def _link_pages(
@@ -613,34 +666,80 @@ def _page_url(path: str, page: int) -> str:
     return f"{path}?{query}"
 
 
+def _id_item_identity(entry: Mapping[str, Any]) -> Hashable:
+    """Default identity for endpoints whose official item shape has an ``id``."""
+
+    identifier = entry.get("id")
+    if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
+        raise AttestationError("GitHub API 条目缺少有效 id")
+    return identifier
+
+
+def _comment_item_identity(entry: Mapping[str, Any]) -> Hashable:
+    """Issue comments are uniquely identified by GitHub's immutable numeric id."""
+
+    return _id_item_identity(entry)
+
+
+def _file_item_identity(entry: Mapping[str, Any]) -> Hashable:
+    """Validate the actual ``GET /pulls/{number}/files`` item shape.
+
+    Unlike issue comments, pull-file objects do not have an ``id`` field.  The
+    stable endpoint key is the file name, optional rename source, blob SHA and
+    status; the caller separately rejects duplicate names so a repeated file
+    cannot be hidden behind a changed SHA/status tuple.
+    """
+
+    filename = entry.get("filename")
+    if not isinstance(filename, str) or not filename:
+        raise AttestationError("GitHub PR files 条目缺少 filename")
+    previous = entry.get("previous_filename")
+    if previous is not None and (not isinstance(previous, str) or not previous):
+        raise AttestationError("GitHub PR files 条目的 previous_filename 异常")
+    sha = entry.get("sha")
+    _sha1(sha, "GitHub PR files 条目的 sha")
+    status = entry.get("status")
+    if status not in {"added", "modified", "deleted", "renamed", "copied", "changed", "unchanged"}:
+        raise AttestationError("GitHub PR files 条目的 status 异常")
+    return (filename, previous, sha, status)
+
+
 def _fetch_pages(
     api: GitHubApi,
     path: str,
     *,
     label: str,
     pagination_paths: Sequence[str] | None = None,
+    unique_key: Callable[[Mapping[str, Any]], Hashable] | None = None,
+    max_items: int | None = None,
 ) -> tuple[list[Mapping[str, Any]], list[ApiResponse]]:
     values: list[Mapping[str, Any]] = []
     responses: list[ApiResponse] = []
-    seen_ids: set[int] = set()
+    seen_keys: set[Hashable] = set()
     page = 1
     while page <= MAX_COMMENT_PAGES:
         response = api.get(_page_url(path, page))
         if not isinstance(response.value, list):
             raise ApiError(f"GitHub API {label} 分页不是数组")
+        if len(response.value) > COMMENT_PAGE_SIZE:
+            raise ApiError(f"GitHub API {label} 单页超过 page size")
         page_values: list[Mapping[str, Any]] = []
         for item in response.value:
             try:
                 entry = _mapping(item, f"GitHub API {label} 条目")
             except AttestationError as error:
                 raise ApiError(f"GitHub API {label} 条目不是对象") from error
-            identifier = entry.get("id")
-            if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
-                raise ApiError(f"GitHub API {label} 条目缺少有效 id")
-            if identifier in seen_ids:
-                raise ApiError(f"GitHub API {label} 出现跨页重复 id")
-            seen_ids.add(identifier)
+            try:
+                identity = (unique_key or _id_item_identity)(entry)
+                hash(identity)
+            except (AttestationError, TypeError, ValueError) as error:
+                raise ApiError(f"GitHub API {label} 条目唯一键异常") from error
+            if identity in seen_keys:
+                raise ApiError(f"GitHub API {label} 出现跨页重复唯一键")
+            seen_keys.add(identity)
             page_values.append(entry)
+        if max_items is not None and len(values) + len(page_values) > max_items:
+            raise ApiError(f"GitHub API {label} 条目数超过安全上限 {max_items}")
         values.extend(page_values)
         responses.append(response)
         next_page = _link_pages(
@@ -759,7 +858,47 @@ def _response_digest(responses: Sequence[ApiResponse]) -> str:
     return digest.hexdigest()
 
 
-def _changed_files(api: GitHubApi, *, pr_number: int, repository_full_name: str) -> tuple[set[str], list[ApiResponse]]:
+def _run_challenge_digest(
+    *,
+    repository: str,
+    pr_number: int,
+    base_sha: str,
+    head_sha: str,
+    run_id: int,
+    run_sha: str,
+    pr_mode: str,
+    comment_id: int,
+    body_sha256: str,
+    api_response_sha256: str,
+) -> str:
+    """Bind this immutable comment transcript to this trusted Actions run.
+
+    This is a per-run challenge/transcript digest, not a replay ledger.  With no
+    new external state or write permission, a future run may still present the
+    same immutable comment; the digest makes that limitation explicit and gives
+    reviewers a verifiable run-specific binding instead of pretending nonce
+    validation is global one-time-use enforcement.
+    """
+
+    return _canonical_digest(
+        {
+            "repository": repository,
+            "pr_number": pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "run_id": run_id,
+            "run_sha": run_sha,
+            "pr_mode": pr_mode,
+            "comment_id": comment_id,
+            "body_sha256": body_sha256,
+            "api_response_sha256": api_response_sha256,
+        }
+    )
+
+
+def _changed_files(
+    api: GitHubApi, *, pr_number: int, repository_full_name: str
+) -> tuple[set[str], list[ApiResponse], int]:
     encoded_repo = urllib.parse.quote(repository_full_name, safe="/")
     path = f"/repos/{encoded_repo}/pulls/{pr_number}/files"
     pagination_paths = (
@@ -771,6 +910,8 @@ def _changed_files(api: GitHubApi, *, pr_number: int, repository_full_name: str)
         path,
         label="PR files",
         pagination_paths=pagination_paths,
+        unique_key=_file_item_identity,
+        max_items=MAX_CHANGED_FILES,
     )
     paths: set[str] = set()
     for entry in entries:
@@ -785,7 +926,7 @@ def _changed_files(api: GitHubApi, *, pr_number: int, repository_full_name: str)
             if previous in paths:
                 raise ApiError("GitHub PR files 出现重复 previous_filename")
             paths.add(previous)
-    return paths, responses
+    return paths, responses, len(entries)
 
 
 def _reject_trust_root_changes(paths: set[str]) -> None:
@@ -800,6 +941,40 @@ def _reject_trust_root_changes(paths: set[str]) -> None:
             "同一 PR 不得修改 OWNER attestation/workflow/permission check 信任根："
             + ", ".join(sorted(protected))
         )
+
+
+def _validate_pr_scope(repository: Path, paths: set[str]) -> str:
+    """Return the PR mode after enforcing the pre-declared permission write set.
+
+    A normal L3 PR and an evidence-only PR use the same reader, but they are not
+    interchangeable: the latter carries a repository-local sentinel and is
+    deliberately non-merge/non-deploy.  The allowlist is intentionally explicit;
+    broad ``docs/**`` or ``tests/**`` matching would let runtime or deployment
+    configuration hide beside an otherwise valid count claim.
+    """
+
+    evidence_only = EVIDENCE_ONLY_SENTINEL in paths
+    allowed = PERMISSION_PR_ALLOWLIST if evidence_only else PERMISSION_PR_ALLOWLIST - {
+        EVIDENCE_ONLY_SENTINEL
+    }
+    unexpected = sorted(path for path in paths if path not in allowed)
+    if unexpected:
+        raise AttestationError(
+            "权限影响面 PR 含 allowlist 之外的 runtime/deploy/配置文件："
+            + ", ".join(unexpected)
+        )
+    if not evidence_only:
+        return "regular-l3"
+    sentinel = repository / EVIDENCE_ONLY_SENTINEL
+    if sentinel.is_symlink() or not sentinel.is_file():
+        raise AttestationError("evidence-only PR 缺少固定 nonmerge/nondeploy sentinel")
+    try:
+        content = sentinel.read_bytes()
+    except OSError as error:
+        raise AttestationError("evidence-only PR sentinel 无法读取") from error
+    if content != EVIDENCE_ONLY_SENTINEL_CONTENT.encode("utf-8"):
+        raise AttestationError("evidence-only PR sentinel 内容不匹配")
+    return "evidence-only"
 
 
 def _provenance(attestation: Mapping[str, Any], evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -822,12 +997,18 @@ def _provenance(attestation: Mapping[str, Any], evidence: Mapping[str, Any]) -> 
         "attestation": {
             "comment_id": comment["id"],
             "comment_url": comment["url"],
+            "repository": evidence["repository"],
+            "pr_number": evidence["pr_number"],
+            "base_sha": evidence["base_sha"],
+            "head_sha": evidence["head_sha"],
             "user_id": comment["user_id"],
             "nonce": evidence["attestation_nonce"],
             "body_sha256": comment["body_sha256"],
             "response_sha256": evidence["api_response_sha256"],
             "run_id": evidence["run_id"],
             "run_sha": evidence["run_sha"],
+            "pr_mode": evidence["pr_mode"],
+            "challenge_sha256": evidence["challenge_sha256"],
         },
     }
 
@@ -881,10 +1062,15 @@ def read_attestation(
     )
     manifest, manifest_sha256 = _load_manifest(manifest_path)
 
-    changed, file_responses = _changed_files(
+    changed, file_responses, changed_file_count = _changed_files(
         api, pr_number=pr_number, repository_full_name=repository_full_name
     )
+    if changed_file_count != pr["changed_files"]:
+        raise AttestationError(
+            "GitHub PR changed_files 与分页枚举数量不一致；可能是截断或响应不完整"
+        )
     _reject_trust_root_changes(changed)
+    pr_mode = _validate_pr_scope(repository, changed)
 
     comment_path = f"/repos/{encoded_repo}/issues/{pr_number}/comments"
     comment_pagination_paths = (
@@ -896,6 +1082,7 @@ def read_attestation(
         comment_path,
         label="PR ordinary comments",
         pagination_paths=comment_pagination_paths,
+        unique_key=_comment_item_identity,
     )
     valid: list[tuple[Mapping[str, Any], dict[str, Any], str]] = []
     for comment in comments:
@@ -942,6 +1129,7 @@ def read_attestation(
         "pr_number": pr_number,
         "base_sha": base_sha,
         "head_sha": head_sha,
+        "pr_mode": pr_mode,
         "run_id": run_id,
         "run_sha": run_sha,
         "comment": {
@@ -949,6 +1137,7 @@ def read_attestation(
             "url": comment_url,
             "user_id": OWNER_ID,
             "user_login": OWNER_LOGIN,
+            "body": body,
             "body_sha256": body_sha256,
             "created_at": comment["created_at"],
         },
@@ -957,6 +1146,18 @@ def read_attestation(
         "api_response_sha256": response_sha256,
         "api_response_count": len([pr_response, *file_responses, *comment_responses]),
     }
+    evidence["challenge_sha256"] = _run_challenge_digest(
+        repository=repository_full_name,
+        pr_number=pr_number,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        run_id=run_id,
+        run_sha=run_sha,
+        pr_mode=pr_mode,
+        comment_id=comment["id"],
+        body_sha256=body_sha256,
+        api_response_sha256=response_sha256,
+    )
     provenance = _provenance(attestation, evidence)
     return attestation, provenance, evidence
 

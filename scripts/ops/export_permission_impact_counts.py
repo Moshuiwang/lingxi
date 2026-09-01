@@ -11,6 +11,9 @@ reader 验证 PM 的一次性评论后才采信，CI 本身不会连接数据库
     PYTHONPATH=src python3 scripts/ops/export_permission_impact_counts.py \
       --base-ref <base-sha> --head-ref <head-sha> \
       --output .github/permission-impact-counts.json
+
+随后在 trusted stage 使用 ``scripts/ops/render_permission_impact_owner_attestation.py``
+生成 OWNER 要发布的 raw JSON 正文；该正文不能由 PR runner 自行生成或代发。
 """
 
 from __future__ import annotations

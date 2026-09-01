@@ -8,8 +8,10 @@
 biai-stage 只读聚合证明会失败关闭，绝不拿角色数、配置行数或任何内部 ID 冒充用户数。
 
 PR 内的计数清单只能是 stage 导出声明（claim），不是可信的 stage 证据。可信链路由
-``read_github_owner_attestation.py`` 从官方 GitHub API 读取固定 OWNER 的一次性评论，
+``read_github_owner_attestation.py`` 从官方 GitHub API 读取固定 OWNER 的不可编辑评论，
 再输出一份不在 PR 工作树中的 provenance；缺少该认证时必须明确失败关闭。
+nonce 与 run challenge 绑定到本次不可变评论和 trusted Actions transcript；没有外部
+ledger 时不宣称跨次运行的全局一次性。
 """
 
 from __future__ import annotations
@@ -70,12 +72,18 @@ PROVENANCE_ATTESTATION_KEYS = frozenset(
     {
         "comment_id",
         "comment_url",
+        "repository",
+        "pr_number",
+        "base_sha",
+        "head_sha",
         "user_id",
         "nonce",
         "body_sha256",
         "response_sha256",
         "run_id",
         "run_sha",
+        "pr_mode",
+        "challenge_sha256",
     }
 )
 COUNT_KEYS = frozenset({"grant", "shrink"})
@@ -256,6 +264,37 @@ def _document_digest(document: Mapping[str, Any]) -> str:
     """计算清单语义摘要；manifest 加入 Git 提交不会改变这份摘要。"""
 
     return hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
+
+
+def _run_challenge_digest(
+    *,
+    repository: str,
+    pr_number: int,
+    base_sha: str,
+    head_sha: str,
+    run_id: int,
+    run_sha: str,
+    pr_mode: str,
+    comment_id: int,
+    body_sha256: str,
+    api_response_sha256: str,
+) -> str:
+    """Same deterministic per-run transcript binding emitted by the trusted reader."""
+
+    return _document_digest(
+        {
+            "repository": repository,
+            "pr_number": pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "run_id": run_id,
+            "run_sha": run_sha,
+            "pr_mode": pr_mode,
+            "comment_id": comment_id,
+            "body_sha256": body_sha256,
+            "api_response_sha256": api_response_sha256,
+        }
+    )
 
 
 def _validate_count_value(value: Any, key: str) -> int:
@@ -458,6 +497,18 @@ def _validate_stage_provenance(
     comment_url = attestation.get("comment_url")
     if not isinstance(comment_url, str) or not comment_url.startswith("https://github.com/"):
         raise CountEvidenceError("GitHub OWNER provenance comment_url 无效")
+    repository = attestation.get("repository")
+    if repository != "Moshuiwang/lingxi":
+        raise CountEvidenceError("GitHub OWNER provenance repository 无效")
+    pr_number = attestation.get("pr_number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise CountEvidenceError("GitHub OWNER provenance pr_number 无效")
+    base_sha = attestation.get("base_sha")
+    head_sha = attestation.get("head_sha")
+    if not isinstance(base_sha, str) or HEX40_RE.fullmatch(base_sha) is None:
+        raise CountEvidenceError("GitHub OWNER provenance base_sha 无效")
+    if not isinstance(head_sha, str) or HEX40_RE.fullmatch(head_sha) is None:
+        raise CountEvidenceError("GitHub OWNER provenance head_sha 无效")
     if attestation.get("user_id") != 200755707:
         raise CountEvidenceError("GitHub OWNER provenance user_id 不是固定 OWNER")
     nonce = attestation.get("nonce")
@@ -467,12 +518,32 @@ def _validate_stage_provenance(
         value = attestation.get(key)
         if not isinstance(value, str) or HEX64_RE.fullmatch(value) is None:
             raise CountEvidenceError(f"GitHub OWNER provenance {key} 无效")
+    pr_mode = attestation.get("pr_mode")
+    if pr_mode not in {"regular-l3", "evidence-only"}:
+        raise CountEvidenceError("GitHub OWNER provenance pr_mode 无效")
+    challenge = attestation.get("challenge_sha256")
+    if not isinstance(challenge, str) or HEX64_RE.fullmatch(challenge) is None:
+        raise CountEvidenceError("GitHub OWNER provenance challenge_sha256 无效")
     run_id = attestation.get("run_id")
     if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
         raise CountEvidenceError("GitHub OWNER provenance run_id 无效")
     run_sha = attestation.get("run_sha")
     if not isinstance(run_sha, str) or HEX40_RE.fullmatch(run_sha) is None:
         raise CountEvidenceError("GitHub OWNER provenance run_sha 无效")
+    expected_challenge = _run_challenge_digest(
+        repository=repository,
+        pr_number=pr_number,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        run_id=run_id,
+        run_sha=run_sha,
+        pr_mode=pr_mode,
+        comment_id=comment_id,
+        body_sha256=attestation["body_sha256"],
+        api_response_sha256=attestation["response_sha256"],
+    )
+    if challenge != expected_challenge:
+        raise CountEvidenceError("GitHub OWNER provenance challenge 未绑定当前运行证据")
 
     return {
         "kind": STAGE_PROVENANCE_SOURCE,
@@ -490,6 +561,12 @@ def _validate_stage_provenance(
         "response_sha256": attestation["response_sha256"],
         "run_id": run_id,
         "run_sha": run_sha,
+        "repository": repository,
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "pr_mode": pr_mode,
+        "challenge_sha256": challenge,
     }
 
 

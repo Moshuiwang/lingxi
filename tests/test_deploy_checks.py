@@ -955,6 +955,10 @@ class PublishJobGuardTest(unittest.TestCase):
                 uses: actions/upload-artifact@sha
                 with:
                   name: permission-impact-pr-1-abc
+              - name: evidence-only PR 硬 nonmerge/nondeploy sentinel
+                run: |
+                  mode=$(python3 -c 'print(json.load(open("evidence.json"))["pr_mode"])')
+                  if [ "${mode}" = "evidence-only" ]; then exit 1; fi
           extras:
             strategy:
               matrix:
@@ -1049,6 +1053,10 @@ class PublishJobGuardTest(unittest.TestCase):
                   python3 "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py" --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json"
                   python3 "${trusted_base}/scripts/ci/check_permission_impact.py"
                   --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json"
+              - name: evidence-only PR 硬 nonmerge/nondeploy sentinel
+                run: |
+                  mode=$(python3 -c 'print(json.load(open("permission-impact-attestation.json"))["pr_mode"])')
+                  if [ "${mode}" = "evidence-only" ]; then exit 1; fi
               - uses: actions/upload-artifact@sha
                 with:
                   name: permission-impact-trusted-pr-1-abc
