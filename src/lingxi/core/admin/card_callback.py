@@ -398,6 +398,26 @@ class AdminCardCallbackHandler:
                 trace_id=trace_id,
             )
             return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
+        if not position_form and not company_id and not metric_name:
+            # #493 P2-2：四个选择项**一个都没到**。``position_form`` 是按"职位或
+            # 公司范围非空"推断出来的，全空时它判 False，于是整条提交落进下面那条
+            # legacy 分支，回一句「请选择公司」——可是 #493 之后生产卡上渲染的是
+            # 职位+公司范围表单，**根本没有"公司"这个下拉**（见
+            # ``core/admin/management_card.py`` 的 ``admin_manage_position_scope_form``）。
+            # 管理员照着这句话在卡上找不到任何可选项，是一条死路。
+            #
+            # 常规路径不会走到这里：三个字段都是 ``required=True``，飞书客户端会先
+            # 拦住空提交。真正会走到这里的是"表单值整体没到服务端"这一类形态（真实
+            # 回调里 ``action.value`` 整体缺失已经实测复现，见 ``apps/gateway/
+            # __init__.py`` ``make_event_handler`` 文档）——这时候我们无法判断这是
+            # 哪一张表单，因此给一句对两张卡都成立的话，并留一条可检索的审计，让
+            # 下一次真实复现能被指认。不新造"请选择职位"这类同样可能指错卡的措辞。
+            self._audit.record(
+                "admin.card_callback.management_empty_form",
+                admin_action=admin_action,
+                trace_id=trace_id,
+            )
+            return _toast_error("没有收到你在卡片上的选择，请重新选择后再提交")
         if position_form:
             if admin_action != ADMIN_ACTION_GRANT:
                 return _toast_error("职位+公司范围只支持补充授权")

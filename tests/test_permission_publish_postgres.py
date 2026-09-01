@@ -160,6 +160,13 @@ class PermissionPublishPostgresTestCase(unittest.TestCase):
             cursor.execute("SELECT count(*) FROM publish_outbox")
             return int(cursor.fetchone()[0])
 
+    def _account_state(self, user_id: str = USER_A) -> str:
+        """读**已提交**的账号状态（独立连接、独立事务），供并发用例取证。"""
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT account_state FROM app_user WHERE id = %s", (user_id,))
+            return str(cursor.fetchone()[0])
+
     def _set_states(
         self,
         user_id: str = USER_A,
@@ -1870,6 +1877,155 @@ class AccountStateGuardTest(PermissionPublishPostgresTestCase):
             self.store.record_decision(  # type: ignore[call-arg]
                 user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
             )
+
+
+class AccountStateGuardConcurrencyTest(PermissionPublishPostgresTestCase):
+    """Issue #483 P1-1（rc24 缺陷账本 #520 F7）：**真正并发**的那一半。
+
+    ``AccountStateGuardTest`` 的每一条都是"先把状态改成 suspended 并提交，再落
+    决定"——那证明的是"读到 suspended 会挡"，不是"挡住了竞态"。#483 的产品承诺
+    比这强一级（``record_decision`` 文档「这是消除竞态，不是缩小窗口」一节）：
+    管理员的停用写入与这次权限决定抢的是 **同一行 ``app_user`` 的同一把
+    ``FOR UPDATE`` 锁**，两个写入者必然串行，先到者提交之后后到者读到的一定是
+    提交后的状态。
+
+    这条用例造的正是那个窗口：事务 A 先锁住目标行并把 ``account_state`` 翻成
+    ``suspended`` 但**不提交**，事务 B 这时才调 ``record_decision(
+    require_enabled_account=True)``。B 必须停在 A 的行锁上（用
+    ``pg_blocking_pids`` 现场取证，不靠 sleep 猜时序），A 提交之后 B 才继续，
+    并且 **B 必须被挡住**——读到的是 A 刚提交的 ``suspended``，不是它进来那一刻
+    的 ``enabled``。
+
+    去掉 ``_record_decision_locked`` 那条 ``SELECT ... FOR UPDATE`` 的 ``FOR
+    UPDATE`` 之后本用例必须变红：READ COMMITTED 下无锁的 SELECT 直接读到 A 提交
+    前的 ``enabled`` 快照，守卫放行，B 一路把版本推进、把非空授权排进 outbox
+    ——正是 #483 要消灭的那次"给一个已经被停用的人发权限"。假 store 与单线程
+    真库用例都测不出这一条：它是行锁的属性。
+    """
+
+    #: A 持锁的上限。B 的 ``lock_timeout`` 是 2 秒（``adapters/postgres.py`` 的
+    #: ``DEFAULT_LOCK_TIMEOUT_SECONDS``），A 必须在此之内提交，否则 B 会以
+    #: ``PermissionDecisionTransientFailure`` 退出——那是另一条已有用例
+    #: （``TransientFailureRealDbTest``）覆盖的形状，不是本条要证的东西。
+    HOLD_BUDGET_SECONDS = 1.0
+
+    def _blocked_backend_count(self) -> int:
+        """当前库里有多少个后端正被别的事务挡住（``pg_blocking_pids`` 现场取证）。
+
+        用它而不是 ``sleep``：sleep 只能证明"等过一会儿"，证明不了"B 真的撞在 A
+        的行锁上"。探测走独立连接、``autocommit``，不会自己参与竞争。
+        """
+
+        with connect(self._dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT count(*)
+                     FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND cardinality(pg_blocking_pids(pid)) > 0"""
+            )
+            return int(cursor.fetchone()[0])
+
+    def test_a_decision_racing_an_uncommitted_suspension_is_blocked_not_let_through(self) -> None:
+        suspension_applied = threading.Event()
+        allow_commit = threading.Event()
+        holder_errors: list[BaseException] = []
+        decision_result: list[object] = []
+        decision_errors: list[BaseException] = []
+
+        def suspend_without_committing() -> None:
+            """事务 A：管理员那次「停用」写入的形状（先锁 ``app_user`` 行、再翻
+            ``account_state``），停在提交之前，等主线程确认 B 已经撞上来。"""
+
+            try:
+                with connect(self._dsn) as connection:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT id FROM app_user WHERE id = %s FOR UPDATE", (USER_A,)
+                            )
+                            cursor.fetchone()
+                            cursor.execute(
+                                "UPDATE app_user SET account_state = %s, updated_at = now() "
+                                "WHERE id = %s",
+                                ("suspended", USER_A),
+                            )
+                            suspension_applied.set()
+                            # 事务块正常退出即提交；异常退出才回滚。这里等主线程
+                            # 放行，放行时刻就是 A 的提交时刻。
+                            allow_commit.wait(timeout=10)
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                holder_errors.append(error)
+
+        def record_the_decision() -> None:
+            """事务 B：一次正常的每日刷新授权，声明"需要账号有效"。"""
+
+            try:
+                decision_result.append(
+                    self.store.record_decision(
+                        user_id=USER_A,
+                        row=_row(),
+                        reason="daily_permission_refresh",
+                        require_enabled_account=True,
+                        decided_at=NOW,
+                    )
+                )
+            except BaseException as error:  # noqa: BLE001 - 收集到主线程再断言
+                decision_errors.append(error)
+
+        holder = threading.Thread(target=suspend_without_committing, name="uncommitted-suspension")
+        holder.start()
+        self.assertTrue(
+            suspension_applied.wait(timeout=5), "事务 A 未能及时锁住目标行并写入 suspended"
+        )
+        # A 还没提交：此刻库里已提交的状态仍然是 enabled。B 如果读的是"进来那一刻
+        # 的快照"，它读到的就是这个值——这正是本条要证伪的形状。
+        self.assertEqual(self._account_state(), "enabled", "A 尚未提交，已提交状态必须还是 enabled")
+
+        decider = threading.Thread(target=record_the_decision, name="racing-decision")
+        decider.start()
+        try:
+            deadline = time.monotonic() + self.HOLD_BUDGET_SECONDS
+            blocked_observed = False
+            while time.monotonic() < deadline:
+                if self._blocked_backend_count() > 0:
+                    blocked_observed = True
+                    break
+                time.sleep(0.02)
+        finally:
+            # A 提交（或至少结束）——放行必须发生在 B 的 lock_timeout 之内，
+            # 因此无论有没有观察到阻塞都要执行。
+            allow_commit.set()
+            holder.join(timeout=10)
+            decider.join(timeout=15)
+
+        self.assertEqual(holder_errors, [], f"事务 A 不应抛出未预期的异常：{holder_errors}")
+        self.assertFalse(holder.is_alive(), "事务 A 未在预算内结束")
+        self.assertFalse(decider.is_alive(), "事务 B 未在预算内结束")
+        self.assertTrue(
+            blocked_observed,
+            "事务 B 没有停在 A 的行锁上——这次跑的不是并发路径，断言不成立",
+        )
+        # A 确实提交了停用，不是回滚掉了。
+        self.assertEqual(self._account_state(), "suspended", "事务 A 的停用必须已经提交")
+
+        self.assertEqual(
+            decision_result,
+            [],
+            "被挡的决定不得返回任何结论：拿到结论就意味着这次授权真的排出去了",
+        )
+        self.assertEqual(len(decision_errors), 1, "事务 B 必须以异常退出")
+        blocked = decision_errors[0]
+        self.assertIsInstance(
+            blocked,
+            PermissionGrantBlockedByAccountState,
+            "B 必须被账号状态守卫挡住（拿到锁之后读的是 A 刚提交的 suspended）；"
+            f"实际是 {type(blocked).__name__}: {blocked}",
+        )
+        self.assertEqual(blocked.account_state, "suspended")  # type: ignore[attr-defined]
+        # 整体回滚：版本没推进、outbox 一行都没有。少了这一半，"被挡"可能只是
+        # 抛异常之前已经写了半套状态。
+        self.assertEqual(self._version(), 0, "被挡的决定不得推进权限版本")
+        self.assertEqual(self._count(), 0, "被挡的决定不得留下任何发布意图")
 
 
 class NoticeRecipientWhitelistTest(PermissionPublishPostgresTestCase):

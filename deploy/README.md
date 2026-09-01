@@ -578,8 +578,8 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 
 | 服务 | stage（cpus / mem / pids） | 生产（cpus / mem / pids） | 依据 |
 | --- | --- | --- | --- |
-| `scheduler` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程 |
-| `gateway` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 长连接接入 + 事件落库，无子进程扇出 |
+| `scheduler` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程。`compose.prod.yaml` 的 `memory` 默认值是 `1G`，**上线由根 `.env.prod` 覆盖为 512M**，理由见下「三个常驻服务的加总核对」 |
+| `gateway` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 长连接接入 + 事件落库，无子进程扇出。`memory` 与 `scheduler` 同一处置：compose 默认 `1G`，**上线由根 `.env.prod` 覆盖为 512M** |
 | `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
 | `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
 | `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
@@ -599,7 +599,9 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 `scripts/ci/verify_compose_structure.sh` 会分别检查这种 fail-fast 形状及可渲染占位
 值；提示语保持纯 ASCII 单行，避免 YAML 先于插值截断 `${...}`。
 
-生产根 `.env.prod` 应包含以下五行（示例合同，不是要求把文件提交到仓库）：
+生产根 `.env.prod` 的 worker-queue 部分应包含以下五行（示例合同，不是要求把文件提交到
+仓库）。**这五行不是根 `.env.prod` 的全部**——另有两行 `scheduler`/`gateway` 内存必须
+同时写入，见下「三个常驻服务的加总核对」：
 
 ```dotenv
 LINGXI_WORKER_MAX_CONCURRENCY=4
@@ -631,11 +633,49 @@ LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
 2. **上限分环境显式**：值由 `LINGXI_WORKER_QUEUE_TMPFS_SIZE` 决定，stage 与生产均钉在 256m（这块盘吃宿主内存）。
 3. **健康检查看得见这块盘**：`lingxi.apps.healthcheck` 增加可用空间判定，低于总量 10% 判红。修复前它一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页，所以"用户在失败、监控显示 healthy"可以无限期持续。时延口径见 `deploy/监控告警.md`「五、时延估算」的 C 类。
 
-**stage 与生产机器采用同一型号合同**：`scheduler`（stage 512M / 生产 1G）+
-`gateway`（stage 512M / 生产 1G）+ `worker-queue`（2G）三个常驻服务的
-worker-queue 预算固定为 1.5 CPU、2G、512 pids、256m tmpfs；一次性作业的其余
-资源值仍见上表。Agent SDK 一个回合会拉起 Claude CLI 与多个 MCP 子进程，pids
-撞顶的失败形态是进程被直接 kill，因此执行并发上限与资源合同必须保持一致。
+### 三个常驻服务的加总核对
+
+**stage 与生产机器采用同一型号（t3.medium，2 vCPU / 3.74GiB）**，因此两边的加总
+核对用同一台主机的容量来算。**只有三个常驻服务会同时在跑**（`worker`/`migrate`/
+`reauthorize` 是一次性作业，通常不与常驻服务的峰值重叠）：
+
+| `memory` 档 | `scheduler` | `gateway` | `worker-queue` | 三者加总 | 主机 3.74GiB |
+| --- | --- | --- | --- | --- | --- |
+| stage 实配 | 512M | 512M | 2G | **3G** | 余约 700MB ✅ |
+| **生产上线实配** | **512M** | **512M** | 2G | **3G** | 余约 700MB ✅ |
+| （对照）`compose.prod.yaml` 未覆盖时的默认值 | 1G | 1G | 2G | 4G | 会超出主机 ❌ |
+
+**第三行是对照，不是上线值。** `compose.prod.yaml` 里 `scheduler`/`gateway` 的
+`memory` 写成 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}` / `${LINGXI_GATEWAY_MEM_LIMIT:-1G}`
+——`1G` 只是**不覆盖时的默认值**，而生产从来不裸跑默认值：上线时根 `deploy/.env.prod`
+把这两项钉成与 stage 同值 `512M`（元守护 W0-3 盘点结论，执行步骤见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519) S-3.5），
+加总因此是 **3G ≤ 3.74GiB**。这与 D5「生产与 stage 同型」是同一件事，不是新的资源
+合同变更，也**不需要改 `compose.prod.yaml` 的默认值**。所以生产根 `.env.prod` 除了
+上面那五行 worker-queue 值，还须包含：
+
+```dotenv
+LINGXI_SCHEDULER_MEM_LIMIT=512M
+LINGXI_GATEWAY_MEM_LIMIT=512M
+```
+
+**漏配这两行的后果是静默的**：它们是 `:-` 有默认值形态（不是 worker-queue 那种
+`${VAR:?}` fail-fast），漏了不会报错，只会安静地退回 `1G`、把加总推到 4G。部署前
+用渲染回读确认，不要只看 env 文件：
+`docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config scheduler gateway`。
+
+**怎么读这张表**：`deploy.resources.limits` 是**上界，不是预留**，三者同时顶格才会
+真的冲突。CPU 超订（生产 1.0 + 1.0 + 1.5 = 3.5 vCPU 对 2 vCPU）只会限流变慢，内存
+超订撞上去才是被 OOM kill——所以需要逐档核对的是 `memory` 这几行。三个常驻服务里
+只有 `worker-queue` 会长期贴近自己的上限（它单独一个就吃掉 2G，占主机一半以上），
+`scheduler`/`gateway` 都没有子进程扇出（依据见上表「依据」列）。另需知道：stage 浸泡
+实测的宿主可用内存是 1.6~1.7GiB、swap 已用 261MiB，实际余量比"3.74GiB 减去加总"更紧，
+因此上线首周仍应观察三者的实测常驻占用；真要腾地方，先动 `scheduler`/`gateway`，
+不放松 `worker-queue`。
+
+`worker-queue` 自己的 2G 够不够用，推导见[架构设计「九、容量与资源」](../docs/技术设计/架构设计.md)
+（(2048 MiB − 256 MiB tmpfs) ÷ 并发 4 = 每回合 448 MiB）。Agent SDK 一个回合会拉起
+Claude CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直接 kill，因此执行并发
+上限与这组资源值必须一起改、不能单改一边。
 
 **`worker-queue` 的内存限额与并发上限必须同步设，两者是同一个约束的两半**：
 `LINGXI_WORKER_MAX_CONCURRENCY`（`apps/worker/config.py`）决定一个容器同一时刻

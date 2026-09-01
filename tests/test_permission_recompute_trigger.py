@@ -250,6 +250,84 @@ class TimeoutAndSkippedOutcomeTests(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: failed == [pending]))
         self.assertEqual(completed, [])
 
+    def test_account_not_enabled_skip_is_routed_to_on_skipped_with_its_reason(self) -> None:
+        """Trace #521 F5（#493 P1-3）：``SKIPPED`` 登记了 ``on_skipped`` 时单独分流，
+        并且**把 reason 一起交出去**——调用方只有拿到 reason 才能分辨"这个人已停用、
+        永远等不到日批"与"快照缺失、日批会纠正"，否则只能共用同一句假承诺。
+        """
+
+        class _AccountNotEnabledDelegate:
+            def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
+                return TargetedRecomputeOutcome(
+                    kind=RecomputeKind.SKIPPED, reason="account_not_enabled"
+                )
+
+        audit = _RecordingAudit()
+        completed: list[PendingAction] = []
+        failed: list[PendingAction] = []
+        skipped: list[tuple[PendingAction, TargetedRecomputeOutcome]] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            _AccountNotEnabledDelegate(),
+            audit=audit,
+            on_completed=completed.append,
+            on_failed=lambda pending, error: failed.append(pending),
+            on_skipped=lambda pending, outcome: skipped.append((pending, outcome)),
+        )
+        pending = _pending(pending_id="pac_bg_notenabled_00000000001")
+        executor.trigger(pending)
+
+        self.assertTrue(_wait_until(lambda: len(skipped) == 1))
+        self.assertEqual(skipped[0][0], pending)
+        self.assertIs(skipped[0][1].kind, RecomputeKind.SKIPPED)
+        self.assertEqual(skipped[0][1].reason, "account_not_enabled")
+        self.assertEqual(failed, [], "跳过不是失败，不得再走失败回调")
+        self.assertEqual(completed, [])
+
+    def test_a_real_failure_still_goes_to_on_failed_even_with_on_skipped_registered(
+        self,
+    ) -> None:
+        """反向对照：真正的执行失败与跳过必须分得开。没有这一条，"把所有异常都当跳过"
+        这种误伤仍然是绿的。"""
+
+        audit = _RecordingAudit()
+        failed: list[tuple[PendingAction, Exception | None]] = []
+        skipped: list[PendingAction] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            _FailingDelegate(RuntimeError("boom")),
+            audit=audit,
+            on_failed=lambda pending, error: failed.append((pending, error)),
+            on_skipped=lambda pending, outcome: skipped.append(pending),
+        )
+        pending = _pending(pending_id="pac_bg_realfail_000000000001")
+        executor.trigger(pending)
+
+        self.assertTrue(_wait_until(lambda: len(failed) == 1))
+        self.assertEqual(failed[0][0], pending)
+        self.assertIsInstance(failed[0][1], Exception)
+        self.assertEqual(skipped, [])
+
+    def test_not_registering_on_skipped_keeps_the_previous_behaviour(self) -> None:
+        """未登记 ``on_skipped`` 时逐字节回落 ``on_failed``——这条参数不改变任何既有
+        调用方的行为。"""
+
+        class _SkippedDelegate:
+            def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
+                return TargetedRecomputeOutcome(
+                    kind=RecomputeKind.SKIPPED, reason="account_not_enabled"
+                )
+
+        audit = _RecordingAudit()
+        failed: list[PendingAction] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            _SkippedDelegate(),
+            audit=audit,
+            on_failed=lambda pending, error: failed.append(pending),
+        )
+        pending = _pending(pending_id="pac_bg_nocallback_0000000001")
+        executor.trigger(pending)
+
+        self.assertTrue(_wait_until(lambda: failed == [pending]))
+
     def test_enqueued_targeted_recompute_is_reported_as_waiting_not_effective(self) -> None:
         class _EnqueuedDelegate:
             def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:

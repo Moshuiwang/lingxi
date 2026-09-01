@@ -136,6 +136,9 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.range_revoked",
     "permission.all_companies",
     "permission.management_correction_summary",
+    # 管理卡对已停用用户做本地权限动作时的真话（Trace #521 F5，#493 P1-3）：
+    # 不能再与普通失败共用「将在次日批处理修正」这句假承诺，理由见 content.toml。
+    "permission.management_account_not_enabled",
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
     "delivery.document_ready_degraded",
@@ -164,6 +167,10 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "memory.type_label.term_mapping",
     "memory.type_label.calibration_preference",
     "memory.type_label.convention_template",
+    # 管理命令面「没看懂」回复（Trace #521 F4-3）：第一条给闲聊（正文与既有文案
+    # 逐字相同），第二条给已判定出失败段的 /admin 命令，带段名与实际分段数。
+    "admin.unknown_command",
+    "admin.unknown_command_detail",
 )
 
 REQUIRED_CARD_KEYS: tuple[str, ...] = (

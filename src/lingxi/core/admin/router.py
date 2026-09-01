@@ -24,9 +24,11 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+from lingxi.config.content import ContentCatalog, RenderedContent, default_content_catalog
 from lingxi.core.admin.commands import (
     AdminCommandKind,
     AdminRejectReason,
+    describe_admin_tokens,
     parse_admin_command,
 )
 from lingxi.core.admin.display_names import AdminDisplayNames
@@ -682,13 +684,25 @@ class AdminCommandRouter:
         # 记进审计是为了让下一次"真人踩到但现场取不到正文"的调查至少知道是哪一段
         # 没通过——Trace #502 W0-2 那次调查正是卡在这里（三条失败只留下一个不带
         # 原因的 UNKNOWN，两个竞争假设至今无法区分）。
+        # 取证字段（#521 F4-1）：只有 ``/admin`` 开头的**命令尝试**留证。形状分类不含
+        # 原文；原文本身产品负责人已裁定本项目验证范围内不按隐私数据处理（凭据/授权码
+        # 从不出现在命令面）。闲聊一个字都不记，见 ``describe_admin_tokens``。
+        shapes = describe_admin_tokens(text)
+        forensics: dict[str, object] = {}
+        if shapes.is_admin_prefixed:
+            forensics = {
+                "token_count": shapes.argument_count,
+                "token_shapes": shapes.shape_summary,
+                "raw_admin_text": shapes.raw_text,
+            }
+        rendered = _render_unknown(command.reject_reason, shapes.argument_count)
         return self._record_or_reject(
             "admin.command.unknown",
             AdminRouteOutcome(
                 handled=True,
-                content_key="admin.unknown_command",
-                content_version=_CONTENT_VERSION,
-                reply_text=_render_unknown(command.reject_reason),
+                content_key=rendered.key,
+                content_version=rendered.version,
+                reply_text=rendered.text,
             ),
             actor=entry.feishu_open_id,
             roles=roles,
@@ -696,6 +710,7 @@ class AdminCommandRouter:
                 command.reject_reason.value if command.reject_reason is not None else None
             ),
             trace_id=trace_id,
+            **forensics,
         )
 
     def _dispatch_write_action(
@@ -1456,16 +1471,30 @@ _REJECT_HINTS: dict[AdminRejectReason, str] = {
     AdminRejectReason.BAD_TRACE_ID: "没有认出追溯号——这一段请填完整的 26 位追溯号，不要带前缀",
 }
 
-#: 不以 ``/admin`` 开头的文本得到的既有文案，逐字不变（Issue #492 完成标准 3）。
-#: 管理命令面**没有 ``/admin`` 前缀预检**，已登记管理员发的任何一句闲聊都会走到
-#: UNKNOWN 分支；对这些输入做分段报错等于对每句闲聊解释命令语法，是误伤。
-_UNKNOWN_COMMAND_TEXT = "未识别的管理命令，请发送 /admin help 查看可用命令。"
+#: 闲聊得到的既有笼统文案键（#492 完成标准 3，正文逐字不变；#521 F4-3 把它移进
+#: ``config/content.toml`` 的版本化目录）。管理命令面**没有 ``/admin`` 前缀预检**，
+#: 管理员的任何一句闲聊都会走到 UNKNOWN；对它们做分段报错等于对每句闲聊解释语法。
+_UNKNOWN_COMMAND_KEY = "admin.unknown_command"
+#: 已判定出"哪一段没看懂"时的分段报错键。
+_UNKNOWN_COMMAND_DETAIL_KEY = "admin.unknown_command_detail"
 
 
-def _render_unknown(reject_reason: AdminRejectReason | None) -> str:
-    """``UNKNOWN`` 的回复：以 ``/admin`` 开头的失败说清是哪一段没看懂，其余原样。"""
+def _render_unknown(
+    reject_reason: AdminRejectReason | None,
+    segment_count: int,
+    catalog: ContentCatalog | None = None,
+) -> RenderedContent:
+    """``UNKNOWN`` 的回复：说清哪一段没看懂 + 实际分成了几段参数（#521 F4-3）。
 
+    ``segment_count`` 是管理员自救的关键事实——#492 那次，管理员发的是"一个邮箱
+    + 24"两段、解析器数出三段；只有把这个数字说出来，才可能意识到"客户端把邮箱
+    拆开了"，而不是反复重发同一条命令。它来自分段计数，**不回显任何输入原文**。
+    """
+
+    catalog = catalog if catalog is not None else default_content_catalog()
     hint = _REJECT_HINTS.get(reject_reason) if reject_reason is not None else None
     if hint is None:
-        return _UNKNOWN_COMMAND_TEXT
-    return f"这条管理命令没有完全看懂：{hint}。请发送 /admin help 查看正确格式后重发。"
+        return catalog.text(_UNKNOWN_COMMAND_KEY)
+    return catalog.text(
+        _UNKNOWN_COMMAND_DETAIL_KEY, hint=hint, segment_count=segment_count
+    )

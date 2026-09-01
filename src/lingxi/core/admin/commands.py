@@ -54,6 +54,50 @@ _UNSUPPORTED_LINK_SCHEME_PATTERN = re.compile(
     r"^(?:https?|ftp|javascript|data|tel|file):", re.IGNORECASE
 )
 
+#: 「显示文本 + 链接目标被拆成两段」的多 token 形态（Trace #521 W0-1）。
+#:
+#: 2026-09-01 的真实失败与上面那批**单 token** 形态无关：``/admin audit <邮箱> 24``
+#: 落的是 ``wrong_argument_count``，而 ``_parse_audit`` 只在 ``len(rest) >= 3`` 时
+#: 返回这个原因——三种已适配的单 token 形态（裸邮箱 / ``mailto:E`` /
+#: ``[E](mailto:E)``）实测全部解析成功，被拒的五种单 token 形态实测全部落
+#: ``bad_identifier``。也就是说：邮箱那一段在正文里**占了两段以上空白分隔的 token**，
+#: 这是唯一能产生观察到那条审计的结构。:func:`_normalize_identifier` 是单 token
+#: 归一化，结构上覆盖不到这一类，因此这里在 ``str.split()` 之前先做一次文本级归一。
+#:
+#: 归一条件严格是「显示文本与链接目标是**同一个**邮箱」：两侧各自剥掉可选的
+#: ``mailto:`` 前缀后都要通过 :data:`_EMAIL_PATTERN`，并且逐字相等。任何一侧不是
+#: 邮箱、或两侧不一致（``<a href="mailto:a@b">别人</a>``、``E (https://…)``）一律
+#: **不归一**——fail closed，输入继续按原样落到既有的拒绝分支，绝不把"看到 A、
+#: 操作 B"的错位变成一次成功解析。
+#:
+#: 这些形态是对「飞书 text 消息里邮箱被自动链接化后的纯文本表现」的推理候选 +
+#: 逐形态实测的合成夹具，**不是真实抓包的逐字节回读**；哪一种真的发生过要靠
+#: ``router.py`` 新增的 ``token_shapes`` 取证字段在下一次复现时指认。
+_LINK_PAIR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # <a href="mailto:E">E</a>（含单引号、附加属性；富文本降级成 HTML 时的形态）
+    re.compile(
+        r"<a\b[^<>]*?\bhref\s*=\s*(?P<quote>[\"'])(?P<target>[^\"'<>]*)(?P=quote)[^<>]*>"
+        r"\s*(?P<display>[^<>]*?)\s*</a>",
+        re.IGNORECASE,
+    ),
+    # [E] (mailto:E)：markdown 链接被插入空格
+    re.compile(r"\[\s*(?P<display>[^\[\]\s]+)\s*\]\s+\(\s*(?P<target>[^()\s]+)\s*\)"),
+    # E (mailto:E) / E (E)：「显示文本 (目标)」式扁平化
+    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+\(\s*(?P<target>[^()\s]+)\s*\)"),
+    # E [mailto:E]
+    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+\[\s*(?P<target>[^\[\]\s]+)\s*\]"),
+    # E <mailto:E>：RFC 5322 / 部分客户端的「显示 <目标>」
+    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+<\s*(?P<target>[^<>\s]+)\s*>"),
+    # E mailto:E：显示与目标之间只剩一个空格
+    re.compile(
+        r"(?P<display>[^\s()\[\]<>`]+)\s+(?P<target>mailto:[^\s()\[\]<>`]+)",
+        re.IGNORECASE,
+    ),
+)
+
+#: 逐 token 形状分类里用到的 CJK 判定（与 :data:`_METRIC_TOKEN_PATTERN` 同一区段）。
+_CJK_PATTERN = re.compile(r"[一-鿿]")
+
 #: 指标名 token 允许的形状（#439 A 档新增中文别名支持）：在 ``_IDENTIFIER_PATTERN``
 #: 的基础上额外放行 CJK 统一表意文字区（``一-鿿``）——真实指标目录
 #: （``config/company_function_metric_map.toml``）当前全部是英文 snake_case 内部
@@ -237,6 +281,160 @@ def _normalize_identifier(token: str) -> str | None:
     return token
 
 
+def _link_payload_email(token: str) -> str | None:
+    """剥掉可选的 ``mailto:`` 前缀后，这一段是不是一个邮箱？不是就返回 ``None``。
+
+    显示侧与目标侧共用同一个判定，因此 ``mailto:E`` 与 ``E`` 会归一到同一个值——
+    ``E (mailto:E)`` 与 ``mailto:E (mailto:E)`` 都算「显示与目标一致」。归一后的值
+    仍要通过 :data:`_IDENTIFIER_PATTERN`，本函数不放宽字符集。
+    """
+
+    if token[: len(_MAILTO_SCHEME)].casefold() == _MAILTO_SCHEME:
+        token = token[len(_MAILTO_SCHEME) :]
+    return token if _EMAIL_PATTERN.fullmatch(token) else None
+
+
+def _collapse_link_pair(match: "re.Match[str]") -> str:
+    """显示与目标是同一个邮箱才合并成一段；否则原样退回（fail closed）。"""
+
+    display = _link_payload_email(match.group("display"))
+    target = _link_payload_email(match.group("target"))
+    if display is None or target is None or display != target:
+        return match.group(0)
+    return display
+
+
+def _collapse_identifier_link_forms(text: str) -> str:
+    """把「显示文本 + 链接目标」这类多段形态合并回一个邮箱 token。
+
+    见 :data:`_LINK_PAIR_PATTERNS`。只做合并，不改写邮箱本身的大小写或内容；一次
+    都没合并成功时返回的字符串与入参逐字相等（调用方据此判断"要不要重试解析"）。
+    """
+
+    for pattern in _LINK_PAIR_PATTERNS:
+        text = pattern.sub(_collapse_link_pair, text)
+    return text
+
+
+#: 逐 token 形状分类的取值（Trace #521 F4-1）。**只描述形状，不含任何输入原文**，
+#: 因此可以原样写进审计字段 ``token_shapes``——下一次真人踩到时，这一串就足以指认
+#: 客户端到底把邮箱渲染成了哪一种纯文本形态，不必再靠推理排除。
+_TOKEN_SHAPE_OTHER = "other"
+
+#: ``raw_text`` 的长度上限：取证要的是"客户端把命令渲染成了什么"，不是让一条审计
+#: 行被一次超长输入撑爆。超出部分截断并留可见标记。
+_RAW_ADMIN_TEXT_LIMIT = 512
+_RAW_ADMIN_TEXT_TRUNCATION_MARK = "…[truncated]"
+
+
+def _token_shape(token: str) -> str:
+    """把一个空白分隔的 token 归到一个固定的形状名上。见 :data:`_TOKEN_SHAPE_OTHER`。"""
+
+    lowered = token.casefold()
+    if lowered == _COMMAND_PREFIX:
+        return "admin_prefix"
+    if lowered.startswith("</a"):
+        return "html_anchor_close"
+    if lowered.startswith("<a"):
+        return "html_anchor_open"
+    if lowered.startswith("href="):
+        # ``<a href="mailto:E">E</a>`` 被空白切开后的第二段同时以 ``href=`` 开头、
+        # 以 ``</a>`` 结尾；属性名是更有信息量的那一半，先判它。
+        return "html_href_attribute"
+    if "</a>" in lowered:
+        return "html_anchor_close"
+    if token.isdigit():
+        return "digits"
+    if _EMAIL_PATTERN.fullmatch(token):
+        return "email"
+    if lowered.startswith(_MAILTO_SCHEME):
+        payload = token[len(_MAILTO_SCHEME) :]
+        return "mailto_email" if _EMAIL_PATTERN.fullmatch(payload) else "mailto_other"
+    if _MARKDOWN_LINK_PATTERN.fullmatch(token):
+        return "markdown_link"
+    if _ANGLE_AUTOLINK_PATTERN.fullmatch(token):
+        return "angle_wrapped"
+    if _INLINE_CODE_PATTERN.fullmatch(token):
+        return "backtick_wrapped"
+    if token.startswith("(") and token.endswith(")") and len(token) > 1:
+        return "paren_wrapped"
+    if token.startswith("[") and token.endswith("]") and len(token) > 1:
+        return "bracket_wrapped"
+    if _UNSUPPORTED_LINK_SCHEME_PATTERN.match(token) or "://" in token:
+        return "url"
+    if is_ulid(token):
+        return "ulid"
+    if token.startswith("ou_"):
+        return "open_id_like"
+    if token.startswith(
+        (_OVERRIDE_ID_PREFIX, _PERMISSION_GROUP_ID_PREFIX, _LEGACY_PERMISSION_GROUP_ID_PREFIX)
+    ):
+        return "override_id_like"
+    if _CJK_PATTERN.search(token):
+        return "cjk_text"
+    if "@" in token:
+        return "at_shaped"
+    if _IDENTIFIER_PATTERN.fullmatch(token):
+        return "bare_word"
+    return _TOKEN_SHAPE_OTHER
+
+
+@dataclass(frozen=True)
+class AdminTokenShapes:
+    """一条管理命令输入的**形状**画像（Trace #521 F4-1），不含任何输入原文。
+
+    ``router.py`` 在 ``admin.command.unknown`` 分支把它写进审计，并用
+    ``argument_count`` 让回复能说出"实际收到 N 段参数"。为什么值得单独取证：#492 的
+    调查里，一条 ``wrong_argument_count`` 只留下一个枚举名，无法区分"客户端把邮箱
+    拆成了两段"和"管理员真的多打了一个参数"——两个假设都能产生逐字相同的审计。
+    """
+
+    #: 整条文本是不是以 ``/admin`` 开头。不是就不做任何取证（闲聊不留原文）。
+    is_admin_prefixed: bool
+    #: ``/admin <子命令>`` 之后还剩几段（归一化**之前**的原始分段数）。
+    argument_count: int
+    #: 逐 token 形状，顺序与原文一致；长度等于整条文本的原始分段数。
+    shapes: tuple[str, ...]
+    #: 供审计留证的命令原文（超长按 :data:`_RAW_ADMIN_TEXT_LIMIT` 截断）。**不是
+    #: ``/admin`` 开头时恒为空串**——闲聊不留原文这条纪律在取样这一步就已经生效，
+    #: 不依赖调用方记得判断。
+    raw_text: str
+
+    @property
+    def shape_summary(self) -> str:
+        """审计字段用的一行摘要（逗号分隔的形状名，无原文）。"""
+
+        return ",".join(self.shapes)
+
+
+def describe_admin_tokens(text: object) -> AdminTokenShapes:
+    """按 :class:`AdminTokenShapes` 描述一条输入的分段形状（Trace #521 F4-1）。
+
+    刻意在**归一化之前**取样：走到 ``UNKNOWN`` 说明归一化要么没触发、要么没能救回
+    这条输入，此时真正需要留证的正是客户端发过来的原始分段。
+    """
+
+    if not isinstance(text, str):
+        return AdminTokenShapes(
+            is_admin_prefixed=False, argument_count=0, shapes=(), raw_text=""
+        )
+    tokens = text.strip().split()
+    is_admin_prefixed = bool(tokens) and tokens[0].casefold() == _COMMAND_PREFIX
+    raw_text = ""
+    if is_admin_prefixed:
+        raw_text = (
+            text
+            if len(text) <= _RAW_ADMIN_TEXT_LIMIT
+            else text[:_RAW_ADMIN_TEXT_LIMIT] + _RAW_ADMIN_TEXT_TRUNCATION_MARK
+        )
+    return AdminTokenShapes(
+        is_admin_prefixed=is_admin_prefixed,
+        argument_count=max(0, len(tokens) - 2),
+        shapes=tuple(_token_shape(token) for token in tokens),
+        raw_text=raw_text,
+    )
+
+
 def parse_admin_command(text: object) -> AdminCommand:
     """把一条私聊文本解析成三条已知命令之一，或 ``UNKNOWN``。
 
@@ -296,11 +494,42 @@ def parse_admin_command(text: object) -> AdminCommand:
     **``UNKNOWN`` 会带上是哪一段没看懂（Issue #492）**：见
     :class:`AdminRejectReason` 与 ``AdminCommand.reject_reason``。这只增加一个
     仅在 ``UNKNOWN`` 时填写的字段，命令的语义、权限与角色门槛一概不变。
+
+    **标识参数容忍「显示文本 + 链接目标」被拆成多段（Trace #521 W0-1/F4）**：整条
+    文本按原样解析**失败**时，才用 :func:`_collapse_identifier_link_forms` 把
+    ``<a href="mailto:E">E</a>``、``E (mailto:E)``、``E mailto:E`` 一类相邻形态
+    合并成一个邮箱 token，再解析一次。这条重试是单向的安全阀：
+
+    - 原样就能解析成功的输入**不进入归一化**，行为逐字节不变（闲聊连
+      ``/admin`` 前缀都没有，更是第一步就返回，绝不被改写）；
+    - 归一化后仍然解析不出来时，返回的是**原样解析的失败原因**，不因为多试了一次
+      就换一个更让人困惑的落点；
+    - 显示文本与链接目标不是同一个邮箱时一律不合并（fail closed），避免"看到 A、
+      操作 B"。
     """
 
     if not isinstance(text, str):
         return _unknown(AdminRejectReason.NOT_A_COMMAND)
-    tokens = text.strip().split()
+
+    command = _parse_tokens(text.strip().split())
+    if (
+        command.kind is not AdminCommandKind.UNKNOWN
+        or command.reject_reason is AdminRejectReason.NOT_A_COMMAND
+    ):
+        return command
+
+    collapsed = _collapse_identifier_link_forms(text)
+    if collapsed == text:
+        return command
+    retried = _parse_tokens(collapsed.strip().split())
+    if retried.kind is AdminCommandKind.UNKNOWN:
+        return command
+    return retried
+
+
+def _parse_tokens(tokens: list[str]) -> AdminCommand:
+    """已经按空白切好的一条命令的解析主体，见 :func:`parse_admin_command`。"""
+
     if not tokens or tokens[0].lower() != _COMMAND_PREFIX:
         return _unknown(AdminRejectReason.NOT_A_COMMAND)
     if len(tokens) < 2:

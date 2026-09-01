@@ -20,7 +20,13 @@ from lingxi.core.admin.management_card import (
 from lingxi.core.admin.router import AdminRouteOutcome
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
 from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverrideView
+from lingxi.config.content import default_content_catalog
 from lingxi.core.permission.position_override import expand_position_scope
+from lingxi.core.permission.targeted_recompute import (
+    SKIP_ACCOUNT_NOT_ENABLED,
+    RecomputeKind,
+    TargetedRecomputeOutcome,
+)
 
 
 NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
@@ -721,16 +727,25 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         )
         return store
 
-    def _submit(self, handler, *, operator="ou_admin", identifier="u@example.com"):
+    def _submit(
+        self,
+        handler,
+        *,
+        operator="ou_admin",
+        identifier="u@example.com",
+        position_name="A运营",
+        company_scope="c1",
+        reason="特批",
+    ):
         return handler.handle_management_form_submit(
             operator_open_id=operator,
             admin_action=ADMIN_ACTION_GRANT,
             identifier=identifier,
             company_id="",
             metric_name="",
-            reason="特批",
-            position_name="A运营",
-            company_scope="c1",
+            reason=reason,
+            position_name=position_name,
+            company_scope=company_scope,
             chat_id="oc_1",
             thread_id=None,
             message_id="om_1",
@@ -891,6 +906,323 @@ class ManagementCardCallbackSecurityTests(unittest.TestCase):
         self.assertEqual(store.lookup_context(message_id="om_1").state, "ready")
         self.assertEqual(refresh.calls[-1]["state"], "ready")
         self.assertIsNone(refresh.calls[-1]["dispatch_status"])
+
+    # ------------------------------------------------------------------
+    # #493 P1-2（rc24 缺陷账本 #520 F6）：职位表单两个必填项的服务端否定用例。
+    # 此前 `handle_management_form_submit` 的「缺职位 / 缺范围」两条拒绝分支
+    # 零测试覆盖——删掉它们全套用例仍全绿。它与 Trace #469 已经付过学费的
+    # 「参数静默左移」是同一族路径（见下面的 `PositionCommandShiftReproductionTests`
+    # 逐字复现），下游 `_parse_position_permission_command` 的语法门只在取值
+    # 恰好不合语法时才兜得住，不能当成这两条校验的替代品。
+    # ------------------------------------------------------------------
+
+    def test_missing_position_name_is_rejected_before_routing(self) -> None:
+        """缺职位：服务端必须在拼命令文本之前拒绝，并给出「请选择银河职位」。
+
+        变异锚点：删掉 ``card_callback.py`` 里 ``if not position_name.strip():
+        return _toast_error("请选择银河职位")`` 两行后，本用例由绿转红。
+        """
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="", company_scope="c1")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(response["toast"]["content"], "请选择银河职位")
+        self.assertEqual(route.calls, [], "缺职位必须在拼命令文本、调用 route() 之前拦住")
+
+    def test_missing_company_scope_is_rejected_before_routing(self) -> None:
+        """缺范围：服务端必须在拼命令文本之前拒绝，并给出「请选择公司范围」。
+
+        变异锚点：删掉 ``card_callback.py`` 里 ``if not company_scope.strip():
+        return _toast_error("请选择公司范围")`` 两行后，本用例由绿转红。
+        """
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="A运营", company_scope="")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertEqual(response["toast"]["content"], "请选择公司范围")
+        self.assertEqual(route.calls, [], "缺范围必须在拼命令文本、调用 route() 之前拦住")
+
+    def test_whitespace_only_position_or_scope_is_treated_as_missing(self) -> None:
+        """只填空白等于没填：``.strip()`` 之后为空的取值必须落回同一条「请选择」
+        文案，而不是滑到下游那条更笼统的「职位或公司范围无效」——两者都拒绝，
+        但只有前者告诉管理员到底缺哪一项。全角空格（U+3000）同样算空白。"""
+
+        status = _status()
+        for position_name, company_scope, expected in (
+            ("   ", "c1", "请选择银河职位"),
+            ("\u3000", "c1", "请选择银河职位"),
+            ("A运营", "   ", "请选择公司范围"),
+            ("A运营", "\u3000", "请选择公司范围"),
+        ):
+            with self.subTest(position_name=position_name, company_scope=company_scope):
+                route = _Route()
+                store = self._store(status)
+                handler = self._handler(
+                    status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+                )
+
+                response = self._submit(
+                    handler, position_name=position_name, company_scope=company_scope
+                )
+
+                self.assertEqual(response["toast"]["type"], "error")
+                self.assertEqual(response["toast"]["content"], expected)
+                self.assertEqual(route.calls, [])
+
+    def test_both_fields_present_still_routes(self) -> None:
+        """否定用例的另一半：两项都选齐时新增断言不得误伤主路径。"""
+
+        status = _status()
+        route = _Route()
+        store = self._store(status)
+        handler = self._handler(
+            status=status, route=route, store=store, refresh=_Refresh(), audit=_Audit()
+        )
+
+        response = self._submit(handler, position_name="A运营", company_scope="c1")
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(len(route.calls), 1)
+        self.assertEqual(
+            route.calls[0]["text"], "/admin grant_position u@example.com A运营 c1 特批"
+        )
+
+
+class PositionCommandShiftReproductionTests(unittest.TestCase):
+    """复现「缺职位 / 缺范围」被放过去之后会发生什么（#493 P1-2 / #520 F6）。
+
+    这里不经过 handler 的校验，直接把「少了一段」的命令文本喂给
+    ``parse_admin_command``：连续空白被 ``str.split()`` 吃成一个分隔符，后面
+    每个字段整体左移一位，解析结果仍然是一条形状完全合法的
+    ``GRANT_POSITION_PERMISSION``——只是职位或公司范围已经换成了管理员从没
+    选过的取值，而管理员看到的却是「已提交，请确认」这类正常回执。
+
+    下游语法门只在左移后的取值恰好不合语法时才拒绝，因此它是运气、不是护栏；
+    这组用例把这一点钉住，防止有人以为「反正下游会拒绝」就够安全（Trace #469
+    已经为同一族根因付过一次学费）。
+    """
+
+    def test_a_missing_position_name_shifts_the_company_scope_into_the_position(self) -> None:
+        identifier = "u@example.com"
+        position_name = ""
+        company_scope = "c1"
+        reason = "c2 补充授权"
+        shifted = f"/admin grant_position {identifier} {position_name} {company_scope} {reason}"
+
+        parsed = parse_admin_command(shifted)
+
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(parsed.position_name, "c1", "管理员选的公司范围被当成了职位")
+        self.assertEqual(parsed.company_scope, "c2", "公司范围换成了原因里的第一个词")
+        self.assertEqual(parsed.reason, "补充授权")
+
+    def test_a_missing_company_scope_shifts_the_reason_into_the_scope(self) -> None:
+        identifier = "u@example.com"
+        position_name = "A运营"
+        company_scope = ""
+        reason = "c2 补充授权"
+        shifted = f"/admin grant_position {identifier} {position_name} {company_scope} {reason}"
+
+        parsed = parse_admin_command(shifted)
+
+        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_POSITION_PERMISSION, "左移后仍然形状合法")
+        self.assertEqual(parsed.position_name, "A运营")
+        self.assertEqual(
+            parsed.company_scope, "c2", "授权范围变成了管理员从没选过的公司"
+        )
+        self.assertEqual(parsed.reason, "补充授权")
+
+
+class _RefresherTransport:
+    def __init__(self) -> None:
+        self.updated: list[dict] = []
+
+    def update(self, **kwargs):
+        self.updated.append(kwargs)
+
+
+class _RefresherContextStore:
+    def next_card_sequence(self, *, message_id: str) -> int:
+        self.message_id = message_id
+        return 3
+
+
+def _refresher_context():
+    return type(
+        "Context",
+        (),
+        {
+            "message_id": "om_f5",
+            "card_id": "card_f5",
+            "identifier": "u@example.com",
+            "last_trace_id": "trc_f5",
+        },
+    )()
+
+
+def _rendered_status(transport: _RefresherTransport) -> str:
+    elements = list(_walk(transport.updated[-1]["card"]["body"]["elements"]))
+    return "\n".join(
+        element.get("content", "") for element in elements if element.get("tag") == "markdown"
+    )
+
+
+def _render_incomplete(*, account_state: str, dispatch_status: str | None) -> str:
+    from lingxi.apps.gateway import _GatewayManagementCardRefresher
+
+    transport = _RefresherTransport()
+    refresher = _GatewayManagementCardRefresher(
+        transport=transport,
+        catalog=_PositionCatalog(),
+        display_names=_DisplayNames(),
+        context_store=_RefresherContextStore(),
+    )
+    refresher.update(
+        context=_refresher_context(),
+        status=AdminUserStatusView(
+            identifier="ou_target",
+            provisioning_state="active",
+            account_state=account_state,
+            permission_version=1,
+            updated_at="2026-08-31T12:00:00+00:00",
+        ),
+        state="incomplete",
+        dispatch_status=dispatch_status,
+    )
+    return _rendered_status(transport)
+
+
+class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
+    """#493 P1-3（Trace #521 F5）：给**已停用**用户补充授权后，管理卡不得再说
+    「权限下发未完成，将在次日批处理修正」。
+
+    那句话是假承诺，不是措辞问题：发权每日批遍历的基线是
+    ``provisioning_state='active' AND account_state='enabled'``
+    （``adapters/postgres_permission_publish.PERMISSION_REFRESH_BASELINE_SQL``），
+    停用用户根本不进遍历集合——``tests/test_permission_refresh_postgres.py`` 的
+    ``test_a_later_round_no_longer_touches_the_suspended_user_and_the_state_is_correct``
+    已经用真库把这条事实钉死了。文案与既有测试互相矛盾，改的是文案。
+
+    本类只钉"管理员看到什么"，不改产品语义：override 照常落库（``prepare`` 不读
+    账号状态），本次只是如实告知不下发。
+    """
+
+    #: 这三个片段构成"真话"的三要素，缺一条这条修复就没有完成。
+    TRUTH_FRAGMENTS = ("已停用", "不会下发", "恢复账号后由次日批处理生效")
+    #: 这些片段一旦出现，就等于又向管理员承诺了"当前会自动修正"。
+    FALSE_PROMISES = ("将在次日批处理修正", "最迟次日自动纠正")
+
+    def _assert_is_the_truth(self, visible: str) -> None:
+        for fragment in self.TRUTH_FRAGMENTS:
+            self.assertIn(fragment, visible, f"真话缺了「{fragment}」这一要素")
+        for promise in self.FALSE_PROMISES:
+            self.assertNotIn(promise, visible, f"仍然向管理员承诺了「{promise}」")
+
+    def test_the_account_not_enabled_skip_renders_the_truth(self) -> None:
+        """SKIPPED/account_not_enabled 走新文案。"""
+
+        from lingxi.apps.gateway.management_status import (
+            skipped_recompute_status_message,
+        )
+
+        message = skipped_recompute_status_message(
+            TargetedRecomputeOutcome(
+                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
+            )
+        )
+        self.assertIsNotNone(message)
+        assert message is not None
+        self._assert_is_the_truth(message)
+        # 文案必须来自版本化内容目录，不是散落在装配代码里的字面量。
+        self.assertEqual(
+            message,
+            default_content_catalog().text("permission.management_account_not_enabled").text,
+        )
+
+    def test_that_truth_actually_reaches_the_rendered_card(self) -> None:
+        """真话必须真的出现在管理员看到的那张卡上，不只是回调的返回值。"""
+
+        from lingxi.apps.gateway.management_status import (
+            skipped_recompute_status_message,
+        )
+
+        message = skipped_recompute_status_message(
+            TargetedRecomputeOutcome(
+                kind=RecomputeKind.SKIPPED, reason=SKIP_ACCOUNT_NOT_ENABLED
+            )
+        )
+        self._assert_is_the_truth(
+            _render_incomplete(account_state="suspended", dispatch_status=message)
+        )
+
+    def test_a_real_failure_still_gets_the_original_wording(self) -> None:
+        """反向对照一：普通失败（不是跳过）仍走原文案。
+
+        没有这一条，"把所有未完成都改口成已停用"这种停服级误伤仍然是绿的。
+        """
+
+        visible = _render_incomplete(
+            account_state="enabled",
+            dispatch_status="下发未完成，最迟次日自动纠正 · 追溯号 trc_f5",
+        )
+        self.assertIn("最迟次日自动纠正", visible)
+        for fragment in self.TRUTH_FRAGMENTS:
+            self.assertNotIn(fragment, visible)
+
+    def test_the_generic_incomplete_fallback_is_unchanged_for_an_enabled_user(self) -> None:
+        """反向对照二：账号正常的用户，兜底渲染仍逐字是原来那句。"""
+
+        visible = _render_incomplete(account_state="enabled", dispatch_status="incomplete")
+        self.assertIn("权限下发未完成，将在次日批处理修正", visible)
+
+    def test_other_skip_reasons_keep_the_original_wording(self) -> None:
+        """反向对照三：其余跳过原因确实可能被日批纠正，行为逐字节不变。"""
+
+        from lingxi.apps.gateway.management_status import (
+            skipped_recompute_status_message,
+        )
+
+        for reason in ("missing_roster_snapshot", "match_failed", None):
+            with self.subTest(reason=reason):
+                self.assertIsNone(
+                    skipped_recompute_status_message(
+                        TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason=reason)
+                    )
+                )
+
+    def test_the_recovery_scanner_repaint_cannot_resurrect_the_false_promise(self) -> None:
+        """卡片恢复 scanner 重画时也不得回到假承诺。
+
+        持久化的 ``dispatch_status`` 只有四个机器态（迁移 ``0081`` 的 CHECK），装不下
+        人类文案；CardKit 那次更新失败、由 scanner 按水位重画时，只剩通用兜底可用。
+        判据因此落在**本次刚读回的账号状态**上，而不是那条读不回来的文案。
+        """
+
+        self._assert_is_the_truth(
+            _render_incomplete(account_state="suspended", dispatch_status="incomplete")
+        )
+
+    def test_a_restored_account_goes_back_to_the_generic_wording(self) -> None:
+        """账号恢复 ``enabled`` 之后，同一张卡再刷新自动回到通用文案——判据读的是
+        当下的账号状态，不是任何缓存下来的结论。"""
+
+        visible = _render_incomplete(account_state="enabled", dispatch_status="incomplete")
+        for fragment in self.TRUTH_FRAGMENTS:
+            self.assertNotIn(fragment, visible)
 
 
 if __name__ == "__main__":

@@ -366,6 +366,11 @@ REQUIRED_MODULES = (
     # 由 `apps/gateway/__init__.py` 在**模块级** import，漏登记会直接让 gateway
     # 起不来。
     "lingxi.apps.gateway.group_mention_hint",
+    # 管理卡「当前状态」那一行的机器状态→产品术语翻译（Trace #521 F5，#493 P1-3）：
+    # 原实现在 `apps/gateway/__init__.py`，为把"停用用户不得看到次日批处理承诺"这条
+    # 判定做成可单测的纯函数而拆到 `apps/gateway/management_status.py`；由
+    # `apps/gateway/__init__.py` 在**模块级** import，漏登记会直接让 gateway 起不来。
+    "lingxi.apps.gateway.management_status",
     # 首次开通编排的装配（Epic D / S-D-02）：产品负责人 2026-08-18 裁定后它住在
     # scheduler，由 `apps/scheduler/__init__.py` 在函数内 import。
     "lingxi.apps.scheduler.onboarding",
@@ -1058,6 +1063,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `redact_identifier`，把要发这条提示的 chat_id 记进日志（不是结构化
             # 审计字段，见该模块内注释与 `V-花名册-34`）。
             "lingxi.apps.gateway.group_mention_hint",
+            # 管理卡状态文案翻译（Trace #521 F5，#493 P1-3）：`apps/gateway/__init__.py`
+            # 模块级 import，该子模块自己再模块级 import `config.content`（版本化文案
+            # 目录）与 `core.permission.targeted_recompute`（跳过原因码）——两者都已经
+            # 在本组里，这里只补它自己这一条。
+            "lingxi.apps.gateway.management_status",
             "lingxi.core.identity.identifiers",
             # `adapters/feishu_directory.py` 的在职状态读取口把成员详情折成
             # `core.identity.first_contact.EmploymentStatus`。gateway 本身不用那个读取口
