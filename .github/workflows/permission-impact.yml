@@ -1,0 +1,118 @@
+name: Permission Impact (trusted base)
+
+on:
+  # pull_request_target loads this workflow from the target branch. It may inspect
+  # the PR head, but all executable gate code is archived from the trusted base below.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: permission-impact-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Permission Impact / trusted base
+    if: github.event_name == 'pull_request_target' && github.base_ref == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Checkout is data-only: no PR code is executed in this workflow. The token is
+      # not persisted, and the reader below is always extracted from the base SHA.
+      - name: 检出 PR head（仅作数据输入）
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 解包 trusted base 门禁脚本
+        run: |
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          mkdir -p "${trusted_base}"
+          git fetch --no-tags --depth=1 \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "${{ github.event.pull_request.base.sha }}"
+          git archive "${{ github.event.pull_request.base.sha }}" \
+            scripts/ci/classify_story_changes.py \
+            scripts/ci/read_github_owner_attestation.py \
+            scripts/ci/prepare_permission_impact_counts.py \
+            scripts/ci/check_permission_impact.py \
+            | tar -x -C "${trusted_base}"
+          test -f "${trusted_base}/scripts/ci/classify_story_changes.py"
+          test -f "${trusted_base}/scripts/ci/read_github_owner_attestation.py"
+          test -f "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py"
+          test -f "${trusted_base}/scripts/ci/check_permission_impact.py"
+
+      - name: 用 trusted base 分类 PR
+        id: route
+        run: |
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          python3 "${trusted_base}/scripts/ci/classify_story_changes.py" \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --github-output "${RUNNER_TEMP}/permission-impact-route"
+          if grep -qx 'risk_level=l3' "${RUNNER_TEMP}/permission-impact-route" \
+             && grep -qx 'l3_changed=true' "${RUNNER_TEMP}/permission-impact-route"; then
+            echo 'required=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'required=false' >> "${GITHUB_OUTPUT}"
+            echo '本 PR 不含 L3 权限事实变更；跳过 OWNER attestation'
+          fi
+
+      - name: 从 trusted base 读取 GitHub OWNER attestation
+        if: steps.route.outputs.required == 'true'
+        run: |
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          GITHUB_TOKEN="${{ github.token }}" \
+            python3 "${trusted_base}/scripts/ci/read_github_owner_attestation.py" \
+            --repository "${GITHUB_WORKSPACE}" \
+            --repository-id 1309889651 \
+            --repository-name Moshuiwang/lingxi \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-sha "${GITHUB_SHA}" \
+            --provenance-output "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --evidence-output "${RUNNER_TEMP}/permission-impact-attestation.json"
+
+      - name: 准备并校验权限影响面（trusted base）
+        if: steps.route.outputs.required == 'true'
+        run: |
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          python3 "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py" \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --repository "${GITHUB_WORKSPACE}" \
+            --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --output "${RUNNER_TEMP}/permission-impact-counts.json"
+          python3 "${trusted_base}/scripts/ci/check_permission_impact.py" \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --user-counts "${RUNNER_TEMP}/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --output "${RUNNER_TEMP}/permission-impact.json"
+
+      - name: 留存权限影响面认证证据
+        if: steps.route.outputs.required == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: permission-impact-trusted-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/permission-impact-counts.json
+            ${{ runner.temp }}/permission-impact-provenance.json
+            ${{ runner.temp }}/permission-impact-attestation.json
+            ${{ runner.temp }}/permission-impact.json
+          if-no-files-found: error
+          retention-days: 30

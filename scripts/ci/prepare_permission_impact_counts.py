@@ -3,9 +3,9 @@
 
 CI 不能连接 biai-stage、读取业务凭据或调用公司系统。本脚本只做两件事：权限面为空
 时根据当前两个 Git ref 的事实集合差确定性生成 0；权限面非空时读取 PR 中由
-biai-stage 生成的纯计数声明，并要求仓库外的 hash registration 绑定两份权限事实和
-grant/shrink 面摘要。PR 自带的声明不是可信 stage 证据，缺少 registration 时响亮失败，
-避免把自报或猜测的 0 伪装成影响面证据。
+biai-stage 生成的纯计数声明，并要求 trusted-base GitHub OWNER reader 生成的仓库外
+provenance 绑定两份权限事实和 grant/shrink 面摘要。PR 自带的声明不是可信 stage
+证据，缺少 OWNER attestation 时响亮失败，避免把自报或猜测的 0 伪装成影响面证据。
 """
 
 from __future__ import annotations
@@ -131,8 +131,7 @@ def prepare(
             )
         if trusted_provenance is None:
             raise IMPACT.CountEvidenceError(
-                "PR 内 biai-stage 聚合只是未验证声明；缺少仓库外 hash registration。"
-                "当前没有受保护 stage artifact/attestation，需经 PM 门补齐注入"
+                "PR 内 biai-stage 聚合只是未验证声明；缺少 GitHub OWNER attestation"
             )
         IMPACT._validate_stage_provenance(
             IMPACT._load_external_provenance(trusted_provenance, repository=repository),
@@ -161,7 +160,7 @@ def main() -> int:
         "--trusted-provenance",
         type=Path,
         help=(
-            "仓库外的 biai-stage hash registration；PR 内清单只是 claim，"
+            "trusted-base reader 生成的 GitHub OWNER provenance；PR 内清单只是 claim，"
             "没有该文件时非空权限面失败关闭"
         ),
     )

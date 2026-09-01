@@ -3,19 +3,14 @@
 
 这是受控验收环境的只读导出工具，不属于 CI：它只执行 ``COUNT(DISTINCT user_id)``
 聚合，不把用户标识、邮箱、角色分组明细或数据库凭据写入输出。生成的 JSON 只是
-可随权限配置 PR 提交的 stage 声明（claim）；只有编排者在仓库外保存的 hash
-registration 才能让 CI 采信，CI 本身不会连接数据库或公司系统。
-
-``--provenance-output`` 生成的是 hash registration 材料，不是 GitHub/OIDC 签名
-attestation。调用方必须把它放在 PR 工作树外，并通过受保护 stage 交接；当前仓库没有
-现成的受保护 stage job/artifact 注入链，不能仅凭本文件自报“可信”。
+可随权限配置 PR 提交的 stage 声明（claim）；CI 只有在 trusted-base GitHub OWNER
+reader 验证 PM 的一次性评论后才采信，CI 本身不会连接数据库或公司系统。
 
 调用示例（在 biai-stage 的受控工作目录执行，DSN 仅从环境变量读取）：
 
     PYTHONPATH=src python3 scripts/ops/export_permission_impact_counts.py \
       --base-ref <base-sha> --head-ref <head-sha> \
-      --output .github/permission-impact-counts.json \
-      --provenance-output /path/outside/pr/permission-impact-provenance.json
+      --output .github/permission-impact-counts.json
 """
 
 from __future__ import annotations
@@ -130,6 +125,11 @@ def export(
     output: Path,
     provenance_output: Path | None = None,
 ) -> dict[str, Any]:
+    if provenance_output is not None:
+        raise IMPACT.CountEvidenceError(
+            "stage exporter 不生成 GitHub OWNER provenance；请把本清单交给 PM，"
+            "由 trusted-base GitHub OWNER reader 验证一次性评论"
+        )
     base_roles, base_metrics, base_role_raw, base_metric_raw = _facts(repository, base_ref)
     head_roles, head_metrics, head_role_raw, head_metric_raw = _facts(repository, head_ref)
     base_surface = IMPACT.build_surface(base_roles, base_metrics)
@@ -178,36 +178,6 @@ def export(
         json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    if provenance_output is not None:
-        registration = {
-            "schema": IMPACT.PROVENANCE_SCHEMA,
-            "manifest_sha256": IMPACT._document_digest(manifest),
-            "base_facts_sha256": manifest["base_facts_sha256"],
-            "head_facts_sha256": manifest["head_facts_sha256"],
-            "grant_surface_sha256": manifest["grant_surface_sha256"],
-            "shrink_surface_sha256": manifest["shrink_surface_sha256"],
-            "source": {
-                "kind": IMPACT.STAGE_PROVENANCE_SOURCE,
-                "environment": manifest["source"]["environment"],
-                "dataset": manifest["source"]["dataset"],
-                "query_version": manifest["source"]["query_version"],
-                "captured_at": manifest["source"]["captured_at"],
-            },
-            "registered_at": datetime.now().astimezone().isoformat(),
-        }
-        IMPACT._validate_stage_provenance(
-            registration,
-            manifest=manifest,
-            expected_base_facts_sha256=manifest["base_facts_sha256"],
-            expected_head_facts_sha256=manifest["head_facts_sha256"],
-            expected_grant_surface_sha256=manifest["grant_surface_sha256"],
-            expected_shrink_surface_sha256=manifest["shrink_surface_sha256"],
-        )
-        provenance_output.parent.mkdir(parents=True, exist_ok=True)
-        provenance_output.write_text(
-            json.dumps(registration, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
     return manifest
 
 
@@ -220,7 +190,7 @@ def main() -> int:
     parser.add_argument(
         "--provenance-output",
         type=Path,
-        help="可选的仓库外 hash registration 输出路径（不是签名 attestation）",
+        help="已废弃；GitHub OWNER provenance 只能由 CI 的 trusted-base reader 生成",
     )
     args = parser.parse_args()
     try:

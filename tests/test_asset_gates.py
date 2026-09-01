@@ -225,6 +225,16 @@ class PermissionImpactTest(unittest.TestCase):
                 "captured_at": source["captured_at"],
             },
             "registered_at": "2026-09-01T00:00:00+00:00",
+            "attestation": {
+                "comment_id": 9001,
+                "comment_url": "https://github.com/Moshuiwang/lingxi/pull/7#issuecomment-9001",
+                "user_id": 200755707,
+                "nonce": "nonce-0123456789ab",
+                "body_sha256": "1" * 64,
+                "response_sha256": "2" * 64,
+                "run_id": 12345,
+                "run_sha": "3" * 40,
+            },
         }
 
     def test_grant_and_shrink_are_separate_and_counts_are_explicit(self) -> None:
@@ -439,7 +449,7 @@ class PermissionImpactTest(unittest.TestCase):
                 0,
             )
             self.assertIn(
-                "out-of-band-hash-registered",
+                "github-owner-attestation",
                 checked.read_text(encoding="utf-8"),
             )
             self.assertEqual(
@@ -447,7 +457,7 @@ class PermissionImpactTest(unittest.TestCase):
                 "provided-registered",
             )
 
-            # 修改 facts 后仍指向同一份 stage registration，必须被事实摘要绑定挡住。
+            # 修改 facts 后仍指向同一份 OWNER provenance，必须被事实摘要绑定挡住。
             metric_path.write_text('[companies."1"]\n"职能" = ["m1", "m2", "m3"]\n', encoding="utf-8")
             changed_facts_head = self._commit(repository, "tamper permission facts")
             with self.assertRaises(PREPARE.IMPACT.CountEvidenceError):
@@ -460,7 +470,7 @@ class PermissionImpactTest(unittest.TestCase):
                     output=prepared,
                 )
 
-            # 修改 count 或 surface digest，registration 与当前 claim 的 hash/绑定均应失败。
+            # 修改 count 或 surface digest，provenance 与当前 claim 的 hash/绑定均应失败。
             original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             for field, value in (
                 ("counts", {"grant": 99, "shrink": 5}),
@@ -771,27 +781,16 @@ class PermissionImpactTest(unittest.TestCase):
             )
             try:
                 output = repository / "counts.json"
-                provenance_output = repository / "provenance.json"
                 with mock.patch.dict(EXPORT.os.environ, {EXPORT.DSN_ENV: "redacted"}):
                     evidence = EXPORT.export(
                         base,
                         head,
                         repository=repository,
                         output=output,
-                        provenance_output=provenance_output,
                     )
             finally:
                 EXPORT._read_stage_counts = original
             self.assertEqual(evidence["counts"], {"grant": 12, "shrink": 5})
-            registration = json.loads(provenance_output.read_text(encoding="utf-8"))
-            IMPACT._validate_stage_provenance(
-                registration,
-                manifest=evidence,
-                expected_base_facts_sha256=evidence["base_facts_sha256"],
-                expected_head_facts_sha256=evidence["head_facts_sha256"],
-                expected_grant_surface_sha256=evidence["grant_surface_sha256"],
-                expected_shrink_surface_sha256=evidence["shrink_surface_sha256"],
-            )
             serialized = output.read_text(encoding="utf-8")
             self.assertNotIn("redacted", serialized)
             self.assertNotIn("user_id", serialized)

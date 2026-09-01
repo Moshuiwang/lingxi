@@ -42,6 +42,9 @@ DEPLOY_CHECKLIST = REPOSITORY_ROOT / "deploy" / "验收前部署配置清单.md"
 COMPOSE_STRUCTURE_SCRIPT = REPOSITORY_ROOT / "scripts" / "ci" / "verify_compose_structure.sh"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 STORY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "story.yml"
+PERMISSION_IMPACT_WORKFLOW = (
+    REPOSITORY_ROOT / ".github" / "workflows" / "permission-impact.yml"
+)
 PUBLISH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml"
 
 FEISHU_DIRECTORY = REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "feishu_directory.py"
@@ -1647,8 +1650,82 @@ def check_ci_workflow() -> list[str]:
     failures: list[str] = []
     full = read(CI_WORKFLOW)
     story = read(STORY_WORKFLOW)
+    trusted_permission = read(PERMISSION_IMPACT_WORKFLOW)
     publish = read(PUBLISH_WORKFLOW)
 
+    # OWNER attestation 只需要 GitHub 的内建只读 PR token；不得借门禁之名扩大
+    # contents、OIDC、runner 或 protected environment 权限。这里读顶层块，避免把
+    # publish.yml 的 packages: write 等合法发布权限误算进来。
+    for label, workflow in (("ci.yml", full), ("story.yml", story)):
+        permissions = re.search(
+            r"^permissions:\n((?:  [A-Za-z0-9_-]+:\s*\S+\n)+)",
+            workflow,
+            re.MULTILINE,
+        )
+        permission_lines = permissions.group(1) if permissions else ""
+        if "contents: read" not in permission_lines:
+            failures.append(f"{label} 顶层 permissions 必须保留 `contents: read`。")
+        if "pull-requests: read" not in permission_lines:
+            failures.append(f"{label} 顶层 permissions 必须新增 `pull-requests: read`。")
+        for forbidden in ("contents: write", "pull-requests: write", "id-token: write"):
+            if forbidden in permission_lines:
+                failures.append(f"{label} OWNER attestation 不得声明 {forbidden}。")
+
+    # pull_request 的 workflow 文件来自 PR merge ref，head 可以删掉一个 gate step。
+    # OWNER 认证因此必须另有 pull_request_target 入口；该入口只从 head checkout
+    # 读取数据，并从 target base 解包所有可执行脚本。这里把这个信任边界钉成源码
+    # 契约，避免未来有人把它改回在 PR head 上执行的普通工作流。
+    trusted_permissions = re.search(
+        r"^permissions:\n((?:  [A-Za-z0-9_-]+:\s*\S+\n)+)",
+        trusted_permission,
+        re.MULTILINE,
+    )
+    trusted_permission_lines = trusted_permissions.group(1) if trusted_permissions else ""
+    if "pull_request_target:" not in trusted_permission:
+        failures.append("permission-impact.yml 必须使用 pull_request_target 读取 OWNER attestation。")
+    if re.search(r"^\s+pull_request:\s*$", trusted_permission, re.MULTILINE):
+        failures.append("permission-impact.yml 不得用可由 PR head 控制的 pull_request 触发器。")
+    if "branches:\n      - main" not in trusted_permission:
+        failures.append("permission-impact.yml 必须只面向 main PR。")
+    if "contents: read" not in trusted_permission_lines:
+        failures.append("permission-impact.yml 必须声明 contents: read。")
+    if "pull-requests: read" not in trusted_permission_lines:
+        failures.append("permission-impact.yml 必须声明 pull-requests: read。")
+    for forbidden in (
+        "contents: write",
+        "pull-requests: write",
+        "id-token:",
+        "secrets.",
+        "environment:",
+        "self-hosted",
+        "container:",
+    ):
+        if forbidden in strip_comments(trusted_permission):
+            failures.append(f"permission-impact.yml 不得出现不受批准的信任边界 {forbidden}。")
+    for marker in (
+        "github.event_name == 'pull_request_target' && github.base_ref == 'main'",
+        "repository: ${{ github.event.pull_request.head.repo.full_name }}",
+        "ref: ${{ github.event.pull_request.head.sha }}",
+        "persist-credentials: false",
+        "git fetch --no-tags --depth=1",
+        "git archive \"${{ github.event.pull_request.base.sha }}\"",
+        "scripts/ci/classify_story_changes.py",
+        "scripts/ci/read_github_owner_attestation.py",
+        "scripts/ci/prepare_permission_impact_counts.py",
+        "scripts/ci/check_permission_impact.py",
+        'GITHUB_TOKEN="${{ github.token }}"',
+        "--repository-name Moshuiwang/lingxi",
+        "--base-sha \"${{ github.event.pull_request.base.sha }}\"",
+        "--head-sha \"${{ github.event.pull_request.head.sha }}\"",
+        "--trusted-provenance \"${RUNNER_TEMP}/permission-impact-provenance.json\"",
+        "name: permission-impact-trusted-pr-",
+        "if-no-files-found: error",
+    ):
+        expected = marker
+        if expected not in trusted_permission:
+            failures.append(f"permission-impact.yml 缺少 trusted-base 门禁标记 {marker}。")
+    if re.search(r"python3\s+scripts/|run:\s+scripts/ci/", strip_comments(trusted_permission)):
+        failures.append("permission-impact.yml 不得直接执行工作树内的脚本。")
     def job_body(workflow: str, job_name: str) -> str | None:
         match = re.search(
             rf"^  {re.escape(job_name)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
@@ -1743,17 +1820,28 @@ def check_ci_workflow() -> list[str]:
         "permission-impact-pr-",
         "needs.classify.outputs.risk_level == 'l3'",
         "needs.classify.outputs.l3_changed == 'true'",
+        "pull-requests: read",
+        "read_github_owner_attestation.py",
+        "git archive",
+        "github.token",
+        "--evidence-output",
+        "lingxi-trusted-base",
+        "github.base_ref == 'main'",
     ):
         if marker not in full:
             failures.append(f"ci.yml 缺少分级 Epic 路由标记 `{marker}`。")
 
     # 计数声明只由 biai-stage 受控导出，PR runner 不得直接调用 stage 导出器；可信
-    # 采信还必须拿到仓库外 hash registration。否则一个 workflow 改动就会把用户数据
-    # 带进普通 CI，或把 PR 自报冒充 stage 证据。gate 自己的本地 postgres 测试 DSN
+    # 采信还必须拿到 trusted-base GitHub OWNER provenance。否则一个 workflow 改动就会
+    # 把用户数据带进普通 CI，或把 PR 自报冒充 stage 证据。gate 自己的本地 postgres 测试 DSN
     # 是允许的，不能把它误判成业务凭据。
     for forbidden in ("scripts/ops/export_permission_impact_counts.py",):
         if forbidden in strip_comments(full):
             failures.append(f"ci.yml 不得在普通 CI 接入受控计数来源 `{forbidden}`。")
+
+    for forbidden in ("id-token: write", "actions/attest-build-provenance"):
+        if forbidden in strip_comments(full):
+            failures.append(f"ci.yml OWNER attestation 不得启用 `{forbidden}`。")
 
     # docs_changed 是独立于风险等级的事实：docs + L1 必须同时通过已有文档门禁，
     # 不能只看 mode/risk（混合改动的 mode=fast、risk=l1 会绕过旧的 docs job）。

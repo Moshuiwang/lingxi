@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -147,16 +148,49 @@ jobs:
           fetch-depth: 0
 
       # PR 内的 `.github/permission-impact-counts.json` 只是 biai-stage 声明；它不能
-      # 自称可信来源。可信绑定必须由受控 stage 在仓库外提供 hash registration。
-      # 当前仓库没有受保护 stage job/artifact/attestation 注入链，故该路径缺失时
-      # 明确失败并报告 PM 门；不新增 token、secret、OIDC 或 protected environment 权限。
-      - name: 准备权限影响面计数证明（L3，需仓库外 stage registration）
+      # 自称可信来源。OWNER reader、prepare 和 check 均从当前 PR 的 trusted base
+      # commit 解包执行，避免 head 自改消费者后放行。reader 再用 pull-requests:read
+      # 重 GET PR、普通评论和变更文件；缺评论、重复、编辑、过期或信任根变更均失败。
+      - name: 从可信 base 读取 GitHub OWNER attestation（L3）
         if: >-
           github.event_name == 'pull_request' &&
+          github.base_ref == 'main' &&
           needs.classify.outputs.risk_level == 'l3' &&
           needs.classify.outputs.l3_changed == 'true'
         run: |
-          python3 scripts/ci/prepare_permission_impact_counts.py \
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          mkdir -p "${trusted_base}"
+          git archive "${{ github.event.pull_request.base.sha }}" \
+            scripts/ci/read_github_owner_attestation.py \
+            scripts/ci/prepare_permission_impact_counts.py \
+            scripts/ci/check_permission_impact.py \
+            | tar -x -C "${trusted_base}"
+          test -f "${trusted_base}/scripts/ci/read_github_owner_attestation.py"
+          test -f "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py"
+          test -f "${trusted_base}/scripts/ci/check_permission_impact.py"
+          GITHUB_TOKEN="${{ github.token }}" \
+            python3 "${trusted_base}/scripts/ci/read_github_owner_attestation.py" \
+            --repository "${GITHUB_WORKSPACE}" \
+            --repository-id 1309889651 \
+            --repository-name "${GITHUB_REPOSITORY}" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-sha "${GITHUB_SHA}" \
+            --provenance-output "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --evidence-output "${RUNNER_TEMP}/permission-impact-attestation.json"
+
+      - name: 准备权限影响面计数证明（L3，OWNER attestation 已认证）
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.base_ref == 'main' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        run: |
+          trusted_base="${RUNNER_TEMP}/lingxi-trusted-base"
+          python3 "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py" \
             --base-ref "${{ github.event.pull_request.base.sha }}" \
             --head-ref "${{ github.event.pull_request.head.sha }}" \
             --repository "${GITHUB_WORKSPACE}" \
@@ -167,10 +201,11 @@ jobs:
       - name: 生成权限影响面 diff（L3）
         if: >-
           github.event_name == 'pull_request' &&
+          github.base_ref == 'main' &&
           needs.classify.outputs.risk_level == 'l3' &&
           needs.classify.outputs.l3_changed == 'true'
         run: |
-          python3 scripts/ci/check_permission_impact.py \
+          python3 "${RUNNER_TEMP}/lingxi-trusted-base/scripts/ci/check_permission_impact.py" \
             --base-ref "${{ github.event.pull_request.base.sha }}" \
             --head-ref "${{ github.event.pull_request.head.sha }}" \
             --user-counts "${RUNNER_TEMP}/permission-impact-counts.json" \
@@ -180,6 +215,7 @@ jobs:
       - name: 留存权限影响面与计数证明（L3）
         if: >-
           github.event_name == 'pull_request' &&
+          github.base_ref == 'main' &&
           needs.classify.outputs.risk_level == 'l3' &&
           needs.classify.outputs.l3_changed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -188,11 +224,9 @@ jobs:
           path: |
             ${{ runner.temp }}/permission-impact-counts.json
             ${{ runner.temp }}/permission-impact-provenance.json
+            ${{ runner.temp }}/permission-impact-attestation.json
             ${{ runner.temp }}/permission-impact.json
-          # 空的有效 surface 只由仓库静态事实推导 0，不会生成 provenance；非空
-          # surface 已在 prepare/check 中对缺 registration fail-closed。counts/report
-          # 若缺失则前置步骤已失败，因此这里允许仅缺少可选的空 diff registration。
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
       - name: L1 资产版本锁与术语扫描（混合高风险改动）

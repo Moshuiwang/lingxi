@@ -925,6 +925,9 @@ class PublishJobGuardTest(unittest.TestCase):
           pull_request:
             branches: [main]
           workflow_call:
+        permissions:
+          contents: read
+          pull-requests: read
         jobs:
           classify:
             outputs:
@@ -942,6 +945,8 @@ class PublishJobGuardTest(unittest.TestCase):
           gate:
             if: needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1'
             steps:
+              - run: git archive base.sha scripts/ci/read_github_owner_attestation.py --trusted-base lingxi-trusted-base # github.base_ref == 'main'
+              - run: GITHUB_TOKEN=${{ github.token }} python3 read_github_owner_attestation.py --evidence-output evidence.json
               - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
                 run: python3 scripts/ci/prepare_permission_impact_counts.py --trusted-provenance permission-impact-provenance
               - if: needs.classify.outputs.risk_level == 'l3' && needs.classify.outputs.l3_changed == 'true'
@@ -973,6 +978,9 @@ class PublishJobGuardTest(unittest.TestCase):
         on:
           pull_request:
             branches: ['epic/**']
+        permissions:
+          contents: read
+          pull-requests: read
         jobs:
           classify:
             outputs:
@@ -1013,15 +1021,61 @@ class PublishJobGuardTest(unittest.TestCase):
               - run: python3 scripts/ci/push_image.py x
     """
 
-    def _with_workflows(self, *, full: str | None = None, story: str | None = None, publish: str | None = None):
+    PERMISSION_IMPACT = """
+        name: Permission Impact (trusted base)
+        on:
+          pull_request_target:
+            branches:
+              - main
+        permissions:
+          contents: read
+          pull-requests: read
+        jobs:
+          gate:
+            name: Permission Impact / trusted base
+            if: github.event_name == 'pull_request_target' && github.base_ref == 'main'
+            runs-on: ubuntu-24.04
+            steps:
+              - uses: actions/checkout@sha
+                with:
+                  repository: ${{ github.event.pull_request.head.repo.full_name }}
+                  ref: ${{ github.event.pull_request.head.sha }}
+                  persist-credentials: false
+              - run: |
+                  git fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "${{ github.event.pull_request.base.sha }}"
+                  git archive "${{ github.event.pull_request.base.sha }}" scripts/ci/classify_story_changes.py scripts/ci/read_github_owner_attestation.py scripts/ci/prepare_permission_impact_counts.py scripts/ci/check_permission_impact.py
+                  python3 "${trusted_base}/scripts/ci/classify_story_changes.py"
+                  GITHUB_TOKEN="${{ github.token }}" python3 "${trusted_base}/scripts/ci/read_github_owner_attestation.py" --repository-name Moshuiwang/lingxi --base-sha "${{ github.event.pull_request.base.sha }}" --head-sha "${{ github.event.pull_request.head.sha }}"
+                  python3 "${trusted_base}/scripts/ci/prepare_permission_impact_counts.py" --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json"
+                  python3 "${trusted_base}/scripts/ci/check_permission_impact.py"
+                  --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json"
+              - uses: actions/upload-artifact@sha
+                with:
+                  name: permission-impact-trusted-pr-1-abc
+                  if-no-files-found: error
+    """
+
+    def _with_workflows(
+        self,
+        *,
+        full: str | None = None,
+        story: str | None = None,
+        permission_impact: str | None = None,
+        publish: str | None = None,
+    ):
         directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
         paths = {
             "CI_WORKFLOW": directory / "ci.yml",
             "STORY_WORKFLOW": directory / "story.yml",
+            "PERMISSION_IMPACT_WORKFLOW": directory / "permission-impact.yml",
             "PUBLISH_WORKFLOW": directory / "publish.yml",
         }
         paths["CI_WORKFLOW"].write_text(textwrap.dedent(full or self.FULL), encoding="utf-8")
         paths["STORY_WORKFLOW"].write_text(textwrap.dedent(story or self.STORY), encoding="utf-8")
+        paths["PERMISSION_IMPACT_WORKFLOW"].write_text(
+            textwrap.dedent(permission_impact or self.PERMISSION_IMPACT),
+            encoding="utf-8",
+        )
         paths["PUBLISH_WORKFLOW"].write_text(textwrap.dedent(publish or self.PUBLISH), encoding="utf-8")
         originals = {name: getattr(CONTRACT, name) for name in paths}
         for name, path in paths.items():
@@ -1108,6 +1162,18 @@ class PublishJobGuardTest(unittest.TestCase):
         self.assertTrue(
             any("write_epic_candidate_images.py" in failure for failure in failures), failures
         )
+
+    def test_trusted_permission_workflow_mutation_is_caught(self) -> None:
+        missing_trigger = self.PERMISSION_IMPACT.replace("pull_request_target:", "pull_request:")
+        failures = self._with_workflows(permission_impact=missing_trigger)
+        self.assertTrue(any("pull_request_target" in failure for failure in failures), failures)
+
+        missing_base_execution = self.PERMISSION_IMPACT.replace(
+            'python3 "${trusted_base}/scripts/ci/read_github_owner_attestation.py"',
+            "python3 scripts/ci/read_github_owner_attestation.py",
+        )
+        failures = self._with_workflows(permission_impact=missing_base_execution)
+        self.assertTrue(any("工作树内的脚本" in failure for failure in failures), failures)
 
 
 class CandidateSummaryRoutingTest(unittest.TestCase):
@@ -1366,7 +1432,7 @@ class RealWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(image_job.count("scripts/ci/build_image.sh"), 2)
 
-    def test_permission_impact_ci_requires_external_registration_without_new_privilege(self) -> None:
+    def test_permission_impact_ci_requires_owner_attestation_without_new_privilege(self) -> None:
         """P2：PR claim 不能独自成为 stage 证据，且当前不偷偷申请新权限。"""
 
         text = CONTRACT.read(CONTRACT.CI_WORKFLOW)

@@ -4,12 +4,12 @@
 只读取两个 Git ref 中的两份 TOML 配置，不连接数据库、不读取生产快照、不需要凭据。
 脚本把角色→职能与公司→职能→指标的有效笛卡尔面做集合差，报告新增授予面与收缩面
 两栏；受影响用户数量必须来自绑定两份权限事实内容、影响面摘要和来源时间的纯计数证明。
-权限面为空时才由 Git diff 严格推出 0；权限面非空而没有经编排者在仓库外登记的
+权限面为空时才由 Git diff 严格推出 0；权限面非空而没有经固定 GitHub OWNER 评论认证的
 biai-stage 只读聚合证明会失败关闭，绝不拿角色数、配置行数或任何内部 ID 冒充用户数。
 
-PR 内的计数清单只能是 stage 导出声明（claim），不是可信的 stage 证据。可信链路需要一
-份不在 PR 工作树中的 hash registration；当前仓库没有受保护 stage job/artifact/attestation
-来自动提供它，所以缺 registration 时必须明确报告 PM 门，而不是把自报来源升格。
+PR 内的计数清单只能是 stage 导出声明（claim），不是可信的 stage 证据。可信链路由
+``read_github_owner_attestation.py`` 从官方 GitHub API 读取固定 OWNER 的一次性评论，
+再输出一份不在 PR 工作树中的 provenance；缺少该认证时必须明确失败关闭。
 """
 
 from __future__ import annotations
@@ -32,13 +32,13 @@ ROLE_MAP_PATH = "src/lingxi/config/galaxy_role_function_map.toml"
 METRIC_MAP_PATH = "src/lingxi/config/company_function_metric_map.toml"
 REPORT_SCHEMA = "lingxi.permission-impact/v1"
 COUNT_SCHEMA = "lingxi.permission-impact-counts/v2"
-PROVENANCE_SCHEMA = "lingxi.permission-impact-provenance/v1"
+PROVENANCE_SCHEMA = "lingxi.permission-impact-provenance/v2"
 EMPTY_COUNT_SOURCE = "derived-static-empty"
 # 这个值故意标明它只是 PR 可携带的声明；不能把它当作受保护 stage 证据。
 STAGE_COUNT_CLAIM_SOURCE = "biai-stage-read-only-aggregate-claim"
 # 旧的 Python 调用方可继续引用该名字，但值已降级为 claim，避免旧代码误称可信来源。
 STAGE_COUNT_SOURCE = STAGE_COUNT_CLAIM_SOURCE
-STAGE_PROVENANCE_SOURCE = "out-of-band-biai-stage-hash-registration"
+STAGE_PROVENANCE_SOURCE = "github-owner-attestation"
 COUNT_SOURCE_KEYS = frozenset(
     {"kind", "environment", "dataset", "query_version", "captured_at"}
 )
@@ -63,10 +63,25 @@ PROVENANCE_KEYS = frozenset(
         "shrink_surface_sha256",
         "source",
         "registered_at",
+        "attestation",
+    }
+)
+PROVENANCE_ATTESTATION_KEYS = frozenset(
+    {
+        "comment_id",
+        "comment_url",
+        "user_id",
+        "nonce",
+        "body_sha256",
+        "response_sha256",
+        "run_id",
+        "run_sha",
     }
 )
 COUNT_KEYS = frozenset({"grant", "shrink"})
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 SurfaceEntry = tuple[str, str, str, str]
 
@@ -230,7 +245,7 @@ def _surface_digest(entries: set[SurfaceEntry]) -> str:
 
 
 def _canonical_json_bytes(document: Mapping[str, Any]) -> bytes:
-    """为跨进程 hash registration 生成不受缩进/键序影响的 JSON 表示。"""
+    """为跨进程 provenance 生成不受缩进/键序影响的 JSON 表示。"""
 
     return json.dumps(
         document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -370,21 +385,22 @@ def _validate_stage_provenance(
     expected_grant_surface_sha256: str,
     expected_shrink_surface_sha256: str,
 ) -> dict[str, Any]:
-    """验证仓库外的 stage hash registration，不把 PR 自报当成可信来源。
+    """验证可信 base reader 生成的 GitHub OWNER provenance。
 
-    这里的 registration 是编排者在 biai-stage 完成只读聚合后保存的最小绑定材料，
-    不是由当前仓库声明的 GitHub/OIDC 签名 attestation。调用方必须把它从 PR 工作树
-    外部注入；当前没有受保护 stage workflow，所以普通 CI 缺少该文件时应失败关闭。
+    ``read_github_owner_attestation.py`` 先从官方 API 重读 PR、普通评论和变更文件，
+    然后把最小绑定材料写到 runner 临时目录。这里仍保留「仓库外文件」检查，防止
+    PR 自己提交一份看似可信的 provenance；JSON 的 owner/comment/run 证据同时严格
+    校验，消费者才能把 stage 的纯计数声明转换为 ``provided-registered``。
     """
 
     if set(provenance) != PROVENANCE_KEYS:
         raise CountEvidenceError(
-            "stage provenance registration 字段不完整或含未知字段；"
+            "GitHub OWNER provenance 字段不完整或含未知字段；"
             "不能把 PR 自报升级为可信证据"
         )
     if provenance.get("schema") != PROVENANCE_SCHEMA:
         raise CountEvidenceError(
-            f"stage provenance registration schema 必须是 {PROVENANCE_SCHEMA}"
+            f"GitHub OWNER provenance schema 必须是 {PROVENANCE_SCHEMA}"
         )
 
     expected_bindings = {
@@ -397,7 +413,7 @@ def _validate_stage_provenance(
     for key, expected in expected_bindings.items():
         value = provenance.get(key)
         if not isinstance(value, str) or value != expected or HEX64_RE.fullmatch(value) is None:
-            raise CountEvidenceError(f"stage provenance registration {key} 未绑定当前事实")
+            raise CountEvidenceError(f"GitHub OWNER provenance {key} 未绑定当前事实")
 
     manifest_source = manifest.get("source")
     if (
@@ -405,18 +421,18 @@ def _validate_stage_provenance(
         or manifest_source.get("kind") != STAGE_COUNT_CLAIM_SOURCE
     ):
         raise CountEvidenceError(
-            "stage provenance registration 只能绑定 biai-stage 聚合声明，"
+            "GitHub OWNER provenance 只能绑定 biai-stage 聚合声明，"
             "不能把其他来源伪装成 stage 证据"
         )
 
     source = provenance.get("source")
     if not isinstance(source, Mapping) or set(source) != COUNT_SOURCE_KEYS:
         raise CountEvidenceError(
-            "stage provenance registration source 字段不完整或含未知字段"
+            "GitHub OWNER provenance source 字段不完整或含未知字段"
         )
     if source.get("kind") != STAGE_PROVENANCE_SOURCE:
         raise CountEvidenceError(
-            "stage provenance registration source.kind 必须是仓库外 hash registration"
+            "GitHub OWNER provenance source.kind 必须是 github-owner-attestation"
         )
     expected_source = {
         "kind": STAGE_PROVENANCE_SOURCE,
@@ -427,9 +443,36 @@ def _validate_stage_provenance(
     }
     if dict(source) != expected_source:
         raise CountEvidenceError(
-            "stage provenance registration 来源元数据与 stage 聚合声明不一致"
+            "GitHub OWNER provenance 来源元数据与 stage 聚合声明不一致"
         )
     registered_at = _validate_timestamp(provenance.get("registered_at"))
+
+    attestation = provenance.get("attestation")
+    if not isinstance(attestation, Mapping) or set(attestation) != PROVENANCE_ATTESTATION_KEYS:
+        raise CountEvidenceError(
+            "GitHub OWNER provenance attestation 字段不完整或含未知字段"
+        )
+    comment_id = attestation.get("comment_id")
+    if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id <= 0:
+        raise CountEvidenceError("GitHub OWNER provenance comment_id 无效")
+    comment_url = attestation.get("comment_url")
+    if not isinstance(comment_url, str) or not comment_url.startswith("https://github.com/"):
+        raise CountEvidenceError("GitHub OWNER provenance comment_url 无效")
+    if attestation.get("user_id") != 200755707:
+        raise CountEvidenceError("GitHub OWNER provenance user_id 不是固定 OWNER")
+    nonce = attestation.get("nonce")
+    if not isinstance(nonce, str) or NONCE_RE.fullmatch(nonce) is None:
+        raise CountEvidenceError("GitHub OWNER provenance nonce 无效")
+    for key in ("body_sha256", "response_sha256"):
+        value = attestation.get(key)
+        if not isinstance(value, str) or HEX64_RE.fullmatch(value) is None:
+            raise CountEvidenceError(f"GitHub OWNER provenance {key} 无效")
+    run_id = attestation.get("run_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise CountEvidenceError("GitHub OWNER provenance run_id 无效")
+    run_sha = attestation.get("run_sha")
+    if not isinstance(run_sha, str) or HEX40_RE.fullmatch(run_sha) is None:
+        raise CountEvidenceError("GitHub OWNER provenance run_sha 无效")
 
     return {
         "kind": STAGE_PROVENANCE_SOURCE,
@@ -438,7 +481,15 @@ def _validate_stage_provenance(
         "query_version": source["query_version"],
         "captured_at": source["captured_at"],
         "registered_at": registered_at,
-        "status": "out-of-band-hash-registered",
+        "status": "github-owner-attestation",
+        "comment_id": comment_id,
+        "comment_url": comment_url,
+        "user_id": attestation["user_id"],
+        "nonce": nonce,
+        "body_sha256": attestation["body_sha256"],
+        "response_sha256": attestation["response_sha256"],
+        "run_id": run_id,
+        "run_sha": run_sha,
     }
 
 
@@ -628,23 +679,23 @@ def _load_json_document(path: Path) -> dict[str, Any]:
 
 
 def _load_external_provenance(path: Path, *, repository: Path) -> dict[str, Any]:
-    """只接受仓库外的 registration，阻止 PR 自己提交一份“可信”证明。"""
+    """只接受 trusted-base reader 写在仓库外的 provenance。"""
 
     if path.is_symlink():
         raise CountEvidenceError(
-            "stage provenance registration 不得是符号链接；需由受控 stage 从仓库外注入"
+            "GitHub OWNER provenance 不得是符号链接；需由 trusted-base reader 写入"
         )
     try:
         resolved = path.resolve(strict=True)
         repository_root = repository.resolve(strict=True)
     except OSError as error:
         raise CountEvidenceError(
-            "stage provenance registration 路径无法解析；需由受控 stage 从仓库外注入"
+            "GitHub OWNER provenance 路径无法解析；需由 trusted-base reader 写入"
         ) from error
     if resolved == repository_root or repository_root in resolved.parents:
         raise CountEvidenceError(
-            "stage provenance registration 不能位于 PR 工作树内；"
-            "当前 workflow 没有受保护 stage artifact，需经 PM 门补齐注入"
+            "GitHub OWNER provenance 不能位于 PR 工作树内；"
+            "否则 PR 可自提交可信证明"
         )
     return _load_json_document(path)
 
@@ -657,7 +708,7 @@ def render_report(report: Mapping[str, Any]) -> str:
     """渲染公开门禁摘要；只展示权限事实与数量，不展示用户明细。"""
 
     lines = [
-        "L3 权限影响面 diff：通过（权限事实静态；stage 数量需另有仓库外 hash registration）"
+        "L3 权限影响面 diff：通过（权限事实静态；stage 数量由 GitHub OWNER attestation 认证）"
     ]
     for label, key, count_key in (
         ("新增授予面（grant）", "grant", "grant_entry_count"),
@@ -719,8 +770,8 @@ def run_check(
     grant_surface = head_surface - base_surface
     shrink_surface = base_surface - head_surface
 
-    # 先验证数量清单的事实绑定，再验证仓库外的 stage registration。这样即便 PR
-    # 提交了一个看似完整的 stage JSON，缺少受控 stage 的 hash 登记也不会被 CI 采信。
+    # 先验证数量清单的事实绑定，再验证 trusted-base reader 生成的 OWNER provenance。
+    # 这样即便 PR 提交了一个看似完整的 stage JSON，缺少 GitHub 认证也不会被 CI 采信。
     provenance: dict[str, Any] | None = None
     if grant_surface or shrink_surface:
         if counts is None:
@@ -737,12 +788,11 @@ def run_check(
             if validated_counts["source"]["kind"] != STAGE_COUNT_CLAIM_SOURCE:
                 raise CountEvidenceError(
                     "非空权限影响面不能使用静态 0 或其他自报来源；"
-                    "请从 biai-stage 取得聚合声明并由仓库外 registration 绑定"
+                    "请从 biai-stage 取得聚合声明并由 GitHub OWNER attestation 绑定"
                 )
             if trusted_provenance_path is None:
                 raise CountEvidenceError(
-                    "PR 内 biai-stage 聚合只是未验证声明；缺少仓库外 hash registration。"
-                    "当前没有受保护 stage artifact/attestation，需经 PM 门补齐注入"
+                    "PR 内 biai-stage 聚合只是未验证声明；缺少 GitHub OWNER attestation"
                 )
             provenance_document = _load_external_provenance(
                 trusted_provenance_path, repository=repository
@@ -794,7 +844,7 @@ def main() -> int:
         "--trusted-provenance",
         type=Path,
         help=(
-            "仓库外的 biai-stage hash registration；PR 内清单只是 claim，"
+            "trusted-base OWNER reader 生成的仓库外 provenance；PR 内清单只是 claim，"
             "没有该文件时非空权限面失败关闭"
         ),
     )
