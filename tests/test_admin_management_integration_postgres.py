@@ -18,9 +18,12 @@ PostgreSQL 16）。
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import unittest
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
@@ -31,12 +34,14 @@ from lingxi.adapters.admin_registry import (
 )
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+from lingxi.adapters.postgres_management_card_context import PostgresManagementCardContextStore
 from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.card_dispatch import ConfirmCardDispatcher
 from lingxi.core.admin.router import AdminCommandRouter
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import OverrideDirection
+from lingxi.core.admin.views import AdminUserStatusView
 
 DSN = os.environ.get("LINGXI_POSTGRES_DSN")
 SKIP_REASON = (
@@ -347,6 +352,434 @@ class RevokeButtonClickCreatesARealPendingActionTests(ManagementCardCallbackInte
 
         self.assertEqual(response["toast"]["type"], "error")
 
+
+class PositionPermissionGroupRealDbTests(ManagementCardCallbackIntegrationTestCase):
+    """#493 P1：真实配置的职位+范围展开、组撤销和别组隔离。"""
+
+    SECOND_TARGET_OPEN_ID = "ou_management_integration_target_2"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.execute(
+            """INSERT INTO app_user
+                 (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
+                  department, tenant_key, provisioning_state, account_state)
+               VALUES (%s, %s, %s, %s, '化名用户二', '测试部门', 'tk_test', 'active', 'enabled')""",
+            (
+                new_id("usr"),
+                self.SECOND_TARGET_OPEN_ID,
+                f"fs_{self.SECOND_TARGET_OPEN_ID}",
+                f"un_{self.SECOND_TARGET_OPEN_ID}",
+            ),
+        )
+
+    def _ensure_management_context(self, message_id: str, identifier: str) -> None:
+        """职位表单的反向 FK 与生产管理卡发送侧登记保持同一前置。"""
+
+        now = datetime.now(timezone.utc) + timedelta(hours=1)
+        self.execute(
+            """INSERT INTO management_card_context
+                 (message_id, card_id, identifier, chat_id, initiated_by_open_id,
+                  snapshot_fingerprint, context_deadline_at)
+               VALUES (%s, %s, %s, 'oc_1', %s, 'fp', %s)""",
+            (message_id, f"card_{message_id}", identifier, ADMIN_OPEN_ID, now),
+        )
+
+    def _submit_and_confirm_position_group(self, target_open_id: str, message_id: str) -> str:
+        self._ensure_management_context(message_id, target_open_id)
+        response = self.handler.handle_management_form_submit(
+            operator_open_id=ADMIN_OPEN_ID,
+            admin_action="grant",
+            identifier=target_open_id,
+            company_id="",
+            metric_name="",
+            reason="真实配置组测试",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id=message_id,
+            trace_id=f"trc_{message_id}",
+            position_name="A运营",
+            company_scope="*",
+        )
+        self.assertEqual(response["toast"]["type"], "success")
+        pending_rows = self.query(
+            "SELECT id, payload FROM pending_action"
+            " WHERE target_open_id = %s AND action_type = 'local_permission_grant'"
+            " ORDER BY created_at DESC",
+            (target_open_id,),
+        )
+        self.assertEqual(len(pending_rows), 1)
+        pending_id, payload = pending_rows[0]
+        payload_data = json.loads(payload)
+        self.assertEqual(payload_data["permission_group_id"].startswith("lpg_"), True)
+        self.assertEqual(len(payload_data["pairs"]), 387)
+        outcome = self.pending_store.confirm(
+            pending_action_id=pending_id,
+            clicker_open_id=ADMIN_OPEN_ID,
+        )
+        self.assertEqual(outcome.decision.kind.value, "execute")
+        return payload_data["permission_group_id"]
+
+    def test_real_387_row_group_is_one_revoke_and_other_group_survives(self) -> None:
+        first_group = self._submit_and_confirm_position_group(TARGET_OPEN_ID, "om_group_1")
+        second_group = self._submit_and_confirm_position_group(
+            self.SECOND_TARGET_OPEN_ID, "om_group_2"
+        )
+
+        first_counts = self.query(
+            "SELECT count(*), count(DISTINCT permission_group_id)"
+            " FROM local_permission_override"
+            " WHERE permission_group_id = %s AND entry_status = 'active'",
+            (first_group,),
+        )
+        self.assertEqual(first_counts, [(387, 1)])
+        second_counts = self.query(
+            "SELECT count(*) FROM local_permission_override"
+            " WHERE permission_group_id = %s AND entry_status = 'active'",
+            (second_group,),
+        )
+        self.assertEqual(second_counts, [(387,)])
+
+        response = self.handler.handle_management_revoke(
+            operator_open_id=ADMIN_OPEN_ID,
+            override_id="",
+            permission_group_id=first_group,
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_group_1",
+            trace_id="trc_group_revoke",
+        )
+        self.assertEqual(response["toast"]["type"], "success")
+        revoke_rows = self.query(
+            "SELECT id, payload FROM pending_action"
+            " WHERE target_open_id = %s AND action_type = 'local_permission_revoke'"
+            " ORDER BY created_at DESC",
+            (TARGET_OPEN_ID,),
+        )
+        self.assertEqual(len(revoke_rows), 1)
+        revoke_id, revoke_payload = revoke_rows[0]
+        revoke_data = json.loads(revoke_payload)
+        self.assertEqual(revoke_data["permission_group_id"], first_group)
+        self.assertEqual(len(revoke_data["override_ids"]), 387)
+        outcome = self.pending_store.confirm(
+            pending_action_id=revoke_id,
+            clicker_open_id=ADMIN_OPEN_ID,
+        )
+        self.assertEqual(outcome.decision.kind.value, "execute")
+
+        revoked_counts = self.query(
+            "SELECT count(*) FILTER (WHERE entry_status = 'active'),"
+            "       count(*) FILTER (WHERE entry_status = 'revoked'),"
+            "       count(*)"
+            "  FROM local_permission_override"
+            " WHERE permission_group_id = %s",
+            (first_group,),
+        )
+        self.assertEqual(revoked_counts, [(0, 387, 387)])
+        # 另一用户的同形职位组不应被第一组的事务性撤销误伤。
+        self.assertEqual(
+            self.query(
+                "SELECT count(*) FROM local_permission_override"
+                " WHERE permission_group_id = %s AND entry_status = 'active'",
+                (second_group,),
+            ),
+            [(387,)],
+        )
+
+
+class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase):
+    """#493 P1：只有真实 daily publish 才能产生每日纠偏群摘要水位。"""
+
+    def _seed_context_and_executed_action(self, message_id: str) -> PostgresManagementCardContextStore:
+        now = datetime.now(timezone.utc)
+        context_store = PostgresManagementCardContextStore(self._dsn)
+        context_store.remember(
+            message_id=message_id,
+            identifier=TARGET_OPEN_ID,
+            card_id=f"card_{message_id}",
+            chat_id="oc_1",
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            snapshot_fingerprint="fp",
+            context_deadline_at=now + timedelta(hours=1),
+        )
+        self.execute(
+            """INSERT INTO pending_action
+                 (id, action_type, target_open_id, target_state_snapshot,
+                  initiated_by_open_id, status, card_delivered, card_id,
+                  payload, origin_card_message_id, confirm_deadline_at,
+                  decided_at, decided_by_open_id)
+               VALUES (%s, 'local_permission_grant', %s, 'absent', %s,
+                       'executed', TRUE, %s, %s, %s, %s, %s, %s)""",
+            (
+                new_id("pac"),
+                TARGET_OPEN_ID,
+                ADMIN_OPEN_ID,
+                f"card_confirm_{message_id}",
+                json.dumps({"company_id": "1011", "metric_name": "daily_active", "reason": "test"}),
+                message_id,
+                now + timedelta(minutes=10),
+                now,
+                ADMIN_OPEN_ID,
+            ),
+        )
+        return context_store
+
+    def _publish_for_context(
+        self,
+        *,
+        reason: str,
+        permission_version: int = 1,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        user_id = self.query(
+            "SELECT id FROM app_user WHERE feishu_open_id = %s", (TARGET_OPEN_ID,)
+        )[0][0]
+        payload = json.dumps(
+            {
+                "record_key": "target@example.com",
+                "email": "target@example.com",
+                "name": "化名用户",
+                "permissions": "{\"1011\":[\"daily_active\"]}",
+                "status": "approved",
+                "updated_at": now.isoformat(),
+            }
+        )
+        self.execute(
+            """INSERT INTO publish_outbox
+                 (id, user_id, permission_version, reason, payload, status,
+                  created_at, published_at, content_expires_at)
+               VALUES (%s, %s, %s, %s, %s, 'published', %s, %s, %s)""",
+            (
+                new_id("pub"),
+                user_id,
+                permission_version,
+                reason,
+                payload,
+                now,
+                now + timedelta(seconds=1),
+                now + timedelta(days=90),
+            ),
+        )
+
+    def test_late_instant_publish_does_not_create_daily_correction_watermark(self) -> None:
+        message_id = "om_correction_instant"
+        context_store = self._seed_context_and_executed_action(message_id)
+        context_store.update_state(
+            message_id=message_id, state="incomplete", dispatch_status="incomplete"
+        )
+        self._publish_for_context(
+            reason="admin_action_instant_recompute",
+        )
+
+        self.assertEqual(context_store.settle_published_contexts(), ())
+        context = context_store.lookup_context(message_id=message_id)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.state, "effective")
+        self.assertFalse(context.daily_correction_pending)
+        self.assertEqual(context_store.unreported_daily_correction_ids(), ())
+
+    def test_daily_publish_qualifies_once_and_late_instant_cannot_clear_it(self) -> None:
+        message_id = "om_correction_daily"
+        context_store = self._seed_context_and_executed_action(message_id)
+        context_store.update_state(
+            message_id=message_id, state="incomplete", dispatch_status="incomplete"
+        )
+        self._publish_for_context(
+            reason="daily_permission_refresh",
+        )
+
+        self.assertEqual(context_store.settle_published_contexts(), (message_id,))
+        context = context_store.lookup_context(message_id=message_id)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertTrue(context.daily_correction_pending)
+        self.assertIsNone(context.daily_correction_reported_at)
+        self.assertTrue(context.needs_refresh)
+        self.assertEqual(context_store.unreported_daily_correction_ids(), (message_id,))
+
+        # 重启/迟到的 instant observer 不能把已经由 daily batch 证明的事实清掉。
+        context_store.update_state(
+            message_id=message_id, state="effective", dispatch_status="effective"
+        )
+        self.assertEqual(context_store.unreported_daily_correction_ids(), (message_id,))
+        context_store.mark_daily_corrections_reported(message_ids=(message_id,))
+        context_store.mark_daily_corrections_reported(message_ids=(message_id,))
+        self.assertEqual(context_store.unreported_daily_correction_ids(), ())
+
+
+class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCase):
+    """#493 P1：两个独立连接上的 scanner/writer 必须按状态代数 CAS。"""
+
+    def _seed_refreshable_context(self, message_id: str) -> PostgresManagementCardContextStore:
+        store = PostgresManagementCardContextStore(self._dsn)
+        store.remember(
+            message_id=message_id,
+            identifier=TARGET_OPEN_ID,
+            card_id=f"card_{message_id}",
+            chat_id="oc_1",
+            initiated_by_open_id=ADMIN_OPEN_ID,
+            snapshot_fingerprint="fp",
+            context_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        store.update_state(
+            message_id=message_id, state="effective", dispatch_status="effective"
+        )
+        return store
+
+    def test_concurrent_state_write_rejects_stale_sequence_claim_without_consuming_it(self) -> None:
+        scanner_store = self._seed_refreshable_context("om_state_cas_claim")
+        writer_store = PostgresManagementCardContextStore(self._dsn)
+        snapshot = scanner_store.lookup_context(message_id="om_state_cas_claim")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+
+        both_ready = threading.Barrier(2)
+        writer_done = threading.Event()
+
+        def write_new_state():
+            both_ready.wait(timeout=5)
+            updated = writer_store.update_state(
+                message_id="om_state_cas_claim",
+                state="incomplete",
+                dispatch_status="incomplete",
+            )
+            writer_done.set()
+            return updated
+
+        def claim_old_snapshot():
+            both_ready.wait(timeout=5)
+            self.assertTrue(writer_done.wait(timeout=5))
+            return scanner_store.next_card_sequence(
+                message_id="om_state_cas_claim",
+                expected_state_version=snapshot.state_version,
+                expected_card_sequence=snapshot.card_sequence,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer_future = pool.submit(write_new_state)
+            scanner_future = pool.submit(claim_old_snapshot)
+            self.assertIsNotNone(writer_future.result(timeout=10))
+            self.assertIsNone(scanner_future.result(timeout=10))
+
+        current = scanner_store.lookup_context(message_id="om_state_cas_claim")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertEqual(current.state_version, snapshot.state_version + 1)
+        self.assertEqual(current.card_sequence, snapshot.card_sequence + 1)
+        self.assertTrue(current.needs_refresh)
+
+    def test_concurrent_state_write_rejects_late_watermark_clear(self) -> None:
+        scanner_store = self._seed_refreshable_context("om_state_cas_mark")
+        writer_store = PostgresManagementCardContextStore(self._dsn)
+        snapshot = scanner_store.lookup_context(message_id="om_state_cas_mark")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        claimed = scanner_store.next_card_sequence(
+            message_id="om_state_cas_mark",
+            expected_state_version=snapshot.state_version,
+            expected_card_sequence=snapshot.card_sequence,
+        )
+        self.assertEqual(claimed, snapshot.card_sequence + 1)
+        assert claimed is not None
+
+        writer_done = threading.Event()
+
+        def write_new_state():
+            updated = writer_store.update_state(
+                message_id="om_state_cas_mark",
+                state="incomplete",
+                dispatch_status="incomplete",
+            )
+            writer_done.set()
+            return updated
+
+        def mark_old_visual():
+            self.assertTrue(writer_done.wait(timeout=5))
+            return scanner_store.mark_visual_refreshed(
+                message_id="om_state_cas_mark",
+                sequence=claimed,
+                expected_state_version=snapshot.state_version,
+                expected_card_sequence=claimed,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer_future = pool.submit(write_new_state)
+            mark_future = pool.submit(mark_old_visual)
+            self.assertIsNotNone(writer_future.result(timeout=10))
+            self.assertFalse(mark_future.result(timeout=10))
+
+        current = scanner_store.lookup_context(message_id="om_state_cas_mark")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "incomplete")
+        self.assertEqual(current.card_sequence, claimed + 1)
+        self.assertEqual(current.visual_sequence, snapshot.visual_sequence)
+        self.assertTrue(current.needs_refresh)
+
+    def test_gateway_refresher_uses_real_context_port_and_clears_only_after_update(self) -> None:
+        from lingxi.apps.gateway import _GatewayManagementCardRefresher
+
+        class _Catalog:
+            def companies(self):
+                return ["1011"]
+
+            def metrics(self):
+                return ["daily_active"]
+
+            def positions(self):
+                return ["A运营"]
+
+        class _DisplayNames:
+            def company_labels(self, *, company_ids):
+                return {company_id: company_id for company_id in company_ids}
+
+            def metric_labels(self, *, metric_ids):
+                return {metric_id: metric_id for metric_id in metric_ids}
+
+        class _Transport:
+            def __init__(self) -> None:
+                self.updates: list[dict] = []
+
+            def update(self, **kwargs) -> None:
+                self.updates.append(kwargs)
+
+        store = self._seed_refreshable_context("om_state_cas_port")
+        context = store.lookup_context(message_id="om_state_cas_port")
+        self.assertIsNotNone(context)
+        assert context is not None
+        status = AdminUserStatusView(
+            identifier=TARGET_OPEN_ID,
+            provisioning_state="active",
+            account_state="enabled",
+            permission_version=1,
+            updated_at="2026-09-01T00:00:00+00:00",
+        )
+        transport = _Transport()
+        refresher = _GatewayManagementCardRefresher(
+            transport=transport,
+            catalog=_Catalog(),
+            display_names=_DisplayNames(),
+            context_store=store,
+        )
+
+        self.assertTrue(
+            refresher.update(
+                context=context,
+                status=status,
+                state=context.state,
+                dispatch_status=context.dispatch_status,
+            )
+        )
+        self.assertEqual(len(transport.updates), 1)
+        self.assertEqual(transport.updates[0]["card_id"], context.card_id)
+        self.assertEqual(transport.updates[0]["sequence"], context.card_sequence + 1)
+        current = store.lookup_context(message_id="om_state_cas_port")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertFalse(current.needs_refresh)
+        self.assertEqual(current.visual_sequence, transport.updates[0]["sequence"])
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

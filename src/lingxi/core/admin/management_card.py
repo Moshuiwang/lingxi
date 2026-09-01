@@ -1,12 +1,14 @@
-"""用户权限管理卡的展示层：纯函数渲染（#439 B 档，管理员操作一卡化）。
+"""用户权限管理卡的展示层：纯函数渲染（#493，职位+公司范围授权）。
 
 与 ``core/admin/notification.py`` 的确认卡片是**两张不同的卡**，不合并进同一张卡
 （见 ``core/admin/router.AdminCommandRouter._send_management_card`` 文档、本 Story
 报告"同卡二次确认"裁定一节）：产品合同「管理员处理入口与安全确认」正文明确
 "待确认操作发送到发起管理员本人的飞书私聊，卡片只承担最终确认，不承担搜索、比较、
-审批流或复杂信息填写"——管理卡负责"复杂信息填写"（银河来源/本地覆盖分列展示 +
-补充授权/屏蔽指标下拉表单 + 逐行撤销按钮），确认卡继续只承担"仅展示一个已经准备好
-的动作 + 确认/取消"。管理卡上的每一次写意图（提交表单 / 点击撤销按钮）都会转译成
+审批流或复杂信息填写"——管理卡负责查询结果展示、职位+公司范围补充授权表单和撤销
+入口，确认卡继续只承担"仅展示一个已经准备好的动作 + 确认/取消"。新职位+范围授权
+按 ``permission_group_id`` 聚合为一个职位+公司范围撤销项；只有历史无组行继续逐行撤销。
+管理卡上的
+每一次写意图（提交表单 / 点击撤销按钮）都会转译成
 一条等价的 ``/admin ...`` 命令文本，交给已有的 ``AdminCommandRouter.route()``
 处理（见 ``core/admin/card_callback.py`` 新增的回调分支），复用其全部既有
 ``prepare()``/角色核对/自我目标防呆/确认卡发送/审计逻辑，本模块不重新实现一遍
@@ -26,35 +28,27 @@ AdminDisplayNames` 端口翻译成人类可读文本——公司显示「中文�
 ``value`` 字段就是什么）——只有展示给管理员看的 ``text`` 字段经过翻译，选中后
 回传给服务端的语义不变，不需要下游再反查一次。
 
-## 200530 修复 + 按钮横排（PM 补充裁定第 5/6 条）
+## 表单字段与按钮
 
-「补充授权 / 屏蔽指标」两个提交按钮现在携带非空且卡内唯一的 ``name``
-（``grant_submit``/``suppress_submit``）——飞书官方错误码 ``200530`` 明确要求
-form 内交互组件必须有 name，建卡请求本身不会暴露这个缺陷（只在真实点击时才
-触发），``core/admin/card_layout.assert_unique_named_form_elements`` 在装配阶段
-静态钉死这条要求。两个按钮改用 ``column_set`` 横排（``core/admin/card_layout.
-button_row``，schema 2.0 官方姿势，W0-1 探针已验证 column_set 嵌 form 可行），
-不再是竖排的两个独立顶层元素。逐行「撤销」按钮不受影响——单个按钮没有"横排"
-这回事，继续是一个裸按钮，不套 form、不套 column_set。
+职位和公司范围下拉、原因输入框均为必填；唯一的表单提交按钮携带非空 ``name``
+（``grant_submit``），并通过 ``column_set`` 排版。独立的“取消”按钮只关闭管理卡。
+撤销按钮不在表单内。旧目录假实现仍保留旧的双按钮渲染分支，仅用于历史测试和已发出
+的旧卡兼容，生产目录始终提供 ``positions()`` 并走新形状。
 
 ## 组件选择
 
-- **公司 / 指标**：``select_static``（官方下拉组件）。选项来自真实指标目录
-  （``config/company_function_metric_map.toml``，经 ``CompanyMetricCatalog`` 端口
-  注入，不在本模块或调用方发明任何公司/指标数据——目录当前内容见该文件模块文档，
-  由产品负责人 2026-08-19 填入，非本卡新增）。目录暂不可用（读取失败/为空）时，
-  对应下拉退化为一个不可选的占位选项，而不是省略整个表单——管理员至少能看到"当前
-  无法枚举，请改用文本命令"这句明确提示，不是一段视觉上缺失的空白。
+- **职位 / 公司范围**：``select_static``（官方下拉组件）。职位选项来自精确角色映射；
+  公司范围包含单个公司和“全部（当前实际公司数）”。目录暂不可用时退化为不可选占位项，
+  不把缺失目录解释成空权限。
 - **原因**：``input``（官方输入框组件），自由文本。
-- **补充授权 / 屏蔽指标**：两个按钮共享同一个 ``form`` 容器（飞书卡片 2.0 官方
-  表单组件），横排在同一个 ``column_set`` 里，提交时把公司/指标/原因三个字段随
-  点击的按钮一起带回同一次回调（``form_action_type: "submit"``）。
-- **逐行撤销**：每条当前生效的本地覆盖各配一个独立按钮，复用已被真实 CardKit
+- **补充授权**：表单只提交职位、公司范围和原因（``form_action_type: "submit"``），
+  服务端在确认事务中展开为公司×指标行。
+- **撤销**：每个新授权组配一个职位+公司范围按钮；历史无组行各配一个独立按钮，复用已被真实 CardKit
   探针验证过的"按钮 + ``behaviors: [{type: callback, value: {...}}]``"形状（见
   ``adapters/feishu_admin_card.py`` 模块文档"2026-08-25 建卡环节已被真实探针证伪
   并修复"）——不需要额外字段输入，不放进 ``form``。
 
-## 证据等级 1：``select_static``/``input``/``form``/``column_set`` 组件未经真实探针验证
+## 外部平台证据边界
 
 上面引用的"已被真实探针验证过"只覆盖按钮与 markdown 两种组件；``column_set``
 嵌 ``form`` 的可行性已由 W0-1 探针在真实发送侧证实（结构合法），但真实点击后
@@ -76,9 +70,11 @@ from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverride
 ADMIN_ACTION_GRANT = "grant"
 ADMIN_ACTION_SUPPRESS = "suppress"
 ADMIN_ACTION_REVOKE = "revoke"
+ADMIN_ACTION_CANCEL = "cancel"
 
-#: 表单内两个提交按钮的 ``name``（飞书官方错误码 200530 要求非空且单卡唯一，
-#: 见模块文档"200530 修复"一节）。**公开常量**（W0-1 追加结论，2026-08-30）：
+#: 表单内提交按钮的 ``name``（飞书官方错误码 200530 要求非空且单卡唯一，
+#: 新卡只提交 ``grant_submit``；旧目录兼容分支另保留 ``suppress_submit``）。
+#: **公开常量**（W0-1 追加结论，2026-08-30）：
 #: 真实点击实测坐实——表单提交回调的 ``action.value`` 常常不以 Mapping 形态
 #: 到达（缺失或需要反序列化的字符串），``apps/gateway/__init__.py`` 的路由
 #: 分流因此需要一个不依赖 ``value`` 内容的后备判据，用回调事件本就会带回的
@@ -97,7 +93,7 @@ _CATALOG_UNAVAILABLE_PLACEHOLDER = "（当前无法枚举，请改用文本命�
 #: 内部标识前缀白名单（Trace #469 S-1），与 ``core/admin/router.
 #: _INTERNAL_ID_PREFIXES`` 同一份判据、独立各自维护一份（两处各自的调用面很薄，
 #: 抽公共函数换来的耦合大于收益，与本模块其余展示层惯例一致）。
-_INTERNAL_ID_PREFIXES: tuple[str, ...] = ("ou_", "lpo_", "pac_")
+_INTERNAL_ID_PREFIXES: tuple[str, ...] = ("ou_", "lpo_", "lpg_", "pac_")
 
 
 def _safe_identifier_echo(identifier: str) -> str:
@@ -117,6 +113,8 @@ class CompanyMetricCatalog(Protocol):
 
     def metrics(self) -> Sequence[str]: ...
 
+    def positions(self) -> Sequence[str]: ...
+
 
 def _plain_text(content: str) -> dict[str, str]:
     return {"tag": "plain_text", "content": content}
@@ -128,6 +126,7 @@ def _select_static(
     placeholder: str,
     options: Sequence[str],
     label_for: Callable[[str], str] | None = None,
+    required: bool = False,
 ) -> dict[str, Any]:
     """``label_for``（Trace #469 S-1 新增）：把每个候选值翻译成管理员看到的
     展示文本；``value`` 字段永远是原始候选值本身（提交语义不变，见模块文档
@@ -142,7 +141,7 @@ def _select_static(
             return value
         return label_for(value)
 
-    return {
+    element = {
         "tag": "select_static",
         "name": name,
         "placeholder": _plain_text(placeholder),
@@ -154,10 +153,16 @@ def _select_static(
             for value in option_values
         ],
     }
+    if required:
+        element["required"] = True
+    return element
 
 
-def _input(*, name: str, placeholder: str) -> dict[str, Any]:
-    return {"tag": "input", "name": name, "placeholder": _plain_text(placeholder)}
+def _input(*, name: str, placeholder: str, required: bool = False) -> dict[str, Any]:
+    element: dict[str, Any] = {"tag": "input", "name": name, "placeholder": _plain_text(placeholder)}
+    if required:
+        element["required"] = True
+    return element
 
 
 def _callback_button(
@@ -172,8 +177,8 @@ def _callback_button(
     ``name``——飞书官方错误码 ``200530`` 明确要求（真实点击时触发，建卡请求
     本身不会暴露，见模块文档）。``form_submit=True`` 但未传 ``name`` 是实现
     缺陷，直接 ``ValueError`` 失败关闭，不静默漏发这个字段。非 form 内的独立
-    按钮（如逐行撤销）不需要 ``name``，``name=None`` 时不写入这个键，保持既有
-    形状不变。
+    按钮（如撤销组/历史行）不需要 ``name``，``name=None`` 时不写入这个键，保持
+    既有形状不变。
     """
 
     if form_submit and not name:
@@ -217,9 +222,9 @@ def _galaxy_source_markdown(
         "role_function_map_unavailable",
     }
     if summary is None or summary.reason in unavailable_reasons:
-        return "**银河来源**：不可用（无法计算，不代表该用户没有银河权限）"
+        return "**银河权限**（银河来源）：暂时读不到（不代表该用户没有权限；当前不可用）"
     if not summary.granted:
-        return f"**银河来源**：当前没有可用的银河权限（原因：{summary.reason}）"
+        return f"**银河权限**（银河来源）：当前没有可用的银河权限（原因：{summary.reason}）"
     if summary.all_companies:
         company_label = "全部公司"
     else:
@@ -227,7 +232,7 @@ def _galaxy_source_markdown(
             "、".join(company_label_for(cid) for cid in summary.companies) or "(无)"
         )
     function_label = "、".join(summary.functions) or "(无)"
-    return f"**银河来源**：公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
+    return f"**银河权限**（银河来源）：公司范围 {company_label} · 职能 {function_label}（职能标签，非最终指标名）"
 
 
 #: 覆盖行原因文本在管理卡上的截断长度，与 ``core/admin/router.
@@ -258,10 +263,17 @@ def _override_row_elements(
         reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
     company_label = company_label_for(override.company_id)
     metric_label = metric_label_for(override.metric_name)
-    description = _markdown(
-        f"- （{direction_label}）公司 {company_label} · 指标 {metric_label}"
-        f" · 原因 {reason} · {override.created_at}"
-    )
+    if override.position_name:
+        scope_label = company_label_for(override.company_scope or override.company_id)
+        description = _markdown(
+            f"- （补充授权）职位 {override.position_name} · 公司范围 {scope_label}"
+            f" · 指标 {metric_label} · 原因 {reason} · {override.created_at}"
+        )
+    else:
+        description = _markdown(
+            f"- （{direction_label}）公司 {company_label} · 指标 {metric_label}"
+            f" · 原因 {reason} · {override.created_at}"
+        )
     button = _callback_button(
         label="撤销",
         style="danger",
@@ -274,12 +286,54 @@ def _override_row_elements(
     return description, button
 
 
+def _permission_group_elements(
+    overrides: Sequence[LocalPermissionOverrideView],
+    *,
+    permission_group_id: str,
+    display_identifier: str,
+    company_label_for: Callable[[str], str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """把一笔职位+范围授权组渲染为一个可见、可撤销的管理卡项。
+
+    展开后的公司×指标行只用于计数和服务端的幂等核对；管理员看到并点击的是
+    ``permission_group_id`` 代表的一个业务项。组 ID 只进入按钮隐藏回调值，不进入
+    可见 markdown，避免把内部标识重新变成用户界面语义。
+    """
+
+    if not overrides or not permission_group_id:
+        raise ValueError("职位授权组必须包含至少一行且有 permission_group_id")
+    first = overrides[0]
+    reason = first.reason
+    if len(reason) > _OVERRIDE_REASON_PREVIEW_LENGTH:
+        reason = reason[:_OVERRIDE_REASON_PREVIEW_LENGTH] + "…"
+    scope_label = company_label_for(first.company_scope or first.company_id)
+    position_label = first.position_name or "（未知职位）"
+    description = _markdown(
+        f"- （补充授权）职位 {position_label} · 公司范围 {scope_label}"
+        f" · 覆盖 {len(overrides)} 项权限 · 原因 {reason} · {first.created_at}"
+    )
+    button = _callback_button(
+        label="撤销",
+        style="danger",
+        value={
+            "admin_action": ADMIN_ACTION_REVOKE,
+            "permission_group_id": permission_group_id,
+            "identifier": display_identifier,
+        },
+    )
+    return description, button
+
+
 def render_management_card(
     status: AdminUserStatusView,
     *,
     display_identifier: str,
     catalog: CompanyMetricCatalog,
     display_names: AdminDisplayNames,
+    submitted: bool = False,
+    dispatch_status: str | None = None,
+    status_message: str | None = None,
+    closed: bool = False,
 ) -> dict[str, Any]:
     """把一次 ``/admin user`` 查询结果渲染成用户权限管理卡的 CardKit 2.0 JSON。
 
@@ -320,14 +374,29 @@ def render_management_card(
     3. （无）——不额外追加分隔或页脚，保持卡片精简。
     """
 
+    companies_available = True
     try:
         companies = tuple(catalog.companies())
     except Exception:  # noqa: BLE001 - 目录不可用不得让整张卡渲染失败
         companies = ()
+        companies_available = False
     try:
         metrics = tuple(catalog.metrics())
     except Exception:  # noqa: BLE001 - 同上
         metrics = ()
+
+    # #493 的产品字段是银河职位+公司范围。旧目录假实现没有 ``positions``，
+    # 继续渲染旧形状只为保持已有历史卡/单测的反序列化兼容；生产目录和所有新卡
+    # 均走下面的新表单，不再渲染「屏蔽指标」入口。
+    try:
+        positions_reader = getattr(catalog, "positions")
+    except AttributeError:
+        positions_reader = None
+    try:
+        positions = tuple(positions_reader()) if callable(positions_reader) else ()
+    except Exception:  # noqa: BLE001 - 目录不可用仍要显示卡片
+        positions = ()
+    position_form = callable(positions_reader)
 
     galaxy_source = status.galaxy_source
     galaxy_company_ids: tuple[str, ...] = (
@@ -343,6 +412,11 @@ def render_management_card(
                 *companies,
                 *galaxy_company_ids,
                 *(override.company_id for override in status.local_overrides),
+                *(
+                    override.company_scope
+                    for override in status.local_overrides
+                    if override.company_scope and override.company_scope != "*"
+                ),
             )
         )
     )
@@ -353,71 +427,199 @@ def render_management_card(
     metric_label_map = dict(display_names.metric_labels(metric_ids=metric_ids_needed))
 
     def _company_label(company_id: str) -> str:
+        if company_id == "*":
+            # The wildcard is a product-facing scope choice, not a real company
+            # key. Keep its actual current cardinality visible wherever an
+            # already-applied position grant is rendered as well as in the form
+            # option; never silently collapse it to a bare "全部" label.
+            if not companies_available:
+                return "全部（当前公司数暂不可用）"
+            return f"全部（{len(companies)} 家公司）"
         return company_label_map.get(company_id, company_id)
 
     def _metric_label(metric_id: str) -> str:
         return metric_label_map.get(metric_id, metric_id)
 
+    user_label = _safe_identifier_echo(display_identifier)
+    user_label_reader = getattr(display_names, "user_label", None)
+    if callable(user_label_reader):
+        try:
+            candidate = user_label_reader(open_id=status.identifier)
+        except Exception:  # noqa: BLE001 - display lookup must not break the card
+            candidate = ""
+        if isinstance(candidate, str) and candidate.strip():
+            user_label = candidate.strip()
+
+    provisioning_labels = {
+        "guest": "访客（尚未开始开通）",
+        "matching": "银河权限匹配中",
+        "manual_review": "待人工复核",
+        "provisioning": "开通中",
+        "mcp_syncing": "问数权限同步中",
+        "active": "已开通",
+        "aborted": "开通已中止",
+    }
+    account_labels = {
+        "enabled": "启用",
+        "suspended": "已停用",
+        "deleting": "删除中",
+        "deleted": "已删除",
+    }
     elements: list[dict[str, Any]] = [
-        _markdown(f"**用户权限管理卡** · 标识 {_safe_identifier_echo(display_identifier)}"),
+        _markdown(
+            f"**用户权限管理卡** · {user_label} · 标识 {_safe_identifier_echo(display_identifier)}"
+        ),
+        _markdown(
+            f"**开通状态**：{provisioning_labels.get(status.provisioning_state, status.provisioning_state)}\n"
+            f"**账号状态**：{account_labels.get(status.account_state, status.account_state)}"
+        ),
         _markdown(_galaxy_source_markdown(status, company_label_for=_company_label)),
         _markdown("**本地覆盖**"),
     ]
     if not status.local_overrides:
         elements.append(_markdown("无本地覆盖"))
     else:
+        rendered_groups: set[str] = set()
+        groups: dict[str, list[LocalPermissionOverrideView]] = {}
         for override in status.local_overrides:
-            description, button = _override_row_elements(
-                override,
-                display_identifier=display_identifier,
-                company_label_for=_company_label,
-                metric_label_for=_metric_label,
-            )
+            if override.permission_group_id:
+                groups.setdefault(override.permission_group_id, []).append(override)
+        for override in status.local_overrides:
+            if override.permission_group_id:
+                if override.permission_group_id in rendered_groups:
+                    continue
+                rendered_groups.add(override.permission_group_id)
+                description, button = _permission_group_elements(
+                    groups[override.permission_group_id],
+                    permission_group_id=override.permission_group_id,
+                    display_identifier=display_identifier,
+                    company_label_for=_company_label,
+                )
+            else:
+                description, button = _override_row_elements(
+                    override,
+                    display_identifier=display_identifier,
+                    company_label_for=_company_label,
+                    metric_label_for=_metric_label,
+                )
             elements.append(description)
             elements.append(button)
 
-    elements.append(_markdown("**补充授权 / 屏蔽指标**"))
-    form_elements: list[dict[str, Any]] = [
-        _select_static(
-            name="company_id",
-            placeholder="选择公司",
-            options=companies,
-            label_for=_company_label,
-        ),
-        _select_static(
-            name="metric_name",
-            placeholder="选择指标",
-            options=metrics,
-            label_for=_metric_label,
-        ),
-        _input(name="reason", placeholder="填写原因"),
-        button_row(
-            [
-                _callback_button(
-                    label="补充授权",
-                    style="primary",
-                    form_submit=True,
-                    name=GRANT_SUBMIT_BUTTON_NAME,
-                    value={"admin_action": ADMIN_ACTION_GRANT, "identifier": display_identifier},
+    if status.updated_at:
+        elements.append(_markdown(f"**数据取自**：{status.updated_at}"))
+    if status_message:
+        elements.append(_markdown(status_message))
+
+    if position_form:
+        elements.append(_markdown("**补充授权**"))
+        if closed:
+            elements.append(_markdown(status_message or dispatch_status or "已关闭"))
+        elif submitted:
+            status_text = "已提交，请在下方确认卡片上确认（10 分钟内有效）"
+            if dispatch_status:
+                status_text += f"\n\n当前状态：{dispatch_status}"
+            elements.append(_markdown(status_text))
+        else:
+            scope_options = ("*", *companies)
+
+            def _scope_label(value: str) -> str:
+                if value == "*":
+                    if not companies_available:
+                        return "全部（当前公司数暂不可用）"
+                    return f"全部（{len(companies)} 家公司）"
+                return _company_label(value)
+
+            form_elements: list[dict[str, Any]] = [
+                _select_static(
+                    name="position_name",
+                    placeholder="选择银河职位",
+                    options=positions,
+                    required=True,
                 ),
-                _callback_button(
-                    label="屏蔽指标",
-                    style="danger",
-                    form_submit=True,
-                    name=SUPPRESS_SUBMIT_BUTTON_NAME,
-                    value={"admin_action": ADMIN_ACTION_SUPPRESS, "identifier": display_identifier},
+                _select_static(
+                    name="company_scope",
+                    placeholder="选择公司范围",
+                    options=scope_options,
+                    label_for=_scope_label,
+                    required=True,
+                ),
+                _input(name="reason", placeholder="填写原因", required=True),
+                button_row(
+                    [
+                        _callback_button(
+                            label="补充授权",
+                            style="primary",
+                            form_submit=True,
+                            name=GRANT_SUBMIT_BUTTON_NAME,
+                            value={"admin_action": ADMIN_ACTION_GRANT, "identifier": display_identifier},
+                        )
+                    ]
                 ),
             ]
-        ),
-    ]
-    assert_unique_named_form_elements(form_elements)
-    elements.append(
-        {
-            "tag": "form",
-            "name": "admin_manage_grant_suppress_form",
-            "elements": form_elements,
-        }
-    )
+            assert_unique_named_form_elements(form_elements)
+            elements.append(
+                {
+                    "tag": "form",
+                    "name": "admin_manage_position_scope_form",
+                    "elements": form_elements,
+                }
+            )
+            if dispatch_status:
+                # 终态（已生效/不完整/已取消）恢复表单可用，但仍把这次异步
+                # 处理结果留在原卡上，避免刷新后只看到新快照而丢失结果提示。
+                elements.append(_markdown(f"当前状态：{dispatch_status}"))
+        if not closed and not submitted:
+            elements.append(
+                _callback_button(
+                    label="取消",
+                    style="default",
+                    value={"admin_action": ADMIN_ACTION_CANCEL, "identifier": display_identifier},
+                )
+            )
+    else:
+        # Legacy renderer for cards produced by pre-#493 test/catalog implementations.
+        elements.append(_markdown("**补充授权 / 屏蔽指标**"))
+        form_elements: list[dict[str, Any]] = [
+            _select_static(
+                name="company_id",
+                placeholder="选择公司",
+                options=companies,
+                label_for=_company_label,
+            ),
+            _select_static(
+                name="metric_name",
+                placeholder="选择指标",
+                options=metrics,
+                label_for=_metric_label,
+            ),
+            _input(name="reason", placeholder="填写原因"),
+            button_row(
+                [
+                    _callback_button(
+                        label="补充授权",
+                        style="primary",
+                        form_submit=True,
+                        name=GRANT_SUBMIT_BUTTON_NAME,
+                        value={"admin_action": ADMIN_ACTION_GRANT, "identifier": display_identifier},
+                    ),
+                    _callback_button(
+                        label="屏蔽指标",
+                        style="danger",
+                        form_submit=True,
+                        name=SUPPRESS_SUBMIT_BUTTON_NAME,
+                        value={"admin_action": ADMIN_ACTION_SUPPRESS, "identifier": display_identifier},
+                    ),
+                ]
+            ),
+        ]
+        assert_unique_named_form_elements(form_elements)
+        elements.append(
+            {
+                "tag": "form",
+                "name": "admin_manage_grant_suppress_form",
+                "elements": form_elements,
+            }
+        )
 
     return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
 
@@ -435,9 +637,8 @@ class ManagementCardCreated:
 class ManagementCardTransport(Protocol):
     """用户权限管理卡的出站端口。真实实现见
     ``adapters/feishu_admin_card.LarkAdminManagementCardTransport``；测试注入
-    内存假实现。管理卡不支持 ``update()``——它不是一次待确认操作，不需要"终态
-    更新"这个概念，每次 ``/admin user`` 查询都发一张新卡，旧卡片保持原样可继续
-    交互（管理员可以对同一个用户先后发起多次授权/抑制/收回，互不影响）。
+    内存假实现。管理卡的 ``update()`` 在原卡片实体上刷新懒过期、已提交和异步
+    下发状态；更新序号由持久上下文存储提供，不能由调用方硬编码。
     """
 
     def create(
@@ -448,3 +649,5 @@ class ManagementCardTransport(Protocol):
         reply_to_message_id: str,
         card: dict[str, Any],
     ) -> ManagementCardCreated: ...
+
+    def update(self, *, card_id: str, sequence: int, card: dict[str, Any]) -> None: ...

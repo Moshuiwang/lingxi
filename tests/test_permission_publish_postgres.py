@@ -39,6 +39,7 @@ from lingxi.core.ids import new_id
 from lingxi.core.permission.publish import (
     DEFAULT_MAX_ATTEMPTS,
     PermissionDecisionTransientFailure,
+    PermissionGrantBlockedByAccountState,
     PermissionPublishExecutor,
     PermissionTableError,
     PublishAttempt,
@@ -46,7 +47,11 @@ from lingxi.core.permission.publish import (
     STATUS_FAILED,
     STATUS_PUBLISHED,
 )
-from lingxi.core.permission.publish_row import CREATED_FIELD_NAMES, PublishRow
+from lingxi.core.permission.publish_row import (
+    CREATED_FIELD_NAMES,
+    PublishRow,
+    build_revocation_row,
+)
 
 #: biai-agent 加密规格 v1 的**公开测试向量**（非生产密钥、非生产令牌）。
 SPEC_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -155,10 +160,37 @@ class PermissionPublishPostgresTestCase(unittest.TestCase):
             cursor.execute("SELECT count(*) FROM publish_outbox")
             return int(cursor.fetchone()[0])
 
+    def _set_states(
+        self,
+        user_id: str = USER_A,
+        *,
+        account_state: str | None = None,
+        provisioning_state: str | None = None,
+    ) -> None:
+        """只翻转这两个状态列，与生产 ``postgres_pending_action.py`` 的
+        ``suspend_user``/``resume_user`` 分支同一姿态（不动其他列）。"""
+
+        assignments = []
+        parameters: list[str] = []
+        if account_state is not None:
+            assignments.append("account_state = %s")
+            parameters.append(account_state)
+        if provisioning_state is not None:
+            assignments.append("provisioning_state = %s")
+            parameters.append(provisioning_state)
+        assert assignments, "至少要翻转一列"
+        parameters.append(user_id)
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE app_user SET {', '.join(assignments)}, updated_at = now() WHERE id = %s",
+                tuple(parameters),
+            )
+
 
 class SameTransactionTest(PermissionPublishPostgresTestCase):
     def test_decision_and_intent_land_together(self) -> None:
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="first_onboarding", decided_at=NOW
         )
         self.assertEqual(decision.outcome, DecisionOutcome.ENQUEUED)
@@ -182,6 +214,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         ):
             with self.assertRaises(RuntimeError):
                 self.store.record_decision(
+                    require_enabled_account=True,
                     user_id=USER_A, row=_row(), reason="first_onboarding", decided_at=NOW
                 )
 
@@ -215,6 +248,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """`V-权限-11` 前半：带令牌密文的七字段快照是合法的内容快照。"""
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first_onboarding",
             decided_at=NOW,
         )
@@ -245,6 +279,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
         )
         first = self.store.claim_next()
@@ -282,6 +317,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """更新尝试不得把出身挪到别的行上——它传的是 ``None``，只能保持不变。"""
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
         )
         self.store.claim_next()
@@ -306,6 +342,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
         )
         self.store.claim_next()
@@ -326,6 +363,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """创建结果不明（没拿到 ID）时不认领出身：重试按普通路径收敛。"""
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(token_cipher=TOKEN_CIPHER), reason="first", decided_at=NOW
         )
         self.store.claim_next()
@@ -365,6 +403,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         cipher = McpTokenCipher(SPEC_MASTER_KEY)
         plaintext = new_token()
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(token_cipher=cipher.encrypt(plaintext)),
             reason="first_onboarding",
@@ -378,9 +417,11 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
 
     def test_unchanged_permission_does_not_enqueue_again(self) -> None:
         first = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW
         )
         second = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW + timedelta(days=1)
         )
         self.assertEqual(second.outcome, DecisionOutcome.UNCHANGED)
@@ -389,8 +430,9 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         self.assertEqual(self._count(), 1)
 
     def test_changed_permission_enqueues_a_new_version(self) -> None:
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW)
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW, require_enabled_account=True)
         second = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1011":["商务"],"1012":["商务"]}'),
             reason="daily_refresh",
@@ -404,6 +446,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         """内容没变不等于已经发布成功：上一条 ``failed`` 时照常排新意图。"""
 
         first = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="first_onboarding", decided_at=NOW
         )
         self.store.claim_next()
@@ -412,6 +455,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
             status=STATUS_FAILED,
         )
         second = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_refresh", decided_at=NOW
         )
         self.assertEqual(second.outcome, DecisionOutcome.ENQUEUED)
@@ -440,7 +484,7 @@ class SameTransactionTest(PermissionPublishPostgresTestCase):
         self.assertEqual(self._count(), 1)
 
     def test_deleting_the_user_removes_the_intent(self) -> None:
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute("DELETE FROM app_user WHERE id = %s", (USER_A,))
         self.assertEqual(self._count(), 0)
@@ -538,6 +582,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.remember_memory(user_id=USER_A)
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(),
             reason="daily_permission_refresh",
@@ -559,6 +604,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         （设计文 e 节第 4 项「UNCHANGED 不误清」）。"""
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
         self.seed_delivered_conversation(
@@ -567,6 +613,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.remember_memory(user_id=USER_A)
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(),
             reason="daily_permission_refresh",
@@ -590,6 +637,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         )
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="first_onboarding", decided_at=NOW
         )
 
@@ -618,6 +666,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         ):
             with self.assertRaises(RuntimeError):
                 self.store.record_decision(
+                    require_enabled_account=True,
                     user_id=USER_A,
                     row=_row(),
                     reason="daily_permission_refresh",
@@ -654,6 +703,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         ):
             with self.assertRaises(RuntimeError):
                 self.store.record_decision(
+                    require_enabled_account=True,
                     user_id=USER_A,
                     row=_row(),
                     reason="daily_permission_refresh",
@@ -683,6 +733,7 @@ class DeliveredContentPurgeTest(PermissionPublishPostgresTestCase):
         self.remember_memory(user_id=USER_B)
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(),
             reason="daily_permission_refresh",
@@ -747,6 +798,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         （ENQUEUED），但 ``permissions`` 列文本一个字符都没动，不该清理。"""
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
         self.seed_delivered_conversation(
@@ -765,6 +817,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         )
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=renamed_row,
             reason="daily_permission_refresh",
@@ -783,6 +836,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         ``permissions`` 内容——这是重试，不是变化，不该清理。"""
 
         first = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
         with connect(self._dsn) as connection, connection.cursor() as cursor:
@@ -797,6 +851,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         )
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(),  # 与第一次决定逐字节相同
             reason="daily_permission_refresh",
@@ -817,6 +872,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         误伤真正的权限变化。"""
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
         self.seed_delivered_conversation(
@@ -827,6 +883,7 @@ class PermissionsUnchangedDoesNotPurgeTest(PermissionPublishPostgresTestCase):
         )
 
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1011":["商务","日活"]}'),
             reason="daily_permission_refresh",
@@ -880,6 +937,7 @@ class TransientFailureRealDbTest(PermissionPublishPostgresTestCase):
         try:
             with self.assertRaises(PermissionDecisionTransientFailure) as raised:
                 self.store.record_decision(
+                    require_enabled_account=True,
                     user_id=USER_A,
                     row=_row(),
                     reason="daily_permission_refresh",
@@ -907,6 +965,7 @@ class TransientFailureRealDbTest(PermissionPublishPostgresTestCase):
 class ClaimTest(PermissionPublishPostgresTestCase):
     def test_claim_returns_the_current_permission_version(self) -> None:
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="x", decided_at=NOW
         )
         claim = self.store.claim_next()
@@ -920,8 +979,9 @@ class ClaimTest(PermissionPublishPostgresTestCase):
     def test_one_user_has_at_most_one_publish_in_flight(self) -> None:
         """`V-权限-12`：同一用户单飞。少了这条，v1 的写入会落后到 v2 之后。"""
 
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1012":["商务"]}'),
             reason="x",
@@ -934,7 +994,7 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         self.assertIsNone(self.store.claim_next())
 
         # 另一个用户不受影响。
-        self.store.record_decision(user_id=USER_B, row=_row(EMAIL_B), reason="x", decided_at=NOW)
+        self.store.record_decision(user_id=USER_B, row=_row(EMAIL_B), reason="x", decided_at=NOW, require_enabled_account=True)
         other = self.store.claim_next()
         assert other is not None
         self.assertEqual(other.user_id, USER_B)
@@ -952,8 +1012,9 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         v2 因为 v1 这条更早的 ``pending`` 而拒领——这正是本用例要钉住的行为。
         """
 
-        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1012":["商务"]}'),
             reason="x",
@@ -990,8 +1051,9 @@ class ClaimTest(PermissionPublishPostgresTestCase):
     def test_a_newer_version_waits_until_the_older_one_reaches_a_terminal_state(self) -> None:
         """已提交路径上的同一条规则：更早的意图没走到终态之前，新版本不被认领。"""
 
-        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        first = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         second = self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1012":["商务"]}'),
             reason="x",
@@ -1018,7 +1080,7 @@ class ClaimTest(PermissionPublishPostgresTestCase):
         self.assertEqual(promoted.outbox_id, second.outbox_id)
 
     def test_claim_marks_publishing_and_counts_attempts(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.claim_next()
         stored = self.store.load(decision.outbox_id or "")
         assert stored is not None
@@ -1031,7 +1093,7 @@ class ClaimTest(PermissionPublishPostgresTestCase):
 
 class CompleteTest(PermissionPublishPostgresTestCase):
     def _claimed(self) -> str:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.claim_next()
         return decision.outbox_id or ""
 
@@ -1108,7 +1170,7 @@ class CompleteTest(PermissionPublishPostgresTestCase):
 
 class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
     def test_expiry_is_pinned_to_ninety_days_after_creation(self) -> None:
-        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT content_expires_at - created_at FROM publish_outbox LIMIT 1"
@@ -1116,7 +1178,7 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
             self.assertEqual(cursor.fetchone()[0], timedelta(days=90))
 
     def test_caller_supplied_expiry_is_ignored(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE publish_outbox SET content_expires_at = now() WHERE id = %s",
@@ -1129,7 +1191,7 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
             self.assertEqual(cursor.fetchone()[0], timedelta(days=90))
 
     def test_the_anchors_cannot_be_rewritten(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         for column, value in (
             ("created_at", NOW),
             ("user_id", USER_B),
@@ -1143,7 +1205,7 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
                     )
 
     def test_published_status_requires_a_publish_time(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         with self.assertRaises(Exception):
             with connect(self._dsn) as connection, connection.cursor() as cursor:
                 cursor.execute(
@@ -1152,7 +1214,7 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
                 )
 
     def test_expired_payload_is_redacted_but_the_run_facts_survive(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.claim_next()
         self.store.complete(_attempt(decision.outbox_id or ""), status=STATUS_PUBLISHED)
 
@@ -1209,6 +1271,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         self, *, user_id: str = USER_A, row: PublishRow | None = None, reason: str = "daily_permission_refresh"
     ) -> str:
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=user_id, row=row or _row(), reason=reason, decided_at=NOW
         )
         claimed = self.store.claim_next()
@@ -1272,6 +1335,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
         """否定断言：**还没发布读回一致的意图不会触发任何通知。**"""
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
 
@@ -1303,6 +1367,7 @@ class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
 
         self._publish()
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(permissions='{"1011":["商务","财务"]}'),
             reason="daily_permission_refresh",
@@ -1444,6 +1509,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
         """
 
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
 
@@ -1451,6 +1517,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
 
     def test_a_claimed_intent_counts_too(self) -> None:
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
         )
         self.store.claim_next()
@@ -1458,7 +1525,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
         self.assertTrue(self.store.has_publish_footprint(USER_A), "publishing 也是在途")
 
     def test_a_published_intent_makes_the_history_true(self) -> None:
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.claim_next()
         self.store.complete(_attempt(decision.outbox_id or ""), status=STATUS_PUBLISHED)
 
@@ -1468,7 +1535,7 @@ class PublishHistoryAndRecipientTest(PermissionPublishPostgresTestCase):
     def test_a_failed_intent_does_not_count_as_a_footprint(self) -> None:
         """否定断言：``failed`` **不算足迹**——那一版从来没有落到外部表。"""
 
-        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW)
+        decision = self.store.record_decision(user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True)
         self.store.claim_next()
         self.store.complete(
             _attempt(decision.outbox_id or "", outcome=PublishOutcome.CONFLICT, record_id=None),
@@ -1547,6 +1614,7 @@ class RoundExclusionPostgresTest(PermissionPublishPostgresTestCase):
 
     def _intent(self, user_id: str = USER_A, email: str = EMAIL_A) -> str:
         decision = self.store.record_decision(
+            require_enabled_account=True,
             user_id=user_id,
             row=_row(email, token_cipher=TOKEN_CIPHER),
             reason="permission_refresh",
@@ -1629,6 +1697,7 @@ class RoundExclusionPostgresTest(PermissionPublishPostgresTestCase):
 
         first = self._intent(USER_A, EMAIL_A)
         self.store.record_decision(
+            require_enabled_account=True,
             user_id=USER_A,
             row=_row(EMAIL_A, permissions='{"1012":["财务"]}', token_cipher=TOKEN_CIPHER),
             reason="permission_refresh",
@@ -1666,6 +1735,167 @@ class RoundExclusionPostgresTest(PermissionPublishPostgresTestCase):
 class _SilentAudit:
     def record(self, action: str, /, **fields: object) -> None:
         del action, fields
+
+
+class AccountStateGuardTest(PermissionPublishPostgresTestCase):
+    """Issue #483：落权限决定的那把行锁里复检账号状态。
+
+    只有真库能证伪的那几条：复检读的是 ``SELECT ... FOR UPDATE`` **同一条语句**多取
+    的一列，被挡时事务**整体回滚**（版本不推进、outbox 不多行、送达正文不清）。假
+    store 上这几条无论实现怎么写都是绿的。
+
+    夹具里的 ``USER_A`` 建档时不写这两个状态列，取数据库默认值
+    （``account_state='enabled'``、``provisioning_state='guest'``），用例按需翻转。
+    """
+
+    def test_a_grant_for_a_suspended_user_is_blocked_and_writes_nothing(self) -> None:
+        """核心断言：声明"需要账号有效"时，停用用户拿不到任何授权，且**零写入**。"""
+
+        self._set_states(account_state="suspended")
+
+        with self.assertRaises(PermissionGrantBlockedByAccountState) as raised:
+            self.store.record_decision(
+                user_id=USER_A,
+                row=_row(),
+                reason="daily_permission_refresh",
+                require_enabled_account=True,
+                decided_at=NOW,
+            )
+
+        self.assertEqual(raised.exception.account_state, "suspended")
+        # 事务整体回滚：版本没推进、outbox 一行都没有。没有这一半，"被挡"可能只是
+        # 抛异常之前已经写了半套状态。
+        self.assertEqual(self._version(), 0, "被挡的决定不得推进权限版本")
+        self.assertEqual(self._count(), 0, "被挡的决定不得留下任何发布意图")
+
+    def test_the_other_two_terminal_account_states_are_blocked_too(self) -> None:
+        """白名单而不是"只挡 suspended"：删除中/已删除同样不得拿到非空授权。
+
+        两个状态各用夹具里的一个用户，不复用同一行——同一行连续翻两次状态会让"第二次
+        到底有没有真的被挡"取决于第一次留下的库状态。
+        """
+
+        for user_id, email, account_state in (
+            (USER_A, EMAIL_A, "deleting"),
+            (USER_B, EMAIL_B, "deleted"),
+        ):
+            with self.subTest(account_state=account_state):
+                self._set_states(user_id, account_state=account_state)
+                with self.assertRaises(PermissionGrantBlockedByAccountState) as raised:
+                    self.store.record_decision(
+                        user_id=user_id,
+                        row=_row(email),
+                        reason="daily_permission_refresh",
+                        require_enabled_account=True,
+                        decided_at=NOW,
+                    )
+                self.assertEqual(raised.exception.account_state, account_state)
+                self.assertEqual(self._version(user_id), 0)
+        self.assertEqual(self._count(), 0, "两次被挡都是零写入")
+
+    def test_a_grant_is_not_blocked_while_the_user_is_still_provisioning(self) -> None:
+        """**反向断言，防停服级误伤**：复检只看 ``account_state``，绝不带
+        ``provisioning_state``。
+
+        首次开通调用 ``record_decision`` 时这个人还是 ``provisioning``（推进到
+        ``mcp_syncing`` 发生在发布**之后**，见 ``core/identity/onboarding_runner.py``
+        的 ``_publish`` 调用次序）。守卫里只要多带一个 ``provisioning_state='active'``，
+        首次开通就会 100% 全部失败——那是比原缺陷更响的停服级误伤。
+        """
+
+        self._set_states(account_state="enabled", provisioning_state="provisioning")
+
+        decision = self.store.record_decision(
+            user_id=USER_A,
+            row=_row(token_cipher=TOKEN_CIPHER),
+            reason="first_onboarding",
+            require_enabled_account=True,
+            decided_at=NOW,
+        )
+
+        self.assertEqual(decision.outcome, DecisionOutcome.ENQUEUED)
+        self.assertEqual(self._version(), 1)
+        self.assertEqual(self._count(), 1)
+
+    def test_a_revocation_for_a_suspended_user_is_never_blocked(self) -> None:
+        """**方向相反、后果最严重的那一处**：撤权必须照常放行。
+
+        ``force_revoke`` 的服务对象本来就是刚被管理员停用的人——守卫如果把撤权也挡了，
+        「停用」就彻底失效，比原缺陷更糟。
+        """
+
+        self._set_states(account_state="suspended")
+
+        decision = self.store.record_decision(
+            user_id=USER_A,
+            row=build_revocation_row(email=EMAIL_A, display_name="化名甲", decided_at=NOW),
+            reason="admin_action_instant_revoke",
+            require_enabled_account=False,
+            decided_at=NOW,
+        )
+
+        self.assertEqual(decision.outcome, DecisionOutcome.ENQUEUED)
+        self.assertEqual(self._version(), 1)
+        stored = self.store.load(decision.outbox_id or "")
+        assert stored is not None
+        self.assertEqual(stored.payload["permissions"], "{}")
+
+    def test_declaring_no_account_check_for_a_non_empty_row_is_refused(self) -> None:
+        """声明与内容自洽：传 ``False`` 却排非空授权，在**进事务之前**就被拒。
+
+        这条让"未来某个调用点把授权声明成撤权"从运行期就写不出来——守卫因此不依赖
+        调用方声明得对，只依赖它声明得自洽。
+        """
+
+        with self.assertRaises(ValueError):
+            self.store.record_decision(
+                user_id=USER_A,
+                row=_row(),
+                reason="daily_permission_refresh",
+                require_enabled_account=False,
+                decided_at=NOW,
+            )
+
+        self.assertEqual(self._version(), 0)
+        self.assertEqual(self._count(), 0)
+
+    def test_the_declaration_is_a_required_keyword(self) -> None:
+        """必填而不是给默认值：忘了传就当场 ``TypeError``，不会静默按"不检查"跑。
+
+        本仓为这条纪律付过一次学费——``merge_permission_sources(full_access_
+        wildcard=...)`` 的默认值曾是一次真实漏接的根因（Trace #445）。
+        """
+
+        with self.assertRaises(TypeError):
+            self.store.record_decision(  # type: ignore[call-arg]
+                user_id=USER_A, row=_row(), reason="daily_permission_refresh", decided_at=NOW
+            )
+
+
+class NoticeRecipientWhitelistTest(PermissionPublishPostgresTestCase):
+    """codex 第 2 轮 P2 的"演进防御"处置（Issue #483）：通知收件人查询改正向白名单。
+
+    行集合与改之前**逐行等价**（``account_state`` 的 CHECK 只有四个取值），这里钉的是
+    每一个取值的实际行为，而不是 SQL 文本——文本断言换个写法就假绿。
+    """
+
+    def test_only_an_active_enabled_user_is_a_notice_recipient(self) -> None:
+        self._set_states(provisioning_state="active")
+        self.assertEqual(self.store.notice_recipient_open_id(USER_A), f"ou_{USER_A}")
+
+        for account_state in ("suspended", "deleting", "deleted"):
+            with self.subTest(account_state=account_state):
+                self._set_states(account_state=account_state)
+                self.assertIsNone(
+                    self.store.notice_recipient_open_id(USER_A),
+                    "非 enabled 的账号一律不是通知收件人",
+                )
+
+    def test_an_unfinished_provisioning_user_is_not_a_notice_recipient(self) -> None:
+        """既有口径不变：还没开通完成的人不该收到"你的可用范围已更新"。"""
+
+        self._set_states(account_state="enabled", provisioning_state="provisioning")
+        self.assertIsNone(self.store.notice_recipient_open_id(USER_A))
 
 
 if __name__ == "__main__":  # pragma: no cover

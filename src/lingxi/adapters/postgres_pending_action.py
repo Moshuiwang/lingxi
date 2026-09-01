@@ -71,21 +71,19 @@
 
 ``LOCAL_PERMISSION_REVOKE`` 与 grant/suppress 共用同一个 prepare/confirm 骨架，
 但输入形状相反——grant/suppress 按"用户+方向+公司+指标"这个键定位；revoke
-按 override_id 这一行本身定位（管理员从 ``/admin user`` 回显里复制这个 id，
-不需要重新填一遍公司/指标）。差异集中在三处：
+对新职位+范围授权按 ``permission_group_id`` 整组定位，对历史
+``permission_group_id IS NULL`` 行按 ``override_id`` 定位（管理员从
+``/admin user`` 或管理卡按钮发起，不需要重新填一遍公司/指标）。差异集中在三处：
 
-- ``prepare()``：复用既有的 ``target_open_id`` 形参承载 override_id（不是真实
-  的 open_id——router 层拿到的 ``command.identifier`` 对 revoke 命令而言就是
-  override_id，见 ``core/admin/router.py`` 的 ``_dispatch_write_action`` 调用点），
-  按这个 id 联表 ``local_permission_override``/``app_user`` 一次查出：这一行现在
-  的 ``entry_status``（写进 ``target_state_snapshot``，取值域收窄成
-  ``VALID_SOURCE_STATES[REVOKE] = {"active"}``）、这一行的属主真实 open_id（写进
-  ``PendingAction.target_open_id``，供确认卡展示"目标：xxx"）、以及这一行的
-  ``direction``/``company_id``/``metric_name``（连同管理员这次填写的收回
-  ``reason`` 一起序列化进 ``payload``，供 ``core/admin/notification.py`` 渲染
-  "含被收回的方向/公司/指标"——卡 B 设计卡显式要求）。行不存在时把 current_state
-  置 ``None``，与 grant/suppress 对"目标不存在"的处理同一姿态，落进
-  ``decide_prepare`` 既有的"未找到"拒绝分支，不产生任何新代码路径。
+- ``prepare()``：复用既有的 ``target_open_id`` 形参承载 override/group ID（不是真实
+  的 open_id——router 层拿到的 ``command.identifier`` 对 revoke 命令而言就是这个
+  不透明 ID，见 ``core/admin/router.py`` 的 ``_dispatch_write_action`` 调用点）。
+  历史行按这个 id 联表 ``local_permission_override``/``app_user`` 一次查出其
+  ``entry_status``、属主真实 open_id、方向/公司/指标；组 ID 则读取该组全部行，要求
+  属主、方向一致且全部为 ``active``，并把完整行 ID 集合冻结进 ``payload``。两种
+  形状都把属主写进 ``PendingAction.target_open_id``，供确认卡展示"目标：xxx"；
+  行/组不存在或状态不满足时把 current_state 置为拒绝值，落进
+  ``decide_prepare`` 既有拒绝分支，不产生任何新代码路径。
 - 自我目标防呆放在这里、不在 router 层（设计卡"检查点位置不同"）：router 拿到
   的 ``target_identifier`` 只是一个不透明的 override_id 字符串，在查库之前无法
   判断它的属主是不是操作者本人——查到属主 open_id 之后立刻核对，相等则直接拒绝、
@@ -93,15 +91,13 @@
   :data:`_REVOKE_SELF_TARGET_FORBIDDEN_CODE`，取值与 ``core/admin/router.
   _SELF_TARGET_FORBIDDEN_CODE`` 相同字符串，两处不互相 import，各自独立定义
   ——与全仓库既有的"结构相同、不共享导入"的 Protocol/常量惯例一致）。
-- ``confirm()``：EXECUTE 分支解析 ``payload`` 取出 override_id，调用
-  :func:`~lingxi.adapters.postgres_local_permission._revoke_locked`（条件
-  ``UPDATE ... WHERE entry_status = 'active'``）。与 grant/suppress 的 INSERT
-  撞唯一索引不同，这里没有异常可捕获——``_revoke_locked`` 用返回的布尔值
-  （``rowcount == 1``）直接说明这一行在 prepare 到这一刻之间是否仍然是
-  ``active``：如果不是（已经被另一条路径抢先收回），同样降级为既有
-  ``ConfirmResultKind.TARGET_DRIFTED``/``FAILED``/``reason="target_drifted"``，
-  不新增错误码——与 grant/suppress 那条 SAVEPOINT 降级路径同一姿态，只是这里的
-  冲突信号是条件更新的影响行数，不是唯一索引异常。
+- ``confirm()``：EXECUTE 分支解析 ``payload``。组 ID 调用
+  :func:`~lingxi.adapters.postgres_local_permission._revoke_group_locked`，在目标用户
+  锁下锁定当前组并核对冻结的完整 ID 集合，再事务性翻转全部行；历史行调用
+  :func:`~lingxi.adapters.postgres_local_permission._revoke_locked`。两者都用返回的
+  布尔值（``rowcount``/完整集合匹配）判断 prepare 到这一刻之间是否仍满足条件，
+  不满足就降级为既有 ``TARGET_DRIFTED``/``FAILED``/``reason="target_drifted"``，
+  不新增错误码，也不部分撤销。
 """
 
 from __future__ import annotations
@@ -117,6 +113,7 @@ from lingxi.adapters.postgres_conversation import _Transaction
 from lingxi.adapters.postgres_local_permission import (
     DuplicateActiveOverride,
     _insert_locked,
+    _revoke_group_locked,
     _revoke_locked,
 )
 from lingxi.core.admin.pending_action import (
@@ -137,6 +134,7 @@ from lingxi.core.admin.pending_action import (
 )
 from lingxi.core.ids import new_id
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.position_override import expand_position_scope
 
 #: ``prepare()`` 撞上同目标在途唯一索引时对外的错误码（外部审查交叉裁定，
 #: codex P1-5）——与 ``core/admin/pending_action.ERROR_CODE``/``CANCEL_ERROR_CODE``
@@ -209,7 +207,7 @@ class CancelOutcome:
 _SELECT_COLUMNS = (
     "id, action_type, target_open_id, target_state_snapshot, initiated_by_open_id,"
     " status, card_delivered, card_id, reason, created_at, confirm_deadline_at,"
-    " decided_at, decided_by_open_id, card_sequence, payload"
+    " decided_at, decided_by_open_id, card_sequence, payload, origin_card_message_id"
 )
 
 
@@ -230,6 +228,7 @@ def _row_to_pending_action(row: tuple) -> PendingAction:
         decided_by_open_id,
         card_sequence,
         payload,
+        origin_card_message_id,
     ) = row
     return PendingAction(
         id=id_,
@@ -247,6 +246,7 @@ def _row_to_pending_action(row: tuple) -> PendingAction:
         decided_by_open_id=decided_by_open_id,
         card_sequence=card_sequence,
         payload=payload,
+        origin_card_message_id=origin_card_message_id,
     )
 
 
@@ -290,6 +290,9 @@ class PostgresPendingActionStore:
         reason: str | None = None,
         now: datetime | None = None,
         trace_id: str | None = None,
+        position_name: str | None = None,
+        company_scope: str | None = None,
+        origin_card_message_id: str | None = None,
     ) -> PrepareOutcome:
         """读目标当前状态、判定是否可以发起，通过则插入一行 ``pending`` 记录
         （``card_delivered=FALSE``，调用方随后发卡片，成功再调用
@@ -331,9 +334,57 @@ class PostgresPendingActionStore:
         pending_id = new_id("pac")
         is_local_permission_action = action_type in _DIRECTION_BY_ACTION_TYPE
         is_revoke_action = action_type is PendingActionType.LOCAL_PERMISSION_REVOKE
+        # 0081 基线曾把职位展开授权的 permission_group_id 写成 pending_action
+        # 的 pac_ id。新授权使用专用 lpg_ 前缀，但存量不迁移，所以旧组卡仍须按组
+        # 撤销，而不能被误当成历史 NULL 组的单行撤销。
+        is_group_revoke_action = is_revoke_action and target_open_id.startswith(
+            ("lpg_", "pac_")
+        )
+        position_expansion = None
+        if position_name is not None or company_scope is not None:
+            if action_type is not PendingActionType.LOCAL_PERMISSION_GRANT:
+                return PrepareOutcome(
+                    decision=PrepareDecision(
+                        ok=False,
+                        code="position_grant_only",
+                        message="职位+公司范围只支持补充授权。",
+                    )
+                )
+            try:
+                from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
+                from lingxi.adapters.role_function_map_file import load_role_function_map
+
+                company_map = load_company_function_metric_map()
+                position_expansion = expand_position_scope(
+                    position_name=position_name or "",
+                    company_scope=company_scope or "",
+                    role_function_map=load_role_function_map(),
+                    company_function_metric_map=company_map,
+                    available_companies=tuple(key for key in company_map if key != "*"),
+                )
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                return PrepareOutcome(
+                    decision=PrepareDecision(
+                        ok=False,
+                        code="position_mapping_unavailable",
+                        message="职位或公司范围当前不可用，请重新查询后再试。",
+                    )
+                )
         payload = (
             json.dumps(
-                {"company_id": company_id, "metric_name": metric_name, "reason": reason},
+                (
+                    {
+                        "position_name": position_expansion.position_name,
+                        "function": position_expansion.function,
+                        "company_scope": position_expansion.company_scope,
+                        "companies": position_expansion.companies,
+                        "pairs": position_expansion.pairs,
+                        "reason": reason,
+                        "permission_group_id": new_id("lpg"),
+                    }
+                    if position_expansion is not None
+                    else {"company_id": company_id, "metric_name": metric_name, "reason": reason}
+                ),
                 ensure_ascii=False,
             )
             if is_local_permission_action
@@ -348,50 +399,105 @@ class PostgresPendingActionStore:
             with connection.transaction():
                 with connection.cursor() as cursor:
                     if is_revoke_action:
-                        override_id = target_open_id
-                        cursor.execute(
-                            "SELECT lpo.entry_status, lpo.direction, lpo.company_id,"
-                            "       lpo.metric_name, au.feishu_open_id"
-                            "  FROM local_permission_override lpo"
-                            "  JOIN app_user au ON au.id = lpo.user_id"
-                            " WHERE lpo.id = %s",
-                            (override_id,),
-                        )
-                        revoke_row = cursor.fetchone()
-                        if revoke_row is None:
-                            current_state = None
-                        else:
-                            (
-                                entry_status,
-                                direction_value,
-                                found_company_id,
-                                found_metric_name,
-                                owner_open_id,
-                            ) = revoke_row
-                            if owner_open_id == initiated_by_open_id:
-                                # 自我目标防呆（模块文档「本地权限收回如何复用同一
-                                # 套机制」）：查到属主之后立刻核对，相等则直接拒绝，
-                                # 不再往下调用 decide_prepare、不产生任何
-                                # pending_action 行。
-                                return PrepareOutcome(
-                                    decision=PrepareDecision(
-                                        ok=False,
-                                        code=_REVOKE_SELF_TARGET_FORBIDDEN_CODE,
-                                        message=_REVOKE_SELF_TARGET_FORBIDDEN_MESSAGE,
-                                    )
-                                )
-                            current_state = entry_status
-                            resolved_target_open_id = owner_open_id
-                            payload = json.dumps(
-                                {
-                                    "override_id": override_id,
-                                    "direction": direction_value,
-                                    "company_id": found_company_id,
-                                    "metric_name": found_metric_name,
-                                    "reason": reason,
-                                },
-                                ensure_ascii=False,
+                        if is_group_revoke_action:
+                            # 新职位+范围授权在管理卡上是一个职位+公司范围项；一次
+                            # 收回必须覆盖该组全部展开行。confirm() 会在同一目标
+                            # 用户锁下再次核对这组行，避免部分撤销或误伤并发新授权。
+                            cursor.execute(
+                                "SELECT lpo.id, lpo.entry_status, lpo.direction,"
+                                "       lpo.company_id, lpo.metric_name, lpo.position_name,"
+                                "       lpo.company_scope, lpo.reason, lpo.created_at,"
+                                "       au.feishu_open_id"
+                                "  FROM local_permission_override lpo"
+                                "  JOIN app_user au ON au.id = lpo.user_id"
+                                " WHERE lpo.permission_group_id = %s"
+                                " ORDER BY lpo.id",
+                                (target_open_id,),
                             )
+                            group_rows = cursor.fetchall()
+                            if not group_rows:
+                                current_state = None
+                            else:
+                                owner_ids = {row[9] for row in group_rows}
+                                statuses = {row[1] for row in group_rows}
+                                directions = {row[2] for row in group_rows}
+                                if len(owner_ids) != 1 or len(directions) != 1:
+                                    current_state = "mixed"
+                                elif statuses == {"active"}:
+                                    owner_open_id = next(iter(owner_ids))
+                                    if owner_open_id == initiated_by_open_id:
+                                        return PrepareOutcome(
+                                            decision=PrepareDecision(
+                                                ok=False,
+                                                code=_REVOKE_SELF_TARGET_FORBIDDEN_CODE,
+                                                message=_REVOKE_SELF_TARGET_FORBIDDEN_MESSAGE,
+                                            )
+                                        )
+                                    resolved_target_open_id = owner_open_id
+                                    current_state = "active"
+                                    first = group_rows[0]
+                                    payload = json.dumps(
+                                        {
+                                            "permission_group_id": target_open_id,
+                                            "override_ids": [row[0] for row in group_rows],
+                                            "direction": first[2],
+                                            "position_name": first[5],
+                                            "company_scope": first[6],
+                                            "companies": list(dict.fromkeys(row[3] for row in group_rows)),
+                                            "pairs": [[row[3], row[4]] for row in group_rows],
+                                            "reason": reason,
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                else:
+                                    # partial/revoked groups are deliberately not
+                                    # reconstructed as a new operation.
+                                    current_state = "mixed"
+                        else:
+                            override_id = target_open_id
+                            cursor.execute(
+                                "SELECT lpo.entry_status, lpo.direction, lpo.company_id,"
+                                "       lpo.metric_name, au.feishu_open_id"
+                                "  FROM local_permission_override lpo"
+                                "  JOIN app_user au ON au.id = lpo.user_id"
+                                " WHERE lpo.id = %s",
+                                (override_id,),
+                            )
+                            revoke_row = cursor.fetchone()
+                            if revoke_row is None:
+                                current_state = None
+                            else:
+                                (
+                                    entry_status,
+                                    direction_value,
+                                    found_company_id,
+                                    found_metric_name,
+                                    owner_open_id,
+                                ) = revoke_row
+                                if owner_open_id == initiated_by_open_id:
+                                    # 自我目标防呆（模块文档「本地权限收回如何复用同一
+                                    # 套机制」）：查到属主之后立刻核对，相等则直接拒绝，
+                                    # 不再往下调用 decide_prepare、不产生任何
+                                    # pending_action 行。
+                                    return PrepareOutcome(
+                                        decision=PrepareDecision(
+                                            ok=False,
+                                            code=_REVOKE_SELF_TARGET_FORBIDDEN_CODE,
+                                            message=_REVOKE_SELF_TARGET_FORBIDDEN_MESSAGE,
+                                        )
+                                    )
+                                current_state = entry_status
+                                resolved_target_open_id = owner_open_id
+                                payload = json.dumps(
+                                    {
+                                        "override_id": override_id,
+                                        "direction": direction_value,
+                                        "company_id": found_company_id,
+                                        "metric_name": found_metric_name,
+                                        "reason": reason,
+                                    },
+                                    ensure_ascii=False,
+                                )
                     elif is_local_permission_action:
                         cursor.execute(
                             "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
@@ -404,13 +510,22 @@ class PostgresPendingActionStore:
                             current_state = None
                         else:
                             direction = _DIRECTION_BY_ACTION_TYPE[action_type]
-                            cursor.execute(
-                                "SELECT 1 FROM local_permission_override"
-                                " WHERE user_id = %s AND direction = %s AND company_id = %s"
-                                "   AND metric_name = %s AND entry_status = 'active'",
-                                (user_id, direction.value, company_id, metric_name),
+                            pairs = (
+                                position_expansion.pairs
+                                if position_expansion is not None
+                                else ((company_id, metric_name),)
                             )
-                            current_state = "present" if cursor.fetchone() is not None else "absent"
+                            current_state = "absent"
+                            for pair_company_id, pair_metric_name in pairs:
+                                cursor.execute(
+                                    "SELECT 1 FROM local_permission_override"
+                                    " WHERE user_id = %s AND direction = %s AND company_id = %s"
+                                    "   AND metric_name = %s AND entry_status = 'active'",
+                                    (user_id, direction.value, pair_company_id, pair_metric_name),
+                                )
+                                if cursor.fetchone() is not None:
+                                    current_state = "present"
+                                    break
                     else:
                         cursor.execute(
                             "SELECT id, account_state FROM app_user WHERE feishu_open_id = %s",
@@ -489,9 +604,9 @@ class PostgresPendingActionStore:
                                 """
                                 INSERT INTO pending_action
                                     (id, action_type, target_open_id, target_state_snapshot,
-                                     initiated_by_open_id, status, card_delivered, created_at,
-                                     confirm_deadline_at, payload)
-                                VALUES (%s, %s, %s, %s, %s, 'pending', FALSE, %s, %s, %s)
+                                    initiated_by_open_id, status, card_delivered, created_at,
+                                     confirm_deadline_at, payload, origin_card_message_id)
+                                VALUES (%s, %s, %s, %s, %s, 'pending', FALSE, %s, %s, %s, %s)
                                 """,
                                 (
                                     pending_id,
@@ -502,6 +617,7 @@ class PostgresPendingActionStore:
                                     moment,
                                     confirm_deadline_at,
                                     payload,
+                                    origin_card_message_id,
                                 ),
                             )
                     except UniqueViolation:
@@ -824,17 +940,6 @@ class PostgresPendingActionStore:
                                 assert target_user_id is not None
                                 assert pending.payload is not None
                                 payload_data = json.loads(pending.payload)
-                                entry = LocalPermissionOverrideEntry(
-                                    user_id=target_user_id,
-                                    direction=_DIRECTION_BY_ACTION_TYPE[pending.action_type],
-                                    company_id=payload_data["company_id"],
-                                    metric_name=payload_data["metric_name"],
-                                    reason=payload_data["reason"],
-                                    initiated_by_open_id=pending.initiated_by_open_id,
-                                    pending_action_id=pending.id,
-                                    created_at=moment,
-                                )
-                                override_id = new_id("lpo")
                                 try:
                                     # 嵌套事务块 = psycopg 的 SAVEPOINT，与 prepare()
                                     # 对 pending_action_single_pending_target_idx 的
@@ -845,7 +950,24 @@ class PostgresPendingActionStore:
                                     # 抢先落地——降级为既有 TARGET_DRIFTED/FAILED，
                                     # 不新增错误码（模块文档）。
                                     with connection.transaction():
-                                        _insert_locked(cursor, override_id=override_id, entry=entry)
+                                        pairs = payload_data.get("pairs")
+                                        if not pairs:
+                                            pairs = ((payload_data["company_id"], payload_data["metric_name"]),)
+                                        for pair_company_id, pair_metric_name in pairs:
+                                            entry = LocalPermissionOverrideEntry(
+                                                user_id=target_user_id,
+                                                direction=_DIRECTION_BY_ACTION_TYPE[pending.action_type],
+                                                company_id=pair_company_id,
+                                                metric_name=pair_metric_name,
+                                                reason=payload_data["reason"],
+                                                initiated_by_open_id=pending.initiated_by_open_id,
+                                                pending_action_id=pending.id,
+                                                created_at=moment,
+                                                position_name=payload_data.get("position_name"),
+                                                company_scope=payload_data.get("company_scope"),
+                                                permission_group_id=payload_data.get("permission_group_id"),
+                                            )
+                                            _insert_locked(cursor, override_id=new_id("lpo"), entry=entry)
                                 except DuplicateActiveOverride:
                                     decision = ConfirmDecision(
                                         kind=ConfirmResultKind.TARGET_DRIFTED,
@@ -862,12 +984,21 @@ class PostgresPendingActionStore:
                                 # core/admin/notification.py 渲染）。
                                 assert pending.payload is not None
                                 payload_data = json.loads(pending.payload)
-                                revoked = _revoke_locked(
-                                    cursor,
-                                    override_id=payload_data["override_id"],
-                                    revoked_pending_action_id=pending.id,
-                                    moment=moment,
-                                )
+                                if payload_data.get("permission_group_id"):
+                                    revoked = _revoke_group_locked(
+                                        cursor,
+                                        permission_group_id=payload_data["permission_group_id"],
+                                        revoked_pending_action_id=pending.id,
+                                        moment=moment,
+                                        expected_override_ids=tuple(payload_data.get("override_ids", ())),
+                                    )
+                                else:
+                                    revoked = _revoke_locked(
+                                        cursor,
+                                        override_id=payload_data["override_id"],
+                                        revoked_pending_action_id=pending.id,
+                                        moment=moment,
+                                    )
                                 if not revoked:
                                     # 与 grant/suppress 的 DuplicateActiveOverride
                                     # 降级同一姿态，只是这里的冲突信号是条件更新的

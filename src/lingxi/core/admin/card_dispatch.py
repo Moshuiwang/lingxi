@@ -30,8 +30,13 @@ AuditSink``/``core/admin/card_callback.AuditSink`` 结构相同的独立 ``Audit
 from __future__ import annotations
 
 import time
+import hashlib
+import json
+import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 
 from lingxi.core.admin.display_names import AdminDisplayNames
@@ -48,6 +53,91 @@ from lingxi.core.admin.notification import (
 )
 from lingxi.core.admin.pending_action import PendingAction
 from lingxi.core.admin.views import AdminUserStatusView
+
+
+# 管理卡上下文只允许在这段时间内接受旧卡回调。它是一个内部保护窗口，不是
+# 待确认操作或本地授权的有效期；但无论调用方如何配置，都不能超过 24 小时。
+# 这两个常量放在 core 的唯一纯逻辑入口，内存兼容实现与 PostgreSQL 适配器共用同一
+# 组边界，避免一边允许更长窗口而另一边已经拒绝的语义分叉。
+MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS = 40.0 * 60.0
+MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS = 24.0 * 60.0 * 60.0
+
+
+def bounded_management_card_ttl_seconds(value: float) -> float:
+    """把管理卡上下文 TTL 收窄到 ``(0, 24h]``。
+
+    ``ttl_seconds`` 是部署/测试配置入口，不能成为绕过 24 小时硬上限的后门。非有限
+    或非正数配置直接失败关闭；超过上限的合法数值收窄到上限。调用方若需要构造一条
+    已经过期的历史上下文，应传一个显式的过去 ``context_deadline_at``，而不是配置
+    一个非法 TTL。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("管理卡上下文 TTL 必须是有限正数")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError("管理卡上下文 TTL 必须是有限正数")
+    return min(number, MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS)
+
+
+def bounded_management_card_deadline(
+    *, now: datetime, requested: datetime | None, ttl_seconds: float
+) -> datetime:
+    """返回不晚于 ``now + 24h`` 的管理卡上下文截止时间。"""
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    elif now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if requested is None:
+        deadline = now + timedelta(seconds=bounded_management_card_ttl_seconds(ttl_seconds))
+    else:
+        deadline = requested
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+    hard_deadline = now + timedelta(seconds=MANAGEMENT_CARD_CONTEXT_MAX_TTL_SECONDS)
+    return min(deadline, hard_deadline)
+
+
+def management_card_fingerprint(status: AdminUserStatusView) -> str:
+    """返回管理卡所依据状态的稳定指纹。
+
+    指纹只包含权限状态、银河摘要和当前本地覆盖内容，不包含卡片/消息 ID 或操作者
+    身份。回调在执行写操作前重新取当前状态并比较它，防止旧卡在数据已经变化后继续
+    写入；排序只用于稳定序列化，不改变权限语义。
+    """
+
+    payload = {
+        "identifier": status.identifier,
+        "provisioning_state": status.provisioning_state,
+        "account_state": status.account_state,
+        "updated_at": status.updated_at,
+        "local_overrides": [
+            {
+                "override_id": item.override_id,
+                "direction": item.direction,
+                "company_id": item.company_id,
+                "metric_name": item.metric_name,
+                "reason": item.reason,
+                "created_at": item.created_at,
+                "position_name": item.position_name,
+                "company_scope": item.company_scope,
+                "group_id": item.group_id,
+            }
+            for item in status.local_overrides
+        ],
+        "galaxy_source": None
+        if status.galaxy_source is None
+        else {
+            "granted": status.galaxy_source.granted,
+            "reason": status.galaxy_source.reason,
+            "companies": sorted(status.galaxy_source.companies),
+            "functions": sorted(status.galaxy_source.functions),
+            "all_companies": status.galaxy_source.all_companies,
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class PendingActionDeliveryTracker(Protocol):
@@ -162,9 +252,49 @@ class ManagementCardDispatchResult:
     delivered: bool
 
 
+@dataclass(frozen=True)
+class ManagementCardContext:
+    """一张管理卡的可恢复上下文。
+
+    ``context_deadline_at`` 只用于回调时的懒检查；后台恢复 scanner 只处理已落库但尚未
+    成功回写的视觉水位，不主动清扫到期上下文，也不改变已经确认生效的本地授权有效期。
+    ``card_sequence`` 是整卡更新序号，必须由持久层原子递增。
+    """
+
+    message_id: str
+    card_id: str
+    identifier: str
+    chat_id: str
+    initiated_by_open_id: str
+    card_sequence: int
+    snapshot_fingerprint: str
+    context_deadline_at: datetime
+    state: str = "ready"
+    dispatch_status: str = "idle"
+    last_trace_id: str | None = None
+    # 仅用于每日批补齐汇总的幂等水位；只有持久层确认 daily refresh/batch 已经补齐
+    # 一条此前即时失败的操作时才置上，普通即时成功不会获得这项资格。
+    daily_correction_reported_at: datetime | None = None
+    # 只有真实 daily refresh/batch 发布补齐过一条此前即时失败的操作时才为真；迟到
+    # 的 instant outbox 成功会清掉它，不能触发“每日纠偏补齐”群摘要。
+    daily_correction_pending: bool = False
+    # ``needs_refresh`` 是持久的视觉回写水位：数据库状态已经改变但 CardKit 尚未
+    # 成功接受最新卡片时为真。``visual_sequence`` 只在 CardKit 成功后推进，不能在
+    # 取号或网络调用失败时提前推进。
+    needs_refresh: bool = False
+    visual_sequence: int = 2
+    # 业务状态代数与 CardKit 的外部 sequence 分开记账。scanner 只能用它读到的
+    # 代数回写；状态在渲染期间改变时，CAS 会拒绝旧视觉。card_sequence 仍是
+    # CardKit 的整卡序号，不能拿它单独充当状态版本。
+    state_version: int = 1
+
+
 class ManagementCardContextStore:
-    """管理卡发送侧登记的 ``message_id -> identifier`` 内存 TTL 映射（Trace #469
-    修复包 B，B-1）。
+    """兼容旧调用方/测试的 ``message_id -> identifier`` 内存 TTL 映射。
+
+    生产 gateway 使用 ``adapters.postgres_management_card_context`` 的持久实现；
+    本类保留为纯逻辑适配器，便于旧调用方和无数据库单测验证同一套回调语义。
+    （Trace #469 修复包 B，B-1。）
 
     ## 要解决的问题
 
@@ -184,15 +314,13 @@ class ManagementCardContextStore:
     这条消息正是管理卡自己。因此发送成功那一刻就能确定性地知道"这条 message_id
     对应哪一次 ``/admin user`` 查询、查的是谁"，不需要在回调时反查任何外部状态。
 
-    ## 为什么是内存 TTL 映射，不落库
+    ## 内存实现的边界
 
-    单实例部署（D11 前提，见仓库既有决策）下，进程内存足以覆盖"管理员发起查询
-    到点击表单提交"这几分钟内的窗口；重启丢失可接受——查不到时退回既有的
-    「请重新查询 /admin user」拒绝路径，此时这句指引恰好是准确操作，不是误导。
-    落库需要迁移、需要处理跨实例一致性，为一个"重启即可自愈"的缓存引入这些
-    成本不划算。
+    本实现仅用于兼容旧调用方和不接数据库的单测；生产实现把完整上下文（含
+    ``card_id``、发起人、快照指纹和 sequence）落在 PostgreSQL，以支持重启恢复。
+    因此这里的 TTL/容量仅是测试适配器的内部默认值，不构成产品承诺。
 
-    TTL 默认 30 分钟（管理卡查询后不太可能拖到半小时之后才提交表单，超时后
+    TTL 默认 40 分钟（管理卡查询后不太可能拖到四十分钟之后才提交表单，超时后
     退回既有拒绝路径不算体验回退）；条目数上限默认 512，超过时逐出**最早写入**
     的一条（``OrderedDict`` + ``move_to_end`` 的最简单可行策略，不需要按最近
     访问时间重新排序——本映射只在"写入"与"回调时读一次"两个时机被触碰，读取
@@ -204,16 +332,35 @@ class ManagementCardContextStore:
     def __init__(
         self,
         *,
-        ttl_seconds: float = 1800.0,
+        ttl_seconds: float = MANAGEMENT_CARD_CONTEXT_DEFAULT_TTL_SECONDS,
         max_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._ttl_seconds = ttl_seconds
+        self._ttl_seconds = bounded_management_card_ttl_seconds(ttl_seconds)
         self._max_entries = max_entries
         self._clock = clock
-        self._entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._entries: OrderedDict[str, tuple[ManagementCardContext, float]] = OrderedDict()
+        # The production adapter gets atomic increments from PostgreSQL.  This
+        # compatibility implementation is also used by gateway-style tests and
+        # must not hand out the same sequence twice when two callbacks race.
+        self._lock = threading.RLock()
 
-    def remember(self, *, message_id: str, identifier: str) -> None:
+    def remember(
+        self,
+        *,
+        message_id: str,
+        identifier: str,
+        card_id: str = "",
+        chat_id: str = "",
+        initiated_by_open_id: str = "",
+        snapshot_fingerprint: str = "",
+        card_sequence: int = 2,
+        state_version: int = 1,
+        context_deadline_at: datetime | None = None,
+        state: str = "ready",
+        dispatch_status: str = "idle",
+        last_trace_id: str | None = None,
+    ) -> None:
         """管理卡发送成功后登记一条映射。``message_id``/``identifier`` 任一为空
         都不登记——空 ``message_id`` 无法在回调时被查到，空 ``identifier``
         登记了也没有意义（回调侧本来就是靠它非空才判定"命中"，见调用方
@@ -222,13 +369,47 @@ class ManagementCardContextStore:
         if not message_id or not identifier:
             return
         expires_at = self._clock() + self._ttl_seconds
-        # 先删后插：同一个 message_id 重复登记（理论上不会发生——每次
-        # `/admin user` 都会建一张新卡、拿到新的 message_id）时把它移到队尾，
-        # 保持"最早写入的排最前面、最先被逐出"这条不变量。
-        self._entries.pop(message_id, None)
-        self._entries[message_id] = (identifier, expires_at)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        deadline = bounded_management_card_deadline(
+            now=datetime.now(timezone.utc),
+            requested=context_deadline_at,
+            ttl_seconds=self._ttl_seconds,
+        )
+        context = ManagementCardContext(
+            message_id=message_id,
+            card_id=card_id,
+            identifier=identifier,
+            chat_id=chat_id,
+            initiated_by_open_id=initiated_by_open_id,
+            card_sequence=max(1, int(card_sequence)),
+            snapshot_fingerprint=snapshot_fingerprint,
+            context_deadline_at=deadline,
+            state=state,
+            dispatch_status=dispatch_status,
+            last_trace_id=last_trace_id,
+            needs_refresh=False,
+            visual_sequence=max(1, int(card_sequence)),
+            state_version=max(1, int(state_version)),
+        )
+        # 同一个 message_id 重复登记（理论上不会发生——每次 `/admin user`
+        # 都会建一张新卡、拿到新的 message_id）只允许抬高 sequence 并延续
+        # 已有状态；不能让一次重放把已关闭/已提交的卡重新变成 ready。
+        with self._lock:
+            existing = self._entries.get(message_id)
+            if existing is not None:
+                previous, _previous_expires_at = existing
+                if context.card_sequence > previous.card_sequence:
+                    previous = ManagementCardContext(
+                        **{**previous.__dict__, "card_sequence": context.card_sequence}
+                    )
+                if context.state_version > previous.state_version:
+                    previous = ManagementCardContext(
+                        **{**previous.__dict__, "state_version": context.state_version}
+                    )
+                self._entries[message_id] = (previous, _previous_expires_at)
+            else:
+                self._entries[message_id] = (context, expires_at)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
 
     def lookup(self, *, message_id: str) -> str | None:
         """回调侧按 ``message_id`` 查回 ``identifier``；未登记、已过期都返回
@@ -236,14 +417,206 @@ class ManagementCardContextStore:
 
         if not message_id:
             return None
-        entry = self._entries.get(message_id)
-        if entry is None:
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, expires_at = entry
+            if self._clock() >= expires_at:
+                return None
+            return context.identifier
+
+    def lookup_context(self, *, message_id: str) -> ManagementCardContext | None:
+        """按消息 ID 找回完整上下文。
+
+        这里保留已过内部缓存窗口的上下文，供回调层做一次惰性关闭/刷新；严格的
+        ``lookup()`` 仍会把过期项视为未命中。容量上限负责避免这类保留无限增长。
+        """
+
+        if not message_id:
             return None
-        identifier, expires_at = entry
-        if self._clock() >= expires_at:
-            del self._entries[message_id]
-            return None
-        return identifier
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, _expires_at = entry
+            return context
+
+    def next_card_sequence(
+        self,
+        *,
+        message_id: str,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> int | None:
+        """在进程内原子递增 sequence，并可按 scanner 快照做 CAS。
+
+        旧调用方不传期望值时保留 ``KeyError``/整数返回的兼容姿态。恢复路径必须
+        同时带上它读到的状态代数与 CardKit 序号；任一在渲染期间改变就返回
+        ``None``，调用方不得把旧卡片发给 CardKit。
+        """
+
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
+
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                if expected_state_version is not None or expected_card_sequence is not None:
+                    return None
+                raise KeyError(message_id)
+            context, expires_at = entry
+            if (
+                expected_state_version is not None
+                and context.state_version != expected_state_version
+            ) or (
+                expected_card_sequence is not None
+                and context.card_sequence != expected_card_sequence
+            ):
+                return None
+            next_value = context.card_sequence + 1
+            self._entries[message_id] = (
+                ManagementCardContext(**{**context.__dict__, "card_sequence": next_value}),
+                expires_at,
+            )
+            return next_value
+
+    def update_state(
+        self,
+        *,
+        message_id: str,
+        state: str | None = None,
+        dispatch_status: str | None = None,
+        snapshot_fingerprint: str | None = None,
+        last_trace_id: str | None = None,
+    ) -> ManagementCardContext | None:
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return None
+            context, expires_at = entry
+            changed = any(
+                value is not None
+                for value in (state, dispatch_status, snapshot_fingerprint, last_trace_id)
+            )
+            updated = ManagementCardContext(
+                message_id=context.message_id,
+                card_id=context.card_id,
+                identifier=context.identifier,
+                chat_id=context.chat_id,
+                initiated_by_open_id=context.initiated_by_open_id,
+                # 每次持久状态改变都占用一个新的整卡版本。除了让 CardKit 的更新
+                # 顺序严格单调，这还使旧 scanner 在新状态写入后不能误把 needs_refresh
+                # 清掉；state_version 与 mark_visual_refreshed() 共同判定是否仍有
+                # 新状态。
+                card_sequence=context.card_sequence + (1 if changed else 0),
+                state_version=context.state_version + (1 if changed else 0),
+                snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
+                context_deadline_at=context.context_deadline_at,
+                state=state if state is not None else context.state,
+                dispatch_status=dispatch_status if dispatch_status is not None else context.dispatch_status,
+                last_trace_id=last_trace_id if last_trace_id is not None else context.last_trace_id,
+                daily_correction_reported_at=(
+                    context.daily_correction_reported_at
+                    if state != "effective" or context.daily_correction_pending
+                    else context.daily_correction_reported_at or datetime.now(timezone.utc)
+                ),
+                # ``incomplete`` 只是失败状态，不足以证明每日批已补齐；保留既有
+                # qualification，只有 settle_published_contexts 才能置位它。
+                daily_correction_pending=context.daily_correction_pending,
+                needs_refresh=context.needs_refresh or changed,
+                visual_sequence=context.visual_sequence,
+            )
+            self._entries[message_id] = (updated, expires_at)
+            return updated
+
+    def list_needing_refresh(self, *, limit: int = 20) -> tuple[ManagementCardContext, ...]:
+        """返回尚未被 CardKit 成功回写的上下文。"""
+
+        if limit < 1:
+            return ()
+        with self._lock:
+            return tuple(
+                context
+                for context, _expires_at in self._entries.values()
+                if context.needs_refresh
+            )[:limit]
+
+    def mark_visual_refreshed(
+        self,
+        *,
+        message_id: str,
+        sequence: int,
+        expected_state_version: int | None = None,
+        expected_card_sequence: int | None = None,
+    ) -> bool:
+        """仅在外部 CardKit update 成功后清除视觉回写水位。
+
+        恢复路径传入渲染快照的状态代数和本次实际领到的 CardKit 序号。状态或
+        序号再被别的写入方推进时，CAS 失败并保留 ``needs_refresh``，让下一轮从
+        当前行重新渲染。
+        """
+
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("sequence 必须是正整数")
+        for name, value in (
+            ("expected_state_version", expected_state_version),
+            ("expected_card_sequence", expected_card_sequence),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} 必须是正整数")
+
+        with self._lock:
+            entry = self._entries.get(message_id)
+            if entry is None:
+                return False
+            context, expires_at = entry
+            if (
+                expected_state_version is not None
+                and context.state_version != expected_state_version
+            ) or (
+                expected_card_sequence is not None
+                and context.card_sequence != expected_card_sequence
+            ):
+                return False
+            if sequence < context.visual_sequence:
+                return False
+            updated = ManagementCardContext(
+                **{
+                    **context.__dict__,
+                    # 与 PostgreSQL ``CASE WHEN card_sequence <= sequence`` 同一
+                    # 语义：若另一个回调已经拿到更高的序号，较早那次成功回写不能
+                    # 清掉较新的待刷新水位。
+                    "needs_refresh": context.card_sequence > sequence,
+                    "visual_sequence": max(context.visual_sequence, sequence),
+                }
+            )
+            self._entries[message_id] = (updated, expires_at)
+            return True
+
+    # The in-memory compatibility store has no publish outbox to observe.  Keep the
+    # production adapter's optional observation surface available so gateway tests and
+    # old callers can inject this store without a special branch.
+    def latest_publish_state_for_message(self, *, message_id: str) -> str | None:
+        del message_id
+        return None
+
+    def settle_published_contexts(self) -> tuple[str, ...]:
+        return ()
+
+    def unreported_daily_correction_ids(self) -> tuple[str, ...]:
+        return ()
+
+    def mark_daily_corrections_reported(self, *, message_ids: tuple[str, ...]) -> None:
+        del message_ids
 
 
 class ManagementCardDispatcher:
@@ -285,6 +658,7 @@ class ManagementCardDispatcher:
         chat_id: str,
         thread_id: str | None,
         reply_to_message_id: str,
+        initiated_by_open_id: str = "",
     ) -> ManagementCardDispatchResult:
         card = render_management_card(
             status,
@@ -323,6 +697,15 @@ class ManagementCardDispatcher:
             # 分支已经在上面 return，不会走到这里——没有实际送达的卡片就没有
             # "这条 message_id 对应哪次查询"这件事可以登记。
             self._context_store.remember(
-                message_id=created.message_id, identifier=display_identifier
+                message_id=created.message_id,
+                identifier=display_identifier,
+                card_id=created.card_id,
+                chat_id=chat_id,
+                initiated_by_open_id=initiated_by_open_id,
+                snapshot_fingerprint=management_card_fingerprint(status),
+                # CardKit's create + reply consume the first two entities in the
+                # card's sequence stream; the first in-place management update
+                # must therefore start at 3.
+                card_sequence=2,
             )
         return ManagementCardDispatchResult(delivered=True)

@@ -33,9 +33,50 @@ scripts/ops/sync_db_env_from_credentials.sh \
 
 机制详见 [`deploy/README.md`「数据库凭据源」](README.md#数据库凭据源supabase-私有凭据文件issue-411)（含 session 模式连接约束）。**截至 2026-08-29 生产尚未切换/部署**：本节只登记同构加载方式，实际执行在生产发布的独立 ops 卡内。
 
+**worker-queue 并发与资源合同（Issue #494/#496/#502）**：生产机器型号与 stage
+一致，执行并发固定为 `4`，资源固定为 CPU `1.5`、memory `2G`、pids `512`、
+`tmpfs 256m`。在目标机外部根 `deploy/.env.prod`（不入库、不写入本仓库）核对并
+写入以下五行：
+
+```dotenv
+LINGXI_WORKER_MAX_CONCURRENCY=4
+LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
+LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
+LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
+LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
+```
+
+`deploy/compose.prod.yaml` 对这五项使用 `${VAR:?}` 无默认值；缺任何一项时，
+`docker compose config` 直接失败，不能带着未核对的默认值启动。部署前用以下命令
+确认渲染后的 worker-queue 环境和资源值与合同一致（命令只读，不创建或修改真实
+生产文件）：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  config worker-queue
+```
+
 ### 2.2 部署前置检查（preflight）
 
 逐条通过 [`deploy/README.md`「部署前置检查」](README.md)的两项：七个文件均 `0600` 且属主为部署用户；部署机已用只读拉取身份登录 GHCR。任一项不符不得执行下一步。
+
+**外加一项就绪检查（[Issue #499](https://github.com/Moshuiwang/lingxi/issues/499)，rc23）**：确认 `.env.prod.gateway` 里 `LINGXI_DOCX_MARKDOWN_CONVERT` 的**实际取值**与本仓库当前结论一致——
+
+```bash
+# 只列这一行配置本身，不打印文件其余内容；该变量不是凭据
+grep -n '^LINGXI_DOCX_MARKDOWN_CONVERT' deploy/.env.prod.gateway || echo '未设置（= 开启，代码默认值）'
+```
+
+判据（三选一，都是合法结论，但必须**是有意选的**，不是漏配的结果）：
+
+| 实际取值 | 生效状态 | 用户可见后果 |
+|---|---|---|
+| 未设置 或 `1` | 官方 markdown→blocks 转换**开启**（[#467](https://github.com/Moshuiwang/lingxi/issues/467) 起的代码默认值） | 正文带官方排版；回答里含表格等不支持的嵌套结构时**降级交付纯文本段落并如实告知格式已简化**（[#499](https://github.com/Moshuiwang/lingxi/issues/499)），不再整次失败 |
+| `0` | 转换**关闭** | 正文一律走纯文本段落路径，没有官方排版，也不会出现降级提示 |
+| 其余任何非空值 | **启动即失败** | gateway 起不来——错配不是未配 |
+
+不符合上表任一行，或取值与本次发布意图不一致时，先改配置再继续，不得带着未确认的取值起服务。
 
 ### 2.3 迁移
 

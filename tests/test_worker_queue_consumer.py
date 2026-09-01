@@ -24,6 +24,8 @@ import itertools
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1294,6 +1296,7 @@ class WorkerServiceTests(unittest.TestCase):
             # 2026-08-23 真实故障：回执超过 SDK 读流缓冲上限（result_too_large，
             # 分类在 apps/worker/turn.py）同样不得压平成「请稍后重试」。
             (False, "result_too_large", "failed", "result_too_large", "worker.result_too_large"),
+            (False, "mcp_bad_gateway", "failed", "mcp_bad_gateway", "worker.mcp_bad_gateway"),
         ):
             with self.subTest(expected_terminal_kind=expected_terminal_kind, failure_code=failure_code):
                 queue = FakeWorkerQueue(stopped=stopped)
@@ -1317,6 +1320,43 @@ class WorkerServiceTests(unittest.TestCase):
                 self.assertEqual(
                     terminal["content"], default_content_catalog().text(expected_content_key).text
                 )
+
+    def test_mcp_bad_gateway_terminal_is_actionable_and_not_duplicated(self) -> None:
+        queue = FakeWorkerQueue()
+        sink = RecordingTerminalOutcomeSink()
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {
+                        "code": "mcp_bad_gateway",
+                        "signature": "mcp.query.http_502",
+                    },
+                }
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+            on_terminal_outcome=sink,
+        )
+
+        asyncio.run(service.process_once())
+        # claim() 已经把任务移出可领取集合；重复巡检不得再写终态或回调一次。
+        asyncio.run(service.process_once())
+
+        self.assertEqual(len(queue.terminals), 1)
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["terminal_kind"], "failed")
+        self.assertEqual(terminal["error_kind"], "mcp_bad_gateway")
+        self.assertEqual(terminal["failure_code"], "mcp_bad_gateway")
+        self.assertEqual(terminal["failure_signature"], "mcp.query.http_502")
+        self.assertEqual(
+            terminal["content"], default_content_catalog().text("worker.mcp_bad_gateway").text
+        )
+        self.assertEqual(len(sink.calls), 1)
+        self.assertEqual(len([event for event in queue.events if event["event_type"] == "terminal"]), 0)
 
     def test_withheld_output_writes_redacted_withheld_terminal_not_success(self) -> None:
         """#141/#149：整段正文因安全策略被拒发时，即使 closed=True 也不得写成
@@ -3965,6 +4005,149 @@ class RealQueueTerminalTests(unittest.TestCase):
         )
 
 
+class SessionTranscriptReclamationTests(unittest.TestCase):
+    """Issue #494 ①：**正常问数流程**下会话转录占用必须收敛在预算内。
+
+    这里刻意用一个连 ``claim_session_cleanups`` 都没有的假队列——**改动前那条唯一
+    的清理路径在本用例里根本不存在**，正如生产里正常问数流程从不往
+    ``agent_session_cleanup`` 排队一样。因此"占用有界"只能由新增的常规回收路径
+    提供：把 `_reclaim_session_transcripts` 从 `_housekeep` 里摘掉，本节第一个用例
+    立刻变红（转录单调增长到远超预算），这正是 rc22 收尾批 S-12 实测到的形状。
+    """
+
+    class _IdleQueue:
+        """只会说"没有任务"的队列：不提供任何回收/清理方法，`_housekeep` 里
+        那几个 `getattr(..., None)` 分支全部走空。"""
+
+        def claim(self, **kwargs: object) -> list[object]:
+            return []
+
+    def _service(self, root: Path, **overrides: object) -> WorkerService:
+        values: dict[str, object] = {
+            "session_disk_budget_bytes": 4096,
+            "session_disk_low_water_ratio": 0.75,
+            "session_reclaim_min_age_seconds": 60.0,
+            "session_reclaim_interval_seconds": 0.0,
+        }
+        values.update(overrides)
+        return WorkerService(
+            config=worker_config(**values),
+            queue=self._IdleQueue(),
+            session_root=root,
+        )
+
+    @staticmethod
+    def _write_transcript(root: Path, index: int, size: int) -> Path:
+        path = root / f"session-{index:04d}.jsonl"
+        path.write_bytes(b"x" * size)
+        # 每一份都往前挪，既让"最旧"有确定顺序，也让它们全部落在保护窗口之外
+        # （真实运行里保护窗口只罩住在途回合，不是全部转录）。
+        stamp = time.time() - 10_000 + index
+        os.utime(path, (stamp, stamp))
+        return path
+
+    @staticmethod
+    def _total(root: Path) -> int:
+        return sum(entry.stat().st_size for entry in root.rglob("*.jsonl"))
+
+    def test_continuous_traffic_without_any_cleanup_queue_stays_within_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root)
+            written = 0
+            peak = 0
+
+            # 40 轮"问数"，每轮产出一份 512B 转录：不回收的话总量会到 20480B，
+            # 是 4096B 预算的 5 倍——正是"单调增长直到写满"的缩尺复现。
+            for index in range(40):
+                self._write_transcript(root, index, 512)
+                written += 512
+                asyncio.run(service.process_once())
+                peak = max(peak, self._total(root))
+
+            self.assertEqual(written, 40 * 512)
+            self.assertLessEqual(
+                peak,
+                4096,
+                "持续问数流量下会话转录占用必须始终收敛在预算内，而不是单调增长",
+            )
+            self.assertGreater(
+                self._total(root), 0, "回收不该把目录清空——只压到低水位，最新的要留着"
+            )
+
+    def test_the_newest_transcripts_survive_a_reclaim_round(self) -> None:
+        """收敛不能靠"全删"：用户刚聊过的会话续得上，是回收方式的一部分。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root)
+            paths = [self._write_transcript(root, index, 1024) for index in range(10)]
+
+            asyncio.run(service.process_once())
+
+            self.assertFalse(paths[0].exists(), "最旧的一份必须先被回收")
+            self.assertTrue(paths[-1].exists(), "最新的一份必须留下")
+
+    def test_a_zero_budget_leaves_every_transcript_in_place(self) -> None:
+        """运维显式关闭回收（保全取证现场）时，一份都不许删。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root, session_disk_budget_bytes=0)
+            paths = [self._write_transcript(root, index, 1024) for index in range(10)]
+
+            asyncio.run(service.process_once())
+
+            self.assertTrue(all(path.exists() for path in paths))
+
+    def test_reclamation_is_throttled_between_rounds(self) -> None:
+        """`process_once` 每 2 秒一轮，不该每轮都去扫一遍目录。"""
+
+        now = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = WorkerService(
+                config=worker_config(
+                    session_disk_budget_bytes=1024,
+                    session_reclaim_interval_seconds=60.0,
+                    session_reclaim_min_age_seconds=60.0,
+                ),
+                queue=self._IdleQueue(),
+                session_root=root,
+                monotonic=lambda: now,
+            )
+            for index in range(4):
+                self._write_transcript(root, index, 1024)
+
+            asyncio.run(service.process_once())  # t=0：跑一次，压到低水位
+            after_first = self._total(root)
+            self.assertLess(after_first, 4 * 1024)
+
+            self._write_transcript(root, 99, 4096)
+            now = 1.0
+            asyncio.run(service.process_once())  # 节流窗口内，不该再跑
+            self.assertEqual(
+                self._total(root),
+                after_first + 4096,
+                "节流窗口内不该再扫一遍目录",
+            )
+
+            now = 100.0
+            asyncio.run(service.process_once())  # 窗口过了，必须再跑一次
+            self.assertLess(self._total(root), after_first + 4096)
+
+    def test_no_session_root_means_no_reclamation_attempt(self) -> None:
+        """取不到会话根目录（例如缺 HOME）时整体跳过，不猜一个路径去删东西。"""
+
+        service = WorkerService(
+            config=worker_config(session_disk_budget_bytes=1),
+            queue=self._IdleQueue(),
+            session_root=None,
+        )
+
+        asyncio.run(service.process_once())  # 不抛异常即通过
+
+
 @unittest.skipUnless(POSTGRES_READY, SKIP_DB)
 class SessionCleanupPipelineIntegrationTests(unittest.TestCase):
     """Issue #153：从"数据库里排了一条待清理"到"物理文件真的被删、行被标记完成"
@@ -4725,3 +4908,403 @@ class YearGroundingSuspectAlertTests(unittest.TestCase):
         terminal = queue.terminals[0]
         self.assertEqual(terminal["terminal_kind"], "success")
         self.assertEqual(terminal["content"], "结果")
+
+
+#: 三种形状不同的"未分类"底层异常，覆盖 Issue #495 完成标准 1 点名的三类来源。
+#: 刻意都在测试文件里现造类：真实的 psycopg/httpx/SDK 异常类不是本仓依赖（也
+#: 不该为了一条断言把它们拖进 fast 门禁），而被断言的行为只与
+#: ``type(error).__module__``/``__qualname__`` 有关，与这些库本身无关。
+#: 定义在模块顶层而不是嵌在测试类里：嵌套类的 ``__qualname__`` 会带上外层类名，
+#: 让签名无谓地长，掩盖"限定名在正常情况下很短"这个事实。
+class FakeDatabaseError(Exception):
+    """psycopg 形状：驱动异常，正文里常带 ``DETAIL: Key (...)=(ou_...)``。"""
+
+
+class FakeHttpError(Exception):
+    """外部 HTTP 形状。"""
+
+
+class FakeSdkInternalError(Exception):
+    """Agent SDK 内部形状。"""
+
+
+class TerminalFailureSignatureTests(unittest.TestCase):
+    """Issue #495：失败终态必须留得下线索——底层异常的**固定类别摘要**与一个
+    非 ``null`` 的失败码。
+
+    真实代价（2026-08-31 浸泡窗口取证，Trace #469 S-12）：8 条任务失败里 6 条
+    **无法归因**，结构化日志只留下 ``worker.task.terminal
+    error_kind=session_failed failure_code=null``；能归因的另外 2 条恰恰是因为
+    走了另一条**会落日志**的分支（``worker.mcp_server_unavailable`` 记下了
+    502）。正反对照就在同一批样本里。
+
+    这一组同时守两条互相拉扯的线：**可诊断**（``..._leaves_a_distinguishable_
+    signature`` 等）与**不泄露**（``test_the_signature_never_carries_exception_
+    text``）。任何一条被牺牲都算失败。
+    """
+
+    _DatabaseError = FakeDatabaseError
+    _HttpError = FakeHttpError
+    _SdkInternalError = FakeSdkInternalError
+
+    @staticmethod
+    def _raising_executor(error: BaseException):
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise error
+
+        return Executor
+
+    def _run(self, executor_class) -> tuple[FakeWorkerQueue, RecordingTerminalOutcomeSink]:
+        queue = FakeWorkerQueue()
+        sink = RecordingTerminalOutcomeSink()
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: executor_class(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+        return queue, sink
+
+    def _run_report(self, report: dict) -> tuple[FakeWorkerQueue, RecordingTerminalOutcomeSink]:
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                return report
+
+        return self._run(Executor)
+
+    def test_each_unclassified_exception_type_leaves_a_distinguishable_signature(self) -> None:
+        """完成标准 1：数据库 / 外部 HTTP / SDK 内部三种底层异常，在日志里必须
+        留下**互不相同**的稳定签名，而不是一律 ``session_failed`` 一个词。签名
+        只由固定类别和不可逆摘要组成，不把运行时类名写入日志。
+
+        **变异验红**（已实测）：把 ``report_extraction.failure_with_signature``
+        的返回值去掉 ``"signature"`` 这一项（等价于"兜底分支不再留签名"这个
+        退化），本用例由绿转红；把 ``exception_failure_signature`` 改成恒返回
+        同一个字符串同样红（三个签名塌成一个，``len(set(...)) == 3`` 捕获）。
+        恢复后复绿。
+        """
+
+        signatures: list[str] = []
+        for error in (
+            self._DatabaseError("connection to server failed"),
+            self._HttpError("502 Bad Gateway"),
+            self._SdkInternalError("transport closed unexpectedly"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                _, sink = self._run(self._raising_executor(error))
+                fields = sink.calls[0]
+                # 用户可见的分类**不变**（完成标准：不改用户可见文案）。
+                self.assertEqual(fields["error_kind"], "session_failed")
+                self.assertEqual(fields["failure_code"], "session_failed")
+                signature = fields["failure_signature"]
+                self.assertIsInstance(signature, str)
+                self.assertRegex(
+                    signature,
+                    r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+                )
+                signatures.append(signature)
+
+        self.assertEqual(
+            len(set(signatures)), 3, f"三种底层异常必须互相可区分，实际={signatures}"
+        )
+
+    def test_the_signature_is_a_stable_digest_not_a_bare_class_name(self) -> None:
+        """签名必须是固定类别加不可逆摘要，而不是裸类名或模块限定名；后者
+        可能由 SDK 用运行时数据动态生成，不能进入低敏出口。
+
+        **变异验红**：把摘要改回裸类名或模块限定名，本用例应由绿转红（输出
+        不符合固定签名形状）。
+        """
+
+        _, sink = self._run(self._raising_executor(self._DatabaseError("boom")))
+
+        signature = sink.calls[0]["failure_signature"]
+        self.assertRegex(
+            signature,
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
+
+    def test_a_builtin_exception_keeps_a_stable_category_signature(self) -> None:
+        """内建异常也只返回固定类别摘要，不把类名或模块名写进日志。"""
+
+        _, sink = self._run(self._raising_executor(ValueError("boom")))
+
+        self.assertRegex(
+            sink.calls[0]["failure_signature"],
+            r"^exception\.builtin\.[0-9a-f]{40}$",
+        )
+
+    def test_the_signature_never_carries_exception_text(self) -> None:
+        """完成标准 2（不泄露）：异常**正文**含外部标识原值时，日志与落库两个
+        出口都必须零出现。
+
+        样式取真实形状，不是编的：psycopg 唯一约束冲突的异常串就长这样
+        （``DETAIL:  Key (feishu_open_id)=(ou_...) already exists.``），rc22
+        opus 审查 P2-5 正是因为 ``event.pipeline_failed`` 记了这段全文才做的
+        收敛；这里照抄那条做法并把样本扩到 `V-花名册-33` 关心的其余三种外部
+        标识（``lpo_``/``pac_``）与邮箱。
+
+        **变异验红**（已实测）：让 ``report_extraction.exception_failure_
+        signature`` 返回 ``f"{type(error).__name__}: {error}"``（即"顺手把正文
+        也带上"这种最容易发生的改动），本用例由绿转红。恢复后复绿。
+        """
+
+        leaking = self._DatabaseError(
+            'duplicate key value violates unique constraint "app_user_feishu_open_id_key"\n'
+            "DETAIL:  Key (feishu_open_id)=(ou_fake0123456789) already exists.\n"
+            "chat=oc_fake9876 permission=lpo_fake4321 package=pac_fake8765 "
+            "contact=someone@example.com"
+        )
+        queue, sink = self._run(self._raising_executor(leaking))
+
+        for label, payload in (
+            ("低敏审计日志", repr(sink.calls[0])),
+            ("终态落库参数", repr(queue.terminals[0])),
+        ):
+            for secret in (
+                "ou_fake0123456789",
+                "lpo_fake4321",
+                "pac_fake8765",
+                "someone@example.com",
+                "duplicate key value",
+            ):
+                with self.subTest(sink=label, secret=secret):
+                    self.assertNotIn(secret, payload)
+        # 正面：泄露被挡住了，但线索**仍在**——否则这条断言用一个恒空的实现
+        # 也能通过。
+        self.assertRegex(
+            sink.calls[0]["failure_signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
+
+    def test_failure_code_is_never_null_on_a_failed_terminal(self) -> None:
+        """完成标准 3：失败终态的 ``failure_code`` 不再为 ``null``。
+
+        三种"没人起名字"的真实形状各给一个显式码，且 ``error_kind`` 与用户
+        文案**逐字不变**（仍是通用失败，见 ``_failure_content`` 默认分支）。
+
+        **变异验红**（已实测）：把 ``service.py`` 里
+        ``logged_failure_code = failure_code or _unnamed_failure_code(report)``
+        改回 ``failure_code``，本用例三条 subTest 全红。恢复后复绿。
+        """
+
+        for label, report, expected_code in (
+            (
+                "回合没收口且没人给失败起名字",
+                {"turn": {"closed": False, "final_text": ""}, "failure": None},
+                "turn_not_closed",
+            ),
+            (
+                "屏障失效（有调用绕过了判定）",
+                {
+                    "turn": {"closed": False, "final_text": "", "gate_bypassed": True},
+                    "failure": None,
+                },
+                "gate_bypassed",
+            ),
+            (
+                "failure 映射存在但缺 code",
+                {
+                    "turn": {"closed": False, "final_text": ""},
+                    "failure": {"message": "something went wrong"},
+                },
+                "unnamed_failure",
+            ),
+        ):
+            with self.subTest(label):
+                queue, sink = self._run_report(report)
+                fields = sink.calls[0]
+                self.assertEqual(fields["failure_code"], expected_code)
+                self.assertIsNotNone(fields["failure_code"])
+                # 用户侧不变：通用失败文案 + 通用 error_kind。
+                self.assertEqual(fields["error_kind"], "session_failed")
+                self.assertEqual(queue.terminals[0]["terminal_kind"], "failed")
+                self.assertEqual(
+                    queue.terminals[0]["content"],
+                    default_content_catalog().text("worker.failed").text,
+                )
+
+    def test_stopped_and_withheld_terminals_also_carry_a_failure_code(self) -> None:
+        """完成标准 3 的另外两支：开工前就被停止、以及安全拒发，此前同样恒
+        ``failure_code=null``——运维按失败码过滤时这两类终态会整块消失。"""
+
+        queue = FakeWorkerQueue(stopped=True)
+        sink = RecordingTerminalOutcomeSink()
+
+        class NeverRuns:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise AssertionError("开工前已 stop，不该跑回合")
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: NeverRuns(),
+            on_terminal_outcome=sink,
+        )
+        asyncio.run(service.process_once())
+        self.assertEqual(sink.calls[0]["terminal_kind"], "stopped")
+        self.assertEqual(sink.calls[0]["failure_code"], "stopped")
+
+        _, withheld_sink = self._run_report(
+            {
+                "turn": {
+                    "closed": True,
+                    "final_text": "被拦下的正文",
+                    "session_id": "s",
+                    "output_safety": {"blocked": True, "withheld": True, "reasons": ("forbidden_value",)},
+                    "user_result": "redacted_withheld",
+                },
+                "failure": None,
+            }
+        )
+        self.assertEqual(withheld_sink.calls[0]["terminal_kind"], "redacted_withheld")
+        self.assertEqual(withheld_sink.calls[0]["failure_code"], "redacted_withheld")
+
+    def test_a_successful_turn_reports_no_failure_code_and_no_signature(self) -> None:
+        """否定测试：成功回合**没有**失败，两个字段必须保持 ``None``——把它们
+        填上一个占位符就是编造一次不存在的失败，也会让上面几条"非 null"断言
+        被一个恒真实现蒙混过关。"""
+
+        queue, sink = self._run_report(
+            {
+                "turn": {"closed": True, "final_text": "日活是 1024。", "session_id": "s"},
+                "failure": None,
+            }
+        )
+
+        self.assertEqual(sink.calls[0]["terminal_kind"], "success")
+        self.assertIsNone(sink.calls[0]["failure_code"])
+        self.assertIsNone(sink.calls[0]["failure_signature"])
+        self.assertIsNone(queue.terminals[0]["failure_code"])
+        self.assertIsNone(queue.terminals[0]["failure_signature"])
+
+    def test_already_classified_failures_keep_their_code_and_carry_no_fake_signature(self) -> None:
+        """完成标准 5（回归）：本来就能归因的失败码原样保留，终态种类与用户
+        文案不变；这些失败不来自异常对象，``failure_signature`` 必须保持
+        ``None``——编一个占位符会让"有签名"这件事失去信息量。"""
+
+        for failure_code, terminal_kind, error_kind in (
+            ("turn_timeout", "timeout", "running_timeout"),
+            ("max_turns_exceeded", "failed", "max_turns_exceeded"),
+            ("result_too_large", "failed", "result_too_large"),
+            ("context_too_long", "failed", "context_too_long"),
+        ):
+            with self.subTest(failure_code=failure_code):
+                queue, sink = self._run_report(
+                    {"turn": {"closed": False, "final_text": ""}, "failure": {"code": failure_code}}
+                )
+                self.assertEqual(sink.calls[0]["failure_code"], failure_code)
+                self.assertIsNone(sink.calls[0]["failure_signature"])
+                self.assertEqual(sink.calls[0]["terminal_kind"], terminal_kind)
+                self.assertEqual(sink.calls[0]["error_kind"], error_kind)
+                self.assertEqual(queue.terminals[0]["failure_code"], failure_code)
+
+    def test_the_failure_code_and_signature_are_persisted_with_the_terminal(self) -> None:
+        """两个出口，不是一个：低敏日志给有容器访问权限的运维，落库列给只有
+        飞书私聊的管理员（``/admin trace``）。worker 与 gateway 是两个独立进程、
+        不共享文件系统，只进 stderr 的线索管理员永远看不到。
+
+        **变异验红**（已实测）：把 ``_finish_terminal`` 传给
+        ``write_terminal_event`` 的 ``failure_code``/``failure_signature`` 两个
+        参数删掉，本用例由绿转红。
+        """
+
+        queue, sink = self._run(self._raising_executor(self._HttpError("502 Bad Gateway")))
+
+        terminal = queue.terminals[0]
+        self.assertEqual(terminal["failure_code"], "session_failed")
+        self.assertEqual(terminal["failure_signature"], sink.calls[0]["failure_signature"])
+        self.assertRegex(
+            terminal["failure_signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
+
+    def test_a_hostile_type_name_and_free_text_are_rejected_or_hashed(self) -> None:
+        """纵深防线：动态类名和数据库异常正文不能靠字符替换进入签名。
+        动态类型只产生固定类别摘要；跨进程报告收到异常正文时直接退回
+        ``unknown``，而不是把 ``ou_x`` 等白名单字符保留下来。"""
+
+        from lingxi.apps.worker.report_extraction import (
+            UNKNOWN_FAILURE_SIGNATURE,
+            sanitize_failure_signature,
+        )
+
+        self.assertEqual(
+            sanitize_failure_signature("Key (feishu_open_id)=(ou_x) 已存在"),
+            UNKNOWN_FAILURE_SIGNATURE,
+        )
+        self.assertEqual(sanitize_failure_signature("A" * 300), UNKNOWN_FAILURE_SIGNATURE)
+        self.assertEqual(sanitize_failure_signature("中文异常"), UNKNOWN_FAILURE_SIGNATURE)
+        self.assertEqual(sanitize_failure_signature(""), UNKNOWN_FAILURE_SIGNATURE)
+        self.assertEqual(
+            sanitize_failure_signature("mcp.query.http_502"), "mcp.query.http_502"
+        )
+
+    def test_a_dynamic_type_name_never_reaches_the_terminal_signature(self) -> None:
+        """审核复现：SDK 动态造出的 ``ou_secret_user`` 类名不能原样进入
+        终态签名、低敏日志或持久终态；同一类型仍应保留一个可区分的固定形状
+        线索。"""
+
+        from lingxi.apps.worker.report_extraction import exception_failure_signature
+
+        dynamic_type = type(
+            "ou_secret_user",
+            (Exception,),
+            {"__module__": "sdk.dynamic.ou_secret_user"},
+        )
+        error = dynamic_type(
+            "ou_secret_user=ou_x lpo_secret=lpo_x pac_secret=pac_x contact=secret@example.com"
+        )
+        signature = exception_failure_signature(error)
+
+        self.assertNotIn("ou_", signature)
+        self.assertNotIn("lpo_", signature)
+        self.assertNotIn("pac_", signature)
+        self.assertNotIn("@", signature)
+        self.assertRegex(signature, r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$")
+        self.assertEqual(signature, exception_failure_signature(dynamic_type("different text")))
+
+        queue, sink = self._run(self._raising_executor(error))
+        for payload in (repr(sink.calls[0]), repr(queue.terminals[0])):
+            for secret in (
+                "ou_secret_user",
+                "ou_x",
+                "lpo_x",
+                "pac_x",
+                "secret@example.com",
+            ):
+                self.assertNotIn(secret, payload)
+        self.assertEqual(queue.terminals[0]["failure_signature"], signature)
+
+    def test_exception_signature_is_stable_across_processes(self) -> None:
+        """失败签名会落库并由另一个进程的 ``/admin trace`` 读取，因此不能
+        使用 Python 的随机 hash；相同类型身份在独立解释器中必须得到同一摘要。"""
+
+        from lingxi.apps.worker.report_extraction import exception_failure_signature
+
+        dynamic_type = type(
+            "RuntimeDatabaseError",
+            (Exception,),
+            {"__module__": "psycopg.errors"},
+        )
+        expected = exception_failure_signature(dynamic_type("not persisted"))
+        child_code = (
+            "from lingxi.apps.worker.report_extraction import exception_failure_signature; "
+            "E = type('RuntimeDatabaseError', (Exception,), "
+            "{'__module__': 'psycopg.errors'}); "
+            "print(exception_failure_signature(E('ou_secret_user=ou_x')))")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", child_code],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.strip(), expected)
+        self.assertNotIn("ou_", result.stdout)

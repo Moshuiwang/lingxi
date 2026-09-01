@@ -82,8 +82,31 @@ read_body_children`` 读一次正文根 block 的现有子块，非空即跳过�
 LarkDocxDelivery.write_paragraphs`，与转换开关是否打开无关——详见
 :meth:`DocumentDeliveryConsumer._process_docx_claim` 写正文步的分支注释。转换
 失败（业务错误码、结果不明、超过 ``MAX_CONVERTED_BLOCKS``）沿用本模块既有的
-definite/结果不明分类，不单独处理，也绝不静默退回段落路径（``LarkDocxDelivery.
-write_body`` 自身的姿态，见该方法文档字符串）。
+definite/结果不明分类，不单独处理。
+
+**唯一的例外是「明示降级」（Issue #499，产品负责人 2026-08-31 裁定）**：转换被
+飞书确定性拒绝且原因码是 ``unsupported_nested_blocks``（回答里含表格等本仓库
+不支持的嵌套结构）时，``LarkDocxDelivery.write_body`` 改走纯文本段落路径把正文
+写进去、并在返回的 ``WriteBodyOutcome`` 里明示降级；本模块接住这个信号，
+**必须**做三件事，缺一件这条裁定就退化成当初被明令禁止的静默降级：
+
+1. 把原因码落进 ``task_document_delivery_request.body_degraded_reason``（迁移
+   0082，:meth:`PostgresDocumentDeliveryStore.mark_body_degraded` 单独提交）
+   ——补发通知路径与检查点恢复路径都是另一次进程调用，读不到这次调用的内存
+   信号；
+2. 成功通知改用 ``delivery.document_ready_degraded``（如实说明格式已简化及
+   原因），不是普通的 ``delivery.document_ready``；
+3. 记一条 ``gateway.document_delivery.body_degraded`` 结构化日志，让运维能按
+   ``task_id`` 查到这次降级。
+
+**不上告警**：降级是"交付成功、但排版被简化"，不是故障；实测命中率 18.2%
+（#499 W0-1），按 ``document_delivery_failed`` 那样命中即报会把管理群刷成噪音，
+反而淹没真正的失败。可观测性由上面第 1、3 两项承担（库里一列 ＋ 一条结构化
+日志），与 ``_fail``/``_uncertain`` 的告警面刻意分开。
+
+**这条降级是"拿得到"，不是"好看"**：段落路径来自 ``paragraphs`` 列，表格会被
+拍平成一段长文本、``|---|`` 分隔行原样留在正文里——用户文案不得暗示格式完好，
+见 ``content.toml`` 的 ``delivery.document_ready_degraded``。
 
 **成功通知走"追加消息"，不进入任何已有话题的投递 outbox**：文档交付可能发生在
 原问数任务已经确认送达很久之后（``uncertain``/``failed`` 转 ``pending`` 的
@@ -298,6 +321,7 @@ class DocumentDeliveryConsumer:
                     document_id=item.document_id,
                     delivery_type=item.delivery_type,
                     resource_url=item.resource_url,
+                    body_degraded_reason=item.body_degraded_reason,
                 )
 
         try:
@@ -341,6 +365,11 @@ class DocumentDeliveryConsumer:
         # 的 document_id 必然是全新文档，从未写过正文，不需要这次额外读回，行为
         # 与修复前逐字相同（见模块说明「写正文步的幂等判据」）。
         recovering_from_checkpoint = document_id is not None
+        # Issue #499：这一行此前是否已经被判定为降级交付（迁移 0082 的
+        # `body_degraded_reason`，由 `claim_pending` 一并读出）。检查点恢复路径
+        # 会跳过写正文步、因此不会再产生一次 `WriteBodyOutcome`——不从 claim 里
+        # 继承这个值，恢复路径发出的就是不带降级说明的"文档已生成"。
+        body_degraded_reason = claim.body_degraded_reason
         try:
             if document_id is None:
                 document_id = self._docx.create_document(claim.title)
@@ -364,9 +393,25 @@ class DocumentDeliveryConsumer:
                 # 与转换开关状态无关（同 write_body 幂等判据一致：两条路径写的
                 # 是同一个坐标）。
                 if claim.markdown is not None:
-                    self._docx.write_body(
+                    outcome = self._docx.write_body(
                         document_id, paragraphs=list(claim.paragraphs), markdown=claim.markdown
                     )
+                    # Issue #499 明示降级：`write_body` 只在
+                    # `unsupported_nested_blocks` 这一个原因码上降级（其余失败仍
+                    # 然向上抛，走下面既有的 definite/结果不明分类）。降级时正文
+                    # **已经**写进飞书了，所以这里先把原因码单独提交成检查点、再
+                    # 继续授权/读回——晚提交会被一次崩溃带走，恢复路径就再也无从
+                    # 知道这一行降级过（见迁移 0082 文件头部「残留窗口如实登记」）。
+                    if outcome.degraded_reason is not None:
+                        body_degraded_reason = outcome.degraded_reason
+                        self._store.mark_body_degraded(
+                            request_id=claim.id, reason=outcome.degraded_reason
+                        )
+                        logger.warning(
+                            "gateway.document_delivery.body_degraded task_id=%s reason=%s",
+                            claim.task_id,
+                            outcome.degraded_reason,
+                        )
                 else:
                     self._docx.write_paragraphs(document_id, list(claim.paragraphs))
             self._docx.grant_full_access(document_id, claim.requester_open_id)
@@ -410,7 +455,13 @@ class DocumentDeliveryConsumer:
             self._uncertain(claim, last_error=type(error).__name__)
             return
 
-        self._finalize_claim(claim, document_id=document_id, members=members, resource_url=None)
+        self._finalize_claim(
+            claim,
+            document_id=document_id,
+            members=members,
+            resource_url=None,
+            body_degraded_reason=body_degraded_reason,
+        )
 
     def _process_sheet_claim(self, claim: DocumentDeliveryClaim) -> None:
         """表格分支（Issue #354 S-H3-2）：与 :meth:`_process_docx_claim` 逐项
@@ -473,11 +524,16 @@ class DocumentDeliveryConsumer:
         document_id: str,
         members: list[dict[str, Any]],
         resource_url: str | None,
+        body_degraded_reason: str | None = None,
     ) -> None:
         """docx/sheet 两条分支共用的收口：验证权限读回、落终态、发送通知
         （Issue #354 S-H3-2 从 ``_process_claim`` 提炼，行为对 docx 零变化——
         判断顺序、异常处理、日志/告警内容逐字相同，只多了 ``delivery_type``
         字段用于分派通知文案）。
+
+        ``body_degraded_reason``（Issue #499）：只由 docx 分支传，非 ``None`` 时
+        成功通知改用明示降级的文案。sheet 分支结构上恒为 ``None``（没有"markdown
+        转换"这个概念，迁移 0082 的 CHECK 也在数据库层拒绝这种行），因此不传。
         """
 
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
@@ -520,6 +576,7 @@ class DocumentDeliveryConsumer:
             document_id=document_id,
             delivery_type=claim.delivery_type,
             resource_url=resource_url,
+            body_degraded_reason=body_degraded_reason,
         )
 
     def _fail(self, claim: DocumentDeliveryClaim, *, last_error: str) -> None:
@@ -612,6 +669,7 @@ class DocumentDeliveryConsumer:
         document_id: str,
         delivery_type: str = "docx",
         resource_url: str | None = None,
+        body_degraded_reason: str | None = None,
     ) -> None:
         """成功后把文档/表格链接作为追加消息发给提问用户；失败只记日志/告警，
         不改写已经落库的 ``succeeded`` 终态——文档/表格已经建好且用户已经拿到
@@ -621,6 +679,13 @@ class DocumentDeliveryConsumer:
         本方法有两个调用点——刚跑完流程的原发送路径（``claim`` 现成可用），与
         补发未确认送达通知的路径（``run_once`` 里的 :class:`UnnotifiedSuccess`，
         没有完整 claim——``title``/``paragraphs``/``attempts`` 对补发通知无关）。
+
+        ``body_degraded_reason``（迁移 0082，Issue #499）：非 ``None`` 时选用
+        ``delivery.document_ready_degraded``。两个调用点各自的来源不同——原发送
+        路径来自本次 ``write_body`` 的返回值（或 claim 里继承的历史值），补发
+        路径来自 :class:`~lingxi.adapters.postgres_document_delivery.
+        UnnotifiedSuccess` 从库里读出的那一列；两条路径必须给出同一个结论，
+        否则同一次交付会因为"第几次尝试通知"而说法不一。
 
         ``delivery_type``/``resource_url``（迁移 0078，Issue #354 S-H3-2）：
         docx 分支不传（保持默认值，取值/行为逐字不变，链接由
@@ -647,7 +712,17 @@ class DocumentDeliveryConsumer:
                 dedupe_prefix = "sheet-ready"
             else:
                 url = self._docx.document_url(document_id)
-                content_key = "delivery.document_ready"
+                # Issue #499 明示降级：正文被降级成纯文本段落路径写入时，用户
+                # 拿到的排版与他本该拿到的不同——必须用如实说明"格式已简化"的
+                # 那条文案，不能沿用普通就绪文案。
+                content_key = (
+                    "delivery.document_ready_degraded"
+                    if body_degraded_reason is not None
+                    else "delivery.document_ready"
+                )
+                # 去重前缀刻意**两条文案共用**：原发送与补发是同一条通知的两次
+                # 尝试，不是两条独立通知。分开前缀会让"第一次发普通文案失败、
+                # 补发时才读到降级列"这种时序发出两条消息给同一个人。
                 dedupe_prefix = "document-ready"
             content = self._catalog.text(content_key, url=url)
             self._notifier.send_text(

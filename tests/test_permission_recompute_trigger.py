@@ -26,6 +26,7 @@ from lingxi.adapters.postgres_permission_recompute_trigger import (
 from lingxi.core.admin.card_callback import AdminCardCallbackHandler
 from lingxi.core.admin.notification import DECISION_CONFIRM
 from lingxi.core.admin.pending_action import PendingAction, PendingActionStatus, PendingActionType
+from lingxi.core.permission.targeted_recompute import RecomputeKind, TargetedRecomputeOutcome
 
 NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -203,6 +204,73 @@ class QueueFullDropTests(unittest.TestCase):
                     BackgroundPermissionRecomputeTrigger(
                         _SlowDelegate(), audit=_RecordingAudit(), queue_maxsize=bad
                     )
+
+
+class TimeoutAndSkippedOutcomeTests(unittest.TestCase):
+    def test_timeout_reports_incomplete_and_late_delegate_cannot_mark_effective(self) -> None:
+        delegate = _SlowDelegate()
+        audit = _RecordingAudit()
+        completed: list[PendingAction] = []
+        timed_out: list[PendingAction] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            delegate,
+            audit=audit,
+            timeout_seconds=0.02,
+            on_completed=completed.append,
+            on_timeout=timed_out.append,
+        )
+        pending = _pending(pending_id="pac_bg_timeout_0000000000001")
+        try:
+            executor.trigger(pending)
+            self.assertTrue(delegate.started.wait(timeout=1))
+            self.assertTrue(_wait_until(lambda: timed_out == [pending], timeout=1))
+            delegate.release.set()
+            self.assertTrue(_wait_until(lambda: len(delegate.calls) == 1, timeout=1))
+            self.assertEqual(completed, [])
+            self.assertEqual(len(audit.fields_for("admin.card_callback.recompute_trigger_timeout")), 1)
+        finally:
+            delegate.release.set()
+
+    def test_skipped_targeted_recompute_is_not_reported_as_effective(self) -> None:
+        class _SkippedDelegate:
+            def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
+                return TargetedRecomputeOutcome(kind=RecomputeKind.SKIPPED, reason="snapshot_missing")
+
+        audit = _RecordingAudit()
+        completed: list[PendingAction] = []
+        failed: list[PendingAction] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            _SkippedDelegate(),
+            audit=audit,
+            on_completed=completed.append,
+            on_failed=lambda pending, error: failed.append(pending),
+        )
+        pending = _pending(pending_id="pac_bg_skipped_0000000000001")
+        executor.trigger(pending)
+        self.assertTrue(_wait_until(lambda: failed == [pending]))
+        self.assertEqual(completed, [])
+
+    def test_enqueued_targeted_recompute_is_reported_as_waiting_not_effective(self) -> None:
+        class _EnqueuedDelegate:
+            def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
+                return TargetedRecomputeOutcome(kind=RecomputeKind.ENQUEUED)
+
+        audit = _RecordingAudit()
+        completed: list[PendingAction] = []
+        queued: list[tuple[PendingAction, TargetedRecomputeOutcome]] = []
+        executor = BackgroundPermissionRecomputeTrigger(
+            _EnqueuedDelegate(),
+            audit=audit,
+            on_completed=completed.append,
+            on_queued=lambda pending, outcome: queued.append((pending, outcome)),
+        )
+        pending = _pending(pending_id="pac_bg_enqueued_000000000001")
+        executor.trigger(pending)
+
+        self.assertTrue(_wait_until(lambda: len(queued) == 1))
+        self.assertEqual(queued[0][0], pending)
+        self.assertEqual(queued[0][1].kind, RecomputeKind.ENQUEUED)
+        self.assertEqual(completed, [])
 
 
 @dataclass(frozen=True)

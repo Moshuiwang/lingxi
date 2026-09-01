@@ -3,7 +3,7 @@
 #
 # 用法：
 #   scripts/dev/check.sh                    # 按当前改动自动分层（对比 --base，默认 main）
-#   scripts/dev/check.sh docs|fast|full      # 强制指定层级，跳过自动判定
+#   scripts/dev/check.sh docs|l1|fast|full  # 强制指定层级，跳过自动判定
 #   scripts/dev/check.sh --base <ref>        # 指定分层对比基线
 #   scripts/dev/check.sh --committed-only    # 分层判定只看已提交差异，不含工作树改动
 #   scripts/dev/check.sh --print-mode        # 只打印分层结论，不安装依赖、不运行任何检查
@@ -13,6 +13,8 @@
 # 三层与 CI 的对应关系（验证与门禁第五节 / 第十一节）：
 #   docs  等价于 Story / docs 与 Epic Full / docs：只跑 scripts/ci/verify_docs.sh，
 #         不装依赖、不起数据库或 Docker。
+#   l1   等价于 Story / content l1 与 Epic Full / l1：校验 content 版本/锁、别名形状
+#         与管理员出口术语，不装依赖、不起数据库或 Docker。
 #   fast  等价于 Story / code fast：extras 组合现读自
 #         .github/workflows/story.yml，不启动真库、不构建镜像，也不跑
 #         workers/oauth-bridge 的 Node 校验（见 docs/技术设计/验证与门禁.md
@@ -62,12 +64,12 @@ initial_git_status_snapshot=$(git status --porcelain)
 
 usage() {
   cat <<'EOF'
-用法：scripts/dev/check.sh [docs|fast|full] [选项]
+用法：scripts/dev/check.sh [docs|l1|fast|full] [选项]
 
 选项：
   --base <ref>        分层判定的对比基线（默认 main）
   --committed-only     分层判定只看 base..HEAD 已提交差异，不含工作树未提交内容
-  --print-mode         只打印分层结论（docs/fast/full），不做任何安装或检查
+  --print-mode         只打印分层结论（docs/l1/fast/full），不做任何安装或检查
   --keep-db            full 模式结束后保留临时真库容器（默认用完即删）
   --reuse-venv         复用已存在的虚拟环境，跳过默认的「每次重建」
   -h, --help           显示本帮助
@@ -83,7 +85,7 @@ reuse_venv=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    docs | fast | full)
+    docs | l1 | fast | full)
       if [[ -n "${mode_arg}" ]]; then
         printf '层级参数给了两次：先是 %s，又给了 %s。只能指定一个层级。\n' "${mode_arg}" "$1" >&2
         exit 1
@@ -139,8 +141,14 @@ if [[ -z "${mode_arg}" ]]; then
   if [[ "${committed_only}" -eq 1 ]]; then
     layer_args+=(--committed-only)
   fi
-  mode=$(python3 scripts/dev/local_layer.py "${layer_args[@]}")
-  printf '本机分层判定（对比 %s，复用 classify_story_changes.classify）：%s\n' "${base_ref}" "${mode}" >&2
+  read -r legacy_mode risk_level < <(python3 scripts/dev/local_layer.py "${layer_args[@]}" --risk)
+  if [[ "${risk_level}" == "l1" ]]; then
+    mode="l1"
+  else
+    mode="${legacy_mode}"
+  fi
+  printf '本机分层判定（对比 %s，复用 classify_story_changes）：mode=%s risk=%s\n' \
+    "${base_ref}" "${mode}" "${risk_level}" >&2
 else
   mode="${mode_arg}"
 fi
@@ -296,6 +304,11 @@ run_docs() {
   scripts/ci/verify_docs.sh
 }
 
+run_l1() {
+  python3 scripts/ci/check_l1_assets.py
+  check_git_tree_is_clean
+}
+
 run_fast() {
   local -A spec=()
   load_spec spec python3 scripts/dev/gate_spec.py fast
@@ -394,10 +407,11 @@ run_full() {
 
 case "${mode}" in
   docs) run_docs ;;
+  l1) run_l1 ;;
   fast) run_fast ;;
   full) run_full ;;
   *)
-    printf '未知层级：%s（分层判定只应该产出 docs/fast/full）\n' "${mode}" >&2
+    printf '未知层级：%s（分层判定只应该产出 docs/l1/fast/full）\n' "${mode}" >&2
     exit 1
     ;;
 esac

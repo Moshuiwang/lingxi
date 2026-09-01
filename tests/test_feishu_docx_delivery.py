@@ -853,7 +853,37 @@ class WriteBlocksTest(unittest.TestCase):
 class WriteBodySwitchTest(unittest.TestCase):
     """Issue #408：``write_body`` 是「markdown 官方转换开关」唯一的可执行分支
     点——默认关闭时逐字调用既有 ``write_paragraphs``（零行为变化），打开时改走
-    convert + write_blocks，失败一律直接向上抛出，不静默退回纯文本路径。"""
+    convert + write_blocks。
+
+    Issue #499（产品负责人 2026-08-31 裁定"降级交付"）在这条分支上开了**唯一
+    一个**例外：转换被拒绝且原因码是 ``unsupported_nested_blocks``（回答里含
+    表格等本仓库不支持的嵌套结构）时改走段落路径，并在返回值里**明示**降级；
+    其余任何失败仍然直接向上抛出。本类同时钉住这个例外成立与它不许扩大。
+
+    **变异锚点（去掉降级分支必红）**：
+    - 把 ``write_body`` 里 ``if error.code != UNSUPPORTED_NESTED_BLOCKS: raise``
+      整段连同 ``try`` 删掉（恢复成"转换失败一律上抛"）——
+      ``test_enabled_unsupported_nested_blocks_degrades_to_the_paragraph_path``
+      会从"发生两次调用、返回 degraded"变红成 ``FeishuDocxDeliveryError``；
+    - 把那个判断反过来（``==`` 改 ``!=``，即"除了这个码之外都降级"）——
+      ``test_enabled_other_definite_codes_still_fail_closed_without_degrading``
+      与既有的 ``test_enabled_over_cap_blocks_fail_closed_without_any_insert_call``
+      会从"抛出"变红成"静默写了一次段落"；
+    - 把降级分支的 ``return WriteBodyOutcome(degraded_reason=error.code)`` 改回
+      ``return WriteBodyOutcome()``（正文降级了却不告诉调用方＝恢复成被明令禁止
+      的静默降级）——同一条用例的返回值断言会红；
+    - 把降级分支泛化成"转换/写入阶段的任何 ``FeishuDocxDeliveryError`` 都退回
+      段落路径"（去掉原因码过滤、并把 ``write_blocks`` 一起包进 ``try``）——
+      ``test_write_blocks_failure_is_never_retried_as_a_paragraph_write`` 会从
+      "只发生两次调用"变红成"第三次调用把同一份正文又写了一遍"。
+
+    **一条如实登记的边界**：单独把 ``try`` 的范围扩大到 ``write_blocks``、而
+    保留原因码过滤，用今天存在的错误码**观察不到差别**——``write_blocks`` 不会
+    抛 ``unsupported_nested_blocks``，过滤器照样把它挡在降级分支之外。窄
+    ``try`` 因此是一条**没有当下行为见证的纵深防线**（防的是"将来某一天写入端点
+    也开始返回这个码"），不是被上面任何一条用例钉住的性质；本类不假装它有变异
+    见证。真正被钉住的是上面那条泛化——它是这条防线在今天唯一可被证伪的形态。
+    """
 
     def test_default_disabled_calls_write_paragraphs_with_zero_convert_calls(self) -> None:
         """变异锚点：把 ``write_body`` 里 ``if self._markdown_convert_enabled``
@@ -863,8 +893,13 @@ class WriteBodySwitchTest(unittest.TestCase):
         transport = RecordingTransport([{"code": 0, "data": {}}])
         client = _client(transport)  # markdown_convert_enabled 默认 False
 
-        client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题\n\n第一段正文")
+        outcome = client.write_body(
+            DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题\n\n第一段正文"
+        )
 
+        # 开关关闭时走段落路径**不是降级**：这是这套部署本来就要求的排版。
+        self.assertFalse(outcome.degraded)
+        self.assertIsNone(outcome.degraded_reason)
         self.assertEqual(len(transport.calls), 1)
         method, url, body, _ = transport.calls[0]
         self.assertEqual(url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children")
@@ -909,8 +944,9 @@ class WriteBodySwitchTest(unittest.TestCase):
         )
         client = _client(transport, markdown_convert_enabled=True)
 
-        client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
+        outcome = client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
 
+        self.assertFalse(outcome.degraded)
         self.assertEqual(len(transport.calls), 2)
         convert_method, convert_url, convert_body, _ = transport.calls[0]
         self.assertEqual(convert_method, "POST")
@@ -930,8 +966,12 @@ class WriteBodySwitchTest(unittest.TestCase):
         )
 
     def test_enabled_convert_failure_fails_closed_without_falling_back_to_paragraphs(self) -> None:
-        """开关打开时 convert 调用失败必须失败关闭，绝不静默退回纯文本段落
-        路径——只应该看到一次 convert 调用，看不到任何 children 插入调用。"""
+        """开关打开时 convert 收到飞书业务错误码必须失败关闭，绝不退回纯文本段落
+        路径——只应该看到一次 convert 调用，看不到任何 children 插入调用。
+
+        Issue #499 只放行 ``unsupported_nested_blocks`` 一个码；限流一类的业务
+        错误码**不是**降级理由（它可能重试就好了，降级会把一次瞬时故障固化成
+        一份排版更差的文档）。"""
 
         transport = RecordingTransport([{"code": 99991400, "msg": "rate limited"}])
         client = _client(transport, markdown_convert_enabled=True)
@@ -941,6 +981,116 @@ class WriteBodySwitchTest(unittest.TestCase):
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(len(transport.calls), 1)
+
+    def test_enabled_unsupported_nested_blocks_degrades_to_the_paragraph_path(self) -> None:
+        """Issue #499 的核心用例：转换端点返回一个含嵌套结构的响应（典型是
+        markdown 表格——单元格作为独立元素出现在 ``blocks`` 里、却不在
+        ``first_level_block_ids`` 内），``convert_markdown_to_blocks`` 因此抛
+        ``unsupported_nested_blocks``。
+
+        期望：**不再整次失败**——改用 ``write_paragraphs`` 把 ``paragraphs``
+        写进同一篇文档（第二次调用就是 children 插入端点，且正文来自段落而不是
+        转换结果），并在返回值里明示这次降级了、为什么降级。
+        """
+
+        table_block = {
+            "block_id": "blk-table",
+            "block_type": 31,
+            "table": {"column_size": 2, "row_size": 2},
+        }
+        # 单元格：出现在 blocks 数组里、但不在 first_level_block_ids 内——这正是
+        # 真实响应里表格的形状（Issue #442 探针实测口径）。
+        cell_block = {"block_id": "blk-table-cell-1", "block_type": 32}
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [table_block, cell_block],
+                        "first_level_block_ids": ["blk-table"],
+                    },
+                },
+                {"code": 0, "data": {}},
+            ]
+        )
+        client = _client(transport, markdown_convert_enabled=True)
+
+        outcome = client.write_body(
+            DOCUMENT_ID,
+            paragraphs=["公司 指标 数值", "| --- | --- | --- |"],
+            markdown="| 公司 | 指标 | 数值 |\n| --- | --- | --- |",
+        )
+
+        self.assertTrue(outcome.degraded)
+        self.assertEqual(outcome.degraded_reason, "unsupported_nested_blocks")
+        self.assertEqual(len(transport.calls), 2, "一次 convert（被拒）＋一次段落写入")
+        _, convert_url, _, _ = transport.calls[0]
+        self.assertEqual(convert_url, f"{BASE_URL}/docx/v1/documents/blocks/convert")
+        _, write_url, write_body, _ = transport.calls[1]
+        self.assertEqual(
+            write_url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/children"
+        )
+        # 写进去的必须是段落路径的产物（纯文本 block_type=2），不是转换响应里的
+        # 任何块——降级的含义就是"改用另一条既有路径重写一遍"。
+        self.assertEqual(
+            write_body["children"],
+            [
+                {"block_type": 2, "text": {"elements": [{"text_run": {"content": "公司 指标 数值"}}]}},
+                {
+                    "block_type": 2,
+                    "text": {"elements": [{"text_run": {"content": "| --- | --- | --- |"}}]},
+                },
+            ],
+        )
+
+    def test_enabled_other_definite_codes_still_fail_closed_without_degrading(self) -> None:
+        """降级的捕获范围必须窄到一个码：``first_level_block_ids`` 缺失是另一条
+        确定性拒绝（响应形状不对，不是"内容含不支持的结构"），必须原样上抛，
+        **不得**被降级分支顺手吞掉——泛化成"捕获所有异常都降级"会把真实故障
+        伪装成交付成功。"""
+
+        transport = RecordingTransport(
+            [{"code": 0, "data": {"blocks": [{"block_id": "blk-1", "block_type": 2}]}}]
+        )
+        client = _client(transport, markdown_convert_enabled=True)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
+
+        self.assertEqual(raised.exception.code, "markdown_convert_missing_first_level_block_ids")
+        self.assertEqual(len(transport.calls), 1, "不该降级，因此不该发生任何段落写入")
+
+    def test_write_blocks_failure_is_never_retried_as_a_paragraph_write(self) -> None:
+        """``write_blocks`` 一旦发起就有副作用，它的失败**绝不能**触发一次段落
+        路径重写，否则同一份正文会在同一篇文档里被写两遍。
+
+        这里让转换成功、插入端点返回业务错误码：期望原样上抛，且总调用数停在
+        两次（convert + 失败的插入），没有第三次段落写入。
+
+        **这条用例守的是"降级不得泛化"，不是"``try`` 写得窄"**（见本类文档
+        末尾那条边界登记）：把降级分支改成"任何 ``FeishuDocxDeliveryError`` 都
+        退回段落路径"并把 ``write_blocks`` 一起包进 ``try`` 时，这里会出现第三
+        次调用而变红；只把 ``try`` 范围放宽、保留原因码过滤则观察不到差别——
+        窄 ``try`` 是面向未来的纵深防线，没有当下的行为见证。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [{"block_id": "blk-1", "block_type": 2}],
+                        "first_level_block_ids": ["blk-1"],
+                    },
+                },
+                {"code": 99991400, "msg": "rate limited"},
+            ]
+        )
+        client = _client(transport, markdown_convert_enabled=True)
+
+        with self.assertRaises(FeishuDocxDeliveryError):
+            client.write_body(DOCUMENT_ID, paragraphs=["第一段正文"], markdown="# 标题")
+
+        self.assertEqual(len(transport.calls), 2, "插入失败后绝不能再写一次段落")
 
     def test_enabled_over_cap_blocks_fail_closed_without_any_insert_call(self) -> None:
         oversized_blocks = [

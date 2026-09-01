@@ -44,15 +44,10 @@ name: lingxi
 # 方式见 deploy/README.md 同一节。
 #
 # **结构在这份基线文件里统一定义、数值分环境覆盖**：每个服务的三项限制都写成
-# `${LINGXI_<SERVICE>_{MEM,CPU,PIDS}_LIMIT:-<安全默认值>}`，基线的默认值等于
-# 生产档（与 LINGXI_SCHEDULER_INTERVAL_SECONDS 的既有写法同一惯例：基线默认值
-# 取更保守/更宽松的那一档，避免漏挂 --env-file 时退化成一个明显偏紧、可能杀死
-# 正常负载的数值）；`compose.stage.yaml`/`compose.prod.yaml` 用同一个变量名各自
-# 覆盖成本环境的建议值。**数值必须分环境**：stage 主机只有 2 核 / 3.7GiB 内存，
-# 按生产档（worker 类 8–16GB）配置会在 stage 上直接顶穿物理内存；反过来照抄 stage
-# 的紧张预算去配生产，会在真实负载下把 worker-queue 的 Agent SDK 回合（Claude CLI
-# + 多个 MCP 子进程）系统性地杀掉——这是本轮设计里判定"比限制偏松更严重"的错误，
-# 因此 pids 一项尤其不能照抄 stage 的量级。
+# `${LINGXI_<SERVICE>_{MEM,CPU,PIDS}_LIMIT:-<安全默认值>}`，worker-queue 的默认值
+# 与当前已批准的 stage/production worker-queue 合同一致；覆盖文件仍可为其他服务
+# 提供各自环境值。生产的 worker-queue 资源变量在 `compose.prod.yaml` 中改为
+# `${VAR:?}` 外部配置门，不能靠这里的默认值绕过主机规格确认。
 #
 # 门禁只核对结构（`scripts/ci/check_deploy_contract.py` 的 `check_resource_limits`）：
 # 六个服务是否都声明了这三项键，不核对具体数值——具体数值是产品/容量判断，不是
@@ -297,6 +292,9 @@ services:
 
     environment:
       LINGXI_WORKER_MODE: queue
+      # Issue #496：产品执行并发硬上限为 4。stage 覆盖显式固定同值；prod 使用
+      # `${LINGXI_WORKER_MAX_CONCURRENCY:?}` 外部 env 门，避免真实生产漂移。
+      LINGXI_WORKER_MAX_CONCURRENCY: "${LINGXI_WORKER_MAX_CONCURRENCY:-4}"
 
     # ---- 停止宽限期（Issue #153；apps/worker/config.py 的
     # DEFAULT_SHUTDOWN_TIMEOUT_SECONDS 头部注释有完整推导）----------------------
@@ -321,14 +319,28 @@ services:
 
     user: "10001:10001"
     read_only: true
+    # ---- /tmp 容量（Issue #494）------------------------------------------------
+    # **这是一块内存盘，写满即占用等量宿主内存**，不是磁盘。镜像把 HOME 指到 /tmp，
+    # Agent 会话转录写在 $HOME/.claude/projects 下：rc22 收尾批 S-12 浸泡实测，
+    # 容器接负载约 45 分钟就把 256MB 写满（32 份转录、单份最大 15MB），而当时
+    # 健康检查一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页。
+    # 三条一起才算修好，缺一条都会让这个故障重新变得静默：
+    #   ① 常规回收：apps/worker/session_cleanup.py 的 reclaim_session_transcripts
+    #      按字节预算删最旧的（此前只有 /new、权限刷新等触发点排队才会删）；
+    #   ② 分环境显式上限：就是这一行，值由 LINGXI_WORKER_QUEUE_TMPFS_SIZE 决定，
+    #      stage/prod 各自在自己的覆盖文件里显式声明，不许沿用基线默认——由
+    #      scripts/ci/check_deploy_contract.py 的 check_worker_tmpfs_capacity 守住；
+    #   ③ 健康检查看得见这块盘：lingxi.apps.healthcheck 增加可用空间判定。
+    # 基线这个 256m 默认值只是"漏挂 --env-file 时不至于更糟"的兜底，不是任何一个
+    # 环境的部署档；真正生效的值来自覆盖文件。
     tmpfs:
-      - /tmp:mode=1777,size=256m
+      - /tmp:mode=1777,size=${LINGXI_WORKER_QUEUE_TMPFS_SIZE:-256m}
     security_opt:
       - no-new-privileges:true
 
     # ---- 资源限制（结构见文件头部说明，数值见 deploy/README.md）--------------
-    # 这是六个服务里唯一直接对应架构设计「九、容量与资源」worker 内存估算
-    # （峰值并发任务 × 单任务内存 = 8–16GB）的服务：常驻领取真实用户任务，
+    # 这是六个服务里唯一直接对应架构设计「九、容量与资源」worker 内存估算的服务：
+    # 常驻领取真实用户任务，
     # 一个容器内同时装下 LINGXI_WORKER_MAX_CONCURRENCY 个并发 Agent SDK 回合，
     # 每个回合各自的 Claude CLI 子进程与多个 MCP 子进程都算在这一个容器的
     # cgroup 里。pids 限制尤其不能照抄 worker（一次性 job）或其余服务的量级
@@ -336,9 +348,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-4.0}"
-          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-16G}
-          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-4096}
+          cpus: "${LINGXI_WORKER_QUEUE_CPU_LIMIT:-1.5}"
+          memory: ${LINGXI_WORKER_QUEUE_MEM_LIMIT:-2G}
+          pids: ${LINGXI_WORKER_QUEUE_PIDS_LIMIT:-512}
 
     logging:
       driver: json-file

@@ -556,6 +556,46 @@ class QueryUserCommandTests(unittest.TestCase):
         self.assertNotIn(long_reason, outcome.reply_text, "reason 不得回显全文")
         self.assertNotIn("无本地覆盖", outcome.reply_text)
 
+    def test_user_with_position_group_overrides_shows_one_group_item(self) -> None:
+        group_id = "lpg_01M1C90YDGMTY567GDTZZJ4C5E"
+        overrides = tuple(
+            LocalPermissionOverrideView(
+                override_id=f"lpo_{index}",
+                direction="grant",
+                company_id=f"c{index}",
+                metric_name=f"metric_{index}",
+                reason="职位范围特批",
+                created_at="2026-08-24T00:00:00+00:00",
+                position_name="A运营",
+                company_scope="*",
+                group_id=group_id,
+            )
+            for index in range(3)
+        )
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=3,
+                    updated_at="2026-08-24T00:00:00+00:00",
+                    local_overrides=overrides,
+                )
+            }
+        )
+        router, _, _, _ = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_target", trace_id="t1"
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.reply_text.count("覆盖 3 项权限"), 1)
+        self.assertIn("职位 A运营", outcome.reply_text)
+        self.assertIn("公司范围 全部", outcome.reply_text)
+        self.assertNotIn("metric_0", outcome.reply_text)
+
     def test_a_user_with_local_overrides_no_longer_carries_the_zero_galaxy_permission_caveat(
         self,
     ) -> None:
@@ -872,7 +912,11 @@ class QueryTraceCommandTests(unittest.TestCase):
 
     def test_trace_without_failure_reason_reported_honestly(self) -> None:
         """追溯号存在（例如成功开通、或仍在进行中）但没有失败记录：如实回
-        「无失败记录」并带上能查到的开通状态，不是假装这条追溯号也查无此人。"""
+        「无开通失败记录」并带上能查到的开通状态，不是假装这条追溯号也查无此人。
+
+        Issue #495 起这句话由「无失败记录」改成「无开通失败记录」：同一条回复
+        里现在可能同时出现"开通没失败"与"问数任务失败了"，旧措辞会与紧随其后
+        的「任务结果: 失败」直接打架。"""
 
         trace_id = new_ulid()
         queries = FakeQueries(
@@ -899,7 +943,7 @@ class QueryTraceCommandTests(unittest.TestCase):
         )
 
         self.assertTrue(outcome.handled)
-        self.assertIn("无失败记录", outcome.reply_text)
+        self.assertIn("无开通失败记录", outcome.reply_text)
         # Trace #469 S-1：英文状态码翻译成中文。
         self.assertIn("已开通", outcome.reply_text)
         self.assertNotIn("查无此追溯号", outcome.reply_text)
@@ -1006,6 +1050,157 @@ class QueryTraceCommandTests(unittest.TestCase):
         self.assertIn(
             "some_future_value_not_yet_registered（未登记显示名）", outcome.reply_text
         )
+
+    def _trace_view(self, trace_id: str, **overrides: object) -> AdminTraceView:
+        values: dict[str, object] = {
+            "trace_id": trace_id,
+            "event_count": 1,
+            "first_received_at": "2026-08-31T01:00:00+00:00",
+            "last_event_type": "im.message.receive_v1",
+            "last_handled_as": "task_queued",
+            "dispatched": True,
+            "provisioning_state": "active",
+            "account_state": "enabled",
+            "failure_reason": None,
+            "failure_event_type": None,
+            "failure_occurred_at": None,
+        }
+        values.update(overrides)
+        return AdminTraceView(**values)  # type: ignore[arg-type]
+
+    def _trace_reply(self, **overrides: object) -> str:
+        trace_id = new_ulid()
+        queries = FakeQueries(traces={trace_id: self._trace_view(trace_id, **overrides)})
+        router, _, _, _ = _router(queries=queries)
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin trace {trace_id}", trace_id="t1"
+        )
+        self.assertTrue(outcome.handled)
+        return outcome.reply_text
+
+    def test_task_failure_is_reported_with_a_readable_reason_and_the_exception_type(
+        self,
+    ) -> None:
+        """Issue #495 完成标准 4：管理员凭追溯号就能拿到「这次问数为什么失败」的
+        可读原因，不必再去检索 worker 容器日志（他根本没有那个权限）。
+
+        翻译口径与 Trace #469 修复包 B 一致：状态与失败码换中文，底层异常
+        **类型名**原样展示（第三方库类名没有可枚举取值域，翻译只能靠猜；原样
+        贴给研发就是最有用的一手信息）。
+
+        **变异验红**（已实测）：删掉 ``_render_trace`` 里
+        ``trace.task_status is not None`` 那一段，本用例由绿转红。恢复后复绿。"""
+
+        reply = self._trace_reply(
+            task_status="failed",
+            task_error_kind="session_failed",
+            task_failure_code="session_failed",
+            task_failure_signature="psycopg.errors.OperationalError",
+            task_ended_at="2026-08-31T01:02:03+00:00",
+        )
+
+        self.assertIn("任务结果: 失败", reply)
+        self.assertIn("2026-08-31T01:02:03+00:00", reply)
+        self.assertIn("会话执行失败（未分类，见底层异常）", reply)
+        self.assertIn("psycopg.errors.OperationalError", reply)
+
+    def test_query_mcp_502_has_a_distinct_trace_reason_and_signature(self) -> None:
+        reply = self._trace_reply(
+            task_status="failed",
+            task_error_kind="mcp_bad_gateway",
+            task_failure_code="mcp_bad_gateway",
+            task_failure_signature="mcp.query.http_502",
+        )
+
+        self.assertIn("指标 MCP 网关返回 502（建连失败）", reply)
+        self.assertIn("失败签名: mcp.query.http_502", reply)
+        self.assertIn("mcp.query.http_502", reply)
+
+    def test_a_trace_without_any_task_omits_the_task_section_entirely(self) -> None:
+        """否定测试：这条追溯号没有派生任务（管理命令、未开通用户、重复投递都
+        不入队）时整段省略，不摆一排空值——否则上一条用例用一个恒真实现也能过。"""
+
+        reply = self._trace_reply()
+
+        self.assertNotIn("任务结果", reply)
+        self.assertNotIn("任务失败原因", reply)
+        self.assertNotIn("底层异常类型", reply)
+
+    def test_a_successful_task_shows_its_status_without_inventing_a_failure(self) -> None:
+        """成功的任务只展示状态：``failure_code``/``failure_signature`` 在这种
+        终态下本来就是 ``NULL``（迁移 ``0080`` 的精确语义），不得凭空补一行
+        「失败原因」。"""
+
+        reply = self._trace_reply(task_status="succeeded", task_ended_at="2026-08-31T01:02:03+00:00")
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertNotIn("任务失败原因", reply)
+        self.assertNotIn("底层异常类型", reply)
+
+    def test_a_failure_without_a_failure_code_falls_back_to_the_error_kind(self) -> None:
+        """没有经过 ``write_terminal_event`` 的失败终态（心跳超时回收、投递到期、
+        排队超时，写入方是 ``_queue_lifecycle.py``）在 ``failure_code`` 列上恒为
+        ``NULL``——回显必须退回 ``error_kind``，不能因此整行消失、让管理员看到
+        一个没有任何原因的「任务结果: 失败」。
+
+        **变异验红**（已实测）：把 ``_render_trace`` 里的
+        ``trace.task_failure_code or trace.task_error_kind`` 改回只看
+        ``task_failure_code``，本用例由绿转红。恢复后复绿。"""
+
+        reply = self._trace_reply(
+            task_status="failed", task_error_kind="retry_exhausted", task_failure_code=None
+        )
+
+        self.assertIn("任务失败原因: 重试次数耗尽", reply)
+
+    def test_an_unregistered_task_failure_code_falls_back_to_the_visible_marker(self) -> None:
+        """未登记的失败码（未来新增但词表忘了同步）走与本文件其余词表同一条
+        回退：原值 + 「未登记显示名」，不崩、不假装认识。"""
+
+        reply = self._trace_reply(
+            task_status="failed", task_failure_code="some_future_failure_code"
+        )
+
+        self.assertIn("some_future_failure_code（未登记显示名）", reply)
+
+    def test_document_delivery_degradation_is_reported_separately_from_task_success(
+        self,
+    ) -> None:
+        """Issue #499：任务成功不等于文档正文按官方排版成功。
+
+        ``body_degraded_reason`` 从文档投递检查点读出后，管理员凭同一个追溯号应
+        能看到「文档成功但正文已降级」及可读原因；不能只展示 task 的成功状态，
+        也不能把降级静默成普通文档成功。
+
+        **变异验红**：删掉 ``_render_trace`` 的文档投递段落，或把降级字段改成
+        恒为空，本用例的两条断言都应变红；恢复后复绿。
+        """
+
+        reply = self._trace_reply(
+            task_status="succeeded",
+            document_delivery_status="succeeded",
+            document_body_degraded_reason="unsupported_nested_blocks",
+        )
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertIn("文档交付结果: 成功", reply)
+        self.assertIn("文档正文处理: 已降级", reply)
+        self.assertIn("正文含暂不支持的嵌套结构", reply)
+
+    def test_document_delivery_failure_is_reported_when_task_itself_succeeded(self) -> None:
+        """文档消费是独立状态机：问数任务成功但文档明确失败时，``/admin trace``
+        仍应如实显示文档失败及其原因，不能拿 task 的成功状态遮住用户未拿到文档
+        这一事实。"""
+
+        reply = self._trace_reply(
+            task_status="succeeded",
+            document_delivery_status="failed",
+            document_delivery_last_error="permission_not_confirmed",
+        )
+
+        self.assertIn("任务结果: 成功", reply)
+        self.assertIn("文档交付结果: 失败", reply)
+        self.assertIn("文档交付原因: 授权结果未能读回确认", reply)
 
     def test_non_admin_is_rejected_and_produces_zero_trace_calls(self) -> None:
         """否定断言：非管理员发 `/admin trace` 被拒绝，且不触发任何下游查询
@@ -2028,6 +2223,160 @@ class RevokePermissionShapeTwoDispatchTests(unittest.TestCase):
         # 未通过身份判定，压根不会走到反查这一步。
         self.assertEqual(queries.resolve_override_calls, [])
         self.assertEqual(pending_actions.prepare_calls, [])
+
+
+#: 一个只出现在测试里的公开形态邮箱（协作约定：夹具不得出现真实内部标识）。
+_LINK_TEST_EMAIL = "someone@example.com"
+
+
+class LinkifiedEmailRoutingTests(unittest.TestCase):
+    """Issue #492：链接化的邮箱在**整条路由**上走通，不只在解析器里。
+
+    现场：产品负责人 2026-08-31 真人操作，输入的邮箱被飞书编辑器自动转成了
+    ``mailto:`` 链接，连续三条命令都只收到"未识别的管理命令"。裁定原话：
+    **不能因为带了 mailto 就未识别**。
+    """
+
+    def test_markdown_linkified_email_reaches_the_query_with_the_bare_address(self) -> None:
+        queries = FakeQueries(
+            users={
+                "ou_target": AdminUserStatusView(
+                    identifier="ou_target",
+                    provisioning_state="active",
+                    account_state="enabled",
+                    permission_version=1,
+                    updated_at="2026-08-31T00:00:00+00:00",
+                )
+            },
+            identifier_aliases={_LINK_TEST_EMAIL: "ou_target"},
+        )
+        router, _, _, audit = _router(queries=queries)
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text=f"/admin user [{_LINK_TEST_EMAIL}](mailto:{_LINK_TEST_EMAIL})",
+            trace_id="t1",
+        )
+
+        self.assertTrue(outcome.handled)
+        # 反查拿到的是裸邮箱（链接外壳已在解析层剥掉），查询拿到的是反查后的 open_id。
+        self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
+        self.assertEqual(queries.user_calls, ["ou_target"])
+        self.assertEqual(audit.actions(), ["admin.command.query_user"])
+
+    def test_bare_mailto_scheme_also_reaches_the_query(self) -> None:
+        """``mailto:a@b.com`` 此前不落 UNKNOWN（``:`` 本来就在字符集里），而是被
+        当成标识原样送去反查、查无此人——同一缺陷更隐蔽的一副面孔。"""
+
+        queries = FakeQueries(identifier_aliases={_LINK_TEST_EMAIL: "ou_target"})
+        router, _, _, _ = _router(queries=queries)
+
+        router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin user mailto:{_LINK_TEST_EMAIL}", trace_id="t1"
+        )
+
+        self.assertEqual(queries.resolve_identifier_calls, [_LINK_TEST_EMAIL])
+
+    def test_unsupported_link_forms_stop_before_identifier_resolution(self) -> None:
+        """#492 的收窄边界在路由层也要保持 fail closed：不把链接化 open_id、
+        不一致目标或任意 URL 送到 ``resolve_identifier``/下游查询。"""
+
+        unsupported = (
+            f"/admin user <{_LINK_TEST_EMAIL}>",
+            f"/admin user `{_LINK_TEST_EMAIL}`",
+            f"/admin user [ou_abc123](mailto:ou_abc123)",
+            f"/admin user [seen@example.com](mailto:{_LINK_TEST_EMAIL})",
+            f"/admin user [{_LINK_TEST_EMAIL}](https://example.com/user)",
+        )
+        for text in unsupported:
+            with self.subTest(text=text):
+                router, _, queries, audit = _router()
+                outcome = router.route(open_id=ADMIN_OPEN_ID, text=text, trace_id="t1")
+
+                self.assertTrue(outcome.handled)
+                self.assertIn("用户标识", outcome.reply_text)
+                self.assertEqual(queries.resolve_identifier_calls, [])
+                self.assertEqual(queries.user_calls, [])
+                self.assertEqual(audit.actions(), ["admin.command.unknown"])
+
+
+class SegmentedUnknownReplyTests(unittest.TestCase):
+    """Issue #492 完成标准 4：解析失败时说清**哪一段**没看懂。
+
+    "未识别的管理命令，请发送 /admin help 查看可用命令"这句话不含任何可据以修正的
+    信息——产品负责人连踩三次时，无法判断是邮箱被客户端链接化了（假设 1）还是公司
+    那一段填了中文名（假设 2），两种情形此前产生**逐字相同**的回复。
+    """
+
+    def test_chinese_company_name_reply_names_the_company_segment(self) -> None:
+        """假设 2 的自救出口：公司参数期望公司编号，输中文名被拒是**正确行为**
+        （不放宽字符集去接受 CJK，那是语义变更）——缺陷只在于没说清楚。"""
+
+        router, _, queries, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID,
+            text="/admin grant_permission ou_target 一零一一 daily_active 特批",
+            trace_id="t1",
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertIn("公司标识", outcome.reply_text)
+        self.assertIn("公司编号", outcome.reply_text)
+        self.assertEqual(queries.user_calls, [])
+        self.assertEqual(audit.actions(), ["admin.command.unknown"])
+        self.assertEqual(audit.records[0][1]["reject_reason"], "bad_company_id")
+
+    def test_unparseable_identifier_reply_names_the_identifier_segment(self) -> None:
+        router, _, _, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin user ou_a;b", trace_id="t1"
+        )
+
+        self.assertIn("用户标识", outcome.reply_text)
+        self.assertEqual(audit.records[0][1]["reject_reason"], "bad_identifier")
+
+    def test_unknown_subcommand_reply_names_the_command_name_segment(self) -> None:
+        router, _, _, audit = _router()
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text="/admin delete_user ou_1", trace_id="t1"
+        )
+
+        self.assertIn("命令名", outcome.reply_text)
+        self.assertEqual(audit.records[0][1]["reject_reason"], "unknown_subcommand")
+
+    def test_plain_chat_text_keeps_the_generic_reply_word_for_word(self) -> None:
+        """不误伤（完成标准 3）：管理命令面**没有 ``/admin`` 前缀预检**，已登记
+        管理员发的任何一句闲聊都会走到 UNKNOWN 分支。对这些输入做分段报错等于对
+        每句闲聊解释命令语法——既有那句笼统文案逐字保留。"""
+
+        router, _, _, audit = _router()
+
+        outcome = router.route(open_id=ADMIN_OPEN_ID, text="不知道说什么", trace_id="t1")
+
+        self.assertEqual(outcome.reply_text, "未识别的管理命令，请发送 /admin help 查看可用命令。")
+        self.assertEqual(audit.records[0][1]["reject_reason"], "not_a_command")
+
+    def test_the_reply_never_echoes_the_admin_input(self) -> None:
+        """否定断言：分段报错只说段名与期望形状，**不回显输入原文**。
+
+        出站是一条飞书文本消息，飞书文本消息里的 ``<at user_id="all"></at>`` 一类
+        标记是有语义的；把输入拼进回复等于把一段可控文本反射进出站消息。段名 +
+        期望形状已经够自救，不值得为这点便利开一个反射面。
+        """
+
+        router, _, _, _ = _router()
+        payload = "ou_a;;;;<at></at>"
+
+        outcome = router.route(
+            open_id=ADMIN_OPEN_ID, text=f"/admin user {payload}", trace_id="t1"
+        )
+
+        self.assertNotIn(payload, outcome.reply_text)
+        self.assertNotIn(";;;;", outcome.reply_text)
+        self.assertNotIn("<at", outcome.reply_text)
 
 
 if __name__ == "__main__":  # pragma: no cover

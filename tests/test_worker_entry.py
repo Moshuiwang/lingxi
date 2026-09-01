@@ -574,6 +574,79 @@ class WorkerWiringTest(unittest.TestCase):
 
         self.assertEqual(report["failure"]["code"], "session_failed")
 
+    def test_the_unclassified_fallback_records_a_stable_signature(self) -> None:
+        """Issue #495：``turn.py`` 那条兜底 ``except`` 分支（把任何未分类的 SDK
+        异常收敛成 ``session_failed`` 一个词）必须在报告里额外留下底层异常的
+        **稳定签名**——它是 queue 链路唯一会进低敏审计日志与 ``task`` 落库列的
+        那一段，也是 2026-08-31 浸泡窗口里 6 条无法归因失败缺的那条线索。签名
+        只保留固定类别和不可逆摘要，不把动态类型原文写入报告。
+
+        分类结论本身**不变**（仍是 ``session_failed``，用户可见文案因此逐字
+        不变），变的只是"还留不留得下线索"。
+
+        **变异验红**（已实测）：把 ``report_extraction.failure_with_signature``
+        的返回值去掉 ``"signature"`` 这一项（``turn.py::_failure`` 就是它的调用
+        方之一），本用例由绿转红。恢复后复绿。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        signatures = []
+        for error in (
+            RuntimeError("connection reset by peer"),
+            OSError("[Errno 28] No space left on device"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+                sdk.raise_after_steps = error
+                sdk.install(self)
+
+                executor = WorkerTurnExecutor(load_config(worker_env()))
+                report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+                self.assertEqual(report["failure"]["code"], "session_failed")
+                signature = report["failure"]["signature"]
+                self.assertRegex(
+                    signature,
+                    r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+                )
+                signatures.append(signature)
+
+        self.assertEqual(len(set(signatures)), 2, f"两种底层异常必须可区分，实际={signatures}")
+
+    def test_the_signature_carries_the_type_only_never_the_exception_text(self) -> None:
+        """Issue #495 完成标准 2：异常正文里的外部标识原值不得随签名外流。
+
+        样式取真实形状（psycopg 唯一约束冲突的异常串），与 rc22 opus 审查 P2-5
+        对 ``event.pipeline_failed`` 的处置同一口径——``failure.message`` 那一份
+        是既有行为（只在 turn 模式的 stdout 报告里，经 ``redact_free_text``），
+        本条断言守的是**新增**的 ``signature`` 字段：它是唯一会离开 worker 进程
+        进入日志与数据库的那一段，必须只含固定类别与不可逆摘要。
+
+        **变异验红**（已实测）：让 ``exception_failure_signature`` 返回
+        ``f"{type(error).__name__}: {error}"``，本用例由绿转红。恢复后复绿。
+        """
+
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        sdk = FakeAgentSDK([{"kind": "text", "text": "半截"}])
+        sdk.raise_after_steps = RuntimeError(
+            'duplicate key value violates unique constraint "app_user_feishu_open_id_key"\n'
+            "DETAIL:  Key (feishu_open_id)=(ou_fake0123456789) already exists."
+        )
+        sdk.install(self)
+
+        executor = WorkerTurnExecutor(load_config(worker_env()))
+        report = asyncio.run(executor.run_turn("查一下频道收视率"))
+
+        self.assertRegex(
+            report["failure"]["signature"],
+            r"^exception\.(builtin|database|http|sdk|runtime|external)\.[0-9a-f]{40}$",
+        )
+        self.assertNotIn("ou_fake0123456789", report["failure"]["signature"])
+
 
 class SessionResumeFallbackTest(unittest.TestCase):
     """会话 resume 失配自动降级（2026-08-27 生产事故 #2）。
@@ -1205,6 +1278,28 @@ class WorkerConfigTest(unittest.TestCase):
         from lingxi.apps.worker.config import load_config
 
         return load_config(worker_env(**overrides))
+
+    def test_worker_queue_concurrency_defaults_to_the_approved_hard_limit(self) -> None:
+        config = self._load()
+        self.assertEqual(config.max_concurrency, 4)
+
+    def test_worker_queue_concurrency_rejects_values_above_the_hard_limit(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            self._load(LINGXI_WORKER_MAX_CONCURRENCY="5")
+
+    def test_direct_worker_config_also_rejects_values_above_the_hard_limit(self) -> None:
+        from lingxi.apps.worker.config import WorkerConfig, WorkerConfigError
+
+        with self.assertRaises(WorkerConfigError):
+            WorkerConfig(
+                question="q",
+                read_only_tools=(READ_ONLY_TOOL,),
+                trace_id="01J0000000000000000TEST000",
+                turn_timeout_seconds=60.0,
+                max_concurrency=5,
+            )
 
     def test_missing_question_fails_with_a_named_variable(self) -> None:
         from lingxi.apps.worker.config import WorkerConfigError, load_config
@@ -2805,6 +2900,64 @@ class McpStatusAuditTest(unittest.TestCase):
 
         self.assertIsNone(report["failure"])
         self.assertEqual(events, [])
+
+    def test_query_http_502_is_a_dedicated_failure_without_retry(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "HTTP 502 Bad Gateway"},
+                ]
+            }
+        )
+
+        self.assertEqual(report["failure"]["code"], "mcp_bad_gateway")
+        self.assertEqual(report["failure"]["signature"], "mcp.query.http_502")
+        self.assertFalse(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1)
+        self.assertEqual(len(fake.options), 1, "502 建连失败不得进入 resume/自动重试")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["server"], "query")
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn("502", events[0]["error"])
+
+    def test_non_query_502_and_query_non_502_keep_existing_success_semantics(self) -> None:
+        report, fake, events = self._run(
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "HTTP 503 Service Unavailable"},
+                    {"name": "billing", "status": "failed", "error": "HTTP 502 Bad Gateway"},
+                ]
+            }
+        )
+
+        self.assertIsNone(report["failure"])
+        self.assertTrue(report["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 1)
+        self.assertEqual({event["server"] for event in events}, {"query", "billing"})
+
+    def test_bad_gateway_signal_is_reset_between_turns(self) -> None:
+        from lingxi.apps.worker.config import load_config
+        from lingxi.apps.worker.turn import WorkerTurnExecutor
+
+        fake = FakeAgentSDK(
+            [{"kind": "text", "text": "日活 1024。"}],
+            mcp_status={
+                "mcpServers": [
+                    {"name": "query", "status": "failed", "error": "status=502"},
+                ]
+            },
+        ).install(self)
+        config = load_config(worker_env())
+        executor = WorkerTurnExecutor(config)
+
+        first = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-reset"))
+        fake.mcp_status = {"mcpServers": [{"name": "query", "status": "connected"}]}
+        second = asyncio.run(executor.run_turn(config.question, task_id="tsk-mcp-reset-2"))
+
+        self.assertEqual(first["failure"]["code"], "mcp_bad_gateway")
+        self.assertIsNone(second["failure"])
+        self.assertTrue(second["turn"]["closed"])
+        self.assertEqual(fake.mcp_status_calls, 2)
 
     def test_pending_and_disabled_are_not_treated_as_failures(self) -> None:
         """G-2 已知边界：`pending`（慢连接、`__aenter__()` 返回时还没到终态）与

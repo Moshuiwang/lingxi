@@ -19,6 +19,10 @@ jobs:
     timeout-minutes: 3
     outputs:
       mode: ${{ steps.changes.outputs.mode }}
+      risk_level: ${{ steps.changes.outputs.risk_level }}
+      docs_changed: ${{ steps.changes.outputs.docs_changed }}
+      l1_changed: ${{ steps.changes.outputs.l1_changed }}
+      l3_changed: ${{ steps.changes.outputs.l3_changed }}
       worker_changed: ${{ steps.changes.outputs.worker_changed }}
     steps:
       - name: 检出代码与比较基线
@@ -38,7 +42,7 @@ jobs:
   docs:
     name: Story / docs
     needs: classify
-    if: needs.classify.outputs.mode == 'docs'
+    if: needs.classify.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
@@ -53,7 +57,7 @@ jobs:
   fast:
     name: Story / code fast
     needs: classify
-    if: needs.classify.outputs.mode == 'fast'
+    if: needs.classify.outputs.mode == 'fast' && needs.classify.outputs.risk_level != 'l1'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -98,6 +102,28 @@ jobs:
       - name: 运行无真库、无镜像的仓库门禁
         run: scripts/ci/verify_repository.sh
 
+      - name: L1 资产版本锁与术语扫描（混合改动）
+        if: needs.classify.outputs.l1_changed == 'true'
+        run: python3 scripts/ci/check_l1_assets.py
+
+      - name: 校验门禁没有改写工作树
+        run: test -z "$(git status --porcelain)"
+
+  l1:
+    name: Story / content l1
+    needs: classify
+    if: needs.classify.outputs.risk_level == 'l1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 运行 L1 用户可见资产轻门禁
+        run: python3 scripts/ci/check_l1_assets.py
+
       - name: 校验门禁没有改写工作树
         run: test -z "$(git status --porcelain)"
 
@@ -109,7 +135,7 @@ jobs:
 
   story-result:
     name: Story Fast
-    needs: [classify, docs, fast, full]
+    needs: [classify, docs, l1, fast, full]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 3
@@ -117,8 +143,11 @@ jobs:
       - name: 汇总唯一适用的门禁
         env:
           MODE: ${{ needs.classify.outputs.mode }}
+          RISK_LEVEL: ${{ needs.classify.outputs.risk_level }}
+          DOCS_CHANGED: ${{ needs.classify.outputs.docs_changed }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
+          L1_RESULT: ${{ needs.l1.result }}
           FAST_RESULT: ${{ needs.fast.result }}
           FULL_RESULT: ${{ needs.full.result }}
         run: |
@@ -126,14 +155,19 @@ jobs:
             echo 'Story 路由失败' >&2
             exit 1
           fi
-          case "${MODE}" in
-            docs) selected=${DOCS_RESULT} ;;
+          if [ "${DOCS_CHANGED}" = true ] && [ "${DOCS_RESULT}" != success ]; then
+            echo "Story 文档门禁未通过：${DOCS_RESULT}" >&2
+            exit 1
+          fi
+          case "${RISK_LEVEL}" in
+            l0) selected=${DOCS_RESULT} ;;
+            l1) selected=${L1_RESULT} ;;
             fast) selected=${FAST_RESULT} ;;
-            full) selected=${FULL_RESULT} ;;
+            l2|l3|full) selected=${FULL_RESULT} ;;
             *) echo "未知 Story 路由：${MODE}" >&2; exit 1 ;;
           esac
           if [ "${selected}" != success ]; then
-            echo "Story ${MODE} 门禁未通过：${selected}" >&2
+            echo "Story ${RISK_LEVEL} 门禁未通过：${selected}" >&2
             exit 1
           fi
-          echo "Story ${MODE} 门禁：通过"
+          echo "Story ${RISK_LEVEL} 门禁：通过（兼容 mode=${MODE}）"

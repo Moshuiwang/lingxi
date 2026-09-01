@@ -438,7 +438,7 @@ def _group_chat_admin_command_payload(*, open_id: str) -> dict:
                 "chat_id": "oc_some_group",
                 "chat_type": "group",
                 "message_type": "text",
-                "content": '{"text": "/admin help"}',
+                "content": '{"text": "/admin user mailto:someone@example.com"}',
             },
         },
     }

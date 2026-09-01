@@ -17,9 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 面向 main 的纯文档 PR 不需要真库、extras 或镜像回归；但仍产出稳定的
-  # `Epic Full` required check。复用 Story 的路径分类器，避免在两处维护“什么是文档”。
-  # workflow_call / 手动运行一律走完整门禁，只有 main PR 才允许此轻量分支。
+  # 面向 main 的 PR，文档改动（包括 docs + L1 混合）都运行文档门禁；纯文档仍不需要
+  # 真库、extras 或镜像回归，并产出稳定的 `Epic Full` required check。复用 Story 的
+  # 路径分类器，避免在两处维护“什么是文档”。workflow_call / 手动运行一律走完整门禁，
+  # 只有 main PR 才允许此轻量分支。
   classify:
     name: Epic / classify
     if: github.event_name == 'pull_request'
@@ -27,6 +28,10 @@ jobs:
     timeout-minutes: 3
     outputs:
       mode: ${{ steps.changes.outputs.mode }}
+      risk_level: ${{ steps.changes.outputs.risk_level }}
+      docs_changed: ${{ steps.changes.outputs.docs_changed }}
+      l1_changed: ${{ steps.changes.outputs.l1_changed }}
+      l3_changed: ${{ steps.changes.outputs.l3_changed }}
       image_candidate: ${{ steps.image_candidate.outputs.value }}
     steps:
       - name: 检出代码与比较基线
@@ -73,7 +78,9 @@ jobs:
   docs:
     name: Epic Full / docs
     needs: [classify]
-    if: github.event_name == 'pull_request' && github.base_ref == 'main' && needs.classify.outputs.mode == 'docs'
+    if: >-
+      github.event_name == 'pull_request' && github.base_ref == 'main' &&
+      needs.classify.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
@@ -85,10 +92,32 @@ jobs:
       - name: 运行文档门禁
         run: scripts/ci/verify_docs.sh
 
+  l1:
+    name: Epic Full / l1
+    needs: [classify]
+    if: >-
+      github.event_name == 'pull_request' && github.base_ref == 'main' &&
+      needs.classify.outputs.risk_level == 'l1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 运行 L1 用户可见资产轻门禁
+        run: python3 scripts/ci/check_l1_assets.py
+
+      - name: 校验门禁没有改写工作树
+        run: test -z "$(git status --porcelain)"
+
   gate:
     name: Epic Full / gate
     needs: [classify]
-    if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
+    if: >-
+      github.event_name != 'pull_request' || github.base_ref != 'main' ||
+      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1')
     runs-on: ubuntu-24.04
     # 本机实测 Python 测试步骤 350s（≈5.8 分钟，679 条，含真库），已超原先的 5 分钟；
     # 而 runner 的波动系数实测可达 3 倍以上——#53 有过一次 90s 量级的工作被拖到 5 分钟
@@ -115,6 +144,60 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      # PR 内的 `.github/permission-impact-counts.json` 只是 biai-stage 声明；它不能
+      # 自称可信来源。可信绑定必须由受控 stage 在仓库外提供 hash registration。
+      # 当前仓库没有受保护 stage job/artifact/attestation 注入链，故该路径缺失时
+      # 明确失败并报告 PM 门；不新增 token、secret、OIDC 或 protected environment 权限。
+      - name: 准备权限影响面计数证明（L3，需仓库外 stage registration）
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        run: |
+          python3 scripts/ci/prepare_permission_impact_counts.py \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --repository "${GITHUB_WORKSPACE}" \
+            --manifest "${GITHUB_WORKSPACE}/.github/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --output "${RUNNER_TEMP}/permission-impact-counts.json"
+
+      - name: 生成权限影响面 diff（L3）
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        run: |
+          python3 scripts/ci/check_permission_impact.py \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "${{ github.event.pull_request.head.sha }}" \
+            --user-counts "${RUNNER_TEMP}/permission-impact-counts.json" \
+            --trusted-provenance "${RUNNER_TEMP}/permission-impact-provenance.json" \
+            --output "${RUNNER_TEMP}/permission-impact.json"
+
+      - name: 留存权限影响面与计数证明（L3）
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify.outputs.risk_level == 'l3' &&
+          needs.classify.outputs.l3_changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: permission-impact-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/permission-impact-counts.json
+            ${{ runner.temp }}/permission-impact-provenance.json
+            ${{ runner.temp }}/permission-impact.json
+          # 空的有效 surface 只由仓库静态事实推导 0，不会生成 provenance；非空
+          # surface 已在 prepare/check 中对缺 registration fail-closed。counts/report
+          # 若缺失则前置步骤已失败，因此这里允许仅缺少可选的空 diff registration。
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: L1 资产版本锁与术语扫描（混合高风险改动）
+        if: needs.classify.outputs.l1_changed == 'true'
+        run: python3 scripts/ci/check_l1_assets.py
 
       - name: 配置 Worker 校验运行时
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -197,7 +280,9 @@ jobs:
   extras:
     name: Epic Full / extras (${{ matrix.extra }})
     needs: [classify]
-    if: github.event_name != 'pull_request' || github.base_ref != 'main' || needs.classify.outputs.mode != 'docs'
+    if: >-
+      github.event_name != 'pull_request' || github.base_ref != 'main' ||
+      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1')
     runs-on: ubuntu-24.04
     # migrate 腿在争抢下实测过 4m32s（此前 bot-test 腿也曾 5 分钟触顶，该 extra 已随
     # #146 清退删除）。每条腿只做「干净环境装一个 extra + 导入校验」，8 分钟足够且
@@ -301,7 +386,7 @@ jobs:
     needs: [classify, gate, extras]
     if: >-
       github.event_name != 'pull_request' || github.base_ref != 'main' ||
-      (needs.classify.outputs.mode != 'docs' &&
+      (needs.classify.outputs.mode != 'docs' && needs.classify.outputs.risk_level != 'l1' &&
       (!startsWith(github.head_ref, 'epic/') || github.run_attempt != '1' ||
       needs.classify.outputs.image_candidate == 'true'))
     timeout-minutes: 45
@@ -485,7 +570,7 @@ jobs:
     name: Epic Full
     runs-on: ubuntu-24.04
     if: always()
-    needs: [classify, docs, gate, extras, image]
+    needs: [classify, docs, l1, gate, extras, image]
     timeout-minutes: 3
 
     steps:
@@ -496,19 +581,52 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           MODE: ${{ needs.classify.outputs.mode }}
+          RISK_LEVEL: ${{ needs.classify.outputs.risk_level }}
+          DOCS_CHANGED: ${{ needs.classify.outputs.docs_changed }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
+          L1_RESULT: ${{ needs.l1.result }}
           GATE_RESULT: ${{ needs.gate.result }}
           EXTRAS_RESULT: ${{ needs.extras.result }}
           IMAGE_RESULT: ${{ needs.image.result }}
         run: |
-          if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] && [ "${MODE}" = docs ]; then
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${CLASSIFY_RESULT}" != success ]; then
+            printf 'Epic 分类器未通过：%s\n' "${CLASSIFY_RESULT}" >&2
+            exit 1
+          fi
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${DOCS_CHANGED}" = true ] \
+             && [ "${DOCS_RESULT}" != success ]; then
+            # main PR 的 Epic Full / docs 应运行；epic/** -> main 的跟踪 PR 通过
+            # Story Fast / docs 覆盖文档，复用进来的 Epic Full / docs 按设计 skipped。
+            # Story Fast 的 story-result 另行要求 caller 的 docs=success。
+            # 后者只允许恰好是 skipped；若 Epic 侧意外失败/取消，仍不能被汇总吞掉。
+            case "${BASE_REF}:${DOCS_RESULT}" in
+              epic/*:skipped) : ;;
+              *)
+                printf '候选文档门禁未通过：base=%s result=%s\n' \
+                  "${BASE_REF}" "${DOCS_RESULT}" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
+             && [ "${MODE}" = docs ] && [ "${RISK_LEVEL}" = l0 ]; then
             if [ "${CLASSIFY_RESULT}" != success ] || [ "${DOCS_RESULT}" != success ]; then
               printf '纯文档候选未通过：classify=%s docs=%s\n' \
                 "${CLASSIFY_RESULT}" "${DOCS_RESULT}" >&2
               exit 1
             fi
             echo 'Epic 纯文档候选：文档门禁通过；不运行真库、extras 或镜像构建'
+            exit 0
+          fi
+          if [ "${EVENT_NAME}" = pull_request ] && [ "${BASE_REF}" = main ] \
+             && [ "${RISK_LEVEL}" = l1 ]; then
+            if [ "${CLASSIFY_RESULT}" != success ] || [ "${L1_RESULT}" != success ]; then
+              printf 'L1 用户可见资产候选未通过：classify=%s l1=%s\n' \
+                "${CLASSIFY_RESULT}" "${L1_RESULT}" >&2
+              exit 1
+            fi
+            echo 'Epic L1 候选：版本/锁/术语轻门禁通过；不运行真库、extras 或镜像构建'
             exit 0
           fi
           # Issue #278：跟踪 PR（epic/* -> main）首次自动触发的 synchronize，image
@@ -541,7 +659,8 @@ jobs:
       - name: 检出代码
         if: >-
           github.event_name == 'pull_request' &&
-          !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs') &&
+          !(github.base_ref == 'main' &&
+          (needs.classify.outputs.mode == 'docs' || needs.classify.outputs.risk_level == 'l1')) &&
           needs.image.result == 'success'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -550,7 +669,8 @@ jobs:
       - name: 写入候选身份
         if: >-
           github.event_name == 'pull_request' &&
-          !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs') &&
+          !(github.base_ref == 'main' &&
+          (needs.classify.outputs.mode == 'docs' || needs.classify.outputs.risk_level == 'l1')) &&
           needs.image.result == 'success'
         run: |
           python3 scripts/ci/write_epic_candidate.py \
@@ -565,7 +685,8 @@ jobs:
       - name: 留存候选证明
         if: >-
           github.event_name == 'pull_request' &&
-          !(github.base_ref == 'main' && needs.classify.outputs.mode == 'docs') &&
+          !(github.base_ref == 'main' &&
+          (needs.classify.outputs.mode == 'docs' || needs.classify.outputs.risk_level == 'l1')) &&
           needs.image.result == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

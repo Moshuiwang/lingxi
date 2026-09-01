@@ -573,7 +573,8 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 
 **数值必须分环境，`compose.yaml`（基线）只给一个安全默认值，真正生效的数值来自
 `compose.stage.yaml`/`compose.prod.yaml` 的覆盖，覆盖来自 `--env-file`**（与
-`LINGXI_SCHEDULER_INTERVAL_SECONDS` 同一套既有写法）：
+`LINGXI_SCHEDULER_INTERVAL_SECONDS` 同一套既有写法）。worker-queue 的并发与生产
+资源合同另有显式门禁，见下文：
 
 | 服务 | stage（cpus / mem / pids） | 生产（cpus / mem / pids） | 依据 |
 | --- | --- | --- | --- |
@@ -582,36 +583,75 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 | `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
 | `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
 | `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
-| `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **4.0 / 16G / 4096** | 架构设计「九、容量与资源」：峰值并发任务 10–16 × 单任务内存 300–500MB = 8–16GB；这是六个服务里唯一直接对应该估算的服务，取估算上限 |
+| `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **1.5 / 2G / 512** | 产品负责人裁定机器与 stage 同型（Issue #496/#502） |
 
-**stage 主机只有 2 核 / 3.7GiB**：`scheduler`（512M）+ `gateway`（512M）+
-`worker-queue`（2G）三个常驻服务加总约 3G，给宿主机与 Docker 守护进程留下约
-700MB 余量；`worker`/`migrate`/`reauthorize` 是一次性作业，通常不与常驻服务的
-峰值重叠。**生产按建议服务器 8 核 / 32GB 定档**：`worker-queue` 单独顶格
-16G，是六个服务里资源需求最大、也是唯一处理真实并发用户负载的服务——把它的
-限制配得比这张表更紧，后果是在真实并发负载下系统性杀死本该成功的 Agent SDK
-回合，而不是"资源紧张时排队变慢"这种更温和的降级；这是本轮裁定判定"比限制
-偏松更严重"的错误方向，`pids` 一项尤其如此（Agent SDK 一个回合会拉起 Claude
-CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直接 kill，不是排队）。
+### 生产 worker-queue 合同（Issue #494/#496/#502，2026-08-31）
 
-**`worker-queue` 的内存限额与并发上界必须同步设，两者是同一个约束的两半**（Trace
-#373 H2 批独立审查 P1-4，与上面「部署前置检查」两条 P1-3/P1-4 是不同批次的编号，
-不要混认）：`LINGXI_WORKER_MAX_CONCURRENCY`（`apps/worker/config.py`，默认
-**16**）决定一个 `worker-queue` 容器同一时刻最多同时跑几个 Agent SDK 回合，
-每个回合按架构设计「九、容量与资源」估算占用 300–500MB；这个数字与上表的
-`memory` 限额必须按同一档位一起看，不能只看限额数值：
+产品负责人已裁定生产机器型号与 stage 一致，生产 `worker-queue` 合同固定为 CPU
+`1.5`、memory `2G`、pids `512`、tmpfs `256m`，执行并发固定为 `4`。这组值是
+仓库可检查的部署合同，不是 E1 的容量上界推断；E1 只证明一次性 1/2/4/6/8 建连
+共 `154/154` 成功，不能把 8 说成执行上界，也不触发扩阶或重跑。
+
+生产的五个 worker-queue 值仍遵循 #494 的外部 env 边界：它们只写在目标机器未入库
+的根 `deploy/.env.prod`，不在仓库创建或写入真实 `.env.prod`。`compose.prod.yaml`
+对并发和四项资源使用 `${VAR:?}` 无默认值；漏配时 `docker compose config`/`up` 直接
+失败，不能静默退回默认值。`scripts/ci/check_deploy_contract.py` 与
+`scripts/ci/verify_compose_structure.sh` 会分别检查这种 fail-fast 形状及可渲染占位
+值；提示语保持纯 ASCII 单行，避免 YAML 先于插值截断 `${...}`。
+
+生产根 `.env.prod` 应包含以下五行（示例合同，不是要求把文件提交到仓库）：
+
+```dotenv
+LINGXI_WORKER_MAX_CONCURRENCY=4
+LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
+LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
+LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
+LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
+```
+
+其中并发值同时由 worker 配置的直接构造校验、compose stage/prod 环境块和部署门禁
+钉住；资源值由 prod 的 `${VAR:?}` 和 runbook/compose 渲染合同钉住。不要创建真实
+`.env.prod` 或把凭据写入仓库。
+
+| 变量 | 生产合同 |
+| --- | --- |
+| `LINGXI_WORKER_MAX_CONCURRENCY` | `4`；stage 与生产执行并发硬上限 |
+| `LINGXI_WORKER_QUEUE_CPU_LIMIT` | `1.5` |
+| `LINGXI_WORKER_QUEUE_MEM_LIMIT` | `2G` |
+| `LINGXI_WORKER_QUEUE_PIDS_LIMIT` | `512` |
+| `LINGXI_WORKER_QUEUE_TMPFS_SIZE` | `256m`；tmpfs 消耗宿主内存，不是磁盘配额 |
+
+其余五个服务的生产档仍沿用上表数值：它们都是无子进程扇出的轻量进程，量级判断不依赖主机规格的精确值；`worker`（一次性 job）的 `/tmp` 也仍是基线的 256m——它跑完一个回合就退出、tmpfs 随容器销毁，没有 `worker-queue` 那种跨任务累积的增长（Issue #494 已核实，不单独立项）。
+
+### `/tmp` 内存盘容量（Issue #494）
+
+`worker`/`worker-queue` 的 `/tmp` 是 **256MB 内存盘**（其余四个服务 16m）。镜像把 `HOME` 指到 `/tmp`，Agent 会话转录写在 `$HOME/.claude/projects` 下——rc22 收尾批 S-12 浸泡实测：worker-queue 接负载约 **45 分钟就写满**（32 份转录、单份最大 15MB），清空后 33 分钟又长回 190MB。三条修复缺一不可：
+
+1. **常规回收**：`apps/worker/session_cleanup.py` 的 `reclaim_session_transcripts` 按字节预算删最旧的（默认预算 128MiB、低水位 75%、保护最近 5 分钟写过的）。此前只有 `/new`、权限刷新等触发点排队才会删，**正常问数流程一次都不排**。运维旋钮见 `deploy/.env.example`「文件五」的 `LINGXI_WORKER_SESSION_DISK_*` / `LINGXI_WORKER_SESSION_RECLAIM_*`；预算设 `0` 显式关闭回收（保全取证现场用）。
+2. **上限分环境显式**：值由 `LINGXI_WORKER_QUEUE_TMPFS_SIZE` 决定，stage 与生产均钉在 256m（这块盘吃宿主内存）。
+3. **健康检查看得见这块盘**：`lingxi.apps.healthcheck` 增加可用空间判定，低于总量 10% 判红。修复前它一路报绿——探针写的是十几字节的活性文件，覆盖写不需要新页，所以"用户在失败、监控显示 healthy"可以无限期持续。时延口径见 `deploy/监控告警.md`「五、时延估算」的 C 类。
+
+**stage 与生产机器采用同一型号合同**：`scheduler`（stage 512M / 生产 1G）+
+`gateway`（stage 512M / 生产 1G）+ `worker-queue`（2G）三个常驻服务的
+worker-queue 预算固定为 1.5 CPU、2G、512 pids、256m tmpfs；一次性作业的其余
+资源值仍见上表。Agent SDK 一个回合会拉起 Claude CLI 与多个 MCP 子进程，pids
+撞顶的失败形态是进程被直接 kill，因此执行并发上限与资源合同必须保持一致。
+
+**`worker-queue` 的内存限额与并发上限必须同步设，两者是同一个约束的两半**：
+`LINGXI_WORKER_MAX_CONCURRENCY`（`apps/worker/config.py`）决定一个容器同一时刻
+最多跑几个 Agent SDK 回合，当前默认与硬上限均为 **4**。它不是 E1 建连探针的
+推导结果；4 是产品负责人对当前 stage/生产资源合同的明确执行配置。
 
 | 档位 | `memory` 限额 | 并发上界建议 | 推导 |
 | --- | --- | --- | --- |
-| stage | 2G | **≤4** | 2048MB ÷ 单任务上限 500MB ≈ 4.1，向下取整；默认值 16 在这一档会在真实并发负载下把 `worker-queue` 顶爆内存，pids/memory 限额会把超额回合直接 kill，不是温和排队降级 |
-| 生产 | 16G | 16（默认值即可） | 16384MB ÷ 单任务上限 500MB ≈ 32.8，默认 16 落在这个上界之内，与架构设计「九、容量与资源」的估算区间（8–16GB）一致，不需要显式覆盖 |
+| stage | 2G | **4（硬上限）** | 产品执行配置；不能因 E1 的 8 建连成功而扩阶 |
+| 生产 | 2G | **4（硬上限）** | 与 stage 同型机器及同一 worker-queue 资源合同 |
 
-**因此：任何设了 `LINGXI_WORKER_QUEUE_MEM_LIMIT` 低于生产档（尤其是 stage 这类
-资源受限环境）的部署，必须同步显式设置 `LINGXI_WORKER_MAX_CONCURRENCY`**——默认值
-16 是按生产档反推出来的，不是"放之四海皆安全"的通用默认，在 stage 这类内存限额
-更紧的环境下沿用默认值属于"限额与并发互相矛盾"的配置错误，不是保守选择。
+**因此：任何 worker-queue 部署都必须保留 `LINGXI_WORKER_MAX_CONCURRENCY=4`**。
+代码、stage compose 与 prod 外部 env 门共同拒绝高于 4 的值；E1 的 8 只是一轮连接
+探针结果，不是执行上界或后续扩阶许可。
 
-**改数值不需要改 compose 文件本身**：全部 18 个变量（6 服务 × 3 项）都在
+**改其他资源数值不需要改 compose 文件本身**：全部资源覆盖变量都在
 `deploy/.env.example`「文件一」小节登记为可选覆盖，默认值已经内置在
 `compose.stage.yaml`/`compose.prod.yaml` 里，只有需要单独调整某个服务时才需要
 在 `deploy/.env.stage`/`deploy/.env.prod` 里显式设置对应变量。
