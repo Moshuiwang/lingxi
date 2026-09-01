@@ -1017,6 +1017,82 @@ class ManagementFormSubmitTests(unittest.TestCase):
         self.assertEqual(response["toast"]["type"], "error")
 
 
+class ManagementEmptyFormSubmitTests(unittest.TestCase):
+    """#493 P2-2：四个选择项全空的提交不得回一句指向**这张卡上不存在的下拉**的话。
+
+    #493 之后生产管理卡渲染的是「银河职位 + 公司范围」表单，卡上没有"公司"下拉；
+    而 ``position_form`` 是按取值非空推断出来的，全空时判 False，整条提交此前会落进
+    legacy 分支回「请选择公司」——管理员照着找不到任何可选项，是一条死路。
+    """
+
+    def _submit(self, router, **overrides):
+        handler, audit = _build_handler(
+            pending_actions=_FakePendingActions(), management_actions=router
+        )
+        kwargs = dict(
+            operator_open_id="ou_admin",
+            admin_action="grant",
+            identifier="ou_target",
+            company_id="",
+            metric_name="",
+            reason="特批",
+            chat_id="oc_1",
+            thread_id=None,
+            message_id="om_1",
+            trace_id="trc_1",
+        )
+        kwargs.update(overrides)
+        return handler.handle_management_form_submit(**kwargs), audit
+
+    def test_an_all_empty_submission_does_not_name_a_dropdown_that_is_not_there(self) -> None:
+        router = _FakeManagementRouter()
+        response, audit = self._submit(router)
+
+        self.assertEqual(response["toast"]["type"], "error")
+        content = response["toast"]["content"]
+        self.assertNotIn("请选择公司", content, "生产卡上没有「公司」这个下拉")
+        self.assertNotIn("请选择指标", content, "生产卡上没有「指标」这个下拉")
+        self.assertIn("重新选择", content)
+        self.assertEqual(router.route_calls, [], "空表单不得拼出命令文本去打扰 route()")
+        self.assertIn(
+            "admin.card_callback.management_empty_form", [action for action, _ in audit.records]
+        )
+
+    def test_a_legacy_form_missing_only_the_company_still_says_so(self) -> None:
+        """反向对照一：只缺公司（指标已选）仍逐字是原来那句——本修复只收窄到全空。"""
+
+        router = _FakeManagementRouter()
+        response, audit = self._submit(router, metric_name="daily_active")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertIn("请选择公司", response["toast"]["content"])
+        self.assertNotIn(
+            "admin.card_callback.management_empty_form", [action for action, _ in audit.records]
+        )
+
+    def test_a_position_form_missing_only_the_scope_still_says_so(self) -> None:
+        """反向对照二：职位已选、公司范围未选，仍走职位表单自己的那句。"""
+
+        router = _FakeManagementRouter()
+        response, _ = self._submit(router, position_name="A运营")
+
+        self.assertEqual(response["toast"]["type"], "error")
+        self.assertIn("请选择公司范围", response["toast"]["content"])
+
+    def test_a_complete_position_submission_is_unaffected(self) -> None:
+        """反向对照三：填全的职位提交照常构造命令文本。没有这一条，"把所有提交都当
+        空表单挡掉"这种停服级误伤仍然是绿的。"""
+
+        router = _FakeManagementRouter()
+        response, _ = self._submit(router, position_name="A运营", company_scope="1011")
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(len(router.route_calls), 1)
+        self.assertEqual(
+            router.route_calls[0]["text"], "/admin grant_position ou_target A运营 1011 特批"
+        )
+
+
 class ManagementFormSubmitWhitespaceValidationTests(unittest.TestCase):
     """Trace #469 修复包 B，B-2：``identifier``/``company_id``/``metric_name``
     非空但含空白字符（含全角空格 U+3000）时，纵深校验必须在拼接命令文本之前

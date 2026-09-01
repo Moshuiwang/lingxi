@@ -253,6 +253,15 @@ class BackgroundPermissionRecomputeTrigger:
         on_completed: Callable[[PendingAction], None] | None = None,
         on_queued: Callable[[PendingAction, TargetedRecomputeOutcome], None] | None = None,
         on_failed: Callable[[PendingAction, Exception | None], None] | None = None,
+        #: ``SKIPPED`` 专用回调（Trace #521 F5，#493 P1-3）。定向重算的 ``SKIPPED``
+        #: 是**常态出口**，不是故障——最典型的一种是管理员对一个已停用用户做本地
+        #: 权限动作（``account_not_enabled``）。此前它与真正的执行失败共用
+        #: ``on_failed``，调用方拿不到 ``reason``，只能渲染同一句"将在次日批处理
+        #: 修正"，而停用用户根本不进日批遍历集合，那句话是假承诺。传入这个回调后
+        #: ``SKIPPED`` 走它并带上完整 outcome，调用方自己决定怎么如实告知；
+        #: **不传（``None``）时行为与本参数加入之前逐字节一致**——仍然回落
+        #: ``on_failed(pending, None)``。本类不解释任何 ``reason``，只负责分流。
+        on_skipped: Callable[[PendingAction, TargetedRecomputeOutcome], None] | None = None,
         on_timeout: Callable[[PendingAction], None] | None = None,
         timeout_seconds: float = _DEFAULT_RECOMPUTE_TIMEOUT_SECONDS,
     ) -> None:
@@ -271,6 +280,7 @@ class BackgroundPermissionRecomputeTrigger:
         self._on_completed = on_completed
         self._on_queued = on_queued
         self._on_failed = on_failed
+        self._on_skipped = on_skipped
         self._on_timeout = on_timeout
         self._timeout_seconds = float(timeout_seconds)
         self._queue: queue.Queue[tuple[PendingAction, _ExecutionWatch, threading.Timer]] = queue.Queue(
@@ -366,11 +376,23 @@ class BackgroundPermissionRecomputeTrigger:
                 )
                 completed = typed_outcome is None
                 queued = typed_outcome is not None and typed_outcome.kind is not RecomputeKind.SKIPPED
+                # ``SKIPPED`` 只有在调用方**显式登记** ``on_skipped`` 时才单独分流；
+                # 未登记时仍走下面那条 ``on_failed`` 老路（见 ``on_skipped`` 文档）。
+                skipped = typed_outcome is not None and typed_outcome.kind is RecomputeKind.SKIPPED
                 if watch.finish():
                     if queued:
                         try:
                             if self._on_queued is not None:
                                 self._on_queued(pending, typed_outcome)  # type: ignore[arg-type]
+                        except Exception as error:  # noqa: BLE001 - callback must not kill worker
+                            self._audit.record(
+                                _RECOMPUTE_TRIGGER_FAILED_ACTION,
+                                pending_action_id=pending.id,
+                                error=type(error).__name__,
+                            )
+                    elif skipped and self._on_skipped is not None:
+                        try:
+                            self._on_skipped(pending, typed_outcome)  # type: ignore[arg-type]
                         except Exception as error:  # noqa: BLE001 - callback must not kill worker
                             self._audit.record(
                                 _RECOMPUTE_TRIGGER_FAILED_ACTION,

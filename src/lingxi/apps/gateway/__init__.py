@@ -63,6 +63,7 @@ from .document_delivery import (
 )
 from .group_mention_hint import GroupMentionHintResponder, build_group_mention_hint_throttle
 from .log_redaction import install_credential_redaction
+from .management_status import rendered_dispatch_status, skipped_recompute_status_message
 from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
@@ -301,23 +302,12 @@ class _GatewayManagementCardRefresher:
         # 执行已结束（已生效/不完整）后，原管理卡恢复为可重新查询/提交的表单；
         # 只有等待中的提交态继续隐藏表单，避免重复点击。取消则关闭这张卡。
         submitted = state in {"submitted", "dispatching"}
-        # 数据库里的 dispatch_status 是机器状态（publishing/effective/incomplete），
-        # 不能原样回显给管理员；所有管理卡可见结果都在这里映射成产品术语。
-        if status_message:
-            rendered_status = status_message
-        elif state in {"submitted", "dispatching"} or dispatch_status == "publishing":
-            rendered_status = "操作已记录，权限正在下发"
-        elif state == "effective" or dispatch_status == "effective":
-            rendered_status = "已生效"
-        elif state == "incomplete" or dispatch_status == "incomplete":
-            rendered_status = dispatch_status if dispatch_status and dispatch_status not in {
-                "incomplete",
-                "publishing",
-            } else "权限下发未完成，将在次日批处理修正"
-        elif state == "closed":
-            rendered_status = "已取消"
-        else:
-            rendered_status = dispatch_status
+        rendered_status = rendered_dispatch_status(
+            status=status,
+            state=state,
+            dispatch_status=dispatch_status,
+            status_message=status_message,
+        )
         card = render_management_card(
             status,
             display_identifier=context.identifier,
@@ -949,6 +939,16 @@ def build_supervisor(
         )
         _start_management_publish_observer(pending)
 
+    def _recompute_skipped(pending: Any, outcome: Any) -> None:
+        """定向重算判 ``SKIPPED`` 的回执（Trace #521 F5，#493 P1-3）：这是常态出口不是故障，
+        只有 ``account_not_enabled`` 有专属真话，其余跳过原因拿到 ``None``、逐字节不变仍走
+        原失败文案（判据与措辞见 `.management_status`）。本地覆盖照常落库——``prepare`` 不读
+        账号状态是既有产品语义，本次只是如实告知这一次不下发。"""
+
+        _refresh_management_after_recompute(
+            pending, complete=False, status_message=skipped_recompute_status_message(outcome)
+        )
+
     def _recompute_failed(pending: Any, error: Exception | None) -> None:
         del error
         _refresh_management_after_recompute(pending, complete=False)
@@ -1016,6 +1016,7 @@ def build_supervisor(
             on_completed=_recompute_completed,
             on_queued=_recompute_queued,
             on_failed=_recompute_failed,
+            on_skipped=_recompute_skipped,
             on_timeout=_recompute_timeout,
         ),
     )

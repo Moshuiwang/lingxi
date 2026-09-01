@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-01"
+version = "2026-09-01-2"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -171,6 +171,19 @@ version = "2026-09-01"
 # 管理卡即时下发超过内部观察窗口后，日批真正读回一致时只向管理群发送一条汇总；
 # 仅报告条数，不带人员、公司或指标标识。
 "permission.management_correction_summary" = "每日权限批处理已补齐 {count} 条此前未完成的权限下发。"
+# 管理卡对一个**已停用**用户做本地权限动作时的真话（Trace #521 F5，#493 P1-3）。
+# 定向重算在落授权决定的那把行锁里发现 account_state != 'enabled'，返回
+# SKIPPED/account_not_enabled（core/permission/targeted_recompute.py）——这是常态
+# 出口，不是故障；override 照常落库，只是这一次不下发。此前这条链路与普通失败共用
+# 「权限下发未完成，将在次日批处理修正」，那是**假承诺**：发权每日批的基线是
+# `provisioning_state='active' AND account_state='enabled'`
+# （adapters/postgres_permission_publish.PERMISSION_REFRESH_BASELINE_SQL），停用用户
+# 根本不进遍历集合，永远等不到"修正"（tests/test_permission_refresh_postgres.py
+# `test_a_later_round_no_longer_touches_the_suspended_user_...` 已钉死这一事实）。
+# 本地覆盖不设有效期（迁移 0072 明确裁定），所以"恢复账号后由次日批处理生效"是
+# 无条件成立的真话：账号恢复 enabled 后这个人重新进入日批基线，日批的本地覆盖合并
+# （S-P-3）会把这条已落库的 override 一并算进发布内容。
+"permission.management_account_not_enabled" = "该用户账号已停用，本次权限调整不会下发；恢复账号后由次日批处理生效。"
 
 # Issue #341 S-ES-3：文档投递独立消费循环成功建档、写正文、授予可管理并读回
 # 确认后，作为一条追加消息发给提问用户（不进入任何已有话题的卡片/文本终态，

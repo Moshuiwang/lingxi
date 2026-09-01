@@ -136,6 +136,9 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "permission.range_revoked",
     "permission.all_companies",
     "permission.management_correction_summary",
+    # 管理卡对已停用用户做本地权限动作时的真话（Trace #521 F5，#493 P1-3）：
+    # 不能再与普通失败共用「将在次日批处理修正」这句假承诺，理由见 content.toml。
+    "permission.management_account_not_enabled",
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
     "delivery.document_ready_degraded",
