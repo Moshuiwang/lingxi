@@ -193,6 +193,8 @@ from lingxi.core.identity.onboarding_ports import (
     # 失败原因落库口（Issue #337，可选，见该协议文档）。
     FailureReasonRecorder,
     GalaxySource,
+    # 存量差集导入口（rc25 S-1，Issue #540）。
+    LegacyPermissionImporter,
     LocalOverrideSource,
     PermissionDecisionStore,
     ReadinessConfirmer,
@@ -202,6 +204,10 @@ from lingxi.core.identity.onboarding_ports import (
     UserNotifier,
     UserStateStore,
     _AuditSink,
+)
+from lingxi.core.identity.legacy_permission_import import (
+    import_legacy_permissions,
+    translate_galaxy,
 )
 from lingxi.core.identity.onboarding_support import draft_from_member, roster_row_for
 from lingxi.core.identity.onboarding_terminal import (
@@ -251,10 +257,6 @@ from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
 from lingxi.core.permission.local_override import ResolvedLocalOverrides, resolve_local_overrides
 from lingxi.core.permission.mcp_readiness import ReadinessBinding, ReadinessOutcome
 from lingxi.core.permission.merge_sources import REASON_LOCAL_OVERRIDE_READ_FAILED, merge_permission_sources
-from lingxi.core.permission.metric_translation import (
-    UncoveredPermissionCombination,
-    translate_company_functions,
-)
 from lingxi.core.permission.notification import describe_scope
 from lingxi.core.permission.publish import PermissionGrantBlockedByAccountState
 from lingxi.core.permission.publish_row import (
@@ -311,6 +313,7 @@ class AutoOnboardingRunner:
         onboarding_failed: Callable[[str, str], None] | None = None,
         failure_reasons: FailureReasonRecorder | None = None,
         local_overrides: LocalOverrideSource | None = None,
+        legacy_importer: LegacyPermissionImporter | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -340,6 +343,14 @@ class AutoOnboardingRunner:
         #: 存量令牌只读源（Issue #281 改道）。``None``＝该能力关闭——坐标未配置时装配层
         #: 不会建出这个对象，`_issue_token` 因此原样走 `issue_token`，与改动前逐字节一致。
         self._stock_tokens = stock_tokens
+        if stock_tokens is not None and legacy_importer is None:
+            # **结构性防漏接**（rc25 S-1，Issue #540；与 ``full_access_wildcard`` 必填同一条
+            # 纪律）：存量令牌源装了、差集导入口没装，会静默退回 rc21–rc24 的"只复制令牌
+            # 不读权限"——存量用户首聊后权限被收窄到银河（PM 本人 9→5 的实证）。宁可
+            # 构造期就拒绝。
+            raise TypeError("注入存量令牌源时必须同时注入存量差集导入口 legacy_importer")
+        #: 存量差集导入口：``None`` 只在存量令牌源也为 ``None`` 时合法（能力整体关闭）。
+        self._legacy_importer = legacy_importer
         self._decisions = decisions
         self._readiness = readiness
         self._notifier = notifier
@@ -877,6 +888,20 @@ class AutoOnboardingRunner:
         if recheck is not None:
             return recheck
 
+        # 银河翻译只算一次（rc25 S-1），翻译失败在这里 fail-closed（早于令牌与环境）。
+        galaxy_map = self._translate_galaxy(user_id, aggregate)
+        if isinstance(galaxy_map, _Terminal):
+            return galaxy_map
+
+        # 存量差集导入挂在零银河判定**之前**（rc25 S-1，Issue #540）：正式表只读一次，
+        # 查找结果同时供 `_issue_token` 采纳令牌。
+        self._stop_guard()
+        lookup = self._lookup_stock_token(request.email)
+        if lookup is not None and lookup.state == ADOPTABLE:
+            self._import_legacy_permissions(
+                user_id, lookup, aggregate, galaxy_map, open_id=open_id, trace_id=trace_id
+            )
+
         if not aggregate.granted:
             # 零银河权限：现在才有 `app_user.id`，查一次**本地授权**。放在
             # 令牌签发/用户环境创建**之前**——不为一个最终会被拒绝的人签发
@@ -888,7 +913,7 @@ class AutoOnboardingRunner:
                 return rejected
 
         self._stop_guard()
-        issued = self._issue_token(user_id, email=request.email)
+        issued = self._issue_token(user_id, lookup)
         self._create_environment(user_id, issued)
         self._users.advance_provisioning_state(user_id, to=STATE_PROVISIONING)
         # **分水岭**（Issue #282 §0.1）：从这一行起，任何失败终态都会让这个人停在
@@ -899,7 +924,9 @@ class AutoOnboardingRunner:
         stalled["user_id"] = user_id
 
         self._stop_guard()
-        published = self._publish(user_id, request, aggregate, issued, trace_id=trace_id)
+        published = self._publish(
+            user_id, request, aggregate, issued, galaxy_map=galaxy_map, trace_id=trace_id
+        )
         if isinstance(published, _Terminal):
             return published
         permission_version, permissions = published
@@ -1150,17 +1177,52 @@ class AutoOnboardingRunner:
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 
-    def _issue_token(self, user_id: str, *, email: str) -> Any:
+    def _lookup_stock_token(self, email: str | None) -> StockTokenLookup | None:
+        """按邮箱查一次存量令牌源（#281 改道）；``None``＝源未装配，原样走签新路径。
+        rc25 S-1 起提前到零银河判定之前：同一结果供差集导入与 `_issue_token` 共用。"""
+
+        if self._stock_tokens is None:
+            return None
+        try:
+            return self._stock_tokens.lookup(email)
+        except Exception as error:  # noqa: BLE001
+            raise OnboardingChainError(
+                f"stock_token_lookup_failed_{type(error).__name__}"
+            ) from error
+
+    def _import_legacy_permissions(
+        self,
+        user_id: str,
+        lookup: StockTokenLookup,
+        aggregate: Any,
+        galaxy_map: Mapping[str, Sequence[str]],
+        *,
+        open_id: str,
+        trace_id: str,
+    ) -> None:
+        """存量用户首聊差集导入（rc25 S-1）：见 ``legacy_permission_import.import_legacy_permissions``。"""
+
+        assert self._legacy_importer is not None  # 构造期不变式：源装了导入口必装
+        import_legacy_permissions(
+            importer=self._legacy_importer,
+            audit=self._audit,
+            metric_translation_map=self._metric_translation_map,
+            now=self._clock(),
+            user_id=user_id,
+            permissions_text=lookup.permissions,
+            full_access_wildcard=ADMIN_FULL_ACCESS_FUNCTION in aggregate.functions,
+            galaxy_map=galaxy_map,
+            open_id=open_id,
+            trace_id=trace_id,
+        )
+
+    def _issue_token(self, user_id: str, lookup: StockTokenLookup | None) -> Any:
         """签发或采纳该用户的问数 MCP 访问令牌（adopt-or-issue，#281 改道裁定）。
+        ``lookup`` 为 ``None``（源未装配）＝原签发路径，与接入前逐字节一致；无行 / 有行
+        无密文退回签新；有行含密文则采纳；**解密失败响亮失败、绝不退回签新**（签新会让
+        用户环境令牌与正式表错位，造成真实 MCP 认证失败）。"""
 
-        ``self._stock_tokens`` 为 ``None``（坐标未配置）时与改动前逐字节一致——直接走
-        原签发路径，这是"未接入存量令牌能力＝零行为变化"的哨兵。注入时先按邮箱查存量源：
-        无行 / 有行无密文都退回原路径签新；有行含密文则采纳；**解密失败响亮失败、绝不
-        退回签新**（签新会让用户环境令牌与正式表错位，造成真实 MCP 认证失败）。
-        """
-
-        if self._stock_tokens is not None:
-            lookup = self._stock_token_lookup(email)
+        if lookup is not None:
             if lookup.state == ADOPTABLE:
                 return self._adopt_token(user_id, lookup)
             if lookup.state == DECRYPT_FAILED:
@@ -1174,21 +1236,14 @@ class AutoOnboardingRunner:
         except Exception as error:  # noqa: BLE001
             raise OnboardingChainError(f"token_issue_failed_{type(error).__name__}") from error
 
-    def _stock_token_lookup(self, email: str) -> StockTokenLookup:
-        try:
-            return self._stock_tokens.lookup(email)
-        except Exception as error:  # noqa: BLE001
-            raise OnboardingChainError(
-                f"stock_token_lookup_failed_{type(error).__name__}"
-            ) from error
-
     def _adopt_token(self, user_id: str, lookup: StockTokenLookup) -> Any:
         try:
             adopted = self._tokens.adopt_token(user_id, lookup.secret)
         except Exception as error:  # noqa: BLE001
             raise OnboardingChainError(f"token_adopt_failed_{type(error).__name__}") from error
         # 权限面由银河同步权威决定，不由本步裁量——这里只审计标注，不改变采纳与否
-        # （#281 改道裁定第四条）。
+        # （#281 改道裁定第四条）。旧行的 ``permissions`` 由 `_import_legacy_permissions`
+        # 作为管理员本地授权导入（rc25 S-1），本步仍只管令牌。
         approved = not lookup.status or lookup.status == STATUS_APPROVED
         self._audit.record(
             "onboarding.stock_token_adopted" if adopted.created else "onboarding.stock_token_existing_kept",
@@ -1215,6 +1270,17 @@ class AutoOnboardingRunner:
 
     # ---- 7. 权限发布 ------------------------------------------------------
 
+    def _translate_galaxy(self, user_id: str, aggregate: Any) -> dict[str, tuple[str, ...]] | _Terminal:
+        """银河聚合 → 「公司 → 指标名」，只算一次供导入与发布共用（rc25 S-1）；实现见
+        ``core/identity/legacy_permission_import.translate_galaxy``。"""
+
+        return translate_galaxy(
+            audit=self._audit,
+            metric_translation_map=self._metric_translation_map,
+            user_id=user_id,
+            aggregate=aggregate,
+        )
+
     def _publish(
         self,
         user_id: str,
@@ -1222,62 +1288,15 @@ class AutoOnboardingRunner:
         aggregate: Any,
         issued: Any,
         *,
+        galaxy_map: Mapping[str, Sequence[str]],
         trace_id: str,
     ) -> _Terminal | tuple[int, str]:
         if not request.email:
             # 发布行的 record_key/email 两列都来自邮箱；纯工号匹配成功但花名册没有邮箱时
             # 没有"这一行是谁的"的答案。归确定性业务失败，不是本侧故障。
             return _not_authorized("archived_identity_incomplete")
-        if aggregate.granted:
-            # 翻译「公司 + 职能」→ 指标名（Issue #227 / #346 修复）：与每日重算
-            # （`permission_refresh.py::_refresh_user`）共用同一个纯函数
-            # `translate_company_functions`，不复制翻译逻辑——两个写发布行的调用点因此
-            # 产出同一语义的值列表（均为指标名，不是未翻译的职能标签）。整轮判据（映射
-            # 整体为空）已经在 `_match` 里挡住（`publish_allowed`，Issue #227 开通侧
-            # 整合），这里仍然按 `error.mapping_is_empty` 的真实值分类而不是硬编码，
-            # 理由同 `permission_refresh._refresh_user` 同一处注释：不让这条逐用户判据
-            # 的正确性依赖"调用方一定会先做整轮判据"这条外部不变量。
-            try:
-                company_metrics = translate_company_functions(
-                    companies=aggregate.companies,
-                    functions=aggregate.functions,
-                    all_companies=aggregate.all_companies,
-                    mapping=self._metric_translation_map,
-                )
-            except UncoveredPermissionCombination as error:
-                # fail-closed（#346）：存在未覆盖的「公司 + 职能」组合时，这条开通链
-                # **整条**拒绝发布——不猜测、不回落成未翻译的职能标签、不产出部分结果
-                # （`metric_translation.py` 模块文档「fail-closed」一节同一条纪律）。
-                # 这不是"银河说他没有权限"（`aggregate.granted` 已经为真），是我们这
-                # 一侧的翻译内容缺口，因此归本侧故障（`_internal`），不落
-                # `_not_authorized`——后者会把一个权限完全正常的人错误地引去银河申请一个
-                # 他已经有的权限。走到这里之前 `record_decision` 从未被调用，外部表零
-                # 写入。
-                self._audit.record(
-                    "onboarding.publish_gate_closed",
-                    user=user_id,
-                    reason=(
-                        "permission_translation_unavailable"
-                        if error.mapping_is_empty
-                        else "permission_translation_uncovered"
-                    ),
-                )
-                return _internal(
-                    "permission_translation_unavailable"
-                    if error.mapping_is_empty
-                    else "permission_translation_uncovered"
-                )
-        else:
-            # 零银河权限（PM 2026-08-29 裁定，Issue #419）：走到这里说明
-            # `_reject_zero_galaxy_without_local_grant` 已经确认过合并结果非空，
-            # 银河这一侧对合并的贡献恒为空——`aggregate.companies`/`functions` 此时
-            # 必为空（`PermissionAggregate.__post_init__` 的不变式），不调用
-            # `translate_company_functions`（对空输入它会直接拒绝，那是"参数缺失"，
-            # 不是"没有内容"）。
-            company_metrics = {}
         # 本地权限覆盖合并（S-P-3 #319），接线点在这里而非更早的 `_match`——本地覆盖的 `user_id` 是内部 `app_user.id`，聚合时还没有它。
-        # `galaxy` 现在与 `permission_refresh.py::_refresh_user` 同一条路径产出：已翻译的指标名（`{公司: (指标名, …)}`），不再是未翻译的职能标签（#346 修复前的形状）；零银河用户则是恒为空的 `{}`（见上）。
-        galaxy_map = company_metrics
+        # `galaxy_map` 由 `_run` 经 `_translate_galaxy` 算好传入（rc25 S-1）：已翻译的指标名（`{公司: (指标名, …)}`），与 `permission_refresh.py::_refresh_user` 同一条路径产出；零银河用户则是恒为空的 `{}`。
         local = self._resolve_local_overrides(user_id)
         # 通配角 v2（Issue #440）：`all_companies=True` 有两个互相独立的成因
         # （`scope.all_countries` 或持有 `ADMIN_FULL_ACCESS_FUNCTION`），只有后者
@@ -1291,6 +1310,15 @@ class AutoOnboardingRunner:
         )
         for reason in merged.skipped_reasons:  # 通配角 v1：见 merge_sources.py「通配角」一节
             self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
+        if merged.unrepresentable_companies:
+            # 本地「全部」组下某公司被抑制到空，读侧回退制无法表示（merge_sources.py
+            # 「本地 "*" 组」一节）：fail-closed，不发布、不撤权，交管理员先撤组再抑制。
+            self._audit.record(
+                "onboarding.publish_gate_closed",
+                user=user_id,
+                reason="suppression_on_all_scope_unrepresentable",
+            )
+            return _internal("suppression_on_all_scope_unrepresentable")
         if not merged.permissions:
             if not aggregate.granted:
                 # 防御性分支，理论上不会发生：`_reject_zero_galaxy_without_local_

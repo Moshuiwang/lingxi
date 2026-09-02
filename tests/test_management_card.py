@@ -315,6 +315,73 @@ class LocalOverrideSectionTests(unittest.TestCase):
         self.assertIn(long_reason[:20], markdown_texts)
 
 
+class LegacyAllScopeGroupSectionTests(unittest.TestCase):
+    """「2.0 迁移导入·全部」组（rc25 S-1，Issue #540）：``company_id="*"`` 的一组行在管理卡
+    上渲染为**一项**、按钮带组 ID 整组撤销；``"*"`` 不当成真实公司键去查中文名。"""
+
+    def _group(self, size: int = 3) -> tuple[LocalPermissionOverrideView, ...]:
+        return tuple(
+            LocalPermissionOverrideView(
+                override_id=f"lpo_all{i}0000000000000000000000",
+                direction="grant",
+                company_id="*",
+                metric_name=f"metric_{i}",
+                reason="2.0 迁移导入",
+                created_at="2026-09-02T08:00:00+00:00",
+                position_name="2.0 迁移导入·全部",
+                company_scope="*",
+                group_id="lpg_01LEGACYALL000000000000000",
+            )
+            for i in range(size)
+        )
+
+    def test_an_explicit_list_group_shows_its_own_label(self) -> None:
+        """独立审核 P1/P3-10：显式列表组带另一个标签，管理员能分辨它不会自动扩指标。"""
+
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        override = LocalPermissionOverrideView(
+            override_id="lpo_explicit000000000000000000",
+            direction="grant",
+            company_id="*",
+            metric_name="metric_x",
+            reason="2.0 迁移导入",
+            created_at="2026-09-02T08:00:00+00:00",
+            position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME,
+            company_scope="*",
+            group_id="lpg_01LEGACYEXPLICIT0000000000",
+        )
+        card = render_management_card(
+            _status(local_overrides=(override,)),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
+        )
+        markdown_texts = "\n".join(e["content"] for e in _elements(card) if e.get("tag") == "markdown")
+        self.assertIn(ALL_SCOPE_EXPLICIT_POSITION_NAME, markdown_texts)
+
+    def test_the_group_renders_as_one_item_with_a_group_revoke_button(self) -> None:
+        display_names = FakeDisplayNames()
+        card = render_management_card(
+            _status(local_overrides=self._group()),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=display_names,
+        )
+        elements = _elements(card)
+        revoke_buttons = [
+            b for b in _find_buttons(elements) if b["behaviors"][0]["value"].get("admin_action") == ADMIN_ACTION_REVOKE
+        ]
+        self.assertEqual(len(revoke_buttons), 1, "一组只渲染一项")
+        value = revoke_buttons[0]["behaviors"][0]["value"]
+        self.assertEqual(value["permission_group_id"], "lpg_01LEGACYALL000000000000000")
+        self.assertNotIn("override_id", value)
+        markdown_texts = "\n".join(e["content"] for e in elements if e.get("tag") == "markdown")
+        self.assertIn("2.0 迁移导入·全部", markdown_texts)
+        self.assertIn("覆盖 3 项权限", markdown_texts)
+        self.assertIn("全部", markdown_texts)
+
+
 class GrantSuppressFormSectionTests(unittest.TestCase):
     def test_form_contains_exactly_two_selects_one_input_and_two_submit_buttons(self) -> None:
         card = render_management_card(

@@ -44,6 +44,10 @@ class StockTokenLookup:
     同一条纪律——取用明文只走字段本身，不让调试器/日志/断言失败信息把它带出来。它只在
     ``state`` 为 :data:`ADOPTABLE` 时非空。
 
+    ``permissions`` 是该行 ``permissions`` 列原文，只在 :data:`ADOPTABLE` 时非 ``None``
+    （rc25 S-1 存量差集导入的唯一输入；解析与差集在
+    ``core/permission/legacy_diff.py``）。
+
     ``status`` 是正式表该行的 ``status`` 列原值（如 ``"approved"``），只在 ``state`` 为
     :data:`ADOPTABLE` 或 :data:`DECRYPT_FAILED`（即行确实存在）时可能非空；供调用方
     审计标注"是否非 approved"，**不参与采纳与否的判定**——权限面由银河同步权威决定，
@@ -53,6 +57,10 @@ class StockTokenLookup:
     state: str
     secret: str = field(repr=False, default="")
     status: str = ""
+    #: 正式表该行 ``permissions`` 单元格的**原文**（rc25 S-1，Issue #540）：只在
+    #: :data:`ADOPTABLE` 时携带，供开通链把「旧行权限 − 银河当前翻译」落成本地授权；
+    #: 其余状态恒为 ``None``。它是权限文档不是凭据，但同样不进审计（审计只记计数）。
+    permissions: str | None = None
 
 
 class StockTokenSource(Protocol):

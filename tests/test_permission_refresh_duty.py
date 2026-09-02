@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import pathlib
+import json
 import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -259,6 +260,27 @@ class FakePublishHistory:
         return user_id in self._published
 
 
+class FakeLegacyAllScope:
+    """「全部」组补行口的假实现（rc25 S-1 方案 E）：记录调用；``overrides`` 给定时把补的
+    行同步写进假本地覆盖源，模拟"落库后重读能看到"。"""
+
+    def __init__(self, *, overrides: "FakeLocalOverrides | None" = None, error: Exception | None = None) -> None:
+        self._overrides = overrides
+        self._error = error
+        self.calls: list[dict[str, object]] = []
+
+    def expand_all_scope_group(self, *, user_id: str, group_id: str, metrics, now) -> int:
+        self.calls.append({"user_id": user_id, "group_id": group_id, "metrics": tuple(metrics), "now": now})
+        if self._error is not None:
+            raise self._error
+        if self._overrides is not None:
+            existing = self._overrides._entries.get(user_id, ())
+            self._overrides._entries[user_id] = existing + tuple(
+                _all_scope_entry(user_id=user_id, metric_name=metric, group_id=group_id) for metric in metrics
+            )
+        return len(tuple(metrics))
+
+
 class FakeLocalOverrides:
     """本地权限覆盖读取口的假实现（S-P-3，Issue #319）。
 
@@ -443,6 +465,7 @@ def build_duty(
     metric_translation_map=None,
     role_function_map=None,
     local_overrides: FakeLocalOverrides | None = None,
+    legacy_all_scope=None,
 ):
     audit = audit or RecordingAudit()
     tokens = tokens or FakeTokens({USER_ONE: TOKEN_CIPHER, USER_TWO: TOKEN_CIPHER})
@@ -468,6 +491,7 @@ def build_duty(
         clock=clock or FixedClock(TODAY),
         stop=stop,
         local_overrides=local_overrides,
+        legacy_all_scope=legacy_all_scope,
     )
     return duty, {
         "audit": audit,
@@ -1026,6 +1050,141 @@ def _override_entry(
         pending_action_id="pac_fake",
         created_at=TODAY,
     )
+
+
+def _all_scope_entry(
+    *,
+    user_id: str = USER_ONE,
+    metric_name: str = METRIC_NAME,
+    group_id: str = "lpg_legacy_all",
+    position_name: str | None = None,
+) -> LocalPermissionOverrideEntry:
+    from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME
+
+    return LocalPermissionOverrideEntry(
+        user_id=user_id,
+        direction=OverrideDirection.GRANT,
+        company_id="*",
+        metric_name=metric_name,
+        reason="2.0 迁移导入",
+        initiated_by_open_id="lingxi:legacy_import_2_0",
+        pending_action_id="pac_legacy",
+        created_at=TODAY,
+        position_name=position_name or ALL_SCOPE_POSITION_NAME,
+        company_scope="*",
+        permission_group_id=group_id,
+    )
+
+
+class LegacyAllScopeRefreshTest(unittest.TestCase):
+    """「2.0 迁移导入·全部」组随映射补齐新指标（rc25 S-1 方案 E）+ 本地 ``"*"`` 组的
+    发布形状 + 抑制不可表示时的 fail-closed（`V-权限-15` 本地 ``"*"`` 组扩展）。
+
+    变异锚点：把 `_expand_legacy_all_scope` 改成直接 ``return entries`` →
+    ``test_a_new_mapped_metric_is_appended_to_the_group_and_published`` 变红。"""
+
+    def test_a_new_mapped_metric_is_appended_to_the_group_and_published(self) -> None:
+        overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+
+        duty.run_once()
+
+        self.assertEqual(len(expander.calls), 1)
+        self.assertEqual(expander.calls[0]["group_id"], "lpg_legacy_all")
+        self.assertEqual(expander.calls[0]["metrics"], (METRIC_NAME_TWO,), "映射有、组里没有的那一个")
+        self.assertEqual(parts["audit"].fields_for("permission_refresh.legacy_all_scope_refreshed"), [{"user": USER_ONE, "added": 1}])
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            json.loads(row.permissions),
+            {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})},
+            "补齐后组已含银河给 1011 的指标：发布行只有 * 键",
+        )
+
+    def test_an_explicit_list_group_is_not_expanded_and_publishes_only_its_own_metric(self) -> None:
+        """独立审核 P1 的回归钉：``{"*":[显式列表]}`` 落成的组带另一个标签，每日重算不补行，
+        发布行的 ``"*"`` 只有旧行列出的指标；银河给具体公司的指标留在该公司键下。"""
+
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME_TWO, position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME),)}
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+
+        duty.run_once()
+
+        self.assertEqual(expander.calls, [], "显式列表组永不自动扩指标")
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            json.loads(row.permissions),
+            {"*": [METRIC_NAME_TWO], COMPANY_ID: sorted({METRIC_NAME, METRIC_NAME_TWO})},
+        )
+
+    def test_a_complete_group_does_not_call_the_expander(self) -> None:
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME), _all_scope_entry(metric_name=METRIC_NAME_TWO))}
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+
+        duty.run_once()
+
+        self.assertEqual(expander.calls, [])
+        self.assertNotIn("permission_refresh.legacy_all_scope_refreshed", [name for name, _ in parts["audit"].records])
+
+    def test_no_expander_wired_keeps_todays_behaviour(self) -> None:
+        overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(json.loads(row.permissions), {"*": [METRIC_NAME]})
+
+    def test_expander_failure_is_audited_and_the_round_continues_with_existing_rows(self) -> None:
+        overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
+        expander = FakeLegacyAllScope(error=RuntimeError("库抖动"))
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+
+        duty.run_once()
+
+        self.assertEqual(
+            parts["audit"].fields_for("permission_refresh.legacy_all_scope_refresh_failed"),
+            [{"user": USER_ONE, "error": "RuntimeError"}],
+        )
+        self.assertEqual(len(parts["decisions"].calls), 1, "本轮照常按既有行发布")
+
+    def test_zero_galaxy_user_with_a_legacy_group_publishes_the_group(self) -> None:
+        overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(
+            identities=(identity(),), role_function_map={}, local_overrides=overrides, legacy_all_scope=expander
+        )
+
+        duty.run_once()
+
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(json.loads(row.permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})})
+
+    def test_suppressing_a_whole_company_under_the_group_is_unrepresentable_and_skipped(self) -> None:
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _all_scope_entry(metric_name=METRIC_NAME),
+                    _override_entry(direction=OverrideDirection.SUPPRESS, company_id=COMPANY_ID, metric_name=METRIC_NAME),
+                )
+            }
+        )
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides)
+
+        duty.run_once()
+
+        self.assertEqual(parts["decisions"].calls, [], "既不发布也不撤权")
+        skipped = parts["audit"].fields_for("permission_refresh.user_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], "suppression_on_all_scope_unrepresentable")
 
 
 class LocalOverrideMergeTest(unittest.TestCase):

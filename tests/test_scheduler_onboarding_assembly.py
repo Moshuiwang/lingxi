@@ -299,6 +299,25 @@ class StockTokenSourceWiringTests(unittest.TestCase):
         )
         self.assertIs(duty._onboarding._stock_tokens, sentinel)
 
+    def test_a_wired_source_brings_the_legacy_importer_with_it(self) -> None:
+        """rc25 S-1（Issue #540）：存量令牌源装了，差集导入口必须一起装（真实的
+        ``PostgresLocalPermissionOverrideStore``）；否则 ``AutoOnboardingRunner`` 构造期就会
+        拒绝——这里钉住装配层确实交出了它。"""
+
+        from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
+
+        config = SchedulerConfig.from_env(WIRED_ENV)
+        duty = _build_onboarding_duty(
+            config,
+            stop=threading.Event(),
+            audit=RecordingAudit(),
+            employment_access_token=lambda: "u-token",
+            metric_translation_map={},
+            permission_publish=_WIRED_PERMISSION_PUBLISH,
+            stock_tokens=object(),
+        )
+        self.assertIsInstance(duty._onboarding._legacy_importer, PostgresLocalPermissionOverrideStore)
+
     def test_the_default_is_none_matching_pre_change_behaviour(self) -> None:
         """未传 ``stock_tokens`` 时默认 ``None``——哨兵：与改道前的调用点逐字节一致。"""
 
@@ -312,6 +331,7 @@ class StockTokenSourceWiringTests(unittest.TestCase):
             permission_publish=_WIRED_PERMISSION_PUBLISH,
         )
         self.assertIsNone(duty._onboarding._stock_tokens)
+        self.assertIsNone(duty._onboarding._legacy_importer)
 
 
 class AssemblyInvariantTests(unittest.TestCase):

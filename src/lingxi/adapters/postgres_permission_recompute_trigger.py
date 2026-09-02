@@ -154,7 +154,10 @@ class PermissionRecomputeAdapter:
         # 上一目了然。
         from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
         from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
-        from lingxi.adapters.postgres_local_permission import local_override_reader
+        from lingxi.adapters.postgres_local_permission import (
+            PostgresLocalPermissionOverrideStore,
+            local_override_reader,
+        )
         from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
         from lingxi.adapters.postgres_roster_audit import PostgresRosterBaselineReader
         from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
@@ -183,6 +186,7 @@ class PermissionRecomputeAdapter:
             metric_translation_map=load_company_function_metric_map(None),
             audit=self._audit,
             local_overrides=local_override_reader(self._dsn, timeouts=self._timeouts),
+            legacy_all_scope=PostgresLocalPermissionOverrideStore(self._dsn, timeouts=self._timeouts),
         )
 
         if pending.action_type is PendingActionType.SUSPEND_USER:

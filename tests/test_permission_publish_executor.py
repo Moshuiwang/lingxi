@@ -458,10 +458,13 @@ class PublishClaimTest(unittest.TestCase):
         # 审计列确实记下了这一行——正是这一点让"拿它当出身"变得危险。
         self.assertEqual(first.external_record_id, "rec_9")
 
-        # 重试：出身仍为 None（我们从没建过这一行），因此照常收敛。
+        # 重试：出身仍为 None（我们从没建过这一行），因此照常收敛。第一次的更新
+        # 其实已经写进去了（只是读回不明），重试读到的既有行内容与待写行逐字段相同
+        # → 「不变不回写」（rc25 S-1）：判发布完成、零外部写入。
         second = publish_claim(_claim(attempts=2), transport=table)
         self.assertTrue(second.published)
-        self.assertEqual(second.action, "update")
+        self.assertEqual(second.action, "unchanged")
+        self.assertEqual([action for action, _ in table.written], ["update"], "重试不再第二次写")
         self.assertEqual(table.rows[0]["fields"]["token_cipher"], "旧系统签发的密文")
 
     def test_an_uncertain_create_does_not_claim_provenance(self) -> None:
@@ -587,7 +590,9 @@ class PublishClaimTest(unittest.TestCase):
         first = publish_claim(_claim(), transport=table)
         second = publish_claim(_claim(attempts=2), transport=table)
         self.assertTrue(first.published and second.published)
-        self.assertEqual(second.action, "update")
+        # 同一内容第二次发布：既有行逐字段相同 → 「不变不回写」（rc25 S-1），仍收敛到
+        # 同一行；内容真的变了才走 update（见 ``UnchangedRowTest``）。
+        self.assertEqual(second.action, "unchanged")
         self.assertEqual(len(table.rows), 1)
         self.assertEqual(first.external_record_id, second.external_record_id)
 
@@ -690,8 +695,11 @@ class PublishClaimTest(unittest.TestCase):
 
         second = publish_claim(_claim(attempts=2), transport=table)
         self.assertTrue(second.published)
-        self.assertEqual(second.action, "update")
+        # 第一次其实已经建成（只是读回不明）：重试命中的既有行内容逐字段相同 →
+        # 「不变不回写」（rc25 S-1），不建第二行、也不再写一次。
+        self.assertEqual(second.action, "unchanged")
         self.assertEqual(len(table.rows), 1)
+        self.assertEqual([action for action, _ in table.written], ["create"])
 
     def test_invalid_payload_is_not_retried(self) -> None:
         attempt = publish_claim(_claim(payload={"record_key": FAKE_EMAIL}), transport=FakeTable())
@@ -750,6 +758,92 @@ class PublishClaimTest(unittest.TestCase):
                 user_id="usr_A",
                 permission_version=1,
             )
+
+
+def _existing_row(**overrides: object) -> dict:
+    fields = {
+        "record_key": FAKE_EMAIL,
+        "email": FAKE_EMAIL,
+        "name": FAKE_NAME,
+        "permissions": PERMISSIONS,
+        "status": "approved",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "token_cipher": "旧系统签发的密文",
+    }
+    fields.update(overrides)
+    return {"record_id": "rec_9", "fields": fields}
+
+
+class UnchangedRowTest(unittest.TestCase):
+    """「不变不回写」（rc25 S-1，Issue #540，`V-权限-16`）：既有行六个内容字段与待写行逐
+    字段相同且密文仍在 → 判发布完成、``action="unchanged"``、零外部写入、``updated_at``
+    逐字节不动；任一内容字段不同仍走 update；密文空洞与自建行密文改写守卫不受影响。
+
+    变异锚点：把短路条件里的 ``existing_cipher`` 拿掉，
+    ``test_a_cipher_hole_is_still_filled_even_when_content_matches`` 变红（空洞不再补写）；
+    把整段短路删掉，``test_identical_row_is_published_without_touching_the_table`` 变红。"""
+
+    def test_identical_row_is_published_without_touching_the_table(self) -> None:
+        table = FakeTable([_existing_row()])
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.PUBLISHED)
+        self.assertTrue(attempt.published)
+        self.assertEqual(attempt.action, "unchanged")
+        self.assertEqual(attempt.external_record_id, "rec_9")
+        self.assertEqual(table.written, [], "零外部写入")
+        self.assertEqual(table.calls, ["find_rows"], "表调用只有查找")
+        self.assertEqual(table.rows[0]["fields"]["updated_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(attempt.audit_facts()["action"], "unchanged")
+
+    def test_unchanged_is_decided_on_the_freshly_read_row_not_the_payload(self) -> None:
+        """判据来自 ``find_rows`` 刚读回的行：快照里的 ``updated_at`` 与表里不同也算相同。"""
+
+        table = FakeTable([_existing_row(updated_at="2025-12-31T00:00:00Z")])
+        attempt = publish_claim(_claim(row=_row()), transport=table)
+        self.assertEqual(attempt.action, "unchanged")
+        self.assertEqual(table.written, [])
+
+    def test_different_permissions_still_update(self) -> None:
+        table = FakeTable([_existing_row(permissions='{"1011":["旧口径"]}')])
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.action, "update")
+        self.assertEqual([action for action, _ in table.written], ["update"])
+        self.assertEqual(table.rows[0]["fields"]["permissions"], PERMISSIONS)
+
+    def test_a_different_name_or_status_still_updates(self) -> None:
+        """比较口径是六个内容字段（不只 permissions）。"""
+
+        for overrides in ({"name": "旧名"}, {"status": "pending"}):
+            with self.subTest(overrides=overrides):
+                table = FakeTable([_existing_row(**overrides)])
+                attempt = publish_claim(_claim(), transport=table)
+                self.assertEqual(attempt.action, "update")
+
+    def test_a_cipher_hole_is_still_filled_even_when_content_matches(self) -> None:
+        """`V-权限-11` 不变：既有行密文为空时不短路，走新建集补写密文。"""
+
+        table = FakeTable([_existing_row(token_cipher="")])
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.PUBLISHED)
+        self.assertEqual(attempt.action, "update")
+        self.assertEqual(set(table.written[0][1]), set(CREATED_FIELD_NAMES))
+        self.assertEqual(table.rows[0]["fields"]["token_cipher"], TOKEN_CIPHER)
+
+    def test_own_row_with_a_rewritten_cipher_is_still_a_mismatch(self) -> None:
+        """自建行密文改写守卫排在短路之前：内容相同也不能收敛成发布完成。"""
+
+        table = FakeTable([_existing_row(token_cipher="平台改过的值")])
+        attempt = publish_claim(_claim(created_record_id="rec_9"), transport=table)
+        self.assertEqual(attempt.outcome, PublishOutcome.MISMATCH)
+        self.assertEqual(attempt.mismatch_fields, ("token_cipher",))
+        self.assertEqual(table.written, [])
+
+    def test_record_key_case_difference_still_counts_as_changed(self) -> None:
+        """内容比较是逐字节的：既有行 ``record_key`` 大小写不同 → 走 update 收敛口径。"""
+
+        table = FakeTable([_existing_row(record_key=FAKE_EMAIL.upper(), email=FAKE_EMAIL.upper())])
+        attempt = publish_claim(_claim(), transport=table)
+        self.assertEqual(attempt.action, "update")
 
 
 class NextStatusTest(unittest.TestCase):

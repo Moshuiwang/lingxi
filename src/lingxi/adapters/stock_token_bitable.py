@@ -23,14 +23,16 @@ identity/onboarding_runner.py` 的 ``_issue_token``）。**全程只读**——�
   状态，不是"读取失败"）。这是唯一对 ``core`` 暴露的实现：装配层
   （``apps/scheduler/onboarding.build_stock_token_source``）只构造这一个类。
 
-## 只读需要的两个字段
+## 只读需要的三个字段
 
 正式表 7 个字段全部是单行文本（``core/permission/publish_row.py`` 模块文档「发布表的
-通道事实」），本模块只取其中两个：``token_cipher``（有没有密文、密文本身）与
-``status``（供调用方审计标注"是否非 approved"，不参与本模块的判定）。**不读
-``record_key``/``name``/``permissions``/``updated_at``**——匹配只需要 ``email``，其余
-字段一次都不进本模块的返回值，减少可识别数据的暴露面（同 ``feishu_roster_bitable`` 模块
-文档「数据范围没有因为本次新增而扩大」的同一条纪律）。
+通道事实」），本模块只取其中三个：``token_cipher``（有没有密文、密文本身）、
+``status``（供调用方审计标注"是否非 approved"，不参与本模块的判定）与
+``permissions``（rc25 S-1，Issue #540：存量用户首聊时把「旧行权限 − 银河当前翻译」
+落成本地授权的唯一输入，只在有密文可采纳时才向上透传）。**不读
+``record_key``/``name``/``updated_at``**——匹配只需要 ``email``，其余字段一次都不进
+本模块的返回值，减少可识别数据的暴露面（同 ``feishu_roster_bitable`` 模块文档
+「数据范围没有因为本次新增而扩大」的同一条纪律）。
 
 ## 多行命中：失败关闭，不猜
 
@@ -75,10 +77,11 @@ class StockTokenSourceError(RuntimeError):
 
 
 class RawStockTokenRow(NamedTuple):
-    """正式表命中的一行，只保留本模块要用的两列（模块文档「只读需要的两个字段」）。"""
+    """正式表命中的一行，只保留本模块要用的三列（模块文档「只读需要的三个字段」）。"""
 
     token_cipher: str
     status: str
+    permissions: str = ""
 
 
 def _require_https(base_url: object) -> str:
@@ -173,6 +176,7 @@ class BitableStockTokenSource:
                         RawStockTokenRow(
                             token_cipher=readback_text(fields.get("token_cipher")).strip(),
                             status=readback_text(fields.get("status")).strip(),
+                            permissions=readback_text(fields.get("permissions")).strip(),
                         )
                     )
             if data.get("has_more") is not True:
@@ -236,7 +240,9 @@ class DecryptingStockTokenSource:
         except McpTokenCipherError:
             logger.warning("存量令牌解密失败：主密钥配错或数据损坏（不回显密文）")
             return StockTokenLookup(state=DECRYPT_FAILED, status=raw.status)
-        return StockTokenLookup(state=ADOPTABLE, secret=secret, status=raw.status)
+        return StockTokenLookup(
+            state=ADOPTABLE, secret=secret, status=raw.status, permissions=raw.permissions
+        )
 
 
 __all__ = [

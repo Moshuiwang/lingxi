@@ -270,6 +270,23 @@ class ExistingPermissionRow(NamedTuple):
 
         return self.record_key.strip().casefold() == record_key.strip().casefold()
 
+    @property
+    def permissions(self) -> str:
+        """这一行当前的 ``permissions`` 单元格文本（归一口径同 :func:`readback_text`）。"""
+
+        return readback_text(self.fields.get("permissions"))
+
+    def content_fields(self, row: "PublishRow") -> dict[str, str]:
+        """按 ``row.content_fields`` 的键集（五个内容字段＝六字段去 ``updated_at``）读回本行对应值，
+        归一走同一个 :func:`readback_text`——与逐字段读回比对是同一把尺子。"""
+
+        return {name: readback_text(self.fields.get(name)) for name in row.content_fields}
+
+    def content_matches(self, row: "PublishRow") -> bool:
+        """内容是否与待写行**逐字段相同**（不看 ``updated_at``，rc25 S-1「不变不回写」）。"""
+
+        return self.content_fields(row) == row.content_fields
+
 
 class PermissionTableTransport(Protocol):
     """当前权限多维表格的可注入写读回面。
@@ -340,7 +357,8 @@ class PublishAttempt:
     user_id: str
     permission_version: int
     attempts: int = 1
-    # "create" / "update" / "none"：这次尝试对外部表格做了哪种动作。
+    # "create" / "update" / "unchanged" / "none"：这次尝试对外部表格做了哪种动作
+    # （``unchanged``＝既有行内容逐字段相同，零外部写入，rc25 S-1）。
     action: str = "none"
     external_record_id: str | None = None
     mismatch_fields: tuple[str, ...] = ()
@@ -585,6 +603,24 @@ def publish_claim(
             error_code="missing_token_cipher",
             failure_kind=PublishFailureKind.DEFINITE,
             detail=type(error).__name__,
+        )
+    if matches and existing_cipher and matches[0].content_matches(row):
+        # **不变不回写**（rc25 S-1，Issue #540）：既有行五个内容字段（六字段去
+        # ``updated_at``）与待写行逐字段相同且密文仍在——一个字都不提交，``updated_at``
+        # 也不再无谓刷新。判据用的是
+        # ``find_rows`` 刚读回的这一行（不是 outbox 里的上一版快照：决定层的
+        # ``UNCHANGED`` 管的是"要不要排意图"，这里管的是"要不要碰外部表"）。存量用户
+        # 首聊时正式表里本就有一行与合成结果相同的，从此零外部写入；密文空洞补写
+        # （``existing_cipher`` 为空）与自建行密文改写守卫（上面）都不走这条短路，
+        # `V-权限-11` 不变。
+        return PublishAttempt(
+            outcome=PublishOutcome.PUBLISHED,
+            outbox_id=claim.outbox_id,
+            user_id=claim.user_id,
+            permission_version=claim.permission_version,
+            attempts=claim.attempts,
+            action="unchanged",
+            external_record_id=record_id,
         )
     try:
         if matches:

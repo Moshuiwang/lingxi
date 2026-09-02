@@ -49,10 +49,12 @@ from test_permission_refresh_duty import (
     USER_ONE,
     FakeDecisions,
     FakeGalaxy,
+    FakeLegacyAllScope,
     FakeLocalOverrides,
     FakePublishHistory,
     FixedClock,
     RecordingAudit,
+    _all_scope_entry,
     galaxy_snapshot,
     identity,
     roster_row,
@@ -89,6 +91,7 @@ def build_recompute(
     local_overrides=None,
     audit=None,
     clock=None,
+    legacy_all_scope=None,
 ):
     audit = audit or RecordingAudit()
     decisions = decisions or FakeDecisions()
@@ -106,6 +109,7 @@ def build_recompute(
         audit=audit,
         local_overrides=local_overrides,
         clock=clock or FixedClock(NOW),
+        legacy_all_scope=legacy_all_scope,
     )
     return recompute, {"audit": audit, "decisions": decisions, "history": history}
 
@@ -395,6 +399,55 @@ class RecomputeAndPublishGrantTests(unittest.TestCase):
             parts["audit"].actions(),
             "有限指标通配这一支恒不登记跳过原因（模块文档「通配角 v2」）",
         )
+
+
+class LegacyAllScopeRecomputeTests(unittest.TestCase):
+    """定向重算侧的「全部」组补行与不可表示 fail-closed（rc25 S-1 方案 E），与每日批
+    ``LegacyAllScopeRefreshTest`` 同一组语义。"""
+
+    def test_missing_metrics_are_appended_before_publishing(self) -> None:
+        overrides = FakeLocalOverrides({USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME),)})
+        expander = FakeLegacyAllScope(overrides=overrides)
+        recompute, parts = build_recompute(
+            identities=(identity(),), published_users={USER_ONE}, local_overrides=overrides, legacy_all_scope=expander
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.ENQUEUED)
+        self.assertEqual(expander.calls[0]["metrics"], (METRIC_NAME_TWO,))
+        self.assertEqual(
+            parts["audit"].fields_for("permission_targeted_recompute.legacy_all_scope_refreshed"),
+            [{"user": USER_ONE, "added": 1}],
+        )
+        [call] = parts["decisions"].calls
+        self.assertEqual(json.loads(call["row"].permissions), {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})})
+
+    def test_unrepresentable_suppression_skips_without_publishing_or_revoking(self) -> None:
+        overrides = FakeLocalOverrides(
+            {
+                USER_ONE: (
+                    _all_scope_entry(metric_name=METRIC_NAME),
+                    LocalPermissionOverrideEntry(
+                        user_id=USER_ONE,
+                        direction=OverrideDirection.SUPPRESS,
+                        company_id=COMPANY_ID,
+                        metric_name=METRIC_NAME,
+                        reason="屏蔽",
+                        initiated_by_open_id="ou_admin",
+                        pending_action_id="pac_s",
+                        created_at=NOW,
+                    ),
+                )
+            }
+        )
+        recompute, parts = build_recompute(identities=(identity(),), published_users={USER_ONE}, local_overrides=overrides)
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, "suppression_on_all_scope_unrepresentable")
+        self.assertEqual(parts["decisions"].calls, [])
 
 
 class PublishNeedsCipherAuditTests(unittest.TestCase):

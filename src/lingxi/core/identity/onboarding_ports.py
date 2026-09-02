@@ -15,6 +15,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from lingxi.core.identity.first_contact import EmploymentStatus
 from lingxi.core.identity.provisioning import UserProvisioningStatus
+from lingxi.core.permission.legacy_diff import LegacyImportPlan, LegacyImportReport
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry
 from lingxi.core.permission.mcp_readiness import ReadinessBinding
 
@@ -122,6 +123,19 @@ class LocalOverrideSource(Protocol):
     """本地权限覆盖的按用户读取口（S-P-3 #319）。与 permission_refresh.py 的同名协议各自独立一份：``core/`` 不 import ``apps/``（代码框架第二节）。"""
 
     def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
+
+
+class LegacyPermissionImporter(Protocol):
+    """存量差集导入的落库口（rc25 S-1，Issue #540）。实现见
+    ``adapters/postgres_local_permission.py::import_legacy_plan``：每用户一事务——合成一条
+    已终态的 ``pending_action``（``reason='legacy_import_2_0'``）与全部
+    ``local_permission_override`` 行原子落库；撞唯一索引降级为 ``already_present``。
+    任何异常原样上抛，由 ``AutoOnboardingRunner`` 按本侧故障 fail-closed（外部表零写入）。"""
+
+    def import_plan(
+        self, *, user_id: str, target_open_id: str, plan: LegacyImportPlan, now: datetime
+    ) -> LegacyImportReport: ...
+
 
 
 class ReadinessConfirmer(Protocol):

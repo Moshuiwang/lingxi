@@ -183,6 +183,173 @@ class NoLocalSourceIsIdentityTests(unittest.TestCase):
         self.assertEqual(result.permissions, {"1011": ("日活",)})
 
 
+class LocalAllScopeTests(unittest.TestCase):
+    """本地「全部」组（rc25 S-1，Issue #540；``merge_sources`` 模块文档「本地 ``"*"`` 组」
+    一节）：本地授权带 ``"*"`` 公司键而银河侧没有 ``"*"`` 时，结果只产出 ``"*"`` 键，
+    **从不产出比 ``"*"`` 更窄的具体公司键**；抑制以具体键表达，减到空不可表示。
+
+    变异锚点：把 ``if ALL_COMPANIES_KEY in local_grants:`` 这一支整体删掉（退回非通配
+    代数），``test_specific_galaxy_collapses_into_the_star_key_only`` 与
+    ``test_never_emits_a_key_narrower_than_star`` 变红（结果长出具体公司键）。"""
+
+    def test_specific_galaxy_collapses_into_the_star_key_only(self) -> None:
+        """精确形状（独立审核 P2-3）：``"*"`` 只放组本身；银河各公司值留在各自具体键下
+        （＝ ``"*"`` ∪ 该公司值），不被抹平到全部公司。"""
+
+        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="*", metric_name="m2"))
+
+        result = merge_permission_sources(
+            galaxy={"88": ("g1",), "99": ("g2",)}, local=local, full_access_wildcard=False
+        )
+
+        self.assertEqual(
+            result.permissions,
+            {"*": ("m1", "m2"), "88": ("g1", "m1", "m2"), "99": ("g2", "m1", "m2")},
+        )
+        self.assertEqual(result.skipped_reasons, ())
+        self.assertEqual(result.unrepresentable_companies, ())
+
+    def test_galaxy_values_already_inside_the_group_emit_no_specific_key(self) -> None:
+        """``{"*":["*"]}`` 用户的典型形态：组＝映射全部指标，银河各公司值都在组里 →
+        发布行只有 ``"*"`` 键。"""
+
+        local = _resolved(*(_entry(company_id="*", metric_name=m) for m in ("g1", "g2", "m1")))
+
+        result = merge_permission_sources(galaxy={"88": ("g1",), "99": ("g2",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(result.permissions, {"*": ("g1", "g2", "m1")})
+
+    def test_zero_galaxy_publishes_exactly_the_group_under_star(self) -> None:
+        local = _resolved(_entry(company_id="*", metric_name="m1"))
+
+        result = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
+
+        self.assertEqual(result.permissions, {"*": ("m1",)})
+
+    def test_a_company_specific_local_grant_stays_under_that_company(self) -> None:
+        """不扩权（独立审核 P2-3）：40 号公司专有的本地授权只出现在 ``"40"`` 键下，
+        不会因为存在「全部」组就被发给全部公司；``"40"`` 键仍 ⊇ ``"*"``（防窄化）。"""
+
+        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="40", metric_name="x9"))
+
+        result = merge_permission_sources(galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(result.permissions, {"*": ("m1",), "40": ("m1", "x9"), "88": ("g1", "m1")})
+
+    def test_never_emits_a_key_narrower_than_star(self) -> None:
+        """自证明：任何具体公司经读侧回退制查到的集合 ⊇ 银河该公司 ∪ 本地全部授权指标。"""
+
+        from lingxi.core.permission.publish_row import lookup_metrics
+
+        galaxy = {"88": ("g1", "g2"), "99": ("g3",)}
+        local = _resolved(_entry(company_id="*", metric_name="m1"), _entry(company_id="99", metric_name="x9"))
+        result = merge_permission_sources(galaxy=galaxy, local=local, full_access_wildcard=False)
+
+        star = set(result.permissions["*"])
+        for company, values in result.permissions.items():
+            self.assertTrue(star <= set(values), f"具体键 {company} 不得比 * 窄")
+        for company, metrics in galaxy.items():
+            seen = set(lookup_metrics(result.permissions, company))
+            self.assertTrue(set(metrics) <= seen, company)
+            self.assertIn("m1", seen, company)
+        self.assertIn("x9", set(lookup_metrics(result.permissions, "99")))
+        # 没有任何来源提到的公司：读侧回退到 * ＝ 组本身，且不含别家公司的专有指标。
+        self.assertEqual(set(lookup_metrics(result.permissions, "40")), {"m1"})
+
+    def test_limited_galaxy_wildcard_keeps_v2_behaviour(self) -> None:
+        local = _resolved(_entry(company_id="*", metric_name="m1"))
+
+        result = merge_permission_sources(galaxy={"*": ("g1",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(result.permissions, {"*": ("g1", "m1")})
+        self.assertEqual(result.skipped_reasons, ())
+
+    def test_true_full_access_galaxy_wildcard_still_skips_the_group(self) -> None:
+        local = _resolved(_entry(company_id="*", metric_name="m1"))
+
+        result = merge_permission_sources(galaxy={"*": ("g1",)}, local=local, full_access_wildcard=True)
+
+        self.assertEqual(result.permissions, {"*": ("g1",)})
+        self.assertIn(REASON_GRANT_REDUNDANT_WILDCARD, result.skipped_reasons)
+
+    def test_a_company_suppression_becomes_a_specific_key_of_star_minus_suppressed(self) -> None:
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="*", metric_name="m2"),
+            _entry(company_id="88", metric_name="m2", direction=OverrideDirection.SUPPRESS),
+        )
+
+        result = merge_permission_sources(galaxy={"99": ("g1",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(result.permissions, {"*": ("m1", "m2"), "88": ("m1",), "99": ("g1", "m1", "m2")})
+        self.assertEqual(result.unrepresentable_companies, ())
+
+    def test_a_suppression_that_does_not_bite_emits_no_specific_key(self) -> None:
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="88", metric_name="nope", direction=OverrideDirection.SUPPRESS),
+        )
+
+        result = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
+
+        self.assertEqual(result.permissions, {"*": ("m1",)})
+
+    def test_suppressing_everything_for_one_company_is_unrepresentable(self) -> None:
+        """减到空：写侧不产出空列表、读侧缺键会回退 ``"*"``——两条路都表达不了"这家公司
+        一个指标都没有"，登记进 ``unrepresentable_companies`` 交调用方 fail-closed。"""
+
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="88", metric_name="m1", direction=OverrideDirection.SUPPRESS),
+        )
+
+        result = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
+
+        self.assertEqual(result.unrepresentable_companies, ("88",))
+        self.assertEqual(result.permissions, {"*": ("m1",)})
+
+    def test_suppressing_on_the_star_key_subtracts_from_the_list(self) -> None:
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="*", metric_name="m2"),
+            _entry(company_id="*", metric_name="m2", direction=OverrideDirection.SUPPRESS),
+        )
+        # 同键 grant+suppress 已由 resolve_local_overrides 判 suppress 赢；这里只剩 m1。
+        result = merge_permission_sources(galaxy={"88": ("m2",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(
+            result.permissions,
+            {"*": ("m1",), "88": ("m1", "m2")},
+            "* 上的抑制只作用于组本身；银河给 88 的 m2 仍在 88 键下",
+        )
+
+    def test_a_fully_suppressed_group_falls_back_to_the_plain_algebra(self) -> None:
+        """整组被同键抑制清空后本地不再有 ``"*"`` 授权：回到非通配代数，银河具体键原样
+        产出；``"*"`` 键上的抑制不跨到具体公司键（既有语义，不在本卡范围）。"""
+
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="*", metric_name="m1", direction=OverrideDirection.SUPPRESS),
+        )
+
+        result = merge_permission_sources(galaxy={"88": ("g1",)}, local=local, full_access_wildcard=False)
+
+        self.assertEqual(result.permissions, {"88": ("g1",)})
+        self.assertEqual(result.unrepresentable_companies, ())
+
+    def test_star_group_suppressed_to_nothing_with_zero_galaxy_is_empty(self) -> None:
+        local = _resolved(
+            _entry(company_id="*", metric_name="m1"),
+            _entry(company_id="*", metric_name="m2"),
+            _entry(company_id="*", metric_name="m1", direction=OverrideDirection.SUPPRESS),
+            _entry(company_id="*", metric_name="m2", direction=OverrideDirection.SUPPRESS),
+        )
+
+        result = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
+
+        self.assertEqual(result.permissions, {})
+
+
 class WildcardRoleTests(unittest.TestCase):
     """通配角 v1 语义（编排者裁定）：``galaxy`` 出现 ``"*"`` 键（当前唯一形态=513
     后台管理员，``all_companies=True``）时，本地授权与抑制整体不参与合并，产出与

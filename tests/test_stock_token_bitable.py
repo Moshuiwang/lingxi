@@ -327,5 +327,53 @@ class DecryptingSourceTest(unittest.TestCase):
             source.lookup(FAKE_EMAIL)
 
 
+class PermissionsColumnTest(unittest.TestCase):
+    """``permissions`` 列读取（rc25 S-1，Issue #540）：原文随可采纳结果透传，其余状态
+    恒为 ``None``——它是存量差集导入的唯一输入，本模块只搬运不解释。"""
+
+    def test_lookup_raw_carries_the_permissions_text(self) -> None:
+        reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {
+                "email": FAKE_EMAIL, "token_cipher": "c", "status": "approved",
+                "permissions": ' {"*":["*"]} ',
+            }}])]
+        )
+        raw = reader.lookup_raw(FAKE_EMAIL)
+        self.assertEqual(raw, RawStockTokenRow(token_cipher="c", status="approved", permissions='{"*":["*"]}'))
+
+    def test_missing_permissions_cell_reads_as_empty_text(self) -> None:
+        reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {"email": FAKE_EMAIL, "token_cipher": "c"}}])]
+        )
+        self.assertEqual(reader.lookup_raw(FAKE_EMAIL).permissions, "")
+
+    def test_adoptable_lookup_passes_permissions_through(self) -> None:
+        reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {
+                "email": FAKE_EMAIL, "token_cipher": _cipher_of("plain"), "status": "approved",
+                "permissions": '{"88":["m1"]}',
+            }}])]
+        )
+        source = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY))
+        result = source.lookup(FAKE_EMAIL)
+        self.assertEqual(result.state, ADOPTABLE)
+        self.assertEqual(result.permissions, '{"88":["m1"]}')
+
+    def test_only_adoptable_carries_permissions(self) -> None:
+        no_cipher_reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {"email": FAKE_EMAIL, "permissions": '{"88":["m1"]}'}}])]
+        )
+        failed_reader, _ = _reader(
+            [_page([{"record_id": "rec_1", "fields": {
+                "email": FAKE_EMAIL, "token_cipher": "not-a-valid-envelope", "permissions": '{"88":["m1"]}',
+            }}])]
+        )
+        for reader, expected_state in ((no_cipher_reader, NO_CIPHER), (failed_reader, DECRYPT_FAILED)):
+            with self.subTest(state=expected_state):
+                result = DecryptingStockTokenSource(reader, cipher=McpTokenCipher(SPEC_MASTER_KEY)).lookup(FAKE_EMAIL)
+                self.assertEqual(result.state, expected_state)
+                self.assertIsNone(result.permissions)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
