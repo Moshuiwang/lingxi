@@ -11,7 +11,7 @@
 
 | 服务 | 形态 | 入口 | 说明 |
 | --- | --- | --- | --- |
-| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据续期扫描、九十天保留清理、空闲会话到点清理、花名册审计日报、运行告警（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 起 `main()` 真实装配 `AlertingDuty`） |
+| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据续期扫描、九十天保留清理（含 rc25 S-3b 新增的内测采集表到期删除，第 12 条职责）、空闲会话到点清理、花名册审计日报、运行告警（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 起 `main()` 真实装配 `AlertingDuty`） |
 | `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57）；同进程后台线程跑投递消费循环（#152）。放在非默认 profile 里，见下 |
 | `worker` | **一次性作业** | `python -m lingxi.apps.worker` | 单回合受控执行。跑一个 Agent SDK 回合、往 stdout 写一个 JSON 报告、退出 |
 | `worker-queue` | **常驻服务，仅 `mvp` profile**（[#153](https://github.com/Moshuiwang/lingxi/issues/153)） | `python -m lingxi.apps.worker`（`LINGXI_WORKER_MODE=queue`） | 与 `worker` **同一镜像**，长期领取队列任务；收到 `SIGTERM` 后停止领取、在途任务在一个轮询周期量级内被请求中断、有界预算内收口；同一收口周期消费 Agent 会话 JSONL 物理清理队列 |
@@ -83,7 +83,11 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 **为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）**同样跑 Agent SDK**（queue 模式下每领一个任务就起一个回合，并发上限 `LINGXI_WORKER_MAX_CONCURRENCY`，见 `compose.yaml` worker-queue 服务块的资源注释），因此它的进程环境同样会被 Claude Code CLI 与 MCP 子进程继承；而它又必须持有 `LINGXI_POSTGRES_DSN` 才能领任务——**这两件事同时成立，就是它必须有自己独立一份、裁到最小的 env 文件，不能借用 `worker` 那份的原因**（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
 
-> **更正与已知边界（2026-09-02，对抗审查 R6-D2）**：本节此前写「`worker-queue` 不跑 Agent SDK、不继承环境给任何子进程」，**这一句不成立**，上面已改。`biai-stage` 受控探针实测坐实：一次会话窗口内，容器里 `claude` 子进程的 `/proc/<pid>/environ` 含 `postgres://` 连接串（进程名与计数级证据，未打印任何值）。也就是说 **生产数据库 DSN 会随进程环境进入 Claude CLI 子进程**。当前的补偿是执行层的 PreToolUse 白名单（无 `Bash`、无任意 `Read`）——它是唯一判定层，同一探针另证其超时行为是失败关闭。**把 DSN 在起 CLI 之前从进程环境摘掉**这项加固尚未实现，登记为待办，不得据本节声称已隔离。
+> **更正与已知边界（2026-09-02，对抗审查 R6-D2）**：本节此前写「`worker-queue` 不跑 Agent SDK、不继承环境给任何子进程」，**这一句不成立**，上面已改。`biai-stage` 受控探针实测坐实：一次会话窗口内，容器里 `claude` 子进程的 `/proc/<pid>/environ` 含 `postgres://` 连接串（进程名与计数级证据，未打印任何值）。也就是说 **生产数据库 DSN 会随进程环境进入 Claude CLI 子进程**。当时的补偿只有执行层的 PreToolUse 白名单（无 `Bash`、无任意 `Read`），同一探针另证其超时行为是失败关闭。
+>
+> **加固已落（2026-09-03，rc25 S-3b，[PR #560](https://github.com/Moshuiwang/lingxi/pull/560)）**：DSN 现在在起 Agent SDK 之前就已经不在进程环境里。摘除发生在**真实进程入口** `apps/worker/__main__.py`——`detach_process_environment()` 先把 `os.environ` 整份快照下来，再把 `LINGXI_POSTGRES_DSN` 从 `os.environ` 摘掉，然后把快照作为 `env=` 喂给 `main()`；`main()` 自己一个字节都不改 `os.environ`，只把「入口摘掉了哪些变量」记进启动日志（只记变量名、不回显值）。**落点必须在入口而不是 `main()` 里**：`main()` 会被单测在同一个解释器里反复调用，放在那里跑完几条队列模式用例之后同进程的真库用例就全都读不到 DSN 了（2026-09-02 CI 实测 40 个 `setUpClass` KeyError）。Dockerfile 的 `CMD ["python", "-m", "lingxi.apps.worker"]` 走的就是这个入口，因此生产必然执行。**为什么 SDK 侧关不掉**：已回源确认随包 `claude-agent-sdk` 的子进程传输层用 `os.environ` 全量继承再叠 `options.env`——`options.env` 只能往上加、不能往下减，没有任何参数能删掉一个已经在进程环境里的变量，所以只能在进程入口摘。**证据等级 3，未连任何机器**：本机起真实子进程读 `/proc/<pid>/environ`，含 DSN 的子进程数为 0（反向对照证明不摘时是 1），另有真实进程端到端用例证明「摘完没把自己饿死」（失败理由是缺 `LINGXI_USER_ENV_ROOT` 而不是缺 DSN）。**未做**：一次真问数的 stage 复现。
+
+**有两个变量刻意不放在这七份 env 文件里，而是写在 compose 的 `environment:` 块中**：`LINGXI_WORKER_WORKSPACE`（Agent SDK 回合的工作目录，Trace #544 S-2b）与 `LINGXI_DEPLOY_ENVIRONMENT`（「这套部署是不是生产」的代码侧判据，Trace #544 S-3b；`compose.prod.yaml` 的 `worker` 与 `worker-queue` 各写一条 `LINGXI_DEPLOY_ENVIRONMENT: "prod"`）。理由相同且是全部理由：**compose 的 `environment:` 覆盖 `env_file`**，因此判据放在这里之后，「有人把 stage 的某份 worker env 文件整份抄进 `.env.prod.worker*`」这类事故里抄来的值不再可能生效——判据活在入库、被评审、被门禁扫描的那份文件里。**不要往 env 文件里写它们**，写了不生效，只会让人误以为部署值是那一份。`LINGXI_DEPLOY_ENVIRONMENT` 声明为生产时，内测轮内容级采集一律不启用（两个开关配得再对也不生效；主开关的形态校验仍排在生产否决之前，错值仍然启动即失败）；未声明或声明成别的值时行为与加这道兜底之前逐字节一致（stage 现状不变，stage 侧要不要做对称声明尚未裁定）。`scripts/ci/check_deploy_contract.py` 的 `check_prod_declares_deploy_environment` 与 `check_worker_workspace_isolation` 分别把两者钉成会变红的断言。
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
@@ -586,11 +590,11 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 
 | 服务 | stage（cpus / mem / pids） | 生产（cpus / mem / pids） | 依据 |
 | --- | --- | --- | --- |
-| `scheduler` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程。`compose.prod.yaml` 的 `memory` 默认值是 `1G`，**上线由根 `.env.prod` 覆盖为 512M**，理由见下「三个常驻服务的加总核对」 |
-| `gateway` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 长连接接入 + 事件落库，无子进程扇出。`memory` 与 `scheduler` 同一处置：compose 默认 `1G`，**上线由根 `.env.prod` 覆盖为 512M** |
+| `scheduler` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程。`compose.prod.yaml` 的 `memory` **无默认值**（rc25 S-3b R6-D4 起是 `${VAR:?}`），**必须由根 `.env.prod` 给出 512M**，理由见下「三个常驻服务的加总核对」 |
+| `gateway` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 长连接接入 + 事件落库，无子进程扇出。`memory` 与 `scheduler` 同一处置：**无默认值**，**必须由根 `.env.prod` 给出 512M** |
 | `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
 | `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
-| `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
+| `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / **2G** / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合。`memory` 默认值 rc25 S-3b（报告 P3）由 `4G` 降到 `2G`：`4G` 大于宿主机可用内存（约 3.9GiB），一个永远不会生效的上限比没有上限更糟 |
 | `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **1.5 / 2G / 512** | 产品负责人裁定机器与 stage 同型（Issue #496/#502） |
 
 ### 生产 worker-queue 合同（Issue #494/#496/#502，2026-08-31）
@@ -651,24 +655,27 @@ LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
 | --- | --- | --- | --- | --- | --- |
 | stage 实配 | 512M | 512M | 2G | **3G** | 余约 700MB ✅ |
 | **生产上线实配** | **512M** | **512M** | 2G | **3G** | 余约 700MB ✅ |
-| （对照）`compose.prod.yaml` 未覆盖时的默认值 | 1G | 1G | 2G | 4G | 会超出主机 ❌ |
+| （对照，**已不可能发生**）`compose.prod.yaml` 曾有的 `1G` 默认值 | 1G | 1G | 2G | 4G | 会超出主机 ❌ |
 
-**第三行是对照，不是上线值。** `compose.prod.yaml` 里 `scheduler`/`gateway` 的
-`memory` 写成 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}` / `${LINGXI_GATEWAY_MEM_LIMIT:-1G}`
-——`1G` 只是**不覆盖时的默认值**，而生产从来不裸跑默认值：上线时根 `deploy/.env.prod`
-把这两项钉成与 stage 同值 `512M`（元守护 W0-3 盘点结论，执行步骤见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519) S-3.5），
-加总因此是 **3G ≤ 3.74GiB**。这与 D5「生产与 stage 同型」是同一件事，不是新的资源
-合同变更，也**不需要改 `compose.prod.yaml` 的默认值**。所以生产根 `.env.prod` 除了
-上面那五行 worker-queue 值，还须包含：
+**第三行是历史对照，不是上线值，而且现在已经不可能发生。** 生产上线时根
+`deploy/.env.prod` 把这两项钉成与 stage 同值 `512M`（元守护 W0-3 盘点结论，执行步骤
+见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519) S-3.5），加总因此是
+**3G ≤ 3.74GiB**。这与 D5「生产与 stage 同型」是同一件事，不是新的资源合同变更。
+生产根 `.env.prod` 除了上面那五行 worker-queue 值，还须包含：
 
 ```dotenv
 LINGXI_SCHEDULER_MEM_LIMIT=512M
 LINGXI_GATEWAY_MEM_LIMIT=512M
 ```
 
-**漏配这两行的后果是静默的**：它们是 `:-` 有默认值形态（不是 worker-queue 那种
-`${VAR:?}` fail-fast），漏了不会报错，只会安静地退回 `1G`、把加总推到 4G。部署前
-用渲染回读确认，不要只看 env 文件：
+**漏配这两行的后果自 rc25 S-3b（报告 R6-D4）起不再是静默的**：`compose.prod.yaml` 里
+`scheduler`/`gateway` 的 `memory` 已由 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}` /
+`${LINGXI_GATEWAY_MEM_LIMIT:-1G}` 改成**无默认值**的 `${VAR:?…}`，与 worker-queue 四项
+同一姿态。漏配时 `docker compose config`/`up` **直接失败**并指名缺哪个变量
+（`required variable LINGXI_SCHEDULER_MEM_LIMIT is missing a value`），起不来，
+不会再安静地退回 `1G`、把加总推到 4G。`PROD_EXTERNAL_HOST_SPEC_LIMITS` 已把这两项
+纳入门禁，改回 `:-` 形态会判红。渲染回读仍然建议做（它同时核对**值对不对**，而不只是
+在不在）：
 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config scheduler gateway`。
 
 **怎么读这张表**：`deploy.resources.limits` 是**上界，不是预留**，三者同时顶格才会
