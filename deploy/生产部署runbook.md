@@ -77,7 +77,7 @@ docker compose --env-file deploy/.env.prod \
 
 ### 2.2 部署前置检查（preflight）
 
-逐条通过 [`deploy/README.md`「部署前置检查」](README.md)的两项：七个文件均 `0600` 且属主为部署用户；部署机已用只读拉取身份登录 GHCR。任一项不符不得执行下一步。
+逐条通过 [`deploy/README.md`「部署前置检查」](README.md)：七个文件均 `0600` 且属主为部署用户。**「部署机已登录 GHCR」这一项当前不适用**——四个镜像包公开、两台机器都靠匿名拉取（见 README「主机读取身份」的现状与已知边界）；包改为 private 之后它才重新成立。第一项不符不得执行下一步。
 
 **外加一项就绪检查（[Issue #499](https://github.com/Moshuiwang/lingxi/issues/499)，rc23）**：确认 `.env.prod.gateway` 里 `LINGXI_DOCX_MARKDOWN_CONVERT` 的**实际取值**与本仓库当前结论一致——
 
@@ -104,6 +104,23 @@ docker compose --env-file deploy/.env.prod \
   --profile job run --rm migrate
 ```
 
+### 2.3.5 起服务前的两道前置（对抗审查 R6-D7 补入）
+
+**这两道前置都在 `up -d` 之前，缺一不可。** `--profile mvp up -d` 一旦执行，scheduler 立即开始消费 `publish_outbox` 往正式权限表写、gateway 立即接管 Bot-Prod 长连接——两件事都是对外部系统的真实写入，事后无法撤销。本节此前只有「2.3 迁移 → 2.4 起服务」，这两道前置一条也没写；2026-09-02 首发是靠 Trace [#521](https://github.com/Moshuiwang/lingxi/issues/521) 的执行合同（`up -d` 只能在 G2 之后）兜住的，仓库正文没有可复现记录。
+
+**① 外部写入方停写门（首发记为 G2）**——只在「本产品之外还有别的写入方在写同一张正式权限表」时适用（首发的旧系统即是）：
+
+1. 旧系统**全部**写路径逐条停止并取得回执（定时任务、机器人、API、文件发送四类都要点到）；
+2. 跨一个**最长旧写入周期**之后复读正式表，逐行不变。首发的窗口取「全部能写表的写入方下次触发时刻」的最大值再 +5 分钟，实测跨 15 分钟、跨两个旧 timer 整点边界；
+3. 判据是行数 / distinct / 重复 / 空键 / 空令牌 / 键与邮箱不等六项计数与停写前快照逐字相同，且整表摘要 `rows_digest` 相同。
+
+**这一门不过就不许 `up -d`**：两个写入方并存即双写，而正式权限表是外部表、写错不可回滚。
+
+**② 凭据与运行时配置落位（首发记为 E8）**——`up -d` 之前必须完成：
+
+- **`runtime-config` 卷内容自带**（详见 11.2）：`system_prompt.md` 到位并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE`。**没有安全的「留空」选项**——文件缺失时 worker 静默降级为无提示词执行，三服务照样全 `healthy`、观察期照样全绿，只有答案质量与验证过的不是一回事；
+- **首次授权走通**（详见 11.5）：`reauthorize` 完成、专用授权凭据落到凭据卷。凭据不到位时 scheduler 起来也同步不了花名册，首批用户一个都开不通。
+
 ### 2.4 起服务（`--profile mvp`）
 
 ```bash
@@ -113,6 +130,12 @@ docker compose --env-file deploy/.env.prod \
 ```
 
 `mvp` profile 同时拉起 `scheduler`、`gateway`、常驻 `worker-queue` 三个常驻服务，语义与 `deploy/README.md` 中 Stage 使用的 profile 完全一致，只替换了 `--env-file` 与 compose 覆盖文件。
+
+**三条命令形态纪律（2026-09-02 首发实测，均属「不报错的错法」，详见 11.3）**：
+
+1. **`--profile mvp` 不能省**：裸 `up -d` 只起 `scheduler`，`gateway` 与 `worker-queue` 都在 `mvp` profile 里；漏掉它 Bot-Prod 长连接根本不接，而命令是成功返回的。
+2. **`-f compose.yaml -f compose.prod.yaml` 两个都不能省**，且对**每一条** compose 命令都成立（含 `migrate`、`reauthorize` 这类临时作业与单服务操作）：各服务的 `env_file` **只声明在覆盖文件里**，只带 `compose.yaml` 时命令照样能跑，跑出来的却是一个没有任何凭据与配置的容器。
+3. **`run --rm <服务> <参数…>` 的参数会替换掉 compose 里声明的 `command`**：需要传参时必须把入口写全，例如 `… run --rm reauthorize python -m lingxi.apps.reauthorize <参数…>`；直接在服务名后追加参数会把入口一起丢掉。
 
 ### 2.5 健康回读
 
@@ -170,7 +193,16 @@ LINGXI_WORKER_IMAGE_DIGEST=@sha256:<worker 镜像本批次 digest>
 LINGXI_MIGRATE_IMAGE_DIGEST=@sha256:<migrate 镜像本批次 digest>
 ```
 
-**部署时核对**：`up -d` 完成后执行 `docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml images`，逐行核对每个服务实际运行的镜像 digest 与上面四个变量固定的值一致；不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
+**部署时核对**：逐份镜像执行
+
+```bash
+docker image inspect --format='{{index .RepoDigests 0}}' \
+  ghcr.io/moshuiwang/lingxi-scheduler:<本批 tag>   # gateway / worker / migrate 同构，各一次
+```
+
+输出形如 `ghcr.io/moshuiwang/lingxi-scheduler@sha256:…`，取 `@` 之后的部分与上面四个变量固定的值逐字比对。不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
+
+> **为什么不用 `docker compose … images`**（2026-09-02 首发实测，实录见 11.3 第 2 条）：那条命令列的是**本项目当前存在的容器**，`migrate` 这类 `--profile job run --rm` 的一次性作业跑完不留容器，输出为空，`migrate` 这一步因此核不到任何东西。`docker image inspect` 读的是本机镜像元数据，不依赖容器是否存在，`up -d` 前后都能用。
 
 ## 四、单实例纪律
 
@@ -207,9 +239,9 @@ LINGXI_MIGRATE_IMAGE_DIGEST=@sha256:<migrate 镜像本批次 digest>
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml up -d
 
-# 3. 回读确认实际运行 digest 与目标一致（见「三、镜像 digest 固定」）
-docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml images
+# 3. 回读确认实际运行 digest 与目标一致（见「三、镜像 digest 固定」；四份镜像各一次）
+docker image inspect --format='{{index .RepoDigests 0}}' \
+  ghcr.io/moshuiwang/lingxi-scheduler:<回滚目标 tag>
 ```
 
 **回滚不触碰数据库与持久卷**：不执行 `down` 移除 volumes，不执行任何迁移降级操作。这一前提成立的条件是迁移遵守「先加后删」——破坏性变更必须拆成两次发布，否则回滚就从「切镜像重启」变成「恢复数据库备份」；该前提由 `V-部署-05`（[验收矩阵「部署与迁移」分册](../docs/技术设计/验收矩阵-部署与迁移.md#三部署与迁移断言)）在每次 CI 上机械核对，2026-08-23 已有 `biai-stage` 真实回滚演练证据（整队切回旧候选、三容器在当前库结构上全部 healthy）。
@@ -233,7 +265,7 @@ docker compose --env-file deploy/.env.prod \
 
 数据库从备份恢复后，在重新对外提供服务（即允许新的问数流量、重新拉起三个常驻服务处理正常任务）之前，**必须先按内容原始写入时间重新执行一轮保留清理**（`V-投递-07` 语义，见[验收矩阵「交付与投递」分册](../docs/技术设计/验收矩阵-交付与投递.md#问数结果投递与正文生命周期)）：备份或 WAL 中无法逐条即时删除的内容（含尚未结束的会话保留窗口）按原写入时间计算到期，不能把恢复完成的时间当成新的保留起点，也不能借这次恢复重新打开一个已经结束的会话窗口。恢复历史备份可能重新带回备份时已有的用户内容，这是已经接受的灾备取舍，但「重新提供服务前先补清理」是这条取舍成立的前提，不是可选步骤。
 
-一次真实的数据库恢复演练目前尚未执行（[Issue #369 第 4 条](https://github.com/Moshuiwang/lingxi/issues/369)）；生产首次部署前应至少完成一次真实恢复演练，核对上述补清理动作确实被执行且结果符合预期，本 runbook 只登记要求，不代为执行。
+一次真实的数据库恢复演练目前尚未执行（[Issue #369 第 4 条](https://github.com/Moshuiwang/lingxi/issues/369)）；生产首次部署前应至少完成一次真实恢复演练，核对上述补清理动作确实被执行且结果符合预期，本 runbook 只登记要求，不代为执行。**已知阻碍（对抗审查 P3-1）**：现有的 `scripts/ops/backup_restore_drill.sh` **对生产不可用**——它只会对本机容器 `docker exec pg_dump`，而 stage 与生产的库都是 Supabase 云托管，没有可 exec 的容器；目前**没有可用于生产的替代演练脚本**。换句话说这条要求当前没有可执行载体，补齐脚本是做这次演练的前置。
 
 **2026-09-02 首发的实际处置**：产品负责人显式豁免了本节要求（首发为空库），演练仍未执行；备份侧的过渡安排与撤销条件见「十一、实录偏差」11.6。**该豁免只对首发有效**，不构成后续升级的常设豁免。
 
@@ -255,6 +287,42 @@ docker compose --env-file deploy/.env.prod \
 
 这两份文件到位后，「七、观察期」之外的长期运行监控与故障发现路径以它们为准；本文件不重复维护监控阈值或日志保留期限的具体数值。
 
+### 10.1 systemd 单元安装（本节 rc25 补入；此前正文里一条 `systemctl` 都没有）
+
+**为什么必须写在这里**：2026-09-02 首发时 `biplus-prod` 上那三个 timer 是**现场手工装的**，仓库正文没有任何安装步骤，也就没有可复现的记录——下一次换机器或重装，只能靠人回忆。本节补齐这条缺口，具体单元内容与凭据文件仍以 `deploy/监控告警.md`、`deploy/日志留存.md` 为准，这里只固定**装什么、什么顺序、怎么回读**。
+
+**时点：三个常驻服务 `healthy`、观察窗口通过之后再装并 `enable`**。提前 `enable` 会在服务还没起来的窗口里向管理群发假告警（首发实录 11.6 已登记）。
+
+```bash
+# 1. 脚本与凭据到位（路径、权限、文件内容见两份文档；凭据值不进本文件）
+#    /opt/lingxi/scripts/{host_health_alert.py,collect-container-logs.sh,monitoring/*}
+#    /opt/lingxi/monitoring/{host-monitor.env,db-business.env,push.env}   均 0600
+
+# 2. 装单元本体（仓库单元里没有 User=）
+sudo install -m 644 deploy/monitoring-units/*.service \
+  deploy/monitoring-units/*.timer /etc/systemd/system/
+
+# 3. 每个单元各配一份本机 drop-in 提供 User=（模板：
+#    deploy/monitoring-units/10-local.conf.example，prod 填 bi-ai-deploy）
+sudo install -d -m 755 /etc/systemd/system/<单元名>.service.d
+sudo install -m 644 <本机 10-local.conf> /etc/systemd/system/<单元名>.service.d/10-local.conf
+
+sudo systemctl daemon-reload
+
+# 4. 逐个 enable --now（monitoring-push 需要监控库最小权限角色，角色未建就先不装）
+sudo systemctl enable --now lingxi-host-monitor.timer lingxi-resource-sample.timer \
+  lingxi-db-business-sample.timer lingxi-log-collect.timer lingxi-logrotate.timer
+
+# 5. 回读三项，缺一不可
+systemctl list-timers 'lingxi-*'                       # 每个 timer 的 NEXT/LAST 在前进
+systemctl cat lingxi-host-monitor.service | grep '^User='   # 解析成本机部署用户
+ls -la /var/log/lingxi                                  # 收集目录里开始出现容器日志
+```
+
+**装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。
+
+**当前生产的实际状态（2026-09-02 只读实测，不代表已装齐）**：`lingxi-host-monitor`、`lingxi-resource-sample`、`lingxi-db-business-sample` 三个 timer 已装并在跑（`User=bi-ai-deploy`）；`lingxi-monitoring-push` 未装（等监控库角色）；**容器日志收集与轮转未装**（`/var/log/lingxi/` 下只有 `monitoring/`）——后者的取证代价见 `deploy/日志留存.md`「已知限制」。
+
 ## 十一、实录偏差（2026-09-02 首发）
 
 > 本节登记 **2026-09-02 首次真实生产部署**与本文件正文（含 `deploy/README.md`）不一致的地方，逐条写清「正文怎么写 / 实际怎么做 / 为什么」。执行记录与逐条回读见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519)（生产执行卡）与 [Issue #263](https://github.com/Moshuiwang/lingxi/issues/263)（硬切卡）。下一次生产执行以本节为准，正文与本节冲突时**以本节更晚的实录为准**。
@@ -273,7 +341,7 @@ docker compose --env-file deploy/.env.prod \
 `compose.prod.yaml` 把宿主目录 `/opt/lingxi/runtime-config` 只读挂进 scheduler 与 worker 容器，但**正文里没有任何一步负责创建它或往里放东西**——docker 会自动建一个空目录，挂载成功但内容为空。首发的处置：
 
 - **`system_prompt.md` 必须从 stage 传入**（首发 sha256 前缀 `84741170e3c2…`，与 stage 逐字节一致），并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE` 指向容器内路径。**没有安全的「留空」选项**：提示词按 2026-08-23 裁定不进代码、不进镜像，镜像里没有可回落的随包版本，文件缺失时 worker **静默降级为无提示词执行**——服务全 `healthy`、观察期全绿、digest 全对、用户也能问出答案，但每次问数的质量与 stage 上验证过的完全不是一回事。该变量与 `LINGXI_WORKER_SYSTEM_PROMPT`、`LINGXI_WORKER_OUTPUT_SAFETY_CANARY` **互斥，同时配置启动即失败**，从 stage 复制 env 时须确认另两个没被一起抄过来。
-- **`LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH` 刻意不设**：外置映射文件与随包默认经结构化逐键比对为 **354 键零差异**，留空即用随包默认，等价且少一个需要长期同步的带外文件。反过来，若照「非敏感配置抄自 stage」的做法把这个路径变量抄进 prod 而文件不在，会按既定语义**响亮失败**（权限发布整轮拒绝，一条发布意图都不排），首批用户全部开不通。
+- **`LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH` 刻意不设**：外置映射文件与随包默认经结构化逐键比对为 **354 键零差异**，留空即用随包默认，等价且少一个需要长期同步的带外文件。反过来，若照「非敏感配置抄自 stage」的做法把这个路径变量抄进 prod 而文件不在，会按既定语义**响亮失败**（权限发布整轮拒绝，一条发布意图都不排），首批用户全部开不通。**将来真要启用外置文件时的两条硬前提**（Trace #544 S-2c）：① 这个变量自 rc25 起 `scheduler` 与 `gateway` **两侧同读**，要配就两份 env 一起配、值相同，要么两边都不配——只配一边会让管理动作按一份映射发布、次日每日重算按另一份翻回来，每次翻转都是用户可见的真实权限变化；② **先补 `gateway` 服务的 `runtime-config` 只读挂载再配变量**——`compose.prod.yaml` 目前只给 `scheduler` 挂了它，gateway 配了却读不到时三处管理动作全部失败关闭（安全但不可用）。详见 [`deploy/验收前部署配置清单.md`「闸① 外置路径」](验收前部署配置清单.md)。
 - **验收判据（首发已执行）**：首批用户第一次问数之后，读该轮 worker 终态审计的 `system_prompt_digest`，必须与 stage 同值、且降级计数为 0。该字段是**提示词文件 strip 之后 sha256 的前 12 位**（首发实测 `2272bd4d40ae`），不是文件本身的 sha256，核对时别拿错值。
 - 同一份 env 里，内测轮的**内容级采集**两个变量在生产禁止配置，且 CI 守卫读不到未入库的生产 env 文件——这条只能靠部署纪律兑现：从 stage 的 worker-queue env 生成 prod 版本时必须**显式剔除**这两项（它们恰恰只存在于 stage 那一份里）。
 
@@ -298,7 +366,7 @@ docker compose --env-file deploy/.env.prod \
 - **授权链接 10 分钟一次性**，两次发起之间不可复用旧链接。首发第一次发起就是因为点了已过期的链接而在回调等待上超时（未写入任何东西），第二次用新链接才成功。执行时应在链接生成后立即点击。
 - 首次建立授权主体用 `--bootstrap-subject <主体 open_id> --confirm-bootstrap`，该 `open_id` 不必写进 env 文件。首发的主体账号**不在组织快照里**，其 `open_id` 是经 `union_id` 跨应用解析得到的。
 - 凭据落地后 **scheduler 无需重启**即会用新凭据自动同步花名册（首发实测：授权完成约 30 秒后 1223 行落库）。组织快照若恰好在上一轮失败后的退避期内，需要重启 scheduler 才会立即触发。
-- §2.2「登录 GHCR」一项本次**不适用**：镜像包当日维持公开，宿主机无需登录即可拉取（D-1 裁定）。**「上线后把包改回 private + 发放只读令牌」是观察期项**；在那之前，公开镜像的暴露面见 11.7。
+- §2.2「登录 GHCR」一项本次**不适用**：镜像包当日维持公开，宿主机无需登录即可拉取（D-1 裁定）。**后续更新**：产品负责人 2026-09-03 裁定「无法实现的 GHCR 就保持原状」，私有化不再是观察期项，四个包**保持公开**是终态；三条外部原因与将来重启用的前置见 `deploy/README.md`「主机读取身份」。公开镜像的暴露面见 11.7。
 
 ### 11.6 监控与备份
 
@@ -309,4 +377,4 @@ docker compose --env-file deploy/.env.prod \
 
 ### 11.7 `deploy/README.md` 的一处表述已更正
 
-README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 内更正；本次首发在知情前提下接受镜像公开，改回 private 加只读令牌是观察期项。
+README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 与 `Dockerfile` 的对应注释里更正；本次首发在知情前提下接受镜像公开。**2026-09-03 更新**：改回 private 不再是观察期项——产品负责人裁定保持原状，保持公开是有裁定的终态（原因见 README 同一节）。

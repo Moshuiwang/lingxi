@@ -1,0 +1,11 @@
+[Unit]
+Description=Lingxi 容器日志轮转单轮（Issue #343 / Trace #373 H2）
+
+[Service]
+Type=oneshot
+# User= 见同目录 10-local.conf.example；与收集单元同一账户（同一份 /var/log/lingxi）。
+# --state 指向独立状态文件、配置放在系统 logrotate 扫不到的 /etc/lingxi/logrotate.d/：
+# 两者共同保证系统自带的 logrotate.timer 不会对同一份日志再转一次（独立审查 P1-3，
+# 双轮转会把 30 天窗口悄悄减半），详见 deploy/日志留存.md「cron 安装」。
+ExecStart=/usr/sbin/logrotate --state /var/log/lingxi/.state/logrotate.state /etc/lingxi/logrotate.d/lingxi-container-logs
+TimeoutStartSec=120

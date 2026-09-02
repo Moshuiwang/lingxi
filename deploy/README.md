@@ -81,7 +81,9 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 七个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
-**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）不跑 Agent SDK、不继承环境给任何子进程，但它需要 `LINGXI_POSTGRES_DSN` 才能领任务——这正是它必须有自己独立一份 env 文件、不能借用 `worker` 那份的原因（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
+**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）**同样跑 Agent SDK**（queue 模式下每领一个任务就起一个回合，并发上限 `LINGXI_WORKER_MAX_CONCURRENCY`，见 `compose.yaml` worker-queue 服务块的资源注释），因此它的进程环境同样会被 Claude Code CLI 与 MCP 子进程继承；而它又必须持有 `LINGXI_POSTGRES_DSN` 才能领任务——**这两件事同时成立，就是它必须有自己独立一份、裁到最小的 env 文件，不能借用 `worker` 那份的原因**（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
+
+> **更正与已知边界（2026-09-02，对抗审查 R6-D2）**：本节此前写「`worker-queue` 不跑 Agent SDK、不继承环境给任何子进程」，**这一句不成立**，上面已改。`biai-stage` 受控探针实测坐实：一次会话窗口内，容器里 `claude` 子进程的 `/proc/<pid>/environ` 含 `postgres://` 连接串（进程名与计数级证据，未打印任何值）。也就是说 **生产数据库 DSN 会随进程环境进入 Claude CLI 子进程**。当前的补偿是执行层的 PreToolUse 白名单（无 `Bash`、无任意 `Read`）——它是唯一判定层，同一探针另证其超时行为是失败关闭。**把 DSN 在起 CLI 之前从进程环境摘掉**这项加固尚未实现，登记为待办，不得据本节声称已隔离。
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
@@ -151,23 +153,25 @@ done
 
 ### 2. 主机读取身份（P1-4）
 
-GHCR 上的镜像包**默认是私有的**，宿主机不登录就拉不下来——`docker compose up` 会停在
-`failed to authorize ... 403 Forbidden`（本批实测过这个报错）。因此部署机必须先有一份**只读**拉取身份：
+**现状（2026-09-02 只读回读，两台机器逐条核实）**：`ghcr.io/moshuiwang/lingxi-{scheduler,gateway,worker,migrate}` 四个包自 2026-08-07 首推起一直是**公开**的；`biai-stage`（部署用户 `wangzhipeng`）与 `biplus-prod`（部署用户 `bi-ai-deploy`）**都从未登录过 GHCR**（两台的 `~/.docker/config.json` 里都没有 `ghcr.io` 条目，prod 连 `~/.docker/` 目录都不存在），两台都靠**匿名拉取**跑通。因此本节下面这条登录步骤**当前不适用**，宿主机不需要任何 GHCR 凭据：
 
 ```bash
-# 令牌由 stage [ops] Issue 供给（GitHub App / 组织级 read:packages 令牌），
+# 仅在镜像包改为 private 之后才需要执行；当前四个包公开，这一步跳过。
+# 令牌必须是专用机器账号的 classic PAT（只勾 read:packages），
 # **不得使用任何个人 GitHub 凭据**，也不得复用 CI 的 GITHUB_TOKEN。
-echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
-  | docker login ghcr.io -u "<LINGXI_GHCR_READ_USER，由 ops 供给>" --password-stdin
+echo "<LINGXI_GHCR_READ_TOKEN>" \
+  | docker login ghcr.io -u "<LINGXI_GHCR_READ_USER>" --password-stdin
 ```
 
-两个变量本批只登记名字与来源，**没有真实值**：镜像还没推上去，拉取身份的发放属于 stage `[ops]` Issue 的范围。
+**公开的真实代价（更正本节此前的一句错误表述）**：原文写「源码本身不在镜像里，只暴露依赖清单与目录结构」，**这不成立**。镜像里包含**全部源码**、用户可见文案版本文件 `content.toml`、公司与职能到指标的映射 TOML，以及 `migrations/` 下的迁移 SQL（安装态的 `lingxi` 包连同这些随包 TOML 一起进了每个运行阶段的 `site-packages`；`migrations/` 另由 migrate 阶段单独 `COPY`）。因此把包设为公开的真实代价是**这些内容对任何人可读**，不只是依赖清单与目录结构。镜像里不含任何凭据（Dockerfile 无一条写凭据的 `ENV`，全部运行期注入）。**另两条已登记的供应链边界（对抗审查 P3-5，供应链治理另议、本批不做）**：① Python 依赖**没有 hash 锁**（本仓库不使用锁文件，见[代码框架「六、依赖与迁移」](../docs/技术设计/代码框架.md)），因此同一个 tag 在不同日期重新构建不保证逐字节一致——这也是回滚必须切镜像制品、不得现场重建的原因之一；② 交付镜像里仍保留 `pip`/`apt-get`/`bash`，拿到容器执行权的人可以在容器内装东西（容器为 `read_only`、非 root、`no-new-privileges`，写入面受限）。
 
-> **2026-09-02 更正与现状**：这个选项已被选中——四个镜像包当日为**公开**，`biplus-prod` 首次部署未登录 GHCR 直接匿名拉取，上面这条登录步骤在生产首发中**不适用**。
+> **已知边界：镜像包保持公开（对抗审查 R6-D1；产品负责人 2026-09-03 裁定「无法实现的 GHCR 就保持原状」，rc25 不做私有化）**。这是一个有裁定的终态，不是欠账。三条外部原因（2026-09-02 只读回源，逐条有官方原文或实测支撑）：
 >
-> 同时更正本节此前的一句错误表述：原文写「源码本身不在镜像里，只暴露依赖清单与目录结构」，**这不成立**。镜像里包含**全部源码**、用户可见文案版本文件 `content.toml`、公司与职能到指标的映射 TOML，以及 `migrations/` 下的迁移 SQL（安装态的 `lingxi` 包连同这些随包 TOML 一起进了每个运行阶段的 `site-packages`；`migrations/` 另由 migrate 阶段单独 `COPY`）。因此把包设为公开的真实代价是**这些内容对任何人可读**，不只是依赖清单与目录结构。
+> 1. **计划中的令牌形态在 GHCR 上不可用，且失败形态是「login 绿、pull 红」**。GitHub 员工在 community discussion 里逐字答复：`packages:read` 权限「does not grant access to pull images from GHCR」「GHCR does not yet accept GitHub App installation tokens for authentication」，属现行平台限制；独立用户实测同样是「`docker login` does work, but `docker pull` doesn't」。按这条路建的凭据刷新单元会一直显示绿灯，故障只在升级窗口爆出来——正好是私有化本要防的事故。官方文档另写明 GitHub Packages 只支持 classic PAT（fine-grained 也不支持）。
+> 2. **改包可见性没有 REST 端点**。`docs.github.com/en/rest/packages/packages` 的 27 条端点里没有任何 PATCH 或可见性相关端点，这个动作只能由产品负责人在网页 UI 逐包手工完成，无法预授权给代理执行。
+> 3. **两台机器从未登录过 GHCR，改成私有即同时失去拉取能力，而回滚路径会一起断**。回滚定义为「切镜像引用后 `up -d`」，runbook 明令不得现场重建；拉不动镜像时这条路径同时失效。更麻烦的是**改回公开的方向本身状态未知**：GitHub 官方文档同一页三处写「Once you make a package public, you cannot make it private again」，而另一份官方 reusable 又写有 admin 权限者「can set the package to private or public」（双向）——官方文档自相矛盾，未坐实前必须按「私有化可能不可逆」处置。
 >
-> 产品负责人在知情前提下裁定上线日维持公开、不加拉取令牌步骤；**「改回 private 并发放只读拉取令牌」登记为上线后的观察期项**（Trace [#521](https://github.com/Moshuiwang/lingxi/issues/521)，实录见 [`生产部署runbook.md`「十一、实录偏差」](生产部署runbook.md)）。改回 private 之后，上面这段登录步骤重新生效。
+> **重启用私有化的前置**（将来若重开，缺一不可）：先用一次性探针包坐实 public → private 是否可行（绝不拿四个生产包试）；建专用机器账号的 classic PAT（只勾 `read:packages`）并登记过期日与轮换责任人；两台机器先完成 `docker login` 并回读 `~/.docker/config.json` 的 `auths` 键，**再**逐包改可见性。**不要动包设置里的「继承权限」开关**——去掉继承会覆盖本仓库自动继承来的 write，下一次 Main Publish 立刻推不上去。改回 private 之后，上面那段登录步骤重新生效。
 
 ## 编排者冻结前显式触发镜像构建（Issue #278）
 
