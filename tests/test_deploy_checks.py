@@ -1580,6 +1580,171 @@ class WorkerQueueUserVolumeTest(unittest.TestCase):
         self.assertEqual(failures, [])
 
 
+class WorkerWorkspaceIsolationTest(unittest.TestCase):
+    """Trace #544 S-2b / 报告 W-1：Agent SDK 回合的工作目录（``cwd``）不得等于
+    用户目录根、不得位于其下、也不得包含它。
+
+    用户目录根下每个用户各有一份 ``0440`` 的 ``.mcp.json``，里面是该用户专属的
+    问数 MCP Bearer 明文；``cwd`` 里的 ``.mcp.json`` 同时还是 Claude CLI 的项目级
+    MCP 配置来源。**stage 的实测现值就是 ``/var/lib/lingxi/users``（用户目录根
+    本身）**，下面第一条用例正是拿这个值验红。
+    """
+
+    USERS_ROOT = "/var/lib/lingxi/users"
+
+    def _failures(
+        self,
+        *,
+        stage_workspace: str | None,
+        prod_workspace: str | None = "/tmp/lingxi-workspace",
+        users_mount: str = "lingxi-users:/var/lib/lingxi/users",
+    ) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+
+        def compose(name: str, workspace: str | None) -> Path:
+            environment = "  environment:\n    LINGXI_WORKER_MODE: queue\n"
+            if workspace is not None:
+                environment += f'    LINGXI_WORKER_WORKSPACE: "{workspace}"\n'
+            body = (
+                "worker-queue:\n"
+                + environment
+                + f"  volumes:\n    - {users_mount}\n"
+            )
+            path = directory / name
+            path.write_text("services:\n" + textwrap.indent(body, "  "), encoding="utf-8")
+            return path
+
+        base = directory / "compose.yaml"
+        base.write_text(
+            "services:\n"
+            + textwrap.indent(
+                f"worker-queue:\n  volumes:\n    - {users_mount}\n", "  "
+            ),
+            encoding="utf-8",
+        )
+        saved = (CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD)
+        CONTRACT.COMPOSE_BASE = base
+        CONTRACT.COMPOSE_STAGE = compose("compose.stage.yaml", stage_workspace)
+        CONTRACT.COMPOSE_PROD = compose("compose.prod.yaml", prod_workspace)
+        try:
+            return CONTRACT.check_worker_workspace_isolation()
+        finally:
+            CONTRACT.COMPOSE_BASE, CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD = saved
+
+    def test_the_stage_measured_value_the_user_directory_root_itself_is_caught(self) -> None:
+        """stage 2026-09-02 实测现值：``LINGXI_WORKER_WORKSPACE=/var/lib/lingxi/users``
+        ——正是全部用户家目录的父目录。这条必须红，否则这个检查没有意义。"""
+
+        failures = self._failures(stage_workspace=self.USERS_ROOT)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "用户目录根" in f for f in failures), failures
+        )
+
+    def test_a_workspace_inside_one_user_home_is_caught(self) -> None:
+        """指向某个具体用户的家目录同样不行：那一份 ``.mcp.json`` 就在 ``cwd`` 里，
+        而它还是 Claude CLI 的项目级 MCP 配置来源。"""
+
+        failures = self._failures(stage_workspace=self.USERS_ROOT + "/usr-1")
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "位于它之下" in f for f in failures), failures
+        )
+
+    def test_a_workspace_that_contains_the_user_root_is_caught(self) -> None:
+        """祖先目录同样危险——整棵用户目录树就摆在工作目录里面。"""
+
+        failures = self._failures(stage_workspace="/var/lib/lingxi")
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "祖先目录" in f for f in failures), failures
+        )
+
+    def test_a_missing_declaration_is_caught_on_both_environments(self) -> None:
+        """完全不声明就等于"由一份门禁读不到的外部 env 文件决定"——stage 长期
+        停在用户目录根上正是这么发生的。stage 与 prod 各判一条。"""
+
+        failures = self._failures(stage_workspace=None, prod_workspace=None)
+        self.assertTrue(any("compose.stage.yaml" in f and "没有显式声明" in f for f in failures), failures)
+        self.assertTrue(any("compose.prod.yaml" in f and "没有显式声明" in f for f in failures), failures)
+
+    def test_an_interpolated_value_is_caught(self) -> None:
+        """留 ``${VAR:-...}`` 插值等于把安全边界的取值交回给未入库的 env 文件。"""
+
+        failures = self._failures(stage_workspace="${LINGXI_WORKER_WORKSPACE:-/tmp/x}")
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "插值" in f for f in failures), failures
+        )
+
+    def test_a_relative_path_is_caught(self) -> None:
+        failures = self._failures(stage_workspace="workspace")
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "不是绝对路径" in f for f in failures), failures
+        )
+
+    def test_a_disjoint_absolute_path_passes(self) -> None:
+        self.assertEqual(self._failures(stage_workspace="/tmp/lingxi-workspace"), [])
+
+    def test_the_user_root_is_derived_from_the_volume_mount_not_hardcoded(self) -> None:
+        """判据来自 ``lingxi-users`` 卷的挂载点，不是写死的 ``/var/lib/lingxi/users``：
+        换一个挂载点，安全/不安全的判定必须跟着换。"""
+
+        mount = "lingxi-users:/srv/lingxi-homes"
+        self.assertEqual(
+            self._failures(stage_workspace="/var/lib/lingxi/users", users_mount=mount),
+            [],
+            "挂载点换了以后，旧的 /var/lib/lingxi/users 不再是用户目录根，应当放行",
+        )
+        failures = self._failures(stage_workspace="/srv/lingxi-homes", users_mount=mount)
+        self.assertTrue(
+            any("compose.stage.yaml" in f and "用户目录根" in f for f in failures), failures
+        )
+
+    def test_a_missing_user_volume_fails_loudly_instead_of_skipping(self) -> None:
+        """推不出用户目录根时必须响亮失败——一个再也找不到目标的检查会安静地
+        永远通过，比没有检查更危险。"""
+
+        failures = self._failures(
+            stage_workspace="/tmp/lingxi-workspace", users_mount="lingxi-other:/var/lib/other"
+        )
+        self.assertTrue(any("无法推导用户目录根" in f for f in failures), failures)
+
+    def test_user_home_layout_drift_in_the_adapter_is_caught(self) -> None:
+        """判据建立在"每个用户家目录都是根的直接子目录"这个形状上
+        （``LocalUserEnvironment.home_of``）。形状改了必须响亮要求重新推导。"""
+
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        drifted = directory / "user_environment.py"
+        drifted.write_text(
+            "class LocalUserEnvironment:\n"
+            "    def home_of(self, user_id: str) -> Path:\n"
+            "        return self._root / user_id[:2] / self._validated(user_id)\n",
+            encoding="utf-8",
+        )
+        saved = CONTRACT.USER_ENVIRONMENT_ADAPTER
+        CONTRACT.USER_ENVIRONMENT_ADAPTER = drifted
+        try:
+            failures = CONTRACT.check_worker_workspace_isolation()
+        finally:
+            CONTRACT.USER_ENVIRONMENT_ADAPTER = saved
+        self.assertTrue(any("home_of" in f for f in failures), failures)
+
+    def test_real_repository_state_passes(self) -> None:
+        """真实仓库状态必须通过——防止本检查因为文件结构变化而变成空转。"""
+
+        self.assertEqual(CONTRACT.check_worker_workspace_isolation(), [])
+
+    def test_the_real_compose_pins_the_variable_on_both_environments(self) -> None:
+        """再正面确认一次：stage 与 prod 的 worker-queue 都真的写了这一行、
+        且都不是插值——不能靠"没有失败"反推"确实配了"。"""
+
+        for path in (CONTRACT.COMPOSE_STAGE, CONTRACT.COMPOSE_PROD):
+            block = CONTRACT.service_block(
+                CONTRACT.strip_comments(CONTRACT.read(path)), "worker-queue"
+            )
+            assert block is not None
+            value = CONTRACT._environment_value(block, CONTRACT.WORKER_WORKSPACE_VARIABLE)
+            self.assertIsNotNone(value, f"{path} 的 worker-queue 缺 LINGXI_WORKER_WORKSPACE")
+            self.assertNotIn("${", value or "")
+
+
 class RealRepositoryTest(unittest.TestCase):
     """反过来跑真实仓库状态：检查一旦找不到目标就会安静地永远通过。"""
 
