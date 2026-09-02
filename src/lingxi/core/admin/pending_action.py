@@ -389,10 +389,16 @@ def decide_confirm(
        不可区分——见迁移 0068 文件头部）；
     2. 早已是终态：幂等返回既有结果，不当作新的确认处理（"重复点击/重复回调/重试
        只能返回已有结果"）；
-    3. 已过期：**首次**发现过期时才由这里转出 ``EXPIRE``（同一动作 ID 再次点击会
-       先在第 2 步被拦住，因为这一步已经把它变成终态）；
-    4. 点击人不是发起人：**不改变** ``pending_action`` 的任何字段——真正的发起人
+    3. 点击人不是发起人：**不改变** ``pending_action`` 的任何字段——真正的发起人
        仍然可能随后点对，不能因为一次错误点击（含伪造回调）就烧掉这次机会；
+       **这一步必须排在过期判定之前**（Trace #544 A-3）：过期判定会把这条记录
+       改写成 ``EXPIRED`` 终态并落 ``decided_by_open_id=点击者``、发群通知、把
+       终态卡回给点击者。确认卡可以被转发（卡片 config 未禁转发），因此"非发起
+       人点了一张已经过期的卡"是真实可达的：判定顺序反过来时，一个与本次操作
+       毫无关系的人会被记成这条操作的决定人，并收到本不该给他的终态卡。放在前
+       面之后，非发起人无论卡片是否已过期都只得到同一句话、不触发任何写入；
+    4. 已过期：**首次**发现过期时才由这里转出 ``EXPIRE``（同一动作 ID 再次点击会
+       先在第 2 步被拦住，因为这一步已经把它变成终态）；
     5. 发起人当前角色已经不满足这个动作类型所需角色（含条目被撤销、条目不存在）：
        转 ``FAILED``，要求管理员重新查询发起；
     6. 目标当前状态与 prepare 时刻的快照不一致：转 ``FAILED``，要求管理员重新查询；
@@ -412,18 +418,18 @@ def decide_confirm(
             message=_terminal_message(pending.status),
         )
 
+    if pending.initiated_by_open_id != clicker_open_id:
+        return ConfirmDecision(
+            kind=ConfirmResultKind.NOT_INITIATOR,
+            message="只有发起该操作的管理员本人可以确认。",
+        )
+
     if pending.is_expired(now=now):
         return ConfirmDecision(
             kind=ConfirmResultKind.EXPIRE,
             message="该待确认操作已过期，请重新查询后再发起。",
             terminal_status=PendingActionStatus.EXPIRED,
             reason="expired",
-        )
-
-    if pending.initiated_by_open_id != clicker_open_id:
-        return ConfirmDecision(
-            kind=ConfirmResultKind.NOT_INITIATOR,
-            message="只有发起该操作的管理员本人可以确认。",
         )
 
     required_role = REQUIRED_ROLE[pending.action_type]
@@ -491,6 +497,10 @@ def decide_cancel(
 ) -> CancelDecision:
     """"取消"按钮的核对链，比确认短：取消不执行任何业务变更，因此不需要重新核对
     角色或目标状态漂移——放弃一个即将过期的操作，即使角色已经变化也应当总是安全。
+
+    判定顺序与 :func:`decide_confirm` 逐条对齐：**发起人判定排在过期判定之前**
+    （Trace #544 A-3），非发起人点一张已过期的卡不得把它翻成 ``EXPIRED``、不得
+    被记成决定人、不得触发群通知。
     """
 
     if pending is None or not pending.card_delivered:
@@ -501,17 +511,17 @@ def decide_cancel(
             kind=CancelResultKind.ALREADY_TERMINAL, message=_terminal_message(pending.status)
         )
 
+    if pending.initiated_by_open_id != clicker_open_id:
+        return CancelDecision(
+            kind=CancelResultKind.NOT_INITIATOR, message="只有发起该操作的管理员本人可以取消。"
+        )
+
     if pending.is_expired(now=now):
         return CancelDecision(
             kind=CancelResultKind.EXPIRE,
             message="该待确认操作已过期。",
             terminal_status=PendingActionStatus.EXPIRED,
             reason="expired",
-        )
-
-    if pending.initiated_by_open_id != clicker_open_id:
-        return CancelDecision(
-            kind=CancelResultKind.NOT_INITIATOR, message="只有发起该操作的管理员本人可以取消。"
         )
 
     return CancelDecision(

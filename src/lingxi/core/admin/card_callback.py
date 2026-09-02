@@ -89,7 +89,6 @@ from lingxi.core.admin.display_names import AdminDisplayNames
 from lingxi.core.admin.management_card import (
     ADMIN_ACTION_CANCEL,
     ADMIN_ACTION_GRANT,
-    ADMIN_ACTION_SUPPRESS,
 )
 from lingxi.core.admin.card_dispatch import (
     ManagementCardContext,
@@ -204,6 +203,18 @@ class ManagementCardContextReader(Protocol):
     ) -> ManagementCardContext | None: ...
 
 
+class PostCallbackExecutor(Protocol):
+    """回调应答之后才执行的那批后处理的执行口（#493 块 B）。
+
+    ``submit`` 返回 ``True`` 表示"我接住了，会执行"；返回 ``False`` 表示"没接住"
+    （例如队列已满），调用方据此原地同步执行——见
+    :meth:`AdminCardCallbackHandler._run_after_response`。实现必须**立即返回**，
+    不得在调用线程里执行任务，否则这个端口就没有意义。
+    """
+
+    def submit(self, task: Callable[[], None]) -> bool: ...
+
+
 class ManagementCardRefresher(Protocol):
     """在原管理卡实体上按持久 sequence 更新最新状态。
 
@@ -305,6 +316,7 @@ class AdminCardCallbackHandler:
         management_context_store: ManagementCardContextReader | None = None,
         management_state_lookup: Callable[[str], AdminUserStatusView | None] | None = None,
         management_card_refresher: ManagementCardRefresher | None = None,
+        post_callback_executor: "PostCallbackExecutor | None" = None,
     ) -> None:
         self._pending_actions = pending_actions
         self._confirm_cards = confirm_cards
@@ -326,6 +338,42 @@ class AdminCardCallbackHandler:
         self._management_context_store = management_context_store
         self._management_state_lookup = management_state_lookup
         self._management_card_refresher = management_card_refresher
+        # 回调应答之后才做的那批网络往返的执行器（#493 块 B）：``None`` = 原地同步做，
+        # 与本参数加入之前逐字节一致。见 :meth:`_run_after_response`。
+        self._post_callback_executor = post_callback_executor
+
+    def _run_after_response(self, task: Callable[[], None], *, pending: PendingAction) -> None:
+        """把"应答之后才做的事"交给注入的执行器；没接执行器就原地同步跑。
+
+        **为什么要有这一层**（#493 块 B，回调超时诱导重复点击）：``handle()`` 的返回值
+        就是飞书要的回调应答帧，飞书的应答窗口是秒级的。确认之后本方法原地做的三件事
+        全是网络往返——出带外更新确认卡、发管理群通知、刷新原管理卡（还要先读一次目标
+        用户状态）。一次 43 家公司 × 9 指标（387 项）的补充授权实测约 4 秒，超出应答
+        窗口：管理员看到「回调服务超时未响应」，「确认执行」按钮重新点亮，于是再点一次。
+        执行本身只发生一次（迁移 ``0084`` 的卡片状态 CAS 挡住了重复执行），但这是把
+        "数据没坏"当成"体验可以接受"。
+
+        搬到应答之后做，**顺序一个字不变**：四件事仍然在同一个任务里按原次序串行执行
+        （出带外换卡 → 群通知 → 刷新原管理卡 → 入队定向重算）。次序是有意义的——原管理
+        卡必须先被推进成「下发中」，再入队重算，否则重算完成回调刷出的「已生效」会被
+        随后到达的「下发中」盖回去（见 ``handle()`` 里那段注释）。
+
+        执行器缺席（``None``）或它自己表示"没接住"（队列满）时**原地同步执行**：宁可这
+        一次回调慢，也不能让终态卡、群通知、原卡刷新整批消失——那是用户可见的结果丢失，
+        比一次超时严重得多。
+        """
+
+        if self._post_callback_executor is not None:
+            try:
+                if self._post_callback_executor.submit(task):
+                    return
+            except Exception as error:  # noqa: BLE001 - 执行器自身故障不得吞掉这批后处理
+                self._audit.record(
+                    "admin.card_callback.post_callback_submit_failed",
+                    pending_action_id=pending.id,
+                    error=type(error).__name__,
+                )
+        task()
 
     def handle_management_form_submit(
         self,
@@ -362,7 +410,7 @@ class AdminCardCallbackHandler:
         if self._management_actions is None:
             return _toast_error("该功能当前不可用，请改用文本命令")
         position_form = bool(position_name or company_scope)
-        if admin_action not in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
+        if admin_action != ADMIN_ACTION_GRANT:
             self._audit.record(
                 "admin.card_callback.management_unknown_action",
                 admin_action=admin_action,
@@ -425,8 +473,6 @@ class AdminCardCallbackHandler:
             )
             return _toast_error("没有收到你在卡片上的选择，请重新选择后再提交")
         if position_form:
-            if admin_action != ADMIN_ACTION_GRANT:
-                return _toast_error("职位+公司范围只支持补充授权")
             if not reason.strip():
                 return _toast_error("请填写原因")
             if not position_name.strip():
@@ -437,6 +483,20 @@ class AdminCardCallbackHandler:
                 ch.isspace() for ch in company_scope
             ):
                 return _toast_error("职位或公司范围无效，请重新选择")
+            if any(ch.isspace() for ch in identifier):
+                # 纵深加固（Trace #469 修复包 B，B-2；随 Trace #544 D-5 撤除旧
+                # 「公司×指标」分支后搬到这里）：一个非空但含空白的 identifier 会让
+                # 下游 ``str.split()`` 把后面的参数整体左移一位，拼出一条**形状合法
+                # 但语义错位**的命令（真正的职位被当成标识吞掉、公司范围被当成职位），
+                # 管理员看到的却是"已生成待确认操作"这类正常回执，察觉不到目标已经变成
+                # 别人。当前 identifier 一律来自服务端管理卡上下文，结构上不可达；
+                # 不假设未来的调用点也一样受控。
+                self._audit.record(
+                    "admin.card_callback.management_missing_identifier",
+                    admin_action=admin_action,
+                    trace_id=trace_id,
+                )
+                return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
             text = f"/admin grant_position {identifier} {position_name} {company_scope} {reason.strip()}"
             outcome = self._route_management_action(
                 operator_open_id=operator_open_id,
@@ -455,50 +515,24 @@ class AdminCardCallbackHandler:
                 )
             return _toast_from_route_outcome(outcome)
 
-        if not company_id:
-            return _toast_error("请选择公司")
-        if not metric_name:
-            return _toast_error("请选择指标")
-        if not reason.strip():
-            return _toast_error("请填写原因")
-        # 纵深加固（Trace #469 修复包 B，B-2）：上面的"非空"校验挡不住一个
-        # 非空但含空白字符的取值——`str.split()` 按任意空白切分（含全角空格
-        # U+3000，Python `str.isspace()` 同样判它为空白），审查实测
-        # `company_id="1011 sub_new_count"` 能把管理员选的指标静默左移替换掉
-        # （与上面 identifier 为空时同一个根因：拼接前不拦住，下游语法校验
-        # 认不出这类错位）。当前调用点全部来自服务端渲染的下拉选项/受控字段，
-        # 结构上不可达，但值得纵深——不假设未来的调用点也一样受控。三个字段
-        # 分别落回各自既有的拒绝文案，不新造一套措辞。
-        if any(ch.isspace() for ch in identifier):
-            self._audit.record(
-                "admin.card_callback.management_missing_identifier",
-                admin_action=admin_action,
-                trace_id=trace_id,
-            )
-            return _toast_error("未识别到目标用户标识，请重新查询 /admin user 后再操作")
-        if any(ch.isspace() for ch in company_id):
-            return _toast_error("请选择公司")
-        if any(ch.isspace() for ch in metric_name):
-            return _toast_error("请选择指标")
-
-        sub_command = "grant_permission" if admin_action == ADMIN_ACTION_GRANT else "suppress_permission"
-        text = f"/admin {sub_command} {identifier} {company_id} {metric_name} {reason.strip()}"
-        outcome = self._route_management_action(
-            operator_open_id=operator_open_id,
-            text=text,
+        # 「公司×指标」表单入口已撤除（Trace #544 D-5，产品负责人裁定）：这条
+        # 分支此前把管理员选中的公司/指标拼成 ``/admin grant_permission`` 或
+        # ``/admin suppress_permission`` 文本再交给 ``route()``，而那两条文本命令
+        # 的语法层只校验字符集、不核对指标目录——目录外的公司与指标能一路走进
+        # 正式发布链（对抗审查 A-4 / P-4，3 级复现）。裁定是撤掉入口本身，不是
+        # 补一层校验：补充授权统一走上面的「银河职位×公司范围」表单（取值全部来自
+        # 服务端渲染的目录下拉，见 ``core/admin/management_card.py``）。
+        #
+        # 生产的管理卡自 #493 起就只渲染职位×范围表单，因此这条分支正常不可达；
+        # 保留它是为了让**历史卡片**上残留的旧按钮点下去得到一句明确的话，而不是
+        # 悄悄落进"未识别的管理命令"。审计留一条可检索的动作名，真实点击一次就能
+        # 指认还有多少旧卡在被使用。
+        self._audit.record(
+            "admin.card_callback.management_retired_form",
+            admin_action=admin_action,
             trace_id=trace_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            message_id=message_id,
         )
-        if outcome.handled and outcome.content_key == _WRITE_ACTION_PENDING_CONTENT_KEY:
-            self._mark_management_submitted(
-                context=context,
-                status=current_status,
-                message_id=message_id,
-                trace_id=trace_id,
-            )
-        return _toast_from_route_outcome(outcome)
+        return _toast_error("该入口已下线，请重新发送 /admin user 后用新卡片的「补充授权」表单")
 
     def _route_management_action(
         self,
@@ -966,28 +1000,36 @@ class AdminCardCallbackHandler:
         # update() 调用是冗余纵深，即使它失败，card_payload 已经在
         # _update_card_to_terminal 内部算好并原样返回——应答本身仍然带着正确的
         # 终态卡（模块文档「载体 #96」）。
+        # 终态卡 JSON 必须**同步**算出来：它就是这次应答要带回去的那张卡。真正的
+        # 网络往返（出带外换卡）与其余三件事一起搬到应答之后，见
+        # :meth:`_run_after_response`（#493 块 B：387 项授权的同步后处理约 4 秒，
+        # 超出飞书回调应答窗口，管理员看到「回调服务超时未响应」并重复点击）。
+        terminal_card: Any | None = None
         card_payload: dict[str, Any] | None = None
         if pending.status is not PendingActionStatus.PENDING:
-            card_payload = self._update_card_to_terminal(pending)
+            terminal_card, card_payload = self._render_terminal_card(pending)
 
-        # 群通知：只在这次点击**首次**产生了新的终态时发送，避免幂等重放刷屏。
-        if outcome.decision.terminal_status is not None:
-            self._notify_group(pending)
+        def _after_response() -> None:
+            # 次序与搬动之前逐字相同，理由见 :meth:`_run_after_response` 文档。
+            if terminal_card is not None:
+                self._push_terminal_card(pending, terminal_card)
+            # 群通知：只在这次点击**首次**产生了新的终态时发送，避免幂等重放刷屏。
+            if outcome.decision.terminal_status is not None:
+                self._notify_group(pending)
+                # 职位表单产生的确认卡带有原管理卡反向链接。确认后立刻把原卡置为
+                # 「下发中」，取消/失败则恢复成最新只读状态；重算完成回调可再次刷新为
+                # 「已生效」或「未完成」。先推进原卡再入队重算，避免极快的后台结果（尤其
+                # ``UNCHANGED`` 无需启动观察线程）被后面的“已提交”刷新覆盖回去。
+                self._refresh_origin_management_card(pending=pending, trace_id=trace_id)
+                # 定向权限重算（Issue #438）：只在这次点击**首次**让操作真正执行成功时
+                # 触发，与群通知同一去重判据（幂等重放/未改变任何状态的拒绝都不重复
+                # 触发）；额外要求 ``status is EXECUTED``——``CANCELLED``/``EXPIRED``/
+                # ``FAILED`` 都不该让任何用户的发布内容发生变化。best-effort：失败只
+                # 记审计,不影响已经落库的确认结果（模块文档「载体 #96」同一姿态）。
+                if pending.status is PendingActionStatus.EXECUTED:
+                    self._trigger_recompute(pending)
 
-        # 职位表单产生的确认卡带有原管理卡反向链接。确认后立刻把原卡置为
-        # 「下发中」，取消/失败则恢复成最新只读状态；重算完成回调可再次刷新为
-        # 「已生效」或「未完成」。先推进原卡再入队重算，避免极快的后台结果（尤其
-        # ``UNCHANGED`` 无需启动观察线程）被后面的“已提交”刷新覆盖回去。
-        if outcome.decision.terminal_status is not None:
-            self._refresh_origin_management_card(pending=pending, trace_id=trace_id)
-
-        # 定向权限重算（Issue #438）：只在这次点击**首次**让操作真正执行成功时
-        # 触发，与群通知同一去重判据（幂等重放/未改变任何状态的拒绝都不重复
-        # 触发）；额外要求 ``status is EXECUTED``——``CANCELLED``/``EXPIRED``/
-        # ``FAILED`` 都不该让任何用户的发布内容发生变化。best-effort：失败只
-        # 记审计,不影响已经落库的确认结果（模块文档「载体 #96」同一姿态）。
-        if outcome.decision.terminal_status is not None and pending.status is PendingActionStatus.EXECUTED:
-            self._trigger_recompute(pending)
+        self._run_after_response(_after_response, pending=pending)
 
         if pending.status is PendingActionStatus.PENDING:
             # 到这里仍是 pending 的唯一分支是点击人不是发起人——其余分支都会让
@@ -1053,8 +1095,21 @@ class AdminCardCallbackHandler:
         ``outcome.decision.message`` 是两件不同的事，见该处注释）。
         """
 
+        card, card_payload = self._render_terminal_card(pending)
+        if card is not None:
+            self._push_terminal_card(pending, card)
+        return card_payload
+
+    def _render_terminal_card(self, pending: PendingAction) -> tuple[Any | None, dict[str, Any] | None]:
+        """只渲染终态卡，不做任何网络调用；返回 ``(card, card_payload)``。
+
+        与 :meth:`_push_terminal_card` 拆开，是因为两者的时机不同（#493 块 B）：
+        ``card_payload`` 是这次回调应答要带回去的载荷，必须同步算出来；出带外的
+        ``update()`` 是冗余纵深，可以等应答发出之后再做。
+        """
+
         if pending.card_id is None:
-            return None
+            return None, None
         target_label = self._display_names.user_label(open_id=pending.target_open_id)
         company_label, metric_label = self._resolve_scope_labels(pending)
         card = render_terminal_card(
@@ -1064,7 +1119,13 @@ class AdminCardCallbackHandler:
             company_label=company_label,
             metric_label=metric_label,
         )
-        card_payload = render_card_payload(card)
+        return card, render_card_payload(card)
+
+    def _push_terminal_card(self, pending: PendingAction, card: Any) -> None:
+        """出带外把已经发出的那张卡片更新成终态。失败只记审计。"""
+
+        if pending.card_id is None:
+            return
         try:
             # 换一个本次调用专用的 sequence（外部审查交叉裁定，opus P2-1）：同一张
             # 卡片可能因为回调重投被多次调用 update，CardKit 要求每次调用携带严格
@@ -1077,7 +1138,6 @@ class AdminCardCallbackHandler:
                 pending_action_id=pending.id,
                 error=type(error).__name__,
             )
-        return card_payload
 
     def _trigger_recompute(self, pending: PendingAction) -> None:
         if self._recompute_trigger is None:

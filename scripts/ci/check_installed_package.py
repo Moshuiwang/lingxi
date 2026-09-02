@@ -309,6 +309,9 @@ REQUIRED_MODULES = (
     "lingxi.adapters.postgres_pending_action",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
+    # 回调应答之后那批网络往返的后台执行器（#493 块 B）：确认成功后的出带外换卡、
+    # 群通知、原管理卡刷新与定向重算入队搬到应答之后串行执行，回调本身不再等它们。
+    "lingxi.adapters.admin_post_callback",
     # 用户权限管理卡（#439 B 档）展示层 + 指标中文别名反查（#439 A 档）的配置
     # 读取——两者均只被 gateway 的管理命令面消费，与上面确认卡片的既有归类
     # 同一姿态。
@@ -1031,6 +1034,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_pending_action",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
+            "lingxi.adapters.admin_post_callback",
             # 用户权限管理卡（#439 B 档）：`/admin user` 除既有文本回复外附带发送
             # 一张管理卡（`ManagementCardDispatcher`/`TomlCompanyMetricCatalog`，
             # 均在函数内由装配层按需 import，与本组其余"函数内 import 也要显式

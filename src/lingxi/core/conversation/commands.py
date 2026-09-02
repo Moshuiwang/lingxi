@@ -282,7 +282,10 @@ def _parse_memory_serial(token: str) -> int | None:
     真正执行删除前解析，见 :class:`MemoryCommand` 文档。
     """
 
-    if not token.isdigit():
+    # ``isdecimal()`` 而不是 ``isdigit()``（Trace #544 A-2 同类）：上标数字
+    # ``"²⁴"`` 让 ``isdigit()`` 为真、``int()`` 抛 ``ValueError``——这条路径任何
+    # 用户发一句 ``/memory forget ²⁴`` 都能走到，不能靠上层兜底把它变成异常。
+    if not token.isdecimal():
         return None
     if token != str(int(token)):
         return None

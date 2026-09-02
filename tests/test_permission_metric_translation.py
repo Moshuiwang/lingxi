@@ -334,3 +334,81 @@ class TranslateOrderingTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class MetricValueHygieneTests(unittest.TestCase):
+    """P-5（Trace #544，对抗审查面 3）：映射文件此前只判"非空字符串"，于是 ``"*"``、
+    纯空白、含换行或零宽字符的指标名都能直通落到权限发布表上。
+
+    其中 ``"*"`` 最危险：读侧把某公司下的 ``"*"`` 当作"该公司**全部**指标（含以后新增
+    的）"，一个笔误因此把范围放到最大，而且**抑制对它无效**（抑制按「公司×指标」精确
+    匹配，减不掉一个 ``"*"``）。
+
+    口径与 ``core/permission/legacy_diff.py`` 逐条对齐：**值严格、公司键不查目录**。
+    """
+
+    def _doc(self, metrics):
+        return {"companies": {"1011": {"销售": metrics}}}
+
+    def test_wildcard_metric_value_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_company_function_metric_map(self._doc(["*"]))
+
+    def test_wildcard_mixed_into_a_metric_name_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_company_function_metric_map(self._doc(["日活*"]))
+
+    def test_blank_metric_value_is_rejected(self) -> None:
+        for value in (" ", "\u3000", "\t"):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    build_company_function_metric_map(self._doc([value]))
+
+    def test_newline_and_invisible_characters_are_rejected(self) -> None:
+        for value in ("日活\n", "日\u200b活", "日活\r", "日\u202e活"):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    build_company_function_metric_map(self._doc([value]))
+
+    def test_company_key_wildcard_is_still_accepted(self) -> None:
+        """口径分界：``"*"`` 在**键**位是合法的全公司通配，只有落到值上才是越权。"""
+
+        mapping = build_company_function_metric_map(
+            {"companies": {"*": {"销售": ["日活"]}}}
+        )
+
+        self.assertEqual(mapping["*"]["销售"], ("日活",))
+
+    def test_company_key_outside_any_catalog_is_still_accepted(self) -> None:
+        """与 S-2d 同一条口径：**只拒值、不拒公司键**——这个文件本身就是目录，
+        没有第二份可以拿来核对公司键在不在里面。"""
+
+        mapping = build_company_function_metric_map(
+            {"companies": {"9999": {"销售": ["日活"]}}}
+        )
+
+        self.assertEqual(mapping["9999"]["销售"], ("日活",))
+
+    def test_ordinary_metric_names_with_inner_spaces_are_still_accepted(self) -> None:
+        """刻意不管的一件事（与 legacy_diff 同）：普通空格不拒——它只会导致一条谁也
+        用不上的死配置，方向是给得更少，不是给错范围。"""
+
+        mapping = build_company_function_metric_map(self._doc(["daily active"]))
+
+        self.assertEqual(mapping["1011"]["销售"], ("daily active",))
+
+    def test_shipped_catalog_still_parses(self) -> None:
+        """不误伤：随包发布的真实映射文件必须仍然过得了这道校验。"""
+
+        import tomllib
+        from pathlib import Path
+
+        import lingxi.config as config_package
+
+        document = tomllib.loads(
+            (Path(config_package.__file__).parent / "company_function_metric_map.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertTrue(build_company_function_metric_map(document))

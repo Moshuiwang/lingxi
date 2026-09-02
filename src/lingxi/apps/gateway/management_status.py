@@ -38,6 +38,10 @@ MANAGEMENT_ACCOUNT_NOT_ENABLED_KEY = "permission.management_account_not_enabled"
 #: 账号状态正常时 ``incomplete`` 的通用兜底——这句对他们成立：日批确实会补齐。
 GENERIC_INCOMPLETE_TEXT = "权限下发未完成，将在次日批处理修正"
 
+#: 「已记录、正在下发」这句**瞬时**状态行的唯一字面量（#493 块 B）。此前
+#: ``apps/gateway/__init__.py`` 另抄了两份，改一处漏两处；现在三处都引用这一个。
+PUBLISHING_STATUS_TEXT = "操作已记录，权限正在下发"
+
 #: 与 ``core/permission/publish.ACCOUNT_STATE_ENABLED`` 同一判据的本地字面量；这里只做
 #: 展示分支，不做任何授权判定，因此不引入那条模块的 import 闭包。
 _ACCOUNT_STATE_ENABLED = "enabled"
@@ -92,6 +96,27 @@ def incomplete_status_text(*, status: Any, dispatch_status: str | None) -> str:
     return GENERIC_INCOMPLETE_TEXT
 
 
+def _claims_publishing(
+    *, state: str, dispatch_status: str | None, status_message: str | None
+) -> bool:
+    """这一次要显示的话，是不是「已记录、正在下发」那句承诺？
+
+    三个入参任意一个指向"正在下发"都算：``status_message`` 是即时路径已经算好的人类
+    文案（它就等于 :data:`PUBLISHING_STATUS_TEXT`），``state``/``dispatch_status`` 是
+    视觉恢复 scanner 重画时唯一可用的机器态。**只认这一句**——「已生效」「已取消」
+    「未完成」各有自己的判据，不在这里顺手一起改写。
+    """
+
+    if status_message == PUBLISHING_STATUS_TEXT:
+        return True
+    if status_message:
+        return False
+    return state in {"submitted", "dispatching"} or dispatch_status in (
+        "publishing",
+        PUBLISHING_STATUS_TEXT,
+    )
+
+
 def rendered_dispatch_status(
     *, status: Any, state: str, dispatch_status: str | None, status_message: str | None
 ) -> str | None:
@@ -102,10 +127,20 @@ def rendered_dispatch_status(
     不再自己拼任何文案。``status_message`` 是即时路径已经算好的那句话，优先级最高。
     """
 
+    if is_account_not_enabled(status) and _claims_publishing(
+        state=state, dispatch_status=dispatch_status, status_message=status_message
+    ):
+        # #493 块 B：终态卡早已被 rc24 F5 纠正成那句真话，可是**瞬时**这一行还在说
+        # 「权限正在下发」——对一个已停用的目标，下发根本不会发生（发布层在那把
+        # ``app_user`` 行锁里就挡住了非 ``enabled`` 账号的非空授权，见
+        # ``adapters/postgres_permission_publish.record_decision`` 的
+        # ``require_enabled_account``）。管理员先看到一句不成立的承诺、隔一会儿才
+        # 被终态纠正，是展示面失真；这里让瞬时与终态说同一句话。
+        return account_not_enabled_text()
     if status_message:
         return status_message
     if state in {"submitted", "dispatching"} or dispatch_status == "publishing":
-        return "操作已记录，权限正在下发"
+        return PUBLISHING_STATUS_TEXT
     if state == "effective" or dispatch_status == "effective":
         return "已生效"
     if state == "incomplete" or dispatch_status == "incomplete":
@@ -118,6 +153,7 @@ def rendered_dispatch_status(
 __all__ = [
     "rendered_dispatch_status",
     "GENERIC_INCOMPLETE_TEXT",
+    "PUBLISHING_STATUS_TEXT",
     "MANAGEMENT_ACCOUNT_NOT_ENABLED_KEY",
     "account_not_enabled_text",
     "incomplete_status_text",

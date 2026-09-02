@@ -188,6 +188,7 @@ def _build_handler(
     management_actions: object | None = None,
     recompute_trigger: "_FakeRecomputeTrigger | None" = None,
     display_names: "FakeDisplayNames | None" = None,
+    post_callback_executor: object | None = None,
 ) -> tuple[AdminCardCallbackHandler, _RecordingAudit]:
     audit = audit or _RecordingAudit()
     handler = AdminCardCallbackHandler(
@@ -199,6 +200,7 @@ def _build_handler(
         display_names=display_names or FakeDisplayNames(),
         management_actions=management_actions,
         recompute_trigger=recompute_trigger,
+        post_callback_executor=post_callback_executor,
     )
     return handler, audit
 
@@ -763,90 +765,45 @@ class ManagementFormSubmitTests(unittest.TestCase):
     prepare()/确认卡发送的真库集成见
     ``tests/test_admin_management_integration_postgres.py``。"""
 
-    def test_grant_submission_constructs_the_equivalent_admin_command_text(self) -> None:
-        router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
+    def test_legacy_company_metric_submission_is_retired(self) -> None:
+        """**否定用例**：「公司×指标」表单提交已随 ``/admin grant_permission`` /
+        ``suppress_permission`` 一起撤除（Trace #544 D-5）。
 
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="特批授权",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+        这条分支此前把管理员选中的公司/指标拼成那两条文本命令再交给 ``route()``；
+        命令撤除之后它必须**明确拒绝**，而不是把一条注定 ``UNKNOWN`` 的文本送进
+        路由器换回一句"未识别的管理命令"。断言三件事：不调用路由器（零授权副作用）、
+        toast 是错误、审计留下可检索的 ``management_retired_form``。
+        """
 
-        self.assertEqual(len(router.route_calls), 1)
-        call = router.route_calls[0]
-        self.assertEqual(
-            call["text"], "/admin grant_permission ou_target 1011 daily_active 特批授权"
-        )
-        self.assertEqual(call["open_id"], "ou_admin")
-        self.assertEqual(call["message_id"], "om_1")
-        self.assertEqual(response["toast"]["type"], "success")
-        self.assertNotIn("card", response)
+        for admin_action in ("grant", "suppress"):
+            with self.subTest(admin_action=admin_action):
+                router = _FakeManagementRouter()
+                handler, audit = _build_handler(
+                    pending_actions=_FakePendingActions(), management_actions=router
+                )
 
-    def test_suppress_submission_uses_the_suppress_subcommand(self) -> None:
-        router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
+                response = handler.handle_management_form_submit(
+                    operator_open_id="ou_admin",
+                    admin_action=admin_action,
+                    identifier="ou_target",
+                    company_id="1011",
+                    metric_name="daily_active",
+                    reason="特批授权",
+                    chat_id="oc_1",
+                    thread_id=None,
+                    message_id="om_1",
+                    trace_id="trc_1",
+                )
 
-        handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="suppress",
-            identifier="ou_target",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="临时抑制",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
-
-        self.assertIn("suppress_permission", router.route_calls[0]["text"])
-
-    def test_reason_containing_slash_admin_text_cannot_smuggle_a_second_command(self) -> None:
-        """否定断言（注入面）：``reason`` 里嵌一段看起来像另一条命令的文本，
-        不能让重构后的命令文本被解析成任何别的命令——``reason`` 结构上永远是
-        ``grant_permission``/``suppress_permission`` 固定形状的最后一段，
-        ``commands.py`` 的语法门只会把它整体当成 reason 拼接消费。"""
-
-        router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
-
-        handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="正常原因 /admin suspend ou_victim",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
-
-        text = router.route_calls[0]["text"]
-        # 整条文本仍然只是一次 grant_permission 调用，注入的 "/admin suspend"
-        # 只是 reason 字段内容的一部分，不会被当成第二条命令解析——真正的证明
-        # 是 core/admin/commands.py 的语法层面：parse_admin_command(text) 只会
-        # 产出一个 GRANT_PERMISSION 结果，reason 整体拼接含那段文本。
-        from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
-
-        parsed = parse_admin_command(text)
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertIn("/admin suspend ou_victim", parsed.reason)
+                self.assertEqual(router.route_calls, [])
+                self.assertEqual(response["toast"]["type"], "error")
+                self.assertNotIn("card", response)
+                self.assertIn(
+                    "admin.card_callback.management_retired_form"
+                    if admin_action == "grant"
+                    else "admin.card_callback.management_unknown_action",
+                    [record[0] for record in audit.records],
+                )
 
     def test_not_wired_replies_unavailable_without_crashing(self) -> None:
         handler, _ = _build_handler(pending_actions=_FakePendingActions())
@@ -967,31 +924,6 @@ class ManagementFormSubmitTests(unittest.TestCase):
             "admin.card_callback.management_missing_identifier", [a for a, _ in audit.records]
         )
 
-    def test_before_the_fix_an_empty_identifier_would_shift_into_a_wellformed_but_wrong_command(
-        self,
-    ) -> None:
-        """复现修复前的缺陷本身（不经过 handler 的校验，直接验证
-        ``commands.py`` 会怎么解析那条被拼错的文本）：``identifier=""`` 时的
-        命令文本左移之后，只要 ``reason`` 里有至少两个词，解析结果仍然是一条
-        看起来完全合法的 ``GRANT_PERMISSION``，目标却已经变成了原本的
-        ``company_id`` 取值——这正是"察觉不到目标已经变成别人"这句话的具体
-        证据，钉在测试里防止有人以为"反正下游会拒绝"就足够安全。"""
-
-        from lingxi.core.admin.commands import AdminCommandKind, parse_admin_command
-
-        identifier = ""
-        company_id = "1011"
-        metric_name = "daily_active"
-        reason = "特批 授权"
-        shifted_text = f"/admin grant_permission {identifier} {company_id} {metric_name} {reason}"
-
-        parsed = parse_admin_command(shifted_text)
-
-        self.assertEqual(parsed.kind, AdminCommandKind.GRANT_PERMISSION, "被左移后仍然形状合法")
-        self.assertEqual(parsed.identifier, company_id, "目标标识被错误地换成了原本的公司 ID")
-        self.assertEqual(parsed.company_id, metric_name, "公司被错误地换成了原本的指标名")
-        self.assertEqual(parsed.metric_name, "特批", "指标名被错误地换成了原因的第一个词")
-
     def test_route_not_handled_is_reported_as_an_error_toast(self) -> None:
         """结构上只会发生在"点击这一刻当前角色恰好已被撤销"——``route()``
         内部重新判定身份，``handled=False`` 时不能假装成功。"""
@@ -1058,14 +990,15 @@ class ManagementEmptyFormSubmitTests(unittest.TestCase):
             "admin.card_callback.management_empty_form", [action for action, _ in audit.records]
         )
 
-    def test_a_legacy_form_missing_only_the_company_still_says_so(self) -> None:
-        """反向对照一：只缺公司（指标已选）仍逐字是原来那句——本修复只收窄到全空。"""
+    def test_a_legacy_form_submission_falls_into_the_retired_entry_reply(self) -> None:
+        """反向对照一：不是"全空"的旧表单提交（指标已选）不走这条"没收到你的选择"，
+        而是落到撤除入口那句话上（Trace #544 D-5）——本修复仍然只收窄到全空。"""
 
         router = _FakeManagementRouter()
         response, audit = self._submit(router, metric_name="daily_active")
 
         self.assertEqual(response["toast"]["type"], "error")
-        self.assertIn("请选择公司", response["toast"]["content"])
+        self.assertIn("该入口已下线", response["toast"]["content"])
         self.assertNotIn(
             "admin.card_callback.management_empty_form", [action for action, _ in audit.records]
         )
@@ -1094,30 +1027,40 @@ class ManagementEmptyFormSubmitTests(unittest.TestCase):
 
 
 class ManagementFormSubmitWhitespaceValidationTests(unittest.TestCase):
-    """Trace #469 修复包 B，B-2：``identifier``/``company_id``/``metric_name``
-    非空但含空白字符（含全角空格 U+3000）时，纵深校验必须在拼接命令文本之前
-    拦住——审查实测 ``company_id="1011 sub_new_count"`` 能把 ``metric_name``
-    静默左移替换成 ``sub_new_count``、把真正的 ``metric_name`` 挤进 ``reason``
-    首词，当前调用点全部受控故不可达，本组用例是纵深加固。"""
+    """Trace #469 修复包 B，B-2：受控字段非空但含空白字符（含全角空格 U+3000）时，
+    纵深校验必须在拼接命令文本之前拦住——审查实测一个嵌了空格的取值能让
+    ``str.split()`` 把后面的参数整体左移一位，拼出一条**形状合法但语义错位**的命令，
+    管理员却收到正常回执。
 
-    def test_identifier_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
-        router = _FakeManagementRouter()
+    覆盖面随 Trace #544 D-5 转到「职位×公司范围」表单：那两条按公司×指标拼文本的命令
+    已经撤除，仍然在拼命令文本的只剩这一个表单（``/admin grant_position <标识>
+    <职位> <公司范围> <原因>``），这条纵深要跟着搬过去，不是随入口一起消失。
+    """
+
+    def _submit(self, router, **overrides):
         handler, audit = _build_handler(
             pending_actions=_FakePendingActions(), management_actions=router
         )
+        fields = {
+            "operator_open_id": "ou_admin",
+            "admin_action": "grant",
+            "identifier": "ou_target",
+            "company_id": "",
+            "metric_name": "",
+            "reason": "特批",
+            "chat_id": "oc_1",
+            "thread_id": None,
+            "message_id": "om_1",
+            "trace_id": "trc_1",
+            "position_name": "A运营",
+            "company_scope": "1011",
+        }
+        fields.update(overrides)
+        return handler.handle_management_form_submit(**fields), audit
 
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target extra_token",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="特批",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+    def test_identifier_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+        router = _FakeManagementRouter()
+        response, audit = self._submit(router, identifier="ou_target extra_token")
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertEqual(router.route_calls, [], "含空白字符的 identifier 不得拼进命令文本")
@@ -1125,104 +1068,44 @@ class ManagementFormSubmitWhitespaceValidationTests(unittest.TestCase):
             "admin.card_callback.management_missing_identifier", [a for a, _ in audit.records]
         )
 
-    def test_company_id_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
-        """审查实测的具体复现场景：``company_id`` 里嵌一个空格 + 别的指标名，
-        企图让 ``str.split()`` 把它左移进 ``metric_name``。"""
+    def test_position_name_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+        """审查实测那一类复现场景在职位表单上的对应形态：``position_name`` 里嵌一个
+        空格，企图让 ``str.split()`` 把它左移进 ``company_scope``。"""
 
         router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
-
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target",
-            company_id="1011 sub_new_count",
-            metric_name="daily_active",
-            reason="特批",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+        response, _ = self._submit(router, position_name="A运营 2022")
 
         self.assertEqual(response["toast"]["type"], "error")
-        self.assertEqual(router.route_calls, [], "含空白字符的 company_id 不得拼进命令文本")
+        self.assertEqual(router.route_calls, [], "含空白字符的 position_name 不得拼进命令文本")
 
-    def test_metric_name_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
+    def test_company_scope_containing_a_space_is_rejected_without_calling_the_router(self) -> None:
         router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
-
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="suppress",
-            identifier="ou_target",
-            company_id="1011",
-            metric_name="daily active",
-            reason="特批",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+        response, _ = self._submit(router, company_scope="1011 2022")
 
         self.assertEqual(response["toast"]["type"], "error")
-        self.assertEqual(router.route_calls, [], "含空白字符的 metric_name 不得拼进命令文本")
+        self.assertEqual(router.route_calls, [], "含空白字符的 company_scope 不得拼进命令文本")
 
     def test_fullwidth_space_in_identifier_is_also_rejected(self) -> None:
         """全角空格（U+3000）与半角空格同样落进 ``str.isspace()``，不能被
         当成一个"看起来正常"的字符漏过校验。"""
 
         router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
-
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target　extra",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="特批",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+        response, _ = self._submit(router, identifier="ou_target　extra")
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertEqual(router.route_calls, [])
 
     def test_well_formed_fields_without_whitespace_still_pass(self) -> None:
-        """否定断言的另一半：正常取值（不含任何空白）不应该被这条新增校验
-        误伤——与既有 ``test_grant_submission_constructs_the_equivalent_
-        admin_command_text`` 覆盖同一条主路径，这里只确认新校验不引入
-        误报。"""
+        """否定断言的另一半：正常取值（不含任何空白）不应该被这条校验误伤。"""
 
         router = _FakeManagementRouter()
-        handler, _ = _build_handler(
-            pending_actions=_FakePendingActions(), management_actions=router
-        )
-
-        response = handler.handle_management_form_submit(
-            operator_open_id="ou_admin",
-            admin_action="grant",
-            identifier="ou_target",
-            company_id="1011",
-            metric_name="daily_active",
-            reason="特批 授权说明",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+        response, _ = self._submit(router, reason="特批 授权说明")
 
         self.assertEqual(response["toast"]["type"], "success")
         self.assertEqual(len(router.route_calls), 1)
+        self.assertEqual(
+            router.route_calls[0]["text"], "/admin grant_position ou_target A运营 1011 特批 授权说明"
+        )
 
 
 class ManagementRevokeClickTests(unittest.TestCase):
@@ -1534,3 +1417,146 @@ class RecomputeTriggerWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class _RecordingExecutor:
+    """``PostCallbackExecutor`` 替身：只记下任务，**不执行**——用来证明"回调应答
+    路径上没有跑过这批后处理"。``accept=False`` 模拟队列已满。"""
+
+    def __init__(self, accept: bool = True) -> None:
+        self.accept = accept
+        self.tasks: list = []
+
+    def submit(self, task) -> bool:
+        self.tasks.append(task)
+        return self.accept
+
+
+class PostCallbackExecutorTests(unittest.TestCase):
+    """#493 块 B（Trace #544）：**大范围授权的确认回调会超时并诱导重复点击**。
+
+    确认成功之后原地做的四件事全是网络往返（出带外换卡、管理群通知、刷新原管理卡、
+    入队定向重算），一次 43 家公司 × 9 指标（387 项）的补充授权实测约 4 秒，超出飞书
+    回调应答窗口：管理员看到「回调服务超时未响应」，「确认执行」按钮重新点亮。执行只
+    发生一次（迁移 0084 的卡片状态 CAS 挡住重复执行），但这是把"数据没坏"当成"体验
+    可以接受"。这批后处理搬到应答之后。
+    """
+
+    @staticmethod
+    def _executed_pending_actions():
+        pending = _pending(status=PendingActionStatus.EXECUTED)
+        pending_actions = _FakePendingActions()
+        pending_actions.set_confirm_result(
+            _FakeOutcome(
+                decision=_FakeDecision(
+                    kind=ConfirmResultKind.EXECUTE,
+                    ok=True,
+                    message="已确认执行。",
+                    terminal_status=PendingActionStatus.EXECUTED,
+                ),
+                pending=pending,
+            )
+        )
+        return pending_actions, pending
+
+    def _confirm(self, executor):
+        pending_actions, pending = self._executed_pending_actions()
+        confirm_cards = _FakeCardTransport()
+        notifier = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+            group_notifier=notifier,
+            post_callback_executor=executor,
+        )
+        response = handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_1",
+        )
+        return response, confirm_cards, notifier, audit
+
+    def test_response_carries_the_terminal_card_without_running_the_network_work(self) -> None:
+        executor = _RecordingExecutor()
+
+        response, confirm_cards, notifier, _ = self._confirm(executor)
+
+        # 应答本身完整：终态卡 JSON 是同步算出来的。
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertIn("card", response)
+        # 网络往返一次都还没发生。
+        self.assertEqual(len(executor.tasks), 1)
+        self.assertEqual(confirm_cards.update_calls, [])
+        self.assertEqual(notifier.sent, [])
+
+    def test_the_deferred_task_still_does_everything_in_the_original_order(self) -> None:
+        executor = _RecordingExecutor()
+
+        _, confirm_cards, notifier, _ = self._confirm(executor)
+        executor.tasks[0]()
+
+        self.assertEqual(len(confirm_cards.update_calls), 1)
+        self.assertEqual(len(notifier.sent), 1)
+
+    def test_a_full_queue_falls_back_to_running_inline(self) -> None:
+        """执行器说"没接住"时必须原地同步做完——宁可这一次回调慢，也不能让终态卡、
+        群通知整批消失（那是用户可见的结果丢失，比一次超时严重得多）。"""
+
+        executor = _RecordingExecutor(accept=False)
+
+        _, confirm_cards, notifier, _ = self._confirm(executor)
+
+        self.assertEqual(len(confirm_cards.update_calls), 1)
+        self.assertEqual(len(notifier.sent), 1)
+
+    def test_without_an_executor_behaviour_is_unchanged(self) -> None:
+        """未接执行器（``None``）：与本改动之前逐字相同，全部同步完成。"""
+
+        pending_actions, pending = self._executed_pending_actions()
+        confirm_cards = _FakeCardTransport()
+        notifier = _FakeGroupNotifier()
+        handler, _ = _build_handler(
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+            group_notifier=notifier,
+        )
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(len(confirm_cards.update_calls), 1)
+        self.assertEqual(len(notifier.sent), 1)
+
+    def test_an_exploding_executor_does_not_swallow_the_post_processing(self) -> None:
+        class ExplodingExecutor:
+            def submit(self, task) -> bool:
+                raise RuntimeError("boom")
+
+        pending_actions, pending = self._executed_pending_actions()
+        confirm_cards = _FakeCardTransport()
+        notifier = _FakeGroupNotifier()
+        handler, audit = _build_handler(
+            pending_actions=pending_actions,
+            confirm_cards=confirm_cards,
+            group_notifier=notifier,
+            post_callback_executor=ExplodingExecutor(),
+        )
+
+        handler.handle(
+            operator_open_id="ou_admin",
+            pending_action_id=pending.id,
+            decision=DECISION_CONFIRM,
+            trace_id="trc_1",
+        )
+
+        self.assertEqual(len(confirm_cards.update_calls), 1)
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertIn(
+            "admin.card_callback.post_callback_submit_failed",
+            [action for action, _ in audit.records],
+        )

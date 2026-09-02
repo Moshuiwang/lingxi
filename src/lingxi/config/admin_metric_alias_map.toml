@@ -1,12 +1,13 @@
 # 「指标中文别名」→ 真实指标 ID 映射（Issue #439 A 档：文本命令兜底人性化）
 #
 # 背景：真实指标目录（config/company_function_metric_map.toml）里的指标 ID 全部是
-# 英文 snake_case 内部标识（如 "sub_new_count"），管理员在 /admin grant_permission /
-# suppress_permission / revoke_permission 里目前必须精确输入这个 ID 才能命中——记不住
-# 拼写、把 grant 与 revoke 参数形状搞混，是 #439 卡内登记的两次真实误用之一。
+# 英文 snake_case 内部标识（如 "sub_new_count"），管理员在 /admin revoke_permission
+# 里目前必须精确输入这个 ID 才能命中——记不住拼写、把参数形状搞混，是 #439 卡内登记的
+# 两次真实误用之一。（``/admin grant_permission`` 与 ``/admin suppress_permission``
+# 已按 Trace #544 D-5 撤除，别名反查因此只剩收回这一个文本命令的使用者。）
 #
 # 本文件只提供「别名 → 真实指标 ID」的查找表，供 adapters/admin_metric_alias_map_file.py
-# 加载、core/admin/router.py 在 grant/suppress/revoke 三条写命令里查一次（查不到就原样
+# 加载、core/admin/router.py 在收回写命令里查一次（查不到就原样
 # 透传输入，交给下游按既有"未找到"语义处理，不新增并行的错误分支——见 router.py 的
 # ``AdminQueries.resolve_metric_name`` 文档）。本文件不校验别名是否已在别处使用，也不
 # 校验右值是否真的出现在 company_function_metric_map.toml 里——两个文件由不同人分别

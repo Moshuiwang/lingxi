@@ -133,7 +133,7 @@ class PendingActionPreparer(Protocol):
     相同，测试注入内存假实现。
 
     ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）只有
-    ``GRANT_PERMISSION``/``SUPPRESS_PERMISSION`` 两条写命令会填——``suspend``/
+    ``REVOKE_PERMISSION`` 形状 2 会填——``suspend``/
     ``resume`` 沿用既有调用形状，不传这三个参数。``REVOKE_PERMISSION``（卡 B）
     只传 ``target_open_id``（复用同一形参承载 override_id，不是 open_id——
     真正的目标用户 open_id 由 ``adapters/postgres_pending_action.py`` 的
@@ -556,25 +556,6 @@ class AdminCommandRouter:
                 trace_id=trace_id,
             )
 
-        if command.kind is AdminCommandKind.GRANT_PERMISSION:
-            assert command.identifier is not None
-            assert command.company_id is not None
-            assert command.metric_name is not None
-            assert command.reason is not None
-            return self._dispatch_write_action(
-                entry=entry,
-                roles=roles,
-                action_type=PendingActionType.LOCAL_PERMISSION_GRANT,
-                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
-                chat_id=chat_id,
-                thread_id=thread_id,
-                message_id=message_id,
-                trace_id=trace_id,
-                company_id=command.company_id,
-                metric_name=self._queries.resolve_metric_name(metric_token=command.metric_name),
-                reason=command.reason,
-            )
-
         if command.kind is AdminCommandKind.GRANT_POSITION_PERMISSION:
             assert command.identifier is not None
             assert command.position_name is not None
@@ -593,25 +574,6 @@ class AdminCommandRouter:
                 company_scope=command.company_scope,
                 reason=command.reason,
                 origin_card_message_id=origin_card_message_id,
-            )
-
-        if command.kind is AdminCommandKind.SUPPRESS_PERMISSION:
-            assert command.identifier is not None
-            assert command.company_id is not None
-            assert command.metric_name is not None
-            assert command.reason is not None
-            return self._dispatch_write_action(
-                entry=entry,
-                roles=roles,
-                action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS,
-                target_identifier=self._queries.resolve_identifier(identifier=command.identifier),
-                chat_id=chat_id,
-                thread_id=thread_id,
-                message_id=message_id,
-                trace_id=trace_id,
-                company_id=command.company_id,
-                metric_name=self._queries.resolve_metric_name(metric_token=command.metric_name),
-                reason=command.reason,
             )
 
         if command.kind is AdminCommandKind.REVOKE_PERMISSION:
@@ -731,17 +693,20 @@ class AdminCommandRouter:
         company_scope: str | None = None,
         origin_card_message_id: str | None = None,
     ) -> AdminRouteOutcome:
-        """``suspend``/``resume``/``grant_permission``/``suppress_permission``/
-        ``revoke_permission`` 共用的写命令编排：角色核对 → 自我目标防呆 →
+        """``suspend``/``resume``/``grant_position``/``revoke_permission``
+        共用的写命令编排：角色核对 → 自我目标防呆 →
         ``prepare_action``（只建待确认操作，不改业务状态）→ 发送确认卡片 →
         回复管理员"已生成待确认操作，请查收卡片"。真正的业务变更只发生在管理员
         本人点击卡片之后，见 ``core/admin/card_callback.AdminCardCallbackHandler``。
 
-        ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）只有
-        ``LOCAL_PERMISSION_GRANT``/``LOCAL_PERMISSION_SUPPRESS`` 会传全部三个；
-        ``LOCAL_PERMISSION_REVOKE``（卡 B）只传 ``reason``，``company_id``/
-        ``metric_name`` 保持 ``None``——``suspend``/``resume`` 三个都不传，保持
-        既有调用形状不变。
+        ``company_id``/``metric_name``/``reason`` 三个参数（#319 S-P-1b 新增）自
+        Trace #544 D-5 起只剩 ``LOCAL_PERMISSION_REVOKE`` 形状 2 会传：
+        ``LOCAL_PERMISSION_GRANT`` 现在只由管理卡「职位×公司范围」表单发起，传
+        ``position_name``/``company_scope``/``reason``；``LOCAL_PERMISSION_
+        SUPPRESS`` 已经没有任何调用方（``/admin suppress_permission`` 撤除后没有
+        第二个入口，历史行仍由确认/通知侧按类型渲染，见 ``_WRITE_ACTION_NAMES``
+        与 ``core/admin/notification.py``）——``suspend``/``resume`` 三个都不传，
+        保持既有调用形状不变。
 
         本方法下面的自我目标防呆判断（``target_identifier == entry.
         feishu_open_id``）对 ``LOCAL_PERMISSION_REVOKE`` 结构上恒假：收回命令的
@@ -968,7 +933,12 @@ class AdminCommandRouter:
 
 def _render_help(roles: Sequence[str]) -> str:
     """术语统一（Trace #469 S-1，PM 补充裁定第 4 条）：命令说明改用「补充授权」
-    「屏蔽指标」「撤销」，与管理卡按钮、确认卡/终态卡/群通知同一份说法。最后一行
+    「屏蔽指标」「撤销」，与管理卡按钮、确认卡/终态卡/群通知同一份说法。
+
+    ``grant_permission``/``suppress_permission`` 两行已按 Trace #544 D-5 撤除
+    （命令本身也已从解析器移除，见 ``core/admin/commands.parse_admin_command``）：
+    补充授权统一走 ``/admin user`` 调出的管理卡「银河职位×公司范围」表单，帮助里
+    不再公开一条已经不受理的命令。最后一行
     不再声称"覆盖ID 见 /admin user 查询结果"——`/admin user` 回显自本批起不再
     展示裸 override_id/permission_group_id（内部 ID 只留审计，见
     ``_render_local_overrides``），已知覆盖ID 时仍可直接使用，但多数场景请改用上一行
@@ -984,11 +954,8 @@ def _render_help(roles: Sequence[str]) -> str:
         "/admin trace <追溯号> — 按追溯号查开通失败原因与事件时间线\n"
         "/admin suspend <标识> — 发起停用该用户（需本人飞书确认卡片）\n"
         "/admin resume <标识> — 发起恢复该用户（需本人飞书确认卡片）\n"
-        "/admin grant_permission <标识> <公司> <指标> <原因> — 发起补充授权"
-        "（需本人飞书确认卡片；指标支持已配置的中文别名）\n"
-        "/admin suppress_permission <标识> <公司> <指标> <原因> — 发起屏蔽指标（同上）\n"
         "/admin revoke_permission <标识> <公司> <指标> <原因> — 发起撤销本地覆盖"
-        "（需本人飞书确认卡片；与 grant/suppress 同一参数形状，服务端反查覆盖ID）\n"
+        "（需本人飞书确认卡片；服务端按标识+公司+指标反查覆盖ID）\n"
         "/admin revoke_permission <覆盖ID/权限组ID> <原因> — 已知 ID 时直接发起撤销"
         "（多数场景请改用上一行的标识+公司+指标形式，或使用管理卡撤销按钮）\n"
         f"当前角色：{role_line}"

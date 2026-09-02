@@ -410,3 +410,21 @@ class UnrecognizedSlashInteractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonDecimalDigitMemorySerialTests(unittest.TestCase):
+    """A-2 同类（Trace #544）：``/memory forget ²⁴`` 这条路径**任何用户**都能走到。
+
+    ``"²⁴".isdigit()`` 为真而 ``int("²⁴")`` 抛 ``ValueError``——序号解析必须用
+    ``isdecimal()``，不能靠上层把一个奇怪字符兜成一次异常。
+    """
+
+    def test_superscript_serial_is_not_a_command_and_does_not_raise(self) -> None:
+        command = parse_memory_command("/memory forget ²⁴")
+
+        self.assertEqual(command.kind, MemoryCommandKind.NONE)
+
+    def test_plain_decimal_serial_still_parses(self) -> None:
+        command = parse_memory_command("/memory forget 3")
+
+        self.assertEqual(command.memory_serial, 3)

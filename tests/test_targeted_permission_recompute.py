@@ -79,6 +79,16 @@ class FakeRosterRows:
         return self._rows
 
 
+class FakeRevocationIdentities:
+    """撤权专用查找口的替身（Trace #544 P-6）：**不看开通进度**，只按 user_id 命中。"""
+
+    def __init__(self, *identities: ArchivedIdentity) -> None:
+        self._by_id = {each.app_user_id: each for each in identities}
+
+    def find_for_revocation(self, *, user_id: str):
+        return self._by_id.get(user_id)
+
+
 def build_recompute(
     *,
     identities=(),
@@ -92,6 +102,7 @@ def build_recompute(
     audit=None,
     clock=None,
     legacy_all_scope=None,
+    revocation_identities=None,
 ):
     audit = audit or RecordingAudit()
     decisions = decisions or FakeDecisions()
@@ -110,6 +121,7 @@ def build_recompute(
         local_overrides=local_overrides,
         clock=clock or FixedClock(NOW),
         legacy_all_scope=legacy_all_scope,
+        revocation_identities=revocation_identities,
     )
     return recompute, {"audit": audit, "decisions": decisions, "history": history}
 
@@ -564,3 +576,79 @@ class AccountStateDeclarationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForceRevokeIdentityLookupTests(unittest.TestCase):
+    """P-6（Trace #544，对抗审查面 3）：**停用要能撤掉"开通到一半"那条在途意图**。
+
+    授权侧的身份基线只收 ``provisioning_state = 'active'`` 的人
+    （``adapters/postgres_roster_audit.ACTIVE_BASELINE_SQL``）。首聊开通到一半就被停用
+    的那个人不在这份基线里，于是 ``force_revoke`` 判 ``user_not_active`` 直接跳过——
+    已经入队的 ``first_onboarding`` 意图照样发到正式表：用户被停用了却仍然在权限表里
+    有一行，而他的问数令牌只在 scheduler 侧、本人根本用不了。这一行既没用又越权，
+    要等到下一次停用/恢复才会被清掉。
+
+    修法是给撤权一条**独立**的身份查找口（只排除已删除账号，不看开通进度）。撤权决定
+    本身推进 ``permission_version``，比它旧的在途意图在认领时判 ``superseded``、一次
+    外部调用都不发——"撤掉在途意图"复用的就是这条既有机制。
+    """
+
+    def test_revokes_a_user_still_being_provisioned(self) -> None:
+        """开通中的用户不在授权基线里（``identities`` 故意留空），仍然要能撤权。"""
+
+        recompute, parts = build_recompute(
+            identities=(),
+            revocation_identities=FakeRevocationIdentities(identity()),
+            roster_rows=None,
+            galaxy=None,
+            published_users={USER_ONE},
+        )
+
+        outcome = recompute.force_revoke(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.REVOKED)
+        [call] = parts["decisions"].calls
+        self.assertEqual(call["row"].permissions, "{}")
+
+    def test_authorization_path_still_refuses_a_user_outside_the_active_baseline(self) -> None:
+        """否定断言：撤权口放宽了，**授权口一个字都不能跟着放宽**——否则开通中的
+        用户会被合并管线算出非空权限直接发出去，比原缺陷严重得多。"""
+
+        recompute, parts = build_recompute(
+            identities=(),
+            revocation_identities=FakeRevocationIdentities(identity()),
+            published_users={USER_ONE},
+        )
+
+        outcome = recompute.recompute_and_publish(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, SKIP_USER_NOT_ACTIVE)
+        self.assertEqual(parts["decisions"].calls, [])
+
+    def test_revocation_lookup_miss_still_skips(self) -> None:
+        """撤权口也不是无条件放行：它查不到（账号已删除）时仍然跳过。"""
+
+        recompute, parts = build_recompute(
+            identities=(identity(),),
+            revocation_identities=FakeRevocationIdentities(),
+            published_users={USER_ONE},
+        )
+
+        outcome = recompute.force_revoke(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.SKIPPED)
+        self.assertEqual(outcome.reason, SKIP_USER_NOT_ACTIVE)
+        self.assertEqual(parts["decisions"].calls, [])
+
+    def test_without_the_dedicated_lookup_behaviour_is_unchanged(self) -> None:
+        """未接撤权口（``None``）时退回授权侧基线，与本修复之前逐字相同。"""
+
+        recompute, parts = build_recompute(
+            identities=(identity(),), published_users={USER_ONE}, roster_rows=None
+        )
+
+        outcome = recompute.force_revoke(user_id=USER_ONE)
+
+        self.assertEqual(outcome.kind, RecomputeKind.REVOKED)
+        self.assertEqual(len(parts["decisions"].calls), 1)

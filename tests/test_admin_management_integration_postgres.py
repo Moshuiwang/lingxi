@@ -155,31 +155,50 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
             (TARGET_OPEN_ID, action_type),
         )
 
+    def _ensure_management_context(self, message_id: str, identifier: str) -> None:
+        """职位表单的反向 FK 与生产管理卡发送侧登记保持同一前置。"""
+
+        now = datetime.now(timezone.utc) + timedelta(hours=1)
+        self.execute(
+            """INSERT INTO management_card_context
+                 (message_id, card_id, identifier, chat_id, initiated_by_open_id,
+                  snapshot_fingerprint, context_deadline_at)
+               VALUES (%s, %s, %s, 'oc_1', %s, 'fp', %s)""",
+            (message_id, f"card_{message_id}", identifier, ADMIN_OPEN_ID, now),
+        )
+
 
 class FormSubmitCreatesARealPendingActionTests(ManagementCardCallbackIntegrationTestCase):
-    def test_grant_form_submit_writes_a_real_pending_action_row_and_sends_a_confirm_card(
+    def test_position_form_submit_writes_a_real_pending_action_row_and_sends_a_confirm_card(
         self,
     ) -> None:
+        """真库那一条：「银河职位×公司范围」表单提交真的落一条 ``pending_action``
+        并发出确认卡。旧的「公司×指标」表单已随 Trace #544 D-5 撤除，覆盖面搬到
+        #493 之后生产唯一还在渲染的这个表单上。"""
+
+        self._ensure_management_context("om_1", TARGET_OPEN_ID)
         response = self.handler.handle_management_form_submit(
             operator_open_id=ADMIN_OPEN_ID,
             admin_action="grant",
             identifier=TARGET_OPEN_ID,
-            company_id="1011",
-            metric_name="daily_active",
+            company_id="",
+            metric_name="",
             reason="特批授权",
             chat_id="oc_1",
             thread_id=None,
             message_id="om_1",
             trace_id="trc_1",
+            position_name="A运营",
+            company_scope="*",
         )
 
-        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(response["toast"]["type"], "success", response["toast"]["content"])
         rows = self.pending_actions_for_target(action_type="local_permission_grant")
         self.assertEqual(len(rows), 1)
         _, status, payload, reason = rows[0]
         self.assertEqual(status, "pending")
-        self.assertIn("1011", payload)
-        self.assertIn("daily_active", payload)
+        self.assertIn("A运营", payload)
+        self.assertIn("permission_group_id", payload)
         # 确认卡片确实通过既有 ConfirmCardDispatcher 发送了一次（真实
         # pending_action.card_delivered 应为真，能被后续 confirm() 使用）。
         self.assertEqual(len(self.confirm_transport.create_calls), 1)
@@ -189,59 +208,74 @@ class FormSubmitCreatesARealPendingActionTests(ManagementCardCallbackIntegration
         sent_card = self.confirm_transport.create_calls[0]["card"]
         self.assertIn("化名用户", sent_card.body)
         self.assertNotIn(TARGET_OPEN_ID, sent_card.body)
-        # 公司编号在没有任何银河批次时按设计原样展示（未导入过银河数据，
-        # company_label 的既有降级行为，见 core/admin/display_names 模块文档）。
-        self.assertIn("公司 1011", sent_card.body)
 
-    def test_suppress_form_submit_writes_the_suppress_action_type(self) -> None:
-        self.handler.handle_management_form_submit(
-            operator_open_id=ADMIN_OPEN_ID,
-            admin_action="suppress",
-            identifier=TARGET_OPEN_ID,
-            company_id="1011",
-            metric_name="daily_active",
-            reason="临时抑制",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-            trace_id="trc_1",
-        )
+    def test_legacy_company_metric_form_submit_writes_nothing(self) -> None:
+        """**否定用例（真库）**：旧「公司×指标」表单提交撤除后一行都不落
+        （Trace #544 D-5）。这条走的是完整真实链路——真实 ``route()``、真实
+        ``prepare()`` 都在，只是根本到不了它们。"""
 
-        rows = self.pending_actions_for_target(action_type="local_permission_suppress")
-        self.assertEqual(len(rows), 1)
+        for admin_action in ("grant", "suppress"):
+            with self.subTest(admin_action=admin_action):
+                response = self.handler.handle_management_form_submit(
+                    operator_open_id=ADMIN_OPEN_ID,
+                    admin_action=admin_action,
+                    identifier=TARGET_OPEN_ID,
+                    company_id="1011",
+                    metric_name="daily_active",
+                    reason="特批授权",
+                    chat_id="oc_1",
+                    thread_id=None,
+                    message_id="om_1",
+                    trace_id="trc_1",
+                )
+
+                self.assertEqual(response["toast"]["type"], "error")
+                self.assertEqual(
+                    self.pending_actions_for_target(action_type="local_permission_grant"), []
+                )
+                self.assertEqual(
+                    self.pending_actions_for_target(action_type="local_permission_suppress"), []
+                )
+                self.assertEqual(self.confirm_transport.create_calls, [])
 
     def test_unauthorized_operator_writes_nothing(self) -> None:
         """否定断言：不是登记表里的管理员——真实 ``route()`` 内部重新判定身份，
         不产生任何待确认操作。"""
 
+        self._ensure_management_context("om_1", TARGET_OPEN_ID)
         response = self.handler.handle_management_form_submit(
             operator_open_id="ou_never_registered",
             admin_action="grant",
             identifier=TARGET_OPEN_ID,
-            company_id="1011",
-            metric_name="daily_active",
+            company_id="",
+            metric_name="",
             reason="特批授权",
             chat_id="oc_1",
             thread_id=None,
             message_id="om_1",
             trace_id="trc_1",
+            position_name="A运营",
+            company_scope="*",
         )
 
         self.assertEqual(response["toast"]["type"], "error")
         self.assertEqual(self.pending_actions_for_target(action_type="local_permission_grant"), [])
 
     def test_missing_reason_is_rejected_before_touching_the_router(self) -> None:
+        self._ensure_management_context("om_1", TARGET_OPEN_ID)
         response = self.handler.handle_management_form_submit(
             operator_open_id=ADMIN_OPEN_ID,
             admin_action="grant",
             identifier=TARGET_OPEN_ID,
-            company_id="1011",
-            metric_name="daily_active",
+            company_id="",
+            metric_name="",
             reason="   ",
             chat_id="oc_1",
             thread_id=None,
             message_id="om_1",
             trace_id="trc_1",
+            position_name="A运营",
+            company_scope="*",
         )
 
         self.assertEqual(response["toast"]["type"], "error")
@@ -371,18 +405,6 @@ class PositionPermissionGroupRealDbTests(ManagementCardCallbackIntegrationTestCa
                 f"fs_{self.SECOND_TARGET_OPEN_ID}",
                 f"un_{self.SECOND_TARGET_OPEN_ID}",
             ),
-        )
-
-    def _ensure_management_context(self, message_id: str, identifier: str) -> None:
-        """职位表单的反向 FK 与生产管理卡发送侧登记保持同一前置。"""
-
-        now = datetime.now(timezone.utc) + timedelta(hours=1)
-        self.execute(
-            """INSERT INTO management_card_context
-                 (message_id, card_id, identifier, chat_id, initiated_by_open_id,
-                  snapshot_fingerprint, context_deadline_at)
-               VALUES (%s, %s, %s, 'oc_1', %s, 'fp', %s)""",
-            (message_id, f"card_{message_id}", identifier, ADMIN_OPEN_ID, now),
         )
 
     def _submit_and_confirm_position_group(self, target_open_id: str, message_id: str) -> str:

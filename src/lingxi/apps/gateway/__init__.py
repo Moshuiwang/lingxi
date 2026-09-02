@@ -44,9 +44,7 @@ from lingxi.core.admin.management_card import (
     ADMIN_ACTION_CANCEL,
     ADMIN_ACTION_GRANT,
     ADMIN_ACTION_REVOKE,
-    ADMIN_ACTION_SUPPRESS,
     GRANT_SUBMIT_BUTTON_NAME,
-    SUPPRESS_SUBMIT_BUTTON_NAME,
     render_management_card,
 )
 from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
@@ -63,7 +61,7 @@ from .document_delivery import (
 )
 from .group_mention_hint import GroupMentionHintResponder, build_group_mention_hint_throttle
 from .log_redaction import install_credential_redaction
-from .management_status import rendered_dispatch_status, skipped_recompute_status_message
+from .management_status import PUBLISHING_STATUS_TEXT, rendered_dispatch_status, skipped_recompute_status_message
 from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
@@ -529,15 +527,14 @@ def make_event_handler(
                 # admin_action（缺失或需要反序列化的字符串，见
                 # adapters/feishu_events.py 的 _parse_action_value 文档），但
                 # 回调事件本就会带回按钮自己的 action.name
-                # （grant_submit/suppress_submit）——用它兜底识别是哪一个
-                # 提交按钮，不这样做，点击后会静默落进下面"未知 decision"分支，
-                # 管理卡补充授权/屏蔽指标从此全部失效（真实点击已实测复现）。
-                # 逐行「撤销」按钮不需要这条后备——它不在 form 内，真实回调的
-                # value 已经带着 admin_action 正常到达。
+                # （grant_submit）——用它兜底识别是哪一个提交按钮，不这样做，
+                # 点击后会静默落进下面"未知 decision"分支，管理卡补充授权从此
+                # 全部失效（真实点击已实测复现）。表单内自 Trace #544 D-5 起只剩
+                # 这一个提交按钮（「屏蔽指标」随 /admin suppress_permission 一起
+                # 撤除）。逐行「撤销」按钮不需要这条后备——它不在 form 内，真实
+                # 回调的 value 已经带着 admin_action 正常到达。
                 if action_event.action_name == GRANT_SUBMIT_BUTTON_NAME:
                     admin_action = ADMIN_ACTION_GRANT
-                elif action_event.action_name == SUPPRESS_SUBMIT_BUTTON_NAME:
-                    admin_action = ADMIN_ACTION_SUPPRESS
             if admin_action == ADMIN_ACTION_REVOKE:
                 chat_id, message_id = _management_card_context(payload)
                 revoke_kwargs = dict(
@@ -565,7 +562,7 @@ def make_event_handler(
                     message_id=message_id,
                     trace_id=action_event.trace_id,
                 )
-            if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
+            if admin_action == ADMIN_ACTION_GRANT:
                 chat_id, message_id = _management_card_context(payload)
                 identifier = action_event.action_value.get("identifier", "")
                 if not identifier and management_card_context_store is not None:
@@ -699,6 +696,7 @@ def build_supervisor(
     from lingxi.adapters.postgres_management_card_context import (
         PostgresManagementCardContextStore,
     )
+    from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
     from lingxi.adapters.postgres_permission_recompute_trigger import (
         BackgroundPermissionRecomputeTrigger,
@@ -844,7 +842,7 @@ def build_supervisor(
             if complete:
                 dispatch_status = "已生效"
             elif state == "dispatching":
-                dispatch_status = status_message or "操作已记录，权限正在下发"
+                dispatch_status = status_message or PUBLISHING_STATUS_TEXT
             else:
                 trace = context.last_trace_id or "当前操作"
                 dispatch_status = (
@@ -934,7 +932,7 @@ def build_supervisor(
             pending,
             complete=False,
             state_override="dispatching",
-            status_message="操作已记录，权限正在下发",
+            status_message=PUBLISHING_STATUS_TEXT,
         )
         _start_management_publish_observer(pending)
 
@@ -1018,6 +1016,8 @@ def build_supervisor(
             on_skipped=_recompute_skipped,
             on_timeout=_recompute_timeout,
         ),
+        # 应答之后才做那批网络往返（#493 块 B，见该适配器模块文档）。
+        post_callback_executor=BackgroundPostCallbackExecutor(audit=audit),
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
     # 普通字符串交给管线——管线自己不再持有任何查询能力，对全体消息都只是内存
