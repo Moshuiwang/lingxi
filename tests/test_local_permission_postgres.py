@@ -162,11 +162,19 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
     同事务合成终态 ``pending_action`` + 行、幂等 ``already_present``、「全部」组可整组撤销、
     新指标补行不复活撤销过的指标。"""
 
-    def _plan(self, pairs=(), all_scope=()):
-        from lingxi.core.permission.legacy_diff import SHAPE_FULL_WILDCARD, SHAPE_SPECIFIC, LegacyImportPlan
+    def _plan(self, pairs=(), all_scope=(), *, explicit: bool = False):
+        from lingxi.core.permission.legacy_diff import (
+            SHAPE_ALL_SCOPE_EXPLICIT,
+            SHAPE_FULL_WILDCARD,
+            SHAPE_SPECIFIC,
+            LegacyImportPlan,
+        )
 
+        shape = SHAPE_SPECIFIC
+        if all_scope:
+            shape = SHAPE_ALL_SCOPE_EXPLICIT if explicit else SHAPE_FULL_WILDCARD
         return LegacyImportPlan(
-            shape=SHAPE_FULL_WILDCARD if all_scope else SHAPE_SPECIFIC,
+            shape=shape,
             pairs=tuple(pairs),
             all_scope_metrics=tuple(all_scope),
             skipped_reasons=(),
@@ -289,6 +297,53 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
             0,
             "再跑一次零写入",
         )
+
+    def test_an_explicit_list_group_carries_its_own_label(self) -> None:
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2"), explicit=True), now=self._now()
+        )
+        labels = {row[0] for row in self.query("SELECT position_name FROM local_permission_override WHERE permission_group_id = %s", (report.group_id,))}
+        self.assertEqual(labels, {ALL_SCOPE_EXPLICIT_POSITION_NAME})
+
+    def test_a_revoked_all_scope_group_is_not_rebuilt_on_reimport(self) -> None:
+        """独立审核 P3-5：管理员整组撤销过、当前没有生效组 → 重新导入不重建组；具体行照常。"""
+
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2")), now=self._now()
+        )
+        ids = tuple(row[0] for row in self.query(
+            "SELECT id FROM local_permission_override WHERE permission_group_id = %s ORDER BY id", (report.group_id,)
+        ))
+        self.assertTrue(self.store.revoke_group(
+            permission_group_id=report.group_id,
+            revoked_pending_action_id=self.add_pending_action(pending_id=new_id("pac")),
+            expected_override_ids=ids,
+        ))
+
+        again = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(pairs=(("88", "m9"),), all_scope=("m1", "m2")), now=self._now()
+        )
+
+        self.assertTrue(again.group_skipped_revoked)
+        self.assertIsNone(again.group_id)
+        self.assertEqual((again.imported, again.already_present), (1, 0))
+        active = [(e.entry.company_id, e.entry.metric_name) for e in self.store.effective_entries(user_id=TARGET_USER_ID)]
+        self.assertEqual(active, [("88", "m9")], "组不复活，具体行照常")
+
+    def test_reusing_an_existing_group_keeps_its_label(self) -> None:
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        first = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1",), explicit=True), now=self._now()
+        )
+        second = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2")), now=self._now()
+        )
+        self.assertEqual(second.group_id, first.group_id)
+        labels = {row[0] for row in self.query("SELECT position_name FROM local_permission_override WHERE permission_group_id = %s", (first.group_id,))}
+        self.assertEqual(labels, {ALL_SCOPE_EXPLICIT_POSITION_NAME}, "沿用既有组也沿用其标签")
 
     def test_expand_for_an_unknown_user_writes_nothing(self) -> None:
         self.assertEqual(

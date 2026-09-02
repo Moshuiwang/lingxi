@@ -1053,7 +1053,11 @@ def _override_entry(
 
 
 def _all_scope_entry(
-    *, user_id: str = USER_ONE, metric_name: str = METRIC_NAME, group_id: str = "lpg_legacy_all"
+    *,
+    user_id: str = USER_ONE,
+    metric_name: str = METRIC_NAME,
+    group_id: str = "lpg_legacy_all",
+    position_name: str | None = None,
 ) -> LocalPermissionOverrideEntry:
     from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME
 
@@ -1066,7 +1070,7 @@ def _all_scope_entry(
         initiated_by_open_id="lingxi:legacy_import_2_0",
         pending_action_id="pac_legacy",
         created_at=TODAY,
-        position_name=ALL_SCOPE_POSITION_NAME,
+        position_name=position_name or ALL_SCOPE_POSITION_NAME,
         company_scope="*",
         permission_group_id=group_id,
     )
@@ -1094,7 +1098,28 @@ class LegacyAllScopeRefreshTest(unittest.TestCase):
         self.assertEqual(
             json.loads(row.permissions),
             {"*": sorted({METRIC_NAME, METRIC_NAME_TWO})},
-            "本地 * 组：发布行只有 * 键，不出现具体公司键",
+            "补齐后组已含银河给 1011 的指标：发布行只有 * 键",
+        )
+
+    def test_an_explicit_list_group_is_not_expanded_and_publishes_only_its_own_metric(self) -> None:
+        """独立审核 P1 的回归钉：``{"*":[显式列表]}`` 落成的组带另一个标签，每日重算不补行，
+        发布行的 ``"*"`` 只有旧行列出的指标；银河给具体公司的指标留在该公司键下。"""
+
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        overrides = FakeLocalOverrides(
+            {USER_ONE: (_all_scope_entry(metric_name=METRIC_NAME_TWO, position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME),)}
+        )
+        expander = FakeLegacyAllScope(overrides=overrides)
+        duty, parts = build_duty(identities=(identity(),), local_overrides=overrides, legacy_all_scope=expander)
+
+        duty.run_once()
+
+        self.assertEqual(expander.calls, [], "显式列表组永不自动扩指标")
+        row = parts["decisions"].calls[0]["row"]
+        self.assertEqual(
+            json.loads(row.permissions),
+            {"*": [METRIC_NAME_TWO], COMPANY_ID: sorted({METRIC_NAME, METRIC_NAME_TWO})},
         )
 
     def test_a_complete_group_does_not_call_the_expander(self) -> None:

@@ -277,7 +277,7 @@ class ExistingPermissionRow(NamedTuple):
         return readback_text(self.fields.get("permissions"))
 
     def content_fields(self, row: "PublishRow") -> dict[str, str]:
-        """按 ``row.content_fields`` 的键集（六字段去 ``updated_at``）读回本行对应值，
+        """按 ``row.content_fields`` 的键集（五个内容字段＝六字段去 ``updated_at``）读回本行对应值，
         归一走同一个 :func:`readback_text`——与逐字段读回比对是同一把尺子。"""
 
         return {name: readback_text(self.fields.get(name)) for name in row.content_fields}
@@ -605,8 +605,9 @@ def publish_claim(
             detail=type(error).__name__,
         )
     if matches and existing_cipher and matches[0].content_matches(row):
-        # **不变不回写**（rc25 S-1，Issue #540）：既有行六个内容字段与待写行逐字段
-        # 相同且密文仍在——一个字都不提交，``updated_at`` 也不再无谓刷新。判据用的是
+        # **不变不回写**（rc25 S-1，Issue #540）：既有行五个内容字段（六字段去
+        # ``updated_at``）与待写行逐字段相同且密文仍在——一个字都不提交，``updated_at``
+        # 也不再无谓刷新。判据用的是
         # ``find_rows`` 刚读回的这一行（不是 outbox 里的上一版快照：决定层的
         # ``UNCHANGED`` 管的是"要不要排意图"，这里管的是"要不要碰外部表"）。存量用户
         # 首聊时正式表里本就有一行与合成结果相同的，从此零外部写入；密文空洞补写

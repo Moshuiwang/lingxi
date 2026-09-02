@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
 
 from lingxi.core.identity.onboarding_ports import LegacyPermissionImporter, _AuditSink
 from lingxi.core.identity.onboarding_terminal import OnboardingChainError, _Terminal, _internal
@@ -84,7 +84,10 @@ def import_legacy_permissions(
     """
 
     try:
-        document = parse_permissions(permissions_text)
+        # 空白单元格按空对象处理（独立审核 P2-2）：它没有任何会被发布覆盖的内容，
+        # fail-closed 的理由在这里不成立；解析失败（非法 JSON、空白键/指标）仍 fail-closed。
+        text = permissions_text.strip() if isinstance(permissions_text, str) else ""
+        document = parse_permissions(text) if text else {}
         plan = plan_legacy_import(
             legacy=document,
             galaxy_current=galaxy_map,
@@ -126,7 +129,7 @@ def import_legacy_permissions(
 
 def _fail(
     audit: _AuditSink, user_id: str, code: str, trace_id: str, cause: BaseException | None = None
-) -> None:
+) -> NoReturn:
     audit.record(
         "onboarding.legacy_permission_import_failed", user=user_id, reason=code, trace_id=trace_id
     )

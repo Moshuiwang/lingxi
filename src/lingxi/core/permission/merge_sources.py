@@ -202,15 +202,17 @@ recompute_and_publish`）与两个零银河分支（`galaxy={}`，通配键结�
 ``"*"`` 键时（普通具体公司用户，或零银河），非通配分支的既有代数会把 ``"*"`` 当成一个
 普通键与各具体公司键并列产出——读侧 :func:`~lingxi.core.permission.publish_row.
 lookup_metrics` 对**存在的**具体公司键不再回退 ``"*"``，那个公司会失去 ``"*"`` 覆盖的
-其余指标，方向是**少给**（与通配角 v1/v2 防住的是同一种窄化）。因此新增一支：
-结果**只产出 ``"*"`` 键**＝本地 ``"*"`` 指标 ∪ 银河各公司值 ∪ 其它本地具体键值
-（行来源无关，与 v2 同一口径）。抑制以具体键表达：对某公司存在生效抑制时产出该公司
-具体键＝``"*"`` 清单 − 该公司抑制；减到空不可表示（写侧不产出空列表、读侧缺键会回退
-``"*"``），登记进 :attr:`MergedPermissionSources.unrepresentable_companies`，三个调用点
-一律 fail-closed（不发布、不撤权、审计理由码 ``suppression_on_all_scope_unrepresentable``）
-——已知边界：要完全屏蔽「全部」组用户的某一家公司，先撤销该组。银河侧为有限
-``"*"``（v2）时本地 ``"*"`` 指标本来就会并入清单，行为不变；真全指标通配（v1）整体
-跳过不变（已 ⊇）。
+其余指标，方向是**少给**（与通配角 v1/v2 防住的是同一种窄化）。因此新增一支，
+**精确形状（独立审核 P2-3 修正）**：``"*"`` 键＝本地 ``"*"`` 指标（减去 ``"*"`` 上的
+抑制）；对银河有值、或本地有具体授权/抑制的每家公司，产出具体键＝``"*"`` ∪ 银河该公司值
+∪ 本地该公司授权 − 该公司抑制，与 ``"*"`` 相同则省略。每个具体键都 ⊇ ``"*"``，读侧回退制下
+不会出现比 ``"*"`` 更窄的键；公司专有的指标只留在该公司键下——不像设计初稿那样把「其它
+本地具体键值 ∪ 银河各公司值」并进 ``"*"``（那会把 40 号公司专有的指标发给全部公司，与合同
+「自动处理不扩大权限」冲突）。某公司减到空不可表示（写侧不产出空列表、读侧缺键会回退
+``"*"``），登记进 :attr:`MergedPermissionSources.unrepresentable_companies`，全部调用点一律
+fail-closed（不发布、不撤权、审计理由码 ``suppression_on_all_scope_unrepresentable``）——已知
+边界：要完全屏蔽「全部」组用户的某一家公司，先撤销该组。银河侧为有限 ``"*"``（v2）时本地
+``"*"`` 指标本来就会并入清单，行为不变；真全指标通配（v1）整体跳过不变（已 ⊇）。
 
 ## 空结果：合并后某个公司的值集合被抑制到空时**丢弃这个键**，不写空列表
 
@@ -366,38 +368,40 @@ def merge_permission_sources(
     local_suppressions = to_company_metric_map(local.suppressions) if local is not None else {}
 
     if ALL_COMPANIES_KEY in local_grants:
-        # 本地「全部」组（rc25 S-1，Issue #540；类比 #440 防窄化）：银河侧没有 "*"
-        # 键而本地授权带 "*" 公司键时，结果**只产出 "*" 键**＝本地 "*" 指标 ∪ 银河各
-        # 公司值 ∪ 其它本地具体键值（行来源无关，与通配角 v2 同一口径）——读侧
-        # 回退制下任何具体公司键都会让该公司失去 "*" 覆盖的其余指标，方向是少给。
-        # 本地抑制：抑制 "*" 键直接从清单里减；抑制具体公司则为该公司产出具体键
-        # ＝清单 − 该公司抑制；减到空**不可表示**（写侧不产出空列表），登记进
+        # 本地「全部」组（rc25 S-1，Issue #540；类比 #440 防窄化，独立审核 P2-3 后改为
+        # **精确形状**）：银河侧没有 "*" 键而本地授权带 "*" 公司键时——
+        #   "*"   ＝ 本地 "*" 指标 − "*" 抑制（组本身）；
+        #   具体键 ＝ "*" ∪ 银河该公司值 ∪ 本地该公司授权 − 该公司抑制，
+        #           与 "*" 相同则省略（读侧回退到 "*" 等价）。
+        # 每个具体键都 ⊇ "*"，因此不会出现比 "*" 更窄的具体键（防窄化）；同时公司专有
+        # 的指标只留在该公司键下，不被抹平到全部公司（不扩权——旧写法把「其它本地
+        # 具体键值 ∪ 银河各公司值」并进 "*"，等于把 40 号公司专有的指标发给全部公司）。
+        # 某公司减到**空**不可表示（写侧不产出空列表、读侧缺键会回退 "*"），登记进
         # `unrepresentable_companies` 交调用方 fail-closed。
-        star = set(local_grants[ALL_COMPANIES_KEY])
-        for values in galaxy_map.values():
-            star |= set(values)
-        for company, values in local_grants.items():
-            if company != ALL_COMPANIES_KEY:
-                star |= set(values)
-        star -= set(local_suppressions.get(ALL_COMPANIES_KEY, ()))
-        if not star:
-            # 「全部」组被整体抑制到空：与非通配分支的空结果同一语义（丢键、不写空列表）。
-            return MergedPermissionSources(permissions={}, skipped_reasons=())
-        collapsed: dict[str, tuple[str, ...]] = {ALL_COMPANIES_KEY: tuple(sorted(star))}
-        unrepresentable: list[str] = []
-        for company, suppressed in local_suppressions.items():
-            if company == ALL_COMPANIES_KEY:
-                continue
-            specific = star - set(suppressed)
-            if not specific:
-                unrepresentable.append(company)
-            elif specific != star:
-                collapsed[company] = tuple(sorted(specific))
-        return MergedPermissionSources(
-            permissions=collapsed,
-            skipped_reasons=(),
-            unrepresentable_companies=tuple(sorted(unrepresentable)),
-        )
+        star = set(local_grants[ALL_COMPANIES_KEY]) - set(local_suppressions.get(ALL_COMPANIES_KEY, ()))
+        if star:
+            collapsed: dict[str, tuple[str, ...]] = {ALL_COMPANIES_KEY: tuple(sorted(star))}
+            unrepresentable: list[str] = []
+            companies = (
+                set(galaxy_map)
+                | {company for company in local_grants if company != ALL_COMPANIES_KEY}
+                | {company for company in local_suppressions if company != ALL_COMPANIES_KEY}
+            )
+            for company in sorted(companies):
+                values = star | set(galaxy_map.get(company, ())) | set(local_grants.get(company, ()))
+                values -= set(local_suppressions.get(company, ()))
+                if not values:
+                    unrepresentable.append(company)
+                elif values != star:
+                    collapsed[company] = tuple(sorted(values))
+            return MergedPermissionSources(
+                permissions=collapsed,
+                skipped_reasons=(),
+                unrepresentable_companies=tuple(unrepresentable),
+            )
+        # 组被 "*" 抑制减到空：本地没有「全部」授权了，回到下面的非通配代数
+        # （与非通配分支的空结果同一语义：丢键、不写空列表）。
+        local_grants = {company: values for company, values in local_grants.items() if company != ALL_COMPANIES_KEY}
 
     keys = set(galaxy_map) | set(local_grants)
     merged: dict[str, tuple[str, ...]] = {}

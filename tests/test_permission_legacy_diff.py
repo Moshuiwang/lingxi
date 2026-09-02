@@ -12,6 +12,7 @@ import unittest
 from datetime import datetime, timezone
 
 from lingxi.core.permission.legacy_diff import (
+    ALL_SCOPE_EXPLICIT_POSITION_NAME,
     ALL_SCOPE_POSITION_NAME,
     REASON_ALL_METRICS_UNAVAILABLE,
     REASON_NOTHING_TO_IMPORT,
@@ -133,6 +134,11 @@ class PlanTests(unittest.TestCase):
         )
         self.assertEqual(plan.shape, SHAPE_ALL_SCOPE_EXPLICIT)
         self.assertEqual(plan.all_scope_metrics, ("m1", "m2"), "公司 * 保留、指标按表中列出的")
+        self.assertEqual(plan.all_scope_position_name, ALL_SCOPE_EXPLICIT_POSITION_NAME)
+
+    def test_full_wildcard_group_carries_the_auto_expanding_label(self) -> None:
+        plan = plan_legacy_import(legacy={"*": ("*",)}, galaxy_current={}, full_access_wildcard=False, mapping=MAPPING)
+        self.assertEqual(plan.all_scope_position_name, ALL_SCOPE_POSITION_NAME)
 
     def test_limited_galaxy_wildcard_subtracts_the_star_list_from_group_and_pairs(self) -> None:
         """银河有限 ``*``（v2）：合并层会把本地 grant 指标并进 ``"*"`` 清单，因此组与具体键
@@ -227,6 +233,13 @@ class MissingAllScopeMetricsTests(unittest.TestCase):
             _entry(metric_name="m1", position_name=None, group_id=None),  # 历史无组 "*" 行
             _entry(metric_name="m1", direction=OverrideDirection.SUPPRESS),  # 抑制
         )
+        self.assertEqual(missing_all_scope_metrics(entries, MAPPING), {})
+
+    def test_an_explicit_list_group_is_never_expanded(self) -> None:
+        """独立审核 P1：``{"*":[显式列表]}`` 的组语义是「就这几个指标」，映射里多出来的
+        指标不得自动补进去——否则显式列表用户次日就静默拿到映射全部指标。"""
+
+        entries = (_entry(metric_name="m1", position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME, group_id="lpg_explicit"),)
         self.assertEqual(missing_all_scope_metrics(entries, MAPPING), {})
 
     def test_no_entries_means_no_groups(self) -> None:

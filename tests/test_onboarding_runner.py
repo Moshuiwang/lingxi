@@ -1527,8 +1527,18 @@ class LegacyPermissionImportTests(unittest.TestCase):
         self.assertEqual(parts["environment"].calls, [])
         self.assertEqual(parts["tokens"].adopt_calls, [], "fail-closed 早于令牌采纳")
 
+    def test_a_blank_permissions_cell_imports_nothing(self) -> None:
+        """独立审核 P2-2：空白单元格没有任何会被发布覆盖的内容，按 ``{}`` 处理而不是
+        永久 fail-closed。"""
+
+        importer = FakeLegacyImporter()
+        parts, _ = run_once(stock_tokens=self._adoptable("   "), legacy_importer=importer)
+        self.assertEqual(importer.calls, [])
+        self.assertEqual(parts["audit"].facts("onboarding.legacy_permission_import_skipped")["reasons"], ["nothing_to_import"])
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+
     def test_unparseable_permissions_text_fails_closed(self) -> None:
-        for text in ("not json", "", '{"88":[" "]}'):
+        for text in ("not json", "[]", '{"88":[" "]}'):
             with self.subTest(text=text):
                 importer = FakeLegacyImporter()
                 parts, _ = run_once(stock_tokens=self._adoptable(text), legacy_importer=importer)

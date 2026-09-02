@@ -335,6 +335,31 @@ class LegacyAllScopeGroupSectionTests(unittest.TestCase):
             for i in range(size)
         )
 
+    def test_an_explicit_list_group_shows_its_own_label(self) -> None:
+        """独立审核 P1/P3-10：显式列表组带另一个标签，管理员能分辨它不会自动扩指标。"""
+
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
+
+        override = LocalPermissionOverrideView(
+            override_id="lpo_explicit000000000000000000",
+            direction="grant",
+            company_id="*",
+            metric_name="metric_x",
+            reason="2.0 迁移导入",
+            created_at="2026-09-02T08:00:00+00:00",
+            position_name=ALL_SCOPE_EXPLICIT_POSITION_NAME,
+            company_scope="*",
+            group_id="lpg_01LEGACYEXPLICIT0000000000",
+        )
+        card = render_management_card(
+            _status(local_overrides=(override,)),
+            display_identifier="ou_target",
+            catalog=FakeCatalog(),
+            display_names=FakeDisplayNames(),
+        )
+        markdown_texts = "\n".join(e["content"] for e in _elements(card) if e.get("tag") == "markdown")
+        self.assertIn(ALL_SCOPE_EXPLICIT_POSITION_NAME, markdown_texts)
+
     def test_the_group_renders_as_one_item_with_a_group_revoke_button(self) -> None:
         display_names = FakeDisplayNames()
         card = render_management_card(

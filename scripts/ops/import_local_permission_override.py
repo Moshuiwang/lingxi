@@ -103,6 +103,12 @@ ALL_COMPANIES_KEY`（``"*"``）键，同样整份导出拒绝导入**（rc21 修
 （``{"company_id", "metric_name", "reason"}``），因此这批记录未来如果被读回
 （例如人工核对某条 override 的来龙去脉）不会撞上任何解析假设。
 
+**rc25 S-1 起落库委托 ``PostgresLocalPermissionOverrideStore.import_legacy_plan``**：
+合成 ``pending_action`` 的 ``payload`` 形状随之变为
+``{"legacy_import_2_0": {"shape", "specific_pairs", "all_scope_metrics",
+"permission_group_id"}, "reason": "2.0 迁移导入"}``（此前是逐笔
+``{"company_id","metric_name","reason"}``）；按 payload 排查时以此为准。
+
 ``initiated_by_open_id``/``decided_by_open_id`` 取本工具 ``--initiated-by``
 参数（运行这次导入的责任人飞书 open_id，通常是产品负责人或受托操作者本人）——
 不写死任何值，避免审计栏目显示一个无法追溯的占位身份。
