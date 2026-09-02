@@ -609,7 +609,11 @@ class ManagementCorrectionRealDbTests(ManagementCardCallbackIntegrationTestCase)
 
 
 class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCase):
-    """#493 P1：两个独立连接上的 scanner/writer 必须按状态代数 CAS。"""
+    """#493 P1：两个独立连接上的 scanner/writer 必须按 ``card_sequence`` CAS。
+
+    rc25 S-4a 把原来的双 CAS（``state_version`` + ``card_sequence``）收敛成单把
+    ``card_sequence`` CAS，因此本类的每条用例都只传 ``expected_card_sequence``。
+    """
 
     def _seed_refreshable_context(self, message_id: str) -> PostgresManagementCardContextStore:
         store = PostgresManagementCardContextStore(self._dsn)
@@ -652,7 +656,6 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             self.assertTrue(writer_done.wait(timeout=5))
             return scanner_store.next_card_sequence(
                 message_id="om_state_cas_claim",
-                expected_state_version=snapshot.state_version,
                 expected_card_sequence=snapshot.card_sequence,
             )
 
@@ -670,6 +673,60 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         self.assertEqual(current.card_sequence, snapshot.card_sequence + 1)
         self.assertTrue(current.needs_refresh)
 
+    def test_two_recoverers_on_one_state_version_cannot_both_claim_a_sequence(self) -> None:
+        """rc25 S-4a：同一状态代数下两个恢复者并发领号，只能有一个拿到序号。
+
+        这是 ``card_sequence`` CAS **独有**的判别面，也是「双 CAS 收敛成单 CAS 后
+        没有丢掉保护」的锚点用例。上面两条并发用例的写方都是 ``update_state()``，
+        它把 ``state_version`` 和 ``card_sequence`` 写在同一条 UPDATE 里两列同时 +1，
+        所以只留任意一把 CAS 都能拒绝它们——那两条证明不了 ``card_sequence`` 的
+        独有价值。本条不同：``next_card_sequence()`` 推进 ``card_sequence`` 却
+        **不动** ``state_version``，于是第二个恢复者调用时行上的 ``state_version``
+        仍等于它读到的快照值，``state_version`` CAS 会放行；只有
+        ``card_sequence`` CAS 认得出「这一号已经被人领走了」。
+
+        少了这把 CAS，两个恢复者会各领一个号、各自按同一份旧快照渲染并推给
+        CardKit，先渲染后到达的那张会把较新的视觉盖回去——正是 #493 要防的用户
+        可见故障。
+        """
+
+        message_id = "om_state_cas_double_claim"
+        first_store = self._seed_refreshable_context(message_id)
+        second_store = PostgresManagementCardContextStore(self._dsn)
+        snapshot = first_store.lookup_context(message_id=message_id)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+
+        both_ready = threading.Barrier(2)
+
+        def claim(store: PostgresManagementCardContextStore) -> int | None:
+            both_ready.wait(timeout=5)
+            return store.next_card_sequence(
+                message_id=message_id,
+                expected_card_sequence=snapshot.card_sequence,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(claim, store) for store in (first_store, second_store)]
+            claims = [future.result(timeout=10) for future in futures]
+
+        # 恰好一个恢复者领到 snapshot+1，另一个被 CAS 拒绝——不是两个都成功。
+        self.assertEqual(
+            sorted(claims, key=lambda value: (value is not None, value)),
+            [None, snapshot.card_sequence + 1],
+            claims,
+        )
+
+        current = first_store.lookup_context(message_id=message_id)
+        self.assertIsNotNone(current)
+        assert current is not None
+        # 被拒绝的那一次没有消耗序号：只推进了一格。
+        self.assertEqual(current.card_sequence, snapshot.card_sequence + 1)
+        # 全程没有任何状态写入，state_version 自始至终等于两个恢复者读到的快照值。
+        # 这正是它在本条路径上零判别力的直接证据。
+        self.assertEqual(current.state_version, snapshot.state_version)
+        self.assertEqual(current.state, snapshot.state)
+
     def test_concurrent_state_write_rejects_late_watermark_clear(self) -> None:
         scanner_store = self._seed_refreshable_context("om_state_cas_mark")
         writer_store = PostgresManagementCardContextStore(self._dsn)
@@ -678,7 +735,6 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
         assert snapshot is not None
         claimed = scanner_store.next_card_sequence(
             message_id="om_state_cas_mark",
-            expected_state_version=snapshot.state_version,
             expected_card_sequence=snapshot.card_sequence,
         )
         self.assertEqual(claimed, snapshot.card_sequence + 1)
@@ -700,7 +756,6 @@ class ManagementCardStateCasRealDbTests(ManagementCardCallbackIntegrationTestCas
             return scanner_store.mark_visual_refreshed(
                 message_id="om_state_cas_mark",
                 sequence=claimed,
-                expected_state_version=snapshot.state_version,
                 expected_card_sequence=claimed,
             )
 

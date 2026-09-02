@@ -205,7 +205,14 @@ class ManagementCardContextReader(Protocol):
 
 
 class ManagementCardRefresher(Protocol):
-    """在原管理卡实体上按持久 sequence 更新最新状态。"""
+    """在原管理卡实体上按持久 sequence 更新最新状态。
+
+    并发保护只用 ``expected_card_sequence`` 一把 CAS（#493 收敛，rc25 S-4a）：
+    每一次 ``state_version`` 递增都与 ``card_sequence`` 递增写在同一条 UPDATE 里，
+    而 ``card_sequence`` 还会被 ``next_card_sequence()`` 单独推进，因此
+    ``card_sequence`` 的判别力严格覆盖 ``state_version``，多一把 CAS 只是多一处
+    要维护的等价条件。``state_version`` 列本身保留（生产 drop column 不可逆）。
+    """
 
     def update(
         self,
@@ -215,7 +222,6 @@ class ManagementCardRefresher(Protocol):
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> bool | None: ...
 

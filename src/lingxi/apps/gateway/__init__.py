@@ -277,7 +277,11 @@ def _management_card_context(payload: dict) -> tuple[str, str]:
 
 
 class _GatewayManagementCardRefresher:
-    """把管理卡状态更新集中到同一个 transport + 持久 sequence 端口。"""
+    """把管理卡状态更新集中到同一个 transport + 持久 sequence 端口。
+
+    并发保护只有 ``expected_card_sequence`` 一把 CAS（#493 双 CAS 收敛，rc25 S-4a）；
+    ``state_version`` 为什么没有独有判别力，见 ``next_card_sequence()`` 的收敛说明。
+    """
 
     def __init__(self, *, transport: Any, catalog: Any, display_names: Any, context_store: Any) -> None:
         self._transport = transport
@@ -293,11 +297,9 @@ class _GatewayManagementCardRefresher:
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> bool:
-        # Use snapshot versions when available; legacy test doubles may omit them.
-        expected_state_version = getattr(context, "state_version", None) if expected_state_version is None else expected_state_version
+        # Use the snapshot sequence when available; legacy test doubles may omit it.
         expected_card_sequence = getattr(context, "card_sequence", None) if expected_card_sequence is None else expected_card_sequence
         # 执行已结束（已生效/不完整）后，原管理卡恢复为可重新查询/提交的表单；
         # 只有等待中的提交态继续隐藏表单，避免重复点击。取消则关闭这张卡。
@@ -319,8 +321,6 @@ class _GatewayManagementCardRefresher:
             closed=state == "closed",
         )
         sequence_kwargs: dict[str, Any] = {"message_id": context.message_id}
-        if expected_state_version is not None:
-            sequence_kwargs["expected_state_version"] = expected_state_version
         if expected_card_sequence is not None:
             sequence_kwargs["expected_card_sequence"] = expected_card_sequence
         sequence = self._context_store.next_card_sequence(**sequence_kwargs)
@@ -330,9 +330,8 @@ class _GatewayManagementCardRefresher:
         mark_visual_refreshed = getattr(self._context_store, "mark_visual_refreshed", None)
         if callable(mark_visual_refreshed):
             mark_kwargs: dict[str, Any] = {"message_id": context.message_id, "sequence": sequence}
-            if expected_state_version is not None:
-                mark_kwargs["expected_state_version"] = expected_state_version
-            if expected_state_version is not None or expected_card_sequence is not None:
+            if expected_card_sequence is not None:
+                # 回写要 CAS 的是本次实际领到的号，不是渲染时读到的快照号。
                 mark_kwargs["expected_card_sequence"] = sequence
             marked = mark_visual_refreshed(**mark_kwargs)
             if marked is False:
