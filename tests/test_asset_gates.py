@@ -344,6 +344,96 @@ class L1GateTest(unittest.TestCase):
                 failures = self._run(paths)
                 self.assertTrue(any(expected in failure for failure in failures), failures)
 
+    def _registration_paths(self):
+        """一份「content.toml 与登记表原本对得上」的合成场景。
+
+        下面三条绕过用例都只改 ``content.py`` 一处：改完之后**运行时**要求的键集合
+        和 ``content.toml`` 就对不上了，所以门禁必须失败关闭；旧实现读到的却仍是
+        改动前那条字面量，于是全绿放行。
+        """
+
+        return self._paths(
+            '[meta]\nversion = "v1"\n[texts]\ngreeting = "hello"\n[cards]\nmain = "ok"\n',
+            'version = "v1"\ndigest = "sha256:bad"\nretired_versions = []\n[keys]\n',
+            '[aliases]\n"别名" = "sub_count"\n',
+        )
+
+    def test_augmented_assignment_to_the_registration_is_rejected(self) -> None:
+        """rc24 fable 审查 P2-1：顶层 ``+=`` 改过登记表，门禁不能还读前面那条字面量。
+
+        ``REQUIRED_TEXT_KEYS += ('spare',)`` 是 ``ast.AugAssign``，旧实现的
+        ``isinstance(node, (ast.AnnAssign, ast.Assign))`` 分支根本不认识它，会静默
+        跳过整条语句——门禁读到 ``('greeting',)``、与 content.toml 精确相等，全绿；
+        运行时读到的却是 ``('greeting', 'spare')``，加载内容目录时直接崩。
+        """
+
+        paths = self._registration_paths()
+        paths[5].write_text(
+            "REQUIRED_TEXT_KEYS: tuple[str, ...] = ('greeting',)\n"
+            "REQUIRED_TEXT_KEYS += ('spare',)\n"
+            "REQUIRED_CARD_KEYS: tuple[str, ...] = ('main',)\n",
+            encoding="utf-8",
+        )
+        failures = self._run(paths)
+        key_failures = [f for f in failures if "REQUIRED_TEXT_KEYS" in f]
+        self.assertTrue(key_failures, failures)
+        self.assertTrue(any("被绑定了 2 次" in f for f in key_failures), key_failures)
+
+    def test_non_top_level_rebinding_of_the_registration_is_rejected(self) -> None:
+        """rc24 fable 审查 P2-1：非顶层重新绑定同样不能骗过门禁。
+
+        旧实现只遍历 ``tree.body``，``if``/``try`` 体里的重绑和 import 期被调用的
+        ``global`` 重绑都看不见；只要顶层还留着一条「好看的」字面量，门禁就照读不误。
+        """
+
+        for body, label in (
+            (
+                "REQUIRED_TEXT_KEYS: tuple[str, ...] = ('greeting',)\n"
+                "if True:\n"
+                "    REQUIRED_TEXT_KEYS = ('greeting', 'spare')\n"
+                "REQUIRED_CARD_KEYS: tuple[str, ...] = ('main',)\n",
+                "if 分支里重绑",
+            ),
+            (
+                "REQUIRED_TEXT_KEYS: tuple[str, ...] = ('greeting',)\n"
+                "def _patch() -> None:\n"
+                "    global REQUIRED_TEXT_KEYS\n"
+                "    REQUIRED_TEXT_KEYS = ('greeting', 'spare')\n"
+                "_patch()\n"
+                "REQUIRED_CARD_KEYS: tuple[str, ...] = ('main',)\n",
+                "import 期 global 重绑",
+            ),
+            (
+                "import os as REQUIRED_TEXT_KEYS\n"
+                "REQUIRED_CARD_KEYS: tuple[str, ...] = ('main',)\n",
+                "被 import as 占用同一个名字",
+            ),
+        ):
+            with self.subTest(label=label):
+                paths = self._registration_paths()
+                paths[5].write_text(body, encoding="utf-8")
+                failures = self._run(paths)
+                self.assertTrue(
+                    [f for f in failures if "REQUIRED_TEXT_KEYS" in f], failures
+                )
+
+    def test_registration_declared_only_inside_a_branch_is_rejected(self) -> None:
+        """唯一那次绑定不在模块顶层时，门禁不能把它当成可静态确定的登记表。"""
+
+        paths = self._registration_paths()
+        paths[5].write_text(
+            "if True:\n"
+            "    REQUIRED_TEXT_KEYS: tuple[str, ...] = ('greeting',)\n"
+            "REQUIRED_CARD_KEYS: tuple[str, ...] = ('main',)\n",
+            encoding="utf-8",
+        )
+        failures = self._run(paths)
+        key_failures = [f for f in failures if "REQUIRED_TEXT_KEYS" in f]
+        self.assertTrue(key_failures, failures)
+        self.assertTrue(
+            any("不是模块顶层的直接赋值" in f for f in key_failures), key_failures
+        )
+
     def test_l1_gate_does_not_import_the_business_package(self) -> None:
         """键集合检查必须是纯 stdlib 静态读取：门禁不导入 lingxi（Issue #520 F1）。
 
@@ -834,6 +924,37 @@ class PermissionImpactTest(unittest.TestCase):
             dangling.symlink_to(root / "does-not-exist.json")
             with self.assertRaises(IMPACT.CountEvidenceError):
                 IMPACT.load_optional_provenance(dangling, repository=repository)
+
+    def test_unreadable_registration_path_fails_closed_instead_of_degrading(self) -> None:
+        """rc24 fable 审查 P2-2 → rc25 S-4d：stat 失败不是「没提供」，必须失败关闭。
+
+        ``Path.exists()``/``Path.is_symlink()`` 把 ``ENOENT``/``ENOTDIR``/``EBADF``/
+        ``ELOOP`` 一律吞成 ``False``。其中 ``ELOOP``（路径中间某一段是符号链接环）
+        是**读不出来**，不是「没提供」；旧实现据此 ``return None``，L3 门禁就会打印
+        「计数证明降级：unregistered」并放行——门禁自己坏了却报通过。这一类必须失败
+        关闭，才不会把一次读取故障伪装成一次合法降级。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repo"
+            repository.mkdir()
+
+            # 路径中间一段是自指符号链接：解析父目录时 ELOOP。
+            loop = root / "loop"
+            loop.symlink_to(loop)
+            through_loop = loop / "provenance.json"
+            # 这一行钉住旧实现为什么会静默降级：exists()/is_symlink() 都返回 False。
+            self.assertFalse(through_loop.exists())
+            self.assertFalse(through_loop.is_symlink())
+            with self.assertRaises(IMPACT.CountEvidenceError):
+                IMPACT.load_optional_provenance(through_loop, repository=repository)
+
+            # 名字超长：读不出来的另一种形态，同样只能失败关闭。
+            with self.assertRaises(IMPACT.CountEvidenceError):
+                IMPACT.load_optional_provenance(
+                    root / ("x" * 4096), repository=repository
+                )
 
     def test_count_input_symlink_is_rejected_before_reading_runner_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

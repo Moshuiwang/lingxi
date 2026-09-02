@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -672,20 +674,41 @@ def _load_external_provenance(path: Path, *, repository: Path) -> dict[str, Any]
     return _load_json_document(path)
 
 
+# 只有这两个 errno 等于「这个路径上真的什么都没有」，可以按 Issue #520 F3 降级；
+# 其余 errno 都是「读不出来」，属于门禁自己坏了，必须失败关闭（rc25 S-4d）。
+_ABSENT_REGISTRATION_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
+
+
 def load_optional_provenance(path: Path | None, *, repository: Path) -> dict[str, Any] | None:
     """registration **缺失**时返回 None；**存在**时仍走原样的严格校验（Issue #520 F3）。
 
     降级只针对「这个文件根本不存在」这一种情况——它是一个从未被实现的输入。只要路径
     上真的有东西（普通文件、目录、甚至断掉的符号链接），一律交给
     :func:`_load_external_provenance` 按原规则判定：仓库内注入、符号链接、无法解析
-    都仍然失败关闭。断链符号链接刻意用 ``is_symlink()`` 单独识别，避免
-    ``exists()`` 的 False 把一次注入尝试误读成「没提供」。
+    都仍然失败关闭。用 :func:`os.lstat` 而不是 ``exists()`` 也顺带保住了断链符号链接
+    ——``lstat`` 不跟随最后一段，断链仍然会被送去按符号链接拒绝。
+
+    「不存在」由 ``lstat`` 的 errno 直接判定，**不用** ``Path.exists()``
+    （rc24 fable 审查 P2-2，rc25 S-4d 由「登记不修」改为失败关闭）。
+    ``Path.exists()``/``Path.is_symlink()`` 会把 ``ENOENT``/``ENOTDIR``/``EBADF``/
+    ``ELOOP`` 一律吞成 ``False``：只有前两个真的等于「没提供」，``ELOOP``（路径中间
+    某一段是符号链接环）是**读不出来**，被吞掉之后会被当成缺席、静默降级为
+    ``unregistered`` 放行——门禁自己坏了却报「通过（未登记）」。这一类现在明确失败
+    关闭，并把 errno 写进消息里，让人看得出是路径读不了而不是没提供。
     """
 
     if path is None:
         return None
-    if not path.exists() and not path.is_symlink():
-        return None
+    try:
+        os.lstat(path)
+    except OSError as error:
+        if error.errno in _ABSENT_REGISTRATION_ERRNOS:
+            return None
+        raise CountEvidenceError(
+            "stage provenance registration 路径无法读取"
+            f"（{errno.errorcode.get(error.errno, error.errno)}）；"
+            "stat 失败不是「没提供」，门禁不能据此降级为 unregistered"
+        ) from error
     return _load_external_provenance(path, repository=repository)
 
 
