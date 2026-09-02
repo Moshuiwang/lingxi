@@ -48,20 +48,32 @@ LINGXI_SCHEDULER_MEM_LIMIT=512M
 LINGXI_GATEWAY_MEM_LIMIT=512M
 ```
 
-**七行分两族，漏配的后果完全不同，都必须写：**
+**七行全部是硬前置：任一行缺失，`docker compose config`/`up` 直接失败，服务起不来。**
 
 | 行 | `compose.prod.yaml` 形态 | 漏配会怎样 |
 | --- | --- | --- |
 | 前五行（worker-queue 并发与资源） | `${VAR:?}` **无默认值** | `docker compose config`/`up` **直接失败**，起不来 |
-| 后两行（`scheduler`/`gateway` 内存，**必写**） | `${VAR:-1G}` **有默认值**（`compose.prod.yaml:35`/`:58`） | **不报错、静默退回 `1G`**——三个常驻服务加总从 3G 变成 4G，超过主机 3.74GiB |
+| 后两行（`scheduler`/`gateway` 内存） | `${VAR:?}` **无默认值**（rc25 S-3b 报告 R6-D4 起；`compose.prod.yaml:42`/`:66`） | 同上，**直接失败**并指名变量：`error while interpolating services.scheduler.deploy.resources.limits.memory: required variable LINGXI_SCHEDULER_MEM_LIMIT is missing a value` |
+
+> **这两行的语气自 rc25 S-3b 起从「要求」升为「硬前置」。** 此前它们是
+> `${VAR:-1G}` 有默认值形态：漏配不报错，只会静默退回 `1G`，把三个常驻服务的加总
+> 从 3G 推到 4G、越过主机 3.74GiB，而 `docker compose config` 一声不响——那时这张表
+> 靠的是执行纪律，不是闸门。现在漏配起不来，本节的渲染回读从「唯一防线」降为
+> **值的复核**（它仍然要做：无默认值只能挡住「没写」，挡不住「写错值」）。
 
 后两行把 `scheduler`/`gateway` 钉成与 stage 同值 `512M`，三个常驻服务加总
-512M + 512M + 2G = **3G ≤ 3.74GiB**；这与「生产与 stage 同型」是同一件事，不改
-`compose.prod.yaml` 的默认值。加总核对与推导见
+512M + 512M + 2G = **3G ≤ 3.74GiB**；这与「生产与 stage 同型」是同一件事。加总核对与推导见
 [`deploy/README.md`「三个常驻服务的加总核对」](README.md#三个常驻服务的加总核对)，此处不复述。
 
-部署前用以下两条只读命令确认渲染后的值与上表一致（只读，不创建或修改真实生产
-文件）。**后两行是有默认值形态，看 env 文件看不出漏没漏，必须靠渲染回读**：
+**一次性 `worker`（`job` profile）的内存默认值同批由 `4G` 降到 `2G`**（报告 P3）：
+`4G` 大于宿主机可用内存（约 3.9GiB），这条"上限"在默认取值下永远不会生效，比没有
+上限更糟。它**保留 `:-` 默认值形态**而不是改成 `${VAR:?}`——compose 的插值对整份文件
+求值、不分 profile，改成无默认值会让每一次 `mvp` 的 `up -d` 都多要求一个变量；要不要
+把它也收紧成显式声明属部署配置决定，需连本 runbook 与 `.env.prod` 一起改，**尚未裁定**。
+不需要为它在 `.env.prod` 加行。
+
+部署前用以下两条只读命令确认渲染后的**取值**与上表一致（只读，不创建或修改真实生产
+文件）。**漏没漏现在渲染会自己报错，但值写错了只有回读看得出来**：
 
 ```bash
 # ① worker-queue：并发与四项资源
@@ -69,7 +81,7 @@ docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
   config worker-queue
 
-# ② scheduler / gateway：确认 memory 渲染成 512M 而不是默认的 1G
+# ② scheduler / gateway：确认 memory 渲染成 512M（漏配已由 ${VAR:?} 直接报错）
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
   config scheduler gateway
