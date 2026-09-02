@@ -265,7 +265,7 @@ docker compose --env-file deploy/.env.prod \
 | --- | --- | --- | --- |
 | 1 | 默认宿主机已备好 Docker 与 Compose 插件 | `biplus-prod`（AL2023）**没有** `docker-compose-plugin` 包：`docker` 从 dnf 现有版本装（server 25.0.16，stage 是 25.0.14，补丁号差异已登记）；Compose 以二进制装入 `/usr/libexec/docker/cli-plugins/`，**版本钉成与 stage 同一个 `v5.2.0`**，下载后 `sha256sum` 与官方 `.sha256` 逐字节比对 | AL2023 的仓库里没有 compose 插件包；compose 的渲染行为影响判据（见 11.3 第 1 条），必须与 stage 同版才能沿用 stage 的验收结论 |
 | 2 | 未提及部署用户的 docker 组 | 部署用户加入 `docker` 组（`usermod -aG docker`） | 让部署用户能直接执行 compose；**docker 组约等于 root，属权限扩大**，本次由产品负责人显式点名放行（R9），下次执行仍需单独授权，不得视为常设 |
-| 3 | 未提及运维脚本的 Python 版本 | prod 系统 Python 是 3.9，而两个受控 ops 脚本（银河导出导入、差集导入）需要 3.12：装 `python3.12` 并建独立虚拟环境 `lingxi-ops-venv`（只装 `psycopg[binary]`），按脚本文档的 `PYTHONPATH=src` 姿势运行 | **不在生产现场安装或构建 `lingxi` 包**——生产只跑冻结制品，现场构建是明令禁止的路径；`PYTHONPATH=src` 让脚本以源码树方式运行而不引入安装态 |
+| 3 | 未提及运维脚本的 Python 版本 | prod 系统 Python 是 3.9，而两个受控运维脚本（银河导出导入 `scripts/import_galaxy_permission_export.py`、差集导入 `scripts/ops/import_local_permission_override.py`）跟随本仓库的 `requires-python >=3.12`：装 `python3.12` 并建独立虚拟环境 `lingxi-ops-venv`（只装 `psycopg[binary]`），按脚本文档的 `PYTHONPATH=src` 姿势运行 | **不在生产现场安装或构建 `lingxi` 包**——生产只跑冻结制品，现场构建是明令禁止的路径；`PYTHONPATH=src` 让脚本以源码树方式运行而不引入安装态 |
 | 4 | 未提及 swap | prod 无 swap 而 stage 有 2G：首发前补一个 2 GiB swapfile 并写入 `/etc/fstab`，实测 `swapoff` → `swapon -a` 可由 fstab 行拉起 | rc24 三张资源类卡（#494/#496/#499）的 L4a 全部跑在有 swap 的 stage 上；不补齐这条不对称，那些结论在内存维度不可迁移（R11）。该 swapfile 属长期保留项，不是临时资源 |
 
 ### 11.2 `runtime-config` 挂载卷：内容必须自带
