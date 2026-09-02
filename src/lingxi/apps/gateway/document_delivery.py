@@ -69,9 +69,12 @@ read_body_children`` 读一次正文根 block 的现有子块，非空即跳过�
 （``document_id`` 本次调用才建出来，必然从未写过正文）不做这次多余的读回，行为
 与修复前逐字相同。该方法已知未被真实验证的假设与后续建议见其模块文档字符串。
 这条判据对官方转换路径同样成立——``write_paragraphs``/官方转换（
-``convert_markdown_to_blocks`` + ``write_blocks``）写的是完全相同的坐标（同一个
-根 block 的 ``children``），``read_body_children`` 不区分"这个坐标上的内容是
-段落写的还是转换写的"，因此不需要为转换路径单独设计幂等判据。
+``convert_markdown_to_body`` + ``write_blocks`` 或 ``write_descendant_blocks``）
+写的是完全相同的坐标（同一个根 block 的 ``children``），``read_body_children``
+不区分"这个坐标上的内容是段落写的、扁平转换写的、还是嵌套转换写的"，因此不需要
+为转换路径单独设计幂等判据。Issue #538 的嵌套块写入路径已在 stage 受控探针上
+实测坐实这一点：同一篇文档 ``descendant`` 写入前根 block 子块为 0、写入后恰好
+是那些一级块，嵌套块不出现在这个坐标上。
 
 **markdown 官方转换路径的接线（迁移 0079，Issue #408 正式方案接线）**：
 ``task_document_delivery_request.markdown`` 非 ``None`` 才有资格走
@@ -85,9 +88,10 @@ LarkDocxDelivery.write_paragraphs`，与转换开关是否打开无关——详�
 definite/结果不明分类，不单独处理。
 
 **唯一的例外是「明示降级」（Issue #499，产品负责人 2026-08-31 裁定）**：转换被
-飞书确定性拒绝且原因码是 ``unsupported_nested_blocks``（回答里含表格等本仓库
-不支持的嵌套结构）时，``LarkDocxDelivery.write_body`` 改走纯文本段落路径把正文
-写进去、并在返回的 ``WriteBodyOutcome`` 里明示降级；本模块接住这个信号，
+飞书确定性拒绝且原因码是 ``unsupported_nested_blocks``（转换结果里出现了一个
+没有任何父块认领、无处安放的块）时，``LarkDocxDelivery.write_body`` 改走纯文本
+段落路径把正文写进去、并在返回的 ``WriteBodyOutcome`` 里明示降级；本模块接住
+这个信号，
 **必须**做三件事，缺一件这条裁定就退化成当初被明令禁止的静默降级：
 
 1. 把原因码落进 ``task_document_delivery_request.body_degraded_reason``（迁移
@@ -388,7 +392,7 @@ class DocumentDeliveryConsumer:
                 # write_body(markdown=claim.markdown)：如果转换开关已经打开
                 # 但这一行的 markdown 列是 NULL（历史行、或登记侧因为某种原因
                 # 没能落上原文），传 None 进 write_body 会被
-                # convert_markdown_to_blocks 判定为空正文而失败关闭——那不是
+                # convert_markdown_to_body 判定为空正文而失败关闭——那不是
                 # 这里要的结果，"markdown 列为 NULL"必须无条件回退段落路径，
                 # 与转换开关状态无关（同 write_body 幂等判据一致：两条路径写的
                 # 是同一个坐标）。

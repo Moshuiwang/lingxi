@@ -22,6 +22,7 @@ from urllib.error import URLError
 
 from lingxi.adapters.feishu_docx_delivery import (
     MAX_CONVERTED_BLOCKS,
+    ConvertedBody,
     FeishuDocxDeliveryError,
     LarkDocxDelivery,
     urllib_transport,
@@ -510,7 +511,10 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         )
         client = _client(transport)
 
-        blocks = client.convert_markdown_to_blocks("# 标题\n\n- 列表项一 3-5%\n- 列表项二\n\n周环比 -12.85%")
+        body = client.convert_markdown_to_body("# 标题\n\n- 列表项一 3-5%\n- 列表项二\n\n周环比 -12.85%")
+        # 纯一级块：不含嵌套结构，扁平路径的请求体块序列与 Issue #538 之前逐字一致。
+        self.assertFalse(body.nested)
+        blocks = body.flat_children()
 
         self.assertEqual(len(transport.calls), 1)
         method, url, body, token = transport.calls[0]
@@ -544,7 +548,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("# 标题")
+            client.convert_markdown_to_body("# 标题")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "markdown_convert_missing_first_level_block_ids")
@@ -564,20 +568,27 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("# 标题")
+            client.convert_markdown_to_body("# 标题")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "markdown_convert_missing_first_level_block_ids")
 
-    def test_a_block_outside_first_level_block_ids_is_rejected_as_unsupported_nested_blocks(
+    def test_a_block_no_parent_claims_is_rejected_as_unsupported_nested_blocks(
         self,
     ) -> None:
-        """典型场景：含表格的 markdown——表格自身是一级块，出现在
-        ``first_level_block_ids`` 里，但它的单元格作为独立元素出现在
-        ``blocks`` 数组里、却不在 ``first_level_block_ids`` 内。本仓库当前
-        不支持任何带嵌套结构的 markdown，必须 definite 拒绝、不做静默丢块。
+        """**"真的处理不了"这条唯一降级判据**（Issue #538 收窄后）：响应里存在
+        一个块（``blk-cell``），它既不在 ``first_level_block_ids`` 里，也没有
+        出现在任何可达块的 ``children`` 里——表格块 ``blk-table`` 压根没有
+        ``children`` 字段，没有任何父块认领这个单元格。本仓库没有任何位置可以
+        把它写进文档，必须 definite 拒绝、不做静默丢块。
 
-        变异锚点：把"块必须在 first_level_block_ids 内"这条判据删掉，本用例
+        **与 Issue #538 之前的区别**：这个夹具此前代表的是"含表格的 markdown"
+        这个**日常**场景（生产 100% 命中）；现在真实的含表格响应里，表格块会
+        带着 ``children`` 指向自己的单元格，走 ``descendant`` 端点正常写入
+        （见 :class:`WriteBodySwitchTest` 的嵌套用例），只有这种**响应内部
+        缺链**的畸形情况才会走到降级。
+
+        变异锚点：把"展开完成后块数必须与原始块数相等"这条判据删掉，本用例
         会从抛出 ``FeishuDocxDeliveryError`` 变红成静默丢弃单元格块、只返回
         表格这一个块。
         """
@@ -598,7 +609,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("| a | b |\n| - | - |\n| 1 | 2 |")
+            client.convert_markdown_to_body("| a | b |\n| - | - |\n| 1 | 2 |")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "unsupported_nested_blocks")
@@ -621,7 +632,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("正文")
+            client.convert_markdown_to_body("正文")
 
         self.assertEqual(raised.exception.code, "unsupported_nested_blocks")
 
@@ -644,7 +655,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(LookupError):
-            client.convert_markdown_to_blocks("正文")
+            client.convert_markdown_to_body("正文")
 
     def test_a_duplicate_block_id_in_mapping_blocks_is_rejected_as_a_count_mismatch(
         self,
@@ -680,7 +691,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("正文")
+            client.convert_markdown_to_body("正文")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "markdown_convert_block_count_mismatch")
@@ -719,7 +730,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("正文")
+            client.convert_markdown_to_body("正文")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "markdown_convert_duplicate_first_level_block_ids")
@@ -729,7 +740,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(ValueError):
-            client.convert_markdown_to_blocks("   ")
+            client.convert_markdown_to_body("   ")
 
         self.assertEqual(transport.calls, [])
 
@@ -738,7 +749,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("# 标题")
+            client.convert_markdown_to_body("# 标题")
 
         self.assertEqual(raised.exception.code, "feishu_code_99991400")
         self.assertTrue(raised.exception.definite)
@@ -758,7 +769,7 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(LookupError):
-            client.convert_markdown_to_blocks("# 标题")
+            client.convert_markdown_to_body("# 标题")
 
     def test_a_response_whose_blocks_are_all_non_mapping_is_a_definite_docx_error(
         self,
@@ -785,10 +796,395 @@ class ConvertMarkdownToBlocksTest(unittest.TestCase):
         client = _client(transport)
 
         with self.assertRaises(FeishuDocxDeliveryError) as raised:
-            client.convert_markdown_to_blocks("# 标题")
+            client.convert_markdown_to_body("# 标题")
 
         self.assertTrue(raised.exception.definite)
         self.assertEqual(raised.exception.code, "markdown_convert_blocks_not_mapping")
+
+
+def _table_convert_response() -> dict:
+    """Issue #538 stage 受控探针（2026-09-03，Bot-Test 真实调用）实测的含表格
+    convert 响应形状，缩成 2×2 表格：
+
+    - 表格块（``block_type=31``）自身是一级块，带 ``children`` 指向 4 个单元格；
+    - 单元格（``block_type=32``）不在 ``first_level_block_ids`` 里，各带
+      ``children`` 指向 1 个文本块；
+    - ``table.property`` 含服务端计算的 ``merge_info``（实测每项都是
+      ``row_span=col_span=1``），``table.cells`` 与 ``children`` 完全重复；
+    - 每个块都带 ``parent_id``（实测恒为空串）。
+    """
+
+    cell_ids = ["cell-00", "cell-01", "cell-10", "cell-11"]
+    blocks: list[dict] = [
+        {
+            "block_id": "blk-heading",
+            "parent_id": "",
+            "block_type": 3,
+            "heading1": {"elements": [{"text_run": {"content": "标题一"}}]},
+        },
+        {
+            "block_id": "blk-table",
+            "parent_id": "",
+            "block_type": 31,
+            "children": list(cell_ids),
+            "table": {
+                "cells": list(cell_ids),
+                "property": {
+                    "row_size": 2,
+                    "column_size": 2,
+                    "column_width": [244, 244],
+                    "merge_info": [{"col_span": 1, "row_span": 1}] * 4,
+                },
+            },
+        },
+        {
+            "block_id": "blk-tail",
+            "parent_id": "",
+            "block_type": 2,
+            "text": {"elements": [{"text_run": {"content": "结尾一段 -12.85%"}}]},
+        },
+    ]
+    for index, cell_id in enumerate(cell_ids):
+        blocks.append(
+            {
+                "block_id": cell_id,
+                "parent_id": "",
+                "block_type": 32,
+                "children": [f"{cell_id}-text"],
+                "table_cell": {},
+            }
+        )
+        blocks.append(
+            {
+                "block_id": f"{cell_id}-text",
+                "parent_id": "",
+                "block_type": 2,
+                "text": {"elements": [{"text_run": {"content": f"格{index}"}}]},
+            }
+        )
+    return {
+        "code": 0,
+        "data": {
+            "blocks": blocks,
+            "first_level_block_ids": ["blk-heading", "blk-table", "blk-tail"],
+            "block_id_to_image_urls": {},
+        },
+    }
+
+
+class ConvertNestedBlocksTest(unittest.TestCase):
+    """Issue #538：含嵌套块（表格）的 markdown 不再整篇作废。
+
+    修复前的行为是：``blocks`` 里只要有一个块不在 ``first_level_block_ids``
+    内就整体抛 ``unsupported_nested_blocks``——含表格的回答因此**必然**命中
+    （生产 2026-09-02 实测 3/3），标题与列表跟着表格一起丢。
+    """
+
+    def test_a_table_response_is_expanded_into_a_tree_instead_of_being_rejected(self) -> None:
+        """**本 Story 的核心用例**。变异锚点：把按 ``children`` 展开这一步删掉、
+        恢复成"每个块都必须在 ``first_level_block_ids`` 内"，本用例会从"拿到
+        11 个块的 ``ConvertedBody``"变红成抛出 ``unsupported_nested_blocks``。
+        """
+
+        transport = RecordingTransport([_table_convert_response()])
+        client = _client(transport)
+
+        body = client.convert_markdown_to_body("| a | b |\n| - | - |\n| 1 | 2 |")
+
+        self.assertTrue(body.nested)
+        self.assertEqual(body.children_id, ("blk-heading", "blk-table", "blk-tail"))
+        # 深度优先展开顺序：一级块之后紧跟它自己的子树。
+        self.assertEqual(
+            [block["block_id"] for block in body.descendants],
+            [
+                "blk-heading",
+                "blk-table",
+                "cell-00",
+                "cell-00-text",
+                "cell-01",
+                "cell-01-text",
+                "cell-10",
+                "cell-10-text",
+                "cell-11",
+                "cell-11-text",
+                "blk-tail",
+            ],
+        )
+        self.assertEqual(len(body.descendants), 11)
+
+    def test_the_readonly_fields_the_descendant_endpoint_rejects_are_stripped(self) -> None:
+        """Issue #538 stage 受控探针实测：带着 ``table.property.merge_info``
+        调 ``descendant`` 端点，飞书以 ``1770001 invalid param`` **整体拒绝**
+        （探针变体 V5）；剥掉它之后同一份载荷全部 ``code=0``。
+
+        变异锚点：把 ``merge_info`` 从
+        ``_DESCENDANT_READONLY_TABLE_PROPERTY_KEYS`` 里去掉，本用例会红——
+        而那条变异在生产上的后果正是本 Story 要修的缺陷换了一种形态（整篇
+        写入被飞书拒绝）。
+        """
+
+        transport = RecordingTransport([_table_convert_response()])
+        client = _client(transport)
+
+        body = client.convert_markdown_to_body("| a | b |\n| - | - |\n| 1 | 2 |")
+
+        table = next(block for block in body.descendants if block["block_type"] == 31)
+        self.assertNotIn("merge_info", table["table"]["property"])
+        self.assertNotIn("cells", table["table"])
+        # 保留下来的排版信息不能被顺手删掉。
+        self.assertEqual(table["table"]["property"]["row_size"], 2)
+        self.assertEqual(table["table"]["property"]["column_size"], 2)
+        self.assertEqual(table["table"]["property"]["column_width"], [244, 244])
+        for block in body.descendants:
+            self.assertNotIn("parent_id", block)
+        # `block_id`/`children` 在这条路径上**不是**只读字段，是父子关系的
+        # 唯一载体，绝不能剥——剥掉表格就散成一堆无主的单元格。
+        self.assertEqual(table["children"], ["cell-00", "cell-01", "cell-10", "cell-11"])
+        cell = next(block for block in body.descendants if block["block_id"] == "cell-00")
+        self.assertEqual(cell["children"], ["cell-00-text"])
+
+    def test_stripping_does_not_mutate_the_transport_response(self) -> None:
+        """剥只读字段必须是拷贝：``table`` 是嵌套结构，浅拷贝会写穿回调用方
+        手里的响应对象（真实链路里那是 ``json.loads`` 的结果，被改了不会有
+        任何东西报错，但重放/记日志时看到的就不再是飞书真正返回的东西）。"""
+
+        response = _table_convert_response()
+        transport = RecordingTransport([response])
+        client = _client(transport)
+
+        client.convert_markdown_to_body("| a | b |")
+
+        raw_table = next(
+            block for block in response["data"]["blocks"] if block["block_type"] == 31
+        )
+        self.assertIn("merge_info", raw_table["table"]["property"])
+        self.assertIn("cells", raw_table["table"])
+        self.assertIn("parent_id", raw_table)
+
+    def test_a_block_claimed_by_two_parents_is_rejected_and_definite(self) -> None:
+        """同一个块出现在两个父块的 ``children`` 里：展开结果不是一棵树，静默
+        放行会让同一段内容在文档两处各出现一次。
+
+        变异锚点：把 ``claimed`` 判重删掉，本用例会从抛出
+        ``markdown_convert_shared_child_block`` 变红成返回一个把 ``blk-shared``
+        写了两遍的 ``ConvertedBody``（块数对账也拦不住：``ordered`` 会有 4 项、
+        ``mapping_blocks`` 只有 3 项，只会误报成另一个码）。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-a", "block_type": 31, "children": ["blk-shared"]},
+                            {"block_id": "blk-b", "block_type": 31, "children": ["blk-shared"]},
+                            {"block_id": "blk-shared", "block_type": 32},
+                        ],
+                        "first_level_block_ids": ["blk-a", "blk-b"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_body("正文")
+
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(raised.exception.code, "markdown_convert_shared_child_block")
+
+    def test_a_children_cycle_is_rejected_instead_of_hanging_or_recursing(self) -> None:
+        """``children`` 成环（``blk-a`` → ``blk-b`` → ``blk-a``）：递归实现会
+        栈溢出成一个没有被任何失败分类接住的 ``RecursionError``，显式栈实现
+        必须在第二次遇到同一个块时确定性拒绝。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-a", "block_type": 31, "children": ["blk-b"]},
+                            {"block_id": "blk-b", "block_type": 32, "children": ["blk-a"]},
+                        ],
+                        "first_level_block_ids": ["blk-a"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.convert_markdown_to_body("正文")
+
+        self.assertEqual(raised.exception.code, "markdown_convert_shared_child_block")
+
+    def test_an_unhashable_first_level_block_id_is_a_lookup_error_not_a_type_error(self) -> None:
+        """``first_level_block_ids`` 里塞了一个不可哈希的条目（响应内部不自洽）。
+        判重用的 ``set()`` 会对它抛一个**裸 ``TypeError``**——那不属于本模块任何
+        一条失败分类，``apps/gateway/document_delivery.py`` 的白名单接不住，
+        整条消费循环会以一个未分类异常炸开。必须先归成结果不明。
+
+        变异锚点：把条目形状校验删掉，本用例会从 ``LookupError`` 变红成
+        ``TypeError: unhashable type``。
+        """
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [{"block_id": "blk-1", "block_type": 2}],
+                        "first_level_block_ids": [["blk-1"]],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(LookupError):
+            client.convert_markdown_to_body("正文")
+
+    def test_flat_children_refuses_a_nested_body_instead_of_dropping_the_nested_blocks(
+        self,
+    ) -> None:
+        """``flat_children()`` 只服务纯一级块的正文。对含嵌套块的正文"顺手只
+        返回一级块"会把单元格静默丢掉——正是 Issue #538 要修的那种内容凭空
+        消失，必须失败关闭。"""
+
+        body = ConvertedBody(
+            children_id=("blk-table",),
+            descendants=(
+                {"block_id": "blk-table", "block_type": 31, "children": ["blk-cell"]},
+                {"block_id": "blk-cell", "block_type": 32},
+            ),
+        )
+
+        self.assertTrue(body.nested)
+        with self.assertRaises(ValueError):
+            body.flat_children()
+
+    def test_children_referencing_an_unknown_block_is_a_lookup_error(self) -> None:
+        """某个块的 ``children`` 指向一个在 ``blocks`` 数组里找不到的 id：
+        响应内部不自洽，连"为什么不一致"都无法确定，归类为结果不明——不是
+        definite 拒绝、也不能静默丢掉那条引用。"""
+
+        transport = RecordingTransport(
+            [
+                {
+                    "code": 0,
+                    "data": {
+                        "blocks": [
+                            {"block_id": "blk-table", "block_type": 31, "children": ["blk-missing"]}
+                        ],
+                        "first_level_block_ids": ["blk-table"],
+                    },
+                }
+            ]
+        )
+        client = _client(transport)
+
+        with self.assertRaises(LookupError):
+            client.convert_markdown_to_body("正文")
+
+
+class WriteDescendantBlocksTest(unittest.TestCase):
+    """Issue #538：嵌套块写入端点的调用形态（stage 受控探针实测坐实）。"""
+
+    def _body(self) -> ConvertedBody:
+        return ConvertedBody(
+            children_id=("blk-1",),
+            descendants=(
+                {"block_id": "blk-1", "block_type": 31, "children": ["blk-2"]},
+                {"block_id": "blk-2", "block_type": 32},
+            ),
+        )
+
+    def test_the_request_matches_the_probed_descendant_shape(self) -> None:
+        """探针实测形状：同一个坐标（根 block 自身）、``index=0``、请求体是
+        ``children_id`` + ``descendants``。
+
+        变异锚点：把路径里的 ``descendant`` 改回 ``children``，本用例会红——
+        而那正是本 Story 修复前的写入端点（只收一级块）。
+        """
+
+        transport = RecordingTransport([{"code": 0, "data": {}}])
+        client = _client(transport)
+        body = self._body()
+
+        client.write_descendant_blocks(DOCUMENT_ID, body)
+
+        self.assertEqual(len(transport.calls), 1)
+        method, url, request_body, token = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/descendant"
+        )
+        self.assertEqual(
+            request_body,
+            {
+                "children_id": ["blk-1"],
+                "index": 0,
+                "descendants": [
+                    {"block_id": "blk-1", "block_type": 31, "children": ["blk-2"]},
+                    {"block_id": "blk-2", "block_type": 32},
+                ],
+            },
+        )
+        self.assertEqual(token, FAKE_TOKEN)
+
+    def test_more_than_the_cap_is_rejected_before_any_call(self) -> None:
+        """上限按 ``descendants`` **总块数**计（不是一级块数）——分批写入会打破
+        ``read_body_children`` 判据依赖的"正文一次写入"假设，理由与
+        :meth:`LarkDocxDelivery.write_blocks` 完全相同。
+
+        变异锚点：把上限判据删掉，本用例会从抛出 ``too_many_blocks`` 变红成
+        真的发起一次写入请求。
+        """
+
+        transport = RecordingTransport([])
+        client = _client(transport)
+        descendants = tuple(
+            {"block_id": f"blk-{index}", "block_type": 2}
+            for index in range(MAX_CONVERTED_BLOCKS + 1)
+        )
+        body = ConvertedBody(children_id=("blk-0",), descendants=descendants)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_descendant_blocks(DOCUMENT_ID, body)
+
+        self.assertEqual(raised.exception.code, "too_many_blocks")
+        self.assertTrue(raised.exception.definite)
+        self.assertEqual(transport.calls, [], "本地检查先于请求发出，不该真的发起 HTTP 调用")
+
+    def test_an_empty_body_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_descendant_blocks(DOCUMENT_ID, ConvertedBody(children_id=(), descendants=()))
+
+        self.assertEqual(transport.calls, [])
+
+    def test_a_blank_document_id_is_rejected_before_any_call(self) -> None:
+        transport = RecordingTransport([])
+        client = _client(transport)
+
+        with self.assertRaises(ValueError):
+            client.write_descendant_blocks("   ", self._body())
+
+        self.assertEqual(transport.calls, [])
+
+    def test_a_feishu_business_error_code_is_rejected(self) -> None:
+        transport = RecordingTransport([{"code": 1770001, "msg": "invalid param"}])
+        client = _client(transport)
+
+        with self.assertRaises(FeishuDocxDeliveryError) as raised:
+            client.write_descendant_blocks(DOCUMENT_ID, self._body())
+
+        self.assertEqual(raised.exception.code, "feishu_code_1770001")
+        self.assertTrue(raised.exception.definite)
 
 
 class WriteBlocksTest(unittest.TestCase):
@@ -965,6 +1361,63 @@ class WriteBodySwitchTest(unittest.TestCase):
             },
         )
 
+    def test_enabled_nested_blocks_are_written_via_the_descendant_endpoint(self) -> None:
+        """**Issue #538 的核心用例（含表格的答案）**：转换返回的响应里有表格，
+        表格块带 ``children`` 指向单元格、单元格再带 ``children`` 指向文字。
+
+        期望：**不再降级**——一次 convert ＋ 一次 ``descendant`` 写入，请求体
+        里同时出现标题、表格与结尾段，表格的父子关系原样保留，
+        ``table.property.merge_info``（飞书对这个端点硬拒的只读键）被剥掉。
+
+        变异锚点（两条都必红）：
+        - 把 ``convert_markdown_to_body`` 里按 ``children`` 展开那一步删掉、
+          恢复成"非一级块即拒"——本用例会变红成 ``outcome.degraded`` 为真、
+          第二次调用是 ``children`` 端点的段落写入（**这就是修复前的生产
+          行为**）；
+        - 把 ``write_body`` 里 ``if body.nested`` 分派删掉、一律走
+          :meth:`write_blocks`——本用例会变红成写入 URL 落在 ``children``
+          端点、请求体里没有任何嵌套结构。
+        """
+
+        transport = RecordingTransport([_table_convert_response(), {"code": 0, "data": {}}])
+        client = _client(transport, markdown_convert_enabled=True)
+
+        outcome = client.write_body(
+            DOCUMENT_ID,
+            paragraphs=["标题一", "格0 格1", "结尾一段 -12.85%"],
+            markdown="# 标题一\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n结尾一段 -12.85%",
+        )
+
+        self.assertFalse(outcome.degraded, "含表格的答案不再降级——这是 #538 要修的东西")
+        self.assertIsNone(outcome.degraded_reason)
+        self.assertEqual(len(transport.calls), 2, "一次 convert ＋ 一次嵌套写入")
+        _, convert_url, _, _ = transport.calls[0]
+        self.assertEqual(convert_url, f"{BASE_URL}/docx/v1/documents/blocks/convert")
+        _, write_url, write_body, _ = transport.calls[1]
+        self.assertEqual(
+            write_url, f"{BASE_URL}/docx/v1/documents/{DOCUMENT_ID}/blocks/{DOCUMENT_ID}/descendant"
+        )
+        self.assertEqual(write_body["children_id"], ["blk-heading", "blk-table", "blk-tail"])
+        self.assertEqual(write_body["index"], 0)
+        descendants = write_body["descendants"]
+        self.assertEqual(len(descendants), 11)
+        # 标题、表格、结尾段三样都在（修复前它们会一起被作废、退回纯文本段落）。
+        self.assertEqual(
+            [block["block_type"] for block in descendants[:2]] + [descendants[-1]["block_type"]],
+            [3, 31, 2],
+        )
+        table = descendants[1]
+        self.assertEqual(table["children"], ["cell-00", "cell-01", "cell-10", "cell-11"])
+        self.assertNotIn("merge_info", table["table"]["property"])
+        # 单元格与单元格内文字都随同一次请求写进去。
+        self.assertEqual(
+            sum(1 for block in descendants if block["block_type"] == 32), 4, "四个单元格"
+        )
+        # 负号逐字保真（Issue #408 当初要修的数据正确性缺陷不得回退）。
+        self.assertEqual(
+            descendants[-1]["text"]["elements"][0]["text_run"]["content"], "结尾一段 -12.85%"
+        )
+
     def test_enabled_convert_failure_fails_closed_without_falling_back_to_paragraphs(self) -> None:
         """开关打开时 convert 收到飞书业务错误码必须失败关闭，绝不退回纯文本段落
         路径——只应该看到一次 convert 调用，看不到任何 children 插入调用。
@@ -983,14 +1436,22 @@ class WriteBodySwitchTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
 
     def test_enabled_unsupported_nested_blocks_degrades_to_the_paragraph_path(self) -> None:
-        """Issue #499 的核心用例：转换端点返回一个含嵌套结构的响应（典型是
-        markdown 表格——单元格作为独立元素出现在 ``blocks`` 里、却不在
-        ``first_level_block_ids`` 内），``convert_markdown_to_blocks`` 因此抛
-        ``unsupported_nested_blocks``。
+        """Issue #499 的核心用例，**Issue #538 之后触发条件已收窄**：转换端点
+        返回的响应里有一个块（单元格 ``blk-table-cell-1``）既不在
+        ``first_level_block_ids`` 里，也没有被任何可达块的 ``children`` 认领
+        （表格块压根没有 ``children`` 字段）——本仓库没有任何位置能把它写进
+        文档，``convert_markdown_to_body`` 因此抛 ``unsupported_nested_blocks``。
 
-        期望：**不再整次失败**——改用 ``write_paragraphs`` 把 ``paragraphs``
+        **这个夹具在 Issue #538 之前代表的是"任何含表格的回答"**（生产实测
+        100% 命中）；现在真实的含表格响应会带着 ``children``，走 descendant
+        端点正常写入（见
+        ``test_enabled_nested_blocks_are_written_via_the_descendant_endpoint``），
+        只有这种响应内部缺链的畸形情况才会走到这里。
+
+        期望：**不整次失败**——改用 ``write_paragraphs`` 把 ``paragraphs``
         写进同一篇文档（第二次调用就是 children 插入端点，且正文来自段落而不是
-        转换结果），并在返回值里明示这次降级了、为什么降级。
+        转换结果），并在返回值里明示这次降级了、为什么降级。**降级机制本身
+        必须原样保留**：Issue #538 收窄的是触发条件，不是降级能力。
         """
 
         table_block = {
@@ -998,8 +1459,9 @@ class WriteBodySwitchTest(unittest.TestCase):
             "block_type": 31,
             "table": {"column_size": 2, "row_size": 2},
         }
-        # 单元格：出现在 blocks 数组里、但不在 first_level_block_ids 内——这正是
-        # 真实响应里表格的形状（Issue #442 探针实测口径）。
+        # 单元格：出现在 blocks 数组里、不在 first_level_block_ids 内，且**没有
+        # 任何父块的 children 认领它**（上面的表格块没有 children 字段）——这是
+        # 一个真的无处安放的块，不是真实 convert 响应里表格的形状。
         cell_block = {"block_id": "blk-table-cell-1", "block_type": 32}
         transport = RecordingTransport(
             [
