@@ -200,6 +200,72 @@ class AgentOptionsShapeTest(_StubSDK):
         self.assertEqual(options.allowed_tools, ["mcp__q__list"])
         self.assertEqual(options.disallowed_tools, [])
 
+    def test_the_three_isolation_options_are_pinned_value_by_value(self) -> None:
+        """W-2（Trace #544 S-2b）：``setting_sources`` / ``strict_mcp_config`` /
+        ``permission_mode`` 三项**逐值**钉死，改任何一项都必须变红。
+
+        此前这里只断言了装配形状（hooks 装上了、allow/disallow 两个列表是显式的），
+        这三项一个都没被断言过——也就是说把它们改掉、甚至整项删掉，全套测试照样
+        绿。它们三个各自堵的是一条**绕过只读屏障**的路，不是可调风格：
+
+        - ``setting_sources=[]``：不加载用户/项目设置源。不显式传空，宿主机
+          ``~/.claude/settings.json`` 里的 ``permissions`` / ``hooks`` /
+          ``mcpServers`` 就会与屏障并存，``PreToolUse`` 单点判定的绕过面被无声
+          打开（架构设计 5.3 的隔离边界）。
+        - ``strict_mcp_config=True``：``setting_sources=[]`` **挡不住 MCP 来源**。
+          SDK 0.2.128 的这个开关默认 ``False``，项目 ``.mcp.json`` / 用户级 /
+          插件 MCP 仍会被加载，甚至可能有同名服务器顶替白名单工具。**与 W-1 的
+          工作目录合同是同一条防线的两半**：即使 ``cwd`` 选错、目录里躺着别人的
+          ``.mcp.json``，这一项也让它不会被当成 MCP 配置源加载。
+        - ``permission_mode="dontAsk"``：L4a 已验证的取值——「当前能力」2026-07-28
+          的定向补测就是在这个取值下确认 hook 拒绝真的阻止执行。不传就落到 SDK
+          默认值，那个取值下屏障是否同样有效**从未验证过**。
+
+        断言用 ``assertIs`` 而不是 ``assertEqual`` 判布尔：``1 == True`` 在
+        Python 里成立，``assertEqual`` 会把 ``strict_mcp_config=1`` 判绿。
+        """
+
+        from lingxi.adapters.claude_agent_session import build_agent_options
+
+        options = build_agent_options(
+            self.gateway(), allowed_tools=("mcp__q__list",), stderr_sink=lambda line: None
+        )
+
+        self.assertEqual(
+            options.setting_sources,
+            [],
+            "setting_sources 必须显式传空列表：不传（None）等于让宿主机的 "
+            "~/.claude/settings.json 与屏障并存",
+        )
+        self.assertIs(
+            options.strict_mcp_config,
+            True,
+            "strict_mcp_config 必须显式为 True：SDK 0.2.128 默认 False，"
+            "项目/用户级/插件 MCP 仍会被加载，同名服务器可以顶替白名单工具",
+        )
+        self.assertEqual(
+            options.permission_mode,
+            "dontAsk",
+            "permission_mode 必须是 L4a 实测验证过的 dontAsk；换成别的取值时"
+            "「hook 拒绝真的阻止执行」这条结论未经验证",
+        )
+
+        # 带上全部可选配置之后三项仍然不许漂移：真实 queue 路径走的就是这一支
+        # （逐用户 mcp_servers + 逐用户 cwd）。
+        full = build_agent_options(
+            self.gateway(),
+            allowed_tools=("mcp__q__list",),
+            stderr_sink=lambda line: None,
+            mcp_servers={"q": {"type": "http", "url": "https://example.invalid/mcp"}},
+            cwd="/tmp/lingxi-workspace",
+            model="claude-sonnet-4-5",
+            system_prompt="只读问数",
+            max_turns=7,
+        )
+        self.assertEqual(full.setting_sources, [])
+        self.assertIs(full.strict_mcp_config, True)
+        self.assertEqual(full.permission_mode, "dontAsk")
+
     def test_optional_fields_are_only_passed_when_configured(self) -> None:
         from lingxi.adapters.claude_agent_session import build_agent_options
 

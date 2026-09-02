@@ -2340,14 +2340,19 @@ class WorkerServiceTests(unittest.TestCase):
         如果不主动让出一次就直接判定，读到的仍是旧值，会把一条还在排队、
         从未执行过的任务领走，直接收口成 ``stopped`` 且不会被重排。
 
-        复现手法：把 ``_housekeep`` 换成一个"在这次同步调用期间，把停机信号
-        排进事件循环就绪队列"的版本——这精确模拟了"信号回调已排队、尚未
-        执行"这个状态，不依赖真实操作系统信号的时序抖动。
+        复现手法：把 ``_housekeep`` 换成一个"在这次巡检期间，把停机信号排进
+        事件循环就绪队列"的版本——这精确模拟了"信号回调已排队、尚未执行"这个
+        状态，不依赖真实操作系统信号的时序抖动。
 
-        变异验证：把 `process_once()` 里 `claim()` 前的 `await
-        asyncio.sleep(0)` + 重新判定 `is_set()` 整段删掉，本用例会变红
-        （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
-        ``stopped``）。
+        **Trace #544 S-2b 之后的口径变化（不是放宽断言，是如实说明）**：巡检
+        已改走 ``await asyncio.to_thread(self._housekeep)``（见
+        ``apps/worker/service.py`` 的 ``process_once``），因此这个替身跑在**工作
+        线程**上，拿不到 running loop，改用
+        预先捕获的循环 + ``call_soon_threadsafe`` 排队。同一个原因也让
+        ``run()`` 的停机判定与 ``claim()`` 之间多了一次真实让出，
+        ``_STOP_SIGNAL_DRAIN_YIELDS`` 那套多轮让出因此从"唯一保证"降为"冗余
+        保证"——**本用例与它的真实信号姊妹用例都不再唯一钉住那个轮数**。本用例
+        断言的产品性质没有变：停机信号已经排队之后，``claim()`` 不许再被调用。
         """
 
         queue = FakeWorkerQueue()
@@ -2381,9 +2386,10 @@ class WorkerServiceTests(unittest.TestCase):
             # 但还没被处理"：这次同步的 `_housekeep()` 调用期间，操作系统
             # 送达了信号，`loop.call_soon` 把 `stop.set` 排进了就绪队列。
             original_housekeep = service._housekeep
+            loop = asyncio.get_running_loop()
 
             def housekeeping_that_races_with_sigterm() -> list[object]:
-                asyncio.get_running_loop().call_soon(stop.set)
+                loop.call_soon_threadsafe(stop.set)
                 return original_housekeep()
 
             service._housekeep = housekeeping_that_races_with_sigterm  # type: ignore[method-assign]
@@ -2494,7 +2500,11 @@ class WorkerServiceTests(unittest.TestCase):
         变异验证：把 `process_once()` 里 claim() 前新增的多轮让出+复判整段
         删掉（或把 `_STOP_SIGNAL_DRAIN_YIELDS` 改回 1），本用例会变红
         （``claim_calls`` 从 0 变成 1，任务被领走后从未真正执行就收口成
-        ``stopped``，且不会被重排）。
+        ``stopped``，且不会被重排）。**Trace #544 S-2b 之后这条变异结论不再成立**：
+        巡检改走 `asyncio.to_thread` 之后，停机判定与 `claim()` 之间
+        多了一次真实让出，自管道投递在那次让出里就被跑完了；见姊妹用例
+        `test_a_sigterm_that_lands_during_the_synchronous_housekeeping_stretch_
+        stops_claiming` 的同一段说明。本用例断言的产品性质不变。
         """
 
         from lingxi.adapters.postgres_conversation import ClaimedTask as _ClaimedTask
@@ -2895,6 +2905,141 @@ class WorkerServiceTests(unittest.TestCase):
         )
         self.assertEqual(len(queue.terminals), 1)
         self.assertEqual(queue.terminals[0]["terminal_kind"], "success")
+
+    def test_a_blocked_database_does_not_stop_the_hook_callback_from_answering(
+        self,
+    ) -> None:
+        """Trace #544 S-2b / 报告 W-1：巡检那几次同步数据库往返卡住时，在途回合的
+        ``PreToolUse`` 钩子回调必须仍能应答，事件循环不许被占住。
+
+        为什么这条是用户可见的：``ToolGateway.on_hook_event`` 是只读屏障的**唯一**
+        判定层，它经 Agent SDK 控制协议在同一个事件循环上应答。rc25 W0-1 探针已经
+        回源坐实 Claude CLI 的钩子超时是**失败关闭**（超时分支原文
+        ``The tool call was not executed``）——因此"事件循环被巡检的数据库往返占住"
+        的代价不是慢一点，而是在途用户回合的工具调用被判死，用户侧看到问数中途失败。
+
+        **断言的牙齿在哪**：``answered_while_blocked``——那次假的数据库往返**还没
+        返回**的时候，钩子就必须已经应答过。产品口径的 30 秒预算
+        （``_HOOK_ANSWER_BUDGET_SECONDS``）同时断言，但它不是这条用例的牙齿：把
+        阻塞时长做到真的超过 30 秒会让 fast 层多花半分钟，因此阻塞只留
+        ``_BLOCKED_DB_GRACE_SECONDS`` 秒的兜底（同时也保证退化时用例不会挂死）。
+
+        变异验红：把 ``process_once()`` 里的
+        ``await asyncio.to_thread(self._housekeep)`` 改回裸调 ``self._housekeep()``，
+        ``answered_while_blocked`` 变成 ``False``（钩子要等那次数据库往返自己超时
+        返回才轮得上应答）。
+
+        ----
+
+        **修法的完整论证放在这里**：``src/lingxi/apps/worker/service.py`` 已经贴着
+        体量棘轮阈值（1500 行、基线为空），容不下这段文字，而它又必须留在仓库里。
+
+        **为什么选线程池而不是异步化**：队列适配器
+        （``adapters/postgres_conversation/*``）是同步 psycopg 实现，没有 async
+        变体。异步化要么整包重写、要么引入第二套数据库驱动，两者都远超本项范围
+        且不可逆。线程池是最小、可回滚的形态——``_housekeep()`` 本身一个字节都
+        不用改，既有白盒调用方（直接调 ``service._housekeep()`` 的用例）逐字节
+        不变，回滚只需把两个调用点的 ``await asyncio.to_thread(...)`` 改回裸调。
+
+        **为什么这样搬是线程安全的**（逐条核对，不是"看起来没问题"）：
+
+        1. **数据库连接不共享**：``_housekeep()`` 命中的六个队列方法
+           （``fail_unavailable_versions`` / ``reclaim_queued`` /
+           ``reclaim_stale_with_outcomes`` / ``expire_undelivered_terminals`` /
+           ``claim_session_cleanups`` / ``mark_session_cleanups_done``）每次都经
+           ``connect()`` 新建自己的连接。唯一复用长连接的是 ``claim()``
+           （``_run_polling_operation`` + ``_pooled_connection``，worker 装配时
+           ``reuse_polling_connection=True``），而 ``claim()`` 只在事件循环线程上
+           调用，且**永远不与巡检重叠**——两个调用点都是先 ``await`` 完巡检再进
+           ``claim()``。
+        2. **告警状态机不重叠**：巡检里的 ``_report_task_stuck`` 会走到
+           ``AlertManager.observe``（写 ``_windows``）与 ``AlertDispatcher.submit``
+           （写 ``_pending``），两者都没有锁。同一轮的 ``_tick_alerts()`` 是在巡检
+           **之前同步跑完**的，不重叠；巡检执行期间事件循环上唯一会碰告警的是
+           ``_monitor`` 的 ``_emit_heartbeat()``，它只写 ``HeartbeatRegistry``，
+           与上面两处是互不相干的数据结构。
+        3. **不重入**：整个进程同时只有一轮 ``process_once()``，两个调用点又都
+           ``await`` 到底，因此巡检不会并发执行自身，``_last_session_reclaim_at``
+           之类的实例状态仍是单写。
+
+        **顺带的结构性影响（不是收益宣称，是如实登记）**：新增的这次真实 ``await``
+        让 ``run()`` 的停机判定与 ``claim()`` 之间不再是一整段没有让出的同步代码，
+        ``_STOP_SIGNAL_DRAIN_YIELDS`` 那套多轮让出+复判从"唯一保证"降为"冗余
+        保证"。代码不动、语义不弱化，但本文件两条 SIGTERM 用例**不再唯一钉住
+        它的轮数**，见那两条用例各自的说明。
+        """
+
+        from lingxi.core.execution.audit import TurnAudit
+        from lingxi.core.execution.hooks import ToolGateway
+        from lingxi.core.execution.tool_policy import ToolPolicy
+
+        _HOOK_ANSWER_BUDGET_SECONDS = 30.0
+        _BLOCKED_DB_GRACE_SECONDS = 5.0
+
+        entered_database_call = threading.Event()
+        hook_answered = threading.Event()
+        observed: dict[str, object] = {}
+
+        class BlockedDatabaseQueue(FakeWorkerQueue):
+            """巡检的数据库往返卡住（锁等待 / 连接卡在 connect_timeout 上）。"""
+
+            def reclaim_queued(self, *, max_wait: object) -> list:
+                entered_database_call.set()
+                observed["answered_while_blocked"] = hook_answered.wait(
+                    timeout=_BLOCKED_DB_GRACE_SECONDS
+                )
+                return []
+
+        queue = BlockedDatabaseQueue()
+        # 本用例只观察巡检与钩子，不领任务：领取路径由别的用例覆盖。
+        queue.claimed = None  # type: ignore[assignment]
+
+        class Executor:
+            async def run_turn(self, prompt: str, **kwargs: object) -> dict:
+                raise AssertionError("本用例不应该领到任何任务")
+
+        service = WorkerService(
+            config=worker_config(),
+            queue=queue,
+            executor_factory=lambda config, marker: Executor(),
+        )
+        gateway = ToolGateway(
+            policy=ToolPolicy(allowed_tools=("mcp__q__read",)), audit=TurnAudit()
+        )
+
+        async def scenario() -> None:
+            housekeeping = asyncio.ensure_future(service.process_once())
+            # 等巡检真的走进那次卡住的数据库往返，再发钩子——不用 sleep 猜时序。
+            await asyncio.to_thread(entered_database_call.wait, _BLOCKED_DB_GRACE_SECONDS)
+            started_at = time.monotonic()
+            decision = await gateway.on_hook_event(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__q__read",
+                    "tool_input": {},
+                },
+                "call-blocked-db",
+            )
+            observed["latency"] = time.monotonic() - started_at
+            observed["decision"] = decision
+            hook_answered.set()
+            await asyncio.wait_for(housekeeping, timeout=_BLOCKED_DB_GRACE_SECONDS * 4)
+
+        asyncio.run(scenario())
+
+        self.assertIs(
+            observed.get("answered_while_blocked"),
+            True,
+            "巡检的数据库往返还卡着的时候，PreToolUse 钩子就必须已经应答过——"
+            "同步直调 _housekeep() 会把事件循环整段占住，钩子只能干等，而 CLI 的"
+            "钩子超时是失败关闭，等于把在途回合的工具调用判死",
+        )
+        self.assertIsNotNone(observed.get("decision"), "钩子必须真的返回了一个判定")
+        self.assertLess(
+            float(observed["latency"]),  # type: ignore[arg-type]
+            _HOOK_ANSWER_BUDGET_SECONDS,
+            "钩子应答必须落在 30 秒预算之内",
+        )
 
     def test_every_exception_in_the_same_done_batch_is_retrieved_before_raising(
         self,
@@ -3311,12 +3456,26 @@ class SemanticProgressTests(unittest.TestCase):
         决定，不依赖真实时钟或调度器的时序抖动。
 
         变异存活证据：把 ``_monitor`` 里 ``on_stall_tick()`` 那次调用整段删掉，
-        本用例会等到 500 次让出用尽、拿到 0 条 progress 事件，断言变红。
+        本用例会等到墙钟预算用尽、拿到 0 条 progress 事件，断言变红。
+
+        **虚拟时钟推进到兜底阈值就冻结**（Trace #544 S-2b 补强，不是放宽断言）：
+        progress 真正落库要经一次 ``asyncio.to_thread`` 的真实线程往返，而虚拟
+        时间由 ``_monitor`` **自己的循环次数**推进——两者一旦赛跑，``_monitor``
+        能在等待那次线程往返的墙钟里把虚拟时间推到任意远，兜底更新于是被触发
+        几十上百次，用例结论变成"看线程池调度脸色"。实测：巡检改走线程池
+        （``_housekeep_off_loop``）之后，同一段代码从"5 次让出后落地、恰好 1 条"
+        变成"523 次让出后落地、174 条"。冻结之后
+        ``_write_progress_if_due`` 的节流窗口永远不再到期，"恰好一次"成为结构性
+        结论，不再依赖任何调度时序；断言本身一个字没改。
         """
 
         queue = FakeWorkerQueue()
 
         class _VirtualClock:
+            #: 推进到兜底周期（``_PROGRESS_FALLBACK_SECONDS`` = 12 秒）就停：
+            #: 兜底更新因此只可能被触发一次。
+            FREEZE_AT_SECONDS = 12.0
+
             def __init__(self) -> None:
                 self.now = 0.0
 
@@ -3324,16 +3483,18 @@ class SemanticProgressTests(unittest.TestCase):
                 return self.now
 
             async def sleep(self, seconds: float) -> None:
-                self.now += seconds
+                self.now = min(self.now + seconds, self.FREEZE_AT_SECONDS)
                 await asyncio.sleep(0)
 
         clock = _VirtualClock()
 
         class Executor:
             async def run_turn(self, prompt: str, **kwargs: object) -> dict:
-                for _ in range(500):
-                    if len(queue.events) >= 2:
-                        break
+                # 墙钟预算而不是固定让出次数：等的是那次真实线程往返，它的耗时
+                # 由调度决定，不由让出次数决定（虚拟时钟已冻结，多等不会多出
+                # 任何一条 progress 事件）。
+                deadline = time.monotonic() + 5.0
+                while len(queue.events) < 2 and time.monotonic() < deadline:
                     await asyncio.sleep(0)
                 return {
                     "turn": {"closed": True, "final_text": "结果", "session_id": "s"},

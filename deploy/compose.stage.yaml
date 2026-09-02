@@ -117,6 +117,18 @@ services:
     environment:
       # Issue #496 / Trace #502：stage 与生产执行并发合同均固定为 4。
       LINGXI_WORKER_MAX_CONCURRENCY: "4"
+      # 隔离边界（Trace #544 S-2b / 报告 W-1）：Agent SDK 回合的工作目录**必须**
+      # 与用户环境根（lingxi-users 卷的挂载点 /var/lib/lingxi/users）互不包含。
+      # 这不是洁癖：那个目录下每个用户各有一份 0440 的 .mcp.json，里面是**该用户
+      # 专属的问数 MCP Bearer 明文**。把 cwd 设成用户目录根（或它的任何祖先/子孙），
+      # 模型一次相对路径读取就能拿到别人的令牌——而 cwd 里的 .mcp.json 同时还是
+      # Claude CLI 的项目级 MCP 配置来源。**这一行写在 compose 而不是外部 env 文件
+      # 里是刻意的**：compose 的 `environment:` 覆盖 `env_file`，因此哪怕
+      # .env.<环境>.worker-queue 里还留着一个不安全的旧值，也不再可能生效。
+      # scripts/ci/check_deploy_contract.py 的 check_worker_workspace_isolation
+      # 把这条边界钉成会变红的断言（用户目录根由 lingxi-users 挂载点推导，用户
+      # 家目录的构造形状回读 adapters/user_environment.py 的 home_of）。
+      LINGXI_WORKER_WORKSPACE: "/tmp/lingxi-workspace"
     # /tmp 内存盘上限（Issue #494）：stage 主机是 t3.medium（2 vCPU / 3.74GiB，
     # 浸泡实测宿主可用内存 1.6~1.7GiB、swap 已用 261MiB），**这块盘写满就等量吃掉
     # 宿主内存**，因此 stage 这一档钉死在 256m 不再往上加；真正解决无界增长的是
