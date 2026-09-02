@@ -14,10 +14,16 @@
 连接串。当前模型侧 Bash/Read 是拒的，因此不可达；与 hook 超时失败开放（报告 W-1）
 叠加时后果直接扩大到生产库。
 
-因此唯一能真正生效的位置是 ``apps/worker/cli.py``：**在起任何回合之前**，把它从
-本进程自己的 ``os.environ`` 里摘掉。本文件把这条钉成断言，验收口径与审查报告的
-上线前预检一致——``/proc/<pid>/environ`` 里含 DSN 的子进程数 = 0，只不过这里用
-本地构造的子进程复现，不连任何机器。
+因此唯一能真正生效的位置是本进程自己的 ``os.environ``。本文件把这条钉成断言，
+验收口径与审查报告的上线前预检一致——``/proc/<pid>/environ`` 里含 DSN 的子进程数
+= 0，只不过这里用本地构造的子进程复现，不连任何机器。
+
+**摘除发生在真实进程入口（``apps/worker/__main__.py``）而不是 ``cli.main()`` 里**：
+``main()`` 是一个会被单测在同一个解释器里反复调用的普通函数，把 ``os.environ.pop``
+放进去，跑完几条队列模式启动用例之后，同一个进程里所有真库用例的 DSN 就都没了
+（2026-09-02 CI 实测：40 个 ``setUpClass`` KeyError，外加 ``verify_repository.sh``
+的「容器在、DSN 没了」守卫判红）。``MainDoesNotMutateProcessEnvironmentTest`` 就是
+那次回归的守门用例。
 """
 
 from __future__ import annotations
@@ -34,7 +40,8 @@ from pathlib import Path
 
 from lingxi.apps.worker.cli import (
     _UNINHERITABLE_ENV_VARS,
-    _detach_inherited_database_credentials,
+    detach_process_environment,
+    main,
 )
 
 DSN_VAR = "LINGXI_POSTGRES_DSN"
@@ -103,11 +110,8 @@ class ChildProcessDoesNotInheritTheDsnTest(unittest.TestCase):
         """验收口径：``/proc/<pid>/environ`` 含 DSN 的子进程数 = 0。"""
 
         os.environ[DSN_VAR] = FAKE_DSN
-        stderr = io.StringIO()
 
-        removed = _detach_inherited_database_credentials(
-            err=stderr, trace_id="01J0000000000000000TEST000"
-        )
+        snapshot, removed = detach_process_environment()
 
         self.assertEqual(removed, (DSN_VAR,))
         self.assertNotIn(DSN_VAR, os.environ)
@@ -115,78 +119,161 @@ class ChildProcessDoesNotInheritTheDsnTest(unittest.TestCase):
         self.assertNotIn(f"{DSN_VAR}=".encode(), environ_bytes)
         self.assertNotIn(FAKE_DSN.encode(), environ_bytes, "值也不许以别的变量名混进去")
 
-    def test_detaching_is_idempotent_and_silent_when_there_is_nothing_to_remove(self) -> None:
+        # 摘除**之前**的快照仍然带着值：本进程照常读得到配置，这正是"摘掉了却
+        # 还能工作"的全部机制。
+        self.assertEqual(snapshot[DSN_VAR], FAKE_DSN)
+
+    def test_detaching_is_idempotent_when_there_is_nothing_to_remove(self) -> None:
         os.environ.pop(DSN_VAR, None)
+
+        snapshot, removed = detach_process_environment()
+
+        self.assertEqual(removed, ())
+        self.assertNotIn(DSN_VAR, snapshot)
+
+    def test_the_startup_log_records_the_variable_name_but_never_the_value(self) -> None:
+        """摘除本身不记日志（那时还没有 trace id）；由 ``main()`` 用入口传进来的
+        变量名记一条。这里直接驱动 ``main()`` 的队列分支验证那一条的形状。"""
+
         stderr = io.StringIO()
+        stdout = io.StringIO()
 
-        self.assertEqual(
-            _detach_inherited_database_credentials(
-                err=stderr, trace_id="01J0000000000000000TEST000"
-            ),
-            (),
+        # 故意缺 LINGXI_USER_ENV_ROOT：队列模式会在读完 DSN、记完这条日志之后
+        # 以配置错误退出，不需要任何数据库。
+        main(
+            env={
+                "LINGXI_WORKER_MODE": "queue",
+                "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
+                "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+                "LINGXI_POSTGRES_DSN": FAKE_DSN,
+            },
+            stdout=stdout,
+            stderr=stderr,
+            detached_env_vars=(DSN_VAR,),
         )
-        self.assertEqual(stderr.getvalue(), "", "没摘掉任何东西时不该有日志噪声")
 
-    def test_the_log_records_the_variable_name_but_never_the_value(self) -> None:
-        os.environ[DSN_VAR] = FAKE_DSN
-        stderr = io.StringIO()
-
-        _detach_inherited_database_credentials(
-            err=stderr, trace_id="01J0000000000000000TEST000"
-        )
-
-        output = stderr.getvalue()
-        self.assertIn(DSN_VAR, output)
-        self.assertNotIn("hunter2", output)
-        self.assertNotIn("db.invalid", output)
-        record = json.loads(output.strip().splitlines()[-1])
+        lines = [line for line in stderr.getvalue().splitlines() if "env_detached" in line]
+        self.assertEqual(len(lines), 1, stderr.getvalue())
+        record = json.loads(lines[0])
         self.assertEqual(record["variables"], [DSN_VAR])
+        self.assertNotIn("hunter2", lines[0])
+        self.assertNotIn("db.invalid", lines[0])
 
 
-class DetachHappensBeforeAnythingCanSpawnTest(unittest.TestCase):
-    """摘除的**位置**是这条修复的全部：晚一步就等于没做。
+class DetachHappensAtTheRealProcessEntryTest(unittest.TestCase):
+    """摘除的**位置**是这条修复的全部：晚一步等于没做，放错层则毒化整个进程。
 
-    源码级断言，因为真正跑一次 queue 模式要连真库、起 SDK。判据是"在 `main` 的
-    queue 分支里，摘除调用出现在任何可能起子进程的东西之前"——`PostgresTaskQueue`
-    之后才摘，第一个回合就已经把 DSN 带出去了。
+    源码级断言，因为真正跑一次 queue 模式要连真库、起 SDK。
     """
 
-    def _queue_branch_calls(self) -> list[str]:
-        source = (
-            Path(__file__).parents[1] / "src/lingxi/apps/worker/cli.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        main = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "main"
+    ENTRY = Path(__file__).parents[1] / "src/lingxi/apps/worker/__main__.py"
+    CLI = Path(__file__).parents[1] / "src/lingxi/apps/worker/cli.py"
+
+    def test_the_entry_point_detaches_before_it_calls_main(self) -> None:
+        tree = ast.parse(self.ENTRY.read_text(encoding="utf-8"))
+        calls: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                calls.append((node.lineno, node.func.id))
+        order = [name for _, name in sorted(calls)]
+
+        self.assertIn("detach_process_environment", order)
+        self.assertIn("main", order)
+        self.assertLess(
+            order.index("detach_process_environment"),
+            order.index("main"),
+            "必须先摘、再进 main——反过来 main 就已经带着 DSN 起了第一个回合",
         )
-        names: list[tuple[int, str]] = []
-        for node in ast.walk(main):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name):
-                    names.append((node.lineno, func.id))
-                elif isinstance(func, ast.Attribute):
-                    names.append((node.lineno, func.attr))
-        return [name for _, name in sorted(names)]
 
-    def test_the_detach_precedes_every_adapter_and_service_construction(self) -> None:
-        order = self._queue_branch_calls()
+    def test_the_entry_point_feeds_main_the_pre_detach_snapshot(self) -> None:
+        """摘掉之后 ``main()`` 还得读得到配置，靠的就是这份快照。
 
-        self.assertIn("_detach_inherited_database_credentials", order)
-        detach_at = order.index("_detach_inherited_database_credentials")
-        for later in ("PostgresTaskQueue", "WorkerService"):
-            with self.subTest(after=later):
-                self.assertIn(later, order, f"{later} 应当仍在 main 的装配里")
-                self.assertLess(
-                    detach_at,
-                    order.index(later),
-                    f"摘除必须早于 {later}——晚一步，第一个回合就已经把 DSN 带出去了",
-                )
+        入口如果不传 ``env=``，``main()`` 会退回读已经被摘空的 ``os.environ``，
+        队列 worker 会以"缺少 LINGXI_POSTGRES_DSN"启动失败——一个把自己饿死的修复。
+        """
+
+        source = self.ENTRY.read_text(encoding="utf-8")
+
+        self.assertRegex(source, r"main\(\s*env=", "main 必须收到入口给的快照")
+        self.assertIn("detached_env_vars=", source, "摘掉了什么要传给 main 记日志")
 
     def test_the_uninheritable_list_is_not_silently_emptied(self) -> None:
         self.assertIn(DSN_VAR, _UNINHERITABLE_ENV_VARS)
+
+
+class MainDoesNotMutateProcessEnvironmentTest(unittest.TestCase):
+    """2026-09-02 CI 回归的守门用例。
+
+    上一版把 ``os.environ.pop`` 放在 ``cli.main()`` 里。``main()`` 会被单测在同一个
+    解释器里反复调用（``test_worker_workspace_precheck`` 等三个文件都走队列模式的
+    启动路径），于是跑完那几条之后，同一个进程里**所有**真库用例的
+    ``LINGXI_POSTGRES_DSN`` 就没了：40 个 ``setUpClass`` KeyError，
+    ``verify_repository.sh`` 的「设了容器却没有 DSN」守卫也准确判红。
+
+    这条用例直接钉住"``main()`` 不碰进程环境"，任何人把 pop 挪回去都必然变红。
+    """
+
+    def test_running_the_queue_branch_leaves_os_environ_untouched(self) -> None:
+        previous = os.environ.get(DSN_VAR)
+        self.addCleanup(
+            lambda: os.environ.__setitem__(DSN_VAR, previous)
+            if previous is not None
+            else os.environ.pop(DSN_VAR, None)
+        )
+        os.environ[DSN_VAR] = FAKE_DSN
+        before = dict(os.environ)
+
+        # 缺 LINGXI_USER_ENV_ROOT，队列模式会在配置检查处退出；这已经走过了
+        # 读 DSN 的那一段，也就是原来 pop 所在的位置。
+        main(
+            env={
+                "LINGXI_WORKER_MODE": "queue",
+                "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
+                "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+                "LINGXI_POSTGRES_DSN": FAKE_DSN,
+            },
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+
+        self.assertEqual(
+            dict(os.environ), before, "main() 不得改动进程环境——它不是进程入口"
+        )
+        self.assertEqual(os.environ[DSN_VAR], FAKE_DSN)
+
+    def test_the_real_entry_still_reads_the_dsn_after_detaching(self) -> None:
+        """真实进程端到端：``python -m lingxi.apps.worker`` 队列模式，
+        DSN 在环境里、``LINGXI_USER_ENV_ROOT`` 故意缺失。
+
+        失败理由必须是"缺少 LINGXI_USER_ENV_ROOT"。如果入口摘掉 DSN 之后没有把
+        快照喂给 ``main()``，这里会变成"缺少 LINGXI_POSTGRES_DSN"——那正是
+        "摘得太干净把自己饿死"的形状。不连任何数据库：这一步在建连接之前。
+        """
+
+        result = subprocess.run(
+            [sys.executable, "-m", "lingxi.apps.worker"],
+            cwd=Path(__file__).parents[1],
+            env={
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "LINGXI_WORKER_MODE": "queue",
+                "LINGXI_WORKER_READONLY_TOOLS": "mcp__query__noop",
+                "LINGXI_WORKER_TRACE_ID": "01J0000000000000000TEST000",
+                "LINGXI_POSTGRES_DSN": FAKE_DSN,
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        combined = result.stdout + result.stderr
+        self.assertIn("LINGXI_USER_ENV_ROOT", combined, combined[-800:])
+        self.assertNotIn(
+            "缺少 LINGXI_POSTGRES_DSN", combined, "入口摘完之后 main 必须仍读得到 DSN"
+        )
+        self.assertIn("env_detached", combined, "摘除必须在启动日志里留痕")
+        self.assertNotIn("hunter2", combined, "启动日志不得回显连接串取值")
 
 
 @unittest.skipUnless(

@@ -29,6 +29,10 @@ from lingxi.apps.scheduler import (
     build_loop,
 )
 
+OWNER_ID = "usr_capture_retention"
+CONVERSATION_ID = "cnv_capture_retention"
+TASK_ID = "tsk_capture_retention"
+
 BASE_ENV = {
     "LINGXI_POSTGRES_DSN": "postgresql://user@localhost:5432/lingxi",
     "LINGXI_FEISHU_APP_ID": "cli_fake",
@@ -182,8 +186,8 @@ class AssemblyTest(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("LINGXI_POSTGRES_DSN"),
-    "跳过：未设置 LINGXI_POSTGRES_DSN，到期删除的真库断言未验证（需真实 PostgreSQL 16）",
+    os.environ.get("LINGXI_POSTGRES_DSN") and importlib.util.find_spec("psycopg"),
+    "跳过：未设置 LINGXI_POSTGRES_DSN 或未安装 psycopg，到期删除的真库断言未验证",
 )
 class RealDatabaseTest(unittest.TestCase):
     """真库：过期的删掉、未过期的一行都不动。"""
@@ -197,38 +201,66 @@ class RealDatabaseTest(unittest.TestCase):
         ensure_production_schema(self._dsn)
         reset_production_rows(self._dsn)
         self._connect = connect
+        self._seed_owner()
+
+    def _seed_owner(self) -> None:
+        """种一行合法的 ``app_user`` + 会话 + 任务。
+
+        ``app_user`` 有一条「六个身份字段全有或全无」的 CHECK（迁移 ``008``）：
+        ``feishu_open_id``/``feishu_user_id``/``feishu_union_id``/``display_name``/
+        ``department``/``tenant_key`` 必须一起给。少给几个不是"字段可空"，是直接
+        ``app_user_check`` 违约（本轮 CI 实测）。
+
+        ``email`` **留空**：迁移 ``0085`` 给它加了 ``lower(btrim(email))`` 的部分
+        唯一索引，条件是 ``email IS NOT NULL AND btrim(email) <> ''``——不写就落在
+        唯一性之外，本用例也不需要邮箱。
+
+        列名照 ``tests/test_postgres_content_capture.py`` 的同一张表夹具，不自造。
+        """
+
+        with self._connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO app_user
+                     (id, feishu_open_id, feishu_user_id, feishu_union_id,
+                      display_name, department, tenant_key, provisioning_state)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                   ON CONFLICT (id) DO NOTHING""",
+                (
+                    OWNER_ID,
+                    "ou_capture_retention",
+                    "u_capture_retention",
+                    "un_capture_retention",
+                    "化名甲",
+                    "数据部",
+                    "tk_capture_retention",
+                ),
+            )
+            cursor.execute(
+                """INSERT INTO conversation (id, user_id, feishu_chat_id, feishu_thread_id)
+                   VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
+                (CONVERSATION_ID, OWNER_ID, "chat_capture_retention", "topic_capture_retention"),
+            )
+            cursor.execute(
+                """INSERT INTO task
+                     (id, conversation_id, user_id, inbound_event_id, prompt, status,
+                      target_worker_version, attempts, content_expires_at)
+                   VALUES (%s, %s, %s, %s, '问题', 'succeeded', 'stable', 1, now())
+                   ON CONFLICT (id) DO NOTHING""",
+                (TASK_ID, CONVERSATION_ID, OWNER_ID, "event_capture_retention"),
+            )
+            connection.commit()
 
     def _insert(self, row_id: str, *, created_at: datetime) -> None:
         with self._connect(self._dsn) as connection, connection.cursor() as cursor:
+            # created_at 显式给出；expires_at 由迁移 0069 的触发器按
+            # created_at + 2160 小时固定（传什么都会被覆盖），因此"造一条已过期
+            # 的行"的唯一正确姿势是把 created_at 推到 90 天以前。
             cursor.execute(
-                "INSERT INTO app_user (id, feishu_open_id, display_name) VALUES (%s, %s, %s)"
-                " ON CONFLICT DO NOTHING",
-                ("usr_capture_retention", "ou_capture_retention", "化名甲"),
-            )
-            cursor.execute(
-                "INSERT INTO conversation (id, user_id, scope) VALUES (%s, %s, %s)"
-                " ON CONFLICT DO NOTHING",
-                ("cnv_capture_retention", "usr_capture_retention", "p2p"),
-            )
-            cursor.execute(
-                "INSERT INTO task (id, conversation_id, user_id, question, state)"
-                " VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (
-                    "tsk_capture_retention",
-                    "cnv_capture_retention",
-                    "usr_capture_retention",
-                    "问题",
-                    "done",
-                ),
-            )
-            # created_at 显式给出；expires_at 由触发器按 created_at + 2160 小时固定，
-            # 因此"造一条已过期的行"的唯一正确姿势是把 created_at 推到 90 天以前。
-            cursor.execute(
-                "INSERT INTO innertest_content_capture"
-                " (id, task_id, worker_id, question_content, answer_content, created_at,"
-                "  expires_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (row_id, "tsk_capture_retention", "wkr", "问题原文", "回答原文", created_at, created_at),
+                """INSERT INTO innertest_content_capture
+                     (id, task_id, worker_id, question_content, answer_content,
+                      created_at, expires_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (row_id, TASK_ID, "wkr", "问题原文", "回答原文", created_at, created_at),
             )
             connection.commit()
 

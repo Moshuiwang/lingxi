@@ -26,7 +26,7 @@ import signal
 import stat
 import sys
 from pathlib import Path
-from typing import Any, Callable, Mapping, TextIO
+from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from lingxi.core.execution.audit import redact_free_text
 from lingxi.core.ids import is_ulid, new_ulid
@@ -55,7 +55,16 @@ def main(
     env: Mapping[str, str] | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
+    detached_env_vars: Sequence[str] = (),
 ) -> int:
+    """受控回合 / 队列 worker 的入口逻辑。
+
+    ``detached_env_vars`` 由**真实进程入口**（``apps/worker/__main__.py``）传进来：
+    那一层在调用本函数之前已经把这些变量从 ``os.environ`` 里摘掉了（报告 R6-D2），
+    这里只负责把这件事记进启动日志。**本函数自己一个字节都不改 os.environ**——
+    理由见 :func:`detach_process_environment` 的文档。
+    """
+
     del argv  # 本切片没有命令行参数：全部输入走 LINGXI_ 前缀环境变量。
     env = os.environ if env is None else env
     out = sys.stdout if stdout is None else stdout
@@ -135,22 +144,22 @@ def main(
             _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
-        # 报告 R6-D2：生产数据库连接串会被 Claude CLI 与它的 MCP 子进程整份继承。
-        #
-        # `claude-agent-sdk` 0.2.128 起子进程时用 `process_env = {**os.environ, …}`
-        # （`subprocess_cli.py`），而 `adapters/claude_agent_session.py` 不传
-        # `options.env`。也就是说：**SDK 侧没有任何参数能删掉一个已经在进程环境
-        # 里的变量**——`options.env` 只能往上加，不能往下减。唯一能真正生效的位置
-        # 就是这里：在起任何回合之前，把它从**本进程自己的 os.environ** 里摘掉。
-        #
-        # 上面已经把值读进局部变量 `dsn`，本进程后续所有数据库连接都用它构造
-        # （queue/listener/记忆读取/采集写入），因此摘掉环境变量不影响本进程；
-        # healthcheck 走 `docker exec` 另起进程、拿的是容器自己的 env，也不受影响。
-        #
-        # 当前模型侧 Bash/Read 工具是拒的（`core/execution/hooks.py`），所以这条
-        # 继承此刻不可达；但它与 hook 超时失败开放那条（报告 W-1）叠加时，后果
-        # 直接扩大到生产库的读写凭据。删掉一个本来就不该在那里的变量，成本为零。
-        _detach_inherited_database_credentials(err=err, trace_id=config.trace_id)
+        # 报告 R6-D2：数据库连接串**已经**在进程入口从 os.environ 里摘掉了，
+        # 见 `detach_process_environment` 与 `apps/worker/__main__.py`。这里只是
+        # 把这件事记进启动日志——一道没人看得见的安全闸和没有这道闸差别不大。
+        # 只记变量名，永不回显取值。
+        if detached_env_vars:
+            _log(
+                err,
+                config.trace_id,
+                "info",
+                "worker.queue.env_detached",
+                variables=list(detached_env_vars),
+                message=(
+                    "进程入口已从 os.environ 移除下列变量，Claude CLI 与 MCP 子进程"
+                    "不再继承它们；本进程改用启动时读到的值（只记变量名，不回显取值）"
+                ),
+            )
         # Epic D 闸⑥：queue 模式是唯一真正处理用户任务的路径，每个任务都要按
         # 它的 user_id 读 <user_env_root>/<user_id>/.mcp.json（见
         # apps/worker/service.py 的 _process_task）。缺了这个根目录，队列
@@ -568,34 +577,53 @@ def _ensure_user_env_root_available(user_env_root: str, *, err: TextIO, trace_id
 #: 不允许被 Claude CLI 及其 MCP 子进程继承的进程环境变量（报告 R6-D2）。
 #: 只列 worker-queue 的 env 文件里真实存在、且本进程读完之后不再需要从环境里
 #: 取第二次的那些。加一项之前先确认：本进程没有任何代码路径会在这之后再去
-#: `os.environ` 读它——否则删掉的是自己的配置，不是子进程的继承面。
+#: `os.environ` 读它——否则删掉的是自己的配置，不是子进程的继承面
+#: （``main()`` 全程用入口传进来的配置快照，不读 ``os.environ``）。
 _UNINHERITABLE_ENV_VARS = ("LINGXI_POSTGRES_DSN",)
 
 
-def _detach_inherited_database_credentials(*, err: TextIO, trace_id: str) -> tuple[str, ...]:
-    """把不该被子进程继承的变量从**本进程的 `os.environ`** 里摘掉，返回摘掉的变量名。
+def detach_process_environment() -> tuple[dict[str, str], tuple[str, ...]]:
+    """**只允许真实进程入口调用**：把配置读走，再把不该被子进程继承的变量从
+    ``os.environ`` 里摘掉。返回 ``(配置快照, 被摘掉的变量名)``。
 
-    必须操作 `os.environ` 而不是 `main()` 收到的 `env` 映射：SDK 拼子进程环境时读
-    的是 `os.environ`，传进来的 `env` 在测试里可能是另一个字典。两者是同一个对象
-    时（生产姿态）这里顺带也从 `env` 里消失了，而 DSN 此刻已经读进局部变量。
+    ## 为什么在这里，不在 ``main()`` 里
 
-    只记变量名，永不回显值。
+    这个函数改的是**整个进程**的环境。``main()`` 不是进程——它是一个会被单测在
+    同一个解释器里反复调用的普通函数：``tests/test_worker_workspace_precheck.py``
+    等三个文件都用 ``main(env=…)`` 走队列模式的启动路径。把 ``os.environ.pop``
+    放在 ``main()`` 里，**跑完那几条用例之后同一个进程里所有真库用例的
+    ``LINGXI_POSTGRES_DSN`` 就没了**——CI 上 40 个 ``setUpClass`` 直接
+    ``KeyError``，而 ``verify_repository.sh`` 的「容器在、DSN 没了」守卫准确地
+    报了红（2026-09-02 实测，本地已复现）。
+
+    这不是"测试写法不好"，是**职责放错了层**：进程级的副作用属于进程入口，不属于
+    一个可复用函数。放在入口还有两个额外好处——摘除发生在 ``main()`` 开始之前
+    （比原来更早，绝无任何回合已经起来的窗口），而且未来任何新写的
+    ``main(env=…)`` 用例都不可能再把它踩回来。
+
+    ## 为什么必须动 ``os.environ`` 而不是给 SDK 传 ``env``
+
+    已回源确认 ``claude-agent-sdk`` 0.2.128 的
+    ``_internal/transport/subprocess_cli.py``：
+    ``inherited_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}``，
+    随后 ``process_env = {**inherited_env, …, **self._options.env, …}``。
+    ``options.env`` **只能往上加、不能往下减**，SDK 侧没有任何参数能删掉一个已经
+    在进程环境里的变量。唯一能真正生效的位置就是本进程自己的 ``os.environ``。
+
+    ## 为什么摘掉之后本进程还工作
+
+    返回的快照是摘除**之前**的完整副本，``main()`` 用它读全部配置（包括 DSN），
+    本进程后续所有数据库连接都用读到的那个值构造。healthcheck 走 ``docker exec``
+    另起进程、拿的是容器自己的 env，同样不受影响。
+
+    只返回变量名，永不回显取值。
     """
 
-    removed = tuple(name for name in _UNINHERITABLE_ENV_VARS if os.environ.pop(name, None) is not None)
-    if removed:
-        _log(
-            err,
-            trace_id,
-            "info",
-            "worker.queue.env_detached",
-            variables=list(removed),
-            message=(
-                "已从进程环境移除下列变量，使 Claude CLI 与 MCP 子进程不再继承它们"
-                "（本进程改用启动时读到的值；只记变量名，不回显取值）"
-            ),
-        )
-    return removed
+    snapshot = dict(os.environ)
+    removed = tuple(
+        name for name in _UNINHERITABLE_ENV_VARS if os.environ.pop(name, None) is not None
+    )
+    return snapshot, removed
 
 
 def _resolve_session_root(config: WorkerConfig, env: Mapping[str, str]) -> Path | None:
