@@ -1,0 +1,17 @@
+[Unit]
+Description=Lingxi 宿主侧容器健康检查与告警单轮（Trace #373 H2；本单元 rc25 补入库）
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User= 不写在本文件里，由 /etc/systemd/system/lingxi-host-monitor.service.d/10-local.conf
+# 提供（见同目录 10-local.conf.example 与 deploy/监控告警.md「安装」）：stage 与生产的
+# 部署用户不同名，硬编码任何一个都会让另一台在安装时被人工改写，仓库与实体随即分叉。
+WorkingDirectory=/opt/lingxi/monitoring
+# 凭据只经 --env-file 指向的 0600 文件读取，不进 ExecStart 命令行。
+# 需要磁盘/负载/采样停更三项阈值告警时，在 drop-in 里覆盖 ExecStart 追加
+# --enable-resource-thresholds（见 deploy/监控告警.md「八、资源与数据库层监控」）。
+ExecStart=/usr/bin/python3 /opt/lingxi/scripts/host_health_alert.py --env-file /opt/lingxi/monitoring/host-monitor.env
+# 小于 timer 的 60s 周期：脚本自带文件锁，超时被杀不会与下一轮重叠。
+TimeoutStartSec=50

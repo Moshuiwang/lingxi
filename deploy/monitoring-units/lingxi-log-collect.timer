@@ -1,0 +1,10 @@
+[Unit]
+Description=每 5 分钟触发一次 Lingxi 容器日志增量收集（Issue #343）
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -5,7 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=wangzhipeng
+# User= 不写在本文件里，由 /etc/systemd/system/<单元名>.service.d/10-local.conf 提供
+# （见同目录 10-local.conf.example）：stage 与生产的部署用户不同名，硬编码任何一个都会
+# 让另一台在安装时被人工改写——2026-09-02 实测两台已因此分叉（报告 R6-D6）。
 WorkingDirectory=/opt/lingxi/scripts/monitoring
 # 凭据只经 EnvironmentFile 注入，文件须 0600，内容只有一行 MONITORING_DSN=...
 # ——独立于业务库凭据的监控库最小权限角色（monitoring_schema.sql
