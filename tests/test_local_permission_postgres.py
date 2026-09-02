@@ -157,6 +157,150 @@ class InsertAndReadBackTests(LocalPermissionOverridePostgresTestCase):
         self.assertEqual(resolved.suppressions, frozenset({("1012", "收入")}))
 
 
+class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
+    """``import_legacy_plan``/``expand_all_scope_group``（rc25 S-1，Issue #540）的真库断言：
+    同事务合成终态 ``pending_action`` + 行、幂等 ``already_present``、「全部」组可整组撤销、
+    新指标补行不复活撤销过的指标。"""
+
+    def _plan(self, pairs=(), all_scope=()):
+        from lingxi.core.permission.legacy_diff import SHAPE_FULL_WILDCARD, SHAPE_SPECIFIC, LegacyImportPlan
+
+        return LegacyImportPlan(
+            shape=SHAPE_FULL_WILDCARD if all_scope else SHAPE_SPECIFIC,
+            pairs=tuple(pairs),
+            all_scope_metrics=tuple(all_scope),
+            skipped_reasons=(),
+            unmapped_companies_kept=0,
+        )
+
+    def _now(self):
+        return datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
+
+    def test_specific_pairs_and_the_all_scope_group_land_in_one_transaction(self) -> None:
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME, IMPORT_REASON, LEGACY_IMPORT_ACTOR
+
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID,
+            target_open_id=TARGET_USER_ID,
+            plan=self._plan(pairs=(("40", "m1"), ("88", "m2")), all_scope=("m1", "m2", "m3")),
+            now=self._now(),
+        )
+
+        self.assertEqual((report.imported, report.already_present, report.group_created), (5, 0, True))
+        self.assertTrue(report.group_id.startswith("lpg_"))
+        rows = self.query(
+            "SELECT company_id, metric_name, reason, initiated_by_open_id, position_name, company_scope,"
+            " permission_group_id, pending_action_id FROM local_permission_override"
+            " WHERE user_id = %s AND entry_status = 'active' ORDER BY company_id, metric_name",
+            (TARGET_USER_ID,),
+        )
+        self.assertEqual([(r[0], r[1]) for r in rows], [("*", "m1"), ("*", "m2"), ("*", "m3"), ("40", "m1"), ("88", "m2")])
+        self.assertTrue(all(r[2] == IMPORT_REASON and r[3] == LEGACY_IMPORT_ACTOR for r in rows))
+        for row in rows:
+            if row[0] == "*":
+                self.assertEqual((row[4], row[5], row[6]), (ALL_SCOPE_POSITION_NAME, "*", report.group_id))
+            else:
+                self.assertEqual((row[4], row[5], row[6]), (None, None, None))
+        pending_ids = {r[7] for r in rows}
+        self.assertEqual(len(pending_ids), 1, "全部行指向同一条合成 pending_action")
+        pending = self.query(
+            "SELECT action_type, status, card_delivered, reason, target_open_id, decided_by_open_id"
+            " FROM pending_action WHERE id = %s",
+            (pending_ids.pop(),),
+        )[0]
+        self.assertEqual(pending, ("local_permission_grant", "executed", False, "legacy_import_2_0", TARGET_USER_ID, LEGACY_IMPORT_ACTOR))
+
+    def test_reimport_is_idempotent_and_leaves_no_orphan_pending_action(self) -> None:
+        plan = self._plan(pairs=(("88", "m2"),), all_scope=("m1",))
+        first = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=plan, now=self._now())
+        second = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=plan, now=self._now())
+
+        self.assertEqual((first.imported, first.already_present), (2, 0))
+        self.assertEqual((second.imported, second.already_present, second.group_created), (0, 2, False))
+        self.assertEqual(second.group_id, first.group_id, "已有「全部」组：沿用组 ID，不建第二组")
+        self.assertEqual(self.query("SELECT count(*) FROM local_permission_override")[0][0], 2)
+        self.assertEqual(self.query("SELECT count(*) FROM pending_action")[0][0], 1, "第二次零写入，不留孤儿终态记录")
+
+    def test_a_partial_reimport_only_adds_the_missing_rows_into_the_same_group(self) -> None:
+        self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1",)), now=self._now()
+        )
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2")), now=self._now()
+        )
+        self.assertEqual((report.imported, report.already_present, report.group_created), (1, 1, False))
+        groups = self.query(
+            "SELECT DISTINCT permission_group_id FROM local_permission_override WHERE user_id = %s", (TARGET_USER_ID,)
+        )
+        self.assertEqual(len(groups), 1)
+
+    def test_the_all_scope_group_can_be_revoked_as_one_unit(self) -> None:
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2")), now=self._now()
+        )
+        ids = tuple(row[0] for row in self.query(
+            "SELECT id FROM local_permission_override WHERE permission_group_id = %s ORDER BY id", (report.group_id,)
+        ))
+        revoke_pending = self.add_pending_action(pending_id=new_id("pac"))
+        self.assertTrue(
+            self.store.revoke_group(
+                permission_group_id=report.group_id,
+                revoked_pending_action_id=revoke_pending,
+                expected_override_ids=ids,
+            )
+        )
+        self.assertEqual(self.store.effective_entries(user_id=TARGET_USER_ID), ())
+
+    def test_expand_adds_only_missing_metrics_and_never_revives_a_revoked_one(self) -> None:
+        report = self.store.import_legacy_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(all_scope=("m1", "m2")), now=self._now()
+        )
+        # 单独撤销 m2 这一行（模拟管理员逐行收回）。
+        m2_id = self.query(
+            "SELECT id FROM local_permission_override WHERE permission_group_id = %s AND metric_name = 'm2'",
+            (report.group_id,),
+        )[0][0]
+        self.assertTrue(self.store.revoke(override_id=m2_id, revoked_pending_action_id=self.add_pending_action(pending_id=new_id("pac"))))
+
+        added = self.store.expand_all_scope_group(
+            user_id=TARGET_USER_ID, group_id=report.group_id, metrics=("m1", "m2", "m3"), now=self._now()
+        )
+
+        self.assertEqual(added, 1, "m1 已有、m2 撤销过不复活，只补 m3")
+        active = sorted(entry.entry.metric_name for entry in self.store.effective_entries(user_id=TARGET_USER_ID))
+        self.assertEqual(active, ["m1", "m3"])
+        new_row = self.query(
+            "SELECT position_name, company_scope, permission_group_id FROM local_permission_override"
+            " WHERE metric_name = 'm3'"
+        )[0]
+        from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME
+
+        self.assertEqual(new_row, (ALL_SCOPE_POSITION_NAME, "*", report.group_id))
+        self.assertEqual(
+            self.query("SELECT reason FROM pending_action ORDER BY created_at DESC, id DESC LIMIT 1")[0][0],
+            "legacy_all_scope_refresh",
+        )
+        self.assertEqual(
+            self.store.expand_all_scope_group(
+                user_id=TARGET_USER_ID, group_id=report.group_id, metrics=("m1", "m2", "m3"), now=self._now()
+            ),
+            0,
+            "再跑一次零写入",
+        )
+
+    def test_expand_for_an_unknown_user_writes_nothing(self) -> None:
+        self.assertEqual(
+            self.store.expand_all_scope_group(user_id="usr_nobody", group_id="lpg_x", metrics=("m1",), now=self._now()),
+            0,
+        )
+        self.assertEqual(self.query("SELECT count(*) FROM pending_action")[0][0], 0)
+
+    def test_an_empty_plan_writes_nothing(self) -> None:
+        report = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(), now=self._now())
+        self.assertEqual((report.imported, report.already_present, report.group_id), (0, 0, None))
+        self.assertEqual(self.query("SELECT count(*) FROM pending_action")[0][0], 0)
+
+
 class DuplicateActiveOverrideTests(LocalPermissionOverridePostgresTestCase):
     """否定断言：迁移 ``0072`` 的部分唯一索引在真库上真实生效。"""
 

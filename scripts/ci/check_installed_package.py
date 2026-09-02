@@ -206,6 +206,11 @@ REQUIRED_MODULES = (
     "lingxi.core.permission.position_override",
     "lingxi.adapters.postgres_local_permission",
     "lingxi.core.permission.merge_sources",
+    # 存量用户首聊差集导入的纯逻辑（rc25 S-1，Issue #540）：开通编排、每日/定向重算
+    # 与本地覆盖适配器都消费它（见下面 scheduler/gateway 闭包）；开通链的两步编排
+    # （翻译一次 + 导入）从 onboarding_runner 拆出（体量棘轮）。
+    "lingxi.core.permission.legacy_diff",
+    "lingxi.core.identity.legacy_permission_import",
     # 权限发布表短期令牌供给（Issue #226）：产品负责人 2026-08-18 裁定方向 3
     # （应用身份 tenant_access_token）。方向无关外壳 table_access_token_supply 与
     # 方向实现 tenant_token_supply 都在 core（不做网络 I/O），真实 HTTP 调用在
@@ -608,6 +613,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.permission.local_override",
             "lingxi.adapters.postgres_local_permission",
             "lingxi.core.permission.merge_sources",
+            # 存量差集导入纯逻辑（rc25 S-1）：`onboarding_runner`/`permission_refresh`/
+            # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
+            "lingxi.core.permission.legacy_diff",
+            "lingxi.core.identity.legacy_permission_import",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
@@ -1047,6 +1056,9 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.galaxy_import",
             "lingxi.core.permission.account_match",
             "lingxi.core.permission.merge_sources",
+            # 存量差集导入纯逻辑（rc25 S-1）：随 `adapters.postgres_local_permission`、
+            # `core.permission.targeted_recompute` 进入 gateway 闭包。
+            "lingxi.core.permission.legacy_diff",
             "lingxi.core.permission.publish_row",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.mcp_readiness",

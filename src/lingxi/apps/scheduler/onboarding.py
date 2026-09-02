@@ -93,7 +93,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
-from lingxi.adapters.postgres_local_permission import local_override_reader
+from lingxi.adapters.postgres_local_permission import (
+    PostgresLocalPermissionOverrideStore,
+    local_override_reader,
+)
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
@@ -842,6 +845,15 @@ def _build_onboarding_duty(
         environment=environment,
         tokens=tokens,
         stock_tokens=stock_tokens,
+        # 存量差集导入口（rc25 S-1，Issue #540）：与存量令牌源**同进同出**——源装了、
+        # 导入口没装时 ``AutoOnboardingRunner`` 构造期直接 ``TypeError``（与
+        # ``full_access_wildcard`` 必填同一条结构性防漏接纪律），不会静默退回
+        # "只复制令牌不读权限"的旧行为。
+        legacy_importer=(
+            PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts)
+            if stock_tokens is not None
+            else None
+        ),
         decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
         readiness=McpReadinessConfirmation(
             probe=guarded_probe,

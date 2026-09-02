@@ -90,6 +90,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
@@ -126,6 +127,9 @@ SKIP_MATCH_FAILED = "match_failed"
 SKIP_ARCHIVED_IDENTITY_INCOMPLETE = "archived_identity_incomplete"
 SKIP_NO_PUBLISHED_ROW = "no_published_row"
 SKIP_LOCAL_OVERRIDE_READ_FAILED = "local_override_read_failed"
+#: 本地「全部」组（rc25 S-1）下某公司被本地抑制减到空：读侧回退制无法表示，本次既不
+#: 发布也不撤权（`merge_sources.py` 「本地 "*" 组」一节）。
+SKIP_SUPPRESSION_UNREPRESENTABLE = "suppression_on_all_scope_unrepresentable"
 #: 落授权决定的那把行锁里发现这个人不是 ``enabled``（Issue #483 缺口②）：本模块的
 #: 身份基线**有意包含** ``suspended``，因此这条跳过是常态出口而不是异常——管理员对
 #: 一个已停用用户做本地权限动作时就会走到这里。与 :data:`SKIP_USER_NOT_ACTIVE`
@@ -207,6 +211,15 @@ class _LocalOverrideReader(Protocol):
     def effective_entries(self, *, user_id: str) -> Sequence[LocalPermissionOverrideEntry]: ...
 
 
+class _LegacyAllScopeExpander(Protocol):
+    """「2.0 迁移导入·全部」组的补行口（rc25 S-1 方案 E），与
+    ``apps/scheduler/permission_refresh.py`` 的同名协议各自独立一份。"""
+
+    def expand_all_scope_group(
+        self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
+    ) -> int: ...
+
+
 class AuditSink(Protocol):
     def record(self, action: str, /, **fields: object) -> None: ...
 
@@ -232,6 +245,7 @@ class TargetedPermissionRecompute:
         audit: AuditSink,
         local_overrides: _LocalOverrideReader | None = None,
         clock: Callable[[], datetime] | None = None,
+        legacy_all_scope: _LegacyAllScopeExpander | None = None,
     ) -> None:
         self._identities = identities
         self._roster_snapshot = roster_snapshot
@@ -242,6 +256,7 @@ class TargetedPermissionRecompute:
         self._metric_translation_map = metric_translation_map
         self._audit = audit
         self._local_overrides = local_overrides
+        self._legacy_all_scope = legacy_all_scope
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     # ------------------------------------------------------------------
@@ -340,6 +355,9 @@ class TargetedPermissionRecompute:
                 user=user_id,
                 reason=reason,
             )
+
+        if merged.unrepresentable_companies:
+            return self._skip(user_id, mode="recompute", reason=SKIP_SUPPRESSION_UNREPRESENTABLE)
 
         if not merged.permissions:
             if not self._publish_history.has_publish_footprint(user_id):
@@ -453,7 +471,46 @@ class TargetedPermissionRecompute:
                 reason=SKIP_LOCAL_OVERRIDE_READ_FAILED,
             )
             return None
+        entries = self._expand_legacy_all_scope(user_id, entries)
         return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _expand_legacy_all_scope(
+        self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
+    ) -> tuple[LocalPermissionOverrideEntry, ...]:
+        """「2.0 迁移导入·全部」组随当前映射补齐新指标（rc25 S-1 方案 E），与每日批
+        ``permission_refresh._expand_legacy_all_scope`` 同一语义：缺才补、同组 ID、只看
+        生效条目；补行或重读失败只审计、不影响本次既有结果。"""
+
+        if self._legacy_all_scope is None:
+            return entries
+        missing = missing_all_scope_metrics(entries, self._metric_translation_map)
+        if not missing:
+            return entries
+        added_total = 0
+        for group_id, metrics in missing.items():
+            try:
+                added = self._legacy_all_scope.expand_all_scope_group(
+                    user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
+                )
+            except Exception as error:  # noqa: BLE001
+                self._audit.record(
+                    "permission_targeted_recompute.legacy_all_scope_refresh_failed",
+                    user=user_id,
+                    error=type(error).__name__,
+                )
+                continue
+            self._audit.record(
+                "permission_targeted_recompute.legacy_all_scope_refreshed",
+                user=user_id,
+                added=added,
+            )
+            added_total += added
+        if added_total == 0:
+            return entries
+        try:
+            return tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception:  # noqa: BLE001
+            return entries
 
     def _skip(
         self, user_id: str, *, mode: str, reason: str, **extra: object

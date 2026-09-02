@@ -245,10 +245,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Protocol
 
-from lingxi.adapters.postgres_local_permission import local_override_reader
+from lingxi.adapters.postgres_local_permission import (
+    PostgresLocalPermissionOverrideStore,
+    local_override_reader,
+)
 from lingxi.core.identity.roster_audit import ArchivedIdentity
 from lingxi.core.identity.roster_snapshot import StoredSnapshotFacts
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account
+from lingxi.core.permission.legacy_diff import missing_all_scope_metrics
 from lingxi.core.permission.local_override import (
     LocalPermissionOverrideEntry,
     ResolvedLocalOverrides,
@@ -351,6 +355,9 @@ SKIP_METRIC_TRANSLATION_UNCOVERED = "metric_translation_uncovered"
 #: 从审计上看出"今天真的发生过一次这样的交错"。上线后第一轮批处理应当回看这条计数，
 #: 正常为 0。
 SKIP_ACCOUNT_NOT_ENABLED = "account_not_enabled"
+#: 本地「全部」组（rc25 S-1）下某公司被本地抑制减到空：读侧回退制无法表示，本轮既不
+#: 发布也不撤权（`merge_sources.py` 「本地 "*" 组」一节；要完全屏蔽该公司先撤组）。
+SKIP_SUPPRESSION_UNREPRESENTABLE = "suppression_on_all_scope_unrepresentable"
 
 #: 逐用户结果的四个分类。``granted`` 之外的三类都**不产生任何发布意图**。
 STAGE_MATCH = "match"
@@ -500,6 +507,17 @@ class _DecisionStore(Protocol):
     ) -> _Decision: ...
 
 
+class _LegacyAllScopeExpander(Protocol):
+    """「2.0 迁移导入·全部」组的补行口（rc25 S-1 方案 E）：新指标进入映射后，每日重算
+    把 ``missing_all_scope_metrics`` 算出的缺项按同组 ID 追加成行。实现见
+    ``adapters/postgres_local_permission.PostgresLocalPermissionOverrideStore.
+    expand_all_scope_group``；``None``＝未装配，行为与接线前逐字节一致。"""
+
+    def expand_all_scope_group(
+        self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
+    ) -> int: ...
+
+
 class _LocalOverrideReader(Protocol):
     """本地权限覆盖的按用户读取口（S-P-3，Issue #319）。
 
@@ -631,6 +649,7 @@ class PermissionRefreshDuty:
         clock: Callable[[], datetime] | None = None,
         stop: threading.Event | None = None,
         local_overrides: _LocalOverrideReader | None = None,
+        legacy_all_scope: _LegacyAllScopeExpander | None = None,
     ) -> None:
         self._baseline_reader = baseline_reader
         self._roster_snapshot = roster_snapshot
@@ -646,6 +665,8 @@ class PermissionRefreshDuty:
         # 一节旁的「本地覆盖」小节 :func:`merge_permission_sources` 对 ``local=None``
         # 恒等的性质）。装配层的真实实现见 ``apps/scheduler/assembly.py``。
         self._local_overrides = local_overrides
+        # 「全部」组补行口（rc25 S-1 方案 E）：``None``＝未装配，不补行。
+        self._legacy_all_scope = legacy_all_scope
         # 时钟注入：跨轮判重与"今天"的用例要能自己决定日期，不能靠等到明天。
         self._clock = clock or (lambda: datetime.now(_UTC))
         # 与同一进程内的其他职责共享停止标志：SIGTERM 一次让所有职责停止领取新工作。
@@ -897,6 +918,10 @@ class PermissionRefreshDuty:
                 reason=reason,
             )
 
+        if merged.unrepresentable_companies:
+            self._skip(tally, identity, STAGE_AGGREGATE, SKIP_SUPPRESSION_UNREPRESENTABLE, revoked=False)
+            return
+
         if not merged.permissions:
             # 红线-2（Trace #328 opus 审查）：银河这一侧原本是有效授权
             # （company_metrics 非空，翻译已经成功），但本地抑制把合并结果压光到
@@ -973,6 +998,10 @@ class PermissionRefreshDuty:
                 user=identity.app_user_id,
                 reason=reason,
             )
+
+        if merged.unrepresentable_companies:
+            self._skip(tally, identity, STAGE_AGGREGATE, SKIP_SUPPRESSION_UNREPRESENTABLE, revoked=False)
+            return
 
         if not merged.permissions:
             # 既无银河也无本地授权（或本地授权已被同键抑制清空）：维持现行撤权
@@ -1101,7 +1130,44 @@ class PermissionRefreshDuty:
             if raise_on_failure:
                 raise _LocalOverrideReadFailed() from error
             return None
+        entries = self._expand_legacy_all_scope(user_id, entries)
         return resolve_local_overrides(user_id=user_id, entries=entries)
+
+    def _expand_legacy_all_scope(
+        self, user_id: str, entries: tuple[LocalPermissionOverrideEntry, ...]
+    ) -> tuple[LocalPermissionOverrideEntry, ...]:
+        """「2.0 迁移导入·全部」组随当前映射补齐新指标（rc25 S-1 方案 E）：缺才补、
+        同组 ID、撤销过的组不参与（只看生效条目）；补行成功后重读一次条目让本轮合并
+        直接带上新行，补行或重读失败都只审计、不影响本轮既有结果。"""
+
+        if self._legacy_all_scope is None:
+            return entries
+        missing = missing_all_scope_metrics(entries, self._metric_translation_map)
+        if not missing:
+            return entries
+        added_total = 0
+        for group_id, metrics in missing.items():
+            try:
+                added = self._legacy_all_scope.expand_all_scope_group(
+                    user_id=user_id, group_id=group_id, metrics=metrics, now=self._clock()
+                )
+            except Exception as error:  # noqa: BLE001 - 补行失败不影响本轮既有合并
+                self._audit.record(
+                    "permission_refresh.legacy_all_scope_refresh_failed",
+                    user=user_id,
+                    error=type(error).__name__,
+                )
+                continue
+            self._audit.record(
+                "permission_refresh.legacy_all_scope_refreshed", user=user_id, added=added
+            )
+            added_total += added
+        if added_total == 0:
+            return entries
+        try:
+            return tuple(self._local_overrides.effective_entries(user_id=user_id))
+        except Exception:  # noqa: BLE001 - 重读失败：新行下一轮自然生效
+            return entries
 
     def _revoke(
         self,
@@ -1367,6 +1433,9 @@ def _build_permission_refresh_duty(
         metric_translation_map=metric_translation_map,
         audit=audit,
         stop=stop, local_overrides=local_override_reader(config.postgres_dsn, timeouts=config.postgres_timeouts),
+        legacy_all_scope=PostgresLocalPermissionOverrideStore(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
     )
     return duty, metric_translation_map
 

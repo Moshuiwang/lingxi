@@ -131,30 +131,33 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from lingxi.core.permission.account_match import MATCHED, match_galaxy_account, normalize_email
+from lingxi.core.permission.legacy_diff import (
+    IMPORT_REASON,
+    PENDING_ACTION_REASON,
+    SHAPE_SPECIFIC,
+    LegacyImportPlan,
+    compute_company_diff,
+)
 from lingxi.core.permission.metric_translation import (
     UncoveredPermissionCombination,
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import ALL_COMPANIES_KEY, aggregate_permission, parse_permissions
 
-#: local_permission_override.reason（迁移 0072 列）——每一行导入产生的授权
-#: 用这句话标注来源，供管理员在 `/admin user` 回显里一眼分辨。
-IMPORT_REASON = "2.0 迁移导入"
-
-#: 合成 pending_action.reason（迁移 0068 列，与上面的 local_permission_override.
-#: reason 是两张表的两个不同字段）——标注这是批量导入产生的终态记录，不是一次
-#: 真实的管理员确认卡点击。
-PENDING_ACTION_REASON = "legacy_import_2_0"
+# ``IMPORT_REASON``/``PENDING_ACTION_REASON``/``compute_company_diff`` 自 rc25 S-1
+# （Issue #540）起住在 ``core/permission/legacy_diff.py``——首聊自动路径与本脚本共用
+# 同一份差集口径与同一个落库方法（``PostgresLocalPermissionOverrideStore.
+# import_legacy_plan``），本脚本只保留 CLI、旧表导出解析与 dry-run 编排。上面的
+# 三个名字仍从本模块可见（既有测试与文档按此引用）。
 
 #: 与 core/admin/pending_action.py 的 PendingActionType.LOCAL_PERMISSION_GRANT
 #: 取值逐字相同——两处不互相 import（该模块在 core/，本脚本不受三层 import
@@ -197,30 +200,6 @@ class ImportPlan:
 
     grants: tuple[PlannedGrant, ...]
     skipped: tuple[SkippedUser, ...]
-
-
-def compute_company_diff(
-    legacy: Mapping[str, Sequence[str]], galaxy_current: Mapping[str, Sequence[str]]
-) -> dict[str, tuple[str, ...]]:
-    """按公司键计算「旧表 − 银河当前能给的」差集，减到空的公司键整体丢弃
-    （不产出空列表——与 :mod:`lingxi.core.permission.merge_sources`「空结果」
-    一节同一姿态）。
-
-    ``galaxy_current`` 出现 :data:`~lingxi.core.permission.publish_row.
-    ALL_COMPANIES_KEY`（513 通配管理员）时，视为银河已经覆盖旧表可能给出的
-    任何具体公司权限，整份差集恒为空——往通配之外再叠一层具体公司键，是已退役
-    的存量沿用机制在通配下会犯的同一个错误（`merge_sources.py` 模块文档
-    「通配角」一节），这里从一开始就不让它发生。
-    """
-
-    if ALL_COMPANIES_KEY in galaxy_current:
-        return {}
-    result: dict[str, tuple[str, ...]] = {}
-    for company_id, metrics in legacy.items():
-        remaining = set(metrics) - set(galaxy_current.get(company_id, ()))
-        if remaining:
-            result[company_id] = tuple(sorted(remaining))
-    return result
 
 
 @dataclass(frozen=True)
@@ -515,78 +494,44 @@ def apply_grant(
     处理的部分，已提交的行不需要重跑）。
 
     先查是否已有同键生效行（幂等的快路径，命中就直接返回，什么都不写）；
-    未命中才依次插入合成的 ``pending_action`` 终态行与
-    ``local_permission_override`` 行（模块文档「确认卡与 pending_action」
+    未命中才委托 ``PostgresLocalPermissionOverrideStore.import_legacy_plan``（rc25
+    S-1 起与首聊自动路径同一份落库方法）在同一事务里插入合成的 ``pending_action``
+    终态行与 ``local_permission_override`` 行（模块文档「确认卡与 pending_action」
     一节）。返回 ``True`` 表示这次真的新写入了一行，``False`` 表示该键已经
-    存在——包括这次检查之后、真正插入之前撞上数据库唯一索引这个极小概率窗口：
-    :class:`~lingxi.adapters.postgres_local_permission.DuplicateActiveOverride`
-    从这条连接的事务里冒泡出去时，``with connect(...) as connection`` 按
-    psycopg 既定语义整体回滚（与 :meth:`~.insert` 让同一异常直接冒泡出连接
-    作用域同一姿态），因此半路失败的这两条 ``INSERT`` 不会留下一个没有对应
-    ``local_permission_override`` 行的孤儿 ``pending_action``；本函数在这里
-    捕获这同一个异常，只是为了把它降级成"已存在"，不让它中断整批导入的循环。
+    存在——包括这次检查之后、真正插入之前撞上数据库唯一索引这个极小概率窗口
+    （该方法用 SAVEPOINT 把它降级成"已存在"，并回收刚合成的 ``pending_action``，
+    不留孤儿终态记录）。
     """
 
     from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, connect
-    from lingxi.adapters.postgres_local_permission import DuplicateActiveOverride, _insert_locked
-    from lingxi.core.ids import new_id
-    from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+    from lingxi.adapters.postgres_local_permission import PostgresLocalPermissionOverrideStore
 
-    payload = json.dumps(
-        {"company_id": grant.company_id, "metric_name": grant.metric_name, "reason": IMPORT_REASON},
-        ensure_ascii=False,
+    resolved_timeouts = timeouts or DEFAULT_POSTGRES_TIMEOUTS
+    with connect(dsn, timeouts=resolved_timeouts) as connection, connection.cursor() as cursor:
+        if _existing_active_grant(
+            cursor,
+            user_id=grant.user_id,
+            company_id=grant.company_id,
+            metric_name=grant.metric_name,
+        ):
+            return False
+    # rc25 S-1（Issue #540）：落库委托给首聊自动路径同一个方法——合成终态
+    # ``pending_action`` + 本地覆盖行同事务，撞索引降级为已存在，全仓库只有一份写法。
+    plan = LegacyImportPlan(
+        shape=SHAPE_SPECIFIC,
+        pairs=((grant.company_id, grant.metric_name),),
+        all_scope_metrics=(),
+        skipped_reasons=(),
+        unmapped_companies_kept=0,
     )
-    pending_id = new_id("pac")
-    override_id = new_id("lpo")
-    confirm_deadline_at = now + timedelta(seconds=1)
-
-    try:
-        with connect(dsn, timeouts=timeouts or DEFAULT_POSTGRES_TIMEOUTS) as connection:
-            with connection.cursor() as cursor:
-                if _existing_active_grant(
-                    cursor,
-                    user_id=grant.user_id,
-                    company_id=grant.company_id,
-                    metric_name=grant.metric_name,
-                ):
-                    return False
-                cursor.execute(
-                    """
-                    INSERT INTO pending_action
-                        (id, action_type, target_open_id, target_state_snapshot,
-                         initiated_by_open_id, status, card_delivered, reason,
-                         created_at, confirm_deadline_at, decided_at, decided_by_open_id,
-                         payload)
-                    VALUES (%s, %s, %s, %s, %s, 'executed', FALSE, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        pending_id,
-                        ACTION_TYPE_GRANT,
-                        grant.feishu_open_id,
-                        "absent",
-                        initiated_by_open_id,
-                        PENDING_ACTION_REASON,
-                        now,
-                        confirm_deadline_at,
-                        now,
-                        initiated_by_open_id,
-                        payload,
-                    ),
-                )
-                entry = LocalPermissionOverrideEntry(
-                    user_id=grant.user_id,
-                    direction=OverrideDirection.GRANT,
-                    company_id=grant.company_id,
-                    metric_name=grant.metric_name,
-                    reason=IMPORT_REASON,
-                    initiated_by_open_id=initiated_by_open_id,
-                    pending_action_id=pending_id,
-                    created_at=now,
-                )
-                _insert_locked(cursor, override_id=override_id, entry=entry)
-    except DuplicateActiveOverride:
-        return False
-    return True
+    report = PostgresLocalPermissionOverrideStore(dsn, timeouts=resolved_timeouts).import_legacy_plan(
+        user_id=grant.user_id,
+        target_open_id=grant.feishu_open_id,
+        plan=plan,
+        now=now,
+        initiated_by_open_id=initiated_by_open_id,
+    )
+    return report.imported == 1
 
 
 # ---------------------------------------------------------------------------

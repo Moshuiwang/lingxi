@@ -46,12 +46,28 @@ S-P-1b 落地后，``adapters/postgres_pending_action.py`` 的 ``_confirm_locked
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.core.ids import new_id
+from lingxi.core.permission.legacy_diff import (
+    ALL_COMPANIES_KEY,
+    ALL_SCOPE_POSITION_NAME,
+    ALL_SCOPE_REFRESH_REASON,
+    IMPORT_REASON,
+    LEGACY_IMPORT_ACTOR,
+    PENDING_ACTION_REASON,
+    LegacyImportPlan,
+    LegacyImportReport,
+)
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+
+#: 与 ``core/admin/pending_action.PendingActionType.LOCAL_PERMISSION_GRANT`` 取值逐字
+#: 相同（本模块不 import ``core/admin``，字面量独立登记，同 ``scripts/ops`` 的既有姿态）。
+_ACTION_TYPE_GRANT = "local_permission_grant"
 
 
 class LocalOverrideEntryReader:
@@ -364,6 +380,240 @@ class PostgresLocalPermissionOverrideStore:
                 moment=moment,
                 expected_override_ids=expected_override_ids,
             )
+
+
+    def import_legacy_plan(
+        self,
+        *,
+        user_id: str,
+        target_open_id: str,
+        plan: LegacyImportPlan,
+        now: datetime,
+        initiated_by_open_id: str = LEGACY_IMPORT_ACTOR,
+    ) -> LegacyImportReport:
+        """存量差集导入的唯一落库口（rc25 S-1，Issue #540；``scripts/ops/
+        import_local_permission_override.py`` 的 ``apply_grant`` 委托同一方法）。
+
+        **每用户一事务**：先一次查出该用户全部生效 grant 行算出真正缺的键；一条都不缺
+        直接返回（零写入）；否则在同一事务里合成一条**已终态**的 ``pending_action``
+        （``action_type='local_permission_grant'``、``status='executed'``、
+        ``card_delivered=FALSE`` 如实反映从未发过卡片、``reason='legacy_import_2_0'``、
+        ``target_state_snapshot='absent'``）并逐行插入；具体公司行无组，「全部」组
+        （``company_id="*"``）共享同一 ``lpg_`` 组 ID——已有生效的「全部」组则沿用其
+        组 ID 补缺行，不建第二组。逐行用 SAVEPOINT 包住：并发撞上迁移 ``0072`` 的部分
+        唯一索引时降级为 ``already_present``，不让整批回滚；最终一行都没新增时删掉
+        刚合成的 ``pending_action``，不留孤儿终态记录。任何其他异常原样上抛，事务整体
+        回滚——调用方按本侧故障 fail-closed。
+        """
+
+        pairs = tuple(plan.pairs)
+        group_metrics = tuple(plan.all_scope_metrics)
+        if not pairs and not group_metrics:
+            return LegacyImportReport(imported=0, already_present=0)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT company_id, metric_name, permission_group_id, position_name"
+                " FROM local_permission_override"
+                " WHERE user_id = %s AND direction = %s AND entry_status = 'active'",
+                (user_id, OverrideDirection.GRANT.value),
+            )
+            existing: dict[tuple[str, str], tuple[str | None, str | None]] = {
+                (company, metric): (group, position)
+                for company, metric, group, position in cursor.fetchall()
+            }
+            existing_group: str | None = None
+            for (company, _metric), (group, position) in existing.items():
+                if company == ALL_COMPANIES_KEY and position == ALL_SCOPE_POSITION_NAME and group:
+                    existing_group = group
+                    break
+            missing_pairs = [pair for pair in pairs if pair not in existing]
+            missing_group = [metric for metric in group_metrics if (ALL_COMPANIES_KEY, metric) not in existing]
+            already_present = (len(pairs) - len(missing_pairs)) + (len(group_metrics) - len(missing_group))
+            if not missing_pairs and not missing_group:
+                return LegacyImportReport(
+                    imported=0, already_present=already_present, group_id=existing_group
+                )
+
+            group_id = existing_group if existing_group else (new_id("lpg") if missing_group else None)
+            pending_id = _insert_synthetic_pending_action(
+                cursor,
+                target_open_id=target_open_id,
+                initiated_by_open_id=initiated_by_open_id,
+                reason=PENDING_ACTION_REASON,
+                moment=now,
+                payload={
+                    "legacy_import_2_0": {
+                        "shape": plan.shape,
+                        "specific_pairs": [list(pair) for pair in missing_pairs],
+                        "all_scope_metrics": list(missing_group),
+                        "permission_group_id": group_id,
+                    },
+                    "reason": IMPORT_REASON,
+                },
+            )
+            imported = 0
+            for company, metric in missing_pairs:
+                entry = LocalPermissionOverrideEntry(
+                    user_id=user_id,
+                    direction=OverrideDirection.GRANT,
+                    company_id=company,
+                    metric_name=metric,
+                    reason=IMPORT_REASON,
+                    initiated_by_open_id=initiated_by_open_id,
+                    pending_action_id=pending_id,
+                    created_at=now,
+                )
+                if _insert_with_savepoint(cursor, entry):
+                    imported += 1
+                else:
+                    already_present += 1
+            for metric in missing_group:
+                entry = LocalPermissionOverrideEntry(
+                    user_id=user_id,
+                    direction=OverrideDirection.GRANT,
+                    company_id=ALL_COMPANIES_KEY,
+                    metric_name=metric,
+                    reason=IMPORT_REASON,
+                    initiated_by_open_id=initiated_by_open_id,
+                    pending_action_id=pending_id,
+                    created_at=now,
+                    position_name=ALL_SCOPE_POSITION_NAME,
+                    company_scope=ALL_COMPANIES_KEY,
+                    permission_group_id=group_id,
+                )
+                if _insert_with_savepoint(cursor, entry):
+                    imported += 1
+                else:
+                    already_present += 1
+            if imported == 0:
+                cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
+                return LegacyImportReport(
+                    imported=0, already_present=already_present, group_id=existing_group
+                )
+            return LegacyImportReport(
+                imported=imported,
+                already_present=already_present,
+                group_id=group_id if (missing_group or existing_group) else None,
+                group_created=bool(missing_group) and existing_group is None,
+            )
+
+    def expand_all_scope_group(
+        self, *, user_id: str, group_id: str, metrics: Sequence[str], now: datetime
+    ) -> int:
+        """新指标进入映射后给「全部」组补缺行（rc25 S-1 方案 E；调用方是每日重算与
+        定向重算，缺项由 ``core/permission/legacy_diff.missing_all_scope_metrics`` 算出）。
+
+        只加不减；同组同指标**任何状态**（含 ``revoked``）已有行都不再插入——管理员
+        单独撤销过的指标不复活。合成一条已终态 ``pending_action``
+        （``reason='legacy_all_scope_refresh'``），目标 open_id 从 ``app_user`` 现读；
+        用户不存在或一行都没新增时零写入。返回实际新增行数。
+        """
+
+        wanted = tuple(dict.fromkeys(metric for metric in metrics if metric))
+        if not group_id or not wanted:
+            return 0
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT feishu_open_id FROM app_user WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            if row is None or not row[0]:
+                return 0
+            target_open_id = str(row[0])
+            cursor.execute(
+                "SELECT metric_name FROM local_permission_override"
+                " WHERE user_id = %s AND permission_group_id = %s AND company_id = %s",
+                (user_id, group_id, ALL_COMPANIES_KEY),
+            )
+            seen = {str(item[0]) for item in cursor.fetchall()}
+            missing = [metric for metric in wanted if metric not in seen]
+            if not missing:
+                return 0
+            pending_id = _insert_synthetic_pending_action(
+                cursor,
+                target_open_id=target_open_id,
+                initiated_by_open_id=LEGACY_IMPORT_ACTOR,
+                reason=ALL_SCOPE_REFRESH_REASON,
+                moment=now,
+                payload={
+                    "legacy_all_scope_refresh": {
+                        "permission_group_id": group_id,
+                        "all_scope_metrics": list(missing),
+                    },
+                    "reason": IMPORT_REASON,
+                },
+            )
+            added = 0
+            for metric in missing:
+                entry = LocalPermissionOverrideEntry(
+                    user_id=user_id,
+                    direction=OverrideDirection.GRANT,
+                    company_id=ALL_COMPANIES_KEY,
+                    metric_name=metric,
+                    reason=IMPORT_REASON,
+                    initiated_by_open_id=LEGACY_IMPORT_ACTOR,
+                    pending_action_id=pending_id,
+                    created_at=now,
+                    position_name=ALL_SCOPE_POSITION_NAME,
+                    company_scope=ALL_COMPANIES_KEY,
+                    permission_group_id=group_id,
+                )
+                if _insert_with_savepoint(cursor, entry):
+                    added += 1
+            if added == 0:
+                cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
+            return added
+
+
+def _insert_synthetic_pending_action(
+    cursor,
+    *,
+    target_open_id: str,
+    initiated_by_open_id: str,
+    reason: str,
+    moment: datetime,
+    payload: dict,
+) -> str:
+    """在调用方事务内插入一条**已终态**的合成 ``pending_action``（迁移 ``0072`` 的
+    ``pending_action_id NOT NULL`` 外键要求每一行本地覆盖都指向一次确认动作；批量导入
+    没有真实卡片，``card_delivered=FALSE`` 如实反映这一点）。返回其 ID。"""
+
+    pending_id = new_id("pac")
+    cursor.execute(
+        """
+        INSERT INTO pending_action
+            (id, action_type, target_open_id, target_state_snapshot,
+             initiated_by_open_id, status, card_delivered, reason,
+             created_at, confirm_deadline_at, decided_at, decided_by_open_id, payload)
+        VALUES (%s, %s, %s, %s, %s, 'executed', FALSE, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            pending_id,
+            _ACTION_TYPE_GRANT,
+            target_open_id,
+            "absent",
+            initiated_by_open_id,
+            reason,
+            moment,
+            moment + timedelta(seconds=1),
+            moment,
+            initiated_by_open_id,
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+    return pending_id
+
+
+def _insert_with_savepoint(cursor, entry: LocalPermissionOverrideEntry) -> bool:
+    """SAVEPOINT 包住一次 :func:`_insert_locked`：撞唯一索引回滚到保存点、返回
+    ``False``（已存在），事务其余部分不受影响。"""
+
+    cursor.execute("SAVEPOINT legacy_override_row")
+    try:
+        _insert_locked(cursor, override_id=new_id("lpo"), entry=entry)
+    except DuplicateActiveOverride:
+        cursor.execute("ROLLBACK TO SAVEPOINT legacy_override_row")
+        return False
+    cursor.execute("RELEASE SAVEPOINT legacy_override_row")
+    return True
 
 
 def _insert_locked(cursor, *, override_id: str, entry: LocalPermissionOverrideEntry) -> None:
