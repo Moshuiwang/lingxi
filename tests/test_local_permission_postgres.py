@@ -276,9 +276,11 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
         from lingxi.core.permission.legacy_diff import ALL_SCOPE_POSITION_NAME
 
         self.assertEqual(new_row, (ALL_SCOPE_POSITION_NAME, "*", report.group_id))
+        # 按 reason 计数而不是取「最新一条」：撤销用的桩 pending_action 用的是真实
+        # 时钟，补行用的是固定时刻，两者先后随运行时刻变化（CI 实测踩过）。
         self.assertEqual(
-            self.query("SELECT reason FROM pending_action ORDER BY created_at DESC, id DESC LIMIT 1")[0][0],
-            "legacy_all_scope_refresh",
+            self.query("SELECT count(*) FROM pending_action WHERE reason = %s", ("legacy_all_scope_refresh",))[0][0],
+            1,
         )
         self.assertEqual(
             self.store.expand_all_scope_group(
