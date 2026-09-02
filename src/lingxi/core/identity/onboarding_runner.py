@@ -169,6 +169,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -620,12 +621,10 @@ class AutoOnboardingRunner:
             terminal = _internal(error.code)
         except Exception as error:  # noqa: BLE001 - 未预料的失败也必须有用户结论
             self._audit.record(
-                "onboarding.chain_failed",
-                event_id=event_id,
-                error=type(error).__name__,
-                trace_id=trace_id,
+                "onboarding.chain_failed", event_id=event_id, error=type(error).__name__, trace_id=trace_id
             )
-            logger.exception("首次开通编排未预料的失败 event=%s", event_id)
+            # C-6：`logger.exception` 连异常正文一起记，psycopg 唯一键冲突正文带着真实 open_id（违 V-花名册-33）；只记类型名与调用栈帧。本行刻意压成单行，见 tests/test_log_exception_body_leak.py。
+            logger.error("首次开通编排未预料的失败 event=%s error=%s\n调用栈（不含异常正文）：\n%s", event_id, type(error).__name__, "".join(traceback.format_tb(error.__traceback__)))
             terminal = _internal(f"unexpected_{type(error).__name__}")
 
         self._audit.record(

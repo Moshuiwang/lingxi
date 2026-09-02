@@ -260,6 +260,142 @@ class VaultSaveArgumentGuardTest(unittest.TestCase):
         self.assertIs(parameters["for_supply"].default, False, "默认必须是到期驱动的那条路径")
 
 
+class UndecryptableCredentialFileTest(unittest.TestCase):
+    """对抗审查 2026-09-02 C-2：主密钥配错**不得**删掉凭据文件。
+
+    这条**不需要数据库**，而且"不需要"本身就是被测的性质：修好的实现在解密失败
+    那一刻就返回，根本走不到主体核对（唯一要连库的一步）。因此这里用一个故意
+    不可达的 DSN——一旦有人把"先判解密"挪回"先判主体"之后，这条用例会因为连不上
+    ``.invalid`` 而**响亮失败**，而不是安静地变成一条"看起来通过了"的用例。
+
+    被防的事故形状：scheduler 与 reauthorize 两侧的
+    ``LINGXI_DELEGATED_CREDENTIAL_KEY`` 不一致时，轮换扫描会把"解不开"读成
+    "文件主体与登记不一致"并 ``unlink`` 掉密文——一次性 ``refresh_token`` 就此
+    永久丢失，把密钥改回正确值也救不回来，只能请产品负责人重新走一次 OAuth Bridge
+    授权。删是不可逆的，留是可逆的。
+    """
+
+    UNREACHABLE_DSN = "postgresql://lingxi-guard-test.invalid:1/never-reached"
+
+    def _vault_and_path(self, key: str):
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "delegated-credential.enc"
+        return HostFileDelegatedCredentialVault(self.UNREACHABLE_DSN, key, str(path)), path
+
+    @staticmethod
+    def _ciphertext(key: str, payload: dict) -> bytes:
+        import json
+
+        from cryptography.fernet import Fernet
+
+        return Fernet(key.encode()).encrypt(json.dumps(payload).encode())
+
+    def _valid_payload(self) -> dict:
+        moment = datetime.now(timezone.utc)
+        return {
+            "generation": "01JCREDENTIALGENERATION0001",
+            "subject_open_id": "ou_delegated_authorization_subject",
+            "refresh_token": FAKE_TOKEN,
+            "scope": "offline_access",
+            "issued_at": moment.isoformat(),
+            "refresh_at": (moment + timedelta(days=5)).isoformat(),
+            "expires_at": (moment + timedelta(days=7)).isoformat(),
+            "consumed_at": None,
+            "refresh_consumed_at": None,
+            "refresh_consumed_count": 0,
+        }
+
+    def test_reading_with_the_wrong_master_key_keeps_the_file_byte_for_byte(self) -> None:
+        from cryptography.fernet import Fernet
+
+        writing_key = Fernet.generate_key().decode()
+        reading_key = Fernet.generate_key().decode()
+        vault, path = self._vault_and_path(reading_key)
+        ciphertext = self._ciphertext(writing_key, self._valid_payload())
+        path.write_bytes(ciphertext)
+
+        # 两条读取路径都不得删文件，也都不得连库（DSN 不可达即证）。
+        self.assertIsNone(vault.load(), "解不开时不得返回凭据")
+        self.assertIsNone(vault.claim_due(), "解不开时不得领取")
+
+        self.assertTrue(path.exists(), "主密钥配错不得删除凭据文件")
+        self.assertEqual(path.read_bytes(), ciphertext, "密文必须字节不变")
+
+    def test_the_right_key_still_reads_the_same_file_afterwards(self) -> None:
+        """"留着"的意义在于可恢复：密钥换回来，同一份文件照常可用。"""
+
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        wrong_vault, path = self._vault_and_path(Fernet.generate_key().decode())
+        path.write_bytes(self._ciphertext(key, self._valid_payload()))
+
+        self.assertIsNone(wrong_vault.load())
+        self.assertTrue(path.exists())
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        # 换成配对的密钥后能真的解开——用 `_read_payload` 断言到 payload 级别，
+        # `load()` 那一步要连库核对主体，本用例刻意不提供数据库。
+        right_vault = HostFileDelegatedCredentialVault(self.UNREACHABLE_DSN, key, str(path))
+        payload = right_vault._read_payload()
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["subject_open_id"], "ou_delegated_authorization_subject")
+
+    def test_a_corrupt_file_is_reported_as_undecryptable_not_as_an_empty_payload(self) -> None:
+        """哨兵与"解开了、内容为空"必须分得开——同形正是 C-2 的根因。"""
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import UNDECRYPTABLE
+
+        key = Fernet.generate_key().decode()
+        vault, path = self._vault_and_path(key)
+
+        path.write_bytes(b"\x01\x02broken")
+        self.assertIs(vault._read_payload(), UNDECRYPTABLE)
+
+        # 没有文件 / 空文件仍然是 None，不能被哨兵吞掉。
+        path.unlink()
+        self.assertIsNone(vault._read_payload())
+        path.write_bytes(b"")
+        self.assertIsNone(vault._read_payload())
+
+        # 真的空 payload 仍然是 dict：它才是"解开了、但什么都没有"。
+        path.write_bytes(self._ciphertext(key, {}))
+        self.assertEqual(vault._read_payload(), {})
+
+    def test_write_and_targeted_revoke_paths_also_refuse_to_touch_the_file(self) -> None:
+        """代际判据同样读不出来：写回与定向撤销都必须放弃，且都不删文件。"""
+
+        from cryptography.fernet import Fernet
+
+        writing_key = Fernet.generate_key().decode()
+        vault, path = self._vault_and_path(Fernet.generate_key().decode())
+        ciphertext = self._ciphertext(writing_key, self._valid_payload())
+        path.write_bytes(ciphertext)
+
+        self.assertFalse(
+            vault.save(
+                subject_open_id="ou_delegated_authorization_subject",
+                grant=AuthorizationGrant(SecretToken(FAKE_TOKEN), 3600, ""),
+                replacing_generation="01JCREDENTIALGENERATION0001",
+            ),
+            "代际核对不了就不得覆盖",
+        )
+        self.assertFalse(
+            vault.revoke(reason="test", generation="01JCREDENTIALGENERATION0001"),
+            "代际核对不了就不得定向撤销",
+        )
+        self.assertFalse(vault.revoke_stale_consumed(), "读不出消费时刻就不得收殓")
+
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), ciphertext, "四条路径都不得改动密文")
+
+
 class ConsumptionMomentConversionTest(unittest.TestCase):
     """每日上界读取消费时刻的换算本体（O6②）。
 

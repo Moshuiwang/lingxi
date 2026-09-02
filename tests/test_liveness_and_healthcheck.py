@@ -720,3 +720,124 @@ class HealthcheckFreeSpaceTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             self.assertIn("可用空间", err.getvalue())
+
+
+class HealthcheckPidsTests(unittest.TestCase):
+    """cgroup ``pids`` 配额判据（对抗审查 2026-09-02 R6-D3）。
+
+    ``deploy/compose.yaml`` 给六个服务都设了 ``pids`` 上限，但健康检查的三段判定里
+    没有任何一段看它。打满之后的现场极难认：``docker exec`` 仍然进得去、健康检查
+    一路报绿——它自己不 fork；而 worker 起 Claude CLI 与 MCP 子进程直接失败，用户
+    的每一个任务都失败，监控上什么都看不出来。与 Issue #494 那次"盘满但探针照样
+    成功"是同一个形状的假绿。
+
+    真实容器复现（2026-09-02，本机 Docker，用完即删）：``--pids-limit 4`` 起
+    ``python:3.12-slim`` 只读挂载 ``src/``，撑到 ``pids.current=4`` 时
+    ``_check_pids`` 判红；同样 4 个进程在 ``--pids-limit 100`` 下判绿。
+    下面的用例是同一判据的可回归形态。
+    """
+
+    def _cgroup(self, current: str, limit: str) -> tuple[tuple[Path, Path], ...]:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        (directory / "pids.current").write_text(current, encoding="utf-8")
+        (directory / "pids.max").write_text(limit, encoding="utf-8")
+        return ((directory / "pids.current", directory / "pids.max"),)
+
+    def test_at_the_limit_the_check_turns_red(self) -> None:
+        with self.assertRaises(healthcheck.HealthcheckError) as raised:
+            healthcheck._check_pids("worker-queue", cgroup_paths=self._cgroup("512", "512"))
+
+        message = str(raised.exception)
+        self.assertIn("512", message)
+        self.assertIn("子进程", message, "错误文本要说清后果，不能只报一个数字")
+
+    def test_the_threshold_is_a_ratio_so_it_scales_with_each_service_limit(self) -> None:
+        """比例而不是固定条数：六个服务的 pids 上限本来就各不相同。"""
+
+        for current, limit, expect_red in (
+            ("461", "512", True),  # 90.0%
+            ("460", "512", False),  # 89.8%
+            ("4", "4", True),  # 真实容器复现用的那一档
+            ("3", "4", False),  # 75%
+        ):
+            with self.subTest(current=current, limit=limit):
+                paths = self._cgroup(current, limit)
+                if expect_red:
+                    with self.assertRaises(healthcheck.HealthcheckError):
+                        healthcheck._check_pids("worker-queue", cgroup_paths=paths)
+                else:
+                    healthcheck._check_pids("worker-queue", cgroup_paths=paths)
+
+    def test_no_cgroup_means_skip_not_red(self) -> None:
+        """非容器环境（开发机、CI、本文件自己）读不到 cgroup 时必须跳过。
+
+        把"没有 cgroup"判成不健康不是判据，是噪声——它会让每一次本机运行都红。
+        这与可用空间那段对 ``statvfs`` 失败判红的取舍**刻意不同**：临时目录是每个
+        角色都必然存在的东西，cgroup pids 控制器在容器外根本不存在。
+        """
+
+        missing = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(missing, ignore_errors=True))
+        paths = ((missing / "pids.current", missing / "pids.max"),)
+
+        self.assertIsNone(healthcheck._read_pids_usage(paths))
+        healthcheck._check_pids("worker-queue", cgroup_paths=paths)
+
+    def test_unlimited_or_unparsable_readings_are_skipped(self) -> None:
+        for current, limit in (("12", "max"), ("12", ""), ("abc", "512"), ("12", "0")):
+            with self.subTest(current=current, limit=limit):
+                paths = self._cgroup(current, limit)
+                self.assertIsNone(healthcheck._read_pids_usage(paths))
+                healthcheck._check_pids("worker-queue", cgroup_paths=paths)
+
+    def test_v1_layout_is_read_when_v2_is_absent(self) -> None:
+        """cgroup v1 的路径多一层 ``pids/``；两种布局都要读得到。"""
+
+        missing = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(missing, ignore_errors=True))
+        v2 = (missing / "pids.current", missing / "pids.max")
+        (v1,) = self._cgroup("300", "512")
+
+        self.assertEqual(healthcheck._read_pids_usage((v2, v1)), (300, 512))
+
+    def test_the_ratio_can_be_disabled_explicitly(self) -> None:
+        healthcheck._check_pids(
+            "worker-queue", max_pids_ratio=0, cgroup_paths=self._cgroup("512", "512")
+        )
+
+    def test_run_reports_pids_before_it_ever_looks_at_the_database(self) -> None:
+        """接线断言：``run()`` 真的调用了这段判定，而且排在依赖可达之前。
+
+        环境里连 DSN 都没有——判定没接上、或排在数据库之后，失败理由会是"缺少
+        数据库连接串"。理由是 pids，才说明这一段确实先跑了。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            paths = self._cgroup("512", "512")
+            with patch.object(healthcheck, "_PIDS_CGROUP_PATHS", paths):
+                exit_code = healthcheck.run(
+                    ["--role", "worker"],
+                    env={"LINGXI_LIVENESS_DIR": tmp},
+                    stderr=err,
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("pids", err.getvalue())
+
+    def test_a_healthy_pids_reading_does_not_by_itself_make_the_run_green(self) -> None:
+        """对照：pids 富余时这一段放行，失败理由回到后面的判定。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            paths = self._cgroup("4", "512")
+            with patch.object(healthcheck, "_PIDS_CGROUP_PATHS", paths):
+                exit_code = healthcheck.run(
+                    ["--role", "worker"],
+                    env={"LINGXI_LIVENESS_DIR": tmp},
+                    stderr=err,
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("pids", err.getvalue(), "pids 富余时不该是它判的红")

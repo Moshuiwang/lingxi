@@ -229,6 +229,113 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertIn("内容", result.text)
         self.assertIn("。", result.text)
 
+    def test_w6_process_markers_fold_fullwidth_and_tolerate_zero_width(self) -> None:
+        """对抗审查 2026-09-02 W-6：过程标记此前在**原文**上匹配。
+
+        系统提示标记那一支早在 #149 就同时做了全角折叠与零宽容忍，过程标记与
+        工具名却一直没跟上——同一个绕过手法在同一个模块里一半有效、一半无效。
+        下面每一条在修复前都是 ``blocked=False``。
+        """
+
+        zw = "\u200b"
+        cases = {
+            "全角 trace_id": "ｔｒａｃｅ＿ｉｄ＝01J000",
+            "全角 tool_use_id": "ｔｏｏｌ＿ｕｓｅ＿ｉｄ = toolu_1",
+            "全角 mcp 工具名": "调用了 ｍｃｐ＿＿ｑｕｅｒｙ＿＿ｌｉｓｔ 之后",
+            "零宽切开 mcp": f"调用了 mcp{zw}__query__list 之后",
+            "零宽切开 pretooluse": f"钩子 pre{zw}tool{zw}use 拒绝了它",
+            "全角 posttooluse": "钩子 ｐｏｓｔｔｏｏｌｕｓｅ 拒绝了它",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                result = constrain_output(text)
+                self.assertTrue(result.blocked, f"{label} 必须被拦下")
+                self.assertIn("process_marker", result.reasons)
+
+    def test_w6_internal_tool_names_fold_fullwidth_and_tolerate_zero_width(self) -> None:
+        """W-6 的第二半：``internal_tool_names`` 此前是纯 ``str.find`` 精确子串。"""
+
+        zw = "\u200b"
+        name = "mcp__query__list_metrics"
+        for label, text in {
+            "全角": "结果来自 ｍｃｐ＿＿ｑｕｅｒｙ＿＿ｌｉｓｔ＿ｍｅｔｒｉｃｓ 这个能力",
+            "零宽": f"结果来自 mcp__query__list{zw}_metrics 这个能力",
+            "原样": f"结果来自 {name} 这个能力",
+        }.items():
+            with self.subTest(case=label):
+                result = constrain_output(text, internal_tool_names=(name,))
+                self.assertTrue(result.blocked, f"{label} 必须被拦下")
+                self.assertIn("internal_tool_name", result.reasons)
+                self.assertIn("结果来自", result.text, "遮蔽必须是局部的，业务正文要留下")
+
+    def test_w6_folding_does_not_start_blocking_ordinary_business_text(self) -> None:
+        """加固只许更紧，不许把正常回答一起吃掉——这才是这道边界的成本上限。"""
+
+        for text in (
+            "上周活跃用户数是 1234，同比增长 5%。",
+            "MCP 是一种协议，指标列表见文档。",
+            "系统运行正常，提示用户稍后重试。",
+            "全角数字１２３４与全角字母ＡＢＣ都是正常内容。",
+            "trace 这个词单独出现不该被拦。",
+        ):
+            with self.subTest(text=text):
+                result = constrain_output(text, internal_tool_names=("mcp__query__list_metrics",))
+                self.assertFalse(result.blocked, f"误伤了正常业务文本：{result.reasons}")
+                self.assertEqual(result.text, text)
+
+    def test_w6_worst_case_process_marker_padding_is_bounded_and_caught(self) -> None:
+        """``_PROCESS_MARKER_MAX_LEN`` 的上界推导必须真的够用。
+
+        与系统提示标记那条最坏情况用例同一纪律：每个字符间隙塞满允许的零宽
+        上限时仍要命中，且一次命中的长度不得超过那个常量——它是
+        ``StreamingOutputGuard`` 保留窗口的输入，算小了会让跨块的半个命中
+        提前被吐出去（这道加固在流式路径上就不成立了）。
+        """
+
+        from lingxi.core.execution.input_safety import (
+            _PROCESS_MARKER_MAX_LEN,
+            _PROCESS_MARKERS,
+            _fold_for_marker_matching,
+            _ZW_GAP_MAX,
+        )
+
+        zw = "\u200b" * _ZW_GAP_MAX
+        padded = zw.join("mcp__") + zw.join("query__list_metrics")
+        result = constrain_output(f"内容：{padded}。")
+
+        self.assertTrue(result.blocked)
+        self.assertIn("process_marker", result.reasons)
+        self.assertIn("内容", result.text)
+
+        longest = max(
+            (match.end() - match.start())
+            for match in _PROCESS_MARKERS.finditer(_fold_for_marker_matching(padded))
+        )
+        self.assertLessEqual(
+            longest,
+            _PROCESS_MARKER_MAX_LEN,
+            "一次命中超过了保留窗口常量，流式路径会漏掉跨块命中",
+        )
+
+    def test_w6_streaming_hold_back_covers_zero_width_padded_tool_names(self) -> None:
+        """流式路径上，被零宽撑开的工具名跨块到达时同样不得漏出去。"""
+
+        from lingxi.core.execution.input_safety import _ZW_GAP_MAX
+
+        zw = "\u200b" * _ZW_GAP_MAX
+        name = "mcp__query__list_metrics"
+        padded = zw.join(name)
+
+        guard = StreamingOutputGuard(internal_tool_names=(name,))
+        emitted = "".join(guard.feed(chunk) for chunk in ("结果来自 ", padded, " 这个能力"))
+        final = guard.finish()
+        emitted += final.text
+
+        self.assertNotIn(name, emitted)
+        self.assertNotIn(padded, emitted)
+        self.assertIn("结果来自", emitted)
+        self.assertIn("internal_tool_name", final.reasons)
+
     def test_v_zhuru_142_system_prompt_fragment_leak_is_caught(self) -> None:
         """#142 缺口一：旧实现只做整串精确匹配，模型只泄露系统提示中的一句时
         照常放行。改坏片段切分（例如把 ``_derive_fragments`` 恒定返回空）必须

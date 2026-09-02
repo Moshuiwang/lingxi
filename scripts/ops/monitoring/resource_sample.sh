@@ -39,6 +39,23 @@ command -v python3 >/dev/null 2>&1 || { echo "缺少命令：python3" >&2; exit 
 
 install -d -m 750 "${OUTPUT_DIR}" "${STATE_DIR}"
 
+# ---- 样本文件保留上限（对抗审查 2026-09-02 P3）---------------------------
+# `/var/log/lingxi/monitoring` 下的 `resource-YYYYMMDD.log` /
+# `db_business-YYYYMMDD.log` 是**每天一个新文件**，此前没有任何东西回收它们：
+# `deploy/lingxi-container-logs.logrotate` 只管六个容器日志，这个目录不在它的
+# 名单里。采样每分钟一轮、常驻运行，磁盘占用因此单调增长，直到把宿主机写满
+# ——而写满宿主机会同时打掉容器日志收集与业务本身。
+#
+# 这里不引入 logrotate 配置（那要新增一个安装步骤，装没装不可见），改为**谁写
+# 谁清**：每轮采样顺手删掉自己那一族里超过保留天数的旧文件。只按文件名前缀匹配
+# 本脚本自己产出的那一族，绝不用通配删整个目录。
+LINGXI_MONITORING_RETENTION_DAYS="${LINGXI_MONITORING_RETENTION_DAYS:-30}"
+if [[ "${LINGXI_MONITORING_RETENTION_DAYS}" =~ ^[0-9]+$ ]] \
+  && (( LINGXI_MONITORING_RETENTION_DAYS > 0 )); then
+  find "${OUTPUT_DIR}" -maxdepth 1 -type f -name 'resource-*.log' \
+    -mtime "+${LINGXI_MONITORING_RETENTION_DAYS}" -delete 2>/dev/null || true
+fi
+
 docker_stats_file=$(mktemp)
 missing_file=$(mktemp)
 cleanup() { rm -f "${docker_stats_file}" "${missing_file}"; }

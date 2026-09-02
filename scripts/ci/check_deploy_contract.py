@@ -631,16 +631,77 @@ def check_worker_concurrency_contract() -> list[str]:
     return failures
 
 
+def check_prod_declares_deploy_environment() -> list[str]:
+    """生产覆盖必须**声明自己是生产**（对抗审查 2026-09-02 C-7）。
+
+    ``apps/worker/config.py`` 的 ``declares_production`` 读
+    ``LINGXI_DEPLOY_ENVIRONMENT``：声明为生产时内测轮内容级采集一律不生效，
+    两个开关变量配得再对也没用。这道兜底只有在**生产真的声明了自己**时才存在，
+    因此这里逐服务核对声明写在 ``deploy/compose.prod.yaml`` 的 ``environment:``
+    块里。
+
+    **必须写在 compose 而不是外部 env 文件里**：compose 的 ``environment:``
+    覆盖 ``env_file``，因此哪怕有人把 stage 的 worker env 文件整份复制进
+    ``.env.prod.worker*``，抄来的值也不再可能生效。写进 env 文件则毫无意义——
+    那正是这道兜底要防的那条路径本身。姿态同 ``check_worker_workspace_isolation``。
+
+    只核对**跑内容采集的那两个服务**（``worker`` 与 ``worker-queue``）：采集只在
+    worker 侧发生，给别的服务加声明不会更安全，只会让人以为这是个通用环境标记。
+    """
+
+    variable = module_constant(WORKER_CONFIG, "DEPLOY_ENVIRONMENT_VAR")
+    values = module_constant(WORKER_CONFIG, "PRODUCTION_ENVIRONMENT_VALUES")
+    if not variable or not values:
+        return [
+            "读不到 apps/worker/config.py 的 DEPLOY_ENVIRONMENT_VAR / "
+            "PRODUCTION_ENVIRONMENT_VALUES（常量被重命名或改写成非字面量赋值时，"
+            "check_prod_declares_deploy_environment 需要同步更新）"
+        ]
+
+    failures: list[str] = []
+    text = strip_comments(read(COMPOSE_PROD))
+    for service in ("worker", "worker-queue"):
+        block = service_block(text, service)
+        if block is None:
+            failures.append(f"{display(COMPOSE_PROD)} 找不到 service `{service}`")
+            continue
+        environment_block = service_block(block, "environment") or ""
+        match = re.search(
+            rf'^\s*{re.escape(variable)}:\s*"?([^"\n]+?)"?\s*$', environment_block, re.MULTILINE
+        )
+        if match is None:
+            failures.append(
+                f"{display(COMPOSE_PROD)} 的 `{service}` 没有在 `environment:` 里声明 "
+                f"`{variable}`。内测轮内容级采集的代码侧兜底（apps/worker/config.py 的 "
+                "declares_production）靠这条声明才存在；写进外部 env 文件不算——"
+                "那条路径正是这道兜底要防的东西（compose 的 environment 覆盖 env_file）。"
+            )
+            continue
+        declared = match.group(1).strip()
+        if declared.casefold() not in values:
+            failures.append(
+                f"{display(COMPOSE_PROD)} 的 `{service}` 声明 `{variable}: {declared}`，"
+                f"不在 apps/worker/config.py 认作生产的取值里（{sorted(values)}）。"
+                "拼错等于这道兜底整个不生效，而且是静默的。"
+            )
+    return failures
+
+
 def check_content_capture_prod_guard() -> list[str]:
     """内测轮内容级采集开关（Issue #251/#304 批次 3）的"正式环境不得生效"结构性
     保证：机械核对而不是只活在文档里的约定。
 
     研究结论（见 ``apps/worker/config.py`` 的 ``_innertest_content_capture`` 与
     迁移 ``0069_innertest_content_capture`` 的模块文档）：``deploy/compose.stage.
-    yaml`` 与 ``compose.prod.yaml`` 结构完全相同，代码里不存在任何"这是 stage
-    还是生产"的运行期判据，因此选用的方案是"双变量确认 + 精确字面量 + 本检查"，
-    而不是声称已有某种运行期环境探测。本检查覆盖这个方案里**唯一可由仓库静态
-    核对**的一环：
+    yaml`` 与 ``compose.prod.yaml`` 结构完全相同，因此方案是"双变量确认 + 精确
+    字面量 + 本检查"，而不是声称已有某种运行期环境**探测**。
+
+    对抗审查 2026-09-02 C-7 之后另加了一道代码侧兜底：部署**声明**自己是谁
+    （``LINGXI_DEPLOY_ENVIRONMENT``），声明为生产时采集一律不生效。那不是探测
+    ——探测在两侧完全同构时做不到——是把判据从"谁都能整份复制的宿主机 env 文件"
+    搬进"入库、被评审、被门禁扫描的 compose 文件"，并利用 compose 的
+    ``environment:`` 覆盖 ``env_file`` 这条语义让抄来的值无法生效。那一半由
+    :func:`check_prod_declares_deploy_environment` 钉住。本检查覆盖的仍是：
 
     1. 两个变量名与第二确认变量要求的精确字面量，一个都不允许出现在任何**入库**
        的 compose 编排文件里（尤其是 ``deploy/compose.prod.yaml``）——它们只能来自
@@ -1008,6 +1069,14 @@ REQUIRED_VARIABLE = re.compile(r'^"?\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}"?$')
 # 以 `${VAR:?...}` 形态 fail-fast，静态检查同时确认这个形状与合同文档中的值。
 PROD_EXTERNAL_HOST_SPEC_LIMITS: dict[str, tuple[str, ...]] = {
     "worker-queue": ("cpus", "memory", "pids"),
+    # 报告 R6-D4（对抗审查 2026-09-02）：这两项原来写成 `${VAR:-1G}`。默认值是
+    # 静默的——漏配时 scheduler 与 gateway 各退回 1G，加上 worker-queue 合同的
+    # 2G 就是 4G，**超过生产宿主机约 3.9GiB 的可用内存**，而 `docker compose
+    # config` 一声不响照常渲染。runbook §2.1 早就要求显式写这两行并渲染回读，
+    # 但那是纪律不是闸门：漏做一次没有任何东西会变红。改成与 worker-queue 同型的
+    # `${VAR:?}` 之后，漏配直接让渲染失败。
+    "scheduler": ("memory",),
+    "gateway": ("memory",),
 }
 
 
@@ -2013,6 +2082,7 @@ def main() -> int:
         ("worker-queue 并发上限与生产资源合同", check_worker_concurrency_contract),
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
+        ("生产覆盖声明部署环境", check_prod_declares_deploy_environment),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
         ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),

@@ -23,7 +23,12 @@
   之前判定。**这是频率上界唯一的权威**，进程内不留第二份账本副本；
 - ``revoke`` 删除凭据文件但**保留登记行**；
 - 超龄未清的消费中残留由 ``revoke_stale_consumed`` 收殓，并以「不可恢复」日志
-  请求人工重新授权。
+  请求人工重新授权；
+- **解密失败绝不触发任何删除**（对抗审查 2026-09-02 C-2）：所有读取路径先判
+  「是不是解不开」，再判「是不是主体不对 / 是不是无效」。密钥配错与凭据无效在
+  这一层长得一样，而两者的正确处置相反——一个要留着等人核对密钥，一个才谈得上
+  清理。判反的代价是**永久**丢掉一次性 ``refresh_token``，只能重新走 OAuth Bridge
+  授权，因此这个顺序是硬约束，见 :class:`_Undecryptable`。
 
 吸收测试资产 ``refresh_tokens.py`` 与数据库版前身已验证的模式：密文落盘、
 明文只在进程内（``SecretToken``）、缺加密依赖构造期即失败、绝不降级为明文。
@@ -86,6 +91,37 @@ DEFAULT_SUPPLY_DAILY_LIMIT = 100
 # `adapters/delegated_subject_lookup.py`；上面的 import 已经把它重新导出到这个
 # 模块的命名空间里，本文件其余部分（`HostFileDelegatedCredentialVault` 的 INSERT/
 # UPDATE/SELECT）继续用同一个 `DELEGATED_PURPOSE` 常量，未改变任何行为。
+
+
+class _Undecryptable:
+    """「文件在，但当前主密钥解不开」的哨兵（对抗审查 2026-09-02 C-2）。
+
+    此前 ``_read_payload`` 对解密失败返回 ``{}``，于是它与「解开了、内容是空的」
+    彻底同形。后果不是少读一次，而是**删文件**：``load``/``claim_due`` 拿到 ``{}``
+    先走主体核对，登记表有行时 ``None != 'ou_…'`` 命中「文件主体与登记不一致」分支
+    并 ``unlink`` 掉密文；登记表为空时也会走到 ``_to_credential`` 返回 ``None`` 的
+    ``revoke(reason="credential_undecryptable")``。也就是说**只要主密钥配错，
+    一次性 ``refresh_token`` 就在下一次扫描里被永久删除**，之后把密钥改回正确值也
+    救不回来，只能请产品负责人经 OAuth Bridge 重新授权。
+
+    因此本模块的判定顺序固定为**先判解密、再判主体**：解密不成功时不知道文件属于谁，
+    也就没有任何依据说它「与登记不一致」或「无效」，唯一安全的处置是原样留着、
+    响亮报错、等人工核对密钥。真要清掉的场景（确认文件损坏）由人工删除，不由一个
+    配置错误代劳——删是不可逆的，留是可逆的。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - 只为日志与断言可读
+        return "<凭据文件无法解密>"
+
+
+UNDECRYPTABLE = _Undecryptable()
+
+_UNDECRYPTABLE_MESSAGE = (
+    "凭据文件存在但当前主密钥解不开（密钥配置不一致或文件损坏）：已保留文件不做删除，"
+    "请核对 LINGXI_DELEGATED_CREDENTIAL_KEY 后重试；确认文件损坏才由人工删除"
+)
 
 
 @dataclass(frozen=True)
@@ -211,6 +247,11 @@ class HostFileDelegatedCredentialVault:
         with self._locked():
             if replacing_generation is not None:
                 current = self._read_payload()
+                if current is UNDECRYPTABLE:
+                    # 解不开就核对不了代际，覆盖等于蒙着眼睛写。与下面「代际不符」
+                    # 同样放弃写回，但不删文件（C-2）。
+                    logger.error(_UNDECRYPTABLE_MESSAGE)
+                    return False
                 current_generation = (current or {}).get("generation")
                 if current_generation != replacing_generation:
                     # 领取之后有过新授权：旧轮换链的结果作废，绝不覆盖新凭据。
@@ -284,6 +325,10 @@ class HostFileDelegatedCredentialVault:
             existed = self._path.exists()
             if existed and generation is not None:
                 current = self._read_payload()
+                if current is UNDECRYPTABLE:
+                    # 定向撤销要求「确认是这一代才删」；解不开就确认不了，不删（C-2）。
+                    logger.error(_UNDECRYPTABLE_MESSAGE)
+                    return False
                 if (current or {}).get("generation") != generation:
                     logger.warning("撤销目标已被新授权取代，跳过")
                     return False
@@ -303,6 +348,10 @@ class HostFileDelegatedCredentialVault:
         with self._locked():
             payload = self._read_payload()
             if payload is None:
+                return False
+            if payload is UNDECRYPTABLE:
+                # 读不出 consumed_at 就判不出「消费后未落盘」，收殓无依据（C-2）。
+                logger.error(_UNDECRYPTABLE_MESSAGE)
                 return False
             consumed_at = _parse_moment(payload.get("consumed_at"))
             if consumed_at is None or consumed_at >= moment - timedelta(seconds=max_age_seconds):
@@ -330,6 +379,11 @@ class HostFileDelegatedCredentialVault:
         with self._locked():
             payload = self._read_payload()
         if payload is None:
+            return None
+        if payload is UNDECRYPTABLE:
+            # **先判解密、再判主体**（C-2）：顺序反过来时，一次密钥配错会被读成
+            # 「文件主体与登记不一致」并删掉密文。这里既不删文件也不连库。
+            logger.error(_UNDECRYPTABLE_MESSAGE)
             return None
         if not self._subject_matches_registry(payload):
             return None
@@ -408,6 +462,10 @@ class HostFileDelegatedCredentialVault:
             moment = now or datetime.now(timezone.utc)
             payload = self._read_payload()
             if payload is None:
+                return None
+            if payload is UNDECRYPTABLE:
+                # 同 `load`：解不开时不删、不连库、不领取（C-2）。
+                logger.error(_UNDECRYPTABLE_MESSAGE)
                 return None
             if payload.get("consumed_at"):
                 return None
@@ -489,7 +547,14 @@ class HostFileDelegatedCredentialVault:
         self._path.unlink(missing_ok=True)
         return False
 
-    def _read_payload(self) -> dict[str, Any] | None:
+    def _read_payload(self) -> dict[str, Any] | _Undecryptable | None:
+        """``None`` = 没有文件；:data:`UNDECRYPTABLE` = 有文件但解不开；否则是明文 payload。
+
+        这三种情况必须由调用方**分别**处置（C-2）：只有第三种才谈得上主体核对与
+        有效期判定，前两种都不构成删除凭据的依据。返回 ``{}`` 会把「解不开」伪装成
+        「解开了、但什么都没有」，让下游的失败关闭分支删掉一份其实完好的密文。
+        """
+
         try:
             blob = self._path.read_bytes()
         except FileNotFoundError:
@@ -499,8 +564,9 @@ class HostFileDelegatedCredentialVault:
         try:
             return json.loads(self._cipher.decrypt(blob))
         except (self._invalid_token, ValueError):
-            # 解密失败按「不可用」处理，调用方决定撤销；不留半解的内容。
-            return {}
+            # 解密失败**不**降级成空 payload：区分不出「密钥配错」与「凭据无效」的
+            # 那一刻，任何自动清理都可能销毁一份完好的一次性令牌。
+            return UNDECRYPTABLE
 
     def _write_encrypted(self, payload: dict[str, Any]) -> None:
         blob = self._cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode())

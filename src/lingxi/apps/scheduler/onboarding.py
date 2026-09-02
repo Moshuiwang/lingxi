@@ -90,6 +90,7 @@ import logging
 import queue
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -390,8 +391,15 @@ class OnboardingExecutor:
                 return
             try:
                 task()
-            except BaseException:  # noqa: BLE001 - 一条链的失败不得带走这条线程
-                logger.exception("开通链在执行线程上抛出未捕获异常")
+            except BaseException as error:  # noqa: BLE001 - 一条链的失败不得带走这条线程
+                # C-6：不用 `logger.exception`——它会把异常正文写进日志，而这条
+                # 兜底捕获的是**整条开通链**的任意异常，psycopg 的唯一键冲突正文里
+                # 带着 `Key (feishu_open_id)=(ou_…)`。只记类型名与调用栈帧。
+                logger.error(
+                    "开通链在执行线程上抛出未捕获异常 error=%s\n调用栈（不含异常正文）：\n%s",
+                    type(error).__name__,
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
             finally:
                 self._queue.task_done()
             if self._stopping.is_set() and self._queue.empty():

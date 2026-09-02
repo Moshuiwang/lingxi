@@ -1161,6 +1161,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "保留清理",
                 "空闲会话清理",
                 "权限链到期清理",
+                "内测采集到期删除",
                 "组织快照同步",
                 "迟到就绪恢复",
                 "开通中途停摆收口",
@@ -1200,6 +1201,7 @@ class DutyRegistrationTest(unittest.TestCase):
                         "保留清理",
                         "空闲会话清理",
                         "权限链到期清理",
+                        "内测采集到期删除",
                         # 内测每日通报（Issue #303 S-O-01）：唯一前置是管理群
                         # chat_id，与花名册 Base 坐标无关——本夹具配了 chat_id、
                         # 缺花名册那两个变量，因此本职责照常注册，花名册那个不注册。
@@ -1245,6 +1247,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "保留清理",
                 "空闲会话清理",
                 "权限链到期清理",
+                "内测采集到期删除",
                 "花名册审计日报",
                 # 内测每日通报（Issue #303 S-O-01）：唯一前置同样是管理群 chat_id，
                 # 本夹具已配好，因此总会真实注册，紧跟花名册那一组之后。
@@ -1329,6 +1332,7 @@ class DutyRegistrationTest(unittest.TestCase):
                 "保留清理",
                 "空闲会话清理",
                 "权限链到期清理",
+                "内测采集到期删除",
                 "花名册审计日报",
                 # 内测每日通报（Issue #303 S-O-01）：唯一前置同样是管理群 chat_id，
                 # 本夹具已配好，因此总会真实注册，紧跟花名册那一组之后。

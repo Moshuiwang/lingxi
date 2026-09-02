@@ -91,6 +91,8 @@ import stat
 from pathlib import Path
 from typing import Any, Mapping
 
+from lingxi.core.mcp_naming import QUERY_MCP_SERVER_NAME
+
 #: 与 ``adapters/user_environment.py`` 的 ``MCP_CONFIG_FILENAME`` 同一形状
 #: （Claude Code 项目级 MCP 配置文件名）。本模块独立持有这个字符串常量而不是
 #: 跨模块 import 私有名字：两侧如果分道扬镳，这里的读取会先失败（文件名对不上），
@@ -114,6 +116,13 @@ _ALLOWED_SERVER_KEYS = frozenset({"type", "url", "headers"})
 #: ``headers`` 只允许这一个键——同样逐字对应写侧的产出形状。
 _ALLOWED_HEADER_KEYS = frozenset({"Authorization"})
 
+#: 端点同源核对的**可选**环境变量（对抗审查 2026-09-02 W-7）。配置了就强制
+#: ``.mcp.json`` 里的 URL 与它同源（scheme + host + port 三项全等），没配就不做
+#: 这一项——**刻意做成可选**：当前 worker-queue 的 env 文件里没有这个变量
+#: （它只在 scheduler 侧供就绪探针使用），做成必填会让一次没有同步改配置的部署
+#: 把每一个用户的问数都失败关闭。这是一道装上就更紧、没装也不会更松的闸。
+QUERY_MCP_ENDPOINT_ENV_VAR = "LINGXI_QUERY_MCP_ENDPOINT"
+
 #: ``Authorization`` 必须是 ``Bearer <非空且不含空白的令牌>``。真实令牌是
 #: base64/hex 一类字符集，不含空白；用这条形状本身筛掉空令牌（``Bearer``、
 #: ``Bearer ``）与夹带额外内容的令牌（``Bearer x y``）。
@@ -126,6 +135,60 @@ class UserMcpConfigError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def _validate_endpoint(url: str) -> None:
+    """URL 必须是形状完好的 https 端点；配了 ``QUERY_MCP_ENDPOINT_ENV_VAR`` 时还要同源。
+
+    对抗审查 2026-09-02 W-7：此前只判 ``url.startswith("https://")``。那条判定
+    放行 ``https://@evil.example``（userinfo 段能把真正的主机藏在 ``@`` 后面，
+    一眼扫过去像是连到前半段）、``https://`` 后跟空主机、以及任何指向第三方的
+    合法 https 地址——而这个 URL 会被原样交给 Agent 会话，带着 ``Authorization:
+    Bearer <该用户的问数令牌>`` 一起发出去。也就是说，改一行 URL 就能把一个真实
+    用户的令牌定向送到任意主机。
+
+    因此这里做三件事：
+
+    1. 真的解析一次 URL，要求 scheme 恰为 ``https``、有非空主机名；
+    2. 拒绝 userinfo（``user:pass@host``）与 fragment——写侧一个都不会产出，
+       它们出现在这里只可能是为了让人读错主机；
+    3. 配置了 ``LINGXI_QUERY_MCP_ENDPOINT`` 时核对**同源**（scheme + host + port
+       三项全等）。这一项可选，理由见该常量的注释。
+    """
+
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise UserMcpConfigError("config_shape_invalid") from None
+    if parts.scheme != "https" or not parts.hostname:
+        raise UserMcpConfigError("config_shape_invalid")
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        raise UserMcpConfigError("config_shape_invalid")
+
+    expected = (os.environ.get(QUERY_MCP_ENDPOINT_ENV_VAR) or "").strip()
+    if not expected:
+        return
+    try:
+        reference = urlsplit(expected)
+    except ValueError:
+        # 部署侧配错了这个变量不该把用户的问数一起打死：只是这道可选闸不生效。
+        return
+    if not reference.hostname:
+        return
+    if _origin(parts) != _origin(reference):
+        # 不回显任何一侧的主机名：错误码要能进日志，而 URL 可能带用户可控内容。
+        raise UserMcpConfigError("config_endpoint_not_same_origin")
+
+
+def _origin(parts: Any) -> tuple[str, str, int | None]:
+    """``(scheme, host, port)``——主机名大小写不敏感，端口按 scheme 归一。"""
+
+    port = parts.port
+    if port is None and parts.scheme == "https":
+        port = 443
+    return (parts.scheme.lower(), (parts.hostname or "").lower(), port)
 
 
 def _errno_name(error: OSError) -> str:
@@ -238,10 +301,24 @@ def _parse_mcp_servers(payload: bytes) -> Mapping[str, Any]:
     # 只是方向相反）。
     if not isinstance(servers, dict) or not servers:
         raise UserMcpConfigError("config_shape_invalid")
-    for name, value in servers.items():
-        if not isinstance(name, str) or not name:
-            raise UserMcpConfigError("config_shape_invalid")
-        _validate_server_shape(value)
+    # W-7：**恰好一个**服务器，且服务名必须是写侧唯一会写的那一个。
+    #
+    # 此前这里接受任意数量、任意名字的服务器。写侧 `build_mcp_config` 只会产出
+    # 一个名为 `QUERY_MCP_SERVER_NAME` 的 HTTP 服务器——多出来的每一个都不可能
+    # 来自本系统，而它们会被原样交给 Agent 会话去连接。"读侧接受写侧根本不会
+    # 产出的形状"就是这道边界的全部漏洞：只要能往 .mcp.json 里塞一行，就能给
+    # 模型挂上一个额外的、指向任意地址的 MCP 服务器。
+    #
+    # 服务名还有第二重后果：工具名是 `mcp__<服务名>__<工具>`，而 worker 的只读
+    # 白名单只放行 `mcp__query__` 前缀（`apps/worker/config.py` 装配期断言）。
+    # 名字对不上时旧实现照样把服务器挂上去，模型的每次调用再在 PreToolUse 被
+    # 无声拒绝——用户看到的是"什么都查不出来"，而不是一条诚实的配置错误。
+    if len(servers) != 1:
+        raise UserMcpConfigError("config_shape_invalid")
+    (name, value), = servers.items()
+    if name != QUERY_MCP_SERVER_NAME:
+        raise UserMcpConfigError("config_shape_invalid")
+    _validate_server_shape(value)
     return servers
 
 
@@ -270,6 +347,7 @@ def _validate_server_shape(value: Any) -> None:
         # 明文 Bearer 走 HTTP 等于把令牌发到网络上——与写侧
         # ``LocalUserEnvironment.__init__`` 对 ``mcp_endpoint`` 的同一条校验。
         raise UserMcpConfigError("config_shape_invalid")
+    _validate_endpoint(url)
     headers = value.get("headers")
     if not isinstance(headers, dict) or set(headers) != _ALLOWED_HEADER_KEYS:
         raise UserMcpConfigError("config_shape_invalid")

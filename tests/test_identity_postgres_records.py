@@ -269,12 +269,57 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
         self.assertEqual(sum(1 for item in results if item is not None), 1)
 
-    def test_an_undecryptable_credential_file_is_revoked_rather_than_retried(self) -> None:
+    def test_an_undecryptable_credential_file_is_kept_instead_of_deleted(self) -> None:
+        """对抗审查 2026-09-02 C-2：解不开 ≠ 无效，绝不因此删掉密文。
+
+        这条用例此前断言的是相反的行为（"revoked rather than retried"）。改断言
+        不是为了迁就实现：登记表**这时有行**，旧实现把解密失败降级成 ``{}`` 之后
+        正好命中「文件主体与登记不一致」分支，于是**一次主密钥配错就等于永久销毁
+        一次性 refresh_token**——正确密钥换回来也救不回。删是不可逆的，留是可逆的。
+        """
+
         self._save()
+        original = self.path.read_bytes()
         self.path.write_bytes(b"\x01\x02broken")
 
-        self.assertIsNone(self.vault.load())
-        self.assertFalse(self.path.exists())
+        self.assertIsNone(self.vault.load(), "解不开时不得返回凭据")
+        self.assertTrue(self.path.exists(), "解密失败不得删除凭据文件")
+        self.assertEqual(self.path.read_bytes(), b"\x01\x02broken", "文件必须原样保留")
+
+        # 领取路径同样不删：轮换扫描每 60 s 跑一次，删一次就没有第二次机会。
+        self.assertIsNone(self.vault.claim_due())
+        self.assertTrue(self.path.exists(), "claim_due 解密失败同样不得删除")
+
+        # 把正确的密文放回去，凭据仍然可用——这正是"留着"换来的可恢复性。
+        self.path.write_bytes(original)
+        recovered = self.vault.load()
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.subject_open_id, DELEGATED_SUBJECT)
+
+    def test_a_wrong_master_key_never_destroys_the_credential_file(self) -> None:
+        """C-2 的上线场景：scheduler 与 reauthorize 两侧主密钥不一致。
+
+        用**另一把合法 Fernet 密钥**（不是坏字节）读同一份文件——这才是配错密钥的
+        真实形状：文件结构完好、只是解不开。原实现会在这里 unlink。
+        """
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._save()
+        ciphertext = self.path.read_bytes()
+
+        wrong_key_vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        self.assertIsNone(wrong_key_vault.load())
+        self.assertIsNone(wrong_key_vault.claim_due())
+        self.assertTrue(self.path.exists(), "配错主密钥不得删除凭据文件")
+        self.assertEqual(self.path.read_bytes(), ciphertext, "密文必须字节不变")
+
+        # 配对的密钥回来时，同一份文件照常可用。
+        self.assertIsNotNone(self.vault.load())
 
     def test_revoking_removes_the_file_but_keeps_the_registry_row(self) -> None:
         """撤销只动凭据文件；登记行是 V-身份-02 触发器的数据来源，必须留下。"""
