@@ -84,7 +84,7 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
     def setUp(self) -> None:
         reset_production_rows(self._dsn)
         self.audit = _RecordingAudit()
-        self.pending_actions = PostgresPendingActionStore(self._dsn, audit=self.audit)
+        self.pending_actions = PostgresPendingActionStore(self._dsn, audit=self.audit, metric_map_path=None)
         self.publish_store = PostgresPermissionPublishStore(self._dsn)
         seed_admin_registry_entry(self._dsn, feishu_open_id=ADMIN_OPEN_ID, label="test-admin")
         self.handler = AdminCardCallbackHandler(
@@ -96,7 +96,7 @@ class PermissionRecomputeTriggerPostgresTestCase(unittest.TestCase):
             # PostgresAdminQueries 结构性实现 AdminDisplayNames（Trace #469
             # S-1），与真实 apps/gateway/__init__.py 装配同一姿态。
             display_names=PostgresAdminQueries(self._dsn),
-            recompute_trigger=PermissionRecomputeAdapter(self._dsn, audit=self.audit),
+            recompute_trigger=PermissionRecomputeAdapter(self._dsn, audit=self.audit, metric_map_path=None),
         )
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:

@@ -75,7 +75,7 @@ class PendingActionPostgresTestCase(unittest.TestCase):
     def setUp(self) -> None:
         reset_production_rows(self._dsn)
         self.audit = _RecordingAudit()
-        self.store = PostgresPendingActionStore(self._dsn, audit=self.audit)
+        self.store = PostgresPendingActionStore(self._dsn, audit=self.audit, metric_map_path=None)
         seed_admin_registry_entry(self._dsn, feishu_open_id=ADMIN_OPEN_ID, label="test-admin")
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
@@ -279,7 +279,7 @@ class DuplicateAndConcurrentConfirmTests(PendingActionPostgresTestCase):
                 # 每个线程用自己的 store（各自独立的审计记录器，避免共享可变状态
                 # 本身成为竞态源；数据库层面的序列化才是本用例真正要证明的东西）。
                 thread_audit = _RecordingAudit()
-                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit)
+                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit, metric_map_path=None)
                 results[index] = thread_store.confirm(
                     pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
                 )
@@ -388,7 +388,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         self.remember_memory(user_id=target_user_id, memory_key="k", memory_value="v")
         pending_id = self.prepare_and_deliver()
         failing_audit = _RecordingAudit(raise_error=True)
-        failing_store = PostgresPendingActionStore(self._dsn, audit=failing_audit)
+        failing_store = PostgresPendingActionStore(self._dsn, audit=failing_audit, metric_map_path=None)
 
         with self.assertRaises(PendingActionAuditWriteFailed):
             failing_store.confirm(pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID)
@@ -417,7 +417,7 @@ class AuditWriteFailureRealDbTests(PendingActionPostgresTestCase):
         self.add_target_user(account_state="enabled")
         pending_id = self.prepare_and_deliver()
         failing_store = PostgresPendingActionStore(
-            self._dsn, audit=_RecordingAudit(raise_error=True)
+            self._dsn, audit=_RecordingAudit(raise_error=True), metric_map_path=None
         )
 
         with self.assertRaises(PendingActionAuditWriteFailed):
@@ -990,7 +990,7 @@ class LazyExpirySweepRealDbTests(PendingActionPostgresTestCase):
                 # 不是共享的应用层状态（与 DuplicateAndConcurrentConfirmTests 的
                 # 真实并发用例同一姿态）。
                 thread_audit = _RecordingAudit()
-                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit)
+                thread_store = PostgresPendingActionStore(self._dsn, audit=thread_audit, metric_map_path=None)
                 results[index] = thread_store.prepare(
                     action_type=PendingActionType.SUSPEND_USER,
                     target_open_id=TARGET_OPEN_ID,
@@ -1245,7 +1245,7 @@ class SuspendPurgeRealDbTests(PendingActionPostgresTestCase):
         def confirm_from_thread(index: int) -> None:
             try:
                 barrier.wait(timeout=5)
-                thread_store = PostgresPendingActionStore(self._dsn, audit=_RecordingAudit())
+                thread_store = PostgresPendingActionStore(self._dsn, audit=_RecordingAudit(), metric_map_path=None)
                 results[index] = thread_store.confirm(
                     pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
                 )

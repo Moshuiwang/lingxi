@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Sequence
 
 from lingxi.core.admin.management_card import ManagementCardCreated
@@ -213,7 +214,27 @@ class TomlCompanyMetricCatalog:
     重启 gateway）。读取或格式失败时返回空元组（fail-open，见
     ``core.admin.management_card.render_management_card`` 对空目录的降级渲染），
     不让整张管理卡因为一份可选的展示数据渲染失败。
+
+    **读哪一份文件由装配层注入**（``metric_map_path``，Trace #544 S-2c 修复对抗
+    审查 P-1）：此前本类无条件读随包默认文件，而 scheduler 读
+    ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 指向的外置文件——外置文件启用后，
+    管理卡下拉里会出现产品负责人**已经删掉**的指标，管理员照着它发起的授权与次日
+    日批重算的口径对不上。构造参数**没有默认值**：新调用点不可能"忘了传"而悄悄
+    退回随包默认。传 ``None`` 是显式的"这台机器没配外置文件"，语义与 scheduler
+    侧完全一致。
+
+    **失败关闭的形状是"空目录"，不是"随包默认"**：配了外置路径却读不出来时，
+    :func:`~lingxi.adapters.company_function_metric_map_file.
+    load_company_function_metric_map` 抛错，本类降级成空目录（管理员看到"没有可选
+    项"这一显眼状态，并留下 `admin.management_card.catalog_load_failed` 警告），
+    **不会**退回随包默认那份"看起来正常、其实是另一份真相"的内容——真正会写出权限
+    的两条路径（`postgres_pending_action.prepare` 的职位展开、
+    `postgres_permission_recompute_trigger` 的定向重算）各自再独立读一次并各自失败
+    关闭，展示层这一层的降级不构成任何越权发布。
     """
+
+    def __init__(self, *, metric_map_path: Path | None) -> None:
+        self._metric_map_path = metric_map_path
 
     def companies(self) -> Sequence[str]:
         mapping = self._load()
@@ -247,7 +268,7 @@ class TomlCompanyMetricCatalog:
         )
 
         try:
-            return dict(load_company_function_metric_map())
+            return dict(load_company_function_metric_map(self._metric_map_path))
         except Exception as error:  # noqa: BLE001 - 展示层降级，不让管理卡渲染失败
             logger.warning(
                 "admin.management_card.catalog_load_failed error=%s", type(error).__name__
