@@ -303,6 +303,8 @@ class FakeLegacyImportReport:
         self.already_present = already_present
         self.group_id = group_id
         self.group_created = group_created
+        self.group_skipped_revoked = False
+        self.revoked_skipped = 0
 
 
 class FakeLegacyImporter:
@@ -1466,6 +1468,7 @@ class LegacyPermissionImportTests(unittest.TestCase):
         self.assertEqual(facts["imported"], 2)
         self.assertEqual(facts["unmapped_companies_kept"], 1)
         self.assertEqual(facts["group_created"], False)
+        self.assertEqual((facts["group_skipped_revoked"], facts["revoked_skipped"]), (False, 0), "撤销跳过标志进审计")
 
     def test_full_wildcard_row_becomes_one_all_scope_group(self) -> None:
         importer = FakeLegacyImporter()

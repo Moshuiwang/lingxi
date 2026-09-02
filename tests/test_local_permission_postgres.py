@@ -332,6 +332,27 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
         active = [(e.entry.company_id, e.entry.metric_name) for e in self.store.effective_entries(user_id=TARGET_USER_ID)]
         self.assertEqual(active, [("88", "m9")], "组不复活，具体行照常")
 
+    def test_a_singly_revoked_group_metric_or_specific_row_is_not_revived_on_reimport(self) -> None:
+        """复核残留项：撤销过的键不复活——组仍在但其中一条被单独撤销、或无组具体行被撤销，
+        重新导入同一计划都不重建，计入 ``revoked_skipped``。"""
+
+        plan = self._plan(pairs=(("88", "m9"),), all_scope=("m1", "m2"))
+        report = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=plan, now=self._now())
+        rows = {row[0]: row[1] for row in self.query(
+            "SELECT metric_name, id FROM local_permission_override WHERE user_id = %s", (TARGET_USER_ID,)
+        )}
+        for metric in ("m2", "m9"):
+            self.assertTrue(self.store.revoke(override_id=rows[metric], revoked_pending_action_id=self.add_pending_action(pending_id=new_id("pac"))))
+
+        again = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=plan, now=self._now())
+
+        self.assertEqual((again.imported, again.already_present, again.revoked_skipped), (0, 1, 2))
+        self.assertEqual(again.group_id, report.group_id)
+        self.assertFalse(again.group_skipped_revoked, "组本身还在，不是整组撤销")
+        active = sorted(e.entry.metric_name for e in self.store.effective_entries(user_id=TARGET_USER_ID))
+        self.assertEqual(active, ["m1"])
+        self.assertEqual(self.query("SELECT count(*) FROM pending_action WHERE reason = 'legacy_import_2_0'")[0][0], 1, "零新增时不留孤儿终态记录")
+
     def test_reusing_an_existing_group_keeps_its_label(self) -> None:
         from lingxi.core.permission.legacy_diff import ALL_SCOPE_EXPLICIT_POSITION_NAME
 

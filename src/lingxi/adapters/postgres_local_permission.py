@@ -404,8 +404,9 @@ class PostgresLocalPermissionOverrideStore:
         :attr:`~lingxi.core.permission.legacy_diff.LegacyImportPlan.all_scope_position_name`
         （全通配「2.0 迁移导入·全部」会随映射补齐指标；显式列表「…全部公司（指定指标）」
         永不自动扩）——已有生效的「全部」组则沿用其组 ID 与标签补缺行，不建第二组；
-        管理员整组撤销过且当前没有生效组时**不重建**（撤销过的组不复活，
-        ``group_skipped_revoked``）。事务开头对 ``app_user`` 行加锁，同一用户的并发开通链
+        管理员整组撤销过且当前没有生效组时**不重建**（``group_skipped_revoked``）；
+        单独撤销过的组内指标或具体公司行同样不重建（``revoked_skipped`` 计数）——
+        撤销过的键不复活。事务开头对 ``app_user`` 行加锁，同一用户的并发开通链
         串行化。逐行用 SAVEPOINT 包住：并发撞上迁移 ``0072`` 的部分唯一索引时降级为
         ``already_present``，不让整批回滚；最终一行都没新增时删掉刚合成的
         ``pending_action``，不留孤儿终态记录。任何其他异常原样上抛，事务整体回滚——
@@ -426,6 +427,7 @@ class PostgresLocalPermissionOverrideStore:
                 (user_id, OverrideDirection.GRANT.value),
             )
             existing: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+            revoked: set[tuple[str, str]] = set()
             existing_group: str | None = None
             revoked_group = False
             for company, metric, group, position, status in cursor.fetchall():
@@ -438,18 +440,33 @@ class PostgresLocalPermissionOverrideStore:
                     existing[(company, metric)] = (group, position)
                     if is_all_scope_row and existing_group is None:
                         existing_group = group
-                elif is_all_scope_row:
-                    revoked_group = True
-            missing_pairs = [pair for pair in pairs if pair not in existing]
-            missing_group = [metric for metric in group_metrics if (ALL_COMPANIES_KEY, metric) not in existing]
+                else:
+                    revoked.add((company, metric))
+                    if is_all_scope_row:
+                        revoked_group = True
+            # **撤销过的键不复活**（独立审核 P3-5 及复核残留项）：管理员单独撤销过的
+            # 组内指标或具体公司行，重新开通时不再重建——撤销是管理员的显式决定。
+            missing_pairs = [pair for pair in pairs if pair not in existing and pair not in revoked]
+            missing_group = [
+                metric
+                for metric in group_metrics
+                if (ALL_COMPANIES_KEY, metric) not in existing and (ALL_COMPANIES_KEY, metric) not in revoked
+            ]
+            revoked_skipped = sum(1 for pair in pairs if pair not in existing and pair in revoked) + sum(
+                1
+                for metric in group_metrics
+                if (ALL_COMPANIES_KEY, metric) not in existing and (ALL_COMPANIES_KEY, metric) in revoked
+            )
             group_skipped_revoked = False
-            if missing_group and existing_group is None and revoked_group:
-                # 管理员整组撤销过、现在没有生效的「全部」组：撤销过的组不复活（独立审核
-                # P3-5）——重新开通不会把它按新组 ID 全量重建；具体公司行照常处理。
+            if group_metrics and existing_group is None and revoked_group:
+                # 管理员整组撤销过、现在没有生效的「全部」组：撤销过的组不复活——重新
+                # 开通不会把它按新组 ID 全量重建（连映射后来新增的指标也不建）；具体
+                # 公司行照常处理。
+                revoked_skipped += len(missing_group)
                 missing_group = []
                 group_skipped_revoked = True
-            already_present = (len(pairs) - len(missing_pairs)) + (
-                len(group_metrics) - len(missing_group) - (len(group_metrics) if group_skipped_revoked else 0)
+            already_present = sum(1 for pair in pairs if pair in existing) + sum(
+                1 for metric in group_metrics if (ALL_COMPANIES_KEY, metric) in existing
             )
             if not missing_pairs and not missing_group:
                 return LegacyImportReport(
@@ -457,6 +474,7 @@ class PostgresLocalPermissionOverrideStore:
                     already_present=already_present,
                     group_id=existing_group,
                     group_skipped_revoked=group_skipped_revoked,
+                    revoked_skipped=revoked_skipped,
                 )
 
             group_id = existing_group if existing_group else (new_id("lpg") if missing_group else None)
@@ -524,6 +542,7 @@ class PostgresLocalPermissionOverrideStore:
                     already_present=already_present,
                     group_id=existing_group,
                     group_skipped_revoked=group_skipped_revoked,
+                    revoked_skipped=revoked_skipped,
                 )
             return LegacyImportReport(
                 imported=imported,
@@ -531,6 +550,7 @@ class PostgresLocalPermissionOverrideStore:
                 group_id=group_id if (missing_group or existing_group) else None,
                 group_created=bool(missing_group) and existing_group is None,
                 group_skipped_revoked=group_skipped_revoked,
+                revoked_skipped=revoked_skipped,
             )
 
     def expand_all_scope_group(

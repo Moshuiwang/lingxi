@@ -153,6 +153,8 @@ class LegacyImportReport:
     group_created: bool = False
     #: 该用户曾有一个「全部」组被管理员整组撤销，本次不再重建（撤销过的组不复活）。
     group_skipped_revoked: bool = False
+    #: 计划里因「同键曾被管理员撤销」而没有重建的行数（组内单条 + 具体公司行）。
+    revoked_skipped: int = 0
 
 
 @dataclass(frozen=True)

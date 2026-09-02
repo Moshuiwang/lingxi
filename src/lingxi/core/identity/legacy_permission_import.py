@@ -122,6 +122,8 @@ def import_legacy_permissions(
         imported=report.imported,
         already_present=report.already_present,
         group_created=report.group_created,
+        group_skipped_revoked=report.group_skipped_revoked,
+        revoked_skipped=report.revoked_skipped,
         unmapped_companies_kept=plan.unmapped_companies_kept,
         trace_id=trace_id,
     )
