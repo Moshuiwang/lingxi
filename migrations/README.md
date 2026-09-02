@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0084_management_card_state_cas` |
+| head revision | `0085_app_user_email_unique` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -568,6 +568,21 @@ CardKit 的 `card_sequence` 分开：状态写入同时推进两条版本链，�
 `needs_refresh` 清除也按同一快照做 CAS。旧 scanner 若在渲染期间遇到状态推进，会
 放弃发送并保留水位，下一轮从当前状态重新渲染。升级只加列并以 1 初始化既有上下文，
 downgrade 删除该列（有损但不删除业务行）。
+
+## `0085_app_user_email_unique`（规范化邮箱的部分唯一索引）
+
+rc25 S-2a，对抗审查 X-1。`app_user` 新增 `lower(btrim(email))` 上的**部分唯一
+索引**（`WHERE email IS NOT NULL AND btrim(email) <> ''`），把"一个规范化邮箱至多
+绑定一个 `app_user`"变成结构性保证：正式表行键 `record_key` 就是规范化邮箱，而开通
+链会按邮箱采纳存量令牌，此前两名共用邮箱的员工会拿到同一把问数令牌、并互相覆写
+同一行的权限范围。索引口径与 `core/permission/account_match.normalize_email` 逐字
+一致；空值与纯空白邮箱不进索引（建档不以邮箱为前提）。应用层的同名闸在
+`core/identity/onboarding_guards.reject_email_bound_to_another_user`，两者是纵深
+关系。`downgrade` 删除该索引，无数据损失。
+
+**升级前置**：目标库 `app_user` 不得已经存在同一规范化邮箱的多行（2026-09-02 生产
+预检为 0 行）。若建索引失败，说明该环境真的有共用邮箱的两个人，必须先人工决定谁
+保留该邮箱再重跑，**不得**改成非唯一索引绕过。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 

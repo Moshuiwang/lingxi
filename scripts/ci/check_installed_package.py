@@ -90,6 +90,14 @@ REQUIRED_MODULES = (
     # `onboarding_runner.py` 顶部 `from .onboarding_terminal import (...)`。随
     # `onboarding_runner.py` 同一条发布理由。
     "lingxi.core.identity.onboarding_terminal",
+    # 开通链的两道失败关闭闸（rc25 S-2a，对抗审查 X-1）：`_reject_zero_galaxy_
+    # without_local_grant` 从 `onboarding_runner.py` 纯移动过来，外加新增的
+    # 「同邮箱已绑给另一个 user_id」闸。随 `onboarding_runner.py` 同一条发布理由。
+    "lingxi.core.identity.onboarding_guards",
+    # 上面那道邮箱闸的只读回读口（`app_user` 规范化邮箱 → user_id）。由
+    # `_build_onboarding_duty` 在函数内 import，同 `postgres_onboarding_failure`
+    # 一条理由：函数内 import 证明不了它装得上，必须显式登记。
+    "lingxi.adapters.postgres_email_binding",
     # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
     # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
     # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
@@ -536,8 +544,15 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
             # 时同样函数内 import——两个调用点都不在模块级，必须显式登记。
             "lingxi.core.identity.innertest_roster_gate",
+            # 开通链的两道失败关闭闸（rc25 S-2a，对抗审查 X-1）：`onboarding_
+            # runner.py` 模块级 import，随它一起进 scheduler 的运行时闭包。
+            "lingxi.core.identity.onboarding_guards",
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
+            # 「同邮箱已绑给另一个 user_id」的只读回读口（rc25 S-2a，对抗审查
+            # X-1）：`_build_onboarding_duty` 在函数内 import，与上一行同一条
+            # "函数内 import 证明不了装得上"的理由。
+            "lingxi.adapters.postgres_email_binding",
             "lingxi.adapters.user_environment",
             # 失败原因落库（Issue #337，S-H3-1）：`_build_onboarding_duty`
             # （`apps/scheduler/onboarding.py`）与 `_build_stalled_provisioning_

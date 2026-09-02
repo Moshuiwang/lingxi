@@ -215,7 +215,10 @@ class ComparisonSetIsActiveOnlyTest(RosterAuditPostgresTestCase):
                 personnel_id=f"ou_p_other_{index}",
                 display_name=UNPROVISIONED_NAME,
                 employee_no=UNPROVISIONED_EMPLOYEE_NO,
-                email=UNPROVISIONED_EMAIL,
+                # 邮箱逐行不同：迁移 0085 起 `app_user` 的规范化邮箱是唯一的，
+                # 六行共用一个邮箱建不出来。本用例断言的是 provisioning_state，
+                # 邮箱取值对结论没有作用面。
+                email=f"other{index}.{UNPROVISIONED_EMAIL}",
                 provisioning_state=state,
             )
 

@@ -747,6 +747,7 @@ def _build_onboarding_duty(
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
@@ -927,6 +928,12 @@ def _build_onboarding_duty(
         # `core/identity/onboarding_ports.FailureReasonRecorder` 协议文档。
         failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
         local_overrides=local_override_reader(dsn, timeouts=timeouts),
+        # 「同邮箱已绑给另一个人」的只读回读口（rc25 S-2a，对抗审查 X-1）。
+        # **必填、没有哨兵值**：漏接在 ``AutoOnboardingRunner`` 构造期就是 TypeError，
+        # 不会静默退回"这道闸不存在"的旧行为。判定层见
+        # ``core/identity/onboarding_guards.reject_email_bound_to_another_person``，
+        # 数据库侧的结构性保证是迁移 ``0085`` 的部分唯一索引，两者是纵深关系。
+        email_bindings=PostgresEmailBindingSource(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(
         store=store,
