@@ -233,6 +233,54 @@ class NotInitiatorRealDbTests(PendingActionPostgresTestCase):
         self.assertTrue(second.decision.ok)
         self.assertEqual(self.current_account_state(), "suspended")
 
+    def test_wrong_clicker_on_an_expired_card_is_not_recorded_as_the_decider(self) -> None:
+        """A-3（Trace #544，对抗审查面 2）：**非发起人点一张已过期的卡**。
+
+        修复前过期判定排在发起人判定之前：这次点击会把行翻成 ``EXPIRED`` 并把
+        ``decided_by_open_id`` 写成**点击者**，随后发管理群通知、刷新原卡、把终态卡
+        返回给他。确认卡可以被转发（卡片 config 未禁转发），因此这是真实可达的：
+        一个与本次操作毫无关系的人被记成了这条操作的决定人。
+
+        修复后发起人判定前移——非发起人无论卡片是否过期都只得到同一句话、
+        **不产生任何写入**（``decided_by_open_id`` 仍为空、行仍是 ``pending``、
+        决策不携带终态因此调用方不会发群通知）。
+        """
+
+        self.add_target_user(account_state="enabled")
+        pending_id = self.prepare_and_deliver()
+        self.execute(
+            "UPDATE pending_action SET confirm_deadline_at = now() - interval '1 second'"
+            " WHERE id = %s",
+            (pending_id,),
+        )
+
+        result = self.store.confirm(
+            pending_action_id=pending_id, clicker_open_id="ou_impersonator"
+        )
+
+        self.assertFalse(result.decision.ok)
+        self.assertEqual(result.decision.code, "not_authorized")
+        # 群通知的唯一触发判据是"这次点击首次产生了新的终态"
+        # （``core/admin/card_callback.py``）——决策不带终态，就不会有群通知。
+        self.assertIsNone(result.decision.terminal_status)
+
+        rows = self.query(
+            "SELECT status, reason, decided_by_open_id, decided_at FROM pending_action"
+            " WHERE id = %s",
+            (pending_id,),
+        )
+        self.assertEqual(rows[0][0], "pending", "非发起人不得把它翻成 EXPIRED")
+        self.assertIsNone(rows[0][2], "不得把点击者记成决定人")
+        self.assertIsNone(rows[0][3])
+        self.assertEqual(self.current_account_state(), "enabled")
+
+        # 不误伤：真正的发起人随后点这张已过期的卡，仍然得到"已过期"并首次转终态。
+        expired = self.store.confirm(
+            pending_action_id=pending_id, clicker_open_id=ADMIN_OPEN_ID
+        )
+        assert expired.pending is not None
+        self.assertEqual(expired.pending.status, PendingActionStatus.EXPIRED)
+
 
 class DuplicateAndConcurrentConfirmTests(PendingActionPostgresTestCase):
     """否定断言：重复点击/重复回调/重试 → 只执行一次，含真库并发用例。"""

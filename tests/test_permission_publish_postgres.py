@@ -1245,6 +1245,87 @@ class RetentionAndTriggerTest(PermissionPublishPostgresTestCase):
         # 再跑一次不会重复计数（已经擦过的行不再进入候选集）。
         self.assertEqual(self.store.redact_expired_payloads(now=expires), 0)
 
+    def test_digests_survive_redaction_and_keep_unchanged_unchanged(self) -> None:
+        """P-3（Trace #544）：**擦除之后，同内容仍然判 UNCHANGED**。
+
+        修复前：擦成 ``'{}'`` 的 payload 让 ``_same_content`` 恒假、
+        ``_permissions_changed`` 恒真——一份内容完全没变的权限被重排一条发布意图，
+        并按「权限变化感知即清」把该用户的 ``user_memory`` 与已送达正文清空。用户侧
+        表现为"什么都没做，记忆和历史答案却没了"。摘要列不参与擦除，判据因此还成立。
+        """
+
+        row = _row()
+        first = self.store.record_decision(
+            user_id=USER_A, row=row, reason="x", decided_at=NOW, require_enabled_account=True
+        )
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_expires_at, content_digest, permissions_digest "
+                "FROM publish_outbox WHERE id = %s",
+                (first.outbox_id,),
+            )
+            expires, content_before, permissions_before = cursor.fetchone()
+
+        # 入队时就算好、且非空——不是"读的时候现算"。
+        self.assertTrue(content_before)
+        self.assertTrue(permissions_before)
+
+        self.assertEqual(self.store.redact_expired_payloads(now=expires), 1)
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT payload, content_digest, permissions_digest "
+                "FROM publish_outbox WHERE id = %s",
+                (first.outbox_id,),
+            )
+            payload, content_after, permissions_after = cursor.fetchone()
+
+        # 内容没了，摘要还在。
+        self.assertEqual(payload, {})
+        self.assertEqual(content_after, content_before)
+        self.assertEqual(permissions_after, permissions_before)
+
+        second = self.store.record_decision(
+            user_id=USER_A,
+            row=row,
+            reason="x",
+            decided_at=NOW,
+            require_enabled_account=True,
+            clear_delivered_content=True,
+        )
+
+        self.assertIs(second.outcome, DecisionOutcome.UNCHANGED)
+        self.assertEqual(second.cleared_events, 0)
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM publish_outbox WHERE user_id = %s", (USER_A,))
+            self.assertEqual(cursor.fetchone()[0], 1, "同内容不得排出第二条意图")
+
+    def test_a_real_permission_change_after_redaction_is_still_detected(self) -> None:
+        """否定断言的另一半：擦除之后**真的变了**仍然要判成变化并重排意图——
+        摘要修的是误判，不是把判定整体关掉。"""
+
+        first = self.store.record_decision(
+            user_id=USER_A, row=_row(), reason="x", decided_at=NOW, require_enabled_account=True
+        )
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_expires_at FROM publish_outbox WHERE id = %s", (first.outbox_id,)
+            )
+            expires = cursor.fetchone()[0]
+        self.assertEqual(self.store.redact_expired_payloads(now=expires), 1)
+
+        changed = _row(permissions='{"1011": ["another_metric"]}')
+        second = self.store.record_decision(
+            user_id=USER_A,
+            row=changed,
+            reason="x",
+            decided_at=NOW,
+            require_enabled_account=True,
+        )
+
+        self.assertIs(second.outcome, DecisionOutcome.ENQUEUED)
+
 
 class AwaitingReadinessTest(PermissionPublishPostgresTestCase):
     """S-C-03b 的每轮 tick 输入：**只有已发布、且确认还没收口**的那一版。

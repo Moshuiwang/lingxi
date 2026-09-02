@@ -60,7 +60,9 @@ from lingxi.core.permission.publish_row import (
     REVOKED_PERMISSIONS_TEXT,
     TOKEN_CIPHER_FIELD,
     PublishRow,
+    content_digest,
     is_cipher_shaped,
+    permissions_digest,
 )
 
 logger = logging.getLogger(__name__)
@@ -345,7 +347,7 @@ class PostgresPermissionPublishStore:
                         raise PermissionGrantBlockedByAccountState(account_state)
 
                     cursor.execute(
-                        """SELECT id, payload, status
+                        """SELECT id, payload, status, content_digest, permissions_digest
                              FROM publish_outbox
                             WHERE user_id = %s
                             ORDER BY permission_version DESC
@@ -356,8 +358,10 @@ class PostgresPermissionPublishStore:
                     # 清理触发的判据（第 4 步文档）：与上面的 ENQUEUED/UNCHANGED
                     # 判定完全独立，只比较 permissions 列文本，不看 email/name 等
                     # 资料字段，也不看上一条意图的状态。
-                    permissions_changed = latest is None or _permissions_changed(latest[1], row)
-                    if latest is not None and _same_content(latest[1], row) and latest[2] in (
+                    permissions_changed = latest is None or _permissions_changed(
+                        latest[1], latest[4], row
+                    )
+                    if latest is not None and _same_content(latest[1], latest[3], row) and latest[2] in (
                         "pending",
                         "publishing",
                         "published",
@@ -463,9 +467,21 @@ class PostgresPermissionPublishStore:
         with tx.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO publish_outbox
-                     (id, user_id, permission_version, reason, payload, content_expires_at)
-                   VALUES (%s, %s, %s, %s, %s, now())""",
-                (outbox_id, user_id, permission_version, reason.strip(), _jsonb(fields)),
+                     (id, user_id, permission_version, reason, payload, content_expires_at,
+                      content_digest, permissions_digest)
+                   VALUES (%s, %s, %s, %s, %s, now(), %s, %s)""",
+                (
+                    outbox_id,
+                    user_id,
+                    permission_version,
+                    reason.strip(),
+                    _jsonb(fields),
+                    # 摘要与快照同一条语句写入，之后**不随内容擦除消失**（迁移
+                    # ``0085``）：擦掉的是邮箱与姓名，留下的是"和另一份一不一样"
+                    # 这一个不可反推的答案，见 :func:`_same_content` 文档。
+                    content_digest(fields),
+                    permissions_digest(fields),
+                ),
             )
         return outbox_id
 
@@ -1010,20 +1026,33 @@ def _text(value: object) -> str:
     return str(value).strip()
 
 
-def _same_content(payload: Any, row: PublishRow) -> bool:
+def _same_content(payload: Any, digest: Any, row: PublishRow) -> bool:
     """上一条意图的内容与这一次的决定是否逐字段相同（``updated_at`` 不参与）。
 
-    比较前先把两边都归一成 ``{字段名: 文本}``：payload 从 JSONB 回来时数字会变成
-    Python 数字，而发布行永远是文本——按类型严格相等会让一次没有变化的刷新被判成变化。
+    **优先用摘要列，摘要列活过内容擦除**（Trace #544 P-3）：``payload`` 过了九十天会
+    被 :meth:`PostgresPermissionPublishStore.redact_expired_payloads` 擦成 ``'{}'``，
+    此后按 payload 比较必然判成"变了"——一份内容完全没变的权限于是被重排一条发布意图，
+    并连带触发 :func:`_permissions_changed` 那一侧的记忆与已送达正文清空。摘要列不参与
+    擦除，因此擦除之后这个判断仍然成立。
+
+    ``digest`` 为 ``NULL`` 的只有**迁移 0085 之前就已经被擦除**的历史行（没有内容可
+    回填）：那时退回原来的 payload 比较，行为与本次改动之前逐字相同——不为了新判据去
+    编造一个说不出来的答案。
+
+    payload 比较前先把两边都归一成 ``{字段名: 文本}``：payload 从 JSONB 回来时数字会
+    变成 Python 数字，而发布行永远是文本——按类型严格相等会让一次没有变化的刷新被判成
+    变化。
     """
 
+    if isinstance(digest, str) and digest:
+        return digest == content_digest(row.content_fields)
     if not isinstance(payload, Mapping):
         return False
     expected = row.content_fields
     return all(str(payload.get(name, "")) == value for name, value in expected.items())
 
 
-def _permissions_changed(payload: Any, row: PublishRow) -> bool:
+def _permissions_changed(payload: Any, digest: Any, row: PublishRow) -> bool:
     """已送达正文清理触发的专属判据（Trace #328 opus 审查 P1）：这次决定的
     ``permissions`` 文本是否与该用户**上一条意图**（不论其状态——失败、被取代、
     仍然有效都一样，见 :meth:`PostgresPermissionPublishStore.record_decision`
@@ -1036,8 +1065,15 @@ def _permissions_changed(payload: Any, row: PublishRow) -> bool:
     ``display_name`` 变化）或对同一份权限内容的重试发布都会让前者判真，但都不该
     触发清理——分开两个函数，让"哪个判定服务哪个决定"在类型上说得清楚，不是靠
     调用方记得只取子集字段。
+
+    **同样优先用摘要列**（Trace #544 P-3）：这一侧的误判后果最重——擦除之后按空 payload
+    比较恒判"变了"，于是把该用户的 ``user_memory`` 与全部会话已送达正文清空，用户侧
+    表现为"什么都没做，记忆和历史答案没了"。``digest`` 为 ``NULL``（迁移 0085 之前
+    就已擦除的历史行）时退回原来的 payload 比较，行为逐字不变。
     """
 
+    if isinstance(digest, str) and digest:
+        return digest != permissions_digest(row.content_fields)
     if not isinstance(payload, Mapping):
         return True
     return str(payload.get("permissions", "")) != row.permissions

@@ -73,24 +73,68 @@ _UNSUPPORTED_LINK_SCHEME_PATTERN = re.compile(
 #: 这些形态是对「飞书 text 消息里邮箱被自动链接化后的纯文本表现」的推理候选 +
 #: 逐形态实测的合成夹具，**不是真实抓包的逐字节回读**；哪一种真的发生过要靠
 #: ``router.py`` 新增的 ``token_shapes`` 取证字段在下一次复现时指认。
+#: 链接形态里「显示」段与「目标」段各自允许的最大长度。
+#:
+#: **这个上限首先是一条安全边界，其次才是形状约束**（Trace #544 A-1）：这几条
+#: pattern 原本用无上限的 ``+`` 描述两个段，正则引擎在**匹配不上**的长 token 上
+#: 会从每一个起点重新向前扫到底，整体退化成 O(n²)——已登记管理员只要发一条
+#: ``/admin user `` + 一个超长 token（连链接语法都不需要）就能让 gateway 的单线程
+#: 事件循环空转（实测 n=2000 → 340 ms，n=4000 → 1.35 s，n=20000 → 25 s 以上），
+#: 全体用户的消息随之排队。加上确定的重复上限后，每个起点最多向前扫这么多字符,
+#: 整体回到线性。
+#:
+#: 取 160 不改变任何一条**能解析成功**的输入的行为：合并后的 token 最终都要过
+#: :data:`_IDENTIFIER_PATTERN`/:data:`_METRIC_TOKEN_PATTERN`/
+#: :data:`_POSITION_TOKEN_PATTERN`，三者的上限都是 128 字符；目标段可能多带一个
+#: ``mailto:`` 前缀（7 字符），160 仍有富余。超过这个长度的段无论合不合并都只会
+#: 落到同一个 ``bad_*`` 拒绝上。
+_LINK_SEGMENT_MAX = 160
+
+#: ``<a …>`` 标签里 ``href`` 前后那两段属性文本的上限：属性不参与合并结果，只需要
+#: 够容纳真实富文本客户端可能塞进来的样式/追踪属性，因此给得比 :data:`_LINK_
+#: SEGMENT_MAX` 宽松；有确定上限同样是为了让这条 pattern 在没有闭合 ``>`` 的长
+#: 输入上不退化成二次方。
+_LINK_ATTRIBUTE_MAX = 512
+
+#: 六条 pattern 各自必须出现的最小标记：``<``（HTML 锚点 / 尖括号自动链接）、
+#: ``[``（markdown 链接）、``(``（扁平化括号形态）、``mailto:``（裸 scheme 形态）。
+#: 四个标记一个都没有时，六条 pattern 一条也不可能匹配——直接原样返回，
+#: 避免为一条注定不匹配的超长文本把整个 gateway 事件循环占住（Trace #544 A-1）。
+_LINK_MARK_CHARS = "<[("
+_LINK_MARK_SCHEME = "mailto:"
+
 _LINK_PAIR_PATTERNS: tuple[re.Pattern[str], ...] = (
     # <a href="mailto:E">E</a>（含单引号、附加属性；富文本降级成 HTML 时的形态）
     re.compile(
-        r"<a\b[^<>]*?\bhref\s*=\s*(?P<quote>[\"'])(?P<target>[^\"'<>]*)(?P=quote)[^<>]*>"
-        r"\s*(?P<display>[^<>]*?)\s*</a>",
+        r"<a\b[^<>]{0,%(attr)d}?\bhref\s*=\s*(?P<quote>[\"'])(?P<target>[^\"'<>]{0,%(cap)d})(?P=quote)"
+        r"[^<>]{0,%(attr)d}>\s*(?P<display>[^<>]{0,%(cap)d}?)\s*</a>"
+        % {"cap": _LINK_SEGMENT_MAX, "attr": _LINK_ATTRIBUTE_MAX},
         re.IGNORECASE,
     ),
     # [E] (mailto:E)：markdown 链接被插入空格
-    re.compile(r"\[\s*(?P<display>[^\[\]\s]+)\s*\]\s+\(\s*(?P<target>[^()\s]+)\s*\)"),
+    re.compile(
+        r"\[\s*(?P<display>[^\[\]\s]{1,%(cap)d})\s*\]\s+\(\s*(?P<target>[^()\s]{1,%(cap)d})\s*\)"
+        % {"cap": _LINK_SEGMENT_MAX}
+    ),
     # E (mailto:E) / E (E)：「显示文本 (目标)」式扁平化
-    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+\(\s*(?P<target>[^()\s]+)\s*\)"),
+    re.compile(
+        r"(?P<display>[^\s()\[\]<>`]{1,%(cap)d})\s+\(\s*(?P<target>[^()\s]{1,%(cap)d})\s*\)"
+        % {"cap": _LINK_SEGMENT_MAX}
+    ),
     # E [mailto:E]
-    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+\[\s*(?P<target>[^\[\]\s]+)\s*\]"),
+    re.compile(
+        r"(?P<display>[^\s()\[\]<>`]{1,%(cap)d})\s+\[\s*(?P<target>[^\[\]\s]{1,%(cap)d})\s*\]"
+        % {"cap": _LINK_SEGMENT_MAX}
+    ),
     # E <mailto:E>：RFC 5322 / 部分客户端的「显示 <目标>」
-    re.compile(r"(?P<display>[^\s()\[\]<>`]+)\s+<\s*(?P<target>[^<>\s]+)\s*>"),
+    re.compile(
+        r"(?P<display>[^\s()\[\]<>`]{1,%(cap)d})\s+<\s*(?P<target>[^<>\s]{1,%(cap)d})\s*>"
+        % {"cap": _LINK_SEGMENT_MAX}
+    ),
     # E mailto:E：显示与目标之间只剩一个空格
     re.compile(
-        r"(?P<display>[^\s()\[\]<>`]+)\s+(?P<target>mailto:[^\s()\[\]<>`]+)",
+        r"(?P<display>[^\s()\[\]<>`]{1,%(cap)d})\s+(?P<target>mailto:[^\s()\[\]<>`]{1,%(cap)d})"
+        % {"cap": _LINK_SEGMENT_MAX},
         re.IGNORECASE,
     ),
 )
@@ -142,9 +186,7 @@ class AdminCommandKind(str, Enum):
     QUERY_TRACE = "query_trace"
     SUSPEND_USER = "suspend_user"
     RESUME_USER = "resume_user"
-    GRANT_PERMISSION = "grant_permission"
     GRANT_POSITION_PERMISSION = "grant_position_permission"
-    SUPPRESS_PERMISSION = "suppress_permission"
     REVOKE_PERMISSION = "revoke_permission"
     UNKNOWN = "unknown"
 
@@ -193,10 +235,10 @@ class AdminRejectReason(str, Enum):
 class AdminCommand:
     """解析结果。``UNKNOWN`` 之外的取值只填各自需要的字段，其余保持默认。
 
-    ``company_id``/``metric_name``/``reason`` 三个字段由 ``GRANT_PERMISSION``/
-    ``SUPPRESS_PERMISSION`` 填（``identifier`` 复用做目标用户标识，与既有
-    ``suspend``/``resume`` 同一惯例）。``REVOKE_PERMISSION`` 有两种形状（#439 A
-    档新增第二种，见 ``_parse_revoke_permission_command`` 文档）：
+    ``company_id``/``metric_name``/``reason`` 三个字段只由 ``REVOKE_PERMISSION``
+    形状 2 填（``identifier`` 复用做目标用户标识，与既有 ``suspend``/``resume``
+    同一惯例）。``REVOKE_PERMISSION`` 有两种形状（#439 A 档新增第二种，见
+    ``_parse_revoke_permission_command`` 文档）：
 
     - 形状 1（旧，按行定位）：只填 ``identifier``（复用同一字段承载 override_id，
       不是 open_id）与 ``reason``，``company_id``/``metric_name`` 保持默认
@@ -309,8 +351,19 @@ def _collapse_identifier_link_forms(text: str) -> str:
 
     见 :data:`_LINK_PAIR_PATTERNS`。只做合并，不改写邮箱本身的大小写或内容；一次
     都没合并成功时返回的字符串与入参逐字相等（调用方据此判断"要不要重试解析"）。
+
+    **成本对输入长度必须是线性的**（Trace #544 A-1）：这个函数跑在 gateway 的单线程
+    事件循环上，一次调用慢下来就是全体用户的消息一起排队。因此先做一次
+    :data:`_LINK_MARK_CHARS`/:data:`_LINK_MARK_SCHEME` 必要标记预检（一个都没有就
+    原样返回），六条 pattern 的显示/目标段也都带确定上限（见
+    :data:`_LINK_SEGMENT_MAX`），不留"每个起点都重新扫到底"的二次方回溯面。
     """
 
+    if not any(mark in text for mark in _LINK_MARK_CHARS) and (
+        _LINK_MARK_SCHEME not in text.casefold()
+    ):
+        # 六条 pattern 的必要标记一个都没有：不可能合并出任何东西，原样返回。
+        return text
     for pattern in _LINK_PAIR_PATTERNS:
         text = pattern.sub(_collapse_link_pair, text)
     return text
@@ -456,12 +509,6 @@ def parse_admin_command(text: object) -> AdminCommand:
     - ``/admin suspend <identifier>``            → SUSPEND_USER（Issue #96 S-M-02：
       只建待确认操作，不直接执行；执行前须经本人飞书确认卡片）
     - ``/admin resume <identifier>``             → RESUME_USER（同上，对称动作）
-    - ``/admin grant_permission <identifier> <company_id> <metric_name> <reason...>``
-      → GRANT_PERMISSION（#319 S-P-1b：同样只建待确认操作，不直接执行；
-      ``company_id``/``metric_name`` 与 ``<identifier>`` 同一形状约束，``reason``
-      是尾部剩余全部 token 拼接成的自由文本，非空白、≤500 字符）
-    - ``/admin suppress_permission <identifier> <company_id> <metric_name> <reason...>``
-      → SUPPRESS_PERMISSION（同上，对称动作）
     - ``/admin revoke_permission <override_id> <reason...>``
       → REVOKE_PERMISSION（卡 B：``override_id`` 是本地权限覆盖行的内部标识
       ``lpo_*``——26 位 Crockford Base32 ULID 前缀，与 ``core/ids.is_ulid`` 同一
@@ -474,12 +521,20 @@ def parse_admin_command(text: object) -> AdminCommand:
       按第一个 token 是否形似 override_id 分辨，见 ``_parse_revoke_permission_
       command`` 文档）
 
+    **``/admin grant_permission`` 与 ``/admin suppress_permission`` 已撤除**
+    （Trace #544 D-5，产品负责人裁定）：这两条命令按"公司×指标"两个自由文本参数
+    收本地权限覆盖，语法层只校验字符集、不核对指标目录，管理员因此可以写出目录
+    外的公司与指标并让它们进入正式发布链。裁定不是给它们加一层目录校验，而是撤
+    掉入口本身——补充授权统一走管理卡的"银河职位×公司范围"表单（目录内取值，见
+    ``_parse_position_permission_command``）。这两个命令名自本批起落在下面
+    ``UNKNOWN_SUBCOMMAND`` 上，与任何一个没听说过的命令名同一条回复，**不产生任何
+    待确认操作、不写任何授权审计**。
+
     任何不匹配以上形状的输入（含空文本、非字符串、未知子命令、参数数量或形状不对、
     小时数越界）一律返回 ``UNKNOWN``——调用方据此回复帮助/拒绝文案，不猜测意图。
 
     **标识参数支持邮箱（#439 A 档）**：``user``/``audit``/``suspend``/``resume``/
-    ``grant_permission``/``suppress_permission`` 与 revoke 新形状里标记目标用户的
-    ``<identifier>``，既可以是 open_id 也可以是邮箱——本函数只按 ``_IDENTIFIER_
+    ``grant_position`` 与 revoke 新形状里标记目标用户的 ``<identifier>``，既可以是 open_id 也可以是邮箱——本函数只按 ``_IDENTIFIER_
     PATTERN`` 判定"形状是否安全"，不区分两者；把邮箱反查成 open_id 是
     ``router.py``/``adapters/admin_registry.py`` 的职责（``AdminQueries.
     resolve_identifier``），本模块继续不做任何查询。
@@ -563,14 +618,8 @@ def _parse_tokens(tokens: list[str]) -> AdminCommand:
     if sub == "resume":
         return _parse_single_identifier(rest, kind=AdminCommandKind.RESUME_USER)
 
-    if sub == "grant_permission":
-        return _parse_permission_command(rest, kind=AdminCommandKind.GRANT_PERMISSION)
-
     if sub in {"grant_position", "grant_position_permission"}:
         return _parse_position_permission_command(rest)
-
-    if sub == "suppress_permission":
-        return _parse_permission_command(rest, kind=AdminCommandKind.SUPPRESS_PERMISSION)
 
     if sub == "revoke_permission":
         return _parse_revoke_permission_command(rest)
@@ -595,8 +644,9 @@ def _parse_single_identifier(rest: list[str], *, kind: AdminCommandKind) -> Admi
 
 
 def _parse_permission_command(rest: list[str], *, kind: AdminCommandKind) -> AdminCommand:
-    """``grant_permission``/``suppress_permission``（以及 ``revoke_permission``
-    形状 2，见 :func:`_parse_revoke_permission_command`）共用的解析：
+    """``revoke_permission`` 形状 2（见 :func:`_parse_revoke_permission_command`）
+    的解析——``grant_permission``/``suppress_permission`` 两条命令已按 Trace #544
+    D-5 撤除，这个形状因此只剩收回一个使用者：
     ``<identifier> <company_id> <metric_name> <reason...>``——前三个 token 与既有
     ``user``/``suspend``/``resume`` 同一形状约束（``_IDENTIFIER_PATTERN``），
     第四个及以后全部 token 按空白拼接还原成一段自由文本 ``reason``。
@@ -688,9 +738,10 @@ def _parse_revoke_permission_command(rest: list[str]) -> AdminCommand:
 
     1. ``<override_id|permission_group_id> <reason...>``——管理卡按钮形状：历史
        ``lpo_`` 按行定位，新授权组 ``lpg_`` 按职位+范围整体定位。
-    2. ``<identifier> <company_id> <metric_name> <reason...>``——与
-       ``grant_permission``/``suppress_permission`` **同一个参数形状**（#439 卡内
-       证据：形状不同致管理员两次真实误用），``identifier`` 是目标用户标识（open_id
+    2. ``<identifier> <company_id> <metric_name> <reason...>``——历史上与
+       ``grant_permission``/``suppress_permission`` 共用的那个参数形状（#439 卡内
+       证据：形状不同致管理员两次真实误用；那两条命令已按 Trace #544 D-5 撤除，
+       这个形状保留在收回一侧不变），``identifier`` 是目标用户标识（open_id
        或邮箱）、``company_id``/``metric_name`` 定位要收回的那一条本地覆盖；服务端
        反查出 override_id 的职责在 ``router.py``（经 ``AdminQueries.
        resolve_override_id``），本模块只负责识别出"这是第二种形状"并原样透传三个
@@ -735,7 +786,7 @@ def _parse_audit(rest: list[str]) -> AdminCommand:
         )
     if len(rest) == 1:
         token = rest[0]
-        if token.isdigit():
+        if token.isdecimal():
             hours = _validated_hours(token)
             if hours is None:
                 return _unknown(AdminRejectReason.BAD_WINDOW_HOURS)
@@ -755,7 +806,7 @@ def _parse_audit(rest: list[str]) -> AdminCommand:
         # （Issue #492 完成标准 4）；拆成两条判断，语义逐字不变。
         if identifier is None or not _IDENTIFIER_PATTERN.fullmatch(identifier):
             return _unknown(AdminRejectReason.BAD_IDENTIFIER)
-        if not hours_token.isdigit():
+        if not hours_token.isdecimal():
             return _unknown(AdminRejectReason.BAD_WINDOW_HOURS)
         hours = _validated_hours(hours_token)
         if hours is None:
@@ -767,7 +818,21 @@ def _parse_audit(rest: list[str]) -> AdminCommand:
 
 
 def _validated_hours(token: str) -> int | None:
-    value = int(token)
+    """把已经过形状判定的小时数 token 换算成整数；换算不出来一律 ``None``。
+
+    **判定用 ``str.isdecimal()`` 而不是 ``str.isdigit()``**（Trace #544 A-2）：
+    ``isdigit()`` 对上标/下标数字（``"²⁴"``、``"₁₂"``）与圈号数字为真，``int()``
+    对它们却直接抛 ``ValueError``——``/admin audit ²⁴`` 于是不是落到"小时数不对"
+    这条明确拒绝上，而是把整条命令打挂成一句笼统的"本次管理命令处理失败"。
+    ``isdecimal()`` 只对真正能被 ``int()`` 接受的十进制数字为真。外面那层
+    ``try`` 是纵深：形状判定与换算分处两个函数，未来任何一处放宽都不该重新把
+    一个奇怪字符变成一次异常。
+    """
+
+    try:
+        value = int(token)
+    except ValueError:
+        return None
     if value < 1 or value > MAX_AUDIT_WINDOW_HOURS:
         return None
     return value

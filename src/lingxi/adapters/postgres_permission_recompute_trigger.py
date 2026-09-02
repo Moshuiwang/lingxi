@@ -84,7 +84,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_targeted_recompute_lookup import (
     resolve_local_override_target,
     resolve_open_id_target,
@@ -118,6 +118,55 @@ class _BaselineIdentityLookup:
 
     def find_active(self, *, user_id: str) -> ArchivedIdentity | None:
         return self._by_id.get(user_id)
+
+
+#: 撤权专用身份查询（Trace #544 P-6）：与 ``postgres_roster_audit.ACTIVE_BASELINE_SQL``
+#: 取同样五列，但**不要求 ``provisioning_state = 'active'``**——停用要服务的是任何还
+#: 可能有一条发布内容在外面的人，包括首聊开通到一半就被停用的那个。仍然排除已删除
+#: 账号：那些行的内容已经随删除流程清理，不该再为它们排一条撤权意图。理由全文见
+#: ``core/permission/targeted_recompute.TargetedPermissionRecompute.force_revoke``。
+_REVOCATION_IDENTITY_SQL = """
+SELECT id, feishu_user_id, display_name, employee_no, email
+  FROM app_user
+ WHERE id = %s
+   AND account_state NOT IN ('deleting', 'deleted')
+"""
+
+
+class _RevocationIdentityLookup:
+    """按 ``user_id`` 现查一行，不预载基线。
+
+    撤权是单点动作，一次一个人；预载全表基线在这里没有意义，而"现查"还顺带保证读到
+    的是**这一刻**的行（停用写入刚提交，紧接着这一查一定看得到）。
+    """
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    def find_for_revocation(self, *, user_id: str) -> ArchivedIdentity | None:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(_REVOCATION_IDENTITY_SQL, (user_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return ArchivedIdentity(
+            app_user_id=str(row[0]),
+            personnel_id=_identity_text(row[1]),
+            display_name=_identity_text(row[2]),
+            employee_no=_identity_text(row[3]),
+            email=_identity_text(row[4]),
+        )
+
+
+def _identity_text(value: object) -> str:
+    """``NULL`` 与空白归一成空串——与 ``adapters/postgres_roster_audit._text`` 同口径。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
 
 class _RosterRowsAdapter:
@@ -216,6 +265,7 @@ class PermissionRecomputeAdapter:
             audit=self._audit,
             local_overrides=local_override_reader(self._dsn, timeouts=self._timeouts),
             legacy_all_scope=PostgresLocalPermissionOverrideStore(self._dsn, timeouts=self._timeouts),
+            revocation_identities=_RevocationIdentityLookup(self._dsn, timeouts=self._timeouts),
         )
 
         if pending.action_type is PendingActionType.SUSPEND_USER:

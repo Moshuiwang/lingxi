@@ -14,7 +14,6 @@ import unittest
 from lingxi.core.admin.management_card import (
     ADMIN_ACTION_GRANT,
     ADMIN_ACTION_REVOKE,
-    ADMIN_ACTION_SUPPRESS,
     render_management_card,
 )
 from lingxi.core.admin.views import (
@@ -382,135 +381,53 @@ class LegacyAllScopeGroupSectionTests(unittest.TestCase):
         self.assertIn("全部", markdown_texts)
 
 
-class GrantSuppressFormSectionTests(unittest.TestCase):
-    def test_form_contains_exactly_two_selects_one_input_and_two_submit_buttons(self) -> None:
+class RetiredLegacyFormSectionTests(unittest.TestCase):
+    """旧目录（无 ``positions()``）兼容分支自 Trace #544 D-5 起**不再渲染写入表单**。
+
+    那个分支原来渲染的是「公司×指标」两个下拉 + 补充授权 / 屏蔽指标两个提交按钮，
+    提交出去的正是 ``/admin grant_permission`` / ``/admin suppress_permission``——
+    命令已经撤除，按钮留着只会点出一句"入口已下线"。生产目录始终提供 ``positions()``
+    并走职位×范围表单，因此这条分支只在历史测试与 pre-#493 假目录下出现。
+    """
+
+    def test_legacy_branch_renders_no_write_form_at_all(self) -> None:
         card = render_management_card(
             _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
         )
-        forms = _find_forms(card)
-        self.assertEqual(len(forms), 1)
-        form_elements = forms[0]["elements"]
-        selects = _find_selects(form_elements)
-        self.assertEqual(len(selects), 2)
-        self.assertEqual({s["name"] for s in selects}, {"company_id", "metric_name"})
-        inputs = [e for e in form_elements if e.get("tag") == "input"]
-        self.assertEqual(len(inputs), 1)
-        self.assertEqual(inputs[0]["name"], "reason")
-        buttons = _find_buttons(form_elements)
-        self.assertEqual(len(buttons), 2)
-        actions = {b["behaviors"][0]["value"]["admin_action"] for b in buttons}
-        self.assertEqual(actions, {ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS})
-        for button in buttons:
-            self.assertEqual(button["form_action_type"], "submit")
-            self.assertEqual(button["behaviors"][0]["value"]["identifier"], "ou_target")
 
-    def test_submit_buttons_are_labelled_with_the_new_terminology(self) -> None:
-        """术语统一（Trace #469 S-1 PM 补充裁定第 4 条）：「新增授权」→「补充
-        授权」、「新增抑制」→「屏蔽指标」。"""
+        self.assertEqual(_find_forms(card), [], "旧分支不得再渲染任何写入表单")
+
+    def test_legacy_branch_offers_no_submit_buttons(self) -> None:
+        """连按钮也不留：一个按不动的按钮比没有按钮更糟。"""
 
         card = render_management_card(
             _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
         )
-        form_elements = _find_forms(card)[0]["elements"]
-        buttons = _find_buttons(form_elements)
-        labels = {b["text"]["content"] for b in buttons}
-        self.assertEqual(labels, {"补充授权", "屏蔽指标"})
-        self.assertNotIn("新增授权", labels)
-        self.assertNotIn("新增抑制", labels)
+        submit_actions = {
+            button["behaviors"][0]["value"].get("admin_action")
+            for button in _find_buttons(_elements(card))
+        }
 
-    def test_submit_buttons_have_non_empty_unique_names_and_are_horizontally_laid_out(
-        self,
-    ) -> None:
-        """200530 修复 + 按钮横排（PM 补充裁定第 5/6 条，W0-1 探针裁定）：两个
-        提交按钮携带非空且互不相同的 ``name``，并横排进一个显式声明
-        ``flex_mode`` 的 ``column_set``（2 个按钮用 ``bisect``）。"""
+        self.assertNotIn("suppress", submit_actions)
+        self.assertNotIn(ADMIN_ACTION_GRANT, submit_actions)
 
+    def test_legacy_branch_says_why_there_is_no_form(self) -> None:
         card = render_management_card(
             _status(), display_identifier="ou_target", catalog=FakeCatalog(), display_names=FakeDisplayNames()
         )
-        form_elements = _find_forms(card)[0]["elements"]
-        column_sets = [e for e in form_elements if e.get("tag") == "column_set"]
-        self.assertEqual(len(column_sets), 1)
-        column_set = column_sets[0]
-        self.assertEqual(column_set["flex_mode"], "bisect")
-        self.assertEqual(len(column_set["columns"]), 2)
-        names: list[str] = []
-        for column in column_set["columns"]:
-            self.assertEqual(column["tag"], "column")
-            self.assertEqual(column["width"], "auto")
-            self.assertEqual(len(column["elements"]), 1)
-            button = column["elements"][0]
-            self.assertEqual(button["tag"], "button")
-            self.assertTrue(button["name"])
-            names.append(button["name"])
-        self.assertEqual(len(names), len(set(names)), "两个提交按钮的 name 必须互不相同")
-
-    def test_mutation_missing_button_name_is_caught_at_assembly_time(self) -> None:
-        """变异验红①（W0-1 探针裁定：200530 只在真实点击时触发，建卡请求本身
-        不会暴露，必须在装配阶段静态钉死）：手工改坏
-        ``core/admin/management_card._callback_button``，去掉 form 内提交按钮
-        的 ``name``，渲染必须失败（``ValueError``），证明这条防线真的在起作用。
-        """
-
-        import lingxi.core.admin.management_card as management_card_module
-
-        original = management_card_module._callback_button
-
-        def _broken_callback_button(*, label, style, value, form_submit=False, name=None):
-            # 模拟"忘记传 name"这一类回归：无条件丢弃调用方传入的 name。
-            return original(label=label, style=style, value=value, form_submit=False)
-
-        management_card_module._callback_button = _broken_callback_button
-        try:
-            with self.assertRaises(ValueError):
-                render_management_card(
-                    _status(),
-                    display_identifier="ou_target",
-                    catalog=FakeCatalog(),
-                    display_names=FakeDisplayNames(),
-                )
-        finally:
-            management_card_module._callback_button = original
-
-    def test_company_and_metric_options_come_from_the_injected_catalog(self) -> None:
-        catalog = FakeCatalog(companies=["1011", "1012", "1013"], metrics=["sub_new_count"])
-        card = render_management_card(
-            _status(), display_identifier="ou_target",
-            catalog=catalog,
-            display_names=FakeDisplayNames(),
+        markdown_texts = "\n".join(
+            e["content"] for e in _elements(card) if e.get("tag") == "markdown"
         )
-        selects = _find_selects(_find_forms(card)[0]["elements"])
-        company_select = next(s for s in selects if s["name"] == "company_id")
-        metric_select = next(s for s in selects if s["name"] == "metric_name")
-        self.assertEqual(
-            [o["value"] for o in company_select["options"]], ["1011", "1012", "1013"]
-        )
-        self.assertEqual([o["value"] for o in metric_select["options"]], ["sub_new_count"])
 
-    def test_empty_catalog_degrades_to_a_placeholder_option_not_a_missing_dropdown(self) -> None:
-        """目录不可用（读取失败/为空）时下拉退化为一个不可选占位项，而不是
-        省略整个表单——见 ``render_management_card`` 模块文档「组件选择」。"""
+        self.assertIn("暂时无法发起补充授权", markdown_texts)
 
-        card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=FakeCatalog(companies=[], metrics=[]),
-            display_names=FakeDisplayNames(),
-        )
-        selects = _find_selects(_find_forms(card)[0]["elements"])
-        for select in selects:
-            self.assertEqual(len(select["options"]), 1)
-            self.assertEqual(select["options"][0]["value"], "")
+    def test_suppress_action_constant_is_gone(self) -> None:
+        """撤除不留半截：卡片层不再有"屏蔽指标"这个动作取值与提交按钮名。"""
 
-    def test_catalog_raising_an_exception_does_not_crash_rendering(self) -> None:
-        """否定断言：目录端口本身抛异常不得让整张卡渲染失败——目录不可用是
-        展示层的可选降级分支，不是渲染函数的前置条件。"""
+        import lingxi.core.admin.management_card as management_card
 
-        card = render_management_card(
-            _status(), display_identifier="ou_target", catalog=RaisingCatalog(), display_names=FakeDisplayNames()
-        )
-        selects = _find_selects(_find_forms(card)[0]["elements"])
-        self.assertEqual(len(selects), 2)
-        for select in selects:
-            self.assertEqual(select["options"][0]["value"], "")
+        self.assertFalse(hasattr(management_card, "ADMIN_ACTION_SUPPRESS"))
+        self.assertFalse(hasattr(management_card, "SUPPRESS_SUBMIT_BUTTON_NAME"))
 
 
 class ZeroInternalIdTests(unittest.TestCase):

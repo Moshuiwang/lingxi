@@ -437,9 +437,19 @@ class DecideConfirmExpiryTests(unittest.TestCase):
         )
         self.assertIs(decision.kind, ConfirmResultKind.EXPIRE)
 
-    def test_expiry_is_checked_before_clicker_identity(self) -> None:
-        """一个过期的操作即使被错误的人点击，结论也是"已过期"而不是"非本人"——
-        这是刻意的核对顺序（见 ``decide_confirm`` 文档），本用例把顺序钉死。"""
+    def test_clicker_identity_is_checked_before_expiry(self) -> None:
+        """**非发起人点一张已过期的卡，结论必须是"非本人"而不是"已过期"**
+        （Trace #544 A-3，本用例把修复后的顺序钉死）。
+
+        顺序反过来时，``EXPIRE`` 会带着 ``terminal_status=EXPIRED`` 回到
+        adapter：那一步把 ``decided_by_open_id`` 写成点击者、发群通知、并把终态
+        卡回给点击者——一个与这次操作毫无关系的人被记成了决定人。确认卡可以被
+        转发，因此这是真实可达的场景，不是理论排列。
+
+        断言两件事：结论是 ``NOT_INITIATOR``，且 ``terminal_status``/``reason``
+        全空——"不记决定人、不发群通知"在这一层的唯一可判据就是这个决策**不携带
+        任何终态写入**（adapter 只在 ``terminal_status`` 非空时才落终态与通知）。
+        """
 
         pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
         decision = decide_confirm(
@@ -449,7 +459,35 @@ class DecideConfirmExpiryTests(unittest.TestCase):
             registry_entry=_full_admin_entry(open_id=OTHER_OPEN_ID),
             current_account_state="enabled",
         )
+        self.assertIs(decision.kind, ConfirmResultKind.NOT_INITIATOR)
+        self.assertIsNone(decision.terminal_status)
+        self.assertIsNone(decision.reason)
+        self.assertFalse(decision.ok)
+
+    def test_initiator_still_sees_expired_after_deadline(self) -> None:
+        """不误伤：真正的发起人点一张已过期的卡，仍然是"已过期"并首次转终态。"""
+
+        pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
+        decision = decide_confirm(
+            pending=pending,
+            clicker_open_id=INITIATOR,
+            now=NOW,
+            registry_entry=_full_admin_entry(),
+            current_account_state="enabled",
+        )
         self.assertIs(decision.kind, ConfirmResultKind.EXPIRE)
+        self.assertIs(decision.terminal_status, PendingActionStatus.EXPIRED)
+
+    def test_cancel_by_non_initiator_after_expiry_writes_nothing(self) -> None:
+        """"取消"侧同一条顺序：非发起人点一张已过期的卡不得把它翻成终态。"""
+
+        pending = _pending(confirm_deadline_at=NOW - timedelta(seconds=1))
+        decision = decide_cancel(
+            pending=pending, clicker_open_id=OTHER_OPEN_ID, now=NOW
+        )
+        self.assertIs(decision.kind, CancelResultKind.NOT_INITIATOR)
+        self.assertIsNone(decision.terminal_status)
+        self.assertIsNone(decision.reason)
 
 
 class DecideConfirmNotInitiatorTests(unittest.TestCase):

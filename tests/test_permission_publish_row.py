@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from lingxi.core.permission.publish_row import (
     ALL_COMPANIES_KEY,
     CREATED_FIELD_NAMES,
+    DIGEST_FIELD_NAMES,
     PUBLISHED_FIELD_NAMES,
     REASON_NO_COMPANY_SCOPE,
     REASON_NO_ROLES,
@@ -40,10 +41,12 @@ from lingxi.core.permission.publish_row import (
     build_publish_row,
     build_translated_publish_row,
     compare_readback,
+    content_digest,
     format_updated_at,
     is_cipher_shaped,
     lookup_metrics,
     parse_permissions,
+    permissions_digest,
     readback_text,
     serialize_permissions,
     serialize_translated_permissions,
@@ -703,3 +706,86 @@ class ReadbackTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ContentDigestTests(unittest.TestCase):
+    """P-3（Trace #544，对抗审查面 3）：内容摘要必须**独立于九十天擦除**。
+
+    ``publish_outbox.payload`` 里有邮箱与姓名，到期必须被擦成空对象；可是"这一版权限
+    和上一版一样吗"此前只能读那份 payload，擦过之后读到空对象，一份内容完全没变的权限
+    被判成"变了"——重排一条发布意图，并按「权限变化感知即清」把该用户的 ``user_memory``
+    与全部会话已送达正文清空。用户侧表现为"什么都没做，记忆和历史答案却没了"。
+
+    摘要是单向的：它说不出邮箱、姓名或权限内容，只能回答"和另一份一不一样"，因此可以
+    留在被擦除之后（迁移 ``0085``）。
+    """
+
+    def _fields(self, **overrides):
+        fields = {
+            "record_key": "rec_1",
+            "email": "a@b.com",
+            "name": "张三",
+            "permissions": '{"1011": ["daily_active"]}',
+            "status": "启用",
+            "updated_at": "2026-09-02 10:00",
+        }
+        fields.update(overrides)
+        return fields
+
+    def test_same_content_same_digest(self) -> None:
+        self.assertEqual(content_digest(self._fields()), content_digest(self._fields()))
+
+    def test_updated_at_does_not_participate(self) -> None:
+        """时间戳每轮都不同：算进去会让每日刷新天天判成"变了"。"""
+
+        self.assertEqual(
+            content_digest(self._fields()),
+            content_digest(self._fields(updated_at="2099-01-01 00:00")),
+        )
+
+    def test_token_cipher_does_not_participate(self) -> None:
+        """七字段新建快照与六字段更新快照的内容摘要必须一致——令牌不是"内容"。"""
+
+        with_cipher = self._fields()
+        with_cipher["token_cipher"] = "v1:xxxx"
+        self.assertEqual(content_digest(self._fields()), content_digest(with_cipher))
+
+    def test_每个内容字段变化都会改变摘要(self) -> None:
+        base = content_digest(self._fields())
+        for field, value in (
+            ("record_key", "rec_2"),
+            ("email", "c@d.com"),
+            ("name", "李四"),
+            ("permissions", '{"1011": ["x"]}'),
+            ("status", "已停用"),
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(base, content_digest(self._fields(**{field: value})))
+
+    def test_permissions_digest_only_tracks_permissions(self) -> None:
+        """改名不该清记忆：``permissions_digest`` 对 email/name 变化恒定。"""
+
+        base = permissions_digest(self._fields())
+        self.assertEqual(base, permissions_digest(self._fields(email="c@d.com", name="李四")))
+        self.assertNotEqual(base, permissions_digest(self._fields(permissions="{}")))
+
+    def test_erased_payload_digests_differ_from_real_content(self) -> None:
+        """被擦成空对象的 payload 算不出与真实内容相同的摘要——这正是"擦除之后判据
+        还成立"要靠**存下来的**摘要而不是现算的原因。"""
+
+        self.assertNotEqual(content_digest({}), content_digest(self._fields()))
+
+    def test_digest_is_stable_across_jsonb_roundtrip_types(self) -> None:
+        """payload 从 JSONB 回来时数字会变成 Python 数字，而发布行永远是文本；
+        摘要归一必须让两者算出同一个值。"""
+
+        numeric = self._fields(record_key=1011)
+        textual = self._fields(record_key="1011")
+        self.assertEqual(content_digest(numeric), content_digest(textual))
+
+    def test_digest_field_order_is_pinned(self) -> None:
+        """顺序是算法的一部分（迁移 0085 的 SQL 回填按同一顺序拼串）。"""
+
+        self.assertEqual(
+            DIGEST_FIELD_NAMES, ("record_key", "email", "name", "permissions", "status")
+        )

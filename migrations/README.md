@@ -11,7 +11,7 @@
 | 当前事实 | 值 |
 | --- | --- |
 | 基线 revision（链首） | `20260806_baseline` |
-| head revision | `0085_app_user_email_unique` |
+| head revision | `0086_publish_outbox_digest` |
 | 配置文件 | 仓库根目录 `alembic.ini` |
 | revision 目录 | `migrations/alembic/versions/` |
 | 连接串环境变量 | `LINGXI_MIGRATION_DSN`（缺失即失败，无默认值） |
@@ -583,6 +583,16 @@ rc25 S-2a，对抗审查 X-1。`app_user` 新增 `lower(btrim(email))` 上的**�
 **升级前置**：目标库 `app_user` 不得已经存在同一规范化邮箱的多行（2026-09-02 生产
 预检为 0 行）。若建索引失败，说明该环境真的有共用邮箱的两个人，必须先人工决定谁
 保留该邮箱再重跑，**不得**改成非唯一索引绕过。
+## `0086_publish_outbox_digest`（发布意图的内容摘要列）
+
+Trace #544 P-3。`publish_outbox` 新增 `content_digest` 与 `permissions_digest`
+两列 SHA-256 摘要，让「这一版权限和上一版一样吗」这个判断**不再依赖会被九十天擦除
+的 `payload`**：擦除之后原来的判据读到空对象，一份内容完全没变的权限被判成变了，
+于是重排一条发布意图并把该用户的 `user_memory` 与全部会话已送达正文一并清空——用户
+侧表现为什么都没发生，记忆和历史答案却没了。两列不参与擦除（摘要是单向的，说不出
+邮箱、姓名或权限内容）。升级同时按同一算法回填**尚未被擦除**的存量行；已经擦过的历史
+行没有内容可回填，保持 `NULL`，读侧遇到 `NULL` 退回原来的 `payload` 比较，行为与本
+迁移之前逐字相同。downgrade 删除两列（有损但不删除业务行）。
 
 ## `0054_retention_cleanup` 的三条越界边界（保留清理）
 
