@@ -746,7 +746,7 @@ def build_supervisor(
     pending_action_store = PostgresPendingActionStore(
         str(config.postgres_dsn),
         timeouts=config.postgres_timeouts,
-        audit=audit,
+        audit=audit, metric_map_path=config.metric_map_path,
     )
     # 管理员可见展示名解析口（Trace #469 S-1）：open_id→姓名+邮箱、公司编号→
     # 中文名、指标 ID→中文别名三个真库/真配置查询集中在 ``PostgresAdminQueries``
@@ -776,7 +776,7 @@ def build_supervisor(
     # 管理卡上下文（#493）由 PostgreSQL 持久保存；发送侧登记与回调侧读取共用同一
     # 个 store，gateway 重启后仍能恢复目标、卡片实体与 sequence。
     management_card_transport = LarkAdminManagementCardTransport(client)
-    management_card_catalog = TomlCompanyMetricCatalog()
+    management_card_catalog = TomlCompanyMetricCatalog(metric_map_path=config.metric_map_path)
     # #493：message_id→目标、card_id、快照和 sequence 必须跨 gateway 重启保留，
     # 生产装配使用 PostgreSQL，而不是旧的进程内 TTL 映射。
     management_card_context_store = PostgresManagementCardContextStore(
@@ -1010,7 +1010,7 @@ def build_supervisor(
         # 模块文档「BackgroundPermissionRecomputeTrigger」一节）。
         recompute_trigger=BackgroundPermissionRecomputeTrigger(
             PermissionRecomputeAdapter(
-                str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
+                str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit, metric_map_path=config.metric_map_path
             ),
             audit=audit,
             on_completed=_recompute_completed,

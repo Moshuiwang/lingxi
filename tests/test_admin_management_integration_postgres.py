@@ -107,7 +107,7 @@ class ManagementCardCallbackIntegrationTestCase(unittest.TestCase):
         )
 
         confirm_audit = _RecordingAudit()
-        self.pending_store = PostgresPendingActionStore(self._dsn, audit=confirm_audit)
+        self.pending_store = PostgresPendingActionStore(self._dsn, audit=confirm_audit, metric_map_path=None)
         # 同一个 PostgresAdminQueries 实例结构性实现 AdminDisplayNames（Trace
         # #469 S-1），与真实 apps/gateway/__init__.py 装配同一姿态——不需要
         # 额外声明或继承，注入到下面三处需要它的构造点。

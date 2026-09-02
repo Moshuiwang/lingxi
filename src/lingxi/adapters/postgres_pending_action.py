@@ -105,6 +105,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Protocol
 
 from lingxi.adapters.admin_registry import admin_registry_entry_from_row
@@ -266,10 +267,23 @@ class PostgresPendingActionStore:
         *,
         timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
         audit: AuditSink,
+        metric_map_path: Path | None,
     ) -> None:
+        """``metric_map_path``：「公司+职能→指标名」映射的外置路径，由装配层从
+        ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 读出后注入（Trace #544 S-2c
+        修复对抗审查 P-1）；``None`` = 这台机器没配外置文件，落回随包默认。
+
+        **刻意没有默认值**：:meth:`prepare` 的职位+公司范围展开会把这份映射直接
+        变成一批"公司×指标"授权对写进 ``pending_action.payload``——管理员确认后
+        就是真实权限。此前这里无条件读随包默认映射，而 scheduler 的日批读外置
+        文件，两条路径因此可以对同一个职位给出不同的指标集合。构造参数没有默认
+        值，新调用点就不可能"忘了传"而悄悄退回随包默认。
+        """
+
         self._dsn = dsn
         self._timeouts = timeouts
         self._audit = audit
+        self._metric_map_path = metric_map_path
 
     def get(self, *, pending_action_id: str) -> PendingAction | None:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
@@ -354,7 +368,7 @@ class PostgresPendingActionStore:
                 from lingxi.adapters.company_function_metric_map_file import load_company_function_metric_map
                 from lingxi.adapters.role_function_map_file import load_role_function_map
 
-                company_map = load_company_function_metric_map()
+                company_map = load_company_function_metric_map(self._metric_map_path)
                 position_expansion = expand_position_scope(
                     position_name=position_name or "",
                     company_scope=company_scope or "",
@@ -363,6 +377,19 @@ class PostgresPendingActionStore:
                     available_companies=tuple(key for key in company_map if key != "*"),
                 )
             except (OSError, ValueError, KeyError, TypeError) as error:
+                # 失败关闭，且**留痕**（Trace #544 S-2c，与 scheduler 侧
+                # `permission_refresh.duty_not_registered reason=metric_
+                # translation_map_unavailable` 同一条纪律与同一份字段：只记异常
+                # 类型，不记路径与文件内容）：这次管理动作一行权限都不写，也
+                # **不会**退回随包默认映射悄悄放一批"看起来正常"的授权出去。
+                # 外置文件配错与"这个职位本来就没配映射"在管理员看到的文案上
+                # 是同一句，运维要靠这条审计分辨该找谁。
+                self._audit.record(
+                    "admin.pending_action.position_mapping_unavailable",
+                    target=target_open_id,
+                    initiated_by=initiated_by_open_id,
+                    error=type(error).__name__,
+                )
                 return PrepareOutcome(
                     decision=PrepareDecision(
                         ok=False,
