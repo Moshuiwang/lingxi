@@ -106,6 +106,27 @@ CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR = "LINGXI_INNERTEST_CONTENT_CAPTURE_ENVI
 # 断言这个值永不出现在任何 compose 编排文件里（尤其是 deploy/compose.prod.yaml）。
 CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE = "stage-innertest-explicit-opt-in"
 
+# 代码侧的环境判据（对抗审查 2026-09-02 C-7）。此前 `_innertest_content_capture`
+# **只**精确匹配上面两个变量，没有任何一处能回答"我现在跑在哪个环境"——两侧镜像
+# 与 compose 结构完全相同，于是"把 stage 的 worker env 文件整份复制到生产"这条
+# 已登记的残余风险在代码层面完全不可识别。
+#
+# 这个变量把判据搬回**入库的 compose 文件**：`deploy/compose.prod.yaml` 的
+# `environment:` 里写死 `prod`，而 compose 的 `environment:` **覆盖** `env_file`
+# ——即使有人把 stage 的 env 文件整份抄进 `.env.prod.worker-queue`，抄来的值也
+# 不再可能生效。判据因此活在被评审、被门禁扫描的仓库文件里，不活在不入库、
+# 谁都能整份复制的宿主机 env 文件里。姿态与同批 `LINGXI_WORKER_WORKSPACE` 一致。
+#
+# 语义刻意保守且**只朝一个方向收紧**：
+#   - 声明为生产 → 内容采集一律不生效（哪怕两个变量都配对了）；
+#   - 未声明或声明为别的值 → 维持原来的双变量判定，不改变 stage 现有行为，
+#     也不让一个漏配的变量把 worker 拦在启动之外（采集是旁路能力，不是服务本体）。
+DEPLOY_ENVIRONMENT_VAR = "LINGXI_DEPLOY_ENVIRONMENT"
+#: 被认作「这是生产」的取值（大小写与首尾空白不敏感）。写成**元组字面量**是为了
+#: 让 `scripts/ci/check_deploy_contract.py` 能用 `ast.literal_eval` 直接读到它，
+#: 不 import 业务代码就能核对 compose 里写的值确实在这张表里（拼错是静默的）。
+PRODUCTION_ENVIRONMENT_VALUES = ("prod", "production", "生产")
+
 # 文档交付触发机制（Issue #341 S-ES-2）：默认关闭——关闭时 apps/worker/turn.py
 # 完全不挂 delivery MCP 服务、不把 mcp__delivery__deliver_document 并入
 # ToolPolicy 白名单，行为与本开关加入之前逐字节一致。校验姿态照抄
@@ -523,16 +544,26 @@ def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
       期告警。
     - 两者都对：``(True, False)``。
 
+    - **环境自称是生产（``DEPLOY_ENVIRONMENT_VAR``）时一律 ``(False, True)``**，
+      两个变量配得再对也不生效（对抗审查 2026-09-02 C-7）。判定见
+      :func:`declares_production`，顺序在第二确认**之前**：生产这条否决没有任何
+      可以被"配对了"绕过的余地。
+
     **已知残余风险（如实登记，不得声称已彻底堵住）**：stage 与生产当前共用
     完全相同的容器镜像与 compose 结构，唯一差异是各服务从哪个不入库的宿主机
     本地 env 文件读取变量（见 deploy/compose.stage.yaml 与 compose.prod.yaml
     头部说明）。如果有人把 stage 的 worker-queue env 文件**整份**复制进生产
-    的对应文件，两个变量会一起被带过去，这道双变量确认无法在代码层面识别出
-    "这其实是从 stage 抄过来的"。`scripts/ci/check_deploy_contract.py` 的
-    `check_content_capture_prod_guard` 断言精确字面量与两个变量名都不出现在
-    任何入库的 compose 编排文件里，`deploy/验收前部署配置清单.md` 与
-    `deploy/.env.example` 同步登记"生产环境禁止配置"；这些是仓库能提供的最强
-    机械保证，真正的最后一道防线仍是部署操作纪律。
+    的对应文件，两个变量会一起被带过去。
+
+    C-7 之后这条风险被**收窄但没有消失**：``LINGXI_DEPLOY_ENVIRONMENT`` 写在
+    `deploy/compose.prod.yaml` 的 `environment:` 里，而 compose 的 `environment:`
+    覆盖 `env_file`，因此**抄 env 文件这条路径已经被堵死**；剩下的路径是有人改
+    入库的 compose 文件本身（会经过评审与门禁）或在 `docker run` 里手工传变量。
+    `scripts/ci/check_deploy_contract.py` 的 `check_content_capture_prod_guard`
+    断言精确字面量与两个变量名都不出现在任何入库的 compose 编排文件里，同一脚本
+    的 `check_prod_declares_deploy_environment` 断言生产覆盖确实声明了自己是生产；
+    `deploy/验收前部署配置清单.md` 与 `deploy/.env.example` 同步登记"生产环境
+    禁止配置"。真正的最后一道防线仍是部署操作纪律。
     """
 
     flag = (env.get(CONTENT_CAPTURE_FLAG_VAR) or "").strip()
@@ -540,10 +571,27 @@ def _innertest_content_capture(env: Mapping[str, str]) -> tuple[bool, bool]:
         return False, False
     if flag != "1":
         raise WorkerConfigError(f'环境变量 {CONTENT_CAPTURE_FLAG_VAR} 只接受精确值 "1"（不回显收到的值）')
+    if declares_production(env):
+        # 代码侧兜底（C-7）：环境自称是生产，采集**一律不生效**，两个变量配得
+        # 再对也不行。`misconfigured=True` 让 `apps/worker/cli.py` 打一条显眼的
+        # 启动告警——"在生产配了内容采集"本身就是必须被看见的部署事故信号，
+        # 但不阻止进程启动（同下面第二确认那一支的取舍：采集是旁路能力）。
+        return False, True
     confirm = (env.get(CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VAR) or "").strip()
     if confirm != CONTENT_CAPTURE_ENVIRONMENT_CONFIRM_VALUE:
         return False, True
     return True, False
+
+
+def declares_production(env: Mapping[str, str]) -> bool:
+    """环境是否**自称**生产（``LINGXI_DEPLOY_ENVIRONMENT``）。
+
+    只回答"有没有明确声明是生产"，不猜：没配、配空、配成别的值一律返回 ``False``。
+    这不是"检测"生产（镜像与编排两侧完全相同，检测不出来），是让部署**声明**自己
+    是谁，并把这份声明放在入库的 compose 文件里，使它不能被一份抄来的 env 文件覆盖。
+    """
+
+    return (env.get(DEPLOY_ENVIRONMENT_VAR) or "").strip().casefold() in PRODUCTION_ENVIRONMENT_VALUES
 
 
 def _document_delivery_enabled(env: Mapping[str, str]) -> bool:

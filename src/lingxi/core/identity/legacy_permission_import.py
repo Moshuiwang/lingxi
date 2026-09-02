@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from datetime import datetime
 from typing import Any, Mapping, NoReturn, Sequence
 
@@ -115,9 +116,20 @@ def import_legacy_permissions(
     try:
         report = importer.import_plan(user_id=user_id, target_open_id=open_id, plan=plan, now=now)
     except Exception as error:  # noqa: BLE001 - 落库失败一律 fail-closed
-        # 异常类型进审计理由码；完整 traceback 只进日志（不含原文/公司键/指标名），
+        # 异常类型进审计理由码；调用栈只进日志（不含原文/公司键/指标名），
         # 让运维能区分「接口漏接」与「库故障」。
-        logger.exception("存量差集导入落库失败 user=%s error=%s", user_id, type(error).__name__)
+        #
+        # C-6（对抗审查 2026-09-02）：这里原本用 `logger.exception`——上面那句
+        # "完整 traceback 不含原文" 对 `logger.exception` **不成立**：它连异常自己
+        # 写的那句话一起记，而 psycopg 的唯一键冲突正文带着
+        # `Key (feishu_open_id)=(ou_…)`（违 V-花名册-33），连接失败正文带
+        # host/user/dbname。改成只记类型名 + 调用栈帧后，那句承诺才为真。
+        logger.error(
+            "存量差集导入落库失败 user=%s error=%s\n调用栈（不含异常正文）：\n%s",
+            user_id,
+            type(error).__name__,
+            "".join(traceback.format_tb(error.__traceback__)),
+        )
         _fail(audit, user_id, f"legacy_permission_import_failed_{type(error).__name__}", trace_id, error)
     audit.record(
         "onboarding.legacy_permission_import",

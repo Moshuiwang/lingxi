@@ -32,6 +32,7 @@ import html
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import NamedTuple, TypeAlias
 
 
@@ -46,16 +47,6 @@ WITHHELD_MESSAGE = "本次结果涉及需要保护的内容，已被安全策略
 ExternalTextItems: TypeAlias = Mapping[str, object] | Iterable[tuple[str, object]]
 
 _SOURCE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
-# mcp__ 工具名后缀有界（{1,40}）：本仓库真实工具名形如
-# ``mcp__bi-metric__list_metrics``（约 30 字符），40 留有余量又不至于让流式场景
-# 的"跨块保留窗口"膨胀到拖慢正常短回答——已知工具名另由 internal_tool_names
-# 的精确匹配兜底，这条正则只是捕捉未登记名称的通用背兜。
-_PROCESS_MARKERS = re.compile(
-    r"(?:\bmcp__[A-Za-z0-9_.-]{1,40}\b|\b(?:pretooluse|posttooluse|posttoolfailure)\b|"
-    r"\b(?:tool_use_id|trace_id)\s{0,4}=?)",
-    re.IGNORECASE,
-)
-_PROCESS_MARKER_MAX_LEN = 45
 # 英文分支沿用原有 system[_ -]?prompt，放宽到 0-4 个空白/连接符，覆盖
 # "System_Prompt"、"system - prompt" 这类轻微变体；中文分支是 #142 缺口二的
 # 修复——原实现只认英文，中文用户反而没有防护。两个分支都是**字面 token 匹配**，
@@ -91,7 +82,11 @@ def _fold_for_marker_matching(text: str) -> str:
 # ``StreamingOutputGuard`` 有界尾部缓冲的前提（见下面 ``_max_pattern_length``
 # 用到的 ``_SYSTEM_PROMPT_MARKER_MAX_LEN``）。
 _ZERO_WIDTH_CHARS = "​‌‍⁠﻿"
-_ZW_GAP = f"[{_ZERO_WIDTH_CHARS}]{{0,4}}"
+#: 单个字符间隙允许穿插的零宽字符上限。它同时是三处上界推导的输入，改它必须
+#: 同步改 ``_SYSTEM_PROMPT_MARKER_MAX_LEN``/``_PROCESS_MARKER_MAX_LEN`` 与
+#: ``_max_pattern_length`` 里工具名那一项（有最坏情况用例验红）。
+_ZW_GAP_MAX = 4
+_ZW_GAP = f"[{_ZERO_WIDTH_CHARS}]{{0,{_ZW_GAP_MAX}}}"
 
 
 def _zw_tolerant(literal: str) -> str:
@@ -99,6 +94,43 @@ def _zw_tolerant(literal: str) -> str:
 
     return _ZW_GAP.join(re.escape(char) for char in literal)
 
+
+# mcp__ 工具名后缀有界（{1,60}）：本仓库真实工具名形如
+# ``mcp__bi-metric__list_metrics``（约 30 字符），留有余量又不至于让流式场景的
+# "跨块保留窗口"膨胀到拖慢正常短回答——已知工具名另由 internal_tool_names 的
+# 匹配兜底，这条正则只是捕捉未登记名称的通用背兜。
+#
+# 对抗审查 2026-09-02 W-6：这条正则原来在**原文**上匹配，既不折全角也不容忍零宽，
+# 于是 `ｔｒａｃｅ＿ｉｄ＝…`（全角）与 `mcp<零宽>__query__…` 两种写法都是
+# blocked=False。系统提示标记那一支早就同时做了这两件事（#149），过程标记与工具名
+# 却一直没跟上——同一个绕过手法在同一个模块里一半有效、一半无效。现在三支统一在
+# **折叠副本**上匹配，且逐字符容忍有界零宽穿插。
+#
+# 折叠副本是逐字符 1:1 的（``_fold_for_marker_matching``），因此在它上面拿到的
+# 偏移量可以直接当原文偏移量用；零宽字符不做剥离（剥离会改长度），而是让正则
+# 自己在字符之间容忍它们。
+_MCP_TOOL_SUFFIX_MAX = 60
+_PROCESS_MARKERS = re.compile(
+    r"(?:\b"
+    + _zw_tolerant("mcp__")
+    + rf"(?:[A-Za-z0-9_.-]|[{_ZERO_WIDTH_CHARS}]){{1,{_MCP_TOOL_SUFFIX_MAX}}}"
+    + r"|\b(?:"
+    + r"|".join(
+        _zw_tolerant(word) for word in ("pretooluse", "posttooluse", "posttoolfailure")
+    )
+    + r")\b|\b(?:"
+    + r"|".join(_zw_tolerant(word) for word in ("tool_use_id", "trace_id"))
+    + r")"
+    + _ZW_GAP
+    + r"\s{0,4}=?)",
+    re.IGNORECASE,
+)
+# 上界推导（mcp 分支最长）："mcp__" 5 字符 + 4 个字符间隙 × 至多 4 个零宽 = 21；
+# 后缀 60 个字符（每个位置要么是名字字符、要么是一个零宽字符）；21 + 60 = 81。
+# 另外两支明显更短：`posttoolfailure` 15 字符 + 14 × 4 = 71，`tool_use_id`
+# 11 + 10 × 4 + 4 + 4 + 1 = 60。改坏这个推导由 test_input_safety.py 的最坏
+# 情况用例验红。
+_PROCESS_MARKER_MAX_LEN = 81
 
 _SYSTEM_PROMPT_MARKERS = re.compile(
     r"(?:\b"
@@ -526,16 +558,22 @@ def _find_spans(
         for start in _iter_substring_positions(candidate, fragment):
             spans.append(_Span(start, start + len(fragment), "forbidden_fragment"))
 
-    for name in _unique_texts(internal_tool_names):
-        for start in _iter_substring_positions(candidate, name):
-            spans.append(_Span(start, start + len(name), "internal_tool_name"))
-
-    for match in _PROCESS_MARKERS.finditer(candidate):
-        spans.append(_Span(match.start(), match.end(), "process_marker"))
-    # 系统提示标记在**全角折叠后**的副本上匹配：折叠是逐字符 1:1 映射（见
-    # ``_fold_for_marker_matching``），不改变长度或位置，因此这里得到的偏移量
-    # 可以直接当作原文 ``candidate`` 上的偏移量使用。
+    # 三类标记全部在**全角折叠后**的副本上匹配（W-6）：折叠是逐字符 1:1 映射
+    # （见 ``_fold_for_marker_matching``），不改变长度或位置，因此这里得到的
+    # 偏移量可以直接当作原文 ``candidate`` 上的偏移量使用。
+    #
+    # ``forbidden_values``/``forbidden_fragment`` 仍在原文上做整串匹配，**有意
+    # 不折叠**：那两类是外部业务文本（指标描述等），模型被期望原样引用它们，
+    # 在折叠副本上匹配会把"全角写法的正常业务文本"也算成命中；而标记类三支要挡
+    # 的恰恰是"故意换个写法把同一个内部标识吐出来"，两者的取舍方向相反。
     folded_for_markers = _fold_for_marker_matching(candidate)
+
+    for name in _unique_texts(internal_tool_names):
+        for match in _zw_tolerant_pattern(name).finditer(folded_for_markers):
+            spans.append(_Span(match.start(), match.end(), "internal_tool_name"))
+
+    for match in _PROCESS_MARKERS.finditer(folded_for_markers):
+        spans.append(_Span(match.start(), match.end(), "process_marker"))
     for match in _SYSTEM_PROMPT_MARKERS.finditer(folded_for_markers):
         spans.append(_Span(match.start(), match.end(), "system_prompt_marker"))
 
@@ -600,6 +638,20 @@ def _choose_placeholder(reasons: Iterable[str]) -> str:
     return _PLACEHOLDER_GENERIC
 
 
+@lru_cache(maxsize=256)
+def _zw_tolerant_pattern(literal: str) -> re.Pattern[str]:
+    """内部工具名的匹配正则：逐字符容忍有界零宽穿插（W-6）。
+
+    大小写**仍然敏感**：工具名在 ``ToolPolicy`` 里就是大小写敏感的，这里不顺手
+    放宽——放宽会把"恰好同名的普通英文词"也算成内部能力泄露。本函数只补上
+    "同一个名字换个不可见写法"这一条，不改变别的判据。
+
+    带缓存：工具名集合在一个进程里是稳定的少数几个，每次回合重编译没有意义。
+    """
+
+    return re.compile(_zw_tolerant(literal))
+
+
 def _iter_substring_positions(candidate: str, needle: str) -> Iterable[int]:
     if not needle:
         return
@@ -638,7 +690,13 @@ def _max_pattern_length(
     system_prompt: str | None,
 ) -> int:
     lengths = [len(value) for value in _unique_texts((*forbidden_values, system_prompt))]
-    lengths.extend(len(name) for name in _unique_texts(internal_tool_names))
+    # 工具名现在容忍字符间的有界零宽穿插（W-6），一次命中最长可以到
+    # ``len(name) + (len(name) - 1) * _ZW_GAP_MAX``——保留窗口必须按最长命中算，
+    # 否则跨块的那一半命中会被提前吐出去，等于这道加固在流式路径上不成立。
+    lengths.extend(
+        len(name) + max(len(name) - 1, 0) * _ZW_GAP_MAX
+        for name in _unique_texts(internal_tool_names)
+    )
     lengths.append(_PROCESS_MARKER_MAX_LEN)
     lengths.append(_SYSTEM_PROMPT_MARKER_MAX_LEN)
     return max(lengths, default=0)

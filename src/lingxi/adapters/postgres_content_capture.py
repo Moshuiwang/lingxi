@@ -14,6 +14,12 @@
 ``read_recent_for_task``只服务测试与未来的受控运维核对（结构约束「仅受控查询」，
 本 Story 明确不做面向使用者的查询界面）；真实运维核对沿用与其它表相同的
 ``psql`` 直连纪律，不在这个方法之外新增任何查询入口。
+
+这张表的**九十天到期删除**在 :mod:`lingxi.adapters.postgres_content_capture_retention`
+（对抗审查 2026-09-02 C-7），**不在本模块**：写入侧要 ``ContentCaptureRecord``，
+而那个类顺着 ``core/innertest_content_capture.py`` 会把整个 ``core.execution``
+（工具判定与审计脱敏）拉进 import 闭包。删除侧的调用方是 scheduler，它没有任何
+理由背上 worker 的执行层——所以清理单独一个只依赖 ``adapters/postgres`` 的模块。
 """
 
 from __future__ import annotations

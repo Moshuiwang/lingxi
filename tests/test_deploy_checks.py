@@ -652,6 +652,114 @@ class ProdExternalHostSpecLimitsTest(unittest.TestCase):
 
         self.assertEqual(CONTRACT.check_resource_limits(), [])
 
+    # -- 报告 R6-D4（对抗审查 2026-09-02）：scheduler/gateway 的内存也纳入外部合同 --
+
+    SCHEDULER_GATEWAY_BODY = (
+        "scheduler:\n"
+        "  deploy:\n"
+        "    resources:\n"
+        "      limits:\n"
+        '        cpus: "${LINGXI_SCHEDULER_CPU_LIMIT:-1.0}"\n'
+        "        memory: ${LINGXI_SCHEDULER_MEM_LIMIT:?待定}\n"
+        "        pids: ${LINGXI_SCHEDULER_PIDS_LIMIT:-512}\n"
+        "gateway:\n"
+        "  deploy:\n"
+        "    resources:\n"
+        "      limits:\n"
+        '        cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-1.0}"\n'
+        "        memory: ${LINGXI_GATEWAY_MEM_LIMIT:?待定}\n"
+        "        pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-512}\n"
+    )
+
+    def test_scheduler_and_gateway_memory_defaults_are_caught(self) -> None:
+        """变异验红：把两处内存改回 ``${VAR:-1G}``。
+
+        这正是修复前的真实状态，而且它的坏处不是"值不好看"——漏配时 scheduler 与
+        gateway 各静默退回 1G，加上 worker-queue 合同的 2G 就是 4G，**超过生产
+        宿主机约 3.9GiB 的可用内存**，而 ``docker compose config`` 一声不响照常
+        渲染。runbook §2.1 早就要求显式写这两行并渲染回读，但那是纪律不是闸门。
+        """
+
+        body = self.SCHEDULER_GATEWAY_BODY.replace(
+            "${LINGXI_SCHEDULER_MEM_LIMIT:?待定}", "${LINGXI_SCHEDULER_MEM_LIMIT:-1G}"
+        ).replace("${LINGXI_GATEWAY_MEM_LIMIT:?待定}", "${LINGXI_GATEWAY_MEM_LIMIT:-1G}")
+        failures = self._with_prod_override(body)
+
+        for service in ("scheduler", "gateway"):
+            with self.subTest(service=service):
+                self.assertTrue(
+                    any(service in f and "`memory`" in f and "无默认值" in f for f in failures),
+                    failures,
+                )
+
+    def test_the_external_contract_form_passes_for_scheduler_and_gateway(self) -> None:
+        failures = self._with_prod_override(self.SCHEDULER_GATEWAY_BODY)
+        self.assertEqual(
+            [f for f in failures if "scheduler" in f or "gateway" in f], []
+        )
+
+    def test_the_external_key_registry_still_lists_all_three_services(self) -> None:
+        """把某个服务从登记表里悄悄摘掉，这道闸对它就整个不生效了。"""
+
+        registry = CONTRACT.PROD_EXTERNAL_HOST_SPEC_LIMITS
+
+        self.assertEqual(registry["worker-queue"], ("cpus", "memory", "pids"))
+        self.assertEqual(registry["scheduler"], ("memory",))
+        self.assertEqual(registry["gateway"], ("memory",))
+
+
+class ProdDeclaresDeployEnvironmentTest(unittest.TestCase):
+    """``check_prod_declares_deploy_environment``（报告 C-7）。
+
+    内容采集的代码侧兜底靠"生产声明自己是生产"才存在；声明必须写在**入库的**
+    compose 的 ``environment:`` 里——写进外部 env 文件毫无意义，那条路径正是这道
+    兜底要防的东西（compose 的 ``environment:`` 覆盖 ``env_file``）。
+    """
+
+    BODY = (
+        "worker:\n"
+        "  environment:\n"
+        '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+        "worker-queue:\n"
+        "  environment:\n"
+        '    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n'
+        "    LINGXI_WORKER_WORKSPACE: \"/tmp/lingxi-workspace\"\n"
+    )
+
+    def _with_prod(self, body: str) -> list[str]:
+        directory = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        prod = directory / "compose.prod.yaml"
+        prod.write_text("services:\n" + textwrap.indent(textwrap.dedent(body), "  "), encoding="utf-8")
+        original = CONTRACT.COMPOSE_PROD
+        CONTRACT.COMPOSE_PROD = prod
+        try:
+            return CONTRACT.check_prod_declares_deploy_environment()
+        finally:
+            CONTRACT.COMPOSE_PROD = original
+
+    def test_the_declared_form_passes(self) -> None:
+        self.assertEqual(self._with_prod(self.BODY), [])
+
+    def test_a_missing_declaration_is_caught(self) -> None:
+        """变异验红：把声明删掉——这正是修复前的状态。"""
+
+        body = self.BODY.replace('    LINGXI_DEPLOY_ENVIRONMENT: "prod"\n', "", 1)
+        failures = self._with_prod(body)
+
+        self.assertTrue(any("worker" in f and "environment" in f for f in failures), failures)
+
+    def test_a_typo_in_the_declared_value_is_caught(self) -> None:
+        """拼错等于这道兜底整个不生效，而且是静默的。"""
+
+        body = self.BODY.replace('"prod"', '"produciton"')
+        failures = self._with_prod(body)
+
+        self.assertEqual(len(failures), 2, failures)
+        self.assertTrue(all("不在" in f for f in failures), failures)
+
+    def test_real_prod_compose_declares_it(self) -> None:
+        self.assertEqual(CONTRACT.check_prod_declares_deploy_environment(), [])
+
 
 class ComposeInterpolationYamlSafetyTest(unittest.TestCase):
     """PR #506 CI 实测教训：compose 的值先过 YAML 解析、再做 `${VAR}` 插值。

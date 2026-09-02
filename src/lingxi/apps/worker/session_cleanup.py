@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -113,6 +114,33 @@ _ARCHIVE_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
 #: 平级），不与任何用户的 ``.mcp.json`` 目录同名，因此不存在用户 id 恰好叫这个
 #: 名字导致的碰撞（用户 id 由内部账号体系分配，不是用户可控输入）。
 _ARCHIVE_SUBDIR_NAME = "_archive"
+#: 会话 id 的形状白名单（对抗审查 2026-09-02 W-3）。
+#:
+#: 这个值经 ``ResultMessage.session_id`` 直落数据库（``core/execution/
+#: message_stream.py`` 只判"是不是非空字符串"），迁移 ``0057`` 的
+#: ``agent_session_id`` 列也没有任何形状约束。从本模块看出去，它就是一个**外部
+#: 来源的字符串**。此前只拒 ``/`` 与反斜杠，然后拿它去 ``rglob(f"{id}.jsonl")``
+#: ——``*``、``?``、``[…]`` 全是 glob 元字符：``agent_session_id="*"`` 会把
+#: ``session_root`` 下**所有**用户的转录一次匹配干净，再原样搬进
+#: ``_archive/<发起这次清理的那个用户>/``。这不是"删多了"，是把 A 的问答原文
+#: 搬进 B 的归档目录。
+#:
+#: 因此改成白名单——"拒绝已知坏字符"永远漏，"只接受已知好形状"不漏。
+#:
+#: **为什么不是更紧的 UUID 正则**：Claude Agent SDK 的会话 id 究竟是什么形状，
+#: 本仓库**没有回源确认过**（venv 里有 SDK 包，但真实 CLI 输出未跑过；既有用例
+#: 用的是 ULID 形状的假值）。把一条清理路径钉死在没验证过的上游形状上，代价是
+#: "上游换了形状 → 清理直接抛异常 → 转录再也不被回收"。这条白名单取文件名安全
+#: 字符集：排除全部 glob 元字符、路径分隔符与点（因而也排除 ``..``），足以关掉
+#: W-3 的两条路径，同时对 UUID / ULID / 其它常见 id 形状都成立。要收紧到 UUID，
+#: 先回源确认 SDK 的形状再改。
+_AGENT_SESSION_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+#: 与 ``adapters/user_environment.py`` / ``adapters/user_mcp_config.py`` 的
+#: ``_USER_ID_PATTERN`` 同一形状（W-3）。归档目录是 ``<user_env_root>/_archive/
+#: <user_id>/``，``user_id`` 未经校验就拼进路径：``"../escape"`` 会让归档落到
+#: ``<user_env_root>/escape/``——那是用户目录的同级，恰好是放 ``.mcp.json`` 的
+#: 那一层。同样只接受白名单。
+_USER_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 #: 与 ``adapters/user_environment.py`` 的 ``HOME_DIR_MODE`` 同一收紧口径——归档
 #: 目录装的是同一批用户会话转录文本，权限边界不应该比用户目录本身更宽。
 _ARCHIVE_DIR_MODE = 0o700
@@ -175,7 +203,19 @@ def _resolve_archive_dir(
         return None
     if not _archive_enabled(env):
         return None
+    if not isinstance(user_id, str) or not _USER_ID_PATTERN.match(user_id):
+        # W-3：拼路径之前先校验。返回 None（退回直接物理删除）而不是抛异常——
+        # 本函数的既有语义就是"算不出归档目录就别归档"，一个畸形 user_id 不该
+        # 让清理整个卡住不干活。归档目录建不出来时走的也是这一支。
+        logger.error("归档目录的 user_id 形状非法，本次退回直接物理删除")
+        return None
     archive_dir = Path(user_env_root) / _ARCHIVE_SUBDIR_NAME / user_id
+    # 双保险：正则已经排除了 `..`/`/`，这里再核对拼出来的路径确实落在归档根之内。
+    # 路径拼接的正确性不该只由"上游那条正则没被改坏"担保。
+    archive_root = (Path(user_env_root) / _ARCHIVE_SUBDIR_NAME).resolve()
+    if archive_root not in archive_dir.resolve().parents:
+        logger.error("归档目录逃出归档根，本次退回直接物理删除")
+        return None
     try:
         archive_dir.mkdir(parents=True, exist_ok=True)
         archive_dir.chmod(_ARCHIVE_DIR_MODE)
@@ -185,6 +225,26 @@ def _resolve_archive_dir(
         )
         return None
     return archive_dir
+
+
+def _files_named(root: Path, filename: str) -> list[Path]:
+    """递归找出 ``root`` 下**文件名逐字等于** ``filename`` 的常规文件。
+
+    刻意不用 ``rglob(filename)``：那条路把调用方传进来的字符串当 glob 模式解释。
+    这里遍历目录树、逐个比较名字，没有任何模式语义。不跟随符号链接
+    （``os.walk`` 默认 ``followlinks=False``），因此一条指向别处的链接目录不能
+    把匹配范围拉出 ``root``。
+    """
+
+    found: list[Path] = []
+    for current, _directories, files in os.walk(root):
+        if filename in files:
+            candidate = Path(current) / filename
+            # 只处理常规文件：符号链接指向的目标可能在 root 之外，移动/删除它
+            # 等于对 root 之外的东西动手。
+            if candidate.is_file() and not candidate.is_symlink():
+                found.append(candidate)
+    return found
 
 
 def _archive_one(match: Path, archive_dir: Path) -> None:
@@ -257,8 +317,17 @@ def delete_agent_session_files(
     退回本 Story 之前的直接物理删除语义，行为与签名变更前完全一致。
     """
 
-    if not agent_session_id or "/" in agent_session_id or "\\" in agent_session_id:
-        raise ValueError(f"非法的 agent_session_id：{agent_session_id!r}")
+    if not isinstance(agent_session_id, str) or not _AGENT_SESSION_ID_PATTERN.match(
+        agent_session_id
+    ):
+        # W-3：白名单而不是黑名单。原来只拒 `/` 与 `\`，`*`/`?`/`[…]` 一路放行到
+        # `rglob()` 里当通配符用。不回显收到的值——它来自数据库，可能是攻击载荷。
+        # **已知残余（登记，未关闭）**：能写数据库的人仍可把 agent_session_id 换成
+        # 另一个用户的**真实**会话 id，把那一份转录移进自己的归档目录。转录树按
+        # CLI cwd 的 slug 分目录、不按用户分目录（S-2b 把 cwd 固定成
+        # /tmp/lingxi-workspace 之后全用户共用一个 slug），本模块拿不到任何
+        # 「这份转录属于谁」的判据，关不掉。前提仍是数据库写权限。
+        raise ValueError("非法的 agent_session_id：只接受文件名安全字符（不回显收到的值）")
     if not session_root.is_dir():
         return 0
 
@@ -266,7 +335,11 @@ def delete_agent_session_files(
 
     handled = 0
     filename = f"{agent_session_id}.jsonl"
-    for match in session_root.rglob(filename):
+    # **精确文件名比对，不是 glob**（W-3）。上面的白名单已经让 `rglob` 拿不到
+    # 任何元字符，这里再把匹配方式本身换掉：判据变成"名字逐字相等"，于是"这个函数
+    # 会不会通配"不再取决于上游那条正则有没有被改坏，也不取决于 pathlib 将来对
+    # glob 语法的解释。两道独立的防线，任一道单独成立都足够。
+    for match in _files_named(session_root, filename):
         try:
             if archive_dir is not None:
                 _archive_one(match, archive_dir)

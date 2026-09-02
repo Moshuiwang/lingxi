@@ -889,6 +889,154 @@ class CredentialsNeverReachTheAuditTest(unittest.TestCase):
         self.assertIn("No such tool available: Write", recorded)
 
 
+class FreeTextRedactionRuleTest(unittest.TestCase):
+    """自由文本脱敏的**每一段规则**各自钉一条（对抗审查 2026-09-02 C-4 / C-5）。
+
+    C-5 的事实是：把 ``_SECRET_SCHEME.sub`` 整段删掉，全量 227 条用例仍然全绿——
+    ``bearer``/``basic`` 认证头那一段**没有任何测试钉住**。原因是既有用例用的样本
+    （``Bearer sk-live-DO-NOT-LEAK``）同时命中赋值规则和长串规则，删掉认证头这一段
+    也照样被别的规则盖住，断言察觉不到。
+
+    因此本类的每条用例都**刻意挑只有那一段规则能盖住的样本**：
+    认证头样本不带键名、令牌短于 16 字符（躲开 ``_TOKEN_RUN``）；赋值样本的值同样
+    短且不含键名以外的线索；URL 样本的主机名与用户名都不是秘密词。删掉对应那一段，
+    这里就必须变红——这正是"钉住"的定义。
+    """
+
+    def test_bearer_scheme_is_the_only_rule_that_can_mask_this(self) -> None:
+        """C-5：短 bearer 令牌只有认证头规则能盖住。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        # 8 字符：`_TOKEN_RUN` 的下界是 16，够不着；没有 `authorization=` 之类的
+        # 键名，赋值规则也对不上。删掉 `_SECRET_SCHEME.sub` 这条必红。
+        redacted = redact_free_text("upstream said: Bearer abc12345 rejected")
+
+        self.assertNotIn("abc12345", redacted)
+        self.assertIn("[REDACTED]", redacted)
+        self.assertIn("upstream said", redacted, "脱敏不得吃掉可诊断信息")
+
+    def test_basic_scheme_is_pinned_too(self) -> None:
+        from lingxi.core.execution.audit import redact_free_text
+
+        redacted = redact_free_text("retry with basic YWJjOjEyMw==")
+
+        self.assertNotIn("YWJjOjEyMw==", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_the_scheme_rule_is_case_insensitive_and_keeps_the_scheme_word(self) -> None:
+        """保留 ``Bearer``/``Basic`` 这个词本身是有诊断价值的事实，不能一起抹掉。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        for sample in ("BEARER abc12345", "Bearer abc12345", "bearer abc12345"):
+            with self.subTest(sample=sample):
+                redacted = redact_free_text(sample)
+                self.assertNotIn("abc12345", redacted)
+                self.assertRegex(redacted, r"(?i)^(bearer) \[REDACTED\]$")
+
+    def test_a_short_password_in_a_dsn_is_masked(self) -> None:
+        """C-4：DSN 的口令写在 userinfo 段，没有键名、也短于长度上界。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        redacted = redact_free_text(
+            "connection failed: postgresql://lingxi_app:hunter2@db.internal:5432/lingxi"
+        )
+
+        self.assertNotIn("hunter2", redacted)
+        self.assertIn("[REDACTED]", redacted)
+        # 主机、库名、端口是排障要看的事实，必须留下。
+        self.assertIn("db.internal:5432/lingxi", redacted)
+        self.assertIn("lingxi_app", redacted)
+
+    def test_urls_without_credentials_are_left_alone(self) -> None:
+        """脱敏不得把普通 URL 误伤成 ``[REDACTED]``——那会让日志读不懂。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        for sample in (
+            "see https://example.com:8443/path?x=1",
+            "connected to wss://bridge.internal:443/socket",
+            "scheme://user@host/x",
+            "mailto:someone@example.com",
+        ):
+            with self.subTest(sample=sample):
+                self.assertEqual(redact_free_text(sample), sample)
+
+    def test_a_chinese_key_name_is_a_key_name(self) -> None:
+        """C-4：中文键名 + 全角冒号，此前 ASCII 词表与半角分隔符两条都对不上。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        for sample, secret in (
+            ("数据库口令：hunter2，请联系管理员。", "hunter2"),
+            ("密码: abc123 已过期", "abc123"),
+            ("凭据＝hunter2", "hunter2"),
+            ("授权码：xyz789", "xyz789"),
+        ):
+            with self.subTest(sample=sample):
+                redacted = redact_free_text(sample)
+                self.assertNotIn(secret, redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_chinese_punctuation_after_the_value_survives(self) -> None:
+        """值的终止符要认中文标点，否则整句后半段会被一起吞掉。"""
+
+        from lingxi.core.execution.audit import redact_free_text
+
+        redacted = redact_free_text("数据库口令：hunter2，请联系管理员。")
+
+        self.assertIn("请联系管理员。", redacted)
+
+    def test_the_assignment_rule_is_pinned_by_a_short_value(self) -> None:
+        from lingxi.core.execution.audit import redact_free_text
+
+        redacted = redact_free_text("auth failed: password=hunter2")
+
+        self.assertNotIn("hunter2", redacted)
+        self.assertIn("auth failed", redacted)
+
+    def test_the_length_ceiling_rule_is_pinned_by_a_keyless_token(self) -> None:
+        from lingxi.core.execution.audit import redact_free_text
+
+        redacted = redact_free_text("upstream rejected sk-live-abcdef1234567890XYZ")
+
+        self.assertNotIn("sk-live-abcdef1234567890XYZ", redacted)
+        self.assertIn("upstream rejected", redacted)
+
+    def test_the_counting_variant_stays_byte_identical_and_counts_every_stage(self) -> None:
+        """采集侧的计数实现必须与脱敏本体逐字节同文，且五段都参与计数。
+
+        本体里那条 ``assert`` 只在被调用时才会响；这里显式把每一段各调一次，
+        新增或删除一段而忘了同步另一处实现，就会在这里立刻变红。
+        """
+
+        from lingxi.core.execution.audit import redact_free_text, redact_free_text_with_count
+
+        samples = {
+            "password=hunter2": 1,
+            "口令：hunter2": 1,
+            "postgresql://u:hunter2@h:5432/db": 1,
+            "Bearer abc12345": 1,
+            "sk-live-abcdef1234567890XYZ": 1,
+        }
+        for sample, expected in samples.items():
+            with self.subTest(sample=sample):
+                text, count = redact_free_text_with_count(sample)
+                self.assertEqual(text, redact_free_text(sample))
+                self.assertEqual(count, expected)
+
+    def test_a_credential_shaped_chinese_field_name_is_redacted_in_structured_input(self) -> None:
+        """字段名走的是 ``_SECRET_KEY``，中文键名同样要命中。"""
+
+        redactor = AuditRedactor(allowed_input_fields=("密码",))
+
+        recorded = redactor.redact({"密码": "hunter2"})
+
+        self.assertEqual(recorded["密码"], "[REDACTED]")
+
+
 class MalformedToolNameRedactionTest(unittest.TestCase):
     """畸形工具名是模型可控文本直达持久记录的一条路径。"""
 

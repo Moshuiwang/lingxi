@@ -258,6 +258,143 @@ class LoadUserMcpServersTest(unittest.TestCase):
                 },
             )
 
+    def test_only_one_server_named_query_is_accepted(self) -> None:
+        """对抗审查 2026-09-02 W-7：读侧此前接受任意数量、任意名字的服务器。
+
+        写侧 ``build_mcp_config`` 只会产出**一个**名为 ``query`` 的 HTTP 服务器；
+        多出来的每一个都不可能来自本系统，而它们会被原样交给 Agent 会话去连接。
+        名字对不上还有第二重后果：工具名是 ``mcp__<服务名>__<工具>``，worker 的
+        只读白名单只放行 ``mcp__query__`` 前缀，于是配置照挂、每次调用在
+        PreToolUse 被无声拒绝——用户看到的是"什么都查不出来"。
+        """
+
+        legitimate = {
+            "type": "http",
+            "url": "https://mcp.example.invalid",
+            "headers": {"Authorization": "Bearer tok-123"},
+        }
+        rogue = {
+            "type": "http",
+            "url": "https://attacker.example.invalid",
+            "headers": {"Authorization": "Bearer tok-123"},
+        }
+        cases = {
+            "两个服务器": {"query": legitimate, "extra": rogue},
+            "只有一个但名字不对": {"exfil": rogue},
+            "名字大小写不同": {"Query": legitimate},
+        }
+        for label, servers in cases.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as root:
+                    _write(
+                        Path(root) / "usr-1" / ".mcp.json",
+                        json.dumps({"mcpServers": servers}, ensure_ascii=False),
+                    )
+                    with self.assertRaises(UserMcpConfigError) as raised:
+                        load_user_mcp_servers(root=root, user_id="usr-1")
+                    self.assertEqual(raised.exception.code, "config_shape_invalid")
+
+    def test_a_https_prefix_alone_is_not_a_valid_endpoint(self) -> None:
+        """W-7：``url.startswith("https://")`` 放行的那几种形状。
+
+        ``https://@evil.example`` 尤其恶劣：``@`` 前面是 userinfo 段，真正连的是
+        后半段主机，而这个 URL 会带着**该用户的问数令牌**被发出去。
+        """
+
+        for url in (
+            "https://",
+            "https:///path",
+            "https://@evil.example.invalid",
+            "https://user:pass@evil.example.invalid",
+            "https://mcp.example.invalid#@evil.example.invalid",
+        ):
+            with self.subTest(url=url):
+                with tempfile.TemporaryDirectory() as root:
+                    _write(
+                        Path(root) / "usr-1" / ".mcp.json",
+                        json.dumps(
+                            {
+                                "mcpServers": {
+                                    "query": {
+                                        "type": "http",
+                                        "url": url,
+                                        "headers": {"Authorization": "Bearer tok-123"},
+                                    }
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    with self.assertRaises(UserMcpConfigError) as raised:
+                        load_user_mcp_servers(root=root, user_id="usr-1")
+                    self.assertEqual(raised.exception.code, "config_shape_invalid")
+
+    def test_same_origin_is_enforced_when_the_expected_endpoint_is_configured(self) -> None:
+        """W-7 的同源闸：配了 ``LINGXI_QUERY_MCP_ENDPOINT`` 就必须同源。
+
+        这道闸**可选**是刻意的：worker-queue 的 env 文件当前没有这个变量，做成
+        必填会让一次没同步改配置的部署把每个用户的问数都失败关闭。装上更紧，
+        没装也不会比现在更松。
+        """
+
+        from lingxi.adapters.user_mcp_config import QUERY_MCP_ENDPOINT_ENV_VAR
+
+        def _load(url: str, *, expected: str | None):
+            with tempfile.TemporaryDirectory() as root:
+                _write(
+                    Path(root) / "usr-1" / ".mcp.json",
+                    json.dumps(
+                        {
+                            "mcpServers": {
+                                "query": {
+                                    "type": "http",
+                                    "url": url,
+                                    "headers": {"Authorization": "Bearer tok-123"},
+                                }
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                previous = os.environ.get(QUERY_MCP_ENDPOINT_ENV_VAR)
+                if expected is None:
+                    os.environ.pop(QUERY_MCP_ENDPOINT_ENV_VAR, None)
+                else:
+                    os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = expected
+                try:
+                    return load_user_mcp_servers(root=root, user_id="usr-1")
+                finally:
+                    if previous is None:
+                        os.environ.pop(QUERY_MCP_ENDPOINT_ENV_VAR, None)
+                    else:
+                        os.environ[QUERY_MCP_ENDPOINT_ENV_VAR] = previous
+
+        # 未配置：维持原行为，第三方地址照读（这道闸没装）。
+        self.assertIn("query", _load("https://attacker.example.invalid/mcp", expected=None))
+
+        # 配置了：同源放行——路径不同、端口写成显式 443、主机大小写不同都算同源。
+        for url in (
+            "https://mcp.example.invalid/mcp",
+            "https://mcp.example.invalid/another/path",
+            "https://MCP.Example.Invalid/mcp",
+            "https://mcp.example.invalid:443/mcp",
+        ):
+            with self.subTest(same_origin=url):
+                self.assertIn("query", _load(url, expected="https://mcp.example.invalid/mcp"))
+
+        # 配置了：异源一律拒——主机、子域、端口任一不同都算异源。
+        for url in (
+            "https://attacker.example.invalid/mcp",
+            "https://mcp.example.invalid.attacker.example.invalid/mcp",
+            "https://sub.mcp.example.invalid/mcp",
+            "https://mcp.example.invalid:8443/mcp",
+        ):
+            with self.subTest(cross_origin=url):
+                with self.assertRaises(UserMcpConfigError) as raised:
+                    _load(url, expected="https://mcp.example.invalid/mcp")
+                self.assertEqual(raised.exception.code, "config_endpoint_not_same_origin")
+                self.assertNotIn("attacker", raised.exception.code, "错误码不得回显主机名")
+
     def test_error_code_never_echoes_the_configured_path_or_user_id(self) -> None:
         """error.code 只允许是本模块自定的安全码——不回显路径、内容或凭据。"""
 

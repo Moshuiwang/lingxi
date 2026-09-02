@@ -187,6 +187,11 @@ REQUIRED_MODULES = (
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 同一张表的**到期删除**侧（对抗审查 2026-09-02 C-7）：由 lingxi-scheduler 的
+    # 保留清理职责在函数内 import。刻意与写入侧分成两个模块——写入侧要
+    # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
+    # import 闭包，而 scheduler 没有任何理由背上 worker 的执行层。
+    "lingxi.adapters.postgres_content_capture_retention",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -595,6 +600,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.scheduler.audit",
             "lingxi.apps.scheduler.credential_rotation",
             "lingxi.apps.scheduler.retention",
+            # 内测采集九十天到期删除（对抗审查 2026-09-02 C-7）：
+            # `_build_content_capture_retention_duty` 函数内 import，与
+            # `role_function_map_file` 一节同一条理由——函数内 import 也是进程真实
+            # 依赖，制品少了它这条清理职责会在第一轮就抛 ImportError。
+            "lingxi.adapters.postgres_content_capture_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             "lingxi.apps.scheduler.loop",

@@ -108,20 +108,23 @@ def main(
             ),
         )
     elif config.innertest_content_capture_misconfigured:
-        # 主开关已配置但第二确认变量缺失/不匹配：采集仍然关闭（结构性保证生
-        # 效），但这通常意味着运维"以为开了但其实没开"，值得一条显眼告警帮助
-        # 发现，而不是安静地什么都不做。
+        # 主开关已配置但被挡住：要么第二确认变量缺失/不匹配，要么环境自称是
+        # 生产（C-7）。采集仍然关闭（结构性保证生效），但这两种情况都值得一条
+        # 显眼告警——前者通常是运维"以为开了但其实没开"，后者是**在生产配了
+        # 只允许 stage 用的采集开关**，属于必须被看见的部署事故信号。
         _log(
             err,
             config.trace_id,
             "warning",
             "worker.innertest_content_capture_blocked",
             message=(
-                "已配置 LINGXI_INNERTEST_CONTENT_CAPTURE=1，但第二确认变量 "
+                "已配置 LINGXI_INNERTEST_CONTENT_CAPTURE=1，但被挡住："
+                "或者环境经 LINGXI_DEPLOY_ENVIRONMENT 自称是生产（生产一律不采集），"
+                "或者第二确认变量 "
                 "LINGXI_INNERTEST_CONTENT_CAPTURE_ENVIRONMENT_CONFIRM 缺失或不匹配"
-                "（不回显取到的值），内容级采集本次运行不生效（结构性保证：正式"
-                "环境即使误配了主开关也不会生效）；若这是一次真实要开启采集的 "
-                "stage 部署，请核对第二确认变量的取值"
+                "（不回显取到的值）。内容级采集本次运行不生效（结构性保证：正式"
+                "环境即使误配了主开关也不会生效）；若这是生产，请立即清空主开关，"
+                "若这是一次真实要开启采集的 stage 部署，请核对第二确认变量的取值"
             ),
         )
 
@@ -132,6 +135,22 @@ def main(
             _log(err, config.trace_id, "error", "worker.queue.config.invalid", message=message)
             _emit(out, config_error_report(trace_id=config.trace_id, message=message))
             return EXIT_CONFIG_ERROR
+        # 报告 R6-D2：生产数据库连接串会被 Claude CLI 与它的 MCP 子进程整份继承。
+        #
+        # `claude-agent-sdk` 0.2.128 起子进程时用 `process_env = {**os.environ, …}`
+        # （`subprocess_cli.py`），而 `adapters/claude_agent_session.py` 不传
+        # `options.env`。也就是说：**SDK 侧没有任何参数能删掉一个已经在进程环境
+        # 里的变量**——`options.env` 只能往上加，不能往下减。唯一能真正生效的位置
+        # 就是这里：在起任何回合之前，把它从**本进程自己的 os.environ** 里摘掉。
+        #
+        # 上面已经把值读进局部变量 `dsn`，本进程后续所有数据库连接都用它构造
+        # （queue/listener/记忆读取/采集写入），因此摘掉环境变量不影响本进程；
+        # healthcheck 走 `docker exec` 另起进程、拿的是容器自己的 env，也不受影响。
+        #
+        # 当前模型侧 Bash/Read 工具是拒的（`core/execution/hooks.py`），所以这条
+        # 继承此刻不可达；但它与 hook 超时失败开放那条（报告 W-1）叠加时，后果
+        # 直接扩大到生产库的读写凭据。删掉一个本来就不该在那里的变量，成本为零。
+        _detach_inherited_database_credentials(err=err, trace_id=config.trace_id)
         # Epic D 闸⑥：queue 模式是唯一真正处理用户任务的路径，每个任务都要按
         # 它的 user_id 读 <user_env_root>/<user_id>/.mcp.json（见
         # apps/worker/service.py 的 _process_task）。缺了这个根目录，队列
@@ -544,6 +563,39 @@ def _ensure_user_env_root_available(user_env_root: str, *, err: TextIO, trace_id
         )
         return False
     return True
+
+
+#: 不允许被 Claude CLI 及其 MCP 子进程继承的进程环境变量（报告 R6-D2）。
+#: 只列 worker-queue 的 env 文件里真实存在、且本进程读完之后不再需要从环境里
+#: 取第二次的那些。加一项之前先确认：本进程没有任何代码路径会在这之后再去
+#: `os.environ` 读它——否则删掉的是自己的配置，不是子进程的继承面。
+_UNINHERITABLE_ENV_VARS = ("LINGXI_POSTGRES_DSN",)
+
+
+def _detach_inherited_database_credentials(*, err: TextIO, trace_id: str) -> tuple[str, ...]:
+    """把不该被子进程继承的变量从**本进程的 `os.environ`** 里摘掉，返回摘掉的变量名。
+
+    必须操作 `os.environ` 而不是 `main()` 收到的 `env` 映射：SDK 拼子进程环境时读
+    的是 `os.environ`，传进来的 `env` 在测试里可能是另一个字典。两者是同一个对象
+    时（生产姿态）这里顺带也从 `env` 里消失了，而 DSN 此刻已经读进局部变量。
+
+    只记变量名，永不回显值。
+    """
+
+    removed = tuple(name for name in _UNINHERITABLE_ENV_VARS if os.environ.pop(name, None) is not None)
+    if removed:
+        _log(
+            err,
+            trace_id,
+            "info",
+            "worker.queue.env_detached",
+            variables=list(removed),
+            message=(
+                "已从进程环境移除下列变量，使 Claude CLI 与 MCP 子进程不再继承它们"
+                "（本进程改用启动时读到的值；只记变量名，不回显取值）"
+            ),
+        )
+    return removed
 
 
 def _resolve_session_root(config: WorkerConfig, env: Mapping[str, str]) -> Path | None:

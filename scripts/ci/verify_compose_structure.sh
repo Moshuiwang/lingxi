@@ -71,6 +71,12 @@ export LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
 export LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
 export LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
 export LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
+# 报告 R6-D4：scheduler/gateway 的内存上限在 prod 覆盖里也改成了无默认值的
+# `${VAR:?}`（漏配即渲染失败，不再静默退回 1G 把三服务加总推到 4G > 主机 3.9GiB）。
+# 占位值取生产合同的 512M；与上面四项同一姿势——结构摘要不含 resources，因此这里
+# 只影响"渲染跑不跑得完"。
+export LINGXI_SCHEDULER_MEM_LIMIT=512M
+export LINGXI_GATEWAY_MEM_LIMIT=512M
 
 # 摘要脚本单独用带引号的 heredoc 装进变量：直接写 `python3 -c '...'` 时，
 # 内层的引号会与外层冲突（第一版就栽在这上面）。
@@ -181,9 +187,13 @@ for environment in stage prod; do
     export LINGXI_WORKER_QUEUE_CPU_LIMIT=1.5
     export LINGXI_WORKER_QUEUE_MEM_LIMIT=2G
     export LINGXI_WORKER_QUEUE_PIDS_LIMIT=512
+    export LINGXI_SCHEDULER_MEM_LIMIT=512M
+    export LINGXI_GATEWAY_MEM_LIMIT=512M
   else
     unset LINGXI_WORKER_QUEUE_TMPFS_SIZE LINGXI_WORKER_QUEUE_CPU_LIMIT
     unset LINGXI_WORKER_QUEUE_MEM_LIMIT LINGXI_WORKER_QUEUE_PIDS_LIMIT
+    # stage 侧仍走自己那一档的 `:-` 默认值，与 worker-queue 四项同一纪律。
+    unset LINGXI_SCHEDULER_MEM_LIMIT LINGXI_GATEWAY_MEM_LIMIT
   fi
   # --profile mvp（Issue #153）：把 worker-queue 也纳入结构对照，否则它只在
   # mvp profile 下才可见，stage/prod 之间的等价性就漏了这个常驻服务一半的检查。

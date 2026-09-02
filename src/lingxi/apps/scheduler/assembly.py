@@ -41,6 +41,7 @@ from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,
     IdleConversationSweepDuty,
     RetentionCleanupDuty,
+    _build_content_capture_retention_duty,
     _build_permission_retention_duty,
 )
 from lingxi.apps.scheduler.roster_audit import (
@@ -247,8 +248,19 @@ def build_loop(
     # 写进外部表格一次。晚一轮清理没有任何后果（到期时间不因清理迟到而后移，断言
     # ``V-保留-16``）。
     permission_retention = _build_permission_retention_duty(config, stop=stop, audit=sink)
+    # 内测轮采集内容的九十天到期删除（对抗审查 2026-09-02 C-7）。与上面几条清理同组，
+    # 无条件装配：删自己库里的到期内容只需要连接串。生产该表恒空，这条每轮删 0 行。
+    content_capture_retention = _build_content_capture_retention_duty(
+        config, stop=stop, audit=sink
+    )
 
-    duties: list[Any] = [rotation, cleanup, idle_sweep, permission_retention]
+    duties: list[Any] = [
+        rotation,
+        cleanup,
+        idle_sweep,
+        permission_retention,
+        content_capture_retention,
+    ]
     # 令牌供给：日报侧要令牌 → 持有者里有新鲜的就直接给，没有就让**凭据轮换职责**
     # 按需换一次（受最小间隔 + 每日上界双重保护，Issue #276）。日报自己不碰一次性
     # refresh_token。
