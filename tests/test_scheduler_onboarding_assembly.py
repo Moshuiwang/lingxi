@@ -317,6 +317,9 @@ class StockTokenSourceWiringTests(unittest.TestCase):
             stock_tokens=object(),
         )
         self.assertIsInstance(duty._onboarding._legacy_importer, PostgresLocalPermissionOverrideStore)
+        # 端口契约：开通链按 ``LegacyPermissionImporter.import_plan`` 调用——stage 首次真实
+        # 用例坐实过一次「有实现、没这个名字」的漏接（AttributeError fail-closed）。
+        self.assertTrue(callable(getattr(duty._onboarding._legacy_importer, "import_plan", None)))
 
     def test_the_default_is_none_matching_pre_change_behaviour(self) -> None:
         """未传 ``stock_tokens`` 时默认 ``None``——哨兵：与改道前的调用点逐字节一致。"""

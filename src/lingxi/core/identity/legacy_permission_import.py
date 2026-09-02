@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Mapping, NoReturn, Sequence
 
@@ -23,6 +24,8 @@ from lingxi.core.permission.metric_translation import (
     translate_company_functions,
 )
 from lingxi.core.permission.publish_row import parse_permissions
+
+logger = logging.getLogger(__name__)
 
 
 def translate_galaxy(
@@ -112,6 +115,9 @@ def import_legacy_permissions(
     try:
         report = importer.import_plan(user_id=user_id, target_open_id=open_id, plan=plan, now=now)
     except Exception as error:  # noqa: BLE001 - 落库失败一律 fail-closed
+        # 异常类型进审计理由码；完整 traceback 只进日志（不含原文/公司键/指标名），
+        # 让运维能区分「接口漏接」与「库故障」。
+        logger.exception("存量差集导入落库失败 user=%s error=%s", user_id, type(error).__name__)
         _fail(audit, user_id, f"legacy_permission_import_failed_{type(error).__name__}", trace_id, error)
     audit.record(
         "onboarding.legacy_permission_import",

@@ -383,6 +383,17 @@ class PostgresLocalPermissionOverrideStore:
             )
 
 
+    def import_plan(
+        self, *, user_id: str, target_open_id: str, plan: LegacyImportPlan, now: datetime
+    ) -> LegacyImportReport:
+        """``core/identity/onboarding_ports.LegacyPermissionImporter`` 端口的实现名：开通链
+        按这个名字调用（stage 首次真实用例坐实：此前只有 :meth:`import_legacy_plan`，装配把
+        本类直接当导入口注入 → 每个存量用户首聊 ``AttributeError`` fail-closed）。"""
+
+        return self.import_legacy_plan(
+            user_id=user_id, target_open_id=target_open_id, plan=plan, now=now
+        )
+
     def import_legacy_plan(
         self,
         *,
