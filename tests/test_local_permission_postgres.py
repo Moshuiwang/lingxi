@@ -373,6 +373,18 @@ class LegacyImportPostgresTests(LocalPermissionOverridePostgresTestCase):
         )
         self.assertEqual(self.query("SELECT count(*) FROM pending_action")[0][0], 0)
 
+    def test_the_port_name_import_plan_is_the_same_write_path(self) -> None:
+        """端口名 ``import_plan``（开通链调用的名字）必须与 ``import_legacy_plan`` 同一落库路径。"""
+
+        from lingxi.core.permission.legacy_diff import LEGACY_IMPORT_ACTOR
+
+        report = self.store.import_plan(
+            user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(pairs=(("88", "m1"),)), now=self._now()
+        )
+        self.assertEqual(report.imported, 1)
+        rows = self.query("SELECT initiated_by_open_id FROM local_permission_override WHERE user_id = %s", (TARGET_USER_ID,))
+        self.assertEqual(rows, [(LEGACY_IMPORT_ACTOR,)])
+
     def test_an_empty_plan_writes_nothing(self) -> None:
         report = self.store.import_legacy_plan(user_id=TARGET_USER_ID, target_open_id="ou_t", plan=self._plan(), now=self._now())
         self.assertEqual((report.imported, report.already_present, report.group_id), (0, 0, None))
