@@ -3,6 +3,8 @@
 > **定位声明**：本文件是未来 `biplus-prod` 生产部署的操作正文，写给到时执行部署的人照做；**它本身不构成执行授权**。任何一次真实生产执行（首次部署、后续升级、回滚、恢复演练）都必须先有一个独立的 `[ops]` Issue 完成开工前事实确认与授权，本文件只提供步骤、判据和边界，不替代那次授权。`[ops]` Issue 的产生方式（直接立项，或作为某个生产部署 Trace 的输出）按 [Issue #369](https://github.com/Moshuiwang/lingxi/issues/369) 的「建议去向」处理，本文件不预设具体路径。
 >
 > 本 Trace（#373 H2 批 S-H2-4）只交付这份 runbook 与配套决策记录，不执行任何生产操作，也不接触 `biplus-prod` 或 `Bot-Prod`。
+>
+> **2026-09-02 起本文件已有一次真实执行记录**：首次生产部署当日与正文不一致的地方逐条登记在「[十一、实录偏差（2026-09-02 首发）](#十一实录偏差2026-09-02-首发)」。**下一次执行前先读那一节**——其中若干条（判据形态、`runtime-config` 卷内容、内测名单写两份）不照做会导致静默失败。
 
 ## 一、前置阅读
 
@@ -233,6 +235,8 @@ docker compose --env-file deploy/.env.prod \
 
 一次真实的数据库恢复演练目前尚未执行（[Issue #369 第 4 条](https://github.com/Moshuiwang/lingxi/issues/369)）；生产首次部署前应至少完成一次真实恢复演练，核对上述补清理动作确实被执行且结果符合预期，本 runbook 只登记要求，不代为执行。
 
+**2026-09-02 首发的实际处置**：产品负责人显式豁免了本节要求（首发为空库），演练仍未执行；备份侧的过渡安排与撤销条件见「十一、实录偏差」11.6。**该豁免只对首发有效**，不构成后续升级的常设豁免。
+
 ## 九、secret 注入与凭据隔离
 
 规则依据见[决策：生产 secret 注入与凭据隔离](../docs/决策记录/2026-08-28-生产secret注入与凭据隔离.md)，这里只给操作要点：
@@ -250,3 +254,59 @@ docker compose --env-file deploy/.env.prod \
 - 容器日志留存：`deploy/日志留存.md`（同上）。
 
 这两份文件到位后，「七、观察期」之外的长期运行监控与故障发现路径以它们为准；本文件不重复维护监控阈值或日志保留期限的具体数值。
+
+## 十一、实录偏差（2026-09-02 首发）
+
+> 本节登记 **2026-09-02 首次真实生产部署**与本文件正文（含 `deploy/README.md`）不一致的地方，逐条写清「正文怎么写 / 实际怎么做 / 为什么」。执行记录与逐条回读见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519)（生产执行卡）与 [Issue #263](https://github.com/Moshuiwang/lingxi/issues/263)（硬切卡）。下一次生产执行以本节为准，正文与本节冲突时**以本节更晚的实录为准**。
+
+### 11.1 环境与主机准备
+
+| # | 正文怎么写 | 实际怎么做 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | 默认宿主机已备好 Docker 与 Compose 插件 | `biplus-prod`（AL2023）**没有** `docker-compose-plugin` 包：`docker` 从 dnf 现有版本装（server 25.0.16，stage 是 25.0.14，补丁号差异已登记）；Compose 以二进制装入 `/usr/libexec/docker/cli-plugins/`，**版本钉成与 stage 同一个 `v5.2.0`**，下载后 `sha256sum` 与官方 `.sha256` 逐字节比对 | AL2023 的仓库里没有 compose 插件包；compose 的渲染行为影响判据（见 11.3 第 1 条），必须与 stage 同版才能沿用 stage 的验收结论 |
+| 2 | 未提及部署用户的 docker 组 | 部署用户加入 `docker` 组（`usermod -aG docker`） | 让部署用户能直接执行 compose；**docker 组约等于 root，属权限扩大**，本次由产品负责人显式点名放行（R9），下次执行仍需单独授权，不得视为常设 |
+| 3 | 未提及运维脚本的 Python 版本 | prod 系统 Python 是 3.9，而两个受控运维脚本（银河导出导入 `scripts/import_galaxy_permission_export.py`、差集导入 `scripts/ops/import_local_permission_override.py`）跟随本仓库的 `requires-python >=3.12`：装 `python3.12` 并建独立虚拟环境 `lingxi-ops-venv`（只装 `psycopg[binary]`），按脚本文档的 `PYTHONPATH=src` 姿势运行 | **不在生产现场安装或构建 `lingxi` 包**——生产只跑冻结制品，现场构建是明令禁止的路径；`PYTHONPATH=src` 让脚本以源码树方式运行而不引入安装态 |
+| 4 | 未提及 swap | prod 无 swap 而 stage 有 2G：首发前补一个 2 GiB swapfile 并写入 `/etc/fstab`，实测 `swapoff` → `swapon -a` 可由 fstab 行拉起 | rc24 三张资源类卡（#494/#496/#499）的 L4a 全部跑在有 swap 的 stage 上；不补齐这条不对称，那些结论在内存维度不可迁移（R11）。该 swapfile 属长期保留项，不是临时资源 |
+
+### 11.2 `runtime-config` 挂载卷：内容必须自带
+
+`compose.prod.yaml` 把宿主目录 `/opt/lingxi/runtime-config` 只读挂进 scheduler 与 worker 容器，但**正文里没有任何一步负责创建它或往里放东西**——docker 会自动建一个空目录，挂载成功但内容为空。首发的处置：
+
+- **`system_prompt.md` 必须从 stage 传入**（首发 sha256 前缀 `84741170e3c2…`，与 stage 逐字节一致），并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE` 指向容器内路径。**没有安全的「留空」选项**：提示词按 2026-08-23 裁定不进代码、不进镜像，镜像里没有可回落的随包版本，文件缺失时 worker **静默降级为无提示词执行**——服务全 `healthy`、观察期全绿、digest 全对、用户也能问出答案，但每次问数的质量与 stage 上验证过的完全不是一回事。该变量与 `LINGXI_WORKER_SYSTEM_PROMPT`、`LINGXI_WORKER_OUTPUT_SAFETY_CANARY` **互斥，同时配置启动即失败**，从 stage 复制 env 时须确认另两个没被一起抄过来。
+- **`LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH` 刻意不设**：外置映射文件与随包默认经结构化逐键比对为 **354 键零差异**，留空即用随包默认，等价且少一个需要长期同步的带外文件。反过来，若照「非敏感配置抄自 stage」的做法把这个路径变量抄进 prod 而文件不在，会按既定语义**响亮失败**（权限发布整轮拒绝，一条发布意图都不排），首批用户全部开不通。
+- **验收判据（首发已执行）**：首批用户第一次问数之后，读该轮 worker 终态审计的 `system_prompt_digest`，必须与 stage 同值、且降级计数为 0。该字段是**提示词文件 strip 之后 sha256 的前 12 位**（首发实测 `2272bd4d40ae`），不是文件本身的 sha256，核对时别拿错值。
+- 同一份 env 里，内测轮的**内容级采集**两个变量在生产禁止配置，且 CI 守卫读不到未入库的生产 env 文件——这条只能靠部署纪律兑现：从 stage 的 worker-queue env 生成 prod 版本时必须**显式剔除**这两项（它们恰恰只存在于 stage 那一份里）。
+
+### 11.3 判据与命令形态
+
+| # | 正文怎么写 | 实际怎么做 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | §2.1 要求确认 memory「渲染成 `512M` 而不是默认 `1G`」 | Compose v5.2.0 的 `config` 输出的是**字节数**，字面 `512M` 根本不会出现。判据按字节读：`512M` → `"536870912"`、`2G` → `"2147483648"`；**`"1073741824"` 就是漏配退回 1G 的那个错**，正是要抓的 | 照字面判据核会把**正确的配置判成不通过**；这两行是 `${VAR:-1G}` 有默认值形态，看 env 文件看不出漏没漏，只能靠渲染回读 |
+| 2 | §三「部署时核对」用 `docker compose … images` 回读 digest | 该判据只在 `up -d` 之后成立。首发在 `migrate` 这一步（`run --rm`，跑完不留容器）改用 `config` 看渲染出的镜像引用是否带正确的 `@sha256:`；`images` 的逐服务核对留到起服务之后 | `run --rm` 不留容器，`images` 输出为空 |
+| 3 | §2.3 / §2.4 的两条示例带齐了 `-f compose.yaml -f compose.prod.yaml`，但正文没有说明为什么两个都不能省 | 首发把它当硬纪律执行：**每一条** compose 命令（含 `migrate`、`reauthorize` 这类临时 job 与单服务操作）都同时带这两个 `-f`，一个都不能省 | 各服务的 `env_file` **只声明在覆盖文件** `compose.prod.yaml` 里；只带 `compose.yaml` 时命令照样能跑，但跑出来的是一个没有任何凭据与配置的容器——这是个不报错的错法 |
+| 4 | `deploy/README.md`「凭据丢失或过期的保底」给的重授权示例是裸的 `--profile job run --rm reauthorize`（不带参数） | 需要传参时（如首次建立授权主体）必须把入口**写全**：`… run --rm reauthorize python -m lingxi.apps.reauthorize <参数…>` | `run --rm <service> <args>` 的 args 会**替换**掉 compose 里声明的 `command`；直接在服务名后面追加参数，会把 `python -m lingxi.apps.reauthorize` 这个入口一起丢掉 |
+| 5 | 未提及 profile | 起服务固定用 `--profile mvp up -d`；裸 `up -d` 只起 scheduler，Bot-Prod 长连接根本不接 | `gateway` 与 `worker-queue` 都在 `mvp` profile 里 |
+
+### 11.4 内测名单：必须写两份，且要在正确的应用作用域下解析
+
+`LINGXI_INNERTEST_ROSTER_OPEN_IDS` 在任何 compose `environment:` 块里都没有声明，**写进根 `.env.prod` 静默无效**。它必须同时写进 `.env.prod.scheduler` 与 `.env.prod.gateway` **两份、逐字一致**——两个服务各读各的，只配一处时另一处按默认空值 = 全拒，首批用户会全部收到「内测未开放」。
+
+名单里的 `open_id` 必须是 **Bot-Prod 作用域**下解析出来的（`open_id` 随应用变，Bot-Test 的名单对 Bot-Prod 全拒）。首发的解析链路是：正式权限表里的用户邮箱 → 花名册人员 ID → 组织快照 `user_id` → Bot-Prod 的 `open_id`。**不要指望用邮箱直接调批量 ID 接口**：该接口在本租户解析不到这些邮箱。
+
+### 11.5 首次授权（`reauthorize` bootstrap）
+
+- **授权链接 10 分钟一次性**，两次发起之间不可复用旧链接。首发第一次发起就是因为点了已过期的链接而在回调等待上超时（未写入任何东西），第二次用新链接才成功。执行时应在链接生成后立即点击。
+- 首次建立授权主体用 `--bootstrap-subject <主体 open_id> --confirm-bootstrap`，该 `open_id` 不必写进 env 文件。首发的主体账号**不在组织快照里**，其 `open_id` 是经 `union_id` 跨应用解析得到的。
+- 凭据落地后 **scheduler 无需重启**即会用新凭据自动同步花名册（首发实测：授权完成约 30 秒后 1223 行落库）。组织快照若恰好在上一轮失败后的退避期内，需要重启 scheduler 才会立即触发。
+- §2.2「登录 GHCR」一项本次**不适用**：镜像包当日维持公开，宿主机无需登录即可拉取（D-1 裁定）。**「上线后把包改回 private + 发放只读令牌」是观察期项**；在那之前，公开镜像的暴露面见 11.7。
+
+### 11.6 监控与备份
+
+- `deploy/monitoring-units/` 三个 `.service` 单元的 `User=` **硬编码为 stage 用户**，安装到 prod 时必须改成生产的部署用户，否则监控静默缺席。这三个单元用 systemd timer 触发（不是 cron），且 `enable` 必须放在服务起来之后——提前装会向管理群发假告警。
+- `monitoring-push` 需要一个数据库监控角色，首发时未创建，**登记为观察期项**；三个采样 timer（主机健康、资源、数据库业务）已安装并各跑通一轮。
+- 容器日志留存（`deploy/日志留存.md`）首发未安装，留观察期补。
+- **`lingxi-prod` 没有备份点**（产品负责人 R8：首发豁免恢复演练）。过渡方案是由部署用户每日一次 `pg_dump -Fc` 到自己的目录（0600），首次 dump 在首批用户开通后立即执行；**产品负责人在托管控制台开启每日备份 / PITR 之后即撤销这个手工过渡**。`scripts/ops/backup_restore_drill.sh` 是演练脚本、不是备份计划，不能顶用。
+
+### 11.7 `deploy/README.md` 的一处表述已更正
+
+README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 内更正；本次首发在知情前提下接受镜像公开，改回 private 加只读令牌是观察期项。
