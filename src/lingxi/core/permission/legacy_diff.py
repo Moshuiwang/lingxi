@@ -32,10 +32,35 @@
   什么都不导入，理由码 :data:`REASON_WILDCARD_GALAXY_CURRENT`。
 - **映射外公司照导入**（PM「本地是本地的」；问数 MCP 认识这些公司），只计数
   :attr:`LegacyImportPlan.unmapped_companies_kept` 供审计。
+
+## 值严格、公司键不查目录（rc25 S-2d，对抗审查 P-2；两条口径的差异在此显式登记）
+
+:func:`classify_legacy_permissions` 是**脚本路径与首聊自动路径共用的那一层**
+（脚本 ``scripts/ops/import_local_permission_override.py::load_legacy_export`` 与自动路径
+``core/identity/legacy_permission_import.py`` → :func:`plan_legacy_import` 都必经此处），
+两侧的取值口径因此不可能分叉。它对**值**与**键**做的是**同一套卫生检查**、**不同的目录
+态度**：
+
+- **卫生（形状）——键、值一样严**：空白、含换行/制表/零宽等不可见字符、把 ``"*"`` 混进
+  名字里（``"日活*"``）一律判**解析失败**（``ValueError``），调用方整份 fail-closed，不是
+  跳过这一条继续。一份值写坏的旧行被"尽力解析"出来的结果，方向是**给错范围**。
+- **目录（内容）——只对值有要求，键一概不查**：指标维度的 ``"*"`` 只在 ``"*"`` 键下、
+  且整列恰为 ``["*"]`` 时才有意义（:data:`SHAPE_FULL_WILDCARD`）；出现在具体公司键下是
+  :data:`SHAPE_UNSUPPORTED_WILDCARD`，调用方 fail-closed。而公司键**不核对**它在不在
+  ``company_function_metric_map`` 里——「映射外公司照常导入」是 PM 2026-09-02 的明示裁定
+  （见上一节），只计数供审计。
+
+**为什么键宽松、值严格**（不是疏漏，是两种不同的后果）：值决定**给多大范围**——``"*"``
+一旦落进 ``local_permission_override``，读侧 :func:`~lingxi.core.permission.publish_row.
+lookup_metrics` 的回退制会让它等于该公司**全部指标（含未来新增）**，而且此后针对单个
+指标的抑制对它无效；公司键只决定**给哪一家公司**，写错一个公司号导入的是一条谁也用不
+上的死行，不扩大任何人的可见范围。因此把键一起收紧成「必须在映射内」既推翻已裁定的产品
+口径，又挡不住 P-2 真正的那条路。
 """
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -82,20 +107,51 @@ REASON_ALL_METRICS_UNAVAILABLE = "legacy_all_metrics_unavailable"
 REASON_SHAPE_UNSUPPORTED = "legacy_wildcard_shape_unsupported"
 
 
-def _blank(value: object) -> bool:
-    return not isinstance(value, str) or not value.strip()
+#: 公司键与指标名里一律不允许出现的 Unicode 类别：控制字符（``Cc``——换行、回车、制表
+#: 都在里面）、格式字符（``Cf``——零宽空格、双向覆盖）、代理与私用区（``Cs``/``Co``）、
+#: 行与段分隔符（``Zl``/``Zp``）。这些字符肉眼不可见或不可分辨，出现在一份要落成权限的
+#: 名字里只有两种可能：导出坏了，或有人在藏东西——两种都该整份拒绝，不该"尽力解析"。
+_FORBIDDEN_CHARACTER_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+
+
+def _malformed(value: object) -> str | None:
+    """公司键 / 指标名的**卫生**判据（模块文档「值严格、公司键不查目录」一节）：不合格
+    返回原因短语，合格返回 ``None``。
+
+    与「目录」判据（这个公司在不在映射里、这个指标在不在映射里）是**两件事**：本函数
+    只看形状，键与值走同一套；目录态度的差异写在模块文档里，不在这里。
+
+    刻意**不**管的一件事：名字首尾的普通空格（``" 日活"``）。它不匹配映射里的任何指标，
+    导入的是一条谁也用不上的死行——方向是给得更少，不是给错范围；而真实旧表导出里这类
+    脏数据很常见，为它整份拒绝只会平白挡住 #263 硬切。
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return "不得为空白"
+    for character in value:
+        if unicodedata.category(character) in _FORBIDDEN_CHARACTER_CATEGORIES:
+            return "不得含换行、制表符或其他不可见字符"
+        if character.isspace() and character != " ":
+            return "不得含普通空格以外的空白字符"
+    if ALL_COMPANIES_KEY in value and value != ALL_COMPANIES_KEY:
+        return f"不得把通配符 {ALL_COMPANIES_KEY} 混进名字里"
+    return None
 
 
 def classify_legacy_permissions(document: Mapping[str, Sequence[str]]) -> str:
-    """判定旧行形状（模块文档的表）。键或指标名为空白时抛 ``ValueError``——那是解析
-    失败，与「形状不受支持」是两种不同的 fail-closed 原因。"""
+    """判定旧行形状（模块文档的表）。键或指标名不合卫生（:func:`_malformed`：空白、含
+    换行/制表/零宽等不可见字符、把 ``"*"`` 混进名字里）时抛 ``ValueError``——那是解析
+    失败，与「形状不受支持」是两种不同的 fail-closed 原因，但**后果相同**：调用方整份
+    不导入、零写入。"""
 
     for company, metrics in document.items():
-        if _blank(company):
-            raise ValueError("旧行权限的公司键不得为空白")
+        problem = _malformed(company)
+        if problem is not None:
+            raise ValueError(f"旧行权限的公司键{problem}")
         for metric in metrics:
-            if _blank(metric):
-                raise ValueError("旧行权限的指标名不得为空白")
+            problem = _malformed(metric)
+            if problem is not None:
+                raise ValueError(f"旧行权限的指标名{problem}")
     star = document.get(ALL_COMPANIES_KEY)
     for company, metrics in document.items():
         if company != ALL_COMPANIES_KEY and ALL_COMPANIES_KEY in metrics:

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
+from lingxi.adapters.admin_registry import seed_admin_registry_entry
 from lingxi.adapters.galaxy_import import PostgresGalaxyImportStore
 from lingxi.adapters.postgres import connect
 
@@ -96,6 +97,10 @@ class ImportLocalPermissionOverridePostgresTest(unittest.TestCase):
 
     def setUp(self) -> None:
         reset_production_rows(self._dsn)
+        # rc25 S-2d（对抗审查 P-8）：``--initiated-by`` 必须是一位生效的已登记管理员，
+        # 否则整次运行在读导出之前就被拒（退出码 2、零写入）。真库用例因此要先把这个
+        # 责任人登记进 ``admin_registry``——用产品自己的种子函数，不手拼 INSERT。
+        seed_admin_registry_entry(self._dsn, feishu_open_id=INITIATED_BY, label="导入责任人（测试）")
         with connect(self._dsn) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO app_user

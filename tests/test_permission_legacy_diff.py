@@ -63,6 +63,48 @@ class ClassifyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             classify_legacy_permissions({"88": ("m1", "  ")})
 
+    # ---- rc25 S-2d（对抗审查 P-2）：值的卫生判据，脚本与自动路径共用这一层 ----
+
+    def test_invisible_characters_in_a_metric_are_unparseable(self) -> None:
+        """换行、回车、制表、零宽空格、不换行空格：整份解析失败，调用方 fail-closed。
+
+        这是**脚本路径与首聊自动路径共用的那一层**——
+        ``scripts/ops/import_local_permission_override.py::load_legacy_export`` 与
+        ``core/identity/legacy_permission_import.py``（经 :func:`plan_legacy_import`）
+        都必经本函数，两侧口径不可能分叉。
+        """
+
+        for bad in ("日\n活", "日\r活", "日\t活", "日​活", "日 活"):
+            with self.subTest(metric=repr(bad)), self.assertRaises(ValueError):
+                classify_legacy_permissions({"88": (bad,)})
+
+    def test_invisible_characters_in_a_company_key_are_unparseable(self) -> None:
+        """卫生判据键值同严——与「公司键不查目录」是两件事（见模块文档）。"""
+
+        with self.assertRaises(ValueError):
+            classify_legacy_permissions({"8\n8": ("m1",)})
+
+    def test_a_star_mixed_into_a_name_is_unparseable(self) -> None:
+        """``"日活*"``/``"1011*"``：``"*"`` 是结构记号，混进名字里只能是导出坏了。"""
+
+        with self.assertRaises(ValueError):
+            classify_legacy_permissions({"88": ("m1*",)})
+        with self.assertRaises(ValueError):
+            classify_legacy_permissions({"88*": ("m1",)})
+
+    def test_ordinary_spaces_inside_a_name_are_still_accepted(self) -> None:
+        """卫生判据只挡不可见字符，不挡普通空格——真实旧表导出里 " 日活 " 这类脏
+        数据很常见，方向是给得更少（匹配不上映射），为它整份拒绝只会平白挡住硬切。"""
+
+        self.assertEqual(classify_legacy_permissions({"88": (" m 1 ",)}), SHAPE_SPECIFIC)
+
+    def test_the_all_scope_shapes_survive_the_hygiene_check(self) -> None:
+        """否定断言：卫生判据不得误伤 S-1 定下的两种合法「全部」形状——恰为 ``"*"``
+        的键与值是结构记号，不是"名字里混了通配符"。"""
+
+        self.assertEqual(classify_legacy_permissions({"*": ("*",)}), SHAPE_FULL_WILDCARD)
+        self.assertEqual(classify_legacy_permissions({"*": ("m1",)}), SHAPE_ALL_SCOPE_EXPLICIT)
+
 
 class AllMetricsTests(unittest.TestCase):
     def test_union_over_every_company_and_function_sorted_deduplicated(self) -> None:
@@ -98,7 +140,13 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(plan.nothing_to_import)
 
     def test_unmapped_companies_are_kept_and_counted(self) -> None:
-        """PM「本地是本地的」：映射外公司（40–43）照导入，只计数供审计。"""
+        """PM「本地是本地的」：映射外公司（40–43）照导入，只计数供审计。
+
+        rc25 S-2d 的**只拒值、不拒键**锚在这里：P-2 的修法只收紧**值**（``"*"``、
+        空白、不可见字符），公司键一概不查目录。变异存活证据：给
+        ``plan_legacy_import``（或 ``classify_legacy_permissions``）加一条"公司键
+        必须在 ``mapping`` 里"的判据，本用例立刻从 2 条 pair 变红成 0 条。
+        """
 
         plan = plan_legacy_import(
             legacy={"40": ("m1",), "43": ("m2",)},
