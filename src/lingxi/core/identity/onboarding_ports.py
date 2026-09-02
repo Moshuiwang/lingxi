@@ -1,4 +1,4 @@
-"""首次开通编排（``onboarding_runner.py``）的注入口：14 个 ``Protocol`` + ``EnvironmentResult``。
+"""首次开通编排（``onboarding_runner.py``）的注入口：15 个 ``Protocol`` + ``EnvironmentResult``。
 
 从 ``core/identity/onboarding_runner.py`` 纯移动拆出（Trace #358 S-H-1，Issue #350 Gate
 G-3 裁定 Option A）：只搬定义，不改任何签名或文档字符串；``AutoOnboardingRunner`` 通过
@@ -51,6 +51,38 @@ class GalaxySource(Protocol):
     """银河当前有效批次；``None`` 表示没有有效批次。"""
 
     def load_current(self) -> Any: ...
+
+
+@dataclass(frozen=True)
+class EmailBinding:
+    """``app_user`` 里一行"这个邮箱已经绑给谁了"的只读投影（rc25 S-2a）。
+
+    ``feishu_open_id`` 是身份去重键（基线里 ``app_user`` 唯一那个 UNIQUE 列），
+    也是首聊事件里唯一直接可得的标识，因此它——而不是 ``user_id``——才是"这一行是不是
+    **同一个人**"的判据：开通链在建档**之前**就要能判，那时本人的 ``user_id`` 还不
+    存在。可空（基线允许），空值一律当作"不是当前这个人"。
+    """
+
+    user_id: str
+    feishu_open_id: str | None
+
+
+class EmailBindingSource(Protocol):
+    """按**规范化邮箱**回读 ``app_user`` 上已经绑定这个邮箱的行（rc25 S-2a，
+    对抗审查 X-1）。真实实现见
+    ``adapters/postgres_email_binding.PostgresEmailBindingSource``；判定层见
+    ``core/identity/onboarding_guards.reject_email_bound_to_another_person``。
+
+    入参是已经过 :func:`~lingxi.core.permission.account_match.normalize_email`
+    的值（去首尾空白 + 转小写）。实现方必须用同一口径比较（``lower(btrim(email))``），
+    否则这道闸与正式表行键 ``record_key`` 会对不齐——而对不齐的闸等于没有闸。
+
+    返回**全部**命中的行（顺序不限、不截断）；查无返回空序列。
+    读取失败请**抛异常**，不要返回空：把一次数据库抖动读成"没有冲突"会让这道闸在
+    最需要它的时刻静默放行。
+    """
+
+    def bindings_for_email(self, email: str) -> Sequence[EmailBinding]: ...
 
 
 class UserStateStore(Protocol):

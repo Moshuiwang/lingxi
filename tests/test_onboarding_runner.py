@@ -24,6 +24,7 @@ from lingxi.core.identity.first_contact import (
     locate_by_open_id,
 )
 from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
+from lingxi.core.identity.onboarding_ports import EmailBinding
 from lingxi.core.identity.onboarding_runner import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
@@ -192,6 +193,32 @@ class FakeProvisioning:
     def provision(self, request: Any) -> ProvisioningResult:
         self.requests.append(request)
         return self.result
+
+
+class FakeEmailBindings:
+    """``EmailBindingSource`` 的内存假实现（rc25 S-2a，对抗审查 X-1）。
+
+    ``bound`` 是「规范化邮箱 → 已绑定这个邮箱的 ``(user_id, feishu_open_id)`` 序列」。
+    默认空映射＝库里没有任何人绑过任何邮箱，本文件绝大多数既有用例走这条默认值，
+    行为与这道闸接线之前逐字节一致。注入 ``error`` 则代表回读本身失败（数据库
+    抖动），用来钉死"读不到不等于没有冲突"。
+    """
+
+    def __init__(
+        self,
+        bound: Mapping[str, Sequence[tuple[str, str | None]]] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.bound = dict(bound or {})
+        self.calls: list[str] = []
+        self._error = error
+
+    def bindings_for_email(self, email: str) -> Sequence[EmailBinding]:
+        self.calls.append(email)
+        if self._error is not None:
+            raise self._error
+        return tuple(EmailBinding(user_id, open_id) for user_id, open_id in self.bound.get(email, ()))
 
 
 class FakeUsers:
@@ -531,6 +558,8 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "galaxy": FakeGalaxy(),
         "provisioning": FakeProvisioning(),
         "users": FakeUsers(),
+        # 默认空：库里没有任何邮箱绑定，这道闸对既有用例恒放行（rc25 S-2a）。
+        "email_bindings": FakeEmailBindings(),
         "environment": FakeEnvironment(),
         "tokens": FakeTokens(),
         # 默认 None：哨兵——不注入存量令牌源时，行为必须与改动前逐字节一致
@@ -566,6 +595,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         galaxy=parts["galaxy"],
         provisioning=parts["provisioning"],
         users=parts["users"],
+        email_bindings=parts["email_bindings"],
         environment=parts["environment"],
         tokens=parts["tokens"],
         stock_tokens=parts["stock_tokens"],
@@ -2473,6 +2503,110 @@ class LegacyImporterConstructionTests(unittest.TestCase):
         self.assertIsInstance(runner, AutoOnboardingRunner)
 
 
+class EmailAlreadyBoundTests(unittest.TestCase):
+    """rc25 S-2a / 对抗审查 X-1：同一规范化邮箱已经绑给另一个 ``user_id`` 时失败关闭。
+
+    挡的是这条链：正式表行键 ``record_key`` 是规范化邮箱，而开通会按邮箱把正式表
+    存量行里**别人的**令牌密文采纳成本用户的令牌，随后又用同一个 ``record_key``
+    把那一行的权限覆写成本用户的范围——两个人以同一个身份查数。因此这里同时钉死
+    **三件事**：走的是 ``LX-ONBOARD-001`` 家族（不是「无权限」）、管理员真的收到
+    告警、以及**在冲突时一个副作用都不留**（不查存量令牌源、不签发/采纳令牌、
+    不建用户环境、不排发布意图、不推进 ``provisioning_state``）。
+    """
+
+    #: ROSTER_ROWS[0]["email"] 的规范化形态（去空白 + 小写），与 ``record_key`` 同源。
+    NORMALIZED = "xiaoming@example.com"
+    OTHER_USER = "usr_01HOTHER"
+    OTHER_OPEN_ID = "ou_employee_2"
+
+    def _conflicting(self, **overrides: Any) -> tuple[dict[str, Any], Any]:
+        bindings = FakeEmailBindings({self.NORMALIZED: ((self.OTHER_USER, self.OTHER_OPEN_ID),)})
+        return run_once(email_bindings=bindings, **overrides)
+
+    def test_another_user_holding_the_same_email_stops_the_chain_as_internal_error(self) -> None:
+        alerts: list[tuple[str, str]] = []
+        parts, _ = self._conflicting(onboarding_failed=lambda reason, trace: alerts.append((reason, trace)))
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+        # 用户看到的是冻结的 LX-ONBOARD-001，**不是**「无可用银河权限」——后者会把
+        # 一个权限完全正常的人引去银河申请一个他其实已经有的权限。
+        self.assertEqual(parts["notifier"].keys(), [KEY_INTERNAL_ERROR])
+        # 管理员真的收到告警（承诺过「已转交管理员处理」）。
+        self.assertEqual(alerts, [("email_already_bound", "trace_1")])
+
+    def test_the_conflicting_user_ids_are_audited_without_the_email_itself(self) -> None:
+        parts, _ = self._conflicting()
+        facts = parts["audit"].facts("onboarding.email_already_bound")
+        self.assertEqual(facts["conflicting_users"], (self.OTHER_USER,))
+        self.assertEqual(facts["trace_id"], "trace_1")
+        # 邮箱与 open_id 都是身份资料值，与本文件其余审计同一条纪律：不进结构化审计字段。
+        self.assertNotIn(self.NORMALIZED, str(facts))
+        self.assertNotIn(OPEN_ID, str(facts))
+
+    def test_a_conflict_leaves_no_token_environment_or_publish_intent(self) -> None:
+        """**副作用零残留**：这是这道闸的全部意义——晚一步就来不及了。"""
+
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret="stolen-token", permissions="{}")
+        )
+        parts, _ = self._conflicting(stock_tokens=stock)
+
+        self.assertEqual(stock.calls, [], "冲突时不该再按邮箱去查正式表存量行")
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [], "绝不能把别人的令牌采纳过来")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [], "publish_outbox 必须零新增")
+        self.assertEqual(parts["users"].advanced, [], "不推进 provisioning_state")
+        # **建档之前**就挡住：``app_user`` 零新增行，不为一个注定失败的人写半条记录。
+        self.assertEqual(parts["provisioning"].requests, [], "冲突时一次建档都不该发起")
+
+    def test_the_persons_own_row_is_not_a_conflict(self) -> None:
+        """重入是常态：这个人自己那一行当然持有自己的邮箱，不能把它算成冲突。
+        判据是 ``feishu_open_id``——建档之前本人还没有 ``app_user.id``。"""
+
+        bindings = FakeEmailBindings({self.NORMALIZED: ((USER_ID, OPEN_ID),)})
+        parts, _ = run_once(email_bindings=bindings)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(bindings.calls, [self.NORMALIZED])
+
+    def test_a_row_without_an_open_id_counts_as_someone_else(self) -> None:
+        """``feishu_open_id`` 可空（基线允许）。空值一律当"不是当前这个人"：
+        把它当成"可能是我自己"就等于给这道闸开了一个安静的口子。"""
+
+        bindings = FakeEmailBindings({self.NORMALIZED: ((self.OTHER_USER, None),)})
+        parts, _ = run_once(email_bindings=bindings)
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+
+    def test_the_lookup_uses_the_normalized_email(self) -> None:
+        """口径必须与 ``record_key``/``normalize_email`` 同源：花名册里存的是
+        ``Xiaoming@Example.com``，查的必须是去空白 + 小写之后的那一份。"""
+
+        parts, _ = run_once()
+        self.assertEqual(parts["email_bindings"].calls, [self.NORMALIZED])
+
+    def test_a_blank_email_skips_the_lookup_entirely(self) -> None:
+        """没有邮箱就没有 ``record_key``，采纳与发布两条链路都不成立；这类行也不进
+        迁移 ``0085`` 的部分索引，判它"与谁冲突"没有意义。"""
+
+        rows = ({**ROSTER_ROWS[0], "email": "   "},)
+        parts, _ = run_once(roster=FakeRoster(rows))
+        self.assertEqual(parts["email_bindings"].calls, [])
+
+    def test_a_read_failure_fails_the_chain_closed(self) -> None:
+        """读不到**不等于**没有冲突：数据库抖动时这道闸必须整链失败关闭，
+        而不是静默放行去签发/采纳令牌。"""
+
+        bindings = FakeEmailBindings(error=RuntimeError("db down"))
+        parts, _ = run_once(email_bindings=bindings)
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [])
+
+
 class ConstructionTests(unittest.TestCase):
     """两个注入口缺省就会静默改变行为，因此在类型层就不给这个选项。"""
 
@@ -2484,6 +2618,7 @@ class ConstructionTests(unittest.TestCase):
             galaxy=FakeGalaxy(),
             provisioning=FakeProvisioning(),
             users=FakeUsers(),
+            email_bindings=FakeEmailBindings(),
             environment=FakeEnvironment(),
             tokens=FakeTokens(),
             decisions=FakeDecisions(),
@@ -2519,6 +2654,21 @@ class ConstructionTests(unittest.TestCase):
                 sleep=lambda seconds: None,
                 onboarding_failed="not-callable",  # type: ignore[arg-type]
                 **self._parts(),
+            )
+
+    def test_a_missing_email_binding_source_is_refused_at_construction(self) -> None:
+        """没有默认哨兵（rc25 S-2a）：``email_bindings`` 是必填关键字参数。
+
+        与 ``publish_allowed``/``innertest_roster_gate`` 同一条纪律——这一格决定的是
+        「两个人会不会共用同一把问数令牌与同一行正式表权限」，给个默认值等于把闸
+        关掉，而关掉之后没有任何症状。漏接必须在**构造期**就是 ``TypeError``。
+        """
+
+        parts = self._parts()
+        del parts["email_bindings"]
+        with self.assertRaises(TypeError):
+            AutoOnboardingRunner(
+                submit=lambda task: True, sleep=lambda seconds: None, **parts  # type: ignore[arg-type]
             )
 
     def test_a_missing_innertest_roster_gate_is_refused_at_construction(self) -> None:

@@ -2131,5 +2131,133 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
         self.assertEqual(self.users.count(), 0)
 
 
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
+class AppUserEmailBindingTest(IdentityPostgresTestCase):
+    """rc25 S-2a / 对抗审查 X-1：一个规范化邮箱至多绑一个 ``app_user``。
+
+    两层防线各有一半只能在真库上验证：
+    - **迁移 0085 的部分唯一索引**——它是"两个人不可能同时绑同一个邮箱"的结构性
+      保证，纯逻辑用例证明不了它真的建出来了、也证明不了它的表达式与
+      ``normalize_email`` 同口径；
+    - **``PostgresEmailBindingSource`` 的回读**——SQL 的 ``lower(btrim(email))``
+      必须与应用层归一化对齐，对不齐的闸等于没有闸。
+
+    编排层"命中即失败关闭、零副作用"的断言在
+    ``tests/test_onboarding_runner.EmailAlreadyBoundTests``；这里额外跑一次**真库上
+    的整条链**，证明第二个人既不建档、也不排发布意图。
+    """
+
+    EMAIL = "Shared.Mailbox@Example-Corp.invalid"
+    NORMALIZED = "shared.mailbox@example-corp.invalid"
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
+
+        self.bindings = PostgresEmailBindingSource(self._dsn)
+
+    def _insert(self, user_id: str, open_id: str, email: str | None) -> None:
+        """直插一行 ``app_user``。身份六列必须**全有**（基线 CHECK：``V-开通-06``
+        的"不得留下半条记录"），因此这里按 ``open_id`` 派生齐全，不是只填两列。"""
+
+        self.execute(
+            """INSERT INTO app_user
+                 (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
+                  department, tenant_key, email)
+               VALUES (%s, %s, %s, %s, %s, '测试部门', 'tenant_a', %s)""",
+            (user_id, open_id, f"fs_{open_id}", f"un_{open_id}", "共用邮箱用例", email),
+        )
+
+    # ---- 数据库侧：部分唯一索引 --------------------------------------
+
+    def test_a_second_row_with_the_same_normalized_email_is_refused(self) -> None:
+        """**变异锚点**：删掉迁移 0085 的唯一索引，这条用例必须变红。
+
+        大小写与首尾空白都不构成"不同的邮箱"——正式表行键 ``record_key`` 用的就是
+        去空白 + 小写之后的那一份，索引口径必须与它逐字一致。
+        """
+
+        self._insert("usr_first", "ou_first", self.EMAIL)
+        with self.assertRaises(self._psycopg.errors.UniqueViolation):
+            self._insert("usr_second", "ou_second", "  SHARED.MAILBOX@example-corp.invalid ")
+
+    def test_updating_a_row_onto_someone_elses_email_is_refused(self) -> None:
+        """建档是 ``ON CONFLICT (feishu_open_id) DO UPDATE``：把某一行的邮箱改成
+        别人已经占用的那一个，同样必须被拒——只挡 INSERT 的索引挡不住换绑。"""
+
+        self._insert("usr_first", "ou_first", self.EMAIL)
+        self._insert("usr_second", "ou_second", "another@example-corp.invalid")
+        with self.assertRaises(self._psycopg.errors.UniqueViolation):
+            self.execute("UPDATE app_user SET email = %s WHERE id = 'usr_second'", (self.EMAIL,))
+
+    def test_rows_without_a_usable_email_are_not_constrained(self) -> None:
+        """建档不以邮箱为前提（基线：工号与邮箱可空）。``NULL`` 与纯空白都不进索引，
+        否则第二个没填邮箱的人就建不了档。"""
+
+        self._insert("usr_a", "ou_a", None)
+        self._insert("usr_b", "ou_b", None)
+        self._insert("usr_c", "ou_c", "   ")
+        self._insert("usr_d", "ou_d", "")
+        self.assertEqual(self.scalar("SELECT count(*) FROM app_user"), 4)
+
+    # ---- 适配器侧：回读口径 ------------------------------------------
+
+    def test_the_binding_source_matches_on_the_normalized_email(self) -> None:
+        self._insert("usr_first", "ou_first", f"  {self.EMAIL.upper()}  ")
+
+        bound = self.bindings.bindings_for_email(self.NORMALIZED)
+
+        self.assertEqual([(item.user_id, item.feishu_open_id) for item in bound], [("usr_first", "ou_first")])
+        self.assertEqual(self.bindings.bindings_for_email("nobody@example-corp.invalid"), ())
+        self.assertEqual(self.bindings.bindings_for_email(""), ())
+
+    def test_blank_emails_are_never_returned_as_a_binding(self) -> None:
+        """空白邮箱不是"绑定"：它不进索引，也不该让判定层拿它当冲突。"""
+
+        self._insert("usr_blank", "ou_blank", "   ")
+        self.assertEqual(self.bindings.bindings_for_email(""), ())
+        self.assertEqual(self.bindings.bindings_for_email("   "), ())
+
+    # ---- 编排层：真库上的整条链 --------------------------------------
+
+    def test_a_second_person_sharing_the_email_is_stopped_before_any_write(self) -> None:
+        """**变异锚点**：拿掉 ``_run`` 里那道闸，这条用例必须变红。
+
+        真库上跑完整条开通链：库里先有一个**别人**的 ``app_user`` 行占着这个邮箱，
+        第二个人首聊进来后必须以 ``LX-ONBOARD-001`` 失败关闭，且 ``app_user``
+        零新增行、``publish_outbox`` 零行。
+        """
+
+        from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+        from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
+
+        roster_email = ROSTER_ROWS[0]["email"]
+        self._insert("usr_incumbent", "ou_someone_else", roster_email)
+
+        parts, _ = run_once(
+            provisioning=PostgresAppUserStore(self._dsn),
+            users=PostgresAppUserStore(self._dsn),
+            email_bindings=PostgresEmailBindingSource(self._dsn),
+            decisions=PostgresPermissionPublishStore(self._dsn),
+            roster=FakeRoster(ROSTER_ROWS),
+        )
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], "internal_error")
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["environment"].calls, [])
+        # 真库读回：第二个人一行都没建，一条发布意图都没排。
+        self.assertEqual(
+            self.query("SELECT id, feishu_open_id FROM app_user ORDER BY id"),
+            [("usr_incumbent", "ou_someone_else")],
+        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM publish_outbox"), 0)
+        self.assertNotEqual(OPEN_ID, "ou_someone_else")
+
+
 if __name__ == "__main__":
     unittest.main()

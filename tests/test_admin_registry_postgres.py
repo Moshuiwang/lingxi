@@ -903,8 +903,14 @@ class TraceLookupTests(AdminRegistryPostgresTestCase):
 
 class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
     """``PostgresAdminQueries.resolve_identifier``（#439 A 档）：邮箱 → open_id
-    真库反查。``app_user.email`` 没有唯一约束（迁移基线只对 ``feishu_open_id``
-    建 UNIQUE），零命中/多命中都必须 fail-open（原样返回输入），不猜测。"""
+    真库反查。零命中/多命中都必须 fail-open（原样返回输入），不猜测。
+
+    迁移 ``0085``（rc25 S-2a）之后，``app_user`` 的**规范化邮箱**已经唯一，
+    "多命中"在一个跑过全链迁移的库上结构性不可能；下面那条多命中用例因此显式
+    把索引摘掉再造这个形状——它守的是**防御分支本身还在**，适用于 0085 之前建成
+    的库、以及任何有人把索引删掉的场合。删掉那条分支而只依赖索引，等于把一道
+    只在特定库上成立的保证当成代码不变式。
+    """
 
     def test_unique_email_match_resolves_to_open_id(self) -> None:
         self.add_user(open_id="ou_target", email="someone@example.com")
@@ -923,8 +929,21 @@ class ResolveIdentifierTests(AdminRegistryPostgresTestCase):
 
     def test_multiple_hits_falls_back_to_the_original_input_not_an_arbitrary_pick(self) -> None:
         """否定断言：同一邮箱命中多个 ``app_user`` 行时不猜测选哪一条，原样
-        透传，交给下游按既有"未找到"语义处理。"""
+        透传，交给下游按既有"未找到"语义处理。
 
+        造这个形状必须先摘掉迁移 ``0085`` 的部分唯一索引（见类文档）；``addCleanup``
+        无论用例成败都把它建回去，不把一个缺索引的库留给同进程后面的用例。
+        """
+
+        self.execute("DROP INDEX app_user_normalized_email_key")
+        # 清理按注册的**逆序**执行：先把这两行重复邮箱删掉，索引才建得回去。
+        self.addCleanup(
+            self.execute,
+            "CREATE UNIQUE INDEX IF NOT EXISTS app_user_normalized_email_key"
+            " ON app_user (lower(btrim(email)))"
+            " WHERE email IS NOT NULL AND btrim(email) <> ''",
+        )
+        self.addCleanup(self.execute, "DELETE FROM app_user")
         self.add_user(user_id="usr_a", open_id="ou_a", email="dup@example.com")
         self.add_user(user_id="usr_b", open_id="ou_b", email="dup@example.com")
         queries = PostgresAdminQueries(self._dsn)
