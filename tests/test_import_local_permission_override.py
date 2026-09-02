@@ -17,10 +17,12 @@ import io
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+from lingxi.core.admin.registry import ALL_ADMIN_ROLES, AdminRegistryEntry, AdminRole
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ops" / "import_local_permission_override.py"
 
@@ -215,6 +217,30 @@ class PlanImportTests(unittest.TestCase):
         self.assertEqual(grant.feishu_open_id, GRANTED_USER.feishu_open_id)
         self.assertEqual(grant.company_id, "BC-甲")
         self.assertEqual(grant.metric_name, "存量指标")
+        self.assertEqual(plan.skipped, ())
+
+    def test_a_company_outside_the_translation_mapping_is_still_planned(self) -> None:
+        """**只拒值、不拒键**（rc25 S-2d 与 S-1 裁定一致）：映射里根本没有 "9999"
+        这家公司，差集照样产出这条 grant——「本地是本地的」，问数 MCP 认识 40–43
+        这类映射外公司。
+
+        变异存活证据：若把 P-2 的值校验误写成"公司键必须在映射内"（不论落在
+        `load_legacy_export` 还是这一层），本用例立刻从 1 条 grant 变红成 0 条。
+        """
+
+        legacy = {GRANTED_USER.email: {"9999": ("存量指标",)}}
+
+        plan = TOOL.plan_import(
+            legacy=legacy,
+            galaxy=_granted_galaxy_snapshot(),
+            role_function_map=ROLE_FUNCTION_MAP,
+            metric_translation_map=METRIC_TRANSLATION_MAP,
+            lookup_user=lambda email: TOOL.UserLookup(record=GRANTED_USER),
+        )
+
+        self.assertEqual(len(plan.grants), 1)
+        self.assertEqual(plan.grants[0].company_id, "9999")
+        self.assertEqual(plan.grants[0].metric_name, "存量指标")
         self.assertEqual(plan.skipped, ())
 
     def test_a_diff_that_is_fully_covered_by_galaxy_produces_no_grant(self) -> None:
@@ -447,6 +473,75 @@ class LoadLegacyExportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TOOL.load_legacy_export(path)
 
+    # ---- rc25 S-2d（对抗审查 P-2）：只判键不判值曾让 "*" 值直通 ------------
+
+    def test_a_wildcard_metric_value_rejects_the_whole_export(self) -> None:
+        """``{"1011": ["*"]}``——通配在**值**里。改动前只判了键，这一行直通落库，
+        读侧 ``lookup_metrics`` 的回退制会让它等于"1011 全部指标（含未来新增）"，
+        且此后对单个指标的抑制减不掉它。
+
+        变异存活证据：把 `load_legacy_export` 里 `classify_legacy_permissions` 那段
+        `shape != SHAPE_SPECIFIC` 的判据删掉，本用例会从抛出 `ValueError` 变红成
+        `load_legacy_export` 正常返回一份含 `("*",)` 值的结果。
+        """
+
+        path = self._write(
+            'email,permissions\n'
+            'ok@example.com,"{""1011"": [""日活""]}"\n'
+            'star@example.com,"{""1011"": [""*""]}"\n'
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            TOOL.load_legacy_export(path)
+
+        self.assertIn("star@example.com", str(raised.exception))
+
+    def test_a_metric_value_that_merely_contains_a_star_is_also_rejected(self) -> None:
+        """``"日活*"``：``"*"`` 混进名字里同样整份拒绝（卫生判据，不是形状判据）。"""
+
+        path = self._write('email,permissions\na@example.com,"{""1011"": [""日活*""]}"\n')
+
+        with self.assertRaises(ValueError):
+            TOOL.load_legacy_export(path)
+
+    def test_a_blank_metric_value_rejects_the_whole_export(self) -> None:
+        path = self._write(
+            'email,permissions\n'
+            'ok@example.com,"{""1011"": [""日活""]}"\n'
+            'blank@example.com,"{""1011"": [""   ""]}"\n'
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            TOOL.load_legacy_export(path)
+
+        self.assertIn("blank@example.com", str(raised.exception))
+
+    def test_a_newline_inside_a_metric_value_rejects_the_whole_export(self) -> None:
+        """指标名里夹一个换行——CSV 引号内的换行是合法字段内容，解析得出来，
+        但一个名字里带换行的指标不可能匹配映射里的任何东西，只可能是导出坏了
+        或有人在藏东西：整份拒绝，不"尽力解析"。"""
+
+        path = self._write(
+            'email,permissions\n'
+            'nl@example.com,"{""1011"": [""日\\n活""]}"\n'
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            TOOL.load_legacy_export(path)
+
+        self.assertIn("nl@example.com", str(raised.exception))
+
+    def test_a_company_key_outside_the_mapping_is_still_accepted(self) -> None:
+        """**只拒值、不拒键**：映射外公司（40–43 这类）照常解析通过——「本地是
+        本地的」是 PM 2026-09-02 对 rc25 S-1 的明示裁定，生产上的首聊路径依赖它。
+
+        变异存活证据：若把值校验误写成"公司键必须在映射/目录内"，本用例立刻变红。
+        """
+
+        path = self._write('email,permissions\na@example.com,"{""9999"": [""日活""]}"\n')
+
+        self.assertEqual(TOOL.load_legacy_export(path), {"a@example.com": {"9999": ("日活",)}})
+
 
 # ---------------------------------------------------------------------------
 # 五、幂等短路查询：_existing_active_grant 用假游标钉住 SQL 形状与判断逻辑
@@ -528,6 +623,202 @@ class PrintPlanTests(unittest.TestCase):
 
         self.assertIn("0", output)
         self.assertNotIn("+ user=", output)
+
+
+# ---------------------------------------------------------------------------
+# 七、main() 的两道前置闸门（rc25 S-2d，对抗审查 P-2 / P-8）：
+#     ① --initiated-by 必须是生效的已登记管理员；② 导出的**值**必须干净。
+#     两道闸都必须在**任何写入之前**拒绝——退出码非 0，`apply_grant` 一次都不许被调用。
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdminRegistryLookup:
+    """假 ``admin_registry`` 读侧：只认一个 open_id，其余一律查无（返回 ``None``）。
+
+    条目的 ``entry_status``/``roles`` 可调，用来验证判定确实走的是
+    ``core/admin/registry.is_authorized_admin``（active + 三类角色全真），而不是
+    "查到一行就算管理员"。
+    """
+
+    def __init__(
+        self,
+        *,
+        authorized_open_id: str | None,
+        entry_status: str = "active",
+        roles: frozenset = ALL_ADMIN_ROLES,
+        error: Exception | None = None,
+    ) -> None:
+        self._authorized_open_id = authorized_open_id
+        self._entry_status = entry_status
+        self._roles = roles
+        self._error = error
+        self.asked: list[str] = []
+
+    def active_entry(self, *, open_id: str) -> Any:
+        self.asked.append(open_id)
+        if self._error is not None:
+            raise self._error
+        if open_id != self._authorized_open_id:
+            return None
+        return AdminRegistryEntry(
+            feishu_open_id=open_id,
+            label="测试管理员",
+            roles=self._roles,
+            entry_status=self._entry_status,
+        )
+
+
+class MainGateTests(unittest.TestCase):
+    ADMIN_OPEN_ID = "ou_registered_admin"
+    GOOD_CSV = 'email,permissions\na@example.com,"{""1011"": [""日活""]}"\n'
+    STAR_VALUE_CSV = 'email,permissions\nstar@example.com,"{""1011"": [""*""]}"\n'
+    BLANK_VALUE_CSV = 'email,permissions\nblank@example.com,"{""1011"": [""   ""]}"\n'
+    NEWLINE_VALUE_CSV = 'email,permissions\nnl@example.com,"{""1011"": [""日\\n活""]}"\n'
+
+    def setUp(self) -> None:
+        self.applied: list[Any] = []
+        self._install_lookup(_FakeAdminRegistryLookup(authorized_open_id=self.ADMIN_OPEN_ID))
+
+        original_apply = TOOL.apply_grant
+
+        def _forbidden_apply(*args: Any, **kwargs: Any) -> bool:
+            # 闸门用例里一行都不该落库：记下来让断言看得见，同时立刻炸掉，
+            # 避免"记了一笔却继续跑下去"把一次真正的回归伪装成通过。
+            self.applied.append((args, kwargs))
+            raise AssertionError("前置闸门之后不该有任何写入")
+
+        TOOL.apply_grant = _forbidden_apply
+        self.addCleanup(setattr, TOOL, "apply_grant", original_apply)
+
+    def _install_lookup(self, lookup: _FakeAdminRegistryLookup) -> None:
+        original = TOOL.resolve_admin_registry_lookup
+        TOOL.resolve_admin_registry_lookup = lambda dsn: lookup
+        self.addCleanup(setattr, TOOL, "resolve_admin_registry_lookup", original)
+        self.lookup = lookup
+
+    def _write(self, text: str) -> Path:
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8", newline=""
+        )
+        handle.write(text)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        return Path(handle.name)
+
+    def _run_apply(self, csv_text: str, *, initiated_by: str | None = None) -> tuple[int, str]:
+        """按最危险的姿势跑一次：``--apply``（真正写入的那一档）。闸门必须在这一档
+        下也整份拒绝，不能只在 dry-run 下报警。"""
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = TOOL.main(
+                [
+                    str(self._write(csv_text)),
+                    "--initiated-by", initiated_by if initiated_by is not None else self.ADMIN_OPEN_ID,
+                    "--dsn", "postgresql://unused/unused",
+                    "--apply",
+                ]
+            )
+        return code, err.getvalue()
+
+    # ---- P-2：值不干净 → 整份拒绝、退出码非 0、零写入 ----------------------
+
+    def test_a_wildcard_metric_value_is_rejected_before_any_write(self) -> None:
+        code, stderr = self._run_apply(self.STAR_VALUE_CSV)
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [], "整份拒绝＝零写入，不是跳过这一条继续导入")
+        self.assertIn("star@example.com", stderr)
+
+    def test_a_blank_metric_value_is_rejected_before_any_write(self) -> None:
+        code, stderr = self._run_apply(self.BLANK_VALUE_CSV)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+        self.assertIn("blank@example.com", stderr)
+
+    def test_a_newline_metric_value_is_rejected_before_any_write(self) -> None:
+        code, stderr = self._run_apply(self.NEWLINE_VALUE_CSV)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+        self.assertIn("nl@example.com", stderr)
+
+    # ---- P-8：--initiated-by 必须是生效的已登记管理员 ----------------------
+
+    def test_an_unregistered_initiated_by_is_rejected_with_zero_writes(self) -> None:
+        """责任人不是已登记管理员：连那份（本身完全合格的）导出都不该被处理。
+
+        变异存活证据：把 `main()` 里 `initiated_by_is_registered_admin` 那段闸门
+        删掉，本用例会从 `code == 2` 变红——`main()` 会继续往下走去连库。
+        """
+
+        code, stderr = self._run_apply(self.GOOD_CSV, initiated_by="ou_stranger")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+        self.assertEqual(self.lookup.asked, ["ou_stranger"], "闸门必须真的去问登记表")
+        self.assertIn("已登记管理员", stderr)
+
+    def test_a_revoked_registration_is_not_an_admin(self) -> None:
+        """判定复用 `is_authorized_admin`：查到一行不等于是管理员，撤销过的不算。"""
+
+        self._install_lookup(
+            _FakeAdminRegistryLookup(
+                authorized_open_id=self.ADMIN_OPEN_ID, entry_status="revoked"
+            )
+        )
+
+        code, _ = self._run_apply(self.GOOD_CSV)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+
+    def test_a_partially_granted_registration_is_not_an_admin(self) -> None:
+        """三类角色没有全部授予同样不算——本仓库没有"部分权限的管理员"这个概念。"""
+
+        self._install_lookup(
+            _FakeAdminRegistryLookup(
+                authorized_open_id=self.ADMIN_OPEN_ID,
+                roles=frozenset({AdminRole.PERMISSION_ADMIN}),
+            )
+        )
+
+        code, _ = self._run_apply(self.GOOD_CSV)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+
+    def test_a_registry_read_failure_fails_closed(self) -> None:
+        """登记表读不出来 → 拒绝。查不到答案不等于答案是"是"。"""
+
+        self._install_lookup(
+            _FakeAdminRegistryLookup(
+                authorized_open_id=self.ADMIN_OPEN_ID,
+                error=RuntimeError("dsn=postgresql://user:pw@host/db 连接失败"),
+            )
+        )
+
+        code, stderr = self._run_apply(self.GOOD_CSV)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+        self.assertIn("管理员登记表不可读", stderr)
+        self.assertIn("RuntimeError", stderr)
+        self.assertNotIn("postgresql://", stderr, "只登记异常类型名，不把异常正文抄进输出")
+
+    def test_a_registered_admin_passes_the_gate_and_the_export_check_still_runs(self) -> None:
+        """正向对照：闸门不是"一律拒绝"。已登记管理员放行后，拒绝理由变成导出
+        本身不合格那一条——证明这次运行确实越过了 P-8 那道闸。"""
+
+        code, stderr = self._run_apply("email,other\na@example.com,x\n")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(self.applied, [])
+        self.assertEqual(self.lookup.asked, [self.ADMIN_OPEN_ID])
+        self.assertIn("旧表导出读取失败", stderr)
+        self.assertNotIn("已登记管理员", stderr)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,20 @@ ALL_COMPANIES_KEY`（``"*"``）键，同样整份导出拒绝导入**（rc21 修
 不猜、不代为决定，命中即整份拒绝——dry-run（含未来的 ``--apply``）都会看到同一
 条拒绝原因。
 
+**值同样整份校验，不是只判键**（rc25 S-2d，对抗审查 P-2）：任意一行的
+``permissions`` **值**里出现 ``"*"``（``{"1011": ["*"]}``）、空白值、含换行或
+零宽等不可见字符的指标名、把 ``"*"`` 混进名字里的指标名（``"日活*"``），一律
+**整份导出拒绝导入**，退出码 2、零写入——不是跳过这一条继续。``"*"`` 值一旦
+落进 ``local_permission_override``，读侧 ``lookup_metrics`` 的回退制会让它等于
+"该公司全部指标（含未来新增）"，而且此后针对单个指标的抑制减不掉它。判定落在
+:func:`~lingxi.core.permission.legacy_diff.classify_legacy_permissions`——首聊
+自动路径走的是同一个函数，两条路径的取值口径结构上不会分叉。
+
+**只拒值、不拒公司键**：本工具**不**核对公司键在不在翻译映射里。「映射外公司
+照常导入」是 PM 2026-09-02 对 rc25 S-1 的明示裁定（「本地是本地的」，问数 MCP
+认识 40–43 这些公司）。两者后果不同：值决定**给多大范围**，公司键只决定**给
+哪一家公司**——写错公司号导入的是一条谁也用不上的死行，不扩大可见范围。
+
 ## 输入二：当前银河快照（从库读，不需要额外文件）
 
 对旧表里出现的每一个邮箱，本工具按**与每日权限重算完全相同**的匹配 + 聚合 +
@@ -113,6 +127,14 @@ ALL_COMPANIES_KEY`（``"*"``）键，同样整份导出拒绝导入**（rc21 修
 参数（运行这次导入的责任人飞书 open_id，通常是产品负责人或受托操作者本人）——
 不写死任何值，避免审计栏目显示一个无法追溯的占位身份。
 
+**``--initiated-by`` 必须是一位生效的已登记管理员**（rc25 S-2d，对抗审查 P-8）：
+在做任何事之前（连 dry-run 也过这一关）按 ``admin_registry`` 核对一次，判据复用
+:func:`~lingxi.core.admin.registry.is_authorized_admin` 这条既有的默认拒绝谓词
+（条目不存在、非 active、三类角色没有全部授予，一律不是管理员），不另写一套。
+不是登记管理员、或登记表读不出来 → 整次运行拒绝，退出码 2、零写入。理由：这个
+open_id 会被逐行写进 ``initiated_by_open_id``/``decided_by_open_id``，是审计上
+"这批授权是谁批的"的唯一答案，不能是一个谁都能随手填的自由文本。
+
 ## 用法
 
 **写入极性（rc21 修复包 B）：默认只出计划，不写入任何一行；要真正写入必须显式
@@ -151,6 +173,7 @@ from lingxi.core.permission.legacy_diff import (
     PENDING_ACTION_REASON,
     SHAPE_SPECIFIC,
     LegacyImportPlan,
+    classify_legacy_permissions,
     compute_company_diff,
 )
 from lingxi.core.permission.metric_translation import (
@@ -432,6 +455,42 @@ def load_legacy_export(path: Path) -> dict[str, dict[str, tuple[str, ...]]]:
                     f' "{ALL_COMPANIES_KEY}"：旧表通配用户的平移方式留 #263 由'
                     " PM 单裁，本工具拒绝导入整份导出。"
                 )
+            # rc25 S-2d（对抗审查 P-2，P1）：**值**同样整份校验，不是只判键。上一段
+            # 只挡住了 ``{"*": …}`` 这种通配**键**，``{"1011": ["*"]}`` 这种通配**值**
+            # 在此之前是直通的——它落库后，读侧 ``lookup_metrics`` 的 "*" 回退制会
+            # 让这一条本地授权等于"该公司全部指标（含未来新增）"，而且此后针对单个
+            # 指标的抑制对它无效（抑制按 (公司, 指标) 精确匹配，减不掉一个 "*"）。
+            # 一份写错的导入文件因此能把某个人的可见范围悄悄放成"全部"。
+            #
+            # 校验落在 ``classify_legacy_permissions`` 这一层，**不是**本脚本自己另写
+            # 一套：首聊自动路径（``core/identity/legacy_permission_import.py`` →
+            # ``legacy_diff.plan_legacy_import``）必经同一个函数，两条路径的取值口径
+            # 因此结构上不可能分叉。上一段已经把带 "*" 键的整份拒掉，所以这里能走到
+            # 的文档只剩两种结局：``SHAPE_SPECIFIC``（键值都不含 "*"）或
+            # ``SHAPE_UNSUPPORTED_WILDCARD``（某个具体公司的值里出现了 "*"）；空白、
+            # 换行、零宽等不可见字符与"把 * 混进名字里"（``"日活*"``）由该函数抛
+            # ``ValueError``，同样整份拒绝。
+            #
+            # **只拒值、不拒键**（差异在此显式登记，见 ``legacy_diff`` 模块文档同名
+            # 一节）：这里**不**核对公司键在不在翻译映射里——「映射外公司照常导入」是
+            # PM 2026-09-02 对 rc25 S-1 的明示裁定（「本地是本地的」，问数 MCP 认识
+            # 40–43 这些公司），生产上正在用的首聊路径依赖它。两者后果不同：值决定
+            # **给多大范围**，键只决定**给哪一家公司**——写错一个公司号导入的是一条
+            # 谁也用不上的死行，不扩大任何人的可见范围。顺手把键一起收紧既推翻已裁
+            # 定的产品口径，又挡不住 P-2 真正的那条路。
+            try:
+                shape = classify_legacy_permissions(permissions)
+            except ValueError as error:
+                raise ValueError(
+                    f"第 {row_number} 行（{email}）permissions 的值不合格（{error}）："
+                    "本工具拒绝导入整份导出，未写入任何一行。"
+                ) from error
+            if shape != SHAPE_SPECIFIC:
+                raise ValueError(
+                    f"第 {row_number} 行（{email}）permissions 的「值」里出现了通配符"
+                    f' "{ALL_COMPANIES_KEY}"（形状 {shape}）：它落库后等于该公司全部'
+                    "指标且抑制对它无效，本工具拒绝导入整份导出，未写入任何一行。"
+                )
             result[email] = permissions
     return result
 
@@ -440,6 +499,33 @@ def load_legacy_export(path: Path) -> dict[str, dict[str, tuple[str, ...]]]:
 # 二、I/O：数据库读写（真实装配，未接单元测试——由 Epic Full 真库门禁与
 #    stage 演练覆盖，与 scripts/import_galaxy_permission_export.py 同一分层）
 # ---------------------------------------------------------------------------
+
+
+def resolve_admin_registry_lookup(dsn: str) -> Any:
+    """真实装配：读 ``admin_registry`` 的只读查询对象（``PostgresAdminRegistryLookup``，
+    与 gateway 管理命令面用的是同一个类）。
+
+    单独成函数是为了给单元测试一个注入点——测试替换本函数即可用假登记表验证
+    :func:`initiated_by_is_registered_admin` 的两种结局，不需要真库。
+    """
+
+    from lingxi.adapters.admin_registry import PostgresAdminRegistryLookup
+
+    return PostgresAdminRegistryLookup(dsn)
+
+
+def initiated_by_is_registered_admin(lookup: Any, open_id: str) -> bool:
+    """``--initiated-by`` 给的这个 open_id 是不是一位**已登记的管理员**（rc25 S-2d，
+    对抗审查 P-8）。
+
+    判定**复用** :func:`lingxi.core.admin.registry.is_authorized_admin` 这条既有的默认
+    拒绝谓词（条目不存在、非 active、或三类角色没有全部授予，一律不是管理员），不在本
+    脚本另写一套——管理员身份在本仓库只有一个判据，多一份拷贝就多一处会漂移的口径。
+    """
+
+    from lingxi.core.admin.registry import is_authorized_admin
+
+    return is_authorized_admin(lookup.active_entry(open_id=open_id))
 
 
 def _lookup_app_user_by_email(cursor: Any, email: str) -> UserLookup:
@@ -560,7 +646,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("legacy_export", type=Path, help="旧表只读导出快照（CSV，见脚本文档「输入一」）")
     parser.add_argument(
         "--initiated-by", required=True, dest="initiated_by_open_id",
-        help="本次导入的责任人飞书 open_id，写入每一行的 initiated_by_open_id/decided_by_open_id",
+        help="本次导入的责任人飞书 open_id，写入每一行的 initiated_by_open_id/decided_by_open_id；"
+        "必须是 admin_registry 里一位生效的已登记管理员，否则整次运行拒绝、零写入",
     )
     parser.add_argument("--dsn", default=None, help="PostgreSQL DSN；缺省读 LINGXI_POSTGRES_DSN")
     parser.add_argument(
@@ -579,6 +666,33 @@ def main(argv: list[str] | None = None) -> int:
     dsn = arguments.dsn or os.environ.get("LINGXI_POSTGRES_DSN")
     if not dsn:
         print("缺少 DSN：既未传 --dsn，也未设置环境变量 LINGXI_POSTGRES_DSN。", file=sys.stderr)
+        return 2
+
+    # rc25 S-2d（对抗审查 P-8）：``--initiated-by`` 以前是一个自由文本 open_id，谁都能
+    # 随手填一个——它却会被逐行写进 initiated_by_open_id/decided_by_open_id，成为审计上
+    # "这批授权是谁批的"的唯一答案。这里在**做任何事之前**核对它是不是 admin_registry
+    # 里一位生效的已登记管理员：不是就整次运行拒绝，退出码 2、零写入。
+    #
+    # 闸门放在最前面（连 dry-run 也过这一关）而不是只挡 --apply：一次连责任人都填不对
+    # 的运行，它打印出来的计划同样不该被当作"已核对过的计划"拿去 --apply。登记表读不出
+    # 来时按 fail-closed 处理——查不到答案不等于答案是"是"。
+    initiated_by_open_id = (arguments.initiated_by_open_id or "").strip()
+    if not initiated_by_open_id:
+        print("--initiated-by 不能为空白，未做任何操作。", file=sys.stderr)
+        return 2
+    try:
+        authorized = initiated_by_is_registered_admin(
+            resolve_admin_registry_lookup(dsn), initiated_by_open_id
+        )
+    except Exception as error:  # noqa: BLE001 - 登记表读不出来一律 fail-closed
+        print(f"管理员登记表不可读，未做任何操作：{type(error).__name__}", file=sys.stderr)
+        return 2
+    if not authorized:
+        print(
+            "--initiated-by 给出的 open_id 不是一位生效的已登记管理员"
+            "（admin_registry 里没有 active 条目，或三类角色没有全部授予），未做任何操作。",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -648,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(timezone.utc)
     report = ApplyReport()
     for grant in plan.grants:
-        if apply_grant(dsn, grant=grant, initiated_by_open_id=arguments.initiated_by_open_id, now=now):
+        if apply_grant(dsn, grant=grant, initiated_by_open_id=initiated_by_open_id, now=now):
             report.imported += 1
         else:
             report.already_present += 1
