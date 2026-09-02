@@ -36,9 +36,10 @@ feishu_tenant_token` 同一习惯：标准库 ``urllib``、零新增依赖、构
 
 ## 失败语义：不静默
 
-七个会发起真实调用的方法（Issue #408 新增 :meth:`LarkDocxDelivery.
-convert_markdown_to_blocks`/:meth:`LarkDocxDelivery.write_blocks`，见「markdown
-官方转换开关」一节）都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
+八个会发起真实调用的方法（Issue #408 新增 :meth:`LarkDocxDelivery.
+convert_markdown_to_body`/:meth:`LarkDocxDelivery.write_blocks`，Issue #538 新增
+:meth:`LarkDocxDelivery.write_descendant_blocks`，见「markdown 官方转换开关」与
+「嵌套块写入路径」两节）都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
 :class:`FeishuDocxDeliveryError`（``definite=True``，判别口径同
 :class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`）；响应本身成功
 （``code`` 为 0）但缺失可回读标识（``document_id``/``items`` 字段缺失或形状
@@ -98,9 +99,10 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
 ``"1"`` 继续解析成开启（既有 stage 配置零迁移成本），完整语义见
 ``apps/gateway/config.py::_markdown_convert_enabled``。
 
-- :meth:`LarkDocxDelivery.convert_markdown_to_blocks`：``POST /docx/v1/documents/
+- :meth:`LarkDocxDelivery.convert_markdown_to_body`：``POST /docx/v1/documents/
   blocks/convert``（``content_type=markdown``），把一段 markdown 转换成飞书官方
-  block 结构。这个端点只做转换、不写入任何文档，失败或重试都不产生外部副作用。
+  block 结构，并整理成一份 :class:`ConvertedBody`。这个端点只做转换、不写入任何
+  文档，失败或重试都不产生外部副作用。
   **Issue #442 受控探针实证**（2026-08-30，Bot-Test 真实调用，见该 issue 正文）
   纠正了本节此前的假设：响应体 ``data.blocks`` **不是文档顺序**（实测「标题→
   两列表项→正文」返回的 ``block_types`` 顺序是 ``[12, 2, 3, 12]``），真实的
@@ -115,50 +117,40 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
 
   1. ``first_level_block_ids`` 缺失、不是列表或为空 → ``markdown_convert_
      missing_first_level_block_ids``；
-  2. 存在任意一个块的 ``block_id`` 不在 ``first_level_block_ids`` 内（典型
-     场景：表格等嵌套结构——表格自身是一级块，但它的单元格是作为独立元素
-     出现在 ``blocks`` 数组里、却不出现在 ``first_level_block_ids`` 里的
-     子块）→ :data:`UNSUPPORTED_NESTED_BLOCKS`。本仓库当前只支持"结果是
-     一份纯一级块序列"的 markdown（标题、列表、正文段落等），**不支持任何
-     带嵌套结构的 markdown**（表格是已知的第一个例子）——这是一个已登记的
-     后续扩展点，不是本次修复的交付范围。**这个码是全模块唯一会被
-     :meth:`LarkDocxDelivery.write_body` 捕获并转成明示降级的原因码**
-     （Issue #499），其余原因码一律照旧向上抛出。已知触发面只穷举到
-     markdown 表格；引用块、嵌套列表等其它嵌套形态是否同样命中，本仓库**未做
-     逐形态探针**，不得声称"只有表格会命中"。
-     若 ``first_level_block_ids`` 引用了一个在 ``blocks`` 数组里找不到的
-     ``block_id``（响应内部不自洽，理论上不应发生），归类为「结果不明」
-     ``LookupError``，同 :meth:`read_body_children` 既有的"响应形状不对但
-     不是飞书明确拒绝"分类口径——这与上面两条"明确知道拒绝原因"的
-     ``definite`` 分支不同：这里连"为什么不一致"都无法确定。
-  3. 重排完成后再补两道对账（rc21 修复包 B，opus 审查发现，同上面两条一样
-     ``definite=True``）：``first_level_block_ids`` 自身出现重复
-     block_id → ``markdown_convert_duplicate_first_level_block_ids``（复现：
-     同一段正文在文档里被重复交付两次）；重排后的块数与 ``mapping_blocks``
-     原始块数对不上 → ``markdown_convert_block_count_mismatch``（复现：
-     ``mapping_blocks`` 里出现重复 block_id 时，建映射的字典推导式会静默
-     用后一个覆盖前一个，前一个块的内容凭空消失）。两条对账各自独立，互不
-     替代——两种成因在计数上恰好互相抵消时（`mapping_blocks` 与
-     `first_level_block_ids` 对同一个 block_id 都重复了同样的次数），只留
-     其中一条会漏判。
+  2. ``first_level_block_ids`` 自身出现重复 block_id →
+     ``markdown_convert_duplicate_first_level_block_ids``（复现：同一段正文
+     在文档里被重复交付两次）；某个块的 ``block_id`` 缺失或不是非空字符串
+     → :data:`UNSUPPORTED_NESTED_BLOCKS`（无法确认它在树里的位置）；
+     ``blocks`` 数组里出现重复 block_id → ``markdown_convert_block_count_
+     mismatch``（复现：建映射的字典推导式静默用后一个覆盖前一个，前一个块
+     的内容凭空消失）。前两条对账各自独立、互不替代——两种成因在计数上恰好
+     互相抵消时（``blocks`` 与 ``first_level_block_ids`` 对同一个 block_id
+     都重复了同样的次数），只留其中一条会漏判。
+  3. 然后按 ``children`` 把父子关系还原成一棵树（从 ``first_level_block_ids``
+     出发、显式栈深度优先展开，见「嵌套块写入路径」一节）。展开中引用了一个
+     在 ``blocks`` 数组里找不到的 ``block_id``（响应内部不自洽，理论上不应
+     发生），归类为「结果不明」``LookupError``，同 :meth:`read_body_children`
+     既有的"响应形状不对但不是飞书明确拒绝"分类口径——这与上面几条"明确知道
+     拒绝原因"的 ``definite`` 分支不同：这里连"为什么不一致"都无法确定。同一
+     个块被两个父块认领（或 ``children`` 成环）→
+     ``markdown_convert_shared_child_block``。
+  4. 展开完成后仍有块没被任何父块认领（既不是一级块、也不在任何可达块的
+     ``children`` 里）→ :data:`UNSUPPORTED_NESTED_BLOCKS`。**这个码是全模块
+     唯一会被 :meth:`LarkDocxDelivery.write_body` 捕获并转成明示降级的原因
+     码**（Issue #499），其余原因码一律照旧向上抛出。
 
-  返回前还会剔除每个块里的只读字段（``block_id``/``parent_id``/``children``，
-  见 :func:`_strip_readonly_block_fields`）——这些字段描述"这个块在文档里的
-  位置/身份"，是服务器生成的，插入端点（``blocks/{document_id}/children``）
-  不接受随插入请求带回同名字段（同官方"重新插入表格 block 前须剔除只读
-  ``merge_info``"一类约束：响应里凡是描述块的位置/关系的字段都不可回插，只有
-  描述块长什么样的字段才能原样写回）。
-
-  **仍未被本仓库任何真实探针验证的假设**（如实标注，不静默宣称已验证）：
-  每个返回的块都携带非空字符串 ``block_id``（重排映射的前提）；剔除的三个
-  字段是插入端点全部拒绝的只读字段全集（目前只确认 ``block_id`` 一定是只读
-  的，``parent_id``/``children`` 是同类推断，未见真实插入报错佐证或证伪）。
-  这两条假设在本次 Issue #442 的受控探针范围之外，留给「验证条件补强」一节
-  要求的自证闭环真实探针核实。
+  返回的 :class:`ConvertedBody` 里，``descendants`` 每个块都剔除了
+  ``descendant`` 端点的只读字段（``parent_id``、``table.cells``、
+  ``table.property.merge_info``，见 :func:`_strip_readonly_descendant_fields`
+  与各常量的实测记录）、但**保留** ``block_id`` 与 ``children``——这两个字段
+  在嵌套路径上是父子关系的唯一载体。走扁平 ``children`` 端点时再由
+  :meth:`ConvertedBody.flat_children` 额外剔除这两个字段（
+  :func:`_strip_readonly_block_fields`），结果与 Issue #538 之前逐字一致。
 - :meth:`LarkDocxDelivery.write_blocks`：把已经是飞书 block 形状的数组沿用与
   :meth:`write_paragraphs` 完全相同的 children 插入端点写入（同一坐标、同一
-  ``index=0`` 单次写入语义）。**超过 :data:`MAX_CONVERTED_BLOCKS`（1000，飞书
-  单次插入上限）一律整体拒绝，不做分批插入**——分批会打破
+  ``index=0`` 单次写入语义）。只服务"这份正文是一份纯一级块序列"的情况；含
+  嵌套块的正文走 :meth:`LarkDocxDelivery.write_descendant_blocks`。
+  **超过 :data:`MAX_CONVERTED_BLOCKS`（1000）一律整体拒绝，不做分批插入**——分批会打破
   :meth:`read_body_children` 判据依赖的"正文一次写入"假设（见上文「幂等判据
   新增方法」一节）：分批写入的中途状态（例如已经插入前 1000 个 block、还剩
   部分未插入）会被下一次检查点恢复误判成"已经写完"，从而跳过本该继续的写入，
@@ -170,7 +162,8 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   实际可执行的分支——``markdown_convert_enabled=False``（构造函数自身的参数
   默认值；真正生效的值由装配层 ``apps/gateway/config.py`` 显式传入，见下一条）
   时逐字调用 :meth:`write_paragraphs`；为 ``True`` 时改走
-  :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。返回
+  :meth:`convert_markdown_to_body` + :meth:`write_blocks`（纯一级块）或
+  :meth:`write_descendant_blocks`（含嵌套块）。返回
   :class:`WriteBodyOutcome`（Issue #499）——调用方据此知道这次是不是降级写的。
   开关打开时的失败**只有一个例外会被捕获**：
   :data:`UNSUPPORTED_NESTED_BLOCKS`（含表格等嵌套结构）时改走纯文本段落路径
@@ -193,6 +186,54 @@ document_delivery.normalize_markdown``），代价是正文里的连字符会被
   ``None`` 决定要不要调用 :meth:`write_body`（非 ``None`` 才调用；``None`` 无
   条件回退 :meth:`write_paragraphs`，与开关是否打开无关）——完整接线细节见该
   模块文档「markdown 官方转换路径的接线」一节。
+
+## 嵌套块写入路径（Issue #538；2026-09-03 stage 受控探针实证）
+
+**这一节修的是一个生产缺陷，不是新增能力**：Issue #538 之前，只要回答里出现
+**一张** markdown 表格，官方转换返回的单元格与单元格内文字就是嵌套块，
+``convert_markdown_to_body`` 的「非一级块即拒」守卫就把**整篇**转换结果作废、
+退回纯文本段落——标题、列表、表格一起丢。生产 2026-09-02 首日实测 3 篇 docx
+**3/3 全部命中**（经营数据类问题的答案天然是表格）。修法是改用飞书为 convert
+配套的嵌套块端点，把守卫收窄成「真的无处安放才拒」。
+
+- 端点：``POST /docx/v1/documents/{document_id}/blocks/{block_id}/descendant``。
+  请求体 ``{"children_id": [...一级块临时 id...], "index": 0, "descendants":
+  [...全部块...]}``。``block_id`` 取 ``document_id`` 本身（根 block），**与
+  ``children`` 插入端点是同一个坐标**——这是幂等判据继续成立的前提。
+- **convert 的输出与 descendant 的输入本就是一对**：``data.blocks`` 里每个块
+  携带的 ``block_id`` 是**临时** id，``data.first_level_block_ids`` 就是
+  ``children_id``，块自己的 ``children`` 就是父子关系。响应的
+  ``data.block_id_relations`` 把临时 id 映射成真实 block_id。
+
+**受控探针实测（Bot-Test，stage，受控测试文档用完即删并回读确认）**：
+
+1. **只读字段**：必须剥掉的只有 ``table.property.merge_info`` ——带着它调用，
+   飞书以 ``1770001 invalid param`` **整体拒绝**（变体 V5 复现）；剥掉后同一
+   份载荷的四个变体（留/不留 ``parent_id``、留/不留 ``table.cells``）全部
+   ``code=0``。本模块另外把 ``parent_id``（convert 输出里恒为空串）与
+   ``table.cells``（与 ``children`` 完全重复的服务端计算值）一并剥掉，取
+   "描述位置/关系的字段一律不回插"这条既有纪律的保守侧。**``block_id`` 与
+   ``children`` 绝不能剥**——扁平路径上它们是只读字段，嵌套路径上它们是唯一
+   的结构信息。
+2. **读回结构**：把一份「标题＋二级标题＋正文＋两条列表＋3×3 表格＋结尾段」
+   的 convert 输出一次写入后，全量读回 26 个块（1 个根块 + convert 的 25 个），
+   表格是货真价实的 ``block_type=31``、``row_size=3``/``column_size=3``、9 个
+   单元格，单元格文字逐字保真（含负号「-12.85%」）；标题与列表原样在位。
+3. **幂等判据不变**：同一篇文档写入前 ``read_body_children`` 返回 0 个子块、
+   写入后返回 **7** 个——恰好是那 7 个一级块（``block_type`` 依次
+   ``[3, 4, 2, 12, 12, 31, 2]``），**嵌套块不出现在根 block 的 children 里**。
+   因此 Issue #353 的"子块非空 = 正文已写过"判据在嵌套写入下逐字继续成立，
+   不需要重建。
+4. **单次块数**：200 / 500 / 1000 个块单次 ``descendant`` 写入全部 ``code=0``，
+   与 :data:`MAX_CONVERTED_BLOCKS` 一致；超限仍然失败关闭，不分批。
+
+**保留降级路径、只收窄触发条件**：:data:`UNSUPPORTED_NESTED_BLOCKS` 不再是
+"出现了嵌套块"，而是"展开完成后仍有块没有任何父块认领"——响应里真的存在一个
+无处安放的块时，本模块仍然按 Issue #499 的裁定降级交付纯文本段落并**明示**。
+
+**如实标注的边界**：探针只覆盖 markdown 表格这一种嵌套形态；引用块、嵌套列表、
+代码块等其它形态是否也能被 ``descendant`` 原样写入，**未做逐形态探针**，不得
+声称"所有 markdown 结构都已支持"。
 
 ## 凭据与内容边界
 
@@ -252,25 +293,105 @@ _DOCX_DOCUMENTS_PATH = "/docx/v1/documents"
 _BLOCKS_CONVERT_PATH = "/docx/v1/documents/blocks/convert"
 _MARKDOWN_CONTENT_TYPE = "markdown"
 
-#: 官方转换响应里每个块携带的只读字段（Issue #442），插入端点不接受随请求体
-#: 带回——见 :meth:`LarkDocxDelivery.convert_markdown_to_blocks` 文档字符串
-#: 「markdown 官方转换开关」一节对应小节的完整理由与已知未验证假设。
+#: markdown 官方转换配套的**嵌套块**创建端点后缀（Issue #538）。完整路径是
+#: ``/docx/v1/documents/{doc}/blocks/{doc}/descendant``——与 ``children`` 插入
+#: 端点写的是同一个坐标（根 block 的 children），区别只在于它额外接受"块与块
+#: 之间的父子关系"，因此能一次写下表格这类嵌套结构。
+_BLOCKS_DESCENDANT_PATH_SUFFIX = "descendant"
+
+#: **扁平**（一级块）插入端点的请求体不接受的只读字段（Issue #442）。
+#: ``block_id``/``children`` 在那条路径上没有任何用处（它本来就只写一层），
+#: 随请求带回会被拒绝——见 :meth:`LarkDocxDelivery.write_blocks` 与模块文档
+#: 「markdown 官方转换开关」一节。
 _CONVERT_RESPONSE_READONLY_BLOCK_KEYS = ("block_id", "parent_id", "children")
 
-#: 单次 children 插入端点的 block 数上限（模块文档「官方能力事实」核实口径，
-#: 未做真实调用探针）。超过时 :meth:`LarkDocxDelivery.write_blocks` 整体拒绝、
-#: 不分批插入——理由见模块文档「markdown 官方转换开关」一节：分批会打破
+#: **嵌套块**（``descendant``）端点的只读字段（Issue #538，2026-09-03 stage
+#: 受控探针实测，见模块文档「嵌套块写入路径」一节）。**与扁平路径的关键差别**：
+#: ``block_id`` 与 ``children`` 在这条路径上**不是**只读字段，恰恰是父子关系的
+#: 唯一载体（``children_id`` 与每个块的 ``children`` 引用的都是 convert 返回的
+#: 临时 block_id），**绝不能剥**；``parent_id`` 在 convert 输出里恒为空串、
+#: 对 ``descendant`` 没有意义，剥掉（探针变体 V3/V4 实测 ``code=0``）。
+_DESCENDANT_READONLY_BLOCK_KEYS = ("parent_id",)
+
+#: 表格块 ``table`` 字段里由服务端计算、不随请求回插的只读键（Issue #538
+#: 实测）：``cells`` 是单元格 block_id 清单，与该块的 ``children`` 完全重复。
+_DESCENDANT_READONLY_TABLE_KEYS = ("cells",)
+
+#: 表格块 ``table.property`` 里必须剥掉的只读键（Issue #538 实测，**这一条是
+#: 唯一硬性的**）：带着 ``merge_info`` 调 ``descendant`` 端点，飞书直接以
+#: ``1770001 invalid param`` **整体拒绝**（受控探针变体 V5 复现；同一份载荷
+#: 只剥掉它之后，变体 V1–V4 全部 ``code=0``）。markdown 表格不含合并单元格
+#: （convert 返回的 ``merge_info`` 逐项都是 ``row_span=col_span=1``），剥掉它
+#: 不损失任何来自 markdown 的信息。
+_DESCENDANT_READONLY_TABLE_PROPERTY_KEYS = ("merge_info",)
+
+#: 单次写入端点的 block 数上限。超过时 :meth:`LarkDocxDelivery.write_blocks` /
+#: :meth:`LarkDocxDelivery.write_descendant_blocks` 整体拒绝、不分批插入——
+#: 理由见模块文档「markdown 官方转换开关」一节：分批会打破
 #: :meth:`LarkDocxDelivery.read_body_children` 判据依赖的"正文一次写入"假设。
+#: ``children`` 端点这个值取自官方文档口径（未做真实调用探针）；``descendant``
+#: 端点 Issue #538 受控探针实测 200/500/1000 个块单次写入全部 ``code=0``，
+#: 因此同一个上限对两条路径都成立。
 MAX_CONVERTED_BLOCKS = 1000
 
-#: 官方转换端点判定"这份 markdown 含本仓库不支持的嵌套结构"（典型是表格：表格
-#: 自身是一级块，单元格却作为独立元素出现在 ``blocks`` 数组里、不在
-#: ``first_level_block_ids`` 内）时的原因码。**独立成常量而不是散落的字面量**：
-#: 它现在同时是抛出点（:meth:`LarkDocxDelivery.convert_markdown_to_blocks`）与
-#: 唯一捕获点（:meth:`LarkDocxDelivery.write_body` 的明示降级分支，Issue #499）
-#: 的判据，两处必须逐字一致——写成两个字面量时，任何一侧改名都会让降级分支
-#: 悄悄失效、退回"整次交付失败"，而没有任何东西会红。
+#: 官方转换结果里出现**无法定位**的块（响应里存在某个块，既不在
+#: ``first_level_block_ids`` 里、也没有被任何一个可达块的 ``children`` 认领，
+#: 因此没有任何位置可以把它写进文档）时的原因码。**独立成常量而不是散落的
+#: 字面量**：它同时是抛出点（:meth:`LarkDocxDelivery.convert_markdown_to_body`）
+#: 与唯一捕获点（:meth:`LarkDocxDelivery.write_body` 的明示降级分支，
+#: Issue #499）的判据，两处必须逐字一致——写成两个字面量时，任何一侧改名都会
+#: 让降级分支悄悄失效、退回"整次交付失败"，而没有任何东西会红。
+#:
+#: **Issue #538 收窄了它的含义**：此前它是"``blocks`` 里出现了任何一个非一级
+#: 块"，于是**只要回答里有一张表格就整篇作废**（生产实测 3/3 命中）；现在
+#: 嵌套结构本身由 ``descendant`` 端点正常写入，这个码只在"这个块连父块都找
+#: 不到、真的无处安放"时才触发。取值刻意不改名——迁移 ``0082`` 已经把它写进
+#: 生产数据、管理台词表也认它，改名会让历史行变成未登记码。
 UNSUPPORTED_NESTED_BLOCKS = "unsupported_nested_blocks"
+
+
+@dataclass(frozen=True)
+class ConvertedBody:
+    """:meth:`LarkDocxDelivery.convert_markdown_to_body` 的返回值：一份已经
+    对账过、可以直接交给写入端点的正文（Issue #538）。
+
+    ``children_id``：一级块的**临时** block_id，按文档真实顺序（来自响应的
+    ``first_level_block_ids``）。
+    ``descendants``：这次要写的**全部**块（含表格单元格这类嵌套块），已剥掉
+    :data:`_DESCENDANT_READONLY_BLOCK_KEYS` 等只读字段、但**保留** ``block_id``
+    与 ``children``——它们是父子关系的唯一载体。顺序是"按 ``children_id`` 深度
+    优先展开"，与 ``descendant`` 端点无关（该端点按 id 引用而不是按数组下标），
+    只为让请求体可读、可 diff。
+
+    :attr:`nested` 为 ``False`` 时这份正文是一份纯一级块序列，
+    :meth:`flat_children` 给出与 Issue #442 之前**逐字相同**的 ``children``
+    端点请求体——含表格的修复不改变不含表格那条路径的任何一个字节。
+    """
+
+    children_id: tuple[str, ...]
+    descendants: tuple[Mapping[str, Any], ...]
+
+    @property
+    def nested(self) -> bool:
+        """这份正文里是否存在嵌套块（一级块之外还有别的块）。"""
+
+        return len(self.descendants) != len(self.children_id)
+
+    def flat_children(self) -> list[dict[str, Any]]:
+        """扁平路径（``children`` 插入端点）的请求体块序列。
+
+        只在 :attr:`nested` 为 ``False`` 时有意义——此时 ``descendants`` 恰好
+        就是一级块本身，按 ``children_id`` 取出后再剥掉 ``block_id``/``children``
+        （那条端点不接受这两个字段），结果与 Issue #538 之前的
+        ``convert_markdown_to_blocks``（Issue #538 前身）返回值逐字一致。
+        """
+
+        if self.nested:
+            # 失败关闭而不是"顺手只返回一级块"：那会把表格单元格一类嵌套块
+            # 静默丢掉，正是 Issue #538 要修的那种"内容凭空消失"。
+            raise ValueError("含嵌套块的正文不能走扁平 children 端点，应调用 write_descendant_blocks")
+        by_block_id = {block["block_id"]: block for block in self.descendants}
+        return [_strip_readonly_block_fields(by_block_id[block_id]) for block_id in self.children_id]
 
 
 @dataclass(frozen=True)
@@ -378,9 +499,33 @@ def _safe_feishu_code(value: object) -> str:
 
 def _strip_readonly_block_fields(block: Mapping[str, Any]) -> dict[str, Any]:
     """剔除 :data:`_CONVERT_RESPONSE_READONLY_BLOCK_KEYS` 里列出的只读字段，
-    返回可以原样传给插入端点的浅拷贝（不修改入参）。"""
+    返回可以原样传给**扁平** ``children`` 插入端点的浅拷贝（不修改入参）。"""
 
     return {key: value for key, value in block.items() if key not in _CONVERT_RESPONSE_READONLY_BLOCK_KEYS}
+
+
+def _strip_readonly_descendant_fields(block: Mapping[str, Any]) -> dict[str, Any]:
+    """剔除 ``descendant`` 端点不接受的只读字段，返回可以原样放进
+    ``descendants`` 数组的深拷贝（不修改入参；``table`` 子结构也要改，浅拷贝
+    会写穿到调用方手里的响应对象）。
+
+    **保留** ``block_id`` 与 ``children``：在这条路径上它们不是只读字段，而是
+    父子关系的唯一载体（见 :data:`_DESCENDANT_READONLY_BLOCK_KEYS`）。
+    """
+
+    stripped = {key: value for key, value in block.items() if key not in _DESCENDANT_READONLY_BLOCK_KEYS}
+    table = stripped.get("table")
+    if isinstance(table, Mapping):
+        table_copy = {key: value for key, value in table.items() if key not in _DESCENDANT_READONLY_TABLE_KEYS}
+        table_property = table_copy.get("property")
+        if isinstance(table_property, Mapping):
+            table_copy["property"] = {
+                key: value
+                for key, value in table_property.items()
+                if key not in _DESCENDANT_READONLY_TABLE_PROPERTY_KEYS
+            }
+        stripped["table"] = table_copy
+    return stripped
 
 
 class Transport(Protocol):
@@ -524,18 +669,50 @@ class LarkDocxDelivery:
         )
         logger.info("飞书 docx 正文已写入 document_id_len=%s 段落数=%s", len(doc_id), len(texts))
 
-    def convert_markdown_to_blocks(self, markdown: str) -> list[dict[str, Any]]:
-        """把一段 markdown 转换成飞书官方 block 结构、按文档真实顺序排好
-        （Issue #408 正式方案，Issue #467／rc22 S-4 起代码默认开启——见
-        :meth:`write_body` 与模块文档「markdown 官方转换开关」一节；重排与
-        防御性拒绝的完整理由见该节 Issue #442 更新的段落）。
+    def convert_markdown_to_body(self, markdown: str) -> ConvertedBody:
+        """把一段 markdown 转换成飞书官方 block 结构，并整理成一份可以直接写入
+        的 :class:`ConvertedBody`（Issue #408 正式方案，Issue #467／rc22 S-4 起
+        代码默认开启，Issue #538 起支持嵌套结构——见 :meth:`write_body` 与模块
+        文档「markdown 官方转换开关」「嵌套块写入路径」两节）。
 
         ``POST /docx/v1/documents/blocks/convert``，请求体 ``{"content_type":
         "markdown", "content": markdown}``。这个端点只做转换、不写入任何文档，
         失败或重试都不产生外部副作用。**响应体 ``data.blocks`` 不是文档顺序**
-        （Issue #442 受控探针实证）——真实顺序由 ``data.first_level_block_ids``
-        给出，本方法据此重排后才返回；``data.block_id_to_image_urls`` 是响应里
-        的另一个键，与 blocks 无关，本方法不读取它。
+        （Issue #442 受控探针实证）——一级块的真实顺序由
+        ``data.first_level_block_ids`` 给出；``data.block_id_to_image_urls`` 是
+        响应里的另一个键，与 blocks 无关，本方法不读取它。
+
+        **Issue #538 的改动**：此前本方法要求 ``blocks`` 里**每一个**块都出现在
+        ``first_level_block_ids`` 里，否则整体拒绝——于是只要回答里有一张表格
+        （单元格与单元格内的文字都是嵌套块），整篇转换结果就作废、退回纯文本
+        段落，标题与列表跟着一起丢（生产 2026-09-02 实测 3/3 命中）。现在改成
+        **按 ``children`` 把父子关系还原成一棵树**：从 ``first_level_block_ids``
+        出发深度优先展开，能被展开到的块都原样保留、交给 ``descendant`` 端点
+        一次写下。:data:`UNSUPPORTED_NESTED_BLOCKS` 因此收窄成"这个块没有任何
+        父块认领、真的无处安放"这一种情况。
+
+        防御性失败关闭（**绝不静默丢块、乱序或重复交付**）：
+
+        1. ``first_level_block_ids`` 缺失/不是列表/为空 →
+           ``markdown_convert_missing_first_level_block_ids``（definite）；
+        2. ``first_level_block_ids`` 自身出现重复 block_id →
+           ``markdown_convert_duplicate_first_level_block_ids``（definite）；
+           复现：同一段正文在文档里被重复交付两次；
+        3. 某个块缺少非空字符串 ``block_id`` → 无法确认它在树里的位置，
+           :data:`UNSUPPORTED_NESTED_BLOCKS`（definite）；
+        4. ``blocks`` 里出现重复 block_id → ``markdown_convert_block_count_
+           mismatch``（definite）；复现：建映射的字典推导式静默用后一个覆盖
+           前一个，前一个块的内容凭空消失；
+        5. ``first_level_block_ids`` 或某个块的 ``children`` 引用了一个在
+           ``blocks`` 数组里找不到的 block_id → 响应内部不自洽，连"为什么不
+           一致"都无法确定，归类为结果不明 ``LookupError``（同
+           :meth:`read_body_children` 既有分类口径）；
+        6. 同一个块被两个父块认领（或 ``children`` 成环）→
+           ``markdown_convert_shared_child_block``（definite）；复现：同一段
+           内容在文档两处各出现一次，或展开过程无限递归；
+        7. 展开完成后仍有块没被任何父块认领 →
+           :data:`UNSUPPORTED_NESTED_BLOCKS`（definite），交给
+           :meth:`write_body` 转成明示降级。
         """
 
         text = (markdown or "").strip()
@@ -559,20 +736,11 @@ class LarkDocxDelivery:
             # 一串字符串/数字，或本仓库对响应形状的假设本身有误）——这与"入参
             # 校验，还没发出任何请求"的 :class:`ValueError` 是两类不同的问题：
             # 这里已经真实调用了转换接口、已经拿到一个响应，只是内容形状不对。
-            # 之前这里静默返回空列表，让空列表流进
-            # :meth:`write_blocks`，那里再触发一条与"未发起任何请求的入参校验"
-            # 同型的裸 ``ValueError("blocks 不能为空")``——把"飞书响应形状不对"
-            # 误归进了 gateway 消费循环白名单里"发出请求前的确定性入参校验"
-            # 那一类（模块 `apps/gateway/document_delivery.py` 文档「四步的
-            # 失败分类只有两种」a 项），而它其实应该走同一个白名单里的
-            # `FeishuDocxDeliveryError` 分支。这个失败是确定性的（转换端点
-            # 不写入任何文档、没有外部副作用，同一份 markdown 重放会得到同样
-            # 的转换结果），因此标 ``definite=True``——与
-            # :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"转换/写入
-            # 前置校验发现的确定性失败"。
+            # 这个失败是确定性的（转换端点不写入任何文档、没有外部副作用，同一
+            # 份 markdown 重放会得到同样的转换结果），因此标 ``definite=True``。
             raise FeishuDocxDeliveryError("markdown_convert_blocks_not_mapping", definite=True)
 
-        # Issue #442：`blocks` 数组不是文档顺序，真实顺序在
+        # Issue #442：`blocks` 数组不是文档顺序，一级块的真实顺序在
         # `first_level_block_ids` 里。缺失/为空一律 definite 拒绝——没有这份
         # 顺序清单就无法保证交付顺序正确，宁可拒绝也不猜测顺序。
         first_level_block_ids = data.get("first_level_block_ids")
@@ -580,66 +748,72 @@ class LarkDocxDelivery:
             raise FeishuDocxDeliveryError(
                 "markdown_convert_missing_first_level_block_ids", definite=True
             )
-
-        # 每个块必须携带非空字符串 block_id 且必须出现在
-        # first_level_block_ids 里，否则一律 definite 拒绝——这既拦住表格一类
-        # 嵌套结构（表格自身是一级块，但它的单元格作为独立元素出现在
-        # `blocks` 里、却不在 `first_level_block_ids` 内），也拦住"块缺
-        # block_id 因而无法确认层级"这种更基础的形状不对，两者都无法安全
-        # 判断该块该不该、该按什么顺序交付，不做静默丢弃或猜测。
-        first_level_ids = {
-            block_id for block_id in first_level_block_ids if isinstance(block_id, str) and block_id
-        }
-        for block in mapping_blocks:
-            block_id = block.get("block_id")
-            if not isinstance(block_id, str) or block_id not in first_level_ids:
-                raise FeishuDocxDeliveryError(UNSUPPORTED_NESTED_BLOCKS, definite=True)
-
-        by_block_id = {block["block_id"]: block for block in mapping_blocks}
-        ordered_blocks: list[Mapping[str, Any]] = []
+        # 条目必须先是非空字符串，判重才做得下去：`set()` 碰上不可哈希的条目
+        # （响应里塞了 list/dict）会抛一个**裸 `TypeError`**，那不属于本模块
+        # 任何一条失败分类，调用方的白名单接不住。非法条目按"响应内部不自洽"
+        # 归成结果不明，与展开阶段引用不存在的块同一口径。
         for block_id in first_level_block_ids:
-            block = by_block_id.get(block_id) if isinstance(block_id, str) else None
-            if block is None:
-                # `first_level_block_ids` 引用了一个在 `blocks` 数组里找不到
-                # 的 block_id：响应内部不自洽，理论上不应发生。这与上面两条
-                # "明确知道拒绝原因"的 definite 分支不同——这里连"为什么不
-                # 一致"都无法确定，归类为结果不明，同
-                # :meth:`read_body_children` 既有的分类口径。
-                raise LookupError(
-                    "markdown 转换响应 first_level_block_ids 引用了不存在的块：结果不明"
-                )
-            ordered_blocks.append(block)
-
-        # 重排后两道对账（rc21 修复包 B，opus 审查发现，与上面「缺失/为空」
-        # 「引用不存在的块」两道既有防线同型同码风格——definite 拒绝，不静默
-        # 丢块或重复交付）：
-        #
-        # 1. `first_level_block_ids` 本身出现重复 block_id：`by_block_id` 是
-        #    按 `block_id` 建的字典，重复的 id 在这一步已经把同一个块对象
-        #    在 `ordered_blocks` 里放了不止一次——复现："first_level 重复静默
-        #    重复交付"（同一段正文在飞书文档里出现两次）。到这里为止所有
-        #    entries 都已经确认是有效字符串（否则上面的循环早就因为
-        #    `block is None` 抛出 `LookupError`），因此直接用 `set` 判重複，
-        #    不需要再过滤一遍。
+            if not isinstance(block_id, str) or not block_id:
+                raise LookupError("markdown 转换响应 first_level_block_ids 含非法条目：结果不明")
+        # rc21 修复包 B（opus 审查发现）：`first_level_block_ids` 自身重复会让
+        # 同一段正文在文档里出现两次。这条对账必须排在"块数对账"之前——两种
+        # 成因在计数上恰好互相抵消时（`blocks` 与 `first_level_block_ids` 对
+        # 同一个 block_id 都重复了同样的次数），只留计数那一条会漏判。
         if len(first_level_block_ids) != len(set(first_level_block_ids)):
             raise FeishuDocxDeliveryError(
                 "markdown_convert_duplicate_first_level_block_ids", definite=True
             )
-        #
-        # 2. 重排后的块数与 `mapping_blocks` 原始块数对不上：`by_block_id`
-        #    是字典推导式，`mapping_blocks` 里出现重复 block_id 时后一个会
-        #    静默覆盖前一个——复现："重复 block_id 静默丢块"（前一个块的内容
-        #    从此在返回结果里凭空消失，且不留任何痕迹）。上面第 1 条已经
-        #    挡住"`first_level_block_ids` 自身重复"这一种成因，这一条挡的
-        #    是"`mapping_blocks` 自身重复、而 `first_level_block_ids` 无重复"
-        #    这一种成因——两种成因互相独立，其中一种恰好在计数上抵消另一种
-        #    时（`mapping_blocks` 与 `first_level_block_ids` 对同一个
-        #    block_id 都重复了同样的次数），单靠这一条计数对账会漏判，所以
-        #    两条对账都必须做，不能只留一条。
-        if len(ordered_blocks) != len(mapping_blocks):
+
+        # 每个块都必须携带非空字符串 block_id，否则无法确认它在树里的位置——
+        # 不做静默丢弃或猜测，走与"无处安放"同一个降级码。
+        for block in mapping_blocks:
+            block_id = block.get("block_id")
+            if not isinstance(block_id, str) or not block_id:
+                raise FeishuDocxDeliveryError(UNSUPPORTED_NESTED_BLOCKS, definite=True)
+        by_block_id: dict[str, Mapping[str, Any]] = {block["block_id"]: block for block in mapping_blocks}
+        # rc21 修复包 B（opus 审查发现）：`blocks` 里出现重复 block_id 时，上面
+        # 那个字典推导式会静默用后一个覆盖前一个——前一个块的内容从此凭空消失，
+        # 且不留任何痕迹。字典条数与原始块数对不上即拒绝。
+        if len(by_block_id) != len(mapping_blocks):
             raise FeishuDocxDeliveryError("markdown_convert_block_count_mismatch", definite=True)
 
-        return [_strip_readonly_block_fields(block) for block in ordered_blocks]
+        # Issue #538：按 `children` 深度优先展开成一棵树。`claimed` 同时充当
+        # 环检测与"同一个块被两个父块认领"的检测——两者都会让展开结果不是一棵
+        # 树，前者还会无限递归。
+        # 展开用显式栈而不是递归：单次块数上限是 :data:`MAX_CONVERTED_BLOCKS`
+        # （1000），一条足够深的链会撞上解释器递归上限——那会是一个**没有被
+        # 本模块任何失败分类接住**的 ``RecursionError``；外部响应不该有能力
+        # 决定本进程用哪种方式崩。
+        ordered: list[Mapping[str, Any]] = []
+        claimed: set[str] = set()
+        stack: list[object] = list(reversed(first_level_block_ids))
+        while stack:
+            block_id = stack.pop()
+            if not isinstance(block_id, str) or block_id not in by_block_id:
+                # 引用了一个在 `blocks` 数组里找不到的 block_id：响应内部不
+                # 自洽，理论上不应发生。这与上面几条"明确知道拒绝原因"的
+                # definite 分支不同——这里连"为什么不一致"都无法确定，归类为
+                # 结果不明，同 :meth:`read_body_children` 既有的分类口径。
+                raise LookupError("markdown 转换响应引用了一个不存在的块：结果不明")
+            if block_id in claimed:
+                raise FeishuDocxDeliveryError("markdown_convert_shared_child_block", definite=True)
+            claimed.add(block_id)
+            block = by_block_id[block_id]
+            ordered.append(block)
+            children = block.get("children")
+            if isinstance(children, list):
+                stack.extend(reversed(children))
+
+        if len(ordered) != len(mapping_blocks):
+            # 展开完成后仍有块没被任何父块认领——它既不是一级块、也不出现在
+            # 任何可达块的 `children` 里，本仓库没有任何位置可以把它写进文档。
+            # 这才是"真的处理不了"，交给 :meth:`write_body` 转成明示降级。
+            raise FeishuDocxDeliveryError(UNSUPPORTED_NESTED_BLOCKS, definite=True)
+
+        return ConvertedBody(
+            children_id=tuple(first_level_block_ids),
+            descendants=tuple(_strip_readonly_descendant_fields(block) for block in ordered),
+        )
 
     def write_blocks(self, document_id: str, blocks: Sequence[Mapping[str, Any]]) -> None:
         """把已经是飞书 block 形状的 ``blocks`` 写进正文，沿用与
@@ -671,6 +845,50 @@ class LarkDocxDelivery:
             "飞书 docx 正文已按官方转换写入 document_id_len=%s block数=%s", len(doc_id), len(children)
         )
 
+    def write_descendant_blocks(self, document_id: str, body: ConvertedBody) -> None:
+        """把一份含嵌套结构的 :class:`ConvertedBody` 一次写进正文（Issue #538）。
+
+        ``POST /docx/v1/documents/{document_id}/blocks/{document_id}/descendant``
+        ——**与 :meth:`write_blocks` 写的是同一个坐标**（根 block 自身的
+        children、``index=0``、单次写入），区别只在于请求体额外带上块与块之间的
+        父子关系：``children_id`` 是一级块的临时 block_id（文档顺序），
+        ``descendants`` 是全部块，每个块用自己的 ``children`` 指向它的子块。
+        飞书在响应的 ``block_id_relations`` 里把临时 id 映射成真实 block_id。
+
+        **同一个坐标这件事是幂等判据成立的前提**：写完之后
+        :meth:`read_body_children` 读到的恰好是这些一级块（Issue #538 stage
+        受控探针实测：写前 0 个子块、写后 7 个，且嵌套块不出现在根 block 的
+        children 里），因此检查点恢复路径的"子块非空 = 正文已写过"判据在嵌套
+        写入下**逐字继续成立**，不需要重建。
+
+        超过 :data:`MAX_CONVERTED_BLOCKS`（按 ``descendants`` 总块数计，不是
+        一级块数）一律在发起任何请求之前整体拒绝，不做分批——理由与
+        :meth:`write_blocks` 完全相同：分批会打破 :meth:`read_body_children`
+        判据依赖的"正文一次写入"假设，中途状态会被下一次检查点恢复误判成
+        "已经写完"。同样沿用 ``too_many_blocks`` 这个 definite 原因码。
+        """
+
+        doc_id = _require_document_id(document_id)
+        descendants = list(body.descendants)
+        children_id = list(body.children_id)
+        if not descendants or not children_id:
+            raise ValueError("descendants 与 children_id 都不能为空")
+        if len(descendants) > MAX_CONVERTED_BLOCKS:
+            raise FeishuDocxDeliveryError("too_many_blocks", definite=True)
+        self._data(
+            self._call(
+                "POST",
+                f"{_DOCX_DOCUMENTS_PATH}/{doc_id}/blocks/{doc_id}/{_BLOCKS_DESCENDANT_PATH_SUFFIX}",
+                body={"children_id": children_id, "index": 0, "descendants": descendants},
+            )
+        )
+        logger.info(
+            "飞书 docx 正文已按官方转换写入（含嵌套块）document_id_len=%s 一级块数=%s 总块数=%s",
+            len(doc_id),
+            len(children_id),
+            len(descendants),
+        )
+
     def write_body(
         self, document_id: str, *, paragraphs: Sequence[str], markdown: str
     ) -> WriteBodyOutcome:
@@ -681,10 +899,15 @@ class LarkDocxDelivery:
         ``markdown_convert_enabled=False``（构造函数默认值）时逐字调用
         :meth:`write_paragraphs`，返回 ``degraded_reason=None``——不是降级，
         是这套部署本来就要求的路径。为 ``True`` 时改走
-        :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
+        :meth:`convert_markdown_to_body`，再按这份正文里**有没有嵌套块**分派
+        写入端点：纯一级块走既有的 :meth:`write_blocks`（``children`` 端点，
+        请求体与 Issue #538 之前逐字相同）；含嵌套块（表格等）走
+        :meth:`write_descendant_blocks`（``descendant`` 端点，同一个坐标）。
+        **两支分开而不是统一走 descendant**：不含表格的排版今天在生产上是好
+        的，本次修复只增加一条新路径，不动那条已经在跑的路径。
 
         **唯一的降级分支（Issue #499，产品负责人 2026-08-31 裁定）**：
-        :meth:`convert_markdown_to_blocks` 抛出
+        :meth:`convert_markdown_to_body` 抛出
         :data:`UNSUPPORTED_NESTED_BLOCKS` 这**一个**原因码时，改用
         :meth:`write_paragraphs` 交付纯文本段落，并返回
         ``degraded_reason=UNSUPPORTED_NESTED_BLOCKS``。裁定依据：翻转
@@ -693,6 +916,12 @@ class LarkDocxDelivery:
         单公司/单指标/单月问题——用户要的是内容，格式损失可以如实告知，空手
         而归的代价明显更大。
 
+        **Issue #538 收窄了这个码的触发条件**：它此前是"转换结果里出现了任何
+        一个非一级块"，因此**含表格的回答 100% 命中**（生产 2026-09-02 实测
+        3/3），标题与列表跟着表格一起被作废。现在嵌套结构由 ``descendant``
+        端点正常写入，这个码只在"某个块连父块都找不到、真的无处安放"时触发。
+        降级机制本身**原样保留**——降级仍然发生、仍然明示。
+
         **这条捕获必须窄到这一个码，且必须只包住转换调用本身**，两条都是安全
         前提，不是风格偏好：
 
@@ -700,12 +929,12 @@ class LarkDocxDelivery:
            错误码/``LookupError`` 全部维持原样向上抛。泛化成"捕获所有异常都
            降级"会把真实故障（限流、权限缺失、响应形状不对）一并吞成"交付
            成功"，那比原来的整次失败更糟。
-        2. ``try`` 只包 :meth:`convert_markdown_to_blocks`——转换端点**不写入
+        2. ``try`` 只包 :meth:`convert_markdown_to_body`——转换端点**不写入
            任何文档、没有外部副作用**，因此在它失败之后改走段落路径是安全的
-           （这篇文档此刻还是空的）。:meth:`write_blocks` 一旦发起就有副作用，
-           它的失败**绝不能**触发第二次写入：那会把同一份正文写两遍。把
-           ``try`` 缩到转换这一步，即使将来 :meth:`write_blocks` 也开始抛同一
-           个码，这条约束也仍然成立。
+           （这篇文档此刻还是空的）。:meth:`write_blocks` /
+           :meth:`write_descendant_blocks` 一旦发起就有副作用，它们的失败
+           **绝不能**触发第二次写入：那会把同一份正文写两遍。把 ``try`` 缩到
+           转换这一步，即使将来写入端点也开始抛同一个码，这条约束也仍然成立。
 
         **降级不等于可以不告诉用户。** 本方法此前的文档字符串写的是"绝不捕获
         后静默退回纯文本段落路径"，理由是静默降级会制造"用户以为拿到了带格式
@@ -727,7 +956,7 @@ class LarkDocxDelivery:
             return WriteBodyOutcome()
 
         try:
-            blocks = self.convert_markdown_to_blocks(markdown)
+            body = self.convert_markdown_to_body(markdown)
         except FeishuDocxDeliveryError as error:
             if error.code != UNSUPPORTED_NESTED_BLOCKS:
                 raise
@@ -741,7 +970,14 @@ class LarkDocxDelivery:
             self.write_paragraphs(document_id, paragraphs)
             return WriteBodyOutcome(degraded_reason=error.code)
 
-        self.write_blocks(document_id, blocks)
+        # Issue #538：含嵌套块（表格等）走 descendant 端点；纯一级块继续走既有
+        # 的 children 端点。**刻意分两支、不是"反正 descendant 两种都能写"就
+        # 统一走一条**：不含嵌套块的排版今天在生产上是好的，这条路径的请求体
+        # 必须与本次修复之前逐字相同，修复只增加一条新路径、不改动既有那条。
+        if body.nested:
+            self.write_descendant_blocks(document_id, body)
+        else:
+            self.write_blocks(document_id, body.flat_children())
         return WriteBodyOutcome()
 
     def grant_full_access(self, document_id: str, open_id: str) -> None:
@@ -842,6 +1078,7 @@ __all__ = [
     "OPENID_MEMBER_TYPE",
     "UNSUPPORTED_NESTED_BLOCKS",
     "USER_OPEN_ID_PREFIX",
+    "ConvertedBody",
     "FeishuDocxDeliveryError",
     "LarkDocxDelivery",
     "WriteBodyOutcome",
@@ -850,7 +1087,8 @@ __all__ = [
     "urllib_transport",
 ]
 
-# 说明：`read_body_children`/`convert_markdown_to_blocks`/`write_blocks`/
-# `write_body` 都是 `LarkDocxDelivery` 的实例方法，不单独导出符号——同
+# 说明：`read_body_children`/`convert_markdown_to_body`/`write_blocks`/
+# `write_descendant_blocks`/`write_body` 都是 `LarkDocxDelivery` 的实例方法，
+# 不单独导出符号——同
 # `create_document`/`write_paragraphs`/`grant_full_access`/`read_members`
 # 既有方法一样，只通过类本身暴露。

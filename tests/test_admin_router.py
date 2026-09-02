@@ -1186,7 +1186,7 @@ class QueryTraceCommandTests(unittest.TestCase):
         self.assertIn("任务结果: 成功", reply)
         self.assertIn("文档交付结果: 成功", reply)
         self.assertIn("文档正文处理: 已降级", reply)
-        self.assertIn("正文含暂不支持的嵌套结构", reply)
+        self.assertIn("正文含无法定位的块结构", reply)
 
     def test_document_delivery_failure_is_reported_when_task_itself_succeeded(self) -> None:
         """文档消费是独立状态机：问数任务成功但文档明确失败时，``/admin trace``

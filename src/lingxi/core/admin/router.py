@@ -1272,7 +1272,7 @@ _DOCUMENT_DELIVERY_REASON_LABEL: dict[str, str] = {
     "attempts_exhausted": "重试次数耗尽",
     "pending_expired_unconsumed": "排队超时未被消费",
     "permission_not_confirmed": "授权结果未能读回确认",
-    "unsupported_nested_blocks": "正文含暂不支持的嵌套结构",
+    "unsupported_nested_blocks": "正文含无法定位的块结构",  # #538 起表格已支持，这个码只剩"无处安放的块"
 }
 
 
