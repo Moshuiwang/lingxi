@@ -22,6 +22,30 @@
 
 以下步骤是对 `deploy/README.md` 既有机制的生产执行顺序汇总，逐字命令以该文件为准；这里只标注生产专属的差异点。
 
+### 2.0 步 0：把生产机仓库工作副本更新到候选（升级必做；rc25 审核③ ❌B 补入）
+
+本文件与 `deploy/README.md` 的**每一条** compose 命令都以相对路径引用生产机仓库工作副本里的 `deploy/compose*.yaml`（工作副本路径：`/home/bi-ai-deploy/projects/lingxi`）。**只改 `.env.prod` 的 tag/digest 就 `up -d` 是一个不报错的错法**：命令全部成功、三容器全 healthy、观察期全绿，但 compose 文件还是旧的——本批新增的 `LINGXI_WORKER_WORKSPACE`（W-1 令牌隔离）、`LINGXI_DEPLOY_ENVIRONMENT`（生产判据兜底）等 `environment:` 行全部缺席，修复零报错地不生效；单元文件、运维脚本的更新同样依赖这一步。CI 门禁只看仓库文件，对「生产机没更新」零报错。2026-09-03 只读实测：生产工作副本 HEAD 停在 `eea6b1215cb9…`（rc24 时代提交），这条缺口是既成事实，不是假设。
+
+```bash
+# ① 更新到本批候选（<候选 SHA> = 本批合入 main 的提交，其前 12 位就是镜像 tag 的 sha 段）
+git -C /home/bi-ai-deploy/projects/lingxi fetch origin
+git -C /home/bi-ai-deploy/projects/lingxi checkout --detach <候选 SHA>
+
+# ② 回读：输出必须逐字等于候选 SHA，不等不得继续
+git -C /home/bi-ai-deploy/projects/lingxi rev-parse HEAD
+
+# ③ 渲染回读（必须带 --no-env-resolution，硬前提见 §2.1）：本批 compose 侧修复必须出现
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  config --no-env-resolution worker-queue \
+  | grep -E 'LINGXI_WORKER_WORKSPACE|LINGXI_DEPLOY_ENVIRONMENT'
+# 期望恰好两行（键按字母序，值可能带引号）：
+#   LINGXI_DEPLOY_ENVIRONMENT: prod
+#   LINGXI_WORKER_WORKSPACE: /tmp/lingxi-workspace
+```
+
+checkout 之前先确认工作副本干净（`git -C /home/bi-ai-deploy/projects/lingxi status --porcelain` 输出为空；有本地改动先由产品负责人裁定处置，不得 `checkout -f` 抹掉）。`deploy/.env.prod*` 七个凭据文件全部匹配 `.gitignore` 的 `.env.*` 规则、不入库也不受 checkout 影响——这一步**不触碰任何凭据文件**。
+
 ### 2.1 准备七个 env 文件
 
 按 [`deploy/README.md`「准备」](README.md#准备)为 `.env.prod`、`.env.prod.scheduler`、`.env.prod.gateway`、`.env.prod.worker`、`.env.prod.worker-queue`、`.env.prod.migrate`、`.env.prod.reauthorize` 七个文件写入生产凭据。生产凭据集与研发/Stage 凭据集完全隔离，任何一个值都不得与 `.env.stage.*` 系列重复（百炼模型端点凭据除外，见本文件「九」）；不得把研发环境的任何文件复制改名后当作生产文件使用。
@@ -72,19 +96,40 @@ LINGXI_GATEWAY_MEM_LIMIT=512M
 把它也收紧成显式声明属部署配置决定，需连本 runbook 与 `.env.prod` 一起改，**尚未裁定**。
 不需要为它在 `.env.prod` 加行。
 
-部署前用以下两条只读命令确认渲染后的**取值**与上表一致（只读，不创建或修改真实生产
+部署前用以下两条只读命令确认渲染后的**取值**与上表一致（不创建或修改真实生产
 文件）。**漏没漏现在渲染会自己报错，但值写错了只有回读看得出来**：
+
+**硬前提（rc25 审核③ ❌A；先核对、后执行，不核对不得跑）**：`docker compose config`
+**默认会把各服务 `env_file:` 的文件内容展开内联进输出**（仓库自证：
+`scripts/ci/verify_compose_structure.sh` 头部注释明确记录了这一行为）——在生产上不带
+开关照跑这条「只读」命令，等于把 `.env.prod.worker-queue`/`.env.prod.scheduler`/
+`.env.prod.gateway` 里的数据库 DSN（含口令）、`LINGXI_MCP_TOKEN_ENCRYPT_KEY`、飞书
+app secret 全部打进终端与会话记录。因此下面两条命令**必须带 `--no-env-resolution`**，
+且执行前先用这条只读命令确认本机 compose 支持该开关（2026-09-03 已在生产实测一次返回
+`1`，窗口内执行前仍复核）：
+
+```bash
+docker compose config --help | grep -c -- '--no-env-resolution'   # 期望输出 1
+```
+
+**输出不是 `1` 时，下面两条 `config` 命令一条都不得执行**——没有「先跑了再说」的选项。
+替代做法：跳过渲染回读，只做不展开 env 的核对（`docker compose … ps`、
+`docker image inspect`，以及 `up -d` 之后
+`docker inspect --format '{{.HostConfig.Memory}}' <容器>` 事后核值）。资源限值来自
+`--env-file` 根文件的插值，不受 `--no-env-resolution` 影响，带开关的回读结论与不带时
+完全相同。
 
 ```bash
 # ① worker-queue：并发与四项资源
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  config worker-queue
+  config --no-env-resolution worker-queue
 
-# ② scheduler / gateway：确认 memory 渲染成 512M（漏配已由 ${VAR:?} 直接报错）
+# ② scheduler / gateway：确认 memory 渲染值（漏配已由 ${VAR:?} 直接报错；判读按
+#    11.3 第 1 条用字节数：512M → "536870912"，出现 "1073741824" 就是错退回 1G）
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  config scheduler gateway
+  config --no-env-resolution scheduler gateway
 ```
 
 ### 2.2 部署前置检查（preflight）
