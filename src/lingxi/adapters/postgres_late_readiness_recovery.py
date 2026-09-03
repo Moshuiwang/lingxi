@@ -77,6 +77,13 @@ class LateOnboardingCandidate:
     permission_version: int
     permissions: str
     next_attempt_no: int
+    #: 这条链是不是系统触发（预开通，rc25 修复包 F3）：判据与
+    #: ``postgres_stalled_provisioning`` 的候选查询同一条线——该用户名下**没有**
+    #: ``handled_as = 'auto_provisioning'`` 的入站事件（预开通刻意不插假事件行，
+    #: 见 :mod:`lingxi.core.identity.preprovision`）。为真时恢复完成**不发**
+    #: 「开通完成」私聊（产品负责人裁定 4：预开通全程静默、首聊时补一句），改在
+    #: 激活的同一个事务里挂起首聊补一句；用户自己发起的链一字不变。
+    system_triggered: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,7 +157,12 @@ class PostgresLateReadinessStore:
             cursor.execute(
                 """
                 SELECT u.id, u.permission_version, o.payload ->> 'permissions',
-                       progress.attempt_count
+                       progress.attempt_count,
+                       NOT EXISTS (
+                             SELECT 1 FROM inbound_event ie
+                              WHERE ie.user_open_id = u.feishu_open_id
+                                AND ie.handled_as = 'auto_provisioning'
+                           ) AS system_triggered
                   FROM app_user u
                   JOIN publish_outbox o
                     ON o.user_id = u.id
@@ -192,6 +204,7 @@ class PostgresLateReadinessStore:
                 permission_version=int(row[1]),
                 permissions=str(row[2]),
                 next_attempt_no=int(row[3]) + 1,
+                system_triggered=bool(row[4]),
             )
             for row in rows
         )
@@ -208,8 +221,17 @@ class PostgresLateReadinessStore:
         company_name: str,
         function_name: str,
         dedupe_key: str,
+        silent_system_trigger: bool = False,
     ) -> bool:
         """就绪之后，**同一个事务**里把状态推进到 ``active``、并排一条待发通知。
+
+        ``silent_system_trigger``（rc25 修复包 F3）：这条链是系统触发（预开通）时为
+        真——产品负责人裁定 4 要求预开通**全程静默、首聊时才补一句**，因此不排
+        「开通完成」私聊；改在**同一个事务**里挂起首聊补一句（守卫与
+        ``postgres_identity.mark_preprovision_notice_pending`` 逐字相同：只挂一次、
+        且只挂给从没跟我们说过话的人——已经在聊的人挂不上，保持彻底静默）。原子
+        不变量（外部独立审查 F1/F3）不变：状态推进与"用户会得到什么"仍然要么一起
+        成立、要么一起不成立。缺省 ``False`` 保持既有行为逐字节不变。
 
         返回是否真的推进了（``False`` = CAS 失败：这个人在候选查到之后账号被停用、
         状态已经不是 ``mcp_syncing``，或权限版本已经变了——三种情况**都不写任何东西，
@@ -264,22 +286,38 @@ class PostgresLateReadinessStore:
                 )
                 if cursor.rowcount != 1:
                     return False
-                cursor.execute(
-                    """INSERT INTO onboarding_completion_notice
-                         (id, user_id, permission_version, company_name, function_name,
-                          dedupe_key)
-                       VALUES (%(id)s, %(user)s, %(version)s, %(company)s, %(function)s,
-                               %(dedupe)s)
-                       ON CONFLICT (dedupe_key) DO NOTHING""",
-                    {
-                        "id": new_id("obn"),
-                        "user": user_id,
-                        "version": expected_permission_version,
-                        "company": company_name,
-                        "function": function_name,
-                        "dedupe": dedupe_key.strip(),
-                    },
-                )
+                if silent_system_trigger:
+                    # 预开通（rc25 修复包 F3）：不排私聊，改挂首聊补一句。两道守卫
+                    # 与 mark_preprovision_notice_pending 一致；0 行（已挂过 / 已经
+                    # 在聊）不是失败，激活本身照常提交。
+                    cursor.execute(
+                        """UPDATE app_user
+                              SET preprovision_notice_armed_at = now()
+                            WHERE id = %(user)s
+                              AND preprovision_notice_armed_at IS NULL
+                              AND NOT EXISTS (
+                                    SELECT 1 FROM inbound_event ie
+                                     WHERE ie.user_open_id = app_user.feishu_open_id
+                                  )""",
+                        {"user": user_id},
+                    )
+                else:
+                    cursor.execute(
+                        """INSERT INTO onboarding_completion_notice
+                             (id, user_id, permission_version, company_name, function_name,
+                              dedupe_key)
+                           VALUES (%(id)s, %(user)s, %(version)s, %(company)s, %(function)s,
+                                   %(dedupe)s)
+                           ON CONFLICT (dedupe_key) DO NOTHING""",
+                        {
+                            "id": new_id("obn"),
+                            "user": user_id,
+                            "version": expected_permission_version,
+                            "company": company_name,
+                            "function": function_name,
+                            "dedupe": dedupe_key.strip(),
+                        },
+                    )
         return True
 
     # ------------------------------------------------------------------
