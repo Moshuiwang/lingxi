@@ -922,11 +922,8 @@ class AutoOnboardingRunner:
         )
         if recheck is not None:
             if grant is not None and recheck.state is OnboardingState.COMPLETED:
-                # rc25 修复包 F2（只改报告口径）：这个人已经 active，在这里提前收口，
-                # 本轮名单带的那笔预授权**没有**走到下面的落库口（它排在本复核之后）。
-                # 「要不要给已 active 用户补上名单权限」是产品语义，产品负责人另行
-                # 裁定——这里绝不静默扩权，只把「答应的授权没有落」如实标注给批量
-                # 清单（`scripts/ops/preprovision.py` 据此单独归类，不计成功）。
+                # rc25 修复包 F2：已 active 提前收口，名单预授权没走到下面的落库口。
+                # 绝不静默扩权，只如实标注给批量清单（语义见 OnboardingResult 文档）。
                 return replace(recheck, grant_not_applied=True)
             return recheck
 
