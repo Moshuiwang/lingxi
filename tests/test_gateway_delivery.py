@@ -1003,6 +1003,40 @@ class DeliveryExpiredNoticeTests(DeliveryConsumerTestCase):
         self.assertFalse(second, "同一次到期只提示一次")
 
 
+class PreprovisionNoticeConsumptionTests(DeliveryConsumerTestCase):
+    """Issue #541 预开通：首聊补一句的消费端（``consume_preprovision_notice``）。
+
+    只有真库能证伪"只提示一次"：查询与标记落在同一条 ``UPDATE ... RETURNING`` 里，
+    在假 store 上无论实现怎么写都是绿的。挂起端（``mark_preprovision_notice_pending``
+    的两道守卫）在 ``tests/test_identity_postgres_records.py``。
+    """
+
+    def _consume(self) -> bool:
+        from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+
+        with PostgresGatewayStore(self._dsn).transaction() as tx:
+            return tx.consume_preprovision_notice(user_id="usr-1")
+
+    def test_an_armed_line_is_consumed_exactly_once(self) -> None:
+        self.execute(
+            "UPDATE app_user SET preprovision_notice_armed_at = now() WHERE id = 'usr-1'"
+        )
+
+        self.assertTrue(self._consume(), "挂起过就该在首聊时命中一次")
+        self.assertFalse(self._consume(), "同一次挂起只提示一次")
+        self.assertIsNotNone(
+            self.scalar("SELECT preprovision_notice_sent_at FROM app_user WHERE id = 'usr-1'")
+        )
+
+    def test_a_user_who_was_never_armed_is_never_prompted(self) -> None:
+        """**否定断言**：绝大多数用户从未被预开通，这条查询对他们恒为假。"""
+
+        self.assertFalse(self._consume())
+        self.assertIsNone(
+            self.scalar("SELECT preprovision_notice_sent_at FROM app_user WHERE id = 'usr-1'")
+        )
+
+
 class QueueDelayHintTests(DeliveryConsumerTestCase):
     """Issue #465（rc22 S-3，排队可感知）：真库读取面 + `DeliveryConsumer` 消费面。
 

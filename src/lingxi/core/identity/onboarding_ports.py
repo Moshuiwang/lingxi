@@ -103,6 +103,22 @@ class UserStateStore(Protocol):
         _abort_if_stalled`），停摆扫描职责（``apps/scheduler/stalled_provisioning.py``）
         调用的是同一个方法。"""
 
+    def mark_preprovision_notice_pending(self, *, open_id: str) -> bool:
+        """挂起「你的 BI Plus 已经开通」这一句，等该用户**首聊时**再补上（Issue #541
+        预开通，产品负责人裁定 4：预开通期间静默）。返回是否真的挂起了。
+
+        实现（``adapters/postgres_identity.PostgresAppUserStore``）在 SQL 里再判两件
+        事，因此本方法对调用方是**幂等**的、也不会打扰不该被打扰的人：
+
+        - 已经挂起过（不管有没有被消费掉）就不再挂起——同一份预开通名单重跑必须**零
+          变化**，重新挂起会让一个早就聊过天的人再收到一次"已经开通"；
+        - 这个人名下有过任何一条 ``inbound_event`` 就不挂起——他不是"从没跟我们说过
+          话"的那种人，那句解释对他没有意义。
+
+        消费点在 ``core/conversation/pipeline.py`` 的 ``ACTIVE`` 分支
+        （``ConversationTransaction.consume_preprovision_notice``），与「投递已过期」
+        提示逐字同一条纪律：只提示一次，且**不影响**这条消息本身的正常处理。"""
+
 
 @dataclass(frozen=True)
 class EnvironmentResult:

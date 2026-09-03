@@ -164,6 +164,10 @@ class FakeState:
     # test_gateway_pipeline.py 的专项用例断言 gateway.delivery_expired 提示的触发
     # 与只提示一次；默认空集合，绝大多数既有用例因此不受影响。
     pending_delivery_expired_notices: set[str] = field(default_factory=set)
+    # Issue #541 预开通：预置某个用户「有一句『你已经被提前开通了』还没说」，供
+    # test_gateway_pipeline.py 的专项用例断言首聊补一句的触发与只提示一次；默认空
+    # 集合，绝大多数既有用例因此不受影响（与上面那条同一条纪律）。
+    pending_preprovision_notices: set[str] = field(default_factory=set)
     # Issue #65 轻审 P2-2：迁移 0062 那一列（``onboarding_dispatched_at``）的内存
     # 对应物——记下哪些事件已经确认交给开通编排。
     # 事件标识 → 认领代次（或 ``_MARKED``，表示「已平账」而不是「被谁认领着」）。
@@ -351,6 +355,14 @@ class FakeTransaction:
         # 测试意图（真实实现的原子性由真库 UPDATE...RETURNING 承担，见
         # adapters.postgres_conversation）。
         self._state.pending_delivery_expired_notices.discard(conversation_id)
+        return True
+
+    def consume_preprovision_notice(self, *, user_id: str) -> bool:
+        self._log.add("store.consume_preprovision_notice", user_id=user_id)
+        if user_id not in self._state.pending_preprovision_notices:
+            return False
+        # 与上面那条过期提示同语义：命中即摘掉，同一次挂起不会被第二条消息再命中。
+        self._state.pending_preprovision_notices.discard(user_id)
         return True
 
     def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:

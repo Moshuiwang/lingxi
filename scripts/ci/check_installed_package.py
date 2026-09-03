@@ -94,14 +94,20 @@ REQUIRED_MODULES = (
     # without_local_grant` 从 `onboarding_runner.py` 纯移动过来，外加新增的
     # 「同邮箱已绑给另一个 user_id」闸。随 `onboarding_runner.py` 同一条发布理由。
     "lingxi.core.identity.onboarding_guards",
+    # 预开通（Issue #541，rc25 S-8a）：系统触发入口的三处差异（合成事件标识、账本
+    # no-op、静默投递）与邮箱→飞书身份的提前定位。`onboarding_runner.py` 与
+    # `adapters/postgres_stalled_provisioning.py` 都在模块级 import 它，随
+    # `onboarding_runner.py` 同一条发布理由。
+    "lingxi.core.identity.preprovision",
     # 上面那道邮箱闸的只读回读口（`app_user` 规范化邮箱 → user_id）。由
     # `_build_onboarding_duty` 在函数内 import，同 `postgres_onboarding_failure`
     # 一条理由：函数内 import 证明不了它装得上，必须显式登记。
     "lingxi.adapters.postgres_email_binding",
     # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
-    # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
-    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
-    # 装配前不在任何进程的模块级 import 闭包里，但必须随制品发布，理由同上一条。
+    # 的 `build_innertest_roster_gate`（rc25 S-8a 从 `AutoOnboardingRunner` 的静态
+    # 方法纯移动到本模块，因此 `apps/scheduler/onboarding.py` 改为模块级 import）与
+    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 函数内 import，
+    # 必须随制品发布，理由同上一条。
     "lingxi.core.identity.innertest_roster_gate",
     "lingxi.adapters.user_environment",
     # Epic D 闸⑥：按用户读取问数 MCP 配置的读侧适配器，配套上一条的写侧。由
@@ -547,14 +553,17 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # "函数内 import 证明不了装得上"条目同一条理由）。
             "lingxi.core.identity.stock_token_source",
             "lingxi.adapters.stock_token_bitable",
-            # 内测名单闸（Issue #302 S-N-01）：`_build_onboarding_duty` 经
-            # `AutoOnboardingRunner.build_innertest_roster_gate` 函数内 import，
-            # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
-            # 时同样函数内 import——两个调用点都不在模块级，必须显式登记。
+            # 内测名单闸（Issue #302 S-N-01）：`apps/scheduler/onboarding.py` 模块级
+            # import `build_innertest_roster_gate`（rc25 S-8a 之前是经
+            # `AutoOnboardingRunner` 的静态方法函数内 import）；`SchedulerConfig.
+            # from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS` 时仍是函数内 import。
             "lingxi.core.identity.innertest_roster_gate",
             # 开通链的两道失败关闭闸（rc25 S-2a，对抗审查 X-1）：`onboarding_
             # runner.py` 模块级 import，随它一起进 scheduler 的运行时闭包。
             "lingxi.core.identity.onboarding_guards",
+            # 预开通（Issue #541）：`onboarding_runner.py` 与停摆候选查询都在模块级
+            # import，随它们一起进 scheduler 的运行时闭包。
+            "lingxi.core.identity.preprovision",
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
             # 「同邮箱已绑给另一个 user_id」的只读回读口（rc25 S-2a，对抗审查

@@ -22,6 +22,7 @@ Issue #65 轻审登记的三项前置修复各有一组用例，同样落在既�
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 from gateway_fakes import (
@@ -41,7 +42,13 @@ from lingxi.adapters.feishu_events import (
     NonPrivateChatError,
     parse_message_event,
 )
-from lingxi.config.content import default_content_catalog
+from lingxi.config.content import (
+    KEY_PREPROVISIONED_FIRST_CHAT,
+    ContentCatalog,
+    ContentRenderError,
+    RenderedContent,
+    default_content_catalog,
+)
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
     EventPipeline,
@@ -273,6 +280,85 @@ class DeliveryExpiredNoticeTests(PipelineTestCase):
         self.assertFalse(
             any("请重新提问" in reply["text"] for reply in replies),
             "没有预置到期任务时不应该凭空出现提示",
+        )
+
+
+class PreprovisionFirstChatNoticeTests(PipelineTestCase):
+    """Issue #541 预开通（产品负责人裁定 4）：预开通期间静默，名单内用户**第一次
+    发消息时**才补一句「你的 BI Plus 已经开通……」。
+
+    与「投递已过期」提示逐字同一条纪律：消费一次、只提示一次，且**不影响**这条消息
+    本身的正常处理。挂起端见 ``core/identity/onboarding_ports.UserStateStore.
+    mark_preprovision_notice_pending``。
+
+    **文案正文由 rc25 S-8b 落进 ``content.toml``**，因此这里一律只断言"问的是哪个键"
+    与"这条消息照常入队"，不断言正文一个字——两者是两张卡的接缝，断言正文会让本卡的
+    用例在对方合入的那一刻变红或变绿，而那与本卡改没改对毫无关系。
+    """
+
+    def _spy_on_catalog(self, *, missing: bool = False) -> list[str]:
+        """记下 pipeline 到底按哪个键取文案；``missing`` 模拟该键尚未登记。"""
+
+        requested: list[str] = []
+        original = ContentCatalog.text
+
+        def spy(catalog, key, *args, **kwargs):
+            requested.append(key)
+            if key == KEY_PREPROVISIONED_FIRST_CHAT:
+                if missing:
+                    raise ContentRenderError("未登记的文案键")
+                return RenderedContent(key=key, version="test", text="你的 BI Plus 已经开通。")
+            return original(catalog, key, *args, **kwargs)
+
+        patcher = unittest.mock.patch.object(ContentCatalog, "text", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return requested
+
+    def test_the_pending_line_is_appended_once_by_its_registered_key(self) -> None:
+        requested = self._spy_on_catalog()
+        self.state.pending_preprovision_notices.add("usr_1")
+
+        self.build().handle_message(message("e1"), now=NOW)
+        self.assertIn(KEY_PREPROVISIONED_FIRST_CHAT, requested)
+        self.assertTrue(
+            any("已经开通" in reply["text"] for reply in self.log.fields("reply.send_text"))
+        )
+
+        requested.clear()
+        self.log = CallLog()
+        self.build().handle_message(message("e2"), now=NOW)
+        self.assertNotIn(
+            KEY_PREPROVISIONED_FIRST_CHAT, requested, "同一次挂起只提示一次"
+        )
+
+    def test_the_pending_line_does_not_block_the_message_from_being_queued(self) -> None:
+        self._spy_on_catalog()
+        self.state.pending_preprovision_notices.add("usr_1")
+
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(
+            outcome.handled_as,
+            HandledAs.TASK_QUEUED,
+            "补一句只是追加的一条回复，不改变这条消息本身该有的正常处理结果",
+        )
+
+    def test_nothing_is_requested_when_no_line_is_pending(self) -> None:
+        requested = self._spy_on_catalog()
+        self.build().handle_message(message("e1"), now=NOW)
+        self.assertNotIn(KEY_PREPROVISIONED_FIRST_CHAT, requested)
+
+    def test_an_unregistered_content_key_never_blocks_the_users_question(self) -> None:
+        """内容目录与代码分两次合入的中间态：键还没登记时，这条消息照常入队，只留
+        一条审计。**绝不能**因为一句附加提示把一个人的问数打断。"""
+
+        self._spy_on_catalog(missing=True)
+        self.state.pending_preprovision_notices.add("usr_1")
+
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(
+            self.log.count("audit.onboarding.preprovision_notice_content_missing"), 1
         )
 
 

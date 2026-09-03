@@ -218,6 +218,7 @@ from lingxi.core.identity.onboarding_guards import (
     reject_zero_galaxy_without_local_grant,
 )
 from lingxi.core.identity.onboarding_support import draft_from_member, roster_row_for
+from lingxi.core.identity.preprovision import NULL_DISPATCH_LEDGER, ORIGIN_PREPROVISION, PositionGrantImporter, PreprovisionGrant, deliver_silently, import_preprovision_grant, is_system_trigger, origin_of, run_system_onboarding
 from lingxi.core.identity.onboarding_terminal import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
@@ -323,6 +324,7 @@ class AutoOnboardingRunner:
         local_overrides: LocalOverrideSource | None = None,
         legacy_importer: LegacyPermissionImporter | None = None,
         email_bindings: EmailBindingSource,
+        position_grants: PositionGrantImporter | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -411,6 +413,9 @@ class AutoOnboardingRunner:
         #: 缺省不装等于把它关掉，与 ``publish_allowed``/``innertest_roster_gate``
         #: 同一条"没有默认放行"的纪律；漏接在构造期就是 ``TypeError``。
         self._email_bindings = email_bindings
+        #: 预授权落库口（Issue #541，可选）。``None``＝未装配：首聊路径一行都不碰它；
+        #: **系统触发带了预授权却没装它时整链失败关闭**（见 ``import_preprovision_grant``）。
+        self._position_grants = position_grants
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -418,28 +423,6 @@ class AutoOnboardingRunner:
         #: 长时间不可用把执行器永久占满。第二次仍然送不到就记账收口，并留一条 ``failed``
         #: 后缀的响亮审计。
         self._released_for_notify: set[str] = set()
-
-    # ------------------------------------------------------------------
-    # 装配便捷方法
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]:
-        """把已解析的内测名单集合包成 ``innertest_roster_gate`` 要的判定口。
-
-        纯粹的装配便利：把 ``core/identity/innertest_roster_gate.py`` 的纯判定函数
-        ``is_open_id_innertest_allowed`` 绑上一份具体的名单集合，返回本类构造时要的
-        ``Callable[[str], bool]``。判据、为什么匹配键是 open_id、为什么空集合＝全拒，
-        全部写在该模块自己的文档字符串里，本方法不重复。放在这里（而不是散落在
-        ``apps/scheduler/assembly.py`` 里手写一个 lambda）只是为了让装配点的那一行
-        足够短——``assembly.py`` 是本仓库棘轮登记的体量封顶文件（`scripts/ci/
-        size_ratchet_baseline.txt`），新增依赖时优先把可复用的胶水代码放在有余量的
-        地方，而不是继续往它里面堆代码。
-        """
-
-        from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
-
-        return lambda open_id: is_open_id_innertest_allowed(open_id, roster)
 
     # ------------------------------------------------------------------
     # OnboardingRunner 合同
@@ -519,6 +502,19 @@ class AutoOnboardingRunner:
             return _internal("executor_unavailable").as_result(trace_id=trace_id)
         return OnboardingResult(state=OnboardingState.STARTED)
 
+    def start_system(
+        self,
+        *,
+        email: str,
+        trace_id: str,
+        origin: str = ORIGIN_PREPROVISION,
+        initiated_by_open_id: str,
+        preprovision_grant: Any | None = None,
+    ) -> OnboardingResult:
+        """系统触发的开通入口（Issue #541 预开通，无入站消息）：按邮箱定位、账本 no-op、全程静默、**同步返回终态**；判定与写入逐字节共用 :meth:`_run`。整段实现、参数形状与立论见 :mod:`lingxi.core.identity.preprovision`。"""
+
+        return run_system_onboarding(self, email=email, trace_id=trace_id, origin=origin, initiated_by_open_id=initiated_by_open_id, preprovision_grant=preprovision_grant)
+
     def _release(self, open_id: str, event_id: str) -> None:
         with self._lock:
             if self._running.get(open_id) == event_id:
@@ -590,10 +586,10 @@ class AutoOnboardingRunner:
     # 执行线程
     # ------------------------------------------------------------------
 
-    def _execute(
-        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
-    ) -> None:
-        """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。"""
+    def _execute(self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None, grant: PreprovisionGrant | None = None) -> _Terminal | None:
+        """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。
+
+        返回这一次的终态（停机中止时 ``None``）：``start()`` 那条路不看它；系统触发那条路（Issue #541）要把它同步交回给批量脚本。"""
 
         # **§7.4 编排层当场收口的挂钩**（Issue #282）：``_run`` 在把这个人推进到
         # ``provisioning``（第 715 行的分水岭）之后才会写 ``stalled["user_id"]``——
@@ -605,7 +601,7 @@ class AutoOnboardingRunner:
         stalled: dict[str, str | None] = {"user_id": None}
         try:
             terminal = self._run(
-                event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled
+                event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled, grant=grant
             )
         except _ChainAborted:
             # 停机中止：放回认领，下一轮（或下次启动）从头重跑。整条链的每一步都幂等，
@@ -627,9 +623,11 @@ class AutoOnboardingRunner:
             logger.error("首次开通编排未预料的失败 event=%s error=%s\n调用栈（不含异常正文）：\n%s", event_id, type(error).__name__, "".join(traceback.format_tb(error.__traceback__)))
             terminal = _internal(f"unexpected_{type(error).__name__}")
 
+        ledger = NULL_DISPATCH_LEDGER if is_system_trigger(event_id) else self._ledger  # Issue #541：系统触发没有 inbound_event 行，两个账本方法都没有对象
         self._audit.record(
             "onboarding.result",
             event_id=event_id,
+            origin=origin_of(event_id),
             state=terminal.state.value,
             failure_reason=terminal.reason,
             content_key=terminal.key,
@@ -678,7 +676,7 @@ class AutoOnboardingRunner:
             # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失——
             # 但**不再**把它当成"当场收口"的触发条件（见上）。
             try:
-                self._ledger.mark_onboarding_dispatched(event_id=event_id)
+                ledger.mark_onboarding_dispatched(event_id=event_id)
             except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次
                 self._audit.record(
                     "onboarding.dispatch_record_failed",
@@ -686,6 +684,7 @@ class AutoOnboardingRunner:
                     error=type(error).__name__,
                     trace_id=trace_id,
                 )
+        return terminal
 
     def _notify(
         self,
@@ -698,6 +697,7 @@ class AutoOnboardingRunner:
         trace_id: str,
     ) -> bool:
         """主动私聊一条消息，**返回是否送达**。失败只留响亮审计，不改写终态。
+        系统触发（Issue #541 预开通）**不发消息、按送达处理**，见 :func:`~lingxi.core.identity.preprovision.deliver_silently`。
 
         有限重试而不是一次定生死：一次飞书抖动就让用户永远停在「已收到」，代价与收益完全
         不成比例。重试之间用注入的 ``sleep``，因此纯单测里一秒都不用等。
@@ -707,6 +707,8 @@ class AutoOnboardingRunner:
         不会互相去重掉。
         """
 
+        if is_system_trigger(event_id):
+            return deliver_silently(key=key, open_id=open_id, users=self._users)
         dedupe_key = f"onboarding:{suffix}{event_id}" if suffix else f"onboarding:{event_id}"
         for attempt in range(1, self._notify_attempts + 1):
             try:
@@ -842,6 +844,7 @@ class AutoOnboardingRunner:
         open_id: str,
         trace_id: str,
         stalled: dict[str, str | None],
+        grant: PreprovisionGrant | None = None,
     ) -> _Terminal:
         """一次开通的固定次序。每一步的失败去向都在这里显式返回。
 
@@ -932,6 +935,12 @@ class AutoOnboardingRunner:
             self._import_legacy_permissions(
                 user_id, lookup, aggregate, galaxy_map, open_id=open_id, trace_id=trace_id
             )
+
+        if grant is not None:
+            # 预开通那一笔预授权（Issue #541）：与 S-1 差集导入**同一个挂点**，且同样排在
+            # 零银河判定**之前**——名单里"银河零权限、靠预授权吃饭"的人，先判零权限就会被
+            # 整批拒绝。落库口没装配时整链失败关闭，见该函数文档。
+            import_preprovision_grant(self._position_grants, grant, user_id=user_id, open_id=open_id, now=self._clock(), audit=self._audit, trace_id=trace_id)
 
         if not aggregate.granted:
             # 零银河权限：现在才有 `app_user.id`，查一次**本地授权**。放在

@@ -1106,6 +1106,55 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
         self.assertIs(lookup.availability, DirectoryAvailability.UNAVAILABLE)
         self.assertEqual(lookup.members, ())
 
+    def test_a_lookup_by_user_id_finds_the_member_in_the_latest_complete_snapshot(self) -> None:
+        """Issue #541 预开通：邮箱 → 花名册 ``personnel_id``（＝飞书 ``user_id``）
+        → 组织快照成员，是**只有预开通需要**的反方向定位。"""
+
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.AVAILABLE)
+        self.assertEqual([m.open_id for m in lookup.members], ["ou_zhang"])
+
+    def test_a_lookup_by_user_id_returns_no_member_for_an_unknown_id(self) -> None:
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_nobody")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.AVAILABLE)
+        self.assertEqual(lookup.members, ())
+
+    def test_a_lookup_by_user_id_returns_every_candidate_when_the_id_is_reused(self) -> None:
+        """``feishu_org_member_snapshot`` 对 ``user_id`` **不设唯一约束**（账号复用
+        换人按 #34 方案 C 留给管理员侧审计）。查询必须如实返回多条，由调用方失败
+        关闭——预开通那一侧就是这么做的（``locate_by_email``）。"""
+
+        self.store.commit_batch(
+            batch(
+                (
+                    member(),
+                    member(member_key="ou_zhang_2", open_id="ou_zhang_2", union_id="union_zhang_2"),
+                )
+            ),
+            source_app_id="cli_fake",
+        )
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
+
+        self.assertEqual(
+            sorted(m.open_id for m in lookup.members), ["ou_zhang", "ou_zhang_2"]
+        )
+
+    def test_a_failed_batch_is_never_the_source_of_a_user_id_lookup_either(self) -> None:
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.UNAVAILABLE)
+        self.assertEqual(lookup.members, ())
+
     def test_the_database_refuses_a_complete_run_with_no_members(self) -> None:
         with self.assertRaises(self._psycopg.errors.CheckViolation):
             self.execute(
@@ -1936,6 +1985,79 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
 
     def test_a_missing_user_reads_back_as_none(self) -> None:
         self.assertIsNone(self.users.read_status("usr_does_not_exist"))
+
+    # ---- 迁移 0087：预开通的两处接缝 ---------------------------------
+
+    def _started_at(self):
+        return self.scalar(
+            "SELECT provisioning_started_at FROM app_user WHERE id = %s", (self.user_id,)
+        )
+
+    def test_entering_provisioning_stamps_the_lease_origin(self) -> None:
+        """Issue #541：``provisioning_started_at`` 是停摆兜底在**没有 ``inbound_event``
+        行**时唯一可用的租约起点，必须与"推进到分水岭"同真同假（同一条 UPDATE）。"""
+
+        self.assertIsNone(self._started_at(), "推进之前不该有起点")
+
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+
+        self.assertIsNotNone(self._started_at())
+
+    def test_a_refused_advance_does_not_stamp_the_lease_origin(self) -> None:
+        """空写不能留下一个"这次开通从现在开始"的假事实。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="active")
+        self.execute("UPDATE app_user SET provisioning_started_at = NULL WHERE id = %s", (self.user_id,))
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertIsNone(self._started_at())
+
+    def test_later_advances_do_not_refresh_the_lease_origin(self) -> None:
+        """租约起点只在进入分水岭那一刻写一次：被后续无关推进刷新的列会让租约永远
+        不到期，那正是"不用 ``updated_at`` 兜底"的理由。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        first = self._started_at()
+
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertEqual(self._started_at(), first)
+
+    def _armed_at(self):
+        return self.scalar(
+            "SELECT preprovision_notice_armed_at FROM app_user WHERE id = %s", (self.user_id,)
+        )
+
+    def _open_id(self) -> str:
+        return str(self.scalar("SELECT feishu_open_id FROM app_user WHERE id = %s", (self.user_id,)))
+
+    def test_the_first_chat_line_is_armed_once(self) -> None:
+        self.assertTrue(self.users.mark_preprovision_notice_pending(open_id=self._open_id()))
+        armed = self._armed_at()
+
+        self.assertFalse(
+            self.users.mark_preprovision_notice_pending(open_id=self._open_id()),
+            "同一份名单重跑必须零变化，不能把同一句话重新挂起一次",
+        )
+        self.assertEqual(self._armed_at(), armed)
+
+    def test_a_person_already_talking_to_us_is_never_armed(self) -> None:
+        """那句解释的全部意义是"你没经历过开通等待"；对一个已经在聊的人说它只会
+        莫名其妙。判据放在 SQL 里，因为调用点（开通链的通知出口）看不到入站事件。"""
+
+        self.execute(
+            """INSERT INTO inbound_event
+                 (feishu_event_id, received_at, event_type, user_open_id, handled_as, trace_id)
+               VALUES ('evt_chatty', now(), 'im.message.receive_v1', %s, 'task_queued', 'trc_chatty')""",
+            (self._open_id(),),
+        )
+
+        self.assertFalse(self.users.mark_preprovision_notice_pending(open_id=self._open_id()))
+        self.assertIsNone(self._armed_at())
+
+    def test_arming_an_unknown_open_id_changes_nothing(self) -> None:
+        self.assertFalse(self.users.mark_preprovision_notice_pending(open_id="ou_nobody"))
 
 
 class StalledProvisioningAbortTest(IdentityPostgresTestCase):
