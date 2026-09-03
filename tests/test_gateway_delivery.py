@@ -1036,6 +1036,72 @@ class PreprovisionNoticeConsumptionTests(DeliveryConsumerTestCase):
             self.scalar("SELECT preprovision_notice_sent_at FROM app_user WHERE id = 'usr-1'")
         )
 
+    # ------------------------------------------------------------------
+    # peek（rc25 修复包 F1）：先渲染后消费的读取端。只有真库能证伪三件事：
+    # 挂起判定与 consume 用同一对列、权限快照按 published + payload ? 'permissions'
+    # + 版本对齐取、peek 本身零写入。
+    # ------------------------------------------------------------------
+
+    def _peek(self):
+        from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+
+        with PostgresGatewayStore(self._dsn).transaction() as tx:
+            return tx.peek_preprovision_notice(user_id="usr-1")
+
+    def _seed_outbox(self, *, payload: str, version: int = 1, status: str = "published") -> None:
+        self.execute(
+            "UPDATE app_user SET permission_version = %s, "
+            "preprovision_notice_armed_at = now() WHERE id = 'usr-1'",
+            (version,),
+        )
+        self.execute(
+            """INSERT INTO publish_outbox
+                 (id, user_id, permission_version, reason, payload, status,
+                  created_at, published_at, content_expires_at)
+               VALUES ('pub-usr-1', 'usr-1', %s, 'first_onboarding', %s, %s,
+                       now(), CASE WHEN %s = 'published' THEN now() END, now())""",
+            (version, payload, status, status),
+        )
+
+    def test_peek_returns_the_published_scope_and_does_not_consume(self) -> None:
+        permissions = '{"C001": ["\u9500\u552e\u57df"]}'
+        self._seed_outbox(payload=json.dumps({"permissions": permissions}))
+
+        first = self._peek()
+        self.assertIsNotNone(first)
+        self.assertEqual(first.permissions, permissions)
+        second = self._peek()
+        self.assertIsNotNone(second, "peek 只读，不得消费一次性标志")
+        self.assertIsNone(
+            self.scalar("SELECT preprovision_notice_sent_at FROM app_user WHERE id = 'usr-1'")
+        )
+
+        self.assertTrue(self._consume())
+        self.assertIsNone(self._peek(), "消费之后不再有待说的那句话")
+
+    def test_peek_reports_an_unavailable_snapshot_after_payload_redaction(self) -> None:
+        """九十天保留期把 ``payload`` 擦成 ``'{}'`` 后：挂起仍然成立，但快照不可用
+        （``permissions is None``）——调用方据此记审计、不消费，不发半句假话。"""
+
+        self._seed_outbox(payload="{}")
+
+        pending = self._peek()
+        self.assertIsNotNone(pending, "挂起本身与快照可用性是两件事")
+        self.assertIsNone(pending.permissions)
+
+    def test_peek_ignores_an_unpublished_intent(self) -> None:
+        """还没发布出去的意图不算数：快照必须是**已发布**那一版（与
+        ``postgres_late_readiness_recovery`` 的候选判据同一套）。"""
+
+        self._seed_outbox(payload=json.dumps({"permissions": "{}"}), status="pending")
+
+        pending = self._peek()
+        self.assertIsNotNone(pending)
+        self.assertIsNone(pending.permissions)
+
+    def test_peek_is_none_for_a_user_who_was_never_armed(self) -> None:
+        self.assertIsNone(self._peek())
+
 
 class QueueDelayHintTests(DeliveryConsumerTestCase):
     """Issue #465（rc22 S-3，排队可感知）：真库读取面 + `DeliveryConsumer` 消费面。

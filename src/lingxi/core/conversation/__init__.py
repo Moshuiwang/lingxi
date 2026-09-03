@@ -21,6 +21,7 @@ from .ports import (
     OnboardingState,
     Outcome,
     PendingOnboarding,
+    PendingPreprovisionNotice,
     UserRecord,
     UserState,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "OnboardingState",
     "Outcome",
     "PendingOnboarding",
+    "PendingPreprovisionNotice",
     "SESSION_IDLE_WINDOW",
     "UserRecord",
     "UserState",

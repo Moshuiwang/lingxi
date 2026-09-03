@@ -65,6 +65,11 @@ from lingxi.config.content import (
     validate_user_visible_text,
 )
 from lingxi.core.ids import new_id
+# 预开通首聊补一句（rc25 修复包 F1）：公司/职能取值与 ``onboarding.completed`` 同一
+# 来源。两个模块都是纯函数 + 内容目录，不把身份链或任何适配器拖进 gateway 的 import
+# 闭包（``apps/gateway`` 本就引用 ``core.permission.*``）。
+from lingxi.core.permission.notification import describe_scope
+from lingxi.core.permission.publish_row import parse_permissions
 from lingxi.core.user_memory import UserMemoryEntry
 
 from .commands import (
@@ -86,6 +91,7 @@ from .ports import (
     OnboardingRunner,
     OnboardingState,
     Outcome,
+    PendingPreprovisionNotice,
     Reactions,
     Replies,
     UserState,
@@ -661,20 +667,24 @@ class EventPipeline:
             # 这条消息接下来按第 6～8 步的正常处理——该入队入队、该判忙碌判忙碌。
             # 挂起是谁写的、为什么只可能挂给"从没跟我们说过话的人"，见
             # ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。
-            if tx.consume_preprovision_notice(user_id=user.user_id):
-                try:
-                    deferred.append(self._texts.catalog.text(KEY_PREPROVISIONED_FIRST_CHAT))
-                except ContentRenderError:
-                    # 文案键还没登记进内容目录。**不能因为一句附加提示打断这个人的问数**
-                    # ——他这条消息的正常处理与这句话无关。生产上走不到这里：内容目录
-                    # 加载期就要求键集合完全相等（``config/content._require_exact_keys``），
-                    # 缺键的构建根本起不来；这条分支覆盖的是内容目录与代码分两次合入的
-                    # 中间态。
-                    self._audit.record(
-                        "onboarding.preprovision_notice_content_missing",
-                        event_id=message.event_id,
-                        trace_id=message.trace_id,
-                    )
+            #
+            # 次序是硬的（rc25 修复包 F1）：**先渲染、渲染成功才消费一次性标志**。
+            # 那句文案带真实公司/职能占位，渲染可能失败；先消费再渲染，失败会把标志
+            # 白白烧掉、异常又被吞成审计，这个人**永远**收不到产品承诺的那句话。渲染
+            # 是纯函数，提前到 consume 之前不改变事务语义；渲染失败只记审计、不消费、
+            # 不打断这条消息的正常处理，下一条消息还会再试。
+            pending_notice = tx.peek_preprovision_notice(user_id=user.user_id)
+            if pending_notice is not None:
+                rendered_notice = self._render_preprovision_notice(
+                    pending_notice,
+                    event_id=message.event_id,
+                    user_id=user.user_id,
+                    trace_id=message.trace_id,
+                )
+                if rendered_notice is not None and tx.consume_preprovision_notice(
+                    user_id=user.user_id
+                ):
+                    deferred.append(rendered_notice)
 
             # —— 第 6 步：解析命令。在忙碌判定**之前**，因为 /stop 不受忙碌拦截。
             command = parse_command(message.text)
@@ -979,6 +989,63 @@ class EventPipeline:
                 ),
             )
         return tuple(rendered)
+
+    def _render_preprovision_notice(
+        self,
+        pending: PendingPreprovisionNotice,
+        *,
+        event_id: str,
+        user_id: str,
+        trace_id: str,
+    ) -> RenderedContent | None:
+        """渲染预开通首聊那句「你的 BI Plus 已经开通……」；失败返回 ``None``、只记审计。
+
+        公司/职能取值与开通链发 ``onboarding.completed`` 时**同一来源、同一姿势**：
+        该用户当前权限版本已发布的权限文档，经 ``describe_scope(parse_permissions(...))``
+        说成两串展示文本（``core/identity/onboarding_runner._completed`` 与
+        ``apps/scheduler/late_readiness_recovery`` 逐字同一调用）。
+
+        **不能因为一句附加提示打断这个人的问数**——他这条消息的正常处理与这句话无关，
+        因此两类失败都只留审计、返回 ``None``；调用方据此**不消费**一次性标志，下一条
+        消息重试（rc25 修复包 F1：「只提示一次」保持，「失败即永远丢失」消除）：
+
+        - 文案侧失败 → 既有 ``onboarding.preprovision_notice_content_missing``。生产
+          上键缺失走不到（内容目录加载期要求键集合完全相等，缺键的构建起不来），这一
+          桶覆盖内容目录与代码分两次合入的中间态，以及占位集合不符、出口安全校验拦截；
+        - 权限快照不可用（``publish_outbox.payload`` 过九十天保留期被擦成 ``'{}'``、
+          或当前版本没有已发布意图）或读不懂 →
+          ``onboarding.preprovision_notice_scope_unavailable``。
+        """
+
+        try:
+            if pending.permissions is None:
+                # 内部错误消息不进用户可见面；本文件禁嵌中文字面量（内容目录守卫）。
+                raise ValueError("preprovision scope snapshot unavailable")
+            company, function = describe_scope(
+                parse_permissions(pending.permissions), catalog=self._texts.catalog
+            )
+            return self._texts.catalog.text(
+                KEY_PREPROVISIONED_FIRST_CHAT,
+                company_name=company,
+                function_name=function,
+            )
+        except (ContentRenderError, ContentSafetyError):
+            # 注意 except 次序：ContentError 继承自 ValueError，先窄后宽。
+            self._audit.record(
+                "onboarding.preprovision_notice_content_missing",
+                event_id=event_id,
+                user_id=user_id,
+                trace_id=trace_id,
+            )
+            return None
+        except ValueError:
+            self._audit.record(
+                "onboarding.preprovision_notice_scope_unavailable",
+                event_id=event_id,
+                user_id=user_id,
+                trace_id=trace_id,
+            )
+            return None
 
     def _busy_hint_for(self, conversation) -> RenderedContent:
         """按话题当前占用任务的真实阶段选文案（Issue #465，rc22 S-3）。

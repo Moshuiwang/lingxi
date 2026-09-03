@@ -81,6 +81,18 @@ class ConversationRecord:
     running_task_status: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingPreprovisionNotice:
+    """一句还没说的预开通首聊提示（Issue #541），以及渲染它所需的权限快照。
+
+    ``permissions``：该用户当前权限版本已发布的权限文档文本（``publish_outbox``
+    的内容快照，与 ``onboarding.completed`` 的公司/职能取值同一来源）；快照不可用
+    时为 ``None``——挂起仍然成立，只是这一次渲染不出来（`GatewayTransaction.
+    peek_preprovision_notice` 的文档交代了两种成因与调用方的处理姿态）。"""
+
+    permissions: str | None = None
+
+
 class HandledAs(str, Enum):
     """``inbound_event.handled_as`` 的取值，与迁移 013 的 CHECK 一致。"""
 
@@ -244,15 +256,32 @@ class GatewayTransaction(Protocol):
         """该话题是否有尚未提示过的「投递已过期」任务；命中即原子标记为已提示
         （Issue #152、`V-投递-06` 后半句）。"""
 
+    def peek_preprovision_notice(self, *, user_id: str) -> PendingPreprovisionNotice | None:
+        """这个人有没有一句"你已经被提前开通了"还没说；有则**只读**返回渲染这句话
+        所需的权限快照，**不消费**一次性标志（rc25 修复包 F1）。
+
+        与 :meth:`consume_preprovision_notice` 拆成两步的理由：那句话的模板要求带上
+        真实的公司/职能范围，渲染可能失败（权限快照过了九十天保留期、内容目录与代码
+        分两次合入的中间态）。先消费再渲染，失败会把一次性标志白白烧掉，这个人**永远**
+        收不到产品承诺的那句话；因此调用方必须先用本方法拿快照、渲染成功之后才调
+        :meth:`consume_preprovision_notice`。并发安全不靠本方法：两个事务同时 peek 到
+        同一句挂起，最终只有一个能在 consume 的原子 ``UPDATE`` 上命中。
+
+        ``permissions`` 是该用户**当前权限版本**已发布的权限文档文本（与开通链发
+        ``onboarding.completed`` 时 ``describe_scope(parse_permissions(...))`` 用的
+        同一来源）；快照不可用（被保留期擦除、当前版本没有已发布意图）时为 ``None``，
+        由调用方按渲染失败处理。"""
+
     def consume_preprovision_notice(self, *, user_id: str) -> bool:
-        """这个人有没有一句"你已经被提前开通了"还没说；命中即原子标记为已提示
+        """把"你已经被提前开通了"那句一次性提示原子标记为已提示
         （Issue #541 预开通，产品负责人裁定 4）。
 
         与 :meth:`consume_delivery_expired_notice` 同型：查询与标记落在同一条
         ``UPDATE``，与调用方所在的入站消息事务一起提交或回滚，因此"只提示一次"不依赖
         任何额外的读锁。**按用户**而不是按话题：预开通是给这个人开的，他第一次说话
         落在哪个话题上都算首聊。挂起端见
-        ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。"""
+        ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。
+        调用次序见 :meth:`peek_preprovision_notice`：渲染成功之后才允许消费。"""
 
     def list_user_memory(self, *, user_id: str) -> list[UserMemoryEntry]:
         """按用户取全部记忆，``/memory list`` 用（Issue #357 S-H3-3）。"""

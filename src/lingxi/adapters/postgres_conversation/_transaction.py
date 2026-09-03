@@ -14,6 +14,7 @@ from typing import Any
 from lingxi.core.conversation.ports import (
     ConversationRecord,
     HandledAs,
+    PendingPreprovisionNotice,
     UserRecord,
     UserState,
 )
@@ -461,14 +462,47 @@ class _Transaction:
         )
         return cursor.fetchone() is not None
 
+    def peek_preprovision_notice(self, *, user_id: str) -> PendingPreprovisionNotice | None:
+        """这个人有没有一句"你已经被提前开通了"还没说；有则只读返回渲染所需的权限
+        快照，**不消费**（rc25 修复包 F1，合同与调用次序见
+        ``core/conversation/ports.GatewayTransaction.peek_preprovision_notice``）。
+
+        权限快照的读取姿势与 ``postgres_late_readiness_recovery`` 的候选查询逐字同一
+        套判据：``status = 'published'``、``payload ? 'permissions'``（九十天保留期
+        会把 payload 擦成 ``'{}'``）、``permission_version`` 与 ``app_user`` 当前版本
+        对齐；``UNIQUE (user_id, permission_version)``（迁移 ``0064``）保证至多一行，
+        LEFT JOIN 落空时挂起仍然成立、快照为 ``None``，渲染失败与否交调用方裁量。
+        """
+
+        cursor = self._execute(
+            """
+            SELECT o.payload ->> 'permissions'
+              FROM app_user u
+              LEFT JOIN publish_outbox o
+                ON o.user_id = u.id
+               AND o.permission_version = u.permission_version
+               AND o.status = 'published'
+               AND o.payload ? 'permissions'
+             WHERE u.id = %s
+               AND u.preprovision_notice_armed_at IS NOT NULL
+               AND u.preprovision_notice_sent_at IS NULL
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return PendingPreprovisionNotice(permissions=row[0])
+
     def consume_preprovision_notice(self, *, user_id: str) -> bool:
-        """这个人有没有一句"你已经被提前开通了"还没说；命中即原子标记为已提示。
+        """把"你已经被提前开通了"那句一次性提示原子标记为已提示。
 
         合同见 ``core/conversation/ports.ConversationTransaction.consume_preprovision_
         notice``。挂起（``preprovision_notice_armed_at``）由预开通链在静默完成时写下，
         本方法只把它消费成 ``preprovision_notice_sent_at``——两列而不是一个布尔的理由
         见迁移 ``0087``：一个布尔分不清"从来没挂起过"与"挂起过、已经提示掉了"，同一份
-        名单重跑会把已经提示过的人重新挂起。
+        名单重跑会把已经提示过的人重新挂起。调用次序（先渲染成功、后消费）见
+        :meth:`peek_preprovision_notice`。
         """
 
         cursor = self._execute(
