@@ -723,13 +723,15 @@ Claude CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直
 `compose.stage.yaml`/`compose.prod.yaml` 里，只有需要单独调整某个服务时才需要
 在 `deploy/.env.stage`/`deploy/.env.prod` 里显式设置对应变量。
 
-**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并）：
+**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并；在持有真实
+凭据的机器上带 `--no-env-resolution`，见「安装与升级」的长期注意事项——`deploy:` 块的
+渲染结果不受该开关影响）：
 
 ```bash
 docker compose --env-file deploy/.env.stage \
-  -f deploy/compose.yaml -f deploy/compose.stage.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml config --no-env-resolution | grep -A4 'deploy:'
 docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution | grep -A4 'deploy:'
 ```
 
 **门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的
