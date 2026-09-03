@@ -417,6 +417,24 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 #    /opt/lingxi/scripts/{host_health_alert.py,collect-container-logs.sh,monitoring/*}
 #    /opt/lingxi/monitoring/{host-monitor.env,db-business.env,push.env}   均 0600
 
+# 1a.（root 级，列入产品负责人亲手放行清单）logrotate 配置到位：
+#     lingxi-logrotate.service 的 ExecStart 指向这个固定路径，配置不在时该 timer
+#     每小时 failed 一次、容器日志无上限增长（deploy/日志留存.md「已知限制」）
+sudo install -d -m 755 /etc/lingxi/logrotate.d
+sudo cp deploy/lingxi-container-logs.logrotate /etc/lingxi/logrotate.d/lingxi-container-logs
+
+# 1b.（root 级，同上）/var/log/lingxi 属主必须是本机部署用户。
+#     2026-09-03 生产实测：当前是 root:root 755，只有 monitoring/ 子目录是
+#     bi-ai-deploy 750——而收集脚本第一步就 chmod 0750 该目录，属主不对时
+#     set -e 直接退出、一行日志都不收（deploy/collect-container-logs.sh）：
+sudo chown bi-ai-deploy:bi-ai-deploy /var/log/lingxi
+sudo chmod 750 /var/log/lingxi
+
+# 1c. 回读（期望第一行 bi-ai-deploy:bi-ai-deploy 750，第二行同属主 750；
+#     以及 logrotate 配置文件存在）
+stat -c '%n %U:%G %a' /var/log/lingxi /var/log/lingxi/monitoring
+ls -l /etc/lingxi/logrotate.d/lingxi-container-logs
+
 # 2. 装单元本体（仓库单元里没有 User=）
 sudo install -m 644 deploy/monitoring-units/*.service \
   deploy/monitoring-units/*.timer /etc/systemd/system/
@@ -441,6 +459,12 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 **装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。
 
 **当前生产的实际状态（2026-09-02 只读实测，不代表已装齐）**：`lingxi-host-monitor`、`lingxi-resource-sample`、`lingxi-db-business-sample` 三个 timer 已装并在跑（`User=bi-ai-deploy`）；`lingxi-monitoring-push` 未装（等监控库角色）；**容器日志收集与轮转未装**（`/var/log/lingxi/` 下只有 `monitoring/`）——后者的取证代价见 `deploy/日志留存.md`「已知限制」。
+
+> **已知边界（rc25 登记，本批不修）**：`deploy/monitoring-units/` 的六个 `.service` 单元
+> 都**没有 `OnFailure=` 告警接线**——timer 或单元失败只留在 systemd 状态里，不会向任何
+> 渠道推送告警（告警目标单元本批不建；对应缺口 W0-12 因 D-25 缓议，由后续卡承接）。
+> 唯一的间接补偿是 host-monitor 的「采样停更」判定。补上之前，`systemctl list-timers
+> 'lingxi-*'` 的人工巡检是发现 timer 静默失败的唯一途径。
 
 ## 十一、实录偏差（2026-09-02 首发）
 
@@ -489,7 +513,7 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 
 ### 11.6 监控与备份
 
-- `deploy/monitoring-units/` 三个 `.service` 单元的 `User=` **硬编码为 stage 用户**，安装到 prod 时必须改成生产的部署用户，否则监控静默缺席。这三个单元用 systemd timer 触发（不是 cron），且 `enable` 必须放在服务起来之后——提前装会向管理群发假告警。
+- **（2026-09-03 更新：本条前半句的旧做法已作废，不得再照做。）** 首发当日 `deploy/monitoring-units/` 的 `.service` 单元 `User=` 硬编码为 stage 用户，当时的处置是安装到 prod 后手改单元文件；rc25 起仓库单元**已不含 `User=`**，该值一律由 §10.1 步 3 的本机 drop-in（`10-local.conf`）提供——**不得手工修改 `/etc/systemd/system` 下的单元文件**（红线三：不人工修改生产文件），单元安装与 `User=` 注入以 §10.1 为准。本条仍然成立的后半句：这些单元用 systemd timer 触发（不是 cron），且 `enable` 必须放在服务起来之后——提前装会向管理群发假告警。
 - `monitoring-push` 需要一个数据库监控角色，首发时未创建，**登记为观察期项**；三个采样 timer（主机健康、资源、数据库业务）已安装并各跑通一轮。
 - 容器日志留存（`deploy/日志留存.md`）首发未安装，留观察期补。
 - **`lingxi-prod` 没有备份点**（产品负责人 R8：首发豁免恢复演练）。过渡方案是由部署用户每日一次 `pg_dump -Fc` 到自己的目录（0600），首次 dump 在首批用户开通后立即执行；**产品负责人在托管控制台开启每日备份 / PITR 之后即撤销这个手工过渡**。`scripts/ops/backup_restore_drill.sh` 是演练脚本、不是备份计划，不能顶用。
