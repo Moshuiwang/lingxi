@@ -497,3 +497,120 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 ### 11.7 `deploy/README.md` 的一处表述已更正
 
 README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 与 `Dockerfile` 的对应注释里更正；本次首发在知情前提下接受镜像公开。**2026-09-03 更新**：改回 private 不再是观察期项——产品负责人裁定保持原状，保持公开是有裁定的终态（原因见 README 同一节）。
+
+## 十二、#541 预开通批量执行姿势（生产；rc25 补入）
+
+> **前提与去留**：本节只在「预开通名单（A-3）已到、且产品负责人裁定纳入本次窗口」时
+> 执行；**名单未到则本节整体移出本次升级窗口（块 Z），由产品负责人裁定顺延**，不影响
+> 本 runbook 其余步骤。执行时点在 §2.0-§2.5 升级完成、三服务 healthy、观察期通过之后
+> ——脚本走的开通链要用到本批新镜像与迁移 0087 的停滞收口接缝，旧镜像上不得执行。
+
+**登记一处脚本自述错误（照 docstring 跑必然失败）**：`scripts/ops/preprovision.py` 的
+docstring 与 CLI 描述给出的运行姿势指向 `/app/scripts/ops/preprovision.py`，但
+`.dockerignore` 排除了 `scripts/`、生产镜像里既没有 `/app` 目录也没有该文件——照抄
+docstring 执行会得到 `No such file`，退出码 2、名单一人未动。正确姿势见本节：**脚本
+本体经 stdin 喂给 scheduler 容器内的 Python**（脚本只依赖标准库与镜像内已装的
+`lingxi.*` 包），不进镜像、不在生产现场构建、不修改任何生产文件。docstring 本身的修正
+属代码面，不在本节范围。
+
+### 12.1 输入投放：名单进容器
+
+名单 CSV（三列 `email,position,company_scope`，形态与整份拒绝规则见脚本 docstring）
+先落到部署用户目录——**输入投放，允许**；名单含邮箱等人员数据，目录 0700、文件 0600：
+
+```bash
+umask 077
+mkdir -p /home/bi-ai-deploy/rc25-preprovision
+# 名单由产品负责人提供后写入 /home/bi-ai-deploy/rc25-preprovision/roster.csv（0600）
+```
+
+再从仓库工作副本目录把名单拷进 scheduler 容器的 `/tmp`（16m tmpfs：够放名单，随容器
+重启自动消失，不在生产留持久文件）：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  cp /home/bi-ai-deploy/rc25-preprovision/roster.csv scheduler:/tmp/roster.csv
+
+# 可读性回读（必做）：docker cp 按归档语义保留宿主文件的权限位、落进容器后属 root——
+# 宿主 0600 的名单在容器内对 uid 10001 不可读。这条以容器默认用户读一次行数：
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler wc -l /tmp/roster.csv
+```
+
+`wc -l` 报 Permission denied 时，改用 stdin 投放（以容器默认用户 uid 10001 写入，绕开
+属主问题，效果等价；两条路都不动生产文件）：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler sh -c 'cat > /tmp/roster.csv' \
+  < /home/bi-ai-deploy/rc25-preprovision/roster.csv
+```
+
+### 12.2 dry-run → 产品负责人过目计数 → `--apply` → 幂等复跑
+
+脚本本体经 stdin 执行（`python -B -` 读标准输入）。参数按脚本真实 argparse 接口：
+位置参数 = 容器内名单路径；`--initiated-by` 必填，且必须是 `admin_registry` 里一位
+生效的已登记管理员（不是则退出码 2、零写入，dry-run 也过这一关）；DSN 缺省读容器
+环境的 `LINGXI_POSTGRES_DSN`（scheduler 容器已有，不需要传 `--dsn`）：
+
+```bash
+# ① dry-run（默认即 dry-run：不带 --apply 就是零写入，结构上不调用开通入口）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --initiated-by <管理员 open_id> \
+  < scripts/ops/preprovision.py
+```
+
+产品负责人逐行核对 dry-run 清单（逐人「邮箱 → 职位 → 公司范围 → 将获得的公司×指标
+条数」与末尾合计）**无误并放行后**，同一条命令追加 `--apply` 真正执行。**参数必须写
+全称**：脚本的 argparse 未关闭前缀缩写，`--ap` 这类唯一前缀也会被解析成 `--apply`
+真执行——窗口内只接受逐字的 `--apply`。
+
+**时长预期（rc25 审核裁定，写给窗口排程）**：逐人**同步**执行，单人最长约 **17 分钟**
+——大头是发布后的 MCP 就绪确认（首探即发、之后每 180 秒一次、总预算 900 秒共 6 次
+探针、单次探针超时 20 秒，见 `src/lingxi/core/permission/mcp_readiness.py`），加上身份
+定位/建档/权限发布等其余同步步骤。名单 N 人的最坏上界按 N×17 分钟排；正常路径远快于
+此（就绪即回）。**多人名单不要挂在交互终端里裸等**：用 nohup 后台执行（或在 tmux 窗口
+内前台跑，等价），把输出落进部署用户目录——日志含邮箱与逐人结果，先 `umask 077`：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+umask 077
+nohup docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --initiated-by <管理员 open_id> --apply \
+  < scripts/ops/preprovision.py \
+  > /home/bi-ai-deploy/rc25-preprovision/apply-$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 &
+# 之后 tail -f 该日志观察进度
+```
+
+**日志落点即失败清单**：脚本结尾打印逐人终态（`provisioned` / `skipped` /
+`failed_<异常类型>`）与三项计数，并明言「跑完即散、请自行保存」——这份日志就是唯一的
+逐人报告，**失败清单可据以重跑**。复跑同一份名单是安全的：重复预授权在库内撞唯一约束
+按 `already_present` 降级、开通链对已完成的人按既有幂等语义处理；更干净的做法是把名单
+裁剪到失败者，重新走一轮 dry-run → `--apply`。**同一时刻只允许一份名单在跑**，不并行
+起第二个批次——脚本的在职回读会消费当天专用凭据续期预算里的一次（常驻 scheduler 日报
+侧那一次可能因此推迟到下一窗口，已知代价），并行没有收益还违反单写入者纪律。
+
+跑完清理（谁建谁清；容器 `/tmp` 是 tmpfs、重启也会自清，这里显式清是不把人员数据留给
+下一步）：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler rm -f /tmp/roster.csv
+# 宿主侧名单与日志按产品负责人指示保存或删除，不长期留在部署用户目录
+```
+
+### 12.3 窗口前真机确认清单（只读，未确认不执行本节）
+
+| # | 要证明什么 | 只读命令（在 `/home/bi-ai-deploy/projects/lingxi` 下） | 期望 |
+| --- | --- | --- | --- |
+| 1 | 本机 compose 支持 `cp` 子命令 | `docker compose cp --help` | 打印用法而不是 unknown command |
+| 2 | 容器内 Python 可执行 stdin 脚本 | `echo 'print("stdin-ok")' \| docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml exec -T scheduler python -B -` | 输出 `stdin-ok` |
+| 3 | 名单拷入后对容器用户可读 | 12.1 的 `wc -l` 回读 | 行数 = 名单数据行数 + 1（表头） |
+| 4 | `--initiated-by` 是生效管理员 | 由 ① dry-run 自查（不是则退出 2、零写入） | dry-run 正常打印清单与计数 |
