@@ -2289,3 +2289,33 @@ class MultiTokenLinkifiedCommandRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class DocumentDeliveryReasonLabelCoverageTests(unittest.TestCase):
+    """新增降级原因码却忘了登记显示名，`/admin trace` 会退化成「原值（未登记显示名）」。
+
+    这是一条**真实发生过**的遗漏：Trace #544 S-7c 改走服务端一次建档，新增
+    `body_too_long` / `title_not_embeddable` / `server_simplified_body` 三个码，
+    三个都没进词表——而这恰恰是管理员最常需要解释给用户听的三种情况。
+
+    兜底样式本身是对的（不吞掉、不假装认识），但它是**兜底**，不该成为常态。
+    这条用例把「适配器定义了什么码」和「管理台认识什么码」绑在一起：加码不加
+    词条就变红，不必依赖谁记得。
+    """
+
+    def test_every_degrade_reason_the_adapter_can_emit_has_a_display_name(self) -> None:
+        from lingxi.adapters import feishu_docx_delivery
+        from lingxi.core.admin.router import _DOCUMENT_DELIVERY_REASON_LABEL
+
+        emitted = {
+            feishu_docx_delivery.BODY_TOO_LONG,
+            feishu_docx_delivery.TITLE_NOT_EMBEDDABLE,
+            feishu_docx_delivery.SERVER_SIMPLIFIED_BODY,
+        }
+        missing = sorted(emitted - set(_DOCUMENT_DELIVERY_REASON_LABEL))
+        self.assertEqual(
+            missing,
+            [],
+            "这些降级原因码适配器会发出、但管理台没有显示名，`/admin trace` 会显示成"
+            "「原值（未登记显示名）」：" + ", ".join(missing),
+        )

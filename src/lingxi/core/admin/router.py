@@ -1240,6 +1240,12 @@ _DOCUMENT_DELIVERY_REASON_LABEL: dict[str, str] = {
     "pending_expired_unconsumed": "排队超时未被消费",
     "permission_not_confirmed": "授权结果未能读回确认",
     "unsupported_nested_blocks": "正文含无法定位的块结构",  # #538 起表格已支持，这个码只剩"无处安放的块"
+    # Trace #544 S-7c 改走服务端一次建档后新增的三个码。不登记的后果不是报错，
+    # 而是 `/admin trace` 把机器码原样显示成"body_too_long（未登记显示名）"——
+    # 管理员看得懂但要多猜一步，而这三个码恰恰是他最常需要解释给用户听的三种。
+    "body_too_long": "正文过长，已改走纯文本段落",
+    "title_not_embeddable": "标题含特殊字符，已改走纯文本段落",
+    "server_simplified_body": "飞书自动排版时简化了部分结构",
 }
 
 
