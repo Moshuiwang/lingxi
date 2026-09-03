@@ -208,7 +208,10 @@ version = "2026-09-03-3"
 # 为什么简化、以及一个用户自己能执行的下一步。三条撰写约束，改文案时逐条守住：
 #   1. **不得暗示格式完好**。段落路径来自 normalize_markdown 的产物：表格被拍平
 #      成一段长文本，`|` 与 `---` 这类分隔符号会原样留在正文里。本降级解决的是
-#      "拿不到"，不保证"好看"（见 adapters/feishu_docx_delivery.py::write_body）。
+#      "拿不到"，不保证"好看"（rc25 S-7c 起正常路是 docs_ai 一次建档
+#      adapters/feishu_docx_delivery.py::create_document_with_markdown，降级才
+#      回落两步段落路径 create_document + write_paragraphs；旧引用 write_body
+#      已随该机制删除——rc25 修复包 F6 更正）。
 #   2. **不得举例说是哪一种结构**（rc25 S-8b，#541 A-7，产品负责人 2026-09-02 裁定）。
 #      原句写的是"例如表格"，而 #538 修好之后含 markdown 表格的答案**不再降级**——
 #      把表格举成例子已经是假话。unsupported_nested_blocks 的完整触发面（引用块、
