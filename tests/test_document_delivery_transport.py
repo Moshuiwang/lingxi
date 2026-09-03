@@ -1800,13 +1800,14 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         )
 
     def _claim(
-        self, *, markdown: str | None, document_id: str | None = None, body_degraded_reason: str | None = None
+        self, *, markdown: str | None, document_id: str | None = None,
+        body_degraded_reason: str | None = None, title: str = "标题",
     ) -> DocumentDeliveryClaim:
         return DocumentDeliveryClaim(
             id="tdd-wire-1",
             task_id="tsk-wire-1",
             requester_open_id=self.OPEN_ID,
-            title="标题",
+            title=title,
             paragraphs=("正文段落",),
             document_id=document_id,
             attempts=1,
@@ -1977,10 +1978,41 @@ class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
         self.assertEqual(events, ["degrade_checkpoint", "write_paragraphs"], "降级检查点必须在写正文之前提交")
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertIn("格式做了简化", notifier.sent[0][1])
-        # rc25 S-5c：前置守卫这一路**仍走** delivery.document_ready_degraded——
-        # 它确实是我们主动改走的段落路径，内容一个字没少，那句担保对它成立。
-        # 把两路都改成新文案 → 这条断言变红。
-        self.assertIn("内容本身没有删减", notifier.sent[0][1])
+        # rc25 修复包 F4：这一路的真实原因是**长度**，不是"回答里有暂时无法排版
+        # 的结构"——旧文案对这个来源是假归因。按来源分派专条、如实说超长；同时
+        # 不再承诺"内容本身没有删减"（对新增来源不作我们无法逐字验证的担保）。
+        # 把分派收回单条旧文案 → 这三句断言变红。
+        self.assertIn("超出了带格式排版的长度上限", notifier.sent[0][1])
+        self.assertNotIn("无法排版的结构", notifier.sent[0][1])
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
+
+    def test_an_unembeddable_title_degrades_with_a_truthful_title_attribution(self) -> None:
+        """**标题前置守卫的文案归因**（rc25 修复包 F4）：``title_not_embeddable``
+        的真实原因是标题形态（含 ``<``/``>``，嵌不进一次排版写入的标题标签），
+        不是"回答里有暂时无法排版的结构"——归因按来源如实分派专条，且不承诺
+        "内容本身没有删减"。守卫本身照旧：一次建档调用一次都不发，改走两步
+        段落路径并落 ``title_not_embeddable`` 检查点。"""
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落", title="含<尖括号>的标题")
+
+        store, notifier = self._consume(transport, claim)
+
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(store.body_degraded, [("tdd-wire-1", "title_not_embeddable")])
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertIn("标题里含有带格式排版暂不支持的特殊字符", notifier.sent[0][1])
+        self.assertIn("格式做了简化", notifier.sent[0][1])
+        self.assertNotIn("无法排版的结构", notifier.sent[0][1])
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
 
     def test_a_gateway_timeout_is_uncertain_and_never_creates_a_second_document(self) -> None:
         """**超时一律不重试建档**：一次建档返回 HTTP 504（响应体带

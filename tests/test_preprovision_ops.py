@@ -259,6 +259,45 @@ class PerPersonFailureIsolationTest(unittest.TestCase):
         self.assertEqual((report.provisioned, report.skipped, report.failed), (0, 1, 0))
         self.assertEqual(report.outcomes[0].reason, "email_multiple_personnel")
 
+    def test_an_already_active_user_with_an_unapplied_grant_is_not_a_success(self) -> None:
+        """rc25 修复包 F2：开通链对已 active 的人提前收口（终态 completed 但
+        ``grant_not_applied=True``）时，清单必须单列 ``already_active_grant_not_
+        applied``、不计入成功——把「名单答应的权限没落」报成 provisioned，产品负责人
+        就会拿着一份写着"都办妥了"的清单收工。"""
+
+        items = TOOL.plan_preprovision(
+            (TOOL.RosterRow(email="a@b.com", position_name="A国家总经理", company_scope="1011"),),
+            role_function_map=ROLE_MAP,
+            company_function_metric_map=COMPANY_MAP,
+        )
+
+        class _Result:
+            state = "completed"
+            failure_reason = None
+            grant_not_applied = True
+
+        report = TOOL.run_preprovision(
+            items,
+            start_system=lambda **_: _Result(),
+            initiated_by_open_id="ou_admin",
+            trace_id_factory=lambda: "trace",
+        )
+
+        self.assertEqual(
+            (report.provisioned, report.skipped, report.failed, report.grant_not_applied),
+            (0, 0, 0, 1),
+        )
+        self.assertEqual(
+            report.outcomes[0].outcome, TOOL.OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
+        )
+        rendered = io.StringIO()
+        with redirect_stdout(rendered):
+            TOOL.print_report(report)
+        printed = rendered.getvalue()
+        self.assertIn("already_active_grant_not_applied", printed)
+        self.assertIn("成功 0", printed, "不计入 provisioned 成功数")
+        self.assertIn("未应用", printed, "汇总必须醒目提示，不靠人肉逐行看")
+
 
 class CommandLineWritePolarityTest(unittest.TestCase):
     """写入极性：默认只出清单、零写入；`--apply` 才真正执行。"""
@@ -326,6 +365,21 @@ class CommandLineWritePolarityTest(unittest.TestCase):
         "a@b.com,A国家总经理,1011\n"
         "c@d.com,A国家财务总监,1012\n"
     )
+
+    def test_an_abbreviated_flag_is_rejected_with_zero_side_effects(self) -> None:
+        """rc25 修复包 F5：argparse 前缀缩写关闭（``allow_abbrev=False``）。``--a``
+        不得被解析成 ``--apply``——对一个"传了就真写库"的开关，手滑半个词不能等于
+        授权执行（本项目历史上被外部审查抓到过 ``--e`` 缩写即触发真实执行的同型
+        缺陷）。缩写被拒必须：退出码非 0、开通入口一次都不调用、装配一次都不发生。"""
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                TOOL.main(self._argv(self.ROSTER) + ["--a"])
+
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertEqual(self.started, [], "缩写被拒＝零副作用：开通入口一次都不调用")
+        self.assertEqual(self.shutdowns, [], "解析都没通过，不应发生任何真实装配")
 
     def test_the_default_run_only_prints_the_plan_and_writes_nothing(self) -> None:
         code, out, _ = self._run(self._argv(self.ROSTER))

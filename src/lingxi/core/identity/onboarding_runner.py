@@ -170,6 +170,7 @@ from __future__ import annotations
 import logging
 import threading
 import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -920,6 +921,10 @@ class AutoOnboardingRunner:
             user_id, aggregate=aggregate, trace_id=trace_id
         )
         if recheck is not None:
+            if grant is not None and recheck.state is OnboardingState.COMPLETED:
+                # rc25 修复包 F2：已 active 提前收口，名单预授权没走到下面的落库口。
+                # 绝不静默扩权，只如实标注给批量清单（语义见 OnboardingResult 文档）。
+                return replace(recheck, grant_not_applied=True)
             return recheck
 
         # 银河翻译只算一次（rc25 S-1），翻译失败在这里 fail-closed（早于令牌与环境）。

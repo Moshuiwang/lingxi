@@ -138,15 +138,18 @@ False``（响应体里那个 ``code=2200`` 不具备判别力）；(b) 本模块
 失败。可观测性由上面第 1、3 两项承担（库里一列 ＋ 结构化日志），与
 ``_fail``/``_uncertain`` 的告警面刻意分开。
 
-**就绪文案按降级来源分派两条（rc25 S-5c 补，Trace #544；S-7c 登记的缺口已关闭）**：
-``delivery.document_ready_degraded`` 是为**段落路径**写的——"文档已按纯文本段落
-交付……内容本身没有删减"对两个前置守卫逐字准确（那两种情况是我们主动改走段落
-路径，内容一个字没少），历史行的 ``unsupported_nested_blocks`` 同样走这条路。
-``server_simplified_body`` 改用新增的 ``delivery.document_ready_simplified``：
-那篇文档其实仍然是带格式的（"已按纯文本段落交付"是假话），而"内容本身没有删减"
-在服务端静默丢块（探针实测原始 HTML 块被丢弃且不产生任何 warning）时可能失实
-——新文案只说"格式做了简化、个别不支持的结构可能没有呈现出来"，不做那句担保，
-并请用户打开核对。分派见 :meth:`DocumentDeliveryConsumer._send_ready_notice`。
+**就绪文案按降级来源逐条分派（rc25 S-5c 开机制，修复包 F4 补全）**：
+每条文案的归因必须对它的触发源逐字为真。``server_simplified_body`` 走
+``delivery.document_ready_simplified``——那篇文档其实仍然是带格式的（"已按纯文本
+段落交付"是假话），而"内容本身没有删减"在服务端静默丢块（探针实测原始 HTML 块
+被丢弃且不产生任何 warning）时可能失实，新文案不做那句担保并请用户打开核对。
+两道前置守卫各有专条（F4：旧文案把它们归因为"回答里有暂时无法排版的结构"，而
+真实原因是**长度**与**标题形态**，归因是假话）——``body_too_long`` 走
+``delivery.document_ready_degraded_too_long``，``title_not_embeddable`` 走
+``delivery.document_ready_degraded_title``；两条新文案同样不承诺"内容本身没有
+删减"。``delivery.document_ready_degraded`` 从此只服务历史行的
+``unsupported_nested_blocks``（"有暂时无法排版的结构……已按纯文本段落交付"对它
+逐字准确）。分派见 :meth:`DocumentDeliveryConsumer._send_ready_notice`。
 
 **这条降级是"拿得到"，不是"好看"**：段落路径来自 ``paragraphs`` 列，表格会被
 拍平成一段长文本、``|---|`` 分隔行原样留在正文里——用户文案不得暗示格式完好，
@@ -799,7 +802,11 @@ class DocumentDeliveryConsumer:
         的行，不需要在这里额外判断"这是不是补发"。
         """
 
-        from lingxi.adapters.feishu_docx_delivery import SERVER_SIMPLIFIED_BODY
+        from lingxi.adapters.feishu_docx_delivery import (
+            BODY_TOO_LONG,
+            SERVER_SIMPLIFIED_BODY,
+            TITLE_NOT_EMBEDDABLE,
+        )
 
         try:
             if delivery_type == DELIVERY_TYPE_SHEET:
@@ -817,15 +824,18 @@ class DocumentDeliveryConsumer:
                 # 拿到的排版与他本该拿到的不同——必须用如实说明"格式已简化"的
                 # 那条文案，不能沿用普通就绪文案。
                 #
-                # **按降级原因分派两条文案**（rc25 S-5c，Trace #544）：
-                # ``delivery.document_ready_degraded`` 说"已按纯文本段落交付
-                # ……内容本身没有删减"，这对**段落路径**逐字准确——两个前置守卫
-                # （``PRE_FLIGHT_DEGRADE_REASONS``）与历史行的
-                # ``unsupported_nested_blocks`` 都是这条路。但
-                # ``server_simplified_body`` 是飞书服务端自己简化的：文档其实
-                # 仍然带格式，而"内容没有删减"在服务端**静默丢块**时可能失实
-                # （探针实测：原始 HTML 块被丢弃且不产生 warning），因此它单独
-                # 走 ``delivery.document_ready_simplified``，不做那句担保。
+                # **按降级原因逐来源分派**（rc25 S-5c 开的机制，修复包 F4 补全）：
+                # 每条文案的归因必须对它的触发源逐字为真——
+                # - ``server_simplified_body``：飞书服务端自己简化的，文档其实
+                #   仍然带格式，而"内容没有删减"在服务端**静默丢块**时可能失实
+                #   （探针实测：原始 HTML 块被丢弃且不产生 warning）→
+                #   ``delivery.document_ready_simplified``，不做那句担保；
+                # - ``body_too_long`` / ``title_not_embeddable``（前置守卫）：真实
+                #   原因是**长度**与**标题形态**，不是"无法排版的结构"——归因按
+                #   来源如实各说各的（F4：旧文案对这两个来源是假归因）；
+                # - 其余（历史行的 ``unsupported_nested_blocks``）：留在
+                #   ``delivery.document_ready_degraded``，"回答里有暂时无法排版的
+                #   结构……已按纯文本段落交付"对它逐字准确。
                 # **默认落在段落路径那条**：未来新增的原因码在补上分派之前先
                 # 说"已按段落交付"，是可被用户当场证伪的过度告知，不是一句
                 # 用户无法察觉的假担保。
@@ -833,6 +843,10 @@ class DocumentDeliveryConsumer:
                     content_key = "delivery.document_ready"
                 elif body_degraded_reason == SERVER_SIMPLIFIED_BODY:
                     content_key = "delivery.document_ready_simplified"
+                elif body_degraded_reason == BODY_TOO_LONG:
+                    content_key = "delivery.document_ready_degraded_too_long"
+                elif body_degraded_reason == TITLE_NOT_EMBEDDABLE:
+                    content_key = "delivery.document_ready_degraded_title"
                 else:
                     content_key = "delivery.document_ready_degraded"
                 # 去重前缀刻意**三条文案共用**：原发送与补发是同一条通知的两次

@@ -22,6 +22,7 @@ from lingxi.core.conversation.ports import (
     OnboardingResult,
     OnboardingState,
     PendingOnboarding,
+    PendingPreprovisionNotice,
     UserRecord,
     UserState,
 )
@@ -168,6 +169,11 @@ class FakeState:
     # test_gateway_pipeline.py 的专项用例断言首聊补一句的触发与只提示一次；默认空
     # 集合，绝大多数既有用例因此不受影响（与上面那条同一条纪律）。
     pending_preprovision_notices: set[str] = field(default_factory=set)
+    # rc25 修复包 F1：挂起用户对应的「当前版本已发布权限文档文本」（真库来源是
+    # ``publish_outbox.payload->'permissions'``）。缺项 = 快照不可用（保留期擦除、
+    # 无已发布意图），peek 会返回 ``permissions=None``——用例据此覆盖"渲染失败不
+    # 烧标志"的路径；默认空字典，绝大多数既有用例不受影响。
+    preprovision_permissions: dict[str, str] = field(default_factory=dict)
     # Issue #65 轻审 P2-2：迁移 0062 那一列（``onboarding_dispatched_at``）的内存
     # 对应物——记下哪些事件已经确认交给开通编排。
     # 事件标识 → 认领代次（或 ``_MARKED``，表示「已平账」而不是「被谁认领着」）。
@@ -356,6 +362,15 @@ class FakeTransaction:
         # adapters.postgres_conversation）。
         self._state.pending_delivery_expired_notices.discard(conversation_id)
         return True
+
+    def peek_preprovision_notice(self, *, user_id: str) -> PendingPreprovisionNotice | None:
+        self._log.add("store.peek_preprovision_notice", user_id=user_id)
+        if user_id not in self._state.pending_preprovision_notices:
+            return None
+        # 与真实实现同语义：只读，不摘除；快照缺项时返回 permissions=None。
+        return PendingPreprovisionNotice(
+            permissions=self._state.preprovision_permissions.get(user_id)
+        )
 
     def consume_preprovision_notice(self, *, user_id: str) -> bool:
         self._log.add("store.consume_preprovision_notice", user_id=user_id)

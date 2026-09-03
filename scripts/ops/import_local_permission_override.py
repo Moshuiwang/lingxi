@@ -642,7 +642,11 @@ def _print_plan(plan: ImportPlan) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="旧表权限差集导入为管理员本地授权（Issue #441）")
+    # allow_abbrev=False（rc25 修复包 F5）：与 scripts/ops/preprovision.py 同一条
+    # 纪律——`--a`/`--ap` 这类前缀缩写不得被解析成 `--apply`，手滑不等于授权执行。
+    parser = argparse.ArgumentParser(
+        description="旧表权限差集导入为管理员本地授权（Issue #441）", allow_abbrev=False
+    )
     parser.add_argument("legacy_export", type=Path, help="旧表只读导出快照（CSV，见脚本文档「输入一」）")
     parser.add_argument(
         "--initiated-by", required=True, dest="initiated_by_open_id",

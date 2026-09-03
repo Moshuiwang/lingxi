@@ -70,17 +70,20 @@ MOMENT = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
 
 def _candidate(
-    *, user_id: str = USER_A, version: int = VERSION, next_attempt_no: int = 8
+    *, user_id: str = USER_A, version: int = VERSION, next_attempt_no: int = 8,
+    system_triggered: bool = False,
 ) -> SimpleNamespace:
     """真实 ``LateOnboardingCandidate`` 的最小形状。**刻意不含 ``already_ready``**
     （F2）：任何试图读它的实现会在这里直接 ``AttributeError``，而不是安静地拿到
-    一个默认值。"""
+    一个默认值。``system_triggered``（rc25 修复包 F3）：预开通 origin 的链，恢复
+    完成必须静默。"""
 
     return SimpleNamespace(
         user_id=user_id,
         permission_version=version,
         permissions=PERMISSIONS,
         next_attempt_no=next_attempt_no,
+        system_triggered=system_triggered,
     )
 
 
@@ -181,6 +184,8 @@ class FakeLateReadinessStore:
         #: （F3 的 duty 级证据：探针绑定的版本必须原样传给 CAS，不能被换成别的值）。
         self._current_versions = current_versions or {}
         self.activate_calls: list[tuple[str, int]] = []
+        #: rc25 修复包 F3：静默完成（挂起首聊补一句）的用户，供否定用例断言。
+        self.armed_silently: list[str] = []
         self._notices: dict[str, dict] = {}
         self._by_dedupe: dict[str, str] = {}
         self._seq = 0
@@ -193,6 +198,7 @@ class FakeLateReadinessStore:
         company_name: str,
         function_name: str,
         dedupe_key: str,
+        silent_system_trigger: bool = False,
     ) -> bool:
         self.activate_calls.append((user_id, expected_permission_version))
         if not self._allow.get(user_id, True):
@@ -202,6 +208,11 @@ class FakeLateReadinessStore:
             # 模拟真实 CAS 的 ``AND permission_version = %(expected)s``：版本对不上
             # 就拒绝，不写任何东西。
             return False
+        if silent_system_trigger:
+            # 与真实实现同语义（rc25 修复包 F3）：系统触发不排任何通知，改挂首聊
+            # 补一句；这里只记录"挂起发生过"，供否定用例断言零出站。
+            self.armed_silently.append(user_id)
+            return True
         if dedupe_key not in self._by_dedupe:
             self._seq += 1
             notice_id = f"obn_{self._seq}"
@@ -418,6 +429,49 @@ class ReadyCandidateTest(unittest.TestCase):
         values = seams["notifier"].calls[0]["values"]
         self.assertEqual(values["company_name"], "2022")
         self.assertEqual(sorted(values["function_name"].split("、")), ["收入", "留存"])
+
+
+class PreprovisionSilentRecoveryTest(unittest.TestCase):
+    """rc25 修复包 F3：系统触发（预开通）的迟到就绪恢复**静默完成**。
+
+    产品负责人裁定 4：预开通全程静默、首聊时才补一句。恢复完成的「开通完成」私聊
+    对预开通用户违反这条承诺，因此：状态照常推进 active，但**不排任何通知**，改在
+    同一个原子事务里挂起首聊补一句（适配器行为见
+    ``tests/test_postgres_late_readiness_recovery.py``）。用户自己发起的链一字不变
+    （本文件其余用例全部跑在 ``system_triggered=False`` 上，就是那半边的钉子）。
+    """
+
+    def test_a_preprovisioned_recovery_activates_without_any_outbound_message(self) -> None:
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate(system_triggered=True)),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(report.activated, 1, "静默不等于不恢复：照常推进 active")
+        self.assertEqual(report.activated_silently, 1)
+        self.assertEqual(seams["notifier"].calls, [], "预开通 origin 不产生任何出站消息")
+        self.assertEqual(seams["store"].armed_silently, [USER_A], "改挂首聊补一句")
+        self.assertEqual(report.notices_claimed, 0, "没有任何通知进 outbox")
+
+        # 第二轮（通知面独立运行）也不得凭空长出消息。
+        second = duty.run_once()
+        self.assertEqual(seams["notifier"].calls, [])
+        self.assertEqual(second.notified, 0)
+
+    def test_the_silent_completion_leaves_an_audit_trail(self) -> None:
+        """静默路径的审计不能少：这条审计是这次恢复在观测面上唯一的完成记录。"""
+
+        duty, seams = build_duty(
+            candidates=FakeCandidates(_candidate(system_triggered=True)),
+            ticker=FakeTicker({USER_A: ReadinessOutcome.READY}),
+        )
+        duty.run_once()
+        self.assertIn(
+            "late_readiness_recovery.activated_silently",
+            [action for action, _ in seams["audit"].records],
+        )
 
 
 class NotReadyCandidateTest(unittest.TestCase):

@@ -254,6 +254,7 @@ class _Activator(Protocol):
         company_name: str,
         function_name: str,
         dedupe_key: str,
+        silent_system_trigger: bool = False,
     ) -> bool: ...
 
 
@@ -299,9 +300,14 @@ class LateReadinessRecoveryReport:
     examined: int = 0
     #: 本轮探到就绪的候选数。
     ready: int = 0
-    #: 真正被推进到 ``active``（且成功排出待发通知）的人数。可能小于 ``ready``
-    #: （账号在这期间被停用，或权限版本已经变了，CAS 拒绝）。
+    #: 真正被推进到 ``active`` 的人数（用户发起的链同时排出待发通知；系统触发的
+    #: 链改为静默挂起首聊补一句，另计入 :attr:`activated_silently`）。可能小于
+    #: ``ready``（账号在这期间被停用，或权限版本已经变了，CAS 拒绝）。
     activated: int = 0
+    #: 其中系统触发（预开通，rc25 修复包 F3）**静默**完成的人数：不发「开通完成」
+    #: 私聊（产品负责人裁定 4：预开通全程静默、首聊时补一句）。单独计数是为了让
+    #: 「activated 有增长、通知面却一条都没经手」读得通。
+    activated_silently: int = 0
     advance_refused: int = 0
     waiting: int = 0
     technical_failures: int = 0
@@ -327,6 +333,7 @@ class LateReadinessRecoveryReport:
             "examined": self.examined,
             "ready": self.ready,
             "activated": self.activated,
+            "activated_silently": self.activated_silently,
             "advance_refused": self.advance_refused,
             "waiting": self.waiting,
             "technical_failures": self.technical_failures,
@@ -350,6 +357,7 @@ class _Tally:
     examined: int = 0
     ready: int = 0
     activated: int = 0
+    activated_silently: int = 0
     advance_refused: int = 0
     waiting: int = 0
     technical_failures: int = 0
@@ -365,6 +373,7 @@ class _Tally:
             examined=self.examined,
             ready=self.ready,
             activated=self.activated,
+            activated_silently=self.activated_silently,
             advance_refused=self.advance_refused,
             waiting=self.waiting,
             technical_failures=self.technical_failures,
@@ -602,6 +611,10 @@ class LateReadinessRecoveryDuty:
                 company_name=company,
                 function_name=function,
                 dedupe_key=dedupe_key,
+                # rc25 修复包 F3：系统触发（预开通）的链**不发**「开通完成」私聊
+                # ——产品负责人裁定 4 是全程静默、首聊时补一句；适配器在同一个原子
+                # 事务里改挂首聊补一句。用户自己发起的链一字不变。
+                silent_system_trigger=item.system_triggered,
             )
         except Exception as error:  # noqa: BLE001 - 占住窗口，再让外层记 failed 并上抛
             self._ticker.record_processing_failure(
@@ -621,8 +634,15 @@ class LateReadinessRecoveryDuty:
             )
             return
         tally.activated += 1
-        # 通知已经在同一个事务里排进 outbox（or 已存在同 dedupe_key 的一条），
-        # 发送由 _drain_notices 独立完成——这里不再做任何发送尝试。
+        if item.system_triggered:
+            # 静默完成（rc25 修复包 F3）：没有任何通知会进 outbox，这条审计是这次
+            # 恢复在观测面上唯一的"完成"记录，缺了它运维只能从状态对比里猜。
+            tally.activated_silently += 1
+            self._audit.record(
+                "late_readiness_recovery.activated_silently", user=item.user_id
+            )
+        # 用户发起的链：通知已经在同一个事务里排进 outbox（or 已存在同 dedupe_key 的
+        # 一条），发送由 _drain_notices 独立完成——这里不再做任何发送尝试。
 
     # ------------------------------------------------------------------
     # 通知阶段

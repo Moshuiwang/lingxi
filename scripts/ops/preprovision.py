@@ -154,6 +154,11 @@ ROSTER_COLUMNS = ("email", "position", "company_scope")
 OUTCOME_PROVISIONED = "provisioned"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED_PREFIX = "failed_"
+#: rc25 修复包 F2：开通链在续行前复核发现这个人**已经 active**、提前收口，名单答应
+#: 的那笔预授权**没有落库**（落库口排在复核之后）。终态虽是 completed，但把它计成
+#: "成功预开通"就是把「权限没给」报成「都办妥了」——单独归类、不进 provisioned。
+#: 要不要给已 active 用户补上名单权限是产品语义，等产品负责人裁定后另行处理。
+OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED = "already_active_grant_not_applied"
 
 
 class RosterError(ValueError):
@@ -213,6 +218,14 @@ class PreprovisionReport:
     @property
     def failed(self) -> int:
         return sum(1 for item in self.outcomes if item.outcome.startswith(OUTCOME_FAILED_PREFIX))
+
+    @property
+    def grant_not_applied(self) -> int:
+        return sum(
+            1
+            for item in self.outcomes
+            if item.outcome == OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED
+        )
 
 
 def load_roster(path: Path) -> tuple[RosterRow, ...]:
@@ -361,6 +374,14 @@ def _classify(email: str, result: Any) -> PersonOutcome:
     state_value = getattr(state, "value", state)
     reason = getattr(result, "failure_reason", None)
     if state_value == "completed":
+        if getattr(result, "grant_not_applied", False):
+            # rc25 修复包 F2：已 active、名单授权没落——不计成功，醒目单列
+            # （见 OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED 旁注）。
+            return PersonOutcome(
+                email=email,
+                outcome=OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED,
+                reason="user_already_active",
+            )
         return PersonOutcome(email=email, outcome=OUTCOME_PROVISIONED)
     return PersonOutcome(
         email=email,
@@ -375,11 +396,18 @@ def print_report(report: PreprovisionReport) -> None:
     print("逐人结果：")
     for item in report.outcomes:
         suffix = f" reason={item.reason}" if item.reason else ""
-        print(f"  - {item.email} {item.outcome}{suffix}")
+        marker = "  ! " if item.outcome == OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED else "  - "
+        print(f"{marker}{item.email} {item.outcome}{suffix}")
     print(
         f"预开通完成：成功 {report.provisioned}、跳过 {report.skipped}、失败 {report.failed}"
         f"（共 {len(report.outcomes)} 人）。"
     )
+    if report.grant_not_applied:
+        print(
+            f"注意：{report.grant_not_applied} 人已是 active、名单预授权未应用"
+            f"（{OUTCOME_ALREADY_ACTIVE_GRANT_NOT_APPLIED}）——不计入成功；"
+            "是否给已 active 用户补授权待产品负责人裁定，本脚本不静默扩权。"
+        )
     print("本清单不落库（仓库没有 audit_event 表，审计出口是结构化日志），请自行保存。")
 
 
@@ -499,7 +527,10 @@ _CLI_DESCRIPTION = (
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=_CLI_DESCRIPTION)
+    # allow_abbrev=False（rc25 修复包 F5）：argparse 默认接受前缀缩写，`--a` 会被
+    # 解析成 `--apply`——对一个"传了就真写库"的开关，手滑半个词不能等于授权执行。
+    # 本项目历史上被外部审查抓到过 `--e` 缩写即触发真实执行的同型缺陷。
+    parser = argparse.ArgumentParser(description=_CLI_DESCRIPTION, allow_abbrev=False)
     parser.add_argument("roster", type=Path, help="名单 CSV，三列 email/position/company_scope")
     parser.add_argument(
         "--initiated-by",

@@ -104,6 +104,11 @@ class _Terminal:
     key: str
     values: tuple[tuple[str, object], ...] = ()
     reason: str | None = None
+    #: rc25 修复包 F2：见 ``core/conversation/ports.OnboardingResult.grant_not_applied``。
+    #: 刻意不复用 ``reason``——``reason`` 非空在 ``_execute`` 里意味着"失败终态"
+    #: （触发失败原因落库与 ``onboarding.result`` 审计的 failure_reason 栏），而这
+    #: 一格是**成功终态上的清单标注**，混用会把一次正常收口记成一次失败。
+    grant_not_applied: bool = False
 
     def as_result(self, *, trace_id: str | None = None) -> OnboardingResult:
         """转成 gateway 消费的受控结果。
@@ -122,6 +127,7 @@ class _Terminal:
             state=self.state,
             messages=(OnboardingMessage(self.key, values),),
             failure_reason=self.reason,
+            grant_not_applied=self.grant_not_applied,
         )
 
 

@@ -919,6 +919,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # rc25 修复包 F1：预开通首聊补一句要带真实公司/职能范围，
+            # `core/conversation/pipeline.py` 因此模块级 import
+            # `core.permission.notification.describe_scope` 与
+            # `core.permission.publish_row.parse_permissions`（与 onboarding.completed
+            # 同一来源）。两个模块及其自身的模块级依赖都是纯函数＋内容目录，不带
+            # 第三方依赖，也不拖身份链；worker 不消费这条提示，只是随 pipeline 的
+            # import 闭包一并载入。
+            "lingxi.core.permission",
+            "lingxi.core.permission.account_match",
+            "lingxi.core.permission.galaxy_scope",
+            "lingxi.core.permission.notification",
+            "lingxi.core.permission.publish_row",
+            "lingxi.core.permission.role_function",
             # 投递事件 outbox 的纯领域逻辑（Issue #151），由
             # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
             "lingxi.core.delivery",
@@ -1102,6 +1115,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission.targeted_recompute` 进入 gateway 闭包。
             "lingxi.core.permission.legacy_diff",
             "lingxi.core.permission.publish_row",
+            # rc25 修复包 F1：pipeline 渲染预开通首聊那句时用
+            # `core.permission.notification.describe_scope`（公司/职能展示文本，
+            # 与 onboarding.completed 同一来源）。
+            "lingxi.core.permission.notification",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.mcp_readiness",
             "lingxi.core.permission.role_function",

@@ -1,5 +1,5 @@
 [meta]
-version = "2026-09-03-2"
+version = "2026-09-03-3"
 
 [texts]
 "onboarding.checking" = "已收到，正在核对你的身份和银河权限，请稍候。无需重复发送。"
@@ -208,7 +208,10 @@ version = "2026-09-03-2"
 # 为什么简化、以及一个用户自己能执行的下一步。三条撰写约束，改文案时逐条守住：
 #   1. **不得暗示格式完好**。段落路径来自 normalize_markdown 的产物：表格被拍平
 #      成一段长文本，`|` 与 `---` 这类分隔符号会原样留在正文里。本降级解决的是
-#      "拿不到"，不保证"好看"（见 adapters/feishu_docx_delivery.py::write_body）。
+#      "拿不到"，不保证"好看"（rc25 S-7c 起正常路是 docs_ai 一次建档
+#      adapters/feishu_docx_delivery.py::create_document_with_markdown，降级才
+#      回落两步段落路径 create_document + write_paragraphs；旧引用 write_body
+#      已随该机制删除——rc25 修复包 F6 更正）。
 #   2. **不得举例说是哪一种结构**（rc25 S-8b，#541 A-7，产品负责人 2026-09-02 裁定）。
 #      原句写的是"例如表格"，而 #538 修好之后含 markdown 表格的答案**不再降级**——
 #      把表格举成例子已经是假话。unsupported_nested_blocks 的完整触发面（引用块、
@@ -234,6 +237,22 @@ version = "2026-09-03-2"
 #      Issue #354）；同时建议用户自己打开核对——我们既然担保不了，就把核对权交给他。
 # {url} 同 delivery.document_ready，是纯本地拼接的文档链接，不含用户数据或凭据。
 "delivery.document_ready_simplified" = "你要的文档已生成：{url}（你已获得可管理权限）。需要说明的是：这份文档的排版由飞书自动完成，其中格式做了简化，个别不支持的结构可能没有呈现出来，建议你打开后核对一下。如果你需要规整的表格，可以让我改用电子表格重新生成一份。"
+# rc25 修复包 F4（Trace #544，与 A-7/S-5c 同一条理由：不让用户看到可能是假话的
+# 句子）：#571 一次建档机制之后，`delivery.document_ready_degraded` 的触发源包含
+# 两道**前置守卫**（body_too_long / title_not_embeddable），而那条文案把降级归因
+# 为「回答里有暂时无法排版的结构」——这两种情况的真实原因是**长度**与**标题形态**，
+# 不是结构，归因是假话。按 `body_degraded_reason` 来源各自分派（见
+# apps/gateway/document_delivery.py::_send_ready_notice）：原有那条从此只服务
+# 历史行的 unsupported_nested_blocks（对它「无法排版的结构」逐字准确）。两条新
+# 文案的撰写约束：
+#   1. **归因如实**：只说长度 / 标题形态，不提「无法排版的结构」。
+#   2. **不承诺「内容本身没有删减」**：这类担保在服务端静默丢块的场景上已被探针
+#      证明可能失实（见 document_ready_simplified 旁注）；对新增来源一开始就不作
+#      任何我们无法逐字验证的担保。段落路径的既有事实（表格拍平、残留符号）照说。
+#   3. **下一步真的可执行**：电子表格交付是已上线的并列能力（deliver_spreadsheet）。
+# {url} 同 delivery.document_ready，是纯本地拼接的文档链接，不含用户数据或凭据。
+"delivery.document_ready_degraded_too_long" = "你要的文档已生成：{url}（你已获得可管理权限）。需要说明的是：这次回答的正文超出了带格式排版的长度上限，文档已按纯文本段落交付，格式做了简化——表格被拍平成文字，正文里可能残留 | 和 --- 这类符号。如果你需要规整的表格，可以让我改用电子表格重新生成一份。"
+"delivery.document_ready_degraded_title" = "你要的文档已生成：{url}（你已获得可管理权限）。需要说明的是：这次回答的标题里含有带格式排版暂不支持的特殊字符，文档已按纯文本段落交付，格式做了简化——表格被拍平成文字，正文里可能残留 | 和 --- 这类符号。如果你需要规整的表格，可以让我改用电子表格重新生成一份。"
 # opus 审查 R-1 第 3 条：此前 mark_failed/mark_uncertain 只落终态与日志/告警，
 # 提出文档请求的用户本人从未收到任何消息——表现成"点了要文档，然后再也没有
 # 下文"。与 delivery.document_ready 同一条出站信道（追加消息，不进入任何已有

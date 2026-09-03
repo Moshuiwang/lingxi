@@ -170,6 +170,7 @@ from lingxi.core.identity.onboarding_runner import (
     STATE_MCP_SYNCING,
     STATE_PROVISIONING,
 )
+from lingxi.core.identity.preprovision import is_system_trigger
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 
 from lingxi.apps.scheduler.audit import AuditSink
@@ -272,6 +273,12 @@ class StalledProvisioningReport:
     #: 没有任何停摆候选"，而真实情况是"有 N 个人还停在中途格，只是刚打过一次
     #: 飞书还没到重试时间"——这两件事对运维的含义完全不同，不能被同一个 0 掩盖。
     skipped_in_backoff: int = 0
+    #: 系统触发（预开通，rc25 修复包 F3）的候选：**不发通知**、静默收口的人数。
+    #: 单独计数是为了让「aborted 大于 notified」读得通——「先通知、送达才收口」的
+    #: 既有不变量只约束用户自己发起的链；预开通用户没有发起任何东西、也没有在等
+    #: 任何消息（产品负责人裁定 4：全程静默），对他收口不需要也不允许先说一句
+    #: 「你发起的开通……」的假话。
+    silenced_system: int = 0
     interrupted: bool = False
     #: 通知出口装配了没有。见模块文档「缺通知出口时的姿态」。
     notifier_wired: bool = True
@@ -285,6 +292,7 @@ class StalledProvisioningReport:
             "advance_refused": self.advance_refused,
             "failed": self.failed,
             "skipped_in_backoff": self.skipped_in_backoff,
+            "silenced_system": self.silenced_system,
             "notifier_wired": self.notifier_wired,
         }
         if self.interrupted:
@@ -301,6 +309,7 @@ class _Tally:
     advance_refused: int = 0
     failed: int = 0
     skipped_in_backoff: int = 0
+    silenced_system: int = 0
 
     def freeze(self, *, interrupted: bool, notifier_wired: bool) -> StalledProvisioningReport:
         return StalledProvisioningReport(
@@ -311,6 +320,7 @@ class _Tally:
             advance_refused=self.advance_refused,
             failed=self.failed,
             skipped_in_backoff=self.skipped_in_backoff,
+            silenced_system=self.silenced_system,
             interrupted=interrupted,
             notifier_wired=notifier_wired,
         )
@@ -485,25 +495,41 @@ class StalledProvisioningDuty:
         return False
 
     def _process_one(self, item: Any, tally: _Tally) -> None:
-        """处置一个候选：**先通知，通知送达才收口**（见模块文档「处置顺序」）。"""
+        """处置一个候选：**先通知，通知送达才收口**（见模块文档「处置顺序」）。
 
-        dedupe_key = f"onboarding:stalled:{item.event_id}"
-        try:
-            self._notifier.send(
-                open_id=item.open_id,
-                key=KEY_STALLED,
-                values={"reference": item.trace_id},
-                dedupe_key=dedupe_key,
-            )
-        except Exception as error:  # noqa: BLE001 - 通知失败：留在原状态，下一轮重来
-            tally.notify_failed += 1
-            self._audit.record(
-                "stalled_provisioning.notify_failed",
-                user=item.user_id,
-                error=type(error).__name__,
-            )
-            return
-        tally.notified += 1
+        系统触发（预开通，rc25 修复包 F3）例外：产品负责人裁定 4 是**全程静默**，
+        而 ``onboarding.stalled`` 文案说的是「你发起开通」——预开通用户没有发起过
+        任何东西，这句对他是假话。判据沿用链上已有的合成事件标识
+        （:func:`~lingxi.core.identity.preprovision.is_system_trigger`，候选查询对
+        无入站事件的用户合成 ``preprovision:<user_id>``，见
+        ``adapters/postgres_stalled_provisioning``）；静默路径与
+        :func:`~lingxi.core.identity.preprovision.deliver_silently` 同一姿态——不发
+        消息、按送达处理，收口写入、审计与失败原因落库照旧。「先通知、送达才收口」
+        （外部独立审查 P2-1）的立论是"用户一条终态都没收到，却已经被收口"，对一个
+        从未被通知过任何事情、也没有在等任何消息的人不成立。用户自己发起的链
+        一字不变。
+        """
+
+        if is_system_trigger(item.event_id):
+            tally.silenced_system += 1
+        else:
+            dedupe_key = f"onboarding:stalled:{item.event_id}"
+            try:
+                self._notifier.send(
+                    open_id=item.open_id,
+                    key=KEY_STALLED,
+                    values={"reference": item.trace_id},
+                    dedupe_key=dedupe_key,
+                )
+            except Exception as error:  # noqa: BLE001 - 通知失败：留在原状态，下一轮重来
+                tally.notify_failed += 1
+                self._audit.record(
+                    "stalled_provisioning.notify_failed",
+                    user=item.user_id,
+                    error=type(error).__name__,
+                )
+                return
+            tally.notified += 1
 
         aborted = self._aborter.abort_stalled_provisioning(
             user_id=item.user_id,

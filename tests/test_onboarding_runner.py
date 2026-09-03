@@ -2890,6 +2890,43 @@ class SystemTriggerTests(unittest.TestCase):
         run_once(position_grants=importer)
         self.assertEqual(importer.calls, [])
 
+    def test_an_already_active_user_keeps_the_grant_unapplied_and_says_so(self) -> None:
+        """rc25 修复包 F2：已 active 的人在续行前复核处提前收口（早于预授权落库口），
+        名单答应的那笔预授权**没有落**。绝不在这里静默给已 active 用户扩权——要不要
+        补授权是产品语义，产品负责人另行裁定；但终态必须把「授权没应用」如实带回
+        批量清单（``grant_not_applied``），不得混进"成功预开通"。"""
+
+        importer = RecordingPositionGrants()
+        users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
+        parts, result = run_system_once(
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
+            position_grants=importer,
+            preprovision_grant={"88": ["销售分析"]},
+        )
+
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertTrue(result.grant_not_applied, "清单必须能看出「授权没应用」")
+        self.assertEqual(importer.calls, [], "绝不静默给已 active 用户扩权")
+        self.assertIsNone(
+            result.failure_reason,
+            "这不是失败终态：不得借用 reason（那会触发失败原因落库与失败审计口径）",
+        )
+        self.assertIn("onboarding.already_active", parts["audit"].actions())
+
+    def test_an_already_active_user_without_a_grant_is_a_plain_completion(self) -> None:
+        """否定断言：不带名单预授权时，已 active 的提前收口保持原样、不带标注——
+        标注只属于「答应了授权、没落成」这一种形状。"""
+
+        users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
+        parts, result = run_system_once(
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
+        )
+
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertFalse(result.grant_not_applied)
+
     # ---- X-1 同邮箱闸在系统触发路径上仍然生效 -------------------------
 
     def test_the_same_email_guard_still_stops_the_system_triggered_chain(self) -> None:
