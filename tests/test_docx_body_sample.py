@@ -9,23 +9,22 @@
 1. **样本没有悄悄退化回"只有表格"**——十八种写法（含标题三级、嵌套两种列表、
    引用块、代码块、待办、加粗、链接、负号、区间、竖线、分隔线）逐条在位。
    Issue #538 的写入探针只做过表格，只有表格的样本验不出其它形态的回归。
-2. **样本的三份"预期"彼此对得上**——块类型直方图、表格内容、父子关系必须与
-   convert 夹具一致。stage 真实回读拿这张直方图当对照表，它自己先错了，真实
-   回读就会照着一个错的预期判绿。
+2. **样本的两份"预期"彼此对得上**——块类型直方图与表格内容必须与正文现数出来
+   的结果一致。stage 真实回读拿这张直方图当对照表，它自己先错了，真实回读就会
+   照着一个错的预期判绿。
 """
 
 from __future__ import annotations
 
+import re
 import unittest
 
 from docx_body_sample import (
     COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM,
-    COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS,
     COMPREHENSIVE_MARKDOWN,
     COMPREHENSIVE_MARKDOWN_SHAPES,
     COMPREHENSIVE_TABLE_ROWS,
     COMPREHENSIVE_VERBATIM_TEXTS,
-    comprehensive_convert_response,
 )
 
 
@@ -67,98 +66,64 @@ class ComprehensiveMarkdownTest(unittest.TestCase):
         self.assertIn(("A 公司", "-12.85%", "3-5%", "旧口径 A | B"), COMPREHENSIVE_TABLE_ROWS)
 
 
-class ComprehensiveConvertFixtureTest(unittest.TestCase):
-    """convert 夹具与样本的三份"预期"必须互相对得上。
+class ComprehensiveHistogramTest(unittest.TestCase):
+    """块类型直方图与样本正文必须对得上。
 
-    这些断言**不调用任何适配器**，只核夹具自身：直方图、表格内容、父子关系。
-    stage 真实回读拿这张直方图当对照表，它自己先错了，真实回读会照着一个错的
-    预期判绿。
+    stage 真实回读拿这张直方图当对照表（Trace #544 探针二实测：一次建档后回读
+    45 块 ＝ 1 个 page 根块 ＋ 本表的 44 个，逐项相符），**它自己先错了，真实
+    回读就会照着一个错的预期判绿**。所以这里从 markdown 正文**现数**一遍能机械
+    数出来的那几种形态，与直方图对账——有人往样本里加一条列表、删一个待办却忘了
+    改直方图时必须变红。
+
+    只核能从 markdown 无歧义数出来的类型；``block_type=2``（文本）由"单元格
+    文字 ＋ 引用块内文字 ＋ 独立段落"三部分构成，靠正则数容易假绿，改为核它与
+    表格单元格数之间的关系。
     """
 
-    def setUp(self) -> None:
-        self.response = comprehensive_convert_response()
-        self.blocks = self.response["data"]["blocks"]
-        self.by_id = {block["block_id"]: block for block in self.blocks}
+    LINES = COMPREHENSIVE_MARKDOWN.splitlines()
 
-    def test_the_block_type_histogram_matches_the_fixture(self) -> None:
-        histogram: dict[int, int] = {}
-        for block in self.blocks:
-            histogram[block["block_type"]] = histogram.get(block["block_type"], 0) + 1
+    def _count(self, pattern: str) -> int:
+        return sum(1 for line in self.LINES if re.match(pattern, line))
 
-        self.assertEqual(histogram, COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM)
-        self.assertEqual(sum(histogram.values()), 44, "15 个一级块 ＋ 5 个嵌套子块 ＋ 24 个表格块")
-        self.assertEqual(len(self.by_id), len(self.blocks), "block_id 不得重复")
+    def test_heading_levels_match_the_histogram(self) -> None:
+        self.assertEqual(self._count(r"# [^#]"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[3])
+        self.assertEqual(self._count(r"## [^#]"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[4])
+        self.assertEqual(self._count(r"### [^#]"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[5])
 
-    def test_every_block_is_reachable_exactly_once(self) -> None:
-        """每个块要么是一级块、要么恰好被一个父块的 ``children`` 认领一次。
+    def test_list_and_todo_counts_match_the_histogram(self) -> None:
+        """无序列表与待办都以 ``- `` 开头，必须分开数——混在一起时"删掉一个待办、
+        加一条列表"这种改动会互相抵消，直方图错了也不会红。"""
 
-        漏认领 = 有块无处安放（真实响应里这会触发 ``unsupported_nested_blocks``
-        整篇降级）；被两个父块认领 = 结构自相矛盾。夹具自己先不能犯这两种错。
-        """
+        self.assertEqual(self._count(r"\s*- \[[ x]\] "), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[17])
+        self.assertEqual(self._count(r"\s*- (?!\[[ x]\])"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[12])
+        self.assertEqual(self._count(r"\s*\d+\. "), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[13])
 
-        claimed: dict[str, int] = {block_id: 0 for block_id in self.by_id}
-        for block_id in COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS:
-            self.assertIn(block_id, self.by_id, f"一级块 {block_id} 不在 blocks 里")
-            claimed[block_id] += 1
-        for block in self.blocks:
-            for child_id in block.get("children", ()):
-                self.assertIn(child_id, self.by_id, f"子块 {child_id} 不在 blocks 里")
-                claimed[child_id] += 1
+    def test_quote_code_and_divider_counts_match_the_histogram(self) -> None:
+        self.assertEqual(self._count(r"> "), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[34])
+        self.assertEqual(self._count(r"```\w") , COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[14])
+        self.assertEqual(sum(1 for line in self.LINES if line == "---"), COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[22])
 
-        self.assertEqual(
-            [block_id for block_id, count in claimed.items() if count != 1],
-            [],
-            "每个块必须恰好被认领一次（0 次＝无处安放，2 次＝结构自相矛盾）",
-        )
+    def test_table_cell_count_matches_the_declared_rows(self) -> None:
+        cells = sum(len(row) for row in COMPREHENSIVE_TABLE_ROWS)
+        self.assertEqual(cells, COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[32])
+        self.assertEqual(COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[31], 1)
+        # 每个单元格里还有一个文本块，引用块内也有一个——文本块数必须容得下它们。
+        self.assertGreater(COMPREHENSIVE_BLOCK_TYPE_HISTOGRAM[2], cells)
 
-    def test_the_physical_order_is_deliberately_not_the_document_order(self) -> None:
-        """Issue #442 实测：``blocks`` 数组的物理顺序**不是**文档顺序，真实顺序
-        由 ``first_level_block_ids`` 给出。夹具必须保留这个差异——两者恰好一致
-        的夹具验不出"按响应原始顺序写入"这个缺陷。"""
+    def test_the_declared_rows_appear_verbatim_in_the_markdown_table(self) -> None:
+        """表格内容与正文必须是同一份：单元格里的裸竖线在 markdown 侧是 ``\\|``，
+        两种写法各自成立，但**除了这一处转义之外不得有第二处差异**。"""
 
-        physical = [block["block_id"] for block in self.blocks]
-        self.assertNotEqual(physical[: len(COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS)],
-                            list(COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS))
-        self.assertEqual(
-            self.response["data"]["first_level_block_ids"],
-            list(COMPREHENSIVE_FIRST_LEVEL_BLOCK_IDS),
-        )
+        for row in COMPREHENSIVE_TABLE_ROWS:
+            with self.subTest(row=row):
+                escaped = tuple(cell.replace("|", "\\|") for cell in row)
+                self.assertIn("| " + " | ".join(escaped) + " |", COMPREHENSIVE_MARKDOWN)
 
-    def test_the_table_cells_carry_the_declared_rows_verbatim(self) -> None:
-        table = self.by_id["blk-table"]
-        cell_ids = table["children"]
-        self.assertEqual(len(cell_ids), 12, "3 行 × 4 列")
-        self.assertEqual(table["table"]["property"]["row_size"], len(COMPREHENSIVE_TABLE_ROWS))
-        self.assertEqual(table["table"]["property"]["column_size"], len(COMPREHENSIVE_TABLE_ROWS[0]))
-        for index, cell_id in enumerate(cell_ids):
-            with self.subTest(cell=cell_id):
-                text_id = self.by_id[cell_id]["children"][0]
-                content = self.by_id[text_id]["text"]["elements"][0]["text_run"]["content"]
-                self.assertEqual(content, COMPREHENSIVE_TABLE_ROWS[index // 4][index % 4])
+    def test_every_verbatim_text_is_actually_in_the_sample(self) -> None:
+        """逐字核对项必须真的能在样本里找到——否则"交付之后这段文字有没有被
+        改写"这个断言在下游会永远判绿。表格单元格那条走裸竖线，markdown 侧是
+        转义写法，两者刻意不同，因此单独处理。"""
 
-    def test_the_fixture_keeps_the_readonly_keys_the_write_path_has_to_strip(self) -> None:
-        """夹具必须**带上** ``table.cells`` 与 ``table.property.merge_info``：
-        它们是服务端计算的只读键，``merge_info`` 一个字段就换来 ``1770001``
-        整体拒绝（Issue #538 探针实测）。夹具不带它们，就验不出剥字段这一步。"""
-
-        table = self.by_id["blk-table"]["table"]
-        self.assertEqual(table["cells"], self.by_id["blk-table"]["children"])
-        self.assertEqual(len(table["property"]["merge_info"]), 12)
-        self.assertTrue(all(block["parent_id"] == "" for block in self.blocks))
-
-    def test_every_verbatim_text_appears_somewhere_in_the_fixture(self) -> None:
-        """:data:`COMPREHENSIVE_VERBATIM_TEXTS` 是交付后要逐字核对的清单——每一
-        条都必须真的能在转换结果里找到，否则 stage 复验会照着一条根本不存在的
-        文字去核对，永远判红或永远判绿。"""
-
-        contents = {
-            element["text_run"]["content"]
-            for block in self.blocks
-            for value in block.values()
-            if isinstance(value, dict)
-            for element in value.get("elements", ())
-        }
-        joined = "\n".join(contents)
         for text in COMPREHENSIVE_VERBATIM_TEXTS:
             with self.subTest(text=text):
-                self.assertIn(text, joined)
+                self.assertIn(text.replace("|", "\\|"), COMPREHENSIVE_MARKDOWN)
