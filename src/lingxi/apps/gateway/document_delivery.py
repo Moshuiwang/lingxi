@@ -138,14 +138,15 @@ False``（响应体里那个 ``code=2200`` 不具备判别力）；(b) 本模块
 失败。可观测性由上面第 1、3 两项承担（库里一列 ＋ 结构化日志），与
 ``_fail``/``_uncertain`` 的告警面刻意分开。
 
-**用户文案的已知缺口（如实登记，Trace #544 S-7c）**：``content.toml`` 现有的
-``delivery.document_ready_degraded`` 是为**段落路径**降级写的——它说"文档已按
-纯文本段落交付……内容本身没有删减"。这对前置守卫那一路逐字准确；对
-``server_simplified_body`` 那一路**只有"格式做了简化"这半句准确**：那篇文档
-其实仍然是带格式的，而"内容本身没有删减"在服务端静默丢块（探针实测原始 HTML
-块被丢弃且不产生任何 warning）时可能失实。本模块按"宁可多说一句、不可少说"
-选用这条文案，**并把"需要为服务端自陈降级另写一条文案"登记为待办**——这属于
-用户承诺，须由产品负责人裁定后再改 ``content.toml``。
+**就绪文案按降级来源分派两条（rc25 S-5c 补，Trace #544；S-7c 登记的缺口已关闭）**：
+``delivery.document_ready_degraded`` 是为**段落路径**写的——"文档已按纯文本段落
+交付……内容本身没有删减"对两个前置守卫逐字准确（那两种情况是我们主动改走段落
+路径，内容一个字没少），历史行的 ``unsupported_nested_blocks`` 同样走这条路。
+``server_simplified_body`` 改用新增的 ``delivery.document_ready_simplified``：
+那篇文档其实仍然是带格式的（"已按纯文本段落交付"是假话），而"内容本身没有删减"
+在服务端静默丢块（探针实测原始 HTML 块被丢弃且不产生任何 warning）时可能失实
+——新文案只说"格式做了简化、个别不支持的结构可能没有呈现出来"，不做那句担保，
+并请用户打开核对。分派见 :meth:`DocumentDeliveryConsumer._send_ready_notice`。
 
 **这条降级是"拿得到"，不是"好看"**：段落路径来自 ``paragraphs`` 列，表格会被
 拍平成一段长文本、``|---|`` 分隔行原样留在正文里——用户文案不得暗示格式完好，
@@ -798,6 +799,8 @@ class DocumentDeliveryConsumer:
         的行，不需要在这里额外判断"这是不是补发"。
         """
 
+        from lingxi.adapters.feishu_docx_delivery import SERVER_SIMPLIFIED_BODY
+
         try:
             if delivery_type == DELIVERY_TYPE_SHEET:
                 if not isinstance(resource_url, str) or not resource_url:
@@ -813,12 +816,26 @@ class DocumentDeliveryConsumer:
                 # Issue #499 明示降级：正文被降级成纯文本段落路径写入时，用户
                 # 拿到的排版与他本该拿到的不同——必须用如实说明"格式已简化"的
                 # 那条文案，不能沿用普通就绪文案。
-                content_key = (
-                    "delivery.document_ready_degraded"
-                    if body_degraded_reason is not None
-                    else "delivery.document_ready"
-                )
-                # 去重前缀刻意**两条文案共用**：原发送与补发是同一条通知的两次
+                #
+                # **按降级原因分派两条文案**（rc25 S-5c，Trace #544）：
+                # ``delivery.document_ready_degraded`` 说"已按纯文本段落交付
+                # ……内容本身没有删减"，这对**段落路径**逐字准确——两个前置守卫
+                # （``PRE_FLIGHT_DEGRADE_REASONS``）与历史行的
+                # ``unsupported_nested_blocks`` 都是这条路。但
+                # ``server_simplified_body`` 是飞书服务端自己简化的：文档其实
+                # 仍然带格式，而"内容没有删减"在服务端**静默丢块**时可能失实
+                # （探针实测：原始 HTML 块被丢弃且不产生 warning），因此它单独
+                # 走 ``delivery.document_ready_simplified``，不做那句担保。
+                # **默认落在段落路径那条**：未来新增的原因码在补上分派之前先
+                # 说"已按段落交付"，是可被用户当场证伪的过度告知，不是一句
+                # 用户无法察觉的假担保。
+                if body_degraded_reason is None:
+                    content_key = "delivery.document_ready"
+                elif body_degraded_reason == SERVER_SIMPLIFIED_BODY:
+                    content_key = "delivery.document_ready_simplified"
+                else:
+                    content_key = "delivery.document_ready_degraded"
+                # 去重前缀刻意**三条文案共用**：原发送与补发是同一条通知的两次
                 # 尝试，不是两条独立通知。分开前缀会让"第一次发普通文案失败、
                 # 补发时才读到降级列"这种时序发出两条消息给同一个人。
                 dedupe_prefix = "document-ready"
