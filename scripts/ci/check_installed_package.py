@@ -654,6 +654,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
             "lingxi.core.permission.legacy_diff",
             "lingxi.core.identity.legacy_permission_import",
+            # 职位＋公司范围预授权（rc25 S-8b，#541）：`postgres_local_permission`
+            # 模块级 import 冻结计划类型（`PositionGrantPlan`），随本地覆盖落库口
+            # 一并进 scheduler 闭包——预开通脚本必须在 lingxi-scheduler 容器内运行。
+            "lingxi.core.permission.position_override",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。

@@ -65,6 +65,7 @@ from lingxi.core.permission.legacy_diff import (
     LegacyImportReport,
 )
 from lingxi.core.permission.local_override import LocalPermissionOverrideEntry, OverrideDirection
+from lingxi.core.permission.position_override import PositionGrantPlan
 
 #: 与 ``core/admin/pending_action.PendingActionType.LOCAL_PERMISSION_GRANT`` 取值逐字
 #: 相同（本模块不 import ``core/admin``，字面量独立登记，同 ``scripts/ops`` 的既有姿态）。
@@ -628,6 +629,138 @@ class PostgresLocalPermissionOverrideStore:
             if added == 0:
                 cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
             return added
+
+
+    def import_position_grant(
+        self,
+        *,
+        user_id: str,
+        target_open_id: str,
+        plan: PositionGrantPlan,
+        now: datetime,
+        initiated_by_open_id: str,
+    ) -> LegacyImportReport:
+        """「职位＋公司范围」预授权的落库口（rc25 S-8b，Issue #541 预开通）。
+
+        与 :meth:`import_legacy_plan` 是**同一条纪律的两个来源**，刻意不合并成一个
+        带开关的方法：差集导入的输入是旧表内容、原因是 ``legacy_import_2_0``；本方法
+        的输入是产品负责人核对过的名单、原因是
+        :data:`~lingxi.core.permission.position_override.
+        PREPROVISION_PENDING_ACTION_REASON`，两者在审计上必须分得开。共用的是下面
+        两个模块级函数（合成终态 ``pending_action`` 与 SAVEPOINT 包住的逐行插入），
+        它们才是"没有确认卡不能写入"这条约束的落点。
+
+        **每用户一事务**：先对 ``app_user`` 行加锁（同一用户的并发开通链串行化），
+        再一次读出该用户全部 ``direction='grant'`` 行；已生效的键计入
+        ``already_present``、**曾被管理员撤销的键不复活**（计入 ``revoked_skipped``）。
+        一条都不缺时零写入直接返回。否则在同一事务里合成一条已终态的
+        ``pending_action``（``status='executed'``、``card_delivered=FALSE`` 如实反映
+        从未发过卡片）并逐行插入；本笔的全部行共享同一个新 ``lpg_`` 组 ID，带
+        ``position_name``/``company_scope``，因此管理卡把它渲染成**一个**职位+范围项、
+        一次事务性整组撤销——"名单给错了怎么撤"要撤的正是这个单位。
+
+        一行都没新增时删掉刚合成的 ``pending_action``，不留孤儿终态记录；其他异常
+        原样上抛、事务整体回滚，调用方按本侧故障失败关闭。
+        """
+
+        if not plan.pairs:
+            return LegacyImportReport(imported=0, already_present=0)
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            return _apply_position_grant_locked(
+                cursor,
+                user_id=user_id,
+                target_open_id=target_open_id,
+                plan=plan,
+                now=now,
+                initiated_by_open_id=initiated_by_open_id,
+            )
+
+
+def _apply_position_grant_locked(
+    cursor,
+    *,
+    user_id: str,
+    target_open_id: str,
+    plan: PositionGrantPlan,
+    now: datetime,
+    initiated_by_open_id: str,
+) -> LegacyImportReport:
+    """在调用方已经持有的 ``cursor``（及其所在事务）上执行一笔职位范围预授权。
+
+    模块级函数而不是实例方法，理由同 :func:`_insert_locked`：它只需要一个已经打开的
+    ``cursor``。拆出来还有第二个作用——"合成的 ``pending_action`` 到底带的是哪个
+    ``reason``"这件事因此可以在**不连数据库**的单测里用假 cursor 逐参数断言，而不是
+    只能靠真库门禁或 stage 演练发现它被改掉。
+    """
+
+    cursor.execute("SELECT id FROM app_user WHERE id = %s FOR UPDATE", (user_id,))
+    cursor.execute(
+        "SELECT company_id, metric_name, entry_status FROM local_permission_override"
+        " WHERE user_id = %s AND direction = %s",
+        (user_id, OverrideDirection.GRANT.value),
+    )
+    active: set[tuple[str, str]] = set()
+    revoked: set[tuple[str, str]] = set()
+    for company, metric, status in cursor.fetchall():
+        (active if status == "active" else revoked).add((company, metric))
+
+    wanted = tuple(dict.fromkeys(plan.pairs))
+    missing = [pair for pair in wanted if pair not in active and pair not in revoked]
+    already_present = sum(1 for pair in wanted if pair in active)
+    revoked_skipped = sum(1 for pair in wanted if pair not in active and pair in revoked)
+    if not missing:
+        return LegacyImportReport(
+            imported=0, already_present=already_present, revoked_skipped=revoked_skipped
+        )
+
+    group_id = new_id("lpg")
+    pending_id = _insert_synthetic_pending_action(
+        cursor,
+        target_open_id=target_open_id,
+        initiated_by_open_id=initiated_by_open_id,
+        reason=plan.pending_action_reason,
+        moment=now,
+        payload={
+            "preprovision": {
+                "position_name": plan.position_name,
+                "company_scope": plan.company_scope,
+                "pairs": [list(pair) for pair in missing],
+                "permission_group_id": group_id,
+            },
+            "reason": plan.override_reason,
+        },
+    )
+    imported = 0
+    for company, metric in missing:
+        entry = LocalPermissionOverrideEntry(
+            user_id=user_id,
+            direction=OverrideDirection.GRANT,
+            company_id=company,
+            metric_name=metric,
+            reason=plan.override_reason,
+            initiated_by_open_id=initiated_by_open_id,
+            pending_action_id=pending_id,
+            created_at=now,
+            position_name=plan.position_name,
+            company_scope=plan.company_scope,
+            permission_group_id=group_id,
+        )
+        if _insert_with_savepoint(cursor, entry):
+            imported += 1
+        else:
+            already_present += 1
+    if imported == 0:
+        cursor.execute("DELETE FROM pending_action WHERE id = %s", (pending_id,))
+        return LegacyImportReport(
+            imported=0, already_present=already_present, revoked_skipped=revoked_skipped
+        )
+    return LegacyImportReport(
+        imported=imported,
+        already_present=already_present,
+        group_id=group_id,
+        group_created=True,
+        revoked_skipped=revoked_skipped,
+    )
 
 
 def _insert_synthetic_pending_action(

@@ -2,8 +2,8 @@
 # 由 scripts/ci/check_content_version.py 生成与校验，请不要手工编辑。
 # 改完 content.toml 的文案后：先递增 [meta] version，再运行
 #   python3 scripts/ci/check_content_version.py --refresh
-version = "2026-09-01-2"
-digest = "sha256:27339ea337d9aaa8db89d1b2a4a01e4a2352d837f199cf615c07a209eb3ed2ba"
+version = "2026-09-03"
+digest = "sha256:f83588e306d3e3ae1f9796b71a624964a12bc91929511d731b9c4492828a68ee"
 
 # 用过的旧版本标识，不得复用：同一个版本号对应两批文案会让落库的追溯依据失效。
 retired_versions = [
@@ -35,6 +35,7 @@ retired_versions = [
   "2026-08-31-4",
   "2026-08-31-5",
   "2026-09-01",
+  "2026-09-01-2",
 ]
 
 # 每条用户可见文案的短摘要，用于在门禁失败时指出具体是哪几个键变了。
@@ -51,7 +52,7 @@ retired_versions = [
 "texts.admin.unknown_command_detail" = "2423ce601f6babc4"
 "texts.delivery.document_failed" = "ca1a6cd54a25a5b9"
 "texts.delivery.document_ready" = "b1877a81322f75a3"
-"texts.delivery.document_ready_degraded" = "66ae2fe6dfabe730"
+"texts.delivery.document_ready_degraded" = "75437483242abffd"
 "texts.delivery.document_uncertain" = "96c0bce63615ee08"
 "texts.delivery.sheet_failed" = "41e6b7f46e1de788"
 "texts.delivery.sheet_ready" = "3e7fbf93015d32a9"
@@ -88,6 +89,7 @@ retired_versions = [
 "texts.onboarding.internal_error" = "c7bef626a5602d4a"
 "texts.onboarding.matched" = "21cf0e7d79a0a085"
 "texts.onboarding.not_authorized" = "c4dfa61c10679764"
+"texts.onboarding.preprovisioned_first_chat" = "b545e317acc2282f"
 "texts.onboarding.stalled" = "1e38f737f519eda2"
 "texts.onboarding.sync_timeout" = "332dedd2c0cff9e1"
 "texts.onboarding.syncing" = "224868e8a7c923cf"
