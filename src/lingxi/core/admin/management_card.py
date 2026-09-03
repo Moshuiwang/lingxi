@@ -32,8 +32,10 @@ AdminDisplayNames` 端口翻译成人类可读文本——公司显示「中文�
 
 职位和公司范围下拉、原因输入框均为必填；唯一的表单提交按钮携带非空 ``name``
 （``grant_submit``），并通过 ``column_set`` 排版。独立的“取消”按钮只关闭管理卡。
-撤销按钮不在表单内。旧目录假实现仍保留旧的双按钮渲染分支，仅用于历史测试和已发出
-的旧卡兼容，生产目录始终提供 ``positions()`` 并走新形状。
+撤销按钮不在表单内。旧目录假实现（无 ``positions()``）走兼容分支，该分支自
+Trace #544 D-5 起**不再渲染任何写入表单**——它原先那两个按钮提交的是
+``/admin grant_permission`` / ``/admin suppress_permission``，命令已撤除；生产
+目录始终提供 ``positions()`` 并走新形状。
 
 ## 组件选择
 
@@ -68,12 +70,12 @@ from lingxi.core.admin.views import AdminUserStatusView, LocalPermissionOverride
 #: 卡片按钮/表单提交回传的 ``admin_action`` 取值，供
 #: ``core/admin/card_callback.py`` 新增的回调分支识别是哪一类管理卡交互。
 ADMIN_ACTION_GRANT = "grant"
-ADMIN_ACTION_SUPPRESS = "suppress"
 ADMIN_ACTION_REVOKE = "revoke"
 ADMIN_ACTION_CANCEL = "cancel"
 
-#: 表单内提交按钮的 ``name``（飞书官方错误码 200530 要求非空且单卡唯一，
-#: 新卡只提交 ``grant_submit``；旧目录兼容分支另保留 ``suppress_submit``）。
+#: 表单内提交按钮的 ``name``（飞书官方错误码 200530 要求非空且单卡唯一）。
+#: 全卡只有 ``grant_submit`` 一个表单提交按钮——「屏蔽指标」按钮随
+#: ``/admin suppress_permission`` 一起在 Trace #544 D-5 撤除。
 #: **公开常量**（W0-1 追加结论，2026-08-30）：
 #: 真实点击实测坐实——表单提交回调的 ``action.value`` 常常不以 Mapping 形态
 #: 到达（缺失或需要反序列化的字符串），``apps/gateway/__init__.py`` 的路由
@@ -81,7 +83,6 @@ ADMIN_ACTION_CANCEL = "cancel"
 #: 按钮 ``action.name`` 兜底识别是哪一个提交按钮，这两个常量必须能被外部
 #: import。
 GRANT_SUBMIT_BUTTON_NAME = "grant_submit"
-SUPPRESS_SUBMIT_BUTTON_NAME = "suppress_submit"
 
 #: 指标/公司目录不可用时下拉唯一的占位选项——``select_static`` 需要至少一个
 #: ``options`` 条目才是结构完整的组件；用一个空 ``value`` 的占位项而不是省略整个
@@ -578,48 +579,13 @@ def render_management_card(
             )
     else:
         # Legacy renderer for cards produced by pre-#493 test/catalog implementations.
-        elements.append(_markdown("**补充授权 / 屏蔽指标**"))
-        form_elements: list[dict[str, Any]] = [
-            _select_static(
-                name="company_id",
-                placeholder="选择公司",
-                options=companies,
-                label_for=_company_label,
-            ),
-            _select_static(
-                name="metric_name",
-                placeholder="选择指标",
-                options=metrics,
-                label_for=_metric_label,
-            ),
-            _input(name="reason", placeholder="填写原因"),
-            button_row(
-                [
-                    _callback_button(
-                        label="补充授权",
-                        style="primary",
-                        form_submit=True,
-                        name=GRANT_SUBMIT_BUTTON_NAME,
-                        value={"admin_action": ADMIN_ACTION_GRANT, "identifier": display_identifier},
-                    ),
-                    _callback_button(
-                        label="屏蔽指标",
-                        style="danger",
-                        form_submit=True,
-                        name=SUPPRESS_SUBMIT_BUTTON_NAME,
-                        value={"admin_action": ADMIN_ACTION_SUPPRESS, "identifier": display_identifier},
-                    ),
-                ]
-            ),
-        ]
-        assert_unique_named_form_elements(form_elements)
-        elements.append(
-            {
-                "tag": "form",
-                "name": "admin_manage_grant_suppress_form",
-                "elements": form_elements,
-            }
-        )
+        # 「公司×指标」的补充授权/屏蔽指标表单已随 ``/admin grant_permission`` /
+        # ``/admin suppress_permission`` 一起撤除（Trace #544 D-5）：那两个按钮提交
+        # 的就是这两条文本命令，命令没了，按钮留着只会点出一句"入口已下线"。这条
+        # 分支只在 pre-#493 假目录下出现（生产目录始终提供 ``positions()``），因此
+        # 只保留一句说明，不再渲染任何写入表单——不给管理员一个按不动的按钮。
+        elements.append(_markdown("**补充授权**"))
+        elements.append(_markdown("当前目录不可用，暂时无法发起补充授权。"))
 
     return {"schema": "2.0", "config": {"update_multi": True}, "body": {"elements": elements}}
 

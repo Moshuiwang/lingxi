@@ -44,9 +44,7 @@ from lingxi.core.admin.management_card import (
     ADMIN_ACTION_CANCEL,
     ADMIN_ACTION_GRANT,
     ADMIN_ACTION_REVOKE,
-    ADMIN_ACTION_SUPPRESS,
     GRANT_SUBMIT_BUTTON_NAME,
-    SUPPRESS_SUBMIT_BUTTON_NAME,
     render_management_card,
 )
 from lingxi.core.admin.card_dispatch import ManagementCardContext, management_card_fingerprint
@@ -63,7 +61,7 @@ from .document_delivery import (
 )
 from .group_mention_hint import GroupMentionHintResponder, build_group_mention_hint_throttle
 from .log_redaction import install_credential_redaction
-from .management_status import rendered_dispatch_status, skipped_recompute_status_message
+from .management_status import PUBLISHING_STATUS_TEXT, rendered_dispatch_status, skipped_recompute_status_message
 from .onboarding import assert_gateway_onboarding_is_inert
 
 logger = logging.getLogger(__name__)
@@ -277,7 +275,11 @@ def _management_card_context(payload: dict) -> tuple[str, str]:
 
 
 class _GatewayManagementCardRefresher:
-    """把管理卡状态更新集中到同一个 transport + 持久 sequence 端口。"""
+    """把管理卡状态更新集中到同一个 transport + 持久 sequence 端口。
+
+    并发保护只有 ``expected_card_sequence`` 一把 CAS（#493 双 CAS 收敛，rc25 S-4a）；
+    ``state_version`` 为什么没有独有判别力，见 ``next_card_sequence()`` 的收敛说明。
+    """
 
     def __init__(self, *, transport: Any, catalog: Any, display_names: Any, context_store: Any) -> None:
         self._transport = transport
@@ -293,11 +295,9 @@ class _GatewayManagementCardRefresher:
         state: str,
         dispatch_status: str | None = None,
         status_message: str | None = None,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> bool:
-        # Use snapshot versions when available; legacy test doubles may omit them.
-        expected_state_version = getattr(context, "state_version", None) if expected_state_version is None else expected_state_version
+        # Use the snapshot sequence when available; legacy test doubles may omit it.
         expected_card_sequence = getattr(context, "card_sequence", None) if expected_card_sequence is None else expected_card_sequence
         # 执行已结束（已生效/不完整）后，原管理卡恢复为可重新查询/提交的表单；
         # 只有等待中的提交态继续隐藏表单，避免重复点击。取消则关闭这张卡。
@@ -319,8 +319,6 @@ class _GatewayManagementCardRefresher:
             closed=state == "closed",
         )
         sequence_kwargs: dict[str, Any] = {"message_id": context.message_id}
-        if expected_state_version is not None:
-            sequence_kwargs["expected_state_version"] = expected_state_version
         if expected_card_sequence is not None:
             sequence_kwargs["expected_card_sequence"] = expected_card_sequence
         sequence = self._context_store.next_card_sequence(**sequence_kwargs)
@@ -330,9 +328,8 @@ class _GatewayManagementCardRefresher:
         mark_visual_refreshed = getattr(self._context_store, "mark_visual_refreshed", None)
         if callable(mark_visual_refreshed):
             mark_kwargs: dict[str, Any] = {"message_id": context.message_id, "sequence": sequence}
-            if expected_state_version is not None:
-                mark_kwargs["expected_state_version"] = expected_state_version
-            if expected_state_version is not None or expected_card_sequence is not None:
+            if expected_card_sequence is not None:
+                # 回写要 CAS 的是本次实际领到的号，不是渲染时读到的快照号。
                 mark_kwargs["expected_card_sequence"] = sequence
             marked = mark_visual_refreshed(**mark_kwargs)
             if marked is False:
@@ -530,15 +527,14 @@ def make_event_handler(
                 # admin_action（缺失或需要反序列化的字符串，见
                 # adapters/feishu_events.py 的 _parse_action_value 文档），但
                 # 回调事件本就会带回按钮自己的 action.name
-                # （grant_submit/suppress_submit）——用它兜底识别是哪一个
-                # 提交按钮，不这样做，点击后会静默落进下面"未知 decision"分支，
-                # 管理卡补充授权/屏蔽指标从此全部失效（真实点击已实测复现）。
-                # 逐行「撤销」按钮不需要这条后备——它不在 form 内，真实回调的
-                # value 已经带着 admin_action 正常到达。
+                # （grant_submit）——用它兜底识别是哪一个提交按钮，不这样做，
+                # 点击后会静默落进下面"未知 decision"分支，管理卡补充授权从此
+                # 全部失效（真实点击已实测复现）。表单内自 Trace #544 D-5 起只剩
+                # 这一个提交按钮（「屏蔽指标」随 /admin suppress_permission 一起
+                # 撤除）。逐行「撤销」按钮不需要这条后备——它不在 form 内，真实
+                # 回调的 value 已经带着 admin_action 正常到达。
                 if action_event.action_name == GRANT_SUBMIT_BUTTON_NAME:
                     admin_action = ADMIN_ACTION_GRANT
-                elif action_event.action_name == SUPPRESS_SUBMIT_BUTTON_NAME:
-                    admin_action = ADMIN_ACTION_SUPPRESS
             if admin_action == ADMIN_ACTION_REVOKE:
                 chat_id, message_id = _management_card_context(payload)
                 revoke_kwargs = dict(
@@ -566,7 +562,7 @@ def make_event_handler(
                     message_id=message_id,
                     trace_id=action_event.trace_id,
                 )
-            if admin_action in (ADMIN_ACTION_GRANT, ADMIN_ACTION_SUPPRESS):
+            if admin_action == ADMIN_ACTION_GRANT:
                 chat_id, message_id = _management_card_context(payload)
                 identifier = action_event.action_value.get("identifier", "")
                 if not identifier and management_card_context_store is not None:
@@ -700,6 +696,7 @@ def build_supervisor(
     from lingxi.adapters.postgres_management_card_context import (
         PostgresManagementCardContextStore,
     )
+    from lingxi.adapters.admin_post_callback import BackgroundPostCallbackExecutor
     from lingxi.adapters.postgres_pending_action import PostgresPendingActionStore
     from lingxi.adapters.postgres_permission_recompute_trigger import (
         BackgroundPermissionRecomputeTrigger,
@@ -746,7 +743,7 @@ def build_supervisor(
     pending_action_store = PostgresPendingActionStore(
         str(config.postgres_dsn),
         timeouts=config.postgres_timeouts,
-        audit=audit,
+        audit=audit, metric_map_path=config.metric_map_path,
     )
     # 管理员可见展示名解析口（Trace #469 S-1）：open_id→姓名+邮箱、公司编号→
     # 中文名、指标 ID→中文别名三个真库/真配置查询集中在 ``PostgresAdminQueries``
@@ -776,7 +773,7 @@ def build_supervisor(
     # 管理卡上下文（#493）由 PostgreSQL 持久保存；发送侧登记与回调侧读取共用同一
     # 个 store，gateway 重启后仍能恢复目标、卡片实体与 sequence。
     management_card_transport = LarkAdminManagementCardTransport(client)
-    management_card_catalog = TomlCompanyMetricCatalog()
+    management_card_catalog = TomlCompanyMetricCatalog(metric_map_path=config.metric_map_path)
     # #493：message_id→目标、card_id、快照和 sequence 必须跨 gateway 重启保留，
     # 生产装配使用 PostgreSQL，而不是旧的进程内 TTL 映射。
     management_card_context_store = PostgresManagementCardContextStore(
@@ -845,7 +842,7 @@ def build_supervisor(
             if complete:
                 dispatch_status = "已生效"
             elif state == "dispatching":
-                dispatch_status = status_message or "操作已记录，权限正在下发"
+                dispatch_status = status_message or PUBLISHING_STATUS_TEXT
             else:
                 trace = context.last_trace_id or "当前操作"
                 dispatch_status = (
@@ -935,7 +932,7 @@ def build_supervisor(
             pending,
             complete=False,
             state_override="dispatching",
-            status_message="操作已记录，权限正在下发",
+            status_message=PUBLISHING_STATUS_TEXT,
         )
         _start_management_publish_observer(pending)
 
@@ -1010,7 +1007,7 @@ def build_supervisor(
         # 模块文档「BackgroundPermissionRecomputeTrigger」一节）。
         recompute_trigger=BackgroundPermissionRecomputeTrigger(
             PermissionRecomputeAdapter(
-                str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit
+                str(config.postgres_dsn), timeouts=config.postgres_timeouts, audit=audit, metric_map_path=config.metric_map_path
             ),
             audit=audit,
             on_completed=_recompute_completed,
@@ -1019,6 +1016,8 @@ def build_supervisor(
             on_skipped=_recompute_skipped,
             on_timeout=_recompute_timeout,
         ),
+        # 应答之后才做那批网络往返（#493 块 B，见该适配器模块文档）。
+        post_callback_executor=BackgroundPostCallbackExecutor(audit=audit),
     )
     # 专用主体结构性出口前置（opus P3-1）：装配期读**一次**登记表，把结果算成一个
     # 普通字符串交给管线——管线自己不再持有任何查询能力，对全体消息都只是内存

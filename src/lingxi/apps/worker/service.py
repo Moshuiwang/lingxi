@@ -253,14 +253,15 @@ class WorkerService:
 
         self._emit_heartbeat()
         self._tick_alerts()
-        terminal_tasks = self._housekeep()
+        # 巡检搬离事件循环（W-1）：占住循环＝只读屏障唯一判定层的 PreToolUse 钩子应答
+        # 不了，而 CLI 钩子超时是失败关闭。取证/选型/线程安全核对见同名回归用例。
+        terminal_tasks = await asyncio.to_thread(self._housekeep)
 
         # 再判一次停机信号，紧贴在 claim() 之前（PR #173 独立复核 P2-1，第二轮
         # 复核证明单次 `sleep(0)` 对真实信号无效，见模块顶部
         # `_STOP_SIGNAL_DRAIN_YIELDS` 的机制说明）：`run()` 的
-        # `while not stop.is_set()` 判定与这里的 `claim()` 之间没有任何 await
-        # （心跳、告警 tick、`_housekeep()` 全是同步代码），信号如果恰好在这段
-        # 同步窗口内被操作系统送达，`self._global_stop.is_set()` 在没有真正让
+        # `while not stop.is_set()` 判定与 `claim()` 之间原本全同步（S-2b 后巡检走线程池、
+        # 多了一次真实让出，这段降为冗余保证）；信号若在那段窗口内送达，`is_set()` 在没有真正让
         # 事件循环跑完自管道投递链路之前读到的都是旧值——会把一条还在排队、
         # 从未执行过的任务领走，直接收口成 `stopped` 且不会被重排。因此连续
         # 让出 `_STOP_SIGNAL_DRAIN_YIELDS` 轮（一旦提前观测到 `is_set()` 立即
@@ -331,8 +332,8 @@ class WorkerService:
         原地补跑一次——复用这个既有常量而不是新开一个独立配置项，因为它已经
         是这个循环里"多久该重新看一眼世界"的既有节奏（`claim()` 轮询、
         `asyncio.wait` 超时都以它为参照），巡检的时效性要求与轮询本身同量级，
-        没有理由让两套节奏各自漂移。两个回调都是同步调用，与整批实现里
-        `process_once()` 入口那次同步调用语义等价，不额外引入并发写。命中的
+        没有理由让两套节奏各自漂移。两个回调与 `process_once()` 入口那次调用同形
+        （`_tick_alerts()` 同步跑、巡检走线程池，见那里），不额外引入并发写。命中的
         终态并入 `terminal_tasks`，让函数末尾的返回值如实反映"这一轮到底有没有
         观察到任何终态"。
         """
@@ -379,7 +380,7 @@ class WorkerService:
                 if now - last_housekeep_at >= housekeep_interval_seconds:
                     last_housekeep_at = now
                     self._tick_alerts()
-                    terminal_tasks.extend(self._housekeep())
+                    terminal_tasks.extend(await asyncio.to_thread(self._housekeep))
         except BaseException:
             for task in pending:
                 task.cancel()

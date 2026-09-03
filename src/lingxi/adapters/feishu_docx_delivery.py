@@ -36,9 +36,11 @@ feishu_tenant_token` 同一习惯：标准库 ``urllib``、零新增依赖、构
 
 ## 失败语义：不静默
 
-七个会发起真实调用的方法（Issue #408 新增 :meth:`LarkDocxDelivery.
-convert_markdown_to_blocks`/:meth:`LarkDocxDelivery.write_blocks`，见「markdown
-官方转换开关」一节）都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
+六个会发起真实调用的方法（:meth:`LarkDocxDelivery.create_document`、
+:meth:`LarkDocxDelivery.create_document_with_markdown`、
+:meth:`LarkDocxDelivery.write_paragraphs`、
+:meth:`LarkDocxDelivery.grant_full_access`、:meth:`LarkDocxDelivery.read_members`、
+:meth:`LarkDocxDelivery.read_body_children`）都不捕获任何未预期异常。飞书业务错误码明确非 0 时抛出
 :class:`FeishuDocxDeliveryError`（``definite=True``，判别口径同
 :class:`lingxi.adapters.feishu_directory.FeishuDirectoryError`）；响应本身成功
 （``code`` 为 0）但缺失可回读标识（``document_id``/``items`` 字段缺失或形状
@@ -68,131 +70,111 @@ JSON 解析失败）由默认传输 :func:`urllib_transport` 分类为
 读写同一个坐标，不依赖任何第二个信号（例如某个计数器在写入后是否必然变化）来
 间接推断，语义上不存在错位空间。
 
-**已知未被本仓库任何 S0/S-ES-1 探针验证过的假设**（如实标注，不静默宣称已验证）：
-飞书文档标题（``document.title``）在创建时写入的是文档元数据，不是根 block 的
-子块——因此一篇刚建好、从未调用过 :meth:`write_paragraphs` 的文档，其根 block
-应当没有任何子块，"子块非空"精确对应"正文已经写过"，不存在"标题占位"与"正文
-已写"的混淆空间。这个假设来自飞书开放平台 docx 数据模型的公开文档口径，与本
-模块既有的 ``block_type=2`` 文本段落约定一致，但**尚未在本仓库任何真实调用中
-实测确认**（本 Story 明确不接触真实飞书端点）。如果这个假设不成立（例如标题
-真的作为一个子块存在），后果是检查点恢复会把"刚建档、从未写过正文"误判成"已经
-写过"，从而**跳过本该发生的首次写正文**——比本次修复要解决的"重复写"更严重。
-因此**在这条判据依赖真实飞书接口投入生产前，应当补一次 L4a 真实探针**：确认
-（a）新建文档的根 block children 确实为空，（b）
-``GET /docx/v1/documents/{id}/blocks/{id}/children`` 的响应形状确实是
-``data.items``（同 ``read_members`` 现有形状口径）。补探针前，这条判据只有
-L1（代码 + 假传输层测试）证据，不是 L4a。
+**这条判据依赖的两个假设已在 2026-09-03 stage 受控探针实测确认**（Trace #544
+P-docs_ai 探针四，Bot-Test 真实调用，受控文档用后删除并回读确认；此前本节登记
+为"尚未在任何真实调用中实测"，现予关闭）：（a）老路径 ``POST /docx/v1/documents``
+新建的空文档，根 block 子块数确实 ``= 0``——标题是文档元数据、不占子块，"子块
+非空"精确对应"正文已经写过"；（b）``GET /docx/v1/documents/{id}/blocks/{id}/
+children`` 的响应键确实是 ``has_more`` ＋ ``items``（同 :meth:`read_members`
+的形状口径）。同一次探针还确认这条判据在**服务端一次建档**（见下节）建出来的
+文档上照常可用：综合样本文档的根 block 返回 15 个一级子块。假设不成立时的后果
+（把"刚建档、从未写过正文"误判成"已经写过"从而跳过首次写正文）因此不再是敞口。
 
-## markdown 官方转换开关（Issue #408；Issue #467／rc22 S-4 起代码默认开启）
+## 服务端一次建档写全文（``docs_ai``；Trace #544 S-7c，2026-09-03 stage 受控探针实证）
 
-正文交付此前把模型产出的 markdown 逐字符剥离成纯文本段落写入（``core.execution.
-document_delivery.normalize_markdown``），代价是正文里的连字符会被一并吃掉——
-「周环比 -12.85%」被剥成「周环比 12.85%」，负号丢失，属于数据正确性缺陷。产品
-负责人 2026-08-29 裁定分两步修：立即停止字符剥离（小修，`core` 侧已完成，见该
-模块），正式排版走飞书官方转换接口——本节是正式方案在本模块的落点。管线接线
-（迁移 0079 持久化原始 markdown、gateway 配置读取
-``LINGXI_DOCX_MARKDOWN_CONVERT``）随 Issue #408 批次完成时开关默认关闭，接线
-本身不改变现网行为；rc21 stage 探针（Issue #442）验证转换路径可用后，Issue
-#467／rc22 S-4 把 ``apps/gateway/config.py`` 的默认值翻转为**代码默认开启**，
-未配置该环境变量即等价于开启，显式关闭改用精确值 ``"0"``，翻转前唯一的开启值
-``"1"`` 继续解析成开启（既有 stage 配置零迁移成本），完整语义见
+正文交付的**写入机制**在本批整条换掉：此前是「客户端调 ``blocks/convert`` 把
+markdown 转成块 → 客户端按 ``children`` 拼树 → 调 ``children``/``descendant``
+把块写进文档」，现在是**一次调用**——把整段 markdown 原文交给飞书，由服务端
+建档并排版：
+
+- 端点：``POST /open-apis/docs_ai/v1/documents``，请求体
+  ``{"format": "markdown", "content": <正文>}``；**标题以 ``<title>…</title>``
+  拼在正文最前面**，不是单独的字段。
+- 响应：``data.document = {document_id, revision_id, url}``，另有可选的
+  ``result``（``success``/``partial_success``/``failed``）与 ``warnings``。
+- 身份：``tenant_access_token``（应用身份）**直接可用，不需要新增任何 scope**
+  （探针一实测 ``code=0``，无 scope 类错误码）。反过来，``docx:document.block:
+  convert`` 这个 scope 随 convert 端点一起**不再被本模块使用**。
+
+**换路的依据不是"更短更好看"，是这条路径把排版责任交回飞书**：客户端拼树那条
+路每支持一种嵌套形态都要自己实测一次（Issue #538 只对表格做过写入探针，引用块／
+嵌套列表／代码块从未验证，一旦被写入端点拒绝就是整次交付失败）。服务端一次
+建档对综合样本（标题 1–3 级、三层嵌套无序列表、两层嵌套有序列表、引用块、代码
+块、待办、加粗、链接、含 ``-12.85%`` 与 ``3-5%`` 的表格、含 ``|`` 的单元格、
+分隔线）实测**十种形态一个不多一个不少**、负号/区间/竖线逐字保真、零 ``warnings``
+（探针二）。落点、所有权、授权档位、链接形态与老路径**逐字相同**（探针三：同一
+个云空间目录、``owner_id`` 同为机器人、``document_url`` 本地拼接结果与响应
+``url`` 一致），**授权与投递环节零改动**。
+
+### 坑一：超时会留下拿不到 id 的完整孤儿文档，**一律不重试建档**
+
+探针五实测：200 000 字符正文 → **HTTP 504 ``code=2200``**，耗时 31.3 s；但事后
+列目录发现**服务端其实已经把这篇完整文档建出来了**，调用方没拿到
+``document_id``。含义：``docs_ai`` 建档超时 ＝ **结果不明且不可回读**——重试会
+产生第二篇**完整**文档（老路径的孤儿只是一篇空文档，这里的孤儿带着全文）。
+
+本模块的硬规则，两条一起才成立：
+
+1. **超时/5xx 一律判「结果不明」，永不重试建档。** :func:`urllib_transport` 对
+   HTTP **5xx 一律不解析响应体**，直接抛 ``FeishuDocxDeliveryError(definite=
+   False)``——不能让响应体里那个 ``code=2200`` 把它伪装成"飞书明确拒绝"
+   （``definite=True``）：网关超时不证明请求没有生效，判成 definite 会让上层
+   把一次"可能已经建好文档"的调用记成确定性失败。调用方
+   （``apps/gateway/document_delivery.py``）据此落 ``uncertain``——按
+   ``V-交付-03``，``uncertain`` **不自动重试**，转人工核对，这正是"不重试建档"
+   在状态机层面的落实。本模块自身与默认传输层都不做任何重试。
+2. **正文长度前置守卫**（:data:`MAX_MARKDOWN_CHARS`）：与其拿一份超长正文去撞
+   504，不如**在发出请求之前**就判定这条路走不通，改走两步的段落路径并明示
+   降级。见该常量的取值依据。
+
+### 坑二：``warnings`` **不覆盖全部降级**，不能只看它
+
+``data.warnings`` 是字符串数组、每项形如 ``degrade_code=2108,msg=…``，**只在
+部分降级时出现**；但探针二同时实测：原始 HTML 块（``<div>…</div>``）被**静默
+丢弃且不产生任何 warning**。所以「有 warnings 即全部告知」**不成立**，
+「如实告知格式已简化」这个用户承诺不能**只**建立在 ``warnings`` 上。
+
+:meth:`LarkDocxDelivery.create_document_with_markdown` 因此把 ``result`` 与
+``warnings`` **一起**判，并且在拿不准时**倒向多说一句**（见
+:func:`_degraded_reason`）：``result="failed"`` → 确定性失败；``warnings`` 非空
+→ 降级；``result`` 是除 ``success`` 之外的任何取值（含 ``partial_success`` 与
+未登记的新取值）→ 降级；``result`` **不存在** → 不降级（探针二实测：干净成功
+时 ``data`` 只有 ``document`` 一个键，"键不存在"就是零告警）。
+
+**如实标注的残余边界**：服务端静默丢弃的形态（原始 HTML 块、``~~删除线~~``、
+``==高亮==``、``$$…$$``）既不出现在 ``warnings`` 里、``result`` 也仍是
+``success``——这类丢弃**本模块无法感知**，因此不会告知用户。模型产出的是普通
+markdown，实际暴露面很低，但这是一条**已知的、未关闭的**边界，不得声称"所有
+降级都会被如实告知"。
+
+### 开关保留为止损闸：``markdown_convert_enabled``
+
+``LINGXI_DOCX_MARKDOWN_CONVERT``（装配层解析成构造函数参数
+``markdown_convert_enabled``，``adapters/`` 不直接读 ``os.environ``）**刻意不
+随 convert 端点一起退役**：它现在的含义从"要不要调官方转换接口"变成"要不要走
+服务端一次建档这条路"。这个接口在飞书开放平台**没有公开文档页**（两轮检索未
+命中），限流、长度上限、SLA 官方无契约——留一个不需要改代码、不需要重新构建
+镜像就能退回纯段落路径的止损闸，代价只是一个已经存在的配置项，收益是生产上
+出问题时有一条立即可用的退路。语义与取值解析逐字不变，见
 ``apps/gateway/config.py::_markdown_convert_enabled``。
 
-- :meth:`LarkDocxDelivery.convert_markdown_to_blocks`：``POST /docx/v1/documents/
-  blocks/convert``（``content_type=markdown``），把一段 markdown 转换成飞书官方
-  block 结构。这个端点只做转换、不写入任何文档，失败或重试都不产生外部副作用。
-  **Issue #442 受控探针实证**（2026-08-30，Bot-Test 真实调用，见该 issue 正文）
-  纠正了本节此前的假设：响应体 ``data.blocks`` **不是文档顺序**（实测「标题→
-  两列表项→正文」返回的 ``block_types`` 顺序是 ``[12, 2, 3, 12]``），真实的
-  文档顺序由响应体的 ``data.first_level_block_ids``（block_id 字符串数组）
-  给出；响应另含 ``data.block_id_to_image_urls`` 键，与 blocks 无关，不得误当
-  成块处理。因此本方法在返回前按 ``first_level_block_ids`` 重排 ``blocks``
-  （建 ``block_id`` → block 的映射后按顺序取出），并做两条防御性失败关闭
-  （**绝不静默丢块或乱序交付**，两条都是 ``FeishuDocxDeliveryError
-  (definite=True)``——转换端点无副作用、同一份 markdown 重放结果确定性相同，
-  同 :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"发起写入前的确定性
-  拒绝"）：
+### 与检查点状态机的关系：**换机制，不动机械**
 
-  1. ``first_level_block_ids`` 缺失、不是列表或为空 → ``markdown_convert_
-     missing_first_level_block_ids``；
-  2. 存在任意一个块的 ``block_id`` 不在 ``first_level_block_ids`` 内（典型
-     场景：表格等嵌套结构——表格自身是一级块，但它的单元格是作为独立元素
-     出现在 ``blocks`` 数组里、却不出现在 ``first_level_block_ids`` 里的
-     子块）→ :data:`UNSUPPORTED_NESTED_BLOCKS`。本仓库当前只支持"结果是
-     一份纯一级块序列"的 markdown（标题、列表、正文段落等），**不支持任何
-     带嵌套结构的 markdown**（表格是已知的第一个例子）——这是一个已登记的
-     后续扩展点，不是本次修复的交付范围。**这个码是全模块唯一会被
-     :meth:`LarkDocxDelivery.write_body` 捕获并转成明示降级的原因码**
-     （Issue #499），其余原因码一律照旧向上抛出。已知触发面只穷举到
-     markdown 表格；引用块、嵌套列表等其它嵌套形态是否同样命中，本仓库**未做
-     逐形态探针**，不得声称"只有表格会命中"。
-     若 ``first_level_block_ids`` 引用了一个在 ``blocks`` 数组里找不到的
-     ``block_id``（响应内部不自洽，理论上不应发生），归类为「结果不明」
-     ``LookupError``，同 :meth:`read_body_children` 既有的"响应形状不对但
-     不是飞书明确拒绝"分类口径——这与上面两条"明确知道拒绝原因"的
-     ``definite`` 分支不同：这里连"为什么不一致"都无法确定。
-  3. 重排完成后再补两道对账（rc21 修复包 B，opus 审查发现，同上面两条一样
-     ``definite=True``）：``first_level_block_ids`` 自身出现重复
-     block_id → ``markdown_convert_duplicate_first_level_block_ids``（复现：
-     同一段正文在文档里被重复交付两次）；重排后的块数与 ``mapping_blocks``
-     原始块数对不上 → ``markdown_convert_block_count_mismatch``（复现：
-     ``mapping_blocks`` 里出现重复 block_id 时，建映射的字典推导式会静默
-     用后一个覆盖前一个，前一个块的内容凭空消失）。两条对账各自独立，互不
-     替代——两种成因在计数上恰好互相抵消时（`mapping_blocks` 与
-     `first_level_block_ids` 对同一个 block_id 都重复了同样的次数），只留
-     其中一条会漏判。
+「建档」这一步现在顺带把正文写完了，但 ``apps/gateway/document_delivery.py``
+的检查点、幂等判据与崩溃恢复路径**沿用原来那一套**，四步（建档 → 写正文 →
+授权 → 读回）一步不减。理由是探针四实测的两条事实：
 
-  返回前还会剔除每个块里的只读字段（``block_id``/``parent_id``/``children``，
-  见 :func:`_strip_readonly_block_fields`）——这些字段描述"这个块在文档里的
-  位置/身份"，是服务器生成的，插入端点（``blocks/{document_id}/children``）
-  不接受随插入请求带回同名字段（同官方"重新插入表格 block 前须剔除只读
-  ``merge_info``"一类约束：响应里凡是描述块的位置/关系的字段都不可回插，只有
-  描述块长什么样的字段才能原样写回）。
+1. **现行判据在 docs_ai 建出来的文档上照常可用**：``read_body_children`` 读的
+   那个坐标（根 block 的 children）在综合样本文档上返回 15 个一级子块，"非空
+   ＝ 正文已写"语义不变，该方法一行不改；
+2. **「文档存在即正文已写」作为普适命题不成立**——只有 ``<title>``、没有正文
+   的 content 建出来的文档，根 block 子块数 ``= 0``。
 
-  **仍未被本仓库任何真实探针验证的假设**（如实标注，不静默宣称已验证）：
-  每个返回的块都携带非空字符串 ``block_id``（重排映射的前提）；剔除的三个
-  字段是插入端点全部拒绝的只读字段全集（目前只确认 ``block_id`` 一定是只读
-  的，``parent_id``/``children`` 是同类推断，未见真实插入报错佐证或证伪）。
-  这两条假设在本次 Issue #442 的受控探针范围之外，留给「验证条件补强」一节
-  要求的自证闭环真实探针核实。
-- :meth:`LarkDocxDelivery.write_blocks`：把已经是飞书 block 形状的数组沿用与
-  :meth:`write_paragraphs` 完全相同的 children 插入端点写入（同一坐标、同一
-  ``index=0`` 单次写入语义）。**超过 :data:`MAX_CONVERTED_BLOCKS`（1000，飞书
-  单次插入上限）一律整体拒绝，不做分批插入**——分批会打破
-  :meth:`read_body_children` 判据依赖的"正文一次写入"假设（见上文「幂等判据
-  新增方法」一节）：分批写入的中途状态（例如已经插入前 1000 个 block、还剩
-  部分未插入）会被下一次检查点恢复误判成"已经写完"，从而跳过本该继续的写入，
-  比本次要解决的问题更严重；因此选择在超限时直接失败关闭，用 ``definite`` 原因
-  码 ``too_many_blocks`` 让调用方明确知道这是一次确定性拒绝，不需要重试。这个
-  取舍的代价是超长 markdown 无法交付带格式的文档——本模块认为"明确拒绝"优于
-  "悄悄改变幂等语义"，是否需要为超限场景另设计分批状态机留给未来 Story。
-- :meth:`LarkDocxDelivery.write_body`：写正文的唯一装配入口，把「开关」变成
-  实际可执行的分支——``markdown_convert_enabled=False``（构造函数自身的参数
-  默认值；真正生效的值由装配层 ``apps/gateway/config.py`` 显式传入，见下一条）
-  时逐字调用 :meth:`write_paragraphs`；为 ``True`` 时改走
-  :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。返回
-  :class:`WriteBodyOutcome`（Issue #499）——调用方据此知道这次是不是降级写的。
-  开关打开时的失败**只有一个例外会被捕获**：
-  :data:`UNSUPPORTED_NESTED_BLOCKS`（含表格等嵌套结构）时改走纯文本段落路径
-  并在返回值里明示降级；其余一切（业务错误码、结果不明、超过 block 数上限、
-  其它 ``markdown_convert_*`` 对账码）仍然直接向上抛出。**降级必须明示，不得
-  静默**——静默降级会制造"用户以为拿到了带格式的文档，实际收到的是转换失败前
-  的另一种内容"这种更难排查的假象；产品负责人 2026-08-31 裁定用"降级 + 如实
-  告知"取代"整次失败"，取代的是失败结论，不是"必须让用户知道"这条纪律，完整
-  理由与安全前提见 :meth:`LarkDocxDelivery.write_body` 文档字符串。
-- **开关本身不是环境变量**：`adapters/` 不直接读 ``os.environ``（[代码框架
-  「三、横切约定」](../../../../docs/技术设计/代码框架.md)的硬性约束），
-  ``markdown_convert_enabled`` 是构造函数参数——真正的环境变量
-  ``LINGXI_DOCX_MARKDOWN_CONVERT`` 由装配层 ``apps/gateway/config.py`` 读取后
-  作为普通布尔值传进来（Issue #467／rc22 S-4 起代码默认开启：未配置或精确值
-  ``"1"``＝开启，精确值 ``"0"``＝显式关闭，其余值启动即失败，与
-  ``apps/worker/config.py`` 既有开关同一「错配失败关闭」姿态）。**接线已完成**（迁移 0079、
-  Issue #408 正式方案接线批次）：``task_document_delivery_request`` 新增可空
-  ``markdown`` 列持久化原始 markdown 全文，``apps/gateway/document_delivery.py``
-  的 :meth:`DocumentDeliveryConsumer._process_docx_claim` 按这一列是否非
-  ``None`` 决定要不要调用 :meth:`write_body`（非 ``None`` 才调用；``None`` 无
-  条件回退 :meth:`write_paragraphs`，与开关是否打开无关）——完整接线细节见该
-  模块文档「markdown 官方转换路径的接线」一节。
+而且本模块保留的**段落路径仍然是两步**（:meth:`create_document` +
+:meth:`write_paragraphs`，服务于开关关闭、``markdown`` 列为 ``NULL``、以及
+前置守卫命中这三种情况），"建了档、正文还没写"这个中间态在生产上真实存在，
+所以那条判据**继续有判别力，不是恒真**。压缩状态机是安全性改动、不是重构
+（#353 正是在这里出过事故），本批不做。
 
 ## 凭据与内容边界
 
@@ -248,51 +230,103 @@ _TEXT_PARAGRAPH_BLOCK_TYPE = 2
 
 _DOCX_DOCUMENTS_PATH = "/docx/v1/documents"
 
-#: markdown 官方转换端点（Issue #408，见模块文档「markdown 官方转换开关」）。
-_BLOCKS_CONVERT_PATH = "/docx/v1/documents/blocks/convert"
-_MARKDOWN_CONTENT_TYPE = "markdown"
+#: 服务端一次建档写全文端点（Trace #544 S-7c，见模块文档同名一节）。**不带
+#: ``/docx`` 前缀**——它是另一个接口族（``docs_ai``），不是 docx 块 API 的子路径。
+_DOCS_AI_DOCUMENTS_PATH = "/docs_ai/v1/documents"
 
-#: 官方转换响应里每个块携带的只读字段（Issue #442），插入端点不接受随请求体
-#: 带回——见 :meth:`LarkDocxDelivery.convert_markdown_to_blocks` 文档字符串
-#: 「markdown 官方转换开关」一节对应小节的完整理由与已知未验证假设。
-_CONVERT_RESPONSE_READONLY_BLOCK_KEYS = ("block_id", "parent_id", "children")
+#: 一次建档的正文格式。另一个合法取值是 ``xml``（带块 id 的结构化形式），本模块
+#: 只发 markdown——模型产出的就是 markdown，转成 xml 等于把刚交回服务端的排版
+#: 责任又拿回来一次。
+_MARKDOWN_FORMAT = "markdown"
 
-#: 单次 children 插入端点的 block 数上限（模块文档「官方能力事实」核实口径，
-#: 未做真实调用探针）。超过时 :meth:`LarkDocxDelivery.write_blocks` 整体拒绝、
-#: 不分批插入——理由见模块文档「markdown 官方转换开关」一节：分批会打破
-#: :meth:`LarkDocxDelivery.read_body_children` 判据依赖的"正文一次写入"假设。
-MAX_CONVERTED_BLOCKS = 1000
+#: 标题在一次建档里的承载方式：拼在正文最前面的一个标签，不是独立字段。
+_TITLE_OPEN_TAG = "<title>"
+_TITLE_CLOSE_TAG = "</title>"
 
-#: 官方转换端点判定"这份 markdown 含本仓库不支持的嵌套结构"（典型是表格：表格
-#: 自身是一级块，单元格却作为独立元素出现在 ``blocks`` 数组里、不在
-#: ``first_level_block_ids`` 内）时的原因码。**独立成常量而不是散落的字面量**：
-#: 它现在同时是抛出点（:meth:`LarkDocxDelivery.convert_markdown_to_blocks`）与
-#: 唯一捕获点（:meth:`LarkDocxDelivery.write_body` 的明示降级分支，Issue #499）
-#: 的判据，两处必须逐字一致——写成两个字面量时，任何一侧改名都会让降级分支
-#: 悄悄失效、退回"整次交付失败"，而没有任何东西会红。
-UNSUPPORTED_NESTED_BLOCKS = "unsupported_nested_blocks"
+#: 服务端对这次建档的自评（``data.result``）。只有 ``success`` 与"该键不存在"
+#: 算作"没有降级"，其余一切取值都倒向降级——见 :func:`_degraded_reason`。
+_RESULT_SUCCESS = "success"
+_RESULT_FAILED = "failed"
 
+#: ``result="failed"`` 的原因码：服务端明确说这次建档失败。判 ``definite``——
+#: 这是服务端给出的结论，不是传输层的猜测。
+DOCS_AI_RESULT_FAILED = "docs_ai_result_failed"
+
+#: 正文长度**前置守卫**阈值（字符数）。超过它就不去调一次建档端点，改走两步的
+#: 段落路径并明示降级——见模块文档「坑一」。
+#:
+#: **这个数字来自 2026-09-03 stage 实测，不是官方文档**：该接口在飞书开放平台
+#: 没有公开文档页（两轮检索未命中），长度上限与限流**官方无契约**。实测四个
+#: 锚点：
+#:
+#: 1. 50 043 字符 → ``code=0`` 建档成功，但服务端耗时 **11.2 s**；
+#: 2. 200 044 字符 → **HTTP 504 ``code=2200``**（31.3 s），且**文档其实已经建
+#:    出来了**、调用方拿不到 id（模块文档「坑一」）；
+#: 3. 本模块自己的出站超时 :data:`REQUEST_TIMEOUT_SECONDS` 是 **20 秒**——真正
+#:    的天花板是这一条，不是那个 200 000 字符的网关超时点：50 000 字符已经用掉
+#:    11.2 s，只剩不到一半余量，而服务端耗时随负载浮动、也随正文结构复杂度
+#:    （表格、嵌套列表）变化，不是字符数的线性函数；
+#: 4. 生产实测的真实正文规模是 **3 268–5 800 字符**（Trace #544 W0-10，生产
+#:    首日三篇 docx）。
+#:
+#: 取 20 000：比实测最大真实正文大约 4 倍（守卫不会误伤正常交付），比实测安全点
+#: 低 60%、比实测失败点低 90%（撞 504 的概率被压到很低），与登记侧
+#: ``core.execution.document_delivery.MAX_TOTAL_CHARS`` 同一量级但**独立取值**
+#: ——那一条是产品规则"正文不该这么长"，这一条是外部接口的实测安全带，两者互不
+#: 依赖：登记侧上限（``MAX_RAW_MARKDOWN_CHARS`` = 40 000）将来若放宽，这道守卫
+#: 仍然独立成立。
+MAX_MARKDOWN_CHARS = 20_000
+
+#: 明示降级的原因码。三个取值都会让调用方把 ``body_degraded_reason`` 落库并改用
+#: 「格式已简化」的用户文案（``apps/gateway/document_delivery.py``），区别只在
+#: 于**为什么**降级，供运维按 ``task_id`` 查因：
+#:
+#: - :data:`BODY_TOO_LONG` / :data:`TITLE_NOT_EMBEDDABLE`：**发出任何请求之前**
+#:   就判定这份正文不适合走一次建档，改走两步段落路径。这两个码由
+#:   :meth:`LarkDocxDelivery.create_document_with_markdown` 抛出，是调用方唯一
+#:   允许捕获并改走段落路径的两个码（它们抛出时**尚未发生任何外部副作用**，
+#:   这是改路安全的前提）；
+#: - :data:`SERVER_SIMPLIFIED_BODY`：一次建档**已经成功**，但服务端自陈这次
+#:   排版有降级（``result`` 非 ``success``，或 ``warnings`` 非空）。文档已经
+#:   建好也写好了，不改路、不重试，只是如实告知。
+#:
+#: 历史取值 ``unsupported_nested_blocks``（Issue #499，客户端转换路径的降级码）
+#: 随 convert 路径一起退役，**不再产生新行**；生产库里已经落下的历史行不受影响
+#: ——``apps/gateway/document_delivery.py`` 的通知分派只判"这一列是不是非空"，
+#: 不枚举取值，迁移 0082 的 CHECK 也只约束"只有 docx 行可以有取值"、不约束取值
+#: 本身。
+BODY_TOO_LONG = "body_too_long"
+TITLE_NOT_EMBEDDABLE = "title_not_embeddable"
+SERVER_SIMPLIFIED_BODY = "server_simplified_body"
+
+#: :meth:`LarkDocxDelivery.create_document_with_markdown` 在**发出请求之前**
+#: 抛出的原因码集合。独立成常量而不是散落的字面量：它同时是抛出点与唯一捕获点
+#: （``apps/gateway/document_delivery.py`` 的改路分支）的判据，两处必须逐字
+#: 一致——写成两处字面量时，任何一侧改名都会让改路分支悄悄失效、把一次本可
+#: 降级交付的请求变成整次失败，而没有任何东西会红。
+PRE_FLIGHT_DEGRADE_REASONS = frozenset({BODY_TOO_LONG, TITLE_NOT_EMBEDDABLE})
 
 @dataclass(frozen=True)
-class WriteBodyOutcome:
-    """:meth:`LarkDocxDelivery.write_body` 的返回值：这次正文到底是按哪条路径
-    写进去的（Issue #499 明示降级）。
+class CreatedDocument:
+    """:meth:`LarkDocxDelivery.create_document_with_markdown` 的返回值：这次
+    一次建档到底建出了什么（Trace #544 S-7c）。
 
-    ``degraded_reason``：``None`` = 按调用方要求的路径原样写入（转换开关关时
-    的段落路径，或开关开时的官方转换路径），没有任何降级；非 ``None`` = 官方
-    转换被飞书**确定性拒绝**（当前唯一取值 :data:`UNSUPPORTED_NESTED_BLOCKS`），
-    正文已经改用纯文本段落路径写入，**用户拿到的排版与他本该拿到的不同**。
+    ``document_id``：新文档的标识，正文**已经**随这次调用写完（不存在"建了档、
+    正文还没写"的中间态——见模块文档「与检查点状态机的关系」）。
 
-    **为什么必须有返回值、而不是让适配器自己把降级咽下去**：本模块此前的姿态
-    是"转换失败一律向上抛，绝不静默退回段落路径"，理由是静默降级会制造"用户
-    以为拿到了带格式的文档、实际收到另一种内容"的假象。产品负责人 2026-08-31
-    就 Issue #499 裁定改为**降级交付**（含表格的回答此前 18.2% 整次交付失败，
-    实测见该 issue W0-1 评论），但这条裁定的成立条件是**把"静默降级"换成
-    "明示降级"**——调用方必须知道这次降级了，才能如实告知用户格式已简化。
-    这个返回值就是那条跨模块信号；调用方（``apps/gateway/document_delivery.py``）
-    丢掉它，等于把裁定退化成当初被明令禁止的静默降级。
+    ``degraded_reason``：``None`` ＝ 服务端未自陈任何降级；非 ``None`` ＝ 服务端
+    说这次排版有简化（当前唯一取值 :data:`SERVER_SIMPLIFIED_BODY`），**用户拿到
+    的排版与他本该拿到的不同**。
+
+    **为什么必须有返回值、而不是让适配器自己把降级咽下去**：静默降级会制造
+    "用户以为拿到了带格式的文档、实际收到另一种内容"的假象。产品负责人
+    2026-08-31 就 Issue #499 裁定用「降级 ＋ 如实告知」取代「整次失败」，取代的
+    是失败结论，**不是"必须让用户知道"这条纪律**。这个字段就是那条跨模块信号；
+    调用方（``apps/gateway/document_delivery.py``）丢掉它，等于把裁定退化成当初
+    被明令禁止的静默降级。
     """
 
+    document_id: str
     degraded_reason: str | None = None
 
     @property
@@ -376,11 +410,53 @@ def _safe_feishu_code(value: object) -> str:
     return "feishu_code_invalid"
 
 
-def _strip_readonly_block_fields(block: Mapping[str, Any]) -> dict[str, Any]:
-    """剔除 :data:`_CONVERT_RESPONSE_READONLY_BLOCK_KEYS` 里列出的只读字段，
-    返回可以原样传给插入端点的浅拷贝（不修改入参）。"""
+def _build_markdown_content(title: str, markdown: str) -> str:
+    """把标题与正文拼成一次建档的 ``content``：``<title>…</title>`` ＋ 空行 ＋
+    正文（Trace #544 S-7c，与官方 CLI 同一形态）。
 
-    return {key: value for key, value in block.items() if key not in _CONVERT_RESPONSE_READONLY_BLOCK_KEYS}
+    只做拼接，不改写正文一个字符——本仓库 2026-08-29 裁定停止字符级剥离的理由
+    仍然成立（正文里的 ``-12.85%``/``3-5%`` 属于数据本身，不是语法噪音）。
+    标题里若含尖括号，拼接会破坏这个标签的边界，由调用方在拼接**之前**拦下
+    （见 :meth:`LarkDocxDelivery.create_document_with_markdown`），这里不做
+    任何静默转义。
+    """
+
+    return f"{_TITLE_OPEN_TAG}{title}{_TITLE_CLOSE_TAG}\n\n{markdown}"
+
+
+def _degraded_reason(data: Mapping[str, Any]) -> str | None:
+    """按服务端自陈判定这次建档有没有降级；``result="failed"`` 直接抛确定性
+    失败（模块文档「坑二」）。
+
+    判定顺序与"拿不准倒向多说一句"的方向都是刻意的：
+
+    1. ``result="failed"`` → :data:`DOCS_AI_RESULT_FAILED`（``definite=True``）。
+       与官方 CLI 同一口径：服务端说失败就是失败，不猜"也许文档其实建出来了"。
+    2. ``warnings`` 非空 → 降级。**不看 ``result``**：服务端可能同时给出
+       ``result="success"`` 与一串 ``degrade_code=…`` 警告，这时以警告为准。
+    3. ``result`` 是除 ``success`` 之外的任何取值（``partial_success``、以及
+       将来可能新增的任何未登记取值）→ 降级。**不枚举白名单**：一个我们没见过
+       的取值最可能的含义是"出了点什么事"，倒向"多说一句格式可能已简化"，
+       不能因为不认识就当成干净成功。
+    4. ``result`` 键不存在 → 不降级。探针二实测：干净成功时 ``data`` 只有
+       ``document`` 一个键，"键不存在"就是零告警，不是"这个版本不返回"。
+
+    **这个函数不是"全部降级都会被发现"的保证**：探针实测原始 HTML 块被静默
+    丢弃且既不产生 ``warnings``、``result`` 也仍是 ``success``——那一类丢弃在
+    响应里没有任何痕迹，本函数看不见（模块文档「坑二」末段如实登记）。
+    """
+
+    result = data.get("result")
+    if isinstance(result, str) and result.strip().lower() == _RESULT_FAILED:
+        raise FeishuDocxDeliveryError(DOCS_AI_RESULT_FAILED, definite=True)
+    warnings = data.get("warnings")
+    if isinstance(warnings, (list, tuple)) and any(warning for warning in warnings):
+        return SERVER_SIMPLIFIED_BODY
+    if result is None:
+        return None
+    if isinstance(result, str) and result.strip().lower() == _RESULT_SUCCESS:
+        return None
+    return SERVER_SIMPLIFIED_BODY
 
 
 class Transport(Protocol):
@@ -390,9 +466,19 @@ class Transport(Protocol):
 
 
 def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = None, token: str | None = None) -> Any:
-    """默认传输层：只发 HTTPS，不重试有副作用的请求（同
+    """默认传输层：只发 HTTPS，**不重试**任何请求（同
     :func:`lingxi.adapters.feishu_tenant_token.urllib_transport` 的姿态：飞书
     调用失败按已知分类抛出，交由调用方决定要不要重试）。
+
+    **HTTP 5xx 一律不解析响应体，直接判"结果不明"（``definite=False``）**
+    ——Trace #544 S-7c 实测坐实的一条硬规则（模块文档「坑一」）：一次建档超时
+    返回的是 HTTP 504 ＋ 响应体 ``{"code": 2200, "msg": "Gateway timeout…"}``，
+    而**服务端其实已经把整篇文档建出来了**。如果照常解析响应体，那个非 0 的
+    ``code`` 会让 :meth:`LarkDocxDelivery._data` 判成"飞书明确拒绝"
+    （``definite=True``），上层据此落 ``failed``——把一次"可能已经建好文档"的
+    调用记成确定性失败，与真实世界相反。5xx 是服务端/网关侧的故障或超时，**永远
+    不证明请求没有生效**，因此响应体里那个业务码在这里不具备判别力，不读。
+    4xx 与 2xx 仍然照常解析：飞书的业务错误码走这两类状态码返回。
     """
 
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
@@ -404,6 +490,9 @@ def urllib_transport(method: str, url: str, *, body: Mapping[str, Any] | None = 
         with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - 地址来自受控配置且已校验 https
             return json.loads(response.read())
     except HTTPError as error:
+        if error.code >= 500:
+            # 见本函数文档字符串：5xx 不解析响应体，结果不明。
+            raise FeishuDocxDeliveryError(f"http_{error.code}", definite=False) from error
         try:
             return json.loads(error.read())
         except Exception as parse_error:
@@ -437,9 +526,11 @@ class LarkDocxDelivery:
         self._tenant_access_token = tenant_access_token
         self._tenant_domain = _require_tenant_domain(tenant_domain)
         self._transport: Callable[..., Any] = transport or urllib_transport
-        # Issue #408「markdown 官方转换开关」：默认 False（零行为变化）；不是
-        # 本类自己读环境变量（adapters/ 不直接读 os.environ），由装配层把解析
-        # 好的布尔值传进来——见 :meth:`write_body` 与模块文档对应小节。
+        # 止损闸（Issue #408 起就有的 `LINGXI_DOCX_MARKDOWN_CONVERT`，Trace
+        # #544 S-7c 改变了它的含义、保留了它本身）：默认 False（构造函数自身的
+        # 默认值＝零行为变化；真正生效的值由装配层显式传入）。不是本类自己读
+        # 环境变量（adapters/ 不直接读 os.environ），由装配层把解析好的布尔值
+        # 传进来——见 :attr:`markdown_convert_enabled` 与模块文档对应小节。
         self._markdown_convert_enabled = bool(markdown_convert_enabled)
 
     def _call(
@@ -524,225 +615,90 @@ class LarkDocxDelivery:
         )
         logger.info("飞书 docx 正文已写入 document_id_len=%s 段落数=%s", len(doc_id), len(texts))
 
-    def convert_markdown_to_blocks(self, markdown: str) -> list[dict[str, Any]]:
-        """把一段 markdown 转换成飞书官方 block 结构、按文档真实顺序排好
-        （Issue #408 正式方案，Issue #467／rc22 S-4 起代码默认开启——见
-        :meth:`write_body` 与模块文档「markdown 官方转换开关」一节；重排与
-        防御性拒绝的完整理由见该节 Issue #442 更新的段落）。
+    @property
+    def markdown_convert_enabled(self) -> bool:
+        """这套部署要不要走「服务端一次建档写全文」这条路（模块文档「开关保留
+        为止损闸」一节）。
 
-        ``POST /docx/v1/documents/blocks/convert``，请求体 ``{"content_type":
-        "markdown", "content": markdown}``。这个端点只做转换、不写入任何文档，
-        失败或重试都不产生外部副作用。**响应体 ``data.blocks`` 不是文档顺序**
-        （Issue #442 受控探针实证）——真实顺序由 ``data.first_level_block_ids``
-        给出，本方法据此重排后才返回；``data.block_id_to_image_urls`` 是响应里
-        的另一个键，与 blocks 无关，本方法不读取它。
+        **只读、不带副作用**，供调用方在决定走哪条路之前问一句。刻意做成属性
+        而不是让 :meth:`create_document_with_markdown` 在开关关闭时抛一个原因码
+        ——开关关闭时走段落路径**不是降级**（那是这套部署本来就要求的排版），
+        用降级机制去表达它会让调用方把一次正常交付告知成"格式已简化"。
         """
 
-        text = (markdown or "").strip()
+        return self._markdown_convert_enabled
+
+    def create_document_with_markdown(self, title: str, markdown: str) -> CreatedDocument:
+        """**一次调用**建档并写完整篇正文，返回 :class:`CreatedDocument`
+        （Trace #544 S-7c，见模块文档「服务端一次建档写全文」一节）。
+
+        ``POST /open-apis/docs_ai/v1/documents``，请求体 ``{"format":
+        "markdown", "content": "<title>标题</title>\\n\\n正文"}``。不传
+        ``parent_token``：探针三实测不传时文档落在应用云空间的同一个目录，与
+        历史真实交付文档并列，所有权仍归机器人——落点、授权、链接形态与老路径
+        逐字相同，因此本模块不引入一个需要额外配置的目录标识。
+
+        **发出请求之前的两道守卫**（都抛
+        :data:`PRE_FLIGHT_DEGRADE_REASONS` 里的原因码，``definite=True``）：
+
+        1. 正文长度超过 :data:`MAX_MARKDOWN_CHARS` → :data:`BODY_TOO_LONG`。
+           不拿超长正文去撞 504（模块文档「坑一」）：那次超时**结果不明且不可
+           回读**，而这里失败关闭时**一个请求都还没发出去**，调用方改走两步
+           段落路径是安全的。
+        2. 标题含 ``<`` 或 ``>`` → :data:`TITLE_NOT_EMBEDDABLE`。标题是拼在
+           正文最前面的一个标签、不是独立字段，尖括号会破坏标签边界（典型后果：
+           标题被提前截断、剩下的半截标题混进正文）。**不做静默转义或剥离**
+           ——那正是 2026-08-29 裁定停止的那类"替用户改写内容"；改走两步路径
+           时标题走的是 JSON 字段，没有这个问题，用户拿到的标题逐字完整。
+
+        这两个码是调用方**唯一**允许捕获并改路的两个码；其余一切（业务错误码、
+        :data:`DOCS_AI_RESULT_FAILED`、结果不明、``LookupError``）都必须原样
+        向上抛。捕获范围必须窄到这两个码，且必须只包住本方法：泛化成"捕获所有
+        异常都改走段落路径"会把真实故障（限流、权限缺失、超时）吞成"交付成功"；
+        而**超时之后改走段落路径会真的建出第二篇文档**——第一篇很可能已经建好
+        且带着全文，只是我们拿不到它的 id。
+
+        **绝不重试**：本方法不重试、默认传输层不重试、结果不明由调用方按
+        ``V-交付-03`` 落 ``uncertain``（不自动重发，转人工核对）。
+
+        返回值里的 ``degraded_reason`` 由 :func:`_degraded_reason` 按服务端自陈
+        判定（``result`` ＋ ``warnings`` 一起看，拿不准倒向多说一句），调用方
+        必须接住并如实告知用户——丢掉它等于静默降级。
+        """
+
+        text = (title or "").strip()
         if not text:
-            raise ValueError("markdown 正文不能为空")
+            raise ValueError("文档标题不能为空")
+        body_text = markdown if isinstance(markdown, str) else ""
+        if not body_text.strip():
+            raise ValueError("文档正文不能为空")
+        if _TITLE_OPEN_TAG[0] in text or _TITLE_CLOSE_TAG[-1] in text:
+            raise FeishuDocxDeliveryError(TITLE_NOT_EMBEDDABLE, definite=True)
+        content = _build_markdown_content(text, body_text)
+        if len(content) > MAX_MARKDOWN_CHARS:
+            raise FeishuDocxDeliveryError(BODY_TOO_LONG, definite=True)
+
         data = self._data(
             self._call(
                 "POST",
-                _BLOCKS_CONVERT_PATH,
-                body={"content_type": _MARKDOWN_CONTENT_TYPE, "content": markdown},
+                _DOCS_AI_DOCUMENTS_PATH,
+                body={"format": _MARKDOWN_FORMAT, "content": content},
             )
         )
-        blocks = data.get("blocks")
-        if not isinstance(blocks, list) or not blocks:
-            raise LookupError("markdown 转换响应缺少可用的 blocks 字段：结果不明")
-        mapping_blocks = [block for block in blocks if isinstance(block, Mapping)]
-        if not mapping_blocks:
-            # P2 顺手（独立审查）：转换请求本身已经成功拿到响应（走到这里说明
-            # `data.get("blocks")` 是非空列表，上面那条 `LookupError` 分支没有
-            # 触发），只是列表里每一项都不是期望的 block 形状（例如飞书返回了
-            # 一串字符串/数字，或本仓库对响应形状的假设本身有误）——这与"入参
-            # 校验，还没发出任何请求"的 :class:`ValueError` 是两类不同的问题：
-            # 这里已经真实调用了转换接口、已经拿到一个响应，只是内容形状不对。
-            # 之前这里静默返回空列表，让空列表流进
-            # :meth:`write_blocks`，那里再触发一条与"未发起任何请求的入参校验"
-            # 同型的裸 ``ValueError("blocks 不能为空")``——把"飞书响应形状不对"
-            # 误归进了 gateway 消费循环白名单里"发出请求前的确定性入参校验"
-            # 那一类（模块 `apps/gateway/document_delivery.py` 文档「四步的
-            # 失败分类只有两种」a 项），而它其实应该走同一个白名单里的
-            # `FeishuDocxDeliveryError` 分支。这个失败是确定性的（转换端点
-            # 不写入任何文档、没有外部副作用，同一份 markdown 重放会得到同样
-            # 的转换结果），因此标 ``definite=True``——与
-            # :meth:`write_blocks` 的 ``too_many_blocks`` 走同一类"转换/写入
-            # 前置校验发现的确定性失败"。
-            raise FeishuDocxDeliveryError("markdown_convert_blocks_not_mapping", definite=True)
-
-        # Issue #442：`blocks` 数组不是文档顺序，真实顺序在
-        # `first_level_block_ids` 里。缺失/为空一律 definite 拒绝——没有这份
-        # 顺序清单就无法保证交付顺序正确，宁可拒绝也不猜测顺序。
-        first_level_block_ids = data.get("first_level_block_ids")
-        if not isinstance(first_level_block_ids, list) or not first_level_block_ids:
-            raise FeishuDocxDeliveryError(
-                "markdown_convert_missing_first_level_block_ids", definite=True
-            )
-
-        # 每个块必须携带非空字符串 block_id 且必须出现在
-        # first_level_block_ids 里，否则一律 definite 拒绝——这既拦住表格一类
-        # 嵌套结构（表格自身是一级块，但它的单元格作为独立元素出现在
-        # `blocks` 里、却不在 `first_level_block_ids` 内），也拦住"块缺
-        # block_id 因而无法确认层级"这种更基础的形状不对，两者都无法安全
-        # 判断该块该不该、该按什么顺序交付，不做静默丢弃或猜测。
-        first_level_ids = {
-            block_id for block_id in first_level_block_ids if isinstance(block_id, str) and block_id
-        }
-        for block in mapping_blocks:
-            block_id = block.get("block_id")
-            if not isinstance(block_id, str) or block_id not in first_level_ids:
-                raise FeishuDocxDeliveryError(UNSUPPORTED_NESTED_BLOCKS, definite=True)
-
-        by_block_id = {block["block_id"]: block for block in mapping_blocks}
-        ordered_blocks: list[Mapping[str, Any]] = []
-        for block_id in first_level_block_ids:
-            block = by_block_id.get(block_id) if isinstance(block_id, str) else None
-            if block is None:
-                # `first_level_block_ids` 引用了一个在 `blocks` 数组里找不到
-                # 的 block_id：响应内部不自洽，理论上不应发生。这与上面两条
-                # "明确知道拒绝原因"的 definite 分支不同——这里连"为什么不
-                # 一致"都无法确定，归类为结果不明，同
-                # :meth:`read_body_children` 既有的分类口径。
-                raise LookupError(
-                    "markdown 转换响应 first_level_block_ids 引用了不存在的块：结果不明"
-                )
-            ordered_blocks.append(block)
-
-        # 重排后两道对账（rc21 修复包 B，opus 审查发现，与上面「缺失/为空」
-        # 「引用不存在的块」两道既有防线同型同码风格——definite 拒绝，不静默
-        # 丢块或重复交付）：
-        #
-        # 1. `first_level_block_ids` 本身出现重复 block_id：`by_block_id` 是
-        #    按 `block_id` 建的字典，重复的 id 在这一步已经把同一个块对象
-        #    在 `ordered_blocks` 里放了不止一次——复现："first_level 重复静默
-        #    重复交付"（同一段正文在飞书文档里出现两次）。到这里为止所有
-        #    entries 都已经确认是有效字符串（否则上面的循环早就因为
-        #    `block is None` 抛出 `LookupError`），因此直接用 `set` 判重複，
-        #    不需要再过滤一遍。
-        if len(first_level_block_ids) != len(set(first_level_block_ids)):
-            raise FeishuDocxDeliveryError(
-                "markdown_convert_duplicate_first_level_block_ids", definite=True
-            )
-        #
-        # 2. 重排后的块数与 `mapping_blocks` 原始块数对不上：`by_block_id`
-        #    是字典推导式，`mapping_blocks` 里出现重复 block_id 时后一个会
-        #    静默覆盖前一个——复现："重复 block_id 静默丢块"（前一个块的内容
-        #    从此在返回结果里凭空消失，且不留任何痕迹）。上面第 1 条已经
-        #    挡住"`first_level_block_ids` 自身重复"这一种成因，这一条挡的
-        #    是"`mapping_blocks` 自身重复、而 `first_level_block_ids` 无重复"
-        #    这一种成因——两种成因互相独立，其中一种恰好在计数上抵消另一种
-        #    时（`mapping_blocks` 与 `first_level_block_ids` 对同一个
-        #    block_id 都重复了同样的次数），单靠这一条计数对账会漏判，所以
-        #    两条对账都必须做，不能只留一条。
-        if len(ordered_blocks) != len(mapping_blocks):
-            raise FeishuDocxDeliveryError("markdown_convert_block_count_mismatch", definite=True)
-
-        return [_strip_readonly_block_fields(block) for block in ordered_blocks]
-
-    def write_blocks(self, document_id: str, blocks: Sequence[Mapping[str, Any]]) -> None:
-        """把已经是飞书 block 形状的 ``blocks`` 写进正文，沿用与
-        :meth:`write_paragraphs` 完全相同的 children 插入端点（同一坐标、同一
-        ``index=0`` 单次写入语义）——供 :meth:`write_body` 在开关打开时调用，
-        也可单独测试。
-
-        超过 :data:`MAX_CONVERTED_BLOCKS` 一律在发起任何请求之前整体拒绝，
-        不做分批插入；理由见模块文档「markdown 官方转换开关」一节（分批会打破
-        :meth:`read_body_children` 判据依赖的"正文一次写入"假设）。这是一次
-        确定性拒绝（``definite=True``），沿用 ``too_many_blocks`` 这个专用原因
-        码，不与飞书返回的业务错误码混用。
-        """
-
-        doc_id = _require_document_id(document_id)
-        children = list(blocks) if blocks is not None else []
-        if not children:
-            raise ValueError("blocks 不能为空")
-        if len(children) > MAX_CONVERTED_BLOCKS:
-            raise FeishuDocxDeliveryError("too_many_blocks", definite=True)
-        self._data(
-            self._call(
-                "POST",
-                f"{_DOCX_DOCUMENTS_PATH}/{doc_id}/blocks/{doc_id}/children",
-                body={"children": children, "index": 0},
-            )
-        )
+        degraded_reason = _degraded_reason(data)
+        document = data.get("document")
+        if not isinstance(document, Mapping):
+            raise LookupError("一次建档响应缺少 document 字段：结果不明，不能确定文档是否已建好")
+        document_id = document.get("document_id")
+        if not isinstance(document_id, str) or not document_id:
+            raise LookupError("一次建档响应缺少可回读标识 document_id：结果不明")
         logger.info(
-            "飞书 docx 正文已按官方转换写入 document_id_len=%s block数=%s", len(doc_id), len(children)
+            "飞书 docx 文档已一次建档并写入正文 document_id_len=%s content_len=%s degraded_reason=%s",
+            len(document_id),
+            len(content),
+            degraded_reason,
         )
-
-    def write_body(
-        self, document_id: str, *, paragraphs: Sequence[str], markdown: str
-    ) -> WriteBodyOutcome:
-        """写正文的唯一装配入口：把「markdown 官方转换开关」变成实际可执行的
-        分支（模块文档同名一节），并把"这次是不是降级写的"作为
-        :class:`WriteBodyOutcome` 返回给调用方。
-
-        ``markdown_convert_enabled=False``（构造函数默认值）时逐字调用
-        :meth:`write_paragraphs`，返回 ``degraded_reason=None``——不是降级，
-        是这套部署本来就要求的路径。为 ``True`` 时改走
-        :meth:`convert_markdown_to_blocks` + :meth:`write_blocks`。
-
-        **唯一的降级分支（Issue #499，产品负责人 2026-08-31 裁定）**：
-        :meth:`convert_markdown_to_blocks` 抛出
-        :data:`UNSUPPORTED_NESTED_BLOCKS` 这**一个**原因码时，改用
-        :meth:`write_paragraphs` 交付纯文本段落，并返回
-        ``degraded_reason=UNSUPPORTED_NESTED_BLOCKS``。裁定依据：翻转
-        Issue #467 的默认值之后，含表格的回答从"降级但拿得到"变成"整次交付
-        失败"，实测 22 次投递里 4 次（18.2%）命中，其中 1 次来自最简单的
-        单公司/单指标/单月问题——用户要的是内容，格式损失可以如实告知，空手
-        而归的代价明显更大。
-
-        **这条捕获必须窄到这一个码，且必须只包住转换调用本身**，两条都是安全
-        前提，不是风格偏好：
-
-        1. 只捕这一个码——``too_many_blocks``/``markdown_convert_*``/飞书业务
-           错误码/``LookupError`` 全部维持原样向上抛。泛化成"捕获所有异常都
-           降级"会把真实故障（限流、权限缺失、响应形状不对）一并吞成"交付
-           成功"，那比原来的整次失败更糟。
-        2. ``try`` 只包 :meth:`convert_markdown_to_blocks`——转换端点**不写入
-           任何文档、没有外部副作用**，因此在它失败之后改走段落路径是安全的
-           （这篇文档此刻还是空的）。:meth:`write_blocks` 一旦发起就有副作用，
-           它的失败**绝不能**触发第二次写入：那会把同一份正文写两遍。把
-           ``try`` 缩到转换这一步，即使将来 :meth:`write_blocks` 也开始抛同一
-           个码，这条约束也仍然成立。
-
-        **降级不等于可以不告诉用户。** 本方法此前的文档字符串写的是"绝不捕获
-        后静默退回纯文本段落路径"，理由是静默降级会制造"用户以为拿到了带格式
-        的文档、实际收到的是另一种内容"的假象。那条理由**至今成立**——被推翻
-        的只是"因此宁可整次失败"这个结论，不是"降级必须让用户知道"这条纪律。
-        返回值就是为此存在：调用方（``apps/gateway/document_delivery.py``）
-        必须接住它并改用明示降级的用户文案。**丢掉这个返回值 = 恢复成当初被
-        明令禁止的静默降级。**
-
-        **降级后的观感如实登记**：``paragraphs`` 由
-        ``core/execution/document_delivery.py::normalize_markdown`` 产出，它按
-        空行切段、段内换行折叠成空格且不剥离 markdown 语法字符——因此表格会被
-        拍平成一段长文本，``|---|`` 这类分隔行会原样留在正文里。**本降级解决
-        的是"拿不到"，不保证"好看"**，用户文案不得暗示格式完好。
-        """
-
-        if not self._markdown_convert_enabled:
-            self.write_paragraphs(document_id, paragraphs)
-            return WriteBodyOutcome()
-
-        try:
-            blocks = self.convert_markdown_to_blocks(markdown)
-        except FeishuDocxDeliveryError as error:
-            if error.code != UNSUPPORTED_NESTED_BLOCKS:
-                raise
-            # 到这里为止没有发起过任何写入（转换端点无副作用），这篇文档仍然
-            # 是空的——改走段落路径不会重复交付内容。
-            logger.warning(
-                "飞书 docx 正文降级为纯文本段落路径 document_id_len=%s reason=%s",
-                len(document_id),
-                error.code,
-            )
-            self.write_paragraphs(document_id, paragraphs)
-            return WriteBodyOutcome(degraded_reason=error.code)
-
-        self.write_blocks(document_id, blocks)
-        return WriteBodyOutcome()
+        return CreatedDocument(document_id=document_id, degraded_reason=degraded_reason)
 
     def grant_full_access(self, document_id: str, open_id: str) -> None:
         """对 ``open_id`` 这个人授予文档级「可管理」（决策记录 2026-08-23 裁定的
@@ -836,21 +792,25 @@ class LarkDocxDelivery:
 
 
 __all__ = [
+    "BODY_TOO_LONG",
+    "DOCS_AI_RESULT_FAILED",
     "DOCX_PERMISSION_TYPE",
     "FULL_ACCESS_PERM",
-    "MAX_CONVERTED_BLOCKS",
+    "MAX_MARKDOWN_CHARS",
     "OPENID_MEMBER_TYPE",
-    "UNSUPPORTED_NESTED_BLOCKS",
+    "PRE_FLIGHT_DEGRADE_REASONS",
+    "SERVER_SIMPLIFIED_BODY",
+    "TITLE_NOT_EMBEDDABLE",
     "USER_OPEN_ID_PREFIX",
+    "CreatedDocument",
     "FeishuDocxDeliveryError",
     "LarkDocxDelivery",
-    "WriteBodyOutcome",
     "REQUEST_TIMEOUT_SECONDS",
     "Transport",
     "urllib_transport",
 ]
 
-# 说明：`read_body_children`/`convert_markdown_to_blocks`/`write_blocks`/
-# `write_body` 都是 `LarkDocxDelivery` 的实例方法，不单独导出符号——同
+# 说明：`create_document_with_markdown`/`read_body_children` 都是
+# `LarkDocxDelivery` 的实例方法，不单独导出符号——同
 # `create_document`/`write_paragraphs`/`grant_full_access`/`read_members`
 # 既有方法一样，只通过类本身暴露。

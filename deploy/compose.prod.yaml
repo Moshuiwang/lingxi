@@ -32,7 +32,14 @@ services:
       resources:
         limits:
           cpus: "${LINGXI_SCHEDULER_CPU_LIMIT:-1.0}"
-          memory: ${LINGXI_SCHEDULER_MEM_LIMIT:-1G}
+          # 报告 R6-D4：这一行原为 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}`。默认值是
+          # 静默的：漏配时 scheduler/gateway 各退回 1G，加上 worker-queue 的 2G
+          # 就是 4G，超过宿主机 3.9GiB 可用内存，而 `docker compose config` 一声
+          # 不响。runbook §2.1 早就要求显式写这两行并渲染回读——那是纪律，不是闸门。
+          # 改成无默认值的 `${VAR:?}` 之后，漏配直接让渲染失败，与 worker-queue
+          # 四项同一姿态。提示语必须是短的纯 ASCII 单行（无冒号加空格、无 `#`），
+          # 理由见下方 worker-queue 段的说明与 check_compose_interpolation_is_yaml_safe。
+          memory: ${LINGXI_SCHEDULER_MEM_LIMIT:?prod scheduler memory must be set in deploy/.env.prod; see deploy/README.md}
           pids: ${LINGXI_SCHEDULER_PIDS_LIMIT:-512}
     volumes:
       - lingxi-credentials:/var/lib/lingxi/credentials
@@ -55,17 +62,36 @@ services:
       resources:
         limits:
           cpus: "${LINGXI_GATEWAY_CPU_LIMIT:-1.0}"
-          memory: ${LINGXI_GATEWAY_MEM_LIMIT:-1G}
+          # 同 scheduler（报告 R6-D4）：无默认值，漏配即渲染失败。
+          memory: ${LINGXI_GATEWAY_MEM_LIMIT:?prod gateway memory must be set in deploy/.env.prod; see deploy/README.md}
           pids: ${LINGXI_GATEWAY_PIDS_LIMIT:-512}
 
   worker:
     env_file:
       - ./.env.prod.worker
+    environment:
+      # 报告 C-7：代码侧的环境判据。`apps/worker/config.py` 的
+      # `_innertest_content_capture` 见到这个值就一律不启用内测轮内容级采集，
+      # 无论 LINGXI_INNERTEST_CONTENT_CAPTURE* 两个变量配成什么。
+      # **写在 `environment:` 而不是外部 env 文件里是刻意的**：compose 的
+      # `environment:` 覆盖 `env_file`，因此哪怕有人把 stage 的 worker env 文件
+      # 整份复制进 .env.prod.worker，抄来的值也不再可能生效——判据活在入库、
+      # 被评审、被门禁扫描的这份文件里。姿态同下方 LINGXI_WORKER_WORKSPACE。
+      # scripts/ci/check_deploy_contract.py 的
+      # check_prod_declares_deploy_environment 把它钉成会变红的断言。
+      LINGXI_DEPLOY_ENVIRONMENT: "prod"
     deploy:
       resources:
         limits:
           cpus: "${LINGXI_WORKER_CPU_LIMIT:-2.0}"
-          memory: ${LINGXI_WORKER_MEM_LIMIT:-4G}
+          # 报告 P3：默认值原为 `4G`，**大于宿主机可用内存**（约 3.9GiB），也就是
+          # 说这条"上限"在默认取值下永远不会生效——一个不会生效的上限比没有上限
+          # 更糟，它让人以为已经限住了。改成与常驻 worker-queue 同样的 2G 合同值。
+          # 这里保留 `:-` 默认值而不是改成 `${VAR:?}`：一次性 worker 属 `job`
+          # profile，而 compose 的插值对整份文件求值、不分 profile，改成无默认值
+          # 会让每一次 mvp 的 `up -d` 都多要求一个变量。真要收紧成显式声明，属
+          # 部署配置决定，需连 runbook 与 .env.prod 一起改。
+          memory: ${LINGXI_WORKER_MEM_LIMIT:-2G}
           pids: ${LINGXI_WORKER_PIDS_LIMIT:-1024}
     volumes:
       - lingxi-users:/var/lib/lingxi/users
@@ -76,10 +102,24 @@ services:
     env_file:
       - ./.env.prod.worker-queue
     environment:
+      # 报告 C-7：同 `worker` 服务，理由见那一段注释。
+      LINGXI_DEPLOY_ENVIRONMENT: "prod"
       # Issue #496 / Trace #502：执行并发硬上限由产品负责人固定为 4。值来自外部
       # 根 `deploy/.env.prod`，不是仓库中的真实生产文件；`${VAR:?}` 让漏配直接
       # 阻止 compose 渲染，不能退回一个未审计的默认值。
       LINGXI_WORKER_MAX_CONCURRENCY: "${LINGXI_WORKER_MAX_CONCURRENCY:?prod worker concurrency must be 4; see deploy/README.md}"
+      # 隔离边界（Trace #544 S-2b / 报告 W-1）：Agent SDK 回合的工作目录**必须**
+      # 与用户环境根（lingxi-users 卷的挂载点 /var/lib/lingxi/users）互不包含。
+      # 这不是洁癖：那个目录下每个用户各有一份 0440 的 .mcp.json，里面是**该用户
+      # 专属的问数 MCP Bearer 明文**。把 cwd 设成用户目录根（或它的任何祖先/子孙），
+      # 模型一次相对路径读取就能拿到别人的令牌——而 cwd 里的 .mcp.json 同时还是
+      # Claude CLI 的项目级 MCP 配置来源。**这一行写在 compose 而不是外部 env 文件
+      # 里是刻意的**：compose 的 `environment:` 覆盖 `env_file`，因此哪怕
+      # .env.<环境>.worker-queue 里还留着一个不安全的旧值，也不再可能生效。
+      # scripts/ci/check_deploy_contract.py 的 check_worker_workspace_isolation
+      # 把这条边界钉成会变红的断言（用户目录根由 lingxi-users 挂载点推导，用户
+      # 家目录的构造形状回读 adapters/user_environment.py 的 home_of）。
+      LINGXI_WORKER_WORKSPACE: "/tmp/lingxi-workspace"
     # ---- 生产 worker-queue 资源合同（Issue #494/#502，2026-08-31）-----------
     # 产品负责人已确认生产机器型号与 stage 一致，worker-queue 合同为 CPU 1.5、
     # memory 2G、pids 512、tmpfs 256m。真实值仍由外部根 `deploy/.env.prod` 注入，

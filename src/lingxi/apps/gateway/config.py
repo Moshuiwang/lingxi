@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
 
 from lingxi.adapters.postgres import (
@@ -110,18 +111,22 @@ class GatewayConfig:
     # 进程需要判断同一份开关，两处读同一个变量名，同 `bot_open_id`/
     # `innertest_roster_open_ids` 不套前缀的理由一致）。默认 `True`（开，
     # Issue #467 执行 PM 裁定：docx 转换已通过 rc21 stage 探针验证，不再需要
-    # 运维每次显式开启）：``apps/gateway/document_delivery.py`` 的
-    # ``_process_docx_claim`` 与 ``adapters/feishu_docx_delivery.py::
-    # LarkDocxDelivery.write_body`` 在这个值为 `True` 时走官方转换路径。显式
-    # 关闭用精确值 `"0"`；历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage
-    # 配置）**必须继续解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
-    # 打开前提：Bot 权限含 ``docx:document.block:convert``。失败语义（Issue
-    # #499，产品负责人 2026-08-31 裁定）：正文含本仓库不支持的嵌套结构
-    # （``unsupported_nested_blocks``，典型是 markdown 表格）时**降级交付**
-    # ——改走纯文本段落路径写入并如实告知用户格式已简化，不是整次失败；其余
-    # 一切失败仍然一律交付失败/结果不明（失败关闭），**不降级、不静默退回段落
-    # 路径**。见 ``deploy/.env.example`` 对应条目与 ``LarkDocxDelivery.
-    # write_body`` 模块文档「markdown 官方转换开关」一节。
+    # 运维每次显式开启）。**Trace #544 S-7c 换了它管的是哪条路，没有换它本身**：
+    # 现在 `True` ＝ ``apps/gateway/document_delivery.py`` 的
+    # ``_create_docx_body`` 走 ``adapters/feishu_docx_delivery.py::
+    # LarkDocxDelivery.create_document_with_markdown``（服务端 ``docs_ai`` 一次
+    # 建档写全文），`False` ＝ 两步纯文本段落路径。显式关闭用精确值 `"0"`；
+    # 历史值 `"1"`（翻转前唯一的开启值，已经写进现网 stage 配置）**必须继续
+    # 解析成开启**，翻转默认值不得让这些既有配置的语义漂移。
+    # **它保留的理由是止损**：``docs_ai`` 在飞书开放平台没有公开文档页，限流与
+    # 长度上限官方无契约——留一个不改代码、不重新构建镜像就能退回纯段落路径的
+    # 闸门，代价只是一个已经存在的配置项。打开前提**不再包含**
+    # ``docx:document.block:convert``（convert 端点已不再被调用；一次建档用
+    # ``tenant_access_token`` 即可，stage 探针实测无需新增 scope）。失败语义
+    # （Issue #499 裁定，rc25 沿用）：判定为降级时**降级交付**——如实告知用户
+    # 格式已简化，不是整次失败；其余一切失败仍然一律交付失败/结果不明（失败
+    # 关闭），**不静默退回段落路径**。见 ``deploy/.env.example`` 对应条目与
+    # ``feishu_docx_delivery`` 模块文档「服务端一次建档写全文」一节。
     markdown_convert_enabled: bool = True
 
     # 群聊@机器人固定引导（Issue #318，#328 v1.0 裁定 #5）：机器人自身 open_id，
@@ -131,6 +136,25 @@ class GatewayConfig:
     # 条功能整体关闭＝维持此前"群聊完全静默"的现状（失败关闭）**；部署时把它填成
     # 什么值（经 bot info 接口取一次落 env）不在本次改动范围内。
     bot_open_id: str | None = None
+
+    # 「公司+职能→指标名」翻译映射的外置路径（Issue #320 的 gateway 侧接线，
+    # Trace #544 S-2c 修复对抗审查 P-1）。与 `innertest_roster_open_ids` 同一条
+    # 纪律：**刻意不套 `LINGXI_GATEWAY_` 前缀**，读的是 scheduler 侧同一个变量名
+    # `LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`——它不是 gateway 私有配置，而是
+    # 「这台机器认哪一份指标映射」这个必须两个进程一致的共享事实。
+    #
+    # **为什么 gateway 必须读它**：管理员在管理卡上确认一个本地权限动作后，gateway
+    # 侧当场做定向重算并**立即发布**权限范围；scheduler 侧次日日批再算一次。此前
+    # gateway 三个调用点硬读随包默认映射，只有 scheduler 读外置文件——外置文件一旦
+    # 启用，同一个人的权限范围会在"管理动作立即发布"与"次日日批"之间来回翻转，每次
+    # 翻转都是用户可见的真实权限变化。
+    #
+    # **可选，默认 `None`＝未配置＝落回随包默认映射**（生产刻意不配这个变量，与外置
+    # 能力交付前逐字节一致，见 `deploy/.env.example` 该条目）——不配**不是**启动
+    # 失败。**错配不是未配**：配了但指向的文件缺失或格式非法，三个调用点各自按自己
+    # 既有的失败关闭姿态处理（定向重算不发布任何范围并留痕、职位展开拒绝这次管理
+    # 动作、管理卡目录降级为空），**没有一处静默回落随包默认**——那正是双真相的来源。
+    metric_map_path: Path | None = None
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
@@ -277,6 +301,32 @@ def _markdown_convert_enabled(env: Mapping[str, str]) -> bool:
     return False
 
 
+def _metric_map_path(env: Mapping[str, str]) -> Path | None:
+    """外置指标映射路径（Trace #544 S-2c）。
+
+    刻意直接读 ``env.get(METRIC_MAP_PATH_ENV)``，不经过本文件 ``_text()`` 的
+    ``LINGXI_GATEWAY_`` 前缀包装——理由见 :class:`GatewayConfig` 该字段的文档。
+    解析规则也不重新实现：整段委托给
+    :func:`lingxi.adapters.company_function_metric_map_file.parse_metric_map_path`，
+    与 ``apps/scheduler/config.py`` 的 ``SchedulerConfig.metric_map_path`` 复用
+    **同一个函数**——同一个变量值在两个进程里只可能解释成同一份文件，不写第二套
+    解释逻辑等着两边慢慢漂移（这正是本项要根治的缺陷本身）。
+
+    未配置 → ``None``（落回随包默认映射，进程照常启动）；配了但含空白字符 →
+    启动即失败关闭，与本文件其余校验错误同一条纪律，只报变量名不回显值。
+    """
+
+    from lingxi.adapters.company_function_metric_map_file import (
+        METRIC_MAP_PATH_ENV,
+        parse_metric_map_path,
+    )
+
+    try:
+        return parse_metric_map_path(env.get(METRIC_MAP_PATH_ENV))
+    except ValueError as error:
+        raise GatewayConfigError(str(error)) from None
+
+
 def _bot_open_id(env: Mapping[str, str]) -> str | None:
     """机器人自身 open_id（Issue #318 群聊@机器人固定引导）。
 
@@ -352,6 +402,7 @@ def load_config(env: Mapping[str, str]) -> GatewayConfig:
         markdown_convert_enabled=_markdown_convert_enabled(env),
 
         bot_open_id=_bot_open_id(env),
+        metric_map_path=_metric_map_path(env),
     )
 
     # 退避参数的合法性由 BackoffPolicy 定义（factor > 1、base > 0），在这里就地校验，

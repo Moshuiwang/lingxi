@@ -97,6 +97,120 @@ class DeleteAgentSessionFilesTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 delete_agent_session_files(root, "")
 
+    def test_glob_metacharacters_in_the_session_id_are_refused(self) -> None:
+        """对抗审查 2026-09-02 W-3：会话 id 曾被原样拼进 ``rglob`` 的模式串。
+
+        旧实现只拒 ``/`` 与反斜杠，``*``/``?``/``[…]`` 一路放行——
+        ``agent_session_id="*"`` 于是匹配 ``session_root`` 下**所有**用户的转录。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for hostile in ("*", "?", "[a-z]", "**", "01J*", "a\\b", ".", "..", " ", "a.b"):
+                with self.subTest(session_id=hostile):
+                    with self.assertRaises(ValueError):
+                        delete_agent_session_files(root, hostile)
+
+    def test_a_wildcard_never_reaches_another_users_transcript(self) -> None:
+        """W-3 的假根复现，改成会变红的断言：两个用户的转录放在同一棵树下，
+        用 ``"*"`` 发起一次清理——必须一个文件都不动。
+
+        旧实现在这里会把**两份**转录都搬进 ``_archive/usr-a/``：A 的问答原文与
+        B 的问答原文躺进同一个目录。这不是"删多了"，是跨用户的内容搬运。
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            project = root / "projects" / "-tmp-lingxi-workspace"
+            project.mkdir(parents=True)
+            mine = project / "01J00000000000000000000AAA.jsonl"
+            theirs = project / "01J00000000000000000000BBB.jsonl"
+            mine.write_text("A 的问答原文", encoding="utf-8")
+            theirs.write_text("B 的问答原文", encoding="utf-8")
+            user_env_root = Path(tmp) / "user-env"
+            user_env_root.mkdir()
+
+            with self.assertRaises(ValueError):
+                delete_agent_session_files(
+                    root, "*", user_env_root=user_env_root, user_id="usr-a", env={}
+                )
+
+            self.assertTrue(mine.exists() and theirs.exists(), "两份转录都必须原地不动")
+            self.assertFalse(
+                (user_env_root / "_archive").exists(), "被拒的清理不得建出任何归档目录"
+            )
+
+    def test_only_the_exactly_named_file_is_handled(self) -> None:
+        """精确文件名比对：同目录下名字相近的转录一个都不许动。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            project = root / "projects" / "-tmp-lingxi-workspace"
+            project.mkdir(parents=True)
+            target = project / "01J00000000000000000000AAA.jsonl"
+            neighbour = project / "01J00000000000000000000AAAB.jsonl"
+            other_suffix = project / "01J00000000000000000000AAA.jsonl.bak"
+            for path in (target, neighbour, other_suffix):
+                path.write_text("{}", encoding="utf-8")
+
+            handled = delete_agent_session_files(root, "01J00000000000000000000AAA")
+
+            self.assertEqual(handled, 1)
+            self.assertFalse(target.exists())
+            self.assertTrue(neighbour.exists(), "前缀相同的另一个会话不得被牵连")
+            self.assertTrue(other_suffix.exists(), "别的后缀不得被牵连")
+
+    def test_a_traversing_user_id_never_places_the_archive_outside_the_archive_root(
+        self,
+    ) -> None:
+        """W-3 的第二条路径：``user_id`` 未经校验就拼进归档目录。
+
+        ``user_id="../escape"`` 会让归档落到 ``<user_env_root>/escape/``——那是
+        用户目录的同级，也就是放各用户 ``.mcp.json`` 的那一层。现在这种取值让
+        归档整个不可用（退回直接物理删除），绝不写到归档根之外。
+        """
+
+        for hostile in ("../escape", "..", "a/b", "", ".hidden"):
+            with self.subTest(user_id=hostile):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "sessions"
+                    project = root / "projects" / "-tmp-lingxi-workspace"
+                    project.mkdir(parents=True)
+                    target = project / "01J00000000000000000000AAA.jsonl"
+                    target.write_text("{}", encoding="utf-8")
+                    user_env_root = Path(tmp) / "user-env"
+                    user_env_root.mkdir()
+
+                    handled = delete_agent_session_files(
+                        root,
+                        "01J00000000000000000000AAA",
+                        user_env_root=user_env_root,
+                        user_id=hostile,
+                        env={},
+                    )
+
+                    # 退回直接物理删除：清理照常完成，但没有任何东西被写到别处。
+                    self.assertEqual(handled, 1)
+                    self.assertFalse(target.exists())
+                    survivors = sorted(item.name for item in user_env_root.iterdir())
+                    self.assertEqual(survivors, [], f"user-env 下不得多出任何东西：{survivors}")
+
+    def test_a_symlinked_transcript_is_not_followed_out_of_the_root(self) -> None:
+        """精确比对之外的第二条边界：树里的符号链接不得把处理范围拉出 root。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            project = root / "projects" / "-tmp-lingxi-workspace"
+            project.mkdir(parents=True)
+            outside = Path(tmp) / "outside.jsonl"
+            outside.write_text("root 之外的内容", encoding="utf-8")
+            (project / "01J00000000000000000000AAA.jsonl").symlink_to(outside)
+
+            handled = delete_agent_session_files(root, "01J00000000000000000000AAA")
+
+            self.assertEqual(handled, 0, "符号链接不算命中")
+            self.assertTrue(outside.exists(), "root 之外的文件必须完好")
+
 
 class ArchiveOnCleanupTests(unittest.TestCase):
     """Issue #291 L6 取证结论（2026-08-22）：验收现场的一次 ``/new`` 触发

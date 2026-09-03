@@ -177,11 +177,21 @@ class RealBaselineIsHonestTest(unittest.TestCase):
         核心文件只剩 `build_loop` 总装配 + 全部 `_build_*` 名字的 re-export，
         实测 337 行，远退回阈值以下，`--refresh` 按规则自动移除该条目。七个
         目标文件（六个既有 + 一个新文件）均远低于阈值，未新增基线登记。
+
+        2026-09-03 重新登记 `onboarding_runner.py`（1502 行，rc25 修复包 F2）：
+        修复「ops 清单把已 active、名单授权没落报成 provisioned」要求在
+        `_run` 的续行前复核返回点（`grant` 与 `recheck` 同在的唯一位置）加
+        4 行（import `replace`、判定、2 行注释、标注返回）；文件此前 1497 行、
+        任何实质改动都会顶穿 1500 阈值。自己的注释已从 5 行压到 2 行（完整
+        语义在 `OnboardingResult` 文档与 preprovision.py 的 OUTCOME 旁注），
+        修复包范围内不做编排器结构性拆分（风险远大于收益），按门禁「确有
+        理由」路径人工登记 1502 为封顶——此后只许变小；下一次增长触发门禁时
+        应优先拆分。下一次这条测试失效时，同样在此登记理由。
         """
 
         self.assertEqual(
             CHECK.load_baseline(CHECK.BASELINE_PATH),
-            {},
+            {"src/lingxi/core/identity/onboarding_runner.py": 1502},
         )
 
 

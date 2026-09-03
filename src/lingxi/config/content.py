@@ -41,6 +41,14 @@ class ContentSafetyError(ContentError):
 
 # 这些键构成当前 Story 的登记表。增加一个键必须同时增加调用方与测试，不能让配置
 # 文件悄悄长出没人消费的文案；调整文字本身则只需修改 content.toml。
+#: 预开通用户首聊时补的那一句（Issue #541，产品负责人裁定 4：预开通期间静默）。
+#: 常量定义在这里、消费点在 ``core/conversation/pipeline.py`` 的 ``ACTIVE`` 分支：
+#: 键名是内容目录与代码之间的接缝，放在内容目录这一侧才只有一个真相来源。
+#: **正文与 ``REQUIRED_TEXT_KEYS`` 登记由 rc25 S-8b 落**（``content.toml`` /
+#: ``content.lock.toml`` / 本文件的登记表三处必须同一次改完，内容目录加载期要求键
+#: 集合完全相等）；在那之前消费点按 ``ContentRenderError`` 优雅跳过，见消费点注释。
+KEY_PREPROVISIONED_FIRST_CHAT = "onboarding.preprovisioned_first_chat"
+
 REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.checking",
     "onboarding.matched",
@@ -51,6 +59,8 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     "onboarding.internal_error",
     "onboarding.stalled",
     "onboarding.innertest_not_open",
+    # 预开通用户首聊时补的一句（Issue #541 rc25 S-8b，裁定④「静默＋首聊补一句」）。
+    "onboarding.preprovisioned_first_chat",
     "onboarding.delegated_subject",
     "gateway.busy_hint",
     "gateway.busy_hint_queued",
@@ -142,6 +152,15 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 文档投递独立消费循环成功后的追加消息（Issue #341 S-ES-3）。
     "delivery.document_ready",
     "delivery.document_ready_degraded",
+    # rc25 S-5c（Trace #544）：服务端自陈降级（server_simplified_body）专用文案，
+    # 不与上一条共用——上一条担保「内容本身没有删减」，那句话在服务端静默丢块时
+    # 可能失实，理由见 content.toml 该键上方注释。
+    "delivery.document_ready_simplified",
+    # rc25 修复包 F4：#571 之后触发面含两道前置守卫，各自的真实原因是长度/标题
+    # 形态，不是「无法排版的结构」——按来源分派两条如实归因的文案，理由见
+    # content.toml 该键上方注释。
+    "delivery.document_ready_degraded_too_long",
+    "delivery.document_ready_degraded_title",
     # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",

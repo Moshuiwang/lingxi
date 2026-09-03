@@ -42,6 +42,15 @@ STATE_DIR="${LOG_DIR}/.state"
 # 分两步（mkdir -p 再 chmod）而不是 `mkdir -p -m`：`-p` 搭配 `-m` 只对
 # "本次调用新建的最深一级目录"生效，中间层级会落在调用者当时的 umask 上
 # （shellcheck SC2174），显式 chmod 不依赖这条隐含规则。
+# 文件权限不依赖调用者的 umask（对抗审查 2026-09-02 P3）：下面用 `>>` 新建
+# 日志文件时，权限由本进程当时的 umask 决定——cron 与交互 shell 的 umask 常常
+# 不同（022 会给出 0644），于是同一份取证日志在不同宿主机、不同触发方式下权限
+# 不一致，可能对同机其他账号可读。这些文件装的是容器 stdout/stderr 的完整转发
+# 内容。0027 让新建文件恒为 0640、新建目录恒为 0750，与下面的 chmod 同一收紧
+# 方向，也与 deploy/lingxi-container-logs.logrotate 的 `create 0640` 一致
+# （轮转之后的新文件由 logrotate 保证，轮转之前的第一份由这里保证）。
+umask 0027
+
 mkdir -p "${LOG_DIR}"
 chmod 0750 "${LOG_DIR}"
 mkdir -p "${STATE_DIR}"
@@ -61,6 +70,13 @@ for service in "${SERVICES[@]}"; do
 
   state_file="${STATE_DIR}/${service}.since"
   log_file="${LOG_DIR}/${service}.log"
+  # 兜底修复既有文件的权限：umask 只作用于**新建**，历史上用更宽 umask 建出来
+  # 的文件不会因为这次运行而收紧。幂等，且不改属主。
+  # 用 if 而不是 `[[ … ]] && chmod`：后者在文件不存在时整条复合命令返回 1，
+  # 在 `set -e` 下会直接中断本次收集（经典陷阱）。
+  if [[ -e "${log_file}" ]]; then
+    chmod 0640 "${log_file}"
+  fi
 
   # 先算好本轮收集的截止时间戳，再执行 docker logs——避免命令执行期间产生的新
   # 日志行落在"已经读过"和"还没读到"之间的空隙里被永久跳过。宁可下一轮与本轮

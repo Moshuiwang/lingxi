@@ -1,6 +1,6 @@
-"""到期数据清理职责：保留清理、空闲会话清理、权限链到期处置。
+"""到期数据清理职责：保留清理、空闲会话清理、权限链到期处置、内测采集到期删除。
 
-从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出，三个职责同组的理由——共用「每轮只
+从 :mod:`lingxi.apps.scheduler`（#237 拆分）搬出，几个职责同组的理由——共用「每轮只
 处理一批、不循环到清空」的纪律与幂等前提——见各类自己的文档字符串与包的
 ``__init__.py`` 模块文档。
 """
@@ -276,6 +276,99 @@ class PermissionRetentionSweepDuty:
             )
             logger.error("权限链到期清理失败 table=%s error=%s", table, type(error).__name__)
             raise
+
+
+class _ExpiredCapturePurger(Protocol):
+    """``innertest_content_capture`` 的到期删除口。"""
+
+    def purge_expired(self) -> int: ...
+
+
+class ContentCaptureRetentionDuty:
+    """``innertest_content_capture`` 的九十天到期删除（对抗审查 2026-09-02 C-7）。
+
+    这张表（迁移 ``0069``）保存的是**用户问题原文、模型回答原文与工具调用详情**
+    ——全仓库内容密度最高的一张表。迁移里 ``expires_at`` 触发器与到期扫描索引都
+    建好了，却**没有任何调用方**：九十天上限只存在于一个没人读的列里。缺的不是
+    机制，是职责。
+
+    形状照 :class:`PermissionRetentionSweepDuty`：应用层小批量 DELETE、每轮一次、
+    不循环到删空、失败关闭（留一条只含异常类型的审计后原样上抛，由
+    ``SchedulerLoop.run_once`` 逐职责隔离）。**不并进那个职责**是因为名字要说真话
+    ——它叫「权限链到期清理」，而这张表与权限链无关；两者的表清单混在同一个返回
+    摘要里，任何一方将来变化都会污染另一方的运行事实。
+
+    **无条件装配**：删自己库里的到期内容只需要连接串，而连接串是必需配置。给一条
+    纯粹回收本方内容的路径加一个能关掉它的开关，等于给保留上界加一个旁路。生产
+    这张表是空的（内容采集在生产一律不生效，见 ``apps/worker/config.py`` 的
+    ``declares_production``），因此这条职责在生产每轮删 0 行、不打日志。
+    """
+
+    name = "内测采集到期删除"
+
+    def __init__(
+        self,
+        *,
+        captures: _ExpiredCapturePurger,
+        audit: AuditSink,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._captures = captures
+        self._audit = audit
+        self._stop = threading.Event() if stop is None else stop
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> int | None:
+        """已经在停止中就一条都不删。返回 ``None`` 表示本轮未执行。"""
+
+        if self._stop.is_set():
+            return None
+        try:
+            purged = int(self._captures.purge_expired())
+        except Exception as error:
+            # 只记异常类型：异常正文可能带上被删那一行的内容（这张表每一行都是原文）。
+            self._audit.record(
+                "content_capture_retention.sweep_failed",
+                table="innertest_content_capture",
+                error=type(error).__name__,
+            )
+            logger.error(
+                "内测采集到期删除失败 table=innertest_content_capture error=%s",
+                type(error).__name__,
+            )
+            raise
+        self._audit.record("content_capture_retention.completed", purged=purged)
+        if purged:
+            # 一轮什么都没到期时不打日志：这条职责每分钟跑一次。
+            logger.info("内测采集到期删除：innertest_content_capture 删除 %s 行", purged)
+        return purged
+
+
+def _build_content_capture_retention_duty(
+    config: SchedulerConfig,
+    *,
+    stop: threading.Event,
+    audit: AuditSink,
+) -> ContentCaptureRetentionDuty:
+    """装配内测采集到期删除职责。**总是装配**，理由见类文档。"""
+
+    from lingxi.adapters.postgres_content_capture_retention import (
+        PostgresContentCaptureRetention,
+    )
+
+    return ContentCaptureRetentionDuty(
+        captures=PostgresContentCaptureRetention(
+            config.postgres_dsn, timeouts=config.postgres_timeouts
+        ),
+        audit=audit,
+        stop=stop,
+    )
 
 
 def _build_permission_retention_duty(

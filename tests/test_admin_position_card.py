@@ -1227,3 +1227,92 @@ class SuspendedUserGetsTheTruthNotADailyBatchPromiseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuspendedUserTransientTextTests(unittest.TestCase):
+    """#493 块 B 第二条（Trace #544）：**对已停用目标操作时的瞬时文案**。
+
+    终态早已被 rc24 F5 纠正成那句真话，可是**瞬时**这一行还在说「操作已记录，权限
+    正在下发」——对一个已停用的目标，下发根本不会发生（发布层在 ``app_user`` 行锁里
+    就挡住了非 ``enabled`` 账号的非空授权）。管理员先看到一句不成立的承诺、隔一会儿
+    才被终态纠正，是展示面失真。这里让瞬时与终态说同一句话。
+    """
+
+    TRUTH_FRAGMENTS = ("已停用", "不会下发")
+    PUBLISHING_PROMISE = "权限正在下发"
+
+    def _rendered(self, *, account_state: str, **overrides) -> str | None:
+        from lingxi.apps.gateway.management_status import rendered_dispatch_status
+
+        status = AdminUserStatusView(
+            identifier="ou_target",
+            provisioning_state="active",
+            account_state=account_state,
+            permission_version=1,
+            updated_at="2026-09-02T12:00:00+00:00",
+        )
+        fields = {"state": "dispatching", "dispatch_status": None, "status_message": None}
+        fields.update(overrides)
+        return rendered_dispatch_status(status=status, **fields)
+
+    def test_suspended_target_never_sees_the_publishing_promise(self) -> None:
+        for name, fields in (
+            ("即时路径已算好的文案", {"status_message": "操作已记录，权限正在下发"}),
+            ("状态机 dispatching", {"state": "dispatching"}),
+            ("状态机 submitted", {"state": "submitted"}),
+            ("恢复 scanner 重画", {"state": "unknown", "dispatch_status": "publishing"}),
+        ):
+            with self.subTest(name=name):
+                visible = self._rendered(account_state="suspended", **fields)
+                assert visible is not None
+                self.assertNotIn(self.PUBLISHING_PROMISE, visible)
+                for fragment in self.TRUTH_FRAGMENTS:
+                    self.assertIn(fragment, visible)
+
+    def test_enabled_target_still_sees_the_publishing_line(self) -> None:
+        """反向对照一：账号正常的用户，瞬时这一行逐字不变。"""
+
+        visible = self._rendered(account_state="enabled")
+        self.assertEqual(visible, "操作已记录，权限正在下发")
+
+    def test_other_states_of_a_suspended_target_are_untouched(self) -> None:
+        """反向对照二：只改写「正在下发」这一句——「已生效」「已取消」各有自己的判据，
+        不在这里顺手一起改写。"""
+
+        self.assertEqual(
+            self._rendered(account_state="suspended", state="effective"), "已生效"
+        )
+        self.assertEqual(self._rendered(account_state="suspended", state="closed"), "已取消")
+
+    def test_a_status_view_without_account_state_keeps_the_old_wording(self) -> None:
+        """反向对照三：读不到账号状态时按"没有额外信息"处理，行为逐字不变
+        （与 ``is_account_not_enabled`` 同一姿态，保护旧测试替身）。"""
+
+        from lingxi.apps.gateway.management_status import rendered_dispatch_status
+
+        class _StatusWithoutAccountState:
+            identifier = "ou_target"
+
+        self.assertEqual(
+            rendered_dispatch_status(
+                status=_StatusWithoutAccountState(),
+                state="dispatching",
+                dispatch_status=None,
+                status_message=None,
+            ),
+            "操作已记录，权限正在下发",
+        )
+
+    def test_the_publishing_literal_has_exactly_one_home(self) -> None:
+        """撤除重复字面量（#493 块 B）：``apps/gateway/__init__.py`` 此前另抄了两份，
+        改一处漏两处。"""
+
+        from pathlib import Path
+
+        import lingxi.apps.gateway as gateway_package
+        from lingxi.apps.gateway.management_status import PUBLISHING_STATUS_TEXT
+
+        source = (Path(gateway_package.__file__)).read_text(encoding="utf-8")
+
+        self.assertEqual(PUBLISHING_STATUS_TEXT, "操作已记录，权限正在下发")
+        self.assertNotIn(f'"{PUBLISHING_STATUS_TEXT}"', source)

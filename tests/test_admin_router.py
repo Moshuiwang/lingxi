@@ -1186,7 +1186,7 @@ class QueryTraceCommandTests(unittest.TestCase):
         self.assertIn("任务结果: 成功", reply)
         self.assertIn("文档交付结果: 成功", reply)
         self.assertIn("文档正文处理: 已降级", reply)
-        self.assertIn("正文含暂不支持的嵌套结构", reply)
+        self.assertIn("正文含无法定位的块结构", reply)
 
     def test_document_delivery_failure_is_reported_when_task_itself_succeeded(self) -> None:
         """文档消费是独立状态机：问数任务成功但文档明确失败时，``/admin trace``
@@ -1596,306 +1596,67 @@ class SuspendResumeDispatchTests(unittest.TestCase):
         self.assertIn("resume", outcome.reply_text)
 
 
-class GrantSuppressPermissionDispatchTests(unittest.TestCase):
-    """``grant_permission``/``suppress_permission`` 写命令编排（#319 S-P-1b 设计
-    卡）：与 ``suspend``/``resume`` 共用同一套 ``_dispatch_write_action`` 骨架，
-    额外核对①新命令不绕过既有身份判定、⑤自我目标防呆。
+class RetiredPermissionCommandRoutingTests(unittest.TestCase):
+    """**否定用例**：``/admin grant_permission`` 与 ``/admin suppress_permission``
+    撤除后，已登记管理员发这两条命令得到「无此命令」一类回应，且**审计里不产生任何
+    授权动作**（Trace #544 D-5，产品负责人裁定；对抗审查 A-4 / P-4）。
+
+    "不产生任何授权动作"在这一层的判据是三条同时成立：没有 ``prepare()`` 调用（没有
+    待确认操作）、没有确认卡发送、审计动作里没有任何 ``admin.command.*_permission``。
+    只断言回复文案是不够的——真正要防的是"文案变了但后面那条写路径还通着"。
     """
 
-    def _grant_text(self, target: str = "ou_target") -> str:
-        return f"/admin grant_permission {target} 1011 daily_active 特批"
+    RETIRED_TEXTS = (
+        "/admin grant_permission ou_target 1011 daily_active 特批",
+        "/admin suppress_permission ou_target 1011 daily_active 特批",
+        # 目录外的公司与指标——正是这两条命令被撤除的直接理由（审查 3 级复现）。
+        "/admin grant_permission ou_target 9999 bogus_metric_xyz 越权尝试",
+    )
 
-    def _suppress_text(self, target: str = "ou_target") -> str:
-        return f"/admin suppress_permission {target} 1011 daily_active 特批"
-
-    def test_unregistered_sender_is_default_denied_same_as_read_only_commands(self) -> None:
-        """①新命令不绕过 ``is_authorized_admin``：未登记者发 grant_permission
-        必须走与 help/user/audit/suspend/resume 完全相同的默认拒绝路径——不因为
-        是新命令就走一条独立的身份判定分支。"""
-
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
-        )
-        confirm_cards = FakeConfirmCards()
-        router, registry, _, audit = _router(
-            registry=FakeRegistry({}),
-            pending_actions=pending_actions,
-            confirm_cards=confirm_cards,
-        )
-
-        outcome = router.route(
-            open_id="ou_never_registered",
-            text=self._grant_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertFalse(outcome.handled)
-        self.assertEqual(pending_actions.prepare_calls, [])
-        self.assertEqual(confirm_cards.send_calls, [])
-
-    def test_partial_role_entry_is_rejected_before_reaching_write_dispatch(self) -> None:
-        """同 suspend/resume：只持有部分角色的条目在 ``route()`` 顶层就被拒绝，
-        走不到 grant/suppress 的写命令分支。"""
-
-        partial_entry = AdminRegistryEntry(
-            feishu_open_id=ADMIN_OPEN_ID,
-            label="future-admin",
-            roles=frozenset({AdminRole.OPS_ADMIN, AdminRole.SUPER_ADMIN}),
-            entry_status="active",
-        )
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
-        )
-        confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            registry=FakeRegistry({ADMIN_OPEN_ID: partial_entry}),
-            pending_actions=pending_actions,
-            confirm_cards=confirm_cards,
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._grant_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertFalse(outcome.handled)
-        self.assertEqual(pending_actions.prepare_calls, [])
-
-    def test_self_target_grant_is_rejected_without_calling_prepare(self) -> None:
-        """⑤自我目标防呆：管理员对自己发起授权被拒绝，且 ``prepare()`` 从未被
-        调用——不合法的意图不应该先创建一条待确认操作再补救。"""
-
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
-        )
-        confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._grant_text(target=ADMIN_OPEN_ID),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertIn("不能对自己", outcome.reply_text)
-        self.assertEqual(pending_actions.prepare_calls, [])
-        self.assertEqual(confirm_cards.send_calls, [])
-
-    def test_self_target_suppress_is_rejected_without_calling_prepare(self) -> None:
-        """对称动作同一防呆。"""
-
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
-        )
-        confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._suppress_text(target=ADMIN_OPEN_ID),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertIn("不能对自己", outcome.reply_text)
-        self.assertEqual(pending_actions.prepare_calls, [])
-
-    def test_self_target_guard_is_always_false_for_suspend_and_resume(self) -> None:
-        """自我目标防呆是"显式条件门，suspend/resume 恒为假"：管理员对自己发起
-        停用/恢复不会被这条新规则拦截——沿用既有 ``decide_prepare``/角色核对
-        判定这次操作是否合理，不属于本条防呆的关注范围。"""
-
-        pending = _prepared_pending(action_type=PendingActionType.SUSPEND_USER)
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
-        )
-        confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=f"/admin suspend {ADMIN_OPEN_ID}",
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertEqual(len(pending_actions.prepare_calls), 1)
-        self.assertNotIn("不能对自己", outcome.reply_text)
-
-    def test_successful_grant_dispatch_forwards_payload_fields_to_prepare(self) -> None:
-        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
-        )
-        confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._grant_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id="thread_1",
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertIn("待确认", outcome.reply_text)
-        self.assertEqual(len(pending_actions.prepare_calls), 1)
-        call = pending_actions.prepare_calls[0]
-        self.assertEqual(call["action_type"], PendingActionType.LOCAL_PERMISSION_GRANT)
-        self.assertEqual(call["target_open_id"], "ou_target")
-        self.assertEqual(call["company_id"], "1011")
-        self.assertEqual(call["metric_name"], "daily_active")
-        self.assertEqual(call["reason"], "特批")
-        self.assertEqual(audit.actions(), ["admin.command.grant_permission"])
-
-    def test_successful_suppress_dispatch(self) -> None:
-        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_SUPPRESS)
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
-        )
-        confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._suppress_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertEqual(
-            pending_actions.prepare_calls[0]["action_type"],
-            PendingActionType.LOCAL_PERMISSION_SUPPRESS,
-        )
-        self.assertEqual(audit.actions(), ["admin.command.suppress_permission"])
-
-    def test_grant_prepare_rejection_is_reported_without_sending_a_card(self) -> None:
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(
-                decision=_FakePrepareDecision(
-                    ok=False, code="target_state_changed", message="该公司×指标已有生效的本地覆盖。"
+    def test_retired_commands_are_rejected_with_no_authorization_side_effect(self) -> None:
+        for text in self.RETIRED_TEXTS:
+            with self.subTest(text=text):
+                pending_actions = FakePendingActions(
+                    outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True))
                 )
-            )
-        )
-        confirm_cards = FakeConfirmCards()
-        router, _, _, audit = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
+                confirm_cards = FakeConfirmCards(delivered=True)
+                router, _, _, audit = _router(
+                    pending_actions=pending_actions, confirm_cards=confirm_cards
+                )
 
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._grant_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
+                outcome = router.route(
+                    open_id=ADMIN_OPEN_ID,
+                    text=text,
+                    trace_id="t1",
+                    chat_id="oc_1",
+                    thread_id=None,
+                    message_id="om_1",
+                )
 
-        self.assertTrue(outcome.handled)
-        self.assertEqual(outcome.reply_text, "该公司×指标已有生效的本地覆盖。")
-        self.assertEqual(confirm_cards.send_calls, [])
+                # 「无此命令」一类回应：管理员得到的是未识别命令的回复，不是一条
+                # 「已生成待确认操作」的回执。
+                self.assertTrue(outcome.handled)
+                self.assertIn("/admin help", outcome.reply_text)
+                self.assertNotIn("待确认", outcome.reply_text)
+                # 零授权副作用。
+                self.assertEqual(pending_actions.prepare_calls, [])
+                self.assertEqual(confirm_cards.send_calls, [])
+                self.assertEqual(audit.actions(), ["admin.command.unknown"])
+                for action in audit.actions():
+                    self.assertNotIn("permission", action)
 
-    def test_help_text_mentions_grant_and_suppress_permission(self) -> None:
+    def test_help_no_longer_advertises_the_retired_commands(self) -> None:
+        """帮助文案里不再公开一条已经不受理的命令。"""
+
         router, _, _, _ = _router()
 
         outcome = router.route(open_id=ADMIN_OPEN_ID, text="/admin help", trace_id="t1")
 
-        self.assertIn("grant_permission", outcome.reply_text)
-        self.assertIn("suppress_permission", outcome.reply_text)
-
-    def test_email_identifier_and_chinese_metric_alias_are_resolved_before_prepare(
-        self,
-    ) -> None:
-        """#439 A 档：grant/suppress 的 identifier（邮箱）与 metric_name（中文
-        别名）在调用 ``prepare()`` 之前分别经 ``resolve_identifier``/
-        ``resolve_metric_name`` 反查——``prepare()`` 拿到的是反查后的真实值，
-        不是管理员原始输入的邮箱/别名。"""
-
-        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
-        )
-        confirm_cards = FakeConfirmCards(delivered=True)
-        queries = FakeQueries(
-            identifier_aliases={"someone@example.com": "ou_target"},
-            metric_aliases={"新增用户数": "sub_new_count"},
-        )
-        router, _, _, _ = _router(
-            queries=queries, pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        outcome = router.route(
-            open_id=ADMIN_OPEN_ID,
-            text="/admin grant_permission someone@example.com 1011 新增用户数 特批",
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertTrue(outcome.handled)
-        self.assertEqual(len(pending_actions.prepare_calls), 1)
-        call = pending_actions.prepare_calls[0]
-        self.assertEqual(call["target_open_id"], "ou_target")
-        self.assertEqual(call["metric_name"], "sub_new_count")
-        self.assertEqual(queries.resolve_identifier_calls, ["someone@example.com"])
-        self.assertEqual(queries.resolve_metric_calls, ["新增用户数"])
-
-    def test_unmapped_metric_token_passes_through_unchanged(self) -> None:
-        """别名表未命中（fail-open）：``metric_name`` 原样透传给
-        ``prepare()``——与既有"英文 ID 直接输入"路径完全等价，不新增行为分叉。"""
-
-        pending = _prepared_pending(action_type=PendingActionType.LOCAL_PERMISSION_GRANT)
-        pending_actions = FakePendingActions(
-            outcome=_FakePrepareOutcome(decision=_FakePrepareDecision(ok=True), pending=pending)
-        )
-        confirm_cards = FakeConfirmCards(delivered=True)
-        router, _, _, _ = _router(
-            pending_actions=pending_actions, confirm_cards=confirm_cards
-        )
-
-        router.route(
-            open_id=ADMIN_OPEN_ID,
-            text=self._grant_text(),
-            trace_id="t1",
-            chat_id="oc_1",
-            thread_id=None,
-            message_id="om_1",
-        )
-
-        self.assertEqual(pending_actions.prepare_calls[0]["metric_name"], "daily_active")
+        self.assertNotIn("grant_permission", outcome.reply_text)
+        self.assertNotIn("suppress_permission", outcome.reply_text)
+        # 不误伤：仍在受理的写命令照常公开。
+        self.assertIn("revoke_permission", outcome.reply_text)
+        self.assertIn("suspend", outcome.reply_text)
 
 
 #: 与 test_admin_commands.py 同一固定字面量（`lpo_` 前缀 + 26 位 Crockford
@@ -2317,7 +2078,7 @@ class SegmentedUnknownReplyTests(unittest.TestCase):
 
         outcome = router.route(
             open_id=ADMIN_OPEN_ID,
-            text="/admin grant_permission ou_target 一零一一 daily_active 特批",
+            text="/admin revoke_permission ou_target 一零一一 daily_active 特批",
             trace_id="t1",
         )
 
@@ -2528,3 +2289,33 @@ class MultiTokenLinkifiedCommandRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class DocumentDeliveryReasonLabelCoverageTests(unittest.TestCase):
+    """新增降级原因码却忘了登记显示名，`/admin trace` 会退化成「原值（未登记显示名）」。
+
+    这是一条**真实发生过**的遗漏：Trace #544 S-7c 改走服务端一次建档，新增
+    `body_too_long` / `title_not_embeddable` / `server_simplified_body` 三个码，
+    三个都没进词表——而这恰恰是管理员最常需要解释给用户听的三种情况。
+
+    兜底样式本身是对的（不吞掉、不假装认识），但它是**兜底**，不该成为常态。
+    这条用例把「适配器定义了什么码」和「管理台认识什么码」绑在一起：加码不加
+    词条就变红，不必依赖谁记得。
+    """
+
+    def test_every_degrade_reason_the_adapter_can_emit_has_a_display_name(self) -> None:
+        from lingxi.adapters import feishu_docx_delivery
+        from lingxi.core.admin.router import _DOCUMENT_DELIVERY_REASON_LABEL
+
+        emitted = {
+            feishu_docx_delivery.BODY_TOO_LONG,
+            feishu_docx_delivery.TITLE_NOT_EMBEDDABLE,
+            feishu_docx_delivery.SERVER_SIMPLIFIED_BODY,
+        }
+        missing = sorted(emitted - set(_DOCUMENT_DELIVERY_REASON_LABEL))
+        self.assertEqual(
+            missing,
+            [],
+            "这些降级原因码适配器会发出、但管理台没有显示名，`/admin trace` 会显示成"
+            "「原值（未登记显示名）」：" + ", ".join(missing),
+        )

@@ -167,29 +167,30 @@ class PostgresManagementCardContextStore:
         self,
         *,
         message_id: str,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> int | None:
-        """原子领取下一条 CardKit 序号，并可按 scanner 快照做 CAS。
+        """原子领取下一条 CardKit 序号，并可按 scanner 快照的序号做 CAS。
 
-        恢复路径必须传入它读取的状态代数和 CardKit 序号。任一期望值不匹配
-        都返回 ``None``，不消耗序号；未传期望值时保留旧调用方的无条件递增
-        兼容姿态，未知消息仍抛 ``KeyError``。
+        恢复路径必须传入它读取的 CardKit 序号；不匹配就返回 ``None`` 且不消耗
+        序号，未传期望值时保留旧调用方的无条件递增兼容姿态，未知消息仍抛
+        ``KeyError``。
+
+        这里只用 ``card_sequence`` 一把 CAS（#493 收敛，rc25 S-4a）。写入方里每一次
+        ``state_version`` 递增都与 ``card_sequence`` 递增写在同一条 UPDATE 语句里，
+        而本方法还会在**不动** ``state_version`` 的前提下推进 ``card_sequence``；
+        所以「``card_sequence`` 未变」蕴含「``state_version`` 未变」，反之不成立——
+        两个恢复者拿着同一份状态快照并发领号时，只有 ``card_sequence`` 认得出来。
+        ``state_version`` 列保留（生产 drop column 不可逆），只是不再参与 CAS。
         """
 
-        for name, value in (
-            ("expected_state_version", expected_state_version),
-            ("expected_card_sequence", expected_card_sequence),
+        if expected_card_sequence is not None and (
+            isinstance(expected_card_sequence, bool)
+            or not isinstance(expected_card_sequence, int)
+            or expected_card_sequence <= 0
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            ):
-                raise ValueError(f"{name} 必须是正整数")
+            raise ValueError("expected_card_sequence 必须是正整数")
         conditions = ["message_id = %(message_id)s"]
         parameters: dict[str, object] = {"message_id": message_id}
-        if expected_state_version is not None:
-            conditions.append("state_version = %(expected_state_version)s")
-            parameters["expected_state_version"] = expected_state_version
         if expected_card_sequence is not None:
             conditions.append("card_sequence = %(expected_card_sequence)s")
             parameters["expected_card_sequence"] = expected_card_sequence
@@ -202,7 +203,7 @@ class PostgresManagementCardContextStore:
             )
             row = cursor.fetchone()
         if row is None:
-            if expected_state_version is not None or expected_card_sequence is not None:
+            if expected_card_sequence is not None:
                 return None
             raise KeyError(message_id)
         return int(row[0])
@@ -246,7 +247,11 @@ class PostgresManagementCardContextStore:
         ):
             # 状态写入和视觉恢复必须属于同一条单调版本链。若 scanner 已经取出旧
             # 快照，随后有新的状态落库，版本抬高后旧回写只能留下 needs_refresh，
-            # 不能把新状态误标为已交付。
+            # 不能把新状态误标为已交付。承担这件事的是 ``card_sequence``——它在这里
+            # 与 ``state_version`` 同语句 +1，另外还会被 ``next_card_sequence()`` 单独
+            # 推进，所以它的判别力严格覆盖 ``state_version``。``state_version`` 自
+            # rc25 S-4a 起不再参与任何 CAS，只作为状态代数留在行上继续维护（生产
+            # drop column 不可逆，按裁定 D-16 保留该列）。
             assignments.append("card_sequence = card_sequence + 1")
             assignments.append("state_version = state_version + 1")
             assignments.append("needs_refresh = TRUE")
@@ -284,26 +289,24 @@ class PostgresManagementCardContextStore:
         *,
         message_id: str,
         sequence: int,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> bool:
-        """仅在 CardKit update 成功后推进视觉水位，并按快照版本做 CAS。
+        """仅在 CardKit update 成功后推进视觉水位，并按本次领到的序号做 CAS。
 
-        ``expected_state_version`` 防止旧状态清掉新状态；``expected_card_sequence``
-        防止两个恢复者为同一状态分别领号后，较旧视觉覆盖/清掉较新的序号。未传
-        期望值时保留旧适配器调用的单调序号姿态。
+        ``expected_card_sequence`` 同时挡住两件事：新的状态写入把行推进了（状态写
+        与 ``card_sequence`` 递增同语句，见 :meth:`update_state`），以及另一个恢复者
+        为同一状态另领了号。因此不再单独判 ``state_version``（#493 收敛，rc25 S-4a）；
+        未传期望值时保留旧适配器调用的单调序号姿态。
         """
 
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
             raise ValueError("sequence 必须是正整数")
-        for name, value in (
-            ("expected_state_version", expected_state_version),
-            ("expected_card_sequence", expected_card_sequence),
+        if expected_card_sequence is not None and (
+            isinstance(expected_card_sequence, bool)
+            or not isinstance(expected_card_sequence, int)
+            or expected_card_sequence <= 0
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            ):
-                raise ValueError(f"{name} 必须是正整数")
+            raise ValueError("expected_card_sequence 必须是正整数")
         conditions = [
             "message_id = %(message_id)s",
             "%(sequence)s >= visual_sequence",
@@ -312,9 +315,6 @@ class PostgresManagementCardContextStore:
             "message_id": message_id,
             "sequence": sequence,
         }
-        if expected_state_version is not None:
-            conditions.append("state_version = %(expected_state_version)s")
-            parameters["expected_state_version"] = expected_state_version
         if expected_card_sequence is not None:
             conditions.append("card_sequence = %(expected_card_sequence)s")
             parameters["expected_card_sequence"] = expected_card_sequence

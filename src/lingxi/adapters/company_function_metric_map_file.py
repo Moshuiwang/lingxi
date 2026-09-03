@@ -37,6 +37,20 @@ deploy/compose.stage.yaml restart scheduler``，prod 同构换成
 map_unavailable` 审计记录里因此既可能是包内文件损坏，也可能是外置路径配错，两者都不
 静默——运维用 `deploy/验收前部署配置清单.md` 登记的挂载方式核对即可，不需要新分支。
 
+## 两条路径同一个来源（Trace #544 S-2c）
+
+外置路径起初只有 scheduler 侧接线，gateway 侧三个调用点
+（``adapters/postgres_permission_recompute_trigger.py`` 的定向重算、
+``adapters/postgres_pending_action.py`` 的职位展开、``adapters/feishu_admin_card.py``
+的管理卡目录）一直硬读随包默认文件——外置文件一旦启用，同一份映射在两条路径上给出
+不同答案：管理员确认一个本地动作，gateway 按**旧的内置表**立即发布一个更宽的范围，
+次日日批再按外置表翻回来（对抗审查 P-1）。现在三处都由各自的装配层把
+:func:`parse_metric_map_path` 的结果注入进来（构造参数 ``metric_map_path``，
+**没有默认值**——新调用点不可能"忘了传"而悄悄退回随包默认）。
+
+**运维前提**：这个变量要么两个进程（scheduler 与 gateway）都配、指向同一份文件，
+要么两个都不配。只配一边＝两条路径又各读各的，正是本节要消灭的分叉。
+
 **加载成功时记录内容 digest 到日志**（沿用系统提示词的先例：`hashlib.sha256(...).
 hexdigest()[:12]`，短摘要足以判断"内容变没变"，不需要可逆）——digest 取的是**文件原始
 字节**，不是解析后的 Python 结构，这样同一份文件不论换行符、键序如何书写，只要字节
@@ -63,6 +77,40 @@ def default_company_function_metric_map_path() -> Path:
     """随包发布的配置文件路径。"""
 
     return Path(__file__).resolve().parents[1] / "config" / _CONFIG_FILE_NAME
+
+
+#: 外置映射文件路径的环境变量名，**全仓库只在这里登记一次**：
+#: ``apps/scheduler/config.py`` 与 ``apps/gateway/config.py`` 都按它读，两个进程
+#: 必须指向同一份文件，见 :func:`parse_metric_map_path`。
+METRIC_MAP_PATH_ENV = "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH"
+
+
+def parse_metric_map_path(raw: str | None) -> Path | None:
+    """把 :data:`METRIC_MAP_PATH_ENV` 的取值解释成"这台机器该读哪一份映射"。
+
+    **唯一一处**做这件事的函数（Trace #544 S-2c，对抗审查 P-1）：此前 scheduler
+    读外置文件、gateway 侧三个调用点硬读随包默认文件，同一份「公司 × 职能 → 指标」
+    在两条路径上因此可以给出不同答案——管理动作经 gateway 立即发布的范围，与次日
+    日批经 scheduler 重算的范围会分叉，而且每次翻转都真的写用户可见的权限。两个
+    进程的配置对象现在都经过本函数，不再各写一套解释逻辑等着慢慢漂移。
+
+    未配置/空白 → ``None``：调用方落回随包默认文件，与外置能力交付前逐字节一致。
+    **"不配置"始终是合法状态**（生产刻意不配这个变量，见 ``deploy/.env.example``
+    该条目），不是一种要在启动期拒绝的缺失。配了但含空白字符 → ``ValueError``：
+    错配不是未配，与 ``apps/scheduler/config.py`` 其余标识类变量同一条纪律；只报
+    变量名，不回显取到的值。
+
+    **文件是否存在、内容是否合法不在这里判定**——那是
+    :func:`load_company_function_metric_map` 读取时的事（配了却读不到一律响亮失败，
+    见下方函数文档）。两处各判一次，判据迟早漂移。
+    """
+
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if any(character.isspace() for character in value):
+        raise ValueError(f"环境变量 {METRIC_MAP_PATH_ENV} 不得包含空白字符（不回显取到的值）")
+    return Path(value)
 
 
 def load_company_function_metric_map(

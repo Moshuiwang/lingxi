@@ -116,11 +116,11 @@ class DocumentDeliveryClaim:
     ``markdown``（迁移 0079，Issue #408 正式方案接线）：docx 类型的原始 markdown
     全文，``NULL`` 即"这一行没有可转换的原文"（历史行、或 sheet 类型——sheet
     恒为 ``NULL``，迁移 0079 的 CHECK 约束）。gateway 侧
-    （``apps/gateway/document_delivery.py::_process_docx_claim``）据此在"官方
-    转换路径"与"段落路径"之间选择：非 ``None`` 才有资格走转换，``None`` 一律
-    回退段落路径——与转换开关是否打开无关，两个条件都满足才会真正调用
-    :meth:`~lingxi.adapters.feishu_docx_delivery.LarkDocxDelivery.write_body`
-    的转换分支。
+    （``apps/gateway/document_delivery.py::_create_docx_body``）据此在"服务端
+    一次建档写全文"与"两步段落路径"之间选择：非 ``None`` 才有资格走一次建档，
+    ``None`` 一律回退段落路径——与止损闸是否打开无关，两个条件都满足才会真正
+    调用 :meth:`~lingxi.adapters.feishu_docx_delivery.LarkDocxDelivery.
+    create_document_with_markdown`。
     """
 
     id: str
@@ -142,8 +142,8 @@ class DocumentDeliveryClaim:
     markdown: str | None = None
     # 迁移 0082（Issue #499）：非 None 即"这一行的正文已经被降级成纯文本段落
     # 路径写入"，取值是原因码。**认领时就要读出来**，因为检查点恢复路径
-    # （`read_body_children` 判定正文已写、直接跳过写正文步）永远不会再调用一次
-    # `write_body`，拿不到那次调用的内存信号——不从库里带进来，这条路径就会发出
+    # （`read_body_children` 判定正文已写、直接跳过写正文步）永远不会再产生一次
+    # 降级信号，拿不到那次调用的内存值——不从库里带进来，这条路径就会发出
     # 不带降级说明的"文档已生成"，退回成裁定明令消灭的静默降级。默认 None 让
     # 既有直接构造 `DocumentDeliveryClaim(...)` 的调用点（测试）零改动。
     body_degraded_reason: str | None = None
@@ -173,7 +173,7 @@ class UnnotifiedSuccess:
     delivery_type: str
     resource_url: str | None
     # 迁移 0082（Issue #499）：补发通知是另一次进程调用，看不到原发送路径那次
-    # `write_body` 的内存信号——不带上这一列，补发出去的就是不含"格式已简化"
+    # 写正文的内存信号——不带上这一列，补发出去的就是不含"格式已简化"
     # 说明的就绪通知（静默降级）。
     body_degraded_reason: str | None = None
 
@@ -269,7 +269,7 @@ class PostgresDocumentDeliveryStore:
         已经发生、本地必须记住"的事实，晚一步提交就可能被一次崩溃带走。差别
         只在守卫——建档那一步用 ``document_id IS NULL`` 防止覆盖已经建出来的
         文档标识；这里不需要那道守卫，因为同一行的降级原因码在同一次交付里只
-        会由唯一一次 ``write_body`` 调用产生，重复写入同一个值是幂等的。
+        会由唯一一次写正文判定产生，重复写入同一个值是幂等的。
 
         ``status = 'processing'`` 守卫保留：命中 0 行说明这一行的持有权已经不在
         本次调用手里（典型是被 ``reclaim_stale_processing`` 回收过的慢消费者），

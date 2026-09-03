@@ -10,6 +10,7 @@ action.decide_prepare`` 的职责（见 ``tests/test_pending_action.py``）。
 
 from __future__ import annotations
 
+import time
 import unittest
 
 from lingxi.core.admin.commands import (
@@ -169,118 +170,69 @@ class SuspendResumeParsingTests(unittest.TestCase):
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
 
 
-class GrantSuppressPermissionParsingTests(unittest.TestCase):
-    """``/admin grant_permission``/``/admin suppress_permission`` 的解析
-    （#319 S-P-1b 设计卡）：``<identifier> <company_id> <metric_name> <reason...>``，
-    前三个 token 复用 ``_IDENTIFIER_PATTERN``，``reason`` 是尾部剩余全部 token
-    拼接的自由文本，非空白、≤500 字符——解析防呆覆盖空白 reason 与形状不对的
-    company_id/metric_name（非法字符）两类输入。"""
+class RetiredPermissionCommandTests(unittest.TestCase):
+    """``/admin grant_permission`` 与 ``/admin suppress_permission`` **已撤除**
+    （Trace #544 D-5，产品负责人裁定；对抗审查 A-4 / P-4）。
 
-    def test_grant_with_single_word_reason_recognized(self) -> None:
-        command = parse_admin_command("/admin grant_permission ou_abc123 1011 daily_active 特批")
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(command.identifier, "ou_abc123")
+    撤的理由不是语法层不严：这两条命令按"公司×指标"两个自由文本参数收本地权限覆盖，
+    语法层只校验字符集、**不核对指标目录**，管理员因此可以写出目录外的公司与指标
+    （审查 3 级复现：``company_id="9999", metric="bogus_metric_xyz"`` 确认后落库并被
+    聚合发布）。裁定不是补一层目录校验，是撤掉入口——补充授权统一走管理卡的
+    「银河职位×公司范围」表单，那里的取值全部来自服务端渲染的目录下拉。
+
+    本类是**否定用例**：撤除之后这两个命令名与任何一个没听说过的命令名待遇相同，
+    落在 ``UNKNOWN_SUBCOMMAND`` 上。``router.py`` 侧"不产生任何授权动作、不写任何
+    授权审计"的断言在 ``tests/test_admin_router.py`` 的同名主题里。
+    """
+
+    RETIRED = ("grant_permission", "suppress_permission")
+
+    def test_retired_commands_are_unknown_subcommand(self) -> None:
+        for name in self.RETIRED:
+            with self.subTest(name=name):
+                command = parse_admin_command(
+                    f"/admin {name} ou_abc123 1011 daily_active 特批"
+                )
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertEqual(command.reject_reason, AdminRejectReason.UNKNOWN_SUBCOMMAND)
+
+    def test_retired_commands_are_unknown_regardless_of_argument_shape(self) -> None:
+        """参数怎么写都不改变结论——撤的是命令名，不是某一种参数形状。"""
+
+        for text in (
+            "/admin grant_permission",
+            "/admin grant_permission ou_abc123",
+            "/admin GRANT_PERMISSION ou_abc123 1011 daily_active 特批",
+            "/admin suppress_permission someone@example.com 1011 新增用户数 特批",
+            "/admin suppress_permission ou_abc123 9999 bogus_metric_xyz 越权尝试",
+        ):
+            with self.subTest(text=text):
+                command = parse_admin_command(text)
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertEqual(command.reject_reason, AdminRejectReason.UNKNOWN_SUBCOMMAND)
+
+    def test_command_kind_enum_no_longer_carries_the_retired_kinds(self) -> None:
+        """枚举里也不留半截：没有任何取值能表示这两条命令。"""
+
+        for name in ("GRANT_PERMISSION", "SUPPRESS_PERMISSION"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(AdminCommandKind, name))
+
+    def test_position_scope_grant_still_parses(self) -> None:
+        """不误伤：#493 的「职位×公司范围」补充授权仍然是被受理的命令。"""
+
+        command = parse_admin_command("/admin grant_position ou_abc123 销售经理 1011 特批")
+        self.assertEqual(command.kind, AdminCommandKind.GRANT_POSITION_PERMISSION)
+
+    def test_revoke_permission_shape_two_still_parses(self) -> None:
+        """不误伤：与撤除命令共用参数形状的 ``revoke_permission`` 形状 2 不受影响。"""
+
+        command = parse_admin_command(
+            "/admin revoke_permission ou_abc123 1011 daily_active 收回"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.company_id, "1011")
         self.assertEqual(command.metric_name, "daily_active")
-        self.assertEqual(command.reason, "特批")
-
-    def test_suppress_with_multi_word_reason_is_joined_back_together(self) -> None:
-        command = parse_admin_command(
-            "/admin suppress_permission ou_abc123 1011 daily_active 离职 交接 期间 收回"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.SUPPRESS_PERMISSION)
-        self.assertEqual(command.reason, "离职 交接 期间 收回")
-
-    def test_case_insensitive_and_whitespace_tolerant(self) -> None:
-        command = parse_admin_command(
-            "  /ADMIN Grant_Permission  ou_abc123  1011  daily_active  特批  "
-        )
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(command.reason, "特批")
-
-    def test_missing_reason_is_unknown(self) -> None:
-        command = parse_admin_command("/admin grant_permission ou_abc123 1011 daily_active")
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_missing_metric_name_is_unknown(self) -> None:
-        command = parse_admin_command("/admin grant_permission ou_abc123 1011")
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_blank_reason_after_strip_is_unknown(self) -> None:
-        """reason 全为空白字符（拼接后 strip 为空）→ UNKNOWN，不当成合法的空原因。"""
-
-        command = parse_admin_command("/admin grant_permission ou_abc123 1011 daily_active    ")
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_reason_over_length_limit_is_unknown(self) -> None:
-        long_reason = "字" * 501
-        command = parse_admin_command(
-            f"/admin grant_permission ou_abc123 1011 daily_active {long_reason}"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_reason_at_length_limit_is_accepted(self) -> None:
-        boundary_reason = "字" * 500
-        command = parse_admin_command(
-            f"/admin grant_permission ou_abc123 1011 daily_active {boundary_reason}"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(command.reason, boundary_reason)
-
-    def test_company_id_with_illegal_character_is_unknown(self) -> None:
-        """公司标识形状不对（复用 ``_IDENTIFIER_PATTERN``，含空白/引号等）→
-        UNKNOWN——与既有 ``suspend``/``resume`` 的形状封闭纪律一致。"""
-
-        command = parse_admin_command("/admin grant_permission ou_abc123 '1011' daily_active 特批")
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_metric_name_with_illegal_character_is_unknown(self) -> None:
-        command = parse_admin_command(
-            "/admin grant_permission ou_abc123 1011 daily;active 特批"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_target_identifier_sql_injection_shaped_is_unknown(self) -> None:
-        command = parse_admin_command(
-            "/admin grant_permission 1; DROP TABLE app_user;-- 1011 daily_active 特批"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
-
-    def test_grant_and_suppress_are_distinct_kinds(self) -> None:
-        grant = parse_admin_command("/admin grant_permission ou_abc123 1011 daily_active 特批")
-        suppress = parse_admin_command("/admin suppress_permission ou_abc123 1011 daily_active 特批")
-        self.assertEqual(grant.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(suppress.kind, AdminCommandKind.SUPPRESS_PERMISSION)
-
-    def test_identifier_accepts_email_shape(self) -> None:
-        """#439 A 档：标识参数支持邮箱——``_IDENTIFIER_PATTERN`` 新增 ``@``。"""
-
-        command = parse_admin_command(
-            "/admin grant_permission someone@example.com 1011 daily_active 特批"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(command.identifier, "someone@example.com")
-
-    def test_metric_name_accepts_chinese_alias(self) -> None:
-        """#439 A 档：指标支持中文别名——``_METRIC_TOKEN_PATTERN`` 放行 CJK，
-        与 ``identifier``/``company_id`` 仍然只认 ``_IDENTIFIER_PATTERN``（更窄）
-        分开验证。是否真的命中别名表是 router.py/adapters 的职责，这里只验证
-        语法层放行。"""
-
-        command = parse_admin_command(
-            "/admin grant_permission ou_abc123 1011 新增用户数 特批"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
-        self.assertEqual(command.metric_name, "新增用户数")
-
-    def test_company_id_does_not_accept_chinese_even_though_metric_name_does(self) -> None:
-        """否定断言：company_id 复用更窄的 ``_IDENTIFIER_PATTERN``（不含 CJK），
-        中文放宽只发生在 metric_name 这一个字段上，不是全局放开。"""
-
-        command = parse_admin_command(
-            "/admin grant_permission ou_abc123 一零一一 daily_active 特批"
-        )
-        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
 
 
 #: 一个形状合法的本地权限覆盖行标识（``lpo_`` 前缀 + 26 位 Crockford Base32
@@ -564,10 +516,6 @@ _EMAIL_TAKING_COMMANDS: dict[str, tuple[str, AdminCommandKind]] = {
     ),
     "suspend": ("/admin suspend {identifier}", AdminCommandKind.SUSPEND_USER),
     "resume": ("/admin resume {identifier}", AdminCommandKind.RESUME_USER),
-    "grant_permission": (
-        "/admin grant_permission {identifier} 1011 daily_active 特批 授权",
-        AdminCommandKind.GRANT_PERMISSION,
-    ),
     "grant_position": (
         "/admin grant_position {identifier} 数据分析师 * 职位授权",
         AdminCommandKind.GRANT_POSITION_PERMISSION,
@@ -575,10 +523,6 @@ _EMAIL_TAKING_COMMANDS: dict[str, tuple[str, AdminCommandKind]] = {
     "grant_position_permission": (
         "/admin grant_position_permission {identifier} 数据分析师 * 职位授权",
         AdminCommandKind.GRANT_POSITION_PERMISSION,
-    ),
-    "suppress_permission": (
-        "/admin suppress_permission {identifier} 1011 daily_active 屏蔽 指标",
-        AdminCommandKind.SUPPRESS_PERMISSION,
     ),
     "revoke_permission_shape_two": (
         "/admin revoke_permission {identifier} 1011 daily_active 撤销 覆盖",
@@ -625,10 +569,10 @@ class LinkifiedIdentifierParsingTests(unittest.TestCase):
         """归一化只作用在标识那一位：公司/指标/原因原样解析，不左移、不吞词。"""
 
         command = parse_admin_command(
-            f"/admin grant_permission [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL}) "
+            f"/admin revoke_permission [{_PLAIN_EMAIL}](mailto:{_PLAIN_EMAIL}) "
             "1011 新增用户数 三月特批 走完审批"
         )
-        self.assertEqual(command.kind, AdminCommandKind.GRANT_PERMISSION)
+        self.assertEqual(command.kind, AdminCommandKind.REVOKE_PERMISSION)
         self.assertEqual(command.identifier, _PLAIN_EMAIL)
         self.assertEqual(command.company_id, "1011")
         self.assertEqual(command.metric_name, "新增用户数")
@@ -729,7 +673,7 @@ class LinkNormalizationDoesNotWidenTheCharsetTests(unittest.TestCase):
         不给它开这个口子（多归一化一个位置就是多一份不必要的解析面）。"""
 
         command = parse_admin_command(
-            "/admin grant_permission ou_abc123 [1011](mailto:1011) daily_active 特批"
+            "/admin revoke_permission ou_abc123 [1011](mailto:1011) daily_active 特批"
         )
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_COMPANY_ID)
@@ -767,7 +711,7 @@ class RejectReasonSegmentationTests(unittest.TestCase):
         此前没说清楚。这条断言钉住"说清楚"这一半。"""
 
         command = parse_admin_command(
-            "/admin grant_permission ou_abc123 一零一一 daily_active 特批"
+            "/admin revoke_permission ou_abc123 一零一一 daily_active 特批"
         )
         self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
         self.assertEqual(command.reject_reason, AdminRejectReason.BAD_COMPANY_ID)
@@ -785,16 +729,16 @@ class RejectReasonSegmentationTests(unittest.TestCase):
             ("/admin user", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin user ou_a extra", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin help now", AdminRejectReason.WRONG_ARGUMENT_COUNT),
-            ("/admin grant_permission ou_a 1011 daily_active", AdminRejectReason.WRONG_ARGUMENT_COUNT),
+            ("/admin revoke_permission ou_a 1011 daily_active", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             # 用户标识那一段
             ("/admin user ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
             ("/admin suspend <a b>", AdminRejectReason.WRONG_ARGUMENT_COUNT),
             ("/admin audit ou_a;b", AdminRejectReason.BAD_IDENTIFIER),
             ("/admin audit ou_a;b 48", AdminRejectReason.BAD_IDENTIFIER),
             # 指标那一段
-            ("/admin grant_permission ou_a 1011 daily;active 特批", AdminRejectReason.BAD_METRIC_NAME),
+            ("/admin revoke_permission ou_a 1011 daily;active 特批", AdminRejectReason.BAD_METRIC_NAME),
             # 原因那一段
-            ("/admin grant_permission ou_a 1011 daily_active " + "长" * 501, AdminRejectReason.BAD_REASON),
+            ("/admin revoke_permission ou_a 1011 daily_active " + "长" * 501, AdminRejectReason.BAD_REASON),
             (f"/admin revoke_permission {_VALID_OVERRIDE_ID} " + "长" * 501, AdminRejectReason.BAD_REASON),
             # 小时数那一段
             ("/admin audit 0", AdminRejectReason.BAD_WINDOW_HOURS),
@@ -819,7 +763,7 @@ class RejectReasonSegmentationTests(unittest.TestCase):
             "/admin help",
             f"/admin user {_PLAIN_EMAIL}",
             "/admin audit",
-            "/admin grant_permission ou_a 1011 daily_active 特批",
+            "/admin revoke_permission ou_a 1011 daily_active 特批",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_admin_command(text).reject_reason)
@@ -933,8 +877,7 @@ class CollapseDoesNotChangeAnythingThatAlreadyParsedTests(unittest.TestCase):
         "/admin audit",
         f"/admin suspend {_PLAIN_EMAIL}",
         f"/admin resume {_PLAIN_EMAIL}",
-        f"/admin grant_permission {_PLAIN_EMAIL} 1011 daily_active 特批 授权",
-        f"/admin suppress_permission {_PLAIN_EMAIL} 1011 daily_active 屏蔽 指标",
+        f"/admin revoke_permission {_PLAIN_EMAIL} 1011 daily_active 撤销 覆盖",
         f"/admin grant_position {_PLAIN_EMAIL} 数据分析师 * 职位授权",
         f"/admin revoke_permission {_PLAIN_EMAIL} 1011 daily_active 撤销 覆盖",
     )
@@ -1061,3 +1004,106 @@ class AdminTokenShapeForensicsTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class LinkCollapseCostTests(unittest.TestCase):
+    """A-1（Trace #544，对抗审查面 2）：**已登记管理员可以自己触发的二次方级 ReDoS**。
+
+    ``/admin user `` + 一个超长 token（连链接语法都不需要）此前会让链接形态合并阶段的
+    四条 pattern 各自 O(n²)：实测 n=2000 → 340 ms、n=4000 → 1.35 s、n=20000 → 25 s 以上。
+    这段代码跑在 gateway 的**单线程事件循环**上，一条消息就能让全体用户的消息排队。
+
+    验收线取 n=20000 ≤ 1.5 s（Trace #544 验收）。这里不断言绝对毫秒数以外的东西——
+    机器负载会影响绝对值，1.5 s 相对修复前的 25 s 有一个数量级以上的余量，不会因为
+    机器慢一点就假红。
+    """
+
+    BUDGET_SECONDS = 1.5
+
+    def _elapsed(self, text: str):
+        started = time.perf_counter()
+        command = parse_admin_command(text)
+        return time.perf_counter() - started, command
+
+    def test_very_long_token_returns_bad_identifier_within_budget(self) -> None:
+        elapsed, command = self._elapsed("/admin user " + "a" * 20000 + "@example.com")
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+        self.assertLess(elapsed, self.BUDGET_SECONDS)
+
+    def test_long_token_carrying_each_link_marker_stays_within_budget(self) -> None:
+        """加上每一种链接标记都不能把成本拉回二次方——必要标记预检只挡掉"一个标记都
+        没有"的输入，真正让成本封顶的是显示/目标段的确定上限。"""
+
+        for name, text in (
+            ("paren", "/admin user " + "a" * 20000 + "(x)"),
+            ("bracket", "/admin user [" + "a" * 20000 + "]"),
+            ("angle", "/admin user <" + "a" * 20000 + ">"),
+            ("mailto", "/admin user mailto:" + "a" * 20000),
+            ("anchor", "/admin user <a href=\"mailto:" + "a" * 20000 + "\">x</a>"),
+        ):
+            with self.subTest(marker=name):
+                elapsed, command = self._elapsed(text)
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertLess(elapsed, self.BUDGET_SECONDS)
+
+    def test_legitimate_link_forms_still_collapse(self) -> None:
+        """不误伤：Issue #492 那批受控链接形态照常合并——限长取 160，而所有标识
+        token 的形状上限本来就是 128。"""
+
+        for text in (
+            "/admin user [a@b.com](mailto:a@b.com)",
+            "/admin user a@b.com (mailto:a@b.com)",
+            "/admin user a@b.com mailto:a@b.com",
+            "/admin user <a href=\"mailto:a@b.com\">a@b.com</a>",
+        ):
+            with self.subTest(text=text):
+                command = parse_admin_command(text)
+                self.assertEqual(command.kind, AdminCommandKind.QUERY_USER)
+                self.assertEqual(command.identifier, "a@b.com")
+
+    def test_a_segment_longer_than_the_cap_is_simply_not_collapsed(self) -> None:
+        """限长是**无损**的：超过上限的段无论合不合并都过不了标识形状校验，
+        结论仍然是同一个 ``bad_identifier``，不是把一个本来能用的输入判死。"""
+
+        long_local_part = "a" * 200
+        command = parse_admin_command(
+            f"/admin user [{long_local_part}@b.com](mailto:{long_local_part}@b.com)"
+        )
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+
+class NonDecimalDigitTokenTests(unittest.TestCase):
+    """A-2（Trace #544）：``str.isdigit()`` 对上标数字为真、``int()`` 却抛
+    ``ValueError``——``/admin audit ²⁴`` 因此不是落到"小时数不对"这条明确拒绝上，
+    而是把整条命令打挂成一句笼统的"本次管理命令处理失败"（``router.py`` 的兜底）。
+    """
+
+    SUPERSCRIPT_24 = "²⁴"
+
+    def test_superscript_hours_does_not_raise(self) -> None:
+        command = parse_admin_command(f"/admin audit a@b.com {self.SUPERSCRIPT_24}")
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_WINDOW_HOURS)
+
+    def test_superscript_single_token_falls_back_to_identifier_shape(self) -> None:
+        command = parse_admin_command(f"/admin audit {self.SUPERSCRIPT_24}")
+
+        self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+        self.assertEqual(command.reject_reason, AdminRejectReason.BAD_IDENTIFIER)
+
+    def test_other_non_decimal_digit_shapes_are_also_safe(self) -> None:
+        for token in ("₁₂", "⑤", "½"):
+            with self.subTest(token=token):
+                command = parse_admin_command(f"/admin audit a@b.com {token}")
+                self.assertEqual(command.kind, AdminCommandKind.UNKNOWN)
+                self.assertEqual(command.reject_reason, AdminRejectReason.BAD_WINDOW_HOURS)
+
+    def test_plain_decimal_hours_still_parse(self) -> None:
+        command = parse_admin_command("/admin audit a@b.com 48")
+
+        self.assertEqual(command.kind, AdminCommandKind.QUERY_AUDIT)
+        self.assertEqual(command.window_hours, 48)

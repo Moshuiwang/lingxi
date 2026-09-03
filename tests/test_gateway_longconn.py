@@ -619,7 +619,10 @@ class ManagementCardDispatchTests(unittest.TestCase):
             ],
         )
 
-    def test_suppress_form_submission_also_routes_to_form_submit(self) -> None:
+    def test_suppress_form_submission_is_no_longer_routed(self) -> None:
+        """**否定用例**：「屏蔽指标」提交按钮随 ``/admin suppress_permission`` 一起
+        撤除（Trace #544 D-5）——旧卡上残留的这个按钮点下去不再进表单处理口。"""
+
         from lingxi.apps.gateway import make_event_handler
 
         class Audit:
@@ -632,18 +635,28 @@ class ManagementCardDispatchTests(unittest.TestCase):
 
         calls: list[dict[str, object]] = []
 
+        fallbacks: list[dict[str, object]] = []
+
         class FakeCardCallbackHandler:
             def handle_management_form_submit(self, **kwargs: object) -> dict:
                 calls.append(kwargs)
                 return {"toast": {"type": "success", "content": "ok"}}
 
+            def handle(self, **kwargs: object) -> dict:
+                # 认不出的 admin_action 落回确认/取消这条通用路径，那里对一个不是
+                # confirm/cancel 的 decision 只回一句"操作不存在或已失效"。
+                fallbacks.append(kwargs)
+                return {"toast": {"type": "error", "content": "操作不存在或已失效"}}
+
         handler = make_event_handler(
             ExplodingPipeline(), audit=Audit(), card_callback_handler=FakeCardCallbackHandler()
         )
 
-        handler(management_form_submit_event(admin_action="suppress"))
+        result = handler(management_form_submit_event(admin_action="suppress"))
 
-        self.assertEqual(calls[0]["admin_action"], "suppress")
+        self.assertEqual(calls, [], "撤除的动作不得再进表单处理口")
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(result["toast"]["type"], "error")
 
     def test_real_click_shape_missing_value_routes_via_button_name(self) -> None:
         """W0-1 追加结论（2026-08-30，真实点击实测坐实）：真实回调里 form 内
@@ -752,9 +765,9 @@ class ManagementCardDispatchTests(unittest.TestCase):
                 "operator": {"open_id": "ou_admin"},
                 "action": {
                     "tag": "form",
-                    "name": "suppress_submit",
+                    "name": "grant_submit",
                     "value": json.dumps(
-                        {"admin_action": "suppress", "identifier": "u@example.invalid"}
+                        {"admin_action": "grant", "identifier": "u@example.invalid"}
                     ),
                     "form_value": {
                         "company_id": "1012",
@@ -769,7 +782,7 @@ class ManagementCardDispatchTests(unittest.TestCase):
         handler(event)
 
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["admin_action"], "suppress")
+        self.assertEqual(calls[0]["admin_action"], "grant")
         self.assertEqual(calls[0]["identifier"], "u@example.invalid")
         self.assertEqual(calls[0]["company_id"], "1012")
 

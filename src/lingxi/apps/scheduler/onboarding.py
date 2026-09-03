@@ -90,6 +90,7 @@ import logging
 import queue
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -97,6 +98,7 @@ from lingxi.adapters.postgres_local_permission import (
     PostgresLocalPermissionOverrideStore,
     local_override_reader,
 )
+from lingxi.core.identity.innertest_roster_gate import build_innertest_roster_gate
 from lingxi.core.permission.mcp_readiness import ReadinessSchedule
 from lingxi.core.permission.metric_translation import metric_translation_available
 
@@ -390,8 +392,15 @@ class OnboardingExecutor:
                 return
             try:
                 task()
-            except BaseException:  # noqa: BLE001 - 一条链的失败不得带走这条线程
-                logger.exception("开通链在执行线程上抛出未捕获异常")
+            except BaseException as error:  # noqa: BLE001 - 一条链的失败不得带走这条线程
+                # C-6：不用 `logger.exception`——它会把异常正文写进日志，而这条
+                # 兜底捕获的是**整条开通链**的任意异常，psycopg 的唯一键冲突正文里
+                # 带着 `Key (feishu_open_id)=(ou_…)`。只记类型名与调用栈帧。
+                logger.error(
+                    "开通链在执行线程上抛出未捕获异常 error=%s\n调用栈（不含异常正文）：\n%s",
+                    type(error).__name__,
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
             finally:
                 self._queue.task_done()
             if self._stopping.is_set() and self._queue.empty():
@@ -747,6 +756,7 @@ def _build_onboarding_duty(
     from lingxi.adapters.feishu_user_message import FeishuUserMessages
     from lingxi.adapters.mcp_token_cipher import McpTokenCipher
     from lingxi.adapters.postgres_conversation import PostgresGatewayStore
+    from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
     from lingxi.adapters.postgres_galaxy_snapshot import PostgresGalaxySnapshotReader
     from lingxi.adapters.postgres_identity import PostgresAppUserStore, PostgresOrgSnapshotStore
     from lingxi.adapters.postgres_mcp_token import PostgresMcpTokenStore, token_cipher_provider
@@ -854,6 +864,11 @@ def _build_onboarding_duty(
             if stock_tokens is not None
             else None
         ),
+        # 预授权落库口（Issue #541 预开通）：与上面那个存量差集导入口是**同一张表、
+        # 同一份适配器**，只是合成 ``pending_action`` 的 ``reason`` 不同（审计要一眼
+        # 分得清"首聊时导入"与"首聊前预授权"）。**无条件装配**：它与存量令牌源无关，
+        # 而系统触发带了预授权却发现它没装时是整链失败关闭，不该由部署配置决定。
+        position_grants=PostgresLocalPermissionOverrideStore(dsn, timeouts=timeouts),
         decisions=PostgresPermissionPublishStore(dsn, timeouts=timeouts),
         readiness=McpReadinessConfirmation(
             probe=guarded_probe,
@@ -884,7 +899,7 @@ def _build_onboarding_duty(
         # 发布行的值列表（#346 坐实的缺陷）。
         metric_translation_map=metric_translation_map,
         # 内测名单闸（Issue #302 S-N-01）：判据与理由见该静态方法与 innertest_roster_gate 模块文档。
-        innertest_roster_gate=AutoOnboardingRunner.build_innertest_roster_gate(config.innertest_roster_open_ids),
+        innertest_roster_gate=build_innertest_roster_gate(config.innertest_roster_open_ids),
         # 每次判定现读一次登记表（只读 `feishu_delegated_subject`，不碰凭据文件、不碰
         # refresh_token）：换主体之后旧值会让新的专用授权账号落回普通员工路径。
         delegated_subject=lambda: registered_delegated_subject_open_id(dsn, timeouts=timeouts),
@@ -927,6 +942,12 @@ def _build_onboarding_duty(
         # `core/identity/onboarding_ports.FailureReasonRecorder` 协议文档。
         failure_reasons=PostgresFailureReasonRecorder(dsn, timeouts=timeouts),
         local_overrides=local_override_reader(dsn, timeouts=timeouts),
+        # 「同邮箱已绑给另一个人」的只读回读口（rc25 S-2a，对抗审查 X-1）。
+        # **必填、没有哨兵值**：漏接在 ``AutoOnboardingRunner`` 构造期就是 TypeError，
+        # 不会静默退回"这道闸不存在"的旧行为。判定层见
+        # ``core/identity/onboarding_guards.reject_email_bound_to_another_person``，
+        # 数据库侧的结构性保证是迁移 ``0085`` 的部分唯一索引，两者是纵深关系。
+        email_bindings=PostgresEmailBindingSource(dsn, timeouts=timeouts),
     )
     duty = OnboardingReconciler(
         store=store,
@@ -944,6 +965,12 @@ def _build_onboarding_duty(
     # 用 `join_onboarding_executors` 接线 stop()/join()——不改 `OnboardingReconciler`
     # 的类定义，见模块文档「停机接线」一节。
     duty.onboarding_executor = executor
+    # 预开通（Issue #541 / rc25 S-8b 的 ops 入口）：把已经装配好的编排挂成一个**公开**
+    # 属性，供「系统触发」的批量入口按名单逐人调用 ``start_system(open_id=…, trace_id=…)``。
+    # 形状照上一行的执行器挂载，不改 ``OnboardingReconciler`` 的类定义；**这是脚本拿到
+    # 编排的唯一受支持方式**——自己 new 一个 ``AutoOnboardingRunner`` 会绕过这里十几个
+    # 装配不变量（发布闸、X-1 回读口、存量令牌源与差集导入口成对、内测名单闸）。
+    duty.onboarding_runner = runner
     logger.info(
         "首次开通编排已装配 线程数=%s 队列深度=%s 认领窗口=%s 就绪节奏=0/%s/%s",
         config.onboarding_workers,

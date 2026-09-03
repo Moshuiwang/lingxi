@@ -456,6 +456,7 @@ class NotifyBackoffTests(unittest.TestCase):
                 "advance_refused": 0,
                 "failed": 0,
                 "skipped_in_backoff": 1,
+                "silenced_system": 0,
                 "notifier_wired": True,
             },
         )
@@ -684,6 +685,59 @@ class FailureReasonRecordingTests(unittest.TestCase):
         self.assertEqual(report.aborted, 1)
 
 
+class PreprovisionSilenceTests(unittest.TestCase):
+    """rc25 修复包 F3：系统触发（预开通）的停摆收口**全程静默**。
+
+    产品负责人裁定 4：预开通期间不向用户发送任何消息；而 ``onboarding.stalled``
+    文案说「你发起开通」——预开通用户没有发起过任何东西，这句对他是假话。判据
+    沿用候选查询为无入站事件用户合成的 ``preprovision:<user_id>`` 事件标识
+    （``is_system_trigger``）。收口写入、审计与失败原因落库照旧；用户自己发起的
+    链一字不变（本文件其余用例全部跑在真实事件标识上，就是那半边的钉子）。
+    """
+
+    def test_a_preprovisioned_chain_is_closed_silently_with_zero_outbound(self) -> None:
+        notifier = FakeNotifier()
+        aborter = FakeAborter()
+        audit = RecordingAudit()
+        reasons = RecordingFailureReasons()
+        duty, _ = build_duty(
+            candidates=FakeCandidates(
+                (_candidate(event_id="preprovision:usr_a", trace_id="preprovision:usr_a"),)
+            ),
+            notifier=notifier,
+            aborter=aborter,
+            audit=audit,
+            failure_reasons=reasons,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(notifier.calls, [], "预开通 origin 不产生任何出站消息")
+        self.assertEqual(notifier.sent, [])
+        self.assertEqual(len(aborter.calls), 1, "静默不等于不收口：卡住的链照常收口")
+        self.assertEqual(report.aborted, 1)
+        self.assertEqual(report.silenced_system, 1)
+        self.assertEqual(report.notified, 0, "没发过的消息不得计成已通知")
+        self.assertIn("stalled_provisioning.aborted", audit.actions(), "审计照旧")
+        self.assertEqual(len(reasons.calls), 1, "失败原因落库照旧（/admin trace 可查）")
+
+    def test_a_user_initiated_chain_still_gets_the_notice_first(self) -> None:
+        """否定断言的另一半：真实事件标识（用户自己发起）逐字走既有「先通知、送达
+        才收口」路径——F3 不改这半边。"""
+
+        notifier = FakeNotifier()
+        duty, _ = build_duty(
+            candidates=FakeCandidates((_candidate(event_id="evt_real"),)),
+            notifier=notifier,
+        )
+
+        report = duty.run_once()
+
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertEqual(report.notified, 1)
+        self.assertEqual(report.silenced_system, 0)
+
+
 class ConstructionTests(unittest.TestCase):
     def test_a_non_positive_lease_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -711,6 +765,7 @@ class ConstructionTests(unittest.TestCase):
                 "advance_refused",
                 "failed",
                 "skipped_in_backoff",
+                "silenced_system",
                 "notifier_wired",
             },
         )

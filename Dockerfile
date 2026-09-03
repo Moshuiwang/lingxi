@@ -84,9 +84,15 @@ COPY src /build/src
 
 # ---------------------------------------------------------------------------
 # 交付层只从构建层取 site-packages，不带构建上下文。最终 rootfs 里因此没有 /build、
-# 没有源码树、没有 pyproject.toml——制品就是 `pip install` 装出来的那一份，与 CI 的
+# 没有仓库工作副本、没有 pyproject.toml——制品就是 `pip install` 装出来的那一份，与 CI 的
 # `check_installed_package.py` 校验的是同一个形态（断言 V-部署-10：测试跑
 # PYTHONPATH=src，部署跑已安装制品，两者会分叉，而分叉只在部署时暴露）。
+#
+# **不要把上面一句读成「镜像里没有源码」**（rc25 更正，对抗审查 R6-D1）：`pip install`
+# 装进 site-packages 的就是全部 `.py` 源文件，外加随包 TOML（用户可见文案版本文件、
+# 公司与职能到指标的映射）；`migrations/` 下的迁移 SQL 由 migrate 阶段另行 COPY。
+# 少掉的只是仓库工作副本这一层目录结构与构建元数据。镜像包当前为公开，因此这些
+# 内容对任何人可读——该代价见 `deploy/README.md`「主机读取身份」一节的现状登记。
 # ---------------------------------------------------------------------------
 
 FROM build-base AS build-scheduler

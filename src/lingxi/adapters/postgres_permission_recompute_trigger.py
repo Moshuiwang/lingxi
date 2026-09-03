@@ -20,7 +20,12 @@
   ``local_override_reader``）：构造只需要 ``dsn``/``timeouts``，gateway 进程本来
   就持有一份用于待确认操作状态机的 Postgres DSN（同一个数据库）。
 - **静态映射文件**（``load_role_function_map``/``load_company_function_metric_map``）：
-  随包发布、无需任何密钥，任何进程都能安全读取。
+  随包发布、无需任何密钥，任何进程都能安全读取。指标映射还可以被
+  ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 指向一份外置文件——**那个变量的值
+  由装配层注入本类**（构造参数 ``metric_map_path``，Trace #544 S-2c 修复对抗审查
+  P-1）：此前本类无条件读随包默认映射，而 scheduler 的每日重算读外置文件，于是
+  同一个人的权限范围会在"管理动作立即发布"与"次日日批"之间来回翻转，每次翻转都
+  是用户可见的真实权限变化。
 
 **刻意不接的一项**：令牌密文读取口（``PostgresMcpTokenStore``）需要 MCP 令牌
 加密主密钥（``LINGXI_MCP_TOKEN_ENCRYPT_KEY``）——这把主密钥目前只活在 scheduler
@@ -76,9 +81,10 @@ from __future__ import annotations
 
 import queue
 import threading
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts
+from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
 from lingxi.adapters.postgres_targeted_recompute_lookup import (
     resolve_local_override_target,
     resolve_open_id_target,
@@ -114,6 +120,55 @@ class _BaselineIdentityLookup:
         return self._by_id.get(user_id)
 
 
+#: 撤权专用身份查询（Trace #544 P-6）：与 ``postgres_roster_audit.ACTIVE_BASELINE_SQL``
+#: 取同样五列，但**不要求 ``provisioning_state = 'active'``**——停用要服务的是任何还
+#: 可能有一条发布内容在外面的人，包括首聊开通到一半就被停用的那个。仍然排除已删除
+#: 账号：那些行的内容已经随删除流程清理，不该再为它们排一条撤权意图。理由全文见
+#: ``core/permission/targeted_recompute.TargetedPermissionRecompute.force_revoke``。
+_REVOCATION_IDENTITY_SQL = """
+SELECT id, feishu_user_id, display_name, employee_no, email
+  FROM app_user
+ WHERE id = %s
+   AND account_state NOT IN ('deleting', 'deleted')
+"""
+
+
+class _RevocationIdentityLookup:
+    """按 ``user_id`` 现查一行，不预载基线。
+
+    撤权是单点动作，一次一个人；预载全表基线在这里没有意义，而"现查"还顺带保证读到
+    的是**这一刻**的行（停用写入刚提交，紧接着这一查一定看得到）。
+    """
+
+    def __init__(self, dsn: str, *, timeouts: PostgresTimeouts) -> None:
+        self._dsn = dsn
+        self._timeouts = timeouts
+
+    def find_for_revocation(self, *, user_id: str) -> ArchivedIdentity | None:
+        with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
+            cursor.execute(_REVOCATION_IDENTITY_SQL, (user_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return ArchivedIdentity(
+            app_user_id=str(row[0]),
+            personnel_id=_identity_text(row[1]),
+            display_name=_identity_text(row[2]),
+            employee_no=_identity_text(row[3]),
+            email=_identity_text(row[4]),
+        )
+
+
+def _identity_text(value: object) -> str:
+    """``NULL`` 与空白归一成空串——与 ``adapters/postgres_roster_audit._text`` 同口径。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
 class _RosterRowsAdapter:
     def __init__(self, store: Any) -> None:
         self._store = store
@@ -138,10 +193,21 @@ class PermissionRecomputeAdapter:
         *,
         timeouts: PostgresTimeouts = DEFAULT_POSTGRES_TIMEOUTS,
         audit: AuditSink,
+        metric_map_path: Path | None,
     ) -> None:
+        """``metric_map_path``：「公司+职能→指标名」映射的外置路径，由装配层从
+        ``LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH`` 读出后注入；``None`` = 这台
+        机器没配外置文件，落回随包默认（生产当前正是这一支）。
+
+        **刻意没有默认值**（Trace #544 S-2c）：本类翻译出来的指标集合会被
+        ``TargetedPermissionRecompute`` 直接发布成用户的真实权限范围，一个"忘了
+        传"的默认值就是双真相本身。
+        """
+
         self._dsn = dsn
         self._timeouts = timeouts
         self._audit = audit
+        self._metric_map_path = metric_map_path
 
     def trigger(self, pending: PendingAction) -> TargetedRecomputeOutcome:
         """``card_callback.py`` 在确认执行成功后调用，best-effort（异常由调用方
@@ -163,6 +229,18 @@ class PermissionRecomputeAdapter:
         from lingxi.adapters.postgres_roster_snapshot import PostgresRosterSnapshotStore
         from lingxi.adapters.role_function_map_file import load_role_function_map
 
+        # 两份静态映射**先读**，读不出来就一次库都不碰、一行权限都不发布
+        # （Trace #544 S-2c）：语义与 scheduler 侧
+        # ``_build_permission_refresh_duty`` 的失败关闭一致——那边"职责不注册"，
+        # 这边"这次定向重算整体不发生"，异常原样冒泡给调用方，由
+        # ``BackgroundPermissionRecomputeTrigger``/``card_callback.py`` 记下
+        # ``admin.card_callback.recompute_trigger_failed`` 并降级回每日批。
+        # **不静默回落随包默认映射**：那正是本项要消灭的第二个真相。放在最前面
+        # 而不是原来的构造行里，是为了让"配置坏了"在任何数据库读写、任何发布
+        # 之前就失败，不留下半步做完的痕迹。
+        role_function_map = load_role_function_map()
+        metric_translation_map = load_company_function_metric_map(self._metric_map_path)
+
         user_id = _resolve_target_user_id(self._dsn, self._timeouts, pending)
         if user_id is None:
             self._audit.record(
@@ -182,11 +260,12 @@ class PermissionRecomputeAdapter:
             galaxy=PostgresGalaxySnapshotReader(self._dsn, timeouts=self._timeouts),
             decisions=publish_store,
             publish_history=publish_store,
-            role_function_map=load_role_function_map(),
-            metric_translation_map=load_company_function_metric_map(None),
+            role_function_map=role_function_map,
+            metric_translation_map=metric_translation_map,
             audit=self._audit,
             local_overrides=local_override_reader(self._dsn, timeouts=self._timeouts),
             legacy_all_scope=PostgresLocalPermissionOverrideStore(self._dsn, timeouts=self._timeouts),
+            revocation_identities=_RevocationIdentityLookup(self._dsn, timeouts=self._timeouts),
         )
 
         if pending.action_type is PendingActionType.SUSPEND_USER:

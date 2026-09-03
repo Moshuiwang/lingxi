@@ -1,6 +1,6 @@
 """``lingxi-scheduler``：定时职责进程。
 
-进程现在跑**十一个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
+进程现在跑**十二个**职责，由 :class:`SchedulerLoop` 按同一个周期依次驱动：
 
 1. **专用授权凭据轮换**（:class:`CredentialRotationLoop`）——「四达文档会议助手」
    ``refresh_token`` 的到期续期；
@@ -148,6 +148,15 @@
     ``_completed_on`` 同一条已知残留，见该模块自己的文档字符串。发送失败记结构化
     审计并通过与职责 5 共用的告警接线触发运行告警，不静默。
 
+12. **内测采集到期删除**（:class:`ContentCaptureRetentionDuty`，对抗审查 2026-09-02
+    C-7）——删掉 ``innertest_content_capture`` 表里过了九十天的行。这张表存的是用户
+    问题原文、模型回答原文与工具调用详情，迁移 ``0069`` 建了 ``expires_at`` 触发器和
+    到期扫描索引，却**没有任何调用方**：九十天上限只存在于一个没人读的列里。这与职责
+    4 的成因是同一个形状（机制交付了、调用点没接），处置也照它：应用层小批量 DELETE、
+    每轮一次、不循环到删空、失败关闭。**无条件装配**——只需要连接串。生产该表恒空
+    （内容采集在生产一律不生效，见 ``apps/worker/config.py::declares_production``），
+    这条职责在生产每轮删 0 行、不打日志。
+
 架构设计把定时职责单独分给本进程，理由是"定时职责与请求路径无关，混在一起会让
 重启语义不清"。2026-08-05 在 `tz` 的复验实测到这条正好被违反：测试资产把续期扫描
 挂在飞书长连接进程内的常驻线程上，把长连接进程 kill 掉后扫描线程无声停止，没有
@@ -188,6 +197,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import traceback
 
 from lingxi.core.alerting import (
     AlertDispatcher,
@@ -248,6 +258,7 @@ from lingxi.apps.scheduler.permission_refresh import (
 )
 from lingxi.apps.scheduler.retention import (
     IDLE_CONVERSATION_SWEEP_AFTER,
+    ContentCaptureRetentionDuty,
     IdleConversationSweepDuty,
     PermissionRetentionReport,
     PermissionRetentionSweepDuty,
@@ -306,6 +317,11 @@ def main(argv: list[str] | None = None) -> int:
         # 的原始异常（如果有）继续原样向上传播。
         try:
             join_onboarding_executors(loop.duties)
-        except Exception:
-            logger.exception("lingxi-scheduler 收尾 join_onboarding_executors 失败")
+        except Exception as error:
+            # C-6：同上，只记类型名与调用栈帧，异常正文不进日志。
+            logger.error(
+                "lingxi-scheduler 收尾 join_onboarding_executors 失败 error=%s\n调用栈（不含异常正文）：\n%s",
+                type(error).__name__,
+                "".join(traceback.format_tb(error.__traceback__)),
+            )
     return 0

@@ -13,6 +13,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Mapping
 
+from lingxi.adapters.company_function_metric_map_file import (
+    METRIC_MAP_PATH_ENV,
+    parse_metric_map_path,
+)
 from lingxi.adapters.postgres import (
     DEFAULT_POSTGRES_TIMEOUTS,
     PostgresTimeoutConfigError,
@@ -212,7 +216,7 @@ class SchedulerConfig:
         "LINGXI_ONBOARDING_WORKERS",
         "LINGXI_INNERTEST_ROSTER_OPEN_IDS",
         "LINGXI_ORG_SNAPSHOT_ROUND_BUDGET_SECONDS",
-        "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH",
+        METRIC_MAP_PATH_ENV,
         "LINGXI_ALERT_HEARTBEAT_TIMEOUT_SECONDS",
         "LINGXI_ALERT_QUEUED_TIMEOUT_SECONDS",
         "LINGXI_ALERT_RUNNING_HEARTBEAT_TIMEOUT_SECONDS",
@@ -387,9 +391,7 @@ class SchedulerConfig:
         # 外置指标映射路径：与 LINGXI_USER_ENV_ROOT 同一条纪律（`optional_identifier`——
         # 不得包含空白字符），文件是否真的存在/合法留给 loader 在读取时判定（错配不是
         # 未配，这里不重复做存在性检查，否则两处判据会漂移）。
-        company_function_metric_map_path = optional_identifier(
-            "LINGXI_COMPANY_FUNCTION_METRIC_MAP_PATH"
-        )
+        company_function_metric_map_path = optional_identifier(METRIC_MAP_PATH_ENV)
 
         raw_chat_id = (source.get("LINGXI_ADMIN_GROUP_CHAT_ID") or "").strip()
         if raw_chat_id:
@@ -444,6 +446,11 @@ class SchedulerConfig:
         供 ``apps/scheduler/assembly.py`` 直接传给 ``load_company_function_metric_map``
         ——把字符串转 ``Path`` 的这一步放在配置对象自己身上，而不是每个调用点各写一次
         三元表达式，理由见 :data:`company_function_metric_map_path` 字段文档。
+
+        **解释规则本身不写在这里**：整段委托给
+        :func:`~lingxi.adapters.company_function_metric_map_file.parse_metric_map_path`
+        ——``apps/gateway/config.py`` 读同一个变量时用的是同一个函数（Trace #544
+        S-2c），两个进程因此不可能对"该读哪一份映射"给出不同答案，见该函数文档。
         """
 
-        return Path(self.company_function_metric_map_path) if self.company_function_metric_map_path else None
+        return parse_metric_map_path(self.company_function_metric_map_path)

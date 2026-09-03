@@ -446,36 +446,34 @@ class ManagementCardContextStore:
         self,
         *,
         message_id: str,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> int | None:
-        """在进程内原子递增 sequence，并可按 scanner 快照做 CAS。
+        """在进程内原子递增 sequence，并可按 scanner 快照的序号做 CAS。
 
         旧调用方不传期望值时保留 ``KeyError``/整数返回的兼容姿态。恢复路径必须
-        同时带上它读到的状态代数与 CardKit 序号；任一在渲染期间改变就返回
+        带上它读到的 CardKit 序号；序号在渲染期间被任何写入方推进就返回
         ``None``，调用方不得把旧卡片发给 CardKit。
+
+        与生产适配器同构：只用 ``card_sequence`` 一把 CAS（#493 收敛，rc25 S-4a）。
+        状态写入把两列写在同一处（见 :meth:`update_state`），而本方法只推进
+        ``card_sequence``，所以 ``card_sequence`` 的判别力严格覆盖 ``state_version``。
         """
 
-        for name, value in (
-            ("expected_state_version", expected_state_version),
-            ("expected_card_sequence", expected_card_sequence),
+        if expected_card_sequence is not None and (
+            isinstance(expected_card_sequence, bool)
+            or not isinstance(expected_card_sequence, int)
+            or expected_card_sequence <= 0
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            ):
-                raise ValueError(f"{name} 必须是正整数")
+            raise ValueError("expected_card_sequence 必须是正整数")
 
         with self._lock:
             entry = self._entries.get(message_id)
             if entry is None:
-                if expected_state_version is not None or expected_card_sequence is not None:
+                if expected_card_sequence is not None:
                     return None
                 raise KeyError(message_id)
             context, expires_at = entry
             if (
-                expected_state_version is not None
-                and context.state_version != expected_state_version
-            ) or (
                 expected_card_sequence is not None
                 and context.card_sequence != expected_card_sequence
             ):
@@ -513,8 +511,9 @@ class ManagementCardContextStore:
                 initiated_by_open_id=context.initiated_by_open_id,
                 # 每次持久状态改变都占用一个新的整卡版本。除了让 CardKit 的更新
                 # 顺序严格单调，这还使旧 scanner 在新状态写入后不能误把 needs_refresh
-                # 清掉；state_version 与 mark_visual_refreshed() 共同判定是否仍有
-                # 新状态。
+                # 清掉——判据是 ``card_sequence``（这里与 state_version 同时 +1，另外
+                # 还会被 next_card_sequence() 单独推进）。``state_version`` 自 rc25 S-4a
+                # 起不再参与 CAS，只作为状态代数继续维护，与生产表保持同一形状。
                 card_sequence=context.card_sequence + (1 if changed else 0),
                 state_version=context.state_version + (1 if changed else 0),
                 snapshot_fingerprint=(snapshot_fingerprint if snapshot_fingerprint is not None else context.snapshot_fingerprint),
@@ -553,26 +552,24 @@ class ManagementCardContextStore:
         *,
         message_id: str,
         sequence: int,
-        expected_state_version: int | None = None,
         expected_card_sequence: int | None = None,
     ) -> bool:
         """仅在外部 CardKit update 成功后清除视觉回写水位。
 
-        恢复路径传入渲染快照的状态代数和本次实际领到的 CardKit 序号。状态或
-        序号再被别的写入方推进时，CAS 失败并保留 ``needs_refresh``，让下一轮从
-        当前行重新渲染。
+        恢复路径传入本次实际领到的 CardKit 序号。任何写入方（状态写入或另一个
+        恢复者领号）推进了 ``card_sequence``，CAS 就失败并保留 ``needs_refresh``，
+        让下一轮从当前行重新渲染。状态写入必然同时推进 ``card_sequence``，因此
+        不再单独判 ``state_version``（#493 收敛，rc25 S-4a）。
         """
 
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
             raise ValueError("sequence 必须是正整数")
-        for name, value in (
-            ("expected_state_version", expected_state_version),
-            ("expected_card_sequence", expected_card_sequence),
+        if expected_card_sequence is not None and (
+            isinstance(expected_card_sequence, bool)
+            or not isinstance(expected_card_sequence, int)
+            or expected_card_sequence <= 0
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            ):
-                raise ValueError(f"{name} 必须是正整数")
+            raise ValueError("expected_card_sequence 必须是正整数")
 
         with self._lock:
             entry = self._entries.get(message_id)
@@ -580,9 +577,6 @@ class ManagementCardContextStore:
                 return False
             context, expires_at = entry
             if (
-                expected_state_version is not None
-                and context.state_version != expected_state_version
-            ) or (
                 expected_card_sequence is not None
                 and context.card_sequence != expected_card_sequence
             ):

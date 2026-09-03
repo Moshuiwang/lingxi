@@ -1,0 +1,12 @@
+[Unit]
+Description=Lingxi 容器日志增量收集单轮（Issue #343 / Trace #373 H2）
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User= 见同目录 10-local.conf.example；运行账户必须能读 docker socket 并读写
+# LINGXI_LOG_COLLECT_DIR（默认 /var/log/lingxi）。
+WorkingDirectory=/opt/lingxi/scripts
+ExecStart=/usr/bin/env bash /opt/lingxi/scripts/collect-container-logs.sh
+TimeoutStartSec=240

@@ -72,6 +72,27 @@ LOG_FILE="${LINGXI_MONITORING_PUSH_LOG:-${STATE_DIR}/push.log}"
 
 install -d -m 750 "${OUTPUT_DIR}" "${STATE_DIR}"
 
+# ---- push.log 的体量上限（对抗审查 2026-09-02 P3）-------------------------
+# 这个文件每轮都追加、常驻运行、没有任何东西回收它，与两族样本文件同一个缺陷。
+# 它只是操作性日志（推了几行、跳过几行坏数据），没有取证价值需要长期保留，
+# 因此用最简单的"超过上限就截断保留尾部"，不引入新的安装步骤。
+LINGXI_MONITORING_PUSH_LOG_MAX_BYTES="${LINGXI_MONITORING_PUSH_LOG_MAX_BYTES:-5242880}"
+if [[ -f "${LOG_FILE}" ]] \
+  && [[ "${LINGXI_MONITORING_PUSH_LOG_MAX_BYTES}" =~ ^[0-9]+$ ]] \
+  && (( LINGXI_MONITORING_PUSH_LOG_MAX_BYTES > 0 )); then
+  push_log_bytes=$(wc -c < "${LOG_FILE}" 2>/dev/null || echo 0)
+  if (( push_log_bytes > LINGXI_MONITORING_PUSH_LOG_MAX_BYTES )); then
+    # 保留尾部一半：截断点之后仍有最近的记录可查，且下一次触发要等它重新长回
+    # 上限，不会每轮都做一次全文件重写。
+    push_log_tmp="${LOG_FILE}.trim"
+    if tail -c "$(( LINGXI_MONITORING_PUSH_LOG_MAX_BYTES / 2 ))" "${LOG_FILE}" > "${push_log_tmp}" 2>/dev/null; then
+      mv -f "${push_log_tmp}" "${LOG_FILE}"
+    else
+      rm -f "${push_log_tmp}"
+    fi
+  fi
+fi
+
 _pg_dsn_without_argv_password "${MONITORING_DSN}"
 
 log() {

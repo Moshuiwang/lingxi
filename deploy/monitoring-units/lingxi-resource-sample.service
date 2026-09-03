@@ -1,12 +1,14 @@
 [Unit]
 Description=Lingxi 资源层监控单轮采样（S-RC20-410，Issue #410）
-# 形态照抄 H2 lingxi-host-monitor.timer/.service 的既有先例（deploy/监控告警.md
-# 「七、已知限制」一节记录的 biai-stage 实际安装形态：root 级 systemd timer/
-# service，User=wangzhipeng，语义与 crontab 等效——该宿主没有 cronie）。
+# 形态照抄 lingxi-host-monitor.timer/.service 的既有先例（root 级 systemd timer/
+# service，语义与 crontab 等效——biai-stage 宿主没有 cronie）；该单元 rc25 起也已
+# 入库，见同目录 lingxi-host-monitor.{service,timer}。
 
 [Service]
 Type=oneshot
-User=wangzhipeng
+# User= 不写在本文件里，由 /etc/systemd/system/<单元名>.service.d/10-local.conf 提供
+# （见同目录 10-local.conf.example）：stage 与生产的部署用户不同名，硬编码任何一个都会
+# 让另一台在安装时被人工改写——2026-09-02 实测两台已因此分叉（报告 R6-D6）。
 WorkingDirectory=/opt/lingxi/scripts/monitoring
 ExecStart=/usr/bin/env bash /opt/lingxi/scripts/monitoring/resource_sample.sh
 # 只依赖 docker（宿主 docker 组权限）与 python3 标准库，不需要任何凭据文件

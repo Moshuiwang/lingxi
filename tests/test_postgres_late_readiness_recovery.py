@@ -248,6 +248,31 @@ class CandidateQueryTest(LateReadinessRecoveryPostgresTestCase):
 
         self.assertEqual(self._candidates(), ())
 
+    def test_origin_is_read_from_the_absence_of_an_auto_provisioning_event(self) -> None:
+        """rc25 修复包 F3：预开通刻意不插入站事件行，因此「名下没有
+        ``handled_as = 'auto_provisioning'`` 的入站事件」= 系统触发（与
+        ``postgres_stalled_provisioning`` 候选查询同一条判据线）。恢复职责据此
+        对预开通 origin 静默完成、不发「开通完成」私聊。"""
+
+        version = self._publish()
+        self._stuck()
+        self._record_timed_out(USER_A, version)
+
+        (candidate,) = self._candidates()
+        self.assertTrue(candidate.system_triggered, "无认领事件 ⇒ 预开通（系统触发）")
+
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO inbound_event
+                     (feishu_event_id, received_at, event_type, user_open_id, handled_as,
+                      trace_id)
+                   VALUES ('evt_first_chat', now(), 'im.message.receive_v1', %s,
+                           'auto_provisioning', 'trc_first_chat')""",
+                (f"ou_{USER_A}",),
+            )
+        (candidate,) = self._candidates()
+        self.assertFalse(candidate.system_triggered, "有认领事件 ⇒ 用户自己发起，行为不变")
+
 
 class ActivationTest(LateReadinessRecoveryPostgresTestCase):
     """F1（同一事务）与 F3（版本守卫）。"""
@@ -274,6 +299,65 @@ class ActivationTest(LateReadinessRecoveryPostgresTestCase):
         self.assertEqual(row[0], "pending")
         self.assertEqual(row[3], "1011")
         self.assertEqual(row[4], "商务")
+
+    def test_a_silent_system_trigger_activation_arms_the_first_chat_line_instead(self) -> None:
+        """rc25 修复包 F3：预开通 origin 的恢复在**同一个事务**里推进 active ＋ 挂起
+        首聊补一句，**不排任何私聊**（产品负责人裁定 4：全程静默、首聊时补）。"""
+
+        version = self._publish()
+        self._stuck()
+
+        activated = self.store.activate_after_late_readiness(
+            user_id=USER_A,
+            expected_permission_version=version,
+            company_name="1011",
+            function_name="商务",
+            dedupe_key=self._dedupe(USER_A, version),
+            silent_system_trigger=True,
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(self._provisioning_state(), "active")
+        self.assertEqual(self._notice_count(), 0, "静默：一条「开通完成」私聊都不排")
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT preprovision_notice_armed_at FROM app_user WHERE id = %s", (USER_A,)
+            )
+            self.assertIsNotNone(cursor.fetchone()[0], "改挂首聊补一句")
+
+    def test_a_silent_activation_never_arms_the_line_for_someone_already_talking(self) -> None:
+        """挂起守卫与 ``mark_preprovision_notice_pending`` 一致：已经在聊的人挂不上
+        （0 行不是失败），激活本身照常提交——对他保持彻底静默。"""
+
+        version = self._publish()
+        self._stuck()
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO inbound_event
+                     (feishu_event_id, received_at, event_type, user_open_id, handled_as,
+                      trace_id)
+                   VALUES ('evt_chatty', now(), 'im.message.receive_v1', %s,
+                           'not_provisioned', 'trc_chatty')""",
+                (f"ou_{USER_A}",),
+            )
+
+        activated = self.store.activate_after_late_readiness(
+            user_id=USER_A,
+            expected_permission_version=version,
+            company_name="1011",
+            function_name="商务",
+            dedupe_key=self._dedupe(USER_A, version),
+            silent_system_trigger=True,
+        )
+
+        self.assertTrue(activated, "挂不上首聊补一句不是失败，激活照常")
+        self.assertEqual(self._provisioning_state(), "active")
+        self.assertEqual(self._notice_count(), 0)
+        with connect(self._dsn) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT preprovision_notice_armed_at FROM app_user WHERE id = %s", (USER_A,)
+            )
+            self.assertIsNone(cursor.fetchone()[0])
 
     def test_a_stale_permission_version_is_refused_and_creates_no_notice(self) -> None:
         """F3：候选查到的版本与当前真实版本不一致时，CAS 拒绝，**不写任何东西**。"""

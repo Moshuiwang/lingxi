@@ -49,6 +49,14 @@
    （那是一把只应该活在 scheduler 进程里的密钥，见 ``apps/scheduler/
    permission_refresh.py::_build_permission_refresh_duty`` 的同一条纪律）。
 
+## 停用要能撤掉"开通到一半"那条在途意图（Trace #544 P-6）
+
+``force_revoke`` 的身份查找**不走**授权侧那份 ``provisioning_state = 'active'`` 基线，
+走独立的 :class:`_RevocationIdentityLookup`（只排除已删除账号）。理由见该方法文档：
+用授权侧基线时，"首聊开通到一半被停用"会被判成"这个人不在基线里"直接跳过，已经入队的
+``first_onboarding`` 意图照样发到正式表——停用没有生效，而用户仍然用不了（令牌只在
+scheduler 侧）。两个口刻意不合并：放宽授权侧基线会让开通中的用户被算出非空权限发出去。
+
 ## 已停用用户不会被本模块重新发权（Issue #483 缺口②）
 
 本模块的身份查找口（``_IdentityLookup``）真实实现取的是**花名册审计基线**
@@ -169,6 +177,19 @@ class _IdentityLookup(Protocol):
     def find_active(self, *, user_id: str) -> ArchivedIdentity | None: ...
 
 
+class _RevocationIdentityLookup(Protocol):
+    """**撤权专用**的身份查找口（Trace #544 P-6）。
+
+    与 :class:`_IdentityLookup` 分开，是因为两条路径要的判据本来就不同：授权侧只
+    服务"已经开通完成"的人（``provisioning_state = 'active'``），撤权侧要服务的是
+    **任何还可能有一条发布内容在外面的人**——包括开通到一半就被停用的那个人。
+    合并成一个口会逼两条路径共用同一个基线，而放宽那个基线会让开通中的用户被授权
+    管线算出非空权限发布出去，正是这条 Protocol 要避免的事。
+    """
+
+    def find_for_revocation(self, *, user_id: str) -> ArchivedIdentity | None: ...
+
+
 class _RosterRows(Protocol):
     """花名册持久快照的行，供匹配用。``None`` 表示快照尚不存在（部署事实，
     不判断新鲜度——见模块文档「三处刻意不同」第 1 条）。
@@ -246,8 +267,13 @@ class TargetedPermissionRecompute:
         local_overrides: _LocalOverrideReader | None = None,
         clock: Callable[[], datetime] | None = None,
         legacy_all_scope: _LegacyAllScopeExpander | None = None,
+        revocation_identities: _RevocationIdentityLookup | None = None,
     ) -> None:
         self._identities = identities
+        # ``None`` = 装配层没接撤权专用查找口：退回 ``identities.find_active``，行为
+        # 与 Trace #544 P-6 之前逐字相同（真实装配一定要接，见
+        # ``adapters/postgres_permission_recompute_trigger.py``）。
+        self._revocation_identities = revocation_identities
         self._roster_snapshot = roster_snapshot
         self._galaxy = galaxy
         self._decisions = decisions
@@ -264,7 +290,22 @@ class TargetedPermissionRecompute:
     # ------------------------------------------------------------------
 
     def force_revoke(self, *, user_id: str) -> TargetedRecomputeOutcome:
-        identity = self._identities.find_active(user_id=user_id)
+        """停用触发的即时撤权：把这个人的发布内容清空，并让任何**在途**的发布意图失效。
+
+        **身份查找走撤权专用口**（Trace #544 P-6）：授权侧那份基线只收
+        ``provisioning_state = 'active'`` 的人，于是"首聊开通到一半就被停用"这一种
+        真实情形会在这里被判成 :data:`SKIP_USER_NOT_ACTIVE` 直接跳过——已经入队的
+        ``first_onboarding`` 发布意图因此照样发到正式表上，用户被停用了却仍然在权限
+        表里有一行；而他的问数令牌只在 scheduler 侧，本人还是用不了，这一行既没用又
+        越权，要等到下一次停用/恢复才会被清掉。撤权口不看开通进度，只排除已经删除的
+        账号：停用是本卡最安全攸关的方向，它不该依赖"这个人开通完了没有"。
+
+        撤权决定本身会推进 ``app_user.permission_version``，比它旧的在途意图在认领时
+        直接判 ``superseded``、一次外部调用都不发（见 ``core/permission/publish.py``
+        「并发边界」一节）——"撤掉在途意图"复用的就是这条既有机制，不新造第二套。
+        """
+
+        identity = self._find_revocation_identity(user_id)
         if identity is None:
             return self._skip(user_id, mode="revoke", reason=SKIP_USER_NOT_ACTIVE)
         if not identity.email or not identity.display_name:
@@ -272,6 +313,13 @@ class TargetedPermissionRecompute:
         if not self._publish_history.has_publish_footprint(user_id):
             return self._skip(user_id, mode="revoke", reason=SKIP_NO_PUBLISHED_ROW)
         return self._settle_revocation(user_id, identity, cause="admin_suspend")
+
+    def _find_revocation_identity(self, user_id: str) -> ArchivedIdentity | None:
+        """撤权侧的身份查找：接了专用口就用它，没接退回授权侧那份基线。"""
+
+        if self._revocation_identities is not None:
+            return self._revocation_identities.find_for_revocation(user_id=user_id)
+        return self._identities.find_active(user_id=user_id)
 
     # ------------------------------------------------------------------
     # 恢复 / 本地权限三类动作：完整合并管线

@@ -57,52 +57,99 @@ worker 侧（``apps/worker/service.py`` 经
 paragraphs`` 续做，绝不二次调用 ``create_document``（S0 探针实测：飞书建文档
 接口没有幂等键，重放会真的多建一篇孤儿文档）。
 
-**写正文步的幂等判据（Issue #353 修复）**：``write_paragraphs``/``write_body``
-同样没有幂等键——检查点恢复路径（``claim.document_id`` 进来时已经非空）如果无
-条件重新调用它，会把正文再追加一遍（#328 E-S 验收发现，P3）。不能靠再加一列本地
-检查点（例如"正文已写"标记）来堵这个洞：飞书写入与本地检查点提交是两次独立的
-数据库/网络往返，非原子，"写正文成功了、但推进本地检查点之前进程崩溃"这个窗口
-永远存在——加检查点列只能缩短这个窗口，不能封死它。因此判据必须直接问外部系统
-的真实状态：只在**检查点恢复路径**（``document_id`` 是从 ``claim`` 带进来的，
-不是本次调用刚建出来的）先调用 ``adapters.feishu_docx_delivery.LarkDocxDelivery.
+**写正文步的幂等判据（Issue #353 修复）**：``write_paragraphs`` 没有幂等键——
+检查点恢复路径（``claim.document_id`` 进来时已经非空）如果无条件重新调用它，
+会把正文再追加一遍（#328 E-S 验收发现，P3）。不能靠再加一列本地检查点（例如
+"正文已写"标记）来堵这个洞：飞书写入与本地检查点提交是两次独立的数据库/网络
+往返，非原子，"写正文成功了、但推进本地检查点之前进程崩溃"这个窗口永远存在
+——加检查点列只能缩短这个窗口，不能封死它。因此判据必须直接问外部系统的真实
+状态：只在**检查点恢复路径**（``document_id`` 是从 ``claim`` 带进来的，不是
+本次调用刚建出来的）先调用 ``adapters.feishu_docx_delivery.LarkDocxDelivery.
 read_body_children`` 读一次正文根 block 的现有子块，非空即跳过写正文；首次路径
-（``document_id`` 本次调用才建出来，必然从未写过正文）不做这次多余的读回，行为
-与修复前逐字相同。该方法已知未被真实验证的假设与后续建议见其模块文档字符串。
-这条判据对官方转换路径同样成立——``write_paragraphs``/官方转换（
-``convert_markdown_to_blocks`` + ``write_blocks``）写的是完全相同的坐标（同一个
-根 block 的 ``children``），``read_body_children`` 不区分"这个坐标上的内容是
-段落写的还是转换写的"，因此不需要为转换路径单独设计幂等判据。
+（``document_id`` 本次调用才建出来）不做这次多余的读回。该判据依赖的两条假设
+已在 2026-09-03 stage 探针实测关闭（新建空文档根块子块为 0、响应键是
+``items``），见该方法所在模块的文档字符串。
 
-**markdown 官方转换路径的接线（迁移 0079，Issue #408 正式方案接线）**：
+**这条判据在 rc25 换成「服务端一次建档写全文」之后仍然成立，而且仍然有判别力**
+（Trace #544 S-7c）：
+
+- **成立**：一次建档（``docs_ai``）写进去的正文，落在的仍然是同一个坐标——
+  stage 实测综合样本文档的根 block 返回 15 个一级子块，``read_body_children``
+  不区分"这个坐标上的内容是段落写的还是服务端一次建档写的"。
+- **有判别力（不是恒真）**：「文档存在即正文已写」作为普适命题**不成立**
+  （只有 ``<title>``、没有正文的 content 建出来的文档，根块子块数 = 0），而且
+  本模块**保留的段落路径仍然是两次独立调用**（``create_document`` → 提交检查点
+  → ``write_paragraphs``，服务于 ``markdown`` 列为 ``NULL`` 的历史行、止损闸
+  关闭、以及一次建档的前置守卫命中三种情况）。"建了档、正文还没写"这个中间态
+  在生产上真实存在，恢复路径必须靠这句判据把正文补上。**因此本批刻意不把四步
+  状态机压成三步**——压缩检查点是安全性改动、不是重构，#353 正是在这里出过
+  事故。
+
+**写正文机制的接线（迁移 0079 ＋ Trace #544 S-7c）**：
 ``task_document_delivery_request.markdown`` 非 ``None`` 才有资格走
-``LarkDocxDelivery.write_body`` 的转换分支，是否真的转换由 gateway 配置
+:meth:`~lingxi.adapters.feishu_docx_delivery.LarkDocxDelivery.
+create_document_with_markdown`（一次建档写全文），是否真的走由止损闸
 ``LINGXI_DOCX_MARKDOWN_CONVERT``（装配进 ``LarkDocxDelivery`` 构造函数的
-``markdown_convert_enabled``）决定；``markdown`` 为 ``None``（历史行、或登记侧
-未能落上原文）**无条件**回退 :meth:`~lingxi.adapters.feishu_docx_delivery.
-LarkDocxDelivery.write_paragraphs`，与转换开关是否打开无关——详见
-:meth:`DocumentDeliveryConsumer._process_docx_claim` 写正文步的分支注释。转换
-失败（业务错误码、结果不明、超过 ``MAX_CONVERTED_BLOCKS``）沿用本模块既有的
+``markdown_convert_enabled``，本模块通过同名只读属性读取）决定；``markdown``
+为 ``None``（历史行、或登记侧未能落上原文）**无条件**回退两步段落路径，与止损闸
+是否打开无关——详见 :meth:`DocumentDeliveryConsumer._create_docx_body` 的分支
+注释。一次建档失败（业务错误码、``result="failed"``、结果不明）沿用本模块既有的
 definite/结果不明分类，不单独处理。
 
-**唯一的例外是「明示降级」（Issue #499，产品负责人 2026-08-31 裁定）**：转换被
-飞书确定性拒绝且原因码是 ``unsupported_nested_blocks``（回答里含表格等本仓库
-不支持的嵌套结构）时，``LarkDocxDelivery.write_body`` 改走纯文本段落路径把正文
-写进去、并在返回的 ``WriteBodyOutcome`` 里明示降级；本模块接住这个信号，
-**必须**做三件事，缺一件这条裁定就退化成当初被明令禁止的静默降级：
+**一次建档超时 ＝ 结果不明，绝不重试建档**（Trace #544 S-7c 实测）：stage 探针
+实测一次超长正文建档返回 HTTP 504，而**服务端其实已经把整篇文档建出来了**、
+调用方拿不到它的 ``document_id``。重试会产生第二篇**完整**文档。落实成三条：
+(a) ``adapters`` 的默认传输层对 HTTP 5xx 一律不解析响应体、判 ``definite=
+False``（响应体里那个 ``code=2200`` 不具备判别力）；(b) 本模块据此落
+``uncertain``，而 ``uncertain`` 按 ``V-交付-03`` **不自动重试**、不会被
+``claim_pending`` 再次认领；(c) 允许"改走段落路径"的捕获范围窄到
+``PRE_FLIGHT_DEGRADE_REASONS`` 这两个**发出请求之前**就判定的原因码，超时不在
+其中——泛化捕获会在超时之后再建一篇。**用户端不会看到重复交付**（授权发生在
+建档之后），孤儿只堆在机器人云空间里：这是运维卫生问题，不是用户结果问题，
+但必须显式设计，不能默认没有。
+
+**「明示降级」（Issue #499，产品负责人 2026-08-31 裁定；rc25 换路后来源改变、
+纪律不变）**：降级信号现在有两个来源，本模块对两者一视同仁——
+
+1. **前置守卫命中**（``body_too_long``/``title_not_embeddable``）：一次建档在
+   发出请求之前判定这份正文/标题走不通，改走两步段落路径。此时降级检查点
+   **先于写正文提交**（守卫在调用之前判定，这个顺序做得到），比"写完再落"更
+   安全：先写后落时一次崩溃会把信号带走，恢复路径会发出不带降级说明的通知。
+2. **服务端自陈降级**（``server_simplified_body``）：一次建档**已经成功**，但
+   ``data.result`` 非 ``success`` 或 ``data.warnings`` 非空。文档已经建好也写好
+   了，不改路、不重试，只是如实告知；此时降级检查点在建档检查点之后紧接着单独
+   提交。
+
+无论来自哪一路，**必须**做三件事，缺一件这条裁定就退化成当初被明令禁止的静默
+降级：
 
 1. 把原因码落进 ``task_document_delivery_request.body_degraded_reason``（迁移
    0082，:meth:`PostgresDocumentDeliveryStore.mark_body_degraded` 单独提交）
    ——补发通知路径与检查点恢复路径都是另一次进程调用，读不到这次调用的内存
    信号；
-2. 成功通知改用 ``delivery.document_ready_degraded``（如实说明格式已简化及
-   原因），不是普通的 ``delivery.document_ready``；
+2. 成功通知改用 ``delivery.document_ready_degraded``（如实说明格式已简化），
+   不是普通的 ``delivery.document_ready``；
 3. 记一条 ``gateway.document_delivery.body_degraded`` 结构化日志，让运维能按
-   ``task_id`` 查到这次降级。
+   ``task_id`` 查到这次降级（前置守卫另有一条
+   ``gateway.document_delivery.pre_flight_degrade``，记录"为什么没走一次建档"）。
 
-**不上告警**：降级是"交付成功、但排版被简化"，不是故障；实测命中率 18.2%
-（#499 W0-1），按 ``document_delivery_failed`` 那样命中即报会把管理群刷成噪音，
-反而淹没真正的失败。可观测性由上面第 1、3 两项承担（库里一列 ＋ 一条结构化
-日志），与 ``_fail``/``_uncertain`` 的告警面刻意分开。
+**不上告警**：降级是"交付成功、但排版被简化"，不是故障；按
+``document_delivery_failed`` 那样命中即报会把管理群刷成噪音，反而淹没真正的
+失败。可观测性由上面第 1、3 两项承担（库里一列 ＋ 结构化日志），与
+``_fail``/``_uncertain`` 的告警面刻意分开。
+
+**就绪文案按降级来源逐条分派（rc25 S-5c 开机制，修复包 F4 补全）**：
+每条文案的归因必须对它的触发源逐字为真。``server_simplified_body`` 走
+``delivery.document_ready_simplified``——那篇文档其实仍然是带格式的（"已按纯文本
+段落交付"是假话），而"内容本身没有删减"在服务端静默丢块（探针实测原始 HTML 块
+被丢弃且不产生任何 warning）时可能失实，新文案不做那句担保并请用户打开核对。
+两道前置守卫各有专条（F4：旧文案把它们归因为"回答里有暂时无法排版的结构"，而
+真实原因是**长度**与**标题形态**，归因是假话）——``body_too_long`` 走
+``delivery.document_ready_degraded_too_long``，``title_not_embeddable`` 走
+``delivery.document_ready_degraded_title``；两条新文案同样不承诺"内容本身没有
+删减"。``delivery.document_ready_degraded`` 从此只服务历史行的
+``unsupported_nested_blocks``（"有暂时无法排版的结构……已按纯文本段落交付"对它
+逐字准确）。分派见 :meth:`DocumentDeliveryConsumer._send_ready_notice`。
 
 **这条降级是"拿得到"，不是"好看"**：段落路径来自 ``paragraphs`` 列，表格会被
 拍平成一段长文本、``|---|`` 分隔行原样留在正文里——用户文案不得暗示格式完好，
@@ -360,60 +407,24 @@ class DocumentDeliveryConsumer:
         from lingxi.adapters.postgres_document_delivery import DocumentDeliveryOwnershipLost
 
         document_id = claim.document_id
-        # Issue #353：只有检查点恢复路径（document_id 从 claim 带进来，不是本次
-        # 调用刚建出来的）才需要在写正文前多问一句"是不是已经写过了"——首次路径
-        # 的 document_id 必然是全新文档，从未写过正文，不需要这次额外读回，行为
-        # 与修复前逐字相同（见模块说明「写正文步的幂等判据」）。
-        recovering_from_checkpoint = document_id is not None
         # Issue #499：这一行此前是否已经被判定为降级交付（迁移 0082 的
         # `body_degraded_reason`，由 `claim_pending` 一并读出）。检查点恢复路径
-        # 会跳过写正文步、因此不会再产生一次 `WriteBodyOutcome`——不从 claim 里
-        # 继承这个值，恢复路径发出的就是不带降级说明的"文档已生成"。
+        # 会跳过写正文步、因此不会再产生一次降级信号——不从 claim 里继承这个值，
+        # 恢复路径发出的就是不带降级说明的"文档已生成"。
         body_degraded_reason = claim.body_degraded_reason
         try:
-            if document_id is None:
-                document_id = self._docx.create_document(claim.title)
-                # 检查点：独立提交，不与下面三步共享事务（见模块说明）。
-                self._store.mark_document_created(request_id=claim.id, document_id=document_id)
-            already_has_body = recovering_from_checkpoint and bool(
-                self._docx.read_body_children(document_id)
-            )
-            if not already_has_body:
-                # Issue #408 正式方案接线：``claim.markdown`` 是否非 None 才是
-                # "有没有资格走官方转换路径"的判据——是否真的转换仍然由
-                # ``LarkDocxDelivery.write_body`` 内部的转换开关
-                # （构造期传入的 ``markdown_convert_enabled``）决定（开关关闭
-                # 时 write_body 逐字调用 write_paragraphs，等价于本分支直接调
-                # write_paragraphs）。这里必须显式分两支、不能无条件都走
-                # write_body(markdown=claim.markdown)：如果转换开关已经打开
-                # 但这一行的 markdown 列是 NULL（历史行、或登记侧因为某种原因
-                # 没能落上原文），传 None 进 write_body 会被
-                # convert_markdown_to_blocks 判定为空正文而失败关闭——那不是
-                # 这里要的结果，"markdown 列为 NULL"必须无条件回退段落路径，
-                # 与转换开关状态无关（同 write_body 幂等判据一致：两条路径写的
-                # 是同一个坐标）。
-                if claim.markdown is not None:
-                    outcome = self._docx.write_body(
-                        document_id, paragraphs=list(claim.paragraphs), markdown=claim.markdown
-                    )
-                    # Issue #499 明示降级：`write_body` 只在
-                    # `unsupported_nested_blocks` 这一个原因码上降级（其余失败仍
-                    # 然向上抛，走下面既有的 definite/结果不明分类）。降级时正文
-                    # **已经**写进飞书了，所以这里先把原因码单独提交成检查点、再
-                    # 继续授权/读回——晚提交会被一次崩溃带走，恢复路径就再也无从
-                    # 知道这一行降级过（见迁移 0082 文件头部「残留窗口如实登记」）。
-                    if outcome.degraded_reason is not None:
-                        body_degraded_reason = outcome.degraded_reason
-                        self._store.mark_body_degraded(
-                            request_id=claim.id, reason=outcome.degraded_reason
-                        )
-                        logger.warning(
-                            "gateway.document_delivery.body_degraded task_id=%s reason=%s",
-                            claim.task_id,
-                            outcome.degraded_reason,
-                        )
-                else:
+            if document_id is not None:
+                # Issue #353 检查点恢复路径（``document_id`` 从 claim 带进来，
+                # 不是本次调用刚建出来的）：文档已经建好，只需要判断正文写没写过
+                # ——首次路径的 document_id 必然是全新文档，不需要这次额外读回。
+                # **这条判据在换成服务端一次建档之后仍然有判别力，不是恒真**：
+                # 见 `_create_docx_body` 的两条分支——段落路径仍然是"建档"与
+                # "写正文"两次独立调用，"建了档、正文还没写"这个中间态在生产上
+                # 真实存在，恢复到这里时必须把正文补上。
+                if not self._docx.read_body_children(document_id):
                     self._docx.write_paragraphs(document_id, list(claim.paragraphs))
+            else:
+                document_id, body_degraded_reason = self._create_docx_body(claim)
             self._docx.grant_full_access(document_id, claim.requester_open_id)
             members = self._docx.read_members(document_id)
         except DocumentDeliveryOwnershipLost:
@@ -429,22 +440,28 @@ class DocumentDeliveryConsumer:
             if error.definite:
                 self._fail(claim, last_error=error.code)
             else:
+                # 结果不明（含**一次建档超时/HTTP 5xx**：服务端可能已经把整篇
+                # 文档建出来了、只是我们拿不到它的 id，见 adapters 模块文档
+                # 「坑一」）→ uncertain。按 V-交付-03，uncertain **不自动重试**，
+                # 转人工核对——这正是"超时一律不重试建档"在状态机层面的落实：
+                # 这一行不会被 claim_pending 再次认领，也就不会产生第二篇文档。
                 self._uncertain(claim, last_error=error.code)
             return
         except ValueError as error:
-            # P3 顺手（opus 审查）：``adapters.feishu_docx_delivery`` 四个动作各自
-            # 的入参校验（``_require_document_id``/``_require_user_open_id``/
-            # ``write_paragraphs`` 的空段落检查）在**发出任何 HTTP 请求之前**就
-            # 会失败，抛的是纯 ``ValueError``——这与"白名单反转"要挡的"有副作用
-            # 的调用因为网络异常而结果不明"是完全不同的情形：没有任何请求真的
-            # 发出去，重放同一份数据必然得到同一个 ``ValueError``，不存在"再等等
-            # 说不定就好了"的空间。这类行归 ``uncertain``（V-交付-03：不自动
-            # 重试，转人工核对）与归 ``failed``（同样不自动重试）在"要不要重试"
-            # 这件事上结果相同，但 ``uncertain`` 会误导排查方向——它暗示"可能已经
-            # 生效，需要人工核对飞书那一侧"，而这里连请求都没发出去，真正需要
-            # 核对的是这一行本身的数据（``requester_open_id`` 形状不对、正文段落
-            # 到了处理时点仍然是空——例如已经被 `V-投递-06` 到期擦除却仍然停在
-            # 非终态，理论上不该发生但没有硬性防线保证）。
+            # P3 顺手（opus 审查）：``adapters.feishu_docx_delivery`` 各动作的入参
+            # 校验（``_require_document_id``/``_require_user_open_id``/
+            # ``write_paragraphs`` 的空段落检查/一次建档的空标题空正文检查）在
+            # **发出任何 HTTP 请求之前**就会失败，抛的是纯 ``ValueError``——这与
+            # "白名单反转"要挡的"有副作用的调用因为网络异常而结果不明"是完全不同
+            # 的情形：没有任何请求真的发出去，重放同一份数据必然得到同一个
+            # ``ValueError``，不存在"再等等说不定就好了"的空间。这类行归
+            # ``uncertain``（V-交付-03：不自动重试，转人工核对）与归 ``failed``
+            # （同样不自动重试）在"要不要重试"这件事上结果相同，但 ``uncertain``
+            # 会误导排查方向——它暗示"可能已经生效，需要人工核对飞书那一侧"，而
+            # 这里连请求都没发出去，真正需要核对的是这一行本身的数据
+            # （``requester_open_id`` 形状不对、正文段落到了处理时点仍然是空——
+            # 例如已经被 `V-投递-06` 到期擦除却仍然停在非终态，理论上不该发生但
+            # 没有硬性防线保证）。
             self._fail(claim, last_error=type(error).__name__)
             return
         except Exception as error:  # noqa: BLE001 - 白名单反转（同 delivery.py R-1）：
@@ -462,6 +479,91 @@ class DocumentDeliveryConsumer:
             resource_url=None,
             body_degraded_reason=body_degraded_reason,
         )
+
+    def _create_docx_body(self, claim: DocumentDeliveryClaim) -> tuple[str, str | None]:
+        """首次路径的「建档 ＋ 写正文」两步，返回 ``(document_id, 降级原因)``。
+
+        由 :meth:`_process_docx_claim` 独占调用，拆出来只为把两条写入路径的
+        分派与它们各自的检查点顺序讲清楚，**异常一概不在这里捕获**（除了那一个
+        允许改路的原因码集合）——失败分类仍然由调用方那一层的 try 统一做。
+
+        两条路径（模块文档「写正文步的幂等判据」与 ``adapters/
+        feishu_docx_delivery.py`` 模块文档「服务端一次建档写全文」）：
+
+        1. **一次建档**（``claim.markdown`` 非 ``None`` 且止损闸打开）：
+           ``create_document_with_markdown`` 一次调用建档并写完整篇正文。
+           **检查点在这一次调用成功之后才提交**，因此这条路径上"检查点已落"
+           蕴含"正文已写"。
+        2. **两步段落路径**（``markdown`` 列为 ``NULL`` 的历史行、止损闸关闭、
+           或一次建档的前置守卫命中）：``create_document`` → 提交检查点 →
+           ``write_paragraphs``。这条路径**保留了"建了档、正文还没写"的中间
+           态**，也正因为它还在，恢复路径那句 ``read_body_children`` 判据继续
+           有判别力，不是恒真的摆设。
+
+        **``claim.markdown`` 是否非 ``None`` 是独立判据，与止损闸无关**：
+        markdown 列为 ``NULL``（历史行、或登记侧因为某种原因没能落上原文）时
+        无条件走段落路径，把 ``None`` 送进一次建档只会被空正文校验拒绝，那不是
+        这里要的结果。
+
+        **前置守卫命中时的降级检查点先于写入提交**：守卫是在发出任何请求之前
+        判定的，所以这里能在写正文**之前**就把原因码落库。比"写完再落"更安全
+        ——如果先写正文再提交原因码，一次崩溃会把这个信号带走，恢复路径读到的
+        是"正文已写、没有降级记录"，于是发出**不带降级说明**的"文档已生成"，
+        正好是裁定要消灭的静默降级。
+        """
+
+        from lingxi.adapters.feishu_docx_delivery import (
+            PRE_FLIGHT_DEGRADE_REASONS,
+            FeishuDocxDeliveryError,
+        )
+
+        pre_flight_degrade_reason: str | None = None
+        if claim.markdown is not None and self._docx.markdown_convert_enabled:
+            try:
+                created = self._docx.create_document_with_markdown(claim.title, claim.markdown)
+            except FeishuDocxDeliveryError as error:
+                if error.code not in PRE_FLIGHT_DEGRADE_REASONS:
+                    raise
+                # 到这里为止**一个请求都没有发出去**（两道守卫都在发起调用之前
+                # 判定），这一行还没有任何外部副作用——改走段落路径不会产生第二
+                # 篇文档。捕获范围必须窄到这一个集合：泛化成"任何失败都改走段落
+                # 路径"会在一次建档**超时**之后再建一篇，而那次超时很可能已经在
+                # 飞书那边留下了一篇带全文的文档。
+                pre_flight_degrade_reason = error.code
+                logger.warning(
+                    "gateway.document_delivery.pre_flight_degrade task_id=%s reason=%s",
+                    claim.task_id,
+                    error.code,
+                )
+            else:
+                document_id = created.document_id
+                # 检查点：独立提交，不与后续两步共享事务（见模块说明）。这条
+                # 路径上正文已经随建档写完，因此检查点一旦落下，"正文写没写过"
+                # 就不再是问题。
+                self._store.mark_document_created(request_id=claim.id, document_id=document_id)
+                if created.degraded_reason is not None:
+                    self._store.mark_body_degraded(
+                        request_id=claim.id, reason=created.degraded_reason
+                    )
+                    logger.warning(
+                        "gateway.document_delivery.body_degraded task_id=%s reason=%s",
+                        claim.task_id,
+                        created.degraded_reason,
+                    )
+                return document_id, created.degraded_reason
+
+        document_id = self._docx.create_document(claim.title)
+        # 检查点：独立提交，不与后续三步共享事务（见模块说明）。
+        self._store.mark_document_created(request_id=claim.id, document_id=document_id)
+        if pre_flight_degrade_reason is not None:
+            self._store.mark_body_degraded(request_id=claim.id, reason=pre_flight_degrade_reason)
+            logger.warning(
+                "gateway.document_delivery.body_degraded task_id=%s reason=%s",
+                claim.task_id,
+                pre_flight_degrade_reason,
+            )
+        self._docx.write_paragraphs(document_id, list(claim.paragraphs))
+        return document_id, pre_flight_degrade_reason
 
     def _process_sheet_claim(self, claim: DocumentDeliveryClaim) -> None:
         """表格分支（Issue #354 S-H3-2）：与 :meth:`_process_docx_claim` 逐项
@@ -682,7 +784,7 @@ class DocumentDeliveryConsumer:
 
         ``body_degraded_reason``（迁移 0082，Issue #499）：非 ``None`` 时选用
         ``delivery.document_ready_degraded``。两个调用点各自的来源不同——原发送
-        路径来自本次 ``write_body`` 的返回值（或 claim 里继承的历史值），补发
+        路径来自本次一次建档的返回值（或 claim 里继承的历史值），补发
         路径来自 :class:`~lingxi.adapters.postgres_document_delivery.
         UnnotifiedSuccess` 从库里读出的那一列；两条路径必须给出同一个结论，
         否则同一次交付会因为"第几次尝试通知"而说法不一。
@@ -700,6 +802,12 @@ class DocumentDeliveryConsumer:
         的行，不需要在这里额外判断"这是不是补发"。
         """
 
+        from lingxi.adapters.feishu_docx_delivery import (
+            BODY_TOO_LONG,
+            SERVER_SIMPLIFIED_BODY,
+            TITLE_NOT_EMBEDDABLE,
+        )
+
         try:
             if delivery_type == DELIVERY_TYPE_SHEET:
                 if not isinstance(resource_url, str) or not resource_url:
@@ -715,12 +823,33 @@ class DocumentDeliveryConsumer:
                 # Issue #499 明示降级：正文被降级成纯文本段落路径写入时，用户
                 # 拿到的排版与他本该拿到的不同——必须用如实说明"格式已简化"的
                 # 那条文案，不能沿用普通就绪文案。
-                content_key = (
-                    "delivery.document_ready_degraded"
-                    if body_degraded_reason is not None
-                    else "delivery.document_ready"
-                )
-                # 去重前缀刻意**两条文案共用**：原发送与补发是同一条通知的两次
+                #
+                # **按降级原因逐来源分派**（rc25 S-5c 开的机制，修复包 F4 补全）：
+                # 每条文案的归因必须对它的触发源逐字为真——
+                # - ``server_simplified_body``：飞书服务端自己简化的，文档其实
+                #   仍然带格式，而"内容没有删减"在服务端**静默丢块**时可能失实
+                #   （探针实测：原始 HTML 块被丢弃且不产生 warning）→
+                #   ``delivery.document_ready_simplified``，不做那句担保；
+                # - ``body_too_long`` / ``title_not_embeddable``（前置守卫）：真实
+                #   原因是**长度**与**标题形态**，不是"无法排版的结构"——归因按
+                #   来源如实各说各的（F4：旧文案对这两个来源是假归因）；
+                # - 其余（历史行的 ``unsupported_nested_blocks``）：留在
+                #   ``delivery.document_ready_degraded``，"回答里有暂时无法排版的
+                #   结构……已按纯文本段落交付"对它逐字准确。
+                # **默认落在段落路径那条**：未来新增的原因码在补上分派之前先
+                # 说"已按段落交付"，是可被用户当场证伪的过度告知，不是一句
+                # 用户无法察觉的假担保。
+                if body_degraded_reason is None:
+                    content_key = "delivery.document_ready"
+                elif body_degraded_reason == SERVER_SIMPLIFIED_BODY:
+                    content_key = "delivery.document_ready_simplified"
+                elif body_degraded_reason == BODY_TOO_LONG:
+                    content_key = "delivery.document_ready_degraded_too_long"
+                elif body_degraded_reason == TITLE_NOT_EMBEDDABLE:
+                    content_key = "delivery.document_ready_degraded_title"
+                else:
+                    content_key = "delivery.document_ready_degraded"
+                # 去重前缀刻意**三条文案共用**：原发送与补发是同一条通知的两次
                 # 尝试，不是两条独立通知。分开前缀会让"第一次发普通文案失败、
                 # 补发时才读到降级列"这种时序发出两条消息给同一个人。
                 dedupe_prefix = "document-ready"

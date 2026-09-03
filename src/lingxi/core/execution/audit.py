@@ -37,7 +37,14 @@ _SECRET_WORDS = (
     r"[A-Za-z0-9_-]*"
     r"(?:token|secret|password|passwd|pwd|authorization|auth|key|credential|cookie|session|signature)"
 )
-_SECRET_KEY = re.compile(rf"({_SECRET_WORDS})", re.IGNORECASE)
+# 中文键名同样是键名（对抗审查 2026-09-02 C-4）：上面的词表全是 ASCII，分隔符也只
+# 认半角 `:`/`=`，于是错误正文里的「密码：hunter2」「口令: abc」两条规则都对不上，
+# 一条短口令原样落库。本仓库的错误正文、工具回执和运维文案本来就是中文的，这不是
+# 边角情况。这里只收**明确指向凭据**的词：`会话`/`签名` 这类在中文里常指诊断事实
+# （会话 ID、签名算法），抹掉它们是拿可读性换假的安全感——与 ASCII 词表的取舍口径
+# 略有不对称，是有意的。
+_SECRET_WORDS_CJK = r"(?:密码|口令|密钥|私钥|令牌|凭据|凭证|授权码)"
+_SECRET_KEY = re.compile(rf"({_SECRET_WORDS}|{_SECRET_WORDS_CJK})", re.IGNORECASE)
 # 错误原文来自工具回执，不经过入参那套字段白名单，因此这里按赋值形态兜底脱敏，
 # 保证 V-审计-03（审计明细中不出现凭据、完整令牌）在错误路径上同样成立。
 _SECRET_ASSIGNMENT = re.compile(
@@ -46,6 +53,19 @@ _SECRET_ASSIGNMENT = re.compile(
     re.IGNORECASE,
 )
 _SECRET_SCHEME = re.compile(r"\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}", re.IGNORECASE)
+# 中文赋值形态：分隔符要认全角 `：`/`＝`，值的终止符要认中文标点，否则「密码：hunter2。」
+# 会把句号一起吞掉、或者干脆匹配不上。
+_SECRET_ASSIGNMENT_CJK = re.compile(
+    rf"((?:{_SECRET_WORDS_CJK})[\"']?\s*[:=：＝]\s*)"
+    rf"(\"[^\"]*\"|'[^']*'|[^\s,;)}}\]，、；。）】」』]+)"
+)
+# DSN / URL 的口令写在 userinfo 段里，**没有任何键名**，而且通常短于长度上界：
+# `postgresql://lingxi_app:hunter2@db.internal:5432/lingxi` 中的 `hunter2` 既命不中
+# 键名规则（`postgresql`、`lingxi_app` 都不是秘密词），也够不着 `_TOKEN_RUN` 的
+# 16 字符下界——三道规则一道都不覆盖它（对抗审查 2026-09-02 C-4）。
+# 只在「`://` 之后、`@` 之前、有冒号分段」时命中：没有 `@` 的普通 URL（含
+# `https://host:8080/path`）与没有口令的 `scheme://user@host` 都不受影响。
+_URL_CREDENTIALS = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@\"']+:)([^\s/@\"']+)(@)")
 _MAX_KEPT_TEXT = 200
 _MAX_KEPT_ERROR_TEXT = 2000
 
@@ -666,9 +686,10 @@ def redact_free_text_with_count(text: str) -> tuple[str, int]:
     唯一消费方是内测轮内容级采集（Issue #251/#304 批次 3，
     ``core/innertest_content_capture.py``）：采集要求"凭据类命中即以占位符替换
     并计数标注"，而 :func:`redact_free_text` 只回答"替换后的文本"，回答不了
-    "替换了几处"。这里不重新发明一套脱敏规则——三段替换（赋值语句、
-    ``bearer``/``basic`` 认证头、含数字或超长的裸令牌串）与 :func:`_redact_free_text`
-    逐条对应，只是把"是否真的发生了替换"从 ``sub()`` 的静默副作用改成显式计数。
+    "替换了几处"。这里不重新发明一套脱敏规则——五段替换（半角赋值语句、中文赋值语句、
+    URL/DSN 的 userinfo 口令、``bearer``/``basic`` 认证头、含数字或超长的裸令牌串）与
+    :func:`_redact_free_text` 逐条对应，只是把"是否真的发生了替换"从 ``sub()`` 的静默
+    副作用改成显式计数。**新增一段脱敏就必须同时改这里**，否则下面那条断言会响亮失败。
 
     ``_TOKEN_RUN`` 那一段尤其不能直接用 ``re.subn()`` 数：``_mask_token_run`` 对
     纯字母且短于 32 字符的候选串**原样放行**（这正是 `V-审计-03` 登记的已知残余
@@ -700,7 +721,14 @@ def redact_free_text_with_count(text: str) -> tuple[str, int]:
             count += 1
         return masked
 
+    def _sub_url(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group(1)}[REDACTED]{match.group(3)}"
+
     step = _SECRET_ASSIGNMENT.sub(_sub_assignment, text)
+    step = _SECRET_ASSIGNMENT_CJK.sub(_sub_assignment, step)
+    step = _URL_CREDENTIALS.sub(_sub_url, step)
     step = _SECRET_SCHEME.sub(_sub_scheme, step)
     step = _TOKEN_RUN.sub(_sub_token, step)
     # 内部一致性核对（本仓库无 -O 优化运行、assert 在生产路径已有先例见
@@ -754,4 +782,6 @@ def _mask_token_run(match: re.Match[str]) -> str:
 
 def _redact_secrets(text: str) -> str:
     text = _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}[REDACTED]", text)
+    text = _SECRET_ASSIGNMENT_CJK.sub(lambda m: f"{m.group(1)}[REDACTED]", text)
+    text = _URL_CREDENTIALS.sub(lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", text)
     return _SECRET_SCHEME.sub(lambda m: f"{m.group(1)} [REDACTED]", text)

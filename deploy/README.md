@@ -11,7 +11,7 @@
 
 | 服务 | 形态 | 入口 | 说明 |
 | --- | --- | --- | --- |
-| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据续期扫描、九十天保留清理、空闲会话到点清理、花名册审计日报、运行告警（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 起 `main()` 真实装配 `AlertingDuty`） |
+| `scheduler` | **常驻服务** | `python -m lingxi.apps.scheduler` | 专用授权凭据续期扫描、九十天保留清理（含 rc25 S-3b 新增的内测采集表到期删除，第 12 条职责）、空闲会话到点清理、花名册审计日报、运行告警（[#153](https://github.com/Moshuiwang/lingxi/issues/153) 起 `main()` 真实装配 `AlertingDuty`） |
 | `gateway` | **常驻服务，但默认不启动** | `python -m lingxi.apps.gateway` | 飞书长连接接入，收事件落库成任务（#57）；同进程后台线程跑投递消费循环（#152）。放在非默认 profile 里，见下 |
 | `worker` | **一次性作业** | `python -m lingxi.apps.worker` | 单回合受控执行。跑一个 Agent SDK 回合、往 stdout 写一个 JSON 报告、退出 |
 | `worker-queue` | **常驻服务，仅 `mvp` profile**（[#153](https://github.com/Moshuiwang/lingxi/issues/153)） | `python -m lingxi.apps.worker`（`LINGXI_WORKER_MODE=queue`） | 与 `worker` **同一镜像**，长期领取队列任务；收到 `SIGTERM` 后停止领取、在途任务在一个轮询周期量级内被请求中断、有界预算内收口；同一收口周期消费 Agent 会话 JSONL 物理清理队列 |
@@ -81,7 +81,13 @@ $EDITOR deploy/.env.stage.reauthorize                # 重授权所需数据库�
 
 七个名字都匹配 `.gitignore` 既有的 `.env.*` 规则，**不入库**；`scripts/ci/verify_repository.sh` 的敏感配置扫描也已覆盖它们。镜像里不预置任何凭据。
 
-**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）不跑 Agent SDK、不继承环境给任何子进程，但它需要 `LINGXI_POSTGRES_DSN` 才能领任务——这正是它必须有自己独立一份 env 文件、不能借用 `worker` 那份的原因（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
+**为什么按服务拆而不是共用一份，且 `worker` 与 `worker-queue` 也必须分开。** worker（一次性 job）跑的是 Claude Agent SDK，而 SDK 会把自己的进程环境**继承给 Claude Code CLI 子进程和每一个 MCP 子进程**。给它挂一份含数据库连接串、Fernet 密钥与飞书密钥的共享 env，等于把这些凭据送进模型执行环境和第三方 MCP 进程——正是产品合同「凭据不进用户环境」要挡住的方向。`worker-queue`（常驻队列消费者）**同样跑 Agent SDK**（queue 模式下每领一个任务就起一个回合，并发上限 `LINGXI_WORKER_MAX_CONCURRENCY`，见 `compose.yaml` worker-queue 服务块的资源注释），因此它的进程环境同样会被 Claude Code CLI 与 MCP 子进程继承；而它又必须持有 `LINGXI_POSTGRES_DSN` 才能领任务——**这两件事同时成立，就是它必须有自己独立一份、裁到最小的 env 文件，不能借用 `worker` 那份的原因**（PR #173 复核 P1-2：早期版本让两者共用 `.env.<环境>.worker`，结果要么 `worker-queue` 拿不到 DSN 无限崩溃重启，要么 `worker` 意外拿到了它不该有的数据库凭据）。scheduler 需要的那些，`worker` 一个都不需要。
+
+> **更正与已知边界（2026-09-02，对抗审查 R6-D2）**：本节此前写「`worker-queue` 不跑 Agent SDK、不继承环境给任何子进程」，**这一句不成立**，上面已改。`biai-stage` 受控探针实测坐实：一次会话窗口内，容器里 `claude` 子进程的 `/proc/<pid>/environ` 含 `postgres://` 连接串（进程名与计数级证据，未打印任何值）。也就是说 **生产数据库 DSN 会随进程环境进入 Claude CLI 子进程**。当时的补偿只有执行层的 PreToolUse 白名单（无 `Bash`、无任意 `Read`），同一探针另证其超时行为是失败关闭。
+>
+> **加固已落（2026-09-03，rc25 S-3b，[PR #560](https://github.com/Moshuiwang/lingxi/pull/560)）**：DSN 现在在起 Agent SDK 之前就已经不在进程环境里。摘除发生在**真实进程入口** `apps/worker/__main__.py`——`detach_process_environment()` 先把 `os.environ` 整份快照下来，再把 `LINGXI_POSTGRES_DSN` 从 `os.environ` 摘掉，然后把快照作为 `env=` 喂给 `main()`；`main()` 自己一个字节都不改 `os.environ`，只把「入口摘掉了哪些变量」记进启动日志（只记变量名、不回显值）。**落点必须在入口而不是 `main()` 里**：`main()` 会被单测在同一个解释器里反复调用，放在那里跑完几条队列模式用例之后同进程的真库用例就全都读不到 DSN 了（2026-09-02 CI 实测 40 个 `setUpClass` KeyError）。Dockerfile 的 `CMD ["python", "-m", "lingxi.apps.worker"]` 走的就是这个入口，因此生产必然执行。**为什么 SDK 侧关不掉**：已回源确认随包 `claude-agent-sdk` 的子进程传输层用 `os.environ` 全量继承再叠 `options.env`——`options.env` 只能往上加、不能往下减，没有任何参数能删掉一个已经在进程环境里的变量，所以只能在进程入口摘。**证据等级 3，未连任何机器**：本机起真实子进程读 `/proc/<pid>/environ`，含 DSN 的子进程数为 0（反向对照证明不摘时是 1），另有真实进程端到端用例证明「摘完没把自己饿死」（失败理由是缺 `LINGXI_USER_ENV_ROOT` 而不是缺 DSN）。**未做**：一次真问数的 stage 复现。
+
+**有两个变量刻意不放在这七份 env 文件里，而是写在 compose 的 `environment:` 块中**：`LINGXI_WORKER_WORKSPACE`（Agent SDK 回合的工作目录，Trace #544 S-2b）与 `LINGXI_DEPLOY_ENVIRONMENT`（「这套部署是不是生产」的代码侧判据，Trace #544 S-3b；`compose.prod.yaml` 的 `worker` 与 `worker-queue` 各写一条 `LINGXI_DEPLOY_ENVIRONMENT: "prod"`）。理由相同且是全部理由：**compose 的 `environment:` 覆盖 `env_file`**，因此判据放在这里之后，「有人把 stage 的某份 worker env 文件整份抄进 `.env.prod.worker*`」这类事故里抄来的值不再可能生效——判据活在入库、被评审、被门禁扫描的那份文件里。**不要往 env 文件里写它们**，写了不生效，只会让人误以为部署值是那一份。`LINGXI_DEPLOY_ENVIRONMENT` 声明为生产时，内测轮内容级采集一律不启用（两个开关配得再对也不生效；主开关的形态校验仍排在生产否决之前，错值仍然启动即失败）；未声明或声明成别的值时行为与加这道兜底之前逐字节一致（stage 现状不变，stage 侧要不要做对称声明尚未裁定）。`scripts/ci/check_deploy_contract.py` 的 `check_prod_declares_deploy_environment` 与 `check_worker_workspace_isolation` 分别把两者钉成会变红的断言。
 
 `LINGXI_POSTGRES_DSN` 的示例值保留 `connect_timeout`、`statement_timeout`、`lock_timeout` 三个参数，作为与连接工厂默认值的对账基线；它们不是运行时唯一控制点。`src/lingxi/adapters/postgres.py` 的连接工厂会通过 kwargs 覆盖 DSN 同名参数，合法覆盖使用 `LINGXI_POSTGRES_CONNECT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_STATEMENT_TIMEOUT_SECONDS`、`LINGXI_POSTGRES_LOCK_TIMEOUT_SECONDS`。停机预算见下方，不能只用 DSN 参数推导。
 
@@ -151,23 +157,25 @@ done
 
 ### 2. 主机读取身份（P1-4）
 
-GHCR 上的镜像包**默认是私有的**，宿主机不登录就拉不下来——`docker compose up` 会停在
-`failed to authorize ... 403 Forbidden`（本批实测过这个报错）。因此部署机必须先有一份**只读**拉取身份：
+**现状（2026-09-02 只读回读，两台机器逐条核实）**：`ghcr.io/moshuiwang/lingxi-{scheduler,gateway,worker,migrate}` 四个包自 2026-08-07 首推起一直是**公开**的；`biai-stage`（部署用户 `wangzhipeng`）与 `biplus-prod`（部署用户 `bi-ai-deploy`）**都从未登录过 GHCR**（两台的 `~/.docker/config.json` 里都没有 `ghcr.io` 条目，prod 连 `~/.docker/` 目录都不存在），两台都靠**匿名拉取**跑通。因此本节下面这条登录步骤**当前不适用**，宿主机不需要任何 GHCR 凭据：
 
 ```bash
-# 令牌由 stage [ops] Issue 供给（GitHub App / 组织级 read:packages 令牌），
+# 仅在镜像包改为 private 之后才需要执行；当前四个包公开，这一步跳过。
+# 令牌必须是专用机器账号的 classic PAT（只勾 read:packages），
 # **不得使用任何个人 GitHub 凭据**，也不得复用 CI 的 GITHUB_TOKEN。
-echo "<LINGXI_GHCR_READ_TOKEN，由 ops 供给>" \
-  | docker login ghcr.io -u "<LINGXI_GHCR_READ_USER，由 ops 供给>" --password-stdin
+echo "<LINGXI_GHCR_READ_TOKEN>" \
+  | docker login ghcr.io -u "<LINGXI_GHCR_READ_USER>" --password-stdin
 ```
 
-两个变量本批只登记名字与来源，**没有真实值**：镜像还没推上去，拉取身份的发放属于 stage `[ops]` Issue 的范围。
+**公开的真实代价（更正本节此前的一句错误表述）**：原文写「源码本身不在镜像里，只暴露依赖清单与目录结构」，**这不成立**。镜像里包含**全部源码**、用户可见文案版本文件 `content.toml`、公司与职能到指标的映射 TOML，以及 `migrations/` 下的迁移 SQL（安装态的 `lingxi` 包连同这些随包 TOML 一起进了每个运行阶段的 `site-packages`；`migrations/` 另由 migrate 阶段单独 `COPY`）。因此把包设为公开的真实代价是**这些内容对任何人可读**，不只是依赖清单与目录结构。镜像里不含任何凭据（Dockerfile 无一条写凭据的 `ENV`，全部运行期注入）。**另两条已登记的供应链边界（对抗审查 P3-5，供应链治理另议、本批不做）**：① Python 依赖**没有 hash 锁**（本仓库不使用锁文件，见[代码框架「六、依赖与迁移」](../docs/技术设计/代码框架.md)），因此同一个 tag 在不同日期重新构建不保证逐字节一致——这也是回滚必须切镜像制品、不得现场重建的原因之一；② 交付镜像里仍保留 `pip`/`apt-get`/`bash`，拿到容器执行权的人可以在容器内装东西（容器为 `read_only`、非 root、`no-new-privileges`，写入面受限）。
 
-> **2026-09-02 更正与现状**：这个选项已被选中——四个镜像包当日为**公开**，`biplus-prod` 首次部署未登录 GHCR 直接匿名拉取，上面这条登录步骤在生产首发中**不适用**。
+> **已知边界：镜像包保持公开（对抗审查 R6-D1；产品负责人 2026-09-03 裁定「无法实现的 GHCR 就保持原状」，rc25 不做私有化）**。这是一个有裁定的终态，不是欠账。三条外部原因（2026-09-02 只读回源，逐条有官方原文或实测支撑）：
 >
-> 同时更正本节此前的一句错误表述：原文写「源码本身不在镜像里，只暴露依赖清单与目录结构」，**这不成立**。镜像里包含**全部源码**、用户可见文案版本文件 `content.toml`、公司与职能到指标的映射 TOML，以及 `migrations/` 下的迁移 SQL（安装态的 `lingxi` 包连同这些随包 TOML 一起进了每个运行阶段的 `site-packages`；`migrations/` 另由 migrate 阶段单独 `COPY`）。因此把包设为公开的真实代价是**这些内容对任何人可读**，不只是依赖清单与目录结构。
+> 1. **计划中的令牌形态在 GHCR 上不可用，且失败形态是「login 绿、pull 红」**。GitHub 员工在 community discussion 里逐字答复：`packages:read` 权限「does not grant access to pull images from GHCR」「GHCR does not yet accept GitHub App installation tokens for authentication」，属现行平台限制；独立用户实测同样是「`docker login` does work, but `docker pull` doesn't」。按这条路建的凭据刷新单元会一直显示绿灯，故障只在升级窗口爆出来——正好是私有化本要防的事故。官方文档另写明 GitHub Packages 只支持 classic PAT（fine-grained 也不支持）。
+> 2. **改包可见性没有 REST 端点**。`docs.github.com/en/rest/packages/packages` 的 27 条端点里没有任何 PATCH 或可见性相关端点，这个动作只能由产品负责人在网页 UI 逐包手工完成，无法预授权给代理执行。
+> 3. **两台机器从未登录过 GHCR，改成私有即同时失去拉取能力，而回滚路径会一起断**。回滚定义为「切镜像引用后 `up -d`」，runbook 明令不得现场重建；拉不动镜像时这条路径同时失效。更麻烦的是**改回公开的方向本身状态未知**：GitHub 官方文档同一页三处写「Once you make a package public, you cannot make it private again」，而另一份官方 reusable 又写有 admin 权限者「can set the package to private or public」（双向）——官方文档自相矛盾，未坐实前必须按「私有化可能不可逆」处置。
 >
-> 产品负责人在知情前提下裁定上线日维持公开、不加拉取令牌步骤；**「改回 private 并发放只读拉取令牌」登记为上线后的观察期项**（Trace [#521](https://github.com/Moshuiwang/lingxi/issues/521)，实录见 [`生产部署runbook.md`「十一、实录偏差」](生产部署runbook.md)）。改回 private 之后，上面这段登录步骤重新生效。
+> **重启用私有化的前置**（将来若重开，缺一不可）：先用一次性探针包坐实 public → private 是否可行（绝不拿四个生产包试）；建专用机器账号的 classic PAT（只勾 `read:packages`）并登记过期日与轮换责任人；两台机器先完成 `docker login` 并回读 `~/.docker/config.json` 的 `auths` 键，**再**逐包改可见性。**不要动包设置里的「继承权限」开关**——去掉继承会覆盖本仓库自动继承来的 write，下一次 Main Publish 立刻推不上去。改回 private 之后，上面那段登录步骤重新生效。
 
 ## 编排者冻结前显式触发镜像构建（Issue #278）
 
@@ -392,6 +400,16 @@ done
 
 **`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。
 
+> **长期注意事项（rc25 审核③ ❌A 登记，不随批次失效）**：`docker compose config`
+> 不带 `--no-env-resolution` 时，在任何声明了 `env_file:` 的服务上**永远**会把那些文件的
+> 内容展开内联进输出（仓库自证：`scripts/ci/verify_compose_structure.sh` 头部注释明确
+> 记录了这一行为并为此专门造空占位文件）。本仓库七份 env 文件全部是凭据载体，因此一条
+> 看似只读的 `config <服务>` 回读会把数据库 DSN、Fernet 密钥、飞书 app secret 打进终端
+> 与会话记录。**在 stage/生产等持有真实凭据的机器上执行任何 `config` 回读，一律加
+> `--no-env-resolution`**；先用 `docker compose config --help | grep -c -- '--no-env-resolution'`
+> 确认本机支持（期望 `1`），输出不是 `1` 就不做渲染回读，改用 `ps`/`docker image inspect`
+> 等不展开 env 的核对。完整渲染（不带该开关）只允许在不含真实凭据的研发机上进行。
+
 ```bash
 # 1. 先跑迁移（一次性作业）
 docker compose --env-file deploy/.env.stage \
@@ -582,11 +600,11 @@ Docker 25.0.14 + Compose v5.2.0 未在本机复现，采用这个选型前请在
 
 | 服务 | stage（cpus / mem / pids） | 生产（cpus / mem / pids） | 依据 |
 | --- | --- | --- | --- |
-| `scheduler` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程。`compose.prod.yaml` 的 `memory` 默认值是 `1G`，**上线由根 `.env.prod` 覆盖为 512M**，理由见下「三个常驻服务的加总核对」 |
-| `gateway` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 长连接接入 + 事件落库，无子进程扇出。`memory` 与 `scheduler` 同一处置：compose 默认 `1G`，**上线由根 `.env.prod` 覆盖为 512M** |
+| `scheduler` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 定时职责、无子进程扇出，量级参照架构设计其余轻量进程。`compose.prod.yaml` 的 `memory` **无默认值**（rc25 S-3b R6-D4 起是 `${VAR:?}`），**必须由根 `.env.prod` 给出 512M**，理由见下「三个常驻服务的加总核对」 |
+| `gateway` | 0.5 / 512M / 256 | 1.0 / **512M** / 512 | 长连接接入 + 事件落库，无子进程扇出。`memory` 与 `scheduler` 同一处置：**无默认值**，**必须由根 `.env.prod` 给出 512M** |
 | `migrate` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性 DDL 作业，允许留一点余量应对大表迁移 |
 | `reauthorize` | 0.5 / 512M / 256 | 1.0 / 1G / 512 | 一次性运维作业，量级同 scheduler |
-| `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / 4G / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合 |
+| `worker`（一次性回合） | 1.5 / 2G / 512 | 2.0 / **2G** / 1024 | 单个 Agent SDK 回合：Claude CLI + 多个 MCP 子进程，但同一时刻只跑一个回合。`memory` 默认值 rc25 S-3b（报告 P3）由 `4G` 降到 `2G`：`4G` 大于宿主机可用内存（约 3.9GiB），一个永远不会生效的上限比没有上限更糟 |
 | `worker-queue`（常驻队列消费者） | 1.5 / 2G / 512 | **1.5 / 2G / 512** | 产品负责人裁定机器与 stage 同型（Issue #496/#502） |
 
 ### 生产 worker-queue 合同（Issue #494/#496/#502，2026-08-31）
@@ -647,25 +665,30 @@ LINGXI_WORKER_QUEUE_TMPFS_SIZE=256m
 | --- | --- | --- | --- | --- | --- |
 | stage 实配 | 512M | 512M | 2G | **3G** | 余约 700MB ✅ |
 | **生产上线实配** | **512M** | **512M** | 2G | **3G** | 余约 700MB ✅ |
-| （对照）`compose.prod.yaml` 未覆盖时的默认值 | 1G | 1G | 2G | 4G | 会超出主机 ❌ |
+| （对照，**已不可能发生**）`compose.prod.yaml` 曾有的 `1G` 默认值 | 1G | 1G | 2G | 4G | 会超出主机 ❌ |
 
-**第三行是对照，不是上线值。** `compose.prod.yaml` 里 `scheduler`/`gateway` 的
-`memory` 写成 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}` / `${LINGXI_GATEWAY_MEM_LIMIT:-1G}`
-——`1G` 只是**不覆盖时的默认值**，而生产从来不裸跑默认值：上线时根 `deploy/.env.prod`
-把这两项钉成与 stage 同值 `512M`（元守护 W0-3 盘点结论，执行步骤见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519) S-3.5），
-加总因此是 **3G ≤ 3.74GiB**。这与 D5「生产与 stage 同型」是同一件事，不是新的资源
-合同变更，也**不需要改 `compose.prod.yaml` 的默认值**。所以生产根 `.env.prod` 除了
-上面那五行 worker-queue 值，还须包含：
+**第三行是历史对照，不是上线值，而且现在已经不可能发生。** 生产上线时根
+`deploy/.env.prod` 把这两项钉成与 stage 同值 `512M`（元守护 W0-3 盘点结论，执行步骤
+见 [Issue #519](https://github.com/Moshuiwang/lingxi/issues/519) S-3.5），加总因此是
+**3G ≤ 3.74GiB**。这与 D5「生产与 stage 同型」是同一件事，不是新的资源合同变更。
+生产根 `.env.prod` 除了上面那五行 worker-queue 值，还须包含：
 
 ```dotenv
 LINGXI_SCHEDULER_MEM_LIMIT=512M
 LINGXI_GATEWAY_MEM_LIMIT=512M
 ```
 
-**漏配这两行的后果是静默的**：它们是 `:-` 有默认值形态（不是 worker-queue 那种
-`${VAR:?}` fail-fast），漏了不会报错，只会安静地退回 `1G`、把加总推到 4G。部署前
-用渲染回读确认，不要只看 env 文件：
-`docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config scheduler gateway`。
+**漏配这两行的后果自 rc25 S-3b（报告 R6-D4）起不再是静默的**：`compose.prod.yaml` 里
+`scheduler`/`gateway` 的 `memory` 已由 `${LINGXI_SCHEDULER_MEM_LIMIT:-1G}` /
+`${LINGXI_GATEWAY_MEM_LIMIT:-1G}` 改成**无默认值**的 `${VAR:?…}`，与 worker-queue 四项
+同一姿态。漏配时 `docker compose config`/`up` **直接失败**并指名缺哪个变量
+（`required variable LINGXI_SCHEDULER_MEM_LIMIT is missing a value`），起不来，
+不会再安静地退回 `1G`、把加总推到 4G。`PROD_EXTERNAL_HOST_SPEC_LIMITS` 已把这两项
+纳入门禁，改回 `:-` 形态会判红。渲染回读仍然建议做（它同时核对**值对不对**，而不只是
+在不在）：
+`docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution scheduler gateway`
+——**在有真实凭据的机器上必须带 `--no-env-resolution`**，先决条件与不支持时的替代见
+「安装与升级」开头的长期注意事项（rc25 审核③ ❌A）。
 
 **怎么读这张表**：`deploy.resources.limits` 是**上界，不是预留**，三者同时顶格才会
 真的冲突。CPU 超订（生产 1.0 + 1.0 + 1.5 = 3.5 vCPU 对 2 vCPU）只会限流变慢，内存
@@ -700,13 +723,15 @@ Claude CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直
 `compose.stage.yaml`/`compose.prod.yaml` 里，只有需要单独调整某个服务时才需要
 在 `deploy/.env.stage`/`deploy/.env.prod` 里显式设置对应变量。
 
-**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并）：
+**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并；在持有真实
+凭据的机器上带 `--no-env-resolution`，见「安装与升级」的长期注意事项——`deploy:` 块的
+渲染结果不受该开关影响）：
 
 ```bash
 docker compose --env-file deploy/.env.stage \
-  -f deploy/compose.yaml -f deploy/compose.stage.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml config --no-env-resolution | grep -A4 'deploy:'
 docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution | grep -A4 'deploy:'
 ```
 
 **门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的

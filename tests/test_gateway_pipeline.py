@@ -22,6 +22,7 @@ Issue #65 轻审登记的三项前置修复各有一组用例，同样落在既�
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 from gateway_fakes import (
@@ -41,7 +42,13 @@ from lingxi.adapters.feishu_events import (
     NonPrivateChatError,
     parse_message_event,
 )
-from lingxi.config.content import default_content_catalog
+from lingxi.config.content import (
+    KEY_PREPROVISIONED_FIRST_CHAT,
+    ContentCatalog,
+    ContentRenderError,
+    RenderedContent,
+    default_content_catalog,
+)
 from lingxi.core.conversation import (
     BUSY_HINT_TEXT,
     EventPipeline,
@@ -274,6 +281,135 @@ class DeliveryExpiredNoticeTests(PipelineTestCase):
             any("请重新提问" in reply["text"] for reply in replies),
             "没有预置到期任务时不应该凭空出现提示",
         )
+
+
+class PreprovisionFirstChatNoticeTests(PipelineTestCase):
+    """Issue #541 预开通（产品负责人裁定 4）＋ rc25 修复包 F1：预开通期间静默，名单内
+    用户**第一次发消息时**才补一句「你的 BI Plus 已经开通……」，句中带**真实的**公司/
+    职能范围。
+
+    与「投递已过期」提示逐字同一条纪律：消费一次、只提示一次，且**不影响**这条消息
+    本身的正常处理。F1 加的硬次序：**先渲染、渲染成功才消费一次性标志**——先消费再
+    渲染，渲染一失败标志就被白白烧掉，这个人永远收不到那句话。
+
+    因此主路径用例必须用**真内容目录**（真 ``content.toml``）走到渲染：把
+    ``ContentCatalog.text`` 整个 patch 掉的用例对「占位没传够」这类渲染缺陷恒绿
+    （rc25 审核①坐实的假绿），只允许留给"键还没登记"的中间态专项。挂起端见
+    ``core/identity/onboarding_ports.UserStateStore.mark_preprovision_notice_pending``。
+    """
+
+    #: 假 store 里预置的「当前版本已发布权限文档」（真库来源 ``publish_outbox``）。
+    PERMISSIONS = '{"C001": ["销售域", "利润域"]}'
+
+    def arm(self, *, with_permissions: bool = True) -> None:
+        self.state.pending_preprovision_notices.add("usr_1")
+        if with_permissions:
+            self.state.preprovision_permissions["usr_1"] = self.PERMISSIONS
+
+    def notice_texts(self) -> list[str]:
+        return [
+            reply["text"]
+            for reply in self.log.fields("reply.send_text")
+            if "已经开通" in reply["text"]
+        ]
+
+    def _spy_on_catalog(self, *, missing: bool = False) -> list[str]:
+        """记下 pipeline 到底按哪个键取文案；``missing`` 模拟该键尚未登记。
+
+        只服务两类不经真渲染也成立的断言（没挂起就不该问这个键、键缺失的中间态）；
+        主路径断言一律走真目录，不进这里。
+        """
+
+        requested: list[str] = []
+        original = ContentCatalog.text
+
+        def spy(catalog, key, *args, **kwargs):
+            requested.append(key)
+            if key == KEY_PREPROVISIONED_FIRST_CHAT and missing:
+                raise ContentRenderError("未登记的文案键")
+            return original(catalog, key, *args, **kwargs)
+
+        patcher = unittest.mock.patch.object(ContentCatalog, "text", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return requested
+
+    def test_the_line_renders_real_scope_from_the_real_catalog_and_only_once(self) -> None:
+        """主路径（F1）：真目录渲染，句子里出现真实公司/职能；同一次挂起只提示一次。"""
+
+        self.arm()
+
+        self.build().handle_message(message("e1"), now=NOW)
+        notices = self.notice_texts()
+        self.assertEqual(len(notices), 1, "首聊应当且只应当补这一句")
+        self.assertIn("C001", notices[0], "公司位必须是这个人真实的权限范围")
+        self.assertIn("利润域、销售域", notices[0], "职能位必须是这个人真实的权限范围（排序并集）")
+
+        self.log = CallLog()
+        self.build().handle_message(message("e2"), now=NOW)
+        self.assertEqual(self.notice_texts(), [], "同一次挂起只提示一次")
+
+    def test_the_pending_line_does_not_block_the_message_from_being_queued(self) -> None:
+        self.arm()
+
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(
+            outcome.handled_as,
+            HandledAs.TASK_QUEUED,
+            "补一句只是追加的一条回复，不改变这条消息本身该有的正常处理结果",
+        )
+
+    def test_nothing_is_requested_when_no_line_is_pending(self) -> None:
+        requested = self._spy_on_catalog()
+        self.build().handle_message(message("e1"), now=NOW)
+        self.assertNotIn(KEY_PREPROVISIONED_FIRST_CHAT, requested)
+
+    def test_a_missing_permission_snapshot_keeps_the_flag_for_a_later_chat(self) -> None:
+        """F1 的另一半：渲染失败**不消费**一次性标志。
+
+        权限快照不可用（真库形状：``publish_outbox.payload`` 过九十天保留期被擦、或
+        当前版本没有已发布意图）时，这条消息照常入队、只记审计；快照恢复后，下一条
+        消息仍然能把那句话补上——「失败即永远丢失」被消除，「只提示一次」保持。
+        """
+
+        self.arm(with_permissions=False)
+
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(self.notice_texts(), [], "渲染不出来就一个字都不发，不发半句假话")
+        self.assertEqual(
+            self.log.count("audit.onboarding.preprovision_notice_scope_unavailable"), 1
+        )
+        self.assertEqual(
+            self.log.count("store.consume_preprovision_notice"), 0,
+            "渲染失败绝不消费一次性标志",
+        )
+        self.assertIn("usr_1", self.state.pending_preprovision_notices)
+
+        self.state.preprovision_permissions["usr_1"] = self.PERMISSIONS
+        self.log = CallLog()
+        self.build().handle_message(message("e2"), now=NOW)
+        self.assertEqual(len(self.notice_texts()), 1, "快照恢复后，那句话必须还发得出来")
+        self.assertNotIn("usr_1", self.state.pending_preprovision_notices)
+
+    def test_an_unregistered_content_key_never_blocks_the_users_question(self) -> None:
+        """内容目录与代码分两次合入的中间态：键还没登记时，这条消息照常入队，只留
+        一条审计，且**不烧**一次性标志（F1 之前这里先消费后渲染，键补上后用户也永远
+        收不到那句话）。**绝不能**因为一句附加提示把一个人的问数打断。"""
+
+        self._spy_on_catalog(missing=True)
+        self.arm()
+
+        outcome = self.build().handle_message(message("e1"), now=NOW)
+        self.assertEqual(outcome.handled_as, HandledAs.TASK_QUEUED)
+        self.assertEqual(
+            self.log.count("audit.onboarding.preprovision_notice_content_missing"), 1
+        )
+        self.assertEqual(
+            self.log.count("store.consume_preprovision_notice"), 0,
+            "渲染失败绝不消费一次性标志",
+        )
+        self.assertIn("usr_1", self.state.pending_preprovision_notices)
 
 
 class TaskOwnershipTests(unittest.TestCase):

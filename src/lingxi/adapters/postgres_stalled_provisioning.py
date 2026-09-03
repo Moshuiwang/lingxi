@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from lingxi.adapters.postgres import DEFAULT_POSTGRES_TIMEOUTS, PostgresTimeouts, connect
+from lingxi.core.identity.preprovision import SYSTEM_EVENT_PREFIX
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,8 @@ class PostgresStalledProvisioningStore:
         2. ``u.account_state = 'enabled'``——与收口写入的 CAS 守卫口径一致，不选一个
            CAS 注定会拒绝的候选；
         3. 取**该 open_id 最新一条 ``auto_provisioning`` 事件**（``ORDER BY
-           received_at DESC LIMIT 1`` 的横向子查询，**不**按认领状态过滤）：
+           received_at DESC LIMIT 1`` 的横向子查询，**不**按认领状态过滤；
+           ``LEFT JOIN``，见下方「没有入站事件的用户」）：
            必须先拿到"这个人最后一次相关事件到底是哪一条"这个事实，再判它有没有被
            认领、认领了多久——外部独立审查 P2-5 修复：此前的写法在子查询里就先过滤
            ``onboarding_dispatched_at IS NOT NULL``，等于默认"最新一条事件一定已经
@@ -99,8 +101,34 @@ class PostgresStalledProvisioningStore:
         5. ``NOT EXISTS(... result = 'timed_out')``——与迟到就绪恢复职责（V-开通-18）
            的候选集合互补，同时不去碰 ``V-开通-18`` 已经认领的那条恢复路径。
 
-        ``ORDER BY e.onboarding_dispatched_at`` 让最先超期的候选先被处理，与
+        ``ORDER BY`` 租约起点让最先超期的候选先被处理，与
         ``late_onboarding_recovery_candidates`` 同一条纪律。
+
+        ## 没有入站事件的用户（Issue #541 预开通，rc25 S-8a）
+
+        预开通是「系统触发」的开通：名单里的人在与 BI Plus 发生任何对话之前就被开通完，
+        因此 ``inbound_event`` 里**一行都没有**（刻意不插假事件行，见
+        :mod:`lingxi.core.identity.preprovision`）。此前这里是 ``JOIN LATERAL``——横向
+        子查询取不到行时整个用户被过滤掉——于是一个预开通失败、停在
+        ``provisioning``/``mcp_syncing`` 的人**结构上永远不会被本职责捞到**，永久卡住，
+        而他一发消息 pipeline 只会照发「正在完成…请稍候」：与 Issue #282 修复前的形状
+        逐字相同。
+
+        改成 ``LEFT JOIN LATERAL``，并把租约起点提成一个显式的 ``lease_start``：
+
+        - **有**最新事件行时取 ``e.onboarding_dispatched_at``——与改动前逐字节一致，
+          包括判据 3/4 那条外部审查 P2-5 修复：最新事件存在但还没被认领
+          （``onboarding_dispatched_at IS NULL``）时 ``lease_start`` 为 ``NULL``，本职责
+          不选中他，那个窗口正确地留给 ``OnboardingReconciler``。**绝不**在这种情况下
+          退回 ``provisioning_started_at``——那会把 P2-5 修复直接作废。
+        - **没有**任何事件行时才取 ``u.provisioning_started_at``（迁移 ``0087``，由
+          推进到 ``provisioning`` 的同一条 UPDATE 写上）。**不用 ``updated_at`` 兜底**：
+          那一列会被任何无关更新刷新，租约会永远不到期。
+
+        这类候选没有真实的 ``feishu_event_id``/``trace_id`` 可返回，合成成
+        ``preprovision:<user_id>``：它只被本职责用作通知去重键与审计/落库的追溯号，
+        **不回写任何表的事件列**。代价如实登记——``/admin trace`` 用这个追溯号查不到
+        入站事件（本来就没有），只能查到本职责落的那一行失败原因。
         """
 
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
@@ -110,10 +138,12 @@ class PostgresStalledProvisioningStore:
         with connect(self._dsn, timeouts=self._timeouts) as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT u.id, u.feishu_open_id, e.feishu_event_id, e.trace_id,
+                SELECT u.id, u.feishu_open_id,
+                       COALESCE(e.feishu_event_id, %(synthetic)s || u.id),
+                       COALESCE(e.trace_id, %(synthetic)s || u.id),
                        u.provisioning_state
                   FROM app_user u
-                  JOIN LATERAL (
+                  LEFT JOIN LATERAL (
                          SELECT feishu_event_id, trace_id, onboarding_dispatched_at
                            FROM inbound_event
                           WHERE user_open_id = u.feishu_open_id
@@ -121,10 +151,17 @@ class PostgresStalledProvisioningStore:
                           ORDER BY received_at DESC
                           LIMIT 1
                        ) e ON TRUE
+                  CROSS JOIN LATERAL (
+                         SELECT CASE
+                                  WHEN e.feishu_event_id IS NULL
+                                  THEN u.provisioning_started_at
+                                  ELSE e.onboarding_dispatched_at
+                                END AS lease_start
+                       ) s
                  WHERE u.provisioning_state IN ('provisioning', 'mcp_syncing')
                    AND u.account_state = 'enabled'
-                   AND e.onboarding_dispatched_at IS NOT NULL
-                   AND e.onboarding_dispatched_at < now() - make_interval(
+                   AND s.lease_start IS NOT NULL
+                   AND s.lease_start < now() - make_interval(
                            secs => %(lease)s::double precision
                        )
                    AND NOT EXISTS (
@@ -133,10 +170,10 @@ class PostgresStalledProvisioningStore:
                             AND t.permission_version = u.permission_version
                             AND t.result = 'timed_out'
                        )
-                 ORDER BY e.onboarding_dispatched_at
+                 ORDER BY s.lease_start
                  LIMIT %(limit)s
                 """,
-                {"lease": lease_seconds, "limit": limit},
+                {"lease": lease_seconds, "limit": limit, "synthetic": SYSTEM_EVENT_PREFIX},
             )
             rows = cursor.fetchall()
         return tuple(

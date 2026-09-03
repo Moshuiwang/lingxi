@@ -23,7 +23,11 @@ from lingxi.core.identity.first_contact import (
     decide_first_contact,
     locate_by_open_id,
 )
-from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
+from lingxi.core.identity.innertest_roster_gate import (
+    build_innertest_roster_gate,
+    is_open_id_innertest_allowed,
+)
+from lingxi.core.identity.onboarding_ports import EmailBinding
 from lingxi.core.identity.onboarding_runner import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
@@ -132,11 +136,23 @@ class FakeDirectory:
         #: 保持空——组织快照读取压根不该发生。
         self.calls: list[str] = []
 
+        #: 反向定位（Issue #541 预开通：花名册人员 ID → 快照成员）的调用记录。
+        #: **与 ``calls`` 分开**：内测名单闸「零副作用」的既有断言看的是按 open_id 的
+        #: 正向定位，而反向定位结构上必须发生在闸之前（不先定位就没有 open_id 可判）。
+        self.user_id_calls: list[str] = []
+
     def lookup(self, open_id: str) -> Any:
         self.calls.append(open_id)
         if self._error is not None:
             raise self._error
         return self._lookup
+
+    def lookup_by_user_id(self, user_id: str) -> Any:
+        self.user_id_calls.append(user_id)
+        if self._error is not None:
+            raise self._error
+        members = tuple(m for m in self._lookup.members if m.user_id == user_id)
+        return FakeLookup(self._lookup.availability, members)
 
 
 class FakeEmployment:
@@ -194,11 +210,48 @@ class FakeProvisioning:
         return self.result
 
 
+class FakeEmailBindings:
+    """``EmailBindingSource`` 的内存假实现（rc25 S-2a，对抗审查 X-1）。
+
+    ``bound`` 是「规范化邮箱 → 已绑定这个邮箱的 ``(user_id, feishu_open_id)`` 序列」。
+    默认空映射＝库里没有任何人绑过任何邮箱，本文件绝大多数既有用例走这条默认值，
+    行为与这道闸接线之前逐字节一致。注入 ``error`` 则代表回读本身失败（数据库
+    抖动），用来钉死"读不到不等于没有冲突"。
+    """
+
+    def __init__(
+        self,
+        bound: Mapping[str, Sequence[tuple[str, str | None]]] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.bound = dict(bound or {})
+        self.calls: list[str] = []
+        self._error = error
+
+    def bindings_for_email(self, email: str) -> Sequence[EmailBinding]:
+        self.calls.append(email)
+        if self._error is not None:
+            raise self._error
+        return tuple(EmailBinding(user_id, open_id) for user_id, open_id in self.bound.get(email, ()))
+
+
 class FakeUsers:
     """``status=None`` 必须能表达"刚建完档却读不回来"，因此缺省同样用哨兵。"""
 
-    def __init__(self, status: Any = _UNSET, *, abort_result: bool = True) -> None:
+    def __init__(
+        self,
+        status: Any = _UNSET,
+        *,
+        abort_result: bool = True,
+        has_inbound_event: bool = False,
+    ) -> None:
         self.status = UserProvisioningStatus("enabled", "matching", 0) if status is _UNSET else status
+        #: 「首聊时补一句」挂起口（Issue #541）的调用记录与它的两个真实守卫。
+        self.notice_calls: list[str] = []
+        #: 真的挂起成功的那几次（守卫拒绝的不进这里）。
+        self.armed: list[str] = []
+        self.has_inbound_event = has_inbound_event
         self.advanced: list[str] = []
         #: `_abort_if_stalled` 每一次调用的完整参数（Issue #282 §7.4「当场收口」）。
         self.aborted: list[tuple[str, tuple[str, ...], str]] = []
@@ -215,6 +268,18 @@ class FakeUsers:
     def advance_provisioning_state(self, user_id: str, *, to: str) -> bool:
         self.advanced.append(to)
         self.current_state = to
+        return True
+
+    def mark_preprovision_notice_pending(self, *, open_id: str) -> bool:
+        """挂起「首聊时补一句」（Issue #541）。**复刻真实实现的两道 SQL 守卫**：
+        只挂起一次（同名单重跑零变化），且这个人名下不能有过入站事件（他不是"从没
+        跟我们说过话"的那种人）。真库那一半由
+        ``tests/test_identity_postgres_records.py`` 钉住。"""
+
+        self.notice_calls.append(open_id)
+        if self.armed or self.has_inbound_event:
+            return False
+        self.armed.append(open_id)
         return True
 
     def abort_stalled_provisioning(
@@ -477,6 +542,32 @@ class RecordingAudit:
         raise AssertionError(f"没有记到 {action}：{self.actions()}")
 
 
+class RecordingPositionGrants:
+    """``PositionGrantImporter`` 的内存假实现（Issue #541 预开通）：记录每一次落库
+    调用的完整关键字参数。真实实现是 rc25 S-8b 的
+    ``PostgresLocalPermissionOverrideStore.import_position_grant``。"""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._error = error
+
+    def import_position_grant(
+        self, *, user_id: str, target_open_id: str, grant: Any, now: Any, initiated_by_open_id: str
+    ) -> Any:
+        if self._error is not None:
+            raise self._error
+        self.calls.append(
+            {
+                "user_id": user_id,
+                "target_open_id": target_open_id,
+                "grant": grant,
+                "now": now,
+                "initiated_by_open_id": initiated_by_open_id,
+            }
+        )
+        return object()
+
+
 class RecordingFailureReasons:
     """``FailureReasonRecorder`` 的内存假实现（Issue #337）：记录每一次调用的
     完整关键字参数，供断言核对。"""
@@ -531,6 +622,8 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         "galaxy": FakeGalaxy(),
         "provisioning": FakeProvisioning(),
         "users": FakeUsers(),
+        # 默认空：库里没有任何邮箱绑定，这道闸对既有用例恒放行（rc25 S-2a）。
+        "email_bindings": FakeEmailBindings(),
         "environment": FakeEnvironment(),
         "tokens": FakeTokens(),
         # 默认 None：哨兵——不注入存量令牌源时，行为必须与改动前逐字节一致
@@ -553,6 +646,9 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         # 默认 None：哨兵——不注入本地权限覆盖 store 时，行为必须与接线之前逐字节
         # 一致（S-P-3，见 LocalOverrideMergeTests.test_store_absent_matches_todays_behavior）。
         "local_overrides": None,
+        # 默认 None：哨兵——首聊路径一行都不碰它；系统触发带了预授权却没装它时整链
+        # 失败关闭（Issue #541，见 PreprovisionGrantTests）。
+        "position_grants": None,
     }
     parts.update({key: value for key, value in overrides.items() if key in parts})
     if parts["stock_tokens"] is not None and parts["legacy_importer"] is None and "legacy_importer" not in overrides:
@@ -566,6 +662,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         galaxy=parts["galaxy"],
         provisioning=parts["provisioning"],
         users=parts["users"],
+        email_bindings=parts["email_bindings"],
         environment=parts["environment"],
         tokens=parts["tokens"],
         stock_tokens=parts["stock_tokens"],
@@ -593,6 +690,7 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
         failure_reasons=parts["failure_reasons"],
         local_overrides=parts["local_overrides"],
         legacy_importer=parts["legacy_importer"],
+        position_grants=parts["position_grants"],
     )
     return runner, parts
 
@@ -600,11 +698,34 @@ def build_runner(**overrides: Any) -> tuple[AutoOnboardingRunner, dict[str, Any]
 #: 认领代次的替身：真库里是那一次认领写进 ``onboarding_dispatched_at`` 的时刻。
 CLAIM_TOKEN = "claim-1"
 
+#: 预开通的责任人（产品负责人本人的 open_id），一路带到合成 ``pending_action``
+#: 的责任人栏。**没有占位身份**（Issue #541）。
+INITIATED_BY = "ou_product_owner"
+
 
 def run_once(**overrides: Any) -> tuple[dict[str, Any], Any]:
     runner, parts = build_runner(**overrides)
     result = runner.start(
         event_id="evt_1", open_id=OPEN_ID, trace_id="trace_1", claim_token=CLAIM_TOKEN
+    )
+    return parts, result
+
+
+def run_system_once(**overrides: Any) -> tuple[dict[str, Any], Any]:
+    """经**系统触发**入口跑同一条链（Issue #541 预开通）。
+
+    与 :func:`run_once` 逐参数同构，唯一差别是入口：没有 ``event_id``、没有认领代次。
+    ``tests/test_onboarding_runner.py`` 里凡是"这条判定必须在两条路径上都成立"的断言
+    都用它再跑一遍同一个夹具，而不是新建第二套假实现——两套夹具会让两条路径的断言
+    悄悄漂移，而漂移正是"另写一条预开通链"这个被否掉的方案的核心风险。
+    """
+
+    runner, parts = build_runner(**overrides)
+    result = runner.start_system(
+        email=overrides.get("email", ROSTER_ROWS[0]["email"]),
+        trace_id="trace_1",
+        initiated_by_open_id=INITIATED_BY,
+        preprovision_grant=overrides.get("preprovision_grant"),
     )
     return parts, result
 
@@ -2432,7 +2553,7 @@ class InnerTestRosterGateTests(unittest.TestCase):
         已知危险对象被禁（验证与门禁 §八第 4 条）。
         """
 
-        gate = AutoOnboardingRunner.build_innertest_roster_gate(frozenset())
+        gate = build_innertest_roster_gate(frozenset())
         parts, _ = run_once(innertest_roster_gate=gate)
 
         _, key, _, _ = parts["notifier"].terminal()
@@ -2442,7 +2563,7 @@ class InnerTestRosterGateTests(unittest.TestCase):
     def test_open_id_on_the_roster_proceeds_through_the_normal_chain(self) -> None:
         """`V-开通-23`：名单内 open_id 不受闸影响，正常推进到既有成功终态。"""
 
-        gate = AutoOnboardingRunner.build_innertest_roster_gate(frozenset({OPEN_ID}))
+        gate = build_innertest_roster_gate(frozenset({OPEN_ID}))
         parts, result = run_once(innertest_roster_gate=gate)
 
         self.assertEqual(result.state, OnboardingState.STARTED)
@@ -2454,7 +2575,7 @@ class InnerTestRosterGateTests(unittest.TestCase):
         """静态方法只是把纯判定函数绑上一份具体集合，不改变其语义。"""
 
         roster = frozenset({OPEN_ID})
-        gate = AutoOnboardingRunner.build_innertest_roster_gate(roster)
+        gate = build_innertest_roster_gate(roster)
 
         self.assertEqual(gate(OPEN_ID), is_open_id_innertest_allowed(OPEN_ID, roster))
         self.assertTrue(gate(OPEN_ID))
@@ -2473,6 +2594,471 @@ class LegacyImporterConstructionTests(unittest.TestCase):
         self.assertIsInstance(runner, AutoOnboardingRunner)
 
 
+class EmailAlreadyBoundTests(unittest.TestCase):
+    """rc25 S-2a / 对抗审查 X-1：同一规范化邮箱已经绑给另一个 ``user_id`` 时失败关闭。
+
+    挡的是这条链：正式表行键 ``record_key`` 是规范化邮箱，而开通会按邮箱把正式表
+    存量行里**别人的**令牌密文采纳成本用户的令牌，随后又用同一个 ``record_key``
+    把那一行的权限覆写成本用户的范围——两个人以同一个身份查数。因此这里同时钉死
+    **三件事**：走的是 ``LX-ONBOARD-001`` 家族（不是「无权限」）、管理员真的收到
+    告警、以及**在冲突时一个副作用都不留**（不查存量令牌源、不签发/采纳令牌、
+    不建用户环境、不排发布意图、不推进 ``provisioning_state``）。
+    """
+
+    #: ROSTER_ROWS[0]["email"] 的规范化形态（去空白 + 小写），与 ``record_key`` 同源。
+    NORMALIZED = "xiaoming@example.com"
+    OTHER_USER = "usr_01HOTHER"
+    OTHER_OPEN_ID = "ou_employee_2"
+
+    def _conflicting(self, **overrides: Any) -> tuple[dict[str, Any], Any]:
+        bindings = FakeEmailBindings({self.NORMALIZED: ((self.OTHER_USER, self.OTHER_OPEN_ID),)})
+        return run_once(email_bindings=bindings, **overrides)
+
+    def test_another_user_holding_the_same_email_stops_the_chain_as_internal_error(self) -> None:
+        alerts: list[tuple[str, str]] = []
+        parts, _ = self._conflicting(onboarding_failed=lambda reason, trace: alerts.append((reason, trace)))
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+        # 用户看到的是冻结的 LX-ONBOARD-001，**不是**「无可用银河权限」——后者会把
+        # 一个权限完全正常的人引去银河申请一个他其实已经有的权限。
+        self.assertEqual(parts["notifier"].keys(), [KEY_INTERNAL_ERROR])
+        # 管理员真的收到告警（承诺过「已转交管理员处理」）。
+        self.assertEqual(alerts, [("email_already_bound", "trace_1")])
+
+    def test_the_conflicting_user_ids_are_audited_without_the_email_itself(self) -> None:
+        parts, _ = self._conflicting()
+        facts = parts["audit"].facts("onboarding.email_already_bound")
+        self.assertEqual(facts["conflicting_users"], (self.OTHER_USER,))
+        self.assertEqual(facts["trace_id"], "trace_1")
+        # 邮箱与 open_id 都是身份资料值，与本文件其余审计同一条纪律：不进结构化审计字段。
+        self.assertNotIn(self.NORMALIZED, str(facts))
+        self.assertNotIn(OPEN_ID, str(facts))
+
+    def test_a_conflict_leaves_no_token_environment_or_publish_intent(self) -> None:
+        """**副作用零残留**：这是这道闸的全部意义——晚一步就来不及了。"""
+
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret="stolen-token", permissions="{}")
+        )
+        parts, _ = self._conflicting(stock_tokens=stock)
+
+        self.assertEqual(stock.calls, [], "冲突时不该再按邮箱去查正式表存量行")
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [], "绝不能把别人的令牌采纳过来")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [], "publish_outbox 必须零新增")
+        self.assertEqual(parts["users"].advanced, [], "不推进 provisioning_state")
+        # **建档之前**就挡住：``app_user`` 零新增行，不为一个注定失败的人写半条记录。
+        self.assertEqual(parts["provisioning"].requests, [], "冲突时一次建档都不该发起")
+
+    def test_the_persons_own_row_is_not_a_conflict(self) -> None:
+        """重入是常态：这个人自己那一行当然持有自己的邮箱，不能把它算成冲突。
+        判据是 ``feishu_open_id``——建档之前本人还没有 ``app_user.id``。"""
+
+        bindings = FakeEmailBindings({self.NORMALIZED: ((USER_ID, OPEN_ID),)})
+        parts, _ = run_once(email_bindings=bindings)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(bindings.calls, [self.NORMALIZED])
+
+    def test_a_row_without_an_open_id_counts_as_someone_else(self) -> None:
+        """``feishu_open_id`` 可空（基线允许）。空值一律当"不是当前这个人"：
+        把它当成"可能是我自己"就等于给这道闸开了一个安静的口子。"""
+
+        bindings = FakeEmailBindings({self.NORMALIZED: ((self.OTHER_USER, None),)})
+        parts, _ = run_once(email_bindings=bindings)
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+
+    def test_the_lookup_uses_the_normalized_email(self) -> None:
+        """口径必须与 ``record_key``/``normalize_email`` 同源：花名册里存的是
+        ``Xiaoming@Example.com``，查的必须是去空白 + 小写之后的那一份。"""
+
+        parts, _ = run_once()
+        self.assertEqual(parts["email_bindings"].calls, [self.NORMALIZED])
+
+    def test_a_blank_email_skips_the_lookup_entirely(self) -> None:
+        """没有邮箱就没有 ``record_key``，采纳与发布两条链路都不成立；这类行也不进
+        迁移 ``0085`` 的部分索引，判它"与谁冲突"没有意义。"""
+
+        rows = ({**ROSTER_ROWS[0], "email": "   "},)
+        parts, _ = run_once(roster=FakeRoster(rows))
+        self.assertEqual(parts["email_bindings"].calls, [])
+
+    def test_a_read_failure_fails_the_chain_closed(self) -> None:
+        """读不到**不等于**没有冲突：数据库抖动时这道闸必须整链失败关闭，
+        而不是静默放行去签发/采纳令牌。"""
+
+        bindings = FakeEmailBindings(error=RuntimeError("db down"))
+        parts, _ = run_once(email_bindings=bindings)
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [])
+
+
+class SystemTriggerTests(unittest.TestCase):
+    """rc25 S-8a / [Issue #541](https://github.com/Moshuiwang/lingxi/issues/541)「预开通」：
+    系统触发入口 ``start_system``——名单里的人在与 BI Plus 发生任何对话之前被开通完。
+
+    这一类断言全部围绕**同一个立论**：预开通与首聊开通共用 ``_run``，因此这里不重复
+    验证链本身，只钉死系统触发路径上那三处刻意的差异（无账本、静默、首聊补一句），
+    以及**两条最容易被第二条链绕过去的判定在系统触发路径上仍然生效**（X-1 同邮箱闸、
+    分水岭之后的当场收口）。判定与写入见 :mod:`lingxi.core.identity.preprovision`。
+    """
+
+    #: ``ROSTER_ROWS[0]["email"]`` 的规范化形态，与 ``EmailAlreadyBoundTests`` 同源。
+    NORMALIZED = "xiaoming@example.com"
+
+    # ---- 整条链 -------------------------------------------------------
+
+    def test_the_full_chain_reaches_active_without_any_inbound_event(self) -> None:
+        parts, result = run_system_once()
+
+        # **同步返回终态**（不是 ``start()`` 的 ``started``）：批量脚本要逐人拿到结论
+        # 才出得了清单，也才能"逐人失败关闭、不阻塞其他人"。
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        # 与首聊路径**逐格相同**的状态推进次序：预开通不是"少跑几步"，是同一条链。
+        self.assertEqual(
+            parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING, STATE_ACTIVE]
+        )
+        self.assertEqual(parts["environment"].calls, [USER_ID])
+        self.assertEqual(parts["decisions"].reasons, ["first_onboarding"])
+
+    def test_no_message_is_sent_to_the_user_at_any_step(self) -> None:
+        """产品负责人裁定 4：预开通期间**一条消息都不发**——包括链中途那条
+        「权限正在同步」。用户对整件事毫无感知，直到他自己第一次说话。"""
+
+        parts, _ = run_system_once()
+        self.assertEqual(parts["notifier"].sent, [])
+        self.assertEqual(parts["notifier"].attempts, 0)
+
+    def test_the_completion_line_is_deferred_to_the_first_chat(self) -> None:
+        """「开通完成」不发，改成挂起一句，等他首聊时补。"""
+
+        parts, _ = run_system_once()
+        self.assertEqual(parts["users"].armed, [OPEN_ID])
+
+    def test_the_first_chat_line_is_never_armed_on_the_normal_path(self) -> None:
+        """真实首聊路径当场就把「开通完成」发出去了，没有什么要补的。"""
+
+        parts, _ = run_once()
+        self.assertEqual(parts["users"].notice_calls, [])
+
+    def test_the_first_chat_line_is_not_armed_for_someone_already_talking_to_us(self) -> None:
+        """挂起口自己再判一次"这个人从没跟我们说过话"：对一个已经在聊的人补一句
+        「你的 BI Plus 已经开通」只会莫名其妙。守卫在存储层（真库那一半见
+        ``tests/test_identity_postgres_records.py``），这里钉住编排层照常调用它、
+        并接受它说不。"""
+
+        users = FakeUsers(has_inbound_event=True)
+        parts, _ = run_system_once(users=users)
+        self.assertEqual(users.notice_calls, [OPEN_ID])
+        self.assertEqual(users.armed, [])
+
+    def test_the_dispatch_ledger_is_never_touched(self) -> None:
+        """系统触发没有 ``inbound_event`` 行：记账与放回都没有对象。**尤其不插假事件
+        行**——那张表是入站审计与对账的基线，插一行会让未开通首聊交接对账把它当成
+        真实首聊重新认领，等于自己给自己制造一条重复开通链。"""
+
+        parts, _ = run_system_once()
+        self.assertEqual(parts["ledger"].marked, [])
+        self.assertEqual(parts["ledger"].released, [])
+
+    def test_the_result_audit_marks_the_preprovision_origin(self) -> None:
+        """审计要能分辨"首聊时开通"与"首聊前预开通"（完成标准第二条）。"""
+
+        preprovisioned, _ = run_system_once()
+        first_chat, _ = run_once()
+
+        self.assertEqual(preprovisioned["audit"].facts("onboarding.result")["origin"], "preprovision")
+        self.assertEqual(first_chat["audit"].facts("onboarding.result")["origin"], "first_chat")
+        # 合成事件标识只进审计与去重键，不落任何表。
+        self.assertEqual(
+            preprovisioned["audit"].facts("onboarding.result")["event_id"], "preprovision:trace_1"
+        )
+
+    def test_the_innertest_roster_gate_still_guards_the_system_path(self) -> None:
+        """预开通绕过了 gateway 侧的名单闸（那一道只在 ``NOT_PROVISIONED`` 分支内），
+        因此 ``_run`` 最前面这一道必须照常拦住名单外的人：零建档、零发布、零环境。"""
+
+        parts, returned = run_system_once(innertest_roster_gate=lambda open_id: False)
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.NOT_AUTHORIZED.value)
+        self.assertEqual(result["failure_reason"], "innertest_roster_rejected")
+        self.assertEqual(returned.failure_reason, "innertest_roster_rejected")
+        # 按 open_id 的正向定位（连同它内部的在职实时回读，会消耗全系统独占的专用
+        # 授权派生令牌）仍然一次都没发生：闸挡在它前面，与首聊路径逐字节一致。
+        self.assertEqual(parts["directory"].calls, [])
+        self.assertEqual(parts["provisioning"].requests, [])
+        self.assertEqual(parts["decisions"].reasons, [])
+
+    # ---- 按邮箱进：定位失败逐人关闭，链一步都不跑 ---------------------
+
+    def test_an_email_that_locates_nobody_never_starts_the_chain(self) -> None:
+        parts, result = run_system_once(email="nobody@example.com")
+
+        self.assertIs(result.state, OnboardingState.NOT_AUTHORIZED)
+        self.assertEqual(result.failure_reason, "email_not_in_roster")
+        self.assertEqual(result.messages, (), "预开通失败没有任何用户可见出口")
+        self.assertEqual(parts["provisioning"].requests, [])
+        self.assertEqual(parts["directory"].calls, [])
+
+    def test_an_email_matching_several_people_is_skipped_without_touching_anything(self) -> None:
+        """裁定 6 在入口上的落点：定位不唯一时链一步都不跑。判据本身的用例在
+        ``tests/test_preprovision.py``；这里钉住"跳过真的没有副作用"。"""
+
+        rows = ROSTER_ROWS + ({**ROSTER_ROWS[0], "personnel_id": "fu_2"},)
+        parts, result = run_system_once(roster=FakeRoster(rows))
+
+        self.assertEqual(result.failure_reason, "email_multiple_personnel")
+        self.assertEqual(parts["provisioning"].requests, [])
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [])
+
+    def test_an_unreadable_roster_is_not_the_same_as_an_unknown_email(self) -> None:
+        parts, result = run_system_once(roster=FakeRoster(rows=None))
+        self.assertEqual(result.failure_reason, "roster_unavailable")
+
+    def test_an_unknown_origin_is_refused_instead_of_silently_running(self) -> None:
+        """收下一个不认识的来源再继续跑，等于让调用方把一条链变成"不静默但也没有
+        账本"的第三种形态。"""
+
+        runner, _ = build_runner()
+        with self.assertRaises(ValueError):
+            runner.start_system(
+                email=ROSTER_ROWS[0]["email"], trace_id="t", origin="whatever",
+                initiated_by_open_id=INITIATED_BY,
+            )
+
+    def test_a_missing_responsible_person_is_refused(self) -> None:
+        """审计栏目里一个无法追溯的假身份比没有审计更糟，因此这一格不接受空值。"""
+
+        runner, _ = build_runner()
+        with self.assertRaises(ValueError):
+            runner.start_system(
+                email=ROSTER_ROWS[0]["email"], trace_id="t", initiated_by_open_id="  ",
+            )
+
+    # ---- 预授权随链落库（次序是硬的） --------------------------------
+
+    def test_the_grant_lands_before_the_zero_galaxy_judgement(self) -> None:
+        """与 rc25 S-1 差集导入**同一个挂点**、同样排在零银河判定之前：名单里"银河零
+        权限、靠预授权吃饭"的人，先判零权限就会被整批拒绝。"""
+
+        importer = RecordingPositionGrants()
+        parts, result = run_system_once(
+            position_grants=importer,
+            preprovision_grant={"88": ["销售分析"]},
+            # 零银河的既有造法（同 ZeroGalaxyLocalGrantTests）：职能映射为空 ⇒
+            # `aggregate.granted` 为假；本地授权是这个人唯一的可发布内容。
+            role_function_map={},
+            local_overrides=FakeLocalOverrides({USER_ID: (_override_entry(),)}),
+        )
+
+        self.assertEqual(len(importer.calls), 1)
+        self.assertEqual(importer.calls[0]["user_id"], USER_ID)
+        self.assertEqual(importer.calls[0]["target_open_id"], OPEN_ID)
+        self.assertEqual(importer.calls[0]["grant"], {"88": ["销售分析"]})
+        self.assertEqual(importer.calls[0]["initiated_by_open_id"], INITIATED_BY)
+        self.assertIs(result.state, OnboardingState.COMPLETED, "零银河 + 预授权兜底必须放行")
+
+    def test_a_grant_without_a_wired_importer_fails_the_chain_closed(self) -> None:
+        """静默跳过的后果是：这个人被开通了、令牌签了、正式表也写了，但范围里**没有**
+        名单答应给他的权限——他能问数，只是问不出该问的东西，而当天没有任何东西会
+        报警。与 rc25 S-1「装了存量令牌源、没装差集导入口」同一个形状，同一个修法。"""
+
+        parts, result = run_system_once(preprovision_grant={"88": ["销售分析"]})
+
+        self.assertIs(result.state, OnboardingState.INTERNAL_ERROR)
+        self.assertEqual(
+            parts["audit"].facts("onboarding.result")["failure_reason"],
+            "preprovision_grant_importer_not_wired",
+        )
+        self.assertEqual(parts["decisions"].reasons, [], "失败关闭时一条发布意图都不排")
+
+    def test_no_grant_means_the_importer_is_never_touched(self) -> None:
+        importer = RecordingPositionGrants()
+        run_system_once(position_grants=importer)
+        self.assertEqual(importer.calls, [])
+
+    def test_the_normal_first_chat_path_never_touches_the_grant_importer(self) -> None:
+        importer = RecordingPositionGrants()
+        run_once(position_grants=importer)
+        self.assertEqual(importer.calls, [])
+
+    def test_an_already_active_user_keeps_the_grant_unapplied_and_says_so(self) -> None:
+        """rc25 修复包 F2：已 active 的人在续行前复核处提前收口（早于预授权落库口），
+        名单答应的那笔预授权**没有落**。绝不在这里静默给已 active 用户扩权——要不要
+        补授权是产品语义，产品负责人另行裁定；但终态必须把「授权没应用」如实带回
+        批量清单（``grant_not_applied``），不得混进"成功预开通"。"""
+
+        importer = RecordingPositionGrants()
+        users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
+        parts, result = run_system_once(
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
+            position_grants=importer,
+            preprovision_grant={"88": ["销售分析"]},
+        )
+
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertTrue(result.grant_not_applied, "清单必须能看出「授权没应用」")
+        self.assertEqual(importer.calls, [], "绝不静默给已 active 用户扩权")
+        self.assertIsNone(
+            result.failure_reason,
+            "这不是失败终态：不得借用 reason（那会触发失败原因落库与失败审计口径）",
+        )
+        self.assertIn("onboarding.already_active", parts["audit"].actions())
+
+    def test_an_already_active_user_without_a_grant_is_a_plain_completion(self) -> None:
+        """否定断言：不带名单预授权时，已 active 的提前收口保持原样、不带标注——
+        标注只属于「答应了授权、没落成」这一种形状。"""
+
+        users = FakeUsers(UserProvisioningStatus("enabled", "active", 3))
+        parts, result = run_system_once(
+            users=users,
+            provisioning=FakeProvisioning(ProvisioningResult.already_provisioned(USER_ID)),
+        )
+
+        self.assertIs(result.state, OnboardingState.COMPLETED)
+        self.assertFalse(result.grant_not_applied)
+
+    # ---- X-1 同邮箱闸在系统触发路径上仍然生效 -------------------------
+
+    def test_the_same_email_guard_still_stops_the_system_triggered_chain(self) -> None:
+        """**本类最重要的一条。** X-1（rc25 S-2a）的立论是"同邮箱两人共用同一把问数
+        令牌与同一行正式表权限"；一条绕过它的第二入口会把那次根治直接作废。这里用
+        ``EmailAlreadyBoundTests`` 一模一样的夹具再跑一遍系统触发路径。"""
+
+        bindings = FakeEmailBindings({self.NORMALIZED: (("usr_01HOTHER", "ou_employee_2"),)})
+        alerts: list[tuple[str, str]] = []
+        parts, _ = run_system_once(
+            email_bindings=bindings,
+            onboarding_failed=lambda reason, trace: alerts.append((reason, trace)),
+        )
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], OnboardingState.INTERNAL_ERROR.value)
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+        # 管理员照常收到告警：预开通失败没有用户可见出口，管理群是唯一的活人通道。
+        self.assertEqual(alerts, [("email_already_bound", "trace_1")])
+
+    def test_a_conflict_on_the_system_path_leaves_no_token_environment_or_publish_intent(self) -> None:
+        stock = FakeStockTokens(
+            StockTokenLookup(state=ADOPTABLE, secret="stolen-token", permissions="{}")
+        )
+        bindings = FakeEmailBindings({self.NORMALIZED: (("usr_01HOTHER", "ou_employee_2"),)})
+        parts, _ = run_system_once(email_bindings=bindings, stock_tokens=stock)
+
+        self.assertEqual(stock.calls, [])
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [], "绝不能把别人的令牌采纳过来")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [])
+        self.assertEqual(parts["users"].advanced, [])
+        self.assertEqual(parts["provisioning"].requests, [])
+
+    # ---- 分水岭之后的当场收口（接缝修复①） ---------------------------
+
+    def test_a_failure_after_the_watershed_is_collapsed_although_nothing_was_delivered(self) -> None:
+        """接缝修复①。「当场收口」原本以通知**确认送达**为前提（外部审查 P2-1）；
+        预开通静默不发通知，照搬那条判据 ⇒ ``delivered`` 恒为假 ⇒ 收口永不触发 ⇒
+        这个人永久停在 ``provisioning``/``mcp_syncing``，与 Issue #282 修复前的形状
+        逐字相同。P2-1 的立论（"用户一条终态都没收到却被判死"）在这条路径上不成立：
+        预开通本来就不发终态通知，没有任何人在等它。"""
+
+        parts, _ = run_system_once(decisions=FakeDecisions(statuses=("failed",)))
+
+        self.assertEqual(parts["notifier"].sent, [], "前提：这条路径确实一条消息都没发")
+        self.assertEqual(
+            parts["users"].aborted,
+            [(USER_ID, (STATE_PROVISIONING, STATE_MCP_SYNCING), "publish_failed")],
+        )
+        self.assertEqual(parts["users"].current_state, "aborted")
+
+    def test_a_readiness_failure_after_the_watershed_is_collapsed_too(self) -> None:
+        parts, _ = run_system_once(readiness=FakeReadiness(ReadinessOutcome.TECHNICAL_FAILURE))
+        self.assertEqual(len(parts["users"].aborted), 1)
+        self.assertEqual(parts["users"].aborted[0][2], "readiness_technical_failure")
+
+    def test_a_sync_timeout_is_still_left_to_the_late_readiness_recovery(self) -> None:
+        """``SYNC_TIMEOUT`` 那一路仍然可能就绪，归属迟到就绪恢复职责（`V-开通-18`）。
+        系统触发**不能**因为"反正没人在等通知"就把它一起收掉——那会抢走另一条职责
+        的活，并把一个还在正常等待的人判死。"""
+
+        parts, _ = run_system_once(readiness=FakeReadiness(ReadinessOutcome.TIMED_OUT))
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "sync_timeout")
+        self.assertEqual(parts["users"].aborted, [])
+        self.assertEqual(parts["users"].advanced, [STATE_PROVISIONING, STATE_MCP_SYNCING])
+
+    def test_failures_before_the_watershed_are_still_never_collapsed(self) -> None:
+        parts, _ = run_system_once(roster=FakeRoster(({**ROSTER_ROWS[0], "employee_no": ""},)))
+        self.assertEqual(parts["users"].aborted, [])
+
+    # ---- 幂等（验收硬条件） -------------------------------------------
+
+    def test_rerunning_the_same_list_creates_nothing_new(self) -> None:
+        """同一份名单重跑**零变化**。出口就在 ``_recheck_still_provisionable``：
+        读回 ``provisioning_state == 'active'`` 当场收口，不重复建环境、不重复发布、
+        不重复签发令牌（`V-开通-14`）。"""
+
+        users = FakeUsers(status=UserProvisioningStatus("enabled", STATE_ACTIVE, 0))
+        parts, _ = run_system_once(users=users)
+
+        self.assertEqual(parts["audit"].facts("onboarding.result")["state"], "completed")
+        self.assertEqual(parts["environment"].calls, [])
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["decisions"].reasons, [], "publish_outbox 零新增意图")
+        self.assertEqual(users.advanced, [], "provisioning_state 一格都不推进")
+
+    def test_rerunning_does_not_re_arm_the_first_chat_line(self) -> None:
+        """重跑名单不能让一个已经被提示过（或已经挂起过）的人再收到一次同样的话。
+        守卫在挂起口自己身上，因此两条路径（真跑一遍链、走 ``already active`` 出口）
+        都被它挡住。"""
+
+        users = FakeUsers()
+        run_system_once(users=users)
+        users.status = UserProvisioningStatus("enabled", STATE_ACTIVE, 0)
+        run_system_once(users=users)
+
+        self.assertEqual(users.notice_calls, [OPEN_ID, OPEN_ID], "两次都调用了挂起口")
+        self.assertEqual(users.armed, [OPEN_ID], "但只真的挂起过一次")
+
+    # ---- 失败落库（逐人失败关闭，不阻塞名单里其他人） -----------------
+
+    def test_a_failure_is_recorded_for_admin_trace(self) -> None:
+        """``onboarding_failure`` 那半边照走 ``_execute`` 的既有写出点，
+        ``event_type`` 仍是 ``onboarding.result``（表上的 CHECK 不需要放宽）。
+        脚本清单那半边归 rc25 S-8b。"""
+
+        recorder = RecordingFailureReasons()
+        run_system_once(
+            failure_reasons=recorder,
+            email_bindings=FakeEmailBindings(
+                {self.NORMALIZED: (("usr_01HOTHER", "ou_employee_2"),)}
+            ),
+        )
+        self.assertEqual(
+            recorder.calls,
+            [
+                {
+                    "trace_id": "trace_1",
+                    "failure_reason": "email_already_bound",
+                    "event_type": "onboarding.result",
+                }
+            ],
+        )
+
+    def test_a_successful_chain_records_no_failure_row(self) -> None:
+        recorder = RecordingFailureReasons()
+        run_system_once(failure_reasons=recorder)
+        self.assertEqual(recorder.calls, [])
+
+
 class ConstructionTests(unittest.TestCase):
     """两个注入口缺省就会静默改变行为，因此在类型层就不给这个选项。"""
 
@@ -2484,6 +3070,7 @@ class ConstructionTests(unittest.TestCase):
             galaxy=FakeGalaxy(),
             provisioning=FakeProvisioning(),
             users=FakeUsers(),
+            email_bindings=FakeEmailBindings(),
             environment=FakeEnvironment(),
             tokens=FakeTokens(),
             decisions=FakeDecisions(),
@@ -2519,6 +3106,21 @@ class ConstructionTests(unittest.TestCase):
                 sleep=lambda seconds: None,
                 onboarding_failed="not-callable",  # type: ignore[arg-type]
                 **self._parts(),
+            )
+
+    def test_a_missing_email_binding_source_is_refused_at_construction(self) -> None:
+        """没有默认哨兵（rc25 S-2a）：``email_bindings`` 是必填关键字参数。
+
+        与 ``publish_allowed``/``innertest_roster_gate`` 同一条纪律——这一格决定的是
+        「两个人会不会共用同一把问数令牌与同一行正式表权限」，给个默认值等于把闸
+        关掉，而关掉之后没有任何症状。漏接必须在**构造期**就是 ``TypeError``。
+        """
+
+        parts = self._parts()
+        del parts["email_bindings"]
+        with self.assertRaises(TypeError):
+            AutoOnboardingRunner(
+                submit=lambda task: True, sleep=lambda seconds: None, **parts  # type: ignore[arg-type]
             )
 
     def test_a_missing_innertest_roster_gate_is_refused_at_construction(self) -> None:

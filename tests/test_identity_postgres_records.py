@@ -269,12 +269,57 @@ class DelegatedCredentialTest(IdentityPostgresTestCase):
 
         self.assertEqual(sum(1 for item in results if item is not None), 1)
 
-    def test_an_undecryptable_credential_file_is_revoked_rather_than_retried(self) -> None:
+    def test_an_undecryptable_credential_file_is_kept_instead_of_deleted(self) -> None:
+        """对抗审查 2026-09-02 C-2：解不开 ≠ 无效，绝不因此删掉密文。
+
+        这条用例此前断言的是相反的行为（"revoked rather than retried"）。改断言
+        不是为了迁就实现：登记表**这时有行**，旧实现把解密失败降级成 ``{}`` 之后
+        正好命中「文件主体与登记不一致」分支，于是**一次主密钥配错就等于永久销毁
+        一次性 refresh_token**——正确密钥换回来也救不回。删是不可逆的，留是可逆的。
+        """
+
         self._save()
+        original = self.path.read_bytes()
         self.path.write_bytes(b"\x01\x02broken")
 
-        self.assertIsNone(self.vault.load())
-        self.assertFalse(self.path.exists())
+        self.assertIsNone(self.vault.load(), "解不开时不得返回凭据")
+        self.assertTrue(self.path.exists(), "解密失败不得删除凭据文件")
+        self.assertEqual(self.path.read_bytes(), b"\x01\x02broken", "文件必须原样保留")
+
+        # 领取路径同样不删：轮换扫描每 60 s 跑一次，删一次就没有第二次机会。
+        self.assertIsNone(self.vault.claim_due())
+        self.assertTrue(self.path.exists(), "claim_due 解密失败同样不得删除")
+
+        # 把正确的密文放回去，凭据仍然可用——这正是"留着"换来的可恢复性。
+        self.path.write_bytes(original)
+        recovered = self.vault.load()
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.subject_open_id, DELEGATED_SUBJECT)
+
+    def test_a_wrong_master_key_never_destroys_the_credential_file(self) -> None:
+        """C-2 的上线场景：scheduler 与 reauthorize 两侧主密钥不一致。
+
+        用**另一把合法 Fernet 密钥**（不是坏字节）读同一份文件——这才是配错密钥的
+        真实形状：文件结构完好、只是解不开。原实现会在这里 unlink。
+        """
+
+        from cryptography.fernet import Fernet
+
+        from lingxi.adapters.delegated_credentials import HostFileDelegatedCredentialVault
+
+        self._save()
+        ciphertext = self.path.read_bytes()
+
+        wrong_key_vault = HostFileDelegatedCredentialVault(
+            self._dsn, Fernet.generate_key().decode(), str(self.path)
+        )
+        self.assertIsNone(wrong_key_vault.load())
+        self.assertIsNone(wrong_key_vault.claim_due())
+        self.assertTrue(self.path.exists(), "配错主密钥不得删除凭据文件")
+        self.assertEqual(self.path.read_bytes(), ciphertext, "密文必须字节不变")
+
+        # 配对的密钥回来时，同一份文件照常可用。
+        self.assertIsNotNone(self.vault.load())
 
     def test_revoking_removes_the_file_but_keeps_the_registry_row(self) -> None:
         """撤销只动凭据文件；登记行是 V-身份-02 触发器的数据来源，必须留下。"""
@@ -1057,6 +1102,55 @@ class OrgSnapshotTest(IdentityPostgresTestCase):
             self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
 
         lookup = self.store.lookup("ou_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.UNAVAILABLE)
+        self.assertEqual(lookup.members, ())
+
+    def test_a_lookup_by_user_id_finds_the_member_in_the_latest_complete_snapshot(self) -> None:
+        """Issue #541 预开通：邮箱 → 花名册 ``personnel_id``（＝飞书 ``user_id``）
+        → 组织快照成员，是**只有预开通需要**的反方向定位。"""
+
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.AVAILABLE)
+        self.assertEqual([m.open_id for m in lookup.members], ["ou_zhang"])
+
+    def test_a_lookup_by_user_id_returns_no_member_for_an_unknown_id(self) -> None:
+        self.store.commit_batch(batch((member(),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_nobody")
+
+        self.assertIs(lookup.availability, DirectoryAvailability.AVAILABLE)
+        self.assertEqual(lookup.members, ())
+
+    def test_a_lookup_by_user_id_returns_every_candidate_when_the_id_is_reused(self) -> None:
+        """``feishu_org_member_snapshot`` 对 ``user_id`` **不设唯一约束**（账号复用
+        换人按 #34 方案 C 留给管理员侧审计）。查询必须如实返回多条，由调用方失败
+        关闭——预开通那一侧就是这么做的（``locate_by_email``）。"""
+
+        self.store.commit_batch(
+            batch(
+                (
+                    member(),
+                    member(member_key="ou_zhang_2", open_id="ou_zhang_2", union_id="union_zhang_2"),
+                )
+            ),
+            source_app_id="cli_fake",
+        )
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
+
+        self.assertEqual(
+            sorted(m.open_id for m in lookup.members), ["ou_zhang", "ou_zhang_2"]
+        )
+
+    def test_a_failed_batch_is_never_the_source_of_a_user_id_lookup_either(self) -> None:
+        with self.assertRaises(SnapshotIntegrityError):
+            self.store.commit_batch(batch((member(open_id="  "),)), source_app_id="cli_fake")
+
+        lookup = self.store.lookup_by_user_id("user_zhang")
 
         self.assertIs(lookup.availability, DirectoryAvailability.UNAVAILABLE)
         self.assertEqual(lookup.members, ())
@@ -1892,6 +1986,79 @@ class ProvisioningStateAdvanceTest(IdentityPostgresTestCase):
     def test_a_missing_user_reads_back_as_none(self) -> None:
         self.assertIsNone(self.users.read_status("usr_does_not_exist"))
 
+    # ---- 迁移 0087：预开通的两处接缝 ---------------------------------
+
+    def _started_at(self):
+        return self.scalar(
+            "SELECT provisioning_started_at FROM app_user WHERE id = %s", (self.user_id,)
+        )
+
+    def test_entering_provisioning_stamps_the_lease_origin(self) -> None:
+        """Issue #541：``provisioning_started_at`` 是停摆兜底在**没有 ``inbound_event``
+        行**时唯一可用的租约起点，必须与"推进到分水岭"同真同假（同一条 UPDATE）。"""
+
+        self.assertIsNone(self._started_at(), "推进之前不该有起点")
+
+        self.assertTrue(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+
+        self.assertIsNotNone(self._started_at())
+
+    def test_a_refused_advance_does_not_stamp_the_lease_origin(self) -> None:
+        """空写不能留下一个"这次开通从现在开始"的假事实。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="active")
+        self.execute("UPDATE app_user SET provisioning_started_at = NULL WHERE id = %s", (self.user_id,))
+
+        self.assertFalse(self.users.advance_provisioning_state(self.user_id, to="provisioning"))
+        self.assertIsNone(self._started_at())
+
+    def test_later_advances_do_not_refresh_the_lease_origin(self) -> None:
+        """租约起点只在进入分水岭那一刻写一次：被后续无关推进刷新的列会让租约永远
+        不到期，那正是"不用 ``updated_at`` 兜底"的理由。"""
+
+        self.users.advance_provisioning_state(self.user_id, to="provisioning")
+        first = self._started_at()
+
+        self.users.advance_provisioning_state(self.user_id, to="mcp_syncing")
+        self.users.advance_provisioning_state(self.user_id, to="active")
+
+        self.assertEqual(self._started_at(), first)
+
+    def _armed_at(self):
+        return self.scalar(
+            "SELECT preprovision_notice_armed_at FROM app_user WHERE id = %s", (self.user_id,)
+        )
+
+    def _open_id(self) -> str:
+        return str(self.scalar("SELECT feishu_open_id FROM app_user WHERE id = %s", (self.user_id,)))
+
+    def test_the_first_chat_line_is_armed_once(self) -> None:
+        self.assertTrue(self.users.mark_preprovision_notice_pending(open_id=self._open_id()))
+        armed = self._armed_at()
+
+        self.assertFalse(
+            self.users.mark_preprovision_notice_pending(open_id=self._open_id()),
+            "同一份名单重跑必须零变化，不能把同一句话重新挂起一次",
+        )
+        self.assertEqual(self._armed_at(), armed)
+
+    def test_a_person_already_talking_to_us_is_never_armed(self) -> None:
+        """那句解释的全部意义是"你没经历过开通等待"；对一个已经在聊的人说它只会
+        莫名其妙。判据放在 SQL 里，因为调用点（开通链的通知出口）看不到入站事件。"""
+
+        self.execute(
+            """INSERT INTO inbound_event
+                 (feishu_event_id, received_at, event_type, user_open_id, handled_as, trace_id)
+               VALUES ('evt_chatty', now(), 'im.message.receive_v1', %s, 'task_queued', 'trc_chatty')""",
+            (self._open_id(),),
+        )
+
+        self.assertFalse(self.users.mark_preprovision_notice_pending(open_id=self._open_id()))
+        self.assertIsNone(self._armed_at())
+
+    def test_arming_an_unknown_open_id_changes_nothing(self) -> None:
+        self.assertFalse(self.users.mark_preprovision_notice_pending(open_id="ou_nobody"))
+
 
 class StalledProvisioningAbortTest(IdentityPostgresTestCase):
     """`abort_stalled_provisioning` 与 `_PROVISIONING_ORDER` 收紧的真库断言
@@ -2129,6 +2296,134 @@ class FirstContactThroughPostgresTest(IdentityPostgresTestCase):
 
         self.assertIs(decision.outcome, FirstContactOutcome.DELEGATED_SUBJECT_IGNORED)
         self.assertEqual(self.users.count(), 0)
+
+
+@unittest.skipUnless(os.environ.get("LINGXI_POSTGRES_DSN") and psycopg_available(), SKIP_REASON)
+class AppUserEmailBindingTest(IdentityPostgresTestCase):
+    """rc25 S-2a / 对抗审查 X-1：一个规范化邮箱至多绑一个 ``app_user``。
+
+    两层防线各有一半只能在真库上验证：
+    - **迁移 0085 的部分唯一索引**——它是"两个人不可能同时绑同一个邮箱"的结构性
+      保证，纯逻辑用例证明不了它真的建出来了、也证明不了它的表达式与
+      ``normalize_email`` 同口径；
+    - **``PostgresEmailBindingSource`` 的回读**——SQL 的 ``lower(btrim(email))``
+      必须与应用层归一化对齐，对不齐的闸等于没有闸。
+
+    编排层"命中即失败关闭、零副作用"的断言在
+    ``tests/test_onboarding_runner.EmailAlreadyBoundTests``；这里额外跑一次**真库上
+    的整条链**，证明第二个人既不建档、也不排发布意图。
+    """
+
+    EMAIL = "Shared.Mailbox@Example-Corp.invalid"
+    NORMALIZED = "shared.mailbox@example-corp.invalid"
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
+
+        self.bindings = PostgresEmailBindingSource(self._dsn)
+
+    def _insert(self, user_id: str, open_id: str, email: str | None) -> None:
+        """直插一行 ``app_user``。身份六列必须**全有**（基线 CHECK：``V-开通-06``
+        的"不得留下半条记录"），因此这里按 ``open_id`` 派生齐全，不是只填两列。"""
+
+        self.execute(
+            """INSERT INTO app_user
+                 (id, feishu_open_id, feishu_user_id, feishu_union_id, display_name,
+                  department, tenant_key, email)
+               VALUES (%s, %s, %s, %s, %s, '测试部门', 'tenant_a', %s)""",
+            (user_id, open_id, f"fs_{open_id}", f"un_{open_id}", "共用邮箱用例", email),
+        )
+
+    # ---- 数据库侧：部分唯一索引 --------------------------------------
+
+    def test_a_second_row_with_the_same_normalized_email_is_refused(self) -> None:
+        """**变异锚点**：删掉迁移 0085 的唯一索引，这条用例必须变红。
+
+        大小写与首尾空白都不构成"不同的邮箱"——正式表行键 ``record_key`` 用的就是
+        去空白 + 小写之后的那一份，索引口径必须与它逐字一致。
+        """
+
+        self._insert("usr_first", "ou_first", self.EMAIL)
+        with self.assertRaises(self._psycopg.errors.UniqueViolation):
+            self._insert("usr_second", "ou_second", "  SHARED.MAILBOX@example-corp.invalid ")
+
+    def test_updating_a_row_onto_someone_elses_email_is_refused(self) -> None:
+        """建档是 ``ON CONFLICT (feishu_open_id) DO UPDATE``：把某一行的邮箱改成
+        别人已经占用的那一个，同样必须被拒——只挡 INSERT 的索引挡不住换绑。"""
+
+        self._insert("usr_first", "ou_first", self.EMAIL)
+        self._insert("usr_second", "ou_second", "another@example-corp.invalid")
+        with self.assertRaises(self._psycopg.errors.UniqueViolation):
+            self.execute("UPDATE app_user SET email = %s WHERE id = 'usr_second'", (self.EMAIL,))
+
+    def test_rows_without_a_usable_email_are_not_constrained(self) -> None:
+        """建档不以邮箱为前提（基线：工号与邮箱可空）。``NULL`` 与纯空白都不进索引，
+        否则第二个没填邮箱的人就建不了档。"""
+
+        self._insert("usr_a", "ou_a", None)
+        self._insert("usr_b", "ou_b", None)
+        self._insert("usr_c", "ou_c", "   ")
+        self._insert("usr_d", "ou_d", "")
+        self.assertEqual(self.scalar("SELECT count(*) FROM app_user"), 4)
+
+    # ---- 适配器侧：回读口径 ------------------------------------------
+
+    def test_the_binding_source_matches_on_the_normalized_email(self) -> None:
+        self._insert("usr_first", "ou_first", f"  {self.EMAIL.upper()}  ")
+
+        bound = self.bindings.bindings_for_email(self.NORMALIZED)
+
+        self.assertEqual([(item.user_id, item.feishu_open_id) for item in bound], [("usr_first", "ou_first")])
+        self.assertEqual(self.bindings.bindings_for_email("nobody@example-corp.invalid"), ())
+        self.assertEqual(self.bindings.bindings_for_email(""), ())
+
+    def test_blank_emails_are_never_returned_as_a_binding(self) -> None:
+        """空白邮箱不是"绑定"：它不进索引，也不该让判定层拿它当冲突。"""
+
+        self._insert("usr_blank", "ou_blank", "   ")
+        self.assertEqual(self.bindings.bindings_for_email(""), ())
+        self.assertEqual(self.bindings.bindings_for_email("   "), ())
+
+    # ---- 编排层：真库上的整条链 --------------------------------------
+
+    def test_a_second_person_sharing_the_email_is_stopped_before_any_write(self) -> None:
+        """**变异锚点**：拿掉 ``_run`` 里那道闸，这条用例必须变红。
+
+        真库上跑完整条开通链：库里先有一个**别人**的 ``app_user`` 行占着这个邮箱，
+        第二个人首聊进来后必须以 ``LX-ONBOARD-001`` 失败关闭，且 ``app_user``
+        零新增行、``publish_outbox`` 零行。
+        """
+
+        from lingxi.adapters.postgres_email_binding import PostgresEmailBindingSource
+        from lingxi.adapters.postgres_identity import PostgresAppUserStore
+        from lingxi.adapters.postgres_permission_publish import PostgresPermissionPublishStore
+        from test_onboarding_runner import OPEN_ID, ROSTER_ROWS, FakeRoster, run_once
+
+        roster_email = ROSTER_ROWS[0]["email"]
+        self._insert("usr_incumbent", "ou_someone_else", roster_email)
+
+        parts, _ = run_once(
+            provisioning=PostgresAppUserStore(self._dsn),
+            users=PostgresAppUserStore(self._dsn),
+            email_bindings=PostgresEmailBindingSource(self._dsn),
+            decisions=PostgresPermissionPublishStore(self._dsn),
+            roster=FakeRoster(ROSTER_ROWS),
+        )
+
+        result = parts["audit"].facts("onboarding.result")
+        self.assertEqual(result["state"], "internal_error")
+        self.assertEqual(result["failure_reason"], "email_already_bound")
+        self.assertEqual(parts["tokens"].calls, [])
+        self.assertEqual(parts["tokens"].adopt_calls, [])
+        self.assertEqual(parts["environment"].calls, [])
+        # 真库读回：第二个人一行都没建，一条发布意图都没排。
+        self.assertEqual(
+            self.query("SELECT id, feishu_open_id FROM app_user ORDER BY id"),
+            [("usr_incumbent", "ou_someone_else")],
+        )
+        self.assertEqual(self.scalar("SELECT count(*) FROM publish_outbox"), 0)
+        self.assertNotEqual(OPEN_ID, "ou_someone_else")
 
 
 if __name__ == "__main__":

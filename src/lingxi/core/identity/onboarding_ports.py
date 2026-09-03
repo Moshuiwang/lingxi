@@ -1,4 +1,4 @@
-"""首次开通编排（``onboarding_runner.py``）的注入口：14 个 ``Protocol`` + ``EnvironmentResult``。
+"""首次开通编排（``onboarding_runner.py``）的注入口：15 个 ``Protocol`` + ``EnvironmentResult``。
 
 从 ``core/identity/onboarding_runner.py`` 纯移动拆出（Trace #358 S-H-1，Issue #350 Gate
 G-3 裁定 Option A）：只搬定义，不改任何签名或文档字符串；``AutoOnboardingRunner`` 通过
@@ -53,6 +53,38 @@ class GalaxySource(Protocol):
     def load_current(self) -> Any: ...
 
 
+@dataclass(frozen=True)
+class EmailBinding:
+    """``app_user`` 里一行"这个邮箱已经绑给谁了"的只读投影（rc25 S-2a）。
+
+    ``feishu_open_id`` 是身份去重键（基线里 ``app_user`` 唯一那个 UNIQUE 列），
+    也是首聊事件里唯一直接可得的标识，因此它——而不是 ``user_id``——才是"这一行是不是
+    **同一个人**"的判据：开通链在建档**之前**就要能判，那时本人的 ``user_id`` 还不
+    存在。可空（基线允许），空值一律当作"不是当前这个人"。
+    """
+
+    user_id: str
+    feishu_open_id: str | None
+
+
+class EmailBindingSource(Protocol):
+    """按**规范化邮箱**回读 ``app_user`` 上已经绑定这个邮箱的行（rc25 S-2a，
+    对抗审查 X-1）。真实实现见
+    ``adapters/postgres_email_binding.PostgresEmailBindingSource``；判定层见
+    ``core/identity/onboarding_guards.reject_email_bound_to_another_person``。
+
+    入参是已经过 :func:`~lingxi.core.permission.account_match.normalize_email`
+    的值（去首尾空白 + 转小写）。实现方必须用同一口径比较（``lower(btrim(email))``），
+    否则这道闸与正式表行键 ``record_key`` 会对不齐——而对不齐的闸等于没有闸。
+
+    返回**全部**命中的行（顺序不限、不截断）；查无返回空序列。
+    读取失败请**抛异常**，不要返回空：把一次数据库抖动读成"没有冲突"会让这道闸在
+    最需要它的时刻静默放行。
+    """
+
+    def bindings_for_email(self, email: str) -> Sequence[EmailBinding]: ...
+
+
 class UserStateStore(Protocol):
     """``app_user`` 的状态读回与推进。"""
 
@@ -70,6 +102,22 @@ class UserStateStore(Protocol):
         把这个人推进到 provisioning」时调用它（见 :meth:`AutoOnboardingRunner.
         _abort_if_stalled`），停摆扫描职责（``apps/scheduler/stalled_provisioning.py``）
         调用的是同一个方法。"""
+
+    def mark_preprovision_notice_pending(self, *, open_id: str) -> bool:
+        """挂起「你的 BI Plus 已经开通」这一句，等该用户**首聊时**再补上（Issue #541
+        预开通，产品负责人裁定 4：预开通期间静默）。返回是否真的挂起了。
+
+        实现（``adapters/postgres_identity.PostgresAppUserStore``）在 SQL 里再判两件
+        事，因此本方法对调用方是**幂等**的、也不会打扰不该被打扰的人：
+
+        - 已经挂起过（不管有没有被消费掉）就不再挂起——同一份预开通名单重跑必须**零
+          变化**，重新挂起会让一个早就聊过天的人再收到一次"已经开通"；
+        - 这个人名下有过任何一条 ``inbound_event`` 就不挂起——他不是"从没跟我们说过
+          话"的那种人，那句解释对他没有意义。
+
+        消费点在 ``core/conversation/pipeline.py`` 的 ``ACTIVE`` 分支
+        （``ConversationTransaction.consume_preprovision_notice``），与「投递已过期」
+        提示逐字同一条纪律：只提示一次，且**不影响**这条消息本身的正常处理。"""
 
 
 @dataclass(frozen=True)

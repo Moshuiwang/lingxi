@@ -53,6 +53,25 @@ SCHEDULER_CREDENTIAL_ROTATION = (
 )
 GATEWAY_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "gateway" / "config.py"
 WORKER_CONFIG = REPOSITORY_ROOT / "src" / "lingxi" / "apps" / "worker" / "config.py"
+USER_ENVIRONMENT_ADAPTER = (
+    REPOSITORY_ROOT / "src" / "lingxi" / "adapters" / "user_environment.py"
+)
+# Agent SDK 回合的工作目录（`ClaudeAgentOptions.cwd`，见 apps/worker/config.py 的
+# `workspace` 与 adapters/claude_agent_session.py 的 `build_agent_options`）。
+WORKER_WORKSPACE_VARIABLE = "LINGXI_WORKER_WORKSPACE"
+# 用户环境持久卷的**具名卷名**：它的挂载点就是全部用户家目录的父目录，也就是本
+# 文件判定"工作目录有没有踩进用户目录"时唯一的事实源，不硬编码路径字面量。
+USER_ENVIRONMENT_VOLUME = "lingxi-users"
+# 用户家目录的构造形状（`adapters/user_environment.py` 的 `LocalUserEnvironment.
+# home_of`）：`<root>/<user_id>`，即**每个用户的家目录都是根的直接子目录**。
+# 下面 `check_worker_workspace_isolation` 的整条判定建立在这个形状上，因此形状
+# 一旦变（例如改成分片目录 `<root>/ab/cd/<user_id>`），门禁必须响亮地要求重新
+# 推导，而不是拿着过期前提继续判绿。
+USER_HOME_LAYOUT = re.compile(
+    r"def home_of\(self, user_id: str\)[^\n]*\n"
+    r"(?:[^\n]*\n)*?"
+    r"\s*return self\._root / self\._validated\(user_id\)"
+)
 WORKER_MAX_CONCURRENCY_VARIABLE = "LINGXI_WORKER_MAX_CONCURRENCY"
 WORKER_QUEUE_PRODUCTION_CONTRACT = {
     WORKER_MAX_CONCURRENCY_VARIABLE: "4",
@@ -612,16 +631,77 @@ def check_worker_concurrency_contract() -> list[str]:
     return failures
 
 
+def check_prod_declares_deploy_environment() -> list[str]:
+    """生产覆盖必须**声明自己是生产**（对抗审查 2026-09-02 C-7）。
+
+    ``apps/worker/config.py`` 的 ``declares_production`` 读
+    ``LINGXI_DEPLOY_ENVIRONMENT``：声明为生产时内测轮内容级采集一律不生效，
+    两个开关变量配得再对也没用。这道兜底只有在**生产真的声明了自己**时才存在，
+    因此这里逐服务核对声明写在 ``deploy/compose.prod.yaml`` 的 ``environment:``
+    块里。
+
+    **必须写在 compose 而不是外部 env 文件里**：compose 的 ``environment:``
+    覆盖 ``env_file``，因此哪怕有人把 stage 的 worker env 文件整份复制进
+    ``.env.prod.worker*``，抄来的值也不再可能生效。写进 env 文件则毫无意义——
+    那正是这道兜底要防的那条路径本身。姿态同 ``check_worker_workspace_isolation``。
+
+    只核对**跑内容采集的那两个服务**（``worker`` 与 ``worker-queue``）：采集只在
+    worker 侧发生，给别的服务加声明不会更安全，只会让人以为这是个通用环境标记。
+    """
+
+    variable = module_constant(WORKER_CONFIG, "DEPLOY_ENVIRONMENT_VAR")
+    values = module_constant(WORKER_CONFIG, "PRODUCTION_ENVIRONMENT_VALUES")
+    if not variable or not values:
+        return [
+            "读不到 apps/worker/config.py 的 DEPLOY_ENVIRONMENT_VAR / "
+            "PRODUCTION_ENVIRONMENT_VALUES（常量被重命名或改写成非字面量赋值时，"
+            "check_prod_declares_deploy_environment 需要同步更新）"
+        ]
+
+    failures: list[str] = []
+    text = strip_comments(read(COMPOSE_PROD))
+    for service in ("worker", "worker-queue"):
+        block = service_block(text, service)
+        if block is None:
+            failures.append(f"{display(COMPOSE_PROD)} 找不到 service `{service}`")
+            continue
+        environment_block = service_block(block, "environment") or ""
+        match = re.search(
+            rf'^\s*{re.escape(variable)}:\s*"?([^"\n]+?)"?\s*$', environment_block, re.MULTILINE
+        )
+        if match is None:
+            failures.append(
+                f"{display(COMPOSE_PROD)} 的 `{service}` 没有在 `environment:` 里声明 "
+                f"`{variable}`。内测轮内容级采集的代码侧兜底（apps/worker/config.py 的 "
+                "declares_production）靠这条声明才存在；写进外部 env 文件不算——"
+                "那条路径正是这道兜底要防的东西（compose 的 environment 覆盖 env_file）。"
+            )
+            continue
+        declared = match.group(1).strip()
+        if declared.casefold() not in values:
+            failures.append(
+                f"{display(COMPOSE_PROD)} 的 `{service}` 声明 `{variable}: {declared}`，"
+                f"不在 apps/worker/config.py 认作生产的取值里（{sorted(values)}）。"
+                "拼错等于这道兜底整个不生效，而且是静默的。"
+            )
+    return failures
+
+
 def check_content_capture_prod_guard() -> list[str]:
     """内测轮内容级采集开关（Issue #251/#304 批次 3）的"正式环境不得生效"结构性
     保证：机械核对而不是只活在文档里的约定。
 
     研究结论（见 ``apps/worker/config.py`` 的 ``_innertest_content_capture`` 与
     迁移 ``0069_innertest_content_capture`` 的模块文档）：``deploy/compose.stage.
-    yaml`` 与 ``compose.prod.yaml`` 结构完全相同，代码里不存在任何"这是 stage
-    还是生产"的运行期判据，因此选用的方案是"双变量确认 + 精确字面量 + 本检查"，
-    而不是声称已有某种运行期环境探测。本检查覆盖这个方案里**唯一可由仓库静态
-    核对**的一环：
+    yaml`` 与 ``compose.prod.yaml`` 结构完全相同，因此方案是"双变量确认 + 精确
+    字面量 + 本检查"，而不是声称已有某种运行期环境**探测**。
+
+    对抗审查 2026-09-02 C-7 之后另加了一道代码侧兜底：部署**声明**自己是谁
+    （``LINGXI_DEPLOY_ENVIRONMENT``），声明为生产时采集一律不生效。那不是探测
+    ——探测在两侧完全同构时做不到——是把判据从"谁都能整份复制的宿主机 env 文件"
+    搬进"入库、被评审、被门禁扫描的 compose 文件"，并利用 compose 的
+    ``environment:`` 覆盖 ``env_file`` 这条语义让抄来的值无法生效。那一半由
+    :func:`check_prod_declares_deploy_environment` 钉住。本检查覆盖的仍是：
 
     1. 两个变量名与第二确认变量要求的精确字面量，一个都不允许出现在任何**入库**
        的 compose 编排文件里（尤其是 ``deploy/compose.prod.yaml``）——它们只能来自
@@ -785,6 +865,154 @@ def check_scheduler_user_volume() -> list[str]:
     return failures
 
 
+def _path_segments(raw: str) -> tuple[str, ...]:
+    """把一个绝对路径切成规范化的路径段元组（去掉空段与 ``.``）。
+
+    刻意**不用** ``os.path.realpath``：门禁跑在开发机与 CI 上，那里根本不存在
+    容器里的这些路径，解析符号链接毫无意义也不可能正确。这里判定的是**声明出来
+    的路径字面量之间的包含关系**，纯词法比较就够，也正是可机械核对的部分。
+    """
+
+    return tuple(segment for segment in raw.split("/") if segment not in ("", "."))
+
+
+def _contains_or_equals(outer: str, inner: str) -> bool:
+    """``inner`` 是不是等于 ``outer``、或者位于 ``outer`` 之下。"""
+
+    outer_segments = _path_segments(outer)
+    inner_segments = _path_segments(inner)
+    return inner_segments[: len(outer_segments)] == outer_segments
+
+
+def check_worker_workspace_isolation() -> list[str]:
+    """stage 与 prod 的 worker-queue **必须**显式钉住
+    ``LINGXI_WORKER_WORKSPACE``，且它与用户目录根**互不包含**
+    （Trace #544 S-2b / 报告 W-1）。
+
+    为什么这条不能只写在文档里：这个变量就是 Agent SDK 回合的 ``cwd``
+    （``adapters/claude_agent_session.py`` 的 ``build_agent_options``）。用户目录根
+    （``lingxi-users`` 卷的挂载点）下每个用户各有一份 ``0440`` 的 ``.mcp.json``，
+    里面是**该用户专属的问数 MCP Bearer 明文**（决策记录《用户环境持有问数 MCP
+    令牌》）。把 ``cwd`` 设成用户目录根、它的祖先或它下面的某个用户家目录，等于把
+    全体用户的令牌放进模型的相对路径可达面；``cwd`` 里的 ``.mcp.json`` 同时还是
+    Claude CLI 的项目级 MCP 配置来源。只读屏障（``PreToolUse`` 默认拒绝）是**唯一**
+    判定层，它能挡住工具调用，但挡不住"工作目录本身就选错了"这件事。
+
+    判定的事实源，逐条都不是硬编码猜测：
+
+    - **用户目录根**取自 compose 里 ``lingxi-users`` 卷在 worker-queue 上的挂载
+      目标（``_volume_mounts`` 精确解析 ``volumes:`` 列表，不做子串命中）；基线与
+      环境覆盖里出现的挂载点必须一致，不一致直接判红。
+    - **用户家目录的形状**回读 ``adapters/user_environment.py`` 的 ``home_of``
+      （``<root>/<user_id>``）。这段代码一旦改形状（例如分片成
+      ``<root>/ab/cd/<user_id>``），本检查会响亮地要求重新推导判据，而不是拿着
+      过期前提继续判绿。
+    - **工作目录**取自 stage/prod 覆盖文件 worker-queue 的 ``environment:`` 块。
+      **必须是字面量绝对路径，不许留 ``${...}`` 插值**：这是安全边界而不是容量
+      旋钮，不能由一份未入库的外部 env 文件决定取值（这也正是它写在 compose 而
+      不是 ``.env.<环境>.worker-queue`` 里的原因——compose 的 ``environment:``
+      覆盖 ``env_file``，因此外部文件里残留的旧值不再可能生效）。
+
+    这条断言对**当前 stage 的实测值** ``/var/lib/lingxi/users``（正是用户目录根
+    本身）判红——这正是它要拦的形状；合入前须先把 stage 的部署值改成与仓库合同
+    一致的安全值。
+    """
+
+    failures: list[str] = []
+
+    adapter_source = read(USER_ENVIRONMENT_ADAPTER)
+    if USER_HOME_LAYOUT.search(adapter_source) is None:
+        failures.append(
+            "adapters/user_environment.py 的 LocalUserEnvironment.home_of 不再是 "
+            "`self._root / self._validated(user_id)`。本检查"
+            "「工作目录不得等于用户目录根、不得位于其下、也不得包含它」的判据"
+            "正是建立在「每个用户家目录都是根的直接子目录」这个形状上，"
+            "形状变了必须回到这里重新推导判据，不能让门禁拿过期前提继续判绿。"
+        )
+
+    base_worker_queue = service_block(strip_comments(read(COMPOSE_BASE)), "worker-queue") or ""
+    base_roots = {
+        target
+        for source, target, _ in _volume_mounts(base_worker_queue)
+        if source == USER_ENVIRONMENT_VOLUME
+    }
+
+    for path in (COMPOSE_STAGE, COMPOSE_PROD):
+        label = display(path)
+        text = strip_comments(read(path))
+        worker_queue = service_block(text, "worker-queue")
+        if worker_queue is None:
+            failures.append(f"{label} 找不到 worker-queue service")
+            continue
+        roots = base_roots | {
+            target
+            for source, target, _ in _volume_mounts(worker_queue)
+            if source == USER_ENVIRONMENT_VOLUME
+        }
+        if not roots:
+            failures.append(
+                f"{label}（含 deploy/compose.yaml 基线）的 worker-queue 没有任何 "
+                f"{USER_ENVIRONMENT_VOLUME} 卷挂载，无法推导用户目录根，"
+                "本检查因此无法判定工作目录是否踩进用户目录——"
+                "这是失败而不是跳过。"
+            )
+            continue
+        if len(roots) > 1:
+            failures.append(
+                f"{label} 与 deploy/compose.yaml 基线给 {USER_ENVIRONMENT_VOLUME} "
+                f"声明了不同的挂载点（{sorted(roots)}）。用户目录根必须唯一，"
+                "否则 scheduler 写的 .mcp.json 与 worker-queue 读的根本不是同一个目录。"
+            )
+            continue
+        user_root = roots.pop()
+
+        raw = _environment_value(worker_queue, WORKER_WORKSPACE_VARIABLE)
+        if raw is None:
+            failures.append(
+                f"{label} 的 worker-queue 没有显式声明 {WORKER_WORKSPACE_VARIABLE}。"
+                "它是 Agent SDK 回合的工作目录（cwd）；不显式钉死就只能由未入库的 "
+                "env 文件决定，而那份文件门禁读不到——真实 stage 就是这样长期停在 "
+                f"{user_root}（用户目录根本身）上的。"
+            )
+            continue
+        workspace = raw.strip().strip('"').strip("'")
+        if "${" in workspace:
+            failures.append(
+                f"{label} 的 {WORKER_WORKSPACE_VARIABLE} 用了插值 `{raw}`。"
+                "工作目录是安全边界不是容量旋钮：取值必须在仓库里可机械核对，"
+                "不能由一份未入库的外部 env 文件决定。"
+            )
+            continue
+        if not workspace.startswith("/"):
+            failures.append(
+                f"{label} 的 {WORKER_WORKSPACE_VARIABLE}=`{workspace}` 不是绝对路径。"
+                "相对路径的解析结果取决于进程启动时的当前目录，无法机械判定它"
+                "有没有落进用户目录。"
+            )
+            continue
+        if _contains_or_equals(user_root, workspace):
+            failures.append(
+                f"{label} 的 {WORKER_WORKSPACE_VARIABLE}=`{workspace}` "
+                f"等于用户目录根 `{user_root}` 或位于它之下。"
+                "那个目录下每个用户各有一份带**问数 MCP Bearer 明文**的 .mcp.json"
+                "（0440），把回合的工作目录设在这里等于把全体用户的令牌放进模型的"
+                "相对路径可达面；cwd 里的 .mcp.json 同时还是 Claude CLI 的项目级 "
+                "MCP 配置来源。请改成与用户目录互不包含的路径"
+                "（当前合同值：/tmp/lingxi-workspace）。"
+            )
+            continue
+        if _contains_or_equals(workspace, user_root):
+            failures.append(
+                f"{label} 的 {WORKER_WORKSPACE_VARIABLE}=`{workspace}` "
+                f"是用户目录根 `{user_root}` 的祖先目录。"
+                "工作目录里就直接摆着整棵用户目录树，一次相对路径读取即可拿到"
+                "别人的问数 MCP 令牌——危害与直接指向用户目录根相同。"
+            )
+            continue
+
+    return failures
+
+
 # ---- 资源限制（Trace #373 H2 / S-H2-1，产品负责人 2026-08-28 先行裁定）--------
 # stage 主机只有 2 核 / 3.7GiB，不设限制的容器可能互相饿死；限制过低又会在正常
 # 负载下杀死真实的 Agent SDK 回合（Claude CLI + 多个 MCP 子进程）。具体数值分
@@ -841,6 +1069,14 @@ REQUIRED_VARIABLE = re.compile(r'^"?\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}"?$')
 # 以 `${VAR:?...}` 形态 fail-fast，静态检查同时确认这个形状与合同文档中的值。
 PROD_EXTERNAL_HOST_SPEC_LIMITS: dict[str, tuple[str, ...]] = {
     "worker-queue": ("cpus", "memory", "pids"),
+    # 报告 R6-D4（对抗审查 2026-09-02）：这两项原来写成 `${VAR:-1G}`。默认值是
+    # 静默的——漏配时 scheduler 与 gateway 各退回 1G，加上 worker-queue 合同的
+    # 2G 就是 4G，**超过生产宿主机约 3.9GiB 的可用内存**，而 `docker compose
+    # config` 一声不响照常渲染。runbook §2.1 早就要求显式写这两行并渲染回读，
+    # 但那是纪律不是闸门：漏做一次没有任何东西会变红。改成与 worker-queue 同型的
+    # `${VAR:?}` 之后，漏配直接让渲染失败。
+    "scheduler": ("memory",),
+    "gateway": ("memory",),
 }
 
 
@@ -1846,7 +2082,9 @@ def main() -> int:
         ("worker-queue 并发上限与生产资源合同", check_worker_concurrency_contract),
         ("闸⑤配置项 .env.example 示范覆盖", check_onboarding_gate_env_example),
         ("内测轮内容级采集正式环境防护", check_content_capture_prod_guard),
+        ("生产覆盖声明部署环境", check_prod_declares_deploy_environment),
         ("scheduler 用户环境卷挂载", check_scheduler_user_volume),
+        ("worker-queue 工作目录与用户目录隔离", check_worker_workspace_isolation),
         ("六服务资源限制结构", check_resource_limits),
         ("worker-queue /tmp 内存盘上限分环境显式", check_worker_tmpfs_capacity),
         ("compose 插值占位符 YAML 安全与渲染可行", check_compose_interpolation_is_yaml_safe),

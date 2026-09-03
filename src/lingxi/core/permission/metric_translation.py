@@ -54,6 +54,7 @@ aggregate_permission` 产出的 ``functions`` 对同一个用户的所有公司�
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -121,6 +122,45 @@ class UncoveredPermissionCombination(ValueError):
         super().__init__(f"未覆盖的公司+职能组合（fail-closed，不猜测、不静默丢弃）：{ordered}")
 
 
+#: 指标名里一律不允许出现的 Unicode 类别：控制字符（``Cc``——换行、回车、制表都在
+#: 里面）、格式字符（``Cf``——零宽空格、双向覆盖）、代理与私用区（``Cs``/``Co``）、
+#: 行与段分隔符（``Zl``/``Zp``）。与 ``core/permission/legacy_diff.py`` 的
+#: ``_FORBIDDEN_CHARACTER_CATEGORIES`` 同一份清单（Trace #544 P-5 / S-2d 同批）。
+_FORBIDDEN_METRIC_CHARACTER_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+
+
+def _malformed_metric_name(value: str) -> str | None:
+    """映射文件里一个**指标名取值**的卫生判据：不合格返回原因短语，合格返回 ``None``。
+
+    **为什么这道校验必须在这里**（Trace #544 P-5）：这个文件是权限翻译链的目录源头，
+    它产出的指标名会被 ``publish_row`` 原样序列化进权限发布表。此前这一层只判"非空
+    字符串"，于是 ``"*"``、``" "``、``"日活\n"``、含零宽字符的名字都能直通落到正式
+    表上。其中 ``"*"`` 最危险：读侧把公司下的 ``"*"`` 当作"该公司全部指标（含以后新增
+    的）"，一个笔误因此会把范围放到最大，而且**抑制对它无效**（抑制按「公司×指标」
+    精确匹配，减不掉一个 ``"*"``）——与 rc21 修复包 B 在导入侧堵掉的是同一个洞，
+    只是这一侧的入口是配置文件而不是导出 CSV。
+
+    口径与 ``core/permission/legacy_diff.py::_malformed`` 逐条对齐（**值严格、公司键
+    不查目录**）：拒空白、拒不可见字符与普通空格以外的空白、拒把 ``"*"`` 混进名字；
+    刻意**不**管名字首尾的普通空格。两处目前各有一份实现——``legacy_diff`` 是本批
+    另一条 Story 的改动面，本批不跨面合并，去重登记在 S-3a 收口报告。
+
+    公司键不走这道校验：``"*"`` 在键位是合法的 :data:`ALL_COMPANIES_KEY` 通配，
+    只有落到**值**上才是越权。
+    """
+
+    if not value.strip():
+        return "不得为空白"
+    for character in value:
+        if unicodedata.category(character) in _FORBIDDEN_METRIC_CHARACTER_CATEGORIES:
+            return "不得含换行、制表符或其他不可见字符"
+        if character.isspace() and character != " ":
+            return "不得含普通空格以外的空白字符"
+    if ALL_COMPANIES_KEY in value:
+        return f"不得为通配符 {ALL_COMPANIES_KEY}，也不得把它混进名字里"
+    return None
+
+
 def build_company_function_metric_map(
     document: Mapping[str, Any],
 ) -> dict[str, dict[str, tuple[str, ...]]]:
@@ -140,19 +180,24 @@ def build_company_function_metric_map(
     - 每个公司下的职能表必须是映射，职能标签必须是非空字符串，且是
       :mod:`lingxi.core.permission.role_function` 产出的**原样**标签
       （精确匹配，不猜测同义词）；
-    - 每个职能对应的指标名列表：必须是非空列表，元素必须是非空字符串。
+    - 每个职能对应的指标名列表：必须是非空列表，元素必须是非空字符串，且要过
+      :func:`_malformed_metric_name` 的卫生判据（Trace #544 P-5）。
       **允许包含重复元素**（:func:`translate_company_functions` 会去重排序），但不
       允许空字符串或非字符串——那是配置错误，不是数据。
 
     **不做的事**：不校验指标名是否真的存在于问数 MCP（那需要真实回源，属受控窗口
     的核对工作，不是配置解析）；不校验职能标签是否出现在
     ``galaxy_role_function_map.toml`` 里（两个配置文件由不同人分别维护，互相校验
-    会让改一个文件牵连另一个文件的解析）。
+    会让改一个文件牵连另一个文件的解析）；**不核对公司键在不在任何目录里**——
+    公司键要么是银河原始取值、要么是 ``"*"``，这个文件本身就是目录，没有第二份
+    可以拿来比对（与 ``core/permission/legacy_diff.py``「值严格、公司键不查目录」
+    同一条口径）。
     """
 
     companies = document.get("companies")
     if not isinstance(companies, Mapping):
         raise ValueError("公司+职能→指标名映射缺少 [companies] 表")
+
 
     result: dict[str, dict[str, tuple[str, ...]]] = {}
     for raw_company, raw_functions in companies.items():
@@ -180,6 +225,11 @@ def build_company_function_metric_map(
                 if not isinstance(item, str) or not item:
                     raise ValueError(
                         f"公司 {company} 职能 {function} 的指标名列表元素必须是非空字符串"
+                    )
+                problem = _malformed_metric_name(item)
+                if problem is not None:
+                    raise ValueError(
+                        f"公司 {company} 职能 {function} 的指标名{problem}"
                     )
                 metrics.append(item)
             functions[function] = tuple(metrics)

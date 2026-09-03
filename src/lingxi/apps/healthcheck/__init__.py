@@ -197,6 +197,27 @@ _SUFFICIENT_FREE_BYTES = 512 * 1024 * 1024
 #: 只用于把字节数渲染成人读得懂的 MiB，不参与任何判定。
 _MIB = 1024 * 1024
 
+#: 进程数占 cgroup ``pids`` 上限的这个比例即判不健康（报告 R6-D3）。
+#:
+#: ``deploy/compose.yaml`` 给六个服务都设了 ``pids`` 上限（worker-queue 512）。
+#: 打满之后的现场极其难认：``docker exec`` 仍然进得去，健康检查也一路报绿——
+#: 它自己不 fork，读文件、statvfs、写活性戳全都不需要新进程；**而 worker 起
+#: Claude CLI 与 MCP 子进程会直接失败**，用户的每一个任务都失败，监控上却看不出
+#: 任何异常。这与 Issue #494 那次"盘满但探针照样成功"是同一个形状的假绿，因此
+#: 处置也照它：判的是**这条资源本身还剩多少**，不是"我这次操作成不成功"。
+#:
+#: 0.90 的余量取法：正常峰值是 4 个并发会话（每个会话一个 CLI 加若干 MCP 子进程），
+#: 实测远低于 300/512；贴到 90% 说明有东西在漏进程，那时离"下一个任务起不来"
+#: 只差几十个 pid，此刻判红仍来得及重启。
+_DEFAULT_MAX_PIDS_RATIO = 0.90
+
+#: cgroup v2 与 v1 的 pids 控制器读数路径。容器内看到的是自己那一层的命名空间视图。
+#: 顺序即优先级：先 v2（本仓库部署的 Docker 29.x 是 v2），再 v1。
+_PIDS_CGROUP_PATHS: tuple[tuple[Path, Path], ...] = (
+    (Path("/sys/fs/cgroup/pids.current"), Path("/sys/fs/cgroup/pids.max")),
+    (Path("/sys/fs/cgroup/pids/pids.current"), Path("/sys/fs/cgroup/pids/pids.max")),
+)
+
 
 class HealthcheckError(RuntimeError):
     """健康检查判定失败；``reason`` 是安全的分类文本，不含业务正文或凭据。"""
@@ -254,6 +275,67 @@ def _check_free_space(
             f"临时目录可用空间 {free / _MIB:.1f}MiB 低于阈值 "
             f"{threshold / _MIB:.1f}MiB（总量 {total / _MIB:.1f}MiB，"
             f"下限比例 {min_free_ratio:.0%}）"
+        )
+
+
+def _read_pids_usage(cgroup_paths: Sequence[tuple[Path, Path]]) -> tuple[int, int] | None:
+    """读 cgroup 的 ``(pids.current, pids.max)``；读不出可判定的数就返回 ``None``。
+
+    返回 ``None`` 的三种情况都**不判红**：
+    - 文件不存在（非容器环境：开发机、CI、本仓库自己的单测都走这一支）；
+    - ``pids.max`` 是 ``"max"``（没设上限，也就没有"占了多少比例"可言）；
+    - 读到的内容不是正整数。
+
+    这与 ``_check_free_space`` 对 ``statvfs`` 失败判红的取舍**刻意不同**：临时
+    目录是每个角色都必然存在、必然要能 stat 的东西，stat 不了就是真出事了；
+    而 cgroup pids 控制器在容器外根本不存在，把"没有 cgroup"判成不健康会让每一次
+    本机运行都红，那不是判据，是噪声。
+    """
+
+    for current_path, max_path in cgroup_paths:
+        try:
+            current_raw = current_path.read_text(encoding="utf-8").strip()
+            max_raw = max_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if max_raw == "max":
+            return None
+        try:
+            current = int(current_raw)
+            limit = int(max_raw)
+        except ValueError:
+            return None
+        if limit <= 0 or current < 0:
+            return None
+        return current, limit
+    return None
+
+
+def _check_pids(
+    role: str,
+    *,
+    max_pids_ratio: float = _DEFAULT_MAX_PIDS_RATIO,
+    cgroup_paths: Sequence[tuple[Path, Path]] | None = None,
+) -> None:
+    """判定这个容器的 ``pids`` 配额还起得来子进程（报告 R6-D3）。
+
+    ``role`` 只进错误文本，不参与判定：六个服务用同一条比例判据，因为
+    ``pids`` 上限本来就逐服务配置，比例天然按各自的上限缩放（同
+    ``_check_free_space`` 用比例而不是固定字节的理由）。
+    """
+
+    usage = _read_pids_usage(_PIDS_CGROUP_PATHS if cgroup_paths is None else cgroup_paths)
+    if usage is None:
+        return
+    current, limit = usage
+    if max_pids_ratio <= 0:
+        # 显式关掉这条判据（`--max-pids-ratio 0`），用于确实不想要它的场景。
+        return
+    if current >= max_pids_ratio * limit:
+        raise HealthcheckError(
+            f"进程数 {current} 已达 pids 上限 {limit} 的 "
+            f"{current / limit:.0%}（阈值 {max_pids_ratio:.0%}）："
+            "此刻起不了新的 CLI 或 MCP 子进程，用户任务会失败"
         )
 
 
@@ -369,6 +451,16 @@ def run(
             f"{_SUFFICIENT_FREE_BYTES // (1024 * 1024)}MiB，0 表示关掉这条上界"
         ),
     )
+    parser.add_argument(
+        "--max-pids-ratio",
+        type=float,
+        default=None,
+        help=(
+            "进程数占 cgroup pids 上限的比例，达到即判不健康（报告 R6-D3）；"
+            f"缺省 {_DEFAULT_MAX_PIDS_RATIO:.0%}，0 表示关掉这条判据。"
+            "非容器环境读不到 cgroup 时本判据自动跳过"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     source = os.environ if env is None else env
@@ -398,6 +490,9 @@ def run(
     sufficient_free_bytes = args.sufficient_free_bytes
     if sufficient_free_bytes is None:
         sufficient_free_bytes = _SUFFICIENT_FREE_BYTES
+    max_pids_ratio = args.max_pids_ratio
+    if max_pids_ratio is None:
+        max_pids_ratio = _DEFAULT_MAX_PIDS_RATIO
 
     started = time.monotonic()
     try:
@@ -409,6 +504,10 @@ def run(
             min_free_ratio=min_free_ratio,
             sufficient_free_bytes=sufficient_free_bytes,
         )
+        # pids 判据排第二：与可用空间同属"这条资源还剩多少"，只读两个文件、
+        # 不 fork、不连网，比数据库探测便宜得多；而它一旦成立，后面的数据库探测
+        # 本来也可能因为起不了辅助进程而失败——先判它给出的诊断最接近根因。
+        _check_pids(args.role, max_pids_ratio=max_pids_ratio)
         _check_database(args.role, db_cache_ttl, source, directory=directory)
         _check_liveness(args.role, max_age, source, directory=directory)
     except HealthcheckError as error:

@@ -225,6 +225,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -293,6 +294,61 @@ CREATED_FIELD_NAMES: tuple[str, ...] = PUBLISHED_FIELD_NAMES + (TOKEN_CIPHER_FIE
 #: 判断「权限有没有变化」时**不看**的字段。只有时间戳一个：把它算进去，每天一轮的
 #: 权限刷新会天天判成「变了」，天天重发一次内容完全相同的权限。
 _VOLATILE_FIELD_NAMES: frozenset[str] = frozenset({"updated_at"})
+
+#: 参与内容摘要的字段与顺序：更新集去掉时间戳，顺序即 :data:`PUBLISHED_FIELD_NAMES`
+#: 的顺序。**这个顺序是摘要算法的一部分**，迁移 ``0085`` 的 SQL 回填按同一顺序拼串，
+#: 改动它会让存量摘要与新算出来的摘要对不上。
+DIGEST_FIELD_NAMES: tuple[str, ...] = tuple(
+    name for name in PUBLISHED_FIELD_NAMES if name not in _VOLATILE_FIELD_NAMES
+)
+
+
+def content_digest(fields: Mapping[str, Any]) -> str:
+    """整行内容（去掉 ``updated_at``）的 SHA-256 十六进制摘要。
+
+    **摘要存在的理由是它能活过内容擦除**（Trace #544 P-3）：``publish_outbox.payload``
+    里有邮箱与姓名，九十天后必须被擦成空对象；可是"这一版权限和上一版一样吗"此前只能
+    读那份 payload，擦过之后它读到空对象，一份内容完全没变的权限被判成"变了"，于是重排
+    一条发布意图、并把该用户的记忆与已送达正文一并清空。摘要是单向的：它说不出邮箱、
+    姓名或权限内容，只能回答"和另一份一不一样"，因此可以留在被擦除之后。
+
+    拼串形态（迁移 ``0085`` 的 SQL 回填逐字节复刻同一形态）：按
+    :data:`DIGEST_FIELD_NAMES` 的顺序，每项写成 ``名字=值``，项间用 ``\n`` 连接。
+    换行是无歧义的分隔符——:meth:`PublishRow.__post_init__` 已经拒绝了任何含换行的
+    字段值。缺键按空串参与，不静默跳过（少一个键与该键为空是两件事，但两者都不该
+    与"完整且相同"撞成同一个摘要，前者在上游就已经被字段集校验拦住）。
+    """
+
+    canonical = "\n".join(
+        f"{name}={_digest_text(fields.get(name))}" for name in DIGEST_FIELD_NAMES
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def permissions_digest(fields: Mapping[str, Any]) -> str:
+    """``permissions`` 单字段的 SHA-256 十六进制摘要。
+
+    与 :func:`content_digest` 分开，是因为两者回答的是不同的问题（见
+    ``adapters/postgres_permission_publish._permissions_changed`` 文档）：整行摘要
+    回答"要不要排一条新的发布意图"，这一个回答"这个人**实际可用权限**变了吗"——
+    只有后者能决定要不要清空用户记忆与已送达正文。改名不该清记忆。
+    """
+
+    return hashlib.sha256(
+        _digest_text(fields.get("permissions")).encode("utf-8")
+    ).hexdigest()
+
+
+def _digest_text(value: Any) -> str:
+    """摘要用的取值归一：``None`` 与缺键都算空串，其余按 ``str`` 取字面量。
+
+    payload 从 JSONB 回来时数字会变成 Python 数字，而发布行永远是文本——不归一会让
+    同一份内容在"刚写进去"与"从库里读回来"两个时刻算出不同的摘要。
+    """
+
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
 
 # fail-closed 的三个内部原因。用户侧一律是同一个「无可用银河权限」出口
 # （Issue #17 已确认的产品规则），这里的区分只供审计与排障。

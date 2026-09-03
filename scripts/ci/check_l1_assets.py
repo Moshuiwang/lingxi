@@ -105,6 +105,45 @@ def load_aliases(path: Path) -> tuple[dict[str, str] | None, list[str]]:
     return (valid if not errors else None), errors
 
 
+def _bound_names(node: ast.AST) -> set[str]:
+    """返回 ``node`` 这一条语句直接绑定（或解绑）的名字。
+
+    只认 ``Store``/``Del`` 上下文里的 ``ast.Name``，所以 ``mapping[X] = v``（``X``
+    是 Load）和 ``obj.X = v``（``X`` 是属性名、不是 Name 节点）都不会被误判成对
+    ``X`` 的绑定；``__all__`` 里的字符串同理不算。
+    """
+
+    def _targets(*expressions: ast.expr | None) -> set[str]:
+        names: set[str] = set()
+        for expression in expressions:
+            if expression is None:
+                continue
+            for child in ast.walk(expression):
+                if isinstance(child, ast.Name) and isinstance(
+                    child.ctx, (ast.Store, ast.Del)
+                ):
+                    names.add(child.id)
+        return names
+
+    if isinstance(node, ast.Assign):
+        return _targets(*node.targets)
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        return _targets(node.target)
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        return _targets(node.target)
+    if isinstance(node, ast.withitem):
+        return _targets(node.optional_vars)
+    if isinstance(node, ast.Delete):
+        return _targets(*node.targets)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, ast.ExceptHandler):
+        return {node.name} if node.name else set()
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return {alias.asname or alias.name.split(".")[0] for alias in node.names}
+    return set()
+
+
 def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] | None, list[str]]:
     """静态读出 ``content.py`` 里登记的必需键集合。
 
@@ -112,6 +151,14 @@ def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] 
     ``lingxi`` 的依赖闭包和副作用带进 CI 的轻量路径。只认**模块顶层**的直接赋值，
     并要求右值是字面量元组/列表——任何需要求值才能确定的写法（拼接、条件、函数
     调用）都当作读不出来而失败关闭，绝不猜一个可能不完整的集合。
+
+    「唯一一处顶层字面量赋值」这件事在**整棵语法树**上判定（rc24 fable 审查 P2-1）。
+    旧实现只遍历 ``tree.body`` 且只认 ``Assign``/``AnnAssign``，于是两类改写能骗过
+    它：模块顶层的 ``REQUIRED_TEXT_KEYS += (...)``（``ast.AugAssign``）被整条跳过，
+    ``if``/``try``/函数体里的重新绑定压根看不见——门禁读到的是前面那条字面量，
+    运行时读到的却是改过的值，是一条真实可用的绕过路径。现在扫全树：目标名在任何
+    位置出现第二次绑定（增广赋值、重绑、``del``、``import as``、同名函数/类定义
+    ……），或者唯一那次绑定不在模块顶层，都失败关闭。
     """
 
     try:
@@ -122,40 +169,56 @@ def required_content_keys(module_path: Path) -> tuple[dict[str, frozenset[str]] 
         ]
 
     wanted = {name for _, name, _ in CONTENT_KEY_DECLARATIONS}
+    top_level = {id(statement) for statement in tree.body}
+    bindings: dict[str, list[ast.AST]] = {name: [] for name in wanted}
+    for node in ast.walk(tree):
+        for name in _bound_names(node) & wanted:
+            bindings[name].append(node)
+
+    display = _display(module_path, REPOSITORY_ROOT)
     found: dict[str, frozenset[str]] = {}
     errors: list[str] = []
-    for node in tree.body:
-        if isinstance(node, ast.AnnAssign):
-            targets: list[ast.expr] = [node.target]
-            value = node.value
-        elif isinstance(node, ast.Assign):
-            targets = list(node.targets)
-            value = node.value
-        else:
-            continue
-        for target in targets:
-            if not isinstance(target, ast.Name) or target.id not in wanted:
-                continue
-            try:
-                literal = ast.literal_eval(value) if value is not None else None
-            except (ValueError, TypeError, SyntaxError):
-                literal = None
-            if not isinstance(literal, (tuple, list)) or not all(
-                isinstance(item, str) for item in literal
-            ):
-                errors.append(
-                    f"{_display(module_path, REPOSITORY_ROOT)} 的 {target.id} "
-                    "必须是模块顶层的字面量字符串元组，否则门禁无法静态确定必需键"
-                )
-                continue
-            found[target.id] = frozenset(literal)
-
-    for name in sorted(wanted - set(found)):
-        if not any(name in error for error in errors):
+    for name in sorted(wanted):
+        nodes = bindings[name]
+        if not nodes:
             errors.append(
-                f"{_display(module_path, REPOSITORY_ROOT)} 里找不到模块顶层的 {name}："
+                f"{display} 里找不到模块顶层的 {name}："
                 "运行时必需键的登记表被改名或移动了，L1 门禁不能再证明配置与运行时一致"
             )
+            continue
+        if len(nodes) > 1:
+            lines = "、".join(
+                str(getattr(node, "lineno", "?")) for node in nodes
+            )
+            errors.append(
+                f"{display} 的 {name} 在模块里被绑定了 {len(nodes)} 次（第 {lines} 行）："
+                "增广赋值或重新绑定会让门禁读到的集合与运行时实际生效的集合不一致，"
+                "只允许一处模块顶层的字面量赋值"
+            )
+            continue
+        node = nodes[0]
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or id(node) not in top_level:
+            errors.append(
+                f"{display} 的 {name} 不是模块顶层的直接赋值"
+                f"（第 {getattr(node, 'lineno', '?')} 行 {type(node).__name__}）："
+                "门禁只静态读取模块顶层的字面量赋值，其他写法一律失败关闭"
+            )
+            continue
+        value = node.value
+        try:
+            literal = ast.literal_eval(value) if value is not None else None
+        except (ValueError, TypeError, SyntaxError):
+            literal = None
+        if not isinstance(literal, (tuple, list)) or not all(
+            isinstance(item, str) for item in literal
+        ):
+            errors.append(
+                f"{display} 的 {name} "
+                "必须是模块顶层的字面量字符串元组，否则门禁无法静态确定必需键"
+            )
+            continue
+        found[name] = frozenset(literal)
+
     if errors:
         return None, errors
     return found, []

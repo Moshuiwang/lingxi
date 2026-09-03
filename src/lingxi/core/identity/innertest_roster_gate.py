@@ -60,6 +60,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import re
 
 #: 飞书用户 open_id 的前缀，与 ``adapters/feishu_user_message.py`` 的
@@ -140,3 +142,21 @@ def is_open_id_innertest_allowed(open_id: object, roster: frozenset[str]) -> boo
     if not needle:
         return False
     return needle in roster
+
+
+def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]:
+    """把已解析的内测名单集合包成 ``AutoOnboardingRunner`` 构造时要的判定口。
+
+    纯粹的装配便利：把上面那个纯判定函数 :func:`is_open_id_innertest_allowed` 绑上
+    一份具体的名单集合。判据、为什么匹配键是 open_id、为什么空集合＝全拒，全部写在
+    本模块的文档字符串里，本函数不重复。
+
+    **从 ``AutoOnboardingRunner.build_innertest_roster_gate``（静态方法）纯移动过来**
+    （rc25 S-8a；同 Trace #358 S-H-1 与 rc25 S-2a 的先例：只搬定义，不改判定）。搬家
+    的直接原因是 ``onboarding_runner.py`` 贴着体量棘轮阈值（1500 行，`scripts/ci/
+    check_size_ratchet.py`），Issue #541 的系统触发入口放不进去；搬到闸自己的模块也比
+    留在编排类上更贴合职责——它绑的就是本模块的判定函数，此前还得为此在方法体里反向
+    import 回本模块。
+    """
+
+    return lambda open_id: is_open_id_innertest_allowed(open_id, roster)

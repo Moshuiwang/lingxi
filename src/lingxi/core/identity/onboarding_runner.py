@@ -17,6 +17,7 @@
   → 身份定位（组织快照 + 在职实时回读，Epic B）
   → 花名册工号 / 邮箱
   → 银河唯一匹配 + 权限聚合
+  → 同邮箱是否已绑给另一个人（rc25 S-2a，core/identity/onboarding_guards.py）
   → 建档（#89 写侧合同，core/identity/provisioning.py）
   → 复核该用户此刻还该不该继续开通
   → 用户环境创建（含按用户 .mcp.json 的 Bearer 落盘）
@@ -35,7 +36,7 @@
 | **内测名单外**（Issue #302 S-N-01，在最前面拦截，早于以下三类） | `open_id` 不在内测名单（未配置/空白 → 空名单，对任何人全拒；非空且非法 → 进程启动失败，不是退化成空名单，见 `core/identity/innertest_roster_gate.py` 模块文档「默认关闭＝全拒」） | 冻结的「内测未开放」，不建档、不发布权限 |
 | **确定性业务失败** | 定位不到、多条、双键冲突、资料不完整、非在职、无受支持职能、`incomplete_identity` | 冻结的「无可用银河权限」 |
 | **专用主体** | `delegated_subject`（判定层或建档触发器） | 冻结的「专用账号不提供问数服务」 |
-| **本侧故障** | 组织资料不可用、`storage_integrity`、用户环境写不出去、发布没能完成、探针技术失败 | 冻结的 `LX-ONBOARD-001` |
+| **本侧故障** | 组织资料不可用、`storage_integrity`、`email_already_bound`（同一邮箱已绑给另一个人）、用户环境写不出去、发布没能完成、探针技术失败 | 冻结的 `LX-ONBOARD-001` |
 
 外加一条**等待类**终态：十五分钟预算耗尽仍未就绪 → 冻结的「权限同步未完成，已转交处理」。
 四类互斥且**先到先得**：一旦选定终态，后置异常不得把它改写成另一种用户结论（`V-开通-13`）。
@@ -168,6 +169,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -184,6 +187,8 @@ from lingxi.core.identity.first_contact import (
 from lingxi.core.identity.onboarding_ports import (
     DirectorySource,
     DispatchLedger,
+    # 「同邮箱是否已绑给另一个人」的回读口（rc25 S-2a，对抗审查 X-1）。
+    EmailBindingSource,
     EmploymentSource,
     # 本文件不直接使用 ``EnvironmentResult``（是 ``_environment.ensure()`` 的返回
     # 类型，方法体不需要按名字标注它），导入只是为了让它继续作为 ``onboarding_
@@ -209,7 +214,12 @@ from lingxi.core.identity.legacy_permission_import import (
     import_legacy_permissions,
     translate_galaxy,
 )
+from lingxi.core.identity.onboarding_guards import (
+    reject_email_bound_to_another_person,
+    reject_zero_galaxy_without_local_grant,
+)
 from lingxi.core.identity.onboarding_support import draft_from_member, roster_row_for
+from lingxi.core.identity.preprovision import NULL_DISPATCH_LEDGER, ORIGIN_PREPROVISION, PositionGrantImporter, PreprovisionGrant, deliver_silently, import_preprovision_grant, is_system_trigger, origin_of, run_system_onboarding
 from lingxi.core.identity.onboarding_terminal import (
     KEY_COMPLETED,
     KEY_DELEGATED_SUBJECT,
@@ -314,6 +324,8 @@ class AutoOnboardingRunner:
         failure_reasons: FailureReasonRecorder | None = None,
         local_overrides: LocalOverrideSource | None = None,
         legacy_importer: LegacyPermissionImporter | None = None,
+        email_bindings: EmailBindingSource,
+        position_grants: PositionGrantImporter | None = None,
     ) -> None:
         if not callable(innertest_roster_gate):
             # **没有默认放行。** 与 ``publish_allowed`` 同一条纪律：这一格决定的是
@@ -397,6 +409,14 @@ class AutoOnboardingRunner:
         self._failure_reasons = failure_reasons
         # 本地权限覆盖读取口（S-P-3）：``None``＝装配层未接线，行为与改动前逐字节一致。
         self._local_overrides = local_overrides
+        #: 「同邮箱已绑给另一个人」的回读口（rc25 S-2a，对抗审查 X-1）。**必填、
+        #: 没有哨兵值**：这道闸挡的是"两个人共用同一把问数令牌与同一行正式表权限"，
+        #: 缺省不装等于把它关掉，与 ``publish_allowed``/``innertest_roster_gate``
+        #: 同一条"没有默认放行"的纪律；漏接在构造期就是 ``TypeError``。
+        self._email_bindings = email_bindings
+        #: 预授权落库口（Issue #541，可选）。``None``＝未装配：首聊路径一行都不碰它；
+        #: **系统触发带了预授权却没装它时整链失败关闭**（见 ``import_preprovision_grant``）。
+        self._position_grants = position_grants
         self._lock = threading.Lock()
         self._running: dict[str, str] = {}
         #: 已经因为「通知没送到」释放过一次认领的事件。**每条事件只放回一次**：释放让下一轮
@@ -404,28 +424,6 @@ class AutoOnboardingRunner:
         #: 长时间不可用把执行器永久占满。第二次仍然送不到就记账收口，并留一条 ``failed``
         #: 后缀的响亮审计。
         self._released_for_notify: set[str] = set()
-
-    # ------------------------------------------------------------------
-    # 装配便捷方法
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_innertest_roster_gate(roster: frozenset[str]) -> Callable[[str], bool]:
-        """把已解析的内测名单集合包成 ``innertest_roster_gate`` 要的判定口。
-
-        纯粹的装配便利：把 ``core/identity/innertest_roster_gate.py`` 的纯判定函数
-        ``is_open_id_innertest_allowed`` 绑上一份具体的名单集合，返回本类构造时要的
-        ``Callable[[str], bool]``。判据、为什么匹配键是 open_id、为什么空集合＝全拒，
-        全部写在该模块自己的文档字符串里，本方法不重复。放在这里（而不是散落在
-        ``apps/scheduler/assembly.py`` 里手写一个 lambda）只是为了让装配点的那一行
-        足够短——``assembly.py`` 是本仓库棘轮登记的体量封顶文件（`scripts/ci/
-        size_ratchet_baseline.txt`），新增依赖时优先把可复用的胶水代码放在有余量的
-        地方，而不是继续往它里面堆代码。
-        """
-
-        from lingxi.core.identity.innertest_roster_gate import is_open_id_innertest_allowed
-
-        return lambda open_id: is_open_id_innertest_allowed(open_id, roster)
 
     # ------------------------------------------------------------------
     # OnboardingRunner 合同
@@ -505,6 +503,19 @@ class AutoOnboardingRunner:
             return _internal("executor_unavailable").as_result(trace_id=trace_id)
         return OnboardingResult(state=OnboardingState.STARTED)
 
+    def start_system(
+        self,
+        *,
+        email: str,
+        trace_id: str,
+        origin: str = ORIGIN_PREPROVISION,
+        initiated_by_open_id: str,
+        preprovision_grant: Any | None = None,
+    ) -> OnboardingResult:
+        """系统触发的开通入口（Issue #541 预开通，无入站消息）：按邮箱定位、账本 no-op、全程静默、**同步返回终态**；判定与写入逐字节共用 :meth:`_run`。整段实现、参数形状与立论见 :mod:`lingxi.core.identity.preprovision`。"""
+
+        return run_system_onboarding(self, email=email, trace_id=trace_id, origin=origin, initiated_by_open_id=initiated_by_open_id, preprovision_grant=preprovision_grant)
+
     def _release(self, open_id: str, event_id: str) -> None:
         with self._lock:
             if self._running.get(open_id) == event_id:
@@ -576,10 +587,10 @@ class AutoOnboardingRunner:
     # 执行线程
     # ------------------------------------------------------------------
 
-    def _execute(
-        self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None
-    ) -> None:
-        """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。"""
+    def _execute(self, *, event_id: str, open_id: str, trace_id: str, claim_token: Any = None, grant: PreprovisionGrant | None = None) -> _Terminal | None:
+        """跑完一条链、通知用户、记账。**异常不外抛**（它跑在执行线程上）。
+
+        返回这一次的终态（停机中止时 ``None``）：``start()`` 那条路不看它；系统触发那条路（Issue #541）要把它同步交回给批量脚本。"""
 
         # **§7.4 编排层当场收口的挂钩**（Issue #282）：``_run`` 在把这个人推进到
         # ``provisioning``（第 715 行的分水岭）之后才会写 ``stalled["user_id"]``——
@@ -591,7 +602,7 @@ class AutoOnboardingRunner:
         stalled: dict[str, str | None] = {"user_id": None}
         try:
             terminal = self._run(
-                event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled
+                event_id=event_id, open_id=open_id, trace_id=trace_id, stalled=stalled, grant=grant
             )
         except _ChainAborted:
             # 停机中止：放回认领，下一轮（或下次启动）从头重跑。整条链的每一步都幂等，
@@ -607,17 +618,17 @@ class AutoOnboardingRunner:
             terminal = _internal(error.code)
         except Exception as error:  # noqa: BLE001 - 未预料的失败也必须有用户结论
             self._audit.record(
-                "onboarding.chain_failed",
-                event_id=event_id,
-                error=type(error).__name__,
-                trace_id=trace_id,
+                "onboarding.chain_failed", event_id=event_id, error=type(error).__name__, trace_id=trace_id
             )
-            logger.exception("首次开通编排未预料的失败 event=%s", event_id)
+            # C-6：`logger.exception` 连异常正文一起记，psycopg 唯一键冲突正文带着真实 open_id（违 V-花名册-33）；只记类型名与调用栈帧。本行刻意压成单行，见 tests/test_log_exception_body_leak.py。
+            logger.error("首次开通编排未预料的失败 event=%s error=%s\n调用栈（不含异常正文）：\n%s", event_id, type(error).__name__, "".join(traceback.format_tb(error.__traceback__)))
             terminal = _internal(f"unexpected_{type(error).__name__}")
 
+        ledger = NULL_DISPATCH_LEDGER if is_system_trigger(event_id) else self._ledger  # Issue #541：系统触发没有 inbound_event 行，两个账本方法都没有对象
         self._audit.record(
             "onboarding.result",
             event_id=event_id,
+            origin=origin_of(event_id),
             state=terminal.state.value,
             failure_reason=terminal.reason,
             content_key=terminal.key,
@@ -666,7 +677,7 @@ class AutoOnboardingRunner:
             # ``failed`` 后缀的审计（见 ``_release_for_notify``），不会无声消失——
             # 但**不再**把它当成"当场收口"的触发条件（见上）。
             try:
-                self._ledger.mark_onboarding_dispatched(event_id=event_id)
+                ledger.mark_onboarding_dispatched(event_id=event_id)
             except Exception as error:  # noqa: BLE001 - 记不上账最坏只是被下一轮再捞一次
                 self._audit.record(
                     "onboarding.dispatch_record_failed",
@@ -674,6 +685,7 @@ class AutoOnboardingRunner:
                     error=type(error).__name__,
                     trace_id=trace_id,
                 )
+        return terminal
 
     def _notify(
         self,
@@ -686,6 +698,7 @@ class AutoOnboardingRunner:
         trace_id: str,
     ) -> bool:
         """主动私聊一条消息，**返回是否送达**。失败只留响亮审计，不改写终态。
+        系统触发（Issue #541 预开通）**不发消息、按送达处理**，见 :func:`~lingxi.core.identity.preprovision.deliver_silently`。
 
         有限重试而不是一次定生死：一次飞书抖动就让用户永远停在「已收到」，代价与收益完全
         不成比例。重试之间用注入的 ``sleep``，因此纯单测里一秒都不用等。
@@ -695,6 +708,8 @@ class AutoOnboardingRunner:
         不会互相去重掉。
         """
 
+        if is_system_trigger(event_id):
+            return deliver_silently(key=key, open_id=open_id, users=self._users)
         dedupe_key = f"onboarding:{suffix}{event_id}" if suffix else f"onboarding:{event_id}"
         for attempt in range(1, self._notify_attempts + 1):
             try:
@@ -830,6 +845,7 @@ class AutoOnboardingRunner:
         open_id: str,
         trace_id: str,
         stalled: dict[str, str | None],
+        grant: PreprovisionGrant | None = None,
     ) -> _Terminal:
         """一次开通的固定次序。每一步的失败去向都在这里显式返回。
 
@@ -876,6 +892,25 @@ class AutoOnboardingRunner:
             return matched
         request, aggregate = matched
 
+        # **同邮箱已绑给另一个人**（rc25 S-2a，对抗审查 X-1）：挡在**建档之前**——
+        # 早于任何数据库写入、早于令牌签发/采纳（``_issue_token`` 会按邮箱把正式表
+        # 存量行里**别人的**密文采纳过来）、早于存量差集导入、也早于任何发布意图。
+        # 判据是 ``feishu_open_id``（建档之前本人还没有 ``app_user.id``）；"为什么
+        # 不等迁移 0085 的唯一索引在写入时拒绝"见
+        # ``core/identity/onboarding_guards.reject_email_bound_to_another_person``。
+        # 放在 ``_run`` 的公共段而不是某条入口分支里：这条链会被「收到首聊消息」与
+        # Issue #541 的「预开通」（系统触发、无入站消息）共同复用，挂在分支上的闸对
+        # 第二条路径等于不存在。
+        bound_elsewhere = reject_email_bound_to_another_person(
+            open_id,
+            request.email,
+            bindings=self._email_bindings,
+            audit=self._audit,
+            trace_id=trace_id,
+        )
+        if bound_elsewhere is not None:
+            return bound_elsewhere
+
         self._stop_guard()
         provisioned = self._provision(request)
         if isinstance(provisioned, _Terminal):
@@ -886,6 +921,10 @@ class AutoOnboardingRunner:
             user_id, aggregate=aggregate, trace_id=trace_id
         )
         if recheck is not None:
+            if grant is not None and recheck.state is OnboardingState.COMPLETED:
+                # rc25 修复包 F2：已 active 提前收口，名单预授权没走到下面的落库口。
+                # 绝不静默扩权，只如实标注给批量清单（语义见 OnboardingResult 文档）。
+                return replace(recheck, grant_not_applied=True)
             return recheck
 
         # 银河翻译只算一次（rc25 S-1），翻译失败在这里 fail-closed（早于令牌与环境）。
@@ -902,12 +941,22 @@ class AutoOnboardingRunner:
                 user_id, lookup, aggregate, galaxy_map, open_id=open_id, trace_id=trace_id
             )
 
+        if grant is not None:
+            # 预开通那一笔预授权（Issue #541）：与 S-1 差集导入**同一个挂点**，且同样排在
+            # 零银河判定**之前**——名单里"银河零权限、靠预授权吃饭"的人，先判零权限就会被
+            # 整批拒绝。落库口没装配时整链失败关闭，见该函数文档。
+            import_preprovision_grant(self._position_grants, grant, user_id=user_id, open_id=open_id, now=self._clock(), audit=self._audit, trace_id=trace_id)
+
         if not aggregate.granted:
             # 零银河权限：现在才有 `app_user.id`，查一次**本地授权**。放在
             # 令牌签发/用户环境创建**之前**——不为一个最终会被拒绝的人签发
             # 问数 MCP 令牌、写一份带凭据的用户环境。
-            rejected = self._reject_zero_galaxy_without_local_grant(
-                user_id, aggregate, trace_id=trace_id
+            rejected = reject_zero_galaxy_without_local_grant(
+                user_id,
+                aggregate,
+                resolve_local_overrides=self._resolve_local_overrides,
+                audit=self._audit,
+                trace_id=trace_id,
             )
             if rejected is not None:
                 return rejected
@@ -1128,52 +1177,6 @@ class AutoOnboardingRunner:
             self._audit.record("onboarding.already_active", user=user_id, trace_id=trace_id)
             return self._completed(serialize_permissions(aggregate))
         return None
-
-    # ---- 5.5 零银河权限的本地授权兜底（PM 2026-08-29 裁定，Issue #419）--------
-
-    def _reject_zero_galaxy_without_local_grant(
-        self, user_id: str, aggregate: Any, *, trace_id: str
-    ) -> _Terminal | None:
-        """零银河权限用户提前查一次**本地授权**：合并结果非空（管理员兜底赋权）
-        → 返回 ``None``，放行继续正常链路（令牌签发、用户环境、`_publish` 会再
-        做一次同样的合并并真正结算发布行——见 `_publish` 里的对应分支，这里
-        重复一次查询换来的是"不为一个注定被拒绝的人签发令牌、建环境"，取舍见
-        下）；合并结果仍为空 → 返回"无可用银河权限"的确定性业务失败终态，
-        **在这里**拒绝——早于 `_issue_token`/`_create_environment`，不为一个
-        注定被拒绝的人签发问数 MCP 令牌、不创建带凭据的用户环境。
-
-        **为什么在这里而不是 `_publish`**：`_publish` 需要已签发的令牌
-        （`issued.token_cipher` 要写进发布行），因此结构上只能排在令牌签发**之后**；
-        零银河用户里绝大多数既无银河也无本地授权（`aggregate.granted` 为假的
-        用户里，只有极少数会恰好也被管理员发过本地授权），把最终判定放在这里能
-        让大多数人在签发令牌/建环境之前就了结，换来的代价是"确实有本地授权兜底
-        的那一小撮人"会被查两次本地覆盖（一次这里、一次 `_publish`）——两次都是
-        只读查询，且第二次结果理论上应当与这次一致（除非管理员在这两步之间的
-        极短窗口收回了授权，那种情况下 `_publish` 会用它自己重新算出的结果，
-        不会用这次的陈旧结论）。
-
-        **不翻译**：`aggregate.granted` 为假时 `aggregate.companies`/`functions`
-        恒为空（`PermissionAggregate.__post_init__` 的不变式），`translate_
-        company_functions` 对空输入直接拒绝（那是"参数缺失"，不是"没有内容"，
-        见其自身校验），因此银河这一侧对合并的贡献直接是 ``{}``，不经过翻译层。
-        这也是这条分支不受 `publish_allowed` 闸门约束的理由——那道闸只保护"银河
-        内容需要翻译才能安全发布"这件事，零银河用户没有银河内容，与改动前"零银河
-        用户结构上从不到达 `publish_allowed` 检查"逐字节一致（见 `_match`）。
-        """
-
-        local = self._resolve_local_overrides(user_id)
-        # `full_access_wildcard` 现在是必填关键字参数（Trace #445 结构性防复发：
-        # 默认值曾是一次真实漏接的根因）——这条分支 `galaxy` 恒为空字典，取值
-        # 对结果没有作用面，仍必须显式传参。
-        merged = merge_permission_sources(galaxy={}, local=local, full_access_wildcard=True)
-        for reason in merged.skipped_reasons:  # 通配角 v1 结构上不会出现（galaxy 恒为空）
-            self._audit.record("onboarding.local_override_skipped", user=user_id, reason=reason)
-        if merged.permissions:
-            return None
-        self._audit.record(
-            "onboarding.no_local_grant_after_zero_galaxy", user=user_id, trace_id=trace_id
-        )
-        return _not_authorized(aggregate.reason)
 
     # ---- 6. 令牌 + 用户环境 ---------------------------------------------
 

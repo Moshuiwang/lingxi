@@ -9,6 +9,9 @@
 ②b（Issue #353）幂等判据封死"外部写成功但检查点未推进"的崩溃窗口：注入"正文
    已经写入飞书、但进程在写检查点之前崩溃"，续做时读回正文根 block 判定非空，
    跳过重驱 ``write_paragraphs``，正文全程单份；
+②c（Trace #544 S-7c）换成「服务端一次建档写全文」之后，②b 那条判据仍然成立且
+   仍然有判别力，超时不重试建档、长度前置守卫先降级——见
+   ``DocxOneShotCreateGatewayWiringTest``（不需要真库，传输层注入）；
 ③ ``read_members`` 不含目标 open_id 或档位不是 ``full_access`` → ``uncertain``，
    不得判 ``succeeded``；
 ④ definite 错误（飞书明确拒绝）→ ``failed`` + ``last_error``；
@@ -40,7 +43,15 @@
 - 把 ``adapters/postgres_document_delivery.py`` 四个 ``mark_*`` 的 ``rowcount``
   检查删掉（静默无视 0 行）→ ⑦红（``docx.write_calls``/``grant_calls``/
   ``read_calls`` 会变成非空，``notifier.sent`` 也会非空，且 ``document_id`` 会被
-  慢消费者的建档结果覆盖）。
+  慢消费者的建档结果覆盖）；
+- 把 ``adapters/feishu_docx_delivery.py`` 的 :data:`MAX_MARKDOWN_CHARS` 前置守卫
+  删掉 → ②c 的"超长正文"用例红（会真的去发一次建档调用，也就是去撞 504）；
+- 把默认传输层"HTTP 5xx 不解析响应体、判结果不明"改回照常解析 → ②c 的"超时"
+  用例红（504 被当成确定性拒绝落 ``failed``，而那次调用其实可能已经建出了一篇
+  完整文档）；
+- 把允许改走段落路径的捕获范围从 ``PRE_FLIGHT_DEGRADE_REASONS`` 放宽成"任何
+  ``FeishuDocxDeliveryError``" → ②c 的"超时"用例红（会出现第二次建档调用）；
+- 把降级判据只绑在 ``data.warnings`` 上 → ②c 的 ``partial_success`` 用例红。
 """
 
 from __future__ import annotations
@@ -54,9 +65,15 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from docx_body_sample import COMPREHENSIVE_MARKDOWN, COMPREHENSIVE_VERBATIM_TEXTS
 from postgres_schema import ensure_production_schema, psycopg_available, reset_production_rows
 
-from lingxi.adapters.feishu_docx_delivery import FeishuDocxDeliveryError, LarkDocxDelivery
+from lingxi.adapters.feishu_docx_delivery import (
+    MAX_MARKDOWN_CHARS,
+    CreatedDocument,
+    FeishuDocxDeliveryError,
+    LarkDocxDelivery,
+)
 from lingxi.adapters.feishu_user_message import FeishuUserMessages
 from lingxi.adapters.postgres import connect
 from lingxi.adapters.postgres_conversation import PostgresTaskQueue
@@ -117,20 +134,51 @@ class _SpyDocx:
     现求值一次），供需要"每次结果不同"或"抛异常"的用例复用同一个构造签名。
     """
 
-    def __init__(self, *, create_result: Any = "doc-1", members: Any = ()) -> None:
+    def __init__(
+        self,
+        *,
+        create_result: Any = "doc-1",
+        members: Any = (),
+        markdown_convert_enabled: bool = False,
+        one_shot_result: Any = None,
+    ) -> None:
         self.create_calls: list[str] = []
+        self.one_shot_calls: list[tuple[str, str]] = []
         self.write_calls: list[tuple[str, list[str]]] = []
         self.grant_calls: list[tuple[str, str]] = []
         self.read_calls: list[str] = []
         self.read_body_children_calls: list[str] = []
         self._create_result = create_result
         self._members = members
+        self._markdown_convert_enabled = markdown_convert_enabled
+        self._one_shot_result = one_shot_result
+
+    @property
+    def markdown_convert_enabled(self) -> bool:
+        """止损闸（Trace #544 S-7c）：默认 ``False``——既有用例的行为逐字不变，
+        走的仍然是 ``create_document`` + ``write_paragraphs`` 两步段落路径。"""
+
+        return self._markdown_convert_enabled
 
     def create_document(self, title: str) -> str:
         self.create_calls.append(title)
         if callable(self._create_result):
             return self._create_result()
         return self._create_result
+
+    def create_document_with_markdown(self, title: str, markdown: str) -> Any:
+        """一次建档写全文的假实现（Trace #544 S-7c）：建档与写正文是**同一次
+        调用**，所以这里同时记一次 ``create_calls`` 与一次 ``write_calls``——
+        ``read_body_children`` 的幂等判据据此照实反映"正文写过没有"，与生产
+        实现（读飞书真实 block 列表）语义一致。"""
+
+        self.one_shot_calls.append((title, markdown))
+        if callable(self._one_shot_result):
+            return self._one_shot_result()
+        self.create_calls.append(title)
+        document_id = self._create_result() if callable(self._create_result) else self._create_result
+        self.write_calls.append((document_id, [markdown]))
+        return self._one_shot_result or CreatedDocument(document_id=document_id)
 
     def write_paragraphs(self, document_id: str, paragraphs: list[str]) -> None:
         self.write_calls.append((document_id, list(paragraphs)))
@@ -1097,7 +1145,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
 
     def test_resent_notice_for_a_degraded_row_still_says_the_format_was_simplified(self) -> None:
         """Issue #499：补发通知是**另一次进程调用**，看不到原发送那次
-        ``write_body`` 的内存信号——它必须从库里读 ``body_degraded_reason``
+        写正文的内存信号——它必须从库里读 ``body_degraded_reason``
         （迁移 0082）才知道要用明示降级的文案。
 
         变异锚点：把 ``claim_unnotified_succeeded`` 的 SELECT 里
@@ -1131,7 +1179,7 @@ class DocumentDeliveryTransportTestCase(unittest.TestCase):
     def test_mark_body_degraded_persists_the_reason_and_claim_pending_reads_it_back(self) -> None:
         """迁移 0082 的检查点列真库往返：``mark_body_degraded`` 单独提交之后，
         下一次认领必须把原因码带回 :class:`DocumentDeliveryClaim`——检查点恢复
-        路径会跳过写正文步、拿不到那次 ``write_body`` 的返回值，只能靠这一列。
+        路径会跳过写正文步、拿不到那次写入的返回值，只能靠这一列。
         """
 
         self._seed_pending_request(request_id="tdd-degrade-checkpoint")
@@ -1703,29 +1751,38 @@ class TenantDomainNotConfiguredSentinelTest(unittest.TestCase):
         self.assertIsInstance(result, DocumentDeliveryConsumer)
 
 
-class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
-    """Issue #408 正式方案接线：证明 gateway 配置 → ``LarkDocxDelivery`` 构造 →
-    ``DocumentDeliveryConsumer._process_docx_claim`` 的分支决策 → 真实 HTTP 调用
-    形状是逐段接起来的一整条链路，不只是"各自的单元测试都通过"。转换开关自身
-    的分支语义（成功/超限/业务错误码分别产生什么调用序列）已由
-    ``tests/test_feishu_docx_delivery.py::WriteBodySwitchTest`` 在适配器层验证
-    过，本类不重复；只钉住 gateway 这一层特有的决策：**``claim.markdown`` 是否
-    非 ``None`` 才决定要不要调用 ``write_body``**，与转换开关状态无关。不接触
-    数据库或网络（传输层全部注入）。
+class DocxOneShotCreateGatewayWiringTest(unittest.TestCase):
+    """Trace #544 S-7c 接线：gateway 配置 → ``LarkDocxDelivery`` 构造 →
+    ``DocumentDeliveryConsumer._process_docx_claim`` 的分派 → 真实 HTTP 调用
+    形状，逐段接起来的一整条链路（不只是"各自的单元测试都通过"）。适配器层的
+    分支语义（``result``/``warnings`` 怎么判、两道前置守卫）已由
+    ``tests/test_feishu_docx_delivery.py::CreateDocumentWithMarkdownTest`` 钉住，
+    本类只验 gateway 这一层特有的决策与副作用顺序。不接触数据库或网络（传输层
+    全部注入）。
 
-    覆盖四条分支（任务卡登记的测试矩阵）：
-    - 开关关 + markdown 非空 → 段落路径零变化；
-    - 开关开 + markdown 非空 → 转换成功；
-    - 开关开 + markdown 非空 + 飞书明确拒绝转换 → 失败关闭，沿用既有 definite
-      分类，不静默退回段落路径；
-    - markdown 为 ``None``（不论开关状态）→ 无条件回退段落路径。
+    覆盖的分支：
 
-    变异锚点：把 ``_process_docx_claim`` 里 ``if claim.markdown is not None``
-    的判断删掉、改成恒调用 ``write_body``——最后一条用例（NULL markdown）会从
-    "只发生 4 次调用、没有 convert"变红成"发生 convert 调用后因空 markdown
-    被 ``convert_markdown_to_blocks`` 判定为空正文而失败"；把判断写反（改成
-    ``is None`` 才调用 ``write_body``）——前两条用例会互换预期，"开关关零变化"
-    那条会变成发生 convert 调用。
+    - 止损闸开 ＋ markdown 非空 → **一次建档**写全文，全程只 3 次外部调用；
+    - 服务端自陈降级（``result="partial_success"``）→ 落 ``body_degraded_reason``
+      ＋ 明示降级的用户文案；
+    - **长度前置守卫命中** → 零次一次建档调用，改走两步段落路径，降级检查点
+      在写正文**之前**提交；
+    - **一次建档超时（HTTP 504）** → ``uncertain``、**只发生一次建档尝试**、
+      不改走段落路径（否则会建出第二篇文档）；
+    - 止损闸关 ＋ markdown 非空 → 两步段落路径，**不报降级**；
+    - ``markdown`` 为 ``NULL`` → 无条件两步段落路径，与止损闸状态无关；
+    - 检查点恢复路径继承已落库的降级原因。
+
+    变异锚点：
+
+    - 把 ``_create_docx_body`` 里 ``if claim.markdown is not None and
+      self._docx.markdown_convert_enabled`` 的 markdown 判断删掉 → NULL markdown
+      那条用例变红（会真的去发一次建档调用）；
+    - 把允许改路的捕获从 ``PRE_FLIGHT_DEGRADE_REASONS`` 放宽成"任何
+      ``FeishuDocxDeliveryError`` 都改走段落路径" → 超时那条用例变红（会看到
+      第二次建档调用，也就是第二篇文档）；
+    - 把长度守卫命中后的 ``mark_body_degraded`` 删掉 → 守卫那条用例变红；
+    - 把降级判据只绑在 ``warnings`` 上 → ``partial_success`` 那条用例变红。
     """
 
     BASE_URL = "https://feishu.invalid/open-apis"
@@ -1742,16 +1799,20 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
             markdown_convert_enabled=markdown_convert_enabled,
         )
 
-    def _claim(self, *, markdown: str | None) -> DocumentDeliveryClaim:
+    def _claim(
+        self, *, markdown: str | None, document_id: str | None = None,
+        body_degraded_reason: str | None = None, title: str = "标题",
+    ) -> DocumentDeliveryClaim:
         return DocumentDeliveryClaim(
             id="tdd-wire-1",
             task_id="tsk-wire-1",
             requester_open_id=self.OPEN_ID,
-            title="标题",
+            title=title,
             paragraphs=("正文段落",),
-            document_id=None,
+            document_id=document_id,
             attempts=1,
             markdown=markdown,
+            body_degraded_reason=body_degraded_reason,
         )
 
     def _create_document_response(self) -> dict[str, Any]:
@@ -1760,29 +1821,17 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
             "data": {"document": {"document_id": self.DOCUMENT_ID, "revision_id": 1, "title": "标题"}},
         }
 
+    def _one_shot_response(self, **data: Any) -> dict[str, Any]:
+        document = {
+            "document_id": self.DOCUMENT_ID,
+            "revision_id": 3,
+            "url": f"https://{self.TENANT_DOMAIN}/docx/{self.DOCUMENT_ID}",
+        }
+        return {"code": 0, "msg": "", "data": {"document": document, **data}}
+
     @staticmethod
     def _children_write_response() -> dict[str, Any]:
         return {"code": 0, "data": {}}
-
-    @staticmethod
-    def _convert_response() -> dict[str, Any]:
-        # Issue #442：真实响应形状——每个块携带只读 block_id，真实顺序由
-        # first_level_block_ids 给出（本夹具只有一个块，顺序无歧义，但形状要
-        # 与探针实测对齐，否则会被 convert_markdown_to_blocks 的防御性拒绝
-        # 判定为 first_level_block_ids 缺失）。
-        return {
-            "code": 0,
-            "data": {
-                "blocks": [
-                    {
-                        "block_id": "blk-converted-1",
-                        "block_type": 2,
-                        "text": {"elements": [{"text_run": {"content": "转换后正文"}}]},
-                    }
-                ],
-                "first_level_block_ids": ["blk-converted-1"],
-            },
-        }
 
     @staticmethod
     def _grant_response() -> dict[str, Any]:
@@ -1794,9 +1843,155 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
             "data": {"items": [{"member_type": "openid", "member_id": self.OPEN_ID, "perm": "full_access"}]},
         }
 
-    def test_switch_off_with_markdown_present_takes_the_paragraph_path_unchanged(self) -> None:
-        """开关关：即使这一行带着 markdown 原文，也必须逐字沿用段落路径——只
-        应该看到一次 children 插入调用，绝不会发生 blocks/convert 调用。"""
+    def _read_body_children_response(self, *, empty: bool) -> dict[str, Any]:
+        items = [] if empty else [{"block_id": "blk-1", "block_type": 2}]
+        return {"code": 0, "data": {"has_more": False, "items": items}}
+
+    def _consume(
+        self, transport: Any, claim: DocumentDeliveryClaim, *, markdown_convert_enabled: bool = True
+    ) -> tuple[_RecordingDeliveryStore, _SpyNotifier]:
+        store = _RecordingDeliveryStore()
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(
+            store=store,
+            docx=self._docx(transport, markdown_convert_enabled=markdown_convert_enabled),
+            notifier=notifier,
+        )
+        consumer._process_docx_claim(claim)
+        return store, notifier
+
+    def test_switch_on_with_markdown_creates_the_document_and_body_in_a_single_call(self) -> None:
+        """一次建档写全文：整条投递只剩 **3** 次外部调用（建档＋正文、授权、
+        读回），既没有 ``blocks/convert``、也没有 ``children``/``descendant``
+        写块调用。正文用共用综合样本，逐字送出。"""
+
+        transport = _RecordingUserMessageTransport(
+            [self._one_shot_response(), self._grant_response(), self._read_members_response()]
+        )
+        claim = self._claim(markdown=COMPREHENSIVE_MARKDOWN)
+
+        store, notifier = self._consume(transport, claim)
+
+        self.assertEqual(len(transport.calls), 3)
+        method, url, body, _ = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{self.BASE_URL}/docs_ai/v1/documents")
+        assert body is not None
+        self.assertEqual(body["format"], "markdown")
+        self.assertTrue(body["content"].startswith("<title>标题</title>\n\n"))
+        for verbatim in COMPREHENSIVE_VERBATIM_TEXTS:
+            if verbatim in COMPREHENSIVE_MARKDOWN:
+                self.assertIn(verbatim, body["content"])
+        for _, called_url, _, _ in transport.calls:
+            self.assertNotIn("blocks/convert", called_url)
+            self.assertNotIn("descendant", called_url)
+            self.assertNotIn("/children", called_url)
+        self.assertEqual(store.document_created, [("tdd-wire-1", self.DOCUMENT_ID, None)])
+        self.assertEqual(store.body_degraded, [], "干净成功不得报降级")
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertNotIn("格式做了简化", notifier.sent[0][1])
+
+    def test_server_reported_partial_success_is_persisted_and_told_to_the_user(self) -> None:
+        """服务端自陈降级（``result="partial_success"``、**没有** warnings）：
+        文档照常交付，但原因码必须落库、用户必须被告知格式已简化。
+
+        「有 warnings 才算降级」这个变异会让这条用例变红——探针实测原始 HTML 块
+        被静默丢弃且不产生 warning，只看 warnings 会漏报。
+        """
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._one_shot_response(result="partial_success"),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        store, notifier = self._consume(transport, claim)
+
+        self.assertEqual(store.body_degraded, [("tdd-wire-1", "server_simplified_body")])
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertIn("格式做了简化", notifier.sent[0][1])
+        self.assertEqual(notifier.sent[0][2], "document-ready:tdd-wire-1")
+        # rc25 S-5c：服务端自陈降级走 delivery.document_ready_simplified，
+        # **不得**出现段落路径那条文案里的两句——文档其实仍然带格式（"已按纯文本
+        # 段落交付"是假话），而服务端静默丢块时"内容本身没有删减"可能失实。
+        # 把分派改回单条文案 → 这两句断言变红。
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
+        self.assertNotIn("已按纯文本段落交付", notifier.sent[0][1])
+        self.assertIn("个别不支持的结构可能没有呈现出来", notifier.sent[0][1])
+
+    def test_an_over_long_body_degrades_before_the_one_shot_call_and_takes_the_paragraph_path(self) -> None:
+        """**长度前置守卫**：正文超过 ``MAX_MARKDOWN_CHARS`` 时**一次建档调用
+        一次都不发**，改走两步段落路径并明示降级。
+
+        守卫存在的理由是探针实测的那次 504：超长正文建档超时，**服务端其实已经
+        把整篇文档建出来了**、调用方拿不到 id。守卫删掉 → 这条用例变红（会看到
+        一次 ``docs_ai`` 调用）。
+
+        顺带钉住副作用顺序：降级检查点在**写正文之前**提交——先写后落时一次
+        崩溃会把降级信号带走，恢复路径会发出不带降级说明的"文档已生成"。
+        """
+
+        events: list[str] = []
+
+        class _OrderedStore(_RecordingDeliveryStore):
+            def mark_body_degraded(self, *, request_id: str, reason: str) -> None:
+                events.append("degrade_checkpoint")
+                super().mark_body_degraded(request_id=request_id, reason=reason)
+
+        class _OrderedTransport(_RecordingUserMessageTransport):
+            def __call__(self, method: str, url: str, *, body=None, token=None):
+                if method == "POST" and url.endswith("/children"):
+                    events.append("write_paragraphs")
+                return super().__call__(method, url, body=body, token=token)
+
+        transport = _OrderedTransport(
+            [
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        store = _OrderedStore()
+        notifier = _SpyNotifier()
+        consumer = DocumentDeliveryConsumer(
+            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
+        )
+        claim = self._claim(markdown="正" * (MAX_MARKDOWN_CHARS + 1))
+
+        consumer._process_docx_claim(claim)
+
+        self.assertEqual(len(transport.calls), 4)
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(transport.calls[0][1], f"{self.BASE_URL}/docx/v1/documents")
+        self.assertEqual(
+            transport.calls[1][1],
+            f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
+        )
+        self.assertEqual(store.body_degraded, [("tdd-wire-1", "body_too_long")])
+        self.assertEqual(events, ["degrade_checkpoint", "write_paragraphs"], "降级检查点必须在写正文之前提交")
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertIn("格式做了简化", notifier.sent[0][1])
+        # rc25 修复包 F4：这一路的真实原因是**长度**，不是"回答里有暂时无法排版
+        # 的结构"——旧文案对这个来源是假归因。按来源分派专条、如实说超长；同时
+        # 不再承诺"内容本身没有删减"（对新增来源不作我们无法逐字验证的担保）。
+        # 把分派收回单条旧文案 → 这三句断言变红。
+        self.assertIn("超出了带格式排版的长度上限", notifier.sent[0][1])
+        self.assertNotIn("无法排版的结构", notifier.sent[0][1])
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
+
+    def test_an_unembeddable_title_degrades_with_a_truthful_title_attribution(self) -> None:
+        """**标题前置守卫的文案归因**（rc25 修复包 F4）：``title_not_embeddable``
+        的真实原因是标题形态（含 ``<``/``>``，嵌不进一次排版写入的标题标签），
+        不是"回答里有暂时无法排版的结构"——归因按来源如实分派专条，且不承诺
+        "内容本身没有删减"。守卫本身照旧：一次建档调用一次都不发，改走两步
+        段落路径并落 ``title_not_embeddable`` 检查点。"""
 
         transport = _RecordingUserMessageTransport(
             [
@@ -1806,236 +2001,211 @@ class DocxMarkdownConvertGatewayWiringTest(unittest.TestCase):
                 self._read_members_response(),
             ]
         )
-        store = _RecordingDeliveryStore()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=False), notifier=_SpyNotifier()
+        claim = self._claim(markdown="# 标题\n\n正文段落", title="含<尖括号>的标题")
+
+        store, notifier = self._consume(transport, claim)
+
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(store.body_degraded, [("tdd-wire-1", "title_not_embeddable")])
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+        self.assertIn("标题里含有带格式排版暂不支持的特殊字符", notifier.sent[0][1])
+        self.assertIn("格式做了简化", notifier.sent[0][1])
+        self.assertNotIn("无法排版的结构", notifier.sent[0][1])
+        self.assertNotIn("内容本身没有删减", notifier.sent[0][1])
+
+    def test_a_gateway_timeout_is_uncertain_and_never_creates_a_second_document(self) -> None:
+        """**超时一律不重试建档**：一次建档返回 HTTP 504（响应体带
+        ``code=2200``）时，本轮只发生**一次**建档尝试，落 ``uncertain``（按
+        ``V-交付-03`` 不自动重试、不会被再次认领），**绝不**改走段落路径。
+
+        探针实测那次 504 的服务端其实已经把整篇文档建出来了。放宽捕获范围让
+        超时也去走段落路径 → 这条用例变红（会看到第二次建档调用，也就是第二
+        篇文档）。
+        """
+
+        transport = _RecordingUserMessageTransport(
+            [
+                FeishuDocxDeliveryError("http_504", definite=False),
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
         )
         claim = self._claim(markdown="# 标题\n\n正文段落")
 
-        consumer._process_docx_claim(claim)
+        store, notifier = self._consume(transport, claim)
+
+        self.assertEqual(len(transport.calls), 1, "超时之后不得再发起任何调用——第二次建档就是第二篇文档")
+        self.assertEqual(transport.calls[0][1], f"{self.BASE_URL}/docs_ai/v1/documents")
+        self.assertEqual(store.uncertain, [("tdd-wire-1", "http_504")])
+        self.assertEqual(store.failed, [], "504 不证明请求没有生效，不能记成确定性失败")
+        self.assertEqual(store.succeeded, [])
+        self.assertEqual(store.document_created, [], "没拿到 document_id 就没有检查点可落")
+        self.assertEqual(store.body_degraded, [])
+        self.assertEqual([text for _, text, _ in notifier.sent], ["文档生成结果暂无法确认，已转人工核对。"])
+
+    def test_a_definite_rejection_of_the_one_shot_call_fails_closed_without_a_paragraph_retry(self) -> None:
+        """一次建档被飞书确定性拒绝：沿用既有 definite 分类判 ``failed``，
+        **不**静默退回段落路径（那会把一次真实故障吞成"交付成功"）。"""
+
+        transport = _RecordingUserMessageTransport([{"code": 1770001, "msg": "invalid param"}])
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        store, _ = self._consume(transport, claim)
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(store.failed, [("tdd-wire-1", "feishu_code_1770001")])
+        self.assertEqual(store.succeeded, [])
+
+    def test_switch_off_with_markdown_present_takes_the_paragraph_path_and_is_not_a_degrade(self) -> None:
+        """止损闸关：即使这一行带着 markdown 原文，也必须走两步段落路径，而且
+        **不报降级**——那是这套部署本来就要求的排版，不是降级。"""
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._create_document_response(),
+                self._children_write_response(),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        claim = self._claim(markdown="# 标题\n\n正文段落")
+
+        store, notifier = self._consume(transport, claim, markdown_convert_enabled=False)
 
         self.assertEqual(len(transport.calls), 4)
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
         _, write_url, write_body, _ = transport.calls[1]
         self.assertEqual(
             write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
         )
         self.assertEqual(
             write_body,
-            {
-                "children": [
-                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}
-                ],
-                "index": 0,
-            },
+            {"children": [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}], "index": 0},
         )
+        self.assertEqual(store.body_degraded, [])
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
-        self.assertEqual(store.failed, [])
+        self.assertNotIn("格式做了简化", notifier.sent[0][1])
 
-    def test_switch_on_with_markdown_present_converts_then_succeeds(self) -> None:
-        """开成功：转换开关打开、这一行带着 markdown 原文——依次发生 convert
-        调用与用转换结果写入的 children 插入调用，最终判定成功。"""
+    def test_null_markdown_falls_back_to_paragraphs_regardless_of_the_switch_state(self) -> None:
+        """NULL markdown 回退段落：即使止损闸打开，这一行的 ``markdown`` 列是
+        ``NULL``（历史行、或登记侧未能落上原文）也必须无条件回退段落路径——
+        判据是 ``claim.markdown is None``，与止损闸状态无关。而且**不报降级**：
+        这条路上本来就没有 markdown 可排版。"""
 
         transport = _RecordingUserMessageTransport(
             [
                 self._create_document_response(),
-                self._convert_response(),
                 self._children_write_response(),
                 self._grant_response(),
                 self._read_members_response(),
             ]
         )
-        store = _RecordingDeliveryStore()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
-        )
-        claim = self._claim(markdown="# 标题\n\n正文段落")
+        claim = self._claim(markdown=None)
 
-        consumer._process_docx_claim(claim)
+        store, _ = self._consume(transport, claim)
 
-        self.assertEqual(len(transport.calls), 5)
-        _, convert_url, convert_body, _ = transport.calls[1]
-        self.assertEqual(convert_url, f"{self.BASE_URL}/docx/v1/documents/blocks/convert")
-        self.assertEqual(convert_body, {"content_type": "markdown", "content": "# 标题\n\n正文段落"})
-        _, write_url, write_body, _ = transport.calls[2]
-        self.assertEqual(
-            write_url, f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children"
-        )
-        # 写入端点收到的必须是剔除只读 block_id 后的块，不是转换响应原样。
-        self.assertEqual(
-            write_body["children"],
-            [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "转换后正文"}}]}}],
-        )
+        self.assertEqual(len(transport.calls), 4, "不该发生任何一次建档调用")
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(store.body_degraded, [])
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
         self.assertEqual(store.failed, [])
 
-    def test_switch_on_convert_failure_fails_closed_via_the_existing_definite_classification(
-        self,
-    ) -> None:
-        """开失败关闭：转换调用收到飞书明确的业务错误码——沿用状态机既有的
-        definite 分类判 ``failed``，绝不静默退回段落路径（因此不会再发生任何
-        grant/read 调用）。"""
+    def test_checkpoint_recovery_with_a_written_body_never_creates_or_writes_again(self) -> None:
+        """幂等（重驱不产生第二篇文档）：检查点恢复路径读回正文根 block 非空
+        → 既不重新建档、也不重写正文，只续做授权与读回。
 
-        transport = _RecordingUserMessageTransport(
-            [self._create_document_response(), {"code": 99991400, "msg": "rate limited"}]
-        )
-        store = _RecordingDeliveryStore()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
-        )
-        claim = self._claim(markdown="# 标题\n\n正文段落")
-
-        consumer._process_docx_claim(claim)
-
-        self.assertEqual(len(transport.calls), 2, "convert 失败后不该再发生 grant/read 调用")
-        self.assertEqual(store.succeeded, [])
-        self.assertEqual(store.failed, [("tdd-wire-1", "feishu_code_99991400")])
-        self.assertEqual(store.document_created, [("tdd-wire-1", self.DOCUMENT_ID, None)])
-
-    @staticmethod
-    def _unsupported_nested_convert_response() -> dict[str, Any]:
-        """真实表格的响应形状：单元格作为独立元素出现在 ``blocks`` 里、却不在
-        ``first_level_block_ids`` 内 → ``unsupported_nested_blocks``。"""
-
-        return {
-            "code": 0,
-            "data": {
-                "blocks": [
-                    {"block_id": "blk-table", "block_type": 31, "table": {"column_size": 2}},
-                    {"block_id": "blk-table-cell", "block_type": 32},
-                ],
-                "first_level_block_ids": ["blk-table"],
-            },
-        }
-
-    def test_switch_on_unsupported_nested_blocks_degrades_delivers_and_tells_the_user(self) -> None:
-        """Issue #499 的 gateway 端核心用例（产品负责人 2026-08-31 裁定）：回答
-        里含表格时**不再整次失败**——转换被拒后改写段落、继续授权与读回、判成功，
-        并且给用户的就绪通知换成明示"格式已简化"的那条文案。
-
-        **同时是"孤儿文档不再产生"的证据**：命中失败的旧行为里，转换在写正文步
-        就抛了，``grant_full_access`` 从never执行——飞书云盘里每失败一次就多留
-        一篇空的、未授权、谁也打不开的文档（#499 W0-1 新发现）。这里断言第 4 次
-        调用确实是授权端点，即那篇文档已经被正常写入并授予给提问用户。
+        判据被破坏（例如恢复路径无条件重写、或判空方向写反）→ 这条用例变红。
         """
 
         transport = _RecordingUserMessageTransport(
             [
-                self._create_document_response(),
-                self._unsupported_nested_convert_response(),
+                self._read_body_children_response(empty=False),
+                self._grant_response(),
+                self._read_members_response(),
+            ]
+        )
+        claim = self._claim(markdown=COMPREHENSIVE_MARKDOWN, document_id=self.DOCUMENT_ID)
+
+        store, _ = self._consume(transport, claim)
+
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(
+            transport.calls[0][1],
+            f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
+        )
+        self.assertEqual(transport.calls[0][0], "GET")
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(store.document_created, [], "恢复路径绝不二次建档")
+        self.assertEqual(store.succeeded, ["tdd-wire-1"])
+
+    def test_checkpoint_recovery_with_an_empty_body_still_writes_it(self) -> None:
+        """**幂等判据仍然有判别力，不是恒真**：两步段落路径真的会留下"建了档、
+        正文还没写"的中间态（``create_document`` 与 ``write_paragraphs`` 之间
+        崩溃），恢复到这里时必须把正文补上。
+
+        把判据改成恒真（"文档存在即正文已写"）→ 这条用例变红（正文永远补不上，
+        用户拿到一篇空文档）。
+        """
+
+        transport = _RecordingUserMessageTransport(
+            [
+                self._read_body_children_response(empty=True),
                 self._children_write_response(),
                 self._grant_response(),
                 self._read_members_response(),
             ]
         )
-        store = _RecordingDeliveryStore()
-        notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
-        )
-        claim = self._claim(markdown="| 公司 | 指标 |\n| --- | --- |")
+        claim = self._claim(markdown=COMPREHENSIVE_MARKDOWN, document_id=self.DOCUMENT_ID)
 
-        consumer._process_docx_claim(claim)
+        store, _ = self._consume(transport, claim)
 
-        self.assertEqual(len(transport.calls), 5, "建档→转换（被拒）→段落写入→授权→读回")
-        _, write_url, write_body, _ = transport.calls[2]
+        self.assertEqual(len(transport.calls), 4)
+        self.assertEqual(transport.calls[1][0], "POST")
         self.assertEqual(
-            write_url,
+            transport.calls[1][1],
             f"{self.BASE_URL}/docx/v1/documents/{self.DOCUMENT_ID}/blocks/{self.DOCUMENT_ID}/children",
         )
-        # 降级后写进去的是段落路径的产物，不是转换响应里的表格块。
-        self.assertEqual(
-            write_body["children"],
-            [{"block_type": 2, "text": {"elements": [{"text_run": {"content": "正文段落"}}]}}],
-        )
-        # 孤儿文档消除的直接证据：授权这一步真的发生了。
-        _, grant_url, _, _ = transport.calls[3]
-        self.assertEqual(
-            grant_url,
-            f"{self.BASE_URL}/drive/v1/permissions/{self.DOCUMENT_ID}/members?type=docx",
-        )
+        for _, url, _, _ in transport.calls:
+            self.assertNotIn("docs_ai", url)
+        self.assertEqual(store.document_created, [])
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
-        self.assertEqual(store.failed, [])
-        # 降级检查点单独落库（迁移 0082）——补发通知与检查点恢复路径靠它。
-        self.assertEqual(store.body_degraded, [("tdd-wire-1", "unsupported_nested_blocks")])
-        # 明示降级：用户拿到的通知必须说清格式被简化了。
-        self.assertEqual(len(notifier.sent), 1)
-        _, text, dedupe_key = notifier.sent[0]
-        self.assertIn("格式做了简化", text)
-        self.assertIn(self.DOCUMENT_ID, text)
-        self.assertEqual(dedupe_key, "document-ready:tdd-wire-1")
 
     def test_checkpoint_recovery_of_a_degraded_row_still_tells_the_user_it_was_simplified(
         self,
     ) -> None:
-        """检查点恢复路径跳过写正文步，因此**永远不会**再产生一次
-        ``WriteBodyOutcome``——降级说明只能从 claim 带进来的
-        ``body_degraded_reason``（迁移 0082）继承。
+        """检查点恢复路径跳过写正文步，因此拿不到这次调用的内存降级信号——
+        降级说明只能从 claim 带进来的 ``body_degraded_reason``（迁移 0082）继承。
 
-        变异锚点：把 ``_process_docx_claim`` 里
-        ``body_degraded_reason = claim.body_degraded_reason`` 改成 ``= None``，
-        本用例会从"文案含格式已简化"变红成普通就绪文案。
+        变异：把 ``_process_docx_claim`` 的 ``body_degraded_reason =
+        claim.body_degraded_reason`` 改成 ``= None``，这条用例会红成"发出的是
+        不带降级说明的文档已生成"。
         """
 
         transport = _RecordingUserMessageTransport(
             [
-                # 恢复路径先读回正文根 block：非空即"已经写过"，跳过写正文。
-                {"code": 0, "data": {"items": [{"block_id": "b1", "block_type": 2}]}},
+                self._read_body_children_response(empty=False),
                 self._grant_response(),
                 self._read_members_response(),
             ]
         )
-        store = _RecordingDeliveryStore()
-        notifier = _SpyNotifier()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=notifier
-        )
-        claim = DocumentDeliveryClaim(
-            id="tdd-wire-1",
-            task_id="tsk-wire-1",
-            requester_open_id=self.OPEN_ID,
-            title="标题",
-            paragraphs=("正文段落",),
+        claim = self._claim(
+            markdown=COMPREHENSIVE_MARKDOWN,
             document_id=self.DOCUMENT_ID,
-            attempts=2,
-            markdown="| 公司 | 指标 |",
             body_degraded_reason="unsupported_nested_blocks",
         )
 
-        consumer._process_docx_claim(claim)
+        store, notifier = self._consume(transport, claim)
 
-        self.assertEqual(len(transport.calls), 3, "读回正文→授权→读回协作者，不再写正文")
+        self.assertEqual(store.body_degraded, [], "恢复路径不重复提交这一列")
         self.assertEqual(store.succeeded, ["tdd-wire-1"])
-        # 没有再次降级，因此不重复落检查点。
-        self.assertEqual(store.body_degraded, [])
         self.assertEqual(len(notifier.sent), 1)
         self.assertIn("格式做了简化", notifier.sent[0][1])
-
-    def test_null_markdown_falls_back_to_paragraphs_regardless_of_the_switch_state(self) -> None:
-        """NULL markdown 回退段落：即使转换开关打开，这一行的 ``markdown`` 列是
-        ``NULL``（历史行、或登记侧未能落上原文）也必须无条件回退段落路径——
-        判据是 ``claim.markdown is None``，与开关状态无关。"""
-
-        transport = _RecordingUserMessageTransport(
-            [
-                self._create_document_response(),
-                self._children_write_response(),
-                self._grant_response(),
-                self._read_members_response(),
-            ]
-        )
-        store = _RecordingDeliveryStore()
-        consumer = DocumentDeliveryConsumer(
-            store=store, docx=self._docx(transport, markdown_convert_enabled=True), notifier=_SpyNotifier()
-        )
-        claim = self._claim(markdown=None)
-
-        consumer._process_docx_claim(claim)
-
-        self.assertEqual(len(transport.calls), 4, "不该发生任何 blocks/convert 调用")
-        for _, url, _, _ in transport.calls:
-            self.assertNotIn("blocks/convert", url)
-        self.assertEqual(store.succeeded, ["tdd-wire-1"])
-        self.assertEqual(store.failed, [])
 
 
 class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
@@ -2101,7 +2271,7 @@ class GatewayConfigMarkdownConvertFlagTest(unittest.TestCase):
         """装配层把已经读好的布尔值传进 ``LarkDocxDelivery`` 构造函数（Issue #408
         正式方案接线）。只读私有属性断言，不驱动真实调用——``assemble_document_
         delivery_consumer`` 构造的令牌供给包着一个真实 ``FeishuTenantTokenClient``
-        （走独立的 urllib 传输，不是这里注入的假传输层），真正调用 ``write_body``
+        （走独立的 urllib 传输，不是这里注入的假传输层），真正发起一次建档
         会触发它去发一次真实网络请求，与本类"不接触数据库或网络"的边界冲突；
         读私有属性是这里唯一不产生副作用的验证方式，且这个属性正是「布尔值有没有
         被传进构造函数」这件事本身的真值来源（``LarkDocxDelivery.__init__`` 里

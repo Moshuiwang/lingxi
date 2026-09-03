@@ -90,10 +90,24 @@ REQUIRED_MODULES = (
     # `onboarding_runner.py` 顶部 `from .onboarding_terminal import (...)`。随
     # `onboarding_runner.py` 同一条发布理由。
     "lingxi.core.identity.onboarding_terminal",
+    # 开通链的两道失败关闭闸（rc25 S-2a，对抗审查 X-1）：`_reject_zero_galaxy_
+    # without_local_grant` 从 `onboarding_runner.py` 纯移动过来，外加新增的
+    # 「同邮箱已绑给另一个 user_id」闸。随 `onboarding_runner.py` 同一条发布理由。
+    "lingxi.core.identity.onboarding_guards",
+    # 预开通（Issue #541，rc25 S-8a）：系统触发入口的三处差异（合成事件标识、账本
+    # no-op、静默投递）与邮箱→飞书身份的提前定位。`onboarding_runner.py` 与
+    # `adapters/postgres_stalled_provisioning.py` 都在模块级 import 它，随
+    # `onboarding_runner.py` 同一条发布理由。
+    "lingxi.core.identity.preprovision",
+    # 上面那道邮箱闸的只读回读口（`app_user` 规范化邮箱 → user_id）。由
+    # `_build_onboarding_duty` 在函数内 import，同 `postgres_onboarding_failure`
+    # 一条理由：函数内 import 证明不了它装得上，必须显式登记。
+    "lingxi.adapters.postgres_email_binding",
     # 内测名单闸的纯判定层（Issue #302 S-N-01）。由同一个 `onboarding_runner.py` 里
-    # 的 `AutoOnboardingRunner.build_innertest_roster_gate` 与
-    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 各自函数内 import，
-    # 装配前不在任何进程的模块级 import 闭包里，但必须随制品发布，理由同上一条。
+    # 的 `build_innertest_roster_gate`（rc25 S-8a 从 `AutoOnboardingRunner` 的静态
+    # 方法纯移动到本模块，因此 `apps/scheduler/onboarding.py` 改为模块级 import）与
+    # `apps/scheduler/config.py` 的 `SchedulerConfig.from_env` 函数内 import，
+    # 必须随制品发布，理由同上一条。
     "lingxi.core.identity.innertest_roster_gate",
     "lingxi.adapters.user_environment",
     # Epic D 闸⑥：按用户读取问数 MCP 配置的读侧适配器，配套上一条的写侧。由
@@ -179,6 +193,11 @@ REQUIRED_MODULES = (
     # wheel 里没有这个模块"正是 V-部署-10 要挡的形状。
     "lingxi.core.innertest_content_capture",
     "lingxi.adapters.postgres_content_capture",
+    # 同一张表的**到期删除**侧（对抗审查 2026-09-02 C-7）：由 lingxi-scheduler 的
+    # 保留清理职责在函数内 import。刻意与写入侧分成两个模块——写入侧要
+    # `ContentCaptureRecord`，那个类会把整个 `core.execution` 拉进 scheduler 的
+    # import 闭包，而 scheduler 没有任何理由背上 worker 的执行层。
+    "lingxi.adapters.postgres_content_capture_retention",
     # 年份接地护栏第二层（Issue #326 批次 5 卡 E）：纯逻辑判定在 core，由
     # apps/worker/service.py 模块级 import（见下面 PROCESS_RUNTIME_IMPORTS 的
     # worker 闭包）——"本地测试全绿但 wheel 里没有这个模块"同样是 V-部署-10
@@ -296,6 +315,9 @@ REQUIRED_MODULES = (
     "lingxi.adapters.postgres_pending_action",
     "lingxi.adapters.postgres_management_card_context",
     "lingxi.adapters.feishu_admin_card",
+    # 回调应答之后那批网络往返的后台执行器（#493 块 B）：确认成功后的出带外换卡、
+    # 群通知、原管理卡刷新与定向重算入队搬到应答之后串行执行，回调本身不再等它们。
+    "lingxi.adapters.admin_post_callback",
     # 用户权限管理卡（#439 B 档）展示层 + 指标中文别名反查（#439 A 档）的配置
     # 读取——两者均只被 gateway 的管理命令面消费，与上面确认卡片的既有归类
     # 同一姿态。
@@ -531,13 +553,23 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # "函数内 import 证明不了装得上"条目同一条理由）。
             "lingxi.core.identity.stock_token_source",
             "lingxi.adapters.stock_token_bitable",
-            # 内测名单闸（Issue #302 S-N-01）：`_build_onboarding_duty` 经
-            # `AutoOnboardingRunner.build_innertest_roster_gate` 函数内 import，
-            # `SchedulerConfig.from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS`
-            # 时同样函数内 import——两个调用点都不在模块级，必须显式登记。
+            # 内测名单闸（Issue #302 S-N-01）：`apps/scheduler/onboarding.py` 模块级
+            # import `build_innertest_roster_gate`（rc25 S-8a 之前是经
+            # `AutoOnboardingRunner` 的静态方法函数内 import）；`SchedulerConfig.
+            # from_env` 解析 `LINGXI_INNERTEST_ROSTER_OPEN_IDS` 时仍是函数内 import。
             "lingxi.core.identity.innertest_roster_gate",
+            # 开通链的两道失败关闭闸（rc25 S-2a，对抗审查 X-1）：`onboarding_
+            # runner.py` 模块级 import，随它一起进 scheduler 的运行时闭包。
+            "lingxi.core.identity.onboarding_guards",
+            # 预开通（Issue #541）：`onboarding_runner.py` 与停摆候选查询都在模块级
+            # import，随它们一起进 scheduler 的运行时闭包。
+            "lingxi.core.identity.preprovision",
             "lingxi.core.identity.provisioning",
             "lingxi.adapters.postgres_identity",
+            # 「同邮箱已绑给另一个 user_id」的只读回读口（rc25 S-2a，对抗审查
+            # X-1）：`_build_onboarding_duty` 在函数内 import，与上一行同一条
+            # "函数内 import 证明不了装得上"的理由。
+            "lingxi.adapters.postgres_email_binding",
             "lingxi.adapters.user_environment",
             # 失败原因落库（Issue #337，S-H3-1）：`_build_onboarding_duty`
             # （`apps/scheduler/onboarding.py`）与 `_build_stalled_provisioning_
@@ -580,6 +612,11 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.apps.scheduler.audit",
             "lingxi.apps.scheduler.credential_rotation",
             "lingxi.apps.scheduler.retention",
+            # 内测采集九十天到期删除（对抗审查 2026-09-02 C-7）：
+            # `_build_content_capture_retention_duty` 函数内 import，与
+            # `role_function_map_file` 一节同一条理由——函数内 import 也是进程真实
+            # 依赖，制品少了它这条清理职责会在第一轮就抛 ImportError。
+            "lingxi.adapters.postgres_content_capture_retention",
             "lingxi.apps.scheduler.roster_audit",
             "lingxi.apps.scheduler.daily_report",
             "lingxi.apps.scheduler.loop",
@@ -617,6 +654,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `postgres_local_permission` 模块级 import；开通链两步编排随 runner 进闭包。
             "lingxi.core.permission.legacy_diff",
             "lingxi.core.identity.legacy_permission_import",
+            # 职位＋公司范围预授权（rc25 S-8b，#541）：`postgres_local_permission`
+            # 模块级 import 冻结计划类型（`PositionGrantPlan`），随本地覆盖落库口
+            # 一并进 scheduler 闭包——预开通脚本必须在 lingxi-scheduler 容器内运行。
+            "lingxi.core.permission.position_override",
             # 权限发布表短期令牌供给（Issue #226 方向 3：应用身份）：`build_loop`
             # 模块级 import 方向无关外壳与缓存层，函数内 import 真实 HTTP 调用的
             # adapters（与 `feishu_group_message` 等其余 adapters 同一条理由）。
@@ -878,6 +919,19 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.core.conversation.pipeline",
             "lingxi.core.conversation.ports",
             "lingxi.core.conversation.session_window",
+            # rc25 修复包 F1：预开通首聊补一句要带真实公司/职能范围，
+            # `core/conversation/pipeline.py` 因此模块级 import
+            # `core.permission.notification.describe_scope` 与
+            # `core.permission.publish_row.parse_permissions`（与 onboarding.completed
+            # 同一来源）。两个模块及其自身的模块级依赖都是纯函数＋内容目录，不带
+            # 第三方依赖，也不拖身份链；worker 不消费这条提示，只是随 pipeline 的
+            # import 闭包一并载入。
+            "lingxi.core.permission",
+            "lingxi.core.permission.account_match",
+            "lingxi.core.permission.galaxy_scope",
+            "lingxi.core.permission.notification",
+            "lingxi.core.permission.publish_row",
+            "lingxi.core.permission.role_function",
             # 投递事件 outbox 的纯领域逻辑（Issue #151），由
             # adapters.postgres_conversation 与 apps.worker.service 共同依赖。
             "lingxi.core.delivery",
@@ -1006,6 +1060,7 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "lingxi.adapters.postgres_pending_action",
             "lingxi.adapters.postgres_management_card_context",
             "lingxi.adapters.feishu_admin_card",
+            "lingxi.adapters.admin_post_callback",
             # 用户权限管理卡（#439 B 档）：`/admin user` 除既有文本回复外附带发送
             # 一张管理卡（`ManagementCardDispatcher`/`TomlCompanyMetricCatalog`，
             # 均在函数内由装配层按需 import，与本组其余"函数内 import 也要显式
@@ -1060,6 +1115,10 @@ PROCESS_RUNTIME_IMPORTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             # `core.permission.targeted_recompute` 进入 gateway 闭包。
             "lingxi.core.permission.legacy_diff",
             "lingxi.core.permission.publish_row",
+            # rc25 修复包 F1：pipeline 渲染预开通首聊那句时用
+            # `core.permission.notification.describe_scope`（公司/职能展示文本，
+            # 与 onboarding.completed 同一来源）。
+            "lingxi.core.permission.notification",
             "lingxi.core.permission.publish",
             "lingxi.core.permission.mcp_readiness",
             "lingxi.core.permission.role_function",
