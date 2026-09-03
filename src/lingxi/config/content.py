@@ -156,6 +156,11 @@ REQUIRED_TEXT_KEYS: tuple[str, ...] = (
     # 不与上一条共用——上一条担保「内容本身没有删减」，那句话在服务端静默丢块时
     # 可能失实，理由见 content.toml 该键上方注释。
     "delivery.document_ready_simplified",
+    # rc25 修复包 F4：#571 之后触发面含两道前置守卫，各自的真实原因是长度/标题
+    # 形态，不是「无法排版的结构」——按来源分派两条如实归因的文案，理由见
+    # content.toml 该键上方注释。
+    "delivery.document_ready_degraded_too_long",
+    "delivery.document_ready_degraded_title",
     # 文档投递终态失败/结果不明后的追加消息（opus 审查 R-1 第 3 条）：此前只有
     # 成功会追加消息，用户请求生成文档失败后从未收到任何后续消息。
     "delivery.document_failed",
