@@ -400,6 +400,16 @@ done
 
 **`--env-file` 不能省。** `env_file:` 只把变量注入**容器**，它**不参与 compose 文件自身的 `${VAR:?}` 插值**。省掉它，compose 会直接报 `LINGXI_IMAGE_REGISTRY` 未设并退出——下面每条命令都逐字执行验证过。
 
+> **长期注意事项（rc25 审核③ ❌A 登记，不随批次失效）**：`docker compose config`
+> 不带 `--no-env-resolution` 时，在任何声明了 `env_file:` 的服务上**永远**会把那些文件的
+> 内容展开内联进输出（仓库自证：`scripts/ci/verify_compose_structure.sh` 头部注释明确
+> 记录了这一行为并为此专门造空占位文件）。本仓库七份 env 文件全部是凭据载体，因此一条
+> 看似只读的 `config <服务>` 回读会把数据库 DSN、Fernet 密钥、飞书 app secret 打进终端
+> 与会话记录。**在 stage/生产等持有真实凭据的机器上执行任何 `config` 回读，一律加
+> `--no-env-resolution`**；先用 `docker compose config --help | grep -c -- '--no-env-resolution'`
+> 确认本机支持（期望 `1`），输出不是 `1` 就不做渲染回读，改用 `ps`/`docker image inspect`
+> 等不展开 env 的核对。完整渲染（不带该开关）只允许在不含真实凭据的研发机上进行。
+
 ```bash
 # 1. 先跑迁移（一次性作业）
 docker compose --env-file deploy/.env.stage \
@@ -676,7 +686,9 @@ LINGXI_GATEWAY_MEM_LIMIT=512M
 不会再安静地退回 `1G`、把加总推到 4G。`PROD_EXTERNAL_HOST_SPEC_LIMITS` 已把这两项
 纳入门禁，改回 `:-` 形态会判红。渲染回读仍然建议做（它同时核对**值对不对**，而不只是
 在不在）：
-`docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config scheduler gateway`。
+`docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution scheduler gateway`
+——**在有真实凭据的机器上必须带 `--no-env-resolution`**，先决条件与不支持时的替代见
+「安装与升级」开头的长期注意事项（rc25 审核③ ❌A）。
 
 **怎么读这张表**：`deploy.resources.limits` 是**上界，不是预留**，三者同时顶格才会
 真的冲突。CPU 超订（生产 1.0 + 1.0 + 1.5 = 3.5 vCPU 对 2 vCPU）只会限流变慢，内存
@@ -711,13 +723,15 @@ Claude CLI 与多个 MCP 子进程，`pids` 撞顶的失败形态是进程被直
 `compose.stage.yaml`/`compose.prod.yaml` 里，只有需要单独调整某个服务时才需要
 在 `deploy/.env.stage`/`deploy/.env.prod` 里显式设置对应变量。
 
-**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并）：
+**结构渲染核对**（不需要真实镜像，`docker compose config` 只做插值与合并；在持有真实
+凭据的机器上带 `--no-env-resolution`，见「安装与升级」的长期注意事项——`deploy:` 块的
+渲染结果不受该开关影响）：
 
 ```bash
 docker compose --env-file deploy/.env.stage \
-  -f deploy/compose.yaml -f deploy/compose.stage.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.stage.yaml config --no-env-resolution | grep -A4 'deploy:'
 docker compose --env-file deploy/.env.prod \
-  -f deploy/compose.yaml -f deploy/compose.prod.yaml config | grep -A4 'deploy:'
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml config --no-env-resolution | grep -A4 'deploy:'
 ```
 
 **门禁只核对结构**（`scripts/ci/check_deploy_contract.py` 的

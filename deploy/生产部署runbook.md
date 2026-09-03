@@ -22,6 +22,30 @@
 
 以下步骤是对 `deploy/README.md` 既有机制的生产执行顺序汇总，逐字命令以该文件为准；这里只标注生产专属的差异点。
 
+### 2.0 步 0：把生产机仓库工作副本更新到候选（升级必做；rc25 审核③ ❌B 补入）
+
+本文件与 `deploy/README.md` 的**每一条** compose 命令都以相对路径引用生产机仓库工作副本里的 `deploy/compose*.yaml`（工作副本路径：`/home/bi-ai-deploy/projects/lingxi`）。**只改 `.env.prod` 的 tag/digest 就 `up -d` 是一个不报错的错法**：命令全部成功、三容器全 healthy、观察期全绿，但 compose 文件还是旧的——本批新增的 `LINGXI_WORKER_WORKSPACE`（W-1 令牌隔离）、`LINGXI_DEPLOY_ENVIRONMENT`（生产判据兜底）等 `environment:` 行全部缺席，修复零报错地不生效；单元文件、运维脚本的更新同样依赖这一步。CI 门禁只看仓库文件，对「生产机没更新」零报错。2026-09-03 只读实测：生产工作副本 HEAD 停在 `eea6b1215cb9…`（rc24 时代提交），这条缺口是既成事实，不是假设。
+
+```bash
+# ① 更新到本批候选（<候选 SHA> = 本批合入 main 的提交，其前 12 位就是镜像 tag 的 sha 段）
+git -C /home/bi-ai-deploy/projects/lingxi fetch origin
+git -C /home/bi-ai-deploy/projects/lingxi checkout --detach <候选 SHA>
+
+# ② 回读：输出必须逐字等于候选 SHA，不等不得继续
+git -C /home/bi-ai-deploy/projects/lingxi rev-parse HEAD
+
+# ③ 渲染回读（必须带 --no-env-resolution，硬前提见 §2.1）：本批 compose 侧修复必须出现
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  config --no-env-resolution worker-queue \
+  | grep -E 'LINGXI_WORKER_WORKSPACE|LINGXI_DEPLOY_ENVIRONMENT'
+# 期望恰好两行（键按字母序，值可能带引号）：
+#   LINGXI_DEPLOY_ENVIRONMENT: prod
+#   LINGXI_WORKER_WORKSPACE: /tmp/lingxi-workspace
+```
+
+checkout 之前先确认工作副本干净（`git -C /home/bi-ai-deploy/projects/lingxi status --porcelain` 输出为空；有本地改动先由产品负责人裁定处置，不得 `checkout -f` 抹掉）。`deploy/.env.prod*` 七个凭据文件全部匹配 `.gitignore` 的 `.env.*` 规则、不入库也不受 checkout 影响——这一步**不触碰任何凭据文件**。
+
 ### 2.1 准备七个 env 文件
 
 按 [`deploy/README.md`「准备」](README.md#准备)为 `.env.prod`、`.env.prod.scheduler`、`.env.prod.gateway`、`.env.prod.worker`、`.env.prod.worker-queue`、`.env.prod.migrate`、`.env.prod.reauthorize` 七个文件写入生产凭据。生产凭据集与研发/Stage 凭据集完全隔离，任何一个值都不得与 `.env.stage.*` 系列重复（百炼模型端点凭据除外，见本文件「九」）；不得把研发环境的任何文件复制改名后当作生产文件使用。
@@ -72,19 +96,40 @@ LINGXI_GATEWAY_MEM_LIMIT=512M
 把它也收紧成显式声明属部署配置决定，需连本 runbook 与 `.env.prod` 一起改，**尚未裁定**。
 不需要为它在 `.env.prod` 加行。
 
-部署前用以下两条只读命令确认渲染后的**取值**与上表一致（只读，不创建或修改真实生产
+部署前用以下两条只读命令确认渲染后的**取值**与上表一致（不创建或修改真实生产
 文件）。**漏没漏现在渲染会自己报错，但值写错了只有回读看得出来**：
+
+**硬前提（rc25 审核③ ❌A；先核对、后执行，不核对不得跑）**：`docker compose config`
+**默认会把各服务 `env_file:` 的文件内容展开内联进输出**（仓库自证：
+`scripts/ci/verify_compose_structure.sh` 头部注释明确记录了这一行为）——在生产上不带
+开关照跑这条「只读」命令，等于把 `.env.prod.worker-queue`/`.env.prod.scheduler`/
+`.env.prod.gateway` 里的数据库 DSN（含口令）、`LINGXI_MCP_TOKEN_ENCRYPT_KEY`、飞书
+app secret 全部打进终端与会话记录。因此下面两条命令**必须带 `--no-env-resolution`**，
+且执行前先用这条只读命令确认本机 compose 支持该开关（2026-09-03 已在生产实测一次返回
+`1`，窗口内执行前仍复核）：
+
+```bash
+docker compose config --help | grep -c -- '--no-env-resolution'   # 期望输出 1
+```
+
+**输出不是 `1` 时，下面两条 `config` 命令一条都不得执行**——没有「先跑了再说」的选项。
+替代做法：跳过渲染回读，只做不展开 env 的核对（`docker compose … ps`、
+`docker image inspect`，以及 `up -d` 之后
+`docker inspect --format '{{.HostConfig.Memory}}' <容器>` 事后核值）。资源限值来自
+`--env-file` 根文件的插值，不受 `--no-env-resolution` 影响，带开关的回读结论与不带时
+完全相同。
 
 ```bash
 # ① worker-queue：并发与四项资源
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  config worker-queue
+  config --no-env-resolution worker-queue
 
-# ② scheduler / gateway：确认 memory 渲染成 512M（漏配已由 ${VAR:?} 直接报错）
+# ② scheduler / gateway：确认 memory 渲染值（漏配已由 ${VAR:?} 直接报错；判读按
+#    11.3 第 1 条用字节数：512M → "536870912"，出现 "1073741824" 就是错退回 1G）
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  config scheduler gateway
+  config --no-env-resolution scheduler gateway
 ```
 
 ### 2.2 部署前置检查（preflight）
@@ -112,10 +157,29 @@ grep -n '^LINGXI_DOCX_MARKDOWN_CONVERT' deploy/.env.prod.gateway || echo '未设
 
 ### 2.3 迁移
 
+先完成「三、镜像 digest 固定」的**①显式拉取与②逐份比对**（rc25 起提前到迁移之前），
+全部一致后再跑迁移：
+
 ```bash
 docker compose --env-file deploy/.env.prod \
   -f deploy/compose.yaml -f deploy/compose.prod.yaml \
   --profile job run --rm migrate
+```
+
+**硬规则（rc25 补入）：`run --rm migrate` 退出码非 0 → 当场停止，不得带伤 `up -d`。**
+本批迁移 0085（`app_user` 部分唯一索引）、0086（`publish_outbox` 两个可空列＋回填）、
+0087（`app_user` 三个可空列）**全部是加法且可重跑**：`migrations/alembic/env.py` 的
+`transaction_per_migration=True` 让任一条失败只回滚该条、版本停在前一条，**失败不需要
+downgrade**，处置完原因后重跑原命令即可。已知失败形态：0085 撞上重复邮箱时
+`CREATE UNIQUE INDEX` 报错、版本停在 0084——按迁移文件与 `migrations/README.md` 的
+说明处置重复数据后重跑，**不得改成非唯一索引绕过**。
+
+```bash
+# 迁移后回读版本头：migrate 前应为 0084_management_card_state_cas (head)，
+# 之后必须是 0087_preprovision_seams (head)，不符不得起服务
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  --profile job run --rm migrate current
 ```
 
 ### 2.3.5 起服务前的两道前置（对抗审查 R6-D7 补入）
@@ -134,6 +198,26 @@ docker compose --env-file deploy/.env.prod \
 
 - **`runtime-config` 卷内容自带**（详见 11.2）：`system_prompt.md` 到位并设 `LINGXI_WORKER_SYSTEM_PROMPT_FILE`。**没有安全的「留空」选项**——文件缺失时 worker 静默降级为无提示词执行，三服务照样全 `healthy`、观察期照样全绿，只有答案质量与验证过的不是一回事；
 - **首次授权走通**（详见 11.5）：`reauthorize` 完成、专用授权凭据落到凭据卷。凭据不到位时 scheduler 起来也同步不了花名册，首批用户一个都开不通。
+
+### 2.3.6 升级窗口注意事项（rc25 补入：挑静默窗口，先查在途）
+
+**① 重启/替换 gateway 之前先确认没有在途任务与在途文档交付。** 只读计数（DSN 从
+`/home/bi-ai-deploy/.config/lingxi/supabase-prod.env` 加载进环境变量后引用，值不回显、
+不粘贴进命令行参数或聊天记录）：
+
+```bash
+psql "$LINGXI_POSTGRES_DSN" -Atc "SELECT (SELECT count(*) FROM task WHERE status='running'), (SELECT count(*) FROM task WHERE status='awaiting_delivery'), (SELECT count(*) FROM task_document_delivery_request WHERE status='processing');"
+```
+
+期望 `0|0|0`；任一项非零就等一轮再查（在途文档投递的认领回收周期为 180 秒量级），
+非零不 `up -d`。
+
+**② 在途 docs_ai 建档若仍被重启打断：不需要任何处置动作，但绝不重试建档。** 一次建档
+请求已发出、响应没等到时，飞书服务端可能已经把整篇文档建了出来；重启后该投递行由
+180 秒回收机制退回队列自行续投，**用户仍只收到一份文档、不会重复交付**。代价是机器人
+云空间可能多出一篇**带全文**的孤儿文档（从未授权给任何人、不在九十天擦除范围）——这是
+**留存面的运维卫生**，不是用户可见故障：不要人工重试建档，不要为找回孤儿去翻机器人
+云空间，如实登记发生过一次打断即可。规避办法就是 ①：挑静默窗口执行整个升级。
 
 ### 2.4 起服务（`--profile mvp`）
 
@@ -207,14 +291,29 @@ LINGXI_WORKER_IMAGE_DIGEST=@sha256:<worker 镜像本批次 digest>
 LINGXI_MIGRATE_IMAGE_DIGEST=@sha256:<migrate 镜像本批次 digest>
 ```
 
-**部署时核对**：逐份镜像执行
+**部署时核对（2026-09-03 修订，rc25 审核③：核对从事后判据提前为事前闸）**：此前这一步
+只能在 `up -d` 之后做——镜像到起服务才被拉下来，「digest 不符不得判成功」因此只能事后
+判。现改为**「①显式拉取 → ②逐份比对 → 才 migrate / up -d」**，顺序不得颠倒；11.3
+第 2 条记录的首发临时办法（用 `config` 看渲染引用）不再需要。
 
 ```bash
+# ① 显式拉取本批全部镜像（job + mvp 两个 profile 一起给即覆盖四份镜像；
+#    .env.prod 已写四个 digest 变量时拉的就是钉住的 digest，值写错会当场报错）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  --profile job --profile mvp pull
+
+# ② 逐份镜像回读 digest（scheduler / gateway / worker / migrate 同构，各一次）
 docker image inspect --format='{{index .RepoDigests 0}}' \
-  ghcr.io/moshuiwang/lingxi-scheduler:<本批 tag>   # gateway / worker / migrate 同构，各一次
+  ghcr.io/moshuiwang/lingxi-scheduler:<本批 tag>
 ```
 
-输出形如 `ghcr.io/moshuiwang/lingxi-scheduler@sha256:…`，取 `@` 之后的部分与上面四个变量固定的值逐字比对。不一致说明本机存在同 tag 不同 digest 的缓存污染，必须先 `docker image prune` 或显式 `docker pull` 该 digest 后重新 `up -d`，不得在 digest 不匹配的状态下继续判定部署成功。
+② 的输出形如 `ghcr.io/moshuiwang/lingxi-scheduler@sha256:<64 位十六进制>`：从 `@` 起
+（含 `@sha256:` 前缀）与 `.env.prod` 里对应的 `LINGXI_<服务组>_IMAGE_DIGEST` 值**逐字
+相同**才算通过。① 失败或 ② 任一份不一致 → **停止，不得进入 §2.3 迁移与 §2.4 起服务**；
+不一致说明本机存在同 tag 不同 digest 的缓存污染，先 `docker image prune` 或显式
+`docker pull` 该 digest，重新走 ①②，四份全部一致后才继续。tag→digest 的解析（往
+`.env.prod` 写四行时用）仍按上文「把 tag 解析为 digest」二选一执行。
 
 > **为什么不用 `docker compose … images`**（2026-09-02 首发实测，实录见 11.3 第 2 条）：那条命令列的是**本项目当前存在的容器**，`migrate` 这类 `--profile job run --rm` 的一次性作业跑完不留容器，输出为空，`migrate` 这一步因此核不到任何东西。`docker image inspect` 读的是本机镜像元数据，不依赖容器是否存在，`up -d` 前后都能用。
 
@@ -259,6 +358,12 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 ```
 
 **回滚不触碰数据库与持久卷**：不执行 `down` 移除 volumes，不执行任何迁移降级操作。这一前提成立的条件是迁移遵守「先加后删」——破坏性变更必须拆成两次发布，否则回滚就从「切镜像重启」变成「恢复数据库备份」；该前提由 `V-部署-05`（[验收矩阵「部署与迁移」分册](../docs/技术设计/验收矩阵-部署与迁移.md#三部署与迁移断言)）在每次 CI 上机械核对，2026-08-23 已有 `biai-stage` 真实回滚演练证据（整队切回旧候选、三容器在当前库结构上全部 healthy）。
+
+> **已知边界（rc25 登记，本批不修）**：rc25 这一批（迁移 0085-0087）的回滚安全性是
+> **静态论证**——三条迁移全为加法、旧镜像 `20260902-5500bfb725aa` 不读不写新列与新索引，
+> 据此判定「切回旧 tag 不碰库」成立；**未针对本批做真实回滚演练**。且 `V-部署-05` 的
+> CI 实测（`scripts/ci/verify_old_image_new_schema.sh`）用的是运行时**合成**的加列迁移、
+> 不是本批真实的 0085-0087，CI 绿不构成对本批的实测覆盖。
 
 ## 七、观察期
 
@@ -312,6 +417,24 @@ docker image inspect --format='{{index .RepoDigests 0}}' \
 #    /opt/lingxi/scripts/{host_health_alert.py,collect-container-logs.sh,monitoring/*}
 #    /opt/lingxi/monitoring/{host-monitor.env,db-business.env,push.env}   均 0600
 
+# 1a.（root 级，列入产品负责人亲手放行清单）logrotate 配置到位：
+#     lingxi-logrotate.service 的 ExecStart 指向这个固定路径，配置不在时该 timer
+#     每小时 failed 一次、容器日志无上限增长（deploy/日志留存.md「已知限制」）
+sudo install -d -m 755 /etc/lingxi/logrotate.d
+sudo cp deploy/lingxi-container-logs.logrotate /etc/lingxi/logrotate.d/lingxi-container-logs
+
+# 1b.（root 级，同上）/var/log/lingxi 属主必须是本机部署用户。
+#     2026-09-03 生产实测：当前是 root:root 755，只有 monitoring/ 子目录是
+#     bi-ai-deploy 750——而收集脚本第一步就 chmod 0750 该目录，属主不对时
+#     set -e 直接退出、一行日志都不收（deploy/collect-container-logs.sh）：
+sudo chown bi-ai-deploy:bi-ai-deploy /var/log/lingxi
+sudo chmod 750 /var/log/lingxi
+
+# 1c. 回读（期望第一行 bi-ai-deploy:bi-ai-deploy 750，第二行同属主 750；
+#     以及 logrotate 配置文件存在）
+stat -c '%n %U:%G %a' /var/log/lingxi /var/log/lingxi/monitoring
+ls -l /etc/lingxi/logrotate.d/lingxi-container-logs
+
 # 2. 装单元本体（仓库单元里没有 User=）
 sudo install -m 644 deploy/monitoring-units/*.service \
   deploy/monitoring-units/*.timer /etc/systemd/system/
@@ -336,6 +459,12 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 **装之前先 `systemctl cat <单元>` 与仓库版本逐行比对**：现装的那几份是首发现场手写的，不保证与仓库版本等价；差异逐条确认后再覆盖，不要盲覆盖。
 
 **当前生产的实际状态（2026-09-02 只读实测，不代表已装齐）**：`lingxi-host-monitor`、`lingxi-resource-sample`、`lingxi-db-business-sample` 三个 timer 已装并在跑（`User=bi-ai-deploy`）；`lingxi-monitoring-push` 未装（等监控库角色）；**容器日志收集与轮转未装**（`/var/log/lingxi/` 下只有 `monitoring/`）——后者的取证代价见 `deploy/日志留存.md`「已知限制」。
+
+> **已知边界（rc25 登记，本批不修）**：`deploy/monitoring-units/` 的六个 `.service` 单元
+> 都**没有 `OnFailure=` 告警接线**——timer 或单元失败只留在 systemd 状态里，不会向任何
+> 渠道推送告警（告警目标单元本批不建；对应缺口 W0-12 因 D-25 缓议，由后续卡承接）。
+> 唯一的间接补偿是 host-monitor 的「采样停更」判定。补上之前，`systemctl list-timers
+> 'lingxi-*'` 的人工巡检是发现 timer 静默失败的唯一途径。
 
 ## 十一、实录偏差（2026-09-02 首发）
 
@@ -384,7 +513,7 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 
 ### 11.6 监控与备份
 
-- `deploy/monitoring-units/` 三个 `.service` 单元的 `User=` **硬编码为 stage 用户**，安装到 prod 时必须改成生产的部署用户，否则监控静默缺席。这三个单元用 systemd timer 触发（不是 cron），且 `enable` 必须放在服务起来之后——提前装会向管理群发假告警。
+- **（2026-09-03 更新：本条前半句的旧做法已作废，不得再照做。）** 首发当日 `deploy/monitoring-units/` 的 `.service` 单元 `User=` 硬编码为 stage 用户，当时的处置是安装到 prod 后手改单元文件；rc25 起仓库单元**已不含 `User=`**，该值一律由 §10.1 步 3 的本机 drop-in（`10-local.conf`）提供——**不得手工修改 `/etc/systemd/system` 下的单元文件**（红线三：不人工修改生产文件），单元安装与 `User=` 注入以 §10.1 为准。本条仍然成立的后半句：这些单元用 systemd timer 触发（不是 cron），且 `enable` 必须放在服务起来之后——提前装会向管理群发假告警。
 - `monitoring-push` 需要一个数据库监控角色，首发时未创建，**登记为观察期项**；三个采样 timer（主机健康、资源、数据库业务）已安装并各跑通一轮。
 - 容器日志留存（`deploy/日志留存.md`）首发未安装，留观察期补。
 - **`lingxi-prod` 没有备份点**（产品负责人 R8：首发豁免恢复演练）。过渡方案是由部署用户每日一次 `pg_dump -Fc` 到自己的目录（0600），首次 dump 在首批用户开通后立即执行；**产品负责人在托管控制台开启每日备份 / PITR 之后即撤销这个手工过渡**。`scripts/ops/backup_restore_drill.sh` 是演练脚本、不是备份计划，不能顶用。
@@ -392,3 +521,122 @@ ls -la /var/log/lingxi                                  # 收集目录里开始�
 ### 11.7 `deploy/README.md` 的一处表述已更正
 
 README 「主机读取身份」一节原写「把镜像包设为公开的代价是……源码本身不在镜像里」——**这一句不成立**。公开镜像里包含全部源码、用户可见文案版本文件、公司与职能到指标的映射 TOML 以及迁移 SQL。该表述已在 README 与 `Dockerfile` 的对应注释里更正；本次首发在知情前提下接受镜像公开。**2026-09-03 更新**：改回 private 不再是观察期项——产品负责人裁定保持原状，保持公开是有裁定的终态（原因见 README 同一节）。
+
+## 十二、#541 预开通批量执行姿势（生产；rc25 补入）
+
+> **前提与去留**：本节只在「预开通名单（A-3）已到、且产品负责人裁定纳入本次窗口」时
+> 执行；**名单未到则本节整体移出本次升级窗口（块 Z），由产品负责人裁定顺延**，不影响
+> 本 runbook 其余步骤。执行时点在 §2.0-§2.5 升级完成、三服务 healthy、观察期通过之后
+> ——脚本走的开通链要用到本批新镜像与迁移 0087 的停滞收口接缝，旧镜像上不得执行。
+
+**登记一处脚本自述错误（照 docstring 跑必然失败）**：`scripts/ops/preprovision.py` 的
+docstring 与 CLI 描述给出的运行姿势指向 `/app/scripts/ops/preprovision.py`，但
+`.dockerignore` 排除了 `scripts/`、生产镜像里既没有 `/app` 目录也没有该文件——照抄
+docstring 执行会得到 `No such file`，退出码 2、名单一人未动。正确姿势见本节：**脚本
+本体经 stdin 喂给 scheduler 容器内的 Python**（脚本只依赖标准库与镜像内已装的
+`lingxi.*` 包），不进镜像、不在生产现场构建、不修改任何生产文件。docstring 本身的修正
+属代码面，不在本节范围。
+
+### 12.1 输入投放：名单进容器
+
+名单 CSV（三列 `email,position,company_scope`，形态与整份拒绝规则见脚本 docstring）
+先落到部署用户目录——**输入投放，允许**；名单含邮箱等人员数据，目录 0700、文件 0600：
+
+```bash
+umask 077
+mkdir -p /home/bi-ai-deploy/rc25-preprovision
+# 名单由产品负责人提供后写入 /home/bi-ai-deploy/rc25-preprovision/roster.csv（0600）
+```
+
+再从仓库工作副本目录把名单拷进 scheduler 容器的 `/tmp`（16m tmpfs：够放名单，随容器
+重启自动消失，不在生产留持久文件）：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  cp /home/bi-ai-deploy/rc25-preprovision/roster.csv scheduler:/tmp/roster.csv
+
+# 可读性回读（必做）：docker cp 按归档语义保留宿主文件的权限位、落进容器后属 root——
+# 宿主 0600 的名单在容器内对 uid 10001 不可读。这条以容器默认用户读一次行数：
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler wc -l /tmp/roster.csv
+```
+
+`wc -l` 报 Permission denied 时，改用 stdin 投放（以容器默认用户 uid 10001 写入，绕开
+属主问题，效果等价；两条路都不动生产文件）：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler sh -c 'cat > /tmp/roster.csv' \
+  < /home/bi-ai-deploy/rc25-preprovision/roster.csv
+```
+
+### 12.2 dry-run → 产品负责人过目计数 → `--apply` → 幂等复跑
+
+脚本本体经 stdin 执行（`python -B -` 读标准输入）。参数按脚本真实 argparse 接口：
+位置参数 = 容器内名单路径；`--initiated-by` 必填，且必须是 `admin_registry` 里一位
+生效的已登记管理员（不是则退出码 2、零写入，dry-run 也过这一关）；DSN 缺省读容器
+环境的 `LINGXI_POSTGRES_DSN`（scheduler 容器已有，不需要传 `--dsn`）：
+
+```bash
+# ① dry-run（默认即 dry-run：不带 --apply 就是零写入，结构上不调用开通入口）
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --initiated-by <管理员 open_id> \
+  < scripts/ops/preprovision.py
+```
+
+产品负责人逐行核对 dry-run 清单（逐人「邮箱 → 职位 → 公司范围 → 将获得的公司×指标
+条数」与末尾合计）**无误并放行后**，同一条命令追加 `--apply` 真正执行。**参数必须写
+全称**：脚本的 argparse 未关闭前缀缩写，`--ap` 这类唯一前缀也会被解析成 `--apply`
+真执行——窗口内只接受逐字的 `--apply`。
+
+**时长预期（rc25 审核裁定，写给窗口排程）**：逐人**同步**执行，单人最长约 **17 分钟**
+——大头是发布后的 MCP 就绪确认（首探即发、之后每 180 秒一次、总预算 900 秒共 6 次
+探针、单次探针超时 20 秒，见 `src/lingxi/core/permission/mcp_readiness.py`），加上身份
+定位/建档/权限发布等其余同步步骤。名单 N 人的最坏上界按 N×17 分钟排；正常路径远快于
+此（就绪即回）。**多人名单不要挂在交互终端里裸等**：用 nohup 后台执行（或在 tmux 窗口
+内前台跑，等价），把输出落进部署用户目录——日志含邮箱与逐人结果，先 `umask 077`：
+
+```bash
+cd /home/bi-ai-deploy/projects/lingxi
+umask 077
+nohup docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler python -B - /tmp/roster.csv --initiated-by <管理员 open_id> --apply \
+  < scripts/ops/preprovision.py \
+  > /home/bi-ai-deploy/rc25-preprovision/apply-$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 &
+# 之后 tail -f 该日志观察进度
+```
+
+**日志落点即失败清单**：脚本结尾打印逐人终态（`provisioned` / `skipped` /
+`failed_<异常类型>`；名单里**已开通**的用户按产品负责人 2026-09-04 裁定（#544）报
+「已开通、名单权限未应用」的独立状态、不计入成功数——预开通不是存量用户的批量授权
+入口，这类人要调权限走管理卡既有授权路径）与计数，并明言「跑完即散、请自行保存」
+——这份日志就是唯一的逐人报告，**失败清单可据以重跑**。复跑同一份名单是安全的：重复预授权在库内撞唯一约束
+按 `already_present` 降级、开通链对已完成的人按既有幂等语义处理；更干净的做法是把名单
+裁剪到失败者，重新走一轮 dry-run → `--apply`。**同一时刻只允许一份名单在跑**，不并行
+起第二个批次——脚本的在职回读会消费当天专用凭据续期预算里的一次（常驻 scheduler 日报
+侧那一次可能因此推迟到下一窗口，已知代价），并行没有收益还违反单写入者纪律。
+
+跑完清理（谁建谁清；容器 `/tmp` 是 tmpfs、重启也会自清，这里显式清是不把人员数据留给
+下一步）：
+
+```bash
+docker compose --env-file deploy/.env.prod \
+  -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  exec -T scheduler rm -f /tmp/roster.csv
+# 宿主侧名单与日志按产品负责人指示保存或删除，不长期留在部署用户目录
+```
+
+### 12.3 窗口前真机确认清单（只读，未确认不执行本节）
+
+| # | 要证明什么 | 只读命令（在 `/home/bi-ai-deploy/projects/lingxi` 下） | 期望 |
+| --- | --- | --- | --- |
+| 1 | 本机 compose 支持 `cp` 子命令 | `docker compose cp --help` | 打印用法而不是 unknown command |
+| 2 | 容器内 Python 可执行 stdin 脚本 | `echo 'print("stdin-ok")' \| docker compose --env-file deploy/.env.prod -f deploy/compose.yaml -f deploy/compose.prod.yaml exec -T scheduler python -B -` | 输出 `stdin-ok` |
+| 3 | 名单拷入后对容器用户可读 | 12.1 的 `wc -l` 回读 | 行数 = 名单数据行数 + 1（表头） |
+| 4 | `--initiated-by` 是生效管理员 | 由 ① dry-run 自查（不是则退出 2、零写入） | dry-run 正常打印清单与计数 |
